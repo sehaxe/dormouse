@@ -1,0 +1,35 @@
+[package]
+name = "dormouse-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+burn = { version = "0.22.0-pre.3", default-features = false, features = ["std", "extension"] }
+burn-tensor = { version = "0.22.0-pre.3", default-features = false }
+burn-nn = { version = "0.22.0-pre.3", default-features = false }
+burn-ndarray = { version = "0.22.0-pre.3", features = ["blas-openblas"] }
+burn-cuda = { version = "0.22.0-pre.3", default-features = false, features = ["std"] }
+burn-kda = { path = "../../../burn-fused/crates/burn-kda" }
+burn-msa = { path = "../../../burn-fused/crates/burn-msa" }
+burn-bitnet = { path = "../../../burn-fused/crates/burn-bitnet" }
+burn-engram = { path = "../../../burn-fused/crates/burn-engram" }
+burn-rmsnorm = { path = "../../../burn-fused/crates/burn-rmsnorm" }
+burn-sct = { path = "../../../burn-fused/crates/burn-sct" }
+burn-spectral = { path = "../../../burn-fused/crates/burn-spectral" }
+half = { version = "2.5", features = ["num-traits"] }
+rand = "0.8"
+
+[features]
+default = ["std"]
+std = ["burn/std", "burn-tensor/std", "burn/autodiff", "burn/ndarray"]
+cuda = [
+    "burn/cuda",
+    "burn-kda/cuda",
+    "burn-kda/autodiff",
+    "burn-msa/cuda",
+    "burn-msa/autodiff",
+    "burn-spectral/cuda",
+    "burn-sct/cuda",
+    "burn-rmsnorm/cuda",
+]

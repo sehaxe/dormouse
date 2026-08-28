@@ -1,0 +1,19 @@
+[package]
+name = "dormouse-serve"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+cuda = ["dormouse-core/cuda", "dormouse-train/cuda", "burn/cuda"]
+
+[dependencies]
+dormouse-core = { path = "../dormouse-core" }
+dormouse-train = { path = "../dormouse-train" }
+burn = { version = "0.22.0-pre.3", default-features = false, features = ["std"] }
+clap = { version = "4", features = ["derive"] }
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rand = "0.8"

@@ -1,0 +1,24 @@
+[workspace]
+members = [
+    "crates/dormouse-core",
+    "crates/dormouse-data",
+    "crates/dormouse-train",
+    "crates/dormouse-cli",
+    "crates/dormouse-bench",
+    "crates/dormouse-serve",
+]
+resolver = "2"
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0"
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# Same patches as aria: stale-page-safe cubecl (#1401 root fix).
+# cubek comes from crates.io (local /tmp/cubek with matmul tail fixes was
+# lost to the tmpfs wipe; registry cubek 0.3.0-pre.3 has the fp4 helpers).
+[patch.crates-io]
+cubecl-runtime = { path = "/home/sehaxe/cubecl-fix/cubecl-runtime" }
+cubecl-cuda = { path = "/home/sehaxe/cubecl-fix/cubecl-cuda" }

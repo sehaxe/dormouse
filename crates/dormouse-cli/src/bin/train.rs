@@ -1,0 +1,26 @@
+//! dormouse train - one command, CUDA by default
+use clap::Parser;
+#[derive(Parser, Debug)]
+struct Args {
+    #[arg(long, alias="data-dir")] data: String,
+    #[arg(long, default_value="small")] preset: String,
+    #[arg(long, default_value="100000")] steps: usize,
+    #[arg(long, default_value="512")] seq_len: usize,
+    #[arg(long, default_value="3")] batch: usize,
+    #[arg(long, default_value="1000", help="checkpoint every N steps (0 = off, final model still saved)")] ckpt_every: usize,
+    #[arg(long, default_value="60")] ckpt_secs: u64,
+    #[arg(long, default_value="0.0001")] lr: f64,
+    #[arg(long, default_value="0.01")] wd: f64,
+    #[arg(long, default_value="1.0")] grad_clip: f64,
+    #[arg(long, default_value="latest", help="checkpoint file name (<name>.bin)")] ckpt_name: String,
+    #[arg(long, default_value="checkpoints")] ckpt_dir: String,
+}
+fn main() {
+    let a = Args::parse();
+    let cfg = dormouse_train::TrainCfg {
+        steps: a.steps, ckpt_every: a.ckpt_every, ckpt_secs: a.ckpt_secs, log_every: 100,
+        seq_len: a.seq_len, batch: a.batch, lr: a.lr, wd: a.wd, grad_clip: a.grad_clip,
+        ckpt_name: a.ckpt_name,
+    };
+    dormouse_train::train_loop(cfg, std::path::PathBuf::from(a.data), a.preset, Some(std::path::PathBuf::from(a.ckpt_dir)));
+}
