@@ -10,6 +10,7 @@ use burn_rmsnorm::RMSNorm;
 
 use crate::attention::AdaptiveAttention;
 use crate::config::DormouseConfig;
+use crate::gr::{GatedResidual, GrState, GR_BRANCHES};
 use crate::param::{bf16_on, LinearLike};
 
 #[derive(Module, Debug)]
@@ -34,6 +35,7 @@ pub struct LoopBlock {
     pub expert_ffns: Vec<ExpertFFN>,
     pub engram: EngramModule,
     pub norm: RMSNorm,
+    pub gr: Option<GatedResidual>,
     pub halt_head: Linear,
     pub iter_embed: burn::module::Param<Tensor<2>>,
     pub residual_scale: burn::module::Param<Tensor<1>>,
@@ -63,6 +65,25 @@ impl LoopBlock {
         }
     }
 
+    /// Polar-retract every TSCT factor U/V in the block (see LinearLike).
+    pub fn retract_tsct(&mut self, iters: usize) {
+        for f in &mut self.expert_ffns {
+            f.gate_up.retract(iters);
+            f.down.retract(iters);
+        }
+        self.out_proj.retract(iters);
+        self.shared_attn.router.retract(iters);
+    }
+
+    /// Worst orthonormality error across all TSCT factors (syncs the device).
+    pub fn max_ortho(&self) -> f32 {
+        let mut m = 0.0f32;
+        for f in &self.expert_ffns {
+            m = m.max(f.gate_up.max_ortho()).max(f.down.max_ortho());
+        }
+        m.max(self.out_proj.max_ortho()).max(self.shared_attn.router.max_ortho())
+    }
+
     pub fn new(cfg: &DormouseConfig, device: &Device) -> Self {
         let d = cfg.d_model;
         let f = cfg.d_ffn;
@@ -79,6 +100,7 @@ impl LoopBlock {
             expert_ffns: (0..cfg.n_experts).map(|_| ExpertFFN::new(d, f, cfg.rank, device)).collect(),
             engram: EngramModule::new(&[4096, 4096, 4096], 32, d, 1, device),
             norm: RMSNorm::new(d, cfg.norm_eps, device),
+            gr: cfg.use_gr.then(|| GatedResidual::new(d, device)),
             halt_head: LinearConfig::new(d, 1).with_bias(false).init(device),
             iter_embed,
             residual_scale: burn::module::Param::from_tensor(Tensor::zeros([1], device)),
@@ -98,8 +120,11 @@ impl LoopBlock {
         &self,
         x: Tensor<3>,
         hashed_ids: Option<Tensor<3, Int>>,
+        host_rows: Option<Tensor<3>>,
         kda_state: Option<Tensor<4>>,
-    ) -> (Tensor<3>, Tensor<4>, Tensor<2>, Tensor<4>)
+        targets: Option<Tensor<2>>,
+        lm_head: &LinearLike,
+    ) -> (Tensor<3>, Tensor<1>, Tensor<2>, Tensor<4>)
     where
         DispatchTensor: DispatchKindConversion<B>,
     {
@@ -107,12 +132,22 @@ impl LoopBlock {
         let bf16 = bf16_on();
         let h0 = x.clone();
         let mut h = x;
+        // Gated Residual: every branch starts from the token embedding.
+        let use_gr = self.gr.is_some();
+        let mut branches: Vec<Tensor<3>> = if use_gr {
+            vec![h0.clone(); GR_BRANCHES]
+        } else {
+            Vec::new()
+        };
         let mut kda_s: Option<Tensor<4>> = kda_state;
         // PonderNet accumulators (Banino et al. 2021, arXiv:2107.05407)
         let mut not_halted = Tensor::<2>::ones([b, 1], &h.device());
         let mut out_acc = Tensor::<3>::zeros([b, t, d], &h.device());
         let mut p_rows: Vec<Tensor<2>> = Vec::with_capacity(self.max_iter);
-        let mut step_outs: Vec<Tensor<3>> = Vec::with_capacity(self.max_iter);
+        // L_Rec = mean_b Σ_n p_n·CE(ŷ_n, y), accumulated inside the loop so we
+        // never materialize/slice the [N,b,t,d] tensor: dynamic slicing of a 4D
+        // autodiff tensor crashes cubecl on sm_120 (CUDA_ERROR_ILLEGAL_ADDRESS).
+        let mut rec = Tensor::<1>::zeros([1], &h.device());
 
         for iter in 0..self.max_iter {
             let row = iter.min(self.max_iter - 1);
@@ -122,10 +157,31 @@ impl LoopBlock {
                 .clone()
                 .slice([row..row + 1, 0..d])
                 .reshape([1, 1, d]);
-            let h_ctx = if bf16 {
-                h.clone() + iter_ctx.cast(FloatDType::BF16)
+            // GR read: normalized gated average of the branches (report
+            // Eq. 30-32) replaces the pre-norm + ReZero pair.
+            let mut gr_state: Option<GrState> = None;
+            let h_ctx = if use_gr {
+                let gr = self.gr.as_ref().unwrap();
+                let (x_in, st) = gr.read::<B>(&branches);
+                gr_state = Some(st);
+                if bf16 {
+                    x_in.clone() + iter_ctx.cast(FloatDType::BF16)
+                } else {
+                    x_in.clone() + iter_ctx
+                }
             } else {
-                h.clone() + iter_ctx
+                if bf16 {
+                    h.clone() + iter_ctx.cast(FloatDType::BF16)
+                } else {
+                    h.clone() + iter_ctx
+                }
+            };
+            // Pre-norm for the block body (identity under GR: the read
+            // already normalized).
+            let normed = if use_gr {
+                h_ctx.clone()
+            } else {
+                self.norm.forward(h_ctx.clone())
             };
 
             // Controller routing on [h_ctx, h0]
@@ -152,7 +208,15 @@ impl LoopBlock {
             };
             kda_s = Some(s_new);
             let msa_out = if use_msa && t > 1 && t >= self.shared_attn.block_size {
-                self.shared_attn.msa.forward::<B>(normed.clone()).output
+                // burn-msa kernels are f32-only: a bf16 input makes them
+                // read the buffer as f32 (twice the bytes) and fault with
+                // CUDA_ERROR_ILLEGAL_ADDRESS (measured 2026-08-29).
+                let msa_in = if bf16 {
+                    normed.clone().cast(FloatDType::F32)
+                } else {
+                    normed.clone()
+                };
+                self.shared_attn.msa.forward::<B>(msa_in).output
             } else {
                 Tensor::zeros([b, t, d], &h.device())
             };
@@ -164,14 +228,37 @@ impl LoopBlock {
 
             // Engram (FNV hashed ids) with memory weight
             let engram_a = if use_engram {
-                match &hashed_ids {
-                    Some(hashed) => self
-                        .engram
-                        .forward((*hashed).clone(), h_ctx.clone().reshape([b, t, 1, d]))
-                        .reshape([b, t, d])
-                        .reshape([b * t, d])
-                        .mul(w_mem),
-                    None => Tensor::zeros([b * t, d], &h.device()),
+                match &host_rows {
+                    // RAM-offload path: rows already gathered on the host.
+                    Some(rows) => {
+                        let eg_in = if bf16 {
+                            h_ctx.clone().reshape([b, t, 1, d]).cast(FloatDType::F32)
+                        } else {
+                            h_ctx.clone().reshape([b, t, 1, d])
+                        };
+                        self.engram
+                            .forward_embeds(rows.clone(), eg_in)
+                            .reshape([b, t, d])
+                            .reshape([b * t, d])
+                            .mul(w_mem)
+                    }
+                    None => match &hashed_ids {
+                        Some(hashed) => {
+                            // burn-engram kernels are f32-only (ILLEGAL_ADDRESS
+                            // on bf16, measured 2026-08-29).
+                            let eg_in = if bf16 {
+                                h_ctx.clone().reshape([b, t, 1, d]).cast(FloatDType::F32)
+                            } else {
+                                h_ctx.clone().reshape([b, t, 1, d])
+                            };
+                            self.engram
+                                .forward((*hashed).clone(), eg_in)
+                                .reshape([b, t, d])
+                                .reshape([b * t, d])
+                                .mul(w_mem)
+                        }
+                        None => Tensor::zeros([b * t, d], &h.device()),
+                    },
                 }
             } else {
                 Tensor::zeros([b * t, d], &h.device())
@@ -188,9 +275,18 @@ impl LoopBlock {
             }
             let ffn = ffn.mul(w_ffn).reshape([b, t, d]);
 
-            // ReZero residual
-            let scale = self.residual_scale.val().clone().reshape([1, 1, 1]);
-            h = h_ctx.clone() + (attn.reshape([b, t, d]) + engram_a.reshape([b, t, d]) + ffn).mul(scale);
+            // ReZero residual (or GR write: per-branch scalar deposit, Eq. 33-34).
+            let y = attn.reshape([b, t, d]) + engram_a.reshape([b, t, d]) + ffn;
+            if use_gr {
+                let gr = self.gr.as_ref().unwrap();
+                branches = gr.write::<B>(&branches, gr_state.as_ref().unwrap(), y);
+                // Readout reads the normalized block input; the branches
+                // carry the accumulated state for the next iteration.
+                h = h_ctx.clone();
+            } else {
+                let scale = self.residual_scale.val().clone().reshape([1, 1, 1]);
+                h = h_ctx.clone() + y.mul(scale);
+            }
 
             // PonderNet readout + probabilistic halting:
             // λ_n = cond. halt prob; p_n = λ_n · Π_{j<n}(1-λ_j) (truncated geometric);
@@ -200,14 +296,29 @@ impl LoopBlock {
                 self.halt_head.forward(h_ctx.clone().mean_dim(1).reshape([b, d])),
             ); // [b,1]
             let p_n = lam.clone() * not_halted.clone();
-            out_acc = out_acc + step_out.mul(p_n.clone().unsqueeze_dim::<3>(2));
+            out_acc = out_acc + step_out.clone().mul(p_n.clone().unsqueeze_dim::<3>(2));
             p_rows.push(p_n.clone());
             not_halted = not_halted * (Tensor::<2>::ones([b, 1], &h.device()) - lam.clone());
-            step_outs.push(h.clone().reshape([b, t, d]));
+            // L_Rec: per-step CE (fp32 logits) weighted by the halting dist p_n.
+            if let Some(tgt) = &targets {
+                let v = tgt.dims()[1];
+                let so = if bf16 { step_out.clone().cast(FloatDType::F32) } else { step_out.clone() };
+                let logits_n = lm_head
+                    .forward::<B>(so.reshape([b * t, d]))
+                    .reshape([b * t, v]);
+                let ce = (burn::tensor::activation::log_softmax(logits_n, 1) * tgt.clone())
+                    .sum_dim(1)
+                    .neg()
+                    .reshape([b, t])
+                    .sum_dim(1)
+                    .div_scalar(t as f32); // [b]
+                let pn = p_n.clone().reshape([b, 1]); // [b,1]
+                rec = rec + (pn * ce.reshape([b, 1])).sum_dim(0).reshape([1]);
+            }
         }
-        let step_hiddens = Tensor::stack(step_outs, 0); // [N, b, t, d]
+        let rec = rec.div_scalar(b as f32); // mean over batch
         let p_dist = Tensor::cat(p_rows, 1); // [b, N]
         let kda = kda_s.unwrap_or_else(|| Tensor::zeros([1, 1, 1, 1], &h.device()));
-        (out_acc, step_hiddens, p_dist, kda)
+        (out_acc, rec, p_dist, kda)
     }
 }

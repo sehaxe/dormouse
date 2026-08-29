@@ -14,7 +14,10 @@ edition = "2021"
 license = "AGPL-3.0"
 [profile.release]
 lto = "thin"
-codegen-units = 1
+# codegen-units = 1 serializes LLVM codegen per crate: with 20 cores the CPU
+# idles and builds drag. 16 keeps every core busy; the training loop is GPU
+# (cubecl) bound, so the runtime cost vs 1 is negligible.
+codegen-units = 16
 
 # Same patches as aria: stale-page-safe cubecl (#1401 root fix).
 # cubek comes from crates.io (local /tmp/cubek with matmul tail fixes was

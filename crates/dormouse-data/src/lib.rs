@@ -200,6 +200,12 @@ impl ByteStream {
 
     /// Next `(bytes, hashes)` batch. Falls back to padding when data is short.
     pub fn next_batch(&mut self) -> (Vec<u8>, Vec<i64>) {
+        self.next_batch_with_tables([4096, 4096, 4096])
+    }
+
+    /// Next batch with explicit n-gram table sizes (RAM-offload tables can
+    /// be millions of slots; the hashes are produced modulo the table size).
+    pub fn next_batch_with_tables(&mut self, tables: [usize; 3]) -> (Vec<u8>, Vec<i64>) {
         let need = self.batch * self.seq_len;
         if self.pos + need > self.buf.len() {
             self.refill();
@@ -218,7 +224,6 @@ impl ByteStream {
         if bytes.len() < need {
             bytes.extend(std::iter::repeat(b' ').take(need - bytes.len()));
         }
-        let tables = [4096usize, 4096, 4096];
         let hashes = self.hashes(&bytes, &tables);
         (bytes, hashes)
     }

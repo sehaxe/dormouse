@@ -24,6 +24,11 @@ pub struct DormouseConfig {
     /// burn-kda chunk-WY backward dominates step time (~3x slowdown at
     /// batch 12/s512). Default off for speed; DM_NO_KDA / DM_KDA=1 override.
     pub use_kda: bool,
+    /// Gated Residual (Qwen3.8-Flash-Next §2.2) instead of pre-norm + ReZero:
+    /// 4-branch residual stream, sigmoid-gated read, scalar writes. Off by
+    /// default (checkpoint-compatible); the report's stability/loss wins come
+    /// from this, so flip it on once the A/B shows it on this box.
+    pub use_gr: bool,
     pub keep_frac: f32,
     pub dropout: f32,
     pub n_experts: usize,
@@ -54,6 +59,7 @@ impl DormouseConfig {
             msa_block: 32,
             use_msa: true,
             use_kda: true,
+            use_gr: false,
             keep_frac: 0.5,
             dropout: 0.0,
             n_experts: 3,
@@ -81,6 +87,7 @@ impl DormouseConfig {
             msa_block: 32,
             use_msa: true,
             use_kda: true,
+            use_gr: false,
             keep_frac: 0.5,
             dropout: 0.0,
             n_experts: 3,
@@ -109,6 +116,7 @@ impl DormouseConfig {
             msa_block: 32,
             use_msa: true,
             use_kda: true,
+            use_gr: false,
             keep_frac: 0.5,
             dropout: 0.0,
             n_experts: 4,

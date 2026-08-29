@@ -601,7 +601,7 @@ checksum = "fc5842a38815d2ba8647e82379d67ece6a4e78e9bda996decf896ad01d39183b"
 dependencies = [
  "burn-backend",
  "burn-std",
- "derive-new",
+ "derive-new 0.7.0",
  "hashbrown 0.16.1",
  "log",
  "num-traits",
@@ -620,7 +620,7 @@ dependencies = [
  "burn-std",
  "bytemuck",
  "cubecl",
- "derive-new",
+ "derive-new 0.7.0",
  "enumset",
  "hashbrown 0.16.1",
  "num-traits",
@@ -666,7 +666,7 @@ dependencies = [
  "burn-pack",
  "burn-std",
  "burn-tensor",
- "derive-new",
+ "derive-new 0.7.0",
  "half",
  "hashbrown 0.16.1",
  "log",
@@ -704,7 +704,7 @@ dependencies = [
  "burn-std",
  "cubecl",
  "cubek",
- "derive-new",
+ "derive-new 0.7.0",
  "futures-lite",
  "log",
  "serde",
@@ -723,7 +723,7 @@ dependencies = [
  "burn-std",
  "cubecl",
  "cubek",
- "derive-new",
+ "derive-new 0.7.0",
  "hashbrown 0.16.1",
  "rmp-serde",
  "serde",
@@ -748,7 +748,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac7e4fdb1241574b8c19828ebb2cef5e6a1ff7634c87eb3097cfa34567058c49"
 dependencies = [
  "csv",
- "derive-new",
+ "derive-new 0.7.0",
  "dirs",
  "rand 0.10.2",
  "rmp-serde",
@@ -766,7 +766,7 @@ version = "0.22.0-pre.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e0d979105178cfd634211192a18329c265718f22fb14d966e3f115b34711da57"
 dependencies = [
- "derive-new",
+ "derive-new 0.7.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -829,7 +829,7 @@ dependencies = [
  "burn-backend",
  "burn-ir",
  "burn-std",
- "derive-new",
+ "derive-new 0.7.0",
  "hashbrown 0.16.1",
  "log",
  "serde",
@@ -891,6 +891,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "burn-muon-plus"
+version = "0.1.0"
+dependencies = [
+ "burn",
+ "burn-cubecl",
+ "burn-cuda",
+ "burn-pack",
+ "burn-tensor",
+ "cubecl",
+ "derive-new 0.6.0",
+ "serde",
+]
+
+[[package]]
 name = "burn-ndarray"
 version = "0.22.0-pre.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -937,7 +951,7 @@ dependencies = [
  "burn-core",
  "burn-derive",
  "burn-pack",
- "derive-new",
+ "derive-new 0.7.0",
  "hashbrown 0.16.1",
  "log",
  "num-traits",
@@ -963,7 +977,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4244322b169bad6fa8572cec96a86d7602122858619200ea3e07ea5c35ac28d6"
 dependencies = [
  "burn-core",
- "derive-new",
+ "derive-new 0.7.0",
  "log",
  "rand 0.10.2",
 ]
@@ -1040,7 +1054,7 @@ dependencies = [
  "cubecl-environment",
  "cubecl-zspace",
  "data-encoding",
- "derive-new",
+ "derive-new 0.7.0",
  "enumset",
  "half",
  "hashbrown 0.16.1",
@@ -1097,7 +1111,7 @@ dependencies = [
  "burn-dispatch",
  "burn-std",
  "colored",
- "derive-new",
+ "derive-new 0.7.0",
  "num-traits",
  "serde",
 ]
@@ -1114,7 +1128,7 @@ dependencies = [
  "burn-optim",
  "burn-rl",
  "burn-std",
- "derive-new",
+ "derive-new 0.7.0",
  "log",
  "nvml-wrapper",
  "rand 0.10.2",
@@ -1144,7 +1158,7 @@ dependencies = [
  "burn-std",
  "bytemuck",
  "cubecl",
- "derive-new",
+ "derive-new 0.7.0",
  "half",
  "image",
  "macerator",
@@ -1658,7 +1672,7 @@ dependencies = [
  "bytemuck",
  "cfg_aliases",
  "cubecl-environment",
- "derive-new",
+ "derive-new 0.7.0",
  "derive_more",
  "float4",
  "float8",
@@ -1688,7 +1702,7 @@ dependencies = [
  "cubecl-macros",
  "cubecl-runtime",
  "cubecl-zspace",
- "derive-new",
+ "derive-new 0.7.0",
  "derive_more",
  "enumset",
  "float-ord",
@@ -1718,7 +1732,7 @@ dependencies = [
  "cubecl-environment",
  "cubecl-opt",
  "cubecl-runtime",
- "derive-new",
+ "derive-new 0.7.0",
  "derive_more",
  "half",
  "itertools 0.15.0",
@@ -1743,7 +1757,7 @@ dependencies = [
  "cubecl-llvm",
  "cubecl-runtime",
  "cubecl-std",
- "derive-new",
+ "derive-new 0.7.0",
  "libc",
  "log",
  "pliron",
@@ -1763,7 +1777,7 @@ dependencies = [
  "cubecl-environment",
  "cubecl-runtime",
  "cudarc",
- "derive-new",
+ "derive-new 0.7.0",
  "half",
  "log",
  "serde",
@@ -1819,7 +1833,7 @@ dependencies = [
  "cubecl-environment",
  "cubecl-hip-sys",
  "cubecl-runtime",
- "derive-new",
+ "derive-new 0.7.0",
  "half",
  "log",
  "paste",
@@ -1847,7 +1861,7 @@ dependencies = [
  "cubecl-common",
  "cubecl-environment",
  "cubecl-macros-internal",
- "derive-new",
+ "derive-new 0.7.0",
  "derive_more",
  "enumset",
  "float-ord",
@@ -1878,7 +1892,7 @@ dependencies = [
  "cubecl-environment",
  "cubecl-opt",
  "cubecl-runtime",
- "derive-new",
+ "derive-new 0.7.0",
  "half",
  "llvm-sys",
  "pliron",
@@ -1894,7 +1908,7 @@ checksum = "3b4166fb3d4c957bf5e8896f1528370992f748cfdefbb85e33375c6d23cfa67f"
 dependencies = [
  "cubecl-common",
  "darling 0.24.1",
- "derive-new",
+ "derive-new 0.7.0",
  "derive_more",
  "ident_case",
  "inflections",
@@ -1928,7 +1942,7 @@ dependencies = [
  "cubecl-core",
  "cubecl-environment",
  "cubecl-ir",
- "derive-new",
+ "derive-new 0.7.0",
  "float-ord",
  "hashbrown 0.17.1",
  "itertools 0.15.0",
@@ -1954,7 +1968,7 @@ dependencies = [
  "cubecl-environment",
  "cubecl-ir",
  "cubecl-zspace",
- "derive-new",
+ "derive-new 0.7.0",
  "derive_more",
  "enumset",
  "futures-util",
@@ -2005,7 +2019,7 @@ dependencies = [
  "cubecl-ir",
  "cubecl-opt",
  "cubecl-runtime",
- "derive-new",
+ "derive-new 0.7.0",
  "derive_more",
  "half",
  "hashbrown 0.17.1",
@@ -2025,7 +2039,7 @@ version = "0.11.0-pre.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2bee1ebdfc423d5395e1158cdf73554cd7b2db726c0d2b0ac356c7349193fa04"
 dependencies = [
- "derive-new",
+ "derive-new 0.7.0",
  "serde",
  "smallvec",
 ]
@@ -2075,7 +2089,7 @@ dependencies = [
  "cubecl-common",
  "cubek-matmul",
  "cubek-std",
- "derive-new",
+ "derive-new 0.7.0",
  "enumset",
  "half",
  "serde",
@@ -2327,6 +2341,17 @@ checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 
 [[package]]
 name = "derive-new"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d150dea618e920167e5973d70ae6ece4385b7164e0d799fe7c122dd0a5d912ad"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "derive-new"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2cdc8d50f426189eef89dac62fabfa0abb27d5cc008f25bf4156a0203325becc"
@@ -2508,6 +2533,7 @@ dependencies = [
  "burn-bitnet",
  "burn-cuda",
  "burn-dispatch",
+ "burn-muon-plus",
  "burn-ndarray",
  "burn-spectral",
  "burn-tensor",

@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-cuda = ["burn/cuda", "burn/autodiff", "dormouse-core/cuda"]
+cuda = ["burn/cuda", "burn/autodiff", "dormouse-core/cuda", "burn-muon-plus/cuda"]
 
 [dependencies]
 dormouse-core = { path = "../dormouse-core" }
@@ -13,6 +13,7 @@ dormouse-data = { path = "../dormouse-data" }
 dormouse-bench = { path = "../dormouse-bench" }
 burn-spectral = { path = "../../../burn-fused/crates/burn-spectral" }
 burn-bitnet = { path = "../../../burn-fused/crates/burn-bitnet" }
+burn-muon-plus = { path = "../../../burn-fused/crates/burn-muon-plus" }
 burn = { version = "0.22.0-pre.3", default-features = false, features = ["std", "autodiff", "optim"] }
 burn-tensor = { version = "0.22.0-pre.3", default-features = false }
 burn-ndarray = { version = "0.22.0-pre.3", features = ["blas-openblas"] }

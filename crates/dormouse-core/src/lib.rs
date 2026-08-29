@@ -1,6 +1,7 @@
 //! dormouse-core - all-bf16 mini Aria on burn-fused kernels (CUDA)
 pub mod attention;
 pub mod config;
+pub mod gr;
 pub mod loop_block;
 pub mod model;
 pub mod param;

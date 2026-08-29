@@ -7,6 +7,7 @@ struct Args {
     #[arg(long, default_value="100000")] steps: usize,
     #[arg(long, default_value="512")] seq_len: usize,
     #[arg(long, default_value="3")] batch: usize,
+    #[arg(long, default_value="100")] log_every: usize,
     #[arg(long, default_value="1000", help="checkpoint every N steps (0 = off, final model still saved)")] ckpt_every: usize,
     #[arg(long, default_value="60")] ckpt_secs: u64,
     #[arg(long, default_value="0.0001")] lr: f64,
@@ -20,8 +21,9 @@ struct Args {
 fn main() {
     let a = Args::parse();
     let cfg = dormouse_train::TrainCfg {
-        steps: a.steps, ckpt_every: a.ckpt_every, ckpt_secs: a.ckpt_secs, log_every: 100,
+        steps: a.steps, ckpt_every: a.ckpt_every, ckpt_secs: a.ckpt_secs,
         seq_len: a.seq_len, batch: a.batch, lr: a.lr, wd: a.wd, grad_clip: a.grad_clip,
+        log_every: a.log_every,
         ckpt_name: a.ckpt_name, eval_every: a.eval_every,
     };
     dormouse_train::train_loop(

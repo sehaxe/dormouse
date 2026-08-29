@@ -49,15 +49,22 @@ impl DormouseModel {
     where
         DispatchTensor: DispatchKindConversion<B>,
     {
-        self.forward_with_hidden::<B>(input_ids, hashed_ids).0
+        self.forward_with_hidden::<B>(input_ids, hashed_ids, None, None).0
     }
 
-    /// Returns (logits, per-step hidden states [N,b,t,d], p_dist [b,N], kda).
+    /// Returns (logits, L_Rec [1], p_dist [b,N], kda). When `targets` is Some,
+    /// the per-step reconstruction loss is accumulated inside the loop block so
+    /// the model never slices a 4D autodiff tensor (cubecl/sm_120 stability).
+    /// `host_rows` carries pre-gathered n-gram rows `[b,t,3*32]` for the
+    /// RAM-offload path (see dormouse-train offload); when None, `hashed_ids`
+    /// drives the in-model tables.
     pub fn forward_with_hidden<B: Backend>(
         &self,
         input_ids: Tensor<2, Int>,
         hashed_ids: Option<Tensor<3, Int>>,
-    ) -> (Tensor<3>, Tensor<4>, Tensor<2>, Tensor<4>)
+        host_rows: Option<Tensor<3>>,
+        targets: Option<Tensor<2, Int>>,
+    ) -> (Tensor<3>, Tensor<1>, Tensor<2>, Tensor<4>)
     where
         DispatchTensor: DispatchKindConversion<B>,
     {
@@ -67,8 +74,12 @@ impl DormouseModel {
         } else {
             x
         };
-        let (out_acc, step_hiddens, p_dist, kda) =
-            self.loop_block.forward_full_state::<B>(x, hashed_ids, None);
+        let [b, t, _d] = x.dims();
+        let v = self.vocab_size;
+        let tgt = targets.map(|tg| tg.reshape([b * t]).one_hot::<2>(v).cast(FloatDType::F32));
+        let (out_acc, rec, p_dist, kda) =
+            self.loop_block
+                .forward_full_state::<B>(x, hashed_ids, host_rows, None, tgt, &self.lm_head);
         // loop activations may be bf16; the final norm+head compute in fp32
         // (bf16 logits make the softmax/CE numerically unstable -> NaN).
         let h = if crate::param::bf16_on() {
@@ -76,45 +87,20 @@ impl DormouseModel {
         } else {
             self.norm.forward(out_acc)
         };
-        let b = h.dims()[0];
-        let t = h.dims()[1];
         let logits = self
             .lm_head
             .forward::<B>(h.reshape([b * t, self.d_model]))
             .reshape([b, t, self.vocab_size]);
-        (logits, step_hiddens, p_dist, kda)
+        (logits, rec, p_dist, kda)
     }
 
-    /// PonderNet loss (Banino et al. 2021): L = Σ_n p_n·CE(ŷ_n, y) + β·KL(p || Geom(λ_p)).
-    pub fn loss<B: Backend>(
-        &self,
-        step_hiddens: Tensor<4>,
-        p_dist: Tensor<2>,
-        targets: Tensor<2, Int>,
-    ) -> Tensor<1>
+    /// PonderNet loss (Banino et al. 2021): L = L_Rec + β·KL(p || Geom(λ_p)).
+    pub fn loss<B: Backend>(&self, rec_ce: Tensor<1>, p_dist: Tensor<2>) -> Tensor<1>
     where
         DispatchTensor: DispatchKindConversion<B>,
     {
-        let [n, b, t, d] = step_hiddens.dims();
-        let v = self.vocab_size;
-        let tgt = targets.reshape([b * t]).one_hot::<2>(v).cast(FloatDType::F32);
-        // L_Rec: expectation of the reconstruction loss over halting steps.
-        let mut rec = Tensor::<1>::zeros([1], &step_hiddens.device());
-        for i in 0..n {
-            let h_n = step_hiddens
-                .clone()
-                .slice([i..i + 1, 0..b, 0..t, 0..d])
-                .reshape([b * t, d]);
-            let logits_n = self.lm_head.forward::<B>(h_n).reshape([b * t, v]);
-            let ce = burn::tensor::loss::cross_entropy_with_logits(logits_n, tgt.clone())
-                .reshape([b, t])
-                .mean_dim(1); // [b]
-            let pn = p_dist.clone().slice([0..b, i..i + 1]).reshape([b, 1]); // [b,1]
-            rec = rec + (pn * ce.reshape([b, 1])).sum_dim(0).reshape([1]);
-        }
-        let rec = rec.div_scalar(b as f32); // mean over batch
         let kl = self.ponder_kl(p_dist, self.ponder_prior); // [1]
-        rec + kl.mul_scalar(self.ponder_beta)
+        rec_ce + kl.mul_scalar(self.ponder_beta)
     }
 
     /// KL(p_dist || truncated-geometric(λ_p)); p_dist is [b, N].
@@ -141,6 +127,29 @@ impl DormouseModel {
         // Mean over batch and steps -> [1]. The double sum + reshape is robust
         // to whether sum_dim keeps the reduced dimension.
         term.sum_dim(1).sum_dim(0).reshape([1]).div_scalar((b * n) as f32)
+    }
+
+    /// Apply a quantization format to every TSCT factor in the model
+    /// (experts, readout/router projections, lm_head).
+    pub fn set_quant_all(&mut self, quant: burn_spectral::QuantFormat) {
+        self.loop_block.set_quant_all(quant);
+        self.loop_block.out_proj.set_quant(quant);
+        self.loop_block.shared_attn.router.set_quant(quant);
+        self.lm_head.set_quant(quant);
+    }
+
+    /// Polar-retract every TSCT factor U/V to orthonormal (on device, keeps
+    /// autodiff tracking). Call every step during training: without it the
+    /// factors drift and the quantized forward degrades into NaN.
+    pub fn retract_tsct(&mut self, iters: usize) {
+        self.loop_block.retract_tsct(iters);
+        self.lm_head.retract(iters);
+    }
+
+    /// Worst orthonormality error across all TSCT factors (syncs the device;
+    /// monitor at cadence, not per step).
+    pub fn max_ortho(&self) -> f32 {
+        self.loop_block.max_ortho().max(self.lm_head.max_ortho())
     }
 
     /// Inference: bytes -> last-token logits [vocab].

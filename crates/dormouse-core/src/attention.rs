@@ -31,6 +31,10 @@ impl AdaptiveAttention {
             hidden_size: d_model,
             num_heads: n_heads,
             head_dim,
+            // Report §2.1.1 wants the short causal conv, but on this box it
+            // made fp32+AdamW NaN at ~step 60 (measured 2026-08-29; without
+            // it the same recipe ran 150+ steps clean). Keep off until the
+            // instability is traced inside burn-kda.
             use_short_conv: false,
             chunk_size: 16,
             ..Default::default()

@@ -79,6 +79,29 @@ impl LinearLike {
             l.set_quant(quant);
         }
     }
+
+    /// Polar-retract the TSCT masters U/V to orthonormal (burn-spectral NS,
+    /// on device, keeps autodiff tracking). No-op for dense/sct variants.
+    /// Without periodic retract the factors drift and the quantized forward
+    /// degrades (bf16_KERNEL_PLAN: retract every 1 step, monitor max_ortho).
+    pub fn retract(&mut self, iters: usize) {
+        if let LinearLikeInner::Tsct(l) = &mut self.inner {
+            l.retract(iters);
+        }
+    }
+
+    /// Worst-case orthonormality error of the TSCT masters (0 for dense/sct).
+    /// Syncs the device (reads back); call at monitor cadence, not per step.
+    pub fn max_ortho(&self) -> f32 {
+        match &self.inner {
+            LinearLikeInner::Tsct(l) => {
+                let u = burn_spectral::ortho_error(&l.u.val());
+                let v = burn_spectral::ortho_error(&l.v.val());
+                u.max(v)
+            }
+            _ => 0.0,
+        }
+    }
 }
 
 impl LinearLike {

@@ -18,6 +18,7 @@
 
 ## 3. Оптимизатор
 
+- Muon+ подключён (burn-fused, OPT=mix): 2D линейные карты, ns=8, ColRow; n-gram таблицы на Adam wd=0; остальное AdamW (Adan — OPT=mix-adan). Политика + validate_routing в `train/src/optim.rs`.
 - AdamW/Muon moments bf16 + stochastic rounding
 - Loss scaling 1024 for CE/JEPA/KoLeo
 - MuonQ 4-bit later 7× saving
