@@ -284,8 +284,8 @@ pub fn train_loop(cfg: TrainCfg, data: PathBuf, preset: String, ckpt_dir: Option
         let shifted: Vec<i64> = bytes.iter().skip(1).chain(std::iter::once(&bytes[0])).map(|&b| b as i64).collect();
         let y: Tensor<2, Int> = Tensor::from_data(TensorData::new(shifted, [cfg.batch, cfg.seq_len]), &device);
         for _ in 0..2 {
-            let (logits, ponder) = model.forward_with_hidden::<Backend>(x.clone(), Some(h.clone()));
-            let loss = model.loss::<Backend>(logits, y.clone(), ponder);
+        let (_logits, sh, pd, _k) = model.forward_with_hidden::<Backend>(x.clone(), Some(h.clone()));
+        let loss = model.loss::<Backend>(sh, pd, y.clone());
             let _g = loss.backward();
         }
         memory_cleanup(&device);
@@ -299,12 +299,12 @@ pub fn train_loop(cfg: TrainCfg, data: PathBuf, preset: String, ckpt_dir: Option
         let (x, h) = bytes_to_tensors::<Backend>(&bytes, &hashes, cfg.seq_len, cfg.batch, &device);
         let shifted: Vec<i64> = bytes.iter().skip(1).chain(std::iter::once(&bytes[0])).map(|&b| b as i64).collect();
         let y: Tensor<2, Int> = Tensor::from_data(TensorData::new(shifted, [cfg.batch, cfg.seq_len]), &device);
-        let (lq, pq) = model.forward_with_hidden::<Backend>(x.clone(), Some(h.clone()));
-        let loss_q: f32 = model.loss::<Backend>(lq.clone(), y.clone(), pq).try_into_scalar().unwrap_or(f32::NAN);
+        let (lq, sh_q, pd_q, _k) = model.forward_with_hidden::<Backend>(x.clone(), Some(h.clone()));
+        let loss_q: f32 = model.loss::<Backend>(sh_q, pd_q, y.clone()).try_into_scalar().unwrap_or(f32::NAN);
         let mut ref_model = model.clone();
         ref_model.loop_block.set_quant_all(burn_spectral::QuantFormat::Fp32);
-        let (lr, pr) = ref_model.forward_with_hidden::<Backend>(x, Some(h));
-        let loss_r: f32 = ref_model.loss::<Backend>(lr.clone(), y, pr).try_into_scalar().unwrap_or(f32::NAN);
+        let (lr, sh_r, pd_r, _k) = ref_model.forward_with_hidden::<Backend>(x, Some(h));
+        let loss_r: f32 = ref_model.loss::<Backend>(sh_r, pd_r, y).try_into_scalar().unwrap_or(f32::NAN);
         let vq: Vec<f32> = lq.into_data().try_to_vec().unwrap_or_default();
         let vr: Vec<f32> = lr.into_data().try_to_vec().unwrap_or_default();
         println!("check sums: q={:.4} ref={:.4} lens={}/{}", vq.iter().sum::<f32>(), vr.iter().sum::<f32>(), vq.len(), vr.len());
@@ -354,8 +354,9 @@ pub fn train_loop(cfg: TrainCfg, data: PathBuf, preset: String, ckpt_dir: Option
         phashes = nh;
         pshift = bytes.iter().skip(1).chain(std::iter::once(&bytes[0])).map(|&b| b as i64).collect();
 
-        let (logits, ponder) = model.forward_with_hidden::<Backend>(x, Some(h));
-        let loss = model.loss::<Backend>(logits, y, ponder);
+        let (_logits, step_hiddens, p_dist, _kda) =
+            model.forward_with_hidden::<Backend>(x, Some(h));
+        let loss = model.loss::<Backend>(step_hiddens, p_dist, y);
         let t_fwd = std::time::Instant::now();
         let ce: f32 = match loss.clone().try_into_scalar() {
             Ok(v) => v,

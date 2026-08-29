@@ -27,6 +27,10 @@ pub struct DormouseConfig {
     pub keep_frac: f32,
     pub dropout: f32,
     pub n_experts: usize,
+    /// PonderNet KL weight β (Banino et al. 2021).
+    pub ponder_beta: f32,
+    /// PonderNet geometric-prior parameter λ_p (sets expected halting steps ≈ 1/λ_p).
+    pub ponder_prior: f32,
 }
 
 impl DormouseConfig {
@@ -53,6 +57,8 @@ impl DormouseConfig {
             keep_frac: 0.5,
             dropout: 0.0,
             n_experts: 3,
+            ponder_beta: 0.01,
+            ponder_prior: 2.0 / 9.0,
         }
     }
     pub fn base() -> Self {
@@ -78,6 +84,8 @@ impl DormouseConfig {
             keep_frac: 0.5,
             dropout: 0.0,
             n_experts: 3,
+            ponder_beta: 0.01,
+            ponder_prior: 2.0 / 9.0,
         }
     }
     /// 1B config - d=2048, 24 layers equivalent via loop 8*3 experts
@@ -104,6 +112,8 @@ impl DormouseConfig {
             keep_frac: 0.5,
             dropout: 0.0,
             n_experts: 4,
+            ponder_beta: 0.01,
+            ponder_prior: 2.0 / 13.0,
         }
     }
 }

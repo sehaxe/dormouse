@@ -99,7 +99,7 @@ impl LoopBlock {
         x: Tensor<3>,
         hashed_ids: Option<Tensor<3, Int>>,
         kda_state: Option<Tensor<4>>,
-    ) -> (Tensor<3>, Tensor<1>, Tensor<1>, Tensor<4>)
+    ) -> (Tensor<3>, Tensor<4>, Tensor<2>, Tensor<4>)
     where
         DispatchTensor: DispatchKindConversion<B>,
     {
@@ -107,9 +107,12 @@ impl LoopBlock {
         let bf16 = bf16_on();
         let h0 = x.clone();
         let mut h = x;
-        let mut ponder = Tensor::<1>::zeros([1], &h.device());
-        let mod_loss = Tensor::<1>::zeros([1], &h.device());
         let mut kda_s: Option<Tensor<4>> = kda_state;
+        // PonderNet accumulators (Banino et al. 2021, arXiv:2107.05407)
+        let mut not_halted = Tensor::<2>::ones([b, 1], &h.device());
+        let mut out_acc = Tensor::<3>::zeros([b, t, d], &h.device());
+        let mut p_rows: Vec<Tensor<2>> = Vec::with_capacity(self.max_iter);
+        let mut step_outs: Vec<Tensor<3>> = Vec::with_capacity(self.max_iter);
 
         for iter in 0..self.max_iter {
             let row = iter.min(self.max_iter - 1);
@@ -185,17 +188,26 @@ impl LoopBlock {
             }
             let ffn = ffn.mul(w_ffn).reshape([b, t, d]);
 
-            // PonderNet halt lambda over current hidden
-            let lam = activation::sigmoid(self.halt_head.forward(h_ctx.clone().mean_dim(1)));
-            ponder = ponder + lam.mean(); // halting term (weight applied in loss)
-
             // ReZero residual
             let scale = self.residual_scale.val().clone().reshape([1, 1, 1]);
-            h = h_ctx + (attn.reshape([b, t, d]) + engram_a.reshape([b, t, d]) + ffn).mul(scale);
+            h = h_ctx.clone() + (attn.reshape([b, t, d]) + engram_a.reshape([b, t, d]) + ffn).mul(scale);
+
+            // PonderNet readout + probabilistic halting:
+            // λ_n = cond. halt prob; p_n = λ_n · Π_{j<n}(1-λ_j) (truncated geometric);
+            // output accumulates the p-weighted expectation of per-step logits.
+            let step_out = self.out_proj.forward::<B>(h.clone().reshape([b * t, d])).reshape([b, t, d]);
+            let lam = activation::sigmoid(
+                self.halt_head.forward(h_ctx.clone().mean_dim(1).reshape([b, d])),
+            ); // [b,1]
+            let p_n = lam.clone() * not_halted.clone();
+            out_acc = out_acc + step_out.mul(p_n.clone().unsqueeze_dim::<3>(2));
+            p_rows.push(p_n.clone());
+            not_halted = not_halted * (Tensor::<2>::ones([b, 1], &h.device()) - lam.clone());
+            step_outs.push(h.clone().reshape([b, t, d]));
         }
-        // final readout projection
-        let out = self.out_proj.forward::<B>(h.clone().reshape([b * t, d])).reshape([b, t, d]);
+        let step_hiddens = Tensor::stack(step_outs, 0); // [N, b, t, d]
+        let p_dist = Tensor::cat(p_rows, 1); // [b, N]
         let kda = kda_s.unwrap_or_else(|| Tensor::zeros([1, 1, 1, 1], &h.device()));
-        (out, ponder, mod_loss, kda)
+        (out_acc, step_hiddens, p_dist, kda)
     }
 }
