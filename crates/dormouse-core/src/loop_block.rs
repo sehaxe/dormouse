@@ -183,6 +183,31 @@ impl LoopBlock {
             } else {
                 self.norm.forward(h_ctx.clone())
             };
+            // BitNet a4.8-style activation quantization (STE, f32 graph):
+            // FFN activations at DM_ACT_QUANT bits, the attention path at
+            // max(bits, 8) - attention is the sensitive part (paper keeps
+            // it higher precision). The quantizer output is f32, so this is
+            // orthogonal to the BF16=1 storage mode.
+            let act_bits: Option<u32> = std::env::var("DM_ACT_QUANT")
+                .ok()
+                .and_then(|v| v.parse().ok());
+            let normed_f = if bf16 {
+                normed.cast(FloatDType::F32)
+            } else {
+                normed.clone()
+            };
+            let attn_bits = act_bits.map(|bits| bits.max(8));
+            let normed_attn = match attn_bits {
+                Some(bits) => crate::act_quant::quant_act::<B>(normed_f.clone().reshape([b * t, d]), bits)
+                    .reshape([b, t, d]),
+                None => normed_f.clone(),
+            };
+            let normed_ffn = match act_bits {
+                Some(bits) => {
+                    crate::act_quant::quant_act::<B>(normed_f.reshape([b * t, d]), bits)
+                }
+                None => normed_f.clone().reshape([b * t, d]),
+            };
 
             // Controller routing on [h_ctx, h0]
             let ctrl_in = Tensor::cat(vec![h_ctx.clone().reshape([b * t, d]), h0.clone().reshape([b * t, d])], 1);
@@ -209,12 +234,7 @@ impl LoopBlock {
                 && std::env::var("DM_NO_MSA").is_err();
             let use_engram = std::env::var("DM_NO_ENGRAM").is_err();
             let (gdn2_out, s_new) = if use_kda {
-                let kda_in = if bf16 {
-                    normed.clone().cast(FloatDType::F32)
-                } else {
-                    normed.clone()
-                };
-                self.shared_attn.gdn2.forward_train_state::<B>(kda_in, kda_s.take())
+                self.shared_attn.gdn2.forward_train_state::<B>(normed_attn.clone(), kda_s.take())
             } else {
                 (Tensor::zeros([b, t, d], &h.device()), kda_s.take().unwrap_or_else(|| Tensor::zeros([b, 1, 1, 1], &h.device())))
             };
@@ -223,18 +243,13 @@ impl LoopBlock {
                 // burn-msa kernels are f32-only: a bf16 input makes them
                 // read the buffer as f32 (twice the bytes) and fault with
                 // CUDA_ERROR_ILLEGAL_ADDRESS (measured 2026-08-29).
-                let msa_in = if bf16 {
-                    normed.clone().cast(FloatDType::F32)
-                } else {
-                    normed.clone()
-                };
-                self.shared_attn.msa.forward::<B>(msa_in).output
+                self.shared_attn.msa.forward::<B>(normed_attn.clone()).output
             } else {
                 Tensor::zeros([b, t, d], &h.device())
             };
             let attn = self
                 .shared_attn
-                .blend::<B>(normed.clone(), gdn2_out, msa_out)
+                .blend::<B>(normed_attn.clone(), gdn2_out, msa_out)
                 .reshape([b * t, d])
                 .mul(w_attn);
 
@@ -277,7 +292,7 @@ impl LoopBlock {
             };
 
             // Expert FFN: softmax blend of n_experts TSCT gate_up/silu/down
-            let normed_flat = normed.reshape([b * t, d]);
+            let normed_flat = normed_ffn.clone();
             let mut ffn = Tensor::zeros([b * t, d], &h.device());
             for e in 0..self.n_experts {
                 let mid = self.expert_ffns[e].gate_up.forward::<B>(normed_flat.clone());

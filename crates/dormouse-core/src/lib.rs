@@ -1,4 +1,5 @@
 //! dormouse-core - all-bf16 mini Aria on burn-fused kernels (CUDA)
+pub mod act_quant;
 pub mod attention;
 pub mod config;
 pub mod gr;
