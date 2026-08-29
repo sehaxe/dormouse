@@ -1,4 +1,20 @@
-//! dormouse-data - ByteStream, FNV 3/5/8 mod 4096, streaming mix
+//! dormouse-data - streaming byte dataset.
+//!
+//! `ByteStream` is a bounded-memory, file-order-shuffled stream of raw bytes
+//! for next-byte-language-model pretraining, plus FNV n-gram hashes used by the
+//! Engram memory. A deterministic train/eval file split is exposed so training
+//! can report held-out perplexity.
+//!
+//! Design notes:
+//! - Files are read incrementally in chunks; bytes live in a ring buffer that
+//!   is compacted after each batch, so memory stays bounded regardless of
+//!   dataset size (the previous implementation slurped whole files into an
+//!   ever-growing buffer).
+//! - File order is shuffled with a seeded Fisher-Yates (no external RNG dep);
+//!   the order is reshuffled every epoch for cheap cross-epoch diversity.
+//! - `train_eval_split` returns a stable held-out tail so eval sees unseen data.
+
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
 pub fn fnv(b: &[u8]) -> u64 {
@@ -10,6 +26,8 @@ pub fn fnv(b: &[u8]) -> u64 {
     h
 }
 
+/// Collect all data files under `root` (parquet/txt/jsonl), sorted for
+/// deterministic iteration.
 fn collect_files(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if let Ok(rd) = std::fs::read_dir(root) {
@@ -17,7 +35,11 @@ fn collect_files(root: &Path) -> Vec<PathBuf> {
             let p = e.path();
             if p.is_dir() {
                 out.extend(collect_files(&p));
-            } else if p.extension().map(|e| e == "parquet" || e == "txt" || e == "jsonl").unwrap_or(false) {
+            } else if p
+                .extension()
+                .map(|e| e == "parquet" || e == "txt" || e == "jsonl")
+                .unwrap_or(false)
+            {
                 out.push(p);
             }
         }
@@ -26,82 +48,176 @@ fn collect_files(root: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// Deterministic Fisher-Yates shuffle using a tiny SplitMix64 PRNG (no deps).
+/// Same seed -> same order, so runs are reproducible.
+fn shuffle_files(files: &mut [PathBuf], mut seed: u64) {
+    let n = files.len();
+    for i in (1..n).rev() {
+        seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let s = (seed ^ (seed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        let s = (s ^ (s >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        let r = (s ^ (s >> 31)) % (i as u64 + 1);
+        files.swap(i, r as usize);
+    }
+}
+
+/// Split collected files into `(train, eval)` by a deterministic held-out
+/// fraction taken from the sorted list's tail (stable across runs).
+pub fn train_eval_split(root: &Path, eval_frac: f64) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let mut files = collect_files(root);
+    if files.is_empty() {
+        return (files, Vec::new());
+    }
+    let eval_n = ((files.len() as f64 * eval_frac.clamp(0.0, 1.0)) as usize)
+        .max(1)
+        .min(files.len() - 1);
+    let split_at = files.len() - eval_n;
+    let eval = files.split_off(split_at);
+    (files, eval)
+}
+
 pub struct ByteStream {
-    pub seq_len: usize,
-    pub batch: usize,
+    seq_len: usize,
+    batch: usize,
     files: Vec<PathBuf>,
+    file_idx: usize,
+    reader: Option<BufReader<std::fs::File>>,
     buf: Vec<u8>,
     pos: usize,
-    file_idx: usize,
+    capacity: usize,
+    seed: u64,
+    epoch: u64,
 }
 
 impl ByteStream {
+    /// Train stream over every data file under `data_root`.
     pub fn new(seq_len: usize, batch: usize, data_root: &Path) -> Self {
-        let files = if data_root.exists() {
-            collect_files(data_root)
-        } else {
-            Vec::new()
+        Self::from_files(seq_len, batch, collect_files(data_root), 0x1234_5678)
+    }
+
+    /// Stream over an explicit file list (e.g. a held-out split).
+    pub fn from_files(seq_len: usize, batch: usize, files: Vec<PathBuf>, seed: u64) -> Self {
+        let mut files = files;
+        shuffle_files(&mut files, seed);
+        let capacity = (seq_len * batch).max(1) * 8;
+        let mut bs = Self {
+            seq_len,
+            batch,
+            files,
+            file_idx: 0,
+            reader: None,
+            buf: Vec::with_capacity(capacity),
+            pos: 0,
+            capacity,
+            seed,
+            epoch: 0,
         };
-        let mut bs = Self { seq_len, batch, files, buf: Vec::new(), pos: 0, file_idx: 0 };
         bs.refill();
         bs
     }
 
-    fn refill(&mut self) {
-        while self.buf.len() - self.pos < self.seq_len * self.batch * 2 && self.file_idx < self.files.len() {
-            if let Ok(data) = std::fs::read(&self.files[self.file_idx]) {
-                // for parquet just take raw bytes, for txt take as is
-                self.buf.extend_from_slice(&data);
+    /// Open a readable file at `file_idx` (skipping unreadable ones). On total
+    /// exhaustion, advance to the next epoch: reshuffle and restart from 0.
+    fn ensure_reader(&mut self) -> bool {
+        if self.reader.is_some() {
+            return true;
+        }
+        while self.file_idx < self.files.len() {
+            if let Ok(f) = std::fs::File::open(&self.files[self.file_idx]) {
+                self.reader = Some(BufReader::new(f));
+                return true;
             }
-            self.file_idx = (self.file_idx + 1) % self.files.len().max(1);
-            if self.files.is_empty() {
-                self.buf.extend_from_slice(&[b'a'; 8192]);
+            self.file_idx += 1;
+        }
+        if self.files.is_empty() {
+            return false;
+        }
+        self.epoch += 1;
+        self.file_idx = 0;
+        shuffle_files(
+            &mut self.files,
+            self.seed.wrapping_add(self.epoch.wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+        );
+        while self.file_idx < self.files.len() {
+            if let Ok(f) = std::fs::File::open(&self.files[self.file_idx]) {
+                self.reader = Some(BufReader::new(f));
+                return true;
+            }
+            self.file_idx += 1;
+        }
+        false
+    }
+
+    /// Top up `buf` so it holds at least `2 * batch * seq_len` unread bytes,
+    /// streaming from the current file and moving on at EOF.
+    fn refill(&mut self) {
+        let need = self.seq_len * self.batch * 2;
+        let chunk = need.max(4096);
+        let mut tmp = vec![0u8; chunk];
+        loop {
+            if self.buf.len() - self.pos >= need {
                 break;
             }
+            if !self.ensure_reader() {
+                break;
+            }
+            let read = {
+                let r = self.reader.as_mut().unwrap();
+                r.read(&mut tmp).unwrap_or(0)
+            };
+            if read == 0 {
+                self.reader = None;
+                self.file_idx += 1;
+                continue;
+            }
+            self.buf.extend_from_slice(&tmp[..read]);
         }
         if self.buf.is_empty() {
-            self.buf = vec![b'x'; 1_000_000];
+            // No data anywhere: bounded dummy filler so training can still run.
+            self.buf = vec![b'x'; (self.seq_len * self.batch).max(1) * 4];
+            self.pos = 0;
         }
     }
 
+    /// FNV 3/5/8-gram hashes (mod 4096) for the Engram memory.
     pub fn hashes(&self, bytes: &[u8], tables: &[usize]) -> Vec<i64> {
-        // bytes: [batch * seq_len]
         let mut out = Vec::with_capacity(self.batch * self.seq_len * tables.len());
         for b in 0..self.batch {
             for p in 0..self.seq_len {
-                let idx = b * self.seq_len + p;
                 let e = p + 1;
                 let s3 = e.saturating_sub(3);
                 let s5 = e.saturating_sub(5);
                 let s8 = e.saturating_sub(8);
-                // slice within this sequence's window
                 let base = b * self.seq_len;
                 let seq = &bytes[base..base + self.seq_len];
                 out.push((fnv(&seq[s3..e]) % tables[0] as u64) as i64);
                 out.push((fnv(&seq[s5..e]) % tables[1] as u64) as i64);
                 out.push((fnv(&seq[s8..e]) % tables[2] as u64) as i64);
-                let _ = idx;
             }
         }
         out
     }
 
+    /// Next `(bytes, hashes)` batch. Falls back to padding when data is short.
     pub fn next_batch(&mut self) -> (Vec<u8>, Vec<i64>) {
         let need = self.batch * self.seq_len;
         if self.pos + need > self.buf.len() {
             self.refill();
             if self.pos + need > self.buf.len() {
-                // wrap
                 self.pos = 0;
             }
         }
         let end = (self.pos + need).min(self.buf.len());
         let mut bytes = self.buf[self.pos..end].to_vec();
         self.pos = end;
+        // Compact consumed prefix to keep memory bounded.
+        if self.pos > self.capacity / 2 {
+            self.buf.drain(0..self.pos);
+            self.pos = 0;
+        }
         if bytes.len() < need {
             bytes.extend(std::iter::repeat(b' ').take(need - bytes.len()));
         }
-        // truncate to byte range 0-255 already
         let tables = [4096usize, 4096, 4096];
         let hashes = self.hashes(&bytes, &tables);
         (bytes, hashes)

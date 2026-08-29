@@ -11,7 +11,7 @@ use burn::{
     module::Module,
     optim::{AdamWConfig, GradientsParams, OptimizerRecord},
     store::ModuleRecord,
-    tensor::{Bytes, Device, Int, Tensor, TensorData},
+    tensor::{Bytes, Device, FloatDType, Int, Tensor, TensorData},
 };
 
 use dormouse_core::{DormouseConfig, DormouseModel};
@@ -41,6 +41,9 @@ pub struct TrainCfg {
     pub grad_clip: f64,
     /// checkpoint file name (default "latest"), saved as `<name>.bin`
     pub ckpt_name: String,
+    /// eval cadence in steps (0 = off). When >0 and an eval data dir is given,
+    /// a held-out cross-entropy is reported every `eval_every` steps.
+    pub eval_every: usize,
 }
 
 impl Default for TrainCfg {
@@ -48,7 +51,7 @@ impl Default for TrainCfg {
         Self {
             steps: 100000, ckpt_every: 1000, ckpt_secs: 600, log_every: 100,
             seq_len: 512, batch: 3, lr: 1e-4, wd: 0.01, grad_clip: 1.0,
-            ckpt_name: "latest".into(),
+            ckpt_name: "latest".into(), eval_every: 0,
         }
     }
 }
@@ -242,7 +245,13 @@ pub fn load_ckpt(dir: &Path, name: &str, cfg: &DormouseConfig, model: &mut Dormo
     Some(step)
 }
 
-pub fn train_loop(cfg: TrainCfg, data: PathBuf, preset: String, ckpt_dir: Option<PathBuf>) {
+pub fn train_loop(
+    cfg: TrainCfg,
+    data: PathBuf,
+    preset: String,
+    ckpt_dir: Option<PathBuf>,
+    eval_data: Option<PathBuf>,
+) {
     let dir = ckpt_dir.unwrap_or_else(|| PathBuf::from("checkpoints"));
     let _ = std::fs::create_dir_all(&dir);
     let dorm_cfg: DormouseConfig = match preset.as_str() {
@@ -270,6 +279,8 @@ pub fn train_loop(cfg: TrainCfg, data: PathBuf, preset: String, ckpt_dir: Option
     let _ = &mut t_step_start;
 
     let mut stream = dormouse_data::ByteStream::new(cfg.seq_len, cfg.batch, &data);
+    let mut eval_stream =
+        eval_data.as_ref().map(|p| dormouse_data::ByteStream::new(cfg.seq_len, cfg.batch, p));
     let mut best = f32::INFINITY;
     let n_params = model.num_params();
     println!(
@@ -396,6 +407,36 @@ pub fn train_loop(cfg: TrainCfg, data: PathBuf, preset: String, ckpt_dir: Option
             // pool_stats syncs the device; only with DM_MEMLOG=1
             let mem = if std::env::var("DM_MEMLOG").is_ok() { pool_stats(&device) } else { String::new() };
             println!("step {step:6} ce={ce:.3} bpb={bpb:.3} best={best:.3} lr={lr:.2e} {mem}");
+        }
+        if cfg.eval_every > 0 {
+            if let Some(ev) = eval_stream.as_mut() {
+                if step % cfg.eval_every as u64 == 0 && step > 0 {
+                    let (eb, eh) = ev.next_batch();
+                    let (ex, eh_t) =
+                        bytes_to_tensors::<Backend>(&eb, &eh, cfg.seq_len, cfg.batch, &device);
+                    let eshift: Vec<i64> = eb
+                        .iter()
+                        .skip(1)
+                        .chain(std::iter::once(&eb[0]))
+                        .map(|&b| b as i64)
+                        .collect();
+                    let ey: Tensor<2, Int> =
+                        Tensor::from_data(TensorData::new(eshift, [cfg.batch, cfg.seq_len]), &device);
+                    let (elogits, ..) = model.forward_with_hidden::<Backend>(ex, Some(eh_t));
+                    let v = model.vocab_size;
+                    let eflat = elogits.reshape([cfg.batch * cfg.seq_len, v]);
+                    let etgt = ey
+                        .reshape([cfg.batch * cfg.seq_len])
+                        .one_hot::<2>(v)
+                        .cast(FloatDType::F32);
+                    let ece: f32 = burn::tensor::loss::cross_entropy_with_logits(eflat, etgt)
+                        .mean()
+                        .try_into_scalar()
+                        .unwrap_or(f32::NAN);
+                    let ebpb = dormouse_bench::bpb(ece);
+                    println!("step {step:6} EVAL ce={ece:.3} bpb={ebpb:.3}");
+                }
+            }
         }
         if cfg.ckpt_every > 0 && step % cfg.ckpt_every as u64 == 0 {
             let _ = save_ckpt(&dir, &cfg.ckpt_name, &model, &optim, step, ce);
