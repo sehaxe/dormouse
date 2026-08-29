@@ -26,9 +26,14 @@ pub fn fnv(b: &[u8]) -> u64 {
     h
 }
 
-/// Collect all data files under `root` (parquet/txt/jsonl), sorted for
-/// deterministic iteration.
+/// Collect all data files under `root`, sorted for deterministic iteration.
+/// Text corpora are read as raw bytes; images and binary blobs feed the
+/// byte-level LM the same way (a JPEG is just a byte sequence to predict).
 fn collect_files(root: &Path) -> Vec<PathBuf> {
+    let text_exts = ["parquet", "txt", "jsonl", "json", "md", "html", "xml", "csv"];
+    let bin_exts = [
+        "png", "jpg", "jpeg", "gif", "webp", "bmp", "bin", "wasm", "zst", "gz",
+    ];
     let mut out = Vec::new();
     if let Ok(rd) = std::fs::read_dir(root) {
         for e in rd.flatten() {
@@ -37,7 +42,10 @@ fn collect_files(root: &Path) -> Vec<PathBuf> {
                 out.extend(collect_files(&p));
             } else if p
                 .extension()
-                .map(|e| e == "parquet" || e == "txt" || e == "jsonl")
+                .map(|e| {
+                    let s = e.to_string_lossy().to_lowercase();
+                    text_exts.contains(&s.as_str()) || bin_exts.contains(&s.as_str())
+                })
                 .unwrap_or(false)
             {
                 out.push(p);
@@ -81,12 +89,69 @@ pub struct ByteStream {
     batch: usize,
     files: Vec<PathBuf>,
     file_idx: usize,
-    reader: Option<BufReader<std::fs::File>>,
+    reader: Option<Source>,
     buf: Vec<u8>,
     pos: usize,
     capacity: usize,
     seed: u64,
     epoch: u64,
+}
+
+/// A file open for byte reading: plain text/binary files stream chunks;
+/// parquet files stream decoded string columns (arrow batch by batch, so
+/// multi-GB parquet never loads into RAM).
+enum Source {
+    Text(BufReader<std::fs::File>),
+    Parquet {
+        reader: parquet::arrow::arrow_reader::ParquetRecordBatchReader,
+        batch: Vec<u8>,
+        pos: usize,
+    },
+}
+
+impl Source {
+    fn read(&mut self, tmp: &mut Vec<u8>) -> std::io::Result<usize> {
+        match self {
+            Source::Text(r) => r.read(tmp),
+            Source::Parquet { reader, batch, pos } => {
+                if *pos >= batch.len() {
+                    batch.clear();
+                    *pos = 0;
+                    let mut got = 0usize;
+                    // Pull batches until one yields text or the file ends.
+                    loop {
+                        match reader.next() {
+                            Some(Ok(record)) => {
+                                let mut chunk = Vec::new();
+                                for col in record.columns() {
+                                    use arrow::array::StringArray;
+                                    if let Some(sa) = col.as_any().downcast_ref::<StringArray>() {
+                                        for v in sa.iter().flatten() {
+                                            chunk.extend_from_slice(v.as_bytes());
+                                            chunk.push(b'\n');
+                                        }
+                                    }
+                                }
+                                if !chunk.is_empty() {
+                                    std::mem::swap(batch, &mut chunk);
+                                    got = batch.len();
+                                    break;
+                                }
+                            }
+                            Some(Err(e)) => return Err(std::io::Error::other(e)),
+                            None => break,
+                        }
+                    }
+                    Ok(got)
+                } else {
+                    let n = tmp.len().min(batch.len() - *pos);
+                    tmp[..n].copy_from_slice(&batch[*pos..*pos + n]);
+                    *pos += n;
+                    Ok(n)
+                }
+            }
+        }
+    }
 }
 
 impl ByteStream {
@@ -123,8 +188,27 @@ impl ByteStream {
             return true;
         }
         while self.file_idx < self.files.len() {
-            if let Ok(f) = std::fs::File::open(&self.files[self.file_idx]) {
-                self.reader = Some(BufReader::new(f));
+            let path = &self.files[self.file_idx];
+            let is_parquet = path
+                .extension()
+                .map(|e| e.to_string_lossy().eq_ignore_ascii_case("parquet"))
+                .unwrap_or(false);
+            let r = if is_parquet {
+                std::fs::File::open(path).ok().and_then(|f| {
+                    parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(f)
+                        .ok()
+                        .and_then(|b| b.build().ok())
+                        .map(|reader| Source::Parquet {
+                            reader,
+                            batch: Vec::new(),
+                            pos: 0,
+                        })
+                })
+            } else {
+                std::fs::File::open(path).ok().map(|f| Source::Text(BufReader::new(f)))
+            };
+            if let Some(r) = r {
+                self.reader = Some(r);
                 return true;
             }
             self.file_idx += 1;
@@ -139,8 +223,27 @@ impl ByteStream {
             self.seed.wrapping_add(self.epoch.wrapping_mul(0x9E37_79B9_7F4A_7C15)),
         );
         while self.file_idx < self.files.len() {
-            if let Ok(f) = std::fs::File::open(&self.files[self.file_idx]) {
-                self.reader = Some(BufReader::new(f));
+            let path = &self.files[self.file_idx];
+            let is_parquet = path
+                .extension()
+                .map(|e| e.to_string_lossy().eq_ignore_ascii_case("parquet"))
+                .unwrap_or(false);
+            let r = if is_parquet {
+                std::fs::File::open(path).ok().and_then(|f| {
+                    parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(f)
+                        .ok()
+                        .and_then(|b| b.build().ok())
+                        .map(|reader| Source::Parquet {
+                            reader,
+                            batch: Vec::new(),
+                            pos: 0,
+                        })
+                })
+            } else {
+                std::fs::File::open(path).ok().map(|f| Source::Text(BufReader::new(f)))
+            };
+            if let Some(r) = r {
+                self.reader = Some(r);
                 return true;
             }
             self.file_idx += 1;

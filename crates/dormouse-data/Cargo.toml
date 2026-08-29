@@ -8,6 +8,8 @@ license.workspace = true
 cuda = ["burn/cuda"]
 
 [dependencies]
+arrow = "59.2.0"
 burn = { version = "0.22.0-pre.3", default-features = false, features = ["std"] }
 fastrand = "2.3"
 memmap2 = "0.9"
+parquet = { version = "59.2.0", features = ["arrow"] }
