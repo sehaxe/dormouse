@@ -29,6 +29,7 @@ dormouse = byte-level LM trainer in Rust (burn 0.22.0-pre.3 + cubecl CUDA) with 
 - `DM_FACTORS_FALLBACK=1` — drop expert TSCT u/v factors from the Muon+ group to the fallback optimizer (A/B: the report kept elongated low-rank projections on AdamW).
 - `DM_RETRACT_EVERY` / `DM_RETRACT_ITERS` — TSCT U/V ortho maintenance cadence (default every 1 step, NS 3 iters; the plan's `max_ortho` monitor falls back to fp32 factors above 1e-3, checked every 50 steps).
 - `DM_STRESS=1` — stability stress protocol (report §3.3): constant LR at `DM_STRESS_LR`× the base, loss-spike counter (201-step median + 0.1), p99.9 pre-clip grad norm; `DM_STRESS_EVERY` log cadence (default 50).
+- `DM_ACT_QUANT=4|fp4|8` — BitNet a4.8-style activation quantization (STE, f32 graph; `core/src/act_quant.rs`): FFN activations at the format, attention path at max(bits, 8); `DM_ACT_GROUP=N` sets per-group scale size (0 = per-token). `fp4` = e2m1 round-to-nearest. Weight side (ternary/2-bit) is SpectralLinear's STE. Verified: fp4 + group 128, 100 steps, 0 NaN, convergence == fp32.
 
 ## GPU/CUDA quirks (hard-won, do not rediscover)
 

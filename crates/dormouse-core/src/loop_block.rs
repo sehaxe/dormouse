@@ -184,28 +184,40 @@ impl LoopBlock {
                 self.norm.forward(h_ctx.clone())
             };
             // BitNet a4.8-style activation quantization (STE, f32 graph):
-            // FFN activations at DM_ACT_QUANT bits, the attention path at
-            // max(bits, 8) - attention is the sensitive part (paper keeps
-            // it higher precision). The quantizer output is f32, so this is
-            // orthogonal to the BF16=1 storage mode.
-            let act_bits: Option<u32> = std::env::var("DM_ACT_QUANT")
+            // FFN activations at DM_ACT_QUANT (4 | fp4 | 8), the attention
+            // path at max(bits, 8) - attention is the sensitive part (paper
+            // keeps it higher precision). DM_ACT_GROUP sets the scale group
+            // size (default per-token). The quantizer output is f32, so this
+            // is orthogonal to the BF16=1 storage mode.
+            let act_fmt: Option<(crate::act_quant::ActFormat, usize)> = std::env::var("DM_ACT_QUANT")
                 .ok()
-                .and_then(|v| v.parse().ok());
+                .map(|v| {
+                    let fmt = if v == "fp4" {
+                        crate::act_quant::ActFormat::Fp4
+                    } else {
+                        crate::act_quant::ActFormat::Int(
+                            v.parse::<u32>().unwrap_or(4).max(2).min(8),
+                        )
+                    };
+                    let group = std::env::var("DM_ACT_GROUP")
+                        .ok()
+                        .and_then(|g| g.parse().ok())
+                        .unwrap_or(0);
+                    (fmt, group)
+                });
             let normed_f = if bf16 {
                 normed.cast(FloatDType::F32)
             } else {
                 normed.clone()
             };
-            let attn_bits = act_bits.map(|bits| bits.max(8));
-            let normed_attn = match attn_bits {
-                Some(bits) => crate::act_quant::quant_act::<B>(normed_f.clone().reshape([b * t, d]), bits)
+            let attn_fmt = act_fmt.map(|(f, g)| (f.attn(), g));
+            let normed_attn = match attn_fmt {
+                Some((f, g)) => crate::act_quant::quant_act::<B>(normed_f.clone().reshape([b * t, d]), f, g)
                     .reshape([b, t, d]),
                 None => normed_f.clone(),
             };
-            let normed_ffn = match act_bits {
-                Some(bits) => {
-                    crate::act_quant::quant_act::<B>(normed_f.reshape([b * t, d]), bits)
-                }
+            let normed_ffn = match act_fmt {
+                Some((f, g)) => crate::act_quant::quant_act::<B>(normed_f.reshape([b * t, d]), f, g),
                 None => normed_f.clone().reshape([b * t, d]),
             };
 
