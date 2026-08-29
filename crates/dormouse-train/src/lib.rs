@@ -283,6 +283,12 @@ pub fn train_loop(
         model.loop_block.set_quant_all(qfmt);
         println!("quant format: {qfmt:?} ({} bits)", qfmt.bits());
     }
+    // True bf16 compute: matmuls run on bf16 (tensor cores) through the
+    // custom autodiff op; the graph and backward stay fp32.
+    if dormouse_core::param::bf16_on() {
+        model.set_bf16_compute(true);
+        println!("bf16 compute: tensor-core matmuls, fp32 graph");
+    }
     let mut optim = build_optim(&cfg);
     // Fail fast if the routing policy no longer matches the model (stale
     // marker after a module rename would silently degrade to AdamW).

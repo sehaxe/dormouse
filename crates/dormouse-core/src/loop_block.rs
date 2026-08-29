@@ -65,6 +65,16 @@ impl LoopBlock {
         }
     }
 
+    /// Toggle the bf16 matmul path on every TSCT factor.
+    pub fn set_bf16_compute(&mut self, on: bool) {
+        for f in &mut self.expert_ffns {
+            f.gate_up.set_bf16_compute(on);
+            f.down.set_bf16_compute(on);
+        }
+        self.out_proj.set_bf16_compute(on);
+        self.shared_attn.router.set_bf16_compute(on);
+    }
+
     /// Polar-retract every TSCT factor U/V in the block (see LinearLike).
     pub fn retract_tsct(&mut self, iters: usize) {
         for f in &mut self.expert_ffns {
@@ -116,7 +126,7 @@ impl LoopBlock {
     }
 
     #[allow(clippy::type_complexity)]
-    pub fn forward_full_state<B: Backend>(
+    pub fn forward_full_state<B: burn::backend::AutodiffBackend>(
         &self,
         x: Tensor<3>,
         hashed_ids: Option<Tensor<3, Int>>,
@@ -126,7 +136,9 @@ impl LoopBlock {
         lm_head: &LinearLike,
     ) -> (Tensor<3>, Tensor<1>, Tensor<2>, Tensor<4>)
     where
-        DispatchTensor: DispatchKindConversion<B>,
+        DispatchTensor: DispatchKindConversion<B>
+            + DispatchKindConversion<B::InnerBackend>
+            + DispatchKindConversion<burn::backend::Autodiff<B::InnerBackend>>,
     {
         let [b, t, d] = x.dims();
         let bf16 = bf16_on();

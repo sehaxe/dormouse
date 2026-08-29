@@ -41,13 +41,15 @@ impl DormouseModel {
         }
     }
 
-    pub fn forward<B: Backend>(
+    pub fn forward<B: burn::backend::AutodiffBackend>(
         &self,
         input_ids: Tensor<2, Int>,
         hashed_ids: Option<Tensor<3, Int>>,
     ) -> Tensor<3>
     where
-        DispatchTensor: DispatchKindConversion<B>,
+        DispatchTensor: DispatchKindConversion<B>
+            + DispatchKindConversion<B::InnerBackend>
+            + DispatchKindConversion<burn::backend::Autodiff<B::InnerBackend>>,
     {
         self.forward_with_hidden::<B>(input_ids, hashed_ids, None, None).0
     }
@@ -58,7 +60,7 @@ impl DormouseModel {
     /// `host_rows` carries pre-gathered n-gram rows `[b,t,3*32]` for the
     /// RAM-offload path (see dormouse-train offload); when None, `hashed_ids`
     /// drives the in-model tables.
-    pub fn forward_with_hidden<B: Backend>(
+    pub fn forward_with_hidden<B: burn::backend::AutodiffBackend>(
         &self,
         input_ids: Tensor<2, Int>,
         hashed_ids: Option<Tensor<3, Int>>,
@@ -66,7 +68,9 @@ impl DormouseModel {
         targets: Option<Tensor<2, Int>>,
     ) -> (Tensor<3>, Tensor<1>, Tensor<2>, Tensor<4>)
     where
-        DispatchTensor: DispatchKindConversion<B>,
+        DispatchTensor: DispatchKindConversion<B>
+            + DispatchKindConversion<B::InnerBackend>
+            + DispatchKindConversion<burn::backend::Autodiff<B::InnerBackend>>,
     {
         let x = self.embedding.forward(input_ids);
         let x = if crate::param::bf16_on() {
@@ -95,9 +99,11 @@ impl DormouseModel {
     }
 
     /// PonderNet loss (Banino et al. 2021): L = L_Rec + β·KL(p || Geom(λ_p)).
-    pub fn loss<B: Backend>(&self, rec_ce: Tensor<1>, p_dist: Tensor<2>) -> Tensor<1>
+    pub fn loss<B: burn::backend::AutodiffBackend>(&self, rec_ce: Tensor<1>, p_dist: Tensor<2>) -> Tensor<1>
     where
-        DispatchTensor: DispatchKindConversion<B>,
+        DispatchTensor: DispatchKindConversion<B>
+            + DispatchKindConversion<B::InnerBackend>
+            + DispatchKindConversion<burn::backend::Autodiff<B::InnerBackend>>,
     {
         let kl = self.ponder_kl(p_dist, self.ponder_prior); // [1]
         rec_ce + kl.mul_scalar(self.ponder_beta)
@@ -138,6 +144,13 @@ impl DormouseModel {
         self.lm_head.set_quant(quant);
     }
 
+    /// Toggle the bf16 matmul path (fp32 graph, tensor-core forward) on
+    /// every TSCT factor. Call under the model's BF16 mode.
+    pub fn set_bf16_compute(&mut self, on: bool) {
+        self.loop_block.set_bf16_compute(on);
+        self.lm_head.set_bf16_compute(on);
+    }
+
     /// Polar-retract every TSCT factor U/V to orthonormal (on device, keeps
     /// autodiff tracking). Call every step during training: without it the
     /// factors drift and the quantized forward degrades into NaN.
@@ -153,9 +166,11 @@ impl DormouseModel {
     }
 
     /// Inference: bytes -> last-token logits [vocab].
-    pub fn forward_bytes<B: Backend>(&self, bytes: &[u8]) -> Vec<f32>
+    pub fn forward_bytes<B: burn::backend::AutodiffBackend>(&self, bytes: &[u8]) -> Vec<f32>
     where
-        DispatchTensor: DispatchKindConversion<B>,
+        DispatchTensor: DispatchKindConversion<B>
+            + DispatchKindConversion<B::InnerBackend>
+            + DispatchKindConversion<burn::backend::Autodiff<B::InnerBackend>>,
     {
         let device = self.embedding.weight.device();
         let ids: Vec<i64> = bytes.iter().map(|&b| b as i64).collect();

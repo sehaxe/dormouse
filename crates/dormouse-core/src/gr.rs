@@ -54,9 +54,11 @@ impl GatedResidual {
     }
 
     /// Read: gate-average the branches into the block input (report Eq. 32).
-    pub fn read<B: Backend>(&self, branches: &[Tensor<3>]) -> (Tensor<3>, GrState)
+    pub fn read<B: burn::backend::AutodiffBackend>(&self, branches: &[Tensor<3>]) -> (Tensor<3>, GrState)
     where
-        DispatchTensor: DispatchKindConversion<B>,
+        DispatchTensor: DispatchKindConversion<B>
+            + DispatchKindConversion<B::InnerBackend>
+            + DispatchKindConversion<burn::backend::Autodiff<B::InnerBackend>>,
     {
         let [b, t, d] = branches[0].dims();
         let normed: Vec<Tensor<3>> = branches
@@ -83,14 +85,16 @@ impl GatedResidual {
 
     /// Write: deposit the block output into every branch (report Eq. 33-34).
     /// `branches` are the pre-read branches: Ri' = Ri + si·y.
-    pub fn write<B: Backend>(
+    pub fn write<B: burn::backend::AutodiffBackend>(
         &self,
         branches: &[Tensor<3>],
         state: &GrState,
         y: Tensor<3>,
     ) -> Vec<Tensor<3>>
     where
-        DispatchTensor: DispatchKindConversion<B>,
+        DispatchTensor: DispatchKindConversion<B>
+            + DispatchKindConversion<B::InnerBackend>
+            + DispatchKindConversion<burn::backend::Autodiff<B::InnerBackend>>,
     {
         let [b, t, d] = y.dims();
         let stacked = Tensor::cat(state.normed.clone(), 2).reshape([b * t, GR_BRANCHES * d]);

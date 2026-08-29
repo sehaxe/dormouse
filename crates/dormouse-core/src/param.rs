@@ -45,22 +45,40 @@ impl LinearLike {
         Self { inner, out_features }
     }
 
-    pub fn forward<B: Backend>(&self, x: Tensor<2>) -> Tensor<2>
+    pub fn forward<B: burn::backend::AutodiffBackend>(&self, x: Tensor<2>) -> Tensor<2>
     where
-        DispatchTensor: DispatchKindConversion<B>,
+        DispatchTensor: DispatchKindConversion<B>
+            + DispatchKindConversion<B::InnerBackend>
+            + DispatchKindConversion<burn::backend::Autodiff<B::InnerBackend>>,
     {
         let y = match &self.inner {
             LinearLikeInner::Tsct(l) => {
                 if std::env::var("DM_QUANT_DEBUG").is_ok() {
-                    println!("[ll] quant={:?} out={}", l.quant, l.out_features);
+                    println!("[ll] quant={:?} out={} bf16_compute={}", l.quant, l.out_features, l.bf16_compute);
                 }
-                if l.quant != burn_spectral::QuantFormat::Fp32 {
+                if l.bf16_compute {
+                    // bf16 matmuls (tensor cores) with the fp32 autodiff
+                    // graph; the factor quant follows the configured format.
+                    // The custom op is CUDA-only; elsewhere fall back.
+                    #[cfg(feature = "cuda")]
+                    {
+                        l.forward_quant_bf16::<B>(x)
+                    }
+                    #[cfg(not(feature = "cuda"))]
+                    {
+                        if l.quant != burn_spectral::QuantFormat::Fp32 {
+                            l.forward_quant::<B>(x)
+                        } else {
+                            l.forward(x)
+                        }
+                    }
+                } else if l.quant != burn_spectral::QuantFormat::Fp32 {
                     l.forward_quant::<B>(x)
                 } else {
                     l.forward(x)
                 }
             }
-            LinearLikeInner::Sct(l) => l.forward(x),
+            LinearLikeInner::Sct(l) => l.forward::<B>(x),
             LinearLikeInner::Dense(l) => l.forward(x),
         };
         // slice back to the real out_features when padded (extra columns are
@@ -77,6 +95,13 @@ impl LinearLike {
     pub fn set_quant(&mut self, quant: burn_spectral::QuantFormat) {
         if let LinearLikeInner::Tsct(l) = &mut self.inner {
             l.set_quant(quant);
+        }
+    }
+
+    /// Enable the bf16 matmul path (fp32 graph, tensor-core forward).
+    pub fn set_bf16_compute(&mut self, on: bool) {
+        if let LinearLikeInner::Tsct(l) = &mut self.inner {
+            l.bf16_compute = on;
         }
     }
 
