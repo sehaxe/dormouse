@@ -423,34 +423,21 @@ pub fn train_loop(
         // RAM-offload path: gather this batch's n-gram rows on the host,
         // copy them to the GPU as an autodiff leaf, and train the tables
         // with CPU Adam from the row gradients (report §2.3). The copy is
-        // ~600 KB per step; the impact on the step time is negligible.
-        let mut rows_param: Option<burn::module::Param<Tensor<2>>> = None;
-        let host_rows = match &host {
+        // ~600 KB per step; the impact on the step time is negligible
+        // (~1 ms CPU against ~10 s GPU).
+        let (rows_param, host_rows) = match &host {
             Some(h) => {
-                let (uniq, pos) = h.unique_rows(&hashes);
-                let mut rows = Vec::new();
-                h.gather(&uniq, &mut rows);
-                let rows_t: Tensor<2> = Tensor::from_data(
-                    TensorData::new(rows, [uniq.len(), 32]),
+                let (p, embed) = offload::rows_for_batch::<Backend>(
+                    h,
+                    &hashes,
+                    cfg.batch,
+                    cfg.seq_len,
                     &device,
-                )
-                .require_grad();
-                rows_param = Some(burn::module::Param::from_tensor(rows_t.into()));
-                let pos_t: Tensor<1, Int> = Tensor::from_data(
-                    TensorData::new(pos, [cfg.batch * cfg.seq_len * 3]),
-                    &device,
+                    true,
                 );
-                let idx2 = pos_t.unsqueeze_dim::<2>(1).repeat(&[1, 32]);
-                Some(
-                    rows_param
-                        .as_ref()
-                        .unwrap()
-                        .val()
-                        .gather(0, idx2)
-                        .reshape([cfg.batch, cfg.seq_len, 96]),
-                )
+                (p, Some(embed))
             }
-            None => None,
+            None => (None, None),
         };
 
         let (_logits, rec_ce, p_dist, _kda) =
@@ -545,7 +532,10 @@ pub fn train_loop(
         if cfg.eval_every > 0 {
             if let Some(ev) = eval_stream.as_mut() {
                 if step % cfg.eval_every as u64 == 0 && step > 0 {
-                    let (eb, eh) = ev.next_batch();
+                    let (eb, eh) = match &host {
+                        Some(h) => ev.next_batch_with_tables(h.slots),
+                        None => ev.next_batch(),
+                    };
                     let (ex, eh_t) =
                         bytes_to_tensors::<Backend>(&eb, &eh, cfg.seq_len, cfg.batch, &device);
                     let eshift: Vec<i64> = eb
@@ -556,7 +546,22 @@ pub fn train_loop(
                         .collect();
                     let ey: Tensor<2, Int> =
                         Tensor::from_data(TensorData::new(eshift, [cfg.batch, cfg.seq_len]), &device);
-                    let (elogits, ..) = model.forward_with_hidden::<Backend>(ex, Some(eh_t), None, None);
+                    let eval_rows = match &host {
+                        Some(h) => Some(
+                            offload::rows_for_batch::<Backend>(
+                                h,
+                                &eh,
+                                cfg.batch,
+                                cfg.seq_len,
+                                &device,
+                                false,
+                            )
+                            .1,
+                        ),
+                        None => None,
+                    };
+                    let (elogits, ..) =
+                        model.forward_with_hidden::<Backend>(ex, None, eval_rows, None);
                     let v = model.vocab_size;
                     let eflat = elogits.reshape([cfg.batch * cfg.seq_len, v]);
                     let etgt = ey

@@ -12,6 +12,10 @@
 
 use std::collections::HashMap;
 
+use burn::backend::{Backend, DispatchKindConversion};
+use burn::module::Param;
+use burn::tensor::{DispatchTensor, Int, Tensor, TensorData};
+
 /// 3 tables (3/5/8-gram), `dim` columns each.
 pub struct HostNgram {
     pub slots: [usize; 3],
@@ -187,4 +191,36 @@ mod tests {
         h2.gather(&uniq, &mut after2);
         assert_eq!(after, after2, "ckpt roundtrip must preserve rows");
     }
+}
+
+/// Gather the batch's rows from RAM into an autodiff leaf and expand them
+/// to the `[b, t, 3*dim]` embedding the model consumes. With `track=false`
+/// (eval) the leaf is skipped and only the embedding is returned.
+pub fn rows_for_batch<B: Backend>(
+    host: &HostNgram,
+    hashes: &[i64],
+    b: usize,
+    t: usize,
+    device: &burn::tensor::Device,
+    track: bool,
+) -> (Option<Param<Tensor<2>>>, Tensor<3>)
+where
+    DispatchTensor: DispatchKindConversion<B>,
+{
+    let (uniq, pos) = host.unique_rows(hashes);
+    let mut rows = Vec::new();
+    host.gather(&uniq, &mut rows);
+    let rows_t: Tensor<2> = Tensor::from_data(TensorData::new(rows, [uniq.len(), host.dim]), device);
+    let p = track.then(|| {
+        let r = rows_t.clone().require_grad();
+        Param::from_tensor(r.into())
+    });
+    let src = match &p {
+        Some(pp) => pp.val(),
+        None => rows_t,
+    };
+    let pos_t: Tensor<1, Int> = Tensor::from_data(TensorData::new(pos, [b * t * 3]), device);
+    let idx2 = pos_t.unsqueeze_dim::<2>(1).repeat(&[1, host.dim]);
+    let embed = src.gather(0, idx2).reshape([b, t, 3 * host.dim]);
+    (p, embed)
 }
