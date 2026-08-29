@@ -105,7 +105,9 @@ impl GatedResidual {
             let si = s_flat
                 .clone()
                 .slice([0..b, 0..t, i..i + 1]);
-            out.push(branches[i].clone() + si.mul(y.clone()));
+            // Store back in the branch dtype (bf16 under BF16=1): the sum
+            // itself is computed in fp32 (mixed-dtype ops NaN on sm_120).
+            out.push(branches[i].clone() + si.mul(y.clone()).cast(branches[i].dtype()));
         }
         out
     }

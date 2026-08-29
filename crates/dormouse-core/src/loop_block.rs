@@ -186,6 +186,13 @@ impl LoopBlock {
 
             // Controller routing on [h_ctx, h0]
             let ctrl_in = Tensor::cat(vec![h_ctx.clone().reshape([b * t, d]), h0.clone().reshape([b * t, d])], 1);
+            // Mixed-dtype ops (bf16 act x fp32 weight) NaN on this stack; the
+            // BF16 mode stores activations in bf16 but computes in fp32.
+            let ctrl_in = if bf16 {
+                ctrl_in.cast(FloatDType::F32)
+            } else {
+                ctrl_in
+            };
             let raw = self.controller.forward(ctrl_in); // [b*t, ctrl_pad]
             let w_attn = activation::sigmoid(raw.clone().slice([0..b * t, 0..1]));
             let w_mem = activation::sigmoid(raw.clone().slice([0..b * t, 1..2]));
@@ -202,7 +209,12 @@ impl LoopBlock {
                 && std::env::var("DM_NO_MSA").is_err();
             let use_engram = std::env::var("DM_NO_ENGRAM").is_err();
             let (gdn2_out, s_new) = if use_kda {
-                self.shared_attn.gdn2.forward_train_state::<B>(normed.clone(), kda_s.take())
+                let kda_in = if bf16 {
+                    normed.clone().cast(FloatDType::F32)
+                } else {
+                    normed.clone()
+                };
+                self.shared_attn.gdn2.forward_train_state::<B>(kda_in, kda_s.take())
             } else {
                 (Tensor::zeros([b, t, d], &h.device()), kda_s.take().unwrap_or_else(|| Tensor::zeros([b, 1, 1, 1], &h.device())))
             };
@@ -285,15 +297,22 @@ impl LoopBlock {
                 h = h_ctx.clone();
             } else {
                 let scale = self.residual_scale.val().clone().reshape([1, 1, 1]);
-                h = h_ctx.clone() + y.mul(scale);
+                // Store the residual back in the activation dtype (bf16
+                // under BF16=1): the sum itself is computed in fp32.
+                h = h_ctx.clone() + y.mul(scale).cast(h_ctx.dtype());
             }
 
             // PonderNet readout + probabilistic halting:
             // λ_n = cond. halt prob; p_n = λ_n · Π_{j<n}(1-λ_j) (truncated geometric);
             // output accumulates the p-weighted expectation of per-step logits.
             let step_out = self.out_proj.forward::<B>(h.clone().reshape([b * t, d])).reshape([b, t, d]);
+            let halt_in = if bf16 {
+                h_ctx.clone().mean_dim(1).reshape([b, d]).cast(FloatDType::F32)
+            } else {
+                h_ctx.clone().mean_dim(1).reshape([b, d])
+            };
             let lam = activation::sigmoid(
-                self.halt_head.forward(h_ctx.clone().mean_dim(1).reshape([b, d])),
+                self.halt_head.forward(halt_in),
             ); // [b,1]
             let p_n = lam.clone() * not_halted.clone();
             out_acc = out_acc + step_out.clone().mul(p_n.clone().unsqueeze_dim::<3>(2));
