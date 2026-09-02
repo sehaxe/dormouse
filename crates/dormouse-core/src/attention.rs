@@ -1,6 +1,6 @@
 //! attention - KDA (burn-kda) + MSA (burn-msa) with learned router blend
 use crate::param::LinearLike;
-use burn::backend::{Backend, DispatchKindConversion};
+use burn::backend::DispatchKindConversion;
 use burn::module::Module;
 use burn::tensor::{activation, Device, DispatchTensor, FloatDType, Tensor};
 use burn_kda::KdaModule;

@@ -14,7 +14,7 @@
 //! All slicing happens on 2D/3D tensors only: dynamic slicing of a 4D
 //! autodiff tensor crashes cubecl on sm_120 (see AGENTS.md).
 
-use burn::backend::{Backend, DispatchKindConversion};
+use burn::backend::DispatchKindConversion;
 use burn::module::Module;
 use burn::tensor::{activation, Device, DispatchTensor, Tensor};
 use burn_rmsnorm::RMSNorm;

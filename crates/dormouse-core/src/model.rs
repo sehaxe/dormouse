@@ -1,5 +1,5 @@
 //! model - Embedding -> LoopBlock -> RMSNorm -> lm_head, all-bf16 capable
-use burn::backend::{Backend, DispatchKindConversion};
+use burn::backend::DispatchKindConversion;
 use burn::module::Module;
 use burn::nn::{Embedding, EmbeddingConfig};
 use burn::tensor::{Device, DispatchTensor, FloatDType, Int, Tensor, TensorData};

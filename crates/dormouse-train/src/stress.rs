@@ -95,22 +95,27 @@ impl StressMonitor {
     }
 }
 
-/// L2 norm of all parameter gradients (pre-clip). Syncs the device; call at
-/// monitor cadence, not per step. Non-destructive: reads via `Param::grad`.
+/// L2 norm of all parameter gradients (pre-clip). The squares accumulate in
+/// one device tensor and the host reads a single scalar, so this costs one
+/// device sync regardless of parameter count. Call at monitor cadence, not
+/// per step. Non-destructive: reads via `Param::grad`.
 pub fn grad_norm<M: burn::module::Module>(model: &M, grads: &burn::tensor::Gradients) -> f32 {
     struct NormVisitor<'a> {
         grads: &'a burn::tensor::Gradients,
-        sq: f64,
+        acc: Option<Tensor<1>>,
     }
     impl ModuleVisitor for NormVisitor<'_> {
         fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<D>>) {
             if let Some(g) = param.grad(self.grads) {
-                let s: f32 = g.powf_scalar(2.0).sum().into_scalar();
-                self.sq += s as f64;
+                let sq = g.powf_scalar(2.0).sum();
+                self.acc = Some(match self.acc.take() {
+                    Some(a) => a + sq,
+                    None => sq,
+                });
             }
         }
     }
-    let mut v = NormVisitor { grads, sq: 0.0 };
+    let mut v = NormVisitor { grads, acc: None };
     model.visit(&mut v);
-    v.sq.sqrt() as f32
+    v.acc.map(|t| t.sqrt().into_scalar()).unwrap_or(0.0)
 }

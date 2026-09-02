@@ -39,7 +39,6 @@ pub type Optim = burn::optim::ModuleOptimizer;
 pub struct TrainCfg {
     pub steps: usize,
     pub ckpt_every: usize,
-    pub ckpt_secs: u64,
     pub log_every: usize,
     pub seq_len: usize,
     pub batch: usize,
@@ -56,7 +55,7 @@ pub struct TrainCfg {
 impl Default for TrainCfg {
     fn default() -> Self {
         Self {
-            steps: 100000, ckpt_every: 1000, ckpt_secs: 600, log_every: 100,
+            steps: 100000, ckpt_every: 1000, log_every: 100,
             seq_len: 512, batch: 3, lr: 1e-4, wd: 0.01, grad_clip: 1.0,
             ckpt_name: "latest".into(), eval_every: 0,
         }
@@ -408,6 +407,14 @@ pub fn train_loop(
     let (mut pbytes, mut phashes) = stream.next_batch();
     let mut         pshift: Vec<i64> = pbytes.iter().skip(1).chain(std::iter::once(&pbytes[0])).map(|&b| b as i64).collect();
     let mut ce = f32::NAN;
+    // Runtime knobs, read once: env::var takes a process-wide lock, and the
+    // loop is CPU-latency-sensitive (every host microsecond is one the GPU
+    // spends idle once the queue drains).
+    let retract_every: u64 = std::env::var("DM_RETRACT_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    let retract_iters: usize = std::env::var("DM_RETRACT_ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+    let timers_on = std::env::var("DM_TIMERS").is_ok();
+    let memlog_on = std::env::var("DM_MEMLOG").is_ok();
+    let harness_on = std::env::var("DM_HARNESS").map(|v| v != "0").unwrap_or(false);
     while step < cfg.steps as u64 {
         let t_iter = std::time::Instant::now();
         let (bytes, hashes) = (std::mem::replace(&mut pbytes, Vec::new()), std::mem::replace(&mut phashes, Vec::new()));
@@ -417,14 +424,17 @@ pub fn train_loop(
         // targets = next byte (shifted by one position)
         let shifted = std::mem::take(&mut pshift);
         let y: Tensor<2, Int> = Tensor::from_data(TensorData::new(shifted, [cfg.batch, cfg.seq_len]), &device);
-        // prepare next batch right away (host->device copy is async)
+        // prepare next batch right away (host->device copy is async). The
+        // shift targets MUST be built from the prefetched batch: building
+        // them from the consumed one trains every step after the first on
+        // the previous batch's labels.
         let (nb, nh) = match &host {
             Some(h) => stream.next_batch_with_tables(h.slots),
             None => stream.next_batch(),
         };
+        pshift = nb.iter().skip(1).chain(std::iter::once(&nb[0])).map(|&b| b as i64).collect();
         pbytes = nb;
         phashes = nh;
-        pshift = bytes.iter().skip(1).chain(std::iter::once(&bytes[0])).map(|&b| b as i64).collect();
 
         // RAM-offload path: gather this batch's n-gram rows on the host,
         // copy them to the GPU as an autodiff leaf, and train the tables
@@ -446,8 +456,14 @@ pub fn train_loop(
             None => (None, None),
         };
 
-        let (_logits, rec_ce, p_dist, _kda) =
-            model.forward_with_hidden::<Backend>(x, Some(h), host_rows, Some(y));
+        let (_logits, rec_ce, p_dist, _kda) = model.forward_with_hidden::<Backend>(
+            x,
+            // RAM-offload path drives the Engram from host_rows; uploading
+            // hashed_ids too would be a dead per-step H2D copy.
+            if host_rows.is_some() { None } else { Some(h) },
+            host_rows,
+            Some(y),
+        );
         let loss = model.loss::<Backend>(rec_ce, p_dist);
         // Defer the device->host sync (loss scalar + RAM Adam grads) to the
         // log steps so the GPU stays saturated: forward/backward/step of
@@ -498,16 +514,8 @@ pub fn train_loop(
         // every step so the quantized forward stays faithful; monitor the
         // drift at cadence and fall back to fp32 factors when it exceeds the
         // plan's 1e-3 threshold. DM_RETRACT_EVERY / DM_RETRACT_ITERS override.
-        let retract_every: usize = std::env::var("DM_RETRACT_EVERY")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1);
-        if step % retract_every as u64 == 0 {
-            let iters: usize = std::env::var("DM_RETRACT_ITERS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(3);
-            model.retract_tsct(iters);
+        if step % retract_every == 0 {
+            model.retract_tsct(retract_iters);
         }
         if step % 50 == 0 {
             let ortho = model.max_ortho();
@@ -517,7 +525,7 @@ pub fn train_loop(
             }
         }
 
-        if std::env::var("DM_TIMERS").is_ok() && step % 50 == 0 {
+        if timers_on && step % 50 == 0 {
             // Force a device sync so the elapsed wall time equals the true GPU
             // step time (forward+backward+optim+retract). data_ms is the CPU
             // side (read + bytes_to_tensors). Their difference is GPU compute.
@@ -531,7 +539,7 @@ pub fn train_loop(
         if step % cfg.log_every as u64 == 0 {
             let bpb = dormouse_bench::bpb(ce);
             // pool_stats syncs the device; only with DM_MEMLOG=1
-            let mem = if std::env::var("DM_MEMLOG").is_ok() { pool_stats(&device) } else { String::new() };
+            let mem = if memlog_on { pool_stats(&device) } else { String::new() };
             println!("step {step:6} ce={ce:.3} bpb={bpb:.3} best={best:.3} lr={lr:.2e} {mem}");
             if let Some(s) = stress.as_ref() {
                 if let Some(line) = s.report(step) {
@@ -594,7 +602,11 @@ pub fn train_loop(
             }
             println!("ckpt {}.bin saved step {step}", cfg.ckpt_name);
         }
-        if step > 0 && step % 2000 == 0 { let _ = harness::run(&format!("step {step} ce {ce:.3}")); }
+        // opencode harness: an external CLI call that stalls the loop while
+        // the GPU idles, so it is opt-in (DM_HARNESS=1).
+        if harness_on && step > 0 && step % 2000 == 0 {
+            let _ = harness::run(&format!("step {step} ce {ce:.3}"));
+        }
         if step % 50 == 0 {
             memory_cleanup(&device);
         }
@@ -620,7 +632,7 @@ pub fn load_model_weights(dir: &Path, name: &str, cfg: DormouseConfig) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::optim::{build_optim_mode, validate_routing_with};
+    use crate::optim::validate_routing_with;
     use dormouse_core::param::{LinearLike, LinearLikeInner};
     use dormouse_data::fnv;
 

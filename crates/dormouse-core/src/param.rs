@@ -3,15 +3,24 @@
 use burn::module::Module;
 use burn::nn::LinearConfig;
 use burn::tensor::{Device, DispatchTensor, Tensor};
-use burn::backend::Backend;
 use burn::backend::DispatchKindConversion;
 use burn_spectral::SpectralLinear;
 use burn_sct::SctLinear;
 
 /// bf16 mode env flag: activations stream in bf16, weights fp32 cast per
 /// forward (burn-ndarray has no bf16 dtype -> CPU tests stay fp32).
+/// Cached: this sits in the per-iteration hot path and `env::var` takes a
+/// process-wide lock on every call.
 pub fn bf16_on() -> bool {
-    std::env::var("BF16").is_ok() && std::env::var("BF16").unwrap() != "0"
+    static BF16: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *BF16.get_or_init(|| std::env::var("BF16").map(|v| v != "0").unwrap_or(false))
+}
+
+/// DM_QUANT_DEBUG, read once per process (queried by every LinearLike
+/// forward otherwise).
+fn quant_debug_on() -> bool {
+    static DBG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DBG.get_or_init(|| std::env::var("DM_QUANT_DEBUG").is_ok())
 }
 
 #[derive(Module, Debug)]
@@ -37,12 +46,10 @@ impl LinearLike {
         } else {
             out_features
         };
-        let inner = if bf16_on() {
-            LinearLikeInner::Tsct(SpectralLinear::new(in_features, padded, rank, device))
-        } else {
-            LinearLikeInner::Tsct(SpectralLinear::new(in_features, padded, rank, device))
-        };
-        Self { inner, out_features }
+        Self {
+            inner: LinearLikeInner::Tsct(SpectralLinear::new(in_features, padded, rank, device)),
+            out_features,
+        }
     }
 
     pub fn forward<B: burn::backend::AutodiffBackend>(&self, x: Tensor<2>) -> Tensor<2>
@@ -53,7 +60,7 @@ impl LinearLike {
     {
         let y = match &self.inner {
             LinearLikeInner::Tsct(l) => {
-                if std::env::var("DM_QUANT_DEBUG").is_ok() {
+                if quant_debug_on() {
                     println!("[ll] quant={:?} out={} bf16_compute={}", l.quant, l.out_features, l.bf16_compute);
                 }
                 if l.bf16_compute {
@@ -144,8 +151,3 @@ impl LinearLike {
         }
     }
 }
-
-/// retract every step: polar Newton-Schulz on U/V (3 iters, burn-sct exposes
-/// the same orthogonalization the trainer calls). SpectralLinear owns retract
-/// via its QR-based parameterization; dense/sct need none.
-pub fn retract_model<M: Module>(_m: &M) {}

@@ -1,8 +1,15 @@
 //! quant fidelity probe: does quantize_tensor(bits=4/8) actually quantize
 //! orthonormal TSCT factors? Prints max/mean quantization error on U.
 //! cargo run --release -p dormouse-core --features cuda --example quant_probe
-use burn::tensor::{Device, Tensor};
+use burn::tensor::Device;
 use burn_spectral::SpectralLinear;
+
+/// Same autodiff backend the trainer uses (forward_with_hidden needs an
+/// AutodiffBackend; plain Cuda is not one).
+type B = burn::backend::autodiff::Autodiff<
+    burn_cuda::Cuda,
+    burn::backend::autodiff::checkpoint::strategy::BalancedCheckpointing,
+>;
 
 fn main() {
     let device = Device::cuda(0);
@@ -66,9 +73,9 @@ fn main() {
         burn::tensor::Tensor::from_data(burn::tensor::TensorData::new(ids.clone(), [2, 64]), &device);
     let yb: burn::tensor::Tensor<2, burn::tensor::Int> =
         burn::tensor::Tensor::from_data(burn::tensor::TensorData::new(ids, [2, 64]), &device);
-    let (lp, pp) = m_plain.forward_with_hidden::<burn_cuda::Cuda>(xb.clone(), None);
-    let l_plain: f32 = m_plain.loss::<burn_cuda::Cuda>(lp, yb.clone(), pp).try_into_scalar().unwrap();
-    let (lq, pq) = m_quant.forward_with_hidden::<burn_cuda::Cuda>(xb, None);
-    let l_quant: f32 = m_quant.loss::<burn_cuda::Cuda>(lq, yb, pq).try_into_scalar().unwrap();
+    let (_lp, rec_p, pd_p, _k) = m_plain.forward_with_hidden::<B>(xb.clone(), None, None, Some(yb.clone()));
+    let l_plain: f32 = m_plain.loss::<B>(rec_p, pd_p).try_into_scalar().unwrap();
+    let (_lq, rec_q, pd_q, _k) = m_quant.forward_with_hidden::<B>(xb, None, None, Some(yb));
+    let l_quant: f32 = m_quant.loss::<B>(rec_q, pd_q).try_into_scalar().unwrap();
     println!("model loss: fp32={l_plain:.4} fp4={l_quant:.4} delta={:.4}", (l_plain - l_quant).abs());
 }

@@ -17,7 +17,7 @@
 //! a4.8 recipe uses group scales for the FFN activations.
 
 use burn::backend::{Backend, DispatchKindConversion};
-use burn::tensor::{activation, DispatchTensor, FloatDType, Tensor};
+use burn::tensor::{DispatchTensor, FloatDType, Tensor};
 
 /// Activation quantization format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

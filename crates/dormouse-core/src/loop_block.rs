@@ -1,7 +1,7 @@
 //! loop - mini UniversalLoop on fused kernels: controller + shared attention
 //! (KDA+MSA) + expert TSCT FFNs + Engram + PonderNet halt head + e_k
 //! (iteration embedding) + ReZero residual scale.
-use burn::backend::{Backend, DispatchKindConversion};
+use burn::backend::DispatchKindConversion;
 use burn::module::Module;
 use burn::nn::{Linear, LinearConfig};
 use burn::tensor::{activation, Device, DispatchTensor, FloatDType, Int, Tensor};
@@ -160,9 +160,37 @@ impl LoopBlock {
         // never materialize/slice the [N,b,t,d] tensor: dynamic slicing of a 4D
         // autodiff tensor crashes cubecl on sm_120 (CUDA_ERROR_ILLEGAL_ADDRESS).
         let mut rec = Tensor::<1>::zeros([1], &h.device());
+        // Pre-compute constants outside the loop: saves per-iter CPU overhead
+        // from env::var syscalls, clone+reshape, and tensor allocation.
+        // env switches (read once per forward): DM_NO_KDA / DM_NO_MSA /
+        // DM_NO_ENGRAM disable an arm, DM_KDA / DM_MSA force-enable (bisect
+        // + A/B).
+        let h0_flat = h0.clone().reshape([b * t, d]);
+        let ones_bh1 = Tensor::<2>::ones([b, 1], &h.device());
+        let act_fmt: Option<(crate::act_quant::ActFormat, usize)> = std::env::var("DM_ACT_QUANT")
+            .ok()
+            .map(|v| {
+                let fmt = if v == "fp4" {
+                    crate::act_quant::ActFormat::Fp4
+                } else {
+                    crate::act_quant::ActFormat::Int(
+                        v.parse::<u32>().unwrap_or(4).max(2).min(8),
+                    )
+                };
+                let group = std::env::var("DM_ACT_GROUP")
+                    .ok()
+                    .and_then(|g| g.parse().ok())
+                    .unwrap_or(0);
+                (fmt, group)
+            });
+        let use_kda = (self.use_kda || std::env::var("DM_KDA").is_ok())
+            && std::env::var("DM_NO_KDA").is_err();
+        let use_msa = (self.use_msa || std::env::var("DM_MSA").is_ok())
+            && std::env::var("DM_NO_MSA").is_err();
+        let use_engram = std::env::var("DM_NO_ENGRAM").is_err();
 
         for iter in 0..self.max_iter {
-            let row = iter.min(self.max_iter - 1);
+            let row = iter;
             let iter_ctx = self
                 .iter_embed
                 .val()
@@ -195,28 +223,6 @@ impl LoopBlock {
             } else {
                 self.norm.forward(h_ctx.clone())
             };
-            // BitNet a4.8-style activation quantization (STE, f32 graph):
-            // FFN activations at DM_ACT_QUANT (4 | fp4 | 8), the attention
-            // path at max(bits, 8) - attention is the sensitive part (paper
-            // keeps it higher precision). DM_ACT_GROUP sets the scale group
-            // size (default per-token). The quantizer output is f32, so this
-            // is orthogonal to the BF16=1 storage mode.
-            let act_fmt: Option<(crate::act_quant::ActFormat, usize)> = std::env::var("DM_ACT_QUANT")
-                .ok()
-                .map(|v| {
-                    let fmt = if v == "fp4" {
-                        crate::act_quant::ActFormat::Fp4
-                    } else {
-                        crate::act_quant::ActFormat::Int(
-                            v.parse::<u32>().unwrap_or(4).max(2).min(8),
-                        )
-                    };
-                    let group = std::env::var("DM_ACT_GROUP")
-                        .ok()
-                        .and_then(|g| g.parse().ok())
-                        .unwrap_or(0);
-                    (fmt, group)
-                });
             let normed_f = if bf16 {
                 normed.cast(FloatDType::F32)
             } else {
@@ -234,7 +240,7 @@ impl LoopBlock {
             };
 
             // Controller routing on [h_ctx, h0]
-            let ctrl_in = Tensor::cat(vec![h_ctx.clone().reshape([b * t, d]), h0.clone().reshape([b * t, d])], 1);
+            let ctrl_in = Tensor::cat(vec![h_ctx.clone().reshape([b * t, d]), h0_flat.clone()], 1);
             // Mixed-dtype ops (bf16 act x fp32 weight) NaN on this stack; the
             // BF16 mode stores activations in bf16 but computes in fp32.
             let ctrl_in = if bf16 {
@@ -248,15 +254,9 @@ impl LoopBlock {
             let w_ffn = activation::sigmoid(raw.clone().slice([0..b * t, 2..3]));
             let blend = activation::softmax(raw.slice([0..b * t, 3..3 + self.n_experts]), 1);
 
-            // Pre-norm, then shared attention (KDA + MSA)
-            let normed = self.norm.forward(h_ctx.clone());
-            // env switches: DM_NO_KDA / DM_NO_MSA / DM_NO_ENGRAM disable,
-            // DM_KDA / DM_MSA force-enable (bisect + A/B).
-            let use_kda = (self.use_kda || std::env::var("DM_KDA").is_ok())
-                && std::env::var("DM_NO_KDA").is_err();
-            let use_msa = (self.use_msa || std::env::var("DM_MSA").is_ok())
-                && std::env::var("DM_NO_MSA").is_err();
-            let use_engram = std::env::var("DM_NO_ENGRAM").is_err();
+            // Shared attention (KDA + MSA). `normed` above is the block-body
+            // input: RMSNorm of h_ctx, identity under GR (the read already
+            // normalized).
             let (gdn2_out, s_new) = if use_kda {
                 self.shared_attn.gdn2.forward_train_state::<B>(normed_attn.clone(), kda_s.take())
             } else {
@@ -316,10 +316,9 @@ impl LoopBlock {
             };
 
             // Expert FFN: softmax blend of n_experts TSCT gate_up/silu/down
-            let normed_flat = normed_ffn.clone();
             let mut ffn = Tensor::zeros([b * t, d], &h.device());
             for e in 0..self.n_experts {
-                let mid = self.expert_ffns[e].gate_up.forward::<B>(normed_flat.clone());
+                let mid = self.expert_ffns[e].gate_up.forward::<B>(normed_ffn.clone());
                 let mid = activation::silu(if bf16 { mid.cast(FloatDType::F32) } else { mid });
                 let out = self.expert_ffns[e].down.forward::<B>(mid);
                 ffn = ffn + out.mul(blend.clone().slice([0..b * t, e..e + 1]));
@@ -356,7 +355,7 @@ impl LoopBlock {
             let p_n = lam.clone() * not_halted.clone();
             out_acc = out_acc + step_out.clone().mul(p_n.clone().unsqueeze_dim::<3>(2));
             p_rows.push(p_n.clone());
-            not_halted = not_halted * (Tensor::<2>::ones([b, 1], &h.device()) - lam.clone());
+            not_halted = not_halted * (ones_bh1.clone() - lam.clone());
             // L_Rec: per-step CE (fp32 logits) weighted by the halting dist p_n.
             if let Some(tgt) = &targets {
                 let v = tgt.dims()[1];
