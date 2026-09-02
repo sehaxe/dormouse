@@ -578,7 +578,9 @@ pub fn train_loop(
         if let Some(t) = teacher.take() {
             teacher = Some(dormouse_core::aux::ema_update(t, &model, dormouse_core::aux::TEACHER_MOMENTUM));
         }
-        if step % 50 == 0 {
+        // max_ortho reads every TSCT factor (30+ device syncs) - cadence, not
+        // per-50-steps: each check drains the pipeline.
+        if step % 500 == 0 {
             let ortho = model.max_ortho();
             if ortho > 1e-3 {
                 println!("max_ortho {ortho:.2e} > 1e-3 - fallback fp32 factors");
@@ -663,11 +665,21 @@ pub fn train_loop(
         if cfg.ckpt_every > 0 && step % cfg.ckpt_every as u64 == 0 {
             let _ = save_ckpt(&dir, &cfg.ckpt_name, &model, &optim, step, ce);
             if let Some(h) = &host {
-                let _ = std::fs::write(dir.join(format!("{}.ngram", cfg.ckpt_name)), h.to_bytes());
+                let path = dir.join(format!("{}.ngram", cfg.ckpt_name));
+                let tmp = dir.join(format!("{}.ngram.tmp.{}", cfg.ckpt_name, std::process::id()));
+                if let Ok(f) = std::fs::File::create(&tmp) {
+                    let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
+                    let _ = h.write_to(&mut w);
+                    let _ = std::io::Write::flush(&mut w);
+                    let _ = std::fs::rename(&tmp, &path);
+                }
             }
             println!("ckpt {}.bin saved step {step}", cfg.ckpt_name);
         }
-        if step % 50 == 0 {
+        // Returning pool pages forces the next steps to re-acquire them from
+        // the driver; at a near-full high-water this stalls the GPU. 500
+        // steps keeps the OOM guard while amortizing the reacquisition.
+        if step % 500 == 0 {
             memory_cleanup(&device);
         }
         step += 1;

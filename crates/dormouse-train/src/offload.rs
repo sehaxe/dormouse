@@ -135,6 +135,23 @@ impl HostNgram {
         buf
     }
 
+    /// Stream the same layout straight to a writer in 64KB blocks: a
+    /// multi-GB table set must not materialize a second copy in RAM.
+    pub fn write_to<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
+        w.write_all(&self.step.to_le_bytes())?;
+        let mut buf = Vec::with_capacity(64 * 1024);
+        for chunk in [&self.tables, &self.m, &self.v] {
+            for block in chunk.chunks(16 * 1024) {
+                buf.clear();
+                for &x in block {
+                    buf.extend_from_slice(&x.to_le_bytes());
+                }
+                w.write_all(&buf)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn from_bytes(bytes: &[u8], slots: [usize; 3], dim: usize) -> Option<Self> {
         let total = slots.iter().sum::<usize>() * dim;
         if bytes.len() < 8 + total * 4 * 3 {

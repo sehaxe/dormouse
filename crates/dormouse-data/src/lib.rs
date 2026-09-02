@@ -164,7 +164,11 @@ impl ByteStream {
     pub fn from_files(seq_len: usize, batch: usize, files: Vec<PathBuf>, seed: u64) -> Self {
         let mut files = files;
         shuffle_files(&mut files, seed);
-        let capacity = (seq_len * batch).max(1) * 8;
+        // The backing store may be an idle drive whose first read costs
+        // ~200 ms: refilling every couple of steps with 4KB reads starves
+        // the GPU. A 64 MB ring refilled in 8 MB chunks touches the disk
+        // ~once per 10k steps instead of once per step.
+        let capacity = 64 * 1024 * 1024;
         let mut bs = Self {
             seq_len,
             batch,
@@ -255,7 +259,7 @@ impl ByteStream {
     /// streaming from the current file and moving on at EOF.
     fn refill(&mut self) {
         let need = self.seq_len * self.batch * 2;
-        let chunk = need.max(4096);
+        let chunk = (8 * 1024 * 1024).max(need);
         let mut tmp = vec![0u8; chunk];
         loop {
             if self.buf.len() - self.pos >= need {
