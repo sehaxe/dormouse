@@ -309,9 +309,6 @@ pub fn train_loop(
     println!("optimizer: {opt_name}{factors} [muon={} tables={} rest={}]", gc.muon, gc.tables, gc.rest);
     let mut step = load_ckpt(&dir, &cfg.ckpt_name, &dorm_cfg, &mut model, &mut optim).unwrap_or(0);
     if step > 0 { println!("resumed {} from {} step {step}", cfg.ckpt_name, dir.display()); }
-    let mut t_step_start = std::time::Instant::now();
-    let _ = &mut t_step_start;
-
     let mut stream = dormouse_data::ByteStream::new(cfg.seq_len, cfg.batch, &data);
     let mut eval_stream =
         eval_data.as_ref().map(|p| dormouse_data::ByteStream::new(cfg.seq_len, cfg.batch, p));
@@ -409,11 +406,14 @@ pub fn train_loop(
     // #5 prefetch: tensors for the NEXT step are prepared while the current
     // step's GPU work is still in flight.
     let (mut pbytes, mut phashes) = stream.next_batch();
-    let mut pshift: Vec<i64> = pbytes.iter().skip(1).chain(std::iter::once(&pbytes[0])).map(|&b| b as i64).collect();
+    let mut         pshift: Vec<i64> = pbytes.iter().skip(1).chain(std::iter::once(&pbytes[0])).map(|&b| b as i64).collect();
+    let mut ce = f32::NAN;
     while step < cfg.steps as u64 {
-        t_step_start = std::time::Instant::now();
+        let t_iter = std::time::Instant::now();
         let (bytes, hashes) = (std::mem::replace(&mut pbytes, Vec::new()), std::mem::replace(&mut phashes, Vec::new()));
+        let t_io = std::time::Instant::now();
         let (x, h) = bytes_to_tensors::<Backend>(&bytes, &hashes, cfg.seq_len, cfg.batch, &device);
+        let data_ms = t_io.elapsed().as_secs_f64() * 1000.0;
         // targets = next byte (shifted by one position)
         let shifted = std::mem::take(&mut pshift);
         let y: Tensor<2, Int> = Tensor::from_data(TensorData::new(shifted, [cfg.batch, cfg.seq_len]), &device);
@@ -447,48 +447,51 @@ pub fn train_loop(
         };
 
         let (_logits, rec_ce, p_dist, _kda) =
-            model.forward_with_hidden::<Backend>(x, None, host_rows, Some(y));
+            model.forward_with_hidden::<Backend>(x, Some(h), host_rows, Some(y));
         let loss = model.loss::<Backend>(rec_ce, p_dist);
-        let t_fwd = std::time::Instant::now();
-        let ce: f32 = match loss.clone().try_into_scalar() {
-            Ok(v) => v,
-            Err(_) => {
-                // device thread died (cubecl "Memory location was never
-                // initialized") - context is poisoned, nothing to save
-                println!("step {step} device error - exit");
-                std::process::exit(1);
-            }
-        };
-        let t_sync = std::time::Instant::now();
-        if !ce.is_finite() {
-            println!("step {step} NaN loss - skip");
-            step += 1;
-            continue;
-        }
-        if ce < best { best = ce; }
-        let grads = loss.backward();
-        let t_bwd = std::time::Instant::now();
+        // Defer the device->host sync (loss scalar + RAM Adam grads) to the
+        // log steps so the GPU stays saturated: forward/backward/step of
+        // adjacent steps overlap in the command queue instead of stalling on a
+        // scalar read every step.
+        let loss_log = loss.clone();
+        let raw_grads = loss.backward();
         let lr = match stress.as_ref() {
             // Constant LR at a multiple of the optimum (report §3.3).
             Some(s) => s.lr(cfg.lr),
             None => wsd_factor(step, cfg.steps as u64, cfg.lr),
         };
-        // CPU Adam for the RAM tables from this batch's row gradients.
-        if let (Some(h), Some(p)) = (host.as_mut(), &rows_param) {
-            if let Some(g) = p.grad(&grads) {
-                let (uniq, _) = h.unique_rows(&hashes);
-                let g_vec: Vec<f32> = g.into_data().try_to_vec().unwrap_or_default();
-                if g_vec.len() == uniq.len() * 32 {
-                    h.adam_update(&uniq, &g_vec, lr as f32);
+        // Sync the device once per log window (not every step) so forward/
+        // backward/step of adjacent steps overlap on the GPU. Reads the loss
+        // scalar, runs RAM-table CPU Adam from the row grads, and (under
+        // DM_STRESS) the pre-clip grad norm.
+        if step % cfg.log_every as u64 == 0 {
+            let ce_now: f32 = match loss_log.clone().try_into_scalar() {
+                Ok(v) => v,
+                Err(_) => {
+                    println!("step {step} device error - exit");
+                    std::process::exit(1);
+                }
+            };
+            if !ce_now.is_finite() {
+                println!("step {step} NaN loss - exit (last good ckpt kept)");
+                std::process::exit(1);
+            }
+            ce = ce_now;
+            if ce < best { best = ce; }
+            if let (Some(h), Some(p)) = (host.as_mut(), &rows_param) {
+                if let Some(g) = p.grad(&raw_grads) {
+                    let (uniq, _) = h.unique_rows(&hashes);
+                    let g_vec: Vec<f32> = g.into_data().try_to_vec().unwrap_or_default();
+                    if g_vec.len() == uniq.len() * 32 {
+                        h.adam_update(&uniq, &g_vec, lr as f32);
+                    }
                 }
             }
+            if let Some(s) = stress.as_mut() {
+                s.observe(ce, grad_norm(&model, &raw_grads));
+            }
         }
-        if let Some(s) = stress.as_mut() {
-            // Pre-clip grad norm (p99.9 in the report's protocol). Syncs the
-            // device: only under DM_STRESS.
-            s.observe(ce, grad_norm(&model, &grads));
-        }
-        let grads = GradientsParams::from_grads(grads, &model);
+        let grads = GradientsParams::from_grads(raw_grads, &model);
         let model_new = optim.step(lr, model, grads);
         model = model_new;
         // TSCT ortho maintenance (bf16_KERNEL_PLAN): retract the U/V masters
@@ -513,17 +516,18 @@ pub fn train_loop(
                 model.set_quant_all(burn_spectral::QuantFormat::Fp32);
             }
         }
-        let t_step = std::time::Instant::now();
+
         if std::env::var("DM_TIMERS").is_ok() && step % 50 == 0 {
+            // Force a device sync so the elapsed wall time equals the true GPU
+            // step time (forward+backward+optim+retract). data_ms is the CPU
+            // side (read + bytes_to_tensors). Their difference is GPU compute.
+            let _: f32 = loss_log.clone().try_into_scalar().unwrap_or(0.0);
+            let total_ms = t_iter.elapsed().as_secs_f64() * 1000.0;
             println!(
-                "timers step {step}: fwd={:.0}ms sync={:.0}ms bwd={:.0}ms step={:.0}ms",
-                t_fwd.duration_since(t_step_start).as_secs_f64() * 1000.0,
-                t_sync.duration_since(t_fwd).as_secs_f64() * 1000.0,
-                t_bwd.duration_since(t_sync).as_secs_f64() * 1000.0,
-                t_step.duration_since(t_bwd).as_secs_f64() * 1000.0,
+                "timer step {step}: total={total_ms:.0}ms data={data_ms:.1}ms gpu_step={:.0}ms",
+                total_ms - data_ms
             );
         }
-
         if step % cfg.log_every as u64 == 0 {
             let bpb = dormouse_bench::bpb(ce);
             // pool_stats syncs the device; only with DM_MEMLOG=1
@@ -542,7 +546,7 @@ pub fn train_loop(
                         Some(h) => ev.next_batch_with_tables(h.slots),
                         None => ev.next_batch(),
                     };
-                    let (ex, eh_t) =
+                    let (ex, _eh_t) =
                         bytes_to_tensors::<Backend>(&eb, &eh, cfg.seq_len, cfg.batch, &device);
                     let eshift: Vec<i64> = eb
                         .iter()

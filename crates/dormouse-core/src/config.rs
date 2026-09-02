@@ -47,7 +47,7 @@ impl DormouseConfig {
             d_ffn: 2048,
             vocab: 256,
             max_seq_len: 512,
-            max_iter: 8,
+            max_iter: std::env::var("DM_MAX_ITER").ok().and_then(|v| v.parse().ok()).unwrap_or(8),
             rank: 64,
             halt_theta: 0.9,
             ponder_w: 0.05,
