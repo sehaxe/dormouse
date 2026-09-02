@@ -56,17 +56,6 @@ impl AdaptiveAttention {
         }
     }
 
-    pub fn forward_train<B: burn::backend::AutodiffBackend>(&self, x: Tensor<3>) -> Tensor<3>
-    where
-        DispatchTensor: DispatchKindConversion<B>
-            + DispatchKindConversion<B::InnerBackend>
-            + DispatchKindConversion<burn::backend::Autodiff<B::InnerBackend>>,
-    {
-        let gdn2_out = self.gdn2.forward_train::<B>(x.clone());
-        let msa_out = self.msa.forward::<B>(x.clone()).output;
-        self.blend::<B>(x, gdn2_out, msa_out)
-    }
-
     pub fn blend<B: burn::backend::AutodiffBackend>(&self, x: Tensor<3>, gdn2_out: Tensor<3>, msa_out: Tensor<3>) -> Tensor<3>
     where
         DispatchTensor: DispatchKindConversion<B>

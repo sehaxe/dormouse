@@ -69,12 +69,11 @@ fn device() -> Device {
     { Device::ndarray().autodiff() }
 }
 
-/// Pool introspection (debug): bytes reserved/used/live allocs on the CUDA client.
+/// The cubecl compute client behind a burn device (CUDA builds). All pool
+/// introspection/cleanup goes through this one handle.
 #[cfg(feature = "cuda")]
-pub fn pool_stats(device: &Device) -> String {
+fn cuda_client(device: &Device) -> cubecl_runtime::client::ComputeClient<cubecl_cuda::CudaRuntime> {
     use burn_dispatch::DispatchDevice;
-    use cubecl_cuda::CudaRuntime;
-    use cubecl_runtime::client::ComputeClient;
     fn unwrap(d: &DispatchDevice) -> &burn_cuda::CudaDevice {
         match d {
             DispatchDevice::Cuda(dev) => dev,
@@ -85,8 +84,13 @@ pub fn pool_stats(device: &Device) -> String {
             other => panic!("expected CUDA device, got {other:?}"),
         }
     }
-    let client = ComputeClient::<CudaRuntime>::load(unwrap(device.as_dispatch()));
-    match client.memory_usage() {
+    cubecl_runtime::client::ComputeClient::load(unwrap(device.as_dispatch()))
+}
+
+/// Pool introspection (debug): bytes reserved/used/live allocs on the CUDA client.
+#[cfg(feature = "cuda")]
+pub fn pool_stats(device: &Device) -> String {
+    match cuda_client(device).memory_usage() {
         Ok(u) => format!("res={:.1}MB used={:.1}MB allocs={}", u.bytes_reserved as f64 / 1e6, u.bytes_in_use as f64 / 1e6, u.number_allocs),
         Err(_) => "mem-err".into(),
     }
@@ -100,21 +104,7 @@ pub fn pool_stats(_device: &Device) -> String { "cpu".into() }
 /// (aria hit the same wall; periodic cleanup is the cheap fix).
 #[cfg(feature = "cuda")]
 pub fn memory_cleanup(device: &Device) {
-    use burn_dispatch::DispatchDevice;
-    use cubecl_cuda::CudaRuntime;
-    use cubecl_runtime::client::ComputeClient;
-    fn unwrap(d: &DispatchDevice) -> &burn_cuda::CudaDevice {
-        match d {
-            DispatchDevice::Cuda(dev) => dev,
-            DispatchDevice::Autodiff(a) => match &**a {
-                DispatchDevice::Cuda(dev) => dev,
-                other => panic!("expected CUDA device, got {other:?}"),
-            },
-            other => panic!("expected CUDA device, got {other:?}"),
-        }
-    }
-    let client = ComputeClient::<CudaRuntime>::load(unwrap(device.as_dispatch()));
-    client.memory_cleanup();
+    cuda_client(device).memory_cleanup();
 }
 #[cfg(not(feature = "cuda"))]
 pub fn memory_cleanup(_device: &Device) {}
@@ -126,24 +116,8 @@ pub fn memory_cleanup(_device: &Device) {}
 /// mark.
 #[cfg(feature = "cuda")]
 pub fn init_pools(device: &Device) {
-    use burn_dispatch::DispatchDevice;
-    use cubecl_cuda::CudaRuntime;
-    use cubecl_runtime::{
-        client::ComputeClient,
-        config::memory::{MemoryPoolsConfig, MemoryPoolsPreset},
-    };
-    fn unwrap(d: &DispatchDevice) -> &burn_cuda::CudaDevice {
-        match d {
-            DispatchDevice::Cuda(dev) => dev,
-            DispatchDevice::Autodiff(a) => match &**a {
-                DispatchDevice::Cuda(dev) => dev,
-                other => panic!("expected CUDA device, got {other:?}"),
-            },
-            other => panic!("expected CUDA device, got {other:?}"),
-        }
-    }
-    let client = ComputeClient::<CudaRuntime>::load(unwrap(device.as_dispatch()));
-    let _ = client.install_memory_pools(&MemoryPoolsConfig::Preset(MemoryPoolsPreset::ExclusivePages));
+    use cubecl_runtime::config::memory::{MemoryPoolsConfig, MemoryPoolsPreset};
+    let _ = cuda_client(device).install_memory_pools(&MemoryPoolsConfig::Preset(MemoryPoolsPreset::ExclusivePages));
 }
 #[cfg(not(feature = "cuda"))]
 pub fn init_pools(_device: &Device) {}
@@ -391,8 +365,8 @@ pub fn train_loop(
             (loss_q - loss_r).abs()
         );
         // factor quantization error on U (is the format actually quantizing?)
-        if let dormouse_core::param::LinearLikeInner::Tsct(l) =
-            &model.loop_block.expert_ffns[0].gate_up.inner
+        let dormouse_core::param::LinearLikeInner::Tsct(l) =
+            &model.loop_block.expert_ffns[0].gate_up.inner;
         {
             let u = l.u.val();
             let q = burn_bitnet::quantize_tensor::<Backend>(u.clone(), qfmt.bits());
@@ -643,11 +617,10 @@ mod tests {
     fn tsct_retract_restores_ortho() {
         let dev = device();
         let mut ll = LinearLike::new(64, 64, 16, &dev);
-        if let LinearLikeInner::Tsct(l) = &mut ll.inner {
+        let LinearLikeInner::Tsct(l) = &mut ll.inner;
+        {
             let u = l.u.val().mul_scalar(3.0).detach();
             l.u = burn::module::Param::from_tensor(u.into());
-        } else {
-            panic!("LinearLike must be TSCT on ndarray");
         }
         let before = ll.max_ortho();
         ll.retract(3);

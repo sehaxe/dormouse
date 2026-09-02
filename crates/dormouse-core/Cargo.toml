@@ -15,7 +15,6 @@ burn-msa = { path = "../../../burn-fused/crates/burn-msa" }
 burn-bitnet = { path = "../../../burn-fused/crates/burn-bitnet" }
 burn-engram = { path = "../../../burn-fused/crates/burn-engram" }
 burn-rmsnorm = { path = "../../../burn-fused/crates/burn-rmsnorm" }
-burn-sct = { path = "../../../burn-fused/crates/burn-sct" }
 burn-spectral = { path = "../../../burn-fused/crates/burn-spectral" }
 half = { version = "2.5", features = ["num-traits"] }
 rand = "0.8"
@@ -30,6 +29,5 @@ cuda = [
     "burn-msa/cuda",
     "burn-msa/autodiff",
     "burn-spectral/cuda",
-    "burn-sct/cuda",
     "burn-rmsnorm/cuda",
 ]

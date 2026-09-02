@@ -1276,21 +1276,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "burn-sct"
-version = "0.1.4"
-dependencies = [
- "burn",
- "burn-cubecl",
- "burn-cuda",
- "burn-nn",
- "burn-tensor",
- "cubecl",
- "cubecl-common",
- "futures-lite",
- "num-traits",
-]
-
-[[package]]
 name = "burn-spectral"
 version = "0.1.0"
 dependencies = [
@@ -2775,7 +2760,6 @@ dependencies = [
  "burn-ndarray",
  "burn-nn",
  "burn-rmsnorm",
- "burn-sct",
  "burn-spectral",
  "burn-tensor",
  "half",
