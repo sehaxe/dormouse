@@ -5,11 +5,13 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-cuda = ["dormouse-core/cuda", "dormouse-train/cuda", "burn/cuda"]
+default = ["cpu"]
+cpu = ["dormouse-train/cpu"]
+cuda = ["dormouse-core/cuda", "dormouse-train/cuda"]
 
 [dependencies]
 dormouse-core = { path = "../dormouse-core" }
-dormouse-train = { path = "../dormouse-train" }
+dormouse-train = { path = "../dormouse-train", default-features = false }
 burn = { version = "0.22.0-pre.3", default-features = false, features = ["std"] }
 clap = { version = "4", features = ["derive"] }
 axum = "0.7"

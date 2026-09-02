@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [features]
+default = ["cpu"]
+cpu = ["dep:burn-ndarray"]
 cuda = ["burn/cuda", "burn/autodiff", "dormouse-core/cuda", "burn-muon-plus/cuda"]
 
 [dependencies]
@@ -16,7 +18,7 @@ burn-bitnet = { path = "../../../burn-fused/crates/burn-bitnet" }
 burn-muon-plus = { path = "../../../burn-fused/crates/burn-muon-plus" }
 burn = { version = "0.22.0-pre.3", default-features = false, features = ["std", "autodiff", "optim"] }
 burn-tensor = { version = "0.22.0-pre.3", default-features = false }
-burn-ndarray = { version = "0.22.0-pre.3", features = ["blas-openblas"] }
+burn-ndarray = { optional = true, version = "0.22.0-pre.3", features = ["blas-openblas"] }
 burn-cuda = { version = "0.22.0-pre.3", default-features = false, features = ["std"] }
 burn-dispatch = { version = "0.22.0-pre.3", default-features = false }
 cubecl-runtime = { version = "0.11.0-pre.3", default-features = false }

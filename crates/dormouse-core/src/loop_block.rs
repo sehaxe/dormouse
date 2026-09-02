@@ -9,9 +9,9 @@ use burn_engram::EngramModule;
 use burn_rmsnorm::RMSNorm;
 
 use crate::attention::AdaptiveAttention;
-use crate::config::DormouseConfig;
+use crate::config::{ActQuant, DormouseConfig};
 use crate::gr::{GatedResidual, GrState, GR_BRANCHES};
-use crate::param::{bf16_on, LinearLike};
+use crate::param::LinearLike;
 
 #[derive(Module, Debug)]
 pub struct ExpertFFN {
@@ -54,6 +54,14 @@ pub struct LoopBlock {
     pub use_msa: bool,
     #[module(skip)]
     pub use_kda: bool,
+    #[module(skip)]
+    pub use_engram: bool,
+    #[module(skip)]
+    pub bf16: bool,
+    #[module(skip)]
+    pub act_quant: Option<ActQuant>,
+    #[module(skip)]
+    pub act_group: usize,
 }
 
 impl LoopBlock {
@@ -106,7 +114,7 @@ impl LoopBlock {
         let iter_embed = burn::module::Param::from_tensor(iter_embed.clone().into());
         Self {
             controller,
-            shared_attn: AdaptiveAttention::new(d, cfg.n_heads, cfg.head_dim, cfg.rank, cfg.msa_block, cfg.msa_topk, device),
+            shared_attn: AdaptiveAttention::new(d, cfg.n_heads, cfg.head_dim, cfg.rank, cfg.msa_block, cfg.msa_topk, cfg.bf16, device),
             expert_ffns: (0..cfg.n_experts).map(|_| ExpertFFN::new(d, f, cfg.rank, device)).collect(),
             engram: EngramModule::new(&[4096, 4096, 4096], 32, d, 1, device),
             norm: RMSNorm::new(d, cfg.norm_eps, device),
@@ -122,6 +130,10 @@ impl LoopBlock {
             halt_theta: cfg.halt_theta,
             use_msa: cfg.use_msa,
             use_kda: cfg.use_kda,
+            use_engram: cfg.use_engram,
+            bf16: cfg.bf16,
+            act_quant: cfg.act_quant,
+            act_group: cfg.act_group,
         }
     }
 
@@ -141,7 +153,7 @@ impl LoopBlock {
             + DispatchKindConversion<burn::backend::Autodiff<B::InnerBackend>>,
     {
         let [b, t, d] = x.dims();
-        let bf16 = bf16_on();
+        let bf16 = self.bf16;
         let h0 = x.clone();
         let mut h = x;
         // Gated Residual: every branch starts from the token embedding.
@@ -160,34 +172,16 @@ impl LoopBlock {
         // never materialize/slice the [N,b,t,d] tensor: dynamic slicing of a 4D
         // autodiff tensor crashes cubecl on sm_120 (CUDA_ERROR_ILLEGAL_ADDRESS).
         let mut rec = Tensor::<1>::zeros([1], &h.device());
-        // Pre-compute constants outside the loop: saves per-iter CPU overhead
-        // from env::var syscalls, clone+reshape, and tensor allocation.
-        // env switches (read once per forward): DM_NO_KDA / DM_NO_MSA /
-        // DM_NO_ENGRAM disable an arm, DM_KDA / DM_MSA force-enable (bisect
-        // + A/B).
+        // Pre-compute loop invariants once: fewer per-iteration allocations
+        // and graph nodes. Arm switches are plain config fields (A/B via the
+        // CLI, not env).
         let h0_flat = h0.clone().reshape([b * t, d]);
         let ones_bh1 = Tensor::<2>::ones([b, 1], &h.device());
-        let act_fmt: Option<(crate::act_quant::ActFormat, usize)> = std::env::var("DM_ACT_QUANT")
-            .ok()
-            .map(|v| {
-                let fmt = if v == "fp4" {
-                    crate::act_quant::ActFormat::Fp4
-                } else {
-                    crate::act_quant::ActFormat::Int(
-                        v.parse::<u32>().unwrap_or(4).max(2).min(8),
-                    )
-                };
-                let group = std::env::var("DM_ACT_GROUP")
-                    .ok()
-                    .and_then(|g| g.parse().ok())
-                    .unwrap_or(0);
-                (fmt, group)
-            });
-        let use_kda = (self.use_kda || std::env::var("DM_KDA").is_ok())
-            && std::env::var("DM_NO_KDA").is_err();
-        let use_msa = (self.use_msa || std::env::var("DM_MSA").is_ok())
-            && std::env::var("DM_NO_MSA").is_err();
-        let use_engram = std::env::var("DM_NO_ENGRAM").is_err();
+        let act_fmt: Option<(crate::act_quant::ActFormat, usize)> =
+            self.act_quant.map(|q| (q.into(), self.act_group));
+        let use_kda = self.use_kda;
+        let use_msa = self.use_msa;
+        let use_engram = self.use_engram;
 
         for iter in 0..self.max_iter {
             let row = iter;

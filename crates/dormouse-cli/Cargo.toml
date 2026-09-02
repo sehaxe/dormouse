@@ -5,14 +5,17 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-cuda = ["dormouse-core/cuda", "dormouse-train/cuda", "burn/cuda"]
+default = ["cpu"]
+cpu = ["dormouse-train/cpu"]
+cuda = ["dormouse-core/cuda", "dormouse-train/cuda"]
 
 [dependencies]
 dormouse-core = { path = "../dormouse-core" }
 dormouse-data = { path = "../dormouse-data" }
-dormouse-train = { path = "../dormouse-train" }
-dormouse-bench = { path = "../dormouse-bench" }
+dormouse-train = { path = "../dormouse-train", default-features = false }
+dormouse-bench = { path = "../dormouse-bench", default-features = false }
 clap = { version = "4", features = ["derive"] }
+libc = "0.2"
 half = { version = "2.5", features = ["num-traits"] }
 rand = "0.8"
 axum = "0.7"

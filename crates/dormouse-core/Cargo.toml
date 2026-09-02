@@ -8,7 +8,6 @@ license.workspace = true
 burn = { version = "0.22.0-pre.3", default-features = false, features = ["std", "extension"] }
 burn-tensor = { version = "0.22.0-pre.3", default-features = false }
 burn-nn = { version = "0.22.0-pre.3", default-features = false }
-burn-ndarray = { version = "0.22.0-pre.3", features = ["blas-openblas"] }
 burn-cuda = { version = "0.22.0-pre.3", default-features = false, features = ["std"] }
 burn-kda = { path = "../../../burn-fused/crates/burn-kda" }
 burn-msa = { path = "../../../burn-fused/crates/burn-msa" }
@@ -19,6 +18,9 @@ burn-sct = { path = "../../../burn-fused/crates/burn-sct" }
 burn-spectral = { path = "../../../burn-fused/crates/burn-spectral" }
 half = { version = "2.5", features = ["num-traits"] }
 rand = "0.8"
+
+[dev-dependencies]
+burn-ndarray = { version = "0.22.0-pre.3", features = ["blas-openblas"] }
 
 [features]
 default = ["std"]
@@ -33,3 +35,7 @@ cuda = [
     "burn-sct/cuda",
     "burn-rmsnorm/cuda",
 ]
+# CUDA-only probe: burn-cuda types exist only with the cuda feature.
+[[example]]
+name = "quant_probe"
+required-features = ["cuda"]

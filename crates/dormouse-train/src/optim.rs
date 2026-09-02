@@ -99,13 +99,13 @@ fn muon_plus_cfg(cfg: &TrainCfg) -> MuonPlusConfig {
         .with_weight_decay(cfg.wd)
 }
 
-/// The Muon+ marker list in effect. `DM_FACTORS_FALLBACK=1` drops the expert
-/// TSCT factors from the Muon+ group (they are very elongated [d, r]/[r, f]
+/// The Muon+ marker list in effect. `factors_fallback` drops the expert TSCT
+/// factors from the Muon+ group (they are very elongated [d, r]/[r, f]
 /// shapes; the report found elongated low-rank projections did better with
 /// AdamW - A/B knob against the default Muon+ routing).
-fn effective_muon_markers() -> Vec<&'static str> {
+fn effective_muon_markers(factors_fallback: bool) -> Vec<&'static str> {
     let mut markers = MUON_PATH_MARKERS.to_vec();
-    if std::env::var("DM_FACTORS_FALLBACK").map(|v| v != "0").unwrap_or(false) {
+    if factors_fallback {
         markers.retain(|m| *m != "expert_ffns.");
     }
     markers
@@ -114,7 +114,7 @@ fn effective_muon_markers() -> Vec<&'static str> {
 /// Build the optimizer for `mode`, the pure core of [`build_optim`].
 pub(crate) fn build_optim_mode(cfg: &TrainCfg, mode: &str) -> Optim {
     let clip = (cfg.grad_clip > 0.0).then_some(GradientClippingConfig::Norm(cfg.grad_clip as f32));
-    let markers = effective_muon_markers();
+    let markers = effective_muon_markers(cfg.factors_fallback);
     let muon_group = || {
         ParamGroup::from_any_predicates(markers.clone())
             .exclude(ParamGroup::from_regex(r"\.s$").expect("valid regex"))
@@ -152,7 +152,7 @@ pub(crate) fn build_optim_mode(cfg: &TrainCfg, mode: &str) -> Optim {
 /// recipe does not clip (gates bound the activations, pre-clip norms stay
 /// low), and Muon+ has no clipping hook.
 pub fn build_optim(cfg: &TrainCfg) -> Optim {
-    build_optim_mode(cfg, &std::env::var("OPT").unwrap_or_default())
+    build_optim_mode(cfg, &cfg.opt)
 }
 
 /// Count parameters per optimizer group (Muon+ / Adam tables / AdamW rest).
@@ -206,10 +206,9 @@ impl ModuleVisitor for PathCollector {
 /// Re-check the routing policy against the live module tree. Fails loudly on
 /// any violation of the policy invariants or on a marker that matches nothing
 /// (stale after a module rename). Call once at startup, before training.
-/// Honors `DM_FACTORS_FALLBACK` (the same effective marker list the optimizer
-/// was built with).
-pub fn validate_routing(model: &DormouseModel) -> Result<GroupCounts, String> {
-    let markers = effective_muon_markers();
+/// `factors_fallback` must match the value the optimizer was built with.
+pub fn validate_routing(model: &DormouseModel, factors_fallback: bool) -> Result<GroupCounts, String> {
+    let markers = effective_muon_markers(factors_fallback);
     validate_routing_with(model, &markers, ENGRAM_TABLE_MARKER)
 }
 

@@ -20,6 +20,8 @@ pub struct DormouseModel {
     #[module(skip)]
     pub d_model: usize,
     #[module(skip)]
+    pub bf16: bool,
+    #[module(skip)]
     pub ponder_beta: f32,
     #[module(skip)]
     pub ponder_prior: f32,
@@ -36,6 +38,7 @@ impl DormouseModel {
             lm_head: LinearLike::new(d, v, cfg.rank.min(d).min(v), device),
             vocab_size: v,
             d_model: d,
+            bf16: cfg.bf16,
             ponder_beta: cfg.ponder_beta,
             ponder_prior: cfg.ponder_prior,
         }
@@ -73,7 +76,7 @@ impl DormouseModel {
             + DispatchKindConversion<burn::backend::Autodiff<B::InnerBackend>>,
     {
         let x = self.embedding.forward(input_ids);
-        let x = if crate::param::bf16_on() {
+        let x = if self.bf16 {
             x.cast(FloatDType::BF16)
         } else {
             x
@@ -86,7 +89,7 @@ impl DormouseModel {
                 .forward_full_state::<B>(x, hashed_ids, host_rows, None, tgt, &self.lm_head);
         // loop activations may be bf16; the final norm+head compute in fp32
         // (bf16 logits make the softmax/CE numerically unstable -> NaN).
-        let h = if crate::param::bf16_on() {
+        let h = if self.bf16 {
             self.norm.forward(out_acc.cast(FloatDType::F32))
         } else {
             self.norm.forward(out_acc)

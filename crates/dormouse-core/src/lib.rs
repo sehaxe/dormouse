@@ -8,10 +8,10 @@ pub mod model;
 pub mod param;
 
 pub use attention::AdaptiveAttention;
-pub use config::DormouseConfig;
+pub use config::{ActQuant, DormouseConfig};
 pub use loop_block::{ExpertFFN, LoopBlock};
 pub use model::DormouseModel;
-pub use param::{bf16_on, LinearLike};
+pub use param::LinearLike;
 
 pub fn fnv_hash(bytes: &[u8]) -> u64 {
     let mut h: u64 = 1469598103934665603;

@@ -17,19 +17,20 @@ dormouse = byte-level LM trainer in Rust (burn 0.22.0-pre.3 + cubecl CUDA) with 
 - Machine-local deps: `Cargo.toml` patches `cubecl-runtime`/`cubecl-cuda` to `/home/sehaxe/cubecl-fix/`, and `dormouse-core` path-deps `burn-*` crates from `/home/sehaxe/burn-fused/`. **Nothing builds without those directories.** No new dependency that duplicates them.
 - CUDA backend is default via `dormouse-train/cuda` feature; without it, NdArray (fp32 only, no bf16).
 - Check: `cargo check -p dormouse-core -p dormouse-train --features dormouse-train/cuda`. Tests: `cargo test -p dormouse-core -p dormouse-data -p dormouse-train --lib` (do NOT run bare `cargo test`: stale `examples/quant_probe.rs` doesn't compile against the current loss API). Release profile: `lto=thin`, `codegen-units=16` (full CPU during builds; the loop is GPU-bound, units=1 bought nothing).
-- Train: `cargo run -p dormouse-cli --bin train -- --data <dir> --preset small --ckpt-name <name> --ckpt-dir checkpoints [--eval <held-out-dir> --eval-every N]`. `runs/train.sh` restarts the release binary on device death (guard loop).
+- Train: `cargo build-train` (cargo alias: release CUDA binary, no OpenBLAS) then `./target/release/train --data <dir> --preset small --ckpt-name <name> --ckpt-dir checkpoints [--eval <held-out-dir> --eval-every N]`. Every knob is a typed CLI flag (`--help`); `--guard` re-execs on NaN/panic with a fresh CUDA context and resumes from the last checkpoint (no shell restart loop); `--log <file>` / `--detach` handle output and daemonization in-process. The GPU binary carries no OpenBLAS: the CPU ndarray backend is the optional `cpu` feature (default on for `cargo test`).
 - Docs are in Russian: `bf16_KERNEL_PLAN.md` (all-bf16 rules, quant plans), `POST_TRAINING.md` (SFT→RLVR→distill→self-evolve loop, EGGROLL). Read both before touching training code.
 
-## Env knobs (runtime switches, no rebuild)
+## Knobs (typed CLI flags on `train`; `--help` for the full list)
 
-- `BF16=1` — bf16 activations/weights (weights fp32→bf16 cast per forward). Off by default; burn-ndarray has no bf16 so CPU runs stay fp32.
-- `DM_NO_KDA` / `DM_KDA`, `DM_NO_MSA` / `DM_MSA`, `DM_NO_ENGRAM` — disable/force-enable attention arms (bisect/A-B). All presets set `use_kda`/`use_msa` true (config.rs doc comments claiming "default off" are stale — the values say otherwise), so `DM_NO_*` is the practical switch; `DM_*` only matters if a preset is flipped to false. Engram default on (`DM_NO_ENGRAM` off).
-- `DM_QUANT_DEBUG` — print quant format of every LinearLike forward.
-- `OPT=mix|mix-adan|adan|adamw|muon` — optimizer (see below, `optim.rs`). Default `mix`.
-- `DM_FACTORS_FALLBACK=1` — drop expert TSCT u/v factors from the Muon+ group to the fallback optimizer (A/B: the report kept elongated low-rank projections on AdamW).
-- `DM_RETRACT_EVERY` / `DM_RETRACT_ITERS` — TSCT U/V ortho maintenance cadence (default every 1 step, NS 3 iters; the plan's `max_ortho` monitor falls back to fp32 factors above 1e-3, checked every 50 steps).
-- `DM_STRESS=1` — stability stress protocol (report §3.3): constant LR at `DM_STRESS_LR`× the base, loss-spike counter (201-step median + 0.1), p99.9 pre-clip grad norm; `DM_STRESS_EVERY` log cadence (default 50).
-- `DM_ACT_QUANT=4|fp4|8` — BitNet a4.8-style activation quantization (STE, f32 graph; `core/src/act_quant.rs`): FFN activations at the format, attention path at max(bits, 8); `DM_ACT_GROUP=N` sets per-group scale size (0 = per-token). `fp4` = e2m1 round-to-nearest. Weight side (ternary/2-bit) is SpectralLinear's STE. Verified: fp4 + group 128, 100 steps, 0 NaN, convergence == fp32.
+- `--bf16` — bf16 activations/weights (weights fp32→bf16 cast per forward). Off by default; CPU runs stay fp32 (burn-ndarray has no bf16).
+- `--no-kda` / `--no-msa` / `--no-engram` — disable an attention/memory arm (bisect/A-B; presets set kda/msa/engram true).
+- `--quant fp32|bf16|fp16|fp8|fp4` — force the TSCT factor format (default: auto per SM).
+- `--opt mix|mix-adan|adan|adamw|muon` — optimizer (see below, `optim.rs`). Default `mix`.
+- `--factors-fallback` — drop expert TSCT u/v factors from the Muon+ group to the fallback optimizer.
+- `--retract-every N` / `--retract-iters K` — TSCT U/V ortho maintenance cadence (default every 1 step, NS 3 iters; `max_ortho` falls back to fp32 factors above 1e-3, checked every 50 steps).
+- `--stress --stress-lr X` — stability stress protocol (report §3.3): constant LR at X× the base, loss-spike counter (201-step median + 0.1), p99.9 pre-clip grad norm; `--stress-every` log cadence (default 50).
+- `--act-quant 4|int8|fp4` + `--act-group N` — BitNet a4.8-style activation quantization (STE, f32 graph; `core/src/act_quant.rs`): FFN activations at the format, attention path at max(bits, 8). Verified: fp4 + group 128, 100 steps, 0 NaN, convergence == fp32.
+- `DM_QUANT_DEBUG=1` remains the one env var (debug-only, prints every LinearLike quant format); `CUBECL_AUTOTUNE_LEVEL` is the cubecl runtime's own knob, exposed as `--autotune`.
 
 ## GPU/CUDA quirks (hard-won, do not rediscover)
 

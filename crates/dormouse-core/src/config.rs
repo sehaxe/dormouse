@@ -1,6 +1,35 @@
 //! dormouse config - all-bf16 scales, no fp32 master
+use crate::act_quant::ActFormat;
+
+/// BitNet a4.8-style activation quantization policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActQuant {
+    /// e2m1 fp4 (the paper's a4).
+    Fp4,
+    /// Symmetric int with `bits` levels (attention path runs at max(bits, 8)).
+    Int(u32),
+}
+
+impl From<ActQuant> for ActFormat {
+    fn from(q: ActQuant) -> Self {
+        match q {
+            ActQuant::Fp4 => ActFormat::Fp4,
+            ActQuant::Int(b) => ActFormat::Int(b),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DormouseConfig {
+    /// bf16 storage mode: activations stored in bf16, compute in fp32 (this
+    /// stack NaNs on mixed-dtype ops). Runtime cast policy only - weights and
+    /// checkpoints are unaffected.
+    pub bf16: bool,
+    /// Some(policy) quantizes FFN activations (attention path at
+    /// max(bits, 8)); None keeps them fp32.
+    pub act_quant: Option<ActQuant>,
+    /// Activation-quant scale group size (0 = per-token).
+    pub act_group: usize,
     pub d_model: usize,
     pub n_heads: usize,
     pub head_dim: usize,
@@ -17,13 +46,14 @@ pub struct DormouseConfig {
     pub rope_base: f64,
     pub msa_topk: usize,
     pub msa_block: usize,
-    /// burn-msa on pre.3 leaks autodiff nodes (~74 tensors/step): a long run
-    /// OOMs regardless of pool mode. Default off; env DM_NO_MSA / DM_MSA=1
-    /// override. Re-enable once burn-msa is fixed.
+    /// Sparse-attention arm (burn-msa). A/B switch: pre.3 leaked autodiff
+    /// nodes (~74 tensors/step) - re-enable after the leak is fixed.
     pub use_msa: bool,
-    /// burn-kda chunk-WY backward dominates step time (~3x slowdown at
-    /// batch 12/s512). Default off for speed; DM_NO_KDA / DM_KDA=1 override.
+    /// Gated-delta attention arm (burn-kda). A/B switch: its chunk-WY
+    /// backward dominates step time (~3x at batch 12/s512).
     pub use_kda: bool,
+    /// Engram n-gram memory arm (disable for bisecting).
+    pub use_engram: bool,
     /// Gated Residual (Qwen3.8-Flash-Next §2.2) instead of pre-norm + ReZero:
     /// 4-branch residual stream, sigmoid-gated read, scalar writes. Off by
     /// default (checkpoint-compatible); the report's stability/loss wins come
@@ -47,7 +77,7 @@ impl DormouseConfig {
             d_ffn: 2048,
             vocab: 256,
             max_seq_len: 512,
-            max_iter: std::env::var("DM_MAX_ITER").ok().and_then(|v| v.parse().ok()).unwrap_or(8),
+            max_iter: 8,
             rank: 64,
             halt_theta: 0.9,
             ponder_w: 0.05,
@@ -57,8 +87,12 @@ impl DormouseConfig {
             rope_base: 10000.0,
             msa_topk: 8,
             msa_block: 32,
+            bf16: false,
+            act_quant: None,
+            act_group: 0,
             use_msa: true,
             use_kda: true,
+            use_engram: true,
             use_gr: false,
             keep_frac: 0.5,
             dropout: 0.0,
@@ -85,8 +119,12 @@ impl DormouseConfig {
             rope_base: 10000.0,
             msa_topk: 8,
             msa_block: 32,
+            bf16: false,
+            act_quant: None,
+            act_group: 0,
             use_msa: true,
             use_kda: true,
+            use_engram: true,
             use_gr: false,
             keep_frac: 0.5,
             dropout: 0.0,
@@ -114,8 +152,12 @@ impl DormouseConfig {
             rope_base: 10000.0,
             msa_topk: 8,
             msa_block: 32,
+            bf16: false,
+            act_quant: None,
+            act_group: 0,
             use_msa: true,
             use_kda: true,
+            use_engram: true,
             use_gr: false,
             keep_frac: 0.5,
             dropout: 0.0,

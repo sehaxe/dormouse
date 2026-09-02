@@ -1,7 +1,6 @@
 //! dormouse-train - CUDA training loop: Autodiff backend, Muon+ mixed
 //! optimizer (see `optim`), burnpack checkpoints with custom name, resume,
 //! opencode harness.
-pub mod harness;
 mod offload;
 mod optim;
 mod stress;
@@ -16,7 +15,7 @@ use burn::{
     tensor::{Bytes, Device, FloatDType, Int, Tensor, TensorData},
 };
 
-use dormouse_core::{DormouseConfig, DormouseModel};
+use dormouse_core::{ActQuant, DormouseConfig, DormouseModel};
 
 pub use optim::{
     build_optim, is_engram_table_param, is_muon_param, validate_routing, GroupCounts, MUON_NS_STEPS,
@@ -28,11 +27,13 @@ pub type Backend = burn::backend::autodiff::Autodiff<
     burn_cuda::Cuda,
     burn::backend::autodiff::checkpoint::strategy::BalancedCheckpointing,
 >;
-#[cfg(not(feature = "cuda"))]
+#[cfg(all(feature = "cpu", not(feature = "cuda")))]
 pub type Backend = burn::backend::autodiff::Autodiff<
     burn_ndarray::NdArray,
     burn::backend::autodiff::checkpoint::strategy::BalancedCheckpointing,
 >;
+#[cfg(not(any(feature = "cpu", feature = "cuda")))]
+compile_error!("dormouse-train: enable a backend feature (cpu or cuda)");
 
 pub type Optim = burn::optim::ModuleOptimizer;
 
@@ -50,6 +51,43 @@ pub struct TrainCfg {
     /// eval cadence in steps (0 = off). When >0 and an eval data dir is given,
     /// a held-out cross-entropy is reported every `eval_every` steps.
     pub eval_every: usize,
+    /// Optimizer mode: "mix" | "mix-adan" | "adamw" | "adan" | "muon".
+    pub opt: String,
+    /// Forced quantization format ("fp32"|"bf16"|"fp16"|"fp8"|"fp4");
+    /// None = auto (sm_120 -> Fp8, bf16 mode -> Bf16, else Fp32).
+    pub quant: Option<String>,
+    /// Drop expert TSCT factors from the Muon+ group to the fallback (A/B).
+    pub factors_fallback: bool,
+    /// TSCT U/V retraction cadence / Newton-Schulz iterations.
+    pub retract_every: usize,
+    pub retract_iters: usize,
+    /// Stress protocol (report §3.3): constant LR at `stress_lr`x, spike
+    /// counter + p99.9 grad norm logged every `stress_every` steps.
+    pub stress: bool,
+    pub stress_lr: f64,
+    pub stress_every: usize,
+    /// RAM-offload Engram tables (host memory, CPU Adam) with slot count.
+    pub engram_ram: bool,
+    pub engram_slots: usize,
+    /// Two fwd+bwd warmup steps before the loop (raises the pool high-water
+    /// early); keep on for long runs.
+    pub warmup: bool,
+    /// One-off quant-fidelity probe on the first step (debug).
+    pub quant_check: bool,
+    /// Print per-step GPU/CPU time split every 50 steps (forces a sync).
+    pub timers: bool,
+    /// Print cubecl pool stats at log cadence (forces a sync).
+    pub memlog: bool,
+    /// bf16 storage mode (activations bf16, compute fp32).
+    pub bf16: bool,
+    /// Model-config overrides; `None` keeps the preset value.
+    pub act_quant: Option<ActQuant>,
+    pub act_group: Option<usize>,
+    pub max_iter: Option<usize>,
+    /// Disable a model arm for A/B (KDA / MSA / Engram).
+    pub no_kda: bool,
+    pub no_msa: bool,
+    pub no_engram: bool,
 }
 
 impl Default for TrainCfg {
@@ -58,6 +96,13 @@ impl Default for TrainCfg {
             steps: 100000, ckpt_every: 1000, log_every: 100,
             seq_len: 512, batch: 3, lr: 1e-4, wd: 0.01, grad_clip: 1.0,
             ckpt_name: "latest".into(), eval_every: 0,
+            opt: "mix".into(), quant: None, factors_fallback: false,
+            retract_every: 1, retract_iters: 3,
+            stress: false, stress_lr: 1.0, stress_every: 50,
+            engram_ram: false, engram_slots: 1_000_000,
+            warmup: true, quant_check: false, timers: false, memlog: false,
+            bf16: false, act_quant: None, act_group: None, max_iter: None,
+            no_kda: false, no_msa: false, no_engram: false,
         }
     }
 }
@@ -65,7 +110,7 @@ impl Default for TrainCfg {
 fn device() -> Device {
     #[cfg(feature = "cuda")]
     { Device::cuda(0).autodiff() }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(all(feature = "cpu", not(feature = "cuda")))]
     { Device::ndarray().autodiff() }
 }
 
@@ -170,10 +215,10 @@ pub fn wsd_factor(step: u64, total: u64, base_lr: f64) -> f64 {
 /// sm_86 (Ampere, 3090) -> Bf16/Fp16, everything else -> Fp32.
 /// DM_QUANT=fp32|bf16|fp16|fp8|fp4 forces a format (emulation anywhere).
 #[cfg(feature = "cuda")]
-pub fn quant_format(device: &Device) -> burn_spectral::QuantFormat {
+pub fn quant_format(device: &Device, forced: Option<&str>, bf16: bool) -> burn_spectral::QuantFormat {
     use burn_spectral::QuantFormat;
-    if let Ok(v) = std::env::var("DM_QUANT") {
-        return match v.as_str() {
+    if let Some(v) = forced {
+        return match v {
             "fp32" => QuantFormat::Fp32,
             "bf16" => QuantFormat::Bf16,
             "fp16" => QuantFormat::Fp16,
@@ -186,7 +231,7 @@ pub fn quant_format(device: &Device) -> burn_spectral::QuantFormat {
     // BF16 mode runs bf16 activations: the factors must match (bf16 quant),
     // not the fp32/fp8 split the plain mode picks per SM. A Fp8-quantized
     // factor under bf16 activations is an inconsistent mix.
-    if dormouse_core::param::bf16_on() {
+    if bf16 {
         QuantFormat::Bf16
     } else if sm >= 120 {
         QuantFormat::Fp8
@@ -195,7 +240,7 @@ pub fn quant_format(device: &Device) -> burn_spectral::QuantFormat {
     }
 }
 #[cfg(not(feature = "cuda"))]
-pub fn quant_format(_device: &Device) -> burn_spectral::QuantFormat {
+pub fn quant_format(_device: &Device, _forced: Option<&str>, _bf16: bool) -> burn_spectral::QuantFormat {
     burn_spectral::QuantFormat::Fp32
 }
 
@@ -273,42 +318,46 @@ pub fn train_loop(
 ) -> Result<(), String> {
     let dir = ckpt_dir.unwrap_or_else(|| PathBuf::from("checkpoints"));
     let _ = std::fs::create_dir_all(&dir);
-    let dorm_cfg: DormouseConfig = match preset.as_str() {
+    let mut dorm_cfg: DormouseConfig = match preset.as_str() {
         "base" => DormouseConfig::base(),
         "one_b" => DormouseConfig::one_b(),
         _ => DormouseConfig::small(),
     };
+    // Model overrides requested by the caller (CLI flags).
+    dorm_cfg.bf16 = cfg.bf16;
+    if let Some(q) = cfg.act_quant { dorm_cfg.act_quant = Some(q); }
+    if let Some(g) = cfg.act_group { dorm_cfg.act_group = g; }
+    if let Some(mi) = cfg.max_iter { dorm_cfg.max_iter = mi; }
+    if cfg.no_kda { dorm_cfg.use_kda = false; }
+    if cfg.no_msa { dorm_cfg.use_msa = false; }
+    if cfg.no_engram { dorm_cfg.use_engram = false; }
     let device = device();
     init_pools(&device);
     let mut model = DormouseModel::new(&dorm_cfg, &device);
-    let qfmt = quant_format(&device);
+    let qfmt = quant_format(&device, cfg.quant.as_deref(), dorm_cfg.bf16);
     if qfmt != burn_spectral::QuantFormat::Fp32 {
         model.loop_block.set_quant_all(qfmt);
         println!("quant format: {qfmt:?} ({} bits)", qfmt.bits());
     }
     // True bf16 compute: matmuls run on bf16 (tensor cores) through the
     // custom autodiff op; the graph and backward stay fp32.
-    if dormouse_core::param::bf16_on() {
+    if dorm_cfg.bf16 {
         model.set_bf16_compute(true);
         println!("bf16 compute: tensor-core matmuls, fp32 graph");
     }
     let mut optim = build_optim(&cfg);
     // Fail fast if the routing policy no longer matches the model (stale
     // marker after a module rename would silently degrade to AdamW).
-    let gc = validate_routing(&model)
+    let gc = validate_routing(&model, cfg.factors_fallback)
         .unwrap_or_else(|e| panic!("optimizer routing check failed: {e}"));
-    let opt_name = match std::env::var("OPT").unwrap_or_default().as_str() {
+    let opt_name = match cfg.opt.as_str() {
         "adan" => "Adan (all params)".to_string(),
         "adamw" => "AdamW (all params)".to_string(),
         "muon" => "Muon+ ColRow (all params, 1D -> Muon+'s AdamW)".to_string(),
         "mix-adan" => format!("Muon+ ColRow ns={MUON_NS_STEPS} + Adam wd0 (tables) + Adan (rest)"),
         _ => format!("Muon+ ColRow ns={MUON_NS_STEPS} + Adam wd0 (tables) + AdamW (rest)"),
     };
-    let factors = if std::env::var("DM_FACTORS_FALLBACK").map(|v| v != "0").unwrap_or(false) {
-        " (expert TSCT factors on fallback)"
-    } else {
-        ""
-    };
+    let factors = if cfg.factors_fallback { " (expert TSCT factors on fallback)" } else { "" };
     println!("optimizer: {opt_name}{factors} [muon={} tables={} rest={}]", gc.muon, gc.tables, gc.rest);
     let mut step = load_ckpt(&dir, &cfg.ckpt_name, &dorm_cfg, &mut model, &mut optim).unwrap_or(0);
     if step > 0 { println!("resumed {} from {} step {step}", cfg.ckpt_name, dir.display()); }
@@ -316,15 +365,12 @@ pub fn train_loop(
     let mut eval_stream =
         eval_data.as_ref().map(|p| dormouse_data::ByteStream::new(cfg.seq_len, cfg.batch, p));
     let mut best = f32::INFINITY;
-    let mut stress = StressMonitor::from_env();
+    let mut stress = cfg.stress.then(|| StressMonitor::new(cfg.stress_lr, cfg.stress_every));
     // RAM-offload n-gram tables (report §2.3): DM_ENGRAM_RAM=1 keeps the
     // tables in host memory (millions of slots in the 64 GB RAM), trains
     // them with CPU Adam, and copies only the batch's rows to the GPU.
-    let mut host: Option<offload::HostNgram> = if std::env::var("DM_ENGRAM_RAM").map(|v| v != "0").unwrap_or(false) {
-        let slots = std::env::var("DM_ENGRAM_SLOTS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(1_000_000);
+    let mut host: Option<offload::HostNgram> = if cfg.engram_ram {
+        let slots = cfg.engram_slots;
         let ng_path = dir.join(format!("{}.ngram", cfg.ckpt_name));
         let h = offload::HostNgram::new([slots, slots, slots], 32, 0x1234_5678);
         let h = std::fs::read(&ng_path)
@@ -347,7 +393,7 @@ pub fn train_loop(
     );
     // #7 warmup: 2 fwd+bwd at full depth raise the pool high-water before the
     // loop (then cleanup returns the pages - later steps reuse cached blocks).
-    if std::env::var("DM_NO_WARMUP").is_err() && step == 0 {
+    if cfg.warmup && step == 0 {
         let (bytes, hashes) = stream.next_batch();
         let (x, h) = bytes_to_tensors::<Backend>(&bytes, &hashes, cfg.seq_len, cfg.batch, &device);
         let shifted: Vec<i64> = bytes.iter().skip(1).chain(std::iter::once(&bytes[0])).map(|&b| b as i64).collect();
@@ -363,7 +409,7 @@ pub fn train_loop(
     // quant fidelity check: quantized model vs fp32 reference on one batch.
     // DM_QUANT_CHECK=1 prints max/mean logit deviation + loss delta so Fp8/Fp4
     // viability is measured, not assumed.
-    if std::env::var("DM_QUANT_CHECK").is_ok() && qfmt != burn_spectral::QuantFormat::Fp32 && step == 0 {
+    if cfg.quant_check && qfmt != burn_spectral::QuantFormat::Fp32 && step == 0 {
         let (bytes, hashes) = stream.next_batch();
         let (x, h) = bytes_to_tensors::<Backend>(&bytes, &hashes, cfg.seq_len, cfg.batch, &device);
         let shifted: Vec<i64> = bytes.iter().skip(1).chain(std::iter::once(&bytes[0])).map(|&b| b as i64).collect();
@@ -411,14 +457,6 @@ pub fn train_loop(
     let (mut pbytes, mut phashes) = stream.next_batch();
     let mut         pshift: Vec<i64> = pbytes.iter().skip(1).chain(std::iter::once(&pbytes[0])).map(|&b| b as i64).collect();
     let mut ce = f32::NAN;
-    // Runtime knobs, read once: env::var takes a process-wide lock, and the
-    // loop is CPU-latency-sensitive (every host microsecond is one the GPU
-    // spends idle once the queue drains).
-    let retract_every: u64 = std::env::var("DM_RETRACT_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
-    let retract_iters: usize = std::env::var("DM_RETRACT_ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
-    let timers_on = std::env::var("DM_TIMERS").is_ok();
-    let memlog_on = std::env::var("DM_MEMLOG").is_ok();
-    let harness_on = std::env::var("DM_HARNESS").map(|v| v != "0").unwrap_or(false);
     while step < cfg.steps as u64 {
         let t_iter = std::time::Instant::now();
         let (bytes, hashes) = (std::mem::replace(&mut pbytes, Vec::new()), std::mem::replace(&mut phashes, Vec::new()));
@@ -516,8 +554,8 @@ pub fn train_loop(
         // every step so the quantized forward stays faithful; monitor the
         // drift at cadence and fall back to fp32 factors when it exceeds the
         // plan's 1e-3 threshold. DM_RETRACT_EVERY / DM_RETRACT_ITERS override.
-        if step % retract_every == 0 {
-            model.retract_tsct(retract_iters);
+        if step % cfg.retract_every.max(1) as u64 == 0 {
+            model.retract_tsct(cfg.retract_iters);
         }
         if step % 50 == 0 {
             let ortho = model.max_ortho();
@@ -527,7 +565,7 @@ pub fn train_loop(
             }
         }
 
-        if timers_on && step % 50 == 0 {
+        if cfg.timers && step % 50 == 0 {
             // Force a device sync so the elapsed wall time equals the true GPU
             // step time (forward+backward+optim+retract). data_ms is the CPU
             // side (read + bytes_to_tensors). Their difference is GPU compute.
@@ -541,7 +579,7 @@ pub fn train_loop(
         if step % cfg.log_every as u64 == 0 {
             let bpb = dormouse_bench::bpb(ce);
             // pool_stats syncs the device; only with DM_MEMLOG=1
-            let mem = if memlog_on { pool_stats(&device) } else { String::new() };
+            let mem = if cfg.memlog { pool_stats(&device) } else { String::new() };
             println!("step {step:6} ce={ce:.3} bpb={bpb:.3} best={best:.3} lr={lr:.2e} {mem}");
             if let Some(s) = stress.as_ref() {
                 if let Some(line) = s.report(step) {
@@ -603,11 +641,6 @@ pub fn train_loop(
                 let _ = std::fs::write(dir.join(format!("{}.ngram", cfg.ckpt_name)), h.to_bytes());
             }
             println!("ckpt {}.bin saved step {step}", cfg.ckpt_name);
-        }
-        // opencode harness: an external CLI call that stalls the loop while
-        // the GPU idles, so it is opt-in (DM_HARNESS=1).
-        if harness_on && step > 0 && step % 2000 == 0 {
-            let _ = harness::run(&format!("step {step} ce {ce:.3}"));
         }
         if step % 50 == 0 {
             memory_cleanup(&device);
@@ -721,7 +754,7 @@ mod tests {
         let cfg = test_cfg();
         let model = DormouseModel::new(&cfg, &device());
         let expected_muon = 4 * cfg.n_experts + 3;
-        let c = validate_routing(&model).expect("policy must hold on the live model");
+        let c = validate_routing(&model, false).expect("policy must hold on the live model");
         assert_eq!(c.muon, expected_muon, "Muon+ group must match the topology");
         assert_eq!(c.tables, 1, "n-gram tables group");
         assert!(c.rest > 0);

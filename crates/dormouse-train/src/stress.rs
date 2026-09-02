@@ -4,9 +4,8 @@
 //! holding the LR constant at a multiple of the optimum: loss spikes
 //! (step above a 201-step rolling median + 0.1), p99.9 pre-clip grad norm
 //! and activation outliers separate a stable recipe from a fragile one
-//! within a few hundred steps. Enable with `DM_STRESS=1` (constant LR,
-//! default 1x, multiplier via `DM_STRESS_LR`), log cadence via
-//! `DM_STRESS_EVERY` (default 50).
+//! within a few hundred steps. Enabled via `TrainCfg::stress` (constant LR
+//! at `stress_lr`x), report cadence via `stress_every`.
 
 use std::collections::VecDeque;
 
@@ -27,28 +26,16 @@ pub struct StressMonitor {
 }
 
 impl StressMonitor {
-    /// Build from env: `DM_STRESS=1` enables, `DM_STRESS_LR` sets the LR
-    /// multiplier, `DM_STRESS_EVERY` the report cadence.
-    pub fn from_env() -> Option<Self> {
-        let on = std::env::var("DM_STRESS").map(|v| v != "0").unwrap_or(false);
-        if !on {
-            return None;
-        }
-        let lr_mult = std::env::var("DM_STRESS_LR")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1.0);
-        let log_every: usize = std::env::var("DM_STRESS_EVERY")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(50);
-        Some(Self {
+    /// Constant-LR monitor at `lr_mult`x the base LR, reporting every
+    /// `log_every` steps.
+    pub fn new(lr_mult: f64, log_every: usize) -> Self {
+        Self {
             lr_mult,
             history: VecDeque::with_capacity(201),
             spikes: 0,
             grad_norms: Vec::new(),
             log_every,
-        })
+        }
     }
 
     /// Constant LR (no WSD decay): the stress protocol's defining switch.

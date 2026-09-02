@@ -7,15 +7,6 @@ use burn::backend::DispatchKindConversion;
 use burn_spectral::SpectralLinear;
 use burn_sct::SctLinear;
 
-/// bf16 mode env flag: activations stream in bf16, weights fp32 cast per
-/// forward (burn-ndarray has no bf16 dtype -> CPU tests stay fp32).
-/// Cached: this sits in the per-iteration hot path and `env::var` takes a
-/// process-wide lock on every call.
-pub fn bf16_on() -> bool {
-    static BF16: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *BF16.get_or_init(|| std::env::var("BF16").map(|v| v != "0").unwrap_or(false))
-}
-
 /// DM_QUANT_DEBUG, read once per process (queried by every LinearLike
 /// forward otherwise).
 fn quant_debug_on() -> bool {

@@ -1,2 +1,5 @@
-[build]
-target-dir = "/home/sehaxe/dormouse/target"
+# CUDA trainer is built WITHOUT the cpu feature so the GPU binary never
+# links OpenBLAS (burn-ndarray's blas backend); no LD_LIBRARY_PATH needed.
+[alias]
+build-train = "build --release -p dormouse-cli --bin train --no-default-features --features cuda"
+check-train = "check -p dormouse-cli --bin train --no-default-features --features cuda"

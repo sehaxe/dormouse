@@ -15,6 +15,8 @@ pub struct AdaptiveAttention {
     pub d_model: usize,
     #[module(skip)]
     pub block_size: usize,
+    #[module(skip)]
+    pub bf16: bool,
 }
 
 impl AdaptiveAttention {
@@ -25,6 +27,7 @@ impl AdaptiveAttention {
         rank: usize,
         msa_block: usize,
         msa_topk: usize,
+        bf16: bool,
         device: &Device,
     ) -> Self {
         let kda_cfg = burn_kda::KdaConfig {
@@ -53,6 +56,7 @@ impl AdaptiveAttention {
             router: LinearLike::new(d_model, 1, rank.min(d_model).min(1), device),
             d_model,
             block_size: msa_block,
+            bf16,
         }
     }
 
@@ -75,7 +79,7 @@ impl AdaptiveAttention {
     {
         let [b, t, d] = x.dims();
         let route = self.router.forward::<B>(x.reshape([b * t, d]));
-        let route = if crate::param::bf16_on() {
+        let route = if self.bf16 {
             route.cast(FloatDType::F32)
         } else {
             route
