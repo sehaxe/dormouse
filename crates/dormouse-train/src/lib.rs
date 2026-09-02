@@ -260,13 +260,17 @@ pub fn load_ckpt(dir: &Path, name: &str, cfg: &DormouseConfig, model: &mut Dormo
     Some(step)
 }
 
+/// Run pretraining. Returns `Err` on a fatal device condition (NaN loss /
+/// unreadable loss scalar) with the last good checkpoint already on disk, so
+/// the caller may resume by re-running with the same `ckpt_name`. On success
+/// the final checkpoint is saved and `Ok(())` returned.
 pub fn train_loop(
     cfg: TrainCfg,
     data: PathBuf,
     preset: String,
     ckpt_dir: Option<PathBuf>,
     eval_data: Option<PathBuf>,
-) {
+) -> Result<(), String> {
     let dir = ckpt_dir.unwrap_or_else(|| PathBuf::from("checkpoints"));
     let _ = std::fs::create_dir_all(&dir);
     let dorm_cfg: DormouseConfig = match preset.as_str() {
@@ -484,13 +488,11 @@ pub fn train_loop(
             let ce_now: f32 = match loss_log.clone().try_into_scalar() {
                 Ok(v) => v,
                 Err(_) => {
-                    println!("step {step} device error - exit");
-                    std::process::exit(1);
+                    return Err(format!("step {step}: device error (loss is not a scalar)"));
                 }
             };
             if !ce_now.is_finite() {
-                println!("step {step} NaN loss - exit (last good ckpt kept)");
-                std::process::exit(1);
+                return Err(format!("step {step}: NaN loss (last good ckpt kept)"));
             }
             ce = ce_now;
             if ce < best { best = ce; }
@@ -614,6 +616,7 @@ pub fn train_loop(
     }
     let _ = save_ckpt(&dir, &cfg.ckpt_name, &model, &optim, step, best);
     println!("done steps={step} best ce={best:.3}");
+    Ok(())
 }
 
 /// Load weights only (inference) from a named ckpt container.
