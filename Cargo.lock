@@ -1298,6 +1298,7 @@ dependencies = [
  "burn-autodiff",
  "burn-bitnet",
  "burn-cubecl",
+ "burn-cuda",
  "burn-nn",
  "burn-tensor",
  "cubecl",
