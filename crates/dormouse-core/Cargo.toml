@@ -14,6 +14,8 @@ burn-msa = { path = "../../../burn-fused/crates/burn-msa" }
 burn-bitnet = { path = "../../../burn-fused/crates/burn-bitnet" }
 burn-engram = { path = "../../../burn-fused/crates/burn-engram" }
 burn-rmsnorm = { path = "../../../burn-fused/crates/burn-rmsnorm" }
+burn-jepa = { path = "../../../burn-fused/crates/burn-jepa" }
+burn-dspark = { path = "../../../burn-fused/crates/burn-dspark", features = ["training"] }
 burn-sct = { path = "../../../burn-fused/crates/burn-sct" }
 burn-spectral = { path = "../../../burn-fused/crates/burn-spectral" }
 half = { version = "2.5", features = ["num-traits"] }

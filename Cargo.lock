@@ -1054,6 +1054,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "burn-dspark"
+version = "0.1.0"
+dependencies = [
+ "burn",
+ "burn-tensor",
+]
+
+[[package]]
 name = "burn-engram"
 version = "0.1.0"
 dependencies = [
@@ -1123,6 +1131,14 @@ dependencies = [
  "burn-backend",
  "hashbrown 0.16.1",
  "serde",
+]
+
+[[package]]
+name = "burn-jepa"
+version = "0.1.0"
+dependencies = [
+ "burn",
+ "burn-tensor",
 ]
 
 [[package]]
@@ -2770,7 +2786,9 @@ dependencies = [
  "burn",
  "burn-bitnet",
  "burn-cuda",
+ "burn-dspark",
  "burn-engram",
+ "burn-jepa",
  "burn-kda",
  "burn-msa",
  "burn-ndarray",

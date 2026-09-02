@@ -64,6 +64,22 @@ pub struct DormouseConfig {
     pub n_experts: usize,
     /// PonderNet KL weight β (Banino et al. 2021).
     pub ponder_beta: f32,
+    /// JEPA auxiliary weight (data2vec 2.0, burn-jepa): the EMA-teacher
+    /// latent is predicted at span-masked positions. 0 = off. Pure helper -
+    /// CE stays the primary objective; causality forbids the identity
+    /// shortcut, so the latent must encode predictive abstractions.
+    pub jepa_weight: f32,
+    /// JEPA masked-position fraction (span-dilated masks, burn-jepa).
+    pub jepa_mask_frac: f32,
+    /// JEPA contiguous mask span length.
+    pub jepa_mask_span: usize,
+    /// DSpark auxiliary weight (DeepSeek draft head, used instead of MTP):
+    /// corrects frozen backbone logits into the next-K tokens. 0 = off.
+    pub dspark_weight: f32,
+    /// DSpark draft depth K (tokens per anchor window).
+    pub dspark_k: usize,
+    /// DSpark anchor stride in bytes.
+    pub dspark_stride: usize,
     /// PonderNet geometric-prior parameter λ_p (sets expected halting steps ≈ 1/λ_p).
     pub ponder_prior: f32,
 }
@@ -99,6 +115,12 @@ impl DormouseConfig {
             n_experts: 3,
             ponder_beta: 0.01,
             ponder_prior: 2.0 / 9.0,
+            jepa_weight: 0.05,
+            jepa_mask_frac: 0.15,
+            jepa_mask_span: 8,
+            dspark_weight: 0.1,
+            dspark_k: 4,
+            dspark_stride: 16,
         }
     }
     pub fn base() -> Self {
@@ -131,6 +153,12 @@ impl DormouseConfig {
             n_experts: 3,
             ponder_beta: 0.01,
             ponder_prior: 2.0 / 9.0,
+            jepa_weight: 0.05,
+            jepa_mask_frac: 0.15,
+            jepa_mask_span: 8,
+            dspark_weight: 0.1,
+            dspark_k: 4,
+            dspark_stride: 16,
         }
     }
     /// 1B config - d=2048, 24 layers equivalent via loop 8*3 experts
@@ -164,6 +192,12 @@ impl DormouseConfig {
             n_experts: 4,
             ponder_beta: 0.01,
             ponder_prior: 2.0 / 13.0,
+            jepa_weight: 0.05,
+            jepa_mask_frac: 0.15,
+            jepa_mask_span: 8,
+            dspark_weight: 0.1,
+            dspark_k: 4,
+            dspark_stride: 16,
         }
     }
 }

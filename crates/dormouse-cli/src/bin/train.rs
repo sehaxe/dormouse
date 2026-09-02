@@ -71,6 +71,19 @@ struct Args {
     #[arg(long, default_value = "false")]
     no_engram: bool,
 
+    // --- auxiliary objectives (helpers on top of CE) ---
+    /// JEPA aux weight (EMA-teacher masked latent prediction). 0 = off;
+    /// default: preset (0.05).
+    #[arg(long)]
+    jepa_weight: Option<f32>,
+    /// DSpark aux weight (DeepSeek draft head, instead of MTP). 0 = off;
+    /// default: preset (0.1).
+    #[arg(long)]
+    dspark_weight: Option<f32>,
+    /// DSpark draft depth K (default: preset, 4).
+    #[arg(long)]
+    dspark_k: Option<usize>,
+
     // --- quantization / maintenance ---
     /// Force factor-quant format: fp32 | bf16 | fp16 | fp8 | fp4.
     #[arg(long)]
@@ -167,6 +180,9 @@ fn run(a: Args) -> Result<(), String> {
         no_kda: a.no_kda,
         no_msa: a.no_msa,
         no_engram: a.no_engram,
+        jepa_weight: a.jepa_weight,
+        dspark_weight: a.dspark_weight,
+        dspark_k: a.dspark_k,
     };
     dormouse_train::train_loop(
         cfg,

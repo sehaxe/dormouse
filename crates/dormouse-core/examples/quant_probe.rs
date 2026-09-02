@@ -73,9 +73,9 @@ fn main() {
         burn::tensor::Tensor::from_data(burn::tensor::TensorData::new(ids.clone(), [2, 64]), &device);
     let yb: burn::tensor::Tensor<2, burn::tensor::Int> =
         burn::tensor::Tensor::from_data(burn::tensor::TensorData::new(ids, [2, 64]), &device);
-    let (_lp, rec_p, pd_p, _k) = m_plain.forward_with_hidden::<B>(xb.clone(), None, None, Some(yb.clone()));
+    let (_lp, rec_p, pd_p, _k, _ap) = m_plain.forward_with_hidden::<B>(xb.clone(), None, None, Some(yb.clone()), None);
     let l_plain: f32 = m_plain.loss::<B>(rec_p, pd_p).try_into_scalar().unwrap();
-    let (_lq, rec_q, pd_q, _k) = m_quant.forward_with_hidden::<B>(xb, None, None, Some(yb));
+    let (_lq, rec_q, pd_q, _k, _aq) = m_quant.forward_with_hidden::<B>(xb, None, None, Some(yb), None);
     let l_quant: f32 = m_quant.loss::<B>(rec_q, pd_q).try_into_scalar().unwrap();
     println!("model loss: fp32={l_plain:.4} fp4={l_quant:.4} delta={:.4}", (l_plain - l_quant).abs());
 }

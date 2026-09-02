@@ -1,5 +1,6 @@
 //! dormouse-core - all-bf16 mini Aria on burn-fused kernels (CUDA)
 pub mod act_quant;
+pub mod aux;
 pub mod attention;
 pub mod config;
 pub mod gr;
@@ -8,6 +9,7 @@ pub mod model;
 pub mod param;
 
 pub use attention::AdaptiveAttention;
+pub use aux::{AuxHeads, TEACHER_MOMENTUM};
 pub use config::{ActQuant, DormouseConfig};
 pub use loop_block::{ExpertFFN, LoopBlock};
 pub use model::DormouseModel;

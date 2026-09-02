@@ -31,6 +31,7 @@ dormouse = byte-level LM trainer in Rust (burn 0.22.0-pre.3 + cubecl CUDA) with 
 - `--stress --stress-lr X` — stability stress protocol (report §3.3): constant LR at X× the base, loss-spike counter (201-step median + 0.1), p99.9 pre-clip grad norm; `--stress-every` log cadence (default 50).
 - `--act-quant 4|int8|fp4` + `--act-group N` — BitNet a4.8-style activation quantization (STE, f32 graph; `core/src/act_quant.rs`): FFN activations at the format, attention path at max(bits, 8). Verified: fp4 + group 128, 100 steps, 0 NaN, convergence == fp32.
 - `DM_QUANT_DEBUG=1` remains the one env var (debug-only, prints every LinearLike quant format); `CUBECL_AUTOTUNE_LEVEL` is the cubecl runtime's own knob, exposed as `--autotune`.
+- `--jepa-weight` / `--dspark-weight` / `--dspark-k` — auxiliary objectives on top of CE (`core/src/aux.rs`, ON by default at 0.05 / 0.1 / K=4): JEPA = data2vec-style masked latent prediction against an EMA teacher (burn-jepa; momentum 0.999, teacher advanced after every optimizer step) + KoLeo anti-collapse; DSpark = DeepSeek-style draft head correcting frozen logits into the next-K tokens (burn-dspark, used instead of MTP; gamma 4.0). Aux value is logged as `aux=` on log steps. Set both weights to 0 for the pure-CE baseline.
 
 ## GPU/CUDA quirks (hard-won, do not rediscover)
 

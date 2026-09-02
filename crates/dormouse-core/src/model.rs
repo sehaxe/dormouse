@@ -5,6 +5,7 @@ use burn::nn::{Embedding, EmbeddingConfig};
 use burn::tensor::{Device, DispatchTensor, FloatDType, Int, Tensor, TensorData};
 use burn_rmsnorm::RMSNorm;
 
+use crate::aux::AuxHeads;
 use crate::config::DormouseConfig;
 use crate::loop_block::LoopBlock;
 use crate::param::LinearLike;
@@ -15,12 +16,25 @@ pub struct DormouseModel {
     pub loop_block: LoopBlock,
     pub norm: RMSNorm,
     pub lm_head: LinearLike,
+    pub aux: AuxHeads,
     #[module(skip)]
     pub vocab_size: usize,
     #[module(skip)]
     pub d_model: usize,
     #[module(skip)]
     pub bf16: bool,
+    #[module(skip)]
+    pub jepa_weight: f32,
+    #[module(skip)]
+    pub jepa_mask_frac: f32,
+    #[module(skip)]
+    pub jepa_mask_span: usize,
+    #[module(skip)]
+    pub dspark_weight: f32,
+    #[module(skip)]
+    pub dspark_k: usize,
+    #[module(skip)]
+    pub dspark_stride: usize,
     #[module(skip)]
     pub ponder_beta: f32,
     #[module(skip)]
@@ -36,9 +50,16 @@ impl DormouseModel {
             loop_block: LoopBlock::new(cfg, device),
             norm: RMSNorm::new(d, cfg.norm_eps, device),
             lm_head: LinearLike::new(d, v, cfg.rank.min(d).min(v), device),
+            aux: AuxHeads::new(d, v, cfg.rank, device),
             vocab_size: v,
             d_model: d,
             bf16: cfg.bf16,
+            jepa_weight: cfg.jepa_weight,
+            jepa_mask_frac: cfg.jepa_mask_frac,
+            jepa_mask_span: cfg.jepa_mask_span,
+            dspark_weight: cfg.dspark_weight,
+            dspark_k: cfg.dspark_k,
+            dspark_stride: cfg.dspark_stride,
             ponder_beta: cfg.ponder_beta,
             ponder_prior: cfg.ponder_prior,
         }
@@ -54,27 +75,56 @@ impl DormouseModel {
             + DispatchKindConversion<B::InnerBackend>
             + DispatchKindConversion<burn::backend::Autodiff<B::InnerBackend>>,
     {
-        self.forward_with_hidden::<B>(input_ids, hashed_ids, None, None).0
+        self.forward_with_hidden::<B>(input_ids, hashed_ids, None, None, None).0
     }
 
-    /// Returns (logits, L_Rec [1], p_dist [b,N], kda). When `targets` is Some,
-    /// the per-step reconstruction loss is accumulated inside the loop block so
-    /// the model never slices a 4D autodiff tensor (cubecl/sm_120 stability).
-    /// `host_rows` carries pre-gathered n-gram rows `[b,t,3*32]` for the
-    /// RAM-offload path (see dormouse-train offload); when None, `hashed_ids`
-    /// drives the in-model tables.
+    /// Teacher pass: the pre-head accumulated latent `out_acc` only (no
+    /// lm_head, no losses). Used for the EMA JEPA teacher.
+    pub fn forward_latent<B: burn::backend::AutodiffBackend>(
+        &self,
+        input_ids: Tensor<2, Int>,
+        hashed_ids: Option<Tensor<3, Int>>,
+        host_rows: Option<Tensor<3>>,
+    ) -> Tensor<3>
+    where
+        DispatchTensor: DispatchKindConversion<B>
+            + DispatchKindConversion<B::InnerBackend>
+            + DispatchKindConversion<burn::backend::Autodiff<B::InnerBackend>>,
+    {
+        let x = self.embedding.forward(input_ids);
+        let x = if self.bf16 {
+            x.cast(FloatDType::BF16)
+        } else {
+            x
+        };
+        let (out_acc, _rec, _p, _kda) = self.loop_block.forward_full_state::<B>(
+            x, hashed_ids, host_rows, None, None, &self.lm_head,
+        );
+        out_acc
+    }
+
+    /// Returns (logits, L_Rec [1], p_dist [b,N], kda, aux Option<[1]>). When
+    /// `targets` is Some, the per-step reconstruction loss is accumulated
+    /// inside the loop block so the model never slices a 4D autodiff tensor
+    /// (cubecl/sm_120 stability). `host_rows` carries pre-gathered n-gram
+    /// rows `[b,t,3*32]` for the RAM-offload path; when None, `hashed_ids`
+    /// drives the in-model tables. `teacher` (the EMA copy) enables the JEPA
+    /// term; `aux` is the weight-combined auxiliary loss (JEPA + DSpark),
+    /// None when every aux weight is 0 or `targets` is None.
     pub fn forward_with_hidden<B: burn::backend::AutodiffBackend>(
         &self,
         input_ids: Tensor<2, Int>,
         hashed_ids: Option<Tensor<3, Int>>,
         host_rows: Option<Tensor<3>>,
         targets: Option<Tensor<2, Int>>,
-    ) -> (Tensor<3>, Tensor<1>, Tensor<2>, Tensor<4>)
+        teacher: Option<&Self>,
+    ) -> (Tensor<3>, Tensor<1>, Tensor<2>, Tensor<4>, Option<Tensor<1>>)
     where
         DispatchTensor: DispatchKindConversion<B>
             + DispatchKindConversion<B::InnerBackend>
             + DispatchKindConversion<burn::backend::Autodiff<B::InnerBackend>>,
     {
+        let ids_raw = targets.clone();
         let x = self.embedding.forward(input_ids);
         let x = if self.bf16 {
             x.cast(FloatDType::BF16)
@@ -90,15 +140,70 @@ impl DormouseModel {
         // loop activations may be bf16; the final norm+head compute in fp32
         // (bf16 logits make the softmax/CE numerically unstable -> NaN).
         let h = if self.bf16 {
-            self.norm.forward(out_acc.cast(FloatDType::F32))
+            self.norm.forward(out_acc.clone().cast(FloatDType::F32))
         } else {
-            self.norm.forward(out_acc)
+            self.norm.forward(out_acc.clone())
         };
         let logits = self
             .lm_head
-            .forward::<B>(h.reshape([b * t, self.d_model]))
+            .forward::<B>(h.clone().reshape([b * t, self.d_model]))
             .reshape([b, t, self.vocab_size]);
-        (logits, rec, p_dist, kda)
+        let aux = self.aux_loss::<B>(&out_acc, teacher, ids_raw, &h, &logits);
+        (logits, rec, p_dist, kda, aux)
+    }
+
+    /// Weight-combined auxiliary loss (JEPA + DSpark). None when every aux
+    /// weight is 0, when there are no targets, or when JEPA is on but no
+    /// teacher was supplied.
+    fn aux_loss<B: burn::backend::AutodiffBackend>(
+        &self,
+        student_latent: &Tensor<3>,
+        teacher: Option<&Self>,
+        ids: Option<Tensor<2, Int>>,
+        h: &Tensor<3>,
+        logits: &Tensor<3>,
+    ) -> Option<Tensor<1>>
+    where
+        DispatchTensor: DispatchKindConversion<B>
+            + DispatchKindConversion<B::InnerBackend>
+            + DispatchKindConversion<burn::backend::Autodiff<B::InnerBackend>>,
+    {
+        if (self.jepa_weight <= 0.0 && self.dspark_weight <= 0.0) || self.dspark_k == 0 {
+            return None;
+        }
+        let ids = ids?;
+        let dev = h.device();
+        let mut total: Option<Tensor<1>> = None;
+        if self.jepa_weight > 0.0 {
+            if let Some(t) = teacher {
+                // Teacher latent over the same inputs; the student predicts
+                // its own out_acc (pre-head accumulation) against it.
+                let tl = t.forward_latent::<B>(ids.clone(), None, None);
+                let j = crate::aux::jepa_aux_loss(
+                    &self.aux.jepa_pred,
+                    student_latent.clone(),
+                    tl,
+                    self.jepa_mask_frac,
+                    self.jepa_mask_span,
+                );
+                total = Some(j.mul_scalar(self.jepa_weight)
+                    + total.unwrap_or_else(|| Tensor::zeros([1], &dev)));
+            }
+        }
+        if self.dspark_weight > 0.0 {
+            let d = crate::aux::dspark_aux_loss(
+                &self.aux.dspark,
+                &self.aux.conf,
+                h.clone(),
+                logits.clone(),
+                ids,
+                self.dspark_k,
+                self.dspark_stride,
+            );
+            total = Some(d.mul_scalar(self.dspark_weight)
+                + total.unwrap_or_else(|| Tensor::zeros([1], &dev)));
+        }
+        total
     }
 
     /// PonderNet loss (Banino et al. 2021): L = L_Rec + β·KL(p || Geom(λ_p)).

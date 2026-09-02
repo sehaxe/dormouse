@@ -88,6 +88,10 @@ pub struct TrainCfg {
     pub no_kda: bool,
     pub no_msa: bool,
     pub no_engram: bool,
+    /// Auxiliary-loss weight overrides; None keeps the preset value.
+    pub jepa_weight: Option<f32>,
+    pub dspark_weight: Option<f32>,
+    pub dspark_k: Option<usize>,
 }
 
 impl Default for TrainCfg {
@@ -103,6 +107,7 @@ impl Default for TrainCfg {
             warmup: true, quant_check: false, timers: false, memlog: false,
             bf16: false, act_quant: None, act_group: None, max_iter: None,
             no_kda: false, no_msa: false, no_engram: false,
+            jepa_weight: None, dspark_weight: None, dspark_k: None,
         }
     }
 }
@@ -331,6 +336,9 @@ pub fn train_loop(
     if cfg.no_kda { dorm_cfg.use_kda = false; }
     if cfg.no_msa { dorm_cfg.use_msa = false; }
     if cfg.no_engram { dorm_cfg.use_engram = false; }
+    if let Some(w) = cfg.jepa_weight { dorm_cfg.jepa_weight = w; }
+    if let Some(w) = cfg.dspark_weight { dorm_cfg.dspark_weight = w; }
+    if let Some(k) = cfg.dspark_k { dorm_cfg.dspark_k = k; }
     let device = device();
     init_pools(&device);
     let mut model = DormouseModel::new(&dorm_cfg, &device);
@@ -361,6 +369,10 @@ pub fn train_loop(
     println!("optimizer: {opt_name}{factors} [muon={} tables={} rest={}]", gc.muon, gc.tables, gc.rest);
     let mut step = load_ckpt(&dir, &cfg.ckpt_name, &dorm_cfg, &mut model, &mut optim).unwrap_or(0);
     if step > 0 { println!("resumed {} from {} step {step}", cfg.ckpt_name, dir.display()); }
+    // EMA teacher for the JEPA aux (momentum 0.0 at init = exact copy with
+    // fresh grad-free params); advanced after every optimizer step below.
+    let aux_on = dorm_cfg.jepa_weight > 0.0 || dorm_cfg.dspark_weight > 0.0;
+    let mut teacher = aux_on.then(|| dormouse_core::aux::ema_update(model.clone(), &model, 0.0));
     let mut stream = dormouse_data::ByteStream::new(cfg.seq_len, cfg.batch, &data);
     let mut eval_stream =
         eval_data.as_ref().map(|p| dormouse_data::ByteStream::new(cfg.seq_len, cfg.batch, p));
@@ -399,7 +411,7 @@ pub fn train_loop(
         let shifted: Vec<i64> = bytes.iter().skip(1).chain(std::iter::once(&bytes[0])).map(|&b| b as i64).collect();
         let y: Tensor<2, Int> = Tensor::from_data(TensorData::new(shifted, [cfg.batch, cfg.seq_len]), &device);
         for _ in 0..2 {
-        let (_logits, rec, pd, _k) = model.forward_with_hidden::<Backend>(x.clone(), Some(h.clone()), None, Some(y.clone()));
+        let (_logits, rec, pd, _k, _aux) = model.forward_with_hidden::<Backend>(x.clone(), Some(h.clone()), None, Some(y.clone()), None);
         let loss = model.loss::<Backend>(rec, pd);
             let _g = loss.backward();
         }
@@ -414,11 +426,11 @@ pub fn train_loop(
         let (x, h) = bytes_to_tensors::<Backend>(&bytes, &hashes, cfg.seq_len, cfg.batch, &device);
         let shifted: Vec<i64> = bytes.iter().skip(1).chain(std::iter::once(&bytes[0])).map(|&b| b as i64).collect();
         let y: Tensor<2, Int> = Tensor::from_data(TensorData::new(shifted, [cfg.batch, cfg.seq_len]), &device);
-        let (lq, rec_q, pd_q, _k) = model.forward_with_hidden::<Backend>(x.clone(), Some(h.clone()), None, Some(y.clone()));
+        let (lq, rec_q, pd_q, _k, _aq) = model.forward_with_hidden::<Backend>(x.clone(), Some(h.clone()), None, Some(y.clone()), None);
         let loss_q: f32 = model.loss::<Backend>(rec_q, pd_q).try_into_scalar().unwrap_or(f32::NAN);
         let mut ref_model = model.clone();
         ref_model.loop_block.set_quant_all(burn_spectral::QuantFormat::Fp32);
-        let (lr, rec_r, pd_r, _k) = ref_model.forward_with_hidden::<Backend>(x, Some(h), None, Some(y));
+        let (lr, rec_r, pd_r, _k, _ar) = ref_model.forward_with_hidden::<Backend>(x, Some(h), None, Some(y), None);
         let loss_r: f32 = ref_model.loss::<Backend>(rec_r, pd_r).try_into_scalar().unwrap_or(f32::NAN);
         let vq: Vec<f32> = lq.into_data().try_to_vec().unwrap_or_default();
         let vr: Vec<f32> = lr.into_data().try_to_vec().unwrap_or_default();
@@ -498,15 +510,21 @@ pub fn train_loop(
             None => (None, None),
         };
 
-        let (_logits, rec_ce, p_dist, _kda) = model.forward_with_hidden::<Backend>(
+        let (_logits, rec_ce, p_dist, _kda, aux) = model.forward_with_hidden::<Backend>(
             x,
             // RAM-offload path drives the Engram from host_rows; uploading
             // hashed_ids too would be a dead per-step H2D copy.
             if host_rows.is_some() { None } else { Some(h) },
             host_rows,
             Some(y),
+            teacher.as_ref(),
         );
-        let loss = model.loss::<Backend>(rec_ce, p_dist);
+        let mut loss = model.loss::<Backend>(rec_ce, p_dist);
+        let mut aux_log: Option<Tensor<1>> = None;
+        if let Some(a) = aux {
+            aux_log = Some(a.clone());
+            loss = loss + a;
+        }
         // Defer the device->host sync (loss scalar + RAM Adam grads) to the
         // log steps so the GPU stays saturated: forward/backward/step of
         // adjacent steps overlap in the command queue instead of stalling on a
@@ -557,6 +575,9 @@ pub fn train_loop(
         if step % cfg.retract_every.max(1) as u64 == 0 {
             model.retract_tsct(cfg.retract_iters);
         }
+        if let Some(t) = teacher.take() {
+            teacher = Some(dormouse_core::aux::ema_update(t, &model, dormouse_core::aux::TEACHER_MOMENTUM));
+        }
         if step % 50 == 0 {
             let ortho = model.max_ortho();
             if ortho > 1e-3 {
@@ -580,7 +601,11 @@ pub fn train_loop(
             let bpb = dormouse_bench::bpb(ce);
             // pool_stats syncs the device; only with DM_MEMLOG=1
             let mem = if cfg.memlog { pool_stats(&device) } else { String::new() };
-            println!("step {step:6} ce={ce:.3} bpb={bpb:.3} best={best:.3} lr={lr:.2e} {mem}");
+            let aux_note = match aux_log.clone().map(|a| a.try_into_scalar::<f32>().ok()) {
+                Some(Some(v)) => format!(" aux={v:.4}"),
+                _ => String::new(),
+            };
+            println!("step {step:6} ce={ce:.3} bpb={bpb:.3} best={best:.3} lr={lr:.2e}{aux_note} {mem}");
             if let Some(s) = stress.as_ref() {
                 if let Some(line) = s.report(step) {
                     println!("  {line}");
@@ -619,7 +644,7 @@ pub fn train_loop(
                         None => None,
                     };
                     let (elogits, ..) =
-                        model.forward_with_hidden::<Backend>(ex, None, eval_rows, None);
+                        model.forward_with_hidden::<Backend>(ex, None, eval_rows, None, None);
                     let v = model.vocab_size;
                     let eflat = elogits.reshape([cfg.batch * cfg.seq_len, v]);
                     let etgt = ey
@@ -814,7 +839,7 @@ mod tests {
             let (x, h) = bytes_to_tensors::<Backend>(&bytes, &hashes, 64, 2, &device());
             let shifted: Vec<i64> = bytes.iter().skip(1).chain(std::iter::once(&bytes[0])).map(|&b| b as i64).collect();
             let y: Tensor<2, Int> = Tensor::from_data(TensorData::new(shifted, [2, 64]), &device());
-            let (_logits, rec, pd, _k) = model.forward_with_hidden::<Backend>(x, Some(h), None, Some(y));
+            let (_logits, rec, pd, _k, _aux) = model.forward_with_hidden::<Backend>(x, Some(h), None, Some(y), None);
             let loss = model.loss::<Backend>(rec, pd);
             let v: f32 = loss.clone().try_into_scalar().unwrap_or(f32::NAN);
             let grads = GradientsParams::from_grads(loss.backward(), &model);
@@ -857,7 +882,7 @@ mod tests {
             let (x, h) = bytes_to_tensors::<Backend>(&bytes, &hashes, 64, 2, &device());
             let shifted: Vec<i64> = bytes.iter().skip(1).chain(std::iter::once(&bytes[0])).map(|&b| b as i64).collect();
             let y: Tensor<2, Int> = Tensor::from_data(TensorData::new(shifted, [2, 64]), &device());
-            let (_logits, rec, pd, _k) = model.forward_with_hidden::<Backend>(x, Some(h), None, Some(y));
+            let (_logits, rec, pd, _k, _aux) = model.forward_with_hidden::<Backend>(x, Some(h), None, Some(y), None);
             let loss = model.loss::<Backend>(rec, pd);
             let v: f32 = loss.clone().try_into_scalar().unwrap_or(f32::NAN);
             let grads = GradientsParams::from_grads(loss.backward(), &model);
@@ -868,6 +893,49 @@ mod tests {
         let tail: f32 = losses[22..].iter().sum::<f32>() / 3.0;
         assert!(losses.iter().all(|l| l.is_finite()), "GR loss must stay finite: {losses:?}");
         assert!(tail < head, "GR must learn: head={head:.3} tail={tail:.3} {losses:?}");
+    }
+
+    /// The auxiliary objectives (JEPA + DSpark) must train end-to-end on the
+    /// live model: aux loss finite, teacher EMA advances away from the
+    /// student, and a full optim step keeps everything finite.
+    #[test]
+    fn aux_losses_and_ema_teacher() {
+        let cfg = test_cfg();
+        let mut model = DormouseModel::new(&cfg, &device());
+        let optim_cfg = TrainCfg { steps: 3, seq_len: 64, batch: 2, lr: 1e-3, wd: 0.01, grad_clip: 1.0, ..Default::default() };
+        let mut optim = crate::optim::build_optim_mode(&optim_cfg, "adamw");
+        assert!(cfg.jepa_weight > 0.0 && cfg.dspark_weight > 0.0, "presets must ship aux ON");
+        let mut teacher: Option<dormouse_core::DormouseModel> =
+            Some(dormouse_core::aux::ema_update(model.clone(), &model, 0.0));
+
+        let mut rng_state: u64 = 0x0A0B_0E5A_0001;
+        let next_u8 = |s: &mut u64| {
+            *s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let x = (*s ^ (*s >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            ((x ^ (x >> 27)) >> 33) as u8
+        };
+        for _ in 0..3 {
+            let bytes: Vec<u8> = (0..128).map(|_| next_u8(&mut rng_state)).collect();
+            let hashes: Vec<i64> = (0..384).map(|p| (p as i64) % 4096).collect();
+            let (x, h) = bytes_to_tensors::<Backend>(&bytes, &hashes, 64, 2, &device());
+            let shifted: Vec<i64> = bytes.iter().skip(1).chain(std::iter::once(&bytes[0])).map(|&b| b as i64).collect();
+            let y: Tensor<2, Int> = Tensor::from_data(TensorData::new(shifted, [2, 64]), &device());
+            let (_logits, rec, pd, _k, aux) = model.forward_with_hidden::<Backend>(
+                x, Some(h), None, Some(y), teacher.as_ref(),
+            );
+            let a = aux.expect("aux must be Some with preset weights on");
+            let a_val: f32 = a.clone().try_into_scalar().expect("aux scalar");
+            assert!(a_val.is_finite(), "aux loss must be finite, got {a_val}");
+            let grads = GradientsParams::from_grads((model.loss::<Backend>(rec, pd) + a).backward(), &model);
+            let model_new = optim.step(1e-3, model, grads);
+            model = model_new;
+            teacher = Some(dormouse_core::aux::ema_update(teacher.unwrap(), &model, dormouse_core::aux::TEACHER_MOMENTUM));
+        }
+        // EMA must have moved the teacher away from the exact initial copy.
+        let t_before: Vec<f32> = teacher.clone().unwrap().aux.jepa_pred.proj.weight.val().into_data().try_to_vec().unwrap();
+        let s_now: Vec<f32> = model.aux.jepa_pred.proj.weight.val().into_data().try_to_vec().unwrap();
+        assert!(t_before != s_now, "EMA teacher must differ from the trained student");
+        let _ = optim_cfg;
     }
 
     /// Every OPT mode must build and take a step without NaN (AdamW, Adan,
@@ -885,7 +953,7 @@ mod tests {
             let (x, h) = bytes_to_tensors::<Backend>(&bytes, &hashes, 64, 2, &device());
             let shifted: Vec<i64> = bytes.iter().skip(1).chain(std::iter::once(&bytes[0])).map(|&b| b as i64).collect();
             let y: Tensor<2, Int> = Tensor::from_data(TensorData::new(shifted, [2, 64]), &device());
-            let (_logits, rec, pd, _k) = model.forward_with_hidden::<Backend>(x, Some(h), None, Some(y));
+            let (_logits, rec, pd, _k, _aux) = model.forward_with_hidden::<Backend>(x, Some(h), None, Some(y), None);
             let loss = model.loss::<Backend>(rec, pd);
             let v: f32 = loss.clone().try_into_scalar().unwrap_or(f32::NAN);
             let grads = GradientsParams::from_grads(loss.backward(), &model);
