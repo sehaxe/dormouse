@@ -84,6 +84,7 @@ macro_rules! buf {
     };
 }
 
+#[cfg(test)]
 thread_local! {
     /// Buffer-level backward dumps (DM_FUSED_BWD_DEBUG=1): (name, values).
     /// Consumed by the gradcheck bisect test; empty unless enabled.
@@ -91,6 +92,9 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// Buffer dump for the gradcheck bisect test; compiles to nothing outside
+/// `cfg(test)` (the sync-ing read would perturb the measured pipeline).
+#[cfg(test)]
 fn dump(client: &ComputeClient<Cuda>, name: &'static str, c: &CubeTensor, _n: usize) {
     if std::env::var("DM_FUSED_BWD_DEBUG").is_ok() {
         let bytes = client.read(vec![c.handle.clone()]).remove(0);
@@ -100,6 +104,9 @@ fn dump(client: &ComputeClient<Cuda>, name: &'static str, c: &CubeTensor, _n: us
         BWD_DUMP.with(|d| d.borrow_mut().push((name, v)));
     }
 }
+
+#[cfg(not(test))]
+fn dump(_client: &ComputeClient<Cuda>, _name: &'static str, _c: &CubeTensor, _n: usize) {}
 
 /// Run the backward kernels and register every weight/input gradient.
 pub(super) fn ponder_backward(
@@ -138,7 +145,10 @@ pub(super) fn ponder_backward(
     let ceb = c1(&st.ceb);
 
     let mut keep: Vec<Tensor<1>> = Vec::new();
-    let mut out: Vec<Option<CubeTensor>> = vec![None; 30];
+    // Parent count = 12 + 6·nexp (n_experts checked at extraction in
+    // `ponder_loop_step`); size everything off the live parent list so
+    // lifting the arity touches one place.
+    let mut out: Vec<Option<CubeTensor>> = vec![None; ops.parents.len()];
     let alloc = |n: usize| empty1(&dev, n);
 
     // ---- per-step CE: dLogits
@@ -400,7 +410,11 @@ pub(super) fn ponder_backward(
                 bt as u32, r as u32,
             );
         }
-        launch_mm(&client, &dz_e, &gu.u, &one, &one, &dx, bt, r, d, r, 1, r, 1, bt * r, d * r, false, true, true, false, true);
+        // bm MUST be U's own absmean (see the dstep note above): tern_b=true
+        // reads bm[0] as the ternary scale - `one` here ternarized U with the
+        // CE buffer's first element as scale, corrupting d(normed) and
+        // everything downstream of it (dg/dh_ctx/dx/die).
+        launch_mm(&client, &dz_e, &gu.u, &one, &gu.mu, &dx, bt, r, d, r, 1, r, 1, bt * r, d * r, false, true, true, false, true);
         out[6 + 6 * e] = Some(du_e);
         out[7 + 6 * e] = Some(ds_e);
         out[8 + 6 * e] = Some(dv_e);
@@ -562,8 +576,8 @@ pub(super) fn ponder_backward(
     // consumes them through shape-checked tensor ops against the params. The
     // grads were computed into flat dense buffers, so the wrap is a free
     // stride relabel (1D -> 2D on a dense buffer never copies).
-    let dims: [Option<[usize; 2]>; 30] = {
-        let mut dm: [Option<[usize; 2]>; 30] = std::array::from_fn(|_| None);
+    let dims: Vec<Option<[usize; 2]>> = {
+        let mut dm: Vec<Option<[usize; 2]>> = vec![None; ops.parents.len()];
         dm[0] = Some([bt, d]);
         dm[1] = Some([2 * d, pad]); // burn Linear Col layout
         dm[2] = None; // norm g: [d]
@@ -578,12 +592,11 @@ pub(super) fn ponder_backward(
             dm[10 + 6 * e] = None;
             dm[11 + 6 * e] = Some([d, r]);
         }
-        dm[24] = Some([d, r]);
-        dm[25] = None;
-        dm[26] = Some([d, r]);
-        dm[27] = Some([d, r]);
-        dm[28] = None;
-        dm[29] = Some([v, r]);
+        let (p_out, p_lm) = (6 + 6 * nexp, 9 + 6 * nexp); // out_proj, lm_head u/s/v
+        dm[p_out] = Some([d, r]);
+        dm[p_out + 2] = Some([d, r]);
+        dm[p_lm] = Some([d, r]);
+        dm[p_lm + 2] = Some([v, r]);
         dm
     };
     for (i, g) in out.into_iter().enumerate() {

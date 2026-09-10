@@ -44,6 +44,7 @@ use cubecl::client::ComputeClient;
 use cubecl::prelude::*;
 
 use backward::PonderState;
+use crate::param::{LinearLike, LinearLikeInner};
 
 pub(crate) type Cuda = cubecl::cuda::CudaRuntime;
 pub(crate) type CB = burn_cubecl::CubeBackend<Cuda>;
@@ -363,6 +364,38 @@ where
 // M1: the fused single-iteration Ponder step
 // ---------------------------------------------------------------------------
 
+/// Refuse to run the fused op on any TSCT factor that is not the PLAIN
+/// fp32-master global-absmean ternary STE the kernels hardcode (`mm_kernel`
+/// tern_b: global mean(|w|) scale, 0.7 dead zone, STE through fp32
+/// masters). burn-spectral's SpectralLinear has other factor modes (2-bit,
+/// N:M, stochastic, per-column, asym, annealing alpha<1, Fp8/Fp4/Bf16/Fp16
+/// factor quant) whose forward computes a DIFFERENT function - the op only
+/// sees detached `Fac` triples and cannot tell, so call this at extraction
+/// time (where the triples are pulled off the model) and fail loudly.
+pub fn assert_fusable(ll: &LinearLike, what: &str) {
+    let LinearLikeInner::Tsct(l) = &ll.inner else {
+        panic!("{what}: fused path requires the TSCT arm");
+    };
+    let bad = if l.two_bit {
+        "two_bit (5-level) factor quant".to_string()
+    } else if l.nm_on() {
+        format!("N:M sparsity ({}/{})", l.nm_n, l.nm_m)
+    } else if l.stochastic {
+        "stochastic ternary rounding".to_string()
+    } else if l.per_column {
+        "per-column ternary scaling".to_string()
+    } else if l.asym {
+        "asym mode (V left unquantized)".to_string()
+    } else if l.alpha != 1.0 {
+        format!("ternary annealing alpha={}", l.alpha)
+    } else if l.quant != burn_spectral::QuantFormat::Fp32 {
+        format!("factor-quant format {:?}", l.quant)
+    } else {
+        return;
+    };
+    panic!("{what}: fused op only supports plain fp32-master ternary STE, found {bad}");
+}
+
 /// One TSCT factor triple (u master, scale, v master) as tracked tensors.
 #[derive(Clone, Debug)]
 pub struct Fac {
@@ -398,8 +431,12 @@ pub(crate) struct FacC {
     mv: CubeTensor,
 }
 
-/// Extract one TSCT factor: on-device absmean of u/v + the graph pieces.
-/// The bridged twins keep every buffer alive until backward completes.
+/// Extract one TSCT factor: allocate the absmean outputs + the graph pieces.
+/// NO raw launches here: the u/v masters are burn-side buffers that
+/// optim.step/retract rewrite every step on the burn stream - the absmean
+/// reads must wait for the fence in `ponder_loop_step` (see it for the
+/// invariant). The bridged twins keep every buffer alive until backward
+/// completes.
 fn fac_cuda(
     f: &Fac,
     keep2: &mut Vec<Tensor<2>>,
@@ -409,12 +446,8 @@ fn fac_cuda(
     let v = ad2(f.v.clone());
     let (s_t, s_at, s_prim) = ad1(f.s.clone());
     let dev = bare_device(&u.prim);
-    let n_u = u.prim.meta.shape().dims::<2>().iter().product::<usize>();
-    let n_v = v.prim.meta.shape().dims::<2>().iter().product::<usize>();
     let (mu_t, mu_c) = empty1(&dev, 1);
     let (mv_t, mv_c) = empty1(&dev, 1);
-    launch_absmean(&u.prim, &mu_c, n_u);
-    launch_absmean(&v.prim, &mv_c, n_v);
     keep2.push(u.t);
     keep2.push(v.t);
     keep1.push(s_t);
@@ -430,6 +463,16 @@ fn fac_cuda(
         },
         [u.at, s_at, v.at],
     )
+}
+
+/// absmean of both masters of one factor (raw launch; FIFO-ordered on the
+/// caller's stream, so it must be enqueued after the fence and before the
+/// ternary mms that consume `mu`/`mv`).
+fn launch_fac_means(fc: &FacC) {
+    let n_u = fc.u.meta.shape().dims::<2>().iter().product::<usize>();
+    let n_v = fc.v.meta.shape().dims::<2>().iter().product::<usize>();
+    launch_absmean(&fc.u, &fc.mu, n_u);
+    launch_absmean(&fc.v, &fc.mv, n_v);
 }
 
 /// Parent order (fixed; matches the registration sequence in `backward`):
@@ -456,6 +499,10 @@ where
     DispatchTensor: DispatchKindConversion<CAd> + DispatchKindConversion<CB>,
 {
     let nexp = inp.experts.len();
+    // The op's parent list is fixed at compile time (Backward<CB, 30>):
+    // 6 dense weights + 6 per expert + 3 out_proj + 3 lm_head = 12 + 6·nexp.
+    // Only n_experts = 3 is compiled (`small`/`base`; one_b runs 4).
+    assert_eq!(nexp, 3, "fused op is compiled for n_experts=3 (30 parents = 12 + 6·n_experts); got n_experts={nexp} - lift PonderLoop's arity before running one_b");
     let [b, t, d] = inp.x.dims();
     let bt = b * t;
     // burn-nn Linear uses the Col layout: the weight is [in, out] = [2d, pad]
@@ -463,6 +510,7 @@ where
     let [two_d, pad] = dense(inp.controller_w.clone()).dims();
     assert_eq!(two_d, 2 * d, "controller weight must be [2d, pad]");
     let max_iter = inp.iter_embed.dims()[0];
+    assert_eq!(max_iter, 1, "M1 is single-iteration; M3 lifts this");
     let x2 = inp.x.clone().reshape([bt, d]);
     let xa = x2
         .clone()
@@ -506,6 +554,11 @@ where
     let f = inp.experts[0][0].v.dims()[0];
     let r = inp.experts[0][0].u.dims()[1];
     let v = inp.lm_head.v.dims()[0];
+    // Factor out_features are padded to N%4 by LinearLike (param.rs, the
+    // `out_features != 1` carve-out included); the fused flat kernels use
+    // them as row strides of dense workspaces and expect the padded layout.
+    debug_assert!(f % 4 == 0, "gate_up out_features must be LinearLike-padded to N%4, got {f}");
+    debug_assert!(v % 4 == 0, "lm_head out_features must be LinearLike-padded to N%4, got {v}");
     let mut experts_c: Vec<[FacC; 2]> = Vec::new();
     for e in &inp.experts {
         let gu = fac_cuda(&e[0], &mut keep2, &mut keep1);
@@ -561,10 +614,24 @@ where
     }
 
     // ---- forward kernels.
-    // Fence first: the inputs above were produced by burn-side ops (val
-    // clones, dense() copies, H2D for targets, the absmean launches) that may
-    // sit on other streams than our raw launches.
+    // FENCE BEFORE THE FIRST RAW LAUNCH, NO EXCEPTIONS: everything above is
+    // burn-side work (val clones, dense() copies, H2D for targets, and in
+    // training optim.step/retract rewriting the u/v masters every step) that
+    // may sit on other streams than our raw launches. Without this barrier
+    // the kernels below race it - the absmean reads of the u/v masters
+    // especially would pick up half-written factors.
     sync(&client);
+    // First raw launches: the absmean of every factor master. They feed the
+    // ternary mms (FIFO order on this stream) and are themselves safe only
+    // after the fence above.
+    for fc in experts_c
+        .iter()
+        .flat_map(|pair| pair.iter())
+        .chain(std::iter::once(&op.0))
+        .chain(std::iter::once(&lm.0))
+    {
+        launch_fac_means(fc);
+    }
     unsafe {
         kernels::hctx_kernel::launch_unchecked::<f32, Cuda>(
             &client,
@@ -760,8 +827,8 @@ where
     }
 
     // ---- ONE autodiff node for the whole computation
-    let nodes: [_; 30] = nodes.try_into().expect("30 parents");
-    let ats: [AdPrim; 30] = ats.try_into().expect("30 checkpoints");
+    let nodes: [_; 30] = nodes.try_into().expect("parent count (n_experts asserted above)");
+    let ats: [AdPrim; 30] = ats.try_into().expect("checkpoint count (n_experts asserted above)");
 
     let state = PonderState {
         b,

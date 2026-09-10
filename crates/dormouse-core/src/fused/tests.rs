@@ -35,6 +35,8 @@ fn tsct(ll: &LinearLike) -> &burn_spectral::SpectralLinear {
 }
 
 fn fac_of(ll: &LinearLike) -> Fac {
+    // extraction-time mode guard (fix-2): refuse non-plain factor modes
+    assert_fusable(ll, "fused gradcheck factor");
     let l = tsct(ll);
     Fac {
         u: l.u.val(),
@@ -75,6 +77,11 @@ fn small_model(dev: &Device) -> (DormouseConfig, DormouseModel) {
     };
     let mut model = DormouseModel::new(&cfg, dev);
     model.loop_block.max_iter = 1;
+    // Shrink the table to match: max_iter=1 with an 8-row iter_embed is the
+    // hack the M1 guard refuses (the op reads the iteration count off the
+    // table height - a real max_iter=1 model is built with a 1-row table).
+    model.loop_block.iter_embed =
+        Param::from_tensor(model.loop_block.iter_embed.val().slice([0..1]).detach());
     // ReZero starts at 0, which would zero the whole FFN-arm gradient; give
     // the gradcheck a live residual path.
     model.loop_block.residual_scale =
@@ -300,8 +307,10 @@ fn fused_bwd_buffers_vs_f64() {
         lm_head: fac_of(&model.lm_head),
         norm_eps: cfg.norm_eps,
     };
-    let (rec_f, pd_f, _oa_f) = ponder_loop_step(inputs);
-    let loss_f = model.loss::<CAd>(rec_f.clone(), pd_f.clone());
+    let (rec_f, pd_f, oa_f) = ponder_loop_step(inputs);
+    // out_acc routed through the loss (sum term): exercises dso_kernel and
+    // dlam_outacc_kernel with a NONZERO upstream grad.
+    let loss_f = model.loss::<CAd>(rec_f.clone(), pd_f.clone()) + oa_f.clone().sum();
     let _grads_f = loss_f.backward();
     BWD_DUMP.with(|dr| {
         let dump = dr.borrow();
@@ -476,7 +485,7 @@ fn fused_bwd_buffers_vs_f64() {
         let loss = rec + beta * kl_mean;
         println!("[f64] loss={loss:.6} rec={rec:.6}");
 
-        // ---- f64 backward (drec=1, dp = beta*(ln lam + 1)/(b*N), dout_acc=0)
+        // ---- f64 backward (drec=1, dp = beta*(ln lam + 1)/(b*N), dout_acc=1)
         let dp: Vec<f64> = (0..b).map(|bi| beta * (lam[bi].ln() + 1.0) / (b * 1) as f64).collect();
         let drec = 1f64;
         let mut dlogits = vec![0f64; bt * v];
@@ -521,7 +530,13 @@ fn fused_bwd_buffers_vs_f64() {
                 dstep[m * d + i] = (0..r).map(|k| dz_l[m * r + k] * ult[i * r + k]).sum();
             }
         }
-        // out_acc path contributes 0 (loss does not use out_acc).
+        // out_acc path (loss += out_acc.sum() => dout_acc = 1):
+        // dStep += dout_acc·lam per row (the dso kernel).
+        for m in 0..bt {
+            for i in 0..d {
+                dstep[m * d + i] += lam[m / t];
+            }
+        }
         let [uo_, so_, vo_] = &facs[2 * nexp];
         let vot = tern(vo_);
         let mut dmo = vec![0f64; bt * r];
@@ -718,8 +733,11 @@ fn fused_bwd_buffers_vs_f64() {
                 }
             }
         }
-        // halt
-        let dosum = vec![0f64; b]; // out_acc unused by the loss
+        // halt; dLam carries the out_acc path: Σ_{t,d} dout_acc·step_out
+        // (the dlam_outacc kernel), dout_acc = 1.
+        let dosum: Vec<f64> = (0..b)
+            .map(|bi| (0..t * d).map(|i| step_out[bi * t * d + i]).sum())
+            .collect();
         let mut dhaltpre = vec![0f64; b];
         for bi in 0..b {
             let dlam = dp[bi] + drec * ceb[bi] / bt as f64 + dosum[bi];
@@ -768,11 +786,16 @@ fn fused_bwd_buffers_vs_f64() {
             dx[i] += dh_ctx[i];
         }
 
-        // ---- compare fused dumps vs f64
+        // ---- compare fused dumps vs f64, ASSERTED: this is the exactness
+        // gate for every backward buffer (the gradcheck vs burn below floors
+        // at burn's own fp32 noise; this holds 1e-4). It is what catches
+        // wrong-scale/ternary bugs - e.g. a gate_up dX mm with the CE value
+        // as its ternary scale survived the vs-burn gradcheck for a while.
         let cmp = |name: &str, truth: &[f64]| {
             let got = get(name);
             let (rel, abs) = rel_stats(&got.iter().map(|&x| x as f32).collect::<Vec<_>>(), &truth.iter().map(|&x| x as f32).collect::<Vec<_>>());
             println!("  {name:>10}: rel={rel:.3e} abs={abs:.3e} (n={})", truth.len());
+            assert!(rel < 1e-4, "fused backward buffer {name} diverges from f64: rel {rel:.3e} abs {abs:.3e}");
         };
         cmp("dlogits", &dlogits);
         cmp("dm_l", &dm_l);
@@ -806,7 +829,7 @@ fn fused_bwd_buffers_vs_f64() {
         let (oa_r, rec_r, pd_r, _k) = ref_model.loop_block.forward_full_state::<NdAd>(
             x_r.clone(), None, None, None, Some(tgt_r), &ref_model.lm_head,
         );
-        let loss_r = ref_model.loss::<NdAd>(rec_r.clone(), pd_r.clone());
+    let loss_r = ref_model.loss::<NdAd>(rec_r.clone(), pd_r.clone()) + oa_r.clone().sum();
         let grads_r = loss_r.backward();
         let lb = &ref_model.loop_block;
         let ref2 = |t: &Tensor<2>| -> Vec<f64> {
@@ -1067,7 +1090,9 @@ fn fused_gradcheck_single_iteration() {
         norm_eps: cfg.norm_eps,
     };
     let (rec_f, pd_f, oa_f) = ponder_loop_step(inputs);
-    let loss_f = model.loss::<CAd>(rec_f.clone(), pd_f.clone());
+    // out_acc routed through the loss (sum term) so the fused backward's
+    // dso_kernel/dlam_outacc_kernel paths run with a NONZERO upstream grad.
+    let loss_f = model.loss::<CAd>(rec_f.clone(), pd_f.clone()) + oa_f.clone().sum();
     let loss_f_val: f32 = scalar(loss_f.clone());
     let grads_f = loss_f.backward();
     let fus_grads = collect(&grads_f, &model, &x);
@@ -1090,7 +1115,7 @@ fn fused_gradcheck_single_iteration() {
         Some(tgt_r),
         &ref_model.lm_head,
     );
-    let loss_r = ref_model.loss::<NdAd>(rec_r.clone(), pd_r.clone());
+    let loss_r = ref_model.loss::<NdAd>(rec_r.clone(), pd_r.clone()) + oa_r.clone().sum();
     let loss_r_val: f32 = scalar(loss_r.clone());
     let grads_r = loss_r.backward();
     let ref_grads = collect(&grads_r, &ref_model, &x_r);
@@ -1101,8 +1126,8 @@ fn fused_gradcheck_single_iteration() {
     let pdv_f: Vec<f32> = pd_f.into_data().try_to_vec().unwrap();
     let pdv_r: Vec<f32> = pd_r.clone().into_data().try_to_vec().unwrap();
     let (pd_rel, _) = rel_stats(&pdv_f, &pdv_r);
-    let oav_f: Vec<f32> = oa_f.into_data().try_to_vec().unwrap();
-    let oav_r: Vec<f32> = oa_r.into_data().try_to_vec().unwrap();
+    let oav_f: Vec<f32> = oa_f.clone().into_data().try_to_vec().unwrap();
+    let oav_r: Vec<f32> = oa_r.clone().into_data().try_to_vec().unwrap();
     let (oa_rel, oa_abs) = rel_stats(&oav_f, &oav_r);
     // ground truth: full forward in f64 on the host, compared against BOTH
     // sides to attribute any residual difference.
@@ -1193,15 +1218,20 @@ fn fused_gradcheck_single_iteration() {
     assert!(pd_rel < 1e-4, "p_dist rel {pd_rel:.2e}");
     assert!(oa_rel < 1e-4, "out_acc rel {oa_rel:.2e}");
 
-    // ---- gradient equality, path by path
-    let mut worst = (String::new(), 0f32);
+    // ---- gradient equality, path by path.
+    // Limits are MEASURED fp32 noise floors with the out_acc path live (it
+    // doubles the contraction depth into out_proj/x): every weight grad
+    // holds ~1.3e-4 worst (op.u, abs diff ~2.5e-6 - it straddled the old
+    // flat 1e-4 even before, seed-dependent), and x's grad is a sum of
+    // strongly cancelling paths where burn's own fp32 NdArray reference
+    // carries ~1e-4 abs off the f64 truth ([xcheck x] in
+    // fused_bwd_buffers_vs_f64), so fused-vs-burn floors at ~1e-2 rel
+    // there. The fused side itself is exact: the buffer bisect above
+    // asserts every backward buffer against f64 at 1e-4.
     for ((name, gr), (_, gf)) in ref_grads.iter().zip(fus_grads.iter()) {
         let (rel, abs) = rel_stats(gf, gr);
         println!("  {name:>12}: rel={rel:.2e} abs={abs:.2e} (n={})", gr.len());
-        if rel > worst.1 {
-            worst = (name.clone(), rel);
-        }
+        let lim = if name == "x" { 5e-2 } else { 5e-4 };
+        assert!(rel < lim, "gradcheck failed on {name}: rel {rel:.2e} (limit {lim:.1e})");
     }
-    println!("worst: {} rel={:.2e}", worst.0, worst.1);
-    assert!(worst.1 < 1e-4, "gradcheck failed on {}: rel {:.2e}", worst.0, worst.1);
 }
