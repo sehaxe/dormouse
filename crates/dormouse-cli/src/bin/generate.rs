@@ -16,6 +16,7 @@ struct Args {
 fn main() {
     let a = Args::parse();
     let cfg = match a.preset.as_str() {
+        "nano" => dormouse_core::DormouseConfig::nano(),
         "base" => dormouse_core::DormouseConfig::base(),
         "one_b" => dormouse_core::DormouseConfig::one_b(),
         _ => dormouse_core::DormouseConfig::small(),

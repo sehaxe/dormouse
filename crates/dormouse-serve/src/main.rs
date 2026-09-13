@@ -213,6 +213,7 @@ async fn models() -> Json<ModelsResp> {
 async fn main() {
     let a = Args::parse();
     let cfg: DormouseConfig = match a.preset.as_str() {
+        "nano" => DormouseConfig::nano(),
         "base" => DormouseConfig::base(),
         "one_b" => DormouseConfig::one_b(),
         _ => DormouseConfig::small(),

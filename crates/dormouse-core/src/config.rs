@@ -85,6 +85,47 @@ pub struct DormouseConfig {
 }
 
 impl DormouseConfig {
+    /// nano - smallest sensible real model: ~30-minute single-GPU probe run
+    /// on the autodiff path with aux heads off. Shallow loop (4 iters), 3
+    /// experts, all attention/memory arms on.
+    pub fn nano() -> Self {
+        Self {
+            d_model: 512,
+            n_heads: 8,
+            head_dim: 64,
+            d_ffn: 2048,
+            vocab: 256,
+            max_seq_len: 512,
+            max_iter: 4,
+            rank: 96,
+            halt_theta: 0.9,
+            ponder_w: 0.05,
+            rec_w: 0.5,
+            guard_w: 0.01,
+            norm_eps: 1e-3,
+            rope_base: 10000.0,
+            msa_topk: 8,
+            msa_block: 32,
+            bf16: false,
+            act_quant: None,
+            act_group: 0,
+            use_msa: true,
+            use_kda: true,
+            use_engram: true,
+            use_gr: false,
+            keep_frac: 0.5,
+            dropout: 0.0,
+            n_experts: 3,
+            ponder_beta: 0.01,
+            ponder_prior: 2.0 / 5.0,
+            jepa_weight: 0.05,
+            jepa_mask_frac: 0.15,
+            jepa_mask_span: 8,
+            dspark_weight: 0.1,
+            dspark_k: 4,
+            dspark_stride: 16,
+        }
+    }
     pub fn small() -> Self {
         Self {
             d_model: 768,

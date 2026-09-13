@@ -12,7 +12,7 @@ struct Args {
     /// Held-out eval directory (optional).
     #[arg(long)]
     eval: Option<String>,
-    /// Model preset: small | base | one_b.
+    /// Model preset: nano | small | base | one_b.
     #[arg(long, default_value = "small")]
     preset: String,
 

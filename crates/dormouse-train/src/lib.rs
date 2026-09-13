@@ -334,6 +334,7 @@ pub fn load_ckpt(dir: &Path, name: &str, cfg: &DormouseConfig, model: &mut Dormo
 /// train loop and the JEPA target precompute pass).
 fn dorm_config(cfg: &TrainCfg, preset: &str) -> DormouseConfig {
     let mut dorm_cfg: DormouseConfig = match preset {
+        "nano" => DormouseConfig::nano(),
         "base" => DormouseConfig::base(),
         "one_b" => DormouseConfig::one_b(),
         _ => DormouseConfig::small(),
