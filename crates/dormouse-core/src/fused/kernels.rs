@@ -155,12 +155,13 @@ pub fn rmsnorm_kernel<F: Float>(x: &[F], g: &[F], out: &mut [F], inv: &mut [F], 
     }
 }
 
-/// h_ctx = x + iter_embed[0] (row 0, broadcast over rows).
+/// h_ctx = in + iter_embed[ie_off/d] (row `ie_off/d`, broadcast over rows;
+/// in = x at iteration 0, the previous iteration's h afterwards).
 #[cube(launch_unchecked)]
-pub fn hctx_kernel<F: Float>(x: &[F], ie: &[F], out: &mut [F], d: u32, n: u32) {
+pub fn hctx_kernel<F: Float>(x: &[F], ie: &[F], out: &mut [F], d: u32, ie_off: u32, n: u32) {
     let i = CUBE_POS_X as usize * 256usize + UNIT_POS_X as usize;
     if i < n as usize {
-        out[i] = x[i] + ie[i % d as usize];
+        out[i] = x[i] + ie[ie_off as usize + i % d as usize];
     }
 }
 
@@ -269,9 +270,9 @@ pub fn rowmean_t_kernel<F: Float>(h_ctx: &[F], out: &mut [F], t: u32, d: u32) {
     }
 }
 
-/// flat[1+b] = sigmoid(halt_in[b] · wh) (lam; p_dist at N=1).
+/// lam[b] = sigmoid(halt_in[b] · wh).
 #[cube(launch_unchecked)]
-pub fn halt_fwd_kernel<F: Float>(halt_in: &[F], wh: &[F], flat: &mut [F], d: u32) {
+pub fn halt_fwd_kernel<F: Float>(halt_in: &[F], wh: &[F], lam: &mut [F], d: u32) {
     let b = CUBE_POS_X as usize;
     let d = d as usize;
     let mut acc = F::new(0.0_f32);
@@ -280,24 +281,84 @@ pub fn halt_fwd_kernel<F: Float>(halt_in: &[F], wh: &[F], flat: &mut [F], d: u32
         acc += halt_in[b * d + j] * wh[j];
         j += 1usize;
     }
-    flat[1usize + b] = F::new(1.0_f32) / (F::new(1.0_f32) + (-acc).exp());
+    lam[b] = F::new(1.0_f32) / (F::new(1.0_f32) + (-acc).exp());
 }
 
-/// flat[out+i] = step_out[i] · lam[(i/d)/t].
+/// PonderNet halting step (loop_block 350-353): p = lam·nh_in;
+/// pd[pd_off+i] = p[i] (the p_dist column of this iteration);
+/// nh_out = nh_in·(1-lam).
+#[cube(launch_unchecked)]
+pub fn halting_kernel<F: Float>(
+    lam: &[F],
+    nh_in: &[F],
+    nh_out: &mut [F],
+    p: &mut [F],
+    pd: &mut [F],
+    pd_off: u32,
+    b: u32,
+) {
+    let i = CUBE_POS_X as usize * 256usize + UNIT_POS_X as usize;
+    if i < b as usize {
+        let l = lam[i];
+        let n = nh_in[i];
+        p[i] = l * n;
+        pd[pd_off as usize + i] = l * n;
+        nh_out[i] = n * (F::new(1.0_f32) - l);
+    }
+}
+
+/// kl = Σ_n Σ_b p·(ln p − ln prior[n]) / (b·N) (model.rs ponder_kl; the
+/// p==0 term is its limit 0, where the naive 0·ln 0 would NaN).
+#[cube(launch_unchecked)]
+pub fn kl_kernel<F: Float>(pd: &[F], prior: &[F], out: &mut [F], pd_off: u32, out_off: u32, b: u32, n: u32) {
+    let (b, n) = (b as usize, n as usize);
+    let mut acc = F::new(0.0_f32);
+    let mut it = 0usize;
+    while it < n {
+        let lp = prior[it].ln();
+        let mut i = 0usize;
+        while i < b {
+            let pv = pd[pd_off as usize + it * b + i];
+            if pv > F::new(0.0_f32) {
+                acc += pv * (pv.ln() - lp);
+            }
+            i += 1usize;
+        }
+        it += 1usize;
+    }
+    out[out_off as usize] = acc / F::cast_from((b * n) as f32);
+}
+
+/// out[dst_off+i] = src[src_off+i] (region copy; mm kernels can only address
+/// a buffer from 0, so flat-output regions cross through this).
+#[cube(launch_unchecked)]
+pub fn copy_kernel<F: Float>(src: &[F], dst: &mut [F], src_off: u32, dst_off: u32, n: u32) {
+    let i = CUBE_POS_X as usize * 256usize + UNIT_POS_X as usize;
+    if i < n as usize {
+        dst[dst_off as usize + i] = src[src_off as usize + i];
+    }
+}
+
+/// oa[i] (= or +=) step_out[i] · p[(i/d)/t] (out_acc accumulation).
 #[cube(launch_unchecked)]
 pub fn outacc_kernel<F: Float>(
     step_out: &[F],
-    flat: &mut [F],
-    lam_off: u32,
-    out_off: u32,
+    p: &[F],
+    oa: &mut [F],
     t: u32,
     d: u32,
     n: u32,
+    #[comptime] accum: bool,
 ) {
     let i = CUBE_POS_X as usize * 256usize + UNIT_POS_X as usize;
     if i < n as usize {
         let bidx = i / d as usize / t as usize;
-        flat[out_off as usize + i] = step_out[i] * flat[lam_off as usize + bidx];
+        let v = step_out[i] * p[bidx];
+        if accum {
+            oa[i] += v;
+        } else {
+            oa[i] = v;
+        }
     }
 }
 
@@ -339,16 +400,28 @@ pub fn ceb_kernel<F: Float>(ce: &[F], ceb: &mut [F], t: u32) {
     ceb[b] = acc;
 }
 
-/// flat[0] = sum_b lam_b · ceb_b / (b·t).
+/// rec[0] (= or +=) sum_b p[b] · ceb[b] / (b·t).
 #[cube(launch_unchecked)]
-pub fn rec_kernel<F: Float>(ceb: &[F], flat: &mut [F], lam_off: u32, b: u32, bt: u32) {
+pub fn rec_kernel<F: Float>(
+    p: &[F],
+    ceb: &[F],
+    rec: &mut [F],
+    b: u32,
+    bt: u32,
+    #[comptime] accum: bool,
+) {
     let mut acc = F::new(0.0_f32);
     let mut i = 0usize;
     while i < b as usize {
-        acc += flat[lam_off as usize + i] * ceb[i];
+        acc += p[i] * ceb[i];
         i += 1usize;
     }
-    flat[0] = acc / F::cast_from(bt as f32);
+    let v = acc / F::cast_from(bt as f32);
+    if accum {
+        rec[0] += v;
+    } else {
+        rec[0] = v;
+    }
 }
 
 // ---------------- backward kernels ----------------
@@ -434,9 +507,17 @@ pub fn col_scale_kernel<F: Float>(x: &[F], s: &[F], out: &mut [F], cols: u32, n:
     }
 }
 
-/// ds[j] = sum_m dM[m,j]·Z[m,j] (one cube, unit-strided columns).
+/// ds[j] (= or +=) sum_m dM[m,j]·Z[m,j] (one cube, unit-strided columns;
+/// weight grads accumulate across loop iterations).
 #[cube(launch_unchecked)]
-pub fn sum_ds_kernel<F: Float>(dm: &[F], z: &[F], ds: &mut [F], rows: u32, r: u32) {
+pub fn sum_ds_kernel<F: Float>(
+    dm: &[F],
+    z: &[F],
+    ds: &mut [F],
+    rows: u32,
+    r: u32,
+    #[comptime] accum: bool,
+) {
     let unit = UNIT_POS_X as usize;
     let (rows, r) = (rows as usize, r as usize);
     let mut j = unit;
@@ -447,7 +528,11 @@ pub fn sum_ds_kernel<F: Float>(dm: &[F], z: &[F], ds: &mut [F], rows: u32, r: u3
             acc += dm[m * r + j] * z[m * r + j];
             m += 1usize;
         }
-        ds[j] = acc;
+        if accum {
+            ds[j] += acc;
+        } else {
+            ds[j] = acc;
+        }
         j += 32usize;
     }
 }
@@ -616,9 +701,10 @@ pub fn add_kernel<F: Float>(dx: &mut [F], dh: &[F], n: u32) {
     }
 }
 
-/// dIterEmbed[0,j] = sum_m dH_ctx[m,j] (higher rows stay zero from init).
+/// dIterEmbed[iter,j] = sum_m dH_ctx[m,j] (row `ie_off/d` of the table;
+/// each row is written exactly once, by its own iteration).
 #[cube(launch_unchecked)]
-pub fn ie_grad_kernel<F: Float>(dh_ctx: &[F], die: &mut [F], rows: u32, d: u32) {
+pub fn ie_grad_kernel<F: Float>(dh_ctx: &[F], die: &mut [F], ie_off: u32, rows: u32, d: u32) {
     let unit = UNIT_POS_X as usize;
     let d = d as usize;
     let mut j = unit;
@@ -629,29 +715,56 @@ pub fn ie_grad_kernel<F: Float>(dh_ctx: &[F], die: &mut [F], rows: u32, d: u32) 
             acc += dh_ctx[m * d + j];
             m += 1usize;
         }
-        die[j] = acc;
+        die[ie_off as usize + j] = acc;
         j += 32usize;
     }
 }
 
-/// dLam = dP + dRec·ceb/(b·t) + dOutAccSum; dHaltpre[b] = dLam·lam·(1-lam).
-/// lam comes from the saved forward flat output (flat_g holds gradients).
+/// PonderNet recurrence backward for one iteration n (plan.md checklist).
+///
+/// With p_m = lam_m·nh_m, nh_m = Π_{j<m}(1−lam_j), the grad of every p_m path
+/// folds into dp̃ = dp_ext + dRec·CE + dot (per batch row):
+/// - dp_ext = gc[pd_off+b] (upstream on the p_dist column)
+///   + dkl·(ln p − ln prior_n + 1)/(b·N) (KL term, model.rs ponder_kl)
+/// - dRec·CE = gc[0]·ceb[b]/(b·t)
+/// - dot[b] = Σ_{t,d} dOut_acc·step_out_n (the out_acc readout path)
+///
+///   dHaltpre[b] = (dp̃ − g_next[b])·nh·lam·(1−lam)
+///   g_cur[b]    = g_next[b]·(1−lam) + dp̃·lam
+///
+/// (g is the accumulated grad on the not_halted factor; identical to the
+/// plan's Σ_{m>n} −dp̃_m·p_m/(1−lam_n) but multiplicative, matching how
+/// burn's autodiff chains it. At N=1, g_next = 0 and nh = 1.)
 #[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
 pub fn lam_bwd_kernel<F: Float>(
-    flat_fwd: &[F],
-    flat_g: &[F],
+    gc: &[F],
+    p: &[F],
+    nh: &[F],
+    lam: &[F],
+    g_next: &[F],
     ceb: &[F],
-    dsum: &[F],
+    dot: &[F],
     dhaltpre: &mut [F],
-    lam_off: u32,
+    g_cur: &mut [F],
+    pd_off: u32,
+    kl_off: u32,
+    log_prior: f32,
+    b: u32,
     bt: u32,
+    bn: u32,
 ) {
-    let b = CUBE_POS_X as usize;
-    let drec = flat_g[0];
-    let dp = flat_g[lam_off as usize + b];
-    let lam = flat_fwd[lam_off as usize + b];
-    let dlam = dp + drec * ceb[b] / F::cast_from(bt as f32) + dsum[b];
-    dhaltpre[b] = dlam * lam * (F::new(1.0_f32) - lam);
+    let i = CUBE_POS_X as usize * 256usize + UNIT_POS_X as usize;
+    if i < b as usize {
+        let dkl = gc[kl_off as usize];
+        let dp_ext = gc[pd_off as usize + i]
+            + dkl * (p[i].ln() - F::cast_from(log_prior) + F::new(1.0_f32))
+                / F::cast_from(bn as f32);
+        let dp = dp_ext + gc[0usize] * ceb[i] / F::cast_from(bt as f32) + dot[i];
+        let (nn, l) = (nh[i], lam[i]);
+        dhaltpre[i] = (dp - g_next[i]) * nn * l * (F::new(1.0_f32) - l);
+        g_cur[i] = g_next[i] * (F::new(1.0_f32) - l) + dp * l;
+    }
 }
 
 /// dH_ctx[(b·t+ti)·d + j] += dHalt_in[b·d + j]/t.
@@ -672,10 +785,18 @@ pub fn haltmean_bwd_kernel<F: Float>(dhalt_in: &[F], dh_ctx: &mut [F], t: u32, d
     }
 }
 
-/// dg[j] = sum_m dXn[m,j]·r[m,j], r = h_ctx·inv (RMSNorm weight grad; the
+/// dg[j] (= or +=) sum_m dXn[m,j]·r[m,j], r = h_ctx·inv (RMSNorm weight grad; the
 /// output is r·g, so the weight jacobian carries r, not r·g).
 #[cube(launch_unchecked)]
-pub fn dg_kernel<F: Float>(dxn: &[F], h_ctx: &[F], inv: &[F], dg: &mut [F], rows: u32, d: u32) {
+pub fn dg_kernel<F: Float>(
+    dxn: &[F],
+    h_ctx: &[F],
+    inv: &[F],
+    dg: &mut [F],
+    rows: u32,
+    d: u32,
+    #[comptime] accum: bool,
+) {
     let unit = UNIT_POS_X as usize;
     let d = d as usize;
     let mut j = unit;
@@ -686,7 +807,11 @@ pub fn dg_kernel<F: Float>(dxn: &[F], h_ctx: &[F], inv: &[F], dg: &mut [F], rows
             acc += dxn[m * d + j] * h_ctx[m * d + j] * inv[m];
             m += 1usize;
         }
-        dg[j] = acc;
+        if accum {
+            dg[j] += acc;
+        } else {
+            dg[j] = acc;
+        }
         j += 32usize;
     }
 }
@@ -770,9 +895,9 @@ pub fn rms_bwd_kernel<F: Float>(
     }
 }
 
-/// out[0] = sum parts (one cube).
+/// out[0] (= or +=) sum parts (one cube).
 #[cube(launch_unchecked)]
-pub fn sum_part_kernel<F: Float>(parts: &[F], out: &mut [F], n: u32) {
+pub fn sum_part_kernel<F: Float>(parts: &[F], out: &mut [F], n: u32, #[comptime] accum: bool) {
     let unit = UNIT_POS_X as usize;
     let mut acc = F::new(0.0_f32);
     let mut i = unit;
@@ -789,7 +914,11 @@ pub fn sum_part_kernel<F: Float>(parts: &[F], out: &mut [F], n: u32) {
         for u in 0..32 {
             s += shared[u];
         }
-        out[0] = s;
+        if accum {
+            out[0] += s;
+        } else {
+            out[0] = s;
+        }
     }
 }
 
