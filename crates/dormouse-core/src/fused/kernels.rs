@@ -816,10 +816,11 @@ pub fn dg_kernel<F: Float>(
     }
 }
 
-/// dLam[b] += sum_{t,d} dOut_acc·step_out (the out_acc = step_out·p path of
-/// the halting distribution; N=1 so the p·π term is identity). `g_out` is the
-/// FULL flat upstream grad; `out_off` selects its out_acc region (without the
-/// offset this sums the rec/lam grad region against step_out - garbage).
+/// dlam[b] += sum_{t,d} g_out[out_off + b·t·d + i]·step_out[b·t·d + i] - the
+/// out_acc halting-path term of dp_n (dOut_acc·step_out_n), one cube per
+/// batch row. The live caller passes a dedicated dOut_acc buffer with
+/// out_off = 0; out_off selects a region inside a FULL flat upstream grad,
+/// and a wrong offset sums an unrelated region against step_out (garbage).
 #[cube(launch_unchecked)]
 pub fn dlam_outacc_kernel<F: Float>(
     g_out: &[F],

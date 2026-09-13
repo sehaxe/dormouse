@@ -226,6 +226,9 @@ pub(super) fn ponder_backward(
     let dxg = zeros_raw(&dev, &client, bt * d);
     let mut g_next = zeros_raw(&dev, &client, b);
     let mut dx_carry: Option<CubeTensor> = None;
+    // lam_bwd_kernel covers exactly one 32-wide cube (UNITS; CubeCount 1×1×1):
+    // a larger b would silently drop the tail.
+    debug_assert!(b <= 32, "lam_bwd_kernel b={b} exceeds the single-cube cap (32)");
     // lm_head grad tails finished after the loop (dV accumulates raw, the
     // column scale commutes with the sum over iterations)
     let dvl = alloc(v * r);
@@ -645,6 +648,19 @@ pub(super) fn ponder_backward(
             buf!(dvl_raw, v * r), buf!(st.lm.s, r), buf!(dvl, v * r),
             r as u32, (v * r) as u32,
         );
+    }
+    // out_proj dV column scale (raw accumulator -> master grad; dV = (dYᵀ·Z)·diag(s),
+    // the ·s folds out of the iteration sum like the lm_head dV above)
+    {
+        let dv_o = alloc(d * r);
+        unsafe {
+            super::kernels::col_scale_kernel::launch_unchecked::<f32, Cuda>(
+                &client, ew_cubes(d * r), EW,
+                buf!(out[26].as_ref().unwrap(), d * r), buf!(st.op.s, r), buf!(dv_o, d * r),
+                r as u32, (d * r) as u32,
+            );
+        }
+        out[26] = Some(dv_o);
     }
     // expert dV column scales (raw accumulators -> master grads; like the
     // lm_head dV, the ·s folds out of the iteration sum)

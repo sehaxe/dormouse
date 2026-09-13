@@ -304,6 +304,7 @@ fn fused_bwd_buffers_vs_f64() {
         },
         1,
         8,
+        true,
     );
 }
 
@@ -322,10 +323,11 @@ fn fused_bwd_buffers_vs_f64_small() {
         },
         2,
         16,
+        false,
     );
 }
 
-fn fused_bwd_buffers_vs_f64_cfg(cfg: DormouseConfig, b: usize, t: usize) {
+fn fused_bwd_buffers_vs_f64_cfg(cfg: DormouseConfig, b: usize, t: usize, perturb_s: bool) {
     std::env::set_var("DM_FUSED_BWD_DEBUG", "1");
     std::env::set_var("DM_FUSED_DEBUG", "1");
     let dev = burn::tensor::Device::default().autodiff();
@@ -333,6 +335,34 @@ fn fused_bwd_buffers_vs_f64_cfg(cfg: DormouseConfig, b: usize, t: usize) {
     model.loop_block.residual_scale =
         Param::from_tensor(Tensor::<1>::from_data(TensorData::new(vec![0.7f32], [1]), &dev));
     deflake_ternary_edges(&mut model, &dev);
+    if perturb_s {
+        // TSCT s inits to ones, which blinds every ·s column-scale check (the
+        // out_proj dV regression ran green this way). Push every s off 1 on
+        // the model BEFORE extraction: the fused op reads its inputs off the
+        // model below and the f64 truth reads the same factors, so one
+        // perturbation covers both sides.
+        let bump = |ll: &mut LinearLike| {
+            if let LinearLikeInner::Tsct(l) = &mut ll.inner {
+                let s: Vec<f32> = l.s
+                    .val()
+                    .into_data()
+                    .try_to_vec::<f32>()
+                    .unwrap()
+                    .into_iter()
+                    .enumerate()
+                    .map(|(k, x)| x * (0.6 + 0.4 * (k % 5) as f32))
+                    .collect();
+                let r = s.len();
+                l.s = Param::from_tensor(Tensor::from_data(TensorData::new(s, [r]), &dev));
+            }
+        };
+        for e in &mut model.loop_block.expert_ffns {
+            bump(&mut e.gate_up);
+            bump(&mut e.down);
+        }
+        bump(&mut model.loop_block.out_proj);
+        bump(&mut model.lm_head);
+    }
     let d = cfg.d_model;
     let f = cfg.d_ffn;
     let r = cfg.rank;
@@ -634,10 +664,13 @@ fn fused_bwd_buffers_vs_f64_cfg(cfg: DormouseConfig, b: usize, t: usize) {
             }
         }
         // lm_head weight grads: final-readout part + per-step part (added below)
+        // z_lf is the UNSCALED z (= hf·U_t); ds and dV apply ·sl themselves
+        // (dz = dm·s, dV = (dlfᵀ·z)·s) - a ·s baked into z here double-counts
+        // into s²·dV, which is invisible only while s == 1.
         let mut z_lf = vec![0f64; bt * r];
         for m in 0..bt {
             for k in 0..r {
-                z_lf[m * r + k] = (0..d).map(|i| hf[m * d + i] * ult[i * r + k]).sum::<f64>() * sl[k];
+                z_lf[m * r + k] = (0..d).map(|i| hf[m * d + i] * ult[i * r + k]).sum::<f64>();
             }
         }
         let mut dsl: Vec<f64> = (0..r)
@@ -706,7 +739,7 @@ fn fused_bwd_buffers_vs_f64_cfg(cfg: DormouseConfig, b: usize, t: usize) {
         let dso: Vec<f64> = (0..r)
             .map(|k| (0..bt).map(|m| dmo[m * r + k] * z_o[m * r + k]).sum())
             .collect();
-        let _dvo: Vec<f64> = (0..d * r)
+        let dvo: Vec<f64> = (0..d * r)
             .map(|i| {
                 let (c, k) = (i / r, i % r);
                 (0..bt).map(|m| dstep[m * d + c] * z_o[m * r + k]).sum::<f64>() * so[k]
@@ -785,10 +818,13 @@ fn fused_bwd_buffers_vs_f64_cfg(cfg: DormouseConfig, b: usize, t: usize) {
                     sil[m * f + j] = sigmoid(a);
                 }
                 for k in 0..r {
+                    // RAW Zd (= silu(mid)·U2_t): ds/dV below apply ·s2
+                    // themselves, and the `o` recompute needs the single ·s2 -
+                    // a ·s baked in here double-counts into s²·dV (invisible
+                    // while s == 1, exposed by the perturbed-s bisect).
                     zd_all[m * r + k] = (0..f)
                         .map(|j| mid[m * f + j] * sigmoid(mid[m * f + j]) * u2t[j * r + k])
-                        .sum::<f64>()
-                        * s2[k];
+                        .sum::<f64>();
                 }
             }
             // dblend uses out_e (recomputed here)
@@ -842,7 +878,11 @@ fn fused_bwd_buffers_vs_f64_cfg(cfg: DormouseConfig, b: usize, t: usize) {
             let mut z_all = vec![0f64; bt * r];
             for m in 0..bt {
                 for k in 0..r {
-                    z_all[m * r + k] = (0..d).map(|i| normed[m * d + i] * ut[i * r + k]).sum::<f64>() * sg[k];
+                    // RAW Z (= normed·U_t): ds_e2/dv_e below apply ·sg
+                    // themselves (same raw-z rule as z_lf / zd_all).
+                    z_all[m * r + k] = (0..d)
+                        .map(|i| normed[m * d + i] * ut[i * r + k])
+                        .sum::<f64>();
                 }
             }
             let ds_e2: Vec<f64> = (0..r)
@@ -998,6 +1038,7 @@ fn fused_bwd_buffers_vs_f64_cfg(cfg: DormouseConfig, b: usize, t: usize) {
         // out_proj + lm_head weight grads (op/lm f64 truths)
         cmp("du_op", &duo);
         cmp("ds_op", &dso);
+        cmp("dv_op", &dvo);
         cmp("du_lm", &dul);
         cmp("ds_lm", &dsl);
         cmp("dv_lm", &dvl);
@@ -1640,7 +1681,9 @@ fn fused_bwd_recurrence_vs_f64_n2() {
                         let a: f64 = (0..r).map(|k| zr[k] * vt[j * r + k]).sum();
                         mid[m * f + j] = a;
                         for k in 0..r {
-                            zd_all[m * r + k] += a * sigmoid(a) * u2t[j * r + k] * s2[k];
+                            // RAW Zd: the `o` recompute below applies the
+                            // single ·s2 (see the N=1 bisect zd_all note).
+                            zd_all[m * r + k] += a * sigmoid(a) * u2t[j * r + k];
                         }
                     }
                 }
