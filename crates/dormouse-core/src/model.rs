@@ -109,8 +109,10 @@ impl DormouseModel {
     /// (cubecl/sm_120 stability). `host_rows` carries pre-gathered n-gram
     /// rows `[b,t,3*32]` for the RAM-offload path; when None, `hashed_ids`
     /// drives the in-model tables. `teacher` (the EMA copy) enables the JEPA
-    /// term; `aux` is the weight-combined auxiliary loss (JEPA + DSpark),
-    /// None when every aux weight is 0 or `targets` is None.
+    /// term (a second full forward per step - use
+    /// [`Self::forward_with_jepa_targets`] with precomputed latents to drop
+    /// it from the hot loop); `aux` is the weight-combined auxiliary loss
+    /// (JEPA + DSpark), None when every aux weight is 0 or `targets` is None.
     pub fn forward_with_hidden<B: burn::backend::AutodiffBackend>(
         &self,
         input_ids: Tensor<2, Int>,
@@ -125,6 +127,54 @@ impl DormouseModel {
             + DispatchKindConversion<burn::backend::Autodiff<B::InnerBackend>>,
     {
         let ids_raw = targets.clone();
+        // Teacher latent over the same inputs (the student predicts its own
+        // out_acc against it). This is the second full forward the offline
+        // path exists to eliminate.
+        let teacher_latent = teacher
+            .zip(ids_raw.as_ref())
+            .map(|(t, ids)| t.forward_latent::<B>(ids.clone(), None, None));
+        drop(ids_raw);
+        self.forward_with_latent::<B>(
+            input_ids, hashed_ids, host_rows, targets, teacher_latent,
+        )
+    }
+
+    /// Same as [`Self::forward_with_hidden`], but the JEPA target latent is
+    /// supplied precomputed (offline teacher targets) instead of running an
+    /// EMA-teacher forward per step: no second forward, no EMA advance in
+    /// the training loop.
+    pub fn forward_with_jepa_targets<B: burn::backend::AutodiffBackend>(
+        &self,
+        input_ids: Tensor<2, Int>,
+        hashed_ids: Option<Tensor<3, Int>>,
+        host_rows: Option<Tensor<3>>,
+        targets: Option<Tensor<2, Int>>,
+        jepa_target: Option<Tensor<3>>,
+    ) -> (Tensor<3>, Tensor<1>, Tensor<2>, Tensor<4>, Option<Tensor<1>>)
+    where
+        DispatchTensor: DispatchKindConversion<B>
+            + DispatchKindConversion<B::InnerBackend>
+            + DispatchKindConversion<burn::backend::Autodiff<B::InnerBackend>>,
+    {
+        self.forward_with_latent::<B>(
+            input_ids, hashed_ids, host_rows, targets, jepa_target,
+        )
+    }
+
+    fn forward_with_latent<B: burn::backend::AutodiffBackend>(
+        &self,
+        input_ids: Tensor<2, Int>,
+        hashed_ids: Option<Tensor<3, Int>>,
+        host_rows: Option<Tensor<3>>,
+        targets: Option<Tensor<2, Int>>,
+        teacher_latent: Option<Tensor<3>>,
+    ) -> (Tensor<3>, Tensor<1>, Tensor<2>, Tensor<4>, Option<Tensor<1>>)
+    where
+        DispatchTensor: DispatchKindConversion<B>
+            + DispatchKindConversion<B::InnerBackend>
+            + DispatchKindConversion<burn::backend::Autodiff<B::InnerBackend>>,
+    {
+        let ids_raw = targets.clone();
         let x = self.embedding.forward(input_ids);
         let x = if self.bf16 {
             x.cast(FloatDType::BF16)
@@ -132,8 +182,8 @@ impl DormouseModel {
             x
         };
         let [b, t, _d] = x.dims();
-        let v = self.vocab_size;
-        let tgt = targets.map(|tg| tg.reshape([b * t]).one_hot::<2>(v).cast(FloatDType::F32));
+        // Indices for the in-loop L_Rec gather (no one-hot [b*t,v] tensor).
+        let tgt = targets.map(|tg| tg.reshape([b * t, 1]));
         let (out_acc, rec, p_dist, kda) =
             self.loop_block
                 .forward_full_state::<B>(x, hashed_ids, host_rows, None, tgt, &self.lm_head);
@@ -148,17 +198,19 @@ impl DormouseModel {
             .lm_head
             .forward::<B>(h.clone().reshape([b * t, self.d_model]))
             .reshape([b, t, self.vocab_size]);
-        let aux = self.aux_loss::<B>(&out_acc, teacher, ids_raw, &h, &logits);
+        let aux = self.aux_loss::<B>(&out_acc, teacher_latent, ids_raw, &h, &logits);
         (logits, rec, p_dist, kda, aux)
     }
 
     /// Weight-combined auxiliary loss (JEPA + DSpark). None when every aux
     /// weight is 0, when there are no targets, or when JEPA is on but no
-    /// teacher was supplied.
+    /// teacher latent was supplied. `teacher_latent` is either the live EMA
+    /// teacher's out_acc (online) or a precomputed frozen target (offline);
+    /// both are detached here - the latent is a stop-grad target.
     fn aux_loss<B: burn::backend::AutodiffBackend>(
         &self,
         student_latent: &Tensor<3>,
-        teacher: Option<&Self>,
+        teacher_latent: Option<Tensor<3>>,
         ids: Option<Tensor<2, Int>>,
         h: &Tensor<3>,
         logits: &Tensor<3>,
@@ -175,14 +227,11 @@ impl DormouseModel {
         let dev = h.device();
         let mut total: Option<Tensor<1>> = None;
         if self.jepa_weight > 0.0 {
-            if let Some(t) = teacher {
-                // Teacher latent over the same inputs; the student predicts
-                // its own out_acc (pre-head accumulation) against it.
-                let tl = t.forward_latent::<B>(ids.clone(), None, None);
+            if let Some(tl) = teacher_latent {
                 let j = crate::aux::jepa_aux_loss(
                     &self.aux.jepa_pred,
                     student_latent.clone(),
-                    tl,
+                    tl.detach(),
                     self.jepa_mask_frac,
                     self.jepa_mask_span,
                 );

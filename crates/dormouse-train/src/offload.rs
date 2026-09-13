@@ -2,10 +2,16 @@
 //!
 //! Deterministic FNV addressing means the tables never need random access
 //! from the GPU: each batch's rows are gathered on the host, copied to the
-//! device (~600 KB for batch 3 x s512), and trained with plain Adam on the
-//! CPU (report: n-gram tables run on Adam with weight decay disabled). The
-//! VRAM cost of the memory scales with the batch's unique rows, not with the
-//! table size, so millions of slots live in the 64 GB RAM for free.
+//! device (~600 KB for batch 3 x s512), and trained on the CPU with Nesterov
+//! momentum + periodic Sinkhorn balancing (DeepSeek V4.1-Flash §2.5: the
+//! embedding tables and head run on one momentum buffer instead of Adam's
+//! m+v - halving the optimizer state - with no weight decay). The VRAM cost
+//! of the memory scales with the batch's unique rows, not with the table
+//! size, so millions of slots live in the 64 GB RAM for free.
+//!
+//! RAM per row: table 128 B + momentum 128 B = 256 B (x2 total), down from
+//! Adam's table + m + v = 384 B (x3). At the real18 size (48M rows) that is
+//! 12.3 GB instead of 18.4 GB.
 //!
 //! Tables are [slots, dim] f32 row-major, one per n-gram order; the hash
 //! indices arrive pre-moduloed by the slot count (data crate).
@@ -16,13 +22,25 @@ use burn::backend::{Backend, DispatchKindConversion};
 use burn::module::Param;
 use burn::tensor::{DispatchTensor, Int, Tensor, TensorData};
 
+/// Nesterov momentum (same value Muon+ uses for its 2D group).
+const MOMENTUM: f32 = 0.95;
+/// Sinkhorn-balance the batch's update block every K updates (between the
+/// balanced steps the update is plain Nesterov).
+const SINKHORN_EVERY: u64 = 4;
+/// Alternating L1 row/column normalizations per balanced update (SinkGD
+/// uses a handful; 2 is enough to pull skewed rows toward the mean).
+const SINKHORN_ITERS: usize = 2;
+/// Layout magic ("2MGN" little-endian). v1 files (Adam m+v) start with the
+/// step counter and can never collide with this; a mismatch fails the load
+/// loudly instead of misreading the state.
+const LAYOUT_MAGIC: u32 = 0x4D_47_4E_32;
+
 /// 3 tables (3/5/8-gram), `dim` columns each.
 pub struct HostNgram {
     pub slots: [usize; 3],
     pub dim: usize,
     tables: Vec<f32>, // concatenated [sum(slots), dim]
-    m: Vec<f32>,      // Adam first moment, same layout
-    v: Vec<f32>,      // Adam second moment, same layout
+    m: Vec<f32>,      // momentum, same layout (the only optimizer state)
     step: u64,
 }
 
@@ -53,7 +71,6 @@ impl HostNgram {
             dim,
             tables,
             m: vec![0.0; total],
-            v: vec![0.0; total],
             step: 0,
         }
     }
@@ -101,33 +118,45 @@ impl HostNgram {
         }
     }
 
-    /// Plain Adam step (weight decay disabled, report §2.3) on the given
-    /// rows, in place. `grads` must be flat `[n*dim]` for the same indices.
-    pub fn adam_update(&mut self, indices: &[i64], grads: &[f32], lr: f32) {
+    /// Nesterov momentum step (weight decay disabled, DeepSeek V4.1-Flash
+    /// §2.3) on the given rows, in place. `grads` must be flat `[n*dim]` for
+    /// the same indices. Every [`SINKHORN_EVERY`]-th update, the batch's
+    /// update block is Sinkhorn-balanced (alternating L1 row/column
+    /// normalization, magnitude-preserving) before it is applied; the work
+    /// stays O(batch rows) - the full table is never touched.
+    pub fn momentum_update(&mut self, indices: &[i64], grads: &[f32], lr: f32) {
         self.step += 1;
-        let b1 = 0.9f32;
-        let b2 = 0.999f32;
-        let eps = 1e-8f32;
-        let bc1 = 1.0 / (1.0 - b1.powi(self.step as i32));
-        let bc2 = (1.0 - b2.powi(self.step as i32)).sqrt();
+        let n = indices.len();
+        debug_assert_eq!(grads.len(), n * self.dim);
+        // Update block [n, dim]: the Nesterov look-ahead gradient.
+        let mut block = vec![0.0f32; n * self.dim];
         for (k, &r) in indices.iter().enumerate() {
             let base = (r as usize) * self.dim;
             for c in 0..self.dim {
-                let g = grads[k * self.dim + c];
                 let mi = base + c;
-                self.m[mi] = b1 * self.m[mi] + (1.0 - b1) * g;
-                self.v[mi] = b2 * self.v[mi] + (1.0 - b2) * g * g;
-                let step = self.m[mi] * bc1 / (self.v[mi].sqrt() * bc2 + eps);
-                self.tables[mi] -= lr * step;
+                self.m[mi] = MOMENTUM * self.m[mi] + (1.0 - MOMENTUM) * grads[k * self.dim + c];
+                block[k * self.dim + c] =
+                    MOMENTUM * self.m[mi] + (1.0 - MOMENTUM) * grads[k * self.dim + c];
+            }
+        }
+        if self.step % SINKHORN_EVERY == 0 {
+            sinkhorn_l1(&mut block, n, self.dim, SINKHORN_ITERS);
+        }
+        for (k, &r) in indices.iter().enumerate() {
+            let base = (r as usize) * self.dim;
+            for c in 0..self.dim {
+                self.tables[base + c] -= lr * block[k * self.dim + c];
             }
         }
     }
 
-    /// Serialize the tables + Adam state (checkpointing; ~row_bytes * rows).
+    /// Serialize the tables + momentum state (checkpointing; ~row_bytes *
+    /// rows). Layout: [magic u32][step u64][tables][m].
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(self.tables.len() * 4 * 3 + 8);
+        let mut buf = Vec::with_capacity(12 + self.tables.len() * 4 * 2);
+        buf.extend_from_slice(&LAYOUT_MAGIC.to_le_bytes());
         buf.extend_from_slice(&self.step.to_le_bytes());
-        for chunk in [&self.tables, &self.m, &self.v] {
+        for chunk in [&self.tables, &self.m] {
             for &x in chunk {
                 buf.extend_from_slice(&x.to_le_bytes());
             }
@@ -138,9 +167,10 @@ impl HostNgram {
     /// Stream the same layout straight to a writer in 64KB blocks: a
     /// multi-GB table set must not materialize a second copy in RAM.
     pub fn write_to<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
+        w.write_all(&LAYOUT_MAGIC.to_le_bytes())?;
         w.write_all(&self.step.to_le_bytes())?;
         let mut buf = Vec::with_capacity(64 * 1024);
-        for chunk in [&self.tables, &self.m, &self.v] {
+        for chunk in [&self.tables, &self.m] {
             for block in chunk.chunks(16 * 1024) {
                 buf.clear();
                 for &x in block {
@@ -152,13 +182,19 @@ impl HostNgram {
         Ok(())
     }
 
+    /// None when the layout magic mismatches (a v1 Adam-state checkpoint):
+    /// the caller must report the skip loudly rather than silently reinit.
     pub fn from_bytes(bytes: &[u8], slots: [usize; 3], dim: usize) -> Option<Self> {
-        let total = slots.iter().sum::<usize>() * dim;
-        if bytes.len() < 8 + total * 4 * 3 {
+        const MAGIC: [u8; 4] = LAYOUT_MAGIC.to_le_bytes();
+        if bytes.len() < 12 || bytes[..4] != MAGIC {
             return None;
         }
-        let step = u64::from_le_bytes(bytes[..8].try_into().ok()?);
-        let mut it = bytes[8..].chunks_exact(4);
+        let total = slots.iter().sum::<usize>() * dim;
+        if bytes.len() < 12 + total * 4 * 2 {
+            return None;
+        }
+        let step = u64::from_le_bytes(bytes[4..12].try_into().ok()?);
+        let mut it = bytes[12..].chunks_exact(4);
         let mut read = |n: usize| -> Option<Vec<f32>> {
             let mut v = Vec::with_capacity(n);
             for _ in 0..n {
@@ -172,9 +208,50 @@ impl HostNgram {
             dim,
             tables: read(total)?,
             m: read(total)?,
-            v: read(total)?,
             step,
         })
+    }
+}
+
+/// SinkGD-style balancing of an update block `[rows, cols]`: alternate L1
+/// row and column normalization (signs preserved - the divisor is the sum
+/// of absolute values), then rescale to the block's original total L1 so
+/// the learning rate keeps its meaning. All rows/cols end up with the same
+/// order of magnitude, so a few huge rows can no longer dominate the
+/// update of the batch's other rows.
+fn sinkhorn_l1(block: &mut [f32], rows: usize, cols: usize, iters: usize) {
+    if rows == 0 || cols == 0 {
+        return;
+    }
+    let orig: f32 = block.iter().map(|x| x.abs()).sum();
+    if !orig.is_finite() || orig <= 1e-12 {
+        return;
+    }
+    for _ in 0..iters {
+        for r in 0..rows {
+            let row = &mut block[r * cols..(r + 1) * cols];
+            let s: f32 = row.iter().map(|x| x.abs()).sum();
+            if s > 1e-12 {
+                for x in row.iter_mut() {
+                    *x /= s;
+                }
+            }
+        }
+        for c in 0..cols {
+            let s: f32 = (0..rows).map(|r| block[r * cols + c].abs()).sum();
+            if s > 1e-12 {
+                for r in 0..rows {
+                    block[r * cols + c] /= s;
+                }
+            }
+        }
+    }
+    let now: f32 = block.iter().map(|x| x.abs()).sum();
+    if now > 1e-12 {
+        let f = orig / now;
+        for x in block.iter_mut() {
+            *x *= f;
+        }
     }
 }
 
@@ -183,7 +260,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gather_adam_roundtrip() {
+    fn gather_momentum_roundtrip() {
         let mut h = HostNgram::new([64, 64, 64], 8, 7);
         // 9 positions, 3 tables; each table-local index repeats 3x.
         let hashes: Vec<i64> = vec![5, 7, 9, 5, 7, 9, 5, 7, 9];
@@ -194,13 +271,13 @@ mod tests {
         let mut rows = Vec::new();
         h.gather(&uniq, &mut rows);
         assert_eq!(rows.len(), uniq.len() * 8);
-        // Adam step must move the gathered rows.
+        // The momentum step must move the gathered rows.
         let before: Vec<f32> = rows.clone();
         let grads: Vec<f32> = rows.iter().map(|x| x * 0.1).collect();
-        h.adam_update(&uniq, &grads, 1e-3);
+        h.momentum_update(&uniq, &grads, 1e-3);
         let mut after = Vec::new();
         h.gather(&uniq, &mut after);
-        assert!(before != after, "adam update must change the rows");
+        assert!(before != after, "momentum update must change the rows");
         // Roundtrip through bytes.
         let bytes = h.to_bytes();
         let h2 = HostNgram::from_bytes(&bytes, [64, 64, 64], 8).expect("ckpt load");
@@ -208,11 +285,68 @@ mod tests {
         h2.gather(&uniq, &mut after2);
         assert_eq!(after, after2, "ckpt roundtrip must preserve rows");
     }
+
+    /// A v1 (Adam m+v) checkpoint has no layout magic: from_bytes must
+    /// reject it loudly (None), never misread the state.
+    #[test]
+    fn v1_layout_is_rejected() {
+        let h = HostNgram::new([64, 64, 64], 8, 7);
+        // Emulate v1: step u64 then three chunks.
+        let mut v1 = Vec::new();
+        v1.extend_from_slice(&1u64.to_le_bytes());
+        let ones = vec![1.0f32; h.tables.len()];
+        for chunk in [&h.tables, &ones, &ones] {
+            for &x in chunk {
+                v1.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+        assert!(HostNgram::from_bytes(&v1, [64, 64, 64], 8).is_none());
+        assert!(HostNgram::from_bytes(&h.to_bytes(), [64, 64, 64], 8).is_some());
+    }
+
+    /// Sinkhorn balancing must even out wildly skewed rows while keeping
+    /// the block's overall magnitude: after balancing, row and column L1
+    /// sums are within a small factor of each other.
+    #[test]
+    fn sinkhorn_balances_rows_and_cols() {
+        let (rows, cols) = (6usize, 8usize);
+        let mut block: Vec<f32> = (0..rows * cols)
+            .map(|i| match i / cols {
+                0 => 1000.0 * ((i % cols) as f32 + 1.0),
+                1 => 0.001 * ((i % cols) as f32 + 1.0),
+                _ => ((i % 7) as f32 - 3.0) * 0.5,
+            })
+            .collect();
+        let orig: f32 = block.iter().map(|x| x.abs()).sum();
+        sinkhorn_l1(&mut block, rows, cols, 8);
+        let row_l1 = |r: usize| block[r * cols..(r + 1) * cols].iter().map(|x| x.abs()).sum::<f32>();
+        let col_l1 = |c: usize| (0..rows).map(|r| block[r * cols + c].abs()).sum::<f32>();
+        let row_sums: Vec<f32> = (0..rows).map(row_l1).collect();
+        let col_sums: Vec<f32> = (0..cols).map(col_l1).collect();
+        let spread = |v: &[f32]| v.iter().cloned().fold(f32::MIN, f32::max) / v.iter().cloned().fold(f32::MAX, f32::max).max(1e-12);
+        assert!(
+            spread(&row_sums) < 3.0,
+            "row L1 sums must balance: {row_sums:?}"
+        );
+        assert!(
+            spread(&col_sums) < 10.0,
+            "col L1 sums must balance: {col_sums:?}"
+        );
+        let now: f32 = block.iter().map(|x| x.abs()).sum();
+        assert!(
+            (now - orig).abs() / orig < 0.05,
+            "total magnitude must be preserved: {orig} -> {now}"
+        );
+        assert!(block.iter().all(|x| x.is_finite()));
+    }
 }
 
 /// Gather the batch's rows from RAM into an autodiff leaf and expand them
 /// to the `[b, t, 3*dim]` embedding the model consumes. With `track=false`
-/// (eval) the leaf is skipped and only the embedding is returned.
+/// (eval) the leaf is skipped and only the embedding is returned. Also
+/// returns the unique absolute row indices (the CPU momentum update
+/// consumes exactly these; recomputing `unique_rows` per step would double
+/// the work).
 pub fn rows_for_batch<B: Backend>(
     host: &HostNgram,
     hashes: &[i64],
@@ -220,7 +354,7 @@ pub fn rows_for_batch<B: Backend>(
     t: usize,
     device: &burn::tensor::Device,
     track: bool,
-) -> (Option<Param<Tensor<2>>>, Tensor<3>)
+) -> (Option<Param<Tensor<2>>>, Tensor<3>, Vec<i64>)
 where
     DispatchTensor: DispatchKindConversion<B>,
 {
@@ -239,5 +373,5 @@ where
     let pos_t: Tensor<1, Int> = Tensor::from_data(TensorData::new(pos, [b * t * 3]), device);
     let idx2 = pos_t.unsqueeze_dim::<2>(1).repeat(&[1, host.dim]);
     let embed = src.gather(0, idx2).reshape([b, t, 3 * host.dim]);
-    (p, embed)
+    (p, embed, uniq)
 }

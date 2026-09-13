@@ -114,13 +114,22 @@ impl LinearLike {
     }
 
     /// Worst-case orthonormality error of the TSCT masters (0 for dense/sct).
-    /// Syncs the device (reads back); call at monitor cadence, not per step.
+    /// Per-entry metric: the Frobenius `||UᵀU - I||_F` divided by the rank k.
+    /// The raw F-norm scales ~k (it sums k² Gram entries), which put the
+    /// plan's 1e-3 threshold *below* the NS retract's own convergence floor
+    /// (~4e-3 raw at r=64) — the fp32 fallback then fired on every fresh
+    /// run and the factor-quant forward never engaged (measured 2026-09-04,
+    /// `ortho_probe`). Per-entry the retract floor is ~6e-5 and 1e-3 is a
+    /// real drift bound. Syncs the device (reads back); monitor at cadence.
     pub fn max_ortho(&self) -> f32 {
         match &self.inner {
             LinearLikeInner::Tsct(l) => {
-                let u = burn_spectral::ortho_error(&l.u.val());
-                let v = burn_spectral::ortho_error(&l.v.val());
-                u.max(v)
+                let u = l.u.val();
+                let v = l.v.val();
+                let ku = u.dims()[1].max(1) as f32;
+                let kv = v.dims()[1].max(1) as f32;
+                (burn_spectral::ortho_error(&u) / ku)
+                    .max(burn_spectral::ortho_error(&v) / kv)
             }
             _ => 0.0,
         }

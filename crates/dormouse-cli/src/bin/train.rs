@@ -83,6 +83,15 @@ struct Args {
     /// DSpark draft depth K (default: preset, 4).
     #[arg(long)]
     dspark_k: Option<usize>,
+    /// Offline JEPA targets: precomputed teacher-latent sidecar (from
+    /// --jepa-precompute). Set = no per-step EMA teacher forward, no EMA
+    /// advance.
+    #[arg(long)]
+    jepa_targets: Option<PathBuf>,
+    /// Precompute N steps of JEPA teacher targets into --jepa-targets and
+    /// exit (one forward per batch, current weights, no training).
+    #[arg(long)]
+    jepa_precompute: Option<usize>,
 
     // --- quantization / maintenance ---
     /// Force factor-quant format: fp32 | bf16 | fp16 | fp8 | fp4.
@@ -109,6 +118,9 @@ struct Args {
     engram_ram: bool,
     #[arg(long, default_value = "1000000")]
     engram_slots: usize,
+    /// Host-table Adam cadence in steps (default 1 = every step; 0 = off).
+    #[arg(long, default_value = "1")]
+    host_adam_every: usize,
 
     // --- diagnostics ---
     /// Per-step GPU/CPU time split every 50 steps (forces a sync).
@@ -169,6 +181,7 @@ fn run(a: Args) -> Result<(), String> {
         stress_every: a.stress_every,
         engram_ram: a.engram_ram,
         engram_slots: a.engram_slots,
+        host_adam_every: a.host_adam_every,
         warmup: true,
         quant_check: a.quant_check,
         timers: a.timers,
@@ -183,7 +196,21 @@ fn run(a: Args) -> Result<(), String> {
         jepa_weight: a.jepa_weight,
         dspark_weight: a.dspark_weight,
         dspark_k: a.dspark_k,
+        jepa_targets: a.jepa_targets,
+        qk_heads: None,
     };
+    if let Some(n) = a.jepa_precompute {
+        let Some(out) = &cfg.jepa_targets else {
+            return Err("--jepa-precompute requires --jepa-targets <output file>".into());
+        };
+        return dormouse_train::precompute_jepa_targets(
+            &cfg,
+            std::path::Path::new(&a.data),
+            &a.preset,
+            n,
+            out,
+        );
+    }
     dormouse_train::train_loop(
         cfg,
         PathBuf::from(a.data),
@@ -194,7 +221,7 @@ fn run(a: Args) -> Result<(), String> {
 }
 
 fn main() {
-    let mut a = Args::parse();
+    let a = Args::parse();
 
     // Daemonize first: SIGHUP ignored + background fork, so the training
     // process outlives its terminal.
@@ -230,6 +257,12 @@ fn main() {
     }
 
     let guard = a.guard;
+    // Resume state must exist for a restart to make sense: a fresh run that
+    // dies before its first checkpoint (bad config, OOM at startup) would
+    // otherwise re-exec into the same crash forever.
+    let resumable = std::path::Path::new(&a.ckpt_dir)
+        .join(format!("{}.bin", a.ckpt_name))
+        .is_file();
     // Panics (e.g. CUDA OOM deep in cubecl) must reach the guard too, so the
     // run is wrapped in catch_unwind; a re-exec'd process rebuilds the CUDA
     // context and memory pools - neither is safe to reuse after a device
@@ -247,7 +280,7 @@ fn main() {
         Ok(()) => {}
         Err(e) => {
             eprintln!("train failed: {e}");
-            if guard {
+            if guard && resumable {
                 eprintln!("guard: restarting in 30s (resume from last checkpoint)");
                 std::thread::sleep(std::time::Duration::from_secs(30));
                 use std::os::unix::process::CommandExt;
@@ -256,6 +289,8 @@ fn main() {
                     .args(std::env::args_os().skip(1))
                     .exec();
                 eprintln!("guard: re-exec failed: {err}");
+            } else if guard {
+                eprintln!("guard: no resumable checkpoint, giving up");
             }
             std::process::exit(1);
         }

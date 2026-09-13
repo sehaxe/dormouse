@@ -1,10 +1,12 @@
 //! dormouse-train - CUDA training loop: Autodiff backend, Muon+ mixed
 //! optimizer (see `optim`), burnpack checkpoints with custom name, resume,
 //! opencode harness.
+mod jepa_targets;
 mod offload;
 mod optim;
 mod stress;
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use burn::{
@@ -12,7 +14,7 @@ use burn::{
     module::Module,
     optim::{GradientsParams, OptimizerRecord},
     store::ModuleRecord,
-    tensor::{Bytes, Device, FloatDType, Int, Tensor, TensorData},
+    tensor::{Bytes, Device, Int, Tensor, TensorData},
 };
 
 use dormouse_core::{ActQuant, DormouseConfig, DormouseModel};
@@ -69,6 +71,10 @@ pub struct TrainCfg {
     /// RAM-offload Engram tables (host memory, CPU Adam) with slot count.
     pub engram_ram: bool,
     pub engram_slots: usize,
+    /// Host-table Adam cadence in steps (default 1 = every step, the
+    /// report's rule; 0 = off). Each update syncs the row grads D2H, so
+    /// values >1 trade table freshness for fewer syncs.
+    pub host_adam_every: usize,
     /// Two fwd+bwd warmup steps before the loop (raises the pool high-water
     /// early); keep on for long runs.
     pub warmup: bool,
@@ -92,6 +98,13 @@ pub struct TrainCfg {
     pub jepa_weight: Option<f32>,
     pub dspark_weight: Option<f32>,
     pub dspark_k: Option<usize>,
+    /// Head-wise Muon for the attention Q/K projections: `Some(n_heads)`
+    /// enables the per-head groups (set from the preset in `train_loop`).
+    pub qk_heads: Option<usize>,
+    /// Offline JEPA targets (precomputed EMA-teacher latents per training
+    /// chunk). When set, the hot loop runs NO second teacher forward and no
+    /// EMA advance; targets are looked up per batch by chunk hash.
+    pub jepa_targets: Option<PathBuf>,
 }
 
 impl Default for TrainCfg {
@@ -103,11 +116,12 @@ impl Default for TrainCfg {
             opt: "mix".into(), quant: None, factors_fallback: false,
             retract_every: 1, retract_iters: 3,
             stress: false, stress_lr: 1.0, stress_every: 50,
-            engram_ram: false, engram_slots: 1_000_000,
+            engram_ram: false, engram_slots: 1_000_000, host_adam_every: 1,
             warmup: true, quant_check: false, timers: false, memlog: false,
             bf16: false, act_quant: None, act_group: None, max_iter: None,
             no_kda: false, no_msa: false, no_engram: false,
             jepa_weight: None, dspark_weight: None, dspark_k: None,
+            qk_heads: None, jepa_targets: None,
         }
     }
 }
@@ -216,9 +230,9 @@ pub fn wsd_factor(step: u64, total: u64, base_lr: f64) -> f64 {
 }
 
 /// Pick the quantization format for the current device:
-/// sm_120 (Blackwell) -> Fp8 by default (Fp4 via DM_QUANT=fp4),
+/// sm_120 (Blackwell) -> Fp8 by default (Fp4 via --quant fp4),
 /// sm_86 (Ampere, 3090) -> Bf16/Fp16, everything else -> Fp32.
-/// DM_QUANT=fp32|bf16|fp16|fp8|fp4 forces a format (emulation anywhere).
+/// --quant fp32|bf16|fp16|fp8|fp4 forces a format (emulation anywhere).
 #[cfg(feature = "cuda")]
 pub fn quant_format(device: &Device, forced: Option<&str>, bf16: bool) -> burn_spectral::QuantFormat {
     use burn_spectral::QuantFormat;
@@ -275,19 +289,25 @@ fn bytes_to_tensors<B: BurnBackend>(
 }
 
 /// ckpt container: [step u64][model_len u64][optim_len u64][model burnpack][optim burnpack]
-/// Saved as `<dir>/<name>.bin`, atomically (tmp + rename).
+/// Saved as `<dir>/<name>.bin`, atomically (tmp + rename). The parts stream
+/// to the file through a BufWriter instead of concatenating a third full
+/// copy in RAM (model+optim already exist as byte vectors; burnpack cannot
+/// stream its records, so ~2x (model+optim) RAM is the floor without
+/// upstream changes).
 pub fn save_ckpt(dir: &Path, name: &str, model: &DormouseModel, optim: &Optim, step: u64, ce: f32) -> std::io::Result<()> {
     let model_bytes = model.clone().into_record().into_bytes().map_err(|e| std::io::Error::other(e.to_string()))?;
     let optim_bytes = optim.to_record().into_bytes().map_err(|e| std::io::Error::other(e.to_string()))?;
-    let mut buf = Vec::with_capacity(24 + model_bytes.len() + optim_bytes.len());
-    buf.extend_from_slice(&step.to_le_bytes());
-    buf.extend_from_slice(&(model_bytes.len() as u64).to_le_bytes());
-    buf.extend_from_slice(&(optim_bytes.len() as u64).to_le_bytes());
-    buf.extend_from_slice(&model_bytes);
-    buf.extend_from_slice(&optim_bytes);
     std::fs::create_dir_all(dir)?;
     let tmp = dir.join(format!("{name}.bin.tmp.{}", std::process::id()));
-    std::fs::write(&tmp, &buf)?;
+    let f = std::fs::File::create(&tmp)?;
+    let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
+    w.write_all(&step.to_le_bytes())?;
+    w.write_all(&(model_bytes.len() as u64).to_le_bytes())?;
+    w.write_all(&(optim_bytes.len() as u64).to_le_bytes())?;
+    w.write_all(&model_bytes)?;
+    w.write_all(&optim_bytes)?;
+    w.flush()?;
+    drop(w);
     std::fs::rename(&tmp, dir.join(format!("{name}.bin")))?;
     std::fs::write(dir.join(format!("{name}.txt")), format!("step {step} ce {ce:.3}\n"))?;
     Ok(())
@@ -310,20 +330,10 @@ pub fn load_ckpt(dir: &Path, name: &str, cfg: &DormouseConfig, model: &mut Dormo
     Some(step)
 }
 
-/// Run pretraining. Returns `Err` on a fatal device condition (NaN loss /
-/// unreadable loss scalar) with the last good checkpoint already on disk, so
-/// the caller may resume by re-running with the same `ckpt_name`. On success
-/// the final checkpoint is saved and `Ok(())` returned.
-pub fn train_loop(
-    cfg: TrainCfg,
-    data: PathBuf,
-    preset: String,
-    ckpt_dir: Option<PathBuf>,
-    eval_data: Option<PathBuf>,
-) -> Result<(), String> {
-    let dir = ckpt_dir.unwrap_or_else(|| PathBuf::from("checkpoints"));
-    let _ = std::fs::create_dir_all(&dir);
-    let mut dorm_cfg: DormouseConfig = match preset.as_str() {
+/// Resolve the preset + CLI overrides into the model config (shared by the
+/// train loop and the JEPA target precompute pass).
+fn dorm_config(cfg: &TrainCfg, preset: &str) -> DormouseConfig {
+    let mut dorm_cfg: DormouseConfig = match preset {
         "base" => DormouseConfig::base(),
         "one_b" => DormouseConfig::one_b(),
         _ => DormouseConfig::small(),
@@ -339,10 +349,17 @@ pub fn train_loop(
     if let Some(w) = cfg.jepa_weight { dorm_cfg.jepa_weight = w; }
     if let Some(w) = cfg.dspark_weight { dorm_cfg.dspark_weight = w; }
     if let Some(k) = cfg.dspark_k { dorm_cfg.dspark_k = k; }
-    let device = device();
-    init_pools(&device);
-    let mut model = DormouseModel::new(&dorm_cfg, &device);
-    let qfmt = quant_format(&device, cfg.quant.as_deref(), dorm_cfg.bf16);
+    dorm_cfg
+}
+
+/// Build the model with the run's factor-quant / bf16 compute settings.
+fn build_model(
+    dorm_cfg: &DormouseConfig,
+    cfg: &TrainCfg,
+    device: &Device,
+) -> (DormouseModel, burn_spectral::QuantFormat) {
+    let mut model = DormouseModel::new(dorm_cfg, device);
+    let qfmt = quant_format(device, cfg.quant.as_deref(), dorm_cfg.bf16);
     if qfmt != burn_spectral::QuantFormat::Fp32 {
         model.loop_block.set_quant_all(qfmt);
         println!("quant format: {qfmt:?} ({} bits)", qfmt.bits());
@@ -353,44 +370,148 @@ pub fn train_loop(
         model.set_bf16_compute(true);
         println!("bf16 compute: tensor-core matmuls, fp32 graph");
     }
+    (model, qfmt)
+}
+
+/// The EMA teacher exists only on the online JEPA path: with offline
+/// targets (`--jepa-targets`) the hot loop must not build, advance, or pay
+/// VRAM for it.
+fn ema_teacher_for(
+    cfg: &TrainCfg,
+    dorm_cfg: &DormouseConfig,
+    model: &DormouseModel,
+) -> Option<DormouseModel> {
+    if cfg.jepa_targets.is_some() {
+        return None;
+    }
+    let aux_on = dorm_cfg.jepa_weight > 0.0 || dorm_cfg.dspark_weight > 0.0;
+    aux_on.then(|| dormouse_core::aux::ema_update(model.clone(), model, 0.0))
+}
+
+/// Precompute `n_steps` of offline JEPA targets: walk the training stream
+/// deterministically, run ONE forward per batch with the current weights
+/// (no optimizer, no EMA advance), and stream `[chunk hash -> latent]`
+/// records to `out`. Consume with `--jepa-targets <out>`; the per-step
+/// lookup then costs one file read instead of a second full forward.
+pub fn precompute_jepa_targets(
+    cfg: &TrainCfg,
+    data: &Path,
+    preset: &str,
+    n_steps: usize,
+    out: &Path,
+) -> Result<(), String> {
+    let dorm_cfg = dorm_config(cfg, preset);
+    let device = device();
+    init_pools(&device);
+    let (model, qfmt) = build_model(&dorm_cfg, cfg, &device);
+    let mut stream = dormouse_data::ByteStream::new(cfg.seq_len, cfg.batch, data);
+    // Mirror the train loop's pre-loop stream consumption (the warmup
+    // forward and the quant-check probe each eat one batch) so record i
+    // corresponds to training step i on a fresh run.
+    if cfg.warmup {
+        let _ = stream.next_batch();
+    }
+    if cfg.quant_check && qfmt != burn_spectral::QuantFormat::Fp32 {
+        let _ = stream.next_batch();
+    }
+    let mut w = jepa_targets::JepaTargetWriter::create(out).map_err(|e| e.to_string())?;
+    println!(
+        "jepa precompute: {} steps -> {} (preset {preset}, batch {} s {})",
+        n_steps,
+        out.display(),
+        cfg.batch,
+        cfg.seq_len
+    );
+    for i in 0..n_steps {
+        let (bytes, hashes) = stream.next_batch();
+        let (x, h) = bytes_to_tensors::<Backend>(&bytes, &hashes, cfg.seq_len, cfg.batch, &device);
+        let latent = model.forward_latent::<Backend>(x, Some(h), None).detach();
+        let [b, t, d] = latent.dims();
+        let vals: Vec<f32> = latent.into_data().try_to_vec().map_err(|e| e.to_string())?;
+        w.push(&bytes, &vals, b, t, d).map_err(|e| e.to_string())?;
+        if (i + 1) % 100 == 0 {
+            println!("jepa precompute: {}/{}", i + 1, n_steps);
+        }
+    }
+    w.flush().map_err(|e| e.to_string())?;
+    println!("jepa precompute: done ({n_steps} records)");
+    Ok(())
+}
+
+/// Run pretraining. Returns `Err` on a fatal device condition (NaN loss /
+/// unreadable loss scalar) with the last good checkpoint already on disk, so
+/// the caller may resume by re-running with the same `ckpt_name`. On success
+/// the final checkpoint is saved and `Ok(())` returned.
+pub fn train_loop(
+    cfg: TrainCfg,
+    data: PathBuf,
+    preset: String,
+    ckpt_dir: Option<PathBuf>,
+    eval_data: Option<PathBuf>,
+) -> Result<(), String> {
+    let dir = ckpt_dir.unwrap_or_else(|| PathBuf::from("checkpoints"));
+    let _ = std::fs::create_dir_all(&dir);
+    let dorm_cfg = dorm_config(&cfg, &preset);
+    // Head-wise Muon for Q/K uses the preset's attention geometry.
+    let mut cfg = cfg;
+    cfg.qk_heads = Some(dorm_cfg.n_heads);
+    let device = device();
+    init_pools(&device);
+    let (mut model, qfmt) = build_model(&dorm_cfg, &cfg, &device);
     let mut optim = build_optim(&cfg);
     // Fail fast if the routing policy no longer matches the model (stale
     // marker after a module rename would silently degrade to AdamW).
-    let gc = validate_routing(&model, cfg.factors_fallback)
+    let gc = validate_routing(&model, cfg.factors_fallback, cfg.qk_heads)
         .unwrap_or_else(|e| panic!("optimizer routing check failed: {e}"));
     let opt_name = match cfg.opt.as_str() {
         "adan" => "Adan (all params)".to_string(),
         "adamw" => "AdamW (all params)".to_string(),
         "muon" => "Muon+ ColRow (all params, 1D -> Muon+'s AdamW)".to_string(),
-        "mix-adan" => format!("Muon+ ColRow ns={MUON_NS_STEPS} + Adam wd0 (tables) + Adan (rest)"),
-        _ => format!("Muon+ ColRow ns={MUON_NS_STEPS} + Adam wd0 (tables) + AdamW (rest)"),
+        "mix-adan" => format!("Muon+ ColRow ns={MUON_NS_STEPS} + head-wise Muon q/k + Adam wd0 (tables) + Adan (rest)"),
+        _ => format!("Muon+ ColRow ns={MUON_NS_STEPS} + head-wise Muon q/k + Adam wd0 (tables) + AdamW (rest)"),
     };
     let factors = if cfg.factors_fallback { " (expert TSCT factors on fallback)" } else { "" };
-    println!("optimizer: {opt_name}{factors} [muon={} tables={} rest={}]", gc.muon, gc.tables, gc.rest);
+    println!("optimizer: {opt_name}{factors} [muon={} qk={} tables={} rest={}]", gc.muon, gc.qk, gc.tables, gc.rest);
     let mut step = load_ckpt(&dir, &cfg.ckpt_name, &dorm_cfg, &mut model, &mut optim).unwrap_or(0);
     if step > 0 { println!("resumed {} from {} step {step}", cfg.ckpt_name, dir.display()); }
     // EMA teacher for the JEPA aux (momentum 0.0 at init = exact copy with
     // fresh grad-free params); advanced after every optimizer step below.
-    let aux_on = dorm_cfg.jepa_weight > 0.0 || dorm_cfg.dspark_weight > 0.0;
-    let mut teacher = aux_on.then(|| dormouse_core::aux::ema_update(model.clone(), &model, 0.0));
+    // Offline mode (--jepa-targets) skips the teacher entirely: no second
+    // forward, no EMA advance, none of its VRAM.
+    let mut teacher = ema_teacher_for(&cfg, &dorm_cfg, &model);
+    let mut jepa_tgts = match &cfg.jepa_targets {
+        Some(p) => Some(jepa_targets::JepaTargets::open(p, &device)?),
+        None => None,
+    };
     let mut stream = dormouse_data::ByteStream::new(cfg.seq_len, cfg.batch, &data);
     let mut eval_stream =
         eval_data.as_ref().map(|p| dormouse_data::ByteStream::new(cfg.seq_len, cfg.batch, p));
     let mut best = f32::INFINITY;
     let mut stress = cfg.stress.then(|| StressMonitor::new(cfg.stress_lr, cfg.stress_every));
-    // RAM-offload n-gram tables (report §2.3): DM_ENGRAM_RAM=1 keeps the
+    // RAM-offload n-gram tables (report §2.3): --engram-ram keeps the
     // tables in host memory (millions of slots in the 64 GB RAM), trains
     // them with CPU Adam, and copies only the batch's rows to the GPU.
     let mut host: Option<offload::HostNgram> = if cfg.engram_ram {
         let slots = cfg.engram_slots;
         let ng_path = dir.join(format!("{}.ngram", cfg.ckpt_name));
         let h = offload::HostNgram::new([slots, slots, slots], 32, 0x1234_5678);
-        let h = std::fs::read(&ng_path)
-            .ok()
-            .and_then(|b| offload::HostNgram::from_bytes(&b, [slots, slots, slots], 32))
-            .unwrap_or(h);
+        let h = match std::fs::read(&ng_path).ok() {
+            Some(b) => match offload::HostNgram::from_bytes(&b, [slots, slots, slots], 32) {
+                Some(h) => h,
+                // v1 checkpoints carried Adam m+v state; the layout magic
+                // rejects them so they are never misread as momentum.
+                None => {
+                    eprintln!(
+                        "ngram ckpt {}: unknown layout (v1 Adam state?) - starting fresh tables",
+                        ng_path.display()
+                    );
+                    h
+                }
+            },
+            None => h,
+        };
         println!(
-            "engram: {} rows in RAM ({} MB), CPU Adam",
+            "engram: {} rows in RAM ({} MB), CPU nesterov momentum + Sinkhorn",
             h.total_rows(),
             h.total_rows() * h.row_bytes() / (1 << 20)
         );
@@ -419,7 +540,7 @@ pub fn train_loop(
         println!("warmup done");
     }
     // quant fidelity check: quantized model vs fp32 reference on one batch.
-    // DM_QUANT_CHECK=1 prints max/mean logit deviation + loss delta so Fp8/Fp4
+    // --quant-check prints max/mean logit deviation + loss delta so Fp8/Fp4
     // viability is measured, not assumed.
     if cfg.quant_check && qfmt != burn_spectral::QuantFormat::Fp32 && step == 0 {
         let (bytes, hashes) = stream.next_batch();
@@ -469,6 +590,10 @@ pub fn train_loop(
     let (mut pbytes, mut phashes) = stream.next_batch();
     let mut         pshift: Vec<i64> = pbytes.iter().skip(1).chain(std::iter::once(&pbytes[0])).map(|&b| b as i64).collect();
     let mut ce = f32::NAN;
+    // One-way fp32 fallback state. With `--quant fp32` the forward is already
+    // exact — the monitor would have nothing to guard, so skip it entirely
+    // (it costs 30+ device syncs per check).
+    let mut ortho_fp32 = cfg.quant.as_deref() == Some("fp32");
     while step < cfg.steps as u64 {
         let t_iter = std::time::Instant::now();
         let (bytes, hashes) = (std::mem::replace(&mut pbytes, Vec::new()), std::mem::replace(&mut phashes, Vec::new()));
@@ -495,9 +620,9 @@ pub fn train_loop(
         // with CPU Adam from the row gradients (report §2.3). The copy is
         // ~600 KB per step; the impact on the step time is negligible
         // (~1 ms CPU against ~10 s GPU).
-        let (rows_param, host_rows) = match &host {
+        let (rows_param, host_rows, uniq_rows) = match &host {
             Some(h) => {
-                let (p, embed) = offload::rows_for_batch::<Backend>(
+                let (p, embed, uniq) = offload::rows_for_batch::<Backend>(
                     h,
                     &hashes,
                     cfg.batch,
@@ -505,42 +630,73 @@ pub fn train_loop(
                     &device,
                     true,
                 );
-                (p, Some(embed))
+                (p, Some(embed), Some(uniq))
             }
-            None => (None, None),
+            None => (None, None, None),
         };
 
-        let (_logits, rec_ce, p_dist, _kda, aux) = model.forward_with_hidden::<Backend>(
-            x,
-            // RAM-offload path drives the Engram from host_rows; uploading
-            // hashed_ids too would be a dead per-step H2D copy.
-            if host_rows.is_some() { None } else { Some(h) },
-            host_rows,
-            Some(y),
-            teacher.as_ref(),
-        );
+        // Offline JEPA: the frozen target for THIS chunk must exist in the
+        // sidecar; a miss is a hard error (stale sidecar), never a silent
+        // aux drop.
+        let jepa_target = match jepa_tgts.as_mut() {
+            Some(t) => Some(t.get(&bytes)?),
+            None => None,
+        };
+        let (_logits, rec_ce, p_dist, _kda, aux) = if let Some(tg) = jepa_target {
+            model.forward_with_jepa_targets::<Backend>(
+                x,
+                // RAM-offload path drives the Engram from host_rows; uploading
+                // hashed_ids too would be a dead per-step H2D copy.
+                if host_rows.is_some() { None } else { Some(h) },
+                host_rows,
+                Some(y),
+                Some(tg),
+            )
+        } else {
+            model.forward_with_hidden::<Backend>(
+                x,
+                if host_rows.is_some() { None } else { Some(h) },
+                host_rows,
+                Some(y),
+                teacher.as_ref(),
+            )
+        };
         let mut loss = model.loss::<Backend>(rec_ce, p_dist);
-        let mut aux_log: Option<Tensor<1>> = None;
+        // Host tables train at their own cadence (the report's rule: Adam on
+        // the RAM tables every step), not piggybacked on the log cadence -
+        // at log_every=100 they got 1/100 of their updates.
+        let host_adam_step = cfg.host_adam_every > 0
+            && step % cfg.host_adam_every as u64 == 0
+            && rows_param.is_some();
+        // Aux is read only on log steps; skip the clone (an extra autodiff
+        // node) elsewhere.
+        let aux_log = if step % cfg.log_every as u64 == 0 {
+            aux.clone()
+        } else {
+            None
+        };
         if let Some(a) = aux {
-            aux_log = Some(a.clone());
             loss = loss + a;
         }
-        // Defer the device->host sync (loss scalar + RAM Adam grads) to the
-        // log steps so the GPU stays saturated: forward/backward/step of
-        // adjacent steps overlap in the command queue instead of stalling on a
-        // scalar read every step.
-        let loss_log = loss.clone();
+        // The device syncs only on steps that read something back (loss
+        // scalar at log cadence, host-table grads at the host-Adam cadence,
+        // timers) so forward/backward/step of adjacent steps overlap on the
+        // GPU. The scalar read rides along free inside the grads D2H.
+        let loss_log = if step % cfg.log_every as u64 == 0
+            || host_adam_step
+            || (cfg.timers && step % 50 == 0)
+        {
+            Some(loss.clone())
+        } else {
+            None
+        };
         let raw_grads = loss.backward();
         let lr = match stress.as_ref() {
             // Constant LR at a multiple of the optimum (report §3.3).
             Some(s) => s.lr(cfg.lr),
             None => wsd_factor(step, cfg.steps as u64, cfg.lr),
         };
-        // Sync the device once per log window (not every step) so forward/
-        // backward/step of adjacent steps overlap on the GPU. Reads the loss
-        // scalar, runs RAM-table CPU Adam from the row grads, and (under
-        // DM_STRESS) the pre-clip grad norm.
-        if step % cfg.log_every as u64 == 0 {
+        if let Some(loss_log) = &loss_log {
             let ce_now: f32 = match loss_log.clone().try_into_scalar() {
                 Ok(v) => v,
                 Err(_) => {
@@ -552,17 +708,22 @@ pub fn train_loop(
             }
             ce = ce_now;
             if ce < best { best = ce; }
-            if let (Some(h), Some(p)) = (host.as_mut(), &rows_param) {
-                if let Some(g) = p.grad(&raw_grads) {
-                    let (uniq, _) = h.unique_rows(&hashes);
-                    let g_vec: Vec<f32> = g.into_data().try_to_vec().unwrap_or_default();
-                    if g_vec.len() == uniq.len() * 32 {
-                        h.adam_update(&uniq, &g_vec, lr as f32);
+            if host_adam_step {
+                if let (Some(h), Some(p), Some(uniq)) =
+                    (host.as_mut(), &rows_param, uniq_rows.as_ref())
+                {
+                    if let Some(g) = p.grad(&raw_grads) {
+                        let g_vec: Vec<f32> = g.into_data().try_to_vec().unwrap_or_default();
+                        if g_vec.len() == uniq.len() * h.dim {
+                            h.momentum_update(uniq, &g_vec, lr as f32);
+                        }
                     }
                 }
             }
-            if let Some(s) = stress.as_mut() {
-                s.observe(ce, grad_norm(&model, &raw_grads));
+            if step % cfg.log_every as u64 == 0 {
+                if let Some(s) = stress.as_mut() {
+                    s.observe(ce, grad_norm(&model, &raw_grads));
+                }
             }
         }
         let grads = GradientsParams::from_grads(raw_grads, &model);
@@ -571,20 +732,25 @@ pub fn train_loop(
         // TSCT ortho maintenance (bf16_KERNEL_PLAN): retract the U/V masters
         // every step so the quantized forward stays faithful; monitor the
         // drift at cadence and fall back to fp32 factors when it exceeds the
-        // plan's 1e-3 threshold. DM_RETRACT_EVERY / DM_RETRACT_ITERS override.
+        // plan's 1e-3 threshold. --retract-every / --retract-iters override.
         if step % cfg.retract_every.max(1) as u64 == 0 {
             model.retract_tsct(cfg.retract_iters);
         }
         if let Some(t) = teacher.take() {
             teacher = Some(dormouse_core::aux::ema_update(t, &model, dormouse_core::aux::TEACHER_MOMENTUM));
         }
-        // max_ortho reads every TSCT factor (30+ device syncs) - cadence, not
-        // per-50-steps: each check drains the pipeline.
-        if step % 500 == 0 {
+        // max_ortho reads every TSCT factor (30+ device syncs) - cadence,
+        // not per-50-steps: each check drains the pipeline. The metric is
+        // per-entry (F-norm/k) so the plan's 1e-3 threshold sits above the
+        // retract's convergence floor and below real drift; before the
+        // normalization (2026-09-04) the fallback fired at step 0 on every
+        // fresh run, silently disabling the factor-quant forward.
+        if step % 500 == 0 && !ortho_fp32 {
             let ortho = model.max_ortho();
             if ortho > 1e-3 {
                 println!("max_ortho {ortho:.2e} > 1e-3 - fallback fp32 factors");
                 model.set_quant_all(burn_spectral::QuantFormat::Fp32);
+                ortho_fp32 = true;
             }
         }
 
@@ -592,7 +758,9 @@ pub fn train_loop(
             // Force a device sync so the elapsed wall time equals the true GPU
             // step time (forward+backward+optim+retract). data_ms is the CPU
             // side (read + bytes_to_tensors). Their difference is GPU compute.
-            let _: f32 = loss_log.clone().try_into_scalar().unwrap_or(0.0);
+            if let Some(ll) = &loss_log {
+                let _: f32 = ll.clone().try_into_scalar().unwrap_or(0.0);
+            }
             let total_ms = t_iter.elapsed().as_secs_f64() * 1000.0;
             println!(
                 "timer step {step}: total={total_ms:.0}ms data={data_ms:.1}ms gpu_step={:.0}ms",
@@ -601,7 +769,7 @@ pub fn train_loop(
         }
         if step % cfg.log_every as u64 == 0 {
             let bpb = dormouse_bench::bpb(ce);
-            // pool_stats syncs the device; only with DM_MEMLOG=1
+            // pool_stats syncs the device; only with --memlog
             let mem = if cfg.memlog { pool_stats(&device) } else { String::new() };
             let aux_note = match aux_log.clone().map(|a| a.try_into_scalar::<f32>().ok()) {
                 Some(Some(v)) => format!(" aux={v:.4}"),
@@ -632,28 +800,29 @@ pub fn train_loop(
                     let ey: Tensor<2, Int> =
                         Tensor::from_data(TensorData::new(eshift, [cfg.batch, cfg.seq_len]), &device);
                     let eval_rows = match &host {
-                        Some(h) => Some(
-                            offload::rows_for_batch::<Backend>(
+                        Some(h) => {
+                            let (_, embed, _) = offload::rows_for_batch::<Backend>(
                                 h,
                                 &eh,
                                 cfg.batch,
                                 cfg.seq_len,
                                 &device,
                                 false,
-                            )
-                            .1,
-                        ),
+                            );
+                            Some(embed)
+                        }
                         None => None,
                     };
                     let (elogits, ..) =
                         model.forward_with_hidden::<Backend>(ex, None, eval_rows, None, None);
                     let v = model.vocab_size;
                     let eflat = elogits.reshape([cfg.batch * cfg.seq_len, v]);
-                    let etgt = ey
-                        .reshape([cfg.batch * cfg.seq_len])
-                        .one_hot::<2>(v)
-                        .cast(FloatDType::F32);
-                    let ece: f32 = burn::tensor::loss::cross_entropy_with_logits(eflat, etgt)
+                    // Gather the target log-prob: no one-hot [b*t,v] fp32
+                    // tensor (extra H2D + traffic) per eval.
+                    let etgt = ey.reshape([cfg.batch * cfg.seq_len, 1]);
+                    let ece: f32 = burn::tensor::activation::log_softmax(eflat, 1)
+                        .gather(1, etgt)
+                        .neg()
                         .mean()
                         .try_into_scalar()
                         .unwrap_or(f32::NAN);
@@ -684,7 +853,9 @@ pub fn train_loop(
         }
         step += 1;
     }
-    let _ = save_ckpt(&dir, &cfg.ckpt_name, &model, &optim, step, best);
+    // Final ckpt records the LAST ce (best is tracked in the logs; the .txt
+    // sidecar should describe this checkpoint's actual loss).
+    let _ = save_ckpt(&dir, &cfg.ckpt_name, &model, &optim, step, ce);
     println!("done steps={step} best ce={best:.3}");
     Ok(())
 }
@@ -731,6 +902,42 @@ mod tests {
         );
     }
 
+    /// The streamed ckpt writer (save_ckpt) must produce a container that
+    /// load_ckpt restores byte-faithfully: same step, same ce sidecar, and
+    /// an identical forward after reload. Guards the 2026-09-04 rewrite
+    /// (concat-buffer -> BufWriter streaming).
+    #[test]
+    fn ckpt_save_load_roundtrip() {
+        let cfg = test_cfg();
+        let model = DormouseModel::new(&cfg, &device());
+        let optim_cfg = TrainCfg { steps: 5, seq_len: 64, batch: 2, ..Default::default() };
+        let optim = crate::optim::build_optim_mode(&optim_cfg, "mix");
+        let dir = std::env::temp_dir().join("dm-ckpt-roundtrip-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        save_ckpt(&dir, "rt", &model, &optim, 42, 3.25).expect("save");
+        let txt = std::fs::read_to_string(dir.join("rt.txt")).expect("sidecar");
+        assert!(txt.contains("step 42 ce 3.250"), "sidecar: {txt}");
+        let mut model2 = DormouseModel::new(&cfg, &device());
+        let mut optim2 = crate::optim::build_optim_mode(&optim_cfg, "mix");
+        let step = load_ckpt(&dir, "rt", &cfg, &mut model2, &mut optim2).expect("load");
+        assert_eq!(step, 42);
+        // identical forward on the same batch
+        let bytes: Vec<u8> = (0..128u32).map(|i| (i.wrapping_mul(37) % 256) as u8).collect();
+        let mut hashes = Vec::with_capacity(128 * 3);
+        for p in 0..128usize {
+            let e = p + 1;
+            hashes.push((fnv(&bytes[e.saturating_sub(3)..e]) % 4096) as i64);
+            hashes.push((fnv(&bytes[e.saturating_sub(5)..e]) % 4096) as i64);
+            hashes.push((fnv(&bytes[e.saturating_sub(8)..e]) % 4096) as i64);
+        }
+        let (x, h) = bytes_to_tensors::<Backend>(&bytes, &hashes, 64, 2, &device());
+        let (l1, ..) = model.forward_with_hidden::<Backend>(x.clone(), Some(h.clone()), None, None, None);
+        let (l2, ..) = model2.forward_with_hidden::<Backend>(x, Some(h), None, None, None);
+        let d = (l1 - l2).abs().max().into_scalar::<f32>();
+        assert!(d < 1e-5, "reloaded model diverges: max |dlogit| = {d:.2e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The report's §3.1 routing, asserted against burn's actual param paths
     /// (field names joined by "."; Vec entries are indices, e.g.
     /// `expert_ffns.0.gate_up.inner.u`). A typo in a marker silently leaves
@@ -751,6 +958,16 @@ mod tests {
         assert!(!is_muon_param("loop_block.shared_attn.gdn2.q_proj.weight"));
         assert!(!is_muon_param("loop_block.shared_attn.msa.attention.out_proj.weight"));
         assert!(!is_muon_param("loop_block.engram.value_proj.weight"));
+        // Attention Q/K go to the head-wise Muon groups instead (not the
+        // plain Muon+ marker list).
+        assert!(crate::optim::is_qk_param("loop_block.shared_attn.gdn2.q_proj.weight"));
+        assert!(crate::optim::is_qk_param("loop_block.shared_attn.gdn2.k_proj.weight"));
+        assert!(crate::optim::is_qk_param("loop_block.shared_attn.msa.attention.q_proj.weight"));
+        assert!(crate::optim::is_qk_param("loop_block.shared_attn.msa.attention.k_proj.weight"));
+        assert!(!crate::optim::is_qk_param("loop_block.shared_attn.gdn2.v_proj.weight"));
+        assert!(!crate::optim::is_qk_param("loop_block.shared_attn.msa.attention.out_proj.weight"));
+        // The MQA indexer stays on the fallback (tiny, ambiguous heads).
+        assert!(!crate::optim::is_qk_param("loop_block.shared_attn.msa.index_branch.q_proj.weight"));
         // Per-head scalar producers (decay/β gates): AdamW.
         assert!(!is_muon_param("loop_block.shared_attn.gdn2.decay.w_up.weight"));
         assert!(!is_muon_param("loop_block.shared_attn.gdn2.beta_proj.weight"));
@@ -785,16 +1002,21 @@ mod tests {
     /// Live model: the policy must hold on the real module tree. The expected
     /// Muon+ count is derived from the config topology, not a literal:
     /// 3 KDA qkv + 4 sparse-core projections + n_experts x (gate_up u,v +
-    /// down u,v) + 1 Engram key_proj + 1 value_proj.
+    /// down u,v) + 1 Engram key_proj + 1 value_proj. With head-wise Q/K
+    /// routing on, the four q/k matrices move into the qk group.
     #[test]
     fn routing_validates_on_live_model() {
         let cfg = test_cfg();
         let model = DormouseModel::new(&cfg, &device());
         let expected_muon = 4 * cfg.n_experts + 3;
-        let c = validate_routing(&model, false).expect("policy must hold on the live model");
+        let c = validate_routing(&model, false, Some(cfg.n_heads)).expect("policy must hold on the live model");
         assert_eq!(c.muon, expected_muon, "Muon+ group must match the topology");
+        assert_eq!(c.qk, 4, "gdn2 q/k + msa q/k must be head-wise Muon");
         assert_eq!(c.tables, 1, "n-gram tables group");
         assert!(c.rest > 0);
+        // Without head-wise routing the q/k params fall back to rest.
+        let c = validate_routing(&model, false, None).expect("policy must hold");
+        assert_eq!(c.qk, 0);
     }
 
     /// The validator must fire when routing breaks: a marker that matches
@@ -806,16 +1028,18 @@ mod tests {
         let cfg = test_cfg();
         let model = DormouseModel::new(&cfg, &device());
         // Stale Muon+ marker: matches no param.
-        let err = validate_routing_with(&model, &["no.such.module"], "engram.memory")
+        let err = validate_routing_with(&model, &["no.such.module"], "engram.memory", None)
             .expect_err("dead Muon+ markers must fail validation");
         assert!(err.contains("matches no param"), "unexpected error: {err}");
         // Stale table marker.
-        let err = validate_routing_with(&model, crate::optim::MUON_PATH_MARKERS, "no.such.table")
+        let err = validate_routing_with(&model, crate::optim::MUON_PATH_MARKERS, "no.such.table", None)
             .expect_err("dead table marker must fail validation");
         assert!(err.contains("matches no param"), "unexpected error: {err}");
         // A marker that hits a 1D param (RMSNorm gain) must trip the rank
-        // invariant: Muon+ only makes sense on matrices.
-        let err = validate_routing_with(&model, &["norm.weight"], "engram.memory")
+        // invariant: Muon+ only makes sense on matrices. (The Q/K group
+        // cannot hit this: its fixed paths are always 2D Linears; the
+        // non-2D guard there is defense-in-depth.)
+        let err = validate_routing_with(&model, &["norm.weight"], "engram.memory", None)
             .expect_err("1D param in the Muon+ group must fail validation");
         assert!(err.contains("1D param routed to Muon+"), "unexpected error: {err}");
     }
@@ -950,6 +1174,104 @@ mod tests {
         let _ = optim_cfg;
     }
 
+    /// Offline JEPA path: (1) the precomputed target equals what the online
+    /// EMA teacher would compute (exact copy at teacher step 0), (2) the
+    /// aux loss consumes the target (different target -> different aux), so
+    /// the teacher forward is genuinely replaced, not silently skipped.
+    #[test]
+    fn offline_jepa_consumes_precomputed_targets() {
+        let cfg = test_cfg();
+        let model = DormouseModel::new(&cfg, &device());
+        let teacher = dormouse_core::aux::ema_update(model.clone(), &model, 0.0);
+        let mut rng_state: u64 = 0x0A0B_0E5A_0002;
+        let next_u8 = |s: &mut u64| {
+            *s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let x = (*s ^ (*s >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            ((x ^ (x >> 27)) >> 33) as u8
+        };
+        let bytes: Vec<u8> = (0..128).map(|_| next_u8(&mut rng_state)).collect();
+        let hashes: Vec<i64> = (0..384).map(|p| (p as i64) % 4096).collect();
+        let (x, h) = bytes_to_tensors::<Backend>(&bytes, &hashes, 64, 2, &device());
+        let shifted: Vec<i64> = bytes.iter().skip(1).chain(std::iter::once(&bytes[0])).map(|&b| b as i64).collect();
+        let y: Tensor<2, Int> = Tensor::from_data(TensorData::new(shifted, [2, 64]), &device());
+        // (1) The target the offline pass would store == the online teacher's
+        // latent. Relative tolerance: under parallel test load OpenBLAS
+        // reduction order differs between the two calls (~1e-5 rel).
+        let target = model.forward_latent::<Backend>(x.clone(), Some(h.clone()), None).detach();
+        let online = teacher.forward_latent::<Backend>(x.clone(), Some(h.clone()), None).detach();
+        let dv: f32 = target.clone().sub(online.clone()).abs().max().into_scalar();
+        let scale: f32 = online.abs().max().into_scalar();
+        assert!(
+            dv < 1e-3 * scale.max(1.0),
+            "precomputed target must equal the online teacher latent: {dv:.2e} (scale {scale:.2e})"
+        );
+        // (2) The aux consumes the target tensor it is handed.
+        let (_, _, _, _, aux_a) = model.forward_with_jepa_targets::<Backend>(
+            x.clone(), Some(h.clone()), None, Some(y.clone()), Some(target.clone()),
+        );
+        let scaled = target.mul_scalar(3.0);
+        let (_, _, _, _, aux_b) = model.forward_with_jepa_targets::<Backend>(
+            x, Some(h), None, Some(y), Some(scaled),
+        );
+        let a: f32 = aux_a.expect("offline aux must be Some with JEPA on").try_into_scalar().unwrap();
+        let b: f32 = aux_b.expect("offline aux must be Some").try_into_scalar().unwrap();
+        assert!(a.is_finite() && b.is_finite(), "offline aux must be finite: {a} {b}");
+        assert!(
+            (a - b).abs() > 1e-4 * a.abs().max(1.0),
+            "offline aux must depend on the supplied target: {a} vs {b}"
+        );
+    }
+
+    /// With --jepa-targets the EMA teacher must never exist: no build, no
+    /// per-step EMA advance, no second-forward VRAM.
+    #[test]
+    fn offline_jepa_skips_ema_teacher() {
+        let dorm_cfg = test_cfg(); // aux weights on (preset values)
+        let model = DormouseModel::new(&dorm_cfg, &device());
+        let offline = TrainCfg { jepa_targets: Some(PathBuf::from("x.bin")), ..Default::default() };
+        assert!(
+            ema_teacher_for(&offline, &dorm_cfg, &model).is_none(),
+            "offline mode must not build an EMA teacher"
+        );
+        let online = TrainCfg::default();
+        assert!(
+            ema_teacher_for(&online, &dorm_cfg, &model).is_some(),
+            "online mode (aux on by default) must build the EMA teacher"
+        );
+    }
+
+    /// The JEPA target sidecar: values must roundtrip by chunk hash, and a
+    /// chunk that was never precomputed must be a loud error (a silently
+    /// dropped aux would corrupt the run).
+    #[test]
+    fn jepa_sidecar_roundtrip_and_guard() {
+        let dev = device();
+        let dir = std::env::temp_dir().join("dm-jepa-targets-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("targets.bin");
+        let mut w = jepa_targets::JepaTargetWriter::create(&path).unwrap();
+        let a: Vec<u8> = (0..64u32).map(|i| i as u8).collect();
+        let b: Vec<u8> = (0..64u32).map(|i| (i * 7 % 256) as u8).collect();
+        let la: Vec<f32> = (0..2 * 8 * 16).map(|i| i as f32 * 0.5).collect();
+        let lb: Vec<f32> = (0..2 * 8 * 16).map(|i| -i as f32 * 0.25).collect();
+        w.push(&a, &la, 2, 8, 16).unwrap();
+        w.push(&b, &lb, 2, 8, 16).unwrap();
+        w.flush().unwrap();
+        let mut t = jepa_targets::JepaTargets::open(&path, &dev).unwrap();
+        assert_eq!(t.len(), 2);
+        let ta = t.get(&a).unwrap();
+        assert_eq!(ta.dims(), [2, 8, 16]);
+        let va: Vec<f32> = ta.into_data().try_to_vec().unwrap();
+        assert_eq!(va, la, "roundtrip must preserve the latent values");
+        let tb = t.get(&b).unwrap();
+        let vb: Vec<f32> = tb.into_data().try_to_vec().unwrap();
+        assert_eq!(vb, lb);
+        let unknown: Vec<u8> = vec![9u8; 64];
+        assert!(t.get(&unknown).is_err(), "unknown chunk must error loudly");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Every OPT mode must build and take a step without NaN (AdamW, Adan,
     /// Muon+, mix, mix-adan - each with its own base optimizer and group
     /// routing). One step per mode keeps the suite fast on NdArray.
@@ -972,9 +1294,68 @@ mod tests {
             model = optim.step(1e-3, model, grads);
             assert!(v.is_finite(), "mode {mode}: loss must be finite, got {v}");
         }
+        // Head-wise Q/K routing (mix + qk_heads) must step clean too.
+        let optim_cfg = TrainCfg {
+            steps: 1, seq_len: 64, batch: 2, lr: 1e-3, wd: 0.01, grad_clip: 1.0,
+            qk_heads: Some(2),
+            ..Default::default()
+        };
+        let mut model = DormouseModel::new(&cfg, &device());
+        let mut optim = crate::optim::build_optim_mode(&optim_cfg, "mix");
+        let bytes: Vec<u8> = (0..128).map(|i| (i * 7) as u8).collect();
+        let hashes: Vec<i64> = (0..384).map(|p| (p as i64) % 4096).collect();
+        let (x, h) = bytes_to_tensors::<Backend>(&bytes, &hashes, 64, 2, &device());
+        let shifted: Vec<i64> = bytes.iter().skip(1).chain(std::iter::once(&bytes[0])).map(|&b| b as i64).collect();
+        let y: Tensor<2, Int> = Tensor::from_data(TensorData::new(shifted, [2, 64]), &device());
+        let (_logits, rec, pd, _k, _aux) = model.forward_with_hidden::<Backend>(x, Some(h), None, Some(y), None);
+        let grads = GradientsParams::from_grads(model.loss::<Backend>(rec, pd).backward(), &model);
+        model = optim.step(1e-3, model, grads);
+        let q = model.loop_block.shared_attn.gdn2.q_proj.weight.val();
+        assert!(q.clone().into_data().try_to_vec().unwrap().iter().all(|x: &f32| x.is_finite()), "head-wise muon step must keep q_proj finite");
     }
 
-    /// DM_FACTORS_FALLBACK drops the expert TSCT factors from the Muon+ group:
+    /// Head-wise Muon must equal plain Muon+ applied to each head slice
+    /// independently: same momentum, one NS preconditioner + ColRow norm
+    /// per [head_dim, d] block, blocks concatenated back. wd=0 and a zero
+    /// weight isolate the update: `update = -updated / lr`.
+    #[test]
+    fn headwise_muon_matches_per_slice_muon() {
+        use burn::optim::Optimizer as _;
+        let tcfg = TrainCfg { wd: 0.0, ..Default::default() };
+        let opt = crate::optim::HeadWiseMuon::new(&tcfg, 2);
+        let dev = device();
+        let (rows, cols, dh) = (64usize, 128usize, 32usize);
+        let vals: Vec<f32> = (0..rows * cols)
+            .map(|i| ((i.wrapping_mul(2654435761) % 1000) as f32 / 500.0) - 1.0)
+            .collect();
+        let grad = Tensor::<2>::from_data(TensorData::new(vals, [rows, cols]), &dev);
+        let w = Tensor::<2>::zeros([rows, cols], &dev);
+        let lr = 1e-3;
+        let (updated, state) = opt.step(lr, w, grad.clone(), None);
+        assert!(state.unwrap().mu_momentum.is_some(), "momentum state must be kept");
+        let update = updated.mul_scalar(-(1.0 / lr as f32));
+        let muon = burn_muon_plus::MuonPlusConfig::new()
+            .with_norm_dir(crate::optim::MUON_NORM_DIR)
+            .with_ns_steps(crate::optim::MUON_NS_STEPS)
+            .build();
+        for h in 0..2 {
+            let slice = grad
+                .clone()
+                .slice([h * dh..(h + 1) * dh, 0..cols])
+                .mul_scalar(0.05); // first-step momentum: (1 - mu) * g, mu=0.95
+            let expect = muon.normalize(muon.orthogonalize(slice));
+            let d: f32 = update
+                .clone()
+                .slice([h * dh..(h + 1) * dh, 0..cols])
+                .sub(expect)
+                .abs()
+                .max()
+                .into_scalar();
+            assert!(d < 1e-4, "head {h} update diverges from per-slice Muon: {d:.2e}");
+        }
+    }
+
+    /// --factors-fallback drops the expert TSCT factors from the Muon+ group:
     /// counts must shift from muon to rest, and validation must stay green
     /// with the effective marker list.
     #[test]
@@ -983,8 +1364,8 @@ mod tests {
         let model = DormouseModel::new(&cfg, &device());
         let full = crate::optim::MUON_PATH_MARKERS;
         let dropped: Vec<&str> = full.iter().copied().filter(|m| *m != "expert_ffns.").collect();
-        let with_factors = validate_routing_with(&model, full, "engram.memory").unwrap();
-        let without = validate_routing_with(&model, &dropped, "engram.memory").unwrap();
+        let with_factors = validate_routing_with(&model, full, "engram.memory", None).unwrap();
+        let without = validate_routing_with(&model, &dropped, "engram.memory", None).unwrap();
         assert_eq!(
             without.muon + 4 * cfg.n_experts,
             with_factors.muon,

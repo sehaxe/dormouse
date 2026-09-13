@@ -144,7 +144,8 @@ impl LoopBlock {
         hashed_ids: Option<Tensor<3, Int>>,
         host_rows: Option<Tensor<3>>,
         kda_state: Option<Tensor<4>>,
-        targets: Option<Tensor<2>>,
+        // Target byte indices [b*t, 1]: L_Rec gathers their log-probs.
+        targets: Option<Tensor<2, Int>>,
         lm_head: &LinearLike,
     ) -> (Tensor<3>, Tensor<1>, Tensor<2>, Tensor<4>)
     where
@@ -330,7 +331,7 @@ impl LoopBlock {
             } else {
                 let scale = self.residual_scale.val().clone().reshape([1, 1, 1]);
                 // Store the residual back in the activation dtype (bf16
-                // under BF16=1): the sum itself is computed in fp32.
+                // under --bf16): the sum itself is computed in fp32.
                 h = h_ctx.clone() + y.mul(scale).cast(h_ctx.dtype());
             }
 
@@ -352,13 +353,13 @@ impl LoopBlock {
             not_halted = not_halted * (ones_bh1.clone() - lam.clone());
             // L_Rec: per-step CE (fp32 logits) weighted by the halting dist p_n.
             if let Some(tgt) = &targets {
-                let v = tgt.dims()[1];
                 let so = if bf16 { step_out.clone().cast(FloatDType::F32) } else { step_out.clone() };
-                let logits_n = lm_head
-                    .forward::<B>(so.reshape([b * t, d]))
-                    .reshape([b * t, v]);
-                let ce = (burn::tensor::activation::log_softmax(logits_n, 1) * tgt.clone())
-                    .sum_dim(1)
+                let logits_n = lm_head.forward::<B>(so.reshape([b * t, d])); // [b*t, v]
+                // Gather the target column of the log-softmax instead of an
+                // elementwise one-hot product: no [b*t,v] fp32 temporary per
+                // iteration (max_iter of them per step otherwise).
+                let ce = burn::tensor::activation::log_softmax(logits_n, 1)
+                    .gather(1, tgt.clone())
                     .neg()
                     .reshape([b, t])
                     .sum_dim(1)

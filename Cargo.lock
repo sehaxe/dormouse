@@ -2785,6 +2785,7 @@ version = "0.1.0"
 dependencies = [
  "burn",
  "burn-bitnet",
+ "burn-cubecl",
  "burn-cuda",
  "burn-dspark",
  "burn-engram",
@@ -2797,6 +2798,8 @@ dependencies = [
  "burn-sct",
  "burn-spectral",
  "burn-tensor",
+ "cubecl",
+ "futures-lite",
  "half",
  "rand 0.8.8",
 ]

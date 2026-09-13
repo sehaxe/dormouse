@@ -18,6 +18,7 @@ I → J[Holdout] →|beats| K[Promote] →|no| L[Strategy review] → G
 - Value head V(s) bf16, GAE λ0.95, PPO clip 0.2, KL 0.01
 - reward = verifier_pass − λ_tokens·T − λ_cost·tools
 - Token-level advantage, not group-relative (GRPO is DPO, encourages verbosity)
+- EBRM (2504.13134): energy-score уточняет reward на инференсе/в loop — robustness к reward-hack, кандидат после первого PPO-прохода
 
 ## On-policy distillation — selective (SEED 2607.14777)
 
@@ -28,7 +29,7 @@ I → J[Holdout] →|beats| K[Promote] →|no| L[Strategy review] → G
 
 Evolves: weights, memory, skills/tools/prompts, verifiers, tasks, harness, curricula.
 
-1. Task-time: K=8 noisy rollouts (PonderNet Q-head) + pick by Q
+1. Task-time: K=8 noisy rollouts (PonderNet Q-head) + pick by Q; апгрейд — EBM-реранкер (Residual-EBM, Meta / EBT 2507.02092): segment-level energy по verifier-лейблам, best-of-n без изменений базовой модели
 2. Post-task: success→skill, fail→diagnostic → memory
 3. Stage-wise: every 2k steps verified trajectories only → PPO+distill → new harness
 
