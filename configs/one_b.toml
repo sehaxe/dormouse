@@ -1,0 +1,40 @@
+[model]
+d_model = 2048
+n_heads = 32
+head_dim = 64
+d_ffn = 5632
+vocab = 256
+max_seq_len = 2048
+max_iter = 12
+rank = 64
+msa_topk = 8
+msa_block = 32
+n_experts = 4
+norm_eps = 0.001
+rope_base = 10000.0
+
+[ponder]
+halt_theta = 0.9
+ponder_w = 0.05
+rec_w = 0.5
+guard_w = 0.01
+ponder_beta = 0.01
+ponder_prior = 0.15384615384615385
+
+[aux]
+jepa_weight = 0.05
+jepa_mask_frac = 0.15
+jepa_mask_span = 8
+dspark_weight = 0.1
+dspark_k = 4
+dspark_stride = 16
+
+[runtime]
+bf16 = false
+act_group = 0
+use_msa = true
+use_kda = true
+use_engram = true
+use_gr = false
+keep_frac = 0.5
+dropout = 0.0

@@ -105,6 +105,8 @@ pub struct TrainCfg {
     /// chunk). When set, the hot loop runs NO second teacher forward and no
     /// EMA advance; targets are looked up per batch by chunk hash.
     pub jepa_targets: Option<PathBuf>,
+    /// Generic config overrides from --set key=value (applied on top of preset).
+    pub config_overrides: Vec<String>,
 }
 
 impl Default for TrainCfg {
@@ -121,7 +123,7 @@ impl Default for TrainCfg {
             bf16: false, act_quant: None, act_group: None, max_iter: None,
             no_kda: false, no_msa: false, no_engram: false,
             jepa_weight: None, dspark_weight: None, dspark_k: None,
-            qk_heads: None, jepa_targets: None,
+            qk_heads: None, jepa_targets: None, config_overrides: Vec::new(),
         }
     }
 }
@@ -333,12 +335,15 @@ pub fn load_ckpt(dir: &Path, name: &str, cfg: &DormouseConfig, model: &mut Dormo
 /// Resolve the preset + CLI overrides into the model config (shared by the
 /// train loop and the JEPA target precompute pass).
 fn dorm_config(cfg: &TrainCfg, preset: &str) -> DormouseConfig {
-    let mut dorm_cfg: DormouseConfig = match preset {
-        "nano" => DormouseConfig::nano(),
-        "base" => DormouseConfig::base(),
-        "one_b" => DormouseConfig::one_b(),
-        _ => DormouseConfig::small(),
-    };
+    let mut dorm_cfg = dormouse_core::config::load_config(preset)
+        .unwrap_or_else(|e| panic!("preset/config load {preset:?}: {e}"));
+    // Generic --set overrides (key=value) from the CLI.
+    if !cfg.config_overrides.is_empty() {
+        let ov = dormouse_core::config::parse_overrides(&cfg.config_overrides)
+            .unwrap_or_else(|e| panic!("--set: {e}"));
+        dormouse_core::config::apply_overrides(&mut dorm_cfg, &ov)
+            .unwrap_or_else(|e| panic!("--set: {e}"));
+    }
     // Model overrides requested by the caller (CLI flags).
     dorm_cfg.bf16 = cfg.bf16;
     if let Some(q) = cfg.act_quant { dorm_cfg.act_quant = Some(q); }

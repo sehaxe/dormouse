@@ -20,6 +20,8 @@ burn-sct = { path = "../../../burn-fused/crates/burn-sct" }
 burn-spectral = { path = "../../../burn-fused/crates/burn-spectral" }
 half = { version = "2.5", features = ["num-traits"] }
 rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 # Already in the build graph via burn-cuda / burn-spectral(cuda); declared so
 # fused.rs can name CubeTensor and launch #[cube] kernels directly.
 burn-cubecl = { version = "0.22.0-pre.3", default-features = false, features = ["std"], optional = true }

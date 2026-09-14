@@ -17,6 +17,8 @@ struct Args {
     #[arg(long, default_value = "checkpoints")] ckpt_dir: PathBuf,
     #[arg(long, default_value = "latest", help = "checkpoint file name (<name>.bin)")] ckpt_name: String,
     #[arg(long, default_value = "small")] preset: String,
+    #[arg(long)] config: Option<String>,
+    #[arg(long = "set", value_name = "KEY=VALUE")] set: Vec<String>,
     #[arg(long, default_value = "8000")] port: u16,
 }
 
@@ -203,6 +205,7 @@ async fn models() -> Json<ModelsResp> {
         object: "list".into(),
         data: vec![
             ModelInfo { id: "dormouse-small".into(), object: "model".into(), created: now(), owned_by: "dormouse".into() },
+            ModelInfo { id: "dormouse-swift50".into(), object: "model".into(), created: now(), owned_by: "dormouse".into() },
             ModelInfo { id: "dormouse-base".into(), object: "model".into(), created: now(), owned_by: "dormouse".into() },
             ModelInfo { id: "dormouse-one_b".into(), object: "model".into(), created: now(), owned_by: "dormouse".into() },
         ],
@@ -212,12 +215,18 @@ async fn models() -> Json<ModelsResp> {
 #[tokio::main]
 async fn main() {
     let a = Args::parse();
-    let cfg: DormouseConfig = match a.preset.as_str() {
-        "nano" => DormouseConfig::nano(),
-        "base" => DormouseConfig::base(),
-        "one_b" => DormouseConfig::one_b(),
-        _ => DormouseConfig::small(),
-    };
+    let preset_name = a.config.as_deref().unwrap_or(&a.preset);
+    let mut cfg: DormouseConfig = dormouse_core::config::load_config(preset_name).unwrap_or_else(|e| {
+        eprintln!("config load {preset_name:?}: {e}"); std::process::exit(1);
+    });
+    if !a.set.is_empty() {
+        let ov = dormouse_core::config::parse_overrides(&a.set).unwrap_or_else(|e| {
+            eprintln!("--set: {e}"); std::process::exit(1);
+        });
+        dormouse_core::config::apply_overrides(&mut cfg, &ov).unwrap_or_else(|e| {
+            eprintln!("--set: {e}"); std::process::exit(1);
+        });
+    }
     let model = dormouse_train::load_model_weights(&a.ckpt_dir, &a.ckpt_name, cfg)
         .unwrap_or_else(|| {
             eprintln!("ckpt not found: {}/{}.bin", a.ckpt_dir.display(), a.ckpt_name);
@@ -225,7 +234,7 @@ async fn main() {
         });
     println!(
         "dormouse-serve {}/{}.bin preset={} params={} -> http://0.0.0.0:{}/v1 (concurrent, {} runtime threads)",
-        a.ckpt_dir.display(), a.ckpt_name, a.preset, model.num_params(), a.port,
+        a.ckpt_dir.display(), a.ckpt_name, preset_name, model.num_params(), a.port,
         std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
     );
     let state = AppState { model: Arc::new(model) };

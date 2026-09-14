@@ -10,17 +10,25 @@ struct Args {
     #[arg(long, default_value = "hello")] prompt: String,
     #[arg(long, default_value = "32")] steps: usize,
     #[arg(long, default_value = "small")] preset: String,
+    #[arg(long)] config: Option<String>,
+    #[arg(long = "set", value_name = "KEY=VALUE")] set: Vec<String>,
     #[arg(long, default_value = "0.8")] temp: f32,
 }
 
 fn main() {
     let a = Args::parse();
-    let cfg = match a.preset.as_str() {
-        "nano" => dormouse_core::DormouseConfig::nano(),
-        "base" => dormouse_core::DormouseConfig::base(),
-        "one_b" => dormouse_core::DormouseConfig::one_b(),
-        _ => dormouse_core::DormouseConfig::small(),
-    };
+    let preset_name = a.config.as_deref().unwrap_or(&a.preset);
+    let mut cfg = dormouse_core::config::load_config(preset_name).unwrap_or_else(|e| {
+        eprintln!("config load {preset_name:?}: {e}"); std::process::exit(1);
+    });
+    if !a.set.is_empty() {
+        let ov = dormouse_core::config::parse_overrides(&a.set).unwrap_or_else(|e| {
+            eprintln!("--set: {e}"); std::process::exit(1);
+        });
+        dormouse_core::config::apply_overrides(&mut cfg, &ov).unwrap_or_else(|e| {
+            eprintln!("--set: {e}"); std::process::exit(1);
+        });
+    }
     let model = dormouse_train::load_model_weights(&a.ckpt_dir, &a.ckpt_name, cfg)
         .unwrap_or_else(|| { eprintln!("ckpt not found: {}/{}.bin", a.ckpt_dir.display(), a.ckpt_name); std::process::exit(1); });
     let mut bytes = a.prompt.as_bytes().to_vec();

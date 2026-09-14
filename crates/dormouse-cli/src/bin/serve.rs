@@ -10,6 +10,8 @@ struct Args {
     #[arg(long, default_value = "checkpoints")] ckpt_dir: PathBuf,
     #[arg(long, default_value = "latest", help = "checkpoint file name (<name>.bin)")] ckpt_name: String,
     #[arg(long, default_value = "small")] preset: String,
+    #[arg(long)] config: Option<String>,
+    #[arg(long = "set", value_name = "KEY=VALUE")] set: Vec<String>,
     #[arg(long, default_value = "8000")] port: u16,
 }
 
@@ -169,6 +171,7 @@ async fn models() -> Json<ModelsResp> {
         object: "list".into(),
         data: vec![
             ModelInfo { id: "dormouse-small".into(), object: "model".into(), created: 0, owned_by: "dormouse".into() },
+            ModelInfo { id: "dormouse-swift50".into(), object: "model".into(), created: 0, owned_by: "dormouse".into() },
             ModelInfo { id: "dormouse-base".into(), object: "model".into(), created: 0, owned_by: "dormouse".into() },
             ModelInfo { id: "dormouse-one_b".into(), object: "model".into(), created: 0, owned_by: "dormouse".into() },
         ],
@@ -178,12 +181,18 @@ async fn models() -> Json<ModelsResp> {
 #[tokio::main]
 async fn main() {
     let a = Args::parse();
-    let cfg = match a.preset.as_str() {
-        "nano" => dormouse_core::DormouseConfig::nano(),
-        "base" => dormouse_core::DormouseConfig::base(),
-        "one_b" => dormouse_core::DormouseConfig::one_b(),
-        _ => dormouse_core::DormouseConfig::small(),
-    };
+    let preset_name = a.config.as_deref().unwrap_or(&a.preset);
+    let mut cfg = dormouse_core::config::load_config(preset_name).unwrap_or_else(|e| {
+        eprintln!("config load {preset_name:?}: {e}"); std::process::exit(1);
+    });
+    if !a.set.is_empty() {
+        let ov = dormouse_core::config::parse_overrides(&a.set).unwrap_or_else(|e| {
+            eprintln!("--set: {e}"); std::process::exit(1);
+        });
+        dormouse_core::config::apply_overrides(&mut cfg, &ov).unwrap_or_else(|e| {
+            eprintln!("--set: {e}"); std::process::exit(1);
+        });
+    }
     let model = dormouse_train::load_model_weights(&a.ckpt_dir, &a.ckpt_name, cfg)
         .unwrap_or_else(|| { eprintln!("ckpt not found: {}/{}.bin", a.ckpt_dir.display(), a.ckpt_name); std::process::exit(1); });
     println!("loaded {}/{}.bin params={}", a.ckpt_dir.display(), a.ckpt_name, model.num_params());
@@ -194,7 +203,7 @@ async fn main() {
         .route("/v1/models", get(models))
         .with_state(state);
     let addr = SocketAddr::from(([0, 0, 0, 0], a.port));
-    println!("dormouse openai serve {}/{}.bin preset {} -> http://{}/v1 (concurrent)", a.ckpt_dir.display(), a.ckpt_name, a.preset, addr);
+    println!("dormouse openai serve {}/{}.bin preset {} -> http://{}/v1 (concurrent)", a.ckpt_dir.display(), a.ckpt_name, preset_name, addr);
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }

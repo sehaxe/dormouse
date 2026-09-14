@@ -12,9 +12,15 @@ struct Args {
     /// Held-out eval directory (optional).
     #[arg(long)]
     eval: Option<String>,
-    /// Model preset: nano | small | base | one_b.
+    /// Model preset: nano | small | swift50 | base | one_b (name or path to .toml).
     #[arg(long, default_value = "small")]
     preset: String,
+    /// Config file path (alias for --preset when a path is given).
+    #[arg(long)]
+    config: Option<String>,
+    /// Override config key=value (e.g. --set max_iter=12 --set d_model=512). Can be repeated.
+    #[arg(long = "set", value_name = "KEY=VALUE")]
+    set: Vec<String>,
 
     #[arg(long, default_value = "100000")]
     steps: usize,
@@ -160,6 +166,7 @@ fn parse_act_quant(v: &str) -> Result<ActQuant, String> {
 }
 
 fn run(a: Args) -> Result<(), String> {
+    let preset_name = a.config.as_deref().unwrap_or(&a.preset).to_string();
     let cfg = dormouse_train::TrainCfg {
         steps: a.steps,
         ckpt_every: a.ckpt_every,
@@ -198,6 +205,7 @@ fn run(a: Args) -> Result<(), String> {
         dspark_k: a.dspark_k,
         jepa_targets: a.jepa_targets,
         qk_heads: None,
+        config_overrides: a.set,
     };
     if let Some(n) = a.jepa_precompute {
         let Some(out) = &cfg.jepa_targets else {
@@ -206,7 +214,7 @@ fn run(a: Args) -> Result<(), String> {
         return dormouse_train::precompute_jepa_targets(
             &cfg,
             std::path::Path::new(&a.data),
-            &a.preset,
+            &preset_name,
             n,
             out,
         );
@@ -214,7 +222,7 @@ fn run(a: Args) -> Result<(), String> {
     dormouse_train::train_loop(
         cfg,
         PathBuf::from(a.data),
-        a.preset,
+        preset_name,
         Some(PathBuf::from(a.ckpt_dir)),
         a.eval.map(PathBuf::from),
     )
