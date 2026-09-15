@@ -267,7 +267,7 @@ impl DormouseModel {
     }
 
     /// KL(p_dist || truncated-geometric(λ_p)); p_dist is [b, N].
-    fn ponder_kl(&self, p_dist: Tensor<2>, lambda_p: f32) -> Tensor<1> {
+    pub(crate) fn ponder_kl(&self, p_dist: Tensor<2>, lambda_p: f32) -> Tensor<1> {
         let n = p_dist.dims()[1];
         let b = p_dist.dims()[0];
         let dev = p_dist.device();

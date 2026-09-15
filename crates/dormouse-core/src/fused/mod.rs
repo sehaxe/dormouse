@@ -45,6 +45,9 @@ use cubecl::prelude::*;
 
 use backward::PonderState;
 use crate::param::{LinearLike, LinearLikeInner};
+use crate::loop_block::LoopBlock;
+use crate::config::DormouseConfig;
+use burn::module::Module;
 
 pub(crate) type Cuda = cubecl::cuda::CudaRuntime;
 pub(crate) type CB = burn_cubecl::CubeBackend<Cuda>;
@@ -67,6 +70,13 @@ thread_local! {
 /// today's burn path is untouched).
 pub fn fused_enabled() -> bool {
     std::env::var("DM_FUSED").map(|v| v == "1").unwrap_or(false)
+}
+
+/// `DM_FUSED_BF16=1` halves the workspace (M5): per-iteration buffers are
+/// stored bf16, compute stays fp32. Off by default until the cast kernels
+/// are profiled.
+pub fn fused_bf16_enabled() -> bool {
+    std::env::var("DM_FUSED_BF16").map(|v| v == "1").unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -405,6 +415,7 @@ pub struct Fac {
 }
 
 /// Everything the fused N-iteration ponder loop needs, as tracked tensors.
+#[derive(Clone, Debug)]
 pub struct PonderInputs {
     /// loop input (embedding output) [b, t, d]
     pub x: Tensor<3>,
@@ -426,6 +437,12 @@ pub struct PonderInputs {
     pub norm_eps: f32,
     /// PonderNet KL prior λ_p (model.rs ponder_kl)
     pub ponder_prior: f32,
+    /// Optional arms (KDA/MSA/Engram) — when Some, the fused loop includes
+    /// the shared attention (KDA+MSA+router blend) and Engram (hashed_ids path)
+    /// inside the single node. `cfg` carries the geometry for the copy.
+    pub hashed_ids: Option<Tensor<3, Int>>,
+    pub loop_block_bytes: Option<Vec<u8>>,
+    pub cfg: Option<crate::config::DormouseConfig>,
 }
 
 #[derive(Clone, Debug)]
@@ -537,6 +554,20 @@ pub fn ponder_loop_step(inp: PonderInputs) -> (Tensor<3>, Tensor<1>, Tensor<2>, 
 where
     DispatchTensor: DispatchKindConversion<CAd> + DispatchKindConversion<CB>,
 {
+    // M4: if arms are requested, delegate to the arms-aware path which
+    // includes KDA/MSA/Engram inside the single node (still 1 node/step).
+    if inp.loop_block_bytes.is_some() || inp.hashed_ids.is_some() || inp.cfg.is_some() {
+        // Check if any arm would actually run (use_* true)
+        let wants_arms = inp
+            .cfg
+            .as_ref()
+            .map(|c| c.use_kda || c.use_msa || c.use_engram)
+            .unwrap_or(false)
+            || inp.loop_block_bytes.is_some();
+        if wants_arms {
+            return ponder_loop_step_arms(inp);
+        }
+    }
     let nexp = inp.experts.len();
     // The op's parent list is fixed at compile time (Backward<CB, 31>):
     // 6 dense weights + 6 per expert + 3 out_proj + 3 lm_head + 1 final
@@ -1081,5 +1112,207 @@ fn split_outputs(
         .transpose();
     let kl = out_t.clone().slice([1 + bn..2 + bn]);
     let logits = out_t.slice([2 + bn..2 + bn + bt * v]).reshape([b, t, v]);
+    (logits, rec, pd, kl)
+}
+
+// ---------------------------------------------------------------------------
+// M4: arms-aware path (KDA/MSA/Engram inside the single node)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+pub(crate) struct ArmsState {
+    pub b: usize,
+    pub t: usize,
+    pub d: usize,
+    pub v: usize,
+    pub n_iter: usize,
+    pub bt: usize,
+    pub cfg: DormouseConfig,
+    pub inp: PonderInputs,
+}
+
+#[derive(Debug)]
+struct PonderLoopArms;
+
+impl Backward<CB, 31> for PonderLoopArms {
+    type State = ArmsState;
+    fn backward(self, ops: Ops<Self::State, 31>, grads: &mut Gradients, _cp: &mut Checkpointer) {
+        crate::fused::backward::ponder_backward_arms(ops, grads, _cp)
+    }
+}
+
+pub fn ponder_loop_step_arms(inp: PonderInputs) -> (Tensor<3>, Tensor<1>, Tensor<2>, Tensor<1>)
+where
+    DispatchTensor: DispatchKindConversion<CAd> + DispatchKindConversion<CB>,
+{
+    let cfg = inp.cfg.clone().expect("cfg required for arms path");
+    let n_iter = cfg.max_iter;
+    let b = inp.x.dims()[0];
+    let t = inp.x.dims()[1];
+    let d = cfg.d_model;
+    let v = cfg.vocab;
+    let bt = b * t;
+    let nexp = cfg.n_experts;
+    assert_eq!(nexp, 3, "arms path compiled for n_experts=3");
+    // Extract the loop_block for the copy (contains shared_attn+engram)
+    let lb_bytes = inp.loop_block_bytes.clone().expect("loop_block_bytes required for arms");
+    // GPU path: inner model on Autodiff<Cuda> (CubeBackend) - 100% GPU, 1 outer node.
+    // The inner forward uses the same fused KDA/MSA/Engram kernels that the
+    // training path uses (gdn2_chunk_*, msa_sparse_attn, engram gather), so
+    // forward is on CubeTensor and the backward (ponder_backward_arms) reuses
+    // their adjoint kernels via Autodiff<Cuda>.
+    type Cad = CAd;
+    let dev_cu = Device::cuda(0).autodiff();
+    let mut model_cu = crate::model::DormouseModel::new(&cfg, &dev_cu);
+    {
+        let mut lb_cu = LoopBlock::new(&cfg, &dev_cu);
+        let rec = burn::store::ModuleRecord::from_bytes(burn::tensor::Bytes::from_bytes_vec(
+            lb_bytes,
+        ))
+        .expect("loop_block record");
+        lb_cu = lb_cu.load_record(rec);
+        model_cu.loop_block = lb_cu;
+    }
+    {
+        let w = Tensor::<1>::from_data(inp.final_norm_g.clone().into_data(), &dev_cu);
+        model_cu.norm.weight = burn::module::Param::from_tensor(w);
+    }
+    {
+        let mut lm = crate::param::LinearLike::new(d, v, cfg.rank, &dev_cu);
+        if let crate::param::LinearLikeInner::Tsct(l) = &mut lm.inner {
+            let u = Tensor::<2>::from_data(inp.lm_head.u.clone().into_data(), &dev_cu);
+            let s = Tensor::<1>::from_data(inp.lm_head.s.clone().into_data(), &dev_cu);
+            let vv = Tensor::<2>::from_data(inp.lm_head.v.clone().into_data(), &dev_cu);
+            l.u = burn::module::Param::from_tensor(u);
+            l.s = burn::module::Param::from_tensor(s);
+            l.v = burn::module::Param::from_tensor(vv);
+        }
+        model_cu.lm_head = lm;
+    }
+    model_cu.ponder_prior = cfg.ponder_prior;
+    model_cu.ponder_beta = cfg.ponder_beta;
+
+    let x_cu = Tensor::<3>::from_data(inp.x.clone().into_data(), &dev_cu);
+    let hashed_cu = inp.hashed_ids.as_ref().map(|h| {
+        Tensor::<3, Int>::from_data(h.clone().into_data(), &dev_cu)
+    });
+    let targets_cu = Tensor::<2, Int>::from_data(inp.targets.clone().into_data(), &dev_cu);
+    let tgt_2d = targets_cu.clone().reshape([bt, 1]);
+    let (out_acc_cu, rec_cu, p_dist_cu, _) = model_cu.loop_block.forward_full_state::<Cad>(
+        x_cu,
+        hashed_cu,
+        None,
+        None,
+        Some(tgt_2d),
+        &model_cu.lm_head,
+    );
+    let h_cu = model_cu.norm.forward(out_acc_cu.clone());
+    let logits_cu = model_cu.lm_head.forward::<Cad>(h_cu.reshape([bt, d])).reshape([b, t, v]);
+    let kl_cu = model_cu.ponder_kl(p_dist_cu.clone(), cfg.ponder_prior);
+    // Copy back to outer CUDA device for the flat (outer op is on CUDA)
+    let rec_ad = Tensor::<1>::from_data(rec_cu.into_data(), &inp.x.device());
+    let p_dist_ad = Tensor::<2>::from_data(p_dist_cu.into_data(), &inp.x.device());
+    let kl_ad = Tensor::<1>::from_data(kl_cu.into_data(), &inp.x.device());
+    let logits_ad = Tensor::<3>::from_data(logits_cu.into_data(), &inp.x.device());
+    // Pack flat as [rec | pd(b·N) | kl | logits]
+    let rec_data: Vec<f32> = rec_ad.clone().into_data().try_to_vec::<f32>().unwrap();
+    let kl_data: Vec<f32> = kl_ad.clone().into_data().try_to_vec::<f32>().unwrap();
+    let logits_data: Vec<f32> = logits_ad.clone().into_data().try_to_vec::<f32>().unwrap();
+    let bn = b * n_iter;
+    let flat_len = 2 + bn + bt * v;
+    let mut flat_data = Vec::with_capacity(flat_len);
+    flat_data.extend(rec_data);
+    let pd_t = p_dist_ad.clone().transpose();
+    let pd_flat: Vec<f32> = pd_t.into_data().try_to_vec::<f32>().unwrap();
+    flat_data.extend(pd_flat);
+    flat_data.extend(kl_data);
+    flat_data.extend(logits_data);
+    assert_eq!(flat_data.len(), flat_len);
+    let xa = inp.x.clone().try_into_primitive::<CAd>().expect("fused arms requires Autodiff<Cuda>");
+    let x_prim = xa.primitive.clone();
+    let client = x_prim.client.clone();
+    // flat must be on the bare backend (CB) for the custom op, create via CB device
+    let dev_bare = Device::cuda(0);
+    let flat_t = Tensor::<1>::from_data(burn::tensor::TensorData::new(flat_data, [flat_len]), &dev_bare);
+    let flat_cube = cube_of1(&flat_t).expect("cuda flat");
+    // Need to sync before creating the op (same fence as non-arms)
+    sync(&client);
+    // Build nodes/ats for the 31 parents (same as non-arms) plus keep arms alive
+    let mut keep2: Vec<Tensor<2>> = Vec::new();
+    let mut keep1: Vec<Tensor<1>> = Vec::new();
+    let mut ats: Vec<AdPrim> = Vec::with_capacity(31);
+    let mut nodes = Vec::with_capacity(31);
+    let wc = ad2(inp.controller_w.clone());
+    let (g_t, g_at, _g_prim) = ad1(inp.norm_g.clone());
+    let (gf_t, gf_at, _gf_prim) = ad1(inp.final_norm_g.clone());
+    let ie = ad2(inp.iter_embed.clone());
+    let (rs_t, rs_at, _rs_prim) = ad1(inp.residual_scale.clone());
+    let wh = ad2(inp.halt_w.clone());
+    keep2.push(wc.t);
+    keep2.push(ie.t);
+    keep2.push(wh.t);
+    keep1.push(g_t);
+    keep1.push(gf_t);
+    keep1.push(rs_t);
+    nodes.push(xa.node.clone());
+    ats.push(xa.clone());
+    nodes.push(wc.at.node.clone());
+    ats.push(wc.at);
+    nodes.push(g_at.node.clone());
+    ats.push(g_at);
+    nodes.push(ie.at.node.clone());
+    ats.push(ie.at);
+    nodes.push(rs_at.node.clone());
+    ats.push(rs_at);
+    nodes.push(wh.at.node.clone());
+    ats.push(wh.at);
+    let mut experts_c: Vec<[FacC; 2]> = Vec::new();
+    for e in &inp.experts {
+        let gu = fac_cuda(&e[0], &mut keep2, &mut keep1);
+        let dn = fac_cuda(&e[1], &mut keep2, &mut keep1);
+        for at in gu.1.iter().chain(dn.1.iter()) {
+            nodes.push(at.node.clone());
+        }
+        ats.extend_from_slice(&gu.1);
+        ats.extend_from_slice(&dn.1);
+        experts_c.push([gu.0, dn.0]);
+    }
+    let op = fac_cuda(&inp.out_proj, &mut keep2, &mut keep1);
+    let lm = fac_cuda(&inp.lm_head, &mut keep2, &mut keep1);
+    for at in op.1.iter().chain(lm.1.iter()) {
+        nodes.push(at.node.clone());
+    }
+    ats.extend_from_slice(&op.1);
+    ats.extend_from_slice(&lm.1);
+    nodes.push(gf_at.node.clone());
+    ats.push(gf_at);
+    assert_eq!(nodes.len(), 31);
+    assert_eq!(ats.len(), 31);
+    let state = ArmsState {
+        b,
+        t,
+        d,
+        v,
+        n_iter,
+        bt,
+        cfg: cfg.clone(),
+        inp: inp.clone(),
+    };
+    let nodes_arr: [_; 31] = nodes.try_into().expect("31 nodes");
+    let ats_arr: [_; 31] = ats.try_into().expect("31 ats");
+    let prep = PonderLoopArms.prepare::<NoCheckpointing>(nodes_arr);
+    let (logits, rec, pd, kl) = match prep.compute_bound().stateful() {
+        OpsKind::Tracked(mut p) => {
+            for at in &ats_arr {
+                let _ = p.checkpoint(at);
+            }
+            let out = p.finish(state, flat_cube);
+            split_outputs(out, b, t, v, bn, bt)
+        }
+        OpsKind::UnTracked(p) => {
+            let out = p.finish(flat_cube);
+            split_outputs(out, b, t, v, bn, bt)
+        }
+    };
     (logits, rec, pd, kl)
 }

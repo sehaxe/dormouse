@@ -32,8 +32,8 @@ use burn::tensor::{Tensor, TensorData};
 use cubecl::prelude::*;
 
 use super::{
-    cube_of1, dense, empty1, ew_cubes, launch_mm, zeros_raw, CubeTensor, FacC, IterBufs, CB, Cuda,
-    UNITS, EW,
+    cube_of1, dense, empty1, ew_cubes, launch_mm, zeros_raw, ArmsState, CubeTensor, FacC, IterBufs,
+    CB, Cuda, UNITS, EW,
 };
 
 /// Saved forward state for the fused Ponder loop (see `mod.rs`).
@@ -800,6 +800,363 @@ pub(super) fn ponder_backward(
                     )
                     .try_into_primitive::<CB>()
                     .expect("grad wrap")
+                }
+            };
+            grads.register::<CB>(node.id, gt);
+        }
+    }
+    super::sync(&client);
+}
+
+/// M4 arms path: run a reference `DormouseModel` forward on Autodiff<CB> with
+/// the same `x`/`hashed_ids`/`targets` and the same weights (taken from the
+/// stored `PonderInputs`), then weight the four outputs by the upstream flat
+/// grad and backward. This reuses the exact burn-kda/burn-msa adjoint kernels
+/// (via Autodiff<Cuda>) for the attention arms, so the grads are correct
+/// without hand-written KDA/MSA kernels. The cost is one extra forward+backward
+/// on the tiny test shapes (b=2 t=16) and one per step in training — still a
+/// single outer node, so CPU graph construction stays at 1 node/step.
+pub(super) fn ponder_backward_arms(
+    ops: Ops<ArmsState, 31>,
+    grads: &mut Gradients,
+    _cp: &mut Checkpointer,
+) {
+    use burn::backend::DispatchKindConversion;
+    use burn::module::Module;
+    use burn::tensor::{Device, Int, Tensor, TensorData};
+
+    let st = ops.state;
+    let gfull = Tensor::<1>::from_primitive::<CB>(grads.consume::<CB>(&ops.node));
+    // gfull is on CB bare (flat [rec|pd|kl|logits]); read it to host
+    let g_data: Vec<f32> = gfull.clone().into_data().try_to_vec::<f32>().unwrap();
+    let bn = st.b * st.n_iter;
+    let bt = st.bt;
+    let v = st.v;
+    assert!(g_data.len() == 2 + bn + bt * v, "gfull len mismatch");
+    let g_rec = g_data[0];
+    let g_pd = g_data[1..1 + bn].to_vec();
+    let g_kl = g_data[1 + bn];
+    let g_logits = g_data[2 + bn..].to_vec();
+
+    // GPU path: inner model on Autodiff<Cuda> (CubeBackend) - 100% GPU.
+    // Reuses the hand-written KDA/MSA adjoints (gdn2_chunk_intra/inter,
+    // msa_backward) via Autodiff<Cuda> - no NdArray fallback.
+    type CuAd = crate::fused::CAd;
+    let dev_cu = Device::cuda(0).autodiff();
+    let cfg = st.cfg.clone();
+    let mut model_cu = crate::model::DormouseModel::new(&cfg, &dev_cu);
+    // Copy the 31 parents' weights from the outer CUDA tensors to inner Cuda
+    // (via host data, numerical values only — NodeIds differ, but we will
+    // use the numerical grads to register for the outer NodeIds)
+    let x_cu = Tensor::<3>::from_data(st.inp.x.clone().into_data(), &dev_cu).require_grad();
+    let controller_w_cu =
+        Tensor::<2>::from_data(st.inp.controller_w.clone().into_data(), &dev_cu).require_grad();
+    let norm_g_cu = Tensor::<1>::from_data(st.inp.norm_g.clone().into_data(), &dev_cu).require_grad();
+    let iter_embed_cu =
+        Tensor::<2>::from_data(st.inp.iter_embed.clone().into_data(), &dev_cu).require_grad();
+    let residual_scale_cu =
+        Tensor::<1>::from_data(st.inp.residual_scale.clone().into_data(), &dev_cu).require_grad();
+    let halt_w_cu = Tensor::<2>::from_data(st.inp.halt_w.clone().into_data(), &dev_cu).require_grad();
+    let mut experts_cu: Vec<[crate::fused::Fac; 2]> = Vec::new();
+    for e in &st.inp.experts {
+        let gu = crate::fused::Fac {
+            u: Tensor::<2>::from_data(e[0].u.clone().into_data(), &dev_cu).require_grad(),
+            s: Tensor::<1>::from_data(e[0].s.clone().into_data(), &dev_cu).require_grad(),
+            v: Tensor::<2>::from_data(e[0].v.clone().into_data(), &dev_cu).require_grad(),
+        };
+        let dn = crate::fused::Fac {
+            u: Tensor::<2>::from_data(e[1].u.clone().into_data(), &dev_cu).require_grad(),
+            s: Tensor::<1>::from_data(e[1].s.clone().into_data(), &dev_cu).require_grad(),
+            v: Tensor::<2>::from_data(e[1].v.clone().into_data(), &dev_cu).require_grad(),
+        };
+        experts_cu.push([gu, dn]);
+    }
+    let out_proj_cu = crate::fused::Fac {
+        u: Tensor::<2>::from_data(st.inp.out_proj.u.clone().into_data(), &dev_cu).require_grad(),
+        s: Tensor::<1>::from_data(st.inp.out_proj.s.clone().into_data(), &dev_cu).require_grad(),
+        v: Tensor::<2>::from_data(st.inp.out_proj.v.clone().into_data(), &dev_cu).require_grad(),
+    };
+    let lm_head_cu = crate::fused::Fac {
+        u: Tensor::<2>::from_data(st.inp.lm_head.u.clone().into_data(), &dev_cu).require_grad(),
+        s: Tensor::<1>::from_data(st.inp.lm_head.s.clone().into_data(), &dev_cu).require_grad(),
+        v: Tensor::<2>::from_data(st.inp.lm_head.v.clone().into_data(), &dev_cu).require_grad(),
+    };
+    let final_norm_g_cu =
+        Tensor::<1>::from_data(st.inp.final_norm_g.clone().into_data(), &dev_cu).require_grad();
+    // Build model_cu's loop_block from experts_cu etc
+    {
+        let lb = &mut model_cu.loop_block;
+        lb.controller.weight = burn::module::Param::from_tensor(controller_w_cu.clone());
+        lb.norm.weight = burn::module::Param::from_tensor(norm_g_cu.clone());
+        lb.iter_embed = burn::module::Param::from_tensor(iter_embed_cu.clone());
+        lb.residual_scale = burn::module::Param::from_tensor(residual_scale_cu.clone());
+        lb.halt_head.weight = burn::module::Param::from_tensor(halt_w_cu.clone());
+        for (i, e) in experts_cu.iter().enumerate() {
+            let dst = &mut lb.expert_ffns[i];
+            if let crate::param::LinearLikeInner::Tsct(l) = &mut dst.gate_up.inner {
+                l.u = burn::module::Param::from_tensor(e[0].u.clone());
+                l.s = burn::module::Param::from_tensor(e[0].s.clone());
+                l.v = burn::module::Param::from_tensor(e[0].v.clone());
+            }
+            if let crate::param::LinearLikeInner::Tsct(l) = &mut dst.down.inner {
+                l.u = burn::module::Param::from_tensor(e[1].u.clone());
+                l.s = burn::module::Param::from_tensor(e[1].s.clone());
+                l.v = burn::module::Param::from_tensor(e[1].v.clone());
+            }
+        }
+        if let crate::param::LinearLikeInner::Tsct(l) = &mut lb.out_proj.inner {
+            l.u = burn::module::Param::from_tensor(out_proj_cu.u.clone());
+            l.s = burn::module::Param::from_tensor(out_proj_cu.s.clone());
+            l.v = burn::module::Param::from_tensor(out_proj_cu.v.clone());
+        }
+        model_cu.norm.weight = burn::module::Param::from_tensor(final_norm_g_cu.clone());
+        if let crate::param::LinearLikeInner::Tsct(l) = &mut model_cu.lm_head.inner {
+            l.u = burn::module::Param::from_tensor(lm_head_cu.u.clone());
+            l.s = burn::module::Param::from_tensor(lm_head_cu.s.clone());
+            l.v = burn::module::Param::from_tensor(lm_head_cu.v.clone());
+        }
+        if let Some(lb_bytes) = st.inp.loop_block_bytes.clone() {
+            let mut lb2 = crate::loop_block::LoopBlock::new(&cfg, &dev_cu);
+            let rec = burn::store::ModuleRecord::from_bytes(burn::tensor::Bytes::from_bytes_vec(
+                lb_bytes,
+            ))
+            .expect("loop_block record");
+            lb2 = lb2.load_record(rec);
+            // Keep shared_attn/engram as constants (not tracked)
+            lb.shared_attn = lb2.shared_attn;
+            lb.engram = lb2.engram;
+            lb.use_kda = lb2.use_kda;
+            lb.use_msa = lb2.use_msa;
+            lb.use_engram = lb2.use_engram;
+        }
+        model_cu.ponder_prior = st.inp.ponder_prior;
+        model_cu.ponder_beta = cfg.ponder_beta;
+    }
+    let hashed_cu = st.inp.hashed_ids.as_ref().map(|h| {
+        Tensor::<3, Int>::from_data(h.clone().into_data(), &dev_cu)
+    });
+    let targets_cu = Tensor::<2, Int>::from_data(st.inp.targets.clone().into_data(), &dev_cu);
+    let tgt_2d = targets_cu.clone().reshape([bt, 1]);
+    let (out_acc_cu, rec_cu, p_dist_cu, _) = model_cu.loop_block.forward_full_state::<CuAd>(
+        x_cu.clone(),
+        hashed_cu.clone(),
+        None,
+        None,
+        Some(tgt_2d),
+        &model_cu.lm_head,
+    );
+    let h_cu = model_cu.norm.forward(out_acc_cu.clone());
+    let logits_cu = model_cu
+        .lm_head
+        .forward::<CuAd>(h_cu.reshape([bt, cfg.d_model]))
+        .reshape([st.b, st.t, v]);
+    let kl_cu = {
+        let n = p_dist_cu.dims()[1];
+        let b_ = p_dist_cu.dims()[0];
+        let dev = p_dist_cu.device();
+        let mut prior = Vec::with_capacity(n);
+        let mut mass = 1.0f32;
+        let mut total = 0.0f32;
+        for _ in 0..n {
+            let prob = cfg.ponder_prior * mass;
+            prior.push(prob);
+            total += prob;
+            mass *= 1.0 - cfg.ponder_prior;
+        }
+        let inv = 1.0 / total;
+        let prior_v: Vec<f32> = prior.iter().map(|x| x * inv).collect();
+        let prior_t = Tensor::<1>::from_data(TensorData::new(prior_v, [n]), &dev).log();
+        let log_p = p_dist_cu.clone().log();
+        let term = p_dist_cu.clone() * (log_p - prior_t.unsqueeze_dim::<2>(0));
+        term.sum_dim(1).sum_dim(0).reshape([1]).div_scalar((b_ * n) as f32)
+    };
+
+    // g_* are on Cuda, create loss on Cuda as well
+    let dev_cu_clone = dev_cu.clone();
+    let g_pd_t = Tensor::<2>::from_data(TensorData::new(g_pd, [st.b, st.n_iter]), &dev_cu_clone);
+    let g_logits_t = Tensor::<3>::from_data(
+        TensorData::new(g_logits, [st.b, st.t, v]),
+        &dev_cu_clone,
+    );
+    let loss = rec_cu.clone().mul_scalar(g_rec)
+        + (p_dist_cu.clone() * g_pd_t).sum()
+        + kl_cu.clone().mul_scalar(g_kl)
+        + (logits_cu.clone() * g_logits_t).sum();
+
+    let grads_cu = loss.backward();
+
+    // Map the 31 parents' grads from the inner Cuda graph to the outer CUDA grads
+    // (numerical values only, NodeIds differ, so we copy via host Vec)
+    let mut out: Vec<Option<CubeTensor>> = vec![None; 31];
+    // Helper to get grad Vec on Cuda and convert to CubeTensor on CUDA
+    let to_cube = |v: Vec<f32>, dims: Option<[usize; 2]>, dev: &Device| -> CubeTensor {
+        match dims {
+            Some([r0, r1]) => {
+                let t = Tensor::<2>::from_data(TensorData::new(v, [r0, r1]), dev);
+                t.try_into_primitive::<CB>().expect("cuda grad")
+            }
+            None => {
+                let len = v.len();
+                let t = Tensor::<1>::from_data(TensorData::new(v, [len]), dev);
+                t.try_into_primitive::<CB>().expect("cuda grad")
+            }
+        }
+    };
+    let dev_cuda = Device::cuda(0);
+    // 0: x
+    if let Some(g) = x_cu.grad(&grads_cu) {
+        let v: Vec<f32> = g.into_data().try_to_vec::<f32>().unwrap();
+        out[0] = Some(to_cube(v, Some([bt, st.d]), &dev_cuda));
+    }
+    if let Some(g) = controller_w_cu.grad(&grads_cu) {
+        let v: Vec<f32> = g.into_data().try_to_vec::<f32>().unwrap();
+        out[1] = Some(to_cube(v, Some([2 * st.d, st.inp.controller_w.dims()[1]]), &dev_cuda));
+    }
+    if let Some(g) = norm_g_cu.grad(&grads_cu) {
+        let v: Vec<f32> = g.into_data().try_to_vec::<f32>().unwrap();
+        out[2] = Some(to_cube(v, None, &dev_cuda));
+    }
+    if let Some(g) = iter_embed_cu.grad(&grads_cu) {
+        let v: Vec<f32> = g.into_data().try_to_vec::<f32>().unwrap();
+        out[3] = Some(to_cube(v, Some([st.n_iter, st.d]), &dev_cuda));
+    }
+    if let Some(g) = residual_scale_cu.grad(&grads_cu) {
+        let v: Vec<f32> = g.into_data().try_to_vec::<f32>().unwrap();
+        out[4] = Some(to_cube(v, None, &dev_cuda));
+    }
+    if let Some(g) = halt_w_cu.grad(&grads_cu) {
+        let v: Vec<f32> = g.into_data().try_to_vec::<f32>().unwrap();
+        out[5] = Some(to_cube(v, Some([st.d, 1]), &dev_cuda));
+    }
+    for (ei, e) in experts_cu.iter().enumerate() {
+        if let Some(g) = e[0].u.grad(&grads_cu) {
+            let v: Vec<f32> = g.into_data().try_to_vec::<f32>().unwrap();
+            out[6 + 6 * ei] = Some(to_cube(v, Some([st.d, e[0].u.dims()[1]]), &dev_cuda));
+        }
+        if let Some(g) = e[0].s.grad(&grads_cu) {
+            let v: Vec<f32> = g.into_data().try_to_vec::<f32>().unwrap();
+            out[7 + 6 * ei] = Some(to_cube(v, None, &dev_cuda));
+        }
+        if let Some(g) = e[0].v.grad(&grads_cu) {
+            let v: Vec<f32> = g.into_data().try_to_vec::<f32>().unwrap();
+            out[8 + 6 * ei] = Some(to_cube(
+                v,
+                Some([e[0].v.dims()[0], e[0].u.dims()[1]]),
+                &dev_cuda,
+            ));
+        }
+        if let Some(g) = e[1].u.grad(&grads_cu) {
+            let v: Vec<f32> = g.into_data().try_to_vec::<f32>().unwrap();
+            out[9 + 6 * ei] = Some(to_cube(
+                v,
+                Some([e[1].u.dims()[0], e[1].u.dims()[1]]),
+                &dev_cuda,
+            ));
+        }
+        if let Some(g) = e[1].s.grad(&grads_cu) {
+            let v: Vec<f32> = g.into_data().try_to_vec::<f32>().unwrap();
+            out[10 + 6 * ei] = Some(to_cube(v, None, &dev_cuda));
+        }
+        if let Some(g) = e[1].v.grad(&grads_cu) {
+            let v: Vec<f32> = g.into_data().try_to_vec::<f32>().unwrap();
+            out[11 + 6 * ei] = Some(to_cube(v, Some([st.d, e[1].u.dims()[1]]), &dev_cuda));
+        }
+    }
+    if let Some(g) = out_proj_cu.u.grad(&grads_cu) {
+        let v: Vec<f32> = g.into_data().try_to_vec::<f32>().unwrap();
+        out[24] = Some(to_cube(v, Some([st.d, out_proj_cu.u.dims()[1]]), &dev_cuda));
+    }
+    if let Some(g) = out_proj_cu.s.grad(&grads_cu) {
+        let v: Vec<f32> = g.into_data().try_to_vec::<f32>().unwrap();
+        out[25] = Some(to_cube(v, None, &dev_cuda));
+    }
+    if let Some(g) = out_proj_cu.v.grad(&grads_cu) {
+        let v: Vec<f32> = g.into_data().try_to_vec::<f32>().unwrap();
+        out[26] = Some(to_cube(v, Some([st.d, out_proj_cu.u.dims()[1]]), &dev_cuda));
+    }
+    if let Some(g) = lm_head_cu.u.grad(&grads_cu) {
+        let v: Vec<f32> = g.into_data().try_to_vec::<f32>().unwrap();
+        out[27] = Some(to_cube(v, Some([st.d, lm_head_cu.u.dims()[1]]), &dev_cuda));
+    }
+    if let Some(g) = lm_head_cu.s.grad(&grads_cu) {
+        let v: Vec<f32> = g.into_data().try_to_vec::<f32>().unwrap();
+        out[28] = Some(to_cube(v, None, &dev_cuda));
+    }
+    if let Some(g) = lm_head_cu.v.grad(&grads_cu) {
+        let v: Vec<f32> = g.into_data().try_to_vec::<f32>().unwrap();
+        out[29] = Some(to_cube(v, Some([st.v, lm_head_cu.u.dims()[1]]), &dev_cuda));
+    }
+    if let Some(g) = final_norm_g_cu.grad(&grads_cu) {
+        let v: Vec<f32> = g.into_data().try_to_vec::<f32>().unwrap();
+        out[30] = Some(to_cube(v, None, &dev_cuda));
+    }
+
+    // Register (same snapshot logic as ponder_backward)
+    let dims: Vec<Option<[usize; 2]>> = {
+        let mut dm: Vec<Option<[usize; 2]>> = vec![None; 31];
+        dm[0] = Some([bt, st.d]);
+        dm[1] = Some([2 * st.d, st.inp.controller_w.dims()[1]]);
+        dm[2] = None;
+        dm[3] = Some([st.n_iter, st.d]);
+        dm[4] = None;
+        dm[5] = Some([st.d, 1]);
+        for e in 0..3 {
+            dm[6 + 6 * e] = Some([st.d, st.inp.experts[e][0].u.dims()[1]]);
+            dm[7 + 6 * e] = None;
+            dm[8 + 6 * e] = Some([st.inp.experts[e][0].v.dims()[0], st.inp.experts[e][0].u.dims()[1]]);
+            dm[9 + 6 * e] = Some([st.inp.experts[e][1].u.dims()[0], st.inp.experts[e][1].u.dims()[1]]);
+            dm[10 + 6 * e] = None;
+            dm[11 + 6 * e] = Some([st.d, st.inp.experts[e][1].u.dims()[1]]);
+        }
+        dm[24] = Some([st.d, st.inp.out_proj.u.dims()[1]]);
+        dm[26] = Some([st.d, st.inp.out_proj.u.dims()[1]]);
+        dm[27] = Some([st.d, st.inp.lm_head.u.dims()[1]]);
+        dm[29] = Some([st.v, st.inp.lm_head.u.dims()[1]]);
+        dm[30] = None;
+        dm
+    };
+    let dev = Device::cuda(0);
+    // Use the same snapshot pattern as the non-arms path: read each grad to
+    // host, then rebuild fresh device tensors for registration (avoids the
+    // foreign-bytes bug observed with direct register of reshaped grads).
+    let client = {
+        let dummy = Tensor::<1>::from_data(TensorData::new(vec![0.0f32], [1]), &Device::cuda(0));
+        dummy.try_into_primitive::<CB>().unwrap().client.clone()
+    };
+    let mut snap: Vec<Option<(Vec<f32>, Option<[usize; 2]>)>> = vec![None; 31];
+    for (i, g) in out.iter().enumerate() {
+        if let Some(gt) = g {
+            let n = match dims[i] {
+                Some([r0, r1]) => r0 * r1,
+                None => match i {
+                    4 => 1,
+                    30 | 2 => st.d,
+                    _ => st.inp.experts[0][0].u.dims()[1],
+                },
+            };
+            let bytes = gt.client.read(vec![gt.handle.clone()]).remove(0);
+            assert!(bytes.len() >= n * 4);
+            snap[i] = Some((
+                unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, n) }.to_vec(),
+                dims[i],
+            ));
+        }
+    }
+    for (i, s) in snap.into_iter().enumerate() {
+        if let (Some(node), Some((mut vals, dims_i))) = (&ops.parents[i], s) {
+            let gt = match dims_i {
+                Some([r0, r1]) => {
+                    let data = std::mem::take(&mut vals);
+                    Tensor::<2>::from_data(TensorData::new(data, [r0, r1]), &dev)
+                        .try_into_primitive::<CB>()
+                        .expect("grad rebuild")
+                }
+                None => {
+                    let data = std::mem::take(&mut vals);
+                    let len = data.len();
+                    Tensor::<1>::from_data(TensorData::new(data, [len]), &dev)
+                        .try_into_primitive::<CB>()
+                        .expect("grad wrap")
                 }
             };
             grads.register::<CB>(node.id, gt);
