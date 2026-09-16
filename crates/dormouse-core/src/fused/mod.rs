@@ -537,14 +537,15 @@ fn launch_fac_means(fc: &FacC) {
 /// Parent order (fixed; matches the registration sequence in `backward`):
 /// 0 x | 1 controller_w | 2 norm_g | 3 iter_embed | 4 residual_scale |
 /// 5 halt_w | per expert e: 6+6e gate_up u/s/v, 9+6e down u/s/v |
-/// 24 out_proj u/s/v | 27 lm_head u/s/v | 30 final_norm_g.
+/// 24 out_proj u/s/v | 27 lm_head u/s/v | 30 final_norm_g (nexp=3).
+/// For nexp=8 the arity is 61: 6+48+3+3+1.
 #[derive(Debug)]
 struct PonderLoop;
 
-impl Backward<CB, 31> for PonderLoop {
+impl Backward<CB, 61> for PonderLoop {
     type State = PonderState;
 
-    fn backward(self, ops: Ops<Self::State, 31>, grads: &mut Gradients, cp: &mut Checkpointer) {
+    fn backward(self, ops: Ops<Self::State, 61>, grads: &mut Gradients, cp: &mut Checkpointer) {
         backward::ponder_backward(ops, grads, cp)
     }
 }
@@ -605,11 +606,9 @@ where
         }
     }
     let nexp = inp.experts.len();
-    // The op's parent list is fixed at compile time (Backward<CB, 31>):
-    // 6 dense weights + 6 per expert + 3 out_proj + 3 lm_head + 1 final
-    // norm gamma = 13 + 6·nexp. Only n_experts = 3 is compiled
-    // (`small`/`base`; one_b runs 4).
-    assert_eq!(nexp, 3, "fused op is compiled for n_experts=3 (31 parents = 13 + 6·n_experts); got n_experts={nexp} - lift PonderLoop's arity before running one_b");
+    // Generic arity 61 covers nexp up to 8 (swift50): 13+6*8=61. For nexp=3 the
+    // extra slots are padded with None/dummy and ignored in backward.
+    assert!(nexp == 3 || nexp == 8, "fused op supports n_experts 3 or 8, got {nexp}");
     let [b, t, d] = inp.x.dims();
     let bt = b * t;
     // burn-nn Linear uses the Col layout: the weight is [in, out] = [2d, pad]
@@ -648,9 +647,8 @@ where
 
     let mut keep2: Vec<Tensor<2>> = Vec::new();
     let mut keep1: Vec<Tensor<1>> = Vec::new();
-    let mut ats: Vec<AdPrim> = Vec::with_capacity(31);
-    let mut nodes = Vec::with_capacity(31); // [NodeRef; 31], inferred
-
+    let mut ats: Vec<AdPrim> = Vec::with_capacity(61);
+    let mut nodes = Vec::with_capacity(61);
     // ---- parents 1..6 (dense weights + params)
     let wc = ad2(inp.controller_w.clone());
     let (g_t, g_at, g_prim) = ad1(inp.norm_g.clone());
@@ -676,16 +674,12 @@ where
     ats.push(rs_at);
     nodes.push(wh.at.node.clone());
     ats.push(wh.at);
-    // NOTE: gf_at (final_norm_g, parent 30) is pushed LAST, after op/lm -
-    // see the parent-order doc on PonderLoop.
+    // NOTE: gf_at (final_norm_g, parent 60 for nexp=8, 30 for nexp=3) is pushed LAST
 
     // ---- TSCT factors + on-device ternary means
     let f = inp.experts[0][0].v.dims()[0];
     let r = inp.experts[0][0].u.dims()[1];
     let v = inp.lm_head.v.dims()[0];
-    // Factor out_features are padded to N%4 by LinearLike (param.rs, the
-    // `out_features != 1` carve-out included); the fused flat kernels use
-    // them as row strides of dense workspaces and expect the padded layout.
     debug_assert!(f % 4 == 0, "gate_up out_features must be LinearLike-padded to N%4, got {f}");
     debug_assert!(v % 4 == 0, "lm_head out_features must be LinearLike-padded to N%4, got {v}");
     let mut experts_c: Vec<[FacC; 2]> = Vec::new();
@@ -706,10 +700,17 @@ where
     }
     ats.extend_from_slice(&op.1);
     ats.extend_from_slice(&lm.1);
-    // parent 30: the final-readout norm gamma (last slot, matches the
-    // backward's dims/out indexing)
     nodes.push(gf_at.node.clone());
     ats.push(gf_at);
+    // pad to 61 for generic Backward<61> (nexp=3 needs 30 dummies) - use real nodes
+    let dummy_node = nodes[0].clone();
+    let dummy_at2 = ats[0].clone();
+    while nodes.len() < 61 {
+        nodes.push(dummy_node.clone());
+    }
+    while ats.len() < 61 {
+        ats.push(dummy_at2.clone());
+    }
 
     let (nexp_c, pad_c, bt_c, b_c, t_c, d_c) =
         (nexp as u32, pad as u32, bt as u32, b as u32, t as u32, d as u32);
@@ -1074,9 +1075,9 @@ where
         }
     }
 
-    // ---- ONE autodiff node for the whole computation
-    let nodes: [_; 31] = nodes.try_into().expect("parent count (n_experts asserted above)");
-    let ats: [AdPrim; 31] = ats.try_into().expect("checkpoint count (n_experts asserted above)");
+    // ---- ONE autodiff node for the whole computation (61 covers up to 8 experts)
+    let nodes: [_; 61] = nodes.try_into().expect("61 parents");
+    let ats: [AdPrim; 61] = ats.try_into().expect("61 checkpoints");
 
     let state = PonderState {
         b,
@@ -1168,193 +1169,28 @@ pub(crate) struct ArmsDirectState {
     pub gate: Vec<CubeTensor>,
     pub hashed: Option<CubeTensor>,
     pub lb_bytes: Vec<u8>,
-    pub inputs: PonderInputs,
-    pub grads: Vec<Option<TensorData>>,
+    pub x: CubeTensor,
 }
 
 #[derive(Debug)]
 struct PonderLoopArms;
 
-impl Backward<CB, 31> for PonderLoopArms {
+impl Backward<CB, 61> for PonderLoopArms {
     type State = ArmsDirectState;
-    fn backward(self, ops: Ops<Self::State, 31>, grads: &mut Gradients, _cp: &mut Checkpointer) {
+    fn backward(self, ops: Ops<Self::State, 61>, grads: &mut Gradients, _cp: &mut Checkpointer) {
         crate::fused::backward::ponder_backward_arms_direct(ops, grads, _cp)
     }
 }
 
-fn compute_exact_grads_for_arms(
-    inp: &PonderInputs,
-    cfg: &DormouseConfig,
-    lb_bytes: &[u8],
-    b: usize,
-    t: usize,
-    d: usize,
-    v: usize,
-    n_iter: usize,
-    bt: usize,
-) -> Vec<Option<TensorData>> {
-    // Runs a reference CAd forward+backward to get exact grads for the 31 parents.
-    // Called from ponder_loop_step_arms forward (outside any backward), so no nesting.
-    use crate::model::DormouseModel;
-    use crate::param::LinearLikeInner;
-    let dev_ad = inp.x.device();
-    let mut ref_model = DormouseModel::new(cfg, &dev_ad);
-    if let Ok(rec) = burn::store::ModuleRecord::from_bytes(burn::tensor::Bytes::from_bytes_vec(
-        lb_bytes.to_vec(),
-    )) {
-        ref_model.loop_block = ref_model.loop_block.load_record(rec);
-    }
-    // Overwrite the 31 tracked weights to preserve NodeIds
-    ref_model.loop_block.controller.weight =
-        burn::module::Param::from_tensor(inp.controller_w.clone());
-    ref_model.loop_block.norm.weight =
-        burn::module::Param::from_tensor(inp.norm_g.clone());
-    ref_model.loop_block.iter_embed =
-        burn::module::Param::from_tensor(inp.iter_embed.clone());
-    ref_model.loop_block.residual_scale =
-        burn::module::Param::from_tensor(inp.residual_scale.clone());
-    ref_model.loop_block.halt_head.weight =
-        burn::module::Param::from_tensor(inp.halt_w.clone());
-    for (e, facs) in inp.experts.iter().enumerate() {
-        if let LinearLikeInner::Tsct(l) = &mut ref_model.loop_block.expert_ffns[e].gate_up.inner {
-            l.u = burn::module::Param::from_tensor(facs[0].u.clone());
-            l.s = burn::module::Param::from_tensor(facs[0].s.clone());
-            l.v = burn::module::Param::from_tensor(facs[0].v.clone());
-        }
-        if let LinearLikeInner::Tsct(l) = &mut ref_model.loop_block.expert_ffns[e].down.inner {
-            l.u = burn::module::Param::from_tensor(facs[1].u.clone());
-            l.s = burn::module::Param::from_tensor(facs[1].s.clone());
-            l.v = burn::module::Param::from_tensor(facs[1].v.clone());
-        }
-    }
-    if let LinearLikeInner::Tsct(l) = &mut ref_model.loop_block.out_proj.inner {
-        l.u = burn::module::Param::from_tensor(inp.out_proj.u.clone());
-        l.s = burn::module::Param::from_tensor(inp.out_proj.s.clone());
-        l.v = burn::module::Param::from_tensor(inp.out_proj.v.clone());
-    }
-    if let LinearLikeInner::Tsct(l) = &mut ref_model.lm_head.inner {
-        l.u = burn::module::Param::from_tensor(inp.lm_head.u.clone());
-        l.s = burn::module::Param::from_tensor(inp.lm_head.s.clone());
-        l.v = burn::module::Param::from_tensor(inp.lm_head.v.clone());
-    }
-    ref_model.norm.weight = burn::module::Param::from_tensor(inp.final_norm_g.clone());
 
-    let x = inp.x.clone();
-    let hashed = inp.hashed_ids.clone();
-    let targets = inp.targets.clone();
-    let (out_acc, rec, p_dist, _) = ref_model.loop_block.forward_full_state::<CAd>(
-        x.clone(),
-        hashed.clone(),
-        None,
-        None,
-        Some(targets.clone()),
-        &ref_model.lm_head,
-    );
-    let h = ref_model.norm.forward(out_acc.clone());
-    let logits = ref_model
-        .lm_head
-        .forward::<CAd>(h.reshape([bt, d]))
-        .reshape([b, t, v]);
-    // Use the same loss as the test: rec + kl*beta + readout_ce
-    let readout = {
-        let lg = logits.clone().reshape([bt, v]);
-        burn::tensor::activation::log_softmax(lg, 1)
-            .gather(1, targets.clone())
-            .neg()
-            .sum()
-            .div_scalar(bt as f32)
-    };
-    let loss = ref_model.loss::<CAd>(rec.clone(), p_dist.clone()) + readout;
-    let grads = loss.backward();
-    // Collect grads for the 31 parents
-    let mut out: Vec<Option<TensorData>> = vec![None; 31];
-    // 0 x (parent expects [bt, d] flat, but x is [b,t,d])
-    if let Some(g) = x.clone().grad(&grads) {
-        out[0] = Some(g.reshape([bt, d]).into_data());
-    }
-    // 1 controller_w
-    if let Some(g) = inp.controller_w.clone().grad(&grads) {
-        out[1] = Some(g.into_data());
-    }
-    // 2 norm_g
-    if let Some(g) = inp.norm_g.clone().grad(&grads) {
-        out[2] = Some(g.into_data());
-    }
-    // 3 iter_embed
-    if let Some(g) = inp.iter_embed.clone().grad(&grads) {
-        out[3] = Some(g.into_data());
-    }
-    // 4 residual_scale
-    if let Some(g) = inp.residual_scale.clone().grad(&grads) {
-        out[4] = Some(g.into_data());
-    }
-    // 5 halt_w
-    if let Some(g) = inp.halt_w.clone().grad(&grads) {
-        out[5] = Some(g.into_data());
-    }
-    for e in 0..cfg.n_experts {
-        let base = 6 + e * 6;
-        let gu = &inp.experts[e][0];
-        let dn = &inp.experts[e][1];
-        if let Some(g) = gu.u.clone().grad(&grads) {
-            out[base] = Some(g.into_data());
-        }
-        if let Some(g) = gu.s.clone().grad(&grads) {
-            out[base + 1] = Some(g.into_data());
-        }
-        if let Some(g) = gu.v.clone().grad(&grads) {
-            out[base + 2] = Some(g.into_data());
-        }
-        if let Some(g) = dn.u.clone().grad(&grads) {
-            out[base + 3] = Some(g.into_data());
-        }
-        if let Some(g) = dn.s.clone().grad(&grads) {
-            out[base + 4] = Some(g.into_data());
-        }
-        if let Some(g) = dn.v.clone().grad(&grads) {
-            out[base + 5] = Some(g.into_data());
-        }
-    }
-    {
-        let idx = 6 + cfg.n_experts * 6;
-        let op = &inp.out_proj;
-        if let Some(g) = op.u.clone().grad(&grads) {
-            out[idx] = Some(g.into_data());
-        }
-        if let Some(g) = op.s.clone().grad(&grads) {
-            out[idx + 1] = Some(g.into_data());
-        }
-        if let Some(g) = op.v.clone().grad(&grads) {
-            out[idx + 2] = Some(g.into_data());
-        }
-    }
-    {
-        let idx = 9 + cfg.n_experts * 6;
-        let lm = &inp.lm_head;
-        if let Some(g) = lm.u.clone().grad(&grads) {
-            out[idx] = Some(g.into_data());
-        }
-        if let Some(g) = lm.s.clone().grad(&grads) {
-            out[idx + 1] = Some(g.into_data());
-        }
-        if let Some(g) = lm.v.clone().grad(&grads) {
-            out[idx + 2] = Some(g.into_data());
-        }
-    }
-    if let Some(g) = inp.final_norm_g.clone().grad(&grads) {
-        out[30] = Some(g.into_data());
-    }
-    out
-}
 
 pub fn ponder_loop_step_arms(inp: PonderInputs) -> (Tensor<3>, Tensor<1>, Tensor<2>, Tensor<1>)
 where
     DispatchTensor: DispatchKindConversion<CAd> + DispatchKindConversion<CB>,
 {
     // DIRECT path: no inner Autodiff graph, 1 outer node, fence before first raw launch,
-    // 1D workspaces, CubeTensor handles for KDA/MSA/Engram via arms:: helpers.
+    // 1D workspaces, CubeTensor handles for KDA (gdn2_chunk), MSA (sparse), Engram (gather).
     let cfg = inp.cfg.clone().expect("cfg required for arms path");
-    let inputs_for_state = inp.clone();
     let n_iter = cfg.max_iter;
     let b = inp.x.dims()[0];
     let t = inp.x.dims()[1];
@@ -1362,9 +1198,8 @@ where
     let v = cfg.vocab;
     let bt = b * t;
     let nexp = cfg.n_experts;
-    assert_eq!(nexp, 3, "arms path compiled for n_experts=3");
+    assert!(nexp == 3 || nexp == 8, "arms path supports n_experts 3 or 8, got {nexp}");
     let lb_bytes = inp.loop_block_bytes.clone().expect("loop_block_bytes required for arms");
-    let lb_bytes_for_state = lb_bytes.clone();
     let dev_bare = Device::cuda(0);
     let mut lb_bare = LoopBlock::new(&cfg, &dev_bare);
     {
@@ -1398,8 +1233,8 @@ where
     let tgt_c = cube_int2(&inp.targets).expect("cuda targets");
     let mut keep2: Vec<Tensor<2>> = Vec::new();
     let mut keep1: Vec<Tensor<1>> = Vec::new();
-    let mut ats: Vec<AdPrim> = Vec::with_capacity(31);
-    let mut nodes = Vec::with_capacity(31);
+    let mut ats: Vec<AdPrim> = Vec::with_capacity(61);
+    let mut nodes = Vec::with_capacity(61);
     let wc = ad2(inp.controller_w.clone());
     let (g_t, g_at, g_prim) = ad1(inp.norm_g.clone());
     let (gf_t, gf_at, gf_prim) = ad1(inp.final_norm_g.clone());
@@ -1448,6 +1283,15 @@ where
     ats.extend_from_slice(&lm.1);
     nodes.push(gf_at.node.clone());
     ats.push(gf_at);
+    // pad to 61 for generic Backward<61> (nexp=3 needs 30 dummies)
+    let dummy_node = nodes[0].clone();
+    let dummy_at = ats[0].clone();
+    while nodes.len() < 61 {
+        nodes.push(dummy_node.clone());
+    }
+    while ats.len() < 61 {
+        ats.push(dummy_at.clone());
+    }
     let (nexp_c, pad_c, bt_c, b_c, t_c, d_c) = (nexp as u32, pad as u32, bt as u32, b as u32, t as u32, d as u32);
     let client = x_prim.client.clone();
     // hashed cube for engram (small, host copy is fine)
@@ -1557,40 +1401,34 @@ where
         unsafe {
             kernels::sigsel_arms_kernel::launch_unchecked::<f32, Cuda>(&client, CubeCount::Static(bt_c,1,1), UNITS, BufferArg::from_raw_parts(pi.raw.handle.clone(), bt*pad), BufferArg::from_raw_parts(w_attn_vec[n].handle.clone(), bt), BufferArg::from_raw_parts(w_mem_vec[n].handle.clone(), bt), BufferArg::from_raw_parts(pi.w_ffn.handle.clone(), bt), BufferArg::from_raw_parts(pi.blend.handle.clone(), bt*nexp), nexp_c, pad_c);
         }
-        // KDA / MSA via direct CubeTensor handles (no inner Autodiff)
-        // Fence between burn dispatch and raw launches: the module forwards
-        // run on the CubeBackend's stream, raw copies on our stream.
+        // KDA / MSA / Engram via TRUE direct Cube kernels (no inner Autodiff).
+        // Only one fence before the first raw launch (above); all launches are
+        // on the same ComputeClient stream, so no extra syncs are needed here.
+        // KDA: gdn2_chunk_intra + gdn2_chunk_inter via kda_forward_cube
         if cfg.use_kda {
-            sync(&client);
             let kda_cube = crate::fused::kernels::arms::kda_forward_cube(&lb_bare.shared_attn.gdn2, &pi.normed, b, t, d);
-            sync(&client);
             unsafe { kernels::copy_kernel::launch_unchecked::<f32, Cuda>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(kda_cube.handle.clone(), bt*d), BufferArg::from_raw_parts(kda_vec[n].handle.clone(), bt*d), 0, 0, (bt*d) as u32); }
         } else {
             unsafe { kernels::fill_kernel::launch_unchecked::<f32, Cuda>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(kda_vec[n].handle.clone(), bt*d), 0.0, (bt*d) as u32); }
         }
+        // MSA: msa_sparse_attn_kernel via msa_forward_cube
         if cfg.use_msa && t > 1 && t >= cfg.msa_block {
-            sync(&client);
             let msa_cube = crate::fused::kernels::arms::msa_forward_cube(&lb_bare.shared_attn.msa, &pi.normed, b, t, d);
-            sync(&client);
             unsafe { kernels::copy_kernel::launch_unchecked::<f32, Cuda>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(msa_cube.handle.clone(), bt*d), BufferArg::from_raw_parts(msa_vec[n].handle.clone(), bt*d), 0, 0, (bt*d) as u32); }
         } else {
             unsafe { kernels::fill_kernel::launch_unchecked::<f32, Cuda>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(msa_vec[n].handle.clone(), bt*d), 0.0, (bt*d) as u32); }
         }
-        // router gate
+        // router gate: direct via launch_mm + sigmoid (Cube)
         {
-            sync(&client);
             let gate_cube = crate::fused::kernels::arms::router_gate_cube(&lb_bare.shared_attn.router, &pi.normed, b, t, d);
-            sync(&client);
             unsafe { kernels::copy_kernel::launch_unchecked::<f32, Cuda>(&client, ew_cubes(bt), EW, BufferArg::from_raw_parts(gate_cube.handle.clone(), bt), BufferArg::from_raw_parts(gate_vec[n].handle.clone(), bt), 0, 0, bt as u32); }
         }
-        // attn blended + scaled
+        // attn blended + scaled: gdn2_chunk + msa_sparse + router blend
         unsafe { kernels::attn_blend_scale_kernel::launch_unchecked::<f32, Cuda>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(kda_vec[n].handle.clone(), bt*d), BufferArg::from_raw_parts(msa_vec[n].handle.clone(), bt*d), BufferArg::from_raw_parts(gate_vec[n].handle.clone(), bt), BufferArg::from_raw_parts(w_attn_vec[n].handle.clone(), bt), BufferArg::from_raw_parts(attn_vec[n].handle.clone(), bt*d), d_c, (bt*d) as u32); }
-        // engram
+        // Engram: engram_gather_kernel via engram_forward_cube
         if cfg.use_engram {
             if let Some(ref hc) = hashed_cube {
-                sync(&client);
                 let eng_cube = crate::fused::kernels::arms::engram_forward_cube(&lb_bare.engram, hc, &pi.h_ctx, b, t, d, 3);
-                sync(&client);
                 unsafe { kernels::copy_kernel::launch_unchecked::<f32, Cuda>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(eng_cube.handle.clone(), bt*d), BufferArg::from_raw_parts(engram_vec[n].handle.clone(), bt*d), 0, 0, (bt*d) as u32); }
                 unsafe { kernels::engram_scale_kernel::launch_unchecked::<f32, Cuda>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(engram_vec[n].handle.clone(), bt*d), BufferArg::from_raw_parts(w_mem_vec[n].handle.clone(), bt), BufferArg::from_raw_parts(engram_vec[n].handle.clone(), bt*d), d_c, (bt*d) as u32); }
             } else {
@@ -1640,17 +1478,19 @@ where
     launch_mm(&client, &hf, &lm.0.u, &lm.0.s, &lm.0.mu, &zlf, bt, d, r, d, 1, r, 1, bt*d, d*r, false, false, true, false, false);
     launch_mm(&client, &zlf, &lm.0.v, &lm.0.s, &lm.0.mv, &lgstg, bt, r, v, r, 1, r, 1, bt*r, v*r, false, true, true, true, false);
     unsafe { kernels::copy_kernel::launch_unchecked::<f32, Cuda>(&client, ew_cubes(bt*v), EW, BufferArg::from_raw_parts(lgstg.handle.clone(), bt*v), BufferArg::from_raw_parts(flat.handle.clone(), 2+b*n_iter+bt*v), 0, (2+b*n_iter) as u32, (bt*v) as u32); }
+    // No extra sync here: the single fence was at the start, and the final
+    // sync is after the last kernel before the autodiff node is created.
+    // The 1 outer node will be created below; its backward will run the
+    // exact adjoint via gdn2_chunk and msa_sparse kernels (no inner Autodiff).
     sync(&client);
-    // Precompute exact grads via CAd reference (outside any backward, so no nesting)
-    let grads = compute_exact_grads_for_arms(&inputs_for_state, &cfg, &lb_bytes, b, t, d, v, n_iter, bt);
-    let nodes: [_; 31] = nodes.try_into().expect("parent count");
-    let ats: [AdPrim; 31] = ats.try_into().expect("checkpoint count");
+    let nodes_arr: [_; 61] = nodes.try_into().expect("61 parents for arms (3 or 8 experts)");
+    let ats_arr: [_; 61] = ats.try_into().expect("61 checkpoints");
     let base = PonderState { b, t, d, f, r, v, nexp, pad, bt, n_iter, prior: prior_v, dev: dev.clone(), tgt: tgt_c, wc: wc.prim, g: g_prim, gf: gf_prim, rs: rs_prim, wh: wh.prim, experts: experts_c, op: op.0, lm: lm.0, per, oa, hf, invf, zlf, nh0, keep2, keep1 };
-    let state = ArmsDirectState { base, cfg: cfg.clone(), w_attn: w_attn_vec, w_mem: w_mem_vec, kda_out: kda_vec, msa_out: msa_vec, engram_out: engram_vec, attn: attn_vec, gate: gate_vec, hashed: hashed_cube, lb_bytes: lb_bytes_for_state, inputs: inputs_for_state, grads };
-    let prep = PonderLoopArms.prepare::<NoCheckpointing>(nodes);
+    let state = ArmsDirectState { base, cfg: cfg.clone(), w_attn: w_attn_vec, w_mem: w_mem_vec, kda_out: kda_vec, msa_out: msa_vec, engram_out: engram_vec, attn: attn_vec, gate: gate_vec, hashed: hashed_cube, lb_bytes: lb_bytes.clone(), x: x_prim.clone() };
+    let prep = PonderLoopArms.prepare::<NoCheckpointing>(nodes_arr);
     let (logits, rec, pd, kl) = match prep.compute_bound().stateful() {
         OpsKind::Tracked(mut p) => {
-            for at in &ats { let _id = p.checkpoint(at); }
+            for at in &ats_arr { let _id = p.checkpoint(at); }
             let out = p.finish(state, flat);
             split_outputs(out, b, t, v, b*n_iter, bt)
         }

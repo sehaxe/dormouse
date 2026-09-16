@@ -1194,39 +1194,27 @@ pub fn silu_kernel<F: Float>(a: &[F], out: &mut [F], n: u32) {
 // no inner Autodiff graph, 1D workspaces, fence before first launch.
 // ---------------------------------------------------------------------------
 
-/// Engram gather: embeds[hashed + off] -> out[b*t*total]
+/// Engram gather: direct Cube gather from host-RAM table.
+/// table: [num_rows, dim] flattened, hashed: [b*t*nhash] i32 row indices,
+/// out: [b*t*nhash*dim] = hashed.len()*dim, 1D workspace, no inner Autodiff.
 #[cube(launch_unchecked)]
 pub fn engram_gather_kernel<F: Float>(
-    table: &[F],      // [total, dim] flattened
+    table: &[F],      // [num_rows, dim] flattened
     hashed: &[i32],   // [b*t*nhash] i32
-    out: &mut [F],    // [b*t*total]
+    out: &mut [F],    // [b*t*nhash*dim]
     dim: u32,
-    nhash: u32,
-    total: u32,
+    _nhash: u32,
+    _total: u32,
 ) {
     let idx = CUBE_POS_X as usize * 256usize + UNIT_POS_X as usize;
     let dim = dim as usize;
-    let nh = nhash as usize;
-    let tot = total as usize;
-    let n = tot * dim; // not used
-    // Each thread handles one output element: out[bt*total + j]
-    // where j = table_row*dim + d
-    let n_out = 256; // dummy
-    let _ = n_out;
-    let out_len = 0; // placeholder
-    let _ = out_len;
-    let _ = n;
-    if idx < 1 {
-        let _ = table[0];
-        let _ = hashed[0];
-        out[0] = table[0];
+    let n_out = hashed.len() * dim;
+    if idx < n_out {
+        let row = idx / dim;
+        let col = idx % dim;
+        let table_row = hashed[row] as usize;
+        out[idx] = table[table_row * dim + col];
     }
-    // Real impl is in `engram_gather_cube` below which uses Tensor gather
-    // on CubeBackend (still a direct Cube kernel via handles, just wrapped).
-    // This stub keeps the file containing a Cube kernel for the arm.
-    let _ = dim;
-    let _ = nh;
-    let _ = tot;
 }
 
 /// Gate for Engram: g = sigmoid(sqrt(|dot|+1e-6)*sign(dot)) where dot = (k·q)/sqrt(d)
@@ -1348,10 +1336,10 @@ pub mod arms {
                 gdn2_ad = gdn2_ad.load_record(rec);
             }
         }
-        let x_data = Tensor::<1>::from_primitive::<CB>(x.clone()).into_data();
-        let dout_data = Tensor::<1>::from_primitive::<CB>(dout.clone()).into_data();
-        let x_ad = Tensor::<3>::from_data(x_data, &dev_ad).reshape([b, t, d]).require_grad();
-        let dout_ad = Tensor::<3>::from_data(dout_data, &dev_ad).reshape([b, t, d]);
+        let x_data = Tensor::<2>::from_primitive::<CB>(x.clone()).into_data();
+        let dout_data = Tensor::<2>::from_primitive::<CB>(dout.clone()).into_data();
+        let x_ad = Tensor::<2>::from_data(x_data, &dev_ad).reshape([b, t, d]).require_grad();
+        let dout_ad = Tensor::<2>::from_data(dout_data, &dev_ad).reshape([b, t, d]);
         let out = gdn2_ad.forward_train::<CAd>(x_ad.clone());
         let loss = (out * dout_ad).sum();
         let grads = loss.backward();
@@ -1392,10 +1380,10 @@ pub mod arms {
                 msa_ad = msa_ad.load_record(rec);
             }
         }
-        let x_data = Tensor::<1>::from_primitive::<CB>(x.clone()).into_data();
-        let dout_data = Tensor::<1>::from_primitive::<CB>(dout.clone()).into_data();
-        let x_ad = Tensor::<3>::from_data(x_data, &dev_ad).reshape([b, t, d]).require_grad();
-        let dout_ad = Tensor::<3>::from_data(dout_data, &dev_ad).reshape([b, t, d]);
+        let x_data = Tensor::<2>::from_primitive::<CB>(x.clone()).into_data();
+        let dout_data = Tensor::<2>::from_primitive::<CB>(dout.clone()).into_data();
+        let x_ad = Tensor::<2>::from_data(x_data, &dev_ad).reshape([b, t, d]).require_grad();
+        let dout_ad = Tensor::<2>::from_data(dout_data, &dev_ad).reshape([b, t, d]);
         let out = msa_ad.forward::<CAd>(x_ad.clone()).output;
         let loss = (out * dout_ad).sum();
         let grads = loss.backward();
@@ -1442,11 +1430,11 @@ pub mod arms {
         let hashed_data = Tensor::<1, Int>::from_primitive::<CB>(hashed.clone()).into_data();
         let hidden_data = Tensor::<1>::from_primitive::<CB>(hidden.clone()).into_data();
         let dout_data = Tensor::<1>::from_primitive::<CB>(dout.clone()).into_data();
-        let hashed_ad = Tensor::<3, Int>::from_data(hashed_data, &dev_ad).reshape([b, t, 3]);
-        let hidden_ad = Tensor::<3>::from_data(hidden_data, &dev_ad).reshape([b, t, d]).require_grad();
+        let hashed_ad = Tensor::<1, Int>::from_data(hashed_data, &dev_ad).reshape([b, t, 3]);
+        let hidden_ad = Tensor::<1>::from_data(hidden_data, &dev_ad).reshape([b, t, d]).require_grad();
         let hidden_4d = hidden_ad.clone().reshape([b, t, 1, d]);
         let out = eng_ad.forward(hashed_ad.clone(), hidden_4d.clone()).reshape([b, t, d]);
-        let dout_ad = Tensor::<3>::from_data(dout_data, &dev_ad).reshape([b, t, d]);
+        let dout_ad = Tensor::<1>::from_data(dout_data, &dev_ad).reshape([b, t, d]);
         let loss = (out * dout_ad).sum();
         let grads = loss.backward();
         let dx = hidden_ad.grad(&grads).expect("eng dx");
