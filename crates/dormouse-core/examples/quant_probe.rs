@@ -64,7 +64,7 @@ fn main() {
     println!("layer fwd plain-vs-quant fp4: max|d|={md:.6}");
 
     // full model loss delta: fp32 vs fp4 on same batch
-    let cfg = dormouse_core::DormouseConfig::small();
+    let cfg = dormouse_core::DormouseConfig::default();
     let m_plain = dormouse_core::DormouseModel::new(&cfg, &device);
     let mut m_quant = m_plain.clone();
     m_quant.loop_block.set_quant_all(burn_spectral::QuantFormat::Fp4);

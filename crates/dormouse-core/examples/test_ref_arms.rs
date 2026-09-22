@@ -1,0 +1,30 @@
+use burn::tensor::{Tensor, TensorData, Device, Int};
+use burn::module::{Module, Param};
+use dormouse_core::config::DormouseConfig;
+use dormouse_core::model::DormouseModel;
+use burn_cubecl::CubeBackend;
+use cubecl::cuda::CudaRuntime;
+type CAd = burn::backend::Autodiff<CubeBackend<CudaRuntime>>;
+fn main(){
+ let dev = Device::cuda(0).autodiff();
+ let cfg = DormouseConfig { max_iter: 4, use_kda:true, use_msa:true, use_engram:true, ..DormouseConfig::default() };
+ let mut model = DormouseModel::new(&cfg, &dev);
+ model.loop_block.residual_scale = Param::from_tensor(Tensor::<1>::from_data(TensorData::new(vec![0.7f32],[1]), &dev));
+ let b=2; let t=16; let d=cfg.d_model; let bt=b*t;
+ let xh = TensorData::new((0..b*t*d).map(|i| ((i%97) as f32 -48.)/48.).collect::<Vec<f32>>(), [b,t,d]);
+ let x = Tensor::<3>::from_data(xh, &dev);
+ let tgt = Tensor::<2, Int>::from_data(TensorData::new((0..bt).map(|i| (i*31%256) as i64).collect::<Vec<i64>>(), [bt,1]), &dev);
+ let hashed = Tensor::<3, Int>::from_data(TensorData::new((0..b*t*3).map(|i| ((i*17+5)%4096) as i64).collect::<Vec<i64>>(), [b,t,3]), &dev);
+ println!("start ref forward");
+ let (out_acc, rec, p_dist, _) = model.loop_block.forward_full_state::<CAd>(x.clone(), Some(hashed.clone()), None, None, Some(tgt.clone()), &model.lm_head);
+ println!("forward done rec {:?}", rec.clone().into_data());
+ let h = model.norm.forward(out_acc.clone());
+ let logits = model.lm_head.forward::<CAd>(h.reshape([bt, d])).reshape([b,t, cfg.vocab]);
+ println!("logits done");
+ let loss = model.loss::<CAd>(rec.clone(), p_dist.clone()) + { let lg=logits.clone().reshape([bt, cfg.vocab]); burn::tensor::activation::log_softmax(lg,1).gather(1, tgt.clone()).neg().sum().div_scalar(bt as f32) };
+ println!("loss {:?}", loss.clone().into_data());
+ let grads = loss.backward();
+ println!("backward done");
+ let xg = x.grad(&grads).unwrap().into_data().try_to_vec::<f32>().unwrap();
+ println!("xg {}", xg[0]);
+}

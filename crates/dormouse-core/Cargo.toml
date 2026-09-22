@@ -16,9 +16,7 @@ burn-engram = { path = "../../../burn-fused/crates/burn-engram" }
 burn-rmsnorm = { path = "../../../burn-fused/crates/burn-rmsnorm" }
 burn-jepa = { path = "../../../burn-fused/crates/burn-jepa" }
 burn-dspark = { path = "../../../burn-fused/crates/burn-dspark", features = ["training"] }
-burn-sct = { path = "../../../burn-fused/crates/burn-sct" }
 burn-spectral = { path = "../../../burn-fused/crates/burn-spectral" }
-half = { version = "2.5", features = ["num-traits"] }
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
@@ -42,7 +40,6 @@ cuda = [
     "burn-msa/cuda",
     "burn-msa/autodiff",
     "burn-spectral/cuda",
-    "burn-sct/cuda",
     "burn-rmsnorm/cuda",
     "dep:burn-cubecl",
     "dep:cubecl",

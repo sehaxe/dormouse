@@ -207,7 +207,10 @@ impl DormouseModel {
     /// teacher latent was supplied. `teacher_latent` is either the live EMA
     /// teacher's out_acc (online) or a precomputed frozen target (offline);
     /// both are detached here - the latent is a stop-grad target.
-    fn aux_loss<B: burn::backend::AutodiffBackend>(
+    ///
+    /// Public so the fused path can run the aux heads on the burn path from
+    /// the op's exposed latents (out_acc, h) - the flagship wiring.
+    pub fn aux_loss<B: burn::backend::AutodiffBackend>(
         &self,
         student_latent: &Tensor<3>,
         teacher_latent: Option<Tensor<3>>,

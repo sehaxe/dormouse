@@ -1,11 +1,9 @@
 //! param - TSCT linear via burn-sct SpectralLinear, pad to multiple of 4,
 //! NM knob, BF16 env (mirrors aria semantics; fresh mini composition)
 use burn::module::Module;
-use burn::nn::LinearConfig;
 use burn::tensor::{Device, DispatchTensor, Tensor};
 use burn::backend::DispatchKindConversion;
 use burn_spectral::SpectralLinear;
-use burn_sct::SctLinear;
 
 /// DM_QUANT_DEBUG, read once per process (queried by every LinearLike
 /// forward otherwise).
@@ -24,7 +22,6 @@ pub struct LinearLike {
 #[derive(Module, Debug)]
 pub enum LinearLikeInner {
     Tsct(SpectralLinear),
-    Sct(SctLinear),
     Dense(burn::nn::Linear),
 }
 
@@ -76,7 +73,6 @@ impl LinearLike {
                     l.forward(x)
                 }
             }
-            LinearLikeInner::Sct(l) => l.forward::<B>(x),
             LinearLikeInner::Dense(l) => l.forward(x),
         };
         // slice back to the real out_features when padded (extra columns are
@@ -104,7 +100,7 @@ impl LinearLike {
     }
 
     /// Polar-retract the TSCT masters U/V to orthonormal (burn-spectral NS,
-    /// on device, keeps autodiff tracking). No-op for dense/sct variants.
+    /// on device, keeps autodiff tracking). No-op for the dense variant.
     /// Without periodic retract the factors drift and the quantized forward
     /// degrades (bf16_KERNEL_PLAN: retract every 1 step, monitor max_ortho).
     pub fn retract(&mut self, iters: usize) {
@@ -113,7 +109,7 @@ impl LinearLike {
         }
     }
 
-    /// Worst-case orthonormality error of the TSCT masters (0 for dense/sct).
+    /// Worst-case orthonormality error of the TSCT masters (0 for dense).
     /// Per-entry metric: the Frobenius `||UᵀU - I||_F` divided by the rank k.
     /// The raw F-norm scales ~k (it sums k² Gram entries), which put the
     /// plan's 1e-3 threshold *below* the NS retract's own convergence floor
@@ -132,22 +128,6 @@ impl LinearLike {
                     .max(burn_spectral::ortho_error(&v) / kv)
             }
             _ => 0.0,
-        }
-    }
-}
-
-impl LinearLike {
-    pub fn dense(in_features: usize, out_features: usize, device: &Device) -> Self {
-        let padded = if !out_features.is_multiple_of(4) && out_features != 1 {
-            out_features.next_multiple_of(4)
-        } else {
-            out_features
-        };
-        Self {
-            inner: LinearLikeInner::Dense(
-                LinearConfig::new(in_features, padded).with_bias(false).init(device),
-            ),
-            out_features,
         }
     }
 }

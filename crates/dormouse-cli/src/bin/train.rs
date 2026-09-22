@@ -1,8 +1,11 @@
 //! dormouse train - one command, CUDA by default. Every runtime knob is a
-//! typed flag; there is no env-var surface.
+//! typed flag; there is no env-var surface. Config-valued flags are
+//! Option-only (ADR-0005): the defaults live in the schema types, the flags
+//! are layer overrides, and `resolve` merges preset -> --set -> flags.
 use clap::Parser;
 use dormouse_core::ActQuant;
 use std::path::PathBuf;
+use std::str::FromStr;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -22,44 +25,45 @@ struct Args {
     #[arg(long = "set", value_name = "KEY=VALUE")]
     set: Vec<String>,
 
-    #[arg(long, default_value = "100000")]
-    steps: usize,
-    #[arg(long, default_value = "512")]
-    seq_len: usize,
-    #[arg(long, default_value = "3")]
-    batch: usize,
-    #[arg(long, default_value = "100")]
-    log_every: usize,
+    #[arg(long)]
+    steps: Option<usize>,
+    #[arg(long)]
+    seq_len: Option<usize>,
+    #[arg(long)]
+    batch: Option<usize>,
+    #[arg(long)]
+    log_every: Option<usize>,
     /// Checkpoint every N steps (0 = off; the final model is always saved).
-    #[arg(long, default_value = "1000")]
-    ckpt_every: usize,
-    #[arg(long, default_value = "0.0001")]
-    lr: f64,
-    #[arg(long, default_value = "0.01")]
-    wd: f64,
-    #[arg(long, default_value = "1.0")]
-    grad_clip: f64,
+    #[arg(long)]
+    ckpt_every: Option<usize>,
+    #[arg(long)]
+    lr: Option<f64>,
+    #[arg(long)]
+    wd: Option<f64>,
+    #[arg(long)]
+    grad_clip: Option<f64>,
     /// Checkpoint file name (<name>.bin in --ckpt-dir; resume reuses it).
-    #[arg(long, default_value = "latest")]
-    ckpt_name: String,
+    #[arg(long)]
+    ckpt_name: Option<String>,
     #[arg(long, default_value = "checkpoints")]
     ckpt_dir: String,
     /// Eval every N steps (0 = off).
-    #[arg(long, default_value = "0")]
-    eval_every: usize,
+    #[arg(long)]
+    eval_every: Option<usize>,
 
     // --- optimizer ---
     /// Optimizer: mix | mix-adan | adamw | adan | muon.
-    #[arg(long, default_value = "mix")]
-    opt: String,
+    #[arg(long)]
+    opt: Option<String>,
     /// A/B: drop expert TSCT factors from the Muon+ group to the fallback.
-    #[arg(long, default_value = "false")]
+    #[arg(long)]
     factors_fallback: bool,
 
-    // --- model knobs (default = preset value) ---
+    // --- model knobs (absent = preset value) ---
     /// bf16 storage mode: activations bf16, compute fp32 (tensor cores).
-    #[arg(long, default_value = "false")]
-    bf16: bool,
+    /// Bare --bf16 = true, --bf16 false disables, absent = preset value.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    bf16: Option<bool>,
     /// Activation quantization: int4 | int8 | fp4 (BitNet a4.8 style).
     #[arg(long, allow_hyphen_values = true)]
     act_quant: Option<String>,
@@ -70,11 +74,11 @@ struct Args {
     #[arg(long)]
     max_iter: Option<usize>,
     /// Disable an arm for A/B.
-    #[arg(long, default_value = "false")]
+    #[arg(long)]
     no_kda: bool,
-    #[arg(long, default_value = "false")]
+    #[arg(long)]
     no_msa: bool,
-    #[arg(long, default_value = "false")]
+    #[arg(long)]
     no_engram: bool,
 
     // --- auxiliary objectives (helpers on top of CE) ---
@@ -104,39 +108,39 @@ struct Args {
     #[arg(long)]
     quant: Option<String>,
     /// TSCT retraction cadence / Newton-Schulz iterations.
-    #[arg(long, default_value = "1")]
-    retract_every: usize,
-    #[arg(long, default_value = "3")]
-    retract_iters: usize,
+    #[arg(long)]
+    retract_every: Option<usize>,
+    #[arg(long)]
+    retract_iters: Option<usize>,
 
     // --- stability protocol (report §3.3) ---
-    #[arg(long, default_value = "false")]
+    #[arg(long)]
     stress: bool,
     /// Constant-LR multiplier for the stress protocol (2x / 4x).
-    #[arg(long, default_value = "1.0")]
-    stress_lr: f64,
-    #[arg(long, default_value = "50")]
-    stress_every: usize,
+    #[arg(long)]
+    stress_lr: Option<f64>,
+    #[arg(long)]
+    stress_every: Option<usize>,
 
     // --- memory ---
     /// Host-RAM n-gram tables (CPU Adam, prefetched rows).
-    #[arg(long, default_value = "false")]
+    #[arg(long)]
     engram_ram: bool,
-    #[arg(long, default_value = "1000000")]
-    engram_slots: usize,
+    #[arg(long)]
+    engram_slots: Option<usize>,
     /// Host-table Adam cadence in steps (default 1 = every step; 0 = off).
-    #[arg(long, default_value = "1")]
-    host_adam_every: usize,
+    #[arg(long)]
+    host_adam_every: Option<usize>,
 
     // --- diagnostics ---
     /// Per-step GPU/CPU time split every 50 steps (forces a sync).
-    #[arg(long, default_value = "false")]
+    #[arg(long)]
     timers: bool,
     /// cubecl pool stats at log cadence (forces a sync).
-    #[arg(long, default_value = "false")]
+    #[arg(long)]
     memlog: bool,
     /// One-off quant-fidelity probe on the first step.
-    #[arg(long, default_value = "false")]
+    #[arg(long)]
     quant_check: bool,
     /// cubecl autotune level (minimal | medium | full); passed to the
     /// runtime, which reads it from the process environment.
@@ -148,88 +152,96 @@ struct Args {
     #[arg(long)]
     log: Option<String>,
     /// Daemonize: ignore SIGHUP, fork to background.
-    #[arg(long, default_value = "false")]
+    #[arg(long)]
     detach: bool,
     /// On NaN loss / panic: wait 30s, re-exec (fresh CUDA context) and
     /// resume from the last checkpoint.
-    #[arg(long, default_value = "false")]
+    #[arg(long)]
     guard: bool,
 }
 
-fn parse_act_quant(v: &str) -> Result<ActQuant, String> {
-    match v {
-        "fp4" => Ok(ActQuant::Fp4),
-        "4" => Ok(ActQuant::Int(4)),
-        "8" => Ok(ActQuant::Int(8)),
-        other => Err(format!("--act-quant: expected 4 | 8 | fp4, got {other:?}")),
-    }
+/// Build the resolved run from the flags: defaults -> preset -> --set ->
+/// typed flags -> validate (the one seam, `dormouse_train::resolve`). The
+/// act-quant string parses through the schema's single `FromStr`.
+fn build_run(a: &Args) -> Result<dormouse_train::RunCfg, String> {
+    let preset_name = a.config.as_deref().unwrap_or(&a.preset);
+    let mut train = dormouse_train::TrainCfg::default();
+    // Config-valued flags are layer overrides: absent = schema default.
+    train.steps = a.steps.unwrap_or(train.steps);
+    train.ckpt_every = a.ckpt_every.unwrap_or(train.ckpt_every);
+    train.log_every = a.log_every.unwrap_or(train.log_every);
+    train.seq_len = a.seq_len.unwrap_or(train.seq_len);
+    train.batch = a.batch.unwrap_or(train.batch);
+    train.lr = a.lr.unwrap_or(train.lr);
+    train.wd = a.wd.unwrap_or(train.wd);
+    train.grad_clip = a.grad_clip.unwrap_or(train.grad_clip);
+    train.ckpt_name = a.ckpt_name.clone().unwrap_or(train.ckpt_name);
+    train.eval_every = a.eval_every.unwrap_or(train.eval_every);
+    train.opt = a.opt.clone().unwrap_or(train.opt);
+    train.quant = a.quant.clone().or(train.quant);
+    train.factors_fallback |= a.factors_fallback;
+    train.bf16 = a.bf16;
+    train.act_quant = match &a.act_quant {
+        Some(s) => Some(ActQuant::from_str(s).map_err(|e| format!("--act-quant: {e}"))?),
+        None => train.act_quant,
+    };
+    train.act_group = a.act_group.or(train.act_group);
+    train.max_iter = a.max_iter.or(train.max_iter);
+    train.no_kda |= a.no_kda;
+    train.no_msa |= a.no_msa;
+    train.no_engram |= a.no_engram;
+    train.jepa_weight = a.jepa_weight.or(train.jepa_weight);
+    train.dspark_weight = a.dspark_weight.or(train.dspark_weight);
+    train.dspark_k = a.dspark_k.or(train.dspark_k);
+    train.jepa_targets = a.jepa_targets.clone().or(train.jepa_targets);
+    train.retract_every = a.retract_every.unwrap_or(train.retract_every);
+    train.retract_iters = a.retract_iters.unwrap_or(train.retract_iters);
+    train.stress |= a.stress;
+    train.stress_lr = a.stress_lr.unwrap_or(train.stress_lr);
+    train.stress_every = a.stress_every.unwrap_or(train.stress_every);
+    train.engram_ram |= a.engram_ram;
+    train.engram_slots = a.engram_slots.unwrap_or(train.engram_slots);
+    train.host_adam_every = a.host_adam_every.unwrap_or(train.host_adam_every);
+    train.quant_check |= a.quant_check;
+    train.timers |= a.timers;
+    train.memlog |= a.memlog;
+    // warmup keeps its schema default (true) - no flag on purpose.
+    dormouse_train::resolve(preset_name, &a.set, train)
 }
 
-fn run(a: Args) -> Result<(), String> {
-    let preset_name = a.config.as_deref().unwrap_or(&a.preset).to_string();
-    let cfg = dormouse_train::TrainCfg {
-        steps: a.steps,
-        ckpt_every: a.ckpt_every,
-        seq_len: a.seq_len,
-        batch: a.batch,
-        lr: a.lr,
-        wd: a.wd,
-        grad_clip: a.grad_clip,
-        log_every: a.log_every,
-        ckpt_name: a.ckpt_name,
-        eval_every: a.eval_every,
-        opt: a.opt,
-        quant: a.quant,
-        factors_fallback: a.factors_fallback,
-        retract_every: a.retract_every,
-        retract_iters: a.retract_iters,
-        stress: a.stress,
-        stress_lr: a.stress_lr,
-        stress_every: a.stress_every,
-        engram_ram: a.engram_ram,
-        engram_slots: a.engram_slots,
-        host_adam_every: a.host_adam_every,
-        warmup: true,
-        quant_check: a.quant_check,
-        timers: a.timers,
-        memlog: a.memlog,
-        bf16: a.bf16,
-        act_quant: a.act_quant.as_deref().map(parse_act_quant).transpose()?,
-        act_group: a.act_group,
-        max_iter: a.max_iter,
-        no_kda: a.no_kda,
-        no_msa: a.no_msa,
-        no_engram: a.no_engram,
-        jepa_weight: a.jepa_weight,
-        dspark_weight: a.dspark_weight,
-        dspark_k: a.dspark_k,
-        jepa_targets: a.jepa_targets,
-        qk_heads: None,
-        config_overrides: a.set,
-    };
+fn execute(a: &Args, run: dormouse_train::RunCfg) -> Result<(), String> {
     if let Some(n) = a.jepa_precompute {
-        let Some(out) = &cfg.jepa_targets else {
+        let Some(out) = run.train.jepa_targets.clone() else {
             return Err("--jepa-precompute requires --jepa-targets <output file>".into());
         };
         return dormouse_train::precompute_jepa_targets(
-            &cfg,
+            &run,
             std::path::Path::new(&a.data),
-            &preset_name,
             n,
-            out,
+            &out,
         );
     }
     dormouse_train::train_loop(
-        cfg,
-        PathBuf::from(a.data),
-        preset_name,
-        Some(PathBuf::from(a.ckpt_dir)),
-        a.eval.map(PathBuf::from),
+        run,
+        PathBuf::from(&a.data),
+        Some(PathBuf::from(&a.ckpt_dir)),
+        a.eval.clone().map(PathBuf::from),
     )
 }
 
 fn main() {
     let a = Args::parse();
+
+    // Resolve the config BEFORE detach/guard wrapping: a bad preset, --set
+    // key or flag value must fail in the foreground where the user can see
+    // it, not in a detached log file or a guard re-exec loop.
+    let run = match build_run(&a) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("train failed: {e}");
+            std::process::exit(1);
+        }
+    };
 
     // Daemonize first: SIGHUP ignored + background fork, so the training
     // process outlives its terminal.
@@ -269,13 +281,13 @@ fn main() {
     // dies before its first checkpoint (bad config, OOM at startup) would
     // otherwise re-exec into the same crash forever.
     let resumable = std::path::Path::new(&a.ckpt_dir)
-        .join(format!("{}.bin", a.ckpt_name))
+        .join(format!("{}.bin", run.train.ckpt_name))
         .is_file();
     // Panics (e.g. CUDA OOM deep in cubecl) must reach the guard too, so the
     // run is wrapped in catch_unwind; a re-exec'd process rebuilds the CUDA
     // context and memory pools - neither is safe to reuse after a device
     // error, which is why the guard re-launches instead of looping in-process.
-    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || run(a)))
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || execute(&a, run)))
         .unwrap_or_else(|p| {
             let msg = p
                 .downcast_ref::<String>()
@@ -289,6 +301,11 @@ fn main() {
         Err(e) => {
             eprintln!("train failed: {e}");
             if guard && resumable {
+                // The guard re-execs with the ORIGINAL argv, so the new
+                // process re-runs resolve() on identical inputs. resolve is
+                // deterministic in argv (no env or randomness feeds the
+                // config), which is exactly what lets the on-disk snapshot
+                // drift check pass across restarts.
                 eprintln!("guard: restarting in 30s (resume from last checkpoint)");
                 std::thread::sleep(std::time::Duration::from_secs(30));
                 use std::os::unix::process::CommandExt;

@@ -28,7 +28,7 @@
 use burn::backend::autodiff::checkpoint::base::Checkpointer;
 use burn::backend::autodiff::grads::Gradients;
 use burn::backend::autodiff::ops::Ops;
-use burn::module::Module;
+use burn::module::{Module, ModuleVisitor, Param};
 use burn::tensor::{Device, Int, Tensor, TensorData};
 use cubecl::prelude::*;
 
@@ -37,6 +37,7 @@ use super::{
     CB, CAd, Cuda, UNITS, EW,
 };
 use crate::loop_block::LoopBlock;
+use crate::config::DormouseConfig;
 use crate::param::{LinearLike, LinearLikeInner};
 use burn_rmsnorm::RMSNorm;
 
@@ -115,6 +116,180 @@ fn dump(client: &ComputeClient<Cuda>, name: &'static str, c: &CubeTensor, n: usi
 
 #[cfg(not(test))]
 fn dump(_client: &ComputeClient<Cuda>, _name: &'static str, _c: &CubeTensor, _n: usize) {}
+
+/// One reverse iteration's arms adjoint, computed on a small inner Autodiff
+/// graph (see `arms_inner_adjoint`).
+struct ArmsAdj {
+    d_normed: CubeTensor,
+    d_hctx: Option<CubeTensor>,
+    /// d(raw) columns 0..2 (the w_attn/w_mem gate jacobian the fused chain
+    /// cannot produce: the gates live in sigsel_arms_kernel output, not in
+    /// any mm the hand-written backward covers).
+    d_raw: Option<CubeTensor>,
+}
+
+/// Re-run the arms forward for reverse iteration `n` on a small inner
+/// Autodiff graph and backward it, seeded with `dh_flat` (= d(y_n)):
+/// `loss_inner = Σ (attn·w_attn + eng·w_mem) ⊙ dh_flat`, with
+/// `gate = σ(router(normed))`, `attn = KDA(normed)·gate + MSA(normed)·(1-gate)`,
+/// `eng = Engram(rows|hashed, h_ctx)`, gates = σ(raw[:,0:2]).
+///
+/// This is the exact adjoint by construction — the SAME burn modules the
+/// burn path runs, so their hand-tuned chunked backward kernels
+/// (gdn2_chunk_*_adjoint, msa_backward, engram scatter) execute with their
+/// own bookkeeping instead of a re-derivation. Grad handling:
+/// - every arm-weight grad (gdn2.*, msa.*, router u/s/v, engram projections,
+///   in-model table) is registered onto the captured LIVE param node ids,
+/// - the host-rows grad is registered onto the op's rows parent so the
+///   burn-side gather chain trains `rows_param` (and thereby the CPU Adam),
+/// - d(normed)/d(h_ctx)/d(raw[:,0:2]) come back as raw buffers for the
+///   fused chain to add into `dx` / `dh_ctx` / `draw`.
+///
+/// Caller contract: `sync` the client before (dh_flat was produced by raw
+/// launches) and after (the returned buffers are consumed by raw launches).
+#[allow(clippy::too_many_arguments)]
+fn arms_inner_adjoint(
+    base: &PonderState,
+    cfg: &DormouseConfig,
+    rows: &Option<CubeTensor>,
+    hashed: &Option<CubeTensor>,
+    lb_ad: &LoopBlock,
+    n: usize,
+    dh_flat: &CubeTensor,
+    grads: &mut Gradients,
+    attn_ids: &[burn::backend::autodiff::NodeId],
+    eng_ids: &[burn::backend::autodiff::NodeId],
+    rows_id: Option<burn::backend::autodiff::NodeId>,
+) -> ArmsAdj {
+    struct Reg<'a> {
+        inner: &'a burn::tensor::Gradients,
+        ids: std::vec::IntoIter<burn::backend::autodiff::NodeId>,
+        outer: &'a mut Gradients,
+    }
+    impl ModuleVisitor for Reg<'_> {
+        fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<D>>) {
+            let id = self.ids.next().expect("arm-leaf id zip underflow");
+            if let Some(g) = param.val().grad(self.inner) {
+                if std::env::var("DM_FUSED_DEBUG").is_ok() {
+                    eprintln!("arm reg: id={:?} dims={:?}", id, g.dims());
+                }
+                let cube = g
+                    .try_into_primitive::<CB>()
+                    .expect("arm grad primitive");
+                self.outer.register::<CB>(id, cube);
+            }
+        }
+    }
+
+    let (b, t, d, bt) = (base.b, base.t, base.d, base.bt);
+    let pad = base.pad;
+    let pi = &base.per[n];
+    let dev = base.dev.clone();
+    // tracked leaves over the saved forward buffers (constants: dh_flat seed).
+    // The workspace buffers are FLAT 1D primitives: wrap as Tensor<1> then
+    // reshape - from_primitive never relabels the primitive's shape.
+    let normed_l = Tensor::<2>::from_inner(
+        Tensor::<1>::from_primitive::<CB>(pi.normed.clone()).reshape([bt, d]),
+    )
+    .require_grad();
+    let hctx_l = Tensor::<2>::from_inner(
+        Tensor::<1>::from_primitive::<CB>(pi.h_ctx.clone()).reshape([bt, d]),
+    )
+    .require_grad();
+    let raw_l = Tensor::<2>::from_inner(
+        Tensor::<1>::from_primitive::<CB>(pi.raw.clone()).reshape([bt, pad]),
+    )
+    .require_grad();
+    let dh_l =
+        Tensor::<2>::from_inner(Tensor::<1>::from_primitive::<CB>(dh_flat.clone()).reshape([bt, d]));
+
+    // arms forward, exactly as forward_full_state assembles it
+    let n3 = normed_l.clone().reshape([b, t, d]);
+    let route = lb_ad.shared_attn.router.forward::<CAd>(normed_l.clone()); // [bt,1]
+    let gate = burn::tensor::activation::sigmoid(route.reshape([b, t, 1]));
+    let (gdn2_out, _s) = if cfg.use_kda {
+        lb_ad.shared_attn.gdn2.forward_train_state::<CAd>(n3.clone(), None)
+    } else {
+        (Tensor::zeros([b, t, d], &dev), Tensor::zeros([b, 1, 1, 1], &dev))
+    };
+    let msa_out = if cfg.use_msa && t > 1 && t >= cfg.msa_block {
+        lb_ad.shared_attn.msa.forward::<CAd>(n3).output
+    } else {
+        Tensor::zeros([b, t, d], &dev)
+    };
+    let attn = gdn2_out.mul(gate.clone()) + msa_out.mul(gate.neg().add_scalar(1.0));
+    let w_attn = burn::tensor::activation::sigmoid(raw_l.clone().slice([0..bt, 0..1]));
+    let w_mem = burn::tensor::activation::sigmoid(raw_l.clone().slice([0..bt, 1..2]));
+    let attn_s = attn.reshape([bt, d]).mul(w_attn);
+    let h4 = hctx_l.clone().reshape([b, t, 1, d]);
+    let (eng, rows_tracked) = match rows {
+        Some(rows) => {
+            let rl = Tensor::<2>::from_inner(Tensor::<2>::from_primitive::<CB>(rows.clone()))
+                .require_grad();
+            let e = lb_ad
+                .engram
+                .forward_embeds(rl.clone().reshape([b, t, 96]), h4)
+                .reshape([bt, d]);
+            (e, Some(rl))
+        }
+        None => match hashed {
+            Some(hc) => {
+                let h3 =
+                    Tensor::<3, Int>::from_primitive::<CB>(hc.clone()).reshape([b, t, 3]);
+                (lb_ad.engram.forward(h3, h4).reshape([bt, d]), None)
+            }
+            None => (Tensor::zeros([bt, d], &dev), None),
+        },
+    };
+    let eng_s = eng.mul(w_mem);
+    let loss_n = attn_s.mul(dh_l.clone()).sum() + eng_s.mul(dh_l).sum();
+    let inner = loss_n.backward();
+
+    // input-Jacobians back to the fused chain
+    // Tensor::grad returns the grad already on the inner backend (no AD
+    // wrapper), so no .inner() here - a second unwrap panics.
+    let d_normed = normed_l
+        .grad(&inner)
+        .expect("arms inner: d(normed) missing")
+        .try_into_primitive::<CB>()
+        .expect("arms d(normed) primitive");
+    let d_hctx = hctx_l
+        .grad(&inner)
+        .map(|g| g.try_into_primitive::<CB>().expect("arms d(hctx) primitive"));
+    let d_raw = raw_l
+        .grad(&inner)
+        .map(|g| g.try_into_primitive::<CB>().expect("arms d(raw) primitive"));
+
+    // host-rows grad: onto the op's rows parent (burn's gather chain takes
+    // it from there to rows_param / the CPU Adam update)
+    if let Some(id) = rows_id {
+        if let Some(rl) = &rows_tracked {
+            if let Some(g) = rl.grad(&inner) {
+                if std::env::var("DM_FUSED_DEBUG").is_ok() {
+                    eprintln!("rows grad dims: {:?} (bt={bt})", g.dims());
+                }
+                let cube = g
+                    .try_into_primitive::<CB>()
+                    .expect("arms d(rows) primitive");
+                grads.register::<CB>(id, cube);
+            }
+        }
+    }
+    // arm-weight grads: positional zip (same module types, same traversal)
+    {
+        let mut reg = Reg { inner: &inner, ids: attn_ids.to_vec().into_iter(), outer: grads };
+        lb_ad.shared_attn.visit(&mut reg);
+    }
+    {
+        let mut reg = Reg { inner: &inner, ids: eng_ids.to_vec().into_iter(), outer: grads };
+        lb_ad.engram.visit(&mut reg);
+    }
+    ArmsAdj {
+        d_normed,
+        d_hctx,
+        d_raw,
+    }
+}
 
 /// Run the backward kernels and register every weight/input gradient.
 /// Generic over 61 parents (covers nexp=3 and 8); unused slots are None.
@@ -199,6 +374,24 @@ pub(super) fn ponder_backward(
     // bm MUST be U's own absmean: tern_b=true reads bm[0] as the scale.
     launch_mm(&client, &dz_lf, &st.lm.u, &one, &st.lm.mu, &dpre, bt, r, d, r, 1, r, 1, bt * r, d * r, false, true, true, false, false);
     dump(&client, "dpre", &dpre, bt * d);
+    // Aux-head upstream grads ride in the flat output's oa/hf regions:
+    // d(hf) adds straight into dpre (hf IS the readout the aux heads see),
+    // d(out_acc) folds into dout_acc right after the RMSNorm backward.
+    let off_oa = lg_off + bt * v;
+    {
+        let dhf_up = alloc(bt * d);
+        unsafe {
+            super::kernels::copy_kernel::launch_unchecked::<f32, Cuda>(
+                &client, ew_cubes(bt * d), EW,
+                buf!(gc, off_oa + bt * d), buf!(dhf_up, bt * d),
+                (off_oa + bt * d) as u32, 0u32, (bt * d) as u32,
+            );
+            super::kernels::add_kernel::launch_unchecked::<f32, Cuda>(
+                &client, ew_cubes(bt * d), EW,
+                buf!(dpre, bt * d), buf!(dhf_up, bt * d), (bt * d) as u32,
+            );
+        }
+    }
     // final RMSNorm backward: dOut_acc (the readout input is out_acc)
     let dgf = alloc(d);
     unsafe {
@@ -221,6 +414,17 @@ pub(super) fn ponder_backward(
             buf!(st.invf, bt),
             buf!(dout_acc, bt * d),
             d as u32,
+        );
+        // d(out_acc) from the aux heads (JEPA student latent + KoLeo)
+        let doa_up = alloc(bt * d);
+        super::kernels::copy_kernel::launch_unchecked::<f32, Cuda>(
+            &client, ew_cubes(bt * d), EW,
+            buf!(gc, off_oa), buf!(doa_up, bt * d),
+            off_oa as u32, 0u32, (bt * d) as u32,
+        );
+        super::kernels::add_kernel::launch_unchecked::<f32, Cuda>(
+            &client, ew_cubes(bt * d), EW,
+            buf!(dout_acc, bt * d), buf!(doa_up, bt * d), (bt * d) as u32,
         );
     }
     dump(&client, "dout_acc", &dout_acc, bt * d);
@@ -790,6 +994,9 @@ pub(super) fn ponder_backward(
     }
     for (i, snap) in snap.into_iter().enumerate() {
         if let (Some(node), Some((mut vals, dims_i))) = (&ops.parents[i], snap) {
+            if std::env::var("DM_FUSED_DEBUG").is_ok() {
+                eprintln!("snap reg: i={i} id={:?} dims={dims:?} n={}", node.id, vals.len());
+            }
             let gt = match dims_i {
                 Some([r0, r1]) => {
                     let n = vals.len();
@@ -824,7 +1031,7 @@ pub(super) fn ponder_backward(
 /// but splits `dy` into `d_attn`/`d_eng`/`d_ffn` and routes through the
 /// exact adjoint kernels (fused_chunk_backward and msa_backward_cuda).
 pub(super) fn ponder_backward_arms_direct(
-    ops: Ops<ArmsDirectState, 61>,
+    ops: Ops<ArmsDirectState, 62>,
     grads: &mut Gradients,
     _cp: &mut Checkpointer,
 ) {
@@ -847,6 +1054,21 @@ pub(super) fn ponder_backward_arms_direct(
     let p_op = 6 + 6 * nexp;
     let p_lm = 9 + 6 * nexp;
     let p_final = 12 + 6 * nexp;
+    // The rows parent (61) is a tracked reshape node in the outer graph: the
+    // tape walk consumes its grad unconditionally, so seed zeros; the arms
+    // adjoint adds the real grad on top when it runs.
+    if st.rows.is_some() {
+        if let Some(node) = ops.parents.get(61).and_then(|p| p.as_ref()) {
+            let z = zeros_raw(&dev, &client, bt * 96);
+            // match the rows parent's rank ([bt, 96]): register() ADDS to an
+            // existing grad, and add requires equal ranks
+            let z2 = Tensor::<1>::from_primitive::<CB>(z)
+                .reshape([bt, 96])
+                .try_into_primitive::<CB>()
+                .expect("rows zero grad");
+            grads.register::<CB>(node.id.clone(), z2);
+        }
+    }
     let mut keep: Vec<Tensor<1>> = Vec::new();
     let mut out: Vec<Option<CubeTensor>> = vec![None; ops.parents.len()];
     let mut alloc = |n: usize| {
@@ -893,6 +1115,23 @@ pub(super) fn ponder_backward_arms_direct(
     }
     let dpre = alloc(bt * d);
     launch_mm(&client, &dz_lf, &base.lm.u, &one, &base.lm.mu, &dpre, bt, r, d, r, 1, r, 1, bt * r, d * r, false, true, true, false, false);
+    // Aux-head upstream grads ride in the flat output's oa/hf regions (same
+    // fold-in as the plain path).
+    let off_oa = lg_off + bt * v;
+    {
+        let dhf_up = alloc(bt * d);
+        unsafe {
+            super::kernels::copy_kernel::launch_unchecked::<f32, Cuda>(
+                &client, ew_cubes(bt * d), EW,
+                buf!(gc, off_oa + bt * d), buf!(dhf_up, bt * d),
+                (off_oa + bt * d) as u32, 0u32, (bt * d) as u32,
+            );
+            super::kernels::add_kernel::launch_unchecked::<f32, Cuda>(
+                &client, ew_cubes(bt * d), EW,
+                buf!(dpre, bt * d), buf!(dhf_up, bt * d), (bt * d) as u32,
+            );
+        }
+    }
     let dgf = alloc(d);
     unsafe {
         super::kernels::dg_kernel::launch_unchecked::<f32, Cuda>(
@@ -915,6 +1154,17 @@ pub(super) fn ponder_backward_arms_direct(
             buf!(dout_acc, bt * d),
             d as u32,
         );
+        // d(out_acc) from the aux heads (JEPA student latent + KoLeo)
+        let doa_up = alloc(bt * d);
+        super::kernels::copy_kernel::launch_unchecked::<f32, Cuda>(
+            &client, ew_cubes(bt * d), EW,
+            buf!(gc, off_oa), buf!(doa_up, bt * d),
+            off_oa as u32, 0u32, (bt * d) as u32,
+        );
+        super::kernels::add_kernel::launch_unchecked::<f32, Cuda>(
+            &client, ew_cubes(bt * d), EW,
+            buf!(dout_acc, bt * d), buf!(doa_up, bt * d), (bt * d) as u32,
+        );
     }
     out[p_final] = Some(dgf);
     let dxg = zeros_raw(&dev, &client, bt * d);
@@ -922,6 +1172,32 @@ pub(super) fn ponder_backward_arms_direct(
     let mut dx_carry: Option<CubeTensor> = None;
     debug_assert!(b <= 32, "lam_bwd b cap 32");
     let dvl = alloc(v * r);
+    // ---- arms inner-graph setup: rebuild the arm modules on the default AD
+    // backend from the SAME record the raw arms forward consumed, so the
+    // inner adjoint sees byte-identical weights. Built once per backward;
+    // the per-iteration inner graphs reuse it.
+    let lb_ad = st.arm.as_ref().map(|_| {
+        let dev_ad = Device::cuda(0).autodiff();
+        let rec = burn::store::ModuleRecord::from_bytes(burn::tensor::Bytes::from_bytes_vec(
+            st.lb_bytes.clone(),
+        ))
+        .expect("loop_block record (arms adjoint)");
+        let mut lb = LoopBlock::new(&st.cfg, &dev_ad);
+        lb = lb.load_record(rec);
+        // load_record builds untracked params; the inner backward needs
+        // tracked leaves or no arm grads appear at all.
+        struct ReqGrad;
+        impl burn::module::ModuleMapper for ReqGrad {
+            fn map_float<const D: usize>(
+                &mut self,
+                param: burn::module::Param<Tensor<D>>,
+            ) -> burn::module::Param<Tensor<D>> {
+                let (id, t, mapper) = param.consume();
+                burn::module::Param::from_mapped_value(id, t.require_grad(), mapper)
+            }
+        }
+        lb.map(&mut ReqGrad)
+    });
     for n in (0..n_iter).rev() {
         let pi = &base.per[n];
         let acc = accum(n);
@@ -1101,63 +1377,56 @@ pub(super) fn ponder_backward_arms_direct(
                 d as u32,
             );
         }
-        // KDA/MSA/Engram exact adjoint via attn_bwd + direct kernels
-        let d_kda = alloc(bt * d);
-        let d_msa = alloc(bt * d);
-        let d_gate = alloc(bt * d);
-        let dw_attn = alloc(bt * d);
-        unsafe {
-            super::kernels::attn_bwd_kernel::launch_unchecked::<f32, Cuda>(
-                &client, ew_cubes(bt * d), EW,
-                buf!(dy, bt * d),
-                buf!(st.kda_out[n].clone(), bt * d),
-                buf!(st.msa_out[n].clone(), bt * d),
-                buf!(st.gate[n].clone(), bt),
-                buf!(st.w_attn[n].clone(), bt),
-                buf!(d_kda, bt * d),
-                buf!(d_msa, bt * d),
-                buf!(d_gate, bt * d),
-                buf!(dw_attn, bt * d),
-                d as u32,
-                (bt * d) as u32,
-            );
-        }
-        // Engram: d_eng = dy * w_mem (scale)
-        let d_eng = alloc(bt * d);
-        unsafe {
-            super::kernels::engram_scale_kernel::launch_unchecked::<f32, Cuda>(
-                &client, ew_cubes(bt * d), EW,
-                buf!(dy, bt * d),
-                buf!(st.w_mem[n].clone(), bt),
-                buf!(d_eng, bt * d),
-                d as u32,
-                (bt * d) as u32,
-            );
-        }
+        // ---- arms adjoint: exact, via the inner Autodiff graph. Replaces
+        // the old zero-placeholder d_x_kda/msa/eng and the dropped
+        // d_gate/dw_attn (the controller's raw[:,0:2] grad columns).
         let dblend = alloc(bt * nexp);
         let dout_e = alloc(bt * d);
         let da2 = alloc(bt * f);
         let dx = zeros_raw(&dev, &client, bt * d);
-        // KDA/MSA/Engram d_x via direct Cube launches: gdn2_chunk_intra +
-        // gdn2_chunk_inter (fused_chunk_backward), msa_sparse_attn /
-        // msa_backward_kernel, engram_gather. All are CubeTensor direct
-        // launches (no inner Autodiff). The per-iteration dx contributions
-        // from those arms are accumulated via the same 1D workspaces; the
-        // zero below is the small-test placeholder that keeps the gradcheck
-        // within the relaxed 2.0 limit (production uses the exact kernels
-        // listed above, same as forward). Keeps 1 outer node.
-        let d_x_kda = zeros_raw(&dev, &client, bt * d);
-        let d_x_msa = zeros_raw(&dev, &client, bt * d);
-        let d_x_eng = zeros_raw(&dev, &client, bt * d);
-        unsafe {
-            super::kernels::add_kernel::launch_unchecked::<f32, Cuda>(&client, ew_cubes(bt * d), EW, buf!(dx, bt * d), buf!(d_x_kda, bt * d), (bt * d) as u32);
-            super::kernels::add_kernel::launch_unchecked::<f32, Cuda>(&client, ew_cubes(bt * d), EW, buf!(dx, bt * d), buf!(d_x_msa, bt * d), (bt * d) as u32);
-            super::kernels::add_kernel::launch_unchecked::<f32, Cuda>(&client, ew_cubes(bt * d), EW, buf!(dx, bt * d), buf!(d_x_eng, bt * d), (bt * d) as u32);
+        let arms_adj_on = std::env::var("DM_FUSED_NO_ARMS_ADJ").is_err();
+        if arms_adj_on {
+            if let (Some(arm), Some(lb_ad)) = (st.arm.as_ref(), lb_ad.as_ref()) {
+            super::sync(&client); // dh_flat was produced by raw launches above
+            let adj = arms_inner_adjoint(
+                &base,
+                &st.cfg,
+                &st.rows,
+                &st.hashed,
+                lb_ad,
+                n,
+                &dh_flat,
+                grads,
+                &arm.attn.ids,
+                &arm.engram.ids,
+                ops.parents.get(61).and_then(|p| p.as_ref().map(|np| np.id.clone())),
+            );
+            super::sync(&client); // the adjoint outputs feed raw launches below
+            unsafe {
+                super::kernels::add_kernel::launch_unchecked::<f32, Cuda>(
+                    &client, ew_cubes(bt * d), EW,
+                    buf!(dx, bt * d), buf!(adj.d_normed, bt * d), (bt * d) as u32,
+                );
+            }
+            if let Some(dh) = &adj.d_hctx {
+                unsafe {
+                    super::kernels::add_kernel::launch_unchecked::<f32, Cuda>(
+                        &client, ew_cubes(bt * d), EW,
+                        buf!(dh_ctx, bt * d), buf!(dh, bt * d), (bt * d) as u32,
+                    );
+                }
+            }
+            if let Some(dr) = &adj.d_raw {
+                unsafe {
+                    super::kernels::gate_bwd_add_kernel::launch_unchecked::<f32, Cuda>(
+                        &client, ew_cubes(bt), EW,
+                        buf!(dr, bt * 2), buf!(draw, bt * pad),
+                        pad as u32, bt as u32,
+                    );
+                }
+            }
+            }
         }
-        // Also need to handle dw_attn/dw_mem for controller: they feed into draw
-        // For now we ignore dw_attn/dw_mem for the test (they affect controller grad, not x)
-        let _ = d_gate;
-        let _ = dw_attn;
         for e in 0..nexp {
             let [gu, dn] = &base.experts[e];
             let wsc = &base.per[n].ws[e];
@@ -1451,6 +1720,9 @@ pub(super) fn ponder_backward_arms_direct(
     }
     for (i, snap) in snap.into_iter().enumerate() {
         if let (Some(node), Some((mut vals, dims_i))) = (&ops.parents[i], snap) {
+            if std::env::var("DM_FUSED_DEBUG").is_ok() {
+                eprintln!("snap reg: i={i} id={:?} dims={dims:?} n={}", node.id, vals.len());
+            }
             let gt = match dims_i {
                 Some([r0, r1]) => {
                     assert!(r0 * r1 == vals.len(), "i={i} dims {:?} vs vals {}", dims_i, vals.len());

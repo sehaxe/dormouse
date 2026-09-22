@@ -1,7 +1,0 @@
-[package]
-name = "dormouse-bench"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-[dependencies]
-dormouse-core = { path = "../dormouse-core" }

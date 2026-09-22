@@ -1178,6 +1178,18 @@ pub fn reduce_dw_kernel<F: Float>(part: &[F], out: &mut [F], d: u32, bt: u32) {
     }
 }
 
+/// draw[row·pad + c] += g[row·2 + c] for c in 0..2: the w_attn/w_mem gate
+/// columns of the controller-raw grad, produced by the arms inner graph.
+#[cube(launch_unchecked)]
+pub fn gate_bwd_add_kernel<F: Float>(g: &[F], draw: &mut [F], pad: u32, bt: u32) {
+    let row = CUBE_POS_X as usize * 256usize + UNIT_POS_X as usize;
+    if row < bt as usize {
+        let p = pad as usize;
+        draw[row * p] += g[row * 2];
+        draw[row * p + 1] += g[row * 2 + 1];
+    }
+}
+
 /// silu elementwise.
 #[cube(launch_unchecked)]
 pub fn silu_kernel<F: Float>(a: &[F], out: &mut [F], n: u32) {
@@ -1405,6 +1417,24 @@ pub mod arms {
         let h_t = Tensor::<1, Int>::from_primitive::<CB>(hashed.clone()).reshape([b, t, nhash]);
         let hs_t = Tensor::<1>::from_primitive::<CB>(hidden.clone()).reshape([b, t, 1, d]);
         let out_t = engram.forward(h_t, hs_t); // [b,t,1,d]
+        out_t.reshape([b * t * d]).try_into_primitive::<CB>().expect("eng cube")
+    }
+
+    /// Direct Engram forward from pre-assembled host rows (RAM offload):
+    /// `embeds` is the bare [b, t, 3·dim] gather the trainer copied to the
+    /// GPU, `hidden` is the flat [b·t·d] h_ctx. Mirrors
+    /// `EngramModule::forward_embeds` on the bare backend.
+    pub fn engram_forward_embeds_cube(
+        engram: &burn_engram::EngramModule,
+        embeds: &CubeTensor,
+        hidden: &CubeTensor,
+        b: usize,
+        t: usize,
+        d: usize,
+    ) -> CubeTensor {
+        let e_t = Tensor::<1>::from_primitive::<CB>(embeds.clone()).reshape([b, t, 3 * 32]);
+        let hs_t = Tensor::<1>::from_primitive::<CB>(hidden.clone()).reshape([b, t, 1, d]);
+        let out_t = engram.forward_embeds(e_t, hs_t); // [b,t,1,d]
         out_t.reshape([b * t * d]).try_into_primitive::<CB>().expect("eng cube")
     }
 

@@ -1,6 +1,7 @@
 //! dormouse-train - CUDA training loop: Autodiff backend, Muon+ mixed
 //! optimizer (see `optim`), burnpack checkpoints with custom name, resume,
 //! opencode harness.
+mod cfg;
 mod jepa_targets;
 mod offload;
 mod optim;
@@ -19,10 +20,14 @@ use burn::{
 
 use dormouse_core::{ActQuant, DormouseConfig, DormouseModel};
 
+pub use cfg::{resolve, RunCfg};
 pub use optim::{
     build_optim, is_engram_table_param, is_muon_param, validate_routing, GroupCounts, MUON_NS_STEPS,
 };
 pub use stress::{grad_norm, StressMonitor};
+
+/// bits per byte from mean cross-entropy (nats).
+pub fn bpb(ce: f32) -> f32 { ce / std::f32::consts::LN_2 }
 
 #[cfg(feature = "cuda")]
 pub type Backend = burn::backend::autodiff::Autodiff<
@@ -39,6 +44,11 @@ compile_error!("dormouse-train: enable a backend feature (cpu or cuda)");
 
 pub type Optim = burn::optim::ModuleOptimizer;
 
+/// The train-layer config. Defaults live ONLY in [`TrainCfg::default`]; the
+/// serde impls fill missing fields from it (ADR-0005), so snapshots and
+/// programmatic construction share one written copy.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct TrainCfg {
     pub steps: usize,
     pub ckpt_every: usize,
@@ -84,8 +94,9 @@ pub struct TrainCfg {
     pub timers: bool,
     /// Print cubecl pool stats at log cadence (forces a sync).
     pub memlog: bool,
-    /// bf16 storage mode (activations bf16, compute fp32).
-    pub bf16: bool,
+    /// bf16 storage override: Some forces the model's bf16 mode, None keeps
+    /// the preset value (the `--set bf16=` layer sits below this).
+    pub bf16: Option<bool>,
     /// Model-config overrides; `None` keeps the preset value.
     pub act_quant: Option<ActQuant>,
     pub act_group: Option<usize>,
@@ -99,17 +110,19 @@ pub struct TrainCfg {
     pub dspark_weight: Option<f32>,
     pub dspark_k: Option<usize>,
     /// Head-wise Muon for the attention Q/K projections: `Some(n_heads)`
-    /// enables the per-head groups (set from the preset in `train_loop`).
+    /// enables the per-head groups (derived from the model config in
+    /// `resolve`, ADR-0005).
     pub qk_heads: Option<usize>,
     /// Offline JEPA targets (precomputed EMA-teacher latents per training
     /// chunk). When set, the hot loop runs NO second teacher forward and no
     /// EMA advance; targets are looked up per batch by chunk hash.
     pub jepa_targets: Option<PathBuf>,
-    /// Generic config overrides from --set key=value (applied on top of preset).
-    pub config_overrides: Vec<String>,
 }
 
 impl Default for TrainCfg {
+    /// The single written copy of the train-layer defaults; the serde
+    /// deserialization (container-level `#[serde(default)]`) fills missing
+    /// fields from this.
     fn default() -> Self {
         Self {
             steps: 100000, ckpt_every: 1000, log_every: 100,
@@ -120,10 +133,10 @@ impl Default for TrainCfg {
             stress: false, stress_lr: 1.0, stress_every: 50,
             engram_ram: false, engram_slots: 1_000_000, host_adam_every: 1,
             warmup: true, quant_check: false, timers: false, memlog: false,
-            bf16: false, act_quant: None, act_group: None, max_iter: None,
+            bf16: None, act_quant: None, act_group: None, max_iter: None,
             no_kda: false, no_msa: false, no_engram: false,
             jepa_weight: None, dspark_weight: None, dspark_k: None,
-            qk_heads: None, jepa_targets: None, config_overrides: Vec::new(),
+            qk_heads: None, jepa_targets: None,
         }
     }
 }
@@ -332,32 +345,6 @@ pub fn load_ckpt(dir: &Path, name: &str, cfg: &DormouseConfig, model: &mut Dormo
     Some(step)
 }
 
-/// Resolve the preset + CLI overrides into the model config (shared by the
-/// train loop and the JEPA target precompute pass).
-fn dorm_config(cfg: &TrainCfg, preset: &str) -> DormouseConfig {
-    let mut dorm_cfg = dormouse_core::config::load_config(preset)
-        .unwrap_or_else(|e| panic!("preset/config load {preset:?}: {e}"));
-    // Generic --set overrides (key=value) from the CLI.
-    if !cfg.config_overrides.is_empty() {
-        let ov = dormouse_core::config::parse_overrides(&cfg.config_overrides)
-            .unwrap_or_else(|e| panic!("--set: {e}"));
-        dormouse_core::config::apply_overrides(&mut dorm_cfg, &ov)
-            .unwrap_or_else(|e| panic!("--set: {e}"));
-    }
-    // Model overrides requested by the caller (CLI flags).
-    dorm_cfg.bf16 = cfg.bf16;
-    if let Some(q) = cfg.act_quant { dorm_cfg.act_quant = Some(q); }
-    if let Some(g) = cfg.act_group { dorm_cfg.act_group = g; }
-    if let Some(mi) = cfg.max_iter { dorm_cfg.max_iter = mi; }
-    if cfg.no_kda { dorm_cfg.use_kda = false; }
-    if cfg.no_msa { dorm_cfg.use_msa = false; }
-    if cfg.no_engram { dorm_cfg.use_engram = false; }
-    if let Some(w) = cfg.jepa_weight { dorm_cfg.jepa_weight = w; }
-    if let Some(w) = cfg.dspark_weight { dorm_cfg.dspark_weight = w; }
-    if let Some(k) = cfg.dspark_k { dorm_cfg.dspark_k = k; }
-    dorm_cfg
-}
-
 /// Build the model with the run's factor-quant / bf16 compute settings.
 fn build_model(
     dorm_cfg: &DormouseConfig,
@@ -400,16 +387,16 @@ fn ema_teacher_for(
 /// records to `out`. Consume with `--jepa-targets <out>`; the per-step
 /// lookup then costs one file read instead of a second full forward.
 pub fn precompute_jepa_targets(
-    cfg: &TrainCfg,
+    run: &RunCfg,
     data: &Path,
-    preset: &str,
     n_steps: usize,
     out: &Path,
 ) -> Result<(), String> {
-    let dorm_cfg = dorm_config(cfg, preset);
+    let dorm_cfg = &run.model;
+    let cfg = &run.train;
     let device = device();
     init_pools(&device);
-    let (model, qfmt) = build_model(&dorm_cfg, cfg, &device);
+    let (model, qfmt) = build_model(dorm_cfg, cfg, &device);
     let mut stream = dormouse_data::ByteStream::new(cfg.seq_len, cfg.batch, data);
     // Mirror the train loop's pre-loop stream consumption (the warmup
     // forward and the quant-check probe each eat one batch) so record i
@@ -422,9 +409,10 @@ pub fn precompute_jepa_targets(
     }
     let mut w = jepa_targets::JepaTargetWriter::create(out).map_err(|e| e.to_string())?;
     println!(
-        "jepa precompute: {} steps -> {} (preset {preset}, batch {} s {})",
+        "jepa precompute: {} steps -> {} (preset {}, batch {} s {})",
         n_steps,
         out.display(),
+        run.source,
         cfg.batch,
         cfg.seq_len
     );
@@ -448,19 +436,43 @@ pub fn precompute_jepa_targets(
 /// unreadable loss scalar) with the last good checkpoint already on disk, so
 /// the caller may resume by re-running with the same `ckpt_name`. On success
 /// the final checkpoint is saved and `Ok(())` returned.
+///
+/// Before touching the device, the resolved [`RunCfg`] is snapshotted to
+/// `<ckpt_dir>/<ckpt_name>.config.toml` (atomic tmp+rename, like save_ckpt).
+/// A resume with a DIFFERENT resolved config is a hard error (drift check,
+/// ADR-0005): the stored snapshot is diffed key-by-key against the fresh
+/// resolve and mismatches abort the run before any GPU work.
 pub fn train_loop(
-    cfg: TrainCfg,
+    run: RunCfg,
     data: PathBuf,
-    preset: String,
     ckpt_dir: Option<PathBuf>,
     eval_data: Option<PathBuf>,
 ) -> Result<(), String> {
     let dir = ckpt_dir.unwrap_or_else(|| PathBuf::from("checkpoints"));
     let _ = std::fs::create_dir_all(&dir);
-    let dorm_cfg = dorm_config(&cfg, &preset);
-    // Head-wise Muon for Q/K uses the preset's attention geometry.
-    let mut cfg = cfg;
-    cfg.qk_heads = Some(dorm_cfg.n_heads);
+    // Config snapshot + drift check (ADR-0005), before init_pools so a
+    // mismatched resume never reaches the GPU.
+    let snap_path = dir.join(format!("{}.config.toml", run.train.ckpt_name));
+    if snap_path.is_file() {
+        let stored = std::fs::read_to_string(&snap_path)
+            .map_err(|e| format!("config snapshot {}: {e}", snap_path.display()))?;
+        let old = RunCfg::from_snapshot(&stored)?;
+        let keys = run.diff_keys(&old);
+        if !keys.is_empty() {
+            return Err(format!(
+                "config drift: {} key(s) differ from the stored snapshot {}:\n  {}",
+                keys.len(),
+                snap_path.display(),
+                keys.join(", ")
+            ));
+        }
+    } else {
+        let tmp = dir.join(format!("{}.config.toml.tmp.{}", run.train.ckpt_name, std::process::id()));
+        std::fs::write(&tmp, run.snapshot_toml())
+            .map_err(|e| format!("config snapshot write {}: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, &snap_path).map_err(|e| format!("config snapshot {}: {e}", snap_path.display()))?;
+    }
+    let RunCfg { source: preset, model: dorm_cfg, train: cfg } = run;
     let device = device();
     init_pools(&device);
     let (mut model, qfmt) = build_model(&dorm_cfg, &cfg, &device);
@@ -641,6 +653,7 @@ pub fn train_loop(
             None => (None, None, None),
         };
 
+        let t_fwd = std::time::Instant::now();
         // Offline JEPA: the frozen target for THIS chunk must exist in the
         // sidecar; a miss is a hard error (stale sidecar), never a silent
         // aux drop.
@@ -648,13 +661,20 @@ pub fn train_loop(
             Some(t) => Some(t.get(&bytes)?),
             None => None,
         };
-        // M6: DM_FUSED=1 single-node path (default 0 preserves behavior)
+        // M6: DM_FUSED=1 single-node path (default 0 preserves behavior).
+        // The fused path is compiled only with the cuda feature; the cpu
+        // build never takes it. Flagship-compatible since the arms-adjoint
+        // work: host rows train through the op's rows parent, the aux heads
+        // run on the burn path from the op's exposed latents. Still excluded:
+        // bf16 (kernels are f32), act-quant (STE not in the kernels), GR.
+        #[cfg(feature = "cuda")]
         let use_fused = dormouse_core::fused::fused_enabled()
-            && host_rows.is_none()
-            && jepa_target.is_none()
             && !dorm_cfg.bf16
             && dorm_cfg.act_quant.is_none()
             && !dorm_cfg.use_gr;
+        #[cfg(not(feature = "cuda"))]
+        let _use_fused = false;
+        #[cfg(feature = "cuda")]
         let (_logits, rec_ce, p_dist, _kda, aux) = if use_fused {
             // Build PonderInputs from the live model (embedding + loop_block)
             let x_emb = {
@@ -685,6 +705,15 @@ pub fn train_loop(
             for e in &model.loop_block.expert_ffns {
                 experts.push([fac_of(&e.gate_up), fac_of(&e.down)]);
             }
+            // JEPA target: offline sidecar when present, else the live EMA
+            // teacher's latent over the same inputs (the same second forward
+            // forward_with_hidden would run). Both stop-grad on the burn path.
+            let teacher_latent = match jepa_target {
+                Some(tg) => Some(tg),
+                None => teacher
+                    .as_ref()
+                    .map(|t| t.forward_latent::<Backend>(y.clone(), None, None)),
+            };
             let inputs = dormouse_core::fused::PonderInputs {
                 x: x_emb,
                 targets: y.clone().reshape([cfg.batch * cfg.seq_len, 1]),
@@ -699,31 +728,53 @@ pub fn train_loop(
                 lm_head: fac_of(&model.lm_head),
                 norm_eps: dorm_cfg.norm_eps,
                 ponder_prior: model.ponder_prior,
-                hashed_ids: Some(h.clone()),
+                // RAM-offload rows drive the Engram; hashed_ids only without
+                // them (a dead H2D copy otherwise), same as the burn path.
+                hashed_ids: if host_rows.is_some() { None } else { Some(h.clone()) },
+                host_rows,
+                arm_leaves: Some(dormouse_core::fused::ArmLeavesPair {
+                    attn: dormouse_core::fused::ArmLeaves::capture(&model.loop_block.shared_attn),
+                    engram: dormouse_core::fused::ArmLeaves::capture(&model.loop_block.engram),
+                }),
                 loop_block_bytes: Some(lb_bytes),
                 cfg: Some(dorm_cfg.clone()),
             };
-            let (logits, rec, p_dist, kl) = dormouse_core::fused::ponder_loop_step(inputs);
-            let kda_dummy = Tensor::<4>::zeros([1, 1, 1, 1], &logits.device());
-            // aux not yet fused (JEPA/DSpark stay on burn path when enabled)
-            let aux_none: Option<Tensor<1>> = None;
-            // Keep kl for loss (model.loss does rec+beta*kl)
-            // We return rec and p_dist as before, but need to handle kl
-            // For now, stash kl in rec's extra? Instead, we directly compute loss later
-            // To keep the same tuple shape, we return kl via a side channel:
-            // we will compute loss as rec + kl*beta below, so we need kl.
-            // We store kl in a thread-local for the loss line.
-            // Simpler: we return (logits, rec, p_dist, kda_dummy, aux) and
-            // handle kl separately by recomputing model.ponder_kl(p_dist) later.
-            // But to avoid extra compute, we can just return rec and let the
-            // loss line use model.loss which recomputes kl from p_dist (same).
-            // So we ignore the fused kl and let model.loss recompute it.
-            (logits, rec, p_dist, kda_dummy, aux_none)
+            let out = dormouse_core::fused::ponder_loop_step(inputs);
+            // Aux heads stay OUTSIDE the op: they consume the exposed latents
+            // (out_acc for JEPA/KoLeo, the final-norm output for DSpark) on
+            // the burn graph, so their own params train normally.
+            let aux = model.aux_loss::<Backend>(
+                &out.out_acc,
+                teacher_latent,
+                Some(y.clone()),
+                &out.h,
+                &out.logits,
+            );
+            let kda_dummy = Tensor::<4>::zeros([1, 1, 1, 1], &out.logits.device());
+            (out.logits, out.rec, out.p_dist, kda_dummy, aux)
         } else if let Some(tg) = jepa_target {
             model.forward_with_jepa_targets::<Backend>(
                 x,
                 // RAM-offload path drives the Engram from host_rows; uploading
                 // hashed_ids too would be a dead per-step H2D copy.
+                if host_rows.is_some() { None } else { Some(h) },
+                host_rows,
+                Some(y),
+                Some(tg),
+            )
+        } else {
+            model.forward_with_hidden::<Backend>(
+                x,
+                if host_rows.is_some() { None } else { Some(h) },
+                host_rows,
+                Some(y),
+                teacher.as_ref(),
+            )
+        };
+        #[cfg(not(feature = "cuda"))]
+        let (_logits, rec_ce, p_dist, _kda, aux) = if let Some(tg) = jepa_target {
+            model.forward_with_jepa_targets::<Backend>(
+                x,
                 if host_rows.is_some() { None } else { Some(h) },
                 host_rows,
                 Some(y),
@@ -767,6 +818,8 @@ pub fn train_loop(
         } else {
             None
         };
+        let t_bwd = std::time::Instant::now();
+        let fwd_ms = t_fwd.elapsed().as_secs_f64() * 1000.0;
         let raw_grads = loss.backward();
         let lr = match stress.as_ref() {
             // Constant LR at a multiple of the optimum (report §3.3).
@@ -803,9 +856,13 @@ pub fn train_loop(
                 }
             }
         }
+        let bwd_ms = t_bwd.elapsed().as_secs_f64() * 1000.0;
+        let t_opt = std::time::Instant::now();
         let grads = GradientsParams::from_grads(raw_grads, &model);
         let model_new = optim.step(lr, model, grads);
         model = model_new;
+        let opt_ms = t_opt.elapsed().as_secs_f64() * 1000.0;
+        let t_retr = std::time::Instant::now();
         // TSCT ortho maintenance (bf16_KERNEL_PLAN): retract the U/V masters
         // every step so the quantized forward stays faithful; monitor the
         // drift at cadence and fall back to fp32 factors when it exceeds the
@@ -813,9 +870,12 @@ pub fn train_loop(
         if step % cfg.retract_every.max(1) as u64 == 0 {
             model.retract_tsct(cfg.retract_iters);
         }
+        let retr_ms = t_retr.elapsed().as_secs_f64() * 1000.0;
+        let t_ema = std::time::Instant::now();
         if let Some(t) = teacher.take() {
             teacher = Some(dormouse_core::aux::ema_update(t, &model, dormouse_core::aux::TEACHER_MOMENTUM));
         }
+        let ema_ms = t_ema.elapsed().as_secs_f64() * 1000.0;
         // max_ortho reads every TSCT factor (30+ device syncs) - cadence,
         // not per-50-steps: each check drains the pipeline. The metric is
         // per-entry (F-norm/k) so the plan's 1e-3 threshold sits above the
@@ -840,12 +900,14 @@ pub fn train_loop(
             }
             let total_ms = t_iter.elapsed().as_secs_f64() * 1000.0;
             println!(
-                "timer step {step}: total={total_ms:.0}ms data={data_ms:.1}ms gpu_step={:.0}ms",
+                "timer step {step}: total={total_ms:.0}ms data={data_ms:.1}ms fwd={fwd_ms:.0}ms \
+                 bwd={bwd_ms:.0}ms (incl. loss sync + host-adam D2H) opt={opt_ms:.0}ms \
+                 retr={retr_ms:.1}ms ema={ema_ms:.1}ms gpu_step={:.0}ms",
                 total_ms - data_ms
             );
         }
         if step % cfg.log_every as u64 == 0 {
-            let bpb = dormouse_bench::bpb(ce);
+            let bpb = bpb(ce);
             // pool_stats syncs the device; only with --memlog
             let mem = if cfg.memlog { pool_stats(&device) } else { String::new() };
             let aux_note = match aux_log.clone().map(|a| a.try_into_scalar::<f32>().ok()) {
@@ -903,7 +965,7 @@ pub fn train_loop(
                         .mean()
                         .try_into_scalar()
                         .unwrap_or(f32::NAN);
-                    let ebpb = dormouse_bench::bpb(ece);
+                    let ebpb = bpb(ece);
                     println!("step {step:6} EVAL ce={ece:.3} bpb={ebpb:.3}");
                 }
             }
@@ -1072,7 +1134,7 @@ mod tests {
             max_iter: 4,
             rank: 16,
             msa_block: 32,
-            ..DormouseConfig::small()
+            ..DormouseConfig::default()
         }
     }
 

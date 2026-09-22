@@ -1,0 +1,27 @@
+quant format: Fp8 (8 bits)
+optimizer: Muon+ ColRow ns=8 + head-wise Muon q/k + Adam wd0 (tables) + AdamW (rest) [muon=15 qk=4 tables=1 rest=41]
+dormouse pretrain configs/nano.toml params=4932427 steps=2000 data="/mnt/e43497ab-0ff2-45b4-b45f-28de3339a53e/aria_data/pretrain/mix/rudialog" lr=0.0001 backend=cuda(autodiff)
+warmup done
+step      0 ce=5.206 bpb=7.511 best=5.206 lr=0.00e0 aux=0.1737 
+ckpt nano2.bin saved step 0
+step     50 ce=4.411 bpb=6.363 best=4.411 lr=1.00e-4 aux=0.1493 
+step    100 ce=1.672 bpb=2.412 best=1.672 lr=1.00e-4 aux=0.1329 
+step    150 ce=0.573 bpb=0.827 best=0.573 lr=1.00e-4 aux=0.1219 
+step    200 ce=0.286 bpb=0.413 best=0.286 lr=1.00e-4 aux=0.1182 
+step    250 ce=0.194 bpb=0.280 best=0.194 lr=1.00e-4 aux=0.1153 
+step    300 ce=0.163 bpb=0.235 best=0.163 lr=1.00e-4 aux=0.1159 
+step    350 ce=0.149 bpb=0.215 best=0.149 lr=1.00e-4 aux=0.1143 
+step    400 ce=0.140 bpb=0.202 best=0.140 lr=1.00e-4 aux=0.1132 
+step    450 ce=0.131 bpb=0.190 best=0.131 lr=1.00e-4 aux=0.1121 
+max_ortho 1.95e-3 > 1e-3 - fallback fp32 factors
+step    500 ce=0.126 bpb=0.182 best=0.126 lr=1.00e-4 aux=0.1125 
+step    500 EVAL ce=5.497 bpb=7.931
+ckpt nano2.bin saved step 500
+step    550 ce=0.125 bpb=0.181 best=0.125 lr=1.00e-4 aux=0.1115 
+step    600 ce=0.121 bpb=0.175 best=0.121 lr=1.00e-4 aux=0.1097 
+step    650 ce=0.119 bpb=0.172 best=0.119 lr=1.00e-4 aux=0.1091 
+step    700 ce=0.117 bpb=0.169 best=0.117 lr=1.00e-4 aux=0.1085 
+step    750 ce=0.114 bpb=0.165 best=0.114 lr=1.00e-4 aux=0.1070 
+step    800 ce=0.113 bpb=0.163 best=0.113 lr=1.00e-4 aux=0.1061 
+step    850 ce=0.111 bpb=0.160 best=0.111 lr=1.00e-4 aux=0.1046 
+step    900 ce=0.109 bpb=0.157 best=0.109 lr=1.00e-4 aux=0.1038 

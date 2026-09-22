@@ -4,8 +4,6 @@ members = [
     "crates/dormouse-data",
     "crates/dormouse-train",
     "crates/dormouse-cli",
-    "crates/dormouse-bench",
-    "crates/dormouse-serve",
 ]
 resolver = "2"
 [workspace.package]

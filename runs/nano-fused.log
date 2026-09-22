@@ -1,0 +1,29 @@
+
+thread 'main' (1366588) panicked at crates/dormouse-train/src/lib.rs:339:29:
+preset/config load "configs/nano-fused.toml": config file "configs/nano-fused.toml": No such file or directory (os error 2)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+train failed: panic: preset/config load "configs/nano-fused.toml": config file "configs/nano-fused.toml": No such file or directory (os error 2)
+guard: no resumable checkpoint, giving up
+quant format: Fp8 (8 bits)
+optimizer: Muon+ ColRow ns=8 + head-wise Muon q/k + Adam wd0 (tables) + AdamW (rest) [muon=15 qk=4 tables=1 rest=41]
+dormouse pretrain configs/nano-fused.toml params=4932427 steps=2000 data="/mnt/e43497ab-0ff2-45b4-b45f-28de3339a53e/aria_data/pretrain/mix/rudialog" lr=0.0001 backend=cuda(autodiff)
+warmup done
+step      0 ce=5.153 bpb=7.434 best=5.153 lr=0.00e0 
+ckpt nano-fused.bin saved step 0
+step     50 ce=4.474 bpb=6.455 best=4.474 lr=1.00e-4 
+step    100 ce=1.655 bpb=2.388 best=1.655 lr=1.00e-4 
+step    150 ce=0.505 bpb=0.728 best=0.505 lr=1.00e-4 
+step    200 ce=0.200 bpb=0.288 best=0.200 lr=1.00e-4 
+step    250 ce=0.088 bpb=0.127 best=0.088 lr=1.00e-4 
+step    300 ce=0.049 bpb=0.071 best=0.049 lr=1.00e-4 
+step    350 ce=0.036 bpb=0.052 best=0.036 lr=1.00e-4 
+step    400 ce=0.027 bpb=0.039 best=0.027 lr=1.00e-4 
+step    450 ce=0.019 bpb=0.028 best=0.019 lr=1.00e-4 
+step    500 ce=0.014 bpb=0.020 best=0.014 lr=1.00e-4 
+ckpt nano-fused.bin saved step 500
+step    550 ce=0.013 bpb=0.019 best=0.013 lr=1.00e-4 
+step    600 ce=0.011 bpb=0.016 best=0.011 lr=1.00e-4 
+step    650 ce=0.010 bpb=0.014 best=0.010 lr=1.00e-4 
+step    700 ce=0.009 bpb=0.013 best=0.009 lr=1.00e-4 
+step    750 ce=0.007 bpb=0.010 best=0.007 lr=1.00e-4 
+step    800 ce=0.007 bpb=0.010 best=0.007 lr=1.00e-4 

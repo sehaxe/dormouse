@@ -104,6 +104,13 @@ impl ModuleMapper for EmaMapper {
 /// `teacher <- momentum * teacher + (1 - momentum) * student`, per param.
 /// Consumes and returns the teacher so params are rebuilt fresh (and stay
 /// grad-free). Both models must be the same type (identical traversal).
+///
+/// The returned teacher is `no_grad()`-frozen: its params are fresh AD leaves
+/// with `require_grad = false`, so (a) the teacher forward never enters the
+/// autodiff tape (a grad-tracked teacher retained every intermediate of a
+/// full second forward - ~2x activation memory, the step-0 OOM axis), and
+/// (b) the EMA chain cannot accumulate param nodes across steps (an
+/// unbounded, never-dropped param history without the freeze).
 pub fn ema_update<M: Module>(teacher: M, student: &M, momentum: f64) -> M {
     let mut col = ParamCollector { flat: Vec::new() };
     student.visit(&mut col);
@@ -111,7 +118,7 @@ pub fn ema_update<M: Module>(teacher: M, student: &M, momentum: f64) -> M {
         student: col.flat.into_iter(),
         m: momentum as f32,
     };
-    teacher.map(&mut mapper)
+    teacher.map(&mut mapper).no_grad()
 }
 
 /// DSpark auxiliary loss: the draft head corrects frozen backbone logits

@@ -182,17 +182,10 @@ async fn models() -> Json<ModelsResp> {
 async fn main() {
     let a = Args::parse();
     let preset_name = a.config.as_deref().unwrap_or(&a.preset);
-    let mut cfg = dormouse_core::config::load_config(preset_name).unwrap_or_else(|e| {
-        eprintln!("config load {preset_name:?}: {e}"); std::process::exit(1);
-    });
-    if !a.set.is_empty() {
-        let ov = dormouse_core::config::parse_overrides(&a.set).unwrap_or_else(|e| {
-            eprintln!("--set: {e}"); std::process::exit(1);
-        });
-        dormouse_core::config::apply_overrides(&mut cfg, &ov).unwrap_or_else(|e| {
-            eprintln!("--set: {e}"); std::process::exit(1);
-        });
-    }
+    // The one config seam (ADR-0005): defaults -> preset -> --set -> validate.
+    let cfg = dormouse_train::resolve(preset_name, &a.set, Default::default())
+        .unwrap_or_else(|e| { eprintln!("config: {e}"); std::process::exit(1); })
+        .model;
     let model = dormouse_train::load_model_weights(&a.ckpt_dir, &a.ckpt_name, cfg)
         .unwrap_or_else(|| { eprintln!("ckpt not found: {}/{}.bin", a.ckpt_dir.display(), a.ckpt_name); std::process::exit(1); });
     println!("loaded {}/{}.bin params={}", a.ckpt_dir.display(), a.ckpt_name, model.num_params());

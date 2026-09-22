@@ -1,4 +1,6 @@
-use super::schema::{ActQuant, DormouseConfig};
+use super::schema::ActQuant;
+use super::schema::DormouseConfig;
+use std::str::FromStr;
 
 #[derive(Debug, Clone)]
 pub struct Override { pub key: String, pub value: String }
@@ -17,16 +19,6 @@ pub fn parse_overrides(raw: &[String]) -> Result<Vec<Override>, String> {
 
 fn parse_bool(v: &str) -> Result<bool, String> {
     match v.to_ascii_lowercase().as_str() { "true"|"1"|"yes"|"on" => Ok(true), "false"|"0"|"no"|"off" => Ok(false), _ => Err(format!("bool expected true/false, got {v:?}")) }
-}
-
-fn parse_act(v: &str) -> Result<Option<ActQuant>, String> {
-    match v.to_ascii_lowercase().as_str() {
-        "none"|"null"|"off"|"" => Ok(None),
-        "fp4" => Ok(Some(ActQuant::Fp4)),
-        "4"|"int4" => Ok(Some(ActQuant::Int(4))),
-        "8"|"int8" => Ok(Some(ActQuant::Int(8))),
-        _ => Err(format!("act_quant expected fp4/4/8/none, got {v:?}")),
-    }
 }
 
 pub fn apply_overrides(cfg: &mut DormouseConfig, ov: &[Override]) -> Result<(), String> {
@@ -67,7 +59,11 @@ pub fn apply_overrides(cfg: &mut DormouseConfig, ov: &[Override]) -> Result<(), 
             "use_kda" => cfg.use_kda = parse_bool(v)?,
             "use_engram" => cfg.use_engram = parse_bool(v)?,
             "use_gr" => cfg.use_gr = parse_bool(v)?,
-            "act_quant" => cfg.act_quant = parse_act(v)?,
+            "act_quant" => cfg.act_quant = match v.to_ascii_lowercase().as_str() {
+                "none" | "null" | "off" | "" => None,
+                // The one act-quant parser: ActQuant::from_str (ADR-0005).
+                _ => Some(ActQuant::from_str(v).map_err(|e| format!("act_quant: {e}"))?),
+            },
             _ => return Err(format!("unknown config key {:?}", o.key)),
         }
     }

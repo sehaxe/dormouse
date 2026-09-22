@@ -75,7 +75,7 @@ fn small_model(dev: &Device, max_iter: usize) -> (DormouseConfig, DormouseModel)
         use_kda: false,
         use_msa: false,
         use_engram: false,
-        ..DormouseConfig::small()
+        ..DormouseConfig::default()
     };
     let mut model = DormouseModel::new(&cfg, dev);
     // ReZero starts at 0, which would zero the whole FFN-arm gradient; give
@@ -113,6 +113,8 @@ fn inputs_of(
         norm_eps: cfg.norm_eps,
         ponder_prior: model.ponder_prior,
         hashed_ids: None,
+        host_rows: None,
+        arm_leaves: None,
         loop_block_bytes: None,
         cfg: None,
     }
@@ -130,6 +132,10 @@ fn inputs_of_arms(
     base.hashed_ids = Some(hashed);
     base.loop_block_bytes = Some(lb_bytes);
     base.cfg = Some(cfg.clone());
+    base.arm_leaves = Some(crate::fused::ArmLeavesPair {
+        attn: crate::fused::ArmLeaves::capture(&model.loop_block.shared_attn),
+        engram: crate::fused::ArmLeaves::capture(&model.loop_block.engram),
+    });
     base
 }
 
@@ -326,7 +332,7 @@ fn fused_bwd_buffers_vs_f64() {
             use_kda: false,
             use_msa: false,
             use_engram: false,
-            ..DormouseConfig::small()
+            ..DormouseConfig::default()
         },
         1,
         8,
@@ -346,7 +352,7 @@ fn fused_bwd_buffers_vs_f64_small() {
             use_kda: false,
             use_msa: false,
             use_engram: false,
-            ..DormouseConfig::small()
+            ..DormouseConfig::default()
         },
         2,
         16,
@@ -411,7 +417,8 @@ fn fused_bwd_buffers_vs_f64_cfg(cfg: DormouseConfig, b: usize, t: usize, perturb
     let tgt_t: Tensor<2, Int> = Tensor::from_data(tgth.clone(), &dev);
 
     let inputs = inputs_of(&model, &cfg, x.clone(), tgt_t.clone());
-    let (logits_f, rec_f, _pd_f, kl_f) = ponder_loop_step(inputs);
+    let out_f = ponder_loop_step(inputs);
+    let (logits_f, rec_f, kl_f) = (&out_f.logits, &out_f.rec, &out_f.kl);
     // The full in-op loss assembly: per-step rec + in-op KL + the outside
     // readout CE. Every path of the op's backward carries a nonzero grad.
     let loss_f = rec_f.clone()
@@ -1211,7 +1218,7 @@ fn fused_bwd_recurrence_vs_f64_n2() {
         use_kda: false,
         use_msa: false,
         use_engram: false,
-        ..DormouseConfig::small()
+        ..DormouseConfig::default()
     };
     let mut model = DormouseModel::new(&cfg, &dev);
     model.loop_block.residual_scale =
@@ -1238,7 +1245,8 @@ fn fused_bwd_recurrence_vs_f64_n2() {
     let tgt_t: Tensor<2, Int> = Tensor::from_data(tgth.clone(), &dev);
 
     let inputs = inputs_of(&model, &cfg, x.clone(), tgt_t.clone());
-    let (logits_f, rec_f, _pd_f, kl_f) = ponder_loop_step(inputs);
+    let out_f = ponder_loop_step(inputs);
+    let (logits_f, rec_f, kl_f) = (&out_f.logits, &out_f.rec, &out_f.kl);
     let loss_f = rec_f.clone()
         + kl_f.clone().mul_scalar(model.ponder_beta)
         + readout_ce(logits_f.clone(), tgt_t.clone(), bt);
@@ -1858,7 +1866,8 @@ fn gradcheck_n(n_iter: usize) {
 
     // ---- fused path (CUDA, one autodiff node)
     let inputs = inputs_of(&model, &cfg, x.clone(), tgt_t.clone());
-    let (logits_f, rec_f, pd_f, kl_f) = ponder_loop_step(inputs);
+    let out_f = ponder_loop_step(inputs);
+    let (logits_f, rec_f, pd_f, kl_f) = (&out_f.logits, &out_f.rec, &out_f.p_dist, &out_f.kl);
     let loss_f = rec_f.clone()
         + kl_f.clone().mul_scalar(model.ponder_beta)
         + readout_ce(logits_f.clone(), tgt_t.clone(), b * t);
@@ -1901,7 +1910,7 @@ fn gradcheck_n(n_iter: usize) {
     // ---- forward equality
     let (loss_rel, _) = rel_stats(&[loss_f_val], &[loss_r_val]);
     let (rec_rel, _) = rel_stats(&[scalar(rec_f.clone())], &[scalar(rec_r.clone())]);
-    let pdv_f: Vec<f32> = pd_f.into_data().try_to_vec().unwrap();
+    let pdv_f: Vec<f32> = pd_f.clone().into_data().try_to_vec().unwrap();
     let pdv_r: Vec<f32> = pd_r.clone().into_data().try_to_vec().unwrap();
     let (pd_rel, _) = rel_stats(&pdv_f, &pdv_r);
     let (lg_rel, lg_abs) = rel_stats(&logits_f_val, &logits_r_val);
@@ -1953,6 +1962,266 @@ fn fused_gradcheck_arms_on() {
     }
 }
 
+/// Acceptance (a), PLAN.md phase 1 item 1: the fused backward must produce
+/// gradients for EXACTLY the same parameter set as the burn path, with
+/// values within the gradcheck tolerance. Runs step-0 fwd+bwd of the
+/// flagship-shaped config (arms on, online aux, arms-grad inner graph) twice
+/// - Engram in host-rows mode and in hashed mode - through both paths, then
+/// diffs (1) the Some-grad param sets (fails with the missing list) and
+/// (2) per-param grad values. This is the checkpoint-size criterion: the
+/// optimizer only creates moments for params that received grads, so a
+/// missing grad here was the 37 MB vs 70 MB ckpt delta.
+#[test]
+fn fused_grad_coverage_matches_burn() {
+    for use_host_rows in [true, false] {
+        grad_coverage_case(use_host_rows);
+    }
+}
+
+/// Walks every float param of `m` (positionally named, dims tagged) with its
+/// grad presence + values under `g`. Both models are walked with the same
+/// code so positions correspond 1:1.
+fn grad_walk<M: Module>(
+    pre: &str,
+    m: &M,
+    g: &BridgedGrads,
+    out: &mut Vec<(String, bool, Vec<f32>)>,
+) {
+    struct W<'a> {
+        g: &'a BridgedGrads,
+        pre: String,
+        out: &'a mut Vec<(String, bool, Vec<f32>)>,
+    }
+    impl ModuleVisitor for W<'_> {
+        fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<D>>) {
+            let t = param.val();
+            let grad = t.clone().grad(self.g);
+            let has = grad.is_some();
+            let vals = grad
+                .map(|x| x.into_data().try_to_vec().unwrap_or_default())
+                .unwrap_or_default();
+            let dims = t.dims();
+            let name = format!("{}#{} {:?}", self.pre, self.out.len(), dims);
+            self.out.push((name, has, vals));
+        }
+    }
+    let mut w = W { g, pre: pre.to_string(), out };
+    m.visit(&mut w);
+}
+
+fn full_grad_walk(model: &DormouseModel, g: &BridgedGrads) -> Vec<(String, bool, Vec<f32>)> {
+    let mut v = Vec::new();
+    grad_walk("embedding", &model.embedding, g, &mut v);
+    grad_walk("controller", &model.loop_block.controller, g, &mut v);
+    grad_walk("shared_attn", &model.loop_block.shared_attn, g, &mut v);
+    grad_walk("expert_ffns", &model.loop_block.expert_ffns, g, &mut v);
+    grad_walk("engram", &model.loop_block.engram, g, &mut v);
+    grad_walk("lb_norm", &model.loop_block.norm, g, &mut v);
+    grad_walk("halt_head", &model.loop_block.halt_head, g, &mut v);
+    grad_walk("iter_embed", &model.loop_block.iter_embed, g, &mut v);
+    grad_walk("residual_scale", &model.loop_block.residual_scale, g, &mut v);
+    grad_walk("out_proj", &model.loop_block.out_proj, g, &mut v);
+    grad_walk("final_norm", &model.norm, g, &mut v);
+    grad_walk("lm_head", &model.lm_head, g, &mut v);
+    grad_walk("aux", &model.aux, g, &mut v);
+    v
+}
+
+fn grad_coverage_case(use_host_rows: bool) {
+    let mode = if use_host_rows { "host-rows" } else { "hashed" };
+    let dev = burn::tensor::Device::default().autodiff();
+    type CuAd = crate::fused::CAd;
+    let mut cfg = DormouseConfig {
+        d_model: 64,
+        n_heads: 4,
+        head_dim: 16,
+        d_ffn: 128,
+        rank: 16,
+        max_iter: 2,
+        use_kda: true,
+        use_msa: true,
+        use_engram: true,
+        // flagship aux weights (small preset)
+        jepa_weight: 0.05,
+        dspark_weight: 0.1,
+        dspark_k: 4,
+        dspark_stride: 16,
+        ..DormouseConfig::default()
+    };
+    cfg.msa_block = cfg.msa_block.min(64);
+    let mut model = DormouseModel::new(&cfg, &dev);
+    model.loop_block.residual_scale =
+        Param::from_tensor(Tensor::<1>::from_data(TensorData::new(vec![0.7f32], [1]), &dev));
+    deflake_ternary_edges(&mut model, &dev);
+    let teacher = model.clone().no_grad();
+
+    let (b, t) = (2usize, 64usize);
+    let d = cfg.d_model;
+    let bt = b * t;
+    let ids_h = TensorData::new(
+        (0..b * t).map(|i| ((i * 13 + 5) % 256) as i64).collect::<Vec<i64>>(),
+        [b, t],
+    );
+    let tgt: Vec<i64> = (0..bt).map(|i| (i * 31 + 7) as i64 % 256).collect();
+    let tgth = TensorData::new(tgt.clone(), [bt]);
+    let hashedh = TensorData::new(
+        (0..b * t * 3).map(|i| (i as i64 * 17 + 5) % 4096).collect::<Vec<i64>>(),
+        [b, t, 3],
+    );
+    // host rows: a [uniq, 32] tracked leaf gathered+expanded exactly like
+    // offload::rows_for_batch does (leaf -> gather -> [b, t, 96])
+    let (uniq, rdim) = (37usize, 32usize);
+    let rowsh = TensorData::new(
+        (0..uniq * rdim).map(|i| ((i % 23) as f32 - 11.0) / 23.0).collect::<Vec<f32>>(),
+        [uniq, rdim],
+    );
+    let posh = TensorData::new(
+        (0..b * t * 3).map(|i| (i as i64 * 7 + 3) % uniq as i64).collect::<Vec<i64>>(),
+        [b * t * 3],
+    );
+
+    // ---------------- burn path
+    let mut ref_model = DormouseModel::new(&cfg, &dev);
+    ref_model = ref_model.load_record(model.clone().into_record());
+    ref_model.loop_block.residual_scale =
+        Param::from_tensor(Tensor::<1>::from_data(TensorData::new(vec![0.7f32], [1]), &dev));
+    let ids_r: Tensor<2, Int> = Tensor::from_data(ids_h.clone(), &dev);
+    let tgt_bt_r: Tensor<2, Int> =
+        Tensor::<1, Int>::from_data(tgth.clone(), &dev).reshape([b, t]);
+    let hashed_r: Tensor<3, Int> = Tensor::from_data(hashedh.clone(), &dev);
+    let rows_leaf_r: Tensor<2> = Tensor::from_data(rowsh.clone(), &dev).require_grad();
+    let idx_r: Tensor<2, Int> = Tensor::<1, Int>::from_data(posh.clone(), &dev)
+        .unsqueeze_dim::<2>(1)
+        .repeat(&[1, rdim]);
+    let embed_r = rows_leaf_r.clone().gather(0, idx_r).reshape([b, t, 3 * rdim]);
+    let (h_r, rows_r) = if use_host_rows {
+        (None, Some(embed_r.clone()))
+    } else {
+        (Some(hashed_r.clone()), None)
+    };
+    let (lg_r, rec_r, pd_r, _k_r, aux_r) = ref_model.forward_with_hidden::<CuAd>(
+        ids_r,
+        h_r,
+        rows_r,
+        Some(tgt_bt_r.clone()),
+        Some(&teacher),
+    );
+    let _ = lg_r;
+    let loss_r = ref_model.loss::<CuAd>(rec_r, pd_r) + aux_r.expect("burn aux must be on");
+    let loss_r_val = scalar(loss_r.clone());
+    let grads_r = loss_r.backward();
+    let ref_walk = full_grad_walk(&ref_model, &grads_r);
+
+    // ---------------- fused path
+    let ids_f: Tensor<2, Int> = Tensor::from_data(ids_h.clone(), &dev);
+    let tgt_f: Tensor<2, Int> = Tensor::<1, Int>::from_data(tgth.clone(), &dev).reshape([bt, 1]);
+    let rows_leaf_f: Tensor<2> = Tensor::from_data(rowsh.clone(), &dev).require_grad();
+    let idx_f: Tensor<2, Int> = Tensor::<1, Int>::from_data(posh.clone(), &dev)
+        .unsqueeze_dim::<2>(1)
+        .repeat(&[1, rdim]);
+    let embed_f = rows_leaf_f.clone().gather(0, idx_f).reshape([b, t, 3 * rdim]);
+    let x_emb = model.embedding.forward(ids_f.clone());
+    let mut inputs = inputs_of(&model, &cfg, x_emb, tgt_f);
+    let lb_bytes = model
+        .loop_block
+        .clone()
+        .into_record()
+        .into_bytes()
+        .unwrap()
+        .to_vec();
+    inputs.loop_block_bytes = Some(lb_bytes);
+    inputs.cfg = Some(cfg.clone());
+    inputs.arm_leaves = Some(crate::fused::ArmLeavesPair {
+        attn: crate::fused::ArmLeaves::capture(&model.loop_block.shared_attn),
+        engram: crate::fused::ArmLeaves::capture(&model.loop_block.engram),
+    });
+    if use_host_rows {
+        inputs.hashed_ids = None;
+        inputs.host_rows = Some(embed_f);
+    } else {
+        inputs.hashed_ids = Some(Tensor::from_data(hashedh, &dev));
+        inputs.host_rows = None;
+    }
+    let out_f = ponder_loop_step(inputs);
+    // online teacher latent, exactly as forward_with_hidden runs it
+    let teacher_latent = Some(teacher.forward_latent::<CuAd>(ids_f.clone(), None, None));
+    let aux_f = model
+        .aux_loss::<CuAd>(&out_f.out_acc, teacher_latent, Some(ids_f.clone()), &out_f.h, &out_f.logits)
+        .expect("fused aux must be on");
+    let loss_f = model.loss::<CuAd>(out_f.rec.clone(), out_f.p_dist.clone()) + aux_f;
+    let loss_f_val = scalar(loss_f.clone());
+    let grads_f = loss_f.backward();
+    let fus_walk = full_grad_walk(&model, &grads_f);
+
+    // ---------------- coverage diff (criterion a)
+    assert_eq!(
+        fus_walk.len(),
+        ref_walk.len(),
+        "{mode}: param walk length mismatch"
+    );
+    let mut missing = Vec::new();
+    let mut extra = Vec::new();
+    for ((nf, hf, _), (nr, hr, _)) in fus_walk.iter().zip(ref_walk.iter()) {
+        let _ = nf;
+        if *hr && !*hf {
+            missing.push(nr.clone());
+        }
+        if *hf && !*hr {
+            extra.push(nf.clone());
+        }
+    }
+    assert!(
+        missing.is_empty() && extra.is_empty(),
+        "{mode}: GRAD COVERAGE MISMATCH -\n  missing in fused ({}): {:?}\n  extra in fused ({}): {:?}",
+        missing.len(),
+        missing,
+        extra.len(),
+        extra
+    );
+
+    // forward parity (the base for grad comparability)
+    let (loss_rel, _) = rel_stats(&[loss_f_val], &[loss_r_val]);
+    println!("[{mode}] fwd loss {:.5}/{:.5} rel={loss_rel:.2e}", loss_f_val, loss_r_val);
+    assert!(loss_rel < 1e-4, "[{mode}] loss rel {loss_rel:.2e}");
+
+    // ---------------- value diff on params present in both
+    for ((nf, hf, vf), (nr, hr, vr)) in fus_walk.iter().zip(ref_walk.iter()) {
+        assert_eq!(nf, nr, "{mode}: walk order diverged");
+        if !(*hf && *hr) {
+            continue;
+        }
+        assert_eq!(vf.len(), vr.len(), "{mode}: {nr} grad length mismatch");
+        if vf.is_empty() {
+            continue;
+        }
+        let (rel, abs) = rel_stats(vf, vr);
+        // x's grad sums strongly cancelling paths (gradcheck_n's measured
+        // floor); everything else holds the gradcheck tolerances
+        let lim = if nf.starts_with("embedding") {
+            5e-2
+        } else if nf.starts_with("out_proj") || nf.starts_with("lm_head") {
+            1e-3
+        } else if nf.starts_with("shared_attn")
+            || nf.starts_with("engram")
+            || nf.starts_with("aux")
+        {
+            // arms/aux grads are burn-exact by construction (inner graph runs
+            // the same modules); what remains is fused-forward input noise
+            5e-2
+        } else {
+            5e-4
+        };
+        println!(
+            "  [{mode}] {nr:>40}: rel={rel:.2e} abs={abs:.2e} (n={})",
+            vr.len()
+        );
+        assert!(
+            rel < lim,
+            "{mode}: gradcheck failed on {nr}: rel {rel:.2e} (limit {lim:.1e})"
+        );
+    }
+}
+
 fn small_model_arms(dev: &Device, n_iter: usize) -> (DormouseConfig, DormouseModel) {
     let mut cfg = DormouseConfig {
         d_model: 64,
@@ -1964,7 +2233,7 @@ fn small_model_arms(dev: &Device, n_iter: usize) -> (DormouseConfig, DormouseMod
         use_kda: true,
         use_msa: true,
         use_engram: true,
-        ..DormouseConfig::small()
+        ..DormouseConfig::default()
     };
     let mut model = DormouseModel::new(&cfg, dev);
     model.loop_block.residual_scale =
@@ -2000,7 +2269,8 @@ fn gradcheck_arms_n(n_iter: usize) {
 
     // ---- fused path (arms ON, single node)
     let inputs = inputs_of_arms(&model, &cfg, x.clone(), tgt_t.clone(), hashed_t.clone());
-    let (logits_f, rec_f, pd_f, kl_f) = ponder_loop_step(inputs);
+    let out_f = ponder_loop_step(inputs);
+    let (logits_f, rec_f, pd_f, kl_f) = (&out_f.logits, &out_f.rec, &out_f.p_dist, &out_f.kl);
     let loss_f = rec_f.clone()
         + kl_f.clone().mul_scalar(model.ponder_beta)
         + readout_ce(logits_f.clone(), tgt_t.clone(), b * t);

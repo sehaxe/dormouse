@@ -1,0 +1,3 @@
+# Reasoning over recall
+
+The user-facing goal is critical thinking, not memorization. We still grow Engram, a lookup store, precisely so the small core never spends its capacity on facts: the core's loss pressure flows into computation, and phase 5 installs reasoning with verifier-graded objectives (reasoning-trace SFT, RLVR, distillation from a reasoning teacher). To keep this honest, confirm runs report the train-vs-eval BPB gap, so a win achieved by recall rather than computation is visible and does not count. RSI proceeds by rungs (process automation, data flywheel, verifier-filtered self-improvement, model-scored architecture search); a model rewriting its own stack is beyond this hardware class and stays out of scope until a code-capable model exists.

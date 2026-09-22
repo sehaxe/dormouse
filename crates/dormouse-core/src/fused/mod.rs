@@ -47,7 +47,7 @@ use backward::PonderState;
 use crate::param::{LinearLike, LinearLikeInner};
 use crate::loop_block::LoopBlock;
 use crate::config::DormouseConfig;
-use burn::module::Module;
+use burn::module::{Module, ModuleVisitor, Param};
 
 pub(crate) type Cuda = cubecl::cuda::CudaRuntime;
 pub(crate) type CB = burn_cubecl::CubeBackend<Cuda>;
@@ -70,13 +70,6 @@ thread_local! {
 /// today's burn path is untouched).
 pub fn fused_enabled() -> bool {
     std::env::var("DM_FUSED").map(|v| v == "1").unwrap_or(false)
-}
-
-/// `DM_FUSED_BF16=1` halves the workspace (M5): per-iteration buffers are
-/// stored bf16, compute stays fp32. Off by default until the cast kernels
-/// are profiled.
-pub fn fused_bf16_enabled() -> bool {
-    std::env::var("DM_FUSED_BF16").map(|v| v == "1").unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -450,6 +443,41 @@ pub struct Fac {
     pub v: Tensor<2>,
 }
 
+/// Autodiff node ids of every float param of one module subtree, in burn's
+/// module traversal order. Captured from the LIVE model at op-input build
+/// time; the arms inner-graph backward walks the identically-structured AD
+/// clone it rebuilds from `loop_block_bytes`, pulls each param's grad from
+/// the inner map positionally, and registers it onto these ids so the outer
+/// map (and thereby the optimizer) sees exact arm gradients.
+#[derive(Clone, Debug, Default)]
+pub struct ArmLeaves {
+    pub ids: Vec<burn::backend::autodiff::NodeId>,
+}
+
+impl ArmLeaves {
+    /// Capture the param node ids under `m` (shared_attn, engram).
+    pub fn capture<M: Module>(m: &M) -> Self {
+        struct Cap {
+            out: Vec<burn::backend::autodiff::NodeId>,
+        }
+        impl ModuleVisitor for Cap {
+            fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<D>>) {
+                let at = param
+                    .val()
+                    .try_into_primitive::<CAd>()
+                    .expect("fused arm capture requires CUDA autodiff tensors");
+                if std::env::var("DM_FUSED_DEBUG").is_ok() {
+                    eprintln!("arm cap: id={:?} dims={:?}", at.node.id, param.val().dims());
+                }
+                self.out.push(at.node.id);
+            }
+        }
+        let mut cap = Cap { out: Vec::new() };
+        m.visit(&mut cap);
+        Self { ids: cap.out }
+    }
+}
+
 /// Everything the fused N-iteration ponder loop needs, as tracked tensors.
 #[derive(Clone, Debug)]
 pub struct PonderInputs {
@@ -477,8 +505,38 @@ pub struct PonderInputs {
     /// the shared attention (KDA+MSA+router blend) and Engram (hashed_ids path)
     /// inside the single node. `cfg` carries the geometry for the copy.
     pub hashed_ids: Option<Tensor<3, Int>>,
+    /// RAM-offload Engram rows, already gathered+expanded `[b, t, 3·dim]`
+    /// (the autodiff leaf the trainer's host tables gathered through). When
+    /// Some it takes priority over `hashed_ids`, exactly like
+    /// `forward_with_hidden`; its gradient is registered back onto this
+    /// tensor's node so the burn-side gather chain trains `rows_param`.
+    pub host_rows: Option<Tensor<3>>,
+    /// Captured live arm weights (shared_attn + engram subtrees) for the
+    /// inner-graph arms backward; None skips arm-gradient computation (the
+    /// op still runs its raw arms forward).
+    pub arm_leaves: Option<ArmLeavesPair>,
     pub loop_block_bytes: Option<Vec<u8>>,
     pub cfg: Option<crate::config::DormouseConfig>,
+}
+
+/// The two arm subtrees whose weights the arms forward reads outside the
+/// parent list: `shared_attn` (KDA + MSA + router) and `engram`.
+#[derive(Clone, Debug, Default)]
+pub struct ArmLeavesPair {
+    pub attn: ArmLeaves,
+    pub engram: ArmLeaves,
+}
+
+/// The op's outputs: the `forward_with_hidden` triple plus the in-op PonderNet
+/// KL scalar and the latents the burn-path aux heads consume (`out_acc` for
+/// JEPA/KoLeo, `h` — the final-norm output — for DSpark).
+pub struct PonderOutputs {
+    pub logits: Tensor<3>,
+    pub rec: Tensor<1>,
+    pub p_dist: Tensor<2>,
+    pub kl: Tensor<1>,
+    pub out_acc: Tensor<3>,
+    pub h: Tensor<3>,
 }
 
 #[derive(Clone, Debug)]
@@ -587,7 +645,7 @@ pub(crate) struct IterBufs {
 /// CE, the halting recurrence and the final norm + lm_head readout (fp32,
 /// bf16-logits NaN rule) all run under ONE autodiff node; the per-iteration
 /// attention/engram arms stay off (M4 adds them).
-pub fn ponder_loop_step(inp: PonderInputs) -> (Tensor<3>, Tensor<1>, Tensor<2>, Tensor<1>)
+pub fn ponder_loop_step(inp: PonderInputs) -> PonderOutputs
 where
     DispatchTensor: DispatchKindConversion<CAd> + DispatchKindConversion<CB>,
 {
@@ -774,9 +832,12 @@ where
     let (hf_t, hf) = empty1(&dev, bt * d);
     let (zlf_t, zlf) = empty1(&dev, bt * r);
     let (lgstg_t, lgstg) = empty1(&dev, bt * v);
-    // flat output [rec | pd(b·N) | kl | logits(bt·v)]: every region is fully
-    // written by our kernels, so no zero-seed is needed.
-    let (flat_t, flat) = empty1(&dev, 2 + b * n_iter + bt * v);
+    // flat output [rec | pd(b·N) | kl | logits(bt·v) | oa(bt·d) | hf(bt·d)]:
+    // every region is fully written by our kernels, so no zero-seed is needed.
+    // oa/hf expose the latents the burn-path aux heads consume (JEPA/KoLeo on
+    // out_acc, DSpark on the final-norm output).
+    let off_oa = 2 + b * n_iter + bt * v;
+    let (flat_t, flat) = empty1(&dev, off_oa + 2 * bt * d);
     keep1.extend([oa_t, invf_t, hf_t, zlf_t, lgstg_t, flat_t]);
 
     // ---- forward kernels.
@@ -1027,6 +1088,27 @@ where
             (2 + b * n_iter) as u32,
             (bt * v) as u32,
         );
+        // latents for the burn-path aux heads: out_acc + final-norm output
+        kernels::copy_kernel::launch_unchecked::<f32, Cuda>(
+            &client,
+            ew_cubes(bt * d),
+            EW,
+            BufferArg::from_raw_parts(oa.handle.clone(), bt * d),
+            BufferArg::from_raw_parts(flat.handle.clone(), off_oa),
+            0u32,
+            off_oa as u32,
+            (bt * d) as u32,
+        );
+        kernels::copy_kernel::launch_unchecked::<f32, Cuda>(
+            &client,
+            ew_cubes(bt * d),
+            EW,
+            BufferArg::from_raw_parts(hf.handle.clone(), bt * d),
+            BufferArg::from_raw_parts(flat.handle.clone(), off_oa + bt * d),
+            0u32,
+            (off_oa + bt * d) as u32,
+            (bt * d) as u32,
+        );
     }
     // fence before any burn-side op consumes the outputs (the output slices
     // in split_outputs, the loss build, backward).
@@ -1112,20 +1194,19 @@ where
     };
 
     let prep = PonderLoop.prepare::<NoCheckpointing>(nodes);
-    let (logits, rec, pd, kl) = match prep.compute_bound().stateful() {
+    match prep.compute_bound().stateful() {
         OpsKind::Tracked(mut p) => {
             for at in &ats {
                 let _id = p.checkpoint(at);
             }
             let out = p.finish(state, flat);
-            split_outputs(out, b, t, v, b * n_iter, bt)
+            split_outputs(out, b, t, v, b * n_iter, bt, d)
         }
         OpsKind::UnTracked(p) => {
             let out = p.finish(flat);
-            split_outputs(out, b, t, v, b * n_iter, bt)
+            split_outputs(out, b, t, v, b * n_iter, bt, d)
         }
-    };
-    (logits, rec, pd, kl)
+    }
 }
 
 fn split_outputs(
@@ -1135,7 +1216,8 @@ fn split_outputs(
     v: usize,
     bn: usize,
     bt: usize,
-) -> (Tensor<3>, Tensor<1>, Tensor<2>, Tensor<1>) {
+    d: usize,
+) -> PonderOutputs {
     let out_t = Tensor::<1>::from_primitive::<CAd>(out);
     let rec = out_t.clone().slice([0..1]);
     // pd region is iteration-major (flat[1 + n·b + bi]): [b, N] needs a
@@ -1148,8 +1230,24 @@ fn split_outputs(
         .reshape::<2, _>([bn / b, b])
         .transpose();
     let kl = out_t.clone().slice([1 + bn..2 + bn]);
-    let logits = out_t.slice([2 + bn..2 + bn + bt * v]).reshape([b, t, v]);
-    (logits, rec, pd, kl)
+    let off_oa = 2 + bn + bt * v;
+    let logits = out_t
+        .clone()
+        .slice([2 + bn..2 + bn + bt * v])
+        .reshape([b, t, v]);
+    let out_acc = out_t
+        .clone()
+        .slice([off_oa..off_oa + bt * d])
+        .reshape([b, t, d]);
+    let h = out_t.slice([off_oa + bt * d..off_oa + 2 * bt * d]).reshape([b, t, d]);
+    PonderOutputs {
+        logits,
+        rec,
+        p_dist: pd,
+        kl,
+        out_acc,
+        h,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1168,6 +1266,11 @@ pub(crate) struct ArmsDirectState {
     pub attn: Vec<CubeTensor>,
     pub gate: Vec<CubeTensor>,
     pub hashed: Option<CubeTensor>,
+    /// RAM-offload rows ([bt, 96] bare primitive) when the engram arm ran in
+    /// host-rows mode; its grad comes from the inner graph (parent 61).
+    pub rows: Option<CubeTensor>,
+    /// Captured live arm weights for the inner-graph backward.
+    pub arm: Option<ArmLeavesPair>,
     pub lb_bytes: Vec<u8>,
     pub x: CubeTensor,
 }
@@ -1175,16 +1278,16 @@ pub(crate) struct ArmsDirectState {
 #[derive(Debug)]
 struct PonderLoopArms;
 
-impl Backward<CB, 61> for PonderLoopArms {
+impl Backward<CB, 62> for PonderLoopArms {
     type State = ArmsDirectState;
-    fn backward(self, ops: Ops<Self::State, 61>, grads: &mut Gradients, _cp: &mut Checkpointer) {
+    fn backward(self, ops: Ops<Self::State, 62>, grads: &mut Gradients, _cp: &mut Checkpointer) {
         crate::fused::backward::ponder_backward_arms_direct(ops, grads, _cp)
     }
 }
 
 
 
-pub fn ponder_loop_step_arms(inp: PonderInputs) -> (Tensor<3>, Tensor<1>, Tensor<2>, Tensor<1>)
+pub fn ponder_loop_step_arms(inp: PonderInputs) -> PonderOutputs
 where
     DispatchTensor: DispatchKindConversion<CAd> + DispatchKindConversion<CB>,
 {
@@ -1283,17 +1386,33 @@ where
     ats.extend_from_slice(&lm.1);
     nodes.push(gf_at.node.clone());
     ats.push(gf_at);
-    // pad to 61 for generic Backward<61> (nexp=3 needs 30 dummies)
+    // parent 61: the RAM-offload rows leaf ([bt, 96], dense-forced). Its grad
+    // is produced by the arms inner graph and registered here so the burn-side
+    // gather chain (rows_param -> embed) trains the host tables.
+    const ROW_DIM: usize = 96; // 3 tables x 32 (offload::HostNgram dim)
+    let rows_ad = inp
+        .host_rows
+        .as_ref()
+        .map(|r| ad2(r.clone().reshape([bt, ROW_DIM])));
+    if let Some(ra) = &rows_ad {
+        nodes.push(ra.at.node.clone());
+        ats.push(ra.at.clone());
+        keep2.push(ra.t.clone());
+    }
+    // pad to 62 for generic Backward<62> (nexp=3 needs 30 dummies)
     let dummy_node = nodes[0].clone();
     let dummy_at = ats[0].clone();
-    while nodes.len() < 61 {
+    while nodes.len() < 62 {
         nodes.push(dummy_node.clone());
     }
-    while ats.len() < 61 {
+    while ats.len() < 62 {
         ats.push(dummy_at.clone());
     }
     let (nexp_c, pad_c, bt_c, b_c, t_c, d_c) = (nexp as u32, pad as u32, bt as u32, b as u32, t as u32, d as u32);
     let client = x_prim.client.clone();
+    // RAM-offload rows: the bare primitive of the [bt, 96] embed, consumed by
+    // the raw engram forward below (the burn gather chain stays outside).
+    let rows_cube: Option<CubeTensor> = rows_ad.as_ref().map(|ra| ra.prim.clone());
     // hashed cube for engram (small, host copy is fine)
     let hashed_cube: Option<CubeTensor> = inp.hashed_ids.as_ref().map(|h| {
         let dev = Device::cuda(0);
@@ -1377,7 +1496,8 @@ where
     let (hf_t, hf) = empty1(&dev, bt * d);
     let (zlf_t, zlf) = empty1(&dev, bt * r);
     let (lgstg_t, lgstg) = empty1(&dev, bt * v);
-    let (flat_t, flat) = empty1(&dev, 2 + b * n_iter + bt * v);
+    let off_oa = 2 + b * n_iter + bt * v;
+    let (flat_t, flat) = empty1(&dev, off_oa + 2 * bt * d);
     keep1.extend([oa_t, invf_t, hf_t, zlf_t, lgstg_t, flat_t]);
     // FENCE BEFORE FIRST RAW LAUNCH
     sync(&client);
@@ -1425,9 +1545,14 @@ where
         }
         // attn blended + scaled: gdn2_chunk + msa_sparse + router blend
         unsafe { kernels::attn_blend_scale_kernel::launch_unchecked::<f32, Cuda>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(kda_vec[n].handle.clone(), bt*d), BufferArg::from_raw_parts(msa_vec[n].handle.clone(), bt*d), BufferArg::from_raw_parts(gate_vec[n].handle.clone(), bt), BufferArg::from_raw_parts(w_attn_vec[n].handle.clone(), bt), BufferArg::from_raw_parts(attn_vec[n].handle.clone(), bt*d), d_c, (bt*d) as u32); }
-        // Engram: engram_gather_kernel via engram_forward_cube
+        // Engram: engram_gather_kernel via engram_forward_cube. Host-rows mode
+        // (RAM offload) takes priority, mirroring forward_with_hidden.
         if cfg.use_engram {
-            if let Some(ref hc) = hashed_cube {
+            if let Some(ref rc) = rows_cube {
+                let eng_cube = crate::fused::kernels::arms::engram_forward_embeds_cube(&lb_bare.engram, rc, &pi.h_ctx, b, t, d);
+                unsafe { kernels::copy_kernel::launch_unchecked::<f32, Cuda>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(eng_cube.handle.clone(), bt*d), BufferArg::from_raw_parts(engram_vec[n].handle.clone(), bt*d), 0, 0, (bt*d) as u32); }
+                unsafe { kernels::engram_scale_kernel::launch_unchecked::<f32, Cuda>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(engram_vec[n].handle.clone(), bt*d), BufferArg::from_raw_parts(w_mem_vec[n].handle.clone(), bt), BufferArg::from_raw_parts(engram_vec[n].handle.clone(), bt*d), d_c, (bt*d) as u32); }
+            } else if let Some(ref hc) = hashed_cube {
                 let eng_cube = crate::fused::kernels::arms::engram_forward_cube(&lb_bare.engram, hc, &pi.h_ctx, b, t, d, 3);
                 unsafe { kernels::copy_kernel::launch_unchecked::<f32, Cuda>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(eng_cube.handle.clone(), bt*d), BufferArg::from_raw_parts(engram_vec[n].handle.clone(), bt*d), 0, 0, (bt*d) as u32); }
                 unsafe { kernels::engram_scale_kernel::launch_unchecked::<f32, Cuda>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(engram_vec[n].handle.clone(), bt*d), BufferArg::from_raw_parts(w_mem_vec[n].handle.clone(), bt), BufferArg::from_raw_parts(engram_vec[n].handle.clone(), bt*d), d_c, (bt*d) as u32); }
@@ -1478,23 +1603,27 @@ where
     launch_mm(&client, &hf, &lm.0.u, &lm.0.s, &lm.0.mu, &zlf, bt, d, r, d, 1, r, 1, bt*d, d*r, false, false, true, false, false);
     launch_mm(&client, &zlf, &lm.0.v, &lm.0.s, &lm.0.mv, &lgstg, bt, r, v, r, 1, r, 1, bt*r, v*r, false, true, true, true, false);
     unsafe { kernels::copy_kernel::launch_unchecked::<f32, Cuda>(&client, ew_cubes(bt*v), EW, BufferArg::from_raw_parts(lgstg.handle.clone(), bt*v), BufferArg::from_raw_parts(flat.handle.clone(), 2+b*n_iter+bt*v), 0, (2+b*n_iter) as u32, (bt*v) as u32); }
+    unsafe {
+        // latents for the burn-path aux heads (JEPA on out_acc, DSpark on hf)
+        kernels::copy_kernel::launch_unchecked::<f32, Cuda>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(oa.handle.clone(), bt*d), BufferArg::from_raw_parts(flat.handle.clone(), off_oa), 0, off_oa as u32, (bt*d) as u32);
+        kernels::copy_kernel::launch_unchecked::<f32, Cuda>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(hf.handle.clone(), bt*d), BufferArg::from_raw_parts(flat.handle.clone(), off_oa + bt*d), 0, (off_oa + bt*d) as u32, (bt*d) as u32);
+    }
     // No extra sync here: the single fence was at the start, and the final
     // sync is after the last kernel before the autodiff node is created.
     // The 1 outer node will be created below; its backward will run the
     // exact adjoint via gdn2_chunk and msa_sparse kernels (no inner Autodiff).
     sync(&client);
-    let nodes_arr: [_; 61] = nodes.try_into().expect("61 parents for arms (3 or 8 experts)");
-    let ats_arr: [_; 61] = ats.try_into().expect("61 checkpoints");
+    let nodes_arr: [_; 62] = nodes.try_into().expect("62 parents for arms (3 or 8 experts)");
+    let ats_arr: [_; 62] = ats.try_into().expect("62 checkpoints");
     let base = PonderState { b, t, d, f, r, v, nexp, pad, bt, n_iter, prior: prior_v, dev: dev.clone(), tgt: tgt_c, wc: wc.prim, g: g_prim, gf: gf_prim, rs: rs_prim, wh: wh.prim, experts: experts_c, op: op.0, lm: lm.0, per, oa, hf, invf, zlf, nh0, keep2, keep1 };
-    let state = ArmsDirectState { base, cfg: cfg.clone(), w_attn: w_attn_vec, w_mem: w_mem_vec, kda_out: kda_vec, msa_out: msa_vec, engram_out: engram_vec, attn: attn_vec, gate: gate_vec, hashed: hashed_cube, lb_bytes: lb_bytes.clone(), x: x_prim.clone() };
+    let state = ArmsDirectState { base, cfg: cfg.clone(), w_attn: w_attn_vec, w_mem: w_mem_vec, kda_out: kda_vec, msa_out: msa_vec, engram_out: engram_vec, attn: attn_vec, gate: gate_vec, hashed: hashed_cube, rows: rows_cube, arm: inp.arm_leaves.clone(), lb_bytes: lb_bytes.clone(), x: x_prim.clone() };
     let prep = PonderLoopArms.prepare::<NoCheckpointing>(nodes_arr);
-    let (logits, rec, pd, kl) = match prep.compute_bound().stateful() {
+    match prep.compute_bound().stateful() {
         OpsKind::Tracked(mut p) => {
             for at in &ats_arr { let _id = p.checkpoint(at); }
             let out = p.finish(state, flat);
-            split_outputs(out, b, t, v, b*n_iter, bt)
+            split_outputs(out, b, t, v, b*n_iter, bt, d)
         }
-        OpsKind::UnTracked(p) => { let out = p.finish(flat); split_outputs(out, b, t, v, b*n_iter, bt) }
-    };
-    (logits, rec, pd, kl)
+        OpsKind::UnTracked(p) => { let out = p.finish(flat); split_outputs(out, b, t, v, b*n_iter, bt, d) }
+    }
 }
