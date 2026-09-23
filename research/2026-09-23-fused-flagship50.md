@@ -67,8 +67,11 @@ correctness premise (grad coverage, ckpt completeness, resume) now holds.
 ## Resume through the fused path (criterion d)
 
 2M-slot round trip (mechanics are slot-count independent; a resumed 48M run
-holds ~37 GB RSS): 60-step fused run killed right after the step-20 ckpt, then
-re-run with the same argv. Load + continuation + drift check results in
-`/tmp/opencode/fused_parity/resume_test.log` (summary: resume loaded step 20,
-ran to 60, exit 0; same ckpt-name with a changed `--lr` hard-errored on config
-drift, exit 1, per ADR-0005).
+holds ~37 GB RSS), confirmed 2026-09-23 in
+`/tmp/opencode/fused_parity/resume_test.log`: the 60-step fused run was
+killed 6 s after the step-20 ckpt save; the same-argv re-run logged
+`resumed fusert from /tmp/opencode/fused_parity/rt step 20`, continued
+through 40 to `done steps=60`, exit 0. The drift negative test (same
+ckpt-name, `--lr 0.001`) hard-errored before any GPU work with
+`config drift: 1 key(s) differ ... train.lr`, exit 1 - ADR-0005 semantics
+intact through the fused path.
