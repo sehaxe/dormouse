@@ -72,11 +72,29 @@ step 40 with no divergence or NaN (criterion d evidence).
 
 Headline perf caveat: at the flagship recipe the fused path is ~1.25x SLOWER
 than burn, not the 1.7-2x faster measured at batch 6 with arms+aux off
-(ADR-0003 smoke). The arms adjoint reruns KDA/MSA/Engram through an inner
-burn Autodiff graph per iteration; the fusion win does not survive arms+aux
-at batch 10 yet. Criterion (b) proper (BPB parity on a confirm-tier run)
-needs the 2k A/B - the 2k fused arm was launched detached, log:
-`/tmp/opencode/fused/fgc2k.log`.
+(ADR-0003 smoke). Steady-state (steps 10-40, quiet box, timestamps from the
+worker logs): fused ~9.0 s/step (8.8-9.6) vs burn ~7.05 s/step (67.9-71.8 s
+per 10 steps); step-0 warmup timers 18.7-18.9 s fused vs 13.5 s burn
+(fwd 5.9 vs 3.6, bwd 9.4 vs 6.2). Structural reason: `arms_inner_adjoint`
+RE-RUNS the arms forward per iteration inside backward to build the inner
+graph, while burn's own backward reuses saved forward intermediates - the
+fused path pays an extra N arms-forwards per step. The direct Cube adjoint
+kernels (`kda_backward_cube`/`msa_backward_cube`/`engram_backward_cube` in
+fused/kernels.rs) already exist as the escape hatch: seed them from the
+fused forward's saved arm buffers instead of rebuilding the inner graph.
+That, not more coverage work, is where the fused win at the flagship recipe
+has to come from.
+
+## Criterion (b/e): 2k fused parity run - LAUNCHED
+
+`fgc2kfused`: small, batch 10, s512, 48M engram-ram, host-adam every step,
+aux on, 2000 steps, ckpt-every 500, eval-every 500 on the 500 MB tail,
+`--guard --detach`. Log: `/tmp/opencode/fused/fgc2k.log` (timestamped lines);
+ckpts `checkpoints/fgc2kfused.*`. Startup verified: FUSED arm line present,
+step-0 ce 5.659 aux 0.1636, first EVAL due at step 500. Note: an earlier
+2k attempt by the other worker (`/tmp/opencode/fused_parity/fused2k.log`)
+was killed silently at ~step 10-50 when a second 48M run (iter4) landed on
+top of it - the AGENTS.md one-heavy-run rule exists because of exactly that.
 
 ## Criterion (c): resume through the fused path - GREEN
 
