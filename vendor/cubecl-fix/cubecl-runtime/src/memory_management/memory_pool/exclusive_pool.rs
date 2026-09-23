@@ -1,0 +1,350 @@
+use crate::{
+    memory_management::{
+        BytesFormat, MemoryLocation, MemoryPoolKind, MemoryPoolReport, MemoryUsage,
+    },
+    server::IoError,
+    storage::{ComputeStorage, StorageUtilization},
+};
+
+use alloc::vec::Vec;
+use cubecl_environment::backtrace::BackTrace;
+
+use super::{
+    ManagedMemoryBinding, ManagedMemoryHandle, MemoryPool, PageMapping, Slice, calculate_padding,
+};
+
+/// A memory pool that allocates buffers in a range of sizes and reuses them to minimize allocations.
+///
+/// - Only one slice is supported per page, due to the limitations in WGPU where each buffer should only bound with
+///   either read only or `read_write` slices but not a mix of both.
+/// - The pool uses a ring buffer to efficiently manage and reuse pages.
+pub struct ExclusiveMemoryPool {
+    /// Slot-preserving page storage: freed pages leave a hole (`None`) that
+    /// future allocations reuse, so a page's index is **permanent for the
+    /// pool's lifetime**. Descriptors cache their page index
+    /// ([`MemoryLocation::page`](super::handle::ManagedMemoryDescriptor)); a
+    /// cached index can therefore never be renumbered out from under its
+    /// owner — cleanup no longer invalidates aliased descriptors.
+    pages: Vec<Option<MemoryPage>>,
+    /// Indices of holes in `pages`, popped by allocation before growing.
+    free_slots: Vec<usize>,
+    alignment: u64,
+    dealloc_period: u64,
+    last_dealloc_check: u64,
+    max_alloc_size: u64,
+    cur_avg_size: f64,
+    location_base: MemoryLocation,
+    /// The most pages ever held at once (pages come and go with
+    /// `dealloc_period`, so the current count understates the peak).
+    pages_peak: u64,
+    /// Occupied slots (`pages` entries that are `Some`).
+    pages_live: usize,
+    /// The largest allocation ever served, in requested (pre-padding) bytes.
+    largest_alloc: u64,
+}
+
+impl core::fmt::Display for ExclusiveMemoryPool {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_fmt(format_args!(
+            " - Exclusive Pool max_alloc_size={}\n",
+            BytesFormat::new(self.max_alloc_size)
+        ))?;
+
+        for page in self.pages.iter().flatten() {
+            let is_free = page.slice.is_free();
+            let size = BytesFormat::new(page.slice.effective_size());
+
+            f.write_fmt(format_args!("   - Page {size} is_free={is_free}\n"))?;
+        }
+
+        if !self.pages.is_empty() {
+            f.write_fmt(format_args!("\n{}\n", self.get_memory_usage()))?;
+        }
+
+        Ok(())
+    }
+}
+
+const SIZE_AVG_DECAY: f64 = 0.01;
+
+// How many times to find the allocation 'free' before deallocating it.
+const ALLOC_AFTER_FREE: u32 = 5;
+
+struct MemoryPage {
+    slice: Slice,
+    alloc_size: u64,
+    free_count: u32,
+}
+
+impl ExclusiveMemoryPool {
+    pub(crate) fn new(
+        max_alloc_size: u64,
+        alignment: u64,
+        dealloc_period: u64,
+        pool_pos: u8,
+    ) -> Self {
+        // Pages should be allocated to be aligned.
+        assert_eq!(max_alloc_size % alignment, 0);
+
+        Self {
+            pages: Vec::new(),
+            free_slots: Vec::new(),
+            alignment,
+            dealloc_period,
+            last_dealloc_check: 0,
+            max_alloc_size,
+            cur_avg_size: max_alloc_size as f64 / 2.0,
+            location_base: MemoryLocation::new(pool_pos, 0, 0),
+            pages_peak: 0,
+            pages_live: 0,
+            largest_alloc: 0,
+        }
+    }
+
+    /// A structured snapshot of the pool: shape, usage, high-water marks.
+    pub(crate) fn report(&self) -> MemoryPoolReport {
+        MemoryPoolReport {
+            kind: MemoryPoolKind::Exclusive {
+                max_alloc_size: self.max_alloc_size,
+            },
+            usage: self.get_memory_usage(),
+            pages: self.pages_live as u64,
+            pages_peak: self.pages_peak,
+            // This pool only allocates eagerly.
+            pages_unmapped: 0,
+            largest_alloc: self.largest_alloc,
+        }
+    }
+
+    /// Finds a free page that can contain the given size
+    /// Returns a slice on that page if successful.
+    fn get_free_page(&mut self, size: u64) -> Option<&mut MemoryPage> {
+        // Return the smallest free page that fits.
+        self.pages
+            .iter_mut()
+            .flatten()
+            .filter(|page| page.alloc_size >= size && page.slice.is_free())
+            .min_by_key(|page| page.free_count)
+    }
+
+    fn alloc_page<Storage: ComputeStorage>(
+        &mut self,
+        storage: &mut Storage,
+        size: u64,
+    ) -> Result<(usize, &mut MemoryPage), IoError> {
+        let alloc_size = (self.cur_avg_size as u64)
+            .max(size)
+            .next_multiple_of(self.alignment);
+
+        let storage = storage.alloc(alloc_size)?;
+
+        let padding = calculate_padding(size, self.alignment);
+        let mut slice = Slice::new(storage, padding);
+
+        // Return a smaller part of the slice. By construction, we only ever
+        // get a page with a big enough size, so this is ok to do.
+        slice.storage.utilization = StorageUtilization { offset: 0, size };
+        slice.padding = padding;
+
+        let page = MemoryPage {
+            slice,
+            alloc_size,
+            // Start the allocation at 'almost ready to free'. Every use will decrement this.
+            // This means allocations start as "suspected as unused" and over time will be kept for longer.
+            free_count: ALLOC_AFTER_FREE - 1,
+        };
+
+        // Reuse a freed slot when one exists: a page index, once handed out
+        // inside a descriptor location, is only ever retired by the owner —
+        // never shifted by cleanup and never renumbered.
+        let idx = match self.free_slots.pop() {
+            Some(idx) => {
+                self.pages[idx] = Some(page);
+                idx
+            }
+            None => {
+                self.pages.push(Some(page));
+                self.pages.len() - 1
+            }
+        };
+        self.pages_live += 1;
+        self.pages_peak = self.pages_peak.max(self.pages_live as u64);
+
+        Ok((idx, self.pages[idx].as_mut().unwrap()))
+    }
+}
+
+impl MemoryPool for ExclusiveMemoryPool {
+    fn accept(&self, size: u64) -> bool {
+        self.max_alloc_size >= size
+    }
+
+    /// Reserves memory of specified size using the reserve algorithm, and return
+    /// a handle to the reserved memory.
+    ///
+    /// Also clean ups, merging free slices together if permitted by the merging strategy
+    fn try_reserve(&mut self, size: u64) -> Option<ManagedMemoryHandle> {
+        self.cur_avg_size =
+            self.cur_avg_size * (1.0 - SIZE_AVG_DECAY) + size as f64 * SIZE_AVG_DECAY;
+
+        let padding = calculate_padding(size, self.alignment);
+
+        let handle = self.get_free_page(size).map(|page| {
+            // Return a smaller part of the slice. By construction, we only ever
+            // get a page with a big enough size, so this is ok to do.
+            page.slice.storage.utilization = StorageUtilization { offset: 0, size };
+            page.slice.padding = padding;
+            page.free_count = page.free_count.saturating_sub(1);
+            page.slice.handle.clone()
+        });
+
+        if handle.is_some() {
+            self.largest_alloc = self.largest_alloc.max(size);
+        }
+
+        handle
+    }
+
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(level = "trace", skip(self, storage))
+    )]
+    fn alloc<Storage: ComputeStorage>(
+        &mut self,
+        storage: &mut Storage,
+        size: u64,
+        // Always eager: this pool serves the preset layouts and the auxiliary
+        // (staging/uniform/pinned) managers, whose buffers are written right
+        // after reservation — laziness would only move the same allocation
+        // one call later.
+        _mapping: PageMapping,
+    ) -> Result<ManagedMemoryHandle, IoError> {
+        if size > self.max_alloc_size {
+            return Err(IoError::BufferTooBig {
+                size,
+                backtrace: BackTrace::capture(),
+            });
+        }
+
+        let (idx, page) = self.alloc_page(storage, size)?;
+        let handle = page.slice.handle.clone();
+        let mut location = self.location_base;
+        location.page = idx as u16;
+        handle.descriptor().update_location(location);
+        self.largest_alloc = self.largest_alloc.max(size);
+
+        Ok(handle)
+    }
+
+    fn get_memory_usage(&self) -> MemoryUsage {
+        let used_slices: Vec<_> = self
+            .pages
+            .iter()
+            .flatten()
+            .filter(|page| !page.slice.is_free())
+            .collect();
+
+        MemoryUsage {
+            number_allocs: used_slices.len() as u64,
+            bytes_in_use: used_slices
+                .iter()
+                .map(|page| page.slice.storage.size())
+                .sum(),
+            bytes_padding: used_slices.iter().map(|page| page.slice.padding).sum(),
+            bytes_reserved: self
+                .pages
+                .iter()
+                .flatten()
+                .map(|page| page.alloc_size)
+                .sum(),
+        }
+    }
+
+    fn cleanup<Storage: ComputeStorage>(
+        &mut self,
+        storage: &mut Storage,
+        alloc_nr: u64,
+        explicit: bool,
+    ) {
+        // Check such that an alloc is free after at most dealloc_period.
+        let check_period = self.dealloc_period / (ALLOC_AFTER_FREE as u64);
+
+        if explicit || alloc_nr - self.last_dealloc_check >= check_period {
+            self.last_dealloc_check = alloc_nr;
+
+            // Pages are freed in place: the slot becomes a hole for future
+            // allocations to reuse, and every surviving page keeps its index.
+            // Descriptors aliasing a page (e.g. orphaned by `bind`) therefore
+            // never observe a stale page index after a cleanup.
+            for idx in 0..self.pages.len() {
+                let dealloc_id = match &mut self.pages[idx] {
+                    Some(page) if page.slice.is_free() => {
+                        page.free_count += 1;
+
+                        // If free found is sufficiently high (ie. we've seen this alloc as free multiple times,
+                        // without it being used in the meantime), deallocate it.
+                        (page.free_count >= ALLOC_AFTER_FREE || explicit)
+                            .then_some(page.slice.storage.id)
+                    }
+                    _ => None,
+                };
+
+                if let Some(id) = dealloc_id {
+                    storage.dealloc(id);
+                    self.pages[idx] = None;
+                    self.free_slots.push(idx);
+                    self.pages_live -= 1;
+                }
+            }
+        }
+    }
+
+    fn bind(
+        &mut self,
+        old: ManagedMemoryHandle,
+        new: ManagedMemoryHandle,
+        cursor: u64,
+    ) -> Result<(), IoError> {
+        let id_old = old.descriptor();
+        let page = self
+            .pages
+            .get_mut(id_old.page())
+            .and_then(|slot| slot.as_mut())
+            .ok_or_else(|| IoError::NotFound {
+                backtrace: BackTrace::capture(),
+                reason: alloc::format!("Memory page {} doesn't exist", id_old.page()).into(),
+            })?;
+        new.descriptor().update_location(id_old.location());
+
+        page.slice.handle = new;
+        page.slice.cursor = cursor;
+
+        Ok(())
+    }
+
+    fn find(&self, binding: &ManagedMemoryBinding) -> Result<&Slice, IoError> {
+        let binding_descriptor = binding.descriptor();
+        let page_index = binding_descriptor.page();
+
+        let page = self
+            .pages
+            .get(page_index)
+            .and_then(|slot| slot.as_ref())
+            .ok_or_else(|| IoError::NotFound {
+                backtrace: BackTrace::capture(),
+                reason: alloc::format!("Memory page {} doesn't exist", page_index).into(),
+            })?;
+
+        // Page indices are permanent but reusable: a binding whose index was
+        // retired and handed to a newer allocation must surface as `NotFound`,
+        // never as the newer allocation's slice.
+        if page.slice.handle.descriptor().id != binding_descriptor.id {
+            return Err(IoError::NotFound {
+                backtrace: BackTrace::capture(),
+                reason: alloc::format!("Stale binding for reused page {page_index}").into(),
+            });
+        }
+
+        Ok(&page.slice)
+    }
+}

@@ -1,0 +1,25 @@
+[package]
+name = "burn-rmsnorm"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "RMS Normalization for Burn (LLaMA/Mistral/Qwen/DeepSeek/Gemma)"
+keywords = ["burn", "rmsnorm", "normalization", "llm"]
+repository = "https://github.com/sehaxe/burn-rmsnorm"
+readme = "README.md"
+
+[features]
+default = ["std"]
+std = ["burn/std", "burn-tensor/std"]
+cuda = ["dep:burn-cuda", "dep:burn-cubecl", "dep:cubecl", "burn/std", "burn/cuda", "burn-tensor/cuda", "burn/extension"]
+
+[dependencies]
+burn = { workspace = true }
+burn-tensor = { workspace = true }
+burn-cuda = { workspace = true, optional = true }
+burn-cubecl = { workspace = true, optional = true }
+cubecl = { workspace = true, optional = true, features = ["std"] }
+
+[dev-dependencies]
+burn-ndarray = { workspace = true, features = ["blas-openblas"] }
+burn = { workspace = true, features = ["ndarray", "std"] }

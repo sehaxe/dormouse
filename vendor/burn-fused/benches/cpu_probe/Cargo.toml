@@ -1,0 +1,13 @@
+[package]
+name = "cpu-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+[dependencies]
+burn = { workspace = true, features = ["std", "cuda"] }
+burn-rope = { path = "../../crates/burn-rope", features = ["cuda"] }
+burn-situ = { path = "../../crates/burn-situ", features = ["cuda"] }
+burn-rmsnorm = { path = "../../crates/burn-rmsnorm", features = ["cuda"] }
+burn-swiglu = { path = "../../crates/burn-swiglu", features = ["cuda"] }
+burn-cubecl = { workspace = true, features = ["std"] }
+cubecl = { workspace = true, features = ["std", "cuda", "cpu"] }

@@ -5,6 +5,9 @@ members = [
     "crates/dormouse-train",
     "crates/dormouse-cli",
 ]
+# vendored fork workspaces: they are their own workspace roots; without this
+# cargo resolves their crates' `workspace = true` inheritance against OUR root.
+exclude = ["vendor/burn-fused", "vendor/cubecl-fix"]
 resolver = "2"
 [workspace.package]
 version = "0.1.0"
@@ -17,9 +20,30 @@ lto = "thin"
 # (cubecl) bound, so the runtime cost vs 1 is negligible.
 codegen-units = 16
 
+# Dev/test speed: burn-ndarray CPU matmuls at opt-level 0 made tests 5-10x
+# slower than they should be, so dependencies compile optimized while our
+# own crates stay at 0 for fast iteration. `line-tables-only` keeps panic
+# backtraces readable with much less debug info to link. Costs one full
+# recompile when it landed (2026-09-22), then caches.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 3
+
+# ...except our own crates: keep them at 0 so incremental builds stay fast.
+[profile.dev.package.dormouse-core]
+opt-level = 0
+[profile.dev.package.dormouse-data]
+opt-level = 0
+[profile.dev.package.dormouse-train]
+opt-level = 0
+[profile.dev.package.dormouse-cli]
+opt-level = 0
+
 # Same patches as aria: stale-page-safe cubecl (#1401 root fix).
 # cubek comes from crates.io (local /tmp/cubek with matmul tail fixes was
 # lost to the tmpfs wipe; registry cubek 0.3.0-pre.3 has the fp4 helpers).
 [patch.crates-io]
-cubecl-runtime = { path = "/home/sehaxe/cubecl-fix/cubecl-runtime" }
-cubecl-cuda = { path = "/home/sehaxe/cubecl-fix/cubecl-cuda" }
+cubecl-runtime = { path = "vendor/cubecl-fix/cubecl-runtime" }
+cubecl-cuda = { path = "vendor/cubecl-fix/cubecl-cuda" }

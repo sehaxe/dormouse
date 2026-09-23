@@ -1,0 +1,58 @@
+name: CI # gdn2
+
+on:
+  push:
+    branches: [main, burn-0.22]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        features: ["--no-default-features", "", "--features autodiff", "--features binary-tests"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo check ${{ matrix.features }}
+
+  # CUDA compile check: needs the NVIDIA toolkit (no GPU on the runner, so
+  # compile only; the GPU tests run locally).
+  cuda-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y nvidia-cuda-toolkit
+      - run: cargo check --features "cuda,autodiff"
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        features: ["", "--features autodiff", "--features binary-tests"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # --release: the 1000-case bit-exact suite is far too slow in debug
+      - run: cargo test --release ${{ matrix.features }}
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo clippy --features autodiff -- -D warnings
+
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check

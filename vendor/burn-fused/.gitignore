@@ -1,0 +1,6 @@
+/target
+crates/*/target
+**/*.bin
+ref_data/
+Cargo.lock.bak
+.bulba/

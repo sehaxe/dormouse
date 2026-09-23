@@ -1,0 +1,12 @@
+{
+  "attnres.fused_ms": 6.701602,
+  "bitnet_fwt.fused_ms": 0.011171,
+  "gdn2_prefill.fused_ms": 0.113058,
+  "kda_prefill.fused_ms": 0.11941,
+  "mhc_sinkhorn.fused_ms": 1.901757,
+  "msa_sparse.fused_ms": 0.013426,
+  "muon_norm.fused_ms": 0.425939,
+  "rope.fused_ms": 0.709685,
+  "sct_qr.fused_ms": 52.27041,
+  "situ.fused_ms": 0.321548
+}

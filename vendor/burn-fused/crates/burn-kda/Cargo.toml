@@ -1,0 +1,29 @@
+[package]
+name = "burn-kda"
+version = "0.5.0"
+edition = "2021"
+license = "MIT"
+description = "Kimi Delta Attention for Burn - data-dependent write strength, channel-wise decay (Kimi Linear + K3), fused CUDA chunk path"
+keywords = ["burn", "kda", "delta", "attention", "recurrent"]
+repository = "https://github.com/sehaxe/burn-kda"
+homepage = "https://github.com/sehaxe/burn-kda"
+readme = "README.md"
+
+[features]
+default = ["std"]
+std = ["burn/std", "burn-tensor/std", "burn-gdn2/std"]
+autodiff = ["burn/autodiff", "burn-gdn2/autodiff", "dep:burn-autodiff"]
+cuda = ["dep:burn-cuda", "dep:burn-cubecl", "dep:cubecl", "burn/cuda", "burn-tensor/cuda", "burn-gdn2/cuda"]
+
+[dependencies]
+burn = { workspace = true }
+burn-tensor = { workspace = true }
+burn-gdn2 = { path = "../burn-gdn2", default-features = false }
+burn-autodiff = { workspace = true, optional = true, features = ["std"] }
+burn-cuda = { workspace = true, optional = true }
+burn-cubecl = { workspace = true, optional = true }
+cubecl = { workspace = true, optional = true, features = ["std"] }
+
+[dev-dependencies]
+burn-ndarray = { workspace = true, features = ["blas-openblas"] }
+burn = { workspace = true, features = ["ndarray", "autodiff", "cuda", "extension"] }

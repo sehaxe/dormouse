@@ -1,0 +1,8 @@
+[workspace]
+members = ["cubecl-runtime", "cubecl-cuda"]
+resolver = "2"
+
+# Link cubecl-cuda (and every transitive consumer) to the patched
+# cubecl-runtime instead of the registry release.
+[patch.crates-io]
+cubecl-runtime = { path = "cubecl-runtime" }

@@ -1,0 +1,35 @@
+[package]
+name = "burn-muon-plus"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "MuonW + hybrid AdamW optimizer for Burn — Nesterov momentum, Newton-Schulz orthogonalization, Moonshot LR scaling (2502.16982)"
+keywords = ["burn", "muon", "optimizer", "newton-schulz", "orthogonalization"]
+repository = "https://github.com/sehaxe/burn-muon-plus"
+homepage = "https://github.com/sehaxe/burn-muon-plus"
+documentation = "https://docs.rs/burn-muon-plus"
+readme = "README.md"
+
+[features]
+cuda = ["dep:burn-cuda", "dep:burn-cubecl", "dep:cubecl", "burn/cuda", "burn-tensor/cuda"]
+default = ["std"]
+std = ["burn/std", "burn-tensor/std", "burn/optim"]
+
+[dependencies]
+burn = { workspace = true, features = ["std", "extension", "optim"] }
+burn-tensor = { workspace = true }
+burn-pack = { workspace = true }
+
+derive-new = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+burn-cuda = { workspace = true, optional = true }
+burn-cubecl = { workspace = true, optional = true }
+cubecl = { workspace = true, optional = true, features = ["std"] }
+
+[dev-dependencies]
+burn = { workspace = true, features = ["ndarray"] }
+burn-autodiff = { workspace = true, features = ["std"] }
+burn-ndarray = { workspace = true, features = ["blas-openblas"] }
+
+[package.metadata.docs.rs]
+all-features = true

@@ -1,0 +1,9 @@
+[package]
+name = "launch-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+[dependencies]
+burn = { workspace = true, features = ["std", "cuda"] }
+cubecl = { workspace = true, features = ["std", "cuda"] }
+burn-cubecl = { workspace = true, features = ["std"] }

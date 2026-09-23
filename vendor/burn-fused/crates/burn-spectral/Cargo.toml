@@ -1,0 +1,51 @@
+[package]
+name = "burn-spectral"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Ternary Spectral Compact Training — BitNet-style ternary SVD weights with rank-1 ternary MoE routing"
+keywords = ["burn", "ternary", "svd", "spectral", "moe"]
+repository = "https://github.com/sehaxe/burn-spectral"
+readme = "README.md"
+
+[features]
+default = ["std"]
+std = ["burn/std", "burn-tensor/std"]
+cuda = ["burn/cuda", "burn-tensor/cuda", "burn/extension", "dep:burn-cubecl", "dep:cubecl", "dep:burn-cuda", "dep:futures-lite", "burn/autodiff"]
+
+[dependencies]
+burn = { workspace = true }
+burn-tensor = { workspace = true }
+burn-nn = { workspace = true }
+burn-cubecl = { workspace = true, optional = true, features = ["std"] }
+cubecl = { workspace = true, optional = true, features = ["std", "cuda"] }
+burn-bitnet = { path = "../burn-bitnet", default-features = false }
+burn-autodiff = { workspace = true, features = ["std"] }
+burn-cuda = { workspace = true, optional = true }
+futures-lite = { workspace = true, optional = true }
+
+[dev-dependencies]
+burn-ndarray = { workspace = true, features = ["blas-openblas"] }
+burn-autodiff = { workspace = true, features = ["std"] }
+burn-optim = { workspace = true, features = ["std"] }
+burn-nn = { workspace = true, features = ["std"] }
+burn-bitnet = { path = "../burn-bitnet" }
+burn-sct = { path = "../burn-sct" }
+burn-muon-plus = { path = "../burn-muon-plus" }
+burn-rope = { path = "../burn-rope" }
+burn-situ = { path = "../burn-situ" }
+burn-kda = { path = "../burn-kda", features = ["autodiff"] }
+burn-msa = { path = "../burn-msa" }
+burn = { workspace = true, features = ["ndarray", "std", "autodiff", "extension"] }
+
+[[example]]
+name = "linear_timing"
+required-features = ["cuda"]
+
+[[example]]
+name = "moe_timing"
+required-features = ["cuda"]
+
+[[example]]
+name = "moe_timing2"
+required-features = ["cuda"]

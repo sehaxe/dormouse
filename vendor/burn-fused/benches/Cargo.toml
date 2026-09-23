@@ -1,0 +1,22 @@
+[package]
+name = "burn-fused-benches"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+burn = { workspace = true, features = ["std", "cuda"] }
+burn-tensor = { workspace = true }
+burn-cubecl = { workspace = true, features = ["std"] }
+cubecl = { workspace = true, features = ["std", "cuda"] }
+burn-attnres = { path = "../crates/burn-attnres", features = ["cuda"] }
+burn-bitnet = { path = "../crates/burn-bitnet", features = ["cuda"] }
+burn-mhc = { path = "../crates/burn-mhc", features = ["cuda"] }
+burn-rope = { path = "../crates/burn-rope", features = ["cuda"] }
+burn-situ = { path = "../crates/burn-situ", features = ["cuda"] }
+burn-msa = { path = "../crates/burn-msa", features = ["cuda"] }
+burn-muon-plus = { path = "../crates/burn-muon-plus", features = ["cuda"] }
+burn-gdn2 = { path = "../crates/burn-gdn2", features = ["cuda"] }
+burn-kda = { path = "../crates/burn-kda", features = ["cuda"] }
+burn-sct = { path = "../crates/burn-sct", features = ["cuda"] }
+serde_json = "1"

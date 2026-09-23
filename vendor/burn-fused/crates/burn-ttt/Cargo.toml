@@ -1,0 +1,21 @@
+[package]
+name = "burn-ttt"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Test-Time Training for Burn - learn from context at inference time (TTT-E2E)"
+keywords = ["burn", "test-time-training", "ttt", "long-context", "continual-learning"]
+repository = "https://github.com/sehaxe/burn-ttt"
+readme = "README.md"
+
+[features]
+default = ["std"]
+std = ["burn/std", "burn-tensor/std"]
+
+[dependencies]
+burn = { workspace = true }
+burn-tensor = { workspace = true }
+
+[dev-dependencies]
+burn-ndarray = { workspace = true, features = ["blas-openblas"] }
+burn = { workspace = true, features = ["ndarray", "std"] }

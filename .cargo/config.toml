@@ -3,3 +3,12 @@
 [alias]
 build-train = "build --release -p dormouse-cli --bin train --no-default-features --features cuda"
 check-train = "check -p dormouse-cli --bin train --no-default-features --features cuda"
+
+[env]
+# cudarc's build script dies on CUDA toolkit 13.4 without a pinned version;
+# every fresh target dir needs this (set once here instead of per shell).
+CUDARC_CUDA_VERSION = "12050"
+
+[target.x86_64-unknown-linux-gnu]
+# mold 2.42 (installed 2026-09-22): fastest linker for burn-sized trees.
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]

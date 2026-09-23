@@ -1,0 +1,22 @@
+[package]
+name = "burn-byteflow"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "ByteFlow Net — tokenizer-free adaptive byte compression via coding-rate chunking (Deng et al. 2026, arXiv 2603.03583)"
+keywords = ["burn", "byteflow", "byte-level", "tokenizer-free", "transformer"]
+repository = "https://github.com/sehaxe/burn-fused"
+readme = "README.md"
+
+[features]
+default = ["std"]
+std = ["burn/std", "burn-tensor/std"]
+
+[dependencies]
+burn = { workspace = true }
+burn-tensor = { workspace = true }
+burn-swiglu = { path = "../burn-swiglu" }
+
+[dev-dependencies]
+burn-ndarray = { workspace = true, features = ["blas-openblas"] }
+burn = { workspace = true, features = ["ndarray", "std", "autodiff"] }

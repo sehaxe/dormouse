@@ -1,4 +1,6 @@
-target/
-checkpoints/
 *.bin
-.bulba/
+.bulba//target/
+/checkpoints/
+checkpoints/
+/runs/
+target/

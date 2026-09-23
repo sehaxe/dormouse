@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test default workspace (CPU paths + autodiff)
+        run: cargo test --workspace --exclude burn-fused-benches
+      - name: Test the meta-crate feature matrix
+        run: |
+          cargo check -p burn-fused --no-default-features
+          cargo check -p burn-fused --features std
+          cargo check -p burn-fused --features cuda
+
+  portability:
+    # fused kernels on the cubecl CPU runtime (no GPU needed): proves the
+    # cubecl codegen is not CUDA-only, the cheap stand-in for ROCm/Metal
+    # coverage until hardware is available
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo run -p cpu-probe --release
+
+  bench-build:
+    # the GPU benches need CUDA: compile-only check on the CPU runner
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check -p burn-fused-benches
+        env:
+          RUSTFLAGS: ""
+
+  gpu-tests:
+    # runs the cuda-gated kernel tests (fused vs tensor correctness) on the
+    # GPU self-hosted runner; the correctness CPU suite already ran above
+    runs-on: [self-hosted, gpu, linux]
+    if: github.event_name == 'pull_request'
+    env:
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@v4
+      - name: cuda-gated kernel tests
+        run: |
+          BURN_DEVICE=cuda cargo test -p burn-rope --all-features --lib
+          BURN_DEVICE=cuda cargo test -p burn-situ --all-features --lib
+          BURN_DEVICE=cuda cargo test -p burn-mhc --all-features --lib
+          BURN_DEVICE=cuda cargo test -p burn-msa --all-features --lib
+          BURN_DEVICE=cuda cargo test -p burn-attnres --all-features --lib
+          BURN_DEVICE=cuda cargo test -p burn-bitnet --all-features --lib
+          # linear-attention / spectral / fused-elementwise crates whose CUDA
+          # coverage lives in lib tests and integration tests:
+          BURN_DEVICE=cuda cargo test -p burn-gdn2 --all-features
+          BURN_DEVICE=cuda cargo test -p burn-kda --all-features
+          BURN_DEVICE=cuda cargo test -p burn-rmsnorm --all-features
+          BURN_DEVICE=cuda cargo test -p burn-swiglu --all-features
+          BURN_DEVICE=cuda cargo test -p burn-sct --all-features
+          BURN_DEVICE=cuda cargo test -p burn-spectral --all-features

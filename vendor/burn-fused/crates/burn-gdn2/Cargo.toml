@@ -1,0 +1,39 @@
+[package]
+name = "burn-gdn2"
+version = "0.7.5"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+description = "Gated DeltaNet 2 - linear recurrent token mixer with channel-wise erase/write gates"
+repository = "https://github.com/sehaxe/burn-gdn2"
+homepage = "https://github.com/sehaxe/burn-gdn2"
+keywords = ["burn", "gdn2", "linear-attention", "recurrent", "transformer"]
+readme = "README.md"
+exclude = ["__pycache__/", "TODO.md", "Cargo.lock", "target/"]
+
+[features]
+default = ["std"]
+std = ["burn/std", "burn-tensor/std"]
+autodiff = ["burn/autodiff", "burn-tensor/std", "dep:burn-autodiff"]
+cuda = ["dep:burn-cuda", "dep:burn-cubecl", "dep:cubecl", "burn/cuda", "burn-tensor/cuda"]
+binary-tests = []
+
+[dependencies]
+burn = { workspace = true, features = ["extension"] }
+burn-nn = { workspace = true }
+burn-tensor = { workspace = true }
+burn-autodiff = { workspace = true, optional = true, features = ["std"] }
+burn-cuda = { workspace = true, optional = true }
+burn-cubecl = { workspace = true, optional = true }
+cubecl = { workspace = true, optional = true, features = ["std"] }
+
+[dev-dependencies]
+burn-ndarray = { workspace = true, features = ["blas-openblas"] }
+burn-cuda = { workspace = true }
+burn-autodiff = { workspace = true }
+burn = { workspace = true, features = ["ndarray", "autodiff", "cuda", "extension"] }
+half = "2"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

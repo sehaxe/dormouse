@@ -1,0 +1,106 @@
+[package]
+name = "burn-fused"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+description = "Community fused-kernel ecosystem for Burn: 100+ technologies, faster than naive chains, less memory, any hardware"
+keywords = ["burn", "fused", "kernels", "attention", "quantization"]
+
+[features]
+default = ["std"]
+# every workspace crate ships a `std` feature, so the meta `std` covers all of them
+std = [
+    "burn-antihall/std",
+    "burn-attnres/std",
+    "burn-bitnet/std",
+    "burn-byteflow/std",
+    "burn-diffusionblocks/std",
+    "burn-dspark/std",
+    "burn-eggroll/std",
+    "burn-engram/std",
+    "burn-es/std",
+    "burn-fastblt/std",
+    "burn-gdn2/std",
+    "burn-jepa/std",
+    "burn-kda/std",
+    "burn-mhc/std",
+    "burn-mod/std",
+    "burn-mor/std",
+    "burn-msa/std",
+    "burn-mtp/std",
+    "burn-muon-plus/std",
+    "burn-nope/std",
+    "burn-parcae/std",
+    "burn-ptrn/std",
+    "burn-rmsnorm/std",
+    "burn-rope/std",
+    "burn-sct/std",
+    "burn-situ/std",
+    "burn-spectral/std",
+    "burn-swiglu/std",
+    "burn-ttt/std",
+]
+# crates that define a `cuda` feature; `/autodiff` is added where the member
+# supports it so the fused paths compose with the autodiff backend
+cuda = [
+    "burn-autodiff",
+    "burn-attnres/cuda",
+    "burn-attnres/autodiff",
+    "burn-bitnet/cuda",
+    "burn-bitnet/autodiff",
+    "burn-gdn2/cuda",
+    "burn-gdn2/autodiff",
+    "burn-kda/cuda",
+    "burn-kda/autodiff",
+    "burn-mhc/cuda",
+    "burn-mhc/autodiff",
+    "burn-msa/cuda",
+    "burn-msa/autodiff",
+    "burn-muon-plus/cuda",
+    "burn-rmsnorm/cuda",
+    "burn-rope/cuda",
+    "burn-rope/autodiff",
+    "burn-sct/cuda",
+    "burn-sct/autodiff",
+    "burn-situ/cuda",
+    "burn-situ/autodiff",
+    "burn-spectral/cuda",
+    "burn-swiglu/cuda",
+]
+
+[dependencies]
+burn-antihall = { path = "../crates/burn-antihall", default-features = false }
+burn-attnres = { path = "../crates/burn-attnres", default-features = false }
+burn-bitnet = { path = "../crates/burn-bitnet", default-features = false }
+burn-byteflow = { path = "../crates/burn-byteflow", default-features = false }
+burn-diffusionblocks = { path = "../crates/burn-diffusionblocks", default-features = false }
+burn-dspark = { path = "../crates/burn-dspark", default-features = false }
+burn-eggroll = { path = "../crates/burn-eggroll", default-features = false }
+burn-engram = { path = "../crates/burn-engram", default-features = false }
+burn-es = { path = "../crates/burn-es", default-features = false }
+burn-fastblt = { path = "../crates/burn-fastblt", default-features = false }
+burn-gdn2 = { path = "../crates/burn-gdn2", default-features = false }
+burn-jepa = { path = "../crates/burn-jepa", default-features = false }
+burn-kda = { path = "../crates/burn-kda", default-features = false }
+burn-mhc = { path = "../crates/burn-mhc", default-features = false }
+burn-mod = { path = "../crates/burn-mod", default-features = false }
+burn-mor = { path = "../crates/burn-mor", default-features = false }
+burn-msa = { path = "../crates/burn-msa", default-features = false }
+burn-mtp = { path = "../crates/burn-mtp", default-features = false }
+burn-muon-plus = { path = "../crates/burn-muon-plus", default-features = false }
+burn-nope = { path = "../crates/burn-nope", default-features = false }
+burn-parcae = { path = "../crates/burn-parcae", default-features = false }
+burn-ptrn = { path = "../crates/burn-ptrn", default-features = false }
+burn-rmsnorm = { path = "../crates/burn-rmsnorm", default-features = false }
+burn-rope = { path = "../crates/burn-rope", default-features = false }
+burn-sct = { path = "../crates/burn-sct", default-features = false }
+burn-situ = { path = "../crates/burn-situ", default-features = false }
+burn-spectral = { path = "../crates/burn-spectral", default-features = false }
+burn-swiglu = { path = "../crates/burn-swiglu", default-features = false }
+burn-ttt = { path = "../crates/burn-ttt", default-features = false }
+burn-autodiff = { workspace = true, optional = true }
+[lib]
+path = "src/lib.rs"

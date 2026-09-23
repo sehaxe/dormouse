@@ -1,0 +1,1135 @@
+//! # burn-kda - Kimi Delta Attention for Burn
+//!
+// burn-ndarray is deprecated upstream; kept as the CPU test backend until the burn-flex migration.
+#![cfg_attr(test, allow(deprecated))]
+//! Complete implementation of KDA from [Kimi Linear](https://arxiv.org/abs/2510.26692)
+//! (fine-grained gating, chunkwise WY form) and [Kimi K3](https://arxiv.org/abs/2607.24653)
+//! (§2.1.1, Eqs 1-6 - lower-bounded decay, full-rank output gate).
+//!
+//! Core recurrence (Eq 1):
+//! ```text
+//! S_t = (I - beta_t k_t k_t^T) Diag(alpha_t) S_{t-1} + beta_t k_t v_t^T
+//! o_t = S_t^T q_t
+//! ```
+//! with data-dependent per-head write strength `beta_t^h = Sigmoid(W_beta^h x_t)`
+//! (K3 Eq 2) and channel-wise decay `alpha_t = exp(g_t)` from a low-rank logit
+//! `z_t = W_alpha^down(W_alpha^up x_t) + b_alpha`:
+//! - Kimi Linear: `g_t = -exp(A_h) * Softplus(z_t)` (unbounded below)
+//! - Kimi K3:     `g_t = g_min * Sigmoid(exp(A_h) z_t)`, fixed `g_min = -5`
+//!
+//! Training uses the chunked WY form (identical algebra to GDN-2 with
+//! `b = beta`, `g = log(alpha)`, `w_gate = 1`); decoding uses the exact
+//! chunked WY form (`forward_recurrent` is the exact per-token reference).
+//! A fused CUDA kernel path (`feature = "cuda"`) reuses the GDN-2 chunked
+//! kernels through the same WY mapping.
+/// Paper's fixed log-space decay floor (K3 Eq 5: `g_min = -5`, alpha > e^-5).
+pub const G_MIN: f64 = -5.0;
+
+/// Decay logit -> per-step log-decay mapping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecayFn {
+    /// Kimi Linear: `g = -exp(A_h) * Softplus(z)`, alpha in (0, 1) - unbounded below.
+    Softplus,
+    /// Kimi K3: `g = g_min * Sigmoid(exp(A_h) z)`, alpha in (e^g_min, 1) - bounded.
+    Sigmoid,
+}
+
+/// Output gate parameterization.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GateMode {
+    /// Kimi Linear: `Sigmoid(W_g^down (W_g^up x))` - low rank, parameter-fair.
+    LowRank,
+    /// Kimi K3: `Sigmoid(W_g x)` - full rank.
+    FullRank,
+}
+
+/// KDA layer configuration.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KdaConfig {
+    pub hidden_size: usize,
+    pub num_heads: usize,
+    pub head_dim: usize,
+    pub num_v_heads: Option<usize>,
+    pub expand_v: f32,
+    pub use_short_conv: bool,
+    /// Low-rank logit rank (both papers use `rank = head_dim`).
+    pub rank: usize,
+    /// Decay logit mapping (Kimi Linear vs K3).
+    pub decay_fn: DecayFn,
+    /// Log-space decay floor (K3); pass `ln(min_decay)` to reinterpret a
+    /// decay-space floor, `<= 0` uses the fixed `G_MIN = -5`.
+    pub g_min: f64,
+    /// Output gate parameterization.
+    pub gate: GateMode,
+    pub chunk_size: usize,
+    pub norm_eps: f64,
+}
+
+impl Default for KdaConfig {
+    fn default() -> Self {
+        Self {
+            hidden_size: 128,
+            num_heads: 4,
+            head_dim: 32,
+            num_v_heads: None,
+            expand_v: 1.0,
+            use_short_conv: true,
+            rank: 0,
+            decay_fn: DecayFn::Sigmoid,
+            g_min: G_MIN,
+            gate: GateMode::FullRank,
+            chunk_size: 16,
+            norm_eps: 1e-5,
+        }
+    }
+}
+
+impl KdaConfig {
+    /// From a `Gdn2Config` (drop-in for the old wrapper) with K3 defaults.
+    pub fn from_gdn2(cfg: &Gdn2Config) -> Self {
+        Self {
+            hidden_size: cfg.hidden_size,
+            num_heads: cfg.num_heads,
+            head_dim: cfg.head_dim,
+            num_v_heads: cfg.num_v_heads,
+            expand_v: cfg.expand_v,
+            use_short_conv: cfg.use_short_conv,
+            rank: cfg.head_dim,
+            decay_fn: DecayFn::Sigmoid,
+            g_min: G_MIN,
+            gate: GateMode::FullRank,
+            chunk_size: cfg.chunk_size,
+            norm_eps: cfg.norm_eps,
+        }
+    }
+}
+#[cfg(feature = "autodiff")]
+use burn::backend::AutodiffBackend;
+use burn::backend::Backend;
+use burn::backend::DispatchKindConversion;
+use burn::module::{Module, Param};
+use burn::nn::{Initializer, Linear, LinearConfig};
+use burn::tensor::{activation, Device, DispatchTensor, Tensor};
+use burn_gdn2::{chunk_wy_forward, l2_normalize, short_conv_1d, Gdn2Config};
+
+pub mod fused;
+
+// ─── Data-dependent decay (Eq 2/5) ────────────────────────────────────
+
+/// Data-dependent channel-wise decay (K3 report Eq 2/5).
+///
+/// ```text
+/// z_t    = W^down(W^up(x_t)) + b_alpha            (Eq 2, low-rank logit)
+/// g_t    = g_min * sigmoid(e^{A_h} * z_t)          (Eq 5, per-head log scale)
+/// alpha_t = exp(g_t)  in (e^{g_min}, 1)
+/// ```
+#[derive(Module, Debug)]
+pub struct KdaDecay {
+    pub w_up: Linear,
+    pub w_down: Linear,
+    pub b_alpha: Param<Tensor<1>>,
+    /// Per-head log-scale `A_h` (Eq 5), shape `[n_heads, 1]`.
+    pub a_log: Param<Tensor<2>>,
+    #[module(skip)]
+    pub g_min: f64,
+    #[module(skip)]
+    pub decay_fn: DecayFn,
+}
+
+impl KdaDecay {
+    /// `rank`: low-rank logit dimension `r` (both papers use `rank = head_dim`).
+    /// `g_min`: log-space decay floor; K3 fixes it at -5; pass
+    /// `ln(min_decay)` to reinterpret a decay-space floor.
+    pub fn new(
+        d_model: usize,
+        n_heads: usize,
+        head_dim: usize,
+        rank: usize,
+        g_min: f64,
+        decay_fn: DecayFn,
+        device: &Device,
+    ) -> Self {
+        let init = Initializer::Normal {
+            mean: 0.0,
+            std: 0.02,
+        };
+        Self {
+            w_up: LinearConfig::new(d_model, rank)
+                .with_bias(false)
+                .with_initializer(init.clone())
+                .init(device),
+            w_down: LinearConfig::new(rank, n_heads * head_dim)
+                .with_bias(false)
+                .with_initializer(init.clone())
+                .init(device),
+            b_alpha: Param::from_tensor(Tensor::ones([n_heads * head_dim], device)),
+            // Moonshot/FLA init (FlashKDA torch_ref, kda.py): A_log = -3
+            // gives exp(A) = 0.05 and dt_bias = 1.0 anchors z ~ 1, so the
+            // decay starts conservative (alpha ~ 0.08) instead of neutral
+            // (alpha ~ 0.5 at A=0, b=0). Matches the reference recipe.
+            a_log: Param::from_tensor(Tensor::full([n_heads, 1], -3.0, device)),
+            g_min,
+            decay_fn,
+        }
+    }
+
+    /// `x`: `[B, T, D]` hidden states. Returns `alpha [B, T, H, HD]`.
+    pub fn forward(&self, x: Tensor<3>) -> Tensor<4> {
+        let z = self.w_down.forward(self.w_up.forward(x));
+        let [b2, t2, hd2] = z.shape().dims::<3>();
+        let z = z.add(self.b_alpha.val().clone().reshape([1, 1, hd2]));
+        let n_heads = self.a_log.val().shape().dims::<2>()[0];
+        let head_dim = hd2 / n_heads;
+        let z_h = z.reshape([b2, t2, n_heads, head_dim]);
+        // Clamp A before exp: an unconstrained A > 88 overflows fp32
+        // (exp(A) = inf), and `inf * 0` at z == 0 poisons the whole decay
+        // with NaN. A <= 20 keeps exp(A) ~ 4.8e8: decay still saturates to
+        // alpha = 0/1 at the extremes, NaN becomes impossible. (Measured on
+        // 5060 Ti 2026-08-29: unclamped NaN episodes at heavy overfit.)
+        let a = self
+            .a_log
+            .val()
+            .clone()
+            .reshape([1, 1, n_heads, 1])
+            .clamp(-10.0, 20.0);
+        let scaled = z_h.mul(a.exp());
+        let g = match self.decay_fn {
+            // Kimi Linear: g = -exp(A_h) * Softplus(z), alpha in (0, 1)
+            DecayFn::Softplus => activation::softplus(scaled, 1.0).neg(),
+            // Kimi K3: g = g_min * Sigmoid(exp(A_h) z), alpha in (e^g_min, 1)
+            DecayFn::Sigmoid => activation::sigmoid(scaled).mul_scalar(self.g_min as f32),
+        };
+        g.exp()
+    }
+}
+
+// ─── Exact single-step recurrence (Eq 1) ──────────────────────────────
+
+/// One KDA step (Eq 1): decay -> erase -> write -> read.
+///
+/// `state`: `[B, H, DK, DV]`, `decay`: `[H, DK]`, `q/k`: `[B, H, DK]`,
+/// `v`: `[B, H, DV]`, `beta`: scalar write strength in `(0, 1)`.
+///
+/// Returns `(state, out [B, H, DV])`.
+pub fn kda_step<B: Backend>(
+    state: Tensor<4>,
+    decay: Tensor<2>,
+    q: Tensor<3>,
+    k: Tensor<3>,
+    v: Tensor<3>,
+    beta: f64,
+) -> (Tensor<4>, Tensor<3>) {
+    let [b, h, dk, dv] = state.shape().dims::<4>();
+
+    let state = state.mul(decay.clone().reshape([1, h, dk, 1]));
+    let v_hat = state
+        .clone()
+        .swap_dims(2, 3)
+        .matmul(k.clone().reshape([b, h, dk, 1]))
+        .reshape([b, h, dv]);
+    let delta = v.clone().sub(v_hat).mul_scalar(beta);
+    let state = state + k.reshape([b, h, dk, 1]).mul(delta.reshape([b, h, 1, dv]));
+    let out = q
+        .reshape([b * h, 1, dk])
+        .matmul(state.clone().reshape([b * h, dk, dv]))
+        .reshape([b, h, dv]);
+    (state, out)
+}
+
+// ─── Full KDA layer ───────────────────────────────────────────────────
+
+/// Kimi Delta Attention layer (K3 report §2.1.1): delta rule with
+/// data-dependent lower-bounded decay.
+///
+/// Block design (K3): `q,k = L2Norm(SiLU(ShortConv(Linear(x))))`,
+/// `v = SiLU(ShortConv(Linear(x)))`; decay from Eq 2/5; scalar `beta`;
+/// output gate `Sigmoid(W_g x) * RMSNorm(o)` before `o_proj`.
+#[derive(Module, Debug)]
+pub struct KdaModule {
+    pub q_proj: Linear,
+    pub k_proj: Linear,
+    pub v_proj: Linear,
+    pub q_conv_w: Option<Param<Tensor<2>>>,
+    pub k_conv_w: Option<Param<Tensor<2>>>,
+    pub v_conv_w: Option<Param<Tensor<2>>>,
+    pub decay: KdaDecay,
+    /// Data-dependent write strength (K3 Eq 2): `beta_t^h = Sigmoid(W_beta^h x_t)`.
+    pub beta_proj: Linear,
+    /// Output gate: full-rank `W_g` (K3 Eq 6) or low-rank pair (Kimi Linear
+    /// Eq 10): `Sigmoid(W_g^down(W_g^up x))`.
+    pub o_gate: Option<Linear>,
+    pub o_gate_up: Option<Linear>,
+    pub o_gate_down: Option<Linear>,
+    #[module(skip)]
+    pub gate: GateMode,
+    pub o_norm_w: Param<Tensor<1>>,
+    pub o_proj: Linear,
+    #[module(skip)]
+    pub d_model: usize,
+    #[module(skip)]
+    pub n_heads: usize,
+    #[module(skip)]
+    pub head_dim: usize,
+    #[module(skip)]
+    pub n_v_heads: usize,
+    #[module(skip)]
+    pub v_head_dim: usize,
+    #[module(skip)]
+    pub use_short_conv: bool,
+    #[module(skip)]
+    pub chunk_size: usize,
+    #[module(skip)]
+    pub norm_eps: f64,
+}
+
+impl KdaModule {
+    /// Builds a KDA layer from a [`KdaConfig`].
+    /// `min_decay`: decay-space floor, reinterpreted as the log-space
+    /// `g_min = ln(min_decay)`; `min_decay <= 0` uses the config's `g_min`.
+    pub fn new(cfg: &KdaConfig, min_decay: f64, device: &Device) -> Self {
+        let d = cfg.hidden_size;
+        let h = cfg.num_heads;
+        let hk = cfg.head_dim;
+        let hv = cfg.num_v_heads.unwrap_or(h);
+        let v_head = (hk as f32 * cfg.expand_v) as usize;
+        let init = Initializer::Normal {
+            mean: 0.0,
+            std: 0.02,
+        };
+        let rank = if cfg.rank > 0 { cfg.rank } else { hk };
+        let g_min = if min_decay > 0.0 {
+            min_decay.ln()
+        } else {
+            cfg.g_min
+        };
+        let conv = |dim: usize| -> Option<Param<Tensor<2>>> {
+            cfg.use_short_conv.then(|| {
+                Initializer::Normal {
+                    mean: 0.0,
+                    std: 0.02,
+                }
+                .init([dim, 4], device)
+            })
+        };
+        Self {
+            q_proj: LinearConfig::new(d, h * hk)
+                .with_bias(false)
+                .with_initializer(init.clone())
+                .init(device),
+            k_proj: LinearConfig::new(d, h * hk)
+                .with_bias(false)
+                .with_initializer(init.clone())
+                .init(device),
+            v_proj: LinearConfig::new(d, hv * v_head)
+                .with_bias(false)
+                .with_initializer(init.clone())
+                .init(device),
+            q_conv_w: conv(h * hk),
+            k_conv_w: conv(h * hk),
+            v_conv_w: conv(hv * v_head),
+            decay: KdaDecay::new(d, h, hk, rank, g_min, cfg.decay_fn, device),
+            beta_proj: LinearConfig::new(d, h)
+                .with_bias(false)
+                .with_initializer(init.clone())
+                .init(device),
+            o_gate: (cfg.gate == GateMode::FullRank).then(|| {
+                LinearConfig::new(d, hv * v_head)
+                    .with_bias(false)
+                    .with_initializer(init.clone())
+                    .init(device)
+            }),
+            o_gate_up: (cfg.gate == GateMode::LowRank).then(|| {
+                LinearConfig::new(d, hk)
+                    .with_bias(false)
+                    .with_initializer(init.clone())
+                    .init(device)
+            }),
+            o_gate_down: (cfg.gate == GateMode::LowRank).then(|| {
+                LinearConfig::new(hk, hv * v_head)
+                    .with_bias(false)
+                    .with_initializer(init.clone())
+                    .init(device)
+            }),
+            gate: cfg.gate,
+            o_norm_w: Initializer::Ones.init([v_head], device),
+            o_proj: LinearConfig::new(hv * v_head, d)
+                .with_bias(false)
+                .with_initializer(init)
+                .init(device),
+            d_model: d,
+            n_heads: h,
+            head_dim: hk,
+            n_v_heads: hv,
+            v_head_dim: v_head,
+            use_short_conv: cfg.use_short_conv,
+            chunk_size: cfg.chunk_size,
+            norm_eps: cfg.norm_eps,
+        }
+    }
+
+    /// Projections + decay (K3 block design). Returns `(q, k, v, log_decay,
+    /// beta, gate_signal)` with heads expanded for grouped value attention.
+    /// Public wrapper of [`Self::project`] (testing / custom chunk paths).
+    #[allow(clippy::type_complexity)]
+    pub fn project_for_test(
+        &self,
+        x: Tensor<3>,
+    ) -> (
+        Tensor<4>,
+        Tensor<4>,
+        Tensor<4>,
+        Tensor<4>,
+        Tensor<4>,
+        Tensor<4>,
+        Tensor<4>,
+    ) {
+        self.project(x)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn project(
+        &self,
+        x: Tensor<3>,
+    ) -> (
+        Tensor<4>,
+        Tensor<4>,
+        Tensor<4>,
+        Tensor<4>,
+        Tensor<4>,
+        Tensor<4>,
+        Tensor<4>,
+    ) {
+        let [batch, tokens, _] = x.shape().dims::<3>();
+        let h = self.n_heads;
+        let hk = self.head_dim;
+        let hv = self.n_v_heads;
+        let vd = self.v_head_dim;
+        let to_4d = |t: Tensor<3>, n: usize, d: usize| -> Tensor<4> {
+            let [b, tt, _] = t.shape().dims::<3>();
+            t.reshape([b, tt, n, d]).permute([0, 2, 1, 3])
+        };
+
+        let q_raw = self.q_proj.forward(x.clone());
+        let k_raw = self.k_proj.forward(x.clone());
+        let v_raw = self.v_proj.forward(x.clone());
+
+        let q_act = if self.use_short_conv {
+            short_conv_1d(q_raw, self.q_conv_w.as_ref().unwrap().val(), None).0
+        } else {
+            activation::silu(q_raw)
+        };
+        let k_act = if self.use_short_conv {
+            short_conv_1d(k_raw, self.k_conv_w.as_ref().unwrap().val(), None).0
+        } else {
+            activation::silu(k_raw)
+        };
+        let v_act = if self.use_short_conv {
+            short_conv_1d(v_raw, self.v_conv_w.as_ref().unwrap().val(), None).0
+        } else {
+            activation::silu(v_raw)
+        };
+
+        let q_norm = l2_normalize(q_act, 1e-6);
+        let k_norm = l2_normalize(k_act, 1e-6);
+
+        let alpha = self.decay.forward(x.clone()); // [B, T, H, HD]
+        let [_, _, _, hd] = alpha.shape().dims::<4>();
+        let log_decay = alpha.log().permute([0, 2, 1, 3]); // [B, H, T, HD]
+        let _ = hd;
+
+        // Eq 2: beta_t^h = Sigmoid(W_beta^h x_t), per-head scalar in (0,1),
+        // repeated over key channels (erase term) and value channels (write).
+        let beta = activation::sigmoid(self.beta_proj.forward(x.clone())); // [B, T, H]
+        let beta_h = beta.permute([0, 2, 1]).reshape([batch, h, tokens, 1]);
+        let mut b_k = beta_h.clone().repeat(&[1, 1, 1, hk]);
+        let mut b_v = beta_h.repeat(&[1, 1, 1, vd]);
+
+        let mut q_4d = to_4d(q_norm, h, hk);
+        let mut k_4d = to_4d(k_norm, h, hk);
+        let v_4d = to_4d(v_act, hv, vd);
+        let mut g_4d = log_decay;
+
+        // Repeat key-side tensors for grouped value attention (GVA)
+        if hv > h {
+            let rep = hv / h;
+            let r = |t: Tensor<4>| -> Tensor<4> {
+                t.unsqueeze_dim::<5>(3)
+                    .repeat(&[1, 1, 1, rep, 1])
+                    .reshape([batch, hv, tokens, hk])
+            };
+            q_4d = r(q_4d);
+            k_4d = r(k_4d);
+            g_4d = r(g_4d);
+            b_k = r(b_k);
+            b_v = b_v
+                .unsqueeze_dim::<5>(3)
+                .repeat(&[1, 1, 1, rep, 1])
+                .reshape([batch, hv, tokens, vd]);
+        }
+
+        let gate_logit = match self.gate {
+            GateMode::FullRank => self.o_gate.as_ref().unwrap().forward(x),
+            GateMode::LowRank => {
+                let up = self.o_gate_up.as_ref().unwrap().forward(x);
+                self.o_gate_down.as_ref().unwrap().forward(up)
+            }
+        };
+        let gate_4d = activation::sigmoid(gate_logit)
+            .reshape([batch, tokens, hv, vd])
+            .permute([0, 2, 1, 3]);
+
+        (q_4d, k_4d, v_4d, g_4d, b_k, b_v, gate_4d)
+    }
+
+    fn output(&self, attn_out: Tensor<4>, gate: Tensor<4>) -> Tensor<3> {
+        let [b, hv, t, vd] = attn_out.shape().dims::<4>();
+        let rms = attn_out
+            .clone()
+            .powf_scalar(2.0)
+            .mean_dim(3)
+            .add_scalar(self.norm_eps)
+            .sqrt();
+        let normed = attn_out / rms;
+        let gated = normed
+            .mul(gate)
+            .mul(self.o_norm_w.val().reshape([1, 1, 1, vd]));
+        self.o_proj
+            .forward(gated.permute([0, 2, 1, 3]).reshape([b, t, hv * vd]))
+    }
+
+    /// Training forward: chunked delta-rule (WY algebra, b = beta, w = 1)
+    /// over a zero-initialized state.
+    ///
+    /// Delegates to [`forward_train_state`](Self::forward_train_state) with
+    /// `state: None` — identical behavior to the pre-carry implementation.
+    pub fn forward_train<B: Backend>(&self, x: Tensor<3>) -> Tensor<3>
+    where
+        DispatchTensor: DispatchKindConversion<B>,
+    {
+        self.forward_train_state::<B>(x, None).0
+    }
+
+    /// Training forward over `state` (chunked delta-rule, WY algebra) with
+    /// state carry — the truncated-BPTT path for long-context training.
+    ///
+    /// Processes `x` as one chunk starting from `state` (zeros when `None`)
+    /// and returns the updated state alongside the output. The caller threads
+    /// the returned state into the next chunk's call. Truncated BPTT: the
+    /// caller MUST `detach()` the returned state before passing it to the next
+    /// chunk so gradient does not flow across chunk boundaries — on the tensor
+    /// path (non-CUDA autodiff) the returned state is a graph node, so without
+    /// the detach the graph grows with every chunk and backward slows/OOMs;
+    /// on the fused autodiff path the state comes back untracked, making the
+    /// detach a no-op there but still required for backend portability.
+    ///
+    /// Dispatch matches [`forward_train`](Self::forward_train): fused chunked
+    /// kernels on the bare CUDA backend, ONE autodiff node over the fused
+    /// kernels on `Autodiff<Cuda>`, the tensor-ops chunk path everywhere else.
+    /// All paths compute the same WY form; the state shape `[B, H, K, V]` is
+    /// independent of the token count, so `x` may be a routed active subset.
+    pub fn forward_train_state<B: Backend>(
+        &self,
+        x: Tensor<3>,
+        state: Option<Tensor<4>>,
+    ) -> (Tensor<3>, Tensor<4>)
+    where
+        DispatchTensor: DispatchKindConversion<B>,
+    {
+        let [batch, _t, _] = x.shape().dims::<3>();
+        let (q, k, v, g, b_k, b_v, gate) = self.project(x);
+        let [_, hv, _, _] = v.shape().dims::<4>();
+        let dev = q.device();
+        // State follows the compute dtype of the inputs: bf16 under the
+        // model-wide BF16 mode (Moonshot FlashKDA trains bf16 state), fp32
+        // otherwise (NdArray has no bf16).
+        let state = state.unwrap_or_else(|| {
+            Tensor::<4>::zeros([batch, hv, self.head_dim, self.v_head_dim], &dev).cast(q.dtype())
+        });
+        let (out, new_state) = {
+            #[cfg(feature = "cuda")]
+            {
+                if let Some((o, s)) = fused::cuda::kda_fused_chunk::<B>(
+                    q.clone(),
+                    k.clone(),
+                    v.clone(),
+                    g.clone(),
+                    b_k.clone(),
+                    b_v.clone(),
+                    state.clone(),
+                    self.chunk_size,
+                ) {
+                    (o, s)
+                } else {
+                    #[cfg(feature = "autodiff")]
+                    {
+                        if fused::cuda::is_autodiff_cuda::<B>() {
+                            // Autodiff<Cuda> training backend: run the whole
+                            // chunked WY recurrence as ONE autodiff node over
+                            // the fused CUDA kernels (falls back to tensor ops
+                            // internally when the kernels cannot apply). Same
+                            // algebra as the tensor path, ~20x fewer launches.
+                            burn_gdn2::chunk_autodiff_or_plain::<fused::cuda::CudaBare>(
+                                q,
+                                k,
+                                v,
+                                g,
+                                b_k,
+                                b_v,
+                                state,
+                                1.0,
+                                self.chunk_size,
+                            )
+                        } else {
+                            chunk_wy_forward(
+                                q,
+                                k,
+                                v,
+                                g,
+                                b_k.clone(),
+                                b_v,
+                                state,
+                                1.0,
+                                self.chunk_size,
+                            )
+                        }
+                    }
+                    #[cfg(not(feature = "autodiff"))]
+                    {
+                        chunk_wy_forward(q, k, v, g, b_k.clone(), b_v, state, 1.0, self.chunk_size)
+                    }
+                }
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                chunk_wy_forward(q, k, v, g, b_k.clone(), b_v, state, 1.0, self.chunk_size)
+            }
+        };
+        (self.output(out, gate), new_state)
+    }
+
+    /// Training forward through the fused autodiff op of burn-gdn2: the whole
+    /// chunked WY recurrence runs as ONE autodiff node with an exact
+    /// matrix-level backward (the fused CUDA kernels run the forward on
+    /// `CudaBare`; the backward never re-runs the forward). Same result as
+    /// [`forward_train`](Self::forward_train), much faster on
+    /// `Autodiff<B>` backends.
+    #[cfg(feature = "autodiff")]
+    pub fn forward_train_fused<B: AutodiffBackend>(&self, x: Tensor<3>) -> Tensor<3>
+    where
+        DispatchTensor: DispatchKindConversion<B>
+            + DispatchKindConversion<B::InnerBackend>
+            + DispatchKindConversion<burn_autodiff::Autodiff<B::InnerBackend>>,
+    {
+        let [batch, _t, _] = x.shape().dims::<3>();
+        let (q, k, v, g, b_k, b_v, gate) = self.project(x);
+        let [_, hv, _, _] = v.shape().dims::<4>();
+        let state = Tensor::<4>::zeros([batch, hv, self.head_dim, self.v_head_dim], &q.device())
+            .cast(q.dtype());
+        let (o, _) = burn_gdn2::chunk_autodiff_or_plain::<B::InnerBackend>(
+            q,
+            k,
+            v,
+            g,
+            b_k,
+            b_v,
+            state,
+            1.0,
+            self.chunk_size,
+        );
+        self.output(o, gate)
+    }
+
+    /// Decode forward: chunked WY form of the per-token recurrence (Eq 1).
+    /// One (fused) call per `chunk_size` tokens does the state update and
+    /// output together, instead of ~13 tensor launches per token. Same
+    /// algebra as [`forward_train`](Self::forward_train); the exact per-token
+    /// reference is [`forward_recurrent`](Self::forward_recurrent).
+    ///
+    /// `update_state=true`: state is decayed/updated per token (autoregressive
+    /// decoding). `update_state=false`: read-only prefill over the state.
+    pub fn forward<B: Backend>(
+        &self,
+        x: Tensor<3>,
+        state: &mut Option<Tensor<4>>,
+        update_state: bool,
+    ) -> Tensor<3>
+    where
+        DispatchTensor: DispatchKindConversion<B>,
+    {
+        let [batch, tokens, _] = x.shape().dims::<3>();
+        let (q, k, v, g, b_k, b_v, gate) = self.project(x.clone());
+        let [_, hv, _, _] = v.shape().dims::<4>();
+        let dev = q.device();
+        let s = state
+            .take()
+            .unwrap_or_else(|| {
+                Tensor::<4>::zeros([batch, hv, self.head_dim, self.v_head_dim], &dev)
+                    .cast(q.dtype())
+            });
+
+        let (out_4d, new_state) = if update_state {
+            let mut outs = Vec::with_capacity(tokens.div_ceil(self.chunk_size));
+            let mut s = s;
+            let mut t = 0;
+            while t < tokens {
+                let e = (t + self.chunk_size).min(tokens);
+                let sl = [0..batch, 0..hv, t..e];
+                let (o_c, s_c) = {
+                    #[cfg(feature = "cuda")]
+                    {
+                        if let Some(r) = fused::cuda::kda_fused_chunk::<B>(
+                            q.clone().slice(sl.clone()),
+                            k.clone().slice(sl.clone()),
+                            v.clone().slice(sl.clone()),
+                            g.clone().slice(sl.clone()),
+                            b_k.clone().slice(sl.clone()),
+                            b_v.clone().slice(sl.clone()),
+                            s.clone(),
+                            self.chunk_size,
+                        ) {
+                            r
+                        } else {
+                            chunk_wy_forward(
+                                q.clone().slice(sl.clone()),
+                                k.clone().slice(sl.clone()),
+                                v.clone().slice(sl.clone()),
+                                g.clone().slice(sl.clone()),
+                                b_k.clone().slice(sl.clone()),
+                                b_v.clone().slice(sl.clone()),
+                                s,
+                                1.0,
+                                self.chunk_size,
+                            )
+                        }
+                    }
+                    #[cfg(not(feature = "cuda"))]
+                    {
+                        chunk_wy_forward(
+                            q.clone().slice(sl.clone()),
+                            k.clone().slice(sl.clone()),
+                            v.clone().slice(sl.clone()),
+                            g.clone().slice(sl.clone()),
+                            b_k.clone().slice(sl.clone()),
+                            b_v.clone().slice(sl.clone()),
+                            s,
+                            1.0,
+                            self.chunk_size,
+                        )
+                    }
+                };
+                outs.push(o_c);
+                s = s_c;
+                t = e;
+            }
+            (Tensor::cat(outs, 2), s)
+        } else {
+            let out = q.matmul(s.clone()).permute([0, 2, 1, 3]);
+            (out, s)
+        };
+        *state = Some(new_state);
+        self.output(out_4d, gate)
+    }
+
+    /// Exact per-token decode (Eq 1). Reference for the chunked
+    /// [`forward`](Self::forward) path: same recurrence, different f32
+    /// rounding. Use [`forward`](Self::forward) for decoding.
+    pub fn forward_recurrent(
+        &self,
+        x: Tensor<3>,
+        state: &mut Option<Tensor<4>>,
+        update_state: bool,
+    ) -> Tensor<3> {
+        let [batch, tokens, _] = x.shape().dims::<3>();
+        let (q, k, v, g, b_k, _b_v, gate) = self.project(x.clone());
+        let [_, hv, _, _] = v.shape().dims::<4>();
+        let dev = q.device();
+        let s = state
+            .take()
+            .unwrap_or_else(|| {
+                Tensor::<4>::zeros([batch, hv, self.head_dim, self.v_head_dim], &dev)
+                    .cast(q.dtype())
+            });
+
+        let beta = b_k; // per-head scalar repeated over channels (Eq 2)
+        let (out_4d, new_state) = if update_state {
+            let mut s = s;
+            let mut outs = Vec::with_capacity(tokens);
+            for t in 0..tokens {
+                let q_t = q.clone().slice_dim(2, t..t + 1);
+                let k_t = k.clone().slice_dim(2, t..t + 1);
+                let v_t = v.clone().slice_dim(2, t..t + 1);
+                let d_t = g.clone().slice_dim(2, t..t + 1).exp();
+                let beta_t = beta.clone().slice_dim(2, t..t + 1); // [B, H, 1, HK]
+                                                                  // S <- Diag(alpha_t) S  (Eq 1)
+                s = s * d_t.swap_dims(2, 3);
+                // erase: S <- S - beta k (k^T S)
+                let erased = (s.clone() * k_t.clone().swap_dims(2, 3))
+                    .sum_dim(2)
+                    .mul(beta_t.clone());
+                s = s - k_t.clone().swap_dims(2, 3) * erased;
+                // write: S <- S + beta k v^T
+                s = s + k_t.swap_dims(2, 3) * v_t.mul(beta_t);
+                // read: o = q^T S
+                let out = (s.clone() * q_t.swap_dims(2, 3)).sum_dim(2);
+                outs.push(out);
+            }
+            (Tensor::cat(outs, 2), s)
+        } else {
+            let out = q.matmul(s.clone()).permute([0, 2, 1, 3]);
+            (out, s)
+        };
+        *state = Some(new_state);
+        self.output(out_4d, gate)
+    }
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::backend::NdArray;
+    use burn::tensor::Device;
+    use burn::tensor::Distribution;
+    fn dev() -> Device {
+        Device::ndarray()
+    }
+    fn cfg(hidden: usize, heads: usize, head_dim: usize, decay_fn: DecayFn) -> KdaConfig {
+        KdaConfig {
+            hidden_size: hidden,
+            num_heads: heads,
+            head_dim,
+            use_short_conv: false,
+            decay_fn,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn kda_decay_bounds() {
+        // K3 Eq 5: alpha = exp(g_min*sigmoid(...)) in (e^{g_min}, 1)
+        let dec = KdaDecay::new(32, 4, 16, 16, G_MIN, DecayFn::Sigmoid, &dev());
+        let x = Tensor::<3>::random([2, 8, 32], Distribution::Default, &dev());
+        let alpha = dec.forward(x.clone());
+        let vals: Vec<f32> = alpha
+            .into_data()
+            .bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        let lo = G_MIN.exp() as f32;
+        assert!(
+            vals.iter().all(|&v| v >= lo - 1e-6 && v <= 1.0 + 1e-6),
+            "alpha out of (e^g_min, 1): lo={lo}, sample {:?}",
+            &vals[..8]
+        );
+        // Kimi Linear: alpha in (0, 1) - unbounded below
+        let dec2 = KdaDecay::new(32, 4, 16, 16, G_MIN, DecayFn::Softplus, &dev());
+        let alpha2 = dec2.forward(x.clone());
+        let vals2: Vec<f32> = alpha2
+            .into_data()
+            .bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        assert!(
+            vals2.iter().all(|&v| v > 0.0 && v <= 1.0 + 1e-6),
+            "softplus alpha must be in (0, 1), sample {:?}",
+            &vals2[..8]
+        );
+    }
+
+    #[test]
+    fn kda_decay_is_data_dependent() {
+        // Eq 2: the logit is a function of x - two different inputs give
+        // different decays. Inputs are scaled up so the projection term
+        // dominates the dt_bias = 1.0 anchor (Moonshot/FLA init).
+        let dec = KdaDecay::new(32, 2, 16, 16, G_MIN, DecayFn::Sigmoid, &dev());
+        let x1 = Tensor::<3>::ones([1, 4, 32], &dev()).mul_scalar(50.0);
+        let x2 = Tensor::<3>::ones([1, 4, 32], &dev()).mul_scalar(-50.0);
+        let a1 = dec.forward(x1);
+        let a2 = dec.forward(x2);
+        let d: Vec<f32> = (a1 - a2)
+            .abs()
+            .into_data()
+            .bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        let max_d = d.iter().fold(0.0f32, |a, &x| a.max(x));
+        assert!(max_d > 1e-3, "decay must depend on the input (Eq 2)");
+    }
+
+    #[test]
+    fn kda_step_shapes() {
+        let s = Tensor::<4>::zeros([2, 4, 32, 64], &dev());
+        let d = Tensor::<2>::ones([4, 32], &dev()).mul_scalar(0.95);
+        let q = Tensor::<3>::random([2, 4, 32], Distribution::Default, &dev());
+        let k = Tensor::<3>::random([2, 4, 32], Distribution::Default, &dev());
+        let v = Tensor::<3>::random([2, 4, 64], Distribution::Default, &dev());
+        let (ns, o) = kda_step::<NdArray>(s, d, q, k, v, 0.5);
+        assert_eq!(ns.dims(), [2, 4, 32, 64]);
+        assert_eq!(o.dims(), [2, 4, 64]);
+    }
+
+    #[test]
+    fn kda_module_forward() {
+        let km = KdaModule::new(&cfg(64, 2, 32, DecayFn::Sigmoid), 0.9, &dev());
+        let x = Tensor::<3>::random([1, 4, 64], Distribution::Default, &dev());
+        assert_eq!(km.forward_train::<NdArray>(x).dims(), [1, 4, 64]);
+    }
+
+    #[test]
+    fn chunked_decode_matches_recurrent() {
+        // Decode fusion: the chunked WY path (forward) must equal the exact
+        // per-token recurrence (forward_recurrent) in output AND carried
+        // state, with T not a multiple of the chunk size.
+        let km = KdaModule::new(&cfg(64, 2, 16, DecayFn::Sigmoid), 0.9, &dev());
+        let x = Tensor::<3>::random([1, 40, 64], Distribution::Default, &dev());
+        let mut s_c: Option<Tensor<4>> = None;
+        let mut s_r: Option<Tensor<4>> = None;
+        let out_c = km.forward::<NdArray>(x.clone(), &mut s_c, true);
+        let out_r = km.forward_recurrent(x, &mut s_r, true);
+        let diff: f32 = (out_c - out_r).powf_scalar(2.0).mean().into_scalar();
+        assert!(
+            diff < 1e-4,
+            "chunked vs recurrent decode mismatch mse {diff}"
+        );
+        let st: f32 = (s_c.unwrap() - s_r.unwrap())
+            .powf_scalar(2.0)
+            .mean()
+            .into_scalar();
+        assert!(st < 1e-4, "carried state mismatch mse {st}");
+    }
+
+    #[test]
+    fn chunk_matches_decode() {
+        // The chunked training path must equal the per-token recurrence.
+        let km = KdaModule::new(&cfg(64, 2, 16, DecayFn::Sigmoid), 0.9, &dev());
+        let x = Tensor::<3>::random([1, 17, 64], Distribution::Default, &dev());
+        let chunk_out = km.forward_train::<NdArray>(x.clone());
+        let mut state: Option<Tensor<4>> = None;
+        let decode_out = km.forward_recurrent(x, &mut state, true);
+        let diff: f32 = (chunk_out - decode_out)
+            .powf_scalar(2.0)
+            .mean()
+            .into_scalar();
+        assert!(diff < 1e-4, "chunk vs decode mismatch mse {diff}");
+    }
+
+    #[test]
+    fn chunk64_matches_decode() {
+        // K3-paper chunk size: the tensor chunk path (burn-gdn2 0.5.1 tile
+        // scheme) must stay exact for chunk 64 under weak decay too.
+        let mut c = cfg(64, 2, 16, DecayFn::Softplus);
+        c.chunk_size = 64;
+        let km = KdaModule::new(&c, 0.9, &dev());
+        let x = Tensor::<3>::random([1, 128, 64], Distribution::Default, &dev());
+        let chunk_out = km.forward_train::<NdArray>(x.clone());
+        let mut state: Option<Tensor<4>> = None;
+        let decode_out = km.forward_recurrent(x, &mut state, true);
+        let diff: f32 = (chunk_out - decode_out)
+            .powf_scalar(2.0)
+            .mean()
+            .into_scalar();
+        assert!(diff < 1e-4, "chunk64 vs decode mismatch mse {diff}");
+    }
+
+    #[test]
+    fn beta_stays_in_unit_interval() {
+        let km = KdaModule::new(&cfg(32, 2, 16, DecayFn::Sigmoid), 0.0, &dev());
+        let x = Tensor::<3>::random([1, 4, 32], Distribution::Default, &dev());
+        let beta = activation::sigmoid(km.beta_proj.forward(x));
+        let vals: Vec<f32> = beta
+            .into_data()
+            .bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        assert!(
+            vals.iter().all(|&v| v > 0.0 && v < 1.0),
+            "beta must be in (0,1), sample {:?}",
+            &vals[..8]
+        );
+    }
+
+    #[test]
+    fn low_rank_gate_matches_full_rank_shapes() {
+        // Both gate modes produce the same output shape.
+        let km_low = KdaModule::new(
+            &KdaConfig {
+                gate: GateMode::LowRank,
+                ..cfg(64, 2, 32, DecayFn::Sigmoid)
+            },
+            0.9,
+            &dev(),
+        );
+        let km_full = KdaModule::new(
+            &KdaConfig {
+                gate: GateMode::FullRank,
+                ..cfg(64, 2, 32, DecayFn::Sigmoid)
+            },
+            0.9,
+            &dev(),
+        );
+        let x = Tensor::<3>::random([1, 4, 64], Distribution::Default, &dev());
+        assert_eq!(
+            km_low.forward_train::<NdArray>(x.clone()).dims(),
+            km_full.forward_train::<NdArray>(x).dims()
+        );
+    }
+
+    #[test]
+    fn softplus_chunk_matches_decode() {
+        // Kimi Linear decay mapping: chunk (WY) == per-token recurrence.
+        let km = KdaModule::new(&cfg(64, 2, 16, DecayFn::Softplus), 0.0, &dev());
+        let x = Tensor::<3>::random([1, 17, 64], Distribution::Default, &dev());
+        let chunk_out = km.forward_train::<NdArray>(x.clone());
+        let mut state: Option<Tensor<4>> = None;
+        let decode_out = km.forward_recurrent(x, &mut state, true);
+        let diff: f32 = (chunk_out - decode_out)
+            .powf_scalar(2.0)
+            .mean()
+            .into_scalar();
+        assert!(diff < 1e-4, "softplus chunk vs decode mismatch mse {diff}");
+    }
+
+    #[test]
+    fn beta_is_data_dependent() {
+        // K3 Eq 2: beta_t^h = Sigmoid(W_beta^h x_t) - different inputs must
+        // give different write strengths (not a global scalar).
+        let km = KdaModule::new(&cfg(32, 2, 16, DecayFn::Sigmoid), 0.0, &dev());
+        let x1 = Tensor::<3>::ones([1, 4, 32], &dev());
+        let x2 = Tensor::<3>::ones([1, 4, 32], &dev()).mul_scalar(-3.0);
+        let b1 = activation::sigmoid(km.beta_proj.forward(x1));
+        let b2 = activation::sigmoid(km.beta_proj.forward(x2));
+        let d: Vec<f32> = (b1 - b2)
+            .abs()
+            .into_data()
+            .bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        let max_d = d.iter().fold(0.0f32, |a, &x| a.max(x));
+        assert!(
+            max_d > 1e-3,
+            "beta must depend on x (Eq 2), max diff {max_d}"
+        );
+    }
+
+    /// Truncated-BPTT carry: 4 x [1, 1024] state-carry calls must equal one
+    /// [1, 4096] training forward. The WY recurrence is grouping-independent
+    /// (chunk boundaries are just state transfers, same per-token algebra —
+    /// the existing `chunk_matches_decode` test pins the same equivalence at
+    /// the 16-token tile level), so the only difference is f32 rounding
+    /// accumulated over 4096 tokens: tolerance 1e-3 mse (vs 1e-4 at 17-40
+    /// tokens) and documented for exactly that reason.
+    #[test]
+    fn forward_train_state_chunked_matches_full() {
+        let km = KdaModule::new(&cfg(64, 2, 16, DecayFn::Sigmoid), 0.9, &dev());
+        let x = Tensor::<3>::random([1, 4096, 64], Distribution::Default, &dev());
+        let full = km.forward_train::<NdArray>(x.clone());
+        let mut state: Option<Tensor<4>> = None;
+        let mut chunk_outs = Vec::with_capacity(4);
+        for c in 0..4 {
+            let (o, s) = km.forward_train_state::<NdArray>(
+                x.clone().slice([0..1, c * 1024..(c + 1) * 1024]),
+                state,
+            );
+            chunk_outs.push(o);
+            state = Some(s);
+        }
+        let chunked = Tensor::cat(chunk_outs, 1);
+        let diff: f32 = (full - chunked).powf_scalar(2.0).mean().into_scalar();
+        assert!(
+            diff < 1e-3,
+            "chunked state-carry vs one-shot forward mismatch mse {diff}"
+        );
+    }
+
+    /// Gradient contract of the truncated-BPTT carry: with the state detached
+    /// at the chunk boundary, the FIRST chunk's input x1 must receive ZERO
+    /// gradient (its only path into the loss is the state, which the detach
+    /// severs) while the SECOND chunk's params get nonzero, finite grads.
+    /// The undetached control (state threaded without detach) must show x1
+    /// receiving gradient — proving the detach — not some other mechanism —
+    /// is what truncates. The carry must also change the second chunk's
+    /// output (it is not a no-op).
+    #[cfg(feature = "autodiff")]
+    #[test]
+    fn forward_train_state_truncated_bptt_grads() {
+        type NdAD = burn::backend::autodiff::Autodiff<
+            burn_ndarray::NdArray,
+            burn::backend::autodiff::checkpoint::strategy::NoCheckpointing,
+        >;
+        let device = dev().autodiff();
+        let km = KdaModule::new(&cfg(64, 2, 16, DecayFn::Sigmoid), 0.9, &device);
+        // require_grad: a probeable leaf (random tensors are untracked in burn
+        // 0.22-pre.2, so without this x1 can never receive a grad to read).
+        let x1 = Tensor::<3>::random([1, 32, 64], Distribution::Default, &device).require_grad();
+        let x2 = Tensor::<3>::random([1, 32, 64], Distribution::Default, &device);
+        let target = Tensor::<3>::random([1, 32, 64], Distribution::Default, &device);
+        let mse = |out: Tensor<3>| -> Tensor<1> { (out - target.clone()).powf_scalar(2.0).mean() };
+        let max_grad = |km: &KdaModule, grads: &burn::tensor::Gradients| -> f32 {
+            km.q_proj
+                .weight
+                .grad(grads)
+                .map(|t| {
+                    t.into_data()
+                        .try_to_vec::<f32>()
+                        .unwrap()
+                        .into_iter()
+                        .fold(0.0f32, |m, x| m.max(x.abs()))
+                })
+                .unwrap_or(f32::NAN)
+        };
+        let max_x1 = |grads: &burn::tensor::Gradients| -> f32 {
+            x1.grad(grads)
+                .map(|t| {
+                    t.into_data()
+                        .try_to_vec::<f32>()
+                        .unwrap()
+                        .into_iter()
+                        .fold(0.0f32, |m, x| m.max(x.abs()))
+                })
+                .unwrap_or(0.0)
+        };
+
+        // (a) The training contract: 2-chunk carry, state detached at the
+        // boundary. Loss touches only chunk 2's output.
+        let (_, s1) = km.forward_train_state::<NdAD>(x1.clone(), None);
+        let (out2, _) = km.forward_train_state::<NdAD>(x2.clone(), Some(s1.detach()));
+        let grads = mse(out2.clone()).backward();
+        let ga = max_grad(&km, &grads);
+        assert!(
+            ga.is_finite() && ga > 1e-10,
+            "second-chunk grads dead: {ga}"
+        );
+        let x1_detached = max_x1(&grads);
+        assert!(
+            x1_detached < 1e-8,
+            "truncated BPTT broken: chunk-1 input got grad {x1_detached} through the detached state"
+        );
+
+        // (b) Undetached control on the same weights: the state is threaded
+        // without detach, so chunk 2's gradient must flow back into x1.
+        let (_, s1b) = km.forward_train_state::<NdAD>(x1.clone(), None);
+        let (out2b, _) = km.forward_train_state::<NdAD>(x2.clone(), Some(s1b));
+        let grads_b = mse(out2b.clone()).backward();
+        let x1_undetached = max_x1(&grads_b);
+        assert!(
+            x1_undetached > 1e-10,
+            "control: without detach the chunk-1 input must receive grad, got {x1_undetached}"
+        );
+
+        // The carry must actually change the output: out2 reads a nonzero
+        // state written by chunk 1 (decay alpha >= e^-5 keeps it alive),
+        // so it differs from the zero-state run over x2 alone.
+        let (out2c, _) = km.forward_train_state::<NdAD>(x2.clone(), None);
+        let carry_effect: f32 = (out2 - out2c).powf_scalar(2.0).mean().into_scalar();
+        assert!(
+            carry_effect > 1e-8,
+            "carried state had no effect on the second chunk output: {carry_effect}"
+        );
+    }
+}

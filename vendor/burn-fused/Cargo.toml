@@ -1,0 +1,74 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/burn-attnres",
+    "crates/burn-bitnet",
+    "crates/burn-gdn2",
+    "crates/burn-kda",
+    "crates/burn-mhc",
+    "crates/burn-msa",
+    "crates/burn-muon-plus",
+    "crates/burn-rope",
+    "crates/burn-sct",
+    "crates/burn-situ",
+    "crates/burn-ttt",
+    "crates/burn-spectral",
+    "crates/burn-rmsnorm",
+    "crates/burn-nope",
+    "crates/burn-swiglu",
+    "crates/burn-fastblt",
+    "crates/burn-mtp",
+    "crates/burn-antihall",
+    "crates/burn-mor",
+    "crates/burn-dspark",
+    "crates/burn-diffusionblocks",
+    "crates/burn-parcae",
+    "crates/burn-jepa",
+    "crates/burn-mod",
+    "crates/burn-ptrn",
+    "crates/burn-eggroll",
+    "crates/burn-es",
+    "crates/burn-engram",
+    "crates/burn-byteflow",
+    "burn-fused",
+    "benches",
+    "benches/cpu_probe",
+    "benches/launch_probe",
+
+]
+# keep the default build fast: only the meta-crate by default
+default-members = ["burn-fused"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/sehaxe/burn-fused"
+readme = "README.md"
+rust-version = "1.85"
+
+
+[workspace.dependencies]
+# single source of truth for external dependency versions: leaf crates
+# reference these via `dep = { workspace = true, features = [...] }`
+burn = { version = "0.22.0-pre.3", default-features = false }
+burn-autodiff = { version = "0.22.0-pre.3", default-features = false, features = ["std"] }
+burn-cubecl = { version = "0.22.0-pre.3", default-features = false }
+burn-cuda = { version = "0.22.0-pre.3", default-features = false }
+burn-nn = { version = "0.22.0-pre.3", default-features = false }
+burn-ndarray = { version = "0.22.0-pre.3", features = ["blas-openblas"] }
+burn-optim = { version = "0.22.0-pre.3", default-features = false, features = ["std"] }
+burn-pack = { version = "0.22.0-pre.3", default-features = false }
+burn-tensor = { version = "0.22.0-pre.3", default-features = false }
+cubecl = { version = "0.11.0-pre.3", default-features = false, features = ["std"] }
+cubecl-common = { version = "0.11.0-pre.3", default-features = false }
+derive-new = "0.6"
+futures-lite = "2"
+num-traits = { version = "0.2", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+

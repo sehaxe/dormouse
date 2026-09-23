@@ -1,0 +1,31 @@
+[package]
+name = "burn-mhc"
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+description = "Manifold-Constrained Hyper-Connections for Burn - multi-branch residual with identity preservation (DeepSeek)"
+keywords = ["burn", "hyper-connection", "residual", "manifold", "transformer"]
+repository = "https://github.com/sehaxe/burn-mhc"
+homepage = "https://github.com/sehaxe/burn-mhc"
+readme = "README.md"
+
+[features]
+cuda = ["dep:burn-cuda", "dep:burn-cubecl", "dep:cubecl", "burn/cuda", "burn-tensor/cuda"]
+autodiff = ["burn/autodiff", "burn-tensor/std", "dep:burn-autodiff"]
+default = ["std"]
+std = ["burn/std", "burn-tensor/std", "burn/cpu"]
+
+[dependencies]
+burn = { workspace = true, features = ["std", "extension"] }
+burn-tensor = { workspace = true }
+burn-autodiff = { workspace = true, optional = true, features = ["std"] }
+burn-cuda = { workspace = true, optional = true }
+burn-cubecl = { workspace = true, optional = true }
+cubecl = { workspace = true, optional = true, features = ["std"] }
+
+[dev-dependencies]
+burn-ndarray = { workspace = true, features = ["blas-openblas"] }
+burn-autodiff = { workspace = true, features = ["std"] }
+burn-cuda = { workspace = true }
+burn = { workspace = true, features = ["ndarray", "autodiff", "cuda", "extension"] }
+
