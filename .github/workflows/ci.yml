@@ -7,11 +7,13 @@ on:
 jobs:
   cpu:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: install mold (repo config links through it)
+        run: sudo apt-get update && sudo apt-get install -y mold
       - name: lib tests (core + data + train)
         run: cargo test -p dormouse-core -p dormouse-data -p dormouse-train --lib
       - name: model seam tests
@@ -23,13 +25,15 @@ jobs:
   # without needing a GPU runner. Flip continue-on-error off once green.
   cuda-compile:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: install mold (repo config links through it)
+        run: sudo apt-get update && sudo apt-get install -y mold
       - name: cuda feature compile check (no GPU required)
-        run: cargo check -p dormouse-core --features dormouse-train/cuda
+        run: cargo check -p dormouse-core -p dormouse-train --features dormouse-train/cuda
         env:
           CUDARC_CUDA_VERSION: "12050"
