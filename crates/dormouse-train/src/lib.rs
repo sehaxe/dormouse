@@ -612,6 +612,41 @@ pub fn train_loop(
     // exact — the monitor would have nothing to guard, so skip it entirely
     // (it costs 30+ device syncs per check).
     let mut ortho_fp32 = cfg.quant.as_deref() == Some("fp32");
+    // M6: DM_FUSED=1 single-node path (default 0 preserves behavior). The
+    // fused path is compiled only with the cuda feature; the cpu build never
+    // takes it. Flagship-compatible since the arms-adjoint work: host rows
+    // train through the op's rows parent, the aux heads run on the burn path
+    // from the op's exposed latents. Still excluded: bf16 (kernels are f32),
+    // act-quant (STE not in the kernels), GR. The gate is hoisted out of the
+    // loop (its inputs are constants) so the startup log line provably
+    // matches what every step does - a silent DM_FUSED=1 fallback is the
+    // failure mode this run-length is too short to expose any other way.
+    #[cfg(feature = "cuda")]
+    let use_fused = dormouse_core::fused::fused_enabled()
+        && !dorm_cfg.bf16
+        && dorm_cfg.act_quant.is_none()
+        && !dorm_cfg.use_gr;
+    #[cfg(feature = "cuda")]
+    {
+        let reason = if !dormouse_core::fused::fused_enabled() {
+            "DM_FUSED=0"
+        } else if dorm_cfg.bf16 {
+            "bf16 compute (fused kernels are f32)"
+        } else if dorm_cfg.act_quant.is_some() {
+            "act-quant (STE not in the fused kernels)"
+        } else if dorm_cfg.use_gr {
+            "Gated Residual"
+        } else {
+            ""
+        };
+        if reason.is_empty() {
+            println!("forward arm: FUSED ponder_loop_step (host-rows engram OK, aux heads burn-side)");
+        } else {
+            println!("forward arm: burn (fused gated off: {reason})");
+        }
+    }
+    #[cfg(not(feature = "cuda"))]
+    let _use_fused = false;
     while step < cfg.steps as u64 {
         let t_iter = std::time::Instant::now();
         let (bytes, hashes) = (std::mem::replace(&mut pbytes, Vec::new()), std::mem::replace(&mut phashes, Vec::new()));
@@ -667,13 +702,6 @@ pub fn train_loop(
         // work: host rows train through the op's rows parent, the aux heads
         // run on the burn path from the op's exposed latents. Still excluded:
         // bf16 (kernels are f32), act-quant (STE not in the kernels), GR.
-        #[cfg(feature = "cuda")]
-        let use_fused = dormouse_core::fused::fused_enabled()
-            && !dorm_cfg.bf16
-            && dorm_cfg.act_quant.is_none()
-            && !dorm_cfg.use_gr;
-        #[cfg(not(feature = "cuda"))]
-        let _use_fused = false;
         #[cfg(feature = "cuda")]
         let (_logits, rec_ce, p_dist, _kda, aux) = if use_fused {
             // Build PonderInputs from the live model (embedding + loop_block)
