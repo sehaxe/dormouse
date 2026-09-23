@@ -51,15 +51,15 @@ rust-version = "1.85"
 [workspace.dependencies]
 # single source of truth for external dependency versions: leaf crates
 # reference these via `dep = { workspace = true, features = [...] }`
-burn = { version = "0.22.0-pre.3", default-features = false }
-burn-autodiff = { version = "0.22.0-pre.3", default-features = false, features = ["std"] }
-burn-cubecl = { version = "0.22.0-pre.3", default-features = false }
-burn-cuda = { version = "0.22.0-pre.3", default-features = false }
-burn-nn = { version = "0.22.0-pre.3", default-features = false }
-burn-ndarray = { version = "0.22.0-pre.3", features = ["blas-openblas"] }
-burn-optim = { version = "0.22.0-pre.3", default-features = false, features = ["std"] }
-burn-pack = { version = "0.22.0-pre.3", default-features = false }
-burn-tensor = { version = "0.22.0-pre.3", default-features = false }
+burn = { version = "0.22.0-pre.4", default-features = false }
+burn-autodiff = { version = "0.22.0-pre.4", default-features = false, features = ["std"] }
+burn-cubecl = { version = "0.22.0-pre.4", default-features = false }
+burn-cuda = { version = "0.22.0-pre.4", default-features = false }
+burn-nn = { version = "0.22.0-pre.4", default-features = false }
+burn-ndarray = { version = "0.22.0-pre.4", features = ["blas-openblas"] }
+burn-optim = { version = "0.22.0-pre.4", default-features = false, features = ["std"] }
+burn-pack = { version = "0.22.0-pre.4", default-features = false }
+burn-tensor = { version = "0.22.0-pre.4", default-features = false }
 cubecl = { version = "0.11.0-pre.3", default-features = false, features = ["std"] }
 cubecl-common = { version = "0.11.0-pre.3", default-features = false }
 derive-new = "0.6"

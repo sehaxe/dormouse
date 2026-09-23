@@ -44,7 +44,7 @@ fn argtopk3(x: Tensor<3>, k: usize, dim: usize) -> Tensor<3, Int> {
     // kind and still panic. Indices carry no gradient, so running bare is
     // numerically identical, and Int results stay valid on the caller's
     // backend.
-    let mut work = x.no_grad();
+    let mut work = x.detach();
     let mut parts: Vec<Tensor<3, Int>> = Vec::with_capacity(k);
     for _ in 0..k {
         // cubecl reduce ops return I32; burn's Int contract is i64, so cast
