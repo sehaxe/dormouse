@@ -5,6 +5,7 @@ use cubecl_core as cubecl;
 use cubecl_core::prelude::*;
 use cubecl_core::server::Handle;
 use cubecl_cuda::CudaRuntime;
+use cubecl_server::runtime::Runtime;
 use std::sync::Mutex;
 
 /// Graph capture toggles device-global allocation state (persistent mode) on
@@ -40,8 +41,8 @@ fn cuda_graph_capture_replay() {
     let input = client.create_from_slice(f32::as_bytes(&[1.0, 2.0, 3.0, 4.0]));
     let output = client.empty(n * core::mem::size_of::<f32>());
 
-    let launch = |client: &ComputeClient<CudaRuntime>| {
-        add_one::launch::<CudaRuntime>(
+    let launch = |client: &Client| {
+        add_one::launch(
             client,
             CubeCount::Static(1, 1, 1),
             CubeDim::new(client, n),
@@ -64,12 +65,12 @@ fn cuda_graph_capture_replay() {
     let graph = client.stop_capture().expect("stop_capture");
 
     // Replay executes the recorded launch; the output is input + 1.
-    unsafe { graph.replay() };
+    unsafe { graph.replay() }.expect("replay enqueues");
     let out = client.read_one(output.clone()).unwrap();
     assert_eq!(f32::from_bytes(&out), &[2.0, 3.0, 4.0, 5.0]);
 
     // Replaying again re-runs it deterministically.
-    unsafe { graph.replay() };
+    unsafe { graph.replay() }.expect("replay enqueues");
     let out = client.read_one(output).unwrap();
     assert_eq!(f32::from_bytes(&out), &[2.0, 3.0, 4.0, 5.0]);
 }
@@ -93,8 +94,8 @@ fn cuda_graph_capture_growing_the_pool_is_rejected() {
     let input = client.create_from_slice(f32::as_bytes(&[1.0, 2.0, 3.0, 4.0]));
     let output = client.empty(n * core::mem::size_of::<f32>());
 
-    let launch = |client: &ComputeClient<CudaRuntime>| {
-        add_one::launch::<CudaRuntime>(
+    let launch = |client: &Client| {
+        add_one::launch(
             client,
             CubeCount::Static(1, 1, 1),
             CubeDim::new(client, n),
@@ -135,8 +136,8 @@ fn cuda_graph_input_rewrite() {
     let input = client.create_from_slice(f32::as_bytes(&[1.0, 2.0, 3.0, 4.0]));
     let output = client.empty(n * core::mem::size_of::<f32>());
 
-    let launch = |client: &ComputeClient<CudaRuntime>| {
-        add_one::launch::<CudaRuntime>(
+    let launch = |client: &Client| {
+        add_one::launch(
             client,
             CubeCount::Static(1, 1, 1),
             CubeDim::new(client, n),
@@ -154,7 +155,7 @@ fn cuda_graph_input_rewrite() {
     launch(&client);
     let graph = client.stop_capture().expect("stop_capture");
 
-    unsafe { graph.replay() };
+    unsafe { graph.replay() }.expect("replay enqueues");
     let out = client.read_one(output.clone()).unwrap();
     assert_eq!(f32::from_bytes(&out), &[2.0, 3.0, 4.0, 5.0]);
 
@@ -164,7 +165,7 @@ fn cuda_graph_input_rewrite() {
         &input,
         Bytes::from_bytes_vec(f32::as_bytes(&[10.0, 20.0, 30.0, 40.0]).to_vec()),
     );
-    unsafe { graph.replay() };
+    unsafe { graph.replay() }.expect("replay enqueues");
     let out = client.read_one(output).unwrap();
     assert_eq!(f32::from_bytes(&out), &[11.0, 21.0, 31.0, 41.0]);
 }
@@ -192,15 +193,15 @@ fn cuda_graph_intermediate_recycling() {
     let input = client.create_from_slice(f32::as_bytes(&[1.0, 2.0, 3.0, 4.0]));
     let output = client.empty(bytes);
 
-    let run = |client: &ComputeClient<CudaRuntime>, tmp: &Handle| {
-        add_one::launch::<CudaRuntime>(
+    let run = |client: &Client, tmp: &Handle| {
+        add_one::launch(
             client,
             CubeCount::Static(1, 1, 1),
             CubeDim::new(client, n),
             unsafe { BufferArg::from_raw_parts(input.clone(), n) },
             unsafe { BufferArg::from_raw_parts(tmp.clone(), n) },
         );
-        mul_two::launch::<CudaRuntime>(
+        mul_two::launch(
             client,
             CubeCount::Static(1, 1, 1),
             CubeDim::new(client, n),
@@ -237,7 +238,7 @@ fn cuda_graph_intermediate_recycling() {
     // Replay. The graph's own OUTPUT is correct regardless: its first kernel
     // rewrites `tmp` before the second reads it (write-before-read), so
     // external reuse cannot corrupt the graph's result.
-    unsafe { graph.replay() };
+    unsafe { graph.replay() }.expect("replay enqueues");
     let out_bytes = client.read_one(output).unwrap();
     let out = f32::from_bytes(&out_bytes);
     println!("graph output: {out:?} (want [4, 6, 8, 10])");
@@ -279,7 +280,7 @@ fn cuda_graph_many_launches_dynamic_metadata() {
 
     // One pass: ping-pong `dst = src + 1` between `a` and `b`. The identical
     // sequence is run once as warmup and once recorded.
-    fn run_pass(client: &ComputeClient<CudaRuntime>, a: &Handle, b: &Handle) {
+    fn run_pass(client: &Client, a: &Handle, b: &Handle) {
         for i in 0..PASS_LAUNCHES {
             let (src, dst) = if i % 2 == 0 { (a, b) } else { (b, a) };
             add_one_tensor::launch(
@@ -339,8 +340,8 @@ fn cuda_graph_many_launches_dynamic_metadata() {
     let graph = client.stop_capture().expect("stop_capture");
 
     // Warmup + 2 replays = 3 executed passes (the recorded pass ran 0 times).
-    unsafe { graph.replay() };
-    unsafe { graph.replay() };
+    unsafe { graph.replay() }.expect("replay enqueues");
+    unsafe { graph.replay() }.expect("replay enqueues");
     let (exp_a, exp_b) = simulate(0.0, 3);
     assert_eq!(
         f32::from_bytes(&client.read_one(a.clone()).unwrap()),
@@ -356,7 +357,7 @@ fn cuda_graph_many_launches_dynamic_metadata() {
     let fresh = f32::as_bytes(&[100.0f32; N]).to_vec();
     client.write(&a, Bytes::from_bytes_vec(fresh.clone()));
     client.write(&b, Bytes::from_bytes_vec(fresh));
-    unsafe { graph.replay() };
+    unsafe { graph.replay() }.expect("replay enqueues");
     let (exp_a, exp_b) = simulate(100.0, 1);
     assert_eq!(
         f32::from_bytes(&client.read_one(a.clone()).unwrap()),

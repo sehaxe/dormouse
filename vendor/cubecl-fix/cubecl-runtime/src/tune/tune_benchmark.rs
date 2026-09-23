@@ -1,5 +1,5 @@
-use super::{AutotuneError, TuneFn, TuneInputs};
-use crate::{client::ComputeClient, runtime::Runtime};
+use super::{AutotuneError, Evictor, TuneFn, TuneInputs};
+use crate::client::Client;
 use alloc::string::ToString;
 use alloc::vec::Vec;
 use cubecl_common::profile::ProfileDuration;
@@ -23,16 +23,17 @@ impl AutotuneOutput for () {
 /// Benchmark how long this operation takes for a number of samples.
 ///
 /// Returns at least one duration, otherwise an error is returned.
-pub fn tune_benchmark<'a, R: Runtime, F: TuneInputs, Out: AutotuneOutput>(
+pub fn tune_benchmark<'a, F: TuneInputs, Out: AutotuneOutput>(
     operation: &TuneFn<F, Out>,
     inputs: <F as TuneInputs>::At<'a>,
-    client: ComputeClient<R>,
+    client: Client,
+    evictor: Option<&mut Evictor<'_>>,
 ) -> Result<Vec<ProfileDuration>, AutotuneError> {
     // `scoped` holds exclusive device access for the whole benchmark loop and
     // accepts non-`'static` closures.
     client
         .clone()
-        .exclusive(move || profile_exclusive(operation, inputs, client))
+        .exclusive(move || profile_exclusive(operation, inputs, client, evictor))
         .map_err(|err| AutotuneError::Unknown {
             name: operation.name.to_string(),
             err: err.to_string(),
@@ -44,25 +45,42 @@ impl<F: TuneInputs, Out: AutotuneOutput> TuneFn<F, Out> {
     ///
     /// Expects to already hold exclusive device access; the adaptive driver takes it once for
     /// the whole round robin rather than once per candidate.
-    pub(crate) fn warmup_once<'a, R: Runtime>(
+    pub(crate) fn warmup_once<'a>(
         &self,
         inputs: <F as TuneInputs>::At<'a>,
-        client: &ComputeClient<R>,
+        client: &Client,
     ) -> Result<(), AutotuneError> {
         // We make sure the server is in a correct state.
         let _errs = client.flush();
 
         // The profile is dropped without being resolved: a warmup only exists to surface a
-        // failure to compile or launch, which is what the error carries.
-        self.sample_once(inputs, client).map(|_| ())
+        // failure to compile or launch, which is what the error carries — so nothing is
+        // evicted for it, either.
+        self.sample_once(inputs, client, None).map(|_| ())
     }
 
     /// Queue a single measured execution. See [`Self::warmup_once`] for the locking expectation.
-    pub(crate) fn sample_once<'a, R: Runtime>(
+    ///
+    /// `evictor` runs first, outside the profiled region, so the sample reads what a real
+    /// call reads rather than what the previous launch left in cache ([`Eviction`]). An
+    /// eviction that fails is logged and the sample taken warm: the measurement is still
+    /// worth more than none, and the failure is the eviction's, not the candidate's.
+    ///
+    /// [`Eviction`]: super::Eviction
+    pub(crate) fn sample_once<'a>(
         &self,
         inputs: <F as TuneInputs>::At<'a>,
-        client: &ComputeClient<R>,
+        client: &Client,
+        evictor: Option<&mut Evictor<'_>>,
     ) -> Result<ProfileDuration, AutotuneError> {
+        if let Some(evict) = evictor
+            && let Err(err) = evict()
+        {
+            log::error!(
+                "The eviction before a sample of `{}` failed, so the sample is measured on a warm cache.\n{err}",
+                self.name
+            );
+        }
         // The output is returned so dead code elimination can't drop the work being profiled.
         let profiled = client.profile(move || self.execute(inputs), &self.name);
 
@@ -77,10 +95,11 @@ impl<F: TuneInputs, Out: AutotuneOutput> TuneFn<F, Out> {
     }
 }
 
-fn profile_exclusive<'a, R: Runtime, F: TuneInputs, Out: AutotuneOutput>(
+fn profile_exclusive<'a, F: TuneInputs, Out: AutotuneOutput>(
     operation: &TuneFn<F, Out>,
     inputs: <F as TuneInputs>::At<'a>,
-    client: ComputeClient<R>,
+    client: Client,
+    mut evictor: Option<&mut Evictor<'_>>,
 ) -> Result<Vec<ProfileDuration>, AutotuneError> {
     // These launches are the measurement, so they run even inside a dry run:
     // that mode exists to skip the *workload*, not the tuning it is there to
@@ -109,7 +128,7 @@ fn profile_exclusive<'a, R: Runtime, F: TuneInputs, Out: AutotuneOutput>(
         // go, so the loop stops on the first error and hands it back untouched. Sampling on
         // would only pay more device round trips to reach the same verdict, with the reason
         // for the failure replaced by `InvalidSamples`.
-        durations.push(operation.sample_once(inputs.clone(), &client)?);
+        durations.push(operation.sample_once(inputs.clone(), &client, evictor.as_deref_mut())?);
     }
 
     if durations.is_empty() {
@@ -121,10 +140,10 @@ fn profile_exclusive<'a, R: Runtime, F: TuneInputs, Out: AutotuneOutput>(
     }
 }
 
-fn warmup<'a, R: Runtime, F: TuneInputs, Out: AutotuneOutput>(
+fn warmup<'a, F: TuneInputs, Out: AutotuneOutput>(
     operation: &TuneFn<F, Out>,
     inputs: <F as TuneInputs>::At<'a>,
-    client: ComputeClient<R>,
+    client: Client,
 ) -> Result<(), AutotuneError> {
     let num_warmup = 3;
 

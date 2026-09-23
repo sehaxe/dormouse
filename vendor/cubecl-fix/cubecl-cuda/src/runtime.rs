@@ -1,4 +1,5 @@
 use crate::{
+    compiler::{CudaBackend, CudaCompilationOptions},
     compute::{CudaServer, context::CudaContext},
     device::CudaDevice,
 };
@@ -6,21 +7,23 @@ use cubecl_common::{
     device::{Device, DeviceService},
     profile::TimingMethod,
 };
+#[cfg(windows)]
+use cubecl_core::ir::AdapterLuid;
 use cubecl_core::{
-    MemoryConfiguration, Runtime,
+    MemoryConfiguration,
     cmma::MatrixLayout,
     device::{DeviceId, ServerUtilitiesHandle},
     ir::{
-        ContiguousElements, DeviceIdentity, DeviceProperties, ElemType, FloatKind,
-        HardwareProperties, MemoryDeviceProperties, MmaProperties, OpaqueType, TargetProperties,
-        Type, VectorSize,
-        features::{AtomicUsage, Plane, Tma, TypeUsage},
+        ComplexKind, ContiguousElements, DeviceIdentity, DeviceProperties, ElemType, FloatKind,
+        HardwareProperties, IntKind, MemoryDeviceProperties, MmaProperties, OpaqueType, PciVendor,
+        PhysicalDevice, TargetProperties, Type, UIntKind, VectorSize,
+        features::{AtomicUsage, ComplexUsage, Plane, Tma, TypeUsage},
+        nvidia::SmArch,
     },
     server::ServerUtilities,
     zspace::{Shape, Strides, striding::has_pitched_row_major_strides},
 };
 use cubecl_cpp::{
-    ComputeKernel,
     cuda::{
         self,
         arch::CudaArchitecture,
@@ -28,16 +31,20 @@ use cubecl_cpp::{
     },
     register_supported_types,
     shared::{
-        CompilationOptions, CppCompiler, CppSupportedFeatures, register_mma_features,
+        CompilationOptions, CppSupportedFeatures, register_mma_features,
         register_scaled_mma_features, register_wmma_features,
     },
-    target::Cuda,
 };
-use cubecl_runtime::{
-    allocator::PitchedMemoryLayoutPolicy, client::ComputeClient, logging::ServerLogger,
+use cubecl_llvm::nvptx::ptx_version::PtxVersion;
+use cubecl_server::{
+    allocator::PitchedMemoryLayoutPolicy, logging::ServerLogger, runtime::Runtime,
 };
-use cudarc::driver::sys::{CUDA_VERSION, cuDeviceTotalMem_v2};
-use std::{mem::MaybeUninit, sync::Arc};
+#[cfg(windows)]
+use cudarc::driver::sys::cuDeviceGetLuid;
+use cudarc::driver::sys::{
+    CUDA_VERSION, CUdevice, cuDeviceGetPCIBusId, cuDeviceTotalMem_v2, cuDriverGetVersion,
+};
+use std::{ffi::CStr, mem::MaybeUninit, sync::Arc};
 
 /// Options configuring the CUDA runtime.
 #[derive(Default)]
@@ -75,14 +82,26 @@ impl DeviceService for CudaServer {
             arch_major * 10 + minor
         } as u32;
 
+        // SAFETY: `cuDriverGetVersion` writes the version into `version`, which outlives the call.
+        let driver_version = unsafe {
+            let mut version = 0;
+            cuDriverGetVersion(&mut version)
+                .result()
+                .expect("the PTX version is chosen from the driver's");
+            version
+        };
+
         // This is the alignment returned by `cuMallocPitched`, so it's the one considered optimal
         // for row alignment by CUDA. This hasn't changed since at least the GTX 700 series.
         // Querying texture row align is a heuristic, but also not guaranteed to be the same.
         let mem_alignment = 512;
 
+        let probe = DeviceProbe::of(device_ptr);
+
         // Ask the wmma compiler for its supported combinations
         let arch = CudaArchitecture {
             version: arch_version,
+            tensor_cores: CudaArchitecture::has_tensor_cores(arch_version, &probe.name),
         };
         let supported_cmma_combinations = CudaCmmaCompiler::Cpp.supported_cmma_combinations(&arch);
         let supported_mma_combinations = cuda::supported_mma_combinations(&arch);
@@ -97,20 +116,22 @@ impl DeviceService for CudaServer {
         };
 
         // SAFETY: `device_ptr` is valid. `cuDeviceTotalMem_v2` writes the total device memory
-        // into the `MaybeUninit`, making `assume_init()` valid on success.
+        // into the `MaybeUninit`, making `assume_init()` valid on the success asserted below.
         let max_memory = unsafe {
             let mut bytes = MaybeUninit::uninit();
-            cuDeviceTotalMem_v2(bytes.as_mut_ptr(), device_ptr);
+            let status = cuDeviceTotalMem_v2(bytes.as_mut_ptr(), device_ptr);
+            status
+                .result()
+                .expect("the memory pools are sized against the device's capacity");
             bytes.assume_init() as u64
         };
-        let mem_properties = MemoryDeviceProperties {
-            max_page_size: max_memory / 4,
-            alignment: mem_alignment as u64,
-        };
+        let mem_properties = MemoryDeviceProperties::new(max_memory / 4, mem_alignment as u64)
+            .with_max_memory(max_memory);
 
         let mut comp_opts = CompilationOptions {
             supports_features: CppSupportedFeatures {
                 fast_math: true,
+                dp4a: arch_version >= 61,
                 ..Default::default()
             },
             ..Default::default()
@@ -145,7 +166,7 @@ impl DeviceService for CudaServer {
             let num_streaming_multiprocessors = Some(
                 get_attribute(device_ptr, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT).unwrap() as u32,
             );
-            let num_tensor_cores = tensor_cores_per_sm(arch_version);
+            let num_tensor_cores = tensor_cores_per_sm(&arch);
 
             comp_opts.warp_size = warp_size as usize;
 
@@ -166,6 +187,7 @@ impl DeviceService for CudaServer {
                     Some(8)
                 },
                 num_cpu_cores: None,
+                last_level_cache_size: None,
                 max_vector_size: VectorSize::MAX,
                 cube_mma_reserved_shared_memory: 0,
             }
@@ -175,22 +197,27 @@ impl DeviceService for CudaServer {
         // the compilation namespace and the identity. Built once and shared
         // with `CudaContext` below, so the two cannot disagree.
         let fingerprint = format!("ptx_sm{arch_version}");
-        // Display only, and a driver that declines to name its device is not a
-        // reason to fail initialization.
-        let device_name = cudarc::driver::result::device::get_name(device_ptr)
-            .unwrap_or_else(|_| "unknown CUDA device".to_string());
 
         let mut device_props = DeviceProperties::new(
             Default::default(),
             mem_properties.clone(),
             hardware_props,
-            TimingMethod::System,
+            TimingMethod::Device,
             DeviceIdentity {
-                name: device_name,
+                name: probe.name,
                 fingerprint: fingerprint.clone(),
+                physical: Some(probe.physical),
             },
         );
         register_supported_types(&mut device_props);
+        for kind in [ComplexKind::C32, ComplexKind::C64] {
+            let ty = ElemType::Complex(kind);
+            device_props.register_type_usage(ty, TypeUsage::Conversion | TypeUsage::Buffer);
+            device_props.register_complex_usage(
+                ty,
+                ComplexUsage::Core | ComplexUsage::Compare | ComplexUsage::Math,
+            );
+        }
         device_props.register_type_usage(ElemType::Float(FloatKind::TF32), TypeUsage::Conversion);
         if arch_version >= 60 {
             device_props.register_atomic_type_usage(
@@ -324,6 +351,8 @@ impl DeviceService for CudaServer {
 
         device_props.features.memory_reinterpret = true;
         device_props.features.alignment = true;
+        // `__threadfence` carries a block's writes to device scope.
+        device_props.features.device_memory_scope = true;
         device_props.features.plane.insert(Plane::Ops);
         device_props
             .features
@@ -334,10 +363,32 @@ impl DeviceService for CudaServer {
         register_mma_features(supported_mma_combinations, &mut device_props);
         register_scaled_mma_features(supported_scaled_mma_combinations, &mut device_props);
 
-        let cuda_ctx = CudaContext::new(comp_opts, device_props.clone(), ctx, arch);
+        // Which backend compiles here decides what may be advertised: the two are not at the
+        // same point, and a feature the selected one cannot honour is a kernel that fails to
+        // compile rather than a slower one.
+        let backend = CudaBackend::default();
+        if backend == CudaBackend::Llvm {
+            restrict_to_llvm_backend(&mut device_props);
+        }
+
+        let comp_opts = CudaCompilationOptions {
+            cpp: comp_opts,
+            arch: Some(SmArch::new(arch_version, arch.tensor_cores)),
+            ptx_version: PtxVersion::for_driver(driver_version),
+        };
+        let cuda_ctx = CudaContext::new(comp_opts, device_props.clone(), ctx, arch, backend);
         let logger = Arc::new(ServerLogger::default());
         let policy = PitchedMemoryLayoutPolicy::new(device_props.memory.alignment as usize);
-        let utilities = ServerUtilities::new(device_props, logger, (), policy);
+        let mut utilities = ServerUtilities::new(
+            cubecl_common::device::ServiceId::of::<Self>(device_id),
+            "cuda",
+            device_props,
+            CudaRuntime::target_properties(),
+            logger,
+            policy,
+        );
+        // SAFETY: the call only tries to `dlopen` each candidate name.
+        utilities.server_comm_enabled = unsafe { cudarc::nccl::sys::is_culib_present() };
 
         CudaServer::new(
             cuda_ctx,
@@ -354,11 +405,118 @@ impl DeviceService for CudaServer {
     }
 }
 
-pub type CudaCompiler = CppCompiler<Cuda>;
-pub type CudaComputeKernel = ComputeKernel;
+/// Narrows what the device advertises to what the LLVM backend actually lowers.
+///
+/// The properties above are the C++ backend's, which has had every generation of NVIDIA's
+/// hardware features added to it as they shipped. The LLVM backend is at the point of running
+/// ordinary kernels: arithmetic, memory, shared memory, the plane operations and the two
+/// barriers. Everything it does not lower is taken away here rather than left to fail at
+/// compile time, because a consumer picks its algorithm off these properties — cubek's matmul
+/// selectors ask for `mma` before they ask anything else — and an advertisement that cannot be
+/// honoured is a launch that fails rather than one that falls back.
+///
+/// Each of these comes back as its lowering lands; see the matrix and TMA work in
+/// `cubecl-llvm`'s `nvptx` module.
+fn restrict_to_llvm_backend(props: &mut DeviceProperties) {
+    // Both matrix families are lowered: the cooperative one through `wmma`, the manual one
+    // through `mma.sync`. Each is narrowed to the element types its lowering has register
+    // shapes for -- `f16` operands throughout, plus the narrow integers on the manual side,
+    // which pass their registers as opaque words. `bf16` and `tf32` are in neither for the
+    // same reason `bf16` is dropped below: the dialect this backend lowers through has no type
+    // for them, so there is nothing to put in a register.
+    let half = ElemType::Float(FloatKind::F16);
+    let byte = |ty: ElemType| {
+        matches!(
+            ty,
+            ElemType::Int(IntKind::I8) | ElemType::UInt(UIntKind::U8)
+        )
+    };
 
-fn tensor_cores_per_sm(version: u32) -> Option<u32> {
-    match version {
+    let matmul = &mut props.features.matmul;
+    matmul.cmma.retain(|config| {
+        config.a_type == half
+            && config.b_type == half
+            && matches!(
+                config.cd_type,
+                ElemType::Float(FloatKind::F16) | ElemType::Float(FloatKind::F32)
+            )
+    });
+    matmul.mma.retain(|config| {
+        let floats = config.a_type == half
+            && config.b_type == half
+            && config.cd_type == ElemType::Float(FloatKind::F32);
+        // The four signed/unsigned pairings are four instructions over the same registers, so
+        // the operands are taken independently.
+        let integers = byte(config.a_type)
+            && byte(config.b_type)
+            && config.cd_type == ElemType::Int(IntKind::I32);
+        floats || integers
+    });
+    // The manual `mma.sync` family, `ldmatrix` and `stmatrix` are advertised: the lowering is
+    // correct, which `test_cmma_manual` checks element by element and cubek's
+    // `multi_level::basic::plane_accelerated::*_mma` matmuls now agree with.
+    //
+    // Those matmuls did come out wrong here for a while, and it is worth saying why they were
+    // not this backend's fault: they published an accumulator tile to shared memory and read it
+    // back across the plane with no barrier, which works on a backend whose optimizer takes the
+    // code at its word and does not survive one that does not. The barrier belongs in the
+    // kernel and is now there.
+
+    // Still on the manual side and still unimplemented: the cube-level API, and the scaled
+    // instructions with their `block_scale` operands.
+    matmul.cube_mma = Default::default();
+    matmul.scaled_mma = Default::default();
+    matmul.cmma_tensor_addressing = false;
+    if matmul.cmma.is_empty() && matmul.mma.is_empty() {
+        props.hardware.num_tensor_cores = None;
+        props.hardware.min_tensor_cores_dim = None;
+    }
+
+    // No TMA, no clusters, no async copy, and no `mbarrier` behind them.
+    props.features.tma = Default::default();
+    props.features.cube_cluster = false;
+    props.features.copy_async = false;
+    props.features.types.opaque.remove(&OpaqueType::TensorMap);
+    props.features.types.opaque.remove(&OpaqueType::Barrier);
+
+    // The shuffles go through `shfl.sync` with a full member mask, which requires the plane to
+    // be converged. The C++ backend advertises this because its own plane lowering handles a
+    // partial mask; until this one does, a diverged plane operation would be undefined rather
+    // than merely slow.
+    props.features.plane.remove(Plane::NonUniformControlFlow);
+
+    // `bf16` has no type in the LLVM dialect this backend lowers through -- pliron has
+    // `builtin.fp16`, `fp32` and `fp64` and nothing between -- so a `bf16` kernel compiles to
+    // something that quietly computes zeros. Until it is either given a type or carried as an
+    // `i16` the way the minifloats are, it must not be offered.
+    let bf16 = ElemType::Float(FloatKind::BF16);
+    props.features.types.elem.remove(&bf16);
+    props
+        .features
+        .types
+        .atomic
+        .retain(|ty, _| ty.elem_type() != bf16);
+
+    // Complex arithmetic is lowered by the C++ backends, not by this one.
+    props.features.types.complex.clear();
+    for kind in [ComplexKind::C32, ComplexKind::C64] {
+        props.features.types.elem.remove(&ElemType::Complex(kind));
+    }
+
+    // Vectorized float atomics: the shared atomic lowering handles the scalar widths, and a
+    // vector `atomicrmw` is not one instruction on this target.
+    props
+        .features
+        .types
+        .atomic
+        .retain(|ty, _| ty.vector_size() == 1);
+}
+
+fn tensor_cores_per_sm(arch: &CudaArchitecture) -> Option<u32> {
+    if !arch.tensor_cores {
+        return None;
+    }
+    match arch.version {
         70 | 75 => Some(8),                           // Volta, Turing
         80 | 86 | 89 | 90 | 91 | 92 | 100 => Some(4), // Ampere, Hopper, Blackwell
         _ => None,                                    // Unknown or unsupported architecture
@@ -366,25 +524,8 @@ fn tensor_cores_per_sm(version: u32) -> Option<u32> {
 }
 
 impl Runtime for CudaRuntime {
-    type Compiler = CudaCompiler;
     type Server = CudaServer;
     type Device = CudaDevice;
-
-    fn client(device: &Self::Device) -> ComputeClient<Self> {
-        ComputeClient::load(device)
-    }
-
-    fn name(_client: &ComputeClient<Self>) -> &'static str {
-        "cuda"
-    }
-
-    fn require_array_lengths() -> bool {
-        true
-    }
-
-    fn max_cube_count() -> (u32, u32, u32) {
-        (i32::MAX as u32, u16::MAX as u32, u16::MAX as u32)
-    }
 
     fn can_read_tensor(shape: &Shape, strides: &Strides) -> bool {
         has_pitched_row_major_strides(shape, strides)
@@ -406,10 +547,16 @@ impl Runtime for CudaRuntime {
         }
     }
 
-    fn enumerate_devices(
-        _: u16,
-        _: &<Self::Server as cubecl_core::server::ComputeServer>::Info,
-    ) -> Vec<cubecl_core::device::DeviceId> {
+    fn enumerate_devices(_: u16) -> Vec<cubecl_core::device::DeviceId> {
+        // `device_count` loads `libcuda` on the way in and panics rather than
+        // erroring when it is not installed, so ask first. A machine with no
+        // NVIDIA driver has no CUDA devices; it is not failing the question.
+        //
+        // SAFETY: the call only tries to `dlopen` each candidate name.
+        if !unsafe { cudarc::driver::sys::is_culib_present() } {
+            return Vec::new();
+        }
+
         let count = cudarc::driver::CudaContext::device_count().unwrap_or(0) as usize;
         (0..count)
             .map(|i| DeviceId {
@@ -417,5 +564,43 @@ impl Runtime for CudaRuntime {
                 index_id: i as u16,
             })
             .collect()
+    }
+}
+
+/// What the driver says about a device. A refused query leaves its field empty rather than
+/// failing initialization.
+struct DeviceProbe {
+    /// The only signal for tensor cores.
+    name: String,
+    physical: PhysicalDevice,
+}
+
+impl DeviceProbe {
+    fn of(device: CUdevice) -> Self {
+        let name = cudarc::driver::result::device::get_name(device)
+            .unwrap_or_else(|_| "unknown CUDA device".to_string());
+
+        let mut bus_id = [0u8; 32];
+        // SAFETY: the buffer outlives the call and its length travels with it.
+        let pci_address = unsafe {
+            cuDeviceGetPCIBusId(bus_id.as_mut_ptr().cast(), bus_id.len() as _, device).result()
+        }
+        .ok()
+        .and_then(|()| CStr::from_bytes_until_nul(&bus_id).ok())
+        .and_then(|id| id.to_str().ok()?.parse().ok());
+        let mut physical = PhysicalDevice::default();
+        physical.pci_address = pci_address;
+        physical.vendor = Some(PciVendor::Nvidia);
+        #[cfg(windows)]
+        {
+            let mut luid = [0 as core::ffi::c_char; 8];
+            let mut node_mask = 0;
+            // SAFETY: both out-parameters outlive the call and `luid` has the eight bytes written.
+            physical.luid = unsafe { cuDeviceGetLuid(luid.as_mut_ptr(), &mut node_mask, device) }
+                .result()
+                .ok()
+                .map(|()| AdapterLuid::new(luid.map(|byte| byte as u8)));
+        }
+        Self { name, physical }
     }
 }

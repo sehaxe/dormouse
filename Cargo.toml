@@ -41,9 +41,11 @@ opt-level = 0
 [profile.dev.package.dormouse-cli]
 opt-level = 0
 
-# Same patches as aria: stale-page-safe cubecl (#1401 root fix).
+# Same patches as aria: stale-page-safe cubecl (#1401 root fix, ported onto
+# 0.11.0-pre.4 where the pools moved into the new cubecl-server crate).
 # cubek comes from crates.io (local /tmp/cubek with matmul tail fixes was
-# lost to the tmpfs wipe; registry cubek 0.3.0-pre.3 has the fp4 helpers).
+# lost to the tmpfs wipe; registry cubek 0.3.0-pre.4 has the fp4 helpers).
 [patch.crates-io]
 cubecl-runtime = { path = "vendor/cubecl-fix/cubecl-runtime" }
+cubecl-server = { path = "vendor/cubecl-fix/cubecl-server" }
 cubecl-cuda = { path = "vendor/cubecl-fix/cubecl-cuda" }

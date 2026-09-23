@@ -4,10 +4,11 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::{Debug, Display};
 use core::hash::Hash;
+use cubecl_common::hash::StableHasher;
 
 use alloc::format;
 
-use crate::tune::{Bounds, BoundsGenerator};
+use crate::tune::{Bounds, BoundsGenerator, Eviction, Evictor};
 
 use super::{
     AutotuneError, input_generator::InputGenerator, key_generator::KeyGenerator,
@@ -44,6 +45,7 @@ pub struct TunableSet<K: AutotuneKey, F: TuneInputs, Output: 'static> {
     key_gen: Arc<dyn KeyGenerator<K, F> + Send + Sync>,
     input_gen: Arc<dyn InputGenerator<K, F> + Send + Sync>,
     bounds_gen: Option<Arc<dyn BoundsGenerator<K, F> + Send + Sync>>,
+    eviction: Option<Arc<dyn Eviction<K, F> + Send + Sync>>,
     short_circuit: bool,
 }
 
@@ -65,6 +67,7 @@ impl<K: AutotuneKey, F: TuneInputs, Output: 'static> TunableSet<K, F, Output> {
             input_gen: Arc::new(input_gen),
             key_gen: Arc::new(key_gen),
             bounds_gen: None,
+            eviction: None,
             short_circuit: true,
         }
     }
@@ -84,6 +87,13 @@ impl<K: AutotuneKey, F: TuneInputs, Output: 'static> TunableSet<K, F, Output> {
     /// Sets the autotune bounds for this set.
     pub fn with_bounds(mut self, bounds: Arc<dyn BoundsGenerator<K, F> + Send + Sync>) -> Self {
         self.bounds_gen = Some(bounds);
+        self
+    }
+
+    /// Sets what runs before every measured sample, so the candidates are timed reading
+    /// memory rather than the cache the previous sample left warm. See [`Eviction`].
+    pub fn with_eviction(mut self, eviction: Arc<dyn Eviction<K, F> + Send + Sync>) -> Self {
+        self.eviction = Some(eviction);
         self
     }
 
@@ -121,7 +131,7 @@ impl<K: AutotuneKey, F: TuneInputs, Output: 'static> TunableSet<K, F, Output> {
         for tune in &self.tunables {
             checksum += &tune.function.name;
         }
-        format!("{:x}", md5::compute(checksum))
+        format!("{:x}", StableHasher::hash_one(&checksum))
     }
 
     /// Generate a key from a set of inputs
@@ -134,14 +144,23 @@ impl<K: AutotuneKey, F: TuneInputs, Output: 'static> TunableSet<K, F, Output> {
         self.input_gen.generate(key, inputs)
     }
 
+    /// The eviction registered on this set, bound to `key` and the reference `inputs`, if
+    /// any: what a benchmark loop runs before each of its samples.
+    pub(crate) fn evictor<'i>(&self, key: &K, inputs: &F::At<'i>) -> Option<Box<Evictor<'i>>> {
+        let eviction = self.eviction.clone()?;
+        let key = key.clone();
+        let inputs = inputs.clone();
+        Some(Box::new(move || eviction.evict(&key, &inputs)))
+    }
+
     /// The throughput bounds registered on this set, if any.
     pub fn bounds(&self, key: &K, inputs: &F::At<'_>) -> Option<Bounds> {
         self.bounds_gen.as_ref().map(|f| f.generate(key, inputs))
     }
 }
 
-#[cfg(autotune_persistence)]
-/// Trait alias with support for persistent caching
+#[cfg(serializable)]
+/// Trait alias, serializable for the persistent cache and the autotune log
 pub trait AutotuneKey:
     Clone
     + Debug
@@ -156,7 +175,7 @@ pub trait AutotuneKey:
     + 'static
 {
 }
-#[cfg(not(autotune_persistence))]
+#[cfg(not(serializable))]
 /// Trait alias
 pub trait AutotuneKey:
     Clone + Debug + PartialEq + Eq + Hash + Display + Send + Sync + 'static

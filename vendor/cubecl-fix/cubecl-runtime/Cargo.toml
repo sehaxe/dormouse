@@ -12,7 +12,7 @@
 [package]
 edition = "2024"
 name = "cubecl-runtime"
-version = "0.11.0-pre.3"
+version = "0.11.0-pre.4"
 authors = [
     "louisfd <louisfd94@gmail.com>",
     "Nathaniel Simard",
@@ -23,7 +23,7 @@ autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "Crate that helps creating high performance async runtimes for CubeCL."
+description = "The runtime API of CubeCL: clients, devices, handles and everything a kernel launch needs."
 readme = "README.md"
 keywords = [
     "deep-learning",
@@ -37,7 +37,6 @@ resolver = "2"
 
 [features]
 autotune-checks = []
-browser-cache = ["cubecl-environment/browser-cache"]
 channel-cell = []
 channel-mpsc = []
 channel-mutex = []
@@ -46,10 +45,14 @@ default = [
     "channel-mutex",
     "channel-mpsc",
     "channel-cell",
-    "storage-bytes",
+    "persistence",
     "cubecl-common/default",
 ]
 exclusive-memory-only = []
+persistence = [
+    "std",
+    "cubecl-environment/persistence",
+]
 profile-tracy = ["dep:tracy-client"]
 std = [
     "cubecl-common/std",
@@ -57,7 +60,6 @@ std = [
     "toml",
     "thiserror/std",
 ]
-storage-bytes = []
 tokio = ["cubecl-environment/tokio"]
 tracing = [
     "dep:tracing",
@@ -69,23 +71,6 @@ tracing = [
 name = "cubecl_runtime"
 path = "src/lib.rs"
 
-[[test]]
-name = "integration_test"
-path = "tests/integration_test.rs"
-
-[[test]]
-name = "memory_pools_config"
-path = "tests/memory_pools_config.rs"
-
-[[bench]]
-name = "dynamic"
-path = "benches/dynamic.rs"
-harness = false
-
-[dependencies.ahash]
-version = "0.8.12"
-default-features = false
-
 [dependencies.buildid]
 version = "1.0.5"
 
@@ -96,7 +81,7 @@ version = "1.16.1"
 version = "1.0.0"
 
 [dependencies.cubecl-common]
-version = "=0.11.0-pre.3"
+version = "=0.11.0-pre.4"
 features = [
     "serde",
     "hash",
@@ -104,16 +89,16 @@ features = [
 default-features = false
 
 [dependencies.cubecl-environment]
-version = "=0.11.0-pre.3"
+version = "=0.11.0-pre.4"
 default-features = false
 
 [dependencies.cubecl-ir]
-version = "=0.11.0-pre.3"
+version = "=0.11.0-pre.4"
 features = ["serde"]
 default-features = false
 
 [dependencies.cubecl-zspace]
-version = "=0.11.0-pre.3"
+version = "=0.11.0-pre.4"
 default-features = false
 
 [dependencies.derive-new]
@@ -122,11 +107,22 @@ default-features = false
 
 [dependencies.derive_more]
 version = "2"
-features = ["eq"]
+features = [
+    "not",
+    "add",
+    "mul",
+    "add_assign",
+    "mul_assign",
+    "display",
+    "debug",
+    "from",
+    "into",
+    "eq",
+]
 default-features = false
 
-[dependencies.enumset]
-version = "1.1"
+[dependencies.foldhash]
+version = "0.2"
 default-features = false
 
 [dependencies.futures-util]
@@ -146,11 +142,8 @@ default-features = false
 version = "^0.4.22"
 default-features = false
 
-[dependencies.md5]
-version = "0.8.0"
-
 [dependencies.pliron]
-version = "0.17"
+version = "0.18"
 default-features = false
 
 [dependencies.serde]
@@ -161,6 +154,14 @@ features = [
     "derive",
 ]
 default-features = false
+
+[dependencies.smallvec]
+version = "1"
+features = [
+    "union",
+    "const_generics",
+    "const_new",
+]
 
 [dependencies.thiserror]
 version = "2"
@@ -204,7 +205,7 @@ default-features = false
 version = "0.2.2"
 
 [target.'cfg(any(target_os = "windows", target_os = "linux", target_os = "macos", target_os = "android"))'.dependencies.cubecl-common]
-version = "=0.11.0-pre.3"
+version = "=0.11.0-pre.4"
 features = [
     "serde",
     "hash",
@@ -212,8 +213,7 @@ features = [
 default-features = false
 
 [target.'cfg(any(target_os = "windows", target_os = "linux", target_os = "macos", target_os = "android"))'.dependencies.cubecl-environment]
-version = "=0.11.0-pre.3"
-features = ["cache"]
+version = "=0.11.0-pre.4"
 default-features = false
 
 [target.'cfg(any(target_os = "windows", target_os = "linux", target_os = "macos", target_os = "android"))'.dependencies.serde_json]
