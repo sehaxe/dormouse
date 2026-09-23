@@ -12,9 +12,9 @@ cuda = ["burn/cuda", "burn/autodiff", "dormouse-core/cuda", "burn-muon-plus/cuda
 [dependencies]
 dormouse-core = { path = "../dormouse-core" }
 dormouse-data = { path = "../dormouse-data" }
-burn-spectral = { path = "../../../burn-fused/crates/burn-spectral" }
-burn-bitnet = { path = "../../../burn-fused/crates/burn-bitnet" }
-burn-muon-plus = { path = "../../../burn-fused/crates/burn-muon-plus" }
+burn-spectral = { path = "../../vendor/burn-fused/crates/burn-spectral" }
+burn-bitnet = { path = "../../vendor/burn-fused/crates/burn-bitnet" }
+burn-muon-plus = { path = "../../vendor/burn-fused/crates/burn-muon-plus" }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 burn = { version = "0.22.0-pre.3", default-features = false, features = ["std", "autodiff", "optim"] }
