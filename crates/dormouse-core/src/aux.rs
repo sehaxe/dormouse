@@ -59,8 +59,24 @@ pub fn jepa_aux_loss(
 where
     DispatchTensor: DispatchKindConversion<burn::backend::Autodiff<burn::backend::NdArray>>,
 {
-    let [b, t, d] = student_latent.dims();
+    let t = student_latent.dims()[1];
     let mask: Tensor<1, Bool> = mask_indices(t, mask_frac, mask_span, &student_latent.device());
+    jepa_aux_loss_masked(pred, student_latent, teacher_latent, mask)
+}
+
+/// [`jepa_aux_loss`] with the mask supplied by the caller. The fused
+/// gradcheck draws ONE mask and feeds both paths so the comparison does not
+/// depend on the global RNG (parallel tests interleave draws).
+pub fn jepa_aux_loss_masked(
+    pred: &JepaPredictor,
+    student_latent: Tensor<3>,
+    teacher_latent: Tensor<3>,
+    mask: Tensor<1, Bool>,
+) -> Tensor<1>
+where
+    DispatchTensor: DispatchKindConversion<burn::backend::Autodiff<burn::backend::NdArray>>,
+{
+    let [b, t, d] = student_latent.dims();
     let mask2: Tensor<2, Bool> = mask.unsqueeze_dim::<2>(0).expand([b, t]);
     let predicted = pred.forward(student_latent.clone());
     let l1 = jepa_l1_loss(predicted, teacher_latent.detach(), mask2);

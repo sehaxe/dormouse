@@ -9,14 +9,14 @@ burn = { version = "0.22.0-pre.3", default-features = false, features = ["std", 
 burn-tensor = { version = "0.22.0-pre.3", default-features = false }
 burn-nn = { version = "0.22.0-pre.3", default-features = false }
 burn-cuda = { version = "0.22.0-pre.3", default-features = false, features = ["std"] }
-burn-kda = { path = "../../../burn-fused/crates/burn-kda" }
-burn-msa = { path = "../../../burn-fused/crates/burn-msa" }
-burn-bitnet = { path = "../../../burn-fused/crates/burn-bitnet" }
-burn-engram = { path = "../../../burn-fused/crates/burn-engram" }
-burn-rmsnorm = { path = "../../../burn-fused/crates/burn-rmsnorm" }
-burn-jepa = { path = "../../../burn-fused/crates/burn-jepa" }
-burn-dspark = { path = "../../../burn-fused/crates/burn-dspark", features = ["training"] }
-burn-spectral = { path = "../../../burn-fused/crates/burn-spectral" }
+burn-kda = { path = "../../vendor/burn-fused/crates/burn-kda" }
+burn-msa = { path = "../../vendor/burn-fused/crates/burn-msa" }
+burn-bitnet = { path = "../../vendor/burn-fused/crates/burn-bitnet" }
+burn-engram = { path = "../../vendor/burn-fused/crates/burn-engram" }
+burn-rmsnorm = { path = "../../vendor/burn-fused/crates/burn-rmsnorm" }
+burn-jepa = { path = "../../vendor/burn-fused/crates/burn-jepa" }
+burn-dspark = { path = "../../vendor/burn-fused/crates/burn-dspark", features = ["training"] }
+burn-spectral = { path = "../../vendor/burn-fused/crates/burn-spectral" }
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
