@@ -771,7 +771,7 @@ pub mod cuda {
     use std::any::{Any, TypeId};
 
     /// The bare (non-fusion) CUDA backend the fused kernels target.
-    pub type CudaBare = CubeBackend<cubecl::cuda::CudaRuntime>;
+    pub type CudaBare = CubeBackend;
 
     pub(crate) fn is_cuda<B: Backend>() -> bool {
         TypeId::of::<B>() == TypeId::of::<CudaBare>()
@@ -781,7 +781,7 @@ pub mod cuda {
     /// CUDA `CubeBackend` and the buffer is row-major contiguous.
     fn cube_of<B: Backend, const D: usize>(
         t: &Tensor<D>,
-    ) -> Option<CubeTensor<cubecl::cuda::CudaRuntime>>
+    ) -> Option<CubeTensor>
     where
         DispatchTensor: DispatchKindConversion<B>,
     {
@@ -789,7 +789,7 @@ pub mod cuda {
             return None;
         }
         let prim = t.clone().try_into_primitive::<B>().ok()?;
-        let cube = (&prim as &dyn Any).downcast_ref::<CubeTensor<cubecl::cuda::CudaRuntime>>()?;
+        let cube = (&prim as &dyn Any).downcast_ref::<CubeTensor>()?;
         let shape = cube.meta.shape().dims::<D>();
         let strides = cube.meta.strides().to_vec();
         let mut expected = 1usize;
@@ -907,7 +907,7 @@ pub mod cuda {
         let cube_dim = CubeDim::new_3d(c as u32, 8, 1);
         let cube_count = CubeCount::Static(nblk as u32, 1, 1);
         unsafe {
-            gdn2_chunk_intra_kernel::launch_unchecked::<f32, cubecl::cuda::CudaRuntime>(
+            gdn2_chunk_intra_kernel::launch_unchecked::<f32>(
                 &client,
                 cube_count,
                 cube_dim,
@@ -941,7 +941,7 @@ pub mod cuda {
         let cube_dim2 = CubeDim::new_3d(c as u32, iy, 1);
         let cube_count2 = CubeCount::Static(bh as u32, vt as u32, 1);
         unsafe {
-            gdn2_chunk_inter_kernel::launch_unchecked::<f32, cubecl::cuda::CudaRuntime>(
+            gdn2_chunk_inter_kernel::launch_unchecked::<f32>(
                 &client,
                 cube_count2,
                 cube_dim2,
@@ -974,10 +974,7 @@ pub mod cuda {
             let cube_dim3 = CubeDim::new_3d(c as u32, (vtile / 2) as u32, 1);
             let cube_count3 = CubeCount::Static(bh as u32, vt as u32, 1);
             unsafe {
-                gdn2_chunk_trajectory_export_kernel::launch_unchecked::<
-                    f32,
-                    cubecl::cuda::CudaRuntime,
-                >(
+                gdn2_chunk_trajectory_export_kernel::launch_unchecked::<f32>(
                     &client,
                     cube_count3,
                     cube_dim3,
@@ -1087,7 +1084,7 @@ pub mod cuda {
         let cube_dim2 = CubeDim::new_3d(c as u32, y_dim as u32, 1);
         let cube_count2 = CubeCount::Static(bh as u32, vt as u32, 1);
         unsafe {
-            gdn2_chunk_inter_kernel::launch_unchecked::<f32, cubecl::cuda::CudaRuntime>(
+            gdn2_chunk_inter_kernel::launch_unchecked::<f32>(
                 &client,
                 cube_count2,
                 cube_dim2,
@@ -1199,7 +1196,7 @@ pub mod cuda {
         let cube_dim = CubeDim::new_3d(c as u32, y_dim as u32, 1);
         let cube_count = CubeCount::Static(nblk as u32, 1, 1);
         unsafe {
-            gdn2_chunk_intra_kernel::launch_unchecked::<f32, cubecl::cuda::CudaRuntime>(
+            gdn2_chunk_intra_kernel::launch_unchecked::<f32>(
                 &client,
                 cube_count,
                 cube_dim,

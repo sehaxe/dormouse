@@ -22,7 +22,7 @@ pub const SINKHORN_ITERS: usize = 20;
 pub fn sinkhorn_knopp(logits: Tensor<4>, iters: usize) -> Tensor<4> {
     #[cfg(all(feature = "cuda", feature = "autodiff"))]
     {
-        type CudaBare = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
+        type CudaBare = burn_cubecl::CubeBackend;
         if let Some(out) =
             crate::sinkhorn_cuda::sinkhorn_autodiff::<CudaBare>(logits.clone(), iters)
         {

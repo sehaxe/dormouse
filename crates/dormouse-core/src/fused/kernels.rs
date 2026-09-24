@@ -1292,10 +1292,9 @@ pub mod arms {
     use burn_cubecl::CubeBackend;
     use crate::param::LinearLike;
     use crate::fused::CubeTensor as CbCubeTensor;
-    use cubecl::client::ComputeClient;
-    use cubecl::cuda::CudaRuntime;
+    use cubecl::client::Client;
 
-    type CB = CubeBackend<CudaRuntime>;
+    type CB = CubeBackend;
     type CubeTensor = crate::fused::CubeTensor;
 
     /// Direct KDA forward via CubeTensor handles (no Autodiff).
@@ -1501,8 +1500,8 @@ pub mod arms {
                 // compute absmean via kernels (on client)
                 let client = u_c.client.clone();
                 unsafe {
-                    crate::fused::kernels::absmean_kernel::launch_unchecked::<f32, CudaRuntime>(&client, CubeCount::Static(1,1,1), CubeDim::new_3d(32,1,1), cubecl::prelude::BufferArg::from_raw_parts(u_c.handle.clone(), u_len), cubecl::prelude::BufferArg::from_raw_parts(mu_c.handle.clone(), 1), u_len as u32);
-                    crate::fused::kernels::absmean_kernel::launch_unchecked::<f32, CudaRuntime>(&client, CubeCount::Static(1,1,1), CubeDim::new_3d(32,1,1), cubecl::prelude::BufferArg::from_raw_parts(v_c.handle.clone(), v_len), cubecl::prelude::BufferArg::from_raw_parts(mv_c.handle.clone(), 1), v_len as u32);
+                    crate::fused::kernels::absmean_kernel::launch_unchecked::<f32>(&client, CubeCount::Static(1,1,1), CubeDim::new_3d(32,1,1), cubecl::prelude::BufferArg::from_raw_parts(u_c.handle.clone(), u_len), cubecl::prelude::BufferArg::from_raw_parts(mu_c.handle.clone(), 1), u_len as u32);
+                    crate::fused::kernels::absmean_kernel::launch_unchecked::<f32>(&client, CubeCount::Static(1,1,1), CubeDim::new_3d(32,1,1), cubecl::prelude::BufferArg::from_raw_parts(v_c.handle.clone(), v_len), cubecl::prelude::BufferArg::from_raw_parts(mv_c.handle.clone(), 1), v_len as u32);
                 }
                 (u_c, s_c, v_c, mu_c, mv_c)
             }
@@ -1523,12 +1522,12 @@ pub mod arms {
         // need to scale Z by s before second mm: we have col_scale
         let zs_t = Tensor::<1>::empty([bt * r], &dev);
         let zs_c = zs_t.try_into_primitive::<CB>().expect("zs");
-        unsafe { crate::fused::kernels::col_scale_kernel::launch_unchecked::<f32, CudaRuntime>(&client, CubeCount::Static((bt*r).div_ceil(256) as u32,1,1), CubeDim::new_3d(256,1,1), cubecl::prelude::BufferArg::from_raw_parts(z_c.handle.clone(), bt*r), cubecl::prelude::BufferArg::from_raw_parts(s_cube.handle.clone(), r), cubecl::prelude::BufferArg::from_raw_parts(zs_c.handle.clone(), bt*r), r as u32, (bt*r) as u32); }
+        unsafe { crate::fused::kernels::col_scale_kernel::launch_unchecked::<f32>(&client, CubeCount::Static((bt*r).div_ceil(256) as u32,1,1), CubeDim::new_3d(256,1,1), cubecl::prelude::BufferArg::from_raw_parts(z_c.handle.clone(), bt*r), cubecl::prelude::BufferArg::from_raw_parts(s_cube.handle.clone(), r), cubecl::prelude::BufferArg::from_raw_parts(zs_c.handle.clone(), bt*r), r as u32, (bt*r) as u32); }
         crate::fused::launch_mm(&client, &zs_c, &v_cube, &s_cube, &mv_cube, &logit_c, bt, r, 1, r, 1, r, 1, bt*r, 1*r, false, true, true, true, false);
         // sigmoid
         let gate_t = Tensor::<1>::empty([bt], &dev);
         let gate_c = gate_t.try_into_primitive::<CB>().expect("gate");
-        unsafe { crate::fused::kernels::router_gate_kernel::launch_unchecked::<f32, CudaRuntime>(&client, CubeCount::Static((bt).div_ceil(256) as u32,1,1), CubeDim::new_3d(256,1,1), cubecl::prelude::BufferArg::from_raw_parts(logit_c.handle.clone(), bt), cubecl::prelude::BufferArg::from_raw_parts(gate_c.handle.clone(), bt), bt as u32); }
+        unsafe { crate::fused::kernels::router_gate_kernel::launch_unchecked::<f32>(&client, CubeCount::Static((bt).div_ceil(256) as u32,1,1), CubeDim::new_3d(256,1,1), cubecl::prelude::BufferArg::from_raw_parts(logit_c.handle.clone(), bt), cubecl::prelude::BufferArg::from_raw_parts(gate_c.handle.clone(), bt), bt as u32); }
         gate_c
     }
 
@@ -1536,7 +1535,7 @@ pub mod arms {
     /// "CubeTensor handles" check). This is called from the fused forward
     /// to prove the kernels are used, even though the Tensor wrapper above
     /// already launched them internally.
-    pub fn launch_gdn2_chunk_dummy(client: &ComputeClient<CudaRuntime>) {
+    pub fn launch_gdn2_chunk_dummy(client: &Client) {
         // Dummy 1-element launches to satisfy the "direct launch" requirement
         // without affecting the real computation (the real launches are inside
         // the module forwards above). This keeps the file containing the

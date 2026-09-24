@@ -368,13 +368,13 @@ where
     };
 
     let (q_t, k_t, v_t, g_t, b_t, w_t, s_t) = (
-        Tensor::from_primitive::<Inner>(q.primitive.clone()),
-        Tensor::from_primitive::<Inner>(k.primitive.clone()),
-        Tensor::from_primitive::<Inner>(v.primitive.clone()),
-        Tensor::from_primitive::<Inner>(g.primitive.clone()),
-        Tensor::from_primitive::<Inner>(b.primitive.clone()),
-        Tensor::from_primitive::<Inner>(w.primitive.clone()),
-        Tensor::from_primitive::<Inner>(state.primitive.clone()),
+        Tensor::from_primitive::<Inner>(q.primitive().clone()),
+        Tensor::from_primitive::<Inner>(k.primitive().clone()),
+        Tensor::from_primitive::<Inner>(v.primitive().clone()),
+        Tensor::from_primitive::<Inner>(g.primitive().clone()),
+        Tensor::from_primitive::<Inner>(b.primitive().clone()),
+        Tensor::from_primitive::<Inner>(w.primitive().clone()),
+        Tensor::from_primitive::<Inner>(state.primitive().clone()),
     );
 
     // Forward on the inner backend. On the bare CUDA backend the two fused
@@ -446,13 +446,13 @@ where
     let new_state_prim = new_state_t.try_into_primitive::<Inner>().unwrap();
 
     let nodes = [
-        q.node.clone(),
-        k.node.clone(),
-        v.node.clone(),
-        g.node.clone(),
-        b.node.clone(),
-        w.node.clone(),
-        state.node.clone(),
+        q.node(),
+        k.node(),
+        v.node(),
+        g.node(),
+        b.node(),
+        w.node(),
+        state.node(),
     ];
     let prep = ChunkWy.prepare::<NoCheckpointing>(nodes);
 

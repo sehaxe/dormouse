@@ -23,7 +23,7 @@ toml = "0.8"
 # Already in the build graph via burn-cuda / burn-spectral(cuda); declared so
 # fused.rs can name CubeTensor and launch #[cube] kernels directly.
 burn-cubecl = { version = "0.22.0-pre.4", default-features = false, features = ["std"], optional = true }
-cubecl = { version = "0.11.0-pre.3", default-features = false, features = ["std", "cuda"], optional = true }
+cubecl = { version = "0.11.0-pre.4", default-features = false, features = ["std", "cuda"], optional = true }
 # already compiled via burn-spectral(cuda); needed to block on client.sync()
 futures-lite = { version = "2", optional = true }
 

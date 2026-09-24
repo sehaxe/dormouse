@@ -35,14 +35,12 @@ use burn_autodiff::grads::Gradients;
 use burn_autodiff::ops::{Backward, Ops, OpsKind};
 use burn_autodiff::Autodiff;
 use burn_cubecl::tensor::CubeTensor;
-use cubecl::client::ComputeClient;
+use cubecl::client::Client;
 use cubecl::prelude::*;
 use cubecl::server::Handle;
 
-type Cuda = cubecl::cuda::CudaRuntime;
-type CB = burn_cubecl::CubeBackend<Cuda>;
+type CB = burn_cubecl::CubeBackend;
 type CAd = Autodiff<CB>;
-type Client = ComputeClient<Cuda>;
 
 static MOE_FWD_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -78,21 +76,21 @@ fn zeros_dense<const D: usize>(dims: [usize; D], device: &Device) -> Tensor<D> {
     Tensor::<1>::zeros([n], device).reshape::<D, _>(dims)
 }
 
-fn cube_of2(t: &Tensor<2>) -> Option<CubeTensor<Cuda>> {
+fn cube_of2(t: &Tensor<2>) -> Option<CubeTensor> {
     let prim = t.clone().try_into_primitive::<CB>().ok()?;
-    let c = (&prim as &dyn Any).downcast_ref::<CubeTensor<Cuda>>()?;
+    let c = (&prim as &dyn Any).downcast_ref::<CubeTensor>()?;
     Some(c.clone())
 }
 
-fn cube_of1(t: &Tensor<1>) -> Option<CubeTensor<Cuda>> {
+fn cube_of1(t: &Tensor<1>) -> Option<CubeTensor> {
     let prim = t.clone().try_into_primitive::<CB>().ok()?;
-    let c = (&prim as &dyn Any).downcast_ref::<CubeTensor<Cuda>>()?;
+    let c = (&prim as &dyn Any).downcast_ref::<CubeTensor>()?;
     Some(c.clone())
 }
 
-fn cube_int2(t: &Tensor<2, Int>) -> Option<CubeTensor<Cuda>> {
+fn cube_int2(t: &Tensor<2, Int>) -> Option<CubeTensor> {
     let prim = t.clone().try_into_primitive::<CB>().ok()?;
-    let c = (&prim as &dyn Any).downcast_ref::<CubeTensor<Cuda>>()?;
+    let c = (&prim as &dyn Any).downcast_ref::<CubeTensor>()?;
     Some(c.clone())
 }
 
@@ -853,7 +851,7 @@ fn router_backward_cuda(
     let d_h_bufc = cube_of2(&d_h_buf)?;
 
     unsafe {
-        moe_router_bwd_kernel::launch_unchecked::<f32, Cuda>(
+        moe_router_bwd_kernel::launch_unchecked::<f32>(
             &client,
             CubeCount::Static(st.b as u32, 1, 1),
             CubeDim::new_3d(32, 1, 1),
@@ -873,7 +871,7 @@ fn router_backward_cuda(
             st.e as u32,
             st.k as u32,
         );
-        moe_router_bwd2_kernel::launch_unchecked::<f32, Cuda>(
+        moe_router_bwd2_kernel::launch_unchecked::<f32>(
             &client,
             CubeCount::Static(st.b as u32, 1, 1),
             CubeDim::new_3d(32, 1, 1),
@@ -884,7 +882,7 @@ fn router_backward_cuda(
             st.in_features as u32,
             st.p as u32,
         );
-        moe_router_bwd3_kernel::launch_unchecked::<f32, Cuda>(
+        moe_router_bwd3_kernel::launch_unchecked::<f32>(
             &client,
             CubeCount::Static(((st.in_features * st.p) as u32).div_ceil(64), 1, 1),
             CubeDim::new_3d(64, 1, 1),
@@ -900,7 +898,7 @@ fn router_backward_cuda(
 }
 
 /// Tensor-path router backward (reference; dead in practice since the op is
-/// only built for `Autodiff<CubeBackend<CudaRuntime>>`).
+/// only built for `Autodiff<CubeBackend>`).
 fn router_backward_tensor(
     st: &RoutState,
     dg: &Tensor<2>,
@@ -1010,7 +1008,7 @@ fn router_cuda(
     let idx_c = cube_int2(&idx)?;
     let gc = cube_of2(&g)?;
     unsafe {
-        moe_router_kernel::launch_unchecked::<f32, Cuda>(
+        moe_router_kernel::launch_unchecked::<f32>(
             &client,
             CubeCount::Static(b as u32, 1, 1),
             CubeDim::new_3d(32, 1, 1),
@@ -1032,7 +1030,7 @@ fn router_cuda(
     Some((c_idx, idx, g))
 }
 
-/// Fused router on `Autodiff<CubeBackend<CudaRuntime>>`: runs the kernels on
+/// Fused router on `Autodiff<CubeBackend>`: runs the kernels on
 /// the inner backend and wraps only the gates in a tracked op (parents:
 /// x, w_proj, w_cluster, w_expert; `c_idx`/`idx` are plain byproducts — they
 /// never carry gradients).
@@ -1051,10 +1049,10 @@ fn router_fused_autodiff(
     let wpa = w_proj.try_into_primitive::<CAd>().ok()?;
     let wca = w_cluster.try_into_primitive::<CAd>().ok()?;
     let wea = w_expert.try_into_primitive::<CAd>().ok()?;
-    let x_t = Tensor::<2>::from_primitive::<CB>(xa.primitive.clone());
-    let wp_t = Tensor::<2>::from_primitive::<CB>(wpa.primitive.clone());
-    let wc_t = Tensor::<2>::from_primitive::<CB>(wca.primitive.clone());
-    let we_t = Tensor::<2>::from_primitive::<CB>(wea.primitive.clone());
+    let x_t = Tensor::<2>::from_primitive::<CB>(xa.primitive().clone());
+    let wp_t = Tensor::<2>::from_primitive::<CB>(wpa.primitive().clone());
+    let wc_t = Tensor::<2>::from_primitive::<CB>(wca.primitive().clone());
+    let we_t = Tensor::<2>::from_primitive::<CB>(wea.primitive().clone());
     let [b, in_features] = x_t.dims();
     let x_d = dense(x_t);
     let wp_d = dense(wp_t);
@@ -1063,10 +1061,10 @@ fn router_fused_autodiff(
     let (c_idx, idx, g) = router_cuda(&x_d, &wp_d, &wc_d, &we_d, p, c, e, k)?;
     let g_prim = g.try_into_primitive::<CB>().unwrap();
     let nodes = [
-        xa.node.clone(),
-        wpa.node.clone(),
-        wca.node.clone(),
-        wea.node.clone(),
+        xa.node(),
+        wpa.node(),
+        wca.node(),
+        wea.node(),
     ];
     let prep = RoutFwdOp.prepare::<NoCheckpointing>(nodes);
     let g_adt = match prep.compute_bound().stateful() {
@@ -1277,7 +1275,7 @@ fn moe_backward_cuda(
     let dgc = cube_of2(&dg)?;
 
     unsafe {
-        moe_bwd_kernel::launch_unchecked::<f32, Cuda>(
+        moe_bwd_kernel::launch_unchecked::<f32>(
             &client,
             CubeCount::Static(b as u32, 1, 1),
             CubeDim::new_3d(32, 1, 1),
@@ -1306,7 +1304,7 @@ fn moe_backward_cuda(
 }
 
 /// Tensor-path backward (reference; dead in practice since the op is only
-/// built for `Autodiff<CubeBackend<CudaRuntime>>`). Re-materializes the
+/// built for `Autodiff<CubeBackend>`). Re-materializes the
 /// gather/intermediates, so it is NOT used for the memory win.
 #[allow(clippy::too_many_arguments)]
 fn moe_backward_tensor(
@@ -1451,7 +1449,7 @@ fn moe_fwd(
     let y = empty_dense([b, dim_out], &dev);
     let yc = cube_of2(&y)?;
     unsafe {
-        moe_fwd_kernel::launch_unchecked::<f32, Cuda>(
+        moe_fwd_kernel::launch_unchecked::<f32>(
             client,
             CubeCount::Static(b as u32, 1, 1),
             CubeDim::new_3d(32, 1, 1),
@@ -1492,7 +1490,7 @@ fn moe_fwd(
     ))
 }
 
-/// Fused forward on `Autodiff<CubeBackend<CudaRuntime>>`: runs the kernels on
+/// Fused forward on `Autodiff<CubeBackend>`: runs the kernels on
 /// the inner backend and wraps the result in a tracked op (parents:
 /// x, u, v, s, gates).
 #[allow(clippy::too_many_arguments)]
@@ -1510,11 +1508,11 @@ fn moe_fused_autodiff(
     let va = v.try_into_primitive::<CAd>().ok()?;
     let sa = s.try_into_primitive::<CAd>().ok()?;
     let ga = gates.try_into_primitive::<CAd>().ok()?;
-    let x_t = Tensor::<2>::from_primitive::<CB>(xa.primitive.clone());
-    let u_t = Tensor::<2>::from_primitive::<CB>(ua.primitive.clone());
-    let v_t = Tensor::<2>::from_primitive::<CB>(va.primitive.clone());
-    let s_t = Tensor::<1>::from_primitive::<CB>(sa.primitive.clone());
-    let g_t = Tensor::<2>::from_primitive::<CB>(ga.primitive.clone());
+    let x_t = Tensor::<2>::from_primitive::<CB>(xa.primitive().clone());
+    let u_t = Tensor::<2>::from_primitive::<CB>(ua.primitive().clone());
+    let v_t = Tensor::<2>::from_primitive::<CB>(va.primitive().clone());
+    let s_t = Tensor::<1>::from_primitive::<CB>(sa.primitive().clone());
+    let g_t = Tensor::<2>::from_primitive::<CB>(ga.primitive().clone());
     let idx_t: Tensor<2, Int> = {
         let prim = idx.clone().try_into_primitive::<CB>().ok()?;
         let prim: <CB as burn::backend::BackendTypes>::IntTensorPrimitive = prim;
@@ -1540,11 +1538,11 @@ fn moe_fused_autodiff(
     )?;
     let out_prim = out_t.try_into_primitive::<CB>().unwrap();
     let nodes = [
-        xa.node.clone(),
-        ua.node.clone(),
-        va.node.clone(),
-        sa.node.clone(),
-        ga.node.clone(),
+        xa.node(),
+        ua.node(),
+        va.node(),
+        sa.node(),
+        ga.node(),
     ];
     let prep = MoeFwdOp.prepare::<NoCheckpointing>(nodes);
     let out_adt = match prep.compute_bound().stateful() {
@@ -2602,14 +2600,14 @@ mod moe_tests {
     fn launch_fwd_raw(
         client: &Client,
         scalar: bool,
-        xc: &CubeTensor<Cuda>,
-        uc: &CubeTensor<Cuda>,
-        vc: &CubeTensor<Cuda>,
-        sc: &CubeTensor<Cuda>,
-        idxc: &CubeTensor<Cuda>,
-        gc: &CubeTensor<Cuda>,
+        xc: &CubeTensor,
+        uc: &CubeTensor,
+        vc: &CubeTensor,
+        sc: &CubeTensor,
+        idxc: &CubeTensor,
+        gc: &CubeTensor,
         z: &Handle,
-        yc: &CubeTensor<Cuda>,
+        yc: &CubeTensor,
         b: u32,
         dim_in: u32,
         m: u32,
@@ -2620,7 +2618,7 @@ mod moe_tests {
         macro_rules! run {
             ($kernel:ident, $count:expr, $dim:expr) => {
                 unsafe {
-                    $kernel::launch_unchecked::<f32, Cuda>(
+                    $kernel::launch_unchecked::<f32>(
                         client,
                         $count,
                         $dim,
@@ -2811,19 +2809,19 @@ mod moe_tests {
     fn launch_bwd_raw(
         client: &Client,
         scalar: bool,
-        doc: &CubeTensor<Cuda>,
-        xc: &CubeTensor<Cuda>,
-        uc: &CubeTensor<Cuda>,
-        vc: &CubeTensor<Cuda>,
-        sc: &CubeTensor<Cuda>,
-        idxc: &CubeTensor<Cuda>,
-        gc: &CubeTensor<Cuda>,
+        doc: &CubeTensor,
+        xc: &CubeTensor,
+        uc: &CubeTensor,
+        vc: &CubeTensor,
+        sc: &CubeTensor,
+        idxc: &CubeTensor,
+        gc: &CubeTensor,
         z: &Handle,
-        dxc: &CubeTensor<Cuda>,
-        duc: &CubeTensor<Cuda>,
-        dvc: &CubeTensor<Cuda>,
-        dsc: &CubeTensor<Cuda>,
-        dgc: &CubeTensor<Cuda>,
+        dxc: &CubeTensor,
+        duc: &CubeTensor,
+        dvc: &CubeTensor,
+        dsc: &CubeTensor,
+        dgc: &CubeTensor,
         b: u32,
         dim_in: u32,
         m: u32,
@@ -2834,7 +2832,7 @@ mod moe_tests {
         macro_rules! run {
             ($kernel:ident, $count:expr, $dim:expr) => {
                 unsafe {
-                    $kernel::launch_unchecked::<f32, Cuda>(
+                    $kernel::launch_unchecked::<f32>(
                         client,
                         $count,
                         $dim,

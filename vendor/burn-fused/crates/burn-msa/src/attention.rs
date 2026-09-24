@@ -72,7 +72,7 @@ impl SparseAttention {
         let (out_4d, block_attn) = {
             #[cfg(all(feature = "cuda", feature = "autodiff"))]
             {
-                type CudaBare = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
+                type CudaBare = burn_cubecl::CubeBackend;
                 if let Some(res) = crate::autodiff::sparse_attn_autodiff::<CudaBare>(
                     Self::to_4d(q.clone(), self.cfg.n_heads_q, self.cfg.d_head),
                     Self::to_4d(k.clone(), self.cfg.n_heads_kv, self.cfg.d_head),

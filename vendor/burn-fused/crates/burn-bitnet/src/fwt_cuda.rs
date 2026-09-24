@@ -134,17 +134,17 @@ fn quant_kernel<F: Float>(
 }
 
 #[cfg(feature = "cuda")]
-type CudaBare = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
+type CudaBare = burn_cubecl::CubeBackend;
 
 #[cfg(feature = "cuda")]
-fn cube_of<const D: usize>(t: &Tensor<D>) -> Option<CubeTensor<cubecl::cuda::CudaRuntime>> {
+fn cube_of<const D: usize>(t: &Tensor<D>) -> Option<CubeTensor> {
     let prim = t.clone().try_into_primitive::<CudaBare>().ok()?;
-    let c = (&prim as &dyn Any).downcast_ref::<CubeTensor<cubecl::cuda::CudaRuntime>>()?;
+    let c = (&prim as &dyn Any).downcast_ref::<CubeTensor>()?;
     Some(c.clone())
 }
 
 #[cfg(feature = "cuda")]
-fn cube_of_1(t: &Tensor<1>) -> Option<CubeTensor<cubecl::cuda::CudaRuntime>> {
+fn cube_of_1(t: &Tensor<1>) -> Option<CubeTensor> {
     cube_of(t)
 }
 
@@ -176,7 +176,7 @@ fn pad_kernel<F: Float>(
 }
 
 #[cfg(feature = "cuda")]
-fn pad_cuda(x: &Tensor<2>, p: usize) -> Option<CubeTensor<cubecl::cuda::CudaRuntime>> {
+fn pad_cuda(x: &Tensor<2>, p: usize) -> Option<CubeTensor> {
     let [n, d] = x.dims();
     // always copy to a fresh buffer: the caller's tensor must never be aliased
     let xc = cube_of(x)?;
@@ -185,7 +185,7 @@ fn pad_cuda(x: &Tensor<2>, p: usize) -> Option<CubeTensor<cubecl::cuda::CudaRunt
     let client = xc.client.clone();
     let chunks = (p as u32).div_ceil(256);
     unsafe {
-        pad_kernel::launch_unchecked::<f32, cubecl::cuda::CudaRuntime>(
+        pad_kernel::launch_unchecked::<f32>(
             &client,
             CubeCount::Static(n as u32, 1, 1),
             CubeDim::new_3d(256, 1, 1),
@@ -216,14 +216,14 @@ pub fn fwt_cuda(x: &Tensor<2>, p: usize) -> Option<Tensor<2>> {
     // launch_unchecked bypasses the graph, so sync before the kernel reads x.
     {
         use burn::backend::Backend as _;
-        let _ = burn_cubecl::CubeBackend::<cubecl::cuda::CudaRuntime>::sync(&xc.device);
+        let _ = <burn_cubecl::CubeBackend as burn::backend::Backend>::sync(&xc.device);
     }
     let threads = (p as u32).min(256);
     let log2p = p.ilog2();
     let cube_dim = CubeDim::new_3d(threads, 1, 1);
     let cube_count = CubeCount::Static(n as u32, 1, 1);
     unsafe {
-        fwt_pad_kernel::launch_unchecked::<f32, cubecl::cuda::CudaRuntime>(
+        fwt_pad_kernel::launch_unchecked::<f32>(
             &client,
             cube_count,
             cube_dim,
@@ -258,7 +258,7 @@ fn fwt_backward_cuda(d_out: &Tensor<2>, p: usize) -> Option<Tensor<2>> {
     let threads = (p as u32).min(256);
     let log2p = p.ilog2();
     unsafe {
-        fwt_pad_kernel::launch_unchecked::<f32, cubecl::cuda::CudaRuntime>(
+        fwt_pad_kernel::launch_unchecked::<f32>(
             &client,
             CubeCount::Static(n as u32, 1, 1),
             CubeDim::new_3d(threads, 1, 1),
@@ -295,7 +295,7 @@ pub fn quant_cuda(x: &Tensor<2>, bits: usize) -> Option<Tensor<2>> {
     let oc = cube_of(&out)?;
     let chunks = (p as u32).div_ceil(256);
     unsafe {
-        quant_kernel::launch_unchecked::<f32, cubecl::cuda::CudaRuntime>(
+        quant_kernel::launch_unchecked::<f32>(
             &client,
             CubeCount::Static(n as u32, 1, 1),
             CubeDim::new_3d(256, 1, 1),
@@ -387,7 +387,7 @@ mod ad {
         DispatchTensor: DispatchKindConversion<Autodiff<Inner>> + DispatchKindConversion<Inner>,
     {
         let xa = x.try_into_primitive::<Autodiff<Inner>>().ok()?;
-        let x_t = Tensor::from_primitive::<Inner>(xa.primitive.clone());
+        let x_t = Tensor::from_primitive::<Inner>(xa.primitive().clone());
         let out_t = {
             #[cfg(feature = "cuda")]
             {
@@ -407,7 +407,7 @@ mod ad {
             }
         };
         let out_prim = out_t.try_into_primitive::<Inner>().unwrap();
-        let nodes = [xa.node.clone()];
+        let nodes = [xa.node()];
         let prep = FwtOp.prepare::<NoCheckpointing>(nodes);
         let out_adt = match prep.compute_bound().stateful() {
             OpsKind::Tracked(prep) => prep.finish(p, out_prim),
@@ -422,7 +422,7 @@ mod ad {
         DispatchTensor: DispatchKindConversion<Autodiff<Inner>> + DispatchKindConversion<Inner>,
     {
         let xa = x.try_into_primitive::<Autodiff<Inner>>().ok()?;
-        let x_t = Tensor::from_primitive::<Inner>(xa.primitive.clone());
+        let x_t = Tensor::from_primitive::<Inner>(xa.primitive().clone());
         let out_t = {
             #[cfg(feature = "cuda")]
             {
@@ -442,7 +442,7 @@ mod ad {
             }
         };
         let out_prim = out_t.try_into_primitive::<Inner>().unwrap();
-        let nodes = [xa.node.clone()];
+        let nodes = [xa.node()];
         let prep = QuantOp.prepare::<NoCheckpointing>(nodes);
         let out_adt = match prep.compute_bound().stateful() {
             OpsKind::Tracked(prep) => prep.finish((), out_prim),

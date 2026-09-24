@@ -1,6 +1,6 @@
 use cubecl::cuda::CudaRuntime;
 use cubecl::prelude::*;
-use cubecl::Runtime;
+use cubecl_runtime::runtime::Runtime;
 use std::time::Instant;
 
 #[cube(launch_unchecked)]
@@ -18,7 +18,7 @@ fn main() {
     // warmup
     for _ in 0..5 {
         unsafe {
-            tiny_kernel::launch_unchecked::<f32, R>(
+            tiny_kernel::launch_unchecked::<f32>(
                 &client,
                 CubeCount::Static(1, 1, 1),
                 dim,
@@ -32,7 +32,7 @@ fn main() {
     let t0 = Instant::now();
     for i in 0..100 {
         unsafe {
-            tiny_kernel::launch_unchecked::<f32, R>(
+            tiny_kernel::launch_unchecked::<f32>(
                 &client,
                 CubeCount::Static(1, 1, 1),
                 dim,

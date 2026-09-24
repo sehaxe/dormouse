@@ -77,10 +77,10 @@ fn finalize_kernel<F: Float>(
     }
 }
 
-fn cube_of<const D: usize>(t: &Tensor<D>) -> Option<CubeTensor<cubecl::cuda::CudaRuntime>> {
-    type B = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
+fn cube_of<const D: usize>(t: &Tensor<D>) -> Option<CubeTensor> {
+    type B = burn_cubecl::CubeBackend;
     let prim = t.clone().try_into_primitive::<B>().ok()?;
-    let c = (&prim as &dyn Any).downcast_ref::<CubeTensor<cubecl::cuda::CudaRuntime>>()?;
+    let c = (&prim as &dyn Any).downcast_ref::<CubeTensor>()?;
     Some(c.clone())
 }
 
@@ -109,7 +109,7 @@ pub fn ns_combine_cuda<const D: usize>(
         let dim = CubeDim::new_3d(threads, 1, 1);
         let count = CubeCount::Static(cubes, 1, 1);
         unsafe {
-            ns_combine_kernel::launch_unchecked::<f32, cubecl::cuda::CudaRuntime>(
+            ns_combine_kernel::launch_unchecked::<f32>(
                 &client,
                 count,
                 dim,
@@ -148,7 +148,7 @@ pub fn momentum_cuda<const D: usize>(m: &mut Tensor<D>, g: &Tensor<D>, mu: f32) 
         let dim = CubeDim::new_3d(threads, 1, 1);
         let count = CubeCount::Static(cubes, 1, 1);
         unsafe {
-            momentum_kernel::launch_unchecked::<f32, cubecl::cuda::CudaRuntime>(
+            momentum_kernel::launch_unchecked::<f32>(
                 &client,
                 count,
                 dim,
@@ -184,7 +184,7 @@ pub fn finalize_cuda<const D: usize>(x: &mut Tensor<D>, u: &Tensor<D>, eta: f32,
         let dim = CubeDim::new_3d(threads, 1, 1);
         let count = CubeCount::Static(cubes, 1, 1);
         unsafe {
-            finalize_kernel::launch_unchecked::<f32, cubecl::cuda::CudaRuntime>(
+            finalize_kernel::launch_unchecked::<f32>(
                 &client,
                 count,
                 dim,
@@ -545,7 +545,7 @@ pub fn norm_colrow_cuda<const D: usize>(x: &mut Tensor<D>, eps: f32) -> bool {
         let p_len = (pc.handle.size_in_used() / 4) as usize;
         let count = CubeCount::Static(n_slabs, n_tiles, 1);
         unsafe {
-            norm_col_partials_kernel::launch_unchecked::<f32, cubecl::cuda::CudaRuntime>(
+            norm_col_partials_kernel::launch_unchecked::<f32>(
                 &client,
                 count.clone(),
                 dim,
@@ -558,7 +558,7 @@ pub fn norm_colrow_cuda<const D: usize>(x: &mut Tensor<D>, eps: f32) -> bool {
                 ps0,
                 ps1,
             );
-            norm_col_apply_kernel::launch_unchecked::<f32, cubecl::cuda::CudaRuntime>(
+            norm_col_apply_kernel::launch_unchecked::<f32>(
                 &client,
                 count.clone(),
                 dim,
@@ -572,7 +572,7 @@ pub fn norm_colrow_cuda<const D: usize>(x: &mut Tensor<D>, eps: f32) -> bool {
                 ps0,
                 ps1,
             );
-            norm_row_kernel_v2::launch_unchecked::<f32, cubecl::cuda::CudaRuntime>(
+            norm_row_kernel_v2::launch_unchecked::<f32>(
                 &client,
                 CubeCount::Static(r as u32, 1, 1),
                 dim,

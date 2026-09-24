@@ -151,23 +151,26 @@ fn device() -> Device {
 /// Pool introspection (debug): bytes reserved/used/live allocs on the CUDA client.
 #[cfg(feature = "cuda")]
 pub fn pool_stats(device: &Device) -> String {
+    use burn_dispatch::devices::CubeDevice;
     use burn_dispatch::DispatchDevice;
     use cubecl_cuda::CudaRuntime;
-    use cubecl_runtime::client::ComputeClient;
+    use cubecl_runtime::runtime::Runtime as _;
     fn unwrap(d: &DispatchDevice) -> &burn_cuda::CudaDevice {
+        // pre.4 unifies every cubecl runtime under DispatchDevice::Cube
+        // (CubeDevice = cubecl::Device); pick the CUDA entry.
         match d {
-            DispatchDevice::Cuda(dev) => dev,
+            DispatchDevice::Cube(CubeDevice::Cuda(dev)) => dev,
             DispatchDevice::Autodiff(a) => match &**a {
-                DispatchDevice::Cuda(dev) => dev,
+                DispatchDevice::Cube(CubeDevice::Cuda(dev)) => dev,
                 other => panic!("expected CUDA device, got {other:?}"),
             },
             other => panic!("expected CUDA device, got {other:?}"),
         }
     }
-    let client = ComputeClient::<CudaRuntime>::load(unwrap(device.as_dispatch()));
-    match client.memory_usage() {
-        Ok(u) => format!("res={:.1}MB used={:.1}MB allocs={}", u.bytes_reserved as f64 / 1e6, u.bytes_in_use as f64 / 1e6, u.number_allocs),
-        Err(_) => "mem-err".into(),
+    let client = CudaRuntime::client(unwrap(device.as_dispatch()));
+    {
+        let u = client.memory_usage();
+        format!("res={:.1}MB used={:.1}MB allocs={}", u.bytes_reserved as f64 / 1e6, u.bytes_in_use as f64 / 1e6, u.number_allocs)
     }
 }
 #[cfg(not(feature = "cuda"))]
@@ -179,20 +182,23 @@ pub fn pool_stats(_device: &Device) -> String { "cpu".into() }
 /// (aria hit the same wall; periodic cleanup is the cheap fix).
 #[cfg(feature = "cuda")]
 pub fn memory_cleanup(device: &Device) {
+    use burn_dispatch::devices::CubeDevice;
     use burn_dispatch::DispatchDevice;
     use cubecl_cuda::CudaRuntime;
-    use cubecl_runtime::client::ComputeClient;
+    use cubecl_runtime::runtime::Runtime as _;
     fn unwrap(d: &DispatchDevice) -> &burn_cuda::CudaDevice {
+        // pre.4 unifies every cubecl runtime under DispatchDevice::Cube
+        // (CubeDevice = cubecl::Device); pick the CUDA entry.
         match d {
-            DispatchDevice::Cuda(dev) => dev,
+            DispatchDevice::Cube(CubeDevice::Cuda(dev)) => dev,
             DispatchDevice::Autodiff(a) => match &**a {
-                DispatchDevice::Cuda(dev) => dev,
+                DispatchDevice::Cube(CubeDevice::Cuda(dev)) => dev,
                 other => panic!("expected CUDA device, got {other:?}"),
             },
             other => panic!("expected CUDA device, got {other:?}"),
         }
     }
-    let client = ComputeClient::<CudaRuntime>::load(unwrap(device.as_dispatch()));
+    let client = CudaRuntime::client(unwrap(device.as_dispatch()));
     client.memory_cleanup();
 }
 #[cfg(not(feature = "cuda"))]
@@ -205,23 +211,26 @@ pub fn memory_cleanup(_device: &Device) {}
 /// mark.
 #[cfg(feature = "cuda")]
 pub fn init_pools(device: &Device) {
+    use burn_dispatch::devices::CubeDevice;
     use burn_dispatch::DispatchDevice;
     use cubecl_cuda::CudaRuntime;
     use cubecl_runtime::{
-        client::ComputeClient,
+        runtime::Runtime as _,
         config::memory::{MemoryPoolsConfig, MemoryPoolsPreset},
     };
     fn unwrap(d: &DispatchDevice) -> &burn_cuda::CudaDevice {
+        // pre.4 unifies every cubecl runtime under DispatchDevice::Cube
+        // (CubeDevice = cubecl::Device); pick the CUDA entry.
         match d {
-            DispatchDevice::Cuda(dev) => dev,
+            DispatchDevice::Cube(CubeDevice::Cuda(dev)) => dev,
             DispatchDevice::Autodiff(a) => match &**a {
-                DispatchDevice::Cuda(dev) => dev,
+                DispatchDevice::Cube(CubeDevice::Cuda(dev)) => dev,
                 other => panic!("expected CUDA device, got {other:?}"),
             },
             other => panic!("expected CUDA device, got {other:?}"),
         }
     }
-    let client = ComputeClient::<CudaRuntime>::load(unwrap(device.as_dispatch()));
+    let client = CudaRuntime::client(unwrap(device.as_dispatch()));
     let _ = client.install_memory_pools(&MemoryPoolsConfig::Preset(MemoryPoolsPreset::ExclusivePages));
 }
 #[cfg(not(feature = "cuda"))]

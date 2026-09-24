@@ -156,11 +156,11 @@ fn sinkhorn_backward_cuda(
         return None;
     }
     let cube =
-        |x: &Tensor<4>| -> Option<burn_cubecl::tensor::CubeTensor<cubecl::cuda::CudaRuntime>> {
-            type B = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
+        |x: &Tensor<4>| -> Option<burn_cubecl::tensor::CubeTensor> {
+            type B = burn_cubecl::CubeBackend;
             let prim = x.clone().try_into_primitive::<B>().ok()?;
             let c = (&prim as &dyn std::any::Any)
-                .downcast_ref::<burn_cubecl::tensor::CubeTensor<cubecl::cuda::CudaRuntime>>()?;
+                .downcast_ref::<burn_cubecl::tensor::CubeTensor>()?;
             Some(c.clone())
         };
     let lc = cube(logits)?;
@@ -169,7 +169,7 @@ fn sinkhorn_backward_cuda(
     let oc = cube(&dlogits)?;
     let client = lc.client.clone();
     unsafe {
-        sinkhorn_backward_kernel::launch_unchecked::<f32, cubecl::cuda::CudaRuntime>(
+        sinkhorn_backward_kernel::launch_unchecked::<f32>(
             &client,
             CubeCount::Static((b * t) as u32, 1, 1),
             CubeDim::new_3d(n as u32, 1, 1),
@@ -190,20 +190,20 @@ pub fn sinkhorn_cuda(x: &mut Tensor<4>, iters: usize) -> bool {
     if n != dims[3] {
         return false;
     }
-    type B = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
+    type B = burn_cubecl::CubeBackend;
     let prim = x.clone().try_into_primitive::<B>().ok();
     let Some(prim) = prim else {
         return false;
     };
     let Some(xc) = (&prim as &dyn Any)
-        .downcast_ref::<burn_cubecl::tensor::CubeTensor<cubecl::cuda::CudaRuntime>>()
+        .downcast_ref::<burn_cubecl::tensor::CubeTensor>()
     else {
         return false;
     };
     let client = xc.client.clone();
     let dim = CubeDim::new_3d(n as u32, 1, 1);
     unsafe {
-        sinkhorn_kernel::launch_unchecked::<f32, cubecl::cuda::CudaRuntime>(
+        sinkhorn_kernel::launch_unchecked::<f32>(
             &client,
             CubeCount::Static((b * t) as u32, 1, 1),
             dim,
@@ -316,7 +316,7 @@ mod ad {
             let d_out = Tensor::from_primitive::<B>(grads.consume::<B>(&ops.node));
             #[cfg(feature = "cuda")]
             {
-                type CudaBare = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
+                type CudaBare = burn_cubecl::CubeBackend;
                 if std::any::TypeId::of::<B>() == std::any::TypeId::of::<CudaBare>() {
                     if let Some(dl) =
                         crate::sinkhorn_cuda::sinkhorn_backward_cuda(&logits, &d_out, iters)
@@ -346,7 +346,7 @@ mod ad {
         DispatchTensor: DispatchKindConversion<Autodiff<Inner>> + DispatchKindConversion<Inner>,
     {
         let la = logits.try_into_primitive::<Autodiff<Inner>>().ok()?;
-        let l_t = Tensor::from_primitive::<Inner>(la.primitive.clone());
+        let l_t = Tensor::from_primitive::<Inner>(la.primitive().clone());
 
         let out_t = {
             let mut m = l_t.exp();
@@ -356,7 +356,7 @@ mod ad {
             let mut fused = false;
             #[cfg(feature = "cuda")]
             {
-                type CudaBare = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
+                type CudaBare = burn_cubecl::CubeBackend;
                 if std::any::TypeId::of::<Inner>() == std::any::TypeId::of::<CudaBare>() {
                     fused = crate::sinkhorn_cuda::sinkhorn_cuda(&mut m, iters);
                 }
@@ -373,7 +373,7 @@ mod ad {
         };
 
         let out_prim = out_t.try_into_primitive::<Inner>().unwrap();
-        let nodes = [la.node.clone()];
+        let nodes = [la.node()];
         let prep = SinkhornOp.prepare::<NoCheckpointing>(nodes);
         let out_adt = match prep.compute_bound().stateful() {
             OpsKind::Tracked(mut prep) => {
@@ -426,7 +426,7 @@ mod ad_tests {
     use super::*;
     use burn::tensor::{Device, Distribution, Tensor};
 
-    type CudaBare = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
+    type CudaBare = burn_cubecl::CubeBackend;
 
     fn to_host(t: Tensor<4>) -> Vec<f32> {
         t.into_data()
@@ -506,7 +506,7 @@ mod fd_tests {
     use super::*;
     use burn::tensor::{Device, Distribution, Tensor};
 
-    type CudaBare = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
+    type CudaBare = burn_cubecl::CubeBackend;
 
     fn to_host(t: Tensor<4>) -> Vec<f32> {
         t.into_data()

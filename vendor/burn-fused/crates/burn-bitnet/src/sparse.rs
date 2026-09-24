@@ -71,7 +71,7 @@ pub fn compute_nm_mask(w: Tensor<2>, n: usize, m: usize) -> Tensor<2> {
 pub fn weight_quant_masked(w: Tensor<2>, n: usize, m: usize) -> Tensor<2> {
     #[cfg(all(feature = "cuda", feature = "autodiff"))]
     {
-        type CudaBare = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
+        type CudaBare = burn_cubecl::CubeBackend;
         if let Some(r) = ad::weight_quant_masked_autodiff::<CudaBare>(w.clone(), n, m) {
             return r;
         }
@@ -259,10 +259,10 @@ pub mod ad {
         DispatchTensor: DispatchKindConversion<Autodiff<Inner>> + DispatchKindConversion<Inner>,
     {
         let wa = w.try_into_primitive::<Autodiff<Inner>>().ok()?;
-        let w_t = Tensor::from_primitive::<Inner>(wa.primitive.clone());
+        let w_t = Tensor::from_primitive::<Inner>(wa.primitive().clone());
         let out_t = weight_quant_masked_tensor(w_t, n, m);
         let out_prim = out_t.try_into_primitive::<Inner>().unwrap();
-        let nodes = [wa.node.clone()];
+        let nodes = [wa.node()];
         let prep = WeightQuantMaskedOp.prepare::<NoCheckpointing>(nodes);
         let out_adt = match prep.compute_bound().stateful() {
             OpsKind::Tracked(prep) => prep.finish((), out_prim),

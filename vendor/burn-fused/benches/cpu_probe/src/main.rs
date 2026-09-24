@@ -1,6 +1,6 @@
 use burn::tensor::{Device, Distribution, Tensor};
 fn main() {
-    type B = burn_cubecl::CubeBackend<cubecl::cpu::CpuRuntime>;
+    type B = burn_cubecl::CubeBackend;
     let dev = Device::cpu();
     let (b, t, nh, hd) = (2usize, 16, 4, 32);
     let x = Tensor::<4>::random([b, t, nh, hd], Distribution::Normal(0.0, 1.0), &dev);
