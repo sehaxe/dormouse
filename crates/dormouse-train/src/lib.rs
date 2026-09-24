@@ -1344,20 +1344,33 @@ mod tests {
             dv < 1e-3 * scale.max(1.0),
             "precomputed target must equal the online teacher latent: {dv:.2e} (scale {scale:.2e})"
         );
-        // (2) The aux consumes the target tensor it is handed.
-        let (_, _, _, _, aux_a) = model.forward_with_jepa_targets::<Backend>(
-            x.clone(), Some(h.clone()), None, Some(y.clone()), Some(target.clone()),
-        );
-        let scaled = target.mul_scalar(3.0);
-        let (_, _, _, _, aux_b) = model.forward_with_jepa_targets::<Backend>(
-            x, Some(h), None, Some(y), Some(scaled),
-        );
-        let a: f32 = aux_a.expect("offline aux must be Some with JEPA on").try_into_scalar().unwrap();
-        let b: f32 = aux_b.expect("offline aux must be Some").try_into_scalar().unwrap();
-        assert!(a.is_finite() && b.is_finite(), "offline aux must be finite: {a} {b}");
+        // (2) The aux consumes the target tensor it is handed. The masked L1
+        // draws a fresh random mask per call (burn-jepa `mask_indices`);
+        // when both draws land empty the L1 term is 0.0 in both calls and
+        // the two aux values coincide bitwise. P(both empty) ~ 5-7% — a
+        // pre-existing flake (reproduced 2/40 on burn pre.3 as well), not a
+        // migration artifact. Retry across rounds: fail only if EVERY round
+        // sees identical aux values (P ~ 2e-6).
+        let mut depends_on_target = false;
+        for _ in 0..5 {
+            let (_, _, _, _, aux_a) = model.forward_with_jepa_targets::<Backend>(
+                x.clone(), Some(h.clone()), None, Some(y.clone()), Some(target.clone()),
+            );
+            let scaled = target.clone().mul_scalar(3.0);
+            let (_, _, _, _, aux_b) = model.forward_with_jepa_targets::<Backend>(
+                x.clone(), Some(h.clone()), None, Some(y.clone()), Some(scaled),
+            );
+            let a: f32 = aux_a.expect("offline aux must be Some with JEPA on").try_into_scalar().unwrap();
+            let b: f32 = aux_b.expect("offline aux must be Some").try_into_scalar().unwrap();
+            assert!(a.is_finite() && b.is_finite(), "offline aux must be finite: {a} {b}");
+            if (a - b).abs() > 1e-4 * a.abs().max(1.0) {
+                depends_on_target = true;
+                break;
+            }
+        }
         assert!(
-            (a - b).abs() > 1e-4 * a.abs().max(1.0),
-            "offline aux must depend on the supplied target: {a} vs {b}"
+            depends_on_target,
+            "offline aux must depend on the supplied target (all 5 rounds identical)"
         );
     }
 
