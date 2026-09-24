@@ -44,14 +44,30 @@ Diagnosis: the step is GPU-kernel-bound, not launch-bound. The step-100 sync ret
 Attack ladder, ordered by leverage:
 
 0. Fine-grained step timers: done (fwd/bwd/opt/retr/ema split, sync-anchored).
+0b. max_iter A/B (4 vs 8), config-only: the step computes 8 iterations x 2 (teacher) ~ 24 forward-equivalents; the research verdict says PonderNet halting adds ~0 and fixed depth wins. If BPB holds at max_iter=4, half the step time is cut by DELETION, and the halt head goes to the knife with it. This outranks every additive optimization.
 1. fused/ to the flagship recipe: host rows, JEPA targets, bf16, act quant, GR (measured 1.7-2.0x on the plain path; ADR-0003). Acceptance criteria before fused becomes a default: (a) the fused backward must produce gradients for exactly the same parameter set as the burn path (checkpoint-size evidence from the 2026-09-21 smoke says it does not today: fused ckpt 37.1 MB vs 69.7 MB, ~33 MB of optimizer moments missing, i.e. params whose grads never arrived); (b) BPB parity with the burn path on a confirm-tier run; (c) full checkpoint round trip through the fused path.
 1b. burn 0.22.0-pre.4 migration (sequenced AFTER item 1 lands: the fused WIP touches the autodiff internals pre.4 changes). What pre.4 buys us, from the release notes: `no_grad` replaced by explicit autodiff conversions (#5557, breaking — migrate aux.rs); autodiff retains input nodes until child registration (#5647, breaking, fused-adjacent); Param flags generalized + gradient control separated from module freezing (#5498/#5537 — the frozen-norm bug class we hit); topk backward (#5531 — MSA indexer differentiability on the burn path); autodiff broadcast-gradient reduced in one pass (#5623 — our ReZero scalar backward); cubecl scatter-add one unit per value with atomics (#5621 — Engram row-grad bridge); fusion perf (block settling #5622, padded layout vote #5620, elementwise memory-order walk #5625); a panicking op no longer poisons its stream (#5535) + cubecl fma sigsegv fix (#5501) — the OOM-flood class; burn capture backend producing GraphIr (pre.3 #5377 — the launch-elimination path, corrected the research report's claim); batched SVD (#5259, our own PR) opens exact-SVD retraction; optimizer/checkpoint record fixes (#5407/#5618). Cost: bump ~25 vendored crate manifests + dormouse crates, rebase the cubecl-fix fork onto the new revs (the real risk — it carries the stale-page fix), API migrations. 1-2 days, gated by the full test suite; the burn-ndarray deprecation also points at a later flex-backend migration for CPU tests.
-2. bf16 storage/compute on the flagship recipe: halves memory traffic; today's cast-copy tax disappears inside fused kernels.
+2. bf16 storage ban on fp32 (2026-09-23, per the project mission "all-bf16 storage, f32 accumulate"): Engram host tables bf16 with stochastic-rounding updates (18.4 -> 9.2 GB), host-Adam m/v bf16 then int8 (18.4 -> 9.2 -> 4.6 GB), activations bf16 inside the fused kernels, KDA state bf16 (FlashKDA recipe), master weights bf16+SR once param count makes it matter. Resumed 48M-slot footprint drops 37 GB -> ~19 GB. fp32 stays ONLY on four islands where it is correctness, not conservatism: fp32 accumulate inside GEMMs, final norm + lm_head + logits (the documented NaN rule), tiny gate params (A_log, dt_bias), and model init. fp8 on the big GEMM sites after item 1 (+1.1-1.3x, speedrun records 19/84/89/90); fp4 waits for cubecl support on sm_120 (the card has fp4 tensor cores). Quality gate: BPB parity A/B at 2M slots for every precision step.
+2b. Fusion backend (2026-09-23 finding): our backend is `Autodiff<Cuda>` with NO fusion wrapper — every elementwise chain (KDA recurrence ops, casts, gates, norms) runs unfused, paying full read+write per op on a 448 GB/s bus; this is the likely fwd/bwd whale alongside the GEMM dtype. burn-cuda has a ready `fusion` feature (`Cuda = Fusion<CubeBackend>`), but the vendored extension crates write custom ops against the bare Cube backend and do NOT compile under Fusion. BLOCKED on item 1b: pre.4 #5673 auto-generates Fusion implementations for backend extensions. After the migration: flip `burn-cuda/fusion`, canary A/B (0.21 blog: launch overhead down 5.4x avg, up to 8.2x small shapes).
 3. Overlap the host-Adam D2H sync with compute on a separate stream; prefetch the next batch's rows.
 4. Retract cadence by measurement: 105 ms/step today is minor; revisit only after 1-2 land.
 5. Longer sequences (s1024/s2048) to amortize per-step overhead over more bytes.
 
 Target: 5x+ bytes/s at the flagship config (realistic ceiling ~10x). Every later A/B gets proportionally cheaper.
+
+### Performance budget (hard numbers, enforced by benches/bench.sh)
+
+| Metric | Now (2026-09-21 honest) | Budget | Stretch |
+|---|---|---|---|
+| Step time, flagship (small/b10/s512, aux on, 48M rows) | 6.7-8.3 s | ≤ 1.7 s | 1.3 s |
+| Bytes/s, same config | ~0.7 KB/s | ≥ 3 KB/s | 7 KB/s |
+| RSS, fresh 48M-slot run (after the bf16 diet) | 18.4 GB + burn | ≤ 12 GB | 8 GB |
+| RSS, resumed 48M-slot run (after the bf16 diet) | 37 GB | ≤ 20 GB | 14 GB |
+| VRAM, flagship | ~11.8 GB | ≤ 12 GB | 9 GB (for batch growth) |
+| Resume sidecar, 48M rows | 33.5 GB | ≤ 10 GB | 6 GB |
+| cpu lib tests | ~7 min (opt-3 deps) | ≤ 5 min | 3 min |
+
+`scripts/bench.sh` appends a metrics line (date, commit, s/step, bytes/s, peak RSS, peak VRAM) to `benches/history.tsv` on every run: the canary (small, aux off, 2M slots, 30 steps — runs anywhere, ~2 GB RSS) before/after every optimization, the full flagship bench before/after every phase. A regression against the last entry blocks the merge.
 
 ### Phase 2: data
 
