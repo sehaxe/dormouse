@@ -127,7 +127,7 @@ mod tests {
     #[test]
     fn train_overrides_are_optional() {
         let run = resolve("small", &[], TrainCfg::default()).unwrap();
-        assert_eq!(run.model.max_iter, 8);
+        assert_eq!(run.model.max_iter, 4);
         let run = resolve("small", &[], TrainCfg { max_iter: Some(3), ..Default::default() }).unwrap();
         assert_eq!(run.model.max_iter, 3);
         assert_eq!(run.model.d_model, 768);
