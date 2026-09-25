@@ -295,6 +295,22 @@ where
     burn::tensor::DispatchTensor: burn::backend::DispatchKindConversion<B>,
 {
     use burn_cubecl::tensor::CubeTensor;
+    // ponytail: DISABLED on the 0.22.0-pre.4 / cubecl 0.11.0-pre.4 stack
+    // (pre4-migration). The kernel's memory contract is "every operand is a
+    // dense row-major buffer" (see dense4/empty_dense4), which pre.3's
+    // reshape guaranteed by materializing copies of non-contiguous inputs.
+    // On pre.4 the reshape/view semantics changed (cubecl #5528/#5670 moved
+    // the runtime into the device value and reworked tensor views), and the
+    // contract no longer holds: two back-to-back forwards poison the CUDA
+    // context with gather reads up to 11.5 GB out of bounds
+    // (compute-sanitizer: gather_kernel_t_f32_i_i64 OOB; minimal repro:
+    // crates/burn-msa/examples/msa_repro.rs — pass 1 dies, pass 0 is clean).
+    // The tensor-op fallback below is correctness-guaranteed; re-enable the
+    // fused path only after the kernel is rewritten against pre.4 views and
+    // re-verified with compute-sanitizer on a two-forward run.
+    if std::env::var("DM_MSA_FUSED").is_err() {
+        return None;
+    }
     let cube = |t: &Tensor<4>| -> Option<CubeTensor> {
         let prim = t.clone().try_into_primitive::<B>().ok()?;
         let c = (&prim as &dyn Any).downcast_ref::<CubeTensor>()?;
@@ -383,6 +399,22 @@ where
     burn::tensor::DispatchTensor: burn::backend::DispatchKindConversion<B>,
 {
     use burn_cubecl::tensor::CubeTensor;
+    // ponytail: DISABLED on the 0.22.0-pre.4 / cubecl 0.11.0-pre.4 stack
+    // (pre4-migration). The kernel's memory contract is "every operand is a
+    // dense row-major buffer" (see dense4/empty_dense4), which pre.3's
+    // reshape guaranteed by materializing copies of non-contiguous inputs.
+    // On pre.4 the reshape/view semantics changed (cubecl #5528/#5670 moved
+    // the runtime into the device value and reworked tensor views), and the
+    // contract no longer holds: two back-to-back forwards poison the CUDA
+    // context with gather reads up to 11.5 GB out of bounds
+    // (compute-sanitizer: gather_kernel_t_f32_i_i64 OOB; minimal repro:
+    // crates/burn-msa/examples/msa_repro.rs — pass 1 dies, pass 0 is clean).
+    // The tensor-op fallback below is correctness-guaranteed; re-enable the
+    // fused path only after the kernel is rewritten against pre.4 views and
+    // re-verified with compute-sanitizer on a two-forward run.
+    if std::env::var("DM_MSA_FUSED").is_err() {
+        return None;
+    }
     let cube = |t: &Tensor<4>| -> Option<CubeTensor> {
         let prim = t.clone().try_into_primitive::<B>().ok()?;
         let c = (&prim as &dyn Any).downcast_ref::<CubeTensor>()?;
