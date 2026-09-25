@@ -13,7 +13,7 @@ pub fn fast_walsh_hadamard(x: Tensor<2>) -> Tensor<2> {
     let _p = d.next_power_of_two();
     #[cfg(all(feature = "cuda", feature = "autodiff"))]
     {
-        type CudaBare = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
+        type CudaBare = burn_cubecl::CubeBackend;
         if let Some(r) = crate::fwt_cuda::fwt_autodiff::<CudaBare>(x.clone(), _p) {
             return r;
         }

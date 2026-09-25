@@ -12,7 +12,7 @@
 [package]
 edition = "2024"
 name = "cubecl-cuda"
-version = "0.11.0-pre.3"
+version = "0.11.0-pre.4"
 authors = ["nathanielsimard <nathaniel.simard.42@gmail.com>"]
 build = "build.rs"
 autolib = false
@@ -32,23 +32,28 @@ repository = "https://github.com/tracel-ai/cubecl/tree/main/crates/cubecl-cuda"
 resolver = "2"
 
 [features]
+cpp = []
 default = [
     "std",
-    "cubecl-runtime/default",
+    "cubecl-server/default",
     "cubecl-common/default",
     "cubecl-core/default",
 ]
-pliron-dump = ["cubecl-cpp/pliron-dump"]
+persistence = ["cubecl-server/persistence"]
+pliron-dump = [
+    "cubecl-cpp/pliron-dump",
+    "cubecl-llvm/pliron-dump",
+]
 ptx-wmma = []
 std = [
-    "cubecl-runtime/std",
+    "cubecl-server/std",
     "cubecl-common/std",
     "cubecl-core/std",
     "cubecl-cpp/std",
 ]
 tracing = [
     "dep:tracing",
-    "cubecl-runtime/tracing",
+    "cubecl-server/tracing",
     "cubecl-common/tracing",
     "cubecl-core/tracing",
 ]
@@ -65,29 +70,35 @@ path = "tests/graph.rs"
 version = "1.16.1"
 
 [dependencies.cubecl-common]
-version = "=0.11.0-pre.3"
+version = "=0.11.0-pre.4"
 features = ["hash"]
 default-features = false
 
 [dependencies.cubecl-core]
-version = "=0.11.0-pre.3"
+version = "=0.11.0-pre.4"
+features = ["nvidia"]
 default-features = false
 
 [dependencies.cubecl-cpp]
-version = "=0.11.0-pre.3"
-features = ["cuda"]
+version = "=0.11.0-pre.4"
+features = []
 default-features = false
 
 [dependencies.cubecl-environment]
-version = "=0.11.0-pre.3"
+version = "=0.11.0-pre.4"
 default-features = false
 
-[dependencies.cubecl-runtime]
-version = "=0.11.0-pre.3"
+[dependencies.cubecl-llvm]
+version = "=0.11.0-pre.4"
 features = [
-    "channel-mutex",
     "std",
+    "nvptx",
 ]
+default-features = false
+
+[dependencies.cubecl-server]
+version = "=0.11.0-pre.4"
+features = ["std"]
 default-features = false
 
 [dependencies.cudarc]
@@ -135,18 +146,15 @@ optional = true
 default-features = false
 
 [dev-dependencies.cubecl-core]
-version = "=0.11.0-pre.3"
+version = "=0.11.0-pre.4"
 features = ["export_tests"]
 
 [dev-dependencies.cubecl-std]
-version = "=0.11.0-pre.3"
+version = "=0.11.0-pre.4"
 features = ["export_tests"]
 
 [dev-dependencies.paste]
 version = "1"
-
-[dev-dependencies.pretty_assertions]
-version = "1.4"
 
 [dev-dependencies.test-log]
 version = "^0.2"

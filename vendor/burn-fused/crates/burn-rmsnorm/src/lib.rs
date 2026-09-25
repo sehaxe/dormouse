@@ -39,7 +39,7 @@ impl RMSNorm {
         {
             let [b, t, _] = x.dims();
             if let Some(out) =
-                crate::fused::rmsnorm_cuda::<burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>>(
+                crate::fused::rmsnorm_cuda::<burn_cubecl::CubeBackend>(
                     x.clone().reshape([b * t, d]),
                     self.weight.val().clone(),
                     self.eps,

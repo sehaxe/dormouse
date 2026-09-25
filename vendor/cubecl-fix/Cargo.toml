@@ -1,8 +1,10 @@
 [workspace]
-members = ["cubecl-runtime", "cubecl-cuda"]
+members = ["cubecl-runtime", "cubecl-server", "cubecl-cuda"]
 resolver = "2"
 
 # Link cubecl-cuda (and every transitive consumer) to the patched
-# cubecl-runtime instead of the registry release.
+# cubecl-runtime and the ported stale-page fix in cubecl-server instead of the
+# registry releases.
 [patch.crates-io]
 cubecl-runtime = { path = "cubecl-runtime" }
+cubecl-server = { path = "cubecl-server" }

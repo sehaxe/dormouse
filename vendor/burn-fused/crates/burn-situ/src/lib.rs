@@ -46,7 +46,7 @@ pub fn situ_glu(gate_up: Tensor<2>, hidden: usize, beta_gate: f64, beta_up: f64)
 
     #[cfg(all(feature = "autodiff", feature = "cuda"))]
     {
-        type CudaBare = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
+        type CudaBare = burn_cubecl::CubeBackend;
         if let Some(out) = crate::fused_situ::situ_glu_autodiff::<CudaBare>(
             gate_up.clone(),
             hidden,

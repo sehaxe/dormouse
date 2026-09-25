@@ -121,14 +121,14 @@ where
     burn::tensor::DispatchTensor: burn::backend::DispatchKindConversion<B>,
 {
     use burn_cubecl::tensor::CubeTensor;
-    let cube = |t: &Tensor<4>| -> Option<CubeTensor<cubecl::cuda::CudaRuntime>> {
+    let cube = |t: &Tensor<4>| -> Option<CubeTensor> {
         let prim = t.clone().try_into_primitive::<B>().ok()?;
-        let c = (&prim as &dyn Any).downcast_ref::<CubeTensor<cubecl::cuda::CudaRuntime>>()?;
+        let c = (&prim as &dyn Any).downcast_ref::<CubeTensor>()?;
         Some(c.clone())
     };
-    let cube2 = |t: &Tensor<2>| -> Option<CubeTensor<cubecl::cuda::CudaRuntime>> {
+    let cube2 = |t: &Tensor<2>| -> Option<CubeTensor> {
         let prim = t.clone().try_into_primitive::<B>().ok()?;
-        let c = (&prim as &dyn Any).downcast_ref::<CubeTensor<cubecl::cuda::CudaRuntime>>()?;
+        let c = (&prim as &dyn Any).downcast_ref::<CubeTensor>()?;
         Some(c.clone())
     };
     let [b, t, nh, hd] = d_out.dims();
@@ -147,7 +147,7 @@ where
     let cube_dim = CubeDim::new_3d(half as u32, h_chunk, 1);
     let cube_count = CubeCount::Static((b * t_groups) as u32, 1, 1);
     unsafe {
-        rope_backward_kernel::launch_unchecked::<f32, cubecl::cuda::CudaRuntime>(
+        rope_backward_kernel::launch_unchecked::<f32>(
             &client,
             cube_count,
             cube_dim,
@@ -171,14 +171,14 @@ where
     burn::tensor::DispatchTensor: burn::backend::DispatchKindConversion<B>,
 {
     use burn_cubecl::tensor::CubeTensor;
-    let cube = |t: &Tensor<4>| -> Option<CubeTensor<cubecl::cuda::CudaRuntime>> {
+    let cube = |t: &Tensor<4>| -> Option<CubeTensor> {
         let prim = t.clone().try_into_primitive::<B>().ok()?;
-        let c = (&prim as &dyn Any).downcast_ref::<CubeTensor<cubecl::cuda::CudaRuntime>>()?;
+        let c = (&prim as &dyn Any).downcast_ref::<CubeTensor>()?;
         Some(c.clone())
     };
-    let cube2 = |t: &Tensor<2>| -> Option<CubeTensor<cubecl::cuda::CudaRuntime>> {
+    let cube2 = |t: &Tensor<2>| -> Option<CubeTensor> {
         let prim = t.clone().try_into_primitive::<B>().ok()?;
-        let c = (&prim as &dyn Any).downcast_ref::<CubeTensor<cubecl::cuda::CudaRuntime>>()?;
+        let c = (&prim as &dyn Any).downcast_ref::<CubeTensor>()?;
         Some(c.clone())
     };
     let [b, t, nh, hd] = x.dims();
@@ -197,7 +197,7 @@ where
     let cube_dim = CubeDim::new_3d(half as u32, h_chunk, 1);
     let cube_count = CubeCount::Static((b * t_groups) as u32, 1, 1);
     unsafe {
-        rope_kernel::launch_unchecked::<f32, cubecl::cuda::CudaRuntime>(
+        rope_kernel::launch_unchecked::<f32>(
             &client,
             cube_count,
             cube_dim,
@@ -344,7 +344,7 @@ mod ad {
 
             #[cfg(feature = "cuda")]
             {
-                type CudaBare = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
+                type CudaBare = burn_cubecl::CubeBackend;
                 if std::any::TypeId::of::<B>() == std::any::TypeId::of::<CudaBare>() {
                     if let Some(dx) = super::rope_backward_cuda::<B>(&d_out, &cos, &sin) {
                         grads.register::<B>(
@@ -386,14 +386,14 @@ mod ad {
         let ca = cos.try_into_primitive::<Autodiff<Inner>>().ok()?;
         let sa = sin.try_into_primitive::<Autodiff<Inner>>().ok()?;
 
-        let x_t = Tensor::from_primitive::<Inner>(xa.primitive.clone());
-        let c_t = Tensor::from_primitive::<Inner>(ca.primitive.clone());
-        let s_t = Tensor::from_primitive::<Inner>(sa.primitive.clone());
+        let x_t = Tensor::from_primitive::<Inner>(xa.primitive().clone());
+        let c_t = Tensor::from_primitive::<Inner>(ca.primitive().clone());
+        let s_t = Tensor::from_primitive::<Inner>(sa.primitive().clone());
 
         let out_t = {
             #[cfg(feature = "cuda")]
             {
-                type CudaBare = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
+                type CudaBare = burn_cubecl::CubeBackend;
                 if std::any::TypeId::of::<Inner>() == std::any::TypeId::of::<CudaBare>() {
                     if let Some(o) =
                         super::rope_cuda::<Inner>(x_t.clone(), c_t.clone(), s_t.clone())
@@ -413,7 +413,7 @@ mod ad {
         };
 
         let out_prim = out_t.try_into_primitive::<Inner>().unwrap();
-        let nodes = [xa.node.clone()];
+        let nodes = [xa.node()];
         let prep = RopeOp.prepare::<NoCheckpointing>(nodes);
         let out_adt = match prep.compute_bound().stateful() {
             OpsKind::Tracked(mut prep) => {
@@ -451,7 +451,7 @@ mod ad_tests {
     use crate::precompute_freqs;
     use burn::tensor::{Device, Distribution, Tensor};
 
-    type CudaBare = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
+    type CudaBare = burn_cubecl::CubeBackend;
 
     fn to_host(t: Tensor<4>) -> Vec<f32> {
         t.into_data()
@@ -504,7 +504,7 @@ mod fd_tests {
     use crate::precompute_freqs;
     use burn::tensor::{Device, Distribution, Tensor};
 
-    type CudaBare = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
+    type CudaBare = burn_cubecl::CubeBackend;
 
     fn to_host<const D: usize>(t: Tensor<D>) -> Vec<f32> {
         t.into_data()

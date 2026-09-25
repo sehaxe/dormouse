@@ -72,7 +72,7 @@ pub mod cuda {
     /// `CubeTensor` without a host round-trip, so fused dispatch only activates
     /// on this type (and on `burn_cuda::Cuda` built without the `fusion`
     /// feature, which aliases to it). Everything else falls back to tensor ops.
-    pub type CudaBare = CubeBackend<cubecl::cuda::CudaRuntime>;
+    pub type CudaBare = CubeBackend;
 
     fn is_cuda<B: Backend>() -> bool {
         TypeId::of::<B>() == TypeId::of::<CudaBare>()
@@ -84,7 +84,7 @@ pub mod cuda {
     /// fusion-wrapped `burn_cuda::Cuda`, or a non-CUDA backend) — the caller
     /// then falls back to the tensor-ops path. Dims of size 1 are ignored, so
     /// permuted single-token views still qualify.
-    fn cube_of<B: Backend>(t: &Tensor<4>) -> Option<CubeTensor<cubecl::cuda::CudaRuntime>>
+    fn cube_of<B: Backend>(t: &Tensor<4>) -> Option<CubeTensor>
     where
         DispatchTensor: DispatchKindConversion<B>,
     {
@@ -92,7 +92,7 @@ pub mod cuda {
             return None;
         }
         let prim = t.clone().try_into_primitive::<B>().ok()?;
-        let cube = (&prim as &dyn Any).downcast_ref::<CubeTensor<cubecl::cuda::CudaRuntime>>()?;
+        let cube = (&prim as &dyn Any).downcast_ref::<CubeTensor>()?;
         let shape = cube.meta.shape().dims::<4>();
         let strides = cube.meta.strides().to_vec();
         let mut expected = 1usize;
@@ -152,7 +152,7 @@ pub mod cuda {
         let cube_dim = CubeDim::new_3d(v_dim as u32, 1, 1);
         let cube_count = CubeCount::Static(heads as u32, 1, 1);
         unsafe {
-            gdn2_step_kernel::launch_unchecked::<f32, cubecl::cuda::CudaRuntime>(
+            gdn2_step_kernel::launch_unchecked::<f32>(
                 &client,
                 cube_count,
                 cube_dim,

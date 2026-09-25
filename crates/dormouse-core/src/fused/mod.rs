@@ -40,7 +40,7 @@ use burn::backend::autodiff::ops::{Backward, Ops, OpsKind};
 use burn::backend::autodiff::Autodiff;
 use burn::backend::{DispatchKindConversion, DispatchTensor};
 use burn::tensor::{Device, Int, Tensor, TensorData};
-use cubecl::client::ComputeClient;
+use cubecl::client::Client;
 use cubecl::prelude::*;
 
 use backward::PonderState;
@@ -50,11 +50,11 @@ use crate::config::DormouseConfig;
 use burn::module::{Module, ModuleVisitor, Param};
 
 pub(crate) type Cuda = cubecl::cuda::CudaRuntime;
-pub(crate) type CB = burn_cubecl::CubeBackend<Cuda>;
+pub(crate) type CB = burn_cubecl::CubeBackend;
 pub(crate) type CAd = Autodiff<CB>;
 pub(crate) type AdPrim = <CAd as burn::backend::BackendTypes>::FloatTensorPrimitive;
 /// Bare cube tensor of the CUDA runtime (buffer handle + client).
-pub(crate) type CubeTensor = burn_cubecl::tensor::CubeTensor<Cuda>;
+pub(crate) type CubeTensor = burn_cubecl::tensor::CubeTensor;
 
 const UNITS: CubeDim = CubeDim::new_3d(32, 1, 1);
 const EW: CubeDim = CubeDim::new_3d(256, 1, 1);
@@ -108,11 +108,11 @@ pub(crate) fn zeros1(dev: &Device, n: usize) -> (Tensor<1>, CubeTensor) {
 /// there is no fence between allocation and first use (the forward fences
 /// with a `sync` before its kernels). A raw fill is FIFO-ordered with the
 /// other raw launches, so `+=` kernels can never race the init.
-pub(crate) fn zeros_raw(dev: &Device, client: &ComputeClient<Cuda>, n: usize) -> CubeTensor {
+pub(crate) fn zeros_raw(dev: &Device, client: &Client, n: usize) -> CubeTensor {
     let t = Tensor::<1>::empty([n], dev);
     let c = cube_of1(&t).expect("fused op requires CUDA tensors");
     unsafe {
-        kernels::fill_kernel::launch_unchecked::<f32, Cuda>(
+        kernels::fill_kernel::launch_unchecked::<f32>(
             client,
             ew_cubes(n),
             EW,
@@ -132,7 +132,7 @@ pub(crate) fn empty1(dev: &Device, n: usize) -> (Tensor<1>, CubeTensor) {
 
 /// An autodiff tensor split into the bare cube primitive + graph pieces.
 /// (The `NodeRef` type is private in burn-autodiff; always reach it through
-/// `at.node.clone()` so it stays inferred.)
+/// `at.node()` so it stays inferred.)
 pub(crate) struct Ad {
     pub t: Tensor<2>,
     pub at: AdPrim,
@@ -146,7 +146,7 @@ pub(crate) fn ad2(t: Tensor<2>) -> Ad {
         .try_into_primitive::<CAd>()
         .expect("fused op requires Autodiff<CudaBackend> tensors");
     Ad {
-        prim: at.primitive.clone(),
+        prim: at.primitive().clone(),
         at,
         t,
     }
@@ -158,7 +158,7 @@ pub(crate) fn ad1(t: Tensor<1>) -> (Tensor<1>, AdPrim, CubeTensor) {
         .clone()
         .try_into_primitive::<CAd>()
         .expect("fused op requires Autodiff<CudaBackend> tensors");
-    (t, at.clone(), at.primitive.clone())
+    (t, at.clone(), at.primitive().clone())
 }
 
 /// The (bare) allocation device of a bare cube primitive.
@@ -176,7 +176,7 @@ fn ew_cubes(n: usize) -> CubeCount {
 /// our kernels race the tensor-graph kernels that produce/consume the same
 /// buffers (observed: matmul results racing the `zeros` init of their own
 /// output buffer). Same escape hatch as burn-spectral's moe_fused.
-pub(crate) fn sync(client: &ComputeClient<Cuda>) {
+pub(crate) fn sync(client: &Client) {
     futures_lite::future::block_on(client.sync()).expect("cuda sync failed");
 }
 
@@ -187,7 +187,7 @@ pub(crate) fn sync(client: &ComputeClient<Cuda>) {
 /// handling). Small mats stay on the naive path (lower launch overhead).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn launch_mm(
-    client: &ComputeClient<Cuda>,
+    client: &Client,
     a: &CubeTensor,
     b: &CubeTensor,
     s: &CubeTensor,
@@ -215,7 +215,7 @@ pub(crate) fn launch_mm(
         let gx = m.div_ceil(TILE);
         let gy = n.div_ceil(TILE);
         unsafe {
-            kernels::mm_tiled_kernel::launch_unchecked::<f32, Cuda>(
+            kernels::mm_tiled_kernel::launch_unchecked::<f32>(
                 client,
                 CubeCount::Static(gx as u32, gy as u32, 1),
                 CubeDim::new_3d(256, 1, 1),
@@ -240,7 +240,7 @@ pub(crate) fn launch_mm(
         }
     } else {
         unsafe {
-            kernels::mm_kernel::launch_unchecked::<f32, Cuda>(
+            kernels::mm_kernel::launch_unchecked::<f32>(
                 client,
                 ew_cubes(m * n),
                 EW,
@@ -270,7 +270,7 @@ pub(crate) fn launch_mm(
 fn launch_absmean(w: &CubeTensor, out: &CubeTensor, n: usize) {
     let client = w.client.clone();
     unsafe {
-        kernels::absmean_kernel::launch_unchecked::<f32, Cuda>(
+        kernels::absmean_kernel::launch_unchecked::<f32>(
             &client,
             CubeCount::Static(1, 1, 1),
             UNITS,
@@ -351,12 +351,12 @@ where
         .clone()
         .try_into_primitive::<CAd>()
         .expect("fused_matmul requires Autodiff<CudaBackend> tensors");
-    let a_t = Tensor::<2>::from_primitive::<CB>(aa.primitive.clone());
+    let a_t = Tensor::<2>::from_primitive::<CB>(aa.primitive().clone());
     let [m, k] = a_t.dims();
-    let w_t = Tensor::<2>::from_primitive::<CB>(wa.primitive.clone());
+    let w_t = Tensor::<2>::from_primitive::<CB>(wa.primitive().clone());
     let [k2, n] = w_t.dims();
     assert_eq!(k, k2, "matmul shape mismatch");
-    let dev = bare_device(&aa.primitive);
+    let dev = bare_device(aa.primitive());
 
     let a_d = dense(a_t);
     let w_d = dense(w_t);
@@ -378,7 +378,7 @@ where
     sync(&client);
     launch_mm(&client, &ac, &wc, &dums, &dummy, &outc, m, k, n, k, 1, n, 1, m * k, k * n, false, false, false, false, false);
     sync(&client);
-    let nodes = [aa.node.clone(), wa.node.clone()];
+    let nodes = [aa.node(), wa.node()];
     let prep = PonderLoopMatmul.prepare::<NoCheckpointing>(nodes);
     match prep.compute_bound().stateful() {
         OpsKind::Tracked(mut p) => {
@@ -467,9 +467,9 @@ impl ArmLeaves {
                     .try_into_primitive::<CAd>()
                     .expect("fused arm capture requires CUDA autodiff tensors");
                 if std::env::var("DM_FUSED_DEBUG").is_ok() {
-                    eprintln!("arm cap: id={:?} dims={:?}", at.node.id, param.val().dims());
+                    eprintln!("arm cap: id={:?} dims={:?}", at.node().id(), param.val().dims());
                 }
-                self.out.push(at.node.id);
+                self.out.push(at.node().id());
             }
         }
         let mut cap = Cap { out: Vec::new() };
@@ -692,7 +692,7 @@ where
         .clone()
         .try_into_primitive::<CAd>()
         .expect("fused op requires Autodiff<CudaBackend> tensors");
-    let x_prim = xa.primitive.clone();
+    let x_prim = xa.primitive().clone();
     let x_t = Tensor::<2>::from_primitive::<CB>(x_prim.clone());
     let dev = x_t.device();
     // bare-backend tensor: cube_of1 refuses autodiff-wrapped primitives
@@ -720,17 +720,17 @@ where
     keep1.push(g_t);
     keep1.push(gf_t);
     keep1.push(rs_t);
-    nodes.push(xa.node.clone());
+    nodes.push(xa.node());
     ats.push(xa.clone());
-    nodes.push(wc.at.node.clone());
+    nodes.push(wc.at.node());
     ats.push(wc.at);
-    nodes.push(g_at.node.clone());
+    nodes.push(g_at.node());
     ats.push(g_at);
-    nodes.push(ie.at.node.clone());
+    nodes.push(ie.at.node());
     ats.push(ie.at);
-    nodes.push(rs_at.node.clone());
+    nodes.push(rs_at.node());
     ats.push(rs_at);
-    nodes.push(wh.at.node.clone());
+    nodes.push(wh.at.node());
     ats.push(wh.at);
     // NOTE: gf_at (final_norm_g, parent 60 for nexp=8, 30 for nexp=3) is pushed LAST
 
@@ -745,7 +745,7 @@ where
         let gu = fac_cuda(&e[0], &mut keep2, &mut keep1);
         let dn = fac_cuda(&e[1], &mut keep2, &mut keep1);
         for at in gu.1.iter().chain(dn.1.iter()) {
-            nodes.push(at.node.clone());
+            nodes.push(at.node());
         }
         ats.extend_from_slice(&gu.1);
         ats.extend_from_slice(&dn.1);
@@ -754,17 +754,19 @@ where
     let op = fac_cuda(&inp.out_proj, &mut keep2, &mut keep1);
     let lm = fac_cuda(&inp.lm_head, &mut keep2, &mut keep1);
     for at in op.1.iter().chain(lm.1.iter()) {
-        nodes.push(at.node.clone());
+        nodes.push(at.node());
     }
     ats.extend_from_slice(&op.1);
     ats.extend_from_slice(&lm.1);
-    nodes.push(gf_at.node.clone());
+    nodes.push(gf_at.node());
     ats.push(gf_at);
     // pad to 61 for generic Backward<61> (nexp=3 needs 30 dummies) - use real nodes
-    let dummy_node = nodes[0].clone();
+    // NodeGuard is not Clone (pre.4 #5647); each `.node()` call mints a
+    // fresh guard for the same underlying node, which is all the padding
+    // needs.
     let dummy_at2 = ats[0].clone();
     while nodes.len() < 61 {
-        nodes.push(dummy_node.clone());
+        nodes.push(dummy_at2.node());
     }
     while ats.len() < 61 {
         ats.push(dummy_at2.clone());
@@ -863,7 +865,7 @@ where
         // h_ctx_n = (x at n=0, else h_{n-1}) + iter_embed row n
         let hin = if n == 0 { &x_prim } else { &per[n - 1].h };
         unsafe {
-            kernels::hctx_kernel::launch_unchecked::<f32, Cuda>(
+            kernels::hctx_kernel::launch_unchecked::<f32>(
                 &client,
                 ew_cubes(bt * d),
                 EW,
@@ -874,7 +876,7 @@ where
                 (n * d) as u32,
                 (bt * d) as u32,
             );
-            kernels::rmsnorm_kernel::launch_unchecked::<f32, Cuda>(
+            kernels::rmsnorm_kernel::launch_unchecked::<f32>(
                 &client,
                 CubeCount::Static(bt_c, 1, 1),
                 UNITS,
@@ -885,7 +887,7 @@ where
                 d_c,
                 inp.norm_eps,
             );
-            kernels::cat_kernel::launch_unchecked::<f32, Cuda>(
+            kernels::cat_kernel::launch_unchecked::<f32>(
                 &client,
                 ew_cubes(bt * d),
                 EW,
@@ -902,7 +904,7 @@ where
         // FIFO, so every producer MUST be enqueued before its consumers
         // (sigsel reads raw, residual reads ffn, ce reads logits, ...).
         unsafe {
-            kernels::sigsel_kernel::launch_unchecked::<f32, Cuda>(
+            kernels::sigsel_kernel::launch_unchecked::<f32>(
                 &client,
                 CubeCount::Static(bt_c, 1, 1),
                 UNITS,
@@ -922,7 +924,7 @@ where
             launch_mm(&client, &wsc[0], &gu.v, &gu.s, &gu.mv, &wsc[1], bt, r, f, r, 1, r, 1, bt * r, f * r, false, true, true, true, false);
             // mid = silu(A_e)
             unsafe {
-                kernels::silu_kernel::launch_unchecked::<f32, Cuda>(
+                kernels::silu_kernel::launch_unchecked::<f32>(
                     &client,
                     ew_cubes(bt * f),
                     EW,
@@ -937,7 +939,7 @@ where
             launch_mm(&client, &wsc[3], &dn.v, &dn.s, &dn.mv, &wsc[4], bt, r, d, r, 1, r, 1, bt * r, d * r, false, true, true, true, false);
             // ffn += out_e · blend[:,e]
             unsafe {
-                kernels::axpy_kernel::launch_unchecked::<f32, Cuda>(
+                kernels::axpy_kernel::launch_unchecked::<f32>(
                     &client,
                     ew_cubes(bt * d),
                     EW,
@@ -952,7 +954,7 @@ where
             }
         }
         unsafe {
-            kernels::residual_kernel::launch_unchecked::<f32, Cuda>(
+            kernels::residual_kernel::launch_unchecked::<f32>(
                 &client,
                 CubeCount::Static(bt_c, 1, 1),
                 UNITS,
@@ -964,7 +966,7 @@ where
                 BufferArg::from_raw_parts(pi.h.handle.clone(), bt * d),
                 d_c,
             );
-            kernels::rowmean_t_kernel::launch_unchecked::<f32, Cuda>(
+            kernels::rowmean_t_kernel::launch_unchecked::<f32>(
                 &client,
                 CubeCount::Static(b_c, 1, 1),
                 UNITS,
@@ -973,7 +975,7 @@ where
                 t_c,
                 d_c,
             );
-            kernels::halt_fwd_kernel::launch_unchecked::<f32, Cuda>(
+            kernels::halt_fwd_kernel::launch_unchecked::<f32>(
                 &client,
                 CubeCount::Static(b_c, 1, 1),
                 UNITS,
@@ -990,7 +992,7 @@ where
         launch_mm(&client, &pi.step_out, &lm.0.u, &lm.0.s, &lm.0.mu, &pi.z_l, bt, d, r, d, 1, r, 1, bt * d, d * r, false, false, true, false, false);
         launch_mm(&client, &pi.z_l, &lm.0.v, &lm.0.s, &lm.0.mv, &pi.logits, bt, r, v, r, 1, r, 1, bt * r, v * r, false, true, true, true, false);
         unsafe {
-            kernels::ce_kernel::launch_unchecked::<f32, Cuda>(
+            kernels::ce_kernel::launch_unchecked::<f32>(
                 &client,
                 CubeCount::Static(bt_c, 1, 1),
                 UNITS,
@@ -999,7 +1001,7 @@ where
                 BufferArg::from_raw_parts(pi.ce.handle.clone(), bt),
                 v as u32,
             );
-            kernels::ceb_kernel::launch_unchecked::<f32, Cuda>(
+            kernels::ceb_kernel::launch_unchecked::<f32>(
                 &client,
                 CubeCount::Static(b_c, 1, 1),
                 UNITS,
@@ -1008,7 +1010,7 @@ where
                 t_c,
             );
             // PonderNet recurrence: p_n, p_dist column, not_halted update
-            kernels::halting_kernel::launch_unchecked::<f32, Cuda>(
+            kernels::halting_kernel::launch_unchecked::<f32>(
                 &client,
                 ew_cubes(b),
                 EW,
@@ -1020,7 +1022,7 @@ where
                 (1 + n * b) as u32,
                 b as u32,
             );
-            kernels::rec_kernel::launch_unchecked::<f32, Cuda>(
+            kernels::rec_kernel::launch_unchecked::<f32>(
                 &client,
                 CubeCount::Static(1, 1, 1),
                 UNITS,
@@ -1032,7 +1034,7 @@ where
                 n > 0,
             );
             // out_acc += step_out · p_n
-            kernels::outacc_kernel::launch_unchecked::<f32, Cuda>(
+            kernels::outacc_kernel::launch_unchecked::<f32>(
                 &client,
                 ew_cubes(bt * d),
                 EW,
@@ -1048,7 +1050,7 @@ where
     }
     // PonderNet KL over the full p_dist (in-op loss part)
     unsafe {
-        kernels::kl_kernel::launch_unchecked::<f32, Cuda>(
+        kernels::kl_kernel::launch_unchecked::<f32>(
             &client,
             CubeCount::Static(1, 1, 1),
             UNITS,
@@ -1063,7 +1065,7 @@ where
     }
     // final readout: model.norm over out_acc + lm_head, all fp32
     unsafe {
-        kernels::rmsnorm_kernel::launch_unchecked::<f32, Cuda>(
+        kernels::rmsnorm_kernel::launch_unchecked::<f32>(
             &client,
             CubeCount::Static(bt_c, 1, 1),
             UNITS,
@@ -1078,7 +1080,7 @@ where
     launch_mm(&client, &hf, &lm.0.u, &lm.0.s, &lm.0.mu, &zlf, bt, d, r, d, 1, r, 1, bt * d, d * r, false, false, true, false, false);
     launch_mm(&client, &zlf, &lm.0.v, &lm.0.s, &lm.0.mv, &lgstg, bt, r, v, r, 1, r, 1, bt * r, v * r, false, true, true, true, false);
     unsafe {
-        kernels::copy_kernel::launch_unchecked::<f32, Cuda>(
+        kernels::copy_kernel::launch_unchecked::<f32>(
             &client,
             ew_cubes(bt * v),
             EW,
@@ -1089,7 +1091,7 @@ where
             (bt * v) as u32,
         );
         // latents for the burn-path aux heads: out_acc + final-norm output
-        kernels::copy_kernel::launch_unchecked::<f32, Cuda>(
+        kernels::copy_kernel::launch_unchecked::<f32>(
             &client,
             ew_cubes(bt * d),
             EW,
@@ -1099,7 +1101,7 @@ where
             off_oa as u32,
             (bt * d) as u32,
         );
-        kernels::copy_kernel::launch_unchecked::<f32, Cuda>(
+        kernels::copy_kernel::launch_unchecked::<f32>(
             &client,
             ew_cubes(bt * d),
             EW,
@@ -1328,7 +1330,7 @@ where
     let prior_v: Vec<f32> = prior.iter().map(|x| x * inv).collect();
     let x2 = inp.x.clone().reshape([bt, d]);
     let xa = x2.clone().try_into_primitive::<CAd>().expect("fused arms requires Autodiff<Cuda>");
-    let x_prim = xa.primitive.clone();
+    let x_prim = xa.primitive().clone();
     let x_t = Tensor::<2>::from_primitive::<CB>(x_prim.clone());
     let dev = x_t.device();
     let prior_t = Tensor::<1>::from_data(burn::tensor::TensorData::new(prior_v.clone(), [n_iter]), &dev);
@@ -1350,17 +1352,17 @@ where
     keep1.push(g_t);
     keep1.push(gf_t);
     keep1.push(rs_t);
-    nodes.push(xa.node.clone());
+    nodes.push(xa.node());
     ats.push(xa.clone());
-    nodes.push(wc.at.node.clone());
+    nodes.push(wc.at.node());
     ats.push(wc.at);
-    nodes.push(g_at.node.clone());
+    nodes.push(g_at.node());
     ats.push(g_at);
-    nodes.push(ie.at.node.clone());
+    nodes.push(ie.at.node());
     ats.push(ie.at);
-    nodes.push(rs_at.node.clone());
+    nodes.push(rs_at.node());
     ats.push(rs_at);
-    nodes.push(wh.at.node.clone());
+    nodes.push(wh.at.node());
     ats.push(wh.at);
     let f = inp.experts[0][0].v.dims()[0];
     let r = inp.experts[0][0].u.dims()[1];
@@ -1371,7 +1373,7 @@ where
         let gu = fac_cuda(&e[0], &mut keep2, &mut keep1);
         let dn = fac_cuda(&e[1], &mut keep2, &mut keep1);
         for at in gu.1.iter().chain(dn.1.iter()) {
-            nodes.push(at.node.clone());
+            nodes.push(at.node());
         }
         ats.extend_from_slice(&gu.1);
         ats.extend_from_slice(&dn.1);
@@ -1380,11 +1382,11 @@ where
     let op = fac_cuda(&inp.out_proj, &mut keep2, &mut keep1);
     let lm = fac_cuda(&inp.lm_head, &mut keep2, &mut keep1);
     for at in op.1.iter().chain(lm.1.iter()) {
-        nodes.push(at.node.clone());
+        nodes.push(at.node());
     }
     ats.extend_from_slice(&op.1);
     ats.extend_from_slice(&lm.1);
-    nodes.push(gf_at.node.clone());
+    nodes.push(gf_at.node());
     ats.push(gf_at);
     // parent 61: the RAM-offload rows leaf ([bt, 96], dense-forced). Its grad
     // is produced by the arms inner graph and registered here so the burn-side
@@ -1395,15 +1397,15 @@ where
         .as_ref()
         .map(|r| ad2(r.clone().reshape([bt, ROW_DIM])));
     if let Some(ra) = &rows_ad {
-        nodes.push(ra.at.node.clone());
+        nodes.push(ra.at.node());
         ats.push(ra.at.clone());
         keep2.push(ra.t.clone());
     }
     // pad to 62 for generic Backward<62> (nexp=3 needs 30 dummies)
-    let dummy_node = nodes[0].clone();
+    // Same non-Clone NodeGuard note as above.
     let dummy_at = ats[0].clone();
     while nodes.len() < 62 {
-        nodes.push(dummy_node.clone());
+        nodes.push(dummy_at.node());
     }
     while ats.len() < 62 {
         ats.push(dummy_at.clone());
@@ -1506,20 +1508,20 @@ where
         let n_u = fc.u.meta.shape().dims::<2>().iter().product::<usize>();
         let n_v = fc.v.meta.shape().dims::<2>().iter().product::<usize>();
         unsafe {
-            crate::fused::kernels::absmean_kernel::launch_unchecked::<f32, Cuda>(&fc.u.client, CubeCount::Static(1,1,1), UNITS, BufferArg::from_raw_parts(fc.u.handle.clone(), n_u), BufferArg::from_raw_parts(fc.mu.handle.clone(), 1), n_u as u32);
-            crate::fused::kernels::absmean_kernel::launch_unchecked::<f32, Cuda>(&fc.v.client, CubeCount::Static(1,1,1), UNITS, BufferArg::from_raw_parts(fc.v.handle.clone(), n_v), BufferArg::from_raw_parts(fc.mv.handle.clone(), 1), n_v as u32);
+            crate::fused::kernels::absmean_kernel::launch_unchecked::<f32>(&fc.u.client, CubeCount::Static(1,1,1), UNITS, BufferArg::from_raw_parts(fc.u.handle.clone(), n_u), BufferArg::from_raw_parts(fc.mu.handle.clone(), 1), n_u as u32);
+            crate::fused::kernels::absmean_kernel::launch_unchecked::<f32>(&fc.v.client, CubeCount::Static(1,1,1), UNITS, BufferArg::from_raw_parts(fc.v.handle.clone(), n_v), BufferArg::from_raw_parts(fc.mv.handle.clone(), 1), n_v as u32);
         }
     }
     for (n, pi) in per.iter().enumerate() {
         let hin = if n == 0 { &x_prim } else { &per[n-1].h };
         unsafe {
-            kernels::hctx_kernel::launch_unchecked::<f32, Cuda>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(hin.handle.clone(), bt*d), BufferArg::from_raw_parts(ie.prim.handle.clone(), n_iter*d), BufferArg::from_raw_parts(pi.h_ctx.handle.clone(), bt*d), d_c, (n*d) as u32, (bt*d) as u32);
-            kernels::rmsnorm_kernel::launch_unchecked::<f32, Cuda>(&client, CubeCount::Static(bt_c,1,1), UNITS, BufferArg::from_raw_parts(pi.h_ctx.handle.clone(), bt*d), BufferArg::from_raw_parts(g_prim.handle.clone(), d), BufferArg::from_raw_parts(pi.normed.handle.clone(), bt*d), BufferArg::from_raw_parts(pi.inv.handle.clone(), bt), d_c, inp.norm_eps);
-            kernels::cat_kernel::launch_unchecked::<f32, Cuda>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(pi.h_ctx.handle.clone(), bt*d), BufferArg::from_raw_parts(x_prim.handle.clone(), bt*d), BufferArg::from_raw_parts(pi.ctrl_in.handle.clone(), 2*bt*d), d_c, (bt*d) as u32);
+            kernels::hctx_kernel::launch_unchecked::<f32>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(hin.handle.clone(), bt*d), BufferArg::from_raw_parts(ie.prim.handle.clone(), n_iter*d), BufferArg::from_raw_parts(pi.h_ctx.handle.clone(), bt*d), d_c, (n*d) as u32, (bt*d) as u32);
+            kernels::rmsnorm_kernel::launch_unchecked::<f32>(&client, CubeCount::Static(bt_c,1,1), UNITS, BufferArg::from_raw_parts(pi.h_ctx.handle.clone(), bt*d), BufferArg::from_raw_parts(g_prim.handle.clone(), d), BufferArg::from_raw_parts(pi.normed.handle.clone(), bt*d), BufferArg::from_raw_parts(pi.inv.handle.clone(), bt), d_c, inp.norm_eps);
+            kernels::cat_kernel::launch_unchecked::<f32>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(pi.h_ctx.handle.clone(), bt*d), BufferArg::from_raw_parts(x_prim.handle.clone(), bt*d), BufferArg::from_raw_parts(pi.ctrl_in.handle.clone(), 2*bt*d), d_c, (bt*d) as u32);
         }
         launch_mm(&client, &pi.ctrl_in, &wc.prim, &rs_prim, &rs_prim, &pi.raw, bt, 2*d, pad, 2*d, 1, pad, 1, bt*d, 2*d*pad, false, false, false, false, false);
         unsafe {
-            kernels::sigsel_arms_kernel::launch_unchecked::<f32, Cuda>(&client, CubeCount::Static(bt_c,1,1), UNITS, BufferArg::from_raw_parts(pi.raw.handle.clone(), bt*pad), BufferArg::from_raw_parts(w_attn_vec[n].handle.clone(), bt), BufferArg::from_raw_parts(w_mem_vec[n].handle.clone(), bt), BufferArg::from_raw_parts(pi.w_ffn.handle.clone(), bt), BufferArg::from_raw_parts(pi.blend.handle.clone(), bt*nexp), nexp_c, pad_c);
+            kernels::sigsel_arms_kernel::launch_unchecked::<f32>(&client, CubeCount::Static(bt_c,1,1), UNITS, BufferArg::from_raw_parts(pi.raw.handle.clone(), bt*pad), BufferArg::from_raw_parts(w_attn_vec[n].handle.clone(), bt), BufferArg::from_raw_parts(w_mem_vec[n].handle.clone(), bt), BufferArg::from_raw_parts(pi.w_ffn.handle.clone(), bt), BufferArg::from_raw_parts(pi.blend.handle.clone(), bt*nexp), nexp_c, pad_c);
         }
         // KDA / MSA / Engram via TRUE direct Cube kernels (no inner Autodiff).
         // Only one fence before the first raw launch (above); all launches are
@@ -1527,40 +1529,40 @@ where
         // KDA: gdn2_chunk_intra + gdn2_chunk_inter via kda_forward_cube
         if cfg.use_kda {
             let kda_cube = crate::fused::kernels::arms::kda_forward_cube(&lb_bare.shared_attn.gdn2, &pi.normed, b, t, d);
-            unsafe { kernels::copy_kernel::launch_unchecked::<f32, Cuda>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(kda_cube.handle.clone(), bt*d), BufferArg::from_raw_parts(kda_vec[n].handle.clone(), bt*d), 0, 0, (bt*d) as u32); }
+            unsafe { kernels::copy_kernel::launch_unchecked::<f32>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(kda_cube.handle.clone(), bt*d), BufferArg::from_raw_parts(kda_vec[n].handle.clone(), bt*d), 0, 0, (bt*d) as u32); }
         } else {
-            unsafe { kernels::fill_kernel::launch_unchecked::<f32, Cuda>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(kda_vec[n].handle.clone(), bt*d), 0.0, (bt*d) as u32); }
+            unsafe { kernels::fill_kernel::launch_unchecked::<f32>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(kda_vec[n].handle.clone(), bt*d), 0.0, (bt*d) as u32); }
         }
         // MSA: msa_sparse_attn_kernel via msa_forward_cube
         if cfg.use_msa && t > 1 && t >= cfg.msa_block {
             let msa_cube = crate::fused::kernels::arms::msa_forward_cube(&lb_bare.shared_attn.msa, &pi.normed, b, t, d);
-            unsafe { kernels::copy_kernel::launch_unchecked::<f32, Cuda>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(msa_cube.handle.clone(), bt*d), BufferArg::from_raw_parts(msa_vec[n].handle.clone(), bt*d), 0, 0, (bt*d) as u32); }
+            unsafe { kernels::copy_kernel::launch_unchecked::<f32>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(msa_cube.handle.clone(), bt*d), BufferArg::from_raw_parts(msa_vec[n].handle.clone(), bt*d), 0, 0, (bt*d) as u32); }
         } else {
-            unsafe { kernels::fill_kernel::launch_unchecked::<f32, Cuda>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(msa_vec[n].handle.clone(), bt*d), 0.0, (bt*d) as u32); }
+            unsafe { kernels::fill_kernel::launch_unchecked::<f32>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(msa_vec[n].handle.clone(), bt*d), 0.0, (bt*d) as u32); }
         }
         // router gate: direct via launch_mm + sigmoid (Cube)
         {
             let gate_cube = crate::fused::kernels::arms::router_gate_cube(&lb_bare.shared_attn.router, &pi.normed, b, t, d);
-            unsafe { kernels::copy_kernel::launch_unchecked::<f32, Cuda>(&client, ew_cubes(bt), EW, BufferArg::from_raw_parts(gate_cube.handle.clone(), bt), BufferArg::from_raw_parts(gate_vec[n].handle.clone(), bt), 0, 0, bt as u32); }
+            unsafe { kernels::copy_kernel::launch_unchecked::<f32>(&client, ew_cubes(bt), EW, BufferArg::from_raw_parts(gate_cube.handle.clone(), bt), BufferArg::from_raw_parts(gate_vec[n].handle.clone(), bt), 0, 0, bt as u32); }
         }
         // attn blended + scaled: gdn2_chunk + msa_sparse + router blend
-        unsafe { kernels::attn_blend_scale_kernel::launch_unchecked::<f32, Cuda>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(kda_vec[n].handle.clone(), bt*d), BufferArg::from_raw_parts(msa_vec[n].handle.clone(), bt*d), BufferArg::from_raw_parts(gate_vec[n].handle.clone(), bt), BufferArg::from_raw_parts(w_attn_vec[n].handle.clone(), bt), BufferArg::from_raw_parts(attn_vec[n].handle.clone(), bt*d), d_c, (bt*d) as u32); }
+        unsafe { kernels::attn_blend_scale_kernel::launch_unchecked::<f32>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(kda_vec[n].handle.clone(), bt*d), BufferArg::from_raw_parts(msa_vec[n].handle.clone(), bt*d), BufferArg::from_raw_parts(gate_vec[n].handle.clone(), bt), BufferArg::from_raw_parts(w_attn_vec[n].handle.clone(), bt), BufferArg::from_raw_parts(attn_vec[n].handle.clone(), bt*d), d_c, (bt*d) as u32); }
         // Engram: engram_gather_kernel via engram_forward_cube. Host-rows mode
         // (RAM offload) takes priority, mirroring forward_with_hidden.
         if cfg.use_engram {
             if let Some(ref rc) = rows_cube {
                 let eng_cube = crate::fused::kernels::arms::engram_forward_embeds_cube(&lb_bare.engram, rc, &pi.h_ctx, b, t, d);
-                unsafe { kernels::copy_kernel::launch_unchecked::<f32, Cuda>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(eng_cube.handle.clone(), bt*d), BufferArg::from_raw_parts(engram_vec[n].handle.clone(), bt*d), 0, 0, (bt*d) as u32); }
-                unsafe { kernels::engram_scale_kernel::launch_unchecked::<f32, Cuda>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(engram_vec[n].handle.clone(), bt*d), BufferArg::from_raw_parts(w_mem_vec[n].handle.clone(), bt), BufferArg::from_raw_parts(engram_vec[n].handle.clone(), bt*d), d_c, (bt*d) as u32); }
+                unsafe { kernels::copy_kernel::launch_unchecked::<f32>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(eng_cube.handle.clone(), bt*d), BufferArg::from_raw_parts(engram_vec[n].handle.clone(), bt*d), 0, 0, (bt*d) as u32); }
+                unsafe { kernels::engram_scale_kernel::launch_unchecked::<f32>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(engram_vec[n].handle.clone(), bt*d), BufferArg::from_raw_parts(w_mem_vec[n].handle.clone(), bt), BufferArg::from_raw_parts(engram_vec[n].handle.clone(), bt*d), d_c, (bt*d) as u32); }
             } else if let Some(ref hc) = hashed_cube {
                 let eng_cube = crate::fused::kernels::arms::engram_forward_cube(&lb_bare.engram, hc, &pi.h_ctx, b, t, d, 3);
-                unsafe { kernels::copy_kernel::launch_unchecked::<f32, Cuda>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(eng_cube.handle.clone(), bt*d), BufferArg::from_raw_parts(engram_vec[n].handle.clone(), bt*d), 0, 0, (bt*d) as u32); }
-                unsafe { kernels::engram_scale_kernel::launch_unchecked::<f32, Cuda>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(engram_vec[n].handle.clone(), bt*d), BufferArg::from_raw_parts(w_mem_vec[n].handle.clone(), bt), BufferArg::from_raw_parts(engram_vec[n].handle.clone(), bt*d), d_c, (bt*d) as u32); }
+                unsafe { kernels::copy_kernel::launch_unchecked::<f32>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(eng_cube.handle.clone(), bt*d), BufferArg::from_raw_parts(engram_vec[n].handle.clone(), bt*d), 0, 0, (bt*d) as u32); }
+                unsafe { kernels::engram_scale_kernel::launch_unchecked::<f32>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(engram_vec[n].handle.clone(), bt*d), BufferArg::from_raw_parts(w_mem_vec[n].handle.clone(), bt), BufferArg::from_raw_parts(engram_vec[n].handle.clone(), bt*d), d_c, (bt*d) as u32); }
             } else {
-                unsafe { kernels::fill_kernel::launch_unchecked::<f32, Cuda>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(engram_vec[n].handle.clone(), bt*d), 0.0, (bt*d) as u32); }
+                unsafe { kernels::fill_kernel::launch_unchecked::<f32>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(engram_vec[n].handle.clone(), bt*d), 0.0, (bt*d) as u32); }
             }
         } else {
-            unsafe { kernels::fill_kernel::launch_unchecked::<f32, Cuda>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(engram_vec[n].handle.clone(), bt*d), 0.0, (bt*d) as u32); }
+            unsafe { kernels::fill_kernel::launch_unchecked::<f32>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(engram_vec[n].handle.clone(), bt*d), 0.0, (bt*d) as u32); }
         }
         // experts
         for e in 0..nexp {
@@ -1568,10 +1570,10 @@ where
             let wsc = &pi.ws[e];
             launch_mm(&client, &pi.normed, &gu.u, &gu.s, &gu.mu, &wsc[0], bt, d, r, d, 1, r, 1, bt*d, d*r, false, false, true, false, false);
             launch_mm(&client, &wsc[0], &gu.v, &gu.s, &gu.mv, &wsc[1], bt, r, f, r, 1, r, 1, bt*r, f*r, false, true, true, true, false);
-            unsafe { kernels::silu_kernel::launch_unchecked::<f32, Cuda>(&client, ew_cubes(bt*f), EW, BufferArg::from_raw_parts(wsc[1].handle.clone(), bt*f), BufferArg::from_raw_parts(wsc[2].handle.clone(), bt*f), (bt*f) as u32); }
+            unsafe { kernels::silu_kernel::launch_unchecked::<f32>(&client, ew_cubes(bt*f), EW, BufferArg::from_raw_parts(wsc[1].handle.clone(), bt*f), BufferArg::from_raw_parts(wsc[2].handle.clone(), bt*f), (bt*f) as u32); }
             launch_mm(&client, &wsc[2], &dn.u, &dn.s, &dn.mu, &wsc[3], bt, f, r, f, 1, r, 1, bt*f, f*r, false, false, true, false, false);
             launch_mm(&client, &wsc[3], &dn.v, &dn.s, &dn.mv, &wsc[4], bt, r, d, r, 1, r, 1, bt*r, d*r, false, true, true, true, false);
-            unsafe { kernels::axpy_kernel::launch_unchecked::<f32, Cuda>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(pi.ffn.handle.clone(), bt*d), BufferArg::from_raw_parts(wsc[4].handle.clone(), bt*d), BufferArg::from_raw_parts(pi.blend.handle.clone(), bt*nexp), e as u32, nexp_c, d_c, (bt*d) as u32); }
+            unsafe { kernels::axpy_kernel::launch_unchecked::<f32>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(pi.ffn.handle.clone(), bt*d), BufferArg::from_raw_parts(wsc[4].handle.clone(), bt*d), BufferArg::from_raw_parts(pi.blend.handle.clone(), bt*nexp), e as u32, nexp_c, d_c, (bt*d) as u32); }
         }
         // y = attn + engram + ffn*w_ffn
         let ffn_scaled = {
@@ -1579,34 +1581,34 @@ where
             keep1.push(t);
             c
         };
-        unsafe { kernels::engram_scale_kernel::launch_unchecked::<f32, Cuda>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(pi.ffn.handle.clone(), bt*d), BufferArg::from_raw_parts(pi.w_ffn.handle.clone(), bt), BufferArg::from_raw_parts(ffn_scaled.handle.clone(), bt*d), d_c, (bt*d) as u32); }
-        unsafe { kernels::add3_kernel::launch_unchecked::<f32, Cuda>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(attn_vec[n].handle.clone(), bt*d), BufferArg::from_raw_parts(engram_vec[n].handle.clone(), bt*d), BufferArg::from_raw_parts(ffn_scaled.handle.clone(), bt*d), BufferArg::from_raw_parts(pi.y.handle.clone(), bt*d), (bt*d) as u32); }
-        unsafe { kernels::h_from_y_kernel::launch_unchecked::<f32, Cuda>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(pi.h_ctx.handle.clone(), bt*d), BufferArg::from_raw_parts(pi.y.handle.clone(), bt*d), BufferArg::from_raw_parts(rs_prim.handle.clone(), 1), BufferArg::from_raw_parts(pi.h.handle.clone(), bt*d), (bt*d) as u32); }
+        unsafe { kernels::engram_scale_kernel::launch_unchecked::<f32>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(pi.ffn.handle.clone(), bt*d), BufferArg::from_raw_parts(pi.w_ffn.handle.clone(), bt), BufferArg::from_raw_parts(ffn_scaled.handle.clone(), bt*d), d_c, (bt*d) as u32); }
+        unsafe { kernels::add3_kernel::launch_unchecked::<f32>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(attn_vec[n].handle.clone(), bt*d), BufferArg::from_raw_parts(engram_vec[n].handle.clone(), bt*d), BufferArg::from_raw_parts(ffn_scaled.handle.clone(), bt*d), BufferArg::from_raw_parts(pi.y.handle.clone(), bt*d), (bt*d) as u32); }
+        unsafe { kernels::h_from_y_kernel::launch_unchecked::<f32>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(pi.h_ctx.handle.clone(), bt*d), BufferArg::from_raw_parts(pi.y.handle.clone(), bt*d), BufferArg::from_raw_parts(rs_prim.handle.clone(), 1), BufferArg::from_raw_parts(pi.h.handle.clone(), bt*d), (bt*d) as u32); }
         unsafe {
-            kernels::rowmean_t_kernel::launch_unchecked::<f32, Cuda>(&client, CubeCount::Static(b_c,1,1), UNITS, BufferArg::from_raw_parts(pi.h_ctx.handle.clone(), bt*d), BufferArg::from_raw_parts(pi.halt_in.handle.clone(), b*d), t_c, d_c);
-            kernels::halt_fwd_kernel::launch_unchecked::<f32, Cuda>(&client, CubeCount::Static(b_c,1,1), UNITS, BufferArg::from_raw_parts(pi.halt_in.handle.clone(), b*d), BufferArg::from_raw_parts(wh.prim.handle.clone(), d), BufferArg::from_raw_parts(pi.lam.handle.clone(), b), d_c);
+            kernels::rowmean_t_kernel::launch_unchecked::<f32>(&client, CubeCount::Static(b_c,1,1), UNITS, BufferArg::from_raw_parts(pi.h_ctx.handle.clone(), bt*d), BufferArg::from_raw_parts(pi.halt_in.handle.clone(), b*d), t_c, d_c);
+            kernels::halt_fwd_kernel::launch_unchecked::<f32>(&client, CubeCount::Static(b_c,1,1), UNITS, BufferArg::from_raw_parts(pi.halt_in.handle.clone(), b*d), BufferArg::from_raw_parts(wh.prim.handle.clone(), d), BufferArg::from_raw_parts(pi.lam.handle.clone(), b), d_c);
         }
         launch_mm(&client, &pi.h, &op.0.u, &op.0.s, &op.0.mu, &pi.z_o, bt, d, r, d, 1, r, 1, bt*d, d*r, false, false, true, false, false);
         launch_mm(&client, &pi.z_o, &op.0.v, &op.0.s, &op.0.mv, &pi.step_out, bt, r, d, r, 1, r, 1, bt*r, d*r, false, true, true, true, false);
         launch_mm(&client, &pi.step_out, &lm.0.u, &lm.0.s, &lm.0.mu, &pi.z_l, bt, d, r, d, 1, r, 1, bt*d, d*r, false, false, true, false, false);
         launch_mm(&client, &pi.z_l, &lm.0.v, &lm.0.s, &lm.0.mv, &pi.logits, bt, r, v, r, 1, r, 1, bt*r, v*r, false, true, true, true, false);
         unsafe {
-            kernels::ce_kernel::launch_unchecked::<f32, Cuda>(&client, CubeCount::Static(bt_c,1,1), UNITS, BufferArg::from_raw_parts(pi.logits.handle.clone(), bt*v), BufferArg::from_raw_parts(tgt_c.handle.clone(), bt), BufferArg::from_raw_parts(pi.ce.handle.clone(), bt), v as u32);
-            kernels::ceb_kernel::launch_unchecked::<f32, Cuda>(&client, CubeCount::Static(b_c,1,1), UNITS, BufferArg::from_raw_parts(pi.ce.handle.clone(), bt), BufferArg::from_raw_parts(pi.ceb.handle.clone(), b), t_c);
-            kernels::halting_kernel::launch_unchecked::<f32, Cuda>(&client, ew_cubes(b), EW, BufferArg::from_raw_parts(pi.lam.handle.clone(), b), BufferArg::from_raw_parts(if n==0{&nh0}else{&per[n-1].nh}.handle.clone(), b), BufferArg::from_raw_parts(pi.nh.handle.clone(), b), BufferArg::from_raw_parts(pi.p.handle.clone(), b), BufferArg::from_raw_parts(flat.handle.clone(), 2+b*n_iter+bt*v), (1+n*b) as u32, b as u32);
-            kernels::rec_kernel::launch_unchecked::<f32, Cuda>(&client, CubeCount::Static(1,1,1), UNITS, BufferArg::from_raw_parts(pi.p.handle.clone(), b), BufferArg::from_raw_parts(pi.ceb.handle.clone(), b), BufferArg::from_raw_parts(flat.handle.clone(), 2+b*n_iter+bt*v), b as u32, bt as u32, n>0);
-            kernels::outacc_kernel::launch_unchecked::<f32, Cuda>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(pi.step_out.handle.clone(), bt*d), BufferArg::from_raw_parts(pi.p.handle.clone(), b), BufferArg::from_raw_parts(oa.handle.clone(), bt*d), t_c, d_c, (bt*d) as u32, n>0);
+            kernels::ce_kernel::launch_unchecked::<f32>(&client, CubeCount::Static(bt_c,1,1), UNITS, BufferArg::from_raw_parts(pi.logits.handle.clone(), bt*v), BufferArg::from_raw_parts(tgt_c.handle.clone(), bt), BufferArg::from_raw_parts(pi.ce.handle.clone(), bt), v as u32);
+            kernels::ceb_kernel::launch_unchecked::<f32>(&client, CubeCount::Static(b_c,1,1), UNITS, BufferArg::from_raw_parts(pi.ce.handle.clone(), bt), BufferArg::from_raw_parts(pi.ceb.handle.clone(), b), t_c);
+            kernels::halting_kernel::launch_unchecked::<f32>(&client, ew_cubes(b), EW, BufferArg::from_raw_parts(pi.lam.handle.clone(), b), BufferArg::from_raw_parts(if n==0{&nh0}else{&per[n-1].nh}.handle.clone(), b), BufferArg::from_raw_parts(pi.nh.handle.clone(), b), BufferArg::from_raw_parts(pi.p.handle.clone(), b), BufferArg::from_raw_parts(flat.handle.clone(), 2+b*n_iter+bt*v), (1+n*b) as u32, b as u32);
+            kernels::rec_kernel::launch_unchecked::<f32>(&client, CubeCount::Static(1,1,1), UNITS, BufferArg::from_raw_parts(pi.p.handle.clone(), b), BufferArg::from_raw_parts(pi.ceb.handle.clone(), b), BufferArg::from_raw_parts(flat.handle.clone(), 2+b*n_iter+bt*v), b as u32, bt as u32, n>0);
+            kernels::outacc_kernel::launch_unchecked::<f32>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(pi.step_out.handle.clone(), bt*d), BufferArg::from_raw_parts(pi.p.handle.clone(), b), BufferArg::from_raw_parts(oa.handle.clone(), bt*d), t_c, d_c, (bt*d) as u32, n>0);
         }
     }
-    unsafe { kernels::kl_kernel::launch_unchecked::<f32, Cuda>(&client, CubeCount::Static(1,1,1), UNITS, BufferArg::from_raw_parts(flat.handle.clone(), 2+b*n_iter+bt*v), BufferArg::from_raw_parts(prior_c.handle.clone(), n_iter), BufferArg::from_raw_parts(flat.handle.clone(), 2+b*n_iter+bt*v), 1, (1+b*n_iter) as u32, b as u32, n_iter as u32); }
-    unsafe { kernels::rmsnorm_kernel::launch_unchecked::<f32, Cuda>(&client, CubeCount::Static(bt_c,1,1), UNITS, BufferArg::from_raw_parts(oa.handle.clone(), bt*d), BufferArg::from_raw_parts(gf_prim.handle.clone(), d), BufferArg::from_raw_parts(hf.handle.clone(), bt*d), BufferArg::from_raw_parts(invf.handle.clone(), bt), d_c, inp.norm_eps); }
+    unsafe { kernels::kl_kernel::launch_unchecked::<f32>(&client, CubeCount::Static(1,1,1), UNITS, BufferArg::from_raw_parts(flat.handle.clone(), 2+b*n_iter+bt*v), BufferArg::from_raw_parts(prior_c.handle.clone(), n_iter), BufferArg::from_raw_parts(flat.handle.clone(), 2+b*n_iter+bt*v), 1, (1+b*n_iter) as u32, b as u32, n_iter as u32); }
+    unsafe { kernels::rmsnorm_kernel::launch_unchecked::<f32>(&client, CubeCount::Static(bt_c,1,1), UNITS, BufferArg::from_raw_parts(oa.handle.clone(), bt*d), BufferArg::from_raw_parts(gf_prim.handle.clone(), d), BufferArg::from_raw_parts(hf.handle.clone(), bt*d), BufferArg::from_raw_parts(invf.handle.clone(), bt), d_c, inp.norm_eps); }
     launch_mm(&client, &hf, &lm.0.u, &lm.0.s, &lm.0.mu, &zlf, bt, d, r, d, 1, r, 1, bt*d, d*r, false, false, true, false, false);
     launch_mm(&client, &zlf, &lm.0.v, &lm.0.s, &lm.0.mv, &lgstg, bt, r, v, r, 1, r, 1, bt*r, v*r, false, true, true, true, false);
-    unsafe { kernels::copy_kernel::launch_unchecked::<f32, Cuda>(&client, ew_cubes(bt*v), EW, BufferArg::from_raw_parts(lgstg.handle.clone(), bt*v), BufferArg::from_raw_parts(flat.handle.clone(), 2+b*n_iter+bt*v), 0, (2+b*n_iter) as u32, (bt*v) as u32); }
+    unsafe { kernels::copy_kernel::launch_unchecked::<f32>(&client, ew_cubes(bt*v), EW, BufferArg::from_raw_parts(lgstg.handle.clone(), bt*v), BufferArg::from_raw_parts(flat.handle.clone(), 2+b*n_iter+bt*v), 0, (2+b*n_iter) as u32, (bt*v) as u32); }
     unsafe {
         // latents for the burn-path aux heads (JEPA on out_acc, DSpark on hf)
-        kernels::copy_kernel::launch_unchecked::<f32, Cuda>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(oa.handle.clone(), bt*d), BufferArg::from_raw_parts(flat.handle.clone(), off_oa), 0, off_oa as u32, (bt*d) as u32);
-        kernels::copy_kernel::launch_unchecked::<f32, Cuda>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(hf.handle.clone(), bt*d), BufferArg::from_raw_parts(flat.handle.clone(), off_oa + bt*d), 0, (off_oa + bt*d) as u32, (bt*d) as u32);
+        kernels::copy_kernel::launch_unchecked::<f32>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(oa.handle.clone(), bt*d), BufferArg::from_raw_parts(flat.handle.clone(), off_oa), 0, off_oa as u32, (bt*d) as u32);
+        kernels::copy_kernel::launch_unchecked::<f32>(&client, ew_cubes(bt*d), EW, BufferArg::from_raw_parts(hf.handle.clone(), bt*d), BufferArg::from_raw_parts(flat.handle.clone(), off_oa + bt*d), 0, (off_oa + bt*d) as u32, (bt*d) as u32);
     }
     // No extra sync here: the single fence was at the start, and the final
     // sync is after the last kernel before the autodiff node is created.

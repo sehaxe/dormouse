@@ -132,16 +132,16 @@ pub fn tsct_linear_cuda(
 ) -> Option<burn::tensor::Tensor<2>> {
     use burn_cubecl::tensor::CubeTensor;
     use cubecl::prelude::CubeElement;
-    type CB = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
+    type CB = burn_cubecl::CubeBackend;
 
     let prim = x.clone().try_into_primitive::<CB>().ok()?;
-    let cube = (&prim as &dyn Any).downcast_ref::<CubeTensor<cubecl::cuda::CudaRuntime>>()?;
+    let cube = (&prim as &dyn Any).downcast_ref::<CubeTensor>()?;
     let client = cube.client.clone();
 
     let out = burn::tensor::Tensor::<2>::zeros([b, n], &x.device());
     let out_prim = out.clone().try_into_primitive::<CB>().ok()?;
     let out_cube = (&out_prim as &dyn Any)
-        .downcast_ref::<CubeTensor<cubecl::cuda::CudaRuntime>>()?
+        .downcast_ref::<CubeTensor>()?
         .clone();
     let x_handle = cube.handle.clone();
     let out_handle = out_cube.handle.clone();
@@ -158,7 +158,7 @@ pub fn tsct_linear_cuda(
     let cube_count = CubeCount::Static(b as u32, cubes_y, 1);
     let cube_dim = CubeDim::new_3d(n_chunk, 1, 1);
     unsafe {
-        tsct_linear_kernel::launch_unchecked::<f32, cubecl::cuda::CudaRuntime>(
+        tsct_linear_kernel::launch_unchecked::<f32>(
             &client,
             cube_count,
             cube_dim,

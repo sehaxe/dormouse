@@ -37,7 +37,7 @@ pub fn bitnet_v2_quantize(x: Tensor<3>, bits: usize) -> Tensor<3> {
     let deq_rot = if bits >= 8 {
         #[cfg(all(feature = "cuda", feature = "autodiff"))]
         {
-            type CudaBare = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
+            type CudaBare = burn_cubecl::CubeBackend;
             if let Some(quant) = crate::fwt_cuda::quant_autodiff::<CudaBare>(rotated.clone(), 8) {
                 return x.clone().add(
                     fast_walsh_hadamard(quant)
@@ -70,7 +70,7 @@ pub fn bitnet_v2_quantize(x: Tensor<3>, bits: usize) -> Tensor<3> {
         // lands in [-8,7] (no x127 pre-scaling — that's the absmax convention).
         #[cfg(all(feature = "cuda", feature = "autodiff"))]
         {
-            type CudaBare = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
+            type CudaBare = burn_cubecl::CubeBackend;
             if let Some(quant) = crate::fwt_cuda::quant_autodiff::<CudaBare>(rotated.clone(), 4) {
                 return x.clone().add(
                     fast_walsh_hadamard(quant)

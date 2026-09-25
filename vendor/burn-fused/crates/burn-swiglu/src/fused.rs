@@ -41,9 +41,9 @@ where
     burn::tensor::DispatchTensor: burn::backend::DispatchKindConversion<B>,
 {
     use burn_cubecl::tensor::CubeTensor;
-    let cube = |t: Tensor<2>| -> Option<CubeTensor<cubecl::cuda::CudaRuntime>> {
+    let cube = |t: Tensor<2>| -> Option<CubeTensor> {
         let prim = t.clone().try_into_primitive::<B>().ok()?;
-        let c = (&prim as &dyn Any).downcast_ref::<CubeTensor<cubecl::cuda::CudaRuntime>>()?;
+        let c = (&prim as &dyn Any).downcast_ref::<CubeTensor>()?;
         Some(c.clone())
     };
     let [rows, d2] = gu.dims();
@@ -60,7 +60,7 @@ where
     let out = Tensor::<2>::empty([rows, h], &gu.device());
     let out_c = cube(out.clone())?;
     unsafe {
-        swiglu_kernel::launch_unchecked::<f32, cubecl::cuda::CudaRuntime>(
+        swiglu_kernel::launch_unchecked::<f32>(
             &client,
             CubeCount::Static(rows as u32, 1, 1),
             CubeDim::new_3d(256, 1, 1),

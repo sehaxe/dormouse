@@ -6,7 +6,7 @@ use burn_cubecl::CubeBackend;
 use burn_msa::{MsaConfig, MsaModule};
 use std::time::Instant;
 
-type B = CubeBackend<cubecl::cuda::CudaRuntime>;
+type B = CubeBackend;
 
 fn time_it(runs: usize, mut f: impl FnMut()) -> f64 {
     for _ in 0..(runs.min(5)) {

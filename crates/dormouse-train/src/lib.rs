@@ -151,23 +151,26 @@ fn device() -> Device {
 /// Pool introspection (debug): bytes reserved/used/live allocs on the CUDA client.
 #[cfg(feature = "cuda")]
 pub fn pool_stats(device: &Device) -> String {
+    use burn_dispatch::devices::CubeDevice;
     use burn_dispatch::DispatchDevice;
     use cubecl_cuda::CudaRuntime;
-    use cubecl_runtime::client::ComputeClient;
+    use cubecl_runtime::runtime::Runtime as _;
     fn unwrap(d: &DispatchDevice) -> &burn_cuda::CudaDevice {
+        // pre.4 unifies every cubecl runtime under DispatchDevice::Cube
+        // (CubeDevice = cubecl::Device); pick the CUDA entry.
         match d {
-            DispatchDevice::Cuda(dev) => dev,
+            DispatchDevice::Cube(CubeDevice::Cuda(dev)) => dev,
             DispatchDevice::Autodiff(a) => match &**a {
-                DispatchDevice::Cuda(dev) => dev,
+                DispatchDevice::Cube(CubeDevice::Cuda(dev)) => dev,
                 other => panic!("expected CUDA device, got {other:?}"),
             },
             other => panic!("expected CUDA device, got {other:?}"),
         }
     }
-    let client = ComputeClient::<CudaRuntime>::load(unwrap(device.as_dispatch()));
-    match client.memory_usage() {
-        Ok(u) => format!("res={:.1}MB used={:.1}MB allocs={}", u.bytes_reserved as f64 / 1e6, u.bytes_in_use as f64 / 1e6, u.number_allocs),
-        Err(_) => "mem-err".into(),
+    let client = CudaRuntime::client(unwrap(device.as_dispatch()));
+    {
+        let u = client.memory_usage();
+        format!("res={:.1}MB used={:.1}MB allocs={}", u.bytes_reserved as f64 / 1e6, u.bytes_in_use as f64 / 1e6, u.number_allocs)
     }
 }
 #[cfg(not(feature = "cuda"))]
@@ -179,20 +182,23 @@ pub fn pool_stats(_device: &Device) -> String { "cpu".into() }
 /// (aria hit the same wall; periodic cleanup is the cheap fix).
 #[cfg(feature = "cuda")]
 pub fn memory_cleanup(device: &Device) {
+    use burn_dispatch::devices::CubeDevice;
     use burn_dispatch::DispatchDevice;
     use cubecl_cuda::CudaRuntime;
-    use cubecl_runtime::client::ComputeClient;
+    use cubecl_runtime::runtime::Runtime as _;
     fn unwrap(d: &DispatchDevice) -> &burn_cuda::CudaDevice {
+        // pre.4 unifies every cubecl runtime under DispatchDevice::Cube
+        // (CubeDevice = cubecl::Device); pick the CUDA entry.
         match d {
-            DispatchDevice::Cuda(dev) => dev,
+            DispatchDevice::Cube(CubeDevice::Cuda(dev)) => dev,
             DispatchDevice::Autodiff(a) => match &**a {
-                DispatchDevice::Cuda(dev) => dev,
+                DispatchDevice::Cube(CubeDevice::Cuda(dev)) => dev,
                 other => panic!("expected CUDA device, got {other:?}"),
             },
             other => panic!("expected CUDA device, got {other:?}"),
         }
     }
-    let client = ComputeClient::<CudaRuntime>::load(unwrap(device.as_dispatch()));
+    let client = CudaRuntime::client(unwrap(device.as_dispatch()));
     client.memory_cleanup();
 }
 #[cfg(not(feature = "cuda"))]
@@ -205,23 +211,26 @@ pub fn memory_cleanup(_device: &Device) {}
 /// mark.
 #[cfg(feature = "cuda")]
 pub fn init_pools(device: &Device) {
+    use burn_dispatch::devices::CubeDevice;
     use burn_dispatch::DispatchDevice;
     use cubecl_cuda::CudaRuntime;
     use cubecl_runtime::{
-        client::ComputeClient,
+        runtime::Runtime as _,
         config::memory::{MemoryPoolsConfig, MemoryPoolsPreset},
     };
     fn unwrap(d: &DispatchDevice) -> &burn_cuda::CudaDevice {
+        // pre.4 unifies every cubecl runtime under DispatchDevice::Cube
+        // (CubeDevice = cubecl::Device); pick the CUDA entry.
         match d {
-            DispatchDevice::Cuda(dev) => dev,
+            DispatchDevice::Cube(CubeDevice::Cuda(dev)) => dev,
             DispatchDevice::Autodiff(a) => match &**a {
-                DispatchDevice::Cuda(dev) => dev,
+                DispatchDevice::Cube(CubeDevice::Cuda(dev)) => dev,
                 other => panic!("expected CUDA device, got {other:?}"),
             },
             other => panic!("expected CUDA device, got {other:?}"),
         }
     }
-    let client = ComputeClient::<CudaRuntime>::load(unwrap(device.as_dispatch()));
+    let client = CudaRuntime::client(unwrap(device.as_dispatch()));
     let _ = client.install_memory_pools(&MemoryPoolsConfig::Preset(MemoryPoolsPreset::ExclusivePages));
 }
 #[cfg(not(feature = "cuda"))]
@@ -1374,20 +1383,33 @@ mod tests {
             dv < 1e-3 * scale.max(1.0),
             "precomputed target must equal the online teacher latent: {dv:.2e} (scale {scale:.2e})"
         );
-        // (2) The aux consumes the target tensor it is handed.
-        let (_, _, _, _, aux_a) = model.forward_with_jepa_targets::<Backend>(
-            x.clone(), Some(h.clone()), None, Some(y.clone()), Some(target.clone()),
-        );
-        let scaled = target.mul_scalar(3.0);
-        let (_, _, _, _, aux_b) = model.forward_with_jepa_targets::<Backend>(
-            x, Some(h), None, Some(y), Some(scaled),
-        );
-        let a: f32 = aux_a.expect("offline aux must be Some with JEPA on").try_into_scalar().unwrap();
-        let b: f32 = aux_b.expect("offline aux must be Some").try_into_scalar().unwrap();
-        assert!(a.is_finite() && b.is_finite(), "offline aux must be finite: {a} {b}");
+        // (2) The aux consumes the target tensor it is handed. The masked L1
+        // draws a fresh random mask per call (burn-jepa `mask_indices`);
+        // when both draws land empty the L1 term is 0.0 in both calls and
+        // the two aux values coincide bitwise. P(both empty) ~ 5-7% — a
+        // pre-existing flake (reproduced 2/40 on burn pre.3 as well), not a
+        // migration artifact. Retry across rounds: fail only if EVERY round
+        // sees identical aux values (P ~ 2e-6).
+        let mut depends_on_target = false;
+        for _ in 0..5 {
+            let (_, _, _, _, aux_a) = model.forward_with_jepa_targets::<Backend>(
+                x.clone(), Some(h.clone()), None, Some(y.clone()), Some(target.clone()),
+            );
+            let scaled = target.clone().mul_scalar(3.0);
+            let (_, _, _, _, aux_b) = model.forward_with_jepa_targets::<Backend>(
+                x.clone(), Some(h.clone()), None, Some(y.clone()), Some(scaled),
+            );
+            let a: f32 = aux_a.expect("offline aux must be Some with JEPA on").try_into_scalar().unwrap();
+            let b: f32 = aux_b.expect("offline aux must be Some").try_into_scalar().unwrap();
+            assert!(a.is_finite() && b.is_finite(), "offline aux must be finite: {a} {b}");
+            if (a - b).abs() > 1e-4 * a.abs().max(1.0) {
+                depends_on_target = true;
+                break;
+            }
+        }
         assert!(
-            (a - b).abs() > 1e-4 * a.abs().max(1.0),
-            "offline aux must depend on the supplied target: {a} vs {b}"
+            depends_on_target,
+            "offline aux must depend on the supplied target (all 5 rounds identical)"
         );
     }
 

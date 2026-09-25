@@ -30,10 +30,10 @@ pub const CHUNK_G: usize = 8;
 struct ChunkState {
     device: burn::tensor::Device,
     key: (usize, usize, usize, usize),
-    chunk: CubeTensor<cubecl::cuda::CudaRuntime>,
-    scores: CubeTensor<cubecl::cuda::CudaRuntime>,
-    max_s: CubeTensor<cubecl::cuda::CudaRuntime>,
-    sum_e: CubeTensor<cubecl::cuda::CudaRuntime>,
+    chunk: CubeTensor,
+    scores: CubeTensor,
+    max_s: CubeTensor,
+    sum_e: CubeTensor,
 }
 
 thread_local! {
@@ -81,14 +81,14 @@ fn cached_state(
     })
 }
 
-fn cube_of<const D: usize>(t: &Tensor<D>) -> Option<CubeTensor<cubecl::cuda::CudaRuntime>> {
-    type B = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
+fn cube_of<const D: usize>(t: &Tensor<D>) -> Option<CubeTensor> {
+    type B = burn_cubecl::CubeBackend;
     let prim = t.clone().try_into_primitive::<B>().ok()?;
-    let c = (&prim as &dyn Any).downcast_ref::<CubeTensor<cubecl::cuda::CudaRuntime>>()?;
+    let c = (&prim as &dyn Any).downcast_ref::<CubeTensor>()?;
     Some(c.clone())
 }
 
-fn cube_of_1(t: &Tensor<1>) -> Option<CubeTensor<cubecl::cuda::CudaRuntime>> {
+fn cube_of_1(t: &Tensor<1>) -> Option<CubeTensor> {
     cube_of(t)
 }
 
@@ -452,29 +452,29 @@ pub fn depth_attend_backward_cuda(
     d_out: &Tensor<3>,
 ) -> Option<(Vec<Tensor<3>>, Tensor<1>)> {
     use burn_cubecl::tensor::CubeTensor;
-    type CudaBare = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
-    let cube = |t: &Tensor<3>| -> Option<CubeTensor<cubecl::cuda::CudaRuntime>> {
+    type CudaBare = burn_cubecl::CubeBackend;
+    let cube = |t: &Tensor<3>| -> Option<CubeTensor> {
         let prim = t.clone().try_into_primitive::<CudaBare>().ok()?;
         let c = (&prim as &dyn std::any::Any)
-            .downcast_ref::<CubeTensor<cubecl::cuda::CudaRuntime>>()?;
+            .downcast_ref::<CubeTensor>()?;
         Some(c.clone())
     };
-    let cube_any = |t: &burn::tensor::Tensor<3, burn::tensor::Float>| -> Option<CubeTensor<cubecl::cuda::CudaRuntime>> {
+    let cube_any = |t: &burn::tensor::Tensor<3, burn::tensor::Float>| -> Option<CubeTensor> {
         let prim = t.clone().try_into_primitive::<CudaBare>().ok()?;
         let c = (&prim as &dyn std::any::Any)
-            .downcast_ref::<CubeTensor<cubecl::cuda::CudaRuntime>>()?;
+            .downcast_ref::<CubeTensor>()?;
         Some(c.clone())
     };
-    let cube1 = |t: &Tensor<1>| -> Option<CubeTensor<cubecl::cuda::CudaRuntime>> {
+    let cube1 = |t: &Tensor<1>| -> Option<CubeTensor> {
         let prim = t.clone().try_into_primitive::<CudaBare>().ok()?;
         let c = (&prim as &dyn std::any::Any)
-            .downcast_ref::<CubeTensor<cubecl::cuda::CudaRuntime>>()?;
+            .downcast_ref::<CubeTensor>()?;
         Some(c.clone())
     };
     let l = history.len();
     let [b, t, d] = history[0].dims();
     let bt = b * t;
-    let hc: Vec<CubeTensor<cubecl::cuda::CudaRuntime>> =
+    let hc: Vec<CubeTensor> =
         history.iter().map(cube).collect::<Option<_>>()?;
     let qc = cube1(query)?;
     let dc = cube(d_out)?;
@@ -492,7 +492,7 @@ pub fn depth_attend_backward_cuda(
     let per = (d as u32).div_ceil(256);
     unsafe {
         for (li, h) in hc.iter().enumerate() {
-            stack_copy_kernel::launch_unchecked::<f32, cubecl::cuda::CudaRuntime>(
+            stack_copy_kernel::launch_unchecked::<f32>(
                 &client,
                 count.clone(),
                 dim,
@@ -504,7 +504,7 @@ pub fn depth_attend_backward_cuda(
                 chunks,
             );
         }
-        depth_attend_backward_kernel::launch_unchecked::<f32, cubecl::cuda::CudaRuntime>(
+        depth_attend_backward_kernel::launch_unchecked::<f32>(
             &client,
             count,
             dim,
@@ -662,7 +662,7 @@ pub fn depth_attend_cuda(history: &[Tensor<3>], query: &Tensor<1>) -> Option<Ten
         return None;
     }
     let qc = cube_of(query)?;
-    let hc: Vec<CubeTensor<cubecl::cuda::CudaRuntime>> =
+    let hc: Vec<CubeTensor> =
         history.iter().map(cube_of).collect::<Option<_>>()?;
     // chunked: peak memory (G+2)*B*T*D instead of (L+1)*B*T*D; the chunk
     // stack is cached (never escapes), out is written once by the last chunk
@@ -689,7 +689,7 @@ pub fn depth_attend_cuda(history: &[Tensor<3>], query: &Tensor<1>) -> Option<Ten
                     break;
                 }
                 let h = &hc[li];
-                attnres_scores_kernel::launch_unchecked::<f32, cubecl::cuda::CudaRuntime>(
+                attnres_scores_kernel::launch_unchecked::<f32>(
                     &client,
                     CubeCount::Static(bt, 1, 1),
                     dim,
@@ -707,7 +707,7 @@ pub fn depth_attend_cuda(history: &[Tensor<3>], query: &Tensor<1>) -> Option<Ten
                 );
             }
             let ga = g.min(l - c * g);
-            attnres_chunk_kernel::launch_unchecked::<f32, cubecl::cuda::CudaRuntime>(
+            attnres_chunk_kernel::launch_unchecked::<f32>(
                 &client,
                 CubeCount::Static(bt, 1, 1),
                 dim,
@@ -745,7 +745,7 @@ pub fn source_score_cuda(query: &Tensor<1>, src: &Tensor<3>) -> Option<Tensor<3>
     let dim = CubeDim::new_3d(THREADS, 1, 1);
     let scale = (d as f64).powf(-0.5) as f32;
     unsafe {
-        source_score_kernel::launch_unchecked::<f32, cubecl::cuda::CudaRuntime>(
+        source_score_kernel::launch_unchecked::<f32>(
             &client,
             CubeCount::Static((b * t) as u32, 1, 1),
             dim,
@@ -785,7 +785,7 @@ pub fn merge_cuda(
     let per = (d as u32).div_ceil(THREADS);
     let dim = CubeDim::new_3d(THREADS, 1, 1);
     unsafe {
-        merge_kernel::launch_unchecked::<f32, cubecl::cuda::CudaRuntime>(
+        merge_kernel::launch_unchecked::<f32>(
             &client,
             CubeCount::Static((b * t) as u32, 1, 1),
             dim,
@@ -1015,7 +1015,7 @@ mod tests {
             for _ in 0..2 {
                 for h in &hc3 {
                     unsafe {
-                        attnres_scores_kernel::launch_unchecked::<f32, cubecl::cuda::CudaRuntime>(
+                        attnres_scores_kernel::launch_unchecked::<f32>(
                             &client3,
                             CubeCount::Static((b * t) as u32, 1, 1),
                             dim3,
@@ -1038,7 +1038,7 @@ mod tests {
             let t0 = std::time::Instant::now();
             for h in &hc3 {
                 unsafe {
-                    attnres_scores_kernel::launch_unchecked::<f32, cubecl::cuda::CudaRuntime>(
+                    attnres_scores_kernel::launch_unchecked::<f32>(
                         &client3,
                         CubeCount::Static((b * t) as u32, 1, 1),
                         dim3,
@@ -1123,7 +1123,7 @@ mod ad {
             let d_out = Tensor::from_primitive::<B>(grads.consume::<B>(&ops.node));
             #[cfg(feature = "cuda")]
             {
-                type CudaBare = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
+                type CudaBare = burn_cubecl::CubeBackend;
                 if std::any::TypeId::of::<B>() == std::any::TypeId::of::<CudaBare>() {
                     if let Some((dhs, dq)) = super::depth_attend_backward_cuda(&hs, &q, &d_out) {
                         for (i, dh) in dhs.into_iter().enumerate() {
@@ -1226,16 +1226,16 @@ mod ad {
             .iter()
             .map(|h| h.clone().try_into_primitive::<Autodiff<Inner>>().ok())
             .collect::<Option<_>>()?;
-        let q_t = Tensor::from_primitive::<Inner>(qa.primitive.clone());
+        let q_t = Tensor::from_primitive::<Inner>(qa.primitive().clone());
         let hs_t: Vec<Tensor<3>> = has
             .iter()
-            .map(|h| Tensor::from_primitive::<Inner>(h.primitive.clone()))
+            .map(|h| Tensor::from_primitive::<Inner>(h.primitive().clone()))
             .collect();
 
         let out_t = {
             #[cfg(feature = "cuda")]
             {
-                type CudaBare = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
+                type CudaBare = burn_cubecl::CubeBackend;
                 if std::any::TypeId::of::<Inner>() == std::any::TypeId::of::<CudaBare>() {
                     if let Some(o) = super::depth_attend_cuda(&hs_t, &q_t) {
                         o
@@ -1255,11 +1255,11 @@ mod ad {
         let out_prim = out_t.try_into_primitive::<Inner>().unwrap();
         let mut nodes: Vec<_> = Vec::with_capacity(N);
         for h in &has {
-            nodes.push(h.node.clone());
+            nodes.push(h.node());
         }
-        nodes.push(qa.node.clone());
+        nodes.push(qa.node());
         while nodes.len() < N {
-            nodes.push(qa.node.clone());
+            nodes.push(qa.node());
         }
         let nodes: [_; N] = nodes.try_into().unwrap();
         let prep = AttnResOp.prepare::<NoCheckpointing>(nodes);
@@ -1314,7 +1314,7 @@ mod ad_tests {
     use super::*;
     use burn::tensor::{Device, Distribution, Tensor};
 
-    type CudaBare = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
+    type CudaBare = burn_cubecl::CubeBackend;
 
     fn to_host<const D: usize>(t: Tensor<D>) -> Vec<f32> {
         t.into_data()
@@ -1373,7 +1373,7 @@ mod fd_tests {
     use super::*;
     use burn::tensor::{Device, Distribution, Tensor};
 
-    type CudaBare = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
+    type CudaBare = burn_cubecl::CubeBackend;
 
     fn to_host<const D: usize>(t: Tensor<D>) -> Vec<f32> {
         t.into_data()

@@ -67,15 +67,15 @@ where
     let a_ad = a.clone().try_into_primitive::<Autodiff<Inner>>().unwrap();
     let w_ad = w.clone().try_into_primitive::<Autodiff<Inner>>().unwrap();
     // Forward in bf16 on the inner backend (tensor cores), fp32 output.
-    let a_t = Tensor::<2>::from_primitive::<Inner>(a_ad.primitive.clone());
-    let w_t = Tensor::<2>::from_primitive::<Inner>(w_ad.primitive.clone());
+    let a_t = Tensor::<2>::from_primitive::<Inner>(a_ad.primitive().clone());
+    let w_t = Tensor::<2>::from_primitive::<Inner>(w_ad.primitive().clone());
     let out = a_t
         .cast(FloatDType::BF16)
         .matmul(w_t.cast(FloatDType::BF16))
         .cast(FloatDType::F32);
     let out_p = out.try_into_primitive::<Inner>().unwrap();
 
-    let nodes = [a_ad.node.clone(), w_ad.node.clone()];
+    let nodes = [a_ad.node(), w_ad.node()];
     let prep = Bf16Matmul.prepare::<NoCheckpointing>(nodes);
     match prep.compute_bound().stateful() {
         OpsKind::Tracked(mut prep) => {
@@ -93,9 +93,9 @@ mod tests {
     use burn::tensor::Distribution;
 
     type AD = burn::backend::autodiff::Autodiff<
-        burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>,
+        burn_cubecl::CubeBackend,
     >;
-    type Bare = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
+    type Bare = burn_cubecl::CubeBackend;
 
     #[test]
     fn bf16_matmul_matches_fp32_with_grads() {

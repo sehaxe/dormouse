@@ -92,11 +92,11 @@ fn situ_glu_backward_kernel<F: Float>(
 }
 
 #[cfg(feature = "cuda")]
-fn cube_of(t: &Tensor<2>) -> Option<burn_cubecl::tensor::CubeTensor<cubecl::cuda::CudaRuntime>> {
-    type B = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
+fn cube_of(t: &Tensor<2>) -> Option<burn_cubecl::tensor::CubeTensor> {
+    type B = burn_cubecl::CubeBackend;
     let prim = t.clone().try_into_primitive::<B>().ok()?;
     let c = (&prim as &dyn std::any::Any)
-        .downcast_ref::<burn_cubecl::tensor::CubeTensor<cubecl::cuda::CudaRuntime>>()?;
+        .downcast_ref::<burn_cubecl::tensor::CubeTensor>()?;
     Some(c.clone())
 }
 
@@ -117,7 +117,7 @@ pub fn situ_glu_cuda(gate_up: &Tensor<2>, hidden: usize, bg: f64, bu: f64) -> Op
     let threads = 256u32;
     let dim = CubeDim::new_3d(threads, 1, 1);
     unsafe {
-        situ_glu_kernel::launch_unchecked::<f32, cubecl::cuda::CudaRuntime>(
+        situ_glu_kernel::launch_unchecked::<f32>(
             &client,
             CubeCount::Static(n as u32, 1, 1),
             dim,
@@ -152,7 +152,7 @@ fn situ_glu_backward_cuda(
     let threads = 256u32;
     let dim = CubeDim::new_3d(threads, 1, 1);
     unsafe {
-        situ_glu_backward_kernel::launch_unchecked::<f32, cubecl::cuda::CudaRuntime>(
+        situ_glu_backward_kernel::launch_unchecked::<f32>(
             &client,
             CubeCount::Static(n as u32, 1, 1),
             dim,
@@ -223,7 +223,7 @@ mod ad {
 
             #[cfg(feature = "cuda")]
             {
-                type CudaBare = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
+                type CudaBare = burn_cubecl::CubeBackend;
                 if std::any::TypeId::of::<B>() == std::any::TypeId::of::<CudaBare>() {
                     if let Some(d_gu) = super::situ_glu_backward_cuda(&gu, &d_out, hidden, bg, bu) {
                         grads.register::<B>(
@@ -255,12 +255,12 @@ mod ad {
         DispatchTensor: DispatchKindConversion<Autodiff<Inner>> + DispatchKindConversion<Inner>,
     {
         let gu = gate_up.try_into_primitive::<Autodiff<Inner>>().ok()?;
-        let gu_t = Tensor::from_primitive::<Inner>(gu.primitive.clone());
+        let gu_t = Tensor::from_primitive::<Inner>(gu.primitive().clone());
 
         let out_t = {
             #[cfg(feature = "cuda")]
             {
-                type CudaBare = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
+                type CudaBare = burn_cubecl::CubeBackend;
                 if std::any::TypeId::of::<Inner>() == std::any::TypeId::of::<CudaBare>() {
                     if let Some(o) = super::situ_glu_cuda(&gu_t, hidden, bg, bu) {
                         o
@@ -278,7 +278,7 @@ mod ad {
         };
 
         let out_prim = out_t.try_into_primitive::<Inner>().unwrap();
-        let nodes = [gu.node.clone()];
+        let nodes = [gu.node()];
         let prep = SituGlu.prepare::<NoCheckpointing>(nodes);
         let out_adt = match prep.compute_bound().stateful() {
             OpsKind::Tracked(mut prep) => {
@@ -407,7 +407,7 @@ mod ad_tests {
     use super::*;
     use burn::tensor::{Device, Distribution, Tensor};
 
-    type CudaBare = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
+    type CudaBare = burn_cubecl::CubeBackend;
 
     fn to_host(t: Tensor<2>) -> Vec<f32> {
         t.into_data()
@@ -471,7 +471,7 @@ mod fd_tests {
     use super::*;
     use burn::tensor::{Device, Distribution, Tensor};
 
-    type CudaBare = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
+    type CudaBare = burn_cubecl::CubeBackend;
 
     fn to_host(t: Tensor<2>) -> Vec<f32> {
         t.into_data()

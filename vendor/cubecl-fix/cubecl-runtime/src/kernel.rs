@@ -1,32 +1,14 @@
-use alloc::{
-    boxed::Box,
-    string::{String, ToString},
-};
-use core::{
-    fmt::Display,
-    hash::Hash,
-    marker::PhantomData,
-    sync::atomic::{AtomicI8, Ordering},
-};
+use alloc::string::String;
+use core::hash::Hash;
+use pliron::derive::format;
 
-use cubecl_common::format::format_str;
-use cubecl_ir::{
-    ElemType, Scope,
-    metadata::Info,
-    pliron::{format, value::Value},
-    settings::KernelSettings,
-};
+use cubecl_ir::{ElemType, Scope, metadata::Info, pliron::value::Value, settings::KernelSettings};
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    compiler::{CompilationError, Compiler, CubeTask},
-    config::{CubeClRuntimeConfig, RuntimeConfig, compilation::CompilationLogLevel},
-    id::KernelId,
-    server::CubeDim,
-};
+use crate::id::KernelId;
 
 /// Implement this trait to create a [kernel definition](KernelDefinition).
-pub trait KernelMetadata: Send + Sync + 'static {
+pub trait KernelMetadata: core::any::Any + Send + Sync + 'static {
     /// Name of the kernel for debugging.
     fn name(&self) -> &'static str {
         core::any::type_name::<Self>()
@@ -73,213 +55,55 @@ pub enum Visibility {
     ReadWrite,
 }
 
-/// A kernel, compiled in the target language
-pub struct CompiledKernel<C: Compiler> {
-    /// The name of the kernel entrypoint.
-    /// For example
-    ///
-    /// ```text
-    /// #[cube(launch)]
-    /// fn gelu_array<F: Float, R: Runtime>() {}
-    /// ```
-    ///
-    /// would have the entrypoint name "`gelu_array`".
-    pub entrypoint_name: String,
+/// What a compiled kernel does with each buffer binding, by buffer position.
+///
+/// The IR owns this concept — the visibility analysis stamps it on the entry
+/// function's arguments — so the launch path reads that enum rather than a
+/// copy of it that could drift. Re-exported here because a backend reaching
+/// for it is holding a `CompiledKernel` (in `cubecl-server`), not an IR
+/// context.
+pub use cubecl_ir::attributes::BufferIOAttr;
 
-    /// A fully qualified debug name of the kernel.
-    ///
-    /// For example
-    ///
-    /// ```text
-    /// #[cube(launch)]
-    /// fn gelu_array<F: Float, R: Runtime>() {}
-    /// ```
-    ///
-    /// would have a debug name such as
-    ///
-    /// ```text
-    /// gelu::gelu_array::GeluArray<
-    ///    cubecl_core::frontend::element::float::F32,
-    ///    cubecl_cuda::runtime::CudaRuntime,
-    /// >
-    /// ```
-    pub debug_name: Option<&'static str>,
-
-    /// Source code of the kernel
+/// A hand-written kernel's own compiled text, standing in for what the
+/// compiler would have produced from a [`KernelDefinition`].
+///
+/// The text goes to the backend as is, so two things the compiler would have
+/// settled are the kernel's to settle:
+///
+/// - `lang` names the language the text is written in, and must equal the
+///   [`lang_tag`](crate::compiler::Compiler::lang_tag) of the compiler the
+///   client runs. `CompiledKernel::compile` in `cubecl-server` refuses a
+///   mismatch, so CUDA C++ handed to a wgpu client is a
+///   [`CompilationError`](crate::compiler::CompilationError), not a naga
+///   parse error at first launch.
+/// - The kernel's [`id`](crate::kernel::KernelMetadata::id) must cover the
+///   text, for instance through [`KernelId::info`](crate::id::KernelId::info)
+///   with a hash of it. Every compilation cache, in memory and on disk, is
+///   keyed by that id and never sees the source, so two kernels with the
+///   same id and different text would share one compiled artifact.
+///
+/// There is no representation to read a dynamic shared memory size from, so
+/// a precompiled kernel is launched with none: what it needs, it declares
+/// statically in the text.
+pub struct PrecompiledSource {
+    /// The compiled source, in the target language.
     pub source: String,
-    /// In-memory representation of the kernel
-    pub repr: Option<C::Representation>,
-    /// Size of a cube for the compiled kernel
-    pub cube_dim: CubeDim,
-    /// Extra debugging information about the compiled kernel.
-    pub debug_info: Option<DebugInformation>,
-}
-
-/// Extra debugging information about the compiled kernel.
-#[derive(new)]
-pub struct DebugInformation {
-    /// The language tag of the source..
-    pub lang_tag: &'static str,
-    /// The compilation id.
-    pub id: KernelId,
+    /// The name of the entrypoint within `source`.
+    pub entrypoint_name: String,
+    /// The language `source` is written in, as the target compiler tags it.
+    pub lang: &'static str,
 }
 
 /// Kernel that can be defined
 pub trait CubeKernel: KernelMetadata {
     /// Define the kernel for compilation
     fn define(&self) -> KernelDefinition;
-}
 
-/// Wraps a [`CubeKernel`] to allow it be compiled.
-pub struct KernelTask<C: Compiler, K: CubeKernel> {
-    kernel_definition: K,
-    _compiler: PhantomData<C>,
-}
-
-/// Generic [`CubeTask`] for compiling kernels
-pub struct CubeTaskKernel<C: Compiler> {
-    /// The inner compilation task being wrapped
-    pub task: Box<dyn CubeTask<C>>,
-}
-
-impl<C: Compiler, K: CubeKernel> KernelTask<C, K> {
-    /// Create a new kernel task
-    pub fn new(kernel_definition: K) -> Self {
-        Self {
-            kernel_definition,
-            _compiler: PhantomData,
-        }
-    }
-}
-
-impl<C: Compiler, K: CubeKernel> CubeTask<C> for KernelTask<C, K> {
-    fn define(&self) -> KernelDefinition {
-        self.kernel_definition.define()
-    }
-
-    fn compile(
-        &self,
-        gpu_ir: KernelDefinition,
-        compiler: &mut C,
-        compilation_options: &C::CompilationOptions,
-    ) -> Result<CompiledKernel<C>, CompilationError> {
-        let entrypoint_name = gpu_ir.settings.kernel_name.clone();
-        let cube_dim = gpu_ir.settings.cube_dim.into();
-        let lower_level_ir = compiler.compile(gpu_ir, compilation_options)?;
-
-        Ok(CompiledKernel {
-            entrypoint_name,
-            debug_name: Some(core::any::type_name::<K>()),
-            source: lower_level_ir.to_string(),
-            repr: Some(lower_level_ir),
-            cube_dim,
-            debug_info: None,
-        })
-    }
-}
-
-impl<C: Compiler, K: CubeKernel> KernelMetadata for KernelTask<C, K> {
-    // Forward ID to underlying kernel definition.
-    fn id(&self) -> KernelId {
-        self.kernel_definition.id()
-    }
-
-    // Forward name to underlying kernel definition.
-    fn name(&self) -> &'static str {
-        self.kernel_definition.name()
-    }
-
-    fn address_type(&self) -> ElemType {
-        self.kernel_definition.address_type()
-    }
-}
-
-impl<C: Compiler> KernelMetadata for Box<dyn CubeTask<C>> {
-    // Deref and use existing ID.
-    fn id(&self) -> KernelId {
-        self.as_ref().id()
-    }
-
-    // Deref and use existing name.
-    fn name(&self) -> &'static str {
-        self.as_ref().name()
-    }
-
-    fn address_type(&self) -> ElemType {
-        self.as_ref().address_type()
-    }
-}
-
-static COMPILATION_LEVEL: AtomicI8 = AtomicI8::new(-1);
-
-fn compilation_level() -> u8 {
-    let compilation_level = COMPILATION_LEVEL.load(Ordering::Relaxed);
-    if compilation_level == -1 {
-        let val = match CubeClRuntimeConfig::get().compilation.logger.level {
-            CompilationLogLevel::Full => 2,
-            CompilationLogLevel::Disabled => 0,
-            CompilationLogLevel::Basic => 1,
-        };
-
-        COMPILATION_LEVEL.store(val, Ordering::Relaxed);
-        val as u8
-    } else {
-        compilation_level as u8
-    }
-}
-
-impl<C: Compiler> Display for CompiledKernel<C> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match compilation_level() {
-            2 => self.format_full(f),
-            _ => self.format_basic(f),
-        }
-    }
-}
-
-impl<C: Compiler> CompiledKernel<C> {
-    fn format_basic(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("[Compiling kernel]")?;
-        if let Some(name) = self.debug_name {
-            if name.len() <= 32 {
-                f.write_fmt(format_args!(" {name}"))?;
-            } else {
-                f.write_fmt(format_args!(" {}", name.split('<').next().unwrap_or("")))?;
-            }
-        }
-
-        Ok(())
-    }
-
-    fn format_full(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("[START_KERNEL_COMPILATION]")?;
-
-        if let Some(name) = self.debug_name {
-            if name.len() <= 32 {
-                f.write_fmt(format_args!("\nname: {name}"))?;
-            } else {
-                let name = format_str(name, &[('<', '>')], false);
-                f.write_fmt(format_args!("\nname: {name}"))?;
-            }
-        }
-
-        if let Some(info) = &self.debug_info {
-            f.write_fmt(format_args!("\nid: {:#?}", info.id))?;
-        }
-
-        f.write_fmt(format_args!(
-            "
-source:
-```{}
-{}
-```
-[END_KERNEL_COMPILATION]
-",
-            self.debug_info
-                .as_ref()
-                .map(|info| info.lang_tag)
-                .unwrap_or(""),
-            self.source
-        ))
+    /// The kernel's own compiled source, for a hand-written kernel that
+    /// carries target-language text rather than IR to compile.
+    ///
+    /// `None`, the default, compiles what [`define`](Self::define) returns.
+    fn source(&self) -> Option<PrecompiledSource> {
+        None
     }
 }

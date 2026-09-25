@@ -31,7 +31,7 @@ where
 {
     #[cfg(all(feature = "cuda", feature = "autodiff"))]
     {
-        type CudaBare = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
+        type CudaBare = burn_cubecl::CubeBackend;
         if let Some(r) =
             crate::rope_cuda::rope_autodiff::<CudaBare>(x.clone(), cos.clone(), sin.clone())
         {

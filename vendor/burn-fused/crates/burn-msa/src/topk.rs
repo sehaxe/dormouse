@@ -44,7 +44,7 @@ fn argtopk3(x: Tensor<3>, k: usize, dim: usize) -> Tensor<3, Int> {
     // kind and still panic. Indices carry no gradient, so running bare is
     // numerically identical, and Int results stay valid on the caller's
     // backend.
-    let mut work = x.no_grad();
+    let mut work = x.detach();
     let mut parts: Vec<Tensor<3, Int>> = Vec::with_capacity(k);
     for _ in 0..k {
         // cubecl reduce ops return I32; burn's Int contract is i64, so cast
@@ -76,7 +76,7 @@ fn argtopk3_cuda(x: &Tensor<3>, k: usize) -> Option<Tensor<3, Int>> {
     use burn_cubecl::tensor::CubeTensor;
     use std::any::Any;
 
-    type CudaBare = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
+    type CudaBare = burn_cubecl::CubeBackend;
     let [b, s, nb] = x.dims();
     let n_rows = b * s;
     if n_rows == 0 || nb == 0 || k == 0 || k > nb {
@@ -90,10 +90,10 @@ fn argtopk3_cuda(x: &Tensor<3>, k: usize) -> Option<Tensor<3, Int>> {
     // indexing only ever sees a dense [n_rows, nb] buffer.
     let flat = x.clone().reshape::<1, _>([n_rows * nb]);
     let prim = flat.try_into_primitive::<CudaBare>().ok()?;
-    let xc = (&prim as &dyn Any).downcast_ref::<CubeTensor<cubecl::cuda::CudaRuntime>>()?;
+    let xc = (&prim as &dyn Any).downcast_ref::<CubeTensor>()?;
     let indices = Tensor::<1, Int>::empty([n_rows * k], &x.device());
     let ip = indices.clone().try_into_primitive::<CudaBare>().ok()?;
-    let ic = (&ip as &dyn Any).downcast_ref::<CubeTensor<cubecl::cuda::CudaRuntime>>()?;
+    let ic = (&ip as &dyn Any).downcast_ref::<CubeTensor>()?;
     let client = xc.client.clone();
     unsafe {
         crate::kernel::topk_select::launch_exp_free_topk(
@@ -248,7 +248,7 @@ mod tests {
     fn topk_autodiff_cuda_fallback_matches_host() {
         use burn::backend::autodiff::Autodiff;
 
-        type CudaBare = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
+        type CudaBare = burn_cubecl::CubeBackend;
         type CudaAd = Autodiff<CudaBare>;
 
         let adev = Device::default().autodiff();

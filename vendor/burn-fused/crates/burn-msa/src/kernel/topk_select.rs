@@ -111,7 +111,7 @@ fn exp_free_topk_kernel<F: Float>(
 /// The handles must reference buffers large enough for `n_rows * n_blocks`
 /// (scores) and `n_rows * topk` (indices) elements; lifetimes are not tracked.
 pub unsafe fn launch_exp_free_topk(
-    client: &ComputeClient<cubecl::cuda::CudaRuntime>,
+    client: &Client,
     scores_handle: &Handle,
     indices_handle: &Handle,
     n_rows: u32,
@@ -120,7 +120,7 @@ pub unsafe fn launch_exp_free_topk(
 ) {
     let cube_dim = CubeDim::new_3d(32, 1, 1);
     let cube_count = CubeCount::Static(n_rows, 1, 1);
-    exp_free_topk_kernel::launch_unchecked::<f32, cubecl::cuda::CudaRuntime>(
+    exp_free_topk_kernel::launch_unchecked::<f32>(
         client,
         cube_count,
         cube_dim,

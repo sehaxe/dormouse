@@ -50,7 +50,7 @@ where
 
         #[cfg(feature = "cuda")]
         {
-            type CudaBare = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
+            type CudaBare = burn_cubecl::CubeBackend;
             if std::any::TypeId::of::<B>() == std::any::TypeId::of::<CudaBare>() {
                 if let Some((dq, dk, dv)) = crate::sparse_kernel::msa_backward_cuda(
                     &q,
@@ -288,9 +288,9 @@ where
     let qa = q.try_into_primitive::<Autodiff<Inner>>().ok()?;
     let ka = k.try_into_primitive::<Autodiff<Inner>>().ok()?;
     let va = v.try_into_primitive::<Autodiff<Inner>>().ok()?;
-    let q_t = Tensor::from_primitive::<Inner>(qa.primitive.clone());
-    let k_t = Tensor::from_primitive::<Inner>(ka.primitive.clone());
-    let v_t = Tensor::from_primitive::<Inner>(va.primitive.clone());
+    let q_t = Tensor::from_primitive::<Inner>(qa.primitive().clone());
+    let k_t = Tensor::from_primitive::<Inner>(ka.primitive().clone());
+    let v_t = Tensor::from_primitive::<Inner>(va.primitive().clone());
     let bi_t: Tensor<4, Int> = {
         let prim = block_indices.clone().try_into_primitive::<Inner>().ok()?;
         let prim: <Inner as burn::backend::BackendTypes>::IntTensorPrimitive = prim;
@@ -303,7 +303,7 @@ where
     let (out_t, ba_t) = {
         #[cfg(feature = "cuda")]
         {
-            type CudaBare = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
+            type CudaBare = burn_cubecl::CubeBackend;
             if std::any::TypeId::of::<Inner>() == std::any::TypeId::of::<CudaBare>() {
                 if let Some((o, ba)) = crate::sparse_kernel::sparse_attn_cuda::<Inner>(
                     q_t.clone(),
@@ -338,7 +338,7 @@ where
 
     let out_prim = out_t.try_into_primitive::<Inner>().unwrap();
     let ba_prim = ba_t.try_into_primitive::<Inner>().unwrap();
-    let nodes = [qa.node.clone(), ka.node.clone(), va.node.clone()];
+    let nodes = [qa.node(), ka.node(), va.node()];
     let prep = SparseAttnOp.prepare::<NoCheckpointing>(nodes);
     let state = SparseAttnState {
         block_indices: bi_state,
@@ -372,7 +372,7 @@ mod ad_tests {
     use super::*;
     use burn::tensor::{Device, Distribution, Int, Tensor};
 
-    type CudaBare = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
+    type CudaBare = burn_cubecl::CubeBackend;
 
     fn to_host<const D: usize>(t: Tensor<D>) -> Vec<f32> {
         t.into_data()

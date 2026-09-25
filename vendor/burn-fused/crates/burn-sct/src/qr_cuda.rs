@@ -38,7 +38,7 @@ use std::any::Any;
 use std::any::TypeId;
 
 /// The bare (non-fusion) CUDA backend the kernels target.
-pub type CudaBare = CubeBackend<cubecl::cuda::CudaRuntime>;
+pub type CudaBare = CubeBackend;
 
 pub fn is_cuda<B: Backend>() -> bool {
     TypeId::of::<B>() == TypeId::of::<CudaBare>()
@@ -51,7 +51,7 @@ pub fn is_cuda<B: Backend>() -> bool {
 /// rows. Row-pitched buffers (cubecl pads 2D row widths to
 /// `next_pow2(width_bytes).clamp(16, 512)`, so a 300-wide row strides 384)
 /// are fine — the row stride is passed to the kernels as a comptime arg.
-pub fn cube_of<B: Backend>(t: &Tensor<2>) -> Option<CubeTensor<cubecl::cuda::CudaRuntime>>
+pub fn cube_of<B: Backend>(t: &Tensor<2>) -> Option<CubeTensor>
 where
     DispatchTensor: DispatchKindConversion<B>,
 {
@@ -59,7 +59,7 @@ where
         return None;
     }
     let prim = t.clone().try_into_primitive::<B>().ok()?;
-    let cube = (&prim as &dyn Any).downcast_ref::<CubeTensor<cubecl::cuda::CudaRuntime>>()?;
+    let cube = (&prim as &dyn Any).downcast_ref::<CubeTensor>()?;
     let shape = cube.meta.shape().dims::<2>();
     let strides = cube.meta.strides().to_vec();
     if strides[1] != 1 || (shape[0] > 1 && strides[0] < shape[1]) {
@@ -69,14 +69,14 @@ where
 }
 
 /// Row stride (elements) of a 2D tensor accepted by [`cube_of`].
-pub(crate) fn row_stride(cube: &CubeTensor<cubecl::cuda::CudaRuntime>) -> u32 {
+pub(crate) fn row_stride(cube: &CubeTensor) -> u32 {
     cube.meta.strides()[0] as u32
 }
 
 /// Like [`cube_of`] for an int tensor (counter buffers).
 pub fn cube_of_int<B: Backend>(
     t: &Tensor<2, burn::tensor::Int>,
-) -> Option<CubeTensor<cubecl::cuda::CudaRuntime>>
+) -> Option<CubeTensor>
 where
     DispatchTensor: DispatchKindConversion<B>,
 {
@@ -84,7 +84,7 @@ where
         return None;
     }
     let prim = t.clone().try_into_primitive::<B>().ok()?;
-    let cube = (&prim as &dyn Any).downcast_ref::<CubeTensor<cubecl::cuda::CudaRuntime>>()?;
+    let cube = (&prim as &dyn Any).downcast_ref::<CubeTensor>()?;
     Some(cube.clone())
 }
 
@@ -328,7 +328,7 @@ where
     let yc = cube_of::<B>(&y)?;
 
     unsafe {
-        sct_gemm_kernel::launch_unchecked::<f32, cubecl::cuda::CudaRuntime>(
+        sct_gemm_kernel::launch_unchecked::<f32>(
             &client,
             CubeCount::Static(b.div_ceil(16) as u32, k.div_ceil(16) as u32, 1),
             CubeDim::new_3d(16, 16, 1),
@@ -344,7 +344,7 @@ where
             row_stride(&uc),
             row_stride(&tc),
         );
-        sct_gemm_t_kernel::launch_unchecked::<f32, cubecl::cuda::CudaRuntime>(
+        sct_gemm_t_kernel::launch_unchecked::<f32>(
             &client,
             CubeCount::Static(b.div_ceil(16) as u32, n.div_ceil(16) as u32, 1),
             CubeDim::new_3d(16, 16, 1),
@@ -589,7 +589,7 @@ where
         row_stride(&q_cube),
     );
     unsafe {
-        sct_qr_qsolve_kernel::launch_unchecked::<f32, cubecl::cuda::CudaRuntime>(
+        sct_qr_qsolve_kernel::launch_unchecked::<f32>(
             &client,
             CubeCount::Static(1, m.div_ceil(256) as u32, 1),
             CubeDim::new_3d(1, 256, 1),

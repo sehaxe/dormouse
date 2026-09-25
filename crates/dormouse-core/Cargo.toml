@@ -5,10 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-burn = { version = "0.22.0-pre.3", default-features = false, features = ["std", "extension"] }
-burn-tensor = { version = "0.22.0-pre.3", default-features = false }
-burn-nn = { version = "0.22.0-pre.3", default-features = false }
-burn-cuda = { version = "0.22.0-pre.3", default-features = false, features = ["std"] }
+burn = { version = "0.22.0-pre.4", default-features = false, features = ["std", "extension"] }
+burn-tensor = { version = "0.22.0-pre.4", default-features = false }
+burn-nn = { version = "0.22.0-pre.4", default-features = false }
+burn-cuda = { version = "0.22.0-pre.4", default-features = false, features = ["std"] }
 burn-kda = { path = "../../vendor/burn-fused/crates/burn-kda" }
 burn-msa = { path = "../../vendor/burn-fused/crates/burn-msa" }
 burn-bitnet = { path = "../../vendor/burn-fused/crates/burn-bitnet" }
@@ -22,13 +22,13 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 # Already in the build graph via burn-cuda / burn-spectral(cuda); declared so
 # fused.rs can name CubeTensor and launch #[cube] kernels directly.
-burn-cubecl = { version = "0.22.0-pre.3", default-features = false, features = ["std"], optional = true }
-cubecl = { version = "0.11.0-pre.3", default-features = false, features = ["std", "cuda"], optional = true }
+burn-cubecl = { version = "0.22.0-pre.4", default-features = false, features = ["std"], optional = true }
+cubecl = { version = "0.11.0-pre.4", default-features = false, features = ["std", "cuda"], optional = true }
 # already compiled via burn-spectral(cuda); needed to block on client.sync()
 futures-lite = { version = "2", optional = true }
 
 [dev-dependencies]
-burn-ndarray = { version = "0.22.0-pre.3", features = ["blas-openblas"] }
+burn-ndarray = { version = "0.22.0-pre.4", features = ["blas-openblas"] }
 
 [features]
 default = ["std"]

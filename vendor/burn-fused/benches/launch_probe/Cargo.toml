@@ -5,5 +5,6 @@ edition = "2021"
 publish = false
 [dependencies]
 burn = { workspace = true, features = ["std", "cuda"] }
+cubecl-runtime = { version = "0.11.0-pre.4", default-features = false }
 cubecl = { workspace = true, features = ["std", "cuda"] }
 burn-cubecl = { workspace = true, features = ["std"] }

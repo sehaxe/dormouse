@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 /// Amount of memory in use by this allocator
 /// and statistics on how much memory is reserved and
 /// wasted in total.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MemoryUsage {
     /// The number of allocations currently active.
     ///
@@ -40,7 +40,8 @@ impl MemoryUsage {
 }
 
 #[derive(new)]
-pub(crate) struct BytesFormat {
+#[doc(hidden)]
+pub struct BytesFormat {
     bytes: u64,
 }
 
@@ -96,7 +97,7 @@ impl core::fmt::Display for MemoryUsage {
 
 /// The pool shape a [`MemoryPoolReport`] describes, carrying the pool's
 /// effective configuration (after alignment rounding and page-size shrinking).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MemoryPoolKind {
     /// Allocations are slices carved from shared pages.
     Sliced {
@@ -123,7 +124,7 @@ pub enum MemoryPoolKind {
 
 /// A structured snapshot of one memory pool: its shape, its current usage, and
 /// the high-water marks a memory plan is derived from.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MemoryPoolReport {
     /// The pool's shape and effective configuration.
     pub kind: MemoryPoolKind,
@@ -149,7 +150,7 @@ pub struct MemoryPoolReport {
     pub largest_alloc: u64,
 }
 
-/// A per-pool report of one [`MemoryManagement`](super::MemoryManagement)
+/// A per-pool report of one `MemoryManagement` (in `cubecl-server`)
 /// instance — the read side of a measured memory plan.
 ///
 /// The intended cycle: install a growable layout, run the workload once under
@@ -161,16 +162,31 @@ pub struct MemoryPoolReport {
 /// A tuning pass inside the measured run allocates too, and its scratch counts
 /// toward these marks like anything else. Warming the tune caches in an
 /// earlier pass and rebuilding the pools
-/// ([`install_pools`](super::MemoryManagement::install_pools), which resets the
+/// (`MemoryManagement::install_pools`, which resets the
 /// marks)
 /// before the measured one leaves the peaks to the workload alone.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MemoryReport {
     /// One entry per dynamic pool, in allocation-routing order — the same
     /// order the layout was configured with.
     pub dynamic: Vec<MemoryPoolReport>,
     /// The persistent pool (weights, caches; explicit persistent windows).
     pub persistent: MemoryPoolReport,
+}
+
+/// A [`MemoryReport`] as the environment records it: a snapshot of one
+/// stream's pools at a moment the caller named, written by
+/// [`Client::record_memory`](crate::client::Client::record_memory).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MemoryRecord {
+    /// What the caller was doing: `model loaded`, `after the dry run`.
+    pub label: alloc::string::String,
+    /// The pools at that moment.
+    pub report: MemoryReport,
+}
+
+impl cubecl_environment::records::Record for MemoryRecord {
+    const KIND: &'static str = "memory";
 }
 
 /// The managed tensor buffer handle that points to some memory segment.

@@ -295,14 +295,30 @@ where
     burn::tensor::DispatchTensor: burn::backend::DispatchKindConversion<B>,
 {
     use burn_cubecl::tensor::CubeTensor;
-    let cube = |t: &Tensor<4>| -> Option<CubeTensor<cubecl::cuda::CudaRuntime>> {
+    // ponytail: DISABLED on the 0.22.0-pre.4 / cubecl 0.11.0-pre.4 stack
+    // (pre4-migration). The kernel's memory contract is "every operand is a
+    // dense row-major buffer" (see dense4/empty_dense4), which pre.3's
+    // reshape guaranteed by materializing copies of non-contiguous inputs.
+    // On pre.4 the reshape/view semantics changed (cubecl #5528/#5670 moved
+    // the runtime into the device value and reworked tensor views), and the
+    // contract no longer holds: two back-to-back forwards poison the CUDA
+    // context with gather reads up to 11.5 GB out of bounds
+    // (compute-sanitizer: gather_kernel_t_f32_i_i64 OOB; minimal repro:
+    // crates/burn-msa/examples/msa_repro.rs — pass 1 dies, pass 0 is clean).
+    // The tensor-op fallback below is correctness-guaranteed; re-enable the
+    // fused path only after the kernel is rewritten against pre.4 views and
+    // re-verified with compute-sanitizer on a two-forward run.
+    if std::env::var("DM_MSA_FUSED").is_err() {
+        return None;
+    }
+    let cube = |t: &Tensor<4>| -> Option<CubeTensor> {
         let prim = t.clone().try_into_primitive::<B>().ok()?;
-        let c = (&prim as &dyn Any).downcast_ref::<CubeTensor<cubecl::cuda::CudaRuntime>>()?;
+        let c = (&prim as &dyn Any).downcast_ref::<CubeTensor>()?;
         Some(c.clone())
     };
-    let cubei = |t: &Tensor<4, Int>| -> Option<CubeTensor<cubecl::cuda::CudaRuntime>> {
+    let cubei = |t: &Tensor<4, Int>| -> Option<CubeTensor> {
         let prim = t.clone().try_into_primitive::<B>().ok()?;
-        let c = (&prim as &dyn Any).downcast_ref::<CubeTensor<cubecl::cuda::CudaRuntime>>()?;
+        let c = (&prim as &dyn Any).downcast_ref::<CubeTensor>()?;
         Some(c.clone())
     };
     let q = dense4(q.clone());
@@ -339,7 +355,7 @@ where
     let cube_dim = CubeDim::new_3d(qpkv as u32, 1, 1);
     let cube_count = CubeCount::Static((batch * n_heads_kv) as u32, seq_q as u32, 1);
     unsafe {
-        msa_backward_kernel::launch_unchecked::<f32, cubecl::cuda::CudaRuntime>(
+        msa_backward_kernel::launch_unchecked::<f32>(
             &client,
             cube_count,
             cube_dim,
@@ -383,14 +399,30 @@ where
     burn::tensor::DispatchTensor: burn::backend::DispatchKindConversion<B>,
 {
     use burn_cubecl::tensor::CubeTensor;
-    let cube = |t: &Tensor<4>| -> Option<CubeTensor<cubecl::cuda::CudaRuntime>> {
+    // ponytail: DISABLED on the 0.22.0-pre.4 / cubecl 0.11.0-pre.4 stack
+    // (pre4-migration). The kernel's memory contract is "every operand is a
+    // dense row-major buffer" (see dense4/empty_dense4), which pre.3's
+    // reshape guaranteed by materializing copies of non-contiguous inputs.
+    // On pre.4 the reshape/view semantics changed (cubecl #5528/#5670 moved
+    // the runtime into the device value and reworked tensor views), and the
+    // contract no longer holds: two back-to-back forwards poison the CUDA
+    // context with gather reads up to 11.5 GB out of bounds
+    // (compute-sanitizer: gather_kernel_t_f32_i_i64 OOB; minimal repro:
+    // crates/burn-msa/examples/msa_repro.rs — pass 1 dies, pass 0 is clean).
+    // The tensor-op fallback below is correctness-guaranteed; re-enable the
+    // fused path only after the kernel is rewritten against pre.4 views and
+    // re-verified with compute-sanitizer on a two-forward run.
+    if std::env::var("DM_MSA_FUSED").is_err() {
+        return None;
+    }
+    let cube = |t: &Tensor<4>| -> Option<CubeTensor> {
         let prim = t.clone().try_into_primitive::<B>().ok()?;
-        let c = (&prim as &dyn Any).downcast_ref::<CubeTensor<cubecl::cuda::CudaRuntime>>()?;
+        let c = (&prim as &dyn Any).downcast_ref::<CubeTensor>()?;
         Some(c.clone())
     };
-    let cubei = |t: &Tensor<4, Int>| -> Option<CubeTensor<cubecl::cuda::CudaRuntime>> {
+    let cubei = |t: &Tensor<4, Int>| -> Option<CubeTensor> {
         let prim = t.clone().try_into_primitive::<B>().ok()?;
-        let c = (&prim as &dyn Any).downcast_ref::<CubeTensor<cubecl::cuda::CudaRuntime>>()?;
+        let c = (&prim as &dyn Any).downcast_ref::<CubeTensor>()?;
         Some(c.clone())
     };
     let q = dense4(q);
@@ -429,7 +461,7 @@ where
     let cube_dim = CubeDim::new_3d(qpkv as u32, 1, 1);
     let cube_count = CubeCount::Static((batch * n_heads_kv) as u32, seq_q as u32, 1);
     unsafe {
-        msa_sparse_attn_kernel::launch_unchecked::<f32, cubecl::cuda::CudaRuntime>(
+        msa_sparse_attn_kernel::launch_unchecked::<f32>(
             &client,
             cube_count,
             cube_dim,
@@ -461,7 +493,7 @@ mod tests {
     use crate::attention::sparse_attn_batched_gqa;
     use burn::tensor::{Device, Distribution, Tensor, TensorData};
     use burn_cubecl::CubeBackend;
-    type Cuda = CubeBackend<cubecl::cuda::CudaRuntime>;
+    type Cuda = CubeBackend;
 
     #[test]
     #[ignore]
@@ -837,7 +869,7 @@ mod dtype_probe {
         );
         let prim = bi.clone().try_into_primitive::<burn_cuda::Cuda>().unwrap();
         let c = (&prim as &dyn std::any::Any)
-            .downcast_ref::<burn_cubecl::tensor::CubeTensor<cubecl::cuda::CudaRuntime>>()
+            .downcast_ref::<burn_cubecl::tensor::CubeTensor>()
             .unwrap();
         println!(
             "int dtype: {:?}, bytes for 4 elems: {:?}",

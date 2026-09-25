@@ -102,7 +102,7 @@ thread_local! {
 /// Buffer dump for the gradcheck bisect test; compiles to nothing outside
 /// `cfg(test)` (the sync-ing read would perturb the measured pipeline).
 #[cfg(test)]
-fn dump(client: &ComputeClient<Cuda>, name: &'static str, c: &CubeTensor, n: usize) {
+fn dump(client: &Client, name: &'static str, c: &CubeTensor, n: usize) {
     if std::env::var("DM_FUSED_BWD_DEBUG").is_ok() {
         let bytes = client.read(vec![c.handle.clone()]).remove(0);
         // cubecl rounds allocations up (pow2 buckets): truncate to the
@@ -115,7 +115,7 @@ fn dump(client: &ComputeClient<Cuda>, name: &'static str, c: &CubeTensor, n: usi
 }
 
 #[cfg(not(test))]
-fn dump(_client: &ComputeClient<Cuda>, _name: &'static str, _c: &CubeTensor, _n: usize) {}
+fn dump(_client: &Client, _name: &'static str, _c: &CubeTensor, _n: usize) {}
 
 /// One reverse iteration's arms adjoint, computed on a small inner Autodiff
 /// graph (see `arms_inner_adjoint`).
@@ -349,7 +349,7 @@ pub(super) fn ponder_backward(
     // grad (the outside CE loss's backward already produced softmax−onehot).
     let dlf = alloc(bt * v);
     unsafe {
-        super::kernels::copy_kernel::launch_unchecked::<f32, Cuda>(
+        super::kernels::copy_kernel::launch_unchecked::<f32>(
             &client,
             ew_cubes(bt * v),
             EW,
@@ -366,7 +366,7 @@ pub(super) fn ponder_backward(
     launch_mm(&client, &dlf, &st.lm.v, &st.lm.s, &st.lm.mv, &dm_lf, bt, v, r, v, 1, r, 1, bt * v, v * r, false, false, true, false, false);
     let dz_lf = alloc(bt * r);
     unsafe {
-        super::kernels::col_scale_kernel::launch_unchecked::<f32, Cuda>(
+        super::kernels::col_scale_kernel::launch_unchecked::<f32>(
             &client, ew_cubes(bt * r), EW,
             buf!(dm_lf, bt * r), buf!(st.lm.s, r), buf!(dz_lf, bt * r),
             r as u32, (bt * r) as u32,
@@ -378,7 +378,7 @@ pub(super) fn ponder_backward(
     launch_mm(&client, &dlf, &st.zlf, &one, &one, &dvl_raw, v, bt, r, v, 1, r, 1, bt * v, bt * r, true, false, false, false, false);
     let dsl = alloc(r);
     unsafe {
-        super::kernels::sum_ds_kernel::launch_unchecked::<f32, Cuda>(
+        super::kernels::sum_ds_kernel::launch_unchecked::<f32>(
             &client, CubeCount::Static(1, 1, 1), UNITS,
             buf!(dm_lf, bt * r), buf!(st.zlf, bt * r), buf!(dsl, r),
             bt as u32, r as u32, false,
@@ -395,12 +395,12 @@ pub(super) fn ponder_backward(
     {
         let dhf_up = alloc(bt * d);
         unsafe {
-            super::kernels::copy_kernel::launch_unchecked::<f32, Cuda>(
+            super::kernels::copy_kernel::launch_unchecked::<f32>(
                 &client, ew_cubes(bt * d), EW,
                 buf!(gc, off_oa + bt * d), buf!(dhf_up, bt * d),
                 (off_oa + bt * d) as u32, 0u32, (bt * d) as u32,
             );
-            super::kernels::add_kernel::launch_unchecked::<f32, Cuda>(
+            super::kernels::add_kernel::launch_unchecked::<f32>(
                 &client, ew_cubes(bt * d), EW,
                 buf!(dpre, bt * d), buf!(dhf_up, bt * d), (bt * d) as u32,
             );
@@ -409,7 +409,7 @@ pub(super) fn ponder_backward(
     // final RMSNorm backward: dOut_acc (the readout input is out_acc)
     let dgf = alloc(d);
     unsafe {
-        super::kernels::dg_kernel::launch_unchecked::<f32, Cuda>(
+        super::kernels::dg_kernel::launch_unchecked::<f32>(
             &client, CubeCount::Static(1, 1, 1), UNITS,
             buf!(dpre, bt * d), buf!(st.oa, bt * d), buf!(st.invf, bt),
             buf!(dgf, d),
@@ -418,7 +418,7 @@ pub(super) fn ponder_backward(
     }
     let dout_acc = zeros_raw(&dev, &client, bt * d);
     unsafe {
-        super::kernels::rms_bwd_kernel::launch_unchecked::<f32, Cuda>(
+        super::kernels::rms_bwd_kernel::launch_unchecked::<f32>(
             &client,
             CubeCount::Static(bt as u32, 1, 1),
             UNITS,
@@ -431,12 +431,12 @@ pub(super) fn ponder_backward(
         );
         // d(out_acc) from the aux heads (JEPA student latent + KoLeo)
         let doa_up = alloc(bt * d);
-        super::kernels::copy_kernel::launch_unchecked::<f32, Cuda>(
+        super::kernels::copy_kernel::launch_unchecked::<f32>(
             &client, ew_cubes(bt * d), EW,
             buf!(gc, off_oa), buf!(doa_up, bt * d),
             off_oa as u32, 0u32, (bt * d) as u32,
         );
-        super::kernels::add_kernel::launch_unchecked::<f32, Cuda>(
+        super::kernels::add_kernel::launch_unchecked::<f32>(
             &client, ew_cubes(bt * d), EW,
             buf!(dout_acc, bt * d), buf!(doa_up, bt * d), (bt * d) as u32,
         );
@@ -465,7 +465,7 @@ pub(super) fn ponder_backward(
         // dot_n[b] = Σ_{t,d} dOut_acc·step_out_n (the out_acc halting path)
         let dot = zeros_raw(&dev, &client, b);
         unsafe {
-            super::kernels::dlam_outacc_kernel::launch_unchecked::<f32, Cuda>(
+            super::kernels::dlam_outacc_kernel::launch_unchecked::<f32>(
                 &client,
                 CubeCount::Static(b as u32, 1, 1),
                 UNITS,
@@ -482,7 +482,7 @@ pub(super) fn ponder_backward(
         // per-step CE: dLogits_n (drec from gc[0], p_n as the row weight)
         let dlogits = alloc(bt * v);
         unsafe {
-            super::kernels::dlogits_kernel::launch_unchecked::<f32, Cuda>(
+            super::kernels::dlogits_kernel::launch_unchecked::<f32>(
                 &client,
                 CubeCount::Static(bt as u32, 1, 1),
                 UNITS,
@@ -504,7 +504,7 @@ pub(super) fn ponder_backward(
         launch_mm(&client, &dlogits, &st.lm.v, &st.lm.s, &st.lm.mv, &dm_l, bt, v, r, v, 1, r, 1, bt * v, v * r, false, false, true, false, false);
         let dz_l = alloc(bt * r);
         unsafe {
-            super::kernels::col_scale_kernel::launch_unchecked::<f32, Cuda>(
+            super::kernels::col_scale_kernel::launch_unchecked::<f32>(
                 &client, ew_cubes(bt * r), EW,
                 buf!(dm_l, bt * r), buf!(st.lm.s, r), buf!(dz_l, bt * r),
                 r as u32, (bt * r) as u32,
@@ -515,7 +515,7 @@ pub(super) fn ponder_backward(
         launch_mm(&client, &pi.step_out, &dz_l, &one, &one, &dul, d, bt, r, d, 1, r, 1, bt * d, bt * r, true, false, false, false, true);
         launch_mm(&client, &dlogits, &pi.z_l, &one, &one, &dvl_raw, v, bt, r, v, 1, r, 1, bt * v, bt * r, true, false, false, false, true);
         unsafe {
-            super::kernels::sum_ds_kernel::launch_unchecked::<f32, Cuda>(
+            super::kernels::sum_ds_kernel::launch_unchecked::<f32>(
                 &client, CubeCount::Static(1, 1, 1), UNITS,
                 buf!(dm_l, bt * r), buf!(pi.z_l, bt * r), buf!(dsl, r),
                 bt as u32, r as u32, true,
@@ -525,7 +525,7 @@ pub(super) fn ponder_backward(
         let dstep = alloc(bt * d);
         launch_mm(&client, &dz_l, &st.lm.u, &one, &st.lm.mu, &dstep, bt, r, d, r, 1, r, 1, bt * r, d * r, false, true, true, false, false);
         unsafe {
-            super::kernels::dso_kernel::launch_unchecked::<f32, Cuda>(
+            super::kernels::dso_kernel::launch_unchecked::<f32>(
                 &client, ew_cubes(bt * d), EW,
                 buf!(dout_acc, bt * d),
                 buf!(pi.p, b),
@@ -542,7 +542,7 @@ pub(super) fn ponder_backward(
         launch_mm(&client, &dstep, &st.op.v, &st.op.s, &st.op.mv, &dmo, bt, d, r, d, 1, r, 1, bt * d, d * r, false, false, true, false, false);
         let dz_o = alloc(bt * r);
         unsafe {
-            super::kernels::col_scale_kernel::launch_unchecked::<f32, Cuda>(
+            super::kernels::col_scale_kernel::launch_unchecked::<f32>(
                 &client, ew_cubes(bt * r), EW,
                 buf!(dmo, bt * r), buf!(st.op.s, r), buf!(dz_o, bt * r),
                 r as u32, (bt * r) as u32,
@@ -558,7 +558,7 @@ pub(super) fn ponder_backward(
             out[p_op + 1] = Some(alloc(r));
         }
         unsafe {
-            super::kernels::sum_ds_kernel::launch_unchecked::<f32, Cuda>(
+            super::kernels::sum_ds_kernel::launch_unchecked::<f32>(
                 &client, CubeCount::Static(1, 1, 1), UNITS,
                 buf!(dmo, bt * r), buf!(pi.z_o, bt * r),
                 buf!(out[p_op + 1].as_ref().unwrap(), r),
@@ -570,7 +570,7 @@ pub(super) fn ponder_backward(
         // the next-lower iteration consumes this iteration's input grad
         if let Some(carry) = dx_carry.take() {
             unsafe {
-                super::kernels::add_kernel::launch_unchecked::<f32, Cuda>(
+                super::kernels::add_kernel::launch_unchecked::<f32>(
                     &client, ew_cubes(bt * d), EW,
                     buf!(dh_flat, bt * d),
                     buf!(carry, bt * d),
@@ -586,7 +586,7 @@ pub(super) fn ponder_backward(
         let drs_part = alloc(bt);
         let dwffn_part = alloc(bt);
         unsafe {
-            super::kernels::residual_bwd_kernel::launch_unchecked::<f32, Cuda>(
+            super::kernels::residual_bwd_kernel::launch_unchecked::<f32>(
                 &client,
                 CubeCount::Static(bt as u32, 1, 1),
                 UNITS,
@@ -605,7 +605,7 @@ pub(super) fn ponder_backward(
             out[4] = Some(alloc(1));
         }
         unsafe {
-            super::kernels::sum_part_kernel::launch_unchecked::<f32, Cuda>(
+            super::kernels::sum_part_kernel::launch_unchecked::<f32>(
                 &client, CubeCount::Static(1, 1, 1), UNITS,
                 buf!(drs_part, bt),
                 buf!(out[4].as_ref().unwrap(), 1),
@@ -617,7 +617,7 @@ pub(super) fn ponder_backward(
         let dffn = alloc(bt * d);
         let draw = zeros_raw(&dev, &client, bt * pad);
         unsafe {
-            super::kernels::ffnrow_bwd_kernel::launch_unchecked::<f32, Cuda>(
+            super::kernels::ffnrow_bwd_kernel::launch_unchecked::<f32>(
                 &client,
                 CubeCount::Static(bt as u32, 1, 1),
                 UNITS,
@@ -641,7 +641,7 @@ pub(super) fn ponder_backward(
             let [gu, dn] = &st.experts[e];
             let wsc = &pi.ws[e];
             unsafe {
-                super::kernels::dblend_kernel::launch_unchecked::<f32, Cuda>(
+                super::kernels::dblend_kernel::launch_unchecked::<f32>(
                     &client,
                     CubeCount::Static(bt as u32, 1, 1),
                     UNITS,
@@ -660,7 +660,7 @@ pub(super) fn ponder_backward(
             launch_mm(&client, &dout_e, &dn.v, &dn.s, &dn.mv, &dm_d, bt, d, r, d, 1, r, 1, bt * d, d * r, false, false, true, false, false);
             let dz_d = alloc(bt * r);
             unsafe {
-                super::kernels::col_scale_kernel::launch_unchecked::<f32, Cuda>(
+                super::kernels::col_scale_kernel::launch_unchecked::<f32>(
                     &client, ew_cubes(bt * r), EW,
                     buf!(dm_d, bt * r), buf!(dn.s, r), buf!(dz_d, bt * r),
                     r as u32, (bt * r) as u32,
@@ -676,7 +676,7 @@ pub(super) fn ponder_backward(
                 out[10 + 6 * e] = Some(alloc(r));
             }
             unsafe {
-                super::kernels::sum_ds_kernel::launch_unchecked::<f32, Cuda>(
+                super::kernels::sum_ds_kernel::launch_unchecked::<f32>(
                     &client, CubeCount::Static(1, 1, 1), UNITS,
                     buf!(dm_d, bt * r), buf!(wsc[3], bt * r),
                     buf!(out[10 + 6 * e].as_ref().unwrap(), r),
@@ -686,7 +686,7 @@ pub(super) fn ponder_backward(
             let dsil = alloc(bt * f);
             launch_mm(&client, &dz_d, &dn.u, &one, &dn.mu, &dsil, bt, r, f, r, 1, r, 1, bt * r, f * r, false, true, true, false, false);
             unsafe {
-                super::kernels::silu_bwd_kernel::launch_unchecked::<f32, Cuda>(
+                super::kernels::silu_bwd_kernel::launch_unchecked::<f32>(
                     &client, ew_cubes(bt * f), EW,
                     buf!(wsc[1], bt * f), buf!(dsil, bt * f), buf!(da2, bt * f),
                     (bt * f) as u32,
@@ -698,7 +698,7 @@ pub(super) fn ponder_backward(
             launch_mm(&client, &da2, &gu.v, &gu.s, &gu.mv, &dm_e, bt, f, r, f, 1, r, 1, bt * f, f * r, false, false, true, false, false);
             let dz_e = alloc(bt * r);
             unsafe {
-                super::kernels::col_scale_kernel::launch_unchecked::<f32, Cuda>(
+                super::kernels::col_scale_kernel::launch_unchecked::<f32>(
                     &client, ew_cubes(bt * r), EW,
                     buf!(dm_e, bt * r), buf!(gu.s, r), buf!(dz_e, bt * r),
                     r as u32, (bt * r) as u32,
@@ -714,7 +714,7 @@ pub(super) fn ponder_backward(
                 out[7 + 6 * e] = Some(alloc(r));
             }
             unsafe {
-                super::kernels::sum_ds_kernel::launch_unchecked::<f32, Cuda>(
+                super::kernels::sum_ds_kernel::launch_unchecked::<f32>(
                     &client, CubeCount::Static(1, 1, 1), UNITS,
                     buf!(dm_e, bt * r), buf!(wsc[0], bt * r),
                     buf!(out[7 + 6 * e].as_ref().unwrap(), r),
@@ -730,7 +730,7 @@ pub(super) fn ponder_backward(
         // Wc is stored [2d, pad] (burn Linear Col layout): dWc = ctrl_inᵀ·draw,
         // dctrl = draw·Wcᵀ.
         unsafe {
-            super::kernels::softmax_bwd_kernel::launch_unchecked::<f32, Cuda>(
+            super::kernels::softmax_bwd_kernel::launch_unchecked::<f32>(
                 &client,
                 CubeCount::Static(bt as u32, 1, 1),
                 UNITS,
@@ -753,7 +753,7 @@ pub(super) fn ponder_backward(
         let dhaltpre = alloc(b);
         let g_cur = alloc(b);
         unsafe {
-            super::kernels::lam_bwd_kernel::launch_unchecked::<f32, Cuda>(
+            super::kernels::lam_bwd_kernel::launch_unchecked::<f32>(
                 &client,
                 CubeCount::Static(1, 1, 1),
                 UNITS,
@@ -785,7 +785,7 @@ pub(super) fn ponder_backward(
         let dhalt_in = alloc(b * d);
         launch_mm(&client, &dhaltpre, &st.wh, &one, &one, &dhalt_in, b, 1, d, 1, 1, d, 1, b, d, false, false, false, false, false);
         unsafe {
-            super::kernels::haltmean_bwd_kernel::launch_unchecked::<f32, Cuda>(
+            super::kernels::haltmean_bwd_kernel::launch_unchecked::<f32>(
                 &client,
                 CubeCount::Static(b as u32, 1, 1),
                 UNITS,
@@ -801,13 +801,13 @@ pub(super) fn ponder_backward(
             out[2] = Some(alloc(d));
         }
         unsafe {
-            super::kernels::dg_kernel::launch_unchecked::<f32, Cuda>(
+            super::kernels::dg_kernel::launch_unchecked::<f32>(
                 &client, CubeCount::Static(1, 1, 1), UNITS,
                 buf!(dx, bt * d), buf!(pi.h_ctx, bt * d), buf!(pi.inv, bt),
                 buf!(out[2].as_ref().unwrap(), d),
                 bt as u32, d as u32, acc,
             );
-            super::kernels::rms_bwd_kernel::launch_unchecked::<f32, Cuda>(
+            super::kernels::rms_bwd_kernel::launch_unchecked::<f32>(
                 &client,
                 CubeCount::Static(bt as u32, 1, 1),
                 UNITS,
@@ -826,7 +826,7 @@ pub(super) fn ponder_backward(
         // in dh_ctx and becomes the carry into iteration n-1 (h_ctx_n =
         // h_{n-1} + ie_n is an identity wrt h_{n-1}).
         unsafe {
-            super::kernels::cat_bwd_kernel::launch_unchecked::<f32, Cuda>(
+            super::kernels::cat_bwd_kernel::launch_unchecked::<f32>(
                 &client, ew_cubes(bt * d), EW,
                 buf!(dctrl, bt * 2 * d),
                 buf!(dh_ctx, bt * d),
@@ -838,7 +838,7 @@ pub(super) fn ponder_backward(
         if n == 0 {
             // h_ctx_0 = x + ie_0: the loop input also inherits dh_ctx_0
             unsafe {
-                super::kernels::add_kernel::launch_unchecked::<f32, Cuda>(
+                super::kernels::add_kernel::launch_unchecked::<f32>(
                     &client, ew_cubes(bt * d), EW,
                     buf!(dxg, bt * d),
                     buf!(dh_ctx, bt * d),
@@ -856,7 +856,7 @@ pub(super) fn ponder_backward(
             out[3] = Some(alloc(n_iter * d));
         }
         unsafe {
-            super::kernels::ie_grad_kernel::launch_unchecked::<f32, Cuda>(
+            super::kernels::ie_grad_kernel::launch_unchecked::<f32>(
                 &client, CubeCount::Static(1, 1, 1), UNITS,
                 buf!(dh_ctx, bt * d),
                 buf!(out[3].as_ref().unwrap(), n_iter * d),
@@ -869,7 +869,7 @@ pub(super) fn ponder_backward(
     }
     // finish the lm_head dV column scale (raw accumulator -> master grad)
     unsafe {
-        super::kernels::col_scale_kernel::launch_unchecked::<f32, Cuda>(
+        super::kernels::col_scale_kernel::launch_unchecked::<f32>(
             &client, ew_cubes(v * r), EW,
             buf!(dvl_raw, v * r), buf!(st.lm.s, r), buf!(dvl, v * r),
             r as u32, (v * r) as u32,
@@ -880,7 +880,7 @@ pub(super) fn ponder_backward(
     {
         let dv_o = alloc(d * r);
         unsafe {
-            super::kernels::col_scale_kernel::launch_unchecked::<f32, Cuda>(
+            super::kernels::col_scale_kernel::launch_unchecked::<f32>(
                 &client, ew_cubes(d * r), EW,
                 buf!(out[p_op + 2].as_ref().unwrap(), d * r), buf!(st.op.s, r), buf!(dv_o, d * r),
                 r as u32, (d * r) as u32,
@@ -894,7 +894,7 @@ pub(super) fn ponder_backward(
         let [gu, dn] = &st.experts[e];
         let dv_e = alloc(f * r);
         unsafe {
-            super::kernels::col_scale_kernel::launch_unchecked::<f32, Cuda>(
+            super::kernels::col_scale_kernel::launch_unchecked::<f32>(
                 &client, ew_cubes(f * r), EW,
                 buf!(out[8 + 6 * e].as_ref().unwrap(), f * r), buf!(gu.s, r), buf!(dv_e, f * r),
                 r as u32, (f * r) as u32,
@@ -903,7 +903,7 @@ pub(super) fn ponder_backward(
         out[8 + 6 * e] = Some(dv_e);
         let dv_d = alloc(d * r);
         unsafe {
-            super::kernels::col_scale_kernel::launch_unchecked::<f32, Cuda>(
+            super::kernels::col_scale_kernel::launch_unchecked::<f32>(
                 &client, ew_cubes(d * r), EW,
                 buf!(out[11 + 6 * e].as_ref().unwrap(), d * r), buf!(dn.s, r), buf!(dv_d, d * r),
                 r as u32, (d * r) as u32,
@@ -1098,7 +1098,7 @@ pub(super) fn ponder_backward_arms_direct(
     // final readout (same as base)
     let dlf = alloc(bt * v);
     unsafe {
-        super::kernels::copy_kernel::launch_unchecked::<f32, Cuda>(
+        super::kernels::copy_kernel::launch_unchecked::<f32>(
             &client,
             ew_cubes(bt * v),
             EW,
@@ -1113,7 +1113,7 @@ pub(super) fn ponder_backward_arms_direct(
     launch_mm(&client, &dlf, &base.lm.v, &base.lm.s, &base.lm.mv, &dm_lf, bt, v, r, v, 1, r, 1, bt * v, v * r, false, false, true, false, false);
     let dz_lf = alloc(bt * r);
     unsafe {
-        super::kernels::col_scale_kernel::launch_unchecked::<f32, Cuda>(
+        super::kernels::col_scale_kernel::launch_unchecked::<f32>(
             &client, ew_cubes(bt * r), EW,
             buf!(dm_lf, bt * r), buf!(base.lm.s, r), buf!(dz_lf, bt * r),
             r as u32, (bt * r) as u32,
@@ -1125,7 +1125,7 @@ pub(super) fn ponder_backward_arms_direct(
     launch_mm(&client, &dlf, &base.zlf, &one, &one, &dvl_raw, v, bt, r, v, 1, r, 1, bt * v, bt * r, true, false, false, false, false);
     let dsl = alloc(r);
     unsafe {
-        super::kernels::sum_ds_kernel::launch_unchecked::<f32, Cuda>(
+        super::kernels::sum_ds_kernel::launch_unchecked::<f32>(
             &client, CubeCount::Static(1, 1, 1), UNITS,
             buf!(dm_lf, bt * r), buf!(base.zlf, bt * r), buf!(dsl, r),
             bt as u32, r as u32, false,
@@ -1139,12 +1139,12 @@ pub(super) fn ponder_backward_arms_direct(
     {
         let dhf_up = alloc(bt * d);
         unsafe {
-            super::kernels::copy_kernel::launch_unchecked::<f32, Cuda>(
+            super::kernels::copy_kernel::launch_unchecked::<f32>(
                 &client, ew_cubes(bt * d), EW,
                 buf!(gc, off_oa + bt * d), buf!(dhf_up, bt * d),
                 (off_oa + bt * d) as u32, 0u32, (bt * d) as u32,
             );
-            super::kernels::add_kernel::launch_unchecked::<f32, Cuda>(
+            super::kernels::add_kernel::launch_unchecked::<f32>(
                 &client, ew_cubes(bt * d), EW,
                 buf!(dpre, bt * d), buf!(dhf_up, bt * d), (bt * d) as u32,
             );
@@ -1152,7 +1152,7 @@ pub(super) fn ponder_backward_arms_direct(
     }
     let dgf = alloc(d);
     unsafe {
-        super::kernels::dg_kernel::launch_unchecked::<f32, Cuda>(
+        super::kernels::dg_kernel::launch_unchecked::<f32>(
             &client, CubeCount::Static(1, 1, 1), UNITS,
             buf!(dpre, bt * d), buf!(base.oa, bt * d), buf!(base.invf, bt),
             buf!(dgf, d),
@@ -1161,7 +1161,7 @@ pub(super) fn ponder_backward_arms_direct(
     }
     let dout_acc = zeros_raw(&dev, &client, bt * d);
     unsafe {
-        super::kernels::rms_bwd_kernel::launch_unchecked::<f32, Cuda>(
+        super::kernels::rms_bwd_kernel::launch_unchecked::<f32>(
             &client,
             CubeCount::Static(bt as u32, 1, 1),
             UNITS,
@@ -1174,12 +1174,12 @@ pub(super) fn ponder_backward_arms_direct(
         );
         // d(out_acc) from the aux heads (JEPA student latent + KoLeo)
         let doa_up = alloc(bt * d);
-        super::kernels::copy_kernel::launch_unchecked::<f32, Cuda>(
+        super::kernels::copy_kernel::launch_unchecked::<f32>(
             &client, ew_cubes(bt * d), EW,
             buf!(gc, off_oa), buf!(doa_up, bt * d),
             off_oa as u32, 0u32, (bt * d) as u32,
         );
-        super::kernels::add_kernel::launch_unchecked::<f32, Cuda>(
+        super::kernels::add_kernel::launch_unchecked::<f32>(
             &client, ew_cubes(bt * d), EW,
             buf!(dout_acc, bt * d), buf!(doa_up, bt * d), (bt * d) as u32,
         );
@@ -1221,7 +1221,7 @@ pub(super) fn ponder_backward_arms_direct(
         let acc = accum(n);
         let dot = zeros_raw(&dev, &client, b);
         unsafe {
-            super::kernels::dlam_outacc_kernel::launch_unchecked::<f32, Cuda>(
+            super::kernels::dlam_outacc_kernel::launch_unchecked::<f32>(
                 &client,
                 CubeCount::Static(b as u32, 1, 1),
                 UNITS,
@@ -1235,7 +1235,7 @@ pub(super) fn ponder_backward_arms_direct(
         }
         let dlogits = alloc(bt * v);
         unsafe {
-            super::kernels::dlogits_kernel::launch_unchecked::<f32, Cuda>(
+            super::kernels::dlogits_kernel::launch_unchecked::<f32>(
                 &client,
                 CubeCount::Static(bt as u32, 1, 1),
                 UNITS,
@@ -1254,7 +1254,7 @@ pub(super) fn ponder_backward_arms_direct(
         launch_mm(&client, &dlogits, &base.lm.v, &base.lm.s, &base.lm.mv, &dm_l, bt, v, r, v, 1, r, 1, bt * v, v * r, false, false, true, false, false);
         let dz_l = alloc(bt * r);
         unsafe {
-            super::kernels::col_scale_kernel::launch_unchecked::<f32, Cuda>(
+            super::kernels::col_scale_kernel::launch_unchecked::<f32>(
                 &client, ew_cubes(bt * r), EW,
                 buf!(dm_l, bt * r), buf!(base.lm.s, r), buf!(dz_l, bt * r),
                 r as u32, (bt * r) as u32,
@@ -1263,7 +1263,7 @@ pub(super) fn ponder_backward_arms_direct(
         launch_mm(&client, &pi.step_out, &dz_l, &one, &one, &dul, d, bt, r, d, 1, r, 1, bt * d, bt * r, true, false, false, false, true);
         launch_mm(&client, &dlogits, &pi.z_l, &one, &one, &dvl_raw, v, bt, r, v, 1, r, 1, bt * v, bt * r, true, false, false, false, true);
         unsafe {
-            super::kernels::sum_ds_kernel::launch_unchecked::<f32, Cuda>(
+            super::kernels::sum_ds_kernel::launch_unchecked::<f32>(
                 &client, CubeCount::Static(1, 1, 1), UNITS,
                 buf!(dm_l, bt * r), buf!(pi.z_l, bt * r), buf!(dsl, r),
                 bt as u32, r as u32, true,
@@ -1272,7 +1272,7 @@ pub(super) fn ponder_backward_arms_direct(
         let dstep = alloc(bt * d);
         launch_mm(&client, &dz_l, &base.lm.u, &one, &base.lm.mu, &dstep, bt, r, d, r, 1, r, 1, bt * r, d * r, false, true, true, false, false);
         unsafe {
-            super::kernels::dso_kernel::launch_unchecked::<f32, Cuda>(
+            super::kernels::dso_kernel::launch_unchecked::<f32>(
                 &client, ew_cubes(bt * d), EW,
                 buf!(dout_acc, bt * d),
                 buf!(pi.p, b),
@@ -1286,7 +1286,7 @@ pub(super) fn ponder_backward_arms_direct(
         launch_mm(&client, &dstep, &base.op.v, &base.op.s, &base.op.mv, &dmo, bt, d, r, d, 1, r, 1, bt * d, d * r, false, false, true, false, false);
         let dz_o = alloc(bt * r);
         unsafe {
-            super::kernels::col_scale_kernel::launch_unchecked::<f32, Cuda>(
+            super::kernels::col_scale_kernel::launch_unchecked::<f32>(
                 &client, ew_cubes(bt * r), EW,
                 buf!(dmo, bt * r), buf!(base.op.s, r), buf!(dz_o, bt * r),
                 r as u32, (bt * r) as u32,
@@ -1302,7 +1302,7 @@ pub(super) fn ponder_backward_arms_direct(
             out[p_op + 1] = Some(alloc(r));
         }
         unsafe {
-            super::kernels::sum_ds_kernel::launch_unchecked::<f32, Cuda>(
+            super::kernels::sum_ds_kernel::launch_unchecked::<f32>(
                 &client, CubeCount::Static(1, 1, 1), UNITS,
                 buf!(dmo, bt * r), buf!(pi.z_o, bt * r),
                 buf!(out[p_op + 1].as_ref().unwrap(), r),
@@ -1313,7 +1313,7 @@ pub(super) fn ponder_backward_arms_direct(
         launch_mm(&client, &dz_o, &base.op.u, &one, &base.op.mu, &dh_flat, bt, r, d, r, 1, r, 1, bt * r, d * r, false, true, true, false, false);
         if let Some(carry) = dx_carry.take() {
             unsafe {
-                super::kernels::add_kernel::launch_unchecked::<f32, Cuda>(
+                super::kernels::add_kernel::launch_unchecked::<f32>(
                     &client, ew_cubes(bt * d), EW,
                     buf!(dh_flat, bt * d),
                     buf!(carry, bt * d),
@@ -1327,7 +1327,7 @@ pub(super) fn ponder_backward_arms_direct(
         let drs_part = alloc(bt);
         let dwffn_part = alloc(bt);
         unsafe {
-            super::kernels::residual_bwd_kernel::launch_unchecked::<f32, Cuda>(
+            super::kernels::residual_bwd_kernel::launch_unchecked::<f32>(
                 &client,
                 CubeCount::Static(bt as u32, 1, 1),
                 UNITS,
@@ -1346,7 +1346,7 @@ pub(super) fn ponder_backward_arms_direct(
             out[4] = Some(alloc(1));
         }
         unsafe {
-            super::kernels::sum_part_kernel::launch_unchecked::<f32, Cuda>(
+            super::kernels::sum_part_kernel::launch_unchecked::<f32>(
                 &client, CubeCount::Static(1, 1, 1), UNITS,
                 buf!(drs_part, bt),
                 buf!(out[4].as_ref().unwrap(), 1),
@@ -1382,7 +1382,7 @@ pub(super) fn ponder_backward_arms_direct(
         let d_ffn = alloc(bt * d);
         let draw = zeros_raw(&dev, &client, bt * pad);
         unsafe {
-            super::kernels::ffnrow_bwd_kernel::launch_unchecked::<f32, Cuda>(
+            super::kernels::ffnrow_bwd_kernel::launch_unchecked::<f32>(
                 &client,
                 CubeCount::Static(bt as u32, 1, 1),
                 UNITS,
@@ -1425,14 +1425,14 @@ pub(super) fn ponder_backward_arms_direct(
             );
             super::sync(&client); // the adjoint outputs feed raw launches below
             unsafe {
-                super::kernels::add_kernel::launch_unchecked::<f32, Cuda>(
+                super::kernels::add_kernel::launch_unchecked::<f32>(
                     &client, ew_cubes(bt * d), EW,
                     buf!(dx, bt * d), buf!(adj.d_normed, bt * d), (bt * d) as u32,
                 );
             }
             if let Some(dh) = &adj.d_hctx {
                 unsafe {
-                    super::kernels::add_kernel::launch_unchecked::<f32, Cuda>(
+                    super::kernels::add_kernel::launch_unchecked::<f32>(
                         &client, ew_cubes(bt * d), EW,
                         buf!(dh_ctx, bt * d), buf!(dh, bt * d), (bt * d) as u32,
                     );
@@ -1440,7 +1440,7 @@ pub(super) fn ponder_backward_arms_direct(
             }
             if let Some(dr) = &adj.d_raw {
                 unsafe {
-                    super::kernels::gate_bwd_add_kernel::launch_unchecked::<f32, Cuda>(
+                    super::kernels::gate_bwd_add_kernel::launch_unchecked::<f32>(
                         &client, ew_cubes(bt), EW,
                         buf!(dr, bt * 2), buf!(draw, bt * pad),
                         pad as u32, bt as u32,
@@ -1453,7 +1453,7 @@ pub(super) fn ponder_backward_arms_direct(
             let [gu, dn] = &base.experts[e];
             let wsc = &base.per[n].ws[e];
             unsafe {
-                super::kernels::dblend_kernel::launch_unchecked::<f32, Cuda>(
+                super::kernels::dblend_kernel::launch_unchecked::<f32>(
                     &client,
                     CubeCount::Static(bt as u32, 1, 1),
                     UNITS,
@@ -1471,7 +1471,7 @@ pub(super) fn ponder_backward_arms_direct(
             launch_mm(&client, &dout_e, &dn.v, &dn.s, &dn.mv, &dm_d, bt, d, r, d, 1, r, 1, bt * d, d * r, false, false, true, false, false);
             let dz_d = alloc(bt * r);
             unsafe {
-                super::kernels::col_scale_kernel::launch_unchecked::<f32, Cuda>(
+                super::kernels::col_scale_kernel::launch_unchecked::<f32>(
                     &client, ew_cubes(bt * r), EW,
                     buf!(dm_d, bt * r), buf!(dn.s, r), buf!(dz_d, bt * r),
                     r as u32, (bt * r) as u32,
@@ -1487,7 +1487,7 @@ pub(super) fn ponder_backward_arms_direct(
                 out[10 + 6 * e] = Some(alloc(r));
             }
             unsafe {
-                super::kernels::sum_ds_kernel::launch_unchecked::<f32, Cuda>(
+                super::kernels::sum_ds_kernel::launch_unchecked::<f32>(
                     &client, CubeCount::Static(1, 1, 1), UNITS,
                     buf!(dm_d, bt * r), buf!(wsc[3], bt * r),
                     buf!(out[10 + 6 * e].as_ref().unwrap(), r),
@@ -1497,7 +1497,7 @@ pub(super) fn ponder_backward_arms_direct(
             let dsil = alloc(bt * f);
             launch_mm(&client, &dz_d, &dn.u, &one, &dn.mu, &dsil, bt, r, f, r, 1, r, 1, bt * r, f * r, false, true, true, false, false);
             unsafe {
-                super::kernels::silu_bwd_kernel::launch_unchecked::<f32, Cuda>(
+                super::kernels::silu_bwd_kernel::launch_unchecked::<f32>(
                     &client, ew_cubes(bt * f), EW,
                     buf!(wsc[1], bt * f), buf!(dsil, bt * f), buf!(da2, bt * f),
                     (bt * f) as u32,
@@ -1507,7 +1507,7 @@ pub(super) fn ponder_backward_arms_direct(
             launch_mm(&client, &da2, &gu.v, &gu.s, &gu.mv, &dm_e, bt, f, r, f, 1, r, 1, bt * f, f * r, false, false, true, false, false);
             let dz_e = alloc(bt * r);
             unsafe {
-                super::kernels::col_scale_kernel::launch_unchecked::<f32, Cuda>(
+                super::kernels::col_scale_kernel::launch_unchecked::<f32>(
                     &client, ew_cubes(bt * r), EW,
                     buf!(dm_e, bt * r), buf!(gu.s, r), buf!(dz_e, bt * r),
                     r as u32, (bt * r) as u32,
@@ -1523,7 +1523,7 @@ pub(super) fn ponder_backward_arms_direct(
                 out[7 + 6 * e] = Some(alloc(r));
             }
             unsafe {
-                super::kernels::sum_ds_kernel::launch_unchecked::<f32, Cuda>(
+                super::kernels::sum_ds_kernel::launch_unchecked::<f32>(
                     &client, CubeCount::Static(1, 1, 1), UNITS,
                     buf!(dm_e, bt * r), buf!(wsc[0], bt * r),
                     buf!(out[7 + 6 * e].as_ref().unwrap(), r),
@@ -1533,7 +1533,7 @@ pub(super) fn ponder_backward_arms_direct(
             launch_mm(&client, &dz_e, &gu.u, &one, &gu.mu, &dx, bt, r, d, r, 1, r, 1, bt * r, d * r, false, true, true, false, true);
         }
         unsafe {
-            super::kernels::softmax_bwd_kernel::launch_unchecked::<f32, Cuda>(
+            super::kernels::softmax_bwd_kernel::launch_unchecked::<f32>(
                 &client,
                 CubeCount::Static(bt as u32, 1, 1),
                 UNITS,
@@ -1553,7 +1553,7 @@ pub(super) fn ponder_backward_arms_direct(
         let dhaltpre = alloc(b);
         let g_cur = alloc(b);
         unsafe {
-            super::kernels::lam_bwd_kernel::launch_unchecked::<f32, Cuda>(
+            super::kernels::lam_bwd_kernel::launch_unchecked::<f32>(
                 &client,
                 CubeCount::Static(1, 1, 1),
                 UNITS,
@@ -1582,7 +1582,7 @@ pub(super) fn ponder_backward_arms_direct(
         let dhalt_in = alloc(b * d);
         launch_mm(&client, &dhaltpre, &base.wh, &one, &one, &dhalt_in, b, 1, d, 1, 1, d, 1, b, d, false, false, false, false, false);
         unsafe {
-            super::kernels::haltmean_bwd_kernel::launch_unchecked::<f32, Cuda>(
+            super::kernels::haltmean_bwd_kernel::launch_unchecked::<f32>(
                 &client,
                 CubeCount::Static(b as u32, 1, 1),
                 UNITS,
@@ -1596,13 +1596,13 @@ pub(super) fn ponder_backward_arms_direct(
             out[2] = Some(alloc(d));
         }
         unsafe {
-            super::kernels::dg_kernel::launch_unchecked::<f32, Cuda>(
+            super::kernels::dg_kernel::launch_unchecked::<f32>(
                 &client, CubeCount::Static(1, 1, 1), UNITS,
                 buf!(dx, bt * d), buf!(pi.h_ctx, bt * d), buf!(pi.inv, bt),
                 buf!(out[2].as_ref().unwrap(), d),
                 bt as u32, d as u32, acc,
             );
-            super::kernels::rms_bwd_kernel::launch_unchecked::<f32, Cuda>(
+            super::kernels::rms_bwd_kernel::launch_unchecked::<f32>(
                 &client,
                 CubeCount::Static(bt as u32, 1, 1),
                 UNITS,
@@ -1615,7 +1615,7 @@ pub(super) fn ponder_backward_arms_direct(
             );
         }
         unsafe {
-            super::kernels::cat_bwd_kernel::launch_unchecked::<f32, Cuda>(
+            super::kernels::cat_bwd_kernel::launch_unchecked::<f32>(
                 &client, ew_cubes(bt * d), EW,
                 buf!(dctrl, bt * 2 * d),
                 buf!(dh_ctx, bt * d),
@@ -1626,7 +1626,7 @@ pub(super) fn ponder_backward_arms_direct(
         }
         if n == 0 {
             unsafe {
-                super::kernels::add_kernel::launch_unchecked::<f32, Cuda>(
+                super::kernels::add_kernel::launch_unchecked::<f32>(
                     &client, ew_cubes(bt * d), EW,
                     buf!(dxg, bt * d),
                     buf!(dh_ctx, bt * d),
@@ -1641,7 +1641,7 @@ pub(super) fn ponder_backward_arms_direct(
             out[3] = Some(alloc(n_iter * d));
         }
         unsafe {
-            super::kernels::ie_grad_kernel::launch_unchecked::<f32, Cuda>(
+            super::kernels::ie_grad_kernel::launch_unchecked::<f32>(
                 &client, CubeCount::Static(1, 1, 1), UNITS,
                 buf!(dh_ctx, bt * d),
                 buf!(out[3].as_ref().unwrap(), n_iter * d),
@@ -1652,7 +1652,7 @@ pub(super) fn ponder_backward_arms_direct(
         }
     }
     unsafe {
-        super::kernels::col_scale_kernel::launch_unchecked::<f32, Cuda>(
+        super::kernels::col_scale_kernel::launch_unchecked::<f32>(
             &client, ew_cubes(v * r), EW,
             buf!(dvl_raw, v * r), buf!(base.lm.s, r), buf!(dvl, v * r),
             r as u32, (v * r) as u32,
@@ -1661,7 +1661,7 @@ pub(super) fn ponder_backward_arms_direct(
     {
         let dv_o = alloc(d * r);
         unsafe {
-            super::kernels::col_scale_kernel::launch_unchecked::<f32, Cuda>(
+            super::kernels::col_scale_kernel::launch_unchecked::<f32>(
                 &client, ew_cubes(d * r), EW,
                 buf!(out[p_op + 2].as_ref().unwrap(), d * r), buf!(base.op.s, r), buf!(dv_o, d * r),
                 r as u32, (d * r) as u32,
@@ -1673,7 +1673,7 @@ pub(super) fn ponder_backward_arms_direct(
         let [gu, dn] = &base.experts[e];
         let dv_e = alloc(f * r);
         unsafe {
-            super::kernels::col_scale_kernel::launch_unchecked::<f32, Cuda>(
+            super::kernels::col_scale_kernel::launch_unchecked::<f32>(
                 &client, ew_cubes(f * r), EW,
                 buf!(out[8 + 6 * e].as_ref().unwrap(), f * r), buf!(gu.s, r), buf!(dv_e, f * r),
                 r as u32, (f * r) as u32,
@@ -1682,7 +1682,7 @@ pub(super) fn ponder_backward_arms_direct(
         out[8 + 6 * e] = Some(dv_e);
         let dv_d = alloc(d * r);
         unsafe {
-            super::kernels::col_scale_kernel::launch_unchecked::<f32, Cuda>(
+            super::kernels::col_scale_kernel::launch_unchecked::<f32>(
                 &client, ew_cubes(d * r), EW,
                 buf!(out[11 + 6 * e].as_ref().unwrap(), d * r), buf!(dn.s, r), buf!(dv_d, d * r),
                 r as u32, (d * r) as u32,

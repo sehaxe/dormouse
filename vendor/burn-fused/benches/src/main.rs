@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 // backend type used by the crates' fused dispatch (rope is generic over it)
-type B = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
+type B = burn_cubecl::CubeBackend;
 
 fn time<F: FnMut()>(runs: usize, mut f: F) -> f64 {
     // warmup (JIT, clock ramp)
