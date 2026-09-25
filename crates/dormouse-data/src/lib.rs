@@ -157,11 +157,29 @@ impl Source {
 impl ByteStream {
     /// Train stream over every data file under `data_root`.
     pub fn new(seq_len: usize, batch: usize, data_root: &Path) -> Self {
-        Self::from_files(seq_len, batch, collect_files(data_root), 0x1234_5678)
+        let files = collect_files(data_root);
+        assert!(
+            !files.is_empty(),
+            "no readable data files under {} (missing path, unmounted drive, or no data extensions)",
+            data_root.display()
+        );
+        Self::from_files(seq_len, batch, files, 0x1234_5678)
     }
 
     /// Stream over an explicit file list (e.g. a held-out split).
     pub fn from_files(seq_len: usize, batch: usize, files: Vec<PathBuf>, seed: u64) -> Self {
+        assert!(!files.is_empty(), "ByteStream needs a non-empty file list");
+        // A sleeping/unmounted drive lists files but serves no bytes; catch it
+        // at construction instead of training on a silent constant stream.
+        let total: u64 = files.iter().map(|f| f.metadata().map(|m| m.len()).unwrap_or(0)).sum();
+        let floor = (seq_len * batch * 4) as u64;
+        assert!(
+            total >= floor,
+            "corpus too small: {} bytes across {} file(s), need >= {} (drive asleep or wrong dir?)",
+            total,
+            files.len(),
+            floor
+        );
         let mut files = files;
         shuffle_files(&mut files, seed);
         // The backing store may be an idle drive whose first read costs
@@ -279,11 +297,11 @@ impl ByteStream {
             }
             self.buf.extend_from_slice(&tmp[..read]);
         }
-        if self.buf.is_empty() {
-            // No data anywhere: bounded dummy filler so training can still run.
-            self.buf = vec![b'x'; (self.seq_len * self.batch).max(1) * 4];
-            self.pos = 0;
-        }
+        assert!(
+            !self.buf.is_empty(),
+            "data stream dry: no readable bytes from {} file(s) (drive dropped mid-run?)",
+            self.files.len()
+        );
     }
 
     /// FNV 3/5/8-gram hashes (mod 4096) for the Engram memory.
@@ -333,5 +351,22 @@ impl ByteStream {
         }
         let hashes = self.hashes(&bytes, &tables);
         (bytes, hashes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[should_panic(expected = "no readable data files")]
+    fn missing_root_is_loud() {
+        ByteStream::new(8, 2, Path::new("/nonexistent/path/xyz"));
+    }
+
+    #[test]
+    #[should_panic(expected = "non-empty file list")]
+    fn empty_file_list_is_loud() {
+        ByteStream::from_files(8, 2, Vec::new(), 1);
     }
 }
