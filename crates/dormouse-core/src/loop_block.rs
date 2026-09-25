@@ -49,7 +49,6 @@ pub struct LoopBlock {
     #[module(skip)]
     pub n_experts: usize,
     #[module(skip)]
-    pub halt_theta: f32,
     #[module(skip)]
     pub use_msa: bool,
     #[module(skip)]
@@ -127,7 +126,6 @@ impl LoopBlock {
             d_model: d,
             ffn_hidden: f,
             n_experts: cfg.n_experts,
-            halt_theta: cfg.halt_theta,
             use_msa: cfg.use_msa,
             use_kda: cfg.use_kda,
             use_engram: cfg.use_engram,

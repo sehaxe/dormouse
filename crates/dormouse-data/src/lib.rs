@@ -346,9 +346,12 @@ impl ByteStream {
             self.buf.drain(0..self.pos);
             self.pos = 0;
         }
-        if bytes.len() < need {
-            bytes.extend(std::iter::repeat(b' ').take(need - bytes.len()));
-        }
+        assert!(
+            bytes.len() == need,
+            "short read: {} of {} bytes (corpus smaller than one batch?)",
+            bytes.len(),
+            need
+        );
         let hashes = self.hashes(&bytes, &tables);
         (bytes, hashes)
     }

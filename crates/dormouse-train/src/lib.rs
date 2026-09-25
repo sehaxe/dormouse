@@ -516,15 +516,12 @@ pub fn train_loop(
         let h = match std::fs::read(&ng_path).ok() {
             Some(b) => match offload::HostNgram::from_bytes(&b, [slots, slots, slots], 32) {
                 Some(h) => h,
-                // v1 checkpoints carried Adam m+v state; the layout magic
-                // rejects them so they are never misread as momentum.
-                None => {
-                    eprintln!(
-                        "ngram ckpt {}: unknown layout (v1 Adam state?) - starting fresh tables",
-                        ng_path.display()
-                    );
-                    h
-                }
+                // v1 checkpoints carried Adam m+v state; loading them into a
+                // Nesterov+Sinkhorn table would silently corrupt momentum.
+                None => panic!(
+                    "ngram ckpt {}: unknown layout (v1 Adam state?) — delete the file or pick another --ckpt-name; silently starting fresh on a 37 GB sidecar is how pretrain v21 died",
+                    ng_path.display()
+                ),
             },
             None => h,
         };
@@ -872,9 +869,14 @@ pub fn train_loop(
                 {
                     if let Some(g) = p.grad(&raw_grads) {
                         let g_vec: Vec<f32> = g.into_data().try_to_vec().unwrap_or_default();
-                        if g_vec.len() == uniq.len() * h.dim {
-                            h.momentum_update(uniq, &g_vec, lr as f32);
-                        }
+                        assert!(
+                            g_vec.len() == uniq.len() * h.dim,
+                            "host-grad shape mismatch: {} vs {} uniq x {} dim — skipping a table update is not an option",
+                            g_vec.len(),
+                            uniq.len(),
+                            h.dim
+                        );
+                        h.momentum_update(uniq, &g_vec, lr as f32);
                     }
                 }
             }

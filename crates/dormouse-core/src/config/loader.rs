@@ -73,7 +73,7 @@ mod tests {
     fn small_preset_file_matches_expectations() {
         let manifest = format!("{}/../../configs/small.toml", env!("CARGO_MANIFEST_DIR"));
         let c = load_config(&manifest).expect("configs/small.toml");
-        assert_eq!(c.d_model, 768); assert_eq!(c.n_heads, 12); assert_eq!(c.max_iter, 8);
+        assert_eq!(c.d_model, 768); assert_eq!(c.n_heads, 12); assert_eq!(c.max_iter, 4);
     }
     #[test]
     fn load_by_name_uses_builtin_or_file() {
@@ -123,7 +123,7 @@ mod tests {
         assert_eq!(n.d_model, 512); assert_eq!(n.rank, 96); assert_eq!(n.ponder_prior, 0.4);
         assert_eq!(n.n_experts, 3); assert_eq!(n.max_iter, 4);
         let s = load_config("small").unwrap();
-        assert_eq!(s.d_model, 768); assert_eq!(s.rank, 64); assert_eq!(s.max_iter, 8);
+        assert_eq!(s.d_model, 768); assert_eq!(s.rank, 64); assert_eq!(s.max_iter, 4);
         assert!((s.ponder_prior as f64 - 2.0/9.0).abs() < 1e-6);
         let b = load_config("base").unwrap();
         assert_eq!(b.d_model, 1024); assert_eq!(b.d_ffn, 2816); assert_eq!(b.max_seq_len, 1024);

@@ -70,7 +70,8 @@ impl RunCfg {
     /// alter the numerics of already-trained steps (2026-09-23, surfaced by
     /// the first real resume hitting the check).
     pub fn diff_keys(&self, other: &RunCfg) -> Vec<String> {
-        const PROGRESS_KEYS: [&str; 3] = ["steps", "log_every", "ckpt_every"];
+        const PROGRESS_KEYS: [&str; 5] =
+            ["steps", "log_every", "ckpt_every", "eval", "eval_every"];
         fn table(r: &RunCfg) -> toml::Table {
             match toml::Value::try_from(r) {
                 Ok(toml::Value::Table(t)) => t,
