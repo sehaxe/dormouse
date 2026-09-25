@@ -18,8 +18,8 @@ mkdir -p "$DIR" /tmp/opencode/bench
 AVAIL=$(free -g | awk '/^Mem/{print $7}')
 [ -z "$(pgrep -ax train)" ] || { echo "bench: a train process is already running"; exit 1; }
 
-DATA=/mnt/e43497ab-0ff2-45b4-b45f-28de3339a53e/aria_data/pretrain/real
-[ -d "$DATA" ] || { echo "bench: corpus drive not mounted"; exit 1; }
+DATA=/mnt/e43497ab-0ff2-45b4-b45f-28de3339a53e/aria_data/pretrain/real_filtered_v2
+[ -d "$DATA" ] || { echo "bench: corpus v2 drive not mounted"; exit 1; }
 
 case "$MODE" in
   canary)

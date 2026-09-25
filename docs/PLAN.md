@@ -2,6 +2,17 @@
 
 Started 2026-09-21 from the architecture grill session. Decisions live in `docs/adr/`, shared language lives in `CONTEXT.md`, evidence lives in `research/2026-09-21-per-gb-sota.md`. Update this file as phases close; do not re-litigate recorded ADRs without new evidence.
 
+## North star (2026-09-25)
+
+The model must be able to code and code its own updates. Not recursive
+self-improvement — a code-capable byte LM whose patches enter the repo only
+through the verification harness (tests + bench + A/B). Implications, in
+order: (1) the official fp32 baseline on corpus v2, (2) a code-domain corpus
+mixture (bytes need no architecture change), (3) SFT on code tasks, (4) the
+RLVR self-evolve loop with cargo-test/bench as the reward oracle
+(POST_TRAINING.md §self-evolve). Every speed/size win below directly buys
+this loop: faster steps = more RLVR rollouts per wall-clock hour.
+
 ## Mission
 
 Maximum capability per gigabyte on one 16 GB GPU (RTX 5060 Ti) plus 64 GB host RAM, byte-level. Every mechanism must scale when hardware grows: more RAM buys Engram rows, more VRAM buys a bigger preset, more machines buy data parallelism. Win on efficiency, not budget (ADR-0007). The goal is a reasoner, not a reciter: the core learns computation, Engram stores facts cheaply, and phase 5 installs reasoning with verifier-graded objectives (ADR-0008).
@@ -22,6 +33,21 @@ Maximum capability per gigabyte on one 16 GB GPU (RTX 5060 Ti) plus 64 GB host R
 4. Every confirm run writes a resolved-config snapshot; resumed runs diff against it (drift check).
 
 ## Phases
+
+### Inference budget (the delivery contract, phase 5 + bench ladder)
+
+Weights at inference live in the component's own format, never bf16: fp8 factors (verified in production), ternary dense via burn-bitnet, int8 Engram rows.
+
+| Metric | Target (flagship: p150 core + 48M-row Engram int8, 1M ctx) |
+|---|---|
+| VRAM, core | **~160 MB fp8-everywhere** (today-realistic: fp8 TSCT verified; dense fp8 = offline ckpt quant) → **~70-100 MB** with ternary dense (BitNet wiring, phase 5) |
+| Host RAM, total | ≤ 5 GB (Engram rows int8: ~4.6 GB; no optimizer states at inference) |
+| Context memory | fixed KDA state + sparse block indices — no growing KV cache |
+| Throughput | hundreds of tok/s on the 5060 Ti, batch 1, after fusion |
+| Multipliers | adaptive depth (easy tokens halt early), DSpark speculative decode (×2-3), fp8 rows |
+| Measured by | an inference bench added to `scripts/`: tok/s, p50/p99 latency at ctx 1k/32k/1M, RAM, VRAM |
+
+Training keeps fp32 masters; the inference checkpoint is quantized offline (masters -> fp8/ternary). Every number above gets a measured line in `benches/history.tsv` before any public claim. The $500-box offline chat demo is this table, delivered.
 
 ### Phase 0: clean base (complete 2026-09-21)
 
@@ -44,10 +70,17 @@ Diagnosis: the step is GPU-kernel-bound, not launch-bound. The step-100 sync ret
 Attack ladder, ordered by leverage:
 
 0. Fine-grained step timers: done (fwd/bwd/opt/retr/ema split, sync-anchored).
-0b. max_iter A/B (4 vs 8), config-only: the step computes 8 iterations x 2 (teacher) ~ 24 forward-equivalents; the research verdict says PonderNet halting adds ~0 and fixed depth wins. If BPB holds at max_iter=4, half the step time is cut by DELETION, and the halt head goes to the knife with it. This outranks every additive optimization.
+0b. max_iter A/B (4 vs 8) — VERDICT (2026-09-24): **max_iter=4 replaces 8.** Confirmed over full 1000-step runs at 8M slots: 2967-3054 ms/step vs 5674 ms (2.13x, physics matched), zero NaN across the entire distance where iter8 hit the documented overfit-NaN at step 193 and died without a resumable checkpoint. Held-out BPB at this horizon is ~7.99 (near-uniform) on the raw stream for the survivor — the raw corpus is unlearnable-generalization-wise at these step counts, which promotes pretrain-v2-on-filtered-corpus from quality-wish to stability-requirement. Consequence: the halt head loses its host config (max_iter=4 default); the PonderNet-halting knife A/B follows per the research verdict.
 1. fused/ to the flagship recipe: host rows, JEPA targets, bf16, act quant, GR (measured 1.7-2.0x on the plain path; ADR-0003). Acceptance criteria before fused becomes a default: (a) the fused backward must produce gradients for exactly the same parameter set as the burn path (checkpoint-size evidence from the 2026-09-21 smoke says it does not today: fused ckpt 37.1 MB vs 69.7 MB, ~33 MB of optimizer moments missing, i.e. params whose grads never arrived); (b) BPB parity with the burn path on a confirm-tier run; (c) full checkpoint round trip through the fused path.
-1b. burn 0.22.0-pre.4 migration (sequenced AFTER item 1 lands: the fused WIP touches the autodiff internals pre.4 changes). What pre.4 buys us, from the release notes: `no_grad` replaced by explicit autodiff conversions (#5557, breaking — migrate aux.rs); autodiff retains input nodes until child registration (#5647, breaking, fused-adjacent); Param flags generalized + gradient control separated from module freezing (#5498/#5537 — the frozen-norm bug class we hit); topk backward (#5531 — MSA indexer differentiability on the burn path); autodiff broadcast-gradient reduced in one pass (#5623 — our ReZero scalar backward); cubecl scatter-add one unit per value with atomics (#5621 — Engram row-grad bridge); fusion perf (block settling #5622, padded layout vote #5620, elementwise memory-order walk #5625); a panicking op no longer poisons its stream (#5535) + cubecl fma sigsegv fix (#5501) — the OOM-flood class; burn capture backend producing GraphIr (pre.3 #5377 — the launch-elimination path, corrected the research report's claim); batched SVD (#5259, our own PR) opens exact-SVD retraction; optimizer/checkpoint record fixes (#5407/#5618). Cost: bump ~25 vendored crate manifests + dormouse crates, rebase the cubecl-fix fork onto the new revs (the real risk — it carries the stale-page fix), API migrations. 1-2 days, gated by the full test suite; the burn-ndarray deprecation also points at a later flex-backend migration for CPU tests.
-2. bf16 storage ban on fp32 (2026-09-23, per the project mission "all-bf16 storage, f32 accumulate"): Engram host tables bf16 with stochastic-rounding updates (18.4 -> 9.2 GB), host-Adam m/v bf16 then int8 (18.4 -> 9.2 -> 4.6 GB), activations bf16 inside the fused kernels, KDA state bf16 (FlashKDA recipe), master weights bf16+SR once param count makes it matter. Resumed 48M-slot footprint drops 37 GB -> ~19 GB. fp32 stays ONLY on four islands where it is correctness, not conservatism: fp32 accumulate inside GEMMs, final norm + lm_head + logits (the documented NaN rule), tiny gate params (A_log, dt_bias), and model init. fp8 on the big GEMM sites after item 1 (+1.1-1.3x, speedrun records 19/84/89/90); fp4 waits for cubecl support on sm_120 (the card has fp4 tensor cores). Quality gate: BPB parity A/B at 2M slots for every precision step.
+1b. burn 0.22.0-pre.4 migration — **PARKED (2026-09-24)**: the migration itself is COMPLETE and green on CPU (branch `pre4-migration`, 6 commits: cubecl fork rebased onto 0.11.0-pre.4 with the #1401 stale-page fix re-derived for the new cubecl-server layout, 128/128 pool tests; burn bumped, no_grad->detach migrated; JEPA mask flake fixed). BLOCKER found at the GPU gate: the pre.4 stack dies on sm_120 at startup with `cuEventCreate -> DriverError status 700 (IllegalAddress)` — reproduced twice, while the pre.3 binary runs clean on the same GPU in the same minute. Either an upstream cubecl 0.11.0-pre.4 regression on Blackwell consumer or a fork-rebase break in the CUDA path; isolation (upstream cubecl without our patch, minimal repro) is a vendor-debug day. What pre.4 would have unlocked: fusion backend for extension crates (#5673 — the elementwise-chain fusion lever), topk backward, broadcast-grad single-pass, scatter atomics, stream-poison fixes. Revisit when upstream cubecl ships an sm_120 fix; the branch and the port notes are the revival kit.
+2. Precision map per component (2026-09-23, corrected 2026-09-24: TSCT and BitNet tracks were BORN quantized — the blanket "bf16 ban" mispainted them):
+   - TSCT masters: fp32 (polar retract needs it), forward reads fp8 on sm_120 — already the design, nothing to change.
+   - FFN activations: BitNet fp4 act-quant — VERIFIED (100 steps, 0 NaN, convergence == fp32); `--act-quant fp4 --act-group 128`. Attention activations: int8 (max(bits,8)). Full speed arrives with the fused kernels (STE in-kernel); on the burn path today it verifies correctness, not speed.
+   - Engram rows + host-Adam moments (host RAM): THE actual fp32 fat. fp32 (37 GB resumed at 48M) -> bf16 (~19 GB) -> rows int8 (~10 GB). Diet of `offload.rs` only.
+   - KDA state: bf16 (FlashKDA trains bf16 state).
+   - fp32 stays ONLY where it is correctness: GEMM accumulation, final norm + lm_head + logits (the documented NaN rule), tiny gate params (A_log, dt_bias), model init, TSCT masters (ortho math).
+   - fp8 big GEMMs after item 1; fp4 GEMMs when cubecl supports sm_120 fp4 (the card has the tensor cores).
+   Quality gate: BPB parity A/B at 2M slots for every precision step.
 2b. Fusion backend (2026-09-23 finding): our backend is `Autodiff<Cuda>` with NO fusion wrapper — every elementwise chain (KDA recurrence ops, casts, gates, norms) runs unfused, paying full read+write per op on a 448 GB/s bus; this is the likely fwd/bwd whale alongside the GEMM dtype. burn-cuda has a ready `fusion` feature (`Cuda = Fusion<CubeBackend>`), but the vendored extension crates write custom ops against the bare Cube backend and do NOT compile under Fusion. BLOCKED on item 1b: pre.4 #5673 auto-generates Fusion implementations for backend extensions. After the migration: flip `burn-cuda/fusion`, canary A/B (0.21 blog: launch overhead down 5.4x avg, up to 8.2x small shapes).
 3. Overlap the host-Adam D2H sync with compute on a separate stream; prefetch the next batch's rows.
 4. Retract cadence by measurement: 105 ms/step today is minor; revisit only after 1-2 land.
