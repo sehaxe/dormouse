@@ -129,9 +129,10 @@ struct ArmsAdj {
 }
 
 /// Re-run the arms forward for reverse iteration `n` on a small inner
-/// Autodiff graph and backward it, seeded with `dh_flat` (= d(y_n)):
-/// `loss_inner = Σ (attn·w_attn + eng·w_mem) ⊙ dh_flat`, with
-/// `gate = σ(router(normed))`, `attn = KDA(normed)·gate + MSA(normed)·(1-gate)`,
+/// Autodiff graph and backward it, seeded with `dy_flat` (= d(y_n), the
+/// post-residual-split gradient dh·rs): `loss_inner = Σ (attn·w_attn +
+/// eng·w_mem) ⊙ dy_flat`, with `gate = σ(router(normed))`,
+/// `attn = KDA(normed)·gate + MSA(normed)·(1-gate)`,
 /// `eng = Engram(rows|hashed, h_ctx)`, gates = σ(raw[:,0:2]).
 ///
 /// This is the exact adjoint by construction — the SAME burn modules the
@@ -155,7 +156,7 @@ fn arms_inner_adjoint(
     hashed: &Option<CubeTensor>,
     lb_ad: &LoopBlock,
     n: usize,
-    dh_flat: &CubeTensor,
+    dy_flat: &CubeTensor,
     grads: &mut Gradients,
     attn_ids: &[burn::backend::autodiff::NodeId],
     eng_ids: &[burn::backend::autodiff::NodeId],
@@ -184,7 +185,6 @@ fn arms_inner_adjoint(
     let (b, t, d, bt) = (base.b, base.t, base.d, base.bt);
     let pad = base.pad;
     let pi = &base.per[n];
-    let dev = base.dev.clone();
     // tracked leaves over the saved forward buffers (constants: dh_flat seed).
     // The workspace buffers are FLAT 1D primitives: wrap as Tensor<1> then
     // reshape - from_primitive never relabels the primitive's shape.
@@ -192,6 +192,11 @@ fn arms_inner_adjoint(
         Tensor::<1>::from_primitive::<CB>(pi.normed.clone()).reshape([bt, d]),
     )
     .require_grad();
+    // Disabled arms produce zeros in this forward; they must carry the
+    // AUTODIFF representation or they end up on the bare-CUDA LHS of ops
+    // against tracked RHS (burn-dispatch lifts a bare RHS to an untracked
+    // leaf, but panics on bare LHS x autodiff RHS).
+    let dev_ad = normed_l.device();
     let hctx_l = Tensor::<2>::from_inner(
         Tensor::<1>::from_primitive::<CB>(pi.h_ctx.clone()).reshape([bt, d]),
     )
@@ -201,7 +206,7 @@ fn arms_inner_adjoint(
     )
     .require_grad();
     let dh_l =
-        Tensor::<2>::from_inner(Tensor::<1>::from_primitive::<CB>(dh_flat.clone()).reshape([bt, d]));
+        Tensor::<2>::from_inner(Tensor::<1>::from_primitive::<CB>(dy_flat.clone()).reshape([bt, d]));
 
     // arms forward, exactly as forward_full_state assembles it
     let n3 = normed_l.clone().reshape([b, t, d]);
@@ -210,12 +215,12 @@ fn arms_inner_adjoint(
     let (gdn2_out, _s) = if cfg.use_kda {
         lb_ad.shared_attn.gdn2.forward_train_state::<CAd>(n3.clone(), None)
     } else {
-        (Tensor::zeros([b, t, d], &dev), Tensor::zeros([b, 1, 1, 1], &dev))
+        (Tensor::zeros([b, t, d], &dev_ad), Tensor::zeros([b, 1, 1, 1], &dev_ad))
     };
     let msa_out = if cfg.use_msa && t > 1 && t >= cfg.msa_block {
         lb_ad.shared_attn.msa.forward::<CAd>(n3).output
     } else {
-        Tensor::zeros([b, t, d], &dev)
+        Tensor::zeros([b, t, d], &dev_ad)
     };
     let attn = gdn2_out.mul(gate.clone()) + msa_out.mul(gate.neg().add_scalar(1.0));
     let w_attn = burn::tensor::activation::sigmoid(raw_l.clone().slice([0..bt, 0..1]));
@@ -238,7 +243,7 @@ fn arms_inner_adjoint(
                     Tensor::<3, Int>::from_primitive::<CB>(hc.clone()).reshape([b, t, 3]);
                 (lb_ad.engram.forward(h3, h4).reshape([bt, d]), None)
             }
-            None => (Tensor::zeros([bt, d], &dev), None),
+            None => (Tensor::zeros([bt, d], &dev_ad), None),
         },
     };
     let eng_s = eng.mul(w_mem);
@@ -258,7 +263,16 @@ fn arms_inner_adjoint(
         .map(|g| g.try_into_primitive::<CB>().expect("arms d(hctx) primitive"));
     let d_raw = raw_l
         .grad(&inner)
-        .map(|g| g.try_into_primitive::<CB>().expect("arms d(raw) primitive"));
+        .map(|g| {
+            // The fused chain consumes only the w_attn/w_mem gate columns,
+            // as a PACKED [bt, 2] buffer (gate_bwd_add indexes g[row*2+c]).
+            // The grad itself is dense [bt, pad]; slice the columns and
+            // materialize (reshape of a strided slice copies).
+            g.slice([0..bt, 0..2])
+                .reshape::<1, _>([bt * 2])
+                .try_into_primitive::<CB>()
+                .expect("arms d(raw) primitive")
+        });
 
     // host-rows grad: onto the op's rows parent (burn's gather chain takes
     // it from there to rows_param / the CPU Adam update)
@@ -1054,11 +1068,15 @@ pub(super) fn ponder_backward_arms_direct(
     let p_op = 6 + 6 * nexp;
     let p_lm = 9 + 6 * nexp;
     let p_final = 12 + 6 * nexp;
-    // The rows parent (61) is a tracked reshape node in the outer graph: the
-    // tape walk consumes its grad unconditionally, so seed zeros; the arms
-    // adjoint adds the real grad on top when it runs.
+    // The rows parent sits at p_final + 1 (= 13 + 6·nexp: 31 for nexp=3,
+    // 61 for nexp=8) — never hardcode 61: the nexp=3 slots beyond p_final
+    // are dummy nodes cloned from the x parent, and a seed registered there
+    // would land on x's grad. The rows parent is a tracked reshape node in
+    // the outer graph: the tape walk consumes its grad unconditionally, so
+    // seed zeros; the arms adjoint adds the real grad on top when it runs.
+    let rows_idx = p_final + 1;
     if st.rows.is_some() {
-        if let Some(node) = ops.parents.get(61).and_then(|p| p.as_ref()) {
+        if let Some(node) = ops.parents.get(rows_idx).and_then(|p| p.as_ref()) {
             let z = zeros_raw(&dev, &client, bt * 96);
             // match the rows parent's rank ([bt, 96]): register() ADDS to an
             // existing grad, and add requires equal ranks
@@ -1388,6 +1406,10 @@ pub(super) fn ponder_backward_arms_direct(
         if arms_adj_on {
             if let (Some(arm), Some(lb_ad)) = (st.arm.as_ref(), lb_ad.as_ref()) {
             super::sync(&client); // dh_flat was produced by raw launches above
+            // Seed = dy (= dh_flat·rs from residual_bwd above): the arms sit
+            // inside y = attn + eng + ffn·w_ffn and h = h_ctx + rs·y, so the
+            // local gradient entering the arms is dy, the same buffer the
+            // ffnrow/expert chains consume - NOT dh_flat (d(h)).
             let adj = arms_inner_adjoint(
                 &base,
                 &st.cfg,
@@ -1395,11 +1417,11 @@ pub(super) fn ponder_backward_arms_direct(
                 &st.hashed,
                 lb_ad,
                 n,
-                &dh_flat,
+                &dy,
                 grads,
                 &arm.attn.ids,
                 &arm.engram.ids,
-                ops.parents.get(61).and_then(|p| p.as_ref().map(|np| np.id.clone())),
+                ops.parents.get(rows_idx).and_then(|p| p.as_ref().map(|np| np.id.clone())),
             );
             super::sync(&client); // the adjoint outputs feed raw launches below
             unsafe {

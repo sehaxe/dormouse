@@ -1,0 +1,55 @@
+# Skills
+- graphify: "Use for any question about a codebase, its architecture, file relationships, or project content — especially when graph
+- wizard: Generate an interactive bash wizard that walks a human through steps only they can perform. Use when provisioning infras
+- wayfinder: Plan a huge chunk of work (more than one agent session can hold) as a shared map of decision tickets, and resolve them o
+- triage: Move issues and external PRs through a state machine of triage roles, categorise, verify, grill if needed, and write age
+- to-tickets: Break a plan, spec, or the current conversation into a set of tracer-bullet tickets, each declaring its blocking edges, 
+- to-spec: "Turn the current conversation into a spec and publish it to the project issue tracker: no interview, just synthesis of 
+- tdd: Test-driven development. Use when the user wants to build features or fix bugs test-first, mentions "red-green-refactor"
+- setup-matt-pocock-skills: "Configure this repo for the engineering skills: set up its issue tracker, triage label vocabulary, and domain doc layou
+- resolving-merge-conflicts: "Use when you need to resolve an in-progress git merge/rebase conflict."
+- research: Investigate a question against high-trust primary sources and capture the findings as a Markdown file in the repo. Use w
+- prototype: Build a throwaway prototype to answer a design question. Use when the user wants to sanity-check whether a state model o
+- improve-codebase-architecture: Scan a codebase for deepening opportunities, present them as a visual HTML report, then grill through whichever one you 
+- implement: "Implement a piece of work based on a spec or set of tickets."
+- grill-with-docs: A relentless interview to sharpen a plan or design, which also creates docs (ADR's and glossary) as we go.
+- domain-modeling: Build and sharpen a project's domain model. Use when discussing codebase terminology, writing or editing a CONTEXT.md, o
+- diagnosing-bugs: Diagnosis loop for hard bugs and performance regressions. Use when the user says "diagnose"/"debug this", or reports som
+- codebase-design: Shared vocabulary for designing deep modules. Use when the user wants to design or improve a module's interface, find de
+- code-review: "Review the changes since a fixed point (commit, branch, tag, or merge-base) along two axes: Standards (does the code fo
+- ask-matt: Ask which skill or flow fits your situation. A router over the skills in this repo.
+- writing-for-agents: Writing documents for agents. Use when creating or editing skills, or modifying AGENTS.md or CLAUDE.md.
+- wait-what: "Stop. That last message did not land: re-pitch it."
+- teach: Teach the user a new skill or concept, within this workspace.
+- handoff: Compact the current conversation into a handoff document for another agent to pick up.
+- grill-me: A relentless interview to sharpen a plan, decision, or idea. Use when the user wants to stress-test their thinking, says
+- writing-shape: "Writing, exploit: shape raw material into an article, paragraph by paragraph."
+- writing-fragments: "Writing, explore: mine raw fragments, no structure yet."
+- writing-beats: Writing, exploit; assemble raw material into a journey of beats, grounding each term before a beat leans on it.
+- retro: "Conduct a retrospective on a coding session."
+- implement-spec: "Implement a specification in code."
+- unslop: Cut AI tells from any writing. Must always apply.
+- deep-research: Exhaustive multi-round research with source verification and a structured cited report written to a file. Use when the u
+- brainstorming: "You MUST use this before any creative work - creating features, building components, adding functionality, or modifying
+- writing-plans: Use when you have a spec or requirements for a multi-step task, before touching code
+- subagent-driven-development: Use when executing implementation plans with independent tasks in the current session
+- verification-before-completion: Use when about to claim work is complete, fixed, or passing, before committing or creating PRs - requires running verifi
+- systematic-debugging: Use when encountering any bug, test failure, or unexpected behavior, before proposing fixes
+- dispatching-parallel-agents: Use when facing 2+ independent tasks that can be worked on without shared state or sequential dependencies
+- docx: "Use this skill whenever the user wants to create, read, edit, or manipulate Word documents (.docx files) or Word templa
+- pptx: "Use this skill any time a .pptx or .potx file is involved in any way — as input, output, or both. This includes: creati
+- xlsx: "Use this skill any time a spreadsheet file is the primary input or output. This means any task where the user wants to:
+- pdf: Use this skill whenever the user wants to do anything with PDF files. This includes reading or extracting text/tables fr
+- frontend-design: Guidance for distinctive, intentional visual design when building new UI or reshaping an existing one. Helps with aesthe
+- webapp-testing: Toolkit for interacting with and testing local web applications using Playwright. Supports verifying frontend functional
+- computer-use: Control the Linux desktop - move the mouse, click, type, scroll, screenshot, manage windows. Use when the user asks to i
+- requesting-code-review: Use when completing tasks, implementing major features, or before merging to verify work meets requirements
+- receiving-code-review: Use when receiving code review feedback, before implementing suggestions, especially if feedback seems unclear or techni
+- executing-plans: Use when you have a written implementation plan to execute in a separate session with review checkpoints
+- finishing-a-development-branch: Use when implementation is complete, all tests pass, and you need to decide how to integrate the work
+- using-git-worktrees: Use when starting feature work that needs isolation from current workspace or before executing implementation plans - en
+- web-design-guidelines: Review UI code for Web Interface Guidelines compliance. Use when asked to "review my UI", "check accessibility", "audit 
+- semgrep: >-
+- codeql: >-
+- sarif-parsing: >-
+- spec-to-code-compliance: Check code against the documentation that specifies it - which requirements hold, which the code contradicts, which are 

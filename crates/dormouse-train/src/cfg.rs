@@ -64,8 +64,14 @@ impl RunCfg {
 
     /// `model.*` / `train.*` keys where `self` and `other` differ. `source`
     /// is provenance (builtin name vs explicit path can produce the same
-    /// values) and is excluded from the comparison.
+    /// values) and is excluded from the comparison. The train-section
+    /// progress keys (`steps`, `log_every`, `ckpt_every`) are exempt too:
+    /// extending a finished run is a legitimate resume, and they cannot
+    /// alter the numerics of already-trained steps (2026-09-23, surfaced by
+    /// the first real resume hitting the check).
     pub fn diff_keys(&self, other: &RunCfg) -> Vec<String> {
+        const PROGRESS_KEYS: [&str; 5] =
+            ["steps", "log_every", "ckpt_every", "eval", "eval_every"];
         fn table(r: &RunCfg) -> toml::Table {
             match toml::Value::try_from(r) {
                 Ok(toml::Value::Table(t)) => t,
@@ -78,9 +84,11 @@ impl RunCfg {
             match (a.get(section), b.get(section)) {
                 (Some(toml::Value::Table(x)), Some(toml::Value::Table(y))) => {
                     for (k, v) in x {
+                        if section == "train" && PROGRESS_KEYS.contains(&k.as_str()) { continue; }
                         if Some(v) != y.get(k) { out.push(format!("{section}.{k}")); }
                     }
                     for k in y.keys() {
+                        if section == "train" && PROGRESS_KEYS.contains(&k.as_str()) { continue; }
                         if !x.contains_key(k) { out.push(format!("{section}.{k}")); }
                     }
                 }
@@ -119,7 +127,7 @@ mod tests {
     #[test]
     fn train_overrides_are_optional() {
         let run = resolve("small", &[], TrainCfg::default()).unwrap();
-        assert_eq!(run.model.max_iter, 8);
+        assert_eq!(run.model.max_iter, 4);
         let run = resolve("small", &[], TrainCfg { max_iter: Some(3), ..Default::default() }).unwrap();
         assert_eq!(run.model.max_iter, 3);
         assert_eq!(run.model.d_model, 768);
@@ -180,6 +188,14 @@ mod tests {
         let mut alt_source = stored.clone();
         alt_source.source = "configs/small.toml".to_string();
         assert!(stored.diff_keys(&alt_source).is_empty());
+        // Progress keys are exempt: extending a finished run is a legal resume.
+        let longer = resolve("small", &set("max_iter=6"), TrainCfg {
+            steps: 999,
+            log_every: 5,
+            ckpt_every: 7,
+            ..TrainCfg::default()
+        }).unwrap();
+        assert!(longer.diff_keys(&stored).is_empty(), "{:?}", longer.diff_keys(&stored));
     }
 
     #[test]

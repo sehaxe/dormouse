@@ -60,19 +60,12 @@ fn d_head_dim() -> usize { 64 }
 fn d_d_ffn() -> usize { 2048 }
 fn d_vocab() -> usize { 256 }
 fn d_max_seq_len() -> usize { 512 }
-fn d_max_iter() -> usize { 8 }
+fn d_max_iter() -> usize { 4 }
 fn d_rank() -> usize { 64 }
-fn d_halt_theta() -> f32 { 0.9 }
-fn d_ponder_w() -> f32 { 0.05 }
-fn d_rec_w() -> f32 { 0.5 }
-fn d_guard_w() -> f32 { 0.01 }
 fn d_norm_eps() -> f32 { 0.001 }
-fn d_rope_base() -> f64 { 10000.0 }
 fn d_msa_topk() -> usize { 8 }
 fn d_msa_block() -> usize { 32 }
 fn d_true() -> bool { true }
-fn d_keep_frac() -> f32 { 0.5 }
-fn d_dropout() -> f32 { 0.0 }
 fn d_n_experts() -> usize { 3 }
 fn d_ponder_beta() -> f32 { 0.01 }
 fn d_ponder_prior() -> f32 { 0.2222222222222222 }
@@ -96,20 +89,13 @@ pub struct DormouseConfig {
     #[serde(default = "d_max_seq_len")] pub max_seq_len: usize,
     #[serde(default = "d_max_iter")] pub max_iter: usize,
     #[serde(default = "d_rank")] pub rank: usize,
-    #[serde(default = "d_halt_theta")] pub halt_theta: f32,
-    #[serde(default = "d_ponder_w")] pub ponder_w: f32,
-    #[serde(default = "d_rec_w")] pub rec_w: f32,
-    #[serde(default = "d_guard_w")] pub guard_w: f32,
     #[serde(default = "d_norm_eps")] pub norm_eps: f32,
-    #[serde(default = "d_rope_base")] pub rope_base: f64,
     #[serde(default = "d_msa_topk")] pub msa_topk: usize,
     #[serde(default = "d_msa_block")] pub msa_block: usize,
     #[serde(default = "d_true")] pub use_msa: bool,
     #[serde(default = "d_true")] pub use_kda: bool,
     #[serde(default = "d_true")] pub use_engram: bool,
     #[serde(default)] pub use_gr: bool,
-    #[serde(default = "d_keep_frac")] pub keep_frac: f32,
-    #[serde(default = "d_dropout")] pub dropout: f32,
     #[serde(default = "d_n_experts")] pub n_experts: usize,
     #[serde(default = "d_ponder_beta")] pub ponder_beta: f32,
     #[serde(default = "d_ponder_prior")] pub ponder_prior: f32,

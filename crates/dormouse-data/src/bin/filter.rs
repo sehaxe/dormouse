@@ -676,6 +676,13 @@ new unique docs will no longer be remembered, membership checks continue",
 // document splitter: blank-line runs (>=2 consecutive '\n') are boundaries
 // ---------------------------------------------------------------------------
 
+/// Which output a completed doc is written to (two-region mode).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Region {
+    Head,
+    Tail,
+}
+
 struct Splitter {
     /// current document bytes (single newlines are content)
     doc: Vec<u8>,
@@ -683,8 +690,13 @@ struct Splitter {
     run: Vec<u8>,
     /// blank-run bytes sitting between the last completed doc and the next
     /// one; written ahead of the next kept doc when both neighbors are kept
+    /// in the SAME region
     pending_sep: Vec<u8>,
-    last_kept: bool,
+    last_kept: Option<Region>,
+    /// input offset of the next byte fed through push
+    pos: u64,
+    /// input offset of the current doc's first byte (valid while doc non-empty)
+    doc_start: u64,
     done: bool,
 }
 
@@ -694,28 +706,33 @@ impl Splitter {
             doc: Vec::with_capacity(4096),
             run: Vec::new(),
             pending_sep: Vec::new(),
-            last_kept: false,
+            last_kept: None,
+            pos: 0,
+            doc_start: 0,
             done: false,
         }
     }
 
-    /// Feed one byte. Completes at most one document; `act` decides keep/drop
-    /// (returning true makes the caller write it out, with the original
-    /// separator bytes ahead of it when the previous kept doc is adjacent).
-    fn push<W: Write>(
+    /// Feed one byte. Completes at most one document; `act` scores it with its
+    /// start offset and returns the output region (None = drop). The original
+    /// separator bytes are written ahead of a kept doc when the previous kept
+    /// doc is adjacent in the same region's output.
+    fn push<W: Write, T: Write + ?Sized>(
         &mut self,
         b: u8,
-        out: &mut W,
-        act: &mut impl FnMut(&[u8]) -> bool,
+        head: &mut W,
+        tail: &mut T,
+        act: &mut impl FnMut(&[u8], u64) -> Option<Region>,
     ) -> std::io::Result<()> {
         if !self.run.is_empty() {
             if b == b'\n' {
                 self.run.push(b);
+                self.pos += 1;
                 return Ok(());
             }
             // blank run ended at this byte
             if self.run.len() >= 2 {
-                self.complete_doc(out, act)?;
+                self.complete_doc(head, tail, act)?;
                 // the run that just ended separates the doc just completed
                 // from whatever comes next
                 self.pending_sep.extend_from_slice(&self.run);
@@ -728,27 +745,38 @@ impl Splitter {
         if b == b'\n' {
             self.run.push(b);
         } else {
+            if self.doc.is_empty() {
+                self.doc_start = self.pos;
+            }
             self.doc.push(b);
         }
+        self.pos += 1;
         Ok(())
     }
 
-    fn complete_doc<W: Write>(
+    fn complete_doc<W: Write, T: Write + ?Sized>(
         &mut self,
-        out: &mut W,
-        act: &mut impl FnMut(&[u8]) -> bool,
+        head: &mut W,
+        tail: &mut T,
+        act: &mut impl FnMut(&[u8], u64) -> Option<Region>,
     ) -> std::io::Result<()> {
         if self.doc.is_empty() {
             // degenerate empty doc between separators: keep byte flow intact
             return Ok(());
         }
-        let kept = act(&self.doc);
-        if kept {
-            if self.last_kept && !self.pending_sep.is_empty() {
-                out.write_all(&self.pending_sep)?;
+        let route = act(&self.doc, self.doc_start);
+        if let Some(r) = route {
+            if self.last_kept == route && !self.pending_sep.is_empty() {
+                match r {
+                    Region::Head => head.write_all(&self.pending_sep)?,
+                    Region::Tail => tail.write_all(&self.pending_sep)?,
+                }
             }
-            out.write_all(&self.doc)?;
-            self.last_kept = true;
+            match r {
+                Region::Head => head.write_all(&self.doc)?,
+                Region::Tail => tail.write_all(&self.doc)?,
+            }
+            self.last_kept = route;
         }
         // the separator ahead of this doc has been consumed either way
         self.pending_sep.clear();
@@ -756,10 +784,11 @@ impl Splitter {
         Ok(())
     }
 
-    fn finish<W: Write>(
+    fn finish<W: Write, T: Write + ?Sized>(
         &mut self,
-        out: &mut W,
-        act: &mut impl FnMut(&[u8]) -> bool,
+        head: &mut W,
+        tail: &mut T,
+        act: &mut impl FnMut(&[u8], u64) -> Option<Region>,
     ) -> std::io::Result<()> {
         if self.done {
             return Ok(());
@@ -767,17 +796,17 @@ impl Splitter {
         self.done = true;
         if !self.run.is_empty() {
             if self.run.len() >= 2 {
-                self.complete_doc(out, act)?;
+                self.complete_doc(head, tail, act)?;
                 // trailing separator: no following doc, dropped
                 self.pending_sep.clear();
             } else {
                 // lone trailing newline is document content
                 self.doc.push(b'\n');
                 self.run.clear();
-                self.complete_doc(out, act)?;
+                self.complete_doc(head, tail, act)?;
             }
         } else {
-            self.complete_doc(out, act)?;
+            self.complete_doc(head, tail, act)?;
         }
         Ok(())
     }
@@ -941,6 +970,10 @@ fn write_stats(
 struct Cli {
     input: String,
     output: String,
+    /// two-region mode: eval tail output path
+    eval_output: Option<String>,
+    /// two-region mode: eval tail = last N MiB of the raw input
+    eval_tail_mb: Option<u64>,
     model: String,
     threshold: f32,
     dedup_only: bool,
@@ -960,6 +993,8 @@ fn parse_args() -> Result<Cli, String> {
     let mut c = Cli {
         input: String::new(),
         output: String::new(),
+        eval_output: None,
+        eval_tail_mb: None,
         model: String::new(),
         threshold: 0.5,
         dedup_only: false,
@@ -980,6 +1015,10 @@ fn parse_args() -> Result<Cli, String> {
         match a.as_str() {
             "--input" => c.input = val(&mut it)?,
             "--output" => c.output = val(&mut it)?,
+            "--eval-output" => c.eval_output = Some(val(&mut it)?),
+            "--eval-tail-mb" => {
+                c.eval_tail_mb = Some(val(&mut it)?.parse().map_err(|_| "--eval-tail-mb u64")?)
+            }
             "--model" => c.model = val(&mut it)?,
             "--threshold" => c.threshold = val(&mut it)?.parse().map_err(|_| "--threshold f32")?,
             "--dedup-only" => c.dedup_only = true,
@@ -1003,11 +1042,15 @@ fn parse_args() -> Result<Cli, String> {
             other => return Err(format!("unknown arg {other}")),
         }
     }
+    if c.eval_output.is_none() != c.eval_tail_mb.is_none() {
+        return Err("--eval-output and --eval-tail-mb go together".into());
+    }
     if c.input.is_empty() || c.output.is_empty() || c.model.is_empty() {
         return Err(
             "required: --input <corpus> --output <filtered> --model <fasttext.bin>\n\
              optional: --threshold F --dedup-only --limit-bytes N --stats JSON \
-             --examples JSONL [--examples-per-class N] --chunk-mb N --dedup-cap N"
+             --examples JSONL [--examples-per-class N] --chunk-mb N --dedup-cap N \
+             --eval-output PATH --eval-tail-mb N"
                 .into(),
         );
     }
@@ -1098,6 +1141,44 @@ impl<'a> Pipeline<'a> {
     }
 }
 
+/// Routes completed docs by their START offset: head docs → train output,
+/// tail docs → eval output, straddlers dropped entirely. One shared Pipeline
+/// keeps dedup global (a tail doc that duplicates a head doc is dropped from
+/// eval — same rule set, no leak in either direction).
+struct Router {
+    /// first input byte of the eval tail region (u64::MAX = single region)
+    boundary: u64,
+    straddle_docs: u64,
+    straddle_bytes: u64,
+    head_docs: u64,
+    head_bytes: u64,
+    tail_docs: u64,
+    tail_bytes: u64,
+}
+
+impl Router {
+    fn route(&mut self, pl: &mut Pipeline, doc: &[u8], start: u64) -> Option<Region> {
+        let end = start + doc.len() as u64;
+        if start < self.boundary && end > self.boundary {
+            self.straddle_docs += 1;
+            self.straddle_bytes += doc.len() as u64;
+            return None;
+        }
+        if !pl.on_doc(doc) {
+            return None;
+        }
+        if start >= self.boundary {
+            self.tail_docs += 1;
+            self.tail_bytes += doc.len() as u64;
+            Some(Region::Tail)
+        } else {
+            self.head_docs += 1;
+            self.head_bytes += doc.len() as u64;
+            Some(Region::Head)
+        }
+    }
+}
+
 fn main() {
     let cli = match parse_args() {
         Ok(a) => a,
@@ -1173,6 +1254,49 @@ nwords={} nlabels={} hq_row={} labels={:?}",
         });
     let mut out = BufWriter::with_capacity(1 << 20, out_file);
 
+    // two-region mode: head [0, boundary) → `out`, tail [boundary, EOF) →
+    // eval output; single-region runs fold into the same path with the
+    // boundary at u64::MAX (everything routes Head).
+    let boundary = match (cli.eval_output.as_deref(), cli.eval_tail_mb) {
+        (Some(_), Some(mb)) => total_in.saturating_sub(mb << 20),
+        _ => u64::MAX,
+    };
+    let mut eval_buf = cli.eval_output.as_deref().map(|p| {
+        let f = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(p)
+            .unwrap_or_else(|e| {
+                eprintln!("filter: open eval output: {e}");
+                std::process::exit(3);
+            });
+        BufWriter::with_capacity(1 << 20, f)
+    });
+    if boundary != u64::MAX {
+        eprintln!(
+            "[filter] two-region mode: eval tail = last {} MiB, boundary at byte {} of {} \
+             (docs straddling the boundary are dropped)",
+            cli.eval_tail_mb.unwrap(),
+            boundary,
+            total_in
+        );
+    }
+    let mut sink = std::io::sink();
+    let tail_out: &mut dyn Write = match &mut eval_buf {
+        Some(w) => w,
+        None => &mut sink,
+    };
+    let mut router = Router {
+        boundary,
+        straddle_docs: 0,
+        straddle_bytes: 0,
+        head_docs: 0,
+        head_bytes: 0,
+        tail_docs: 0,
+        tail_bytes: 0,
+    };
+
     let mut pipeline = Pipeline {
         model: &model,
         threshold: cli.threshold,
@@ -1220,10 +1344,10 @@ nwords={} nlabels={} hq_row={} labels={:?}",
         pipeline.st.input_bytes_read += filled as u64;
 
         {
-            let pl = &mut pipeline;
-            let mut act = |doc: &[u8]| pl.on_doc(doc);
+            let (pl, rt) = (&mut pipeline, &mut router);
+            let mut act = |doc: &[u8], start: u64| rt.route(pl, doc, start);
             for &b in &chunk[..filled] {
-                if let Err(e) = splitter.push(b, &mut out, &mut act) {
+                if let Err(e) = splitter.push(b, &mut out, tail_out, &mut act) {
                     eprintln!("filter: write: {e}");
                     std::process::exit(4);
                 }
@@ -1268,9 +1392,9 @@ nwords={} nlabels={} hq_row={} labels={:?}",
     }
 
     {
-        let pl = &mut pipeline;
-        let mut act = |doc: &[u8]| pl.on_doc(doc);
-        if let Err(e) = splitter.finish(&mut out, &mut act) {
+        let (pl, rt) = (&mut pipeline, &mut router);
+        let mut act = |doc: &[u8], start: u64| rt.route(pl, doc, start);
+        if let Err(e) = splitter.finish(&mut out, tail_out, &mut act) {
             eprintln!("filter: write: {e}");
             std::process::exit(4);
         }
@@ -1278,6 +1402,12 @@ nwords={} nlabels={} hq_row={} labels={:?}",
     if let Err(e) = out.flush() {
         eprintln!("filter: flush: {e}");
         std::process::exit(4);
+    }
+    if let Some(w) = eval_buf.as_mut() {
+        if let Err(e) = w.flush() {
+            eprintln!("filter: flush: {e}");
+            std::process::exit(4);
+        }
     }
 
     let el = t0.elapsed().as_secs_f64();
@@ -1294,6 +1424,17 @@ read={:.1}MB wrote={:.1}MB = {:.1}MB/s",
         st.input_bytes_read as f64 / 1e6,
         st.bytes_written as f64 / 1e6,
         st.input_bytes_read as f64 / 1e6 / el,
+    );
+    eprintln!(
+        "[filter] regions: boundary={} head_docs={} head_MB={} tail_docs={} tail_MB={} \
+straddle_dropped={} ({}MB)",
+        router.boundary,
+        router.head_docs,
+        router.head_bytes as f64 / 1e6,
+        router.tail_docs,
+        router.tail_bytes as f64 / 1e6,
+        router.straddle_docs,
+        router.straddle_bytes as f64 / 1e6,
     );
 
     if let Some(sp) = &cli.stats {
@@ -1373,34 +1514,43 @@ mod tests {
     fn splitter_preserves_separator_between_kept() {
         let mut sp = Splitter::new();
         let mut out: Vec<u8> = Vec::new();
+        let mut tail: Vec<u8> = Vec::new();
         let docs = std::cell::RefCell::new(Vec::new());
         {
-            let mut act = |d: &[u8]| -> bool {
+            let mut act = |d: &[u8], _s: u64| -> Option<Region> {
                 docs.borrow_mut().push(String::from_utf8_lossy(d).into_owned());
-                true
+                Some(Region::Head)
             };
             for b in b"aa\nbb\n\ncc\n\n\ndd" {
-                let _ = sp.push(*b, &mut out, &mut act).unwrap();
+                let _ = sp.push(*b, &mut out, &mut tail, &mut act).unwrap();
             }
-            let _ = sp.finish(&mut out, &mut act).unwrap();
+            let _ = sp.finish(&mut out, &mut tail, &mut act).unwrap();
         }
         // "aa\nbb" (single newline stays inside), then "cc", then "dd"
         assert_eq!(docs.borrow().len(), 3);
         assert_eq!(docs.borrow()[0], "aa\nbb");
         // separators between kept docs preserved verbatim (2 then 3 newlines)
         assert_eq!(out, b"aa\nbb\n\ncc\n\n\ndd");
+        assert!(tail.is_empty());
     }
 
     #[test]
     fn splitter_drops_dropped_doc_separators() {
         let mut sp = Splitter::new();
         let mut out: Vec<u8> = Vec::new();
+        let mut tail: Vec<u8> = Vec::new();
         {
-            let mut act = |d: &[u8]| -> bool { d.starts_with(b"keep") };
+            let mut act = |d: &[u8], _s: u64| -> Option<Region> {
+                if d.starts_with(b"keep") {
+                    Some(Region::Head)
+                } else {
+                    None
+                }
+            };
             for b in b"keep1\n\ndrop\n\nkeep2\n\n" {
-                let _ = sp.push(*b, &mut out, &mut act).unwrap();
+                let _ = sp.push(*b, &mut out, &mut tail, &mut act).unwrap();
             }
-            let _ = sp.finish(&mut out, &mut act).unwrap();
+            let _ = sp.finish(&mut out, &mut tail, &mut act).unwrap();
         }
         assert_eq!(out, b"keep1\n\nkeep2");
     }
@@ -1409,19 +1559,53 @@ mod tests {
     fn splitter_final_doc_processed() {
         let mut sp = Splitter::new();
         let mut out: Vec<u8> = Vec::new();
+        let mut tail: Vec<u8> = Vec::new();
         let count = std::cell::Cell::new(0u32);
         {
-            let mut act = |_d: &[u8]| -> bool {
+            let mut act = |_d: &[u8], _s: u64| -> Option<Region> {
                 count.set(count.get() + 1);
-                true
+                Some(Region::Head)
             };
             for b in b"only-doc\nwith lines" {
-                let _ = sp.push(*b, &mut out, &mut act).unwrap();
+                let _ = sp.push(*b, &mut out, &mut tail, &mut act).unwrap();
             }
             assert_eq!(count.get(), 0);
-            let _ = sp.finish(&mut out, &mut act).unwrap();
+            let _ = sp.finish(&mut out, &mut tail, &mut act).unwrap();
         }
         assert_eq!(count.get(), 1);
         assert_eq!(out, b"only-doc\nwith lines");
+    }
+
+    /// Two-region routing: docs owned by start offset, the doc straddling the
+    /// boundary dropped whole, and no separator bytes carried across regions.
+    #[test]
+    fn splitter_two_regions_drops_straddler() {
+        // offsets: head1@0 head2@7 straddle@14..22 tail1@24 tail2@31
+        let bytes = b"head1\n\nhead2\n\nstraddle\n\ntail1\n\ntail2";
+        let mut sp = Splitter::new();
+        let (mut head, mut tail) = (Vec::new(), Vec::new());
+        let boundary = 16u64; // inside "straddle"
+        let seen = std::cell::Cell::new(0u32);
+        {
+            let mut act = |d: &[u8], s: u64| -> Option<Region> {
+                seen.set(seen.get() + 1);
+                let end = s + d.len() as u64;
+                if s < boundary && end > boundary {
+                    return None; // straddler
+                }
+                if s >= boundary {
+                    Some(Region::Tail)
+                } else {
+                    Some(Region::Head)
+                }
+            };
+            for &b in bytes {
+                let _ = sp.push(b, &mut head, &mut tail, &mut act).unwrap();
+            }
+            let _ = sp.finish(&mut head, &mut tail, &mut act).unwrap();
+        }
+        assert_eq!(seen.get(), 5);
+        assert_eq!(head, b"head1\n\nhead2");
+        assert_eq!(tail, b"tail1\n\ntail2");
     }
 }

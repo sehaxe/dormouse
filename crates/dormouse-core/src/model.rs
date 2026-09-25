@@ -39,6 +39,8 @@ pub struct DormouseModel {
     pub ponder_beta: f32,
     #[module(skip)]
     pub ponder_prior: f32,
+    #[module(skip)]
+    pub max_seq_len: usize,
 }
 
 impl DormouseModel {
@@ -62,6 +64,7 @@ impl DormouseModel {
             dspark_stride: cfg.dspark_stride,
             ponder_beta: cfg.ponder_beta,
             ponder_prior: cfg.ponder_prior,
+            max_seq_len: cfg.max_seq_len,
         }
     }
 
@@ -341,6 +344,6 @@ impl DormouseModel {
     }
 
     pub fn max_seq_len(&self) -> usize {
-        4096
+        self.max_seq_len
     }
 }
