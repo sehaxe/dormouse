@@ -66,6 +66,7 @@ fn d_norm_eps() -> f32 { 0.001 }
 fn d_msa_topk() -> usize { 8 }
 fn d_msa_block() -> usize { 32 }
 fn d_true() -> bool { true }
+fn d_false() -> bool { false }
 fn d_n_experts() -> usize { 3 }
 fn d_ponder_beta() -> f32 { 0.01 }
 fn d_ponder_prior() -> f32 { 0.2222222222222222 }
@@ -92,7 +93,7 @@ pub struct DormouseConfig {
     #[serde(default = "d_norm_eps")] pub norm_eps: f32,
     #[serde(default = "d_msa_topk")] pub msa_topk: usize,
     #[serde(default = "d_msa_block")] pub msa_block: usize,
-    #[serde(default = "d_true")] pub use_msa: bool,
+    #[serde(default = "d_false")] pub use_msa: bool,
     #[serde(default = "d_true")] pub use_kda: bool,
     #[serde(default = "d_true")] pub use_engram: bool,
     #[serde(default)] pub use_gr: bool,
