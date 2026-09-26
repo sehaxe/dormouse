@@ -1,126 +1,177 @@
-# dormouse
+<div align="center">
 
-Byte-level language-model trainer in Rust, built on burn 0.22.0-pre.4 with the
-cubecl CUDA backend. The design point is training the largest useful model that
-fits on one workstation: 16 GB of VRAM plus 64 GB of host RAM, with host RAM as
-a latency-tolerant extension of VRAM rather than a limit on parameter count.
-Precision is per-component, not blanket: fp32 where correctness requires it
-(GEMM accumulate, logits, gates, TSCT masters), fp8/bf16/int8 where a verified
-A/B says the bytes are wasted.
+# 🐹 dormouse
 
-North star: a model that can code and code its own updates — patches enter the
-repo only through the verification harness (tests + bench + A/B). Every speed
-and size win below buys that loop: faster steps are more RLVR rollouts per
-wall-clock hour.
+**Maximum capability per gigabyte — a byte-level LM trainer for one workstation.**
 
-## Model
+[![CI](https://github.com/sehaxe/dormouse/actions/workflows/ci.yml/badge.svg)](https://github.com/sehaxe/dormouse/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org)
+[![CUDA](https://img.shields.io/badge/CUDA-sm_120-green.svg)](https://developer.nvidia.com/cuda-gpus)
+[![burn](https://img.shields.io/badge/burn-0.22.0--pre.4-red.svg)](https://github.com/burn-rs/burn)
 
-- **PonderNet adaptive compute.** A single shared `LoopBlock` runs up to
-  `max_iter` iterations per sequence (default 4 — measured 2.13x faster than 8
-  with better stability); a halt head learns when to stop.
-- **Attention.** KDA gated-delta (linear attention, burn-kda) as the primary
-  arm. MSA top-k sparse attention (burn-msa) is **disabled on the pre.4
-  stack** — its indexer feeds garbage indices and gathers read out of bounds
-  (ADR-0012); it returns only with a rewritten kernel and a won A/B.
-- **Engram n-gram memory.** FNV-hashed n-gram embedding tables. Tables live in
-  host RAM at millions of rows; only the current batch's rows (~600 KB) touch
-  the GPU each step.
-- **Spectral experts.** Feed-forward experts are low-rank TSCT linear layers
-  (burn-spectral); masters stay fp32, the forward reads fp8 on sm_120, and
-  per-step polar retraction keeps factors orthonormal with a one-way fp32
-  fallback if drift exceeds threshold.
-- **Auxiliary heads** (configurable weights): JEPA masked latent prediction
-  against an EMA teacher with KoLeo, and a DSpark draft head for next-K
-  prediction. Both face a pending vs-pure-CE A/B — A/B or death applies.
-- **Optimizer.** Muon+ (burn-muon-plus) on 2D weight matrices with routing
-  validation, AdamW on embeddings/heads/1D, Adan as the alternative fallback.
+*Rust · burn + cubecl · one RTX 5060 Ti (16 GB) + 64 GB host RAM · 15.5k lines, every one held by a verdict*
 
-## Repo layout
+</div>
 
-- `crates/dormouse-core` — the model: config seam (flat TOML presets in
-  `configs/`, schema defaults mirror `small`), LoopBlock, attention, Engram,
-  experts, aux heads, the fused CUDA kernel experiment.
-- `crates/dormouse-data` — streaming byte pipeline: ring buffer, seeded
-  shuffle, loud failures on bad corpora, plus `bin/filter.rs` (DCLM-style
-  filtering with a two-region mode that structurally excludes the eval tail
-  from training data).
-- `crates/dormouse-train` — training loop: Muon+ mixed optimizer, burnpack
-  checkpoints, resume with a config-drift check, host-RAM offload, stress
-  protocol.
-- `crates/dormouse-cli` — `train`, `generate`, `serve`.
-- `vendor/` — three patched cubecl crates (runtime, server, cuda) carrying the
-  slot-preserving memory-pool fix; mapped through `[patch.crates-io]`.
+---
 
-## Doctrine
+dormouse trains byte-level language models with the biggest possible brain per
+gigabyte: n-gram memory lives in host RAM by the billion of rows, adaptive
+compute decides per sequence how deep to think, and precision is spent only
+where numerics demand it. The end goal is a model that can code — and code its
+own updates, merged only through the verification harness.
 
-1. **A/B or death** (ADR-0002): every mechanism beats its own removal on
-   held-out BPB at fixed steps, or it is deleted. The same audit applies to
-   code: every line is held up by a recorded verdict
-   (`docs/audit-2026-09-25.md`).
-2. **Loud failures** (ADR-0011): data that does not exist stops the run — it is
-   never synthesized; shape mismatches assert; NASA P10 Rule 5 sets the
-   assertion density; `--guard` is the recovery action.
-3. **The bench gate is alive**: `scripts/bench.sh canary|flagship` appends to
-   `benches/history.tsv`; a regression against the previous row blocks the
-   merge. Verdicts land as TSV rows, not prose.
-4. **One heavy thing at a time**: ram-guard service, MemoryMax cgroup caps,
-   slot caps, persistent logs in `~/logs`. The desktop survived three freezes
-   to learn this.
+## Table of contents
 
-## Data
+- [Architecture](#architecture)
+- [The doctrine](#the-doctrine)
+- [Presets](#presets)
+- [Quick start](#quick-start)
+- [Data pipeline](#data-pipeline)
+- [Performance](#performance)
+- [Status & roadmap](#status--roadmap)
+- [Docs](#docs)
+- [License](#license)
 
-The training corpus is DCLM-filtered (46.2 GB raw → ~20 GB kept). Eval is a
-carved tail that is excluded from the filtered corpus at filter time
-(two-region mode, straddler documents dropped — ADR-0010): held-out numbers
-measure generalization, not memorization. Cadence evals run on a 2 MiB slice
-every 500 steps; the full tail is reserved for milestones.
+## Architecture
 
-## Build & run
+One shared `LoopBlock`, run up to `max_iter` times per sequence (PonderNet
+halting decides how deep to think):
 
-Requires CUDA (developed on an RTX 5060 Ti, sm_120) and the vendored forks in
-`vendor/` (nothing builds without them).
+```mermaid
+flowchart LR
+    B[bytes 0..255] --> E[Embedding]
+    E --> L[LoopBlock x max_iter]
+    subgraph L[LoopBlock - shared weights, adaptive depth]
+        C[controller<br>sigmoid gates] --> K[KDA gated-delta<br>linear attention]
+        C --> G[Engram n-gram memory<br>host RAM, millions of rows]
+        C --> X[TSCT low-rank experts<br>fp8 forward, polar retract]
+        K & G & X --> H[halt head<br>PonderNet]
+    end
+    L --> N[RMSNorm fp32] --> HD[lm_head fp32] --> P[next byte]
+    H -.->|stop when confident| P
+```
+
+- **Engram memory** — FNV-hashed n-gram tables live in host RAM at millions of
+  rows; only the current batch's rows (~600 KB) touch the GPU per step.
+- **Spectral experts** — low-rank TSCT layers: fp32 masters, fp8 forward on
+  sm_120, per-step polar retraction with a one-way fp32 fallback on drift.
+- **Precision per component** — fp32 only where correctness demands it (GEMM
+  accumulate, logits, gates, masters); bf16/int8/fp4 where a measured A/B says
+  the bytes are wasted.
+- **Optimizer** — Muon+ (ColRow, routing-validated) on 2D matrices, AdamW on
+  embeddings/heads/1D, Adan as the fallback group.
+- **Aux heads** (configurable) — JEPA masked-latent vs an EMA teacher + KoLeo,
+  and a DSpark draft head for next-K prediction.
+
+## The doctrine
+
+1. **A/B or death** — every mechanism beats its own removal on held-out BPB at
+   a fixed step budget, or it is deleted. Ties delete. The same audit applies
+   to source lines: each one is held by a recorded verdict.
+2. **Loud failures** — data that does not exist stops the run, it is never
+   synthesized (a silent filler once trained a model on constant bytes for 500
+   steps); shape mismatches assert; assertions average ≥2 per non-trivial
+   function (NASA P10 Rule 5); `--guard` is the recovery action.
+3. **The bench gate is alive** — `benches/history.tsv` accumulates one row per
+   benchmark; a regression against the previous row blocks the merge. Verdicts
+   are rows, not prose.
+4. **One heavy thing at a time** — ram-guard service, MemoryMax cgroup caps,
+   slot caps, persistent logs. Learned from three full-system freezes.
+
+## Presets
+
+Flat TOML in [`configs/`](configs/) — presets are data, not code.
+
+| preset | d_model | experts | max_iter | target |
+|---|---|---|---|---|
+| `nano` | 512 | 3 | 4 | smoke tests |
+| `small` | 768 | 3 | 4 | **flagship on 16 GB** (7.53M params) |
+| `swift50` | 1024 | 8 | 8 | 50M-class experiments |
+| `base` | 1024 | 3 | 8 | 12.2M params |
+| `one_b` | 2048 | 4 | 12 | the 1B dream |
+| `p150` | 4096 | 4 | 12 | 159.7M params |
+
+## Quick start
+
+CUDA GPU required (developed on sm_120). The build pulls patched forks from
+`vendor/` — nothing works without them.
 
 ```sh
-cargo build-train   # release CUDA binary, no OpenBLAS
-./target/release/train --data <dir> --preset small --ckpt-name latest \
-  --ckpt-dir checkpoints --eval <held-out-dir> --eval-every 500
+git clone https://github.com/sehaxe/dormouse && cd dormouse
+cargo build-train                                    # release CUDA binary
+
+# train (all knobs are typed flags: --help)
+./target/release/train --data <corpus-dir> --preset small \
+  --ckpt-name latest --ckpt-dir checkpoints \
+  --eval <held-out-dir> --eval-every 500 \
+  --engram-ram --engram-slots 8000000 --guard --detach
+
+# generate + serve from the same checkpoint pair
+./target/release/generate --ckpt-name latest --ckpt-dir checkpoints --prompt "once"
+./target/release/serve   --ckpt-name latest --ckpt-dir checkpoints
+
+# the regression gate: one row per run, compare before merging
 ./scripts/bench.sh canary
 ```
 
-Every knob is a typed CLI flag: `./target/release/train --help`. Notable:
-`--no-kda` / `--no-msa` / `--no-engram`, `--quant` (TSCT factor format),
-`--act-quant`, `--opt`, `--engram-ram --engram-slots N`, `--host-adam-every`,
-`--guard`, `--log`, `--detach`. `generate` and `serve` load checkpoints from
-the same `--ckpt-dir`/`--ckpt-name` pair.
+Long runs survive: `--guard` re-execs on NaN/panic with a fresh CUDA context
+and resumes from the last checkpoint; `--detach` daemonizes in-process with
+`--log <file>`.
 
-## Status (2026-09-26)
+## Data pipeline
 
-On `main`: burn/cubecl 0.22.0-pre.4 (the memory-pool stale-page fix lives in
-`vendor/cubecl-fix` as slot-preserving pools), presets `use_msa = false`, the
-config seam with snapshot+drift check, loud-failure data pipeline, corpus v2.
-Open fronts, in order: flip the fusion backend and A/B it against the canary
-baseline; the fused-kernel rewrite rungs (ADR-0009 — direct adjoints seeded
-from saved buffers, hand matmuls replaced by autotuned ones, kill switch at
-parity); the official 100k-step baseline on corpus v2; the knife A/Bs (aux
-heads, GR, rank). The minimal-design path is written down in
-`docs/design-minimal.md` (~-60% LOC with zero functionality loss, sequenced at
-verdict moments).
+Streams bytes (text, parquet, images, binaries — a JPEG is just bytes to
+predict) through a 64 MB ring refilled in 8 MB chunks, seeded Fisher-Yates
+shuffled, split deterministically. `bin/filter.rs` is a DCLM-style corpus
+filter with a **two-region mode**: the eval tail is excluded from training
+data at filter time — straddler documents dropped, dedup shared — so held-out
+BPB measures generalization, never memorization (ADR-0010). A corrupt or
+missing corpus stops the run loudly; data is never synthesized.
+
+## Performance
+
+One GPU, one honest gate:
+
+| date | commit | mode | step | throughput | final CE |
+|---|---|---|---|---|---|
+| 2026-09-25 | bdddbaf | canary (2M slots, aux off) | 4081 ms | 1.23 KB/s | 5.141 |
+
+Every optimization lands by beating the previous row at equal or better BPB —
+fused-kernel rungs, the fusion backend, the bf16/int8 diets — or it is
+deleted. Full history: [`benches/history.tsv`](benches/history.tsv).
+
+## Status & roadmap
+
+**On `main` (2026-09-26):** burn/cubecl 0.22.0-pre.4 with a slot-preserving
+memory-pool fix vendored; MSA disabled pending a kernel rewrite + won A/B
+(ADR-0012); corpus v2 with leak-free eval; loud-failure data pipeline; the
+config seam with snapshot + drift check.
+
+Next, in order:
+
+- [ ] flip the fusion backend, A/B against the canary row
+- [ ] fused-kernel rungs: direct adjoints from saved buffers, autotuned
+      matmuls; kill switch at parity (ADR-0009)
+- [ ] the official 100k-step baseline on corpus v2
+- [ ] knife A/Bs: aux heads vs pure CE, GR vs ReZero, rank 64 vs 32
+- [ ] bf16/int8 diets for the host-RAM tables
+- [ ] code-domain corpus mixture → SFT → RLVR self-evolve loop
+      ([`POST_TRAINING.md`](POST_TRAINING.md))
 
 ## Docs
 
-- `AGENTS.md` — agent-facing repo state: measured numbers, GPU quirks, knobs.
-  Read before touching training code.
-- `docs/PLAN.md` — the program plan, phase ladder, verdicts, north star.
-- `docs/adr/0001..0012` — every recorded decision (config seam, A/B doctrine,
-  fused verdicts, context ladder, research verdicts, scaling, reasoning,
-  fused rungs, corpus v2, loud failures, MSA).
-- `docs/audit-2026-09-25.md` — the codebase verdict audit (kill list, P10
-  violations, missing A/Bs).
-- `docs/design-minimal.md` — the minimal-architecture target and its math.
-- `docs/fused-verification-2026-09-23.md`,
-  `research/2026-09-25-fused-rewrite-plan.md` — the fused story: verification,
-  the measured loss, the rewrite plan.
-- `research/` — research notes (per-GB SOTA, fast-training kernels, NASA/burn
-  practices).
-- `bf16_KERNEL_PLAN.md`, `POST_TRAINING.md` — in Russian: bf16 kernel rules,
-  and the post-training plan (SFT, RLVR, distillation, self-evolve).
+| doc | what |
+|---|---|
+| [`AGENTS.md`](AGENTS.md) | agent-facing repo state: measured numbers, GPU quirks, knobs |
+| [`docs/PLAN.md`](docs/PLAN.md) | program plan, phase ladder, verdicts, north star |
+| [`docs/adr/`](docs/adr/) | ADR-0001..0012 — every recorded decision |
+| [`docs/audit-2026-09-25.md`](docs/audit-2026-09-25.md) | the codebase verdict audit: kill list, P10 violations, missing A/Bs |
+| [`docs/design-minimal.md`](docs/design-minimal.md) | the minimal-architecture target (~-60% LOC, zero loss) |
+| [`research/2026-09-25-fused-rewrite-plan.md`](research/2026-09-25-fused-rewrite-plan.md) | why fused was slow, the rewrite rungs |
+| [`POST_TRAINING.md`](POST_TRAINING.md) | post-training loop (in Russian) |
+
+## License
+
+[MIT](LICENSE) © 2026 sehaxe
