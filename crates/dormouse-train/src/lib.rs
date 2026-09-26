@@ -514,7 +514,9 @@ pub fn train_loop(
     if step > 0 {
         // Resume: fast-forward past bytes already trained on, or the stream
         // rewinds to byte 0 and the run memorizes the corpus head.
-        stream.skip_bytes((step as u64) * (cfg.batch * cfg.seq_len) as u64);
+        let skip = (step as u64) * (cfg.batch * cfg.seq_len) as u64;
+        stream.skip_bytes(skip);
+        println!("stream resume: skipped {skip} bytes (step {step})");
     }
     let mut eval_stream =
         eval_data.as_ref().map(|p| dormouse_data::ByteStream::new(cfg.seq_len, cfg.batch, p));

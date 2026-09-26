@@ -20,7 +20,7 @@ toml = "0.8"
 burn = { version = "0.22.0-pre.4", default-features = false, features = ["std", "autodiff", "optim"] }
 burn-tensor = { version = "0.22.0-pre.4", default-features = false }
 burn-ndarray = { optional = true, version = "0.22.0-pre.4", features = ["blas-openblas"] }
-burn-cuda = { version = "0.22.0-pre.4", default-features = false, features = ["std", "cpp"] }
+burn-cuda = { version = "0.22.0-pre.4", default-features = false, features = ["std", "autotune"] }
 burn-dispatch = { version = "0.22.0-pre.4", default-features = false }
 cubecl-runtime = { version = "0.11.0-pre.4", default-features = false }
 cubecl-cuda = { version = "0.11.0-pre.4", default-features = false }
