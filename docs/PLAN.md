@@ -2,6 +2,12 @@
 
 Started 2026-09-21 from the architecture grill session. Decisions live in `docs/adr/`, shared language lives in `CONTEXT.md`, evidence lives in `research/2026-09-21-per-gb-sota.md`. Update this file as phases close; do not re-litigate recorded ADRs without new evidence.
 
+## Status
+
+2026-09-26: pre.4 merged to main; the official fp32 baseline (corpus v2, small,
+8M slots, iter4, 100k steps) is RUNNING (log: ~/logs/official_baseline.log,
+ckpt: ~/official_baseline). All optimization A/Bs pause-bench-resume against it.
+
 ## North star (2026-09-25)
 
 The model must be able to code and code its own updates. Not recursive
