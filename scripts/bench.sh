@@ -29,6 +29,13 @@ case "$MODE" in
           --steps 30 --log-every 10 --timers)
     BYTES_PER_STEP=$((10*512))
     ;;
+  canary-bf16)
+    [ "$AVAIL" -ge 6 ] || { echo "bench: need >=6G available, have ${AVAIL}G"; exit 1; }
+    ARGS=(--preset small --batch 10 --seq-len 512 --jepa-weight 0 --dspark-weight 0 --bf16
+          --engram-ram --engram-slots 2000000 --host-adam-every 0
+          --steps 30 --log-every 10 --timers)
+    BYTES_PER_STEP=$((10*512))
+    ;;
   flagship)
     [ "$AVAIL" -ge 25 ] || { echo "bench: need >=25G available, have ${AVAIL}G"; exit 1; }
     ARGS=(--preset small --batch 10 --seq-len 512
@@ -36,7 +43,7 @@ case "$MODE" in
           --steps 50 --log-every 10 --timers --memlog)
     BYTES_PER_STEP=$((10*512))
     ;;
-  *) echo "usage: bench.sh [canary|flagship]"; exit 1;;
+  *) echo "usage: bench.sh [canary|canary-bf16|flagship]"; exit 1;;
 esac
 
 BIN=./target/release/train
