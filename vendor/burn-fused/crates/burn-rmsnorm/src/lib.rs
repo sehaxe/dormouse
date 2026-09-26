@@ -21,13 +21,18 @@ pub struct RMSNorm {
 impl RMSNorm {
     pub fn new(d_model: usize, eps: f32, device: &Device) -> Self {
         Self {
-            // require_grad is mandatory: burn 0.22-pre.3's Param::initialized
-            // inherits the tensor's flag and Tensor::ones defaults to false,
-            // which froze the weight at 1.0 for the whole training (found by
-            // dormouse's model_seam gradient_flow test, 2026-09-21).
+            // pre.3 required require_grad here (Param::initialized inherits
+            // the flag; without it the weight froze — model_seam
+            // gradient_flow, 2026-09-21). pre.4 panics on require_grad for
+            // non-autodiff devices (raw-launch modules), and still needs the
+            // flag on autodiff devices — so branch on the device context.
             weight: Param::initialized(
                 ParamId::new(),
-                Tensor::ones([d_model], device).require_grad(),
+                if device.is_autodiff() {
+                    Tensor::ones([d_model], device).require_grad()
+                } else {
+                    Tensor::ones([d_model], device)
+                },
             ),
             eps,
         }

@@ -191,6 +191,7 @@ fn arms_inner_adjoint(
     let normed_l = Tensor::<2>::from_inner(
         Tensor::<1>::from_primitive::<CB>(pi.normed.clone()).reshape([bt, d]),
     )
+    .autodiff()
     .require_grad();
     // Disabled arms produce zeros in this forward; they must carry the
     // AUTODIFF representation or they end up on the bare-CUDA LHS of ops
@@ -200,10 +201,12 @@ fn arms_inner_adjoint(
     let hctx_l = Tensor::<2>::from_inner(
         Tensor::<1>::from_primitive::<CB>(pi.h_ctx.clone()).reshape([bt, d]),
     )
+    .autodiff()
     .require_grad();
     let raw_l = Tensor::<2>::from_inner(
         Tensor::<1>::from_primitive::<CB>(pi.raw.clone()).reshape([bt, pad]),
     )
+    .autodiff()
     .require_grad();
     let dh_l =
         Tensor::<2>::from_inner(Tensor::<1>::from_primitive::<CB>(dy_flat.clone()).reshape([bt, d]));
@@ -230,6 +233,7 @@ fn arms_inner_adjoint(
     let (eng, rows_tracked) = match rows {
         Some(rows) => {
             let rl = Tensor::<2>::from_inner(Tensor::<2>::from_primitive::<CB>(rows.clone()))
+                .autodiff()
                 .require_grad();
             let e = lb_ad
                 .engram

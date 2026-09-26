@@ -97,6 +97,15 @@ pub(crate) fn cube_int2(t: &Tensor<2, Int>) -> Option<CubeTensor> {
     t.clone().try_into_primitive::<CB>().ok()
 }
 
+/// Model-world (autodiff-context) int tensors: pre.4's dispatch requires the
+/// conversion through the autodiff backend type — the concrete conversion
+/// refuses `autodiff == Enabled` tensors.
+pub(crate) fn cube_int2_ad(t: &Tensor<2, Int>) -> Option<CubeTensor> {
+    // Int tensors are not autodiff-tracked: the Autodiff backend's int
+    // primitive IS the bare CubeTensor.
+    t.clone().try_into_primitive::<CAd>().ok()
+}
+
 pub(crate) fn zeros1(dev: &Device, n: usize) -> (Tensor<1>, CubeTensor) {
     let t = Tensor::<1>::zeros([n], dev);
     let c = cube_of1(&t).expect("fused op requires CUDA tensors");
@@ -701,7 +710,7 @@ where
         &dev,
     );
     let prior_c = cube_of1(&dense(prior_t)).expect("cuda prior");
-    let tgt_c = cube_int2(&inp.targets).expect("cuda targets");
+    let tgt_c = cube_int2_ad(&inp.targets).expect("cuda targets");
 
     let mut keep2: Vec<Tensor<2>> = Vec::new();
     let mut keep1: Vec<Tensor<1>> = Vec::new();
@@ -1335,7 +1344,7 @@ where
     let dev = x_t.device();
     let prior_t = Tensor::<1>::from_data(burn::tensor::TensorData::new(prior_v.clone(), [n_iter]), &dev);
     let prior_c = cube_of1(&dense(prior_t)).expect("cuda prior");
-    let tgt_c = cube_int2(&inp.targets).expect("cuda targets");
+    let tgt_c = cube_int2_ad(&inp.targets).expect("cuda targets");
     let mut keep2: Vec<Tensor<2>> = Vec::new();
     let mut keep1: Vec<Tensor<1>> = Vec::new();
     let mut ats: Vec<AdPrim> = Vec::with_capacity(61);

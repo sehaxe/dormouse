@@ -45,7 +45,7 @@ fn mini_nano() -> DormouseConfig {
         head_dim: 32,
         d_ffn: 256,
         rank: 32,
-        msa_topk: 4,
+        use_msa: false,
         ..nano_cfg()
     }
 }
@@ -331,9 +331,15 @@ fn gradient_flow() {
     // Documented grad-free params (see the test doc): the MSA indexer (no
     // differentiable path) and the RMSNorm gains (burn-rmsnorm require_grad
     // bug). Anything else missing is a regression.
+    // MSA params are structurally grad-free while the arm is off (ADR-0012:
+    // use_msa=false gates the forward; the module is still constructed).
     const KNOWN_GRAD_FREE: &[&str] = &[
         "loop_block.shared_attn.msa.index_branch.q_proj.weight",
         "loop_block.shared_attn.msa.index_branch.k_proj.weight",
+        "loop_block.shared_attn.msa.attention.q_proj.weight",
+        "loop_block.shared_attn.msa.attention.k_proj.weight",
+        "loop_block.shared_attn.msa.attention.v_proj.weight",
+        "loop_block.shared_attn.msa.attention.out_proj.weight",
         "loop_block.norm.weight",
         "norm.weight",
     ];
