@@ -323,6 +323,30 @@ impl ByteStream {
         out
     }
 
+    /// Fast-forward by `n` bytes (resume): a resumed run must continue on
+    /// UNSEEN data — the stream otherwise rewinds to byte 0 and the model
+    /// re-reads (and memorizes) the corpus head, collapsing train CE
+    /// (pretrain v2, 2026-09-26). Exact: the unread-buffer remainder stays
+    /// buffered, nothing is skipped twice and nothing is lost.
+    pub fn skip_bytes(&mut self, mut n: u64) {
+        while n > 0 {
+            if self.buf.len() - self.pos == 0 {
+                self.refill();
+            }
+            let buffered = (self.buf.len() - self.pos) as u64;
+            if buffered == 0 {
+                break; // refill's dry assert has already fired for real corpora
+            }
+            let take = buffered.min(n);
+            self.pos += take as usize;
+            n -= take;
+            if self.pos > self.capacity / 2 {
+                self.buf.drain(0..self.pos);
+                self.pos = 0;
+            }
+        }
+    }
+
     /// Next `(bytes, hashes)` batch. Falls back to padding when data is short.
     pub fn next_batch(&mut self) -> (Vec<u8>, Vec<i64>) {
         self.next_batch_with_tables([4096, 4096, 4096])
@@ -371,5 +395,22 @@ mod tests {
     #[should_panic(expected = "non-empty file list")]
     fn empty_file_list_is_loud() {
         ByteStream::from_files(8, 2, Vec::new(), 1);
+    }
+
+    #[test]
+    fn skip_bytes_resumes_exactly() {
+        let dir = std::env::temp_dir().join(format!("dormouse_skip_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pattern: Vec<u8> = (0..256u32).map(|i| (i * 7 % 251) as u8).cycle().take(1 << 20).collect();
+        let f = dir.join("corpus.bin");
+        std::fs::write(&f, &pattern).unwrap();
+        let (seq, batch) = (8usize, 2usize);
+        let mut s = ByteStream::new(seq, batch, &dir);
+        let skip = 1000u64;
+        s.skip_bytes(skip);
+        let (bytes, _) = s.next_batch();
+        assert_eq!(bytes.len(), seq * batch);
+        assert_eq!(bytes[..], pattern[skip as usize..skip as usize + seq * batch]);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
