@@ -2,6 +2,24 @@
 
 Started 2026-09-21 from the architecture grill session. Decisions live in `docs/adr/`, shared language lives in `CONTEXT.md`, evidence lives in `research/2026-09-21-per-gb-sota.md`. Update this file as phases close; do not re-litigate recorded ADRs without new evidence.
 
+## CRITICAL FINDING 2026-09-26: the Engram eats the core's gradient
+
+official_v3 (fp32, sharded corpus): train CE -> 0.10 (Engram memorizes the
+stream at lookup speed) while held-out EVAL froze at EXACTLY BPB 8.000 —
+a uniform distribution over 256 bytes — from step ~1000 onward. The core
+model collapsed to constant outputs on unseen data: the memory explains the
+targets by itself, the residual gradient reaching the core is ~0, and an
+ungradiented core decays to uniform. Every earlier run's flat eval curve was
+this same failure seen too early to recognize.
+
+Probe running: core_probe (identical run, --no-engram, 3k steps, eval@250).
+If its eval descends, the core learns language when the memory is silent —
+and the fix is one of: (1) core-first warmup with the engram off, (2) an
+engram output gate initialized closed (the memory joins only where it beats
+the core on the residual), (3) a row-lr diet. The Qwen report's rule — memory
+is auxiliary and gated, the core carries the language — is the design law
+here.
+
 ## Status
 
 2026-09-26: pre.4 merged to main; the official fp32 baseline (corpus v2, small,
