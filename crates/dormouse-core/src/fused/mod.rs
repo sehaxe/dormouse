@@ -1504,7 +1504,6 @@ where
     // FENCE BEFORE FIRST RAW LAUNCH
     sync(&client);
     for fc in experts_c.iter().flat_map(|p| p.iter()).chain(std::iter::once(&op.0)).chain(std::iter::once(&lm.0)) {
-        crate::fused::kernels::arms::launch_gdn2_chunk_dummy(&client);
         let n_u = fc.u.meta.shape().dims::<2>().iter().product::<usize>();
         let n_v = fc.v.meta.shape().dims::<2>().iter().product::<usize>();
         unsafe {

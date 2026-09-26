@@ -8,7 +8,7 @@ license.workspace = true
 burn = { version = "0.22.0-pre.4", default-features = false, features = ["std", "extension"] }
 burn-tensor = { version = "0.22.0-pre.4", default-features = false }
 burn-nn = { version = "0.22.0-pre.4", default-features = false }
-burn-cuda = { version = "0.22.0-pre.4", default-features = false, features = ["std", "fusion"] }
+burn-cuda = { version = "0.22.0-pre.4", default-features = false, features = ["std"] }
 burn-kda = { path = "../../vendor/burn-fused/crates/burn-kda" }
 burn-msa = { path = "../../vendor/burn-fused/crates/burn-msa" }
 burn-bitnet = { path = "../../vendor/burn-fused/crates/burn-bitnet" }

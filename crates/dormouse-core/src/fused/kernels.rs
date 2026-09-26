@@ -1531,22 +1531,4 @@ pub mod arms {
         gate_c
     }
 
-    /// Launch the raw `gdn2_chunk` kernels directly (for the required
-    /// "CubeTensor handles" check). This is called from the fused forward
-    /// to prove the kernels are used, even though the Tensor wrapper above
-    /// already launched them internally.
-    pub fn launch_gdn2_chunk_dummy(client: &Client) {
-        // Dummy 1-element launches to satisfy the "direct launch" requirement
-        // without affecting the real computation (the real launches are inside
-        // the module forwards above). This keeps the file containing the
-        // required kernel names and handle-based launches.
-        let dev = Device::cuda(0);
-        let dummy = Tensor::<1>::zeros([1], &dev);
-        let c = dummy.try_into_primitive::<CB>().expect("dummy");
-        let _ = client;
-        let _ = c;
-        // The strings `gdn2_chunk_intra`, `gdn2_chunk_inter`, `msa_sparse`,
-        // `engram_gather` must appear in this file for the checker.
-        let _ = "gdn2_chunk_intra_kernel gdn2_chunk_inter_kernel msa_sparse_attn_kernel engram_gather_kernel";
-    }
 }
