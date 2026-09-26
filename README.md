@@ -41,16 +41,18 @@ halting decides how deep to think):
 
 ```mermaid
 flowchart LR
-    B[bytes 0..255] --> E[Embedding]
-    E --> L[LoopBlock x max_iter]
-    subgraph L[LoopBlock - shared weights, adaptive depth]
-        C[controller<br>sigmoid gates] --> K[KDA gated-delta<br>linear attention]
-        C --> G[Engram n-gram memory<br>host RAM, millions of rows]
-        C --> X[TSCT low-rank experts<br>fp8 forward, polar retract]
-        K & G & X --> H[halt head<br>PonderNet]
+    B["bytes 0..255"] --> E["Embedding"]
+    E --> L
+    subgraph L ["LoopBlock: shared weights, adaptive depth"]
+        C["controller: sigmoid gates"] --> K["KDA gated-delta attention"]
+        C --> G["Engram n-gram memory"]
+        C --> X["TSCT low-rank experts"]
+        K --> H["halt head: PonderNet"]
+        G --> H
+        X --> H
     end
-    L --> N[RMSNorm fp32] --> HD[lm_head fp32] --> P[next byte]
-    H -.->|stop when confident| P
+    L --> N["RMSNorm fp32"] --> HD["lm_head fp32"] --> P["next byte"]
+    H -.->|"stop when confident"| P
 ```
 
 - **Engram memory** — FNV-hashed n-gram tables live in host RAM at millions of
