@@ -80,7 +80,8 @@ fn main() {
             b_v.clone(),
             st0.clone(),
             16,
-        );
+        )
+        .expect("fused must run");
     }
     let n = 200;
     let t0 = std::time::Instant::now();
@@ -94,7 +95,8 @@ fn main() {
             b_v.clone(),
             st0.clone(),
             16,
-        );
+        )
+        .expect("fused must run");
         std::hint::black_box(o.shape());
         std::hint::black_box(s.shape());
     }
