@@ -123,14 +123,31 @@ impl DormouseModel {
             + DispatchKindConversion<B::InnerBackend>
             + DispatchKindConversion<burn::backend::Autodiff<B::InnerBackend>>,
     {
-        let ids_raw = targets.clone();
-        // Teacher latent over the same inputs (the student predicts its own
-        // out_acc against it). This is the second full forward the offline
-        // path exists to eliminate.
-        let teacher_latent = teacher
-            .zip(ids_raw.as_ref())
-            .map(|(t, ids)| t.forward_latent::<B>(ids.clone(), None, None));
-        drop(ids_raw);
+        // The teacher consumes EXACTLY the student's three inputs, so the JEPA
+        // target is the student's own latent under EMA weights and the teacher
+        // is the student's architecture with different weights (same arms
+        // live). This is the definition `precompute_jepa_targets` implements
+        // offline (`forward_latent(x, Some(h), None)`): the two paths must
+        // agree or `--jepa-targets` is a different objective. NOT `targets` -
+        // that is the one-byte-shifted LABEL sequence, and `None` keys leave
+        // the Engram arm inert (no keys -> the memory branch is zeros), i.e. a
+        // structurally different network on a different input; that was this
+        // function's state from the aux objectives' first commit, and no
+        // finite/closeness test could see it. Pinned by
+        // `teacher_target_is_the_student_latent` in tests/jepa_teacher_seam.rs.
+        //
+        // `host_rows` is detached: same values, no grad-carrying leaf. The
+        // teacher's params are no_grad-frozen, so a live row leaf would put a
+        // second full forward on the tape (~2x activations, the step-0 OOM
+        // axis). The RAM tables have no EMA copy (they live on the host,
+        // outside the Module), so both sides read the same rows there.
+        let teacher_latent = teacher.zip(targets.as_ref()).map(|(t, _)| {
+            t.forward_latent::<B>(
+                input_ids.clone(),
+                hashed_ids.clone(),
+                host_rows.clone().map(|r| r.detach()),
+            )
+        });
         self.forward_with_latent::<B>(
             input_ids, hashed_ids, host_rows, targets, teacher_latent,
         )
@@ -171,6 +188,13 @@ impl DormouseModel {
             + DispatchKindConversion<B::InnerBackend>
             + DispatchKindConversion<burn::backend::Autodiff<B::InnerBackend>>,
     {
+        // DSpark's window tokens only (the JEPA teacher's input is
+        // `input_ids` above, see `forward_with_hidden`). KNOWN, NOT FIXED:
+        // these are the LABEL sequence, so the draft head's step s is fed
+        // x[p+s+1] and trained to emit x[p+s+2] - a one-position shift
+        // against the sequence the model actually consumed. Changing it
+        // changes every DSpark number, so it needs its own A/B, not a
+        // drive-by in a JEPA bugfix.
         let ids_raw = targets.clone();
         let x = self.embedding.forward(input_ids);
         let x = if self.bf16 {
