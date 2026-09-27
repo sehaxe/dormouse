@@ -429,6 +429,21 @@ The defenses are installed, not optional.
   re-pricing; the measured numbers are in `tests/preset_exec.rs` and the README
   table, and the 7.5M figure is still hardcoded as a test constant
   (`loop_block.rs:706`) and asserted in a doc comment (`schema.rs:130`).
+- **"the fused KDA op is 11.2x faster than PyTorch on fwd+bwd" (2026-09-28).**
+  Only the FORWARD claim survives. `alloc_probe` and both benches build their
+  device as `Device::autodiff(...)` = NoCheckpointing and enter the node with
+  `B = Autodiff<..>`, where the adjoint's `TypeId` gate at
+  `chunk_adjoint_cube.rs:399` returned `None` — so the **tensor** adjoint ran
+  and the measured fwd+bwd time contained it. Worse,
+  `fused_chunk_verify.rs:132` (`fused_op_grads_match_tensor_path_cuda`)
+  compared that tensor adjoint against the tensor path, i.e. **verified the
+  tensor adjoint twice**, and the only caller of `fused_chunk_backward` in the
+  whole tree is `bench_fused_bwd.rs:146` — bare tensors, inside a timer, result
+  discarded. The fused adjoint kernels have therefore never been numerically
+  compared to anything. A counter placed BEFORE that gate is what let the CUDA
+  gate test assert `bwd > 0` and pass; it now sits after the gate (`f737710`),
+  so the test is **deliberately red** until the backward gate lands. Do not
+  quote a fused fwd+bwd number until the new gradient comparison is green.
 
 ## 3.3 Broken, open, or undocumented
 
