@@ -1,0 +1,35 @@
+# A/B arm: small + MoR (Mixture-of-Recursions, arXiv 2507.10524).
+# A copy of `small` with ONLY the three MoR lines changed, so control-vs-MoR
+# differs in nothing else. NOT combinable with --rand-depth (both buy depth
+# robustness; `dormouse_train::resolve` refuses the pair loudly).
+bf16 = false
+act_group = 0
+d_model = 768
+n_heads = 12
+head_dim = 64
+d_ffn = 2048
+vocab = 256
+max_seq_len = 512
+max_iter = 4
+rank = 64
+norm_eps = 0.001
+use_kda = true
+use_engram = true
+use_gr = false
+n_experts = 3
+jepa_weight = 0.05
+jepa_mask_frac = 0.15
+jepa_mask_span = 8
+dspark_weight = 0.1
+dspark_k = 4
+dspark_stride = 16
+engram_rows = 500000
+engram_orders = [2, 3, 4]
+engram_dim = 32
+engram_lam_max = 0.5
+# MoR on: top-2 of the 4 iteration slots per position, BCE aux at 0.05. The
+# A/B runs pure CE (--jepa-weight 0 --dspark-weight 0), so this BCE is the only
+# auxiliary the MoR arm has and the control has none.
+use_mor = true
+mor_k = 2
+mor_bce_weight = 0.05

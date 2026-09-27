@@ -6,7 +6,10 @@ pub mod config;
 pub mod gr;
 pub mod loop_block;
 pub mod model;
+pub mod mor;
 pub mod param;
+pub mod probe;
+pub mod routing;
 
 pub use attention::{fused_seam_counts, AdaptiveAttention};
 pub use aux::{AuxHeads, TEACHER_MOMENTUM};
@@ -14,6 +17,7 @@ pub use config::{ActQuant, DormouseConfig};
 pub use loop_block::{ExpertFFN, LoopBlock};
 pub use model::DormouseModel;
 pub use param::LinearLike;
+pub use routing::{Group, GroupCounts, Role, Routed, Routing};
 
 pub fn fnv_hash(bytes: &[u8]) -> u64 {
     let mut h: u64 = 1469598103934665603;
@@ -39,7 +43,7 @@ mod tests {
     /// bandwidth optimization, not a semantics change.
     #[test]
     fn gather_ce_matches_one_hot() {
-        let dev = burn::tensor::Device::ndarray();
+        let dev = burn::tensor::Device::flex();
         let (n, v): (usize, usize) = (128, 256);
         let logits = Tensor::<2>::random([n, v], Distribution::Normal(0.0, 4.0), &dev);
         let tgt: Vec<i64> = (0..n).map(|i| (i * 7 + 3) as i64 % v as i64).collect();

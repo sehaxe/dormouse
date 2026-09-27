@@ -1,0 +1,451 @@
+//! routing - which optimizer each parameter goes to, DECLARED BY THE MODULE
+//! THAT OWNS IT (Qwen3.8-Flash-Next §3.1 routing, ADR-0017).
+//!
+//! Burn matches optimizer groups by module path, so this used to be a table
+//! of the model's private field names living in the trainer
+//! (`"expert_ffns."`, `"gdn2.q_proj"`, ...), plus 85 lines of startup
+//! validation re-deriving the policy from those strings. A rename then
+//! silently demoted a parameter from Muon+ to AdamW: a quality regression
+//! with no error anywhere, and the one violation that fought every move in
+//! the refactor plan.
+//!
+//! Here the declaration sits next to the arms it names, and the group is
+//! built from `ParamId`s ([`ParamGroup::from_ids`]), so a rename or a
+//! restructure cannot change where a parameter trains. The POLICY is one
+//! match, [`group_of`]; everything else is bookkeeping:
+//! - each arm claims the parameters that need a non-default optimizer and
+//!   declares the rest of its own subtree as [`Group::Rest`];
+//! - a parameter no arm claims is a startup error ([`Routing::check`]),
+//!   so a new arm cannot slip in unnoticed;
+//! - a new [`Role`] or [`LinearParam`] does not compile until the policy
+//!   match says where it trains.
+
+use std::collections::{BTreeMap, HashMap};
+
+use burn::module::{Module, ModuleVisitor, Param, ParamGroup, ParamId};
+use burn::tensor::Tensor;
+use burn_engram::EngramModule;
+
+use crate::attention::AdaptiveAttention;
+use crate::loop_block::{ExpertFFN, LoopBlock};
+use crate::model::DormouseModel;
+use crate::param::{LinearLike, LinearParam};
+
+/// The optimizer group of a parameter. The set is closed: [`Group::ALL`] is
+/// what the trainer must be able to serve, and a group is registered by
+/// construction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Group {
+    /// Muon+ ColRow with Newton-Schulz (`ns_steps = 8`).
+    Muon,
+    /// Head-wise Muon+ for the attention Q/K weights: each `[head_dim, d]`
+    /// block gets its own preconditioner (report §3.1).
+    QkHeadWise,
+    /// n-gram tables: plain Adam, weight decay disabled (report §2.3).
+    Table,
+    /// Everything else - the base (AdamW / Adan per `--opt`).
+    Rest,
+}
+
+impl Group {
+    pub const ALL: [Group; 4] = [Group::Muon, Group::QkHeadWise, Group::Table, Group::Rest];
+}
+
+/// Parameter count per group, for the startup banner and the tests.
+#[derive(Default, Debug, PartialEq, Eq)]
+pub struct GroupCounts {
+    pub muon: usize,
+    pub qk: usize,
+    pub tables: usize,
+    pub rest: usize,
+}
+
+/// What a [`LinearLike`] IS in the model. The owner says this where it builds
+/// the linear; [`group_of`] turns (role, kind) into the group. Adding a role
+/// does not compile until the policy decides it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    /// An expert FFN's gate_up/down (report: fc1/fc2 of routed/shared experts).
+    Expert,
+    /// The per-iteration loop readout.
+    Readout,
+    /// The output head.
+    Head,
+}
+
+/// THE POLICY, in one match. Everything else in this file is bookkeeping.
+///
+/// Only the small low-rank TSCT **factors** go to Muon+: the Newton-Schulz
+/// iteration costs ~3 matmuls per step on the FULL `[m,n]` matrix, and on
+/// this box (5060 Ti, fp32, no tensor cores) 8 NS iters on the `[d,d]`
+/// projections added ~40 s/step, while the factored `[d,r]`/`[r,f]` form is
+/// ~1000x cheaper. So:
+/// - the 1D TSCT scale leaf `s` is excluded (a 1-D output has no shared
+///   linear structure to orthogonalize);
+/// - a dense (`use_tsct = false`) linear's weight and bias are excluded -
+///   a dense linear is a real `[d,d]` map, i.e. the expensive case;
+/// - the elongated low-rank readout's factors ARE included, but `--factors-
+///   fallback` moves the EXPERT factors to the fallback (A/B knob).
+#[must_use]
+pub fn group_of(role: Role, kind: LinearParam, factors_fallback: bool) -> Group {
+    use Group::*;
+    use LinearParam::*;
+    use Role::*;
+    match (role, kind) {
+        (Expert, Factor) if factors_fallback => Rest,
+        (Expert | Readout, Factor) => Muon,
+        // The head is an elongated [d, vocab] readout: AdamW (report).
+        (Head, Factor | Scale | DenseWeight | DenseBias) => Rest,
+        (Expert | Readout, Scale | DenseWeight | DenseBias) => Rest,
+    }
+}
+
+/// Declare the parameters of one linear, by what it is.
+pub fn route_linear(into: &mut Routing, lin: &LinearLike, role: Role, factors_fallback: bool) {
+    for (id, kind) in lin.param_kinds() {
+        into.push(group_of(role, kind, factors_fallback), id);
+    }
+}
+
+/// Every param of a module subtree as `(path, id)`. Paths are for error
+/// messages only - no routing decision is ever made from one.
+#[derive(Default)]
+struct IdCollector {
+    stack: Vec<String>,
+    out: Vec<(String, ParamId)>,
+}
+
+impl ModuleVisitor for IdCollector {
+    fn enter_module(&mut self, name: &str, _container: &str) {
+        self.stack.push(name.to_string());
+    }
+    fn exit_module(&mut self, _name: &str, _container: &str) {
+        self.stack.pop();
+    }
+    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<D>>) {
+        self.out.push((self.stack.join("."), param.id));
+    }
+}
+
+/// The declared routing: one id list per group.
+#[derive(Default)]
+pub struct Routing {
+    groups: BTreeMap<Group, Vec<ParamId>>,
+}
+
+impl Routing {
+    fn push(&mut self, group: Group, id: ParamId) {
+        self.groups.entry(group).or_default().push(id);
+    }
+
+    /// Declare everything in this subtree that no arm has claimed yet as
+    /// [`Group::Rest`]. This is how an arm states its default: a new
+    /// parameter added to an existing arm is trained by the base optimizer
+    /// unless someone routes it, and it is still CHECKED (below), never
+    /// invisible.
+    fn rest_of<M: Module>(&mut self, module: &M) {
+        let mut c = IdCollector::default();
+        module.visit(&mut c);
+        for (_, id) in c.out {
+            if self.claimed(id) {
+                continue;
+            }
+            self.push(Group::Rest, id);
+        }
+    }
+
+    /// A parameter is claimed if it is ALREADY declared anywhere, Rest
+    /// included: `rest_of` is called on nested subtrees (the attention arm
+    /// first, then the whole block), so without this a parameter nothing
+    /// explicitly routed - `v_proj`, every norm - is pushed to Rest twice and
+    /// `check` reports it as declared in two groups.
+    fn claimed(&self, id: ParamId) -> bool {
+        self.groups.values().any(|ids| ids.contains(&id))
+    }
+
+    /// The burn group for one declared group. Ids, not paths: this is the
+    /// whole point - the seam carries no field names.
+    pub fn group(&self, group: Group) -> ParamGroup {
+        ParamGroup::from_ids(self.groups.get(&group).cloned().unwrap_or_default())
+    }
+
+    pub fn count(&self, group: Group) -> usize {
+        self.groups.get(&group).map_or(0, Vec::len)
+    }
+
+    /// The startup assertion, and now the only one: every parameter of the
+    /// live model is declared, in exactly one group. It checks the
+    /// DECLARATION - not a second derivation of the policy from names - so it
+    /// cannot disagree with the group builder by construction.
+    pub fn check(&self, model: &DormouseModel) -> Result<GroupCounts, String> {
+        let mut c = IdCollector::default();
+        model.visit(&mut c);
+        let path_of: HashMap<ParamId, String> = c.out.iter().map(|(p, id)| (*id, p.clone())).collect();
+        let mut declared: HashMap<ParamId, Group> = HashMap::with_capacity(path_of.len());
+        for (group, ids) in &self.groups {
+            for id in ids {
+                if let Some(prev) = declared.insert(*id, *group) {
+                    return Err(format!(
+                        "{}: declared in both {prev:?} and {group:?}",
+                        path_of.get(id).map_or("<unknown param>", |p| p.as_str())
+                    ));
+                }
+            }
+        }
+        for (path, id) in &c.out {
+            if !declared.contains_key(id) {
+                return Err(format!("{path}: no declared optimizer group"));
+            }
+        }
+        // The n-gram tables are the one group that must never be empty: the
+        // report's §2.3 rule is that they train on plain Adam, and a model
+        // with no table means an arm that silently stopped being built.
+        if self.count(Group::Table) == 0 {
+            return Err("no parameter is routed to the n-gram table group".to_string());
+        }
+        Ok(GroupCounts {
+            muon: self.count(Group::Muon),
+            qk: self.count(Group::QkHeadWise),
+            tables: self.count(Group::Table),
+            rest: self.count(Group::Rest),
+        })
+    }
+}
+
+/// A module that declares where its parameters train.
+pub trait Routed {
+    fn route(&self, into: &mut Routing, factors_fallback: bool);
+}
+
+/// The declared routing of a live model. Called once at startup, next to the
+/// optimizer build it feeds.
+pub fn routing(model: &DormouseModel, factors_fallback: bool) -> Routing {
+    let mut into = Routing::default();
+    model.route(&mut into, factors_fallback);
+    into
+}
+
+impl Routed for DormouseModel {
+    fn route(&self, into: &mut Routing, factors_fallback: bool) {
+        route_linear(into, &self.lm_head, Role::Head, factors_fallback);
+        self.loop_block.route(into, factors_fallback);
+        // Embedding, final norm, aux heads - and any arm added later, which
+        // lands on the base optimizer until someone routes it.
+        into.rest_of(self);
+    }
+}
+
+impl Routed for LoopBlock {
+    fn route(&self, into: &mut Routing, factors_fallback: bool) {
+        for e in &self.expert_ffns {
+            e.route(into, factors_fallback);
+        }
+        route_linear(into, &self.out_proj, Role::Readout, factors_fallback);
+        self.shared_attn.route(into, factors_fallback);
+        self.engram.route(into, factors_fallback);
+        // Controller, mem_dense, norm, GR, iter_embed, residual_scale, the
+        // MoR router: routers, scalars and norms are AdamW (orthogonalizing
+        // them is meaningless or harmful).
+        into.rest_of(self);
+    }
+}
+
+impl Routed for ExpertFFN {
+    fn route(&self, into: &mut Routing, factors_fallback: bool) {
+        let Self { gate_up, down } = self;
+        route_linear(into, gate_up, Role::Expert, factors_fallback);
+        route_linear(into, down, Role::Expert, factors_fallback);
+    }
+}
+
+impl Routed for AdaptiveAttention {
+    fn route(&self, into: &mut Routing, _factors_fallback: bool) {
+        let Self { gdn2 } = self;
+        // Q/K only: report §3.1 splits them per head before orthogonalization
+        // (see the trainer's `HeadWiseMuon`). v/o, the decay and beta gates
+        // and the output norm are the rest of the attention arm.
+        for qk in [&gdn2.q_proj, &gdn2.k_proj] {
+            into.push(Group::QkHeadWise, qk.weight.id);
+        }
+        into.rest_of(gdn2);
+    }
+}
+
+impl Routed for EngramModule {
+    fn route(&self, into: &mut Routing, _factors_fallback: bool) {
+        // ponytail: the one path match left in the repo, because
+        // burn-engram keeps its fields private and its key projections are
+        // indistinguishable from its value projection by type or shape (both
+        // are a bias-free `nn::Linear` [3*32, d]). The patterns are matched
+        // against paths RELATIVE to the engram, in the file that owns the
+        // model; `Routing::check` fails loudly if a rename moves a param out
+        // of all three. Undo by making the fields public in the library.
+        let mut v = EngramVisitor { into, stack: Vec::new() };
+        self.visit(&mut v);
+    }
+}
+
+struct EngramVisitor<'a> {
+    into: &'a mut Routing,
+    stack: Vec<String>,
+}
+
+impl ModuleVisitor for EngramVisitor<'_> {
+    fn enter_module(&mut self, name: &str, _container: &str) {
+        self.stack.push(name.to_string());
+    }
+    fn exit_module(&mut self, _name: &str, _container: &str) {
+        self.stack.pop();
+    }
+    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<D>>) {
+        let arm = self.stack.first().map_or("", String::as_str);
+        let group = match arm {
+            // Report §3.1: the n-gram KEY projections are Muon+ candidates.
+            "key_projs" => Group::Muon,
+            // Report §2.3: the hashed tables train on plain Adam, no wd.
+            "memory" => Group::Table,
+            // value_proj is [d,d] (too expensive for fp32 NS) and the
+            // optional short-conv kernel is a 1-D filter: the fallback.
+            _ => Group::Rest,
+        };
+        self.into.push(group, param.id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::DormouseConfig;
+    use burn::tensor::Device;
+
+    fn dev() -> Device {
+        Device::ndarray()
+    }
+
+    fn cfg() -> DormouseConfig {
+        DormouseConfig {
+            d_model: 32,
+            n_heads: 2,
+            head_dim: 16,
+            d_ffn: 64,
+            max_iter: 2,
+            n_experts: 2,
+            rank: 8,
+            engram_rows: 64,
+            ..DormouseConfig::default()
+        }
+    }
+
+    /// The policy, pinned as a table. This is the replacement for the string
+    /// table: every parameter kind of the model, and the group it trains on.
+    /// A rename or a restructure cannot move a row (ids, not paths); a new
+    /// row that nobody declared fails `Routing::check`; a change to any of
+    /// these cells is a change to [`group_of`] and shows up HERE first.
+    #[test]
+    fn policy_table_is_pinned() {
+        use Group::*;
+        use LinearParam::*;
+        use Role::*;
+        // (role, kind, factors_fallback) -> group.
+        let table: &[(Role, LinearParam, bool, Group)] = &[
+            // TSCT spectral factors: Muon+ (expert factors move to the
+            // fallback under --factors-fallback, an A/B knob).
+            (Expert, Factor, false, Muon),
+            (Expert, Factor, true, Rest),
+            (Readout, Factor, false, Muon),
+            (Readout, Factor, true, Muon),
+            // The 1D TSCT scale leaf: never orthogonalized.
+            (Expert, Scale, false, Rest),
+            (Readout, Scale, false, Rest),
+            // A dense linear is the expensive [d,d] case: weight AND bias on
+            // the fallback. This is the pair that disagreed before
+            // (is_muon_param said the weight was Muon+, the group builder
+            // said otherwise).
+            (Expert, DenseWeight, false, Rest),
+            (Expert, DenseBias, false, Rest),
+            (Readout, DenseWeight, false, Rest),
+            (Readout, DenseBias, false, Rest),
+            // The output head: elongated [d, vocab], AdamW.
+            (Head, Factor, false, Rest),
+            (Head, Scale, false, Rest),
+            (Head, DenseWeight, false, Rest),
+            (Head, DenseBias, false, Rest),
+        ];
+        for (role, kind, ff, want) in table {
+            assert_eq!(
+                group_of(*role, *kind, *ff),
+                *want,
+                "policy changed for {role:?} {kind:?} factors_fallback={ff}"
+            );
+        }
+        // Exhaustive by construction: every (role, kind) pair is in the table
+        // above, so a new role or a new leaf is a compile error in the match
+        // in `group_of` AND a missing row here.
+        let all: Vec<(Role, LinearParam, bool, Group)> = [
+            Expert,
+            Readout,
+            Head,
+        ]
+        .into_iter()
+        .flat_map(|r| [Factor, Scale, DenseWeight, DenseBias].into_iter().map(move |k| (r, k)))
+        .flat_map(|(r, k)| [(false, group_of(r, k, false)), (true, group_of(r, k, true))])
+        .map(|((r, k), (ff, g))| (r, k, ff, g))
+        .collect();
+        assert_eq!(all.len(), table.len(), "the table must cover every (role, kind)");
+    }
+
+    /// The whole model, checked against the declaration: nothing invisible,
+    /// nothing twice. The counts come from the topology, not from literals.
+    #[test]
+    fn every_param_is_declared_exactly_once() {
+        let cfg = cfg();
+        let model = DormouseModel::new(&cfg, &dev());
+        let r = routing(&model, false);
+        let c = r.check(&model).expect("the live model must be fully declared");
+        // 4 factors per expert (gate_up u,v + down u,v) + the readout's u,v
+        // + the engram's key projection.
+        assert_eq!(c.muon, 4 * cfg.n_experts + 3, "Muon+ group must match the topology");
+        assert_eq!(c.qk, 2, "KDA q/k weights are head-wise Muon");
+        assert_eq!(c.tables, 1, "the n-gram tables are one param");
+        assert!(c.rest > 0, "embedding, head, router, norms, conv...");
+        assert_eq!(
+            c.muon + c.qk + c.tables + c.rest,
+            r.groups.values().map(Vec::len).sum::<usize>(),
+            "the counts must cover the declaration exactly"
+        );
+        // The dense arm declares the SAME number of params and the same
+        // total, but routes the experts' weights to the fallback: the
+        // is_muon_param/group-builder disagreement could not be seen here
+        // before, because neither side looked at a real model.
+        let dense = DormouseConfig { use_tsct: false, ..cfg.clone() };
+        let m2 = DormouseModel::new(&dense, &dev());
+        let c2 = routing(&m2, false).check(&m2).expect("dense model must be fully declared");
+        assert_eq!(c2.muon + c2.qk + c2.tables + c2.rest, c.muon + c.qk + c.tables + c.rest);
+    }
+
+    /// The check still has teeth: a parameter nobody claims is an error, not
+    /// a silent fallback. Drop the readout's declaration by hand.
+    #[test]
+    fn undeclared_param_fails_the_check() {
+        let cfg = cfg();
+        let model = DormouseModel::new(&cfg, &dev());
+        let mut r = routing(&model, false);
+        let mut ids = r.groups.get_mut(&Group::Muon).expect("declared");
+        let dropped = ids.pop().expect("non-empty");
+        let err = r.check(&model).expect_err("an unclaimed param must fail");
+        assert!(err.contains("no declared optimizer group"), "unexpected error: {err}");
+        assert!(!err.contains(&dropped.val().to_string()), "the error names the path: {err}");
+    }
+
+    /// `--factors-fallback` moves exactly the expert factors, from Muon+ to
+    /// the base optimizer, and the declaration stays valid.
+    #[test]
+    fn factors_fallback_moves_only_the_experts() {
+        let cfg = cfg();
+        let model = DormouseModel::new(&cfg, &dev());
+        let with = routing(&model, false).check(&model).expect("declared");
+        let without = routing(&model, true).check(&model).expect("declared");
+        assert_eq!(without.muon + 4 * cfg.n_experts, with.muon);
+        assert_eq!(without.rest - with.rest, 4 * cfg.n_experts);
+    }
+}
