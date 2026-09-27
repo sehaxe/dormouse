@@ -74,6 +74,21 @@ The v2 stack, each piece tied to a source:
 6. **Post-training (phase 6): Rufus-Air ordering** (2609.29421) — verifiable
    rewards first, judges later; matches POST_TRAINING.md.
 
+## LONG-CONTEXT LADDER (2026-09-26, research 2026-09-26-long-context-agentic.md)
+
+KDA needs no RoPE/YaRN (Kimi Linear is NoPE end-to-end; decay carries the
+position; the RoPE variant is worse at length). The constant state caps
+EXACT recall at ~2-4K bytes (GDN-2 state-matched: passkeys ~2K, multi-key
+NIAH 28-38% at 4-8K) — length generalization (train 4K, retrieve 8K) is the
+linear superpower. Ladder: 512 -> 2K -> 8K bytes, extension ~1% of tokens.
+Known gap: forward_train_state truncates state BPTT (FLA's chunked backward
+is exact) — first suspect for the 8K stage. Probe first: byte-level RULER
+(S/MK-NIAH at 1-8K) as our own capacity curve. The 3:1 hybrid pattern
+(linear:full) is structurally present as MSA + Engram arms — verify, don't
+rebuild. Agentic post-training at 7.5M: K2-style synthetic pipeline, 1-5k
+trajectories 1:4 with general data; Verilog via CodeV-R1 open assets as the
+first RLVR domain (no sub-100M precedent exists).
+
 ## RESEARCH MAP 2026-09-26 (four fresh papers, owner-directed)
 
 1. **Memory Attention (2609.28399, Kang; code: Joluck/memory-attention)** — the
