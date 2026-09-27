@@ -2,6 +2,36 @@
 
 Started 2026-09-21 from the architecture grill session. Decisions live in `docs/adr/`, shared language lives in `CONTEXT.md`, evidence lives in `research/2026-09-21-per-gb-sota.md`. Update this file as phases close; do not re-litigate recorded ADRs without new evidence.
 
+## RESEARCH MAP 2026-09-26 (four fresh papers, owner-directed)
+
+1. **Memory Attention (2609.28399, Kang; code: Joluck/memory-attention)** — the
+   Engram redesign: V = K0 + RMSNorm(M[s]) — a token-keyed learnable table
+   folded INTO the attention value path, no separate value projection, no
+   separate gated arm. At inference the norm folds into the table (lookup +
+   add). CPU-offload with prefetching = our engram-ram pattern. Reported:
+   WikiText ppl 31.55 -> 28.64 at matched tokens (with added table params).
+   Dormouse synthesis: keep the N-GRAM hashed keys (capacity, the Qwen story)
+   but move the lookup INTO the KDA value path (V += RMSNorm(M[fnv(ctx)])) —
+   structurally gradient-theft-proof (the core's K is always in the value).
+   The separate gated Engram arm is retired (its A/B lost: uniform death).
+   Author's repo: fla/layers/memory_attn.py (FLA-based, Apache-2.0).
+2. **Self-Play Pretraining with Zero Data (2609.30063, Goodman/Levine)** —
+   generator writes programs, a UTM executes them into bytes, the learner
+   predicts bytes with plain CE, the generator is RL-trained on
+   gradient-alignment reward (preconditioned grad magnitude vs a lookback
+   checkpoint). Zero-shot transfer to natural data at <25M params / 4K ctx —
+   OUR SCALE. The data-side revolution for dormouse: a self-play curriculum
+   engine replacing/augmenting the corpus (owner's "RSI ladder" seed).
+3. **FlashLoop (2609.29812)** — looped-transformer inference: token-sparse
+   loop updates (later loops change few tokens), attention-column sparsity,
+   KV-residual quantization; 1.64x speed, 6x KV reduction, ~lossless. Phase-5
+   inference lever for our LoopBlock; also evidence our max_iter=4 is deep
+   enough (later loops change little).
+4. **Rufus-Air (2609.29421)** — an 8-stage post-training recipe (SFT ->
+   verifiable-reward RL stages -> RLHF) on a 106B base. Phase-6 template for
+   our post-training ladder; the reward-reliability ordering principle
+   matches POST_TRAINING.md.
+
 ## CRITICAL FINDING 2026-09-26: the Engram eats the core's gradient
 
 official_v3 (fp32, sharded corpus): train CE -> 0.10 (Engram memorizes the
