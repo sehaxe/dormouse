@@ -1,5 +1,15 @@
 name: CI
 
+# STANDALONE-FORK VARIANT. In the dormouse repo this file is dead weight:
+# `vendor/burn-fused` has no `.git`, so nothing in `.github/` under it can ever
+# run, and the gate that actually executes is
+# `../../.github/workflows/fused-library.yml` (root of dormouse). Keep the two
+# crate lists in sync when a crate gains or loses a `cuda` feature.
+#
+# This file is what runs if burn-fused is ever split into its own repository,
+# which is also the only way this file becomes a real gate instead of
+# documentation.
+
 on:
   push:
     branches: [main]
@@ -7,46 +17,88 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings"
+  # cubecl compiles CUDA through NVRTC at runtime: the toolkit must be on PATH
+  # (the ubuntu image ships it) but no GPU is needed for a compile check.
+  CUDARC_CUDA_VERSION: "12050"
 
 jobs:
-  format:
+  # every crate, on the ndarray backend, in one command
+  ndarray-all-crates:
+    name: "fused-lib :: ndarray check+test, all crates (a broken CPU build)"
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - run: cargo fmt --all -- --check
-
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-
-  test:
-    runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Test default workspace (CPU paths + autodiff)
-        run: cargo test --workspace --exclude burn-fused-benches
-      - name: Test the meta-crate feature matrix
+      - name: check every target of every crate
+        run: cargo check --workspace --all-targets --exclude burn-fused-benches --exclude cpu-probe --exclude launch-probe
+      - name: test every crate on ndarray
+        run: cargo test --workspace --exclude burn-fused-benches --exclude cpu-probe --exclude launch-probe
+      - name: clippy, warnings are errors
+        run: cargo clippy --workspace --all-targets --exclude burn-fused-benches --exclude cpu-probe --exclude launch-probe -- -D warnings
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+
+  # the feature combinations a user actually picks
+  feature-matrix:
+    name: "fused-lib :: feature matrix (a --no-default-features / autodiff / binary-tests that stopped building)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: the meta-crate, the only thing a default build compiles
         run: |
           cargo check -p burn-fused --no-default-features
           cargo check -p burn-fused --features std
-          cargo check -p burn-fused --features cuda
+          cargo check -p burn-fused --features std,cuda
+      - name: leaf crates, every combination a README tells users to type
+        run: |
+          cargo check -p burn-gdn2 --no-default-features
+          cargo check -p burn-gdn2
+          cargo check -p burn-gdn2 --features autodiff
+          cargo check -p burn-gdn2 --features binary-tests
+          cargo check -p burn-kda --no-default-features
+          cargo check -p burn-kda --features autodiff
+          cargo check -p burn-sct --features autodiff
 
+  # the flagship claim, part 1: the fixture is regenerable
+  ref-data-reproducible:
+    name: "fused-lib :: ref_data.bin regenerates byte-identically (a fixture that drifted from its generator)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: crates/burn-gdn2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build the generator (std-only, no cargo workspace needed)
+        run: rustc --edition 2021 -O tools/gen_reference.rs -o "$RUNNER_TEMP/gen_reference"
+      - name: regenerate
+        run: "$RUNNER_TEMP/gen_reference"
+      - name: the committed fixture must be exactly what the generator emits
+        run: git diff --exit-code -- tests/ref_data.bin
+
+  # the flagship claim, part 2: burn against that fixture
+  bit-exact:
+    name: "fused-lib :: 1000 bit-exact cases vs the paper reference (fused/tensor drift)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # --release: the 1000-case scan is minutes in an opt-0 build.
+      - run: cargo test --release -p burn-gdn2 --features binary-tests --test bit_exact --test test_chunk
+
+  # fused kernels on the cubecl CPU runtime (no GPU needed): proves the cubecl
+  # codegen is not CUDA-only, the cheap stand-in for ROCm/Metal coverage until
+  # hardware is available
   portability:
-    # fused kernels on the cubecl CPU runtime (no GPU needed): proves the
-    # cubecl codegen is not CUDA-only, the cheap stand-in for ROCm/Metal
-    # coverage until hardware is available
+    name: "fused-lib :: cubecl CPU runtime (kernels that only work on CUDA)"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -54,39 +106,58 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo run -p cpu-probe --release
 
+  # the GPU benches need CUDA: compile-only check on the CPU runner
   bench-build:
-    # the GPU benches need CUDA: compile-only check on the CPU runner
+    name: "fused-lib :: bench + probe packages compile (a benchmark that stopped building)"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check -p burn-fused-benches
-        env:
-          RUSTFLAGS: ""
+      - run: |
+          cargo check -p burn-fused-benches
+          cargo check -p cpu-probe
+          cargo check -p launch-probe
 
-  gpu-tests:
-    # runs the cuda-gated kernel tests (fused vs tensor correctness) on the
-    # GPU self-hosted runner; the correctness CPU suite already ran above
-    runs-on: [self-hosted, gpu, linux]
-    if: github.event_name == 'pull_request'
-    env:
-      RUSTFLAGS: ""
+  # every crate that declares a `cuda` feature, compile-only. An explicit list:
+  # `--features cuda` on a crate without one is a silent no-op.
+  cuda-compiles:
+    name: "fused-lib :: cuda feature compiles (a cuda build that no longer builds)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
-      - name: cuda-gated kernel tests
-        run: |
-          BURN_DEVICE=cuda cargo test -p burn-rope --all-features --lib
-          BURN_DEVICE=cuda cargo test -p burn-situ --all-features --lib
-          BURN_DEVICE=cuda cargo test -p burn-mhc --all-features --lib
-          BURN_DEVICE=cuda cargo test -p burn-msa --all-features --lib
-          BURN_DEVICE=cuda cargo test -p burn-attnres --all-features --lib
-          BURN_DEVICE=cuda cargo test -p burn-bitnet --all-features --lib
-          # linear-attention / spectral / fused-elementwise crates whose CUDA
-          # coverage lives in lib tests and integration tests:
-          BURN_DEVICE=cuda cargo test -p burn-gdn2 --all-features
-          BURN_DEVICE=cuda cargo test -p burn-kda --all-features
-          BURN_DEVICE=cuda cargo test -p burn-rmsnorm --all-features
-          BURN_DEVICE=cuda cargo test -p burn-swiglu --all-features
-          BURN_DEVICE=cuda cargo test -p burn-sct --all-features
-          BURN_DEVICE=cuda cargo test -p burn-spectral --all-features
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: |
+          for c in burn-attnres burn-bitnet burn-gdn2 burn-kda burn-mhc burn-mor \
+                   burn-muon-plus burn-rmsnorm burn-rope burn-sct burn-situ \
+                   burn-spectral burn-swiglu; do
+            cargo check -p "$c" --features cuda
+            cargo check -p "$c" --features cuda,autodiff
+            cargo test -p "$c" --features cuda,autodiff --no-run
+          done
+
+  # cuda tests, on real hardware
+  cuda-tests:
+    name: "fused-lib :: cuda tests on a GPU (fused-vs-tensor divergence only the GPU shows)"
+    runs-on: [self-hosted, gpu, linux]
+    if: github.event_name == 'pull_request'
+    timeout-minutes: 120
+    env:
+      # burn-rope and burn-situ cuda tests `return`/`skip` (reporting PASS)
+      # unless this is set. Without it the job is green having asserted nothing.
+      BURN_DEVICE: cuda
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: |
+          for c in burn-attnres burn-bitnet burn-gdn2 burn-kda burn-mhc burn-mor \
+                   burn-muon-plus burn-rmsnorm burn-rope burn-sct burn-situ \
+                   burn-spectral burn-swiglu; do
+            cargo test -p "$c" --all-features
+          done
+      # The configuration a trainer actually runs in. Nothing else in the
+      # library tests it: see TEST-AUDIT.md, finding 3.
+      - run: cargo test -p burn-gdn2 --features cuda,autodiff --release --test fused_chunk_verify

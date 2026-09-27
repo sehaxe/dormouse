@@ -1,6 +1,10 @@
 /target
 crates/*/target
+# `ref_data/` is NOT ignored: a test fixture nobody can regenerate is not a
+# reproducibility claim. burn-gdn2's bit-exact fixture is committed (the
+# exception below) and burn-sct's is wanted the same way once its generator
+# exists — see crates/burn-gdn2/TEST-AUDIT.md.
 **/*.bin
-ref_data/
+!crates/burn-gdn2/tests/ref_data.bin
 Cargo.lock.bak
 .bulba/

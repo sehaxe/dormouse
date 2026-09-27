@@ -1,4 +1,41 @@
-//! Bit-exact reference tests for the Gated DeltaNet 2 paper implementation.
+// Bit-exact reference tests for the Gated DeltaNet 2 paper implementation.
+//
+// WHAT `ref_data.bin` IS. A *transcription* of the original authors' layer —
+// NVlabs/GatedDeltaNet-2, `lit_gpt/gdn2.py` — with the Triton `fused_recurrent`
+// kernel replaced by an equivalent per-token scan. `tools/gen_reference.rs` is
+// the executable transcription (a line-for-line port of `tests/gen_reference.py`,
+// which is the readable one and stays in the tree for review). It is NOT the
+// original authors' output bytes, and despite this file's name this is NOT a
+// bit-for-bit comparison: it is an absolute-tolerance comparison of two
+// independent implementations of the same math. A real bit-for-bit claim needs
+// NVlabs' kernel in the tree. What this harness actually proves is that
+// burn-gdn2's fused and chunked paths agree with an independent transcription
+// of the published layer to 5e-4 over 1000 shapes.
+//
+// HOW TO REGENERATE, AND HOW TO KNOW IT IS THE SAME DATA.
+//     cd crates/burn-gdn2
+//     rustc --edition 2021 -O tools/gen_reference.rs -o /tmp/gen_reference
+//     /tmp/gen_reference                           # rewrites tests/ref_data.bin
+//     git diff --exit-code -- tests/ref_data.bin   # must be empty
+// Regeneration is bit-reproducible, deliberately: the generator is std-only
+// (no cargo workspace, no Python, no torch to pin), the RNG is splitmix64 +
+// Box-Muller seeded 1337, and all arithmetic is sequential f32 with no parallel
+// reduction and no thread-count dependence, so the output is byte-identical on
+// any platform, core count and rustc version. CI regenerates and diffs on every
+// push (`fused-lib :: ref_data.bin regenerates byte-identically`), so a fixture
+// that drifts from its generator cannot merge quietly.
+//
+// PRECISION, AND THE TOLERANCE THIS HONESTLY NEEDS. The fixture is f32,
+// little-endian, 1000 cases of `[1, T, 64]` input and `[1, T, 64]` output with
+// T in 1..=38 (13470 tokens, 6.8 MiB). Two independent transcriptions of one
+// recurrence in f32 differ by O(1e-6) from reduction order and libm alone, so
+// `EPSILON = 5e-4` is two orders of magnitude above the noise floor and still
+// tight enough to catch any real change in the recurrence. It is an ABSOLUTE
+// tolerance against a fixture whose output scale is ~6e-3, so 5e-4 is ~8% of
+// the signal: not vacuous, but a relative or RMS-normalised tolerance would be
+// the stronger gate. Changing it needs a measured noise floor from a second
+// independent transcription, so it stays a follow-up rather than a guess.
+//
 // burn-ndarray is deprecated upstream; kept as the CPU test backend until the burn-flex migration.
 #![allow(deprecated)]
 #![allow(dead_code)]

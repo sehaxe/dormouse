@@ -1,3 +1,20 @@
+// Chunked-WY against the same reference fixture as `bit_exact.rs`.
+//
+// `ref_data.bin` is a transcription of the original authors' layer (NVlabs
+// GatedDeltaNet-2, `lit_gpt/gdn2.py`, Triton kernel replaced by a per-token
+// scan), produced by `tools/gen_reference.rs` — std-only, splitmix64 + Box-Muller
+// seeded 1337, sequential f32, byte-identical on every platform. Regenerate and
+// diff it with:
+//
+//     cd crates/burn-gdn2
+//     rustc --edition 2021 -O tools/gen_reference.rs -o /tmp/gen_reference
+//     /tmp/gen_reference && git diff --exit-code -- tests/ref_data.bin
+//
+// One fixture, five chunk sizes: `epsilon = 1e-3` per case and a global
+// `1e-2`, i.e. ~1e-6 transcription noise plus the chunked path's own reduction
+// order, with two orders of headroom. See the module comment in `bit_exact.rs`
+// for the full precision argument and for what this harness does NOT claim.
+
 #[test]
 #[cfg(feature = "binary-tests")]
 fn test_chunk_vs_reference() {
