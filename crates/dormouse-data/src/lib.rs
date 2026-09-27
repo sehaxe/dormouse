@@ -352,6 +352,19 @@ impl ByteStream {
         self.next_batch_with_tables([4096, 4096, 4096])
     }
 
+    /// Restart the stream from the first byte of the buffer it already holds.
+    ///
+    /// For EVAL this is what makes the numbers comparable: without it every
+    /// eval call reads the NEXT slice, so eval N of one run and eval N of
+    /// another see different bytes and the cross-run comparisons the whole
+    /// A/B program rests on are noise. Deterministic as long as the data fits
+    /// the ring (the eval split is ~2 MB against a 64 MB ring); a larger
+    /// corpus would refill, and `refill` shuffles, so re-evaluating that
+    /// needs a fresh `ByteStream` instead.
+    pub fn rewind(&mut self) {
+        self.pos = 0;
+    }
+
     /// Next batch with explicit n-gram table sizes (RAM-offload tables can
     /// be millions of slots; the hashes are produced modulo the table size).
     pub fn next_batch_with_tables(&mut self, tables: [usize; 3]) -> (Vec<u8>, Vec<i64>) {
@@ -411,6 +424,30 @@ mod tests {
         let (bytes, _) = s.next_batch();
         assert_eq!(bytes.len(), seq * batch);
         assert_eq!(bytes[..], pattern[skip as usize..skip as usize + seq * batch]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `rewind` is what makes the held-out eval comparable: every eval call
+    /// must score the SAME bytes, otherwise eval N of run A and eval N of run
+    /// B read different windows (measured 2026-09-27: one checkpoint scored
+    /// 6.443 on one pass and 6.551 on the next, purely from stream position).
+    #[test]
+    fn rewind_restarts_the_same_window() {
+        let dir = std::env::temp_dir().join(format!("dormouse_rewind_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pattern: Vec<u8> = (0..256u32).map(|i| (i * 13 % 241) as u8).cycle().take(1 << 20).collect();
+        std::fs::write(dir.join("corpus.bin"), &pattern).unwrap();
+        let (seq, batch) = (8usize, 2usize);
+        let mut s = ByteStream::new(seq, batch, &dir);
+        let (first, _) = s.next_batch();
+        let (second, _) = s.next_batch();
+        assert_ne!(first, second, "the stream must actually advance");
+        s.rewind();
+        let (again, _) = s.next_batch();
+        assert_eq!(first, again, "rewind must replay the first window exactly");
+        s.rewind();
+        let (again2, _) = s.next_batch();
+        assert_eq!(first, again2, "rewind must be idempotent");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

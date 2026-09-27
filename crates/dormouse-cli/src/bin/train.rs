@@ -110,6 +110,10 @@ struct Args {
     /// inference stays max_iter; --gen-max-iter picks it lower.
     #[arg(long)]
     rand_depth: bool,
+    /// Batches averaged per held-out eval (20 = 100 KB). The eval window is
+    /// fixed and rewound every time, so numbers are comparable across runs.
+    #[arg(long)]
+    eval_batches: Option<usize>,
 
     // --- quantization / maintenance ---
     /// Force factor-quant format: fp32 | bf16 | fp16 | fp8 | fp4.
@@ -203,6 +207,7 @@ fn build_run(a: &Args) -> Result<dormouse_train::RunCfg, String> {
     train.dspark_k = a.dspark_k.or(train.dspark_k);
     train.jepa_targets = a.jepa_targets.clone().or(train.jepa_targets);
     train.rand_depth |= a.rand_depth;
+    train.eval_batches = a.eval_batches.unwrap_or(train.eval_batches);
     train.retract_every = a.retract_every.unwrap_or(train.retract_every);
     train.retract_iters = a.retract_iters.unwrap_or(train.retract_iters);
     train.stress |= a.stress;

@@ -77,6 +77,11 @@ pub struct TrainCfg {
     /// schedule knob a resume blocker for runs started before it existed.
     #[serde(skip)]
     pub rand_depth: bool,
+    /// Batches averaged per held-out eval. One batch is 5 KB, whose sampling
+    /// noise is bigger than the effects we A/B; 20 batches = 100 KB. Part of
+    /// the EVAL LINE so a curve is self-documenting about its own protocol.
+    #[serde(skip)]
+    pub eval_batches: usize,
     pub retract_every: usize,
     pub retract_iters: usize,
     /// Stress protocol (report §3.3): constant LR at `stress_lr`x, spike
@@ -136,6 +141,7 @@ impl Default for TrainCfg {
             ckpt_name: "latest".into(), eval_every: 0,
             opt: "mix".into(), quant: None, factors_fallback: false,
             rand_depth: false,
+            eval_batches: 20,
             retract_every: 1, retract_iters: 3,
             stress: false, stress_lr: 1.0, stress_every: 50,
             engram_ram: false, engram_slots: 1_000_000, host_adam_every: 1,
@@ -935,49 +941,76 @@ pub fn train_loop(
         if cfg.eval_every > 0 {
             if let Some(ev) = eval_stream.as_mut() {
                 if step % cfg.eval_every as u64 == 0 && step > 0 {
-                    let (eb, eh) = match &host {
-                        Some(h) => ev.next_batch_with_tables(h.slots),
-                        None => ev.next_batch(),
-                    };
-                    let (ex, _eh_t) =
-                        bytes_to_tensors::<Backend>(&eb, &eh, cfg.seq_len, cfg.batch, &device);
-                    let eshift: Vec<i64> = eb
-                        .iter()
-                        .skip(1)
-                        .chain(std::iter::once(&eb[0]))
-                        .map(|&b| b as i64)
-                        .collect();
-                    let ey: Tensor<2, Int> =
-                        Tensor::from_data(TensorData::new(eshift, [cfg.batch, cfg.seq_len]), &device);
-                    let eval_rows = match &host {
-                        Some(h) => {
-                            let (_, embed, _) = offload::rows_for_batch::<Backend>(
-                                h,
-                                &eh,
-                                cfg.batch,
-                                cfg.seq_len,
-                                &device,
-                                false,
-                            );
-                            Some(embed)
-                        }
-                        None => None,
-                    };
-                    let (elogits, ..) =
-                        model.forward_with_hidden::<Backend>(ex, None, eval_rows, None, None);
-                    let v = model.vocab_size;
-                    let eflat = elogits.reshape([cfg.batch * cfg.seq_len, v]);
-                    // Gather the target log-prob: no one-hot [b*t,v] fp32
-                    // tensor (extra H2D + traffic) per eval.
-                    let etgt = ey.reshape([cfg.batch * cfg.seq_len, 1]);
-                    let ece: f32 = burn::tensor::activation::log_softmax(eflat, 1)
-                        .gather(1, etgt)
-                        .neg()
-                        .mean()
-                        .try_into_scalar()
-                        .unwrap_or(f32::NAN);
+                    // Rewind FIRST: every eval must score the SAME bytes, or
+                    // eval N of run A and eval N of run B read different
+                    // windows and no A/B is comparable (measured 2026-09-27:
+                    // v5 and its own resume scored 6.443 vs 6.551 for the
+                    // SAME checkpoint, purely from stream position).
+                    ev.rewind();
+                    // A validation snapshot: no autodiff graph, so 20 eval
+                    // forwards cannot pile up activations (they are never
+                    // backwarded, and with grad tracking on they OOM'd the
+                    // card at 15.9/16.3 GB on the first eval). The original
+                    // model keeps training - burn's docs say exactly that.
+                    let eval_model = model.valid();
+                    // Average over eval_batches batches: one batch is 5 KB,
+                    // whose sampling noise is larger than the effects we A/B.
+                    let mut ce_sum = 0.0f32;
+                    let mut n = 0u32;
+                    for _ in 0..cfg.eval_batches.max(1) {
+                        let (eb, eh) = match &host {
+                            Some(h) => ev.next_batch_with_tables(h.slots),
+                            None => ev.next_batch(),
+                        };
+                        let (ex, _eh_t) =
+                            bytes_to_tensors::<Backend>(&eb, &eh, cfg.seq_len, cfg.batch, &device);
+                        let eshift: Vec<i64> = eb
+                            .iter()
+                            .skip(1)
+                            .chain(std::iter::once(&eb[0]))
+                            .map(|&b| b as i64)
+                            .collect();
+                        let ey: Tensor<2, Int> = Tensor::from_data(
+                            TensorData::new(eshift, [cfg.batch, cfg.seq_len]),
+                            &device,
+                        );
+                        let eval_rows = match &host {
+                            Some(h) => {
+                                let (_, embed, _) = offload::rows_for_batch::<Backend>(
+                                    h,
+                                    &eh,
+                                    cfg.batch,
+                                    cfg.seq_len,
+                                    &device,
+                                    false,
+                                );
+                                Some(embed)
+                            }
+                            None => None,
+                        };
+                        let (elogits, ..) = eval_model.forward_with_hidden::<Backend>(
+                            ex, None, eval_rows, None, None,
+                        );
+                        let v = eval_model.vocab_size;
+                        let eflat = elogits.reshape([cfg.batch * cfg.seq_len, v]);
+                        // Gather the target log-prob: no one-hot [b*t,v]
+                        // fp32 tensor (extra H2D + traffic) per eval.
+                        let etgt = ey.reshape([cfg.batch * cfg.seq_len, 1]);
+                        let ece: f32 = burn::tensor::activation::log_softmax(eflat, 1)
+                            .gather(1, etgt)
+                            .neg()
+                            .mean()
+                            .try_into_scalar()
+                            .unwrap_or(f32::NAN);
+                        ce_sum += ece;
+                        n += 1;
+                    }
+                    let ece = ce_sum / n as f32;
                     let ebpb = bpb(ece);
-                    println!("step {step:6} EVAL ce={ece:.3} bpb={ebpb:.3}");
+                    let bytes = (n as u64) * (cfg.batch * cfg.seq_len) as u64;
+                    println!(
+                        "step {step:6} EVAL ce={ece:.3} bpb={ebpb:.3} over {bytes} B (fixed window)"
+                    );
                 }
             }
         }

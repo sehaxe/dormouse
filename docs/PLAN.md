@@ -74,6 +74,37 @@ The v2 stack, each piece tied to a source:
 6. **Post-training (phase 6): Rufus-Air ordering** (2609.29421) — verifiable
    rewards first, judges later; matches POST_TRAINING.md.
 
+## HELD-OUT EVAL PROTOCOL (fixed 2026-09-27 - the A/B criterion was unsound)
+
+The eval stream was created once and each eval consumed the NEXT batch, so
+eval N of run A and eval N of run B scored DIFFERENT bytes. Measured
+consequence: one and the same checkpoint scored **6.443** on one pass and
+**6.551** on the next, purely from stream position - and the program judges
+every mechanism by held-out BPB, so cross-run comparisons (the whole A/B
+apparatus) were carrying ~0.1 BPB of pure protocol noise on top of a 5 KB
+sample whose own sampling noise is larger than most effects we chase.
+
+Two fixes, both in:
+- `ByteStream::rewind()` - every eval restarts from the same bytes. P10
+  check: `rewind_restarts_the_same_window` (advances, rewinds, replays the
+  first window exactly, idempotent).
+- `--eval-batches` (default 20, `serde(skip)`, a protocol knob like
+  steps/log_every): 20 x 5 KB = 100 KB per eval, and the eval LINE prints the
+  byte count, so a curve is self-documenting about its own protocol
+  (`EVAL ce=... bpb=... over 102400 B (fixed window)`).
+
+Side finding worth keeping: the eval forward must run on a `Module::valid()`
+snapshot. With grad tracking on, each eval forward builds autodiff nodes that
+are never backwarded; at 20 batches that is ~8 GB of live activations and the
+card OOM'd at 15.9/16.3 GB on the very first eval (the resumed run starts at a
+step that is a multiple of eval_every). One batch never showed it. This also
+removes a pre-existing per-eval leak.
+
+Consequence for the record: eval numbers taken before this commit are
+comparable only WITHIN one run's own sequence, never across runs or resumes.
+official_v5 was restarted on the fixed protocol (eval@1000 = 6.498 on the
+100 KB window).
+
 ## RANDOM DEPTH (shipped 2026-09-27, ADR-0013 rank 2)
 
 `--rand-depth` samples the loop depth T in 1..=max_iter per step (a
