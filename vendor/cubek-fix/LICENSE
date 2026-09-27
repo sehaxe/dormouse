@@ -24,24 +24,22 @@ SOFTWARE.
 
 ## vendored / patched copy
 
-This directory is a PATCHED COPY of upstream burn-rs/cubecl
-(https://github.com/burn-rs/cubecl) — crates `cubecl-runtime`, `cubecl-server`
-and `cubecl-cuda` at 0.11.0-pre.4 — redistributed under the same dual license
-as upstream (MIT OR Apache-2.0, per each crate's `Cargo.toml`).
+This directory is a PATCHED COPY of upstream tracel-ai/cubek
+(https://github.com/tracel-ai/cubek) — crate `cubek-reduce` at 0.3.0-pre.4 —
+redistributed under the same dual license as upstream (`MIT OR Apache-2.0`, per
+the crate's `Cargo.toml`).
 
-The upstream copyright notice above is retained deliberately. MIT section (a)
-and Apache-2.0 section 4 both require it, and this copy was previously stamped
-"Copyright (c) 2026 sehaxe", which was wrong: it is upstream code we patch, not
-code we wrote.
+The upstream copyright notice above is retained deliberately. This file was
+previously EMPTY while the vendored code declared `MIT OR Apache-2.0`.
 
-Patches applied by dormouse:
+Patch applied by dormouse (`docs/adr/0015-topk-gather.md`):
 
-- `cubecl-runtime`, `cubecl-server` — the stale-page #1401 fix to the memory
-  pools. The pools moved to `cubecl-server` upstream in 0.11.0-pre.4, so the
-  fix lives there now.
-- `cubecl-cuda` — no local patch; carried so the vendored unit is one tree and
-  the root `[patch.crates-io]` has one path per crate.
+- `src/components/instructions/topk.rs` and `base.rs` — two hunks. 0.3.0-pre.4's
+  `reaches` fast-path guard cannot tell an empty top-k slot from one holding
+  `-inf`, so a masked score row emits the `u32::MAX` seed coordinate as an index
+  and the caller's gather reads out of bounds. The fix is in the kernel rather
+  than at any call site, plus a coordinate clamp on the way out.
 
-The repository as a whole is AGPL-3.0-only (see the root `LICENSE`). These
-vendored directories keep their upstream terms, which is what the root
-`vendor/burn-fused/LICENSE` scope note describes.
+This directory is required for the project to build at all: the root
+`[patch.crates-io]` maps `cubek-reduce` here, and the whole family was once
+untracked, so a fresh clone had a patch entry pointing at a missing path.

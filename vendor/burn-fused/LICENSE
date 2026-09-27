@@ -19,3 +19,13 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+---
+
+## scope
+
+This covers dormouse's OWN crates (burn-kda, burn-gdn2, burn-rope, burn-mor,
+...), which are original work published here under MIT — see
+`docs/adr/0017-dormouse-fused.md` for why they live in this directory instead of
+being burn-rs dependencies. It does NOT cover upstream burn-rs code vendored
+elsewhere in the tree (`vendor/cubecl-fix`, `vendor/cubek-fix`), which keeps its
+own upstream notices and terms.
