@@ -260,21 +260,14 @@ pub fn init_pools(_device: &Device) {}
 /// Returns the masked loss and a 1.0/0.0 device counter increment so the
 /// event rate can be reported at log cadence instead of being swallowed.
 ///
-/// A zero loss is NOT a silent skip: `train_loop` prints the count loudly
-/// and refuses to continue past a whole log window of them (that is a broken
-/// model, not a spike).
-pub fn mask_nonfinite(loss: Tensor<1>) -> (Tensor<1>, Tensor<1>) {
+/// A zero loss is NOT a silent skip: `train_loop` counts the events on the
+/// HOST (from the loss scalar it already reads at log/timer cadence - device
+/// arithmetic turned out to be untrustworthy here, see the note at the call
+/// site), prints the count loudly, and refuses to continue past a whole log
+/// window of them (that is a broken model, not a spike).
+pub fn mask_nonfinite(loss: Tensor<1>) -> Tensor<1> {
     let nonfinite = loss.clone().is_finite().bool_not();
-    // The counter is built with mask_fill on a FLOAT ones tensor, never with
-    // a Bool -> Float cast: on cubecl that cast returns 0 for `true`
-    // (measured 2026-09-27, official_v5: 50 "non-finite" per 50-step window
-    // on a perfectly finite loss), which both over-reports and would trip the
-    // broken-model fuse on a healthy run. The bool itself is trustworthy -
-    // it is what the mask above uses.
-    // 1.0 exactly on the steps whose loss was masked, 0.0 elsewhere.
-    let bump = Tensor::zeros_like(&loss).mask_fill(nonfinite.clone(), 1.0);
-    let masked = loss.mask_fill(nonfinite, 0.0);
-    (masked, bump)
+    loss.mask_fill(nonfinite, 0.0)
 }
 
 /// The random-depth draw (ADR-0013 rank 2): `T` for this step, in
@@ -681,9 +674,15 @@ pub fn train_loop(
     // exact — the monitor would have nothing to guard, so skip it entirely
     // (it costs 30+ device syncs per check).
     let mut ortho_fp32 = cfg.quant.as_deref() == Some("fp32");
-    // Non-finite losses since the last log step (device-side counter; read
-    // only at log cadence so the hot path stays sync-free).
-    let mut nan_steps = Tensor::<1>::zeros([1], &device);
+    // Non-finite losses seen at the last read, counted on the host. Device
+    // arithmetic is not used for this: on the dispatch path both the
+    // Bool->Float cast and `zeros_like().mask_fill(m, 1.0)` fed into `add`
+    // reported 1.0 for every step of a perfectly finite loss (official_v5,
+    // twice: 50 "non-finite" per 50-step window, then a false fuse at step
+    // 2000). The mask itself is sound - it is what makes a bad step a no-op -
+    // so the counting is the only thing that has to be conservative, and the
+    // host is the only place we have ground truth.
+    let mut nan_window = 0u32;
     while step < cfg.steps as u64 {
         let t_iter = std::time::Instant::now();
         let (bytes, hashes) = (std::mem::replace(&mut pbytes, Vec::new()), std::mem::replace(&mut phashes, Vec::new()));
@@ -799,8 +798,7 @@ pub fn train_loop(
         // recovery now lives inside the process and stays honest: see
         // `mask_nonfinite`. The log copy above is the RAW loss, so a spike
         // still prints as NaN/inf.
-        let (loss, nan_bad) = mask_nonfinite(loss);
-        nan_steps = nan_steps.add(nan_bad);
+        let loss = mask_nonfinite(loss);
         let t_bwd = std::time::Instant::now();
         let fwd_ms = t_fwd.elapsed().as_secs_f64() * 1000.0;
         let raw_grads = loss.backward();
@@ -816,26 +814,27 @@ pub fn train_loop(
                     return Err(format!("step {step}: device error (loss is not a scalar)"));
                 }
             };
-            // Firewall accounting: how many steps since the last log had a
-            // non-finite loss. Those steps were no-ops (zero grads), so the
-            // weights are intact and the run continues; the count is the
-            // honest signal that the numerics need attention.
-            let n_nan: f32 = nan_steps
-                .clone()
-                .try_into_scalar()
-                .map_err(|_| format!("step {step}: device error (nan counter is not a scalar)"))?;
-            nan_steps = Tensor::<1>::zeros([1], &device);
-            if n_nan > 0.0 {
+            // Firewall accounting, on the host, from the value we just read:
+            // this counts the reads that saw a non-finite loss, so between
+            // reads it is a LOWER BOUND (stated as such in the message). The
+            // steps it misses were no-ops anyway - the mask is what makes them
+            // harmless - and the host is the only counter we trust.
+            if !ce_now.is_finite() {
+                nan_window += 1;
+            }
+            if nan_window > 0 {
                 println!(
-                    "non-finite loss x{n_nan:.0} since the last log step (grads zeroed, weights untouched)"
+                    "non-finite loss at >= {} read(s) since the last log step (each masked to a no-op; weights untouched)",
+                    nan_window
                 );
-                // A spike or two is survivable; a persistently broken model
-                // is not. Refuse to limp on forever.
-                if n_nan > 8.0 && step % cfg.log_every as u64 == 0 {
+                // A spike or two is survivable; a persistently broken model is
+                // not. Refuse to limp on forever.
+                if nan_window > 8 && step % cfg.log_every as u64 == 0 {
                     return Err(format!(
-                        "step {step}: {n_nan:.0} non-finite losses in one log window - the model is broken, not spiking"
+                        "step {step}: {nan_window} non-finite losses in one log window - the model is broken, not spiking"
                     ));
                 }
+                nan_window = 0;
             }
             // A non-finite ce here already had its step neutralised above;
             // it must not poison `best`.
@@ -1504,19 +1503,17 @@ mod tests {
         let (_l, rec, _k, _a) = model.forward_with_hidden::<Backend>(x, Some(h), None, Some(y), None);
         let loss = model.loss::<Backend>(rec);
 
-        // A finite loss passes through untouched and counts nothing.
-        let (ok, bad_ok) = mask_nonfinite(loss.clone());
+        // A finite loss passes through untouched.
+        let ok = mask_nonfinite(loss.clone());
         let ok_v: f32 = ok.clone().try_into_scalar().unwrap();
         let base_v: f32 = loss.clone().try_into_scalar().unwrap();
         assert!((ok_v - base_v).abs() < 1e-6, "finite loss must pass through: {ok_v} vs {base_v}");
-        assert_eq!(bad_ok.try_into_scalar::<f32>().unwrap(), 0.0, "finite loss must not count");
 
-        // The poisoned loss: masked to exactly 0, counted once.
+        // The poisoned loss: masked to exactly 0.
         let nan = Tensor::<1>::from_data(TensorData::new(vec![f32::NAN], [1]), &device());
-        let (masked, bad) = mask_nonfinite(loss.clone() + nan);
+        let masked = mask_nonfinite(loss.clone() + nan);
         let m_v: f32 = masked.clone().try_into_scalar().unwrap();
         assert_eq!(m_v, 0.0, "non-finite loss must mask to exactly 0, got {m_v}");
-        assert_eq!(bad.try_into_scalar::<f32>().unwrap(), 1.0, "the event must be counted");
 
         // The step on the masked loss must not move a single weight.
         let before: Vec<f32> = model.loop_block.norm.weight.val().into_data().try_to_vec().unwrap();
