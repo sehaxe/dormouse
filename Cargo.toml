@@ -5,6 +5,7 @@ members = [
     "crates/dormouse-data",
     "crates/dormouse-train",
     "crates/dormouse-cli",
+    "crates/backend-parity",
 ]
 # vendored fork workspaces: they are their own workspace roots; without this
 # cargo resolves their crates' `workspace = true` inheritance against OUR root.

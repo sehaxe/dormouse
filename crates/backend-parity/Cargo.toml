@@ -1,0 +1,37 @@
+[package]
+name = "backend-parity"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# The CPU/CUDA parity gate for the backend precision bugs (ADR-0016) lives in
+# its own crate on purpose: it tests the BACKEND, not dormouse, so it must keep
+# building and running when `dormouse-core` is mid-refactor. It depends on
+# burn-tensor and the two backends and on nothing else - the whole gate
+# compiles in seconds against an already-built burn stack.
+[dependencies]
+burn-tensor = { version = "0.22.0-pre.4", default-features = false, features = [
+    "std",
+] }
+# `ndarray` only, NOT `flex`: the `ndarray` feature is already unified across
+# this workspace (dormouse-core enables it), so this crate adds no new feature
+# to the shared `burn` build. Enabling `flex` here re-fingerprints the whole
+# burn stack for every crate in the workspace - measured, do not.
+burn = { version = "0.22.0-pre.4", default-features = false, features = [
+    "std",
+    "ndarray",
+] }
+
+[dev-dependencies]
+burn-ndarray = { version = "0.22.0-pre.4", features = ["blas-openblas"] }
+burn-cuda = { version = "0.22.0-pre.4", default-features = false, features = [
+    "std",
+    "autotune",
+] }
+
+[features]
+default = []
+# `--features cuda` is the whole point of this crate: the bug class these
+# three gates cover is INVISIBLE to a CPU-only run. Always run the CUDA half.
+cuda = ["burn/cuda", "burn/autodiff"]
