@@ -85,7 +85,9 @@ impl Rng {
     /// torch's `xavier_uniform_(w, gain)` for a torch-layout [out, in] weight.
     fn xavier(&mut self, out_f: usize, in_f: usize, gain: f32) -> Vec<f32> {
         let bound = gain * (6.0 / (in_f + out_f) as f32).sqrt();
-        (0..out_f * in_f).map(|_| self.uniform(-bound, bound)).collect()
+        (0..out_f * in_f)
+            .map(|_| self.uniform(-bound, bound))
+            .collect()
     }
 }
 
@@ -150,23 +152,23 @@ fn l2_normalize_last(x: &mut [f32], n: usize) {
 
 // --- The reference layer. One forward, batch 1. ----------------------------
 struct Params {
-    q_proj: Vec<f32>,   // [KD, D]
-    k_proj: Vec<f32>,   // [KD, D]
-    v_proj: Vec<f32>,   // [VD, D]
-    f_proj_0: Vec<f32>, // [V_HEAD, D]
-    f_proj_1: Vec<f32>, // [KD, V_HEAD]
-    b_proj: Vec<f32>,   // [KD, D]
-    w_proj: Vec<f32>,   // [VD, D]
-    g_proj_0: Vec<f32>, // [V_HEAD, D]
-    g_proj_1: Vec<f32>, // [VD, V_HEAD]
+    q_proj: Vec<f32>,     // [KD, D]
+    k_proj: Vec<f32>,     // [KD, D]
+    v_proj: Vec<f32>,     // [VD, D]
+    f_proj_0: Vec<f32>,   // [V_HEAD, D]
+    f_proj_1: Vec<f32>,   // [KD, V_HEAD]
+    b_proj: Vec<f32>,     // [KD, D]
+    w_proj: Vec<f32>,     // [VD, D]
+    g_proj_0: Vec<f32>,   // [V_HEAD, D]
+    g_proj_1: Vec<f32>,   // [VD, V_HEAD]
     g_proj_1_b: Vec<f32>, // [VD]
-    a_log: Vec<f32>,    // [H]
-    dt_bias: Vec<f32>,  // [KD]
-    o_norm_w: Vec<f32>, // [V_HEAD]
-    o_proj: Vec<f32>,   // [D, VD]
-    q_conv_w: Vec<f32>, // [KD, 4]
-    k_conv_w: Vec<f32>, // [KD, 4]
-    v_conv_w: Vec<f32>, // [VD, 4]
+    a_log: Vec<f32>,      // [H]
+    dt_bias: Vec<f32>,    // [KD]
+    o_norm_w: Vec<f32>,   // [V_HEAD]
+    o_proj: Vec<f32>,     // [D, VD]
+    q_conv_w: Vec<f32>,   // [KD, 4]
+    k_conv_w: Vec<f32>,   // [KD, 4]
+    v_conv_w: Vec<f32>,   // [VD, 4]
 }
 
 fn init_params(rng: &mut Rng) -> Params {
@@ -191,13 +193,19 @@ fn init_params(rng: &mut Rng) -> Params {
     let dt_bias: Vec<f32> = (0..KD)
         .map(|_| {
             let u = rng.unit();
-            let dt = (u * (0.1f32.ln() - 0.001f32.ln()) + 0.001f32.ln()).exp().max(1e-4);
+            let dt = (u * (0.1f32.ln() - 0.001f32.ln()) + 0.001f32.ln())
+                .exp()
+                .max(1e-4);
             dt + (-(-dt).exp_m1()).ln() // dt + log(-expm1(-dt))
         })
         .collect();
 
     let o_norm_w = vec![1f32; V_HEAD];
-    let conv = |rng: &mut Rng, ch: usize| (0..ch * 4).map(|_| rng.uniform(-0.5, 0.5)).collect::<Vec<f32>>();
+    let conv = |rng: &mut Rng, ch: usize| {
+        (0..ch * 4)
+            .map(|_| rng.uniform(-0.5, 0.5))
+            .collect::<Vec<f32>>()
+    };
     let q_conv_w = conv(rng, KD);
     let k_conv_w = conv(rng, KD);
     let v_conv_w = conv(rng, VD);
@@ -315,7 +323,9 @@ fn forward(p: &Params, x: &[f32]) -> Vec<f32> {
             for vv in 0..V_HEAD {
                 let mut erased = 0f32;
                 for kk in 0..HK {
-                    erased += s[(h * HK + kk) * V_HEAD + vv] * at(&b, h, ti, kk, HK) * at(&k, h, ti, kk, HK);
+                    erased += s[(h * HK + kk) * V_HEAD + vv]
+                        * at(&b, h, ti, kk, HK)
+                        * at(&k, h, ti, kk, HK);
                 }
                 let v_new = at(&w_gate, h, ti, vv, V_HEAD) * at(&v, h, ti, vv, V_HEAD) - erased;
                 for kk in 0..HK {
@@ -390,7 +400,9 @@ fn bytemuck_f32(t: &[f32]) -> &[u8] {
 }
 
 fn main() {
-    let out_path = std::env::args().nth(1).unwrap_or_else(|| "tests/ref_data.bin".to_string());
+    let out_path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "tests/ref_data.bin".to_string());
     let f = std::fs::File::create(&out_path).unwrap_or_else(|e| panic!("{out_path}: {e}"));
     let mut f = BufWriter::new(f);
 
@@ -402,7 +414,8 @@ fn main() {
     w_i32(&mut f, HK as i32);
     w_i32(&mut f, HV as i32);
     w_i32(&mut f, (EXPAND_V * 10.0) as i32);
-    f.write_all(&[USE_SHORT_CONV as u8, ALLOW_NEG_EIGVAL as u8]).unwrap();
+    f.write_all(&[USE_SHORT_CONV as u8, ALLOW_NEG_EIGVAL as u8])
+        .unwrap();
 
     w_linear(&mut f, "q_proj", &p.q_proj, KD, D);
     w_linear(&mut f, "k_proj", &p.k_proj, KD, D);
