@@ -27,3 +27,18 @@ cubecl = { workspace = true, optional = true, features = ["std"] }
 [dev-dependencies]
 burn-ndarray = { workspace = true, features = ["blas-openblas"] }
 burn = { workspace = true, features = ["ndarray", "autodiff", "cuda", "extension"] }
+
+# `cargo test` builds examples, so without these the three `#![cfg(feature =
+# "cuda")]` examples compile to an empty crate and the crate's own documented
+# command fails with E0601 `main` function not found.
+[[example]]
+name = "bitforbit_cuda"
+required-features = ["cuda"]
+
+[[example]]
+name = "kda_bench"
+required-features = ["cuda"]
+
+[[example]]
+name = "kda_step_probe"
+required-features = ["cuda"]
