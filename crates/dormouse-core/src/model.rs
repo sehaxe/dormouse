@@ -252,6 +252,24 @@ impl DormouseModel {
         total
     }
 
+    /// (checked, non-finite) over a sample of parameter tensors, read back
+    /// once. Used to refuse a corrupt checkpoint at load time instead of
+    /// training a GPU-hour into a NaN (measured 2026-09-27: a run that died
+    /// while the allocator was failing saved those weights, and every resume
+    /// replayed the corruption). A sample is enough: a corrupt save is NaN
+    /// everywhere, not in one tensor.
+    pub fn finite_scan(&self) -> (usize, usize) {
+        let read = |v: Result<Vec<f32>, _>| v.unwrap_or_default();
+        let vecs = [
+            read(self.embedding.weight.val().clone().into_data().try_to_vec::<f32>()),
+            read(self.norm.weight.val().clone().into_data().try_to_vec::<f32>()),
+            read(self.loop_block.residual_scale.val().clone().into_data().try_to_vec::<f32>()),
+        ];
+        let checked = vecs.iter().map(|v| v.len()).sum();
+        let bad = vecs.iter().map(|v| v.iter().filter(|x| !x.is_finite()).count()).sum();
+        (checked, bad)
+    }
+
     /// Random-depth arm (ADR-0013 rank 2): run only the first `n` loop
     /// iterations, `None` for the fixed-depth default. Cheapest way to get
     /// adaptive depth without a learned halting head - and nothing to

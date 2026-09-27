@@ -368,6 +368,17 @@ fn bytes_to_tensors<B: BurnBackend>(
 /// stream its records, so ~2x (model+optim) RAM is the floor without
 /// upstream changes).
 pub fn save_ckpt(dir: &Path, name: &str, model: &DormouseModel, optim: &Optim, step: u64, ce: f32) -> std::io::Result<()> {
+    // Rotate the previous save aside BEFORE writing the new one: with a single
+    // file, one bad save (a run dying mid-write, or weights written while the
+    // allocator was failing) destroys the last known-good state and every
+    // resume after it replays the same corruption. Cheap insurance: a hard
+    // link, no extra bytes while both exist.
+    let live = dir.join(format!("{name}.bin"));
+    if live.exists() {
+        let prev = dir.join(format!("{name}.prev.bin"));
+        let _ = std::fs::remove_file(&prev);
+        let _ = std::fs::hard_link(&live, &prev);
+    }
     let model_bytes = model.clone().into_record().into_bytes().map_err(|e| std::io::Error::other(e.to_string()))?;
     let optim_bytes = optim.to_record().into_bytes().map_err(|e| std::io::Error::other(e.to_string()))?;
     std::fs::create_dir_all(dir)?;
@@ -400,8 +411,22 @@ pub fn load_ckpt(dir: &Path, name: &str, cfg: &DormouseConfig, model: &mut Dormo
     let device = device();
     *model = DormouseModel::new(cfg, &device).load_record(mrec);
     *optim = optim.clone().load_record(orec);
+    // A checkpoint written while the allocator was failing is itself garbage,
+    // and resuming from it burns a GPU-hour before the first eval notices
+    // (measured 2026-09-27: official_v5 died at step 2000, saved over the good
+    // checkpoint, and every resume since produces NaN on the first step).
+    // Check the weights NOW, loudly, at load time.
+    let (total, bad) = model.finite_scan();
+    if bad > 0 {
+        eprintln!(
+            "checkpoint {name}.bin at step {step} has {bad}/{total} non-finite parameters - refusing to train from it (the save was corrupt; retry from {name}.prev.bin or start fresh)"
+        );
+        return None;
+    }
     Some(step)
 }
+
+
 
 /// Build the model with the run's factor-quant / bf16 compute settings.
 fn build_model(
@@ -1005,6 +1030,16 @@ pub fn train_loop(
                         n += 1;
                     }
                     let ece = ce_sum / n as f32;
+                    // A non-finite held-out number means the model OR the
+                    // allocator is broken (measured 2026-09-27: a cubecl pool
+                    // that had lost its buffers kept "training" and printed
+                    // NaN evals for 500 more steps). Refuse loudly instead of
+                    // collecting garbage.
+                    if !ece.is_finite() {
+                        return Err(format!(
+                            "step {step}: held-out eval is {ece:.3} (non-finite) - the model or the allocator is broken, not the data"
+                        ));
+                    }
                     let ebpb = bpb(ece);
                     let bytes = (n as u64) * (cfg.batch * cfg.seq_len) as u64;
                     println!(

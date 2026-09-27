@@ -246,6 +246,40 @@ fn execute(a: &Args, run: dormouse_train::RunCfg) -> Result<(), String> {
 fn main() {
     let a = Args::parse();
 
+    // Pin a stable executable image before anything else, but only when the
+    // guard is in play. `cargo build-train` REPLACES target/release/train, so a
+    // running process's /proc/self/exe resolves to a deleted inode and the
+    // guard's re-exec fails with ENOENT - exactly when the recovery is needed
+    // (measured 2026-09-27: official_v5f died, guard could not restart it, and
+    // the crash loop went unnoticed). A sibling image file that cargo does not
+    // know about survives rebuilds, and the re-exec points at it.
+    if a.guard {
+        const IMAGE_ENV: &str = "DORMOUSE_GUARD_EXE";
+        if std::env::var(IMAGE_ENV).is_err() {
+            let exe = std::env::current_exe().expect("current_exe");
+            // A SUBDIRECTORY, and the file must stay named `train`: the
+            // machine's ram-guard kills the heaviest process whose comm is
+            // exactly "train" (~/bin/ram-guard.sh), so an image named
+            // anything else would silently disable the memory guard for every
+            // --guard run. cargo does not own this directory.
+            let dir = exe.with_file_name("guard-image");
+            std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("create {}: {e}", dir.display()));
+            let image = dir.join("train");
+            let tmp = dir.join("train.tmp");
+            std::fs::copy(&exe, &tmp)
+                .unwrap_or_else(|e| panic!("pin guard image from {}: {e}", exe.display()));
+            std::fs::rename(&tmp, &image)
+                .unwrap_or_else(|e| panic!("pin guard image {}: {e}", image.display()));
+            use std::os::unix::process::CommandExt;
+            let err = std::process::Command::new(&image)
+                .args(std::env::args_os().skip(1))
+                .env(IMAGE_ENV, &image)
+                .exec();
+            eprintln!("guard image exec failed: {err}");
+            std::process::exit(1);
+        }
+    }
+
     // Resolve the config BEFORE detach/guard wrapping: a bad preset, --set
     // key or flag value must fail in the foreground where the user can see
     // it, not in a detached log file or a guard re-exec loop.
@@ -323,7 +357,10 @@ fn main() {
                 eprintln!("guard: restarting in 30s (resume from last checkpoint)");
                 std::thread::sleep(std::time::Duration::from_secs(30));
                 use std::os::unix::process::CommandExt;
-                let exe = std::env::current_exe().expect("current_exe");
+                // The pinned image if we have one, else our own path (which
+                // works as long as nothing rebuilt the binary under us).
+                let exe = std::env::var("DORMOUSE_GUARD_EXE")
+                    .unwrap_or_else(|_| std::env::current_exe().expect("current_exe").display().to_string());
                 let err = std::process::Command::new(exe)
                     .args(std::env::args_os().skip(1))
                     .exec();
