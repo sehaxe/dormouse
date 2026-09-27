@@ -236,6 +236,27 @@ pub fn init_pools(device: &Device) {
 #[cfg(not(feature = "cuda"))]
 pub fn init_pools(_device: &Device) {}
 
+/// The NaN firewall (2026-09-27). A non-finite loss must never reach the
+/// optimizer: backward turns it into NaN grads for every parameter, the step
+/// writes them into the weights, and from then on the model is dead - the
+/// guard then replays the poisoned region from a stale checkpoint forever.
+///
+/// Fix: mask the loss to 0 ON DEVICE. Backward through the masked tensor
+/// yields exactly zero gradients (not NaN), so the step degrades into a
+/// no-op, with no per-gradient-tensor walk and no per-step device sync.
+/// Returns the masked loss and a 1.0/0.0 device counter increment so the
+/// event rate can be reported at log cadence instead of being swallowed.
+///
+/// A zero loss is NOT a silent skip: `train_loop` prints the count loudly
+/// and refuses to continue past a whole log window of them (that is a broken
+/// model, not a spike).
+pub fn mask_nonfinite(loss: Tensor<1>) -> (Tensor<1>, Tensor<1>) {
+    let finite = loss.clone().is_finite();
+    let masked = loss.mask_fill(finite.clone().bool_not(), 0.0);
+    let bad = finite.float().neg().add_scalar(1.0);
+    (masked, bad)
+}
+
 /// WSD schedule (warmup 2% -> const -> 1.5-power decay over final 20%),
 /// same shape as aria's schedule.rs.
 pub fn wsd_factor(step: u64, total: u64, base_lr: f64) -> f64 {
@@ -625,6 +646,9 @@ pub fn train_loop(
     // exact — the monitor would have nothing to guard, so skip it entirely
     // (it costs 30+ device syncs per check).
     let mut ortho_fp32 = cfg.quant.as_deref() == Some("fp32");
+    // Non-finite losses since the last log step (device-side counter; read
+    // only at log cadence so the hot path stays sync-free).
+    let mut nan_steps = Tensor::<1>::zeros([1], &device);
     while step < cfg.steps as u64 {
         let t_iter = std::time::Instant::now();
         let (bytes, hashes) = (std::mem::replace(&mut pbytes, Vec::new()), std::mem::replace(&mut phashes, Vec::new()));
@@ -722,6 +746,18 @@ pub fn train_loop(
         } else {
             None
         };
+        // ── In-software NaN firewall ──────────────────────────────────────
+        // A non-finite loss used to be INVISIBLE between log steps: the
+        // scalar is only read every log_every steps, so backward produced
+        // NaN grads, the optimizer wrote them into the weights, and the
+        // guard then replayed the poisoned region from a stale ckpt forever
+        // (measured 2026-09-26 on official_v4: NaN at step 1550, then 1700,
+        // ckpt stuck at 1000, zero progress across three restarts). The
+        // recovery now lives inside the process and stays honest: see
+        // `mask_nonfinite`. The log copy above is the RAW loss, so a spike
+        // still prints as NaN/inf.
+        let (loss, nan_bad) = mask_nonfinite(loss);
+        nan_steps = nan_steps.add(nan_bad);
         let t_bwd = std::time::Instant::now();
         let fwd_ms = t_fwd.elapsed().as_secs_f64() * 1000.0;
         let raw_grads = loss.backward();
@@ -737,17 +773,37 @@ pub fn train_loop(
                     return Err(format!("step {step}: device error (loss is not a scalar)"));
                 }
             };
-            if !ce_now.is_finite() {
-                return Err(format!("step {step}: NaN loss (last good ckpt kept)"));
+            // Firewall accounting: how many steps since the last log had a
+            // non-finite loss. Those steps were no-ops (zero grads), so the
+            // weights are intact and the run continues; the count is the
+            // honest signal that the numerics need attention.
+            let n_nan: f32 = nan_steps
+                .clone()
+                .try_into_scalar()
+                .map_err(|_| format!("step {step}: device error (nan counter is not a scalar)"))?;
+            nan_steps = Tensor::<1>::zeros([1], &device);
+            if n_nan > 0.0 {
+                println!(
+                    "non-finite loss x{n_nan:.0} since the last log step (grads zeroed, weights untouched)"
+                );
+                // A spike or two is survivable; a persistently broken model
+                // is not. Refuse to limp on forever.
+                if n_nan > 8.0 && step % cfg.log_every as u64 == 0 {
+                    return Err(format!(
+                        "step {step}: {n_nan:.0} non-finite losses in one log window - the model is broken, not spiking"
+                    ));
+                }
             }
+            // A non-finite ce here already had its step neutralised above;
+            // it must not poison `best`.
             ce = ce_now;
-            if ce < best { best = ce; }
+            if ce.is_finite() && ce < best { best = ce; }
             if host_adam_step {
                 if let (Some(h), Some(p), Some(uniq)) =
                     (host.as_mut(), &rows_param, uniq_rows.as_ref())
                 {
                     if let Some(g) = p.grad(&raw_grads) {
-                        let g_vec: Vec<f32> = g.into_data().try_to_vec().unwrap_or_default();
+                        let mut g_vec: Vec<f32> = g.into_data().try_to_vec().unwrap_or_default();
                         assert!(
                             g_vec.len() == uniq.len() * h.dim,
                             "host-grad shape mismatch: {} vs {} uniq x {} dim — skipping a table update is not an option",
@@ -755,6 +811,15 @@ pub fn train_loop(
                             uniq.len(),
                             h.dim
                         );
+                        // One non-finite row grad poisons the host table
+                        // (9-48M rows, no rollback): zero it and say so.
+                        let bad = g_vec.iter().filter(|x| !x.is_finite()).count();
+                        if bad > 0 {
+                            println!("host-table grad: {bad} non-finite of {} zeroed", g_vec.len());
+                            for x in g_vec.iter_mut() {
+                                if !x.is_finite() { *x = 0.0; }
+                            }
+                        }
                         h.momentum_update(uniq, &g_vec, lr as f32);
                     }
                 }
@@ -1097,7 +1162,10 @@ mod tests {
     /// config: NdArray autodiff on the `small` preset takes minutes per step.
     #[test]
     fn mixed_optim_converges() {
-        const STEPS: usize = 40;
+        // 60 steps: burn's init is seeded per process, so the curve moves by
+        // ~0.02 run to run; 60 steps give a ~0.2 head-tail gap and the 0.1
+        // assertion keeps 2x headroom over that noise.
+        const STEPS: usize = 60;
         let cfg = test_cfg();
         let mut model = DormouseModel::new(&cfg, &device());
         let optim_cfg = TrainCfg { steps: 40, seq_len: 64, batch: 2, lr: 1e-3, wd: 0.01, grad_clip: 1.0, ..Default::default() };
@@ -1138,8 +1206,8 @@ mod tests {
         let head: f32 = losses[..5].iter().sum::<f32>() / 5.0;
         let tail: f32 = losses[STEPS - 5..].iter().sum::<f32>() / 5.0;
         assert!(losses.iter().all(|l| l.is_finite()), "loss must stay finite: {losses:?}");
-        // Real margin, not jitter: 40 steps fit the batch's byte marginals
-        // (ln(256)=5.545 -> 5.41 here, monotone). 0.1 is ~1000x the 1e-4
+        // Real margin, not jitter: the run fits the batch's byte marginals
+        // (ln(256)=5.545 -> ~5.35 here, monotone). 0.1 is ~1000x the 1e-4
         // wobble the old fresh-noise-per-step data produced.
         println!("mixed_optim head={head:.3} tail={tail:.3} losses={losses:?}");
         assert!(tail < head - 0.1, "loss must decrease: head={head:.3} tail={tail:.3} {losses:?}");
@@ -1344,6 +1412,49 @@ mod tests {
         let unknown: Vec<u8> = vec![9u8; 64];
         assert!(t.get(&unknown).is_err(), "unknown chunk must error loudly");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The NaN firewall must make a non-finite loss a true no-op. This is
+    /// the bug that killed official_v4: between log steps the NaN loss was
+    /// invisible, backward produced NaN grads, the optimizer wrote them into
+    /// the weights, and the guard replayed the poisoned region forever.
+    /// Contract: masked loss == 0, counter == 1, and with wd=0 (fresh AdamW
+    /// state) the step leaves a weight BIT-IDENTICAL.
+    #[test]
+    fn nan_firewall_makes_a_nonfinite_loss_a_noop() {
+        let cfg = test_cfg();
+        let mut model = DormouseModel::new(&cfg, &device());
+        let optim_cfg = TrainCfg { steps: 1, seq_len: 64, batch: 2, lr: 1e-3, wd: 0.0, grad_clip: 1.0, ..Default::default() };
+        let mut optim = crate::optim::build_optim_mode(&optim_cfg, "adamw");
+        let bytes: Vec<u8> = (0..128).map(|i| (i * 7) as u8).collect();
+        let hashes: Vec<i64> = (0..384).map(|p| (p as i64) % 4096).collect();
+        let (x, h) = bytes_to_tensors::<Backend>(&bytes, &hashes, 64, 2, &device());
+        let shifted: Vec<i64> = bytes.iter().skip(1).chain(std::iter::once(&bytes[0])).map(|&b| b as i64).collect();
+        let y: Tensor<2, Int> = Tensor::from_data(TensorData::new(shifted, [2, 64]), &device());
+        let (_l, rec, _k, _a) = model.forward_with_hidden::<Backend>(x, Some(h), None, Some(y), None);
+        let loss = model.loss::<Backend>(rec);
+
+        // A finite loss passes through untouched and counts nothing.
+        let (ok, bad_ok) = mask_nonfinite(loss.clone());
+        let ok_v: f32 = ok.clone().try_into_scalar().unwrap();
+        let base_v: f32 = loss.clone().try_into_scalar().unwrap();
+        assert!((ok_v - base_v).abs() < 1e-6, "finite loss must pass through: {ok_v} vs {base_v}");
+        assert_eq!(bad_ok.try_into_scalar::<f32>().unwrap(), 0.0, "finite loss must not count");
+
+        // The poisoned loss: masked to exactly 0, counted once.
+        let nan = Tensor::<1>::from_data(TensorData::new(vec![f32::NAN], [1]), &device());
+        let (masked, bad) = mask_nonfinite(loss.clone() + nan);
+        let m_v: f32 = masked.clone().try_into_scalar().unwrap();
+        assert_eq!(m_v, 0.0, "non-finite loss must mask to exactly 0, got {m_v}");
+        assert_eq!(bad.try_into_scalar::<f32>().unwrap(), 1.0, "the event must be counted");
+
+        // The step on the masked loss must not move a single weight.
+        let before: Vec<f32> = model.loop_block.norm.weight.val().into_data().try_to_vec().unwrap();
+        let grads = GradientsParams::from_grads(masked.backward(), &model);
+        model = optim.step(1e-3, model, grads);
+        let after: Vec<f32> = model.loop_block.norm.weight.val().into_data().try_to_vec().unwrap();
+        assert_eq!(before, after, "a masked loss must produce exactly zero grads");
+        assert!(after.iter().all(|x| x.is_finite()), "weights must stay finite");
     }
 
     /// Every OPT mode must build and take a step without NaN (AdamW, Adan,
