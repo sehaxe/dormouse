@@ -136,6 +136,61 @@ A/B (GPU slot needed): fixed-4 (official_v5, running) vs `--rand-depth`, judged
 on held-out BPB. The inference-side partner is a confidence exit in
 `generate` (~20 lines), not yet written.
 
+## POST-TRAINING VERDICT 2026-09-27 (research/2026-09-27-posttraining-compare.md)
+
+Answers the owner's question "is Rufus-Air the best?" - **no, it is the
+best-documented, and its 8-stage serial shape is already obsolete**: INTELLECT-3,
+MiMo-V2.6 and Nemotron 3 all replaced it with one mixed RL run plus post-RL
+multi-teacher distillation. Copy Rufus-Air's four PRINCIPLES (SFT as capability
+floor, learnability band, order stages by exposure-to-hacking, infra is part of
+the recipe), not its stage list.
+
+What actually transfers to a small model is **nanochat** (Karpathy): the only
+complete pretrain->SFT->RL pipeline published at ~124M, three scripts, and it
+contains the trick that removes our biggest data problem - **tool use is taught
+INSIDE GSM8K** via sandboxed Python execution (8K rows x 4 epochs against 460K
+chat rows, ~14:1), not as a separate agentic dataset. We therefore do not need an
+agentic corpus for the first agentic capability.
+
+Concrete RL recipe to copy when we get there (it is ~250 lines): no trust
+region, no KL to a reference, DAPO token-level normalization, advantage = r - mu
+(NO z-score), 16 samples per example, 256 new tokens, temperature 1.0, top-k 50,
+**RL lr = 5% of the SFT lr**, simple rampdown to zero with no warmup, and the
+loss masked on prompt bytes AND tool-observation bytes - the same mask rule as
+SFT. The chat template, the loss mask and the tool protocol are fixed in SFT and
+never touched by RL.
+
+Three findings that change the program:
+
+1. **>= 3 seeds per A/B.** At 151M, seed variance was larger than every recipe
+   difference measured. Our single-arm A/Bs (random depth, TSCT, aux, retract)
+   are therefore statistically weak as designed; each needs 3 seeds, which is
+   3x the GPU. Budget it explicitly instead of pretending one arm decides.
+2. **RL can COLLAPSE an already-aligned model at <= 1.5B** (measured: plain
+   GRPO on GSM8K at 135M LOWERED accuracy 1.82% -> 1.59%). Our n-gram memory arm
+   creates exactly such a near-optimum, so during RL we watch the held-out curve,
+   not the reward curve.
+3. **Process rewards beat outcome rewards by ~10 points at 0.5B**, and **GRPO
+   fails multi-turn agentic** (on-policy distillation beat it by 23.6 points on
+   ALFWorld/WebShop/Search-QA). So: process-level rewards from the start, and
+   distillation - not RL - for anything multi-turn.
+
+Byte-level specifics that change the design: chat formatting is a WIRE PROTOCOL,
+not a tokenizer - use control bytes (0x00-0x08 are near-absent from UTF-8 text)
+as role delimiters and derive the loss mask from those bytes; XML-tool and
+Python-tool sections need EXPLICIT byte markers because nothing disambiguates
+them; and byte sequences are 3-4x longer per content token, which is the
+strongest argument AGAINST long-CoT RL for us and FOR the tool-trace formulation
+(replace thinking tokens with verifiable tool turns).
+
+Recommended ladder, gated: SFT floor (10-100K conversations) -> execution-
+grounded RLVR on 1-10K verified short tasks -> on-policy distillation for
+multi-turn -> DPO/merge. Skip judge rewards, sandboxed agent RL, RLHF and
+browsing until the base is >= 100M AND stage 1 works. Honest uncertainty: zero
+byte-level post-training results exist at any scale, and 7.5M is ~16x below the
+smallest published pipeline - so the FIRST milestone stays the base model
+beating the 5-gram counter.
+
 ## COST ABLATION 2026-09-27 (what a step actually pays for)
 
 Same shape, same binary, one mechanism switched per arm, `small` at batch 4 /
