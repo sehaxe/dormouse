@@ -99,12 +99,18 @@ Ranked, by regime:
    dominates and the fixed cost amortizes away. Tensor cores are then THE lever
    - and they are reachable: the NVPTX wmma lowering defines its fragments for
    **f16** (A/B 8x2, accumulator f16 4x2 or **f32 8x1**), so f16 x f16 -> f32
-   accumulate is emittable, and measured 7.6x faster than f32 on the FFN shape.
-   bf16 is the one the dialect cannot lower (burn-spectral's bf16_matmul fails
-   its own two tests on pre.4+cuda, burn-cubecl ops/tensor.rs:150). cubecl's
-   f16 path is still incomplete: some shapes die with "builtin.fp16 to
-   implement dyn SizedType". A cuBLAS `gemm_ex` primitive (cudarc has a cublas
-   module; cubecl-cuda links cudarc, not cuBLAS) bypasses the dialect entirely.
+   accumulate is emittable in principle. But cubecl's f16 TYPE support is
+   incomplete upstream: every shape probed panics with "Expected type
+   builtin.fp16 to implement dyn SizedType" (cubecl-ir-0.11.0-pre.4
+   interfaces/mod.rs:402 - the fp16 scalar has no SizedType impl), and bf16 is
+   worse (burn-spectral's bf16_matmul fails its own two tests on pre.4+cuda,
+   burn-cubecl ops/tensor.rs:150). So on this stack BOTH tensor-core GEMM
+   paths are dead end-to-end, and the f32-only path costs us the 4-8x that
+   LLMQ's numbers assume. Fix order: (i) check whether a newer cubecl/burn
+   pre-release registers fp16 as a SizedType (free if yes), (ii) otherwise
+   vendor cubecl-ir and add the impl, (iii) otherwise a cuBLAS `gemm_ex`
+   primitive (cudarc has a cublas module; cubecl-cuda links cudarc, not
+   cuBLAS) bypasses cubecl's IR for the GEMM entirely.
 4. **Memory at 1B is an offload problem:** fp32 Adam states are 8 B/param;
    bf16 m/v halves it (stochastic rounding, per LLMQ); host double-buffering
    removes it - and LLMQ measured that zero-copy is BAD on gaming cards and
