@@ -124,3 +124,57 @@ fixed cost that a small model amortizes over few tokens.
 So the honest program order: (a) cut fixed overhead now (it compounds into
 every future run), (b) unlock bf16 GEMM via cuBLAS before any 1B attempt,
 (c) only then scale N, with optimizer offload as the memory enabler.
+
+
+## Addendum: the cuBLAS measurement (the actual 1B answer)
+
+Two more experiments, both on this box, source in `research/cublas_probe/`:
+
+1. **A hand-rolled WMMA kernel is not a free win.** 100 lines of classic
+   `wmma::mma_sync` (f16 fragments, f32 accumulator) on the 1B FFN shape:
+   **8.4 TFLOP/s**, against **10.2 TFLOP/s** for a plain tiled fp32 SGEMM in
+   the same binary. Tensor cores need real GEMM engineering (double
+   buffering, 128x128 tiles, async copies); a quick kernel is slower than
+   fp32. So "write our own bf16 kernel" is not the answer.
+2. **cuBLAS is the answer** (`cublas_combos.cu`, RTX 5060 Ti, 5120x2048x8192,
+   with official_v5 training concurrently so these are lower bounds):
+
+   | A/B | C | computeType | ms | TFLOP/s | max rel err vs fp32 |
+   |-----|---|-------------|----|---------|---------------------|
+   | f32 | f32 | 32F | 13.0 | **13.2** | 0 |
+   | f32 | f32 | 32F_FAST_TF32 | 9.8 | 17.5 | 4.1e-4 |
+   | f32 | f32 | 32F_FAST_16F | 8.9 | 19.4 | 4.1e-4 |
+   | **f16** | **f32** | **32F** | **3.9** | **43.7** | **4.1e-4** |
+   | f16 | f32 | 32F_FAST_16F | 5.0 | 34.7 | 4.1e-4 |
+   | bf16 | f32 | 32F | 4.3 | 39.8 | (input conversion not verified in this probe) |
+
+   **cuBLAS f16 with an fp32 accumulator is 3.3-4x cuBLAS fp32, and ~5-10x
+   our current cubecl f32 path (3.5-7.6 TFLOP/s).** The 4.1e-4 relative error
+   is ordinary AMP territory. LLMQ's 39 TFLOP/s on this card is exactly this
+   number - their stack is cuBLAS too. TF32 is nearly pointless here (1.3x),
+   so the usual "just enable TF32" advice does not apply to consumer
+   Blackwell.
+
+**Consequence.** The 1B goal does not need a new kernel, it needs the big
+matmuls routed through cuBLAS with f16/bf16 inputs and an fp32 accumulator,
+with the rest of the graph in fp32 (the `bf16_ops.rs` custom-autodiff-op
+pattern already exists and can be reused verbatim with a cuBLAS body).
+
+**The integration crux, found while spiking it (worth knowing before anyone
+re-derives it):** a burn tensor's buffer is a cubecl `Handle`
+(ManagedMemoryHandle + offset), NOT a raw device pointer, and
+`cubecl-runtime` 0.11.0-pre.4 exposes no pointer-resolution API on the client.
+`CubeTensor` does expose `client`/`handle`/`meta` publicly, and cudarc 0.19.10
+has a full `cublas` module (its `sys` FFI is public, so `cublasGemmEx` with
+CUDA_R_16F / CUBLAS_COMPUTE_32F is callable). So the missing piece is
+resolving a cubecl handle to a device pointer inside the same CUDA
+context/stream, or a cubecl-side hook for foreign library calls. That is a
+bounded but real piece of systems work - hence documented here rather than
+half-built.
+
+Row-major layout note for whoever implements it: cuBLAS is column-major, and
+the correct call for a row-major `C[M,N] = A[M,K] @ B[K,N]` is
+`GemmEx(OP_T, OP_N, m=N, n=M, k=K, A=B, lda=K, B=A, ldb=K, C, ldc=N)`.
+Both `OP_T, OP_T` and `OP_N, OP_N` are rejected (illegal lda/ldb) - that cost
+an hour and is exactly the kind of detail the "no invented maths" rule exists
+for.
