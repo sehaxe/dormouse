@@ -19,7 +19,7 @@ the gated delta rule. O(T) complexity instead of O(T²).
 | Backends | CPU, CUDA, Vulkan, Metal, WGPU (any burn backend) | **NVIDIA only** (Triton + flash-attn) |
 | Dependencies | burn only | lit-gpt + fla + einops + transformers + triton + flash-attn |
 | Backward pass | exact fused autodiff op (matrix-level WY adjoint, M⁻¹ reuse) | hand-written Triton kernels per op |
-| Verification | 1000-case bit-exact reference tests (regenerated with `tests/gen_reference.py`) | none shipped |
+| Verification | 1000-case comparison against an independent transcription (regenerated with `tests/gen_reference.py`) | none shipped |
 | Extras | `min_decay` (per-channel decay floor), GVA, `allow_neg_eigval` | GVA, `allow_neg_eigval` |
 
 ## Install
@@ -259,7 +259,7 @@ Notes:
 ```bash
 cargo test -p burn-gdn2                                   # unit + autodiff + decode
 cargo test -p burn-gdn2 --features autodiff --test autodiff_chunk  # fused op grads == tensor path + finite differences
-cargo test -p burn-gdn2 --features binary-tests           # 1000-case bit-exact vs the paper reference
+cargo test -p burn-gdn2 --features binary-tests           # 1000-case vs an independent transcription (NOT bit-for-bit)
 cargo test -p burn-gdn2 --features "cuda,autodiff" --test fused_chunk_verify  # kernels vs tensor path, CUDA grads
 python3 tests/gen_reference.py                            # regenerate tests/ref_data.bin
 ```

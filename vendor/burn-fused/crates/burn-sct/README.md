@@ -65,23 +65,29 @@ ever materialized. The `sign(diag(R))` correction matches the paper's
 | LLaMA-7B | 721.4 MB | 7.7 MB | 93× |
 | LLaMA-70B | 3,758 MB | 18.9 MB | **199×** |
 
-## Bit-exactness vs the reference
+## Reference comparison — NOT YET RUNNING
 
-`tests/cmp_reference.rs` (behind the `binary-tests` feature) proves
-forward, retraction, and `from_dense` match the official PyTorch reference
-([EctoSpace/SCT](https://github.com/EctoSpace/SCT)) within f32 tolerance.
-Reference tensors live in `tests/ref_data/*.bin` (gitignored); regenerate
-with `python3 gen_reference.py` (needs torch + numpy):
+`tests/cmp_reference.rs` (behind the non-default `binary-tests` feature) is
+written to compare forward, retraction and `from_dense` against the official
+PyTorch reference ([EctoSpace/SCT](https://github.com/EctoSpace/SCT)).
+
+**It has never run.** The reference tensors it loads (`tests/ref_data/*.bin`)
+are not in the tree, and the generator that produces them
+(`tests/gen_reference.py`) is not either — this crate's `.gitignore`
+inherits `*.py` and `*.bin` from a standalone-repo template and therefore
+excludes exactly the two things the comparison needs. Any accuracy number
+quoted for this crate before the generator and the fixture are committed is
+unmeasured.
 
 ```
 cargo test --release --features binary-tests --test cmp_reference -- --nocapture
 ```
 
 Configs: tiny 64×128/k8, small 256×512/k16, med 512×1024/k32, large 1024×2048/k64.
-Current results: forward ~2e-7, retract ~1e-7, `from_dense` ≤ 5.9e-4 (tolerance 1e-3).
-The `from_dense` SVD is one-sided (Hestenes) Jacobi — exact to f32 rounding, equivalent
-to `torch.linalg.svd`. The harness compares rank-k reconstructions (sign-invariant),
-never raw singular vectors (unique only up to sign).
+When it does run, the harness compares rank-k reconstructions (sign-invariant),
+never raw singular vectors (unique only up to sign), and the `from_dense` SVD is
+one-sided (Hestenes) Jacobi — exact to f32 rounding, equivalent to
+`torch.linalg.svd`.
 
 ## License
 

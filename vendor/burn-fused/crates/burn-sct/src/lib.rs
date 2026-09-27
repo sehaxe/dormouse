@@ -318,8 +318,8 @@ pub(crate) fn matmul_rt(
 /// Paper Eq 5: Q,R = QR(U); U <- Q * sign(diag(R)). Native single-allocation
 /// Householder path (qr.rs, LAPACK dgeqrf scheme, O(m k^2), AVX2/FMA +
 /// parallel Q). The sign(diag(R)) correction matches the paper's safe_qr
-/// (PyTorch linalg.qr + sign flip), verified bit-close by
-/// tests/cmp_reference.rs.
+/// (PyTorch linalg.qr + sign flip). tests/cmp_reference.rs compares this
+/// against the reference, but it has never run: see the README.
 fn orthogonalize_cpu(matrix: Tensor<2>) -> Tensor<2> {
     let device = matrix.device();
     let require_grad = matrix.is_require_grad();

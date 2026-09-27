@@ -2,9 +2,11 @@
 // burn-ndarray is deprecated upstream; kept as the CPU test backend until the burn-flex migration.
 #![cfg_attr(test, allow(deprecated))]
 //!
-//! Building blocks from [DSpark](https://arxiv.org/abs/2607.05147) (DeepSeek AI, 2026),
-//! matched against the official [DeepSpec](https://github.com/deepseek-ai/DeepSpec)
-//! implementation:
+//! Building blocks from [DSpark](https://arxiv.org/abs/2607.05147) (DeepSeek AI, 2026).
+//! NOT yet matched against the official
+//! [DeepSpec](https://github.com/deepseek-ai/DeepSpec) implementation — the
+//! 7 tests here are hand-derived and cannot detect a wrong loss term, a wrong
+//! `gamma`, or L1-on-logits instead of L1-on-probs:
 //!
 //! - `VanillaMarkov` — low-rank first-order transition bias `B = W1[x]W2` (Eq 5)
 //! - `GatedMarkovHead` — gated variant: `gate * W1[x]` with `sigmoid(W_g[h; W1[x]])`
