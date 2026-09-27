@@ -178,3 +178,38 @@ the correct call for a row-major `C[M,N] = A[M,K] @ B[K,N]` is
 Both `OP_T, OP_T` and `OP_N, OP_N` are rejected (illegal lda/ldb) - that cost
 an hour and is exactly the kind of detail the "no invented maths" rule exists
 for.
+
+
+## The integration, specified (spiked 2026-09-27, not built)
+
+Good news from the vendor tree: the pieces exist.
+
+- `vendor/cubecl-fix/cubecl-cuda/src/compute/storage/gpu.rs` already models
+  `GpuResource { ptr: u64, binding: *mut c_void, size: u64 }` - the raw device
+  pointer is a first-class field, it is simply not reachable from the client.
+- The compute stream is a `cudarc::driver::sys::CUstream`
+  (`compute/stream.rs`, `type Stream = Stream`), i.e. cudarc's own stream type,
+  so a `cudarc::cublas::CudaBlas` can be pointed at cubecl's stream rather
+  than making a second one (two cudarc contexts in a process share the driver's
+  primary context, so pointers stay valid either way).
+
+So the missing work is bounded and specific:
+
+1. A server-side resolver `Handle -> GpuResource` in cubecl-cuda plus a client
+   RPC to call it (we already vendor and patch this crate).
+2. `CudaBlas` on cubecl's stream in our crate (cudarc 0.19.10, `sys` FFI is
+   public, so `cublasGemmEx` with `CUDA_R_16F` + `CUBLAS_COMPUTE_32F` is
+   callable directly).
+3. A burn custom autodiff op shaped exactly like `burn-spectral`'s
+   `bf16_matmul` (forward on the inner backend, fp32 backward), with the
+   row-major layout call from the section above.
+4. Verification: max relative error against the fp32 matmul on the real shapes
+   (~4e-4 expected), then a step-time A/B on held-out BPB parity.
+
+Estimated 3-5 hours including debugging. Not started: it must land as one
+complete, tested piece, and the honest sequencing puts it after the current
+baseline and the research queue, not in the middle of a session that also has
+a live run to protect. The cheaper staged-buffer variant (copy operands in
+through cudarc, copy the result out) needs no vendor changes and costs ~25-40%
+of the win - it is the fallback if the RPC route turns out to be deeper than
+it looks.
