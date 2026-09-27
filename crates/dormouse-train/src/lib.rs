@@ -258,10 +258,17 @@ pub fn init_pools(_device: &Device) {}
 /// and refuses to continue past a whole log window of them (that is a broken
 /// model, not a spike).
 pub fn mask_nonfinite(loss: Tensor<1>) -> (Tensor<1>, Tensor<1>) {
-    let finite = loss.clone().is_finite();
-    let masked = loss.mask_fill(finite.clone().bool_not(), 0.0);
-    let bad = finite.float().neg().add_scalar(1.0);
-    (masked, bad)
+    let nonfinite = loss.clone().is_finite().bool_not();
+    // The counter is built with mask_fill on a FLOAT ones tensor, never with
+    // a Bool -> Float cast: on cubecl that cast returns 0 for `true`
+    // (measured 2026-09-27, official_v5: 50 "non-finite" per 50-step window
+    // on a perfectly finite loss), which both over-reports and would trip the
+    // broken-model fuse on a healthy run. The bool itself is trustworthy -
+    // it is what the mask above uses.
+    // 1.0 exactly on the steps whose loss was masked, 0.0 elsewhere.
+    let bump = Tensor::zeros_like(&loss).mask_fill(nonfinite.clone(), 1.0);
+    let masked = loss.mask_fill(nonfinite, 0.0);
+    (masked, bump)
 }
 
 /// The random-depth draw (ADR-0013 rank 2): `T` for this step, in
