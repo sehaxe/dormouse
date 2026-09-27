@@ -74,6 +74,51 @@ The v2 stack, each piece tied to a source:
 6. **Post-training (phase 6): Rufus-Air ordering** (2609.29421) — verifiable
    rewards first, judges later; matches POST_TRAINING.md.
 
+## OPTIMIZATION 2026-09-27 (measured; full data in research/2026-09-27-optimization-1b.md)
+
+Step = 1.9 s for 5120 tokens on 7.5M params. The decisive measurement: at
+seq 128, batch 10 -> 551 ms and batch 40 -> 808 ms for the SAME launch count
+and 4x the tokens, i.e. **~465 ms of FIXED cost per step** + 0.067 ms/token.
+Our fp32 GEMMs measure 3.5-7.6 TFLOP/s (gemm_probe) and one step holds ~40 ms
+of GEMM against 1900 ms: **~2-5% arithmetic, the rest overhead**. Reference:
+LLMQ (2512.15306) on this very RTX 5060 Ti reaches 78-85% MFU (39 TFLOP/s).
+
+Ranked, by regime:
+1. **Now (7.5M): kill fixed overhead.** CUDA-graph capture EXISTS in cubecl
+   0.11.0-pre.4 (`cubecl-cuda/src/compute/capture.rs`, server graph_prepare /
+   begin_capture / replay). Capture the whole step, replay per iteration:
+   static shapes + a persistent input buffer + zero syncs inside the window
+   (the loss read, max_ortho, ckpt save and the pool must stay outside).
+   Spike first: capture a loop of elementwise ops, measure replay vs eager.
+2. **Flags-only A/Bs (no new code), judged on held-out BPB:** `--retract-every 5`
+   (the polar retraction exists for the QUANTIZED forward; under `--quant fp32`
+   it is 87 ms/step of pure overhead), `--bf16` (halves elementwise traffic -
+   the dominant per-token term; the old "bf16 is slower" note predates the
+   restored autotune and must be re-measured), Muon NS steps 8 -> 5.
+3. **At 1B the ranking inverts:** per-step FLOPs ~123 TFLOP, so GEMM efficiency
+   dominates and the fixed cost amortizes away. Tensor cores are then THE lever
+   - and they are reachable: the NVPTX wmma lowering defines its fragments for
+   **f16** (A/B 8x2, accumulator f16 4x2 or **f32 8x1**), so f16 x f16 -> f32
+   accumulate is emittable, and measured 7.6x faster than f32 on the FFN shape.
+   bf16 is the one the dialect cannot lower (burn-spectral's bf16_matmul fails
+   its own two tests on pre.4+cuda, burn-cubecl ops/tensor.rs:150). cubecl's
+   f16 path is still incomplete: some shapes die with "builtin.fp16 to
+   implement dyn SizedType". A cuBLAS `gemm_ex` primitive (cudarc has a cublas
+   module; cubecl-cuda links cudarc, not cuBLAS) bypasses the dialect entirely.
+4. **Memory at 1B is an offload problem:** fp32 Adam states are 8 B/param;
+   bf16 m/v halves it (stochastic rounding, per LLMQ); host double-buffering
+   removes it - and LLMQ measured that zero-copy is BAD on gaming cards and
+   good on L40S, the opposite of the datacenter intuition. We already ship the
+   host machinery (offload.rs, CPU Adam, D2H row grads).
+5. **Allocate everything at startup** (LLMQ): the antidote to our pool
+   high-water behaviour; `memory_cleanup()` mid-run is a workaround for a
+   design the reference never needed.
+
+Honest 1B math: LLMQ's optimized 1.5B does 3.9k tok/s on this card, so a
+Chinchilla-minimum 10B-token 1B run is ~30 days continuous. The regime where
+our current stack is competitive is small N with long training, where the fixed
+per-step cost is amortized over few tokens.
+
 ## LONG-CONTEXT LADDER (2026-09-26, research 2026-09-26-long-context-agentic.md)
 
 KDA needs no RoPE/YaRN (Kimi Linear is NoPE end-to-end; decay carries the
