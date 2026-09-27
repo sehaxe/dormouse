@@ -388,10 +388,24 @@ mod tests {
         ]
         .into_iter()
         .flat_map(|r| [Factor, Scale, DenseWeight, DenseBias].into_iter().map(move |k| (r, k)))
-        .flat_map(|(r, k)| [(false, group_of(r, k, false)), (true, group_of(r, k, true))])
-        .map(|((r, k), (ff, g))| (r, k, ff, g))
+        .flat_map(|(r, k)| {
+            // (r, k) has to ride through the (ff, g) expansion: the pair
+            // below is the only carrier, so dropping it here loses the role
+            // and the kind and the map after it has nothing to destructure.
+            [(false, group_of(r, k, false)), (true, group_of(r, k, true))]
+                .into_iter()
+                .map(move |(ff, g)| (r, k, ff, g))
+        })
         .collect();
-        assert_eq!(all.len(), table.len(), "the table must cover every (role, kind)");
+        // The ENUMERATION is exhaustive by construction; the table above is
+        // the readable subset (every cell the policy says something
+        // non-obvious about). Asserting they have the same LENGTH was wrong
+        // - it demanded 24 hand-written rows to document 14 decisions - and
+        // the per-row check above already ties every table cell to
+        // `group_of`. What must not go stale is the enumeration: a new Role
+        // or LinearParam changes this number, and the match in `group_of`
+        // stops compiling at the same time.
+        assert_eq!(all.len(), 24, "3 roles x 4 kinds x 2 fallback settings");
     }
 
     /// The whole model, checked against the declaration: nothing invisible,
@@ -413,14 +427,23 @@ mod tests {
             r.groups.values().map(Vec::len).sum::<usize>(),
             "the counts must cover the declaration exactly"
         );
-        // The dense arm declares the SAME number of params and the same
-        // total, but routes the experts' weights to the fallback: the
-        // is_muon_param/group-builder disagreement could not be seen here
-        // before, because neither side looked at a real model.
+        // The dense arm moves the experts' weights to the fallback. It does
+        // NOT declare the same number of params: a dense linear is TWO
+        // (weight, bias) where the TSCT it replaces is THREE (u, s, v), so
+        // the dense model has FEWER param tensors. Asserting equal totals
+        // here was the bug; the disagreement this test exists for is about
+        // the GROUP, and that is what the three lines below check.
         let dense = DormouseConfig { use_tsct: false, ..cfg.clone() };
         let m2 = DormouseModel::new(&dense, &dev());
         let c2 = routing(&m2, false).check(&m2).expect("dense model must be fully declared");
-        assert_eq!(c2.muon + c2.qk + c2.tables + c2.rest, c.muon + c.qk + c.tables + c.rest);
+        assert!(
+            c2.rest > c.rest,
+            "the dense experts' weights must move to the fallback ({:?} -> {:?})",
+            c,
+            c2
+        );
+        assert_eq!(c2.qk, c.qk, "the head-wise Q/K group is the KDA q and k either way");
+        assert_eq!(c2.tables, c.tables, "the n-gram table is one param either way");
     }
 
     /// The check still has teeth: a parameter nobody claims is an error, not
