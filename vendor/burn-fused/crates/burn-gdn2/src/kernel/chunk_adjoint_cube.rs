@@ -391,7 +391,7 @@ pub mod cuda {
     use burn::tensor::{DispatchTensor, Tensor};
     use burn_cubecl::tensor::CubeTensor;
     use burn_cubecl::CubeBackend;
-    use std::any::{Any, TypeId};
+    use std::any::TypeId;
 
     /// The bare (non-fusion) CUDA backend the fused kernels target.
     pub type CudaBare = CubeBackend;
@@ -401,29 +401,16 @@ pub mod cuda {
     }
 
     /// Owned copy of the underlying `CubeTensor` of `t`, if `B` is the bare
-    /// CUDA `CubeBackend` and the buffer is row-major contiguous.
+    /// CUDA `CubeBackend` and the buffer is row-major contiguous. A strided
+    /// view is materialized once, never recursed into — see
+    /// [`crate::kernel::contiguous_cube_of`].
     fn cube_of<B: Backend, const D: usize>(
         t: &Tensor<D>,
     ) -> Option<CubeTensor>
     where
         DispatchTensor: DispatchKindConversion<B>,
     {
-        if !is_cuda::<B>() {
-            return None;
-        }
-        let prim = t.clone().try_into_primitive::<B>().ok()?;
-        let cube = (&prim as &dyn Any).downcast_ref::<CubeTensor>()?;
-        let shape = cube.meta.shape().dims::<D>();
-        let strides = cube.meta.strides().to_vec();
-        let mut expected = 1usize;
-        for i in (0..D).rev() {
-            if shape[i] > 1 && strides[i] != expected {
-                let contig = t.clone().mul_scalar(1.0);
-                return cube_of::<B, D>(&contig);
-            }
-            expected *= shape[i];
-        }
-        Some(cube.clone())
+        crate::kernel::contiguous_cube_of::<B, D>(t)
     }
 
     /// Exported forward buffers consumed by the fused backward.

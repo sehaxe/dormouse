@@ -24,6 +24,40 @@ static SITES: OnceLock<Mutex<Vec<(&'static str, u64)>>> = OnceLock::new();
 /// "did the backward re-execute the forward, and how many times".
 static CHUNK_ITERATIONS: AtomicU64 = AtomicU64::new(0);
 
+/// Strided views copied into a row-major buffer so the fused kernels can read
+/// them linearly. The trainer's KDA inputs are all permutes, so this is the
+/// normal path, not an anomaly — and a copy is a real cost, so it is counted.
+static CONTIG_COPIES: AtomicU64 = AtomicU64::new(0);
+/// Materializations that did NOT come back row-major (a pitched allocation).
+/// A fallback, so it is counted rather than silent.
+static CONTIG_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+/// One strided input materialized into a contiguous buffer.
+#[inline]
+pub fn note_contiguous_copy() {
+    CONTIG_COPIES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// One input that could not be made row-major: the caller fell back.
+#[inline]
+pub fn note_contiguous_fallback() {
+    CONTIG_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// `(materialized, fell_back)` since [`reset_contiguous`].
+pub fn contiguous_copies() -> (u64, u64) {
+    (
+        CONTIG_COPIES.load(Ordering::Relaxed),
+        CONTIG_FALLBACKS.load(Ordering::Relaxed),
+    )
+}
+
+/// Zero both contiguous counters.
+pub fn reset_contiguous() {
+    CONTIG_COPIES.store(0, Ordering::Relaxed);
+    CONTIG_FALLBACKS.store(0, Ordering::Relaxed);
+}
+
 /// One executed iteration of the tensor-ops chunk loop.
 #[inline]
 pub fn chunk_iteration() {
