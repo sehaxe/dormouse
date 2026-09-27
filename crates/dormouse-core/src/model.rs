@@ -283,7 +283,14 @@ impl DormouseModel {
     /// replayed the corruption). A sample is enough: a corrupt save is NaN
     /// everywhere, not in one tensor.
     pub fn finite_scan(&self) -> (usize, usize) {
-        let read = |v: Result<Vec<f32>, _>| v.unwrap_or_default();
+        // LOUD on a failed readback: `unwrap_or_default()` turned a device
+        // error into an EMPTY vector, so `checked = 0, bad = 0` and this
+        // guard - the one that refuses a corrupt checkpoint at load time -
+        // reported "clean" for weights it never looked at (ADR-0019).
+        let read = |v: Result<Vec<f32>, burn::tensor::DataError>| -> Vec<f32> {
+            v.expect("finite_scan: reading a parameter back from the device failed - \
+                      the checkpoint cannot be judged, refusing to say it is clean")
+        };
         let vecs = [
             read(self.embedding.weight.val().clone().into_data().try_to_vec::<f32>()),
             read(self.norm.weight.val().clone().into_data().try_to_vec::<f32>()),
@@ -353,7 +360,15 @@ impl DormouseModel {
         let x: Tensor<2, Int> = Tensor::from_data(TensorData::new(ids, [1, bytes.len().max(1)]), &device);
         let logits = self.forward::<B>(x, None);
         let [_, t, v] = logits.dims();
-        logits.slice([0..1, t - 1..t, 0..v]).reshape([v]).into_data().try_to_vec().unwrap_or_else(|_| vec![0.0; v])
+        // LOUD, not `vec![0.0; v]`: all-zero logits is a CONFIDENT answer to
+        // "which byte comes next" (argmax says byte 0 forever) and the sampler
+        // cannot tell it from a real prediction (ADR-0019).
+        logits
+            .slice([0..1, t - 1..t, 0..v])
+            .reshape([v])
+            .into_data()
+            .try_to_vec()
+            .expect("forward_bytes: logits readback failed")
     }
 
     pub fn max_seq_len(&self) -> usize {

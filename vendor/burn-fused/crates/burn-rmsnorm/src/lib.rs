@@ -52,6 +52,10 @@ impl RMSNorm {
             {
                 return out.reshape([b, t, d]);
             }
+            // The tensor path below is CORRECT, so the only honest way to see
+            // a dead fused kernel is a counter (ADR-0019): on dormouse's
+            // training backend this line is the normal case, not an error.
+            crate::fused::SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         // eps inside the sqrt (LLaMA/HF convention): x / sqrt(mean(x^2) + eps)
         let rms = x

@@ -46,8 +46,23 @@ use burn::{
 };
 use burn_muon_plus::{MuonPlus, MuonPlusConfig, MuonPlusState, NormDir};
 use dormouse_core::DormouseModel;
+use std::sync::atomic::Ordering::Relaxed;
 
 use crate::{Optim, TrainCfg};
+
+/// How many times a fused Muon+ CUDA kernel was asked for and answered with
+/// the tensor-ops path instead. `false` from `momentum_cuda`/`finalize_cuda`
+/// means "not a bare cubecl tensor" or "empty", and the tensor path computes
+/// the same function - so without a counter the fused optimizer kernel can be
+/// dead for a whole run and the log looks identical (ADR-0019; the head-wise
+/// Q/K group this guards is ON in every run, `qk_heads` is always resolved).
+pub fn fused_kernels_skipped() -> (u64, u64) {
+    (SKIPPED_MOMENTUM.load(Relaxed), SKIPPED_FINALIZE.load(Relaxed))
+}
+/// Present on every build so [`fused_kernels_skipped`] has one answer: with
+/// no cuda feature the fused kernels are never asked, and `(0, 0)` says so.
+static SKIPPED_MOMENTUM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SKIPPED_FINALIZE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Newton-Schulz iterations for Muon+ orthogonalization. Report §3.1: 8 for
 /// stability (the Muon+ paper default is 5).
@@ -196,6 +211,7 @@ impl Optimizer for HeadWiseMuon {
                 #[cfg(feature = "cuda")]
                 {
                     if !burn_muon_plus::fused_kernels::momentum_cuda(&mut mm, &grad, mu) {
+                        SKIPPED_MOMENTUM.fetch_add(1, Relaxed); // tensor path, counted
                         mm = mm
                             .clone()
                             .mul_scalar(mu)
@@ -241,6 +257,7 @@ impl Optimizer for HeadWiseMuon {
                 lr_scaled as f32,
                 wd,
             ) {
+                SKIPPED_FINALIZE.fetch_add(1, Relaxed); // tensor path, counted
                 updated = updated
                     .clone()
                     .mul_scalar(1.0 - wd)

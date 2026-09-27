@@ -8,7 +8,7 @@ pub mod loop_block;
 pub mod model;
 pub mod param;
 
-pub use attention::AdaptiveAttention;
+pub use attention::{fused_seam_counts, AdaptiveAttention};
 pub use aux::{AuxHeads, TEACHER_MOMENTUM};
 pub use config::{ActQuant, DormouseConfig};
 pub use loop_block::{ExpertFFN, LoopBlock};

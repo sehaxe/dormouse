@@ -7,6 +7,25 @@
 use burn::tensor::Device;
 use burn_kda::KdaModule;
 
+/// Fused-path accounting for the two library seams this crate's arms cross,
+/// as one line a training log can print (ADR-0019: a fused kernel that falls
+/// back to tensor ops returns the RIGHT answer, so nothing but a counter
+/// distinguishes "ran" from "fell back").
+///
+/// `(kda_fused_forward, kda_fused_backward)` are launch counters the library
+/// already keeps (`burn_gdn2::fused_calls`); `(norm_asked, norm_skipped)` is
+/// the fused RMSNorm. `norm_asked == norm_skipped` means the norm kernel never
+/// engaged - the state on the trainer's autodiff backend, where the fused
+/// kernel cannot take an autodiff tensor.
+pub fn fused_seam_counts() -> (u64, u64, u64, u64) {
+    #[cfg(all(feature = "cuda", feature = "std"))]
+    let (kda_f, kda_b) = burn_gdn2::fused_calls();
+    #[cfg(not(all(feature = "cuda", feature = "std")))]
+    let (kda_f, kda_b) = (0, 0);
+    let (norm_asked, norm_skipped) = burn_rmsnorm::fused::calls();
+    (kda_f, kda_b, norm_asked, norm_skipped)
+}
+
 #[derive(Debug, burn::module::Module)]
 pub struct AdaptiveAttention {
     pub gdn2: KdaModule,

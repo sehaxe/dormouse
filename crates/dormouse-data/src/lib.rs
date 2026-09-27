@@ -144,15 +144,71 @@ pub fn read_bytes(files: &[PathBuf], limit: usize) -> Vec<u8> {
                 break 'outer;
             }
             match src.read(&mut tmp) {
-                Ok(0) | Err(_) => break,
+                // A read ERROR is not an EOF: treating it as one ends the
+                // file early and the caller measures a corpus shorter than
+                // the one it asked for, with no sign of it (ADR-0019).
+                Ok(0) => break,
+                Err(e) => {
+                    skipped.push(format!("{}: read {e}", f.display()));
+                    break;
+                }
                 Ok(n) => out.extend_from_slice(&tmp[..n]),
             }
         }
     }
+    if !skipped.is_empty() {
+        eprintln!(
+            "read_bytes: {} of {} file(s) unreadable, the sample is short by them: {}",
+            skipped.len(),
+            files.len(),
+            skipped.join("; ")
+        );
+    }
+    // An empty sample measures NOTHING and the caller's BPB is then a
+    // division by a corpus that was never read - loud, naming the cause.
+    assert!(
+        !out.is_empty(),
+        "read_bytes: no bytes from {} file(s) (unreadable root, unmounted drive, or no data extensions?)",
+        files.len()
+    );
     if limit > 0 && out.len() > limit {
         out.truncate(limit);
     }
     out
+}
+
+/// Open one data file as a [`Source`], or `None` with the reason on stderr.
+/// A parquet file that the arrow reader refuses is NOT quietly dropped: the
+/// corpus is a list of shards and a missing one is a hole in every number
+/// computed from it (ADR-0019 - the previous `.ok().and_then(..)` chain
+/// skipped it invisibly).
+fn open_source(path: &Path) -> Option<Source> {
+    let is_parquet = path
+        .extension()
+        .map(|e| e.to_string_lossy().eq_ignore_ascii_case("parquet"))
+        .unwrap_or(false);
+    let r = if is_parquet {
+        std::fs::File::open(path)
+            .and_then(|f| {
+                parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(f)
+                    .and_then(|b| b.build())
+                    .map(|reader| Source::Parquet {
+                        reader,
+                        batch: Vec::new(),
+                        pos: 0,
+                    })
+                    .map_err(std::io::Error::other)
+            })
+    } else {
+        std::fs::File::open(path).map(|f| Source::Text(BufReader::new(f)))
+    };
+    match r {
+        Ok(s) => Some(s),
+        Err(e) => {
+            eprintln!("data: skipping unreadable shard {}: {e}", path.display());
+            None
+        }
+    }
 }
 
 /// A file open for byte reading: plain text/binary files stream chunks;
@@ -353,8 +409,18 @@ impl ByteStream {
                 break;
             }
             let read = {
+                let path = self
+                    .files
+                    .get(self.file_idx)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
                 let r = self.reader.as_mut().unwrap();
-                r.read(&mut tmp).unwrap_or(0)
+                // An Err is NOT an EOF: `unwrap_or(0)` here used to end the
+                // file early and move on, so a mid-file I/O error (or a bad
+                // parquet row group) truncated the corpus with nothing in the
+                // log - the training half of the `read_bytes` fix (ADR-0019).
+                r.read(&mut tmp)
+                    .unwrap_or_else(|e| panic!("data: read {path} failed: {e}"))
             };
             if read == 0 {
                 self.reader = None;
@@ -370,20 +436,37 @@ impl ByteStream {
         );
     }
 
-    /// FNV 3/5/8-gram hashes (mod 4096) for the Engram memory.
+    /// FNV n-gram hashes for the Engram memory, one column per entry of
+    /// [`ORDERS`], REDUCED mod `tables[t]`.
+    ///
+    /// This is the host-RAM path's contract: the caller owns the tables
+    /// (`HostNgram::slots`), so the reduction happens here and the host
+    /// gather is a plain in-range index. For the in-VRAM path use
+    /// [`Self::hashes_raw`] - the model masks the slot index itself, so its
+    /// `engram_rows` config is the only copy of the capacity.
     pub fn hashes(&self, bytes: &[u8], tables: &[usize]) -> Vec<i64> {
-        let mut out = Vec::with_capacity(self.batch * self.seq_len * tables.len());
+        let mut out = self.hashes_raw(bytes);
+        for (i, h) in out.iter_mut().enumerate() {
+            *h = h.rem_euclid(tables[i % tables.len()] as i64);
+        }
+        out
+    }
+
+    /// FNV n-gram hashes, RAW (not reduced): the low 32 bits of the FNV-1a
+    /// digest of each context, one column per entry of [`ORDERS`]. Truncating
+    /// to 32 bits is deliberate - CUDA stores Int as i32 - and a 4.3e9 key
+    /// space is far more than any affordable table can separate anyway.
+    pub fn hashes_raw(&self, bytes: &[u8]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(self.batch * self.seq_len * ORDERS.len());
         for b in 0..self.batch {
             for p in 0..self.seq_len {
                 let e = p + 1;
-                let s3 = e.saturating_sub(3);
-                let s5 = e.saturating_sub(5);
-                let s8 = e.saturating_sub(8);
                 let base = b * self.seq_len;
                 let seq = &bytes[base..base + self.seq_len];
-                out.push((fnv(&seq[s3..e]) % tables[0] as u64) as i64);
-                out.push((fnv(&seq[s5..e]) % tables[1] as u64) as i64);
-                out.push((fnv(&seq[s8..e]) % tables[2] as u64) as i64);
+                for &n in ORDERS.iter() {
+                    let s = e.saturating_sub(n);
+                    out.push((fnv(&seq[s..e]) as u32) as i64);
+                }
             }
         }
         out
@@ -481,6 +564,36 @@ mod tests {
     #[should_panic(expected = "non-empty file list")]
     fn empty_file_list_is_loud() {
         ByteStream::from_files(8, 2, Vec::new(), 1);
+    }
+
+    /// A read ERROR is not an EOF, and must not become one. `refill` used to
+    /// `unwrap_or(0)` the read result, so an unreadable shard ended the file
+    /// at byte 0, the stream moved on, and the run trained on whatever the
+    /// NEXT shard held - no error, no log line, a corpus quietly smaller
+    /// than the one that was configured (ADR-0019).
+    ///
+    /// A directory named `corpus.bin` opens fine and fails on the first read
+    /// (EISDIR), which is exactly the shape of a bad drive, so the panic has
+    /// to name the read failure rather than pretend the file ended. The batch
+    /// is tiny so the size floor (which counts a directory's 40 bytes) passes
+    /// and the READ is what is under test.
+    #[test]
+    #[should_panic(expected = "read ")]
+    fn a_shard_that_fails_to_read_is_not_a_silent_eof() {
+        let dir = std::env::temp_dir().join(format!("dormouse_read_err_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(dir.join("corpus.bin")).unwrap();
+        let _ = ByteStream::from_files(2, 2, vec![dir.join("corpus.bin")], 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `read_bytes` measured NOTHING when every file it was handed failed to
+    /// open, and returned an empty vec that the anchors tool then divided by:
+    /// a BPB for a corpus that was never read. It must refuse (ADR-0019).
+    #[test]
+    #[should_panic(expected = "read_bytes: no bytes")]
+    fn an_empty_sample_is_loud_not_a_zero_byte_corpus() {
+        let _ = read_bytes(&[PathBuf::from("/nonexistent/path/shard.txt")], 1 << 10);
     }
 
     #[test]

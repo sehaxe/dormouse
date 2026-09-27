@@ -11,7 +11,6 @@ pub fn validate(c: &DormouseConfig) -> Result<(), String> {
     if c.norm_eps <= 0.0 { return Err("norm_eps must be >0".into()); }
     if c.jepa_weight < 0.0 || c.dspark_weight < 0.0 { return Err("jepa/dspark_weight >=0".into()); }
     if c.jepa_mask_frac < 0.0 || c.jepa_mask_frac > 1.0 { return Err("jepa_mask_frac 0..1".into()); }
-    if c.d_ffn % 2 != 0 { /* SwiGLU needs even */ }
     if c.d_model % c.n_heads != 0 { return Err("d_model must be divisible by n_heads".into()); }
     Ok(())
 }

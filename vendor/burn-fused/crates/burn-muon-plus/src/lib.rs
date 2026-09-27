@@ -295,7 +295,7 @@ impl Optimizer for MuonPlus {
             // O_t = Norm_(d)(Ortho(M_t)), gated by "this step had a signal"
             let update = self
                 .normalize(self.orthogonalize(momentum.clone()))
-                .mul(g_active.reshape([1, 1]));
+                .mul(g_active.unsqueeze());
 
             // W_t = W_{t-1} - η·max(1, m/n)^0.5·O_t (Bernstein dimensional
             // factor, Jordan et al. muon.py: max(1, m/n)^0.5; the plain
@@ -361,7 +361,7 @@ impl Optimizer for MuonPlus {
                 .clone()
                 .mul_scalar(1.0 - (self.weight_decay as f32 * lr as f32).min(0.999));
             (
-                decayed.sub(step.mul(g_active.reshape([1])).mul_scalar(lr as f32)),
+                decayed.sub(step.mul(g_active.unsqueeze()).mul_scalar(lr as f32)),
                 MuonPlusState::new(None, Some(m), Some(v), Some(t)),
             )
         };

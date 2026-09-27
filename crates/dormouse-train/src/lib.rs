@@ -18,7 +18,7 @@ use burn::{
     tensor::{Bytes, Device, Int, Tensor, TensorData},
 };
 
-use dormouse_core::{ActQuant, DormouseConfig, DormouseModel};
+use dormouse_core::{fused_seam_counts, ActQuant, DormouseConfig, DormouseModel};
 
 pub use cfg::{resolve, RunCfg};
 pub use optim::{
@@ -358,7 +358,11 @@ pub fn quant_format(device: &Device, forced: Option<&str>, bf16: bool) -> burn_s
             "fp16" => QuantFormat::Fp16,
             "fp8" => QuantFormat::Fp8,
             "fp4" => QuantFormat::Fp4,
-            _ => QuantFormat::Fp32,
+            // LOUD, not Fp32: `--quant fp8x` used to train a whole run in
+            // fp32 and print a normal-looking loss curve (ADR-0019).
+            other => panic!(
+                "--quant {other:?} is not a format; use one of fp32|bf16|fp16|fp8|fp4"
+            ),
         };
     }
     let sm = sm_of(device);
@@ -1131,8 +1135,19 @@ pub fn train_loop(
                     }
                     let ebpb = bpb(ece);
                     let bytes = (n as u64) * (cfg.batch * cfg.seq_len) as u64;
+                    // Seam counters (ADR-0019): a fused CUDA kernel that falls
+                    // back to tensor ops is CORRECT, so the only way a reader
+                    // of this log learns the fast path was skipped is that it
+                    // is printed here, on the line they already watch.
+                    let (kda_f, kda_b, norm_asked, norm_skipped) = fused_seam_counts();
+                    let (mu_mom, mu_fin) = optim::fused_kernels_skipped();
                     println!(
-                        "step {step:6} EVAL ce={ece:.3} bpb={ebpb:.3} over {bytes} B (fixed window)"
+                        "step {step:6} EVAL ce={ece:.3} bpb={ebpb:.3} over {bytes} B (fixed window) \
+                         fused kda={kda_f}/{kda_b} norm={}/{} muon_skipped={}/{}",
+                        norm_asked.saturating_sub(norm_skipped),
+                        norm_asked,
+                        mu_mom,
+                        mu_fin
                     );
                     // Depth curve, no training. Our readout is the MEAN of the
                     // per-iteration outputs, so "stop after k iterations" is

@@ -10,6 +10,9 @@ burn-tensor = { version = "0.22.0-pre.4", default-features = false }
 burn-nn = { version = "0.22.0-pre.4", default-features = false }
 burn-cuda = { version = "0.22.0-pre.4", default-features = false, features = ["std", "autotune"] }
 burn-kda = { path = "../../vendor/burn-fused/crates/burn-kda" }
+# The fused-kernel seam counters (ADR-0019): burn-kda's fused dispatch hands
+# its launch counts to burn-gdn2, which is the crate that owns them.
+burn-gdn2 = { path = "../../vendor/burn-fused/crates/burn-gdn2", default-features = false }
 burn-bitnet = { path = "../../vendor/burn-fused/crates/burn-bitnet" }
 burn-engram = { path = "../../vendor/burn-fused/crates/burn-engram" }
 burn-rmsnorm = { path = "../../vendor/burn-fused/crates/burn-rmsnorm" }
@@ -30,6 +33,8 @@ cuda = [
     "burn/cuda",
     "burn-kda/cuda",
     "burn-kda/autodiff",
+    "burn-gdn2/cuda",
+    "burn-gdn2/autodiff",
     "burn-spectral/cuda",
     "burn-rmsnorm/cuda",
 ]

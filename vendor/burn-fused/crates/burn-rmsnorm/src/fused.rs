@@ -1,5 +1,37 @@
 //! Fused RMSNorm CUDA kernel: x / sqrt(mean(x^2) + eps) * w in one launch
 //! (vs ~5 tensor passes). One cube per row, 256 threads, shared reduction.
+//!
+//! The seam accounting lives here (ADR-0019): `rmsnorm_cuda` returning `None`
+//! is a CORRECT tensor-ops answer, so a kernel that never engages looks
+//! exactly like one that does - on the trainer's backend it does not engage
+//! (the model's norm input is an autodiff tensor, not a bare `CubeTensor`).
+//! `(asked, skipped)` is the pair that says so out loud; the trainer prints it
+//! on the eval line.
+
+/// `(times the fused kernel was asked for, times it was skipped for the
+/// tensor path)`. `asked == skipped` is a DEAD kernel; `asked == 0` is a
+/// build without the cuda feature. Both are incremented on the two sides of
+/// the one `if let` in [`crate::RMSNorm::forward`], so they cannot disagree.
+#[cfg(feature = "cuda")]
+pub fn calls() -> (u64, u64) {
+    (
+        ASKED.load(std::sync::atomic::Ordering::Relaxed),
+        SKIPPED.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Seam counters (ADR-0019): one increment per ask, one per fallback.
+#[cfg(feature = "cuda")]
+pub static ASKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "cuda")]
+pub static SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// No fused path exists without the cuda feature, so nothing was asked and
+/// nothing was skipped. The trainer's eval line prints this as `0/0`.
+#[cfg(not(feature = "cuda"))]
+pub fn calls() -> (u64, u64) {
+    (0, 0)
+}
 
 #[cfg(feature = "cuda")]
 use burn::backend::Backend;
@@ -73,6 +105,7 @@ where
     burn::tensor::DispatchTensor: burn::backend::DispatchKindConversion<B>,
 {
     use burn_cubecl::tensor::CubeTensor;
+    ASKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let cube = |t: Tensor<2>| -> Option<CubeTensor> {
         let prim = t.clone().try_into_primitive::<B>().ok()?;
         let c = (&prim as &dyn Any).downcast_ref::<CubeTensor>()?;
