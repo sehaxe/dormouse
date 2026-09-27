@@ -86,14 +86,42 @@ flowchart LR
 
 Flat TOML in [`configs/`](configs/) — presets are data, not code.
 
-| preset | d_model | experts | max_iter | target |
-|---|---|---|---|---|
-| `nano` | 512 | 3 | 4 | smoke tests |
-| `small` | 768 | 3 | 4 | **flagship on 16 GB** (7.53M params) |
-| `swift50` | 1024 | 8 | 8 | 50M-class experiments |
-| `base` | 1024 | 3 | 8 | 12.2M params |
-| `one_b` | 2048 | 4 | 12 | the 1B dream |
-| `p150` | 4096 | 4 | 12 | 159.7M params |
+Parameter counts are **measured on the instantiated model**, split into
+computation and n-gram memory rows, by
+`cargo test -p dormouse-core --test preset_exec` (the widths too wide to
+instantiate on a CPU test run are behind `-- --ignored`). The split is the
+column that matters: a preset whose count is mostly rows is a lookup table
+with a model attached, which is the shape that made every run in this
+project's history need `--no-engram` instead of a config.
+
+| preset | d_model | experts | max_iter | params (compute) | memory rows | rows share | target |
+|---|---|---|---|---|---|---|---|
+| `nano` | 512 | 3 | 4 | 7.19M (4.05M) | 3.15M | **43.7%** | smoke tests |
+| `nano-fused` | 512 | 3 | 4 | 7.19M (4.05M) | 3.15M | **43.7%** | KDA+Engram+aux off, single-node path |
+| `small` | 768 | 3 | 4 | 9.20M (6.05M) | 3.15M | 34.2% | **flagship on 16 GB** |
+| `mor` | 768 | 3 | 4 | 9.20M (6.05M) | 3.15M | 34.2% | `small` + Mixture-of-Recursions A/B arm |
+| `base` | 1024 | 3 | 8 | 13.07M (9.92M) | 3.15M | 24.1% | 24 GB-class experiments (OOMs on 16 GB at batch 6) |
+| `swift50` | 1024 | 8 | 8 | see `-- --ignored` | 3.15M | — | many-expert experiments |
+| `one_b` | 2048 | 4 | 12 | see `-- --ignored` | 3.15M | — | the 1B dream |
+| `p150` | 4096 | 4 | 12 | ~160M compute (159.7M per the header probe) | 3.15M | ~2% | the 150M-program flagship (64 heads) |
+
+Notes, all of them checked by that test:
+
+- Every preset pays the same 3.15M memory rows: 3 tables × 32 768 rows (25 000
+  rounded up to a power of two, because the in-model read masks the hash) ×
+  32 dims. That is 24% of `base` and **44% of `nano`** — the budget is a
+  ratio, so the narrow presets pay it hardest. The old `small` figure
+  (7.53M total) and the old `base` figure (12.2M) predate the 2026-09-27
+  re-pricing from 8M rows/order to 25 000 and are stale.
+- `use_engram = false` does **not** shrink the model: `nano-fused` ships the
+  arm off and still allocates the full 3.15M rows. `--engram-ram` squeezes
+  them to 1 row per order; a preset that wants the rows gone needs the same.
+- `configs/mor.toml` shipped `engram_rows = 500_000` until 2026-09-27 while
+  every other preset was re-priced to 25 000: 50.3M memory rows against a
+  6.05M backbone, 89% of the model, and an A/B against `small` that measured
+  MoR *plus* an 11x table rather than the three lines it claims to differ in.
+  Corrected, and the test now asserts the A/B pair differs in `use_mor`,
+  `mor_k` and `mor_bce_weight` only.
 
 ## Quick start
 

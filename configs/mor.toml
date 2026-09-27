@@ -23,7 +23,14 @@ jepa_mask_span = 8
 dspark_weight = 0.1
 dspark_k = 4
 dspark_stride = 16
-engram_rows = 500000
+# The memory capacity is `small`'s, 25_000 rows/order: this file is the A/B
+# control for MoR and every other preset was re-priced from 500_000 on
+# 2026-09-27 (86% of the model, the monopoly shape that got the arm rescued
+# with --no-engram instead of a config). At 500_000 this preset was the last
+# one still carrying the old budget, so the A/B measured MoR *plus* an 11x
+# memory table against a control with 25_000 - not the three lines it claims
+# to differ in. Measured: 50_331_648 memory rows against a 7.05M backbone.
+engram_rows = 25000
 engram_orders = [2, 3, 4]
 engram_dim = 32
 engram_lam_max = 0.5
