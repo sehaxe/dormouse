@@ -347,6 +347,36 @@ fn gradient_flow() {
         "{} params with non-finite grads: {nonfinite:#?}",
         nonfinite.len()
     );
+    // Every parameter that HAS a gradient must have a NON-ZERO one. This is
+    // the arbiter that should have caught the real bug: with the ReZero scale
+    // initialized to 0 (its value until 2026-09-27) dL/dy = 0, so the KDA arm,
+    // every expert FFN and both controller gates started with no gradient at
+    // all and the model was a linear map of the byte embedding. The old test
+    // bumped the scale by hand and only asserted on the controller; the
+    // initialization is now 1.0 (identity, as ReZero specifies) and nothing
+    // needs the workaround.
+    // The JEPA predictor is exempt BY CONSTRUCTION, not by convenience: its
+    // loss is an L1 over a RANDOM span mask (2% start rate, 128 positions), and
+    // when no start lands the mask is empty, the masked loss is identically
+    // zero and the head's gradient is exactly zero. That is a property of the
+    // objective, not starvation - and it bites ~7.6% of steps, so the old
+    // catch-all assert flaked.
+    const RANDOM_MASK_EXEMPT: &[&str] = &[
+        "aux.jepa_pred.proj.weight",
+        "aux.jepa_pred.norm.gamma",
+        "aux.jepa_pred.norm.beta",
+    ];
+    let starved: Vec<&str> = probe
+        .rows
+        .iter()
+        .filter(|(p, has, n)| *has && n.abs() < 1e-12 && !RANDOM_MASK_EXEMPT.contains(&p.as_str()))
+        .map(|(p, _, _)| p.as_str())
+        .collect();
+    assert!(
+        starved.is_empty(),
+        "{} parameters have a zero gradient at init (starved, not just small): {starved:#?}",
+        starved.len()
+    );
     let zeros: Vec<(&str, f32)> = probe
         .rows
         .iter()
@@ -361,11 +391,9 @@ fn gradient_flow() {
     for (p, n) in &zeros {
         println!("  zero-grad-norm: {p} ({n:.2e})");
     }
-    // The halt head is gone (ADR-0013); the controller's gradient is
-    // legitimately zero at init: everything it gates is multiplied by the
-    // zero residual scale. So the wiring assert runs a second backward with
-    // the scale bumped to 1 - one optimizer step's worth - where the
-    // controller must light up.
+    // The controller's gates multiply the arms, so it is the last thing to
+    // light up; a second backward with the scale forced to 1 asserts the
+    // wiring independently of whatever the init happens to be.
     let head_norm = |rows: &[(String, bool, f32)], want: &str| {
         rows.iter()
             .find(|(p, _, _)| p == want)
@@ -373,9 +401,7 @@ fn gradient_flow() {
             .2
     };
     let ctrl0 = head_norm(&probe.rows, "loop_block.controller.weight");
-    println!(
-        "gradient_flow at init: controller norm={ctrl0:.3e} (ReZero scale=0 zeroes the controller's path)"
-    );
+    println!("gradient_flow at init: controller norm={ctrl0:.3e}");
 
     model.loop_block.residual_scale =
         burn::module::Param::from_tensor(Tensor::<1>::ones([1], &dev));

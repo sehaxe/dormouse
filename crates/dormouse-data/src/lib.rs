@@ -103,6 +103,10 @@ pub struct ByteStream {
     capacity: usize,
     seed: u64,
     epoch: u64,
+    /// Set once the ring has dropped its consumed prefix; after that a
+    /// rewind() can no longer reach the original first byte, and the eval's
+    /// "same window every time" guarantee is over (see `rewind`).
+    drained: bool,
 }
 
 /// A file open for byte reading: plain text/binary files stream chunks;
@@ -206,6 +210,7 @@ impl ByteStream {
             capacity,
             seed,
             epoch: 0,
+            drained: false,
         };
         bs.refill();
         bs
@@ -370,6 +375,13 @@ impl ByteStream {
     /// corpus would refill, and `refill` shuffles, so re-evaluating that
     /// needs a fresh `ByteStream` instead.
     pub fn rewind(&mut self) {
+        assert!(
+            !self.drained,
+            "rewind() after the ring buffer dropped its consumed prefix: the \
+             'fixed eval window' guarantee is void (a fresh ByteStream is the \
+             only correct rewind). Keep the eval split smaller than half the \
+             ring, or re-eval with a new stream."
+        );
         self.pos = 0;
     }
 

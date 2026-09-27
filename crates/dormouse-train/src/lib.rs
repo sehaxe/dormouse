@@ -82,6 +82,13 @@ pub struct TrainCfg {
     /// the EVAL LINE so a curve is self-documenting about its own protocol.
     #[serde(skip)]
     pub eval_batches: usize,
+    /// At every eval, also score depths 1..=max_iter and print the curve. One
+    /// extra forward per depth, NO training: it answers "is the model actually
+    /// depth-robust, and how much headroom would an early exit have?" before
+    /// we spend a GPU-day on adaptive depth (measure first - see
+    /// research/2026-09-27-adaptive-depth-safe.md).
+    #[serde(skip)]
+    pub eval_depths: bool,
     pub retract_every: usize,
     pub retract_iters: usize,
     /// Stress protocol (report §3.3): constant LR at `stress_lr`x, spike
@@ -398,7 +405,27 @@ pub fn save_ckpt(dir: &Path, name: &str, model: &DormouseModel, optim: &Optim, s
 }
 
 pub fn load_ckpt(dir: &Path, name: &str, cfg: &DormouseConfig, model: &mut DormouseModel, optim: &mut Optim) -> Option<u64> {
-    let raw = std::fs::read(dir.join(format!("{name}.bin"))).ok()?;
+    // Try the live checkpoint, then the rotated one: a save written while the
+    // allocator was failing is garbage, and silently starting from scratch (or
+    // promoting the garbage to .prev on the next save) is how we lost a day
+    // (review 2026-09-27).
+    for cand in [format!("{name}.bin"), format!("{name}.prev.bin")] {
+        if let Some(step) = load_ckpt_file(dir, &cand, cfg, model, optim) {
+            return Some(step);
+        }
+        eprintln!("checkpoint {cand} unusable - trying the previous one");
+    }
+    None
+}
+
+fn load_ckpt_file(
+    dir: &Path,
+    file: &str,
+    cfg: &DormouseConfig,
+    model: &mut DormouseModel,
+    optim: &mut Optim,
+) -> Option<u64> {
+    let raw = std::fs::read(dir.join(file)).ok()?;
     if raw.len() < 24 { return None; }
     let step = u64::from_le_bytes(raw[0..8].try_into().ok()?);
     let mlen = u64::from_le_bytes(raw[8..16].try_into().ok()?) as usize;
@@ -419,7 +446,7 @@ pub fn load_ckpt(dir: &Path, name: &str, cfg: &DormouseConfig, model: &mut Dormo
     let (total, bad) = model.finite_scan();
     if bad > 0 {
         eprintln!(
-            "checkpoint {name}.bin at step {step} has {bad}/{total} non-finite parameters - refusing to train from it (the save was corrupt; retry from {name}.prev.bin or start fresh)"
+            "checkpoint {file} at step {step} has {bad}/{total} non-finite parameters - refusing to train from it (the save was corrupt)"
         );
         return None;
     }
@@ -823,53 +850,55 @@ pub fn train_loop(
         // recovery now lives inside the process and stays honest: see
         // `mask_nonfinite`. The log copy above is the RAW loss, so a spike
         // still prints as NaN/inf.
+        // The firewall has to SKIP the step, not just mask the loss. Masking
+        // the loss scalar only zeroes the gradient when the NaC came FROM the
+        // loss; if it came from an intermediate activation, backward still
+        // produces NaN grads and the optimizer writes them into the weights
+        // anyway (measured 2026-09-27: a held-out eval that is NaN proves the
+        // NaN is in the WEIGHTS, not in the batch, and every resume replayed
+        // the same poisoned checkpoint). So: read the scalar every step, and
+        // on a non-finite loss do not backward, do not step, do not retract.
+        // The read costs one small D2H per step, which is noise against a
+        // launch-bound step, and it makes the count exact instead of a bound.
+        let loss_f: f32 = loss.clone().try_into_scalar().unwrap_or(f32::NAN);
+        let loss_bad = !loss_f.is_finite();
+        if loss_bad {
+            nan_window += 1;
+            if nan_window > 8 {
+                return Err(format!(
+                    "step {step}: {nan_window} consecutive non-finite losses - the model is broken, not spiking"
+                ));
+            }
+            if nan_window == 1 || nan_window % 50 == 0 {
+                println!("step {step:6} non-finite loss - step SKIPPED (no backward, no optimizer step)");
+            }
+        } else {
+            nan_window = 0;
+        }
         let loss = mask_nonfinite(loss);
         let t_bwd = std::time::Instant::now();
         let fwd_ms = t_fwd.elapsed().as_secs_f64() * 1000.0;
-        let raw_grads = loss.backward();
+        let raw_grads = if loss_bad { None } else { Some(loss.backward()) };
         let lr = match stress.as_ref() {
             // Constant LR at a multiple of the optimum (report §3.3).
             Some(s) => s.lr(cfg.lr),
             None => wsd_factor(step, cfg.steps as u64, cfg.lr),
         };
-        if let Some(loss_log) = &loss_log {
-            let ce_now: f32 = match loss_log.clone().try_into_scalar() {
-                Ok(v) => v,
-                Err(_) => {
-                    return Err(format!("step {step}: device error (loss is not a scalar)"));
-                }
-            };
-            // Firewall accounting, on the host, from the value we just read:
-            // this counts the reads that saw a non-finite loss, so between
-            // reads it is a LOWER BOUND (stated as such in the message). The
-            // steps it misses were no-ops anyway - the mask is what makes them
-            // harmless - and the host is the only counter we trust.
-            if !ce_now.is_finite() {
-                nan_window += 1;
-            }
-            if nan_window > 0 {
-                println!(
-                    "non-finite loss at >= {} read(s) since the last log step (each masked to a no-op; weights untouched)",
-                    nan_window
-                );
-                // A spike or two is survivable; a persistently broken model is
-                // not. Refuse to limp on forever.
-                if nan_window > 8 && step % cfg.log_every as u64 == 0 {
-                    return Err(format!(
-                        "step {step}: {nan_window} non-finite losses in one log window - the model is broken, not spiking"
-                    ));
-                }
-                nan_window = 0;
-            }
-            // A non-finite ce here already had its step neutralised above;
-            // it must not poison `best`.
+        if loss_log.is_some() {
+            // The RAW loss, read BEFORE the mask ran. Reading `loss_log`
+            // here was wrong: `clone()` shares the device buffer and
+            // `mask_fill` picks the in-place strategy on CUDA when only two
+            // handles alias it, so the "raw" copy was already zeroed - the
+            // log printed ce=0.000 on a NaN step and `best` stuck at 0 forever
+            // (found by review 2026-09-27). `loss_f` above is the honest value.
+            let ce_now = loss_f;
             ce = ce_now;
             if ce.is_finite() && ce < best { best = ce; }
-            if host_adam_step {
+            if host_adam_step && !loss_bad {
                 if let (Some(h), Some(p), Some(uniq)) =
                     (host.as_mut(), &rows_param, uniq_rows.as_ref())
                 {
-                    if let Some(g) = p.grad(&raw_grads) {
+                    if let Some(g) = raw_grads.as_ref().and_then(|rg| p.grad(rg)) {
                         let mut g_vec: Vec<f32> = g.into_data().try_to_vec().unwrap_or_default();
                         assert!(
                             g_vec.len() == uniq.len() * h.dim,
@@ -891,24 +920,31 @@ pub fn train_loop(
                     }
                 }
             }
-            if step % cfg.log_every as u64 == 0 {
+            if step % cfg.log_every as u64 == 0 && !loss_bad {
                 if let Some(s) = stress.as_mut() {
-                    s.observe(ce, grad_norm(&model, &raw_grads));
+                    if let Some(rg) = raw_grads.as_ref() {
+                        s.observe(ce, grad_norm(&model, rg));
+                    }
                 }
             }
         }
         let bwd_ms = t_bwd.elapsed().as_secs_f64() * 1000.0;
         let t_opt = std::time::Instant::now();
-        let grads = GradientsParams::from_grads(raw_grads, &model);
-        let model_new = optim.step(lr, model, grads);
-        model = model_new;
+        if let Some(rg) = raw_grads {
+            let grads = GradientsParams::from_grads(rg, &model);
+            model = optim.step(lr, model, grads);
+        }
+        // On a skipped step the optimizer's MOMENTUM still applies (Muon+
+        // re-normalizes a zero gradient to unit norm and takes a full step in
+        // the stale direction), which is why the step is skipped rather than
+        // merely masked.
         let opt_ms = t_opt.elapsed().as_secs_f64() * 1000.0;
         let t_retr = std::time::Instant::now();
         // TSCT ortho maintenance (bf16_KERNEL_PLAN): retract the U/V masters
         // every step so the quantized forward stays faithful; monitor the
         // drift at cadence and fall back to fp32 factors when it exceeds the
         // plan's 1e-3 threshold. --retract-every / --retract-iters override.
-        if step % cfg.retract_every.max(1) as u64 == 0 {
+        if step % cfg.retract_every.max(1) as u64 == 0 && !loss_bad {
             model.retract_tsct(cfg.retract_iters);
         }
         let retr_ms = t_retr.elapsed().as_secs_f64() * 1000.0;
@@ -916,6 +952,7 @@ pub fn train_loop(
         if let Some(t) = teacher.take() {
             teacher = Some(dormouse_core::aux::ema_update(t, &model, dormouse_core::aux::TEACHER_MOMENTUM));
         }
+        let _ = lr;
         let ema_ms = t_ema.elapsed().as_secs_f64() * 1000.0;
         // max_ortho reads every TSCT factor (30+ device syncs) - cadence,
         // not per-50-steps: each check drains the pipeline. The metric is
@@ -976,7 +1013,13 @@ pub fn train_loop(
                     // backwarded, and with grad tracking on they OOM'd the
                     // card at 15.9/16.3 GB on the first eval). The original
                     // model keeps training - burn's docs say exactly that.
-                    let eval_model = model.valid();
+                    let mut eval_model = model.valid();
+                    // `depth_override` is a plain field, so the snapshot
+                    // inherits the step's SAMPLED depth under --rand-depth and
+                    // the eval line would report a depth-T model (found by
+                    // review 2026-09-27). The eval is always the full-depth
+                    // model; the depth curve is what varies.
+                    eval_model.set_loop_depth(None);
                     // Average over eval_batches batches: one batch is 5 KB,
                     // whose sampling noise is larger than the effects we A/B.
                     let mut ce_sum = 0.0f32;
@@ -1045,6 +1088,62 @@ pub fn train_loop(
                     println!(
                         "step {step:6} EVAL ce={ece:.3} bpb={ebpb:.3} over {bytes} B (fixed window)"
                     );
+                    // Depth curve, no training. Our readout is the MEAN of the
+                    // per-iteration outputs, so "stop after k iterations" is
+                    // the prefix mean over 1..k - which is exactly what
+                    // --rand-depth trains. That is why a confidence exit
+                    // composes with the shipped arm for free: no head, no
+                    // retraining, just a different k per sequence.
+                    if cfg.eval_depths {
+                        let mut line = String::new();
+                        for depth in 1..=eval_model.loop_block.max_iter {
+                            let mut m = eval_model.clone();
+                            m.set_loop_depth(Some(depth));
+                            let mut d_sum = 0.0f32;
+                            let mut d_n = 0u32;
+                            for _ in 0..cfg.eval_batches.max(1) {
+                                let (db, dh) = match &host {
+                                    Some(h) => ev.next_batch_with_tables(h.slots),
+                                    None => ev.next_batch(),
+                                };
+                                let (dx, _dt) =
+                                    bytes_to_tensors::<Backend>(&db, &dh, cfg.seq_len, cfg.batch, &device);
+                                let dshift: Vec<i64> = db
+                                    .iter()
+                                    .skip(1)
+                                    .chain(std::iter::once(&db[0]))
+                                    .map(|&b| b as i64)
+                                    .collect();
+                                let dy: Tensor<2, Int> = Tensor::from_data(
+                                    TensorData::new(dshift, [cfg.batch, cfg.seq_len]),
+                                    &device,
+                                );
+                                let drows = match &host {
+                                    Some(h) => {
+                                        let (_, e, _) = offload::rows_for_batch::<Backend>(
+                                            h, &dh, cfg.batch, cfg.seq_len, &device, false,
+                                        );
+                                        Some(e)
+                                    }
+                                    None => None,
+                                };
+                                let (dl, ..) =
+                                    m.forward_with_hidden::<Backend>(dx, None, drows, None, None);
+                                let dv = m.vocab_size;
+                                let dflat = dl.reshape([cfg.batch * cfg.seq_len, dv]);
+                                let dtgt = dy.reshape([cfg.batch * cfg.seq_len, 1]);
+                                d_sum += burn::tensor::activation::log_softmax(dflat, 1)
+                                    .gather(1, dtgt)
+                                    .neg()
+                                    .mean()
+                                    .try_into_scalar()
+                                    .unwrap_or(f32::NAN);
+                                d_n += 1;
+                            }
+                            line.push_str(&format!(" d{depth}={:.3}", bpb(d_sum / d_n as f32)));
+                        }
+                        println!("step {step:6} DEPTHS{line}");
+                    }
                 }
             }
         }

@@ -112,6 +112,10 @@ struct Args {
     /// fixed and rewound every time, so numbers are comparable across runs.
     #[arg(long)]
     eval_batches: Option<usize>,
+    /// Also print the held-out BPB at depths 1..=max_iter at every eval (no
+    /// extra training): measures depth-robustness and early-exit headroom.
+    #[arg(long)]
+    eval_depths: bool,
 
     // --- quantization / maintenance ---
     /// Force factor-quant format: fp32 | bf16 | fp16 | fp8 | fp4.
@@ -205,6 +209,7 @@ fn build_run(a: &Args) -> Result<dormouse_train::RunCfg, String> {
     train.jepa_targets = a.jepa_targets.clone().or(train.jepa_targets);
     train.rand_depth |= a.rand_depth;
     train.eval_batches = a.eval_batches.unwrap_or(train.eval_batches);
+    train.eval_depths |= a.eval_depths;
     train.retract_every = a.retract_every.unwrap_or(train.retract_every);
     train.retract_iters = a.retract_iters.unwrap_or(train.retract_iters);
     train.stress |= a.stress;
@@ -260,13 +265,18 @@ fn main() {
             // anything else would silently disable the memory guard for every
             // --guard run. cargo does not own this directory.
             let dir = exe.with_file_name("guard-image");
-            std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("create {}: {e}", dir.display()));
             let image = dir.join("train");
-            let tmp = dir.join("train.tmp");
-            std::fs::copy(&exe, &tmp)
-                .unwrap_or_else(|e| panic!("pin guard image from {}: {e}", exe.display()));
-            std::fs::rename(&tmp, &image)
-                .unwrap_or_else(|e| panic!("pin guard image {}: {e}", image.display()));
+            // pid-suffixed tmp: two concurrent launches sharing a fixed
+            // `train.tmp` can publish a truncated image through the rename.
+            let tmp = dir.join(format!("train.tmp.{}", std::process::id()));
+            // Best-effort: a read-only target/ must fall back to current_exe,
+            // not panic before the config is even validated.
+            let pinned = std::fs::create_dir_all(&dir).is_ok()
+                && std::fs::copy(&exe, &tmp).is_ok()
+                && std::fs::rename(&tmp, &image).is_ok();
+            if !pinned {
+                eprintln!("guard: could not pin an executable image, using the live path");
+            }
             use std::os::unix::process::CommandExt;
             let err = std::process::Command::new(&image)
                 .args(std::env::args_os().skip(1))
@@ -345,13 +355,26 @@ fn main() {
         Ok(()) => {}
         Err(e) => {
             eprintln!("train failed: {e}");
-            if guard && resumable {
+            let restarts: u32 = std::env::var("DORMOUSE_GUARD_RESTARTS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            // An in-loop Err is now reachable for a PERMANENT condition (a
+            // non-finite held-out eval = a broken allocator), and the guard
+            // re-exec'd every 30 s forever - which also manufactures the
+            // "two GPU processes at once" that corrupted the pool in the first
+            // place (review 2026-09-27). Cap the chain: after 3 restarts the
+            // operator has to look.
+            if guard && resumable && restarts < 3 {
                 // The guard re-execs with the ORIGINAL argv, so the new
                 // process re-runs resolve() on identical inputs. resolve is
                 // deterministic in argv (no env or randomness feeds the
                 // config), which is exactly what lets the on-disk snapshot
                 // drift check pass across restarts.
-                eprintln!("guard: restarting in 30s (resume from last checkpoint)");
+                eprintln!(
+                    "guard: restarting in 30s (resume from last checkpoint, restart {} of 3)",
+                    restarts + 1
+                );
                 std::thread::sleep(std::time::Duration::from_secs(30));
                 use std::os::unix::process::CommandExt;
                 // The pinned image if we have one, else our own path (which
@@ -360,10 +383,13 @@ fn main() {
                     .unwrap_or_else(|_| std::env::current_exe().expect("current_exe").display().to_string());
                 let err = std::process::Command::new(exe)
                     .args(std::env::args_os().skip(1))
+                    .env("DORMOUSE_GUARD_RESTARTS", (restarts + 1).to_string())
                     .exec();
                 eprintln!("guard: re-exec failed: {err}");
             } else if guard {
-                eprintln!("guard: no resumable checkpoint, giving up");
+                eprintln!(
+                    "guard: giving up (resumable={resumable}, restarts={restarts}) - a persistent failure needs a human"
+                );
             }
             std::process::exit(1);
         }

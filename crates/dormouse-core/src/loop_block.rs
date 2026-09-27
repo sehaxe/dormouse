@@ -121,7 +121,12 @@ impl LoopBlock {
             norm: RMSNorm::new(d, cfg.norm_eps, device),
             gr: cfg.use_gr.then(|| GatedResidual::new(d, device)),
             iter_embed,
-            residual_scale: burn::module::Param::from_tensor(Tensor::zeros([1], device)),
+            // ReZero's residual coefficient starts at 1 (identity init), NOT 0:
+            // at 0 the block body contributes nothing AND its gradient is
+            // exactly zero (dL/dy = 0), so the KDA arm, the expert FFNs and the
+            // controller's gates all start with no gradient at all - the model
+            // is a linear map of the byte embedding until the scalar moves.
+            residual_scale: burn::module::Param::from_tensor(Tensor::ones([1], device)),
             out_proj: LinearLike::with_tsct(d, d, cfg.rank, cfg.use_tsct, device),
             max_iter: cfg.max_iter,
             d_model: d,
@@ -356,10 +361,17 @@ impl LoopBlock {
                     .div_scalar(t as f32); // [b]
                 rec = rec + ce.sum_dim(0).reshape([1]).div_scalar(iters as f32);
             }
-            // The readout consumed the post-residual h; the recurrence reset
-            // it to the block input (per-iteration writes reach the loss via
-            // step_out/out_acc, not the next iteration).
-            h = h_ctx.clone();
+            // The RECURRENCE: the next iteration reads this iteration's
+            // post-residual h. It used to be reset to h_ctx here, which
+            // silently reduced the "looped block" to 4 independent passes
+            // over `x + sum(e_k)` with shared weights - a weight-tied
+            // ensemble with ~2 effective layers, not a loop, and 4x the
+            // forward/backward for ~1x the capacity. Under Gated Residual the
+            // state lives in the branch array instead (`gr.write` just
+            // updated it) and h is re-read there, so only that path resets.
+            if use_gr {
+                h = h_ctx.clone();
+            }
         }
         let rec = rec.div_scalar(b as f32); // mean over batch
         let kda = kda_s.unwrap_or_else(|| Tensor::zeros([1, 1, 1, 1], &h.device()));
