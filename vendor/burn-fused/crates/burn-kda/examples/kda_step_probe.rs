@@ -1,47 +1,68 @@
-//! Where does a dormouse training step actually go? The KDA path, timed end
-//! to end on the real module.
+//! Is a KDA training step the KERNEL or the ALLOCATOR?
 //!
-//! `kda_bench` measured the fused FORWARD kernel at 0.23 ms on the production
-//! shape, and the conclusion drawn from it was "KDA is free (0.016% of a
-//! step)". That was wrong - it timed one kernel and ignored the backward. The
-//! ablation says otherwise: `--no-kda` steps in 188 ms where the full model
-//! takes 956 ms, so the KDA backward is ~80% of a step.
+//! `research/2026-09-27-kda-sota-ceiling.md` §2.5 puts the whole question on
+//! one number: the fused chunk kernels' own floor is ~80-100 us, we measure
+//! ~120 ms per call, and the hypothesis is that 248 MB of fresh scratch per
+//! forward misses the cubecl pool. This harness is the test that document asks
+//! for, at the PRODUCTION shape, with the three measurements that separate the
+//! two hypotheses:
 //!
-//! This harness times the paths the model actually uses, on the production
-//! shape (b=10, t=512, d=768, 12 heads, K=V=64, chunk 16):
-//!   forward_train      - the chunked delta-rule training forward
-//!   backward           - the full backward through it
-//!   forward_train_fused - the fused-kernel variant of the same
-//!   forward            - the inference path (what generation pays)
+//!   - **enqueue vs total.** The cubecl backend is async, so `Instant` around
+//!     a forward only measures the host's enqueue. Every number here is
+//!     `enqueue` + `gpu tail` with a real D2H read in between. If the enqueue
+//!     alone is the cost, the work is on the host - i.e. the allocator.
+//!   - **cold vs warm.** The first call into an empty pool pays every
+//!     `cudaMalloc`; later calls with the same shapes should hit. A kernel
+//!     cost is identical in both; an allocator cost is not.
+//!   - **per-chunk scaling.** 32 chunks vs 4 chunks at fixed batch. A cost
+//!     that scales with chunks is in the chunk loop; a flat one is not.
 //!
-//! Run: cargo run --release -p burn-kda --example kda_step_probe --features cuda
+//!   cargo run --release -p burn-kda --example kda_step_probe --features cuda
+//!
+//! NOTE on the binary: built inside `vendor/burn-fused` this links *unpatched*
+//! registry cubecl (that workspace has no `[patch.crates-io]`), so the
+//! authoritative numbers come from
+//! `crates/dormouse-train/examples/kda_alloc_probe.rs`, which links the same
+//! patched cubecl the trainer does. This harness is the shape-independent
+//! cross-check.
 
-#[cfg(feature = "cuda")]
+#![cfg(feature = "cuda")]
+
+use burn::backend::autodiff::Autodiff;
+use burn::backend::autodiff::checkpoint::strategy::{BalancedCheckpointing, NoCheckpointing};
+use burn::module::Module;
+use burn::tensor::{Device, Tensor, TensorData};
+use burn_kda::{KdaConfig, KdaModule};
+
+/// The production shape: `small` preset, batch 10, seq 512, 12 heads,
+/// K=V=64, chunk 16, fp32.
+const B: usize = 10;
+const T: usize = 512;
+const D: usize = 768;
+const H: usize = 12;
+const HK: usize = 64;
+const CHUNK: usize = 16;
+
 fn main() {
-    use burn::backend::autodiff::Autodiff;
-    use burn::module::Module;
-    use burn::tensor::Tensor;
-    use burn_cuda::Cuda;
-    use burn_kda::{KdaConfig, KdaModule};
+    let dev = Device::cuda(0);
+    let adev = dev.clone().autodiff().gradient_checkpointing();
+    let adev_no = dev.clone().autodiff();
 
-    type Ad = Autodiff<Cuda>;
-    let dev = burn::tensor::Device::cuda(0);
-    // pre.4 idiom (as in burn-spectral's own tests): float tensors live on the
-    // default backend, created on an AUTODIFF device, with require_grad. A
-    // concrete `Tensor<_, Autodiff<..>>` does not satisfy BasicOps.
-    let adev = dev.clone().autodiff();
-
-    // The `small` preset geometry.
-    let (b, t, d) = (10usize, 512usize, 768usize);
     let cfg = KdaConfig {
-        hidden_size: d,
-        num_heads: 12,
-        head_dim: 64,
+        hidden_size: D,
+        num_heads: H,
+        head_dim: HK,
         use_short_conv: false, // the preset disables it (it NaN'd on this box)
-        chunk_size: 16,
+        chunk_size: CHUNK,
         ..Default::default()
     };
-    let m = KdaModule::new(&cfg, 0.0, &dev);
+    let m = KdaModule::new(&cfg, 0.0, &adev);
+    // The fused-op dispatch is a TypeId check on the whole backend type, so
+    // `Autodiff<Cuda, Balanced>` MISSES it and falls to the tensor chunk path.
+    // A second module on a NoCheckpointing device is the only way to compare
+    // the two paths in one process: a module's tensors and the input must
+    // share their checkpointing strategy or the op asserts.
+    let m_no = KdaModule::new(&cfg, 0.0, &adev_no);
 
     let mut st = 0x243F6A88_5A30_8D3Du64;
     let mut next = || {
@@ -50,71 +71,69 @@ fn main() {
         st ^= st << 17;
         (st % 10000) as f32 / 10000.0 - 0.5
     };
-    let data: Vec<f32> = (0..b * t * d).map(|_| next()).collect();
-    let x = || -> Tensor<3> {
-        Tensor::from_data(burn::tensor::TensorData::new(data.clone(), [b, t, d]), &adev).require_grad()
+    let data: Vec<f32> = (0..B * T * D).map(|_| next()).collect();
+    let data_short: Vec<f32> = (0..B * 64 * D).map(|_| next()).collect();
+    let x = |t: usize, d: &[f32], dev: &Device| {
+        Tensor::<3>::from_data(
+            TensorData::new(d.to_vec(), [B, t, D]),
+            dev,
+        )
+        .require_grad()
     };
 
-    let iters = 10;
-    let warmup = 3;
-
-    let time = |f: &mut dyn FnMut()| -> f32 {
-        for _ in 0..warmup {
-            f();
-        }
-        let t = std::time::Instant::now();
-        for _ in 0..iters {
-            f();
-        }
-        t.elapsed().as_secs_f32() * 1000.0 / iters as f32
+    // One call, with the host/GPU split at every boundary. `into_data` is a
+    // real D2H, so each boundary is a genuine device sync.
+    let mut call = |i: usize, t: usize, d: &[f32], fused: bool| {
+        let xi = if fused {
+            x(t, d, &adev_no)
+        } else {
+            x(t, d, &adev)
+        };
+        let t0 = std::time::Instant::now();
+        let y = if fused {
+            m_no.forward_train::<Autodiff<burn_cuda::Cuda, NoCheckpointing>>(xi.clone())
+        } else {
+            m.forward_train::<Autodiff<burn_cuda::Cuda, BalancedCheckpointing>>(xi.clone())
+        };
+        let t1 = std::time::Instant::now(); // host: allocations + launches
+        let _ = y.clone().into_data();
+        let t2 = std::time::Instant::now(); // GPU drained
+        let loss = y.clone().sum();
+        let t3 = std::time::Instant::now();
+        let grads = loss.backward();
+        let bytes = xi
+            .grad(&grads)
+            .map(|t| t.into_data().bytes.len())
+            .unwrap_or(0);
+        let t4 = std::time::Instant::now(); // host: backward allocations + launches
+        let _ = bytes;
+        let t5 = std::time::Instant::now(); // GPU drained
+        let ms = |a: std::time::Instant, b: std::time::Instant| (b - a).as_secs_f32() * 1e3;
+        println!(
+            "  iter {i} t={t:<4} fwd enq {:8.1} + gpu {:7.1} = {:8.1} ms | bwd enq {:8.1} + gpu {:7.1} = {:8.1} ms",
+            ms(t0, t1), ms(t1, t2), ms(t0, t2),
+            ms(t3, t4), ms(t4, t5), ms(t3, t5),
+        );
     };
 
-    // Backward: one graph, backwarded repeatedly is invalid (the graph is
-    // consumed), so rebuild per iteration and time the pair separately.
-    let mut fwd;
-    let mut bwd = f32::NAN;
-    {
-        for _ in 0..warmup {
-            let y = m.forward_train::<Ad>(x());
-            let _ = y.sum().backward();
-        }
-        let mut fwd_ms = 0f32;
-        let mut bwd_ms = 0f32;
-        for _ in 0..iters {
-            let xi = x();
-            let t0 = std::time::Instant::now();
-            let y = m.forward_train::<Ad>(xi);
-            let loss = y.sum();
-            fwd_ms += t0.elapsed().as_secs_f32() * 1000.0;
-            let t1 = std::time::Instant::now();
-            let _ = loss.backward();
-            bwd_ms += t1.elapsed().as_secs_f32() * 1000.0;
-        }
-        fwd = fwd_ms / iters as f32;
-        bwd = bwd_ms / iters as f32;
-        bwd = bwd_ms / iters as f32;
+    println!("KDA production-shape probe: b={B} t={T} d={D} heads={H} K=V={HK} chunk={CHUNK}");
+    println!("  (BalancedCheckpointing = the trainer's backend, TENSOR chunk path;");
+    println!("   NoCheckpointing = the same math behind ONE fused autodiff node)\n");
+    println!("  A. trainer today: Autodiff<Cuda, Balanced> -> tensor chunk path");
+    for i in 0..5 {
+        call(i, T, &data, false);
     }
-
-    #[cfg(feature = "autodiff")]
-    let fused = time(&mut || {
-        let _ = m.forward_train_fused::<Ad>(x());
-    });
-    #[cfg(not(feature = "autodiff"))]
-    let fused = f32::NAN;
-    let infer = time(&mut || {
-        let mut st = None;
-        let _ = m.forward::<Ad>(x(), &mut st, false);
-    });
-
-    println!("KDA production shape: b={b} t={t} d={d} heads=12 K=V=64 chunk=16 (iters={iters})");
-    println!("  forward_train (chunked)   {fwd:9.3} ms   (from the timed fwd+bwd pair)");
-    println!("  backward through it       {bwd:9.3} ms   <- the 80% of the step");
-    println!("  forward_train_fused       {fused:9.3} ms");
-    println!("  forward (inference path)  {infer:9.3} ms");
-    println!("  params in module: {}", m.num_params());
-}
-
-#[cfg(not(feature = "cuda"))]
-fn main() {
-    eprintln!("kda_step_probe needs --features cuda");
+    println!("\n  B. Autodiff<Cuda, NoCheckpointing> -> fused CUDA kernels, one node");
+    for i in 0..5 {
+        call(i, T, &data, true);
+    }
+    println!("\n  C. per-chunk scaling, tensor path, 4 chunks instead of 32:");
+    for i in 0..3 {
+        call(i, 64, &data_short, false);
+    }
+    println!("\n  D. per-chunk scaling, fused path, 4 chunks instead of 32:");
+    for i in 0..3 {
+        call(i, 64, &data_short, true);
+    }
+    println!("\n  params in module: {}", m.num_params());
 }

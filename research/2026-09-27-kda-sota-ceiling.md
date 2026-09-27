@@ -1,5 +1,34 @@
 # KDA at the production shape: what SOTA actually is, and where our 1445 ms really goes
 
+> ## ⚠️ CORRECTED 2026-09-27 — read this first
+>
+> `research/2026-09-27-kda-allocator-fix.md` measured the §2.5 hypothesis this
+> document was built on, at the production shape, on the trainer's own patched
+> cubecl, with real `Client::sync()` barriers. Three claims below are false and
+> must not be relied on:
+>
+> - **"The fused kernels are engaged."** They were not, in any training step.
+>   burn-kda's dispatch was a `TypeId` test against `Autodiff<CudaBare>` (=
+>   NoCheckpointing); the trainer runs `Autodiff<Cuda, BalancedCheckpointing>`,
+>   which fails that test by construction, so every step ran the ~150-op-per-
+>   chunk **tensor** path. The §2.4 "1300x gap" and §3(a)'s "already built, and
+>   it is not the bottleneck" both rest on that false premise.
+> - **§2.5's allocator arithmetic.** "1 GB of pool misses per step ≈ 1000 ms"
+>   is falsified: `client.memory_cleanup()` returned 887 MB to the driver, the
+>   next call re-reserved +887.2 MB, and it ran in 561 ms — the same as the
+>   warm 519/470 ms calls. Warm fwd+bwd is **470-635 ms per call with the GPU
+>   on 1-20 ms: 99% host dispatch.**
+> - **"17 fresh tensors totalling 248 MB."** ~850 allocation *slices* per
+>   forward; 301.8 MB in use, 914 MB reserved.
+>
+> What survives: the memory-bound verdict (§2.3, 3.1 FLOP/byte), the roofline
+> arithmetic, FLA's structural facts (§1), and §4's `max_iter` lever. What the
+> measurement adds: engaging the fused node is worth **1.57x** on the KDA call
+> (505 → 321 ms, warm), the pool's real damage is VRAM growth (+918 MB per
+> forward-only call, never reused) rather than time, and the binding constraint
+> after the dispatch fix is still host-side op count — i.e. §3/AGENTS.md's CUDA
+> graph, not more kernel work.
+
 Date: 2026-09-27. Subagent deliverable, no source changes.
 Shape under test: `b=10 t=512 h=12 K=V=64 chunk=16 fp32` (dormouse `small` preset, 4 loop
 iterations, JEPA EMA teacher). GPU: RTX 5060 Ti, sm_120, 170 SM, 16 GB, 1792 GB/s.

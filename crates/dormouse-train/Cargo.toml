@@ -24,5 +24,8 @@ burn-cuda = { version = "0.22.0-pre.4", default-features = false, features = ["s
 burn-dispatch = { version = "0.22.0-pre.4", default-features = false }
 cubecl-runtime = { version = "0.11.0-pre.4", default-features = false }
 cubecl-cuda = { version = "0.11.0-pre.4", default-features = false }
+# kda_alloc_probe needs a real device barrier (`Client::sync` returns a
+# future) and this is the only blocking executor on the stack.
+cubecl-environment = { version = "0.11.0-pre.4", default-features = false }
 cudarc = { version = "0.19.9", default-features = false, features = ["driver"] }
 rand = "0.8"
