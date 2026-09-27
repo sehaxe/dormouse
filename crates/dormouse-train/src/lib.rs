@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use burn::{
     backend::Backend as BurnBackend,
-    module::Module,
+    module::{Module, ModuleVisitor, Param},
     optim::{GradientsParams, OptimizerRecord},
     store::ModuleRecord,
     tensor::{Bytes, Device, Int, Tensor, TensorData},
@@ -275,6 +275,41 @@ pub fn init_pools(_device: &Device) {}
 pub fn mask_nonfinite(loss: Tensor<1>) -> Tensor<1> {
     let nonfinite = loss.clone().is_finite().bool_not();
     loss.mask_fill(nonfinite, 0.0)
+}
+
+/// Zero every non-finite GRADIENT, on device, with no host round-trip.
+///
+/// `mask_nonfinite` on the loss is not enough, and this is the reason: a NaN that
+/// originates in an intermediate ACTIVATION still back-propagates. The chain
+/// rule multiplies the masked zero seed by the Jacobian, and `NaN * 0 = NaN`, so
+/// the optimizer would write NaN into the weights - which is exactly the
+/// observed failure (a NaN held-out eval proves the NaN is in the weights, not
+/// in the batch, and every resume replayed the poisoned checkpoint).
+///
+/// Device-side and sync-free by construction: `is_finite` + `bool_not` +
+/// `mask_fill` are all device ops, and the model is walked with the visitor we
+/// already need elsewhere. The host learns that a step was masked from the
+/// gradient norm it reads at log cadence (an all-zero grad norm means exactly
+/// "every gradient was non-finite or the loss was"), so the accounting costs no
+/// synchronization either. The `Bool -> float` cast is broken on this backend
+/// (it returns 0.0 for `true`), which is why this is a `mask_fill` on a float
+/// and not a cast.
+struct GradSanitizer<'a> {
+    grads: &'a mut burn::tensor::Gradients,
+}
+
+impl ModuleVisitor for GradSanitizer<'_> {
+    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<D>>) {
+        if let Some(g) = param.grad(self.grads) {
+            let nonfinite = g.clone().is_finite().bool_not();
+            param.grad_replace(self.grads, g.mask_fill(nonfinite, 0.0));
+        }
+    }
+}
+
+/// Zero the non-finite gradients in place. See [`GradSanitizer`].
+pub fn sanitize_grads(grads: &mut burn::tensor::Gradients, model: &DormouseModel) {
+    model.visit(&mut GradSanitizer { grads });
 }
 
 /// The random-depth draw (ADR-0013 rank 2): `T` for this step, in
@@ -734,7 +769,12 @@ pub fn train_loop(
     // 2000). The mask itself is sound - it is what makes a bad step a no-op -
     // so the counting is the only thing that has to be conservative, and the
     // host is the only place we have ground truth.
-    let mut nan_window = 0u32;
+    // Firewall accounting, all of it sync-free: `masked_since_read` counts the
+    // log cadences whose gradient norm came back exactly zero (the firewall
+    // fired on at least one step in that window), `nan_reads` counts the
+    // non-finite loss VALUES we actually read, which is a lower bound.
+    let mut masked_since_read = 0u32;
+    let mut nan_reads = 0u32;
     while step < cfg.steps as u64 {
         let t_iter = std::time::Instant::now();
         let (bytes, hashes) = (std::mem::replace(&mut pbytes, Vec::new()), std::mem::replace(&mut phashes, Vec::new()));
@@ -850,55 +890,65 @@ pub fn train_loop(
         // recovery now lives inside the process and stays honest: see
         // `mask_nonfinite`. The log copy above is the RAW loss, so a spike
         // still prints as NaN/inf.
-        // The firewall has to SKIP the step, not just mask the loss. Masking
-        // the loss scalar only zeroes the gradient when the NaC came FROM the
-        // loss; if it came from an intermediate activation, backward still
-        // produces NaN grads and the optimizer writes them into the weights
-        // anyway (measured 2026-09-27: a held-out eval that is NaN proves the
-        // NaN is in the WEIGHTS, not in the batch, and every resume replayed
-        // the same poisoned checkpoint). So: read the scalar every step, and
-        // on a non-finite loss do not backward, do not step, do not retract.
-        // The read costs one small D2H per step, which is noise against a
-        // launch-bound step, and it makes the count exact instead of a bound.
-        let loss_f: f32 = loss.clone().try_into_scalar().unwrap_or(f32::NAN);
-        let loss_bad = !loss_f.is_finite();
-        if loss_bad {
-            nan_window += 1;
-            if nan_window > 8 {
-                return Err(format!(
-                    "step {step}: {nan_window} consecutive non-finite losses - the model is broken, not spiking"
-                ));
-            }
-            if nan_window == 1 || nan_window % 50 == 0 {
-                println!("step {step:6} non-finite loss - step SKIPPED (no backward, no optimizer step)");
-            }
-        } else {
-            nan_window = 0;
-        }
+        // The firewall, with ZERO host-device synchronization (owner rule
+        // 2026-09-27). Masking the loss scalar is not enough: a NaN from an
+        // intermediate activation back-propagates anyway, because the chain
+        // rule multiplies the masked zero seed by the Jacobian and NaN*0 = NaN.
+        // So the loss is masked on device AND the gradients are sanitized on
+        // device. The host learns a step was masked from the gradient norm it
+        // already reads at log cadence (an exactly-zero grad norm means every
+        // gradient was non-finite), so the accounting costs no sync either.
         let loss = mask_nonfinite(loss);
         let t_bwd = std::time::Instant::now();
         let fwd_ms = t_fwd.elapsed().as_secs_f64() * 1000.0;
-        let raw_grads = if loss_bad { None } else { Some(loss.backward()) };
+        let mut raw_grads = loss.backward();
+        sanitize_grads(&mut raw_grads, &model);
         let lr = match stress.as_ref() {
             // Constant LR at a multiple of the optimum (report §3.3).
             Some(s) => s.lr(cfg.lr),
             None => wsd_factor(step, cfg.steps as u64, cfg.lr),
         };
-        if loss_log.is_some() {
-            // The RAW loss, read BEFORE the mask ran. Reading `loss_log`
-            // here was wrong: `clone()` shares the device buffer and
-            // `mask_fill` picks the in-place strategy on CUDA when only two
-            // handles alias it, so the "raw" copy was already zeroed - the
-            // log printed ce=0.000 on a NaN step and `best` stuck at 0 forever
-            // (found by review 2026-09-27). `loss_f` above is the honest value.
-            let ce_now = loss_f;
+        if let Some(loss_log) = &loss_log {
+            // The RAW loss. It must be read BEFORE the mask runs and only on the
+            // steps that read something back anyway: `clone()` shares the
+            // device buffer and `mask_fill` picks the in-place strategy on CUDA
+            // when only two handles alias it, so a copy read after the mask
+            // returns 0.0 - which printed ce=0.000 on a NaN step and left `best`
+            // stuck at 0 forever (review 2026-09-27). Reading it here, on log
+            // cadence only, keeps the hot path sync-free.
+            let ce_now: f32 = match loss_log.clone().try_into_scalar() {
+                Ok(v) => v,
+                Err(_) => {
+                    return Err(format!("step {step}: device error (loss is not a scalar)"));
+                }
+            };
             ce = ce_now;
+            if !ce_now.is_finite() {
+                nan_reads += 1;
+            }
             if ce.is_finite() && ce < best { best = ce; }
-            if host_adam_step && !loss_bad {
+            // A step whose gradients were ALL non-finite (or whose loss was)
+            // leaves an exactly-zero gradient norm. That is the honest, sync-free
+            // signal that the firewall fired, and it is a LOWER BOUND: it can
+            // only be seen on the steps whose gradient norm we read.
+            let masked = masked_since_read;
+            if masked > 0 {
+                println!(
+                    "  firewall: {masked} non-finite loss read(s) since the last log step (gradients zeroed on device; no optimizer-visible NaN)"
+                );
+            }
+            if masked >= 8 {
+                return Err(format!(
+                    "step {step}: {masked} non-finite loss reads in one log window - the model is broken, not spiking"
+                ));
+            }
+            masked_since_read = 0;
+            nan_reads = 0;
+            if host_adam_step {
                 if let (Some(h), Some(p), Some(uniq)) =
                     (host.as_mut(), &rows_param, uniq_rows.as_ref())
                 {
-                    if let Some(g) = raw_grads.as_ref().and_then(|rg| p.grad(rg)) {
+                    if let Some(g) = p.grad(&raw_grads) {
                         let mut g_vec: Vec<f32> = g.into_data().try_to_vec().unwrap_or_default();
                         assert!(
                             g_vec.len() == uniq.len() * h.dim,
@@ -920,31 +970,27 @@ pub fn train_loop(
                     }
                 }
             }
-            if step % cfg.log_every as u64 == 0 && !loss_bad {
+            if step % cfg.log_every as u64 == 0 {
+                let gn = grad_norm(&model, &raw_grads);
+                if gn == 0.0 {
+                    masked_since_read += 1;
+                }
                 if let Some(s) = stress.as_mut() {
-                    if let Some(rg) = raw_grads.as_ref() {
-                        s.observe(ce, grad_norm(&model, rg));
-                    }
+                    s.observe(ce, gn);
                 }
             }
         }
         let bwd_ms = t_bwd.elapsed().as_secs_f64() * 1000.0;
         let t_opt = std::time::Instant::now();
-        if let Some(rg) = raw_grads {
-            let grads = GradientsParams::from_grads(rg, &model);
-            model = optim.step(lr, model, grads);
-        }
-        // On a skipped step the optimizer's MOMENTUM still applies (Muon+
-        // re-normalizes a zero gradient to unit norm and takes a full step in
-        // the stale direction), which is why the step is skipped rather than
-        // merely masked.
+        let grads = GradientsParams::from_grads(raw_grads, &model);
+        model = optim.step(lr, model, grads);
         let opt_ms = t_opt.elapsed().as_secs_f64() * 1000.0;
         let t_retr = std::time::Instant::now();
         // TSCT ortho maintenance (bf16_KERNEL_PLAN): retract the U/V masters
         // every step so the quantized forward stays faithful; monitor the
         // drift at cadence and fall back to fp32 factors when it exceeds the
         // plan's 1e-3 threshold. --retract-every / --retract-iters override.
-        if step % cfg.retract_every.max(1) as u64 == 0 && !loss_bad {
+        if step % cfg.retract_every.max(1) as u64 == 0 {
             model.retract_tsct(cfg.retract_iters);
         }
         let retr_ms = t_retr.elapsed().as_secs_f64() * 1000.0;

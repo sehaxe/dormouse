@@ -246,6 +246,25 @@ impl Optimizer for MuonPlus {
     ) -> (Tensor<D>, Option<Self::State<D>>) {
         let state = state.unwrap_or_else(|| MuonPlusState::new(None, None, None, None));
 
+        // A gradient that is exactly zero carries no signal, and the momentum
+        // turns it into a FULL-magnitude step in the STALE direction: the
+        // Newton-Schulz normalization rescales whatever it is handed to unit
+        // Frobenius norm, and the decayed momentum is not zero. So a step the
+        // trainer masked as a no-op (the NaN firewall zeroes the gradients on
+        // device) still moved every weight, which is precisely the poisoning
+        // that killed runs on 2026-09-26/27. Zero gradient now means zero
+        // update, decided on device with no host synchronization. The factor is
+        // built with `mask_fill` on a float tensor because the Bool -> float
+        // cast is broken on this backend (it returns 0.0 for `true`).
+        let g_active = Tensor::<1>::ones([1], &grad.device()).mask_fill(
+            grad.clone()
+                .powf_scalar(2.0)
+                .sum()
+                .greater_elem(0.0)
+                .bool_not(),
+            0.0,
+        );
+
         let (updated, state) = if D == 2 {
             // --- Muon+ group ---
             let mu = self.momentum.elem::<f32>();
@@ -273,8 +292,10 @@ impl Optimizer for MuonPlus {
                 }
                 None => grad.clone().mul_scalar(1.0 - mu),
             };
-            // O_t = Norm_(d)(Ortho(M_t))
-            let update = self.normalize(self.orthogonalize(momentum.clone()));
+            // O_t = Norm_(d)(Ortho(M_t)), gated by "this step had a signal"
+            let update = self
+                .normalize(self.orthogonalize(momentum.clone()))
+                .mul(g_active.reshape([1, 1]));
 
             // W_t = W_{t-1} - η·max(1, m/n)^0.5·O_t (Bernstein dimensional
             // factor, Jordan et al. muon.py: max(1, m/n)^0.5; the plain
@@ -340,7 +361,7 @@ impl Optimizer for MuonPlus {
                 .clone()
                 .mul_scalar(1.0 - (self.weight_decay as f32 * lr as f32).min(0.999));
             (
-                decayed.sub(step.mul_scalar(lr as f32)),
+                decayed.sub(step.mul(g_active.reshape([1])).mul_scalar(lr as f32)),
                 MuonPlusState::new(None, Some(m), Some(v), Some(t)),
             )
         };
