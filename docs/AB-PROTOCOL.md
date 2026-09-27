@@ -47,6 +47,7 @@ parallel: the GPU is the bottleneck, not the ideas.
 | 2 | **dense FFN** | `--set use_tsct=false` | do the TSCT factors, the polar retraction and the quant machinery earn ~1000 lines? (the dense arm has a narrower FFN at the same param budget - that is the comparison that means something) | 2.7 h |
 | 3 | **working set** | `--data .../real_ws16` | does 4 epochs over 4.8 GB beat one pass over 19 GB at equal steps? (the byte-LM recipe research's central claim) | 2.7 h |
 | 4 | **rand depth** | `--rand-depth` | does trained depth-robustness pay, or is fixed-4 better? | 2.7 h |
+| 4b | **depth 2 vs 4** | `--max-iter 2` | the cheapest and highest-leverage arm in the queue - see below | 2.7 h |
 | 5 | **KDA decay form** | (needs the flag from the KDA agent) | our decay starts at alpha ~0.077 (a ~9-token memory); the FLA reference starts at alpha 0.2-0.999. If a longer effective memory helps, this is a technology REPLACE, not a tuning knob | 2.7 h |
 
 Rule for reading a result: an arm wins if its mean held-out BPB at the same step
@@ -64,3 +65,31 @@ it might help later".
   which then wrote garbage weights into a checkpoint and killed a run
   (2026-09-27: official_v5, three wasted resumes). The ram-guard stops a
   runaway; it does not stop two legal processes from colliding.
+
+## Arm 4b: depth 2 vs 4 is the cheapest big lever (2026-09-27)
+
+Two independent lines of evidence now point the same way, and both are measured:
+
+- **Cost.** Each loop iteration is a FULL-sequence gated-delta pass, and that
+  pass allocates 17 fresh tensors / 248 MB of saved scratch
+  (research/2026-09-27-kda-sota-ceiling.md). Four iterations is ~1 GB/step of
+  allocator traffic against a 7 ms arithmetic budget and a cubecl pool that is
+  high-water and never frees. That is why KDA is ~80% of a step, and why a
+  *perfect* KDA kernel would still leave the step at ~365 ms: the 465 ms
+  launch-overhead floor dominates below ~80M parameters.
+- **Quality.** The adaptive-depth survey found the peak-then-fall effect in the
+  literature: Ouro-1.4B drops 20.47% past its peak, RecurTrace measures fixed
+  depth 54.71@2 degrading to 47.54@16, and Huginn tokens that "settle" at depth
+  8 carry 0.00 at >=32. Extra depth is not free capacity on a shared-weight loop.
+
+So `--max-iter 2` halves the dominant cost AND tests the quality claim. Run it
+with `--eval-depths`, which prints the held-out BPB at depths 1..=max_iter at
+every eval for free (no extra training) - that curve is the deliverable, because
+it says whether the model is even using the depth it pays for.
+
+**Measure the noise floor first.** The paired-eval resolution on the fixed
+window is estimated at 0.002-0.005 BPB but is NOT VERIFIED, and the real floor
+is the training seed (seed variance at 151M exceeded every recipe difference we
+measured). Concretely: evaluate the SAME checkpoint twice at the same depth and
+confirm the numbers are bit-identical; then run two A0 seeds before believing
+any win smaller than their spread.
