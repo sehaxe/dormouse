@@ -2570,6 +2570,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "cublas-poc"
+version = "0.1.0"
+dependencies = [
+ "burn",
+ "burn-cuda",
+ "cubecl",
+ "cudarc",
+ "half",
+]
+
+[[package]]
 name = "cudarc"
 version = "0.19.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2842,8 +2853,6 @@ dependencies = [
  "burn-rmsnorm",
  "burn-spectral",
  "burn-tensor",
- "cudarc",
- "half",
  "rand 0.8.8",
  "serde",
  "toml 0.8.23",

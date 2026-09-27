@@ -1,0 +1,169 @@
+diff --git a/vendor/cubecl-fix/cubecl-cuda/src/compute/mod.rs b/vendor/cubecl-fix/cubecl-cuda/src/compute/mod.rs
+index afeddfb..cd3bd29 100644
+--- a/vendor/cubecl-fix/cubecl-cuda/src/compute/mod.rs
++++ b/vendor/cubecl-fix/cubecl-cuda/src/compute/mod.rs
+@@ -4,6 +4,8 @@ pub(crate) mod context;
+ pub(crate) mod driver;
+ pub(crate) mod events;
+ pub(crate) mod storage;
++// `GpuResource.ptr` is the address `Client::native_handles` hands out.
++pub use storage::gpu::GpuResource;
+ pub(crate) mod stream;
+ 
+ mod server;
+diff --git a/vendor/cubecl-fix/cubecl-cuda/src/compute/server.rs b/vendor/cubecl-fix/cubecl-cuda/src/compute/server.rs
+index 2faa318..c546941 100644
+--- a/vendor/cubecl-fix/cubecl-cuda/src/compute/server.rs
++++ b/vendor/cubecl-fix/cubecl-cuda/src/compute/server.rs
+@@ -103,6 +103,32 @@ impl Server for CudaServer {
+         self.streams.logger.clone()
+     }
+ 
++    fn native_ptrs(
++        &mut self,
++        bindings: Vec<BufferBinding>,
++        stream_id: StreamId,
++    ) -> Option<Vec<u64>> {
++        let mut ptrs = Vec::with_capacity(bindings.len());
++        for binding in bindings {
++            // The same claim check `get_resource` makes: a buffer a failed
++            // launch never filled gets no address, rather than one pointing at
++            // whatever was there before.
++            self.streams
++                .ensure_written([&binding].into_iter())
++                .ok()?;
++            let mut command = self.command(stream_id, [&binding].into_iter());
++            ptrs.push(command.resource(binding).ok()?.ptr);
++        }
++        Some(ptrs)
++    }
++
++    fn native_stream(&mut self, stream_id: StreamId) -> Option<u64> {
++        // `try_stream_mut`, not a resolve: this is a lookup of a handle that
++        // already exists, and it must not order the stream behind anything or
++        // bump its cursor.
++        Some(self.streams.try_stream_mut(&stream_id)?.sys as u64)
++    }
++
+     fn staging(&mut self, sizes: &[usize], stream_id: StreamId) -> Result<Vec<Bytes>, ServerError> {
+         let mut command = self.command_no_inputs(stream_id);
+ 
+diff --git a/vendor/cubecl-fix/cubecl-cuda/src/lib.rs b/vendor/cubecl-fix/cubecl-cuda/src/lib.rs
+index f9a9360..dd3ec0e 100644
+--- a/vendor/cubecl-fix/cubecl-cuda/src/lib.rs
++++ b/vendor/cubecl-fix/cubecl-cuda/src/lib.rs
+@@ -8,6 +8,10 @@ mod device;
+ mod runtime;
+ 
+ pub use compiler::{CudaCompilationOptions, CudaCompiler, CudaRepresentation};
++// `Client::get_resource` / `Client::native_handles` are generic over the server
++// type, so it has to be nameable from outside the crate to be usable at all.
++pub use compute::CudaServer;
++pub use compute::GpuResource;
+ pub use device::*;
+ pub use runtime::*;
+ 
+diff --git a/vendor/cubecl-fix/cubecl-runtime/src/client.rs b/vendor/cubecl-fix/cubecl-runtime/src/client.rs
+index 2aeab06..028c8f4 100644
+--- a/vendor/cubecl-fix/cubecl-runtime/src/client.rs
++++ b/vendor/cubecl-fix/cubecl-runtime/src/client.rs
+@@ -468,6 +468,55 @@ impl Client {
+             .unwrap_or_resume()
+     }
+ 
++    /// The backend's own raw device addresses for `handles`, and the raw
++    /// stream they are used on. See [`Server::native_ptrs`] and
++    /// [`Server::native_stream`]: this is the pair a foreign device library
++    /// (cuBLAS, cuDNN) needs to run on this graph's stream, over this
++    /// allocator's memory, without a host round trip.
++    ///
++    /// `None` inside the vector is a binding the backend cannot address, and a
++    /// `None` stream is a backend with no stream to borrow. One round trip for
++    /// the whole batch, and the stream is a per-stream constant, so a caller
++    /// resolves that once and reuses it.
++    ///
++    /// # Errors
++    ///
++    /// [`ServerError::ServiceMismatch`] when `S` is not this client's server.
++    pub fn native_handles<S: Server>(
++        &self,
++        handles: Vec<Handle>,
++    ) -> Result<(Vec<Option<u64>>, Option<u64>), ServerError> {
++        let stream_id = self.stream_id();
++        let bindings = handles
++            .into_iter()
++            .map(|handle| handle.binding())
++            .collect::<Vec<_>>();
++        for binding in &bindings {
++            self.local(binding)?;
++        }
++        if !self.is_service::<S>() {
++            return Err(ServerError::ServiceMismatch {
++                client: format!("{}", self.service_id()),
++                requested: String::from(core::any::type_name::<S>()),
++                backtrace: BackTrace::capture(),
++            });
++        }
++        Ok(self
++            .device
++            .submit_blocking(move |server| {
++                let server = (server as &mut dyn Any)
++                    .downcast_mut::<S>()
++                    .expect("is_service passed, so this is the server's type");
++                let ptrs: Vec<Option<u64>> = server
++                    .native_ptrs(bindings, stream_id)
++                    .map(|ptrs| ptrs.into_iter().map(Some).collect())
++                    .unwrap_or_default();
++                (ptrs, server.native_stream(stream_id))
++            })
++            .map_err(Into::into)
++            .unwrap_or_resume())
++    }
++
+     fn do_create_from_slices(
+         &self,
+         descriptors: Vec<MemoryLayoutDescriptor>,
+diff --git a/vendor/cubecl-fix/cubecl-runtime/src/server/base.rs b/vendor/cubecl-fix/cubecl-runtime/src/server/base.rs
+index 49bc94d..af34f65 100644
+--- a/vendor/cubecl-fix/cubecl-runtime/src/server/base.rs
++++ b/vendor/cubecl-fix/cubecl-runtime/src/server/base.rs
+@@ -739,6 +739,39 @@ pub trait Server:
+         Vec::from([StreamId::current()])
+     }
+ 
++    /// The backend's own raw handles for `bindings`: one address per binding,
++    /// in the order given, each already offset by the binding's own offset.
++    ///
++    /// This is the escape hatch for a foreign device library (cuBLAS, cuDNN,
++    /// cuSPARSE) that has no cubecl kernel: with the addresses and
++    /// [`native_stream`](Self::native_stream), a caller can enqueue that
++    /// library's work on this server's stream, in this graph's stream order,
++    /// on memory this allocator owns — no host round trip, no barrier, and no
++    /// second allocator whose frees the graph does not know about.
++    ///
++    /// `None` on a backend that cannot answer (the default: an address is not
++    /// necessarily a `u64` — see `GpuResource::ptr` for CUDA's). The same
++    /// claim check a read makes guards each binding: a buffer a failed launch
++    /// never filled has no address worth handing out.
++    fn native_ptrs(
++        &mut self,
++        _bindings: Vec<BufferBinding>,
++        _stream_id: StreamId,
++    ) -> Option<Vec<u64>> {
++        None
++    }
++
++    /// The backend's own raw stream handle for `stream_id`, opaque: a
++    /// `CUstream` as a `u64` on CUDA, `None` where there is no such thing
++    /// (the default).
++    ///
++    /// A stream is created once per stream id and never replaced, so a caller
++    /// resolves this once and reuses the value for the whole run — which is
++    /// what makes the round trip affordable inside a step.
++    fn native_stream(&mut self, _stream_id: StreamId) -> Option<u64> {
++        None
++    }
++
+     /// Ask the server to release memory that it can release.
+     fn memory_cleanup(&mut self, stream_id: StreamId);
+ 

@@ -1,0 +1,31 @@
+[package]
+name = "cublas-poc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# A spike, not a library: a binary that measures whether cuBLAS can serve
+# dormouse's big GEMMs, and what routing through it costs. Kept out of
+# dormouse-core so the probe's raw FFI and its pinned cudarc cannot touch the
+# crates the trainer links.
+publish = false
+
+[dependencies]
+burn = { version = "0.22.0-pre.4", default-features = false, features = ["std", "extension", "cuda"] }
+burn-cuda = { version = "0.22.0-pre.4", default-features = false, features = ["std", "autotune"] }
+# `cubecl` only for the two patched types the zero-copy section names
+# (`cubecl::cuda::CudaServer`); every other crate is reachable through burn.
+cubecl = { version = "0.11.0-pre.4", default-features = false, features = ["std", "cuda"] }
+# Raw CUDA driver + a dlopen'd cuBLAS. Pinned to the cudarc the lock already
+# resolved, so the probe cannot pull a second copy into the graph; note the
+# `cublas` cargo feature is deliberately NOT enabled (it would recompile every
+# cubecl crate in the tree, and four dlopen'd symbols do the same job).
+cudarc = { version = "=0.19.9", default-features = false, features = ["std", "driver"] }
+half = { version = "2.7", default-features = false }
+
+[features]
+default = []
+# Section 4 (zero-copy on cubecl's own stream) needs the cubecl patch in
+# research/2026-09-27-cublas-integration-poc.md, which is deliberately not in
+# the tree - so this is OFF by default and a plain `cargo check` still builds.
+# Sections 0-3 of the measurement need no patch and run either way.
+cublas-native = []

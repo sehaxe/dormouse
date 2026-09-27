@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/cublas-poc",
     "crates/dormouse-core",
     "crates/dormouse-data",
     "crates/dormouse-train",

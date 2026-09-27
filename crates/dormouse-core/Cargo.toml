@@ -22,10 +22,6 @@ toml = "0.8"
 
 [dev-dependencies]
 burn-ndarray = { version = "0.22.0-pre.4", features = ["blas-openblas"] }
-# cublas_poc speaks raw CUDA driver + cuBLAS FFI. Pinned to the cudarc the
-# lock already resolved, so the probe cannot pull a second copy into the graph.
-cudarc = { version = "=0.19.9", default-features = false, features = ["std", "driver"] }
-half = { version = "2.7", default-features = false }
 
 [features]
 default = ["std"]
@@ -43,6 +39,3 @@ cuda = [
 name = "quant_probe"
 required-features = ["cuda"]
 
-[[example]]
-name = "cublas_poc"
-required-features = ["cuda"]
