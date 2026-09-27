@@ -114,12 +114,24 @@ Two caveats, stated because they matter:
   registry cubecl** (that workspace has no `[patch.crates-io]`). The ratio is
   the transferable number; the absolutes are not. The §1/§2 tables are from
   the dormouse build (patched) because the allocator is precisely what differs.
-* The end-to-end step-time before/after was **not** measured: the trainer
-  rebuild is 5-12 min in a workspace three other agents are editing, and the GPU
-  never had a clean window (another agent's bench loop had it continuously).
-  Command, ready to run:
-  `./target/release/train --data <sharded dir> --preset small --batch 10 --seq-len 512 --no-engram --quant fp32 --timers --log-every 100 --steps 60 --ckpt-name kdafix --ckpt-dir /tmp/opencode/kdabench`
-  and read `timer step 50` before vs after.
+* The end-to-end step-time before/after was **not** measured, for three
+  independent reasons, all outside this deliverable:
+  1. the trainer does not currently build — `dormouse-data/src/lib.rs:143` is
+     another agent's in-flight parquet edit and fails to compile;
+  2. the pre-fix binary (`target/release/train`, 18:50) cannot read the current
+     data dir at all: it panics inside its own data code with
+     `Element cannot be represented in the target type: "i64"(3318600119) => "i32"`
+     (a byte offset past 2 GiB), so there is no usable "before";
+  3. the fused path has **no runtime switch** — no config field, no env var —
+     so both arms cannot be taken from one binary without editing another
+     agent's in-flight `burn-kda`/`burn-gdn2` code.
+
+  The SOTA document's own 1810 ms/step cannot stand in for "before" either:
+  dormouse-core has changed substantially since it was taken (MoR routing,
+  `loop_block.rs` +335 lines), so a step-time difference measured now versus
+  then would not be attributable to the KDA fix. Command, once the tree builds:
+  `./target/release/train --data /mnt/e43497ab-0ff2-45b4-b45f-28de3339a53e/aria_data/pretrain/real_sharded --preset small --batch 10 --seq-len 512 --steps 60 --no-engram --quant fp32 --timers --log-every 100 --ckpt-name kdafix --ckpt-dir /tmp/opencode/kdabench`
+  and read `timer step 50`.
 
 ## 4. Mechanism
 
