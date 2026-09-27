@@ -18,6 +18,13 @@
 //!     --holdout 0.25      trailing fraction reserved for scoring
 //!     --order 5           n-gram order for the strongest baseline
 //!     --skip-header       drop FASTA '>' lines from the byte stream
+//!     --fit <dir-or-file> fit the counters on ANOTHER corpus and score the
+//!                         positional one. This is the only way to get the bar
+//!                         for the exact bytes the trainer's eval reads: its
+//!                         eval is the FIRST 100 KB of the eval dir, while an
+//!                         internal --holdout split scores the TRAILING
+//!                         quarter, so the two numbers were never comparable
+//!                         (review 2026-09-27).
 //!
 //! Note on genomics: a genome is bytes, so this tool works on it unchanged -
 //! no tokenizer, no conversion. The floor is ln(4) = 1.39 bits/byte for pure
@@ -44,23 +51,24 @@ fn collect(root: &Path, out: &mut Vec<PathBuf>) {
 /// Read up to `limit` raw bytes, sorted by path so two runs on the same corpus
 /// see the same stream. Gzip is decompressed: training reads plain bytes, and
 /// a compressed file is not the domain.
+/// The trainer's own reader, so the bar is measured on the same bytes the
+/// model sees (parquet columns decoded, not the container).
 fn read_corpus(files: &[PathBuf], limit: usize) -> Vec<u8> {
-    let mut buf: Vec<u8> = Vec::new();
+    let mut out: Vec<u8> = Vec::new();
     for f in files {
-        let data = if f.extension().map(|e| e == "gz").unwrap_or(false) {
-            gunzip_to_vec(f).unwrap_or_else(|e| panic!("gunzip {}: {e}", f.display()))
+        if f.extension().map(|e| e == "gz").unwrap_or(false) {
+            out.extend_from_slice(&gunzip_to_vec(f).unwrap_or_else(|e| panic!("gunzip {}: {e}", f.display())));
         } else {
-            std::fs::read(f).unwrap_or_else(|e| panic!("read {}: {e}", f.display()))
-        };
-        buf.extend_from_slice(&data);
-        if limit > 0 && buf.len() >= limit {
+            out.extend_from_slice(&dormouse_data::read_bytes(std::slice::from_ref(f), limit.saturating_sub(out.len())));
+        }
+        if limit > 0 && out.len() >= limit {
             break;
         }
     }
-    if limit > 0 && buf.len() > limit {
-        buf.truncate(limit);
+    if limit > 0 && out.len() > limit {
+        out.truncate(limit);
     }
-    buf
+    out
 }
 
 /// `gzip -dc <file>` with the file passed as an ARGUMENT, not piped into the
@@ -85,7 +93,7 @@ fn gunzip_to_vec(path: &Path) -> std::io::Result<Vec<u8>> {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
-        eprintln!("usage: anchors <dir-or-file> [--bytes N] [--holdout F] [--order N] [--skip-header]");
+        eprintln!("usage: anchors <dir-or-file> [--bytes N] [--holdout F] [--order N] [--skip-header] [--fit <dir-or-file>]");
         std::process::exit(2);
     }
     let target = args[0].clone();
@@ -93,6 +101,7 @@ fn main() {
     let mut holdout = 0.25f64;
     let mut order = 5usize;
     let mut skip_header = false;
+    let mut fit: Option<String> = None;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -100,6 +109,7 @@ fn main() {
             "--holdout" => { holdout = args[i + 1].parse().unwrap(); i += 2; }
             "--order" => { order = args[i + 1].parse().unwrap(); i += 2; }
             "--skip-header" => { skip_header = true; i += 1; }
+            "--fit" => { fit = Some(args[i + 1].clone()); i += 2; }
             other => { eprintln!("unknown flag {other}"); std::process::exit(2); }
         }
     }
@@ -120,9 +130,44 @@ fn main() {
             .collect();
     }
     assert!(data.len() > 10_000, "corpus too small for an anchor: {} B", data.len());
-    let cut = ((data.len() as f64) * (1.0 - holdout)) as usize;
-    let (train, test) = data.split_at(cut);
-    println!("corpus: {} files, {} B read, {} B train / {} B held out", files.len(), data.len(), train.len(), test.len());
+    // With --fit, the positional corpus is the SCORING window and the counters
+    // are fitted on the other one - the trainer's own split, not our own.
+    let mut fit_data: Vec<u8> = Vec::new();
+    let (train, test): (&[u8], &[u8]) = match &fit {
+        Some(f) => {
+            let mut ffiles = Vec::new();
+            collect(Path::new(f), &mut ffiles);
+            let mut fd = read_corpus(&ffiles, bytes);
+            if skip_header {
+                fd = fd
+                    .split_inclusive(|b| *b == b'\n')
+                    .filter(|l| !l.starts_with(b">"))
+                    .flat_map(|l| l.to_vec())
+                    .collect();
+            }
+            println!(
+                "fit on {} ({} B) / score on {} ({} B)",
+                f,
+                fd.len(),
+                target,
+                data.len()
+            );
+            fit_data = fd;
+            (fit_data.as_slice(), data.as_slice())
+        }
+        None => {
+            let cut = ((data.len() as f64) * (1.0 - holdout)) as usize;
+            println!(
+                "corpus: {} files, {} B read, {} B train / {} B held out",
+                files.len(),
+                data.len(),
+                cut,
+                data.len() - cut
+            );
+            data.split_at(cut)
+        }
+    };
+    let (train, test) = (train, test);
     if let Some(name) = Path::new(&target).file_name() {
         println!("domain: {}", name.to_string_lossy());
     }

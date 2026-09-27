@@ -109,6 +109,52 @@ pub struct ByteStream {
     drained: bool,
 }
 
+/// Read up to `limit` bytes from `files` EXACTLY as [`ByteStream`] would see
+/// them - including the parquet column decode. Exists so the anchors tool
+/// measures the same bytes the trainer trains on: reading a `.parquet` file
+/// raw measures the thrift/snappy container (a 2.1 GB books shard measured
+/// 7.006/6.759 BPB that way, i.e. the high-entropy "books" domain was pure
+/// container noise), and two readers would drift apart silently.
+pub fn read_bytes(files: &[PathBuf], limit: usize) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut tmp = vec![0u8; 1 << 20];
+    'outer: for f in files {
+        let is_parquet = f
+            .extension()
+            .map(|e| e.to_string_lossy().eq_ignore_ascii_case("parquet"))
+            .unwrap_or(false);
+        let mut src: Source = if is_parquet {
+            match std::fs::File::open(f).ok().and_then(|fh| {
+                parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(fh)
+                    .ok()
+                    .and_then(|b| b.build().ok())
+                    .map(|reader| Source::Parquet { reader, batch: Vec::new(), pos: 0 })
+            }) {
+                Some(s) => s,
+                None => continue,
+            }
+        } else {
+            match std::fs::File::open(f) {
+                Ok(fh) => Source::Text(BufReader::new(fh)),
+                Err(_) => continue,
+            }
+        };
+        loop {
+            if limit > 0 && out.len() >= limit {
+                break 'outer;
+            }
+            match src.read(&mut tmp) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => out.extend_from_slice(&tmp[..n]),
+            }
+        }
+    }
+    if limit > 0 && out.len() > limit {
+        out.truncate(limit);
+    }
+    out
+}
+
 /// A file open for byte reading: plain text/binary files stream chunks;
 /// parquet files stream decoded string columns (arrow batch by batch, so
 /// multi-GB parquet never loads into RAM).
@@ -129,8 +175,14 @@ impl Source {
                 if *pos >= batch.len() {
                     batch.clear();
                     *pos = 0;
-                    let mut got = 0usize;
-                    // Pull batches until one yields text or the file ends.
+                    // Pull batches until one yields text or the file ends. This
+                    // used to `return Ok(batch.len())` WITHOUT copying into
+                    // `tmp`, so both callers (`ByteStream::refill` and
+                    // `read_bytes`) sliced `tmp[..n]` past its end: reading ANY
+                    // parquet corpus panicked or ingested garbage. Found by
+                    // running the anchors tool on mix/books (a .parquet shard)
+                    // 2026-09-27. Fall through to the copy instead.
+                    let mut got_text = false;
                     loop {
                         match reader.next() {
                             Some(Ok(record)) => {
@@ -146,7 +198,7 @@ impl Source {
                                 }
                                 if !chunk.is_empty() {
                                     std::mem::swap(batch, &mut chunk);
-                                    got = batch.len();
+                                    got_text = true;
                                     break;
                                 }
                             }
@@ -154,13 +206,14 @@ impl Source {
                             None => break,
                         }
                     }
-                    Ok(got)
-                } else {
-                    let n = tmp.len().min(batch.len() - *pos);
-                    tmp[..n].copy_from_slice(&batch[*pos..*pos + n]);
-                    *pos += n;
-                    Ok(n)
+                    if !got_text {
+                        return Ok(0);
+                    }
                 }
+                let n = tmp.len().min(batch.len() - *pos);
+                tmp[..n].copy_from_slice(&batch[*pos..*pos + n]);
+                *pos += n;
+                Ok(n)
             }
         }
     }
