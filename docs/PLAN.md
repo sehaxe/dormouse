@@ -74,6 +74,37 @@ The v2 stack, each piece tied to a source:
 6. **Post-training (phase 6): Rufus-Air ordering** (2609.29421) — verifiable
    rewards first, judges later; matches POST_TRAINING.md.
 
+## RANDOM DEPTH (shipped 2026-09-27, ADR-0013 rank 2)
+
+`--rand-depth` samples the loop depth T in 1..=max_iter per step (a
+deterministic mix of the step index: no RNG state, an A/B replays exactly, a
+resume continues the same sequence). The loop runs only the first T
+iterations and BOTH the readout average and the CE divide by what actually
+ran, so each step is an honest model at depth T - not a partial sum of a
+depth-4 one. Depth 0 or > max_iter is refused loudly, never clamped: a
+silently clamped depth would make the A/B lie about what it trained.
+
+Why it cannot collapse: there is no learned halting head and no λ, so there is
+nothing for a gradient to drive to zero (that was PonderNet's failure, twice).
+
+`TrainCfg.rand_depth` is `serde(skip)` on purpose - it is a training SCHEDULE
+like steps/log_every, not a model or optimizer setting. Putting it in the
+snapshot would make every schedule knob a config-drift blocker for runs
+started before the flag existed (ADR-0005 compares key-by-key and reports
+keys present in the fresh resolve but missing from the stored snapshot).
+
+P10 check: `random_depth_is_honest_and_still_learns` - sampler determinism,
+range, spread over all four depths; 60 steps of sampled depth on a fixed batch
+descend by >0.1; depth 1 and depth 4 are different models; `None` reproduces
+fixed depth exactly; depth 9 panics. The depth comparison runs AFTER training
+on purpose: at init the ReZero residual scale is 0, so every depth collapses
+to the same uniform output and a pre-training comparison would pass without
+the depth doing anything.
+
+A/B (GPU slot needed): fixed-4 (official_v5, running) vs `--rand-depth`, judged
+on held-out BPB. The inference-side partner is a confidence exit in
+`generate` (~20 lines), not yet written.
+
 ## OPTIMIZATION 2026-09-27 (measured; full data in research/2026-09-27-optimization-1b.md)
 
 Step = 1.9 s for 5120 tokens on 7.5M params. The decisive measurement: at

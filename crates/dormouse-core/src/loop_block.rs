@@ -53,6 +53,13 @@ pub struct LoopBlock {
     pub use_msa: bool,
     #[module(skip)]
     pub use_kda: bool,
+    /// Random-depth arm (ADR-0013 rank 2): run only the first `n` iterations
+    /// instead of `max_iter`, and average the readout and the CE over the
+    /// iterations actually executed. `None` = fixed depth, the default.
+    /// The trainer sets it per step; there is no learned halting here, so
+    /// there is nothing to collapse.
+    #[module(skip)]
+    pub depth_override: Option<usize>,
     #[module(skip)]
     pub use_engram: bool,
     #[module(skip)]
@@ -127,6 +134,7 @@ impl LoopBlock {
             n_experts: cfg.n_experts,
             use_msa: cfg.use_msa,
             use_kda: cfg.use_kda,
+            depth_override: None,
             use_engram: cfg.use_engram,
             bf16: cfg.bf16,
             act_quant: cfg.act_quant,
@@ -178,8 +186,23 @@ impl LoopBlock {
         let use_kda = self.use_kda;
         let use_msa = self.use_msa;
         let use_engram = self.use_engram;
+        // Random-depth arm (ADR-0013 rank 2): `depth_override` runs the first
+        // n iterations only, and BOTH averages below divide by what actually
+        // ran - a truncated run is a complete, honest model at depth n, not a
+        // partial sum of a depth-max_iter one.
+        let iters = match self.depth_override {
+            Some(n) => {
+                assert!(
+                    n >= 1 && n <= self.max_iter,
+                    "loop depth {n} outside 1..={} (loud, not clamped)",
+                    self.max_iter
+                );
+                n
+            }
+            None => self.max_iter,
+        };
 
-        for iter in 0..self.max_iter {
+        for iter in 0..iters {
             let row = iter;
             let iter_ctx = self
                 .iter_embed
@@ -331,11 +354,12 @@ impl LoopBlock {
             }
 
             // Per-iteration readout. Fixed depth (ADR-0013): uniform
-            // iteration weights and an honest unweighted CE — the PonderNet
-            // variant lost its A/B (lambda collapse zeroed rec, a fake loss,
-            // and out_acc, uniform outputs).
+            // iteration weights over the executed iterations and an honest
+            // unweighted CE — the PonderNet variant lost its A/B (lambda
+            // collapse zeroed rec, a fake loss, and out_acc, uniform
+            // outputs).
             let step_out = self.out_proj.forward::<B>(h.clone().reshape([b * t, d])).reshape([b, t, d]);
-            let w = 1.0f32 / self.max_iter as f32;
+            let w = 1.0f32 / iters as f32;
             out_acc = out_acc + step_out.clone().mul_scalar(w);
             if let Some(tgt) = &targets {
                 let so = if bf16 { step_out.clone().cast(FloatDType::F32) } else { step_out.clone() };
@@ -349,7 +373,7 @@ impl LoopBlock {
                     .reshape([b, t])
                     .sum_dim(1)
                     .div_scalar(t as f32); // [b]
-                rec = rec + ce.sum_dim(0).reshape([1]).div_scalar(self.max_iter as f32);
+                rec = rec + ce.sum_dim(0).reshape([1]).div_scalar(iters as f32);
             }
             // The readout consumed the post-residual h; the recurrence reset
             // it to the block input (per-iteration writes reach the loss via
@@ -359,5 +383,19 @@ impl LoopBlock {
         let rec = rec.div_scalar(b as f32); // mean over batch
         let kda = kda_s.unwrap_or_else(|| Tensor::zeros([1, 1, 1, 1], &h.device()));
         (out_acc, rec, kda)
+    }
+
+    /// Random-depth arm: run only the first `n` iterations. `None` restores
+    /// fixed depth. Rejects `n == 0` or `n > max_iter` loudly — a silently
+    /// clamped depth would make the A/B lie about what it trained.
+    pub fn set_depth(&mut self, n: Option<usize>) {
+        if let Some(n) = n {
+            assert!(
+                n >= 1 && n <= self.max_iter,
+                "loop depth {n} outside 1..={} (loud, not clamped)",
+                self.max_iter
+            );
+        }
+        self.depth_override = n;
     }
 }

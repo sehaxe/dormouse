@@ -103,6 +103,14 @@ struct Args {
     #[arg(long)]
     jepa_precompute: Option<usize>,
 
+    /// Random-depth arm: sample the loop depth T in 1..=max_iter per step
+    /// (deterministic from the step index) so the model is trained to be
+    /// correct at EVERY depth. Adaptive depth without a learned halting head,
+    /// so there is nothing to collapse (ADR-0013 rank 2). The depth at
+    /// inference stays max_iter; --gen-max-iter picks it lower.
+    #[arg(long)]
+    rand_depth: bool,
+
     // --- quantization / maintenance ---
     /// Force factor-quant format: fp32 | bf16 | fp16 | fp8 | fp4.
     #[arg(long)]
@@ -194,6 +202,7 @@ fn build_run(a: &Args) -> Result<dormouse_train::RunCfg, String> {
     train.dspark_weight = a.dspark_weight.or(train.dspark_weight);
     train.dspark_k = a.dspark_k.or(train.dspark_k);
     train.jepa_targets = a.jepa_targets.clone().or(train.jepa_targets);
+    train.rand_depth |= a.rand_depth;
     train.retract_every = a.retract_every.unwrap_or(train.retract_every);
     train.retract_iters = a.retract_iters.unwrap_or(train.retract_iters);
     train.stress |= a.stress;

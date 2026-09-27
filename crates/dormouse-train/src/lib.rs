@@ -71,6 +71,12 @@ pub struct TrainCfg {
     /// Drop expert TSCT factors from the Muon+ group to the fallback (A/B).
     pub factors_fallback: bool,
     /// TSCT U/V retraction cadence / Newton-Schulz iterations.
+    /// Random-depth arm: sample T in 1..=max_iter per step. `serde(skip)` on
+    /// purpose - like steps/log_every this is a training SCHEDULE, not a model
+    /// or optimizer setting, and putting it in the snapshot would make every
+    /// schedule knob a resume blocker for runs started before it existed.
+    #[serde(skip)]
+    pub rand_depth: bool,
     pub retract_every: usize,
     pub retract_iters: usize,
     /// Stress protocol (report §3.3): constant LR at `stress_lr`x, spike
@@ -129,6 +135,7 @@ impl Default for TrainCfg {
             seq_len: 512, batch: 3, lr: 1e-4, wd: 0.01, grad_clip: 1.0,
             ckpt_name: "latest".into(), eval_every: 0,
             opt: "mix".into(), quant: None, factors_fallback: false,
+            rand_depth: false,
             retract_every: 1, retract_iters: 3,
             stress: false, stress_lr: 1.0, stress_every: 50,
             engram_ram: false, engram_slots: 1_000_000, host_adam_every: 1,
@@ -255,6 +262,21 @@ pub fn mask_nonfinite(loss: Tensor<1>) -> (Tensor<1>, Tensor<1>) {
     let masked = loss.mask_fill(finite.clone().bool_not(), 0.0);
     let bad = finite.float().neg().add_scalar(1.0);
     (masked, bad)
+}
+
+/// The random-depth draw (ADR-0013 rank 2): `T` for this step, in
+/// `1..=max_iter`. A deterministic mix of the step index - no RNG state to
+/// carry across a resume, and an A/B run replays exactly. `max_iter <= 1`
+/// degenerates to the fixed-depth case.
+pub fn sample_depth(step: u64, max_iter: usize) -> usize {
+    if max_iter <= 1 {
+        return 1;
+    }
+    let mut z = step.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    1 + (z as usize) % max_iter
 }
 
 /// WSD schedule (warmup 2% -> const -> 1.5-power decay over final 20%),
@@ -691,6 +713,14 @@ pub fn train_loop(
         };
 
         let t_fwd = std::time::Instant::now();
+        // Random-depth arm (ADR-0013 rank 2): T is a deterministic mix of the
+        // step index, so an A/B run replays exactly and a resume continues the
+        // same sequence. Both averages inside the loop divide by what ran, so
+        // each step is an honest model at depth T.
+        if cfg.rand_depth {
+            let t = sample_depth(step, model.loop_block.max_iter);
+            model.set_loop_depth(Some(t));
+        }
         // Offline JEPA: the frozen target for THIS chunk must exist in the
         // sidecar; a miss is a hard error (stale sidecar), never a silent
         // aux drop.
@@ -1455,6 +1485,85 @@ mod tests {
         let after: Vec<f32> = model.loop_block.norm.weight.val().into_data().try_to_vec().unwrap();
         assert_eq!(before, after, "a masked loss must produce exactly zero grads");
         assert!(after.iter().all(|x| x.is_finite()), "weights must stay finite");
+    }
+
+    /// The random-depth arm (ADR-0013 rank 2) must be honest: it trains, the
+    /// depths become genuinely different models, and an out-of-range depth is
+    /// refused loudly rather than clamped.
+    ///
+    /// Note the order: depth is compared AFTER training, because at init the
+    /// ReZero residual scale is 0, so every depth collapses to the same
+    /// uniform output (5.545 = ln 256) and a pre-training comparison would
+    /// "pass" without the depth doing anything.
+    #[test]
+    fn random_depth_is_honest_and_still_learns() {
+        // The sampler: deterministic, in range, and it actually spreads.
+        assert_eq!(sample_depth(7, 4), sample_depth(7, 4), "same step, same depth");
+        let hit: std::collections::HashSet<usize> = (0..64).map(|s| sample_depth(s, 4)).collect();
+        assert_eq!(hit.len(), 4, "all depths 1..=4 must be reachable: {hit:?}");
+        assert!(hit.iter().all(|d| (1..=4).contains(d)), "depth out of range: {hit:?}");
+        assert_eq!(sample_depth(3, 1), 1, "max_iter=1 must degenerate to fixed depth");
+
+        let cfg = test_cfg(); // max_iter = 4
+        let mut model = DormouseModel::new(&cfg, &device());
+        assert_eq!(model.loop_block.max_iter, 4, "test config must have 4 iterations");
+        let bytes: Vec<u8> = (0..128).map(|i| (i * 7) as u8).collect();
+        let hashes: Vec<i64> = (0..384).map(|p| (p as i64) % 4096).collect();
+        let (x, h) = bytes_to_tensors::<Backend>(&bytes, &hashes, 64, 2, &device());
+        let shifted: Vec<i64> = bytes.iter().skip(1).chain(std::iter::once(&bytes[0])).map(|&b| b as i64).collect();
+        let y: Tensor<2, Int> = Tensor::from_data(TensorData::new(shifted, [2, 64]), &device());
+
+        // Train with sampled depths on a fixed batch: must descend for real.
+        let optim_cfg = TrainCfg { steps: 60, seq_len: 64, batch: 2, lr: 1e-3, wd: 0.0, grad_clip: 1.0, ..Default::default() };
+        let mut optim = crate::optim::build_optim_mode(&optim_cfg, "adamw");
+        let mut losses = Vec::with_capacity(60);
+        for step in 0..60u64 {
+            let mut m = model.clone();
+            m.set_loop_depth(if step % 2 == 0 { Some(sample_depth(step, 4)) } else { None });
+            let (_l, rec, _k, _a) = m.forward_with_hidden::<Backend>(
+                x.clone(), Some(h.clone()), None, Some(y.clone()), None,
+            );
+            let loss = m.loss::<Backend>(rec);
+            let v: f32 = loss.clone().try_into_scalar().unwrap_or(f32::NAN);
+            let grads = GradientsParams::from_grads(loss.backward(), &m);
+            model = optim.step(1e-3, model, grads);
+            losses.push(v);
+        }
+        let head: f32 = losses[..5].iter().sum::<f32>() / 5.0;
+        let tail: f32 = losses[55..].iter().sum::<f32>() / 5.0;
+        assert!(losses.iter().all(|l| l.is_finite()), "rand-depth losses must stay finite");
+        assert!(
+            tail < head - 0.1,
+            "random depth must still learn: head={head:.3} tail={tail:.3} {losses:?}"
+        );
+
+        // The trained model: depth 1 and depth 4 are DIFFERENT models, and
+        // None reproduces the fixed-depth run exactly.
+        let loss_at = |m: &DormouseModel, depth: Option<usize>| {
+            let mut m2 = m.clone();
+            m2.set_loop_depth(depth);
+            let (_l, rec, _k, _a) = m2.forward_with_hidden::<Backend>(
+                x.clone(), Some(h.clone()), None, Some(y.clone()), None,
+            );
+            m2.loss::<Backend>(rec).try_into_scalar().unwrap_or(f32::NAN)
+        };
+        let d1 = loss_at(&model, Some(1));
+        let d4 = loss_at(&model, Some(4));
+        assert!(d1.is_finite() && d4.is_finite(), "both depths must be finite: {d1} {d4}");
+        assert!(
+            (d1 - d4).abs() > 1e-4,
+            "depth 1 and depth 4 must be different models, got {d1} vs {d4}"
+        );
+        assert!((loss_at(&model, None) - d4).abs() < 1e-6, "None must mean fixed depth");
+
+        // Loud refusal: a clamped depth would make the A/B lie about what it
+        // trained.
+        let mut bad = model.clone();
+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            bad.set_loop_depth(Some(9));
+        }))
+        .is_err();
+        assert!(refused, "depth 9 (> max_iter 4) must be refused loudly");
     }
 
     /// Every OPT mode must build and take a step without NaN (AdamW, Adan,

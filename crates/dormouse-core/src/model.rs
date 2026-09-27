@@ -252,6 +252,14 @@ impl DormouseModel {
         total
     }
 
+    /// Random-depth arm (ADR-0013 rank 2): run only the first `n` loop
+    /// iterations, `None` for the fixed-depth default. Cheapest way to get
+    /// adaptive depth without a learned halting head - and nothing to
+    /// collapse. Rejects an out-of-range depth loudly.
+    pub fn set_loop_depth(&mut self, n: Option<usize>) {
+        self.loop_block.set_depth(n);
+    }
+
     /// The training loss: the honest mean CE from the loop (ADR-0013).
     pub fn loss<B: burn::backend::AutodiffBackend>(&self, rec_ce: Tensor<1>) -> Tensor<1>
     where
