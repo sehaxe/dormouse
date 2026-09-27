@@ -3,8 +3,6 @@ pub mod act_quant;
 pub mod aux;
 pub mod attention;
 pub mod config;
-#[cfg(feature = "cuda")]
-pub mod fused;
 pub mod gr;
 pub mod loop_block;
 pub mod model;

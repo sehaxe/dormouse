@@ -625,41 +625,6 @@ pub fn train_loop(
     // exact — the monitor would have nothing to guard, so skip it entirely
     // (it costs 30+ device syncs per check).
     let mut ortho_fp32 = cfg.quant.as_deref() == Some("fp32");
-    // M6: DM_FUSED=1 single-node path (default 0 preserves behavior). The
-    // fused path is compiled only with the cuda feature; the cpu build never
-    // takes it. Flagship-compatible since the arms-adjoint work: host rows
-    // train through the op's rows parent, the aux heads run on the burn path
-    // from the op's exposed latents. Still excluded: bf16 (kernels are f32),
-    // act-quant (STE not in the kernels), GR. The gate is hoisted out of the
-    // loop (its inputs are constants) so the startup log line provably
-    // matches what every step does - a silent DM_FUSED=1 fallback is the
-    // failure mode this run-length is too short to expose any other way.
-    #[cfg(feature = "cuda")]
-    let use_fused = dormouse_core::fused::fused_enabled()
-        && !dorm_cfg.bf16
-        && dorm_cfg.act_quant.is_none()
-        && !dorm_cfg.use_gr;
-    #[cfg(feature = "cuda")]
-    {
-        let reason = if !dormouse_core::fused::fused_enabled() {
-            "DM_FUSED=0"
-        } else if dorm_cfg.bf16 {
-            "bf16 compute (fused kernels are f32)"
-        } else if dorm_cfg.act_quant.is_some() {
-            "act-quant (STE not in the fused kernels)"
-        } else if dorm_cfg.use_gr {
-            "Gated Residual"
-        } else {
-            ""
-        };
-        if reason.is_empty() {
-            println!("forward arm: FUSED ponder_loop_step (host-rows engram OK, aux heads burn-side)");
-        } else {
-            println!("forward arm: burn (fused gated off: {reason})");
-        }
-    }
-    #[cfg(not(feature = "cuda"))]
-    let _use_fused = false;
     while step < cfg.steps as u64 {
         let t_iter = std::time::Instant::now();
         let (bytes, hashes) = (std::mem::replace(&mut pbytes, Vec::new()), std::mem::replace(&mut phashes, Vec::new()));
@@ -709,113 +674,11 @@ pub fn train_loop(
             Some(t) => Some(t.get(&bytes)?),
             None => None,
         };
-        // M6: DM_FUSED=1 single-node path (default 0 preserves behavior).
-        // The fused path is compiled only with the cuda feature; the cpu
-        // build never takes it. Flagship-compatible since the arms-adjoint
-        // work: host rows train through the op's rows parent, the aux heads
-        // run on the burn path from the op's exposed latents. Still excluded:
-        // bf16 (kernels are f32), act-quant (STE not in the kernels), GR.
-        #[cfg(feature = "cuda")]
-        let (_logits, rec_ce, p_dist, _kda, aux) = if use_fused {
-            // Build PonderInputs from the live model (embedding + loop_block)
-            let x_emb = {
-                let e = model.embedding.forward(x.clone());
-                if dorm_cfg.bf16 {
-                    e.cast(burn::tensor::FloatDType::BF16)
-                } else {
-                    e
-                }
-            };
-            // Fac helper (same as fused/tests.rs)
-            let fac_of = |ll: &dormouse_core::LinearLike| {
-                let l = match &ll.inner {
-                    dormouse_core::param::LinearLikeInner::Tsct(l) => l,
-                    _ => panic!("fused requires TSCT"),
-                };
-                dormouse_core::fused::Fac {
-                    u: l.u.val(),
-                    s: l.s.val(),
-                    v: l.v.val(),
-                }
-            };
-            let lb_bytes = {
-                let rec = model.loop_block.clone().into_record();
-                rec.into_bytes().unwrap().to_vec()
-            };
-            let mut experts = Vec::new();
-            for e in &model.loop_block.expert_ffns {
-                experts.push([fac_of(&e.gate_up), fac_of(&e.down)]);
-            }
-            // JEPA target: offline sidecar when present, else the live EMA
-            // teacher's latent over the same inputs (the same second forward
-            // forward_with_hidden would run). Both stop-grad on the burn path.
-            let teacher_latent = match jepa_target {
-                Some(tg) => Some(tg),
-                None => teacher
-                    .as_ref()
-                    .map(|t| t.forward_latent::<Backend>(y.clone(), None, None)),
-            };
-            let inputs = dormouse_core::fused::PonderInputs {
-                x: x_emb,
-                targets: y.clone().reshape([cfg.batch * cfg.seq_len, 1]),
-                controller_w: model.loop_block.controller.weight.val(),
-                norm_g: model.loop_block.norm.weight.val(),
-                final_norm_g: model.norm.weight.val(),
-                iter_embed: model.loop_block.iter_embed.val(),
-                residual_scale: model.loop_block.residual_scale.val(),
-                halt_w: model.loop_block.halt_head.weight.val(),
-                experts,
-                out_proj: fac_of(&model.loop_block.out_proj),
-                lm_head: fac_of(&model.lm_head),
-                norm_eps: dorm_cfg.norm_eps,
-                ponder_prior: model.ponder_prior,
-                // RAM-offload rows drive the Engram; hashed_ids only without
-                // them (a dead H2D copy otherwise), same as the burn path.
-                hashed_ids: if host_rows.is_some() { None } else { Some(h.clone()) },
-                host_rows,
-                arm_leaves: Some(dormouse_core::fused::ArmLeavesPair {
-                    attn: dormouse_core::fused::ArmLeaves::capture(&model.loop_block.shared_attn),
-                    engram: dormouse_core::fused::ArmLeaves::capture(&model.loop_block.engram),
-                }),
-                loop_block_bytes: Some(lb_bytes),
-                cfg: Some(dorm_cfg.clone()),
-            };
-            let out = dormouse_core::fused::ponder_loop_step(inputs);
-            // Aux heads stay OUTSIDE the op: they consume the exposed latents
-            // (out_acc for JEPA/KoLeo, the final-norm output for DSpark) on
-            // the burn graph, so their own params train normally.
-            let aux = model.aux_loss::<Backend>(
-                &out.out_acc,
-                teacher_latent,
-                Some(y.clone()),
-                &out.h,
-                &out.logits,
-            );
-            let kda_dummy = Tensor::<4>::zeros([1, 1, 1, 1], &out.logits.device());
-            (out.logits, out.rec, out.p_dist, kda_dummy, aux)
-        } else if let Some(tg) = jepa_target {
+        let (_logits, rec_ce, p_dist, _kda, aux) = if let Some(tg) = jepa_target {
             model.forward_with_jepa_targets::<Backend>(
                 x,
                 // RAM-offload path drives the Engram from host_rows; uploading
                 // hashed_ids too would be a dead per-step H2D copy.
-                if host_rows.is_some() { None } else { Some(h) },
-                host_rows,
-                Some(y),
-                Some(tg),
-            )
-        } else {
-            model.forward_with_hidden::<Backend>(
-                x,
-                if host_rows.is_some() { None } else { Some(h) },
-                host_rows,
-                Some(y),
-                teacher.as_ref(),
-            )
-        };
-        #[cfg(not(feature = "cuda"))]
-        let (_logits, rec_ce, p_dist, _kda, aux) = if let Some(tg) = jepa_target {
-            model.forward_with_jepa_targets::<Backend>(
-                x,
                 if host_rows.is_some() { None } else { Some(h) },
                 host_rows,
                 Some(y),

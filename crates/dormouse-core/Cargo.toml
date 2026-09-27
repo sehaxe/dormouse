@@ -20,12 +20,6 @@ burn-spectral = { path = "../../vendor/burn-fused/crates/burn-spectral" }
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
-# Already in the build graph via burn-cuda / burn-spectral(cuda); declared so
-# fused.rs can name CubeTensor and launch #[cube] kernels directly.
-burn-cubecl = { version = "0.22.0-pre.4", default-features = false, features = ["std"], optional = true }
-cubecl = { version = "0.11.0-pre.4", default-features = false, features = ["std", "cuda"], optional = true }
-# already compiled via burn-spectral(cuda); needed to block on client.sync()
-futures-lite = { version = "2", optional = true }
 
 [dev-dependencies]
 burn-ndarray = { version = "0.22.0-pre.4", features = ["blas-openblas"] }
@@ -41,9 +35,6 @@ cuda = [
     "burn-msa/autodiff",
     "burn-spectral/cuda",
     "burn-rmsnorm/cuda",
-    "dep:burn-cubecl",
-    "dep:cubecl",
-    "dep:futures-lite",
 ]
 # CUDA-only probe: burn-cuda types exist only with the cuda feature.
 [[example]]

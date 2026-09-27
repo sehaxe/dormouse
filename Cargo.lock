@@ -2855,7 +2855,6 @@ version = "0.1.0"
 dependencies = [
  "burn",
  "burn-bitnet",
- "burn-cubecl",
  "burn-cuda",
  "burn-dspark",
  "burn-engram",
@@ -2867,8 +2866,6 @@ dependencies = [
  "burn-rmsnorm",
  "burn-spectral",
  "burn-tensor",
- "cubecl",
- "futures-lite",
  "rand 0.8.8",
  "serde",
  "toml 0.8.23",
