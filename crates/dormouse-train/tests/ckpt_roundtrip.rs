@@ -5,6 +5,10 @@
 //!
 //! `save_ckpt`/`load_ckpt` are backend-agnostic (burnpack bytes + the
 //! crate's own device factory), so the contract is testable without CUDA.
+//! ADR-0021: the container also carries the run state the config cannot
+//! express - the EMA teacher and the latched fp32-factor fallback - and both
+//! are asserted here through the public API, which is the seam a resume goes
+//! through.
 
 use burn::tensor::{Device, Int, Tensor, TensorData};
 use dormouse_core::{fnv_hash, DormouseConfig, DormouseModel};
@@ -63,15 +67,16 @@ fn ckpt_roundtrip_identical_logits() {
     };
     let optim = build_optim(&optim_cfg);
 
-    save_ckpt(&dir, "seam", &model, &optim, 7, 5.5).expect("save_ckpt");
+    save_ckpt(&dir, "seam", &model, &optim, None, false, 7, 5.5).expect("save_ckpt");
     assert!(dir.join("seam.bin").exists(), "container missing");
     let sidecar = std::fs::read_to_string(dir.join("seam.txt")).expect("sidecar");
     assert!(sidecar.contains("step 7"), "sidecar: {sidecar}");
 
     let mut model2 = DormouseModel::new(&cfg, &dev);
     let mut optim2 = build_optim(&optim_cfg);
-    let step = load_ckpt(&dir, "seam", &cfg, &mut model2, &mut optim2).expect("load_ckpt");
-    assert_eq!(step, 7);
+    let loaded = load_ckpt(&dir, "seam", &cfg, &mut model2, &mut optim2).expect("load_ckpt");
+    assert_eq!(loaded.step, 7);
+    assert!(loaded.teacher.is_none(), "a run with no teacher saves none");
 
     // Same input through both: logits must match to fp32 round-trip noise.
     let (b, s) = (1, 128);
@@ -99,5 +104,53 @@ fn ckpt_roundtrip_identical_logits() {
         d < 1e-5,
         "reloaded model diverges: max |dlogit| = {d:.3e}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// ADR-0021, through the public API only: a checkpoint must carry the run
+/// state the config cannot express. Both used to be rebuilt from the config
+/// on every resume, which is how a resumed run became a different experiment
+/// wearing the same step count.
+#[test]
+fn ckpt_carries_the_state_the_config_cannot() {
+    let dir = std::env::temp_dir().join("dm-ckpt-roundtrip-state");
+    let _ = std::fs::remove_dir_all(&dir);
+    let cfg = mini_nano();
+    let dev = device();
+    let model = DormouseModel::new(&cfg, &dev);
+    let optim_cfg = TrainCfg { steps: 3, ..Default::default() };
+    let optim = build_optim(&optim_cfg);
+
+    // A teacher deliberately at distance from the student, and the one-way
+    // fp32 fallback latched: both must come back.
+    let teacher = {
+        use burn::module::{Module, ModuleMapper, Param};
+        struct Bump;
+        impl ModuleMapper for Bump {
+            fn map_float<const D: usize>(&mut self, p: Param<Tensor<D>>) -> Param<Tensor<D>> {
+                let (id, t, m) = p.consume();
+                Param::from_mapped_value(id, t.add_scalar(1.0), m)
+            }
+        }
+        model.clone().map(&mut Bump).no_grad()
+    };
+    save_ckpt(&dir, "st", &model, &optim, Some(&teacher), true, 21, 4.0).expect("save_ckpt");
+
+    let mut m2 = DormouseModel::new(&cfg, &dev);
+    let mut o2 = build_optim(&optim_cfg);
+    let loaded = load_ckpt(&dir, "st", &cfg, &mut m2, &mut o2).expect("load_ckpt");
+    assert!(loaded.ortho_fp32, "the one-way fp32-factor fallback must survive a save/load");
+    let t2 = loaded.teacher.expect("the EMA teacher must be in the container");
+    let read = |m: &DormouseModel| {
+        m.embedding
+            .weight
+            .val()
+            .clone()
+            .into_data()
+            .try_to_vec::<f32>()
+            .expect("embedding readable")
+    };
+    assert_eq!(read(&t2), read(&teacher), "the restored teacher must equal the saved one");
+    assert_ne!(read(&t2), read(&model), "the teacher must not be a copy of the student");
     let _ = std::fs::remove_dir_all(&dir);
 }

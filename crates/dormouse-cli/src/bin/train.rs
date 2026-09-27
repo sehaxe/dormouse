@@ -100,6 +100,12 @@ struct Args {
     /// exit (one forward per batch, current weights, no training).
     #[arg(long)]
     jepa_precompute: Option<usize>,
+    /// Seed for the JEPA span mask, the only stochastic input to a step. The
+    /// mask is a pure function of (seed, step), so an A/B of two arms replays
+    /// the same masks and a resume continues the interrupted run's sequence
+    /// (ADR-0021). Part of the config snapshot: changing it mid-run is drift.
+    #[arg(long)]
+    seed: Option<u64>,
 
     /// Random-depth arm: sample the loop depth T in 1..=max_iter per step
     /// (deterministic from the step index) so the model is trained to be
@@ -207,6 +213,7 @@ fn build_run(a: &Args) -> Result<dormouse_train::RunCfg, String> {
     train.dspark_weight = a.dspark_weight.or(train.dspark_weight);
     train.dspark_k = a.dspark_k.or(train.dspark_k);
     train.jepa_targets = a.jepa_targets.clone().or(train.jepa_targets);
+    train.seed = a.seed.unwrap_or(train.seed);
     train.rand_depth |= a.rand_depth;
     train.eval_batches = a.eval_batches.unwrap_or(train.eval_batches);
     train.eval_depths |= a.eval_depths;

@@ -41,8 +41,33 @@ pub fn resolve(preset: &str, set: &[String], mut train: TrainCfg) -> Result<RunC
     if let Some(w) = train.jepa_weight { model.jepa_weight = w; }
     if let Some(w) = train.dspark_weight { model.dspark_weight = w; }
     if let Some(k) = train.dspark_k { model.dspark_k = k; }
+    // Host-RAM n-gram tables: the in-model table is never READ on that path
+    // (the rows arrive pre-gathered, `hashed_ids` is None in both the train
+    // and the eval forward), so it must not cost VRAM and per-checkpoint
+    // bytes. At the shipped budget that is 3 x 524288 x 32 = 50M params /
+    // 201 MB of dead weights written into every burnpack. Squeeze it to one
+    // row per order; the host table (`--engram-slots`) is the real capacity.
+    if train.engram_ram {
+        model.engram_rows = 1;
+    }
     // Head-wise Muon for Q/K uses the resolved attention geometry.
     train.qk_heads = Some(model.n_heads);
+    // 3b. The random-depth arm and the MoR router are two different ways to
+    // buy the SAME property (depth robustness): one samples the loop depth
+    // per step, the other ranks the iteration slots per position. Applying
+    // both silently would make either A/B a lie about what it trained, so the
+    // pair is refused HERE - the one seam that sees both, in the foreground,
+    // before any GPU work. (`--eval-depths` is unaffected: it truncates the
+    // loop for a measurement on a clone, and the MoR arm's k shrinks to the
+    // slots that ran.)
+    if model.use_mor && train.rand_depth {
+        return Err(
+            "--rand-depth and use_mor are both depth-robustness mechanisms and cannot \
+             be combined: the A/B would measure neither. Run one arm (--preset mor, or \
+             --set use_mor=true) with --rand-depth off."
+                .into(),
+        );
+    }
     // 4. Validate the merged config (the train path previously never did).
     dormouse_core::config::validate(&model)?;
     Ok(RunCfg { source: preset.to_string(), model, train })
@@ -63,11 +88,19 @@ impl RunCfg {
 
     /// `model.*` / `train.*` keys where `self` and `other` differ. `source`
     /// is provenance (builtin name vs explicit path can produce the same
-    /// values) and is excluded from the comparison. The train-section
-    /// progress keys (`steps`, `log_every`, `ckpt_every`) are exempt too:
-    /// extending a finished run is a legitimate resume, and they cannot
-    /// alter the numerics of already-trained steps (2026-09-23, surfaced by
-    /// the first real resume hitting the check).
+    /// values) and is excluded from the comparison.
+    ///
+    /// THE RULE (ADR-0021): a resume must reproduce the run, so the exempt
+    /// class is exactly the keys that change WHEN we look, never WHAT the
+    /// model computes - the progress/cadence keys, because extending a
+    /// finished run is a legitimate resume and none of them can alter the
+    /// numerics of a step that has already run. Everything else is strict,
+    /// including every knob that reaches a forward: there is no
+    /// "schedule knobs are not config" exemption, because a knob that
+    /// changes the objective is a different experiment wearing the same
+    /// step count. `rand_depth` (the loop depth per step) was on the wrong
+    /// side of this line - `serde(skip)`, invisible here - and is now in
+    /// the snapshot like any other objective knob.
     pub fn diff_keys(&self, other: &RunCfg) -> Vec<String> {
         const PROGRESS_KEYS: [&str; 5] =
             ["steps", "log_every", "ckpt_every", "eval", "eval_every"];
@@ -168,6 +201,78 @@ mod tests {
         assert_eq!(back, run);
     }
 
+    /// ADR-0021, item 8: the snapshot is the ONLY record of what a run is,
+    /// and the drift check can only compare what the snapshot carries. A
+    /// `#[serde(skip)]` field is a field the drift check is blind to - and
+    /// three of them were: `rand_depth` (the loop depth drawn per step, so it
+    /// reaches every gradient), `eval_batches`, `eval_depths`. A resume that
+    /// flipped one of those was a different experiment with the same step
+    /// count and nothing said so.
+    ///
+    /// ONE test for the whole class, by making the two lists provably equal
+    /// rather than by asserting twenty field names: the snapshot must carry
+    /// every field the struct has. A skipped field shows up as a deficit
+    /// here, whatever its name and whatever it does; adding a field without
+    /// adding it to the snapshot (or vice versa) fails the count.
+    #[test]
+    fn snapshot_carries_every_train_field() {
+        // The field list, written out. This is the price of the guarantee and
+        // it is paid ONCE: a new TrainCfg field must be added here, which is
+        // exactly the moment the author has to ask "does this belong in the
+        // snapshot?" - the question the skip hid.
+        const FIELDS: [&str; 39] = [
+            "steps", "ckpt_every", "log_every", "seq_len", "batch", "lr", "wd",
+            "grad_clip", "ckpt_name", "eval_every", "opt", "quant",
+            "factors_fallback", "rand_depth", "eval_batches", "eval_depths",
+            "retract_every", "retract_iters", "stress", "stress_lr",
+            "stress_every", "engram_ram", "engram_slots", "host_adam_every",
+            "warmup", "quant_check", "timers", "memlog", "bf16", "act_quant",
+            "act_group", "max_iter", "no_kda", "no_engram", "jepa_weight",
+            "dspark_weight", "dspark_k", "jepa_targets", "seed",
+        ];
+        // An Option field that is None is omitted by the TOML serializer, so
+        // a skipped Option is invisible to the round trip too. Set them.
+        let run = resolve("small", &[], TrainCfg {
+            quant: Some("fp32".into()),
+            bf16: Some(true),
+            act_quant: Some(dormouse_core::ActQuant::Int(8)),
+            act_group: Some(64),
+            max_iter: Some(3),
+            jepa_weight: Some(0.1),
+            dspark_weight: Some(0.2),
+            dspark_k: Some(3),
+            jepa_targets: Some(std::path::PathBuf::from("t.bin")),
+            ..Default::default()
+        })
+        .unwrap();
+        let table = toml::Value::try_from(&run).unwrap();
+        let train = table.get("train").and_then(toml::Value::as_table).unwrap();
+        let missing: Vec<&str> = FIELDS.iter().copied().filter(|f| !train.contains_key(*f)).collect();
+        assert!(missing.is_empty(), "fields absent from the config snapshot: {missing:?}");
+        assert_eq!(
+            train.len(),
+            FIELDS.len() + 1, // + qk_heads, derived in resolve
+            "the train section has {} keys, the field list has {}: a field was added or dropped",
+            train.len(),
+            FIELDS.len() + 1
+        );
+        // The three that used to be skipped: flipping each one MUST show up in
+        // the drift check, or the snapshot is carrying decoration.
+        let stored = RunCfg::from_snapshot(&run.snapshot_toml()).unwrap();
+        for (field, flipped) in [
+            ("rand_depth", TrainCfg { rand_depth: true, ..run.train.clone() }),
+            ("eval_batches", TrainCfg { eval_batches: 7, ..run.train.clone() }),
+            ("eval_depths", TrainCfg { eval_depths: true, ..run.train.clone() }),
+            ("seed", TrainCfg { seed: run.train.seed + 1, ..run.train.clone() }),
+        ] {
+            let other = RunCfg { train: flipped, ..stored.clone() };
+            assert!(
+                other.diff_keys(&stored).contains(&format!("train.{field}")),
+                "train.{field} does not reach the drift check - a resume may change it silently"
+            );
+        }
+    }
+
     /// Drift check: a re-resolved config that differs from the stored
     /// snapshot names the changed key (model AND derived train keys).
     #[test]
@@ -200,5 +305,76 @@ mod tests {
     #[test]
     fn unknown_preset_errors() {
         assert!(resolve("no_such_preset_xyz", &[], TrainCfg::default()).is_err());
+    }
+
+    /// The hashed-memory order list is written in TWO crates - the model
+    /// config's `engram_orders` and the data crate's `ORDERS`, which is what
+    /// actually hashes - because the trainer's plumbing that would pass the
+    /// config into `ByteStream` is mid-edit. They must not drift: if they
+    /// do, the model sizes its tables from one list and the data emits
+    /// columns for another. This is the one test that sees both.
+    #[test]
+    fn model_and_data_agree_on_the_engram_orders() {
+        let run = resolve("small", &[], TrainCfg::default()).unwrap();
+        assert_eq!(
+            run.model.engram_orders,
+            dormouse_data::ORDERS.to_vec(),
+            "DormouseConfig::engram_orders must equal dormouse_data::ORDERS"
+        );
+        // The order COUNT is what the trainer's [b, t, 3] hash tensor can
+        // hold, so a shorter/longer list is a shape error, not a relayout.
+        assert_eq!(run.model.engram_orders.len(), 3);
+    }
+
+    /// The two depth-robustness arms are mutually exclusive, and the refusal
+    /// is a loud Err at resolve time (not a silent interaction): MoR ranks the
+    /// iteration slots per position, `--rand-depth` samples the loop depth per
+    /// step, and an A/B with both applied measures neither.
+    #[test]
+    fn mor_and_rand_depth_are_refused_together() {
+        let rd = TrainCfg { rand_depth: true, ..Default::default() };
+        // Either alone resolves.
+        assert!(resolve("small", &[], TrainCfg::default()).is_ok());
+        assert!(resolve("mor", &[], TrainCfg::default()).is_ok());
+        assert!(resolve("small", &set("use_mor=true"), rd.clone()).is_ok());
+        // Together: refused, and the message names both mechanisms.
+        let err = resolve("mor", &[], rd).expect_err("the pair must be refused");
+        assert!(err.contains("rand-depth") && err.contains("use_mor"), "{err}");
+    }
+
+    /// A preset that switches the arm OFF must still be able to switch it on
+    /// with its capacity fields intact: the budget is config, not a property
+    /// of the arm being enabled (this is the re-enable of 2026-09-27).
+    #[test]
+    fn disabled_preset_keeps_the_capacity_budget() {
+        let off = resolve("nano-fused", &[], TrainCfg::default()).unwrap();
+        assert!(!off.model.use_engram, "nano-fused ships the arm off");
+        assert_eq!(off.model.engram_rows, 25_000, "the budget is config, not gated on the arm");
+        assert_eq!(off.model.engram_lam_max, 0.5);
+        let on = resolve("nano-fused", &set("use_engram=true"), TrainCfg::default()).unwrap();
+        assert!(on.model.use_engram, "--set must be able to turn the arm back on");
+        assert_eq!(on.model.engram_rows, off.model.engram_rows);
+        // And the row budget is overridable, with the floor validated.
+        let rows = resolve("small", &set("engram_rows=250000"), TrainCfg::default()).unwrap();
+        assert_eq!(rows.model.engram_rows, 250_000);
+        assert!(resolve("small", &set("engram_lam_max=0"), TrainCfg::default()).is_err());
+        assert!(resolve("small", &set("engram_lam_max=1.5"), TrainCfg::default()).is_err());
+        let orders = resolve("small", &set("engram_orders=2,3,5"), TrainCfg::default()).unwrap();
+        assert_eq!(orders.model.engram_orders, vec![2, 3, 5]);
+    }
+
+    /// `--engram-ram` moves the tables to the host, so the in-model table is
+    /// dead weight: 3 x 32_768 x 32 = 3.1M params / 12.6 MB of VRAM and of
+    /// every burnpack for a tensor nothing reads. The resolve seam squeezes it
+    /// to 1 row per order, which is also a loud signal in the config snapshot
+    /// if a resume flips the flag.
+    #[test]
+    fn engram_ram_drops_the_in_vram_table() {
+        let vram = resolve("small", &[], TrainCfg::default()).unwrap();
+        assert_eq!(vram.model.engram_rows, 25_000, "in-VRAM: the config IS the capacity");
+        let ram = resolve("small", &[], TrainCfg { engram_ram: true, ..Default::default() }).unwrap();
+        assert_eq!(ram.model.engram_rows, 1, "host-RAM: the in-model table is never read");
+        assert_eq!(ram.model.engram_orders, vram.model.engram_orders, "orders are unchanged");
+        assert!(!ram.diff_keys(&vram).is_empty(), "the flag must show up in the drift check");
     }
 }

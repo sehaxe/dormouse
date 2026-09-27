@@ -71,23 +71,23 @@ pub struct TrainCfg {
     /// Drop expert TSCT factors from the Muon+ group to the fallback (A/B).
     pub factors_fallback: bool,
     /// TSCT U/V retraction cadence / Newton-Schulz iterations.
-    /// Random-depth arm: sample T in 1..=max_iter per step. `serde(skip)` on
-    /// purpose - like steps/log_every this is a training SCHEDULE, not a model
-    /// or optimizer setting, and putting it in the snapshot would make every
-    /// schedule knob a resume blocker for runs started before it existed.
-    #[serde(skip)]
+    /// Random-depth arm: sample T in 1..=max_iter per step. IN THE SNAPSHOT
+    /// (ADR-0021): the depth is drawn from the step index, so it changes the
+    /// objective of every step - a run that resumes with a different value is
+    /// a different experiment, not a longer one. It used to be `serde(skip)`.
     pub rand_depth: bool,
     /// Batches averaged per held-out eval. One batch is 5 KB, whose sampling
     /// noise is bigger than the effects we A/B; 20 batches = 100 KB. Part of
-    /// the EVAL LINE so a curve is self-documenting about its own protocol.
-    #[serde(skip)]
+    /// the EVAL LINE so a curve is self-documenting about its own protocol,
+    /// and in the snapshot for the same reason: an eval number is meaningless
+    /// without the protocol that produced it.
     pub eval_batches: usize,
     /// At every eval, also score depths 1..=max_iter and print the curve. One
     /// extra forward per depth, NO training: it answers "is the model actually
     /// depth-robust, and how much headroom would an early exit have?" before
     /// we spend a GPU-day on adaptive depth (measure first - see
-    /// research/2026-09-27-adaptive-depth-safe.md).
-    #[serde(skip)]
+    /// research/2026-09-27-adaptive-depth-safe.md). In the snapshot: it
+    /// changes what the eval line reports.
     pub eval_depths: bool,
     pub retract_every: usize,
     pub retract_iters: usize,
@@ -134,6 +134,11 @@ pub struct TrainCfg {
     /// chunk). When set, the hot loop runs NO second teacher forward and no
     /// EMA advance; targets are looked up per batch by chunk hash.
     pub jepa_targets: Option<PathBuf>,
+    /// Seed for the one stochastic part of a step: the JEPA span mask, which
+    /// is a pure function of `(seed, step)` (ADR-0021) so an A/B replays
+    /// exactly and a resume continues the same sequence. In the snapshot -
+    /// a different seed is a different run.
+    pub seed: u64,
 }
 
 impl Default for TrainCfg {
@@ -157,6 +162,7 @@ impl Default for TrainCfg {
             no_kda: false, no_engram: false,
             jepa_weight: None, dspark_weight: None, dspark_k: None,
             qk_heads: None, jepa_targets: None,
+            seed: 1,
         }
     }
 }
@@ -407,13 +413,93 @@ fn bytes_to_tensors<B: BurnBackend>(
     (x, h)
 }
 
-/// ckpt container: [step u64][model_len u64][optim_len u64][model burnpack][optim burnpack]
-/// Saved as `<dir>/<name>.bin`, atomically (tmp + rename). The parts stream
-/// to the file through a BufWriter instead of concatenating a third full
-/// copy in RAM (model+optim already exist as byte vectors; burnpack cannot
-/// stream its records, so ~2x (model+optim) RAM is the floor without
-/// upstream changes).
-pub fn save_ckpt(dir: &Path, name: &str, model: &DormouseModel, optim: &Optim, step: u64, ce: f32) -> std::io::Result<()> {
+/// ckpt container (ADR-0021):
+/// `[magic 8B][step u64][model_len u64][optim_len u64][teacher_len u64][flags u64]`
+/// then the three burnpack records. Saved as `<dir>/<name>.bin`, atomically
+/// (tmp + rename). The parts stream to the file through a BufWriter instead
+/// of concatenating a third full copy in RAM (model+optim already exist as
+/// byte vectors; burnpack cannot stream its records, so ~2x (model+optim) RAM
+/// is the floor without upstream changes).
+///
+/// The teacher and the flags are here because the CONFIG CANNOT EXPRESS
+/// THEM: both are run state that only exists because the loop advanced, and
+/// re-deriving them from the config is exactly how a resume becomes a
+/// different experiment wearing the same step count.
+const CKPT_MAGIC: [u8; 8] = *b"DMCK\x00\x02\x00\x00";
+/// Bytes of the v2 header (magic + 5 u64).
+const CKPT_HEADER: usize = 48;
+/// Bytes of the pre-ADR-0021 header (step + 2 u64).
+const CKPT_HEADER_LEGACY: usize = 24;
+/// `flags` bit 0: the one-way fp32-factor fallback is latched.
+const CKPT_ORTHO_FP32: u64 = 1;
+
+/// What a checkpoint carried besides the weights: the EMA teacher (JEPA's
+/// momentum is state, not config) and the latched fp32-factor fallback (a
+/// one-way switch the run can never undo).
+#[derive(Debug, Clone)]
+pub struct Loaded {
+    pub step: u64,
+    /// The teacher exactly as the run left it. `None` when the run had none
+    /// (aux off / offline JEPA targets) or when the container predates
+    /// ADR-0021 and cannot carry one.
+    pub teacher: Option<DormouseModel>,
+    /// The fp32-factor fallback was latched when this was written.
+    pub ortho_fp32: bool,
+    /// Pre-ADR-0021 container: no teacher, no flags in the file.
+    pub legacy: bool,
+}
+
+struct CkptHeader {
+    step: u64,
+    model: usize,
+    optim: usize,
+    teacher: usize,
+    flags: u64,
+    legacy: bool,
+    body: usize,
+}
+
+/// Parse the container header. A pre-ADR-0021 file starts with the raw step
+/// where the magic is, so it reads back as "no teacher, no flags" instead of
+/// being misparsed as a v2 record.
+fn parse_header(raw: &[u8]) -> Option<CkptHeader> {
+    if raw.len() >= CKPT_HEADER && raw[..8] == CKPT_MAGIC {
+        let u = |s: &[u8]| u64::from_le_bytes(s.try_into().expect("8-byte window"));
+        Some(CkptHeader {
+            step: u(&raw[8..16]),
+            model: u(&raw[16..24]) as usize,
+            optim: u(&raw[24..32]) as usize,
+            teacher: u(&raw[32..40]) as usize,
+            flags: u(&raw[40..48]),
+            legacy: false,
+            body: CKPT_HEADER,
+        })
+    } else if raw.len() >= CKPT_HEADER_LEGACY {
+        let u = |s: &[u8]| u64::from_le_bytes(s.try_into().expect("8-byte window"));
+        Some(CkptHeader {
+            step: u(&raw[0..8]),
+            model: u(&raw[8..16]) as usize,
+            optim: u(&raw[16..24]) as usize,
+            teacher: 0,
+            flags: 0,
+            legacy: true,
+            body: CKPT_HEADER_LEGACY,
+        })
+    } else {
+        None
+    }
+}
+
+pub fn save_ckpt(
+    dir: &Path,
+    name: &str,
+    model: &DormouseModel,
+    optim: &Optim,
+    teacher: Option<&DormouseModel>,
+    ortho_fp32: bool,
+    step: u64,
+    ce: f32,
+) -> std::io::Result<()> {
     // Rotate the previous save aside BEFORE writing the new one: with a single
     // file, one bad save (a run dying mid-write, or weights written while the
     // allocator was failing) destroys the last known-good state and every
@@ -425,17 +511,28 @@ pub fn save_ckpt(dir: &Path, name: &str, model: &DormouseModel, optim: &Optim, s
         let _ = std::fs::remove_file(&prev);
         let _ = std::fs::hard_link(&live, &prev);
     }
-    let model_bytes = model.clone().into_record().into_bytes().map_err(|e| std::io::Error::other(e.to_string()))?;
-    let optim_bytes = optim.to_record().into_bytes().map_err(|e| std::io::Error::other(e.to_string()))?;
+    let eio = |e: String| std::io::Error::other(e);
+    let model_bytes = model.clone().into_record().into_bytes().map_err(|e| eio(e.to_string()))?;
+    let optim_bytes = optim.to_record().into_bytes().map_err(|e| eio(e.to_string()))?;
+    let teacher_bytes = match teacher {
+        Some(t) => t.clone().into_record().into_bytes().map_err(|e| eio(e.to_string()))?,
+        None => Bytes::from_bytes_vec(Vec::new()),
+    };
+    let mut flags = 0u64;
+    if ortho_fp32 { flags |= CKPT_ORTHO_FP32; }
     std::fs::create_dir_all(dir)?;
     let tmp = dir.join(format!("{name}.bin.tmp.{}", std::process::id()));
     let f = std::fs::File::create(&tmp)?;
     let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
+    w.write_all(&CKPT_MAGIC)?;
     w.write_all(&step.to_le_bytes())?;
     w.write_all(&(model_bytes.len() as u64).to_le_bytes())?;
     w.write_all(&(optim_bytes.len() as u64).to_le_bytes())?;
+    w.write_all(&(teacher_bytes.len() as u64).to_le_bytes())?;
+    w.write_all(&flags.to_le_bytes())?;
     w.write_all(&model_bytes)?;
     w.write_all(&optim_bytes)?;
+    w.write_all(&teacher_bytes)?;
     w.flush()?;
     drop(w);
     std::fs::rename(&tmp, dir.join(format!("{name}.bin")))?;
@@ -443,14 +540,20 @@ pub fn save_ckpt(dir: &Path, name: &str, model: &DormouseModel, optim: &Optim, s
     Ok(())
 }
 
-pub fn load_ckpt(dir: &Path, name: &str, cfg: &DormouseConfig, model: &mut DormouseModel, optim: &mut Optim) -> Option<u64> {
+pub fn load_ckpt(
+    dir: &Path,
+    name: &str,
+    cfg: &DormouseConfig,
+    model: &mut DormouseModel,
+    optim: &mut Optim,
+) -> Option<Loaded> {
     // Try the live checkpoint, then the rotated one: a save written while the
     // allocator was failing is garbage, and silently starting from scratch (or
     // promoting the garbage to .prev on the next save) is how we lost a day
     // (review 2026-09-27).
     for cand in [format!("{name}.bin"), format!("{name}.prev.bin")] {
-        if let Some(step) = load_ckpt_file(dir, &cand, cfg, model, optim) {
-            return Some(step);
+        if let Some(l) = load_ckpt_file(dir, &cand, cfg, model, optim) {
+            return Some(l);
         }
         eprintln!("checkpoint {cand} unusable - trying the previous one");
     }
@@ -463,15 +566,13 @@ fn load_ckpt_file(
     cfg: &DormouseConfig,
     model: &mut DormouseModel,
     optim: &mut Optim,
-) -> Option<u64> {
+) -> Option<Loaded> {
     let raw = std::fs::read(dir.join(file)).ok()?;
-    if raw.len() < 24 { return None; }
-    let step = u64::from_le_bytes(raw[0..8].try_into().ok()?);
-    let mlen = u64::from_le_bytes(raw[8..16].try_into().ok()?) as usize;
-    let olen = u64::from_le_bytes(raw[16..24].try_into().ok()?) as usize;
-    if 24 + mlen + olen > raw.len() { return None; }
-    let mb = Bytes::from_bytes_vec(raw[24..24 + mlen].to_vec());
-    let ob = Bytes::from_bytes_vec(raw[24 + mlen..24 + mlen + olen].to_vec());
+    let h = parse_header(&raw)?;
+    let CkptHeader { step, model: mlen, optim: olen, teacher: tlen, flags, legacy, body } = h;
+    if body + mlen + olen + tlen > raw.len() { return None; }
+    let mb = Bytes::from_bytes_vec(raw[body..body + mlen].to_vec());
+    let ob = Bytes::from_bytes_vec(raw[body + mlen..body + mlen + olen].to_vec());
     let mrec = ModuleRecord::from_bytes(mb).ok()?;
     let orec = OptimizerRecord::from_bytes(ob).ok()?;
     let device = device();
@@ -489,7 +590,18 @@ fn load_ckpt_file(
         );
         return None;
     }
-    Some(step)
+    let teacher = if tlen > 0 {
+        let tb = Bytes::from_bytes_vec(raw[body + mlen + olen..body + mlen + olen + tlen].to_vec());
+        let trec = ModuleRecord::from_bytes(tb).ok()?;
+        // `no_grad()` after the load, always: the freeze is what keeps the
+        // teacher forward off the autodiff tape (a second full forward's
+        // activations - the step-0 OOM axis) and stops the EMA chain from
+        // accumulating param nodes. A record does not carry the flag.
+        Some(DormouseModel::new(cfg, &device).load_record(trec).no_grad())
+    } else {
+        None
+    };
+    Some(Loaded { step, teacher, ortho_fp32: flags & CKPT_ORTHO_FP32 != 0, legacy })
 }
 
 
@@ -502,17 +614,69 @@ fn build_model(
 ) -> (DormouseModel, burn_spectral::QuantFormat) {
     let mut model = DormouseModel::new(dorm_cfg, device);
     let qfmt = quant_format(device, cfg.quant.as_deref(), dorm_cfg.bf16);
+    apply_compute_settings(&mut model, qfmt, dorm_cfg.bf16, false);
+    (model, qfmt)
+}
+
+/// The forward-path settings a checkpoint does NOT carry: the factor-quant
+/// format, bf16 compute, and the latched fp32 fallback. They live in plain
+/// (non-param) fields, so `load_ckpt` - which rebuilds the model from `new()`
+/// and loads only the params - wipes them. A resumed run therefore trained the
+/// fp32 forward while its own log said "quant format: Fp8" (ADR-0021), and the
+/// same hole swallowed the one-way fallback. `ortho_fp32` wins: it is the
+/// latch the run committed to and can never undo.
+fn apply_compute_settings(
+    model: &mut DormouseModel,
+    qfmt: burn_spectral::QuantFormat,
+    bf16: bool,
+    ortho_fp32: bool,
+) {
     if qfmt != burn_spectral::QuantFormat::Fp32 {
         model.loop_block.set_quant_all(qfmt);
         println!("quant format: {qfmt:?} ({} bits)", qfmt.bits());
     }
-    // True bf16 compute: matmuls run on bf16 (tensor cores) through the
-    // custom autodiff op; the graph and backward stay fp32.
-    if dorm_cfg.bf16 {
+    if ortho_fp32 {
+        // True bf16 compute: matmuls run on bf16 (tensor cores) through the
+        // custom autodiff op; the graph and backward stay fp32.
+        println!("fp32 factor fallback: latched, factors run fp32");
+        model.set_quant_all(burn_spectral::QuantFormat::Fp32);
+        return;
+    }
+    if bf16 {
         model.set_bf16_compute(true);
         println!("bf16 compute: tensor-core matmuls, fp32 graph");
     }
-    (model, qfmt)
+}
+
+/// Write the host-RAM n-gram sidecar for `step`, atomically (tmp + rename).
+/// LOUD on every failure: this sidecar IS the whole n-gram state, and a
+/// `File::create` that failed used to leave a "saved" line over a sidecar
+/// that does not exist - a resumed run then starts with empty tables and no
+/// idea why (pretrain v21's death).
+///
+/// The sidecar carries no training-step stamp, so a crash between the model
+/// write and this one leaves a mismatched pair that nothing can detect
+/// (ADR-0021, "what remains"). It is written on EVERY model save, including
+/// the final one, so the window is the crash window and not the cadence.
+fn save_ngram(
+    dir: &Path,
+    name: &str,
+    host: Option<&offload::HostNgram>,
+    step: u64,
+) -> Result<(), String> {
+    let Some(h) = host else { return Ok(()) };
+    let path = dir.join(format!("{name}.ngram"));
+    let tmp = dir.join(format!("{name}.ngram.tmp.{}", std::process::id()));
+    let f = std::fs::File::create(&tmp)
+        .map_err(|e| format!("step {step}: ngram sidecar {}: {e}", tmp.display()))?;
+    let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
+    h.write_to(&mut w)
+        .map_err(|e| format!("step {step}: ngram sidecar write: {e}"))?;
+    std::io::Write::flush(&mut w)
+        .map_err(|e| format!("step {step}: ngram sidecar flush: {e}"))?;
+    std::fs::rename(&tmp, &path)
+        .map_err(|e| format!("step {step}: ngram sidecar rename: {e}"))?;
+    Ok(())
 }
 
 /// The EMA teacher exists only on the online JEPA path: with offline
@@ -639,24 +803,57 @@ pub fn train_loop(
     };
     let factors = if cfg.factors_fallback { " (expert TSCT factors on fallback)" } else { "" };
     println!("optimizer: {opt_name}{factors} [muon={} qk={} tables={} rest={}]", gc.muon, gc.qk, gc.tables, gc.rest);
-    let mut step = load_ckpt(&dir, &cfg.ckpt_name, &dorm_cfg, &mut model, &mut optim).unwrap_or(0);
+    let loaded = load_ckpt(&dir, &cfg.ckpt_name, &dorm_cfg, &mut model, &mut optim);
+    let mut step = loaded.as_ref().map(|l| l.step).unwrap_or(0);
     if step > 0 { println!("resumed {} from {} step {step}", cfg.ckpt_name, dir.display()); }
+    // The forward path is NOT in the record: re-apply it, or a resumed run
+    // silently trains the fp32 forward while the log above announced Fp8.
+    let saved_ortho = loaded.as_ref().is_some_and(|l| l.ortho_fp32);
+    apply_compute_settings(&mut model, qfmt, dorm_cfg.bf16, saved_ortho);
     // EMA teacher for the JEPA aux (momentum 0.0 at init = exact copy with
     // fresh grad-free params); advanced after every optimizer step below.
     // Offline mode (--jepa-targets) skips the teacher entirely: no second
     // forward, no EMA advance, none of its VRAM.
-    let mut teacher = ema_teacher_for(&cfg, &dorm_cfg, &model);
+    //
+    // RESTORED FROM THE CHECKPOINT, not rebuilt. A teacher that is a fresh
+    // copy of the student is a different regression target than the one the
+    // run accumulated momentum in, so the JEPA term changes from step 1 of
+    // the resumed run - two experiments wearing one step count (ADR-0021).
+    let saved_teacher = loaded.as_ref().and_then(|l| l.teacher.clone());
+    let legacy = loaded.as_ref().is_some_and(|l| l.legacy);
+    let mut teacher = match saved_teacher {
+        Some(t) => Some(t),
+        none => {
+            let t = ema_teacher_for(&cfg, &dorm_cfg, &model);
+            if t.is_some() && step > 0 {
+                eprintln!(
+                    "resume: the checkpoint carries NO EMA teacher ({} container) - the JEPA target restarts \
+                     from the student, so this run is NOT the run it continues",
+                    if legacy { "pre-ADR-0021" } else { "teacher-less" }
+                );
+            }
+            t
+        }
+    };
     let mut jepa_tgts = match &cfg.jepa_targets {
         Some(p) => Some(jepa_targets::JepaTargets::open(p, &device)?),
         None => None,
     };
+    // Batches a FRESH run consumes before step 0's forward: the two warmup /
+    // quant-check probes (each exactly one batch). A resume skips them (they
+    // are gated on step == 0), so the fast-forward has to include them or the
+    // run lands `pre` batches behind and re-trains on data it has seen
+    // (ADR-0021).
+    let pre_batches = cfg.warmup as u64
+        + (cfg.quant_check && qfmt != burn_spectral::QuantFormat::Fp32) as u64;
     let mut stream = dormouse_data::ByteStream::new(cfg.seq_len, cfg.batch, &data);
     if step > 0 {
         // Resume: fast-forward past bytes already trained on, or the stream
-        // rewinds to byte 0 and the run memorizes the corpus head.
-        let skip = (step as u64) * (cfg.batch * cfg.seq_len) as u64;
+        // rewinds to byte 0 and the model re-reads (and memorizes) the corpus
+        // head.
+        let skip = (step + pre_batches) * (cfg.batch * cfg.seq_len) as u64;
         stream.skip_bytes(skip);
-        println!("stream resume: skipped {skip} bytes (step {step})");
+        println!("stream resume: skipped {skip} bytes (step {step} + {pre_batches} pre-loop batch(es))");
     }
     let mut eval_stream =
         eval_data.as_ref().map(|p| dormouse_data::ByteStream::new(cfg.seq_len, cfg.batch, p));
@@ -761,10 +958,16 @@ pub fn train_loop(
     let (mut pbytes, mut phashes) = stream.next_batch();
     let mut         pshift: Vec<i64> = pbytes.iter().skip(1).chain(std::iter::once(&pbytes[0])).map(|&b| b as i64).collect();
     let mut ce = f32::NAN;
-    // One-way fp32 fallback state. With `--quant fp32` the forward is already
-    // exact — the monitor would have nothing to guard, so skip it entirely
-    // (it costs 30+ device syncs per check).
-    let mut ortho_fp32 = cfg.quant.as_deref() == Some("fp32");
+    // One-way fp32 fallback state, RESTORED from the checkpoint above: a run
+    // that latched it did so because its factors drifted, and re-running the
+    // quantized forward for even one step re-quantizes exactly the factors the
+    // latch was protecting (ADR-0021). With `--quant fp32` the forward is
+    // already exact — the monitor would have nothing to guard, so skip it
+    // entirely (it costs 30+ device syncs per check).
+    let mut ortho_fp32 = saved_ortho || cfg.quant.as_deref() == Some("fp32");
+    if saved_ortho && cfg.quant.as_deref() != Some("fp32") {
+        println!("fp32 factor fallback restored from the checkpoint (one-way, still latched)");
+    }
     // Non-finite losses seen at the last read, counted on the host. Device
     // arithmetic is not used for this: on the dispatch path both the
     // Bool->Float cast and `zeros_like().mask_fill(m, 1.0)` fed into `add`
@@ -779,6 +982,12 @@ pub fn train_loop(
     // non-finite loss VALUES we actually read, which is a lower bound.
     let mut masked_since_read = 0u32;
     let mut nan_reads = 0u32;
+    // The JEPA span mask is the only stochastic input to a step, and it is a
+    // pure function of `(cfg.seed, step)` — so a resume redraws the same mask
+    // the interrupted run used and two A/B arms differ only in the arm
+    // (ADR-0021). Before this, the mask came off burn's global RNG: never
+    // seeded, never repeated, and different on every run of the same config.
+    dormouse_core::aux::set_mask_stream(cfg.seed, step);
     while step < cfg.steps as u64 {
         let t_iter = std::time::Instant::now();
         let (bytes, hashes) = (std::mem::replace(&mut pbytes, Vec::new()), std::mem::replace(&mut phashes, Vec::new()));
@@ -1209,17 +1418,13 @@ pub fn train_loop(
             }
         }
         if cfg.ckpt_every > 0 && step % cfg.ckpt_every as u64 == 0 {
-            let _ = save_ckpt(&dir, &cfg.ckpt_name, &model, &optim, step, ce);
-            if let Some(h) = &host {
-                let path = dir.join(format!("{}.ngram", cfg.ckpt_name));
-                let tmp = dir.join(format!("{}.ngram.tmp.{}", cfg.ckpt_name, std::process::id()));
-                if let Ok(f) = std::fs::File::create(&tmp) {
-                    let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
-                    let _ = h.write_to(&mut w);
-                    let _ = std::io::Write::flush(&mut w);
-                    let _ = std::fs::rename(&tmp, &path);
-                }
-            }
+            // LOUD, not `let _ =` + an unconditional "saved" line: a failed
+            // save used to print "ckpt saved", keep training for hours and
+            // lose the run (ADR-0019). A run that cannot checkpoint must say
+            // so at the first failure.
+            save_ckpt(&dir, &cfg.ckpt_name, &model, &optim, teacher.as_ref(), ortho_fp32, step, ce)
+                .map_err(|e| format!("step {step}: checkpoint save failed: {e}"))?;
+            save_ngram(&dir, &cfg.ckpt_name, host.as_ref(), step)?;
             println!("ckpt {}.bin saved step {step}", cfg.ckpt_name);
         }
         // Returning pool pages forces the next steps to re-acquire them from
@@ -1231,8 +1436,14 @@ pub fn train_loop(
         step += 1;
     }
     // Final ckpt records the LAST ce (best is tracked in the logs; the .txt
-    // sidecar should describe this checkpoint's actual loss).
-    let _ = save_ckpt(&dir, &cfg.ckpt_name, &model, &optim, step, ce);
+    // sidecar should describe this checkpoint's actual loss). The ngram
+    // sidecar goes with it: it used to be written only on the `ckpt_every`
+    // cadence, so a finished run left model@final over tables@last-cadence
+    // and the next resume replayed up to ckpt_every steps of row updates on
+    // top of a model that had already trained on them (ADR-0021).
+    save_ckpt(&dir, &cfg.ckpt_name, &model, &optim, teacher.as_ref(), ortho_fp32, step, ce)
+        .map_err(|e| format!("final checkpoint save failed: {e}"))?;
+    save_ngram(&dir, &cfg.ckpt_name, host.as_ref(), step)?;
     println!("done steps={step} best ce={best:.3}");
     Ok(())
 }
@@ -1240,10 +1451,9 @@ pub fn train_loop(
 /// Load weights only (inference) from a named ckpt container.
 pub fn load_model_weights(dir: &Path, name: &str, cfg: DormouseConfig) -> Option<DormouseModel> {
     let raw = std::fs::read(dir.join(format!("{name}.bin"))).ok()?;
-    if raw.len() < 24 { return None; }
-    let mlen = u64::from_le_bytes(raw[8..16].try_into().ok()?) as usize;
-    if 24 + mlen > raw.len() { return None; }
-    let mb = Bytes::from_bytes_vec(raw[24..24 + mlen].to_vec());
+    let h = parse_header(&raw)?;
+    if h.body + h.model > raw.len() { return None; }
+    let mb = Bytes::from_bytes_vec(raw[h.body..h.body + h.model].to_vec());
     let mrec = ModuleRecord::from_bytes(mb).ok()?;
     let device = device();
     let model = DormouseModel::new(&cfg, &device);
@@ -1291,13 +1501,14 @@ mod tests {
         let optim = crate::optim::build_optim_mode(&optim_cfg, "mix");
         let dir = std::env::temp_dir().join("dm-ckpt-roundtrip-test");
         let _ = std::fs::remove_dir_all(&dir);
-        save_ckpt(&dir, "rt", &model, &optim, 42, 3.25).expect("save");
+        save_ckpt(&dir, "rt", &model, &optim, None, false, 42, 3.25).expect("save");
         let txt = std::fs::read_to_string(dir.join("rt.txt")).expect("sidecar");
         assert!(txt.contains("step 42 ce 3.250"), "sidecar: {txt}");
         let mut model2 = DormouseModel::new(&cfg, &device());
         let mut optim2 = crate::optim::build_optim_mode(&optim_cfg, "mix");
-        let step = load_ckpt(&dir, "rt", &cfg, &mut model2, &mut optim2).expect("load");
-        assert_eq!(step, 42);
+        let loaded = load_ckpt(&dir, "rt", &cfg, &mut model2, &mut optim2).expect("load");
+        assert_eq!(loaded.step, 42);
+        assert!(!loaded.legacy, "a container we just wrote is not legacy");
         // identical forward on the same batch
         let bytes: Vec<u8> = (0..128u32).map(|i| (i.wrapping_mul(37) % 256) as u8).collect();
         let mut hashes = Vec::with_capacity(128 * 3);
@@ -1312,6 +1523,90 @@ mod tests {
         let (l2, ..) = model2.forward_with_hidden::<Backend>(x, Some(h), None, None, None);
         let d = (l1 - l2).abs().max().into_scalar::<f32>();
         assert!(d < 1e-5, "reloaded model diverges: max |dlogit| = {d:.2e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-0021: the state the config CANNOT express must survive the
+    /// container - the EMA teacher and the latched fp32-factor fallback. Both
+    /// used to be rebuilt from the config on every resume, which is how a
+    /// resumed run became a different experiment wearing the same step count.
+    /// Asserted by construction: the teacher here is NOT a copy of the
+    /// student, so a restore that quietly re-derived it cannot pass.
+    #[test]
+    fn ckpt_carries_teacher_and_fallback_latch() {
+        let cfg = test_cfg();
+        let model = DormouseModel::new(&cfg, &device());
+        let optim_cfg = TrainCfg { steps: 5, seq_len: 64, batch: 2, ..Default::default() };
+        let optim = crate::optim::build_optim_mode(&optim_cfg, "mix");
+        // A teacher at distance from the student: every param + 1. A restore
+        // that re-derived the teacher from the student cannot pass.
+        struct Bump;
+        impl burn::module::ModuleMapper for Bump {
+            fn map_float<const D: usize>(
+                &mut self,
+                p: burn::module::Param<burn::tensor::Tensor<D>>,
+            ) -> burn::module::Param<burn::tensor::Tensor<D>> {
+                let (id, tensor, mapper) = p.consume();
+                burn::module::Param::from_mapped_value(id, tensor.add_scalar(1.0), mapper)
+            }
+        }
+        let teacher = model.clone().map(&mut Bump).no_grad();
+        let dir = std::env::temp_dir().join("dm-ckpt-teacher-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        save_ckpt(&dir, "st", &model, &optim, Some(&teacher), true, 11, 1.5).expect("save");
+
+        let mut m2 = DormouseModel::new(&cfg, &device());
+        let mut o2 = crate::optim::build_optim_mode(&optim_cfg, "mix");
+        let loaded = load_ckpt(&dir, "st", &cfg, &mut m2, &mut o2).expect("load");
+        assert!(loaded.ortho_fp32, "the one-way fp32 fallback must be persisted");
+        let t2 = loaded.teacher.expect("the EMA teacher must be in the container");
+        // Compared on a concrete param, not on "some forward agrees": the
+        // claim is that the teacher's VALUES came back.
+        let (a, b, c) = (
+            t2.embedding.weight.val().clone().into_data(),
+            teacher.embedding.weight.val().clone().into_data(),
+            model.embedding.weight.val().clone().into_data(),
+        );
+        let (a, b, c): (Vec<f32>, Vec<f32>, Vec<f32>) = (
+            a.try_to_vec().unwrap(),
+            b.try_to_vec().unwrap(),
+            c.try_to_vec().unwrap(),
+        );
+        assert_eq!(a, b, "the restored teacher must equal the saved one");
+        assert!(a != c, "the saved teacher must not be a copy of the student");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pre-ADR-0021 container (no magic, no teacher) must still LOAD - and
+    /// must say out loud that it carries no teacher, because a run that
+    /// silently rebuilt one is the bug this whole change is about. The legacy
+    /// path is exercised by rewriting the v2 header as the old 24-byte one.
+    #[test]
+    fn legacy_container_still_loads_and_is_flagged() {
+        let cfg = test_cfg();
+        let model = DormouseModel::new(&cfg, &device());
+        let optim_cfg = TrainCfg { steps: 5, seq_len: 64, batch: 2, ..Default::default() };
+        let optim = crate::optim::build_optim_mode(&optim_cfg, "mix");
+        let dir = std::env::temp_dir().join("dm-ckpt-legacy-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        save_ckpt(&dir, "lg", &model, &optim, None, false, 9, 2.0).expect("save");
+
+        // Rewrite [magic][step][mlen][olen][tlen][flags] as [step][mlen][olen].
+        let raw = std::fs::read(dir.join("lg.bin")).expect("read");
+        let u = |s: &[u8]| u64::from_le_bytes(s.try_into().unwrap());
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice(&u(&raw[8..16]).to_le_bytes());
+        legacy.extend_from_slice(&u(&raw[16..24]).to_le_bytes());
+        legacy.extend_from_slice(&u(&raw[24..32]).to_le_bytes());
+        legacy.extend_from_slice(&raw[CKPT_HEADER..]);
+        std::fs::write(dir.join("lg.bin"), &legacy).expect("rewrite");
+
+        let mut m2 = DormouseModel::new(&cfg, &device());
+        let mut o2 = crate::optim::build_optim_mode(&optim_cfg, "mix");
+        let loaded = load_ckpt(&dir, "lg", &cfg, &mut m2, &mut o2).expect("a legacy container must still load");
+        assert_eq!(loaded.step, 9);
+        assert!(loaded.legacy, "the reader must know it is reading a pre-ADR-0021 file");
+        assert!(loaded.teacher.is_none(), "a legacy file cannot carry a teacher");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
