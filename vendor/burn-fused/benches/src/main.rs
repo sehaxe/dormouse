@@ -123,44 +123,6 @@ fn main() {
         );
     }
 
-    // --- msa sparse attention (fused kernel, topk >= 4) ---
-    {
-        let (b, hq, hkv, s, d, topk, bs) = (1usize, 8, 2, 64, 16, 4, 8);
-        let nblocks = s / bs;
-        let q = Tensor::<4>::random([b, hq, s, d], Distribution::Normal(0.0, 1.0), &dev);
-        let k = Tensor::<4>::random([b, hkv, s, d], Distribution::Normal(0.0, 1.0), &dev);
-        let v = Tensor::<4>::random([b, hkv, s, d], Distribution::Normal(0.0, 1.0), &dev);
-        // Deterministic golden-ratio hash spreads the block indices over ALL
-        // nblocks uniformly. (The previous pattern `(i % topk) % nblocks`
-        // only ever touched the first `topk` blocks, biasing memory access
-        // locality versus a realistic routing distribution.)
-        let bi_data: Vec<i64> = (0..b * hkv * s * topk)
-            .map(|i| {
-                let h = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-                ((h >> 33) % nblocks as u64) as i64
-            })
-            .collect();
-        let bi = Tensor::<4, burn::tensor::Int>::from_data(
-            burn::tensor::TensorData::new(bi_data, [b, hkv, s, topk]),
-            &dev,
-        );
-        let fused = time(200, || {
-            let r = burn_msa::sparse_kernel::sparse_attn_cuda::<B>(
-                q.clone(),
-                k.clone(),
-                v.clone(),
-                bi.clone(),
-                (d as f64).sqrt(),
-                bs,
-                hkv,
-                hq,
-                false,
-            );
-            let _ = r.expect("fused path must trigger");
-        });
-        out.insert("msa_sparse.fused_ms".into(), fused.into());
-    }
-
     // --- muon-plus: column-row norm (in-place fused) ---
     {
         let (n, h) = (2048usize, 5120usize);

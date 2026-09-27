@@ -88,7 +88,7 @@ mod tests {
     fn nano_fused_file_parses() {
         let manifest = format!("{}/../../configs/nano-fused.toml", env!("CARGO_MANIFEST_DIR"));
         let c = load_config(&manifest).expect("configs/nano-fused.toml");
-        assert!(!c.use_msa && !c.use_kda && !c.use_engram);
+        assert!(!c.use_kda && !c.use_engram);
         assert_eq!(c.d_model, 512);
     }
     #[test]

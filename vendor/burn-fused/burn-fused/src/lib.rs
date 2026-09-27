@@ -30,7 +30,6 @@ pub use burn_kda;
 pub use burn_mhc;
 pub use burn_mod;
 pub use burn_mor;
-pub use burn_msa;
 pub use burn_mtp;
 pub use burn_muon_plus;
 pub use burn_nope;

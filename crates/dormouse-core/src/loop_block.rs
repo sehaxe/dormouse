@@ -1,4 +1,4 @@
-//! loop - mini UniversalLoop: controller + shared attention (KDA+MSA) +
+//! loop - mini UniversalLoop: controller + shared attention (KDA) +
 //! expert TSCT FFNs + Engram + e_k (iteration embedding) + ReZero residual
 //! scale. Fixed depth (ADR-0013): every iteration counts equally, the loss
 //! is an honest unweighted CE.
@@ -49,9 +49,6 @@ pub struct LoopBlock {
     #[module(skip)]
     pub n_experts: usize,
     #[module(skip)]
-    #[module(skip)]
-    pub use_msa: bool,
-    #[module(skip)]
     pub use_kda: bool,
     /// Random-depth arm (ADR-0013 rank 2): run only the first `n` iterations
     /// instead of `max_iter`, and average the readout and the CE over the
@@ -86,7 +83,6 @@ impl LoopBlock {
             f.down.set_bf16_compute(on);
         }
         self.out_proj.set_bf16_compute(on);
-        self.shared_attn.router.set_bf16_compute(on);
     }
 
     /// Polar-retract every TSCT factor U/V in the block (see LinearLike).
@@ -96,7 +92,6 @@ impl LoopBlock {
             f.down.retract(iters);
         }
         self.out_proj.retract(iters);
-        self.shared_attn.router.retract(iters);
     }
 
     /// Worst orthonormality error across all TSCT factors (syncs the device).
@@ -105,7 +100,7 @@ impl LoopBlock {
         for f in &self.expert_ffns {
             m = m.max(f.gate_up.max_ortho()).max(f.down.max_ortho());
         }
-        m.max(self.out_proj.max_ortho()).max(self.shared_attn.router.max_ortho())
+        m.max(self.out_proj.max_ortho())
     }
 
     pub fn new(cfg: &DormouseConfig, device: &Device) -> Self {
@@ -120,7 +115,7 @@ impl LoopBlock {
         let iter_embed = burn::module::Param::from_tensor(iter_embed.clone().into());
         Self {
             controller,
-            shared_attn: AdaptiveAttention::new(d, cfg.n_heads, cfg.head_dim, cfg.rank, cfg.msa_block, cfg.msa_topk, cfg.bf16, cfg.use_tsct, device),
+            shared_attn: AdaptiveAttention::new(d, cfg.n_heads, cfg.head_dim, device),
             expert_ffns: (0..cfg.n_experts).map(|_| ExpertFFN::new(d, f, cfg.rank, cfg.use_tsct, device)).collect(),
             engram: EngramModule::new(&[4096, 4096, 4096], 32, d, 1, device),
             norm: RMSNorm::new(d, cfg.norm_eps, device),
@@ -132,7 +127,6 @@ impl LoopBlock {
             d_model: d,
             ffn_hidden: f,
             n_experts: cfg.n_experts,
-            use_msa: cfg.use_msa,
             use_kda: cfg.use_kda,
             depth_override: None,
             use_engram: cfg.use_engram,
@@ -184,7 +178,6 @@ impl LoopBlock {
         let act_fmt: Option<(crate::act_quant::ActFormat, usize)> =
             self.act_quant.map(|q| (q.into(), self.act_group));
         let use_kda = self.use_kda;
-        let use_msa = self.use_msa;
         let use_engram = self.use_engram;
         // Random-depth arm (ADR-0013 rank 2): `depth_override` runs the first
         // n iterations only, and BOTH averages below divide by what actually
@@ -267,8 +260,8 @@ impl LoopBlock {
             let w_ffn = activation::sigmoid(raw.clone().slice([0..b * t, 2..3]));
             let blend = activation::softmax(raw.slice([0..b * t, 3..3 + self.n_experts]), 1);
 
-            // Shared attention (KDA + MSA). `normed` above is the block-body
-            // input: RMSNorm of h_ctx, identity under GR (the read already
+            // Shared attention. `normed` above is the block-body input:
+            // RMSNorm of h_ctx, identity under GR (the read already
             // normalized).
             let (gdn2_out, s_new) = if use_kda {
                 self.shared_attn.gdn2.forward_train_state::<B>(normed_attn.clone(), kda_s.take())
@@ -276,19 +269,7 @@ impl LoopBlock {
                 (Tensor::zeros([b, t, d], &h.device()), kda_s.take().unwrap_or_else(|| Tensor::zeros([b, 1, 1, 1], &h.device())))
             };
             kda_s = Some(s_new);
-            let msa_out = if use_msa && t > 1 && t >= self.shared_attn.block_size {
-                // burn-msa kernels are f32-only: a bf16 input makes them
-                // read the buffer as f32 (twice the bytes) and fault with
-                // CUDA_ERROR_ILLEGAL_ADDRESS (measured 2026-08-29).
-                self.shared_attn.msa.forward::<B>(normed_attn.clone()).output
-            } else {
-                Tensor::zeros([b, t, d], &h.device())
-            };
-            let attn = self
-                .shared_attn
-                .blend::<B>(normed_attn.clone(), gdn2_out, msa_out)
-                .reshape([b * t, d])
-                .mul(w_attn);
+            let attn = gdn2_out.reshape([b * t, d]).mul(w_attn);
 
             // Engram (FNV hashed ids) with memory weight
             let engram_a = if use_engram {

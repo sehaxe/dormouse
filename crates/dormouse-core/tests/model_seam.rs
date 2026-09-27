@@ -30,7 +30,7 @@ fn device() -> Device {
 }
 
 /// Nano's shape at a debug-build-friendly width: everything that defines
-/// the seam (loop iterations, expert count, aux weights, KDA+MSA+Engram
+/// the seam (loop iterations, expert count, aux weights, KDA+Engram
 /// arms, vocab 256) stays nano; only the widths shrink. use_gr stays false
 /// and bf16 stays off (CPU is fp32-only anyway).
 fn nano_cfg() -> DormouseConfig {
@@ -45,7 +45,6 @@ fn mini_nano() -> DormouseConfig {
         head_dim: 32,
         d_ffn: 256,
         rank: 32,
-        use_msa: false,
         ..nano_cfg()
     }
 }
@@ -243,10 +242,6 @@ fn kda_long_stability() {
 /// must receive a gradient (routing stays connected).
 ///
 /// Two documented exceptions - anything else missing fails the test:
-/// - `msa.index_branch.{q,k}_proj`: the top-k block selection is
-///   non-differentiable, so the indexer has no CE grad path by design (it
-///   trains via the MSA KL distill loss, which this interface does not
-///   return).
 /// - the two RMSNorm gains (`loop_block.norm.weight`, `norm.weight`):
 ///   burn-rmsnorm builds them with `Param::initialized(.., Tensor::ones)`
 ///   instead of `Param::from_tensor`, so the param inherits the tensor's
@@ -324,21 +319,9 @@ fn gradient_flow() {
         .filter(|(_, has, _)| !has)
         .map(|(p, _, _)| p.as_str())
         .collect();
-    // Documented grad-free params (see the test doc): the MSA indexer (no
-    // differentiable path) and the RMSNorm gains (burn-rmsnorm require_grad
-    // bug). Anything else missing is a regression.
-    // MSA params are structurally grad-free while the arm is off (ADR-0012:
-    // use_msa=false gates the forward; the module is still constructed).
-    const KNOWN_GRAD_FREE: &[&str] = &[
-        "loop_block.shared_attn.msa.index_branch.q_proj.weight",
-        "loop_block.shared_attn.msa.index_branch.k_proj.weight",
-        "loop_block.shared_attn.msa.attention.q_proj.weight",
-        "loop_block.shared_attn.msa.attention.k_proj.weight",
-        "loop_block.shared_attn.msa.attention.v_proj.weight",
-        "loop_block.shared_attn.msa.attention.out_proj.weight",
-        "loop_block.norm.weight",
-        "norm.weight",
-    ];
+    // Documented grad-free params (see the test doc): the RMSNorm gains
+    // (burn-rmsnorm require_grad bug). Anything else missing is a regression.
+    const KNOWN_GRAD_FREE: &[&str] = &["loop_block.norm.weight", "norm.weight"];
     let unexpected: Vec<&str> = missing
         .iter()
         .filter(|p| !KNOWN_GRAD_FREE.contains(p))
@@ -350,7 +333,7 @@ fn gradient_flow() {
         unexpected.len()
     );
     println!(
-        "gradient_flow: {} params grad-free (2 MSA indexer by design, 2 RMSNorm gains: burn-rmsnorm require_grad bug)",
+        "gradient_flow: {} params grad-free (2 RMSNorm gains: burn-rmsnorm require_grad bug)",
         missing.len()
     );
     let nonfinite: Vec<&str> = probe

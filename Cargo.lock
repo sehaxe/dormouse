@@ -1258,21 +1258,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "burn-msa"
-version = "0.2.4"
-dependencies = [
- "burn",
- "burn-autodiff",
- "burn-cubecl",
- "burn-cuda",
- "burn-nn",
- "burn-rope",
- "burn-tensor",
- "cubecl",
- "futures-lite",
-]
-
-[[package]]
 name = "burn-muon-plus"
 version = "0.1.0"
 dependencies = [
@@ -1371,14 +1356,6 @@ dependencies = [
  "burn-backend",
  "burn-cubecl",
  "cubecl",
-]
-
-[[package]]
-name = "burn-rope"
-version = "0.2.0"
-dependencies = [
- "burn",
- "burn-tensor",
 ]
 
 [[package]]
@@ -2860,12 +2837,13 @@ dependencies = [
  "burn-engram",
  "burn-jepa",
  "burn-kda",
- "burn-msa",
  "burn-ndarray",
  "burn-nn",
  "burn-rmsnorm",
  "burn-spectral",
  "burn-tensor",
+ "cudarc",
+ "half",
  "rand 0.8.8",
  "serde",
  "toml 0.8.23",

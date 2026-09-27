@@ -892,7 +892,6 @@ dependencies = [
  "burn-mhc",
  "burn-mod",
  "burn-mor",
- "burn-msa",
  "burn-mtp",
  "burn-muon-plus",
  "burn-nope",
@@ -918,7 +917,6 @@ dependencies = [
  "burn-gdn2",
  "burn-kda",
  "burn-mhc",
- "burn-msa",
  "burn-muon-plus",
  "burn-rope",
  "burn-sct",
@@ -1038,23 +1036,6 @@ dependencies = [
  "burn",
  "burn-ndarray",
  "burn-tensor",
-]
-
-[[package]]
-name = "burn-msa"
-version = "0.2.4"
-dependencies = [
- "burn",
- "burn-autodiff",
- "burn-cubecl",
- "burn-cuda",
- "burn-ndarray",
- "burn-nn",
- "burn-rope",
- "burn-tensor",
- "cubecl",
- "futures-lite",
- "serde",
 ]
 
 [[package]]
@@ -1263,7 +1244,6 @@ dependencies = [
  "burn-cubecl",
  "burn-cuda",
  "burn-kda",
- "burn-msa",
  "burn-muon-plus",
  "burn-ndarray",
  "burn-nn",

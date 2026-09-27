@@ -29,7 +29,6 @@ std = [
     "burn-mhc/std",
     "burn-mod/std",
     "burn-mor/std",
-    "burn-msa/std",
     "burn-mtp/std",
     "burn-muon-plus/std",
     "burn-nope/std",
@@ -57,8 +56,6 @@ cuda = [
     "burn-kda/autodiff",
     "burn-mhc/cuda",
     "burn-mhc/autodiff",
-    "burn-msa/cuda",
-    "burn-msa/autodiff",
     "burn-muon-plus/cuda",
     "burn-rmsnorm/cuda",
     "burn-rope/cuda",
@@ -88,7 +85,6 @@ burn-kda = { path = "../crates/burn-kda", default-features = false }
 burn-mhc = { path = "../crates/burn-mhc", default-features = false }
 burn-mod = { path = "../crates/burn-mod", default-features = false }
 burn-mor = { path = "../crates/burn-mor", default-features = false }
-burn-msa = { path = "../crates/burn-msa", default-features = false }
 burn-mtp = { path = "../crates/burn-mtp", default-features = false }
 burn-muon-plus = { path = "../crates/burn-muon-plus", default-features = false }
 burn-nope = { path = "../crates/burn-nope", default-features = false }

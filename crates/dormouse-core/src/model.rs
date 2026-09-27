@@ -289,11 +289,10 @@ impl DormouseModel {
     }
 
     /// Apply a quantization format to every TSCT factor in the model
-    /// (experts, readout/router projections, lm_head).
+    /// (experts, readout projections, lm_head).
     pub fn set_quant_all(&mut self, quant: burn_spectral::QuantFormat) {
         self.loop_block.set_quant_all(quant);
         self.loop_block.out_proj.set_quant(quant);
-        self.loop_block.shared_attn.router.set_quant(quant);
         self.lm_head.set_quant(quant);
     }
 

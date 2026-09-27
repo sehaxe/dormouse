@@ -31,7 +31,6 @@ fn mini_nano() -> DormouseConfig {
         head_dim: 32,
         d_ffn: 256,
         rank: 32,
-        msa_topk: 4,
         ..nano_cfg()
     }
 }

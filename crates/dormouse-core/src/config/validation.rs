@@ -6,8 +6,8 @@ pub fn validate(c: &DormouseConfig) -> Result<(), String> {
     }
     gt0!(c.d_model, "d_model"); gt0!(c.n_heads, "n_heads"); gt0!(c.head_dim, "head_dim");
     gt0!(c.d_ffn, "d_ffn"); gt0!(c.vocab, "vocab"); gt0!(c.max_seq_len, "max_seq_len");
-    gt0!(c.max_iter, "max_iter"); gt0!(c.rank, "rank"); gt0!(c.msa_topk, "msa_topk");
-    gt0!(c.msa_block, "msa_block"); gt0!(c.n_experts, "n_experts");
+    gt0!(c.max_iter, "max_iter"); gt0!(c.rank, "rank");
+    gt0!(c.n_experts, "n_experts");
     if c.norm_eps <= 0.0 { return Err("norm_eps must be >0".into()); }
     if c.jepa_weight < 0.0 || c.dspark_weight < 0.0 { return Err("jepa/dspark_weight >=0".into()); }
     if c.jepa_mask_frac < 0.0 || c.jepa_mask_frac > 1.0 { return Err("jepa_mask_frac 0..1".into()); }

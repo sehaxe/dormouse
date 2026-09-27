@@ -77,8 +77,6 @@ struct Args {
     #[arg(long)]
     no_kda: bool,
     #[arg(long)]
-    no_msa: bool,
-    #[arg(long)]
     no_engram: bool,
 
     // --- auxiliary objectives (helpers on top of CE) ---
@@ -200,7 +198,6 @@ fn build_run(a: &Args) -> Result<dormouse_train::RunCfg, String> {
     train.act_group = a.act_group.or(train.act_group);
     train.max_iter = a.max_iter.or(train.max_iter);
     train.no_kda |= a.no_kda;
-    train.no_msa |= a.no_msa;
     train.no_engram |= a.no_engram;
     train.jepa_weight = a.jepa_weight.or(train.jepa_weight);
     train.dspark_weight = a.dspark_weight.or(train.dspark_weight);

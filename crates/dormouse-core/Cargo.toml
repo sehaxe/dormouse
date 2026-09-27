@@ -10,7 +10,6 @@ burn-tensor = { version = "0.22.0-pre.4", default-features = false }
 burn-nn = { version = "0.22.0-pre.4", default-features = false }
 burn-cuda = { version = "0.22.0-pre.4", default-features = false, features = ["std", "autotune"] }
 burn-kda = { path = "../../vendor/burn-fused/crates/burn-kda" }
-burn-msa = { path = "../../vendor/burn-fused/crates/burn-msa" }
 burn-bitnet = { path = "../../vendor/burn-fused/crates/burn-bitnet" }
 burn-engram = { path = "../../vendor/burn-fused/crates/burn-engram" }
 burn-rmsnorm = { path = "../../vendor/burn-fused/crates/burn-rmsnorm" }
@@ -23,6 +22,10 @@ toml = "0.8"
 
 [dev-dependencies]
 burn-ndarray = { version = "0.22.0-pre.4", features = ["blas-openblas"] }
+# cublas_poc speaks raw CUDA driver + cuBLAS FFI. Pinned to the cudarc the
+# lock already resolved, so the probe cannot pull a second copy into the graph.
+cudarc = { version = "=0.19.9", default-features = false, features = ["std", "driver"] }
+half = { version = "2.7", default-features = false }
 
 [features]
 default = ["std"]
@@ -31,12 +34,15 @@ cuda = [
     "burn/cuda",
     "burn-kda/cuda",
     "burn-kda/autodiff",
-    "burn-msa/cuda",
-    "burn-msa/autodiff",
     "burn-spectral/cuda",
     "burn-rmsnorm/cuda",
 ]
-# CUDA-only probe: burn-cuda types exist only with the cuda feature.
+# CUDA-only probes: burn-cuda types and a CUDA context exist only with the
+# cuda feature.
 [[example]]
 name = "quant_probe"
+required-features = ["cuda"]
+
+[[example]]
+name = "cublas_poc"
 required-features = ["cuda"]

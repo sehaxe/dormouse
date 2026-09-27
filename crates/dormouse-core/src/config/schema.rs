@@ -63,10 +63,7 @@ fn d_max_seq_len() -> usize { 512 }
 fn d_max_iter() -> usize { 4 }
 fn d_rank() -> usize { 64 }
 fn d_norm_eps() -> f32 { 0.001 }
-fn d_msa_topk() -> usize { 8 }
-fn d_msa_block() -> usize { 32 }
 fn d_true() -> bool { true }
-fn d_false() -> bool { false }
 fn d_n_experts() -> usize { 3 }
 fn d_jepa_weight() -> f32 { 0.05 }
 fn d_jepa_mask_frac() -> f32 { 0.15 }
@@ -89,9 +86,6 @@ pub struct DormouseConfig {
     #[serde(default = "d_max_iter")] pub max_iter: usize,
     #[serde(default = "d_rank")] pub rank: usize,
     #[serde(default = "d_norm_eps")] pub norm_eps: f32,
-    #[serde(default = "d_msa_topk")] pub msa_topk: usize,
-    #[serde(default = "d_msa_block")] pub msa_block: usize,
-    #[serde(default = "d_false")] pub use_msa: bool,
     #[serde(default = "d_true")] pub use_kda: bool,
     /// Spectral (low-rank TSCT) linears vs plain dense ones. The spectral
     /// path is what makes the FFN 2048-wide on 7.5M params; turning it off

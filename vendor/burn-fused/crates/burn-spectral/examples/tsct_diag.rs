@@ -2,11 +2,8 @@
 //! char-level task, dense vs SpectralLinear vs SpectralMoE, same params budget.
 // burn-ndarray is deprecated upstream; kept as the CPU test backend until the burn-flex migration.
 #![allow(deprecated)]
-//! Attention is swappable via ATTN=dense|kda|msa|hybrid|hybrid_naive (dense
-//! MHA+RoPE is the default baseline; kda = burn-kda linear attention, msa =
-//! burn-msa block-sparse, hybrid = gated MoD blend: KDA always runs, MSA only
-//! on the top-ATTN_BUDGET tokens per row via a learned gumbel-topk gate,
-//! hybrid_naive = plain sum of both - see AttnImpl).
+//! Attention is swappable via ATTN=dense|kda (dense MHA+RoPE is the default
+//! baseline; kda = burn-kda linear attention - see AttnImpl).
 //!
 //! Run: cargo run -p burn-tsct --example tsct_diag
 use burn::backend::{Backend, DispatchKindConversion};
@@ -15,7 +12,6 @@ use burn::nn::{Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig, Linear, L
 use burn::tensor::DispatchTensor;
 use burn::tensor::{activation, Bool, Device, Distribution, Int, Tensor};
 use burn_kda::{KdaConfig, KdaModule};
-use burn_msa::{MsaConfig, MsaModule};
 use burn_muon_plus::{MuonPlusConfig, NormDir};
 use burn_optim::lr_scheduler::module_lr_scheduler::{ModuleLrScheduler, ModuleLrSchedulerConfig};
 use burn_optim::GradientsParams;
@@ -787,66 +783,11 @@ impl Attention {
 }
 
 /// Attention implementation per the ATTN knob: dense MHA+RoPE (baseline,
-/// byte-identical to the pre-knob harness), burn-kda linear attention,
-/// burn-msa block-sparse, or a gated blend of both. The gated hybrid is the
-/// Mixture-of-Depths mechanism applied to attention (same philosophy as
-/// aria's controller: the model decides when the expensive branch is worth
-/// it): KDA always runs, MSA only on the top-k tokens per batch row, where
-/// k = max(1, ceil(ATTN_BUDGET * T)) and the gate is a per-layer learned
-/// Linear(d, 1) on the (already pre-normed) attention input. The top-k
-/// selection is non-differentiable, so the gate is trained with gumbel-topk
-/// STE: noisy scores s = (g + gumbel_noise) / ATTN_GATE_TEMP, hard mask =
-/// one_hot(topk(s)), and the msa multiplier blends hard (forward) with the
-/// gumbel-sigmoid relaxation (backward), so the gate gets gradient from the
-/// selected tokens' msa loss and msa weights train only on selected tokens.
+/// byte-identical to the pre-knob harness) or burn-kda linear attention.
 #[derive(Module, Debug)]
 enum AttnImpl {
     Dense(Attention),
     Kda(KdaModule),
-    Msa(MsaModule),
-    Hybrid(HybridAttn),
-    HybridNaive(HybridAttn),
-}
-
-/// Learned gate: one score per token from the pre-normed attention input.
-#[derive(Module, Debug)]
-struct AttnGate {
-    proj: Linear,
-}
-
-/// kda + msa pair (burn's Module derive needs single-field tuple variants).
-/// `gate` is only used by the gated hybrid; hybrid_naive reuses the struct
-/// with the gate ignored (kept so both modes share the pair construction).
-#[derive(Module, Debug)]
-struct HybridAttn {
-    kda: KdaModule,
-    msa: MsaModule,
-    gate: AttnGate,
-}
-
-/// ATTN_BUDGET: fraction of tokens per batch row MSA may touch (default
-/// 0.25, clamped to (0, 1]). The budgeted FLOPs print uses k/T exactly.
-fn attn_budget() -> f32 {
-    std::env::var("ATTN_BUDGET")
-        .ok()
-        .and_then(|v| v.parse::<f32>().ok())
-        .unwrap_or(0.25)
-        .clamp(f32::MIN_POSITIVE, 1.0)
-}
-
-/// ATTN_GATE_TEMP: gumbel-sigmoid temperature (default 1.0; lower = sharper
-/// soft mask, higher = more exploration).
-fn attn_gate_temp() -> f32 {
-    std::env::var("ATTN_GATE_TEMP")
-        .ok()
-        .and_then(|v| v.parse::<f32>().ok())
-        .unwrap_or(1.0)
-        .max(f32::MIN_POSITIVE)
-}
-
-/// Exact token budget per batch row: k = max(1, ceil(budget * T)).
-fn attn_budget_k(t: usize) -> usize {
-    (attn_budget() * t as f32).ceil().max(1.0) as usize
 }
 
 fn kda_module(d: usize, device: &Device) -> KdaModule {
@@ -862,63 +803,12 @@ fn kda_module(d: usize, device: &Device) -> KdaModule {
     KdaModule::new(&cfg, 0.0, device)
 }
 
-fn msa_module(d: usize, seq: usize, device: &Device) -> MsaModule {
-    // Aria-style: 1 KV head (GQA), causal masked; KL alignment off (the
-    // harness has its own loss). Block/topk overridable via ATTN_BLOCK /
-    // ATTN_TOPK; defaults are MsaConfig's (128/16), so at
-    // seq <= topk*block MSA degenerates to full attention and the FLOPs
-    // print shows it. burn-msa's causal mask broadcasts block indices over
-    // the full scores matrix, so block must divide seq.
-    let block = std::env::var("ATTN_BLOCK")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(128)
-        .min(seq);
-    assert!(
-        block >= 1,
-        "ATTN_BLOCK={block} must be >= 1 (seq % block is div-by-zero otherwise)"
-    );
-    assert!(
-        seq.is_multiple_of(block),
-        "ATTN_BLOCK={block} must divide SEQ={seq} (attended blocks would exceed the causal mask)"
-    );
-    let mut topk = std::env::var("ATTN_TOPK")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(16);
-    assert!(topk >= 1, "ATTN_TOPK={topk} must be >= 1");
-    // attended = topk * block must stay <= seq (the causal mask is [.., seq]).
-    if topk > seq / block {
-        println!(
-            "note: ATTN_TOPK {topk} > SEQ/ATTN_BLOCK {}; clamped to {} so attended <= seq",
-            seq / block,
-            seq / block
-        );
-        topk = seq / block;
-    }
-    let mut cfg = MsaConfig::new(d, N_HEADS, 1, d / N_HEADS, 64);
-    cfg.block_size = block;
-    cfg.topk = topk;
-    cfg.use_kl_loss = false;
-    MsaModule::new(&cfg, device)
-}
-
 impl AttnImpl {
-    fn new(mode: &str, d: usize, seq: usize, device: &Device) -> Self {
-        let pair = || HybridAttn {
-            kda: kda_module(d, device),
-            msa: msa_module(d, seq, device),
-            gate: AttnGate {
-                proj: LinearConfig::new(d, 1).init(device),
-            },
-        };
+    fn new(mode: &str, d: usize, _seq: usize, device: &Device) -> Self {
         match mode {
             "dense" => AttnImpl::Dense(Attention::new(d, device)),
             "kda" => AttnImpl::Kda(kda_module(d, device)),
-            "msa" => AttnImpl::Msa(msa_module(d, seq, device)),
-            "hybrid" => AttnImpl::Hybrid(pair()),
-            "hybrid_naive" => AttnImpl::HybridNaive(pair()),
-            other => panic!("ATTN must be dense|kda|msa|hybrid|hybrid_naive, got {other}"),
+            other => panic!("ATTN must be dense|kda, got {other}"),
         }
     }
 
@@ -932,46 +822,8 @@ impl AttnImpl {
             // grads under AdamW (delta-rule solve); the fused node has an
             // exact matrix-level backward (burn-gdn2 autodiff.rs)
             AttnImpl::Kda(k) => k.forward_train_fused::<burn_autodiff::Autodiff<SctBackend>>(x),
-            AttnImpl::Msa(m) => m.forward::<B>(x).output,
-            AttnImpl::Hybrid(h) => gated_hybrid::<B>(h, x),
-            AttnImpl::HybridNaive(h) => h
-                .kda
-                .forward_train_fused::<burn_autodiff::Autodiff<SctBackend>>(x.clone())
-                .add(h.msa.forward::<B>(x).output),
         }
     }
-}
-
-/// Gated MoD blend: KDA always runs; MSA is computed everywhere but its
-/// output is zeroed outside the top-k token budget, with gumbel-topk STE
-/// (forward = hard mask, backward = gumbel-sigmoid) so the gate learns from
-/// the selected tokens' msa gradient. ponytail: msa(x) still computes all
-/// tokens; a fused masked kernel (T2.x) will skip unselected rows, making
-/// the real cost match the budgeted FLOPs print.
-fn gated_hybrid<B: Backend>(h: &HybridAttn, x: Tensor<3>) -> Tensor<3>
-where
-    DispatchTensor: DispatchKindConversion<B>,
-{
-    let [b, t, d] = x.dims();
-    let k = attn_budget_k(t);
-    // gate scores from the (already pre-normed) attention input
-    let g = h.gate.proj.forward(x.clone()).squeeze_dim::<2>(2); // [B, T]
-                                                                // gumbel noise, same -log(-log u) construction as generate()
-    let u = Tensor::<2>::random([b, t], Distribution::Uniform(0.0, 1.0), &x.device())
-        .clamp(f32::MIN_POSITIVE, 1.0);
-    let noise = u.log().neg().log().neg();
-    let s = g.add(noise).div_scalar(attn_gate_temp()); // [B, T] noisy scores
-                                                       // hard mask: exactly k selected tokens per row, constant w.r.t. g
-    let (_vals, idx) = s.clone().topk_with_indices(k, 1); // [B, k] Int
-    let hard = idx.float().one_hot::<3>(t).sum_dim(1).squeeze_dim::<2>(1); // [B, T] {0,1}
-                                                                           // gumbel-sigmoid relaxation on selected tokens: the gate's gradient
-                                                                           // flows through soft; the STE blend keeps the forward value = hard mask
-    let soft = activation::sigmoid(s).mul(hard.clone());
-    let w = soft.clone().add(hard.sub(soft).detach());
-    let msa_out = h.msa.forward::<B>(x.clone()).output; // [B, T, d]
-    h.kda
-        .forward_train_fused::<burn_autodiff::Autodiff<SctBackend>>(x)
-        .add(msa_out.mul(w.reshape([b, t, 1]).expand([b, t, d])))
 }
 
 // Attention MACs per token per layer, counted from the actual ops:
@@ -981,19 +833,6 @@ where
 //           decode-loop state ops ~5*NH*hd*hd per token (decay apply,
 //           erase k^T S + outer, write k v^T, read q^T S) - counted from
 //           KdaModule::forward(update_state=true)
-//   msa:    q proj d*d; k,v proj 2*d*(n_kv*hd) (GQA); out proj d*d;
-//           index branch q_idx d*n_kv*d_idx + k_idx d*d_idx + block scores
-//           n_kv*seq*d_idx; real attn 2*NH*hd*attended with
-//           attended = min(topk, seq/block)*block. NOTE: under autodiff the
-//           tensor fallback runs — burn-msa is a path dep here without its
-//           cuda feature (Cargo.toml), so the fused topk kernel never
-//           compiles — and computes full seq^2 scores + mask, so the topk
-//           term is the fused-kernel ceiling, not what this harness runs.
-//   hybrid: executed = kda + msa (the gate masks the msa OUTPUT only; the
-//           per-token q/k/v/o proj + index branch still run on all tokens);
-//           ideal-budgeted = kda + msa_fixed + (k/T)*attended, the ceiling
-//           of a fused masked kernel (k/T exact, k = ATTN_BUDGET top-k)
-//   hybrid_naive: kda + msa
 fn dense_attn_flops(d: usize, seq: usize) -> usize {
     4 * d * d + 2 * N_HEADS * (d / N_HEADS) * seq
 }
@@ -1002,54 +841,11 @@ fn kda_attn_flops(k: &KdaModule, d: usize) -> usize {
     let hd = k.head_dim;
     5 * d * d + 2 * d * hd + d * h + 5 * h * hd * hd
 }
-/// (fixed, attended) msa MACs per token per layer: everything except the
-/// real-attn term is per-token; attended scales with the tokens touched.
-fn msa_attn_flops_split(m: &MsaModule, seq: usize) -> (usize, usize) {
-    let c = &m.cfg;
-    let attended = c.topk.min(seq.div_ceil(c.block_size)) * c.block_size;
-    let fixed = c.d_model * c.d_model
-        + 2 * c.d_model * (c.n_heads_kv * c.d_head)
-        + c.d_model * c.d_model
-        + c.d_model * c.n_heads_kv * c.d_idx
-        + c.d_model * c.d_idx
-        + c.n_heads_kv * seq * c.d_idx;
-    (fixed, 2 * c.n_heads_q * c.d_head * attended)
-}
-fn msa_attn_flops(m: &MsaModule, seq: usize) -> usize {
-    let (fixed, attended) = msa_attn_flops_split(m, seq);
-    fixed + attended
-}
-/// (executed, ideal) MACs per token per layer. Executed is what the harness
-/// runs; ideal is the fused masked-kernel ceiling (only differs for hybrid).
-fn attn_flops(mode: &AttnImpl, d: usize, seq: usize) -> (usize, usize) {
+/// MACs per token per layer for the layer's attention impl.
+fn attn_flops(mode: &AttnImpl, d: usize, seq: usize) -> usize {
     match mode {
-        AttnImpl::Dense(_) => {
-            let f = dense_attn_flops(d, seq);
-            (f, f)
-        }
-        AttnImpl::Kda(k) => {
-            let f = kda_attn_flops(k, d);
-            (f, f)
-        }
-        AttnImpl::Msa(m) => {
-            let f = msa_attn_flops(m, seq);
-            (f, f)
-        }
-        AttnImpl::Hybrid(h) => {
-            // budgeted-ideal: only k/T of the attended term counts (exact
-            // top-k); the fixed part still runs on every token
-            let k = attn_budget_k(seq);
-            let (msa_fixed, msa_attended) = msa_attn_flops_split(&h.msa, seq);
-            let kda = kda_attn_flops(&h.kda, d);
-            (
-                kda + msa_fixed + msa_attended,
-                kda + msa_fixed + msa_attended * k / seq,
-            )
-        }
-        AttnImpl::HybridNaive(h) => {
-            let f = kda_attn_flops(&h.kda, d) + msa_attn_flops(&h.msa, seq);
-            (f, f)
-        }
+        AttnImpl::Dense(_) => dense_attn_flops(d, seq),
+        AttnImpl::Kda(k) => kda_attn_flops(k, d),
     }
 }
 
@@ -1258,8 +1054,8 @@ fn train(kind: &str, steps: usize, lr: f64) -> (f32, f32) {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(D);
-    // ATTN knob: dense (default) | kda | msa | hybrid - swaps the attention
-    // implementation of every layer (see AttnImpl)
+    // ATTN knob: dense (default) | kda - swaps the attention implementation
+    // of every layer (see AttnImpl)
     let attn_mode = std::env::var("ATTN").unwrap_or_else(|_| "dense".into());
     // TRAIN_FILE/VAL_FILE: true holdout corpora (any text file; 63-char
     // set). Default mid-scale val source: /mnt/e43497ab-0ff2-45b4-b45f-28de3339a53e/datasets/wikipedia/books_00495.txt (6.3MB, exists).
@@ -1372,23 +1168,14 @@ fn train(kind: &str, steps: usize, lr: f64) -> (f32, f32) {
             topk_per_step += m.topk_cost(rows);
         }
     }
-    // attention cost per mode (see attn_flops for the counted formulas):
-    // executed is what the harness runs; ideal-budgeted is the fused
-    // masked-kernel ceiling (hybrid: the gate masks the msa output only)
-    let (attn_flops, attn_ideal) = model
+    // attention cost per mode (see attn_flops for the counted formulas)
+    let attn_flops = model
         .attns
         .iter()
         .map(|a| attn_flops(a, d, seq))
-        .fold((0, 0), |(x, y), (ex, id)| (x + ex, y + id));
+        .sum::<usize>();
     flops_token += attn_flops;
-    let attn_note = if attn_mode == "hybrid" {
-        format!(
-            "attn=hybrid executed={attn_flops} (ideal-budgeted={attn_ideal}, gate k/T={:.2}) MACs/token",
-            attn_budget_k(seq) as f64 / seq as f64
-        )
-    } else {
-        format!("attn={attn_mode} {attn_flops} MACs/token")
-    };
+    let attn_note = format!("attn={attn_mode} {attn_flops} MACs/token");
     println!(
         "  {kind}: FLOPs/step = {} MACs ({} MACs/token over {} layers x {} tokens/step, {attn_note}){}",
         flops_token * rows + topk_per_step,
@@ -1885,77 +1672,12 @@ mod tests {
         let _g = lock_rng();
         // autodiff device: the kda arm runs the fused autodiff op
         let d = Device::ndarray().autodiff();
-        for mode in ["kda", "msa", "hybrid", "hybrid_naive"] {
+        for mode in ["dense", "kda"] {
             let model = MiniGPT::new_with_dim("dense", D, mode, SEQ, &d);
             let ids = Tensor::<2, Int>::zeros([1, SEQ], &d);
             let out = model.forward::<SctBackend>(ids);
             assert_eq!(out.dims(), [1, SEQ, VOCAB]);
         }
-    }
-
-    #[test]
-    fn hybrid_gate_gets_gradient() {
-        // the gumbel-topk STE must give the gate real gradient signal;
-        // with a hard-only mask the gate would never learn which tokens
-        // MSA helps (no gradient would reach the gate proj weight)
-        let _g = lock_rng();
-        let d = Device::ndarray().autodiff();
-        let model = MiniGPT::new_with_dim("dense", D, "hybrid", SEQ, &d);
-        let ids = Tensor::<2, Int>::zeros([1, SEQ], &d);
-        let logits = model.forward::<SctBackend>(ids);
-        let grads = GradientsParams::from_grads(logits.sum().backward(), &model);
-        let AttnImpl::Hybrid(h) = &model.attns[0] else {
-            panic!("hybrid mode must build the gated pair");
-        };
-        let g: f32 = grads
-            .get::<2>(h.gate.proj.weight.id)
-            .expect("gate proj weight must receive a gradient")
-            .abs()
-            .mean()
-            .into_scalar();
-        assert!(
-            g > 0.0 && g.is_finite(),
-            "gate gradient must be nonzero, got {g}"
-        );
-    }
-
-    #[test]
-    fn hybrid_flops_honest_split() {
-        // D=64, SEQ=32 hand-check: kda 27,904 + msa 24,576 (fixed 20,480 +
-        // attended 4,096) per layer; k/T = ceil(0.25*32)/32 = 8/32.
-        let _g = lock_rng();
-        std::env::set_var("ATTN_BUDGET", "0.25");
-        let d = Device::ndarray();
-        let msa = msa_module(64, 32, &d);
-        let (fixed, attended) = msa_attn_flops_split(&msa, 32);
-        assert_eq!((fixed, attended), (20_480, 4_096));
-        assert_eq!(msa_attn_flops(&msa, 32), 24_576);
-        assert_eq!(kda_attn_flops(&kda_module(64, &d), 64), 27_904);
-        let (exec, ideal) = attn_flops(
-            &AttnImpl::Hybrid(HybridAttn {
-                kda: kda_module(64, &d),
-                msa,
-                gate: AttnGate {
-                    proj: LinearConfig::new(64, 1).init(&d),
-                },
-            }),
-            64,
-            32,
-        );
-        assert_eq!((exec, ideal), (52_480, 49_408));
-        // ideal can never exceed executed for a budget <= 1
-        let (exec_naive, ideal_naive) = attn_flops(
-            &AttnImpl::HybridNaive(HybridAttn {
-                kda: kda_module(64, &d),
-                msa: msa_module(64, 32, &d),
-                gate: AttnGate {
-                    proj: LinearConfig::new(64, 1).init(&d),
-                },
-            }),
-            64,
-            32,
-        );
-        assert_eq!((exec_naive, ideal_naive), (52_480, 52_480));
     }
 
     #[test]
@@ -1995,7 +1717,7 @@ mod tests {
             "attns.0.o.weight",
             "attns.0.gate.proj.weight",
             "attns.0.kda.q_proj.weight",
-            "attns.1.msa.q_proj.weight",
+            "attns.1.kda.v_proj.weight",
             "lns.0.weight",
             "lns.0.bias",
             "ln.weight",

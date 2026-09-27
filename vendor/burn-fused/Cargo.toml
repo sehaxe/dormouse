@@ -6,7 +6,6 @@ members = [
     "crates/burn-gdn2",
     "crates/burn-kda",
     "crates/burn-mhc",
-    "crates/burn-msa",
     "crates/burn-muon-plus",
     "crates/burn-rope",
     "crates/burn-sct",

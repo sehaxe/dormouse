@@ -1,36 +1,19 @@
-//! attention - KDA (burn-kda) + MSA (burn-msa) with learned router blend
-use crate::param::LinearLike;
-use burn::backend::DispatchKindConversion;
-use burn::module::Module;
-use burn::tensor::{activation, Device, DispatchTensor, FloatDType, Tensor};
+//! attention - KDA (burn-kda), the only attention arm.
+//!
+//! The MSA (block-sparse top-k) arm was cut with its crate (ADR-0014): broken
+//! on the pre.4 stack and off in every preset since ADR-0012. The wrapper
+//! struct stays for one reason only - it keeps the checkpoint param prefix
+//! `loop_block.shared_attn.gdn2.*` stable across the cut.
+use burn::tensor::Device;
 use burn_kda::KdaModule;
-use burn_msa::{MsaConfig, MsaModule};
 
-#[derive(Module, Debug)]
+#[derive(Debug, burn::module::Module)]
 pub struct AdaptiveAttention {
     pub gdn2: KdaModule,
-    pub msa: MsaModule,
-    pub router: LinearLike,
-    #[module(skip)]
-    pub d_model: usize,
-    #[module(skip)]
-    pub block_size: usize,
-    #[module(skip)]
-    pub bf16: bool,
 }
 
 impl AdaptiveAttention {
-    pub fn new(
-        d_model: usize,
-        n_heads: usize,
-        head_dim: usize,
-        rank: usize,
-        msa_block: usize,
-        msa_topk: usize,
-        bf16: bool,
-        use_tsct: bool,
-        device: &Device,
-    ) -> Self {
+    pub fn new(d_model: usize, n_heads: usize, head_dim: usize, device: &Device) -> Self {
         let kda_cfg = burn_kda::KdaConfig {
             hidden_size: d_model,
             num_heads: n_heads,
@@ -43,38 +26,8 @@ impl AdaptiveAttention {
             chunk_size: 16,
             ..Default::default()
         };
-        let n_kv = (n_heads / 4).max(1);
-        let mut msa_cfg = MsaConfig::new(d_model, n_heads, n_kv, head_dim, 64);
-        msa_cfg.block_size = msa_block;
-        msa_cfg.topk = msa_topk;
-        // gradient_detach leaks autodiff nodes (~72 tensors/step on pre.3):
-        // the detached index branch keeps its nodes alive after backward.
-        // False = index branch trains (small extra cost), no leak.
-        msa_cfg.gradient_detach = false;
         Self {
             gdn2: KdaModule::new(&kda_cfg, 0.0, device),
-            msa: MsaModule::new(&msa_cfg, device),
-            router: LinearLike::with_tsct(d_model, 1, rank.min(d_model).min(1), use_tsct, device),
-            d_model,
-            block_size: msa_block,
-            bf16,
         }
-    }
-
-    pub fn blend<B: burn::backend::AutodiffBackend>(&self, x: Tensor<3>, gdn2_out: Tensor<3>, msa_out: Tensor<3>) -> Tensor<3>
-    where
-        DispatchTensor: DispatchKindConversion<B>
-            + DispatchKindConversion<B::InnerBackend>
-            + DispatchKindConversion<burn::backend::Autodiff<B::InnerBackend>>,
-    {
-        let [b, t, d] = x.dims();
-        let route = self.router.forward::<B>(x.reshape([b * t, d]));
-        let route = if self.bf16 {
-            route.cast(FloatDType::F32)
-        } else {
-            route
-        };
-        let gate = activation::sigmoid(route.reshape([b, t, 1]));
-        gdn2_out.mul(gate.clone()) + msa_out.mul(gate.neg().add_scalar(1.0))
     }
 }

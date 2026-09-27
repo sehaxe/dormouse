@@ -112,9 +112,8 @@ pub struct TrainCfg {
     pub act_quant: Option<ActQuant>,
     pub act_group: Option<usize>,
     pub max_iter: Option<usize>,
-    /// Disable a model arm for A/B (KDA / MSA / Engram).
+    /// Disable a model arm for A/B (KDA / Engram).
     pub no_kda: bool,
-    pub no_msa: bool,
     pub no_engram: bool,
     /// Auxiliary-loss weight overrides; None keeps the preset value.
     pub jepa_weight: Option<f32>,
@@ -142,12 +141,13 @@ impl Default for TrainCfg {
             opt: "mix".into(), quant: None, factors_fallback: false,
             rand_depth: false,
             eval_batches: 20,
+            eval_depths: false,
             retract_every: 1, retract_iters: 3,
             stress: false, stress_lr: 1.0, stress_every: 50,
             engram_ram: false, engram_slots: 1_000_000, host_adam_every: 1,
             warmup: true, quant_check: false, timers: false, memlog: false,
             bf16: None, act_quant: None, act_group: None, max_iter: None,
-            no_kda: false, no_msa: false, no_engram: false,
+            no_kda: false, no_engram: false,
             jepa_weight: None, dspark_weight: None, dspark_k: None,
             qk_heads: None, jepa_targets: None,
         }
@@ -1173,25 +1173,17 @@ mod tests {
         // [d,d] projections and dense linears stay on the fallback while the
         // fp32 NS cost is prohibitive.
         assert!(!is_muon_param("loop_block.shared_attn.gdn2.q_proj.weight"));
-        assert!(!is_muon_param("loop_block.shared_attn.msa.attention.out_proj.weight"));
         assert!(!is_muon_param("loop_block.engram.value_proj.weight"));
-        // Attention Q/K go to the head-wise Muon groups instead (not the
+        // Attention Q/K go to the head-wise Muon group instead (not the
         // plain Muon+ marker list).
         assert!(crate::optim::is_qk_param("loop_block.shared_attn.gdn2.q_proj.weight"));
         assert!(crate::optim::is_qk_param("loop_block.shared_attn.gdn2.k_proj.weight"));
-        assert!(crate::optim::is_qk_param("loop_block.shared_attn.msa.attention.q_proj.weight"));
-        assert!(crate::optim::is_qk_param("loop_block.shared_attn.msa.attention.k_proj.weight"));
         assert!(!crate::optim::is_qk_param("loop_block.shared_attn.gdn2.v_proj.weight"));
-        assert!(!crate::optim::is_qk_param("loop_block.shared_attn.msa.attention.out_proj.weight"));
-        // The MQA indexer stays on the fallback (tiny, ambiguous heads).
-        assert!(!crate::optim::is_qk_param("loop_block.shared_attn.msa.index_branch.q_proj.weight"));
         // Per-head scalar producers (decay/β gates): AdamW.
         assert!(!is_muon_param("loop_block.shared_attn.gdn2.decay.w_up.weight"));
         assert!(!is_muon_param("loop_block.shared_attn.gdn2.beta_proj.weight"));
         // Routers/scorers: AdamW.
         assert!(!is_muon_param("loop_block.controller.weight"));
-        assert!(!is_muon_param("loop_block.shared_attn.router.inner.u"));
-        assert!(!is_muon_param("loop_block.shared_attn.msa.index_branch.q_proj.weight"));
         // Embeddings, elongated readouts, output head: AdamW.
         assert!(!is_muon_param("embedding.weight"));
         assert!(!is_muon_param("lm_head.inner.v"));
@@ -1210,16 +1202,15 @@ mod tests {
             d_ffn: 256,
             max_iter: 4,
             rank: 16,
-            msa_block: 32,
             ..DormouseConfig::default()
         }
     }
 
     /// Live model: the policy must hold on the real module tree. The expected
     /// Muon+ count is derived from the config topology, not a literal:
-    /// 3 KDA qkv + 4 sparse-core projections + n_experts x (gate_up u,v +
-    /// down u,v) + 1 Engram key_proj + 1 value_proj. With head-wise Q/K
-    /// routing on, the four q/k matrices move into the qk group.
+    /// n_experts x (gate_up u,v + down u,v) + 1 Engram key_proj + 1
+    /// value_proj. With head-wise Q/K routing on, KDA's two q/k matrices move
+    /// into the qk group.
     #[test]
     fn routing_validates_on_live_model() {
         let cfg = test_cfg();
@@ -1227,7 +1218,7 @@ mod tests {
         let expected_muon = 4 * cfg.n_experts + 3;
         let c = validate_routing(&model, false, Some(cfg.n_heads)).expect("policy must hold on the live model");
         assert_eq!(c.muon, expected_muon, "Muon+ group must match the topology");
-        assert_eq!(c.qk, 4, "gdn2 q/k + msa q/k must be head-wise Muon");
+        assert_eq!(c.qk, 2, "gdn2 q/k must be head-wise Muon");
         assert_eq!(c.tables, 1, "n-gram tables group");
         assert!(c.rest > 0);
         // Without head-wise routing the q/k params fall back to rest.

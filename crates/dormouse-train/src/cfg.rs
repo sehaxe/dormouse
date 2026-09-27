@@ -37,7 +37,6 @@ pub fn resolve(preset: &str, set: &[String], mut train: TrainCfg) -> Result<RunC
     if let Some(g) = train.act_group { model.act_group = g; }
     if let Some(mi) = train.max_iter { model.max_iter = mi; }
     if train.no_kda { model.use_kda = false; }
-    if train.no_msa { model.use_msa = false; }
     if train.no_engram { model.use_engram = false; }
     if let Some(w) = train.jepa_weight { model.jepa_weight = w; }
     if let Some(w) = train.dspark_weight { model.dspark_weight = w; }

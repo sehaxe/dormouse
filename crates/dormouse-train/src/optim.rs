@@ -2,9 +2,8 @@
 //! param routing.
 //!
 //! Policy (report §3.1, validated by [`validate_routing`]):
-//! - **Muon+ ColRow** on matrices that genuinely act as linear maps: KDA q/k/v,
-//!   sparse-attention core q/k/v/out, expert TSCT u/v factors, Engram
-//!   key/value projections.
+//! - **Muon+ ColRow** on matrices that genuinely act as linear maps: KDA
+//!   key_projs, expert TSCT u/v factors, Engram key projections.
 //! - **Head-wise Muon+** on the attention Q/K weights (report §3.1: split
 //!   qkv per head BEFORE orthogonalization - fusing mixes singular
 //!   directions): each `[head_dim, d]` block gets its own NS
@@ -12,9 +11,9 @@
 //!   preset's n_heads in the train loop).
 //! - **Plain Adam, weight decay disabled** on the n-gram tables (§2.3).
 //! - **AdamW** on everything else: embeddings, output head, routers/scorers
-//!   (controller, attention blend, MSA indexer, halt head), per-head scalar
-//!   producers (KDA decay/β gates), elongated low-rank readouts (out_proj),
-//!   conv kernels and all 1D leaves. Orthogonalization is meaningless or
+//!   (controller, halt head), per-head scalar producers (KDA decay/β gates),
+//!   elongated low-rank readouts (out_proj), conv kernels and all 1D leaves.
+//!   Orthogonalization is meaningless or
 //!   harmful there (e.g. a 1-D output like the router score has no shared
 //!   linear structure to exploit).
 //!
@@ -122,20 +121,14 @@ fn muon_plus_cfg(cfg: &TrainCfg) -> MuonPlusConfig {
 }
 
 /// Q/K paths routed to the head-wise Muon group (per-head preconditioner).
-/// The k-side of the sparse attention has GQA heads (`n_kv = n_heads/4`),
-/// so it forms its own group with a different head count. The MQA indexer
-/// (msa.index_branch) stays on the fallback: 4 q-heads / 1 shared k-head,
-/// tiny matrices with ambiguous per-head semantics.
-pub(crate) const QK_HEAD_MARKERS: &[&str] = &[
-    "gdn2.q_proj",
-    "gdn2.k_proj",
-    "msa.attention.q_proj",
-];
-pub(crate) const QK_KV_MARKER: &str = "msa.attention.k_proj";
+/// One group, one head count: KDA's q and k both carry `n_heads` heads (the
+/// GQA k-side group that needed its own head count was the MSA arm's, cut in
+/// ADR-0014).
+pub(crate) const QK_HEAD_MARKERS: &[&str] = &["gdn2.q_proj", "gdn2.k_proj"];
 
 /// True when a param path belongs to a head-wise Q/K group (2D only).
 pub fn is_qk_param(path: &str) -> bool {
-    QK_HEAD_MARKERS.iter().any(|m| path.contains(m)) || path.contains(QK_KV_MARKER)
+    QK_HEAD_MARKERS.iter().any(|m| path.contains(m))
 }
 
 /// Head-wise Muon+ for the attention Q/K projections (Qwen3.8-Flash-Next
@@ -147,9 +140,8 @@ pub fn is_qk_param(path: &str) -> bool {
 /// what makes routing Q/K to Muon affordable on this box (fp32 NS on
 /// [768,768] was ~40 s/step; 12 blocks of [64,768] are milliseconds).
 ///
-/// Q/K here are separate Linears (burn-kda gdn2, burn-msa attention), so
-/// the per-head split is unambiguous - there is no fused [d, 3d] qkv to
-/// disambiguate.
+/// Q/K here are separate Linears (burn-kda gdn2), so the per-head split is
+/// unambiguous - there is no fused [d, 3d] qkv to disambiguate.
 #[derive(Clone)]
 pub struct HeadWiseMuon {
     muon: MuonPlus,
@@ -327,23 +319,15 @@ pub(crate) fn build_optim_mode(cfg: &TrainCfg, mode: &str) -> Optim {
 }
 
 /// Route the attention Q/K projections to head-wise Muon when `qk_heads`
-/// is set (the preset's `n_heads`); the GQA k-side gets the reduced head
-/// count. Unset keeps Q/K on the base fallback optimizer.
+/// is set (the preset's `n_heads`). Unset keeps Q/K on the base fallback
+/// optimizer.
 fn with_qk_groups(opt: Optim, cfg: &TrainCfg) -> Optim {
     let Some(h) = cfg.qk_heads else { return opt };
-    let n_kv = (h / 4).max(1); // must mirror AdaptiveAttention::new
-    let mut o = opt;
-    o = o.with_group(
+    opt.with_group(
         ParamGroup::from_any_predicates(QK_HEAD_MARKERS.to_vec()),
         HeadWiseMuon::new(cfg, h),
         None,
-    );
-    o = o.with_group(
-        ParamGroup::from_any_predicates(vec![QK_KV_MARKER]),
-        HeadWiseMuon::new(cfg, n_kv),
-        None,
-    );
-    o
+    )
 }
 
 /// Build the optimizer per OPT env:
@@ -485,7 +469,7 @@ pub(crate) fn validate_routing_with(
         return Err(format!("table marker {table_marker:?} matches no param (renamed?)"));
     }
     if qk_heads.is_some() {
-        for marker in QK_HEAD_MARKERS.iter().chain(std::iter::once(&QK_KV_MARKER)) {
+        for marker in QK_HEAD_MARKERS {
             if !collector.paths.iter().any(|(p, _)| p.contains(marker)) {
                 return Err(format!("Q/K marker {marker:?} matches no param (renamed?)"));
             }
