@@ -3,7 +3,7 @@
 //! One kernel computes the per-token rank-`r` expert projection WITHOUT ever
 //! materializing `[B, k*r, in]` / `[B, k*r, out]` (the OOM source), and one
 //! kernel runs the exact backward (scatter-add into the masters via float
-//! atomics, mirrors burn-msa / `fused.rs`). The router itself (projections,
+//! atomics, mirrors the bf16 fused op in `fused.rs`). The router itself (projections,
 //! argmax/argtopk, softmax, gates) is also one kernel per direction
 //! (`moe_router_kernel` + `moe_router_bwd_kernel`), killing the ~11 tensor
 //! graph nodes the tensor-path router adds per module; the tensor router stays
@@ -50,7 +50,7 @@ pub fn moe_fused_forward_count() -> usize {
     MOE_FWD_COUNT.load(Ordering::Relaxed)
 }
 
-/// Force a dense row-major tensor (see burn-msa `sparse_kernel::dense4`).
+/// Force a dense row-major tensor (see the bf16 fused op in `fused.rs`).
 /// cubecl pitches 2D rows to `next_pow2(width_bytes).clamp(16, 512)`; the
 /// fused kernels index flat row-major, so every operand must be exactly dense.
 fn dense<const D: usize, K>(t: Tensor<D, K>) -> Tensor<D, K>
@@ -207,7 +207,7 @@ fn moe_fwd_kernel<F: Float>(
 /// staged the same way, lane `a` computing `d_x` row `i0+a` and the `d_u`
 /// scatter-add. Stage 4 folds `d_s` (columns split across lanes) and
 /// `d_gates` (one expert per lane). Scatter-adds stay float atomics into the
-/// zeroed buffers (same non-determinism burn-msa tolerates).
+/// zeroed buffers (same non-determinism the bf16 fused op tolerates).
 #[allow(clippy::unnecessary_cast)]
 #[cube(launch_unchecked)]
 fn moe_bwd_kernel<F: Float>(
