@@ -2,6 +2,40 @@
 
 Started 2026-09-21 from the architecture grill session. Decisions live in `docs/adr/`, shared language lives in `CONTEXT.md`, evidence lives in `research/2026-09-21-per-gb-sota.md`. Update this file as phases close; do not re-litigate recorded ADRs without new evidence.
 
+## ARCHITECTURE v2 (2026-09-26, research-grounded redesign)
+
+Measured failures that force it: lambda collapse x2 (fake loss, uniform eval),
+engram gradient theft (core -> constant outputs), domain-sorted corpus
+(meaningless train CE), the pre.4 inference-forward regression (split-brain
+probe: train loss 0.005 real vs inference logits constant ~0 on the same
+weights), lr 1e-4 starving Muon+.
+
+The v2 stack, each piece tied to a source:
+1. **Core: fixed-depth LoopBlock, max_iter=4** (use_halting=false default).
+   PonderNet halting retired: our p_n lacked the remainder term (sum(p) was
+   free to vanish -> rec = sum(p*CE) became a fake loss and out_acc -> 0).
+   The prior-weighted KL fix is kept for any re-entry. Re-entry candidate:
+   MoR routers (2507.10524) — token-level expert-choice depth without
+   probabilistic halting; below vanilla at 135M, Pareto-competitive from
+   360M — our scale is 7.5M, so fixed-depth first, MoR as a measured A/B.
+2. **DeepLoop residual scaling A/B** (2607.13491): tied-depth visits change
+   the stability exponent; our learned residual_scale -> A/B against the
+   DeepLoop init alpha=(2N)^1/2, beta=(8N)^-1/2 at N=4.
+3. **Memory: MA-style value-path lookup** (2609.28399) replaces the separate
+   gated Engram arm: in KDA, V = V_proj + RMSNorm(M[fnv(3/5/8-gram)]) — the
+   hashed n-gram tables keep the capacity story (Qwen 51B-row style), the
+   core's K stays in every value (gradient-theft-proof by construction),
+   tables stay CPU-resident (our offload machinery). Reference impl:
+   fla/layers/memory_attn.py.
+4. **Data: corpus v3 sharded** (done, shard.rs). Next: Self-Play pretraining
+   (2609.30063) — generator/learner byte curriculum at our exact scale
+   (<25M params), the compute-bounded data engine.
+5. **Inference (phase 5): FlashLoop** (2609.29812) lazy updates on the looped
+   block — token-sparse recursion, KV-residual quantization; 1.64x/6x
+   reported, training-free.
+6. **Post-training (phase 6): Rufus-Air ordering** (2609.29421) — verifiable
+   rewards first, judges later; matches POST_TRAINING.md.
+
 ## RESEARCH MAP 2026-09-26 (four fresh papers, owner-directed)
 
 1. **Memory Attention (2609.28399, Kang; code: Joluck/memory-attention)** — the
