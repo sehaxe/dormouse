@@ -51,3 +51,14 @@ opt-level = 0
 cubecl-runtime = { path = "vendor/cubecl-fix/cubecl-runtime" }
 cubecl-server = { path = "vendor/cubecl-fix/cubecl-server" }
 cubecl-cuda = { path = "vendor/cubecl-fix/cubecl-cuda" }
+# cubecl-ir carries pliron's f16 size interfaces (ADR-0016 bug 3, ~40 lines in
+# src/types/scalar.rs). pliron's `builtin.fp16` - the type `cube.f16` lowers to -
+# implemented `FloatTypeInterface` and no `SizedType`, and the shared-memory
+# sizing query (`cubecl-opt/src/lib.rs:36-40`) unwraps that cast. An f16 matmul
+# is the one matmul that stages f16 tiles, so f16 is the one element type that
+# reaches it: the candidate kernel panicked at compile, and the autotuner
+# caught it and fell back to a non-accelerated routine, so f16 matmul was
+# CORRECT and silently un-accelerated. SizedType is LOCAL to this crate, which
+# is why the impl is legal here and not in a downstream crate. This is the only
+# cubecl-ir change; the f64 and bf16 equivalents are deliberately not touched.
+cubecl-ir = { path = "vendor/cubecl-fix/cubecl-ir" }

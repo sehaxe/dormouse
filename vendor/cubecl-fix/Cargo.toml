@@ -1,5 +1,5 @@
 [workspace]
-members = ["cubecl-runtime", "cubecl-server", "cubecl-cuda"]
+members = ["cubecl-ir", "cubecl-runtime", "cubecl-server", "cubecl-cuda"]
 resolver = "2"
 
 # Link cubecl-cuda (and every transitive consumer) to the patched
