@@ -2,6 +2,44 @@
 
 Started 2026-09-21 from the architecture grill session. Decisions live in `docs/adr/`, shared language lives in `CONTEXT.md`, evidence lives in `research/2026-09-21-per-gb-sota.md`. Update this file as phases close; do not re-litigate recorded ADRs without new evidence.
 
+## ARCHITECTURE v2.1 (2026-09-26, scale-gated completeness — owner directive)
+
+Principle: EVERY mechanism lives in the architecture from birth; presets gate
+ACTIVATION by scale. "Best architecture in the world for any size" =
+mechanisms whose cost/benefit is scale-tuned, not mechanisms added by
+rewrite later. At equal compute, the tuned gate stack beats any dense peer.
+
+The complete mechanism set (all in the codebase, config-gated):
+1. **Recursion routing (MoR-style)** — lightweight per-loop router, top-k
+   token continuation, recursion-wise KV. GATE: off at nano/small (routing
+   underperforms vanilla <135M per 2507.10524), ON at base/one_b/p150.
+   Replaces the deleted PonderNet (no lambda, no KL, no collapse mode).
+2. **KDA -> GDN-2** (2605.22791, NVIDIA; FLA fla/ops/gdn2 MIT kernels) —
+   channel-wise erase b_t + write w_t gates on top of our KDA: strict
+   superset, matched-table win (53.11 vs 52.28; MK-NIAH 37.8 vs 28.0).
+   Port cost ~300-800 lines, verified bit-for-bit against FLA.
+3. **MA value-path memory** (2609.28399) — V += RMSNorm(M[fnv(3/5/8-gram)])
+   inside the attention value construction; hashed tables keep the capacity
+   story; CPU-resident (our offload). Structurally gradient-theft-proof.
+4. **DeepLoop residual scaling** (2607.13491) — tied-depth init rule
+   alpha=(2N)^1/2, beta=(8N)^-1/2; A/B against the learned residual_scale.
+5. **FlashLoop lazy inference** (2609.29812) — phase 5: token-sparse loop
+   updates, KV-residual quantization.
+6. **Self-play data engine** (2609.30063) — phase 5+: generator/learner
+   byte curriculum at the learner's frontier (the compute-bounded data
+   source; the RSI seed).
+7. **Post-training** (phase 6): Rufus-Air ordering (2609.29421) —
+   verifiable rewards first.
+
+Scale gates (the presets decide, the code is size-blind):
+| mechanism | nano/small | base | one_b/p150 |
+|---|---|---|---|
+| fixed loop 4 | on | on | on |
+| recursion routing | off | on | on |
+| MA value-path memory | on (compact) | on | on |
+| GDN-2 gates | on | on | on |
+| FlashLoop inference | phase 5 | phase 5 | phase 5 |
+
 ## ARCHITECTURE v2 (2026-09-26, research-grounded redesign)
 
 Measured failures that force it: lambda collapse x2 (fake loss, uniform eval),
