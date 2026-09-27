@@ -40,6 +40,38 @@ impl LinearLike {
         }
     }
 
+    /// Plain dense linear - the A/B counterpart of the spectral path. It was
+    /// unreachable before (the enum variant existed, nothing constructed it),
+    /// which made "is TSCT earning its ~1000 lines?" unanswerable. The honest
+    /// question is wide-and-low-rank (TSCT, 2048-wide FFN on 7.5M params)
+    /// versus narrow-and-dense (same param budget), not TSCT against nothing.
+    pub fn dense(in_features: usize, out_features: usize, device: &Device) -> Self {
+        let padded = if !out_features.is_multiple_of(4) && out_features != 1 {
+            out_features.next_multiple_of(4)
+        } else {
+            out_features
+        };
+        Self {
+            inner: LinearLikeInner::Dense(burn::nn::LinearConfig::new(in_features, padded).init(device)),
+            out_features,
+        }
+    }
+
+    /// Spectral or dense, chosen once by the caller from `use_tsct`.
+    pub fn with_tsct(
+        in_features: usize,
+        out_features: usize,
+        rank: usize,
+        use_tsct: bool,
+        device: &Device,
+    ) -> Self {
+        if use_tsct {
+            Self::new(in_features, out_features, rank, device)
+        } else {
+            Self::dense(in_features, out_features, device)
+        }
+    }
+
     pub fn forward<B: burn::backend::AutodiffBackend>(&self, x: Tensor<2>) -> Tensor<2>
     where
         DispatchTensor: DispatchKindConversion<B>

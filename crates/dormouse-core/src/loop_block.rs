@@ -21,10 +21,10 @@ pub struct ExpertFFN {
 }
 
 impl ExpertFFN {
-    pub fn new(d: usize, f: usize, rank: usize, device: &Device) -> Self {
+    pub fn new(d: usize, f: usize, rank: usize, use_tsct: bool, device: &Device) -> Self {
         Self {
-            gate_up: LinearLike::new(d, f, rank, device),
-            down: LinearLike::new(f, d, rank, device),
+            gate_up: LinearLike::with_tsct(d, f, rank, use_tsct, device),
+            down: LinearLike::with_tsct(f, d, rank, use_tsct, device),
         }
     }
 }
@@ -120,14 +120,14 @@ impl LoopBlock {
         let iter_embed = burn::module::Param::from_tensor(iter_embed.clone().into());
         Self {
             controller,
-            shared_attn: AdaptiveAttention::new(d, cfg.n_heads, cfg.head_dim, cfg.rank, cfg.msa_block, cfg.msa_topk, cfg.bf16, device),
-            expert_ffns: (0..cfg.n_experts).map(|_| ExpertFFN::new(d, f, cfg.rank, device)).collect(),
+            shared_attn: AdaptiveAttention::new(d, cfg.n_heads, cfg.head_dim, cfg.rank, cfg.msa_block, cfg.msa_topk, cfg.bf16, cfg.use_tsct, device),
+            expert_ffns: (0..cfg.n_experts).map(|_| ExpertFFN::new(d, f, cfg.rank, cfg.use_tsct, device)).collect(),
             engram: EngramModule::new(&[4096, 4096, 4096], 32, d, 1, device),
             norm: RMSNorm::new(d, cfg.norm_eps, device),
             gr: cfg.use_gr.then(|| GatedResidual::new(d, device)),
             iter_embed,
             residual_scale: burn::module::Param::from_tensor(Tensor::zeros([1], device)),
-            out_proj: LinearLike::new(d, d, cfg.rank, device),
+            out_proj: LinearLike::with_tsct(d, d, cfg.rank, cfg.use_tsct, device),
             max_iter: cfg.max_iter,
             d_model: d,
             ffn_hidden: f,

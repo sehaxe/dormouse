@@ -47,7 +47,7 @@ impl DormouseModel {
             embedding: EmbeddingConfig::new(v, d).init(device),
             loop_block: LoopBlock::new(cfg, device),
             norm: RMSNorm::new(d, cfg.norm_eps, device),
-            lm_head: LinearLike::new(d, v, cfg.rank.min(d).min(v), device),
+            lm_head: LinearLike::with_tsct(d, v, cfg.rank.min(d).min(v), cfg.use_tsct, device),
             aux: AuxHeads::new(d, v, cfg.rank, device),
             vocab_size: v,
             d_model: d,

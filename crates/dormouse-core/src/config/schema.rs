@@ -93,6 +93,12 @@ pub struct DormouseConfig {
     #[serde(default = "d_msa_block")] pub msa_block: usize,
     #[serde(default = "d_false")] pub use_msa: bool,
     #[serde(default = "d_true")] pub use_kda: bool,
+    /// Spectral (low-rank TSCT) linears vs plain dense ones. The spectral
+    /// path is what makes the FFN 2048-wide on 7.5M params; turning it off
+    /// gives the A/B that decides whether it earns its retraction, quant
+    /// machinery and ~1000 lines (at a matched param budget the FFN gets
+    /// narrower, which is the comparison that actually means something).
+    #[serde(default = "d_true")] pub use_tsct: bool,
     #[serde(default = "d_true")] pub use_engram: bool,
     #[serde(default)] pub use_gr: bool,
     #[serde(default = "d_n_experts")] pub n_experts: usize,

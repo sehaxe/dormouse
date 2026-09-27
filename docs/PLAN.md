@@ -136,6 +136,39 @@ A/B (GPU slot needed): fixed-4 (official_v5, running) vs `--rand-depth`, judged
 on held-out BPB. The inference-side partner is a confidence exit in
 `generate` (~20 lines), not yet written.
 
+## COST ABLATION 2026-09-27 (what a step actually pays for)
+
+Same shape, same binary, one mechanism switched per arm, `small` at batch 4 /
+seq 256, step-50 timer (measured while official_v5 trains, so absolute values
+are inflated; the deltas are the point):
+
+| arm | step | delta |
+|-----|------|-------|
+| baseline (TSCT + aux + retract every step + KDA) | 956 ms | - |
+| `--no-kda` | **188 ms** | **-768 ms (-80%)** |
+| `--jepa-weight 0 --dspark-weight 0` | 707 ms | -249 ms (-26%) |
+| `--retract-every 7` | 790 ms | -166 ms (-17%) |
+| `--set use_tsct=false` (dense, 16.5M params) | 762 ms | -194 ms, but NOT a fair A/B (2.2x the params) |
+
+**The KDA BACKWARD is ~80% of a training step.** The earlier bench measured the
+fused forward kernel (0.23 ms) and concluded "KDA is free at 0.016% of the
+step" - that was a measurement blind spot: one kernel, no backward. The
+in-situ ablation is the honest number, and it says the linear-attention arm we
+kept for its 1.88 MiB constant state is also, right now, the step's whole cost.
+
+Second: the auxiliary objectives (JEPA + DSpark, ON by default, never A/B'd)
+cost a quarter of the step, almost all in the forward.
+
+Third: the TSCT polar retraction every step is 17%. Under `--quant fp32` the
+retraction exists to keep the QUANTIZED factor forward faithful, and there is no
+quantized forward - so that 17% buys nothing at this quant setting.
+
+`--set use_tsct=false` is now reachable (the Dense variant existed but nothing
+constructed it, so the "does TSCT earn its ~1000 lines?" question was
+unanswerable; `is_dense_bias` also had to be taught to the routing policy,
+which caught the 1D dense bias in Muon+ - and the rule now lives in ONE
+predicate used by both the group builder and the validator, which had drifted).
+
 ## OPTIMIZATION 2026-09-27 (measured; full data in research/2026-09-27-optimization-1b.md)
 
 Step = 1.9 s for 5120 tokens on 7.5M params. The decisive measurement: at

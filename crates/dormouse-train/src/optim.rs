@@ -85,7 +85,24 @@ const ENGRAM_TABLE_MARKER: &str = "engram.memory";
 /// TSCT scale leaf `s` is excluded, end-anchored so `inner.s` is caught but
 /// `inner.u`/`inner.v` are not).
 pub fn is_muon_param(path: &str) -> bool {
-    MUON_PATH_MARKERS.iter().any(|m| path.contains(m)) && !path.ends_with(".s")
+    if path.ends_with(".s") {
+        return false; // the 1D TSCT scale leaf
+    }
+    // A dense bias is 1D and must not be orthogonalized (that is what the
+    // routing check caught when the spectral path was switched off). Only
+    // the weight of a dense linear is a 2D Muon candidate.
+    if path.contains("inner.Dense") {
+        return path.ends_with(".weight") && !is_dense_bias(path);
+    }
+    MUON_PATH_MARKERS.iter().any(|m| path.contains(m))
+}
+
+/// A dense (non-spectral) linear's bias is 1D and must not be
+/// orthogonalized. Kept as one predicate because it has to be applied in BOTH
+/// the group builder and the routing validator - they used to disagree, which
+/// is precisely the class of bug the validator exists to catch.
+pub(crate) fn is_dense_bias(path: &str) -> bool {
+    path.contains("inner.Dense") && path.ends_with(".bias")
 }
 
 /// True when a module param path is an n-gram table (plain Adam, no wd).
@@ -278,6 +295,7 @@ pub(crate) fn build_optim_mode(cfg: &TrainCfg, mode: &str) -> Optim {
     let muon_group = || {
         ParamGroup::from_any_predicates(markers.clone())
             .exclude(ParamGroup::from_regex(r"\.s$").expect("valid regex"))
+            .exclude(ParamGroup::from_regex(r"inner\.Dense\.bias$").expect("valid regex"))
     };
     let muon_plus = || muon_plus_cfg(cfg).build();
     let mut opt = match mode {
@@ -409,7 +427,7 @@ pub(crate) fn validate_routing_with(
     table_marker: &str,
     qk_heads: Option<usize>,
 ) -> Result<GroupCounts, String> {
-    let is_muon = |p: &str| markers.iter().any(|m| p.contains(m)) && !p.ends_with(".s");
+    let is_muon = |p: &str| !is_dense_bias(p) && markers.iter().any(|m| p.contains(m)) && !p.ends_with(".s");
     let is_table = |p: &str| p.contains(table_marker);
     // The Q/K groups exist only when head-wise routing is on; otherwise the
     // params stay in the base fallback group like before.

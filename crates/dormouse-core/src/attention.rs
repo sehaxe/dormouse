@@ -28,6 +28,7 @@ impl AdaptiveAttention {
         msa_block: usize,
         msa_topk: usize,
         bf16: bool,
+        use_tsct: bool,
         device: &Device,
     ) -> Self {
         let kda_cfg = burn_kda::KdaConfig {
@@ -53,7 +54,7 @@ impl AdaptiveAttention {
         Self {
             gdn2: KdaModule::new(&kda_cfg, 0.0, device),
             msa: MsaModule::new(&msa_cfg, device),
-            router: LinearLike::new(d_model, 1, rank.min(d_model).min(1), device),
+            router: LinearLike::with_tsct(d_model, 1, rank.min(d_model).min(1), use_tsct, device),
             d_model,
             block_size: msa_block,
             bf16,
