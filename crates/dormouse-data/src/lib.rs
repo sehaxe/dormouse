@@ -30,7 +30,15 @@ pub fn fnv(b: &[u8]) -> u64 {
 /// Text corpora are read as raw bytes; images and binary blobs feed the
 /// byte-level LM the same way (a JPEG is just a byte sequence to predict).
 fn collect_files(root: &Path) -> Vec<PathBuf> {
-    let text_exts = ["parquet", "txt", "jsonl", "json", "md", "html", "xml", "csv"];
+    // FASTA matters here: a genome is bytes (A/C/G/T plus ASCII headers), so
+    // the genomics arm needs no tokenizer, no new code path - only for the
+    // loader to accept the files. Decompress .gz upstream: .gz is in bin_exts
+    // because the corpus builder writes plain shards, and reading compressed
+    // bytes as text would train on noise.
+    let text_exts = [
+        "parquet", "txt", "jsonl", "json", "md", "html", "xml", "csv", "fa", "fna", "fasta",
+        "ffn",
+    ];
     let bin_exts = [
         "png", "jpg", "jpeg", "gif", "webp", "bmp", "bin", "wasm", "zst", "gz",
     ];

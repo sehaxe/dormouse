@@ -117,3 +117,45 @@ Verilog results). Our own measured anchors — 5.17 unigram, 2.57 5-gram on
 text — are the only honest yardstick we have, and per-domain anchors of that
 kind (unigram/5-gram on the genomics and code slices) are the first thing to
 compute, exactly as we did for the text slice.
+
+
+## Measured anchors: the genetics bar (2026-09-27)
+
+`crates/dormouse-data/src/bin/anchors.rs` computes the three bars for any
+byte corpus (uniform / unigram / n-gram + backoff, with a held-out tail and
+FASTA-header stripping). On the first genomic slice (yeast + drosophila
+RefSeq, 4 MB read, 3 MB train / 1 MB held out):
+
+| corpus | uniform | unigram | 5-gram + backoff |
+|--------|---------|---------|------------------|
+| text slice (`eval_2m_v2`, 1.5 MB train) | 8.000 | 5.398 | 2.911 |
+| genomics, headers included | 8.000 | **2.040** | **2.012** |
+| genomics, sequence only | 8.000 | 2.034 | 2.010 |
+
+Reading: a genome's byte stream is *far* more compressible than prose - a
+letter-frequency counter alone gets 2.03 bits/byte, which is essentially the
+4-letter entropy floor (ln 4 / ln 2 = 2.0), and a 5-gram adds almost nothing
+(0.024 bits). So in this domain:
+
+- the bar to beat is **~2.0 BPB**, not the text domain's 2.9;
+- the headroom for a model is entirely in **long-range structure** - codons,
+- repeats, regulatory motifs, and the promoter/enhancer grammar that the
+  genomics literature says is the actual biology (200 kb contexts in
+  OmniReg-GPT). Local n-grams are already saturated by a counter.
+
+That is a favourable shape for us and a hostile one for k-mer gLMs: the signal
+is in the long-range dependencies, which is exactly what a linear-attention
+state is for, and exactly what a fixed-kmer tokenizer throws away. It also
+means the honest genomics A/B is not "can the model do genomics" (any byte
+model can hit 2.03 by counting letters) but "does it go BELOW 2.01" - i.e.
+does it learn motifs a 5-gram cannot see.
+
+Data note for whoever continues the acquisition: NCBI's current assemblies
+mostly ship a whole-genome `*_genomic.fna.gz` and NOT per-chromosome files;
+hardcoded per-chromosome URLs 404 into 990-byte HTML pages, and a
+word-splitting shell loop over the accession list silently turns every entry
+into a SKIP. The working approach is to list the accession directory, take
+the first `GCF_*` assembly dir, then fetch `${asm}_genomic.fna.gz` from it.
+Two genomes (yeast, drosophila) are already in
+`aria_data/genomics_raw/`; the human genome is 928 MB gzipped and is the
+obvious next pull.
