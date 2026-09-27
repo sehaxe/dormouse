@@ -94,6 +94,11 @@ pub struct DormouseConfig {
     #[serde(default = "d_msa_topk")] pub msa_topk: usize,
     #[serde(default = "d_msa_block")] pub msa_block: usize,
     #[serde(default = "d_false")] pub use_msa: bool,
+    /// PonderNet probabilistic halting. OFF by default: with the (now fixed)
+    /// prior-weighted KL the lambda-collapse still wins at practical beta —
+    /// p->0 zeroes rec (a fake loss) and out_acc (uniform eval). Re-enter
+    /// via --set use_halting=true only with an A/B win (ADR-0013).
+    #[serde(default = "d_false")] pub use_halting: bool,
     #[serde(default = "d_true")] pub use_kda: bool,
     #[serde(default = "d_true")] pub use_engram: bool,
     #[serde(default)] pub use_gr: bool,

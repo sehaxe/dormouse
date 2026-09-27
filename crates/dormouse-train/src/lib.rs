@@ -1572,3 +1572,5 @@ mod tests {
         assert_eq!(without.rest - with_factors.rest, 4 * cfg.n_experts);
     }
 }
+#[cfg(test)]
+mod eval_probe;

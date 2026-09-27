@@ -268,6 +268,9 @@ impl DormouseModel {
             + DispatchKindConversion<B::InnerBackend>
             + DispatchKindConversion<burn::backend::Autodiff<B::InnerBackend>>,
     {
+        if !self.loop_block.use_halting {
+            return rec_ce; // fixed depth: no halting distribution to regularize
+        }
         let kl = self.ponder_kl(p_dist, self.ponder_prior); // [1]
         rec_ce + kl.mul_scalar(self.ponder_beta)
     }
@@ -290,9 +293,17 @@ impl DormouseModel {
         }
         let inv = 1.0 / total;
         let prior_v: Vec<f32> = prior.iter().map(|x| x * inv).collect();
-        let prior_t = Tensor::<1>::from_data(TensorData::new(prior_v, [n]), &dev).log();
-        let log_p = p_dist.clone().log();
-        let term = p_dist * (log_p - prior_t.unsqueeze_dim::<2>(0)); // [b, N]
+        let prior_probs =
+            Tensor::<1>::from_data(TensorData::new(prior_v.clone(), [n]), &dev);
+        let prior_log = prior_probs.clone().log();
+        // KL(Prior || p), prior-weighted. The p||prior direction made halting
+        // collapse FREE: as p -> 0, p*log(p/prior) -> 0, so the optimizer
+        // silenced the halt head, rec = sum(p*CE) -> 0 became a fake loss and
+        // out_acc -> 0 (uniform eval, noise generation). Prior-weighted KL
+        // diverges instead, forcing p toward the prior. eps guards log(0).
+        let log_p = (p_dist.clone() + 1e-8).log();
+        let term = prior_probs.unsqueeze_dim::<2>(0)
+            * (prior_log.unsqueeze_dim::<2>(0) - log_p); // [b, N]
         // Mean over batch and steps -> [1]. The double sum + reshape is robust
         // to whether sum_dim keeps the reduced dimension.
         term.sum_dim(1).sum_dim(0).reshape([1]).div_scalar((b * n) as f32)

@@ -51,6 +51,7 @@ pub struct LoopBlock {
     #[module(skip)]
     #[module(skip)]
     pub use_msa: bool,
+    pub use_halting: bool,
     #[module(skip)]
     pub use_kda: bool,
     #[module(skip)]
@@ -127,6 +128,7 @@ impl LoopBlock {
             ffn_hidden: f,
             n_experts: cfg.n_experts,
             use_msa: cfg.use_msa,
+            use_halting: cfg.use_halting,
             use_kda: cfg.use_kda,
             use_engram: cfg.use_engram,
             bf16: cfg.bf16,
@@ -337,6 +339,27 @@ impl LoopBlock {
             // λ_n = cond. halt prob; p_n = λ_n · Π_{j<n}(1-λ_j) (truncated geometric);
             // output accumulates the p-weighted expectation of per-step logits.
             let step_out = self.out_proj.forward::<B>(h.clone().reshape([b * t, d])).reshape([b, t, d]);
+            if !self.use_halting {
+                // Fixed depth: uniform iteration weights, no PonderNet. The
+                // halting variant lost its A/B (ADR-0013) — lambda collapse
+                // zeroed rec (a fake loss) and out_acc (uniform outputs).
+                let w = 1.0f32 / self.max_iter as f32;
+                out_acc = out_acc + step_out.clone().mul_scalar(w);
+                // real (unweighted) CE so the loss stays an honest objective
+                if let Some(tgt) = &targets {
+                    let so = if bf16 { step_out.clone().cast(FloatDType::F32) } else { step_out.clone() };
+                    let logits_n = lm_head.forward::<B>(so.reshape([b * t, d])); // [b*t, v]
+                    let ce = burn::tensor::activation::log_softmax(logits_n, 1)
+                        .gather(1, tgt.clone())
+                        .neg()
+                        .reshape([b, t])
+                        .sum_dim(1)
+                        .div_scalar(t as f32); // [b]
+                    rec = rec + ce.sum_dim(0).reshape([1]).div_scalar(self.max_iter as f32);
+                }
+                h = h_ctx.clone();
+                continue;
+            }
             let halt_in = if bf16 {
                 h_ctx.clone().mean_dim(1).reshape([b, d]).cast(FloatDType::F32)
             } else {
@@ -367,7 +390,13 @@ impl LoopBlock {
             }
         }
         let rec = rec.div_scalar(b as f32); // mean over batch
-        let p_dist = Tensor::cat(p_rows, 1); // [b, N]
+        // Fixed depth never fills p_rows: p_dist is unused there (loss skips
+        // the KL when halting is off), so a [b, 1] zero placeholder suffices.
+        let p_dist = if self.use_halting {
+            Tensor::cat(p_rows, 1) // [b, N]
+        } else {
+            Tensor::zeros([b, 1], &h.device())
+        };
         let kda = kda_s.unwrap_or_else(|| Tensor::zeros([1, 1, 1, 1], &h.device()));
         (out_acc, rec, p_dist, kda)
     }
