@@ -49,6 +49,7 @@
 //! - **`binary-tests`** - bit-exact reference tests against `tests/ref_data.bin`
 //!   (regenerated with `tests/gen_reference.py`)
 
+pub mod alloc_trace;
 pub mod config;
 pub mod forward;
 pub mod kernel;

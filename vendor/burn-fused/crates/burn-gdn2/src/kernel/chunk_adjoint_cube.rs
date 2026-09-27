@@ -530,6 +530,14 @@ pub mod cuda {
         // the vtile column is covered by y·n_vp lanes (same as the forward inter)
         let cube_dim = CubeDim::new_3d(c as u32, (vtile / 2) as u32, 1);
         let cube_count = CubeCount::Static(bh as u32, vt as u32, 1);
+        // The counter means "a kernel launch happened", so it is incremented
+        // HERE, past every gate above (the `is_cuda` TypeId, the `cube_of`
+        // conversions, and their contiguity materializations). It used to be
+        // the FIRST statement, so `fused_calls().1` counted a fused backward
+        // that had returned `None` on the next line — which is why
+        // `tests/autodiff_cuda_gate.rs`'s `bwd > 0` was green while the fused
+        // adjoint had never run (ADR-0019).
+        crate::cuda_dispatch::note_fused_backward();
         unsafe {
             gdn2_chunk_inter_adjoint_kernel::launch_unchecked::<f32>(
                 &client,

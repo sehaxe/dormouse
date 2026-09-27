@@ -92,6 +92,37 @@ fn backend_gate_decides_right_for_every_backend_we_run() {
 /// The production gate: from a Balanced-checkpointed graph the fused forward
 /// AND adjoint kernels must launch, and the numbers must still be the chunked
 /// WY form.
+///
+/// # What this proves
+///
+/// - `fused_calls()` counts kernel LAUNCHES and nothing else. Both counters
+///   are incremented past every gate (backend, divisibility, dtype, kernel
+///   limits, contiguity) and immediately before the first `launch_unchecked`,
+///   so `(1, 0)` after the forward and `(1, 1)` after the backward mean one
+///   fused forward and one fused adjoint really ran. Each counter used to be
+///   the first statement of its entry point, which counted the CALLER's
+///   interest: the backward one moved even when the adjoint returned `None` on
+///   the next line, and this test's `bwd > 0` was green on that lie
+///   (ADR-0019).
+/// - The fused ADJOINT produces the same gradients as the tensor adjoint, to
+///   the same tolerance the forward already had to meet. A counter cannot tell
+///   a right adjoint from a wrong one, and the adjoint is the half of the fused
+///   path that had never run inside a trainer.
+///
+/// # What this still cannot prove
+///
+/// - Anything on CPU: the kernels, both counters and this whole file are behind
+///   `feature = "cuda"`. `tests/autodiff_nested_balanced.rs` is the CPU twin for
+///   the graph SHAPE (nested parents, `BalancedCheckpointing`, real fwd+bwd) and
+///   cannot see the kernels, the counters, or this gradient comparison.
+/// - That the fused fwd+bwd is FASTER, or even that it is usable end to end in
+///   a training step. This test asserts nothing about time. Until a step-time
+///   measurement exists on a quiet GPU, only the fused FORWARD is established
+///   as live; a 1.57x fwd+bwd number measured through the node may already have
+///   included the tensor adjoint, and nobody has checked.
+/// - That the trainer's own graph works: the inputs here are contiguous and the
+///   graph is flat. The strided-input reproducer is
+///   `tests/fused_permuted_view.rs`.
 #[test]
 fn fused_kernels_run_from_a_balanced_graph() {
     let device = Device::cuda(0);
@@ -124,19 +155,29 @@ fn fused_kernels_run_from_a_balanced_graph() {
         Fused::Fused(r) => r,
         Fused::Fallback(why) => panic!("the fused path did not run: {why:?}"),
     };
-    let (fwd, _) = fused_calls();
-    assert!(
-        fwd > 0,
-        "the fused forward kernel never launched: the gate is closed again"
+    let (fwd, bwd_after_fwd) = fused_calls();
+    assert_eq!(
+        (fwd, bwd_after_fwd),
+        (1, 0),
+        "one fused forward and no adjoint yet; anything else means a counter is \
+         counting a gate that refused, or the graph ran the op twice"
     );
 
-    // Backward: the fused adjoint kernel, not the tensor-ops adjoint.
-    let loss = out.clone().powf_scalar(2.0).sum() + state.clone().powf_scalar(2.0).sum();
+    // Backward: the fused adjoint kernel, not the tensor-ops adjoint. Ops AFTER
+    // the op, so the adjoint is reached through a chain.
+    let loss = out
+        .clone()
+        .powf_scalar(2.0)
+        .sum()
+        .add(state.clone().powf_scalar(2.0).sum())
+        .add(out.clone().sum().mul_scalar(0.5));
     let grads = loss.backward();
-    let (_, bwd) = fused_calls();
-    assert!(
-        bwd > 0,
-        "the fused adjoint kernel never launched: the gate is closed again"
+    let (fwd, bwd) = fused_calls();
+    assert_eq!(fwd, 1, "the fused forward ran more than once");
+    assert_eq!(
+        bwd, 1,
+        "the fused adjoint kernel never launched: the gate is closed again, and \
+         the counter now says so instead of counting the call"
     );
     for (i, t) in inp.iter().enumerate() {
         let g = t
@@ -167,6 +208,44 @@ fn fused_kernels_run_from_a_balanced_graph() {
     println!("fused vs tensor-ops chunk path: out {d_out:.3e}, state {d_state:.3e}");
     assert!(d_out < 1e-4, "forward drift vs tensor path: {d_out:.3e}");
     assert!(d_state < 1e-4, "state drift vs tensor path: {d_state:.3e}");
+
+    // The adjoint must be the SAME function as the tensor adjoint's, or the
+    // fused path is a different optimizer rather than a faster one. Same
+    // values, same graph, tensor path instead of the fused node.
+    let (ref_out, ref_state) = chunk_wy_forward(
+        inp[0].clone(),
+        inp[1].clone(),
+        inp[2].clone(),
+        inp[3].clone(),
+        inp[4].clone(),
+        inp[5].clone(),
+        inp[6].clone(),
+        scale,
+        chunk,
+    );
+    let ref_loss = ref_out
+        .clone()
+        .powf_scalar(2.0)
+        .sum()
+        .add(ref_state.powf_scalar(2.0).sum())
+        .add(ref_out.sum().mul_scalar(0.5));
+    let ref_grads = ref_loss.backward();
+    let d_loss = (loss.clone().into_scalar::<f32>() - ref_loss.into_scalar::<f32>()).abs();
+    println!("fused graph vs tensor graph: loss {d_loss:.3e}");
+    assert!(d_loss < 1e-3, "loss differs between the fused and the tensor graph");
+    for (i, t) in inp.iter().enumerate() {
+        let fused_g = t.grad(&grads).unwrap().clone();
+        let ref_g = t
+            .grad(&ref_grads)
+            .unwrap_or_else(|| panic!("input {i} got no gradient on the tensor path"));
+        let d = rel_diff(fused_g.clone(), ref_g.clone());
+        println!("input {i} gradient, fused adjoint vs tensor adjoint: rel {d:.3e}");
+        assert!(
+            d < 1e-3,
+            "input {i}: the fused adjoint disagrees with the tensor adjoint \
+             (rel={d:.2e}) — the fused backward would be a different function"
+        );
+    }
 }
 
 /// The strategy is a parameter of the op, not a hardcoded

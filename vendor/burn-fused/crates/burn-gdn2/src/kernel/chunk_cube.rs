@@ -891,6 +891,12 @@ pub mod cuda {
 
         let cube_dim = CubeDim::new_3d(c as u32, 8, 1);
         let cube_count = CubeCount::Static(nblk as u32, 1, 1);
+        // The counter means "a kernel launch happened", so it is incremented
+        // HERE, past every gate above (backend, divisibility, dtype, kernel
+        // limits, contiguity). Before the gates it counted the CALLER's
+        // interest, and `fused_calls()` then reported a fused run that fell
+        // back to the tensor path — a green test on a lie (ADR-0019).
+        crate::cuda_dispatch::note_fused_forward();
         unsafe {
             gdn2_chunk_intra_kernel::launch_unchecked::<f32>(
                 &client,
