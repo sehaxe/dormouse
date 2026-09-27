@@ -563,8 +563,8 @@ pub fn train_loop(
         let shifted: Vec<i64> = bytes.iter().skip(1).chain(std::iter::once(&bytes[0])).map(|&b| b as i64).collect();
         let y: Tensor<2, Int> = Tensor::from_data(TensorData::new(shifted, [cfg.batch, cfg.seq_len]), &device);
         for _ in 0..2 {
-        let (_logits, rec, pd, _k, _aux) = model.forward_with_hidden::<Backend>(x.clone(), Some(h.clone()), None, Some(y.clone()), None);
-        let loss = model.loss::<Backend>(rec, pd);
+        let (_logits, rec, _k, _aux) = model.forward_with_hidden::<Backend>(x.clone(), Some(h.clone()), None, Some(y.clone()), None);
+        let loss = model.loss::<Backend>(rec);
             let _g = loss.backward();
         }
         memory_cleanup(&device);
@@ -578,12 +578,12 @@ pub fn train_loop(
         let (x, h) = bytes_to_tensors::<Backend>(&bytes, &hashes, cfg.seq_len, cfg.batch, &device);
         let shifted: Vec<i64> = bytes.iter().skip(1).chain(std::iter::once(&bytes[0])).map(|&b| b as i64).collect();
         let y: Tensor<2, Int> = Tensor::from_data(TensorData::new(shifted, [cfg.batch, cfg.seq_len]), &device);
-        let (lq, rec_q, pd_q, _k, _aq) = model.forward_with_hidden::<Backend>(x.clone(), Some(h.clone()), None, Some(y.clone()), None);
-        let loss_q: f32 = model.loss::<Backend>(rec_q, pd_q).try_into_scalar().unwrap_or(f32::NAN);
+        let (lq, rec_q, _kq, _aq) = model.forward_with_hidden::<Backend>(x.clone(), Some(h.clone()), None, Some(y.clone()), None);
+        let loss_q: f32 = model.loss::<Backend>(rec_q).try_into_scalar().unwrap_or(f32::NAN);
         let mut ref_model = model.clone();
         ref_model.loop_block.set_quant_all(burn_spectral::QuantFormat::Fp32);
-        let (lr, rec_r, pd_r, _k, _ar) = ref_model.forward_with_hidden::<Backend>(x, Some(h), None, Some(y), None);
-        let loss_r: f32 = ref_model.loss::<Backend>(rec_r, pd_r).try_into_scalar().unwrap_or(f32::NAN);
+        let (lr, rec_r, _kr, _ar) = ref_model.forward_with_hidden::<Backend>(x, Some(h), None, Some(y), None);
+        let loss_r: f32 = ref_model.loss::<Backend>(rec_r).try_into_scalar().unwrap_or(f32::NAN);
         let vq: Vec<f32> = lq.into_data().try_to_vec().unwrap_or_default();
         let vr: Vec<f32> = lr.into_data().try_to_vec().unwrap_or_default();
         println!("check sums: q={:.4} ref={:.4} lens={}/{}", vq.iter().sum::<f32>(), vr.iter().sum::<f32>(), vq.len(), vr.len());
@@ -674,7 +674,7 @@ pub fn train_loop(
             Some(t) => Some(t.get(&bytes)?),
             None => None,
         };
-        let (_logits, rec_ce, p_dist, _kda, aux) = if let Some(tg) = jepa_target {
+        let (_logits, rec_ce, _kda, aux) = if let Some(tg) = jepa_target {
             model.forward_with_jepa_targets::<Backend>(
                 x,
                 // RAM-offload path drives the Engram from host_rows; uploading
@@ -693,7 +693,7 @@ pub fn train_loop(
                 teacher.as_ref(),
             )
         };
-        let mut loss = model.loss::<Backend>(rec_ce, p_dist);
+        let mut loss = model.loss::<Backend>(rec_ce);
         // Host tables train at their own cadence (the report's rule: Adam on
         // the RAM tables every step), not piggybacked on the log cadence -
         // at log_every=100 they got 1/100 of their updates.
@@ -1021,7 +1021,6 @@ mod tests {
         assert!(!is_muon_param("loop_block.shared_attn.gdn2.beta_proj.weight"));
         // Routers/scorers: AdamW.
         assert!(!is_muon_param("loop_block.controller.weight"));
-        assert!(!is_muon_param("loop_block.halt_head.weight"));
         assert!(!is_muon_param("loop_block.shared_attn.router.inner.u"));
         assert!(!is_muon_param("loop_block.shared_attn.msa.index_branch.q_proj.weight"));
         // Embeddings, elongated readouts, output head: AdamW.
@@ -1092,49 +1091,58 @@ mod tests {
         assert!(err.contains("1D param routed to Muon+"), "unexpected error: {err}");
     }
 
-    /// End-to-end on NdArray: the mixed optimizer must drive the PonderNet
-    /// loss down on synthetic bytes (routing, Muon+ step and checkpoint-free
-    /// resume all exercise the real path). Uses a shrunken config: NdArray
-    /// autodiff on the `small` preset takes minutes per step.
+    /// End-to-end on NdArray: the mixed optimizer must drive the training loss
+    /// down on a fixed synthetic byte batch (routing, Muon+ step and the
+    /// checkpoint-free resume all exercise the real path). Uses a shrunken
+    /// config: NdArray autodiff on the `small` preset takes minutes per step.
     #[test]
     fn mixed_optim_converges() {
+        const STEPS: usize = 40;
         let cfg = test_cfg();
         let mut model = DormouseModel::new(&cfg, &device());
         let optim_cfg = TrainCfg { steps: 40, seq_len: 64, batch: 2, lr: 1e-3, wd: 0.01, grad_clip: 1.0, ..Default::default() };
         let mut optim = crate::optim::build_optim_mode(&optim_cfg, "mix");
 
+        // The SAME batch every step: fresh random bytes per step carry no
+        // signal at all (their entropy IS ln(256)), so a loss-decrease
+        // assertion on them is a coin flip on float noise - the fake-convergence
+        // trap. A fixed batch is learnable, so the drop is real.
         let mut rng_state: u64 = 0x9E37_79B9_7F4A_7C15;
         let next_u8 = |s: &mut u64| {
             *s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
             let x = (*s ^ (*s >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
             ((x ^ (x >> 27)) >> 33) as u8
         };
-        let mut losses: Vec<f32> = Vec::with_capacity(40);
-        for step_i in 0..40usize {
-            let bytes: Vec<u8> = (0..128).map(|_| next_u8(&mut rng_state)).collect();
-            // FNV 3/5/8-gram hashes mod 4096, mirroring ByteStream::hashes.
-            let mut hashes = Vec::with_capacity(128 * 3);
-            for p in 0..128usize {
-                let e = p + 1;
-                hashes.push((fnv(&bytes[e.saturating_sub(3)..e]) % 4096) as i64);
-                hashes.push((fnv(&bytes[e.saturating_sub(5)..e]) % 4096) as i64);
-                hashes.push((fnv(&bytes[e.saturating_sub(8)..e]) % 4096) as i64);
-            }
-            let (x, h) = bytes_to_tensors::<Backend>(&bytes, &hashes, 64, 2, &device());
-            let shifted: Vec<i64> = bytes.iter().skip(1).chain(std::iter::once(&bytes[0])).map(|&b| b as i64).collect();
-            let y: Tensor<2, Int> = Tensor::from_data(TensorData::new(shifted, [2, 64]), &device());
-            let (_logits, rec, pd, _k, _aux) = model.forward_with_hidden::<Backend>(x, Some(h), None, Some(y), None);
-            let loss = model.loss::<Backend>(rec, pd);
+        let bytes: Vec<u8> = (0..128).map(|_| next_u8(&mut rng_state)).collect();
+        // FNV 3/5/8-gram hashes mod 4096, mirroring ByteStream::hashes.
+        let mut hashes = Vec::with_capacity(128 * 3);
+        for p in 0..128usize {
+            let e = p + 1;
+            hashes.push((fnv(&bytes[e.saturating_sub(3)..e]) % 4096) as i64);
+            hashes.push((fnv(&bytes[e.saturating_sub(5)..e]) % 4096) as i64);
+            hashes.push((fnv(&bytes[e.saturating_sub(8)..e]) % 4096) as i64);
+        }
+        let (x, h) = bytes_to_tensors::<Backend>(&bytes, &hashes, 64, 2, &device());
+        let shifted: Vec<i64> = bytes.iter().skip(1).chain(std::iter::once(&bytes[0])).map(|&b| b as i64).collect();
+        let y: Tensor<2, Int> = Tensor::from_data(TensorData::new(shifted, [2, 64]), &device());
+        let mut losses: Vec<f32> = Vec::with_capacity(STEPS);
+        for _ in 0..STEPS {
+            // Constant lr: the WSD warmup would eat half of a 40-step test.
+            let (_logits, rec, _k, _aux) = model.forward_with_hidden::<Backend>(x.clone(), Some(h.clone()), None, Some(y.clone()), None);
+            let loss = model.loss::<Backend>(rec);
             let v: f32 = loss.clone().try_into_scalar().unwrap_or(f32::NAN);
             let grads = GradientsParams::from_grads(loss.backward(), &model);
-            let lr = wsd_factor(step_i as u64, 40, 1e-3);
-            model = optim.step(lr, model, grads);
+            model = optim.step(1e-3, model, grads);
             losses.push(v);
         }
         let head: f32 = losses[..5].iter().sum::<f32>() / 5.0;
-        let tail: f32 = losses[35..].iter().sum::<f32>() / 5.0;
+        let tail: f32 = losses[STEPS - 5..].iter().sum::<f32>() / 5.0;
         assert!(losses.iter().all(|l| l.is_finite()), "loss must stay finite: {losses:?}");
-        assert!(tail < head, "loss must decrease: head={head:.3} tail={tail:.3} {losses:?}");
+        // Real margin, not jitter: 40 steps fit the batch's byte marginals
+        // (ln(256)=5.545 -> 5.41 here, monotone). 0.1 is ~1000x the 1e-4
+        // wobble the old fresh-noise-per-step data produced.
+        println!("mixed_optim head={head:.3} tail={tail:.3} losses={losses:?}");
+        assert!(tail < head - 0.1, "loss must decrease: head={head:.3} tail={tail:.3} {losses:?}");
     }
 
     /// Gated Residual must train too: the same synthetic-byte loop with
@@ -1153,30 +1161,35 @@ mod tests {
             let x = (*s ^ (*s >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
             ((x ^ (x >> 27)) >> 33) as u8
         };
-        let mut losses: Vec<f32> = Vec::with_capacity(25);
-        for _ in 0..25usize {
-            let bytes: Vec<u8> = (0..128).map(|_| next_u8(&mut rng_state)).collect();
-            let mut hashes = Vec::with_capacity(128 * 3);
-            for p in 0..128usize {
-                let e = p + 1;
-                hashes.push((fnv(&bytes[e.saturating_sub(3)..e]) % 4096) as i64);
-                hashes.push((fnv(&bytes[e.saturating_sub(5)..e]) % 4096) as i64);
-                hashes.push((fnv(&bytes[e.saturating_sub(8)..e]) % 4096) as i64);
-            }
-            let (x, h) = bytes_to_tensors::<Backend>(&bytes, &hashes, 64, 2, &device());
-            let shifted: Vec<i64> = bytes.iter().skip(1).chain(std::iter::once(&bytes[0])).map(|&b| b as i64).collect();
-            let y: Tensor<2, Int> = Tensor::from_data(TensorData::new(shifted, [2, 64]), &device());
-            let (_logits, rec, pd, _k, _aux) = model.forward_with_hidden::<Backend>(x, Some(h), None, Some(y), None);
-            let loss = model.loss::<Backend>(rec, pd);
+        // Fixed batch, same reason as mixed_optim_converges: fresh random
+        // bytes per step have entropy ln(256) and teach nothing.
+        let bytes: Vec<u8> = (0..128).map(|_| next_u8(&mut rng_state)).collect();
+        let mut hashes = Vec::with_capacity(128 * 3);
+        for p in 0..128usize {
+            let e = p + 1;
+            hashes.push((fnv(&bytes[e.saturating_sub(3)..e]) % 4096) as i64);
+            hashes.push((fnv(&bytes[e.saturating_sub(5)..e]) % 4096) as i64);
+            hashes.push((fnv(&bytes[e.saturating_sub(8)..e]) % 4096) as i64);
+        }
+        let (x, h) = bytes_to_tensors::<Backend>(&bytes, &hashes, 64, 2, &device());
+        let shifted: Vec<i64> = bytes.iter().skip(1).chain(std::iter::once(&bytes[0])).map(|&b| b as i64).collect();
+        let y: Tensor<2, Int> = Tensor::from_data(TensorData::new(shifted, [2, 64]), &device());
+        let mut losses: Vec<f32> = Vec::with_capacity(50);
+        for _ in 0..50usize {
+            let (_logits, rec, _k, _aux) = model.forward_with_hidden::<Backend>(x.clone(), Some(h.clone()), None, Some(y.clone()), None);
+            let loss = model.loss::<Backend>(rec);
             let v: f32 = loss.clone().try_into_scalar().unwrap_or(f32::NAN);
             let grads = GradientsParams::from_grads(loss.backward(), &model);
             model = optim.step(1e-3, model, grads);
             losses.push(v);
         }
-        let head: f32 = losses[..3].iter().sum::<f32>() / 3.0;
-        let tail: f32 = losses[22..].iter().sum::<f32>() / 3.0;
+        let head: f32 = losses[..5].iter().sum::<f32>() / 5.0;
+        let tail: f32 = losses[45..].iter().sum::<f32>() / 5.0;
         assert!(losses.iter().all(|l| l.is_finite()), "GR loss must stay finite: {losses:?}");
-        assert!(tail < head, "GR must learn: head={head:.3} tail={tail:.3} {losses:?}");
+        println!("gr head={head:.3} tail={tail:.3} losses={losses:?}");
+        // The GR arm's own slope: monotone 5.546 -> 5.52 over 25 steps, still
+        // accelerating, so 50 steps clear 0.05 (500x the old jitter floor).
+        assert!(tail < head - 0.05, "GR must learn: head={head:.3} tail={tail:.3} {losses:?}");
     }
 
     /// The auxiliary objectives (JEPA + DSpark) must train end-to-end on the
@@ -1204,13 +1217,13 @@ mod tests {
             let (x, h) = bytes_to_tensors::<Backend>(&bytes, &hashes, 64, 2, &device());
             let shifted: Vec<i64> = bytes.iter().skip(1).chain(std::iter::once(&bytes[0])).map(|&b| b as i64).collect();
             let y: Tensor<2, Int> = Tensor::from_data(TensorData::new(shifted, [2, 64]), &device());
-            let (_logits, rec, pd, _k, aux) = model.forward_with_hidden::<Backend>(
+            let (_logits, rec, _k, aux) = model.forward_with_hidden::<Backend>(
                 x, Some(h), None, Some(y), teacher.as_ref(),
             );
             let a = aux.expect("aux must be Some with preset weights on");
             let a_val: f32 = a.clone().try_into_scalar().expect("aux scalar");
             assert!(a_val.is_finite(), "aux loss must be finite, got {a_val}");
-            let grads = GradientsParams::from_grads((model.loss::<Backend>(rec, pd) + a).backward(), &model);
+            let grads = GradientsParams::from_grads((model.loss::<Backend>(rec) + a).backward(), &model);
             let model_new = optim.step(1e-3, model, grads);
             model = model_new;
             teacher = Some(dormouse_core::aux::ema_update(teacher.unwrap(), &model, dormouse_core::aux::TEACHER_MOMENTUM));
@@ -1262,11 +1275,11 @@ mod tests {
         // sees identical aux values (P ~ 2e-6).
         let mut depends_on_target = false;
         for _ in 0..5 {
-            let (_, _, _, _, aux_a) = model.forward_with_jepa_targets::<Backend>(
+            let (_, _, _, aux_a) = model.forward_with_jepa_targets::<Backend>(
                 x.clone(), Some(h.clone()), None, Some(y.clone()), Some(target.clone()),
             );
             let scaled = target.clone().mul_scalar(3.0);
-            let (_, _, _, _, aux_b) = model.forward_with_jepa_targets::<Backend>(
+            let (_, _, _, aux_b) = model.forward_with_jepa_targets::<Backend>(
                 x.clone(), Some(h.clone()), None, Some(y.clone()), Some(scaled),
             );
             let a: f32 = aux_a.expect("offline aux must be Some with JEPA on").try_into_scalar().unwrap();
@@ -1348,8 +1361,8 @@ mod tests {
             let (x, h) = bytes_to_tensors::<Backend>(&bytes, &hashes, 64, 2, &device());
             let shifted: Vec<i64> = bytes.iter().skip(1).chain(std::iter::once(&bytes[0])).map(|&b| b as i64).collect();
             let y: Tensor<2, Int> = Tensor::from_data(TensorData::new(shifted, [2, 64]), &device());
-            let (_logits, rec, pd, _k, _aux) = model.forward_with_hidden::<Backend>(x, Some(h), None, Some(y), None);
-            let loss = model.loss::<Backend>(rec, pd);
+            let (_logits, rec, _k, _aux) = model.forward_with_hidden::<Backend>(x, Some(h), None, Some(y), None);
+            let loss = model.loss::<Backend>(rec);
             let v: f32 = loss.clone().try_into_scalar().unwrap_or(f32::NAN);
             let grads = GradientsParams::from_grads(loss.backward(), &model);
             model = optim.step(1e-3, model, grads);
@@ -1368,8 +1381,8 @@ mod tests {
         let (x, h) = bytes_to_tensors::<Backend>(&bytes, &hashes, 64, 2, &device());
         let shifted: Vec<i64> = bytes.iter().skip(1).chain(std::iter::once(&bytes[0])).map(|&b| b as i64).collect();
         let y: Tensor<2, Int> = Tensor::from_data(TensorData::new(shifted, [2, 64]), &device());
-        let (_logits, rec, pd, _k, _aux) = model.forward_with_hidden::<Backend>(x, Some(h), None, Some(y), None);
-        let grads = GradientsParams::from_grads(model.loss::<Backend>(rec, pd).backward(), &model);
+        let (_logits, rec, _k, _aux) = model.forward_with_hidden::<Backend>(x, Some(h), None, Some(y), None);
+        let grads = GradientsParams::from_grads(model.loss::<Backend>(rec).backward(), &model);
         model = optim.step(1e-3, model, grads);
         let q = model.loop_block.shared_attn.gdn2.q_proj.weight.val();
         assert!(q.clone().into_data().try_to_vec().unwrap().iter().all(|x: &f32| x.is_finite()), "head-wise muon step must keep q_proj finite");
@@ -1435,5 +1448,3 @@ mod tests {
         assert_eq!(without.rest - with_factors.rest, 4 * cfg.n_experts);
     }
 }
-#[cfg(test)]
-mod eval_probe;

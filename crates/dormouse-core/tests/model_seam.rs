@@ -30,7 +30,7 @@ fn device() -> Device {
 }
 
 /// Nano's shape at a debug-build-friendly width: everything that defines
-/// the seam (PonderNet iterations, expert count, aux weights, KDA+MSA+Engram
+/// the seam (loop iterations, expert count, aux weights, KDA+MSA+Engram
 /// arms, vocab 256) stays nano; only the widths shrink. use_gr stays false
 /// and bf16 stays off (CPU is fp32-only anyway).
 fn nano_cfg() -> DormouseConfig {
@@ -156,21 +156,19 @@ fn forward_smoke() {
 
     // No teacher: the JEPA term drops (needs the EMA copy) but DSpark keeps
     // `aux` alive at nano's dspark_weight = 0.1.
-    let (logits, rec, p_dist, kda, aux) =
+    let (logits, rec, kda, aux) =
         model.forward_with_hidden::<B>(x, Some(h), None, Some(y), None);
 
     assert_eq!(logits.dims(), [b, s, cfg.vocab]);
     assert_eq!(rec.dims(), [1]);
-    assert_eq!(p_dist.dims(), [b, cfg.max_iter]);
     assert_eq!(kda.dims().len(), 4, "kda state must be a Tensor<4>");
     assert_eq!(kda.dims()[0], b, "kda state batch dim");
     assert_all_finite("logits", &logits);
     assert_all_finite("rec", &rec);
-    assert_all_finite("p_dist", &p_dist);
     assert_all_finite("kda", &kda);
     let aux = aux.expect("aux must be Some (dspark_weight > 0, targets given)");
     assert_all_finite("aux", &aux);
-    let loss = model.loss::<B>(rec, p_dist);
+    let loss = model.loss::<B>(rec);
     assert_all_finite("loss", &loss);
     println!(
         "forward_smoke ok: loss={:.4} aux={:.4} ({} ms)",
@@ -219,13 +217,12 @@ fn kda_long_stability() {
     let h = hashed_ids(&bytes, b, s, &dev);
     let y = targets(&bytes, b, s, &dev);
 
-    let (logits, rec, p_dist, kda, aux) =
+    let (logits, rec, kda, aux) =
         model.forward_with_hidden::<B>(x, Some(h), None, Some(y), None);
     assert_all_finite("logits", &logits);
     assert_all_finite("rec", &rec);
-    assert_all_finite("p_dist", &p_dist);
     assert_all_finite("kda", &kda);
-    let mut loss = model.loss::<B>(rec, p_dist);
+    let mut loss = model.loss::<B>(rec);
     if let Some(a) = aux {
         assert_all_finite("aux", &a);
         loss = loss + a;
@@ -241,10 +238,9 @@ fn kda_long_stability() {
     println!("kda_long_stability ok ({} ms)", t0.elapsed().as_millis());
 }
 
-/// Backward through the full loss (CE + PonderNet KL + JEPA + DSpark):
-/// every named float parameter on a live grad path receives a finite
-/// gradient; controller and halt head must receive gradients (PonderNet
-/// halting and routing stay connected).
+/// Backward through the full loss (CE + JEPA + DSpark): every named float
+/// parameter on a live grad path receives a finite gradient; the controller
+/// must receive a gradient (routing stays connected).
 ///
 /// Two documented exceptions - anything else missing fails the test:
 /// - `msa.index_branch.{q,k}_proj`: the top-k block selection is
@@ -276,14 +272,14 @@ fn gradient_flow() {
     let h = hashed_ids(&bytes, b, s, &dev);
     let y = targets(&bytes, b, s, &dev);
 
-    let (_logits, rec, p_dist, _kda, aux) = model.forward_with_hidden::<B>(
+    let (_logits, rec, _kda, aux) = model.forward_with_hidden::<B>(
         x.clone(),
         Some(h.clone()),
         None,
         Some(y.clone()),
         Some(&teacher),
     );
-    let mut loss = model.loss::<B>(rec, p_dist);
+    let mut loss = model.loss::<B>(rec);
     if let Some(a) = aux {
         loss = loss + a;
     }
@@ -382,8 +378,7 @@ fn gradient_flow() {
     for (p, n) in &zeros {
         println!("  zero-grad-norm: {p} ({n:.2e})");
     }
-    // Halt head must carry signal even at ReZero zero (the PonderNet KL term
-    // does not pass through the residual scale). The controller's gradient is
+    // The halt head is gone (ADR-0013); the controller's gradient is
     // legitimately zero at init: everything it gates is multiplied by the
     // zero residual scale. So the wiring assert runs a second backward with
     // the scale bumped to 1 - one optimizer step's worth - where the
@@ -394,18 +389,16 @@ fn gradient_flow() {
             .unwrap_or_else(|| panic!("{want} not found in module tree"))
             .2
     };
-    let halt0 = head_norm(&probe.rows, "loop_block.halt_head.weight");
-    assert!(halt0 > 0.0, "halt_head grad norm at init is {halt0}");
     let ctrl0 = head_norm(&probe.rows, "loop_block.controller.weight");
     println!(
-        "gradient_flow at init: halt_head norm={halt0:.3e}, controller norm={ctrl0:.3e} (ReZero scale=0 zeroes the controller's path)"
+        "gradient_flow at init: controller norm={ctrl0:.3e} (ReZero scale=0 zeroes the controller's path)"
     );
 
     model.loop_block.residual_scale =
         burn::module::Param::from_tensor(Tensor::<1>::ones([1], &dev));
-    let (_l, rec, pd, _k, aux) =
+    let (_l, rec, _k, aux) =
         model.forward_with_hidden::<B>(x, Some(h), None, Some(y), Some(&teacher));
-    let mut loss = model.loss::<B>(rec, pd);
+    let mut loss = model.loss::<B>(rec);
     if let Some(a) = aux {
         loss = loss + a;
     }
@@ -417,10 +410,7 @@ fn gradient_flow() {
     };
     model.visit(&mut probe1);
     let ctrl1 = head_norm(&probe1.rows, "loop_block.controller.weight");
-    let halt1 = head_norm(&probe1.rows, "loop_block.halt_head.weight");
-    println!(
-        "gradient_flow at scale=1: controller norm={ctrl1:.3e}, halt_head norm={halt1:.3e}"
-    );
+    println!("gradient_flow at scale=1: controller norm={ctrl1:.3e}");
     assert!(
         ctrl1 > 0.0,
         "controller grad norm stays zero with residual scale on: {ctrl1}"
@@ -444,7 +434,7 @@ fn aux_heads() {
     let h = hashed_ids(&bytes, b, s, &dev);
     let y = targets(&bytes, b, s, &dev);
 
-    let (_l1, _rec, _pd, _k, aux) = model.forward_with_hidden::<B>(
+    let (_l1, _rec, _k, aux) = model.forward_with_hidden::<B>(
         x.clone(),
         Some(h.clone()),
         None,
@@ -468,10 +458,9 @@ fn aux_heads() {
         tw.iter().all(|v| v.is_finite()),
         "teacher params went non-finite after ema_update"
     );
-    let (_l2, rec2, pd2, _k2, aux2) =
+    let (_l2, rec2, _k2, aux2) =
         model.forward_with_hidden::<B>(x, Some(h), None, Some(y), Some(&teacher));
     assert_all_finite("rec(2nd)", &rec2);
-    assert_all_finite("p_dist(2nd)", &pd2);
     let aux2 = aux2.expect("aux must still be Some after the EMA advance");
     assert_all_finite("aux(2nd)", &aux2);
     println!(
@@ -507,7 +496,7 @@ fn engram_host_rows() {
     let x = input_ids(&bytes, b, s, &dev);
 
     let zeros = Tensor::<3>::zeros([b, s, ROW_DIM], &dev);
-    let (lz, _rec, _pd, _k, _aux) =
+    let (lz, _rec, _k, _aux) =
         model.forward_with_hidden::<B>(x.clone(), None, Some(zeros), None, None);
     assert_all_finite("logits(zero rows)", &lz);
 
@@ -516,7 +505,7 @@ fn engram_host_rows() {
         .map(|_| (rng.next() % 2000) as f32 / 1000.0 - 1.0)
         .collect();
     let rnd = Tensor::<3>::from_data(TensorData::new(rows, [b, s, ROW_DIM]), &dev);
-    let (lr, _rec, _pd, _k, _aux) =
+    let (lr, _rec, _k, _aux) =
         model.forward_with_hidden::<B>(x, None, Some(rnd), None, None);
     assert_all_finite("logits(random rows)", &lr);
 

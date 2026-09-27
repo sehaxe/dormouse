@@ -83,9 +83,9 @@ fn ckpt_roundtrip_identical_logits() {
     let x = Tensor::from_data(TensorData::new(v, [b, s]), &dev);
     let h = hashed_ids(&bytes, b, s, &dev);
 
-    let (l1, _rec1, _pd1, _k1, _aux1) =
+    let (l1, _rec1, _k1, _aux1) =
         model.forward_with_hidden::<Backend>(x.clone(), Some(h.clone()), None, None, None);
-    let (l2, _rec2, _pd2, _k2, _aux2) =
+    let (l2, _rec2, _k2, _aux2) =
         model2.forward_with_hidden::<Backend>(x, Some(h), None, None, None);
 
     let v1: Vec<f32> = l1

@@ -36,10 +36,6 @@ pub struct DormouseModel {
     #[module(skip)]
     pub dspark_stride: usize,
     #[module(skip)]
-    pub ponder_beta: f32,
-    #[module(skip)]
-    pub ponder_prior: f32,
-    #[module(skip)]
     pub max_seq_len: usize,
 }
 
@@ -62,8 +58,6 @@ impl DormouseModel {
             dspark_weight: cfg.dspark_weight,
             dspark_k: cfg.dspark_k,
             dspark_stride: cfg.dspark_stride,
-            ponder_beta: cfg.ponder_beta,
-            ponder_prior: cfg.ponder_prior,
             max_seq_len: cfg.max_seq_len,
         }
     }
@@ -100,13 +94,13 @@ impl DormouseModel {
         } else {
             x
         };
-        let (out_acc, _rec, _p, _kda) = self.loop_block.forward_full_state::<B>(
+        let (out_acc, _rec, _kda) = self.loop_block.forward_full_state::<B>(
             x, hashed_ids, host_rows, None, None, &self.lm_head,
         );
         out_acc
     }
 
-    /// Returns (logits, L_Rec [1], p_dist [b,N], kda, aux Option<[1]>). When
+    /// Returns (logits, L_Rec [1], kda, aux Option<[1]>). When
     /// `targets` is Some, the per-step reconstruction loss is accumulated
     /// inside the loop block so the model never slices a 4D autodiff tensor
     /// (cubecl/sm_120 stability). `host_rows` carries pre-gathered n-gram
@@ -123,7 +117,7 @@ impl DormouseModel {
         host_rows: Option<Tensor<3>>,
         targets: Option<Tensor<2, Int>>,
         teacher: Option<&Self>,
-    ) -> (Tensor<3>, Tensor<1>, Tensor<2>, Tensor<4>, Option<Tensor<1>>)
+    ) -> (Tensor<3>, Tensor<1>, Tensor<4>, Option<Tensor<1>>)
     where
         DispatchTensor: DispatchKindConversion<B>
             + DispatchKindConversion<B::InnerBackend>
@@ -153,7 +147,7 @@ impl DormouseModel {
         host_rows: Option<Tensor<3>>,
         targets: Option<Tensor<2, Int>>,
         jepa_target: Option<Tensor<3>>,
-    ) -> (Tensor<3>, Tensor<1>, Tensor<2>, Tensor<4>, Option<Tensor<1>>)
+    ) -> (Tensor<3>, Tensor<1>, Tensor<4>, Option<Tensor<1>>)
     where
         DispatchTensor: DispatchKindConversion<B>
             + DispatchKindConversion<B::InnerBackend>
@@ -171,7 +165,7 @@ impl DormouseModel {
         host_rows: Option<Tensor<3>>,
         targets: Option<Tensor<2, Int>>,
         teacher_latent: Option<Tensor<3>>,
-    ) -> (Tensor<3>, Tensor<1>, Tensor<2>, Tensor<4>, Option<Tensor<1>>)
+    ) -> (Tensor<3>, Tensor<1>, Tensor<4>, Option<Tensor<1>>)
     where
         DispatchTensor: DispatchKindConversion<B>
             + DispatchKindConversion<B::InnerBackend>
@@ -187,7 +181,7 @@ impl DormouseModel {
         let [b, t, _d] = x.dims();
         // Indices for the in-loop L_Rec gather (no one-hot [b*t,v] tensor).
         let tgt = targets.map(|tg| tg.reshape([b * t, 1]));
-        let (out_acc, rec, p_dist, kda) =
+        let (out_acc, rec, kda) =
             self.loop_block
                 .forward_full_state::<B>(x, hashed_ids, host_rows, None, tgt, &self.lm_head);
         // loop activations may be bf16; the final norm+head compute in fp32
@@ -202,7 +196,7 @@ impl DormouseModel {
             .forward::<B>(h.clone().reshape([b * t, self.d_model]))
             .reshape([b, t, self.vocab_size]);
         let aux = self.aux_loss::<B>(&out_acc, teacher_latent, ids_raw, &h, &logits);
-        (logits, rec, p_dist, kda, aux)
+        (logits, rec, kda, aux)
     }
 
     /// Weight-combined auxiliary loss (JEPA + DSpark). None when every aux
@@ -210,10 +204,7 @@ impl DormouseModel {
     /// teacher latent was supplied. `teacher_latent` is either the live EMA
     /// teacher's out_acc (online) or a precomputed frozen target (offline);
     /// both are detached here - the latent is a stop-grad target.
-    ///
-    /// Public so the fused path can run the aux heads on the burn path from
-    /// the op's exposed latents (out_acc, h) - the flagship wiring.
-    pub fn aux_loss<B: burn::backend::AutodiffBackend>(
+    fn aux_loss<B: burn::backend::AutodiffBackend>(
         &self,
         student_latent: &Tensor<3>,
         teacher_latent: Option<Tensor<3>>,
@@ -261,52 +252,14 @@ impl DormouseModel {
         total
     }
 
-    /// PonderNet loss (Banino et al. 2021): L = L_Rec + β·KL(p || Geom(λ_p)).
-    pub fn loss<B: burn::backend::AutodiffBackend>(&self, rec_ce: Tensor<1>, p_dist: Tensor<2>) -> Tensor<1>
+    /// The training loss: the honest mean CE from the loop (ADR-0013).
+    pub fn loss<B: burn::backend::AutodiffBackend>(&self, rec_ce: Tensor<1>) -> Tensor<1>
     where
         DispatchTensor: DispatchKindConversion<B>
             + DispatchKindConversion<B::InnerBackend>
             + DispatchKindConversion<burn::backend::Autodiff<B::InnerBackend>>,
     {
-        if !self.loop_block.use_halting {
-            return rec_ce; // fixed depth: no halting distribution to regularize
-        }
-        let kl = self.ponder_kl(p_dist, self.ponder_prior); // [1]
-        rec_ce + kl.mul_scalar(self.ponder_beta)
-    }
-
-    /// KL(p_dist || truncated-geometric(λ_p)); p_dist is [b, N].
-    pub(crate) fn ponder_kl(&self, p_dist: Tensor<2>, lambda_p: f32) -> Tensor<1> {
-        let n = p_dist.dims()[1];
-        let b = p_dist.dims()[0];
-        let dev = p_dist.device();
-        // Truncated-geometric prior pmf over the N halting steps, renormalized
-        // so the support sums to 1.
-        let mut prior = Vec::with_capacity(n);
-        let mut mass = 1.0f32;
-        let mut total = 0.0f32;
-        for _ in 0..n {
-            let prob = lambda_p * mass;
-            prior.push(prob);
-            total += prob;
-            mass *= 1.0 - lambda_p;
-        }
-        let inv = 1.0 / total;
-        let prior_v: Vec<f32> = prior.iter().map(|x| x * inv).collect();
-        let prior_probs =
-            Tensor::<1>::from_data(TensorData::new(prior_v.clone(), [n]), &dev);
-        let prior_log = prior_probs.clone().log();
-        // KL(Prior || p), prior-weighted. The p||prior direction made halting
-        // collapse FREE: as p -> 0, p*log(p/prior) -> 0, so the optimizer
-        // silenced the halt head, rec = sum(p*CE) -> 0 became a fake loss and
-        // out_acc -> 0 (uniform eval, noise generation). Prior-weighted KL
-        // diverges instead, forcing p toward the prior. eps guards log(0).
-        let log_p = (p_dist.clone() + 1e-8).log();
-        let term = prior_probs.unsqueeze_dim::<2>(0)
-            * (prior_log.unsqueeze_dim::<2>(0) - log_p); // [b, N]
-        // Mean over batch and steps -> [1]. The double sum + reshape is robust
-        // to whether sum_dim keeps the reduced dimension.
-        term.sum_dim(1).sum_dim(0).reshape([1]).div_scalar((b * n) as f32)
+        rec_ce
     }
 
     /// Apply a quantization format to every TSCT factor in the model

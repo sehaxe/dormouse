@@ -120,11 +120,9 @@ mod tests {
     #[test]
     fn presets_match_original_values() {
         let n = load_config("nano").unwrap();
-        assert_eq!(n.d_model, 512); assert_eq!(n.rank, 96); assert_eq!(n.ponder_prior, 0.4);
-        assert_eq!(n.n_experts, 3); assert_eq!(n.max_iter, 4);
+        assert_eq!(n.d_model, 512); assert_eq!(n.rank, 96); assert_eq!(n.n_experts, 3); assert_eq!(n.max_iter, 4);
         let s = load_config("small").unwrap();
         assert_eq!(s.d_model, 768); assert_eq!(s.rank, 64); assert_eq!(s.max_iter, 4);
-        assert!((s.ponder_prior as f64 - 2.0/9.0).abs() < 1e-6);
         let b = load_config("base").unwrap();
         assert_eq!(b.d_model, 1024); assert_eq!(b.d_ffn, 2816); assert_eq!(b.max_seq_len, 1024);
         let sw = load_config("swift50").unwrap();
@@ -132,7 +130,7 @@ mod tests {
         assert_eq!(sw.dspark_weight, 0.0);
         let o = load_config("one_b").unwrap();
         assert_eq!(o.d_model, 2048); assert_eq!(o.max_seq_len, 2048); assert_eq!(o.max_iter, 12);
-        assert_eq!(o.n_experts, 4); assert!((o.ponder_prior as f64 - 2.0/13.0).abs() < 1e-6);
+        assert_eq!(o.n_experts, 4);
         for name in ["nano","small","base","swift50","one_b"] {
             let c = load_config(name).unwrap();
             super::super::validation::validate(&c).expect(name);

@@ -68,8 +68,6 @@ fn d_msa_block() -> usize { 32 }
 fn d_true() -> bool { true }
 fn d_false() -> bool { false }
 fn d_n_experts() -> usize { 3 }
-fn d_ponder_beta() -> f32 { 0.01 }
-fn d_ponder_prior() -> f32 { 0.2222222222222222 }
 fn d_jepa_weight() -> f32 { 0.05 }
 fn d_jepa_mask_frac() -> f32 { 0.15 }
 fn d_jepa_mask_span() -> usize { 8 }
@@ -94,17 +92,10 @@ pub struct DormouseConfig {
     #[serde(default = "d_msa_topk")] pub msa_topk: usize,
     #[serde(default = "d_msa_block")] pub msa_block: usize,
     #[serde(default = "d_false")] pub use_msa: bool,
-    /// PonderNet probabilistic halting. OFF by default: with the (now fixed)
-    /// prior-weighted KL the lambda-collapse still wins at practical beta —
-    /// p->0 zeroes rec (a fake loss) and out_acc (uniform eval). Re-enter
-    /// via --set use_halting=true only with an A/B win (ADR-0013).
-    #[serde(default = "d_false")] pub use_halting: bool,
     #[serde(default = "d_true")] pub use_kda: bool,
     #[serde(default = "d_true")] pub use_engram: bool,
     #[serde(default)] pub use_gr: bool,
     #[serde(default = "d_n_experts")] pub n_experts: usize,
-    #[serde(default = "d_ponder_beta")] pub ponder_beta: f32,
-    #[serde(default = "d_ponder_prior")] pub ponder_prior: f32,
     #[serde(default = "d_jepa_weight")] pub jepa_weight: f32,
     #[serde(default = "d_jepa_mask_frac")] pub jepa_mask_frac: f32,
     #[serde(default = "d_jepa_mask_span")] pub jepa_mask_span: usize,

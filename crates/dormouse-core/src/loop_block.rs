@@ -1,6 +1,7 @@
-//! loop - mini UniversalLoop on fused kernels: controller + shared attention
-//! (KDA+MSA) + expert TSCT FFNs + Engram + PonderNet halt head + e_k
-//! (iteration embedding) + ReZero residual scale.
+//! loop - mini UniversalLoop: controller + shared attention (KDA+MSA) +
+//! expert TSCT FFNs + Engram + e_k (iteration embedding) + ReZero residual
+//! scale. Fixed depth (ADR-0013): every iteration counts equally, the loss
+//! is an honest unweighted CE.
 use burn::backend::DispatchKindConversion;
 use burn::module::Module;
 use burn::nn::{Linear, LinearConfig};
@@ -36,7 +37,6 @@ pub struct LoopBlock {
     pub engram: EngramModule,
     pub norm: RMSNorm,
     pub gr: Option<GatedResidual>,
-    pub halt_head: Linear,
     pub iter_embed: burn::module::Param<Tensor<2>>,
     pub residual_scale: burn::module::Param<Tensor<1>>,
     pub out_proj: LinearLike,
@@ -51,7 +51,6 @@ pub struct LoopBlock {
     #[module(skip)]
     #[module(skip)]
     pub use_msa: bool,
-    pub use_halting: bool,
     #[module(skip)]
     pub use_kda: bool,
     #[module(skip)]
@@ -119,7 +118,6 @@ impl LoopBlock {
             engram: EngramModule::new(&[4096, 4096, 4096], 32, d, 1, device),
             norm: RMSNorm::new(d, cfg.norm_eps, device),
             gr: cfg.use_gr.then(|| GatedResidual::new(d, device)),
-            halt_head: LinearConfig::new(d, 1).with_bias(false).init(device),
             iter_embed,
             residual_scale: burn::module::Param::from_tensor(Tensor::zeros([1], device)),
             out_proj: LinearLike::new(d, d, cfg.rank, device),
@@ -128,7 +126,6 @@ impl LoopBlock {
             ffn_hidden: f,
             n_experts: cfg.n_experts,
             use_msa: cfg.use_msa,
-            use_halting: cfg.use_halting,
             use_kda: cfg.use_kda,
             use_engram: cfg.use_engram,
             bf16: cfg.bf16,
@@ -147,7 +144,7 @@ impl LoopBlock {
         // Target byte indices [b*t, 1]: L_Rec gathers their log-probs.
         targets: Option<Tensor<2, Int>>,
         lm_head: &LinearLike,
-    ) -> (Tensor<3>, Tensor<1>, Tensor<2>, Tensor<4>)
+    ) -> (Tensor<3>, Tensor<1>, Tensor<4>)
     where
         DispatchTensor: DispatchKindConversion<B>
             + DispatchKindConversion<B::InnerBackend>
@@ -165,19 +162,17 @@ impl LoopBlock {
             Vec::new()
         };
         let mut kda_s: Option<Tensor<4>> = kda_state;
-        // PonderNet accumulators (Banino et al. 2021, arXiv:2107.05407)
-        let mut not_halted = Tensor::<2>::ones([b, 1], &h.device());
+        // Fixed depth (ADR-0013): out_acc averages the per-iteration outputs.
         let mut out_acc = Tensor::<3>::zeros([b, t, d], &h.device());
-        let mut p_rows: Vec<Tensor<2>> = Vec::with_capacity(self.max_iter);
-        // L_Rec = mean_b Σ_n p_n·CE(ŷ_n, y), accumulated inside the loop so we
-        // never materialize/slice the [N,b,t,d] tensor: dynamic slicing of a 4D
-        // autodiff tensor crashes cubecl on sm_120 (CUDA_ERROR_ILLEGAL_ADDRESS).
+        // L_Rec = mean over iterations and batch of CE(ŷ_n, y), accumulated
+        // inside the loop so we never materialize/slice the [N,b,t,d] tensor:
+        // dynamic slicing of a 4D autodiff tensor crashes cubecl on sm_120
+        // (CUDA_ERROR_ILLEGAL_ADDRESS).
         let mut rec = Tensor::<1>::zeros([1], &h.device());
         // Pre-compute loop invariants once: fewer per-iteration allocations
         // and graph nodes. Arm switches are plain config fields (A/B via the
         // CLI, not env).
         let h0_flat = h0.clone().reshape([b * t, d]);
-        let ones_bh1 = Tensor::<2>::ones([b, 1], &h.device());
         let act_fmt: Option<(crate::act_quant::ActFormat, usize)> =
             self.act_quant.map(|q| (q.into(), self.act_group));
         let use_kda = self.use_kda;
@@ -335,44 +330,13 @@ impl LoopBlock {
                 h = h_ctx.clone() + y.mul(scale).cast(h_ctx.dtype());
             }
 
-            // PonderNet readout + probabilistic halting:
-            // λ_n = cond. halt prob; p_n = λ_n · Π_{j<n}(1-λ_j) (truncated geometric);
-            // output accumulates the p-weighted expectation of per-step logits.
+            // Per-iteration readout. Fixed depth (ADR-0013): uniform
+            // iteration weights and an honest unweighted CE — the PonderNet
+            // variant lost its A/B (lambda collapse zeroed rec, a fake loss,
+            // and out_acc, uniform outputs).
             let step_out = self.out_proj.forward::<B>(h.clone().reshape([b * t, d])).reshape([b, t, d]);
-            if !self.use_halting {
-                // Fixed depth: uniform iteration weights, no PonderNet. The
-                // halting variant lost its A/B (ADR-0013) — lambda collapse
-                // zeroed rec (a fake loss) and out_acc (uniform outputs).
-                let w = 1.0f32 / self.max_iter as f32;
-                out_acc = out_acc + step_out.clone().mul_scalar(w);
-                // real (unweighted) CE so the loss stays an honest objective
-                if let Some(tgt) = &targets {
-                    let so = if bf16 { step_out.clone().cast(FloatDType::F32) } else { step_out.clone() };
-                    let logits_n = lm_head.forward::<B>(so.reshape([b * t, d])); // [b*t, v]
-                    let ce = burn::tensor::activation::log_softmax(logits_n, 1)
-                        .gather(1, tgt.clone())
-                        .neg()
-                        .reshape([b, t])
-                        .sum_dim(1)
-                        .div_scalar(t as f32); // [b]
-                    rec = rec + ce.sum_dim(0).reshape([1]).div_scalar(self.max_iter as f32);
-                }
-                h = h_ctx.clone();
-                continue;
-            }
-            let halt_in = if bf16 {
-                h_ctx.clone().mean_dim(1).reshape([b, d]).cast(FloatDType::F32)
-            } else {
-                h_ctx.clone().mean_dim(1).reshape([b, d])
-            };
-            let lam = activation::sigmoid(
-                self.halt_head.forward(halt_in),
-            ); // [b,1]
-            let p_n = lam.clone() * not_halted.clone();
-            out_acc = out_acc + step_out.clone().mul(p_n.clone().unsqueeze_dim::<3>(2));
-            p_rows.push(p_n.clone());
-            not_halted = not_halted * (ones_bh1.clone() - lam.clone());
-            // L_Rec: per-step CE (fp32 logits) weighted by the halting dist p_n.
+            let w = 1.0f32 / self.max_iter as f32;
+            out_acc = out_acc + step_out.clone().mul_scalar(w);
             if let Some(tgt) = &targets {
                 let so = if bf16 { step_out.clone().cast(FloatDType::F32) } else { step_out.clone() };
                 let logits_n = lm_head.forward::<B>(so.reshape([b * t, d])); // [b*t, v]
@@ -385,19 +349,15 @@ impl LoopBlock {
                     .reshape([b, t])
                     .sum_dim(1)
                     .div_scalar(t as f32); // [b]
-                let pn = p_n.clone().reshape([b, 1]); // [b,1]
-                rec = rec + (pn * ce.reshape([b, 1])).sum_dim(0).reshape([1]);
+                rec = rec + ce.sum_dim(0).reshape([1]).div_scalar(self.max_iter as f32);
             }
+            // The readout consumed the post-residual h; the recurrence reset
+            // it to the block input (per-iteration writes reach the loss via
+            // step_out/out_acc, not the next iteration).
+            h = h_ctx.clone();
         }
         let rec = rec.div_scalar(b as f32); // mean over batch
-        // Fixed depth never fills p_rows: p_dist is unused there (loss skips
-        // the KL when halting is off), so a [b, 1] zero placeholder suffices.
-        let p_dist = if self.use_halting {
-            Tensor::cat(p_rows, 1) // [b, N]
-        } else {
-            Tensor::zeros([b, 1], &h.device())
-        };
         let kda = kda_s.unwrap_or_else(|| Tensor::zeros([1, 1, 1, 1], &h.device()));
-        (out_acc, rec, p_dist, kda)
+        (out_acc, rec, kda)
     }
 }

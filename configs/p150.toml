@@ -7,6 +7,5 @@ d_ffn = 11264
 n_experts = 4
 max_iter = 12
 max_seq_len = 2048
-ponder_prior = 0.15384615384615385
 # core params measured with the header probe: 159,720,195
 # Engram rows live in host RAM as a train-side knob (--engram-slots), not here.
