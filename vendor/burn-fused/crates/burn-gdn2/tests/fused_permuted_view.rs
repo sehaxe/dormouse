@@ -57,10 +57,12 @@
 
 use burn::backend::AutodiffBackend;
 use burn::tensor::{Bytes, Device, Distribution, Tensor};
-use burn_autodiff::Autodiff;
 use burn_autodiff::checkpoint::strategy::BalancedCheckpointing;
+use burn_autodiff::Autodiff;
 use burn_gdn2::alloc_trace::{contiguous_copies, reset_contiguous};
-use burn_gdn2::{chunk_dispatch, chunk_wy_forward, fused_calls, reset_fused_calls, CudaBare, Fused};
+use burn_gdn2::{
+    chunk_dispatch, chunk_wy_forward, fused_calls, reset_fused_calls, CudaBare, Fused,
+};
 
 type AdBal = Autodiff<CudaBare, BalancedCheckpointing>;
 
@@ -108,13 +110,19 @@ fn rnd<const D: usize>(device: &Device, shape: [usize; D], mean: f64) -> Tensor<
 fn project_to_4d(t: Tensor<3>, heads: usize, d: usize) -> Tensor<4> {
     let [b, tokens, hk] = t.shape().dims::<3>();
     assert_eq!(hk, heads * d, "the projection must be [B,T,H*D]");
-    t.reshape([b, tokens, heads, d])
-        .permute([0, 2, 1, 3])
+    t.reshape([b, tokens, heads, d]).permute([0, 2, 1, 3])
 }
 
 /// The seven op inputs, transposed exactly as the trainer transposes them: six
 /// token-side tensors `[B,T,H,D] -> [B,H,T,D]`, and the state `[B,H,K,V]`
 /// which the trainer starts each loop as a contiguous zeros leaf.
+///
+/// Returns `(side_leaves, state_leaf, op_inputs)`. The leaves come back
+/// separately because the op's parents are `permute` NODES, not leaves:
+/// `permute`'s own backward consumes its gradient and forwards it onward, so
+/// after a complete `backward()` the gradient is registered on the leaves and
+/// `grad()` on a permute output is `None`. A test asserting on the transposed
+/// views reports "no gradient" for a seam that worked perfectly.
 fn strided_inputs(
     device: &Device,
     batch: usize,
@@ -122,31 +130,42 @@ fn strided_inputs(
     time: usize,
     k: usize,
     v: usize,
-) -> [Tensor<4>; 7] {
+) -> ([Tensor<3>; 6], Tensor<4>, [Tensor<4>; 7]) {
     // The activation comes first, like `project()` does (silu / sigmoid / log),
     // and the view ops last, so the op's parent is a node over a strided buffer.
-    let side = |d: usize, mean: f64| -> Tensor<4> {
-        project_to_4d(
-            lift!(rnd(device, [batch, time, heads * d], mean)).mul_scalar(0.5),
-            heads,
-            d,
-        )
-    };
-    [
-        side(k, 0.0),
-        side(k, 0.0),
-        side(v, 0.0),
-        // negative, like a log decay the model produces
-        project_to_4d(
-            lift!(rnd(device, [batch, time, heads * k], -1.0)).exp().log(),
-            heads,
-            k,
-        ),
-        side(k, 0.0),
-        side(v, 0.0),
-        // the state: contiguous, like the trainer's zeros
-        lift!(rnd(device, [batch, heads, k, v], 0.0)),
-    ]
+    // Six explicit sides rather than a closure over a captured Vec: the array
+    // literal evaluates left to right, so the leaf order is the input order and
+    // the borrow checker can see it.
+    let l0 = lift!(rnd(device, [batch, time, heads * k], 0.0));
+    let l1 = lift!(rnd(device, [batch, time, heads * k], 0.0));
+    let l2 = lift!(rnd(device, [batch, time, heads * v], 0.0));
+    // the decay gate through a log, like `alpha.log()`: negative, as a decay
+    // the model produces
+    let l3 = lift!(rnd(device, [batch, time, heads * k], -1.0));
+    let l4 = lift!(rnd(device, [batch, time, heads * k], 0.0));
+    let l5 = lift!(rnd(device, [batch, time, heads * v], 0.0));
+    // the state: contiguous, like the trainer's zeros
+    let state = lift!(rnd(device, [batch, heads, k, v], 0.0));
+    (
+        [
+            l0.clone(),
+            l1.clone(),
+            l2.clone(),
+            l3.clone(),
+            l4.clone(),
+            l5.clone(),
+        ],
+        state.clone(),
+        [
+            project_to_4d(l0.mul_scalar(0.5), heads, k),
+            project_to_4d(l1.mul_scalar(0.5), heads, k),
+            project_to_4d(l2.mul_scalar(0.5), heads, v),
+            project_to_4d(l3.exp().log(), heads, k),
+            project_to_4d(l4.mul_scalar(0.5), heads, k),
+            project_to_4d(l5.mul_scalar(0.5), heads, v),
+            state,
+        ],
+    )
 }
 
 /// The same seven shapes with NO transposition: the control. A materializer
@@ -171,11 +190,7 @@ fn contiguous_inputs(
     ]
 }
 
-fn run_op(
-    inp: &[Tensor<4>; 7],
-    scale: f64,
-    chunk: usize,
-) -> (Tensor<4>, Tensor<4>, &'static str) {
+fn run_op(inp: &[Tensor<4>; 7], scale: f64, chunk: usize) -> (Tensor<4>, Tensor<4>, &'static str) {
     match chunk_dispatch::<AdBal>(
         inp[0].clone(),
         inp[1].clone(),
@@ -222,36 +237,29 @@ fn contiguous_inputs_are_left_alone() {
 /// with the fused forward engaged, the views materialized once each, and the
 /// numbers unchanged.
 ///
-/// # `#[ignore]`d: the materializer is proven, the ADJOINT it feeds is not
+/// # GREEN on hardware, 2026-09-28
 ///
-/// Half of this test is green and stays that way: `contiguous_inputs_are_left_alone`
-/// ran on hardware 2026-09-28 and passed, and with the fixture fixed the forward
-/// half of this test — `copies >= 6`, zero fallbacks, the fused launch, the
-/// caller's tensors unmutated, the output equal to the tensor path — ran too, on
-/// the same card, inside the trainer smoke (`fused kda=12/0`).
+/// The tail that had never run — `loss.backward()` — runs, and this test is no
+/// longer `#[ignore]`d. The `#[ignore]` named the adjoint's `strip(k)` refusal,
+/// which was real; what it did not say is that the test also asserted its
+/// gradient on the wrong tensors. The op's parents are `permute` NODES, and
+/// `permute`'s own backward forwards the gradient onward, so `grad()` on a
+/// permute output is `None` after a full backward however well the seam worked.
+/// `strided_inputs` now hands the LEAVES back and the assertion is made there —
+/// which is where a model parameter's gradient actually lands.
 ///
-/// What has never passed is the tail: `loss.backward()`, which reaches
-/// `src/autodiff.rs:195` and refuses, because the fused adjoint is not live yet.
-/// So the test is `#[ignore]`d rather than left red — a permanently red suite
-/// trains everyone to ignore red, and this project's retracted claims all came
-/// from green-looking checks covering something other than what they said.
-///
-/// When un-ignored it proves the WHOLE seam on the trainer's own layout: a
-/// transposed-view input is materialized rather than read as contiguous, the
-/// fused forward launches, the fused adjoint launches, the backward completes
-/// and every input gets a non-zero gradient, the caller's tensors are unchanged
-/// by the materialization, and the fused forward still equals the tensor path.
-///
-/// Run it on demand:
-/// `cargo test -p burn-gdn2 --release --features cuda,autodiff --test fused_permuted_view -- --ignored --exact a_strided_input_reaches_the_fused_kernels_and_completes_a_backward --nocapture`
+/// So this proves the whole seam on the trainer's own layout: a transposed-view
+/// input is materialized rather than read as contiguous, the fused forward
+/// launches, the fused adjoint launches, the backward completes, every leaf gets
+/// a non-zero gradient, the caller's tensors are unmutated by the
+/// materialization, and the fused forward still equals the tensor path.
 #[test]
-#[ignore = "the fused adjoint refuses at autodiff.rs:195; the forward half of this test ran green on hardware, the backward half never has"]
 fn a_strided_input_reaches_the_fused_kernels_and_completes_a_backward() {
     let device = Device::cuda(0);
     // Small: the overflow was shape-independent, so the reproducer must be too.
     let (batch, heads, time, k, v, chunk) = (1usize, 2usize, 64usize, 32usize, 32usize, 16usize);
     let scale = (k as f64).powf(-0.5);
-    let inp = strided_inputs(&device, batch, heads, time, k, v);
+    let (side_leaves, state_leaf, inp) = strided_inputs(&device, batch, heads, time, k, v);
     // Keep the values: a materialization that wrote in memory order instead of
     // logical order would leave the inputs alone and corrupt what the kernel
     // reads, so the numbers below are the check.
@@ -284,7 +292,18 @@ fn a_strided_input_reaches_the_fused_kernels_and_completes_a_backward() {
         .sum()
         .add(out.clone().sum().mul_scalar(0.5));
     let grads = loss.backward();
-    for (i, t) in inp.iter().enumerate() {
+    // On the LEAVES, not on the transposed views - see `strided_inputs`: the
+    // gradient reaches a model parameter, and asserting on the op's parents
+    // would be asserting on permute outputs whose own backward has already
+    // forwarded the gradient onward.
+    let state_grad = state_leaf
+        .grad(&grads)
+        .expect("the state leaf got no gradient");
+    assert!(
+        state_grad.abs().max().into_scalar::<f32>() > 0.0,
+        "the state leaf got a zero gradient"
+    );
+    for (i, t) in side_leaves.iter().enumerate() {
         let g = t
             .grad(&grads)
             .unwrap_or_else(|| panic!("input {i} got no gradient"));
@@ -305,8 +324,12 @@ fn a_strided_input_reaches_the_fused_kernels_and_completes_a_backward() {
 
     // And the fused forward must still be the chunked WY function, not a
     // differently-ordered copy of it: same numbers as the tensor path on the
-    // same transposed inputs.
-    let plain = strided_inputs(&device, batch, heads, time, k, v);
+    // SAME transposed inputs. The SAME inputs, not a second draw —
+    // `strided_inputs` generates from the device's RNG, and this used to build
+    // a fresh set here, so the comparison was between two different random
+    // tensors and read rel 1.19 on a seam that was correct. The device is not
+    // re-seeded between the two calls, so a fresh draw is a fresh value.
+    let plain = inp.clone();
     let (plain_out, _) = chunk_wy_forward(
         plain[0].clone(),
         plain[1].clone(),

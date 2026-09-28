@@ -160,7 +160,16 @@ fn gdn2_chunk_intra_adjoint_kernel<F: Float>(
             let e = gexp[kb + r * kd + k];
             let kk = k_buf[kb + r * kd + k];
             let bb = b_buf[kb + r * kd + k];
-            let bk = (bb * kk) * e;
+            // rhs_k = b·k·E, so the E-FREE factor every d_E term wants is
+            // bk = rhs_k/E = b·k. This line carried the extra `* e`, which
+            // made `e_rhsk` and `e_bke` below the adjoint of rhs_k with respect
+            // to b (already accounted for by `d_bk`) instead of with respect to
+            // E. It feeds nothing but d_e, so d_g was wrong and the other six
+            // gradients stayed exact - measured 2026-09-28 on CUDA, rel 3.5e-1
+            // against burn's autograd over the ops path, on a SINGLE chunk, so
+            // with no BPTT in the picture at all. See
+            // `tests/fused_adjoint_vs_ops.rs`.
+            let bk = bb * kk;
             let d_rhs_k = d_rhs_k_sh[r * kd + k];
             let d_qe_k = d_qe_sh[r * kd + k];
             let d_k_g = d_kg_sh[r * kd + k] + kg2;
@@ -404,9 +413,7 @@ pub mod cuda {
     /// CUDA `CubeBackend` and the buffer is row-major contiguous. A strided
     /// view is materialized once, never recursed into — see
     /// [`crate::kernel::contiguous_cube_of`].
-    fn cube_of<B: Backend, const D: usize>(
-        t: &Tensor<D>,
-    ) -> Option<CubeTensor>
+    fn cube_of<B: Backend, const D: usize>(t: &Tensor<D>) -> Option<CubeTensor>
     where
         DispatchTensor: DispatchKindConversion<B>,
     {
@@ -518,7 +525,10 @@ pub mod cuda {
         let d_s_out_c = cube_of::<B, 4>(&d_s).expect("backend mismatch");
         for (l, b) in [
             ("bwd:d_v_new", crate::alloc_trace::bytes_of(&d_v_new)),
-            ("bwd:d_s trajectory", crate::alloc_trace::bytes_of(&d_s_flat)),
+            (
+                "bwd:d_s trajectory",
+                crate::alloc_trace::bytes_of(&d_s_flat),
+            ),
             ("bwd:d_q", crate::alloc_trace::bytes_of(&d_q)),
             ("bwd:d_k", crate::alloc_trace::bytes_of(&d_k)),
             ("bwd:d_b", crate::alloc_trace::bytes_of(&d_b)),
@@ -530,9 +540,18 @@ pub mod cuda {
             crate::alloc_trace::note(l, b);
         }
         for (l, b) in [
-            ("bwd:d_k_bptt (discarded)", crate::alloc_trace::bytes_of(&d_k_bptt)),
-            ("bwd:d_e_bptt (discarded)", crate::alloc_trace::bytes_of(&d_e_bptt)),
-            ("bwd:d_e_last (discarded)", crate::alloc_trace::bytes_of(&d_e_last)),
+            (
+                "bwd:d_k_bptt (discarded)",
+                crate::alloc_trace::bytes_of(&d_k_bptt),
+            ),
+            (
+                "bwd:d_e_bptt (discarded)",
+                crate::alloc_trace::bytes_of(&d_e_bptt),
+            ),
+            (
+                "bwd:d_e_last (discarded)",
+                crate::alloc_trace::bytes_of(&d_e_last),
+            ),
         ] {
             crate::alloc_trace::note(l, b);
         }
@@ -602,10 +621,26 @@ pub mod cuda {
             2,
         );
         // batched [c,v]@[v,k] over b1 = B·H·nt (explicit 3D: the 5D matmul
-        // path reshapes internally in a way that breaks non-contiguous RHS)
+        // path reshapes internally in a way that breaks non-contiguous RHS).
         let b1 = batch * heads * nt;
+        //
+        // The contraction is over V, and `d_s` is stored [k][v], so the last
+        // two dims must be SWAPPED. `reshape` does not move elements — it
+        // reinterprets the buffer — so the old `reshape([b1, v_dim, k_dim])`
+        // contracted over K instead: d_k was off by rel 3.3e-1 and d_g by
+        // 6.2e-1 on a 4-chunk sequence, while every single-chunk case passed
+        // (d_s_shift is all zeros when there is no chunk to carry, so the bad
+        // contraction evaluated to nothing). Measured 2026-09-28 on CUDA
+        // against burn's autograd over the ops path; see
+        // `tests/fused_adjoint_vs_ops.rs`. `* 1.0` materializes the transposed
+        // view once, the same trick `forward.rs` uses on the permuted module
+        // inputs.
         let v_new_3 = v_new_r.clone().reshape([b1, c, v_dim]);
-        let d_s_3 = d_s_shift.clone().reshape([b1, v_dim, k_dim]);
+        let d_s_3 = d_s_shift
+            .clone()
+            .reshape([b1, k_dim, v_dim])
+            .swap_dims(1, 2)
+            * 1.0;
         let d_hat = v_new_3.matmul(d_s_3).reshape([batch, heads, nt, c, k_dim]); // [B,H,nt,c,k]
         let decay = fwd
             .glast

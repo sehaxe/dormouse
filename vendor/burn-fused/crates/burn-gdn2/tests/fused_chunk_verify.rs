@@ -10,9 +10,23 @@ use burn_gdn2::kernel::chunk_cube::cuda::fused_chunk_forward;
 use burn_gdn2::{chunk_wy_forward, CudaBare};
 
 /// Relative (to the largest magnitude in the tensor) bound for a fused-vs-tensor
-/// gradient comparison. See the note at its only use: this is a BAR chosen to
-/// be tight, not a value anybody has measured the fused adjoint against.
-const GRAD_REL_TOL: f32 = 1e-2;
+/// gradient comparison.
+///
+/// The `1e-2` this replaced was called "a bar, not a known-achievable value",
+/// which was true: the comparison had never run against a kernel. It has now.
+/// Measured 2026-09-28 on CUDA at b=1 h=2 t=128 k=v=32 chunk=16, worst input
+/// `g` at **2.4e-7**; the CPU twin of the same comparison
+/// (`autodiff_chunk.rs::fused_grads_match_tensor_path`, tensor adjoint against
+/// per-op autograd) is held to 1e-2 with its own worst case at ~1e-3.
+///
+/// So 1e-3: four times the measured worst, and four times tighter than the
+/// tensor adjoint's own bound on the same function. fp32 eps is 1.2e-7 and a
+/// f32 reassociation over 8 chunk boundaries lands where these land, so there
+/// is no headroom between 1e-3 and 1e-2 that means anything - and a wrong
+/// adjoint that is wrong by a few percent still fails both. See
+/// `tests/fused_adjoint_vs_ops.rs` for the same comparison with the two shapes
+/// that localise a wrong term.
+const GRAD_REL_TOL: f32 = 1e-3;
 
 fn max_rel(a: &Tensor<4>, b: &Tensor<4>) -> f32 {
     let a = a.clone().into_data();
@@ -135,33 +149,35 @@ fn fused_chunk_matches_tensor_path() {
 /// The fused-op backward with the kernel-exported M^-1 must match the
 /// tensor-path gradients on CUDA (within fp32 noise from the kernel).
 ///
-/// # `#[ignore]`d: this gate has never run green, and its old reason is stale
+/// # GREEN on hardware, 2026-09-28 — and it is no longer a tautology
 ///
-/// The reason this test was ignored, 2026-09-28, was a real measurement: it
-/// panicked inside `ChunkWy::backward` (`src/autodiff.rs`) because the fused
-/// forward engaged and the adjoint closure refused at `strip(k)`. `277b442`
-/// then rewrote that closure — the strip-to-bare / run / rebuild now happens
-/// where `Inner` is nameable, so the `TypeId` gate is asked about the right
-/// backend and is no longer dead. **No CUDA test has been run since, so whether
-/// the refusal is gone is unmeasured.** This `#[ignore]` therefore no longer
-/// names a known bug; it records that nobody has looked. A trainer's eval line
-/// reads `fused kda=2086/0` (2026-09-28): 2086 forward dispatches, zero
-/// adjoints.
+/// This test compared `ChunkWy::backward` against the tensor path, and for its
+/// whole life both sides of that pair were the TENSOR adjoint: the fused
+/// forward branch was gated on `fused_forced_off()`, so the fused kernels ran
+/// only when the kill switch said the fused path was off. Any `rel` it printed
+/// was tensor-vs-tensor, which is why the tolerance could be described as a bar
+/// nobody had measured and still be committed.
 ///
-/// What was never true of this test, and is the reason its numbers must not be
-/// quoted: while the adjoint gate was dead, the "fused-op backward" it compared
-/// was the TENSOR adjoint, twice. The tolerance it asserted has therefore never
-/// been exercised against the fused kernels — see `GRAD_REL_TOL`.
+/// Three things changed, all in the library, all measured (see
+/// `autodiff_cuda_gate.rs` for the same three with a git history):
+///   1. the fused-forward gate was inverted, so the kernels ran in neither
+///      direction;
+///   2. the adjoint's strip-to-bare asked the dispatch layer for an autodiff
+///      context on a tensor that arrives `Disabled`, and the registration
+///      re-wrapped gradients as `Autodiff<Inner, S>` where `Backward`'s `B` is
+///      the bare backend;
+///   3. two real arithmetic defects the comparison was in no position to see,
+///      because it was comparing the tensor adjoint with itself: a spurious
+///      factor of `E` in BK1's `bk` (d_g wrong by 3.5e-1 on a single chunk) and
+///      a `reshape` standing in for a transpose of `d_s` in the BPTT glue
+///      (d_k wrong by 3.3e-1 whenever there is more than one chunk to carry).
 ///
-/// The fused adjoint also cannot be checked anywhere else: it is
-/// `#[cfg(feature = "cuda")]` and gated on the bare `CubeBackend`, so there is
-/// no CPU device on which these kernels run at all. This test, or
-/// `autodiff_cuda_gate.rs`, is the only place the question can be asked.
-///
-/// Run it on demand:
-/// `cargo test -p burn-gdn2 --release --features cuda,autodiff --test fused_chunk_verify -- --ignored --nocapture`
+/// Printed values now, worst input first: g 2.4e-7, s 2.9e-7, q 2.7e-7.
+/// The fused adjoint is `#[cfg(feature = "cuda")]` and its kernels are
+/// `#[cfg(feature = "cuda")]` on the bare `CubeBackend`, so this file and
+/// `autodiff_cuda_gate.rs` are the only places the question can be asked —
+/// which is why the tolerance below is a measured number.
 #[test]
-#[ignore = "the gate on the fused adjoint's numerics, never run green; its old reason (a refusal at strip(k)) was fixed in 277b442 and has not been re-measured on hardware"]
 fn fused_op_grads_match_tensor_path_cuda() {
     use burn::tensor::Device as D;
     let plain: D = Default::default();
@@ -230,26 +246,6 @@ fn fused_op_grads_match_tensor_path_cuda() {
         }
         let rel = max_abs / scale_v.max(1e-30);
         println!("{name}: grads rel={rel:.2e}");
-        // One bar for every input, 1e-2 relative to the largest magnitude in
-        // the tensor. This used to be `if name == "k" { 1e-1 } else { 1e-2 }`,
-        // with a comment claiming k's chunk-boundary rows divide by
-        // E≈glast (~1e-3) and "amplify fp32 path noise to a few percent".
-        //
-        // That claim is not a measurement. The tolerance was never exercised
-        // against the fused adjoint: the test is `#[ignore]`d, and until
-        // `277b442` the "fused" side was the tensor adjoint too, so any `rel`
-        // it printed was tensor-vs-tensor. A 10% allowance on one of seven
-        // gradients is a green light for a wrong adjoint, and it was the
-        // largest number in the file.
-        //
-        // 1e-2 is therefore a BAR, not a known-achievable value: it is what
-        // the other six inputs were already held to, and a first run that
-        // fails it is information, not a reason to widen. If k's gradient
-        // turns out to be ill-conditioned through the `k·glast/kgd`
-        // reconstruction, fix the conditioning. Whoever runs this first:
-        // paste the seven printed `rel` values into the commit message — they
-        // are the deliverable, and until they exist nobody knows whether the
-        // fused adjoint is right, only that it has never been asked.
         assert!(rel < GRAD_REL_TOL, "{name}: grads mismatch rel={rel:.2e}");
     }
 }
@@ -257,13 +253,17 @@ fn fused_op_grads_match_tensor_path_cuda() {
 /// Zero-key regression: a key row that is exactly 0.0 must not NaN the fused
 /// backward. The old `k·glast/kgd` E-reconstruction divides 0/0 in that case.
 ///
-/// # `#[ignore]`d 2026-09-28, same cause as `fused_op_grads_match_tensor_path_cuda`
+/// # GREEN on hardware, 2026-09-28
 ///
-/// The fused forward engages, the op's backward refuses at `strip(k)`, and the
-/// NaN assertions below are unreachable. Ignored rather than left red; run it
-/// on demand with `-- --ignored`.
+/// The `#[ignore]` this replaces named the adjoint's `strip(k)` refusal, which
+/// was real and is gone. The gate was never reachable before: the fused
+/// forward branch was gated on `fused_forced_off()`, so the op's backward ran
+/// the tensor branch and the fused adjoint's kernels were not what produced the
+/// gradients. With the branch fixed and the two arithmetic defects repaired
+/// (see `fused_op_grads_match_tensor_path_cuda`), a key row of exactly 0.0
+/// leaves every gradient finite: the old `k·glast/kgd` E-reconstruction divided
+/// 0/0, and the forward now exports `E` directly.
 #[test]
-#[ignore = "the op's backward refuses at strip(k); the zero-key NaN gate needs the fused adjoint, never run green"]
 fn fused_zero_key_row_grads_finite() {
     use burn::tensor::TensorData;
     let plain: burn::tensor::Device = Default::default();

@@ -31,10 +31,12 @@
 //! [`chunk_dispatch`] is all three, wired for the chunked WY op, and it
 //! REPORTS which arm ran: a `None` cannot tell "computed" from "fell back".
 
+use burn::backend::{AutodiffBackend, BackendTypes};
 use burn::backend::{Backend, DispatchKindConversion};
 use burn::tensor::{DispatchTensor, Tensor};
-use burn_autodiff::checkpoint::strategy::{BalancedCheckpointing, CheckpointStrategy, NoCheckpointing};
-use burn::backend::{AutodiffBackend, BackendTypes};
+use burn_autodiff::checkpoint::strategy::{
+    BalancedCheckpointing, CheckpointStrategy, NoCheckpointing,
+};
 use burn_autodiff::Autodiff;
 
 /// Which arm ran. A bare `Option`/`bool` cannot distinguish "computed" from
@@ -108,7 +110,7 @@ where
     t.clone().try_into_primitive::<Autodiff<Inner, S>>().ok()
 }
 
-/// The bare tensor a kernel can take, from the autodiff primitive: the same
+/// The bare tensor a kernel can take, from an autodiff primitive: the same
 /// bytes with a DISABLED autodiff context.
 pub fn bare_from_node<Inner: Backend, S: CheckpointStrategy, const D: usize>(
     node: &AdNode<Inner, S>,
@@ -119,6 +121,46 @@ where
     Tensor::from_primitive::<Inner>(node.primitive().clone())
 }
 
+/// The autodiff layer off, for a `Tensor` whatever route it arrived by.
+///
+/// TWO cases, in this order, and the order is the whole point:
+///
+/// 1. the tensor is ALREADY bare — `DispatchAutodiffContext::Disabled` and the
+///    concrete backend's kind. That is what [`bare_from_node`] produces in the
+///    forward, and it is also what `ChunkWy::backward` receives: burn builds
+///    the checkpoints from `AutodiffTensor::primitive` (an `AutodiffTensor`)
+///    and `Tensor::from_primitive` re-wraps it, but by the time the op's
+///    backward runs, the dispatch tensor it hands the closure carries
+///    `Disabled`. Measured 2026-09-28, where the autodiff-only path below
+///    refused with "Expected BalancedCheckpointing autodiff context, got
+///    Disabled" and the fused adjoint was unreachable from every backward.
+/// 2. an autodiff node: lift to the primitive and take `.primitive()`.
+///
+/// Case 1 cannot hand a kernel the wrong bytes: a bare conversion either
+/// yields a genuine hardware tensor or errors, and an error in case 1 is not
+/// swallowed — case 2 runs and reports its own reason.
+pub fn try_strip<Inner: Backend, S: CheckpointStrategy, const D: usize>(
+    t: &Tensor<D>,
+) -> Result<Tensor<D>, String>
+where
+    DispatchTensor: DispatchKindConversion<Autodiff<Inner, S>> + DispatchKindConversion<Inner>,
+{
+    let why = |e: burn::tensor::PrimitiveConversionError| match e {
+        burn::tensor::PrimitiveConversionError::BackendMismatch(why)
+        | burn::tensor::PrimitiveConversionError::KindMismatch(why) => why,
+    };
+    if let Ok(prim) = t.clone().try_into_primitive::<Inner>() {
+        return Ok(Tensor::from_primitive::<Inner>(prim));
+    }
+    // `PrimitiveConversionError` has no Display impl; the message is in the
+    // variant, so unwrap it rather than printing the enum name.
+    let node = t
+        .clone()
+        .try_into_primitive::<Autodiff<Inner, S>>()
+        .map_err(why)?;
+    Ok(bare_from_node::<Inner, S, D>(&node))
+}
+
 /// The autodiff layer off: a tensor on `Autodiff<Inner, S>` becomes a bare
 /// `Tensor<Inner>`, whatever the strategy. `None` when it is not on one.
 pub fn strip<Inner: Backend, S: CheckpointStrategy, const D: usize>(
@@ -127,7 +169,7 @@ pub fn strip<Inner: Backend, S: CheckpointStrategy, const D: usize>(
 where
     DispatchTensor: DispatchKindConversion<Autodiff<Inner, S>> + DispatchKindConversion<Inner>,
 {
-    Some(bare_from_node::<Inner, S, D>(&autodiff_node::<Inner, S, D>(t)?))
+    try_strip::<Inner, S, D>(t).ok()
 }
 
 /// The bare tensor back into an autodiff leaf on `Autodiff<Inner, S>` — the
@@ -310,7 +352,9 @@ mod fused {
                 ) {
                     // The op only ever builds nodes on `Autodiff<CudaBare, S>`,
                     // so the result comes back as `B` exactly when that IS `B`.
-                    if let (Ok(o), Ok(s)) = (o.try_into_primitive::<B>(), s.try_into_primitive::<B>()) {
+                    if let (Ok(o), Ok(s)) =
+                        (o.try_into_primitive::<B>(), s.try_into_primitive::<B>())
+                    {
                         return Fused::Fused((
                             Tensor::from_primitive::<B>(o),
                             Tensor::from_primitive::<B>(s),
@@ -343,9 +387,8 @@ mod fused {
         // than the fused kernels and correct - which is the trade the project
         // is making deliberately until a fused path is A/B-proven against
         // this one rather than against a run that trained nothing.
-        let (o, s, _scratch) = crate::forward::chunk_wy_forward_impl(
-            q, k, v, g, b, w, state, scale, chunk_size, None,
-        );
+        let (o, s, _scratch) =
+            crate::forward::chunk_wy_forward_impl(q, k, v, g, b, w, state, scale, chunk_size, None);
         note_fused_declined();
         Fused::Fused((o, s))
     }

@@ -51,7 +51,7 @@ pub struct FusedAdjoint(
                 Tensor<4>,
                 f64,
                 usize,
-            ) -> Result<[Tensor<4>; 7], &'static str>
+            ) -> Result<[Tensor<4>; 7], String>
             + Send
             + Sync,
     >,
@@ -76,7 +76,7 @@ fn fused_adjoint<Inner: Backend, S: CheckpointStrategy>() -> FusedAdjoint
 where
     DispatchTensor: DispatchKindConversion<Autodiff<Inner, S>> + DispatchKindConversion<Inner>,
 {
-    use crate::cuda_dispatch::{rebuild, strip};
+    use crate::cuda_dispatch::try_strip;
     use crate::kernel::chunk_adjoint_cube::cuda::fused_chunk_backward;
     FusedAdjoint(std::sync::Arc::new(
         |fwd: &crate::kernel::chunk_adjoint_cube::cuda::FusedBackwardInputs,
@@ -89,15 +89,18 @@ where
             // chain from a zero state adjoint, which is this op's contract —
             // the output state is an untracked leaf (see the module header).
             let [Some(k), Some(v), Some(b), Some(w)] = xs else {
-                return Err("an op parent was not a tracked node");
+                return Err("an op parent was not a tracked node".to_string());
             };
             // Bare, so `try_into_primitive` inside the kernels sees what it
             // expects: a hardware tensor, not an autodiff handle. Named
             // separately because a refusal here and a refusal inside the
             // kernels are different bugs, and a message that says neither is
-            // the message that costs the next person an afternoon.
-            let bare = |t: &Tensor<4>, name: &'static str| {
-                strip::<Inner, S, 4>(t).ok_or(name)
+            // the message that costs the next person an afternoon. The
+            // dispatch layer's OWN reason travels with it (`try_strip`, not
+            // `strip`): it knows whether the refusal was the autodiff context
+            // or the checkpointing strategy.
+            let bare = |t: &Tensor<4>, name: &str| {
+                try_strip::<Inner, S, 4>(t).map_err(|why| format!("{name}: {why}"))
             };
             let k = bare(k, "strip(k)")?;
             let v = bare(v, "strip(v)")?;
@@ -105,20 +108,31 @@ where
             let w = bare(w, "strip(w)")?;
             let d_out = bare(&d_out, "strip(d_out)")?;
             let out = fused_chunk_backward::<Inner>(fwd, &k, &v, &b, &w, &d_out, scale, chunk_size)
-                .ok_or(
+                .ok_or_else(|| {
                     "fused_chunk_backward refused (its own is_cuda gate, or a contiguity \
-                     materialization that did not come back row-major)",
-                )?;
+                     materialization that did not come back row-major)"
+                        .to_string()
+                })?;
+            // BARE, and that is the whole answer for this half.
+            //
+            // The op's `Backward<B, _>` is instantiated with `B = Inner` — the
+            // bare backend, not the caller's `Autodiff<Inner, S>` — because
+            // `OpsPrep::finish` takes `FloatTensor<B>` and burn builds the
+            // `AutodiffTensor` node AROUND that primitive. So every gradient
+            // this backward registers goes through
+            // `grad.try_into_primitive::<B>()` = `try_into_primitive::<Inner>`,
+            // which requires a DISABLED autodiff context.
+            //
+            // `rebuild` did the opposite: it re-wrapped each gradient as
+            // `Autodiff<Inner, S>`, so the registration unwrap below refused
+            // with "Expected concrete Cube backend with disabled autodiff
+            // context, got Enabled(Balanced)". Measured 2026-09-28; that
+            // unwrap is the third refusal this seam produced, and it is the
+            // reason the adjoint was reported as reachable after `277b442`
+            // and then was not.
             Ok([
-                out.d_q,
-                out.d_k,
-                out.d_v,
-                out.d_g,
-                out.d_b,
-                out.d_w,
-                out.d_s,
-            ]
-            .map(|t| rebuild::<Inner, S, 4>(&t)))
+                out.d_q, out.d_k, out.d_v, out.d_g, out.d_b, out.d_w, out.d_s,
+            ])
         },
     ))
 }
@@ -480,7 +494,9 @@ pub fn chunk_wy_forward_autodiff<Inner: Backend>(
 where
     DispatchTensor: DispatchKindConversion<Autodiff<Inner>> + DispatchKindConversion<Inner>,
 {
-    chunk_wy_forward_autodiff_s::<Inner, NoCheckpointing>(q, k, v, g, b, w, state, scale, chunk_size)
+    chunk_wy_forward_autodiff_s::<Inner, NoCheckpointing>(
+        q, k, v, g, b, w, state, scale, chunk_size,
+    )
 }
 
 /// [`chunk_wy_forward_autodiff`] for an EXPLICIT checkpointing strategy.
@@ -507,19 +523,29 @@ where
     DispatchTensor: DispatchKindConversion<Autodiff<Inner, S>> + DispatchKindConversion<Inner>,
 {
     use crate::cuda_dispatch::{autodiff_node, bare_from_node};
-    // `OpsPrep::prepare` derives its `Requirement` from the parents' node
-    // refs and returns `UnTracked` when that requirement is `None` - which
-    // `Requirement::from_nodes` reports only if NO parent requires grad. So
-    // this is the same decision burn will make, read from the public API
-    // instead of from the private node ref.
-    let any_requires_grad = [&q, &k, &v, &g, &b, &w, &state]
+    // `OpsPrep::prepare` derives its `Requirement` from the parents' node refs
+    // and returns `UnTracked` when that requirement is `None`. The same
+    // decision, read from the same public API burn reads it from
+    // (`AutodiffTensor::is_tracked` is literally `!requirement.is_none()`).
+    //
+    // NOT `Tensor::is_require_grad()`: that is `matches!(requirement, Grad)`,
+    // the strict requirement of a LEAF, and every one of the trainer's seven
+    // inputs is the output of a projection - a matmul, a silu, a sigmoid - so
+    // its requirement is `GradInBackward` and `is_require_grad()` is FALSE for
+    // all of them. Asking that question made this op decline on the trainer's
+    // own graph while every test that lifted bare `require_grad()` leaves
+    // passed: `tests/autodiff_nested_balanced.rs` builds its inputs exactly the
+    // trainer's way (leaf -> `mul_scalar` -> `permute`) and is the test that
+    // catches it. A declined op is COUNTED, so the failure mode was a fused
+    // counter reading 0 with a declining counter reading the full count.
+    let any_tracked = [&q, &k, &v, &g, &b, &w, &state]
         .iter()
-        .any(|t| t.is_require_grad());
+        .any(|t| autodiff_node::<Inner, S, 4>(t).is_some_and(|node| node.is_tracked()));
     #[cfg(feature = "cuda")]
     let forced_off = crate::cuda_dispatch::fused_forced_off();
     #[cfg(not(feature = "cuda"))]
     let forced_off = false;
-    if !any_requires_grad || forced_off {
+    if !any_tracked || forced_off {
         // Declining here is what makes `chunk_dispatch` fall through to the
         // OPS path, where burn builds the graph from its own tensor ops. See
         // the long note there: the custom node this function creates is a
@@ -559,14 +585,24 @@ where
     // `ops kind = UnTracked`. Every KDA number this project has ever produced
     // came from an attention arm frozen at initialisation.
     //
-    // `OpsPrep::prepare` yields `Tracked` exactly when every parent has a
-    // node id, so this predicate is that same decision made BEFORE paying for
-    // the forward. When it is false the tensor path runs instead: it builds a
-    // real graph, so gradients flow. The fused kernels still serve the
-    // gradient-free passes (held-out eval), where a leaf is harmless and the
-    // speed is worth having.
+    // `OpsPrep::prepare` yields `Tracked` exactly when at least one parent has
+    // a node ref with a non-`None` requirement, so the early return above -
+    // which declines unless some input `is_require_grad()`, and burn's
+    // `is_require_grad` is `requirement == Grad` - already guarantees Tracked
+    // for anything that reaches this point. A node that is Tracked can send a
+    // gradient back, so the fused branch is safe here and the tensor path's
+    // 150-ops-per-chunk replay is the arm that is not.
+    //
+    // This line read `fused_forced_off()`, i.e. the fused kernels ran ONLY
+    // when the kill switch said the fused path was OFF - and the kill switch
+    // had already returned None three lines earlier, so both arms of it were
+    // dead and the fused kernels were unreachable from the whole autodiff
+    // entry point. Measured 2026-09-28: the already-committed
+    // `the_checkpointing_strategy_is_a_parameter_not_a_constant` was RED on
+    // hardware ("no fused forward on NoCheckpointing"), and the trainer's eval
+    // line printed `fused kda=0/0`.
     #[cfg(feature = "cuda")]
-    let fused_allowed = crate::cuda_dispatch::fused_forced_off();
+    let fused_allowed = !crate::cuda_dispatch::fused_forced_off();
     #[cfg(not(feature = "cuda"))]
     let fused_allowed = false;
 
