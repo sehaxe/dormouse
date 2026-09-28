@@ -77,11 +77,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: vendor/burn-fused
-      - name: the meta-crate, the only thing a default build compiles
-        run: |
-          cargo check -p burn-fused --no-default-features
-          cargo check -p burn-fused --features std
-          cargo check -p burn-fused --features std,cuda
+      - name: the facade: generated files in sync + every feature combination
+        # The re-export list and the feature flags are GENERATED from the
+        # member manifests (tools/gen_facade.py), and this is the gate that
+        # keeps them honest: 13 crates declare `cuda`, the hand-written list
+        # named 12 (burn-mor missing) for months, and nothing noticed. The
+        # script also checks the generated files and builds every combination
+        # a user can type; the two common ones run the test suite, which is
+        # what resolves all 28 re-exports.
+        run: tools/test-feature-matrix.sh
       - name: leaf crates, every combination a README tells users to type
         run: |
           cargo check -p burn-gdn2 --no-default-features
@@ -159,39 +163,37 @@ jobs:
           cargo check -p cpu-probe
           cargo check -p launch-probe
 
-  # 6. cuda tests, on real hardware
-  cuda-tests:
-    name: "fused-lib :: cuda tests on a GPU (fused-vs-tensor divergence only the GPU shows)"
-    # HONEST LIMITATION: this job needs a runner registered with the
-    # `gpu,linux` labels. None is registered on the dormouse repo yet, so the
-    # job sits queued and says so — which is the point. A silently absent GPU
-    # gate is what let the deleted-crate job sit in the fork's fiction for six
-    # months. Register a runner (or move this to a hosted GPU instance) and it
-    # starts gating on the next PR.
-    runs-on: [self-hosted, gpu, linux]
-    if: github.event_name == 'pull_request'
-    timeout-minutes: 120
-    env:
-      # burn-rope and burn-situ cuda tests `return`/`skip` (reporting PASS)
-      # unless this is set. Without it the job is green having asserted nothing.
-      BURN_DEVICE: cuda
-    defaults:
-      run:
-        working-directory: vendor/burn-fused
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: vendor/burn-fused
-      - name: every cuda crate, tests on the GPU
-        run: |
-          for c in burn-attnres burn-bitnet burn-gdn2 burn-kda burn-mhc burn-mor \
-                   burn-muon-plus burn-rmsnorm burn-rope burn-sct burn-situ \
-                   burn-spectral burn-swiglu; do
-            cargo test -p "$c" --all-features
-          done
-      - name: the fused kernels through the trainer's autodiff graph
-        # The configuration dormouse actually trains in. Nothing else in this
-        # library tests it: see vendor/burn-fused/TEST-AUDIT.md, finding 3.
-        run: cargo test -p burn-gdn2 --features cuda,autodiff --release --test fused_chunk_verify
+  # There is deliberately NO cuda-tests job here.
+  #
+  # There used to be one: `cuda-tests` on `runs-on: [self-hosted, gpu, linux]`,
+  # with a comment admitting no runner was registered. It never ran. Its
+  # `cuda-compiles` sibling only does `--no-run`, which proves the crate COMPILES
+  # and cannot fail on a CUDA-only bug — so every GPU-only claim in this library
+  # was unverified, which is how the fused gated-delta dispatch gate stayed
+  # dead for a year. A job that advertises a check which never fires is worse
+  # than no job: it is read as a gate.
+  #
+  # A runner was not registered instead, on purpose. This workstation is the
+  # only GPU in the project's life, and it is simultaneously the trainer (a
+  # resumed 48M-slot run holds ~37 GB), the benchmark box, and the agent
+  # workstation. A GitHub runner polling it would accept a release CUDA build
+  # next to that training run and get OOM-killed by `ram-guard`, going red for
+  # reasons that have nothing to do with the diff — a gate that is red half the
+  # time teaches people to re-run it, which is a decoration with a status light.
+  # Registering a runner also means minting a registration token against the
+  # owner's repo, which is the owner's call, not a code change's.
+  #
+  # So the GPU check is a command a contributor runs on the GPU box, and it is
+  # a real one — it compiles AND runs AND reports per test:
+  #
+  #     vendor/burn-fused/tools/gpu-gate.sh
+  #
+  # It refuses to pass without a visible CUDA device, sets BURN_DEVICE=cuda so
+  # the `if env::var("BURN_DEVICE") != "cuda" { return; }` guards cannot report
+  # PASS having asserted nothing, and fails if the test count is not what it
+  # expects. `burn-fused/tests/gpu_production_shape.rs` is the assertion: the
+  # gated-delta chunk path at the shape dormouse trains (batch 10, seq 512,
+  # 12 heads x 64) through `Autodiff<CudaBare, BalancedCheckpointing>`, the
+  # trainer's backend, asserting the fused forward AND adjoint kernels LAUNCHED
+  # (launch counters, not numbers — a fallback computes the same function).
+  # What the gate does not yet cover is listed at the end of the script.
