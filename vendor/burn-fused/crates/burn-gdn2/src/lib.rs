@@ -79,7 +79,7 @@ pub use cuda_dispatch::{backend_matches, rebuild, strip, AdNode, Fallback, Fused
 #[cfg(all(feature = "cuda", feature = "autodiff"))]
 pub use cuda_dispatch::{
     chunk_dispatch, custom_node_backward, dispatch_asked, fused_calls, fused_declined, ops_path,
-    reset_fused_calls, seam_counts, FusedCudaAutodiff,
+    reset_fused_calls, seam_counts, try_strip, FusedCudaAutodiff,
 };
 
 #[cfg(feature = "cuda")]
