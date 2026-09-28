@@ -6,7 +6,10 @@
 //! full-magnitude step in the stale direction. That is how a run the firewall
 //! was protecting still got its weights moved. The gate is a device-side
 //! `mask_fill` on a float tensor, with no host synchronization, because the
-//! `Bool -> float` cast is broken on this backend (returns 0.0 for `true`).
+//! project rule is to never build a numeric indicator from a bool tensor on
+//! device and count on the host instead (ADR-0018 rule 2) - not because the
+//! cast is broken, which was believed until ADR-0016 measured it correct on
+//! both backends. The rule outlived the reason.
 //!
 //! The rule lives in `impl Optimizer for MuonPlus::step`, so this drives that
 //! impl directly (`MuonPlusConfig::build()` + an explicit state slot) rather

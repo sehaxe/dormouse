@@ -254,8 +254,11 @@ impl Optimizer for MuonPlus {
         // device) still moved every weight, which is precisely the poisoning
         // that killed runs on 2026-09-26/27. Zero gradient now means zero
         // update, decided on device with no host synchronization. The factor is
-        // built with `mask_fill` on a float tensor because the Bool -> float
-        // cast is broken on this backend (it returns 0.0 for `true`).
+        // built with `mask_fill` on a float tensor because the project rule is
+        // to never build a numeric indicator from a bool tensor on device and
+        // count on the host instead (ADR-0018 rule 2) - not because the cast is
+        // broken, which was believed until ADR-0016 measured it correct on both
+        // backends. The rule outlived the reason.
         let g_active = Tensor::<1>::ones([1], &grad.device()).mask_fill(
             grad.clone()
                 .powf_scalar(2.0)

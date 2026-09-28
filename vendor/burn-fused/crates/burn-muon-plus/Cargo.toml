@@ -31,5 +31,12 @@ burn = { workspace = true, features = ["ndarray"] }
 burn-autodiff = { workspace = true, features = ["std"] }
 burn-ndarray = { workspace = true, features = ["blas-openblas"] }
 
+# A CUDA-only test target. Without this the binary is still built on the CPU
+# backend and reports `running 0 tests ... ok`, which is a green line over a
+# test that does not exist. Not building the target is the honest shape.
+[[test]]
+name = "bf16_matmul"
+required-features = ["cuda"]
+
 [package.metadata.docs.rs]
 all-features = true
