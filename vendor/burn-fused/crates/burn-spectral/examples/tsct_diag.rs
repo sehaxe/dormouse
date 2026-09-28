@@ -1508,8 +1508,11 @@ fn vram_usage<const R: usize>(t: &Tensor<R>) -> Option<(u64, u64)> {
         .clone()
         .try_into_primitive::<burn_autodiff::Autodiff<CB>>()
         .ok()?;
-    let client = prim.primitive.client.clone();
-    let m = client.memory_usage().ok()?;
+    // `AutodiffTensor::primitive` is a private FIELD in pre.4; the public
+    // spelling is the `primitive()` accessor (same value, autodiff context off).
+    let client = prim.primitive().client.clone();
+    // pre.4 returns `MemoryUsage` by value, not a `Result`.
+    let m = client.memory_usage();
     Some((m.bytes_in_use, m.bytes_reserved))
 }
 

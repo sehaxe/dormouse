@@ -134,6 +134,33 @@ pub fn ste_ternary_per_column(w: Tensor<2>) -> Tensor<2> {
 /// within the 1.05 safety factor even for square Wishart (λ2/λ1 ≈ 1).
 const POWER_ITERS: usize = 5;
 
+/// A retracted master: `polar_orthogonalize(before).detach()`, re-flagged as a
+/// tracked leaf ONLY if `before` was tracked.
+///
+/// The re-flag is load-bearing on an autodiff backend: the polar output is a
+/// non-leaf (`GradInBackward`), and burn-optim's step re-tracks
+/// `Requirement::Grad` only, so a stored non-leaf is silently downgraded to an
+/// untracked leaf - the master freezes and the fused op's backward sees a
+/// pruned parent. That is why it was added, and why it must not be simply
+/// dropped.
+///
+/// It is also the only autodiff-dependent step in a retraction, and forcing it
+/// unconditionally is wrong twice over. On a backend with NO autodiff (a plain
+/// `NdArray<f32>` module - a CPU model, an inference-only build) `set_require_grad`
+/// is a hard panic, so `retract` could not be called at all. On an autodiff one
+/// it silently UN-FREEZES a master the caller had frozen, which is the
+/// ADR-0011 class: the state changed and nothing said so. Hence mirror the
+/// state, do not force it.
+fn polar_retracked(before: &Tensor<2>, iters: usize) -> Tensor<2> {
+    let tracked = before.is_require_grad();
+    let out = polar_orthogonalize(before.clone(), iters).detach();
+    if tracked {
+        out.set_require_grad(true)
+    } else {
+        out
+    }
+}
+
 /// Newton-Schulz polar iteration (Muon+ 2602.21545 §1): nearest
 /// orthonormal approximation under Frobenius norm, all tensor ops on the
 /// device - replaces SCT's CPU QR entirely. Newton-Schulz in X·Xᵀ form
@@ -585,19 +612,10 @@ impl SpectralLinear {
     /// Retract the masters to orthonormal (Newton-Schulz polar, on device).
     pub fn retract(&mut self, iters: usize) {
         let (id_u, u_val, map_u) = self.u.clone().consume();
-        // keep the masters tracked leaves: the polar output is a non-leaf
-        // (GradInBackward), and burn-optim's step only re-tracks
-        // Requirement::Grad, so a stored non-leaf is silently downgraded to
-        // an untracked leaf (the master freezes and the fused op's
-        // backward sees a pruned parent)
-        let u_ret = polar_orthogonalize(u_val, iters)
-            .detach()
-            .set_require_grad(true);
+        let u_ret = polar_retracked(&u_val, iters);
         self.u = Param::from_mapped_value(id_u, u_ret, map_u);
         let (id_v, v_val, map_v) = self.v.clone().consume();
-        let v_ret = polar_orthogonalize(v_val, iters)
-            .detach()
-            .set_require_grad(true);
+        let v_ret = polar_retracked(&v_val, iters);
         self.v = Param::from_mapped_value(id_v, v_ret, map_v);
     }
 
@@ -1207,14 +1225,10 @@ impl SpectralMoE {
     /// orthonormal factors to retract).
     pub fn retract(&mut self, iters: usize) {
         let (id_u, u_val, map_u) = self.u.clone().consume();
-        let u_ret = polar_orthogonalize(u_val, iters)
-            .detach()
-            .set_require_grad(true);
+        let u_ret = polar_retracked(&u_val, iters);
         self.u = Param::from_mapped_value(id_u, u_ret, map_u);
         let (id_v, v_val, map_v) = self.v.clone().consume();
-        let v_ret = polar_orthogonalize(v_val, iters)
-            .detach()
-            .set_require_grad(true);
+        let v_ret = polar_retracked(&v_val, iters);
         self.v = Param::from_mapped_value(id_v, v_ret, map_v);
     }
 }
@@ -1268,6 +1282,27 @@ mod tests {
             "polar must improve ortho: {before} -> {after}"
         );
         assert!(after < 1e-3, "polar must restore orthonormality: {after}");
+    }
+
+    #[test]
+    fn retract_mirrors_master_tracking() {
+        // Under autodiff the masters are tracked, and the retraction must hand
+        // burn-optim a tracked leaf or the master silently freezes.
+        let mut m = SpectralLinear::new(64, 128, 8, &Device::ndarray().autodiff());
+        m.retract(5);
+        assert!(
+            m.u.val().is_require_grad(),
+            "retract dropped the tracked master on an autodiff backend"
+        );
+        // With no autodiff at all, `set_require_grad` is a hard panic, and a
+        // forced flag would silently un-freeze a master the caller froze.
+        // Both are regressions this test exists to catch.
+        let mut m = SpectralLinear::new(64, 128, 8, &Device::ndarray());
+        m.retract(5);
+        assert!(
+            !m.u.val().is_require_grad(),
+            "retract silently un-froze a master on a non-autodiff backend"
+        );
     }
 
     #[test]
