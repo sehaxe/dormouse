@@ -157,6 +157,40 @@ pub fn chunk_wy_forward_impl(
 
 /// The batched arm: `chunk_size <= TILE`, every chunk of the whole sequence in
 /// one set of tensor ops, and the state recurrence left sequential.
+///
+/// ## What is batched, and why that split
+///
+/// `v_new` for chunk `i` needs the state left by chunk `i-1`, so the state
+/// recurrence is irreducibly sequential and stays a loop. Everything else —
+/// the scores, the decay, the WY right-hand sides and the triangular solve —
+/// depends only on that chunk's own inputs, so it is done for all `n` chunks
+/// at once on a rank-5 `[B, H, n, c, *]` view: ONE reshape, and the whole
+/// forward is ~30 tensor ops for the scores and solves plus 2(c-1) for the
+/// inversion, against ~110 per chunk before.
+///
+/// The head axis and the chunk axis stay separate on purpose: the backward's
+/// per-chunk scratch is then a contiguous slice on axis 2 instead of a strided
+/// one. (`tests/b5_seam_probe.rs` measures the rank-5 ops this relies on.)
+///
+/// ## Ragged tails
+///
+/// `T` need not be a multiple of `chunk_size`. The last chunk is zero-padded
+/// to `chunk_size` and the padding is then exactly the loop's answer, not an
+/// approximation: `g` padded with 0 makes `E` constant over the padded rows,
+/// so `k/E = 0` there and every padded row of `akk`, `aqk`, `rhs_k`, `rhs_v`,
+/// `q_gated` and the output is 0, and `k*decay_last` is 0 so the padded rows
+/// cannot reach the state either. That is what lets one batched set of ops
+/// cover both the full and the ragged case; the loop's `chunk_masks(c)` /
+/// `eye(c)` special case is not needed here.
+///
+/// ## The inversion
+///
+/// `akk` is masked strictly lower triangular, so with `L = akk` and
+/// `M = I + L`, `L^c = 0` EXACTLY for a `c x c` matrix, and the Neumann series
+/// `M^-1 = I - L + L^2 - ... + (-L)^(c-1)` is a finite identity, not a
+/// truncated one. That is 2(c-1) batched matmuls for every chunk at once,
+/// against the loop's 15 iterations of (clone, 2 slices, tiny matmul,
+/// slice-assign) per chunk.
 #[allow(clippy::too_many_arguments)]
 pub fn chunk_wy_forward_batched(
     q: Tensor<4>,
@@ -165,11 +199,145 @@ pub fn chunk_wy_forward_batched(
     g: Tensor<4>,
     b: Tensor<4>,
     w_gate: Tensor<4>,
-    state: Tensor<4>,
+    mut state: Tensor<4>,
     scale: f64,
     chunk_size: usize,
 ) -> (Tensor<4>, Tensor<4>, ChunkWyScratch) {
-    chunk_wy_forward_loop(q, k, v, g, b, w_gate, state, scale, chunk_size, None)
+    assert!(
+        chunk_size <= TILE,
+        "the batched chunk arm is the c <= TILE path: chunk_size={chunk_size} needs the K3 \
+         16-tile decay scheme, which lives in the loop arm. Route it with ChunkPath::Loop \
+         (or leave DM_GDN2_OPS unset and let the dispatcher route it)."
+    );
+    let [batch, heads, time, k_dim] = q.shape().dims::<4>();
+    let v_dim = v.shape().dims::<4>()[3];
+    let device = q.device();
+    let n_chunks = time.div_ceil(chunk_size);
+    let pad = n_chunks * chunk_size - time;
+
+    // The module feeds permuted [B,H,T,K] views here; cubecl ops would copy
+    // them per-op. Materialize once so every later op sees contiguous buffers.
+    // Then pad the tail and fold the time axis into (chunk, position) — the
+    // one reshape that turns the whole forward into batched ops.
+    let fold = |t: Tensor<4>, d: usize| -> Tensor<5> {
+        let t = t.mul_scalar(1.0);
+        let t = if pad > 0 {
+            Tensor::cat(vec![t, Tensor::zeros([batch, heads, pad, d], &device)], 2)
+        } else {
+            t
+        };
+        t.reshape([batch, heads, n_chunks, chunk_size, d])
+    };
+    let q5 = fold(q, k_dim);
+    let k5 = fold(k, k_dim);
+    let v5 = fold(v, v_dim);
+    let g5 = fold(g, k_dim);
+    let b5 = fold(b, k_dim);
+    let w5 = fold(w_gate, v_dim);
+
+    // masks, hoisted with the scale folded in: the batched body pays one mul
+    let (scale_causal, strict) = chunk_masks(chunk_size, &device);
+    let scale_causal = scale_causal
+        .mul_scalar(scale)
+        .reshape([1, 1, 1, chunk_size, chunk_size]);
+    let strict = strict.reshape([1, 1, 1, chunk_size, chunk_size]);
+    let eye = Tensor::<2>::eye(chunk_size, &device).reshape([1, 1, 1, chunk_size, chunk_size]);
+
+    // --- phase A: scores / decay / right-hand sides, all chunks at once
+    let g_cumsum = g5.cumsum(3);
+    let g_exp = g_cumsum.clone().exp();
+    let k_over_gamma = k5.clone() / g_exp.clone();
+    let k_over_gamma_t = k_over_gamma.clone().swap_dims(3, 4);
+    let q_gated = q5 * g_exp.clone();
+    let aqk = q_gated.clone().matmul(k_over_gamma_t.clone()) * scale_causal;
+    let bk = b5 * k5.clone();
+    let akk = (bk.clone() * g_exp.clone()).matmul(k_over_gamma_t) * strict;
+
+    // --- phase B: the triangular solve, all chunks at once
+    let m_inv = neumann_inverse(akk, chunk_size, eye);
+    let w_wy = m_inv.clone().matmul(bk * g_exp.clone());
+    let u = m_inv.clone().matmul(w5 * v5);
+
+    // --- phase C: the state recurrence, which is irreducibly sequential
+    let g_last = g_exp.clone().slice([
+        0..batch,
+        0..heads,
+        0..n_chunks,
+        chunk_size - 1..chunk_size,
+        0..k_dim,
+    ]);
+    let decay_last = (g_cumsum.clone().slice([
+        0..batch,
+        0..heads,
+        0..n_chunks,
+        chunk_size - 1..chunk_size,
+        0..k_dim,
+    ]) - g_cumsum)
+        .exp();
+    let k_dec = k5 * decay_last;
+
+    let mut outputs = Vec::with_capacity(n_chunks);
+    for ci in 0..n_chunks {
+        // Executed (not logical) iterations: a retro-forward replay of this
+        // loop lands here too, which is how the checkpointer recompute is
+        // counted. See `alloc_trace::chunk_iterations`.
+        crate::alloc_trace::chunk_iteration();
+        let cut = |t: Tensor<5>, d: usize| -> Tensor<4> {
+            t.slice([0..batch, 0..heads, ci..ci + 1, 0..chunk_size, 0..d])
+                .squeeze_dim::<4>(2)
+        };
+        let s_before = state.clone();
+        let v_new = cut(u.clone(), v_dim) - cut(w_wy.clone(), k_dim).matmul(s_before.clone());
+        let out_c = cut(aqk.clone(), chunk_size).matmul(v_new.clone())
+            + cut(q_gated.clone(), k_dim)
+                .matmul(s_before.clone())
+                .mul_scalar(scale);
+        outputs.push(out_c);
+        state = s_before * cut(g_last.clone(), k_dim).swap_dims(2, 3)
+            + cut(k_dec.clone(), k_dim).swap_dims(2, 3).matmul(v_new);
+    }
+
+    // The same four values per chunk the custom node's analytic backward needs.
+    // Views only — a slice on this backend is offsets and a shape, so the ops
+    // path (which discards the scratch) pays nothing for them.
+    let mut chunks = Vec::with_capacity(n_chunks);
+    for ci in 0..n_chunks {
+        let cut = |t: &Tensor<5>, d: usize| -> Tensor<4> {
+            t.clone()
+                .slice([0..batch, 0..heads, ci..ci + 1, 0..chunk_size, 0..d])
+                .squeeze_dim::<4>(2)
+        };
+        chunks.push(ChunkScratch {
+            g_exp: cut(&g_exp, k_dim),
+            q_gated: cut(&q_gated, k_dim),
+            aqk: cut(&aqk, chunk_size),
+            m_inv: cut(&m_inv, chunk_size),
+        });
+    }
+
+    (
+        Tensor::cat(outputs, 2).slice([0..batch, 0..heads, 0..time, 0..v_dim]),
+        state,
+        ChunkWyScratch { chunks },
+    )
+}
+
+/// `(I + L)^-1` for a strictly lower triangular `L` (here `akk`), batched over
+/// every leading axis: `sum_{j=0}^{c-1} (-L)^j`, exact because `L^c = 0`.
+///
+/// 2(c-1) matmuls and adds for ALL chunks at once, against the loop's c-1
+/// iterations of a rank-4 matmul each. The diagonal of the seed is what carries
+/// the identity; the strictly-lower mask on `akk` is what makes `L^c` zero
+/// rather than merely small, so this is an identity and not a truncation.
+fn neumann_inverse(akk: Tensor<5>, c: usize, eye: Tensor<5>) -> Tensor<5> {
+    let neg_l = akk.mul_scalar(-1.0);
+    let mut acc = eye.clone();
+    let mut p = neg_l.clone();
+    for _ in 1..c {
+        acc = acc + p.clone();
+        p = p.matmul(neg_l.clone());
+    }
+    acc
 }
 
 /// The reference implementation: one pass over the chunks, the triangular

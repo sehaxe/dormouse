@@ -100,7 +100,11 @@ fn make(
     let kraw = if c.noise < 1.0 {
         // one shared direction per head + a little noise => <k_i,k_j> ~ 1
         let base = Tensor::<4>::random([nb, nh, 1, nk], Distribution::Normal(0.0, 1.0), dev);
-        let noise = Tensor::<4>::random([nb, nh, nt, nk], Distribution::Normal(0.0, c.noise as f64), dev);
+        let noise = Tensor::<4>::random(
+            [nb, nh, nt, nk],
+            Distribution::Normal(0.0, c.noise as f64),
+            dev,
+        );
         base.repeat_dim(2, nt) + noise
     } else {
         Tensor::<4>::random([nb, nh, nt, nk], Distribution::Normal(0.0, 1.0), dev)
@@ -108,13 +112,13 @@ fn make(
     let k = kraw.clone() / kraw.powf_scalar(2.0).sum_dim(3).sqrt();
     let v = Tensor::<4>::random([nb, nh, nt, c.v_dim], Distribution::Normal(0.0, 1.0), dev);
     // b is the erase gate: a sigmoid output, so [0,1].
-    let b = Tensor::<4>::random([nb, nh, nt, nk], Distribution::Uniform(0.0, c.b_hi as f64), dev);
-    // w_gate is the write gate; the KDA path feeds 1, the GDN-2 path a sigmoid.
-    let w = Tensor::<4>::random(
-        [nb, nh, nt, c.v_dim],
-        Distribution::Uniform(0.5, 1.0),
+    let b = Tensor::<4>::random(
+        [nb, nh, nt, nk],
+        Distribution::Uniform(0.0, c.b_hi as f64),
         dev,
     );
+    // w_gate is the write gate; the KDA path feeds 1, the GDN-2 path a sigmoid.
+    let w = Tensor::<4>::random([nb, nh, nt, c.v_dim], Distribution::Uniform(0.5, 1.0), dev);
     let g = Tensor::<4>::random(
         [nb, nh, nt, nk],
         Distribution::Uniform(c.g_range.0 as f64, c.g_range.1 as f64),
@@ -161,7 +165,12 @@ fn rel_dev(a: &Tensor<4>, b: &Tensor<4>) -> f32 {
 fn akk_row_sum(c: &Case, g: &Tensor<4>, k: &Tensor<4>, b: &Tensor<4>) -> f32 {
     let [bs, hh, tt, kd] = [c.batch, c.heads, c.time, c.k_dim];
     let take = |t: &Tensor<4>| -> Vec<f32> {
-        host(t).chunks(kd).take(bs * hh * tt).flatten().copied().collect()
+        host(t)
+            .chunks(kd)
+            .take(bs * hh * tt)
+            .flatten()
+            .copied()
+            .collect()
     };
     let (gk, kk, bk) = (take(g), take(k), take(b));
     let mut worst = 0.0f32;
@@ -188,7 +197,8 @@ fn akk_row_sum(c: &Case, g: &Tensor<4>, k: &Tensor<4>, b: &Tensor<4>) -> f32 {
                             }
                             acc.exp()
                         };
-                        s += (bk[((bi * hh + hi) * tt + i) * kd + d] * e[d]
+                        s += (bk[((bi * hh + hi) * tt + i) * kd + d]
+                            * e[d]
                             * kk[((bi * hh + hi) * tt + j) * kd + d]
                             / ek) as f64;
                     }
@@ -345,7 +355,15 @@ fn the_batched_chunk_path_agrees_with_the_loop() {
     let mut worst_overall = 0.0f32;
     for c in cases() {
         let (q, k, v, g, b, w, s) = make(&c, &dev);
-        let args = (q.clone(), k.clone(), v.clone(), g.clone(), b.clone(), w.clone(), s.clone());
+        let args = (
+            q.clone(),
+            k.clone(),
+            v.clone(),
+            g.clone(),
+            b.clone(),
+            w.clone(),
+            s.clone(),
+        );
         let (lo, ls, sc_loop) = chunk_wy_forward_loop(
             args.0.clone(),
             args.1.clone(),
@@ -375,7 +393,11 @@ fn the_batched_chunk_path_agrees_with_the_loop() {
                 c.chunk,
             );
             let (d, why) = burn_gdn2::alloc_trace::batched_declined();
-            assert_eq!(d, 1, "{}: the batched arm declined without being counted", c.name);
+            assert_eq!(
+                d, 1,
+                "{}: the batched arm declined without being counted",
+                c.name
+            );
             println!(
                 "{:<46} past TILE: routed to the loop, counted ({why}); dev out {:e} state {:e}",
                 c.name,
@@ -384,8 +406,9 @@ fn the_batched_chunk_path_agrees_with_the_loop() {
             );
             continue;
         }
-        let (bo, bs, sc) =
-            chunk_wy_forward_batched(args.0, args.1, args.2, args.3, args.4, args.5, args.6, scale, c.chunk);
+        let (bo, bs, sc) = chunk_wy_forward_batched(
+            args.0, args.1, args.2, args.3, args.4, args.5, args.6, scale, c.chunk,
+        );
 
         let d_out = rel_dev(&lo, &bo);
         let d_state = rel_dev(&ls, &bs);
@@ -399,14 +422,36 @@ fn the_batched_chunk_path_agrees_with_the_loop() {
             "{}: scratch chunk count",
             c.name
         );
-        assert_eq!(sc_loop.chunks.len(), sc.chunks.len(), "{}: reference scratch", c.name);
+        assert_eq!(
+            sc_loop.chunks.len(),
+            sc.chunks.len(),
+            "{}: reference scratch",
+            c.name
+        );
+        // The scratch's chunk axis is `c_pad`, and the two arms disagree about
+        // it on a ragged tail BY DESIGN: the loop stores the real `c` rows, the
+        // batched arm stores `chunk_size` (zero-padded). The custom node's
+        // backward reads `c_real` from `time`/`chunk_size` and pads the inputs
+        // to whatever `c_pad` the scratch carries, so both are consumable — and
+        // `tests/ops_batched_autodiff.rs` is what proves the padded one is.
+        // Compare the rows that both arms actually computed.
         let mut d_scratch = 0.0f32;
-        for (a, b) in sc_loop.chunks.iter().zip(sc.chunks.iter()) {
+        for (ci, (a, b)) in sc_loop.chunks.iter().zip(sc.chunks.iter()).enumerate() {
+            let start = ci * c.chunk;
+            let c_real = (start + c.chunk).min(c.time) - start;
+            let rows = |t: &Tensor<4>| -> Tensor<4> {
+                t.clone()
+                    .slice([0..c.batch, 0..c.heads, 0..c_real, 0..c.k_dim])
+            };
+            let rows_c = |t: &Tensor<4>| -> Tensor<4> {
+                t.clone()
+                    .slice([0..c.batch, 0..c.heads, 0..c_real, 0..c_real])
+            };
             d_scratch = d_scratch
-                .max(rel_dev(&a.g_exp, &b.g_exp))
-                .max(rel_dev(&a.q_gated, &b.q_gated))
-                .max(rel_dev(&a.aqk, &b.aqk))
-                .max(rel_dev(&a.m_inv, &b.m_inv));
+                .max(rel_dev(&rows(&a.g_exp), &rows(&b.g_exp)))
+                .max(rel_dev(&rows(&a.q_gated), &rows(&b.q_gated)))
+                .max(rel_dev(&rows_c(&a.aqk), &rows_c(&b.aqk)))
+                .max(rel_dev(&rows_c(&a.m_inv), &rows_c(&b.m_inv)));
         }
         worst_overall = worst_overall.max(d_out).max(d_state).max(d_scratch);
         println!(

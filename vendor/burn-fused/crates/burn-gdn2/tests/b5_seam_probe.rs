@@ -120,8 +120,7 @@ fn five_d_seam_on_ndarray() {
             for nn in 0..shape[2] {
                 for cc in 1..shape[3] {
                     for kk in 0..shape[4] {
-                        let p = ((((bb * shape[1] + hh) * shape[2] + nn) * shape[3]
-                            + (cc - 1))
+                        let p = ((((bb * shape[1] + hh) * shape[2] + nn) * shape[3] + (cc - 1))
                             * shape[4])
                             + kk;
                         let c = ((((bb * shape[1] + hh) * shape[2] + nn) * shape[3] + cc)
@@ -153,10 +152,7 @@ fn five_d_seam_on_ndarray() {
     println!("slice rank5 dim2: worst {:e}", worst(&got, &want));
 
     // 5. 4D permuted view reshaped to rank 5, and 5D permute.
-    let t4 = Tensor::<4>::from_data(
-        TensorData::new(data.clone(), vec![2, 3, 20, 6]),
-        &dev,
-    );
+    let t4 = Tensor::<4>::from_data(TensorData::new(data.clone(), vec![2, 3, 20, 6]), &dev);
     let got5 = t4.clone().swap_dims(1, 2).reshape([2, 4, 5, 3, 6]);
     let want5 = {
         let mut v = vec![0.0; n];
@@ -181,15 +177,36 @@ fn five_d_seam_on_ndarray() {
     );
 
     let got = host(&t.clone().permute([0, 1, 2, 4, 3]));
-    println!("permute rank5 (3<->4): worst {:e}", worst(&got, &ref_swap34(shape, &data)));
+    println!(
+        "permute rank5 (3<->4): worst {:e}",
+        worst(&got, &ref_swap34(shape, &data))
+    );
 
     // Every one of the six must be EXACT, not merely close: these are index
     // permutations and small gemms, where a wrong answer is a wrong answer.
     for (what, d) in [
-        ("swap_dims(3,4)", worst(&host(&t.clone().swap_dims(3, 4)), &ref_swap34(shape, &data))),
-        ("matmul", worst(&host(&t.clone().matmul(t.clone().swap_dims(3, 4))), &ref_matmul(shape, &data, &ref_swap34(shape, &data)))),
-        ("permute", worst(&host(&t.clone().permute([0, 1, 2, 4, 3])), &ref_swap34(shape, &data))),
+        (
+            "swap_dims(3,4)",
+            worst(&host(&t.clone().swap_dims(3, 4)), &ref_swap34(shape, &data)),
+        ),
+        (
+            "matmul",
+            worst(
+                &host(&t.clone().matmul(t.clone().swap_dims(3, 4))),
+                &ref_matmul(shape, &data, &ref_swap34(shape, &data)),
+            ),
+        ),
+        (
+            "permute",
+            worst(
+                &host(&t.clone().permute([0, 1, 2, 4, 3])),
+                &ref_swap34(shape, &data),
+            ),
+        ),
     ] {
-        assert_eq!(d, 0.0, "rank-5 {what} is not exact on this backend: worst {d:e}");
+        assert_eq!(
+            d, 0.0,
+            "rank-5 {what} is not exact on this backend: worst {d:e}"
+        );
     }
 }
