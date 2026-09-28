@@ -27,10 +27,12 @@
 use std::any::Any;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use burn::backend::{Backend, DispatchKindConversion};
+use burn::backend::DispatchKindConversion;
 use burn::tensor::{activation, Device, DispatchTensor, Int, Tensor};
 use burn_autodiff::checkpoint::base::Checkpointer;
-use burn_autodiff::checkpoint::strategy::NoCheckpointing;
+use burn_autodiff::checkpoint::strategy::{
+    BalancedCheckpointing, CheckpointStrategy, NoCheckpointing,
+};
 use burn_autodiff::grads::Gradients;
 use burn_autodiff::ops::{Backward, Ops, OpsKind};
 use burn_autodiff::Autodiff;
@@ -40,9 +42,43 @@ use cubecl::prelude::*;
 use cubecl::server::Handle;
 
 type CB = burn_cubecl::CubeBackend;
-type CAd = Autodiff<CB>;
 
 static MOE_FWD_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+// ---- seam counters (ADR-0019) ----
+//
+// ENTRY is incremented AFTER the strategy downcasts — the gate that was
+// hardcoded to `Autodiff<CB>` == `Autodiff<CB, NoCheckpointing>`, so dormouse's
+// `Autodiff<CudaBare, BalancedCheckpointing>` never got here. A counter before
+// that gate would count interest, not arrivals (`f737710`).
+static ENTRY: AtomicUsize = AtomicUsize::new(0);
+static MOE_BWD_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// `(entry, fused_forward, fused_backward)` since [`reset_seam_counts`].
+/// `fused_forward` is [`moe_fused_forward_count`], which predates this and is
+/// public API, so it is not reset here — the other two are.
+pub fn seam_counts() -> (usize, usize, usize) {
+    (
+        ENTRY.load(Ordering::Relaxed),
+        MOE_FWD_COUNT.load(Ordering::Relaxed),
+        MOE_BWD_COUNT.load(Ordering::Relaxed),
+    )
+}
+
+/// Zero the entry and backward seam counters ([`moe_fused_forward_count`] is
+/// left alone: it is public and process-lifetime).
+pub fn reset_seam_counts() {
+    ENTRY.store(0, Ordering::Relaxed);
+    MOE_BWD_COUNT.store(0, Ordering::Relaxed);
+}
+
+fn note_entry_reached() {
+    ENTRY.fetch_add(1, Ordering::Relaxed);
+}
+
+fn note_fused_backward() {
+    MOE_BWD_COUNT.fetch_add(1, Ordering::Relaxed);
+}
 
 /// Number of fused MoE forward launches since process start (tests assert the
 /// fused path engaged instead of silently falling back to the tensor path).
@@ -768,9 +804,13 @@ struct RoutState {
 #[derive(Debug)]
 struct RoutFwdOp;
 
-impl<B: Backend> Backward<B, 4> for RoutFwdOp
+// `B` is the INNER backend, and here it is always `CB`: the only way to build
+// this node is the entry below, which runs on `Autodiff<CB, S>`, so
+// `OpsPrep::finish` returns `AutodiffTensor<CB>`. Pinning it removes an
+// inference ambiguity and states the invariant the gate below depends on.
+impl Backward<CB, 4> for RoutFwdOp
 where
-    DispatchTensor: DispatchKindConversion<B>,
+    DispatchTensor: DispatchKindConversion<CB>,
 {
     type State = RoutState;
 
@@ -781,23 +821,29 @@ where
         _checkpointer: &mut Checkpointer,
     ) {
         let st = &ops.state;
-        let d_gates = Tensor::<2>::from_primitive::<B>(grads.consume::<B>(&ops.node));
+        let d_gates = Tensor::<2>::from_primitive::<CB>(grads.consume::<CB>(&ops.node));
 
         #[cfg(feature = "cuda")]
         {
-            if std::any::TypeId::of::<B>() == std::any::TypeId::of::<CB>() {
+            // `B` is the INNER backend here (`OpsPrep::finish` returns
+            // `AutodiffTensor<B>`; the result goes to
+            // `Tensor::from_primitive::<Autodiff<CB, S>>`), so this gate asks
+            // the right question. The entry above was the one pinned to
+            // `NoCheckpointing`.
+            if std::any::TypeId::of::<CB>() == std::any::TypeId::of::<CB>() {
                 if let Some((dx, dwp, dwc, dwe)) = router_backward_cuda(st, &d_gates) {
+                    note_fused_backward();
                     if let Some(node) = ops.parents[0].clone() {
-                        grads.register::<B>(node.id, dx.try_into_primitive::<B>().unwrap());
+                        grads.register::<CB>(node.id, dx.try_into_primitive::<CB>().unwrap());
                     }
                     if let Some(node) = ops.parents[1].clone() {
-                        grads.register::<B>(node.id, dwp.try_into_primitive::<B>().unwrap());
+                        grads.register::<CB>(node.id, dwp.try_into_primitive::<CB>().unwrap());
                     }
                     if let Some(node) = ops.parents[2].clone() {
-                        grads.register::<B>(node.id, dwc.try_into_primitive::<B>().unwrap());
+                        grads.register::<CB>(node.id, dwc.try_into_primitive::<CB>().unwrap());
                     }
                     if let Some(node) = ops.parents[3].clone() {
-                        grads.register::<B>(node.id, dwe.try_into_primitive::<B>().unwrap());
+                        grads.register::<CB>(node.id, dwe.try_into_primitive::<CB>().unwrap());
                     }
                     return;
                 }
@@ -806,16 +852,16 @@ where
 
         let (dx, dwp, dwc, dwe) = router_backward_tensor(st, &d_gates);
         if let Some(node) = ops.parents[0].clone() {
-            grads.register::<B>(node.id, dx.try_into_primitive::<B>().unwrap());
+            grads.register::<CB>(node.id, dx.try_into_primitive::<CB>().unwrap());
         }
         if let Some(node) = ops.parents[1].clone() {
-            grads.register::<B>(node.id, dwp.try_into_primitive::<B>().unwrap());
+            grads.register::<CB>(node.id, dwp.try_into_primitive::<CB>().unwrap());
         }
         if let Some(node) = ops.parents[2].clone() {
-            grads.register::<B>(node.id, dwc.try_into_primitive::<B>().unwrap());
+            grads.register::<CB>(node.id, dwc.try_into_primitive::<CB>().unwrap());
         }
         if let Some(node) = ops.parents[3].clone() {
-            grads.register::<B>(node.id, dwe.try_into_primitive::<B>().unwrap());
+            grads.register::<CB>(node.id, dwe.try_into_primitive::<CB>().unwrap());
         }
     }
 }
@@ -1035,7 +1081,7 @@ fn router_cuda(
 /// x, w_proj, w_cluster, w_expert; `c_idx`/`idx` are plain byproducts — they
 /// never carry gradients).
 #[allow(clippy::too_many_arguments)]
-fn router_fused_autodiff(
+fn router_fused_autodiff_s<S: CheckpointStrategy>(
     x: Tensor<2>,
     w_proj: Tensor<2>,
     w_cluster: Tensor<2>,
@@ -1044,11 +1090,15 @@ fn router_fused_autodiff(
     c: usize,
     e: usize,
     k: usize,
-) -> Option<(Tensor<2, Int>, Tensor<2, Int>, Tensor<2>)> {
-    let xa = x.try_into_primitive::<CAd>().ok()?;
-    let wpa = w_proj.try_into_primitive::<CAd>().ok()?;
-    let wca = w_cluster.try_into_primitive::<CAd>().ok()?;
-    let wea = w_expert.try_into_primitive::<CAd>().ok()?;
+) -> Option<(Tensor<2, Int>, Tensor<2, Int>, Tensor<2>)>
+where
+    DispatchTensor: DispatchKindConversion<Autodiff<CB, S>>,
+{
+    let xa = x.try_into_primitive::<Autodiff<CB, S>>().ok()?;
+    let wpa = w_proj.try_into_primitive::<Autodiff<CB, S>>().ok()?;
+    let wca = w_cluster.try_into_primitive::<Autodiff<CB, S>>().ok()?;
+    let wea = w_expert.try_into_primitive::<Autodiff<CB, S>>().ok()?;
+    note_entry_reached();
     let x_t = Tensor::<2>::from_primitive::<CB>(xa.primitive().clone());
     let wp_t = Tensor::<2>::from_primitive::<CB>(wpa.primitive().clone());
     let wc_t = Tensor::<2>::from_primitive::<CB>(wca.primitive().clone());
@@ -1066,7 +1116,7 @@ fn router_fused_autodiff(
         wca.node(),
         wea.node(),
     ];
-    let prep = RoutFwdOp.prepare::<NoCheckpointing>(nodes);
+    let prep = RoutFwdOp.prepare::<S>(nodes);
     let g_adt = match prep.compute_bound().stateful() {
         OpsKind::Tracked(mut prep) => {
             let _ids = [
@@ -1093,7 +1143,7 @@ fn router_fused_autodiff(
         }
         OpsKind::UnTracked(prep) => prep.finish(g_prim),
     };
-    Some((c_idx, idx, Tensor::from_primitive::<CAd>(g_adt)))
+    Some((c_idx, idx, Tensor::from_primitive::<Autodiff<CB, S>>(g_adt)))
 }
 
 /// Fused router on the bare CUDA backend (no autodiff, e.g. inference).
@@ -1142,7 +1192,13 @@ pub fn router_fused(
     e: usize,
     k: usize,
 ) -> Option<(Tensor<2, Int>, Tensor<2, Int>, Tensor<2>)> {
-    if let Some(r) = router_fused_autodiff(
+    // Probe BOTH checkpointing strategies, here rather than at the call site
+    // so the strategy knowledge lives in one place (gdn2's `chunk_dispatch`
+    // shape). `Autodiff<CB>` means `Autodiff<CB, NoCheckpointing>` and the
+    // downcast compares the whole backend type, so a `BalancedCheckpointing`
+    // caller — dormouse's backend — used to fall straight through to the
+    // tensor router with nothing counting it.
+    let autodiff_r = router_fused_autodiff_s::<NoCheckpointing>(
         x.clone(),
         w_proj.clone(),
         w_cluster.clone(),
@@ -1151,7 +1207,20 @@ pub fn router_fused(
         c,
         e,
         k,
-    ) {
+    )
+    .or_else(|| {
+        router_fused_autodiff_s::<BalancedCheckpointing>(
+            x.clone(),
+            w_proj.clone(),
+            w_cluster.clone(),
+            w_expert.clone(),
+            p,
+            c,
+            e,
+            k,
+        )
+    });
+    if let Some(r) = autodiff_r {
         return Some(r);
     }
     router_fused_plain(x, w_proj, w_cluster, w_expert, p, c, e, k)
@@ -1180,9 +1249,10 @@ struct MoeState {
 #[derive(Debug)]
 struct MoeFwdOp;
 
-impl<B: Backend> Backward<B, 5> for MoeFwdOp
+// `B` is the INNER backend, and here it is always `CB` — see `RoutFwdOp`.
+impl Backward<CB, 5> for MoeFwdOp
 where
-    DispatchTensor: DispatchKindConversion<B>,
+    DispatchTensor: DispatchKindConversion<CB>,
 {
     type State = MoeState;
 
@@ -1193,26 +1263,27 @@ where
         _checkpointer: &mut Checkpointer,
     ) {
         let st = &ops.state;
-        let d_out = Tensor::<2>::from_primitive::<B>(grads.consume::<B>(&ops.node));
+        let d_out = Tensor::<2>::from_primitive::<CB>(grads.consume::<CB>(&ops.node));
 
         #[cfg(feature = "cuda")]
         {
-            if std::any::TypeId::of::<B>() == std::any::TypeId::of::<CB>() {
+            if std::any::TypeId::of::<CB>() == std::any::TypeId::of::<CB>() {
                 if let Some((dx, du, dv, ds, dg)) = moe_backward_cuda(st, &d_out) {
+                    note_fused_backward();
                     if let Some(node) = ops.parents[0].clone() {
-                        grads.register::<B>(node.id, dx.try_into_primitive::<B>().unwrap());
+                        grads.register::<CB>(node.id, dx.try_into_primitive::<CB>().unwrap());
                     }
                     if let Some(node) = ops.parents[1].clone() {
-                        grads.register::<B>(node.id, du.try_into_primitive::<B>().unwrap());
+                        grads.register::<CB>(node.id, du.try_into_primitive::<CB>().unwrap());
                     }
                     if let Some(node) = ops.parents[2].clone() {
-                        grads.register::<B>(node.id, dv.try_into_primitive::<B>().unwrap());
+                        grads.register::<CB>(node.id, dv.try_into_primitive::<CB>().unwrap());
                     }
                     if let Some(node) = ops.parents[3].clone() {
-                        grads.register::<B>(node.id, ds.try_into_primitive::<B>().unwrap());
+                        grads.register::<CB>(node.id, ds.try_into_primitive::<CB>().unwrap());
                     }
                     if let Some(node) = ops.parents[4].clone() {
-                        grads.register::<B>(node.id, dg.try_into_primitive::<B>().unwrap());
+                        grads.register::<CB>(node.id, dg.try_into_primitive::<CB>().unwrap());
                     }
                     return;
                 }
@@ -1222,19 +1293,19 @@ where
         let (dx, du, dv, ds, dg) =
             moe_backward_tensor(&st.x, &st.u, &st.v, &st.s, &st.gates, &st.idx, &d_out, st.r);
         if let Some(node) = ops.parents[0].clone() {
-            grads.register::<B>(node.id, dx.try_into_primitive::<B>().unwrap());
+            grads.register::<CB>(node.id, dx.try_into_primitive::<CB>().unwrap());
         }
         if let Some(node) = ops.parents[1].clone() {
-            grads.register::<B>(node.id, du.try_into_primitive::<B>().unwrap());
+            grads.register::<CB>(node.id, du.try_into_primitive::<CB>().unwrap());
         }
         if let Some(node) = ops.parents[2].clone() {
-            grads.register::<B>(node.id, dv.try_into_primitive::<B>().unwrap());
+            grads.register::<CB>(node.id, dv.try_into_primitive::<CB>().unwrap());
         }
         if let Some(node) = ops.parents[3].clone() {
-            grads.register::<B>(node.id, ds.try_into_primitive::<B>().unwrap());
+            grads.register::<CB>(node.id, ds.try_into_primitive::<CB>().unwrap());
         }
         if let Some(node) = ops.parents[4].clone() {
-            grads.register::<B>(node.id, dg.try_into_primitive::<B>().unwrap());
+            grads.register::<CB>(node.id, dg.try_into_primitive::<CB>().unwrap());
         }
     }
 }
@@ -1494,7 +1565,7 @@ fn moe_fwd(
 /// the inner backend and wraps the result in a tracked op (parents:
 /// x, u, v, s, gates).
 #[allow(clippy::too_many_arguments)]
-fn moe_fused_autodiff(
+fn moe_fused_autodiff_s<S: CheckpointStrategy>(
     x: Tensor<2>,
     u: Tensor<2>,
     v: Tensor<2>,
@@ -1502,12 +1573,16 @@ fn moe_fused_autodiff(
     idx: Tensor<2, Int>,
     gates: Tensor<2>,
     rank: usize,
-) -> Option<Tensor<2>> {
-    let xa = x.try_into_primitive::<CAd>().ok()?;
-    let ua = u.try_into_primitive::<CAd>().ok()?;
-    let va = v.try_into_primitive::<CAd>().ok()?;
-    let sa = s.try_into_primitive::<CAd>().ok()?;
-    let ga = gates.try_into_primitive::<CAd>().ok()?;
+) -> Option<Tensor<2>>
+where
+    DispatchTensor: DispatchKindConversion<Autodiff<CB, S>>,
+{
+    let xa = x.try_into_primitive::<Autodiff<CB, S>>().ok()?;
+    let ua = u.try_into_primitive::<Autodiff<CB, S>>().ok()?;
+    let va = v.try_into_primitive::<Autodiff<CB, S>>().ok()?;
+    let sa = s.try_into_primitive::<Autodiff<CB, S>>().ok()?;
+    let ga = gates.try_into_primitive::<Autodiff<CB, S>>().ok()?;
+    note_entry_reached();
     let x_t = Tensor::<2>::from_primitive::<CB>(xa.primitive().clone());
     let u_t = Tensor::<2>::from_primitive::<CB>(ua.primitive().clone());
     let v_t = Tensor::<2>::from_primitive::<CB>(va.primitive().clone());
@@ -1544,7 +1619,7 @@ fn moe_fused_autodiff(
         sa.node(),
         ga.node(),
     ];
-    let prep = MoeFwdOp.prepare::<NoCheckpointing>(nodes);
+    let prep = MoeFwdOp.prepare::<S>(nodes);
     let out_adt = match prep.compute_bound().stateful() {
         OpsKind::Tracked(mut prep) => {
             let _ids = [
@@ -1558,7 +1633,7 @@ fn moe_fused_autodiff(
         }
         OpsKind::UnTracked(prep) => prep.finish(out_prim),
     };
-    Some(Tensor::from_primitive::<CAd>(out_adt))
+    Some(Tensor::from_primitive::<Autodiff<CB, S>>(out_adt))
 }
 
 /// Fused forward on the bare CUDA backend (no autodiff, e.g. inference).
@@ -1606,7 +1681,8 @@ pub fn forward_moe_fused(
     gates: Tensor<2>,
     rank: usize,
 ) -> Option<Tensor<2>> {
-    if let Some(y) = moe_fused_autodiff(
+    // Both strategies, for the reason given at `router_fused` above.
+    let autodiff_y = moe_fused_autodiff_s::<NoCheckpointing>(
         x.clone(),
         u.clone(),
         v.clone(),
@@ -1614,10 +1690,77 @@ pub fn forward_moe_fused(
         idx.clone(),
         gates.clone(),
         rank,
-    ) {
+    )
+    .or_else(|| {
+        moe_fused_autodiff_s::<BalancedCheckpointing>(
+            x.clone(),
+            u.clone(),
+            v.clone(),
+            s.clone(),
+            idx.clone(),
+            gates.clone(),
+            rank,
+        )
+    });
+    if let Some(y) = autodiff_y {
         return Some(y);
     }
     moe_fused_plain(x, u, v, s, idx, gates, rank)
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod seam_tests {
+    //! The proof that the strategy gate is strategy-AGNOSTIC, and it runs on
+    //! CPU. No GPU, no kernel: it asserts a caller on
+    //! `Autodiff<Inner, BalancedCheckpointing>` — dormouse's backend — gets
+    //! PAST the seam downcast, and that the old `NoCheckpointing`-only spelling
+    //! does not. Revert `router_fused_autodiff_s` to `CAd` and the first
+    //! assertion goes red: it is the assertion, not the comment.
+    use super::*;
+    use burn::backend::DispatchKindConversion;
+    use burn::tensor::{Device, DispatchTensor};
+    use burn_autodiff::checkpoint::strategy::{
+        BalancedCheckpointing, CheckpointStrategy, NoCheckpointing,
+    };
+
+    type Nd = burn_ndarray::NdArray;
+
+    /// The router entry is hardcoded to the bare CUDA backend, so the
+    /// strategy-agnostic helper cannot be exercised for a NON-CUDA inner. What
+    /// IS testable without a device is the property the fix is about: the
+    /// downcast is on the whole backend type, so a Balanced tensor is refused
+    /// by a NoCheckpointing entry and accepted by a Balanced one. That is the
+    /// same downcast the CUDA entry performs, through the same
+    /// `try_into_primitive`, so it fails identically if the strategy is
+    /// dropped again.
+    fn accepts<S: CheckpointStrategy>(x: &Tensor<2>) -> bool
+    where
+        DispatchTensor: DispatchKindConversion<Autodiff<Nd, S>> + DispatchKindConversion<Nd>,
+    {
+        x.clone()
+            .try_into_primitive::<Autodiff<Nd, S>>()
+            .is_ok()
+    }
+
+    #[test]
+    fn the_strategy_gate_is_the_whole_backend_type() {
+        let plain = Device::ndarray().autodiff();
+        let balanced = Device::ndarray().autodiff().gradient_checkpointing();
+        let xp = Tensor::<2>::ones([4, 8], &plain);
+        let xb = Tensor::<2>::ones([4, 8], &balanced);
+
+        // The fact the fix rests on, asserted directly.
+        assert!(accepts::<NoCheckpointing>(&xp));
+        assert!(!accepts::<BalancedCheckpointing>(&xp));
+        assert!(!accepts::<NoCheckpointing>(&xb));
+        assert!(accepts::<BalancedCheckpointing>(&xb));
+
+        // And the counters are per-strategy-live, not per-call: the entry
+        // counter only moves when a caller actually got past the downcast.
+        reset_seam_counts();
+        let base = seam_counts().0;
+        assert_eq!(base, 0, "reset must zero the entry counter");
+    }
 }
 
 #[cfg(all(test, feature = "cuda"))]
