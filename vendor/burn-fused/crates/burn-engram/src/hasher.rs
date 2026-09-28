@@ -312,15 +312,23 @@ mod tests {
 
     /// 5: no systematic collision bias. 200k pseudo-random 2-grams into the
     /// prime slot (257 for vocab 256): every bin hit, and every bin within
-    /// 0.75x..1.25x of uniform. Uniform gives E = 778, sd = 27, so the band is
-    /// ~28 sigma wide — it can only fire on a structural defect (a stuck bit,
-    /// a weak multiplier, a wrong mod), never on sampling noise. The generator
-    /// is an inline splitmix64: no dependency, byte-identical on every host.
+    /// 0.85x..1.18x of uniform. Uniform gives E = 778 and sd = 27, so the band
+    /// is +3.6 / -3.0 sd — chosen for the FAMILY, not for one bin: 257 bins
+    /// tested at once means a 2.5-sd bound fires on a perfectly uniform hash
+    /// about once in three runs (the first version of this test had exactly
+    /// that band and failed on a bin at 1.15x; the histogram's chi2 is
+    /// 235/256 = 0.92, i.e. uniform). The bias this still catches is a factor
+    /// of 1.2 or more: a stuck bit, a lost power, a weak multiplier, a wrong
+    /// mod. The generator is an inline splitmix64 — no dependency, identical
+    /// bytes on every host.
     #[test]
     fn ngram_keys_are_uniform_over_their_slot() {
         let h = NgramHasher::new(256, 2, 2, 1, 0, 7);
         let p = h.primes[0] as usize;
-        assert!((250..260).contains(&p), "expected a prime near 257, got {p}");
+        assert!(
+            (250..260).contains(&p),
+            "expected a prime near 257, got {p}"
+        );
         let n = 200_000usize;
         let mut s = 0x243F6A8885A308D3u64;
         let mut next = move || {
@@ -330,14 +338,16 @@ mod tests {
             z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
             ((z ^ (z >> 31)) >> 33) as usize % 256
         };
-        let ids: Vec<i64> = (0..n).map(|_| next() as i64 * 256 + next() as i64).collect();
+        let ids: Vec<i64> = (0..n)
+            .map(|_| next() as i64 * 256 + next() as i64)
+            .collect();
         let keys = h.hash_ids(&ids);
         let mut bins = vec![0usize; p];
         for &k in &keys {
             bins[k as usize] += 1;
         }
         let e = n as f64 / p as f64;
-        let (lo, hi) = (0.75 * e, 1.25 * e);
+        let (lo, hi) = (0.85 * e, 1.18 * e);
         for (b, &c) in bins.iter().enumerate() {
             assert!(c > 0, "bin {b} never hit: a hole in the key space");
             let f = c as f64;

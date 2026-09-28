@@ -151,8 +151,7 @@ fn situ_glu_backward_kernel<F: Float>(
 fn cube_of(t: &Tensor<2>) -> Option<burn_cubecl::tensor::CubeTensor> {
     type B = burn_cubecl::CubeBackend;
     let prim = t.clone().try_into_primitive::<B>().ok()?;
-    let c = (&prim as &dyn std::any::Any)
-        .downcast_ref::<burn_cubecl::tensor::CubeTensor>()?;
+    let c = (&prim as &dyn std::any::Any).downcast_ref::<burn_cubecl::tensor::CubeTensor>()?;
     Some(c.clone())
 }
 
@@ -397,10 +396,10 @@ mod seam_tests {
     use super::*;
     use burn::backend::DispatchKindConversion;
     use burn::tensor::{Device, DispatchTensor};
-    use burn_autodiff::Autodiff as Ad;
     use burn_autodiff::checkpoint::strategy::{
         BalancedCheckpointing, CheckpointStrategy, NoCheckpointing,
     };
+    use burn_autodiff::Autodiff as Ad;
 
     type Nd = burn_ndarray::NdArray;
 
@@ -417,7 +416,9 @@ mod seam_tests {
         let x = Tensor::<2>::ones([4, 8], &dev);
 
         reset_seam_counts();
-        let base = seam_counts().expect("autodiff feature is on in this test").0;
+        let base = seam_counts()
+            .expect("autodiff feature is on in this test")
+            .0;
 
         assert!(reach::<BalancedCheckpointing>(&x).is_some());
         assert_eq!(
@@ -445,19 +446,23 @@ mod seam_tests {
     }
 }
 
+/// These tests need a live CUDA context. NOT a silent skip: each is
+/// `#[ignore]`d so `cargo test` prints `ignored` with the reason instead of
+/// counting a zero-assertion `return` as a PASS (ADR-0011), and asking for one
+/// explicitly without a GPU FAILS loudly rather than passing. File level, not
+/// inside one module: the three test modules below all call it, and the
+/// previous per-module copy meant `--features cuda,autodiff` did not compile.
+#[cfg(all(test, feature = "cuda"))]
+fn require_cuda(what: &str) {
+    assert_eq!(
+        std::env::var("BURN_DEVICE").as_deref(),
+        Ok("cuda"),
+        "{what} needs a live CUDA context: BURN_DEVICE=cuda cargo test -p burn-situ --features cuda,autodiff -- --ignored"
+    );
+}
+
 #[cfg(all(test, feature = "cuda"))]
 mod cuda_tests {
-    // These tests need a live CUDA context. NOT a silent skip: each is
-    // `#[ignore]`d so `cargo test` prints `ignored` with the reason instead of
-    // counting a zero-assertion `return` as a PASS (ADR-0011), and asking for
-    // one explicitly without a GPU FAILS loudly rather than passing.
-    fn require_cuda(what: &str) {
-        assert_eq!(
-            std::env::var("BURN_DEVICE").as_deref(),
-            Ok("cuda"),
-            "{what} needs a live CUDA context: BURN_DEVICE=cuda cargo test -p burn-situ --features cuda,autodiff -- --ignored"
-        );
-    }
 
     use super::*;
     use burn::tensor::{Device, Distribution, Tensor};

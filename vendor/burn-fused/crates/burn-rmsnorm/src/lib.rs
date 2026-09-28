@@ -43,13 +43,11 @@ impl RMSNorm {
         #[cfg(feature = "cuda")]
         {
             let [b, t, _] = x.dims();
-            if let Some(out) =
-                crate::fused::rmsnorm_cuda::<burn_cubecl::CubeBackend>(
-                    x.clone().reshape([b * t, d]),
-                    self.weight.val().clone(),
-                    self.eps,
-                )
-            {
+            if let Some(out) = crate::fused::rmsnorm_cuda::<burn_cubecl::CubeBackend>(
+                x.clone().reshape([b * t, d]),
+                self.weight.val().clone(),
+                self.eps,
+            ) {
                 return out.reshape([b, t, d]);
             }
             // The tensor path below is CORRECT, so the only honest way to see
@@ -118,7 +116,9 @@ mod tests {
         // invisible.
         let w: Vec<f32> = (0..d).map(|i| 0.5 + 0.25 * i as f32).collect();
         norm.weight = Param::from_tensor(Tensor::<1>::from_floats(w.as_slice(), &dev));
-        let xs: Vec<f32> = (0..b * t * d).map(|i| (i as f32 * 0.37).sin() * 3.0).collect();
+        let xs: Vec<f32> = (0..b * t * d)
+            .map(|i| (i as f32 * 0.37).sin() * 3.0)
+            .collect();
         let x = Tensor::<3>::from_data(burn::tensor::TensorData::new(xs.clone(), [b, t, d]), &dev);
         let got: Vec<f32> = norm
             .forward(x)

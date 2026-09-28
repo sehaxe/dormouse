@@ -535,17 +535,20 @@ mod seam_tests {
     use super::*;
     use burn::backend::DispatchKindConversion;
     use burn::tensor::{Device, DispatchTensor};
-    use burn_autodiff::Autodiff as Ad;
     use burn_autodiff::checkpoint::strategy::{
         BalancedCheckpointing, CheckpointStrategy, NoCheckpointing,
     };
+    use burn_autodiff::Autodiff as Ad;
 
     type Nd = burn_ndarray::NdArray;
 
     #[test]
     fn balanced_checkpointing_reaches_the_seam_and_the_legacy_entry_does_not() {
-        fn reach<S: CheckpointStrategy>(x: &Tensor<4>, c: &Tensor<2>, s: &Tensor<2>)
-        -> Option<Tensor<4>>
+        fn reach<S: CheckpointStrategy>(
+            x: &Tensor<4>,
+            c: &Tensor<2>,
+            s: &Tensor<2>,
+        ) -> Option<Tensor<4>>
         where
             DispatchTensor: DispatchKindConversion<Ad<Nd, S>> + DispatchKindConversion<Nd>,
         {
@@ -557,7 +560,9 @@ mod seam_tests {
         let (c, s) = crate::precompute_freqs(4, 8, 10000.0, &dev);
 
         reset_seam_counts();
-        let base = seam_counts().expect("autodiff feature is on in this test").0;
+        let base = seam_counts()
+            .expect("autodiff feature is on in this test")
+            .0;
 
         assert!(reach::<BalancedCheckpointing>(&x, &c, &s).is_some());
         assert_eq!(

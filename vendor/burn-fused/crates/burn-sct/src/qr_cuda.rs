@@ -75,9 +75,7 @@ pub(crate) fn row_stride(cube: &CubeTensor) -> u32 {
 }
 
 /// Like [`cube_of`] for an int tensor (counter buffers).
-pub fn cube_of_int<B: Backend>(
-    t: &Tensor<2, burn::tensor::Int>,
-) -> Option<CubeTensor>
+pub fn cube_of_int<B: Backend>(t: &Tensor<2, burn::tensor::Int>) -> Option<CubeTensor>
 where
     DispatchTensor: DispatchKindConversion<B>,
 {

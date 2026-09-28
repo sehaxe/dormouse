@@ -181,11 +181,8 @@ mod tests {
         // element: every path from w to q runs through `wd = w.detach()`.
         let dev = burn::tensor::Device::ndarray().autodiff();
         let xs = [0.1f32, -0.2, 0.6, -0.9, 1.4, 2.0, -3.0, 0.05];
-        let w = Tensor::<2>::from_data(
-            burn::tensor::TensorData::new(xs.to_vec(), [2, 4]),
-            &dev,
-        )
-        .require_grad();
+        let w = Tensor::<2>::from_data(burn::tensor::TensorData::new(xs.to_vec(), [2, 4]), &dev)
+            .require_grad();
         // any non-constant scalar function of q; sum keeps the expected grad
         // at exactly 1 so a wrong derivative is unmissable.
         let grads = weight_quant_b158(w.clone()).sum().backward();
