@@ -51,7 +51,7 @@ pub struct FusedAdjoint(
                 Tensor<4>,
                 f64,
                 usize,
-            ) -> Option<[Tensor<4>; 7]>
+            ) -> Result<[Tensor<4>; 7], &'static str>
             + Send
             + Sync,
     >,
@@ -89,23 +89,27 @@ where
             // chain from a zero state adjoint, which is this op's contract —
             // the output state is an untracked leaf (see the module header).
             let [Some(k), Some(v), Some(b), Some(w)] = xs else {
-                return None;
+                return Err("an op parent was not a tracked node");
             };
             // Bare, so `try_into_primitive` inside the kernels sees what it
-            // expects: a hardware tensor, not an autodiff handle.
-            let (Some(k), Some(v), Some(b), Some(w), Some(d_out)) = (
-                strip::<Inner, S, 4>(k),
-                strip::<Inner, S, 4>(v),
-                strip::<Inner, S, 4>(b),
-                strip::<Inner, S, 4>(w),
-                strip::<Inner, S, 4>(&d_out),
-            ) else {
-                return None;
+            // expects: a hardware tensor, not an autodiff handle. Named
+            // separately because a refusal here and a refusal inside the
+            // kernels are different bugs, and a message that says neither is
+            // the message that costs the next person an afternoon.
+            let bare = |t: &Tensor<4>, name: &'static str| {
+                strip::<Inner, S, 4>(t).ok_or(name)
             };
-            let out = fused_chunk_backward::<Inner>(
-                fwd, &k, &v, &b, &w, &d_out, scale, chunk_size,
-            )?;
-            Some([
+            let k = bare(k, "strip(k)")?;
+            let v = bare(v, "strip(v)")?;
+            let b = bare(b, "strip(b)")?;
+            let w = bare(w, "strip(w)")?;
+            let d_out = bare(&d_out, "strip(d_out)")?;
+            let out = fused_chunk_backward::<Inner>(fwd, &k, &v, &b, &w, &d_out, scale, chunk_size)
+                .ok_or(
+                    "fused_chunk_backward refused (its own is_cuda gate, or a contiguity \
+                     materialization that did not come back row-major)",
+                )?;
+            Ok([
                 out.d_q,
                 out.d_k,
                 out.d_v,
@@ -192,11 +196,13 @@ where
                 scale,
                 chunk_size,
             )
-            .expect(
-                "the fused chunk forward ran, so its adjoint must: this is a bug in the \
-                 fused backward seam (strip / kernel limits / contiguity), and the tensor \
-                 adjoint cannot take over because the fused forward kept no scratch",
-            );
+            .unwrap_or_else(|why| {
+                panic!(
+                    "the fused chunk forward ran, so its adjoint must, and it refused at \
+                     {why}. The tensor adjoint cannot take over because the fused forward \
+                     kept no chunk scratch, so there is no fallback that is not a lie."
+                )
+            });
             for (i, grad) in d_inputs.into_iter().enumerate() {
                 if let Some(node) = ops.parents[i].clone() {
                     grads.register::<B>(node.id, grad.try_into_primitive::<B>().unwrap());
