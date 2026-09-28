@@ -215,33 +215,134 @@ mod tests {
         }
     }
 
+    /// The properties this test suite asserts, in place of a hand-copied
+    /// expected value. A copied constant moves with the bug; these cannot:
+    ///
+    /// 1. **in range** — every key is a valid address for its own slot
+    ///    (`0 <= key < prime(slot)`), or the embedding lookup reads OOB.
+    /// 2. **stable** — the same ids give the same keys, every call.
+    /// 3. **position-independent / window-local** — the key at position i
+    ///    depends on the n-gram ENDING at i and on nothing else. This is what
+    ///    makes it an n-gram *memory* rather than a positional hash, and it is
+    ///    the property a restatement of the implementation can never show.
+    /// 4. **distinct inputs of the right width give distinct keys** — a 1-gram
+    ///    slot is a bijection on the vocabulary (p > vocab, multiplier coprime
+    ///    to p), so all `vocab_size` single tokens land on `vocab_size`
+    ///    different keys.
+    /// 5. **no systematic collision bias** — n-gram keys are ~uniform over
+    ///    their slot: every bin hit, and no bin more than 1.25x / less than
+    ///    0.75x its expected count.
+    ///
+    /// Deliberately absent: a bit-exact comparison with `engram_demo_v1.py`.
+    /// This port uses a splitmix64 stream where the reference uses PCG64, so
+    /// it cannot be bit-for-bit with the reference; the header says so. Until
+    /// someone commits a fixture from the authors' code, fidelity is
+    /// UNMEASURED and only these properties are claimed.
     #[test]
-    fn matches_reference_algorithm() {
-        // Reproduce the reference exactly for one sequence by hand:
-        // vocab 10, min=2, max=2, heads=1, pad 0, seed such that the first
-        // multiplier is known. Compute the XOR mix manually.
-        let h = NgramHasher::new(10, 2, 2, 1, 0, 99);
-        let m0 = h.multipliers[0];
-        let m1 = h.multipliers[1];
-        let p = h.primes[0];
-        let ids = [3i64, 5, 8];
-        let out = h.hash_ids(&ids);
-        // shift k: token k steps back, pad_id before t=0 (reference shift_k)
-        // t=0: (3, pad) -> 3*m0 ^ pad*m1
+    fn hash_properties() {
+        // 1 + 2
+        let h = NgramHasher::new(256, 1, 3, 1, 0, 42);
+        let ids: Vec<i64> = (0..64).collect();
+        let a = h.hash_ids(&ids);
+        assert_eq!(a, h.hash_ids(&ids), "must be deterministic");
+        assert_eq!(a.len(), 64 * 3);
+        for (i, &v) in a.iter().enumerate() {
+            let slot = i % 3;
+            assert!((0..h.primes[slot]).contains(&v), "out of range: {v}");
+        }
+        // 3: the same n-gram ENDING at two positions hashes the same, so the
+        // key is a function of the window, not of the position.
+        let seq: Vec<i64> = vec![9, 4, 77, 200, 9, 4, 77, 13, 9, 4, 77];
+        let k = h.hash_ids(&seq);
+        let t = h.num_tables(); // min=1..=3, n_heads=1 -> slot = ngram - 1
+        let key = |i: usize, slot: usize| k[i * t + slot];
+        assert_eq!(key(1, 1), key(5, 1), "2-gram (4,9) at 1 and 5");
+        assert_eq!(key(5, 1), key(9, 1), "2-gram (4,9) at 5 and 9");
+        assert_eq!(key(2, 2), key(6, 2), "3-gram (77,4,9) at 2 and 6");
+        assert_eq!(key(6, 2), key(10, 2), "3-gram (77,4,9) at 6 and 10");
+
+        // 3, other direction: a token strictly outside the window ending at
+        // `end` cannot change that window's key, for ANY slot. A hasher that
+        // mixed in more than the last n tokens would fail here.
+        let end = 6usize;
+        for slot in 0..t {
+            let n = slot + 1;
+            for far in 0..=end.saturating_sub(n + 1) {
+                let mut other = seq.clone();
+                other[far] = (other[far] + 1) % 256;
+                assert_eq!(
+                    key(end, slot),
+                    h.hash_ids(&other)[end * t + slot],
+                    "slot {slot} (n={n}) moved with token {far}, which is {n} steps back"
+                );
+            }
+            // ...and the newest token IS inside every window, so it must move
+            // them all. Fixed data, fixed seed: this is a fixed fact, not a
+            // probabilistic claim.
+            let mut bumped = seq.clone();
+            bumped[end] += 1;
+            let b = h.hash_ids(&bumped);
+            assert_ne!(
+                key(end, slot),
+                b[end * t + slot],
+                "slot {slot} ignored the token it ends on"
+            );
+        }
+    }
+
+    /// 4: a 1-gram slot is injective over the vocabulary. p > vocab_size and
+    /// the multiplier is coprime to p, so every token gets its own key. A
+    /// degenerate multiplier (0, or a multiple of p) collapses the whole
+    /// vocabulary onto one key and this is the test that says so.
+    #[test]
+    fn one_gram_keys_are_injective_over_the_vocab() {
+        let h = NgramHasher::new(256, 1, 1, 1, 0, 42);
+        let ids: Vec<i64> = (0..256).collect();
+        let keys = h.hash_ids(&ids);
+        let distinct: std::collections::HashSet<i64> = keys.iter().copied().collect();
         assert_eq!(
-            out[0],
-            (3i64.wrapping_mul(m0) ^ 0i64.wrapping_mul(m1)).rem_euclid(p)
+            distinct.len(),
+            256,
+            "256 tokens collapsed onto {} keys (prime {}, multiplier {})",
+            distinct.len(),
+            h.primes[0],
+            h.multipliers[0]
         );
-        // t=1: (5, 3) -> 5*m0 ^ 3*m1
-        assert_eq!(
-            out[1],
-            (5i64.wrapping_mul(m0) ^ 3i64.wrapping_mul(m1)).rem_euclid(p)
-        );
-        // t=2: (8, 5)
-        assert_eq!(
-            out[2],
-            (8i64.wrapping_mul(m0) ^ 5i64.wrapping_mul(m1)).rem_euclid(p)
-        );
+    }
+
+    /// 5: no systematic collision bias. 200k pseudo-random 2-grams into the
+    /// prime slot (257 for vocab 256): every bin hit, and every bin within
+    /// 0.75x..1.25x of uniform. Uniform gives E = 778, sd = 27, so the band is
+    /// ~28 sigma wide — it can only fire on a structural defect (a stuck bit,
+    /// a weak multiplier, a wrong mod), never on sampling noise. The generator
+    /// is an inline splitmix64: no dependency, byte-identical on every host.
+    #[test]
+    fn ngram_keys_are_uniform_over_their_slot() {
+        let h = NgramHasher::new(256, 2, 2, 1, 0, 7);
+        let p = h.primes[0] as usize;
+        assert!((250..260).contains(&p), "expected a prime near 257, got {p}");
+        let n = 200_000usize;
+        let mut s = 0x243F6A8885A308D3u64;
+        let mut next = move || {
+            s = s.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = s;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            ((z ^ (z >> 31)) >> 33) as usize % 256
+        };
+        let ids: Vec<i64> = (0..n).map(|_| next() as i64 * 256 + next() as i64).collect();
+        let keys = h.hash_ids(&ids);
+        let mut bins = vec![0usize; p];
+        for &k in &keys {
+            bins[k as usize] += 1;
+        }
+        let e = n as f64 / p as f64;
+        let (lo, hi) = (0.75 * e, 1.25 * e);
+        for (b, &c) in bins.iter().enumerate() {
+            assert!(c > 0, "bin {b} never hit: a hole in the key space");
+            let f = c as f64;
+            assert!(f > lo && f < hi, "bin {b}: {c} hits, expected ~{e:.0}");
+        }
     }
 
     #[test]

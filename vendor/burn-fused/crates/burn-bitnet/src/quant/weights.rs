@@ -102,10 +102,17 @@ mod tests {
     }
 
     #[test]
-    fn b158_roundclip_matches_paper_closed_form() {
-        // arXiv 2402.17764 / 2504.18415 Eq.1: W̃ = RoundClip(W/γ, −1, 1)·γ,
-        // γ = mean|W|. Input crafted so every branch is exercised:
-        // |w| < γ/2 → 0, mid → ±γ, large → clip keeps ±γ.
+    fn b158_roundclip_is_nearest_of_three_levels() {
+        // The oracle is a scalar loop over host f64, NOT a restatement of the
+        // tensor chain at :19-33 (which is what this test used to be: a
+        // hand-copy of the implementation moves with the bug). The property
+        // is the DEFINING one of Eq. 1 — every weight lands on the level in
+        // {-1,0,+1} nearest to W/gamma, scaled by gamma — stated as
+        // argmin over the level set, which is a different computation from
+        // round().clamp() and disagrees with it if gamma is taken over the
+        // wrong axis or the clamp is applied before the round.
+        // Input crafted so every branch is exercised:
+        // |w| < gamma/2 -> 0, mid -> +-gamma, large -> clip keeps +-gamma.
         let xs = [
             0.1f32, -0.2, 0.6, -0.9, //
             1.4, 2.0, -3.0, 0.05,
@@ -113,9 +120,16 @@ mod tests {
         let w = Tensor::<2>::from_data(burn::tensor::TensorData::new(xs.to_vec(), [2, 4]), &dev());
         let q = weight_quant_b158(w.clone());
         let v: Vec<f32> = to_host(q);
-        let gamma: f32 = to_host(w.clone().abs().mean())[0];
+        let gamma = xs.iter().map(|x| f64::from(*x).abs()).sum::<f64>() / xs.len() as f64;
         for (got, x) in v.iter().zip(xs.iter()) {
-            let want = (x / gamma).round().clamp(-1.0, 1.0) * gamma;
+            let r = f64::from(*x) / gamma;
+            // nearest level in {-1,0,+1}: distance, not rounding
+            let level = [(-1.0f64, r + 1.0), (0.0, r.abs()), (1.0, (r - 1.0).abs())]
+                .iter()
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .expect("three levels")
+                .0;
+            let want = (level * gamma) as f32;
             assert!((got - want).abs() < 1e-6, "{got} vs {want}");
         }
         // weight_quant_ternary IS the paper form now (delegates to b158):
@@ -128,6 +142,57 @@ mod tests {
             s.iter().zip(v.iter()).any(|(a, b)| (a - b).abs() > 1e-3),
             "roundclip and sign variants should diverge here"
         );
+    }
+
+    #[test]
+    fn b158_exactly_three_levels_bounded_by_gamma() {
+        // Properties of ANY correct b1.58 quantizer, on random input: the code
+        // book is exactly {-gamma, 0, +gamma}, gamma is the absmean of the
+        // INPUT, and nothing exceeds it. A copied expected value cannot see
+        // the level count or the bound.
+        let w = Tensor::<2>::random([8, 64], Distribution::Normal(0.0, 1.0), &dev());
+        let master = to_host(w.clone());
+        let gamma = to_host(w.clone().abs().mean())[0];
+        let v = to_host(weight_quant_b158(w));
+        for q in &v {
+            let on_level = (*q - gamma).abs() < 1e-6 || (*q + gamma).abs() < 1e-6 || q.abs() < 1e-6;
+            assert!(on_level, "{q} is not one of {{-gamma, 0, +gamma}}");
+            assert!(q.abs() <= gamma + 1e-6, "{q} exceeds gamma {gamma}");
+        }
+        assert!(
+            v.iter().filter(|q| q.abs() < 1e-6).count() > 0,
+            "a 512-element normal sample must contain zeroed weights"
+        );
+        // sign is preserved unless the weight is zeroed (|w| < gamma/2). The
+        // band starts at 0.55, not 0.5: exactly at the threshold the f32
+        // absmean and the implementation's gamma can disagree on which side of
+        // it a weight sits, and that is a rounding artefact, not a bug.
+        for (q, m) in v.iter().zip(master.iter()) {
+            if m.abs() >= gamma * 0.55 {
+                assert_eq!(q.signum(), m.signum(), "sign flipped at w={m}");
+            }
+        }
+    }
+
+    #[test]
+    fn b158_ste_gradient_is_exactly_identity() {
+        // The straight-through claim (doc :11) is about the BACKWARD, so no
+        // forward-value oracle can check it. dQ/dW must be exactly 1 per
+        // element: every path from w to q runs through `wd = w.detach()`.
+        let dev = burn::tensor::Device::ndarray().autodiff();
+        let xs = [0.1f32, -0.2, 0.6, -0.9, 1.4, 2.0, -3.0, 0.05];
+        let w = Tensor::<2>::from_data(
+            burn::tensor::TensorData::new(xs.to_vec(), [2, 4]),
+            &dev,
+        )
+        .require_grad();
+        // any non-constant scalar function of q; sum keeps the expected grad
+        // at exactly 1 so a wrong derivative is unmissable.
+        let grads = weight_quant_b158(w.clone()).sum().backward();
+        let d = to_host(w.grad(&grads).expect("weight grad"));
+        for (i, g) in d.iter().enumerate() {
+            assert!((g - 1.0).abs() < 1e-6, "dQ/dW[{i}] = {g}, STE says 1");
+        }
     }
 
     #[test]

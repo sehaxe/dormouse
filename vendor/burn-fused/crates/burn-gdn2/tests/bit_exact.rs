@@ -31,7 +31,7 @@
 // recurrence in f32 differ by O(1e-6) from reduction order and libm alone, so
 // `EPSILON = 5e-4` is two orders of magnitude above the noise floor and still
 // tight enough to catch any real change in the recurrence. It is an ABSOLUTE
-// tolerance against a fixture whose output scale is ~6e-3, so 5e-4 is ~8% of
+// tolerance against a fixture whose output scale is ~1e-2, so 5e-4 is ~5% of
 // the signal: not vacuous, but a relative or RMS-normalised tolerance would be
 // the stronger gate. Changing it needs a measured noise floor from a second
 // independent transcription, so it stays a follow-up rather than a guess.

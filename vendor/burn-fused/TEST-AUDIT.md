@@ -127,8 +127,8 @@ run them set `BURN_DEVICE: cuda`; the crates should fail loudly instead.
 - **`rust-toolchain.toml` says `channel = "stable"`, which floats.** For a
   library whose headline claim is bit-level reproducibility, the toolchain is
   part of the claim. Pin it (1 line) and say which version.
-- **The 5e-4 absolute tolerance is ~8% of the fixture's output scale** (outputs
-  are ~6e-3). A relative or RMS-normalised tolerance would be the stronger
+- **The 5e-4 absolute tolerance is ~5% of the fixture's output scale** (outputs
+  reach ~9e-3). A relative or RMS-normalised tolerance would be the stronger
   gate, but picking one needs a measured noise floor from a second independent
   transcription, not a guess.
 - **`burn-gdn2`'s `python3 tests/gen_reference.py` path in `README.md:262-265`**

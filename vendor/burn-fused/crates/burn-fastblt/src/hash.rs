@@ -142,13 +142,125 @@ mod tests {
         assert_ne!(ids, ids3);
     }
 
+    /// The properties this suite asserts instead of a hand-copied expected
+    /// value. A copied constant moves with the bug; these cannot:
+    ///
+    /// 1. **in range** — every key is a valid row index (`0 <= key < max_hash`).
+    /// 2. **stable** — the same bytes give the same keys, every call.
+    /// 3. **position-independent / window-local** — the key at position i is a
+    ///    function of the `group_size` bytes ENDING at i and nothing else.
+    ///    That is what makes it a byte-window hash rather than a positional
+    ///    one, and a restatement of the implementation cannot show it.
+    /// 4. **distinct inputs of the right width give distinct keys** — no two
+    ///    random `group_size`-windows share a key, beyond the birthday rate.
+    /// 5. **no systematic collision bias** — keys are ~uniform over
+    ///    `[0, max_hash)`: every bin hit, none more than 1.25x / less than
+    ///    0.75x its expected count.
+    ///
+    /// Deliberately absent: a comparison with Meta's `patcher.py`. The header
+    /// records that this variant's Horner order differs from the reference's
+    /// on purpose, so no bit-exact oracle is possible without changing the
+    /// hash. Fidelity to `bytelatent` is UNMEASURED.
     #[test]
-    fn hash_matches_reference_formula() {
-        // reference: hash = sum_i x[i] * prime^i, no mod for small values
-        let prime = HASH_PRIMES[0];
-        let ids = byte_group_hash_ids(&[3, 5], 2, 0, i64::MAX);
-        assert_eq!(ids[0], 3); // (pad, 3): 3*prime^0
-        assert_eq!(ids[1], 5 + 3 * prime); // (3, 5): 5 + 3*prime
+    fn hash_properties() {
+        // 1 + 2
+        let bytes = [1i64, 2, 3, 4, 5];
+        let ids = byte_group_hash_ids(&bytes, 2, 0, 1000);
+        assert_eq!(ids, byte_group_hash_ids(&bytes, 2, 0, 1000));
+        assert!(ids.iter().all(|&v| (0..1000).contains(&v)));
+        // a different prime (hash function) gives a different keying
+        assert_ne!(ids, byte_group_hash_ids(&bytes, 2, 1, 1000));
+        // a different window width gives a different keying
+        assert_ne!(ids, byte_group_hash_ids(&bytes, 3, 0, 1000));
+
+        // 3: same window, two positions -> same key. No mod involved, so this
+        // is exact arithmetic, not a probabilistic claim.
+        let seq = [9i64, 4, 77, 200, 9, 4, 77, 13, 9, 4, 77];
+        for gs in [2usize, 3] {
+            let k = byte_group_hash_ids(&seq, gs, 0, 1_000_003);
+            let first = k[gs - 1]; // window ending at gs-1: seq[0..=gs-1] reversed
+            let first_at = gs - 1;
+            for i in gs..seq.len() {
+                let w: Vec<i64> = (0..gs).map(|d| seq[i - d]).collect();
+                let w0: Vec<i64> = (0..gs).map(|d| seq[gs - 1 - d]).collect();
+                if w == w0 {
+                    assert_eq!(k[i], first, "gs={gs} window {w:?} at {i} vs {first_at}");
+                }
+            }
+        }
+        // 3, other direction: a byte strictly outside the window ending at
+        // `end` cannot change that window's key, for any width or prime.
+        let end = 6usize;
+        for gs in 1usize..=4 {
+            for pidx in 0..HASH_PRIMES.len() {
+                let base = byte_group_hash_ids(&seq, gs, pidx, 1_000_003)[end];
+                for far in 0..=end.saturating_sub(gs + 1) {
+                    let mut other = seq;
+                    other[far] += 1;
+                    assert_eq!(
+                        base,
+                        byte_group_hash_ids(&other, gs, pidx, 1_000_003)[end],
+                        "gs={gs} prime#{pidx} moved with byte {far} (not in the window)"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 4: distinct windows give distinct keys. 5000 random 3-windows into a
+    /// 100003-row table: a uniform hash gives ~4870 distinct keys (birthday),
+    /// so >= 4800 is a floor no correct-but-degenerate hash can pass (a stuck
+    /// bit, a zero multiplier or a lost power of p collapses the count by an
+    /// order of magnitude) while sitting ~1.5 sd under the expectation.
+    #[test]
+    fn distinct_windows_get_distinct_keys() {
+        let mut s = 0x243F6A8885A308D3u64;
+        let mut next = move || {
+            s = s.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = s;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            ((z ^ (z >> 31)) >> 33) as i64 % 256
+        };
+        let bytes: Vec<i64> = (0..5000).map(|_| next()).collect();
+        let keys = byte_group_hash_ids(&bytes, 3, 0, 100_003);
+        let distinct: std::collections::HashSet<i64> = keys.iter().copied().collect();
+        assert!(
+            distinct.len() >= 4800,
+            "5000 windows collapsed onto {} keys",
+            distinct.len()
+        );
+    }
+
+    /// 5: no systematic collision bias. 100k random 3-windows into 997 rows:
+    /// every bin hit, every bin within 0.75x..1.25x of uniform (E = 100, sd =
+    /// 10, so the band is ~5 sigma). A degenerate hash (stuck bit, zeroed
+    /// power, one dominant byte) leaves bins empty or 2-3x hot.
+    #[test]
+    fn keys_are_uniform_over_the_table() {
+        let mut s = 0x9E3779B97F4A7C15u64;
+        let mut next = move || {
+            s = s.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = s;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            ((z ^ (z >> 31)) >> 33) as i64 % 256
+        };
+        let bytes: Vec<i64> = (0..100_000).map(|_| next()).collect();
+        let keys = byte_group_hash_ids(&bytes, 3, 4, 997);
+        let mut bins = vec![0usize; 997];
+        for &k in &keys {
+            bins[k as usize] += 1;
+        }
+        let e = 100_000f64 / 997.0;
+        for (b, &c) in bins.iter().enumerate() {
+            assert!(c > 0, "bin {b} never hit: a hole in the key space");
+            let f = c as f64;
+            assert!(
+                f > 0.75 * e && f < 1.25 * e,
+                "bin {b}: {c} hits, expected ~{e:.0}"
+            );
+        }
     }
 
     #[test]

@@ -548,7 +548,10 @@ impl KdaModule {
         let (out, new_state) = {
             #[cfg(feature = "cuda")]
             {
-                if let Some((o, s)) = fused::cuda::kda_fused_chunk::<B>(
+                // The fused chunk kernels, on the bare CUDA backend or from
+                // ANY autodiff wrapper of it (any checkpointing strategy).
+                // The else arm is the tensor-ops chunk path.
+                if let Some((o, s)) = fused::cuda::kda_fused_chunk_reported::<B>(
                     q.clone(),
                     k.clone(),
                     v.clone(),
@@ -557,46 +560,22 @@ impl KdaModule {
                     b_v.clone(),
                     state.clone(),
                     self.chunk_size,
-                ) {
+                )
+                .into_option()
+                {
                     (o, s)
                 } else {
-                    #[cfg(feature = "autodiff")]
-                    {
-                        if fused::cuda::is_autodiff_cuda::<B>() {
-                            // Autodiff<Cuda> training backend: run the whole
-                            // chunked WY recurrence as ONE autodiff node over
-                            // the fused CUDA kernels (falls back to tensor ops
-                            // internally when the kernels cannot apply). Same
-                            // algebra as the tensor path, ~20x fewer launches.
-                            burn_gdn2::chunk_autodiff_or_plain::<fused::cuda::CudaBare>(
-                                q,
-                                k,
-                                v,
-                                g,
-                                b_k,
-                                b_v,
-                                state,
-                                1.0,
-                                self.chunk_size,
-                            )
-                        } else {
-                            chunk_wy_forward(
-                                q,
-                                k,
-                                v,
-                                g,
-                                b_k.clone(),
-                                b_v,
-                                state,
-                                1.0,
-                                self.chunk_size,
-                            )
-                        }
-                    }
-                    #[cfg(not(feature = "autodiff"))]
-                    {
-                        chunk_wy_forward(q, k, v, g, b_k.clone(), b_v, state, 1.0, self.chunk_size)
-                    }
+                    chunk_wy_forward(
+                        q,
+                        k,
+                        v,
+                        g,
+                        b_k.clone(),
+                        b_v,
+                        state,
+                        1.0,
+                        self.chunk_size,
+                    )
                 }
             }
             #[cfg(not(feature = "cuda"))]

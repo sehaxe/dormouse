@@ -318,8 +318,8 @@ pub(crate) fn matmul_rt(
 /// Paper Eq 5: Q,R = QR(U); U <- Q * sign(diag(R)). Native single-allocation
 /// Householder path (qr.rs, LAPACK dgeqrf scheme, O(m k^2), AVX2/FMA +
 /// parallel Q). The sign(diag(R)) correction matches the paper's safe_qr
-/// (PyTorch linalg.qr + sign flip). tests/cmp_reference.rs compares this
-/// against the reference, but it has never run: see the README.
+/// (PyTorch linalg.qr + sign flip). There is NO comparison against the
+/// authors' code in this crate: see the README's "Reference comparison".
 fn orthogonalize_cpu(matrix: Tensor<2>) -> Tensor<2> {
     let device = matrix.device();
     let require_grad = matrix.is_require_grad();
@@ -353,7 +353,7 @@ where
 /// rotated. Internal state is f64, so the dot/rotation noise floor is
 /// ~eps/sqrt(n) ~ 1e-14 even at n=11008; 1e-12 is both reachable (sweeps
 /// exit once converged) and ~9 orders tighter than the 1e-3 reconstruction
-/// tolerance the reference tests gate.
+/// tolerance `from_dense_roundtrip` gates.
 const JACOBI_EPS: f64 = 1e-12;
 
 /// Truncated SVD of an `n x m` row-major matrix via one-sided (Hestenes)
@@ -367,10 +367,9 @@ const JACOBI_EPS: f64 = 1e-12;
 ///
 /// Accuracy: internal state is f64 (one-sided Jacobi in f32 accumulates
 /// ~sqrt(m·sweeps)·eps of rotation noise per element, which for m=1024 lands
-/// at ~1e-3 relative — right on the reference test tolerance). With f64 the
-/// reconstruction is exact to ~1e-13, i.e. several orders better than
-/// torch.linalg.svd's own f32 result, so the comparison against the
-/// reference is dominated by torch's rounding, not ours.
+/// at ~1e-3 relative — the 1e-3 tolerance `from_dense_roundtrip` gates). With
+/// f64 the reconstruction is exact to ~1e-13, i.e. several orders better than
+/// torch.linalg.svd's own f32 result.
 ///
 /// Peak memory: the transposed f64 copy `a` (n·m·8) + right-rotation
 /// accumulator `v` (m·m·8) + outputs (k·(m+n)). The old per-column triplet

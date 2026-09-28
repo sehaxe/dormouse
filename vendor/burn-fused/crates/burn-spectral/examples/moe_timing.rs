@@ -23,7 +23,10 @@ fn main() {
     let mut opt = AdamWConfig::new().init();
     let grads = GradientsParams::from_grads(grads, &m);
     let t = std::time::Instant::now();
-    let m2 = opt.step(1e-3.into(), m.clone(), grads);
+    // `ModuleOptimizer::step` takes `impl Into<ModuleLearningRate>`, so a bare
+    // `1e-3.into()` leaves `Self` unconstrained (E0283). The lr is a bare f64
+    // (`LearningRate` is a type alias for it), so pass it straight.
+    let m2 = opt.step(1e-3, m.clone(), grads);
     println!("opt.step: {:.3}s", t.elapsed().as_secs_f64());
     let _ = m2;
     println!("ALL OK");

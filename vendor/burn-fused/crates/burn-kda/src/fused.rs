@@ -24,15 +24,15 @@ pub mod cuda {
 
     pub type CudaBare = burn_gdn2::CudaBare;
 
-    fn is_cuda<B: Backend>() -> bool {
+    /// `true` when `B` IS the bare CUDA backend (no autodiff wrapper). A
+    /// `TypeId` is the right test HERE and only here: a bare backend has
+    /// exactly one identity. It is NOT the test for "CUDA underneath" — an
+    /// autodiff wrapper is a different type for every checkpointing strategy,
+    /// which is what kept the fused path out of every training step
+    /// (`Autodiff<CudaBare, BalancedCheckpointing>` is dormouse's trainer
+    /// backend). For that see [`burn_gdn2::backend_matches`].
+    fn is_bare_cuda<B: Backend>() -> bool {
         TypeId::of::<B>() == TypeId::of::<CudaBare>()
-    }
-    #[cfg(all(feature = "cuda", feature = "autodiff"))]
-    /// `true` when `B` is the training backend `Autodiff<CudaBare>` (default
-    /// `NoCheckpointing` strategy), which runs the fused kernels through the
-    /// single autodiff node of [`burn_gdn2::chunk_autodiff_or_plain`].
-    pub fn is_autodiff_cuda<B: Backend>() -> bool {
-        TypeId::of::<B>() == TypeId::of::<burn::backend::autodiff::Autodiff<CudaBare>>()
     }
 
     /// `q,k,v`: `[B, H, T, K/V]` projected (L2-normed q/k, Swish v).
@@ -57,17 +57,62 @@ pub mod cuda {
     where
         DispatchTensor: DispatchKindConversion<B>,
     {
-        if !is_cuda::<B>() {
-            return None;
+        kda_fused_chunk_reported::<B>(q, k, v, log_alpha, beta_k, beta_v, state, chunk_size)
+            .into_option()
+    }
+
+    /// The production gate, and it SAYS which arm ran.
+    ///
+    /// Bare CUDA backend: the kernels take the tensors as they are. Autodiff
+    /// wrapper over CUDA, ANY checkpointing strategy: the seam in
+    /// [`burn_gdn2::cuda_dispatch`] strips the autodiff context, runs the
+    /// fused kernels on the bare backend inside ONE autodiff node, and
+    /// rebuilds the node on the caller's own strategy. Everything else
+    /// (NdArray, ...) reports [`Fallback::NotCuda`] and the caller runs the
+    /// tensor-ops chunk path.
+    ///
+    /// `Fused::Fused` means the single-node op ran; the launch counters
+    /// ([`burn_gdn2::fused_calls`]) are the ground truth for whether the
+    /// kernels inside it engaged or it used its own tensor fallback.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kda_fused_chunk_reported<B: Backend>(
+        q: Tensor<4>,
+        k: Tensor<4>,
+        v: Tensor<4>,
+        log_alpha: Tensor<4>,
+        beta_k: Tensor<4>,
+        beta_v: Tensor<4>,
+        state: Tensor<4>,
+        chunk_size: usize,
+    ) -> burn_gdn2::Fused<(Tensor<4>, Tensor<4>)>
+    where
+        DispatchTensor: DispatchKindConversion<B>,
+    {
+        use burn_gdn2::{Fallback, Fused};
+        if is_bare_cuda::<B>() {
+            // Numerical limit of the reused GDN-2 kernel: K/exp(cumsum(g))
+            // underflows f32 once cumsum(g) < -88, i.e. chunk > 17 at the K3
+            // floor g = -5. FlashKDA picked chunk 16 for exactly this reason.
+            if chunk_size > 16 {
+                return Fused::Fallback(Fallback::KernelLimits);
+            }
+            return match burn_gdn2::kernel::chunk_cube::cuda::fused_chunk_forward::<B>(
+                q, k, v, log_alpha, beta_k, beta_v, state, 1.0, chunk_size,
+            ) {
+                Some(r) => Fused::Fused(r),
+                None => Fused::Fallback(Fallback::KernelLimits),
+            };
         }
-        // Numerical limit of the reused GDN-2 kernel: K/exp(cumsum(g))
-        // underflows f32 once cumsum(g) < -88, i.e. chunk > 17 at the K3
-        // floor g = -5. FlashKDA picked chunk 16 for exactly this reason.
-        if chunk_size > 16 {
-            return None;
+        #[cfg(feature = "autodiff")]
+        {
+            burn_gdn2::chunk_dispatch::<B>(
+                q, k, v, log_alpha, beta_k, beta_v, state, 1.0, chunk_size,
+            )
         }
-        burn_gdn2::kernel::chunk_cube::cuda::fused_chunk_forward::<B>(
-            q, k, v, log_alpha, beta_k, beta_v, state, 1.0, chunk_size,
-        )
+        #[cfg(not(feature = "autodiff"))]
+        {
+            let _ = (q, k, v, log_alpha, beta_k, beta_v, state, chunk_size);
+            Fused::Fallback(Fallback::NotCuda)
+        }
     }
 }

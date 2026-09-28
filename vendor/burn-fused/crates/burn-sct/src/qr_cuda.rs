@@ -14,9 +14,10 @@
 //!      cross-thread synchronization, and Q is written row-major directly.
 //!
 //! Accuracy: G = A^T·A squares the condition number; for retraction inputs
-//! (near-orthonormal, kappa ~ 1.1-2) the f32 error stays ~1e-6, far inside
-//! the 1e-4 reference tolerance. Results agree with the CPU Householder
-//! path to ~1e-6 (verified by tests/cuda_retract.rs).
+//! (near-orthonormal, kappa ~ 1.1-2) the f32 error stays ~1e-6. Results agree
+//! with the CPU Householder path to ~1e-6 (verified by tests/cuda_retract.rs,
+//! which needs a GPU). There is no authors'-code comparison; see the README's
+//! "Reference comparison".
 //!
 //! On the bare CUDA `CubeBackend` this replaces the CPU path entirely
 //! (no host round-trip for the data itself); every other backend falls back

@@ -875,11 +875,13 @@ dependencies = [
 name = "burn-fused"
 version = "0.1.0"
 dependencies = [
+ "burn",
  "burn-antihall",
  "burn-attnres",
  "burn-autodiff",
  "burn-bitnet",
  "burn-byteflow",
+ "burn-cuda",
  "burn-diffusionblocks",
  "burn-dspark",
  "burn-eggroll",
@@ -894,6 +896,7 @@ dependencies = [
  "burn-mor",
  "burn-mtp",
  "burn-muon-plus",
+ "burn-ndarray",
  "burn-nope",
  "burn-parcae",
  "burn-ptrn",
@@ -955,6 +958,7 @@ dependencies = [
  "burn-nn",
  "burn-tensor",
  "cubecl",
+ "cubecl-runtime",
  "half",
 ]
 

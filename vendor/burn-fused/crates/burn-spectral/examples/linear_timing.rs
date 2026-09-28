@@ -1,6 +1,12 @@
 //! SpectralLinear fused training kernels vs dense at real sizes: forward and
-//! forward+backward wall-clock at B=16384, plus per-kernel ms (TSCT_TIMING=1).
+//! forward+backward wall-clock at B=16384.
 //! Run: cargo run --release -p burn-spectral --features cuda --example linear_timing
+//!
+//! The per-kernel breakdown this used to print under `TSCT_TIMING=1` is gone
+//! with the `burn_spectral::fused` module: the collector it read
+//! (`clear_step_timing` / `take_step_timing`) was deleted with the module and
+//! nothing replaced it, so the env var now selects nothing. The wall-clock arms
+//! below are unaffected - they need no instrumentation.
 use burn::module::Module;
 use burn::nn::{Linear, LinearConfig};
 use burn::tensor::{Device, Distribution, Tensor};
@@ -77,19 +83,6 @@ fn bench(label: &str, m: usize, n: usize, k: usize, b: usize, iters: usize) {
         dense / fused_fwd,
         dense / fused_fb
     );
-    if std::env::var("TSCT_TIMING").map_or(false, |v| v == "1") {
-        // drain everything since process start: the list below must cover
-        // exactly the one measured step (8 kernels, not ~21 accumulated)
-        burn_spectral::fused::clear_step_timing();
-        let y = s.forward(x.clone());
-        let _ = y.powf_scalar(2.0).sum().backward();
-        let times = burn_spectral::fused::take_step_timing();
-        let total: f32 = times.iter().map(|(_, ms)| ms).sum();
-        for (name, ms) in &times {
-            println!("    kernel {name}: {ms:.4} ms");
-        }
-        println!("    kernels total (fwd+bwd): {total:.4} ms");
-    }
 }
 
 fn main() {

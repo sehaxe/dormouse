@@ -14,7 +14,9 @@ default = ["std"]
 std = ["burn/std", "burn-tensor/std"]
 serde = ["dep:serde"]
 autodiff = ["burn/autodiff"]
-binary-tests = []
+# `binary-tests` was removed 2026-09-27 with tests/cmp_reference.rs: it gated a
+# harness whose fixture and generator were both absent, so it could only ever
+# report PASS having asserted nothing. See README "Reference comparison".
 cuda = ["dep:burn-cuda", "dep:burn-cubecl", "dep:cubecl", "dep:cubecl-common", "dep:futures-lite", "burn/cuda", "burn-tensor/cuda"]
 
 [dependencies]

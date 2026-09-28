@@ -18,7 +18,7 @@ use burn_optim::GradientsParams;
 use burn_spectral::{SpectralLinear, SpectralMoE};
 
 #[cfg(feature = "cuda")]
-type SctBackend = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
+type SctBackend = burn_cubecl::CubeBackend;
 #[cfg(not(feature = "cuda"))]
 type SctBackend = burn_ndarray::NdArray;
 
@@ -1503,7 +1503,7 @@ fn train(kind: &str, steps: usize, lr: f64) -> (f32, f32) {
 /// tensor's client. `None` on non-CUDA backends (silent skip).
 #[cfg(feature = "cuda")]
 fn vram_usage<const R: usize>(t: &Tensor<R>) -> Option<(u64, u64)> {
-    type CB = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
+    type CB = burn_cubecl::CubeBackend;
     let prim = t
         .clone()
         .try_into_primitive::<burn_autodiff::Autodiff<CB>>()

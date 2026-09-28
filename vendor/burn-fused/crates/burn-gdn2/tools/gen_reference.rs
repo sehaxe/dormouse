@@ -235,24 +235,34 @@ fn init_params(rng: &mut Rng) -> Params {
 fn forward(p: &Params, x: &[f32]) -> Vec<f32> {
     let t = x.len() / D;
 
-    // project, short-conv (or bare SiLU), then per-head L2 normalize
-    let mut q = linear(x, &p.q_proj, None, D, KD);
-    let mut k = linear(x, &p.k_proj, None, D, KD);
-    let mut v = linear(x, &p.v_proj, None, D, VD);
-    for t_ in q.iter_mut() {
-        *t_ = silu(*t_);
-    }
-    for t_ in k.iter_mut() {
-        *t_ = silu(*t_);
-    }
-    for t_ in v.iter_mut() {
-        *t_ = silu(*t_);
-    }
-    if USE_SHORT_CONV {
-        q = short_conv(&q, &p.q_conv_w, KD);
-        k = short_conv(&k, &p.k_conv_w, KD);
-        v = short_conv(&v, &p.v_conv_w, VD);
-    }
+    // project, then the short conv (which ends in SiLU) or a bare SiLU — one
+    // SiLU, as in the Python: `short_conv(x, w)` is conv-then-SiLU, and the
+    // no-conv branch is `F.silu(proj(x))`, not both.
+    let q = if USE_SHORT_CONV {
+        short_conv(&linear(x, &p.q_proj, None, D, KD), &p.q_conv_w, KD)
+    } else {
+        linear(x, &p.q_proj, None, D, KD)
+            .into_iter()
+            .map(silu)
+            .collect()
+    };
+    let k = if USE_SHORT_CONV {
+        short_conv(&linear(x, &p.k_proj, None, D, KD), &p.k_conv_w, KD)
+    } else {
+        linear(x, &p.k_proj, None, D, KD)
+            .into_iter()
+            .map(silu)
+            .collect()
+    };
+    let v = if USE_SHORT_CONV {
+        short_conv(&linear(x, &p.v_proj, None, D, VD), &p.v_conv_w, VD)
+    } else {
+        linear(x, &p.v_proj, None, D, VD)
+            .into_iter()
+            .map(silu)
+            .collect()
+    };
+    let (mut q, mut k) = (q, k);
     l2_normalize_last(&mut q, HK);
     l2_normalize_last(&mut k, HK);
 

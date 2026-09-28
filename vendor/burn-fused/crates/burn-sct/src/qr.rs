@@ -17,7 +17,8 @@
 //!
 //! Combined with the `sign(diag(R))` correction in [`crate::orthogonalize`]
 //! both reproduce the paper's `safe_qr` (PyTorch `torch.linalg.qr` + sign
-//! flip), verified by `tests/cmp_reference.rs`.
+//! flip) in FORM. Not verified against the authors' code — the harness that
+//! would have done it was deleted, see the README's "Reference comparison".
 
 use burn::tensor::Tensor;
 

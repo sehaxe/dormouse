@@ -116,6 +116,10 @@ pub fn chunk_wy_forward_impl(
         if c == 0 {
             continue;
         }
+        // Executed (not logical) iterations: a retro-forward replay of this
+        // loop lands here too, which is how the checkpointer recompute is
+        // counted. See `alloc_trace::chunk_iterations`.
+        crate::alloc_trace::chunk_iteration();
 
         let q_c = q
             .clone()
@@ -360,6 +364,15 @@ pub fn chunk_wy_forward(
     scale: f64,
     chunk_size: usize,
 ) -> (Tensor<4>, Tensor<4>) {
+    if crate::alloc_trace::enabled() {
+        let [b, h, t, kd] = q.shape().dims::<4>();
+        let vd = v.shape().dims::<4>()[3];
+        println!(
+            "[gdn2] TENSOR-OP chunk path (fused kernels NOT engaged): b={b} h={h} t={t} \
+             K={kd} V={vd} chunk={chunk_size} n_chunks={}",
+            t.div_ceil(chunk_size)
+        );
+    }
     let (output, new_state, _scratch) =
         chunk_wy_forward_impl(q, k, v, g, b, w_gate, state, scale, chunk_size, None);
     (output, new_state)

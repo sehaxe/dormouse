@@ -813,6 +813,20 @@ pub mod cuda {
         let [batch, heads, time, k_dim] = q.shape().dims::<4>();
         let v_dim = v.shape().dims::<4>()[3];
         let c = chunk_size;
+        // Trace: the table accumulated so far is the PREVIOUS call's forward
+        // plus its backward (the fused kernels run here, so this is the only
+        // choke point every engaged call passes through). Dumping at the top
+        // keeps one report per fwd+bwd pair.
+        if crate::alloc_trace::enabled() {
+            println!(
+                "[gdn2] fused chunk kernels ENGAGED: b={batch} h={heads} t={time} \
+                 K={k_dim} V={v_dim} chunk={c} nblk={} n_chunks={}",
+                batch * heads * (time / c),
+                time / c
+            );
+            crate::alloc_trace::dump("gdn2 chunk call (previous fwd+bwd)");
+            crate::alloc_trace::reset();
+        }
         if time % c != 0 || time == 0 {
             return None;
         }
@@ -865,6 +879,25 @@ pub mod cuda {
         let wvt = mk([nblk, v_dim, c]);
         let glast = Tensor::<2>::empty([nblk, k_dim], &device);
         let out = Tensor::<4>::empty([batch, heads, time, v_dim], &device);
+        for (l, b) in [
+            ("fwd:state private copy", crate::alloc_trace::bytes_of(&state)),
+            ("fwd:state initial copy", crate::alloc_trace::bytes_of(&state_initial)),
+            ("fwd:gexp", crate::alloc_trace::bytes_of(&gexp)),
+            ("fwd:kgt", crate::alloc_trace::bytes_of(&kgt)),
+            ("fwd:qgt", crate::alloc_trace::bytes_of(&qgt)),
+            ("fwd:bkt", crate::alloc_trace::bytes_of(&bkt)),
+            ("fwd:aqk", crate::alloc_trace::bytes_of(&aqk)),
+            ("fwd:akk", crate::alloc_trace::bytes_of(&akk)),
+            ("fwd:m_inv", crate::alloc_trace::bytes_of(&m_inv)),
+            ("fwd:w", crate::alloc_trace::bytes_of(&w_blk)),
+            ("fwd:u", crate::alloc_trace::bytes_of(&u_blk)),
+            ("fwd:kgd", crate::alloc_trace::bytes_of(&kgd)),
+            ("fwd:wvt", crate::alloc_trace::bytes_of(&wvt)),
+            ("fwd:glast", crate::alloc_trace::bytes_of(&glast)),
+            ("fwd:out", crate::alloc_trace::bytes_of(&out)),
+        ] {
+            crate::alloc_trace::note(l, b);
+        }
         let m_inv_c = cube_of::<B, 3>(&m_inv).expect("backend mismatch");
         let gexp_c = cube_of::<B, 3>(&gexp).expect("backend mismatch");
         let kgt_c = cube_of::<B, 3>(&kgt).expect("backend mismatch");
@@ -957,6 +990,11 @@ pub mod cuda {
         // Export buffers padded to a unique size.
         let v_new_out = Tensor::<1>::empty([nblk * c * v_dim + 262144], &device);
         let states_out = Tensor::<1>::empty([nblk * k_dim * v_dim + 262144], &device);
+        crate::alloc_trace::note("fwd:v_new export", crate::alloc_trace::bytes_of(&v_new_out));
+        crate::alloc_trace::note(
+            "fwd:state trajectory export",
+            crate::alloc_trace::bytes_of(&states_out),
+        );
         let v_new_c = cube_of::<B, 1>(&v_new_out).expect("backend mismatch");
         let states_c = cube_of::<B, 1>(&states_out).expect("backend mismatch");
 

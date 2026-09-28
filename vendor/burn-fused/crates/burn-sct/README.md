@@ -65,29 +65,44 @@ ever materialized. The `sign(diag(R))` correction matches the paper's
 | LLaMA-7B | 721.4 MB | 7.7 MB | 93× |
 | LLaMA-70B | 3,758 MB | 18.9 MB | **199×** |
 
-## Reference comparison — NOT YET RUNNING
+## Reference comparison — UNIMPLEMENTED
 
-`tests/cmp_reference.rs` (behind the non-default `binary-tests` feature) is
-written to compare forward, retraction and `from_dense` against the official
-PyTorch reference ([EctoSpace/SCT](https://github.com/EctoSpace/SCT)).
+**There is no comparison against the official PyTorch reference
+([EctoSpace/SCT](https://github.com/EctoSpace/SCT)).** A harness existed
+(`tests/cmp_reference.rs`, behind a non-default `binary-tests` feature) and was
+deleted on 2026-09-27: the reference tensors it loaded (`tests/ref_data/*.bin`)
+and the generator that produced them (`tests/gen_reference.py`) were both
+absent from the tree, and this crate's `.gitignore` inherits `*.py` and `*.bin`
+from a standalone-repo template — so it could not run by three independent
+routes and reported a green suite having asserted nothing. A test that pretends
+to be an oracle is worse than no test.
 
-**It has never run.** The reference tensors it loads (`tests/ref_data/*.bin`)
-are not in the tree, and the generator that produces them
-(`tests/gen_reference.py`) is not either — this crate's `.gitignore`
-inherits `*.py` and `*.bin` from a standalone-repo template and therefore
-excludes exactly the two things the comparison needs. Any accuracy number
-quoted for this crate before the generator and the fixture are committed is
-unmeasured.
+**Consequence: every accuracy number for this crate is UNMEASURED against the
+authors' code.** What the suite does check is listed below.
 
-```
-cargo test --release --features binary-tests --test cmp_reference -- --nocapture
-```
+To restore the comparison: write `tests/gen_reference.py` from
+`spectral_compact_training/spectral_layer.py`, commit the four fixtures it
+emits, and re-add the harness. The comparison should be rank-k
+reconstructions (sign-invariant), never raw singular vectors (unique only up to
+sign); the `from_dense` SVD is one-sided (Hestenes) Jacobi — exact to f32
+rounding, equivalent to `torch.linalg.svd`. Planned configs: tiny 64×128/k8,
+small 256×512/k16, med 512×1024/k32, large 1024×2048/k64.
 
-Configs: tiny 64×128/k8, small 256×512/k16, med 512×1024/k32, large 1024×2048/k64.
-When it does run, the harness compares rank-k reconstructions (sign-invariant),
-never raw singular vectors (unique only up to sign), and the `from_dense` SVD is
-one-sided (Hestenes) Jacobi — exact to f32 rounding, equivalent to
-`torch.linalg.svd`.
+### What IS tested
+
+Invariants only, all on the ndarray backend unless noted:
+
+| Check | Test |
+|---|---|
+| `U^T U = I`, `V^T V = I` after `retract()` | `retract_restores_ortho` |
+| retraction error does not grow | `ortho_error_decreases` |
+| init is orthonormal; `sign(diag(R))` correction applied | `orthonormal_init`, `sign_correction` |
+| one-sided Jacobi SVD reproduces `A` (three shapes, incl. non-diagonal) | `svd_cpu_roundtrip_*` |
+| `from_dense` rank-k reconstruction | `from_dense_roundtrip` |
+| shapes, param count, rank auto-clamp, compression ratio | `forward_shape`, `param_count`, `rank_auto_clamped`, `compression_ratio` |
+| fused CUDA QR vs the CPU Householder path (~1e-6) | `tests/cuda_retract.rs` — needs a GPU |
+
+None of these is the paper's reference. They are invariants.
 
 ## License
 

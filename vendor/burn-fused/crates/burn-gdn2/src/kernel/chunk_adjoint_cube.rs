@@ -516,7 +516,28 @@ pub mod cuda {
         let d_v_c = cube_of::<B, 4>(&d_v).expect("backend mismatch");
         let d_w_c = cube_of::<B, 4>(&d_w).expect("backend mismatch");
         let d_s_out_c = cube_of::<B, 4>(&d_s).expect("backend mismatch");
+        for (l, b) in [
+            ("bwd:d_v_new", crate::alloc_trace::bytes_of(&d_v_new)),
+            ("bwd:d_s trajectory", crate::alloc_trace::bytes_of(&d_s_flat)),
+            ("bwd:d_q", crate::alloc_trace::bytes_of(&d_q)),
+            ("bwd:d_k", crate::alloc_trace::bytes_of(&d_k)),
+            ("bwd:d_b", crate::alloc_trace::bytes_of(&d_b)),
+            ("bwd:d_g", crate::alloc_trace::bytes_of(&d_g)),
+            ("bwd:d_v", crate::alloc_trace::bytes_of(&d_v)),
+            ("bwd:d_w", crate::alloc_trace::bytes_of(&d_w)),
+            ("bwd:d_s", crate::alloc_trace::bytes_of(&d_s)),
+        ] {
+            crate::alloc_trace::note(l, b);
+        }
+        for (l, b) in [
+            ("bwd:d_k_bptt (discarded)", crate::alloc_trace::bytes_of(&d_k_bptt)),
+            ("bwd:d_e_bptt (discarded)", crate::alloc_trace::bytes_of(&d_e_bptt)),
+            ("bwd:d_e_last (discarded)", crate::alloc_trace::bytes_of(&d_e_last)),
+        ] {
+            crate::alloc_trace::note(l, b);
+        }
         let state_in = Tensor::<3>::zeros([bh, k_dim, v_dim], &device);
+        crate::alloc_trace::note("bwd:state_in", crate::alloc_trace::bytes_of(&state_in));
         let state_in_c = cube_of::<B, 3>(&state_in).expect("backend mismatch");
 
         // E = exp(cumsum(g)) exported directly by the forward kernel. The old
