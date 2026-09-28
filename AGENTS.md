@@ -63,7 +63,7 @@ them are still open.
   (`src/cfg.rs`).
 - `crates/dormouse-cli` — bins `train`, `generate`, `serve` (checkpoints dir +
   `--ckpt-name`, preset). BPB scoring lives in `dormouse-train` (`pub fn bpb`).
-- `vendor/burn-fused/crates/*` — **our own** technology library, 26 crates
+- `vendor/burn-fused/crates/*` — **our own** technology library, 28 crates
   (KDA, gdn2, spectral, sct, muon-plus, rmsnorm, bitnet, jepa, dspark, mor, …),
   not a dependency. Every mechanism and kernel that is not the model lives
   here, with its own paper reference and its own A/B (ADR-0017, ADR-0018). A
@@ -239,7 +239,11 @@ the file that says so is that one function.
   launch-bound. Overhead-bound below ~80M params, GEMM-bound above. KDA is
   ~80% of a step: each iteration is a full-sequence gated-delta pass
   allocating 17 fresh tensors / 248 MB of saved scratch, ~1 GB/step of allocator
-  traffic against a 7 ms arithmetic budget.
+  traffic against a 7 ms arithmetic budget. **The "~80%" attribution is dead as
+  of 2026-09-28**: the attention arm ran no backward in any of these runs
+  (`8fa5d4c`, `fused kda=<f>/0`), so 80% of a step that skipped the backward is
+  not the cost of training attention — §3.2. The 465 ms floor and the
+  launch-bound shape are not affected; only the split is.
 - **GEMMs are not where the win is** — measured on this GPU (2026-09-27): cuBLAS
   f16-in/fp32-accumulate 43.7 TFLOP/s, cuBLAS fp32 13.2, our cubecl f32
   3.5-7.6 (TF32 only 17.5 — pointless on consumer Blackwell), a hand-rolled
@@ -316,18 +320,27 @@ The defenses are installed, not optional.
 
 ## 2.5 Build and toolchain
 
-- Machine-local deps are GONE (2026-09-22): `burn-fused` (3.5 MB source) and
-  `cubecl-fix` (1.8 MB) are vendored under `vendor/` and the workspace root
-  `exclude`s them (they are their own workspace roots; without the exclude,
-  cargo resolves their crates' `workspace = true` inheritance against OUR root
-  and fails). The original working copies at `/home/sehaxe/burn-fused` and
-  `/home/sehaxe/cubecl-fix` still exist but are NOT referenced — edit the
-  `vendor/` copies, the repo is canonical and self-contained. No new dependency
-  that duplicates them. Since 2026-09-24 the repo is on burn 0.22.0-pre.4, and
-  `vendor/cubecl-fix` carries THREE patched crates: `cubecl-runtime`,
-  `cubecl-server` (new upstream home of the memory pools since cubecl
-  0.11.0-pre.4 — the stale-page #1401 fix lives here now) and `cubecl-cuda`; the
-  root `[patch.crates-io]` maps all three.
+- Machine-local deps are GONE (2026-09-22): `burn-fused` (3.5 MB source),
+  `cubecl-fix` (1.8 MB) and `cubek-fix` (added 2026-09-28, `422414c`) are
+  vendored under `vendor/` and the workspace root `exclude`s all three (they are
+  their own workspace roots; without the exclude, cargo resolves their crates'
+  `workspace = true` inheritance against OUR root and fails). The original
+  working copies at `/home/sehaxe/burn-fused` and `/home/sehaxe/cubecl-fix`
+  still exist but are NOT referenced — edit the `vendor/` copies, the repo is
+  canonical and self-contained. No new dependency that duplicates them. Since
+  2026-09-24 the repo is on burn 0.22.0-pre.4, and the root
+  `[patch.crates-io]` maps **FIVE** vendored crates:
+  `cubecl-runtime`, `cubecl-server` (new upstream home of the memory pools since
+  cubecl 0.11.0-pre.4 — the stale-page #1401 fix lives here now), `cubecl-cuda`,
+  `cubecl-ir` (pliron's f16 `SizedType`, ~40 lines in `src/types/scalar.rs`; it
+  is what makes the f16 tensor-core candidate compile instead of being
+  silently un-accelerated, §2.1), and `cubek-reduce` (the top-k index kernel,
+  ADR-0015 — 0.3.0-pre.4's `reaches` fast-path guard cannot tell an empty top-k
+  slot from one holding `-inf`, so a masked score row emits the `u32::MAX` seed
+  coordinate as an index and the caller's gather reads out of bounds). The
+  count was three until 2026-09-28 and this section said so until then; check
+  the root `Cargo.toml` `[patch.crates-io]` before repeating a count, it is the
+  only authority.
 - CUDA backend is the default via the `dormouse-train/cuda` feature; without it,
   NdArray (fp32 only, no bf16). The GPU binary carries no OpenBLAS: the CPU
   ndarray backend is the optional `cpu` feature (default on for `cargo test`).
@@ -363,14 +376,47 @@ The defenses are installed, not optional.
   0.5 + exact dedup, 272M docs → 104.2M kept). The drive must be mounted.
 - Eval is the sibling `real_eval/eval_tail.bin`, a 500 MB tail carve (the old
   30 MB tail is kept as `.30m.bak`; **pre-carve BPB numbers are not
-  comparable**). Eval anchors on the same fixed window: uniform 8.000, unigram
-  5.398, 5-gram 2.911 — a model that has not beaten the 5-gram line has not
-  learned language, whatever its held-out number looks like.
-- The eval instrument is fixed (2026-09-27): `rewind()` before every eval, 20
-  batches (100 KB) averaged, `Module::valid()` (no autodiff — 20 never-
-  backwarded graph nodes OOM the card at 15.9/16.3 GB), the byte count printed
-  on the eval line. Before the fix, the same checkpoint scored 6.443 and 6.551
-  on consecutive evals, from stream position alone; cross-run A/Bs were noise.
+  comparable**).
+- **The eval window is `eval_batches × batch × seq_len` bytes**
+  (`train/src/lib.rs:1417`), so it is a function of the batch size and two runs
+  at different batch sizes scored different amounts of text. Observed: the
+  batch-10 recipe reports `over 102400 B`, the batch-2 arm ablations report
+  `over 20480 B` — a 5× difference in scored bytes, from `--batch`, a throughput
+  knob no reader would expect to change how much text the eval scores. **A BPB
+  is only comparable within one window**,
+  and `--eval-batches` alone does not fix the window: quoting "20 batches" or
+  "100 KB" without `batch × seq_len` is not a number. The formula is right in
+  `docs/glossary.md` ("eval tail") and was wrong as a constant here, in §3.1,
+  in `docs/AB-PROTOCOL.md:14` and in `README.md` — four documents carried
+  "100 KB" for a run that scored 20 480 B.
+- **The anchors are a property of the fit, not of the corpus.** The bar moves
+  with the fit corpus, the fit size and the scored window; `anchors.rs:22-35`
+  says the in-corpus `--holdout` split scores the *trailing quarter of its own
+  read* while the trainer's eval reads a fixed window from a different file, so
+  **the two were never comparable** — that is the tool's own comment, and
+  `--fit` exists because of it. Readings on record, none of them on a trainer
+  eval window: unigram 5.398 / 5-gram 2.911 (this file, §3.1 — source not
+  named, do not reuse), unigram 5.170 / 5-gram 2.572 (`anchors.rs:3-7` and
+  `README.md`, an in-corpus split of a 2 MB read), unigram 5.011 / 5-gram 2.588
+  (`--fit` on the filtered corpus scoring the eval tail, `anchors.rs:27-32` —
+  the only same-file measurement, but over the whole tail, not over 20 480 B),
+  and 2.826 vs 2.849 for the same file at `--bytes 1M` vs `2M`, i.e. the bar
+  moves 0.023 on the fit size alone. Uniform is 8.000 by definition. **Get the
+  bar with `--fit` on the eval file at the fit size you quote, and print the
+  window in the comparison.** What survives from all of it: a model that has not
+  beaten the 5-gram line has not learned language, whatever its held-out number
+  looks like — and this is the one comparison the window disagreement does not
+  affect, because every 5-gram reading (2.588 / 2.572 / 2.911) is **2.1 to 2.4
+  BPB below** the best held-out number in the archive. There is no reading of
+  the bar that puts 4.997 near it.
+- The eval instrument is fixed (2026-09-27): `rewind()` before every eval,
+  `eval_batches` windows of `batch × seq_len` averaged, `Module::valid()` (no
+  autodiff — 20 never-backwarded graph nodes OOM the card at 15.9/16.3 GB), the
+  byte count printed on the eval line. Before the fix, the same checkpoint
+  scored 6.443 and 6.551 on consecutive evals, from stream position alone;
+  cross-run A/Bs were noise. The eval line also prints `engram=<rows>/<arms>`
+  over the eval's own forwards, and that field is the only way a reader learns
+  the memory arm did not run — see §3.2.
 - Preset param counts are measured on the instantiated model by
   `cargo test -p dormouse-core --test preset_exec` (the widths too wide to
   instantiate on CPU are behind `-- --ignored`). The memory/compute split is the
@@ -388,29 +434,151 @@ The defenses are installed, not optional.
 
 | what | number | where |
 |---|---|---|
+| **best held-out BPB with nothing known-broken in it** | **4.997** at step 6500, then regressed to 5.450 by 19500 (best-of a curve that overfits) | `~/logs/train_nokda.log:91`, 2026-09-28. `nokda_ce.config.toml`: `use_kda=false`, `use_engram=false`, `engram_ram=false`, batch 2, seq 512, **depth 2**, 9 195 854 params, 20 480 B window. It is a `--no-kda` run, so it is a statement about a model with **no attention arm at all** — the one number in the archive clean on both §3.2 defects. Below every unigram bar on record, above the 5-gram line by 1.5 |
+| second-best held-out, and the only depth-4 number on record | **6.351** at step 1500 | `~/logs/official_v5e.log`, 2026-09-27, 7 526 223 params (pre-repricing `small`; the shipped `small` is 9.20 M), batch 10, depth 4, **102 400 B window** — not comparable to the 4.997 above. `use_kda=true`, so its attention arm got no gradient (§3.2) |
 | bench gate row | canary (small, aux off, 2M slots, batch 10 s512) **4081 ms/step**, final CE 5.141 | `benches/history.tsv`, 2026-09-25 `bdddbaf` |
 | real18 recipe (small, aux on, 48M rows, batch 10 s512) | 6.7-8.3 s/step | 2026-09-21, after the EMA `no_grad` fix; the older 3.4-3.9 s/step note predates it and is not reproducible |
-| per-step cost at 7.5M params | ~465 ms fixed; KDA ~80% of it | §2.2 |
-| a 2k-step A/B run | ~1.6 s/step → 53 min/run, 2.7 GPU-h per arm | `docs/AB-PROTOCOL.md` |
+| per-step cost at 7.5M params | ~465 ms fixed; KDA ~80% of it | §2.2. **Killed as an attribution by `8fa5d4c`**: the arm was not training, so "80% of the step" was 80% of a step that skipped the backward. See §3.2 |
+| eval window size | `eval_batches × batch × seq_len`; 102 400 B at batch 10, 20 480 B at batch 2, printed on every eval line | `train/src/lib.rs:1417`, §2.6 |
+| a 2k-step A/B run | ~1.6 s/step → 53 min/run, 2.7 GPU-h per arm. **This budget assumed an attention arm that did no backward work**; the re-cost is in §3.3 and is not measured | `docs/AB-PROTOCOL.md` |
 | VRAM-validated on 16 GB | `small` batch 10 s512 with a 48M-row Engram; `base` fits at batch 3 and OOMs at batch 6 (the JEPA teacher is a second full forward) | AGENTS history, 2026-09 |
 | host-table Adam cadence cost | every-step vs 0: +2.3% step time (10884 vs 10637 ms) — the pipeline drain is the sync wait, not the copy | small/batch3/s512 smoke, 2026-09-04 |
 | GEMM ceilings on this GPU | cuBLAS f16 43.7 TFLOP/s, cuBLAS fp32 13.2, cubecl f32 3.5-7.6 | §2.2 |
-| eval anchors on the fixed window | uniform 8.000, unigram 5.398, 5-gram 2.911 | §2.6 |
+| eval anchors | **four readings, none on a trainer eval window** — unigram 5.398 / 5-gram 2.911, unigram 5.170 / 5-gram 2.572, `--fit` unigram 5.011 / 5-gram 2.588, and 2.826 vs 2.849 for one file at two `--bytes` | §2.6, `anchors.rs:22-35`. Uniform 8.000 by definition. A bar is a property of the fit, so no anchor here is reusable as published |
 | paired-eval resolution | estimated 0.002-0.005 BPB, **not verified** — measure it before believing a win that small | `docs/AB-PROTOCOL.md` |
 
 ## 3.2 Retracted — do not cite these
 
+- **Every held-out BPB from a run that had the in-VRAM Engram ON.** Until
+  `7adda92`, the eval forward passed `hashed_ids = None` **unconditionally**
+  (`train/src/lib.rs`, the `-` line of that commit's diff) while the training
+  step passed real keys. `eval_rows` is `Some` only when the host offload is
+  live (`lib.rs:1361-1374`), so on the in-VRAM path `loop_block` took its inert
+  branch and returned zeros: **the held-out number was a measurement of a
+  different network than the one being trained.** `--eval-depths` had the same
+  defect and is fixed in the same hunk.
+  - **It bites exactly when `use_engram = true` AND `engram_ram = false`** — the
+    in-VRAM Engram arm. It cannot bite when `use_engram = false`, because a
+    forward with no memory in it is the *correct* forward for a model with no
+    memory in it; and it cannot bite under `--engram-ram`, where `eval_rows` was
+    already `Some` and the host rows were passed. That scoping is the whole
+    finding: this is a retracted arm, not a retracted history.
+  - **Touched: 2 of the 12 config snapshots in `checkpoints/`** —
+    `engram_ce` (batch 2, depth 2, 25 000 rows) and `small12` (batch 10, depth
+    4). `engram_ce`'s **6.453 at step 2000 is invalid**, and so is every other
+    number on that curve. For `small12` the config is in the affected class but
+    **no eval line for it is on record** in `~/logs/`, so nothing is retracted
+    that was not printed; it is listed so nobody reuses its snapshot believing
+    the memory arm was scored. The other 10 snapshots are all
+    `use_engram = false`.
+  - **"The Engram arm lost by 1.46 BPB" is not a verdict, and never was.** The
+    comparison was `engram_ce`'s 6.453 against `nokda_ce`'s 4.997, and the
+    first of those is a memory-enabled training run scored by a
+    memory-disabled evaluation of itself. Note what was *not* wrong with it:
+    both runs are batch 2, so both scored the same 20 480 B window at the same
+    depth 2. The window matched. **The eval defect is the whole of the
+    failure** — there is no second reason to discount it, and no second reason
+    to rescue it either.
+  - **Not touched: the 4.997 at step 6500.** `nokda_ce.config.toml` has
+    `use_engram = false`, so nothing was missing from that eval — the `None` was
+    the right answer. It also has `use_kda = false`, so it is clean of the
+    second defect below. It is the one held-out number in the archive that is a
+    number for the network that produced it, and it stands, with the caveats in
+    §3.1 (depth 2, a `--no-kda` model, a 20 480 B window, and best-of-an-
+    overfitting-curve).
+  - The evidence is a counter, not a reading, and the counter is **newer than
+    the defect**: `engram=<rows>/<arms>` was added to the eval line in the same
+    commit as the fix (`7adda92`), so **no pre-fix log in `~/logs/` carries the
+    field at all** — `train_nokda.log`, `train_kda_full.log` and
+    `train_engram25k.log` all end in `muon_skipped=0/0` with nothing after it.
+    That the pre-fix eval read `0/0` is `c4214ad`'s assertion, not something
+    the logs show. What the logs do show is the post-fix reading on hardware:
+    a 20-step run with the Engram on printing `engram=4/4` — 4 rows over 4 arms
+    for `--eval-batches 2` at depth 2 (`c4214ad`). Going forward the field is the
+    check: `engram=0/<n>` means the eval just ran a memory-disabled forward.
+  - **The commit that carries the fix is `7adda92`**, whose message is about
+    the best-checkpoint and does not mention it. `b3d6914`'s message *does*
+    claim the eval fix and its diff does not contain it; `c4214ad` is the
+    no-leak enforcement (`ByteStream::train_and_eval`). Cite `7adda92`. A
+    commit message that describes a fix it does not carry is the ADR-0020
+    failure in its purest form, and it is why the fix was hard to find.
+- **Every held-out BPB from a run with `use_kda = true`.** `8fa5d4c`:
+  `chunk_wy_forward_autodiff_s` ran the forward on the **bare** backend and
+  wrapped the result in one hand-rolled autodiff node. `OpsPrep::prepare`
+  decides tracked-ness from the parents' node refs, and under
+  `BalancedCheckpointing` — the trainer's strategy — the op's inputs are
+  checkpoint leaves, so the node came back `UnTracked` and its output was a
+  leaf. The tensor-ops fallback lives *inside* that node's backward, so a leaf
+  means no gradient either way. **The attention arm had no gradient for the
+  entire history of this project**: it ran thousands of forwards and trained
+  nothing, and every other op built its own graph, which is why the loss curve
+  looked healthy and only the counter was wrong.
+  - The counter is in this box's logs: `~/logs/train_kda_full.log` prints
+    `fused kda=1046/0` at step 500 and `3126/0` at 1500 — 3126 forwards,
+    **zero backwards**.
+  - So `kda_ce`, `kda_full`, `kda_smoke{,2..5}`, `noengram_ce`, `probe2` and
+    `small12` all reported a network whose attention arm sat at initialisation.
+    The 6.351 in §3.1 is one of them (`use_kda = true`), which is the *second*
+    reason that row is not a depth-4 quality result.
+  - **This also explains a speedup that was never a speedup**: the fused
+    forward made attention look nearly free (+22 ms) precisely because it was
+    doing no backward work at all. A fused path that skips the backward is not
+    faster than a tensor path that runs it; it is a different program.
+  - **The fix is verified to compile and NOT verified to train.** `8fa5d4c`'s
+    own message says the gradient-flowing check is the next step and is not
+    done; `DM_GDN2_BWD_TRACE=1` should print `ENTERED` on `ChunkWy::backward`,
+    and that line appears in no run before it. Treat "the attention arm trains
+    again" as **unverified** until a run shows it.
+  - Cost of the working backward, as reported by the 2026-09-28 audit and
+    **not reproduced here, with no committed log and no `benches/history.tsv`
+    row**: the tensor-op path at batch 8 measured **25.8 s/step** against
+    **3076 ms** without the arm. If that holds, the A/B budget in
+    `docs/AB-PROTOCOL.md` (53 min per 2k-step run) is wrong by more than an
+    order of magnitude and the queue has to be re-costed before it is run. The
+    `4628`-era note that the same op costs `3628 ms` fwd+bwd (`README.md:77`) is
+    a different shape and is not a substitute.
+- **Every parquet corpus result before `f6ab353`.** `Source::read`
+  downcast the *top-level* columns to `StringArray` and dropped everything else
+  with no counter. `mix/qa` nests its text (`document: struct { html, title,
+  url, tokens }`), so the only top-level string was `id`. Measured on one 200 MB
+  shard asking for 8 MB: **21 811 B before the fix, 8 000 000 B after** — and
+  the bar tool printed anchors either way ("unigram 3.544 / 5-gram 3.278" on
+  21 KB of UUIDs, 367× short). **Every parquet run trained on a fraction of its
+  corpus and reported the loss curve as if it had not.** A shard that yields no
+  text is now counted by name rather than vanishing.
+- **"fp4 + group 128, 100 steps, 0 NaN, convergence == fp32" (act quant)** —
+  retracted twice over, for two independent reasons, and the second is the one
+  that makes the number meaningless rather than merely partial. (1) The
+  attention upgrade is unconditional — `ActFormat::attn()` maps `Fp4 -> Int(8)`
+  and `Int(b) -> Int(b.max(8))` — so `--act-quant fp4` has **never** run 4-bit
+  attention; that verified the FFN path only. (2) `9b343d3`: **`fp4` was not
+  e2m1 at all.** Real e2m1 has no 0.75 (the grid is 0, .5, 1, 1.5, 2, 3, 4, 6),
+  the mantissa rule emitted 0.75 for `a ∈ [0.625, 1)`, and the caller scaled
+  each block's max onto **1** rather than onto the format's max (6) — so only
+  `{0, 0.5, 0.75, 1}` of the eight magnitudes were reachable. That is a
+  ~3-level quantizer wearing a 4-bit label, and 1.5…6 was dead code. Every
+  `--act-quant fp4` number before that commit measured the 3-level thing. The
+  `4` and `8` paths are untouched and pinned bit-identical
+  (`int4_levels_are_the_whole_symmetric_range`).
+- **All Gated Residual numbers — of which there are none.** Worth stating
+  precisely, because "retracted" would over-claim: `use_gr = false` in all
+  eight `configs/*.toml`, so no preset, log, checkpoint or A/B number is
+  invalidated. What *was* wrong is in `9b343d3`: the write omitted the sigmoid
+  **and** the factor 2 of Eq. 33 while the comment above it wrote out the
+  equation the code did not implement; the read omitted the `1/nr` that sits
+  inside the SiLU (Eq. 31), giving a gate saturated at init; and the readout was
+  taken from the state *before* the write, so GR was a depth-(iters−1) model
+  and at `max_iter = 1` the entire block body was computed and discarded. The
+  report's −0.026 and its zero-spike result cannot transfer in any case, because
+  the report puts one GR per attention and MLP sublayer of a 56-sublayer stack
+  and we run one weight-shared block recursively (§3.5). **The arm has still
+  never been A/B'd, which is the debt this does not discharge.**
 - **"fused is 1.7-2.0× faster than burn" (ADR-0003).** Retracted in ADR-0009. At
   flagship the whole-loop fused op measured **9.21 s/step against burn's 7.05**
   — 1.3× *slower* (`research/2026-09-23-fused-flagship50.md:52-53`). The
   `fused/` module and the `DM_FUSED` switch are now **deleted**; its kill
   switch in ADR-0009 is moot. What survives under the name "fused" is the
   library's own fused kernels, which are live and counted.
-- **"fp4 + group 128, 100 steps, 0 NaN, convergence == fp32" (act quant).** The
-  attention upgrade is unconditional — `ActFormat::attn()` maps `Fp4 -> Int(8)`
-  and `Int(b) -> Int(b.max(8))` — so `--act-quant fp4` has **never** run 4-bit
-  attention. That verified the FFN path only (ADR-0019). The silence is itself
-  the defect.
 - **"the bool→float cast returns 0.0 for true on cuda" (memory.md:15).** Wrong;
   the miscount was `clone()` aliasing plus a firewall that did not skip the
   step (ADR-0016). One code comment still says it — see the glossary.
@@ -424,7 +592,14 @@ The defenses are installed, not optional.
   on every fresh run, so no pre-fix run actually used the factor-quant forward.
 - **The 2026-09-27 `--no-kda` 956 → 188 ms ablation**: measured alongside a live
   run, so it is a ratio, not an absolute. Step-time claims need same-shape
-  measurement on a quiet GPU.
+  measurement on a quiet GPU. It is also the *only* step-time measurement of
+  removing the attention arm, and the arm was not training at the time, so it
+  does not price the arm the fixed one costs.
+- **Every A/B verdict in `docs/AB-PROTOCOL.md`.** Not one arm has been judged.
+  The instrument was wrong for the Engram arm (above), the attention arm in
+  every control was frozen at initialisation (above), and no two runs in the
+  archive share a window size. The queue is a list of experiments to *run*, not
+  results, and its cost line is void.
 - **`small` = 7.5M / `base` = 12.2M params.** Pre-date the 2026-09-27 memory
   re-pricing; the measured numbers are in `tests/preset_exec.rs` and the README
   table, and the 7.5M figure is still hardcoded as a test constant
@@ -447,6 +622,36 @@ The defenses are installed, not optional.
 
 ## 3.3 Broken, open, or undocumented
 
+- **The eval's memory arm has no test.** `b3d6914` says it in its own message:
+  the eval call site is inside a 1400-line function and is not callable from a
+  test, so the half of the fix that mattered — passing the keys the training
+  step passes — is carried by the code and by the `engram=` field, and nothing
+  would fail if it regressed. The decode half *does* have one
+  (`decode_seam`, `decode_wiring`, both on the CPU backend). The cheapest real
+  gate is to assert that the eval line's `engram=<rows>/<arms>` field is
+  non-zero whenever `use_engram` is true, on a 2-batch CPU run.
+- **Whether the attention arm trains is unverified.** `8fa5d4c` compiles and
+  says so; the `DM_GDN2_BWD_TRACE=1` `ENTERED` line on `ChunkWy::backward` has
+  not been seen. Until it is, §3.2's second retraction stands for the *present*
+  code too, not only for history, and every cost estimate that assumed a
+  working attention backward is unmeasured.
+- **The A/B budget has not been re-costed.** `docs/AB-PROTOCOL.md` still prices
+  a 2k-step arm at 53 min, derived from ~1.6 s/step on a run whose attention
+  backward did not execute. The 25.8 s/step batch-8 figure that would replace
+  it has no committed log and no `benches/history.tsv` row, so the honest state
+  is **the cost of one A/B arm is currently unknown**, not "2.7 GPU-h".
+- **Four silent-data-loss fixes with no gate** (`7adda92`): a resume overwrote
+  the best checkpoint because `best_eval_bpb` was a local; `.best` was a
+  different model because the `.ngram` sidecar did not travel with the weights;
+  `inf` was printed as a score; and the sidecar is read as `None => h`, i.e.
+  freshly seeded rows, when absent. All four are fixed, none has a test, and the
+  commit says so.
+- **A commit message described a fix its diff did not carry.** `b3d6914`'s
+  message spends a paragraph on the eval-keys fix; the fix is in `7adda92`.
+  Anyone citing the fix from the message would cite the wrong commit, which is
+  how a "verified" claim becomes unverifiable. Check the diff, not the message
+  — and when a message and a diff disagree, the disagreement is a defect in its
+  own right.
 - **Two implementations of the optimizer policy.** `train/src/optim.rs` builds
   the optimizer from path-string markers and is what runs; `core/src/routing.rs`
   declares the same policy from `ParamId`s and is exercised only by tests.
@@ -491,6 +696,18 @@ The defenses are installed, not optional.
 
 ## 3.4 Next, in the order the evidence says
 
+**Precondition on the whole queue, added 2026-09-28: the control run has to be
+re-baselined before any arm is judged, and it has to be a run in which the
+attention arm actually receives a gradient.** Every run in `~/logs/` predates
+`8fa5d4c`, so every control on record is a network whose attention arm was
+frozen at initialisation, and the Engram arm's only comparison was scored by a
+memory-disabled eval (§3.2). Two arms below are therefore not merely unrun, they
+are **undefined against the old control**: arm 5 (KDA decay form) presupposes
+KDA trains at all, and the hashed-memory arm presupposes an eval that passes the
+keys. The `engram=` and `fused kda=` fields on the eval line are the cheapest
+way to confirm a new control is clean — read them before the first A/B number
+is believed.
+
 The A/B queue with flags, costs and what each arm decides is
 [`docs/AB-PROTOCOL.md`](docs/AB-PROTOCOL.md). Summary: control → pure CE (do the
 aux heads earn their share of the step) → dense FFN (do TSCT, the retraction
@@ -499,6 +716,8 @@ vs one pass over 19 GB) → rand depth → **depth 2 vs 4**, the cheapest big le
 → KDA decay form (a technology REPLACE, not a knob) → hashed memory
 (25_000 rows/order, the 24% operating point) → the memory capacity ladder.
 Every arm is 3 seeds, 2k steps, pure CE, at the program's operating depth.
+**The per-arm cost is unknown, not 2.7 GPU-h** (§3.3), and every arm must be run
+at one batch size so the eval window matches across seeds and arms (§2.6).
 
 Also queued: the fusion backend flip (parked — under fusion, burn's `Tensor`
 becomes the dispatch type and the vendored crates downcast the bare
@@ -707,6 +926,9 @@ Ranked applicability:
   claim.
 - `--eval-batches N` (default 20) — batches averaged per held-out eval; part of
   the config snapshot, because a number without its protocol is not a number.
+  **The window is `N × batch × seq_len` bytes, not a fixed size** — 102 400 B at
+  batch 10, 20 480 B at batch 2 — so this flag alone does not make two runs
+  comparable. The byte count on the eval line is the authority; quote it (§2.6).
 - `--jepa-weight` / `--dspark-weight` / `--dspark-k` — auxiliary objectives on top
   of CE (`core/src/aux.rs`, ON by default at 0.05 / 0.1 / K=4): JEPA =
   data2vec-style masked latent prediction against an EMA teacher (burn-jepa;

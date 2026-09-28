@@ -89,9 +89,15 @@ Two fixes, both in:
   check: `rewind_restarts_the_same_window` (advances, rewinds, replays the
   first window exactly, idempotent).
 - `--eval-batches` (default 20, `serde(skip)`, a protocol knob like
-  steps/log_every): 20 x 5 KB = 100 KB per eval, and the eval LINE prints the
-  byte count, so a curve is self-documenting about its own protocol
-  (`EVAL ce=... bpb=... over 102400 B (fixed window)`).
+  steps/log_every): the window is `eval_batches × batch × seq_len` bytes, **not a
+  constant** — 20 × 10 × 512 = 102 400 B at batch 10, 20 × 2 × 512 = 20 480 B at
+  batch 2, and the batch-2 arm ablations all reported `over 20480 B`. The
+  "20 × 5 KB = 100 KB" phrasing that stood here until 2026-09-28 was the
+  batch-10 shape quoted as a property of the eval, which is how a 5× smaller
+  window went unnoted. A BPB is comparable only within one window. The eval LINE
+  prints the byte count, so a curve is self-documenting about its own protocol
+  (`EVAL ce=... bpb=... over 102400 B (fixed window)`), and that number is the
+  authority — quote it in any table.
 
 Side finding worth keeping: the eval forward must run on a `Module::valid()`
 snapshot. With grad tracking on, each eval forward builds autodiff nodes that
@@ -104,6 +110,15 @@ Consequence for the record: eval numbers taken before this commit are
 comparable only WITHIN one run's own sequence, never across runs or resumes.
 official_v5 was restarted on the fixed protocol (eval@1000 = 6.498 on the
 100 KB window).
+
+**Two later defects voided part of that record too, and they are not the same
+defect.** (1) The eval passed `hashed_ids = None` unconditionally (`7adda92`),
+so on the in-VRAM Engram path it scored a network with no memory in it; it
+cannot bite a `--no-engram` run and cannot bite `--engram-ram`. (2) The
+attention arm received no gradient at all (`8fa5d4c`), so every
+`use_kda=true` run's number describes a network with attention frozen at
+initialisation. Both post-date the 100 KB window above; `AGENTS.md` §3.2 scopes
+them run by run.
 
 ## RANDOM DEPTH (shipped 2026-09-27, ADR-0013 rank 2)
 

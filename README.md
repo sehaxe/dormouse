@@ -35,11 +35,12 @@ rustc 1.98.1, burn 0.22.0-pre.4 + vendored cubecl.
 | claim | number | when / shape / how |
 |---|---|---|
 | Fused gated-delta (KDA) kernel, forward | **1.212 ms** vs `torch.compile` 54.5 ms = **45×**; vs PyTorch eager-best 160.1 ms = 132× | 2026-09-27. b=10, t=512, h=12, K=V=64, chunk=16, fp32, 10 runs × 200 iters, real `a_log=-3` decay. torch 2.11.0+cu128. [`research/2026-09-27-pytorch-baseline.md`](research/2026-09-27-pytorch-baseline.md) §1 |
-| …same op, forward+backward | **25.9 ms** vs PyTorch eager-best 290.3 ms = **11.2×**; 138× fewer allocations, 2.5× less VRAM, 32 % of this card's memory roofline | same doc, fused as one autodiff node (the bare-kernel 45× is not the fwd+bwd number — do not quote it as one) |
+| …same op, forward+backward | **RETRACTED — do not cite.** It read **25.9 ms** vs PyTorch eager-best 290.3 ms = **11.2×**, 138× fewer allocations, 2.5× less VRAM. The device was built as `Device::autodiff(...)` = NoCheckpointing, so the measured backward contained the *tensor* adjoint, and the verification test compared that tensor adjoint against the tensor path — verified the tensor adjoint twice. Only the FORWARD row above survives | retracted 2026-09-28, `AGENTS.md` §3.2 (last bullet). The fused adjoint kernels have still never been numerically compared to anything |
 | f16 GEMM, our path vs cuBLAS | **7.4× behind** (0.389 ms / 41.4 TFLOP/s cuBLAS vs 2.880 ms / 5.6 TFLOP/s ours) | 2026-09-27, `[5120,768]×[768,2048]`, zero-copy on cubecl's own stream, `max rel err 2.7e-4`. `crates/cublas-poc`; log `~/logs/cublas_poc_2026-09-27.log` |
 | fp32 GEMM, our path vs cuBLAS | **no ratio claimed** — 4.8 / 47.1 / 47.7 / 51.7 / 71.1 ms for one fixed matmul in the *same binary* (15× spread, power-capped) | 2026-09-27. At the median we are 4.4× behind; at the fastest sample 2.3× ahead. The measurement does not resolve it, so neither number is published as fact |
 | Training step, batch 10 × seq 512 | **1.58–1.84 s/step** over steps 1050–1500 of the best run (1.86–1.94 s over steps 50–100 of the same run). ~465 ms of it is fixed per-step launch cost, measured as `t = 465 ms + 0.067 ms/token` | `--timers`, `~/logs/official_v5e.log`, 2026-09-27 |
-| **Best held-out BPB ever recorded** | **6.351** at step 1500, on a fixed 100 KB window (`--eval-batches 20`) | 2026-09-27. A 7 526 223-param model over a 19 GB sharded corpus, `~/logs/official_v5e.log`. **That parameter count is the pre-2026-09-27-pricing `small`; the shipped `small` is 9.20 M, so the best number on record was not produced by a preset in `configs/` today.** Anchors on comparable windows: uniform 8.000, unigram 5.17, **5-gram+backoff 2.572**. See (d) |
+| **Best held-out BPB with nothing known-broken in it** | **4.997** at step 6500 (regressed to 5.450 by 19500 — best-of a curve that overfits) | 2026-09-28, `~/logs/train_nokda.log`. `nokda_ce.config.toml`: `use_kda=false`, `use_engram=false`, `engram_ram=false`, batch 2, seq 512, **depth 2**, 9 195 854 params, over a **20 480 B** window. Both of this project's held-out instruments were broken for some runs and neither touched this one: no memory in training means no memory missing in eval, and `--no-kda` means the no-gradient attention arm was not in the model. It is a statement about a model with **no attention arm at all**. Below every unigram bar on record; 1.5 BPB *worse* than the 5-gram. See (d) |
+| Best held-out BPB at depth 4 | **6.351** at step 1500 | 2026-09-27, `~/logs/official_v5e.log`, 7 526 223 params (pre-repricing `small`; the shipped `small` is 9.20 M, so the best number on record was not produced by a preset in `configs/` today), batch 10, over a **102 400 B** window. **Not comparable to the 4.997 above — different window, different depth, different batch.** Its `use_kda=true`, so its attention arm received no gradient (`8fa5d4c`): it is a depth-4 result for a network with frozen attention |
 | Reference-fidelity suite | 1000 cases, fused vs an independent transcription, 5e-4 absolute, fixture regenerable byte-identically in CI | `vendor/burn-fused/crates/burn-gdn2/tests/bit_exact.rs`. Real work; **wrong provenance** — see (b) |
 | Test inventory | 315 unit + 62 integration `#[test]` functions across 28 crates | counted from source 2026-09-27. Presence is not correctness — see (b) |
 
@@ -66,17 +67,34 @@ rustc 1.98.1, burn 0.22.0-pre.4 + vendored cubecl.
   does not exist). Same audit, §3.
 - **No mechanism in the model has an A/B verdict.** The protocol requires
   3 seeds per arm at 2000 steps ([`docs/AB-PROTOCOL.md`](docs/AB-PROTOCOL.md));
-  the queue is written down and unrun. The Engram arm — 2.4 M memory parameters,
-  24 % of `small`, on by default in every preset — has never been compared to
-  `--no-engram`. Its capacity default cites a *third-party* curve (arXiv
-  2601.16531, single-author preprint) measured on a 125 M backbone, 16× ours.
-- **The fused KDA kernels are proven to launch from a benchmark and NOT proven
-  to launch from a training step.** The dispatch gate was
-  `TypeId::of::<B>() == TypeId::of::<Autodiff<CudaBare>>()`, which cannot match
-  the trainer's `Autodiff<Cuda, BalancedCheckpointing>` — so every training step
-  to date ran the tensor-ops path, where the same op costs 3628 ms fwd+bwd
-  instead of 25.9 ms. A rewritten gate exists; no rebuilt training step has been
-  shown entering it.
+  the queue is written down and unrun, and its per-arm cost is currently
+  unknown because the 1.6 s/step it was budgeted at came from a run whose
+  attention backward did not execute. The Engram arm — 2.4 M memory parameters,
+  24 % of `small`, on by default in every preset — **was** compared to
+  `--no-engram` once, and the comparison is void: the eval threw the n-gram
+  keys away on the in-VRAM path (`7adda92`), so the Engram run's held-out 6.453
+  was scored by a memory-disabled evaluation of itself, and the "Engram lost by
+  1.46 BPB" reading is not a verdict. It cannot bite a `--no-engram` run and
+  cannot bite `--engram-ram`, which is why the retraction is scoped to that one
+  arm rather than to the project's history. Its capacity default also cites a
+  *third-party* curve (arXiv 2601.16531, single-author preprint) measured on a
+  125 M backbone, 16× ours.
+- **The fused KDA kernels ran in no training step at all, for the whole history
+  of this project, and the reason was worse than a gate that never fired.**
+  `chunk_wy_forward_autodiff_s` ran the forward on the bare backend and wrapped
+  it in one hand-rolled autodiff node; under `BalancedCheckpointing` the inputs
+  are checkpoint leaves, the node came back `UnTracked`, and its output was a
+  leaf — so **the attention arm received no gradient** (`8fa5d4c`). The tensor
+  fallback lives inside that same node's backward, so a leaf means no gradient
+  either way. `~/logs/train_kda_full.log` prints `fused kda=3126/0`: 3126
+  forwards, zero backwards. Two consequences a reader should not have to
+  discover: every held-out number from a `use_kda=true` run describes a network
+  with attention frozen at initialisation, and **the fused forward made
+  attention look nearly free (+22 ms) precisely because it was doing no
+  backward work.** The fix makes the op decline (`fused kda=0/0` in a training
+  pass) and lets burn build the graph; it is verified to compile and **not
+  verified to train** — `DM_GDN2_BWD_TRACE=1` should print `ENTERED` on
+  `ChunkWy::backward` and that line has not been seen yet.
 - **No fused multi-head attention exists in this stack at all.** dormouse's only
   attention arm is the gated-delta recurrence; `burn-cubecl` 0.22.0-pre.4 ships
   no fused attention kernel. Where PyTorch has one (mem-efficient, 0.656 ms at
@@ -141,12 +159,36 @@ rustc 1.98.1, burn 0.22.0-pre.4 + vendored cubecl.
 
 **No. Not one, and not close.**
 
-| model | held-out BPB | vs the counter |
-|---|---|---|
-| uniform byte | 8.000 | — |
-| unigram counter | 5.17 | — |
-| **dormouse, best run, step 1500 (2026-09-27)** | **6.351** | **+1.18 worse than the unigram counter** |
-| 5-gram + backoff, ~24 lines of counting | **2.572** | **+3.78 worse** |
+Two held-out numbers, on **two different windows** — the window is
+`eval_batches × batch × seq_len` bytes, so a BPB is only comparable within one
+window, and no run in the archive has been scored on both. The `window` column
+is the authority, and it is printed on every eval line.
+
+| model | held-out BPB | window | vs the counter |
+|---|---|---|---|
+| uniform byte | 8.000 | — | — |
+| unigram counter | 5.17 | *not a trainer window* | — |
+| **dormouse, `--no-kda`, step 6500 (2026-09-28)** | **4.997** | **20 480 B**, depth 2 | **0.17 better than the unigram reading above — on a window the bar was not measured on** |
+| dormouse, best depth-4 run, step 1500 (2026-09-27) | **6.351** | **102 400 B**, depth 4 | +1.18 worse than the unigram counter |
+| 5-gram + backoff, ~24 lines of counting | **2.572** | *not a trainer window* | +2.43 worse (4.997) / +3.78 worse (6.351) |
+
+The two anchor rows are the weakest part of that table and should not be read
+as a measured margin. `crates/dormouse-data/src/bin/anchors.rs:22-27` says in
+its own header that the internal `--holdout` split scores the trailing quarter
+of its own read while the trainer's eval reads a fixed window from a different
+file, so **the two "were never comparable"** — which is why `--fit` exists. Four
+readings are in circulation and none is on a trainer eval window: unigram
+5.398 / 5-gram 2.911, unigram 5.170 / 5-gram 2.572, `--fit` unigram 5.011 /
+5-gram 2.588 (`anchors.rs:27-32`, the only same-*file* measurement, but over the
+whole 500 MB tail), and 2.826 vs 2.849 for one file at `--bytes 1M` vs `2M` — the
+bar moves 0.023 on the fit size alone. To state a real margin, run
+`anchors --fit <filtered corpus> <eval file>` and put its `window:` line next to
+the model's. Uniform is 8.000 by definition.
+
+What the bars do support without any of that: **the 5-gram line is the one every
+number is far above**, by 2.1–2.4 BPB on the best measurement in the archive and
+3.8 on the depth-4 one. So the answer to this section's question is no, and the
+answer does not depend on which of the four unigram readings you pick.
 
 The 5-gram line is not a strawman: on the corpus the model is trained on, a
 4-gram beats it by ~4.9 BPB, and on the text domains a 5-gram sits at 2.25–2.66
@@ -494,7 +536,7 @@ exposed as `--autotune` rather than left as an env var.
 | model arms | `--bf16[=true\|false]` · `--act-quant int4\|int8\|fp4` · `--act-group` · `--max-iter` · `--no-kda` · `--no-engram` · `--quant fp32\|bf16\|fp16\|fp8\|fp4` · `--retract-every` · `--retract-iters` · `--rand-depth` |
 | aux objectives | `--jepa-weight` · `--jepa-k` is **not** a flag (K is `--dspark-k`) · `--dspark-weight` · `--dspark-k` · `--jepa-targets` · `--jepa-precompute` |
 | memory offload | `--engram-ram` · `--engram-slots` (default 1 000 000) · `--host-adam-every` (default 1) |
-| measurement | `--eval-batches` (default 20 = 100 KB) · `--eval-depths` · `--timers` · `--memlog` · `--quant-check` · `--autotune` |
+| measurement | `--eval-batches` (default 20, over a window of `20 × batch × seq_len` bytes — 102 400 B at batch 10, 20 480 B at batch 2, **not a fixed 100 KB**) · `--eval-depths` · `--timers` · `--memlog` · `--quant-check` · `--autotune` |
 | stability | `--stress` · `--stress-lr` · `--stress-every` |
 | process | `--log` · `--detach` · `--guard` |
 
