@@ -307,9 +307,9 @@ mod tests {
 // before that gate would count interest, not arrivals (`f737710`).
 #[cfg(feature = "autodiff")]
 static ENTRY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-#[cfg(all(feature = "autodiff", feature = "cuda"))]
+#[cfg(feature = "cuda")]
 static FWD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-#[cfg(all(feature = "autodiff", feature = "cuda"))]
+#[cfg(feature = "cuda")]
 static BWD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// `(entry, fused_forward, fused_backward)` since [`reset_seam_counts`].

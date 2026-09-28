@@ -1137,11 +1137,11 @@ mod tests {
 // hardcoded to `NoCheckpointing`, so dormouse's
 // `Autodiff<CudaBare, BalancedCheckpointing>` never got here. A counter
 // before that gate would count interest, not arrivals (`f737710`).
-#[cfg(feature = "autodiff")]
+#[cfg(any(feature = "autodiff", test))]
 static ENTRY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-#[cfg(all(feature = "autodiff", feature = "cuda"))]
+#[cfg(feature = "cuda")]
 static FWD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-#[cfg(all(feature = "autodiff", feature = "cuda"))]
+#[cfg(feature = "cuda")]
 static BWD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// `(entry, fused_forward, fused_backward)` since [`reset_seam_counts`].
@@ -1172,7 +1172,7 @@ pub fn reset_seam_counts() {
     }
 }
 
-#[cfg(feature = "autodiff")]
+#[cfg(any(feature = "autodiff", test))]
 fn note_entry_reached() {
     ENTRY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
@@ -1197,6 +1197,7 @@ mod ad {
     use burn_autodiff::grads::Gradients;
     use burn_autodiff::ops::{Backward, Ops, OpsKind};
     use burn_autodiff::Autodiff;
+    #[cfg(any(feature = "autodiff", test))]
     use crate::fused_attnres::note_entry_reached;
     #[cfg(feature = "cuda")]
     use crate::fused_attnres::{note_fused_backward, note_fused_forward};
