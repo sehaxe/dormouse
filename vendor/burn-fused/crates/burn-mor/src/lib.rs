@@ -54,12 +54,14 @@
 mod loss;
 mod routing;
 mod topk;
+mod topk_gather;
 
 pub use loss::load_balancing_loss;
 pub use routing::{
     gather_active, scatter_active, select_active, select_active_only, MoRConfig, MoRRouter,
 };
 pub use topk::topk_indices;
+pub use topk_gather::{topk_gather, topk_indices_last};
 
 #[cfg(test)]
 mod tests {
@@ -89,23 +91,23 @@ mod tests {
             &dev(),
         );
         let idx = topk_indices(x, 3, 1);
-        let v: Vec<i64> = idx.into_data().to_vec().unwrap();
+        let v: Vec<i64> = idx.into_data().try_to_vec_as::<i64>().unwrap();
         assert_eq!(v, vec![3, 1, 2, 0, 2, 4]);
         // k = 0 -> empty, k = n-1 -> all but the minimum.
         let e = topk_indices(Tensor::<2>::from_floats([[2.0, 1.0]], &dev()), 0, 1);
         assert_eq!(e.dims(), [1, 0]);
         let all = topk_indices(Tensor::<2>::from_floats([[2.0, 1.0, 3.0]], &dev()), 2, 1);
-        let a: Vec<i64> = all.into_data().to_vec().unwrap();
+        let a: Vec<i64> = all.into_data().try_to_vec_as::<i64>().unwrap();
         assert_eq!(a, vec![2, 0]);
         // Wide row beyond the old argtopk take<=16 cap: exact top-k set,
         // descending order (all values distinct, no tie-order dependence).
         let vals: Vec<f32> = (0..64).map(|i| (63 - i) as f32).collect(); // [63, 62, .., 0]
         let big = Tensor::<2>::from_data(burn::tensor::TensorData::new(vals, [1, 64]), &dev());
         let idx = topk_indices(big.clone(), 40, 1);
-        let v: Vec<i64> = idx.into_data().to_vec().unwrap();
+        let v: Vec<i64> = idx.into_data().try_to_vec_as::<i64>().unwrap();
         assert_eq!(v, (0..40).collect::<Vec<i64>>()); // top-40 = 63..24
         let idx2 = topk_indices(big, 5, 1);
-        let v2: Vec<i64> = idx2.into_data().to_vec().unwrap();
+        let v2: Vec<i64> = idx2.into_data().try_to_vec_as::<i64>().unwrap();
         assert_eq!(v2, (0..5).collect::<Vec<i64>>());
     }
 
@@ -116,8 +118,8 @@ mod tests {
         let (active, inactive) = select_active(scores, 0.5, &dev());
         assert_eq!(active.dims(), [1, 4]);
         assert_eq!(inactive.dims(), [1, 4]);
-        let a: Vec<i64> = active.into_data().to_vec().unwrap();
-        let i: Vec<i64> = inactive.into_data().to_vec().unwrap();
+        let a: Vec<i64> = active.into_data().try_to_vec_as::<i64>().unwrap();
+        let i: Vec<i64> = inactive.into_data().try_to_vec_as::<i64>().unwrap();
         let mut both = a.clone();
         both.extend(i.clone());
         both.sort();
@@ -137,9 +139,9 @@ mod tests {
         let (active, inactive) = select_active(scores, 0.5, &dev());
         assert_eq!(active.dims(), [2, 1]);
         assert_eq!(inactive.dims(), [2, 0]);
-        let a: Vec<i64> = active.into_data().to_vec().unwrap();
+        let a: Vec<i64> = active.into_data().try_to_vec_as::<i64>().unwrap();
         assert_eq!(a, vec![0, 0]);
-        let i: Vec<i64> = inactive.into_data().to_vec().unwrap();
+        let i: Vec<i64> = inactive.into_data().try_to_vec_as::<i64>().unwrap();
         assert!(i.is_empty(), "inactive should be empty");
     }
 

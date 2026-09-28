@@ -61,11 +61,16 @@ pub fn route(scores: Tensor<3>, k: usize) -> (Tensor<3>, Tensor<1>) {
     // host round trip and NO bool->float cast (that cast is broken on cubecl,
     // AGENTS.md 2026-09-27): one-hot the picks with `mask_fill` on a FLOAT
     // tensor - the sanctioned idiom - and sum the k rows.
-    let ar = Tensor::<1, Int>::arange(0..n as i64, &dev).reshape([1, 1, 1, n]);
-    let eq = idx.reshape([b * t, k, 1]).unsqueeze_dim::<4>(3).equal(ar);
-    let mask = Tensor::<4>::zeros([b * t, k, 1, n], &dev)
+    //
+    // Both Int tensors here come from the same device, so they share its Int
+    // dtype: `topk_indices` must NOT hand back a hard-coded one. Sum the k
+    // axis (dim 1) - `sum_dim` is keepdim in burn 0.22, so the result is
+    // `[b*t, 1, n]` and the reshape below is exact.
+    let ar = Tensor::<1, Int>::arange(0..n as i64, &dev).reshape([1, 1, n]);
+    let eq = idx.reshape([b * t, k, 1]).equal(ar); // [b*t, k, n]
+    let mask = Tensor::<3>::zeros([b * t, k, n], &dev)
         .mask_fill(eq, 1.0)
-        .sum_dim(2)
+        .sum_dim(1)
         .reshape([b, t, n]);
     // Ingredient 2: the label is a FRESH top-k of THESE scores (computed four
     // lines above, from this batch, inside this call) - not a stored target.
