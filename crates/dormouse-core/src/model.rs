@@ -275,6 +275,13 @@ impl DormouseModel {
                     self.jepa_mask_frac,
                     self.jepa_mask_span,
                 );
+                // COUNTED, and it was dead: `probe::JEPA` is asserted by
+                // `tests/preset_exec.rs` and was bumped NOWHERE in the source,
+                // so the test asserting the arm ran was red, and the counter
+                // that would have caught a dropped JEPA term was itself a
+                // no-op. Bumped here, where the term is actually added - not
+                // where the weight is declared.
+                crate::probe::note(crate::probe::JEPA);
                 total = Some(j.mul_scalar(self.jepa_weight)
                     + total.unwrap_or_else(|| Tensor::zeros([1], &dev)));
             }
@@ -289,6 +296,7 @@ impl DormouseModel {
                 self.dspark_k,
                 self.dspark_stride,
             );
+            crate::probe::note(crate::probe::DSPARK);
             total = Some(d.mul_scalar(self.dspark_weight)
                 + total.unwrap_or_else(|| Tensor::zeros([1], &dev)));
         }
