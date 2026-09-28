@@ -26,6 +26,20 @@ pub fn fnv(b: &[u8]) -> u64 {
     h
 }
 
+/// N-gram orders the Engram hashes, one table each, smallest first. The
+/// model's `DormouseConfig::engram_orders` defaults to the same list and a
+/// cross-crate test in dormouse-train pins the two together (the trainer
+/// cannot pass the config down here without touching its frozen plumbing).
+///
+/// 2/3/4 replaces 3/5/8, which spent 2/3 of the table on two dead arms: at
+/// 8M rows only n=3 had per-key support (the corpus exhausts the 16.8M
+/// 3-gram key space 2750x over) and n=5/n=8 were ~5775-way averages, i.e.
+/// 512M parameters carrying no more information than the mean of their
+/// members. It is DeepSeek's own shipped set over compressed tokens
+/// (V4.1-Flash n in {2,3,4}; Engram-27B [2,3]) and the deepest order whose
+/// key space (256^4 = 4.3e9) a 46 GB byte corpus can still populate.
+pub const ORDERS: [usize; 3] = [2, 3, 4];
+
 /// Collect all data files under `root`, sorted for deterministic iteration.
 /// Text corpora are read as raw bytes; images and binary blobs feed the
 /// byte-level LM the same way (a JPEG is just a byte sequence to predict).
@@ -118,25 +132,15 @@ pub struct ByteStream {
 pub fn read_bytes(files: &[PathBuf], limit: usize) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::new();
     let mut tmp = vec![0u8; 1 << 20];
+    let mut skipped: Vec<String> = Vec::new();
     'outer: for f in files {
-        let is_parquet = f
-            .extension()
-            .map(|e| e.to_string_lossy().eq_ignore_ascii_case("parquet"))
-            .unwrap_or(false);
-        let mut src: Source = if is_parquet {
-            match std::fs::File::open(f).ok().and_then(|fh| {
-                parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(fh)
-                    .ok()
-                    .and_then(|b| b.build().ok())
-                    .map(|reader| Source::Parquet { reader, batch: Vec::new(), pos: 0 })
-            }) {
-                Some(s) => s,
-                None => continue,
-            }
-        } else {
-            match std::fs::File::open(f) {
-                Ok(fh) => Source::Text(BufReader::new(fh)),
-                Err(_) => continue,
+        // COUNTED, not silent: a shard the loader cannot open is a hole in
+        // the measurement (open_source already says which one on stderr).
+        let mut src = match open_source(f) {
+            Some(s) => s,
+            None => {
+                skipped.push(f.display().to_string());
+                continue;
             }
         };
         loop {
@@ -325,33 +329,17 @@ impl ByteStream {
         bs
     }
 
-    /// Open a readable file at `file_idx` (skipping unreadable ones). On total
-    /// exhaustion, advance to the next epoch: reshuffle and restart from 0.
+    /// Open a readable file at `file_idx` (skipping unreadable ones, but
+    /// SAYING so: a shard that cannot be opened is a hole in the corpus, and
+    /// a run that trains on 63 of 64 shards must not look like one that
+    /// trains on 64). On total exhaustion, advance to the next epoch:
+    /// reshuffle and restart from 0.
     fn ensure_reader(&mut self) -> bool {
         if self.reader.is_some() {
             return true;
         }
         while self.file_idx < self.files.len() {
-            let path = &self.files[self.file_idx];
-            let is_parquet = path
-                .extension()
-                .map(|e| e.to_string_lossy().eq_ignore_ascii_case("parquet"))
-                .unwrap_or(false);
-            let r = if is_parquet {
-                std::fs::File::open(path).ok().and_then(|f| {
-                    parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(f)
-                        .ok()
-                        .and_then(|b| b.build().ok())
-                        .map(|reader| Source::Parquet {
-                            reader,
-                            batch: Vec::new(),
-                            pos: 0,
-                        })
-                })
-            } else {
-                std::fs::File::open(path).ok().map(|f| Source::Text(BufReader::new(f)))
-            };
-            if let Some(r) = r {
+            if let Some(r) = open_source(&self.files[self.file_idx]) {
                 self.reader = Some(r);
                 return true;
             }
@@ -367,26 +355,7 @@ impl ByteStream {
             self.seed.wrapping_add(self.epoch.wrapping_mul(0x9E37_79B9_7F4A_7C15)),
         );
         while self.file_idx < self.files.len() {
-            let path = &self.files[self.file_idx];
-            let is_parquet = path
-                .extension()
-                .map(|e| e.to_string_lossy().eq_ignore_ascii_case("parquet"))
-                .unwrap_or(false);
-            let r = if is_parquet {
-                std::fs::File::open(path).ok().and_then(|f| {
-                    parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(f)
-                        .ok()
-                        .and_then(|b| b.build().ok())
-                        .map(|reader| Source::Parquet {
-                            reader,
-                            batch: Vec::new(),
-                            pos: 0,
-                        })
-                })
-            } else {
-                std::fs::File::open(path).ok().map(|f| Source::Text(BufReader::new(f)))
-            };
-            if let Some(r) = r {
+            if let Some(r) = open_source(&self.files[self.file_idx]) {
                 self.reader = Some(r);
                 return true;
             }
@@ -504,8 +473,13 @@ impl ByteStream {
     }
 
     /// Next `(bytes, hashes)` batch. Falls back to padding when data is short.
+    /// RAW hashes (the in-VRAM path: the model owns the capacity and masks
+    /// the slot index itself, so there is no second copy of the row count
+    /// here). See [`Self::hashes`].
     pub fn next_batch(&mut self) -> (Vec<u8>, Vec<i64>) {
-        self.next_batch_with_tables([4096, 4096, 4096])
+        let bytes = self.next_bytes();
+        let raw = self.hashes_raw(&bytes);
+        (bytes, raw)
     }
 
     /// Restart the stream from the first byte of the buffer it already holds.
@@ -531,6 +505,13 @@ impl ByteStream {
     /// Next batch with explicit n-gram table sizes (RAM-offload tables can
     /// be millions of slots; the hashes are produced modulo the table size).
     pub fn next_batch_with_tables(&mut self, tables: [usize; 3]) -> (Vec<u8>, Vec<i64>) {
+        let bytes = self.next_bytes();
+        let hashes = self.hashes(&bytes, &tables);
+        (bytes, hashes)
+    }
+
+    /// The next `batch * seq_len` bytes, advancing the stream.
+    fn next_bytes(&mut self) -> Vec<u8> {
         let need = self.batch * self.seq_len;
         if self.pos + need > self.buf.len() {
             self.refill();
@@ -539,7 +520,7 @@ impl ByteStream {
             }
         }
         let end = (self.pos + need).min(self.buf.len());
-        let mut bytes = self.buf[self.pos..end].to_vec();
+        let bytes = self.buf[self.pos..end].to_vec();
         self.pos = end;
         // Compact consumed prefix to keep memory bounded.
         if self.pos > self.capacity / 2 {
@@ -552,8 +533,7 @@ impl ByteStream {
             bytes.len(),
             need
         );
-        let hashes = self.hashes(&bytes, &tables);
-        (bytes, hashes)
+        bytes
     }
 }
 
@@ -565,6 +545,62 @@ mod tests {
     #[should_panic(expected = "no readable data files")]
     fn missing_root_is_loud() {
         ByteStream::new(8, 2, Path::new("/nonexistent/path/xyz"));
+    }
+
+    /// The two hash contracts, on the same batch. `hashes_raw` (the in-VRAM
+    /// path) is the low 32 bits of the FNV digest, one column per
+    /// `ORDERS` entry, NOT reduced - the model masks the slot index against
+    /// its own `engram_rows`, so the row count lives in exactly one place.
+    /// `hashes` (the host-RAM path) is the same thing reduced mod the
+    /// caller's table size, because the host gathers the row immediately.
+    #[test]
+    fn raw_hashes_are_unreduced_and_reduction_is_the_callers() {
+        let dir = std::env::temp_dir().join(format!("dormouse_hash_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pattern: Vec<u8> = (0..256u32).map(|i| (i * 29 % 251) as u8).cycle().take(1 << 16).collect();
+        std::fs::write(dir.join("corpus.bin"), &pattern).unwrap();
+        let (seq, batch) = (8usize, 2usize);
+        let mut s = ByteStream::new(seq, batch, &dir);
+        let raw = s.hashes_raw(&pattern[..seq * batch]);
+        assert_eq!(raw.len(), batch * seq * ORDERS.len());
+        // Unreduced, and 31 bits so `Int` (i32 on burn-flex) holds every value
+        // without a panic. This assertion CHANGED on 2026-09-28: the old
+        // version required the corpus to produce a NEGATIVE i32, i.e. it
+        // pinned the exact 32-bit behaviour that made every training run die
+        // with "Element cannot be represented in the target type". Its purpose
+        // — raw is unreduced, the reduction belongs to the caller — is kept; its
+        // bit width is corrected.
+        assert!(
+            raw.iter().all(|&h| (0..(1i64 << 31)).contains(&h)),
+            "raw hashes fit in i32 (the type `Int` actually is on burn-flex)"
+        );
+        assert!(raw.iter().any(|&h| h > 4096), "raw hashes must NOT be pre-reduced");
+        assert!(
+            raw.iter().all(|&h| (h as i32) >= 0),
+            "every raw hash must survive the i32 cast the trainer performs"
+        );
+
+        // The reduction is exactly the caller's table size, applied per column.
+        let tables = [4096usize, 100_000, 524_288];
+        let red = s.hashes(&pattern[..seq * batch], &tables);
+        assert_eq!(red.len(), raw.len());
+        for (i, (&r, &g)) in red.iter().zip(raw.iter()).enumerate() {
+            assert_eq!(r, g.rem_euclid(tables[i % ORDERS.len()] as i64), "column {i}");
+        }
+        assert!(red.iter().all(|&h| h >= 0 && h < 524_288));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The order list the hashes are built from, spelled out: 3 tables (the
+    /// trainer's hash tensor is `[b, t, 3]`), orders 2/3/4 ascending, no
+    /// order deep enough to be a dead arm (n=5 at 500K rows averaged ~2.2M
+    /// distinct 5-grams per row).
+    #[test]
+    fn orders_are_the_evidence_backed_list() {
+        assert_eq!(ORDERS, [2, 3, 4]);
+        let mut sorted = ORDERS;
+        sorted.sort_unstable();
+        assert_eq!(sorted, ORDERS, "orders must be ascending (table order == column order)");
     }
 
     #[test]

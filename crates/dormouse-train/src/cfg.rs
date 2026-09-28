@@ -333,10 +333,17 @@ mod tests {
     #[test]
     fn mor_and_rand_depth_are_refused_together() {
         let rd = TrainCfg { rand_depth: true, ..Default::default() };
-        // Either alone resolves.
+        // Either alone resolves. This line previously asserted that
+        // `use_mor=true` TOGETHER with rand_depth resolves, which is the exact
+        // combination the guard below refuses - the test contradicted itself
+        // and its "either alone" half was meaningless.
         assert!(resolve("small", &[], TrainCfg::default()).is_ok());
         assert!(resolve("mor", &[], TrainCfg::default()).is_ok());
-        assert!(resolve("small", &set("use_mor=true"), rd.clone()).is_ok());
+        assert!(resolve("small", &[], rd.clone()).is_ok(), "rand-depth alone must resolve");
+        assert!(
+            resolve("small", &set("use_mor=true"), TrainCfg::default()).is_ok(),
+            "use_mor alone must resolve"
+        );
         // Together: refused, and the message names both mechanisms.
         let err = resolve("mor", &[], rd).expect_err("the pair must be refused");
         assert!(err.contains("rand-depth") && err.contains("use_mor"), "{err}");
