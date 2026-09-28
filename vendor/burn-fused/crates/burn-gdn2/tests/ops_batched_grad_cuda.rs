@@ -119,15 +119,20 @@ fn t4s(data: &[f32], shape: [usize; 4], dev: &Device) -> T4 {
 
 /// A scalar loss over the output AND the output state, so the arm that only
 /// reaches one of them cannot pass.
-fn loss(a: &Arms, dev: &Device) -> T1 {
+///
+/// `q_override` exists so a caller can hold the SAME `q` tensor it will ask
+/// for the gradient of. Building it twice makes two nodes, and the backward
+/// registers against the one that is not the one being read — which is what
+/// "q got no gradient" means.
+fn loss(a: &Arms, dev: &Device, q_override: Option<Tensor<4>>) -> T1 {
     let (o, s) = burn_gdn2::forward::chunk_wy_forward(
-        t4(&a.q, SHAPE, dev),
+        q_override.unwrap_or_else(|| t4(&a.q, SHAPE, dev)),
         t4(&a.k, SHAPE, dev),
         t4(&a.v, SHAPE, dev),
         t4(&a.g, SHAPE, dev),
         t4(&a.b, SHAPE, dev),
         t4(&a.w, SHAPE, dev),
-        t4s(&a.state, [SHAPE[0], SHAPE[1], SHAPE[2], SHAPE[2]], dev),
+        t4s(&a.state, [SHAPE[0], SHAPE[1], SHAPE[3], SHAPE[3]], dev),
         (SHAPE[2] as f64).powf(-0.5),
         CHUNK,
     );
@@ -146,7 +151,7 @@ fn host(t: &T4) -> Vec<f32> {
 /// d(loss)/d(q) of one arm, plus the loss value, on the trainer's backend.
 fn analytic(a: &Arms, dev: &Device) -> (Vec<f32>, f32) {
     let q = t4(&a.q, SHAPE, dev);
-    let l = loss(a, dev);
+    let l = loss(a, dev, Some(q.clone()));
     let lval = l.clone().into_scalar::<f32>();
     let grads = l.backward();
     (
@@ -164,7 +169,7 @@ fn fd(a: &Arms, dev: &Device, idx: usize, h: f32) -> f32 {
     let at = |q: Vec<f32>| -> f32 {
         let mut b = a.clone();
         b.q = q;
-        loss(&b, dev).into_scalar::<f32>()
+        loss(&b, dev, None).into_scalar::<f32>()
     };
 
     let mut up = a.q.clone();
@@ -174,28 +179,83 @@ fn fd(a: &Arms, dev: &Device, idx: usize, h: f32) -> f32 {
     (at(up) - at(dn)) / (2.0 * h)
 }
 
+/// Is this coordinate one central differences in f32 can speak about?
+///
+/// `fd(h) = (L(+h) - L(-h)) / 2h`, and `L` is an f32 scalar. The subtraction
+/// cannot resolve a perturbation smaller than a few ulps of `L`, so a
+/// coordinate is checkable only when `2h*|dL/dq|` clears that floor:
+///
+///     |dL/dq| >= FD_FLOOR_ULPS * f32::EPSILON * |L| / h
+///
+/// A coordinate below the floor is not a failing gradient, it is an
+/// unmeasurable one — the finite-difference reference returns noise (or zero)
+/// there and any bar would be a bar on noise. The MEASURED example: on this
+/// shape, `q[640]` has dL/dq = 2.3e-4 on a loss of 45.79, so at h = 1e-2 the
+/// perturbation is 4.7e-7 = 0.085 ulp of the loss, and at h/10 it is 0.0085
+/// ulp and the difference comes back exactly 0. That is the round-off-dominated
+/// signature ops_grad_cuda.rs tells you to look for ("a round-off-dominated
+/// residual rises" as h falls), not a disagreement between the arms.
+///
+/// So coordinates are chosen from the RESOLVABLE set, deterministically, and
+/// the test still fails if too few of them exist — a shrinking resolvable set
+/// is the instrument degrading, and that must not pass quietly.
+const FD_FLOOR_ULPS: f32 = 8.0;
+
 #[test]
 fn both_arms_produce_the_same_gradient_of_the_same_function() {
     let dev = Device::cuda(0);
     let a = draw(&dev);
 
+    // The analytic gradient of the batched arm first: it decides which
+    // coordinates the finite-difference reference is allowed to judge.
+    burn_gdn2::set_chunk_path(ChunkPath::Batched);
+    let (g_batched, lval) = analytic(&a, &dev);
+    assert!(
+        g_batched.iter().fold(0.0f32, |m, v| m.max(v.abs())) > 0.0,
+        "Batched: d(loss)/dq is all zero"
+    );
+    let floor = FD_FLOOR_ULPS * f32::EPSILON * lval.abs() / H;
+    let resolvable: Vec<usize> = (0..a.q.len())
+        .filter(|i| g_batched[*i].abs() >= floor)
+        .collect();
+    println!(
+        "loss {lval:.6}; fd floor {floor:.2e}; {} of {} coordinates resolvable in f32",
+        resolvable.len(),
+        a.q.len()
+    );
+    assert!(
+        resolvable.len() >= a.q.len() / 4,
+        "only {} of {} coordinates clear the f32 finite-difference floor ({floor:.2e}) — the \
+         reference cannot judge this shape, and a test that skips most of its \
+         coordinates is not a test",
+        resolvable.len(),
+        a.q.len()
+    );
+    // deterministic spread through the resolvable set
+    let coords: Vec<usize> = (0..N_COORDS)
+        .map(|j| resolvable[j * resolvable.len() / N_COORDS])
+        .collect();
+
     let mut worst = [0.0f32; 2];
-    let mut grads = Vec::new();
+    let mut grads = vec![g_batched];
     for (i, path) in [ChunkPath::Batched, ChunkPath::Loop]
         .into_iter()
         .enumerate()
     {
         burn_gdn2::set_chunk_path(path);
-        let (g, lval) = analytic(&a, &dev);
-        assert!(
-            g.iter().fold(0.0f32, |m, v| m.max(v.abs())) > 0.0,
-            "{path:?}: d(loss)/dq is all zero"
-        );
-        grads.push(g);
-        let step = a.q.len() / N_COORDS;
-        println!("--- {path:?} (loss {lval:.6}) ---");
-        for j in 0..N_COORDS {
-            let idx = j * step;
+        if i == 0 {
+            // already computed above; only the printed loss is missing
+            println!("--- {path:?} (loss {lval:.6}) ---");
+        } else {
+            let (g, lval) = analytic(&a, &dev);
+            assert!(
+                g.iter().fold(0.0f32, |m, v| m.max(v.abs())) > 0.0,
+                "{path:?}: d(loss)/dq is all zero"
+            );
+            grads.push(g);
+            println!("--- {path:?} (loss {lval:.6}) ---");
+        }
+        for &idx in &coords {
             let ga = grads[i][idx];
             assert!(
                 ga.abs() > 0.0,
