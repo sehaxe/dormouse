@@ -90,60 +90,44 @@ fn backend_gate_decides_right_for_every_backend_we_run() {
 }
 
 /// The production gate: from a Balanced-checkpointed graph the fused forward
-/// AND adjoint kernels must launch, and the numbers must still be the chunked
-/// WY form.
+/// AND adjoint kernels must launch, and the adjoint must be the SAME FUNCTION
+/// as the tensor path's - not merely non-zero.
 ///
-/// # What this proves
+/// # Status, measured on hardware 2026-09-28
 ///
-/// - `fused_calls()` counts kernel LAUNCHES and nothing else. Both counters
-///   are incremented past every gate (backend, divisibility, dtype, kernel
-///   limits, contiguity) and immediately before the first `launch_unchecked`,
-///   so `(1, 0)` after the forward and `(1, 1)` after the backward mean one
-///   fused forward and one fused adjoint really ran. Each counter used to be
-///   the first statement of its entry point, which counted the CALLER's
-///   interest: the backward one moved even when the adjoint returned `None` on
-///   the next line, and this test's `bwd > 0` was green on that lie
-///   (ADR-0019).
-/// - The fused ADJOINT produces the same gradients as the tensor adjoint, to
-///   the same tolerance the forward already had to meet. A counter cannot tell
-///   a right adjoint from a wrong one, and the adjoint is the half of the fused
-///   path that had never run inside a trainer.
+/// The forward and the adjoint both LAUNCH now. Two real defects fixed that
+/// day are why they used to refuse: an inverted `fused_allowed` in
+/// `autodiff.rs` (so the fused forward was dead code and every entry silently
+/// took the tensor branch) and a `strip`/`rebuild` pair in `FusedAdjoint` for
+/// tensors that were already bare (so the adjoint returned `Err` and the
+/// caller panicked). `the_checkpointing_strategy_is_a_parameter_not_a_constant`
+/// below is what caught the first one: it asserts `fused_calls().0 > 0` where
+/// the op is Tracked.
 ///
-/// # What this still cannot prove
+/// It still fails, and the failure is REAL and NEW: the fused adjoint's `d_k`
+/// and `d_g` disagree with the ops path once there is more than one chunk.
+/// Measured on the same card, `b=2 h=2 k=v=32 chunk=16`, loss `sum(out^2)`,
+/// fused adjoint vs the ops path, varying T:
 ///
-/// - Anything on CPU: the kernels, both counters and this whole file are behind
-///   `feature = "cuda"`. `tests/autodiff_nested_balanced.rs` is the CPU twin for
-///   the graph SHAPE (nested parents, `BalancedCheckpointing`, real fwd+bwd) and
-///   cannot see the kernels, the counters, or this gradient comparison.
-/// - That the fused fwd+bwd is FASTER, or even that it is usable end to end in
-///   a training step. This test asserts nothing about time. Until a step-time
-///   measurement exists on a quiet GPU, only the fused FORWARD is established
-///   as live; a 1.57x fwd+bwd number measured through the node may already have
-///   included the tensor adjoint, and nobody has checked.
-/// - That the trainer's own graph works: the inputs here are contiguous and the
-///   graph is flat. The strided-input reproducer is
-///   `tests/fused_permuted_view.rs`.
+/// ```text
+/// T=16  (1 chunk)  q 1.6e-7  k 2.4e-7  v 2.5e-7  g 1.7e-2  b 3.4e-7  w 2.5e-7  s 1.9e-7
+/// T=32  (2 chunks) q 4.2e-7  k 1.8e-1   v 3.5e-7  g 2.3e-2  b 2.4e-7  w 1.7e-7  s 3.0e-7
+/// T=64  (4 chunks) q 4.2e-7  k 2.0e-1   v 1.5e-7  g 2.2e-2  b 2.4e-7  w 3.6e-7  s 3.4e-7
+/// T=128 (8 chunks) q 4.2e-7  k 2.8e-1   v 3.0e-7  g 3.2e-2  b 3.0e-7  w 3.1e-7  s 4.3e-7
+/// ```
 ///
-/// # `#[ignore]`d: this is the gate on the fused ADJOINT, and it has never passed
-///
-/// Measured on hardware 2026-09-28 — before `277b442` — it panicked at
-/// `src/autodiff.rs:195`, where the adjoint closure refused, because the gate it
-/// asked was the dead `TypeId` test on the autodiff backend. `277b442` rewrote
-/// that closure so the strip-to-bare / run / rebuild happens where `Inner` is
-/// nameable. **Nothing has been re-measured since, on either this test or
-/// `fused_chunk_verify.rs`, so the refusal may or may not still happen**; what
-/// is certain is that `bwd > 0` below has never been observed. The counter
-/// placement from `f737710` stands: it sits after the gate, so a `bwd == 0`
-/// today is the honest reading and not a counter lying about a refused call.
-///
-/// Un-ignoring this is not a formality: it is the measurement that decides
-/// whether the fused backward is usable, and it must go green before any claim
-/// about fused fwd+bwd or any training arm that relies on it.
+/// q, v, b, w and the state agree to f32 noise at every length; `d_k` and
+/// `d_g` are correct for ONE chunk and wrong for two or more, which points at
+/// the cross-chunk BPTT chain for the `E = exp(cumsum(g))` terms rather than at
+/// the per-chunk algebra. That is the open bug this gate exists for, and it is
+/// the reason the fused arm is not the default: the ops path's gradient is
+/// verified against finite differences in
+/// `burn-kda/tests/ops_grad_cuda.rs`, the fused one is not.
 ///
 /// Run it on demand:
 /// `cargo test -p burn-gdn2 --release --features cuda,autodiff --test autodiff_cuda_gate -- --ignored --exact fused_kernels_run_from_a_balanced_graph --nocapture`
 #[test]
-#[ignore = "the gate on the fused adjoint, never run green; its old reason (a refusal at autodiff.rs:195 through the dead TypeId gate) was fixed in 277b442 and has not been re-measured, and the gradient comparison has never run on hardware"]
+#[ignore = "MEASURED 2026-09-28: the fused forward and adjoint both launch (the old refusal was an inverted fused_allowed plus a strip of already-bare tensors, both fixed here), and they are correct for one chunk - but from two chunks on the fused adjoint's d_k is off by 1.8e-1..2.8e-1 and its d_g by 1.7e-2..3.2e-2 against the ops path, while q/v/b/w/state agree to ~3e-7"]
 fn fused_kernels_run_from_a_balanced_graph() {
     let device = Device::cuda(0);
     let (batch, heads, time, k_dim, v_dim) = (2usize, 2usize, 64usize, 32usize, 32usize);
@@ -185,12 +169,15 @@ fn fused_kernels_run_from_a_balanced_graph() {
 
     // Backward: the fused adjoint kernel, not the tensor-ops adjoint. Ops AFTER
     // the op, so the adjoint is reached through a chain.
-    let loss = out
-        .clone()
-        .powf_scalar(2.0)
-        .sum()
-        .add(state.clone().powf_scalar(2.0).sum())
-        .add(out.clone().sum().mul_scalar(0.5));
+    //
+    // The loss is the OUTPUT only. The op's state output is an UNTRACKED leaf
+    // on this path (the burn-gdn2 module header says so, and the fused adjoint
+    // starts its BPTT chain from a zero state adjoint), so a `state^2` term
+    // would ask for a gradient this node structurally cannot produce - the
+    // test would then be red for a reason that is the op's contract, not a
+    // defect, which is the same class of green-looking gate this file exists
+    // to stop.
+    let loss = out.clone().powf_scalar(2.0).sum().add(out.clone().sum().mul_scalar(0.5));
     let grads = loss.backward();
     let (fwd, bwd) = fused_calls();
     assert_eq!(fwd, 1, "the fused forward ran more than once");
@@ -231,7 +218,10 @@ fn fused_kernels_run_from_a_balanced_graph() {
 
     // The adjoint must be the SAME function as the tensor adjoint's, or the
     // fused path is a different optimizer rather than a faster one. Same
-    // values, same graph, tensor path instead of the fused node.
+    // values, same graph, tensor path instead of the fused node. The tensor
+    // path's own gradient is pinned against finite differences in
+    // `burn-kda/tests/ops_grad_cuda.rs`, so this is a comparison against a
+    // checked value and not between two unchecked ones.
     let (ref_out, ref_state) = chunk_wy_forward(
         inp[0].clone(),
         inp[1].clone(),
@@ -247,7 +237,6 @@ fn fused_kernels_run_from_a_balanced_graph() {
         .clone()
         .powf_scalar(2.0)
         .sum()
-        .add(ref_state.powf_scalar(2.0).sum())
         .add(ref_out.sum().mul_scalar(0.5));
     let ref_grads = ref_loss.backward();
     let d_loss = (loss.clone().into_scalar::<f32>() - ref_loss.into_scalar::<f32>()).abs();
@@ -263,7 +252,7 @@ fn fused_kernels_run_from_a_balanced_graph() {
         assert!(
             d < 1e-3,
             "input {i}: the fused adjoint disagrees with the tensor adjoint \
-             (rel={d:.2e}) — the fused backward would be a different function"
+             (rel={d:.2e}) - the fused backward would be a different function"
         );
     }
 }

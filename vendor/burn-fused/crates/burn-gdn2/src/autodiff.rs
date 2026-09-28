@@ -68,15 +68,31 @@ impl core::fmt::Debug for FusedAdjoint {
 ///
 /// `fused_chunk_backward` gates on `is_cuda::<B>()`, which is the SAME dead
 /// `TypeId` test that kept this adjoint out of every training step: the op's
-/// `backward` always passes an autodiff backend, so the gate was always false
-/// and the tensor adjoint ran. Here `B` IS the inner backend, so the gate asks
-/// the right question, and the inputs are genuinely bare by the time it does.
+/// `backward` is generic over its backend and the *caller* used to name the
+/// autodiff backend, so the gate was always false and the tensor adjoint ran.
+/// Inside the closure the backend is `Inner` — the bare one — so the gate asks
+/// the right question.
+///
+/// # `Inner` is already the tensors' backend here — no strip, no rebuild
+///
+/// MEASURED 2026-09-28. This closure used to `strip::<Inner, S, 4>` its inputs
+/// and `rebuild` its outputs, on the belief that `Backward::backward` hands it
+/// autodiff tensors. It does not: `impl<B: Backend> Backward<B, N> for ChunkWy`
+/// is instantiated with `B = Inner` (the forward ran on the bare backend and
+/// `out_prim` is `Inner::FloatTensorPrimitive`), so `checkpointer`'s
+/// `retrieve_node_output` and `grads.consume` both yield BARE primitives and
+/// the very first `strip(k)` returned `None`. Every fused backward therefore
+/// ended in the `.expect` at the call site, i.e. a panic — the refusal that
+/// `277b442` believed it had fixed.
+///
+/// The strip/rebuild is deleted rather than repaired, because the tensors
+/// arriving here ARE what the kernels want, and the outputs the caller
+/// registers through `grads.register::<B>` are consumed on the same backend.
 #[cfg(feature = "cuda")]
 fn fused_adjoint<Inner: Backend, S: CheckpointStrategy>() -> FusedAdjoint
 where
     DispatchTensor: DispatchKindConversion<Autodiff<Inner, S>> + DispatchKindConversion<Inner>,
 {
-    use crate::cuda_dispatch::{rebuild, strip};
     use crate::kernel::chunk_adjoint_cube::cuda::fused_chunk_backward;
     FusedAdjoint(std::sync::Arc::new(
         |fwd: &crate::kernel::chunk_adjoint_cube::cuda::FusedBackwardInputs,
@@ -91,24 +107,13 @@ where
             let [Some(k), Some(v), Some(b), Some(w)] = xs else {
                 return Err("an op parent was not a tracked node");
             };
-            // Bare, so `try_into_primitive` inside the kernels sees what it
-            // expects: a hardware tensor, not an autodiff handle. Named
-            // separately because a refusal here and a refusal inside the
-            // kernels are different bugs, and a message that says neither is
-            // the message that costs the next person an afternoon.
-            let bare = |t: &Tensor<4>, name: &'static str| {
-                strip::<Inner, S, 4>(t).ok_or(name)
-            };
-            let k = bare(k, "strip(k)")?;
-            let v = bare(v, "strip(v)")?;
-            let b = bare(b, "strip(b)")?;
-            let w = bare(w, "strip(w)")?;
-            let d_out = bare(&d_out, "strip(d_out)")?;
-            let out = fused_chunk_backward::<Inner>(fwd, &k, &v, &b, &w, &d_out, scale, chunk_size)
-                .ok_or(
-                    "fused_chunk_backward refused (its own is_cuda gate, or a contiguity \
-                     materialization that did not come back row-major)",
-                )?;
+            let out = fused_chunk_backward::<Inner>(
+                fwd, k, v, b, w, &d_out, scale, chunk_size,
+            )
+            .ok_or(
+                "fused_chunk_backward refused (its own is_cuda gate, or a contiguity \
+                 materialization that did not come back row-major)",
+            )?;
             Ok([
                 out.d_q,
                 out.d_k,
@@ -117,8 +122,7 @@ where
                 out.d_b,
                 out.d_w,
                 out.d_s,
-            ]
-            .map(|t| rebuild::<Inner, S, 4>(&t)))
+            ])
         },
     ))
 }
@@ -565,10 +569,21 @@ where
     // real graph, so gradients flow. The fused kernels still serve the
     // gradient-free passes (held-out eval), where a leaf is harmless and the
     // speed is worth having.
-    #[cfg(feature = "cuda")]
-    let fused_allowed = crate::cuda_dispatch::fused_forced_off();
-    #[cfg(not(feature = "cuda"))]
-    let fused_allowed = false;
+    //
+    // MEASURED 2026-09-28, this line was `fused_allowed =
+    // fused_forced_off()` - INVERTED. `fused_forced_off()` is true only when
+    // `DM_FUSED_KDA=0`, and that case has already returned `None` above, so
+    // `fused_allowed` was true only on a path that cannot be reached, and
+    // false everywhere else: the fused forward inside the node was DEAD CODE
+    // and every entry to it silently took the tensor branch. The symptom is
+    // indistinguishable from the intended state - `fused_calls()` reads
+    // `(0, 0)` and a declined op reads `(0, 0)` too, which is why
+    // `tests/autodiff_cuda_gate.rs::the_checkpointing_strategy_is_a_parameter_not_a_constant`
+    // caught it on hardware: it asserts `fused_calls().0 > 0` on a graph where
+    // the op is Tracked and the fused kernel demonstrably runs
+    // (`fused_chunk_forward_scratch` on the same stripped buffers returns
+    // `Some`). The one-word fix is below; the test that found it is unchanged.
+    let fused_allowed = !forced_off;
 
     // Forward on the inner backend. On the bare CUDA backend the two fused
     // chunk kernels run instead of the tensor path (2 launches per chunk

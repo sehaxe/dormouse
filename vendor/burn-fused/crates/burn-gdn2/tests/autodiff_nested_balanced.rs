@@ -170,7 +170,15 @@ where
     DispatchTensor: DispatchKindConversion<Autodiff<NdArray, S>> + DispatchKindConversion<NdArray>,
 {
     let g = nested::<S>(device, raw);
-    let (out, _state) = chunk_wy_forward_autodiff_s::<NdArray, S>(
+    // The op DECLINES here, and that is the fixed behaviour, not a regression:
+    // the seven inputs are `permute(act(leaf))` - all `GradInBackward`
+    // intermediates - so the custom node this function would build comes back
+    // `UnTracked`, its output is a LEAF, and no gradient could reach the arm.
+    // Declining routes the call to the ops path on the same tensors, which is
+    // what burn's own graph then differentiates - so this file still measures
+    // the thing it was written for (the same graph under two checkpointing
+    // strategies), through the arm that actually runs.
+    let (out, _state) = match chunk_wy_forward_autodiff_s::<NdArray, S>(
         g.inputs[0].clone(),
         g.inputs[1].clone(),
         g.inputs[2].clone(),
@@ -180,8 +188,20 @@ where
         g.inputs[6].clone(),
         1.0,
         chunk,
-    )
-    .expect("the op must accept a graph on the caller's own checkpointing strategy");
+    ) {
+        Some(r) => r,
+        None => burn_gdn2::chunk_wy_forward(
+            g.inputs[0].clone(),
+            g.inputs[1].clone(),
+            g.inputs[2].clone(),
+            g.inputs[3].clone(),
+            g.inputs[4].clone(),
+            g.inputs[5].clone(),
+            g.inputs[6].clone(),
+            1.0,
+            chunk,
+        ),
+    };
 
     // Ops AFTER the op, so the backward reaches it through a chain instead of
     // consuming its output directly. Nothing outside the op contributes, so a
@@ -283,14 +303,28 @@ fn nested_balanced_graph_matches_no_checkpointing() {    let (batch, heads, time
     }
 }
 
-/// The nested graph must reach the op at all: a strategy-blind op returns
-/// `None` here, which is the silent fallback that kept the fused path out of
-/// production. Asserted apart from the numbers so a `None` is a clear failure.
+/// The nested graph must NOT reach the op, and the reason is the bug this
+/// project shipped for its whole history.
+///
+/// Asserted apart from the numbers so a silent change of arm is a clear
+/// failure rather than a slightly different set of gradients: on inputs that
+/// are all intermediates, the custom node is declined, because a node whose
+/// parents' node refs report no requirement comes back `UnTracked` and its
+/// output is a leaf with no gradient behind it. Both strategy entry points
+/// must decline, for the same reason and independently of the strategy - which
+/// is what `chunk_dispatch` relies on when it falls through to the ops path.
 #[test]
-fn the_op_accepts_a_nested_balanced_graph() {
+fn the_op_declines_a_nested_graph_and_the_ops_path_carries_the_gradient() {
     let raw = raw_inputs(1, 2, 32, 4, 3);
     let device = balanced_device();
     let g = nested::<BalancedCheckpointing>(&device, &raw);
+    for (i, t) in g.inputs.iter().enumerate() {
+        assert!(
+            !t.is_require_grad(),
+            "input {i} is a require_grad leaf: this fixture is supposed to be all \
+             intermediates, and the decline it is testing for would not happen"
+        );
+    }
     let balanced = chunk_wy_forward_autodiff_s::<NdArray, BalancedCheckpointing>(
         g.inputs[0].clone(),
         g.inputs[1].clone(),
@@ -303,12 +337,14 @@ fn the_op_accepts_a_nested_balanced_graph() {
         16,
     );
     assert!(
-        balanced.is_some(),
-        "the op refused a Balanced graph: it is still strategy-blind"
+        balanced.is_none(),
+        "the op built a node over all-intermediate inputs: its output is a LEAF, \
+         which is the defect 8fa5d4c fixed"
     );
-    // The same values through the default-strategy entry point must stay
-    // blind: that blindness is what `chunk_dispatch` probes around, and it
-    // must not be "fixed" by making the two indistinguishable.
+    // The same values through the default-strategy entry point must decline for
+    // the same reason, not because the strategy is part of the conversion: the
+    // two must not be distinguishable here, or `chunk_dispatch`'s two probes
+    // would be testing the wrong thing.
     let default_entry = burn_gdn2::chunk_wy_forward_autodiff::<NdArray>(
         g.inputs[0].clone(),
         g.inputs[1].clone(),
@@ -322,7 +358,33 @@ fn the_op_accepts_a_nested_balanced_graph() {
     );
     assert!(
         default_entry.is_none(),
-        "the NoCheckpointing entry point accepted a Balanced graph: \
-         the strategy is no longer part of the conversion"
+        "the NoCheckpointing entry point built a node where the Balanced one \
+         declined: the decline is no longer strategy-blind and the two are no \
+         longer equivalent"
     );
+
+    // And the gradient the ops path produces is real: the loss reaches every
+    // leaf. This is the assertion that would have failed on a frozen arm.
+    let (out, _state) = burn_gdn2::chunk_wy_forward(
+        g.inputs[0].clone(),
+        g.inputs[1].clone(),
+        g.inputs[2].clone(),
+        g.inputs[3].clone(),
+        g.inputs[4].clone(),
+        g.inputs[5].clone(),
+        g.inputs[6].clone(),
+        1.0,
+        16,
+    );
+    let grads = out.powf_scalar(2.0).sum().backward();
+    for (i, t) in g.leaves.iter().enumerate() {
+        let d = t
+            .grad(&grads)
+            .unwrap_or_else(|| panic!("leaf {i} got no gradient at all"))
+            .clone();
+        assert!(
+            d.abs().max().into_scalar::<f32>() > 0.0,
+            "leaf {i} got a zero gradient through the ops path"
+        );
+    }
 }

@@ -67,7 +67,12 @@ impl<T> Fused<T> {
         }
     }
 
-    /// `true` when the fused kernels ran.
+    /// `true` when the CHUNK OP ran, on either arm.
+    ///
+    /// NOT "the fused kernels ran": [`chunk_dispatch`] returns `Fused` for
+    /// the ops path too, because that path is the correct answer rather than
+    /// a failure. Whether the fused KERNELS ran is
+    /// [`crate::cuda_dispatch::fused_calls`] (`#[cfg(feature = "cuda")]`).
     pub fn is_fused(&self) -> bool {
         matches!(self, Fused::Fused(_))
     }
@@ -156,6 +161,21 @@ mod fused {
     static FUSED_FWD: AtomicU64 = AtomicU64::new(0);
     static FUSED_BWD: AtomicU64 = AtomicU64::new(0);
     static FUSED_DECLINED: AtomicU64 = AtomicU64::new(0);
+    /// Times [`chunk_dispatch`] was ASKED for a chunk forward. Without it,
+    /// `fused_calls() == (0, 0)` cannot tell "asked, and the fused path was
+    /// correctly declined" from "never asked" - which is the exact shape of
+    /// the bug the decline was added for: for a day, `fused kda=30/0` read as
+    /// "the fast path is slow", and the arm was training nothing.
+    static DISPATCH_ASKED: AtomicU64 = AtomicU64::new(0);
+    /// Times [`chunk_dispatch`] took the OPS path (the ordinary burn tensor
+    /// ops on the incoming tensors, so burn builds the graph itself). This is
+    /// the arm that carries a gradient; the fused kernels are not.
+    static OPS_PATH: AtomicU64 = AtomicU64::new(0);
+    /// Times `ChunkWy::backward` - the CUSTOM node's backward - was entered.
+    /// Zero while [`ops_path`] is positive is the statement that the backward
+    /// was burn's own graph, not this crate's replay. It is the one number
+    /// that separates "correct gradients" from "no gradient at all".
+    static CUSTOM_NODE_BWD: AtomicU64 = AtomicU64::new(0);
 
     /// Called by the fused kernels when they actually launch (never when a
     /// caller merely *considered* the fused path and fell back).
@@ -176,19 +196,61 @@ mod fused {
     /// it is a silent gradient loss - this arm's parameters would never
     /// train while every other op in the model trains normally. Traced so the
     /// distinction is a measurement rather than a reading of the code.
+    ///
     /// Called when the fused path is DECLINED - either because the op's
     /// inputs carry no node id (so a fused output would be a leaf and the arm
     /// would train nothing) or because `DM_FUSED_KDA=0`. COUNTED, not silent:
     /// a fused arm that quietly stops running is how 30 forwards and 0
     /// gradients read as healthy for a day.
+    ///
+    /// Counts DECLINES OF THE FUNCTION, so a caller that probes two
+    /// strategies (`chunk_dispatch` does) counts twice for one dispatch. The
+    /// dispatch-level number is [`ops_path`]; use that one to reason about a
+    /// training run.
     #[inline]
     pub fn note_fused_declined() {
         FUSED_DECLINED.fetch_add(1, Relaxed);
     }
 
-    /// Fused forward declines since [`reset_fused_calls`].
+    /// Fused forward declines since [`reset_fused_calls`]. Function-level; see
+    /// [`note_fused_declined`].
     pub fn fused_declined() -> u64 {
         FUSED_DECLINED.load(Relaxed)
+    }
+
+    /// [`chunk_dispatch`] was asked for a chunk forward. The denominator every
+    /// other counter here is read against.
+    pub fn dispatch_asked() -> u64 {
+        DISPATCH_ASKED.load(Relaxed)
+    }
+
+    /// [`chunk_dispatch`] took the OPS path. This is the arm that produces a
+    /// gradient: `chunk_wy_forward_impl` on the INCOMING tensors, so burn
+    /// builds the graph itself.
+    pub fn ops_path() -> u64 {
+        OPS_PATH.load(Relaxed)
+    }
+
+    /// `ChunkWy::backward` - the custom node's replay - was entered. `0` while
+    /// [`ops_path`] is positive is the statement that the backward came from
+    /// burn's own graph, which is the whole point of the ops path.
+    pub fn custom_node_backward() -> u64 {
+        CUSTOM_NODE_BWD.load(Relaxed)
+    }
+
+    /// Every seam counter on this line, for a training log that already
+    /// watches `fused_calls()`: `(asked, fused_fwd, fused_bwd, declined,
+    /// ops_path, custom_node_bwd)`.
+    pub fn seam_counts() -> (u64, u64, u64, u64, u64, u64) {
+        let (f, b) = fused_calls();
+        (
+            dispatch_asked(),
+            f,
+            b,
+            fused_declined(),
+            ops_path(),
+            custom_node_backward(),
+        )
     }
 
     /// Forces the tensor path even where the fused path could deliver
@@ -219,8 +281,15 @@ mod fused {
     /// acceleration). The first is a silent gradient loss; the second is
     /// only a missing speedup. Different bugs, so they need different
     /// evidence. Trace with `DM_GDN2_BWD_TRACE=1`.
+    ///
+    /// A COUNT, not just a `Once`: since the ops path
+    /// (`8fa5d4c`, the fix for the leaf-node bug) the custom node is declined
+    /// before it exists, so this counter is 0 in every training step that
+    /// carries a gradient. `ops_path() > 0` next to `custom_node_backward()
+    /// == 0` is what says "burn's graph did the backward".
     #[inline]
     pub fn note_backward_node() {
+        CUSTOM_NODE_BWD.fetch_add(1, Relaxed);
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
             if std::env::var_os("DM_GDN2_BWD_TRACE").is_some() {
@@ -249,10 +318,17 @@ mod fused {
         (FUSED_FWD.load(Relaxed), FUSED_BWD.load(Relaxed))
     }
 
-    /// Zero the launch counters.
+    /// Zero the launch counters - ALL of them, including
+    /// [`fused_declined`], [`dispatch_asked`], [`ops_path`] and
+    /// [`custom_node_backward`]. A reset that left the decline counter stale
+    /// would make a later "declined" reading mean nothing.
     pub fn reset_fused_calls() {
         FUSED_FWD.store(0, Relaxed);
         FUSED_BWD.store(0, Relaxed);
+        FUSED_DECLINED.store(0, Relaxed);
+        DISPATCH_ASKED.store(0, Relaxed);
+        OPS_PATH.store(0, Relaxed);
+        CUSTOM_NODE_BWD.store(0, Relaxed);
     }
 
     /// The dispatch layer can hand out bare `CudaBare` tensors and take
@@ -295,6 +371,7 @@ mod fused {
         if !backend_matches::<B>() {
             return Fused::Fallback(Fallback::NotCuda);
         }
+        DISPATCH_ASKED.fetch_add(1, Relaxed);
         macro_rules! probe {
             ($S:ty) => {
                 if let Some((o, s)) = crate::autodiff::chunk_wy_forward_autodiff_s::<CudaBare, $S>(
@@ -343,10 +420,15 @@ mod fused {
         // than the fused kernels and correct - which is the trade the project
         // is making deliberately until a fused path is A/B-proven against
         // this one rather than against a run that trained nothing.
+        //
+        // COUNTED as `ops_path`, not as a second decline: the decline
+        // counter lives in `chunk_wy_forward_autodiff_s` and fires once per
+        // strategy probe, so counting here too would report two declines for
+        // one dispatch.
         let (o, s, _scratch) = crate::forward::chunk_wy_forward_impl(
             q, k, v, g, b, w, state, scale, chunk_size, None,
         );
-        note_fused_declined();
+        OPS_PATH.fetch_add(1, Relaxed);
         Fused::Fused((o, s))
     }
 }
