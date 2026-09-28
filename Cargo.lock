@@ -728,6 +728,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "backend-parity"
+version = "0.1.0"
+dependencies = [
+ "burn",
+ "burn-cuda",
+ "burn-ndarray",
+ "burn-tensor",
+]
+
+[[package]]
 name = "backtrace"
 version = "0.3.76"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1258,6 +1268,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "burn-mor"
+version = "0.1.1"
+dependencies = [
+ "burn",
+ "burn-tensor",
+]
+
+[[package]]
 name = "burn-muon-plus"
 version = "0.1.0"
 dependencies = [
@@ -1367,6 +1385,7 @@ dependencies = [
  "burn-autodiff",
  "burn-core",
  "burn-cubecl",
+ "burn-flex",
  "burn-fusion",
  "burn-std",
 ]
@@ -2532,8 +2551,6 @@ dependencies = [
 [[package]]
 name = "cubek-reduce"
 version = "0.3.0-pre.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c5fd3d3821203d0435f5880b729745c47736928ce9519c77ee6f087c90bf733"
 dependencies = [
  "cubecl",
  "cubek-std",
@@ -2844,9 +2861,10 @@ dependencies = [
  "burn-cuda",
  "burn-dspark",
  "burn-engram",
+ "burn-gdn2",
  "burn-jepa",
  "burn-kda",
- "burn-ndarray",
+ "burn-mor",
  "burn-nn",
  "burn-rmsnorm",
  "burn-spectral",
@@ -2876,11 +2894,15 @@ dependencies = [
  "burn-ndarray",
  "burn-spectral",
  "burn-tensor",
+ "clap",
+ "crc32fast",
  "cubecl-cuda",
+ "cubecl-environment",
  "cubecl-runtime",
  "cudarc",
  "dormouse-core",
  "dormouse-data",
+ "half",
  "rand 0.8.8",
  "serde",
  "toml 0.8.23",

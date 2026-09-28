@@ -9,7 +9,7 @@ members = [
 ]
 # vendored fork workspaces: they are their own workspace roots; without this
 # cargo resolves their crates' `workspace = true` inheritance against OUR root.
-exclude = ["vendor/burn-fused", "vendor/cubecl-fix"]
+exclude = ["vendor/burn-fused", "vendor/cubecl-fix", "vendor/cubek-fix"]
 resolver = "2"
 [workspace.package]
 version = "0.1.0"
@@ -62,3 +62,9 @@ cubecl-cuda = { path = "vendor/cubecl-fix/cubecl-cuda" }
 # is why the impl is legal here and not in a downstream crate. This is the only
 # cubecl-ir change; the f64 and bf16 equivalents are deliberately not touched.
 cubecl-ir = { path = "vendor/cubecl-fix/cubecl-ir" }
+# cubek-reduce carries the top-k index kernel (ADR-0015). Vendored, not forked
+# from a working copy: 0.3.0-pre.4's `reaches` fast-path guard cannot tell an
+# empty top-k slot from one holding -inf, so a masked score row emits the
+# `u32::MAX` seed coordinate as an index and the caller's gather reads out of
+# bounds. Two hunks in src/components/instructions/{topk,base}.rs.
+cubek-reduce = { path = "vendor/cubek-fix/cubek-reduce" }
