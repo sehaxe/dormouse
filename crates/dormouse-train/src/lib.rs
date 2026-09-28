@@ -2,6 +2,7 @@
 //! optimizer (see `optim`), burnpack checkpoints with custom name, resume,
 //! opencode harness.
 mod cfg;
+pub mod decode;
 pub mod export;
 mod jepa_targets;
 mod offload;
@@ -19,7 +20,7 @@ use burn::{
     tensor::{Bytes, Device, Int, Tensor, TensorData},
 };
 
-use dormouse_core::{fused_seam_counts, ActQuant, DormouseConfig, DormouseModel};
+use dormouse_core::{fused_seam_counts, probe, ActQuant, DormouseConfig, DormouseModel};
 
 pub use cfg::{resolve, RunCfg};
 pub use optim::{
@@ -831,7 +832,7 @@ pub fn train_loop(
     let legacy = loaded.as_ref().is_some_and(|l| l.legacy);
     let mut teacher = match saved_teacher {
         Some(t) => Some(t),
-        none => {
+        None => {
             let t = ema_teacher_for(&cfg, &dorm_cfg, &model);
             if t.is_some() && step > 0 {
                 eprintln!(
@@ -871,6 +872,32 @@ pub fn train_loop(
     // training log should be told about, and it is what `<name>.best` holds.
     let mut best_eval_bpb = f32::INFINITY;
     let mut best_eval_step: u64 = 0;
+    // A resumed run must not believe it has no best artifact. Without this the
+    // first eval after any resume compares against `inf`, overwrites
+    // `<name>.best.bin` with a usually-worse checkpoint, and the whole feature
+    // silently re-creates the bug it exists to prevent (found by audit
+    // 2026-09-28, hours after the feature landed, and lost once to a
+    // concurrent commit that rewrote this file).
+    {
+        let bpb_path = dir.join(format!("{}.best.bpb", cfg.ckpt_name));
+        if let Ok(text) = std::fs::read_to_string(&bpb_path) {
+            let mut it = text.split_whitespace();
+            if let (Some(b), Some(s)) = (it.next(), it.next()) {
+                match (b.parse::<f32>(), s.parse::<u64>()) {
+                    (Ok(b), Ok(s)) if b.is_finite() => {
+                        best_eval_bpb = b;
+                        best_eval_step = s;
+                    }
+                    _ => {
+                        return Err(format!(
+                            "{bpb_path:?} is unreadable ({text:?}) - refusing to resume, because \
+                             overwriting the best checkpoint needs a score to compare against"
+                        ));
+                    }
+                }
+            }
+        }
+    }
     let mut stress = cfg.stress.then(|| StressMonitor::new(cfg.stress_lr, cfg.stress_every));
     // RAM-offload n-gram tables (report §2.3): --engram-ram keeps the
     // tables in host memory (millions of slots in the 64 GB RAM), trains
@@ -1296,12 +1323,23 @@ pub fn train_loop(
                     // whose sampling noise is larger than the effects we A/B.
                     let mut ce_sum = 0.0f32;
                     let mut n = 0u32;
+                    // The memory arm, counted over the eval's own forwards.
+                    // A memory-disabled forward is CORRECT and produces a
+                    // normal-looking BPB, so the eval line is the only place
+                    // a reader learns it happened; this is the arm counter
+                    // ADR-0011 asks for, and `0/<n>` is the shape of the
+                    // defect that made every pre-2026-09-28 eval line a
+                    // measurement of a network with no n-gram memory in it.
+                    let (eg_arms0, eg_rows0) = (
+                        probe::count(probe::ENGRAM),
+                        probe::count(probe::ENGRAM_KEYS),
+                    );
                     for _ in 0..cfg.eval_batches.max(1) {
                         let (eb, eh) = match &host {
                             Some(h) => ev.next_batch_with_tables(h.slots),
                             None => ev.next_batch(),
                         };
-                        let (ex, _eh_t) =
+                        let (ex, eh_t) =
                             bytes_to_tensors::<Backend>(&eb, &eh, cfg.seq_len, cfg.batch, &device);
                         let eshift: Vec<i64> = eb
                             .iter()
@@ -1327,8 +1365,21 @@ pub fn train_loop(
                             }
                             None => None,
                         };
+                        // The SAME memory arm the training step ran, or the
+                        // held-out number is a different model than the one
+                        // being trained: the in-VRAM path needs the keys, the
+                        // host path needs the rows (and uploading the keys too
+                        // would be a dead H2D copy). This eval passed `None`
+                        // unconditionally, so on the in-VRAM path - every run
+                        // without --engram-ram, i.e. all of them until now -
+                        // the Engram branch took its inert arm and the
+                        // reported BPB was a network with no memory at all.
                         let (elogits, ..) = eval_model.forward_with_hidden::<Backend>(
-                            ex, None, eval_rows, None, None,
+                            ex,
+                            if eval_rows.is_some() { None } else { Some(eh_t) },
+                            eval_rows,
+                            None,
+                            None,
                         );
                         let v = eval_model.vocab_size;
                         let eflat = elogits.reshape([cfg.batch * cfg.seq_len, v]);
@@ -1376,9 +1427,13 @@ pub fn train_loop(
                     // is printed here, on the line they already watch.
                     let (kda_f, kda_b, norm_asked, norm_skipped) = fused_seam_counts();
                     let (mu_mom, mu_fin) = optim::fused_kernels_skipped();
+                    let (eg_arms, eg_rows) = (
+                        probe::count(probe::ENGRAM) - eg_arms0,
+                        probe::count(probe::ENGRAM_KEYS) - eg_rows0,
+                    );
                     println!(
                         "step {step:6} EVAL ce={ece:.3} bpb={ebpb:.3}{} over {bytes} B (fixed window) \
-                         fused kda={kda_f}/{kda_b} norm={}/{} muon_skipped={}/{}",
+                         fused kda={kda_f}/{kda_b} norm={}/{} muon_skipped={}/{} engram={eg_rows}/{eg_arms}",
                         if is_best_eval { " BEST" } else { "" },
                         norm_asked.saturating_sub(norm_skipped),
                         norm_asked,
@@ -1403,6 +1458,23 @@ pub fn train_loop(
                         ) {
                             return Err(format!("step {step}: writing the best checkpoint failed: {e}"));
                         }
+                        // The n-gram sidecar travels with the weights. Without
+                        // it, `foo.best.bin` is step-S weights and NO tables,
+                        // and the loader reads a missing sidecar as `None => h`
+                        // - freshly seeded rows, silently. That is a DIFFERENT
+                        // model from the one that was measured (ADR-0019).
+                        if let Err(e) = save_ngram(&dir, &best_name, host.as_ref(), step) {
+                            return Err(format!(
+                                "step {step}: the best checkpoint's ngram sidecar failed: {e} \
+                                 - the artifact would load as a DIFFERENT model"
+                            ));
+                        }
+                        // Persist the score the artifact was chosen by, so a
+                        // resume compares against it instead of against `inf`.
+                        let bpb_path = dir.join(format!("{best_name}.bpb"));
+                        if let Err(e) = std::fs::write(&bpb_path, format!("{ebpb} {step}\n")) {
+                            return Err(format!("step {step}: writing {bpb_path:?} failed: {e}"));
+                        }
                     }
                     // Depth curve, no training. Our readout is the MEAN of the
                     // per-iteration outputs, so "stop after k iterations" is
@@ -1422,7 +1494,7 @@ pub fn train_loop(
                                     Some(h) => ev.next_batch_with_tables(h.slots),
                                     None => ev.next_batch(),
                                 };
-                                let (dx, _dt) =
+                                let (dx, dh_t) =
                                     bytes_to_tensors::<Backend>(&db, &dh, cfg.seq_len, cfg.batch, &device);
                                 let dshift: Vec<i64> = db
                                     .iter()
@@ -1443,8 +1515,16 @@ pub fn train_loop(
                                     }
                                     None => None,
                                 };
-                                let (dl, ..) =
-                                    m.forward_with_hidden::<Backend>(dx, None, drows, None, None);
+                                // Same arm as the step above, for the same
+                                // reason: a depth curve is a claim about the
+                                // model, and this measured one without memory.
+                                let (dl, ..) = m.forward_with_hidden::<Backend>(
+                                    dx,
+                                    if drows.is_some() { None } else { Some(dh_t) },
+                                    drows,
+                                    None,
+                                    None,
+                                );
                                 let dv = m.vocab_size;
                                 let dflat = dl.reshape([cfg.batch * cfg.seq_len, dv]);
                                 let dtgt = dy.reshape([cfg.batch * cfg.seq_len, 1]);
@@ -1490,11 +1570,17 @@ pub fn train_loop(
     save_ckpt(&dir, &cfg.ckpt_name, &model, &optim, teacher.as_ref(), ortho_fp32, step, ce)
         .map_err(|e| format!("final checkpoint save failed: {e}"))?;
     save_ngram(&dir, &cfg.ckpt_name, host.as_ref(), step)?;
-    println!(
-        "done steps={step} best ce={best:.3} | BEST HELD-OUT bpb={best_eval_bpb:.3} at step {best_eval_step} \
-         -> checkpoints/{}.best.bin",
-        cfg.ckpt_name
-    );
+    if best_eval_bpb.is_finite() {
+        println!(
+            "done steps={step} best ce={best:.3} | BEST HELD-OUT bpb={best_eval_bpb:.3} at step {best_eval_step} \
+             -> checkpoints/{}.best.bin",
+            cfg.ckpt_name
+        );
+    } else {
+        // No eval ran, so there is no best artifact. Advertising the path and
+        // an infinite score is a wrong number in the log.
+        println!("done steps={step} best ce={best:.3} | no held-out eval ran, so no best checkpoint");
+    }
     Ok(())
 }
 
@@ -1659,10 +1745,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The report's §3.1 routing, asserted against burn's actual param paths
-    /// (field names joined by "."; Vec entries are indices, e.g.
-    /// `expert_ffns.0.gate_up.inner.u`). A typo in a marker silently leaves
-    /// the param on AdamW, so every boundary is pinned here.
+    /// The report's §3.1 routing, asserted on the LIVE model: every boundary
+    /// the string table used to pin is checked here by name, but the group
+    /// comes from the declaration (and the installed groups), never from a
+    /// path match. A path is used only to say WHICH parameter the assertion is
+    /// about - the parameter list itself is pinned by
+    /// `tests/routing_policy.rs` over every arm.
     #[test]
     fn muon_routing_matches_report() {
         let cfg = test_cfg();
@@ -1790,10 +1878,14 @@ mod tests {
         assert_eq!(c.qk, 0);
     }
 
-    /// The validator must fire when routing breaks: a marker that matches
-/// nothing (stale after a rename) and a marker that routes a 1D param into
-/// the Muon+ group. Silent fallback is the failure mode this check exists
-/// to prevent.
+    /// The loud gate must FIRE, not merely exist. The old validator had a
+    /// test like this one - and it tested a string table against itself, which
+    /// is why the dense expert weight could drift while the test stayed green.
+    /// These cases are checked against the `ParamGroup`s the optimizer HOLDS,
+    /// built by hand through `Installed::of` so they lie on purpose. Each lie
+    /// is MINIMAL: it adds exactly one violation on top of the declared group,
+    /// so the error the gate reports is unambiguously about that violation
+    /// rather than about the first parameter it happens to walk past.
     #[test]
     fn routing_gate_detects_a_lying_install() {
         use dormouse_core::routing::Group;
@@ -1846,6 +1938,13 @@ mod tests {
         assert!(err.contains("Some(Muon)"), "the error must name the declared group: {err}");
     }
 
+    /// An installed group that claims nothing is the reachable form of a
+    /// stale marker, and it must be loud (ADR-0019: a rule matching zero
+    /// parameters is a failure, not a degradation). The old table caught this
+    /// with a dead-marker check; with ids there are no markers, so the Q/K
+    /// group is caught per parameter instead - declared `QkHeadWise`, claimed
+    /// by nothing, so the run would quietly train attention Q/K on AdamW.
+    #[test]
     fn an_installed_but_empty_qk_group_is_loud() {
         use dormouse_core::routing::Group;
         use crate::optim::{check_installed, Installed};
@@ -2329,8 +2428,8 @@ mod tests {
     }
 
     /// --factors-fallback drops the expert TSCT factors from the Muon+ group:
-    /// counts must shift from muon to rest, and validation must stay green
-    /// with the effective marker list.
+    /// counts must shift from muon to rest, and the install must stay valid
+    /// (it is checked against the live tree, not against a marker list).
     #[test]
     fn factors_fallback_routing() {
         let cfg = test_cfg();
