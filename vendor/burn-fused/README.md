@@ -2,18 +2,27 @@
 
 Community fused-kernel ecosystem for [Burn](https://burn.dev): one workspace,
 one meta-crate, 100+ technologies in sight. Every kernel is fused (single
-launch), every forward has a fused backward where it matters, and every
-performance claim is backed by a benchmark that CI re-checks on every PR.
+launch) and every forward has a fused backward where it matters.
+
+**Not every performance number in this workspace is a measurement.** Several
+benches read the clock with no device flush inside the timed loop, so they time
+CPU enqueue rather than the kernel; those are retracted in place and named —
+`crates/burn-mhc/README.md` and `crates/burn-gdn2/README.md` carry the list.
+Quoting a speedup from this workspace means checking that its bench flushes.
 
 Not affiliated with the official burn project.
 
 ## Layout
 
 ```
-crates/            28 crates: fused kernels + ops-only technologies (burn-rope, burn-mhc, burn-ttt, ...)
+crates/            20 crates: fused kernels + ops-only technologies (burn-rope, burn-mhc, ...)
 burn-fused/        the meta-crate: `burn-fused = { features = ["cuda"] }`
 benches/           perf harness + regression gate (GPU runner)
 ```
+
+**10 of these 20 are in dormouse's build**, the other 10 are reference ports
+nobody links. The per-crate table — fate, line count, how each crate is (or is
+not) reachable — is `docs/library-crate-fate.md` in the dormouse repository.
 
 ## Quick start
 
@@ -81,7 +90,7 @@ fused timings. Configs are fixed so regressions are comparable run to run.
 - [x] perf-regression coverage for all 10 workspace crates (bench harness + baselines)
 - [x] rope flat-grid kernel (262k -> 8k cubes, 1.6-2.3x faster)
 - [x] msa topk<4: root cause investigated (cubecl kernel-level defect), safe guard kept, documented in `sparse_kernel.rs`
-- [x] port all crates from 0.21 to 0.22 (workspace now has 28 crates)
+- [x] port all crates from 0.21 to 0.22 (workspace now has 20 crates)
 - [ ] flagship `burn-flash-attention`
 - [ ] training example + inference example per family
 - [ ] CI benches on CPU/ROCm/Metal/WebGPU in addition to CUDA

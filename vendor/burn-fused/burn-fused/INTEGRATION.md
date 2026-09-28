@@ -1,6 +1,6 @@
 # Integrating burn-fused
 
-28 fused-kernel and ops crates for [Burn](https://burn.dev) 0.22, one
+20 fused-kernel and ops crates for [Burn](https://burn.dev) 0.22, one
 dependency, one `burn` version, three feature flags. Not affiliated with the
 official burn project; MIT.
 
@@ -33,7 +33,7 @@ use burn_fused::burn_rope::apply_rope_4d;
 
 Every crate in the workspace pins the same `burn` **pre-release**,
 `0.22.0-pre.4`. That is a single choice made in one place — the workspace
-manifest — instead of 28 manifests you would each have to keep in step.
+manifest — instead of 20 manifests you would each have to keep in step.
 
 It also means your own `burn` must resolve to a version compatible with ours.
 Cargo unifies semver-compatible versions, so `burn = "0.22"` is fine when
@@ -66,7 +66,7 @@ The re-exports are unconditional, too: a member is always reachable as
 `burn_fused::burn_<name>`, whatever the flags. The flags control each member's
 *runtime* features (which kernels get compiled), not whether you can name the
 crate. That is deliberate — a re-export behind a `cfg` can rot without anyone
-noticing, and `burn-fused/tests/facade.rs` resolves all 28 of them on every CI
+noticing, and `burn-fused/tests/facade.rs` resolves all 20 of them on every CI
 run.
 
 ## 3. Which backend types work

@@ -1,6 +1,8 @@
 name: fused-library
 
-# The gate for `vendor/burn-fused` — the 28-crate fused-kernel library.
+# The gate for `vendor/burn-fused` — the fused-kernel library (20 crates; was
+# 28 until 2026-09-28, when 8 unreachable crates were deleted — the per-crate
+# fate table is docs/library-crate-fate.md).
 #
 # WHY THIS FILE EXISTS. `vendor/burn-fused` has no `.git` of its own and the
 # root `Cargo.toml` `exclude`s it (its crates are separate cargo workspace
@@ -42,7 +44,7 @@ jobs:
   # belongs to whoever owns that crate, and a job that hides it is the failure
   # mode this rewrite exists to end.
   ndarray-all-crates:
-    name: "fused-lib :: ndarray check+test, all 28 crates (a broken CPU build)"
+    name: "fused-lib :: ndarray check+test, all 20 crates (a broken CPU build)"
     runs-on: ubuntu-latest
     timeout-minutes: 90
     defaults:
@@ -84,7 +86,7 @@ jobs:
         # named 12 (burn-mor missing) for months, and nothing noticed. The
         # script also checks the generated files and builds every combination
         # a user can type; the two common ones run the test suite, which is
-        # what resolves all 28 re-exports.
+        # what resolves all 20 re-exports.
         run: tools/test-feature-matrix.sh
       - name: leaf crates, every combination a README tells users to type
         run: |
