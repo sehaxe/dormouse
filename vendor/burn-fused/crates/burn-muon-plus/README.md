@@ -61,7 +61,24 @@ collapse them to a handful of launches.
 | [4096×4096] step | 22.4 ms | **232 µs** | **96×** |
 | [8192×1024] step | 47.3 ms | **563 µs** | **84×** |
 
+**Both columns are retracted: the bench has no device flush.**
+`step_bench` (`src/fused_kernels.rs:302-312`) times 10 iterations between one
+`Instant::now()` and one `elapsed()` with no `into_scalar`/`into_data` in the
+loop, on either side. 232 µs is the host cost of queueing the launches, and
+22.4 ms is the host cost of queueing ~15 matmuls; the **96× is a ratio of CPU
+dispatch overhead**, not a speedup. `ortho_bench` (`:243`) and `ns_bench`
+(`src/lib.rs:447`) have the same defect, so the "3.6× faster" below is
+unmeasured too. The fix is one line per timed loop (a flush per iteration, as
+`burn-rope/src/rope_cuda.rs:284` does); it is a `src/` change and is not made
+here. Nothing in this crate has a measured kernel speedup until it is.
+
 Also: the Newton-Schulz polynomial is evaluated factored
-(a·x + b·(xx·x) + c·(xx·(xx·x))) for strongly non-square params — measured
+(a·x + b·(xx·x) + c·(xx·(xx·x))) for strongly non-square params — claimed
 3.6× faster on [8192,512] with a lower peak footprint (never materializes
-(XXᵀ)²). All kernels verified == tensor path (<1e-4).
+(XXᵀ)²), which is unmeasured for the reason above.
+
+Numerics: **one** kernel, `norm_colrow`, is checked against the tensor path
+(<1e-4, `src/fused_kernels.rs:216-231`). The step kernel, the NS combine, the
+momentum and the final decay+update have no such comparison, so "all kernels
+verified == tensor path" is not true and is withdrawn here. **No external
+reference exists** for any of them (ADR-0020).

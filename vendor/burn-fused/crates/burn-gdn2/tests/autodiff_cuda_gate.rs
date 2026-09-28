@@ -123,7 +123,27 @@ fn backend_gate_decides_right_for_every_backend_we_run() {
 /// - That the trainer's own graph works: the inputs here are contiguous and the
 ///   graph is flat. The strided-input reproducer is
 ///   `tests/fused_permuted_view.rs`.
+///
+/// # `#[ignore]`d: this is the gate on the fused ADJOINT, and it has never passed
+///
+/// Measured on hardware 2026-09-28 — before `277b442` — it panicked at
+/// `src/autodiff.rs:195`, where the adjoint closure refused, because the gate it
+/// asked was the dead `TypeId` test on the autodiff backend. `277b442` rewrote
+/// that closure so the strip-to-bare / run / rebuild happens where `Inner` is
+/// nameable. **Nothing has been re-measured since, on either this test or
+/// `fused_chunk_verify.rs`, so the refusal may or may not still happen**; what
+/// is certain is that `bwd > 0` below has never been observed. The counter
+/// placement from `f737710` stands: it sits after the gate, so a `bwd == 0`
+/// today is the honest reading and not a counter lying about a refused call.
+///
+/// Un-ignoring this is not a formality: it is the measurement that decides
+/// whether the fused backward is usable, and it must go green before any claim
+/// about fused fwd+bwd or any training arm that relies on it.
+///
+/// Run it on demand:
+/// `cargo test -p burn-gdn2 --release --features cuda,autodiff --test autodiff_cuda_gate -- --ignored --exact fused_kernels_run_from_a_balanced_graph --nocapture`
 #[test]
+#[ignore = "the gate on the fused adjoint, never run green; its old reason (a refusal at autodiff.rs:195 through the dead TypeId gate) was fixed in 277b442 and has not been re-measured, and the gradient comparison has never run on hardware"]
 fn fused_kernels_run_from_a_balanced_graph() {
     let device = Device::cuda(0);
     let (batch, heads, time, k_dim, v_dim) = (2usize, 2usize, 64usize, 32usize, 32usize);

@@ -50,27 +50,73 @@ let out = mhc.forward(h, &[ffn_out]);         // h, ffn_out: [B, T, D]
 `SINKHORN_ITERS=20` Sinkhorn-Knopp is fused into one launch per (batch, time)
 matrix (alternating row/column normalizations, `sync_cube()` between phases).
 
+**The forward row of this table is retracted. It measured kernel enqueue, not
+the kernel.** `sinkhorn_bench` (`src/sinkhorn_cuda.rs:253-281`) reads the clock
+at line 266 with no device read inside the timed loop; the only
+`into_scalar()` in that function's neighbourhood is at line 463, in the
+*backward* bench. What the 1.65 µs / 2.55 µs are is the host-side cost of
+queuing the launch. The tensor-path loop at lines 267-275 has the same defect,
+so the 32.4 ms / 104.7 ms are enqueue too and the **19,600× / 41,000× ratio is
+a ratio of CPU dispatch overhead, not a speedup**: 4.2 M elements × 40
+normalization phases cannot execute in 1.65 µs on any GPU.
+
+**mhc is not the only bench in this library with a clock read and no flush, and
+that is now a library-wide item.** rope (`rope_cuda.rs:284`), bitnet
+(`fwt_cuda.rs:548`), situ (`fused_situ.rs:353`) and attnres
+(`fused_attnres.rs:1050`) all flush inside the timed loop. These do not:
+`burn-gdn2/tests/bench_cuda.rs:34-44` and `bench_train_cuda.rs:18-24` (the
+shared `time_it` helper behind every number in burn-gdn2's performance tables),
+`burn-muon-plus/src/lib.rs:447` (`ns_bench`), `fused_kernels.rs:243`
+(`ortho_bench`) and `:302` (`step_bench`), and this file. Every speedup those
+print is a ratio of CPU dispatch overhead until a flush is added.
+
 | Op | Config | Tensor path | Fused | Speedup |
 |----|--------|-------------|-------|---------|
-| forward | [8, 2048, 16] | 32.4 ms | **1.65 µs** | **19,600×** |
-| forward | [4, 1024, 64] | 104.7 ms | **2.55 µs** | **41,000×** |
+| forward | [8, 2048, 16] | ~~32.4 ms~~ enqueue only | ~~1.65 µs~~ enqueue only | **RETRACTED** |
+| forward | [4, 1024, 64] | ~~104.7 ms~~ enqueue only | ~~2.55 µs~~ enqueue only | **RETRACTED** |
 | backward | [8, 2048, 16] | 67.1 ms | **17.7 ms** | **4×** |
 
-Verified == tensor path and doubly stochastic (<1e-2); the fused backward
-reverses the 2·iters normalizations with per-step sums kept in shared memory.
+**A real forward number is recoverable and has not been measured.** The fix is
+one line in the timed loop — `let _: f32 = k.clone().sum().into_scalar();` after
+each `sinkhorn_cuda` call, mirroring `bench_fused_bwd.rs` in burn-gdn2 — and
+the same flush inside the tensor loop, after which the ratio is meaningful. It
+is a `src/` change and is not made here; until someone makes it, this crate has
+no measured forward speedup.
+
+The backward row is the only kernel-time measurement in the crate: it flushes
+at `sinkhorn_cuda.rs:463` after the loop and amortizes over 20 calls, so
+17.7 ms includes the kernels' execution. It still carries no date or commit
+(ADR-0020 rule 1) and predates the retractions above.
+
+Numerics: the fused forward matches the tensor path and is doubly stochastic
+to <1e-2 (`sinkhorn_cuda.rs:224-249`); the fused backward matches the
+tensor-path backward to <1e-3 (`sinkhorn_cuda.rs:480-503`) and the analytic
+gradient matches central finite differences to 2e-2
+(`sinkhorn_cuda.rs:520-573`). **No external reference exists** — all three
+compare this crate against its own tensor path, which is a self-consistency
+check, not a verification against anything published (ADR-0020).
 
 ## Training
 
 The fused Sinkhorn runs as a single tracked node under `Autodiff<Cuda>`; the
 backward is a fused kernel that recomputes the forward trajectory's per-step
 row/col sums in shared memory and reverses the 2·iters normalizations
-(`d_m_pre = d/s − m_pre·Σd/s²`). Verified fused backward == tensor-path
-backward (<1e-3). Training and inference both use the fused kernels.
+(`d_m_pre = d/s − m_pre·Σd/s²`). The fused backward matches the tensor-path
+backward to <1e-3 (`sinkhorn_cuda.rs:480-503`); that is a self-comparison, and
+**no external reference exists**. Training and inference both use the fused
+kernels: the node strips to bare and gates on `TypeId` of the *inner* backend
+(`sinkhorn_cuda.rs:349-360`), the pattern burn-gdn2's adjoint only learned at
+`277b442`. That gate is on the **bare** `CubeBackend`, so under burn's default
+`Cuda` (which is `Fusion<CubeBackend>`-wrapped) the fused node does not engage
+and `sinkhorn_knopp` falls back to the tensor loop — **silently**, with no
+counter (a COUNTED-or-LOUD item, ADR-0011, still open in this crate).
 
 ## Inference
 
-Forward-only builds use the bare CUDA fused Sinkhorn directly (2 µs per
-(b, t) matrix — the tensor path was 32-105 ms).
+Forward-only builds use the bare CUDA fused Sinkhorn directly. **This crate has
+no measured forward speedup** — see the retraction above; the "2 µs per (b, t)
+matrix against a 32-105 ms tensor path" sentence that used to stand here was
+enqueue time on both sides.
 
 ## License
 

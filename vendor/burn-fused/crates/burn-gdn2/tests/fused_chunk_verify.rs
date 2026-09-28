@@ -9,6 +9,11 @@ use burn::tensor::{Device, Distribution, Tensor};
 use burn_gdn2::kernel::chunk_cube::cuda::fused_chunk_forward;
 use burn_gdn2::{chunk_wy_forward, CudaBare};
 
+/// Relative (to the largest magnitude in the tensor) bound for a fused-vs-tensor
+/// gradient comparison. See the note at its only use: this is a BAR chosen to
+/// be tight, not a value anybody has measured the fused adjoint against.
+const GRAD_REL_TOL: f32 = 1e-2;
+
 fn max_rel(a: &Tensor<4>, b: &Tensor<4>) -> f32 {
     let a = a.clone().into_data();
     let b = b.clone().into_data();
@@ -129,7 +134,34 @@ fn fused_chunk_matches_tensor_path() {
 
 /// The fused-op backward with the kernel-exported M^-1 must match the
 /// tensor-path gradients on CUDA (within fp32 noise from the kernel).
+///
+/// # `#[ignore]`d: this gate has never run green, and its old reason is stale
+///
+/// The reason this test was ignored, 2026-09-28, was a real measurement: it
+/// panicked inside `ChunkWy::backward` (`src/autodiff.rs`) because the fused
+/// forward engaged and the adjoint closure refused at `strip(k)`. `277b442`
+/// then rewrote that closure — the strip-to-bare / run / rebuild now happens
+/// where `Inner` is nameable, so the `TypeId` gate is asked about the right
+/// backend and is no longer dead. **No CUDA test has been run since, so whether
+/// the refusal is gone is unmeasured.** This `#[ignore]` therefore no longer
+/// names a known bug; it records that nobody has looked. A trainer's eval line
+/// reads `fused kda=2086/0` (2026-09-28): 2086 forward dispatches, zero
+/// adjoints.
+///
+/// What was never true of this test, and is the reason its numbers must not be
+/// quoted: while the adjoint gate was dead, the "fused-op backward" it compared
+/// was the TENSOR adjoint, twice. The tolerance it asserted has therefore never
+/// been exercised against the fused kernels — see `GRAD_REL_TOL`.
+///
+/// The fused adjoint also cannot be checked anywhere else: it is
+/// `#[cfg(feature = "cuda")]` and gated on the bare `CubeBackend`, so there is
+/// no CPU device on which these kernels run at all. This test, or
+/// `autodiff_cuda_gate.rs`, is the only place the question can be asked.
+///
+/// Run it on demand:
+/// `cargo test -p burn-gdn2 --release --features cuda,autodiff --test fused_chunk_verify -- --ignored --nocapture`
 #[test]
+#[ignore = "the gate on the fused adjoint's numerics, never run green; its old reason (a refusal at strip(k)) was fixed in 277b442 and has not been re-measured on hardware"]
 fn fused_op_grads_match_tensor_path_cuda() {
     use burn::tensor::Device as D;
     let plain: D = Default::default();
@@ -198,11 +230,27 @@ fn fused_op_grads_match_tensor_path_cuda() {
         }
         let rel = max_abs / scale_v.max(1e-30);
         println!("{name}: grads rel={rel:.2e}");
-        // k's chunk-boundary rows divide by E≈glast (~1e-3 here), which
-        // amplifies fp32 path noise to a few percent (data-dependent);
-        // everything else is 1e-3 or better.
-        let tol = if name == "k" { 1e-1 } else { 1e-2 };
-        assert!(rel < tol, "{name}: grads mismatch rel={rel:.2e}");
+        // One bar for every input, 1e-2 relative to the largest magnitude in
+        // the tensor. This used to be `if name == "k" { 1e-1 } else { 1e-2 }`,
+        // with a comment claiming k's chunk-boundary rows divide by
+        // E≈glast (~1e-3) and "amplify fp32 path noise to a few percent".
+        //
+        // That claim is not a measurement. The tolerance was never exercised
+        // against the fused adjoint: the test is `#[ignore]`d, and until
+        // `277b442` the "fused" side was the tensor adjoint too, so any `rel`
+        // it printed was tensor-vs-tensor. A 10% allowance on one of seven
+        // gradients is a green light for a wrong adjoint, and it was the
+        // largest number in the file.
+        //
+        // 1e-2 is therefore a BAR, not a known-achievable value: it is what
+        // the other six inputs were already held to, and a first run that
+        // fails it is information, not a reason to widen. If k's gradient
+        // turns out to be ill-conditioned through the `k·glast/kgd`
+        // reconstruction, fix the conditioning. Whoever runs this first:
+        // paste the seven printed `rel` values into the commit message — they
+        // are the deliverable, and until they exist nobody knows whether the
+        // fused adjoint is right, only that it has never been asked.
+        assert!(rel < GRAD_REL_TOL, "{name}: grads mismatch rel={rel:.2e}");
     }
 }
 

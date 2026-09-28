@@ -55,8 +55,11 @@ let model = GatedDeltaNet2::<B>::new(&cfg, &device);
 let x = Tensor::<B, 3>::random([1, 1024, 256], Distribution::Normal(0.0, 1.0), &device);
 let output = model.forward_train(x);
 
-// Training with the fused autodiff op (one graph node, exact backward,
-// ~3-5x faster end-to-end on CUDA; requires `Autodiff<B>` with the `autodiff` feature).
+// Training with the fused autodiff op (one graph node, exact backward;
+// requires `Autodiff<B>` with the `autodiff` feature). The "~3-5x faster
+// end-to-end on CUDA" this comment used to carry is WITHDRAWN: no fused
+// fwd+bwd time has been measured on a quiet GPU since the adjoint gate was
+// fixed in 277b442, and any earlier one may have measured the tensor path.
 let output = model.forward_train_fused(x);
 
 // Inference - prefill, then decode token-by-token with persistent state.
@@ -68,8 +71,11 @@ let next = model.forward(token, &mut state, true);     // decode
 
 `Gdn2State` carries both the recurrent matrix state `S [B, HV, K, V]` and the
 short-convolution caches. This is what makes token-by-token decoding **exactly
-equivalent** to one forward pass over the full sequence (verified bit-exact by
-`tests/autodiff.rs`).
+equivalent** to one forward pass over the full sequence — checked by
+`tests/autodiff.rs::prefill_then_decode_matches_extended_forward` (<1e-6) and
+`::decode_equals_full_forward`. Both are **self-consistency checks against our
+own prefill path; no external reference exists**, and neither says "bit-exact"
+without a byte-level fixture to back it (ADR-0020).
 
 ## Architecture
 
@@ -111,8 +117,10 @@ kernels** instead of the per-chunk tensor-op loop:
 
 Dispatch is gated on `burn_gdn2::CudaBare` (the bare `CubeBackend`, exported
 for convenience); every other backend transparently falls back to the tensor
-path. The fused path is numerically verified against the tensor path
-(`fused_kernel_matches_tensor_path` in `tests/bench_cuda.rs`).
+path. The **forward** is checked against the tensor path to 1e-3
+(`fused_kernel_matches_tensor_path` in `tests/bench_cuda.rs`); that is a
+self-comparison and **no external reference exists** for the kernels
+themselves. The backward is a separate story, below.
 
 ## Configuration
 
@@ -189,6 +197,16 @@ module adds ~0.7 ms of projection/launch overhead at the smallest config.)
 | d=1024, T=2048 | ~1.0 ms | 402.9 ms | **~400×** |
 | d=2048, T=4096 | ~1.0 ms | 804.7 ms | **~800×** |
 
+**The `burn-gdn2 module` column measured enqueue, not the kernel.** Every row
+comes from the `time_it` helper at `tests/bench_cuda.rs:34-44`, which times
+`runs` iterations between one `Instant::now()` and one `elapsed()` with **no
+device read inside the loop** — the same defect as burn-mhc's retracted
+`19,600×`. A 58× to 800× ratio here is a ratio of CPU dispatch overhead until a
+flush is added (`let _ = r.into_scalar();` per iteration, as
+`fused_attnres.rs:1050` does). `bench_train_cuda.rs:18-24` has the same helper
+with not even a warmup. The PyTorch column may be sound; the comparison is
+not, because only one side was measured. Fix and re-measure before quoting.
+
 ### Training (forward + backward)
 
 | Config | burn-gdn2 fused op | PyTorch chunked + autograd | vs PyTorch |
@@ -198,25 +216,59 @@ module adds ~0.7 ms of projection/launch overhead at the smallest config.)
 | d=1024, T=2048 | 45.4 ms | 2188.5 ms | **48×** |
 | d=2048, T=4096 | 141.7 ms | 4236.8 ms | **30×** |
 
+**The `burn-gdn2 fused op` column measured enqueue, not the kernel, and
+predates `277b442`.** `time_it` (`tests/bench_train_cuda.rs:18-24`) has no
+device read inside its timed loop, so these are host dispatch times. On top of
+that the column carries no date and no commit, and the fused adjoint's `TypeId`
+gate was dead throughout 2026-09-28, so a fused-fwd+bwd time taken before
+`277b442` may be the tensor path's time, labelled fused. Re-measure with
+`bench_train_cuda` on a quiet GPU, after adding a flush, before quoting any of
+it (ADR-0020 rule 1: a measurement is a measurement only with the config, the
+date and the commit).
+
 The training path never re-runs the forward: the intra kernel exports
 `M⁻¹ = (I+L)⁻¹`, `aqk`, `qE` and the decay factors (one extra buffer write),
 the op rebuilds the backward scratch from them (`E = k·glast/kgd`), and the
 backward recomputes only ~8 cheap ops per chunk (`W = M⁻¹·rhs` etc.). The
 per-chunk row-by-row inversion and the full-forward recompute are both gone
-(gradients verified against the tensor path on CUDA,
-`tests/fused_chunk_verify.rs`). Memory per training step: the op holds 4
-small tensors per chunk (vs 11 before) and checkpoints 5 inputs instead of 7
-(`q`/`g` are recoverable as `qE`/`E` from the scratch) — roughly **half the
-activation memory** at d=2048, T=4096 (~330 MB vs ~565 MB).
+(**the fused kernel adjoint is NOT verified — see below**). Memory per training
+step: the op holds 4 small tensors per chunk (vs 11 before) and checkpoints 5
+inputs instead of 7 (`q`/`g` are recoverable as `qE`/`E` from the scratch) —
+roughly **half the activation memory** at d=2048, T=4096 (~330 MB vs ~565 MB).
+
+**The fused adjoint's numerics have never been checked on hardware.** The
+gradient comparison lives in `tests/fused_chunk_verify.rs::fused_op_grads_match_tensor_path_cuda`
+and it is `#[ignore]`d. Until `277b442` it also could not have checked anything:
+the "fused" side fell back to the tensor adjoint through a dead `TypeId` gate,
+so it compared the tensor path against itself. `277b442` moved the strip-and-run
+into a closure where the inner backend is nameable and fixed that gate, and no
+CUDA test has been run since — a trainer's eval line reads `fused kda=2086/0`
+(2026-09-28), 2086 forward dispatches and zero adjoints. Run the gate:
+
+```bash
+cargo test -p burn-gdn2 --release --features cuda,autodiff --test fused_chunk_verify -- --ignored --nocapture
+```
+
+What *is* established, on CPU, in `tests/autodiff_chunk.rs`: the op's
+**hand-written matrix-level adjoint** matches burn's own autodiff of the tensor
+path to 1e-3 and matches central finite differences. That is a real check of
+the adjoint *algorithm*. It says nothing about the fused CUDA *kernels*
+implementing it — those are `#[cfg(feature = "cuda")]` and gated on the bare
+`CubeBackend`, so there is no CPU device on which they can run at all.
 
 How this is achieved:
 
 - **Forward**: the two fused chunk kernels (`src/kernel/chunk_cube.rs`)
   collapse each chunk into two launches instead of ~150 tensor ops, and are
   wired into the module (`Chunk` mode, `CudaBare`) and into the fused op.
-  Kahan-compensated decay cumsum keeps them within ~1e-4 of the tensor path
-  (which itself carries more noise; the kernels were verified against an
-  exact reference at ~1e-7, `tests/fused_chunk_verify.rs`).
+  Kahan-compensated decay cumsum keeps them within 1e-3 of the tensor path
+  (`tests/fused_chunk_verify.rs::fused_chunk_matches_tensor_path`, which runs
+  under `--features cuda`). The **~1e-7 figure is not about the kernels**: the
+  1000-case comparison against an independent transcription of
+  NVlabs/GatedDeltaNet-2 `lit_gpt/gdn2.py` (`tests/bit_exact.rs`, `EPSILON =
+  5e-4`, committed fixture `tests/ref_data.bin`, regenerated by
+  `tests/gen_reference.py`) runs on **NdArray** and therefore covers the tensor
+  paths, not the CUDA kernels. `bit_exact.rs` states this itself.
 - **Backward**: the whole chunked WY recurrence is **one autodiff node**
   (`GatedDeltaNet2::forward_train_fused`, `src/autodiff.rs`) with an exact
   matrix-level adjoint. The WY solve factorizes through `M⁻¹` (computed once
@@ -227,7 +279,8 @@ How this is achieved:
   node per tensor op (~16k graph nodes for a 2048-token forward), each with
   node allocation, checkpoint bookkeeping and a separate launch; the fused op
   removes all of that. On `Autodiff<CudaBare>` this is worth ~5-10× end-to-end
-  over the tensor path alone.
+  over the tensor path alone — an unmeasured figure with no date and no commit,
+  taken while the fused adjoint's gate was dead; see the retraction above.
 
 Run it yourself:
 
@@ -258,11 +311,17 @@ Notes:
 
 ```bash
 cargo test -p burn-gdn2                                   # unit + autodiff + decode
-cargo test -p burn-gdn2 --features autodiff --test autodiff_chunk  # fused op grads == tensor path + finite differences
+cargo test -p burn-gdn2 --features autodiff --test autodiff_chunk  # hand-written op adjoint == tensor path + finite differences (CPU)
 cargo test -p burn-gdn2 --features binary-tests           # 1000-case vs an independent transcription (NOT bit-for-bit)
-cargo test -p burn-gdn2 --features "cuda,autodiff" --test fused_chunk_verify  # kernels vs tensor path, CUDA grads
+cargo test -p burn-gdn2 --features "cuda,autodiff" --test fused_chunk_verify  # FORWARD kernels vs tensor path only
+cargo test -p burn-gdn2 --release --features "cuda,autodiff" --test fused_chunk_verify -- --ignored  # the fused adjoint gate, never run green
+cargo test -p burn-gdn2 --release --features "cuda,autodiff" --test autodiff_cuda_gate -- --ignored      # same gate, through a balanced graph
 python3 tests/gen_reference.py                            # regenerate tests/ref_data.bin
 ```
+
+The two `#[ignore]`d CUDA gates are the only tests that would compare the fused
+adjoint against the tensor path, and neither has ever passed. Everything a
+plain `cargo test` covers about gradients is the hand-written adjoint on CPU.
 
 ### API
 
@@ -302,6 +361,9 @@ the forward. Attention-core kernels (fwd+bwd, RTX 5060 Ti, chunk 16):
 | d=2048, T=4096 | 1.34 ms | 4.6 ms | ~284 ms |
 | d=4096, T=8192 | 0.32 ms | 8.2 ms | ~733 ms |
 
-`tests/fused_chunk_verify.rs` checks the fused-op gradients against the tensor
-path within fp32 noise (k's chunk-boundary /E amplification is allowed up to
-10%).
+**The fused-op gradient check in `tests/fused_chunk_verify.rs` has never run.**
+The test is `#[ignore]`d, and before `277b442` it compared the tensor adjoint
+against itself. Its former `k`-gradient allowance of 10% was an unmeasured
+hypothesis, not an observation; it has been replaced by one uniform 1e-2 bar so
+the first real run produces a number instead of an excuse. Nothing in this
+section is evidence about the fused adjoint until that run happens.
