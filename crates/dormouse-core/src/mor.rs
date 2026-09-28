@@ -205,32 +205,3 @@ mod tests {
         assert_ne!(&got2[0..4], &got2[4..8], "distinct rows must not share a label");
     }
 }
-
-#[cfg(test)]
-mod scratch {
-    use super::*;
-    #[test]
-    fn shapes() {
-        let dev = burn::tensor::Device::default();
-        let scores = Tensor::<3>::from_data(
-            burn::tensor::TensorData::new(vec![5.0f32, 1.0, 4.0, 2.0, 0.0, 9.0, 1.0, 8.0], [1, 2, 4]),
-            &dev,
-        );
-        let [b, t, n] = scores.dims();
-        let k = 2usize;
-        let idx = burn_mor::topk_indices(scores.clone().reshape([b * t, n]), k, 1);
-        println!("idx dims {:?} vals {:?}", idx.dims(), idx.clone().into_data().try_to_vec::<i32>().unwrap_or_default());
-        let ar = Tensor::<1, Int>::arange(0..n as i64, &dev).reshape([1, 1, 1, n]);
-        println!("ar dims {:?}", ar.dims());
-        let e = idx.reshape([b * t, k, 1]).unsqueeze_dim::<4>(3);
-        println!("e dims {:?}", e.dims());
-        let eq = e.equal(ar);
-        println!("eq dims {:?}", eq.dims());
-        let m4 = Tensor::<4>::zeros([b * t, k, 1, n], &dev).mask_fill(eq, 1.0);
-        println!("m4 dims {:?} vals {:?}", m4.dims(), m4.clone().into_data().try_to_vec::<f32>().unwrap_or_default());
-        let s2 = m4.clone().sum_dim(2);
-        println!("sum_dim(2) dims {:?} vals {:?}", s2.dims(), s2.clone().into_data().try_to_vec::<f32>().unwrap_or_default());
-        let s1 = m4.sum_dim(1);
-        println!("sum_dim(1) dims {:?} vals {:?}", s1.dims(), s1.clone().into_data().try_to_vec::<f32>().unwrap_or_default());
-    }
-}
