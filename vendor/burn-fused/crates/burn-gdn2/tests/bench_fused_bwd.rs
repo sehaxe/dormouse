@@ -1,5 +1,25 @@
 #![cfg(all(feature = "cuda", feature = "autodiff"))]
 //! Fused-backward attention-core bench (chunk 16): op train vs plain autodiff.
+//!
+//! # Read the seam line before quoting a number from here
+//!
+//! This bench times the CUSTOM NODE's forward and its `tt - tf` difference, so
+//! what it prices is a backward that a real training step may never take:
+//! `chunk_wy_forward_autodiff_s` DECLINES whenever no input is a
+//! `require_grad` leaf, which is the case for every input the trainer produces
+//! (`KdaModule::project` output is a `GradInBackward` intermediate), and then
+//! `chunk_dispatch` takes the ops path and burn builds the graph itself. The
+//! bench feeds `.require_grad()` leaves, so the node is built and the numbers
+//! are real for THAT arm.
+//!
+//! Worse, and measured: that arm is not a correct gradient. On hardware
+//! 2026-09-28 the fused adjoint agrees with the ops path to ~3e-7 for q, v, b,
+//! w and the state at any length, and to 2.4e-7 for k at ONE chunk - and from
+//! two chunks on its `d_k` is off by 1.8e-1..2.8e-1 and its `d_g` by
+//! 1.7e-2..3.2e-2 (table in `tests/autodiff_cuda_gate.rs`). **A speed number
+//! for a wrong gradient is not a speed number.** The bench now prints the seam
+//! counters on every shape so a reader can see which arm it timed, and the
+//! `#[ignore]` reason says the rest.
 
 use burn::tensor::{Distribution, Tensor};
 use burn_gdn2::CudaBare;
@@ -13,7 +33,7 @@ fn time_it(runs: usize, mut f: impl FnMut()) -> f64 {
 }
 
 #[test]
-#[ignore]
+#[ignore = "prices the custom node's backward, which the trainer never takes (chunk_wy_forward_autodiff_s declines on every real input) AND whose d_k/d_g are wrong past one chunk; kept because it is the only instrument for the raw-kernel cost"]
 fn bench_fused_bwd() {
     let dev: burn::tensor::Device = Default::default();
     let ad_dev = burn::tensor::Device::autodiff(dev.clone());
@@ -51,6 +71,7 @@ fn bench_fused_bwd() {
         let gs = loss.backward();
         let _ = gs;
         let runs = if t <= 2048 { 5 } else { 3 };
+        burn_gdn2::reset_fused_calls();
         let tf = time_it(runs, || {
             let (o2, _) = burn_gdn2::chunk_wy_forward_autodiff::<CudaBare>(
                 q.clone(),
@@ -83,11 +104,15 @@ fn bench_fused_bwd() {
             let g2 = l.backward();
             let _ = g2;
         });
+        let counts = burn_gdn2::seam_counts();
         println!(
-            "d={d} h={h} hk={hk} T={t}: fwd {:.3} ms  train {:.3} ms  bwd {:.3} ms",
+            "d={d} h={h} hk={hk} T={t}: fwd {:.3} ms  train {:.3} ms  bwd {:.3} ms  \
+             [seam asked={} fused_fwd={} fused_bwd={} declined={} ops_path={} custom_node_bwd={} \
+             - this is the CUSTOM NODE, not the trainer's arm]",
             tf * 1e3,
             tt * 1e3,
-            (tt - tf) * 1e3
+            (tt - tf) * 1e3,
+            counts.0, counts.1, counts.2, counts.3, counts.4, counts.5
         );
         // raw kernels: fused_chunk_forward_scratch + fused_chunk_backward
         {
