@@ -20,11 +20,69 @@ use {
     burn::backend::{Backend, DispatchKindConversion},
     burn::tensor::DispatchTensor,
     burn_autodiff::checkpoint::base::Checkpointer,
-    burn_autodiff::checkpoint::strategy::NoCheckpointing,
+    burn_autodiff::checkpoint::strategy::{CheckpointStrategy, NoCheckpointing},
     burn_autodiff::grads::Gradients,
     burn_autodiff::ops::{Backward, Ops, OpsKind},
     burn_autodiff::Autodiff,
 };
+
+// ---- seam counters (ADR-0019: "if you add an arm, add its counter") ----
+//
+// ENTRY is the one that matters. It is incremented AFTER the strategy
+// downcast succeeded, i.e. AFTER the gate that used to be hardcoded to
+// `NoCheckpointing`, so it answers "did a caller on a non-default
+// checkpointing strategy get past the seam?" — a number that is 0 forever if
+// the hardcode is still there. FWD/BWD count actual kernel launches.
+#[cfg(feature = "autodiff")]
+static ENTRY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(all(feature = "autodiff", feature = "cuda"))]
+static FWD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(all(feature = "autodiff", feature = "cuda"))]
+static BWD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(entry, fused_forward, fused_backward)` since [`reset_seam_counts`].
+/// `None` when the `autodiff` feature is off: there is no seam to count then.
+pub fn seam_counts() -> Option<(u64, u64, u64)> {
+    #[cfg(feature = "autodiff")]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        #[cfg(feature = "cuda")]
+        return Some((ENTRY.load(Relaxed), FWD.load(Relaxed), BWD.load(Relaxed)));
+        #[cfg(not(feature = "cuda"))]
+        return Some((ENTRY.load(Relaxed), 0, 0));
+    }
+    #[cfg(not(feature = "autodiff"))]
+    None
+}
+
+/// Zero the seam counters.
+pub fn reset_seam_counts() {
+    #[cfg(feature = "autodiff")]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        ENTRY.store(0, Relaxed);
+        #[cfg(feature = "cuda")]
+        {
+            FWD.store(0, Relaxed);
+            BWD.store(0, Relaxed);
+        }
+    }
+}
+
+#[cfg(feature = "autodiff")]
+fn note_entry_reached() {
+    ENTRY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(feature = "cuda")]
+fn note_fused_forward() {
+    FWD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(feature = "cuda")]
+fn note_fused_backward() {
+    BWD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// Fused zero-pad + Fast Walsh-Hadamard Transform: reads `[n, d]`, zero-pads
 /// each row to `p` inside shared memory, runs the butterfly on the padded
@@ -340,8 +398,19 @@ mod ad {
             let d_out = Tensor::from_primitive::<B>(grads.consume::<B>(&ops.node));
             #[cfg(feature = "cuda")]
             {
+                // NOT the gdn2 bug. `B` here is the *inner* backend, not the
+                // autodiff one: `OpsPrep::finish` takes `FloatTensor<B>` and
+                // returns `AutodiffTensor<B>`, and the result is handed to
+                // `Tensor::from_primitive::<Autodiff<Inner, S>>`, so the
+                // compiler pins `B = Inner`. (Typing this impl
+                // `B: AutodiffBackend` instead fails with "required for
+                // `FwtOp` to implement `Backward<Inner, 1>`" — that error IS
+                // the proof.) The test therefore asks the right question; what
+                // was dead was the ENTRY above, which could only build the
+                // node on `NoCheckpointing`.
                 if std::any::TypeId::of::<B>() == std::any::TypeId::of::<CudaBare>() {
                     if let Some(dx) = super::fwt_backward_cuda(&d_out, p) {
+                        note_fused_backward();
                         grads.register::<B>(
                             ops.parents[0].clone().unwrap().id,
                             dx.try_into_primitive::<B>().unwrap(),
@@ -381,18 +450,33 @@ mod ad {
         }
     }
 
-    /// Fused FWT with exact backward on `Autodiff<Inner>`.
-    pub fn fwt_autodiff<Inner: Backend>(x: Tensor<2>, p: usize) -> Option<Tensor<2>>
+    /// Fused FWT with exact backward on `Autodiff<Inner, S>`, for ANY
+    /// checkpointing strategy.
+    ///
+    /// The `_s` suffix is the same one gdn2 uses, and for the same reason: the
+    /// un-suffixed spelling below says `Autodiff<Inner>`, which is
+    /// `Autodiff<Inner, NoCheckpointing>` because that is `Autodiff`'s default
+    /// type parameter. The strategy is not a type the caller can elide past —
+    /// `try_into_primitive` compares the whole backend type — so a
+    /// `NoCheckpointing`-only entry returns `None` on dormouse's
+    /// `Autodiff<CudaBare, BalancedCheckpointing>` and the tensor path runs
+    /// instead, SILENTLY and CORRECTLY.
+    pub fn fwt_autodiff_s<Inner: Backend, S: CheckpointStrategy>(
+        x: Tensor<2>,
+        p: usize,
+    ) -> Option<Tensor<2>>
     where
-        DispatchTensor: DispatchKindConversion<Autodiff<Inner>> + DispatchKindConversion<Inner>,
+        DispatchTensor: DispatchKindConversion<Autodiff<Inner, S>> + DispatchKindConversion<Inner>,
     {
-        let xa = x.try_into_primitive::<Autodiff<Inner>>().ok()?;
+        let xa = x.try_into_primitive::<Autodiff<Inner, S>>().ok()?;
+        note_entry_reached();
         let x_t = Tensor::from_primitive::<Inner>(xa.primitive().clone());
         let out_t = {
             #[cfg(feature = "cuda")]
             {
                 if std::any::TypeId::of::<Inner>() == std::any::TypeId::of::<CudaBare>() {
                     if let Some(o) = super::fwt_cuda(&x_t, p) {
+                        note_fused_forward();
                         o
                     } else {
                         crate::fast_walsh_hadamard_tensor::<Inner>(x_t, p)
@@ -408,26 +492,40 @@ mod ad {
         };
         let out_prim = out_t.try_into_primitive::<Inner>().unwrap();
         let nodes = [xa.node()];
-        let prep = FwtOp.prepare::<NoCheckpointing>(nodes);
+        let prep = FwtOp.prepare::<S>(nodes);
         let out_adt = match prep.compute_bound().stateful() {
             OpsKind::Tracked(prep) => prep.finish(p, out_prim),
             OpsKind::UnTracked(prep) => prep.finish(out_prim),
         };
-        Some(Tensor::from_primitive::<Autodiff<Inner>>(out_adt))
+        Some(Tensor::from_primitive::<Autodiff<Inner, S>>(out_adt))
     }
 
-    /// Fused quantize (straight-through backward) on `Autodiff<Inner>`.
-    pub fn quant_autodiff<Inner: Backend>(x: Tensor<2>, bits: usize) -> Option<Tensor<2>>
+    /// [`fwt_autodiff_s`] on the default (no-checkpointing) strategy. Kept so
+    /// existing callers keep compiling; it is NOT the strategy dormouse runs.
+    pub fn fwt_autodiff<Inner: Backend>(x: Tensor<2>, p: usize) -> Option<Tensor<2>>
     where
         DispatchTensor: DispatchKindConversion<Autodiff<Inner>> + DispatchKindConversion<Inner>,
     {
-        let xa = x.try_into_primitive::<Autodiff<Inner>>().ok()?;
+        fwt_autodiff_s::<Inner, NoCheckpointing>(x, p)
+    }
+
+    /// Fused quantize (straight-through backward) on `Autodiff<Inner, S>`.
+    pub fn quant_autodiff_s<Inner: Backend, S: CheckpointStrategy>(
+        x: Tensor<2>,
+        bits: usize,
+    ) -> Option<Tensor<2>>
+    where
+        DispatchTensor: DispatchKindConversion<Autodiff<Inner, S>> + DispatchKindConversion<Inner>,
+    {
+        let xa = x.try_into_primitive::<Autodiff<Inner, S>>().ok()?;
+        note_entry_reached();
         let x_t = Tensor::from_primitive::<Inner>(xa.primitive().clone());
         let out_t = {
             #[cfg(feature = "cuda")]
             {
                 if std::any::TypeId::of::<Inner>() == std::any::TypeId::of::<CudaBare>() {
                     if let Some(o) = super::quant_cuda(&x_t, bits) {
+                        note_fused_forward();
                         o
                     } else {
                         crate::quantize_tensor::<Inner>(x_t, bits)
@@ -443,17 +541,94 @@ mod ad {
         };
         let out_prim = out_t.try_into_primitive::<Inner>().unwrap();
         let nodes = [xa.node()];
-        let prep = QuantOp.prepare::<NoCheckpointing>(nodes);
+        let prep = QuantOp.prepare::<S>(nodes);
         let out_adt = match prep.compute_bound().stateful() {
             OpsKind::Tracked(prep) => prep.finish((), out_prim),
             OpsKind::UnTracked(prep) => prep.finish(out_prim),
         };
-        Some(Tensor::from_primitive::<Autodiff<Inner>>(out_adt))
+        Some(Tensor::from_primitive::<Autodiff<Inner, S>>(out_adt))
+    }
+
+    /// [`quant_autodiff_s`] on the default (no-checkpointing) strategy.
+    pub fn quant_autodiff<Inner: Backend>(x: Tensor<2>, bits: usize) -> Option<Tensor<2>>
+    where
+        DispatchTensor: DispatchKindConversion<Autodiff<Inner>> + DispatchKindConversion<Inner>,
+    {
+        quant_autodiff_s::<Inner, NoCheckpointing>(x, bits)
     }
 }
 
 #[cfg(feature = "autodiff")]
-pub use ad::{fwt_autodiff, quant_autodiff};
+pub use ad::{fwt_autodiff, fwt_autodiff_s, quant_autodiff, quant_autodiff_s};
+
+#[cfg(all(test, feature = "autodiff"))]
+mod seam_tests {
+    //! The proof that the strategy gate is strategy-AGNOSTIC, and it runs on
+    //! CPU. No GPU, no kernel: it asserts that a caller on
+    //! `Autodiff<Inner, BalancedCheckpointing>` — dormouse's backend — gets
+    //! PAST the seam downcast, and that the old `NoCheckpointing`-only
+    //! spelling does not. Revert `fwt_autodiff_s` to `Autodiff<Inner>` and the
+    //! first assertion goes red: it is the assertion, not the comment.
+    use super::*;
+    use burn::backend::DispatchKindConversion;
+    use burn::tensor::Device;
+    use burn_autodiff::Autodiff as Ad;
+    use burn_autodiff::checkpoint::strategy::{
+        BalancedCheckpointing, CheckpointStrategy, NoCheckpointing,
+    };
+
+    type Nd = burn_ndarray::NdArray;
+
+    #[test]
+    fn balanced_checkpointing_reaches_the_seam_and_the_legacy_entry_does_not() {
+        fn reach<S: CheckpointStrategy>(x: &Tensor<2>) -> Option<Tensor<2>>
+        where
+            DispatchTensor: DispatchKindConversion<Ad<Nd, S>> + DispatchKindConversion<Nd>,
+        {
+            fwt_autodiff_s::<Nd, S>(x.clone(), 16)
+        }
+
+        // dormouse's own backend, on the CPU inner backend so the test needs no
+        // device. The strategy is the only variable under test.
+        let dev = Device::ndarray().autodiff().gradient_checkpointing();
+        let x = Tensor::<2>::ones([4, 12], &dev);
+
+        reset_seam_counts();
+        let base = seam_counts().expect("autodiff feature is on in this test").0;
+
+        // 1. the strategy-generic entry reaches the seam on Balanced.
+        assert!(reach::<BalancedCheckpointing>(&x).is_some());
+        assert_eq!(
+            seam_counts().expect("counters").0,
+            base + 1,
+            "a BalancedCheckpointing caller must get past the seam downcast"
+        );
+
+        // 2. and the legacy NoCheckpointing-only spelling does NOT, which is
+        //    precisely what used to happen to dormouse: a silent `None`, a
+        //    correct tensor answer, and a fused arm that never ran.
+        assert!(
+            fwt_autodiff::<Nd>(x.clone(), 16).is_none(),
+            "on a Balanced tensor the NoCheckpointing entry must refuse"
+        );
+        assert_eq!(
+            seam_counts().expect("counters").0,
+            base + 1,
+            "the refusing entry must not have counted a reach"
+        );
+
+        // 3. the default strategy still works, so the probe is not a
+        //    replacement but an addition. Its own device, because that is the
+        //    point: the strategy is a property of the tensor, not of the call.
+        let plain = Device::ndarray().autodiff();
+        let xp = Tensor::<2>::ones([4, 12], &plain);
+        assert!(reach::<NoCheckpointing>(&xp).is_some());
+        assert!(
+            reach::<BalancedCheckpointing>(&xp).is_none(),
+            "and the cross-check must refuse too, or the gate is not real"
+        );
+    }
+}
 
 #[cfg(all(test, feature = "autodiff", feature = "cuda"))]
 mod ad_tests {

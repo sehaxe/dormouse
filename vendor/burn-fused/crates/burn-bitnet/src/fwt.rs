@@ -8,13 +8,46 @@ use burn::tensor::Tensor;
 /// FWT dispatch: fused CUDA kernel when available, butterfly tensor path
 /// otherwise. Orthogonal (normalized by 1/sqrt(p)), so applying it twice is
 /// the identity.
+///
+/// The autodiff arm probes BOTH checkpointing strategies, because the node it
+/// builds lives on the caller's strategy and `Autodiff<Inner>`'s default type
+/// parameter is `NoCheckpointing` — probing only that one silently sent
+/// dormouse (`Autodiff<CudaBare, BalancedCheckpointing>`) to the tensor path.
+#[cfg(all(feature = "cuda", feature = "autodiff"))]
+macro_rules! fwt_probe {
+    ($x:expr, $p:expr) => {{
+        use burn::tensor::DispatchTensor;
+        use burn_autodiff::checkpoint::strategy::{
+            BalancedCheckpointing, CheckpointStrategy, NoCheckpointing,
+        };
+        type CudaBare = burn_cubecl::CubeBackend;
+        // Both conversions must exist for the probe to compile; assert it in
+        // the bound rather than discovering it as a silent `None`.
+        fn assert_conv<S: CheckpointStrategy>()
+        where
+            DispatchTensor: burn::backend::DispatchKindConversion<AutodiffAlias<S>>,
+        {
+        }
+        type AutodiffAlias<S> = burn_autodiff::Autodiff<CudaBare, S>;
+        assert_conv::<NoCheckpointing>();
+        assert_conv::<BalancedCheckpointing>();
+        if let Some(r) = crate::fwt_cuda::fwt_autodiff_s::<CudaBare, NoCheckpointing>(
+            $x.clone(),
+            $p,
+        ) {
+            Some(r)
+        } else {
+            crate::fwt_cuda::fwt_autodiff_s::<CudaBare, BalancedCheckpointing>($x.clone(), $p)
+        }
+    }};
+}
+
 pub fn fast_walsh_hadamard(x: Tensor<2>) -> Tensor<2> {
     let [_, d] = x.dims();
     let _p = d.next_power_of_two();
     #[cfg(all(feature = "cuda", feature = "autodiff"))]
     {
-        type CudaBare = burn_cubecl::CubeBackend;
-        if let Some(r) = crate::fwt_cuda::fwt_autodiff::<CudaBare>(x.clone(), _p) {
+        if let Some(r) = fwt_probe!(x, _p) {
             return r;
         }
     }
