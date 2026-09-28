@@ -298,8 +298,11 @@ pub fn chunk_wy_forward_batched(
     }
 
     // The same four values per chunk the custom node's analytic backward needs.
-    // Views only — a slice on this backend is offsets and a shape, so the ops
-    // path (which discards the scratch) pays nothing for them.
+    // Free on the ops path, which discards them: cubecl's `slice` with aligned
+    // offsets is a handle offset, not a kernel (f32 and a chunk-axis offset are
+    // always aligned, so the copy fallback does not fire here), and a slice
+    // costs a node only on the autodiff backend, which is the arm that reads
+    // them.
     let mut chunks = Vec::with_capacity(n_chunks);
     for ci in 0..n_chunks {
         let cut = |t: &Tensor<5>, d: usize| -> Tensor<4> {
