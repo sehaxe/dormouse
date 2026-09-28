@@ -6,8 +6,18 @@ license.workspace = true
 
 [features]
 default = ["cpu"]
-cpu = ["dep:burn-ndarray"]
+# The CPU backend is burn-flex: pure Rust, no BLAS, and unlike the deprecated
+# burn-ndarray it supports f16/bf16. The `burn-ndarray` dep below is a compile
+# bridge for one `Device::ndarray()` in src/lib.rs (2026-09-27).
+cpu = ["burn/flex", "dep:burn-ndarray"]
 cuda = ["burn/cuda", "burn/autodiff", "dormouse-core/cuda", "burn-muon-plus/cuda"]
+
+[dev-dependencies]
+# The divergence measurement is a program, not a test (a trained model is a
+# moving target), so it needs the CLI parser outside the lib. It runs on the CPU
+# backend on purpose: the narrowing is host arithmetic, and a measurement that
+# needs the GPU is a measurement that cannot run beside a training run.
+clap = { version = "4", features = ["derive"] }
 
 [dependencies]
 dormouse-core = { path = "../dormouse-core" }
@@ -17,9 +27,14 @@ burn-bitnet = { path = "../../vendor/burn-fused/crates/burn-bitnet" }
 burn-muon-plus = { path = "../../vendor/burn-fused/crates/burn-muon-plus" }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+# The export's two primitives, both already in this build graph through burn
+# (burn-std re-exports `half`) and burn-pack (`crc32fast`), so neither is a new
+# dependency in the compile.
+half = "2"
+crc32fast = "1"
 burn = { version = "0.22.0-pre.4", default-features = false, features = ["std", "autodiff", "optim"] }
 burn-tensor = { version = "0.22.0-pre.4", default-features = false }
-burn-ndarray = { optional = true, version = "0.22.0-pre.4", features = ["blas-openblas"] }
+burn-ndarray = { optional = true, version = "0.22.0-pre.4" }
 burn-cuda = { version = "0.22.0-pre.4", default-features = false, features = ["std", "autotune"] }
 burn-dispatch = { version = "0.22.0-pre.4", default-features = false }
 cubecl-runtime = { version = "0.11.0-pre.4", default-features = false }

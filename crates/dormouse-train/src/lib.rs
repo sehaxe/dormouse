@@ -2,6 +2,7 @@
 //! optimizer (see `optim`), burnpack checkpoints with custom name, resume,
 //! opencode harness.
 mod cfg;
+pub mod export;
 mod jepa_targets;
 mod offload;
 mod optim;
@@ -167,7 +168,13 @@ impl Default for TrainCfg {
     }
 }
 
-fn device() -> Device {
+/// The device every path in this crate runs on, autodiff-wrapped. `pub`
+/// because the export's gate and its divergence measurement have to build
+/// their models on the SAME device as the code under test: a test that quietly
+/// hardcodes `Device::ndarray()` under `--features cuda` compares two BACKENDS
+/// and calls the 1-ULP difference a container bug (which is exactly what it
+/// did before this was public).
+pub fn device() -> Device {
     #[cfg(feature = "cuda")]
     { Device::cuda(0).autodiff() }
     #[cfg(all(feature = "cpu", not(feature = "cuda")))]

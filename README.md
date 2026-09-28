@@ -365,9 +365,12 @@ mkdir -p /tmp/smoke && head -c 4000000 /path/to/corpus.bin > /tmp/smoke/corpus.b
   --eval <held-out-dir> --eval-every 500 \
   --engram-ram --engram-slots 8000000 --guard --detach --log /path/to/log
 
-# inference from the same checkpoint pair
-./target/release/generate --ckpt-name latest --ckpt-dir checkpoints --prompt "once" --steps 64
-./target/release/serve   --ckpt-name latest --ckpt-dir checkpoints --port 8000
+# turn the training checkpoint into a standalone inference file, then use it.
+# This is the ONLY way `generate` and `serve` will load a model.
+./target/release/export run --ckpt-dir checkpoints --ckpt-name latest \
+  --dtype bf16 --out checkpoints/latest.bf16.dmexp
+./target/release/generate --export checkpoints/latest.bf16.dmexp --prompt "once" --steps 64
+./target/release/serve   --export checkpoints/latest.bf16.dmexp --port 8000
 ```
 
 Long runs survive: `--guard` re-execs on NaN/panic with a fresh CUDA context and
@@ -376,6 +379,106 @@ needs a human); `--detach` daemonizes in-process with `--log <file>`. Resuming
 reuses `--ckpt-name`, and a resume whose resolved config differs from the
 `<ckpt_name>.config.toml` snapshot is a hard error, except for `steps`,
 `log_every` and `ckpt_every` — extending a run is a legal resume.
+
+## The model file: `.dmexp` (a public interface)
+
+**A training checkpoint is a run, not a model.** It holds a model section, an
+optimizer section and an EMA teacher, and it sits next to a `.ngram` sidecar
+that reaches 34 GB at the 48M-slot budget. `generate` and `serve` reading
+*that* is what made a 9.2 M-parameter model a 73 MB download plus whatever
+sidecar the run happened to leave.
+
+`dormouse export` produces the other thing: one self-describing file with the
+optimizer dropped, the `.ngram` sidecar never opened, and the fp32 masters
+narrowed to 2 or 4 bytes each.
+
+```sh
+# convert (config comes from <ckpt-name>.config.toml, the run's own snapshot)
+./target/release/export run --ckpt-dir checkpoints --ckpt-name latest --dtype bf16
+
+# identify + verify, without loading a model
+./target/release/export info checkpoints/latest.bf16.dmexp
+```
+
+### Layout
+
+```text
+[0..8)    magic "DMEXPRT" + format version byte
+[8..12)   header length, u32 LE
+[12..20)  payload length in bytes, u64 LE
+[20..24)  CRC-32 (IEEE) of the payload, u32 LE
+[24..24+H)  header, UTF-8 TOML
+[24+H..)    payload: the tensors, in header order, contiguous
+```
+
+The header is TOML and carries the weight dtype, the full `DormouseConfig` (so
+the model **shape** travels with the weights — a shape a reader has to be told
+separately is a shape they can be told wrong), every tensor's module path and
+dims, the source checkpoint and step, the parameter count, the weight magnitude
+range, and the count of values that fell below the format's smallest normal.
+`export info` prints all of it and checks the CRC. One file, one command, and
+you can tell what it is and whether it arrived intact.
+
+### `--dtype`: the trade-off, measured
+
+Measured on a 20-step `small` run (9,197,390 params in 54 tensors) against the
+same checkpoint's fp32 logits on 16 held-out windows of 256 B from
+`real_eval_v2/eval_tail.bin`. Reproduce with
+`cargo run --release -p dormouse-train --example export_divergence -- --train <corpus> --eval <held-out>`.
+
+| format | file bytes | max abs weight | min non-zero weight | flushed to 0 | max abs logit delta | top-1 agree | greedy 64 |
+|---|---|---|---|---|---|---|---|
+| `f32` | **36,795,131** | 5.1545 | 1.1023e-9 | 0 | **0.000e+0** | 100.0% | identical |
+| `f16` | **18,400,340** | 5.1562 | 5.9605e-8 | **8** | 1.247e-1 | 100.0% | **DIFFERS** |
+| `bf16` | **18,400,343** | 5.1562 | 1.1059e-9 | **0** | 1.025e-1 | 75.0% | identical |
+
+A 2-byte format halves the download: **18.4 MB against 36.8 MB for fp32, and
+5.7× against the 104 MB training container.** f32 is bit-exact (delta exactly
+0), so the entire question is the narrowing and nothing else.
+
+**Read the last two columns honestly.** This model's logits barely leave 0
+(|max| 1.11 over 256 bytes) because 20 steps is not training, so the argmax is
+a near-tie and top-1 agreement is a worst case, not a prediction. The two
+metrics disagree about which format is safer: f16 wins top-1 and loses the
+greedy continuation, bf16 the reverse. **Neither 2-byte format preserves greedy
+decoding at this scale, and the data does not say which is better.** Settling it
+needs a converged checkpoint's softmax, which this repo does not currently have
+(`checkpoints/` is empty) — it is the open item in the ADR.
+
+What *is* settled is the exponent range, and it is the durable half of the
+measurement: the model's smallest non-zero weight is **1.1e-9**, four orders of
+magnitude below f16's smallest normal (6.1e-5), so **f16 had to zero 8
+weights**. bf16 reproduced 1.1059e-9 exactly, because bf16's exponent is f32's.
+
+**Ship `bf16` (the default).** f16 is genuinely the *more accurate* format —
+10 mantissa bits against 7, and 2.8× lower mean logit delta (3.5e-3 against
+9.7e-3) — so this costs real precision. It buys a failure mode that stops being
+data-dependent: an f16 weight above 65504 becomes `inf`, and the only thing
+standing between that and a broken model is a guard the exporter applies. bf16
+needs no guard. **f16 remains the better file when the measured range fits** —
+`export info` prints `max_abs` and `min_nonzero_abs`, and comparing them
+against 65504 and 6.1e-5 is the decision; it ships so a stranger can make it
+without rebuilding this crate.
+
+**This is a storage format, not a compute-precision change.** Loading a bf16
+export gives an **fp32** model: bf16 matmul does not exist on this CUDA backend
+(ADR-0016 — the LLVM dialect has no bf16 type) and f16 matmul works but falls
+back off the tensor cores without saying so. The `u16`-bit-pattern storage
+primitive the export uses is the one pinned in
+`vendor/burn-fused/crates/burn-gdn2/tests/lowp_bf16_cuda.rs`.
+
+**The refusal.** `generate` and `serve` take `--export` and nothing else. Given
+a training checkpoint they say what the file is and print the command that
+converts it, then exit — they never train-shaped-load the optimizer section and
+never go looking for the sidecar (ADR-0011: a wrong-but-plausible answer is the
+cardinal sin, and a 34 GB read to obtain 30 MB of weights is that sin wearing a
+plausible face). An export also cannot carry a `--engram-ram` run's host table:
+that is training state, and no 18 MB file holds 34 GB of it. The in-model
+Engram tables (3.15M of the 9.2M params) do travel.
+
+Spec, evidence and the gate: [`docs/adr/0023-inference-export.md`](docs/adr/0023-inference-export.md).
+Gate: `cargo test -p dormouse-train --test export_roundtrip` (and again with
+`--no-default-features --features cuda`).
 
 ### Every flag on `train`
 

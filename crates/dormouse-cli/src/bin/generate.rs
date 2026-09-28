@@ -1,29 +1,34 @@
-//! dormouse generate - inference from a named ckpt
+//! dormouse generate - inference from an exported model file.
+//!
+//! It reads an INFERENCE EXPORT (`.dmexp`), never a training checkpoint. That
+//! is a deliberate refusal, not a missing feature: a checkpoint is a run, with
+//! the optimizer section and a `.ngram` sidecar that reaches 34 GB, and a
+//! loader that accepts one here would be a loader that quietly reads 34 GB to
+//! produce 30 MB of weights. `dormouse export` turns a checkpoint into this
+//! file, and it names itself when handed the wrong one.
 use clap::Parser;
 use rand::Rng;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 struct Args {
-    #[arg(long, default_value = "checkpoints")] ckpt_dir: PathBuf,
-    #[arg(long, default_value = "latest", help = "checkpoint file name (<name>.bin)")] ckpt_name: String,
+    #[arg(long, help = "inference export written by `dormouse export` (<name>.dmexp)")] export: PathBuf,
     #[arg(long, default_value = "hello")] prompt: String,
     #[arg(long, default_value = "32")] steps: usize,
-    #[arg(long, default_value = "small")] preset: String,
-    #[arg(long)] config: Option<String>,
-    #[arg(long = "set", value_name = "KEY=VALUE")] set: Vec<String>,
     #[arg(long, default_value = "0.8")] temp: f32,
 }
 
 fn main() {
     let a = Args::parse();
-    let preset_name = a.config.as_deref().unwrap_or(&a.preset);
-    // The one config seam (ADR-0005): defaults -> preset -> --set -> validate.
-    let cfg = dormouse_train::resolve(preset_name, &a.set, Default::default())
-        .unwrap_or_else(|e| { eprintln!("config: {e}"); std::process::exit(1); })
-        .model;
-    let model = dormouse_train::load_model_weights(&a.ckpt_dir, &a.ckpt_name, cfg)
-        .unwrap_or_else(|| { eprintln!("ckpt not found: {}/{}.bin", a.ckpt_dir.display(), a.ckpt_name); std::process::exit(1); });
+    let (model, _cfg, h) = dormouse_train::export::read(&a.export)
+        .unwrap_or_else(|e| { eprintln!("generate: {e}"); std::process::exit(1); });
+    println!(
+        "loaded {} ({:?} weights, {} params, step {})",
+        a.export.display(),
+        h.dtype,
+        h.num_params,
+        h.step
+    );
     let mut bytes = a.prompt.as_bytes().to_vec();
     println!("prompt: {}", a.prompt);
     let mut rng = rand::thread_rng();

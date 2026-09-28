@@ -1,23 +1,27 @@
 //! dormouse serve - OpenAI compatible API, concurrent (model forward is &self)
+//!
+//! It reads an INFERENCE EXPORT (`.dmexp`), never a training checkpoint: see
+//! `generate.rs` for why that refusal is the feature. Pointing this at a
+//! training checkpoint (or its 34 GB `.ngram` sidecar) prints why it will not
+//! and exits; it never train-shaped-loads the optimizer section.
 use axum::{extract::Json, routing::{get, post}, Router};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
-use burn::module::Module;
 
 #[derive(Parser, Debug)]
 struct Args {
-    #[arg(long, default_value = "checkpoints")] ckpt_dir: PathBuf,
-    #[arg(long, default_value = "latest", help = "checkpoint file name (<name>.bin)")] ckpt_name: String,
-    #[arg(long, default_value = "small")] preset: String,
-    #[arg(long)] config: Option<String>,
-    #[arg(long = "set", value_name = "KEY=VALUE")] set: Vec<String>,
+    #[arg(long, help = "inference export written by `dormouse export` (<name>.dmexp)")] export: PathBuf,
     #[arg(long, default_value = "8000")] port: u16,
 }
 
 #[derive(Clone)]
 struct AppState {
     model: Arc<dormouse_core::DormouseModel>,
+    /// What is actually loaded. `/v1/models` used to answer with four hardcoded
+    /// names of models that may not be the one on the GPU, which is the
+    /// wrong-but-plausible answer ADR-0011 calls the cardinal sin.
+    model_id: String,
 }
 
 #[derive(Deserialize)]
@@ -166,37 +170,46 @@ async fn completions(
     })
 }
 
-async fn models() -> Json<ModelsResp> {
+async fn models(axum::extract::State(state): axum::extract::State<AppState>) -> Json<ModelsResp> {
     Json(ModelsResp {
         object: "list".into(),
-        data: vec![
-            ModelInfo { id: "dormouse-small".into(), object: "model".into(), created: 0, owned_by: "dormouse".into() },
-            ModelInfo { id: "dormouse-swift50".into(), object: "model".into(), created: 0, owned_by: "dormouse".into() },
-            ModelInfo { id: "dormouse-base".into(), object: "model".into(), created: 0, owned_by: "dormouse".into() },
-            ModelInfo { id: "dormouse-one_b".into(), object: "model".into(), created: 0, owned_by: "dormouse".into() },
-        ],
+        data: vec![ModelInfo {
+            id: state.model_id.clone(),
+            object: "model".into(),
+            created: 0,
+            owned_by: "dormouse".into(),
+        }],
     })
 }
 
 #[tokio::main]
 async fn main() {
     let a = Args::parse();
-    let preset_name = a.config.as_deref().unwrap_or(&a.preset);
-    // The one config seam (ADR-0005): defaults -> preset -> --set -> validate.
-    let cfg = dormouse_train::resolve(preset_name, &a.set, Default::default())
-        .unwrap_or_else(|e| { eprintln!("config: {e}"); std::process::exit(1); })
-        .model;
-    let model = dormouse_train::load_model_weights(&a.ckpt_dir, &a.ckpt_name, cfg)
-        .unwrap_or_else(|| { eprintln!("ckpt not found: {}/{}.bin", a.ckpt_dir.display(), a.ckpt_name); std::process::exit(1); });
-    println!("loaded {}/{}.bin params={}", a.ckpt_dir.display(), a.ckpt_name, model.num_params());
-    let state = AppState { model: Arc::new(model) };
+    // One load path, and it is the export. The config is not a flag here: it
+    // travels inside the file, so the served model cannot be a preset the
+    // operator mistyped (ADR-0011: a wrong-but-plausible answer is the sin).
+    let (model, cfg, h) = dormouse_train::export::read(&a.export)
+        .unwrap_or_else(|e| { eprintln!("serve: {e}"); std::process::exit(1); });
+    println!(
+        "loaded {} ({:?} weights, {} params, step {}, d_model {}, vocab {})",
+        a.export.display(), h.dtype, h.num_params, h.step, cfg.d_model, cfg.vocab
+    );
+    let state = AppState {
+        model: Arc::new(model),
+        model_id: a
+            .export
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("dormouse")
+            .to_string(),
+    };
     let app = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
         .route("/v1/models", get(models))
         .with_state(state);
     let addr = SocketAddr::from(([0, 0, 0, 0], a.port));
-    println!("dormouse openai serve {}/{}.bin preset {} -> http://{}/v1 (concurrent)", a.ckpt_dir.display(), a.ckpt_name, preset_name, addr);
+    println!("dormouse openai serve {} -> http://{}/v1 (concurrent)", a.export.display(), addr);
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
