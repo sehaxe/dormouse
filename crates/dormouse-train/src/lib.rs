@@ -942,9 +942,16 @@ pub fn train_loop(
         None
     };
     let n_params = model.num_params();
+    // The backend is REPORTED, not assumed. A hardcoded `cuda(autodiff)`
+    // made every CPU run's log lie about where it ran, which is the exact
+    // class of wrong number this project keeps retracting - and it cost a
+    // reader real time: a test run believed it was on the GPU.
     println!(
-        "dormouse pretrain {preset} params={n_params} steps={} data={:?} lr={} backend=cuda(autodiff)",
-        cfg.steps, data, cfg.lr
+        "dormouse pretrain {preset} params={n_params} steps={} data={:?} lr={} backend={:?}",
+        cfg.steps,
+        data,
+        cfg.lr,
+        device,
     );
     // #7 warmup: 2 fwd+bwd at full depth raise the pool high-water before the
     // loop (then cleanup returns the pages - later steps reuse cached blocks).

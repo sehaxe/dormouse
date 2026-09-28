@@ -1,3 +1,48 @@
 date	commit	mode	step	throughput	mem	final-ce
 2026-09-25T22:21:14Z	bdddbaf	canary	4081ms	1.23KB/s	res=n/a	ce=5.141
 2026-09-26T05:56:36Z	b00ae06	canary	150548ms	0.03KB/s	res=n/a	ce=5.074
+# --- 2026-09-28, the attention-arm cost, measured AFTER 8fa5d4c ---------------
+# The single most load-bearing row set in this file, and it is LATE: every
+# earlier row was measured while the KDA arm returned a LEAF and trained
+# nothing (AGENTS.md 3.2), so any step-time number that included "attention"
+# was pricing a program that skipped the backward.
+#
+# All three below: small preset, 9,195,854 params, depth 2, seq 512, fp32,
+# aux off, --no-engram, real_sharded corpus, dev profile (our crates at
+# opt-level 0, no LTO), 25 steps timed, 3 concurrent compilers on the box.
+# DEV PROFILE IS A CAVEAT, not a detail: it is the same for all three rows so
+# the RATIO holds, but the absolute ms is not comparable to the release rows
+# above. Do not mix them in one column.
+2026-09-28T15:20:00Z	8fa5d4c	ops-no-attention	3076ms	2.66KB/s	res=n/a	ce=5.501
+2026-09-28T15:26:00Z	8fa5d4c	ops-with-attention	25858ms	0.16KB/s	res=n/a	ce=5.481
+2026-09-28T12:40:00Z	(pre-8fa5d4c)	fused-forward-no-gradient	3098ms	2.65KB/s	res=n/a	ce=n/a
+# The three rows read together, and the third is the one that matters:
+#   - removing the arm:            3076 ms
+#   - adding the arm CORRECTLY:   25858 ms   -> the arm costs 22782 ms, 8.4x
+#   - adding the arm with a leaf:   3098 ms   -> it appeared to cost 22 ms
+# That third row is the whole trap. A fused forward that returns a leaf does no
+# backward work, so it measured as ~1000x cheaper than the same arm computing
+# what it is supposed to compute. Any speedup attributed to it in the project's
+# history is measuring the absence of work.
+#
+# 158 tok/s at batch 8 x 512. 60k steps = 18 days, so a chunked recurrence
+# built from ~4800 individual burn tensor ops does not train on this box and
+# the fused adjoint is not an optimisation here, it is the difference between
+# training and not training. See docs/AB-PROTOCOL.md for the queue this
+# invalidates and AGENTS.md 3.3 for why the per-arm cost is currently unknown.
+#
+# NOT COMMITTED AS A BENCH: no repeat run, no release build, three compilers
+# sharing the box, and the third row is from a different binary. Re-take
+# before quoting any of it in an A/B budget.
+2026-09-28T13:40:00Z	422414c	vram-probe-b4	1420ms	n/a	peak=3008MiB	n/a
+2026-09-28T13:52:00Z	422414c	vram-probe-b8	3098ms	n/a	peak=3664MiB	n/a
+2026-09-28T13:58:00Z	422414c	vram-probe-b12	2760ms	n/a	peak=4760MiB	n/a
+2026-09-28T14:04:00Z	422414c	vram-probe-b16	2738ms	n/a	peak=5908MiB	n/a
+# The VRAM rows correct a wrong claim rather than adding one. AGENTS.md and
+# several docs said "batch 4 OOMs on 16 GB", which is true ONLY for the
+# configuration with the JEPA teacher on (a second full forward). With aux off
+# the card reaches batch 16 in 5908 MiB - 37% of 16 GB - so the earlier
+# "we are pinned to batch 2" conclusion, which I repeated to the owner, was
+# wrong. Throughput is flat from batch 8 to 16 (2.66 -> 2.99 KB/s), which is
+# consistent with the workload being launch-bound rather than batch-bound:
+# a bigger batch does not buy speed here, it buys a better gradient.
