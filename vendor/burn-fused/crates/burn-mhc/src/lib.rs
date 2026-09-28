@@ -17,7 +17,12 @@
 //! Hyper-parameters follow App. A.1: gating factors alpha init = 0.01,
 //! Sinkhorn-Knopp t_max = 20.
 #![allow(clippy::single_range_in_vec_init, clippy::needless_range_loop)]
-#[cfg(feature = "cuda")]
+// `autodiff` alone also compiles this module, and deliberately so: the fused
+// ADJOINT and its strategy seam live in it, and a gate that can only be
+// compile-checked with a GPU is exactly how a `NoCheckpointing`-only entry
+// survived. The kernels inside stay `#[cfg(feature = "cuda")]`, which is what
+// the CPU seam test exercises — the tensor path, after the downcast.
+#[cfg(any(feature = "cuda", feature = "autodiff"))]
 pub mod sinkhorn_cuda;
 
 /// Sinkhorn-Knopp iterations used in the paper (App. A.1: t_max = 20).

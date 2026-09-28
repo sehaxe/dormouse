@@ -22,9 +22,23 @@ pub const SINKHORN_ITERS: usize = 20;
 pub fn sinkhorn_knopp(logits: Tensor<4>, iters: usize) -> Tensor<4> {
     #[cfg(all(feature = "cuda", feature = "autodiff"))]
     {
+        // Probe BOTH checkpointing strategies. `Autodiff<Inner>`'s second type
+        // parameter defaults to `NoCheckpointing`, and the downcast compares the
+        // whole backend type, so probing only that one silently sent a
+        // `BalancedCheckpointing` caller (dormouse's backend) to the log-domain
+        // tensor loop: the right answer, slowly, with nothing counting it.
+        use burn_autodiff::checkpoint::strategy::{BalancedCheckpointing, NoCheckpointing};
         type CudaBare = burn_cubecl::CubeBackend;
-        if let Some(out) =
-            crate::sinkhorn_cuda::sinkhorn_autodiff::<CudaBare>(logits.clone(), iters)
+        if let Some(out) = crate::sinkhorn_cuda::sinkhorn_autodiff_s::<CudaBare, NoCheckpointing>(
+            logits.clone(),
+            iters,
+        ) {
+            return out;
+        }
+        if let Some(out) = crate::sinkhorn_cuda::sinkhorn_autodiff_s::<
+            CudaBare,
+            BalancedCheckpointing,
+        >(logits.clone(), iters)
         {
             return out;
         }
