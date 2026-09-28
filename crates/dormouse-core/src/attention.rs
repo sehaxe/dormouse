@@ -26,6 +26,30 @@ pub fn fused_seam_counts() -> (u64, u64, u64, u64) {
     (kda_f, kda_b, norm_asked, norm_skipped)
 }
 
+/// The gdn2 seam in FULL: `(asked, fused_fwd, fused_bwd, declined, ops_path,
+/// custom_node_bwd)`.
+///
+/// The four-tuple above cannot answer the question that matters, and asking it
+/// is how a day went missing: `fused kda=30/0` reads as "the fast path is
+/// slow", when the truth was that the op was returning a LEAF and the arm
+/// trained nothing. `asked` separates "never asked" from "asked and correctly
+/// declined", `ops_path` is the arm that actually carries a gradient, and
+/// `custom_node_backward` is the one number that separates "correct gradients"
+/// from "no gradient at all" - zero while `ops_path` is positive means burn's
+/// own graph did the backward.
+///
+/// Separate from `fused_seam_counts` so the trainer can print it without
+/// changing the signature every other caller holds.
+#[cfg(all(feature = "cuda", feature = "std"))]
+pub fn kda_seam_counts() -> (u64, u64, u64, u64, u64, u64) {
+    burn_gdn2::seam_counts()
+}
+
+#[cfg(not(all(feature = "cuda", feature = "std")))]
+pub fn kda_seam_counts() -> (u64, u64, u64, u64, u64, u64) {
+    (0, 0, 0, 0, 0, 0)
+}
+
 #[derive(Debug, burn::module::Module)]
 pub struct AdaptiveAttention {
     pub gdn2: KdaModule,

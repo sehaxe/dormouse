@@ -1447,6 +1447,13 @@ pub fn train_loop(
                     // of this log learns the fast path was skipped is that it
                     // is printed here, on the line they already watch.
                     let (kda_f, kda_b, norm_asked, norm_skipped) = fused_seam_counts();
+                    // Order is (asked, fused_fwd, fused_bwd, declined, ops_path,
+                    // custom_node_bwd) - names, not blanks, because a blank in
+                    // a destructuring pattern is how I read `bwd` as
+                    // `declined` and briefly concluded the ops path was not
+                    // counting itself.
+                    let (kda_asked, _, kda_bwd, kda_decl, kda_ops, kda_node_bwd) =
+                        dormouse_core::kda_seam_counts();
                     let (mu_mom, mu_fin) = optim::fused_kernels_skipped();
                     let (eg_arms, eg_rows) = (
                         probe::count(probe::ENGRAM) - eg_arms0,
@@ -1454,7 +1461,9 @@ pub fn train_loop(
                     );
                     println!(
                         "step {step:6} EVAL ce={ece:.3} bpb={ebpb:.3}{} over {bytes} B (fixed window) \
-                         fused kda={kda_f}/{kda_b} norm={}/{} muon_skipped={}/{} engram={eg_rows}/{eg_arms}",
+                         fused kda={kda_f}/{kda_b} asked={kda_asked} bwd={kda_bwd} \
+                         declined={kda_decl} ops={kda_ops} node_bwd={kda_node_bwd} \
+                         norm={}/{} muon_skipped={}/{} engram={eg_rows}/{eg_arms}",
                         if is_best_eval { " BEST" } else { "" },
                         norm_asked.saturating_sub(norm_skipped),
                         norm_asked,

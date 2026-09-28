@@ -11,7 +11,7 @@ pub mod param;
 pub mod probe;
 pub mod routing;
 
-pub use attention::{fused_seam_counts, AdaptiveAttention};
+pub use attention::{fused_seam_counts, kda_seam_counts, AdaptiveAttention};
 pub use aux::{AuxHeads, TEACHER_MOMENTUM};
 pub use config::{ActQuant, DormouseConfig};
 pub use loop_block::{ExpertFFN, LoopBlock};
