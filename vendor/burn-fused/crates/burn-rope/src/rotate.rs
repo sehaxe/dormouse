@@ -31,10 +31,25 @@ where
 {
     #[cfg(all(feature = "cuda", feature = "autodiff"))]
     {
+        // Probe BOTH checkpointing strategies. `Autodiff<Inner>`'s second type
+        // parameter defaults to `NoCheckpointing` and the downcast compares the
+        // whole backend type, so probing only that one silently sent a
+        // `BalancedCheckpointing` caller (dormouse's backend) to the slice/cat
+        // tensor path: the same rotation, more kernels, nothing counting it.
+        use burn_autodiff::checkpoint::strategy::{BalancedCheckpointing, NoCheckpointing};
         type CudaBare = burn_cubecl::CubeBackend;
-        if let Some(r) =
-            crate::rope_cuda::rope_autodiff::<CudaBare>(x.clone(), cos.clone(), sin.clone())
-        {
+        if let Some(r) = crate::rope_cuda::rope_autodiff_s::<CudaBare, NoCheckpointing>(
+            x.clone(),
+            cos.clone(),
+            sin.clone(),
+        ) {
+            return r;
+        }
+        if let Some(r) = crate::rope_cuda::rope_autodiff_s::<CudaBare, BalancedCheckpointing>(
+            x.clone(),
+            cos.clone(),
+            sin.clone(),
+        ) {
             return r;
         }
     }

@@ -239,17 +239,18 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs a live CUDA context: BURN_DEVICE=cuda cargo test -p burn-rope --features cuda -- --ignored"]
     fn rope_matches_ref() {
-        // Needs a real CUDA context. Local CPU sweeps skip this via the env
-        // guard (the GPU may be busy/OOM); the CI gpu-job sets
-        // BURN_DEVICE=cuda so the fused-vs-tensor check still runs there.
-        if std::env::var("BURN_DEVICE")
-            .map(|v| v != "cuda")
-            .unwrap_or(true)
-        {
-            eprintln!("skipping rope_matches_ref: BURN_DEVICE != cuda");
-            return;
-        }
+        // NOT a silent skip. The old `return` here reported PASS with zero
+        // assertions on every CPU run, which is how a broken kernel stayed
+        // green (ADR-0011). Now the test is `#[ignore]`d, so `cargo test`
+        // prints `ignored` with the reason, and asking for it explicitly
+        // without a GPU FAILS instead of passing.
+        assert_eq!(
+            std::env::var("BURN_DEVICE").as_deref(),
+            Ok("cuda"),
+            "rope_matches_ref needs BURN_DEVICE=cuda; without it there is no fused kernel to compare"
+        );
         let device = Default::default();
         for hd in [64usize, 128, 256] {
             for t in [1usize, 17, 64] {
@@ -298,13 +299,69 @@ mod tests {
     }
 }
 
+// ---- seam counters (ADR-0019) ----
+//
+// ENTRY is incremented AFTER the strategy downcasts — the gate that was
+// hardcoded to `NoCheckpointing`, so dormouse's
+// `Autodiff<CudaBare, BalancedCheckpointing>` never got here. A counter
+// before that gate would count interest, not arrivals (`f737710`).
+#[cfg(feature = "autodiff")]
+static ENTRY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(all(feature = "autodiff", feature = "cuda"))]
+static FWD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(all(feature = "autodiff", feature = "cuda"))]
+static BWD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(entry, fused_forward, fused_backward)` since [`reset_seam_counts`].
+pub fn seam_counts() -> Option<(u64, u64, u64)> {
+    #[cfg(feature = "autodiff")]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        #[cfg(feature = "cuda")]
+        return Some((ENTRY.load(Relaxed), FWD.load(Relaxed), BWD.load(Relaxed)));
+        #[cfg(not(feature = "cuda"))]
+        return Some((ENTRY.load(Relaxed), 0, 0));
+    }
+    #[cfg(not(feature = "autodiff"))]
+    None
+}
+
+/// Zero the seam counters.
+pub fn reset_seam_counts() {
+    #[cfg(feature = "autodiff")]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        ENTRY.store(0, Relaxed);
+        #[cfg(feature = "cuda")]
+        {
+            FWD.store(0, Relaxed);
+            BWD.store(0, Relaxed);
+        }
+    }
+}
+
+#[cfg(feature = "autodiff")]
+fn note_entry_reached() {
+    ENTRY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(feature = "cuda")]
+fn note_fused_forward() {
+    FWD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(feature = "cuda")]
+fn note_fused_backward() {
+    BWD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[cfg(feature = "autodiff")]
 mod ad {
     use super::*;
     use burn::backend::DispatchKindConversion;
     use burn::tensor::{DispatchTensor, Tensor};
     use burn_autodiff::checkpoint::base::Checkpointer;
-    use burn_autodiff::checkpoint::strategy::NoCheckpointing;
+    use burn_autodiff::checkpoint::strategy::{CheckpointStrategy, NoCheckpointing};
     use burn_autodiff::grads::Gradients;
     use burn_autodiff::ops::{Backward, Ops, OpsKind};
     use burn_autodiff::Autodiff;
@@ -345,8 +402,14 @@ mod ad {
             #[cfg(feature = "cuda")]
             {
                 type CudaBare = burn_cubecl::CubeBackend;
+                // `B` is the INNER backend here (`OpsPrep::finish` returns
+                // `AutodiffTensor<B>`; the result goes to
+                // `Tensor::from_primitive::<Autodiff<Inner, S>>`), so this
+                // gate asks the right question. The entry below was the one
+                // pinned to `NoCheckpointing`.
                 if std::any::TypeId::of::<B>() == std::any::TypeId::of::<CudaBare>() {
                     if let Some(dx) = super::rope_backward_cuda::<B>(&d_out, &cos, &sin) {
+                        note_fused_backward();
                         grads.register::<B>(
                             ops.parents[0].clone().unwrap().id,
                             dx.try_into_primitive::<B>().unwrap(),
@@ -374,21 +437,22 @@ mod ad {
     }
 
     /// Fused RoPE with exact backward on `Autodiff<Inner>`.
-    pub fn rope_autodiff<Inner: Backend>(
+    pub fn rope_autodiff_s<Inner: Backend, S: CheckpointStrategy>(
         x: Tensor<4>,
         cos: Tensor<2>,
         sin: Tensor<2>,
     ) -> Option<Tensor<4>>
     where
-        DispatchTensor: DispatchKindConversion<Autodiff<Inner>> + DispatchKindConversion<Inner>,
+        DispatchTensor: DispatchKindConversion<Autodiff<Inner, S>> + DispatchKindConversion<Inner>,
     {
-        let xa = x.try_into_primitive::<Autodiff<Inner>>().ok()?;
-        let ca = cos.try_into_primitive::<Autodiff<Inner>>().ok()?;
-        let sa = sin.try_into_primitive::<Autodiff<Inner>>().ok()?;
+        let xa = x.try_into_primitive::<Autodiff<Inner, S>>().ok()?;
+        let ca = cos.try_into_primitive::<Autodiff<Inner, S>>().ok()?;
+        let sa = sin.try_into_primitive::<Autodiff<Inner, S>>().ok()?;
+        note_entry_reached();
 
-        let x_t = Tensor::from_primitive::<Inner>(xa.primitive().clone());
-        let c_t = Tensor::from_primitive::<Inner>(ca.primitive().clone());
-        let s_t = Tensor::from_primitive::<Inner>(sa.primitive().clone());
+        let x_t = Tensor::<4>::from_primitive::<Inner>(xa.primitive().clone());
+        let c_t = Tensor::<2>::from_primitive::<Inner>(ca.primitive().clone());
+        let s_t = Tensor::<2>::from_primitive::<Inner>(sa.primitive().clone());
 
         let out_t = {
             #[cfg(feature = "cuda")]
@@ -398,6 +462,7 @@ mod ad {
                     if let Some(o) =
                         super::rope_cuda::<Inner>(x_t.clone(), c_t.clone(), s_t.clone())
                     {
+                        note_fused_forward();
                         o
                     } else {
                         super::rope_tensor::<Inner>(x_t.clone(), c_t.clone(), s_t.clone())
@@ -414,7 +479,7 @@ mod ad {
 
         let out_prim = out_t.try_into_primitive::<Inner>().unwrap();
         let nodes = [xa.node()];
-        let prep = RopeOp.prepare::<NoCheckpointing>(nodes);
+        let prep = RopeOp.prepare::<S>(nodes);
         let out_adt = match prep.compute_bound().stateful() {
             OpsKind::Tracked(mut prep) => {
                 let _ids = [Some(prep.checkpoint(&xa))];
@@ -422,12 +487,24 @@ mod ad {
             }
             OpsKind::UnTracked(prep) => prep.finish(out_prim),
         };
-        Some(Tensor::from_primitive::<Autodiff<Inner>>(out_adt))
+        Some(Tensor::from_primitive::<Autodiff<Inner, S>>(out_adt))
+    }
+
+    /// [`rope_autodiff_s`] on the default (no-checkpointing) strategy.
+    pub fn rope_autodiff<Inner: Backend>(
+        x: Tensor<4>,
+        cos: Tensor<2>,
+        sin: Tensor<2>,
+    ) -> Option<Tensor<4>>
+    where
+        DispatchTensor: DispatchKindConversion<Autodiff<Inner>> + DispatchKindConversion<Inner>,
+    {
+        rope_autodiff_s::<Inner, NoCheckpointing>(x, cos, sin)
     }
 }
 
 #[cfg(feature = "autodiff")]
-pub use ad::rope_autodiff;
+pub use ad::{rope_autodiff, rope_autodiff_s};
 
 /// Pure tensor-path RoPE (shared forward for the autodiff fallback).
 pub fn rope_tensor<B: Backend>(x: Tensor<4>, cos: Tensor<2>, sin: Tensor<2>) -> Tensor<4>
@@ -443,6 +520,70 @@ where
     let rot1 = x1.clone().mul(c.clone()).sub(x2.clone().mul(s.clone()));
     let rot2 = x1.mul(s).add(x2.mul(c));
     Tensor::cat(vec![rot1, rot2], 3).reshape([b, t, nh, hd])
+}
+
+#[cfg(all(test, feature = "autodiff", feature = "cuda"))]
+mod seam_tests {
+    //! The proof that the strategy gate is strategy-AGNOSTIC. It needs the
+    //! `cuda` feature to COMPILE (this file's kernels are not feature-gated
+    //! individually) but uses only the ndarray backend at RUNTIME: no device,
+    //! no kernel launch. It asserts a caller on
+    //! `Autodiff<Inner, BalancedCheckpointing>` — dormouse's backend — gets
+    //! PAST the seam downcast, and that the old `NoCheckpointing`-only
+    //! spelling does not. Revert `rope_autodiff_s` to `Autodiff<Inner>` and the
+    //! first assertion goes red: it is the assertion, not the comment.
+    use super::*;
+    use burn::backend::DispatchKindConversion;
+    use burn::tensor::{Device, DispatchTensor};
+    use burn_autodiff::Autodiff as Ad;
+    use burn_autodiff::checkpoint::strategy::{
+        BalancedCheckpointing, CheckpointStrategy, NoCheckpointing,
+    };
+
+    type Nd = burn_ndarray::NdArray;
+
+    #[test]
+    fn balanced_checkpointing_reaches_the_seam_and_the_legacy_entry_does_not() {
+        fn reach<S: CheckpointStrategy>(x: &Tensor<4>, c: &Tensor<2>, s: &Tensor<2>)
+        -> Option<Tensor<4>>
+        where
+            DispatchTensor: DispatchKindConversion<Ad<Nd, S>> + DispatchKindConversion<Nd>,
+        {
+            rope_autodiff_s::<Nd, S>(x.clone(), c.clone(), s.clone())
+        }
+
+        let dev = Device::ndarray().autodiff().gradient_checkpointing();
+        let x = Tensor::<4>::ones([1, 8, 2, 4], &dev);
+        let (c, s) = crate::precompute_freqs(4, 8, 10000.0, &dev);
+
+        reset_seam_counts();
+        let base = seam_counts().expect("autodiff feature is on in this test").0;
+
+        assert!(reach::<BalancedCheckpointing>(&x, &c, &s).is_some());
+        assert_eq!(
+            seam_counts().expect("counters").0,
+            base + 1,
+            "a BalancedCheckpointing caller must get past the seam downcast"
+        );
+
+        assert!(
+            rope_autodiff::<Nd>(x.clone(), c.clone(), s.clone()).is_none(),
+            "on a Balanced tensor the NoCheckpointing entry must refuse"
+        );
+        assert_eq!(
+            seam_counts().expect("counters").0,
+            base + 1,
+            "the refusing entry must not have counted a reach"
+        );
+
+        // The default strategy still works, and the cross-check refuses, so
+        // the gate is real rather than always-true.
+        let plain = Device::ndarray().autodiff();
+        let xp = Tensor::<4>::ones([1, 8, 2, 4], &plain);
+        let (cp, sp) = crate::precompute_freqs(4, 8, 10000.0, &plain);
+        assert!(reach::<NoCheckpointing>(&xp, &cp, &sp).is_some());
+        assert!(reach::<BalancedCheckpointing>(&xp, &cp, &sp).is_none());
+    }
 }
 
 #[cfg(all(test, feature = "autodiff", feature = "cuda"))]
