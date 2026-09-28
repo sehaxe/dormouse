@@ -11,13 +11,14 @@ to other agents, this file is the hand-off.
 
 ## The gate
 
-`vendor/burn-fused` has no `.git` and the root `Cargo.toml` `exclude`s it, so
-the fork's own `.github/workflows/ci.yml` has never executed for this copy. It
-was also wrong: it tested `burn-msa`, deleted 2026-09-27 (ADR-0014). The gate
-that runs is now **`../../.github/workflows/fused-library.yml`** (root of
-dormouse), which builds the fork from inside `vendor/burn-fused` because the
-exclude makes `cargo test -p burn-gdn2` from the root a guaranteed
-"package not found".
+`vendor/burn-fused` has no `.git` and the root `Cargo.toml` `exclude`s it, so no
+`.github/` under it can ever execute for this copy. The fork-level workflow
+that was there also tested `burn-msa`, deleted 2026-09-27 (ADR-0014); it and
+the ten per-crate ones have since been deleted (`4963c3a`), which is the right
+call — dead config invites the belief that a crate is gated. The gate that runs
+is **`../../.github/workflows/fused-library.yml`** (root of dormouse), which
+builds the fork from inside `vendor/burn-fused` because the exclude makes
+`cargo test -p burn-gdn2` from the root a guaranteed "package not found".
 
 Why the root job and not a separate repository for the fork: the fork's crates
 are consumed by `path =` from `dormouse-core`, and 7 of them are load-bearing
@@ -34,12 +35,57 @@ to do inside a test-and-CI change.
 `crates/burn-gdn2/tests/ref_data.bin` is now committed (6.8 MiB, 1000 cases)
 and regenerable byte-for-byte by `crates/burn-gdn2/tools/gen_reference.rs`
 (std-only, `rustc tools/gen_reference.rs`; splitmix64 + Box-Muller seeded 1337,
-sequential f32, no thread-count dependence). CI regenerates and `git diff
---exit-code`s it on every push, so the fixture cannot drift from its generator
-unnoticed. `binary-tests` is in burn-gdn2's default features, so the suite runs
-on every `cargo test -p burn-gdn2` rather than only when someone remembers the
-flag. The full precision argument, and what the harness does **not** claim, is
-in the module comment of `tests/bit_exact.rs`.
+sequential f32, no thread-count dependence, so the bytes do not depend on the
+platform, the core count or the rustc version - two runs `cmp` clean). CI
+regenerates it and `git diff --exit-code`s it on every push, so the fixture
+cannot drift from its generator unnoticed. The full precision argument, and
+what the harness does **not** claim, is in the module comment of
+`tests/bit_exact.rs`.
+
+### FINDING 0: the harness is RED, and the reference is the *less* likely culprit
+
+`binary-tests` is **not** in burn-gdn2's default features, on purpose: making it
+default would put a red suite in every `cargo test -p burn-gdn2` whose cause is
+not yet named, and a red default that nobody can explain gets deleted rather
+than fixed. The gate is explicit instead, and it is loud - the CI job is named
+`fused-lib :: 1000 bit-exact cases vs the paper reference (fused/tensor drift)`.
+
+Measured 2026-09-27, ndarray, against the committed fixture:
+
+```
+1000 cases: max_diff = 1.38e-2,  failures = 976/1000      (EPSILON = 5e-4)
+  FAIL [1] shape=1x3x64  max_diff=2.88e-3
+  FAIL [3] shape=1x11x64 max_diff=6.79e-3
+  FAIL [5] shape=1x37x64 max_diff=1.17e-2
+```
+
+Three things this is not:
+
+- **Not the tolerance.** 5e-4 is 28x below the observed max_diff, and the
+  measured transcription noise between two f32 implementations of this
+  recurrence is 2e-6 to 2e-5 (below). Loosening `EPSILON` to make this green
+  would be deleting the test's only assertion.
+- **Not the fixture's format or its determinism.** A parser that mimics
+  `bit_exact.rs`'s reader exactly consumes all 7 091 978 bytes with zero
+  trailing bytes, finds all 17 tensors under their expected names and shapes,
+  reads 1000 cases, and every value is finite.
+- **Not a per-token difference.** On a *passing* single-token case, burn's
+  `project()` output and the generator agree to ~2e-6 relative (q, k, v, g, b,
+  w) and the scan output at t=0 agrees to ~2e-5. So the projections, the SiLU,
+  the short conv at t=0, the L2 normalize, the decay, the erase, the per-head
+  RMS-norm, the SiLU gate and `o_proj` are all in agreement to f32 noise.
+
+What is left is exactly what T=1 cannot reach: the short conv's cross-token
+taps, and the state carry-over. In burn the carry-over is
+`kernel::fused_recurrent::fused_recurrent_forward`, which slices the *permuted*
+`[B, HV, T, D]` views from `project()` one token at a time
+(`slice_dim(2, t..t+1)`). A stride/offset error in that slice is invisible at
+t=0 (offset 0) and wrong for every t >= 1, which is the observed signature; a
+conv tap-indexing error in the generator has the same signature. The one
+measurement that separates them, still to be run: print q/k/v at t=1 for case 1
+(T=3) on both sides. It was not run here because the machine hit 100% disk
+mid-build and the test binary would not link - so this finding is stated as
+localized, not as diagnosed.
 
 ## FINDINGS — false confidence, for the crate owners
 
@@ -123,18 +169,20 @@ run them set `BURN_DEVICE: cuda`; the crates should fail loudly instead.
   `gen_reference.py` — referenced by `README.md:77` — does not exist in the
   crate at all. `binary-tests` there has never been runnable. Needs a generator
   port like burn-gdn2's, and the fixture committed.
-- **Ten per-crate workflows are the same fiction**
-  (`crates/*/.github/workflows/ci.yml` for attnres, bitnet, gdn2, kda, mhc,
-  rope, sct, situ + `bench.yml`). They cannot execute here. Delete them, or port
-  them when the fork gets its own repository; keeping them invites the belief
-  that the crate is gated.
+- ~~Ten per-crate workflows are the same fiction.~~ **Done**: deleted in
+  `4963c3a` along with the fork-level one, with the GPU job replaced by a
+  local command (a polling runner on this box would sit next to the trainer and
+  be OOM-killed by ram-guard). Keep it that way: the root workflow is the only
+  CI these crates have.
 - **`rust-toolchain.toml` says `channel = "stable"`, which floats.** For a
   library whose headline claim is bit-level reproducibility, the toolchain is
   part of the claim. Pin it (1 line) and say which version.
-- **The 5e-4 absolute tolerance is ~5% of the fixture's output scale** (outputs
-  reach ~9e-3). A relative or RMS-normalised tolerance would be the stronger
-  gate, but picking one needs a measured noise floor from a second independent
-  transcription, not a guess.
+- **The tolerance is measured now, and it is not the problem** (FINDING 0): the
+  noise floor between two f32 implementations of this recurrence is 2e-6 to
+  2e-5, so 5e-4 is the right order of magnitude. What the next version of this
+  gate wants is a *relative* or RMS-normalised tolerance (the fixture's outputs
+  reach ~9e-3, so 5e-4 is ~5% of the signal) — but only after FINDING 0 is
+  closed, or it would be tightening a threshold around an unexplained gap.
 - **`burn-gdn2`'s `python3 tests/gen_reference.py` path in `README.md:262-265`**
   still tells a reader to run the torch script. It is the readable reference and
   it stays, but the runnable one is now `tools/gen_reference.rs`.

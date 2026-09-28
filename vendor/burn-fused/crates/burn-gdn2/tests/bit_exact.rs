@@ -8,9 +8,35 @@
 // original authors' output bytes, and despite this file's name this is NOT a
 // bit-for-bit comparison: it is an absolute-tolerance comparison of two
 // independent implementations of the same math. A real bit-for-bit claim needs
-// NVlabs' kernel in the tree. What this harness actually proves is that
-// burn-gdn2's fused and chunked paths agree with an independent transcription
-// of the published layer to 5e-4 over 1000 shapes.
+// NVlabs' kernel in the tree.
+//
+// STATUS: RED, MEASURED 2026-09-27 AGAINST THIS FIXTURE, AND `binary-tests` IS
+// THEREFORE NOT IN THE CRATE'S `default` FEATURES.
+//     cargo test -p burn-gdn2 --features binary-tests --test bit_exact
+//     1000 cases: max_diff = 1.38e-2, failures = 976/1000   (EPSILON = 5e-4)
+// The diff grows with sequence length - 2.9e-3 at T=3, 8.8e-3 at T=20, 1.2e-2
+// at T=37 - and exactly 24 cases pass, which are exactly the 24 single-token
+// cases (seq_len == 1, i = 0, 42, 84, ...). So the divergence lives in
+// something a single token cannot exercise. Instrumenting both sides on a
+// passing single-token case: the projections (q/k/v/g/b/w out of
+// GatedDeltaNet2::project) agree to ~2e-6 relative, and the scan output at t=0
+// to ~2e-5 - f32 reduction noise, not a semantic difference. What T=1 cannot
+// reach is (a) the short conv's cross-token taps and (b) the state carry-over,
+// and in burn (b) happens only in
+// kernel::fused_recurrent::fused_recurrent_forward, whose per-token
+// slice_dim(2, t..t+1) runs over the *permuted* [B, HV, T, D] views that
+// project() hands it. The one measurement that settles which of (a)/(b) it is:
+// print q/k/v at t=1 for case 1 (T=3) on both sides. Matching q/k/v puts the
+// divergence in that slicing (a burn-ndarray stride question - a library bug,
+// not a reference bug); differing q/k/v puts it in this generator's short_conv
+// tap indexing. Not run here: the machine reached 100% disk mid-build and the
+// test binary would not link.
+//
+// The tolerance is NOT the problem: 5e-4 is 28x below the observed 1.38e-2 and
+// two orders above the measured transcription noise. Do not "fix" this by
+// loosening EPSILON - that hides a real disagreement, and the 24 passing cases
+// prove the harness can discriminate. Full write-up, with the three
+// false-confidence findings from the same audit: vendor/burn-fused/TEST-AUDIT.md.
 //
 // HOW TO REGENERATE, AND HOW TO KNOW IT IS THE SAME DATA.
 //     cd crates/burn-gdn2
