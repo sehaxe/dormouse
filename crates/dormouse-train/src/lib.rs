@@ -865,6 +865,11 @@ pub fn train_loop(
     let mut eval_stream =
         eval_data.as_ref().map(|p| dormouse_data::ByteStream::new(cfg.seq_len, cfg.batch, p));
     let mut best = f32::INFINITY;
+    // Best HELD-OUT BPB seen so far, and where. `best` above is train CE,
+    // which is the quantity ADR-0011 calls fake; this is the one a reader of a
+    // training log should be told about, and it is what `<name>.best` holds.
+    let mut best_eval_bpb = f32::INFINITY;
+    let mut best_eval_step: u64 = 0;
     let mut stress = cfg.stress.then(|| StressMonitor::new(cfg.stress_lr, cfg.stress_every));
     // RAM-offload n-gram tables (report §2.3): --engram-ram keeps the
     // tables in host memory (millions of slots in the 64 GB RAM), trains
@@ -1351,6 +1356,19 @@ pub fn train_loop(
                     }
                     let ebpb = bpb(ece);
                     let bytes = (n as u64) * (cfg.batch * cfg.seq_len) as u64;
+                    // The run's best checkpoint is the one with the best
+                    // HELD-OUT score, not the best train CE. Measured
+                    // 2026-09-28: a 20k-step run reached held-out 4.997 at
+                    // step 6500 - below the unigram counter - and then
+                    // overfit back to 5.450 by step 19500, and the step-19500
+                    // weights were the only ones on disk. `best` above tracks
+                    // train CE, which is exactly the quantity ADR-0011 calls
+                    // fake. So write `<name>.best` whenever held-out improves.
+                    let is_best_eval = ebpb < best_eval_bpb;
+                    if is_best_eval {
+                        best_eval_bpb = ebpb;
+                        best_eval_step = step;
+                    }
                     // Seam counters (ADR-0019): a fused CUDA kernel that falls
                     // back to tensor ops is CORRECT, so the only way a reader
                     // of this log learns the fast path was skipped is that it
@@ -1358,13 +1376,33 @@ pub fn train_loop(
                     let (kda_f, kda_b, norm_asked, norm_skipped) = fused_seam_counts();
                     let (mu_mom, mu_fin) = optim::fused_kernels_skipped();
                     println!(
-                        "step {step:6} EVAL ce={ece:.3} bpb={ebpb:.3} over {bytes} B (fixed window) \
+                        "step {step:6} EVAL ce={ece:.3} bpb={ebpb:.3}{} over {bytes} B (fixed window) \
                          fused kda={kda_f}/{kda_b} norm={}/{} muon_skipped={}/{}",
+                        if is_best_eval { " BEST" } else { "" },
                         norm_asked.saturating_sub(norm_skipped),
                         norm_asked,
                         mu_mom,
                         mu_fin
                     );
+                    if is_best_eval {
+                        // Save under a distinct name: the periodic save owns
+                        // `<name>.bin` and a resume reuses `<name>`, so
+                        // overwriting it here would make "the best model" and
+                        // "the last step" the same file.
+                        let best_name = format!("{}.best", cfg.ckpt_name);
+                        if let Err(e) = save_ckpt(
+                            &dir,
+                            &best_name,
+                            &model,
+                            &optim,
+                            teacher.as_ref(),
+                            ortho_fp32,
+                            step,
+                            ce,
+                        ) {
+                            return Err(format!("step {step}: writing the best checkpoint failed: {e}"));
+                        }
+                    }
                     // Depth curve, no training. Our readout is the MEAN of the
                     // per-iteration outputs, so "stop after k iterations" is
                     // the prefix mean over 1..k - which is exactly what
@@ -1451,7 +1489,11 @@ pub fn train_loop(
     save_ckpt(&dir, &cfg.ckpt_name, &model, &optim, teacher.as_ref(), ortho_fp32, step, ce)
         .map_err(|e| format!("final checkpoint save failed: {e}"))?;
     save_ngram(&dir, &cfg.ckpt_name, host.as_ref(), step)?;
-    println!("done steps={step} best ce={best:.3}");
+    println!(
+        "done steps={step} best ce={best:.3} | BEST HELD-OUT bpb={best_eval_bpb:.3} at step {best_eval_step} \
+         -> checkpoints/{}.best.bin",
+        cfg.ckpt_name
+    );
     Ok(())
 }
 
