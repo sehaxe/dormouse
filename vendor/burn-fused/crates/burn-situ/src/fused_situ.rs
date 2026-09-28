@@ -19,11 +19,67 @@ use cubecl::prelude::*;
 #[cfg(feature = "autodiff")]
 use {
     burn_autodiff::checkpoint::base::Checkpointer,
-    burn_autodiff::checkpoint::strategy::NoCheckpointing,
+    burn_autodiff::checkpoint::strategy::{CheckpointStrategy, NoCheckpointing},
     burn_autodiff::grads::Gradients,
     burn_autodiff::ops::{Backward, Ops, OpsKind},
     burn_autodiff::Autodiff,
 };
+
+// ---- seam counters (ADR-0019) ----
+//
+// ENTRY is incremented AFTER the strategy downcast — the gate that was
+// hardcoded to `NoCheckpointing`, so dormouse's
+// `Autodiff<CudaBare, BalancedCheckpointing>` never got here. A counter
+// placed before that gate would count interest, not arrivals (`f737710`).
+#[cfg(feature = "autodiff")]
+static ENTRY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(all(feature = "autodiff", feature = "cuda"))]
+static FWD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(all(feature = "autodiff", feature = "cuda"))]
+static BWD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(entry, fused_forward, fused_backward)` since [`reset_seam_counts`].
+pub fn seam_counts() -> Option<(u64, u64, u64)> {
+    #[cfg(feature = "autodiff")]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        #[cfg(feature = "cuda")]
+        return Some((ENTRY.load(Relaxed), FWD.load(Relaxed), BWD.load(Relaxed)));
+        #[cfg(not(feature = "cuda"))]
+        return Some((ENTRY.load(Relaxed), 0, 0));
+    }
+    #[cfg(not(feature = "autodiff"))]
+    None
+}
+
+/// Zero the seam counters.
+pub fn reset_seam_counts() {
+    #[cfg(feature = "autodiff")]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        ENTRY.store(0, Relaxed);
+        #[cfg(feature = "cuda")]
+        {
+            FWD.store(0, Relaxed);
+            BWD.store(0, Relaxed);
+        }
+    }
+}
+
+#[cfg(feature = "autodiff")]
+fn note_entry_reached() {
+    ENTRY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(feature = "cuda")]
+fn note_fused_forward() {
+    FWD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(feature = "cuda")]
+fn note_fused_backward() {
+    BWD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
 
 #[cfg(feature = "cuda")]
 /// out[row·H+col] = bg·tanh(g/bg)·sigmoid(g)·bu·tanh(u/bu), g = gate, u = up.
@@ -224,8 +280,14 @@ mod ad {
             #[cfg(feature = "cuda")]
             {
                 type CudaBare = burn_cubecl::CubeBackend;
+                // `B` is the INNER backend here (`OpsPrep::finish` returns
+                // `AutodiffTensor<B>`; the result goes to
+                // `Tensor::from_primitive::<Autodiff<Inner, S>>`), so this
+                // gate asks the right question. The entry below was the one
+                // pinned to `NoCheckpointing`.
                 if std::any::TypeId::of::<B>() == std::any::TypeId::of::<CudaBare>() {
                     if let Some(d_gu) = super::situ_glu_backward_cuda(&gu, &d_out, hidden, bg, bu) {
+                        note_fused_backward();
                         grads.register::<B>(
                             ops.parents[0].clone().unwrap().id,
                             d_gu.try_into_primitive::<B>().unwrap(),
@@ -245,17 +307,18 @@ mod ad {
 
     /// Fused SiTU-GLU with exact backward on `Autodiff<Inner>`; `None` when the
     /// tensor is not on an autodiff backend (caller falls back).
-    pub fn situ_glu_autodiff<Inner: Backend>(
+    pub fn situ_glu_autodiff_s<Inner: Backend, S: CheckpointStrategy>(
         gate_up: Tensor<2>,
         hidden: usize,
         bg: f64,
         bu: f64,
     ) -> Option<Tensor<2>>
     where
-        DispatchTensor: DispatchKindConversion<Autodiff<Inner>> + DispatchKindConversion<Inner>,
+        DispatchTensor: DispatchKindConversion<Autodiff<Inner, S>> + DispatchKindConversion<Inner>,
     {
-        let gu = gate_up.try_into_primitive::<Autodiff<Inner>>().ok()?;
-        let gu_t = Tensor::from_primitive::<Inner>(gu.primitive().clone());
+        let gu = gate_up.try_into_primitive::<Autodiff<Inner, S>>().ok()?;
+        note_entry_reached();
+        let gu_t = Tensor::<2>::from_primitive::<Inner>(gu.primitive().clone());
 
         let out_t = {
             #[cfg(feature = "cuda")]
@@ -263,6 +326,7 @@ mod ad {
                 type CudaBare = burn_cubecl::CubeBackend;
                 if std::any::TypeId::of::<Inner>() == std::any::TypeId::of::<CudaBare>() {
                     if let Some(o) = super::situ_glu_cuda(&gu_t, hidden, bg, bu) {
+                        note_fused_forward();
                         o
                     } else {
                         super::situ_glu_tensor(&gu_t, hidden, bg, bu)
@@ -279,7 +343,7 @@ mod ad {
 
         let out_prim = out_t.try_into_primitive::<Inner>().unwrap();
         let nodes = [gu.node()];
-        let prep = SituGlu.prepare::<NoCheckpointing>(nodes);
+        let prep = SituGlu.prepare::<S>(nodes);
         let out_adt = match prep.compute_bound().stateful() {
             OpsKind::Tracked(mut prep) => {
                 let _ids = [Some(prep.checkpoint(&gu))];
@@ -287,7 +351,20 @@ mod ad {
             }
             OpsKind::UnTracked(prep) => prep.finish(out_prim),
         };
-        Some(Tensor::from_primitive::<Autodiff<Inner>>(out_adt))
+        Some(Tensor::from_primitive::<Autodiff<Inner, S>>(out_adt))
+    }
+
+    /// [`situ_glu_autodiff_s`] on the default (no-checkpointing) strategy.
+    pub fn situ_glu_autodiff<Inner: Backend>(
+        gate_up: Tensor<2>,
+        hidden: usize,
+        bg: f64,
+        bu: f64,
+    ) -> Option<Tensor<2>>
+    where
+        DispatchTensor: DispatchKindConversion<Autodiff<Inner>> + DispatchKindConversion<Inner>,
+    {
+        situ_glu_autodiff_s::<Inner, NoCheckpointing>(gate_up, hidden, bg, bu)
     }
 }
 
@@ -307,16 +384,79 @@ pub fn situ_glu_tensor(gate_up: &Tensor<2>, hidden: usize, bg: f64, bu: f64) -> 
 }
 
 #[cfg(feature = "autodiff")]
-pub use ad::situ_glu_autodiff;
+pub use ad::{situ_glu_autodiff, situ_glu_autodiff_s};
+
+#[cfg(all(test, feature = "autodiff"))]
+mod seam_tests {
+    //! The proof that the strategy gate is strategy-AGNOSTIC, and it runs on
+    //! CPU. No GPU, no kernel: it asserts a caller on
+    //! `Autodiff<Inner, BalancedCheckpointing>` — dormouse's backend — gets
+    //! PAST the seam downcast, and that the old `NoCheckpointing`-only spelling
+    //! does not. Revert `situ_glu_autodiff_s` to `Autodiff<Inner>` and the
+    //! first assertion goes red: it is the assertion, not the comment.
+    use super::*;
+    use burn::backend::DispatchKindConversion;
+    use burn::tensor::{Device, DispatchTensor};
+    use burn_autodiff::Autodiff as Ad;
+    use burn_autodiff::checkpoint::strategy::{
+        BalancedCheckpointing, CheckpointStrategy, NoCheckpointing,
+    };
+
+    type Nd = burn_ndarray::NdArray;
+
+    #[test]
+    fn balanced_checkpointing_reaches_the_seam_and_the_legacy_entry_does_not() {
+        fn reach<S: CheckpointStrategy>(x: &Tensor<2>) -> Option<Tensor<2>>
+        where
+            DispatchTensor: DispatchKindConversion<Ad<Nd, S>> + DispatchKindConversion<Nd>,
+        {
+            situ_glu_autodiff_s::<Nd, S>(x.clone(), 4, 1.0, 1.0)
+        }
+
+        let dev = Device::ndarray().autodiff().gradient_checkpointing();
+        let x = Tensor::<2>::ones([4, 8], &dev);
+
+        reset_seam_counts();
+        let base = seam_counts().expect("autodiff feature is on in this test").0;
+
+        assert!(reach::<BalancedCheckpointing>(&x).is_some());
+        assert_eq!(
+            seam_counts().expect("counters").0,
+            base + 1,
+            "a BalancedCheckpointing caller must get past the seam downcast"
+        );
+
+        assert!(
+            situ_glu_autodiff::<Nd>(x.clone(), 4, 1.0, 1.0).is_none(),
+            "on a Balanced tensor the NoCheckpointing entry must refuse"
+        );
+        assert_eq!(
+            seam_counts().expect("counters").0,
+            base + 1,
+            "the refusing entry must not have counted a reach"
+        );
+
+        // The default strategy still works, and the cross-check refuses, so
+        // the gate is real rather than always-true.
+        let plain = Device::ndarray().autodiff();
+        let xp = Tensor::<2>::ones([4, 8], &plain);
+        assert!(reach::<NoCheckpointing>(&xp).is_some());
+        assert!(reach::<BalancedCheckpointing>(&xp).is_none());
+    }
+}
 
 #[cfg(all(test, feature = "cuda"))]
 mod cuda_tests {
-    // These tests need a live CUDA context; local CPU sweeps skip them via
-    // BURN_DEVICE (the CI gpu-job sets BURN_DEVICE=cuda).
-    fn cuda_enabled() -> bool {
-        std::env::var("BURN_DEVICE")
-            .map(|v| v == "cuda")
-            .unwrap_or(false)
+    // These tests need a live CUDA context. NOT a silent skip: each is
+    // `#[ignore]`d so `cargo test` prints `ignored` with the reason instead of
+    // counting a zero-assertion `return` as a PASS (ADR-0011), and asking for
+    // one explicitly without a GPU FAILS loudly rather than passing.
+    fn require_cuda(what: &str) {
+        assert_eq!(
+            std::env::var("BURN_DEVICE").as_deref(),
+            Ok("cuda"),
+            "{what} needs a live CUDA context: BURN_DEVICE=cuda cargo test -p burn-situ --features cuda,autodiff -- --ignored"
+        );
     }
 
     use super::*;
@@ -367,11 +507,9 @@ mod cuda_tests {
     }
 
     #[test]
+    #[ignore = "needs a live CUDA context: BURN_DEVICE=cuda cargo test -p burn-situ --features cuda -- --ignored"]
     fn unaligned_h_falls_back() {
-        if !cuda_enabled() {
-            eprintln!("skipped: BURN_DEVICE != cuda");
-            return;
-        }
+        require_cuda("unaligned_h_falls_back");
         // h % 8 != 0: the fused kernel must decline so the tensor path runs.
         let dev = Device::default();
         let gu = Tensor::<2>::random([4, 6], Distribution::Normal(0.0, 1.0), &dev);
@@ -386,11 +524,9 @@ mod cuda_tests {
     }
 
     #[test]
+    #[ignore = "needs a live CUDA context: BURN_DEVICE=cuda cargo test -p burn-situ --features cuda -- --ignored"]
     fn situ_fused_matches_tensor() {
-        if !cuda_enabled() {
-            eprintln!("skipped: BURN_DEVICE != cuda");
-            return;
-        }
+        require_cuda("situ_fused_matches_tensor");
         let dev = Device::default();
         for (n, h) in [(16usize, 64usize), (2048, 5120), (4, 8)] {
             let gu = Tensor::<2>::random([n, 2 * h], Distribution::Normal(0.0, 1.0), &dev);
@@ -425,11 +561,9 @@ mod ad_tests {
     }
 
     #[test]
+    #[ignore = "needs a live CUDA context: BURN_DEVICE=cuda cargo test -p burn-situ --features cuda,autodiff -- --ignored"]
     fn fused_backward_matches_tensor_backward() {
-        if !cuda_enabled() {
-            eprintln!("skipped: BURN_DEVICE != cuda");
-            return;
-        }
+        require_cuda("fused_backward_matches_tensor_backward");
         let dev = Device::default().autodiff();
         let gu = Tensor::<2>::random([4, 8], Distribution::Normal(0.0, 1.0), &dev);
 
@@ -452,11 +586,9 @@ mod ad_tests {
     }
 
     #[test]
+    #[ignore = "needs a live CUDA context: BURN_DEVICE=cuda cargo test -p burn-situ --features cuda,autodiff -- --ignored"]
     fn fused_forward_autodiff_matches() {
-        if !cuda_enabled() {
-            eprintln!("skipped: BURN_DEVICE != cuda");
-            return;
-        }
+        require_cuda("fused_forward_autodiff_matches");
         let dev = Device::default().autodiff();
         let gu = Tensor::<2>::random([3, 6], Distribution::Normal(0.0, 1.0), &dev);
         let out_f = situ_glu_autodiff::<CudaBare>(gu.clone(), 3, 1.0, 2.0).unwrap();
@@ -486,11 +618,9 @@ mod fd_tests {
     }
 
     #[test]
+    #[ignore = "needs a live CUDA context: BURN_DEVICE=cuda cargo test -p burn-situ --features cuda,autodiff -- --ignored"]
     fn situ_grad_matches_finite_difference() {
-        if !cuda_enabled() {
-            eprintln!("skipped: BURN_DEVICE != cuda");
-            return;
-        }
+        require_cuda("situ_grad_matches_finite_difference");
         // Independent gradient check: the analytic backward (fused op) must
         // match central finite differences of the scalar loss sum(situ(x)).
         let dev = Device::default();

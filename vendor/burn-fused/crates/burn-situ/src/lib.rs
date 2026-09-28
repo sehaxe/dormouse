@@ -14,8 +14,13 @@
 //! than SwiGLU for deep models and low-bit quantization (MXFP4).
 use burn::tensor::{activation, Tensor};
 
+// `autodiff` alone also compiles this module, deliberately: the fused ADJOINT
+// and its strategy seam live here, and a gate that can only be compile-checked
+// with a GPU is how a `NoCheckpointing`-only entry survived review. The
+// kernels inside stay `#[cfg(feature = "cuda")]`. `pub` because the seam
+// counters are the arm's only externally visible evidence (ADR-0019).
 #[cfg(any(feature = "cuda", feature = "autodiff"))]
-mod fused_situ;
+pub mod fused_situ;
 
 /// Soft-cap: `beta * tanh(x / beta)`
 ///
@@ -46,13 +51,26 @@ pub fn situ_glu(gate_up: Tensor<2>, hidden: usize, beta_gate: f64, beta_up: f64)
 
     #[cfg(all(feature = "autodiff", feature = "cuda"))]
     {
+        // Probe BOTH checkpointing strategies. `Autodiff<Inner>`'s second type
+        // parameter defaults to `NoCheckpointing` and the downcast compares the
+        // whole backend type, so probing only that one silently sent a
+        // `BalancedCheckpointing` caller (dormouse's backend) to the ~7-pass
+        // tensor path: the right answer, slowly, with nothing counting it.
+        use burn_autodiff::checkpoint::strategy::{BalancedCheckpointing, NoCheckpointing};
         type CudaBare = burn_cubecl::CubeBackend;
-        if let Some(out) = crate::fused_situ::situ_glu_autodiff::<CudaBare>(
+        if let Some(out) = crate::fused_situ::situ_glu_autodiff_s::<CudaBare, NoCheckpointing>(
             gate_up.clone(),
             hidden,
             beta_gate,
             beta_up,
         ) {
+            return out;
+        }
+        if let Some(out) = crate::fused_situ::situ_glu_autodiff_s::<
+            CudaBare,
+            BalancedCheckpointing,
+        >(gate_up.clone(), hidden, beta_gate, beta_up)
+        {
             return out;
         }
     }
