@@ -75,6 +75,13 @@ the fork is a leaf. (`burn-spectral`'s `burn-kda`/`burn-muon-plus`/`burn-sct`/
 
 \* `burn-mor` is wired only as a dev-dep into a file that does not compile.
 
+> **The column above is a 2026-09-27 snapshot and it is stale in both
+> directions**: eight of those eighteen crates have since been deleted, and the
+> line counts predate that. The current, measured table — fate, line count and
+> reachability for all of them — is [`library-crate-fate.md`](library-crate-fate.md).
+> Nothing in this snapshot is edited, because a snapshot is a snapshot.
+
+
 ### 1.3 Violations, model → library (things the MODEL owns that a library should)
 
 | # | Violation | LOC | Why it is a violation |

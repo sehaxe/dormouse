@@ -1,5 +1,13 @@
 # burn-ptrn
 
+> **Not in the dormouse build.** No crate under `crates/dormouse-{core,data,train,cli}/`
+> depends on this one; the only incoming edge is the `burn-fused` facade. Kept as a
+> **reference port**: test-time scaling is aimed at exactly this project's
+> parameter-shared loop, but the mechanism as written scores rollouts with a
+> **learned Q-head that ADR-0013 deleted with PonderNet** — `AGENTS.md:645` records
+> that the selection rule must be re-specified before this crate can be used at all.
+> Fate table: `docs/library-crate-fate.md`.
+
 [![CI](https://github.com/sehaxe/burn-ptrn/actions/workflows/ci.yml/badge.svg)](https://github.com/sehaxe/burn-ptrn/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/burn-ptrn)](https://crates.io/crates/burn-ptrn)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)

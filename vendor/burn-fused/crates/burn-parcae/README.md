@@ -1,5 +1,12 @@
 # burn-parcae — stable looping via spectral retention
 
+> **Not in the dormouse build.** No crate under `crates/dormouse-{core,data,train,cli}/`
+> depends on this one; the only incoming edge is the `burn-fused` facade.
+> **Recommendation: WIRE** — this is the one unwired crate aimed at a problem this
+> project has open: spectral control of a parameter-shared loop (`AGENTS.md:256`).
+> Not wired here because the call site is in `crates/`, which this pass does not own.
+> `docs/library-crate-fate.md` names the call site and the A/B that would earn it.
+
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Burn](https://img.shields.io/badge/Burn-0.22-orange.svg)](https://burn.dev)
 

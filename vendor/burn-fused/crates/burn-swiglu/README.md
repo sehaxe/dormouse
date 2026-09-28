@@ -1,5 +1,11 @@
 # burn-swiglu - SiLU-Gated Linear Unit for Burn
 
+> **Not in the dormouse build.** No crate under `crates/dormouse-{core,data,train,cli}/`
+> depends on this one; the incoming edges are `benches/cpu_probe` and the `burn-fused`
+> facade. The FFN it would replace is a line of `burn::activation::silu`, so adopting
+> it would add a dependency to save nothing. Kept as a **reference port** because the
+> probe measures its fused kernel; fate table: `docs/library-crate-fate.md`.
+
 [![CI](https://github.com/sehaxe/burn-swiglu/actions/workflows/ci.yml/badge.svg)](https://github.com/sehaxe/burn-swiglu/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/burn-swiglu)](https://crates.io/crates/burn-swiglu)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)

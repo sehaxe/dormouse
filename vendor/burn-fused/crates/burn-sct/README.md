@@ -1,5 +1,14 @@
 # burn-sct - Spectral Compact Training
 
+> **Not in the dormouse build**, and **duplicated in it.** `dormouse-core` builds its
+> TSCT linears from `burn_spectral::SpectralLinear`
+> (`crates/dormouse-core/src/param.rs:6`); this crate's `SctLinear` is the
+> non-ternary original. The one incoming edge from a wired crate is a
+> `[dev-dependencies]` entry of `burn-spectral` (one example), so this builds in the
+> library's CI and in no training run. **Recommendation: DELETE** once the
+> `tsct_diag` example and the bench probe stop naming it — left in place because
+> those are live path dependencies. See `docs/library-crate-fate.md`.
+
 [![CI](https://github.com/sehaxe/burn-sct/actions/workflows/ci.yml/badge.svg)](https://github.com/sehaxe/burn-sct/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/burn-sct)](https://crates.io/crates/burn-sct)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -113,5 +122,6 @@ MIT
 - **Forward** is memory-optimal: `y = (x@U)·s @ Vᵀ` — peak footprint is just
   the input + the two GEMM outputs (no extra `[in, k]` intermediate).
 - **QR retract** runs on CUDA via custom `sct_qr_r`/`sct_qr_q` kernels (no host
-  round-trip, verified 2e-7); the CPU fallback uses AVX2/FMA SIMD dot3 on
-  x86_64.
+  round-trip; the fused path agrees with the CPU Householder path to ~2e-7 —
+  again our own two formulations, so kind (d), not a verification of the paper);
+  the CPU fallback uses AVX2/FMA SIMD dot3 on x86_64.
