@@ -161,12 +161,25 @@ impl LoopBlock {
         let bf16 = self.bf16;
         let h0 = x.clone();
         let mut h = x;
-        // Gated Residual: every branch starts from the token embedding.
+        // Gated Residual: every branch starts from the token embedding, and
+        // `h` becomes the READ of the branches (Eq. 31-32) rather than the
+        // embedding. The read is also re-taken after every write, which is
+        // what makes the readout see the current iteration's deposit.
         let use_gr = self.gr.is_some();
         let mut branches: Vec<Tensor<3>> = if use_gr {
             vec![h0.clone(); GR_BRANCHES]
         } else {
             Vec::new()
+        };
+        // The normalized branches Eq. 33 reads `vec(Rhat)` from. Refreshed
+        // with every read, so the write always uses the CURRENT branches.
+        let mut gr_state: Option<GrState> = if use_gr {
+            let gr = self.gr.as_ref().unwrap();
+            let (x_in, st) = gr.read::<B>(&branches);
+            h = x_in;
+            Some(st)
+        } else {
+            None
         };
         let mut kda_s: Option<Tensor<4>> = kda_state;
         // Fixed depth (ADR-0013): out_acc averages the per-iteration outputs.
@@ -208,25 +221,20 @@ impl LoopBlock {
                 .clone()
                 .slice([row..row + 1, 0..d])
                 .reshape([1, 1, d]);
-            // GR read: normalized gated average of the branches (report
-            // Eq. 30-32) replaces the pre-norm + ReZero pair.
-            let mut gr_state: Option<GrState> = None;
-            let h_ctx = if use_gr {
-                let gr = self.gr.as_ref().unwrap();
-                let (x_in, st) = gr.read::<B>(&branches);
-                gr_state = Some(st);
+            // The loop's depth signal. Under GR it lands on the READ (the
+            // report's block has no such term; the loop needs one), under
+            // ReZero on the residual stream - same place in both, so the two
+            // arms differ only in the residual operator underneath.
+            let add_iter = |base: Tensor<3>| -> Tensor<3> {
                 if bf16 {
-                    x_in.clone() + iter_ctx.cast(FloatDType::BF16)
+                    base + iter_ctx.clone().cast(FloatDType::BF16)
                 } else {
-                    x_in.clone() + iter_ctx
-                }
-            } else {
-                if bf16 {
-                    h.clone() + iter_ctx.cast(FloatDType::BF16)
-                } else {
-                    h.clone() + iter_ctx
+                    base + iter_ctx.clone()
                 }
             };
+            // GR: `h` is the read of the branches as they stand (Eq. 31-32),
+            // which is initialized below and re-read after every write.
+            let h_ctx = add_iter(h.clone());
             // Pre-norm for the block body (identity under GR: the read
             // already normalized).
             let normed = if use_gr {
@@ -329,9 +337,16 @@ impl LoopBlock {
             if use_gr {
                 let gr = self.gr.as_ref().unwrap();
                 branches = gr.write::<B>(&branches, gr_state.as_ref().unwrap(), y);
-                // Readout reads the normalized block input; the branches
-                // carry the accumulated state for the next iteration.
-                h = h_ctx.clone();
+                // Re-read the branches Eq. 32, AFTER the Eq. 34 deposit. The
+                // readout below and the next iteration's input are both this
+                // read, so iteration n's output contains iteration n's own
+                // block body. Reading the pre-write state here made GR a
+                // depth-(iters-1) model: at max_iter=1 the entire body (KDA,
+                // memory, every expert) was discarded and the block reduced to
+                // out_proj(read(h0) + e_0), while the ReZero arm kept `y`.
+                let (x_next, st) = gr.read::<B>(&branches);
+                gr_state = Some(st);
+                h = x_next;
             } else {
                 let scale = self.residual_scale.val().clone().reshape([1, 1, 1]);
                 // Store the residual back in the activation dtype (bf16
@@ -366,12 +381,10 @@ impl LoopBlock {
             // silently reduced the "looped block" to 4 independent passes
             // over `x + sum(e_k)` with shared weights - a weight-tied
             // ensemble with ~2 effective layers, not a loop, and 4x the
-            // forward/backward for ~1x the capacity. Under Gated Residual the
-            // state lives in the branch array instead (`gr.write` just
-            // updated it) and h is re-read there, so only that path resets.
-            if use_gr {
-                h = h_ctx.clone();
-            }
+            // forward/backward for ~1x the capacity. Under Gated Residual `h`
+            // is the post-write READ of the branches, assigned in the write
+            // branch above, so there is nothing to reset: both arms carry
+            // this iteration's body into the next one.
         }
         let rec = rec.div_scalar(b as f32); // mean over batch
         let kda = kda_s.unwrap_or_else(|| Tensor::zeros([1, 1, 1, 1], &h.device()));

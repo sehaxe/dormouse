@@ -522,16 +522,37 @@ payoff for a 16 GB GPU + 64 GB RAM box. **Status per item in brackets:**
    Rule from the report: n-gram tables train with Adam, weight decay disabled
    (ours: plain Adam in-VRAM; Nesterov + Sinkhorn on the host path). Loss drops
    monotonically with vocab scale; downstream saturates — evaluate both.
-2. **Gated Residual (GR)** [wired, never A/B'd]. Widen the residual stream to 4
-   branches; read = elementwise sigmoid gate on a low-rank bottleneck (rank
-   d/8) over group-RMSNorm'd branches; write = one scalar per branch; no
-   branch-mixing operator. Replaces ReZero scale and pre-norm. Report: −0.026
-   loss at 276B tokens, zero loss spikes at 4× LR, no qk-clip/SwiGLU-clip needed.
+2. **Gated Residual (GR)** [wired, never A/B'd, and the code did not match the
+   equations until 2026-09-28]. Widen the residual stream to 4 branches; read =
+   elementwise sigmoid gate on a low-rank bottleneck (rank d/8) over
+   group-RMSNorm'd branches; write = one scalar per branch; no branch-mixing
+   operator. Replaces ReZero scale and pre-norm. Report: −0.026 loss at 276B
+   tokens, zero loss spikes at 4× LR, no qk-clip/SwiGLU-clip needed.
    Do NOT use sparse writes (top-2 branches): fine in pretraining, degrades
    post-training. Shipped as the `use_gr` config flag (off by default for
    checkpoint compatibility; `crates/dormouse-core/src/gr.rs`, all slicing
    2D/3D — a 4D gate tensor would crash sm_120), convergence-tested on NdArray.
    Also `GatedNorm` (RMSNorm ⊙ σ(W2 SiLU(W1 RMSNorm(u)))) helps everywhere.
+   **The audit of 2026-09-28 found four defects, all fixed in the same commit:**
+   the write was `(1/nr)W_w vec(R̂)` with **no σ and no factor 2** (Eq. 33 is
+   `2σ((1/nr)W_w vec(R̂))`) while the module doc sold the sigmoid as the
+   stability mechanism — `s` was unconstrained in sign, so a block could cancel
+   the branch it wrote; the read was missing the `1/nr` **inside the SiLU**
+   (Eq. 31), giving 4× the gate pre-activation and a gate saturated at init
+   instead of near 0.5; and **the readout was one iteration behind** — the
+   per-iteration output came from the state *before* `write`, so GR was a
+   depth-(iters−1) model and at `max_iter=1` the whole block body was
+   discarded. Eq. 32 was the one of the three that was right. `gr.rs` now pins
+   Eq. 31/32 and Eq. 33/34 against a host reference, and
+   `crates/dormouse-core/tests/gr_seam.rs` pins the loop's ordering (the output
+   must change when the block body changes, at every depth). **Placement is
+   still ours, not the report's**: one GR per loop ITERATION of a weight-shared
+   block, with the iteration embedding added to the read, against a separate GR
+   per attention and MLP sublayer of a 56-sublayer stack. A transposition, so
+   the report's −0.026 and its zero-spike result do not transfer unmeasured.
+   **Every GR-shaped number before this commit is invalid**, and there were
+   none: `use_gr = false` in all eight configs, so no preset, log or A/B ever
+   ran it (`docs/audit-2026-09-25.md` already ruled it "A/B or delete").
 3. **Muon+** [wired, the default optimizer]. Muon + post-polar ColRow
    normalization, fused CUDA kernels, hybrid 2D→Muon+/1D→AdamW, with the
    report's param-group routing: Muon+ ColRow on 2D linear maps; AdamW for
@@ -648,7 +669,15 @@ Ranked applicability:
   upgrade is unconditional — `ActFormat::attn()` maps `Fp4 -> Int(8)` and
   `Int(b) -> Int(b.max(8))` — so `--act-quant fp4` has NEVER run 4-bit
   attention.** The earlier claim "fp4 + group 128, 100 steps, 0 NaN, convergence
-  == fp32" verified the FFN path only.
+  == fp32" verified the FFN path only. **CORRECTED AGAIN 2026-09-28: `fp4` was
+  not e2m1 either.** The mantissa rule emitted 0.75 (not a level of the format)
+  and the caller scaled each block's max onto **1**, so only {0, 0.5, 0.75, 1}
+  were ever reachable — a ~3-level quantizer with a 4-bit label, whose 1.5/2/3/4/6
+  levels were dead code. Fixed: the grid is the real e2m1 (`E2M1`, 8 magnitudes,
+  16 codes) and the block scale maps onto the FORMAT's max (`ActFormat::max_value`
+  = 6). **Every `--act-quant fp4` number before 2026-09-28 is INVALIDATED** — it
+  measured a 3-level quantizer. The `4` and `8` paths are bit-identical
+  (`int4_levels_are_the_whole_symmetric_range` pins that).
 - `--opt mix|mix-adan|adan|adamw|muon` — optimizer (default `mix`; see
   `optim.rs`).
 - `--factors-fallback` — drop expert TSCT u/v factors from the Muon+ group to

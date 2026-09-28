@@ -171,10 +171,22 @@ pre-norm + ReZero pair, off by default.
 ### Gated Residual (GR)
 
 Four-branch residual: a normalized gated read over per-branch RMSNorms plus a
-per-branch scalar write, replacing pre-norm + ReZero when `use_gr` is set.
+per-branch scalar write, replacing pre-norm + ReZero when `use_gr` is set. Our
+`read` is Eq. 31-32 and our `write` is Eq. 33-34 of the Qwen3.8-Flash-Next
+report, including the `1/nr` inside the SiLU and the `2 sigma` on the write
+scaler; `gr.rs`'s tests compute both on the host from the module's own weights
+and compare.
 
-`crates/dormouse-core/src/gr.rs` (`GR_BRANCHES = 4` at `:25`), wired at
-`loop_block.rs:207`, read/write at `:314-322` and `:467-473`.
+The one thing that is OURS: the report puts a GR module on the attention block
+and the MLP block of every layer, we run ONE weight-shared block recursively, so
+the module is read and written once per loop ITERATION and the loop's
+iteration embedding is added to the read. A transposition, not the report's
+placement, and the report's numbers (-0.026 loss, no loss spikes at 4x LR) do
+not transfer to it unmeasured.
+
+`crates/dormouse-core/src/gr.rs` (`GR_BRANCHES = 4`), wired in
+`loop_block.rs`'s `forward_full_state`; the loop's ordering test is
+`crates/dormouse-core/tests/gr_seam.rs`.
 
 **Not** mHC (`burn-mhc`), not AttnRes (`burn-attnres`) — both are implemented in
 the library and neither is wired; ADR-0017 lists the four residual
@@ -206,7 +218,15 @@ use_tsct=false` builds the dense variant, and that A/B is live.
 2. **Activation quant** — `--act-quant 4|8|fp4` + `--act-group N`, BitNet
    a4.8-style, applied to the FFN input at the requested width and to the
    attention input at `max(bits, 8)`.
-   `crates/dormouse-core/src/act_quant.rs:24` and `:34` (`ActFormat::attn`).
+   `crates/dormouse-core/src/act_quant.rs` (`ActFormat`, `E2M1`,
+   `ActFormat::attn`, `ActFormat::max_value`).
+   `fp4` is the OCP MX **e2m1** grid: 8 magnitudes (0, 0.5, 1, 1.5, 2, 3, 4, 6),
+   16 codes, 4 bits. The block scale maps a block's max onto 6, not onto 1 —
+   normalizing to [-1, 1] left every level above 1 unreachable and the format
+   carried 3 of its 8 magnitudes. Fixed 2026-09-28, together with a 0.75 that
+   is not in e2m1 at all; **every `--act-quant fp4` number before that date is
+   invalidated** (it was a ~3-level quantizer wearing a 4-bit label). The `4`
+   and `8` paths are unchanged — same grid, same output.
 3. **Weight quant** — the ternary/NM quantizers inside the library
    (`burn-bitnet`), reached through the TSCT factors.
 

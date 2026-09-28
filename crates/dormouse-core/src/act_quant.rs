@@ -9,20 +9,29 @@
 //! limitation entirely.
 //!
 //! Formats:
-//! - [`ActFormat::Fp4`]: e2m1 (the paper's fp4). Values 0, +/-{0.5, 0.75,
-//!   1, 1.5, 2, 3, 4, 6}; round-to-nearest via the e2m1 mantissa rule.
+//! - [`ActFormat::Fp4`]: **e2m1**, the OCP MX FP4 grid: 1 sign, 2 exponent
+//!   (bias 1), 1 mantissa, so the magnitudes are 0, 0.5, 1, 1.5, 2, 3, 4, 6 -
+//!   16 codes, 4 bits. There is no 0.75; the only subnormal is 0.5.
 //! - [`ActFormat::Int(bits)`]: symmetric integer (int4 levels 7, int8 127).
+//!
+//! The scale maps a block's max onto the FORMAT's max ([`ActFormat::max_value`]),
+//! not onto 1. Normalizing to [-1, 1] and calling that "fp4" is the bug this
+//! comment used to hide: only {0, 0.5, 0.75, 1} were ever reachable, so the
+//! format carried 3 bits of code space and none of 1.5..6 - and 1.0 only at
+//! the exact block max.
 //!
 //! Scales are per-token (group = 0) or per-group of `group` columns; the
 //! a4.8 recipe uses group scales for the FFN activations.
 
 use burn::backend::{Backend, DispatchKindConversion};
-use burn::tensor::{DispatchTensor, FloatDType, Tensor};
+use burn::tensor::{DispatchTensor, Tensor};
 
 /// Activation quantization format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActFormat {
-    /// e2m1 fp4 (the paper's a4).
+    /// e2m1 fp4 - the OCP MX FP4 grid, [`E2M1`]. Four bits, and now four
+    /// bits' worth of levels are actually reachable (they were not: see the
+    /// module doc).
     Fp4,
     /// Symmetric integer, `bits` levels 2^(bits-1)-1.
     Int(u32),
@@ -37,6 +46,17 @@ impl ActFormat {
             ActFormat::Int(b) => ActFormat::Int(b.max(8)),
         }
     }
+
+    /// Largest magnitude the format represents, and therefore what a block's
+    /// max must be scaled ONTO: 6 for e2m1, 2^(bits-1)-1 for the integers.
+    /// The scale is `block_max / max_value`; using `block_max` alone is what
+    /// left fp4 with 3 of its 8 magnitudes unreachable.
+    pub fn max_value(self) -> f32 {
+        match self {
+            ActFormat::Fp4 => 6.0,
+            ActFormat::Int(bits) => ((1i64 << (bits - 1)) - 1) as f32,
+        }
+    }
 }
 
 /// Quantize `x [B, D]` with a straight-through estimator.
@@ -48,30 +68,35 @@ where
 {
     let [b, d] = x.dims();
     let g = if group == 0 { d } else { group.min(d) };
+    // The block max, in the format's OWN units: dividing by `block_max`
+    // normalized to [-1, 1], which for e2m1 (max 6) made every level above 1
+    // unreachable and cost the format half its code space.
+    let fmax = fmt.max_value();
     let scale = if g == d {
         // Per-token scale: [b, 1] broadcast over d.
-        x.clone().abs().max_dim(1).clamp_min(1e-8)
+        x.clone().abs().max_dim(1)
     } else {
         // Per-group scale: [b, d/g, 1] broadcast inside each group.
         x.clone()
-            .reshape([b, d / g, g])
             .abs()
+            .reshape([b, d / g, g])
             .max_dim(2)
-            .clamp_min(1e-8)
             .reshape([b, d / g, 1])
             .repeat(&[1, 1, g])
             .reshape([b, d])
     };
-    let norm = x.clone().div(scale.clone()); // [-1, 1] per scale unit
+    let scale = scale.clamp_min(1e-8).div_scalar(fmax);
+    let norm = x.clone().div(scale.clone()); // in [-fmax, fmax]
+    // `q` comes back in the FORMAT'S OWN UNITS (an e2m1 level, or an integer
+    // level count) and is dequantized by the same `scale`, so the int path is
+    // bit-identical to the old `round(norm*l)/l * block_max` spelling: the
+    // format change is confined to Fp4.
     let q = match fmt {
         ActFormat::Fp4 => fp4_round::<B>(norm),
         ActFormat::Int(bits) => {
             let l = ((1i64 << (bits - 1)) - 1) as f32;
-            norm.clone()
-                .mul_scalar(l)
-                .round()
-                .clamp(-l, l)
-                .div_scalar(l)
+            debug_assert_eq!(l, fmax, "max_value and the int level must agree");
+            norm.round().clamp(-l, l)
         }
     };
     let xq = q.mul(scale);
@@ -79,60 +104,47 @@ where
     x.clone().add(xq.sub(x).detach())
 }
 
-/// Round to the nearest e2m1 value (needs the input within the fp4 range;
-/// the caller scales it to [-1, 1] first and rescales after).
+/// The e2m1 magnitude grid, ascending. The OCP MX FP4 format: 1 sign bit,
+/// 2 exponent bits (bias 1), 1 mantissa bit. Positive values are
+/// 0, 0.5, 1, 1.5, 2, 3, 4, 6; 0.5 is the subnormal and 0.75 IS NOT IN THE
+/// FORMAT. The old `0.625` half-step emitted 0.75, which is not e2m1.
+pub const E2M1: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+
+/// Round to the nearest e2m1 value, ties away from zero. `x` must already be
+/// in the format's range (the caller scales to +/-6); anything above 6
+/// saturates, anything below 0.25 is zero.
+///
+/// The previous implementation derived the level from a log2 exponent plus a
+/// mantissa step, which is where 0.75 came from, and the previous caller
+/// normalized to [-1, 1] so the levels above 1 were dead code. This is a
+/// direct search over [`E2M1`]: the grid is eight numbers, and a bucket test
+/// per level is both shorter to read and impossible to get subtly wrong the
+/// way a re-derived mantissa rule is.
 fn fp4_round<B: Backend>(x: Tensor<2>) -> Tensor<2>
 where
     DispatchTensor: DispatchKindConversion<B>,
 {
+    let dims = x.dims();
+    let device = x.device();
     let a = x.clone().abs();
     let sign = x.div(a.clone().clamp_min(1e-12)).clamp(-1.0, 1.0);
-    // e2m1 positive set: 0.5, 0.75, 1, 1.5, 2, 3, 4, 6. Rule: e = floor(log2 a),
-    // m = a / 2^e in [1, 2) for a >= 0.5; m < 1.25 -> 2^e, else 1.5*2^e.
-    let zero = a.clone().lower_scalar(0.25).int().cast(FloatDType::F32);
-    let half = a
-        .clone()
-        .greater_equal_scalar(0.25)
-        .int()
-        .cast(FloatDType::F32)
-        .mul(a.clone().lower_scalar(0.625).int().cast(FloatDType::F32));
-    let big = a
-        .clone()
-        .greater_equal_scalar(0.625)
-        .int()
-        .cast(FloatDType::F32);
-    let ln2 = std::f32::consts::LN_2;
-    let e = a
-        .clone()
-        .clamp_min(1e-8)
-        .log()
-        .div_scalar(ln2)
-        .floor(); // floor(log2 a)
-    let v = e.mul_scalar(ln2).exp(); // 2^e
-    let m = a.clone().div(v.clone());
-    let mant = m
-        .clone()
-        .lower_scalar(1.25)
-        .int()
-        .cast(FloatDType::F32)
-        .mul_scalar(1.0)
-        .add(
-            m.greater_equal_scalar(1.25)
-                .int()
-                .cast(FloatDType::F32)
-                .mul_scalar(1.5),
-        );
-    let val = v.mul(mant).mul(big);
-    // 0.5 bucket: a in [0.25, 0.625) -> 0.5
-    let val = val.add(half.mul_scalar(0.5));
-    // sign * value, zero for a < 0.25
-    sign.mul(val).mul(zero.neg().add_scalar(1.0))
+    // Ascending ladder of thresholds, each one overwriting the last: 0.5
+    // claims [0.25, ...), then 1.0 claims [0.75, ...) on top of it, and so on
+    // to 6.0 at [5.0, ...), which saturates. Below 0.25 no threshold fires and
+    // the value stays zero. A two-sided mask would be the same thing spelled
+    // with a Bool AND; the thresholds are already monotonic.
+    let mut val = Tensor::zeros(dims, &device);
+    for (i, level) in E2M1.iter().enumerate().skip(1) {
+        let lo = 0.5 * (E2M1[i - 1] + level);
+        val = val.mask_fill(a.clone().greater_equal_scalar(lo), *level);
+    }
+    sign.mul(val)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn_ndarray::NdArray;
+    use burn::backend::NdArray;
     use burn::tensor::Distribution;
 
     #[test]
@@ -150,22 +162,134 @@ mod tests {
         assert!(max_d > 1e-4, "quantization must actually quantize");
     }
 
+    /// Every positive e2m1 magnitude must round to itself. The list is
+    /// [`E2M1`] minus the sign, NOT a list written to match the
+    /// implementation: 0.75 was on it and is not in the format.
     #[test]
-    fn fp4_round_matches_e2m1_values() {
+    fn every_e2m1_magnitude_round_trips() {
         let dev = burn::tensor::Device::ndarray();
-        // Every positive e2m1 value must round to itself.
-        let vals: Vec<f32> = vec![0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+        let vals: Vec<f32> = E2M1.iter().skip(1).copied().collect();
         let x: Tensor<2> = Tensor::from_data(
-            burn::tensor::TensorData::new(vals.clone(), [2, 4]),
+            burn::tensor::TensorData::new(vals.clone(), [1, vals.len()]),
             &dev,
         );
-        let q = fp4_round::<NdArray>(x);
-        let out: Vec<f32> = q.into_data().try_to_vec().unwrap();
+        let out: Vec<f32> = fp4_round::<NdArray>(x).into_data().try_to_vec().unwrap();
         for (a, b) in vals.iter().zip(out.iter()) {
+            assert!((a - b).abs() < 1e-4, "e2m1 round-trip: {a} -> {b}");
+        }
+        // And the negative mirror, which is where a lost sign shows up.
+        let x: Tensor<2> = Tensor::from_data(
+            burn::tensor::TensorData::new(vals.iter().map(|v| -v).collect::<Vec<_>>(), [1, vals.len()]),
+            &dev,
+        );
+        let out: Vec<f32> = fp4_round::<NdArray>(x).into_data().try_to_vec().unwrap();
+        for (a, b) in vals.iter().zip(out.iter()) {
+            assert!((a + b).abs() < 1e-4, "e2m1 round-trip: -{a} -> {b}");
+        }
+    }
+
+    /// A golden of the FORMAT, not of the code: for a grid of inputs, the
+    /// output must be the nearest member of [`E2M1`] (ties to the coarser
+    /// level) and nothing else. Written against the format's definition - 1
+    /// sign, 2 exponent (bias 1), 1 mantissa, so the magnitudes are exactly
+    /// 0, .5, 1, 1.5, 2, 3, 4, 6 - and it fails for any other grid, which is
+    /// what the old test could not do.
+    #[test]
+    fn fp4_output_is_always_the_nearest_e2m1_level() {
+        let dev = burn::tensor::Device::ndarray();
+        // Midpoints are where a rounding rule differs; sample around each.
+        let mut grid: Vec<f32> = (0..=120).map(|i| i as f32 * 0.1 - 1.0).collect();
+        for w in E2M1.windows(2) {
+            let mid = 0.5 * (w[0] + w[1]);
+            for eps in [-0.02f32, -0.005, 0.0, 0.005, 0.02] {
+                grid.push(mid + eps);
+                grid.push(-(mid + eps));
+            }
+        }
+        let n = grid.len();
+        let want: Vec<f32> = grid
+            .iter()
+            .map(|v| {
+                let a = v.abs();
+                // Nearest level, ties to the LOWER magnitude.
+                let mut best = 0.0f32;
+                for l in E2M1.iter().skip(1) {
+                    if a >= 0.5 * (best + l) {
+                        best = *l;
+                    }
+                }
+                best.copysign(*v)
+            })
+            .collect();
+        let got: Vec<f32> = fp4_round::<NdArray>(Tensor::from_data(
+            burn::tensor::TensorData::new(grid.clone(), [1, n]),
+            &dev,
+        ))
+        .into_data()
+        .try_to_vec()
+        .unwrap();
+        for (i, (a, b)) in grid.iter().zip(got.iter()).enumerate() {
             assert!(
-                (a - b).abs() < 1e-4,
-                "fp4 round-trip: {a} -> {b}"
+                (want[i] - b).abs() < 1e-4,
+                "e2m1: {a} -> {b}, nearest of E2M1 is {}",
+                want[i]
+            );
+            assert!(
+                E2M1.iter().any(|l| (l - b.abs()).abs() < 1e-6),
+                "e2m1 produced {b} for {a}, which is not a level of the format"
             );
         }
+    }
+
+    /// A ramp over [0, 1] in one block, so the block max is 1 and the scale is
+    /// `1 / max_value`. `quant_act` returns DEQUANTIZED values, so level `L`
+    /// comes back as `L * scale`.
+    fn dequantized_ramp(fmt: ActFormat, n: usize) -> Vec<f32> {
+        let dev = burn::tensor::Device::ndarray();
+        let ramp: Vec<f32> = (0..n).map(|i| i as f32 / (n - 1) as f32).collect();
+        let q = quant_act::<NdArray>(
+            Tensor::from_data(burn::tensor::TensorData::new(ramp, [1, n]), &dev),
+            fmt,
+            0,
+        );
+        q.into_data().try_to_vec().unwrap()
+    }
+
+    /// The scale must reach the whole format. `--act-quant fp4` is a 4-bit
+    /// claim; with the old `scale = block_max` the normalized values stopped at
+    /// 1, so {1.5, 2, 3, 4, 6} were unreachable and the "e2m1" grid carried
+    /// three levels. This is the test that would have caught it.
+    #[test]
+    fn fp4_reaches_every_level_through_the_public_quantizer() {
+        let out = dequantized_ramp(ActFormat::Fp4, 4096);
+        let s = 1.0 / ActFormat::Fp4.max_value();
+        let missing: Vec<f32> = E2M1
+            .iter()
+            .copied()
+            .filter(|l| !out.iter().any(|v| (v - l * s).abs() < 1e-4))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "fp4 through quant_act never emitted {missing:?} of the e2m1 grid (scale {s}) - the block scale is not reaching the format max"
+        );
+    }
+
+    /// The int path's scale change (`block_max / (2^(b-1)-1)` instead of
+    /// `block_max`) must be a no-op on the OUTPUT: the old code multiplied the
+    /// normalized value by the level count and divided back, so both
+    /// spellings produce the same grid. If this ever fails, the refactor
+    /// changed a format instead of renaming it.
+    #[test]
+    fn int4_levels_are_the_whole_symmetric_range() {
+        // Block max is 1, so level k dequantizes to k/7 either way - the
+        // scale refactor must not move the int grid by a factor of 7.
+        let out = dequantized_ramp(ActFormat::Int(4), 4096);
+        let want: Vec<f32> = (0..=7).map(|k| k as f32 / 7.0).collect();
+        let missing: Vec<f32> = want
+            .iter()
+            .copied()
+            .filter(|v| !out.iter().any(|o| (o - v).abs() < 1e-5))
+            .collect();
+        assert!(missing.is_empty(), "int4 never emitted {missing:?}");
     }
 }
