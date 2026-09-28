@@ -855,7 +855,16 @@ pub fn train_loop(
     // (ADR-0021).
     let pre_batches = cfg.warmup as u64
         + (cfg.quant_check && qfmt != burn_spectral::QuantFormat::Fp32) as u64;
-    let mut stream = dormouse_data::ByteStream::new(cfg.seq_len, cfg.batch, &data);
+    // ADR-0010's rule is filter-time and structural, but nothing could ENFORCE
+    // it: `collect_files` recurses into every subdirectory, so pointing
+    // `--data` at the parent of an eval tree trains on the held-out bytes
+    // with no error, and the eval then reports a memorised number as if it
+    // were generalisation. `train_and_eval` canonicalises both roots and
+    // refuses when either contains the other. It is one call site, and the
+    // alternative - a marker file - protects only the runs that remember to
+    // write one, which is the failure this rule exists to prevent.
+    let (mut stream, mut eval_stream) =
+        dormouse_data::ByteStream::train_and_eval(cfg.seq_len, cfg.batch, &data, eval_data.as_deref());
     if step > 0 {
         // Resume: fast-forward past bytes already trained on, or the stream
         // rewinds to byte 0 and the model re-reads (and memorizes) the corpus
@@ -864,8 +873,6 @@ pub fn train_loop(
         stream.skip_bytes(skip);
         println!("stream resume: skipped {skip} bytes (step {step} + {pre_batches} pre-loop batch(es))");
     }
-    let mut eval_stream =
-        eval_data.as_ref().map(|p| dormouse_data::ByteStream::new(cfg.seq_len, cfg.batch, p));
     let mut best = f32::INFINITY;
     // Best HELD-OUT BPB seen so far, and where. `best` above is train CE,
     // which is the quantity ADR-0011 calls fake; this is the one a reader of a
