@@ -43,8 +43,25 @@
 //!     reason and carries the same exception.
 //! If this test goes red, that is a finding about the kernel, not a tolerance
 //! to be widened.
+//!
+//! MEASURED 2026-09-29 on the RTX 5060 Ti, through `tools/gpu-gate.sh`:
+//!   * the fused forward kernel LAUNCHED (counter 1) and the fused adjoint
+//!     kernel LAUNCHED (counter 1) on `Autodiff<CudaBare,
+//!     BalancedCheckpointing>` at B=10 H=12 T=512 k=v=64 chunk 16. That half of
+//!     the claim is now measured rather than advertised.
+//!   * `chunk` must be 16, not `Gdn2Config`'s default 64: at 64 the fused
+//!     forward itself panics with the same matmul error. Every fused test in
+//!     this library uses 16, and `fused_chunk_verify.rs:31-32` says why ("chunk
+//!     <= 16: the fused kernels' numerical range (K3 design)"). The default and
+//!     the kernel design disagree; `bench_train_cuda.rs` is the only thing that
+//!     ever ran chunk 64 and it discards its result.
+//!   * the test is RED, and the panic is in the TENSOR-OPS REFERENCE, not the
+//!     fused path: `chunk_wy_forward` dies on a matmul of [10,12,16,64] against
+//!     [10,12,512,64] ("inner dimension ... 64 and 512"). Handed to burn-gdn2's
+//!     owner; the fix is in that crate, not in this file. Note which arm is
+//!     broken: the fallback that was supposed to be the safe harbour.
 
-use burn::backend::AutodiffBackend;
+use burn::backend::{AutodiffBackend, BackendTypes};
 use burn::tensor::{Device, Distribution, Tensor};
 use burn_fused::burn_autodiff::Autodiff;
 use burn_fused::burn_autodiff::checkpoint::strategy::BalancedCheckpointing;
@@ -101,13 +118,16 @@ fn finite(t: &Tensor<4>) -> bool {
 fn gated_delta_chunk_path_runs_at_the_production_shape() {
     let device = Device::cuda(0);
     device.seed(42); // a gate that flakes is worse than no gate
-    let (batch, heads, time, k_dim, v_dim, chunk) = (10usize, 12usize, 512usize, 64, 64, 64);
+    let (batch, heads, time, k_dim, v_dim, chunk) = (10usize, 12usize, 512usize, 64, 64, 16);
     let scale = (k_dim as f64).powf(-0.5);
+    // `Backend::name` takes the backend's own device type (`CubeDevice`), not
+    // the tensor-level `Device` these tensors are built on.
+    let backend_device = <AdBal as BackendTypes>::Device::default();
     println!(
         "production shape: B={batch} H={heads} T={time} k={k_dim} v={v_dim} chunk={chunk} \
          ({} chunks), backend {}",
         time / chunk,
-        <AdBal as burn::backend::Backend>::name(&device),
+        <AdBal as burn::backend::Backend>::name(&backend_device),
     );
 
     // The gate must be open for the backend we ship on, or the rest of this
@@ -155,21 +175,11 @@ fn gated_delta_chunk_path_runs_at_the_production_shape() {
             &device
         )),
     ];
-    // The state is [B, H, K, V] and starts at zero, as it does in training.
-    let state = lift!(Tensor::<4>::zeros(
-        [batch, heads, k_dim, v_dim],
-        &device
-    ));
-    let inputs = [
-        inp[0].clone(),
-        inp[1].clone(),
-        inp[2].clone(),
-        inp[3].clone(),
-        inp[4].clone(),
-        inp[5].clone(),
-        inp[6].clone(),
-        state,
-    ];
+    // Seven inputs, and seven: the op's last argument IS the incoming state
+    // S0. An earlier revision of this test built an eighth tensor and then
+    // demanded a gradient for it, which asserted that a tensor the op never
+    // received came back differentiated. Seven is the arity.
+    let inputs = inp;
 
     reset_fused_calls();
     let (out, st) = match chunk_dispatch::<AdBal>(
@@ -205,18 +215,8 @@ fn gated_delta_chunk_path_runs_at_the_production_shape() {
         "the fused adjoint kernel never launched: the gate is closed again"
     );
 
-    for (i, t) in inputs.iter().enumerate() {
-        let g = t
-            .grad(&grads)
-            .unwrap_or_else(|| panic!("input {i} got no gradient"));
-        assert!(finite(&g), "input {i} got a non-finite gradient");
-        assert!(
-            g.abs().max().into_scalar::<f32>() > 0.0,
-            "input {i} got a zero gradient"
-        );
-    }
-
-    // And the numbers are the chunked WY form: the fused kernels against the
+    // The numbers are the chunked WY form, and this comes FIRST because it
+    // settles what the incoming state is: the fused kernels against the
     // tensor-ops chunk path, which is what the trainer ran while the gate was
     // closed. Different algorithm (f32 reassociation over chunks), same
     // function.
@@ -237,11 +237,20 @@ fn gated_delta_chunk_path_runs_at_the_production_shape() {
     assert!(d_out < 1e-3, "forward drift vs tensor path: {d_out:.3e}");
     assert!(d_state < 1e-3, "state drift vs tensor path: {d_state:.3e}");
 
-    // Same comparison for the gradients: the fused adjoint against the
-    // tensor-ops adjoint of the identical loss, off the forward already
-    // computed above.
+    for (i, t) in inputs.iter().enumerate() {
+        let g = t
+            .grad(&grads)
+            .unwrap_or_else(|| panic!("input {i} got no gradient"));
+        assert!(finite(&g), "input {i} got a non-finite gradient");
+        assert!(
+            g.abs().max().into_scalar::<f32>() > 0.0,
+            "input {i} got a zero gradient"
+        );
+    }
+
+    // The gradients, the same comparison, off the forward already computed.
     let ref_grads = (plain_out.powf_scalar(2.0).sum() + plain_st.powf_scalar(2.0).sum()).backward();
-    for (name, t) in ["q", "k", "v", "g", "b", "w", "s"].iter().zip(inputs.iter()) {
+    for (name, t) in ["q", "k", "v", "g", "b", "w", "s0"].iter().zip(inputs.iter()) {
         let rel = rel_diff(
             t.grad(&grads).unwrap().clone(),
             t.grad(&ref_grads).unwrap().clone(),
