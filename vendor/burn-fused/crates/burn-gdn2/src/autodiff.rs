@@ -11,7 +11,10 @@
 //! - all elementwise gates are differentiated symbolically.
 //!
 //! The backward recomputes the forward intermediates (deterministic on a given
-//! backend), so the op state only carries the input checkpoints.
+//! backend), so the op state only carries the input checkpoints — EXCEPT on
+//! the fused CUDA path, where the state instead carries the buffers the fused
+//! forward exported plus the adjoint that consumes them (see [`FusedAdjoint`]),
+//! and the tensor adjoint below is then not run at all.
 //!
 //! ponytail: `new_state` is returned as an untracked leaf — gradients through
 //! the *output* state (manual BPTT chaining) are not supported; the *input*
@@ -20,7 +23,7 @@
 use burn::backend::{AutodiffBackend, Backend, DispatchKindConversion};
 use burn::tensor::{DispatchTensor, Tensor};
 use burn_autodiff::checkpoint::base::Checkpointer;
-use burn_autodiff::checkpoint::strategy::NoCheckpointing;
+use burn_autodiff::checkpoint::strategy::{CheckpointStrategy, NoCheckpointing};
 use burn_autodiff::grads::Gradients;
 use burn_autodiff::ops::{Backward, Ops, OpsKind};
 use burn_autodiff::{Autodiff, NodeId};
@@ -29,9 +32,100 @@ use crate::forward::{chunk_masks, chunk_wy_forward, chunk_wy_forward_impl};
 
 const N_PARENTS: usize = 7;
 
-/// Backward data saved by the fused forward kernels (CUDA only).
+/// The fused adjoint as a NO-CAPTURE closure, built where `Inner` is known.
+///
+/// `Backward::backward` is generic over its backend `B` and cannot name `Inner`
+/// (burn 0.22 deleted `B::InnerBackend`), so the three steps — strip the
+/// caller's tensors to bare, run the kernels on bare, rebuild the gradients on
+/// the caller's own strategy — can only be done at the call site. The closure
+/// carries no captures on purpose: the state must be `Send` and `Clone`, and
+/// `Arc<dyn Fn>` is only `Send` for a `Sync` closure, which the exported
+/// buffers are not required to be. They travel in the state instead.
 #[cfg(feature = "cuda")]
-type FusedState = Option<crate::kernel::chunk_adjoint_cube::cuda::FusedBackwardInputs>;
+#[derive(Clone)]
+pub struct FusedAdjoint(
+    std::sync::Arc<
+        dyn Fn(
+                &crate::kernel::chunk_adjoint_cube::cuda::FusedBackwardInputs,
+                &[Option<Tensor<4>>; 4],
+                Tensor<4>,
+                f64,
+                usize,
+            ) -> Option<[Tensor<4>; 7]>
+            + Send
+            + Sync,
+    >,
+);
+
+#[cfg(feature = "cuda")]
+impl core::fmt::Debug for FusedAdjoint {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("FusedAdjoint")
+    }
+}
+
+/// Build the fused adjoint for a caller on `Autodiff<Inner, S>`.
+///
+/// `fused_chunk_backward` gates on `is_cuda::<B>()`, which is the SAME dead
+/// `TypeId` test that kept this adjoint out of every training step: the op's
+/// `backward` always passes an autodiff backend, so the gate was always false
+/// and the tensor adjoint ran. Here `B` IS the inner backend, so the gate asks
+/// the right question, and the inputs are genuinely bare by the time it does.
+#[cfg(feature = "cuda")]
+fn fused_adjoint<Inner: Backend, S: CheckpointStrategy>() -> FusedAdjoint
+where
+    DispatchTensor: DispatchKindConversion<Autodiff<Inner, S>> + DispatchKindConversion<Inner>,
+{
+    use crate::cuda_dispatch::{rebuild, strip};
+    use crate::kernel::chunk_adjoint_cube::cuda::fused_chunk_backward;
+    FusedAdjoint(std::sync::Arc::new(
+        |fwd: &crate::kernel::chunk_adjoint_cube::cuda::FusedBackwardInputs,
+         xs: &[Option<Tensor<4>>; 4],
+         d_out: Tensor<4>,
+         scale: f64,
+         chunk_size: usize| {
+            // k, v, b, w. NOT the input state: the fused adjoint takes its
+            // per-chunk states from the forward's export and starts its BPTT
+            // chain from a zero state adjoint, which is this op's contract —
+            // the output state is an untracked leaf (see the module header).
+            let [Some(k), Some(v), Some(b), Some(w)] = xs else {
+                return None;
+            };
+            // Bare, so `try_into_primitive` inside the kernels sees what it
+            // expects: a hardware tensor, not an autodiff handle.
+            let (Some(k), Some(v), Some(b), Some(w), Some(d_out)) = (
+                strip::<Inner, S, 4>(k),
+                strip::<Inner, S, 4>(v),
+                strip::<Inner, S, 4>(b),
+                strip::<Inner, S, 4>(w),
+                strip::<Inner, S, 4>(&d_out),
+            ) else {
+                return None;
+            };
+            let out = fused_chunk_backward::<Inner>(
+                fwd, &k, &v, &b, &w, &d_out, scale, chunk_size,
+            )?;
+            Some([
+                out.d_q,
+                out.d_k,
+                out.d_v,
+                out.d_g,
+                out.d_b,
+                out.d_w,
+                out.d_s,
+            ]
+            .map(|t| rebuild::<Inner, S, 4>(&t)))
+        },
+    ))
+}
+
+/// Backward data saved by the fused forward kernels (CUDA only): the buffers
+/// the forward exported, and the adjoint to run on them.
+#[cfg(feature = "cuda")]
+type FusedState = Option<(
+    crate::kernel::chunk_adjoint_cube::cuda::FusedBackwardInputs,
+    FusedAdjoint,
+)>;
 #[cfg(not(feature = "cuda"))]
 type FusedState = ();
 
@@ -81,23 +175,34 @@ where
         let d_out = Tensor::from_primitive::<B>(grads.consume::<B>(&ops.node));
 
         #[cfg(feature = "cuda")]
-        if let Some(fwd) = fused_data {
-            use crate::kernel::chunk_adjoint_cube::cuda::{fused_chunk_backward, is_cuda};
-            if is_cuda::<B>() {
-                if let Some(out) =
-                    fused_chunk_backward::<B>(&fwd, &k, &v, &b, &w, &d_out, scale, chunk_size)
-                {
-                    let d_inputs = [
-                        out.d_q, out.d_k, out.d_v, out.d_g, out.d_b, out.d_w, out.d_s,
-                    ];
-                    for (i, grad) in d_inputs.into_iter().enumerate() {
-                        if let Some(node) = ops.parents[i].clone() {
-                            grads.register::<B>(node.id, grad.try_into_primitive::<B>().unwrap());
-                        }
-                    }
-                    return;
+        if let Some((fwd, adjoint)) = fused_data {
+            // LOUD, not a fallback: the fused forward ran, so it did NOT keep
+            // the chunk scratch, and the tensor adjoint below panics without
+            // it. Dropping the gradients instead would train on a lie, so a
+            // refusal here names the cause instead of hiding it.
+            let d_inputs = (adjoint.0)(
+                &fwd,
+                &[
+                    Some(k.clone()),
+                    Some(v.clone()),
+                    Some(b.clone()),
+                    Some(w.clone()),
+                ],
+                d_out.clone(),
+                scale,
+                chunk_size,
+            )
+            .expect(
+                "the fused chunk forward ran, so its adjoint must: this is a bug in the \
+                 fused backward seam (strip / kernel limits / contiguity), and the tensor \
+                 adjoint cannot take over because the fused forward kept no scratch",
+            );
+            for (i, grad) in d_inputs.into_iter().enumerate() {
+                if let Some(node) = ops.parents[i].clone() {
+                    grads.register::<B>(node.id, grad.try_into_primitive::<B>().unwrap());
                 }
             }
+            return;
         }
 
         let [batch, heads, time, k_dim] = k.shape().dims::<4>();
@@ -342,7 +447,8 @@ where
 ///
 /// Takes tensors dispatched on `Autodiff<Inner>` (default checkpoint
 /// strategy). Returns `None` when the dispatch does not match, in which case
-/// the caller falls back to the plain tensor-ops path.
+/// the caller falls back to the plain tensor-ops path. For an explicit
+/// strategy see [`chunk_wy_forward_autodiff_s`].
 #[allow(clippy::too_many_arguments)]
 pub fn chunk_wy_forward_autodiff<Inner: Backend>(
     q: Tensor<4>,
@@ -358,23 +464,50 @@ pub fn chunk_wy_forward_autodiff<Inner: Backend>(
 where
     DispatchTensor: DispatchKindConversion<Autodiff<Inner>> + DispatchKindConversion<Inner>,
 {
-    let inner = |t: Tensor<4>| t.try_into_primitive::<Autodiff<Inner>>().ok();
-    let [q, k, v, g, b, w, state] = [q, k, v, g, b, w, state].map(inner);
+    chunk_wy_forward_autodiff_s::<Inner, NoCheckpointing>(q, k, v, g, b, w, state, scale, chunk_size)
+}
+
+/// [`chunk_wy_forward_autodiff`] for an EXPLICIT checkpointing strategy.
+///
+/// The strategy is a parameter, not a hardcoded `NoCheckpointing`, because the
+/// primitive type (`AutodiffTensor<Inner>`) does not carry it — only burn's
+/// runtime dispatch context does — so an op that names the default strategy
+/// cannot accept the tensors of a `BalancedCheckpointing` graph at all (every
+/// conversion returns `None`). dormouse trains on Balanced, so the strategy
+/// is exactly what made this op unreachable in production.
+#[allow(clippy::too_many_arguments)]
+pub fn chunk_wy_forward_autodiff_s<Inner: Backend, S: CheckpointStrategy>(
+    q: Tensor<4>,
+    k: Tensor<4>,
+    v: Tensor<4>,
+    g: Tensor<4>,
+    b: Tensor<4>,
+    w: Tensor<4>,
+    state: Tensor<4>,
+    scale: f64,
+    chunk_size: usize,
+) -> Option<(Tensor<4>, Tensor<4>)>
+where
+    DispatchTensor: DispatchKindConversion<Autodiff<Inner, S>> + DispatchKindConversion<Inner>,
+{
+    use crate::cuda_dispatch::{autodiff_node, bare_from_node};
+    let [q, k, v, g, b, w, state] =
+        [q, k, v, g, b, w, state].map(|t| autodiff_node::<Inner, S, 4>(&t));
     let (q, k, v, g, b, w, state) = match (q, k, v, g, b, w, state) {
         (Some(q), Some(k), Some(v), Some(g), Some(b), Some(w), Some(state)) => {
             (q, k, v, g, b, w, state)
         }
         _ => return None,
     };
-
+    // The kernels see the BARE backend, where `is_cuda::<Inner>()` is correct.
     let (q_t, k_t, v_t, g_t, b_t, w_t, s_t) = (
-        Tensor::from_primitive::<Inner>(q.primitive().clone()),
-        Tensor::from_primitive::<Inner>(k.primitive().clone()),
-        Tensor::from_primitive::<Inner>(v.primitive().clone()),
-        Tensor::from_primitive::<Inner>(g.primitive().clone()),
-        Tensor::from_primitive::<Inner>(b.primitive().clone()),
-        Tensor::from_primitive::<Inner>(w.primitive().clone()),
-        Tensor::from_primitive::<Inner>(state.primitive().clone()),
+        bare_from_node::<Inner, S, 4>(&q),
+        bare_from_node::<Inner, S, 4>(&k),
+        bare_from_node::<Inner, S, 4>(&v),
+        bare_from_node::<Inner, S, 4>(&g),
+        bare_from_node::<Inner, S, 4>(&b),
+        bare_from_node::<Inner, S, 4>(&w),
+        bare_from_node::<Inner, S, 4>(&state),
     );
 
     // Forward on the inner backend. On the bare CUDA backend the two fused
@@ -420,7 +553,7 @@ where
                         o,
                         ns,
                         None, // fused backward uses the exported buffers, not the scratch
-                        Some(fused_inputs),
+                        Some((fused_inputs, fused_adjoint::<Inner, S>())),
                     )
                 } else {
                     let (o, ns, sc) = chunk_wy_forward_impl(
@@ -454,7 +587,7 @@ where
         w.node(),
         state.node(),
     ];
-    let prep = ChunkWy.prepare::<NoCheckpointing>(nodes);
+    let prep = ChunkWy.prepare::<S>(nodes);
 
     let (out_adt, new_state_adt) = match prep.compute_bound().stateful() {
         OpsKind::Tracked(mut prep) => {
@@ -470,21 +603,21 @@ where
             let out = prep.finish((ids, scale, chunk_size, scratch, fused_data), out_prim);
             (
                 out,
-                <Autodiff<Inner> as AutodiffBackend>::from_inner(new_state_prim),
+                <Autodiff<Inner, S> as AutodiffBackend>::from_inner(new_state_prim),
             )
         }
         OpsKind::UnTracked(prep) => {
             let out = prep.finish(out_prim);
             (
                 out,
-                <Autodiff<Inner> as AutodiffBackend>::from_inner(new_state_prim),
+                <Autodiff<Inner, S> as AutodiffBackend>::from_inner(new_state_prim),
             )
         }
     };
 
     Some((
-        Tensor::from_primitive::<Autodiff<Inner>>(out_adt),
-        Tensor::from_primitive::<Autodiff<Inner>>(new_state_adt),
+        Tensor::from_primitive::<Autodiff<Inner, S>>(out_adt),
+        Tensor::from_primitive::<Autodiff<Inner, S>>(new_state_adt),
     ))
 }
 

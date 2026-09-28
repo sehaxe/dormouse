@@ -62,13 +62,17 @@ fn raw_inputs(batch: usize, heads: usize, time: usize, k: usize, v: usize) -> [T
         Tensor::<4>::random(shape, Distribution::Normal(mean, 0.3), &device)
     };
     [
-        r([batch, heads, time, k], 0.0),
-        r([batch, heads, time, k], 0.0),
-        r([batch, heads, time, v], 0.0),
+        // The six token-side leaves are laid out [B,T,H,D], the layout a
+        // projection leaves them in; `project_to_4d` transposes to [B,H,T,D].
+        r([batch, time, heads, k], 0.0),
+        r([batch, time, heads, k], 0.0),
+        r([batch, time, heads, v], 0.0),
         // negative, like a log decay the model produces
-        r([batch, heads, time, k], -1.0),
-        r([batch, heads, time, k], 0.0),
-        r([batch, heads, time, v], 0.0),
+        r([batch, time, heads, k], -1.0),
+        r([batch, time, heads, k], 0.0),
+        r([batch, time, heads, v], 0.0),
+        // the state is [B,H,K,V] and contiguous, exactly like the zeros the
+        // trainer starts each loop with
         r([batch, heads, k, v], 0.0),
     ]
 }
@@ -95,16 +99,36 @@ struct Nested {
     inputs: [Tensor<4>; 7],
 }
 
+/// The trainer's own input construction, copied: `KdaModule::project`'s
+/// `to_4d` (burn-kda `src/lib.rs:407-410`) is a `reshape([B,T,H,D])` of a
+/// CONTIGUOUS projection followed by `.permute([0,2,1,3])` — a metadata-only
+/// transposition. The leaf here is already split into heads, so the reshape is
+/// the identity view and only the permute acts; the strides that reach the op
+/// are the same either way.
+///
+/// The detail that matters, and that a fixture can get wrong: it must be a
+/// reshape-then-permute, NOT a `swap_dims(1,2)` followed by its own inverse
+/// `permute([0,2,1,3])` — that round trip returns the strides to where they
+/// started and yields a CONTIGUOUS tensor, so a fixture built that way
+/// exercises no strided view at all. [`the_trainers_view_is_a_real_transposition`]
+/// is that mistake, turned into a runnable check.
+fn project_to_4d(t: Tensor<4>, heads: usize, d: usize) -> Tensor<4> {
+    let [b, tokens, h, dd] = t.shape().dims::<4>();
+    assert_eq!((h, dd), (heads, d), "the leaf must be [B,T,H,D]");
+    let _ = (b, tokens);
+    t.permute([0, 2, 1, 3])
+}
+
 fn nested<S: CheckpointStrategy>(device: &Device, raw: &[Tensor<4>; 7]) -> Nested
 where
     DispatchTensor: DispatchKindConversion<Autodiff<NdArray, S>> + DispatchKindConversion<NdArray>,
 {
     let l = |i: usize| lift::<S>(&raw[i], device);
-    // The model reaches the op through a projection that lands [B,T,H,D] and
-    // is then `.permute([0,2,1,3])`-ed to [B,H,T,D] — a metadata-only view, so
-    // the op's input is a STRIDED tensor of unchanged logical shape. That is
-    // the layout the CUDA seam has to materialize, and this is its twin.
-    let to_4d = |t: Tensor<4>| -> Tensor<4> { t.swap_dims(1, 2).permute([0, 2, 1, 3]) };
+    // heads and dims come from the leaves: a [B,T,H,D] leaf, so its last two
+    // axes ARE the head count and the head width.
+    let [b, time, heads, k] = raw[0].shape().dims::<4>();
+    let v = raw[2].shape().dims::<4>()[3];
+    let _ = (b, time);
 
     let q_l = l(0);
     let k_l = l(1);
@@ -115,13 +139,17 @@ where
     let s_l = l(6);
 
     let inputs = [
-        to_4d(q_l.clone().mul_scalar(0.5)),
-        to_4d(sigmoid(k_l.clone()).mul_scalar(0.5)),
-        to_4d(v_l.clone().mul_scalar(0.5)),
+        project_to_4d(q_l.clone().mul_scalar(0.5), heads, k),
+        project_to_4d(sigmoid(k_l.clone()).mul_scalar(0.5), heads, k),
+        project_to_4d(v_l.clone().mul_scalar(0.5), heads, v),
         // the decay gate through a log, like `alpha.log()`
-        to_4d(g_l.clone().mul_scalar(0.5).powf_scalar(2.0).log()),
-        to_4d(sigmoid(b_l.clone())),
-        to_4d(sigmoid(w_l.clone())),
+        project_to_4d(
+            g_l.clone().mul_scalar(0.5).powf_scalar(2.0).log(),
+            heads,
+            k,
+        ),
+        project_to_4d(sigmoid(b_l.clone()), heads, k),
+        project_to_4d(sigmoid(w_l.clone()), heads, v),
         s_l.clone().mul_scalar(0.1),
     ];
     Nested {
@@ -177,13 +205,52 @@ where
     (value, leaves)
 }
 
+/// The fixture must really be a TRANSPOSITION, because a fixture that is not
+/// is a test that does not test — the exact failure that let the fused seam's
+/// infinite recursion ship (`Tensor::random` is contiguous, so no test ever
+/// reached the non-contiguous branch), and the one that made
+/// `tests/fused_permuted_view.rs` report `0 copies` on its first GPU run.
+///
+/// Proved with VALUES, not with an assumption about strides, so it holds on any
+/// backend: a `[B,T,H,D]` tensor whose `permute([0,2,1,3])` reads the same
+/// elementwise is a no-op permutation, i.e. contiguous. The trainer's view
+/// does not, and the inverse-pair mistake does.
+#[test]
+fn the_trainers_view_is_a_real_transposition() {
+    let device = Device::ndarray();
+    let (b, t, h, d) = (2usize, 6usize, 3usize, 4usize);
+    let src = Tensor::<4>::random([b, t, h, d], Distribution::Uniform(0.0, 1.0), &device);
+
+    // The trainer's construction: a real transposition, so the [B,H,T,D] view
+    // holds the data in a different order than a row-major buffer of that
+    // shape — i.e. it is strided and must be materialized.
+    let trainer_view = project_to_4d(src.clone(), h, d);
+    assert_eq!(trainer_view.shape().dims::<4>(), [b, h, t, d]);
+    assert_ne!(
+        trainer_view.clone().into_data().bytes,
+        src.clone().into_data().bytes,
+        "the trainer's [B,T,H,D]->[B,H,T,D] permute was a no-op: the fixture \
+         would be contiguous and no strided path would be exercised"
+    );
+
+    // The mistake: swap_dims(1,2) followed by its own inverse permute returns
+    // the strides to where they started, so the data reads back identical.
+    let round_trip = src.clone().swap_dims(1, 2).permute([0, 2, 1, 3]);
+    assert_eq!(round_trip.shape().dims::<4>(), [b, t, h, d]);
+    assert_eq!(
+        round_trip.into_data().bytes,
+        src.into_data().bytes,
+        "swap_dims followed by its inverse permute stopped being the identity; \
+         if this ever fails the strided-fixture argument above needs rechecking"
+    );
+}
+
 /// The op on a nested graph under `BalancedCheckpointing` — the trainer's
 /// configuration, where the backward must re-execute the dropped parents —
 /// must give the same loss and the same gradients as the same graph under
 /// `NoCheckpointing`, which recomputes nothing.
 #[test]
-fn nested_balanced_graph_matches_no_checkpointing() {
-    let (batch, heads, time, k, v, chunk) = (2usize, 2usize, 32usize, 4usize, 3usize, 16usize);
+fn nested_balanced_graph_matches_no_checkpointing() {    let (batch, heads, time, k, v, chunk) = (2usize, 2usize, 32usize, 4usize, 3usize, 16usize);
     let raw = raw_inputs(batch, heads, time, k, v);
 
     let (loss_bal, grads_bal) = {

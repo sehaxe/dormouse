@@ -58,6 +58,9 @@ pub mod module;
 pub mod short_conv;
 
 #[cfg(feature = "autodiff")]
+pub mod cuda_dispatch;
+
+#[cfg(feature = "autodiff")]
 pub mod autodiff;
 
 pub use config::{Gdn2Config, Gdn2Mode};
@@ -68,7 +71,15 @@ pub use module::{rms_norm_gate_per_head, GatedDeltaNet2, Gdn2State, ProjectedInp
 pub use short_conv::{short_conv_1d, SHORT_CONV_CACHE, SHORT_CONV_KERNEL};
 
 #[cfg(feature = "autodiff")]
-pub use autodiff::{chunk_autodiff_or_plain, chunk_wy_forward_autodiff};
+pub use autodiff::{chunk_autodiff_or_plain, chunk_wy_forward_autodiff, chunk_wy_forward_autodiff_s};
+
+#[cfg(feature = "autodiff")]
+pub use cuda_dispatch::{backend_matches, rebuild, strip, AdNode, Fallback, Fused};
+
+#[cfg(all(feature = "cuda", feature = "autodiff"))]
+pub use cuda_dispatch::{
+    chunk_dispatch, fused_calls, reset_fused_calls, FusedCudaAutodiff,
+};
 
 #[cfg(feature = "cuda")]
 pub use kernel::fused_recurrent_cube::cuda::CudaBare;
