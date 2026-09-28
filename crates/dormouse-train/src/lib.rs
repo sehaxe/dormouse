@@ -797,6 +797,28 @@ pub fn train_loop(
     let RunCfg { source: preset, model: dorm_cfg, train: cfg } = run;
     let device = device();
     init_pools(&device);
+    // SEED THE BACKEND BEFORE ANY PARAMETER IS CREATED, or nothing downstream
+    // is reproducible.
+    //
+    // Measured 2026-09-28: two runs of this binary with identical flags, the
+    // same 8 KB deterministic corpus and ZERO steps produced checkpoints
+    // differing in 34,730,605 of 43,725,616 bytes. The cause is that
+    // `Device::seed` was never called, so every parameter drew from process
+    // entropy. Three things follow, and all three are load-bearing:
+    //
+    //   - no bit-exact golden is possible, which is why docs/VERIFICATION.md
+    //     layer 2 had no way to exist;
+    //   - ADR-0002's "3 seeds per arm, and a win must beat the spread of the
+    //     control's own seeds" was NOT IMPLEMENTABLE as written, because
+    //     `--seed` only sets the JEPA span mask (see cfg.rs) and the weights
+    //     were different every run regardless;
+    //   - every A/B in the archive compared two different random inits and
+    //     called the difference an arm.
+    //
+    // `cfg.seed` is the one knob already in the snapshot, and it is what the
+    // protocol says the seed IS, so a different value in the config is now a
+    // different run in the strongest sense: a different model.
+    device.seed(cfg.seed as u64);
     let (mut model, qfmt) = build_model(&dorm_cfg, &cfg, &device);
     let mut optim = build_optim(&model, &cfg);
     // Fail fast if the routing policy no longer matches the model (stale
@@ -2806,3 +2828,4 @@ mod tests {
         assert_eq!(without.rest - with_factors.rest, 4 * cfg.n_experts);
     }
 }
+
