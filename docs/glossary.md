@@ -565,9 +565,19 @@ The held-out evaluation: `eval_batches` (default 20) windows of
 run scores the same bytes. The tail itself is a carve of the real corpus that
 training never sees (ADR-0010).
 
-`crates/dormouse-train/src/lib.rs:1261-1345`, `rewind` at
-`crates/dormouse-data/src/lib.rs:487`, `eval_batches` default at
-`lib.rs:155`.
+`crates/dormouse-train/src/lib.rs:1310-1454` (the eval block and the byte count
+at `:1417`), `rewind` at `crates/dormouse-data/src/lib.rs:684`, `eval_batches`
+default at `lib.rs:158`.
+
+**A "held-out window" is not a fixed size.** The formula above makes it a
+function of the batch: 102 400 B at batch 10 × seq 512, 20 480 B at batch 2, both
+with the default 20 batches. **A BPB is comparable only within one window**, so
+a window is part of the measurement, not a detail of it — the byte count is
+printed on every eval line and belongs in any table a number appears in. This
+entry carried the formula while `AGENTS.md` §2.6, `docs/AB-PROTOCOL.md` and two
+`README.md` places carried the constant "100 KB", which was the batch-10 shape
+quoted as if it were a property of the eval; a one-word fix here would have
+prevented four wrong documents.
 
 **Not** the depth curve (`--eval-depths`, which re-runs the same window at
 depths 1..=max_iter and trains nothing). **Not** a validation *split* of the
@@ -682,3 +692,6 @@ still needs an owner's decision, and the fix may be a code change.
 | 18 | ADR index | 22 ADRs | "ADR-0001..0012" (`README.md:199` docs table) | **OPEN** (`README.md`) |
 | 19 | `nano-fused` | KDA+Engram+aux off; `DM_FUSED` exists nowhere in the tree | "KDA+Engram+aux off, single-node path", and the file's own header comment names the deleted env var (`configs/nano-fused.toml:2`, `README.md:99`) | **OPEN** — proposed rename `nano-arms-off`; not renamed here, and `cfg.rs:349` pins the current name in a test |
 | 20 | ADR-0009's kill switch | the module it guards is already deleted | ADR-0009 written in the future tense about rungs that will "delete all ~7.4k LOC of `fused/`" | **OPEN** — `docs/adr/` has other agents in it |
+| 21 | **the eval's n-gram keys** | the eval passes the keys the training step passes, and counts it: `engram=<rows>/<arms>` (`lib.rs:1384-1390`, `:1443`; fix in `7adda92`) | `b3d6914`'s **commit message** spends a paragraph on this fix and its **diff does not contain it**; the fix is in `7adda92`, whose message is about the best-checkpoint and does not mention it. `c4214ad` is the no-leak enforcement | `AGENTS.md`/`README.md`/`AB-PROTOCOL.md` **FIXED** — all three cite `7adda92` and state the fix's scope. `b3d6914`'s message is **OPEN**: a message describing a fix it does not carry is the ADR-0020 failure in its purest form, and the log is `crates/`'s file plus history |
+| 22 | **the eval window size** | `eval_batches × batch × seq_len` bytes, printed on every eval line (`lib.rs:1417`); 102 400 B at batch 10, 20 480 B at batch 2 | "100 KB per eval (`--eval-batches 20`, 20 × 5 KB)" in `AGENTS.md` §2.6/§3.1, `docs/AB-PROTOCOL.md` and `README.md` — the batch-10 shape quoted as a property of the eval, against runs reporting `over 20480 B` | **FIXED** in all four; the glossary's "eval tail" entry carried the right formula the whole time, which is why the disagreement was findable |
+| 23 | **the anchor triple** | four readings, none on a trainer eval window: unigram 5.398 / 5-gram 2.911 (source unnamed), 5.170 / 2.572 (`anchors.rs:3-7`, `README.md`), `--fit` 5.011 / 2.588 (`anchors.rs:27-32`, same file but the whole tail), 2.826 vs 2.849 at two `--bytes` | `AGENTS.md` §2.6/§3.1 and `docs/AB-PROTOCOL.md` both published "unigram 5.398, 5-gram 2.911 **on the same window**"; `anchors.rs:22-27` says the internal split "was never comparable" to the trainer's eval window, which is why `--fit` exists | **FIXED** in `AGENTS.md`/`README.md`/`AB-PROTOCOL.md` — all four readings named, none reusable, and the rule is now `anchors --fit` on the eval file with its `window:` line quoted. **OPEN**: the 5.398/2.911 reading has no command line recorded anywhere, so it can be neither reproduced nor retired — someone has to re-run it or delete it |
