@@ -660,17 +660,15 @@ fn on_cuda_a_preset_attention_arm_actually_reaches_the_fused_kernels() {
         fx.max_iter as u64,
         "the KDA arm was declared ON and never entered"
     );
-    let (fwd, _bwd) = after;
-    let prev_fwd = before.0;
+    let (kda_f, kda_b, norm_asked, norm_skipped) = after;
     assert!(
-        fwd > prev_fwd,
+        kda_f > before.0,
         "the KDA arm RAN ({:>4} entries) and not one fused kernel launched: the dispatch gate is \
          closed and the run is silently on the tensor-ops chunk path. counts: {:?} -> {:?}",
         probe::count(probe::KDA),
         before,
         after
     );
-    let (kda_f, kda_b, norm_asked, norm_skipped) = after;
     println!(
         "fused kda fwd/bwd {kda_f}/{kda_b}; fused rmsnorm engaged {}/{} ({})",
         norm_asked.saturating_sub(norm_skipped),

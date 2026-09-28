@@ -21,12 +21,10 @@ use dormouse_core::{fnv_hash, DormouseConfig, DormouseModel};
 
 /// Same alias the train crate uses for `--features cpu`: proven to satisfy
 /// the `DispatchKindConversion` bounds `forward_with_hidden` carries.
-#[allow(deprecated)]
-type B = Autodiff<burn_ndarray::NdArray, BalancedCheckpointing>;
+type B = Autodiff<burn::backend::Flex, BalancedCheckpointing>;
 
-#[allow(deprecated)] // Device::ndarray is deprecated upstream; the repo still targets it
 fn device() -> Device {
-    Device::ndarray().autodiff()
+    Device::flex().autodiff()
 }
 
 /// Nano's shape at a debug-build-friendly width: everything that defines
@@ -45,6 +43,11 @@ fn mini_nano() -> DormouseConfig {
         head_dim: 32,
         d_ffn: 256,
         rank: 32,
+        // Capacity is not what this seam tests, and 500_000 rows is 50M
+        // in-model params per fixture. The shipped budget is
+        // `DormouseConfig::default().engram_rows`, pinned in loop_block's
+        // `capacity_budget_is_the_measured_optimum`.
+        engram_rows: 4096,
         ..nano_cfg()
     }
 }
@@ -89,17 +92,19 @@ fn targets(bytes: &[u8], b: usize, t: usize, dev: &Device) -> Tensor<2, Int> {
     Tensor::from_data(TensorData::new(v, [b, t]), dev)
 }
 
-/// FNV-hashed 3-gram ids `[b, t, 3]`, modded to the Engram table size
-/// (LoopBlock builds `[4096; 3]` tables; windows 3/5/8 like the train loop).
+/// FNV-hashed n-gram ids `[b, t, 3]`, RAW (not reduced) exactly as
+/// `dormouse_data::hashes_raw` emits them for the in-VRAM path: the model
+/// masks the slot index against its own table size, so the model config is
+/// the only copy of the capacity. Windows are the shipped `ORDERS` 2/3/4.
 fn hashed_ids(bytes: &[u8], b: usize, t: usize, dev: &Device) -> Tensor<3, Int> {
     let mut v = Vec::with_capacity(b * t * 3);
     for r in 0..b {
         let row = &bytes[r * t..(r + 1) * t];
         for p in 0..t {
             let e = p + 1;
-            v.push((fnv_hash(&row[e.saturating_sub(3)..e]) % 4096) as i64);
-            v.push((fnv_hash(&row[e.saturating_sub(5)..e]) % 4096) as i64);
-            v.push((fnv_hash(&row[e.saturating_sub(8)..e]) % 4096) as i64);
+            for &n in [2usize, 3, 4].iter() {
+                v.push((fnv_hash(&row[e.saturating_sub(n)..e]) as u32) as i64);
+            }
         }
     }
     Tensor::from_data(TensorData::new(v, [b, t, 3]), dev)
@@ -525,4 +530,84 @@ fn engram_host_rows() {
         "host_rows does not reach the logits: max |dlogit| = {d:.3e}"
     );
     println!("engram_host_rows ok ({} ms)", t0.elapsed().as_millis());
+}
+
+/// The backbone's gradient path THROUGH the memory branch. Two parameters
+/// have to be on the live graph for the arm to be a memory and not a sink:
+///
+/// - `loop_block.engram.key_projs.0.weight` - the key projection, the one
+///   backbone parameter on the addressing path (`3*engram_dim -> d_model`).
+/// - `loop_block.mem_dense.weight` - the `(1 - lam)` half of the convex
+///   mixture (FwPKM eq. 12's dense value path), which is what makes the
+///   floor a gradient path and not just a coefficient.
+///
+/// Honest limit, stated here because the test cannot fix it: the SLOT INDEX
+/// is a fixed FNV digest, so the key projection can only re-weight which of
+/// the three fixed tables to trust - it cannot learn to address. Learned
+/// addressing is product keys (1907.05242) / learned sub-keys, a different
+/// mechanism and a separate decision; this pins the cheap route instead of
+/// pretending the hash is trainable.
+#[test]
+fn engram_addressing_path_receives_gradient() {
+    let dev = device();
+    let mut cfg = mini_nano();
+    // KDA off so the only non-FFN branch on the graph is the memory: a
+    // nonzero grad here is unambiguously the memory's.
+    cfg.use_kda = false;
+    cfg.jepa_weight = 0.0;
+    cfg.dspark_weight = 0.0;
+    let model = DormouseModel::new(&cfg, &dev);
+    let (b, s) = (2, 64);
+    let bytes = batch_bytes(0xADD, b * s);
+    let x = input_ids(&bytes, b, s, &dev);
+    let h = hashed_ids(&bytes, b, s, &dev);
+    let y = targets(&bytes, b, s, &dev);
+
+    let (_logits, rec, _kda, aux) =
+        model.forward_with_hidden::<B>(x, Some(h), None, Some(y), None);
+    let mut loss = model.loss::<B>(rec);
+    if let Some(a) = aux {
+        loss = loss + a;
+    }
+    let grads = loss.backward();
+
+    struct Probe<'a> {
+        stack: Vec<String>,
+        grads: &'a burn::tensor::Gradients,
+        want: Vec<String>,
+        found: Vec<(String, f32)>,
+    }
+    impl ModuleVisitor for Probe<'_> {
+        fn enter_module(&mut self, name: &str, _c: &str) {
+            self.stack.push(name.to_string());
+        }
+        fn exit_module(&mut self, _name: &str, _c: &str) {
+            self.stack.pop();
+        }
+        fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<D>>) {
+            let path = self.stack.join(".");
+            if self.want.iter().any(|w| path == *w) {
+                let g = param
+                    .grad(self.grads)
+                    .map(|g| g.powf_scalar(2.0).sum().into_scalar::<f32>())
+                    .unwrap_or(0.0);
+                self.found.push((path, g));
+            }
+        }
+    }
+    let want = vec![
+        "loop_block.engram.key_projs.0.weight".to_string(),
+        "loop_block.mem_dense.weight".to_string(),
+    ];
+    let mut p = Probe { stack: vec![], grads: &grads, want: want.clone(), found: vec![] };
+    model.visit(&mut p);
+    assert_eq!(p.found.len(), want.len(), "visitor missed a param: {:?} vs {want:?}", p.found.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>());
+    for (name, sq) in p.found {
+        assert!(
+            sq > 1e-12,
+            "{name} has no gradient through the memory branch (sum sq {sq:.3e}) - \
+             the arm is a sink, not a memory"
+        );
+        println!("{name}: sum sq grad = {sq:.3e}");
+    }
 }

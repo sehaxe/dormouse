@@ -12,7 +12,58 @@ use burn_rmsnorm::RMSNorm;
 use crate::attention::AdaptiveAttention;
 use crate::config::{ActQuant, DormouseConfig};
 use crate::gr::{GatedResidual, GrState, GR_BRANCHES};
+use crate::mor::{self, MoRRouter};
 use crate::param::LinearLike;
+
+/// Table sizes for the in-VRAM hashed memory: `n_tables` of `rows` rounded UP
+/// to a power of two, plus the matching slot-index mask. The rounding exists
+/// because the in-model read MASKS the raw FNV hash (`hash & mask`) instead of
+/// dividing it on device: one integer op, and every index is in range by
+/// construction. 500_000 -> 524_288 rows (+4.9%), which sits on the flat part
+/// of the measured 300K/500K/800K curve.
+pub fn engram_tables(rows: usize, n_tables: usize) -> (Vec<usize>, i32) {
+    assert!(rows > 0, "engram_rows must be > 0");
+    assert!(n_tables > 0, "engram needs at least one order");
+    assert!(
+        rows.next_power_of_two() <= i32::MAX as usize,
+        "engram_rows {} does not fit an i32 slot mask",
+        rows
+    );
+    let pow2 = rows.next_power_of_two();
+    (vec![pow2; n_tables], (pow2 - 1) as i32)
+}
+
+/// The memory branch, as a CONVEX MIXTURE with a hard floor:
+///
+/// ```text
+/// out = lam * memory + (1 - lam) * dense,   lam = min(w_mem, lam_max)
+/// ```
+///
+/// `memory` is the gated read (`value_proj(e) * sigma(sign(s)*sqrt(|s|+1e-6))`,
+/// the DeepSeek gate, unchanged) and `dense` is `mem_dense(normed)` - a plain
+/// projection of the same hidden state. The point is that the guarantee is
+/// STRUCTURAL: whatever the controller learns, the memory's coefficient in
+/// this branch cannot exceed `lam_max`, so the backbone's share is never below
+/// `1 - lam_max`. Before this the branch was a direct row copy scaled by an
+/// unbounded `w_mem`, which is how a 99%-of-the-model lookup table ended up
+/// explaining the targets (rec -> 0.005, held-out at uniform 8.000 BPB).
+///
+/// Copied from: FwPKM eq. 12 `o_t = g_t*v_hat_t + (1-g_t)*v_t` (the dense
+/// value path from the same hidden state is what makes it a floor rather
+/// than a gate), kNN-LM eq. 3 `p = lambda*p_knn + (1-lambda)*p_lm` (lambda is
+/// a tuned CONSTANT, not a learned value - same claim, and the reason it
+/// generalizes), and XLM's PKM `EmbeddingBag(per_sample_weights=True)`
+/// (xlm/model/memory/memory.py:79) where the read is a bounded weighted
+/// average of rows rather than one row.
+pub fn memory_floor_mix(
+    memory: Tensor<2>,
+    dense: Tensor<2>,
+    w_mem: Tensor<2>,
+    lam_max: f32,
+) -> Tensor<2> {
+    let lam = w_mem.clamp(0.0, lam_max);
+    memory.mul(lam.clone()) + dense.mul(lam.neg().add_scalar(1.0))
+}
 
 #[derive(Module, Debug)]
 pub struct ExpertFFN {
@@ -35,11 +86,22 @@ pub struct LoopBlock {
     pub shared_attn: AdaptiveAttention,
     pub expert_ffns: Vec<ExpertFFN>,
     pub engram: EngramModule,
+    /// The dense half of the memory branch's convex mixture: a plain
+    /// `d_model -> d_model` projection of the SAME hidden state the memory
+    /// is gated against. It is the `(1 - g) * v_t` term of FwPKM eq. 12 and
+    /// the reason the backbone can no longer be starved (see
+    /// [`memory_floor_mix`]).
+    pub mem_dense: Linear,
     pub norm: RMSNorm,
     pub gr: Option<GatedResidual>,
     pub iter_embed: burn::module::Param<Tensor<2>>,
     pub residual_scale: burn::module::Param<Tensor<1>>,
     pub out_proj: LinearLike,
+    /// MoR router: the shared linear scorer of arXiv 2507.10524, one score
+    /// per (position, iteration slot). Always present (769 params, routed to
+    /// AdamW by the optimizer policy - routers are not Muon+ candidates);
+    /// `use_mor` decides whether it is read.
+    pub mor_router: MoRRouter,
     #[module(skip)]
     pub max_iter: usize,
     #[module(skip)]
@@ -59,6 +121,25 @@ pub struct LoopBlock {
     pub depth_override: Option<usize>,
     #[module(skip)]
     pub use_engram: bool,
+    /// MoR routing arm (arXiv 2507.10524). Off by default; the fixed-depth
+    /// mean readout is the default path.
+    #[module(skip)]
+    pub use_mor: bool,
+    /// Selected iteration slots per position under MoR (>= 1, see
+    /// `mor::route`). Ignored when `use_mor` is off.
+    #[module(skip)]
+    pub mor_k: usize,
+    /// Slot-index mask for the in-VRAM tables: `engram_rows` rounded UP to a
+    /// power of two, minus one. Masking (not dividing) keeps the address
+    /// arithmetic to one op on the device and makes every index in range by
+    /// construction - the data crate emits RAW FNV hashes on this path and
+    /// the model owns the capacity. See [`LoopBlock::engram_slot_mask`].
+    #[module(skip)]
+    pub engram_slot_mask: i32,
+    /// HARD floor on the memory branch: `w_mem` is clamped to this, so the
+    /// dense half of the branch never carries less than `1 - lam_max`.
+    #[module(skip)]
+    pub engram_lam_max: f32,
     #[module(skip)]
     pub bf16: bool,
     #[module(skip)]
@@ -113,11 +194,15 @@ impl LoopBlock {
         let mut iter_embed = burn::tensor::Tensor::<2>::zeros([cfg.max_iter, d], device);
         iter_embed = iter_embed.into();
         let iter_embed = burn::module::Param::from_tensor(iter_embed.clone().into());
+        // One table per n-gram order, `engram_rows` rounded up to a power of
+        // two (the slot index is masked on device, see engram_slot_mask).
+        let (tables, mask) = engram_tables(cfg.engram_rows, cfg.engram_orders.len());
         Self {
             controller,
             shared_attn: AdaptiveAttention::new(d, cfg.n_heads, cfg.head_dim, device),
             expert_ffns: (0..cfg.n_experts).map(|_| ExpertFFN::new(d, f, cfg.rank, cfg.use_tsct, device)).collect(),
-            engram: EngramModule::new(&[4096, 4096, 4096], 32, d, 1, device),
+            engram: EngramModule::new(&tables, cfg.engram_dim, d, 1, device),
+            mem_dense: LinearConfig::new(d, d).with_bias(false).init(device),
             norm: RMSNorm::new(d, cfg.norm_eps, device),
             gr: cfg.use_gr.then(|| GatedResidual::new(d, device)),
             iter_embed,
@@ -128,6 +213,7 @@ impl LoopBlock {
             // is a linear map of the byte embedding until the scalar moves.
             residual_scale: burn::module::Param::from_tensor(Tensor::ones([1], device)),
             out_proj: LinearLike::with_tsct(d, d, cfg.rank, cfg.use_tsct, device),
+            mor_router: MoRRouter::new(d, device),
             max_iter: cfg.max_iter,
             d_model: d,
             ffn_hidden: f,
@@ -135,6 +221,10 @@ impl LoopBlock {
             use_kda: cfg.use_kda,
             depth_override: None,
             use_engram: cfg.use_engram,
+            use_mor: cfg.use_mor,
+            mor_k: cfg.mor_k,
+            engram_slot_mask: mask,
+            engram_lam_max: cfg.engram_lam_max,
             bf16: cfg.bf16,
             act_quant: cfg.act_quant,
             act_group: cfg.act_group,
@@ -151,7 +241,7 @@ impl LoopBlock {
         // Target byte indices [b*t, 1]: L_Rec gathers their log-probs.
         targets: Option<Tensor<2, Int>>,
         lm_head: &LinearLike,
-    ) -> (Tensor<3>, Tensor<1>, Tensor<4>)
+    ) -> (Tensor<3>, Tensor<1>, Tensor<4>, Option<Tensor<1>>)
     where
         DispatchTensor: DispatchKindConversion<B>
             + DispatchKindConversion<B::InnerBackend>
@@ -212,8 +302,18 @@ impl LoopBlock {
             }
             None => self.max_iter,
         };
+        // MoR routing arm (arXiv 2507.10524). Off by default. The loop body
+        // is unchanged either way: all `iters` iterations run, and the gate
+        // picks which of them reach the readout and the CE. The per-iteration
+        // score, output and CE are collected here and combined after the loop
+        // (the top-k cannot be known before the last score exists).
+        let use_mor = self.use_mor;
+        let mut slot_scores: Vec<Tensor<3>> = Vec::with_capacity(iters);
+        let mut step_outs: Vec<Tensor<3>> = Vec::with_capacity(iters);
+        let mut ce_terms: Vec<Tensor<2>> = Vec::with_capacity(iters);
 
         for iter in 0..iters {
+            crate::probe::note(crate::probe::ITER);
             let row = iter;
             let iter_ctx = self
                 .iter_embed
@@ -243,7 +343,9 @@ impl LoopBlock {
                 self.norm.forward(h_ctx.clone())
             };
             let normed_f = if bf16 {
-                normed.cast(FloatDType::F32)
+                // clone: `normed` is read again below (the Engram dense-path
+                // input), and `cast` consumes the tensor.
+                normed.clone().cast(FloatDType::F32)
             } else {
                 normed.clone()
             };
@@ -254,7 +356,10 @@ impl LoopBlock {
                 None => normed_f.clone(),
             };
             let normed_ffn = match act_fmt {
-                Some((f, g)) => crate::act_quant::quant_act::<B>(normed_f.reshape([b * t, d]), f, g),
+                Some((f, g)) => {
+                    crate::probe::note(crate::probe::ACT_QUANT);
+                    crate::act_quant::quant_act::<B>(normed_f.reshape([b * t, d]), f, g)
+                }
                 None => normed_f.clone().reshape([b * t, d]),
             };
 
@@ -277,6 +382,7 @@ impl LoopBlock {
             // RMSNorm of h_ctx, identity under GR (the read already
             // normalized).
             let (gdn2_out, s_new) = if use_kda {
+                crate::probe::note(crate::probe::KDA);
                 self.shared_attn.gdn2.forward_train_state::<B>(normed_attn.clone(), kda_s.take())
             } else {
                 (Tensor::zeros([b, t, d], &h.device()), kda_s.take().unwrap_or_else(|| Tensor::zeros([b, 1, 1, 1], &h.device())))
@@ -284,9 +390,17 @@ impl LoopBlock {
             kda_s = Some(s_new);
             let attn = gdn2_out.reshape([b * t, d]).mul(w_attn);
 
-            // Engram (FNV hashed ids) with memory weight
+            // Engram (hashed n-gram lookup) as a convex mixture with a hard
+            // floor: `min(w_mem, lam_max) * memory + (1 - that) * dense`.
+            // The module's own gate (the DeepSeek sigmoid(sqrt|s| sign s), which
+            // decides WHETHER to trust the row) is untouched; what is new is
+            // that the memory can never carry more than `lam_max` of the
+            // branch, and that the other half is a function of the hidden
+            // state - so the backbone keeps a gradient path through the
+            // memory branch and the branch cannot explain the target alone.
             let engram_a = if use_engram {
-                match &host_rows {
+                crate::probe::note(crate::probe::ENGRAM);
+                let mem_read = match &host_rows {
                     // RAM-offload path: rows already gathered on the host.
                     Some(rows) => {
                         let eg_in = if bf16 {
@@ -294,11 +408,11 @@ impl LoopBlock {
                         } else {
                             h_ctx.clone().reshape([b, t, 1, d])
                         };
-                        self.engram
-                            .forward_embeds(rows.clone(), eg_in)
-                            .reshape([b, t, d])
-                            .reshape([b * t, d])
-                            .mul(w_mem)
+                        Some(
+                            self.engram
+                                .forward_embeds(rows.clone(), eg_in)
+                                .reshape([b * t, d]),
+                        )
                     }
                     None => match &hashed_ids {
                         Some(hashed) => {
@@ -309,14 +423,38 @@ impl LoopBlock {
                             } else {
                                 h_ctx.clone().reshape([b, t, 1, d])
                             };
-                            self.engram
-                                .forward((*hashed).clone(), eg_in)
-                                .reshape([b, t, d])
-                                .reshape([b * t, d])
-                                .mul(w_mem)
+                            // Raw FNV hashes arrive here: the model owns the
+                            // capacity, so it masks the slot index itself
+                            // (one op, in range by construction - see
+                            // `engram_tables`).
+                            Some(
+                                self.engram
+                                    .forward(hashed.clone().bitwise_and_scalar(self.engram_slot_mask), eg_in)
+                                    .reshape([b * t, d]),
+                            )
                         }
-                        None => Tensor::zeros([b * t, d], &h.device()),
+                        // No keys this call (inference without hashed ids): the
+                        // arm is inert, dense path included.
+                        None => None,
                     },
+                };
+                match mem_read {
+                    Some(mem) => {
+                        crate::probe::note(crate::probe::ENGRAM_KEYS);
+                        // The dense half reads the same block-body input the
+                        // attention and FFN arms read (RMSNorm of h_ctx;
+                        // identity under GR). Cast to fp32 first under
+                        // --bf16: mixed-dtype (bf16 act x fp32 weight) NaNs
+                        // on this stack, the rule every Linear here follows.
+                        let dense_in = if bf16 {
+                            normed.clone().cast(FloatDType::F32)
+                        } else {
+                            normed.clone()
+                        };
+                        let dense = self.mem_dense.forward(dense_in.reshape([b * t, d]));
+                        memory_floor_mix(mem, dense, w_mem.clone(), self.engram_lam_max)
+                    }
+                    None => Tensor::zeros([b * t, d], &h.device()),
                 }
             } else {
                 Tensor::zeros([b * t, d], &h.device())
@@ -335,6 +473,7 @@ impl LoopBlock {
             // ReZero residual (or GR write: per-branch scalar deposit, Eq. 33-34).
             let y = attn.reshape([b, t, d]) + engram_a.reshape([b, t, d]) + ffn;
             if use_gr {
+                crate::probe::note(crate::probe::GR);
                 let gr = self.gr.as_ref().unwrap();
                 branches = gr.write::<B>(&branches, gr_state.as_ref().unwrap(), y);
                 // Re-read the branches Eq. 32, AFTER the Eq. 34 deposit. The
@@ -358,10 +497,20 @@ impl LoopBlock {
             // iteration weights over the executed iterations and an honest
             // unweighted CE — the PonderNet variant lost its A/B (lambda
             // collapse zeroed rec, a fake loss, and out_acc, uniform
-            // outputs).
+            // outputs). The per-iteration pieces are COLLECTED here and
+            // combined once after the loop: under MoR the router ranks the
+            // slots, and the top-k cannot be known before the last slot's
+            // score exists. Holding them costs nothing — the autograd graph
+            // pins them either way.
             let step_out = self.out_proj.forward::<B>(h.clone().reshape([b * t, d])).reshape([b, t, d]);
-            let w = 1.0f32 / iters as f32;
-            out_acc = out_acc + step_out.clone().mul_scalar(w);
+            if use_mor {
+                crate::probe::note(crate::probe::MOR);
+                // MoR router: the shared linear scorer reads THIS iteration's
+                // input state (arXiv 2507.10524's per-step linear router).
+                let hs = if bf16 { h_ctx.clone().cast(FloatDType::F32) } else { h_ctx.clone() };
+                slot_scores.push(self.mor_router.scores(hs));
+            }
+            step_outs.push(step_out.clone());
             if let Some(tgt) = &targets {
                 let so = if bf16 { step_out.clone().cast(FloatDType::F32) } else { step_out.clone() };
                 let logits_n = lm_head.forward::<B>(so.reshape([b * t, d])); // [b*t, v]
@@ -371,10 +520,8 @@ impl LoopBlock {
                 let ce = burn::tensor::activation::log_softmax(logits_n, 1)
                     .gather(1, tgt.clone())
                     .neg()
-                    .reshape([b, t])
-                    .sum_dim(1)
-                    .div_scalar(t as f32); // [b]
-                rec = rec + ce.sum_dim(0).reshape([1]).div_scalar(iters as f32);
+                    .reshape([b, t]); // [b, t], summed below under the same gate
+                ce_terms.push(ce);
             }
             // The RECURRENCE: the next iteration reads this iteration's
             // post-residual h. It used to be reset to h_ctx here, which
@@ -386,14 +533,62 @@ impl LoopBlock {
             // branch above, so there is nothing to reset: both arms carry
             // this iteration's body into the next one.
         }
+        // Combine the per-iteration pieces under the iteration gate. MoR off:
+        // the gate is all-ones and the divisor is `iters`, i.e. exactly the
+        // fixed-depth mean this loop has always used. MoR on: the gate is the
+        // 0/1 top-k membership of `mor::route` and the divisor is the number
+        // of selected slots — what actually ran, a CONSTANT, not a learned
+        // weight (ingredient 4: no p_n, nothing that can decay to zero).
+        let (mask, mor_aux) = if use_mor {
+            let sc = Tensor::cat(slot_scores, 2); // [b, t, iters]
+            let (m, bce) = mor::route(sc, self.mor_k);
+            (m, Some(bce))
+        } else {
+            (
+                Tensor::<3>::ones([b, t, iters], &h.device()),
+                None,
+            )
+        };
+        // The divisor is the count of selected slots, known on the host (k is
+        // a config constant) — reading it off the mask would sync the device
+        // every step for a number we already have.
+        let ksel = if use_mor { mor::eff_k(self.mor_k, iters) } else { iters };
+        let w = 1.0f32 / ksel as f32;
+        for n in 0..iters {
+            // Mixed-dtype (f32 mask x bf16 activation) NaNs on this stack, so
+            // the gate lands in the readout's own dtype.
+            let g = mask.clone().slice([0..b, 0..t, n..n + 1]);
+            let g = g.cast(step_outs[n].dtype());
+            out_acc = out_acc + step_outs[n].clone().mul(g.clone()).mul_scalar(w);
+            if let Some(ce) = ce_terms.get(n) {
+                rec = rec + ce
+                    .clone()
+                    .mul(g.reshape([b, t]))
+                    .sum_dim(1)
+                    .div_scalar(t as f32)
+                    .sum_dim(0)
+                    .reshape([1])
+                    .mul_scalar(w);
+            }
+        }
         let rec = rec.div_scalar(b as f32); // mean over batch
         let kda = kda_s.unwrap_or_else(|| Tensor::zeros([1, 1, 1, 1], &h.device()));
-        (out_acc, rec, kda)
+        (out_acc, rec, kda, mor_aux)
     }
 
     /// Random-depth arm: run only the first `n` iterations. `None` restores
     /// fixed depth. Rejects `n == 0` or `n > max_iter` loudly — a silently
     /// clamped depth would make the A/B lie about what it trained.
+    ///
+    /// Under MoR this is the `--eval-depths` MEASUREMENT path, not a second
+    /// training arm: the router still ranks the slots, `k` shrinks to the
+    /// slots that ran (`mor::eff_k`), and the readout and CE divide by that
+    /// count, so each depth is a complete model of depth `n`. Training-time
+    /// random depth is a different mechanism buying the same depth
+    /// robustness, and the pair is refused LOUDLY before any GPU work, in
+    /// `dormouse_train::resolve` — that is the only place that can tell the
+    /// training flag from this eval call, because both arrive through this
+    /// one setter.
     pub fn set_depth(&mut self, n: Option<usize>) {
         if let Some(n) = n {
             assert!(
@@ -403,5 +598,141 @@ impl LoopBlock {
             );
         }
         self.depth_override = n;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::DormouseConfig;
+    use burn::tensor::Device;
+
+    fn dev() -> Device {
+        Device::ndarray()
+    }
+
+    /// Recover the mixture coefficient `a` in `out = a*mem + (1-a)*dense`
+    /// from the two inputs: `a = (out - dense) / (mem - dense)`. Asserting on
+    /// the RECOVERED coefficient is what makes this a test of the floor
+    /// rather than of the numbers that went in - no magic output value.
+    fn recover_a(out: &Tensor<2>, mem: f32, dense: f32) -> f32 {
+        let o = out.clone().into_scalar::<f32>();
+        (o - dense) / (mem - dense)
+    }
+
+    /// THE FLOOR HOLDS. The controller's `w_mem` is a sigmoid, so it can
+    /// reach 1.0; the memory's coefficient in the branch must still be capped
+    /// at `lam_max`, i.e. the backbone keeps at least `1 - lam_max` of the
+    /// branch no matter what is learned. Drive the controller to its maximum
+    /// and check the recovered coefficient.
+    #[test]
+    fn memory_floor_caps_the_controller() {
+        let lam_max = 0.5_f32;
+        // A wide spread so the recovered `a` is a ratio, not a rounding
+        // artifact: the memory read is 1000x the dense path elementwise.
+        let (mem, dense) = (1000.0_f32, 1.0_f32);
+        let t = |x: f32| Tensor::<2>::from_floats([[x]], &dev());
+        // w_mem saturated high (sigmoid of a large pre-activation).
+        let out = memory_floor_mix(t(mem), t(dense), t(1.0), lam_max);
+        let a = recover_a(&out, mem, dense);
+        assert!(
+            a <= lam_max,
+            "floor violated: saturated controller gave a = {a} > lam_max {lam_max}"
+        );
+        assert!((a - lam_max).abs() < 1e-5, "saturated w_mem must sit AT the cap, got {a}");
+
+        // Below the cap the learned value still works - the clamp is a
+        // ceiling, not a constant.
+        let out = memory_floor_mix(t(mem), t(dense), t(0.1), lam_max);
+        let a = recover_a(&out, mem, dense);
+        assert!((a - 0.1).abs() < 1e-5, "below the cap the mix must follow w_mem, got {a}");
+
+        // lam_max = 1.0 is the old behaviour (a direct row copy, no floor) -
+        // the degenerate case this test exists to forbid by default.
+        let out = memory_floor_mix(t(mem), t(dense), t(1.0), 1.0);
+        let a = recover_a(&out, mem, dense);
+        assert!((a - 1.0).abs() < 1e-5, "lam_max=1 must be a pure memory read, got {a}");
+    }
+
+    /// The block's wiring uses the configured floor, and the row budget
+    /// rounds up to a power of two with a matching mask (so a raw FNV hash is
+    /// always in range, whatever the corpus).
+    #[test]
+    fn block_uses_the_configured_floor() {
+        // The 500_000 -> 524_288 rounding (raw FNV hashes are masked on
+        // device, not divided), and the degenerate cases.
+        let (tables, mask) = engram_tables(500_000, 3);
+        assert_eq!(tables, vec![524_288; 3], "500_000 rounds up to the next power of two");
+        assert_eq!(mask, 524_287);
+        assert_eq!(engram_tables(25_000, 3), (vec![32_768; 3], 32_767));
+        assert_eq!(engram_tables(1024, 3), (vec![1024; 3], 1023));
+        assert_eq!(engram_tables(1, 1), (vec![1], 0));
+
+        let mut cfg = DormouseConfig::default();
+        cfg.d_model = 32;
+        cfg.n_heads = 2;
+        cfg.head_dim = 16;
+        cfg.d_ffn = 64;
+        cfg.max_iter = 1;
+        cfg.n_experts = 1;
+        cfg.rank = 8;
+        cfg.engram_rows = 1024;
+        cfg.engram_lam_max = 0.25;
+        let b = LoopBlock::new(&cfg, &dev());
+        assert_eq!(b.engram_lam_max, 0.25, "the block must carry the configured floor");
+        assert_eq!(b.engram_slot_mask, 1023);
+
+        // The floor is a floor: validate() refuses 0 (deletes the arm) and
+        // >1 (not a floor), and the order count is pinned to the trainer's
+        // [b, t, 3] hash tensor.
+        assert!(crate::config::validate(&cfg).is_ok());
+        cfg.engram_lam_max = 0.0;
+        assert!(crate::config::validate(&cfg).is_err());
+        cfg.engram_lam_max = 1.5;
+        assert!(crate::config::validate(&cfg).is_err());
+        cfg.engram_lam_max = 0.5;
+        cfg.engram_orders = vec![3, 5];
+        assert!(crate::config::validate(&cfg).is_err(), "the order COUNT is pinned to 3");
+        cfg.engram_orders = vec![2, 3, 4];
+        cfg.engram_rows = 0;
+        assert!(crate::config::validate(&cfg).is_err());
+    }
+
+    /// The capacity budget the config ships, spelled out, with the two
+    /// numbers it is chosen between: the measured slot-count curve (500K/order
+    /// optimum, on a 16x larger backbone) and the allocation ratio (DeepSeek's
+    /// 20-25%, which is what "monopoly" means). The preset ships the ratio.
+    #[test]
+    fn capacity_budget_is_a_minority_of_the_model() {
+        let c = DormouseConfig::default();
+        assert_eq!(c.engram_rows, 25_000);
+        assert_eq!(c.engram_orders, vec![2, 3, 4]);
+        assert_eq!(c.engram_dim, 32);
+        assert_eq!(c.engram_lam_max, 0.5);
+        // 3 tables x 25_000 rows x 32 dim.
+        let mem = 3 * c.engram_rows * c.engram_dim;
+        assert_eq!(mem, 2_400_000);
+        // The `small` backbone is 7.5M (the trainer's header print), so the
+        // arm is 24% of the model - DeepSeek's own operating point, and the
+        // opposite of the 86% that made every production run need
+        // --no-engram.
+        const BACKBONE_SMALL: usize = 7_500_000;
+        let share = mem as f64 / (mem + BACKBONE_SMALL) as f64;
+        assert!(
+            (0.20..0.30).contains(&share),
+            "memory must stay a minority of the model, got {:.1}%",
+            share * 100.0
+        );
+        // The shapes this replaced, for the record: 500K/order is the
+        // measured optimum on a 125M backbone but 86% of THIS model, and
+        // 8M/order was 99% of it - the configuration the arm was deleted for.
+        assert_eq!(3 * 500_000 * c.engram_dim, 48_000_000);
+        let monopoly = 3.0 * 500_000.0 * c.engram_dim as f64
+            / (3 * 500_000 * c.engram_dim + BACKBONE_SMALL) as f64;
+        assert!(monopoly > 0.8, "the 500K point is the monopoly shape at our scale");
+        // In VRAM the rows round up to a power of two: 25_000 -> 32_768.
+        let (tables, mask) = engram_tables(c.engram_rows, c.engram_orders.len());
+        assert_eq!(tables, vec![32_768; 3]);
+        assert_eq!(mask, 32_767);
     }
 }

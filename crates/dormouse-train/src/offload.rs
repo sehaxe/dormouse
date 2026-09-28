@@ -91,14 +91,17 @@ impl HostNgram {
 
     /// Deduplicate the batch's `[b*t*3]` table-local indices into
     /// `(unique_abs, pos)` where `pos[i]` maps position i to its unique row.
-    /// A row index is `table_base(t) + (idx % slots[t])`.
+    /// A row index is `table_base(t) + rem_euclid(idx, slots[t])`.
+    /// `rem_euclid`, not `%`: a negative `%` indexes the table before its
+    /// base, and the raw FNV hashes the in-VRAM path produces (the model
+    /// masks those) arrive as i32, i.e. sometimes negative.
     pub fn unique_rows(&self, hashes: &[i64]) -> (Vec<i64>, Vec<i64>) {
         let mut map: HashMap<i64, i64> = HashMap::with_capacity(hashes.len());
         let mut uniq: Vec<i64> = Vec::with_capacity(hashes.len());
         let mut pos = Vec::with_capacity(hashes.len());
         for (i, h) in hashes.iter().enumerate() {
             let t = i % 3;
-            let abs = self.table_base(t) as i64 + (h % self.slots[t] as i64);
+            let abs = self.table_base(t) as i64 + h.rem_euclid(self.slots[t] as i64);
             let u = *map.entry(abs).or_insert_with(|| {
                 uniq.push(abs);
                 (uniq.len() - 1) as i64
@@ -258,6 +261,29 @@ fn sinkhorn_l1(block: &mut [f32], rows: usize, cols: usize, iters: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Raw FNV hashes reach this table as i32, so they are sometimes
+    /// NEGATIVE (the in-VRAM path hands the model its own raw hashes and
+    /// masks them; `unique_rows` must be safe for either contract). With
+    /// `%` a negative index lands before the table's base and gathers the
+    /// wrong row - or panics. `rem_euclid` is the fix, and this is its test.
+    #[test]
+    fn negative_hashes_stay_in_range() {
+        let h = HostNgram::new([64, 64, 64], 8, 3);
+        // i32::MIN-ish values, as the raw FNV-32 truncation produces.
+        let hashes: Vec<i64> = vec![-1, -2, -3, -65, -1000, i32::MIN as i64];
+        let (uniq, pos) = h.unique_rows(&hashes);
+        assert_eq!(pos.len(), hashes.len());
+        assert!(uniq.iter().all(|&r| (0..h.total_rows() as i64).contains(&r)), "{uniq:?}");
+        // Same rows as the non-negative remainder.
+        let nonneg: Vec<i64> = hashes.iter().map(|&x| x.rem_euclid(1 << 31)).collect();
+        let (uniq2, _) = h.unique_rows(&nonneg);
+        assert_eq!(uniq, uniq2, "negative hashes must reduce like their unsigned twins");
+        // And the gather is in bounds, which is the actual crash.
+        let mut rows = Vec::new();
+        h.gather(&uniq, &mut rows);
+        assert_eq!(rows.len(), uniq.len() * 8);
+    }
 
     #[test]
     fn gather_momentum_roundtrip() {

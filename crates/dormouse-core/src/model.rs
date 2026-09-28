@@ -35,6 +35,11 @@ pub struct DormouseModel {
     pub dspark_k: usize,
     #[module(skip)]
     pub dspark_stride: usize,
+    /// MoR router BCE weight (arXiv 2507.10524). The label is the router's
+    /// own top-k recomputed on the current batch, so it cannot go stale; with
+    /// the arm off there is nothing to weight.
+    #[module(skip)]
+    pub mor_bce_weight: f32,
     #[module(skip)]
     pub max_seq_len: usize,
 }
@@ -58,6 +63,7 @@ impl DormouseModel {
             dspark_weight: cfg.dspark_weight,
             dspark_k: cfg.dspark_k,
             dspark_stride: cfg.dspark_stride,
+            mor_bce_weight: cfg.mor_bce_weight,
             max_seq_len: cfg.max_seq_len,
         }
     }
@@ -94,7 +100,7 @@ impl DormouseModel {
         } else {
             x
         };
-        let (out_acc, _rec, _kda) = self.loop_block.forward_full_state::<B>(
+        let (out_acc, _rec, _kda, _mor) = self.loop_block.forward_full_state::<B>(
             x, hashed_ids, host_rows, None, None, &self.lm_head,
         );
         out_acc
@@ -205,7 +211,7 @@ impl DormouseModel {
         let [b, t, _d] = x.dims();
         // Indices for the in-loop L_Rec gather (no one-hot [b*t,v] tensor).
         let tgt = targets.map(|tg| tg.reshape([b * t, 1]));
-        let (out_acc, rec, kda) =
+        let (out_acc, rec, kda, mor_aux) =
             self.loop_block
                 .forward_full_state::<B>(x, hashed_ids, host_rows, None, tgt, &self.lm_head);
         // loop activations may be bf16; the final norm+head compute in fp32
@@ -219,7 +225,7 @@ impl DormouseModel {
             .lm_head
             .forward::<B>(h.clone().reshape([b * t, self.d_model]))
             .reshape([b, t, self.vocab_size]);
-        let aux = self.aux_loss::<B>(&out_acc, teacher_latent, ids_raw, &h, &logits);
+        let aux = self.aux_loss::<B>(&out_acc, teacher_latent, ids_raw, &h, &logits, mor_aux);
         (logits, rec, kda, aux)
     }
 
@@ -235,18 +241,31 @@ impl DormouseModel {
         ids: Option<Tensor<2, Int>>,
         h: &Tensor<3>,
         logits: &Tensor<3>,
+        mor_aux: Option<Tensor<1>>,
     ) -> Option<Tensor<1>>
     where
         DispatchTensor: DispatchKindConversion<B>
             + DispatchKindConversion<B::InnerBackend>
             + DispatchKindConversion<burn::backend::Autodiff<B::InnerBackend>>,
     {
-        if (self.jepa_weight <= 0.0 && self.dspark_weight <= 0.0) || self.dspark_k == 0 {
+        // The original gate, kept exactly (dspark_k == 0 disables the channel),
+        // plus the MoR term as a third way in. `any` is the pre-existing
+        // condition, so no arm changes behaviour when MoR is off.
+        let any = (self.jepa_weight > 0.0 || self.dspark_weight > 0.0) && self.dspark_k > 0;
+        let mor = self.mor_bce_weight > 0.0;
+        if !any && !mor {
             return None;
         }
         let ids = ids?;
         let dev = h.device();
         let mut total: Option<Tensor<1>> = None;
+        // MoR first: the router's own BCE against its top-k recomputed on this
+        // batch, the one auxiliary the MoR arm has under a pure-CE recipe.
+        if let Some(m) = mor_aux {
+            crate::probe::note(crate::probe::MOR_BCE);
+            total = Some(m.mul_scalar(self.mor_bce_weight)
+                + total.unwrap_or_else(|| Tensor::zeros([1], &dev)));
+        }
         if self.jepa_weight > 0.0 {
             if let Some(tl) = teacher_latent {
                 let j = crate::aux::jepa_aux_loss(

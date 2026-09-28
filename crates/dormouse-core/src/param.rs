@@ -1,9 +1,26 @@
 //! param - TSCT linear via burn-sct SpectralLinear, pad to multiple of 4,
 //! NM knob, BF16 env (mirrors aria semantics; fresh mini composition)
-use burn::module::Module;
+use burn::module::{Module, ParamId};
 use burn::tensor::{Device, DispatchTensor, Tensor};
 use burn::backend::DispatchKindConversion;
 use burn_spectral::SpectralLinear;
+
+/// What one of a [`LinearLike`]'s parameters IS, structurally - no optimizer
+/// opinion here. The policy is a function of (this, the linear's `Role`) in
+/// `crate::routing`; adding a variant makes that match fail to compile, which
+/// is the point: a new leaf cannot appear without a decision about where it
+/// trains.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinearParam {
+    /// TSCT master factor, `[in, k]` (u) or `[out, k]` (v).
+    Factor,
+    /// TSCT singular scales, `[k]` - 1D.
+    Scale,
+    /// Dense (`use_tsct = false`) weight, `[out, in]`.
+    DenseWeight,
+    /// Dense bias - 1D, absent when the linear has none.
+    DenseBias,
+}
 
 /// DM_QUANT_DEBUG, read once per process (queried by every LinearLike
 /// forward otherwise).
@@ -114,6 +131,27 @@ impl LinearLike {
             y.slice([0..n, 0..self.out_features])
         } else {
             y
+        }
+    }
+
+    /// Every parameter this linear owns, with what it is. Destructured
+    /// WITHOUT `..` on purpose: a new leaf here is a compile error, not a
+    /// parameter nobody declared a group for.
+    pub fn param_kinds(&self) -> Vec<(ParamId, LinearParam)> {
+        let Self { inner, out_features: _ } = self;
+        match inner {
+            LinearLikeInner::Tsct(l) => vec![
+                (l.u.id, LinearParam::Factor),
+                (l.v.id, LinearParam::Factor),
+                (l.s.id, LinearParam::Scale),
+            ],
+            LinearLikeInner::Dense(l) => l
+                .bias
+                .as_ref()
+                .map(|b| (b.id, LinearParam::DenseBias))
+                .into_iter()
+                .chain([(l.weight.id, LinearParam::DenseWeight)])
+                .collect(),
         }
     }
 

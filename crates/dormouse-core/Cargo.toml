@@ -19,16 +19,22 @@ burn-rmsnorm = { path = "../../vendor/burn-fused/crates/burn-rmsnorm" }
 burn-jepa = { path = "../../vendor/burn-fused/crates/burn-jepa" }
 burn-dspark = { path = "../../vendor/burn-fused/crates/burn-dspark", features = ["training"] }
 burn-spectral = { path = "../../vendor/burn-fused/crates/burn-spectral" }
+# MoR routing mechanism (arXiv 2507.10524): the shared router + the repaired
+# top-k index primitive the loop's per-position routing rides on.
+burn-mor = { path = "../../vendor/burn-fused/crates/burn-mor" }
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 
-[dev-dependencies]
-burn-ndarray = { version = "0.22.0-pre.4", features = ["blas-openblas"] }
-
 [features]
 default = ["std"]
-std = ["burn/std", "burn-tensor/std", "burn/autodiff", "burn/ndarray"]
+# The CPU backend is burn-flex (upstream's burn-ndarray replacement, and the
+# one that has f16/bf16). No BLAS: burn-flex matmuls through the `gemm` crate,
+# so the test path needs no native build dependency at all.
+#
+# `burn/ndarray` is a COMPILE BRIDGE for one `Device::ndarray()` in
+# loop_block.rs's test module (2026-09-27). Delete it together with that line.
+std = ["burn/std", "burn-tensor/std", "burn/autodiff", "burn/flex", "burn/ndarray"]
 cuda = [
     "burn/cuda",
     "burn-kda/cuda",
@@ -43,4 +49,3 @@ cuda = [
 [[example]]
 name = "quant_probe"
 required-features = ["cuda"]
-

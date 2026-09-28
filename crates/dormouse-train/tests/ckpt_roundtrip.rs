@@ -65,7 +65,7 @@ fn ckpt_roundtrip_identical_logits() {
         steps: 3,
         ..Default::default()
     };
-    let optim = build_optim(&optim_cfg);
+    let optim = build_optim(&model, &optim_cfg);
 
     save_ckpt(&dir, "seam", &model, &optim, None, false, 7, 5.5).expect("save_ckpt");
     assert!(dir.join("seam.bin").exists(), "container missing");
@@ -73,7 +73,7 @@ fn ckpt_roundtrip_identical_logits() {
     assert!(sidecar.contains("step 7"), "sidecar: {sidecar}");
 
     let mut model2 = DormouseModel::new(&cfg, &dev);
-    let mut optim2 = build_optim(&optim_cfg);
+    let mut optim2 = build_optim(&model2, &optim_cfg);
     let loaded = load_ckpt(&dir, "seam", &cfg, &mut model2, &mut optim2).expect("load_ckpt");
     assert_eq!(loaded.step, 7);
     assert!(loaded.teacher.is_none(), "a run with no teacher saves none");
@@ -119,7 +119,7 @@ fn ckpt_carries_the_state_the_config_cannot() {
     let dev = device();
     let model = DormouseModel::new(&cfg, &dev);
     let optim_cfg = TrainCfg { steps: 3, ..Default::default() };
-    let optim = build_optim(&optim_cfg);
+    let optim = build_optim(&model, &optim_cfg);
 
     // A teacher deliberately at distance from the student, and the one-way
     // fp32 fallback latched: both must come back.
@@ -137,7 +137,7 @@ fn ckpt_carries_the_state_the_config_cannot() {
     save_ckpt(&dir, "st", &model, &optim, Some(&teacher), true, 21, 4.0).expect("save_ckpt");
 
     let mut m2 = DormouseModel::new(&cfg, &dev);
-    let mut o2 = build_optim(&optim_cfg);
+    let mut o2 = build_optim(&m2, &optim_cfg);
     let loaded = load_ckpt(&dir, "st", &cfg, &mut m2, &mut o2).expect("load_ckpt");
     assert!(loaded.ortho_fp32, "the one-way fp32-factor fallback must survive a save/load");
     let t2 = loaded.teacher.expect("the EMA teacher must be in the container");

@@ -39,8 +39,17 @@ pub fn apply_overrides(cfg: &mut DormouseConfig, ov: &[Override]) -> Result<(), 
             "jepa_mask_span" => cfg.jepa_mask_span = v.parse().map_err(|e| format!("jepa_mask_span: {e}"))?,
             "dspark_k" => cfg.dspark_k = v.parse().map_err(|e| format!("dspark_k: {e}"))?,
             "dspark_stride" => cfg.dspark_stride = v.parse().map_err(|e| format!("dspark_stride: {e}"))?,
+            "mor_k" => cfg.mor_k = v.parse().map_err(|e| format!("mor_k: {e}"))?,
+            "mor_bce_weight" => cfg.mor_bce_weight = v.parse().map_err(|e| format!("mor_bce_weight: {e}"))?,
             "norm_eps" => cfg.norm_eps = v.parse().map_err(|e| format!("norm_eps: {e}"))?,
-            "jepa_weight" => cfg.jepa_weight = v.parse().map_err(|e| format!("jepa_weight: {e}"))?,
+            "engram_rows" => cfg.engram_rows = v.parse().map_err(|e| format!("engram_rows: {e}"))?,
+            "engram_dim" => cfg.engram_dim = v.parse().map_err(|e| format!("engram_dim: {e}"))?,
+            "engram_lam_max" => cfg.engram_lam_max = v.parse().map_err(|e| format!("engram_lam_max: {e}"))?,
+            // Comma-separated, e.g. `--set engram_orders=2,3,4`.
+            "engram_orders" => cfg.engram_orders = v
+                .split(',')
+                .map(|p| p.trim().parse::<usize>().map_err(|e| format!("engram_orders: {e}")))
+                .collect::<Result<Vec<usize>, String>>()?,            "jepa_weight" => cfg.jepa_weight = v.parse().map_err(|e| format!("jepa_weight: {e}"))?,
             "jepa_mask_frac" => cfg.jepa_mask_frac = v.parse().map_err(|e| format!("jepa_mask_frac: {e}"))?,
             "dspark_weight" => cfg.dspark_weight = v.parse().map_err(|e| format!("dspark_weight: {e}"))?,
             "bf16" => cfg.bf16 = parse_bool(v)?,
@@ -48,6 +57,7 @@ pub fn apply_overrides(cfg: &mut DormouseConfig, ov: &[Override]) -> Result<(), 
             "use_kda" => cfg.use_kda = parse_bool(v)?,
             "use_engram" => cfg.use_engram = parse_bool(v)?,
             "use_gr" => cfg.use_gr = parse_bool(v)?,
+            "use_mor" => cfg.use_mor = parse_bool(v)?,
             "act_quant" => cfg.act_quant = match v.to_ascii_lowercase().as_str() {
                 "none" | "null" | "off" | "" => None,
                 // The one act-quant parser: ActQuant::from_str (ADR-0005).

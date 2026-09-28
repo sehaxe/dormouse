@@ -71,6 +71,13 @@ fn d_jepa_mask_span() -> usize { 8 }
 fn d_dspark_weight() -> f32 { 0.1 }
 fn d_dspark_k() -> usize { 4 }
 fn d_dspark_stride() -> usize { 16 }
+fn d_engram_rows() -> usize { 25_000 }
+fn d_engram_orders() -> Vec<usize> { vec![2, 3, 4] }
+fn d_engram_dim() -> usize { 32 }
+fn d_engram_lam_max() -> f32 { 0.5 }
+fn d_false() -> bool { false }
+fn d_mor_k() -> usize { 2 }
+fn d_mor_bce_weight() -> f32 { 0.05 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DormouseConfig {
@@ -102,6 +109,75 @@ pub struct DormouseConfig {
     #[serde(default = "d_dspark_weight")] pub dspark_weight: f32,
     #[serde(default = "d_dspark_k")] pub dspark_k: usize,
     #[serde(default = "d_dspark_stride")] pub dspark_stride: usize,
+
+    // --- hashed n-gram memory (Engram): the arm's capacity budget ---
+    /// Rows per n-gram order. A CAPACITY BUDGET, not a tuning knob: the arm
+    /// was switched off on 2026-09-27 because at 8M rows/order it was 99% of
+    /// the model (768M memory params against a 7.5M backbone) and
+    /// monopolized the loss (rec -> 0.005, held-out frozen at exactly
+    /// uniform 8.000 BPB). Two pieces of evidence set this number, and they
+    /// disagree at our scale - so the smaller one wins and the disagreement
+    /// is written down rather than averaged away:
+    ///
+    /// 1. The measured saturation curve at iso-parameter (arXiv 2601.16531:
+    ///    125M backbone, 128M Engram, slots per order): Hash-300K 4.4825 /
+    ///    Hash-500K **4.4809** / Hash-800K 4.4961 - 500K is the optimum, 800K
+    ///    is ~2 sigma WORSE, and 8M was 16x past the knee. That curve is FLAT
+    ///    from 300K to 500K (delta 0.0016 against sigma 0.008-0.012) and says
+    ///    nothing below 300K.
+    /// 2. The allocation ratio, which is what "monopoly" means. The curve
+    ///    above was measured on a 125M backbone; `small` has 7.5M, so the
+    ///    same slot count is 16x more memory per backbone parameter and
+    ///    3 x 500_000 x 32 = 48M params = **86% of the model** - the exact
+    ///    shape that failed. DeepSeek's shipped operating point is 196B Engram
+    ///    against a 552B backbone (26% of total, 0.36x) and its stated law is
+    ///    20-25% of the sparse budget; 25_000 rows/order puts this preset at
+    ///    2.4M memory params against 7.5M = **24% of the model, 0.32x** -
+    ///    the published operating point, not a guess.
+    ///
+    /// In-VRAM tables round UP to a power of two (the slot index is masked on
+    /// device, not divided): 25_000 -> 32_768 rows, 3.1M params, 29% of the
+    /// model. The host-RAM path (`--engram-ram --engram-slots`) takes its row
+    /// count from that flag; the two are the same knob until the trainer's
+    /// plumbing is unfrozen. The 500K point AT THIS SCALE is untested: it is
+    /// the first rung of the capacity ladder the A/B queue should run next,
+    /// and it is only worth running as a single seed, because at 500K the arm
+    /// is the monopoly again.
+    #[serde(default = "d_engram_rows")] pub engram_rows: usize,
+    /// N-gram orders, one table each, smallest first. At 8M rows only n=3
+    /// had per-key support (the corpus exhausts the 16.8M 3-gram space 2750x
+    /// over) while n=5 and n=8 were ~5775-way averages - 512M dead
+    /// parameters, 2/3 of the table. 2/3/4 is DeepSeek's own shipped set
+    /// over compressed tokens (V4.1-Flash n in {2,3,4}, Engram-27B [2,3])
+    /// and the deepest order whose key space (256^4 = 4.3e9) a 46 GB byte
+    /// corpus can populate; n>=5 spaces (1.1e12) are hopeless. The VALUES
+    /// are what `dormouse_data::ORDERS` hashes; the COUNT is what the model
+    /// sizes its tables from, and `validate` pins the count to 3 (the
+    /// trainer's hash tensor is `[b, t, 3]`).
+    #[serde(default = "d_engram_orders")] pub engram_orders: Vec<usize>,
+    /// Columns per memory row. One shared value projection over all orders
+    /// (arXiv 2601.07372 Sec. 2.4 eq. 6), so a row is a lookup, not a
+    /// per-order model.
+    #[serde(default = "d_engram_dim")] pub engram_dim: usize,
+    /// HARD ceiling on the memory branch's share of the block output. The
+    /// branch is `lam * memory + (1 - lam) * dense(normed)` with
+    /// `lam = min(w_mem, engram_lam_max)`, so the backbone's share of that
+    /// branch is never below `1 - engram_lam_max` - a floor, not a learned
+    /// value (kNN-LM eq. 3, FwPKM eq. 12).
+    #[serde(default = "d_engram_lam_max")] pub engram_lam_max: f32,
+    /// MoR - Mixture-of-Recursions (arXiv 2507.10524) routing on the loop's
+    /// iteration slots: per position, a shared linear router ranks the
+    /// `max_iter` slots and the top `mor_k` of them feed the readout and the
+    /// CE. Default OFF so the fixed-depth arm stays the default; it is
+    /// mutually exclusive with the random-depth arm (`--rand-depth`), which
+    /// buys the same depth robustness the other way.
+    #[serde(default = "d_false")] pub use_mor: bool,
+    /// Selected slots per position. Fixed capacity: the set always fills, and
+    /// the floor of 1 recursion is structural (`mor::route` refuses k=0).
+    #[serde(default = "d_mor_k")] pub mor_k: usize,
+    /// Weight of the MoR BCE auxiliary, whose label is the router's own top-k
+    /// recomputed on the current batch every step.
+    #[serde(default = "d_mor_bce_weight")] pub mor_bce_weight: f32,
 }
 
 impl Default for DormouseConfig {
