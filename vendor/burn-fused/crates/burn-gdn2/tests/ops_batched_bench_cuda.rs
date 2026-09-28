@@ -19,6 +19,26 @@
 //
 // Release is not optional here: a debug build's op dispatch dominates the very
 // thing being measured.
+//
+// MEASURED 2026-09-28, commit e11c0d5's parent tree, this box (5060 Ti, fp32):
+//
+//   Loop:    284.7 ms fwd+bwd   14389 tokens/s
+//   Batched:  83.0 ms fwd+bwd   49373 tokens/s      3.43x
+//
+// And in the trainer itself (batch 8, seq 512, depth 2, `--no-engram --quant
+// fp32 --jepa-weight 0 --dspark-weight 0`, 25 steps, per-step times read from
+// the step lines, MEDIAN because every run has one ~1 s outlier step that a mean
+// would charge to the arm):
+//
+//   --no-kda control   175 ms/step   23365 tok/s
+//   batched (default)  286 ms/step   14300 tok/s   arm = 111 ms/step
+//   loop  (DM_GDN2_OPS=loop) 663 ms/step  6180 tok/s  arm = 487 ms/step
+//
+// so the ARM is 4.4x cheaper and the whole step 2.31x faster. The op-level
+// ratio (3.43x) is the LOWER bound: this bench's loss reduction reads 7
+// gradients back to the host per iteration, which costs the cheap arm relatively
+// more, and the trainer's graph saves the loop arm ~3000 extra nodes per
+// iteration for the checkpointer to track on top of the op's own time.
 
 #![cfg(all(feature = "cuda", feature = "autodiff"))]
 
