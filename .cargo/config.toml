@@ -3,8 +3,24 @@
 [alias]
 build-train = "build --release -p dormouse-cli --bin train --no-default-features --features cuda"
 check-train = "check -p dormouse-cli --bin train --no-default-features --features cuda"
+# ITERATION PATH. `build-train` costs 4-6 min (release + thin LTO across 753
+# crates) and that is the price of a binary you RUN FOR HOURS. It is the
+# wrong tool for "does it compile" or "run 20 steps and read one counter":
+# a release build was spent 4 times today answering questions `check` answers
+# in seconds. Use check-train for type errors and build-probe for short runs.
+build-probe = "build -p dormouse-cli --bin train --no-default-features --features cuda"
+test-core = "test -p dormouse-core --lib"
+test-data = "test -p dormouse-data --lib"
+test-train = "test -p dormouse-train --lib"
 
 [env]
+# sccache 0.x is installed and was NOT being used (0 requests, cold cache).
+# Without it, every profile change, every `touch` of a vendored path dep, and
+# every fresh worktree recompiles all 753 packages from source. The vendored
+# burn-fused crates are PATH deps, so their fingerprint is per-worktree - the
+# exact case a compile cache exists for. Costs one cold build, then pays.
+RUSTC_WRAPPER = "sccache"
+SCCACHE_CACHE_SIZE = "20G"
 # cudarc's build script dies on CUDA toolkit 13.4 without a pinned version;
 # every fresh target dir needs this (set once here instead of per shell).
 CUDARC_CUDA_VERSION = "12050"
