@@ -19,7 +19,7 @@ use burn::tensor::{Bool, DispatchTensor, Int, Tensor};
 use burn::backend::DispatchKindConversion;
 use burn_dspark::{AcceptRatePredictor, RNNHead, dspark_loss};
 use burn_jepa::{jepa_l1_loss, koleo_loss, JepaPredictor};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::cell::Cell;
 
 /// EMA teacher momentum (data2vec 2.0 ballpark).
 pub const TEACHER_MOMENTUM: f64 = 0.999;
@@ -56,31 +56,52 @@ impl AuxHeads {
 /// the config's seed; the model does not, and threading a step parameter
 /// through every forward signature (and every caller of it) buys nothing the
 /// mask does not already get from the batch it is masking. Hence the seam.
-/// It is a pair of atomics, not an RNG: no state to carry, nothing to restore.
-static MASK_SEED: AtomicU64 = AtomicU64::new(1);
-static MASK_STEP: AtomicU64 = AtomicU64::new(0);
+/// It is a pair of cells, not an RNG: no state to carry, nothing to restore.
+///
+/// PER THREAD, not process-global. A global `AtomicU64` pair made the mask a
+/// function of `(seed, step, whatever any other thread last stored)`: the
+/// test harness runs tests on separate threads, and with both mask tests
+/// in flight `mask_is_a_function_of_seed_and_step` failed 15 runs in 40
+/// while passing 30/30 when run alone. The trainer's step loop is one thread,
+/// so a thread-local is the same stream there - and here it is a *different*
+/// run, which is what the test means.
+thread_local! {
+    static MASK_STREAM: Cell<(u64, u64)> = const { Cell::new((1, 0)) };
+}
 
 /// Point the mask stream at step `step` of the run seeded with `seed`.
 pub fn set_mask_stream(seed: u64, step: u64) {
-    MASK_SEED.store(seed, Ordering::Relaxed);
-    MASK_STEP.store(step, Ordering::Relaxed);
+    MASK_STREAM.with(|c| c.set((seed, step)));
 }
 
 /// Bernoulli-start span-dilated mask, identical to `burn_jepa::mask_indices`
 /// in distribution and semantics but drawn from `(seed, step, index)` instead
 /// of global RNG state: same inputs, same mask, on any backend, forever.
+pub fn mask_stream(t: usize, mask_frac: f32, mask_span: usize) -> Vec<bool> {
+    let (seed, step) = MASK_STREAM.with(|c| c.get());
+    mask_from(seed, step, t, mask_frac, mask_span)
+}
+
+/// The mask itself, with no ambient state at all: a pure function of
+/// `(seed, step)`, so two processes at the same commit produce the same bits
+/// and a third party can pin a golden. [`mask_stream`] is this plus the
+/// per-thread seam the trainer points at each step.
 ///
 /// The start rate is inverted so the expected masked fraction is exactly
 /// `mask_frac`: `p = 1 - (1 - mask_frac)^(1/span)`. A start masks itself and
 /// the `span - 1` positions after it, which is what makes a masked position
 /// never predictable from a masked neighbour - the point of masking at all.
-pub fn mask_stream(t: usize, mask_frac: f32, mask_span: usize) -> Vec<bool> {
+///
+/// The only non-integer step is `powf`; a libm that differs by 1 ulp can
+/// move a threshold and flip a position whose draw lands inside that ulp
+/// (~1e-7 per position). The pinned golden in the tests is a same-machine
+/// cross-process check, not a cross-libm one.
+pub fn mask_from(seed: u64, step: u64, t: usize, mask_frac: f32, mask_span: usize) -> Vec<bool> {
     let span = mask_span.max(1);
     let rate = 1.0 - (1.0 - mask_frac.clamp(0.0, 1.0)).powf(1.0 / span as f32);
-    let key = MASK_SEED
-        .load(Ordering::Relaxed)
+    let key = seed
         .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        .wrapping_add(MASK_STEP.load(Ordering::Relaxed));
+        .wrapping_add(step);
     let mut out = vec![false; t];
     let mut starts = 0usize;
     for i in 0..t {
@@ -308,6 +329,10 @@ mod tests {
     /// ADR-0021: the mask is a pure function of `(seed, step)`. The whole
     /// point of the change is that property, so it is the thing asserted -
     /// not "a mask came out" (which the RNG version also satisfied).
+    ///
+    /// This test was RED at HEAD (15 runs in 40 with the sibling test in
+    /// flight, 30/30 green alone): the seam was a process-global `AtomicU64`
+    /// pair, so another thread's `set_mask_stream` moved it mid-assertion.
     #[test]
     fn mask_is_a_function_of_seed_and_step() {
         let (t, frac, span) = (512, 0.15, 4);
@@ -324,7 +349,59 @@ mod tests {
         // A different seed is a different run.
         set_mask_stream(8, 100);
         assert_ne!(a, mask_stream(t, frac, span), "a different seed must differ");
+        // ...and the seam is wired to the no-ambient-state function, which is
+        // what makes the property survive into a second process.
+        assert_eq!(a, mask_from(7, 100, t, frac, span), "the seam must feed mask_from");
     }
+
+    /// Two threads, two runs, one process: each must get its own
+    /// `(seed, step)` mask. This is the half that was broken, and it is the
+    /// production shape too - a step must not be able to move another run's
+    /// mask. Cheap: the inner thread redraws while the outer one is mid-step.
+    #[test]
+    fn mask_stream_is_per_thread() {
+        let t = 4096;
+        set_mask_stream(1, 1);
+        let mine = mask_from(1, 1, t, 0.2, 4);
+        let other = std::thread::spawn(move || {
+            set_mask_stream(9, 9);
+            let before = mask_stream(t, 0.2, 4);
+            for k in 1..=64u64 {
+                set_mask_stream(9, 9 + k);
+            }
+            (before, mask_from(1, 1, t, 0.2, 4))
+        })
+        .join()
+        .unwrap();
+        assert_eq!(other.0, mask_from(9, 9, t, 0.2, 4), "other thread's own step");
+        assert_eq!(other.1, mine, "another thread's step must not move this run's mask");
+        assert_eq!(mask_stream(t, 0.2, 4), mine, "this thread's step must survive the spawn");
+    }
+
+    /// The cross-process half. `mask_from` reads nothing but its arguments and
+    /// integer mixing, so two processes at the same commit MUST agree - the
+    /// only way that claim can rot is a silent change to the derivation, and
+    /// a pinned FNV of the mask bits is what catches it. (ADR-0021's
+    /// "two runs of the same seed produce the same mask", in the only form a
+    /// unit test can honestly assert without launching a second process.)
+    #[test]
+    fn mask_from_is_pinned() {
+        let m = mask_from(1, 0, 64, 0.5, 1);
+        assert_eq!(m.len(), 64);
+        // A constant mask would satisfy any golden; require the actual mix.
+        let ones = m.iter().filter(|b| **b).count();
+        assert!((8..=56).contains(&ones), "pinned mask is not a mix: {ones}/64 true");
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in &m {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+        // Regenerate after ANY deliberate change to the derivation, and say so
+        // in the commit: a changed golden here means the mask of every past
+        // run is no longer the mask of the next one.
+        assert_eq!(h, GOLDEN_MASK_FNV, "mask derivation changed; re-pin deliberately");
+    }
+    const GOLDEN_MASK_FNV: u64 = 8732553446442614006;
 
     /// The mask must still BE the thing it replaced: the masked fraction is
     /// `mask_frac` (that identity is what the inverted start rate exists for)
