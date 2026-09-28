@@ -90,11 +90,32 @@ ADR**; `(was SILENT)` marks the ones this commit changed.
 | 37 | `train/src/lib.rs` (`load_model_weights`) → `None` on any read failure | LOUD (the CLI exits with "ckpt not found") |
 | 38 | `train/src/lib.rs` (`init_pools`: `let _ = client.install_memory_pools(ExclusivePages)`) — a refused pool install means the long-run OOM profile changes | SILENT — *proposal (one println)* |
 | 39 | `train/src/lib.rs` (`jepa_tgts.get(&bytes)?`) — a stale sidecar is an error, not a dropped aux | LOUD (ADR precedent, the right shape) |
-| 40 | `core/src/loop_block.rs` (the depth/act-quant/kda-state/hash-key `None` arms) — `None` arms for depth override, act-quant, the KDA state, missing hash keys | LOUD/correct by construction (the state asserts, the hash key means "inference without hashed ids") |
+| 40 | `core/src/loop_block.rs` (the depth/act-quant/kda-state/hash-key `None` arms) — `None` arms for depth override, act-quant, the KDA state, missing hash keys | LOUD/correct by construction for depth override, act-quant and the KDA state (the state asserts). **The hash-key `None` arm is NOT correct by construction, and this row classified it wrongly until 2026-09-28** — see the correction below. The "it means inference without hashed ids" reading is true for a decode path and false for a held-out *measurement*, and the same `None` served both |
+| 41 | `train/src/lib.rs` (the eval forward, `lib.rs:1384-1390`) — the held-out eval passed `hashed_ids = None` unconditionally while the training step passed real keys, so on the in-VRAM Engram path the eval scored a network with no memory in it | was **SILENT**, and the most expensive instance of this class in the project's history. Fixed in `7adda92`; the eval line now prints `engram=<rows>/<arms>` counted over the eval's own forwards, which makes it COUNTED |
 
-**Counts after this ADR: 40 sites — 17 LOUD, 11 COUNTED, 12 SILENT (of which 9
-were fixed here and 3 are proposals).** Before it: 17 LOUD, 4 COUNTED, 19
-SILENT.
+**Correction to row 40, and the generalisable lesson (2026-09-28).** The
+`None` hash-key arm was justified here as "inference without hashed ids", and
+that justification is what let the eval defect survive a whole audit: the rule
+was written as a property of the *function* ("a model may be asked for logits
+without n-gram keys") when the thing that matters is the property of the
+*caller* ("is this caller measuring, or is it answering?"). A `None` that is
+legitimate for a sampler is a silent wrong number for an eval, and the two
+call sites differed in the one way that mattered. The test a fallback has to
+pass is therefore not "does this arm have a defensible meaning" but "**can the
+caller that chose it tell the reader which arm ran**" — which is what the
+`engram=` counter is for, and what no `None` arm can do for itself.
+
+Two instances of the same shape, for the record: `forward_bytes` (row 4 above,
+the decode half) and the eval forward (row 41). Both passed `hashed_ids = None`
+to one shared code path. Fixing one without noticing the other is how the second
+survived the first fix's own commit message.
+
+**Counts after this ADR: 41 sites — 17 LOUD, 11 COUNTED, 13 SILENT (of which
+10 were fixed — 9 here, plus row 41 on 2026-09-28 — and 3 remain as
+proposals).** Before it: 17 LOUD, 4 COUNTED, 19 SILENT. Row 41 is the eval
+forward, added to the enumeration on 2026-09-28 after `7adda92` fixed it, and
+row 40's hash-key arm has been reclassified out of "correct by construction" —
+see the correction below, which is the more useful half of that edit.
 
 ## The top ten, by what they would have cost
 

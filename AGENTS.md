@@ -660,12 +660,20 @@ The defenses are installed, not optional.
 - **The fused RMSNorm kernel never engages on the trainer's backend** — the eval
   line shows `norm=0/N` because an autodiff tensor cannot be handed a bare
   kernel. Counted, not silent; a fix belongs in the library, not in a gate here.
-- **12 SILENT fallbacks remain** in ADR-0019's enumeration (9 were fixed there,
-  3 are proposals; the table lists every site by file:line). The notable ones:
+- **3 SILENT fallbacks remain** in ADR-0019's enumeration (41 sites total: 17
+  LOUD, 11 COUNTED, 13 SILENT, of which 10 have been fixed and 3 are
+  proposals; the table lists every site by file:line). The notable ones:
   `aux_loss` returning `None` for a missing teacher latent, `dspark_aux_loss`
   contributing nothing when the sequence is shorter than the draft window, the
   pool install result being ignored, and a non-statted shard counting as 0
-  bytes in the size floor.
+  bytes in the size floor. **A fourth, and the largest instance of the class in
+  this project's history, was found on 2026-09-28 and is fixed**: the held-out
+  eval passed `hashed_ids = None` (row 41, `7adda92`). It survived this long
+  because row 40 classified the `None` hash-key arm as "correct by
+  construction — inference without hashed ids", which is true for a decode path
+  and false for a measurement. The correction, and the rule it generalises to,
+  are in ADR-0019: **a fallback is not excused by having a defensible meaning,
+  it is excused by the caller being able to tell the reader which arm ran.**
 - **`StressMonitor` state is lost on resume** (ADR-0021 item 4): the 201-entry
   window, the spike count and the p99.9 restart empty. It corrupts the *report*,
   not the objective. Fix: `to_bytes`/`from_bytes` plus a fourth container
