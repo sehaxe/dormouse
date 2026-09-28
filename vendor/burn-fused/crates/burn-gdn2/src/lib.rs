@@ -64,7 +64,7 @@ pub mod cuda_dispatch;
 pub mod autodiff;
 
 pub use config::{Gdn2Config, Gdn2Mode};
-pub use forward::chunk_wy_forward;
+pub use forward::{chunk_path, chunk_wy_forward, set_chunk_path, ChunkPath};
 pub use kernel::fused_recurrent::fused_recurrent_forward;
 pub use l2norm::{l2_normalize, l2_normalize_4d};
 pub use module::{rms_norm_gate_per_head, GatedDeltaNet2, Gdn2State, ProjectedInputs};
