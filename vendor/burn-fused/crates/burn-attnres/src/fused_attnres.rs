@@ -170,8 +170,9 @@ fn attnres_scores_kernel<F: Float>(
 /// Per (b,t): chunk max m_c and exp-sum, running merge
 /// m' = max(m, m_c); acc' = acc·e^(m−m') + Σ_g e^(s_g−m')·h_g;
 /// sum' = sum·e^(m−m') + sumexp_c·e^(m_c−m'); the last chunk writes
-/// out = acc'/clamp(sum', 1e-12). All state reads happen before any write, so
-/// no cross-thread race on `max_s`/`sum_e`.
+/// out = acc'/clamp(sum', 1e-12). The per-thread state lives in registers and
+/// shared memory, and a `sync_cube()` guards the read-then-write of
+/// `max_s`/`sum_e` (see the note in `merge_kernel`).
 #[cube(launch_unchecked)]
 fn attnres_chunk_kernel<F: Float>(
     scores: &[F],    // [G, B, T] current chunk (rows >= ga stale)
@@ -264,6 +265,10 @@ fn attnres_chunk_kernel<F: Float>(
             }
         }
     }
+    // Same barrier requirement as `merge_kernel`: every thread read
+    // `max_s[bt]`/`sum_e[bt]` (and filled `ws`) above, only `tid == 0`
+    // writes them below. See the note there.
+    sync_cube();
     if tid == 0 {
         max_s[bt] = m_new;
         sum_e[bt] = sum_new;
@@ -646,6 +651,11 @@ fn merge_kernel<F: Float>(
             out[i] = a / den;
         }
     }
+    // `max_s[bt]`/`sum_exp[bt]` are read by every thread above (into the
+    // thread-local `m_old`/`rescale`/`sum_new`) and written by `tid == 0`
+    // below. Without this barrier a slower warp can reach the read *after*
+    // tid 0's write landed, silently computing rescale = 1.
+    sync_cube();
     if tid == 0 {
         max_s[bt] = m_new;
         sum_exp[bt] = sum_new;
@@ -927,7 +937,11 @@ mod tests {
     #[test]
     fn streaming_fused_matches_tensor_path() {
         // CPU (burn-cpu, tensor path) vs CUDA (fused kernels): the same module
-        // semantics must agree at every step.
+        // semantics must agree at every step. The comparison is on the online
+        // state as well as the output: `acc`/`max_score`/`sum_exp` diverge
+        // first if the kernel's in/out buffers are the problem, and the output
+        // diverges with the state intact if the kernel's maths is — the panic
+        // message names which, so a red run says where to look.
         let cdev = Device::default();
         let cpu_dev = Device::cpu();
         let (b, t, d, bs) = (1usize, 3usize, 64usize, 2usize);
@@ -947,9 +961,41 @@ mod tests {
             let out_cpu = cpu.step(h.clone(), &mut st_cpu);
             let hc = Tensor::<3>::from_data(h.into_data(), &cdev);
             let out_cuda = cuda.step(hc, &mut st_cuda);
-            let md = maxdiff(&to_host(out_cuda), &to_host(out_cpu));
-            assert!(md < 1e-4, "step {step}: maxdiff {md}");
+            let md = maxdiff(&to_host(out_cuda.clone()), &to_host(out_cpu));
+            let md_acc = maxdiff(&to_host(st_cuda.acc.clone()), &to_host(st_cpu.acc.clone()));
+            let md_ms = maxdiff(&to_host(st_cuda.max_score.clone()), &to_host(st_cpu.max_score.clone()));
+            let md_se = maxdiff(&to_host(st_cuda.sum_exp.clone()), &to_host(st_cpu.sum_exp.clone()));
+            assert!(
+                md < 1e-4 && md_acc < 1e-4 && md_ms < 1e-4 && md_se < 1e-4,
+                "step {step}: out {md} acc {md_acc} max_score {md_ms} sum_exp {md_se} \
+                 (started {} vs {})",
+                st_cuda.started,
+                st_cpu.started
+            );
         }
+    }
+
+    /// `cube_of` (and every `BufferArg::from_raw_parts` below it) takes the
+    /// raw allocation handle and a length — it does **not** read the tensor's
+    /// strides or offset. A strided view (`permute`, `reshape().permute()`,
+    /// `slice` on the cubecl backend) therefore hands the kernel the wrong
+    /// memory while looking like a perfectly ordinary `[B,T,D]` tensor. Every
+    /// other test here feeds `Tensor::random`/`from_data`/elementwise results,
+    /// which are contiguous, so none of them can see this. `#[ignore]`d as a
+    /// probe: it is a claim to be falsified on a free GPU, not a green test.
+    #[test]
+    #[ignore]
+    fn source_score_noncontiguous_matches_tensor() {
+        let cdev = Device::default();
+        let (b, t, d) = (2usize, 8usize, 64usize);
+        // [B, D, T] view of a [B, T, D] allocation: same shape as the fused
+        // kernels expect, non-row-major strides.
+        let view = Tensor::<3>::random([b, t, d], Distribution::Normal(0.0, 1.0), &cdev)
+            .permute([0, 2, 1]);
+        let q = Tensor::<1>::random([d], Distribution::Normal(0.0, 1.0), &cdev);
+        let expected = to_host(crate::source_score(&q, &view));
+        let md = maxdiff(&to_host(source_score_cuda(&q, &view).unwrap()), &expected);
+        assert!(md < 1e-4, "strided input: maxdiff {md}");
     }
 
     #[test]
@@ -1085,16 +1131,75 @@ mod tests {
     }
 }
 
+// ---- seam counters (ADR-0019) ----
+//
+// ENTRY is incremented AFTER the strategy downcasts — the gate that was
+// hardcoded to `NoCheckpointing`, so dormouse's
+// `Autodiff<CudaBare, BalancedCheckpointing>` never got here. A counter
+// before that gate would count interest, not arrivals (`f737710`).
+#[cfg(feature = "autodiff")]
+static ENTRY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(all(feature = "autodiff", feature = "cuda"))]
+static FWD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(all(feature = "autodiff", feature = "cuda"))]
+static BWD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(entry, fused_forward, fused_backward)` since [`reset_seam_counts`].
+pub fn seam_counts() -> Option<(u64, u64, u64)> {
+    #[cfg(feature = "autodiff")]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        #[cfg(feature = "cuda")]
+        return Some((ENTRY.load(Relaxed), FWD.load(Relaxed), BWD.load(Relaxed)));
+        #[cfg(not(feature = "cuda"))]
+        return Some((ENTRY.load(Relaxed), 0, 0));
+    }
+    #[cfg(not(feature = "autodiff"))]
+    None
+}
+
+/// Zero the seam counters.
+pub fn reset_seam_counts() {
+    #[cfg(feature = "autodiff")]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        ENTRY.store(0, Relaxed);
+        #[cfg(feature = "cuda")]
+        {
+            FWD.store(0, Relaxed);
+            BWD.store(0, Relaxed);
+        }
+    }
+}
+
+#[cfg(feature = "autodiff")]
+fn note_entry_reached() {
+    ENTRY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(feature = "cuda")]
+fn note_fused_forward() {
+    FWD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(feature = "cuda")]
+fn note_fused_backward() {
+    BWD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[cfg(any(feature = "autodiff", test))]
 #[allow(dead_code)] // items are wired by the autodiff dispatch / ad tests
 mod ad {
     use burn::backend::{Backend, DispatchKindConversion};
     use burn::tensor::{DispatchTensor, Tensor};
     use burn_autodiff::checkpoint::base::Checkpointer;
-    use burn_autodiff::checkpoint::strategy::NoCheckpointing;
+    use burn_autodiff::checkpoint::strategy::{CheckpointStrategy, NoCheckpointing};
     use burn_autodiff::grads::Gradients;
     use burn_autodiff::ops::{Backward, Ops, OpsKind};
     use burn_autodiff::Autodiff;
+    use crate::fused_attnres::note_entry_reached;
+    #[cfg(feature = "cuda")]
+    use crate::fused_attnres::{note_fused_backward, note_fused_forward};
 
     #[derive(Debug)]
     struct AttnResOp;
@@ -1124,8 +1229,14 @@ mod ad {
             #[cfg(feature = "cuda")]
             {
                 type CudaBare = burn_cubecl::CubeBackend;
+                // `B` is the INNER backend here (`OpsPrep::finish` returns
+                // `AutodiffTensor<B>`; the result goes to
+                // `Tensor::from_primitive::<Autodiff<Inner, S>>`), so this
+                // gate asks the right question. The entry below was the one
+                // pinned to `NoCheckpointing`.
                 if std::any::TypeId::of::<B>() == std::any::TypeId::of::<CudaBare>() {
                     if let Some((dhs, dq)) = super::depth_attend_backward_cuda(&hs, &q, &d_out) {
+                        note_fused_backward();
                         for (i, dh) in dhs.into_iter().enumerate() {
                             grads.register::<B>(
                                 ops.parents[i].clone().unwrap().id,
@@ -1210,26 +1321,27 @@ mod ad {
     }
 
     /// Fused chunked depth_attend with exact backward on `Autodiff<Inner>`.
-    pub fn depth_attend_autodiff<Inner: Backend, const N: usize>(
+    pub fn depth_attend_autodiff_s<Inner: Backend, S: CheckpointStrategy, const N: usize>(
         history: &[Tensor<3>],
         query: Tensor<1>,
     ) -> Option<Tensor<3>>
     where
-        DispatchTensor: DispatchKindConversion<Autodiff<Inner>> + DispatchKindConversion<Inner>,
+        DispatchTensor: DispatchKindConversion<Autodiff<Inner, S>> + DispatchKindConversion<Inner>,
     {
         let l = history.len();
         if l + 1 > N {
             return None;
         }
-        let qa = query.try_into_primitive::<Autodiff<Inner>>().ok()?;
+        let qa = query.try_into_primitive::<Autodiff<Inner, S>>().ok()?;
         let has: Vec<_> = history
             .iter()
-            .map(|h| h.clone().try_into_primitive::<Autodiff<Inner>>().ok())
+            .map(|h| h.clone().try_into_primitive::<Autodiff<Inner, S>>().ok())
             .collect::<Option<_>>()?;
-        let q_t = Tensor::from_primitive::<Inner>(qa.primitive().clone());
+        note_entry_reached();
+        let q_t = Tensor::<1>::from_primitive::<Inner>(qa.primitive().clone());
         let hs_t: Vec<Tensor<3>> = has
             .iter()
-            .map(|h| Tensor::from_primitive::<Inner>(h.primitive().clone()))
+            .map(|h| Tensor::<3>::from_primitive::<Inner>(h.primitive().clone()))
             .collect();
 
         let out_t = {
@@ -1238,6 +1350,7 @@ mod ad {
                 type CudaBare = burn_cubecl::CubeBackend;
                 if std::any::TypeId::of::<Inner>() == std::any::TypeId::of::<CudaBare>() {
                     if let Some(o) = super::depth_attend_cuda(&hs_t, &q_t) {
+                        note_fused_forward();
                         o
                     } else {
                         super::depth_attend_tensor_ad(&hs_t, q_t)
@@ -1262,7 +1375,7 @@ mod ad {
             nodes.push(qa.node());
         }
         let nodes: [_; N] = nodes.try_into().unwrap();
-        let prep = AttnResOp.prepare::<NoCheckpointing>(nodes);
+        let prep = AttnResOp.prepare::<S>(nodes);
         let out_adt = match prep.compute_bound().stateful() {
             OpsKind::Tracked(mut prep) => {
                 for h in &has {
@@ -1273,12 +1386,23 @@ mod ad {
             }
             OpsKind::UnTracked(prep) => prep.finish(out_prim),
         };
-        Some(Tensor::from_primitive::<Autodiff<Inner>>(out_adt))
+        Some(Tensor::from_primitive::<Autodiff<Inner, S>>(out_adt))
+    }
+
+    /// [`depth_attend_autodiff_s`] on the default (no-checkpointing) strategy.
+    pub fn depth_attend_autodiff<Inner: Backend, const N: usize>(
+        history: &[Tensor<3>],
+        query: Tensor<1>,
+    ) -> Option<Tensor<3>>
+    where
+        DispatchTensor: DispatchKindConversion<Autodiff<Inner>> + DispatchKindConversion<Inner>,
+    {
+        depth_attend_autodiff_s::<Inner, NoCheckpointing, N>(history, query)
     }
 }
 
 #[cfg(feature = "autodiff")]
-pub use ad::depth_attend_autodiff;
+pub use ad::{depth_attend_autodiff, depth_attend_autodiff_s};
 
 /// Stack the history into [L,B,T,D] (tensor path for the autodiff fallback).
 #[cfg(any(feature = "autodiff", test))]
@@ -1307,6 +1431,68 @@ pub fn depth_attend_tensor_ad(history: &[Tensor<3>], query: Tensor<1>) -> Tensor
         .mul(weights.reshape([n, b, t, 1usize]))
         .sum_dim(0)
         .reshape([b, t, d])
+}
+
+#[cfg(all(test, feature = "autodiff", feature = "cuda"))]
+mod seam_tests {
+    //! The proof that the strategy gate is strategy-AGNOSTIC. It needs the
+    //! `cuda` feature to COMPILE but uses only the ndarray backend at RUNTIME:
+    //! no device, no kernel launch. It asserts a caller on
+    //! `Autodiff<Inner, BalancedCheckpointing>` — dormouse's backend — gets
+    //! PAST the seam downcasts, and that the old `NoCheckpointing`-only
+    //! spelling does not. Revert `depth_attend_autodiff_s` to `Autodiff<Inner>`
+    //! and the first assertion goes red: it is the assertion, not the comment.
+    use super::*;
+    use burn::backend::DispatchKindConversion;
+    use burn::tensor::{Device, DispatchTensor};
+    use burn_autodiff::Autodiff as Ad;
+    use burn_autodiff::checkpoint::strategy::{
+        BalancedCheckpointing, CheckpointStrategy, NoCheckpointing,
+    };
+
+    type Nd = burn_ndarray::NdArray;
+
+    #[test]
+    fn balanced_checkpointing_reaches_the_seam_and_the_legacy_entry_does_not() {
+        fn reach<S: CheckpointStrategy>(h: &[Tensor<3>], q: &Tensor<1>) -> Option<Tensor<3>>
+        where
+            DispatchTensor: DispatchKindConversion<Ad<Nd, S>> + DispatchKindConversion<Nd>,
+        {
+            depth_attend_autodiff_s::<Nd, S, 8>(h, q.clone())
+        }
+
+        let dev = Device::ndarray().autodiff().gradient_checkpointing();
+        let h = vec![Tensor::<3>::ones([1, 4, 8], &dev); 2];
+        let q = Tensor::<1>::ones([8], &dev);
+
+        reset_seam_counts();
+        let base = seam_counts().expect("autodiff feature is on in this test").0;
+
+        assert!(reach::<BalancedCheckpointing>(&h, &q).is_some());
+        assert_eq!(
+            seam_counts().expect("counters").0,
+            base + 1,
+            "a BalancedCheckpointing caller must get past the seam downcast"
+        );
+
+        assert!(
+            depth_attend_autodiff::<Nd, 8>(&h, q.clone()).is_none(),
+            "on a Balanced tensor the NoCheckpointing entry must refuse"
+        );
+        assert_eq!(
+            seam_counts().expect("counters").0,
+            base + 1,
+            "the refusing entry must not have counted a reach"
+        );
+
+        // The default strategy still works, and the cross-check refuses, so
+        // the gate is real rather than always-true.
+        let plain = Device::ndarray().autodiff();
+        let hp = vec![Tensor::<3>::ones([1, 4, 8], &plain); 2];
+        let qp = Tensor::<1>::ones([8], &plain);
+        assert!(reach::<NoCheckpointing>(&hp, &qp).is_some());
+        assert!(reach::<BalancedCheckpointing>(&hp, &qp).is_none());
+    }
 }
 
 #[cfg(all(test, feature = "autodiff", feature = "cuda"))]

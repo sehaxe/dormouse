@@ -15,8 +15,13 @@ use burn::module::{Module, Param};
 use burn::nn::Initializer;
 use burn::tensor::{activation, Device, Tensor};
 
+// `pub` (it was private) so the ADR-0019 seam counters are readable from
+// outside; and it still compiles under `autodiff` alone, deliberately: the
+// fused ADJOINT and its strategy seam live here, and a gate that can only be
+// compile-checked with a GPU is how a `NoCheckpointing`-only entry survived
+// review. The kernels inside stay `#[cfg(feature = "cuda")]`.
 #[cfg(feature = "cuda")]
-mod fused_attnres;
+pub mod fused_attnres;
 
 /// Full AttnRes: learned pseudo-query attends over ALL previous hidden states.
 ///
@@ -105,10 +110,27 @@ pub fn depth_attend(history: &[Tensor<3>], query: Tensor<1>) -> Tensor<3> {
 
     #[cfg(all(feature = "cuda", feature = "autodiff"))]
     {
+        // Probe BOTH checkpointing strategies. `Autodiff<Inner>`'s second type
+        // parameter defaults to `NoCheckpointing` and the downcast compares the
+        // whole backend type, so probing only that one silently sent a
+        // `BalancedCheckpointing` caller (dormouse's backend) to the stacked
+        // tensor path: the same attention, nothing counting it.
+        use burn_autodiff::checkpoint::strategy::{BalancedCheckpointing, NoCheckpointing};
         type CudaBare = burn_cubecl::CubeBackend;
         // variable parent count: try fixed-N specializations
-        if let Some(out) =
-            crate::fused_attnres::depth_attend_autodiff::<CudaBare, 64>(history, query.clone())
+        if let Some(out) = crate::fused_attnres::depth_attend_autodiff_s::<
+            CudaBare,
+            NoCheckpointing,
+            64,
+        >(history, query.clone())
+        {
+            return out;
+        }
+        if let Some(out) = crate::fused_attnres::depth_attend_autodiff_s::<
+            CudaBare,
+            BalancedCheckpointing,
+            64,
+        >(history, query.clone())
         {
             return out;
         }
