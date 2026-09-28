@@ -452,10 +452,17 @@ impl ByteStream {
         out
     }
 
-    /// FNV n-gram hashes, RAW (not reduced): the low 32 bits of the FNV-1a
+    /// FNV n-gram hashes, RAW (not reduced): the low **31** bits of the FNV-1a
     /// digest of each context, one column per entry of [`ORDERS`]. Truncating
-    /// to 32 bits is deliberate - CUDA stores Int as i32 - and a 4.3e9 key
-    /// space is far more than any affordable table can separate anyway.
+    /// is deliberate - `Int` is i32 on burn-flex and the cast PANICS above
+    /// `i32::MAX` instead of wrapping the way CUDA's does - and 2.1e9 keys is
+    /// far more than any affordable table can separate anyway.
+    ///
+    /// 31, not 32: the previous 32-bit version was correct in its reasoning and
+    /// off by one bit in its implementation, which made every training run die
+    /// on real data with `Element cannot be represented in the target type:
+    /// "i64"(...) => "i32"`. The key space lost is one bit; the class of bug
+    /// lost is "the trainer cannot start".
     pub fn hashes_raw(&self, bytes: &[u8]) -> Vec<i64> {
         let mut out = Vec::with_capacity(self.batch * self.seq_len * ORDERS.len());
         for b in 0..self.batch {
@@ -465,7 +472,7 @@ impl ByteStream {
                 let seq = &bytes[base..base + self.seq_len];
                 for &n in ORDERS.iter() {
                     let s = e.saturating_sub(n);
-                    out.push((fnv(&seq[s..e]) as u32) as i64);
+                    out.push(((fnv(&seq[s..e]) as u32) & 0x7fff_ffff) as i64);
                 }
             }
         }
