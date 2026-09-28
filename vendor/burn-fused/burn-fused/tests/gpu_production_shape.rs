@@ -102,7 +102,7 @@ fn gated_delta_chunk_path_runs_at_the_production_shape() {
     let device = Device::cuda(0);
     device.seed(42); // a gate that flakes is worse than no gate
     let (batch, heads, time, k_dim, v_dim, chunk) = (10usize, 12usize, 512usize, 64, 64, 64);
-    let scale = k_dim as f64.powf(-0.5);
+    let scale = (k_dim as f64).powf(-0.5);
     println!(
         "production shape: B={batch} H={heads} T={time} k={k_dim} v={v_dim} chunk={chunk} \
          ({} chunks), backend {}",

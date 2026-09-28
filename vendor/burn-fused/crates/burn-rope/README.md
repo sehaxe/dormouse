@@ -1,5 +1,14 @@
 # burn-rope - Rotary Position Embedding for Burn
 
+> **Not in the dormouse build.** No crate under `crates/dormouse-{core,data,train,cli}/`
+> depends on this one. It is a `[dev-dependencies]` entry of `burn-spectral` (one
+> example, `tsct_diag.rs`) and a `path =` dependency of the library's own
+> `benches/cpu_probe`, so the library's CI builds it and nothing that trains does.
+> **Recommendation: WIRE** — see `docs/library-crate-fate.md`. The model has no
+> positional encoding at all today, and `AGENTS.md:586` says the attention arm
+> keeps RoPE. Left in place rather than deleted because the bench and the example
+> name it.
+
 [![CI](https://github.com/sehaxe/burn-rope/actions/workflows/ci.yml/badge.svg)](https://github.com/sehaxe/burn-rope/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/burn-rope)](https://crates.io/crates/burn-rope)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -82,7 +91,16 @@ row instead of 4 muls + 2 adds + a `[.., hd]` cat.
 RoPE runs as a single tracked node under `Autodiff<Cuda>`: fused forward and
 a fused elementwise backward (d_x from the checkpointed input and recomputed
 cos/sin). The freqs are treated as constants (learnable freqs fall back to the
-tensor path). Verified fused backward == tensor-path backward (<1e-3).
+tensor path). The fused backward is checked against the tensor-path backward
+(<1e-3): two of our own formulations of the same derivative compared to each
+other, which is kind (d) under `docs/adr/0020-oracle-discipline.md`, not
+verification. **No external reference exists** for either path.
+
+The fused seam was `NoCheckpointing`-only until `861b9f7`, so under
+`Autodiff<Cuda, BalancedCheckpointing>` — the trainer's backend — this node fell
+back to the tensor path until then. The fused backward has been reachable on the
+autodiff path since; it has not been re-measured since, and the performance table
+above predates that.
 
 ## Inference
 

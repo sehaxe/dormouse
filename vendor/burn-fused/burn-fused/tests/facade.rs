@@ -23,29 +23,22 @@
 // `pub use` in lib.rs turns one of these lines into a compile error.
 #[allow(unused_imports)]
 mod re_exports {
-    use burn_fused::burn_antihall;
     use burn_fused::burn_attnres;
     #[cfg(feature = "autodiff")]
     use burn_fused::burn_autodiff;
     use burn_fused::burn_bitnet;
-    use burn_fused::burn_byteflow;
     #[cfg(feature = "cuda")]
     use burn_fused::burn_cuda;
-    use burn_fused::burn_diffusionblocks;
     use burn_fused::burn_dspark;
     use burn_fused::burn_eggroll;
     use burn_fused::burn_engram;
     use burn_fused::burn_es;
-    use burn_fused::burn_fastblt;
     use burn_fused::burn_gdn2;
     use burn_fused::burn_jepa;
     use burn_fused::burn_kda;
     use burn_fused::burn_mhc;
-    use burn_fused::burn_mod;
     use burn_fused::burn_mor;
-    use burn_fused::burn_mtp;
     use burn_fused::burn_muon_plus;
-    use burn_fused::burn_nope;
     use burn_fused::burn_parcae;
     use burn_fused::burn_ptrn;
     use burn_fused::burn_rmsnorm;
@@ -54,7 +47,6 @@ mod re_exports {
     use burn_fused::burn_situ;
     use burn_fused::burn_spectral;
     use burn_fused::burn_swiglu;
-    use burn_fused::burn_ttt;
 }
 // --- end generated ---
 
@@ -115,11 +107,10 @@ fn attention_arms_compose() {
     let rotated = burn_fused::burn_rope::apply_rope_4d::<NdArray>(x, cos, sin);
     assert_eq!(rotated.dims(), [b, t, 2, 32]);
 
-    // NoPE, the positional-free alternative, reachable the same way.
-    let q = Tensor::<4>::random([b, t, 2, 32], Distribution::Default, &dev());
-    let v = Tensor::<4>::random([b, t, 2, 32], Distribution::Default, &dev());
-    let attended = burn_fused::burn_nope::nope_attention(q.clone(), q, v, true);
-    assert_eq!(attended.dims(), [b, t, 2, 32]);
+    // NoPE (`burn-nope`) used to be exercised here. It was deleted 2026-09-28
+    // as unreachable from `crates/dormouse-*` with no reason to stay — see
+    // `docs/library-crate-fate.md` in the dormouse repository. Worth recording
+    // that this test was the only thing making it look alive.
 }
 
 /// The doc's dtype claim, on the path a CPU user actually gets: the tensor

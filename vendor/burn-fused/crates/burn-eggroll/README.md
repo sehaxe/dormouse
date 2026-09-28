@@ -1,5 +1,11 @@
 # burn-eggroll
 
+> **Not in the dormouse build.** No crate under `crates/dormouse-{core,data,train,cli}/`
+> depends on this one; the only incoming edge is the `burn-fused` facade. Kept as a
+> **reference port** for the post-training phase named in `POST_TRAINING.md`
+> ("EGGROLL — exploration for controllers"), which does not exist yet, so no A/B can
+> be run against it before then. Fate table: `docs/library-crate-fate.md`.
+
 EGGROLL — **low-rank evolutionary strategies** for Burn, per
 [arXiv:2511.16652](https://arxiv.org/abs/2511.16652) *"Evolution Strategies
 at the Hyperscale"*.

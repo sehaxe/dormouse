@@ -1,5 +1,11 @@
 # burn-mhc - Manifold-Constrained Hyper-Connections for Burn
 
+> **Not in the dormouse build.** No crate under `crates/dormouse-{core,data,train,cli}/`
+> depends on this one; the only incoming edges are the `burn-fused` facade and the
+> `burn-fused-benches` probe. Kept as a **reference port**: `docs/PLAN-minimal-core.md`
+> §M2 names it as a residual-stream A/B arm, and that A/B has not been run. Fate
+> table and reasoning: `docs/library-crate-fate.md`.
+
 [![CI](https://github.com/sehaxe/burn-mhc/actions/workflows/ci.yml/badge.svg)](https://github.com/sehaxe/burn-mhc/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/burn-mhc)](https://crates.io/crates/burn-mhc)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)

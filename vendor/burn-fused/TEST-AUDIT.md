@@ -1,7 +1,11 @@
 # TEST-AUDIT — what the library's tests actually assert
 
 Written 2026-09-27, snapshot `1fab19e`. Scope: the CI gate and the
-reproducibility of the bit-for-bit claim, for the 28 crates under `crates/`.
+reproducibility of the bit-for-bit claim, for the 28 crates under `crates/`
+as they stood at that snapshot. Eight of them (`burn-antihall`, `burn-byteflow`,
+`burn-diffusionblocks`, `burn-fastblt`, `burn-mod`, `burn-mtp`, `burn-nope`,
+`burn-ttt`) were deleted 2026-09-28 as unreachable; see
+`docs/library-crate-fate.md`.
 Nothing in a `src/` was changed here — the crates listed under FINDINGS belong
 to other agents, this file is the hand-off.
 

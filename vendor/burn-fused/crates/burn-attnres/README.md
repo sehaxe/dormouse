@@ -1,5 +1,12 @@
 # burn-attnres - Attention Residuals for Burn
 
+> **Not in the dormouse build.** No crate under `crates/dormouse-{core,data,train,cli}/`
+> depends on this one, directly or transitively; the only incoming edges are the
+> library's own `burn-fused` facade and the `burn-fused-benches` probe. Kept as a
+> **reference port**: `docs/PLAN-minimal-core.md` §M2 names this crate as one of the
+> residual-stream A/B arms (alongside `burn-mhc` and the in-model ReZero/GR), and
+> that A/B has not been run. Fate table and reasoning: `docs/library-crate-fate.md`.
+
 [![CI](https://github.com/sehaxe/burn-attnres/actions/workflows/ci.yml/badge.svg)](https://github.com/sehaxe/burn-attnres/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/burn-attnres)](https://crates.io/crates/burn-attnres)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -63,7 +70,17 @@ exact full-depth weights.
 The fused `depth_attend` runs as a single tracked node under `Autodiff<Cuda>`
 with a fused backward (per (b,t) cube: RMS scores over L via tree reductions,
 softmax, then d_h_l and d_q in one launch; the history is stacked with a fast
-copy kernel). Verified fused backward == tensor-path backward (dh/dq < 1e-2).
+copy kernel). The fused backward is checked against the tensor-path backward
+(dh/dq < 1e-2) — that is a **self-consistency check between two of our own
+formulations of the same derivative**, so under `docs/adr/0020-oracle-discipline.md`
+it is kind (d), *not* verification: **no external reference exists**, and the
+word "verified" is withdrawn from this line. The check is real and worth having;
+what it cannot do is catch a transcription error shared by both sides.
+
+Also note the fused seam was `NoCheckpointing`-only until `fdf9b20`, so on the
+trainer's backend (`Autodiff<Cuda, BalancedCheckpointing>`) this node fell back
+to the tensor path until that commit. Any number in this file measured before it
+is not a fused-kernel number.
 Parent count is capped at 64 history layers + query (const-generic op).
 
 ## Inference
