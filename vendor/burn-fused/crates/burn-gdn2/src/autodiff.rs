@@ -156,6 +156,8 @@ where
     ) {
         #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
         let (ids, scale, chunk_size, scratch, fused_data) = ops.state;
+        #[cfg(feature = "cuda")]
+        crate::cuda_dispatch::note_backward_node();
         // q and g are not checkpointed: the scratch (always saved) carries
         // everything their values would contribute (qE, E), so the adjoint
         // never touches q or g. Keeping them out saves 2 full-sequence
@@ -210,6 +212,14 @@ where
             }
             return;
         }
+
+        // Past this point the fused adjoint is NOT used: the chunk trajectory
+        // is replayed on tensor ops. Gradients are then correct and the fused
+        // forward's saved state went unused. Traced so that `bwd=0` in a
+        // training log can be told apart from "the node never ran at all" -
+        // the first is a missing speedup, the second a silent gradient loss.
+        #[cfg(feature = "cuda")]
+        crate::cuda_dispatch::note_tensor_branch();
 
         let [batch, heads, time, k_dim] = k.shape().dims::<4>();
         let v_dim = v.shape().dims::<4>()[3];
@@ -497,6 +507,29 @@ where
     DispatchTensor: DispatchKindConversion<Autodiff<Inner, S>> + DispatchKindConversion<Inner>,
 {
     use crate::cuda_dispatch::{autodiff_node, bare_from_node};
+    // `OpsPrep::prepare` derives its `Requirement` from the parents' node
+    // refs and returns `UnTracked` when that requirement is `None` - which
+    // `Requirement::from_nodes` reports only if NO parent requires grad. So
+    // this is the same decision burn will make, read from the public API
+    // instead of from the private node ref.
+    let any_requires_grad = [&q, &k, &v, &g, &b, &w, &state]
+        .iter()
+        .any(|t| t.is_require_grad());
+    #[cfg(feature = "cuda")]
+    let forced_off = crate::cuda_dispatch::fused_forced_off();
+    #[cfg(not(feature = "cuda"))]
+    let forced_off = false;
+    if !any_requires_grad || forced_off {
+        // Declining here is what makes `chunk_dispatch` fall through to the
+        // OPS path, where burn builds the graph from its own tensor ops. See
+        // the long note there: the custom node this function creates is a
+        // LEAF whenever the inputs carry no node id, which under
+        // BalancedCheckpointing is always, so a fused output is a value the
+        // backward can never reach.
+        #[cfg(feature = "cuda")]
+        crate::cuda_dispatch::note_fused_declined();
+        return None;
+    }
     let [q, k, v, g, b, w, state] =
         [q, k, v, g, b, w, state].map(|t| autodiff_node::<Inner, S, 4>(&t));
     let (q, k, v, g, b, w, state) = match (q, k, v, g, b, w, state) {
@@ -516,6 +549,27 @@ where
         bare_from_node::<Inner, S, 4>(&state),
     );
 
+    // ROOT CAUSE, 2026-09-28. The fused path returns a LEAF whenever the op's
+    // inputs carry no node id - and under `BalancedCheckpointing`, the
+    // trainer's strategy, every intermediate tensor is such a leaf. A leaf
+    // means no gradient can reach this op's inputs, so the fused forward
+    // runs, its counter climbs, and the arm trains nothing at all.
+    //
+    // Measured on a real 20-step run: 30 fused forwards, 0 adjoint launches,
+    // `ops kind = UnTracked`. Every KDA number this project has ever produced
+    // came from an attention arm frozen at initialisation.
+    //
+    // `OpsPrep::prepare` yields `Tracked` exactly when every parent has a
+    // node id, so this predicate is that same decision made BEFORE paying for
+    // the forward. When it is false the tensor path runs instead: it builds a
+    // real graph, so gradients flow. The fused kernels still serve the
+    // gradient-free passes (held-out eval), where a leaf is harmless and the
+    // speed is worth having.
+    #[cfg(feature = "cuda")]
+    let fused_allowed = crate::cuda_dispatch::fused_forced_off();
+    #[cfg(not(feature = "cuda"))]
+    let fused_allowed = false;
+
     // Forward on the inner backend. On the bare CUDA backend the two fused
     // chunk kernels run instead of the tensor path (2 launches per chunk
     // instead of ~150; verified in tests/fused_chunk_verify.rs). The tensor
@@ -526,7 +580,7 @@ where
         #[cfg(feature = "cuda")]
         {
             use crate::kernel::chunk_cube::cuda::{fused_chunk_forward_scratch, is_cuda};
-            if is_cuda::<Inner>() {
+            if is_cuda::<Inner>() && fused_allowed {
                 if let Some((o, ns, io)) = fused_chunk_forward_scratch::<Inner>(
                     q_t.clone(),
                     k_t.clone(),
@@ -613,6 +667,8 @@ where
             )
         }
         OpsKind::UnTracked(prep) => {
+            #[cfg(feature = "cuda")]
+            crate::cuda_dispatch::note_untracked();
             let out = prep.finish(out_prim);
             (
                 out,

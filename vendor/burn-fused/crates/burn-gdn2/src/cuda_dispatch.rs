@@ -155,6 +155,7 @@ mod fused {
 
     static FUSED_FWD: AtomicU64 = AtomicU64::new(0);
     static FUSED_BWD: AtomicU64 = AtomicU64::new(0);
+    static FUSED_DECLINED: AtomicU64 = AtomicU64::new(0);
 
     /// Called by the fused kernels when they actually launch (never when a
     /// caller merely *considered* the fused path and fell back).
@@ -167,6 +168,78 @@ mod fused {
     #[inline]
     pub fn note_fused_backward() {
         FUSED_BWD.fetch_add(1, Relaxed);
+    }
+
+    /// Called when the op's inputs carry no node id, so `prepare` returns
+    /// `OpsKind::UnTracked` and the op's output is a LEAF: nothing downstream
+    /// can send a gradient back through it. That is not a missing speedup,
+    /// it is a silent gradient loss - this arm's parameters would never
+    /// train while every other op in the model trains normally. Traced so the
+    /// distinction is a measurement rather than a reading of the code.
+    /// Called when the fused path is DECLINED - either because the op's
+    /// inputs carry no node id (so a fused output would be a leaf and the arm
+    /// would train nothing) or because `DM_FUSED_KDA=0`. COUNTED, not silent:
+    /// a fused arm that quietly stops running is how 30 forwards and 0
+    /// gradients read as healthy for a day.
+    #[inline]
+    pub fn note_fused_declined() {
+        FUSED_DECLINED.fetch_add(1, Relaxed);
+    }
+
+    /// Fused forward declines since [`reset_fused_calls`].
+    pub fn fused_declined() -> u64 {
+        FUSED_DECLINED.load(Relaxed)
+    }
+
+    /// Forces the tensor path even where the fused path could deliver
+    /// gradients. The kill switch ADR-0011 asks for, so an A/B arm can be run
+    /// from the same binary instead of a rebuild.
+    pub fn fused_forced_off() -> bool {
+        std::env::var_os("DM_FUSED_KDA").as_deref() == Some(std::ffi::OsStr::new("0"))
+    }
+
+    #[inline]
+    pub fn note_untracked() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            if std::env::var_os("DM_GDN2_BWD_TRACE").is_some() {
+                eprintln!(
+                    "[gdn2] ops kind = UnTracked -> the fused output is a LEAF, \
+                     no gradient can reach this op's inputs"
+                );
+            }
+        });
+    }
+
+    /// Called on ENTRY to the fused op's autodiff node, before any branch.
+    ///
+    /// `fused_calls().1 == 0` cannot tell two very different worlds apart:
+    /// the node never ran (so this path contributed no gradient at all) vs
+    /// the node ran and took the tensor branch (correct gradients, no fused
+    /// acceleration). The first is a silent gradient loss; the second is
+    /// only a missing speedup. Different bugs, so they need different
+    /// evidence. Trace with `DM_GDN2_BWD_TRACE=1`.
+    #[inline]
+    pub fn note_backward_node() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            if std::env::var_os("DM_GDN2_BWD_TRACE").is_some() {
+                eprintln!("[gdn2] ChunkWy::backward ENTERED");
+            }
+        });
+    }
+
+    /// Called when the node runs but does NOT use the fused adjoint, i.e. it
+    /// replays the chunk trajectory on tensor ops. Gradients are then
+    /// correct and the fused forward's saved state went unused.
+    #[inline]
+    pub fn note_tensor_branch() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            if std::env::var_os("DM_GDN2_BWD_TRACE").is_some() {
+                eprintln!("[gdn2] ChunkWy::backward took the TENSOR branch");
+            }
+        });
     }
 
     /// `(forward, backward)` fused kernel launches since [`reset_fused_calls`].
@@ -248,7 +321,33 @@ mod fused {
         }
         probe!(NoCheckpointing);
         probe!(BalancedCheckpointing);
-        Fused::Fallback(Fallback::UnknownStrategy)
+
+        // THE OPS PATH - and the reason this function returns a value at all
+        // on the trainer's backend.
+        //
+        // `chunk_wy_forward_autodiff_s` runs the forward on the BARE backend
+        // and wraps the result in ONE hand-rolled autodiff node whose backward
+        // replays the chunk trajectory itself. So gradients exist only if
+        // that node is TRACKED - and its parents' node refs decide that, and
+        // under `BalancedCheckpointing` the op's inputs are checkpoint
+        // leaves, so `prepare` returns `UnTracked` and the output is a LEAF.
+        // Measured 2026-09-28 on a real run: `fused kda=30/0`, 30 fused
+        // forwards, 0 adjoint launches, 0 gradient into the attention arm.
+        // Every KDA number this project had ever produced came from an arm
+        // frozen at initialisation.
+        //
+        // `chunk_wy_forward_impl` is written with ordinary burn tensor ops
+        // (`matmul`, `mul`, ...) and is generic over the backend, so handing
+        // it the INCOMING tensors lets burn build the graph itself. No custom
+        // node, no leaf, every step of the recurrence differentiable. Slower
+        // than the fused kernels and correct - which is the trade the project
+        // is making deliberately until a fused path is A/B-proven against
+        // this one rather than against a run that trained nothing.
+        let (o, s, _scratch) = crate::forward::chunk_wy_forward_impl(
+            q, k, v, g, b, w, state, scale, chunk_size, None,
+        );
+        note_fused_declined();
+        Fused::Fused((o, s))
     }
 }
 
