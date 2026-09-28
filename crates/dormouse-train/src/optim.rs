@@ -1,42 +1,56 @@
 //! Optimizer policy: Muon+ (burn-fused) with the Qwen3.8-Flash-Next §3.1
 //! param routing.
 //!
-//! Policy (report §3.1, validated by [`validate_routing`]):
-//! - **Muon+ ColRow** on matrices that genuinely act as linear maps: KDA
-//!   key_projs, expert TSCT u/v factors, Engram key projections.
-//! - **Head-wise Muon+** on the attention Q/K weights (report §3.1: split
-//!   qkv per head BEFORE orthogonalization - fusing mixes singular
-//!   directions): each `[head_dim, d]` block gets its own NS
-//!   preconditioner ([`HeadWiseMuon`]). Enabled by `qk_heads` (set from the
-//!   preset's n_heads in the train loop).
-//! - **Plain Adam, weight decay disabled** on the n-gram tables (§2.3).
-//! - **AdamW** on everything else: embeddings, output head, routers/scorers
-//!   (controller, halt head), per-head scalar producers (KDA decay/β gates),
-//!   elongated low-rank readouts (out_proj), conv kernels and all 1D leaves.
-//!   Orthogonalization is meaningless or
-//!   harmful there (e.g. a 1-D output like the router score has no shared
-//!   linear structure to exploit).
+//! **The policy lives in [`dormouse_core::routing`]**, next to the arms it
+//! names, and this file only ASSEMBLES the optimizer. It used to keep a
+//! SECOND copy here: a table of path markers (`"expert_ffns."`,
+//! `"gdn2.q_proj"`, ...) re-derived from the module field names. The two
+//! copies did disagree, and the disagreement was load-bearing - the marker
+//! set excluded `inner.Dense.bias` but not `inner.Dense.weight`, so with
+//! `--set use_tsct=false` a dense expert fed its full `[d,d]` weight to Muon+
+//! and fp32 Newton-Schulz, the ~40 s/step case the declaration exists to avoid.
+//! The only count in the log was the marker's own, so nothing said so.
 //!
-//! Burn matches parameter groups by module path (field names joined by ".",
-//! Vec entries as indices, e.g. `expert_ffns.0.gate_up.inner.u`), so the
-//! policy is declared as path markers. Path strings are the framework's
-//! mechanism; what keeps them honest is [`validate_routing`], which re-checks
-//! the policy invariants against the live module tree at startup and fails
-//! loudly when a marker goes stale (module renamed) instead of silently
-//! falling back to AdamW.
+//! What is here now:
+//! - [`optimizer_groups`] turns the declaration into the three
+//!   [`ParamGroup`]s the optimizer installs, by id. A rename cannot move a
+//!   parameter between groups, and a parameter nothing declared is a startup
+//!   error ([`routing::Routing::check`]).
+//! - [`check_installed`] runs the INSTALLED groups against the live module
+//!   tree: a parameter in no group, in two, or a 1D parameter in Muon+ is a
+//!   loud error naming the path. This is the check with teeth, because it
+//!   asks the objects the optimizer actually holds instead of re-deriving the
+//!   policy a third time.
+//!
+//! Which group is which (report §3.1):
+//! - **Muon+ ColRow** on the small matrices that genuinely act as linear maps:
+//!   the Engram key projections and the low-rank TSCT `u`/`v` factors.
+//! - **Head-wise Muon+** on the attention Q/K weights (report §3.1: split qkv
+//!   per head BEFORE orthogonalization - fusing mixes singular directions):
+//!   each `[head_dim, d]` block gets its own NS preconditioner
+//!   ([`HeadWiseMuon`]). Installed only when `qk_heads` is set (the train
+//!   loop derives it from the preset's `n_heads`); unset, Q/K train on the
+//!   base optimizer.
+//! - **Plain Adam, weight decay disabled** on the n-gram tables (§2.3).
+//! - **The base optimizer** (AdamW / Adan per `--opt`) on everything else:
+//!   embeddings, output head, routers/scorers, per-head scalar producers
+//!   (KDA decay/β gates), conv kernels, and every dense `[m,n]` leaf - a dense
+//!   linear IS the expensive NS case.
 //!
 //! Selection via `--opt` (runtime switch, no rebuild):
-//! - `mix` (default): the policy above (AdamW fallback).
-//! - `mix-adan`: same policy, but the fallback group runs Adan
+//! - `mix` (default): the groups above (AdamW fallback).
+//! - `mix-adan`: same groups, but the fallback group runs Adan
 //!   (arXiv 2208.06677: Nesterov momentum + gradient-difference correction,
 //!   the "AdamW+" already shipped in burn-optim).
 //! - `adan`: Adan on every param.
 //! - `adamw`: legacy AdamW on every param (A/B baseline).
 //! - `muon`: Muon+ on every param (its own AdamW fallback for 1D); debug
-//!   mode, not the report recipe.
+//!   mode, not the report recipe. No groups are installed - the mode already
+//!   says "Muon on everything".
 //!
-//! `--factors-fallback` additionally drops the expert TSCT factors from
-//! the Muon+ group (see [`effective_muon_markers`]).
+//! `--factors-fallback` additionally drops the expert TSCT factors from the
+//! Muon+ group. That is a [`routing::group_of`] branch, not a group to filter
+//! here: the declaration has to be the only place a group is decided.
 
 use burn::{
     grad_clipping::GradientClippingConfig,
@@ -45,6 +59,7 @@ use burn::{
     tensor::{Device, ElementConversion, Tensor},
 };
 use burn_muon_plus::{MuonPlus, MuonPlusConfig, MuonPlusState, NormDir};
+use dormouse_core::routing::{self, Group};
 use dormouse_core::DormouseModel;
 use std::sync::atomic::Ordering::Relaxed;
 
@@ -71,79 +86,11 @@ pub const MUON_NS_STEPS: usize = 8;
 /// paper's best combination).
 pub const MUON_NORM_DIR: Option<NormDir> = Some(NormDir::ColRow);
 
-/// Muon+ group markers. Each marker must match at least one param of the
-/// live model (checked by [`validate_routing`]).
-///
-/// Only SMALL matrices go to Muon+: the Newton-Schulz orthogonalization
-/// costs ~3 matmuls per iteration on the FULL [m,n] matrix, and on this box
-/// (5060 Ti, fp32, no tensor cores) 8 NS iters on [768,768] projections
-/// added ~40 s per step. The low-rank TSCT factors are [d,64]/[64,f]:
-/// orthogonalize in the factored [64,64] form, ~1000x cheaper. The dense
-/// [d,d] attention projections stay on the fallback until the bf16 compute
-/// path (tensor cores) is fixed.
-pub(crate) const MUON_PATH_MARKERS: &[&str] = &[
-    // Expert TSCT factors (report: fc1/fc2 of routed and shared experts).
-    // The 1D scale leaf `s` is excluded from the group.
-    "expert_ffns.",
-    // Engram key projection (report: n-gram key/value projections on Muon;
-    // value_proj is [d,d] here, excluded for the same cost reason).
-    "engram.key_projs",
-    // Loop readout projection (low-rank [d,64]/[64,d]).
-    "out_proj.inner",
-];
-
-/// n-gram tables: plain Adam with weight decay disabled (report §2.3).
-const ENGRAM_TABLE_MARKER: &str = "engram.memory";
-
-/// True when a module param path belongs to the Muon+ group (2D only; the 1D
-/// TSCT scale leaf `s` is excluded, end-anchored so `inner.s` is caught but
-/// `inner.u`/`inner.v` are not).
-pub fn is_muon_param(path: &str) -> bool {
-    if path.ends_with(".s") {
-        return false; // the 1D TSCT scale leaf
-    }
-    // A dense bias is 1D and must not be orthogonalized (that is what the
-    // routing check caught when the spectral path was switched off). Only
-    // the weight of a dense linear is a 2D Muon candidate.
-    if path.contains("inner.Dense") {
-        return path.ends_with(".weight") && !is_dense_bias(path);
-    }
-    MUON_PATH_MARKERS.iter().any(|m| path.contains(m))
-}
-
-/// A dense (non-spectral) linear's bias is 1D and must not be
-/// orthogonalized. Kept as one predicate because it has to be applied in BOTH
-/// the group builder and the routing validator - they used to disagree, which
-/// is precisely the class of bug the validator exists to catch.
-pub(crate) fn is_dense_bias(path: &str) -> bool {
-    path.contains("inner.Dense") && path.ends_with(".bias")
-}
-
-/// True when a module param path is an n-gram table (plain Adam, no wd).
-pub fn is_engram_table_param(path: &str) -> bool {
-    path.contains(ENGRAM_TABLE_MARKER)
-}
-
-fn engram_table_group() -> ParamGroup {
-    ParamGroup::from_predicate(ENGRAM_TABLE_MARKER)
-}
-
 fn muon_plus_cfg(cfg: &TrainCfg) -> MuonPlusConfig {
     MuonPlusConfig::new()
         .with_norm_dir(MUON_NORM_DIR)
         .with_ns_steps(MUON_NS_STEPS)
         .with_weight_decay(cfg.wd)
-}
-
-/// Q/K paths routed to the head-wise Muon group (per-head preconditioner).
-/// One group, one head count: KDA's q and k both carry `n_heads` heads (the
-/// GQA k-side group that needed its own head count was the MSA arm's, cut in
-/// ADR-0014).
-pub(crate) const QK_HEAD_MARKERS: &[&str] = &["gdn2.q_proj", "gdn2.k_proj"];
-
-/// True when a param path belongs to a head-wise Q/K group (2D only).
-pub fn is_qk_param(path: &str) -> bool {
-    QK_HEAD_MARKERS.iter().any(|m| path.contains(m))
 }
 
 /// Head-wise Muon+ for the attention Q/K projections (Qwen3.8-Flash-Next
@@ -156,7 +103,7 @@ pub fn is_qk_param(path: &str) -> bool {
 /// [768,768] was ~40 s/step; 12 blocks of [64,768] are milliseconds).
 ///
 /// Q/K here are separate Linears (burn-kda gdn2), so the per-head split is
-/// unambiguous - there is no fused [d, 3d] qkv to disambiguate.
+/// unambiguous - there is no fused `[d, 3d]` qkv to disambiguate.
 #[derive(Clone)]
 pub struct HeadWiseMuon {
     muon: MuonPlus,
@@ -285,172 +232,106 @@ impl Optimizer for HeadWiseMuon {
     }
 }
 
-/// The Muon+ marker list in effect. `factors_fallback` drops the expert TSCT
-/// factors from the Muon+ group (they are very elongated [d, r]/[r, f]
-/// shapes; the report found elongated low-rank projections did better with
-/// AdamW - A/B knob against the default Muon+ routing).
-fn effective_muon_markers(factors_fallback: bool) -> Vec<&'static str> {
-    let mut markers = MUON_PATH_MARKERS.to_vec();
-    if factors_fallback {
-        markers.retain(|m| *m != "expert_ffns.");
+/// The optimizer groups the trainer INSTALLS, built by id from the
+/// declaration. This is the only place a group is assembled; the decision of
+/// which group a parameter is in lives in [`routing::group_of`].
+pub struct Installed {
+    pub muon: ParamGroup,
+    /// `None` when head-wise Q/K routing is off: those two parameters then
+    /// train on the base optimizer, so the group is not installed and must
+    /// not be counted.
+    pub qk: Option<ParamGroup>,
+    pub table: ParamGroup,
+}
+
+impl Installed {
+    fn new(r: &routing::Routing, qk_heads: Option<usize>) -> Self {
+        Self::of(
+            r.group(Group::Muon),
+            qk_heads.map(|_| r.group(Group::QkHeadWise)),
+            r.group(Group::Table),
+        )
     }
-    markers
-}
 
-/// Build the optimizer for `mode`, the pure core of [`build_optim`].
-pub(crate) fn build_optim_mode(cfg: &TrainCfg, mode: &str) -> Optim {
-    let clip = (cfg.grad_clip > 0.0).then_some(GradientClippingConfig::Norm(cfg.grad_clip as f32));
-    let markers = effective_muon_markers(cfg.factors_fallback);
-    let muon_group = || {
-        ParamGroup::from_any_predicates(markers.clone())
-            .exclude(ParamGroup::from_regex(r"\.s$").expect("valid regex"))
-            .exclude(ParamGroup::from_regex(r"inner\.Dense\.bias$").expect("valid regex"))
-    };
-    let muon_plus = || muon_plus_cfg(cfg).build();
-    let mut opt = match mode {
-        // Fallback optimizer candidates for the "rest" group.
-        "adamw" => AdamWConfig::new().with_weight_decay(cfg.wd as f32).init(),
-        "adan" => AdanConfig::new().with_weight_decay(cfg.wd as f32).init(),
-        "muon" => muon_plus_cfg(cfg).init(),
-        "mix-adan" => {
-            let mut o = AdanConfig::new().with_weight_decay(cfg.wd as f32).init();
-            o = o.with_group(muon_group(), muon_plus(), None);
-            o = o.with_group(engram_table_group(), AdamConfig::new().build(), None);
-            o = with_qk_groups(o, cfg);
-            o
-        }
-        // mix (default): the report §3.1 recipe.
-        _ => {
-            let mut o = AdamWConfig::new().with_weight_decay(cfg.wd as f32).init();
-            o = o.with_group(muon_group(), muon_plus(), None);
-            o = o.with_group(engram_table_group(), AdamConfig::new().build(), None);
-            o = with_qk_groups(o, cfg);
-            o
-        }
-    };
-    if let Some(c) = clip {
-        // ModuleOptimizer::with_grad_clipping applies to the first optimizer.
-        opt = opt.with_grad_clipping(c.init());
+    /// An install built by hand. Exists so the loud gate
+    /// ([`check_installed`]) can be tested against a group set that LIES -
+    /// a group that claims nothing, everything, or a 1D leaf. That is the
+    /// only way to prove the gate fires, and the previous string-based
+    /// validator had exactly this test while the thing it did not test - the
+    /// groups the optimizer actually holds - drifted.
+    pub fn of(muon: ParamGroup, qk: Option<ParamGroup>, table: ParamGroup) -> Self {
+        Self { muon, qk, table }
     }
-    opt
-}
 
-/// Route the attention Q/K projections to head-wise Muon when `qk_heads`
-/// is set (the preset's `n_heads`). Unset keeps Q/K on the base fallback
-/// optimizer.
-fn with_qk_groups(opt: Optim, cfg: &TrainCfg) -> Optim {
-    let Some(h) = cfg.qk_heads else { return opt };
-    opt.with_group(
-        ParamGroup::from_any_predicates(QK_HEAD_MARKERS.to_vec()),
-        HeadWiseMuon::new(cfg, h),
-        None,
-    )
-}
-
-/// Build the optimizer per OPT env:
-/// `mix` (default) | `mix-adan` | `adamw` | `adan` | `muon`.
-/// Grad clipping stays on the base (first) optimizer; the report's Muon
-/// recipe does not clip (gates bound the activations, pre-clip norms stay
-/// low), and Muon+ has no clipping hook.
-pub fn build_optim(cfg: &TrainCfg) -> Optim {
-    build_optim_mode(cfg, &cfg.opt)
-}
-
-/// Count parameters per optimizer group (Muon+ / head-wise Q/K / Adam
-/// tables / AdamW rest). Used by the startup banner and the routing tests.
-#[derive(Default, Debug)]
-pub struct GroupCounts {
-    pub muon: usize,
-    pub qk: usize,
-    pub tables: usize,
-    pub rest: usize,
-    stack: Vec<String>,
-}
-
-impl ModuleVisitor for GroupCounts {
-    fn enter_module(&mut self, name: &str, _container: &str) {
-        self.stack.push(name.to_string());
-    }
-    fn exit_module(&mut self, _name: &str, _container: &str) {
-        self.stack.pop();
-    }
-    fn visit_float<const D: usize>(&mut self, _param: &Param<Tensor<D>>) {
-        let path = self.stack.join(".");
-        if is_muon_param(&path) {
-            self.muon += 1;
-        } else if is_qk_param(&path) {
-            self.qk += 1;
-        } else if is_engram_table_param(&path) {
-            self.tables += 1;
-        } else {
-            self.rest += 1;
+    /// The group `id` must be INSTALLED into, as the declaration sees it.
+    /// `None` means "no group": the base optimizer, which is correct for
+    /// [`Group::Rest`] and for Q/K when `qk_heads` is unset.
+    fn expected_group(&self, r: &routing::Routing, id: &burn::module::ParamId) -> Option<Group> {
+        match r.group_of_id(id)? {
+            Group::Rest => None,
+            Group::QkHeadWise if self.qk.is_none() => None,
+            g => Some(g),
         }
     }
 }
 
-/// Collect every float param path with its tensor rank.
-#[derive(Default)]
-struct PathCollector {
-    stack: Vec<String>,
-    paths: Vec<(String, usize)>,
+/// The groups for `model`, from the declaration, verified against the live
+/// module tree. The one call the trainer makes; it fails loudly rather than
+/// installing groups that do not cover the model.
+pub fn optimizer_groups(model: &DormouseModel, cfg: &TrainCfg) -> Result<Installed, String> {
+    let r = routing::routing(model, cfg.factors_fallback);
+    // Every parameter declared, in exactly one group (the declaration is
+    // total, so this is the "a new arm cannot slip in unnoticed" gate).
+    r.check(model)?;
+    let g = Installed::new(&r, cfg.qk_heads);
+    let _ = check_installed(model, &r, &g)?;
+    Ok(g)
 }
 
-impl ModuleVisitor for PathCollector {
-    fn enter_module(&mut self, name: &str, _container: &str) {
-        self.stack.push(name.to_string());
-    }
-    fn exit_module(&mut self, _name: &str, _container: &str) {
-        self.stack.pop();
-    }
-    fn visit_float<const D: usize>(&mut self, _param: &Param<Tensor<D>>) {
-        self.paths.push((self.stack.join("."), D));
-    }
-}
-
-/// Re-check the routing policy against the live module tree. Fails loudly on
-/// any violation of the policy invariants or on a marker that matches nothing
-/// (stale after a module rename). Call once at startup, before training.
-/// `factors_fallback` must match the value the optimizer was built with;
-/// `qk_heads` must be `Some(n_heads)` iff the head-wise Q/K groups were
-/// enabled.
-pub fn validate_routing(
+/// Run the INSTALLED groups against the live module tree and require that
+/// they REPRODUCE the declaration, parameter by parameter. A parameter in two
+/// groups, a 1D parameter in a Muon+ group, and a parameter the install puts
+/// somewhere the policy does not are all loud errors naming the path.
+///
+/// `Rest` is the base optimizer and installs no group, so "claimed by
+/// nothing" is not on its own an error - "claimed by nothing WHEN THE POLICY
+/// SAYS MUON+" is. That distinction is the check; the previous version tested
+/// only the string copy of the rules against itself.
+///
+/// This is the loud gate (ADR-0011/ADR-0019), and it reads the `ParamGroup`s
+/// the optimizer holds, not a copy of the rules.
+pub fn check_installed(
     model: &DormouseModel,
-    factors_fallback: bool,
-    qk_heads: Option<usize>,
+    r: &routing::Routing,
+    g: &Installed,
 ) -> Result<GroupCounts, String> {
-    let markers = effective_muon_markers(factors_fallback);
-    validate_routing_with(model, &markers, ENGRAM_TABLE_MARKER, qk_heads)
-}
-
-pub(crate) fn validate_routing_with(
-    model: &DormouseModel,
-    markers: &[&str],
-    table_marker: &str,
-    qk_heads: Option<usize>,
-) -> Result<GroupCounts, String> {
-    let is_muon = |p: &str| !is_dense_bias(p) && markers.iter().any(|m| p.contains(m)) && !p.ends_with(".s");
-    let is_table = |p: &str| p.contains(table_marker);
-    // The Q/K groups exist only when head-wise routing is on; otherwise the
-    // params stay in the base fallback group like before.
-    let is_qk = |p: &str| qk_heads.is_some() && is_qk_param(p);
-    let mut collector = PathCollector::default();
-    model.visit(&mut collector);
+    let params = param_paths(model);
     let mut counts = GroupCounts::default();
-    for (path, rank) in &collector.paths {
-        let muon = is_muon(path);
-        let table = is_table(path);
-        let qk = is_qk(path);
-        if muon && table {
-            return Err(format!("{path}: matches both Muon+ and table groups"));
+    for (path, id, rank) in &params {
+        let muon = g.muon.matches(id, Some(path));
+        let qk = g.qk.as_ref().is_some_and(|q| q.matches(id, Some(path)));
+        let table = g.table.matches(id, Some(path));
+        let hits = [muon, qk, table].iter().filter(|hit| **hit).count();
+        if hits > 1 {
+            return Err(format!("{path}: matches multiple installed optimizer groups ({hits})"));
         }
-        if muon && qk || table && qk {
-            return Err(format!("{path}: matches multiple optimizer groups"));
+        // A 1D leaf has no shared linear structure to orthogonalize; the TSCT
+        // scale leaf's being 1D is the whole reason the factors are in the
+        // group and `s` is not.
+        if (muon || qk) && *rank != 2 {
+            return Err(format!("{path}: 1D param routed to a Muon+ group"));
         }
-        if muon && *rank == 1 {
-            return Err(format!("{path}: 1D param routed to Muon+"));
-        }
-        if qk && *rank != 2 {
-            return Err(format!("{path}: non-2D param routed to the Q/K head-wise group"));
+        let declared = g.expected_group(r, id);
+        let installed = muon
+            .then_some(Group::Muon)
+            .or(qk.then_some(Group::QkHeadWise))
+            .or(table.then_some(Group::Table));
+        if declared != installed {
+            return Err(format!(
+                "{path}: the installed optimizer group ({installed:?}) is not the declared one \
+                 ({declared:?}) - the group sets must be built from the declaration, not from a \
+                 second copy of the rules"
+            ));
         }
         if muon {
             counts.muon += 1;
@@ -461,36 +342,137 @@ pub(crate) fn validate_routing_with(
         } else {
             counts.rest += 1;
         }
-        // Policy invariants: expert TSCT factors are always Muon+ (unless
-        // --factors-fallback removed them), n-gram tables always plain Adam.
-        if markers.iter().any(|m| *m == "expert_ffns.")
-            && path.contains("expert_ffns.")
-            && (path.ends_with(".u") || path.ends_with(".v"))
-        {
-            if !muon {
-                return Err(format!("{path}: expert TSCT factor must be Muon+"));
-            }
-        }
-        if path.contains(table_marker) && !table {
-            return Err(format!("{path}: n-gram table must be on plain Adam"));
-        }
     }
-    // No dead markers: every marker must match at least one live param, so a
-    // module rename surfaces here instead of silently degrading to AdamW.
-    for marker in markers {
-        if !collector.paths.iter().any(|(p, _)| p.contains(marker)) {
-            return Err(format!("Muon+ marker {marker:?} matches no param (renamed?)"));
-        }
+    if params.is_empty() {
+        return Err("the live model has no float parameters to route".to_string());
     }
-    if !collector.paths.iter().any(|(p, _)| p.contains(table_marker)) {
-        return Err(format!("table marker {table_marker:?} matches no param (renamed?)"));
-    }
-    if qk_heads.is_some() {
-        for marker in QK_HEAD_MARKERS {
-            if !collector.paths.iter().any(|(p, _)| p.contains(marker)) {
-                return Err(format!("Q/K marker {marker:?} matches no param (renamed?)"));
-            }
-        }
+    // A rule that routes NOTHING is the reachable form of a stale marker:
+    // the groups are ids, so a marker cannot "match nothing" any more, but
+    // an arm that stopped being built leaves its group empty and the run
+    // would train that arm on the base optimizer without saying so. The
+    // Engram key projection and the n-gram table are covered by
+    // `Routing::check`; the Q/K group is only supposed to exist when it is
+    // installed, so it is covered here.
+    if g.qk.is_some() && counts.qk == 0 {
+        return Err(
+            "the head-wise Q/K group is installed (qk_heads is set) but claims no parameter - the \
+             KDA q/k projections are gone"
+                .to_string(),
+        );
     }
     Ok(counts)
+}
+
+/// Count parameters per optimizer group (Muon+ / head-wise Q/K / Adam tables
+/// / base-optimizer rest), counted off the INSTALLED groups. Used by the
+/// startup banner and the routing tests.
+#[derive(Default, Debug)]
+pub struct GroupCounts {
+    pub muon: usize,
+    pub qk: usize,
+    pub tables: usize,
+    pub rest: usize,
+}
+
+/// Every float param of the live model: `(path, id, rank)`. Paths are for
+/// error messages only - no routing decision is ever made from one.
+#[derive(Default)]
+struct PathCollector {
+    stack: Vec<String>,
+    out: Vec<(String, burn::module::ParamId, usize)>,
+}
+
+impl ModuleVisitor for PathCollector {
+    fn enter_module(&mut self, name: &str, _container: &str) {
+        self.stack.push(name.to_string());
+    }
+    fn exit_module(&mut self, _name: &str, _container: &str) {
+        self.stack.pop();
+    }
+    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<D>>) {
+        self.out.push((self.stack.join("."), param.id, D));
+    }
+}
+
+/// Every float parameter of `model` as `(path, id, rank)`. Paths are for
+/// error messages and for tests that want to say WHICH parameter a group
+/// decision is about - no routing decision is ever made from one, which is
+/// the property the marker table violated.
+pub fn param_paths(model: &DormouseModel) -> Vec<(String, burn::module::ParamId, usize)> {
+    let mut c = PathCollector::default();
+    model.visit(&mut c);
+    c.out
+}
+
+/// Build the optimizer for `mode`, the pure core of [`build_optim`].
+pub(crate) fn build_optim_mode(model: &DormouseModel, cfg: &TrainCfg, mode: &str) -> Optim {
+    let clip = (cfg.grad_clip > 0.0).then_some(GradientClippingConfig::Norm(cfg.grad_clip as f32));
+    let groups = optimizer_groups(model, cfg)
+        .unwrap_or_else(|e| panic!("optimizer routing check failed: {e}"));
+    let muon_plus = || muon_plus_cfg(cfg).build();
+    let mut opt = match mode {
+        // Fallback optimizer candidates for the "rest" group.
+        "adamw" => AdamWConfig::new().with_weight_decay(cfg.wd as f32).init(),
+        "adan" => AdanConfig::new().with_weight_decay(cfg.wd as f32).init(),
+        "muon" => muon_plus_cfg(cfg).init(),
+        "mix-adan" => {
+            let mut o = AdanConfig::new().with_weight_decay(cfg.wd as f32).init();
+            o = o.with_group(groups.muon.clone(), muon_plus(), None);
+            o = o.with_group(groups.table.clone(), AdamConfig::new().build(), None);
+            with_qk_groups(o, cfg, &groups)
+        }
+        // mix (default): the report §3.1 recipe.
+        _ => {
+            let mut o = AdamWConfig::new().with_weight_decay(cfg.wd as f32).init();
+            o = o.with_group(groups.muon.clone(), muon_plus(), None);
+            o = o.with_group(groups.table.clone(), AdamConfig::new().build(), None);
+            with_qk_groups(o, cfg, &groups)
+        }
+    };
+    if let Some(c) = clip {
+        // ModuleOptimizer::with_grad_clipping applies to the first optimizer.
+        opt = opt.with_grad_clipping(c.init());
+    }
+    opt
+}
+
+/// Install the head-wise Q/K group when `qk_heads` is set (the preset's
+/// `n_heads`). Unset keeps Q/K on the base fallback optimizer, which is why
+/// the group is not installed rather than installed empty.
+fn with_qk_groups(opt: Optim, cfg: &TrainCfg, groups: &Installed) -> Optim {
+    let (Some(qk), Some(heads)) = (&groups.qk, cfg.qk_heads) else {
+        return opt;
+    };
+    opt.with_group(qk.clone(), HeadWiseMuon::new(cfg, heads), None)
+}
+
+/// Build the optimizer per OPT env:
+/// `mix` (default) | `mix-adan` | `adamw` | `adan` | `muon`.
+/// Grad clipping stays on the base (first) optimizer; the report's Muon
+/// recipe does not clip (gates bound the activations, pre-clip norms stay
+/// low), and Muon+ has no clipping hook.
+///
+/// `model` is the LIVE instance, not a config: the groups are built from its
+/// parameter ids, so this must be the model that will be trained.
+pub fn build_optim(model: &DormouseModel, cfg: &TrainCfg) -> Optim {
+    build_optim_mode(model, cfg, &cfg.opt)
+}
+
+/// The startup check, and the counts the banner prints. Reads the same
+/// declaration the optimizer is built from and verifies the installed groups
+/// against the live tree, so this cannot disagree with the install by
+/// construction - which is the whole point: the previous version re-derived
+/// the policy from path strings and disagreed with it on dense experts.
+///
+/// `factors_fallback` and `qk_heads` must match the values the optimizer was
+/// built with.
+pub fn validate_routing(
+    model: &DormouseModel,
+    factors_fallback: bool,
+    qk_heads: Option<usize>,
+) -> Result<GroupCounts, String> {
+    let r = routing::routing(model, factors_fallback);
+    r.check(model)?;
+    let g = Installed::new(&r, qk_heads);
+    check_installed(model, &r, &g)
 }

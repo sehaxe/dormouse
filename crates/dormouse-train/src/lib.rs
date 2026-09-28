@@ -23,7 +23,8 @@ use dormouse_core::{fused_seam_counts, ActQuant, DormouseConfig, DormouseModel};
 
 pub use cfg::{resolve, RunCfg};
 pub use optim::{
-    build_optim, is_engram_table_param, is_muon_param, validate_routing, GroupCounts, MUON_NS_STEPS,
+    build_optim, check_installed, optimizer_groups, param_paths, validate_routing, GroupCounts,
+    Installed, MUON_NS_STEPS,
 };
 pub use stress::{grad_norm, StressMonitor};
 
@@ -796,7 +797,7 @@ pub fn train_loop(
     let device = device();
     init_pools(&device);
     let (mut model, qfmt) = build_model(&dorm_cfg, &cfg, &device);
-    let mut optim = build_optim(&cfg);
+    let mut optim = build_optim(&model, &cfg);
     // Fail fast if the routing policy no longer matches the model (stale
     // marker after a module rename would silently degrade to AdamW).
     let gc = validate_routing(&model, cfg.factors_fallback, cfg.qk_heads)
@@ -1512,7 +1513,6 @@ pub fn load_model_weights(dir: &Path, name: &str, cfg: DormouseConfig) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::optim::validate_routing_with;
     use dormouse_core::param::{LinearLike, LinearLikeInner};
     use dormouse_data::fnv;
 
@@ -1547,14 +1547,14 @@ mod tests {
         let cfg = test_cfg();
         let model = DormouseModel::new(&cfg, &device());
         let optim_cfg = TrainCfg { steps: 5, seq_len: 64, batch: 2, ..Default::default() };
-        let optim = crate::optim::build_optim_mode(&optim_cfg, "mix");
+        let optim = crate::optim::build_optim_mode(&model, &optim_cfg, "mix");
         let dir = std::env::temp_dir().join("dm-ckpt-roundtrip-test");
         let _ = std::fs::remove_dir_all(&dir);
         save_ckpt(&dir, "rt", &model, &optim, None, false, 42, 3.25).expect("save");
         let txt = std::fs::read_to_string(dir.join("rt.txt")).expect("sidecar");
         assert!(txt.contains("step 42 ce 3.250"), "sidecar: {txt}");
         let mut model2 = DormouseModel::new(&cfg, &device());
-        let mut optim2 = crate::optim::build_optim_mode(&optim_cfg, "mix");
+        let mut optim2 = crate::optim::build_optim_mode(&model, &optim_cfg, "mix");
         let loaded = load_ckpt(&dir, "rt", &cfg, &mut model2, &mut optim2).expect("load");
         assert_eq!(loaded.step, 42);
         assert!(!loaded.legacy, "a container we just wrote is not legacy");
@@ -1586,7 +1586,7 @@ mod tests {
         let cfg = test_cfg();
         let model = DormouseModel::new(&cfg, &device());
         let optim_cfg = TrainCfg { steps: 5, seq_len: 64, batch: 2, ..Default::default() };
-        let optim = crate::optim::build_optim_mode(&optim_cfg, "mix");
+        let optim = crate::optim::build_optim_mode(&model, &optim_cfg, "mix");
         // A teacher at distance from the student: every param + 1. A restore
         // that re-derived the teacher from the student cannot pass.
         struct Bump;
@@ -1605,7 +1605,7 @@ mod tests {
         save_ckpt(&dir, "st", &model, &optim, Some(&teacher), true, 11, 1.5).expect("save");
 
         let mut m2 = DormouseModel::new(&cfg, &device());
-        let mut o2 = crate::optim::build_optim_mode(&optim_cfg, "mix");
+        let mut o2 = crate::optim::build_optim_mode(&model, &optim_cfg, "mix");
         let loaded = load_ckpt(&dir, "st", &cfg, &mut m2, &mut o2).expect("load");
         assert!(loaded.ortho_fp32, "the one-way fp32 fallback must be persisted");
         let t2 = loaded.teacher.expect("the EMA teacher must be in the container");
@@ -1635,7 +1635,7 @@ mod tests {
         let cfg = test_cfg();
         let model = DormouseModel::new(&cfg, &device());
         let optim_cfg = TrainCfg { steps: 5, seq_len: 64, batch: 2, ..Default::default() };
-        let optim = crate::optim::build_optim_mode(&optim_cfg, "mix");
+        let optim = crate::optim::build_optim_mode(&model, &optim_cfg, "mix");
         let dir = std::env::temp_dir().join("dm-ckpt-legacy-test");
         let _ = std::fs::remove_dir_all(&dir);
         save_ckpt(&dir, "lg", &model, &optim, None, false, 9, 2.0).expect("save");
@@ -1651,7 +1651,7 @@ mod tests {
         std::fs::write(dir.join("lg.bin"), &legacy).expect("rewrite");
 
         let mut m2 = DormouseModel::new(&cfg, &device());
-        let mut o2 = crate::optim::build_optim_mode(&optim_cfg, "mix");
+        let mut o2 = crate::optim::build_optim_mode(&model, &optim_cfg, "mix");
         let loaded = load_ckpt(&dir, "lg", &cfg, &mut m2, &mut o2).expect("a legacy container must still load");
         assert_eq!(loaded.step, 9);
         assert!(loaded.legacy, "the reader must know it is reading a pre-ADR-0021 file");
@@ -1665,35 +1665,95 @@ mod tests {
     /// the param on AdamW, so every boundary is pinned here.
     #[test]
     fn muon_routing_matches_report() {
-        // Muon+ group: small low-rank factors only (NS on [d,d] projections
-        // is ~40 s/step on this box in fp32; see optim.rs doc).
-        assert!(is_muon_param("loop_block.expert_ffns.0.gate_up.inner.u"));
-        assert!(is_muon_param("loop_block.expert_ffns.2.down.inner.v"));
-        assert!(is_muon_param("loop_block.engram.key_projs.0.weight"));
-        assert!(is_muon_param("loop_block.out_proj.inner.u"));
-        assert!(is_muon_param("loop_block.out_proj.inner.v"));
+        let cfg = test_cfg();
+        let model = DormouseModel::new(&cfg, &device());
+        let tcfg = TrainCfg { qk_heads: Some(cfg.n_heads), ..TrainCfg::default() };
+        let g = optimizer_groups(&model, &tcfg).expect("the declared install must be valid");
+        let r = dormouse_core::routing::routing(&model, false);
+
+        let group = |suffix: &str| {
+            let hit = crate::optim::param_paths(&model)
+                .into_iter()
+                .find(|(p, _, _)| p.ends_with(suffix));
+            let (path, id, _) = hit.unwrap_or_else(|| panic!("no param ending in {suffix:?}"));
+            (path.clone(), g.muon.matches(&id, Some(&path)), r.group_of_id(&id))
+        };
+
+        // The Muon+ group: small low-rank factors only (fp32 NS on a [d,d]
+        // projection is ~40 s/step on this box; see optim.rs).
+        for s in [
+            "expert_ffns.0.gate_up.inner.Tsct.u",
+            "expert_ffns.0.down.inner.Tsct.v",
+            "engram.key_projs.0.weight",
+            "out_proj.inner.Tsct.u",
+            "out_proj.inner.Tsct.v",
+        ] {
+            let (path, on_muon, _) = group(s);
+            assert!(on_muon, "{path}: a low-rank factor must be on Muon+");
+        }
         // 1D TSCT scale stays on AdamW.
-        assert!(!is_muon_param("loop_block.expert_ffns.0.gate_up.inner.s"));
+        let (path, on_muon, declared) = group("expert_ffns.0.gate_up.inner.Tsct.s");
+        assert!(!on_muon, "{path}: the 1D TSCT scale must not be orthogonalized");
+        assert_eq!(declared, Some(dormouse_core::routing::Group::Rest), "{path}");
         // [d,d] projections and dense linears stay on the fallback while the
-        // fp32 NS cost is prohibitive.
-        assert!(!is_muon_param("loop_block.shared_attn.gdn2.q_proj.weight"));
-        assert!(!is_muon_param("loop_block.engram.value_proj.weight"));
-        // Attention Q/K go to the head-wise Muon group instead (not the
-        // plain Muon+ marker list).
-        assert!(crate::optim::is_qk_param("loop_block.shared_attn.gdn2.q_proj.weight"));
-        assert!(crate::optim::is_qk_param("loop_block.shared_attn.gdn2.k_proj.weight"));
-        assert!(!crate::optim::is_qk_param("loop_block.shared_attn.gdn2.v_proj.weight"));
-        // Per-head scalar producers (decay/β gates): AdamW.
-        assert!(!is_muon_param("loop_block.shared_attn.gdn2.decay.w_up.weight"));
-        assert!(!is_muon_param("loop_block.shared_attn.gdn2.beta_proj.weight"));
-        // Routers/scorers: AdamW.
-        assert!(!is_muon_param("loop_block.controller.weight"));
-        // Embeddings, elongated readouts, output head: AdamW.
-        assert!(!is_muon_param("embedding.weight"));
-        assert!(!is_muon_param("lm_head.inner.v"));
-        // n-gram tables: plain Adam, wd disabled; projections are Muon+.
-        assert!(is_engram_table_param("loop_block.engram.memory.embedding.weight"));
-        assert!(!is_engram_table_param("loop_block.engram.key_projs.0.weight"));
+        // fp32 NS cost is prohibitive. The dense expert weight is the leaf the
+        // marker table got wrong: it MATCHED "expert_ffns." and matched
+        // neither exclude, so the trainer sent a [d,d] map to Muon+ while the
+        // declaration said Rest. Named explicitly, not left to the loop.
+        let dense = DormouseModel::new(&DormouseConfig { use_tsct: false, ..cfg.clone() }, &device());
+        let dg = optimizer_groups(&dense, &tcfg).expect("the dense install must be valid");
+        let dense_weight = crate::optim::param_paths(&dense)
+            .into_iter()
+            .find(|(p, _, _)| p.ends_with("expert_ffns.0.gate_up.inner.Dense.weight"))
+            .expect("a dense expert weight exists");
+        let (path, id, rank) = dense_weight;
+        assert_eq!(rank, 2, "{path}: a dense expert weight is a [d,d] map");
+        assert!(!dg.muon.matches(&id, Some(&path)), "{path}: a [d,d] map reached Muon+");
+        // Per-head scalar producers (decay/beta gates), routers, embeddings,
+        // the output head: AdamW.
+        for s in [
+            "gdn2.decay.w_up.weight",
+            "gdn2.beta_proj.weight",
+            "controller.weight",
+            "embedding.weight",
+            "lm_head.inner.Tsct.v",
+        ] {
+            let (path, on_muon, declared) = group(s);
+            assert!(!on_muon, "{path}: must not be on Muon+");
+            assert_eq!(declared, Some(dormouse_core::routing::Group::Rest), "{path}");
+        }
+        // Attention Q/K go to the head-wise group instead of the Muon+ one.
+        for s in ["gdn2.q_proj.weight", "gdn2.k_proj.weight"] {
+            let (path, id, _) = crate::optim::param_paths(&model)
+                .into_iter()
+                .find(|(p, _, _)| p.ends_with(s))
+                .unwrap_or_else(|| panic!("no param ending in {s:?}"));
+            assert!(!g.muon.matches(&id, Some(&path)), "{path}: Q/K is head-wise, not plain Muon+");
+            assert!(
+                g.qk.as_ref().is_some_and(|q| q.matches(&id, Some(&path))),
+                "{path}: Q/K must be in the head-wise group"
+            );
+        }
+        // v_proj is not a Q/K projection.
+        let (path, id, _) = crate::optim::param_paths(&model)
+            .into_iter()
+            .find(|(p, _, _)| p.ends_with("gdn2.v_proj.weight"))
+            .expect("v_proj");
+        assert!(!g.qk.as_ref().is_some_and(|q| q.matches(&id, Some(&path))), "{path}: v_proj is not Q/K");
+        // n-gram tables: plain Adam, wd disabled; the key projections are
+        // Muon+. Both from the installed groups, both in one test so a table
+        // that quietly stopped being a table cannot pass.
+        let table = crate::optim::param_paths(&model)
+            .into_iter()
+            .find(|(p, _, _)| p.contains("engram.memory"))
+            .expect("the n-gram table");
+        let (path, id, _) = table;
+        assert!(g.table.matches(&id, Some(&path)), "{path}: the table must be on plain Adam");
+        let (path, id, _) = crate::optim::param_paths(&model)
+            .into_iter()
+            .find(|(p, _, _)| p.contains("engram.key_projs"))
+            .expect("the key projection");
+        assert!(!g.table.matches(&id, Some(&path)), "{path}: a key projection is not a table");
     }
 
     /// NdArray-friendly mini config: model init and steps take seconds on CPU
@@ -1735,24 +1795,76 @@ mod tests {
 /// the Muon+ group. Silent fallback is the failure mode this check exists
 /// to prevent.
     #[test]
-    fn routing_validator_detects_stale_markers() {
+    fn routing_gate_detects_a_lying_install() {
+        use dormouse_core::routing::Group;
+        use crate::optim::{check_installed, Installed};
+        use burn::module::ParamGroup;
+
         let cfg = test_cfg();
         let model = DormouseModel::new(&cfg, &device());
-        // Stale Muon+ marker: matches no param.
-        let err = validate_routing_with(&model, &["no.such.module"], "engram.memory", None)
-            .expect_err("dead Muon+ markers must fail validation");
-        assert!(err.contains("matches no param"), "unexpected error: {err}");
-        // Stale table marker.
-        let err = validate_routing_with(&model, crate::optim::MUON_PATH_MARKERS, "no.such.table", None)
-            .expect_err("dead table marker must fail validation");
-        assert!(err.contains("matches no param"), "unexpected error: {err}");
-        // A marker that hits a 1D param (RMSNorm gain) must trip the rank
-        // invariant: Muon+ only makes sense on matrices. (The Q/K group
-        // cannot hit this: its fixed paths are always 2D Linears; the
-        // non-2D guard there is defense-in-depth.)
-        let err = validate_routing_with(&model, &["norm.weight"], "engram.memory", None)
-            .expect_err("1D param in the Muon+ group must fail validation");
-        assert!(err.contains("1D param routed to Muon+"), "unexpected error: {err}");
+        let r = dormouse_core::routing::routing(&model, false);
+        let table = r.group(Group::Table);
+        let paths = crate::optim::param_paths(&model);
+        // The declared Muon+ ids, recovered through the public declaration.
+        let declared_muon: Vec<_> = paths
+            .iter()
+            .filter(|(_, id, _)| r.group_of_id(id) == Some(Group::Muon))
+            .map(|(_, id, _)| *id)
+            .collect();
+        assert!(!declared_muon.is_empty(), "the fixture has a Muon+ group");
+
+        // 1D param routed to Muon+: the declared group PLUS one norm gain.
+        let (norm_path, norm_id, _) = paths
+            .iter()
+            .find(|(p, _, rank)| p.ends_with("norm.weight") && *rank == 1)
+            .map(|(p, id, r)| (p.clone(), *id, *r))
+            .expect("a 1D norm gain");
+        let mut ids = declared_muon.clone();
+        ids.push(norm_id);
+        let lie = Installed::of(ParamGroup::from_ids(ids), None, table.clone());
+        let err = check_installed(&model, &r, &lie)
+            .expect_err("a 1D param in the Muon+ group must fail the gate");
+        assert!(err.contains("1D param routed to a Muon+ group"), "unexpected error: {err}");
+        assert!(err.contains(&norm_path), "the error must name the parameter: {err}");
+
+        // The whole model in the Muon+ group. Every parameter the policy puts
+        // on the base optimizer is now claimed, and the gate must say which.
+        let all: Vec<_> = paths.iter().map(|(_, id, _)| *id).collect();
+        let lie = Installed::of(ParamGroup::from_ids(all), None, table.clone());
+        let err = check_installed(&model, &r, &lie)
+            .expect_err("a group claiming parameters the policy does not must fail the gate");
+        assert!(err.contains("is not the declared one"), "unexpected error: {err}");
+
+        // The policy says Muon+, the install claims nothing: a 2D parameter
+        // silently on the fallback must be loud, not a warning. This is the
+        // direction that matters - it is a quality regression, and nothing
+        // else in the run would say so.
+        let lie = Installed::of(ParamGroup::from_ids(vec![]), None, table);
+        let err = check_installed(&model, &r, &lie)
+            .expect_err("a declared Muon+ parameter in no installed group must fail the gate");
+        assert!(err.contains("is not the declared one"), "unexpected error: {err}");
+        assert!(err.contains("Some(Muon)"), "the error must name the declared group: {err}");
+    }
+
+    fn an_installed_but_empty_qk_group_is_loud() {
+        use dormouse_core::routing::Group;
+        use crate::optim::{check_installed, Installed};
+        use burn::module::ParamGroup;
+
+        let cfg = test_cfg();
+        let model = DormouseModel::new(&cfg, &device());
+        let r = dormouse_core::routing::routing(&model, false);
+        assert_eq!(r.count(Group::QkHeadWise), 2, "the fixture routes KDA q and k");
+        let lie = Installed::of(
+            r.group(Group::Muon),
+            Some(ParamGroup::from_ids(vec![])),
+            r.group(Group::Table),
+        );
+        let err = check_installed(&model, &r, &lie)
+            .expect_err("an installed group that claims nothing must fail the gate");
+        assert!(err.contains("is not the declared one"), "unexpected error: {err}");
+        assert!(err.contains("Some(QkHeadWise)"), "the error must name the declared group: {err}");
+        assert!(err.contains("gdn2.q_proj.weight"), "the error must name the parameter: {err}");
     }
 
     /// End-to-end on NdArray: the mixed optimizer must drive the training loss
@@ -1768,7 +1880,7 @@ mod tests {
         let cfg = test_cfg();
         let mut model = DormouseModel::new(&cfg, &device());
         let optim_cfg = TrainCfg { steps: 40, seq_len: 64, batch: 2, lr: 1e-3, wd: 0.01, grad_clip: 1.0, ..Default::default() };
-        let mut optim = crate::optim::build_optim_mode(&optim_cfg, "mix");
+        let mut optim = crate::optim::build_optim_mode(&model, &optim_cfg, "mix");
 
         // The SAME batch every step: fresh random bytes per step carry no
         // signal at all (their entropy IS ln(256)), so a loss-decrease
@@ -1821,7 +1933,7 @@ mod tests {
         cfg.use_gr = true;
         let mut model = DormouseModel::new(&cfg, &device());
         let optim_cfg = TrainCfg { steps: 25, seq_len: 64, batch: 2, lr: 1e-3, wd: 0.01, grad_clip: 1.0, ..Default::default() };
-        let mut optim = crate::optim::build_optim_mode(&optim_cfg, "adamw");
+        let mut optim = crate::optim::build_optim_mode(&model, &optim_cfg, "adamw");
         let mut rng_state: u64 = 0xDEAD_BEEF;
         let next_u8 = |s: &mut u64| {
             *s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -1867,7 +1979,7 @@ mod tests {
         let cfg = test_cfg();
         let mut model = DormouseModel::new(&cfg, &device());
         let optim_cfg = TrainCfg { steps: 3, seq_len: 64, batch: 2, lr: 1e-3, wd: 0.01, grad_clip: 1.0, ..Default::default() };
-        let mut optim = crate::optim::build_optim_mode(&optim_cfg, "adamw");
+        let mut optim = crate::optim::build_optim_mode(&model, &optim_cfg, "adamw");
         assert!(cfg.jepa_weight > 0.0 && cfg.dspark_weight > 0.0, "presets must ship aux ON");
         let mut teacher: Option<dormouse_core::DormouseModel> =
             Some(dormouse_core::aux::ema_update(model.clone(), &model, 0.0));
@@ -2024,7 +2136,7 @@ mod tests {
         let cfg = test_cfg();
         let mut model = DormouseModel::new(&cfg, &device());
         let optim_cfg = TrainCfg { steps: 1, seq_len: 64, batch: 2, lr: 1e-3, wd: 0.0, grad_clip: 1.0, ..Default::default() };
-        let mut optim = crate::optim::build_optim_mode(&optim_cfg, "adamw");
+        let mut optim = crate::optim::build_optim_mode(&model, &optim_cfg, "adamw");
         let bytes: Vec<u8> = (0..128).map(|i| (i * 7) as u8).collect();
         let hashes: Vec<i64> = (0..384).map(|p| (p as i64) % 4096).collect();
         let (x, h) = bytes_to_tensors::<Backend>(&bytes, &hashes, 64, 2, &device());
@@ -2082,7 +2194,7 @@ mod tests {
 
         // Train with sampled depths on a fixed batch: must descend for real.
         let optim_cfg = TrainCfg { steps: 60, seq_len: 64, batch: 2, lr: 1e-3, wd: 0.0, grad_clip: 1.0, ..Default::default() };
-        let mut optim = crate::optim::build_optim_mode(&optim_cfg, "adamw");
+        let mut optim = crate::optim::build_optim_mode(&model, &optim_cfg, "adamw");
         let mut losses = Vec::with_capacity(60);
         for step in 0..60u64 {
             let mut m = model.clone();
@@ -2142,7 +2254,7 @@ mod tests {
         let optim_cfg = TrainCfg { steps: 1, seq_len: 64, batch: 2, lr: 1e-3, wd: 0.01, grad_clip: 1.0, ..Default::default() };
         for mode in ["adamw", "adan", "muon", "mix", "mix-adan"] {
             let mut model = DormouseModel::new(&cfg, &device());
-            let mut optim = crate::optim::build_optim_mode(&optim_cfg, mode);
+            let mut optim = crate::optim::build_optim_mode(&model, &optim_cfg, mode);
             let bytes: Vec<u8> = (0..128).map(|i| (i * 7) as u8).collect();
             let hashes: Vec<i64> = (0..384).map(|p| (p as i64) % 4096).collect();
             let (x, h) = bytes_to_tensors::<Backend>(&bytes, &hashes, 64, 2, &device());
@@ -2162,7 +2274,7 @@ mod tests {
             ..Default::default()
         };
         let mut model = DormouseModel::new(&cfg, &device());
-        let mut optim = crate::optim::build_optim_mode(&optim_cfg, "mix");
+        let mut optim = crate::optim::build_optim_mode(&model, &optim_cfg, "mix");
         let bytes: Vec<u8> = (0..128).map(|i| (i * 7) as u8).collect();
         let hashes: Vec<i64> = (0..384).map(|p| (p as i64) % 4096).collect();
         let (x, h) = bytes_to_tensors::<Backend>(&bytes, &hashes, 64, 2, &device());
@@ -2223,10 +2335,10 @@ mod tests {
     fn factors_fallback_routing() {
         let cfg = test_cfg();
         let model = DormouseModel::new(&cfg, &device());
-        let full = crate::optim::MUON_PATH_MARKERS;
-        let dropped: Vec<&str> = full.iter().copied().filter(|m| *m != "expert_ffns.").collect();
-        let with_factors = validate_routing_with(&model, full, "engram.memory", None).unwrap();
-        let without = validate_routing_with(&model, &dropped, "engram.memory", None).unwrap();
+        let with_factors = validate_routing(&model, false, Some(cfg.n_heads))
+            .expect("the default install must be valid");
+        let without = validate_routing(&model, true, Some(cfg.n_heads))
+            .expect("the --factors-fallback install must be valid");
         assert_eq!(
             without.muon + 4 * cfg.n_experts,
             with_factors.muon,

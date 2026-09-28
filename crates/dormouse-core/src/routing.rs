@@ -173,6 +173,14 @@ impl Routing {
         self.groups.get(&group).map_or(0, Vec::len)
     }
 
+    /// The declared group of ONE parameter, by id. The trainer reads the
+    /// policy through this and through [`Routing::group`] - the same map, so
+    /// there is no second place a group can be decided, and no second place
+    /// they can disagree.
+    pub fn group_of_id(&self, id: &ParamId) -> Option<Group> {
+        self.groups.iter().find_map(|(g, ids)| ids.contains(id).then_some(*g))
+    }
+
     /// The startup assertion, and now the only one: every parameter of the
     /// live model is declared, in exactly one group. It checks the
     /// DECLARATION - not a second derivation of the policy from names - so it
@@ -192,16 +200,29 @@ impl Routing {
                 }
             }
         }
+        // A group that routes NOTHING is reported BEFORE the totality scan
+        // below, because that scan would fire first and name one of the
+        // orphaned parameters instead of the arm that stopped being built.
+        // The n-gram tables are one such group: the report's §2.3 rule is that
+        // they train on plain Adam, and a model with no table means an arm
+        // that silently stopped being built.
+        if self.count(Group::Table) == 0 {
+            return Err("no parameter is routed to the n-gram table group".to_string());
+        }
+        // Likewise the Engram KEY projection, which the report routes to
+        // Muon+. An empty Muon+ group means the Engram arm stopped being
+        // built, and the symptom without this check is a run that reports
+        // `muon=0` in the banner and trains the whole model on AdamW.
+        if self.count(Group::Muon) == 0 {
+            return Err(
+                "no parameter is routed to the Muon+ group - the Engram key projection is gone"
+                    .to_string(),
+            );
+        }
         for (path, id) in &c.out {
             if !declared.contains_key(id) {
                 return Err(format!("{path}: no declared optimizer group"));
             }
-        }
-        // The n-gram tables are the one group that must never be empty: the
-        // report's §2.3 rule is that they train on plain Adam, and a model
-        // with no table means an arm that silently stopped being built.
-        if self.count(Group::Table) == 0 {
-            return Err("no parameter is routed to the n-gram table group".to_string());
         }
         Ok(GroupCounts {
             muon: self.count(Group::Muon),
@@ -458,6 +479,25 @@ mod tests {
         let err = r.check(&model).expect_err("an unclaimed param must fail");
         assert!(err.contains("no declared optimizer group"), "unexpected error: {err}");
         assert!(!err.contains(&dropped.val().to_string()), "the error names the path: {err}");
+    }
+
+    /// A rule that routes NOTHING is loud (ADR-0019), not a silent
+    /// degradation. The groups are ids, so a marker cannot "match nothing"
+    /// any more - but an arm that stopped being built leaves its group empty,
+    /// and the symptom without this is a run that trains the whole Engram (or
+    /// the whole table set) on the base optimizer and reports no error.
+    #[test]
+    fn an_empty_routing_group_is_loud() {
+        let cfg = cfg();
+        let model = DormouseModel::new(&cfg, &dev());
+        for group in [Group::Muon, Group::Table] {
+            let mut r = routing(&model, false);
+            let ids = r.groups.get_mut(&group).expect("declared");
+            assert!(!ids.is_empty(), "{group:?} starts non-empty");
+            ids.clear();
+            let err = r.check(&model).expect_err("an empty group must fail the check");
+            assert!(err.contains("no parameter is routed"), "unexpected error: {err}");
+        }
     }
 
     /// `--factors-fallback` moves exactly the expert factors, from Muon+ to
