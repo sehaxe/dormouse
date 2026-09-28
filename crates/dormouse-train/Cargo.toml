@@ -44,3 +44,12 @@ cubecl-cuda = { version = "0.11.0-pre.4", default-features = false }
 cubecl-environment = { version = "0.11.0-pre.4", default-features = false }
 cudarc = { version = "0.19.9", default-features = false, features = ["driver"] }
 rand = "0.8"
+# Uses `Device::cuda(0)`, which only exists with the `cuda` feature. Without
+# this a plain `cargo check --all-targets` fails on it, and cargo stops
+# reporting targets after the first failure - so one ungated example hides
+# whether every other target compiles. Same shape as
+# `dormouse-core/examples/quant_probe.rs`, which AGENTS.md 2.5 already
+# documents and which nobody applied here.
+[[example]]
+name = "kda_alloc_probe"
+required-features = ["cuda"]
