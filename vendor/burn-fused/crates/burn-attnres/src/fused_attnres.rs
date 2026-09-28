@@ -998,6 +998,75 @@ mod tests {
         assert!(md < 1e-4, "strided input: maxdiff {md}");
     }
 
+    /// The online-softmax state machine, over a chain of merges.
+    ///
+    /// `merge_cuda` mutates the caller's `acc`/`max_score`/`sum_exp` **in
+    /// place** through a raw `BufferArg`, so its only proof that the write
+    /// landed is a read-back. `merge_fused_matches_tensor` checks `out` and
+    /// `acc` once; this chains 64 merges per shape and checks all four values
+    /// at every step against a plain-host reference evaluated from the
+    /// PRE-merge state (read before the launch, never a tensor handed across
+    /// backends), which is what a single merge cannot tell you.
+    ///
+    /// Honest scope: this does NOT reliably catch the missing-barrier race in
+    /// `merge_kernel` — that race is timing-dependent, and this test passes
+    /// with the barrier deleted (measured 2026-09-29). It is the coverage, not
+    /// the gate, for that defect; the gate that failed is
+    /// `streaming_fused_matches_tensor_path`, which is what found it.
+    #[test]
+    fn merge_state_writeback_matches_host_reference() {
+        let cdev = Device::default();
+        let (b, t) = (1usize, 3usize);
+        for d in [64usize, 128, 256] {
+            let q = Tensor::<1>::random([d], Distribution::Normal(0.0, 1.0), &cdev);
+            let mut acc = Tensor::<3>::random([b, t, d], Distribution::Normal(0.0, 1.0), &cdev);
+            let mut mx = Tensor::<3>::ones([b, t, 1], &cdev).add_scalar(0.3);
+            let mut se = Tensor::<3>::ones([b, t, 1], &cdev).mul_scalar(1.7);
+            let bt = b * t;
+            for i in 0..64 {
+                let src = Tensor::<3>::random([b, t, d], Distribution::Normal(0.0, 1.0), &cdev);
+                let s = source_score_cuda(&q, &src).unwrap();
+                // The PRE-merge state and inputs, on the host, before the launch.
+                let f = to_host(acc.clone());
+                let m_old = to_host(mx.clone());
+                let se_old = to_host(se.clone());
+                let sv = to_host(s.clone());
+                let srcv = to_host(src.clone());
+                let got = to_host(merge_cuda(&mut acc, &mut mx, &mut se, &src, &s).unwrap());
+                // Reference in plain host f32 off those pre-merge values, so a
+                // stale in-kernel read of the state shows up as a state
+                // divergence and not only as a wrong output. No tensor crosses
+                // backends: every value is read back once, so the reference
+                // cannot itself be the racy thing.
+                let mut want_acc = vec![0f32; bt * d];
+                let mut want_out = vec![0f32; bt * d];
+                let mut want_m = vec![0f32; bt];
+                let mut want_se = vec![0f32; bt];
+                for p in 0..bt {
+                    let m_new = (m_old[p] + sv[p] + (m_old[p] - sv[p]).abs()) / 2.0;
+                    let rescale = (m_old[p] - m_new).exp();
+                    let w = (sv[p] - m_new).exp();
+                    want_m[p] = m_new;
+                    want_se[p] = se_old[p] * rescale + w;
+                    for c in 0..d {
+                        let a = f[p * d + c] * rescale + srcv[p * d + c] * w;
+                        want_acc[p * d + c] = a;
+                        want_out[p * d + c] = a / want_se[p].max(1e-12);
+                    }
+                }
+                // state first: the state write is the root, the output the symptom
+                let md = maxdiff(&to_host(mx.clone()), &want_m);
+                assert!(md < 1e-5, "d{d} merge {i}: max_score state maxdiff {md}");
+                let md = maxdiff(&to_host(se.clone()), &want_se);
+                assert!(md < 1e-5, "d{d} merge {i}: sum_exp state maxdiff {md}");
+                let md = maxdiff(&to_host(acc.clone()), &want_acc);
+                assert!(md < 1e-5, "d{d} merge {i}: acc state maxdiff {md}");
+                let md = maxdiff(&got, &want_out);
+                assert!(md < 1e-5, "d{d} merge {i}: out maxdiff {md}");
+            }
+        }
+    }
+
     #[test]
     #[ignore]
     fn attnres_backward_bench() {
