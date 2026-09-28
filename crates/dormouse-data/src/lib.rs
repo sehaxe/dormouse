@@ -17,6 +17,9 @@
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
+use arrow::array::Array;
+use arrow::datatypes::DataType;
+
 pub fn fnv(b: &[u8]) -> u64 {
     let mut h = 1469598103934665603u64;
     for &x in b {
@@ -40,10 +43,47 @@ pub fn fnv(b: &[u8]) -> u64 {
 /// key space (256^4 = 4.3e9) a 46 GB byte corpus can still populate.
 pub const ORDERS: [usize; 3] = [2, 3, 4];
 
+/// The FNV n-gram keys of ONE byte sequence, row-major `[t, ORDERS]`: the low
+/// **31** bits of the FNV-1a digest of each context, one column per entry of
+/// [`ORDERS`], RAW (not reduced) — the model masks the slot index itself, so
+/// `engram_rows` stays the only copy of the capacity.
+///
+/// The one derivation, shared by every caller that starts from bytes: the
+/// trainer's [`ByteStream::hashes_raw`] (this function, once per batch row),
+/// and the decode seam `dormouse_train::decode::next_byte_logits`. A key
+/// computed by a second copy of the FNV is a key the model was never trained
+/// on, and the symptom is not an error — it is a network whose memory arm
+/// quietly contributes something else (or, with no keys at all, literal
+/// zeros: `loop_block.rs`'s `None => None`).
+///
+/// Truncating to 31 bits is deliberate - `Int` is i32 on burn-flex and the cast
+/// PANICS above `i32::MAX` instead of wrapping the way CUDA's does - and 2.1e9
+/// keys is far more than any affordable table can separate anyway. 31, not 32:
+/// the previous 32-bit version was correct in its reasoning and off by one bit
+/// in its implementation, which made every training run die on real data with
+/// `Element cannot be represented in the target type: "i64"(...) => "i32"`.
+pub fn raw_keys(bytes: &[u8]) -> Vec<i64> {
+    let mut out = Vec::with_capacity(bytes.len() * ORDERS.len());
+    for e in 1..=bytes.len() {
+        for &n in ORDERS.iter() {
+            let s = e.saturating_sub(n);
+            out.push(((fnv(&bytes[s..e]) as u32) & 0x7fff_ffff) as i64);
+        }
+    }
+    out
+}
+
 /// Collect all data files under `root`, sorted for deterministic iteration.
 /// Text corpora are read as raw bytes; images and binary blobs feed the
 /// byte-level LM the same way (a JPEG is just a byte sequence to predict).
-fn collect_files(root: &Path) -> Vec<PathBuf> {
+///
+/// PUBLIC because it is the definition of "the files the trainer sees", and a
+/// second reader of the same directory is how two tools disagree by
+/// construction: the anchors tool had its own walk that filtered by nothing,
+/// so on `real_eval/` (which holds `eval_tail.bin.30m.bak`) it reported "2
+/// files" and would have folded a 30 MB pre-carve backup into a measurement
+/// whose trainer-side stream sees one file. Both readers call this now.
+pub fn collect_files(root: &Path) -> Vec<PathBuf> {
     // FASTA matters here: a genome is bytes (A/C/G/T plus ASCII headers), so
     // the genomics arm needs no tokenizer, no new code path - only for the
     // loader to accept the files. Decompress .gz upstream: .gz is in bin_exts
@@ -117,9 +157,12 @@ pub struct ByteStream {
     capacity: usize,
     seed: u64,
     epoch: u64,
-    /// Set once the ring has dropped its consumed prefix; after that a
-    /// rewind() can no longer reach the original first byte, and the eval's
-    /// "same window every time" guarantee is over (see `rewind`).
+    /// Set by the two places that drop the ring's consumed prefix
+    /// ([`Self::next_bytes`] and [`Self::skip_bytes`]); after that a rewind()
+    /// can no longer reach the original first byte, and the eval's "same
+    /// window every time" guarantee is over (see [`Self::rewind`]). It was
+    /// declared, initialised `false`, asserted in `rewind` and never assigned,
+    /// so the guard on that guarantee was dead code.
     drained: bool,
 }
 
@@ -200,6 +243,7 @@ fn open_source(path: &Path) -> Option<Source> {
                         reader,
                         batch: Vec::new(),
                         pos: 0,
+                        path: path.to_path_buf(),
                     })
                     .map_err(std::io::Error::other)
             })
@@ -215,6 +259,90 @@ fn open_source(path: &Path) -> Option<Source> {
     }
 }
 
+/// One line per non-null value, for whichever of arrow's three string physical
+/// types the column happens to be. `LargeUtf8` is not an exotic choice: it is
+/// what a writer emits for strings over 2 GB, and a corpus built with it used
+/// to decode to nothing at all, silently.
+fn push_strings(a: &dyn Array, out: &mut Vec<u8>) {
+    use arrow::array::{LargeStringArray, StringArray, StringViewArray};
+    macro_rules! lines {
+        ($t:ty) => {
+            if let Some(x) = a.as_any().downcast_ref::<$t>() {
+                for v in x.iter().flatten() {
+                    out.extend_from_slice(v.as_bytes());
+                    out.push(b'\n');
+                }
+            }
+        };
+    }
+    lines!(StringArray);
+    lines!(LargeStringArray);
+    lines!(StringViewArray);
+}
+
+/// Append every string the column TREE holds, in schema order, one per line.
+///
+/// This walk is by DATA TYPE, and it recurses. The decoder it replaces
+/// downcast the top-level columns to `StringArray` and dropped everything else
+/// **without a counter**, so a corpus whose text is nested one level down
+/// (`document: struct { html: Utf8, ... }`, `annotations: list<struct { text:
+/// Utf8 }>`) contributed almost nothing and the run reported a confident loss
+/// curve over the wrong bytes: measured on `mix/qa`, 2 534 708 673 B on disk
+/// decoded to 283 KB (0.011%) — the `id` column alone, which is the only
+/// TOP-LEVEL string in that schema.
+///
+/// Nothing is synthesized: only string-typed columns are read, never a cast
+/// from a number, so the stream is the corpus' own text. A corpus that stores
+/// the same passage twice (HF's `document.html` AND `document.tokens.token`
+/// both carry it) therefore appears twice — that is duplication the file has,
+/// and choosing fields by NAME to avoid it would be a heuristic.
+fn push_text(dt: &DataType, a: &dyn Array, out: &mut Vec<u8>) {
+    use arrow::array::{
+        Array, FixedSizeListArray, LargeListArray, ListArray, MapArray, StructArray,
+    };
+    use arrow::datatypes::DataType as D;
+    match dt {
+        D::Utf8 | D::LargeUtf8 | D::Utf8View => push_strings(a, out),
+        // Dictionary-encoded strings: the physical array is the dictionary, so
+        // the downcasts above cannot see a value. Cast to the dictionary's own
+        // VALUE type (one record batch, bounded) and read that.
+        D::Dictionary(_, v) if matches!(v.as_ref(), D::Utf8 | D::LargeUtf8 | D::Utf8View) => {
+            if let Ok(c) = arrow::compute::cast(a, v) {
+                push_strings(c.as_ref(), out);
+            }
+        }
+        D::Struct(_) => {
+            if let Some(x) = a.as_any().downcast_ref::<StructArray>() {
+                for c in x.columns() {
+                    push_text(c.data_type(), c.as_ref(), out);
+                }
+            }
+        }
+        D::List(_) => {
+            if let Some(x) = a.as_any().downcast_ref::<ListArray>() {
+                push_text(x.values().data_type(), x.values().as_ref(), out);
+            }
+        }
+        D::LargeList(_) => {
+            if let Some(x) = a.as_any().downcast_ref::<LargeListArray>() {
+                push_text(x.values().data_type(), x.values().as_ref(), out);
+            }
+        }
+        D::FixedSizeList(_, _) => {
+            if let Some(x) = a.as_any().downcast_ref::<FixedSizeListArray>() {
+                push_text(x.values().data_type(), x.values().as_ref(), out);
+            }
+        }
+        // Keys as well as values: a map's key is text the file contains.
+        D::Map(_, _) => {
+            if let Some(x) = a.as_any().downcast_ref::<MapArray>() {
+                push_text(x.entries().data_type(), x.entries(), out);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// A file open for byte reading: plain text/binary files stream chunks;
 /// parquet files stream decoded string columns (arrow batch by batch, so
 /// multi-GB parquet never loads into RAM).
@@ -224,6 +352,7 @@ enum Source {
         reader: parquet::arrow::arrow_reader::ParquetRecordBatchReader,
         batch: Vec<u8>,
         pos: usize,
+        path: PathBuf,
     },
 }
 
@@ -231,7 +360,12 @@ impl Source {
     fn read(&mut self, tmp: &mut Vec<u8>) -> std::io::Result<usize> {
         match self {
             Source::Text(r) => r.read(tmp),
-            Source::Parquet { reader, batch, pos } => {
+            Source::Parquet {
+                reader,
+                batch,
+                pos,
+                path,
+            } => {
                 if *pos >= batch.len() {
                     batch.clear();
                     *pos = 0;
@@ -248,13 +382,7 @@ impl Source {
                             Some(Ok(record)) => {
                                 let mut chunk = Vec::new();
                                 for col in record.columns() {
-                                    use arrow::array::StringArray;
-                                    if let Some(sa) = col.as_any().downcast_ref::<StringArray>() {
-                                        for v in sa.iter().flatten() {
-                                            chunk.extend_from_slice(v.as_bytes());
-                                            chunk.push(b'\n');
-                                        }
-                                    }
+                                    push_text(col.data_type(), col.as_ref(), &mut chunk);
                                 }
                                 if !chunk.is_empty() {
                                     std::mem::swap(batch, &mut chunk);
@@ -267,6 +395,15 @@ impl Source {
                         }
                     }
                     if !got_text {
+                        // COUNTED, and it names the shard: read to the end and
+                        // found no string anywhere is a hole in the corpus, the
+                        // same class as a shard that will not open. It used to
+                        // be silent, which is how a 2.4 GB corpus trained on
+                        // 0.011% of its bytes with a clean log.
+                        eprintln!(
+                            "data: {} yielded NO text (read to the end, no string column this decoder walks): the stream is a hole where that shard was",
+                            path.display()
+                        );
                         return Ok(0);
                     }
                 }
@@ -289,6 +426,48 @@ impl ByteStream {
             data_root.display()
         );
         Self::from_files(seq_len, batch, files, 0x1234_5678)
+    }
+
+    /// The training and held-out streams of ONE run, built together.
+    ///
+    /// "The eval tail never trains" (ADR-0010) is a property of the PAIR, not
+    /// of a flag spelling, and it cannot be checked one stream at a time:
+    /// [`collect_files`] recurses, so `--data` pointed at the parent of the
+    /// eval directory collects the eval bytes as training data, the held-out
+    /// numbers the run prints are optimistic by an unmeasured amount, and
+    /// nothing anywhere says so. The filter-time split (documents routed by
+    /// their start offset, straddlers dropped) is correct and is the only
+    /// thing that makes the two trees disjoint — so this refuses, by name,
+    /// when they are not.
+    ///
+    /// Build both streams with this rather than two [`Self::new`] calls: that
+    /// is the shape the hole got in, and a caller that goes through here
+    /// cannot forget the check.
+    pub fn train_and_eval(
+        seq_len: usize,
+        batch: usize,
+        data_root: &Path,
+        eval_root: Option<&Path>,
+    ) -> (Self, Option<Self>) {
+        if let Some(ev) = eval_root {
+            let d = std::fs::canonicalize(data_root)
+                .unwrap_or_else(|e| panic!("data: --data {}: {e}", data_root.display()));
+            let e = std::fs::canonicalize(ev)
+                .unwrap_or_else(|err| panic!("data: --eval {}: {err}", ev.display()));
+            assert!(
+                !e.starts_with(&d) && !d.starts_with(&e),
+                "NO-LEAK: the training tree {} and the eval tree {} are the same tree, or one \
+                 contains the other, so the held-out bytes are inside the training bytes. Eval \
+                 regions are excluded at FILTER time (filter --eval-output carves the tail into \
+                 its own tree), never by a flag: point --data at the head-only tree, or --eval \
+                 at a separate carve.",
+                data_root.display(),
+                ev.display()
+            );
+        }
+        let train = Self::new(seq_len, batch, data_root);
+        let eval = eval_root.map(|p| Self::new(seq_len, batch, p));
+        (train, eval)
     }
 
     /// Stream over an explicit file list (e.g. a held-out split).
@@ -370,6 +549,7 @@ impl ByteStream {
         let need = self.seq_len * self.batch * 2;
         let chunk = (8 * 1024 * 1024).max(need);
         let mut tmp = vec![0u8; chunk];
+        let epoch0 = self.epoch;
         loop {
             if self.buf.len() - self.pos >= need {
                 break;
@@ -399,6 +579,15 @@ impl ByteStream {
             self.buf.extend_from_slice(&tmp[..read]);
         }
         assert!(
+            self.epoch == epoch0,
+            "data: the ring wanted {need} unread bytes and the corpus ran out first (wrapped to \
+             epoch {}): the stream would serve the corpus AGAIN instead of advancing, so a resume \
+             or a training stream would silently re-read bytes it has already trained on (the \
+             pretrain-v2 collapse). A corpus smaller than 2 batches, or a drive that stopped \
+             serving mid-fill.",
+            self.epoch
+        );
+        assert!(
             !self.buf.is_empty(),
             "data stream dry: no readable bytes from {} file(s) (drive dropped mid-run?)",
             self.files.len()
@@ -421,29 +610,21 @@ impl ByteStream {
         out
     }
 
-    /// FNV n-gram hashes, RAW (not reduced): the low **31** bits of the FNV-1a
-    /// digest of each context, one column per entry of [`ORDERS`]. Truncating
-    /// is deliberate - `Int` is i32 on burn-flex and the cast PANICS above
-    /// `i32::MAX` instead of wrapping the way CUDA's does - and 2.1e9 keys is
-    /// far more than any affordable table can separate anyway.
+    /// FNV n-gram hashes for the Engram memory, one column per entry of
+    /// [`ORDERS`], RAW (not reduced) — one [`raw_keys`] call per batch row,
+    /// which is where the derivation (and the 31-bit truncation) lives. The
+    /// low **31** bits of the FNV-1a digest of each context, in `[b, t, 3]`
+    /// order.
     ///
-    /// 31, not 32: the previous 32-bit version was correct in its reasoning and
-    /// off by one bit in its implementation, which made every training run die
-    /// on real data with `Element cannot be represented in the target type:
-    /// "i64"(...) => "i32"`. The key space lost is one bit; the class of bug
-    /// lost is "the trainer cannot start".
+    /// This is the in-VRAM path's contract: the model masks the slot index
+    /// itself, so its `engram_rows` config is the only copy of the capacity.
+    /// For the host-RAM path use [`Self::hashes`] — same keys, reduced mod the
+    /// caller's table size.
     pub fn hashes_raw(&self, bytes: &[u8]) -> Vec<i64> {
         let mut out = Vec::with_capacity(self.batch * self.seq_len * ORDERS.len());
         for b in 0..self.batch {
-            for p in 0..self.seq_len {
-                let e = p + 1;
-                let base = b * self.seq_len;
-                let seq = &bytes[base..base + self.seq_len];
-                for &n in ORDERS.iter() {
-                    let s = e.saturating_sub(n);
-                    out.push(((fnv(&seq[s..e]) as u32) & 0x7fff_ffff) as i64);
-                }
-            }
+            let base = b * self.seq_len;
+            out.extend_from_slice(&raw_keys(&bytes[base..base + self.seq_len]));
         }
         out
     }
@@ -459,15 +640,24 @@ impl ByteStream {
                 self.refill();
             }
             let buffered = (self.buf.len() - self.pos) as u64;
-            if buffered == 0 {
-                break; // refill's dry assert has already fired for real corpora
-            }
+            // LOUD, where this used to `break`: a skip that runs off the end of
+            // the corpus used to exit here having skipped LESS than asked, with
+            // nothing said, and the run resumed at the head of the corpus it
+            // had already trained on - the pretrain-v2 collapse. `refill` now
+            // panics on the wrap itself; this catches the case where it ever
+            // returns empty, rather than spinning or silently short-skipping.
+            assert!(
+                buffered > 0,
+                "skip_bytes({n}) past the end of the corpus: the ring came back empty, so the \
+                 resume would land earlier than the checkpoint says"
+            );
             let take = buffered.min(n);
             self.pos += take as usize;
             n -= take;
             if self.pos > self.capacity / 2 {
                 self.buf.drain(0..self.pos);
                 self.pos = 0;
+                self.drained = true;
             }
         }
     }
@@ -515,17 +705,27 @@ impl ByteStream {
         let need = self.batch * self.seq_len;
         if self.pos + need > self.buf.len() {
             self.refill();
-            if self.pos + need > self.buf.len() {
-                self.pos = 0;
-            }
+            // No rewind here. This used to reset `pos = 0` when the refill
+            // still left a short buffer, which reads as "recover from a short
+            // buffer" and is the pretrain-v2 collapse on the training path:
+            // the stream would serve the head of the ring again and the run
+            // would re-train on bytes it had already seen. It was also dead -
+            // `refill` returns only with `>= 2 * need` unread bytes, or
+            // panics - which is the real reason the collapse never happened
+            // and the reason nobody noticed the line. The `short read` assert
+            // below is the loud failure that replaces it.
         }
         let end = (self.pos + need).min(self.buf.len());
         let bytes = self.buf[self.pos..end].to_vec();
         self.pos = end;
-        // Compact consumed prefix to keep memory bounded.
+        // Compact consumed prefix to keep memory bounded. This is the event
+        // `drained` documents, so it is the event that sets it: after the
+        // ring drops its head, `rewind` cannot reach the original first byte
+        // and the "same window every eval" guarantee is void.
         if self.pos > self.capacity / 2 {
             self.buf.drain(0..self.pos);
             self.pos = 0;
+            self.drained = true;
         }
         assert!(
             bytes.len() == need,
@@ -540,6 +740,13 @@ impl ByteStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("dormouse_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
 
     #[test]
     #[should_panic(expected = "no readable data files")]
@@ -563,6 +770,16 @@ mod tests {
         let mut s = ByteStream::new(seq, batch, &dir);
         let raw = s.hashes_raw(&pattern[..seq * batch]);
         assert_eq!(raw.len(), batch * seq * ORDERS.len());
+        // `hashes_raw` IS `raw_keys` per batch row, one row at a time. Pinned
+        // because the trainer and the decode seam must derive the same key for
+        // the same bytes: the seam has no ByteStream, and a second copy of the
+        // FNV here is a second thing that can drift.
+        for b in 0..batch {
+            let row = &pattern[b * seq..(b + 1) * seq];
+            let one = raw_keys(row);
+            assert_eq!(one.len(), seq * ORDERS.len());
+            assert_eq!(&raw[b * seq * ORDERS.len()..(b + 1) * seq * ORDERS.len()], &one[..]);
+        }
         // Unreduced, and 31 bits so `Int` (i32 on burn-flex) holds every value
         // without a panic. This assertion CHANGED on 2026-09-28: the old
         // version required the corpus to produce a NEGATIVE i32, i.e. it
@@ -679,4 +896,266 @@ mod tests {
         assert_eq!(first, again2, "rewind must be idempotent");
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    /// The ring dropping its consumed prefix is the one event that voids the
+    /// fixed-eval-window guarantee, and `rewind()` is what must refuse after
+    /// it. `drained` was declared, initialised `false`, asserted in `rewind`
+    /// and never assigned, so this guard did not exist: an eval stream big
+    /// enough to outgrow half the 64 MB ring (the 500 MB milestone eval does)
+    /// would have silently scored a different window every eval.
+    #[test]
+    #[should_panic(expected = "fixed eval window")]
+    fn rewind_after_the_ring_drops_its_head_is_loud() {
+        let dir = tmpdir("drained");
+        // Sparse: 34 MB of file the size check counts, without 34 MB of writes.
+        std::fs::File::create(dir.join("corpus.bin"))
+            .unwrap()
+            .set_len(34 << 20)
+            .unwrap();
+        let mut s = ByteStream::new(8, 2, &dir);
+        s.rewind(); // fine before the ring compacts
+        s.skip_bytes((33 << 20) as u64); // past capacity/2 -> the prefix is dropped
+        s.rewind(); // must not be silent
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A resume must not land EARLIER than the checkpoint says. `skip_bytes`
+    /// used to `break` out of its loop when the corpus ran out, so it skipped
+    /// less than asked and the run went on to re-train from the head of the
+    /// corpus - the pretrain-v2 collapse, with nothing in the log. It is loud
+    /// now, from `refill` (the ring cannot be filled without wrapping into the
+    /// next epoch).
+    #[test]
+    #[should_panic(expected = "wrapped to epoch")]
+    fn a_skip_past_the_end_of_the_corpus_is_loud() {
+        let dir = tmpdir("skip_past_end");
+        let pattern: Vec<u8> = (0..256u32).map(|i| (i * 7 % 251) as u8).cycle().take(1 << 20).collect();
+        std::fs::write(dir.join("corpus.bin"), &pattern).unwrap();
+        let mut s = ByteStream::new(8, 2, &dir);
+        s.skip_bytes(2 << 20); // the corpus holds 1 MiB
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The eval tree must not be reachable from the training tree, by name,
+    /// or not at all. `collect_files` recurses, so `--data` at the parent of
+    /// the eval directory trained on the eval bytes and every held-out number
+    /// was optimistic by an unmeasured amount (ADR-0010). Filter-time routing
+    /// is the real fix and it is already there; this is the assertion that
+    /// the two trees the run was GIVEN are disjoint.
+    #[test]
+    #[should_panic(expected = "NO-LEAK")]
+    fn a_data_root_containing_the_eval_tree_is_loud() {
+        let dir = tmpdir("leak");
+        let sub = dir.join("pretrain");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("corpus.bin"), vec![7u8; 1 << 16]).unwrap();
+        std::fs::write(sub.join("eval_tail.bin"), vec![9u8; 1 << 16]).unwrap();
+        let _ = ByteStream::train_and_eval(8, 2, &dir, Some(&sub));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The escape: disjoint trees, and both streams work. The same tree for
+    /// both must also refuse (it is the `starts_with` case above), and no eval
+    /// root at all is the plain training case.
+    #[test]
+    fn disjoint_data_and_eval_trees_are_the_normal_case() {
+        let dir = tmpdir("no_leak_ok");
+        for (name, byte) in [("data", 7u8), ("eval", 9u8)] {
+            std::fs::create_dir_all(dir.join(name)).unwrap();
+            std::fs::write(dir.join(name).join("shard.bin"), vec![byte; 1 << 16]).unwrap();
+        }
+        let (mut train, eval) = ByteStream::train_and_eval(
+            8,
+            2,
+            &dir.join("data"),
+            Some(&dir.join("eval")),
+        );
+        let (bytes, _) = train.next_batch();
+        assert_eq!(bytes, vec![7u8; 16]);
+        let mut eval = eval.expect("an eval root must yield a stream");
+        let (first, _) = eval.next_batch();
+        assert_eq!(first, vec![9u8; 16]);
+        eval.rewind();
+        let (again, _) = eval.next_batch();
+        assert_eq!(first, again, "the eval window must be fixed");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// One definition of "the files the trainer sees", so a second reader of
+    /// the same directory cannot disagree by construction. The anchors tool
+    /// used to walk with no extension filter at all, which on `real_eval/`
+    /// (which holds `eval_tail.bin.30m.bak`) reported "2 files" and would
+    /// fold a 30 MB pre-carve backup into a measurement whose trainer-side
+    /// stream sees one file.
+    #[test]
+    fn collect_files_is_the_trainer_side_file_set() {
+        let dir = tmpdir("collect");
+        for name in [
+            "corpus.bin",
+            "shard-0001.parquet",
+            "notes.md",
+            "eval_tail.bin.30m.bak",
+            "README",
+        ] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        std::fs::create_dir_all(dir.join("nested")).unwrap();
+        std::fs::write(dir.join("nested").join("a.txt"), b"x").unwrap();
+        let names: Vec<String> = collect_files(&dir)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["corpus.bin", "a.txt", "notes.md", "shard-0001.parquet"]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A corpus whose text is NESTED must yield that text. The decoder used to
+    /// downcast the top-level columns to `StringArray` and drop everything else
+    /// with no counter, so `mix/qa` — `id: Utf8`, `document: struct { html,
+    /// title, ... }`, `annotations: list<struct { short_answers: ... }>` — gave
+    /// up 2 534 708 673 B on disk and 283 KB to the loader (0.011%: the `id`
+    /// column, the only top-level string), and the run trained on ids while
+    /// reporting a confident loss curve.
+    #[test]
+    fn nested_parquet_text_is_not_dropped() {
+        use arrow::array::{
+            ArrayRef, DictionaryArray, Int32Array, ListArray, StringArray, StructArray,
+        };
+        use arrow::buffer::OffsetBuffer;
+        use arrow::datatypes::{Field, Fields, Schema};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        let dir = tmpdir("pq_nested");
+        let f = dir.join("qa.parquet");
+        let strs = |v: &[&str]| -> ArrayRef { Arc::new(StringArray::from(v.to_vec())) };
+        let list = |field: Field, offsets: Vec<i32>, values: ArrayRef| -> ArrayRef {
+            Arc::new(ListArray::new(
+                Arc::new(field),
+                OffsetBuffer::new(offsets.into()),
+                values,
+                None,
+            ))
+        };
+        // annotations: list<struct { short_answers: list<struct { text }> }>
+        let answer = Arc::new(StructArray::new(
+            Fields::from(vec![Field::new("text", DataType::Utf8, true)]),
+            vec![strs(&["blue whale", "blue whale"])],
+            None,
+        ));
+        let short_answers = list(
+            Field::new(
+                "item",
+                DataType::Struct(Fields::from(vec![Field::new("text", DataType::Utf8, true)])),
+                true,
+            ),
+            vec![0, 1, 2],
+            answer as ArrayRef,
+        );
+        let ann_item = Arc::new(StructArray::new(
+            Fields::from(vec![Field::new(
+                "short_answers",
+                short_answers.data_type().clone(),
+                true,
+            )]),
+            vec![short_answers],
+            None,
+        ));
+        let annotations = list(
+            Field::new("item", ann_item.data_type().clone(), true),
+            vec![0, 1, 2],
+            ann_item as ArrayRef,
+        );
+        // document: struct { html: Utf8, title: Utf8 }
+        let document = Arc::new(StructArray::new(
+            Fields::from(vec![
+                Field::new("html", DataType::Utf8, true),
+                Field::new("title", DataType::Utf8, true),
+            ]),
+            vec![
+                strs(&["<html>the whale</html>", "<html>a fin</html>"]),
+                strs(&["whale", "fin"]),
+            ],
+            None,
+        ));
+        // tags: dictionary-encoded string - the physical array is a dictionary,
+        // so a downcast to StringArray cannot see it at all.
+        let tags = Arc::new(DictionaryArray::try_new(
+            Int32Array::from(vec![1, 0]),
+            strs(&["marine biology", "cephalopod"]),
+        )
+        .unwrap());
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new("document", document.data_type().clone(), true),
+            Field::new(
+                "annotations",
+                annotations.data_type().clone(),
+                true,
+            ),
+            Field::new("tags", tags.data_type().clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                strs(&["row-0", "row-1"]),
+                document as ArrayRef,
+                annotations,
+                tags as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let mut w = parquet::arrow::ArrowWriter::try_new(
+            std::fs::File::create(&f).unwrap(),
+            schema,
+            None,
+        )
+        .unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+
+        let out = read_bytes(&[f], 0);
+        let s = String::from_utf8(out).unwrap();
+        for want in [
+            "row-0",
+            "<html>the whale</html>",
+            "whale",
+            "blue whale",
+            "marine biology",
+        ] {
+            assert!(s.contains(want), "nested text {want:?} missing from {s:?}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The other half of the same rule: a numeric column is NEVER read as
+    /// text. Casting a number to a string would synthesize bytes the corpus
+    /// does not contain, which is the one thing the decoder must not do.
+    #[test]
+    #[should_panic(expected = "no bytes")]
+    fn a_parquet_of_numbers_yields_no_invented_text() {
+        use arrow::array::{ArrayRef, Int64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+        let dir = tmpdir("pq_numbers");
+        let f = dir.join("n.parquet");
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, true)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1i64, 2, 3])) as ArrayRef],
+        )
+        .unwrap();
+        let mut w =
+            parquet::arrow::ArrowWriter::try_new(std::fs::File::create(&f).unwrap(), schema, None)
+                .unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        let _ = read_bytes(&[f], 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
+

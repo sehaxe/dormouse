@@ -24,7 +24,15 @@
 //!                         eval is the FIRST 100 KB of the eval dir, while an
 //!                         internal --holdout split scores the TRAILING
 //!                         quarter, so the two numbers were never comparable
-//!                         (review 2026-09-27).
+//!                         (review 2026-09-27). Measured 2026-09-28: --fit on
+//!                         the filtered corpus scores the eval tail at
+//!                         unigram 5.011 / 5-gram 2.588, against 5.115 / 3.001
+//!                         for the in-corpus split of the same file - the
+//!                         in-corpus bar is the EASIER one, and it still moves
+//!                         with --bytes (1M vs 2M: 2.826 vs 2.849). --bytes
+//!                         bounds the fit corpus too, so a 100 KB --fit scores
+//!                         3.624: the bar is a property of the fit size, and
+//!                         the header line says which one it was.
 //!
 //! Note on genomics: a genome is bytes, so this tool works on it unchanged -
 //! no tokenizer, no conversion. The floor is ln(4) = 1.39 bits/byte for pure
@@ -34,17 +42,34 @@ use std::collections::HashMap;
 
 use std::path::{Path, PathBuf};
 
-fn collect(root: &Path, out: &mut Vec<PathBuf>) {
-    if root.is_file() {
-        out.push(root.to_path_buf());
-        return;
+/// The files of a target, by the TRAINER's rule (`dormouse_data::collect_files`)
+/// for a directory and as named for an explicit file.
+///
+/// This tool used to carry its own walk that filtered by nothing, so two
+/// readers of one directory disagreed by construction: on `real_eval/` (which
+/// holds `eval_tail.bin` AND the 30 MB pre-carve `eval_tail.bin.30m.bak`) it
+/// reported "2 files", and any run whose limit outran the first file folded
+/// that backup into the measurement while the trainer's stream sees one file —
+/// a bar for a corpus nobody trains on. A directory is the trainer's business;
+/// a file named on the command line is the user's.
+fn files_of(target: &str) -> Vec<PathBuf> {
+    let p = Path::new(target);
+    if p.is_file() {
+        vec![p.to_path_buf()]
+    } else {
+        dormouse_data::collect_files(p)
     }
-    if let Ok(rd) = std::fs::read_dir(root) {
-        let mut entries: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
-        entries.sort(); // deterministic order across machines
-        for p in entries {
-            collect(&p, out);
-        }
+}
+
+/// `N file(s) [name, name, (+K more)]` — a bar is a number only if you know
+/// which files it came from.
+fn names(files: &[PathBuf]) -> String {
+    let n = |p: &PathBuf| p.file_name().unwrap_or(p.as_os_str()).to_string_lossy().into_owned();
+    let head: Vec<String> = files.iter().take(3).map(n).collect();
+    if files.len() > 3 {
+        format!("{}, +{} more", head.join(", "), files.len() - 3)
+    } else {
+        head.join(", ")
     }
 }
 
@@ -113,10 +138,22 @@ fn main() {
             other => { eprintln!("unknown flag {other}"); std::process::exit(2); }
         }
     }
-    let mut files = Vec::new();
-    collect(Path::new(&target), &mut files);
+    // 0 fits no held-out window at all (every baseline divides 0 by 0 and
+    // prints NaN), 1 trains the counters on nothing (every baseline reads
+    // 8.000, the uniform line, which is indistinguishable from a result).
+    // Both used to exit 0 with a bar on stdout.
+    if fit.is_none() && !(holdout > 0.0 && holdout < 1.0) {
+        eprintln!(
+            "anchors: --holdout {holdout} leaves no held-out window: 0 scores nothing (unigram \
+             NaN) and 1 fits the counters on nothing (every baseline reads 8.000, the uniform \
+             line, not a result). Pass 0 < --holdout < 1, or --fit <corpus> to score this corpus \
+             with counters fitted on another."
+        );
+        std::process::exit(2);
+    }
+    let files = files_of(&target);
     if files.is_empty() {
-        eprintln!("no files under {target}");
+        eprintln!("no data files under {target} (the trainer's extension list, or the path does not exist)");
         std::process::exit(1);
     }
     let mut data = read_corpus(&files, bytes);
@@ -133,10 +170,10 @@ fn main() {
     // With --fit, the positional corpus is the SCORING window and the counters
     // are fitted on the other one - the trainer's own split, not our own.
     let mut fit_data: Vec<u8> = Vec::new();
+    let mut cut = 0usize;
     let (train, test): (&[u8], &[u8]) = match &fit {
         Some(f) => {
-            let mut ffiles = Vec::new();
-            collect(Path::new(f), &mut ffiles);
+            let ffiles = files_of(f);
             let mut fd = read_corpus(&ffiles, bytes);
             if skip_header {
                 fd = fd
@@ -145,25 +182,26 @@ fn main() {
                     .flat_map(|l| l.to_vec())
                     .collect();
             }
-            println!(
-                "fit on {} ({} B) / score on {} ({} B)",
-                f,
-                fd.len(),
-                target,
-                data.len()
+            // An unreadable --fit root used to leave the counters fitted on
+            // NOTHING and print 8.000 for every baseline, the same number a
+            // real uniform corpus gives.
+            assert!(
+                fd.len() > 10_000,
+                "anchors: --fit {f} yielded {} B (unreadable path, or a directory with no data files?) - the counters would be fitted on nothing",
+                fd.len()
+            );
+            // Fitted on the bytes it scores: every baseline below is
+            // memorisation wearing a BPB.
+            assert!(
+                std::fs::canonicalize(f).ok() != std::fs::canonicalize(&target).ok(),
+                "anchors: --fit {f} IS the corpus being scored - the counters would be fitted on the \
+                 exact bytes they are scored against, so the numbers below measure nothing"
             );
             fit_data = fd;
             (fit_data.as_slice(), data.as_slice())
         }
         None => {
-            let cut = ((data.len() as f64) * (1.0 - holdout)) as usize;
-            println!(
-                "corpus: {} files, {} B read, {} B train / {} B held out",
-                files.len(),
-                data.len(),
-                cut,
-                data.len() - cut
-            );
+            cut = ((data.len() as f64) * (1.0 - holdout)) as usize;
             data.split_at(cut)
         }
     };
@@ -171,6 +209,40 @@ fn main() {
     if let Some(name) = Path::new(&target).file_name() {
         println!("domain: {}", name.to_string_lossy());
     }
+    // The headline a bar is quoted from, and the fix for "a quoted bar is not a
+    // number": WHICH files, how many bytes were read, and WHICH bytes were
+    // scored. The bar moves with --bytes because the counters are fitted on one
+    // window and scored on the next, and a 500 MB tail carve has drifting local
+    // statistics - measured on the same file, 1M vs 2M gave 2.826 vs 2.849 BPB,
+    // so the window, not the corpus, sets the number.
+    println!(
+        "corpus: {} - {} file(s) [{}], {} B read",
+        target,
+        files.len(),
+        names(&files),
+        data.len()
+    );
+    let (lo, fitted) = if fit.is_some() {
+        (
+            0,
+            format!(
+                "{} B of {} (a different corpus; --bytes bounds the fit corpus too, so a small \
+                 --bytes starves the counters)",
+                fit_data.len(),
+                fit.as_deref().unwrap_or("?")
+            ),
+        )
+    } else {
+        (
+            cut,
+            format!("bytes [0, {cut}) of the same read, holdout {holdout}"),
+        )
+    };
+    println!(
+        "window: scored bytes [{lo}, {}) = {} B; counters fitted on {fitted}",
+        data.len(),
+        data.len() - lo
+    );
 
     // uniform
     println!("uniform            {:>8.3} BPB", 8.0);
