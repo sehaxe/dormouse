@@ -887,20 +887,27 @@ pub fn train_loop(
     // concurrent commit that rewrote this file).
     {
         let bpb_path = dir.join(format!("{}.best.bpb", cfg.ckpt_name));
+        // A file that exists but carries no parsable pair is NOT a fresh run.
+        // It is a truncated write (fs::write is not atomic), and treating it
+        // as "no best yet" is the silent data loss this file exists to
+        // prevent - so the parse is total: missing tokens, a bad float, a
+        // non-finite score and empty content all take the same loud path.
         if let Ok(text) = std::fs::read_to_string(&bpb_path) {
             let mut it = text.split_whitespace();
-            if let (Some(b), Some(s)) = (it.next(), it.next()) {
-                match (b.parse::<f32>(), s.parse::<u64>()) {
-                    (Ok(b), Ok(s)) if b.is_finite() => {
-                        best_eval_bpb = b;
-                        best_eval_step = s;
-                    }
-                    _ => {
-                        return Err(format!(
-                            "{bpb_path:?} is unreadable ({text:?}) - refusing to resume, because \
-                             overwriting the best checkpoint needs a score to compare against"
-                        ));
-                    }
+            let pair = match (it.next(), it.next()) {
+                (Some(b), Some(s)) => b.parse::<f32>().ok().zip(s.parse::<u64>().ok()),
+                _ => None,
+            };
+            match pair {
+                Some((b, s)) if b.is_finite() => {
+                    best_eval_bpb = b;
+                    best_eval_step = s;
+                }
+                _ => {
+                    return Err(format!(
+                        "{bpb_path:?} is unreadable ({text:?}) - refusing to resume, because \
+                         overwriting the best checkpoint needs a score to compare against"
+                    ));
                 }
             }
         }
@@ -1577,18 +1584,26 @@ pub fn train_loop(
     save_ckpt(&dir, &cfg.ckpt_name, &model, &optim, teacher.as_ref(), ortho_fp32, step, ce)
         .map_err(|e| format!("final checkpoint save failed: {e}"))?;
     save_ngram(&dir, &cfg.ckpt_name, host.as_ref(), step)?;
-    if best_eval_bpb.is_finite() {
-        println!(
-            "done steps={step} best ce={best:.3} | BEST HELD-OUT bpb={best_eval_bpb:.3} at step {best_eval_step} \
-             -> checkpoints/{}.best.bin",
-            cfg.ckpt_name
-        );
-    } else {
-        // No eval ran, so there is no best artifact. Advertising the path and
-        // an infinite score is a wrong number in the log.
-        println!("done steps={step} best ce={best:.3} | no held-out eval ran, so no best checkpoint");
-    }
+    println!(
+        "done steps={step} best ce={best:.3} | {}",
+        best_artifact_summary(best_eval_bpb, best_eval_step, &cfg.ckpt_name)
+    );
     Ok(())
+}
+
+/// The last line of a run: where the best HELD-OUT artifact is, or the
+/// admission that there is none. A function, not inline `println!`, because
+/// the `inf` case used to name `checkpoints/<name>.best.bin` for a file that
+/// was never written - and a sentence nobody can call is a sentence nobody
+/// can test.
+fn best_artifact_summary(best_eval_bpb: f32, best_eval_step: u64, ckpt_name: &str) -> String {
+    if best_eval_bpb.is_finite() {
+        format!(
+            "BEST HELD-OUT bpb={best_eval_bpb:.3} at step {best_eval_step} -> checkpoints/{ckpt_name}.best.bin"
+        )
+    } else {
+        "no held-out eval ran, so no best checkpoint".to_string()
+    }
 }
 
 /// Load weights only (inference) from a named ckpt container.
@@ -1608,6 +1623,328 @@ mod tests {
     use super::*;
     use dormouse_core::param::{LinearLike, LinearLikeInner};
     use dormouse_data::fnv;
+
+    // ---- the best-held-out-checkpoint feature (4f68b28 + the resume fix) ----
+    //
+    // These drive the REAL `train_loop` on the CPU backend against a
+    // purpose-built tiny corpus, with the checkpoint dir injected. That is the
+    // point: the behaviour lives in the middle of a 1500-line function that
+    // writes files and reads a sidecar, and a copy of the rule in a test
+    // would pass while the rule rotted. What each test pins is in its own
+    // comment - the short version: the artifact is chosen by HELD-OUT, a
+    // resume compares against the recorded score instead of `inf`, an
+    // unparsable sidecar is a loud refusal, and no eval means no artifact and
+    // no advertised path.
+    //
+    // The eval bytes are a fixed learnable ramp, so the held-out score is a
+    // property of the run and not of the byte stream's luck. What the tests
+    // do NOT do is assume which way this run's score moves: each one drives
+    // the decision from the recorded `.best.bpb` - the input the resume path
+    // is specified to read - and the one test that has to know a direction
+    // (held-out vs train CE) measures the bracket it needs instead of
+    // guessing it.
+
+    /// A self-contained run: its own train tree, its own held-out tree (the
+    /// no-leak rule in `train_and_eval` refuses one inside the other, so they
+    /// are siblings), and its own checkpoint dir. A ramp rather than random
+    /// bytes, because a fresh-random-byte batch carries no signal and any
+    /// loss claim on it is a coin flip.
+    struct Run {
+        root: PathBuf,
+        cfg: RunCfg,
+        data: PathBuf,
+        eval: PathBuf,
+        ckpts: PathBuf,
+    }
+
+    impl Drop for Run {
+        /// Each run leaves two ~50 MB containers behind, and /tmp is a 32 GB
+        /// tmpfs SHARED with every other job on this box (AGENTS 2.4). Seven
+        /// of these is a disk-full event waiting for a training run, so
+        /// cleanup is Drop and not a line each test has to remember -
+        /// especially the ones that fail before reaching it.
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    impl Run {
+        /// `steps` is the only knob the tests turn: it is one of the five
+        /// PROGRESS_KEYS, so two runs of the same `Run` differ exactly the
+        /// way a resume is allowed to (ADR-0005) and never trip the drift
+        /// check.
+        fn new(tag: &str, steps: usize) -> Self {
+            let root = std::env::temp_dir().join(format!("dm-best-{tag}"));
+            let _ = std::fs::remove_dir_all(&root);
+            let (data, eval, ckpts) = (root.join("train"), root.join("eval"), root.join("ckpts"));
+            for d in [&data, &eval, &ckpts] {
+                std::fs::create_dir_all(d).unwrap();
+            }
+            // ~1.5 kB on a 13-symbol period: learnable, and comfortably over
+            // the stream's seq_len*batch*4 floor.
+            let corpus: Vec<u8> = (0..1536u32).map(|i| (i.wrapping_mul(7) % 13) as u8).collect();
+            std::fs::write(data.join("corpus.bin"), &corpus).unwrap();
+            std::fs::write(eval.join("eval_tail.bin"), &corpus).unwrap();
+            Self {
+                root,
+                cfg: RunCfg {
+                    source: "test".into(),
+                    model: DormouseConfig { max_iter: 1, ..test_cfg() },
+                    train: TrainCfg {
+                        steps,
+                        seq_len: 32,
+                        batch: 2,
+                        lr: 1e-3,
+                        ckpt_name: "b".into(),
+                        eval_every: 1,
+                        eval_batches: 2,
+                        log_every: 1_000, // quiet: the log is not the assertion
+                        ckpt_every: 1_000,
+                        warmup: false,
+                        ..Default::default()
+                    },
+                },
+                data,
+                eval,
+                ckpts,
+            }
+        }
+
+        /// One process. `eval` is the held-out tree, or None for a run with no
+        /// `--eval` at all.
+        fn go(&self, eval: Option<&Path>) -> Result<(), String> {
+            train_loop(self.cfg.clone(), self.data.clone(), Some(self.ckpts.clone()), eval.map(|p| p.to_path_buf()))
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            self.ckpts.join(name)
+        }
+    }
+
+    /// The score+step a `.best.bpb` records, as the resume path reads it.
+    fn read_bpb(run: &Run) -> Option<(f32, u64)> {
+        let text = std::fs::read_to_string(run.path("b.best.bpb")).ok()?;
+        let mut it = text.split_whitespace();
+        Some((it.next()?.parse::<f32>().ok()?, it.next()?.parse::<u64>().ok()?))
+    }
+
+    /// The step+ce `save_ckpt` writes beside a container: "step 2 ce 5.705".
+    /// `ce` is the TRAIN ce of that step, which is what makes it a second,
+    /// independent witness of which step won.
+    fn read_ckpt_sidecar(run: &Run, name: &str) -> Option<(u64, f32)> {
+        let text = std::fs::read_to_string(run.path(&format!("{name}.txt"))).ok()?;
+        let f: Vec<&str> = text.split_whitespace().collect();
+        Some((f.get(1)?.parse().ok()?, f.get(3)?.parse().ok()?))
+    }
+
+    /// A marker standing in for an artifact that already exists. The LIVE
+    /// file is the assertion: a save replaces it (and rotates the old bytes
+    /// into `.prev.bin`, which is the rotation working, not a failed rewrite).
+    fn seed_marker(run: &Run, bpb: &str, marker: &[u8]) {
+        std::fs::write(run.path("b.best.bpb"), bpb).unwrap();
+        std::fs::write(run.path("b.best.bin"), marker).unwrap();
+    }
+
+    fn marker_survived(run: &Run, marker: &[u8]) -> bool {
+        std::fs::read(run.path("b.best.bin")).is_ok_and(|b| b == marker)
+    }
+
+    /// The whole point of the feature: the artifact is chosen by the HELD-OUT
+    /// score, and not by the train CE that ADR-0011 calls fake. A run whose
+    /// saved "best" tracks train CE keeps the LAST weights instead of the
+    /// best ones (measured 2026-09-28: held-out 4.997 at step 6500, overfit
+    /// back to 5.450 by step 19500, and only step 19500 was on disk).
+    ///
+    /// The two quantities are not interchangeable and the gap is STRUCTURAL,
+    /// which is what makes this testable at all: `bpb()` is ce/ln(2), so a
+    /// barely-trained byte model reads ~5.7 as a CE and ~8.0 as a bpb. The
+    /// same run is therefore run twice, with a recorded best of 6.5 and 8.5:
+    ///   - 6.5: below its held-out, above its train CE -> held-out rule says
+    ///     DO NOT save; a train-CE rule would save.
+    ///   - 8.5: above its held-out -> held-out rule says save.
+    /// Together the two runs BRACKET this run's held-out bpb into [6.5, 8.5)
+    /// and the test asserts the train CE it really produced is below that
+    /// whole bracket, so run 1's "did not save" is only reachable by having
+    /// compared held-out. No assumption about how fast the model learns: the
+    /// bracket is measured, not assumed. If the model ever learns enough to
+    /// leave the bracket, run 1 goes red and says so - the fix is a wider
+    /// bracket, not a weaker test.
+    #[test]
+    fn best_artifact_is_chosen_by_held_out_not_train_ce() {
+        let marker = b"PRE-EXISTING BEST";
+        // Run 1: recorded best 6.5 sits inside the gap, so held-out must lose.
+        let lo = Run::new("heldout-lo", 3);
+        seed_marker(&lo, "6.5 999\n", marker);
+        lo.go(Some(&lo.eval)).expect("run must succeed");
+        assert!(
+            marker_survived(&lo, marker),
+            "a held-out bpb above 6.5 must not replace the best artifact - if this run's held-out \
+             has learned its way below 6.5, the bracket needs re-deriving"
+        );
+        // Run 2: recorded best 8.5 is above its held-out, so held-out must win.
+        let hi = Run::new("heldout-hi", 3);
+        seed_marker(&hi, "8.5 999\n", marker);
+        hi.go(Some(&hi.eval)).expect("run must succeed");
+        assert!(
+            !marker_survived(&hi, marker),
+            "a held-out bpb below 8.5 must replace the best artifact - the bracket is empty, so \
+             these two runs cannot be told apart"
+        );
+        // The premise that makes run 1 a discriminator: the train CE of the
+        // step that won run 2 is BELOW the whole bracket, so a comparison
+        // against it would have saved in run 1 as well.
+        let (_, train_ce) = read_ckpt_sidecar(&hi, "b.best").expect("the winner records its ce");
+        assert!(
+            train_ce < 6.5,
+            "this run's train ce is {train_ce}, not below the bracket - run 1 no longer \
+             discriminates held-out from train CE"
+        );
+    }
+
+    /// The artifact, the score that chose it and the step it came from must be
+    /// one evaluation, not three drifting facts. A `.best.bpb` that stays
+    /// `inf`, or a score written by a different decision than the artifact it
+    /// sits beside, is a resume comparing against the wrong number - which is
+    /// silent, and is the whole failure mode the sidecar exists to stop.
+    #[test]
+    fn best_artifact_is_chosen_by_held_out_score() {
+        let run = Run::new("heldout", 3);
+        run.go(Some(&run.eval)).expect("run must succeed");
+        let (bpb, step) = read_bpb(&run).expect("a run that evaluated must record the score it chose by");
+        assert!(bpb.is_finite() && bpb > 0.0, "recorded best must be a real score, got {bpb}");
+        assert!(step > 0 && step <= 3, "best must name a real step of this run, got {step}");
+        assert!(run.path("b.best.bin").is_file(), "the artifact the score names must exist");
+        let (art_step, _) = read_ckpt_sidecar(&run, "b.best").expect("the artifact records its step");
+        assert_eq!(art_step, step, "the artifact and the score that chose it must be one evaluation");
+        assert!(load_model_weights(&run.ckpts, "b.best", run.cfg.model.clone()).is_some(),
+                "the best artifact must be a real, loadable container");
+    }
+
+    /// A resume must not overwrite a better artifact. `best_eval_bpb` is a
+    /// local, so without the `.best.bpb` sidecar a second process starts at
+    /// `inf` and its FIRST eval always wins - which silently re-creates the
+    /// bug the feature exists to prevent.
+    ///
+    /// The sidecar is pre-seeded with a score no eval can beat (0.1, against
+    /// a uniform ceiling of 8.0), so the correct answer is unambiguous
+    /// whatever this run's held-out number happens to be. The `.best.bin`
+    /// bytes are captured first and compared after, because "did not save" and
+    /// "saved the same thing" are different answers and only the bytes tell
+    /// them apart.
+    #[test]
+    fn resume_does_not_overwrite_the_best_with_a_worse_eval() {
+        let run = Run::new("noclobber", 2);
+        let marker = b"PRE-EXISTING BEST";
+        seed_marker(&run, "0.1 999\n", marker);
+        run.go(Some(&run.eval)).expect("run must succeed");
+        assert!(
+            marker_survived(&run, marker),
+            "an eval worse than the recorded 0.1 must not touch the best artifact"
+        );
+        assert!(
+            !run.path("b.best.prev.bin").exists(),
+            "no save means no rotation either: a .prev beside the best artifact is a save that happened"
+        );
+        let (bpb, step) = read_bpb(&run).expect("sidecar must survive");
+        assert_eq!((bpb, step), (0.1, 999), "a losing eval must not rewrite the recorded score");
+        // The run really happened, so "did not save" is a decision and not a
+        // crash: its own last step is on disk.
+        assert!(run.path("b.bin").is_file(), "the run must still have saved its last step");
+    }
+
+    /// The other direction, or the sidecar is a one-way trap: a better eval
+    /// MUST replace the artifact, and the recorded score must move with it.
+    /// A pre-seeded 12.0 (above the uniform ceiling of 8.0) is beaten by every
+    /// real eval, so this needs no assumption about which way this run trains.
+    #[test]
+    fn a_better_eval_replaces_the_best_and_moves_the_score() {
+        let run = Run::new("clobberup", 2);
+        let marker = b"STALE BEST";
+        seed_marker(&run, "12.0 999\n", marker);
+        run.go(Some(&run.eval)).expect("run must succeed");
+        let (bpb, step) = read_bpb(&run).expect("sidecar must exist");
+        assert!(bpb < 12.0, "a better eval must lower the recorded score, got {bpb}");
+        assert!(step > 0 && step <= 2, "the new score must name a real step, got {step}");
+        // The LIVE artifact is what a reader of the log opens, and it is no
+        // longer the marker. (The stale bytes reappearing in `.prev` would be
+        // the rotation doing its job, not a failure to rewrite.)
+        assert!(!marker_survived(&run, marker), "a better eval must rewrite the artifact");
+        // And the artifact must be loadable, not just present: this is what a
+        // reader of the log is told to open.
+        assert!(load_model_weights(&run.ckpts, "b.best", run.cfg.model.clone()).is_some(),
+                "the best artifact must be a real, loadable container");
+    }
+
+    /// An unparsable `.best.bpb` is a LOUD refusal, never a silent `inf`.
+    /// The score file is written after the artifact, so a crash in between
+    /// leaves a stale or truncated pair - and quietly falling back to `inf`
+    /// is exactly the overwrite the sidecar was added to stop. Every malformed
+    /// shape is covered, because the fix has to be TOTAL: a reader that
+    /// accepts the well-formed two-token case and drops the empty one has
+    /// reintroduced the bug for the crash it was written for.
+    #[test]
+    fn an_unparsable_best_bpb_is_a_loud_refusal() {
+        for (tag, body) in [
+            ("empty", ""),
+            ("blank", "   \n"),
+            ("one-token", "0.1\n"),
+            ("garbage", "best bpb was very good indeed\n"),
+            ("bad-float", "not-a-number 5\n"),
+            ("bad-step", "0.1 step-five\n"),
+            ("nonfinite", "inf 5\n"),
+        ] {
+            let run = Run::new(&format!("refuse-{tag}"), 1);
+            seed_marker(&run, body, b"PRE-EXISTING BEST");
+            let err = run.go(Some(&run.eval)).expect_err("an unparsable sidecar must refuse the run");
+            assert!(
+                err.contains("b.best.bpb") && err.contains("refusing to resume"),
+                "{tag}: the refusal must name the file and the reason, got: {err}"
+            );
+            assert!(
+                marker_survived(&run, b"PRE-EXISTING BEST"),
+                "{tag}: a refused run must not touch the artifact"
+            );
+        }
+    }
+
+    /// No eval, no best artifact - and the log must not advertise one. The
+    /// unguarded version printed `bpb=inf at step 0 -> checkpoints/b.best.bin`
+    /// for a run that never wrote one. Two independent claims, both asserted:
+    /// the FILESYSTEM has no artifact (the real defect), and the SENTENCE
+    /// names no path (the reader was misled).
+    #[test]
+    fn no_eval_means_no_best_artifact_and_no_advertised_path() {
+        let run = Run::new("noeval", 2);
+        run.go(None).expect("a run with no --eval must succeed");
+        assert!(!run.path("b.best.bin").exists(), "no eval must write no best artifact");
+        assert!(!run.path("b.best.bpb").exists(), "no eval must record no best score");
+        // The last step's own artifacts ARE there, so the run really happened.
+        assert!(run.path("b.bin").is_file(), "the run must still have saved its last step");
+        let line = best_artifact_summary(f32::INFINITY, 0, "b");
+        assert!(!line.contains("b.best.bin"), "must not name an artifact that does not exist: {line}");
+        assert!(!line.contains("inf"), "must not report an infinite score: {line}");
+    }
+
+    /// The n-gram sidecar travels WITH the best artifact. Without it,
+    /// `b.best.bin` is step-S weights and no tables, and the loader reads a
+    /// missing sidecar as freshly seeded rows - a DIFFERENT model from the
+    /// one that was measured, silently. A weights-only save therefore ships
+    /// a checkpoint that does not reproduce its own score.
+    #[test]
+    fn the_best_artifact_carries_its_ngram_sidecar() {
+        let run = Run::new("sidecar", 2);
+        let mut cfg = run.cfg.clone();
+        cfg.train.engram_ram = true;
+        cfg.train.engram_slots = 1024; // 3 MB of host tables, not 12 GB
+        train_loop(cfg, run.data.clone(), Some(run.ckpts.clone()), Some(run.eval.clone()))
+            .expect("run must succeed");
+        assert!(run.path("b.best.bin").is_file(), "this run must produce a best artifact");
+        assert!(
+            run.path("b.best.ngram").is_file(),
+            "the best artifact must travel with its n-gram sidecar: the loader reads a missing \
+             one as freshly seeded rows, i.e. a different model"
+        );
+    }
 
     /// Retract must pull drifted TSCT masters back to orthonormal: corrupt
     /// U by scaling, verify ortho_error collapses below the plan's 1e-3
