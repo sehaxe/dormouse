@@ -74,6 +74,33 @@ pub fn reset_iterations() {
     CHUNK_ITERATIONS.store(0, Ordering::Relaxed);
 }
 
+/// `(declines, last reason)` since [`reset_batched_declined`] — the count of
+/// calls the batched chunk arm could not express (chunk_size > TILE, or a
+/// caller-supplied `m_invs`), with the reason of the most recent one. COUNTED,
+/// not silent: a reader asking whether the batched arm ran should not have to
+/// infer it from the config.
+static BATCHED_DECLINED: AtomicU64 = AtomicU64::new(0);
+static BATCHED_REASON: Mutex<&'static str> = Mutex::new("");
+
+#[inline]
+pub fn note_batched_declined(why: &'static str) {
+    BATCHED_DECLINED.fetch_add(1, Ordering::Relaxed);
+    if let Ok(mut slot) = BATCHED_REASON.lock() {
+        *slot = why;
+    }
+}
+
+pub fn batched_declined() -> (u64, &'static str) {
+    (
+        BATCHED_DECLINED.load(Ordering::Relaxed),
+        BATCHED_REASON.lock().map(|s| *s).unwrap_or(""),
+    )
+}
+
+pub fn reset_batched_declined() {
+    BATCHED_DECLINED.store(0, Ordering::Relaxed);
+}
+
 fn sites() -> &'static Mutex<Vec<(&'static str, u64)>> {
     SITES.get_or_init(|| Mutex::new(Vec::new()))
 }

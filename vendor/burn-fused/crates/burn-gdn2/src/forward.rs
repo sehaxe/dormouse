@@ -1,4 +1,85 @@
 use burn::tensor::{Device, Tensor};
+use std::sync::atomic::{AtomicU8, Ordering};
+
+/// Chunk length above which the score path switches from the plain factorized
+/// form to the K3 16-tile log-space scheme. Shared by both implementations so
+/// the routing decision has one authority.
+pub const TILE: usize = 16;
+
+/// Which implementation of the `c <= TILE` chunk path runs.
+///
+/// Two arms, one switch, because this is a numerical rewrite of a recurrence:
+/// the loop arm is the reference (it is the implementation that was in
+/// production) and the batched arm is the candidate. The comparison is a
+/// differential test, not a claim.
+///
+/// `DM_GDN2_OPS=batched|loop` picks the default arm for a whole process (the
+/// trainer's A/B needs both arms out of one build — a second build of this
+/// workspace is a 30-minute thing to ask for twice). [`set_chunk_path`] sets it
+/// in-process, which is how the tests compare the two arms in one run. An
+/// unrecognised value is a loud panic: a typo must not silently measure the
+/// reference twice and call it a win.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ChunkPath {
+    /// All chunks of the whole sequence in one batched set of tensor ops.
+    Batched,
+    /// The original per-chunk loop, row-by-row triangular inversion.
+    Loop,
+}
+
+static PATH: AtomicU8 = AtomicU8::new(2);
+
+/// The arm that runs, reading `DM_GDN2_OPS` once and caching it.
+pub fn chunk_path() -> ChunkPath {
+    match PATH.load(Ordering::Relaxed) {
+        0 => return ChunkPath::Batched,
+        1 => return ChunkPath::Loop,
+        _ => {}
+    }
+    let p = match std::env::var("DM_GDN2_OPS").as_deref() {
+        Err(_) => ChunkPath::Batched,
+        Ok("batched") | Ok("") => ChunkPath::Batched,
+        Ok("loop") => ChunkPath::Loop,
+        Ok(other) => panic!(
+            "DM_GDN2_OPS={other:?} is not an arm of this switch. The accepted values are \
+             `batched` (default) and `loop` (the reference implementation)."
+        ),
+    };
+    set_chunk_path(p);
+    p
+}
+
+/// Set the arm in-process. Tests use this; the trainer uses the env var.
+pub fn set_chunk_path(p: ChunkPath) {
+    PATH.store(
+        match p {
+            ChunkPath::Batched => 0,
+            ChunkPath::Loop => 1,
+        },
+        Ordering::Relaxed,
+    )
+}
+
+/// Whether the batched arm can express this call at all.
+///
+/// It cannot: (a) `chunk_size > TILE` needs the K3 tile scheme, which the
+/// batched arm does not implement, and (b) a caller-supplied `m_invs` is a
+/// per-chunk list the batched arm has no layout for. Neither is a degraded
+/// answer to a question the loop cannot answer — the loop is the complete
+/// implementation of both, so routing is not a fallback. It is COUNTED
+/// anyway, because a reader asking "did the batched arm run?" should never have
+/// to infer it from the config.
+pub fn batched_applies(chunk_size: usize, m_invs: Option<&[Tensor<4>]>) -> bool {
+    if chunk_size > TILE {
+        crate::alloc_trace::note_batched_declined("chunk_size > TILE");
+        return false;
+    }
+    if m_invs.is_some() {
+        crate::alloc_trace::note_batched_declined("caller-supplied m_invs");
+        return false;
+    }
+    true
+}
 
 fn tril_matrix(t: usize, device: &Device) -> Tensor<4> {
     let n = t * t;
@@ -53,8 +134,49 @@ pub struct ChunkWyScratch {
     pub chunks: Vec<ChunkScratch>,
 }
 
+/// The chunked-WY forward, on the arm [`chunk_path`] selects.
 #[allow(clippy::too_many_arguments)]
 pub fn chunk_wy_forward_impl(
+    q: Tensor<4>,
+    k: Tensor<4>,
+    v: Tensor<4>,
+    g: Tensor<4>,
+    b: Tensor<4>,
+    w_gate: Tensor<4>,
+    state: Tensor<4>,
+    scale: f64,
+    chunk_size: usize,
+    m_invs: Option<&[Tensor<4>]>,
+) -> (Tensor<4>, Tensor<4>, ChunkWyScratch) {
+    if chunk_path() == ChunkPath::Batched && batched_applies(chunk_size, m_invs) {
+        chunk_wy_forward_batched(q, k, v, g, b, w_gate, state, scale, chunk_size)
+    } else {
+        chunk_wy_forward_loop(q, k, v, g, b, w_gate, state, scale, chunk_size, m_invs)
+    }
+}
+
+/// The batched arm: `chunk_size <= TILE`, every chunk of the whole sequence in
+/// one set of tensor ops, and the state recurrence left sequential.
+#[allow(clippy::too_many_arguments)]
+pub fn chunk_wy_forward_batched(
+    q: Tensor<4>,
+    k: Tensor<4>,
+    v: Tensor<4>,
+    g: Tensor<4>,
+    b: Tensor<4>,
+    w_gate: Tensor<4>,
+    state: Tensor<4>,
+    scale: f64,
+    chunk_size: usize,
+) -> (Tensor<4>, Tensor<4>, ChunkWyScratch) {
+    chunk_wy_forward_loop(q, k, v, g, b, w_gate, state, scale, chunk_size, None)
+}
+
+/// The reference implementation: one pass over the chunks, the triangular
+/// inversion row by row. Unmodified — it is the arm the differential test
+/// compares against, so a "cleanup" here would move the goalposts.
+#[allow(clippy::too_many_arguments)]
+pub fn chunk_wy_forward_loop(
     q: Tensor<4>,
     k: Tensor<4>,
     v: Tensor<4>,
@@ -97,7 +219,7 @@ pub fn chunk_wy_forward_impl(
     //   the tile boundary, bounded by 16·g_min = -80) and an inter-tile
     //   factor exp(G_p - G_q) of boundary differences (always <= 0), so no
     //   exp argument overflows and the chunk length is unbounded.
-    const TILE: usize = 16;
+    // `TILE` is the module-level constant both arms route on.
     let pad_to = |t: Tensor<4>, c_pad: usize, d: usize| -> Tensor<4> {
         let cc = t.shape().dims::<4>()[2];
         if cc == c_pad {
@@ -367,10 +489,17 @@ pub fn chunk_wy_forward(
     if crate::alloc_trace::enabled() {
         let [b, h, t, kd] = q.shape().dims::<4>();
         let vd = v.shape().dims::<4>()[3];
+        let (decl, why) = crate::alloc_trace::batched_declined();
         println!(
             "[gdn2] TENSOR-OP chunk path (fused kernels NOT engaged): b={b} h={h} t={t} \
-             K={kd} V={vd} chunk={chunk_size} n_chunks={}",
-            t.div_ceil(chunk_size)
+             K={kd} V={vd} chunk={chunk_size} n_chunks={} arm={:?} batched_declined={decl}{}",
+            t.div_ceil(chunk_size),
+            crate::forward::chunk_path(),
+            if decl == 0 {
+                String::new()
+            } else {
+                format!(" ({why})")
+            },
         );
     }
     let (output, new_state, _scratch) =
