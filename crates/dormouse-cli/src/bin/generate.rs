@@ -20,7 +20,12 @@ struct Args {
 
 fn main() {
     let a = Args::parse();
-    let (model, _cfg, h) = dormouse_train::export::read(&a.export)
+    let (model, cfg, h) = dormouse_train::export::read(&a.export)
+        .unwrap_or_else(|e| { eprintln!("generate: {e}"); std::process::exit(1); });
+    // LOUD before a single byte is sampled: a --engram-ram model has its
+    // memory in a .ngram sidecar this export does not ship, so decoding it
+    // here would answer from a memory arm that never ran.
+    dormouse_train::decode::refuse_unservable_memory(&cfg)
         .unwrap_or_else(|e| { eprintln!("generate: {e}"); std::process::exit(1); });
     println!(
         "loaded {} ({:?} weights, {} params, step {})",
@@ -33,7 +38,7 @@ fn main() {
     println!("prompt: {}", a.prompt);
     let mut rng = rand::thread_rng();
     for _ in 0..a.steps {
-        let logits = model.forward_bytes::<dormouse_train::Backend>(&bytes);
+        let logits = dormouse_train::decode::next_byte_logits::<dormouse_train::Backend>(&model, &bytes);
         let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let exp: Vec<f32> = logits.iter().map(|x| ((x - max)/a.temp).exp()).collect();
         let sum: f32 = exp.iter().sum();

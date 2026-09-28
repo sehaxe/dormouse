@@ -28,6 +28,7 @@
 
 use burn::module::Module;
 use dormouse_core::{DormouseConfig, DormouseModel};
+use dormouse_train::decode;
 use dormouse_train::export::{self, DType};
 
 /// The crate's own device, NOT a hardcoded one. Under `--features cuda` a
@@ -71,8 +72,10 @@ fn input() -> Vec<u8> {
 /// autotuner's business and not the container's. Warming both sides makes the
 /// comparison a statement about the EXPORT.
 fn logits(m: &DormouseModel) -> Vec<f32> {
-    let _ = m.forward_bytes::<dormouse_train::Backend>(&input());
-    m.forward_bytes::<dormouse_train::Backend>(&input())
+    // Through the decode seam, so this comparison is a statement about the
+    // EXPORT and not about which memory keys each side happened to pass.
+    let _ = decode::next_byte_logits::<dormouse_train::Backend>(m, &input());
+    decode::next_byte_logits::<dormouse_train::Backend>(m, &input())
 }
 
 fn max_delta(a: &[f32], b: &[f32]) -> f32 {
@@ -267,7 +270,7 @@ fn write_mini_ckpt(path: &std::path::Path) {
     let dir = path.parent().expect("a parent dir");
     let cfg = cfg();
     let model = DormouseModel::new(&cfg, &device());
-    let optim = build_optim(&TrainCfg::default());
+    let optim = build_optim(&model, &TrainCfg::default());
     save_ckpt(dir, "rt", &model, &optim, None, false, 3, 2.5).expect("saves");
     assert!(path.exists(), "save_ckpt wrote {path:?}");
     let run = RunCfg { source: "test".into(), model: cfg, train: TrainCfg::default() };

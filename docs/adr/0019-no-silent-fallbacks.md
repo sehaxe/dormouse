@@ -56,7 +56,7 @@ ADR**; `(was SILENT)` marks the ones this commit changed.
 | 7 | `dormouse-train/src/stress.rs:130` `grad_norm` → `unwrap_or(0.0)` when NO gradient was found; the loop reads 0.0 as "the firewall fired" | **COUNTED** (was SILENT; now NaN + the loop's test) |
 | 8 | `dormouse-train/src/stress.rs:55,70` `partial_cmp(..).unwrap_or(Equal)` sorted NaN into the median and p99.9 | **COUNTED** (was SILENT; now refused + counted) |
 | 9 | `core/src/model.rs` (`finite_scan`): `unwrap_or_default()` on a readback → `checked=0, bad=0` → "checkpoint is clean" for weights it never read | **LOUD** (was SILENT) |
-| 10 | `core/src/model.rs` (`forward_bytes`): `unwrap_or_else(|_| vec![0.0; v])` → all-zero logits, i.e. a confident "byte 0 forever" | **LOUD** (was SILENT) |
+| 10 | `core/src/model.rs` (then `forward_bytes`, now `train/src/decode.rs`): `unwrap_or_else(|_| vec![0.0; v])` → all-zero logits, i.e. a confident "byte 0 forever" | **LOUD** (was SILENT) |
 | 11 | `data/src/lib.rs` (`refill`): `r.read(..).unwrap_or(0)` — a read ERROR became an EOF, so a bad shard ended at byte 0 and the run trained on the next one | **LOUD** (was SILENT) |
 | 12 | `data/src/lib.rs` (`read_bytes`) skipped a file it could not open / read, and returned whatever was left | **COUNTED** (was SILENT; now a stderr summary + a list) |
 | 13 | `data/src/lib.rs` (`read_bytes` end) returned an empty vec when every file failed — a BPB for a corpus never read | **LOUD** (was SILENT) |
@@ -104,6 +104,9 @@ SILENT.
 3. `DormouseModel::finite_scan` — the corrupt-checkpoint guard passing on a readback that
    read nothing.
 4. `model.rs::forward_bytes` — all-zero logits presented as a prediction.
+   (Removed 2026-09-28 with the bigger defect it carried: the same function
+   passed `hashed_ids = None`, so every decoded byte came from a network whose
+   memory arm contributed literal zeros. See `train/src/decode.rs`.)
 5. `optim.rs` (momentum_cuda / finalize_cuda) — the fused Muon kernel dead in every run, silently.
 6. `stress.rs::grad_norm` — the firewall's only host-side signal, overloaded with a
    second meaning.

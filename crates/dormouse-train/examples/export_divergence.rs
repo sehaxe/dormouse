@@ -29,7 +29,8 @@ use std::path::{Path, PathBuf};
 use burn::module::Module;
 use burn::tensor::{Int, Tensor, TensorData};
 
-use dormouse_core::{fnv_hash, DormouseConfig, DormouseModel};
+use dormouse_core::{DormouseConfig, DormouseModel};
+use dormouse_train::decode;
 use dormouse_train::export::{self, DType};
 
 #[derive(clap::Parser, Debug)]
@@ -83,7 +84,9 @@ fn main() {
         .collect();
 
     let ref_logits: Vec<Vec<f32>> =
-        windows.iter().map(|w| fp32.forward_bytes::<dormouse_train::Backend>(w)).collect();
+        windows.iter()
+            .map(|w| decode::next_byte_logits::<dormouse_train::Backend>(&fp32, w))
+            .collect();
     assert!(
         ref_logits.iter().flatten().all(|x| x.is_finite()),
         "the fp32 reference must be finite or every number below is noise"
@@ -109,7 +112,7 @@ fn main() {
 
         let (mut max_d, mut sum_d, mut count, mut top1) = (0.0f32, 0.0f64, 0u64, 0u64);
         for (w, r) in windows.iter().zip(&ref_logits) {
-            let l = m.forward_bytes::<dormouse_train::Backend>(w);
+            let l = decode::next_byte_logits::<dormouse_train::Backend>(&m, w);
             for (x, y) in l.iter().zip(r) {
                 max_d = max_d.max((x - y).abs());
                 sum_d += (x - y).abs() as f64;
@@ -160,7 +163,7 @@ fn train_n_steps(a: &Args, dir: &PathBuf, ckpt: &Path) -> DormouseConfig {
     let dev = dormouse_train::device();
     println!("training     {} batch {} seq {} steps {} on {} B of corpus", a.preset, a.batch, a.seq_len, a.steps, corpus.len());
     let mut model = DormouseModel::new(&cfg, &dev);
-    let mut optim = build_optim(&train);
+    let mut optim = build_optim(&model, &train);
     let chunk = a.batch * a.seq_len;
     for step in 0..a.steps {
         let off = (step * chunk) % corpus.len().saturating_sub(chunk + 1);
@@ -191,20 +194,21 @@ fn train_n_steps(a: &Args, dir: &PathBuf, ckpt: &Path) -> DormouseConfig {
 }
 
 /// One batch: bytes in, the shifted-label batch, and the FNV n-gram keys the
-/// Engram arm indexes with (2/3/4-grams, the preset's orders).
+/// Engram arm indexes with.
+///
+/// The keys come from `dormouse_data::raw_keys` — the SAME derivation the
+/// trainer and the decode seam use. This used to be a third hand-rolled FNV
+/// over 3/5/8-grams reduced mod 4096, which is a different key space from the
+/// one the model was trained on: a 20-step model trained through it, and a
+/// measured "export divergence" computed against a decode path that read no
+/// rows at all. One derivation, one key space.
 fn batch(bytes: &[u8], dev: &burn::tensor::Device) -> (Tensor<2, Int>, Tensor<3, Int>, Tensor<2, Int>) {
     let (b, t) = (1usize, bytes.len());
     let ids: Vec<i64> = bytes.iter().map(|&x| x as i64).collect();
     let y: Vec<i64> = bytes.iter().skip(1).map(|&x| x as i64).chain(std::iter::once(bytes[0] as i64)).collect();
-    let mut h: Vec<i64> = Vec::with_capacity(t * 3);
-    for e in 1..=t {
-        h.push((fnv_hash(&bytes[e.saturating_sub(3)..e]) % 4096) as i64);
-        h.push((fnv_hash(&bytes[e.saturating_sub(5)..e]) % 4096) as i64);
-        h.push((fnv_hash(&bytes[e.saturating_sub(8)..e]) % 4096) as i64);
-    }
     (
         Tensor::from_data(TensorData::new(ids, [b, t]), dev),
-        Tensor::from_data(TensorData::new(h, [b, t, 3]), dev),
+        Tensor::from_data(TensorData::new(dormouse_data::raw_keys(bytes), [b, t, 3]), dev),
         Tensor::from_data(TensorData::new(y, [b, t]), dev),
     )
 }
@@ -221,7 +225,7 @@ fn argmax(v: &[f32]) -> usize {
 fn greedy(m: &DormouseModel, prompt: &[u8], steps: usize) -> Vec<u8> {
     let mut b = prompt.to_vec();
     for _ in 0..steps {
-        let l = m.forward_bytes::<dormouse_train::Backend>(&b);
+        let l = decode::next_byte_logits::<dormouse_train::Backend>(m, &b);
         b.push(argmax(&l) as u8);
         if b.len() > m.max_seq_len() {
             break;

@@ -106,7 +106,7 @@ fn generate(model: &dormouse_core::DormouseModel, prompt: &str, max_tokens: usiz
     let mut bytes = prompt.as_bytes().to_vec();
     let mut rng = rand::thread_rng();
     for _ in 0..max_tokens {
-        let logits = model.forward_bytes::<dormouse_train::Backend>(&bytes);
+        let logits = dormouse_train::decode::next_byte_logits::<dormouse_train::Backend>(model, &bytes);
         let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let exp: Vec<f32> = logits.iter().map(|x| ((x - max)/temp).exp()).collect();
         let sum: f32 = exp.iter().sum();
@@ -132,8 +132,14 @@ async fn chat_completions(
     let temp = req.temperature.unwrap_or(0.8);
     let model = state.model.clone();
     let prompt_len = prompt.len();
+    // LOUD, not `unwrap_or_default()`: a panicking decode task used to become
+    // an EMPTY string, i.e. a 200 carrying a confident empty completion. The
+    // decode seam asserts on an inert memory arm and on a failed logit
+    // readback, so those two checks were being answered with a valid-looking
+    // response and a line in the log nobody reads (ADR-0019).
     let text = tokio::task::spawn_blocking(move || generate(&model, &prompt, max_tokens, temp))
-        .await.unwrap_or_default();
+        .await
+        .expect("serve: the decode task panicked - refusing to answer with an empty completion");
     let content = text[prompt_len..].to_string();
     let prompt_tokens = prompt_len;
     let comp_tokens = content.len();
@@ -156,7 +162,8 @@ async fn completions(
     let model = state.model.clone();
     let prompt = req.prompt.clone();
     let text = tokio::task::spawn_blocking(move || generate(&model, &prompt, max_tokens, temp))
-        .await.unwrap_or_default();
+        .await
+        .expect("serve: the decode task panicked - refusing to answer with an empty completion");
     let comp = text[req.prompt.len()..].to_string();
     let prompt_tokens = req.prompt.len();
     let comp_tokens = comp.len();
@@ -189,6 +196,11 @@ async fn main() {
     // travels inside the file, so the served model cannot be a preset the
     // operator mistyped (ADR-0011: a wrong-but-plausible answer is the sin).
     let (model, cfg, h) = dormouse_train::export::read(&a.export)
+        .unwrap_or_else(|e| { eprintln!("serve: {e}"); std::process::exit(1); });
+    // LOUD before the socket is bound: a --engram-ram model has its memory in
+    // a .ngram sidecar this export does not ship, so serving it would answer
+    // every request from a memory arm that never ran.
+    dormouse_train::decode::refuse_unservable_memory(&cfg)
         .unwrap_or_else(|e| { eprintln!("serve: {e}"); std::process::exit(1); });
     println!(
         "loaded {} ({:?} weights, {} params, step {}, d_model {}, vocab {})",

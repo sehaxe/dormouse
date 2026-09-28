@@ -2,7 +2,7 @@
 use burn::backend::DispatchKindConversion;
 use burn::module::Module;
 use burn::nn::{Embedding, EmbeddingConfig};
-use burn::tensor::{Device, DispatchTensor, FloatDType, Int, Tensor, TensorData};
+use burn::tensor::{Device, DispatchTensor, FloatDType, Int, Tensor};
 use burn_rmsnorm::RMSNorm;
 
 use crate::aux::AuxHeads;
@@ -348,28 +348,18 @@ impl DormouseModel {
         self.loop_block.max_ortho().max(self.lm_head.max_ortho())
     }
 
-    /// Inference: bytes -> last-token logits [vocab].
-    pub fn forward_bytes<B: burn::backend::AutodiffBackend>(&self, bytes: &[u8]) -> Vec<f32>
-    where
-        DispatchTensor: DispatchKindConversion<B>
-            + DispatchKindConversion<B::InnerBackend>
-            + DispatchKindConversion<burn::backend::Autodiff<B::InnerBackend>>,
-    {
-        let device = self.embedding.weight.device();
-        let ids: Vec<i64> = bytes.iter().map(|&b| b as i64).collect();
-        let x: Tensor<2, Int> = Tensor::from_data(TensorData::new(ids, [1, bytes.len().max(1)]), &device);
-        let logits = self.forward::<B>(x, None);
-        let [_, t, v] = logits.dims();
-        // LOUD, not `vec![0.0; v]`: all-zero logits is a CONFIDENT answer to
-        // "which byte comes next" (argmax says byte 0 forever) and the sampler
-        // cannot tell it from a real prediction (ADR-0019).
-        logits
-            .slice([0..1, t - 1..t, 0..v])
-            .reshape([v])
-            .into_data()
-            .try_to_vec()
-            .expect("forward_bytes: logits readback failed")
-    }
+    // NOTE: there is deliberately NO `forward_bytes(bytes) -> logits` here.
+    // It was deleted 2026-09-28 and it is the bug this comment is here to stop
+    // recurring. A bytes->logits entry point in the model has to derive the
+    // Engram keys, the keys are derived by `dormouse_data::raw_keys`, and
+    // `dormouse-core` cannot reach that crate without either a dependency edge
+    // this crate should not have or a second copy of the FNV. So the one had
+    // `hashed_ids = None`, `loop_block`'s memory branch took its
+    // `None => None` arm, and `generate`/`serve` shipped a network whose
+    // memory arm contributed LITERAL ZEROS: a confident, wrong, unlogged
+    // product, in the only two binaries a user ever sees. The seam that both
+    // call now lives where the model and the data crate meet:
+    // `dormouse_train::decode::next_byte_logits`.
 
     pub fn max_seq_len(&self) -> usize {
         self.max_seq_len
