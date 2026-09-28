@@ -882,6 +882,20 @@ fn router_backward_cuda(
     let dgc = cube_of2(&d_gates)?;
     let client = xc.client.clone();
 
+    // LOUD refusal, not a guess. `moe_router_bwd2_kernel` writes
+    // `d_x[token*in_features + j]` for `j = a, a+p, a+2p, …` with `a` in
+    // `0..32` (the cube's x-extent), so it covers every column ONLY when
+    // `p == 32`. For `p > 32` the columns with `j % p >= 32` are never
+    // written, and `dx` below is `Tensor::empty` — so the tail would be
+    // uninitialised memory handed back as a gradient, with a green test,
+    // because the test's reference is computed from the same fresh buffer.
+    // `p < 32` is broken the other way: `shared_dh[a] = d_h[token*p + a]`
+    // reads past the row. The kernel is written for 32 lanes == p; refuse
+    // anything else and let the tensor adjoint take it.
+    if st.p != 32 {
+        return None;
+    }
+
     let dev = st.x.device();
     let dx = empty_dense([st.b, st.in_features], &dev);
     let dwp = zeros_dense([st.in_features, st.p], &dev);
