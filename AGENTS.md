@@ -271,10 +271,16 @@ adamw` 150-step-clean runs were lucky seeds) once the model **overfits hard** �
 with the 0.85 MB test corpus loss hits ~0.5 by step 50 and the KDA recurrence
 goes NaN (a_log overflow fixed with a clamp in burn-kda 2026-08-29; the deeper
 overflow path is not isolated — a bisect showed `--no-kda` stays clean through
-deep overfit). Moonshot/FLA decay init (`a_log=-3`, `b_alpha=1.0`) + clamp
+deep overfit). Our own decay init (`a_log=-3`, `b_alpha=1.0`) + clamp
 measurably extended the clean window (110+ steps, Muon+, fp32, 0 NaN on
-2026-08-29, against 45-127 before). Fp8 quant (the sm_120 default) additionally
-degrades at overfit (range overflow). This is an overfit-corpus artifact: on a
+2026-08-29, against 45-127 before). **That pair is not from any paper** —
+Kimi K3 §2.1.1 says `A_h = 0`, FLA uses `log(U(1,16))` (`kda.py:178`, or
+`zeros` under `safe_gate`), and FlashKDA has no `kda.py`; see
+`vendor/burn-fused/crates/burn-kda/src/lib.rs` module docs for the per-source
+table and for why the bias **sign** (not `A`) caps initial retention at
+`e^{g_min/2}`. That record also does not isolate `a_log` from the clamp, so
+cite it as our measurement, not as Moonshot's. Fp8 quant (the sm_120 default)
+additionally degrades at overfit (range overflow). This is an overfit-corpus artifact: on a
 real loss profile (3+) it should not trigger; verify on real data before chasing
 it further. **OOM flood follows NaN episodes** (~10-50 steps later);
 `memory_cleanup` right after NaN makes it worse (the pool goes bad), so the
@@ -826,18 +832,27 @@ payoff for a 16 GB GPU + 64 GB RAM box. **Status per item in brackets:**
    garbage indices on pre.4 and was deleted rather than disabled; re-entry
    needs an implementation that works, not this one.
 5. **GDN details for KDA** [the hybrid shape dormouse already has]. Sigmoid
-   output gate (not SiLU), zero-centered RMSNorm everywhere, L2-normalized q/k,
-   decay α_t = exp[−exp(A)·softplus(Wα x + bα)]. One full-attention layer per 4
+   output gate (not SiLU), zero-centered RMSNorm everywhere, L2-normalized q/k.
+   **The decay we run is K3's, not Kimi Linear's** — `DecayFn::Sigmoid`,
+   `α_t = exp[g_min·Sigmoid(exp(A)·z)]`, `g_min = -5` (this line said
+   `exp[−exp(A)·softplus(Wα x + bα)]`, the branch we do not run).
+   One full-attention layer per 4
    (the per-iteration router blend covers this; keep RoPE in the attention arm —
    NoPE → endless generation after post-training). `use_short_conv` (the
    report's local-bias choice) was tried and REVERTED: it made fp32+AdamW NaN
    at ~step 60 on this box while the same recipe ran 150+ steps clean without it
    (measured 2026-08-29) — trace inside burn-kda before re-enabling. KDA state
    dtype follows the inputs (bf16 under `--bf16`, fp32 otherwise — Moonshot
-   FlashKDA trains bf16 state); decay init matches the Moonshot/FLA recipe
-   (`a_log=-3`, `b_alpha=1.0` — conservative alpha~0.08 at start, and the open
-   question in the A/B queue). FlashKDA math (K3 decay, chunked WY, chunk 16)
-   already matches burn-kda; their CUTLASS kernels are the remaining perf delta.
+   FlashKDA trains bf16 state). **Decay init does NOT match the report**:
+   `A_h = -3` / `b_alpha = +1.0` (α ≈ 0.077 at start) is our own measured
+   choice, not Moonshot's (`A_h = 0`) and not FLA's (`inv_dt ∈ [-6.91,-2.25]`,
+   which is negative and reaches α ≈ 0.95). Under the K3 sigmoid a
+   non-negative `z` caps α at `e^{g_min/2} = 0.0821`, so **the bias sign, not
+   `A`, is the lever** — and neither knob alone gets there. Arithmetic with
+   sources: `burn-kda/src/lib.rs` module docs. This is A/B queue arm 5, and it
+   is a technology REPLACE, not a knob. FlashKDA math (K3 decay, chunked WY,
+   chunk 16) already matches burn-kda; their CUTLASS kernels are the remaining
+   perf delta.
 6. **Hyperparameters & stability**: with Muon+GR, batch-size warmup is wasted
    (−18.8% extra steps, no gain) — start at target batch/LR; optimal LR/batch
    shift up. Refit scaling laws per architecture change (the report's new recipe

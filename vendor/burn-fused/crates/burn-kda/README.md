@@ -44,6 +44,23 @@ o_t = S_t^T q_t
 > backward never re-runs the forward). `forward_train` is the plain tensor
 > path for any backend.
 
+## Decay initialisation
+
+`a_log = -3`, `b_alpha = +1` is **ours**, not a reference recipe. Kimi K3 §2.1.1
+(arXiv:2607.24653v2) says *"We initialize `A_h = 0`*; FLA `kda.py:178` uses
+`log(U(1,16))` and `kda.py:176` uses `zeros` **only under `safe_gate=True`** (the
+`DecayFn::Sigmoid` branch this crate defaults to); FlashKDA has no `kda.py` and
+its `tests/torch_ref.py` initialises nothing. Our pair was kept on this project's
+own stability measurement (dormouse `AGENTS.md` §2.3, 2026-08-29).
+
+It is also the reason the two knobs are **not** interchangeable. Under
+`DecayFn::Sigmoid` a non-negative `z` forces `alpha < e^{g_min/2} = 0.0821`, and
+the init sits at `alpha = 0.0771` — 94% of that ceiling. FLA's `inv_dt` bias is
+*negative* (`[-6.91, -2.25]`), which is how the reference reaches
+`alpha ≈ 0.62-0.995`. The full arithmetic, with sources and per-knob rows, is in
+the module docs of `src/lib.rs`; changing either number re-initialises the model
+and is an A/B, not a patch.
+
 ## Install
 
 ```bash
