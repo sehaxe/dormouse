@@ -103,3 +103,33 @@ date	commit	mode	step	throughput	mem	final-ce
 # same config, CUBECL_AUTOTUNE_LEVEL=0 gives opt=5946ms and level=3 gives 3993ms.
 2026-09-29T03:41:00Z	6891e23	step0-autotune-L0	8204ms	n/a	res=5908MiB	n/a
 2026-09-29T03:41:00Z	6891e23	step0-autotune-L3	5579ms	n/a	res=5908MiB	n/a
+# --- 2026-09-29, WHY THE GPU IS IDLE: the workload is launch-bound
+# ---------------------------------------------------------------------------
+# The answer to "get the card to 100%". Sampled nvidia-smi utilization.gpu at
+# 2 Hz for 90 s across a 150-step warm run, batch 32, 9 195 854 params, depth 2,
+# fp32, aux off, --no-engram, autotune L3. Raw: /tmp/opencode/util2.log.
+#   warm window (samples 21+, n=180):  mean 13.3%,  142/180 at <=5%,
+#                                    24/180 at >50%,  3 samples at 100%
+# The card is idle ~87% of a warm step. The kernels are too small and too many:
+# this is launch overhead, not a lack of arithmetic.
+#
+# The lever that attacks launch overhead directly is CUDA graph capture/replay,
+# and it is CONFIRMED WORKING ON THIS GPU - vendor/cubecl-fix/cubecl-cuda/tests/
+# graph.rs is 5/5 green here (capture+replay, input rewrite, intermediate
+# recycling, pool-growth refusal, many-launches with dynamic metadata). Client API:
+# graph_prepare -> start_capture -> stop_capture -> Graph::replay.
+# NOT YET BUILT. The blocker is documented at client.rs:1288-1296: inside a
+# capture window the stream refuses reads, syncs and handle writes, and a
+# training step must do all three. So the first version captures ONE stage that
+# needs no host round-trip - not the whole step.
+#
+# Batch ladder, warm, same config, step time / tokens-per-second:
+#   8 -> 244ms / 16.8K      16 -> 440ms / 18.6K
+#  32 -> 826ms / 19.8K      64 -> OOM (server.rs:144, 100MB reserve)
+# +18% throughput for 4x the memory, and diminishing (+11%, then +6.5%). This
+# CORRECTS the "throughput is flat from batch 8 to 16" claim at line 54: it is
+# +11%. A bigger batch buys gradient quality here, not speed.
+2026-09-29T04:12:00Z	6891e23	gpu-util-batch32	828ms	19.8Ktok/s	gpu-util-mean=13.3%	pct<=5%=79%
+2026-09-29T04:12:00Z	6891e23	warm-batch8	244ms	16.8Ktok/s	res=5908MiB	ce=5.42
+2026-09-29T04:12:00Z	6891e23	warm-batch16	440ms	18.6Ktok/s	res=5908MiB	ce=5.40
+2026-09-29T04:12:00Z	6891e23	warm-batch32	826ms	19.8Ktok/s	res=5908MiB	ce=5.38
