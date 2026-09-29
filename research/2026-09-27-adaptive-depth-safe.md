@@ -37,12 +37,27 @@ frontier with a confidence exit**, not a router.
   honest depth-T model. Under this arm, **the prefix mean over 1..T is a trained readout at every
   T** — that fact is the whole basis of §3.
 * Held-out eval: a fixed rewound window, `eval_batches=20` × `batch×seq_len` = 20 × 5 120 B =
-  **102 400 B ≈ 100 KB**, scored as the CE of the *final* readout only. It calls
+  **102 400 B** (and NOT a fixed 100 KB: the window is
+  `eval_batches × batch × seq_len`, so it is 102 400 B at batch 10 and 20 480 B at
+  batch 2 - two runs at different batch sizes scored different amounts of text;
+  the byte count on the eval line is the authority), scored as the CE of the
+  *final* readout only. It calls
   `forward_with_hidden(..., targets=None, ...)`, so **no per-iteration CE is computed at eval**, and
   there is **no flag to force the eval depth** (`set_depth` exists in core, nothing exposes it).
-* Repo doctrine: steps are launch-bound (fixed ≈465 ms/step), so training-side FLOP savings from
+* Repo doctrine: steps are launch-bound, so training-side FLOP savings from
   adaptive depth buy ~no wall-clock. The ROI of adaptive depth here is inference-side plus
   depth-robustness, not throughput.
+  **CORRECTED 2026-09-29: this doctrine line now has an instrument behind it,
+  and it is confirmed.** It was originally "launch-bound (fixed ≈465 ms/step)";
+  the 465 ms was fitted to step-0 readings and is struck (`benches/history.tsv`,
+  2026-09-29 - a warm step at batch 8 is 244 ms, a step-0 step is 5549 ms, 23x
+  apart, because the cubecl autotune cache is cold for the first steps; `--timers`
+  used to print on `step % 50 == 0` only, and that defect is now fixed in
+  `b8a47ee` - it follows `--log-every`). What replaces it is direct: over a 150-step
+  warm run at batch 32 the GPU is **13.3 % utilised on average, 142 of 180 samples
+  at <=5 %**. Too many small kernels to fill the SMs. The conclusion this document
+  rests on - FLOP savings buy ~no wall clock at our scale - is therefore stronger
+  than when it was written, and the 465 ms number should not be quoted.
 
 ---
 
@@ -546,6 +561,14 @@ without a task suite — settling is the regime where extra depth is free.
 
 * **NOT VERIFIED:** the paired eval noise floor on our fixed 100 KB window (§6, item 1) — needs a
   measurement, and it gates the "is `BPB@4 − BPB@3` real" call.
+* **THE "100 KB window" IN THIS DOCUMENT IS NOT A CONSTANT, and every occurrence
+  above is batch-10 shorthand.** The window is `eval_batches × batch × seq_len`; at
+  batch 10 × seq 512 it is 102 400 B, at batch 2 it is **20 480 B**, and runs at
+  different batch sizes have therefore scored different amounts of text (the
+  batch-2 ablations reported `over 20480 B`, the batch-10 recipe
+  `over 102400 B`). A BPB is only comparable **within one window**, and the byte
+  count printed on the eval line is the authority. Any A/B run at a different
+  batch size from its control is void regardless of the numbers.
 * **NOT VERIFIED:** whether *any* adaptive-depth mechanism has been measured below 0.6B on natural
   language. The closest small-scale result (2608.18230) is about **which part** of the loop to
   recur, not about per-input depth allocation. There is no source for "adaptive depth pays at 7.5M".

@@ -1,5 +1,43 @@
 # KDA at the production shape: what SOTA actually is, and where our 1445 ms really goes
 
+> ## ⚠️ CORRECTED 2026-09-29 (2nd pass) — the step-time numbers are also retracted
+>
+> The correction below (2026-09-27) addressed *which arm ran*. It did not
+> address the **step-time readings**, which are a separate defect and are
+> retracted here. Warm, release, quiet card, `CUBECL_AUTOTUNE_LEVEL=3`,
+> `--timers` at a step index past 50 (`benches/history.tsv`, 2026-09-29):
+>
+> - **The `1810 ms` step** (§2.4, §4.2) and the **`1445 ms` KDA cost** are
+>   **step-0 readings**. A warm step at batch 8 x seq 512 is **244 ms** and the
+>   **warm forward is 46-48 ms**, i.e. 19 % of a step, not 80 %. A step-0 step
+>   is 5549 ms in the same configuration — **23x** — because the cubecl
+>   autotune cache is cold for the first steps. `--timers` prints on
+>   printed on `step % 50 == 0` only and was not tied to `--log-every`, so a
+>   short run could only ever see step 0 (**fixed in `b8a47ee`; the cadence now
+>   follows `--log-every`**). **The "KDA is 80 % of a step" attribution is
+>   therefore dead twice over**: it was measured on a run that skipped the
+>   backward, and it was measured at step 0.
+> - **The `~465 ms fixed cost`** (§2.3, §2.5) is **not a measured constant**.
+>   It was fitted to two step-0 readings. The warm step is 244 ms — the same
+>   order, smaller — so the *conclusion* the floor was used for survives with
+>   a smaller number, but do not quote 465 ms.
+> - **§4.2 item 4's "a perfect KDA kernel takes the step from 1810 → 365 ms"**
+>   is withdrawn without replacement. Both endpoints are step-0 readings and
+>   the subtraction inherits the error.
+>
+> **What is confirmed, and it is the same conclusion this document reached by
+> a different route: the cost is host-side launch overhead, not arithmetic.**
+> That was measured here in 2026-09-27 (99 % host dispatch, GPU on 1-20 ms of
+> a 470-635 ms call) and it is now measured a second, independent way — **the
+> GPU is 13.3 % utilised on average with 142 of 180 samples at <=5 %** over a
+> 150-step warm run at batch 32 (`nvidia-smi` at 2 Hz). Two instruments, one
+> week apart, same verdict.
+>
+> **Still not re-derived:** the attention backward's true cost. The
+> measurements here and in `kda-allocator-fix.md` both predate the backward
+> running, and no run on record has executed one (`fused kda=<f>/0`).
+> §4's `max_iter` lever is unchanged and still the largest single flag.
+>
 > ## ⚠️ CORRECTED 2026-09-27 — read this first
 >
 > `research/2026-09-27-kda-allocator-fix.md` measured the §2.5 hypothesis this
@@ -309,12 +347,18 @@ costs 0 extra bytes.
 
 **fwd+bwd ideal = 1.35 ms per KDA call.** With `max_iter=4` and a no-grad EMA teacher that
 still runs a full forward: 8 forwards + 4 backwards = **7.0 ms/step** of KDA work at the
-roofline, against a step whose fixed launch overhead alone is **~465 ms**.
+roofline, against a step whose fixed launch overhead alone is ~~**~465 ms**~~ **(2026-09-29:
+not a measured constant — it was fitted to step-0 readings; the warm step is
+244 ms. The order holds, the number does not.)**
 
 ### 2.4 Our fraction of roofline
 
-Per step, 1810 ms total, fwd 730-754, bwd 893-1059, KDA 1445 ms (80%). At `max_iter=4`
-that is ~12 KDA calls (4 student fwd + 4 teacher fwd + 4 bwd) → **~120 ms per call**.
+~~Per step, 1810 ms total, fwd 730-754, bwd 893-1059, KDA 1445 ms (80%).~~ **RETRACTED
+2026-09-29: these are step-0 readings.** Warm, a step is 244 ms and the forward
+is 46-48 ms (19 %). The per-call figure below is not replaced — the backward has
+never run, so there is no warm number for it. At `max_iter=4`
+that is ~12 KDA calls (4 student fwd + 4 teacher fwd + 4 bwd) → **~120 ms per call**
+**(step-0; the 2026-09-27 correction already localised where it goes — 99 % host dispatch).**
 
 | | measured | roofline | **fraction of roofline** | **off by** |
 |---|---|---|---|---|
@@ -342,7 +386,8 @@ size ever seen, never frees → long runs OOM"*, with `memory_cleanup()` called 
 allocation), 1 GB of misses per step is ~1000 ms.** That is the 1445 ms. It also explains
 the other three measurements in the brief without any extra theory: **4x tokens costs only
 1.47x time** (allocations scale with `nblk = B·H·NT`, so 4x tokens = 4x bytes, but the
-*malloc* count and the per-malloc cost are sublinear in size); the **~465 ms fixed cost**;
+*malloc* count and the per-malloc cost are sublinear in size); the **~~465 ms fixed cost**
+(struck 2026-09-29 — fitted to step-0 readings; the warm step is 244 ms)**;
 and why the earlier bench that timed one kernel found "0.23 ms" while the step pays 1445 ms.
 
 **This is a hypothesis, not a measurement.** It is, however, the hypothesis that costs one
@@ -478,11 +523,16 @@ roofline of a kernel we already wrote.**
    state recurrence with a register-resident state. Worth ~3-4x on a kernel that is then
    ~1-3 ms. 3-8 days. Do it because it is the right kernel, not because it is the bottleneck.
 4. **Meanwhile, the bigger lever is a config flag, not a kernel.** `--no-kda` saves 768 ms of
-   a 956 ms step at b4/t256. `max_iter` is settable (`--set max_iter=N`) and the trainer
+   a 956 ms step at b4/t256. *(Both step times are step-0 readings and measured
+   alongside a live run, so this is a ratio and not an absolute; see the
+   2026-09-29 correction at the top.)* `max_iter` is settable (`--set max_iter=N`) and the trainer
    already has a random-depth arm that samples `T ∈ 1..=max_iter` plus an eval curve over
-   depths 1..max_iter. **Four sequential full-sequence KDA passes per step is 80% of the
-   step, and three of the four are removable with a flag.** A perfect KDA kernel (0 ms) takes
-   the step from 1810 → 365 ms; the floor is 465 ms of launch overhead anyway. Cutting
+   depths 1..max_iter. **Four sequential full-sequence KDA passes per step is ~~80% of the
+   step~~ RETRACTED 2026-09-29 (measured on a run that skipped the backward, at step 0;
+   warm the forward is 19 % of a step), and three of the four are removable with a flag.**
+   ~~A perfect KDA kernel (0 ms) takes the step from 1810 → 365 ms; the floor is 465 ms of
+   launch overhead anyway.~~ **WITHDRAWN without replacement — both endpoints are step-0
+   readings.** Cutting
    `max_iter` 4 → 2 removes half the KDA cost with a one-token diff. **Run the depth curve
    first — the quality answer may make the kernel question moot.**
 

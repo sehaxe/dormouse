@@ -43,7 +43,7 @@ rustc 1.98.1, burn 0.22.0-pre.4 + vendored cubecl.
 | ~~Training step 1.58–1.84 s/step~~ | **RETRACTED 2026-09-29.** The old `t = 465 ms + 0.067 ms/token` model is the right order; the 1.58–1.84 s figure and the "4081 ms" bench row are **step-0 readings** | Every reading above that lacked a step index was a step-0 reading, and a step-0 step is **23× a warm one** because the cubecl autotune cache is cold. `--timers` used to print on `step % 50` only, so short runs could only ever see step 0. Both are fixed. `benches/history.tsv` keeps the retracted rows visible |
 | **Best held-out BPB with nothing known-broken in it** | **4.997** at step 6500 (regressed to 5.450 by 19500 — best-of a curve that overfits) | 2026-09-28, `~/logs/train_nokda.log`. `nokda_ce.config.toml`: `use_kda=false`, `use_engram=false`, `engram_ram=false`, batch 2, seq 512, **depth 2**, 9 195 854 params, over a **20 480 B** window. Both of this project's held-out instruments were broken for some runs and neither touched this one: no memory in training means no memory missing in eval, and `--no-kda` means the no-gradient attention arm was not in the model. It is a statement about a model with **no attention arm at all**. Below every unigram bar on record; 1.5 BPB *worse* than the 5-gram. See (d) |
 | Best held-out BPB at depth 4 | **6.351** at step 1500 | 2026-09-27, `~/logs/official_v5e.log`, 7 526 223 params (pre-repricing `small`; the shipped `small` is 9.20 M, so the best number on record was not produced by a preset in `configs/` today), batch 10, over a **102 400 B** window. **Not comparable to the 4.997 above — different window, different depth, different batch.** Its `use_kda=true`, so its attention arm received no gradient (`8fa5d4c`): it is a depth-4 result for a network with frozen attention |
-| Reference-fidelity suite | 1000 cases, fused vs an independent transcription, 5e-4 absolute, fixture regenerable byte-identically in CI | `vendor/burn-fused/crates/burn-gdn2/tests/bit_exact.rs`. Real work; **wrong provenance** — see (b) |
+| Reference-fidelity suite | ~~1000 cases pass~~ **RETRACTED 2026-09-29: it is RED — 976/1000 cases fail at 5e-4 (`max_diff = 1.38e-2`), and `binary-tests` is not a default feature so it does not run by default.** The fixture discipline is real and CI regenerates it byte-identically | `vendor/burn-fused/crates/burn-gdn2/tests/bit_exact.rs`; status in its own module header and `vendor/burn-fused/TEST-AUDIT.md` FINDING 0. Cause **not isolated** — the 24 passing cases are exactly the single-token ones. **Not a passing gate: do not cite it as one.** Provenance is also wrong (our own transcription, not the authors' output) — see (b) |
 | Test inventory | 315 unit + 62 integration `#[test]` functions across 28 crates | counted from source 2026-09-27. Presence is not correctness — see (b) |
 
 > **The raw training logs are not in this repository** (`~/logs/`, gitignored
@@ -69,9 +69,13 @@ rustc 1.98.1, burn 0.22.0-pre.4 + vendored cubecl.
   does not exist). Same audit, §3.
 - **No mechanism in the model has an A/B verdict.** The protocol requires
   3 seeds per arm at 2000 steps ([`docs/AB-PROTOCOL.md`](docs/AB-PROTOCOL.md));
-  the queue is written down and unrun, and its per-arm cost is currently
-  unknown because the 1.6 s/step it was budgeted at came from a run whose
-  attention backward did not execute. The Engram arm — 2.4 M memory parameters,
+  the queue is written down and unrun, and **its per-arm cost is unknown**:
+  the 1.6 s/step it was budgeted at came from a run whose attention backward
+  did not execute, and the 25.8 s/step that would replace it has no committed
+  log (both struck in `benches/history.tsv`). What *is* measured, at the queue's
+  own shape, is a 1068 ms warm step (`tools/mor_ab.sh` preflight, 2026-09-29) —
+  also with `fused kda=64/0`, so also a floor. Every warm number on record is
+  a floor until the attention backward runs once. The Engram arm — 2.4 M memory parameters,
   24 % of `small`, on by default in every preset — **was** compared to
   `--no-engram` once, and the comparison is void: the eval threw the n-gram
   keys away on the in-VRAM path (`7adda92`), so the Engram run's held-out 6.453
@@ -216,9 +220,14 @@ measured throughput (`research/2026-09-27-scale-ladder.md`):
 
 | | 7.5 M (now) | 1 B |
 |---|---|---|
-| step time, fp32 | 1.6 s | ~16 s |
-| step time, working f16 GEMM | 1.6 s | ~2.5 s |
-| wall clock to 20 B tokens | **9 h** | **30–90 days**; ~11 days with both fixes |
+| step time, fp32 | ~~1.6 s~~ **WITHDRAWN (step-0 reading); warm at batch 8 is 245 ms** | ~16 s *(roofline from FLOPs × measured TFLOP/s, not a step reading — unaffected)* |
+| step time, working f16 GEMM | ~~1.6 s~~ (same withdrawal) | ~2.5 s *(same roofline basis)* |
+| wall clock to 20 B tokens | ~~**9 h**~~ **withdrawn with the step time; 150M tokens at the measured 16.8K tok/s is ~2.5 h** | **30–90 days** *(this is **LLMQ's** figure for this card at 1.5B and 3.9k tok/s, not ours. It does not follow from the 16 s/step above: 20B tokens at 5120/step at 16 s is ~2 years. Both numbers were under one label.)* |
+
+The 7.5 M column was struck on 2026-09-29 (see row 3 of the table in (a)). The
+1 B column is a roofline and stands; its **wall clock** did not, and the
+discrepancy is named above rather than smoothed over. `research/2026-09-27-scale-ladder.md`
+carries the full withdrawal.
 
 Four blockers, all measured or code-verified:
 
@@ -236,8 +245,11 @@ Four blockers, all measured or code-verified:
    Measured, warm, at 9.2 M parameters: the GPU is **13.3 % utilised and 79 %
    of samples at ≤5 %** — too many small kernels to fill the SMs, not a
    shortage of arithmetic. The step is ~245 ms (bwd 96–100 · retr 52–61 ·
-   fwd 46–48 · opt 43–47), and that warm floor is the right order of the old
-   ~465 ms estimate; what dominates is the number of launches, not FLOPs. The
+   fwd 46–48 · opt 43–47). The old ~465 ms "fixed cost" is **withdrawn**
+   — it was fitted to step-0 readings, and a step-0 step is 5549 ms against a
+   warm 245 ms in the same config (`benches/history.tsv`) — but its conclusion
+   is now measured rather than inferred: what dominates is the number of
+   launches, not FLOPs. The
    lever that attacks launches directly is **CUDA graph capture/replay**,
    confirmed working on this GPU (`vendor/cubecl-fix/cubecl-cuda/tests/graph.rs`,
    5/5). A seam that captures the optimizer + retraction tail and replays it is

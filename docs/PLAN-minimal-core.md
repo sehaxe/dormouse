@@ -324,15 +324,28 @@ The evidence supports **one**:
 
 ### 5.3 What the default costs, and the smallest trainable thing
 
-- `small` = 7.5M backbone + 3×500 000×32 = **48M memory params** = 55.5M total,
-  ~1.8 GB fp32. Measured **6.7-8.3 s/step at batch 10 s512 with aux on** (AGENTS
-  honest baseline 2026-09-21); the JEPA default-off change removes a second full
-  forward from that. `small` batch 10 s512 is VRAM-validated on 16 GB; `base`
+- `small` = 7.7M backbone + 3×500 000×32 = **48M memory params** = 55.5M total,
+  ~1.8 GB fp32. ~~Measured **6.7-8.3 s/step at batch 10 s512 with aux on**~~ **(AGENTS
+  honest baseline 2026-09-21) — WITHDRAWN 2026-09-29: an un-indexed step reading,
+  i.e. almost certainly step 0. Warm, a step at batch 8 with aux off is ~245 ms
+  and a step-0 step is 5549 ms (`benches/history.tsv`). This shape - batch 10,
+  aux on - has not been re-measured warm and I am not replacing the number with a
+  guess.** The JEPA default-off change removes a second full
+  forward from whatever it turns out to be. `small` batch 10 s512 is VRAM-validated on 16 GB; `base`
   (12.2M) fits at batch 3, OOMs at 6 — *because of the teacher*.
-- The KDA backward is ~80% of a step, and each iteration allocates 17 tensors /
-  248 MB of scratch: four iterations ≈ 1 GB/step of allocator traffic against a
-  7 ms arithmetic budget, with a 465 ms launch-overhead floor below ~80M params.
-  **The cheapest big lever is `--max-iter 2`** (AB-PROTOCOL 4b), and
+  *(The param count is also stale: the re-priced `small` is 9.20 M, and
+  `cargo test -p dormouse-core --test preset_exec` is what prints it.)*
+- ~~The KDA backward is ~80% of a step~~ **RETRACTED 2026-09-29**: that was
+  measured on a run where the attention arm executed no backward
+  (`fused kda=<f>/0`) and at step 0. Warm, the forward is 46-48 ms of a 245 ms
+  step — **19 %**. And each iteration's 17 tensors / 248 MB of scratch (~1
+  GB/step at four iterations) was the *wrong* explanation: the allocator was
+  falsified directly (`research/2026-09-27-kda-allocator-fix.md`), and the cost
+  is host-side op dispatch, now confirmed a second way — the GPU is 13.3 %
+  utilised with 79 % of samples at <=5 %. So: not a 465 ms launch-overhead
+  floor (not a measured constant; the warm step is 245 ms) and not 80 % of
+  anything. **The cheapest big lever is still `--max-iter 2`**
+  (AB-PROTOCOL 4b), on the count of passes rather than on a cost share, and
   `--eval-depths` prints the whole depth curve for free.
 - **Smallest config someone can actually train today:** the trainer's own
   `test_cfg()` (d_model 128) still inherits the schema default
