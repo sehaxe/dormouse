@@ -20,7 +20,7 @@ n_experts = 3
 jepa_weight = 0.05
 jepa_mask_frac = 0.15
 jepa_mask_span = 8
-dspark_weight = 0.1
+dspark_weight = 0.0
 dspark_k = 4
 dspark_stride = 16
 # The memory capacity is `small`'s, 25_000 rows/order: this file is the A/B

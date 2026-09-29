@@ -17,6 +17,6 @@ n_experts = 4
 jepa_weight = 0.05
 jepa_mask_frac = 0.15
 jepa_mask_span = 8
-dspark_weight = 0.1
+dspark_weight = 0.0
 dspark_k = 4
 dspark_stride = 16
