@@ -58,3 +58,48 @@ date	commit	mode	step	throughput	mem	final-ce
 2026-09-28T13:52:00Z	422414c	vram-probe-b8	3098ms	n/a	peak=3664MiB	n/a
 2026-09-28T13:58:00Z	422414c	vram-probe-b12	2760ms	n/a	peak=4760MiB	n/a
 2026-09-28T14:04:00Z	422414c	vram-probe-b16	2738ms	n/a	peak=5908MiB	n/a
+# --- 2026-09-29, THE 10 809 ms READING ABOVE IS A STEP-0 ARTIFACT
+# ---------------------------------------------------------------------------
+# The block at lines 22-27 ("the optimizer is 77% of the step", opt=8303ms of
+# 10809ms) was read at STEP 0 ONLY. I promoted it to the AGENTS.md rulebook as
+# the project's optimization target without replicating it, on the strength of a
+# comment inside this file. It is wrong. Replicated by hand, quiet card, release,
+# small (9 195 854 params), batch 8 x seq 512, depth 2, fp32, aux off, --no-engram,
+# CUBECL_AUTOTUNE_LEVEL=3, --timers:
+#
+#   step      total    fwd    bwd    opt    retr    ema
+#      0     5549ms    97  1007   4053   392    0.0
+#     50      249ms    46    98     43    61    0.0
+#    100      240ms    48    96     43    52    0.0
+#    150      250ms    46    98     47    58    0.0
+#
+# A WARM STEP IS ~245 ms, and opt is 43 ms of it (18%), not 4053 (73%). The
+# whole of the cold cost is the cubecl autotune cache: every candidate kernel is
+# benchmarked at runtime over the first steps. opt alone warms 94x.
+#
+# TWO RULES THAT GENERALISE, both learned the expensive way here:
+#   1. A step-time reading with no step index is not a measurement of a step.
+#   2. `--timers` prints on `step % 50 == 0` only (train/src/lib.rs:1316). It is
+#      NOT tied to --log-every, so every short run in this project's history has
+#      reported step 0 and nothing else - which is exactly how a 23x error
+#      survived in a TSV and reached the rulebook.
+#
+# What survives the retraction: the ~465 ms "fixed cost" floor (§2.2) is the
+# RIGHT ORDER and was vindicated, not contradicted. The "KDA ~80% of a step"
+# attribution stays dead - the warm forward is 46-48 ms, i.e. 19%.
+#
+# THE REAL WARM PROFILE, and the actual optimization targets in order:
+#   bwd  96-98 ms (40%)  - and the attention backward does not run at all
+#                         (fused kda=<f>/0), so this is an incomplete backward
+#   retr 52-61 ms (22%)  - the TSCT polar retraction, in no doc, never examined
+#   fwd  46-48 ms (19%)
+#   opt  43-47 ms (19%)
+# ema is 0.0 because aux was off for this reading.
+2026-09-29T03:58:00Z	6891e23	warm-step-s50	249ms	n/a	res=5908MiB	ce=5.42
+2026-09-29T03:58:00Z	6891e23	warm-step-s100	240ms	n/a	res=5908MiB	ce=5.40
+2026-09-29T03:58:00Z	6891e23	warm-step-s150	250ms	n/a	res=5908MiB	ce=5.38
+2026-09-29T03:58:00Z	6891e23	cold-step-s0	5549ms	n/a	res=5908MiB	ce=5.54
+# Step-0 opt is also a reading of the TUNING SETTING, not the workload: with the
+# same config, CUBECL_AUTOTUNE_LEVEL=0 gives opt=5946ms and level=3 gives 3993ms.
+2026-09-29T03:41:00Z	6891e23	step0-autotune-L0	8204ms	n/a	res=5908MiB	n/a
+2026-09-29T03:41:00Z	6891e23	step0-autotune-L3	5579ms	n/a	res=5908MiB	n/a

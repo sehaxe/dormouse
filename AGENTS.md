@@ -236,7 +236,20 @@ the file that says so is that one function.
 - **Molds of the step** (2026-09-27, 7.5M params): fixed per-step cost ~465 ms;
   4× the tokens costs only 1.47× the time; GEMMs are 2-5% of a step;
   opt/retr/ema do not scale with N (84 → 85 ms at 1.6× params) — they are
-  launch-bound. Overhead-bound below ~80M params, GEMM-bound above. KDA is
+  launch-bound. Overhead-bound below ~80M params, GEMM-bound above.
+  **The 10 809 ms reading that seemed to contradict this was a STEP-0
+  ARTIFACT (2026-09-29) — see §3.1.** Replicated by hand on a quiet card: a
+  warm step at 9.2M params is **~245 ms** (249/240/250 at steps 50/100/150),
+  against 5 549 ms at step 0, because the cubecl autotune cache is cold for
+  the first steps. So the ~465 ms "fixed cost" is **the same order as reality**,
+  and the figure that was off by 23x was the new one, not this one. Two
+  consequences, both rules: **a step-time reading with no step index is not a
+  measurement of a step**, and **`--timers` prints on `step % 50 == 0` only
+  (`train/src/lib.rs:1316`) — it is NOT tied to `--log-every`**, so every short
+  run in this project's history has reported step 0 and nothing else. What
+  survives from this bullet: the workload IS launch-bound (throughput flat from
+  batch 8 to 16) and GEMMs are a small fraction of a step, so the cuBLAS 7.4x
+  in `9006dcb` is worth ~0.1-0.35%. KDA is
   ~80% of a step: each iteration is a full-sequence gated-delta pass
   allocating 17 fresh tensors / 248 MB of saved scratch, ~1 GB/step of allocator
   traffic against a 7 ms arithmetic budget. **The "~80%" attribution is dead as
@@ -438,7 +451,9 @@ The defenses are installed, not optional.
 | second-best held-out, and the only depth-4 number on record | **6.351** at step 1500 | `~/logs/official_v5e.log`, 2026-09-27, 7 526 223 params (pre-repricing `small`; the shipped `small` is 9.20 M), batch 10, depth 4, **102 400 B window** — not comparable to the 4.997 above. `use_kda=true`, so its attention arm got no gradient (§3.2) |
 | bench gate row | canary (small, aux off, 2M slots, batch 10 s512) **4081 ms/step**, final CE 5.141 | `benches/history.tsv`, 2026-09-25 `bdddbaf` |
 | real18 recipe (small, aux on, 48M rows, batch 10 s512) | 6.7-8.3 s/step | 2026-09-21, after the EMA `no_grad` fix; the older 3.4-3.9 s/step note predates it and is not reproducible |
-| per-step cost at 7.5M params | ~465 ms fixed; KDA ~80% of it | §2.2. **Killed as an attribution by `8fa5d4c`**: the arm was not training, so "80% of the step" was 80% of a step that skipped the backward. See §3.2 |
+| **A REAL STEP IS ~245 ms, AND `opt` IS NOT THE PROBLEM** | **step 50/100/150 = 249 / 240 / 250 ms** at 9 195 854 params, batch 8 x seq 512, depth 2, fp32, aux off, `--no-engram`, release, quiet card, `CUBECL_AUTOTUNE_LEVEL=3`, `--timers` | Measured 2026-09-29 by hand, this box, `/tmp/opencode/s200`. Split: **bwd 96-98 ms (40%) · retr (TSCT polar retraction) 52-61 ms (22%) · fwd 46-48 ms (19%) · opt 43-47 ms (19%)**. **This row replaces a false one I wrote earlier today and then deleted** — see the retraction row below. The attention backward does not currently run at all (`fused kda=<f>/0`), so the 40% bwd is a backward that is not doing the whole job; repairing it will make bwd larger and reshape this table. |
+| ~~THE STEP IS 77% OPTIMIZER~~ — **RETRACTED 2026-09-29, it was a warmup artifact** | ~~`opt` = 8303 ms of a 10 809 ms step~~ | The number came from `benches/history.tsv:22-27`, which records it at **step 0 only**, and I promoted it to this rulebook as "THE optimization target" before replicating it. Replicated: `opt` is **4053 ms at step 0 and 43 ms at step 50/100/150** — **a 94x warmup**, because the cubecl autotune cache is cold and every candidate is benchmarked at runtime on the first steps. The step is 5 549 ms at step 0 and ~245 ms warm: **23x**. **The real lesson, and the one that generalises: a step-time reading with no step index is not a measurement of a step.** `CUBECL_AUTOTUNE_LEVEL` also moves step 0 substantially (opt 5946 at level 0, 3993 at level 3), so a step-0 reading is also a reading of the *tuning setting*, not of the workload. |
+| per-step cost at 7.5M params | ~465 ms fixed; **KDA ~80% of it** — the floor is ~VINDICATED, the attribution is still dead | §2.2, and the same figure in 13 other files. Replicated 2026-09-29: a warm step at 9.2M params is ~245 ms, so `465 + 0.067*tok` is the right order and the 10 809 ms reading that appeared to contradict it was a step-0 artifact (row above). The **KDA attribution stays retracted** (`8fa5d4c`: the arm ran no backward, so "80% of the step" was 80% of a step that skipped the backward) — and the warm profile agrees with that: fwd is 46-48 ms of 245, i.e. **19%**, not 80%. The ten `research/` docs reasoning from "the floor is 465 ms of launch overhead anyway" are therefore **vindicated, not void**; the `opt/retr/ema = 84-85 ms` sub-figure is still unverified (measured: opt 43, retr 52-61, ema 0). |
 | eval window size | `eval_batches × batch × seq_len`; 102 400 B at batch 10, 20 480 B at batch 2, printed on every eval line | `train/src/lib.rs:1417`, §2.6 |
 | a 2k-step A/B run | ~1.6 s/step → 53 min/run, 2.7 GPU-h per arm. **This budget assumed an attention arm that did no backward work**; the re-cost is in §3.3 and is not measured | `docs/AB-PROTOCOL.md` |
 | VRAM-validated on 16 GB | `small` batch 10 s512 with a 48M-row Engram; `base` fits at batch 3 and OOMs at batch 6 (the JEPA teacher is a second full forward) | AGENTS history, 2026-09 |
@@ -947,9 +962,22 @@ Ranked applicability:
 - `--jepa-precompute N` + `--jepa-targets <file>` — offline teacher latents: one
   forward per batch, no optimizer, no EMA advance; the hot loop then runs no
   second forward and no teacher at all.
-- `--seed N` (default 1) — the only stochastic input to a step (the JEPA span
-  mask), a pure function of `(seed, step)`. In the snapshot: a different seed is
-  a different run. It does **not** seed the model init or the data order.
+- `--seed N` (default 1) — seeds the device RNG (`device.seed(cfg.seed)`,
+  `train/src/lib.rs`), so it now governs the **model init** as well as the JEPA
+  span mask, both pure functions of `(seed, step)`. In the snapshot: a different
+  seed is a different run. It does **not** seed the data order.
+  **CORRECTED 2026-09-29.** This paragraph said the opposite until today: the
+  seed reached only the JEPA mask, so the model was never seeded. Measured
+  before the fix (`4b42b6d`): two runs, identical flags, zero steps, checkpoints
+  differing in **34 730 605 of 43 725 616 bytes**. Every A/B in the archive
+  compared two different initialisations and charged the difference to the arm;
+  "3 seeds per arm" (§1.2) was not implementable, because all three seeds
+  produced different initialisations regardless.
+  **Not finished, and the gap is measured:** the same commit still reports
+  **409 043 differing values** on a repeated run — ~4% of the model is
+  process entropy that the seed does not reach. Until that is zero, two runs
+  under the same seed are not the same run and the protocol remains
+  *nearly* implementable.
 - `DM_QUANT_DEBUG=1` remains the one env var (debug-only, prints every
   `LinearLike` quant format); `CUBECL_AUTOTUNE_LEVEL` is the cubecl runtime's
   own knob, exposed as `--autotune`. Everything else is a typed flag:

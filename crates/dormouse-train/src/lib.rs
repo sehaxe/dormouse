@@ -1311,7 +1311,16 @@ pub fn train_loop(
             }
         }
 
-        if cfg.timers && step % 50 == 0 {
+        // Cadence: step 0 and every log step, NOT a hardcoded `% 50`. That
+        // constant is why every short run in this project's history reported
+        // step 0 and nothing else, which is how a 23x step-time error
+        // (opt=8303ms of 10809ms) survived in benches/history.tsv and reached
+        // the rulebook as "the optimizer is 77% of the step". A warm step is
+        // ~245 ms; the cold one is 5549 ms, and only a run that prints past
+        // step 0 can tell the two apart. Gated on `cfg.timers`, so an ordinary
+        // run pays nothing for the sync below.
+        let timer_step = step == 0 || (cfg.log_every > 0 && step % cfg.log_every as u64 == 0);
+        if cfg.timers && timer_step {
             // Force a device sync so the elapsed wall time equals the true GPU
             // step time (forward+backward+optim+retract). data_ms is the CPU
             // side (read + bytes_to_tensors). Their difference is GPU compute.

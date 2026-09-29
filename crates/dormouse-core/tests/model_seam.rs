@@ -103,7 +103,13 @@ fn hashed_ids(bytes: &[u8], b: usize, t: usize, dev: &Device) -> Tensor<3, Int> 
         for p in 0..t {
             let e = p + 1;
             for &n in [2usize, 3, 4].iter() {
-                v.push((fnv_hash(&row[e.saturating_sub(n)..e]) as u32) as i64);
+                // `& 0x7fff_ffff`, exactly as `dormouse_data::raw_keys` does it.
+                // The tensor is `Int` = i32 on this backend; an unmasked u32
+                // above `i32::MAX` panics on Flex ("Element cannot be
+                // represented in the target type") while CUDA wraps silently.
+                // The model masks the key against its own table size, so the
+                // high bit was never load-bearing.
+                v.push(((fnv_hash(&row[e.saturating_sub(n)..e]) as u32) & 0x7fff_ffff) as i64);
             }
         }
     }
@@ -326,7 +332,19 @@ fn gradient_flow() {
         .collect();
     // Documented grad-free params (see the test doc): the RMSNorm gains
     // (burn-rmsnorm require_grad bug). Anything else missing is a regression.
-    const KNOWN_GRAD_FREE: &[&str] = &["loop_block.norm.weight", "norm.weight"];
+    //
+    // The MoR router joins them by DESIGN, not by defect: `LoopBlock.mor_router`
+    // is documented as "always present (769 params, routed to AdamW...);
+    // `use_mor` decides whether it is read" (loop_block.rs:100-103). With
+    // `use_mor = false` the forward never reads it, so it cannot carry a
+    // gradient. 769 of 9.2M params, and constructing it conditionally would
+    // break every checkpoint that has one.
+    const KNOWN_GRAD_FREE: &[&str] = &[
+        "loop_block.norm.weight",
+        "norm.weight",
+        "loop_block.mor_router.proj.weight",
+        "loop_block.mor_router.proj.bias",
+    ];
     let unexpected: Vec<&str> = missing
         .iter()
         .filter(|p| !KNOWN_GRAD_FREE.contains(p))
