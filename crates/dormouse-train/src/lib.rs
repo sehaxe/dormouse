@@ -271,6 +271,28 @@ pub fn init_pools(device: &Device) {
 #[cfg(not(feature = "cuda"))]
 pub fn init_pools(_device: &Device) {}
 
+/// The cubecl client behind a `Device`, or `None` off CUDA. The same
+/// unwrap `init_pools` does, factored out because the graph seam needs it too
+/// and two copies of a backend downcast is how they drift.
+#[cfg(feature = "cuda")]
+pub fn cubecl_client(device: &Device) -> cubecl_runtime::client::Client {
+    use burn_dispatch::devices::CubeDevice;
+    use burn_dispatch::DispatchDevice;
+    use cubecl_cuda::CudaRuntime;
+    use cubecl_runtime::runtime::Runtime as _;
+    fn unwrap(d: &DispatchDevice) -> &burn_cuda::CudaDevice {
+        match d {
+            DispatchDevice::Cube(CubeDevice::Cuda(dev)) => dev,
+            DispatchDevice::Autodiff(a) => match &**a {
+                DispatchDevice::Cube(CubeDevice::Cuda(dev)) => dev,
+                other => panic!("expected CUDA device, got {other:?}"),
+            },
+            other => panic!("expected CUDA device, got {other:?}"),
+        }
+    }
+    CudaRuntime::client(unwrap(device.as_dispatch()))
+}
+
 /// The NaN firewall (2026-09-27). A non-finite loss must never reach the
 /// optimizer: backward turns it into NaN grads for every parameter, the step
 /// writes them into the weights, and from then on the model is dead - the
@@ -1168,9 +1190,13 @@ pub fn train_loop(
         // scalar at log cadence, host-table grads at the host-Adam cadence,
         // timers) so forward/backward/step of adjacent steps overlap on the
         // GPU. The scalar read rides along free inside the grads D2H.
+        // One cadence for the timer and for the loss copy that feeds it, or the
+        // timer reports a step whose loss was never read back. Both used to say
+        // `step % 50` independently, and they now say the same thing.
+        let timer_step = step == 0 || (cfg.log_every > 0 && step % cfg.log_every as u64 == 0);
         let loss_log = if step % cfg.log_every as u64 == 0
             || host_adam_step
-            || (cfg.timers && step % 50 == 0)
+            || (cfg.timers && timer_step)
         {
             Some(loss.clone())
         } else {
@@ -1311,15 +1337,15 @@ pub fn train_loop(
             }
         }
 
-        // Cadence: step 0 and every log step, NOT a hardcoded `% 50`. That
-        // constant is why every short run in this project's history reported
-        // step 0 and nothing else, which is how a 23x step-time error
-        // (opt=8303ms of 10809ms) survived in benches/history.tsv and reached
-        // the rulebook as "the optimizer is 77% of the step". A warm step is
-        // ~245 ms; the cold one is 5549 ms, and only a run that prints past
-        // step 0 can tell the two apart. Gated on `cfg.timers`, so an ordinary
-        // run pays nothing for the sync below.
-        let timer_step = step == 0 || (cfg.log_every > 0 && step % cfg.log_every as u64 == 0);
+        // Cadence: `timer_step`, decided above together with the loss copy that
+        // feeds it. That constant used to be a hardcoded `% 50` and the
+        // timer was gated on it alone, which is why every short run in this
+        // project's history reported step 0 and nothing else - and how a 23x
+        // step-time error (opt=8303ms of 10809ms) survived in
+        // benches/history.tsv and reached the rulebook as "the optimizer is 77%
+        // of the step". A warm step is ~245 ms; the cold one is 5549 ms, and
+        // only a run that prints past step 0 can tell the two apart. Gated on
+        // `cfg.timers`, so an ordinary run pays nothing for the sync below.
         if cfg.timers && timer_step {
             // Force a device sync so the elapsed wall time equals the true GPU
             // step time (forward+backward+optim+retract). data_ms is the CPU

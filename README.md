@@ -38,7 +38,9 @@ rustc 1.98.1, burn 0.22.0-pre.4 + vendored cubecl.
 | …same op, forward+backward | **RETRACTED — do not cite.** It read **25.9 ms** vs PyTorch eager-best 290.3 ms = **11.2×**, 138× fewer allocations, 2.5× less VRAM. The device was built as `Device::autodiff(...)` = NoCheckpointing, so the measured backward contained the *tensor* adjoint, and the verification test compared that tensor adjoint against the tensor path — verified the tensor adjoint twice. Only the FORWARD row above survives | retracted 2026-09-28, `AGENTS.md` §3.2 (last bullet). The fused adjoint kernels have still never been numerically compared to anything |
 | f16 GEMM, our path vs cuBLAS | **7.4× behind** (0.389 ms / 41.4 TFLOP/s cuBLAS vs 2.880 ms / 5.6 TFLOP/s ours) | 2026-09-27, `[5120,768]×[768,2048]`, zero-copy on cubecl's own stream, `max rel err 2.7e-4`. `crates/cublas-poc`; log `~/logs/cublas_poc_2026-09-27.log` |
 | fp32 GEMM, our path vs cuBLAS | **no ratio claimed** — 4.8 / 47.1 / 47.7 / 51.7 / 71.1 ms for one fixed matmul in the *same binary* (15× spread, power-capped) | 2026-09-27. At the median we are 4.4× behind; at the fastest sample 2.3× ahead. The measurement does not resolve it, so neither number is published as fact |
-| Training step, batch 10 × seq 512 | **1.58–1.84 s/step** over steps 1050–1500 of the best run (1.86–1.94 s over steps 50–100 of the same run). ~465 ms of it is fixed per-step launch cost, measured as `t = 465 ms + 0.067 ms/token` | `--timers`, `~/logs/official_v5e.log`, 2026-09-27 |
+| **A warm training step, batch 8 × seq 512** | **246–250 ms** (steps 4/8/50/100/150 → 248/246/249/240/250). Split: bwd 96–100 ms · retr 52–61 · fwd 46–48 · opt 43–47 | Measured 2026-09-29 on this box, release, `small` 9 195 854 params, depth 2, fp32, aux off, `--no-engram`, `CUBECL_AUTOTUNE_LEVEL=3`, `--timers`. **A step-0 reading is 5549 ms and is worth nothing** — see the note under the table |
+| **GPU utilisation, warm** | **13.3% mean; 142 of 180 samples at ≤5%** | `nvidia-smi` at 2 Hz across a 150-step run, batch 32. The workload is **launch-bound**: too many small kernels to fill the SMs. This is the ceiling, and it is not the model. The lever is CUDA graph capture/replay — 5/5 green on this GPU in `vendor/cubecl-fix/cubecl-cuda/tests/graph.rs`, **not yet wired** |
+| ~~Training step 1.58–1.84 s/step~~ | **RETRACTED 2026-09-29.** The old `t = 465 ms + 0.067 ms/token` model is the right order; the 1.58–1.84 s figure and the "4081 ms" bench row are **step-0 readings** | Every reading above that lacked a step index was a step-0 reading, and a step-0 step is **23× a warm one** because the cubecl autotune cache is cold. `--timers` used to print on `step % 50` only, so short runs could only ever see step 0. Both are fixed. `benches/history.tsv` keeps the retracted rows visible |
 | **Best held-out BPB with nothing known-broken in it** | **4.997** at step 6500 (regressed to 5.450 by 19500 — best-of a curve that overfits) | 2026-09-28, `~/logs/train_nokda.log`. `nokda_ce.config.toml`: `use_kda=false`, `use_engram=false`, `engram_ram=false`, batch 2, seq 512, **depth 2**, 9 195 854 params, over a **20 480 B** window. Both of this project's held-out instruments were broken for some runs and neither touched this one: no memory in training means no memory missing in eval, and `--no-kda` means the no-gradient attention arm was not in the model. It is a statement about a model with **no attention arm at all**. Below every unigram bar on record; 1.5 BPB *worse* than the 5-gram. See (d) |
 | Best held-out BPB at depth 4 | **6.351** at step 1500 | 2026-09-27, `~/logs/official_v5e.log`, 7 526 223 params (pre-repricing `small`; the shipped `small` is 9.20 M, so the best number on record was not produced by a preset in `configs/` today), batch 10, over a **102 400 B** window. **Not comparable to the 4.997 above — different window, different depth, different batch.** Its `use_kda=true`, so its attention arm received no gradient (`8fa5d4c`): it is a depth-4 result for a network with frozen attention |
 | Reference-fidelity suite | 1000 cases, fused vs an independent transcription, 5e-4 absolute, fixture regenerable byte-identically in CI | `vendor/burn-fused/crates/burn-gdn2/tests/bit_exact.rs`. Real work; **wrong provenance** — see (b) |
@@ -620,9 +622,28 @@ one exists because breaking it cost a run, a week, or a claim.
    a fixed step budget with 3 seeds per arm, or it is deleted. PonderNet was
    deleted this way. Anything inside the control's own seed spread is "no
    difference", and no difference means gone.
-3. **Zero host syncs outside a read.** The device is synchronized only on steps
-   that already read something back (log cadence, host-Adam cadence, timers).
-   A sync added for convenience is a step-time regression wearing a disguise.
+3. **No host read in the hot loop, and it is measured, not asserted.** The
+   trainer's step body reads nothing back from the device. The four host reads
+   that exist in the loop are each behind a guard, and a run proves the guards
+   hold by counting what escapes:
+
+   | check | result |
+   |---|---|
+   | 40 steps, `--log-every 10` | **4** log lines — one read per log step, none on the other 36 |
+   | 40 steps, `--log-every 10000` | **1** log line |
+   | 60 steps, `--log-every 5` vs `--log-every 10000` | **142 s vs 141 s** wall (2 rounds each, both 140–142) — the reads are not measurable in step time |
+   | `--timers` on vs off, 60 steps | **142 s vs 142 s** — and `--timers` *adds* a `try_into_scalar`, so this measures a run that deliberately syncs |
+   | `bwd` on a warm log step | **99–100 ms**, against 246–248 ms total: a read that costs no measurable time |
+
+   Measured 2026-09-29, release, `small` 9 195 854 params, batch 8 × seq 512,
+   depth 2, fp32, aux off, `--no-engram`, `CUBECL_AUTOTUNE_LEVEL=3`.
+
+   **The honest limit of this claim:** zero *reads* is not zero
+   *synchronization* — the driver may still block inside a kernel launch, and
+   the measurement above cannot see that. What it does establish is that no
+   host round-trip is on the step's critical path. A sync added for convenience
+   is a step-time regression wearing a disguise; one that costs nothing has to
+   be justified anyway, because the next arm may not be launch-bound.
    Corollary, learned the hard way: **never build a numeric indicator from a bool
    tensor on device — count on the host.** `mask_fill` writes in place through a
    buffer that `clone()` shares, and a counting indicator built that way
