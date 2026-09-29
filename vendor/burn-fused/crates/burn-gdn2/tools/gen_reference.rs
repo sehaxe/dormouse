@@ -139,7 +139,10 @@ fn short_conv(x: &[f32], w: &[f32], ch: usize) -> Vec<f32> {
     }
     out
 }
-/// F.normalize(x, p=2, dim=-1) along the last axis of a head-major [t, n] slice.
+/// F.normalize(x, p=2, dim=-1) over each contiguous run of `n` channels, i.e.
+/// each (token, head) group of a token-major `[T, n_heads * n]` buffer. Same
+/// math as normalizing the last axis *after* the head split, which is where
+/// `gen_reference.py` does it; the groups are the same elements either way.
 fn l2_normalize_last(x: &mut [f32], n: usize) {
     for row in x.chunks_mut(n) {
         let ss: f32 = row.iter().map(|v| v * v).sum();
@@ -231,6 +234,21 @@ fn init_params(rng: &mut Rng) -> Params {
     }
 }
 
+/// `x.reshape([t, n_heads, n]).transpose(1, 2)` as a contiguous buffer: token
+/// major in, head-major `[n_heads, t, n]` out. This is the layout the scan in
+/// `forward` reads; `linear` returns token-major, so every scan input needs it.
+fn to_head_major(src: &[f32], t: usize, n_heads: usize, n: usize) -> Vec<f32> {
+    let mut out = vec![0f32; t * n_heads * n];
+    for h in 0..n_heads {
+        for ti in 0..t {
+            for i in 0..n {
+                out[(h * t + ti) * n + i] = src[(ti * n_heads + h) * n + i];
+            }
+        }
+    }
+    out
+}
+
 /// The reference forward: x is [T, D], y is [T, D].
 fn forward(p: &Params, x: &[f32]) -> Vec<f32> {
     let t = x.len() / D;
@@ -284,11 +302,25 @@ fn forward(p: &Params, x: &[f32]) -> Vec<f32> {
     let w_raw = linear(x, &p.w_proj, None, D, VD);
     let w_gate: Vec<f32> = w_raw.iter().map(|x| sigmoid(*x)).collect();
 
+    // Head split: `x.reshape(B, T, n_heads, n).transpose(1, 2)`, the port of
+    // `gen_reference.py`'s per-head split. Torch makes it a free view; here it
+    // is a real copy, and the scan below reads head-major offsets, so the copy
+    // has to happen — reading token-major storage with head-major offsets is
+    // indistinguishable at T=1 and wrong for every t >= 1.
+    let q = to_head_major(&q, t, H, HK);
+    let k = to_head_major(&k, t, H, HK);
+    let g = to_head_major(&g, t, H, HK);
+    let b = to_head_major(&b, t, H, HK);
+    let v = to_head_major(&v, t, HV, V_HEAD);
+    let w_gate = to_head_major(&w_gate, t, HV, V_HEAD);
+
     // GVA: repeat the key-side heads when there are more value heads than
     // query heads (HV % H == 0, as in the official layer).
     let rep = HV / H;
     assert!(HV % H == 0, "GVA needs HV % H == 0");
-    // head-major [H, T, n] -> [HV, T, n], value head hv reads query head hv / rep
+    // head-major [H, T, n] -> [HV, T, n], value head hv reads query head hv / rep.
+    // `src` is head-major (see the head split above), so the rep == 1 case is
+    // already the right layout and returns unchanged.
     let expand = |src: &[f32], n_per_head: usize| -> Vec<f32> {
         if rep == 1 {
             return src.to_vec();

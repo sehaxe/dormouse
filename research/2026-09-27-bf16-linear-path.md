@@ -457,10 +457,14 @@ no production path includes.
 Naming the evidence, per AGENTS.md §1.4: the "reference" here is **our own
 transcription** (the CPU harness and a per-token scan), not NVlabs' own bytes.
 `tests/bit_exact.rs` compares against a *third* transcription
-(`gen_reference.py`, the NVlabs layer) and is **red by design and by
-measurement** - 976/1000 cases fail at 5e-4 - which another agent measured on
-2026-09-27 and documented in that file's header; it is not in the crate's
-default features and I did not touch it.
+(`tools/gen_reference.rs`, the NVlabs layer). It was red when this was written
+- 976/1000 cases failing at 5e-4, measured 2026-09-27 - and that was a bug in
+the generator, not in burn: it read token-major buffers with head-major
+offsets, which is invisible at T=1 and wrong for every t >= 1. Fixed
+2026-09-29, and the gate is green at max_diff 2.32e-7 with the tolerance
+unchanged; see `vendor/burn-fused/TEST-AUDIT.md` FINDING 0. The bf16 numbers
+above are unaffected either way: they compare fused against the CPU harness,
+not against that fixture.
 
 ### 7.3 60-step `--bf16` run - it does not run
 
