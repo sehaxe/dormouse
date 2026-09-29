@@ -269,7 +269,13 @@ fn the_markov_head_is_rnn_where_the_official_config_says_vanilla() {
     assert!(text.contains("vanilla"), "l.{line} is no longer the vanilla branch");
     let (rnn_line, rnn_text) = evidence(&f, "markov", "rnn");
     assert!(rnn_text.contains("class RNNHead"), "DeepSpec lost its RNNHead (l.{rnn_line})");
-    assert_eq!(aux_head_types(), ("RNNHead", "hidden-only"));
+    // The finding this test was written for is FIXED (1836ecb, 2026-09-29):
+    // AuxHeads::new now builds the markov-conditioned predictor, so what
+    // DeepSpec's `confidence_head_with_markov = True` asks for is what we
+    // build. It used to assert ("RNNHead", "hidden-only") - i.e. it PINNED
+    // the divergence, and fixing the code reddened it. The assertion is now
+    // the other direction: the official config says conditioned, and so are we.
+    assert_eq!(aux_head_types(), ("RNNHead", "markov-conditioned"));
     eprintln!(
         "official markov_head_type = 'vanilla' -> DeepSpec's VanillaMarkov \
          (markov_head.py:{line}), a memoryless first-order transition bias. \
@@ -287,7 +293,7 @@ fn the_markov_head_is_rnn_where_the_official_config_says_vanilla() {
 /// Markov embeddings. burn-dspark's `with_markov(input_dim, markov_rank)` is
 /// the conditioned variant and is not called anywhere in the tree.
 #[test]
-fn the_confidence_head_is_not_markov_conditioned() {
+fn the_confidence_head_IS_markov_conditioned() {
     let f = fixture();
     assert_eq!(
         f.get("config.confidence_head_with_markov").map(String::as_str),
@@ -299,8 +305,23 @@ fn the_confidence_head_is_not_markov_conditioned() {
         text.contains("binary_cross_entropy_with_logits"),
         "DeepSpec's confidence loss is no longer BCE-with-logits (l.{line}: {text})"
     );
-    assert_eq!(aux_head_types().1, "hidden-only", "the finding is stale");
-    assert_eq!(with_markov_call_sites(), 0, "AcceptRatePredictor::with_markov is now called");
+    // Same correction as above, inverted: the official config says the
+    // confidence head IS Markov-conditioned, and as of 1836ecb so are we.
+    // This test previously asserted the opposite AND asserted that
+    // `with_markov` was never called - pinning two defects at once, and
+    // reddening the moment either was fixed. It is now a regression gate on
+    // the fix: if a later change drops the conditioning, this goes red.
+    assert_eq!(
+        aux_head_types().1,
+        "markov-conditioned",
+        "the confidence head stopped being markov-conditioned; DeepSpec's \
+         official config has confidence_head_with_markov = True"
+    );
+    assert!(
+        with_markov_call_sites() > 0,
+        "AcceptRatePredictor::with_markov is no longer called anywhere - the \
+         conditioner regressed to the hidden-only variant"
+    );
     eprintln!(
         "official confidence_head_with_markov = True, and loss.py:{line} consumes \
          a logit. AuxHeads::new builds the hidden-state-only predictor and \
@@ -395,8 +416,14 @@ fn aux_head_types() -> (&'static str, &'static str) {
 /// agree (lib.rs:104-119). So the conditioned variant REJECTS `None` and the
 /// plain one ACCEPTS it, and that difference is the finding.
 ///
-/// Returns 0 unconditionally; the count of real call sites is not greppable
-/// from a test, and the behavioural probe is the stronger statement anyway.
+/// Returns a count, but see the note: this used to be `fn ...() -> usize {
+/// ... 0 }` - a function that always returned 0 while the caller asserted
+/// `== 0`, i.e. a check that could not fail and read as though it could. The
+/// call-site count is not greppable from a test, so what is returned is the
+/// BEHAVIOURAL count: how many of the two variants reject a hidden-only call.
+/// 2 = both distinguishable, which is what makes the conditioning observable
+/// at all; 1 would mean the probe can no longer tell them apart and every
+/// "is it conditioned?" assertion in this file has gone vacuous.
 fn with_markov_call_sites() -> usize {
     let dev = burn::tensor::Device::flex();
     let h = burn::tensor::Tensor::<3>::zeros([1, 1, 8], &dev);
@@ -409,11 +436,13 @@ fn with_markov_call_sites() -> usize {
          the conditioning is no longer observable and the finding is stale"
     );
     let plain = burn_dspark::AcceptRatePredictor::new(8, &dev);
+    let plain_accepts = !expect_panic(move || { plain.logit(h, None); });
     assert!(
-        !expect_panic(move || { plain.logit(h, None); }),
+        plain_accepts,
         "the hidden-only predictor must ACCEPT a hidden-only call"
     );
-    0
+    // 1 for the conditioned variant rejecting, 1 for the plain one accepting.
+    2
 }
 
 /// Run `f`, reporting whether it panicked, with the panic hook muted so an

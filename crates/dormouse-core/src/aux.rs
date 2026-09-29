@@ -403,6 +403,14 @@ mod tests {
             use_tsct: false,
             engram_rows: 1024,
             dspark_stride: 8,
+            // DSpark is OFF in every shipped preset as of 2026-09-29 (DeepSeek's
+            // own MTP ablation reports the head bits-per-byte neutral, and our
+            // protocol measures BPB), so `default()` gives dspark_weight = 0
+            // and `forward_with_hidden` correctly returns `None` aux - `any` at
+            // model.rs:254 needs a non-zero weight plus dspark_k > 0. These
+            // tests check that the DSpark TERM behaves, not that the default
+            // turns it on, so the arm is switched on here explicitly.
+            dspark_weight: 0.1,
             ..DormouseConfig::default()
         }
     }
