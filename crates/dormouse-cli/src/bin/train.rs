@@ -100,10 +100,16 @@ struct Args {
     /// exit (one forward per batch, current weights, no training).
     #[arg(long)]
     jepa_precompute: Option<usize>,
-    /// Seed for the JEPA span mask, the only stochastic input to a step. The
-    /// mask is a pure function of (seed, step), so an A/B of two arms replays
-    /// the same masks and a resume continues the interrupted run's sequence
-    /// (ADR-0021). Part of the config snapshot: changing it mid-run is drift.
+    /// Seed for the model initialisation AND the JEPA span mask. This text said
+    /// "the mask, the only stochastic input to a step" until 2026-09-29; that
+    /// stopped being true in 4b42b6d, which added `device.seed(cfg.seed)`
+    /// before any parameter is created — before it every parameter drew from
+    /// process entropy, so two runs of one config were two different models.
+    /// Both are pure functions of (seed, step), so an A/B of two arms replays
+    /// the same init and the same masks, and a resume continues the interrupted
+    /// run's sequence (ADR-0021). Part of the config snapshot: changing it
+    /// mid-run is drift. What is and is not verified about this:
+    /// `model_seam::two_models_one_seed_are_bit_identical`.
     #[arg(long)]
     seed: Option<u64>,
 
