@@ -3,7 +3,9 @@
 //!
 //! Context: LLMQ (arXiv 2512.15306) reports on an RTX 5060 Ti - our exact
 //! GPU - 3.9k tok/s at 78% MFU for 1.5B in BF16 and 13.0k at 85% for 0.5B.
-//! We run 2.7k tok/s on 7.5M params = 0.12 TFLOP/s, ~325x off that. The
+//! We run 2.7k tok/s on small's 9 197 390 params (MEASURED on the instantiated
+//! model; the 7.5M that used to stand here is the retracted pre-2026-09-27
+//! figure) = 0.12 TFLOP/s, ~325x off that. The
 //! candidates for the gap are (a) no tensor cores at all (fp32 CUDA cores)
 //! and (b) per-op overhead. This probe answers (a) with numbers instead of an
 //! estimate, on the shapes the `small` preset actually multiplies

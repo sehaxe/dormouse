@@ -95,8 +95,10 @@ pub struct DormouseConfig {
     #[serde(default = "d_norm_eps")] pub norm_eps: f32,
     #[serde(default = "d_true")] pub use_kda: bool,
     /// Spectral (low-rank TSCT) linears vs plain dense ones. The spectral
-    /// path is what makes the FFN 2048-wide on 7.5M params; turning it off
-    /// gives the A/B that decides whether it earns its retraction, quant
+    /// path is what makes the FFN 2048-wide on `small` (9 197 390 params,
+    /// MEASURED on the instantiated model - the 7.5M in older comments here
+    /// predates the 2026-09-27 memory re-pricing and is retracted); turning it
+    /// off gives the A/B that decides whether it earns its retraction, quant
     /// machinery and ~1000 lines (at a matched param budget the FFN gets
     /// narrower, which is the comparison that actually means something).
     #[serde(default = "d_true")] pub use_tsct: bool,

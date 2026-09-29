@@ -60,7 +60,8 @@ impl LinearLike {
     /// Plain dense linear - the A/B counterpart of the spectral path. It was
     /// unreachable before (the enum variant existed, nothing constructed it),
     /// which made "is TSCT earning its ~1000 lines?" unanswerable. The honest
-    /// question is wide-and-low-rank (TSCT, 2048-wide FFN on 7.5M params)
+    /// question is wide-and-low-rank (TSCT, 2048-wide FFN on small's
+    /// 9 197 390 measured params; the older 7.5M figure is retracted)
     /// versus narrow-and-dense (same param budget), not TSCT against nothing.
     pub fn dense(in_features: usize, out_features: usize, device: &Device) -> Self {
         let padded = if !out_features.is_multiple_of(4) && out_features != 1 {
