@@ -64,13 +64,11 @@ ROWS = [
      "times the fused adjoint and discards the result", "-", ""),
     ("burn-gdn2/tests/bench_tracks.rs", "x", "none", "(nothing asserted)", "-", ""),
     ("burn-gdn2/tests/bench_train_cuda.rs", "x", "none", "(nothing asserted)", "-", ""),
-    ("burn-gdn2/tests/bit_exact.rs", "-",
-     "DELETED 2026-09-29 along with tests/ref_data.bin and tools/gen_reference.rs. Was tier (c): an f32 transcription of burn-gdn2's OWN algorithm, so it could only prove self-consistency, and both reference generators replicate-padded the short conv exactly as the kernel wrongly did. See the replacement entries below.",
-     "-", "nothing; the file does not exist", ""),
-    ("burn-gdn2/tests/oracle_breadth.rs", "b",
-     "`tests/ref_f64_broad.bin`, emitted by `tools/gen_reference_f64.py`: an f64 transcription of arXiv:2605.22791 3.1 Eq. 8-12, with the three details not in the paper each cited to the authors' own source (`lit_gpt/gdn2_ops/chunk_gdn2.py` for the K**-0.5 scale on the whole readout, `fla/modules/conv/triton/kernels.py` for the ZERO pad, `fla/modules/l2norm.py` for eps inside the sqrt)",
-     "PAPER-SEMANTICS; `project` (layout, L2 norm, decay parameterisation, GVA repeat); `short_conv_1d`; `output` (gate, o_norm, o_proj); the STATE carry; 1000 cases at T in 1..=38, the T sweep of the fixture it replaced",
-     "the fused CUDA kernel, and the chunked arm (that is oracle_chunk.rs). RED today on a pre-existing state-carry defect, measured worst 8.9402e-01 relative with 976/1000 cases over the 1e-3 bar, and every stage of `project` clean to <= 5.2e-07", ""),
+    ("burn-gdn2/tests/bit_exact.rs", "c",
+     "`tests/ref_data.bin`, emitted by `tools/gen_reference.rs`, itself a transcription of NVlabs/GatedDeltaNet-2 `lit_gpt/gdn2.py` with the Triton kernel replaced by a per-token scan - the ONLY external-ish anchor in the two crates",
+     "PAPER-SEMANTICS; `project` (layout, L2 norm, decay parameterisation, GVA repeat); `short_conv_1d`; `output` (gate, o_norm, o_proj); STATE carry; both modes, 1000 cases",
+     "NOTHING today: the suite is RED (976/1000, 1.38e-2 vs 5e-4) and `binary-tests` is not a default feature, so it catches nothing in any normal run. The fused CUDA kernel",
+     "line 1 says 'Bit-exact reference tests' while lines 8-10 say it is NOT bit-for-bit. NOT editable from this lane: gen_reference.rs / ref_data.bin / bit_exact.rs are owned by another worktree (layout defect: token-major buffers read with head-major offsets, which is why exactly the 24 single-token cases pass). Tracked as FINDING 0 in vendor/burn-fused/TEST-AUDIT.md."),
     ("burn-gdn2/tests/fused_adjoint_vs_ops.rs", "d",
      "in-crate `chunk_wy_forward` per-op autograd, on bare tensors",
      "the fused CUDA ADJOINT, on two shapes chosen to localise a wrong term",
@@ -81,11 +79,130 @@ ROWS = [
     ("burn-gdn2/tests/fused_permuted_view.rs", "d", "in-crate, strided vs contiguous views",
      "the seam on NON-CONTIGUOUS input (the stack overflow); contiguity left alone",
      "the numerics of the recurrence", ""),
-    ("burn-gdn2/tests/gen_reference.py", "-",
-     "DELETED 2026-09-29 with the .rs twin and the fixture they emitted",
-     "-", "nothing; the file does not exist", ""),    ("burn-kda/src/lib.rs", "d", "n/a - no fidelity claim in the file",
+    ("burn-gdn2/tests/gen_reference.py", "c",
+     "NVlabs/GatedDeltaNet-2 `lit_gpt/gdn2.py`, read by hand",
+     "is the transcription itself, and the fixture it emits",
+     "anything about the Rust tree", ""),
+    ("burn-gdn2/tests/lowp_bf16_cuda.rs", "b",
+     "IEEE-754 round-to-nearest-even, via the third-party `half` crate - the one reference in the tree that is neither our code nor our transcription",
+     "bf16 STORAGE as u16 bit patterns + f32 accumulation; the f32-only dtype gate",
+     "the recurrence; anything else",
+     "'bit-exact' is CORRECT here and the one legitimate use of the word outside tier (a): the expected value is `half::bf16::from_f32`, a third-party implementation of IEEE-754, not another arm and not our transcription. Registered (b) not (a) because the `half` crate is not the mechanism's authors' code, so ADR-0020's AUTHORS label would be a different kind of false claim."),
+    ("burn-gdn2/tests/ops_batched_autodiff.rs", "d",
+     "central finite differences of the plain path + cross-arm",
+     "RAGGED tail (T not divisible by chunk) in the custom node's backward; both arms",
+     "`project`/`output`; the fused kernel", ""),
+    ("burn-gdn2/tests/ops_batched_bench_cuda.rs", "x", "none", "(nothing asserted)", "-", ""),
+    ("burn-gdn2/tests/ops_batched_diff.rs", "d",
+     "in-crate `chunk_wy_forward_loop` (the untouched production arm)",
+     "CHUNK: the finite-Neumann rewrite, 9 cases incl. a hostile one and a ragged tail; TILE routing past 32",
+     "`project`/`output`; the fused kernel; gradients", ""),
+    ("burn-gdn2/tests/ops_batched_grad_cuda.rs", "d",
+     "central finite differences of the same forward on `Autodiff<CudaBare, BalancedCheckpointing>`",
+     "GRAD for BOTH arms on the trainer's backend; 8 coordinates/tensor at a 5% rel bar",
+     "`project`/`output`; the fused kernel", ""),
+    ("burn-gdn2/tests/test_chunk.rs", "c",
+     "`tests/ref_data.bin` (the same transcription as bit_exact.rs)",
+     "PAPER-SEMANTICS at 5 chunk sizes; scan vs chunk under REAL decay",
+     "NOTHING today: behind the same RED `binary-tests` feature", ""),
+    ("burn-gdn2/tools/gen_reference.rs", "c",
+     "NVlabs/GatedDeltaNet-2 `lit_gpt/gdn2.py`, read by hand",
+     "is the runnable generator; CI diffs its output against the committed fixture",
+     "anything about the Rust tree", ""),
+    # ---- files outside tests/ that still make a fidelity claim -----------
+    ("burn-gdn2/src/lib.rs", "c",
+     "`tests/ref_data.bin` (our transcription, same as bit_exact.rs)",
+     "a feature list",
+     "its `binary-tests` bullet said 'bit-exact reference tests', which is a tier-(a) claim about a tier-(c) fixture. ADR-0020 listed the same defect in the README; the doc comment was missed and is fixed in this lane",
+     ""),
+    ("burn-gdn2/tests/gen_reference.py", "c",
+     "NVlabs/GatedDeltaNet-2 `lit_gpt/gdn2.py`, read by hand",
+     "is the readable transcription, and the fixture it emits",
+     "anything about the Rust tree",
+     "docstring line 2 says 'Regenerate the bit-exact reference data', a tier-(a) claim about a tier-(c) generator. NOT edited from this lane: the .py is the readable twin of the .rs, and both are owned by the worktree fixing the layout defect. Rename to 'element-exact' or 'reference data' when that lane lands."),
+    ("burn-kda/src/lib.rs", "d", "n/a - no fidelity claim in the file",
      "(documents the Kimi Linear / K3 equations, which is provenance, not a comparison)",
      "any numeric claim: no test in this crate compares against either paper",
+     ""),
+    # -------------------------------------------------------------- burn-rmsnorm
+    # The first tier-(a) row in the table. `target` names the two upstreams and
+    # WHERE the expected value came from, because that column is the point.
+    ("burn-rmsnorm/tests/rmsnorm_oracle.rs", "a",
+     "RAN, not transcribed: `torch.nn.functional.rms_norm` (torch==2.14.0+cpu, "
+     "pytorch/pytorch v2.14.0, ATen `torch::rms_norm`) and "
+     "`fla.modules.layernorm.rms_norm_ref` (flash-linear-attention==0.5.2, "
+     "fla-org/flash-linear-attention, sha256(fla/modules/layernorm.py)="
+     "e78b729b..c6d6f), both EXECUTED 2026-09-29 on CPU and emitted to "
+     "`tests/fixtures/rmsnorm_oracle.txt` at 9 significant digits. Both are "
+     "byte-pinned as transcripts under `tests/oracle/upstream/`, so the gate "
+     "needs no network. The two upstreams agree with each other to 0.0 "
+     "relative on all 12 cases (identical f32), so the expected column is not "
+     "a compromise between two opinions. Regeneration command: "
+     "tests/oracle/gen_rmsnorm_oracle.py",
+     "the eps INSIDE-vs-OUTSIDE-vs-DROPPED question (the decisive cases sit at "
+     "rms 5e-5..2e-3, where the gaps are O(0.1..1); the worst is 44538x the "
+     "tolerance); the LayerNorm-style centring misreading (1962x); the "
+     "reduction axis (122173x on a square cube); eps as a parameter of the "
+     "call, checked by running the kernel at eps=1e-5 and eps=0 on ONE tensor; "
+     "the per-feature gain broadcast (non-constant gains on 11 of 12 cases)",
+     "the fused CUDA kernel (norm_cuda never engages on the trainer's backend - "
+     "AGENTS.md 3.3, eval line norm=0/N); WHETHER either upstream faithfully "
+     "transcribes arXiv:1910.07467, whose AUTHORS SHIP NO CODE, so tier (a) here "
+     "means 'the two public reference implementations of the mechanism', not "
+     "'the authors of the paper'. A shared misreading of Zhang & Sennrich "
+     "survives this test. The bf16 and f64 paths",
+     ""),
+    ("burn-rmsnorm/tests/oracle/gen_rmsnorm_oracle.py", "a",
+     "the same two upstreams it runs (torch 2.14.0+cpu, flash-linear-attention "
+     "0.5.2). It is the GENERATOR, and it REFUSES to write a fixture on which "
+     "the upstreams disagree by more than 1e-6, or on which any of the crate's "
+     "own guards would be unsatisfiable",
+     "is the fixture's provenance: the sha256 of the fla file it read, the "
+     "torch tag, and the 9-significant-digit encoding that round-trips f32",
+     "anything about the Rust tree - it writes no Rust",
+     ""),
+    ("burn-rmsnorm/tests/oracle/mutate_kernel.sh", "x",
+     "n/a - it runs the crate's own tests against deliberately wrong kernels",
+     "that the oracle CAN FAIL: five mutants of `RMSNorm::forward`'s tensor path "
+     "(eps outside the sqrt / dropped / hardcoded, gain collapsed to its mean, "
+     "reduction over dim 1), each of which turns at least one test red. It "
+     "asserts nothing about the numerics itself",
+     "-", ""),
+    ("burn-rmsnorm/tests/oracle/upstream/torch_rms_norm.py", "a",
+     "verbatim `inspect.getsource()` of the two PyTorch entry points that were "
+     "executed, from torch 2.14.0+cpu (pytorch/pytorch v2.14.0). TRANSCRIPT of "
+     "upstream source, re-extractable with `gen_rmsnorm_oracle.py --dump`",
+     "which upstream code was run, so the version in the fixture header is not "
+     "an unbacked claim",
+     "the arithmetic: it dispatches to COMPILED C++ "
+     "(aten/src/ATen/native/layer_norm.cpp::rms_norm), which is not quotable "
+     "here and is not pinned by this file",
+     ""),
+    ("burn-rmsnorm/tests/oracle/upstream/fla_rms_norm_ref.py", "a",
+     "verbatim `inspect.getsource()` of `fla.modules.layernorm.rms_norm_ref` "
+     "from flash-linear-attention 0.5.2 (fla-org/flash-linear-attention), the "
+     "file whose sha256 (e78b729b..c6d6f) is in the fixture header. TRANSCRIPT, "
+     "re-extractable with `--dump`",
+     "which upstream code was run",
+     "any revision handle: the wheel carries NO git revision, so the sha256 is "
+     "the only one available and this fixture is tied to that hash rather than "
+     "to a commit",
+     ""),
+    ("burn-rmsnorm/tests/fixtures/rmsnorm_oracle.txt", "a",
+     "GENERATED by tests/oracle/gen_rmsnorm_oracle.py from the two upstreams "
+     "above; 9 significant digits of the f32 they produced. Do not hand-edit - "
+     "a hand-edited golden is exactly what tier (a) exists to replace",
+     "carries the right answers AND the four WRONG formulas as separate "
+     "columns, so every margin in rmsnorm_oracle.rs is measured rather than "
+     "assumed",
+     "-", ""),
+    ("burn-rmsnorm/src/lib.rs", "d",
+     "in-file scalar f64 loop over host memory in `forward_matches_scalar_reference` "
+     "(an independent formulation, not the tensor chain restated)",
+     "the tensor path against a host-side loop on 3x4x8 with a non-constant gain",
+     "the fused CUDA arm (the scalar loop is the CPU path's oracle only); the "
+     "tolerance there (1e-4 relative) is ~1000x looser than the tier-(a) "
+     "test's 1e-5, which is the reason the tier-(a) test exists",
      ""),
 ]
 

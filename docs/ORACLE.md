@@ -56,11 +56,10 @@ are the *same function* everywhere else.
 > every differential test in the tree**. A bug there moves the tensor-ops arm and
 > the fused arm together, and the difference between them is exactly zero.
 
-The test suite's own files know this in places and not in others. The
-fixture-backed layer (`ref_f64.rs`, `oracle_breadth.rs`, `oracle_chunk.rs`) was
-written precisely because the arm-vs-arm tests cannot see `project` — it
-instantiates a whole `GatedDeltaNet2` and compares it to an outside reference.
-It is also red, and two of its three targets are off by default. See §5.
+The test suite's own files know this in places and not in others. `bit_exact.rs`
+was written precisely because the arm-vs-arm tests could not see `project` — it
+is the only fixture that instantiates a whole `GatedDeltaNet2` and compares
+anything to an outside reference. It is also red, and off by default. See §5.
 
 ---
 
@@ -79,7 +78,7 @@ under test?
 | L5 | **central finite differences** | `burn-kda/tests/ops_grad_cuda.rs`, `ops_batched_grad_cuda.rs`, `ops_batched_autodiff.rs`, `autodiff_chunk.rs:200` | the **method of differentiation** — not a formulation, a different way to compute the same number | (d) | numerics, not code |
 | L6 | host rank-5 references | `b5_seam_probe.rs` | rank-5 view semantics on ndarray | (d) | a scalar-index model, same file |
 | L7 | seam counters / arm reachability | `cuda_gate.rs`, `autodiff_cuda_gate.rs` | *which arm ran* — not any number | (d) | counters |
-| L8 | **paper transcription** | `ref_f64.rs`, `oracle_breadth.rs`, `oracle_chunk.rs`, `ref_f64.bin`, `ref_f64_faults.bin`, `ref_f64_broad.bin` | **`project`, `output`, the short conv, the recurrence itself** | **(b)** | our f64 transcription of arXiv:2605.22791 §3.1 Eq. 8-12, with the three non-paper details cited to `lit_gpt/gdn2_ops/chunk_gdn2.py`, `fla/modules/conv/triton/kernels.py` and `fla/modules/l2norm.py`. Was **(c)** — `bit_exact.rs` / `test_chunk.rs` / `ref_data.bin`, an f32 transcription of our own algorithm — all DELETED 2026-09-29. |
+| L8 | **paper transcription** | `bit_exact.rs`, `test_chunk.rs`, `ref_data.bin` | **`project`, `output`, the short conv, the recurrence itself** | **(c)** | our transcription of NVlabs `lit_gpt/gdn2.py` |
 | L9 | IEEE-754 RNE | `lowp_bf16_cuda.rs` | bf16 storage semantics | (b) | the `half` crate, third-party |
 | — | nothing | | | **(a)** | **no file in this tree has one** |
 
@@ -124,34 +123,9 @@ This file narrows that to the two crates that carry the headline.
 
 ## 5. The external anchor exists and is currently switched off
 
-**SUPERSEDED 2026-09-29, and the rest of this section is kept as the record of
-the search.** `tests/ref_data.bin`, `tools/gen_reference.rs` and
-`tests/gen_reference.py` are DELETED. They were an f32 transcription of
-burn-gdn2's OWN algorithm, i.e. tier (c) by the strict reading of ADR-0020 and
-in practice weaker than that: both generators replicate-padded the short conv's
-left edge exactly as the kernel wrongly did, so the fixture agreed with the bug
-and the suite was green. The f64 layer (`tools/gen_reference_f64.py`,
-`tests/ref_f64*.bin`) replaced them, the two `binary-tests` targets were
-retargeted onto it as `oracle_breadth` / `oracle_chunk`, and the tier is now
-(b). R5 below is resolved: no file called `bit_exact` exists.
-
-The anchor is still **RED**, and now for a reason that is a real defect rather
-than a stale fixture — measured 2026-09-29 on the base commit `dbfa4ca`, i.e.
-before the retarget: `ref_f64::gdn2_f32_agrees_with_the_f64_reference` fails at
-9.227e-02 relative (T=2), and after the retarget the breadth sweep reads worst
-8.9402e-01 at T=3 with 976/1000 cases over the bar. Every stage of `project` is
-clean to <= 5.2e-07 including all seven per-head 4-D tensors, and token 0 is
-correct at every length while every token from 1 on is not, so the fault is in
-the state carry. It is NOT yet localised to a line; see the STATUS block in
-`vendor/burn-fused/crates/burn-gdn2/tests/ref_f64.rs` for what is measured and
-for the one measurement that could not be reproduced.
-
-What follows is the 2026-09-29 record of the tier-(c) red, kept because the
-search it describes is the one that found the pad.
-
-`tests/ref_data.bin` was committed, `tools/gen_reference.rs` regenerated it
-byte-identically, and CI diffed the two — that was a real, well-built tier-(c)
-anchor, and the best infrastructure in the tree.
+`tests/ref_data.bin` is committed, `tools/gen_reference.rs` regenerates it
+byte-identically, and CI diffs the two — that is a real, well-built tier-(c)
+anchor, and it is the best infrastructure in the tree.
 
 It is **RED**, and the red reproduces exactly. Re-measured on this cell
 2026-09-29 at `57f324b`, ndarray, `--release`, from `wt/oracle`:
@@ -199,28 +173,19 @@ Two further consequences that belong in any decision about this crate:
 ### 5.1 The default CPU cell is blind to it, and that is measurable
 
 `cargo test -p burn-gdn2 -p burn-kda --features autodiff` on this box, 2026-09-29,
-ran `tests/bit_exact.rs` and reported:
+runs `tests/bit_exact.rs` and reports:
 
 ```
 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
-**Two.** The 1000-case test was not among them. `bit_exact.rs` also contained
-`bench_ndarray_short` and `bench_ndarray_single`, and those were the two that
-ran. `test_gdn2_1000_cases` was behind `#[cfg(feature = "binary-tests")]`, so
-every ordinary `cargo test -p burn-gdn2` on this crate executed **zero** lines
+**Two.** The 1000-case test is not among them. `bit_exact.rs` also contains
+`bench_ndarray_short` and `bench_ndarray_single`, and those are the two that
+run. `test_gdn2_1000_cases` is behind `#[cfg(feature = "binary-tests")]`, so
+every ordinary `cargo test -p burn-gdn2` on this crate executes **zero** lines
 of the only layer in the tree that can see `project`. A green test run on
 `burn-gdn2` is not evidence about the projection stack, and reading it as such
 is the most likely way this crate gets trusted by accident.
-
-**STILL TRUE after the 2026-09-29 retarget, and that is deliberate.** The two
-targets are now `oracle_breadth` and `oracle_chunk`, still behind
-`binary-tests`, still with the benchmarks ungated so the target is live on the
-default cell (a `[[test]]` block with `required-features` would make cargo skip
-the target there and lose the benchmarks). `tools/lib_gate.sh` is the only thing
-that passes the feature, and if that cell ever reports 0 tests for burn-gdn2,
-the line to look at is `tools/lib_gate.sh`, not the suite. `oracle_breadth`'s
-header carries the reason.
 
 ---
 
@@ -288,32 +253,42 @@ and that accepting these inputs is the known-bad path.
 
 `tools/oracle_gate.py`, five rules, exit 1 on a real violation:
 
-- **R1 COVERAGE** — every `tests/` and `examples/` file in the two crates has a
-  row in `ORACLE-TIERS.tsv`, and so does any `src/`/`tools/`/`README` file that
-  makes a fidelity claim. A new test cannot land without declaring what it is
-  compared against.
+- **R1 COVERAGE** — every `tests/` and `examples/` file in the audited crates
+  has a row in `ORACLE-TIERS.tsv`, and so does any `src/`/`tools/`/`README`
+  file that makes a fidelity claim. A new test cannot land without declaring
+  what it is compared against.
 - **R2 VOCABULARY** — a file whose tier is not `(a)` may not contain a positive
   "bit-for-bit"/"bit-exact" claim. Disclaimers pass; claims do not.
 - **R3 PROVENANCE** — `(a)` needs a `github.com` URL in the file; `(b)`/`(c)`
   need an arXiv id or a named fixture+generator.
 - **R4 STALE** — a row naming a file that no longer exists is a defect.
-- **R5 FILENAME** — `bit_exact.rs` at tier `(c)` was a violation in its own
-  right: the filename is what `cargo test --test bit_exact` printed and what got
-  quoted. **RESOLVED 2026-09-29**: the file and the target are deleted and the
-  tests are `oracle_breadth` / `oracle_chunk`, which name what they compare
-  against.
+- **R5 FILENAME** — `bit_exact.rs` at tier `(c)` is a violation in its own right:
+  the filename is what `cargo test --test bit_exact` prints and what gets quoted.
 
 Wording fixed in this lane by the gate going red on it:
 `burn-gdn2/src/lib.rs:49` (ADR-0020 listed this defect in the README and missed
 the doc comment), `b5_seam_probe.rs:11`, and the two `burn-kda` `bitforbit`
-docstrings. Three rows were waived with a written reason, because the files belonged
-to another lane: `bit_exact.rs` and `gen_reference.py` (both since deleted,
-2026-09-29), and `lowp_bf16_cuda.rs`
+docstrings. Three rows are waived with a written reason, because the files belong
+to another lane: `bit_exact.rs`, `gen_reference.py`, and `lowp_bf16_cuda.rs`
 (the last is the one *legitimate* use of the word outside tier (a) — its expected
 value is `half::bf16::from_f32`, a third-party implementation of IEEE-754).
 
 Run it: `python3 tools/oracle_gate.py`. It is not in CI yet; that is one line in
 `fused-library.yml` and it belongs to whoever owns the workflow.
+
+The gate's scope grew to three crates on 2026-09-29 (`burn-rmsnorm` joined,
+when `tests/rmsnorm_oracle.rs` became the tree's first tier-(a) row). A
+registry row nothing scans is a row that cannot fail, so widening the scope is
+what makes that row's R1/R2/R3 checks live rather than decorative: 61 files are
+scanned now, 54 before.
+
+**It is currently RED on five R1s, and none of them are new.** `burn-gdn2`'s
+`tests/ref_f64.rs`, `tests/common/ref_f64.rs`, `tests/official_forward.rs`,
+`tests/fused_launch_count.rs` and `examples/ref_f64_stages.rs` are tracked at
+`HEAD` and have no registry row. Verified by running this lane's own gate
+against `HEAD`'s `ORACLE-TIERS.tsv`: the same five, same messages. They belong
+to the f64-oracle lanes; declaring them is a one-line-per-file edit to
+`tools/gen_oracle_tiers.py` and is left to whoever owns that work.
 
 ---
 
