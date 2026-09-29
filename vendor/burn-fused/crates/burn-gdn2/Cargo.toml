@@ -66,6 +66,10 @@ name = "alloc_probe"
 required-features = ["cuda", "autodiff"]
 
 [[test]]
+name = "autodiff_bwd_f64"
+required-features = ["autodiff"]
+
+[[test]]
 name = "autodiff_chunk"
 required-features = ["autodiff"]
 
@@ -91,6 +95,10 @@ required-features = ["cuda", "autodiff"]
 
 [[test]]
 name = "bench_train_cuda"
+required-features = ["cuda", "autodiff"]
+
+[[test]]
+name = "fused_adjoint_f64"
 required-features = ["cuda", "autodiff"]
 
 [[test]]

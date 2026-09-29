@@ -303,18 +303,45 @@ fn nested_balanced_graph_matches_no_checkpointing() {    let (batch, heads, time
     }
 }
 
-/// The nested graph must NOT reach the op, and the reason is the bug this
-/// project shipped for its whole history.
+/// The nested graph must reach the op, and the op's output must be a TRACKED
+/// node — a node that can send a gradient back — rather than a leaf.
 ///
-/// Asserted apart from the numbers so a silent change of arm is a clear
-/// failure rather than a slightly different set of gradients: on inputs that
-/// are all intermediates, the custom node is declined, because a node whose
-/// parents' node refs report no requirement comes back `UnTracked` and its
-/// output is a leaf with no gradient behind it. Both strategy entry points
-/// must decline, for the same reason and independently of the strategy - which
-/// is what `chunk_dispatch` relies on when it falls through to the ops path.
+/// Asserted apart from the numbers, so a silent change of arm is a clear
+/// failure rather than a slightly different set of gradients.
+///
+/// # This assertion was INVERTED once, and the reason it is written this way
+///
+/// `8fa5d4c` diagnosed the right disease and prescribed the wrong cure. The
+/// disease was real: under `BalancedCheckpointing` the op's inputs are
+/// checkpoint leaves, so `OpsPrep::prepare` returned `UnTracked`, the custom
+/// node's output was a LEAF, and no gradient could reach the arm. The cure was
+/// to DECLINE (`return None`) whenever no input "requires grad", so
+/// `chunk_dispatch` fell through to the ops path. That works — and it is
+/// precisely why this test was written to assert the decline.
+///
+/// It stopped being the right cure at `2a430cc`, which changed the gate from
+/// `Tensor::is_require_grad()` (literally `requirement == Grad`, the strict
+/// requirement of a LEAF) to `AutodiffTensor::is_tracked()` (literally
+/// `!requirement.is_none()`, which is what `OpsPrep::prepare` reads). Every one
+/// of the trainer's seven inputs is a projection output with requirement
+/// `GradInBackward`, so the old gate declined on the trainer's own graph while
+/// every fixture built from lifted `require_grad()` leaves passed — the exact
+/// shape of the defect `8fa5d4c` was written about, re-created one commit later.
+///
+/// So "the op declined" stopped being the intended behaviour, and this assertion
+/// went red against a DELIBERATE change rather than against a regression. The
+/// replacement therefore does not invert it: it asserts the PROPERTY the decline
+/// was standing in for, which is the thing that was actually broken —
+///
+///   * the op builds a node on a projection graph (it does not decline), and
+///   * that node is TRACKED, i.e. its output carries a gradient, and
+///   * the loss reaches every leaf through it, with the ops path's numbers.
+///
+/// A fixture that stops being non-leaf would stop testing the thing, so the
+/// fixture is checked for that too — the mistake `8fa5d4c` made was in the
+/// GATE, and the mistake this test could make is in the FIXTURE.
 #[test]
-fn the_op_declines_a_nested_graph_and_the_ops_path_carries_the_gradient() {
+fn the_op_builds_a_tracked_node_on_a_projection_graph_and_the_gradient_reaches_every_leaf() {
     let raw = raw_inputs(1, 2, 32, 4, 3);
     let device = balanced_device();
     let g = nested::<BalancedCheckpointing>(&device, &raw);
@@ -322,10 +349,11 @@ fn the_op_declines_a_nested_graph_and_the_ops_path_carries_the_gradient() {
         assert!(
             !t.is_require_grad(),
             "input {i} is a require_grad leaf: this fixture is supposed to be all \
-             intermediates, and the decline it is testing for would not happen"
+             intermediates, and a lifted leaf would let a gate that asks the wrong \
+             question pass"
         );
     }
-    let balanced = chunk_wy_forward_autodiff_s::<NdArray, BalancedCheckpointing>(
+    let args = [
         g.inputs[0].clone(),
         g.inputs[1].clone(),
         g.inputs[2].clone(),
@@ -333,58 +361,117 @@ fn the_op_declines_a_nested_graph_and_the_ops_path_carries_the_gradient() {
         g.inputs[4].clone(),
         g.inputs[5].clone(),
         g.inputs[6].clone(),
+    ];
+    let r = chunk_wy_forward_autodiff_s::<NdArray, BalancedCheckpointing>(
+        args[0].clone(),
+        args[1].clone(),
+        args[2].clone(),
+        args[3].clone(),
+        args[4].clone(),
+        args[5].clone(),
+        args[6].clone(),
         1.0,
         16,
     );
-    assert!(
-        balanced.is_none(),
-        "the op built a node over all-intermediate inputs: its output is a LEAF, \
-         which is the defect 8fa5d4c fixed"
+    let (out, _state) = r.expect(
+        "the op declined on the trainer's own graph shape (leaf -> mul_scalar -> permute). \
+         That is `8fa5d4c`'s behaviour, not `2a430cc`'s: the gate must be \
+         `AutodiffTensor::is_tracked()` = `!requirement.is_none()`, because every one of \
+         these inputs is a projection output whose requirement is `GradInBackward`. If this \
+         fires, the gate is asking `is_require_grad()` again and the attention arm is \
+         training nothing.",
     );
-    // The same values through the default-strategy entry point must decline for
-    // the same reason, not because the strategy is part of the conversion: the
-    // two must not be distinguishable here, or `chunk_dispatch`'s two probes
-    // would be testing the wrong thing.
-    let default_entry = burn_gdn2::chunk_wy_forward_autodiff::<NdArray>(
-        g.inputs[0].clone(),
-        g.inputs[1].clone(),
-        g.inputs[2].clone(),
-        g.inputs[3].clone(),
-        g.inputs[4].clone(),
-        g.inputs[5].clone(),
-        g.inputs[6].clone(),
-        1.0,
-        16,
+    // Tracked-ness is `!requirement.is_none()` on the primitive, which is
+    // literally what `OpsPrep::prepare` reads.  A second, INDEPENDENT witness
+    // that the output is a node and not a leaf: a leaf's `requirement` is the
+    // strict `Grad`, and a tracked node's output is not — so `is_require_grad`
+    // being FALSE here is the observable signature of "this is a node, and burn
+    // will run its backward".  The first is the mechanism, the second is what a
+    // caller can see, and a defect that only moves one of them is still a
+    // defect.
+    let node = out
+        .clone()
+        .try_into_primitive::<Autodiff<NdArray, BalancedCheckpointing>>()
+        .expect("the op's output is not an autodiff tensor at all");
+    assert!(
+        node.is_tracked(),
+        "the op built a node but its output is not TRACKED: the backward cannot reach the \
+         arm through it. This is the `8fa5d4c` defect itself (OpsPrep returned UnTracked), \
+         and a leaf output is silent — the forward runs, its counter climbs, and no \
+         gradient is produced."
     );
     assert!(
-        default_entry.is_none(),
-        "the NoCheckpointing entry point built a node where the Balanced one \
-         declined: the decline is no longer strategy-blind and the two are no \
-         longer equivalent"
+        !out.is_require_grad(),
+        "the op's output reports the strict LEAF requirement. A node's output carries \
+         `GradInBackward`, not `Grad`; if this is true the output is a leaf and the whole \
+         assertion above is vacuous."
     );
 
-    // And the gradient the ops path produces is real: the loss reaches every
-    // leaf. This is the assertion that would have failed on a frozen arm.
-    let (out, _state) = burn_gdn2::chunk_wy_forward(
-        g.inputs[0].clone(),
-        g.inputs[1].clone(),
-        g.inputs[2].clone(),
-        g.inputs[3].clone(),
-        g.inputs[4].clone(),
-        g.inputs[5].clone(),
-        g.inputs[6].clone(),
+    // NOT probed through `chunk_wy_forward_autodiff` (the NoCheckpointing entry
+    // point) here, and the reason is worth recording because the previous
+    // version of this test got it backwards.  `Autodiff<Inner, S>`'s float
+    // primitive is `AutodiffTensor<Inner>` and `S` does not appear in the type,
+    // so the two entry points are not interchangeable on the same tensors: the
+    // strategy lives in burn's runtime dispatch context, and asking for
+    // `NoCheckpointing` on a tensor whose context is `BalancedCheckpointing`
+    // makes every conversion return `None`.  That is a TYPE-level fact, not the
+    // tracked-ness gate, and asserting on it measured nothing about the
+    // backward.  What the strategy-blindness actually needs is covered where it
+    // is meaningful: `nested_balanced_graph_matches_no_checkpointing` runs the
+    // same graph under both strategies and requires the gradients to agree.
+
+    // And the gradient is real and it is the SAME gradient the ops path gives.
+    // This is the assertion that would have failed on a frozen arm, and
+    // comparing the two is what makes "it is not zero" more than a smoke test.
+    //
+    // TWO graphs, not one graph walked twice: burn's autodiff tape is consumed
+    // by the first `backward()` and `retain_graph` does not exist, so a second
+    // call on the same nodes panics with "graph tape has already been
+    // consumed".  `nested` rebuilds every tensor, so the two graphs are
+    // independent and the comparison is still value-for-value.
+    let g_ops = nested::<BalancedCheckpointing>(&device, &raw);
+    let (ops_out, _) = burn_gdn2::chunk_wy_forward(
+        g_ops.inputs[0].clone(),
+        g_ops.inputs[1].clone(),
+        g_ops.inputs[2].clone(),
+        g_ops.inputs[3].clone(),
+        g_ops.inputs[4].clone(),
+        g_ops.inputs[5].clone(),
+        g_ops.inputs[6].clone(),
         1.0,
         16,
     );
-    let grads = out.powf_scalar(2.0).sum().backward();
+    let ops_grads = ops_out
+        .clone()
+        .powf_scalar(2.0)
+        .sum()
+        .add(ops_out.sum().mul_scalar(0.5))
+        .backward();
+    let grads = out.clone().powf_scalar(2.0).sum().add(out.sum().mul_scalar(0.5)).backward();
+    let mut worst = 0.0f32;
+    let mut mags = Vec::new();
     for (i, t) in g.leaves.iter().enumerate() {
         let d = t
             .grad(&grads)
-            .unwrap_or_else(|| panic!("leaf {i} got no gradient at all"))
+            .unwrap_or_else(|| panic!("leaf {i} got no gradient at all: the arm is frozen"))
             .clone();
-        assert!(
-            d.abs().max().into_scalar::<f32>() > 0.0,
-            "leaf {i} got a zero gradient through the ops path"
-        );
+        let m = d.clone().abs().max().into_scalar::<f32>();
+        assert!(m > 0.0, "leaf {i} got a ZERO gradient through the op");
+        mags.push(m);
+        let r_ops = g_ops.leaves[i]
+            .grad(&ops_grads)
+            .expect("the ops path left a leaf without a gradient")
+            .clone();
+        worst = worst.max(rel_diff(&d, &r_ops));
     }
+    println!(
+        "BalancedCheckpointing, all-intermediate inputs: the op built a TRACKED node; \
+         leaf gradient |max| = {mags:?}; worst disagreement with the ops path {worst:.2e} \
+         (bar {RELATOL:.0e})"
+    );
+    assert!(
+        worst < RELATOL,
+        "the node's gradient differs from the ops path's by {worst:.2e}: the tracked node is \
+         carrying a gradient, but not the gradient of this function"
+    );
 }

@@ -22,5 +22,15 @@ crates/*/target
 !crates/burn-gdn2/tests/ref_f64.bin
 !crates/burn-gdn2/tests/ref_f64_faults.bin
 !crates/burn-gdn2/tests/ref_f64_broad.bin
+# The f64 GRADIENT oracle for the chunked-WY backward, same reason: its
+# expected values come from NumPy, and `tests/autodiff_bwd_f64.rs` must run in
+# CI with no Python present. `ref_bwd_f64.bin` is the oracle;
+# `ref_bwd_f64_faults.bin` is the other side of its margin; and
+# `ref_bwd_f64_carry.bin` is the ORACLE FOR THE STATE-CARRY DEFECT below, so
+# the diagnosis carries its own expected values rather than only a number in
+# a commit message.
+!crates/burn-gdn2/tests/ref_bwd_f64.bin
+!crates/burn-gdn2/tests/ref_bwd_f64_faults.bin
+!crates/burn-gdn2/tests/ref_bwd_f64_carry.bin
 Cargo.lock.bak
 .bulba/
