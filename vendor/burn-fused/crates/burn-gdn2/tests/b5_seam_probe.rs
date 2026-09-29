@@ -8,7 +8,9 @@
 // designed around folding the chunk axis into a 4-D batch axis because of it.
 // That claim is NOT reproducible on the pinned 0.22.0-pre.4: every op the
 // batched arm needs — swap_dims(3,4), matmul, cumsum, slice on the chunk axis,
-// permute, and a 4-D permuted view reshaped to rank 5 — is bit-exact here
+// permute, and a 4-D permuted view reshaped to rank 5 — is element-exact here
+// against the host references below (which are ours, so this is a self-consistency
+// check and not a bit-exactness claim: no external reference exists)
 // (worst deviation 0e0, asserted below, not printed). So the batched arm uses
 // rank 5 and keeps the head and chunk axes separate, which is what lets the
 // per-chunk scratch stay contiguous.

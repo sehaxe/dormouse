@@ -1,7 +1,12 @@
-//! Bit-for-bit dump harness (CPU, deterministic): one seeded input through
+//! Tensor-dump harness (CPU, deterministic): one seeded input through
 //! the per-token reference and the chunked tensor path; every tensor dumped
 //! as f32-LE + a shape file for the python/FLA cross-check. Also dumps the
 //! raw chunked output (before output()) and the output-stage weights.
+//!
+//! NOT a bit-for-bit comparison, despite this binary's name: both sides are two
+//! of our own formulations of the same recurrence, so it is a self-consistency
+//! dump and there is no external reference. Nothing here asserts anything; the
+//! cross-check is the off-tree FLA/PyTorch run it feeds. See docs/ORACLE.md.
 //!   cargo run --release -p burn-kda --example bitforbit
 
 use burn::prelude::*;
