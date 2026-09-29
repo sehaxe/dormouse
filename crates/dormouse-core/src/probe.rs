@@ -33,7 +33,16 @@ pub const JEPA: usize = 7;
 pub const DSPARK: usize = 8;
 /// The MoR router BCE was added.
 pub const MOR_BCE: usize = 9;
-pub const N_ARMS: usize = 10;
+/// TSCT retraction, per-factor arm: one host-syncing `polar_orthogonalize`
+/// per factor. This is what ran in production until 2026-09-29 and it is
+/// still the default.
+pub const RETRACT_FACTOR: usize = 10;
+/// TSCT retraction, grouped arm: `burn_spectral::retract_batched`, sync-free
+/// per shape group (`--retract-batched`). Counted because a fallback here is
+/// invisible in every other number: the batched arm computes the same
+/// matrices, so a run that silently took the slow arm prints the same loss.
+pub const RETRACT_BATCHED: usize = 11;
+pub const N_ARMS: usize = 12;
 /// Arm name per index, for assertion messages that name the thing.
 pub const NAMES: [&str; N_ARMS] = [
     "iterations",
@@ -46,6 +55,8 @@ pub const NAMES: [&str; N_ARMS] = [
     "jepa",
     "dspark",
     "mor_bce",
+    "retract_factor",
+    "retract_batched",
 ];
 
 thread_local! {

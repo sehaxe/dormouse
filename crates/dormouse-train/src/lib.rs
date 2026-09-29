@@ -94,6 +94,21 @@ pub struct TrainCfg {
     pub eval_depths: bool,
     pub retract_every: usize,
     pub retract_iters: usize,
+    /// Retract the TSCT masters in ONE grouped pass per factor shape
+    /// (`burn_spectral::retract_batched`, sync-free) instead of one
+    /// host-syncing Newton-Schulz per factor.
+    ///
+    /// Default FALSE = the per-factor path, which is what every run in the
+    /// archive used. The retraction is a FIXED per-step cost that does not
+    /// amortise (measured 2026-09-29: 52.8 ms at batch 8, 64.6 ms at batch
+    /// 32, against step times growing 244 -> 826 ms; 22% of a warm step at
+    /// batch 8), and the grouped path exists to remove exactly that - but a
+    /// flag that silently changes which of two numerical paths a run takes
+    /// belongs in the snapshot, so a resume cannot change its arm. The step
+    /// log line prints `retr_arm=batched:<n>/factor:<n>` either way
+    /// (ADR-0019: no silent arm - the two arms produce the same loss, so
+    /// nothing else in the log would say which one ran).
+    pub retract_batched: bool,
     /// Stress protocol (report §3.3): constant LR at `stress_lr`x, spike
     /// counter + p99.9 grad norm logged every `stress_every` steps.
     pub stress: bool,
@@ -157,7 +172,7 @@ impl Default for TrainCfg {
             rand_depth: false,
             eval_batches: 20,
             eval_depths: false,
-            retract_every: 1, retract_iters: 3,
+            retract_every: 1, retract_iters: 3, retract_batched: false,
             stress: false, stress_lr: 1.0, stress_every: 50,
             engram_ram: false, engram_slots: 1_000_000, host_adam_every: 1,
             warmup: true, quant_check: false, timers: false, memlog: false,
@@ -1313,7 +1328,11 @@ pub fn train_loop(
         // drift at cadence and fall back to fp32 factors when it exceeds the
         // plan's 1e-3 threshold. --retract-every / --retract-iters override.
         if step % cfg.retract_every.max(1) as u64 == 0 {
-            model.retract_tsct(cfg.retract_iters);
+            if cfg.retract_batched {
+                model.retract_tsct_batched(cfg.retract_iters);
+            } else {
+                model.retract_tsct(cfg.retract_iters);
+            }
         }
         let retr_ms = t_retr.elapsed().as_secs_f64() * 1000.0;
         let t_ema = std::time::Instant::now();
@@ -1369,7 +1388,12 @@ pub fn train_loop(
                 Some(Some(v)) => format!(" aux={v:.4}"),
                 _ => String::new(),
             };
-            println!("step {step:6} ce={ce:.3} bpb={bpb:.3} best={best:.3} lr={lr:.2e}{aux_note} {mem}");
+            println!(
+                "step {step:6} ce={ce:.3} bpb={bpb:.3} best={best:.3} lr={lr:.2e}{aux_note} \
+                 retr_arm=batched:{}/factor:{} {mem}",
+                probe::count(probe::RETRACT_BATCHED),
+                probe::count(probe::RETRACT_FACTOR),
+            );
             if let Some(s) = stress.as_ref() {
                 if let Some(line) = s.report(step) {
                     println!("  {line}");

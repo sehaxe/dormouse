@@ -1,6 +1,6 @@
 //! model - Embedding -> LoopBlock -> RMSNorm -> lm_head, all-bf16 capable
 use burn::backend::DispatchKindConversion;
-use burn::module::Module;
+use burn::module::{Module, Param, ParamId, ParamMapper};
 use burn::nn::{Embedding, EmbeddingConfig};
 use burn::tensor::{Device, DispatchTensor, FloatDType, Int, Tensor};
 use burn_rmsnorm::RMSNorm;
@@ -372,8 +372,70 @@ impl DormouseModel {
     /// autodiff tracking). Call every step during training: without it the
     /// factors drift and the quantized forward degrades into NaN.
     pub fn retract_tsct(&mut self, iters: usize) {
+        crate::probe::note(crate::probe::RETRACT_FACTOR);
         self.loop_block.retract_tsct(iters);
         self.lm_head.retract(iters);
+    }
+
+    /// The same retraction as [`Self::retract_tsct`], grouped: factors are
+    /// stacked by shape and each group is one sync-free batched Newton-Schulz
+    /// call (`burn_spectral::retract_batched`) instead of one host-syncing
+    /// `polar_orthogonalize` per factor.
+    ///
+    /// Two invariants are copied from the scalar path on purpose, because
+    /// getting them wrong is invisible rather than wrong:
+    /// - every master is handed back through `Param::from_mapped_value` with
+    ///   its OWN id and mapper - the optimizer's records are keyed by id, so
+    ///   fresh ids would silently reset every factor's momentum;
+    /// - each master's `require_grad` state is MIRRORED, not forced. The polar
+    ///   output is a non-leaf on an autodiff backend and burn-optim downgrades
+    ///   a non-leaf to a frozen master; forcing the flag would equally
+    ///   un-freeze a master the caller had frozen.
+    ///
+    /// Counted (`probe::RETRACT_BATCHED`) because this arm and the default one
+    /// produce the same numbers - a silent fallback here is a run that is
+    /// correct and 22% slower.
+    pub fn retract_tsct_batched(&mut self, iters: usize) {
+        crate::probe::note(crate::probe::RETRACT_BATCHED);
+        let mut slots = self.tsct_master_slots();
+        let mut ids: Vec<ParamId> = Vec::with_capacity(slots.len());
+        let mut maps: Vec<ParamMapper<Tensor<2>>> = Vec::with_capacity(slots.len());
+        let mut tracked: Vec<bool> = Vec::with_capacity(slots.len());
+        let mut vals: Vec<Tensor<2>> = Vec::with_capacity(slots.len());
+        for p in slots.iter() {
+            let was_tracked = p.val().is_require_grad();
+            let (id, val, map) = Param::clone(p).consume();
+            ids.push(id);
+            maps.push(map);
+            tracked.push(was_tracked);
+            vals.push(val);
+        }
+        {
+            let mut refs: Vec<&mut Tensor<2>> = vals.iter_mut().collect();
+            burn_spectral::retract_batched(&mut refs, iters);
+        }
+        for (slot, (((id, map), was_tracked), val)) in slots
+            .iter_mut()
+            .zip(ids.into_iter().zip(maps).zip(tracked).zip(vals))
+        {
+            let val = val.detach();
+            let val = if was_tracked {
+                val.set_require_grad(true)
+            } else {
+                val
+            };
+            **slot = Param::from_mapped_value(id, val, map);
+        }
+    }
+
+    /// Every TSCT master slot in the model, `u` then `v` per linear
+    /// (loop_block experts, readout, lm_head) - what
+    /// [`Self::retract_tsct_batched`] retracts.
+    pub fn tsct_master_slots(&mut self) -> Vec<&mut Param<Tensor<2>>> {
+        let mut out: Vec<&mut Param<Tensor<2>>> = Vec::new();
+        self.loop_block.push_tsct_masters(&mut out);
+        self.lm_head.push_tsct_masters(&mut out);
+        out
     }
 
     /// Worst orthonormality error across all TSCT factors (syncs the device;

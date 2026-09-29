@@ -1,6 +1,6 @@
 //! param - TSCT linear via burn-sct SpectralLinear, pad to multiple of 4,
 //! NM knob, BF16 env (mirrors aria semantics; fresh mini composition)
-use burn::module::{Module, ParamId};
+use burn::module::{Module, Param, ParamId};
 use burn::tensor::{Device, DispatchTensor, Tensor};
 use burn::backend::DispatchKindConversion;
 use burn_spectral::SpectralLinear;
@@ -177,6 +177,20 @@ impl LinearLike {
     pub fn retract(&mut self, iters: usize) {
         if let LinearLikeInner::Tsct(l) = &mut self.inner {
             l.retract(iters);
+        }
+    }
+
+    /// Append this linear's TSCT masters (`u`, then `v`) to `out` as writable
+    /// `Param` slots - the factor list a batched retraction needs. A dense
+    /// linear contributes nothing, because it has no factors to retract.
+    ///
+    /// Slots, not tensors: the batched arm must hand each result back through
+    /// `Param::from_mapped_value` with its OWN id and mapper, or the
+    /// optimizer's per-factor records (keyed by id) silently reset.
+    pub fn push_tsct_masters<'a>(&'a mut self, out: &mut Vec<&'a mut Param<Tensor<2>>>) {
+        if let LinearLikeInner::Tsct(l) = &mut self.inner {
+            out.push(&mut l.u);
+            out.push(&mut l.v);
         }
     }
 

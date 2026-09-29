@@ -138,6 +138,12 @@ struct Args {
     retract_every: Option<usize>,
     #[arg(long)]
     retract_iters: Option<usize>,
+    /// Retract the TSCT masters grouped by shape (one sync-free batched
+    /// Newton-Schulz per group) instead of one per factor. Same numbers,
+    /// fewer launches and no per-factor host syncs. Off = the per-factor
+    /// path every run in the archive used.
+    #[arg(long)]
+    retract_batched: bool,
 
     // --- stability protocol (report §3.3) ---
     #[arg(long)]
@@ -225,6 +231,7 @@ fn build_run(a: &Args) -> Result<dormouse_train::RunCfg, String> {
     train.eval_depths |= a.eval_depths;
     train.retract_every = a.retract_every.unwrap_or(train.retract_every);
     train.retract_iters = a.retract_iters.unwrap_or(train.retract_iters);
+    train.retract_batched = a.retract_batched || train.retract_batched;
     train.stress |= a.stress;
     train.stress_lr = a.stress_lr.unwrap_or(train.stress_lr);
     train.stress_every = a.stress_every.unwrap_or(train.stress_every);
