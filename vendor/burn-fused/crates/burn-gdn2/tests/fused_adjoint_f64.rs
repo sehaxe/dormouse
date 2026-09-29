@@ -81,7 +81,9 @@ fn rd_name(c: &mut Cursor<&[u8]>) -> String {
 
 fn load() -> Fixture {
     let data = include_bytes!("ref_bwd_f64.bin");
-    let mut c = Cursor::new(data);
+    // `include_bytes!` yields `&[u8; N]`; `Cursor::new` over the SLICE is what
+    // gives the `&[u8]` the rd_* readers take. Same shape as ref_f64.rs.
+    let mut c = Cursor::new(&data[..]);
     let mut m = [0u8; 8];
     c.read_exact(&mut m).unwrap();
     assert_eq!(&m, b"GDN2BFD\0", "ref_bwd_f64.bin is not this format");
