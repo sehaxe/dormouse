@@ -22,6 +22,70 @@
 //! chunked WY form (`forward_recurrent` is the exact per-token reference).
 //! A fused CUDA kernel path (`feature = "cuda"`) reuses the GDN-2 chunked
 //! kernels through the same WY mapping.
+//!
+//! # Decay init: `a_log = -3`, `b_alpha = +1` is OURS, and it is not a citation
+//!
+//! This pair has been quoted as "the Moonshot/FLA recipe". It is not in any of
+//! the three sources, and each says something different:
+//!
+//! | source | what it says |
+//! |---|---|
+//! | Kimi K3 §2.1.1, arXiv:2607.24653v2 | "We initialize `A_h = 0`", and "each bias `b_alpha^h` is initialized following [57, 24, 139]" — i.e. following Kimi Linear / GDN / Mamba-2, not Moonshot's own constant |
+//! | FLA `fla/layers/kda.py:176` (v0.5.2) | `A_log = zeros` **only under `safe_gate=True`** — the K3 lower-bounded branch, the one this crate runs as [`DecayFn::Sigmoid`] |
+//! | FLA `fla/layers/kda.py:178` | otherwise `A_log = log(U(1, 16))` |
+//! | FLA `fla/layers/kda.py:180-184` | `dt_bias = inv_dt = dt + log(-expm1(-dt))`, `dt ~ logU(0.001, 0.1)` ⇒ `inv_dt ∈ [-6.91, -2.25]`, **negative** |
+//! | FlashKDA | there is no `kda.py` in the repo (master tree `7afb9f4`); `tests/torch_ref.py` takes `A_log`/`dt_bias` as arguments and initialises nothing; its tests use `torch.rand` and `torch.full(0.0)` |
+//!
+//! So `-3` / `+1.0` are this project's own choice, kept on its own
+//! measurement: the decay init **plus** the `a_log` clamp extended the
+//! NaN-free window to 110+ steps under heavy overfit (2026-08-29, dormouse
+//! `AGENTS.md` §2.3). That record does not isolate `a_log` from the clamp or
+//! from `b_alpha`, so it does not attribute the value to a paper either. An
+//! honest "we chose this and measured it" is the whole claim.
+//!
+//! # The open discrepancy: the bias SIGN caps retention, not `A_h`
+//!
+//! Under [`DecayFn::Sigmoid`], `g = g_min·sigmoid(exp(A_h)·z)` and `z` starts at
+//! `b_alpha`. `sigmoid(u) > 1/2` for `u > 0`, so **any non-negative `z` forces
+//! `g < g_min/2 = -2.5`, i.e. `alpha < e^{g_min/2} = 0.0821`.** With
+//! `b_alpha = +1` the init sits at `alpha = 0.0771`, 94% of that ceiling, and
+//! no `A_h` lifts it: `A=+3 → 0.0067`, `A=0 → 0.0259`, `A=-10` (the clamp
+//! floor) `→ 0.0821`. The reference family reaches `alpha ≈ 0.62-0.995`
+//! because its bias is negative.
+//!
+//! | init | `alpha` | `1/(1-alpha)`, steps |
+//! |---|---|---|
+//! | ours (`A=-3`, `b=+1`) | 0.0771 | 1.08 |
+//! | the paper's `A` with our bias (`A=0`, `b=+1`) | 0.0259 | 1.03 |
+//! | our `A` with FLA's mean bias (`A=-3`, `b=-4.60`) | 0.1092 | 1.12 |
+//! | `A=0`, `b=FLA mean inv_dt` — **FLA's `safe_gate` branch** | 0.9515 | 20.6 |
+//!
+//! 12x on `alpha`, 19x on effective memory. Neither knob alone reaches it: `A`
+//! is not the lever, and the sign of the bias is not the whole lever — the pair
+//! has to move together, which is exactly what the paper's recipe does. Changing
+//! either changes initialisation and every number derived from it: that is an
+//! A/B, not a patch. Note the same pair is *benign* under [`DecayFn::Softplus`]
+//! (`alpha = 0.937`): there `exp(A_h)` is a plain multiplier on `softplus(z)`,
+//! `A = -3` damps by 20x, and nothing caps retention — and that is also the
+//! branch the `a_log` overflow clamp below exists for. Under the K3 sigmoid the
+//! midpoint is 0 rather than `softplus(0) = 0.693`, so the same pair lands at
+//! the floor. Which branch the pair was chosen for is not recoverable from this
+//! repo's history; "ours, measured" is the claim it can carry.
+//!
+//! # GVA: the decay is parameterised on the KEY-head axis
+//!
+//! `a_log` is `[num_heads, 1]` and `b_alpha` is `[num_heads * head_dim]` —
+//! [`KdaDecay::new`] is called with the key-head count, not the value-head one.
+//! FLA parameterises on the value-head axis: `gate_dim = num_v_heads *
+//! head_k_dim` and `A_log = zeros(num_v_heads)` "per value-head for native GVA
+//! support" (`fla/layers/kda.py:166-167, 174-178`). So under
+//! `num_v_heads = rep · num_heads` this crate holds `rep`× too few decay
+//! parameters and `KdaModule::project` copies the key-head decay across the
+//! group (`g_4d = r(g_4d)`). The forward is self-consistent, which is why a
+//! shape-only check calls it a match; the **parameter** is the finding. Dormouse
+//! runs `hv == h` (`dormouse-core/src/attention.rs:60` leaves `num_v_heads:
+//! None`), so it is dormant there, but both crates ship GVA. Parameter shapes are
+//! checkpoint format: changing them invalidates every burn-kda checkpoint.
 /// Paper's fixed log-space decay floor (K3 Eq 5: `g_min = -5`, alpha > e^-5).
 pub const G_MIN: f64 = -5.0;
 
@@ -127,8 +191,13 @@ pub mod fused;
 pub struct KdaDecay {
     pub w_up: Linear,
     pub w_down: Linear,
+    /// Decay-logit bias, shape `[n_heads * head_dim]`. KEY-head axis: under GVA
+    /// (`num_v_heads > num_heads`) one bias is shared across a group, where FLA
+    /// gives each value head its own (`fla/layers/kda.py:166-167, 174-178`).
+    /// See the module docs, "GVA: the decay is parameterised on the KEY-head axis".
     pub b_alpha: Param<Tensor<1>>,
-    /// Per-head log-scale `A_h` (Eq 5), shape `[n_heads, 1]`.
+    /// Per-head log-scale `A_h` (Eq 5), shape `[n_heads, 1]`. Key-head axis, same
+    /// GVA caveat as [`Self::b_alpha`].
     pub a_log: Param<Tensor<2>>,
     #[module(skip)]
     pub g_min: f64,
@@ -162,11 +231,12 @@ impl KdaDecay {
                 .with_bias(false)
                 .with_initializer(init.clone())
                 .init(device),
+            // OURS, deliberately not from any reference — the module docs
+            // ("Decay init", "The open discrepancy") carry the sources this
+            // was once misattributed to and the alpha each of them gives.
+            // Keep the numbers; changing them re-initialises the model and
+            // invalidates every checkpoint.
             b_alpha: Param::from_tensor(Tensor::ones([n_heads * head_dim], device)),
-            // Moonshot/FLA init (FlashKDA torch_ref, kda.py): A_log = -3
-            // gives exp(A) = 0.05 and dt_bias = 1.0 anchors z ~ 1, so the
-            // decay starts conservative (alpha ~ 0.08) instead of neutral
-            // (alpha ~ 0.5 at A=0, b=0). Matches the reference recipe.
             a_log: Param::from_tensor(Tensor::full([n_heads, 1], -3.0, device)),
             g_min,
             decay_fn,
@@ -822,7 +892,7 @@ mod tests {
     fn kda_decay_is_data_dependent() {
         // Eq 2: the logit is a function of x - two different inputs give
         // different decays. Inputs are scaled up so the projection term
-        // dominates the dt_bias = 1.0 anchor (Moonshot/FLA init).
+        // dominates the b_alpha = 1.0 anchor (our init, see module docs).
         let dec = KdaDecay::new(32, 2, 16, 16, G_MIN, DecayFn::Sigmoid, &dev());
         let x1 = Tensor::<3>::ones([1, 4, 32], &dev()).mul_scalar(50.0);
         let x2 = Tensor::<3>::ones([1, 4, 32], &dev()).mul_scalar(-50.0);
