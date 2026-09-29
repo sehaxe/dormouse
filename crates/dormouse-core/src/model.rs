@@ -194,14 +194,21 @@ impl DormouseModel {
             + DispatchKindConversion<B::InnerBackend>
             + DispatchKindConversion<burn::backend::Autodiff<B::InnerBackend>>,
     {
-        // DSpark's window tokens only (the JEPA teacher's input is
-        // `input_ids` above, see `forward_with_hidden`). KNOWN, NOT FIXED:
-        // these are the LABEL sequence, so the draft head's step s is fed
-        // x[p+s+1] and trained to emit x[p+s+2] - a one-position shift
-        // against the sequence the model actually consumed. Changing it
-        // changes every DSpark number, so it needs its own A/B, not a
-        // drive-by in a JEPA bugfix.
-        let ids_raw = targets.clone();
+        // DSpark's window tokens are the sequence the model CONSUMED, not the
+        // label sequence. They used to be `targets`, which put the draft
+        // head's step s one position ahead of its own base logits: it was fed
+        // x[p+s+1] - the very byte `logits[p+s]` had just predicted - and
+        // supervised toward x[p+s+2], while the hidden state it was given
+        // (h[p+s]) had only seen x[0..=p+s]. The head was handed the answer.
+        // `dspark_aux_loss`'s window arithmetic is unchanged and now reads
+        // positions in the consumed sequence, where step s's base logits and
+        // its CE target finally line up (FIXED 2026-09-29; this invalidates
+        // every DSpark number recorded before it).
+        //
+        // The GATE is still `targets.is_some()`, not `ids`: it exists so a
+        // decode forward (which passes no labels) builds no aux graph at
+        // all, not to feed the window.
+        let ids_raw = targets.as_ref().map(|_| input_ids.clone());
         let x = self.embedding.forward(input_ids);
         let x = if self.bf16 {
             x.cast(FloatDType::BF16)

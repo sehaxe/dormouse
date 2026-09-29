@@ -325,6 +325,115 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{DormouseConfig, DormouseModel};
+    use burn::backend::autodiff::Autodiff;
+    use burn::backend::autodiff::checkpoint::strategy::BalancedCheckpointing;
+    use burn::tensor::{Device, TensorData};
+
+    /// The backend alias the train crate uses for `--features cpu`;
+    /// proven to satisfy the `DispatchKindConversion` bounds the forward and
+    /// this module's loss wrapper carry.
+    type B = Autodiff<burn::backend::Flex, BalancedCheckpointing>;
+
+    /// A DSpark-carrying model small enough for a `--lib` test: the shipped
+    /// aux weights and K = 4, the widths cut to nothing. `dspark_stride = 8`
+    /// on t = 64 leaves `(64-4-1)/8 = 7` anchors, so the window is real and
+    /// the n == 0 arm is not what is under test.
+    fn mini() -> DormouseConfig {
+        DormouseConfig {
+            d_model: 32,
+            n_heads: 2,
+            head_dim: 16,
+            d_ffn: 64,
+            rank: 8,
+            max_iter: 1,
+            n_experts: 1,
+            max_seq_len: 64,
+            use_kda: false,
+            use_tsct: false,
+            engram_rows: 1024,
+            dspark_stride: 8,
+            ..DormouseConfig::default()
+        }
+    }
+
+    /// Deterministic bytes (Knuth MMIX LCG, same one the seam tests use) -
+    /// no RNG dependency, so a failure is reproducible.
+    fn bytes(seed: u64, n: usize) -> Vec<i64> {
+        let mut s = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        (0..n)
+            .map(|_| {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((s >> 33) % 256) as i64
+            })
+            .collect()
+    }
+
+    fn ids2(v: &[i64], dev: &Device) -> Tensor<2, Int> {
+        Tensor::from_data(TensorData::new(v.to_vec(), [1, v.len()]), dev)
+    }
+
+    /// The DSpark window is teacher-forced from ONE id tensor: step `s` of the
+    /// window at anchor `p` is conditioned on the byte at `p+s` and supervised
+    /// toward the byte at `p+s+1`. The tensor must therefore be the sequence
+    /// the model CONSUMED.
+    ///
+    /// It was `targets` until 2026-09-29, and because `targets` is the
+    /// label sequence (`targets[q] == x[q+1]`) the head's step `s` was fed
+    /// `x[p+s+1]` - the byte `logits[p+s]` had just predicted - and asked to
+    /// emit `x[p+s+2]`, while the hidden state it was handed, `h[p+s]`, had
+    /// only ever seen `x[0..=p+s]`. The draft head was given the answer.
+    ///
+    /// The property that pins the fix is INVARIANCE, not a golden number: the
+    /// term is a function of `(input_ids, hidden, logits)` and of nothing
+    /// else, so the label sequence cannot move it by a bit. With the old
+    /// wiring the two runs below read 0.17736106 and 0.17743118 - a 7e-5
+    /// difference on a RANDOMLY INITIALIZED head - and this test is red.
+    #[test]
+    fn dspark_aux_does_not_read_the_label_sequence() {
+        let dev = Device::flex().autodiff();
+        let cfg = mini();
+        let model = DormouseModel::new(&cfg, &dev);
+        let t = cfg.max_seq_len;
+        let x = bytes(0xD5, t);
+        // The real trainer's labelling: y[q] = x[q+1].
+        let y_shift: Vec<i64> = x[1..].iter().chain(std::iter::once(&x[0])).copied().collect();
+        // A second, unrelated labelling of the same input.
+        let y_other = bytes(0x1F, t);
+
+        let run = |y: &[i64]| -> f32 {
+            model
+                .forward_with_hidden::<B>(ids2(&x, &dev), None, None, Some(ids2(y, &dev)), None)
+                .3
+                .expect("dspark_weight > 0 with labels given must return an aux term")
+                .into_scalar::<f32>()
+        };
+        let a = run(&y_shift);
+        let b = run(&y_other);
+        assert!(
+            (a - b).abs() < 1e-6,
+            "the DSpark term read the LABELS: {a} vs {b} for the same input"
+        );
+        assert!(a.is_finite() && a != 0.0, "the term is vacuous at {a}, so invariance is free");
+        // Non-vacuity in the other direction: it IS a function of the input
+        // the backbone consumed (an always-zero aux would pass the above).
+        let x2: Vec<i64> = x.iter().map(|&v| (v + 97) % 256).collect();
+        let c = model
+            .forward_with_hidden::<B>(
+                ids2(&x2, &dev),
+                None,
+                None,
+                Some(ids2(&y_shift, &dev)),
+                None,
+            )
+            .3
+            .expect("aux")
+            .into_scalar::<f32>();
+        assert!(
+            (a - c).abs() > 1e-4,
+            "the DSpark term ignores the consumed sequence too: {a} vs {c}"
+        );
+    }
 
     /// ADR-0021: the mask is a pure function of `(seed, step)`. The whole
     /// point of the change is that property, so it is the thing asserted -

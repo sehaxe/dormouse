@@ -707,9 +707,24 @@ The defenses are installed, not optional.
   that nothing can detect. The fix is a `train_step` field in the header and a
   refusal to load a mismatched pair — deferred because it invalidates an 18 GB
   production artifact and that wants its own decision.
-- **DSpark's window is one position shifted** (`model.rs:197-203`): the draft
-  head's step *s* is fed `x[p+s+1]` and trained to emit `x[p+s+2]`. Fixing it
-  changes every DSpark number, so it needs its own A/B.
+- **DSpark's window was one position shifted — FIXED 2026-09-29, and it
+  invalidates every DSpark number this project has ever recorded.** The window
+  was built from `targets`, the LABEL sequence, so with `targets[q] == x[q+1]`
+  the draft head's step *s* was fed `x[p+s+1]` — the very byte `logits[p+s]`
+  had just predicted — and supervised toward `x[p+s+2]`, while the hidden
+  state it was handed, `h[p+s]`, had only seen `x[0..=p+s]`. The head was
+  handed the answer, one step early. `dspark_aux_loss`'s window arithmetic
+  (`aux.rs:263-282`) was correct throughout and is unchanged; the fix is one
+  line in `model.rs` (feed the teacher's `input_ids`, gate still on
+  `targets.is_some()` so a decode forward builds no aux graph). Gate:
+  `aux::tests::dspark_aux_does_not_read_the_label_sequence` — the DSpark term
+  is a function of `(input_ids, hidden, logits)` and of nothing else, so the
+  label sequence must not move it; with the bug it reads 0.17736106 vs
+  0.17743118. **No DSpark number survives it**: every run with
+  `dspark_weight > 0` measured a different objective and trained its aux heads
+  on it. Nothing in `~/logs/`, `benches/history.tsv` or `docs/` is a DSpark
+  result, so there is no number to retract — but the next one is a first
+  measurement, not a continuation.
 - **`dspark_stride`** is a config field with no documented meaning anywhere.
 - **Adaptive depth is only an arm**: `--rand-depth` (sample `T` per step) and
   MoR (rank the slots per position) both exist, are mutually exclusive by a
