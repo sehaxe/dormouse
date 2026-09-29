@@ -622,32 +622,41 @@ one exists because breaking it cost a run, a week, or a claim.
    a fixed step budget with 3 seeds per arm, or it is deleted. PonderNet was
    deleted this way. Anything inside the control's own seed spread is "no
    difference", and no difference means gone.
-3. **No host read in the hot loop, and it is measured, not asserted.** The
-   trainer's step body reads nothing back from the device. The four host reads
-   that exist in the loop are each behind a guard, and a run proves the guards
-   hold by counting what escapes:
+3. **The step's OWN body reads nothing back. The retraction does — 112 times.**
+   This corrects a claim this file made hours ago. It said "no host read in
+   the hot loop" with a five-row measurement table, and the table had no
+   retraction-off arm, so it generalised from the forward/backward/optimizer
+   body to the whole step. It was wrong.
 
-   | check | result |
-   |---|---|
-   | 40 steps, `--log-every 10` | **4** log lines — one read per log step, none on the other 36 |
-   | 40 steps, `--log-every 10000` | **1** log line |
-   | 60 steps, `--log-every 5` vs `--log-every 10000` | **142 s vs 141 s** wall (2 rounds each, both 140–142) — the reads are not measurable in step time |
-   | `--timers` on vs off, 60 steps | **142 s vs 142 s** — and `--timers` *adds* a `try_into_scalar`, so this measures a run that deliberately syncs |
-   | `bwd` on a warm log step | **99–100 ms**, against 246–248 ms total: a read that costs no measurable time |
+   What the corrected claim is, and how it is measured:
 
-   Measured 2026-09-29, release, `small` 9 195 854 params, batch 8 × seq 512,
-   depth 2, fp32, aux off, `--no-engram`, `CUBECL_AUTOTUNE_LEVEL=3`.
+   | part of a step | host reads | evidence |
+   |---|---|---|
+   | forward, backward, optimizer, EMA | **0** on a non-log step | the four reads at `lib.rs` are each behind a guard; 40 steps at `--log-every 10` produce 4 log lines, at `10000` produce 1; 60 steps at log 5 vs log 10000 cost 142 s vs 141 s; `--timers` on/off 142 s vs 142 s and `--timers` *adds* a `try_into_scalar` |
+   | **TSCT retraction** | **112 per step, unguarded, uncounted** | 16 TSCT factors at `small` (3 experts × 2 LinearLike × 2 factors, plus `out_proj` and `lm_head`) × 7 `into_scalar` at `burn-spectral/src/lib.rs:186,197,198,649,653,656` |
 
-   **The honest limit of this claim:** zero *reads* is not zero
-   *synchronization* — the driver may still block inside a kernel launch, and
-   the measurement above cannot see that. What it does establish is that no
-   host round-trip is on the step's critical path. A sync added for convenience
-   is a step-time regression wearing a disguise; one that costs nothing has to
-   be justified anyway, because the next arm may not be launch-bound.
-   Corollary, learned the hard way: **never build a numeric indicator from a bool
-   tensor on device — count on the host.** `mask_fill` writes in place through a
-   buffer that `clone()` shares, and a counting indicator built that way
-   reported 50 false non-finite losses per 50-step window.
+   The retraction's 112 syncs are the 52.8 ms it costs: 52.8 ms / 112 ≈ 0.47 ms
+   per sync, which is what a blocking device read costs. `--retract-every 1000`
+   gives `retr = 0.0` and a 188 ms step against 240 — the difference is those
+   reads, not the arithmetic. **The sync is the cost, not the math:** a reviewer
+   showed the `σ_max` power iteration inside the retraction is provably
+   unnecessary — a unit-Frobenius input has `σ_max ≤ 1` by Cauchy–Schwarz, and
+   the cubic's basin is exactly `[0, 1]` — so those reads can simply not be
+   needed. That is a 5-line change, against 52.8 ms → ~17 ms.
+
+   So the honest statement is: **the step's own body is sync-free; the
+   retraction is a fixed 112-read tax, and it is 22% of a warm step at batch 8.**
+   A `retract_batched` implementation that removes them already exists
+   (`burn-spectral/src/lib.rs:275`), is unit-tested, and **is never called** —
+   the tests are the only callers.
+
+   **And it must not be wired as written.** It takes `&mut [&mut Tensor<2>]`,
+   cannot reach `Param::from_mapped_value`, and `polar_orthogonalize_batched`
+   contains no `.detach()`. The scalar path documents at length why that
+   matters: a stored non-leaf is silently downgraded to an untracked leaf and
+   **the master freezes** — and all four batched tests run on `Device::ndarray`
+   where `is_require_grad` is never true, so they would pass while the model
+   stopped training.
 4. **A bit-for-bit claim must name the external source.** "Verified against the
    reference" is not a claim; "verified against `NVlabs/GatedDeltaNet-2`,
    `lit_gpt/gdn2_ops/fused_recurrent_gdn2.py`, tolerance 5e-4, harness at
