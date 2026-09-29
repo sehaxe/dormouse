@@ -341,7 +341,16 @@ One sentence per mechanism, and why it is there:
 - **Aux objectives, on by default** — JEPA masked-latent prediction against an
   EMA teacher (weight 0.05) + KoLeo, and a DSpark draft head for next-K
   prediction (weight 0.1, K = 4). Both have never been A/B'd against pure CE;
-  `--jepa-weight 0 --dspark-weight 0` is arm 1 of the queue.
+  `--jepa-weight 0 --dspark-weight 0` is arm 1 of the queue. The DSpark term was
+  repaired on 2026-09-29 and **has no valid number yet**: its teacher-forced
+  window read the label sequence, so the draft head was handed the very byte
+  its own base logits had just predicted (it now reads the consumed sequence),
+  and its acceptance head was a `w^T[h_k]` stand-in rather than the paper's
+  `sigmoid(w^T[h_k; W1[x_{k-1}]])`. Windows are placed every `dspark_stride`
+  = 16 positions instead of the paper's random anchors — a determinism fix
+  (ADR-0021), not an approximation the A/B has confirmed. The head's projection
+  grew from `[d_model, 1]` to `[d_model + rank, 1]`, so a pre-2026-09-29
+  checkpoint is refused at load rather than silently reshaped.
 
 ---
 

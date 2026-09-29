@@ -725,7 +725,24 @@ The defenses are installed, not optional.
   on it. Nothing in `~/logs/`, `benches/history.tsv` or `docs/` is a DSpark
   result, so there is no number to retract — but the next one is a first
   measurement, not a continuation.
-- **`dspark_stride`** is a config field with no documented meaning anywhere.
+- **`dspark_stride`** is the ANCHOR SPACING of the DSpark window, in byte
+  positions (the stream is bytes, so one position is one byte; not a token
+  count, not a fraction). Windows start at `p = 0, stride, 2·stride, …` and
+  the anchor count is `floor((t − k − 1) / stride)`, so the first anchor needs
+  `t ≥ k + 1 + stride` and a shorter sequence gets NO window and an exactly
+  zero term. Default **16**, which at `k = 4` / `seq_len = 512` is **31
+  anchors** (`p = 0 … 480`) — i.e. the field is a *sampling density* (`1` = a
+  window at every position, `16` = ~6% of positions) and the term's cost
+  scales with the anchor count. `0` is refused loudly by `config::validate`.
+  **Why striding and not the paper's random anchor sampling**: sampling is a
+  second RNG stream, and burn's global RNG is never seeded — the same defect
+  that forced the JEPA mask to be rebuilt from `(seed, step)` (ADR-0021). Two
+  runs of one config drew different anchor sets, no A/B was reproducible and a
+  resume changed the objective. A fixed stride is the same coverage per step
+  with none of that; it is a determinism fix, and it has never been A/B'd
+  against sampling, so "deterministic and documented" is the claim — not
+  "equivalent to the paper's estimator". Gate:
+  `aux::tests::dspark_stride_is_the_anchor_spacing`.
 - **Adaptive depth is only an arm**: `--rand-depth` (sample `T` per step) and
   MoR (rank the slots per position) both exist, are mutually exclusive by a
   loud refusal in `resolve`, and neither has been A/B'd against fixed depth.
@@ -992,6 +1009,16 @@ Ranked applicability:
   anti-collapse; DSpark = DeepSeek-style draft head correcting frozen logits into
   the next-K tokens (burn-dspark, used instead of MTP; gamma 4.0). Aux value is
   logged as `aux=` on log steps. Set both weights to 0 for the pure-CE baseline.
+  Three things about the DSpark term that are not visible from the flags, all
+  fixed/documented 2026-09-29: the window is teacher-forced from the **consumed**
+  sequence (it read the labels it was asked to predict — §3.3, and that
+  invalidates every DSpark number ever recorded); the acceptance head is
+  Eq. 7's markov-conditioned `sigmoid(w^T[h_k; W1[x_{k-1}]])` over the draft
+  head's own `W1` (it was a `w^T[h_k]` stand-in with `with_markov` uncalled, so
+  its projection is now `[d_model + rank, 1]` and an older checkpoint's
+  `[d_model, 1]` is refused at load); and `dspark_stride` is the anchor spacing
+  in byte positions, default 16, never A/B'd against the paper's random anchor
+  sampling (§3.3).
 - `--jepa-precompute N` + `--jepa-targets <file>` — offline teacher latents: one
   forward per batch, no optimizer, no EMA advance; the hot loop then runs no
   second forward and no teacher at all.

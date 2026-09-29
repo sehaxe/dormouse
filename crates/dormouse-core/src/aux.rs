@@ -34,6 +34,19 @@ const KOLEO_WEIGHT: f32 = 0.1;
 pub struct AuxHeads {
     pub jepa_pred: JepaPredictor,
     pub dspark: RNNHead,
+    /// The acceptance head, paper Eq. 7: `sigmoid(w^T[h_k ; W1[x_{k-1}]])`.
+    /// Markov-CONDITIONED, and that is the whole point: the previous draft
+    /// token is the mechanism, so a `w^T[h_k]` stand-in is a different head
+    /// (it was, until 2026-09-29, and it had no caller for
+    /// `AcceptRatePredictor::with_markov` at all).
+    ///
+    /// Its projection is `[d_model + rank, 1]`, so a checkpoint written
+    /// before that date carries `[d_model, 1]` here and burnpack REFUSES the
+    /// load with a shape-mismatch validation error naming the path
+    /// (`load_record` validates by default). That is the loud outcome: the
+    /// head trained on the one-position-shifted window and is worthless
+    /// now, and there is no partial-load flag in this trainer to paper over
+    /// it with.
     pub conf: AcceptRatePredictor,
 }
 
@@ -42,7 +55,10 @@ impl AuxHeads {
         Self {
             jepa_pred: JepaPredictor::new(d_model, device),
             dspark: RNNHead::new(vocab, rank, d_model, device),
-            conf: AcceptRatePredictor::new(d_model, device),
+            // `rank` is the width `W1` emits, i.e. the same table the draft
+            // head conditions on - the conditioning input of Eq. 7, not a
+            // second embedding of its own.
+            conf: AcceptRatePredictor::with_markov(d_model, rank, device),
         }
     }
 }
@@ -234,6 +250,33 @@ pub fn ema_update<M: Module>(teacher: M, student: &M, momentum: f64) -> M {
 /// DSpark auxiliary loss: the draft head corrects frozen backbone logits
 /// into the next-K tokens at strided anchor positions. `hidden` carries
 /// gradients into the backbone; `logits` enter detached (frozen target).
+///
+/// # `stride` — the anchor SPACING
+///
+/// `stride` is a distance in BYTE POSITIONS (the sequence is a byte stream,
+/// so a "position" is one byte), not a token count and not a fraction. The
+/// window of `k` draft steps starts at every `stride`-th position:
+/// `p_i = i * stride` for `i = 0, 1, ..., n-1`, and the anchor count is
+/// `n = (t - k - 1) / stride` (floor), which keeps the whole window inside
+/// the sequence. The consequence worth knowing: the first anchor needs
+/// `t >= k + 1 + stride`, so a sequence shorter than that gets NO window and
+/// the term is exactly zero. At the shipped `dspark_stride = 16`, `k = 4`
+/// and `seq_len = 512` that is **31 anchors, at p = 0, 16, ..., 480**. So `stride`
+/// is a *sampling density*: `stride = 1` is a window at every position,
+/// `stride = 16` trains on ~6% of the positions, and the cost of the term
+/// (K gathers of `[b, n, v]` plus the RNN's `k` steps) scales with `n`.
+/// `stride = 0` is refused loudly by `config::validate` — it would collapse
+/// the K-step window into K copies of one CE at position 0.
+///
+/// **Why striding and not random sampling.** The paper samples the anchors at
+/// random every step. That is a second RNG stream, and this trainer's mask
+/// stream had to be rebuilt from `(seed, step)` for exactly this reason
+/// (ADR-0021): burn's global RNG is never seeded, so two runs of one config
+/// drew different anchor sets, no A/B was reproducible, and a resume
+/// changed the objective. A fixed stride is the same coverage per step with
+/// none of that. It is a determinism fix, not an approximation of the
+/// paper's estimator, and it has never been A/B'd against sampling — the
+/// honest statement is "deterministic and documented", not "equivalent".
 pub fn dspark_aux_loss(
     dspark: &burn_dspark::RNNHead,
     conf: &AcceptRatePredictor,
@@ -249,7 +292,8 @@ where
     let [b, t, d] = hidden.dims();
     let v = logits.dims()[2];
     let k = k.max(1);
-    // Anchors p_i = i*stride with the whole draft window inside the sequence.
+    // Anchors p_i = i*stride (see the doc above for what stride is): with the
+    // whole draft window inside the sequence, `n = floor((t-k-1)/stride)`.
     let n = if t > k + 1 { (t - k - 1) / stride.max(1) } else { 0 };
     if n == 0 {
         return Tensor::zeros([1], &hidden.device());
@@ -305,10 +349,16 @@ where
     // Draft = frozen base logits corrected by the recurrent head; the head
     // and the backbone (through the hidden states) train jointly.
     let draft = dspark
-        .apply_block_logits(base_win, token_ids, hidden_win.clone())
+        .apply_block_logits(base_win, token_ids.clone(), hidden_win.clone())
         .reshape([b * n, k, v]);
+    // Eq. 7: the acceptance head sees the PREVIOUS DRAFT TOKEN as well as
+    // the hidden state, through the draft head's own `W1` - the same
+    // mechanism the paper's `W1[x_{k-1}]` names, not a second embedding.
+    // `token_ids` is the window's conditioning token per step, which is
+    // exactly the token this step's own prediction is verified against.
+    let prev_emb = dspark.get_prev_embeddings(token_ids.reshape([b * n, k]));
     let conf_logits = conf
-        .prob(hidden_win.reshape([b * n, k, d]), None)
+        .prob(hidden_win.reshape([b * n, k, d]), Some(prev_emb))
         .reshape([b * n, k, 1]);
     let mask = Tensor::<2>::ones([b * n, k], &draft.device());
     let (total, _ce, _tv, _conf) = dspark_loss(
@@ -328,7 +378,7 @@ mod tests {
     use crate::{DormouseConfig, DormouseModel};
     use burn::backend::autodiff::Autodiff;
     use burn::backend::autodiff::checkpoint::strategy::BalancedCheckpointing;
-    use burn::tensor::{Device, TensorData};
+    use burn::tensor::{Device, Distribution, TensorData};
 
     /// The backend alias the train crate uses for `--features cpu`;
     /// proven to satisfy the `DispatchKindConversion` bounds the forward and
@@ -417,6 +467,10 @@ mod tests {
         assert!(a.is_finite() && a != 0.0, "the term is vacuous at {a}, so invariance is free");
         // Non-vacuity in the other direction: it IS a function of the input
         // the backbone consumed (an always-zero aux would pass the above).
+        // The two tolerances sit on purpose and neither sits on a value:
+        // the invariance bound is 1e-6, the sensitivity measures 2.8e-5 on a
+        // randomly initialized head, and the LABEL leak moves the term by
+        // 7.0e-5 - so the gate separates the three cases with margin.
         let x2: Vec<i64> = x.iter().map(|&v| (v + 97) % 256).collect();
         let c = model
             .forward_with_hidden::<B>(
@@ -430,9 +484,168 @@ mod tests {
             .expect("aux")
             .into_scalar::<f32>();
         assert!(
-            (a - c).abs() > 1e-4,
+            (a - c).abs() > 1e-6,
             "the DSpark term ignores the consumed sequence too: {a} vs {c}"
         );
+    }
+
+    /// THE MARKOV PATH IS THE ONE THAT RUNS. Two halves, both mechanical:
+    ///
+    /// 1. the head `AuxHeads` builds is the markov-conditioned one - it
+    ///    accepts `[h; W1[x]]` and REFUSES `None`, which a hidden-only head
+    ///    would accept;
+    /// 2. the loss wrapper feeds it that embedding - a hidden-only head
+    ///    handed to the same wrapper panics, because the wrapper passes
+    ///    `Some(..)`.
+    ///
+    /// Between them, a regression to `prob(h, None)` cannot be green: the
+    /// first test would panic on the shape, the second on the missing
+    /// embedding. `burn_dspark`'s own
+    /// `accept_rate_predictor_reads_the_previous_token` shows the two heads
+    /// are not the same function.
+    #[test]
+    fn dspark_window_runs_only_on_the_markov_confidence_head() {
+        let dev = Device::flex().autodiff();
+        let cfg = mini();
+        let heads = AuxHeads::new(cfg.d_model, cfg.vocab, cfg.rank, &dev);
+        let (b, t) = (1, cfg.max_seq_len);
+        let v = cfg.vocab;
+        let hidden = Tensor::<3>::random([b, t, cfg.d_model], Distribution::Normal(0.0, 1.0), &dev);
+        let logits = Tensor::<3>::random([b, t, v], Distribution::Normal(0.0, 1.0), &dev);
+        let ids: Vec<i64> = bytes(0x3C, b * t);
+        let ids = Tensor::from_data(TensorData::new(ids, [b, t]), &dev);
+        let l = dspark_aux_loss(
+            &heads.dspark,
+            &heads.conf,
+            hidden.clone(),
+            logits,
+            ids.clone(),
+            cfg.dspark_k,
+            cfg.dspark_stride,
+        );
+        let got = l.into_scalar::<f32>();
+        assert!(got.is_finite() && got > 0.0, "the window must produce a real term, got {got}");
+
+    }
+
+    /// Half 1: the head `AuxHeads` builds cannot run without the token at
+    /// all. A hidden-only head accepts `None` happily, so this panic IS the
+    /// assertion - and it is the half that fails if the constructor goes
+    /// back to `AcceptRatePredictor::new`.
+    #[test]
+    #[should_panic(expected = "predictor expects Markov embeddings")]
+    fn the_confidence_head_cannot_run_without_the_previous_token() {
+        let dev = Device::flex();
+        let cfg = mini();
+        let heads = AuxHeads::new(cfg.d_model, cfg.vocab, cfg.rank, &dev);
+        let h = Tensor::<3>::zeros([1, 2, cfg.d_model], &dev);
+        assert_eq!(
+            heads.conf.prob(h.clone(), Some(Tensor::zeros([1, 2, cfg.rank], &dev))).dims(),
+            [1, 2, 1]
+        );
+        let _ = heads.conf.logit(h, None);
+    }
+
+    /// Eq. 7's mechanism, asserted from this side of the boundary: the
+    /// acceptance logit must MOVE with the previous token, and the
+    /// hidden-only head must be a constant. `burn_dspark`'s own
+    /// `accept_rate_predictor_reads_the_previous_token` says the same thing
+    /// at the type; this copy is the one the repo's gate actually runs
+    /// (`tools/wt.sh test` builds the vendor crates as dependencies, never
+    /// their test targets).
+    ///
+    /// The projection is bias-free, so a ZERO hidden state leaves the markov
+    /// block as the only live input - the isolation is by construction, not
+    /// by surgery on private weights.
+    #[test]
+    fn the_confidence_head_reads_the_previous_draft_token() {
+        const D: usize = 8;
+        const R: usize = 4;
+        let dev = Device::flex();
+        let markov = burn_dspark::VanillaMarkov::new(64, R, &dev);
+        let p = AcceptRatePredictor::with_markov(D, R, &dev);
+        let h = Tensor::<3>::zeros([1, 3, D], &dev);
+        let token = |i: i64| -> Tensor<2, Int> {
+            Tensor::from_data(TensorData::new(vec![i, 1 + i, 2 + i], [1, 3]), &dev)
+        };
+        let logit = |t: i64| -> Vec<f32> {
+            p.logit(h.clone(), Some(markov.get_prev_embeddings(token(t))))
+                .into_data()
+                .try_to_vec()
+                .unwrap()
+        };
+        let (a, b) = (logit(1), logit(9));
+        let moved: f32 = (0..a.len()).map(|i| (a[i] - b[i]).abs()).fold(0.0, f32::max);
+        assert!(moved > 1e-4, "the markov head ignores W1[x]: {a:?} vs {b:?}");
+        let hidden_only: Vec<f32> =
+            AcceptRatePredictor::new(D, &dev).prob(h, None).into_data().try_to_vec().unwrap();
+        assert!(
+            hidden_only.iter().all(|x| (x - 0.5).abs() < 1e-6),
+            "a bias-free hidden-only head on a ZERO hidden state is sigmoid(0): {hidden_only:?}"
+        );
+    }
+
+    /// A hidden-only head CANNOT serve this window: the wrapper hands it the
+    /// previous token's embedding, which it was not sized for. Loud, by
+    /// construction, on both sides (ADR-0019) - there is no arm here that
+    /// quietly degrades to `w^T[h_k]`.
+    #[test]
+    #[should_panic(expected = "predictor was built hidden-only")]
+    fn dspark_window_refuses_a_hidden_only_confidence_head() {
+        let dev = Device::flex().autodiff();
+        let cfg = mini();
+        let heads = AuxHeads::new(cfg.d_model, cfg.vocab, cfg.rank, &dev);
+        let (b, t) = (1, cfg.max_seq_len);
+        let hidden = Tensor::<3>::random([b, t, cfg.d_model], Distribution::Normal(0.0, 1.0), &dev);
+        let logits = Tensor::<3>::random([b, t, cfg.vocab], Distribution::Normal(0.0, 1.0), &dev);
+        let ids = Tensor::from_data(TensorData::new(bytes(0x3C, b * t), [b, t]), &dev);
+        let _ = dspark_aux_loss(
+            &heads.dspark,
+            &AcceptRatePredictor::new(cfg.d_model, &dev),
+            hidden,
+            logits,
+            ids,
+            cfg.dspark_k,
+            cfg.dspark_stride,
+        );
+    }
+
+    /// The documented meaning of `stride`, made checkable: it is the anchor
+    /// SPACING in byte positions, and the count of windows it leaves is
+    /// `floor((t - k - 1) / stride)` - so there is a length below which the
+    /// field buys nothing at all, and that boundary is where the doc's
+    /// "31 anchors at t=512, k=4, stride=16" comes from. (These off-by-ones
+    /// are not decorative: the first draft of this test claimed the first
+    /// window fits at `t = k + 2` and the run below refused it. It needs
+    /// `t >= k + 1 + stride`.)
+    ///
+    /// The `n == 0` arm returning a real zero (rather than a tiny term) is
+    /// also the one ADR-0019 lists as site 32; this pins the value, not the
+    /// count, because a count that nobody can read off the loss is exactly
+    /// what made that site invisible.
+    #[test]
+    fn dspark_stride_is_the_anchor_spacing() {
+        let dev = Device::flex().autodiff();
+        let cfg = mini();
+        let heads = AuxHeads::new(cfg.d_model, cfg.vocab, cfg.rank, &dev);
+        let (k, v) = (cfg.dspark_k, cfg.vocab);
+        let run = |t: usize, stride: usize| -> f32 {
+            let hidden = Tensor::<3>::random([1, t, cfg.d_model], Distribution::Normal(0.0, 1.0), &dev);
+            let logits = Tensor::<3>::random([1, t, v], Distribution::Normal(0.0, 1.0), &dev);
+            let ids = Tensor::from_data(TensorData::new(bytes(0x77, t), [1, t]), &dev);
+            dspark_aux_loss(&heads.dspark, &heads.conf, hidden, logits, ids, k, stride)
+                .into_scalar::<f32>()
+        };
+        let stride = 16usize;
+        // n = 0 below t = k + 1 + stride, and the term is then exactly zero.
+        assert_eq!(run(k + stride, stride), 0.0, "t = k + stride leaves (stride-1)/stride = 0");
+        assert!(run(k + stride + 1, stride) > 0.0, "t = k + stride + 1 fits the first window");
+        // The doc's arithmetic, t = 512 / k = 4 / stride = 16 -> 31 anchors.
+        assert_eq!((512 - 4 - 1) / 16, 31, "the anchor count the doc quotes");
+        // One position short of spanning the gap is no window; exactly
+        // spanning it is the single window at p = 0.
+        assert_eq!(run(64, 64), 0.0, "stride wider than t - k - 1 leaves nothing");
+        assert!(run(64, 59) > 0.0, "stride == t - k - 1 must leave the single window at p = 0");
     }
 
     /// ADR-0021: the mask is a pure function of `(seed, step)`. The whole

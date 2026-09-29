@@ -199,6 +199,15 @@ impl RNNHead {
         (new_state, bias.squeeze_dim::<2>(1))
     }
 
+    /// `W1[x]` for the tokens feeding each step: the head's OWN Markov
+    /// embedding table, the `W1` of Eq. 6. Exposed because the acceptance
+    /// head of Eq. 7 is conditioned on the same embedding, and this module
+    /// holds the only copy of `W1` in the model - a second table would be a
+    /// second, unrelated `W1`.
+    pub fn get_prev_embeddings(&self, token_ids: Tensor<2, Int>) -> Tensor<3> {
+        self.inner.get_prev_embeddings(token_ids)
+    }
+
     /// Teacher-forced block application (DeepSpec `apply_block_logits`):
     /// `base_logits [B, N, L, V]`, `token_ids [B, N, L]` (previous ids per
     /// position), `hidden_states [B, N, L, d]`.
