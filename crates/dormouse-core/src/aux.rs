@@ -489,20 +489,12 @@ mod tests {
         );
     }
 
-    /// THE MARKOV PATH IS THE ONE THAT RUNS. Two halves, both mechanical:
-    ///
-    /// 1. the head `AuxHeads` builds is the markov-conditioned one - it
-    ///    accepts `[h; W1[x]]` and REFUSES `None`, which a hidden-only head
-    ///    would accept;
-    /// 2. the loss wrapper feeds it that embedding - a hidden-only head
-    ///    handed to the same wrapper panics, because the wrapper passes
-    ///    `Some(..)`.
-    ///
-    /// Between them, a regression to `prob(h, None)` cannot be green: the
-    /// first test would panic on the shape, the second on the missing
-    /// embedding. `burn_dspark`'s own
-    /// `accept_rate_predictor_reads_the_previous_token` shows the two heads
-    /// are not the same function.
+    /// THE MARKOV PATH IS THE ONE THAT RUNS. This is half 2 of the pair with
+    /// `the_confidence_head_cannot_run_without_the_previous_token` (half 1):
+    /// the loss wrapper feeds the head the previous token's embedding, so a
+    /// regression to `prob(h, None)` panics on the markov head instead of
+    /// running. Both halves must stay green together, and both are shown red
+    /// against the wiring they forbid.
     #[test]
     fn dspark_window_runs_only_on_the_markov_confidence_head() {
         let dev = Device::flex().autodiff();
@@ -517,15 +509,14 @@ mod tests {
         let l = dspark_aux_loss(
             &heads.dspark,
             &heads.conf,
-            hidden.clone(),
+            hidden,
             logits,
-            ids.clone(),
+            ids,
             cfg.dspark_k,
             cfg.dspark_stride,
         );
         let got = l.into_scalar::<f32>();
         assert!(got.is_finite() && got > 0.0, "the window must produce a real term, got {got}");
-
     }
 
     /// Half 1: the head `AuxHeads` builds cannot run without the token at
