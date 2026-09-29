@@ -13,25 +13,14 @@ test-core = "test -p dormouse-core --lib"
 test-data = "test -p dormouse-data --lib"
 test-train = "test -p dormouse-train --lib"
 
-# sccache: ABSOLUTE path under `build.rustc-wrapper`, NOT under `[env]`.
-#
-# `[env] RUSTC_WRAPPER` is a NO-OP. Cargo reads RUSTC_WRAPPER out of its OWN
-# environment when it starts, then applies `[env]` to the processes it spawns -
-# too late to affect its own decision. Measured on this tree: with the wrapper
-# only in `[env]`, `cargo check -p dormouse-data` after a `touch` gave sccache
-# 0 requests; with the identical value exported in the real environment, the
-# same command gave 7. 0 requests, 0 hits, cold cache, while 10 rustc
-# processes ran - and no error anywhere to say why.
-#
-# It matters here: the vendored burn-fused crates are PATH deps, so their
-# fingerprint is per-worktree and every fresh worktree recompiles 753 packages
-# from source. A cold worktree build costs >= 23 min (AGENTS.md 2.5). That is
-# the exact case a compile cache exists for.
-[build]
-rustc-wrapper = "/home/sehaxe/.cargo/bin/sccache"
+# NO `rustc-wrapper` HERE, ON PURPOSE. sccache is a property of this machine -
+# an absolute path to a binary that exists nowhere else - and cargo hard-errors
+# on a rustc-wrapper it cannot execute, so putting it in the committed config
+# killed both jobs in .github/workflows/ci.yml (2026-09-29). It lives in
+# ~/.cargo/config.toml instead, which cargo reads for every invocation
+# regardless of PATH. The failure was silent locally and fatal remotely: a
+# green local run and a dead CI, from the same line.
 
-[env]
-SCCACHE_CACHE_SIZE = "20G"
 # cudarc's build script dies on CUDA toolkit 13.4 without a pinned version;
 # every fresh target dir needs this (set once here instead of per shell).
 CUDARC_CUDA_VERSION = "12050"
