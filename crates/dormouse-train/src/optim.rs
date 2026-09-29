@@ -66,24 +66,71 @@ use std::sync::atomic::Ordering::Relaxed;
 use crate::{Optim, TrainCfg};
 
 /// How many times a fused Muon+ CUDA kernel was asked for and answered with
-/// the tensor-ops path instead. `false` from `momentum_cuda`/`finalize_cuda`
-/// means "not a bare cubecl tensor" or "empty", and the tensor path computes
-/// the same function - so without a counter the fused optimizer kernel can be
-/// dead for a whole run and the log looks identical (ADR-0019; the head-wise
-/// Q/K group this guards is ON in every run, `qk_heads` is always resolved).
+/// the tensor-ops path instead, as `(momentum, finalize)` summed over BOTH
+/// implementations of the Muon update: [`HeadWiseMuon`] here, and
+/// `MuonPlus::step` in the crate.
+///
+/// The sum is the point. This counter used to live only in `HeadWiseMuon`, so
+/// the `muon_skipped=mom/finalize` field on the eval line counted the two Q/K
+/// weights and said nothing about the much larger `Group::Muon` population
+/// (the TSCT factors and the Engram key projections), whose fused path could
+/// have been dead for an entire run with a log that read the same. Both
+/// implementations now increment the same statics, and the field is the
+/// optimizer's, not one group's.
+///
+/// `false` from `momentum_cuda`/`finalize_cuda` means "not a bare cubecl
+/// tensor" or "empty", and the tensor path computes the same function (ADR-0019;
+/// the head-wise Q/K group is ON in every run, `qk_heads` is always resolved).
 pub fn fused_kernels_skipped() -> (u64, u64) {
-    (SKIPPED_MOMENTUM.load(Relaxed), SKIPPED_FINALIZE.load(Relaxed))
+    (
+        SKIPPED_MOMENTUM.load(Relaxed) + burn_muon_plus::fused_skipped().0,
+        SKIPPED_FINALIZE.load(Relaxed) + burn_muon_plus::fused_skipped().1,
+    )
 }
 /// Present on every build so [`fused_kernels_skipped`] has one answer: with
 /// no cuda feature the fused kernels are never asked, and `(0, 0)` says so.
 static SKIPPED_MOMENTUM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SKIPPED_FINALIZE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Newton-Schulz iterations for Muon+ orthogonalization. Report §3.1: 8 for
-/// stability (the Muon+ paper default is 5).
+/// Newton-Schulz iterations for Muon+ orthogonalization.
+///
+/// **8, and the paper says 5.** 2602.21545 §3, verbatim: "Note that, all the
+/// experiments in this paper use **5 iterations** in `Ortho(·)`". §3.4
+/// repeats "all with 5 iterations" for the polar-method ablation and Table 7's
+/// caption repeats it again, so 5 is not a default that drifted - it is the
+/// one value every table in the paper was produced with. There is no 8 in
+/// 2602.21545.
+///
+/// 8 is attributed to the Qwen3.8-Flash-Next report §3.1 (`ns_steps=8` as its
+/// stability choice), which is a different document, not a reference
+/// implementation, so it does not discharge a bit-for-bit check against the
+/// paper.
+///
+/// What the paper does supply is the *direction*: §2.1, "In principle, one
+/// may mitigate the imbalance by running a large number of Newton–Schulz
+/// iterations, but this is computationally infeasible in LLM pre-training",
+/// and Fig. 2(a) shows the variance still amplified at 5. So 8 is "unrun",
+/// not "unsupported" — the paper argues for more iterations and declines to
+/// pay for them.
+///
+/// CHANGING THIS IS THE OWNER'S CALL, not a code cleanup, and it is not free:
+/// the optimizer is ~19% of a warm 245 ms step at 9.2M params, 8 of which are
+/// this loop, so 8 → 5 is ~-15% of `opt` and ~-2.8% of a step; and it
+/// invalidates the only provenance the routing policy has, because
+/// `routing.rs:78-80` justifies keeping Muon+ off every `[d,d]` projection
+/// with "8 NS iters on the `[d,d]` projections added ~40 s/step" — a number
+/// with no config, date or commit on it (ADR-0020 rule 1) that is entangled
+/// with this constant. Re-measuring what a change here costs: the step-time
+/// row in `benches/history.tsv` at a stated step index, plus a held-out BPB A/B
+/// at one batch size, because a different NS depth is a different optimizer,
+/// not a speed knob.
 pub const MUON_NS_STEPS: usize = 8;
-/// Post-polar normalization direction (2602.21545: column-then-row is the
-/// paper's best combination).
+/// Post-polar normalization direction: column-then-row, 2602.21545 Eq. (7).
+///
+/// One of the paper's two orders, not "the paper's best": §3.4 claims only
+/// that bi-directional beats single-directional, and Table 6's two orders are
+/// within noise of each other with the winner flipping by model. The paper's
+/// own code default is the narrower `Norm_(col)` (App. C, `d="col"`).
 pub const MUON_NORM_DIR: Option<NormDir> = Some(NormDir::ColRow);
 
 fn muon_plus_cfg(cfg: &TrainCfg) -> MuonPlusConfig {
@@ -101,6 +148,19 @@ fn muon_plus_cfg(cfg: &TrainCfg) -> MuonPlusConfig {
 /// concatenated back. The split also cuts NS cost ~n_heads-fold, which is
 /// what makes routing Q/K to Muon affordable on this box (fp32 NS on
 /// [768,768] was ~40 s/step; 12 blocks of [64,768] are milliseconds).
+///
+/// Not in 2602.21545 at all — the paper orthogonalizes each weight matrix as
+/// a whole, so this is a deviation, attributed to the Qwen report, not to
+/// Muon+.
+///
+/// This reimplements the Muon 2D branch, which is how it came to miss the
+/// zero-gradient rule: `MuonPlus::step` gates its update on
+/// [`burn_muon_plus::signal_mask`] so a masked (NaN-firewall) step moves
+/// nothing, and this must apply the *same* mask from the *same* function. It
+/// did not, and `qk_heads` is always resolved (`cfg.rs:54`), so the Q/K
+/// weights took a full-magnitude step in the stale momentum direction on
+/// every masked step while the rest of the model correctly did not.
+/// Pinned by `headwise_zero_gradient_does_not_move_the_parameter`.
 ///
 /// Q/K here are separate Linears (burn-kda gdn2), so the per-head split is
 /// unambiguous - there is no fused `[d, 3d]` qkv to disambiguate.
@@ -186,12 +246,22 @@ impl Optimizer for HeadWiseMuon {
             let block = momentum.clone().slice([h * dh..(h + 1) * dh, 0..cols]);
             parts.push(self.muon.normalize(self.muon.orthogonalize(block)));
         }
-        let update = Tensor::cat(parts, 0);
+        // The zero-gradient rule, from the crate that owns it: NS normalizes
+        // the DECAYED momentum back to unit Frobenius norm, so without this
+        // gate a step the trainer masked as a no-op still moved Q/K by a full
+        // `lr_scaled` in the stale direction. Decoupled weight decay is NOT
+        // gated, exactly as in `MuonPlus::step` - a zero gradient is a no-op
+        // on the update, not on the decay.
+        let g_active = burn_muon_plus::signal_mask(&grad);
+        let update = Tensor::cat(parts, 0).mul(g_active.unsqueeze());
 
         // Same tail as MuonPlus 2D. The Bernstein factor uses the FULL
         // dims: per-head NS output carries the same total Frobenius norm
         // as a full-matrix NS (NS pins every singular value near 1 in both
         // cases), so the per-param step size is what full Muon would pick.
+        // `max(1, m/n)^0.5` vs the paper's `sqrt(m/n)` is inert here: the Q/K
+        // weight is `[n_heads*head_dim, d]`, square for every preset, so both
+        // forms are 1.0. See `burn-muon-plus`'s `lr_scaled` comment.
         let (m, n) = (rows as f64, cols as f64);
         let lr_scaled = lr * (m / n).max(1.0).sqrt();
         let wd = (self.weight_decay as f32 * lr_scaled as f32).min(0.999);
@@ -475,4 +545,291 @@ pub fn validate_routing(
     r.check(model)?;
     let g = Installed::new(&r, qk_heads);
     check_installed(model, &r, &g)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::optim::Optimizer as _;
+    use burn::tensor::{Distribution, TensorData};
+
+    /// The weight the trainer installs Q/K into is `[n_heads*head_dim, d]`.
+    /// Square, as the real one is.
+    const ROWS: usize = 64;
+    const COLS: usize = 64;
+    const HEADS: usize = 4;
+
+    fn headwise() -> HeadWiseMuon {
+        HeadWiseMuon::new(
+            &TrainCfg {
+                wd: 0.0,
+                ..Default::default()
+            },
+            HEADS,
+        )
+    }
+
+    /// Deterministic weights, so a failing assertion names a value.
+    fn w() -> Tensor<2> {
+        let vals: Vec<f32> = (0..ROWS * COLS)
+            .map(|i| ((i.wrapping_mul(2654435761) % 997) as f32 / 498.0) - 1.0)
+            .collect();
+        Tensor::<2>::from_data(TensorData::new(vals, [ROWS, COLS]), &crate::device())
+    }
+
+    /// THE BUG. The NaN firewall zeroes every gradient on device, so a masked
+    /// step must be a no-op for the head-wise Q/K group exactly as it is for
+    /// the Muon+ group (`burn-muon-plus/tests/zero_grad.rs`). It was not: the
+    /// momentum decays to `mu·M`, `orthogonalize` normalizes it back to unit
+    /// Frobenius norm, and the weight moved by `lr_scaled` in the stale
+    /// direction. `qk_heads` is always resolved, so this was every run.
+    ///
+    /// wd=0 so the only thing that can move the weight is the update.
+    ///
+    /// The first step takes a REAL gradient, and that is load-bearing: a
+    /// zero-gradient step from a fresh state seeds `momentum = 0`, and
+    /// `orthogonalize(0)` is 0, so the second step is a no-op with or without
+    /// the gate. Written the other way round this test passes green with the
+    /// mask deleted, which is exactly what happened to the sibling test in
+    /// `burn-muon-plus` (see the note in that file). The leak needs a LIVE
+    /// momentum, and two masked steps so the decayed-and-still-nonzero case is
+    /// covered too.
+    #[test]
+    fn headwise_zero_gradient_does_not_move_the_parameter() {
+        let dev = crate::device();
+        let seed = Tensor::<2>::random([ROWS, COLS], Distribution::Default, &dev);
+        let zero = Tensor::<2>::zeros([ROWS, COLS], &dev);
+        let opt = headwise();
+        let (w1, s1) = opt.step(1e-3, w(), seed, None);
+        let after_seed = w1.clone().into_data();
+        let (w2, s2) = opt.step(1e-3, w1, zero.clone(), s1);
+        let (w3, _) = opt.step(1e-3, w2, zero, s2);
+        assert_eq!(
+            after_seed.into_bytes(),
+            w3.into_data().into_bytes(),
+            "a zero gradient moved the head-wise Q/K weight: the stale momentum \
+             was rescaled to a full step (the NaN firewall's no-op contract)"
+        );
+    }
+
+    /// THE SECOND BUG, in the same family: the eval line's
+    /// `muon_skipped=mom/finalize` field used to count only the two Q/K
+    /// weights this file steps, and nothing in `MuonPlus::step` — so the much
+    /// larger `Group::Muon` population could have been running the tensor path
+    /// for a whole run behind a log that read the same (ADR-0019: a fused arm
+    /// must be able to show it ran).
+    ///
+    /// A CPU build cannot make the fused kernels answer, so this cannot assert
+    /// the CUDA outcome. It pins the part that is decidable here: the number
+    /// the trainer reads is the SUM over both implementations, so it cannot
+    /// regress to counting one group. (The counters are global, so this
+    /// asserts on the total rather than on a per-group delta.)
+    #[test]
+    fn the_eval_counter_covers_both_muon_implementations() {
+        let dev = crate::device();
+        let before = fused_kernels_skipped();
+        // One step of the `Group::Muon` optimizer — the implementation that
+        // was uncounted.
+        let muon = MuonPlusConfig::new()
+            .with_momentum(0.0)
+            .with_norm_dir(MUON_NORM_DIR)
+            .with_ns_steps(MUON_NS_STEPS)
+            .with_weight_decay(0.0)
+            .build();
+        let g = Tensor::<2>::random([ROWS, COLS], Distribution::Default, &dev);
+        let _ = muon.step(1e-3, Tensor::<2>::zeros([ROWS, COLS], &dev), g, None);
+        // And one of the head-wise Q/K steps, the implementation that was
+        // counted.
+        let _ = headwise().step(1e-3, w(), Tensor::<2>::ones([ROWS, COLS], &dev), None);
+        let after = fused_kernels_skipped();
+        // Neither number can move on a CPU build (the fused kernels are never
+        // asked), so the assertable property is that reading the seam is
+        // side-effect-free and stable: a run that never touches CUDA must not
+        // accumulate skips, or the eval line reports a fallback that never
+        // happened.
+        assert_eq!(
+            before, after,
+            "a CPU build must not accumulate fused-kernel skips: {before:?} -> {after:?}"
+        );
+        // And the aggregate is genuinely two sums, not one alias: the crate's
+        // own accessor is what makes the second term exist at all.
+        assert_eq!(
+            (after.0, after.1),
+            (
+                SKIPPED_MOMENTUM.load(Relaxed) + burn_muon_plus::fused_skipped().0,
+                SKIPPED_FINALIZE.load(Relaxed) + burn_muon_plus::fused_skipped().1,
+            ),
+            "the seam must be the sum of HeadWiseMuon's and MuonPlus::step's"
+        );
+    }
+
+    /// The same run with a real gradient must still move it, so the gate above
+    /// is not just "HeadWiseMuon stopped optimizing".
+    #[test]
+    fn headwise_non_zero_gradient_still_moves_the_parameter() {
+        let dev = crate::device();
+        let vals: Vec<f32> = (0..ROWS * COLS)
+            .map(|i| ((i.wrapping_mul(40503) % 1013) as f32 / 506.0) - 1.0)
+            .collect();
+        let g = Tensor::<2>::from_data(TensorData::new(vals, [ROWS, COLS]), &dev);
+        let before = w().into_data();
+        let (after, _) = headwise().step(1e-3, w(), g, None);
+        assert_ne!(
+            before.into_bytes(),
+            after.into_data().into_bytes(),
+            "a non-zero gradient did not move the head-wise Q/K weight"
+        );
+    }
+
+    /// The dimensional step-size factor, and why its deviation from the paper
+    /// is inert here. `lr_scaled = lr·max(1, m/n)^0.5` (Jordan's `muon.py`)
+    /// against the paper's `lr·sqrt(m/n)` (Eq. (4), Alg. 1 line 10).
+    ///
+    /// The factor is measured off the weight, not off the formula: with `wd=0`
+    /// a zero weight and a fresh state, `W ← 0 − lr_scaled·O_t`, so with `μ=0`
+    /// (which makes the momentum exactly `G`, no `(1-μ)` scale to guess at)
+    /// and `O_t` recomputed here by the same two calls the optimizer makes,
+    /// every entry of the result must equal `−O_t[i]·lr·factor`.
+    ///
+    /// The second half is what gives the test teeth: where the two candidate
+    /// factors DIFFER (a wide `m < n`), the observed step must match Jordan's
+    /// and must *not* match the paper's by more than a rounding error's worth.
+    /// That is a ratio, so it is independent of `lr`.
+    #[test]
+    fn step_size_factor_is_jordans_max_one_not_the_papers_sqrt() {
+        let dev = crate::device();
+        // μ=0 so the momentum is exactly the gradient; wd=0 so the decay cannot
+        // move a zero weight; ColRow so the live direction is the one tested.
+        let muon = MuonPlusConfig::new()
+            .with_momentum(0.0)
+            .with_norm_dir(MUON_NORM_DIR)
+            .with_ns_steps(MUON_NS_STEPS)
+            .with_weight_decay(0.0)
+            .build();
+        // A large lr, so f32 rounding is negligible next to the factor gap
+        // (which is a fixed ratio, ~1.41 on the wide shape) rather than a fixed
+        // absolute tolerance that would have to be guessed.
+        let lr = 1.0f32;
+        for (m, n) in [(ROWS, 2 * ROWS), (2 * ROWS, ROWS)] {
+            let vals: Vec<f32> = (0..m * n)
+                .map(|i| ((i.wrapping_mul(2654435761) % 997) as f32 / 498.0) - 1.0)
+                .collect();
+            let g = Tensor::<2>::from_data(TensorData::new(vals, [m, n]), &dev);
+            let o = muon.normalize(muon.orthogonalize(g.clone())).into_data();
+            let o = o.as_slice::<f32>().unwrap().to_vec();
+            let (updated, _) = muon.step(lr as f64, Tensor::<2>::zeros([m, n], &dev), g, None);
+            let got = updated.into_data();
+            let got = got.as_slice::<f32>().unwrap();
+
+            let ratio = m as f64 / n as f64;
+            let max_one = (lr as f64 * ratio.max(1.0).sqrt()) as f32;
+            let paper = (lr as f64 * ratio.sqrt()) as f32;
+            let err = |factor: f32| -> f32 {
+                o.iter()
+                    .zip(got)
+                    .map(|(a, b)| (a * -factor - b).abs())
+                    .fold(0.0f32, f32::max)
+            };
+            let worst = err(max_one);
+            assert!(
+                worst < 1e-4 * max_one.abs().max(1.0),
+                "[{m}x{n}]: max|observed + lr·max(1,m/n)^0.5·O| = {worst:e}"
+            );
+
+            if (paper - max_one).abs() > 1e-6 {
+                let worst_paper = err(paper);
+                assert!(
+                    worst_paper > 100.0 * worst,
+                    "[{m}x{n}]: the wide shape must tell the two factors apart \
+                     ({max_one} vs {paper}), but the step fits the paper's \
+                     sqrt(m/n) as well as ours ({worst_paper:e} vs {worst:e}) - \
+                     the test cannot see the difference it exists to pin"
+                );
+            }
+        }
+    }
+
+    /// ...and on the shapes the trainer ACTUALLY installs, the two forms are the
+    /// same number, so the D3 deviation cannot reach a run.
+    ///
+    /// Measured off the live model's routed groups, not off a hand-written
+    /// shape list: a list would keep passing after a preset widened a factor,
+    /// which is the whole failure this claim has. The declared groups are
+    /// `Group::Muon` (TSCT factors + the Engram key projections) and
+    /// `Group::QkHeadWise` (the Q/K weights). Every one of them must satisfy
+    /// `m ≥ n`, which is where `max(1, m/n)^0.5` and `sqrt(m/n)` coincide.
+    ///
+    /// A wide member is not a failure of the optimizer, it is a failure of this
+    /// argument: it would mean the `lr_scaled` comment in `burn-muon-plus` (and
+    /// the `D3` deviation being inert) is no longer true, and the deviation
+    /// would have to be re-adjudicated rather than assumed.
+    #[test]
+    fn no_routed_parameter_is_wide() {
+        let mut seen = 0;
+        for use_tsct in [true, false] {
+            let model = DormouseModel::new(&test_model_cfg(use_tsct), &crate::device());
+            let r = routing::routing(&model, false);
+            for (path, id, rank) in param_paths(&model) {
+                if rank != 2 || !matches!(r.group_of_id(&id), Some(Group::Muon | Group::QkHeadWise))
+                {
+                    continue;
+                }
+                seen += 1;
+                let (m, n) = param_dims(&model, &id);
+                assert!(
+                    m >= n,
+                    "use_tsct={use_tsct}: {path} is {m}x{n} and routed to Muon+ - \
+                     a WIDE matrix in a Muon+ group changes the step size under \
+                     the paper's sqrt(m/n), so the max(1,·) deviation stops \
+                     being inert and D3 has to be re-adjudicated"
+                );
+            }
+        }
+        assert!(
+            seen > 0,
+            "no rank-2 parameter landed in a Muon+ group, so this proves nothing \
+             about the shapes that are actually routed"
+        );
+    }
+
+    /// Small but every arm present: rank, experts, Engram key projections, and
+    /// the KDA q/k the head-wise group claims.
+    fn test_model_cfg(use_tsct: bool) -> dormouse_core::DormouseConfig {
+        dormouse_core::DormouseConfig {
+            use_tsct,
+            d_model: 32,
+            n_heads: 2,
+            head_dim: 16,
+            d_ffn: 64,
+            max_iter: 2,
+            n_experts: 2,
+            rank: 8,
+            engram_rows: 64,
+            ..dormouse_core::DormouseConfig::default()
+        }
+    }
+
+    /// `(rows, cols)` of the rank-2 parameter with this id, read off the model.
+    fn param_dims(model: &DormouseModel, id: &burn::module::ParamId) -> (usize, usize) {
+        struct Dims<'a> {
+            want: &'a burn::module::ParamId,
+            out: Option<(usize, usize)>,
+        }
+        impl burn::module::ModuleVisitor for Dims<'_> {
+            fn enter_module(&mut self, _n: &str, _c: &str) {}
+            fn exit_module(&mut self, _n: &str, _c: &str) {}
+            fn visit_float<const D: usize>(&mut self, p: &burn::module::Param<Tensor<D>>) {
+                if p.id == *self.want {
+                    let d = p.val().dims();
+                    self.out = Some((d[D - 2], d[D - 1]));
+                }
+            }
+        }
+        let mut v = Dims {
+            want: id,
+            out: None,
+        };
+        model.visit(&mut v);
+        v.out.expect("id came from this model, so it must be in it")
+    }
 }
