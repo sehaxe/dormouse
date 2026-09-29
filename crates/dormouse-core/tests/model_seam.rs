@@ -48,6 +48,13 @@ fn mini_nano() -> DormouseConfig {
         // `DormouseConfig::default().engram_rows`, pinned in loop_block's
         // `capacity_budget_is_the_measured_optimum`.
         engram_rows: 4096,
+        // DSpark is OFF in every shipped preset as of 2026-09-29 (DeepSeek's
+        // own MTP ablation reports it bits-per-byte neutral, and our protocol
+        // measures BPB). These tests check that the aux HEADS exist, work and
+        // carry a gradient - not that the default turns them on. So the head
+        // is switched on here explicitly; otherwise three tests silently stop
+        // testing it and pass for the wrong reason.
+        dspark_weight: 0.1,
         ..nano_cfg()
     }
 }

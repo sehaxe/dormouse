@@ -68,7 +68,7 @@ fn d_n_experts() -> usize { 3 }
 fn d_jepa_weight() -> f32 { 0.05 }
 fn d_jepa_mask_frac() -> f32 { 0.15 }
 fn d_jepa_mask_span() -> usize { 8 }
-fn d_dspark_weight() -> f32 { 0.1 }
+fn d_dspark_weight() -> f32 { 0.0 }
 fn d_dspark_k() -> usize { 4 }
 fn d_dspark_stride() -> usize { 16 }
 fn d_engram_rows() -> usize { 25_000 }
