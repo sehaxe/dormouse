@@ -10,6 +10,10 @@
 #   tools/wt.sh rm <task>     land or discard the task, then drop the worktree
 #   tools/wt.sh list          what exists
 #
+# `test` runs TWO gates: TEST_CMD below (our three crates, `--lib` only) and
+# tools/lib_gate.sh (vendor/burn-fused, a separate cargo workspace, every crate
+# on ndarray). Either red fails the worktree. lib_gate.sh also runs standalone.
+#
 # Builds are SERIAL. One heavy thing at a time (AGENTS.md doctrine 4): a cold
 # worktree target dir compiles the whole burn+cubecl stack, and a mold link
 # spikes tens of GB, so `test` refuses to start while another cargo is running
@@ -73,7 +77,14 @@ test)
     cd "$path" || die "cd failed"
     s=$(date +%s); $TEST_CMD -j 4; rc=$?
     echo "wt: $(( $(date +%s) - s ))s, exit $rc"
-    exit $rc
+    # The 21 crates of vendor/burn-fused are a SEPARATE cargo workspace (the
+    # root Cargo.toml excludes it), so `-p` cannot reach them: the crossing is
+    # a second cargo run from inside the fork. Without this branch the whole
+    # technology library - including the 31 integration targets the `--lib`
+    # above never builds - was ungated locally.
+    tools/lib_gate.sh "$path" || rc=$?
+    echo "wt: lib_gate exit $rc"
+    [ "$rc" -eq 0 ] || die "gate red: see above"
     ;;
 rm)
     [ $# -eq 2 ] || die "usage: wt.sh rm <task>"
