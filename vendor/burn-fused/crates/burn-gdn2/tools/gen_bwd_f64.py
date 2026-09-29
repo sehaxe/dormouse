@@ -51,11 +51,16 @@ anything.  The observed spread is measured (`--h-sweep`) and written into the
 fixture, so the Rust test prints the oracle's real precision rather than quoting
 this paragraph.
 
-  Measured on this box, f64, at the committed h = 1e-3, full tensor:
-  the largest |fd - forward-mode| / |forward-mode| over all 3200 coordinates is
-  2.2e-12, on `w`.  That is the number the generator gates on, and it is ~10x
-  the analysis above, which is the usual gap between "the derivative is O(1)"
-  and "the fifth derivative is O(1)" for a function that is neither.
+  Measured on this box, f64, at the committed h = 1e-3, full tensor (one chunk,
+  1792 coordinates): the largest |fd - forward-mode| / |forward-mode| is
+  1.18e-12, on `g`.  That is the number the generator gates on, and it is ~4x the
+  analysis above, which is the usual gap between "the derivative is O(1)" and
+  "the fifth derivative is O(1)" for a function that is neither.  `--sweep`
+  measures the whole V: 8.4e-9 at h=1e-2, 6.8e-11 at 3e-3, **2.2e-12 at 1e-3**,
+  5.7e-12 at 3e-4, 2.0e-11 at 1e-4, 6.2e-11 at 3e-5, 1.8e-10 at 1e-5 - i.e.
+  truncation-dominated on the left, round-off-dominated on the right, minimum at
+  the h the analysis predicts.  A single point without the sweep would be a
+  number, not a measurement of a band.
 
 THE HONEST CEILING, one sentence: the FORWARD is still a transcription.  If it
 and the Rust ops path share a misreading, the oracle differentiates the wrong
@@ -371,6 +376,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="tests/ref_bwd_f64.bin")
     ap.add_argument("--faults-out", default="tests/ref_bwd_f64_faults.bin")
+    ap.add_argument("--carry-out", default="tests/ref_bwd_f64_carry.bin",
+                    help="the same oracle at TWO chunks, for the carry gate")
+    ap.add_argument("--carry-t", type=int, default=2 * CHUNK,
+                    help="sequence length of the carry fixture (chunks = T/chunk)")
     ap.add_argument("--h", type=float, default=H_DEFAULT)
     ap.add_argument("--fault", default=None, help="write ONLY this fault's FD gradients")
     ap.add_argument("--sweep", action="store_true",
@@ -442,6 +451,36 @@ def main():
                 for n in NAMES:
                     fh.write(_tensor(f"d{n}", fg[n]))
         print("wrote", args.faults_out)
+
+    # The TWO-chunk oracle, same generator, same methods, T = 2*chunk. Written
+    # unconditionally because `tests/autodiff_bwd_f64.rs` needs it to state the
+    # carry defect as a gate rather than as a paragraph: the oracle for the shape
+    # that FAILS is the thing that makes the failure legible.
+    #
+    # `SHAPES` is a module-level dict built at import, so changing `T` alone
+    # leaves every tensor at the old length and the "two-chunk" fixture is a
+    # byte-identical copy of the one-chunk one. Rebuild it.
+    global T, SHAPES
+    T = args.carry_t
+    SHAPES = {
+        "q": (B, H, T, K), "k": (B, H, T, K), "v": (B, H, T, V),
+        "g": (B, H, T, K), "b": (B, H, T, K), "w": (B, H, T, V),
+        "state": (B, H, K, V),
+    }
+    cinp, cdout = make_inputs(), make_cotangent()
+    cout, cstate = forward(cinp)
+    cl = loss(cinp, cdout)
+    cgrads, cspread, cwhere = oracle(cinp, cdout, args.h)
+    print(f"\ncarry fixture: T={T} ({T // CHUNK} chunks)  loss={cl:.12e}  "
+          f"|fd - fwd-mode|max = {cspread:.3e} (worst input {cwhere})")
+    write_fixture(
+        args.carry_out,
+        [(n, cinp[n]) for n in NAMES]
+        + [("d_out", cdout), ("out", cout), ("out_state", cstate), ("loss", np.array([cl]))]
+        + [(f"d{n}", cgrads[n]) for n in NAMES],
+        cspread,
+    )
+    print("wrote", args.carry_out)
     return 0
 
 
