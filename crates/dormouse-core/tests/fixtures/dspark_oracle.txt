@@ -1,0 +1,41 @@
+# dspark / deepspec oracle fixture - GENERATED, do not hand-edit.
+# config: deepseek-ai/DeepSpec@main config/dspark/dspark_qwen3_4b.py
+# config file: dspark_qwen3_4b.py, exp_name dspark_block7_qwen3_4b
+# regenerate: python3 gen_dspark_oracle.py dspark_qwen3_4b.py \
+#              dspark_loss.py dspark_markov_head.py dspark_common.py \
+#              ../fixtures/dspark_oracle.txt
+# values are read with ast.literal_eval, so this file never executes
+# the code it quotes.
+
+config.block_size: 7
+config.ce_loss_alpha: 0.1
+config.confidence_head_alpha: 1.0
+config.confidence_head_with_markov: True
+config.l1_loss_alpha: 0.9
+config.loss_decay_gamma: 4.0
+config.markov_head_type: 'vanilla'
+config.markov_rank: 256
+config.mask_token_id: 151669
+config.num_anchors: 512
+config.num_draft_layers: 5
+config.target_layer_ids: 1,9,17,25,33
+evidence.common.block_size_doc.line: 19
+evidence.common.block_size_doc.text: 'block_size: number of draft positions per anchor'
+evidence.common.position_ids.line: 257
+evidence.common.position_ids.text: 'offsets = torch.arange(block_size, device=device).view(1, 1, -1)'
+evidence.loss.accept.line: 69
+evidence.loss.accept.text: 'accept_rate_3d = 1.0 - 0.5 * (draft_probs - target_probs).abs().sum(dim=-1)'
+evidence.loss.bce.line: 157
+evidence.loss.bce.text: 'confidence_errors = F.binary_cross_entropy_with_logits('
+evidence.loss.decay.line: 35
+evidence.loss.decay.text: 'decay_weights = torch.exp(-positions.float() / float(loss_decay_gamma))'
+evidence.loss.mix.line: 249
+evidence.loss.mix.text: 'ce_loss_alpha * ce_loss'
+evidence.markov.gated.line: 299
+evidence.markov.gated.text: 'if markov_head_type == "gated":'
+evidence.markov.joint.line: 145
+evidence.markov.joint.text: 'self.joint_proj = nn.Linear('
+evidence.markov.rnn.line: 125
+evidence.markov.rnn.text: 'class RNNHead(VanillaMarkov):'
+evidence.markov.vanilla.line: 294
+evidence.markov.vanilla.text: 'if markov_head_type == "vanilla":'

@@ -3,6 +3,8 @@ pub mod act_quant;
 pub mod aux;
 pub mod attention;
 pub mod config;
+#[cfg(test)]
+mod dspark_oracle;
 pub mod gr;
 pub mod loop_block;
 pub mod model;
