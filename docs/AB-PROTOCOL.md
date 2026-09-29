@@ -90,20 +90,41 @@ step index, so a seed is a config difference only).
 functions of `(seed, step)` — before that fix two runs with identical flags
 differed in **34 730 605 of 43 725 616 checkpoint bytes**, so every A/B in the
 archive compared two different initialisations and charged the difference to
-the arm. **The remaining 4 % — 409 043 differing values on a repeated run — is PROSE,
-NOT A MEASUREMENT (2026-09-29).** It is in this file, in `AGENTS.md` §3.7, in
-`PLAN-2026-09-29.md:198` and in two reviews, and in **no test and no log**. Its
-cited source `4b42b6d` shipped `device.seed()` plus a comment and no test, so
-nothing in the tree reproduces the number. **What is measured:**
-`model_seam::two_models_one_seed_are_bit_identical` asserts 0 differing bytes
-for two models under one seed, and that two different seeds DO differ — and it
-is **green on the CPU backend**, where every parameter reaches `.init(device)`.
-So either the figure is CUDA-specific (a different RNG implementation) or it
-was mistaken. **This page still gates on it, and the gate is honest:** until
-that is closed *or* refuted on the backend where the A/Bs run, a same-seed
-repeat may not be the same run and the 3-seed spread you compare against may
-carry a per-run component. The cheapest way to settle it is one same-seed
-repeat on CUDA compared elementwise — not a code change.
+the arm. **MEASURED 2026-09-29 ON CUDA, AND IT IS WORSE THAN 4 %.** Three
+zero-step runs of one binary, same flags, `--seed 7`, `small`, batch 2, seq
+128, `--no-kda --no-engram`, 8 KB corpus, compared as f32 slots of the
+checkpoint:
+
+| pair | when | differing slots (of 18 398 028) | % |
+|---|---|---|---|
+| A vs B | consecutive, seconds apart | 30 682 | **0.167 %** |
+| A vs C | same flags, minutes later | 2 299 790 | **12.50 %** |
+| B vs C | | 2 301 566 | **12.51 %** |
+
+**The residue is not a stable set.** The differing index sets of A/B and A/C
+overlap at Jaccard **0.012** — essentially disjoint. A fixed uninitialised
+region would be the same indices every time. The magnitudes are not rounding
+either: median |delta| 3.4e-8 against **max 2.07e+38**.
+
+**Four things: three established, one open.**
+1. **CPU is deterministic.** `model_seam::two_models_one_seed_are_bit_identical`
+   builds two models under one seed, asserts 0 differing bytes AND that two
+   different seeds differ. Green.
+2. **CUDA is not**, and the magnitude depends on WHEN the run happened
+   (0.17 % back-to-back, 12.5 % later). That points at machine state — the
+   cubecl pool is documented high-water and never frees (`AGENTS.md` §2.2) —
+   rather than at a fixed unseeded RNG in the init path.
+3. **409 043 is not reproducible and must not be cited as measured.** It sits
+   between two values the same experiment does not produce consistently, and
+   its source `4b42b6d` shipped no test.
+4. **OPEN, and it changes the method: the checkpoint FILE is not a sound
+   instrument.** It carries 0–4 NaN slots and ~475–501 slots at |v| >= 1e30,
+   mostly at stable indices (475 of ~490 overlap between runs) with a varying
+   remainder, so a byte-comparison of two checkpoints measures some of that
+   too. A trustworthy check compares the **tensors**, not the files.
+
+Until 2 and 4 are closed, two runs under one seed are not the same run and the
+3-seed spread may carry a per-run component.
 
 **~~Budget: 2000 steps at ~1.6 s = 53 min per run, so one arm = 2.7 GPU-hours.
 Four arms (control + 3) = ~11 GPU-hours.~~ STRUCK 2026-09-29. The 1.6 s/step
@@ -179,10 +200,13 @@ it might help later".
 
 **Two things must be true before ANY row is run, and neither is a formality:**
 
-- **The seed gap is closed** (the 409 043 differing values, above). Until two
-  runs under one seed are the same run, the spread this protocol compares
+- **The seed gap is closed ON THE BACKEND THE ARM RUNS ON**, measured at the
+  tensor level rather than by comparing checkpoint files (see the measurement
+  above: 0.167 % back-to-back on CUDA, 12.50 % minutes later, CPU exact). Until
+  two runs under one seed are the same run, the spread this protocol compares
   against is not a seed spread, and a 3-seed verdict measures the seed plus
-  process entropy plus the arm.
+  machine state plus the arm. **This is the cheapest item on the page and it
+  is not closed.**
 - **A control with a gradient-carrying attention arm exists** (row 0 below).
 
 Then, of the rows: three are not merely unrun — they are **undefined against the
