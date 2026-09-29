@@ -133,3 +133,5 @@ date	commit	mode	step	throughput	mem	final-ce
 2026-09-29T04:12:00Z	6891e23	warm-batch8	244ms	16.8Ktok/s	res=5908MiB	ce=5.42
 2026-09-29T04:12:00Z	6891e23	warm-batch16	440ms	18.6Ktok/s	res=5908MiB	ce=5.40
 2026-09-29T04:12:00Z	6891e23	warm-batch32	826ms	19.8Ktok/s	res=5908MiB	ce=5.38
+2026-09-29T17:40:00Z	feaf0da	warm-batch8-retract-per-factor	265ms	15.5Ktok/s	res=n/a	ce=3.236
+2026-09-29T17:41:00Z	feaf0da	warm-batch8-retract-batched	221ms	18.5Ktok/s	res=n/a	ce=3.232
