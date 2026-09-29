@@ -712,14 +712,25 @@ mod tests {
         // 3 tables x 25_000 rows x 32 dim.
         let mem = 3 * c.engram_rows * c.engram_dim;
         assert_eq!(mem, 2_400_000);
-        // The `small` backbone is 7.5M (the trainer's header print), so the
-        // arm is 24% of the model - DeepSeek's own operating point, and the
-        // opposite of the 86% that made every production run need
-        // --no-engram.
-        const BACKBONE_SMALL: usize = 7_500_000;
+        // The `small` backbone is 9_197_390 params MEASURED on the
+        // instantiated model (preset_exec, 2026-09-29), so 3 x 25_000 x 32 is
+        // 3_145_728 = 34.2% of the model, not the 24% this comment claimed.
+        // The 24% was 2.4M / (2.4M + 7.5M) against the RETRACTED 7.5M
+        // backbone; 7.5M is the pre-2026-09-27 memory re-pricing and is
+        // asserted in schema.rs:130 as a doc comment. `nano` is higher still,
+        // 43.7% of 7_192_906.
+        //
+        // So the containment argument INVERTS and the bound moves: this used
+        // to assert 0.20..0.30 and cannot, at 34.2%, without lying. The gate
+        // is `share <= 0.5` in preset_exec, deliberately looser, and its
+        // reason is that the job here is to stop the 48M-row monopoly shape
+        // returning - which 0.5 still does - and NOT to certify a capacity
+        // number, which is the owner's call (901be21 declined to move it for
+        // exactly that reason).
+        const BACKBONE_SMALL: usize = 9_197_390;
         let share = mem as f64 / (mem + BACKBONE_SMALL) as f64;
         assert!(
-            (0.20..0.30).contains(&share),
+            share <= 0.5,
             "memory must stay a minority of the model, got {:.1}%",
             share * 100.0
         );
