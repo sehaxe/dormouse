@@ -349,9 +349,15 @@ layout and its own linear algebra, and holds the layer to 1e-5 (it measures
 the short-conv left pad — that the 1000-case fixture could not, because that
 fixture is a transcription of this crate's own algorithm: a comparison against
 a transcription of the code under test cannot find a divergence from the code
-the transcription was meant to copy. It is currently RED on both, by 1.38e-2
-across 4880 cases, and the cause is in its generator, not here — see
-`research/papers/gdn-kda.md` §4.1 and §7.1.
+the transcription was meant to copy. It WAS RED on both by 1.38e-2, and it was
+diagnosed as a defect in this crate for four commits before `ff7cd57` found it
+in the *generator*: `tools/gen_reference.rs` read token-major buffers with
+head-major offsets, which agrees with the correct indexing only at T=1 — which
+is why exactly the 24 single-token cases passed. `ff7cd57` fixed it, and the
+numbers now are 1000 cases, max_diff 2.32e-7, 0 failures. The 1.38e-2 carried
+by `0a6998a`'s message, and by this paragraph until 2026-09-29, was a defect in
+the reference and not in this crate — see `research/papers/gdn-kda.md` §4.1
+and §7.1.
 
 The two `#[ignore]`d CUDA gates are the only tests that would compare the fused
 adjoint against the tensor path, and neither has ever passed. Everything a

@@ -10,21 +10,16 @@
 // WHY IT EXISTS. Every other numeric test in this crate compares our code to
 // our code. `docs/ORACLE.md` §2 shows why that is not enough: a bug above the
 // fused/ops branch point — i.e. inside `project` or `output` — moves both arms
-// together and the difference is exactly zero. `tests/ref_data.bin` used to be
-// the one layer that could see `project`; it is DELETED (2026-09-29) because it
-// was an f32 transcription of our OWN algorithm, so all it could ever prove was
-// self-consistency, and it replicate-padded the short conv exactly as the kernel
-// wrongly did. This file is its replacement, and it is the first layer here
-// whose expected value does not come from a second implementation of the same
-// code. The two `binary-tests` targets it absorbed are `tests/oracle_breadth.rs`
-// (1000-case breadth sweep, `tests/ref_f64_broad.bin`) and
-// `tests/oracle_chunk.rs` (the same sweep at five chunk sizes); both are RED, on
-// the pre-existing defect the STATUS block below measures.
+// together and the difference is exactly zero. `tests/ref_data.bin` was the one
+// layer that could see `project`, and it is RED (1.38e-2, 976/1000) behind a
+// non-default feature. This file is the replacement, and it is the first layer
+// here whose expected value does not come from a second implementation of the
+// same code.
 //
 // TIER, HONESTLY. This is **(b)**, not (a). It is a transcription, so a shared
 // *misreading* of the paper would survive it. It is not the authors' own bytes;
 // those need NVlabs' Triton kernel actually run (`docs/ORACLE.md` §8 candidate
-// (2), not attempted). The words "bit-exact" and "bit-for-bit" are not used
+// (2), not attempted). Neither "bit-exact" nor "bit-for-bit" is used
 // about anything here and must not be.
 //
 // THE BAR, AND WHY IT IS FAKEABLE. A semantic error is O(1) relative; f32
@@ -35,91 +30,143 @@
 // the gap on every run, from committed data, so the claim cannot rot into a
 // self-consistency check.
 //
-// ============================ STATUS: RED ================================
+// ===================== STATUS: the RED was the FIXTURE =====================
 //
-// `gdn2_f32_agrees_with_the_f64_reference` FAILS. Not a tolerance problem and
-// not f32 noise: the deviation is 9.227e-02 relative at T=2, two orders above
-// the 1e-3 bar. Reproduce with
-//     cargo test --release -p burn-gdn2 --test ref_f64
+// `gdn2_f32_agrees_with_the_f64_reference` was RED, and it was this file's
+// reference that was wrong. Not a tolerance problem, not f32 noise, and not the
+// kernel. It is recorded here at length because the shape of the mistake is the
+// reusable part.
 //
-// THE BLOCK BELOW IS THE 2026-09-28 TEXT AND IT IS NOW MEASURED WRONG IN
-// THREE PLACES. Kept as a record of the search, corrected where measurement
-// moved it, and corrected measurements are marked CORRECTED. The three:
+// THE DEFECT, ONE LINE. `tools/gen_reference_f64.py` split the six per-head
+// tensors like this:
 //
-// 1. THE CONV PAD IS FIXED AND THE FIX IS RIGHT. `0a6998a` changed
-//    `src/short_conv.rs` from replicate to zero padding. Re-measured against
-//    this layer's f64 ZERO-pad oracle, `cargo run --release -p burn-gdn2
-//    --example ref_f64_stages` + `python3 tools/gen_reference_f64.py
-//    --diff-stages /tmp/rust_stages.txt`:
+//     q = q.reshape(t, H, HK).transpose(1, 0, 2)   # [T, KD] -> [T, H, HK] -> [H, T, HK]
+//     k = k.reshape(t, H, HK).transpose(1, 0, 2)
+//     g = g.T.reshape(H, t, HK)                   # <- head-major. WRONG.
+//     b = b.reshape(t, H, HK).transpose(1, 0, 2)
 //
-//        stage       T=1 (was)   T=1 (now)    T=70 (was)  T=70 (now)
-//        q_conv      1.8e-01     1.683e-07    1.6e-01     1.418e-07
-//        k_conv      1.4e-01     2.884e-07    1.3e-01     1.742e-07
-//        v_conv      1.5e-01     2.371e-07    1.9e-01     1.867e-07
+// Every one of those is a [T, KD] token-major buffer. `g` alone was reshaped
+// head-major, so for t > 1 the head axis and the token axis are mixed. With
+// H=4, HK=16, t=2 and input g[kd, i], `g.T.reshape(H, t, HK)` puts
+// out[1, 0, 0] = g[32, 0] where out[1, 0, 0] must be g[16, 0].
 //
-//    The old table's numbers are relative to each stage's own scale; the
-//    absolute columns it quotes are unchanged in kind. Every conv row is now
-//    f32 noise at both lengths. "OUR `q_conv` MATCHES A f64 REPLICATE-PAD TO
-//    1.06e-07" is a statement about a bug that no longer exists.
+// AT t == 1 THE TWO FORMS COINCIDE ON EVERY ELEMENT. So case 0 (T=1) was green,
+// case 1 (T=2) was 9.227e-2 against a 1e-3 bar, and everything after it was
+// worse. A canary that passes for a structural reason is not a canary.
 //
-// 2. `project` IS CLEAN, INCLUDING EVERY PER-HEAD TENSOR. The old text says the
-//    second difference "is not in `project`'s 2-D stages", which was all the
-//    diagnostic could see: `diff_stages` compared only 2-D and 1-D rows
-//    because a permuted 4-D view reads back unstably on ndarray. It does, but
-//    pushing the view through an elementwise op first forces a dense readback
-//    (burn 0.22.0-pre.4 has no `contiguous()`), and with those rows added every
-//    per-head tensor agrees too: q4d 1.7e-07/3.4e-07, k4d 5.2e-07/2.5e-07,
-//    g4d 2.1e-07/3.9e-07, b4d 1.7e-07/2.1e-07, v4d 4.6e-07/1.9e-07, w4d
-//    1.9e-07/2.1e-07, gate4d 1.3e-07/1.6e-07 (T=1 / T=70). So the fault is
-//    DOWNSTREAM of `project`.
+// WHY IT SURVIVED A FIXTURE THAT REPRODUCES. The committed `.bin`
+// regenerates to the identical bytes from the generator - checked, `cmp` clean -
+// so reproducibility was never going to catch it. Only comparing the fixture
+// against an INDEPENDENT computation of the same quantity does, which is what
+// the arithmetic below is.
 //
-// 3. THE FAULT IS THE STATE CARRY, NOT AN UNEXPLAINED DIFFERENCE. Per token,
-//    over this 18-case matrix: token 0 is right at every length (3.07e-07 at
-//    T=1, 3.49e-08 at T=64) and every token from 1 on is O(1) wrong. `S`
-//    starts at zero, so T=1 has no carry - which is also why exactly 24 of the
-//    1000 cases in the breadth sweep (`tests/oracle_breadth.rs`, same fixture
-//    family) pass and they are exactly the T=1 ones.
+// THE EVIDENCE, AND IT IS CLOSED. The failing number is not merely the right
+// order of magnitude, it is the right number:
 //
-// NOT YET LOCALISED TO A LINE, and one number I do not trust. Dumping the
-// carry's four sub-steps by hand at T=2 (decay, erase, `v_new`, and the
-// resulting `S`) has all four agreeing to <= 4.6e-07 at every step, final `S`
-// included, which leaves the readout as the only suspect BY ELIMINATION and not
-// by measurement. A separate probe calling the crate's own
-// `fused_recurrent_forward` reported a final state 1.34e-01 off on the same
-// input, which contradicts that and which I could not reproduce. Neither number
-// is claimed. The next measurement is the readout
-// `(state * q_t.swap_dims(2, 3)).sum_dim(2)` with a RAW (not squared) readback
-// of `q_t`: the probe written to settle it squared and then took `sqrt`, which
-// recovers `|x|` and not `x`, so every signed row in it read O(1). That is a
-// bug in the probe and it is the reason this header claims no line.
+//   observed   9.227e-02 rel * 1.124e-01 scale = 1.0371e-02 absolute
+//   predicted  max |ref_broken - ref_fixed| at T=2     = 1.037104e-02
+//   predicted  the same at T=1                         = 0.000000e+00 exactly
 //
-// WHAT THE OLD TEXT GOT RIGHT AND STILL STANDS. The pad was a real defect and
-// both reference generators replicate-padded it too, which is why the
-// self-transcription agreed with the bug - `docs/ORACLE.md` §2 in a concrete
-// instance. `tests/ref_data.bin`, `tools/gen_reference.rs` and
-// `tests/gen_reference.py` are DELETED (2026-09-29) rather than regenerated;
-// `tests/bit_exact.rs` and `tests/test_chunk.rs` are retargeted at the f64
-// layer as `tests/oracle_breadth.rs` and `tests/oracle_chunk.rs`.
+// So our f32 output agrees with the CORRECTED reference, and the entire
+// deviation the test reported was the fixture's own error. That is a
+// measurement, not an inference: if the kernel had a defect of its own the
+// deviation would be the sum of two errors and would not land on the predicted
+// value to five significant figures. The fix is the transpose, in the
+// generator, to the idiom the same function already used four lines above.
 //
-// WHY T=1 IS A WEAK CANARY, MEASURED. `S` starts at zero, so `S̄ = Diag(a) S = 0`
-// and `r = S̄^T e = 0`: neither the decay nor the erase gate appears at T=1.
-// Injected as faults, `decay-sign` and `no-erase-gate` change the T=1 output by
-// EXACTLY 0.0, while the other five change it by 0.8 to 2.3. The old fixture's
-// 24 passing single-token cases were therefore blind to two of the seven
-// semantic error classes, and to the entire state carry - and it turns out the
-// state carry is where this crate's live defect is.
+// SAME DISEASE AS `ff7cd57`, IN A FILE WRITTEN AFTER THAT FIX.
+// `tools/gen_reference.rs` read token-major scan inputs with head-major offsets;
+// there it produced a false RED (1000 cases, 1.38e-2) and here it produced a
+// false FIXTURE. Both were invisible at T=1, and in both the single-token cases
+// were the ones that passed. A canary that only tests the degenerate case of
+// its own indexing rule is a comment, not a gate.
 //
-// OWNER'S NOTE, the 2026-09-28 text that is now DONE. The padding fix is no
-// longer deferred to another lane; `0a6998a` landed it, and the current
-// numbers above are the check that it was right.
+// ------------------------- WHAT WAS TRUE, AND IS NOT -------------------
 //
-// CONDITIONING, because it changed the numbers. `lit_gpt/gdn2.py` zeroes every
-// bias, which puts the output gate at `silu(0) = 0` exactly, so a freshly
-// initialised layer's output is ~7.5e-04 where its pre-gate value is O(1). A
-// RELATIVE bar through a near-null quantity is meaningless - it read 1e+0 for
-// differences that were f32 noise. The fixture therefore gives `g_proj_1` a
-// non-zero bias (see `make_params`), which changes no formula and no projection,
-// only the scale the output is measured against: max|out| goes 7.5e-04 -> 1.1e-01.
+// History, corrected rather than deleted, because a reader comparing this file
+// against `8162672`'s message needs to know which claims died and why.
+//
+// 1. "The short conv pads by REPLICATING; the authors zero-fill." TRUE of the
+//    code between `0a6998a` and `ff7cd57`, and FIXED: `src/short_conv.rs:44-58`
+//    now pads with `Tensor::zeros` and names the three sources. `conv-padding`
+//    is still in the fault list, and it is still a wrong formula - it is just no
+//    longer what we do.
+// 2. "The stage table shows `q_conv`/`k_conv`/`v_conv` disagreeing by 0.49..3.01
+//    while every other 2-D stage of `project` agrees to <= 3e-07." That table
+//    was measured WHILE the pad was wrong. It is not evidence about the current
+//    code and is not repeated here.
+// 3. "`bit_exact` is RED at 1.38e-2 and the cause is elsewhere." FIXED by
+//    `ff7cd57`: the generator, not the crate. 1000 cases, max_diff 2.32e-7.
+//    The paragraph in this crate's `README.md` that still says "currently RED on
+//    both, by 1.38e-2" is corrected in this commit; `0a6998a`'s message cannot
+//    be edited and now names a defect that had been fixed four commits earlier.
+// 4. "NOT FULLY EXPLAINED: at T=1, where no state carry exists, the gap between
+//    our output and a replicate-padded f64 forward is 1.15e+00, so a SECOND
+//    difference exists." THERE IS NO SECOND DIFFERENCE. The probe that printed
+//    it compared case 0's output against the FIRST `d` VALUES OF CASE 17 - a
+//    T=70 output, computed from a DIFFERENT random input (the fixtures draw one
+//    input per case from a single stream). Two unrelated inputs cannot agree
+//    below O(1) and it never could, so the probe had no power to read below
+//    O(1) and its O(1) output was not evidence of anything. At HEAD it printed
+//    9.410e-01, and an independent Python computation of the same mis-measured
+//    quantity gives 9.410e-01. The probe is DELETED, because a measurement with
+//    no power to discriminate is worse than no measurement: it was quoted as an
+//    open defect, and an unexplained 1.15 would have implied a third bug that
+//    does not exist. What actually answers the question it asked is the main
+//    test: case 0 passes, so at T=1 our output IS the f64 answer to within
+//    1e-3, and the whole of any T=1 disagreement is nothing.
+//
+// ------------------------------ THE MARGIN ------------------------------
+//
+// BAR = 1e-3 relative; f32 reassociation noise is ~1e-6; SEMANTIC_FLOOR = 1e-1.
+// EIGHT wrong formulas are committed in `ref_f64_faults.bin` on the same
+// weights and the same input, and `the_bar_bites_a_wrong_formula` measures the
+// far side of the gap on every run. Measured on the committed fixture:
+//
+//     output-gate-sigmoid  2.090e-01   209x BAR   2.1x SEMANTIC_FLOOR
+//     no-write-gate        2.584e-01   258x BAR   2.6x
+//     no-erase-gate        3.850e-01   385x BAR   3.8x
+//     no-scale             4.171e-01   417x BAR   4.2x
+//     conv-padding         5.170e-01   517x BAR   5.2x
+//     read-before-write    6.005e-01   600x BAR   6.0x
+//     decay-sign           1.345e+00  1345x BAR  13.4x
+//     transposed-proj      1.389e+00  1389x BAR  13.9x
+//
+// The margin is 209x, and the nearest wrong formula is now the OUTPUT GATE -
+// the one line where two credible upstreams disagree and this crate has picked
+// one without an A/B behind it. That is the honest place for the tightest
+// number in the table to be.
+//
+// THE OLD "460x" WAS THE DENOMINATOR, NOT THE MARGIN. `0a6998a`/`8162672` and
+// this file both quoted "460x" from 4.6e-01, which is `max|ref_y|` - the
+// quantity every relative deviation is DIVIDED by. The nearest wrong formula
+// was 2.71e-01 away, i.e. 272x. The claim was conservative (it overstated the
+// margin rather than hiding a tight one) and it was still not what the
+// arithmetic says. The test now prints `max|ref_y|` separately, on its own
+// line, so the two can never be conflated again.
+//
+// ------------------------- THE OUTPUT GATE ------------------------------
+//
+// The 8th fault is new and is the point of it. `src/module.rs` applies
+// `silu(gate)`. `fla/layers/gdn2.py:197` (fla-org/flash-linear-attention @
+// 9f38d249, fetched 2026-09-29) applies `sigmoid`. Both branches live in ONE
+// upstream kernel - `fla/modules/fused_norm_gate.py:101-104`, selected by
+// `ACTIVATION` - and the line the reference always cited (`:102`) is the SWISH
+// one, so the reference and the kernel agree on this line and have done since
+// the fixture was written.
+//
+// A claim that this oracle "transcribes the FLA file and therefore picks
+// sigmoid" is wrong, and wrong in a way worth writing down: `fla/modules/` is
+// the KERNEL and `fla/layers/` is the LAYER, and only the layer selects
+// `activation="sigmoid"`. The oracle is NOT blind to a kernel flip - if
+// `silu(gate)` became `sigmoid(gate)` the main test would fail loudly, because
+// the reference is swish. What it did not do is MEASURE the choice, so the
+// choice rested on a docstring sentence. It is now a committed wrong formula
+// with a measured distance, and the `saw_output_gate` assert in
+// `the_bar_bites_a_wrong_formula` fails the suite if a regeneration ever drops
+// it. The choice itself is deliberately not
+// changed: it is a technology A/B arm, and the neighbouring `burn-kda` already
+// picks the other side (arXiv:2607.24653 §2.1.1 Eq. 6).
 //
 // END-TO-END DEMONSTRATION THAT THE TEST FAILS ON A WRONG FORMULA, 2026-09-29,
 // ndarray, `--release`. Regenerate the fixture with a wrong formula and re-run
@@ -129,12 +176,9 @@
 //     python3 tools/gen_reference_f64.py --fault transposed-proj
 //     cargo test -p burn-gdn2 --release --test ref_f64     -> FAILED
 //     python3 tools/gen_reference_f64.py                   # restore
-// CAVEAT, stated because it matters: at T=1 the `decay-sign` and
-// `no-erase-gate` fixtures are bit-identical to the correct one (see above), so
-// the assert trips on T=1 for the pre-existing reason rather than for the
-// injected fault. The clean, attribution-valid measurement is the committed one:
+// The clean, attribution-valid measurement is the committed one:
 // `the_bar_bites_a_wrong_formula` runs on every invocation and puts the nearest
-// wrong formula 460x above the bar, from data in the tree.
+// wrong formula 209x above the bar, from data in the tree.
 //
 // burn-ndarray is deprecated upstream; kept as the CPU test backend until the
 // burn-flex migration.
@@ -154,12 +198,20 @@ const BAR: f64 = 1e-3;
 /// largest measured semantic error.
 const SEMANTIC_FLOOR: f64 = 1e-1;
 
-/// The fault-fixture entry that `src/short_conv.rs` actually implements: it
-/// replicates the first token into the short conv's left pad where the authors'
-/// kernel zero-fills. At T=1, where nothing else can disagree, our output
-/// coincides with this entry — which is what identifies the pad as a real
-/// defect rather than a transcription difference. See the STATUS block.
-const CONV_FAULT: &str = "conv-padding";
+/// The fault entry covering the unresolved output-gate technology choice.
+///
+/// `src/module.rs` applies `silu(gate)`; `fla/layers/gdn2.py:197` selects
+/// `sigmoid`. Both branches are in ONE upstream kernel
+/// (`fla/modules/fused_norm_gate.py:101-104`), so this is a configuration
+/// choice between two credible implementations, not a transcription error, and
+/// it is deliberately NOT resolved here. What this constant does is make the
+/// choice MEASURED instead of assumed: the fixture carries the sigmoid answer
+/// for the same weights and the same input, so the distance between the branch
+/// we implement and the branch the other upstream picks is a number in the
+/// tree. The `saw_output_gate` assert below fails loudly if a
+/// regeneration ever drops it, which is how this class would silently go back
+/// to being uncovered.
+const OUTPUT_GATE_FAULT: &str = "output-gate-sigmoid";
 
 /// The main assertion: our f32 output, on both dispatch arms, is the f64
 /// reference's answer to within f32 arithmetic.
@@ -174,8 +226,8 @@ fn gdn2_f32_agrees_with_the_f64_reference() {
         t.d, t.h, t.hk, t.hv, t.expand_v, t.hv * v_head, t.cases.len(), t.tensors.len()
     );
     for (label, module) in [
-        ("FusedRecurrent", build(&t, Gdn2Mode::FusedRecurrent, 64, &device)),
-        ("Chunk", build(&t, Gdn2Mode::Chunk, 64, &device)),
+        ("FusedRecurrent", build(&t, Gdn2Mode::FusedRecurrent, &device)),
+        ("Chunk", build(&t, Gdn2Mode::Chunk, &device)),
     ] {
         let mut worst = 0.0f64;
         let mut worst_t = 0usize;
@@ -245,13 +297,14 @@ fn the_bar_bites_a_wrong_formula() {
     );
 
     let device = Device::ndarray();
-    let module = build(&t, Gdn2Mode::FusedRecurrent, 64, &device);
+    let module = build(&t, Gdn2Mode::FusedRecurrent, &device);
     let input = Tensor::<3>::from_data(TensorData::new(x.clone(), [1, seq, t.d]), &device);
     let mut state: Option<burn_gdn2::Gdn2State> = None;
     let got = to_f32_vec(&module.forward::<NdArray>(input, &mut state, true));
     let scale = max_abs(ref_y).max(f64::MIN_POSITIVE);
 
     let mut devs = Vec::new();
+    let mut saw_output_gate = false;
     for _ in 0..n_faults {
         let name = rd_name_pub(&mut c);
         let faulty = rd_f64_pub(&mut c, seq * t.d);
@@ -267,6 +320,7 @@ fn the_bar_bites_a_wrong_formula() {
              SEMANTIC_FLOOR {SEMANTIC_FLOOR:.0e} — the bar is no longer separating \
              semantic error from arithmetic noise"
         );
+        saw_output_gate |= name == OUTPUT_GATE_FAULT;
         devs.push((name, rel));
     }
     assert_eq!(
@@ -274,70 +328,33 @@ fn the_bar_bites_a_wrong_formula() {
         data.len(),
         "trailing bytes in the fault fixture"
     );
+    // The output-gate class must stay covered. The loop above only proves the
+    // bar separates what IS in the fixture; this proves the fixture still
+    // contains the one entry that keeps the SiLU-vs-sigmoid choice honest.
+    assert!(
+        saw_output_gate,
+        "ref_f64_faults.bin has no `{OUTPUT_GATE_FAULT}` entry, so the output-gate \
+         technology choice is uncovered again. Re-run tools/gen_reference_f64.py."
+    );
     for (name, rel) in &devs {
-        println!("  wrong formula {name:>18}: {rel:>10.3e} rel  (BAR {BAR:.0e})");
+        println!("  wrong formula {name:>20}: {rel:>10.3e} rel  (BAR {BAR:.0e})");
     }
     let smallest = devs.iter().map(|(_, r)| *r).fold(f64::INFINITY, f64::min);
+    // The margin is `smallest / BAR` and NOTHING ELSE. It used to be quoted as
+    // `max|ref_y| / BAR` (4.6e-01/1e-3 = "460x"), which is the DENOMINATOR of
+    // the relative deviation, not the numerator: the nearest wrong formula was
+    // 2.71e-01 away, i.e. 272x. The number was conservative - it overstated the
+    // margin rather than hiding a tight one - and it was still not what the
+    // arithmetic says. Printed separately from here on so the two can never be
+    // confused again.
     println!(
         "margin: the nearest wrong formula is {smallest:.3e} and the bar is {BAR:.0e} \
          — {:.0}x below it, against f32 noise at the 1e-6 scale",
         smallest / BAR
     );
-    // The `conv-padding` row above is O(1), NOT because the whole of our
-    // disagreement is the conv pad. It is O(1) at T=70 for two reasons at once:
-    // we really do pad wrongly (confirmed stage-by-stage, STATUS block), AND
-    // something between `project`'s output and the layer output disagrees too
-    // (see "NOT FULLY EXPLAINED" in the header). T=1 has no state carry, so it
-    // isolates the pad: measured there, our output and the replicate-padded f64
-    // output are the same number to four significant figures, which is what
-    // "the pad is a real and sufficient explanation at T=1" means. Nothing at
-    // T>1 is explained by it.
-    let (t0, x0, _) = &t.cases[0];
-    assert_eq!(*t0, 1, "case 0 is meant to be the single-token canary");
-    let m0 = build(&t, Gdn2Mode::FusedRecurrent, 64, &device);
-    let inp0 = Tensor::<3>::from_data(TensorData::new(x0.clone(), [1, 1, t.d]), &device);
-    let mut st0: Option<burn_gdn2::Gdn2State> = None;
-    let got0 = to_f32_vec(&m0.forward::<NdArray>(inp0, &mut st0, true));
-    let mut c0 = Cursor::new(data.as_slice());
-    let mut m8 = [0u8; 8];
-    c0.read_exact(&mut m8).unwrap();
-    let _ = rd_u32_pub(&mut c0); // case_idx
-    let _ = rd_u32_pub(&mut c0); // n_faults
-    let _ = rd_u32_pub(&mut c0); // T
-    let _ = rd_u64_pub(&mut c0); // input hash
-    let mut ident = None;
-    for _ in 0..n_faults {
-        let name = rd_name_pub(&mut c0);
-        let faulty = rd_f64_pub(&mut c0, seq * t.d);
-        if name != CONV_FAULT {
-            continue;
-        }
-        // The fault fixture holds T=70 outputs. Its first `d` values are that
-        // case's t=0 output, which is the single-token quantity we want here.
-        let first = &faulty[..t.d];
-        ident = Some(
-            got0.iter()
-                .zip(first.iter())
-                .map(|(a, b)| (*a as f64 - b).abs())
-                .fold(0.0f64, f64::max)
-                / max_abs(first).max(f64::MIN_POSITIVE),
-        );
-    }
-    let ident = ident.expect("the fault fixture has no `conv-padding` entry");
-    // Printed, NOT asserted. The hypothesis this measures is "at T=1, where no
-    // state carry exists, the whole of our disagreement is the conv pad, so our
-    // output should equal the replicate-padded f64 output". IT DOES NOT: the
-    // measured value is O(1), not ~1e-6, even though our `q_conv` matches a f64
-    // replicate-pad to 1.06e-07 and every other 2-D stage of `project` agrees
-    // to ~2e-07. So a SECOND difference exists between this crate's output and
-    // the f64 reference that is not in `project`'s 2-D stages and not in
-    // `fused_recurrent_forward` (which was read against Eq. 9 and matches it).
-    // Asserting the identification would be asserting something measured to be
-    // false; asserting its negation would be asserting an open question. So it
-    // is reported, and left open. See "NOT FULLY EXPLAINED" in the header.
     println!(
-        "T=1 probe: our output vs the {CONV_FAULT} f64 output is {ident:.3e} rel \
-         (expected ~1e-6 if the pad were the ONLY difference; it is not)"
+        "  (for contrast: max|ref_y| on this case is {scale:.3e}, which is the \
+         DENOMINATOR of every rel figure above and is NOT the margin)"
     );
 }
 

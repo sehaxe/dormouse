@@ -55,13 +55,73 @@ PROVENANCE, line by line. Every non-obvious line cites where it comes from:
         `F.conv1d(..., padding=width-1)`; and that test builds its cache from
         an explicit `torch.zeros(B, D, 1)`.
   * output: `FusedRMSNormSwishGate` = `(x / sqrt(mean(x^2) + eps)) * w * silu(g)`,
-        w initialised to ones, NO bias:
-        `fla/modules/fused_norm_gate.py::layer_norm_gated_fwd_kernel`,
-        `IS_RMS_NORM` branch + `b_y = b_y * b_g * sigmoid(b_g)`. The bias is
-        `register_parameter("bias", None)`, so it does not exist.
+        w initialised to ones, NO bias.
+        THE GATE IS A CONFIGURATION, NOT A TRANSCRIPTION, and this layer is
+        where a reader previously got it wrong in both directions, so the whole
+        dispatch is spelled out. Fetched 2026-09-29:
+          fla-org/flash-linear-attention @ 9f38d249 (main)
+            fla/modules/fused_norm_gate.py:101-104, `layer_norm_gated_fwd_kernel`
+                if ACTIVATION == "swish" or ACTIVATION == "silu":
+                    b_y = b_y * b_g * tl.sigmoid(b_g)
+                elif ACTIVATION == "sigmoid":
+                    b_y = b_y * tl.sigmoid(b_g)
+            ONE kernel, TWO branches. The line quoted above is the `swish` one.
+            :1074 `class FusedRMSNormSwishGate(FusedRMSNormGated)` does not pass
+            `activation` to super().__init__, so it takes the class default at
+            :997, `activation: str = "swish"` => silu.
+            :997 `FusedRMSNormGated.__init__` default; `register_parameter(
+            "bias", None)`, so the norm has no bias.
+          NVlabs/GatedDeltaNet-2 @ a5552fe3 (main)
+            lit_gpt/gdn2.py:212  self.o_norm = FusedRMSNormSwishGate(...)  => silu
+          fla/layers/gdn2.py:197 (same repo, DIFFERENT FILE)
+            self.o_norm = FusedRMSNormGated(self.head_v_dim, activation="sigmoid")
+            => sigmoid.
+        So the two credible upstreams DISAGREE, and they disagree at the LAYER
+        (`fla/layers/gdn2.py`), not inside the kernel. `src/module.rs` and
+        `research/papers/output-gate-silu-vs-sigmoid.md` carry the finding; it is
+        an unresolved technology A/B arm and is deliberately NOT settled here.
+        What is settled is that the choice is not silent: `output-gate-sigmoid`
+        is one of the committed wrong formulas, so the distance between the two
+        branches on these weights and this input is data in the tree. A claim
+        that this layer "transcribes the FLA file" and therefore picks sigmoid
+        is wrong in a way worth naming: the citation above is to
+        `fla/modules/`, and the file that selects sigmoid is `fla/layers/`.
   * GVA: q, k, g, b repeated across value-head groups; v and w already live on
         the value-head axis. Paper §3.5 and App. C.1.
   * `allow_neg_eigval` scales ONLY b by 2, never w. Paper §3.1 and App. C.1.
+
+THE SWEEP FOR THE CLASS THE OUTPUT GATE BELONGS TO. A citation to file A and a
+kernel that lives in file B is a blind spot if A and B can disagree. Four lines
+here cite one file and are implemented against another, so all four were checked
+against BOTH upstreams on 2026-09-29 at a5552fe3 (NVlabs) and 9f38d249 (fla).
+Three cannot diverge; one does, and it is the output gate.
+
+  short conv   CANNOT DIVERGE. `lit_gpt/gdn2.py:36` is
+               `from fla.modules import FusedRMSNormSwishGate,
+               ShortConvolution` - NVlabs imports FLA's class, so "our source" and
+               "their source" are the same object.
+  L2 norm      CANNOT DIVERGE. `lit_gpt/gdn2_ops/chunk_gdn2.py:64` is
+               `from fla.modules.l2norm import l2norm_fwd, l2norm_bwd`, called
+               at :2060-2061. And the one place NVlabs does NOT import it, the
+               recurrent kernel's own `USE_QK_L2NORM_IN_KERNEL` branch
+               (`fused_recurrent_gdn2.py:198-200`), hardcodes the same
+               `1 / sqrt(sum(x*x) + 1e-6)` this file uses.
+  scale        CANNOT DIVERGE. The reference claims 1/sqrt(K) multiplies the
+               WHOLE readout, not one term. `fla/ops/gla/chunk.py` carries it on
+               both: `:188`/`:267` scale the intra-chunk `b_A`, and `:427`
+               `b_o *= scale` scales the inter-chunk readout. NVlabs's chunk
+               kernel is the same shape (`:196`/`:334` on `b_Aqk`). The arm this
+               fixture actually exercises is the recurrent one, and
+               `fused_recurrent_gdn2.py:201` does `b_q = b_q * scale` with the
+               default `scale = k.shape[-1] ** -0.5` at `:322` - scaling the
+               readout query, which is the same thing.
+  output gate  DIVERGES, and is the finding. One kernel, two `ACTIVATION`
+               branches; the two LAYERS select them differently.
+
+So the output gate is the only line in this transcription where "what NVlabs
+does" and "what fla does" are different functions, and it is the one the review
+found by diffing the two upstreams. Anyone extending this file should re-run the
+sweep rather than assume the next citation is safe.
 
 WHY f32 WEIGHTS IN THE FIXTURE. The weights and the inputs are stored f32, so
 both arms of the comparison start from bit-identical values and the ONLY thing
@@ -246,9 +306,28 @@ def gdn2_forward(x, P, fault=None):
         g = -g
 
     # -> per head, [H, T, *]
+    #
+    # ALL SIX use the same idiom, and all six are [T, flat] token-major buffers
+    # being split as (T, H, HK) and then transposed to [H, T, HK]. `g` used to be
+    # `g.T.reshape(H, t, HK)` instead - a head-major reshape of the same
+    # token-major buffer. That is correct for no t and wrong for every t > 1;
+    # it agrees with the correct form ONLY at t == 1, where the two indexings
+    # coincide on every element. Arithmetic, H=4 HK=16 t=2, input g[kd, i]:
+    #     out[h, 0, 0] = g[(16*(h*t+0)+0) % 64, (h*t+0)//4] = g[32*h, h*t//4]
+    # so head 1 read g[32, ...] where it must read g[16, ...]. Verified
+    # numerically: the two forms are bit-identical at t=1 (max|d| = 0.0) and
+    # differ by 1.037e-02 at t=2, rising to 2.1e-01 at t=70.
+    #
+    # This is the `ff7cd57` defect again, in a file written after that fix:
+    # `tools/gen_reference.rs` read token-major scan inputs with head-major
+    # offsets, and exactly the 24 single-token cases there coincided. The
+    # consequence for that test was a false RED; here it was a false FIXTURE,
+    # and the cost was that `tests/ref_f64.rs` was red on every case from the
+    # second one onwards for a reason that had nothing to do with the kernel.
+    # See the STATUS block in tests/ref_f64.rs.
     q = q.reshape(t, H, HK).transpose(1, 0, 2)
     k = k.reshape(t, H, HK).transpose(1, 0, 2)
-    g = g.T.reshape(H, t, HK)
+    g = g.T.reshape(t, H, HK).transpose(1, 0, 2)
     b = b.reshape(t, H, HK).transpose(1, 0, 2)
     v = v.reshape(t, HV, VH).transpose(1, 0, 2)
     wg = wg.reshape(t, HV, VH).transpose(1, 0, 2)
@@ -295,7 +374,14 @@ def gdn2_forward(x, P, fault=None):
     gate = (P["g_proj_1"] @ (P["g_proj_0"] @ x.T) + P["g_proj_1_b"][:, None]).T
     gate = gate.reshape(t, HV, VH)
     rms = np.sqrt((outs * outs).mean(-1, keepdims=True) + NORM_EPS)
-    outs = outs / rms * P["o_norm_w"] * silu(gate)
+    # The `sigmoid` branch is the OTHER credible upstream's layer-level choice
+    # (`fla/layers/gdn2.py:197`, @ 9f38d249) and is an unresolved A/B arm - see
+    # the docstring. It lives here, in the FAULT list, so the distance between
+    # the two branches is a committed number on these weights and this input
+    # rather than a sentence in a docstring. `silu` is the branch we implement
+    # and the branch `lit_gpt/gdn2.py:212` (@ a5552fe3) selects.
+    act = sigmoid(gate) if fault == "output-gate-sigmoid" else silu(gate)
+    outs = outs / rms * P["o_norm_w"] * act
     return (P["o_proj"] @ outs.reshape(t, VD).T).T
 
 
@@ -412,7 +498,7 @@ def write_fixture(path, P, fault=None, seq_lens=SEQ_LENS):
 
 
 FAULTS = ["decay-sign", "transposed-proj", "no-write-gate", "no-erase-gate",
-          "read-before-write", "conv-padding", "no-scale"]
+          "read-before-write", "conv-padding", "no-scale", "output-gate-sigmoid"]
 
 # The case whose wrong-formula outputs get committed. The longest one: it is
 # the only length where a semantic error and f32 noise are both fully present
@@ -432,7 +518,7 @@ def write_fault_fixture(path, P):
 
     The input hash is not decoration. The first version of this file re-drew
     the RNG for this case instead of consuming the stream up to it, so these
-    outputs were computed on a DIFFERENT input and all seven faults read O(1)
+    outputs were computed on a DIFFERENT input and every fault read O(1)
     for a reason that had nothing to do with the formulas. The test now
     recomputes this hash from `ref_f64.bin` and refuses to compare if it
     differs."""
@@ -610,7 +696,7 @@ def main():
     ap.add_argument("--fault", default=None,
                     choices=["decay-sign", "transposed-proj", "no-write-gate",
                              "no-erase-gate", "read-before-write", "conv-padding",
-                             "no-scale"])
+                             "no-scale", "output-gate-sigmoid"])
     ap.add_argument("--faults-out", default="tests/ref_f64_faults.bin",
                     help="where to write the wrong-formula fixture")
     ap.add_argument("--self-test", action="store_true")
