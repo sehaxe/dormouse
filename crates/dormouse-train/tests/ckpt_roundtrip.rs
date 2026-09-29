@@ -14,9 +14,8 @@ use burn::tensor::{Device, Int, Tensor, TensorData};
 use dormouse_core::{fnv_hash, DormouseConfig, DormouseModel};
 use dormouse_train::{build_optim, load_ckpt, save_ckpt, Backend, TrainCfg};
 
-#[allow(deprecated)] // Device::ndarray is deprecated upstream; the repo still targets it
 fn device() -> Device {
-    Device::ndarray().autodiff()
+    Device::flex().autodiff()
 }
 
 /// Nano's shape at a debug-build-friendly width (same reasoning as the train

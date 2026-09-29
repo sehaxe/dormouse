@@ -31,10 +31,7 @@ default = ["std"]
 # The CPU backend is burn-flex (upstream's burn-ndarray replacement, and the
 # one that has f16/bf16). No BLAS: burn-flex matmuls through the `gemm` crate,
 # so the test path needs no native build dependency at all.
-#
-# `burn/ndarray` is a COMPILE BRIDGE for one `Device::ndarray()` in
-# loop_block.rs's test module (2026-09-27). Delete it together with that line.
-std = ["burn/std", "burn-tensor/std", "burn/autodiff", "burn/flex", "burn/ndarray"]
+std = ["burn/std", "burn-tensor/std", "burn/autodiff", "burn/flex"]
 cuda = [
     "burn/cuda",
     "burn-kda/cuda",

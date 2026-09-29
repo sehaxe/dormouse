@@ -144,14 +144,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn::backend::NdArray;
+    use burn::backend::Flex;
     use burn::tensor::Distribution;
 
     #[test]
     fn quant_act_bounds_and_ste() {
-        let dev = burn::tensor::Device::ndarray();
+        let dev = burn::tensor::Device::flex();
         let x: Tensor<2> = Tensor::random([16, 64], Distribution::Normal(0.0, 1.0), &dev);
-        let q = quant_act::<NdArray>(x.clone(), ActFormat::Int(4), 0);
+        let q = quant_act::<Flex>(x.clone(), ActFormat::Int(4), 0);
         let v: Vec<f32> = q.into_data().try_to_vec().unwrap();
         assert!(v.iter().all(|x| x.is_finite()), "quantized acts must be finite");
         let orig: Vec<f32> = x.into_data().try_to_vec().unwrap();
@@ -167,13 +167,13 @@ mod tests {
     /// implementation: 0.75 was on it and is not in the format.
     #[test]
     fn every_e2m1_magnitude_round_trips() {
-        let dev = burn::tensor::Device::ndarray();
+        let dev = burn::tensor::Device::flex();
         let vals: Vec<f32> = E2M1.iter().skip(1).copied().collect();
         let x: Tensor<2> = Tensor::from_data(
             burn::tensor::TensorData::new(vals.clone(), [1, vals.len()]),
             &dev,
         );
-        let out: Vec<f32> = fp4_round::<NdArray>(x).into_data().try_to_vec().unwrap();
+        let out: Vec<f32> = fp4_round::<Flex>(x).into_data().try_to_vec().unwrap();
         for (a, b) in vals.iter().zip(out.iter()) {
             assert!((a - b).abs() < 1e-4, "e2m1 round-trip: {a} -> {b}");
         }
@@ -182,7 +182,7 @@ mod tests {
             burn::tensor::TensorData::new(vals.iter().map(|v| -v).collect::<Vec<_>>(), [1, vals.len()]),
             &dev,
         );
-        let out: Vec<f32> = fp4_round::<NdArray>(x).into_data().try_to_vec().unwrap();
+        let out: Vec<f32> = fp4_round::<Flex>(x).into_data().try_to_vec().unwrap();
         for (a, b) in vals.iter().zip(out.iter()) {
             assert!((a + b).abs() < 1e-4, "e2m1 round-trip: -{a} -> {b}");
         }
@@ -196,7 +196,7 @@ mod tests {
     /// what the old test could not do.
     #[test]
     fn fp4_output_is_always_the_nearest_e2m1_level() {
-        let dev = burn::tensor::Device::ndarray();
+        let dev = burn::tensor::Device::flex();
         // Midpoints are where a rounding rule differs; sample around each.
         let mut grid: Vec<f32> = (0..=120).map(|i| i as f32 * 0.1 - 1.0).collect();
         for w in E2M1.windows(2) {
@@ -221,7 +221,7 @@ mod tests {
                 best.copysign(*v)
             })
             .collect();
-        let got: Vec<f32> = fp4_round::<NdArray>(Tensor::from_data(
+        let got: Vec<f32> = fp4_round::<Flex>(Tensor::from_data(
             burn::tensor::TensorData::new(grid.clone(), [1, n]),
             &dev,
         ))
@@ -245,9 +245,9 @@ mod tests {
     /// `1 / max_value`. `quant_act` returns DEQUANTIZED values, so level `L`
     /// comes back as `L * scale`.
     fn dequantized_ramp(fmt: ActFormat, n: usize) -> Vec<f32> {
-        let dev = burn::tensor::Device::ndarray();
+        let dev = burn::tensor::Device::flex();
         let ramp: Vec<f32> = (0..n).map(|i| i as f32 / (n - 1) as f32).collect();
-        let q = quant_act::<NdArray>(
+        let q = quant_act::<Flex>(
             Tensor::from_data(burn::tensor::TensorData::new(ramp, [1, n]), &dev),
             fmt,
             0,

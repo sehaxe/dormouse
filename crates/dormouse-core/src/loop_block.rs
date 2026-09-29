@@ -608,7 +608,7 @@ mod tests {
     use burn::tensor::Device;
 
     fn dev() -> Device {
-        Device::ndarray()
+        Device::flex()
     }
 
     /// Recover the mixture coefficient `a` in `out = a*mem + (1-a)*dense`

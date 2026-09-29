@@ -39,7 +39,7 @@ pub type Backend = burn::backend::autodiff::Autodiff<
 >;
 #[cfg(all(feature = "cpu", not(feature = "cuda")))]
 pub type Backend = burn::backend::autodiff::Autodiff<
-    burn_ndarray::NdArray,
+    burn::backend::Flex,
     burn::backend::autodiff::checkpoint::strategy::BalancedCheckpointing,
 >;
 #[cfg(not(any(feature = "cpu", feature = "cuda")))]
@@ -173,14 +173,14 @@ impl Default for TrainCfg {
 /// The device every path in this crate runs on, autodiff-wrapped. `pub`
 /// because the export's gate and its divergence measurement have to build
 /// their models on the SAME device as the code under test: a test that quietly
-/// hardcodes `Device::ndarray()` under `--features cuda` compares two BACKENDS
+/// hardcodes a different device under `--features cuda` compares two BACKENDS
 /// and calls the 1-ULP difference a container bug (which is exactly what it
 /// did before this was public).
 pub fn device() -> Device {
     #[cfg(feature = "cuda")]
     { Device::cuda(0).autodiff() }
     #[cfg(all(feature = "cpu", not(feature = "cuda")))]
-    { Device::ndarray().autodiff() }
+    { Device::flex().autodiff() }
 }
 
 /// Pool introspection (debug): bytes reserved/used/live allocs on the CUDA client.
@@ -1995,7 +1995,7 @@ mod tests {
             let u = l.u.val().mul_scalar(3.0).detach();
             l.u = burn::module::Param::from_tensor(u.into());
         } else {
-            panic!("LinearLike must be TSCT on ndarray");
+            panic!("LinearLike must be TSCT on the CPU backend");
         }
         let before = ll.max_ortho();
         ll.retract(3);

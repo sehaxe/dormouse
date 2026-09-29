@@ -28,15 +28,15 @@ use dormouse_core::loop_block::ExpertFFN;
 use dormouse_core::param::LinearLikeInner;
 use dormouse_core::{fnv_hash, DormouseConfig, DormouseModel};
 
-// NdArray, like the rest of this crate's CPU tests. Nothing here is
-// device-specific: what is under test is loop ORDER.
-type B = Autodiff<burn::backend::NdArray, BalancedCheckpointing>;
+// The CPU backend (burn-flex), like the rest of this crate's CPU tests.
+// Nothing here is device-specific: what is under test is loop ORDER.
+type B = Autodiff<burn::backend::Flex, BalancedCheckpointing>;
 
 const BATCH: usize = 2;
 const SEQ: usize = 16;
 
 fn device() -> Device {
-    Device::ndarray().autodiff()
+    Device::flex().autodiff()
 }
 
 /// A GR model small enough for a CPU forward. `use_tsct = false` so the

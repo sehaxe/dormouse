@@ -157,10 +157,9 @@ mod tests {
     use burn::backend::autodiff::checkpoint::strategy::BalancedCheckpointing;
     use burn::tensor::TensorData;
 
-    // NdArray, the backend this crate's CPU tests ran on before the flex
-    // migration. Either works: the arithmetic here is backend-independent and
-    // the point is the EQUATION, not the device.
-    type B = Autodiff<burn::backend::NdArray, BalancedCheckpointing>;
+    // The CPU backend (burn-flex). Either backend works: the arithmetic here is
+    // backend-independent and the point is the EQUATION, not the device.
+    type B = Autodiff<burn::backend::Flex, BalancedCheckpointing>;
 
     const D: usize = 8;
     const R: usize = 4; // (D/8).max(4)
@@ -171,7 +170,7 @@ mod tests {
     /// Dense linears: the TSCT path's u/s/v factorization is not what these
     /// tests are about, and a host reference needs one [out, in] matrix.
     fn device() -> Device {
-        Device::ndarray().autodiff()
+        Device::flex().autodiff()
     }
 
     fn gr(device: &Device) -> GatedResidual {

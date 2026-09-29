@@ -144,7 +144,7 @@ mod tests {
     #[test]
     fn no_gradient_is_nan_not_a_clean_zero() {
         use burn::nn::LinearConfig;
-        let dev = burn::tensor::Device::ndarray().autodiff();
+        let dev = burn::tensor::Device::flex().autodiff();
         let lin = LinearConfig::new(4, 4).init(&dev);
         // A gradient set that shares no parameter with `lin` at all.
         let unrelated = burn::tensor::Tensor::<1>::zeros([1], &dev)

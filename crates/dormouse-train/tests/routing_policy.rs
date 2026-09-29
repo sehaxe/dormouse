@@ -24,9 +24,8 @@ use dormouse_core::routing::{routing, Group};
 use dormouse_core::{DormouseConfig, DormouseModel};
 use dormouse_train::{optimizer_groups, param_paths, TrainCfg};
 
-#[allow(deprecated)] // Device::ndarray is deprecated upstream; the repo still targets it
 fn device() -> burn::tensor::Device {
-    burn::tensor::Device::ndarray().autodiff()
+    burn::tensor::Device::flex().autodiff()
 }
 
 /// Small enough to build in a second on the CPU backend, wide enough that

@@ -340,7 +340,7 @@ mod tests {
     use burn::tensor::Device;
 
     fn dev() -> Device {
-        Device::ndarray()
+        Device::flex()
     }
 
     fn cfg() -> DormouseConfig {

@@ -733,6 +733,7 @@ version = "0.1.0"
 dependencies = [
  "burn",
  "burn-cuda",
+ "burn-mor",
  "burn-ndarray",
  "burn-tensor",
 ]
@@ -2891,7 +2892,6 @@ dependencies = [
  "burn-cuda",
  "burn-dispatch",
  "burn-muon-plus",
- "burn-ndarray",
  "burn-spectral",
  "burn-tensor",
  "clap",
