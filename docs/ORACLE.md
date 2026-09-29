@@ -127,12 +127,14 @@ This file narrows that to the two crates that carry the headline.
 byte-identically, and CI diffs the two — that is a real, well-built tier-(c)
 anchor, and it is the best infrastructure in the tree.
 
-It is **RED**: 1000 cases, `max_diff = 1.38e-2`, 976/1000 failures at
-`EPSILON = 5e-4`, and `binary-tests` is not in `default`. Confirmed by running
-it on this cell, and confirmed *twice over* — see §5.1. The cause is localised
-but not diagnosed (a layout defect in the generator: token-major buffers read
-with head-major offsets, which is why exactly the 24 single-token cases pass).
-Two consequences that belong in any decision about this crate:
+It is **RED**. Recorded measurement: 1000 cases, `max_diff = 1.38e-2`,
+976/1000 failures at `EPSILON = 5e-4` — `vendor/burn-fused/TEST-AUDIT.md`
+FINDING 0, ndarray, 2026-09-27, snapshot `1fab19e`. The cause is localised but
+not diagnosed (a layout defect in the generator: token-major buffers read with
+head-major offsets, which is why exactly the 24 single-token cases pass). The
+`binary-tests` feature is deliberately not in `default`, and the consequence is
+measurable in an ordinary test run — see §5.1. Two further consequences that
+belong in any decision about this crate:
 
 1. **The only layer that can see `project` currently sees nothing**, because the
    feature is not default and the suite is red. Every run of
