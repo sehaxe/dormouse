@@ -161,10 +161,50 @@ fn polar_retracked(before: &Tensor<2>, iters: usize) -> Tensor<2> {
     }
 }
 
-/// Newton-Schulz polar iteration (Muon+ 2602.21545 §1): nearest
-/// orthonormal approximation under Frobenius norm, all tensor ops on the
-/// device - replaces SCT's CPU QR entirely. Newton-Schulz in X·Xᵀ form
-/// (small side [c,c]) with the optimal cubic coefficients.
+/// Newton-Schulz polar iteration: nearest orthonormal approximation under
+/// Frobenius norm, all tensor ops on the device - replaces SCT's CPU QR
+/// entirely. Newton-Schulz in X·Xᵀ form (small side [c,c]) with the optimal
+/// cubic coefficients `(15/8, −5/4, 3/8)`.
+///
+/// **The coefficients**: the last entry of the PolarExpress schedule tabulated
+/// in Muon+ **v3** (arXiv:2602.21545**v3**, 14 May 2026) **Appendix D.3**, which
+/// prints `{(aₜ,bₜ,cₜ)}ₜ₌₁⁸` ending at exactly `(1.875, −1.25, 0.375)` — our
+/// triple. That appendix is the only place the triple appears; **v1 and v2
+/// print no NS coefficients at all** (checked 2026-09-29: neither HTML
+/// version contains the string `1.875`), so the citation must name v3, not the
+/// paper's §1. Fetched from `https://arxiv.org/html/2602.21545v3`.
+///
+/// **Why the sigma_max power iteration is here** (it is not removable, and
+/// `research/reviews/muon-tsct-review-b.md` §1.7 gets this wrong): the cubic
+/// `p(s) = 1.875s − 1.25s³ + 0.375s⁵` has `p′(s) = 1.875(s²−1)² ≥ 0`, `p(1) = 1`
+/// and `p(s) − s > 0` on `(0,1)`, so its basin is `[0,1]` and Cauchy–Schwarz
+/// (`σ_max ≤ ‖X‖_F`) proves a **Frobenius prescale cannot make it diverge**.
+/// That part is right. What it does not show is that the prescale is
+/// *redundant*: the prescale's job is to put `σ_max` **at** the fixed point
+/// `p(1) = 1`, not merely inside the basin, and only a `σ_max`-normalised
+/// scalar does that. With `iters = 3` on an on-the-manifold `k = 64` factor
+/// the two prescales give completely different answers:
+///
+/// | prescale | start `σ` | `σ` after 3 iters | per-entry `‖UᵀU−I‖` |
+/// |---|---|---|---|
+/// | `σ_max · 1.05` (here) | 0.952 | **1.0000** | 3.0e-7 |
+/// | `‖X‖_F` | 0.125 | **0.6992** | **6.4e-2** |
+///
+/// (fp32, on a `[768,64]` factor that starts exactly on the manifold; both
+/// rows are fixed points of themselves over 5 further applications, so the
+/// second is not a decay to zero — it is a retraction onto a *different*
+/// manifold.) A factor that arrives on the manifold at `σ = 1` is shrunk 30%
+/// in one step and then held there forever, its Frobenius norm is 5.5938
+/// instead of 8, and `max_ortho` sits at 6.4e-2 per entry — 64× over the
+/// one-way 1e-3 latch in `train/src/lib.rs`, which then persists in the
+/// checkpoint. The reviewer also gets the iteration count wrong when it
+/// appeals to the optimizer: its plain Frobenius prescale
+/// (`burn-muon-plus/src/lib.rs:137`) runs `ns_steps = 8`, where
+/// `p⁸(1/√k) = 1`; the retraction runs 3, where `p³(1/√k) ≠ 1` for `k ≥ 10`
+/// (`0.997` at `k = 8`, `0.963` at 16, `0.699` at 64).
+/// `retraction_holds_the_manifold_at_rank_64` and
+/// `retraction_puts_sigma_max_at_one` are the tests that fail if anyone
+/// swaps this for a Frobenius prescale.
 pub fn polar_orthogonalize(x: Tensor<2>, iters: usize) -> Tensor<2> {
     let dims = x.dims();
     let (rows, cols) = (dims[0], dims[1]);
@@ -173,17 +213,24 @@ pub fn polar_orthogonalize(x: Tensor<2>, iters: usize) -> Tensor<2> {
     } else {
         (x, false)
     };
-    // Scale sigma_max to ~1 so every singular value lands inside the cubic
-    // NS basin (sigma < sqrt(3)). A Frobenius/sqrt(k) pre-scale does NOT
-    // bound sigma_max: for a square n×n Gaussian matrix ||X||_F ≈ n but
-    // sigma_max ≈ 2√n (Bai-Yin), so sigma_max ≈ 2 stays above the basin
-    // and NS diverges (measured: polar([512,512], 3) -> max entry ~1e14).
-    // Estimate sigma_max via power iteration on the small-side Gram [c,c].
+    // Put sigma_max at ~1 (see the doc comment for why this is not a plain
+    // Frobenius divide) by power iteration on the small-side Gram [c,c].
+    // The norm is a [1]-shaped TENSOR broadcast against v, never a host
+    // scalar: this path used to take 7 blocking device reads per factor (5
+    // in the power loop, 2 for the Rayleigh quotient) and now takes none -
+    // 112 per training step at `small`, 16 TSCT factors x 7. Same
+    // construction as polar_orthogonalize_batched below and as the optimizer
+    // at burn-muon-plus/src/lib.rs:137. Same ops, same order, so the values
+    // do not move: `sync_free_retraction_is_bit_identical_to_the_host_read_one`
+    // pins that bit-for-bit against the old code on the ndarray backend; on
+    // cubecl the only difference is the reduction kernel for a 64-element sum
+    // (`sum` vs `sum_dim(0)`), a reordering inside one block, and the result
+    // enters as a single divisor.
     let g = m.clone().matmul(m.clone().transpose()); // [c, c]
     let mut v = g.clone().sum_dim(1).squeeze_dim::<1>(1); // [c], row sums = g·1
     for _ in 0..POWER_ITERS {
-        let vn = v.clone().mul(v.clone()).sum().sqrt().clamp_min(1e-12);
-        v = v.div_scalar(vn.into_scalar::<f32>());
+        let vn = v.clone().mul(v.clone()).sum_dim(0).sqrt().clamp_min(1e-12); // [1]
+        v = v.div(vn);
         v = g
             .clone()
             .matmul(v.clone().unsqueeze_dim::<2>(1))
@@ -194,12 +241,14 @@ pub fn polar_orthogonalize(x: Tensor<2>, iters: usize) -> Tensor<2> {
         .clone()
         .matmul(v.clone().unsqueeze_dim::<2>(1))
         .squeeze_dim::<1>(1);
-    let vgv = v.clone().mul(gv).sum().into_scalar::<f32>();
-    let vv = v.clone().mul(v.clone()).sum().into_scalar::<f32>();
-    let sigma = (vgv / vv.max(1e-14)).sqrt().max(1e-7);
+    let vgv = v.clone().mul(gv).sum_dim(0).unsqueeze_dim::<2>(0); // [1, 1]
+    let vv = v.clone().mul(v.clone()).sum_dim(0).unsqueeze_dim::<2>(0); // [1, 1]
+    // `clamp_min` is the tensor form of the old `f32::max` clamps; the two
+    // differ only for NaN, and vᵀv >= 0 makes NaN unreachable here.
+    let sigma = vgv.div(vv.clamp_min(1e-14)).sqrt().clamp_min(1e-7); // [1, 1]
     // 1.05 safety factor: power iteration converges from below, so the true
     // sigma_max stays strictly inside the basin (Q is scale-invariant).
-    m = m.div_scalar(sigma * 1.05);
+    m = m.div(sigma.mul_scalar(1.05));
     // Newton-Schulz in X·Xᵀ form (small side [c,c], same as Muon+):
     // x <- a·x + (b·XXᵀ + c·(XXᵀ)²)·x, optimal NS coefficients
     let (a, b, c) = (15.0f32 / 8.0, -5.0f32 / 4.0, 3.0f32 / 8.0);
@@ -1282,6 +1331,297 @@ mod tests {
             "polar must improve ortho: {before} -> {after}"
         );
         assert!(after < 1e-3, "polar must restore orthonormality: {after}");
+    }
+
+    /// The `max_ortho` metric, per entry: `‖UᵀU−I‖_F / rank`. Same
+    /// definition as the one the trainer's one-way fp32 latch uses
+    /// (`train/src/lib.rs`), and the threshold below is that latch's.
+    fn ortho_err_per_entry(u: &Tensor<2>) -> f32 {
+        ortho_error(u) / u.dims()[1] as f32
+    }
+
+    /// An exactly orthonormal `[768, 64]` factor - the trainer's factor
+    /// shape at `rank = 64`. The first 64 modes of the n=768 DCT-II basis
+    /// (rows of an orthogonal transform, so exact in real arithmetic; 1.3e-7
+    /// per entry in fp32), rather than `qr_householder` at this size: the
+    /// Householder path is 64 passes of `[768, 768]` and a test that spends
+    /// seconds proving nothing is a test that gets skipped. The j = 0 mode
+    /// carries `1/√N` and the rest `√(2/N)`; that asymmetry is the whole
+    /// normalisation, and the test asserts the fixture rather than trusting it.
+    fn ortho_factor_768x64(dev: &Device) -> Tensor<2> {
+        const N: usize = 768;
+        const K: usize = 64;
+        let mut data = vec![0.0f32; N * K];
+        for i in 0..N {
+            for j in 0..K {
+                let scale = if j == 0 {
+                    1.0 / (N as f32).sqrt()
+                } else {
+                    (2.0 / N as f32).sqrt()
+                };
+                data[i * K + j] = scale
+                    * ((std::f32::consts::PI * (2 * i + 1) as f32 * j as f32)
+                        / (2 * N) as f32)
+                        .cos();
+            }
+        }
+        Tensor::<2>::from_data(burn::tensor::TensorData::new(data, [N, K]), dev)
+    }
+
+    /// A retraction is a map whose fixed point is the manifold: a factor
+    /// that is ALREADY orthonormal must come back orthonormal, at the rank
+    /// the trainer actually runs (`rank = 64`, `retract_iters = 3`), not at
+    /// the `k = 8` of the test above.
+    ///
+    /// This is the gate on the `sigma_max` prescale, and it is deliberately
+    /// at `iters = 3`: the cubic's `p³` sends the *normalized* singular
+    /// values to 1 only from a start near 1. An `σ_max`-normalized factor
+    /// starts at `1/1.05` and lands on the manifold; a `‖X‖_F`-normalized
+    /// one starts at `1/√64` and `p³(0.125) = 0.6992`, which is 6.4e-2 per
+    /// entry - 64× over the latch. It is a fixed point of itself, so it is
+    /// not a decay: every input is mapped to a factor 30% short of the
+    /// manifold and held there. See the doc comment on
+    /// [`polar_orthogonalize`]; the retraction is a fixed 3 iterations
+    /// (`retract_iters: 3`), which is why the optimizer's 8-iteration
+    /// Frobenius prescale is not a substitute.
+    #[test]
+    fn retraction_holds_the_manifold_at_rank_64() {
+        let dev = dev();
+        let u = ortho_factor_768x64(&dev);
+        assert!(
+            ortho_err_per_entry(&u) < 1e-4,
+            "fixture is not on the manifold to begin with: {}",
+            ortho_err_per_entry(&u)
+        );
+        // The manifold is a fixed point: retract it and it must still be there.
+        let once = polar_orthogonalize(u.clone(), 3);
+        let e = ortho_err_per_entry(&once);
+        assert!(
+            e < 1e-3,
+            "retraction must HOLD the manifold at rank 64 / 3 iters, got {e:.3e} \
+             per entry (1e-3 is the trainer's max_ortho latch)"
+        );
+        // ...and it must be a fixed point there, or the retraction is a
+        // drift. A bound, not an equality: the retraction is not bit-
+        // idempotent in fp32 (one more pass moves the last bits), but a
+        // second pass must not move the factor. A Frobenius prescale moves
+        // it by 30%.
+        let twice = polar_orthogonalize(once.clone(), 3);
+        let drift = twice.clone().sub(once.clone()).abs().max().into_scalar::<f32>();
+        assert!(
+            drift < 1e-4,
+            "a second retraction must be a no-op on the manifold, max drift {drift:.3e}"
+        );
+        // And it must still pull a scaled factor back (the job), at this rank.
+        let scaled = polar_orthogonalize(u.mul_scalar(3.0), 3);
+        let es = ortho_err_per_entry(&scaled);
+        assert!(es < 1e-3, "retraction must pull 3x off the manifold: {es:.3e}");
+        // Scale is preserved, not merely direction: a retraction does not
+        // shrink the factor. `‖X‖_F ~ sqrt(rank)` is what "on the manifold"
+        // means for a tall factor.
+        let n = scaled.powf_scalar(2.0).sum().into_scalar::<f32>().sqrt();
+        assert!(
+            (n - 8.0).abs() < 1e-2,
+            "retracted [768,64] must have ||X||_F ~ sqrt(rank) = 8, got {n}"
+        );
+    }
+
+    /// The same invariant on a REAL tracked tensor: `polar_retracked` is
+    /// the one autodiff-dependent step in a retraction, and this is the
+    /// shape and the device where `is_require_grad` is live and the
+    /// `.detach()` / re-flag actually decides whether the master freezes.
+    /// A test on a bare `Device::ndarray()` cannot fail here at all, which
+    /// is why the tracking tests use `.autodiff()`. The fixture goes through
+    /// `Param::from_tensor` because that is what makes a master tracked — a
+    /// tensor built from raw data is an untracked leaf.
+    #[test]
+    fn retraction_holds_the_manifold_on_a_tracked_master() {
+        let adev = Device::ndarray().autodiff();
+        let u = Param::from_tensor(ortho_factor_768x64(&adev)).val();
+        assert!(u.is_require_grad(), "fixture is not a tracked master");
+        let r = polar_retracked(&u, 3);
+        assert!(r.is_require_grad(), "retract dropped the tracked master");
+        let e = ortho_err_per_entry(&r);
+        assert!(
+            e < 1e-3,
+            "tracked master must land on the manifold, got {e:.3e} per entry"
+        );
+    }
+
+    /// The other half of the prescale claim, in values: the retraction
+    /// normalizes by `sigma_max`, not by the Frobenius norm. The doc comment
+    /// on [`polar_orthogonalize`] says 0.6992 vs 1.0; this keeps the number
+    /// honest in the tree so a comment and a behaviour cannot drift apart.
+    /// `sqrt(trace(UᵀU)/k)` is the RMS singular value - 1.0 for an
+    /// on-the-manifold retraction, 0.6992 for a Frobenius-normalised one.
+    #[test]
+    fn retraction_puts_sigma_max_at_one() {
+        let dev = dev();
+        let s = polar_orthogonalize(ortho_factor_768x64(&dev), 3);
+        let k = s.dims()[1] as f32;
+        let rms = s
+            .clone()
+            .transpose()
+            .matmul(s)
+            .sum()
+            .into_scalar::<f32>()
+            / k;
+        let sigma_max = rms.sqrt();
+        assert!(
+            (sigma_max - 1.0).abs() < 1e-2,
+            "retracted rank-64 factor has sigma_max {sigma_max:.4}, expected \
+             ~1.0; a Frobenius prescale gives 0.6992 and is NOT a retraction"
+        );
+    }
+
+    /// The source of `fn <name>` in this file, from its signature to the
+    /// first brace at column 0.
+    fn fn_source<'a>(src: &'a str, name: &str) -> &'a str {
+        let needle = format!("fn {name}(");
+        let at = src
+            .find(&needle)
+            .unwrap_or_else(|| panic!("no `{needle}` in lib.rs"));
+        let start = src[..at].rfind('\n').map_or(at, |p| p + 1);
+        let rest = &src[start..];
+        let end = rest
+            .find("\n}\n")
+            .unwrap_or_else(|| panic!("`{needle}` has no closing brace at column 0"));
+        &rest[..end + 3]
+    }
+
+    /// Gate: the scalar retraction takes ZERO host reads. It used to take
+    /// seven per factor - five in the power loop, two for the Rayleigh
+    /// quotient - i.e. 112 blocking device reads per training step at
+    /// `small` (16 TSCT factors x 7), which is most of what
+    /// `retr = 52.8 ms` was made of (ADR-0011 rule 2: a host round-trip in
+    /// the hot path is a defect whether or not it is visible in the loss).
+    ///
+    /// This is a source gate and it has to be: on `Device::ndarray()` an
+    /// `into_scalar` is a free pointer chase, so no runtime test in this
+    /// crate can see one, and the crate has no CUDA dev-dependency to count
+    /// `client.read` calls from. What the gate does is exact - it fails on
+    /// the line, whoever wrote it, for any future edit to these two
+    /// functions. The norm is a `[1]`-shaped tensor broadcast against `v`
+    /// for the same reason `polar_orthogonalize_batched` needs no sync.
+    #[test]
+    fn scalar_retraction_makes_no_host_read() {
+        let src = include_str!("lib.rs");
+        for f in ["polar_orthogonalize", "polar_retracked"] {
+            let body = fn_source(src, f);
+            for read in ["into_scalar", "into_data", "try_to_vec"] {
+                assert!(
+                    !body.contains(read),
+                    "`{f}` does a host read (`{read}`): the sigma_max norm must \
+                     stay a tensor and be broadcast, or the retraction is back \
+                     to 7 blocking syncs per factor"
+                );
+            }
+        }
+    }
+
+    /// The retraction exactly as it was before the `sigma_max` norm became a
+    /// tensor: 7 blocking host reads per factor (5 in the power loop, 2 for
+    /// the Rayleigh quotient). Test-only, kept verbatim so the sync-free
+    /// rewrite is pinned to the real previous code rather than to a
+    /// description of it. The only differences from
+    /// [`polar_orthogonalize`] are `div_scalar(f32)` vs `div(Tensor<1>)`,
+    /// `sum()` vs `sum_dim(0)` and the f32 clamps - same ops, same order.
+    fn polar_orthogonalize_host_read(x: Tensor<2>, iters: usize) -> Tensor<2> {
+        let dims = x.dims();
+        let (rows, cols) = (dims[0], dims[1]);
+        let (mut m, transposed) = if rows > cols {
+            (x.swap_dims(0, 1), true)
+        } else {
+            (x, false)
+        };
+        let g = m.clone().matmul(m.clone().transpose()); // [c, c]
+        let mut v = g.clone().sum_dim(1).squeeze_dim::<1>(1); // [c]
+        for _ in 0..POWER_ITERS {
+            let vn = v.clone().mul(v.clone()).sum().sqrt().clamp_min(1e-12);
+            v = v.div_scalar(vn.into_scalar::<f32>());
+            v = g
+                .clone()
+                .matmul(v.clone().unsqueeze_dim::<2>(1))
+                .squeeze_dim::<1>(1);
+        }
+        let gv = g
+            .clone()
+            .matmul(v.clone().unsqueeze_dim::<2>(1))
+            .squeeze_dim::<1>(1);
+        let vgv = v.clone().mul(gv).sum().into_scalar::<f32>();
+        let vv = v.clone().mul(v.clone()).sum().into_scalar::<f32>();
+        let sigma = (vgv / vv.max(1e-14)).sqrt().max(1e-7);
+        m = m.div_scalar(sigma * 1.05);
+        let (a, b, c) = (15.0f32 / 8.0, -5.0f32 / 4.0, 3.0f32 / 8.0);
+        for _ in 0..iters {
+            let xx = m.clone().matmul(m.clone().transpose()); // [r, r]
+            let xx2 = xx.clone().matmul(xx.clone());
+            let poly = xx.mul_scalar(b).add(xx2.mul_scalar(c));
+            m = m.clone().mul_scalar(a).add(poly.matmul(m.clone()));
+        }
+        if transposed {
+            m.swap_dims(0, 1)
+        } else {
+            m
+        }
+    }
+
+    /// A dense, deterministic `[rows, cols]` matrix: no RNG, so a bit-for-bit
+    /// comparison is meaningful, and non-orthonormal, so the retraction
+    /// actually has work to do.
+    fn det_factor(rows: usize, cols: usize, dev: &Device) -> Tensor<2> {
+        let mut d = vec![0.0f32; rows * cols];
+        for i in 0..rows {
+            for j in 0..cols {
+                d[i * cols + j] = ((i * 7 + j * 13) as f32).sin() * 0.5
+                    + ((i * 3 + j * 5) as f32).cos();
+            }
+        }
+        Tensor::<2>::from_data(burn::tensor::TensorData::new(d, [rows, cols]), dev)
+    }
+
+    /// The sync-free rewrite changes no number. This is the evidence, not an
+    /// assertion about it: the old path is kept above as
+    /// `polar_orthogonalize_host_read` and the two are compared elementwise
+    /// — on a bare device AND on a real autodiff device, where the tracked
+    /// leaf is live, through `polar_retracked` (the wrapper whose detach and
+    /// re-flag are load-bearing).
+    ///
+    /// Shapes: the two the trainer retracts at `small` ([768,64] and
+    /// [2048,64]), a small one, and a wide one so the canonical transpose
+    /// runs the other way.
+    #[test]
+    fn sync_free_retraction_is_bit_identical_to_the_host_read_one() {
+        let shapes = [(768usize, 64usize), (2048, 64), (64, 8), (8, 64)];
+        for (rows, cols) in shapes {
+            let x = det_factor(rows, cols, &dev());
+            let a = polar_orthogonalize(x.clone(), 3);
+            let b = polar_orthogonalize_host_read(x, 3);
+            assert_eq!(
+                a.into_data().try_to_vec::<f32>().unwrap(),
+                b.into_data().try_to_vec::<f32>().unwrap(),
+                "sync-free retraction changed the numbers at [{rows},{cols}]"
+            );
+        }
+        // Same on a real tracked master, through the wrapper: value AND
+        // tracking. A host read is not what makes this work, and the fix
+        // must not have traded one for the other.
+        let adev = Device::ndarray().autodiff();
+        for (rows, cols) in shapes {
+            let x = Param::from_tensor(det_factor(rows, cols, &adev)).val();
+            assert!(x.is_require_grad(), "fixture is not a tracked master");
+            let r = polar_retracked(&x, 3);
+            let expect = polar_orthogonalize_host_read(x, 3);
+            assert!(
+                r.is_require_grad(),
+                "[{rows},{cols}] retract dropped the tracked master"
+            );
+            assert_eq!(
+                r.into_data().try_to_vec::<f32>().unwrap(),
+                expect.into_data().try_to_vec::<f32>().unwrap(),
+                "tracked sync-free retraction changed the numbers at [{rows},{cols}]"
+            );
+        }
     }
 
     #[test]
