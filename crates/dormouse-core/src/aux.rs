@@ -639,6 +639,38 @@ mod tests {
         assert!(run(64, 59) > 0.0, "stride == t - k - 1 must leave the single window at p = 0");
     }
 
+    /// THE PRICE OF EQ. 7, measured rather than asserted. `aux.conf` grew
+    /// from `[d_model, 1]` to `[d_model + rank, 1]`, and a record written
+    /// before that is REFUSED by the loader - a validation error naming the
+    /// path, not a silent reshape and not a silently re-initialized head.
+    /// `load_record` validates by default and this trainer passes no
+    /// `allow_partial`.
+    ///
+    /// What that costs, concretely: every checkpoint on this box that was
+    /// written with a `conf` head in it, which is all of them (the heads are
+    /// serialized whether or not the terms are on) - 2.1 GB across
+    /// `checkpoints/*.bin`, `mor_ab_ckpt/*.bin`, `official_v{3,4,5}.bin`,
+    /// `pretrain_v21.bin`, `core_probe.bin`. The escape is a loader change
+    /// (`allow_partial` + `allow_unused`, so the stale tensor is dropped and
+    /// the head re-initializes) at `dormouse-train/src/lib.rs:607`, which is
+    /// not this crate's file and is therefore NOT done here: whether to keep
+    /// a backbone whose aux head was trained on the shifted window is the
+    /// owner's call, and it is worth making deliberately.
+    #[test]
+    fn an_older_conf_shape_is_refused_not_reshaped() {
+        let dev = Device::flex();
+        let cfg = mini();
+        let record = AuxHeads::new(cfg.d_model, cfg.vocab, cfg.rank, &dev).into_record();
+        // Rebuild the head the way it was built on 2026-09-28.
+        let mut heads = AuxHeads::new(cfg.d_model, cfg.vocab, cfg.rank, &dev);
+        heads.conf = AcceptRatePredictor::new(cfg.d_model, &dev);
+        let err = heads
+            .try_load_record(record)
+            .expect_err("a [d_model, 1] conf must be refused, not loaded into [d_model + rank, 1]")
+            .to_string();
+        assert!(err.contains("conf"), "the error must name the field it refused: {err}");
+    }
+
     /// ADR-0021: the mask is a pure function of `(seed, step)`. The whole
     /// point of the change is that property, so it is the thing asserted -
     /// not "a mask came out" (which the RNG version also satisfied).
