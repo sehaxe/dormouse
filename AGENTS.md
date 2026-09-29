@@ -1036,11 +1036,22 @@ Ranked applicability:
   compared two different initialisations and charged the difference to the arm;
   "3 seeds per arm" (§1.2) was not implementable, because all three seeds
   produced different initialisations regardless.
-  **Not finished, and the gap is measured:** the same commit still reports
-  **409 043 differing values** on a repeated run — ~4% of the model is
-  process entropy that the seed does not reach. Until that is zero, two runs
-  under the same seed are not the same run and the protocol remains
-  *nearly* implementable.
+  **The 409 043 figure is PROSE, NOT A MEASUREMENT — 2026-09-29.** It appears in
+  five files (`AB-PROTOCOL.md:93`, `this section`, `PLAN-2026-09-29.md:198`, and
+  two reviews) and in **no test and no log**. Its cited source, `4b42b6d`,
+  shipped a `device.seed()` call and a comment — 23 lines in one file, no test
+  and no measurement — so the number it is cited for was never produced by
+  anything a reader can re-run. **What IS measured:** `model_seam::two_models_
+  one_seed_are_bit_identical` builds two models from one seed and asserts
+  0 differing bytes *and* that two different seeds do differ. On the CPU
+  backend that test is **green — two models, one seed, bit-identical.** Every
+  parameter reaches `.init(device)` (`model.rs:48-64`), so a 4% residue on CPU
+  has no visible mechanism. Two readings are still open: the figure was taken
+  on CUDA, where the RNG is a different implementation, or it was mistaken.
+  **The cost of not knowing is the whole queue:** `AB-PROTOCOL.md:175` gates
+  the protocol on this going to zero, and no A/B can be trusted while a
+  same-seed repeat may not be the same run. Do not quote 409 043 as measured
+  until something reproduces it.
 - `DM_QUANT_DEBUG=1` remains the one env var (debug-only, prints every
   `LinearLike` quant format); `CUBECL_AUTOTUNE_LEVEL` is the cubecl runtime's
   own knob, exposed as `--autotune`. Everything else is a typed flag:

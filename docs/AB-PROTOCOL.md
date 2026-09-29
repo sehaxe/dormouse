@@ -90,13 +90,20 @@ step index, so a seed is a config difference only).
 functions of `(seed, step)` — before that fix two runs with identical flags
 differed in **34 730 605 of 43 725 616 checkpoint bytes**, so every A/B in the
 archive compared two different initialisations and charged the difference to
-the arm. **The gap that remains, measured in the same commit: 409 043 differing
-values on a *repeated* run under the same seed — ~4 % of the model is process
-entropy the seed does not reach.** Until that is zero, two runs under one seed
-are not the same run, so the 3-seed spread you compare against is contaminated
-by a per-run random component. **Close the seed gap before the queue, not
-during it** — it is the cheapest item on this page and it gates the reading
-rule below.
+the arm. **The remaining 4 % — 409 043 differing values on a repeated run — is PROSE,
+NOT A MEASUREMENT (2026-09-29).** It is in this file, in `AGENTS.md` §3.7, in
+`PLAN-2026-09-29.md:198` and in two reviews, and in **no test and no log**. Its
+cited source `4b42b6d` shipped `device.seed()` plus a comment and no test, so
+nothing in the tree reproduces the number. **What is measured:**
+`model_seam::two_models_one_seed_are_bit_identical` asserts 0 differing bytes
+for two models under one seed, and that two different seeds DO differ — and it
+is **green on the CPU backend**, where every parameter reaches `.init(device)`.
+So either the figure is CUDA-specific (a different RNG implementation) or it
+was mistaken. **This page still gates on it, and the gate is honest:** until
+that is closed *or* refuted on the backend where the A/Bs run, a same-seed
+repeat may not be the same run and the 3-seed spread you compare against may
+carry a per-run component. The cheapest way to settle it is one same-seed
+repeat on CUDA compared elementwise — not a code change.
 
 **~~Budget: 2000 steps at ~1.6 s = 53 min per run, so one arm = 2.7 GPU-hours.
 Four arms (control + 3) = ~11 GPU-hours.~~ STRUCK 2026-09-29. The 1.6 s/step

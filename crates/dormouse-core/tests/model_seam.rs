@@ -217,6 +217,71 @@ fn determinism() {
     println!("determinism ok ({} ms)", t0.elapsed().as_millis());
 }
 
+/// TWO MODELS, ONE SEED. The `determinism` test above builds one model and
+/// runs it twice, so it cannot see an init that draws fresh entropy - which
+/// is exactly the defect it was cited as covering.
+///
+/// The claim this pins is `device.seed(s)` -> the same weights, which is what
+/// ADR-0002's "3 seeds per arm" needs and what `4b42b6d` asserted when it
+/// added the `device.seed(cfg.seed)` call. That commit shipped the call and a
+/// comment; it shipped no test, so "the seed governs the init" has been prose
+/// since. The number usually quoted for what is left - 409 043 differing
+/// values, ~4% of the model - appears ONLY in docs/AB-PROTOCOL.md:93 and
+/// docs/PLAN-2026-09-29.md:198. It was never measured in a test, and a reader
+/// has no way to check it. This test is the measurement, and it runs on CPU in
+/// seconds.
+///
+/// It also pins the OTHER half, which is what makes a seed a run: two
+/// different seeds must NOT give the same model, or the knob does nothing.
+#[test]
+fn two_models_one_seed_are_bit_identical() {
+    let cfg = mini_nano();
+    let (b, s) = (2, 128);
+    let bytes = batch_bytes(0xC0FFEE, b * s);
+    let x = input_ids(&bytes, b, s, &device());
+    let h = hashed_ids(&bytes, b, s, &device());
+
+    let fwd = |d: &Device| {
+        d.seed(7u64);
+        let m = DormouseModel::new(&cfg, d);
+        // A forward touches every arm's parameters, so a difference anywhere
+        // shows up in the logits rather than needing per-param plumbing.
+        m.forward::<B>(x.clone(), Some(h.clone())).into_data()
+    };
+    let (a, c) = (fwd(&device()), fwd(&device()));
+
+    let diff = a
+        .bytes
+        .iter()
+        .zip(c.bytes.iter())
+        .filter(|(x, y)| x != y)
+        .count();
+    // Report the VALUE count too, since the standing claim is phrased in
+    // values: differing bytes are not differing values, and conflating them
+    // is how a 4% figure and a 0.9% figure end up describing one number.
+    let vals = (0..a.bytes.len() / 4)
+        .filter(|i| a.bytes[i * 4..i * 4 + 4] != c.bytes[i * 4..i * 4 + 4])
+        .count();
+    assert_eq!(
+        diff, 0,
+        "same seed, two builds: {diff} differing bytes / {vals} differing f32 values \
+         out of {} - init is not a pure function of the seed",
+        a.bytes.len() / 4
+    );
+
+    // A seed that changes nothing is not a seed. Cheap, and it stops a
+    // "fix" that hardcodes every initializer from passing this test.
+    let d2 = device();
+    d2.seed(8u64);
+    let other = DormouseModel::new(&cfg, &d2)
+        .forward::<B>(x, Some(h))
+        .into_data();
+    assert_ne!(
+        a.bytes, other.bytes,
+        "seed 7 and seed 8 produced the same model - the seed does nothing"
+    );
+}
+
 /// Full nano preset, single sequence s8192, forward AND backward through
 /// the KDA recurrence: no NaN/Inf in any returned tensor or in the gradient
 /// norm. This is the seam the 16 GB box cannot probe cheaply on CUDA.
