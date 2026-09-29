@@ -319,6 +319,49 @@ mod tests {
         let _ = p.logit(h, Some(Tensor::<3>::zeros([1, 2, 8], &dev())));
     }
 
+    /// Eq. 7 is `sigmoid(w^T[h_k ; W1[x_{k-1}]])`, and the PREVIOUS TOKEN is
+    /// the mechanism, so this asserts the mechanism: hold the hidden state
+    /// fixed, change the token, and the acceptance logit must move.
+    ///
+    /// The projection is BIAS-FREE and the hidden state here is ZERO, so the
+    /// number that comes out is exactly `w_markov . W1[x]` - the markov block
+    /// isolated by construction, with no surgery on the weights. The
+    /// comparison is the second half: the hidden-only head on the same
+    /// features is a constant 0.5, because it cannot read a token at all.
+    /// Same inputs, different function - which is what `prob(h, None)` was
+    /// doing in production, and why `logit` REFUSES `None` on a markov head
+    /// rather than quietly degrading to `w^T[h_k]` (ADR-0019).
+    #[test]
+    fn accept_rate_predictor_reads_the_previous_token() {
+        const D: usize = 8;
+        const R: usize = 4;
+        let markov = VanillaMarkov::new(64, R, &dev());
+        let p = AcceptRatePredictor::with_markov(D, R, &dev());
+        let h = Tensor::<3>::zeros([1, 3, D], &dev());
+        let token = |i: i64| -> Tensor<2, Int> {
+            Tensor::from_data(burn::tensor::TensorData::new(vec![i, 1 + i, 2 + i], [1, 3]), &dev())
+        };
+        let logit = |t: i64| -> Vec<f32> {
+            p.logit(h.clone(), Some(markov.get_prev_embeddings(token(t))))
+                .into_data()
+                .try_to_vec()
+                .unwrap()
+        };
+        let (a, b) = (logit(1), logit(9));
+        let moved: f32 = (0..a.len()).map(|i| (a[i] - b[i]).abs()).fold(0.0, f32::max);
+        assert!(moved > 1e-4, "the markov head ignores W1[x]: {a:?} vs {b:?}");
+
+        let hidden_only: Vec<f32> = AcceptRatePredictor::new(D, &dev())
+            .prob(h, None)
+            .into_data()
+            .try_to_vec()
+            .unwrap();
+        assert!(
+            hidden_only.iter().all(|x| (x - 0.5).abs() < 1e-6),
+            "a bias-free hidden-only head on a ZERO hidden state is sigmoid(0): {hidden_only:?}"
+        );
+    }
+
     #[test]
     fn position_weights_decay() {
         let w: Vec<f32> = position_weights(4, 4.0, &dev())
