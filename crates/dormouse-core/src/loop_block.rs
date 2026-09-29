@@ -3,7 +3,7 @@
 //! scale. Fixed depth (ADR-0013): every iteration counts equally, the loss
 //! is an honest unweighted CE.
 use burn::backend::DispatchKindConversion;
-use burn::module::Module;
+use burn::module::{Module, Param};
 use burn::nn::{Linear, LinearConfig};
 use burn::tensor::{activation, Device, DispatchTensor, FloatDType, Int, Tensor};
 use burn_engram::EngramModule;
@@ -173,6 +173,17 @@ impl LoopBlock {
             f.down.retract(iters);
         }
         self.out_proj.retract(iters);
+    }
+
+    /// Append every TSCT master in the block (`u`, `v` per linear) to `out`.
+    /// The factor list [`LoopBlock::retract_tsct`] walks, handed to the
+    /// batched arm instead of one factor at a time.
+    pub fn push_tsct_masters<'a>(&'a mut self, out: &mut Vec<&'a mut Param<Tensor<2>>>) {
+        for f in &mut self.expert_ffns {
+            f.gate_up.push_tsct_masters(out);
+            f.down.push_tsct_masters(out);
+        }
+        self.out_proj.push_tsct_masters(out);
     }
 
     /// Worst orthonormality error across all TSCT factors (syncs the device).
