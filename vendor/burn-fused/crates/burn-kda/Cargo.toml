@@ -42,3 +42,30 @@ required-features = ["cuda"]
 [[example]]
 name = "kda_step_probe"
 required-features = ["cuda"]
+
+# Same rule for the test targets, and it is the same defect: a file-level
+# `#![cfg(feature = "cuda")]` alone still leaves cargo building the target on
+# the default cell, so `cargo test -p burn-kda` printed FOUR `running 0 tests
+# ... ok` lines - green over a test that does not exist. `required-features` is
+# what stops cargo from building the empty target at all. Both are needed
+# (243a003). `tools/test_targets.py` fails the build if a gated file appears
+# without one.
+#
+# `fused_cuda.rs` names `autodiff` too: it gates its gradient arm per-test
+# (`fused_train_grads_flow_cuda`), so with only `cuda` the target would build,
+# report green, and silently drop that arm - the same lie one level down.
+[[test]]
+name = "bench_cuda"
+required-features = ["cuda", "autodiff"]
+
+[[test]]
+name = "cuda_gate"
+required-features = ["cuda", "autodiff"]
+
+[[test]]
+name = "fused_cuda"
+required-features = ["cuda", "autodiff"]
+
+[[test]]
+name = "ops_grad_cuda"
+required-features = ["cuda", "autodiff"]
