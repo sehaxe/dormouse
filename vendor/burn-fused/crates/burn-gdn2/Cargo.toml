@@ -126,11 +126,24 @@ name = "ops_batched_grad_cuda"
 required-features = ["cuda", "autodiff"]
 
 # Both of its `#[test]`s are `#[cfg(feature = "binary-tests")]` - per-test, not
-# file-level, so the file compiled to an empty binary and reported 0/0 ok. The
-# fixture it needs (`ref_data.bin`) is committed, so the gate is real.
+# file-level, so the file compiles to an empty binary and reports 0/0 ok. The
+# fixture it needs (`tests/ref_f64_broad.bin`) is committed, so the gate is
+# real. Renamed from `test_chunk` when the target was retargeted at the f64
+# oracle; the name no longer claims to be a comparison against "the reference"
+# without saying which one.
 [[test]]
-name = "test_chunk"
+name = "oracle_chunk"
 required-features = ["binary-tests"]
+
+# `oracle_breadth` deliberately has NO `[[test]]` block, and that is the correct
+# shape, not an oversight. Its two `bench_ndarray_*` timings are NOT gated, so
+# `tools/test_targets.py` counts the target as live on the default cell - which
+# means a `required-features` block would make cargo SKIP the whole target
+# there and those benchmarks would stop running. The 1000-case oracle test in
+# the same file is `#[cfg(feature = "binary-tests")]` and runs only in the
+# explicit `--features binary-tests` cell of `tools/lib_gate.sh`, exactly as
+# `bit_exact`'s 1000-case test did before the rename. If a `[[test]]` block for
+# it ever appears, the benchmarks are what breaks.
 
 [package.metadata.docs.rs]
 all-features = true

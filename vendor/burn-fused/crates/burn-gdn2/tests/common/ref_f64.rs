@@ -1,12 +1,20 @@
 // Shared fixture loader + module builder for the f64 reference layer.
-// Included by `tests/ref_f64.rs` and by the `ref_f64_stages` example; NOT a
-// test target of its own (a leading-underscore-free file in `tests/` would be).
+// Included by `tests/ref_f64.rs`, by the breadth/chunk tests, and by the
+// `ref_f64_stages` example; NOT a test target of its own (a file in `tests/`
+// that is not a declared target would be).
 //
-// `ref_f64.bin` layout (written by `tools/gen_reference_f64.py`):
+// `ref_f64*.bin` layout (written by `tools/gen_reference_f64.py`):
 //   "GDN2F64\0" | u32 d,h,hk,hv | f64 expand_v | u8 use_sc, allow_neg, n_tensors
 //   | { u32 namelen, name, u32 ndim, u32 numel, i32[ndim] shape, f32[numel] }*
 //   | u32 n_cases | { u32 t, f32[d*t] x, f64[d*t] y }*
 // Linear weights are `[d_input, d_output]`, burn's on-disk layout.
+//
+// TWO FIXTURES, ONE FORMAT, ONE LOADER. `ref_f64.bin` is the 18-case
+// hand-picked length matrix, and its wrong-formula companion
+// `ref_f64_faults.bin` is committed against one specific case of it;
+// `ref_f64_broad.bin` is the 1000-case breadth sweep. The sweep is a separate
+// FILE rather than a longer case list precisely so the matrix's pinned case
+// index keeps its meaning; see `BROAD_CASES` in the generator.
 //
 // Included, not compiled on its own, so it can carry `use` statements without
 // colliding with the includer's. No inner attributes here: `include!` does not
@@ -76,12 +84,12 @@ fn rd_f32_tensor(c: &mut Cursor<&[u8]>) -> (String, Vec<usize>, Vec<f32>) {
     (name, shape, rd_f32_vec(c, n))
 }
 
-pub fn load() -> Fixture {
-    let data = include_bytes!("../ref_f64.bin");
-    let mut c = Cursor::new(data.as_slice());
+/// Read a `GDN2F64` fixture. `what` only names the file in a panic message.
+pub fn load_bytes(what: &str, data: &[u8]) -> Fixture {
+    let mut c = Cursor::new(data);
     let mut magic = [0u8; 8];
     c.read_exact(&mut magic).unwrap();
-    assert_eq!(&magic, b"GDN2F64\0", "ref_f64.bin is not this format");
+    assert_eq!(&magic, b"GDN2F64\0", "{what} is not this format");
     let d = rd_u32(&mut c) as usize;
     let h = rd_u32(&mut c) as usize;
     let hk = rd_u32(&mut c) as usize;
@@ -107,7 +115,7 @@ pub fn load() -> Fixture {
     assert_eq!(
         c.position() as usize,
         data.len(),
-        "trailing bytes in ref_f64.bin"
+        "trailing bytes in {what}"
     );
     Fixture {
         d,
@@ -120,6 +128,16 @@ pub fn load() -> Fixture {
         tensors,
         cases,
     }
+}
+
+/// The 18-case hand-picked length matrix.
+pub fn load() -> Fixture {
+    load_bytes("ref_f64.bin", include_bytes!("../ref_f64.bin"))
+}
+
+/// The 1000-case breadth sweep, same format, same loader.
+pub fn load_broad() -> Fixture {
+    load_bytes("ref_f64_broad.bin", include_bytes!("../ref_f64_broad.bin"))
 }
 
 pub fn get(t: &Fixture, name: &str) -> (Vec<usize>, Vec<f32>) {
@@ -167,7 +185,11 @@ fn lin_wb(t: &Fixture, name: &str, bias: &str, device: &Device) -> Linear {
     lin
 }
 
-pub fn build(t: &Fixture, mode: Gdn2Mode, device: &Device) -> GatedDeltaNet2 {
+/// `chunk_size` is a parameter, not a constant, because the chunk-sweep test
+/// has to build the SAME weights at five chunk sizes. `self.config.chunk_size`
+/// is read at forward time (`src/module.rs:341`, `:451`), but passing it in
+/// makes the test say what it means rather than rely on that.
+pub fn build(t: &Fixture, mode: Gdn2Mode, chunk_size: usize, device: &Device) -> GatedDeltaNet2 {
     GatedDeltaNet2 {
         q_proj: lin_w(t, "q_proj", device),
         k_proj: lin_w(t, "k_proj", device),
@@ -204,7 +226,7 @@ pub fn build(t: &Fixture, mode: Gdn2Mode, device: &Device) -> GatedDeltaNet2 {
             allow_neg_eigval: t.allow_neg_eigval,
             norm_eps: 1e-5,
             mode,
-            chunk_size: 64,
+            chunk_size,
             min_decay: None,
         },
         decay_factors: None,

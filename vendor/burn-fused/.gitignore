@@ -1,17 +1,26 @@
 /target
 crates/*/target
 # `ref_data/` is NOT ignored: a test fixture nobody can regenerate is not a
-# reproducibility claim. burn-gdn2's bit-exact fixture is committed (the
-# exception below) and burn-sct's is wanted the same way once its generator
+# reproducibility claim. burn-gdn2's oracle fixtures are committed (the
+# exceptions below) and burn-sct's is wanted the same way once its generator
 # exists — see crates/burn-gdn2/TEST-AUDIT.md.
 **/*.bin
-!crates/burn-gdn2/tests/ref_data.bin
 # The f64 reference fixtures, same reason and one more: `tests/ref_f64.rs` must
 # run in CI without Python or NumPy present at all, so the expected values have
-# to be bytes in the tree. `ref_f64.bin` is the layer's output;
+# to be bytes in the tree. `ref_f64.bin` is the 18-case length matrix;
 # `ref_f64_faults.bin` is the other side of its margin, and a margin asserted
-# against data nobody can regenerate is not a margin.
+# against data nobody can regenerate is not a margin; `ref_f64_broad.bin` is the
+# 1000-case breadth sweep behind `oracle_breadth`/`oracle_chunk`.
+#
+# MEASURED 2026-09-29, and this is why the last exception exists: writing
+# `ref_f64_broad.bin`, writing the two tests against it, and getting them green
+# all worked while `git status` did not list the file — `**/*.bin` was the only
+# reason. A fixture that is not in the tree is a test that does not exist for
+# every reader but the one who ran the generator, and nothing local complains:
+# the `include_bytes!` resolves on the author's disk. `git check-ignore -v <new
+# fixture>` before trusting a green run.
 !crates/burn-gdn2/tests/ref_f64.bin
 !crates/burn-gdn2/tests/ref_f64_faults.bin
+!crates/burn-gdn2/tests/ref_f64_broad.bin
 Cargo.lock.bak
 .bulba/

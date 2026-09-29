@@ -99,8 +99,16 @@ jobs:
           cargo check -p burn-sct --features autodiff
 
   # 3. the flagship claim: the reference fixture is regenerable and unchanged
+  #
+  # The generator is now `tools/gen_reference_f64.py` (f64 NumPy, no torch), and
+  # the fixture is `tests/ref_f64_broad.bin` - the 1000-case breadth sweep. The
+  # f32 self-transcription this job used to police (`tools/gen_reference.rs` ->
+  # `tests/ref_data.bin`) is DELETED: it was an f32 transcription of burn-gdn2's
+  # OWN algorithm, so it could only ever prove self-consistency, and it replicate-
+  # padded the short conv's left edge exactly as the kernel wrongly did - which
+  # is how a real defect (`0a6998a`) stayed green in this very job.
   ref-data-reproducible:
-    name: "fused-lib :: ref_data.bin regenerates byte-identically (a fixture that drifted from its generator)"
+    name: "fused-lib :: ref_f64_broad.bin regenerates byte-identically (a fixture that drifted from its generator)"
     runs-on: ubuntu-latest
     timeout-minutes: 30
     defaults:
@@ -109,23 +117,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: build the generator (std-only, no cargo workspace needed)
-        run: rustc --edition 2021 -O tools/gen_reference.rs -o "$RUNNER_TEMP/gen_reference"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: numpy
+        run: pip install numpy
+      # Both f64 fixtures, and the committed wrong-formula companion, so a
+      # generator edit cannot quietly move the negative control either.
       - name: regenerate
-        run: "$RUNNER_TEMP/gen_reference"
-      - name: the committed fixture must be exactly what the generator emits
-        run: git diff --exit-code -- tests/ref_data.bin
+        run: |
+          python3 tools/gen_reference_f64.py --broad
+          python3 tools/gen_reference_f64.py
+      - name: the committed fixtures must be exactly what the generator emits
+        run: |
+          git diff --exit-code -- tests/ref_f64_broad.bin
+          git diff --exit-code -- tests/ref_f64.bin tests/ref_f64_faults.bin
 
-  # 4. the flagship claim: burn against that fixture
-  # GREEN as of 2026-09-29: max_diff 2.32e-7 against EPSILON 5e-4, 0/1000
-  # failures, tolerance unchanged. It was RED for three days (1.38e-2,
-  # 976/1000) and the fault was in tools/gen_reference.rs, not in burn: the
-  # generator read token-major buffers with head-major offsets, which is
-  # invisible at T=1 and wrong for every t >= 1, and exactly 24 of the 1000
-  # cases are single-token. Full write-up: vendor/burn-fused/TEST-AUDIT.md,
-  # FINDING 0. This job is the gate and it stays.
-  bit-exact:
-    name: "fused-lib :: 1000 bit-exact cases vs the paper reference (fused/tensor drift)"
+  # 4. the flagship claim: burn against the f64 oracle
+  # GREEN as of 2026-09-29, --release, ndarray: 1000 cases on the
+  # fused-recurrent arm and 1000 x 5 chunk sizes on the chunked arm, both
+  # against `tests/ref_f64_broad.bin` at 1e-3 RELATIVE. It was RED
+  # (max_diff 7.90e-3 against EPSILON 5e-4, 1000/1000) because the fixture it
+  # read was stale: `0a6998a` fixed the conv pad in `src/short_conv.rs` and the
+  # f32 self-transcription still had the old padding in it. Regenerating it
+  # would have re-committed the bug as the truth. This job is the gate and it
+  # stays.
+  oracle-breadth:
+    name: "fused-lib :: 1000 cases vs the f64 oracle, fused-recurrent and 5 chunk sizes"
     runs-on: ubuntu-latest
     timeout-minutes: 90
     defaults:
@@ -138,8 +156,8 @@ jobs:
         with:
           workspaces: vendor/burn-fused
       # --release: the 1000-case scan is minutes in an opt-0 build.
-      - name: burn-gdn2, fused recurrent and chunked, vs the reference
-        run: cargo test --release -p burn-gdn2 --features binary-tests --test bit_exact --test test_chunk
+      - name: burn-gdn2, fused recurrent and chunked, vs the f64 oracle
+        run: cargo test --release -p burn-gdn2 --features binary-tests --test oracle_breadth --test oracle_chunk
 
   # 5. cuda compiles, on a CPU runner
   cuda-compiles:

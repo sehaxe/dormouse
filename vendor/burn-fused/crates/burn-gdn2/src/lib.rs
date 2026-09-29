@@ -46,12 +46,18 @@
 //! - **`std`** (default) - standard library support
 //! - **`autodiff`** - differentiation support (required for training)
 //! - **`cuda`** - CUDA backend support
-//! - **`binary-tests`** - 1000-case reference tests against `tests/ref_data.bin`.
-//!   That fixture is **our** transcription of NVlabs' `lit_gpt/gdn2.py` (runnable
-//!   generator: `tools/gen_reference.rs`), compared at an absolute tolerance -
-//!   **not** bit-for-bit; a bit-for-bit claim needs the authors' kernel in the
-//!   tree. Not in `default`, and **RED as of 2026-09-27** (976/1000): see
-//!   `vendor/burn-fused/TEST-AUDIT.md` FINDING 0 and `docs/ORACLE.md`.
+//! - **`binary-tests`** - the 1000-case fixture-backed oracle tests
+//!   (`tests/oracle_breadth.rs`, `tests/oracle_chunk.rs`). The fixture is
+//!   `tests/ref_f64_broad.bin`, the f64 output of `tools/gen_reference_f64.py`:
+//!   a **transcription** of arXiv:2605.22791 §3.1 Eq. 8-12, with the three
+//!   details that are not in the paper each cited to the authors' own source.
+//!   Compared at 1e-3 **relative**. Not bit-for-bit, and not tier (a) - a
+//!   bit-for-bit claim needs NVlabs' Triton kernel in the tree. Not in `default`
+//!   (it is a fork-CI marker no crate reads); `tools/lib_gate.sh` passes it
+//!   explicitly. It replaced an f32 transcription of this crate's OWN algorithm,
+//!   which could only ever prove self-consistency and had replicate-padded the
+//!   short conv exactly as the kernel wrongly did. See `docs/ORACLE.md` §2-§3
+//!   and the header of `tests/oracle_breadth.rs`.
 
 pub mod alloc_trace;
 pub mod config;

@@ -77,6 +77,7 @@ of that gap every run, so the claim cannot rot.
 
 Usage:
     python3 tools/gen_reference_f64.py               # write tests/ref_f64.bin
+    python3 tools/gen_reference_f64.py --broad       # write ref_f64_broad.bin
     python3 tools/gen_reference_f64.py --self-test   # print the margin table
     python3 tools/gen_reference_f64.py --fault conv-padding --out /tmp/x.bin
                                                        # a wrong formula
@@ -107,6 +108,31 @@ VD = HV * VH             # 96, value_dim
 # conv tap, so several candidate layouts coincide. The rest straddle every
 # chunk size the crate tests (4, 8, 16, 32, 64).
 SEQ_LENS = [1, 2, 3, 4, 5, 7, 8, 9, 13, 16, 17, 21, 32, 33, 37, 64, 65, 70]
+
+# THE BREADTH SWEEP, and why it is a SEPARATE file rather than a bigger
+# `SEQ_LENS`. `tests/ref_f64.bin` is hand-picked (one length per interesting
+# boundary) and its wrong-formula companion `tests/ref_f64_faults.bin` is
+# committed against `FAULT_CASE = len(SEQ_LENS) - 1`, i.e. against the LAST
+# entry, chosen because the longest length is the only one where a semantic
+# error and f32 noise are both fully present. Widening the list would silently
+# move that anchor to a short case and cost the margin table its worst case. So
+# breadth is a second fixture in the SAME binary format, read by the same
+# loader, and the matrix above keeps its meaning.
+#
+# The sweep is the old f32 fixture's T formula verbatim - `gen_reference.rs:482`,
+# `let seq_len = (1usize << (i % 6)) + (i % 7);` - so the breadth these two tests
+# cover is preserved EXACTLY and the only thing that changes is which arm the
+# expected value comes from. It spans T in 1..=38 (the `gen_reference.rs:482`
+# comment says "2..70"; the formula's real max is 32 + 6 = 38, which is the
+# figure `tests/bit_exact.rs` used and the one measured here), so chunk sizes
+# 4/8/16/32 each get straddled many times and 64 does not - as before. The
+# 18-case matrix above is what covers chunk 64 (T = 64, 65, 70) and the long
+# state carry, and `tests/ref_f64.rs` runs BOTH arms over it.
+BROAD_CASES = 1000
+
+
+def broad_seq_len(i):
+    return (1 << (i % 6)) + (i % 7)
 
 MASK64 = (1 << 64) - 1
 
@@ -334,7 +360,7 @@ LINEARS = {
 }
 
 
-def make_inputs():
+def make_inputs(seq_lens=SEQ_LENS):
     """The fixture's inputs, in fixture order, from ONE rng stream consumed once.
 
     Everything that needs case i's input must go through this. It used to be
@@ -344,9 +370,12 @@ def make_inputs():
     read O(1) for the wrong reason. The fault fixture now carries a hash of the
     input it used and `tests/ref_f64.rs` checks it against the main fixture, so
     that class of mistake fails loudly instead of looking like a huge margin.
+
+    `seq_lens` is a parameter so the breadth sweep draws its own stream
+    positionally the same way; the default keeps the 18-case matrix.
     """
     rng = Rng(SEED)
-    return [rng.normal((t, D)).astype(np.float32) for t in SEQ_LENS]
+    return [rng.normal((t, D)).astype(np.float32) for t in seq_lens]
 
 
 def fnv1a64(data: bytes) -> int:
@@ -356,9 +385,10 @@ def fnv1a64(data: bytes) -> int:
     return h
 
 
-def write_fixture(path, P, fault):
+def write_fixture(path, P, fault=None, seq_lens=SEQ_LENS):
+    xs = make_inputs(seq_lens)
     cases = [(t, x, gdn2_forward(x.astype(np.float64), P, fault))
-             for (t, x) in zip(SEQ_LENS, make_inputs())]
+             for (t, x) in zip(seq_lens, xs)]
     with open(path, "wb") as f:
         f.write(b"GDN2F64\0")
         f.write(struct.pack("<4I", D, H, HK, HV))
@@ -452,7 +482,75 @@ def stages(x, P):
     g_pre = P["f_proj_1"] @ (P["f_proj_0"] @ x.T)
     g = -np.repeat(np.exp(P["A_log"]), HK)[:, None] * softplus(g_pre + P["dt_bias"][:, None])
     out["g_recomputed"] = g.T          # [T,KD] == g_unpermuted
+
+    # The 4-D per-head tensors, in the SAME [H, T, HK] / [HV, T, VH] layout the
+    # crate hands to the recurrence — so the Rust side only has to
+    # `.contiguous()` them and read them back. These are the stages the
+    # localisation could not see before: `diff_stages` used to compare only
+    # 2-D and 1-D rows, on the grounds that a permuted 4-D view reads back
+    # unstably on ndarray. Forcing a copy on the Rust side removes the
+    # ambiguity, and without these rows a per-head layout defect or a wrong GVA
+    # repeat is invisible to the whole diagnostic.
+    def to_heads(a, n, d):
+        """[T, n*d] -> [n, T, d], the crate's `to_4d`.
+
+        The transposed result's flat order is h*(T*d) + t*d + d, which IS the
+        crate's [B, n, T, d] flat order, so `diff_stages` can compare it
+        positionally. (Contrast `gate4d`, which is token-major on the Rust side
+        and must stay token-major here.)"""
+        return a.reshape(t, n, d).transpose(1, 0, 2)
+
+    # Per head, the way `to_4d` does it. `out["q_conv"]` and friends are [T, KD]
+    # token-major, so they go through `to_heads` before the per-channel
+    # operations; doing the L2 over the flat [T, KD] axis normalises across
+    # HEADS, which is a different quantity and reads as a garbage-scale row
+    # rather than a finding.
+    q4, k4 = to_heads(out["q_conv"], H, HK), to_heads(out["k_conv"], H, HK)
+    v4 = to_heads(out["v_conv"], HV, VH)  # the VALUE head is VH = HK*expand_v
+    g4 = g.T.reshape(t, H, HK).transpose(1, 0, 2)
+    b4 = sigmoid((P["b_proj"] @ x.T).T).reshape(t, H, HK).transpose(1, 0, 2)
+    w4 = sigmoid((P["w_proj"] @ x.T).T).reshape(t, HV, VH).transpose(1, 0, 2)
+    if HV > H:  # the GVA repeat; an identity in this crate's own config (H == HV)
+        rep = HV // H
+        for a in (q4, k4, g4, b4):
+            a[:] = np.repeat(a, rep, axis=0)
+    # NO `q4d_norm` ROW, and the reason is worth keeping: it looks like the
+    # obvious thing to add (dump `l2_normalize_4d`'s divisor separately) and it
+    # is a trap. `project` returns q and k ALREADY normalised, so a norm taken
+    # from `projected.q` is ~1.0 by construction while the f64 reference's
+    # pre-L2 norm is ~1e-4 - the row then reads O(1) and names a defect that is
+    # not there, which is exactly how two mutually inconsistent numbers were
+    # produced during this localisation. Measuring the divisor needs the
+    # PRE-L2 tensor, which `project` does not expose; `q4d` agreeing to ~2e-07
+    # is the evidence that the normalisation is right, because it is the
+    # quotient.
+    # post-L2, which is where `project` leaves them (l2_normalize_4d, 1e-6)
+    q4 = q4 / np.sqrt((q4 * q4).sum(-1, keepdims=True) + L2_EPS)
+    k4 = k4 / np.sqrt((k4 * k4).sum(-1, keepdims=True) + L2_EPS)
+    out["q4d"], out["k4d"], out["g4d"] = q4, k4, g4
+    out["b4d"], out["v4d"], out["w4d"] = b4, v4, w4
+    # Token-major, NOT [HV, T, VH]. `diff_stages` compares positionally after
+    # `got.reshape(ref.shape)`, and the crate's tensors are [B, T, HV, VH], whose
+    # flat order is t*(HV*VH) + h*VH + v. A transposed [HV, T, VH] reference has
+    # the flat order h*(t*VH) + t*VH + v - the same values in a different order,
+    # so the row reads O(1) and names a defect that is not there. Measured:
+    # that mistake put `gate4d` at 7.5e-01 at T=70 while the 2-D `gp1` row, same
+    # tensor, sat at 1.6e-07. The per-head rows below are [H, T, D] for the same
+    # reason: `to_heads` is applied to a token-major [T, n*d] array, so its flat
+    # order already matches.
+    out["gate4d"] = (
+        (P["g_proj_1"] @ (P["g_proj_0"] @ x.T) + P["g_proj_1_b"][:, None])
+        .T
+        .reshape(t, HV, VH)
+    )
     return out
+
+
+# The stages `examples/ref_f64_stages.rs` dumps SQUARED, because it has to push
+# a permuted 4-D view through an elementwise op to get a dense readback out of
+# burn 0.22 (no `contiguous()`), and squaring is the one op that cannot be
+# optimised away. `diff_stages` squares the reference to match.
+SQUARED_STAGES = {"q4d", "k4d", "g4d", "b4d", "v4d", "w4d", "gate4d"}
 
 
 def diff_stages(path, P):
@@ -469,10 +567,14 @@ def diff_stages(path, P):
         ci = int(key[1 : key.index("/")])
         stage = key[key.index("/") + 1 :]
         ref = stages(xs[ci], P)[stage]
-        # Only 2-D and 1-D stages are compared. `project` leaves the per-head
-        # tensors as permuted [B,H,T,D] views and this backend's `into_data()`
-        # on a strided view does not read in a stable order, so a 4-D row here
-        # is a false positive rather than a finding. See the example's header.
+        # The 4-D per-head stages are dumped SQUARED (the example pushes the
+        # permuted view through `powf_scalar(2.0)` because burn 0.22 has no
+        # `contiguous()`, and an elementwise op is the only thing guaranteed to
+        # write a dense buffer in logical order), so square the reference to
+        # match. The row is self-verifying: a readback that permutes the data
+        # gives an O(1) diff here rather than a silent pass.
+        if stage in SQUARED_STAGES:
+            ref = ref * ref
         d = np.abs(got.reshape(ref.shape) - ref)
         scale = max(np.abs(ref).max(), 1e-30)
         print(f"{stage:<14} {d.max():>14.3e} {scale:>12.3e} {d.max()/scale:>10.3e}")
@@ -499,7 +601,12 @@ def self_test(P):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default="tests/ref_f64.bin")
+    ap.add_argument("--out", default=None,
+                    help="output path (default tests/ref_f64.bin, or "
+                         "tests/ref_f64_broad.bin with --broad)")
+    ap.add_argument("--broad", action="store_true",
+                    help="write the 1000-case breadth sweep instead of the "
+                         "18-case length matrix")
     ap.add_argument("--fault", default=None,
                     choices=["decay-sign", "transposed-proj", "no-write-gate",
                              "no-erase-gate", "read-before-write", "conv-padding",
@@ -518,9 +625,20 @@ def main():
     if args.self_test:
         self_test(P)
         return
-    cases = write_fixture(args.out, P, args.fault)
+    if args.broad:
+        out = args.out or "tests/ref_f64_broad.bin"
+        lens = [broad_seq_len(i) for i in range(BROAD_CASES)]
+        cases = write_fixture(out, P, args.fault, lens)
+        assert args.fault is None, (
+            "--broad never writes the wrong-formula fixture: it is committed "
+            "against the 18-case matrix's FAULT_CASE, not this sweep")
+        print(f"wrote {out}: {len(cases)} cases, d={D} h={H} hk={HK} hv={HV} "
+              f"expand_v={EXPAND_V}, T in {min(lens)}..{max(lens)}")
+        return
+    out = args.out or "tests/ref_f64.bin"
+    cases = write_fixture(out, P, args.fault)
     tag = f" WITH FAULT '{args.fault}'" if args.fault else ""
-    print(f"wrote {args.out}{tag}: {len(cases)} cases, d={D} h={H} hk={HK} hv={HV} "
+    print(f"wrote {out}{tag}: {len(cases)} cases, d={D} h={H} hk={HK} hv={HV} "
           f"expand_v={EXPAND_V}, T in {SEQ_LENS[0]}..{SEQ_LENS[-1]}")
     if args.fault is None:
         write_fault_fixture(args.faults_out, P)
