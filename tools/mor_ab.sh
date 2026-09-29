@@ -41,23 +41,30 @@ WINDOW=$((EVAL_BATCHES * BATCH * SEQ))
 BUDGET=${BUDGET:-14400}
 mkdir -p "$LOGDIR" "$CKPT"
 
-gpu_busy() { [ "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader | wc -l)" -ne 0 ]; }
+gpu_mib() { nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | head -1; }
 
+# A free card, confirmed TWICE with a gap: the desktop's own GL context sits at
+# a few hundred MiB, and a run that starts while the previous agent's process is
+# still tearing down dies with "out of device memory" on a 1 GB allocation
+# (measured 2026-09-29, 02:51 — the card read 303 MiB free afterwards).
 wait_for_gpu() {
   for _ in $(seq 1 720); do
-    gpu_busy || return 0
+    if [ "$(gpu_mib)" -lt 800 ]; then
+      sleep 30
+      [ "$(gpu_mib)" -lt 800 ] && return 0
+    fi
     sleep 30
   done
   return 1
 }
 
-launch() { # name preset steps seed extra...
-  local name=$1 preset=$2 steps=$3 seed=$4; shift 4
+launch() { # name preset steps seed eval_every [extra...]
+  local name=$1 preset=$2 steps=$3 seed=$4 eval_every=$5; shift 5
   wait_for_gpu || { echo "GPU never freed for $name"; return 1; }
   echo "=== $name preset=$preset steps=$steps seed=$seed start $(date +%H:%M)"
   systemd-run --user --scope -q -p MemoryMax=40G \
     ./target/release/train \
-      --data "$DATA" --eval "$EVAL" --eval-every 250 --eval-batches "$EVAL_BATCHES" \
+      --data "$DATA" --eval "$EVAL" --eval-every "$eval_every" --eval-batches "$EVAL_BATCHES" \
       --eval-depths --preset "$preset" --steps "$steps" --seed "$seed" \
       --batch "$BATCH" --seq-len "$SEQ" \
       --jepa-weight 0 --dspark-weight 0 --quant fp32 --timers \
@@ -69,15 +76,17 @@ launch() { # name preset steps seed extra...
 # rung 1 (smoke: NaN, speed, early slope) is the same run.
 preflight() {
   local name="$1" preset="$2"
-  # 60 steps, not 20: --timers prints every 50 steps and the wall clock below
-  # needs a compile-out, a warmup and a steady state to mean anything.
+  # 100 steps at --eval-every 25: rung 1 of the protocol ladder (smoke = NaN,
+  # speed, early slope) and the only rung that is cheap enough to run while
+  # the queue is being re-costed. It also prices the arm and produces four
+  # held-out points per arm, which is where the collapse canary is read.
   local t0 t1
   t0=$(date +%s)
-  launch "pre_$name" "$preset" 60 1 || return 1
+  launch "pre_$name" "$preset" 100 1 25 || return 1
   t1=$(date +%s)
   # Setup (CUDA context, autotune, data indexing) is in there, so this is an
   # UPPER bound on the per-step cost, which is the right direction for a gate.
-  local per_step=$(( (t1 - t0) / 60 ))
+  local per_step=$(( (t1 - t0) / 100 ))
   local projected=$(( per_step * STEPS ))
   echo "=== preflight $name: ~${per_step} s/step wall (incl. setup) -> ~$(( projected / 3600 )) h for $STEPS steps (window $WINDOW B)"
   echo "=== preflight NaN lines: $(grep -c NaN "$LOGDIR/pre_$name.log")"
@@ -116,7 +125,7 @@ clean_control() {
 run() { # name preset seed
   local name=$1 preset=$2 seed=$3
   if [ -f "$LOGDIR/$name.done" ]; then echo "skip $name (done)"; return 0; fi
-  launch "$name" "$preset" "$STEPS" "$seed" || return 1
+  launch "$name" "$preset" "$STEPS" "$seed" 250 || return 1
   local rc=$?
   if [ $rc -ne 0 ] || ! grep -q "step $STEPS" "$LOGDIR/$name.log" 2>/dev/null; then
     echo "=== $name FAILED rc=$rc (see $LOGDIR/$name.log)"; return 1
@@ -133,6 +142,12 @@ run() { # name preset seed
 case "${1:-all}" in
   preflight)
     preflight ctrl small && preflight mor mor ;;
+  # One arm's smoke on its own. The MoR arm is worth this separately: it is
+  # the only end-to-end evidence that the routing trains on the real backend
+  # (the argsort top-k, the mask, the BCE, the masked readout) rather than
+  # only that it passes a CPU unit test.
+  preflight-ctrl) preflight ctrl small ;;
+  preflight-mor)  preflight mor   mor ;;
   all)
     preflight ctrl small || exit 1
     preflight mor   mor   || exit 1
