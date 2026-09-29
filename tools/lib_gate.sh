@@ -53,6 +53,22 @@ cargo test --workspace \
     --no-fail-fast
 rc=$?
 
+# `binary-tests` is NOT a default of burn-gdn2, and that is deliberate: the
+# facade classifies it in NOT_PUBLIC as a fork-CI marker no crate reads, so a
+# default would make every consumer of the facade pay for a flag it never uses
+# (and cargo refuses a facade `default` naming a feature it cannot forward).
+# But it gates two of the crate's most valuable tests - bit_exact's 1000-case
+# anchor and test_chunk - and a gate that does not pass it is a gate that
+# cannot see them. So ask for it explicitly. If this cell ever goes to 0 tests
+# for burn-gdn2, THIS is the line that stopped asking, not a green suite.
+echo
+echo "── burn-gdn2 fixture-backed tests (binary-tests) ──"
+cargo test -p burn-gdn2 --features binary-tests \
+    --test bit_exact --test test_chunk --no-fail-fast
+rc2=$?
+[ "$rc" -eq 0 ] || rc=$rc2
+[ "$rc2" -eq 0 ] || rc=$rc2
+
 echo
 if [ "$rc" -eq 0 ]; then
     echo "PASS  lib_gate: the fused library's CPU cell is green."

@@ -15,6 +15,9 @@ readme = "INTEGRATION.md"
 [features]
 default = ["std"]
 
+# every member ships `std`; the facade default is exactly this.
+# a member default feature NOT listed here is one the facade does not
+# restore (see NOT_PUBLIC) - its owner must require it explicitly.
 autodiff = [
     "burn-attnres/autodiff",
     "burn-bitnet/autodiff",

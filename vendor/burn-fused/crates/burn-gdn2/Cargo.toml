@@ -12,7 +12,7 @@ readme = "README.md"
 exclude = ["__pycache__/", "TODO.md", "Cargo.lock", "target/"]
 
 [features]
-default = ["std", "binary-tests"]
+default = ["std"]
 std = ["burn/std", "burn-tensor/std"]
 autodiff = ["burn/autodiff", "burn-tensor/std", "dep:burn-autodiff"]
 cuda = ["dep:burn-cuda", "dep:burn-cubecl", "dep:cubecl", "burn/cuda", "burn-tensor/cuda"]

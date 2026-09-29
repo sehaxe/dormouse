@@ -90,21 +90,55 @@ def check_members(crates: list[dict]) -> list[str]:
     public = set(propagated(crates))
     problems = []
     for c in crates:
-        if c["default"] != ["std"]:
-            problems.append(
-                f"{c['name']}: default = {c['default']}, the facade assumes "
-                '[ "std" ] (it sets default-features = false per dep and '
-                "re-derives std). Re-derive the facade default or drop the dep."
-            )
+        # The facade sets `default-features = false` per dependency and
+        # re-derives the default itself, so a member's default features must
+        # all be features the facade can name. `std` used to be ASSUMED rather
+        # than checked: the check was `c["default"] != ["std"]`, so any member
+        # that grew a second default feature made the generator refuse to run
+        # instead of carrying it. That is what ff7cd57 hit, when it put
+        # `binary-tests` into burn-gdn2's default to get the 1000-case
+        # bit-exactness anchor and test_chunk back into the default cell.
+        for f in c["default"]:
+            if f not in public and f not in NOT_PUBLIC:
+                problems.append(
+                    f"{c['name']}: default feature {f!r} is not something the "
+                    "facade can name (it sets default-features = false per dep "
+                    "and re-derives the default), so a facade consumer would "
+                    f"silently lose it. Add {f!r} to the facade's default, or "
+                    "take it out of the member's default and require it "
+                    "explicitly - NOT_PUBLIC says why it is not propagated."
+                )
         for f in c["features"]:
             if f != "default" and f not in public and f not in NOT_PUBLIC:
                 problems.append(f"{c['name']}: unhandled feature {f!r}")
     return problems
 
 
+def facade_default(crates: list[dict]) -> list[str]:
+    """The union of every member's DEFAULT features, sorted.
+
+    This is what the facade's own `default` must be: it disables each
+    dependency's defaults and re-enables them here, so a member default that
+    is not re-enabled here is a feature a consumer of the facade silently does
+    not get. Deriving it means a member can grow a default feature and the
+    facade follows, instead of the generator refusing to run - but only
+    features the facade can actually name may appear (check_members), because
+    cargo rejects a `default` entry that is neither a dependency nor a feature
+    this crate declares.
+    """
+    return sorted({f for c in crates for f in c["default"]})
+
+
 def feature_table(crates: list[dict]) -> str:
     """[features]: every member feature, listing the members that declare it."""
-    lines = ["[features]", 'default = ["std"]', ""]
+    lines = [
+        "[features]",
+        'default = ["std"]',
+        "",
+        "# every member ships `std`; the facade default is exactly this.",
+        "# a member default feature NOT listed here is one the facade does not",
+        "# restore (see NOT_PUBLIC) - its owner must require it explicitly.",
+    ]
     for feat in propagated(crates):
         on = [c for c in crates if feat in c["features"]]
         if feat == "std":
