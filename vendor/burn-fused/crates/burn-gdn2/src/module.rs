@@ -633,21 +633,48 @@ pub fn rms_norm_gate_per_head(
 }
 
 // THE OUTPUT GATE IS SiLU, AND TWO AUTHORITIES DISAGREE ABOUT IT. Fetched
-// 2026-09-29, both at `main`, neither pinned:
+// 2026-09-29; the two SHAs are recorded so the pair is reproducible, unlike an
+// unpinned `main`:
 //
-//   NVlabs/GatedDeltaNet-2  lit_gpt/gdn2.py:212
+//   NVlabs/GatedDeltaNet-2 @ a5552fe3   lit_gpt/gdn2.py:212
 //       self.o_norm = FusedRMSNormSwishGate(self.head_v_dim, eps=norm_eps)
-//   fla-org/flash-linear-attention  fla/layers/gdn2.py:197
+//   fla-org/flash-linear-attention @ 9f38d249   fla/layers/gdn2.py:197
 //       self.o_norm = FusedRMSNormGated(self.head_v_dim,
 //                                       activation="sigmoid", eps=norm_eps)
 //
 // We implement SiLU, i.e. the NVlabs choice - the original GDN-2 reference.
-// `research/reviews/gdn-fwd-review.md` found this, and the finding matters
-// for a reason beyond the choice itself: **our own f64 oracle transcribes the
-// FLA file, which selects the OTHER branch.** So the oracle cannot see this
-// divergence - it is a transcription agreeing with a shared misunderstanding,
-// which is the exact failure `docs/ORACLE.md` §3 classifies as tier (c). Every
-// other column in `ref_f64.bin` would agree even if this were wrong.
+// `research/reviews/gdn-fwd-review.md` found the disagreement, and it matters
+// for a reason beyond the choice itself: this is a *configuration* selected at
+// the LAYER, and the two files are different files in the same repo.
+//
+// BOTH BRANCHES ARE IN ONE KERNEL, so nothing here is a transcription of a
+// formula. `fla/modules/fused_norm_gate.py:101-104`,
+// `layer_norm_gated_fwd_kernel`:
+//     if ACTIVATION == "swish" or ACTIVATION == "silu":
+//         b_y = b_y * b_g * tl.sigmoid(b_g)
+//     elif ACTIVATION == "sigmoid":
+//         b_y = b_y * tl.sigmoid(b_g)
+// `fla/modules/` is the kernel; `fla/layers/gdn2.py` is the layer, and only the
+// layer passes `activation="sigmoid"`. `FusedRMSNormSwishGate` (same file,
+// :1074) subclasses `FusedRMSNormGated` without overriding `activation`, so it
+// takes the class default "swish" at :997, i.e. silu.
+//
+// CORRECTION, 2026-09-29, because the first version of this comment was wrong
+// in the direction that mattered. It said "our own f64 oracle transcribes the
+// FLA file, which selects the OTHER branch", and that the oracle was therefore
+// structurally blind. It is not: `tools/gen_reference_f64.py` cites
+// `fla/modules/fused_norm_gate.py:102`, which IS the swish branch, so the
+// reference and the kernel AGREE on this line and always have. A flip of
+// `silu(gate)` to `sigmoid(gate)` here would fail `tests/ref_f64.rs` loudly.
+// The claim confused `fla/modules/` with `fla/layers/`.
+//
+// WHAT THE ORACLE WAS ACTUALLY MISSING is smaller and worth having: nothing
+// MEASURED the choice, so it rested on a docstring sentence. `output-gate-sigmoid`
+// is now the nearest of the eight committed wrong formulas in
+// `ref_f64_faults.bin` - 2.090e-01 relative, 209x the bar, 2.1x
+// SEMANTIC_FLOOR - so the distance between this branch and the other upstream's
+// is data in the tree, and a regeneration that dropped the entry fails the
+// suite. That is a coverage gap closed, not a tier-(c) failure found.
 //
 // NOT RESOLVED HERE, deliberately. This is a technology choice between two
 // credible implementations, not a transcription error, and ADR-0002/A-B-002 is
@@ -660,7 +687,10 @@ pub fn rms_norm_gate_per_head(
 // A note on the scale of the effect, NOT measured and not claimed: replacing
 // silu with sigmoid changes the gate's range from (-inf, 1) to (0, 1) - it
 // removes the negative half entirely - so it is a strictly positive gate after
-// the change. That is a real architectural difference, not a detail.
+// the change. That is a real architectural difference, not a detail. It is
+// MEASURED in one direction only: 2.090e-01 relative on the committed fixture,
+// which is how far apart the two formulas are on fixed weights and a fixed
+// input, not how far apart they are in held-out BPB.
 
 pub struct ProjectedInputs<'a> {
     pub q: Tensor<4>,
