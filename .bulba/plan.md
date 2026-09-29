@@ -100,6 +100,36 @@ testable and A/B-able (ADR-0017).
       which parameter each assertion is about (a rename fails it loudly) — no
       group is decided from one.
 - [ ] C12. `feat: smoke preset + --smoke`, `docs/README-model.md` (≤60 lines).
+- [x] D1. `docs: retract the false step-time and verification claims` (prose only,
+      no Rust). **Landed 2026-09-29.** Withdrawn without replacement, because the
+      corrected value is not known: the 25.8 s/step batch-8 figure (no committed
+      log, no `benches/history.tsv` row, struck there as measured-under-load);
+      the 3076 ms no-attention figure beside it (same); the `1810 → 365 ms`
+      subtraction in `kda-sota-ceiling.md` §4.2 (both endpoints step-0);
+      the attention backward's true cost (never measured - no run on record has
+      executed one); the `~465 ms` as a measured fixed cost and the
+      `0.067 ms/token` coefficient it was fitted with (the fit overpredicts 3x at
+      the batch-8 shape); the `1.6 s/step` A/B budget and every `cost` cell
+      derived from it; the scale ladder's whole wall-clock column; the
+      `9 h`/`30-90 days` pair in `README.md` (e), which also disagreed with
+      itself. Corrected WITH a sourced value: the 10 809 ms anecdote in
+      `VERIFICATION.md`; the `bit_exact.rs` "pattern to follow" recommendation
+      (it is RED 976/1000 and its 1000-case test is feature-gated off the
+      default cell); the `--seed` claim in Layer 2 (`4b42b6d` seeds the init, and
+      4 % of the model is still process entropy); "layers 1 and 2 pass today"
+      (Layer 2 is unwritten); the `VERIFIED` row for the attention arm
+      (`fused kda=64/0` in both arms of the 2026-09-29 preflight, and
+      `autodiff_nested_balanced` is RED); "no CUDA graph capture in the
+      burn/cubecl stack" (it is 5/5 green on this GPU); the `--bf16` flag
+      experiment in `PLAN.md` (bf16 matmul cannot work on this backend);
+      the `6.7-8.3 s/step` baseline and `KDA ~80 %` in `PLAN-minimal-core.md`;
+      the `2-5 %` arithmetic share (~16 % against a warm step). Six research
+      documents corrected in place, none deleted. Every correction names
+      `benches/history.tsv`, a commit, or a `file:line`.
+      **Deliberately left alone:** the ~465 ms order-of-magnitude reading in
+      ten files is *vindicated* by the 245 ms warm step, and the launch-bound
+      reasoning that rests on it is now confirmed by an independent instrument
+      (13.3 % mean GPU utilisation, 79 % of samples ≤5 %).
 
 ## Critical Files
 

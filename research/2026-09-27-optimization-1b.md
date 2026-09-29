@@ -33,14 +33,68 @@ Their recipe for fitting a model on 16 GB (the part we can copy):
 6. All allocations at startup: "if the program does not run out of memory
    before the first step, it will never run out".
 
+> ## ⚠ CORRECTION 2026-09-29 — the step-time numbers below are superseded.
+> **The conclusions of this document stand. The numbers do not, and the reason
+> is specific.** Re-measured by hand on a quiet card, release build, same
+> preset family, `CUBECL_AUTOTUNE_LEVEL=3`, `--timers`
+> (`benches/history.tsv`, 2026-09-29):
+>
+> | | this document (2026-09-27) | measured warm (2026-09-29) |
+> |---|---|---|
+> | step time, batch 8 x seq 512 | 1.8-2.1 s | **~245 ms** (249/240/250 at steps 50/100/150) |
+> | step 0 | not separated | **5549 ms** |
+> | fwd / bwd / opt | 800 / 1000 / 80 ms | **46-48 / 96-98 / 43-47 ms** |
+> | retract | 87 ms | **52-61 ms** (22 % of a warm step, in no document before 2026-09-29) |
+>
+> **The old figures are step-0 readings.** The cubecl autotune cache is cold
+> for the first steps and benchmarks every candidate at runtime, so a step-0
+> step is **23x** a warm one and `opt` warms **94x** (4053 ms -> 43 ms).
+> `--timers` used to print on `step % 50 == 0` only and was not tied to
+> `--log-every`, so every short run in this project's history could only ever
+> see step 0. **That defect is fixed (`b8a47ee`): the cadence is now
+> `step == 0 || step % log_every == 0`, so today's bench rows carry a step
+> index.** The 1.8-2.1 s in this document is one of the old readings, and so
+> is the `10809 ms` reading later promoted to `AGENTS.md` §3.1 as a headline.
+>
+> **What is vindicated, and it is the load-bearing part of this document: the
+> workload is launch-bound.** That was inferred here from a step-time fit; it
+> is now **measured directly** — over a 150-step warm run at batch 32 the GPU
+> is **13.3 % utilised on average with 142 of 180 samples at <=5 %**
+> (`nvidia-smi` at 2 Hz, 2026-09-29, `benches/history.tsv`). Too many small
+> kernels to fill the SMs. The 465 ms fixed cost below is the right *order*
+> (the warm step is ~245 ms, i.e. smaller, not larger) and the reasoning that
+> rests on it — cut launches, not FLOPs — is confirmed by an instrument that
+> did not exist when this was written. **The model itself is not merely
+> imprecise, it is now falsified as a fit:** at 4096 tokens/step it predicts
+> 465 + 0.067x4096 = 739 ms against a measured warm 244 ms, a 3x
+> overprediction. It was fitted at seq 128 (551/808 ms), a shape whose
+> per-token term is much larger, so the "fixed cost" it isolated is partly the
+> per-token term of a different shape. Keep the conclusion; stop quoting the
+> coefficients.
+>
+> **The one conclusion that does NOT survive: "the optimizer is not where the
+> time is" was never stated here, but "KDA is the dominant cost" is retracted
+> elsewhere** — the warm forward is 46-48 ms, i.e. **19 %** of a warm step, not
+> 80 %. And the attention backward **does not run at all** in the warm
+> measurement (`fused kda=<f>/0`), so the backward figure above is an
+> incomplete backward, not the cost of training attention.
+>
+> Unchanged and still correct: the GEMM table and its TFLOP/s numbers (a probe,
+> not a step reading), the 1B arithmetic in §"Consequences" item 3, and the
+> cuBLAS addendum.
+
 ## Our measured reality
 
 `small` preset, batch 10 x seq 512 = 5120 tokens/step, fp32, no-engram:
 
 - **1.8-2.1 s/step steady state** (v4/v5 logs, `--timers`).
+  **WITHDRAWN as an absolute — this is a step-0 reading; see the correction
+  above. The warm figure at batch 8 is ~245 ms.**
 - CPU-side phase timers sum to the whole step: fwd ~800 ms + bwd ~1000 ms +
   opt ~80 ms + retract ~87 ms. The CPU never runs ahead of the GPU ⇒ the GPU
-  is idle waiting for work ⇒ **launch/dispatch-bound**.
+  is idle waiting for work ⇒ **launch/dispatch-bound**. **(The inference is
+  confirmed and now measured: 13.3 % mean GPU utilisation, 79 % of samples at
+  <=5 %. The per-phase ms values are step-0 and do not survive.)**
 
 ### The decisive experiment (seq 128, same launch count, 4x the tokens)
 
@@ -52,6 +106,13 @@ Their recipe for fitting a model on 16 GB (the part we can copy):
 Fitting `t = F + c*tokens`: **c = 0.067 ms/token, F = ~465 ms fixed per step.**
 (Measured with v5 training concurrently, so contention inflates the
 GPU-bound arm — the true fixed share is if anything larger.)
+**Both step times here are step-0 readings** (v5 was a short run and
+`--timers` only prints every 50th step), so the fit describes the autotune
+warm-up curve rather than the steady state. The *conclusion* it was used for —
+a large fixed cost that does not scale with tokens — survives: the warm batch
+ladder is 244 / 440 / 826 ms at batch 8 / 16 / 32, i.e. 4x the tokens for 3.4x
+the time at the same launch count. **The 465 ms figure itself is not a measured
+fixed cost and should not be quoted as one**; the warm step is ~245 ms.
 
 ### Where the arithmetic actually sits
 
@@ -79,17 +140,42 @@ optimizer, TSCT retraction, and pool/launch overhead.
    tensor cores cannot give LLMQ's 4-8x here: their runs are 50-85%
    GEMM-bound, ours is ~4%. The levers are CUDA-graph capture of the step,
    op fusion (fewer elementwise passes), and killing fixed costs.
+   **CORRECTED 2026-09-29: the "ours is ~4%" is a step-0 denominator.** The
+   GEMM probe is real (~40 ms of GEMM per step, `gemm_probe`), but it was
+   divided by a 1900 ms step-0 reading; against the warm ~245 ms step the same
+   GEMM is **~16 %, not 2-5 %** (shapes differ slightly: the probe is at batch
+   10, the warm step at batch 8). The *conclusion* survives on its own
+   instrument — **13.3 % mean GPU utilisation, 79 % of samples at <=5 %** means
+   the card is idle, whatever the arithmetic share is — but the arithmetic
+   share is three times what was claimed, and precision is a weaker lever here
+   than this bullet said.
 2. **Cheap fixed-cost cuts available today (no new code):**
    - `--retract-every 5` instead of 1: the polar retraction exists to keep
      the *quantized* factor forward faithful; under `--quant fp32` it is
      87 ms/step of pure overhead. A/B on held-out BPB.
+     **CORRECTED 2026-09-29: the retraction is 52-61 ms warm, 22 % of a warm
+     step, and it is a FIXED cost — 8x the data costs 1.2x the retraction
+     (52.8/53.3/64.6 ms at batch 8/16/32).** `--retract-every 1000` gives
+     `retr = 0.0` and a **188 ms** step against 240, so the 52 ms is real and
+     not arithmetic. It is also **112 unguarded host reads per step** at
+     `small` (16 TSCT factors x 7 `into_scalar`), which is where the time
+     goes; a reviewer showed the `σ_max` power iteration inside it is provably
+     unnecessary for a unit-Frobenius input, so those reads need not exist
+     (README working rule 3).
    - `--bf16` storage halves elementwise traffic (the per-token term). Flag
      only; the AGENTS.md note that it was slower predates the current
-     autotune/fused state and must be re-measured.
+     autotune/fused state and must be re-measured. **Superseded: bf16
+     matmul cannot work on this backend at all (§2.1) — it is slower than
+     fp32 by construction, not by measurement, so this is no longer a cheap
+     flag-only experiment.**
 3. **At 1B the ranking inverts.** Per-step FLOPs scale with N: 4 iterations x
    6 x 1e9 x 5120 tokens ≈ 123 TFLOP/step. At our 7.6 TFLOP/s that is 16 s/step;
    at a bf16-tensor-core 50 TFLOP/s it is 2.5 s/step. So for 1B, GEMM
    efficiency IS the lever, and it is currently **blocked**.
+   **This arithmetic is UNAFFECTED by the step-time retraction** — it is
+   derived from FLOPs and the measured TFLOP/s of a probe, not from a step
+   timer. It is the one part of this document that needed no correction, and
+   the 16 s/step here is a roofline estimate, explicitly not a measurement.
 4. **The bf16 GEMM blocker is now localized, not vague.** `bf16_matmul`
    (burn-spectral, the true tensor-core path) **fails its own tests on
    pre.4 + cuda**: both `bf16_matmul_matches_fp32_with_grads` and

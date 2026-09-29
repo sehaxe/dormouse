@@ -241,11 +241,30 @@ predicate used by both the group builder and the validator, which had drifted).
 
 ## OPTIMIZATION 2026-09-27 (measured; full data in research/2026-09-27-optimization-1b.md)
 
-Step = 1.9 s for 5120 tokens on 7.5M params. The decisive measurement: at
+> **Step-time figures in this section are WITHDRAWN 2026-09-29.** They are
+> **step-0 readings**. Warm, release, quiet card, `CUBECL_AUTOTUNE_LEVEL=3`,
+> `--timers` at a step index past 50 (`benches/history.tsv`, 2026-09-29): a step
+> is **~245 ms** at batch 8 (249/240/250 at steps 50/100/150) and a step-0 step
+> is **5549 ms** - **23x**, from the cold cubecl autotune cache. `--timers`
+> printed on `step % 50 == 0` only and was not tied to `--log-every`, so a short
+> run could only ever see step 0. **Fixed in `b8a47ee`**: the cadence is now
+> `step == 0 || step % log_every == 0` (`crates/dormouse-train/src/lib.rs:1196`),
+> so today's rows carry a step index. The readings quoted here predate the fix
+> and are all step 0. The same defect produced the retracted
+> `25858 ms`, the retracted `10809 ms` "77% optimizer" headline, and the
+> retracted `1.58-1.84 s/step` figure that reached `README.md`.
+> **What survives, and it is the load-bearing claim: the workload is
+> launch-bound** - now measured rather than inferred, at **13.3 % mean GPU
+> utilisation with 79 % of samples at <=5 %**. The arithmetic share is ~16 %,
+> not 2-5 % (the same ~40 ms of GEMM against a 245 ms step).
+
+~~Step = 1.9 s for 5120 tokens on 7.5M params.~~ The decisive measurement: at
 seq 128, batch 10 -> 551 ms and batch 40 -> 808 ms for the SAME launch count
-and 4x the tokens, i.e. **~465 ms of FIXED cost per step** + 0.067 ms/token.
+and 4x the tokens, i.e. ~~**~465 ms of FIXED cost per step**~~ (not a measured
+constant - it was fitted to two step-0 readings; the warm step is 245 ms) + 0.067 ms/token.
 Our fp32 GEMMs measure 3.5-7.6 TFLOP/s (gemm_probe) and one step holds ~40 ms
-of GEMM against 1900 ms: **~2-5% arithmetic, the rest overhead**. Reference:
+of GEMM against ~~1900 ms~~ **245 ms**: **~16% arithmetic** (was quoted as 2-5% on
+the step-0 denominator), the rest overhead. Reference:
 LLMQ (2512.15306) on this very RTX 5060 Ti reaches 78-85% MFU (39 TFLOP/s).
 
 Ranked, by regime:
@@ -257,9 +276,15 @@ Ranked, by regime:
    Spike first: capture a loop of elementwise ops, measure replay vs eager.
 2. **Flags-only A/Bs (no new code), judged on held-out BPB:** `--retract-every 5`
    (the polar retraction exists for the QUANTIZED forward; under `--quant fp32`
-   it is 87 ms/step of pure overhead), `--bf16` (halves elementwise traffic -
-   the dominant per-token term; the old "bf16 is slower" note predates the
-   restored autotune and must be re-measured), Muon NS steps 8 -> 5.
+   it is ~~87 ms/step of pure overhead~~ **52-61 ms warm, 22 % of a warm step,
+   and a FIXED cost - 8x the data costs 1.2x the retraction. `--retract-every
+   1000` gives `retr = 0.0` and a 188 ms step against 240, so the 52 ms is real
+   and is 112 unguarded host reads per step, not arithmetic**),
+   ~~`--bf16` (halves elementwise traffic - the dominant per-token term)~~
+   **NOT AVAILABLE: bf16 matmul cannot work on this backend at all** (the LLVM
+   dialect has no bf16 type, so `--bf16` computes fp32 through cast copies and
+   is slower than fp32 by construction - AGENTS.md §2.1). Delete this
+   experiment, do not re-measure it, Muon NS steps 8 -> 5.
 3. **At 1B the ranking inverts:** per-step FLOPs ~123 TFLOP, so GEMM efficiency
    dominates and the fixed cost amortizes away. Tensor cores are then THE lever
    - and they are reachable: the NVPTX wmma lowering defines its fragments for

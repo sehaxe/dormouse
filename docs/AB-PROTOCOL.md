@@ -84,39 +84,85 @@ anything at our scale. Every A/B is **3 seeds per arm**, same data order
 (the stream is seeded deterministically, and `sample_depth` is a function of the
 step index, so a seed is a config difference only).
 
-Budget: 2000 steps at ~1.6 s = 53 min per run, so one arm = 2.7 GPU-hours.
-Four arms (control + 3) = ~11 GPU-hours. This is the price of an honest
-verdict, and it is why mechanism work is prioritised rather than run in
-parallel: the GPU is the bottleneck, not the ideas.
+**⚠ That parenthetical is now known to be too strong, and the protocol is
+"nearly" implementable rather than implemented.** `device.seed(cfg.seed)`
+(`4b42b6d`, 2026-09-28) does govern the model init and the JEPA mask, both pure
+functions of `(seed, step)` — before that fix two runs with identical flags
+differed in **34 730 605 of 43 725 616 checkpoint bytes**, so every A/B in the
+archive compared two different initialisations and charged the difference to
+the arm. **The gap that remains, measured in the same commit: 409 043 differing
+values on a *repeated* run under the same seed — ~4 % of the model is process
+entropy the seed does not reach.** Until that is zero, two runs under one seed
+are not the same run, so the 3-seed spread you compare against is contaminated
+by a per-run random component. **Close the seed gap before the queue, not
+during it** — it is the cheapest item on this page and it gates the reading
+rule below.
 
-**That budget is void, and the replacement has not been measured.** The ~1.6
-s/step came from a run whose attention backward did not execute at all
-(`8fa5d4c`), so it is the cost of a model with no attention training in it. The
-figure that would replace it — the tensor-op path carrying a real backward at
-batch 8, reported as **25.8 s/step** against **3076 ms** without the arm — was
-taken by the 2026-09-28 audit and has **no committed log and no
-`benches/history.tsv` row**, so it is a single unreproduced observation and is
-recorded as such rather than as the new budget. If it holds, 3 seeds × 2k steps
-is ~14 h *per run* and the queue has to be re-scoped (fewer arms, or fewer
-steps, or a smaller batch) before it is worth starting. **Measure one step's
-wall time with `--timers` on a quiet GPU at the intended batch, and write it in
-`benches/history.tsv`, before planning anything on this table.** The `cost`
-column below is the old figure and is kept only so the rows line up; treat it as
-"unknown".
+**~~Budget: 2000 steps at ~1.6 s = 53 min per run, so one arm = 2.7 GPU-hours.
+Four arms (control + 3) = ~11 GPU-hours.~~ STRUCK 2026-09-29. The 1.6 s/step
+was a model with no attention training in it, and a step time is not a number
+without its step index.**
+
+**The cost of one arm is currently UNKNOWN, and that is the honest state of
+this table.** Both directions of the error are real and neither is a usable
+budget:
+
+- **The 1.6 s/step that priced this table is withdrawn.** It came from a run
+  whose attention backward executed **zero** times (`fused kda=<f>/0`,
+  `8fa5d4c`), so it is the cost of a model with no attention training in it.
+- **The 25.8 s/step that would replace it is withdrawn too.** The tensor-op
+  path at batch 8 reported as 25.8 s/step against 3076 ms without the arm came
+  from the 2026-09-28 audit and has **no committed log and no
+  `benches/history.tsv` row**. Both figures were also measured under
+  conditions nobody can reproduce (load, dev profile, eval enabled), and
+  `benches/history.tsv` strikes them for exactly that reason. A single
+  unreproduced observation is not a budget.
+- **What is measured, 2026-09-29, warm, in `benches/history.tsv`** — release,
+  `small` 9 195 854 params, depth 2, fp32, aux off, `--no-engram`,
+  `CUBECL_AUTOTUNE_LEVEL=3`, `--timers`:
+
+  | batch | warm step | 2000 steps |
+  |---|---|---|
+  | 8 | **244 ms** | ~8 min |
+  | 16 | **440 ms** | ~15 min |
+  | 32 | **826 ms** | ~28 min |
+
+  **Every one of these is a floor, not a budget**: the attention backward does
+  not run in any of them, and the step it adds is the entire open question.
+  A step-0 reading in the same configuration is 5549 ms — **23x** the warm
+  step — so a queue planned from any un-indexed timer line is wrong by more
+  than an order of magnitude in either direction.
+- **One partial data point at the queue's own shape, and it is the most useful
+  number here**: `tools/mor_ab.sh preflight` (`.bulba/memory.md:36`,
+  2026-09-29, `small`+`mor`, batch 20 x seq 512, fp32, pure CE, release, quiet
+  card, 204 800 B window) measures a **steady 1068 ms** step (fwd 251 / bwd
+  674 / opt 73 / retr 69), i.e. a 2k-step arm ≈ 36 min and a 3-seed × 2-arm
+  sweep ≈ 3.6 GPU-h. That same run printed `fused kda=64/0` in **both** arms,
+  so it is also a floor — and it says the cost is *not* what blocks the queue.
+  A control re-baseline is.
+
+**Do not plan from the `cost` column below.** It is the withdrawn 1.6 s/step
+figure, kept only so the rows line up; treat every entry as "unknown". The
+cheapest way to replace it: run one step with `--timers` on a quiet GPU at the
+intended batch, **at a step index past 50**, and write the row in
+`benches/history.tsv` before planning anything on this table.
 
 ## The queue, in the order the evidence says to run it
 
+<!-- `cost` is UNKNOWN in every row. The 2.7 h / 5.4 h / 3.6 h figures were derived
+from a withdrawn 1.6 s/step and are struck above; see the budget section. Do not
+repopulate this column from any step-time reading that has no step index. -->
 | # | arm | flag | what it decides | cost |
 |---|-----|------|-----------------|------|
-| 0 | control | current recipe | the reference curve | 2.7 h |
-| 1 | **pure CE** | `--jepa-weight 0 --dspark-weight 0` | do the aux losses earn their 26% of the step? (they have never been A/B'd, and the audit says they go if they lose) | 2.7 h |
-| 2 | **dense FFN** | `--set use_tsct=false` | do the TSCT factors, the polar retraction and the quant machinery earn ~1000 lines? (the dense arm has a narrower FFN at the same param budget - that is the comparison that means something) | 2.7 h |
-| 3 | **working set** | `--data .../real_ws16` | does 4 epochs over 4.8 GB beat one pass over 19 GB at equal steps? (the byte-LM recipe research's central claim) | 2.7 h |
-| 4 | **rand depth** | `--rand-depth` | does trained depth-robustness pay, or is fixed-4 better? | 2.7 h |
-| 4b | **depth 2 vs 4** | `--max-iter 2` | the cheapest and highest-leverage arm in the queue - see below | 2.7 h |
-| 5 | **KDA decay form** | (needs the flag from the KDA agent) | our decay starts at alpha ~0.077 (a ~9-token memory); the FLA reference starts at alpha 0.2-0.999. If a longer effective memory helps, this is a technology REPLACE, not a tuning knob | 2.7 h |
-| 6 | **hashed memory (Engram)** | default (in) vs `--no-engram` | RUN 2026-09-27 at the program's operating depth (`--max-iter 2`), pure CE, 3 seeds per arm, 2000 steps, batch 20 x s512. The arm ships at 25_000 rows/order x 3 orders x 32 dim = 2.4M memory params (24% of the model) behind a hard floor (`lam = min(w_mem, 0.5)`); verdict and numbers below | 5.4 h |
-| 6b | **memory capacity ladder** | `--set engram_rows=100000` / `500000` | one seed per rung, not three: the measured slot-count curve (arXiv 2601.16531) peaks at 500K/order but on a 125M backbone - at ours 500K is 48M params = 86% of the model, the monopoly shape. Rung 6 says whether the arm earns its 24%; this says whether 24% is the right rung | 3.6 h |
+| 0 | control | current recipe | the reference curve | unknown |
+| 1 | **pure CE** | `--jepa-weight 0 --dspark-weight 0` | do the aux losses earn their 26% of the step? (they have never been A/B'd, and the audit says they go if they lose) | unknown |
+| 2 | **dense FFN** | `--set use_tsct=false` | do the TSCT factors, the polar retraction and the quant machinery earn ~1000 lines? (the dense arm has a narrower FFN at the same param budget - that is the comparison that means something) | unknown |
+| 3 | **working set** | `--data .../real_ws16` | does 4 epochs over 4.8 GB beat one pass over 19 GB at equal steps? (the byte-LM recipe research's central claim) | unknown |
+| 4 | **rand depth** | `--rand-depth` | does trained depth-robustness pay, or is fixed-4 better? | unknown |
+| 4b | **depth 2 vs 4** | `--max-iter 2` | the cheapest and highest-leverage arm in the queue - see below | unknown |
+| 5 | **KDA decay form** | (needs the flag from the KDA agent) | **Provenance corrected 2026-09-29: `alpha ~0.077` is OURS, not a reference's.** `a_log = -3` / `b_alpha = +1.0` is a measured choice of this repo's; Kimi K3 §2.1.1 uses `A_h = 0` and FLA uses `inv_dt ∈ [-6.91, -2.25]` (negative, reaching `alpha ~0.95`). Under the K3 sigmoid a non-negative `z` caps `alpha` at `e^{g_min/2} = 0.0821`, so **the bias SIGN, not `A`, is the lever**, and neither knob alone gets there (`vendor/burn-fused/crates/burn-kda/src/lib.rs` module docs carry the per-source table). If a longer effective memory helps, this is a technology REPLACE, not a tuning knob | unknown |
+| 6 | **hashed memory (Engram)** | default (in) vs `--no-engram` | RUN 2026-09-27 at the program's operating depth (`--max-iter 2`), pure CE, 3 seeds per arm, 2000 steps, batch 20 x s512. The arm ships at 25_000 rows/order x 3 orders x 32 dim = 2.4M memory params (24% of the model) behind a hard floor (`lam = min(w_mem, 0.5)`); verdict and numbers below | unknown |
+| 6b | **memory capacity ladder** | `--set engram_rows=100000` / `500000` | one seed per rung, not three: the measured slot-count curve (arXiv 2601.16531) peaks at 500K/order but on a 125M backbone - at ours 500K is 48M params = 86% of the model, the monopoly shape. Rung 6 says whether the arm earns its 24%; this says whether 24% is the right rung | unknown |
 
 Rule for reading a result: an arm wins if its mean held-out BPB at the same step
 count is below the control's mean by more than the spread across the control's
@@ -124,8 +170,16 @@ own 3 seeds. Anything inside that spread is "no difference", and a mechanism
 that cannot show a win over its own seed noise gets deleted, not kept "because
 it might help later".
 
-Three of these rows are not merely unrun — they are **undefined against the old
-control**, and running them as written would produce a number that means
+**Two things must be true before ANY row is run, and neither is a formality:**
+
+- **The seed gap is closed** (the 409 043 differing values, above). Until two
+  runs under one seed are the same run, the spread this protocol compares
+  against is not a seed spread, and a 3-seed verdict measures the seed plus
+  process entropy plus the arm.
+- **A control with a gradient-carrying attention arm exists** (row 0 below).
+
+Then, of the rows: three are not merely unrun — they are **undefined against the
+old control**, and running them as written would produce a number that means
 nothing:
 
 - **Row 0, the control, has to be re-baselined first.** Every control on record
@@ -142,12 +196,29 @@ nothing:
 
 ## What is NOT an A/B
 
-- Step-time claims need the same-shape measurement (`--timers` at the same
-  batch/seq, on a quiet GPU): the 2026-09-27 ablation (`--no-kda` 956 -> 188 ms)
-  was measured alongside a live run and is a ratio, not an absolute. It is also
-  the only step-time measurement of removing the attention arm, and the arm was
-  not training at the time — so it prices neither the arm as it was nor the arm
-  as it now is. Do not reuse it as either.
+- Step-time claims need **three** things, and until 2026-09-29 this project
+  routinely supplied at most one: the same shape (batch/seq/depth, `--timers`),
+  a quiet GPU, **and a step index past 50**. `--timers` used to print on
+  `step % 50 == 0` only and was not tied to `--log-every`, so an un-indexed
+  reading was almost always step 0. **That defect is fixed** (`b8a47ee`: the
+  cadence is now `step == 0 || step % log_every == 0`,
+  `crates/dormouse-train/src/lib.rs:1196`, and a warm step is reached by step
+  2), so a `benches/history.tsv` row written today carries its step index —
+  quote it. The historical readings do not, and a step-0 step is **5549 ms
+  against a warm ~245 ms** in the same configuration
+  (`benches/history.tsv`, 2026-09-29). **A step-time reading
+  with no step index is not a measurement of a step.** Under those conditions
+  this file has produced, in order: `25858 ms`, `10809 ms`, and `1.58-1.84
+  s/step`. All three are struck.
+- The 2026-09-27 `--no-kda` ablation (956 -> 188 ms) was measured alongside a
+  live run and is a ratio, not an absolute. It is also the only step-time
+  measurement of removing the attention arm, and the arm was not training at
+  the time — so it prices neither the arm as it was nor the arm as it now is.
+  Do not reuse it as either. **Withdrawn from the cost column too:** the
+  25.8 s/step batch-8 figure that would have replaced the 1.6 s budget has no
+  committed log and no `benches/history.tsv` row, and the 3076 ms
+  no-attention figure beside it was measured under the same unreproducible
+  conditions. Both are struck in `benches/history.tsv`.
 - **A BPB from two different windows is not a comparison.** The window is
   `eval_batches × batch × seq_len`; 4.997 is 20 480 B and 6.351 is 102 400 B.
   If an A/B table has one arm at a different batch size from its control, the
@@ -165,13 +236,28 @@ Two independent lines of evidence now point the same way, and both are measured:
   pass allocates 17 fresh tensors / 248 MB of saved scratch
   (research/2026-09-27-kda-sota-ceiling.md). Four iterations is ~1 GB/step of
   allocator traffic against a 7 ms arithmetic budget and a cubecl pool that is
-  high-water and never frees. That is why KDA is ~80% of a step, and why a
-  *perfect* KDA kernel would still leave the step at ~365 ms: the 465 ms
-  launch-overhead floor dominates below ~80M parameters. **Both cost
-  attributions above are now suspect in the same way**: they were measured on a
-  run where the attention arm executed no backward (`fused kda=<f>/0`,
-  `8fa5d4c`), so "80% of a step" is 80% of a step that skipped the backward.
-  Re-measure before using this bullet to argue depth.
+  high-water and never frees. That is why KDA was measured at ~80% of a step,
+  and why a *perfect* KDA kernel would still have left the step at ~365 ms:
+  the ~465 ms launch-overhead floor dominates below ~80M parameters.
+
+  **Both cost attributions in this bullet are retracted, in the same way and
+  for the same reason.** They were measured on a run where the attention arm
+  executed no backward (`fused kda=<f>/0`, `8fa5d4c`), so "80% of a step" is
+  80% of a step that skipped the backward, and the 465 ms floor was read at
+  **step 0** (the `10809 ms` reading it was fitted from is a step-0 artifact —
+  `benches/history.tsv`, 2026-09-29). Re-measure before using this bullet to
+  argue depth.
+
+  **What survives, and it is the part this arm is argued on: the workload is
+  launch-bound, now measured directly rather than inferred from a step-time
+  fit.** Over a 150-step warm run at batch 32 the GPU is **13.3 % utilised on
+  average with 142 of 180 samples at <=5 %** (`benches/history.tsv`,
+  2026-09-29, `nvidia-smi` at 2 Hz). The kernels are too small and too many to
+  fill the SMs, so cutting arithmetic in the attention arm buys little wall
+  clock while cutting *launches* buys a lot. That is the launch-bound claim the
+  465 ms figure was standing in for, and it now has an instrument behind it.
+  The warm step itself is **~245 ms**, so the floor argument holds with a
+  smaller number than the one it was originally made with.
 - **Quality.** The adaptive-depth survey found the peak-then-fall effect in the
   literature: Ouro-1.4B drops 20.47% past its peak, RecurTrace measures fixed
   depth 54.71@2 degrading to 47.54@16, and Huginn tokens that "settle" at depth

@@ -508,4 +508,17 @@ ce 5.709 -> 5.703 over 6 steps, 0 NaN
   attention backward actually running (AGENTS.md §3.2/§3.3), and this is the
   same order as the 25.8 s/step batch-8 figure that has no committed log
   either. It is the first number I have seen with the attention backward in it.
+  **STRUCK 2026-09-29, both of them.** This document named its own limitation
+  correctly and the project did not act on it: these 21-27 s are **step-0
+  readings** and are not a steady state. A warm step at batch 8 is **244 ms**
+  and a step-0 step is **5549 ms** in the same configuration - a **23x** gap,
+  because the cubecl autotune cache benchmarks every candidate at runtime over
+  the first steps (`benches/history.tsv`, 2026-09-29). So this file's
+  observation is a third instance of the same defect, not a competing
+  measurement, and the **25.8 s/step figure it cross-references is withdrawn
+  outright** (no committed log, no `benches/history.tsv` row, and struck there
+  as measured-under-load in the dev profile with eval enabled).
+  **The per-step steady state of a run WITH the attention backward in it is
+  still unmeasured**, and that is the honest state: no run on record prints a
+  nonzero attention-backward count.
 - The `--bf16` arm of this gate has no number: it does not reach step 0 (§7.3).

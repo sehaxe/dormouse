@@ -3,6 +3,21 @@
 Date: 2026-09-27. Subagent deliverable. Companion to (and correction of)
 `research/2026-09-27-kda-sota-ceiling.md`.
 
+> **Step-time caveat, 2026-09-29.** This document's own probe measurements
+> (99 % host dispatch, GPU on 1-20 ms of a 470-635 ms call) are **not** step
+> readings and are unaffected. But the `1810 ms` / `1445 ms` step figures in the
+> document it corrects, and the `~465 ms fixed cost` it discusses, **are**
+> step-0 readings and are struck (`benches/history.tsv`, 2026-09-29): a warm step
+> at batch 8 is **244 ms** and a step-0 step is **5549 ms** in the same
+> configuration, a 23x gap from the cold cubecl autotune cache. `--timers`
+> printed on `step % 50 == 0` only and was not tied to `--log-every` (that defect
+> is fixed in `b8a47ee`; the cadence now follows `--log-every`, so today's rows
+> carry a step index). The
+> conclusion of both documents - host-side dispatch, not bytes - is
+> **independently confirmed** by the 2026-09-29 GPU-utilisation measurement
+> (13.3 % mean, 79 % of samples at <=5 %). **The attention backward's cost
+> remains unmeasured**: every run on record prints `fused kda=<f>/0`.
+
 Shape: `b=10 t=512 d=768 h=12 K=V=64 chunk=16 fp32`, the dormouse `small` preset, on
 `Autodiff<Cuda, BalancedCheckpointing>` — verbatim the backend in
 `crates/dormouse-train/src/lib.rs:33`, which is what every KDA call in
@@ -161,7 +176,7 @@ be relied on.
 | §0/§2.4/§3(a): "the fused kernels **are engaged** (3 launches fwd, 2 bwd) … their floor is 80-100 µs, we measure 120 ms, a ~1300x gap" | **False for the trainer's backend.** The `TypeId` gate made them unreachable; production ran the tensor path. The 1300x was never a kernel gap. |
 | §2.5: "`fused_chunk_forward_scratch` allocates 17 fresh tensors totalling 248 MB … at ~1 GB per step" | **Bytes right, count wrong.** ~850 allocation slices per forward; 301.8 MB in use / 914 MB reserved per call. |
 | §2.5: "At 1 ms per pool-miss `cudaMalloc`, 1 GB of misses per step is ~1000 ms. That is the 1445 ms." | **Falsified.** 887 MB of deliberate re-misses (after `memory_cleanup()`) cost ~0 ms; warm steady state is identical with and without them. |
-| §2.5: the hypothesis "explains 4x tokens costs 1.47x time, the ~465 ms fixed cost, and the 0.23 ms-vs-1445 ms contradiction" | **Not needed.** A single measurement explains all three: the cost is host-side op dispatch, which is per-op and per-chunk, not per-byte. |
+| §2.5: the hypothesis "explains 4x tokens costs 1.47x time, the ~465 ms fixed cost, and the 0.23 ms-vs-1445 ms contradiction" | **Not needed.** A single measurement explains all three: the cost is host-side op dispatch, which is per-op and per-chunk, not per-byte. **And the ~465 ms itself is struck 2026-09-29** — it was fitted to step-0 readings. Warm, a step is 244 ms (`benches/history.tsv`, 2026-09-29) and the GPU is 13.3 % utilised with 79 % of samples at <=5 %, which is the same "launch overhead, not bytes" conclusion with an instrument behind it. The 465 ms number is **not replaced**. |
 | §2.4 roofline framing (fraction of HBM roofline) | **Kept, but demoted.** With 99% of the time on the host, the binding constraint is dispatch, and the honest comparison is against a per-op host cost. The kernel is still worth ~1.57x once it is actually reached. |
 | §4's `max_iter` lever | **Unchanged and still the biggest single one** (3 of 4 full-sequence KDA passes per step are removable). Nothing in my data argues against it. |
 
