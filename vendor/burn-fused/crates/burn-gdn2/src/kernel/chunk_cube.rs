@@ -810,6 +810,33 @@ pub mod cuda {
     where
         DispatchTensor: DispatchKindConversion<B>,
     {
+        let (out, state, io) = fused_chunk_forward_impl::<B>(
+            q, k, v, g, b, w, state, scale, chunk_size, true,
+        )?;
+        Some((out, state, io.expect("want_scratch = true always exports IntraOut")))
+    }
+
+    /// The body of both fused entries. `want_scratch` selects whether the
+    /// trajectory export kernel runs and its buffers are allocated; the
+    /// forward-only path must not pay for the backward's inputs.
+    ///
+    /// Returns `(out, state, None)` when `want_scratch` is false.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_chunk_forward_impl<B: Backend>(
+        q: Tensor<4>,
+        k: Tensor<4>,
+        v: Tensor<4>,
+        g: Tensor<4>,
+        b: Tensor<4>,
+        w: Tensor<4>,
+        state: Tensor<4>,
+        scale: f64,
+        chunk_size: usize,
+        want_scratch: bool,
+    ) -> Option<(Tensor<4>, Tensor<4>, Option<IntraOut>)>
+    where
+        DispatchTensor: DispatchKindConversion<B>,
+    {
         let [batch, heads, time, k_dim] = q.shape().dims::<4>();
         let v_dim = v.shape().dims::<4>()[3];
         let c = chunk_size;
@@ -859,7 +886,9 @@ pub mod cuda {
         // private copy so the caller's tensor (and any autodiff checkpoint
         // holding the same handle) is never corrupted.
         let state = state.clone() * 1.0;
-        let state_initial = state.clone() * 1.0;
+        // Only the export kernel reads the pre-update state, so the forward-only
+        // path must not pay for this second full-size copy.
+        let state_initial = if want_scratch { Some(state.clone() * 1.0) } else { None };
         let state_cube = cube_of::<B, 4>(&state).expect("backend mismatch");
 
         let nblk = bh * nt;
@@ -881,7 +910,12 @@ pub mod cuda {
         let out = Tensor::<4>::empty([batch, heads, time, v_dim], &device);
         for (l, b) in [
             ("fwd:state private copy", crate::alloc_trace::bytes_of(&state)),
-            ("fwd:state initial copy", crate::alloc_trace::bytes_of(&state_initial)),
+            (
+                "fwd:state initial copy",
+                state_initial
+                    .as_ref()
+                    .map_or(0, crate::alloc_trace::bytes_of),
+            ),
             ("fwd:gexp", crate::alloc_trace::bytes_of(&gexp)),
             ("fwd:kgt", crate::alloc_trace::bytes_of(&kgt)),
             ("fwd:qgt", crate::alloc_trace::bytes_of(&qgt)),
@@ -930,6 +964,8 @@ pub mod cuda {
         // interest, and `fused_calls()` then reported a fused run that fell
         // back to the tensor path — a green test on a lie (ADR-0019).
         crate::cuda_dispatch::note_fused_forward();
+        crate::alloc_trace::note_fused_launch_call();
+        crate::alloc_trace::note_fused_launch("gdn2_chunk_intra_kernel");
         unsafe {
             gdn2_chunk_intra_kernel::launch_unchecked::<f32>(
                 &client,
@@ -964,6 +1000,7 @@ pub mod cuda {
         let vt = v_dim.div_ceil(vtile);
         let cube_dim2 = CubeDim::new_3d(c as u32, iy, 1);
         let cube_count2 = CubeCount::Static(bh as u32, vt as u32, 1);
+        crate::alloc_trace::note_fused_launch("gdn2_chunk_inter_kernel");
         unsafe {
             gdn2_chunk_inter_kernel::launch_unchecked::<f32>(
                 &client,
@@ -987,21 +1024,26 @@ pub mod cuda {
             );
         }
 
-        // Export buffers padded to a unique size.
-        let v_new_out = Tensor::<1>::empty([nblk * c * v_dim + 262144], &device);
-        let states_out = Tensor::<1>::empty([nblk * k_dim * v_dim + 262144], &device);
-        crate::alloc_trace::note("fwd:v_new export", crate::alloc_trace::bytes_of(&v_new_out));
-        crate::alloc_trace::note(
-            "fwd:state trajectory export",
-            crate::alloc_trace::bytes_of(&states_out),
-        );
-        let v_new_c = cube_of::<B, 1>(&v_new_out).expect("backend mismatch");
-        let states_c = cube_of::<B, 1>(&states_out).expect("backend mismatch");
-
-        {
+        // The trajectory export, and the two over-allocated buffers it writes,
+        // exist only for the backward adjoint. The forward-only entry point
+        // skips all three; that is the whole difference between it and
+        // `fused_chunk_forward_scratch`.
+        let scratch = if want_scratch {
+            // Export buffers padded to a unique size.
+            let v_new_out = Tensor::<1>::empty([nblk * c * v_dim + 262144], &device);
+            let states_out = Tensor::<1>::empty([nblk * k_dim * v_dim + 262144], &device);
+            crate::alloc_trace::note("fwd:v_new export", crate::alloc_trace::bytes_of(&v_new_out));
+            crate::alloc_trace::note(
+                "fwd:state trajectory export",
+                crate::alloc_trace::bytes_of(&states_out),
+            );
+            let v_new_c = cube_of::<B, 1>(&v_new_out).expect("backend mismatch");
+            let states_c = cube_of::<B, 1>(&states_out).expect("backend mismatch");
+            let state_initial = state_initial.expect("want_scratch => state_initial is Some");
             let state_initial_c = cube_of::<B, 4>(&state_initial).expect("backend mismatch");
             let cube_dim3 = CubeDim::new_3d(c as u32, (vtile / 2) as u32, 1);
             let cube_count3 = CubeCount::Static(bh as u32, vt as u32, 1);
+            crate::alloc_trace::note_fused_launch("gdn2_chunk_trajectory_export_kernel");
             unsafe {
                 gdn2_chunk_trajectory_export_kernel::launch_unchecked::<f32>(
                     &client,
@@ -1021,12 +1063,7 @@ pub mod cuda {
                     vtile as u32,
                 );
             }
-        }
-
-        Some((
-            out.clone(),
-            state,
-            IntraOut {
+            Some(IntraOut {
                 aqk,
                 w: w_blk,
                 u: u_blk,
@@ -1043,13 +1080,31 @@ pub mod cuda {
                     .clone()
                     .slice(0..nblk * k_dim * v_dim)
                     .reshape([nblk, k_dim, v_dim]),
-                out,
+                out: out.clone(),
                 gexp,
-            },
-        ))
+            })
+        } else {
+            None
+        };
+
+        Some((out.clone(), state, scratch))
     }
 
     /// Fused chunked forward without the exported intermediates (module path).
+    ///
+    /// TWO launches, not three. The trajectory export kernel exists only to hand
+    /// `v_new` and the per-chunk state trajectory to the backward adjoint, and
+    /// this entry point throws them away — but it used to call the scratch entry
+    /// and discard the result, so it paid for the export kernel, for a second
+    /// full-size copy of the initial state (`state_initial`, which only the
+    /// export reads), and for two deliberately over-allocated export buffers
+    /// (`nblk*c*V + 262144` and `nblk*K*V + 262144`) on every call. The
+    /// reference is two kernels (`spec-flashkda.md` §1: `fwd_kernel1` 587 lines +
+    /// `fwd_kernel2` 840 lines), so three was one too many before the rewrite too.
+    ///
+    /// The launch count is now measured, not asserted in a comment:
+    /// `alloc_trace::fused_launches_per_call()` and
+    /// `tests/fused_launch_count.rs::module_forward_issues_two_launches`.
     #[allow(clippy::too_many_arguments)]
     pub fn fused_chunk_forward<B: Backend>(
         q: Tensor<4>,
@@ -1065,7 +1120,7 @@ pub mod cuda {
     where
         DispatchTensor: DispatchKindConversion<B>,
     {
-        fused_chunk_forward_scratch::<B>(q, k, v, g, b, w, state, scale, chunk_size)
+        fused_chunk_forward_impl::<B>(q, k, v, g, b, w, state, scale, chunk_size, false)
             .map(|(out, state, _io)| (out, state))
     }
 

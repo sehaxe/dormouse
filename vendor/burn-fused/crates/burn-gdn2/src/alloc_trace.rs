@@ -32,6 +32,70 @@ static CONTIG_COPIES: AtomicU64 = AtomicU64::new(0);
 /// A fallback, so it is counted rather than silent.
 static CONTIG_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 
+/// Fused-kernel launches, and how many engaged forward calls they belonged to.
+///
+/// Separate from `cuda_dispatch::fused_calls()` on purpose: that counts CALLS,
+/// this counts LAUNCHES, and the two differ whenever one call issues more than
+/// one kernel. The module path used to be 3 launches per call while the
+/// reference is 2, and nothing reported it — the only counter in the crate
+/// divided launches by nothing and so could not have said so.
+static FUSED_LAUNCHES: AtomicU64 = AtomicU64::new(0);
+static FUSED_LAUNCH_CALLS: AtomicU64 = AtomicU64::new(0);
+/// Launch labels in issue order, capped, so a test can NAME the kernels rather
+/// than only count them.
+static FUSED_LAUNCH_LOG: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+
+/// One fused kernel launch, with the kernel's name.
+#[inline]
+pub fn note_fused_launch(what: &'static str) {
+    FUSED_LAUNCHES.fetch_add(1, Ordering::Relaxed);
+    if let Ok(mut g) = FUSED_LAUNCH_LOG.lock() {
+        if g.len() < 64 {
+            g.push(what);
+        }
+    }
+}
+
+/// One engaged fused forward call. Paired with [`note_fused_launch`] so
+/// [`fused_launches_per_call`] can divide one by the other, which is the number
+/// that says whether a call grew or shrank.
+#[inline]
+pub fn note_fused_launch_call() {
+    FUSED_LAUNCH_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// `(launches, engaged_calls)` since [`reset_fused_launches`].
+pub fn fused_launches() -> (u64, u64) {
+    (
+        FUSED_LAUNCHES.load(Ordering::Relaxed),
+        FUSED_LAUNCH_CALLS.load(Ordering::Relaxed),
+    )
+}
+
+/// Launches per engaged call. A float, so a region with no engaged call reads
+/// `0.0` instead of dividing by zero.
+pub fn fused_launches_per_call() -> f64 {
+    let (l, c) = fused_launches();
+    if c == 0 {
+        0.0
+    } else {
+        l as f64 / c as f64
+    }
+}
+
+/// The launch labels recorded since the last reset, in issue order.
+pub fn fused_launch_log() -> Vec<&'static str> {
+    FUSED_LAUNCH_LOG.lock().map(|g| g.clone()).unwrap_or_default()
+}
+
+pub fn reset_fused_launches() {
+    FUSED_LAUNCHES.store(0, Ordering::Relaxed);
+    FUSED_LAUNCH_CALLS.store(0, Ordering::Relaxed);
+    if let Ok(mut g) = FUSED_LAUNCH_LOG.lock() {
+        g.clear();
+    }
+}
+
 /// One strided input materialized into a contiguous buffer.
 #[inline]
 pub fn note_contiguous_copy() {

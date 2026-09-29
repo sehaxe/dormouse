@@ -102,6 +102,10 @@ name = "fused_chunk_verify"
 required-features = ["cuda", "autodiff"]
 
 [[test]]
+name = "fused_launch_count"
+required-features = ["cuda", "autodiff"]
+
+[[test]]
 name = "fused_permuted_view"
 required-features = ["cuda", "autodiff"]
 

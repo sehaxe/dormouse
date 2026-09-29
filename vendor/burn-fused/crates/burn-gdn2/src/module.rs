@@ -541,12 +541,40 @@ impl GatedDeltaNet2 {
         q_4d = l2_normalize_4d(q_4d, 1e-6);
         k_4d = l2_normalize_4d(k_4d, 1e-6);
 
-        // Repeat key-side tensors for grouped value attention (GVA)
+        // Repeat key-side tensors for grouped value attention (GVA).
+        //
+        // Value head `vh` reads key head `vh / rep`, NOT `vh % h`. That is the
+        // reference's own indexing: `i_h = i_hv // (HV // H)` in
+        // `fused_recurrent_gdn2.py:125-126` (spec-gdn2-official.md §3.2), and
+        // `repeat_interleave` on the key-side axis in `lit_gpt/gdn2.py:331-335`.
+        // For h=2, rep=2 the head list is `[k0, k0, k1, k1]`.
+        //
+        // It used to read `unsqueeze_dim::<5>(3).repeat(&[1,1,1,rep,1])
+        // .reshape([batch, hv, tokens, hk])`, which is wrong and not a rounding
+        // error: that reshape merges axis 1 (h) with axis 3 (rep), and they are
+        // NOT adjacent, so the merge reinterprets flat memory and every repeated
+        // head reads a mixture of heads and token positions. Measured 2026-09-29
+        // by `tests/official_forward.rs::gva_head_repeat_preserves_values_on_this_backend`,
+        // which bisects it: on `[1, 2, 13, 16]` the permute is exact (1.2e-7),
+        // the 5-D repeat is exact (1.2e-7), and only the final reshape is wrong
+        // (4.35 — garbage-scale, not noise). On `[1, 4, 70, 16]`, 5.49.
+        //
+        // The fix is the same idiom with the new axis put NEXT TO the head axis,
+        // so the merge is over adjacent axes and is a legal index-preserving
+        // reshape: `repeat_interleave(rep, dim=head)` in torch. Measured 1.2e-7
+        // off the permuted (strided) view, which is the state the tensor is
+        // actually in at this point.
+        //
+        // `repeat_dim(1, rep)` and `cat(rep copies, 1)` are each ONE op and both
+        // value-preserving, and both are the WRONG head list: they tile it to
+        // `[k0, k1, k0, k1]`, i.e. `vh % h`. The probe asserts that, so choosing
+        // the three-op form over the one-op form is checkable rather than a
+        // matter of taste.
         if hv > h {
             let rep = hv / h;
             let r = |t: Tensor<4>| -> Tensor<4> {
-                t.unsqueeze_dim::<5>(3)
-                    .repeat(&[1, 1, 1, rep, 1])
+                t.unsqueeze_dim::<5>(2)
+                    .repeat_dim(2, rep)
                     .reshape([batch, hv, tokens, hk])
             };
             q_4d = r(q_4d);

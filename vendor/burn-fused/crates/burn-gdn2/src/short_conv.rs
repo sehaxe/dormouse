@@ -11,9 +11,10 @@ pub const SHORT_CONV_CACHE: usize = 3;
 /// Returns `(output, cache)` where `cache` carries the last
 /// `SHORT_CONV_CACHE` input values `[B, 3, C]`. Pass the cache from a previous
 /// call to continue a sequence (incremental decoding); pass `None` for a fresh
-/// prefill (the beginning of the sequence is padded by replicating the first
-/// token). The returned cache makes token-by-token decoding produce exactly
-/// the same outputs as one forward pass over the full sequence.
+/// prefill (the beginning of the sequence is padded with ZEROS, as the
+/// reference's `causal_conv1d` does). The returned cache makes token-by-token
+/// decoding produce exactly the same outputs as one forward pass over the full
+/// sequence.
 ///
 /// # Panics
 ///
@@ -40,10 +41,21 @@ pub fn short_conv_1d(
             )
         }
         None => {
-            let pad = x
-                .clone()
-                .slice([0..b, 0..1, 0..c])
-                .repeat(&[1, SHORT_CONV_CACHE, 1]);
+            // ZEROS on the left pad, not the first token replicated.
+            //
+            // The reference is `fla.modules.ShortConvolution` -> `causal_conv1d`,
+            // whose kernel loads the out-of-range (left-pad) taps with
+            // `other=0.0` (`fla/modules/conv/triton/kernels.py`), and whose
+            // decode path starts from `cache = x.new_zeros(...)`
+            // (`fla/modules/conv/short_conv.py::step`). See
+            // `research/papers/gdn-kda.md` §2.5 / §4.1.
+            //
+            // It used to replicate the first token, which both reference
+            // generators also did, so the 1000-case fixture was structurally
+            // blind to it. The cost of the bug: positions 0..2 of every
+            // sequence, and a T=1 decode-from-scratch completely
+            // (`y = w3*x0` in the reference, `(w0+w1+w2+w3)*x0` here).
+            let pad = Tensor::zeros([b, SHORT_CONV_CACHE, c], &x.device());
             let combined = Tensor::cat(vec![pad, x], 1);
             (
                 combined.clone(),
