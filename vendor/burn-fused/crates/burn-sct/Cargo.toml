@@ -62,3 +62,12 @@ required-features = ["cuda"]
 [[example]]
 name = "mm_probe"
 required-features = ["cuda"]
+
+# The one `[[test]]`-worthy file this crate had, and it was the one that was
+# missed: `tests/cuda_retract.rs` is `#![cfg(feature = "cuda")]` with no target,
+# so `cargo test -p burn-sct` built it, compiled it away and printed a green
+# `running 0 tests ... ok`. Same rule as 243a003, guarded by
+# `tools/test_targets.py`.
+[[test]]
+name = "cuda_retract"
+required-features = ["cuda"]

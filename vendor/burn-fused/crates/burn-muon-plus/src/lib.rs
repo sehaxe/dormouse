@@ -39,6 +39,11 @@
 //! ```
 use burn::config::Config;
 use burn::optim::{LearningRate, ModuleOptimizer, Optimizer, RecordState, StateSink, StateSource};
+/// Fused kernels. `ns_combine_cuda` has **no production caller**: its only one
+/// was the factored NS branch in [`MuonPlus::orthogonalize`], deleted as
+/// unsatisfiable (the same polynomial, behind a guard that could never be
+/// true). It is kept because its own test in this module still pins the
+/// kernel against the tensor-op expression it computes.
 #[cfg(feature = "cuda")]
 pub mod fused_kernels;
 
@@ -119,63 +124,46 @@ pub struct MuonPlus {
     weight_decay: f64,
 }
 
+/// Transpose `g` if it is taller than it is wide, then scale to unit Frobenius
+/// norm. Returns the matrix and whether it was transposed, so the caller can
+/// swap it back.
+///
+/// The `cols >= rows` guarantee is what the NS loop in
+/// [`MuonPlus::orthogonalize`] is shaped around. It is pinned by
+/// `orient_and_normalize_is_never_taller_than_wide`: a shape-handling edit here
+/// is free to change it, and nothing downstream checks.
+fn orient_and_normalize<const D: usize>(g: Tensor<D>) -> (Tensor<D>, bool) {
+    let dims = g.dims();
+    let transposed = dims[D - 2] > dims[D - 1];
+    let x = if transposed {
+        g.swap_dims(D - 2, D - 1)
+    } else {
+        g
+    };
+    let norm = x.clone().mul(x.clone()).sum().sqrt().clamp_min(1e-7);
+    (x.div(norm.unsqueeze()), transposed)
+}
+
 impl MuonPlus {
     /// Orthogonalize `g` via Newton-Schulz (zeroth power, tall-matrix aware).
     ///
     /// Public for testing: returns the nearest-orthogonal approximation of
     /// `g` under the Frobenius norm (2602.21545 §1, Eq. 1).
     pub fn orthogonalize<const D: usize>(&self, g: Tensor<D>) -> Tensor<D> {
-        let dims = g.dims();
-        let (rows, cols) = (dims[D - 2], dims[D - 1]);
-        let (mut x, transposed) = if rows > cols {
-            (g.swap_dims(D - 2, D - 1), true)
-        } else {
-            (g, false)
-        };
-
-        // Normalize to unit Frobenius norm.
-        let norm = x.clone().mul(x.clone()).sum().sqrt().clamp_min(1e-7);
-        x = x.div(norm.unsqueeze());
+        let (mut x, transposed) = orient_and_normalize(g);
 
         let (a, b, c) = self.ns_coeffs;
-        let [nr, nc] = x.dims()[D - 2..D].try_into().unwrap();
-        // Factored polynomial a·x + b·(xx·x) + c·(xx·(xx·x)) wins on strongly
-        // non-square matrices (measured 3.6x on [8192,512] via two [c,c]@[c,r]
-        // matmuls instead of [c,c]@[c,c] + [c,c]@[c,r]); the direct form is
-        // ~10% faster on squares (same FLOPs, one fewer matmul launch).
-        if nc * 4 < nr {
-            for _ in 0..self.ns_steps {
-                let xt = x.clone().swap_dims(D - 2, D - 1);
-                let xx = x.clone().matmul(xt); // X X^T
-                let t1 = xx.clone().matmul(x.clone());
-                let t2 = xx.matmul(t1.clone());
-                #[cfg(feature = "cuda")]
-                {
-                    if !crate::fused_kernels::ns_combine_cuda(&mut x, &t1, &t2, a, b, c) {
-                        x = x
-                            .clone()
-                            .mul_scalar(a)
-                            .add(t1.mul_scalar(b))
-                            .add(t2.mul_scalar(c));
-                    }
-                }
-                #[cfg(not(feature = "cuda"))]
-                {
-                    x = x
-                        .clone()
-                        .mul_scalar(a)
-                        .add(t1.mul_scalar(b))
-                        .add(t2.mul_scalar(c));
-                }
-            }
-        } else {
-            for _ in 0..self.ns_steps {
-                let xt = x.clone().swap_dims(D - 2, D - 1);
-                let xx = x.clone().matmul(xt); // X X^T
-                let xx2 = xx.clone().matmul(xx.clone()); // (X X^T)²
-                let poly = xx.mul_scalar(b).add(xx2.mul_scalar(c));
-                x = x.clone().mul_scalar(a).add(poly.matmul(x.clone()));
-            }
+        // `orient_and_normalize` leaves x never taller than wide, so `X Xᵀ` is
+        // always the smaller factor and this is the cheap form: 2·r²c + r³
+        // against the factored `a·x + b·M x + c·M²x` (M = X Xᵀ) at 3·r²c.
+        // Since r ≤ c, r³ ≤ r²c, so the factored grouping can never be the
+        // cheaper of the two here — it is the same polynomial regrouped.
+        for _ in 0..self.ns_steps {
+            let xt = x.clone().swap_dims(D - 2, D - 1);
+            let xx = x.clone().matmul(xt); // X X^T
+            let xx2 = xx.clone().matmul(xx.clone()); // (X X^T)²
+            let poly = xx.mul_scalar(b).add(xx2.mul_scalar(c));
+            x = x.clone().mul_scalar(a).add(poly.matmul(x.clone()));
         }
 
         if transposed {
@@ -397,6 +385,45 @@ impl MuonPlusConfig {
     /// Initialize the optimizer for a module.
     pub fn init(&self) -> ModuleOptimizer {
         ModuleOptimizer::from(self.build())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::tensor::Distribution;
+
+    /// The invariant [`MuonPlus::orthogonalize`]'s polynomial is shaped around:
+    /// the oriented matrix is never taller than it is wide, so `X Xᵀ` is always
+    /// the smaller factor. Every shape goes in, including the tall ones that
+    /// are the only thing that could break it.
+    #[test]
+    fn orient_and_normalize_is_never_taller_than_wide() {
+        let dev = Default::default();
+        for (r, c) in [
+            (1usize, 1usize),
+            (8, 8),
+            (32, 8),  // tall: must transpose
+            (8, 32),  // wide
+            (64, 1),  // extreme tall
+            (1, 64),  // extreme wide
+            (33, 32), // off by one, tall side
+            (32, 33), // off by one, wide side
+        ] {
+            let g = Tensor::<2>::random([r, c], Distribution::Default, &dev);
+            let (x, transposed) = orient_and_normalize(g);
+            let dims = x.dims();
+            assert!(
+                dims[0] <= dims[1],
+                "oriented {r}x{c} came out as {dims:?} — taller than wide"
+            );
+            assert_eq!(transposed, r > c, "transpose flag wrong for {r}x{c}");
+            let norm = x.clone().mul(x).sum().sqrt().into_scalar::<f32>();
+            assert!(
+                (norm - 1.0).abs() < 1e-4,
+                "oriented {r}x{c} is not unit-norm: {norm}"
+            );
+        }
     }
 }
 
