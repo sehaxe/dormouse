@@ -17,6 +17,28 @@ n_experts = 3
 jepa_weight = 0.05
 jepa_mask_frac = 0.15
 jepa_mask_span = 8
-dspark_weight = 0.1
+dspark_weight = 0.0
 dspark_k = 4
 dspark_stride = 16
+# Hashed n-gram memory (Engram). Capacity budget, not tuning knobs: the arm
+# was off because 8M rows/order was 99% of the model and monopolized the loss.
+# 25_000 rows/order x 3 orders x 32 dim = 2.4M memory params against a 7.5M
+# backbone = 24% of the model, which is DeepSeek's own shipped operating point
+# (V4.1-Flash 196B Engram vs a 552B backbone = 26% of total; its stated law is
+# 20-25% of the sparse budget). The measured slot-count curve (arXiv
+# 2601.16531, iso-parameter at a 125M backbone) peaks at 500K/order, but that
+# backbone is 16x ours: the same 500K here is 48M params = 86% of this model,
+# i.e. the monopoly shape again. The curve is flat 300K-500K and silent below,
+# so the ratio anchors the default and the 500K point stays a ladder rung.
+# Orders 2/3/4 replace the dead 3/5/8 (only n=3 had per-key support; n=5/n=8
+# were ~5775-way averages). engram_lam_max is the HARD floor on the memory's
+# share of its branch (`lam = min(w_mem, 0.5)`, the other half a dense
+# projection of the same hidden state) - kNN-LM eq. 3 / FwPKM eq. 12, a
+# constant, not a learned value.
+engram_rows = 25000
+engram_orders = [2, 3, 4]
+engram_dim = 32
+engram_lam_max = 0.5
+use_mor = false
+mor_k = 2
+mor_bce_weight = 0.05

@@ -17,6 +17,16 @@ n_experts = 4
 jepa_weight = 0.05
 jepa_mask_frac = 0.15
 jepa_mask_span = 8
-dspark_weight = 0.1
+dspark_weight = 0.0
 dspark_k = 4
 dspark_stride = 16
+
+# Hashed n-gram memory (Engram), the 2026-09-27 re-enable. 25_000 rows/order x
+# 3 orders x 32 dim = 2.4M memory params; see configs/small.toml for why the
+# budget is the DeepSeek allocation ratio (20-25% of the model) and not the
+# 500K/order that the iso-parameter curve peaks at on a 16x larger backbone.
+# At this preset's width the same 2.4M is 0.2% of the model.
+engram_rows = 25000
+engram_orders = [2, 3, 4]
+engram_dim = 32
+engram_lam_max = 0.5
