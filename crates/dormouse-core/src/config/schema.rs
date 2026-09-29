@@ -113,36 +113,77 @@ pub struct DormouseConfig {
     // --- hashed n-gram memory (Engram): the arm's capacity budget ---
     /// Rows per n-gram order. A CAPACITY BUDGET, not a tuning knob: the arm
     /// was switched off on 2026-09-27 because at 8M rows/order it was 99% of
-    /// the model (768M memory params against a 7.5M backbone) and
-    /// monopolized the loss (rec -> 0.005, held-out frozen at exactly
-    /// uniform 8.000 BPB). Two pieces of evidence set this number, and they
-    /// disagree at our scale - so the smaller one wins and the disagreement
-    /// is written down rather than averaged away:
+    /// the model (3 x 8M x 32 = 768M memory params against `small`'s measured
+    /// 6.05M compute params, 9.2M total) and monopolized the loss (rec ->
+    /// 0.005, held-out frozen at exactly uniform 8.000 BPB). Two pieces of
+    /// evidence set this number, and they disagree at our scale - so the
+    /// smaller one wins and the disagreement is written down rather than
+    /// averaged away:
     ///
-    /// 1. The measured saturation curve at iso-parameter (arXiv 2601.16531:
-    ///    125M backbone, 128M Engram, slots per order): Hash-300K 4.4825 /
-    ///    Hash-500K **4.4809** / Hash-800K 4.4961 - 500K is the optimum, 800K
-    ///    is ~2 sigma WORSE, and 8M was 16x past the knee. That curve is FLAT
-    ///    from 300K to 500K (delta 0.0016 against sigma 0.008-0.012) and says
-    ///    nothing below 300K.
+    /// 1. The measured slot-count curve at iso-parameter (arXiv 2601.16531v2,
+    ///    Table 3, slots per order per head): Hash-300K 4.4825 / Hash-500K
+    ///    **4.4809** / Hash-800K 4.4961 - 500K is the best point and 800K is
+    ///    ~1.9 sigma worse (0.0152 / the one std that is reported for a Hash
+    ///    row, 0.0082). 300K-500K is FLAT: 0.0016 against that same 0.0082.
+    ///    Only 500K has a std (0.0082; the 300K/800K rows report "-"), and
+    ///    the paper's largest point is 800K - there is no measured 8M, so
+    ///    "16x past the knee" was OUR extrapolation, not its data.
     /// 2. The allocation ratio, which is what "monopoly" means. The curve
-    ///    above was measured on a 125M backbone; `small` has 7.5M, so the
-    ///    same slot count is 16x more memory per backbone parameter and
-    ///    3 x 500_000 x 32 = 48M params = **86% of the model** - the exact
-    ///    shape that failed. DeepSeek's shipped operating point is 196B Engram
-    ///    against a 552B backbone (26% of total, 0.36x) and its stated law is
-    ///    20-25% of the sparse budget; 25_000 rows/order puts this preset at
-    ///    2.4M memory params against 7.5M = **24% of the model, 0.32x** -
-    ///    the published operating point, not a guess.
+    ///    above was measured on a **~185M** GPT-2-arch backbone carrying a
+    ///    128M Engram (Table 1; total 313 567 232) - so the paper's own
+    ///    memory-to-compute density is 0.69x, which the paper itself calls
+    ///    "likely much higher than in practical large-scale deployments".
+    ///    At `small`'s real size (6.05M compute) 3 x 500_000 x 32 = 48M nominal is
+    ///    7.9x the compute side, and the in-VRAM rounding takes it to
+    ///    3 x 524_288 x 32 = 50.3M = 8.3x - 12x denser than the paper's own
+    ///    config, and **89% of the model**: the exact shape that failed.
+    ///
+    ///    The allocation ratio this comment used to cite came from the WRONG
+    ///    source: "196B Engram against a 552B backbone" is DeepSeek-V4.1-
+    ///    Flash's shipped shape (196.6B Engram tables in layers 1 and 14,
+    ///    ~384M rows x 256 dims, against a 552B backbone = 26.2% of total,
+    ///    0.356x - model card / vLLM recipes, NOT arXiv 2601.07372, which has
+    ///    no "552" and no "196" anywhere in it: its largest model is
+    ///    Engram-40B at 39.5B total / 18.5B Engram). The ratio is real; the
+    ///    citation was not.
+    ///
+    /// What the shipped number actually costs, and the two denominators it was
+    /// previously quoted under (all of it measured on the instantiated models,
+    /// `cargo test -p dormouse-core --test preset_exec -- --nocapture`, this
+    /// box 2026-09-29 at 8ac7942 - re-derive by running it):
+    ///
+    /// | preset | memory rows | compute | total | share of total | x compute |
+    /// |--------|------------:|--------:|------:|---------------:|----------:|
+    /// | small  |     3 145 728 | 6 051 662 | 9 197 390 | **34.2%** | 0.52x |
+    /// | nano   |     3 145 728 | 4 047 178 | 7 192 906 | **43.7%** | 0.78x |
+    /// | base   |     3 145 728 | 9 920 082 | 13 065 810 | 24.1% | 0.32x |
+    ///
+    /// "share of total" is memory/(memory+compute) - the denominator
+    /// `loop_block::tests::capacity_budget_is_a_minority_of_the_model` uses;
+    /// "x compute" is memory/compute. The old comment quoted 24%, 0.32x and
+    /// 29% as if they were one number: 24% and 29% were share-of-total with
+    /// the NOMINAL 25 000 rows (2.4M) and with the rounded table (3.1M)
+    /// respectively, and 0.32x was the other denominator, all three computed
+    /// against the retracted 7.5M backbone.
+    ///
+    /// So the honest containment claim is not "inside 20-25%": at 34.2%
+    /// (`small`) and 43.7% (`nano`) the shipped share is ABOVE that band, and
+    /// what it IS inside is the range the Engram paper actually ships -
+    /// 5.7B Engram in a 26.7B Engram-27B (21% of total, 0.27x a 21.0B compute
+    /// side) up to 18.5B in a 39.5B Engram-40B (47%, 0.88x). The paper's
+    /// "20-25%" is a fraction of the SPARSE (inactive) budget at its optimum
+    /// rho ~ 80% (Sec. 3.1), not a fraction of the model, and this comment
+    /// used to read it as the latter. This is the capacity decision the owner
+    /// owns; the numbers above are the input to it.
     ///
     /// In-VRAM tables round UP to a power of two (the slot index is masked on
-    /// device, not divided): 25_000 -> 32_768 rows, 3.1M params, 29% of the
-    /// model. The host-RAM path (`--engram-ram --engram-slots`) takes its row
-    /// count from that flag; the two are the same knob until the trainer's
-    /// plumbing is unfrozen. The 500K point AT THIS SCALE is untested: it is
-    /// the first rung of the capacity ladder the A/B queue should run next,
-    /// and it is only worth running as a single seed, because at 500K the arm
-    /// is the monopoly again.
+    /// device, not divided): 25_000 -> 32_768 rows, 3 145 728 params, which is
+    /// the 3.1M in the table above. The host-RAM path (`--engram-ram
+    /// --engram-slots`) takes its row count from that flag; the two are the
+    /// same knob until the trainer's plumbing is unfrozen. The 500K point AT
+    /// THIS SCALE is untested: it is the first rung of the capacity ladder the
+    /// A/B queue should run next, and it is only worth running as a single
+    /// seed, because at 500K the arm is the monopoly again (89%).
     #[serde(default = "d_engram_rows")] pub engram_rows: usize,
     /// N-gram orders, one table each, smallest first. At 8M rows only n=3
     /// had per-key support (the corpus exhausts the 16.8M 3-gram space 2750x
@@ -156,8 +197,10 @@ pub struct DormouseConfig {
     /// trainer's hash tensor is `[b, t, 3]`).
     #[serde(default = "d_engram_orders")] pub engram_orders: Vec<usize>,
     /// Columns per memory row. One shared value projection over all orders
-    /// (arXiv 2601.07372 Sec. 2.4 eq. 6), so a row is a lookup, not a
-    /// per-order model.
+    /// (arXiv 2601.07372 Sec. 2.4: "a single sparse embedding table and a
+    /// Value projection matrix W_V are shared across all M branches"; its
+    /// eq. 6 is the branch GATE, not the sharing), so a row is a lookup, not
+    /// a per-order model.
     #[serde(default = "d_engram_dim")] pub engram_dim: usize,
     /// HARD ceiling on the memory branch's share of the block output. The
     /// branch is `lam * memory + (1 - lam) * dense(normed)` with
@@ -216,6 +259,29 @@ mod tests {
         assert!(c.use_kda);
         assert_eq!(c.dspark_k, 4);
         assert_eq!(c.act_quant, None);
+    }
+
+    /// The memory-row count the `engram_rows` comment quotes. The comment
+    /// carries three numbers and they disagreed; this pins the one that is
+    /// pure arithmetic on the shipped default, so a change to `engram_rows`,
+    /// `engram_dim` or the order count cannot leave the prose stale without
+    /// failing here. The shares that comment also quotes come off the
+    /// INSTANTIATED models (`cargo test -p dormouse-core --test preset_exec
+    /// -- --nocapture`), which is where they are measured, not here.
+    #[test]
+    fn shipped_memory_rows_are_what_the_comment_says() {
+        use crate::loop_block::engram_tables;
+        let c = DormouseConfig::default();
+        assert_eq!((c.engram_rows, c.engram_dim, c.engram_orders.len()), (25_000, 32, 3));
+        let (tables, _mask) = engram_tables(c.engram_rows, c.engram_orders.len());
+        // In-VRAM rounds UP to a power of two, so 25 000 buys 32 768 rows.
+        assert_eq!(tables, vec![32_768; 3]);
+        let mem: usize = tables.iter().sum::<usize>() * c.engram_dim;
+        assert_eq!(mem, 3_145_728, "the comment's 3 145 728 / 3.1M");
+        // And the nominal figure it must NOT be confused with: 2.4M is what
+        // `engram_rows` says, before the rounding. Two different numbers for
+        // the same table is the whole reason the old comment read as three.
+        assert_eq!(c.engram_orders.len() * c.engram_rows * c.engram_dim, 2_400_000);
     }
 
     /// The one act-quant parser: strings, ints, and the error naming the input.

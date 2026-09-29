@@ -778,7 +778,10 @@ aux heads earn their share of the step) → dense FFN (do TSCT, the retraction
 and the quant machinery earn ~1000 lines) → working set (4 epochs over 4.8 GB
 vs one pass over 19 GB) → rand depth → **depth 2 vs 4**, the cheapest big lever
 → KDA decay form (a technology REPLACE, not a knob) → hashed memory
-(25_000 rows/order, the 24% operating point) → the memory capacity ladder.
+(`engram_rows = 25_000`, **34.2% of `small`'s 9 197 390 params and 43.7% of
+`nano`'s 7 192 906 — measured on the instantiated models, not the 24% this
+line used to claim; see `schema.rs`'s `engram_rows`) → the memory capacity
+ladder.
 Every arm is 3 seeds, 2k steps, pure CE, at the program's operating depth.
 **The per-arm cost is unknown, not 2.7 GPU-h** (§3.3), and every arm must be run
 at one batch size so the eval window matches across seeds and arms (§2.6).
