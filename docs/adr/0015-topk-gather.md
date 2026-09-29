@@ -86,36 +86,78 @@ four hunks, in the kernel rather than at any call site:
    passes through (2). Belt and braces: (1) and (2) are each independently
    sufficient for the `-inf` case; (3) costs nothing and removes the class.
 
-The guarantee that was missing now holds: **every index `argtopk` returns is in
-`[0, n)`, whatever the scores contain.**
+The guarantee that was missing now holds, and it is measured: **every index
+`argtopk` returns is in `[0, n)`, whatever the scores contain.** See "What is
+measured" below.
 
 ## What now works
 
 `burn-mor/src/topk_gather.rs` exposes the primitive the three mechanisms were
-all waiting on, and the gate that was missing:
+all waiting on:
 
-- `topk_gather(scores, values, k)` — `[b,q,n]` scores -> `[b,q,k,m]` gathered
-  rows,
-- `topk_indices_last(scores, k)` — the index half alone,
-- `topk_indices_are_in_range_and_gather_the_right_rows` and
-  `production_shape_stays_in_range`, both running on **ndarray and cuda** from
-  one body. Adversarial rows: all-equal (everywhere ties), a single hot index,
-  `k == n`, `k = 1`, an all-`-inf` row, a `-inf` prefix with only 3 visible
-  candidates at `k = 8`, and b=10 q=512 n=12 k=64.
+- `topk_gather(scores, values, k)` — `[b,q,n]` scores against `[b,q,n,m]` value
+  rows -> `[b,q,k,m]` gathered,
+- `topk_indices_last(scores, k)` — the index half alone, for a caller that
+  gathers from more than one tensor with the same picks.
 
-The CUDA arm is the point of the test, not an extra: ndarray's `argtopk` is
-burn's own and was always correct, which is exactly why the failure was
-invisible until the gather faulted. Reach it with
-`cargo test -p dormouse-core --features cuda --lib` (burn-mor is a
-dev-dependency of dormouse-core, so the patched `cubek-reduce` is exercised
-through the same graph the trainer uses).
+The gate is `crates/backend-parity/tests/topk_gather_parity.rs`, in the crate
+that exists for exactly this bug class ("the CPU/CUDA parity gate for the
+backend precision bugs, in its own crate so it keeps building while
+`dormouse-core` is mid-refactor"). One body of assertions run against
+`Device::ndarray()` and `Device::cuda(0)`, so there is no second copy to drift.
+Adversarial rows: all-equal (ties everywhere), a single hot index, `k = n - 1`
+(the tightest legal `k`), `k = 1`, an all-masked row, a `-inf` prefix with 3
+visible candidates taken at `k = 8`, the same rows masked with `-1e30` instead
+of `-inf`, and the block-indexer shape b=10 q=512 n=128 k=64.
 
-One sharp edge remains and is documented at the function, not papered over:
-`k > n` is now *safe* (the surplus repeats an index rather than pointing past
-the axis) but not *meaningful*. A caller that needs `k` distinct picks must keep
-`k <= n` and pad its score rows. Ties are unordered by contract — the `k`-th
-largest is well defined, which of `k` elements share that value is not — so
-every consumer here takes the picked set, never its order.
+Two facts the gate established that are worth more than the fix:
+
+- **`k == n` is not expressible.** burn's `argtopk` asserts `shape[dim] > k`
+  (`burn-tensor/src/tensor/api/orderable.rs:614`). So a plan that asks for
+  `topk=64` over 12 heads/blocks cannot be written as one call; the candidate
+  axis has to be the axis that actually holds the candidates.
+- **The index dtype is backend-defined**: I64 from ndarray, I32 from cubecl.
+  Any consumer that reads indices back has to convert, not cast-assert.
+
+## What is measured (sm_120, committed patch, 2026-09-28)
+
+- **The out-of-bounds read is GONE.** Zero out-of-range indices on every
+  fixture, masked rows included, where the same tensor faulted the gather with
+  `cuEventCreate 700` before. The ndarray arm is fully green.
+- **One defect is still open, and it is NOT the crash.** On a partially masked
+  row the trailing top-k slots come back naming **one repeated column** instead
+  of the masked columns' own:
+
+  ```text
+  scores [0, -inf, 2, -inf, 4, -inf, 6, -inf, 8, -inf, 10, -inf],  n=12, k=8
+  picks  [10, 8, 6, 4, 2, 0, 0, 0]        # 0, 0 should be two of the -inf columns
+  ```
+
+  The gather reads a valid address and returns a valid row, so this is a
+  **silent wrong answer** — a defect by ADR-0011, not a pass. The CUDA arm of
+  the gate is therefore `#[ignore]`d with that reason, the same convention this
+  crate already uses for the bf16 gap and the fused-backward gap. **Do not put a
+  masking mechanism on this primitive until it is green.**
+
+  What was tried and did not work, so nobody repeats it: adding the
+  empty-slot-loses clause to `reaches` (which is in the committed patch), to
+  `topk_finalize_with_coords`, and to the insertion walk in both `topk_insert`
+  and `plane_topk_insert_with_coords`. The last three changed the output **not
+  at all** — bit-identical picks — which says the masked candidates are not
+  reaching the code those comparisons guard, and the next step is to find which
+  layout is taken for a `n=12, k=8` reduce (the `n=128, k=64` fixture passes,
+  so the two shapes take different paths: `to_output_parallel` +
+  `topk_finalize_*` versus `to_output_perpendicular` + the plane insertion) and
+  to instrument there rather than in the selection network. Those three hunks
+  are **not** in the tree: an unverified patch to a vendored upstream kernel is
+  worse than no patch, because the next reader believes the path is covered.
+
+  The clean statement of the invariant every one of those sites violates: **an
+  incumbent slot still holding the `min_value` seed is EMPTY, and an empty slot
+  must always lose to a candidate** — `-inf` is below the seed, so every
+  plain `<`/`>` comparison between them calls the empty slot the better one.
+  Whoever finishes this should apply that one rule at each site rather than
+  patching a symptom per layout.
 
 ## What it unblocks
 
@@ -123,17 +165,22 @@ All three were cut or rejected *because of this primitive*, not on their merits:
 
 - **MSA sparse attention** (cut, ADR-0014). Its re-entry condition 1 was "a
   working block-sparse implementation with its indices verified in-range under
-  compute-sanitizer on pre.4" — condition 1 is now met by construction. Note
-  the indexer is a *masking* consumer, i.e. the `-inf` case: the cut mechanism
-  is the one this fixes. The other two ADR-0014 conditions (two-forward
-  compute-sanitizer under autodiff, and the A/B) still stand, and re-adding the
-  arm is its own agent's job.
+  compute-sanitizer on pre.4" — that condition is met by construction now, and
+  the gate above is the verification it asked for. Note the indexer is a
+  *masking* consumer, i.e. the open defect above, so condition 1 is met for
+  safety and NOT yet for the picked set: the other two ADR-0014 conditions
+  stand, and re-adding the arm is its own agent's job.
 - **MoR / mixture-of-recursions** (2507.10524, rejected in ADR-0013 for "its
   per-depth gathers are sm_120-hostile" — this is what that meant).
   `burn-mor` is in the tree and now has a primitive whose output cannot fault.
-  ADR-0013's own re-entry bar is untouched: an A/B win over fixed depth at
-  matched steps on held-out BPB.
-- **PKM-style product-key memory** (its top-k -> gather is this same call).
+  Its router scores are *unmasked* (every token is a candidate), so it is the
+  one of the three that does not wait on the open defect above — which is
+  consistent with the "rank the slots per position" arm already landing in
+  `core/src/mor.rs`. ADR-0013's own re-entry bar is untouched: an A/B win over
+  fixed depth at matched steps on held-out BPB.
+- **PKM-style product-key memory** (its top-k -> gather is this same call). A
+  product-key lookup masks nothing by default, so it is unblocked; a
+  capacity-masked variant would hit the open defect.
 
 ## Cost
 

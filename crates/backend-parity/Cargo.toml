@@ -25,6 +25,9 @@ burn = { version = "0.22.0-pre.4", default-features = false, features = [
 
 [dev-dependencies]
 burn-ndarray = { version = "0.22.0-pre.4", features = ["blas-openblas"] }
+# the subject of the ADR-0015 gate: the top-k -> gather primitive, whose
+# `argtopk` is the kernel the gate is about.
+burn-mor = { path = "../../vendor/burn-fused/crates/burn-mor" }
 burn-cuda = { version = "0.22.0-pre.4", default-features = false, features = [
     "std",
     "autotune",
