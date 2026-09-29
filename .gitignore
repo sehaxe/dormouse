@@ -5,3 +5,4 @@ checkpoints/
 /runs/
 target/
 graphify-out/cache/
+__pycache__/
