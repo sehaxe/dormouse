@@ -632,6 +632,36 @@ pub fn rms_norm_gate_per_head(
     normed * w * silu(gate)
 }
 
+// THE OUTPUT GATE IS SiLU, AND TWO AUTHORITIES DISAGREE ABOUT IT. Fetched
+// 2026-09-29, both at `main`, neither pinned:
+//
+//   NVlabs/GatedDeltaNet-2  lit_gpt/gdn2.py:212
+//       self.o_norm = FusedRMSNormSwishGate(self.head_v_dim, eps=norm_eps)
+//   fla-org/flash-linear-attention  fla/layers/gdn2.py:197
+//       self.o_norm = FusedRMSNormGated(self.head_v_dim,
+//                                       activation="sigmoid", eps=norm_eps)
+//
+// We implement SiLU, i.e. the NVlabs choice - the original GDN-2 reference.
+// `research/reviews/gdn-fwd-review.md` found this, and the finding matters
+// for a reason beyond the choice itself: **our own f64 oracle transcribes the
+// FLA file, which selects the OTHER branch.** So the oracle cannot see this
+// divergence - it is a transcription agreeing with a shared misunderstanding,
+// which is the exact failure `docs/ORACLE.md` §3 classifies as tier (c). Every
+// other column in `ref_f64.bin` would agree even if this were wrong.
+//
+// NOT RESOLVED HERE, deliberately. This is a technology choice between two
+// credible implementations, not a transcription error, and ADR-0002/A-B-002 is
+// the mechanism for it: SiLU vs sigmoid on the output gate is a named arm. The
+// neighbouring arm already picks the other side - `burn-kda` applies
+// `RMSNorm(o) * sigmoid(W_g x) * w_norm` per arXiv:2607.24653 §2.1.1 Eq. 6
+// (`gdn-kda.md` row 30) - so the two crates in this repo currently disagree
+// with each other, deliberately and on the record.
+//
+// A note on the scale of the effect, NOT measured and not claimed: replacing
+// silu with sigmoid changes the gate's range from (-inf, 1) to (0, 1) - it
+// removes the negative half entirely - so it is a strictly positive gate after
+// the change. That is a real architectural difference, not a detail.
+
 pub struct ProjectedInputs<'a> {
     pub q: Tensor<4>,
     pub k: Tensor<4>,
