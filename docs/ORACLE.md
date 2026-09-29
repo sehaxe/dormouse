@@ -253,10 +253,10 @@ and that accepting these inputs is the known-bad path.
 
 `tools/oracle_gate.py`, five rules, exit 1 on a real violation:
 
-- **R1 COVERAGE** — every `tests/` and `examples/` file in the two crates has a
-  row in `ORACLE-TIERS.tsv`, and so does any `src/`/`tools/`/`README` file that
-  makes a fidelity claim. A new test cannot land without declaring what it is
-  compared against.
+- **R1 COVERAGE** — every `tests/` and `examples/` file in the audited crates
+  has a row in `ORACLE-TIERS.tsv`, and so does any `src/`/`tools/`/`README`
+  file that makes a fidelity claim. A new test cannot land without declaring
+  what it is compared against.
 - **R2 VOCABULARY** — a file whose tier is not `(a)` may not contain a positive
   "bit-for-bit"/"bit-exact" claim. Disclaimers pass; claims do not.
 - **R3 PROVENANCE** — `(a)` needs a `github.com` URL in the file; `(b)`/`(c)`
@@ -275,6 +275,20 @@ value is `half::bf16::from_f32`, a third-party implementation of IEEE-754).
 
 Run it: `python3 tools/oracle_gate.py`. It is not in CI yet; that is one line in
 `fused-library.yml` and it belongs to whoever owns the workflow.
+
+The gate's scope grew to three crates on 2026-09-29 (`burn-rmsnorm` joined,
+when `tests/rmsnorm_oracle.rs` became the tree's first tier-(a) row). A
+registry row nothing scans is a row that cannot fail, so widening the scope is
+what makes that row's R1/R2/R3 checks live rather than decorative: 61 files are
+scanned now, 54 before.
+
+**It is currently RED on five R1s, and none of them are new.** `burn-gdn2`'s
+`tests/ref_f64.rs`, `tests/common/ref_f64.rs`, `tests/official_forward.rs`,
+`tests/fused_launch_count.rs` and `examples/ref_f64_stages.rs` are tracked at
+`HEAD` and have no registry row. Verified by running this lane's own gate
+against `HEAD`'s `ORACLE-TIERS.tsv`: the same five, same messages. They belong
+to the f64-oracle lanes; declaring them is a one-line-per-file edit to
+`tools/gen_oracle_tiers.py` and is left to whoever owns that work.
 
 ---
 
