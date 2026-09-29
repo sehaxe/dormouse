@@ -205,10 +205,12 @@ milestone ladder reads "7.5 M beats a 24-line counter" as rung 1
 
 ### (e) What blocks a 1 B-parameter core model, in numbers
 
-1 B parameters at Chinchilla's 20 tokens/param is **20 B tokens**. At the measured
-7.5 M operating point (`1.58–1.84 s/step`, 5120 tokens/step, ~465 ms of that
-fixed launch cost that does not grow with N) the same card does 0.5 B at
-13.0 k tok/s and 1.5 B at 3.9 k tok/s in the only published benchmark of this
+1 B parameters at Chinchilla's 20 tokens/param is **20 B tokens**. At the
+measured 9.2 M operating point — **~245 ms warm**, 4096 tokens/step at batch 8
+(16.8 K tok/s), rising to 826 ms / 19.8 K tok/s at batch 32, with the GPU
+**13.3 % utilised and 79 % of samples ≤5 %** (launch-bound, not compute-bound)
+— the same card does 0.5 B at 13.0 k tok/s and 1.5 B at 3.9 k tok/s in the only
+published benchmark of this
 exact GPU (LLMQ, arXiv 2512.15306, 78–85 % MFU). Our own arithmetic, from
 measured throughput (`research/2026-09-27-scale-ladder.md`):
 
@@ -230,9 +232,23 @@ Four blockers, all measured or code-verified:
    rounding, double-buffered host offload (it measured zero-copy as *bad* on
    5060 Ti/4090), and all allocations at startup. The host-offload machinery
    exists — but only for the n-gram tables.
-3. **~465 ms of fixed per-step launch cost** dominates any model below ~80 M
-   parameters, and burn's optimizers are functional, so a captured CUDA graph
-   cannot be replayed without in-place parameter updates.
+3. **The workload is launch-bound, and that is the ceiling on this card.**
+   Measured, warm, at 9.2 M parameters: the GPU is **13.3 % utilised and 79 %
+   of samples at ≤5 %** — too many small kernels to fill the SMs, not a
+   shortage of arithmetic. The step is ~245 ms (bwd 96–100 · retr 52–61 ·
+   fwd 46–48 · opt 43–47), and that warm floor is the right order of the old
+   ~465 ms estimate; what dominates is the number of launches, not FLOPs. The
+   lever that attacks launches directly is **CUDA graph capture/replay**,
+   confirmed working on this GPU (`vendor/cubecl-fix/cubecl-cuda/tests/graph.rs`,
+   5/5). A seam that captures the optimizer + retraction tail and replays it is
+   built and compiles; **it is not yet measured, and the in-place parameter
+   update inside a replay is exactly the part that has to be proven.** A capture
+   window refuses reads, syncs and profiles, so a step that reads the loss
+   scalar for the NaN firewall runs ungraphed by construction.
+4. **The model is too small to use the card.** ~19.8 K tok/s at batch 32 is
+   close to what this card does on a 9.2 M-parameter model at all. The ceiling is
+   model size and launch count together, and neither is fixed by making the code
+   faster.
 4. **The evidence base does not exist yet.** Per (b), no mechanism has an A/B
    verdict and no checkpoint beats a counter. Scaling a recipe that has not been
    shown to work at 7.5 M is optimizing the wrong term.
