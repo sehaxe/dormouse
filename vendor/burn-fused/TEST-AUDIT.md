@@ -42,15 +42,19 @@ cannot drift from its generator unnoticed. The full precision argument, and
 what the harness does **not** claim, is in the module comment of
 `tests/bit_exact.rs`.
 
-### FINDING 0: the harness is RED, and the reference is the *less* likely culprit
+### FINDING 0: SOLVED 2026-09-29 — it was the reference generator, not burn
 
-`binary-tests` is **not** in burn-gdn2's default features, on purpose: making it
-default would put a red suite in every `cargo test -p burn-gdn2` whose cause is
-not yet named, and a red default that nobody can explain gets deleted rather
-than fixed. The gate is explicit instead, and it is loud - the CI job is named
-`fused-lib :: 1000 bit-exact cases vs the paper reference (fused/tensor drift)`.
+**This finding was wrong in its conclusion for three days.** It correctly
+ruled out the tolerance, the fixture format and per-token arithmetic, then
+localized the fault to "the short conv's cross-token taps, and the state
+carry-over" and named burn's `fused_recurrent_forward` per-token
+`slice_dim(2, t..t+1)` over permuted `[B, HV, T, D]` views as the likely
+culprit. The fault was in `tools/gen_reference.rs` and had nothing to do with
+either. `binary-tests` is now back in burn-gdn2's default features, and the CI
+job (`fused-lib :: 1000 bit-exact cases vs the paper reference`) still gates
+the merge.
 
-Measured 2026-09-27, ndarray, against the committed fixture:
+Measured 2026-09-27, ndarray, against the then-committed fixture:
 
 ```
 1000 cases: max_diff = 1.38e-2,  failures = 976/1000      (EPSILON = 5e-4)
@@ -59,33 +63,62 @@ Measured 2026-09-27, ndarray, against the committed fixture:
   FAIL [5] shape=1x37x64 max_diff=1.17e-2
 ```
 
-Three things this is not:
+Measured 2026-09-29, ndarray, same tolerance, after one fix to the generator:
 
-- **Not the tolerance.** 5e-4 is 28x below the observed max_diff, and the
-  measured transcription noise between two f32 implementations of this
-  recurrence is 2e-6 to 2e-5 (below). Loosening `EPSILON` to make this green
-  would be deleting the test's only assertion.
-- **Not the fixture's format or its determinism.** A parser that mimics
-  `bit_exact.rs`'s reader exactly consumes all 7 091 978 bytes with zero
-  trailing bytes, finds all 17 tensors under their expected names and shapes,
-  reads 1000 cases, and every value is finite.
-- **Not a per-token difference.** On a *passing* single-token case, burn's
-  `project()` output and the generator agree to ~2e-6 relative (q, k, v, g, b,
-  w) and the scan output at t=0 agrees to ~2e-5. So the projections, the SiLU,
-  the short conv at t=0, the L2 normalize, the decay, the erase, the per-head
-  RMS-norm, the SiLU gate and `o_proj` are all in agreement to f32 noise.
+```
+1000 cases: max_diff = 2.32e-7,  failures = 0/1000        (EPSILON = 5e-4)
+```
 
-What is left is exactly what T=1 cannot reach: the short conv's cross-token
-taps, and the state carry-over. In burn the carry-over is
-`kernel::fused_recurrent::fused_recurrent_forward`, which slices the *permuted*
-`[B, HV, T, D]` views from `project()` one token at a time
-(`slice_dim(2, t..t+1)`). A stride/offset error in that slice is invisible at
-t=0 (offset 0) and wrong for every t >= 1, which is the observed signature; a
-conv tap-indexing error in the generator has the same signature. The one
-measurement that separates them, still to be run: print q/k/v at t=1 for case 1
-(T=3) on both sides. It was not run here because the machine hit 100% disk
-mid-build and the test binary would not link - so this finding is stated as
-localized, not as diagnosed.
+**The defect.** `linear` fills a token-major `[T, KD]` buffer, and the code
+said so at the one place it mattered (`let c = n % KD; // channel index within
+[T, KD]`). But the scan read its inputs through
+
+```rust
+let at = |a: &[f32], h, ti, i, n| a[h * t * n + ti * n + i];   // head-major
+```
+
+against those same token-major buffers. The GVA expander `expand` made it
+worse in two ways: its `rep == 1` early return handed back the token-major
+input unchanged, and its non-trivial branch read `src[(from_h * t + ti) * n +
+i]`, a head-major read of a token-major buffer. `v` and `w_gate` never went
+through `expand` at all and were read head-major at their own width `VD`. So
+**no** scan input was ever in the layout the scan indexed.
+
+**Why 24/1000, exactly.** At `T == 1` the head-major and token-major
+indexings coincide on every element (`h*1*n + 0*n + i == h*n + i`), so a
+single-token case cannot see the bug. `gen_reference.rs` picks
+`seq_len = (1 << (i % 6)) + (i % 7)`, and that is 1 exactly when `i % 42 == 0`
+— 24 cases out of 1000. The 24 passes were the 24 single-token cases. The
+`gen_reference.py` original does a real `q.reshape(B,T,H,HK).transpose(1,2)`,
+which torch makes a free view; the Rust port reimplemented head-major layout as
+flat offsets but never built the head-major buffer.
+
+**The evidence that needed no GPU.** Regenerating with `to_head_major` applied
+to q/k/g/b at width HK and to v/w_gate at width V_HEAD changes exactly 976 of
+the 1000 fixture outputs and leaves the 24 single-token ones bit-identical —
+independently of burn. The peak difference between the old and new fixture
+outputs is 1.383e-2, which is the `1.38e-2` burn had been reporting: the
+generator was the sole source of the divergence, and the tolerance, the fixture
+format, burn's per-token slicing and the short conv were all innocent. The test
+itself is the corroboration, and it needed no CUDA: `max_diff = 2.32e-7`,
+0/1000 failures, `EPSILON` unchanged at 5e-4.
+
+**What the three original "this is not" bullets got right, and why they did
+not save it.** The tolerance really was not the problem, the fixture really was
+well-formed and deterministic, and the projections really did agree to f32
+noise at `t=0`. All three are measurements *at T=1*, where the bug is
+invisible by construction. The audit reasoned "T=1 cannot reach cross-token
+taps and state carry-over" and looked for a cross-token bug; it never asked
+whether the generator's own cross-token layout was consistent, which was the
+one thing that could be checked by reading 40 lines of it.
+
+**Residual, and what it is.** `2.32e-7` is f32 reduction-order noise plus one
+genuine transcription difference, named because it is the one left: burn's
+`l2_normalize_4d` divides by `sqrt(ss + 1e-6)` (`module.rs` calls it with
+`1e-6`), the generator by `sqrt(max(ss, 1e-12))` — an epsilon inside the root
+against a clamp before it. At ~1e-6 relative on a head's 16 channels that is
+the same order as the observed residual, so this measurement does not separate
+the two. Fixing it is not required for green and was not done.
 
 ## FINDINGS — false confidence, for the crate owners
 
@@ -177,12 +210,15 @@ run them set `BURN_DEVICE: cuda`; the crates should fail loudly instead.
 - **`rust-toolchain.toml` says `channel = "stable"`, which floats.** For a
   library whose headline claim is bit-level reproducibility, the toolchain is
   part of the claim. Pin it (1 line) and say which version.
-- **The tolerance is measured now, and it is not the problem** (FINDING 0): the
-  noise floor between two f32 implementations of this recurrence is 2e-6 to
-  2e-5, so 5e-4 is the right order of magnitude. What the next version of this
-  gate wants is a *relative* or RMS-normalised tolerance (the fixture's outputs
-  reach ~9e-3, so 5e-4 is ~5% of the signal) — but only after FINDING 0 is
-  closed, or it would be tightening a threshold around an unexplained gap.
+- **The tolerance is measured now, and it is not the problem** (FINDING 0, now
+  closed): the gate runs at `max_diff = 2.32e-7` against `EPSILON = 5e-4`, so
+  the threshold has ~2000x of headroom over the observed noise and the measured
+  noise is f32 reduction order plus the one `l2_normalize_4d` eps difference
+  named in FINDING 0. What this gate now wants is a *relative* or
+  RMS-normalised tolerance (the fixture's outputs reach ~9e-3, so 5e-4 is ~5% of
+  the signal) — the honest reason is no longer "an unexplained gap to tighten
+  around", it is that an absolute threshold on a fixture with a known output
+  scale is the weaker instrument.
 - **`burn-gdn2`'s `python3 tests/gen_reference.py` path in `README.md:262-265`**
   still tells a reader to run the torch script. It is the readable reference and
   it stays, but the runnable one is now `tools/gen_reference.rs`.

@@ -10,33 +10,38 @@
 // independent implementations of the same math. A real bit-for-bit claim needs
 // NVlabs' kernel in the tree.
 //
-// STATUS: RED, MEASURED 2026-09-27 AGAINST THIS FIXTURE, AND `binary-tests` IS
-// THEREFORE NOT IN THE CRATE'S `default` FEATURES.
+// STATUS: MEASURED 2026-09-29, AND IT WAS THE GENERATOR, NOT BURN.
 //     cargo test -p burn-gdn2 --features binary-tests --test bit_exact
-//     1000 cases: max_diff = 1.38e-2, failures = 976/1000   (EPSILON = 5e-4)
-// The diff grows with sequence length - 2.9e-3 at T=3, 8.8e-3 at T=20, 1.2e-2
-// at T=37 - and exactly 24 cases pass, which are exactly the 24 single-token
-// cases (seq_len == 1, i = 0, 42, 84, ...). So the divergence lives in
-// something a single token cannot exercise. Instrumenting both sides on a
-// passing single-token case: the projections (q/k/v/g/b/w out of
-// GatedDeltaNet2::project) agree to ~2e-6 relative, and the scan output at t=0
-// to ~2e-5 - f32 reduction noise, not a semantic difference. What T=1 cannot
-// reach is (a) the short conv's cross-token taps and (b) the state carry-over,
-// and in burn (b) happens only in
-// kernel::fused_recurrent::fused_recurrent_forward, whose per-token
-// slice_dim(2, t..t+1) runs over the *permuted* [B, HV, T, D] views that
-// project() hands it. The one measurement that settles which of (a)/(b) it is:
-// print q/k/v at t=1 for case 1 (T=3) on both sides. Matching q/k/v puts the
-// divergence in that slicing (a burn-ndarray stride question - a library bug,
-// not a reference bug); differing q/k/v puts it in this generator's short_conv
-// tap indexing. Not run here: the machine reached 100% disk mid-build and the
-// test binary would not link.
+//     1000 cases: max_diff = 2.32e-7, failures = 0/1000   (EPSILON = 5e-4)
+// For three days this test was red at max_diff 1.38e-2 / 976 failures and was
+// misdiagnosed, twice, as a burn bug: once as a stride question in
+// fused_recurrent_forward's per-token slice_dim, and once as a short-conv tap
+// index. Both were wrong. `tools/gen_reference.rs` read its own scan inputs
+// with head-major offsets (`a[h*t*n + ti*n + i]`, the layout of
+// `[H, T, n]`) out of buffers `linear` had filled token-major as `[T, H*n]` —
+// the `x.reshape(B,T,H,HK).transpose(1,2)` that `gen_reference.py` gets free
+// from torch was never materialised, and `expand` returned its input unchanged
+// when `rep == 1` instead of doing the transpose. At T=1 the two indexings
+// coincide on every element, and `seq_len == 1` for exactly 24 of the 1000
+// cases (`(1 << (i % 6)) + (i % 7) == 1` iff `i % 42 == 0`), which is exactly
+// the 24 that passed. That is the whole signature, and it never needed the GPU.
 //
-// The tolerance is NOT the problem: 5e-4 is 28x below the observed 1.38e-2 and
-// two orders above the measured transcription noise. Do not "fix" this by
-// loosening EPSILON - that hides a real disagreement, and the 24 passing cases
-// prove the harness can discriminate. Full write-up, with the three
-// false-confidence findings from the same audit: vendor/burn-fused/TEST-AUDIT.md.
+// The fix is `to_head_major`, applied to q/k/g/b at width HK and to v/w_gate at
+// width V_HEAD; the generator is otherwise unchanged and the tolerance is
+// UNCHANGED at 5e-4. Nothing about burn's per-token slicing or the short conv
+// was touched. The 2.32e-7 residual is f32 reduction-order noise plus one real
+// transcription difference, named because it is the one left: burn's
+// `l2_normalize_4d` divides by `sqrt(ss + 1e-6)` and the generator by
+// `sqrt(max(ss, 1e-12))` — an eps inside the root against a clamp before it.
+// At ~1e-6 relative on a head's 16 channels that is the same order as the
+// residual, so the two are not separated by this measurement.
+//
+// `binary-tests` IS in the crate's `default` features as of this fix. It was
+// removed because the suite was red and the cause was unknown; a red default
+// that nobody could explain is how this stayed misdiagnosed for three days. The
+// gate is loud either way and now runs in every `cargo test -p burn-gdn2`.
+// Full write-up, with the three false-confidence findings from the same audit:
+// vendor/burn-fused/TEST-AUDIT.md.
 //
 // HOW TO REGENERATE, AND HOW TO KNOW IT IS THE SAME DATA.
 //     cd crates/burn-gdn2

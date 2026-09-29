@@ -117,14 +117,13 @@ jobs:
         run: git diff --exit-code -- tests/ref_data.bin
 
   # 4. the flagship claim: burn against that fixture
-  # KNOWN RED as of 2026-09-27, and deliberately left red: max_diff 1.38e-2
-  # against EPSILON 5e-4, 976/1000 cases, and the 24 passes are exactly the 24
-  # single-token cases. Localized (not diagnosed) to a path T=1 cannot reach -
-  # the short conv's cross-token taps or the state carry-over in
-  # fused_recurrent_forward. Numbers, the instrumented comparison that rules the
-  # tolerance and the fixture out, and the one measurement that would settle it:
-  # vendor/burn-fused/TEST-AUDIT.md, FINDING 0. This job is the gate; it stays
-  # until whoever owns burn-gdn2 closes it.
+  # GREEN as of 2026-09-29: max_diff 2.32e-7 against EPSILON 5e-4, 0/1000
+  # failures, tolerance unchanged. It was RED for three days (1.38e-2,
+  # 976/1000) and the fault was in tools/gen_reference.rs, not in burn: the
+  # generator read token-major buffers with head-major offsets, which is
+  # invisible at T=1 and wrong for every t >= 1, and exactly 24 of the 1000
+  # cases are single-token. Full write-up: vendor/burn-fused/TEST-AUDIT.md,
+  # FINDING 0. This job is the gate and it stays.
   bit-exact:
     name: "fused-lib :: 1000 bit-exact cases vs the paper reference (fused/tensor drift)"
     runs-on: ubuntu-latest
