@@ -10,11 +10,16 @@
 // WHY IT EXISTS. Every other numeric test in this crate compares our code to
 // our code. `docs/ORACLE.md` §2 shows why that is not enough: a bug above the
 // fused/ops branch point — i.e. inside `project` or `output` — moves both arms
-// together and the difference is exactly zero. `tests/ref_data.bin` was the one
-// layer that could see `project`, and it is RED (1.38e-2, 976/1000) behind a
-// non-default feature. This file is the replacement, and it is the first layer
-// here whose expected value does not come from a second implementation of the
-// same code.
+// together and the difference is exactly zero. `tests/ref_data.bin` used to be
+// the one layer that could see `project`; it is DELETED (2026-09-29) because it
+// was an f32 transcription of our OWN algorithm, so all it could ever prove was
+// self-consistency, and it replicate-padded the short conv exactly as the kernel
+// wrongly did. This file is its replacement, and it is the first layer here
+// whose expected value does not come from a second implementation of the same
+// code. The two `binary-tests` targets it absorbed are `tests/oracle_breadth.rs`
+// (1000-case breadth sweep, `tests/ref_f64_broad.bin`) and
+// `tests/oracle_chunk.rs` (the same sweep at five chunk sizes); both are RED, on
+// the pre-existing defect the STATUS block below measures.
 //
 // TIER, HONESTLY. This is **(b)**, not (a). It is a transcription, so a shared
 // *misreading* of the paper would survive it. It is not the authors' own bytes;
@@ -32,83 +37,81 @@
 //
 // ============================ STATUS: RED ================================
 //
-// `gdn2_f32_agrees_with_the_f64_reference` FAILS. It is not a tolerance problem
-// and not f32 noise: the deviation is 1.2e+00 relative at T=1, three orders
-// above the 1e-3 bar. Here is exactly what is established, and what is not.
+// `gdn2_f32_agrees_with_the_f64_reference` FAILS. Not a tolerance problem and
+// not f32 noise: the deviation is 9.227e-02 relative at T=2, two orders above
+// the 1e-3 bar. Reproduce with
+//     cargo test --release -p burn-gdn2 --test ref_f64
 //
-// ESTABLISHED, MEASURED. `src/short_conv.rs` pads the short convolution's left
-// edge by REPLICATING the first token. The authors' kernel zero-fills. Three
-// independent sources agree on zeros, all quoted in the module docstring of
-// `tools/gen_reference_f64.py`. `examples/ref_f64_stages.rs` localises it: every
-// 2-D stage of `project` that does not pass through the conv agrees to
-// 1e-08..3e-07, and the conv disagrees by 0.49..3.01 relative. Our `q_conv`
-// matches a f64 REPLICATE-pad to 1.06e-07 (measured directly against
-// `short_conv`, both lengths) - the padding is self-consistent and wrong, which
-// is a stronger statement than "it looks wrong".
+// THE BLOCK BELOW IS THE 2026-09-28 TEXT AND IT IS NOW MEASURED WRONG IN
+// THREE PLACES. Kept as a record of the search, corrected where measurement
+// moved it, and corrected measurements are marked CORRECTED. The three:
 //
-//     stage              case 0 (T=1)                case 17 (T=70)
-//                         max|d|      rel            max|d|      rel
-//     raw_q_proj         6.2e-08     1.4e-07        1.5e-07     2.2e-07
-//     raw_k_proj         8.4e-08     1.7e-07        2.2e-07     3.3e-07
-//     raw_v_proj         7.1e-08     2.2e-07        1.6e-07     2.7e-07
-//     f0 / f1            6.4e-08     1.3e-07        2.0e-07     2.7e-07
-//                        9.0e-09     1.4e-07        2.3e-08     2.1e-07
-//     gp0 / gp1          1.0e-07     2.7e-07        1.6e-07     2.1e-07
-//                        1.5e-07     9.6e-08        1.7e-07     1.0e-07
-//     g (the log-decay)  9.8e-08     1.2e-07        2.4e-07     2.9e-07
-//     a_exp              1.1e-06     1.3e-07        1.1e-06     1.3e-07
-//     dt_bias            2.8e-07     4.0e-08        2.8e-07     4.0e-08
-//     A_log              3.2e-08     1.5e-08        3.2e-08     1.5e-08
-//     q_conv             1.8e-01     3.0e+00  <--   1.6e-01     5.3e-01
-//     k_conv             1.4e-01     1.4e+00        1.3e-01     4.9e-01
-//     v_conv             1.5e-01     2.0e+00        1.9e-01     6.3e-01
+// 1. THE CONV PAD IS FIXED AND THE FIX IS RIGHT. `0a6998a` changed
+//    `src/short_conv.rs` from replicate to zero padding. Re-measured against
+//    this layer's f64 ZERO-pad oracle, `cargo run --release -p burn-gdn2
+//    --example ref_f64_stages` + `python3 tools/gen_reference_f64.py
+//    --diff-stages /tmp/rust_stages.txt`:
 //
-// Reproduce with:
-//     cargo run  -p burn-gdn2 --release --example ref_f64_stages
-//     python3 tools/gen_reference_f64.py --diff-stages /tmp/rust_stages.txt
+//        stage       T=1 (was)   T=1 (now)    T=70 (was)  T=70 (now)
+//        q_conv      1.8e-01     1.683e-07    1.6e-01     1.418e-07
+//        k_conv      1.4e-01     2.884e-07    1.3e-01     1.742e-07
+//        v_conv      1.5e-01     2.371e-07    1.9e-01     1.867e-07
 //
-// `tests/gen_reference.py` and `tools/gen_reference.rs` REPLICATE too, so the
-// existing red `ref_data.bin` test could never have seen this: two arms share
-// the bug and it cancels. That is `docs/ORACLE.md` §2 in a concrete instance,
-// and it is the first defect in this crate that only an f64 external layer can
-// reach.
+//    The old table's numbers are relative to each stage's own scale; the
+//    absolute columns it quotes are unchanged in kind. Every conv row is now
+//    f32 noise at both lengths. "OUR `q_conv` MATCHES A f64 REPLICATE-PAD TO
+//    1.06e-07" is a statement about a bug that no longer exists.
 //
-// NOT FULLY EXPLAINED, AND NOT ASSERTED. If the padding were the ONLY
-// difference, our output would EQUAL a f64 replicate-padded forward. Measured at
-// T=1, where there is no state carry and `fused_recurrent_forward` reduces to
-// `S = k (w v)^T; o = (w v)(k.q) scale`, the gap between our output and that
-// variant is 1.15e+00, not ~1e-06. So a SECOND difference exists. It is not in
-// `project`'s 2-D stages (all <= 3e-07 above, at both lengths) and
-// `fused_recurrent_forward` was read line by line against Eq. 9 and matches it
-// (`state * g_t.swap_dims(2,3)` is `Diag(a_t) S`; the erase is `(S (b*k)^T)`;
-// the write is the rank-1 `k (z - r)^T`; the readout is `(S q^T)`). It has NOT
-// been localised, and
-// this file does not claim to have localised it: the T=1 probe prints the number
-// and asserts nothing, because asserting the identification would assert
-// something measured false, and asserting its negation would assert an open
-// question. Treat "one more defect exists downstream of `project`" as OPEN.
+// 2. `project` IS CLEAN, INCLUDING EVERY PER-HEAD TENSOR. The old text says the
+//    second difference "is not in `project`'s 2-D stages", which was all the
+//    diagnostic could see: `diff_stages` compared only 2-D and 1-D rows
+//    because a permuted 4-D view reads back unstably on ndarray. It does, but
+//    pushing the view through an elementwise op first forces a dense readback
+//    (burn 0.22.0-pre.4 has no `contiguous()`), and with those rows added every
+//    per-head tensor agrees too: q4d 1.7e-07/3.4e-07, k4d 5.2e-07/2.5e-07,
+//    g4d 2.1e-07/3.9e-07, b4d 1.7e-07/2.1e-07, v4d 4.6e-07/1.9e-07, w4d
+//    1.9e-07/2.1e-07, gate4d 1.3e-07/1.6e-07 (T=1 / T=70). So the fault is
+//    DOWNSTREAM of `project`.
 //
-// THE 1.38e-2 IS NOT THE PADDING. `bit_exact.rs` reports max_diff 1.38e-2,
-// identical at chunk 4/8/16/32/64, with the 24 single-token cases passing. If
-// the padding were that defect, the T=1 cases would fail too: at T=1 the pad is
-// `x0 * sum(w)` instead of `x0 * w[3]`. They pass. So the padding is a second,
-// independent defect that the old test was structurally blind to, and the
-// 1.38e-2 has a different, still-unknown cause. This layer does not explain it.
+// 3. THE FAULT IS THE STATE CARRY, NOT AN UNEXPLAINED DIFFERENCE. Per token,
+//    over this 18-case matrix: token 0 is right at every length (3.07e-07 at
+//    T=1, 3.49e-08 at T=64) and every token from 1 on is O(1) wrong. `S`
+//    starts at zero, so T=1 has no carry - which is also why exactly 24 of the
+//    1000 cases in the breadth sweep (`tests/oracle_breadth.rs`, same fixture
+//    family) pass and they are exactly the T=1 ones.
+//
+// NOT YET LOCALISED TO A LINE, and one number I do not trust. Dumping the
+// carry's four sub-steps by hand at T=2 (decay, erase, `v_new`, and the
+// resulting `S`) has all four agreeing to <= 4.6e-07 at every step, final `S`
+// included, which leaves the readout as the only suspect BY ELIMINATION and not
+// by measurement. A separate probe calling the crate's own
+// `fused_recurrent_forward` reported a final state 1.34e-01 off on the same
+// input, which contradicts that and which I could not reproduce. Neither number
+// is claimed. The next measurement is the readout
+// `(state * q_t.swap_dims(2, 3)).sum_dim(2)` with a RAW (not squared) readback
+// of `q_t`: the probe written to settle it squared and then took `sqrt`, which
+// recovers `|x|` and not `x`, so every signed row in it read O(1). That is a
+// bug in the probe and it is the reason this header claims no line.
+//
+// WHAT THE OLD TEXT GOT RIGHT AND STILL STANDS. The pad was a real defect and
+// both reference generators replicate-padded it too, which is why the
+// self-transcription agreed with the bug - `docs/ORACLE.md` §2 in a concrete
+// instance. `tests/ref_data.bin`, `tools/gen_reference.rs` and
+// `tests/gen_reference.py` are DELETED (2026-09-29) rather than regenerated;
+// `tests/bit_exact.rs` and `tests/test_chunk.rs` are retargeted at the f64
+// layer as `tests/oracle_breadth.rs` and `tests/oracle_chunk.rs`.
 //
 // WHY T=1 IS A WEAK CANARY, MEASURED. `S` starts at zero, so `S̄ = Diag(a) S = 0`
 // and `r = S̄^T e = 0`: neither the decay nor the erase gate appears at T=1.
 // Injected as faults, `decay-sign` and `no-erase-gate` change the T=1 output by
-// EXACTLY 0.0, while the other five change it by 0.8 to 2.3. The old fixture's 24
-// passing single-token cases were therefore blind to two of the seven semantic
-// error classes, and to the entire state carry.
+// EXACTLY 0.0, while the other five change it by 0.8 to 2.3. The old fixture's
+// 24 passing single-token cases were therefore blind to two of the seven
+// semantic error classes, and to the entire state carry - and it turns out the
+// state carry is where this crate's live defect is.
 //
-// OWNER'S CALL, NOT FIXED HERE. The padding fix is a few lines in
-// `src/short_conv.rs` (pad with zeros; initialise the decode cache with zeros -
-// the authors' `ShortConvolution.step` does `cache = x.new_zeros(...)` and their
-// own test builds `zero_padding = torch.zeros(B, D, 1)`). It is NOT applied in
-// this commit: `short_conv.rs` also feeds `tests/bit_exact.rs`, which another
-// lane owns and which is itself red, and changing the pad moves that lane's
-// numbers. Fix it there, where both tests can be re-measured together.
+// OWNER'S NOTE, the 2026-09-28 text that is now DONE. The padding fix is no
+// longer deferred to another lane; `0a6998a` landed it, and the current
+// numbers above are the check that it was right.
 //
 // CONDITIONING, because it changed the numbers. `lit_gpt/gdn2.py` zeroes every
 // bias, which puts the output gate at `silu(0) = 0` exactly, so a freshly
@@ -171,8 +174,8 @@ fn gdn2_f32_agrees_with_the_f64_reference() {
         t.d, t.h, t.hk, t.hv, t.expand_v, t.hv * v_head, t.cases.len(), t.tensors.len()
     );
     for (label, module) in [
-        ("FusedRecurrent", build(&t, Gdn2Mode::FusedRecurrent, &device)),
-        ("Chunk", build(&t, Gdn2Mode::Chunk, &device)),
+        ("FusedRecurrent", build(&t, Gdn2Mode::FusedRecurrent, 64, &device)),
+        ("Chunk", build(&t, Gdn2Mode::Chunk, 64, &device)),
     ] {
         let mut worst = 0.0f64;
         let mut worst_t = 0usize;
@@ -242,7 +245,7 @@ fn the_bar_bites_a_wrong_formula() {
     );
 
     let device = Device::ndarray();
-    let module = build(&t, Gdn2Mode::FusedRecurrent, &device);
+    let module = build(&t, Gdn2Mode::FusedRecurrent, 64, &device);
     let input = Tensor::<3>::from_data(TensorData::new(x.clone(), [1, seq, t.d]), &device);
     let mut state: Option<burn_gdn2::Gdn2State> = None;
     let got = to_f32_vec(&module.forward::<NdArray>(input, &mut state, true));
@@ -291,7 +294,7 @@ fn the_bar_bites_a_wrong_formula() {
     // T>1 is explained by it.
     let (t0, x0, _) = &t.cases[0];
     assert_eq!(*t0, 1, "case 0 is meant to be the single-token canary");
-    let m0 = build(&t, Gdn2Mode::FusedRecurrent, &device);
+    let m0 = build(&t, Gdn2Mode::FusedRecurrent, 64, &device);
     let inp0 = Tensor::<3>::from_data(TensorData::new(x0.clone(), [1, 1, t.d]), &device);
     let mut st0: Option<burn_gdn2::Gdn2State> = None;
     let got0 = to_f32_vec(&m0.forward::<NdArray>(inp0, &mut st0, true));

@@ -3,11 +3,13 @@
 //!
 //! # Why this file exists
 //!
-//! The crate's other reference (`tests/ref_data.bin` + `tools/gen_reference.rs`)
-//! is a transcription of the same code under test, so it can only prove
-//! self-consistency — it cannot find a divergence from the source it was meant
-//! to copy, and it is written in a layout the layer does not use
-//! (`research/papers/gdn-kda.md` §4.1, §7.1). This file is the tier-1 answer
+//! The crate's other reference used to be `tests/ref_data.bin` +
+//! `tools/gen_reference.rs` — a transcription of the same code under test, so
+//! it could only prove self-consistency, and it replicate-padded the short
+//! conv exactly as the kernel wrongly did. Both are DELETED (2026-09-29); the
+//! f64 fixture layer (`tests/ref_f64.rs`, `tests/oracle_breadth.rs`,
+//! `tests/oracle_chunk.rs`) took over and is the fixture-backed tier. This file
+//! is still the tier-1 answer
 //! from that report: **fp64 algebraic properties, no fixture, runnable here.**
 //!
 //! It is written from the equations, not from the implementation:

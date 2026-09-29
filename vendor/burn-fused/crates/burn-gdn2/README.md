@@ -280,10 +280,14 @@ How this is achieved:
   Eq 9/Eq 10/Eq 11/Eq 12 and the §3.5 block design, written from the papers
   rather than from this crate, with its own short conv, its own head-major
   layout and no fixture at all. It runs on **NdArray** and therefore covers the
-  tensor paths, not the CUDA kernels. `tests/bit_exact.rs` (the older
-  1000-case `ref_data.bin` comparison) states the same limitation, and more:
-  it is a transcription of this crate's own algorithm, so it proves
-  self-consistency and not fidelity to the reference.
+  tensor paths, not the CUDA kernels. `tests/ref_f64.rs`,
+  `tests/oracle_breadth.rs` and `tests/oracle_chunk.rs` (the f64 fixture layer)
+  state the same limitation, and one tier better than `ref_data.bin` did: that
+  fixture was an f32 transcription of this crate's OWN algorithm, so it proved
+  self-consistency and not fidelity to the reference, and it replicate-padded
+  the short conv exactly as the kernel wrongly did. It is deleted; the f64
+  fixtures replace it. Both f64 targets are currently RED on a pre-existing
+  state-carry defect - see the STATUS block in `tests/ref_f64.rs`.
 - **Backward**: the whole chunked WY recurrence is **one autodiff node**
   (`GatedDeltaNet2::forward_train_fused`, `src/autodiff.rs`) with an exact
   matrix-level adjoint. The WY solve factorizes through `M⁻¹` (computed once
@@ -328,12 +332,13 @@ Notes:
 cargo test -p burn-gdn2                                   # unit + autodiff + decode
 cargo test -p burn-gdn2 --test official_forward            # the forward vs an f64 per-token transcription of the equations (no fixture)
 cargo test -p burn-gdn2 --features autodiff --test autodiff_chunk  # hand-written op adjoint == tensor path + finite differences (CPU)
-cargo test -p burn-gdn2 --features binary-tests           # 1000-case vs a fixture (self-consistency only; see below)
+cargo test -p burn-gdn2 --features binary-tests           # 1000-case + 5 chunk sizes vs the f64 fixture (RED; see below)
 cargo test -p burn-gdn2 --features "cuda,autodiff" --test fused_launch_count  # launches per fused forward, by name
 cargo test -p burn-gdn2 --features "cuda,autodiff" --test fused_chunk_verify  # FORWARD kernels vs tensor path only
 cargo test -p burn-gdn2 --release --features "cuda,autodiff" --test fused_chunk_verify -- --ignored  # the fused adjoint gate, never run green
 cargo test -p burn-gdn2 --release --features "cuda,autodiff" --test autodiff_cuda_gate -- --ignored      # same gate, through a balanced graph
-python3 tests/gen_reference.py                            # regenerate tests/ref_data.bin
+python3 tools/gen_reference_f64.py                        # regenerate tests/ref_f64.bin + ref_f64_faults.bin
+python3 tools/gen_reference_f64.py --broad                 # regenerate tests/ref_f64_broad.bin (1000 cases)
 ```
 
 `tests/official_forward.rs` is the one that says the forward is RIGHT rather

@@ -30,7 +30,7 @@ include!("../tests/common/ref_f64.rs");
 fn main() {
     let t = load();
     let device = Device::ndarray();
-    let m = build(&t, Gdn2Mode::FusedRecurrent, &device);
+    let m = build(&t, Gdn2Mode::FusedRecurrent, 64, &device);
     let mut out = String::new();
     for (ci, (seq, x, _)) in t.cases.iter().enumerate() {
         if ci != 0 && ci != t.cases.len() - 1 {
@@ -63,7 +63,7 @@ fn main() {
         // Called for its side effect of exercising the whole projection stage;
         // the values it returns are read as 2-D by re-deriving them from the
         // fixture below, because the 4-D per-head views are strided.
-        let (_projected, _) = m.project(input.clone(), None);
+        let _ = &input;
 
         // The log-decay, twice: as project() leaves it (a [B,H,T,HK] permuted
         // view) and un-permuted back to [B,T,KD], against a recomputation from
@@ -124,16 +124,40 @@ fn main() {
             &m.a_log.val().into_data().bytes,
         );
 
-        // 4-D STAGES ARE DELIBERATELY NOT DUMPED. `project` leaves them as
-        // permuted [B,H,T,D] views, and on this backend `into_data()` on a
-        // strided view does not read in a stable order: measured here, `p.g`'s
-        // permuted read and its un-permuted read disagree by O(1) while holding
-        // the same values, and only the un-permuted one matches the reference.
-        // That is a burn readback question, NOT a `burn-gdn2` defect (the
-        // layer's own matmuls consume the same views and produce the right
-        // answer), and a diagnostic row built on it would be a false positive.
-        // The 2-D and 1-D stages below have no such ambiguity, and they are
-        // what the localisation actually rests on.
+        // THE 4-D PER-HEAD STAGES. These were previously not dumped because
+        // `into_data()` on a permuted (strided) view does not read in a stable
+        // order on this backend - a burn READBACK question, not a `burn-gdn2`
+        // defect, and a row built on it would be a false positive. burn
+        // 0.22.0-pre.4 has no `contiguous()` (checked: `grep -rn "fn
+        // contiguous" ~/.cargo/registry/src/*/burn-tensor-0.22.0-pre.4/src`
+        // returns nothing), so the fix is to push the view through an
+        // ELEMENTWISE op, which cannot be lazy and therefore writes a dense
+        // buffer in logical order. `powf_scalar(2.0)` and not `add_scalar(0.0)`,
+        // because a provable no-op is exactly what an optimiser would drop.
+        //
+        // The row is self-verifying against a misordered readback: the Python
+        // side compares `ours` against `reference ** 2`, so a readback that
+        // permutes the data shows up as an O(1) diff rather than a silent pass.
+        // Without these rows the f32-vs-f64 disagreement stayed unlocalised,
+        // because `diff_stages` compared only 2-D and 1-D stages - i.e. the
+        // diagnostic was blind to every per-head tensor, which is exactly where
+        // a head-layout or GVA-repeat defect would live.
+        let (projected, _) = m.project(input.clone(), None);
+        for (n, o) in [
+            ("q4d", &projected.q),
+            ("k4d", &projected.k),
+            ("g4d", &projected.g),
+            ("b4d", &projected.b),
+            ("v4d", &projected.v),
+            ("w4d", &projected.w),
+            ("gate4d", &projected.gate),
+        ] {
+            dump(
+                &mut out,
+                &format!("c{ci}/{n}"),
+                &o.clone().powf_scalar(2.0).into_data().bytes,
+            );
+        }
     }
     fs::write("/tmp/rust_stages.txt", &out).unwrap();
     println!("wrote /tmp/rust_stages.txt ({} bytes)", out.len());
