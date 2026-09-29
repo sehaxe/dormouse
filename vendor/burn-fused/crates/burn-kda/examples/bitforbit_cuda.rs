@@ -1,8 +1,13 @@
-//! Bit-for-bit CUDA harness: the FUSED chunk kernel vs the per-token
+//! Tensor-dump harness (CUDA): the FUSED chunk kernel vs the per-token
 //! reference, both on the CUDA device, both on the EXACT projections the CPU
 //! harness dumped (loads q,k,v,g,b_k,b_v from /tmp/opencode/kda_bfb/ so no
 //! RNG can drift between backends). Dumps f32-LE + .shape to
 //! /tmp/opencode/kda_bfb_cuda/ and prints max-abs diffs.
+//!
+//! NOT a bit-for-bit comparison, despite this binary's name: the per-token
+//! reference is `burn_kda`'s own `forward_recurrent`, so both sides are ours and
+//! there is no external reference. The printed max-abs diff is the number to
+//! read; the assertion lives in tests/fused_cuda.rs. See docs/ORACLE.md.
 //!   cargo run --release -p burn-kda --example bitforbit_cuda --features cuda
 #![cfg(feature = "cuda")]
 

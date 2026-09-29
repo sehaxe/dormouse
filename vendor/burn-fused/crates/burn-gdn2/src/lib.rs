@@ -46,8 +46,12 @@
 //! - **`std`** (default) - standard library support
 //! - **`autodiff`** - differentiation support (required for training)
 //! - **`cuda`** - CUDA backend support
-//! - **`binary-tests`** - bit-exact reference tests against `tests/ref_data.bin`
-//!   (regenerated with `tests/gen_reference.py`)
+//! - **`binary-tests`** - 1000-case reference tests against `tests/ref_data.bin`.
+//!   That fixture is **our** transcription of NVlabs' `lit_gpt/gdn2.py` (runnable
+//!   generator: `tools/gen_reference.rs`), compared at an absolute tolerance -
+//!   **not** bit-for-bit; a bit-for-bit claim needs the authors' kernel in the
+//!   tree. Not in `default`, and **RED as of 2026-09-27** (976/1000): see
+//!   `vendor/burn-fused/TEST-AUDIT.md` FINDING 0 and `docs/ORACLE.md`.
 
 pub mod alloc_trace;
 pub mod config;

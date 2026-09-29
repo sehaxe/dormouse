@@ -5,6 +5,19 @@ the list of what is currently unverified — because a rule that is not written
 down is not followed, and "we checked it once by eye" is how 25858 ms/step
 became a number three people believed.
 
+> **For the fused library, read `docs/ORACLE.md` first.** It is the companion to
+> this file and answers a question this one does not: for `burn-kda` and
+> `burn-gdn2`, *which defect class each existing test can and cannot catch*, and
+> which classes **no** test in those crates can catch. The short version, which
+> changes how the tables below should be read: the tensor-ops path and the fused
+> path share one `project` and one `output`, so a bug above the branch point
+> moves both arms together and every arm-vs-arm differential in the tree sees
+> **zero** difference. The only layer that can see that region is the
+> `ref_data.bin` transcription, and it is currently red and behind a
+> non-default feature. The machine-readable table is
+> `docs/ORACLE-TIERS.tsv`; `tools/oracle_gate.py` exits 1 on a claim of
+> bit-exactness against an arm-vs-arm comparison.
+
 ## The rule
 
 **Every optimisation must preserve the model's output, bit for bit or within a
