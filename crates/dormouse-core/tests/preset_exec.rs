@@ -247,9 +247,22 @@ fn executes(name: &str) {
         // no-teacher total PLUS a non-negative JEPA term. A sign error, a
         // detached target or a term added to the wrong side all fail here;
         // "how much" is a masked quantity by construction and is not claimed.
-        let with = model.forward_with_hidden::<B>(x.clone(), Some(h.clone()), None, Some(y.clone()), Some(&teacher)).3
+        // BOTH forwards run on `ref_m`, so the ONLY difference is the teacher.
+        // (Comparing `model` against the clone would compare two different
+        // objectives: JEPA-only against DSpark-only.) On a clone, so the probe
+        // counts asserted above are untouched.
+        let mut ref_m = model.clone();
+        ref_m.dspark_weight = 1.0;
+        let with = ref_m.forward_with_hidden::<B>(x.clone(), Some(h.clone()), None, Some(y.clone()), Some(&teacher)).3
             .expect("jepa on").into_scalar::<f32>();
-        let without = model.forward_with_hidden::<B>(x.clone(), Some(h.clone()), None, Some(y.clone()), None).3
+        // "No teacher" leaves DSpark's term, not "JEPA alone". Every preset
+        // ships dspark_weight = 0.0 (DeepSeek's own MTP ablation reports the
+        // head bits-per-byte neutral, and our protocol measures BPB), so on a
+        // shipped preset the no-teacher forward has NOTHING to sum and `aux`
+        // is correctly `None` - `any` at model.rs:254 needs a non-zero weight
+        // plus dspark_k > 0. Hence `ref_m` above, which enables the arm for
+        // BOTH sides so the subtraction isolates the teacher.
+        let without = ref_m.forward_with_hidden::<B>(x.clone(), Some(h.clone()), None, Some(y.clone()), None).3
             .expect("dspark only").into_scalar::<f32>();
         assert!(
             with >= without - 1e-4,
