@@ -29,14 +29,35 @@
 // not the authors' own bytes; there is no tier-(a) layer in this tree
 // (`docs/ORACLE.md` §3) and this is not one. What it buys is a reference whose
 // expected value does not come from a second implementation of the same
-// DERIVATIVE — which is the property the previous tests lacked. The words
-// "bit-exact" and "bit-for-bit" are not used about anything here.
+// DERIVATIVE — which is the property the previous tests lacked. The tolerances
+// below are relative bars with a measured margin on BOTH sides, never a claim of
+// exact reproduction: the oracle is 1.2e-12 from the implementation's own
+// second method, and the implementation is 2.5e-7 from the oracle.
 //
 // The transcription risk is BOUNDED rather than assumed: `the_forward_agrees_
 // with_the_f64_transcription` runs first and asserts our f32 forward against the
 // f64 one, so every gradient below is the derivative of a function whose
 // forward has been checked. A gradient gate whose forward does not match is a
 // statement about nothing.
+//
+// # THE GATE'S POWER, MEASURED, AND IT IS NOT MORE THAN THIS
+//
+// A test that cannot fail is the defect class this project keeps rediscovering,
+// so the failure was provoked and measured, by editing `ChunkWy::backward` in
+// `src/autodiff.rs` and reading the table:
+//
+//   perturbation on `d_q` alone      q rel      verdict
+//   x 1.01   (1% )                  9.901e-3   RED,  9.9x the bar
+//   x 1.0001 (1e-4)                 1.000e-4   green
+//   none                           1.352e-7   green
+//
+// with the other six inputs unmoved at 1.3e-7..2.5e-7 in every case, so the
+// table LOCALISES the perturbation as well as detecting it. So the honest
+// statement of what this gate is worth: **it detects a wrong adjoint at 1e-3
+// relative and above, per input.** Below that it does not, and no claim is made
+// that it does. The bar sits 4000x above this implementation's own f32 noise
+// floor (2.5e-7) and 720x below the nearest wrong formula the fixture
+// contains (7.2e-1), and both numbers are re-measured on every run.
 //
 // # WHAT IS COMPARED, AND WHY EVERY COORDINATE
 //
@@ -436,6 +457,103 @@ fn read_tensor(c: &mut Cursor<&[u8]>) -> (String, Vec<f64>) {
     let bytes = unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, numel * 8) };
     std::io::Read::read_exact(c, bytes).unwrap();
     (name, v)
+}
+
+// --- THE FINDING: the forward's chunk carry ------------------------------
+/// Two chunks instead of one, against the same oracle at T = 2*chunk. This test
+/// is RED, and it is red on purpose.
+///
+/// # What is measured, and what is established
+///
+/// With T = 16 = chunk the forward matches the f64 transcription to 1.4e-7. With
+/// T = 32 = 2 chunks it matches to 8.3e-1. The difference is localised:
+///
+///   * chunk 0 agrees to ~3e-8, every token, every channel;
+///   * chunk 1 is off by 0.06 to 0.56 absolute, an order above the output scale;
+///   * the RETURNED final state is off by 8.9e-1 relative;
+///   * `ChunkPath::Batched` and `ChunkPath::Loop` give the same answer, so it is
+///     not the batched rewrite (measured, `DM_GDN2_OPS=loop`);
+///   * it persists with the initial state set to zero, so it is not the
+///     `S_in * E_last` term (measured);
+///   * the state the code carried across the boundary is UNIQUELY determined by
+///     its own chunk-1 output — the linear system `out1 = aqk1 U1 +
+///     (scale*qg1 - aqk1 W1) S` is 16 equations in 8 unknowns per value column,
+///     rank 8, and fits the f32 output to 3e-8 — and it is not
+///     `khat0^T v_new0` under any of six decay conventions.
+///
+/// The intra-chunk algebra is therefore NOT the difference: it is the state
+/// handed from chunk 0 to chunk 1.
+///
+/// # What is NOT established, and is not claimed
+///
+/// Which side is wrong. The reference is a transcription and this file is not in
+/// a position to say the Rust is the odd one out; the two Rust arms agreeing with
+/// each other is weak evidence and no more. `FLA`'s `chunk_gated_delta_rule_fwd_
+/// kernel_h_blockdim64` states the same update this file's transcription does
+/// (`b_h1 *= exp2(b_gk_last); b_h1 += dot(b_k, b_v)` with
+/// `b_k = kg = k*exp2(gn - gk)`), which is a point in favour of the
+/// transcription and against the Rust, and it is a point, not a measurement.
+/// Settling it needs the authors' own kernel run, which is
+/// `docs/ORACLE.md` §8 candidate (2) and was not attempted.
+///
+/// # Why it is a test and not a paragraph
+///
+/// Because everything above `forward.rs:296-297` and its twin at
+/// `forward.rs:636` — the whole backward's BPTT half, and the fused kernel's
+/// BK2 with its `d_k_bptt` / `d_e_bptt` / `d_s_shift` — is UNVERIFIED while this
+/// is red, and the terms `2a430cc` measured at rel 3.3e-1 and 6.2e-1 live
+/// exactly there. A finding that is a paragraph gets re-litigated; a finding that
+/// is a red gate with its oracle committed next to it does not.
+#[test]
+fn two_chunks_the_forward_still_agrees_with_the_f64_transcription() {
+    let f = load(include_bytes!("ref_bwd_f64_carry.bin"), b"GDN2BFD\0");
+    let dev = Device::ndarray();
+    let inp = tensors(&f, &dev);
+    let (out_shape, out_ref) = f.get("out");
+    let (out, new_state) = chunk_wy_forward(
+        inp[0].clone(),
+        inp[1].clone(),
+        inp[2].clone(),
+        inp[3].clone(),
+        inp[4].clone(),
+        inp[5].clone(),
+        inp[6].clone(),
+        SCALE,
+        CHUNK,
+    );
+    let (r, scale) = rel(&host(&out), &out_ref);
+    let got_out = host(&out);
+    let (t_dim, c_dim) = (out_shape[2], out_shape[3]);
+    let per_t: Vec<f64> = (0..t_dim)
+        .map(|t| {
+            (0..c_dim)
+                .map(|c| (got_out[t * c_dim + c] - out_ref[t * c_dim + c]).abs())
+                .fold(0.0f64, f64::max)
+        })
+        .collect();
+    let c0 = per_t[..CHUNK].iter().copied().fold(0.0f64, f64::max);
+    let c1 = per_t[CHUNK..].iter().copied().fold(0.0f64, f64::max);
+    let (_, s_ref) = f.get("out_state");
+    let (sr, _) = rel(&host(&new_state), &s_ref);
+    println!(
+        "\nT = {t_dim} = 2 chunks, against the same f64 oracle:\n  \
+         output        rel = {r:.3e}  (scale {scale:.3e})\n  \
+         chunk 0       max |diff| = {c0:.3e}\n  \
+         chunk 1       max |diff| = {c1:.3e}\n  \
+         final state   rel = {sr:.3e}\n  \
+         oracle self-consistency (fwd-mode vs FD) = {:.3e}\n\
+         ESTABLISHED: the intra-chunk algebra agrees (chunk 0 at {c0:.1e}) and the state\n\
+         HANDED ACROSS THE BOUNDARY does not.  NOT established: which side is wrong - the\n\
+         reference is a transcription, and two Rust arms agreeing is a point, not a proof.",
+        f.spread
+    );
+    assert!(
+        r < FWD_BAR as f64,
+        "the forward is {r:.3e} from the f64 transcription on a TWO-chunk sequence \
+         (chunk 0 {c0:.3e}, chunk 1 {c1:.3e}, final state {sr:.3e}). Until this is fixed the \
+         backward's inter-chunk half - and the fused kernel's BK2 - have no oracle, because \
+         an oracle for a function we do not compute is not an oracle."
+    );
 }
 
 impl Fixture {
