@@ -6,5 +6,12 @@ crates/*/target
 # exists — see crates/burn-gdn2/TEST-AUDIT.md.
 **/*.bin
 !crates/burn-gdn2/tests/ref_data.bin
+# The f64 reference fixtures, same reason and one more: `tests/ref_f64.rs` must
+# run in CI without Python or NumPy present at all, so the expected values have
+# to be bytes in the tree. `ref_f64.bin` is the layer's output;
+# `ref_f64_faults.bin` is the other side of its margin, and a margin asserted
+# against data nobody can regenerate is not a margin.
+!crates/burn-gdn2/tests/ref_f64.bin
+!crates/burn-gdn2/tests/ref_f64_faults.bin
 Cargo.lock.bak
 .bulba/

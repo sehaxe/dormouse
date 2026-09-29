@@ -1,0 +1,530 @@
+#!/usr/bin/env python3
+"""f64 CPU reference for Gated DeltaNet-2. Generates `tests/ref_f64.bin`.
+
+WHAT THIS IS, AND WHAT IT IS NOT.
+
+This is an **f64 transcription of the paper's equations**, written out one
+token at a time, plus a committed fixture of its outputs. It exists because
+every other test in this crate compares our code to our code
+(`vendor/burn-fused/TEST-AUDIT.md`, `docs/ORACLE.md` §2): a bug above the
+fused/ops branch point moves both arms together and the difference is exactly
+zero. This layer is the first one whose expected value does not come from a
+second implementation of the same code.
+
+**It is tier (b), not tier (a).** It is a transcription, so a shared
+*misreading* of the paper survives it. It is not the authors' own bytes; those
+need `NVlabs/GatedDeltaNet-2`'s Triton kernel actually run, which is
+`docs/ORACLE.md` §8 candidate (2) and was not attempted here. What it buys is
+the removal of one confound: with f64 at the top of the stack, a discrepancy is
+no longer ambiguous between "our maths" and "f32 conditioning".
+
+PROVENANCE, line by line. Every non-obvious line cites where it comes from:
+
+  * the recurrence, Eq. 9/10:      arXiv:2605.22791 §3.1
+        S̄_t = D_t S_{t-1},  r_t = S̄_t^T e_t,  S_t = S̄_t + k_t (z_t - r_t)^T
+        e_t = b_t ⊙ k_t (§8),  z_t = w_t ⊙ v_t (§8),  α_t = exp(g_t) (§12)
+  * o_t = S_t^T q_t:              §3.1, and App. C.5 for the decode kernel
+  * `scale = 1/sqrt(K)`:          NOT in the paper. From the authors' kernel,
+        `lit_gpt/gdn2_ops/chunk_gdn2.py`:
+            if scale is None: scale = k.shape[-1] ** -0.5
+        and it multiplies the WHOLE readout, not one term:
+        `fla/ops/gla/chunk.py::chunk_gla_fwd_kernel_o` does `b_o *= scale` on
+        the inter-chunk (state) term, while the intra-chunk term arrives
+        through `Aqk`, which was already built with `* scale`.
+  * g = -exp(A) ⊙ softplus(W_f x + dt), A per head broadcast over d_k:
+        paper Eq. 12 + App. C.1; `lit_gpt/gdn2.py` builds it on the FLAT
+        `key_dim` (`A_log.float().exp().repeat_interleave(head_k_dim)`) and
+        then GVA-repeats it, which is the same thing as building it per head.
+  * L2 norm of q and k per head, `x / sqrt(sum(x^2) + 1e-6)`:
+        paper App. D.2; the exact form (add eps INSIDE the sqrt) is
+        `fla/modules/l2norm.py::l2norm_fwd_kernel`:
+            b_rstd = 1 / tl.sqrt(tl.sum(b_x * b_x) + eps)
+  * short conv, depthwise, W=4, **ZERO left padding**, last tap is the
+        current token:
+        `fla/modules/conv/triton/kernels.py::causal_conv1d_fwd_kernel`, the
+        `not USE_INITIAL_STATE` branch:
+            for i_w in tl.static_range(-W + 1, 1):
+                o_x = o_t + i_w
+                b_yi = tl.load(..., mask=((o_x >= 0) & (o_x < T))[...,], other=0.0)
+                b_yi *= tl.sum(b_w * (o_w == (i_w + W - 1)), 1)
+        i.e. out[t] = sum_i w[i] * x[t - W + 1 + i], and x[s<0] is ZERO, not a
+        copy of x[0]. Cross-checked three ways: `ShortConvolution` is an
+        `nn.Conv1d(padding=kernel_size-1)` with the default
+        `padding_mode='zeros'`; fla's own test reference
+        (`tests/modules/test_conv.py::causal_conv1d_ref_torch`) is
+        `F.conv1d(..., padding=width-1)`; and that test builds its cache from
+        an explicit `torch.zeros(B, D, 1)`.
+  * output: `FusedRMSNormSwishGate` = `(x / sqrt(mean(x^2) + eps)) * w * silu(g)`,
+        w initialised to ones, NO bias:
+        `fla/modules/fused_norm_gate.py::layer_norm_gated_fwd_kernel`,
+        `IS_RMS_NORM` branch + `b_y = b_y * b_g * sigmoid(b_g)`. The bias is
+        `register_parameter("bias", None)`, so it does not exist.
+  * GVA: q, k, g, b repeated across value-head groups; v and w already live on
+        the value-head axis. Paper §3.5 and App. C.1.
+  * `allow_neg_eigval` scales ONLY b by 2, never w. Paper §3.1 and App. C.1.
+
+WHY f32 WEIGHTS IN THE FIXTURE. The weights and the inputs are stored f32, so
+both arms of the comparison start from bit-identical values and the ONLY thing
+the bar is measuring is arithmetic. If the weights were stored f64, burn would
+round them to f32 on load and the test would be measuring that too - a real
+effect, but one that muddies the question the test exists to answer.
+
+WHY THE BAR IS 1e-3 RELATIVE. A semantic error is O(1) relative; f32
+reassociation over 8 chunk boundaries is O(1e-6). A bar at 1e-3 sits three
+orders of magnitude above the noise and three below the smallest semantic
+error. `tests/ref_f64.rs` carries a negative control that MEASURES both sides
+of that gap every run, so the claim cannot rot.
+
+Usage:
+    python3 tools/gen_reference_f64.py               # write tests/ref_f64.bin
+    python3 tools/gen_reference_f64.py --self-test   # print the margin table
+    python3 tools/gen_reference_f64.py --fault conv-padding --out /tmp/x.bin
+                                                       # a wrong formula
+"""
+
+import argparse
+import math
+import struct
+import sys
+
+import numpy as np
+
+# --- configuration, matching the crate's existing test matrix -----------------
+D, H, HK, HV = 64, 4, 16, 4
+EXPAND_V = 1.5
+USE_SHORT_CONV = True
+ALLOW_NEG_EIGVAL = False
+NORM_EPS = 1e-5
+L2_EPS = 1e-6
+CONV_W = 4
+SEED = 20260929
+
+KD = H * HK              # 64, key_dim  (flattened)
+VH = int(HK * EXPAND_V)  # 24, head_v_dim
+VD = HV * VH             # 96, value_dim
+
+# T=1 is a canary: with one token there is no state carry and no cross-token
+# conv tap, so several candidate layouts coincide. The rest straddle every
+# chunk size the crate tests (4, 8, 16, 32, 64).
+SEQ_LENS = [1, 2, 3, 4, 5, 7, 8, 9, 13, 16, 17, 21, 32, 33, 37, 64, 65, 70]
+
+MASK64 = (1 << 64) - 1
+
+
+class Rng:
+    """splitmix64 + Box-Muller. stdlib-only and provably stable, so the fixture
+    is byte-reproducible forever without pinning a numpy or torch version."""
+
+    def __init__(self, seed):
+        self.s = seed & MASK64
+
+    def _next(self):
+        self.s = (self.s + 0x9E3779B97F4A7C15) & MASK64
+        z = self.s
+        z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & MASK64
+        z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & MASK64
+        return (z ^ (z >> 31)) & MASK64
+
+    def _u01(self, n):
+        out = np.empty(n, dtype=np.float64)
+        for i in range(n):
+            out[i] = (self._next() >> 11) * (2.0 ** -53)
+        return out
+
+    def uniform(self, lo, hi, shape):
+        return lo + (hi - lo) * self._u01(int(np.prod(shape))).reshape(shape)
+
+    def normal(self, shape):
+        n = int(np.prod(shape))
+        u = self._u01(2 * n).reshape(n, 2)
+        u1 = np.clip(u[:, 0], 1e-300, 1.0)
+        r = np.sqrt(-2.0 * np.log(u1))
+        return (r * np.cos(2.0 * math.pi * u[:, 1])).reshape(shape)
+
+
+def xavier(rng, out_f, in_f, gain):
+    """torch's `nn.init.xavier_uniform_(w, gain)` on a [out, in] matrix."""
+    a = gain * math.sqrt(6.0 / (in_f + out_f))
+    return rng.uniform(-a, a, (out_f, in_f))
+
+
+def softplus(z):
+    """`F.softplus(z, beta=1)`. `logaddexp(0, z)` is the stable form; above the
+    torch threshold of 20 it differs from `z` by < 2e-9 absolute, which is far
+    below the f32 the authors themselves use for this quantity."""
+    return np.logaddexp(0.0, z)
+
+
+def silu(x):
+    return x / (1.0 + np.exp(-x))
+
+
+def sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def short_conv(x, w, pad="zeros"):
+    """Causal depthwise conv, kernel CONV_W, then SiLU.
+
+    x: [T, C], w: [C, CONV_W]. Returns [T, C].
+
+    out[t] = sum_i w[:, i] * x[t - CONV_W + 1 + i], with x[s] = 0 for s < 0
+    (ZERO padding - see the module docstring for the three sources). Tap
+    CONV_W-1 multiplies the CURRENT token, because `F.conv1d` is a
+    cross-correlation and the causal left pad is CONV_W-1 wide.
+    """
+    t, c = x.shape
+    assert w.shape == (c, CONV_W), w.shape
+    if pad == "replicate":
+        xp = np.concatenate([np.repeat(x[:1], CONV_W - 1, axis=0), x], axis=0)
+    else:
+        xp = np.concatenate([np.zeros((CONV_W - 1, c)), x], axis=0)
+    out = np.zeros((t, c))
+    for i in range(CONV_W):
+        out += xp[i : i + t] * w[:, i]
+    return silu(out)
+
+
+def gdn2_forward(x, P, fault=None):
+    """The whole layer, f64 throughout. x: [T, D] -> [T, D]."""
+    t = x.shape[0]
+    g_pre = P["f_proj_1"] @ (P["f_proj_0"] @ x.T)          # [KD, T]
+    # Eq. 12 / App. C.1. A is per head, broadcast over that head's d_k.
+    decay = np.repeat(np.exp(P["A_log"]), HK)
+    g = -decay[:, None] * softplus(g_pre + P["dt_bias"][:, None])
+
+    if fault == "transposed-proj":
+        # W instead of W^T, applied to the projections where that is still
+        # shape-legal - q, k and b are all [64, 64] in this config. That is the
+        # whole danger: a transposed projection is only a SILENT wrong answer on
+        # a square matrix, and the key side usually is.
+        qp, kp = x @ P["q_proj"], x @ P["k_proj"]
+        bp = x @ P["b_proj"]
+        vp, wp = (P["v_proj"] @ x.T).T, (P["w_proj"] @ x.T).T
+    else:
+        qp, kp, vp = (P["q_proj"] @ x.T).T, (P["k_proj"] @ x.T).T, (P["v_proj"] @ x.T).T
+        bp, wp = (P["b_proj"] @ x.T).T, (P["w_proj"] @ x.T).T
+
+    if USE_SHORT_CONV:
+        pad = "replicate" if fault == "conv-padding" else "zeros"
+        q = short_conv(qp, P["q_conv_w"], pad)
+        k = short_conv(kp, P["k_conv_w"], pad)
+        v = short_conv(vp, P["v_conv_w"], pad)
+    else:
+        q, k, v = silu(qp), silu(kp), silu(vp)
+
+    b = sigmoid(bp)                                       # [T, KD]
+    wg = sigmoid(wp)                                      # [T, VD]
+
+    if fault == "decay-sign":                              # wrong sign on g
+        g = -g
+
+    # -> per head, [H, T, *]
+    q = q.reshape(t, H, HK).transpose(1, 0, 2)
+    k = k.reshape(t, H, HK).transpose(1, 0, 2)
+    g = g.T.reshape(H, t, HK)
+    b = b.reshape(t, H, HK).transpose(1, 0, 2)
+    v = v.reshape(t, HV, VH).transpose(1, 0, 2)
+    wg = wg.reshape(t, HV, VH).transpose(1, 0, 2)
+
+    # GVA: key-side repeated across value-head groups; v and w already there.
+    if HV > H:
+        rep = HV // H
+        q = np.repeat(q, rep, axis=0)
+        k = np.repeat(k, rep, axis=0)
+        g = np.repeat(g, rep, axis=0)
+        b = np.repeat(b, rep, axis=0)
+
+    # App. D.2. eps goes INSIDE the sqrt (fla/modules/l2norm.py).
+    q = q / np.sqrt((q * q).sum(-1, keepdims=True) + L2_EPS)
+    k = k / np.sqrt((k * k).sum(-1, keepdims=True) + L2_EPS)
+
+    if ALLOW_NEG_EIGVAL:
+        b = b * 2.0
+
+    scale = HK ** -0.5
+    if fault == "no-scale":
+        scale = 1.0
+
+    # ---- Eq. 9, one token at a time, f64 --------------------------------
+    S = np.zeros((HV, HK, VH))
+    outs = np.empty((HV, t, VH))
+    for i in range(t):
+        Sb = S * np.exp(g[:, i])[:, :, None]          # S̄ = Diag(α_t) S, Eq. 9
+        e = b[:, i] * k[:, i] if fault != "no-erase-gate" else k[:, i]
+        r = np.einsum("hkv,hk->hv", Sb, e)            # r = S̄^T e
+        z = wg[:, i] * v[:, i]                        # z = w ⊙ v
+        if fault == "no-write-gate":
+            z = v[:, i]
+        S = Sb + k[:, i][:, :, None] * (z - r)[:, None, :]   # S̄ + k (z-r)^T
+        # The readout is S^T q, from the state AFTER the write. Reading S̄^T q
+        # instead is the `gr.rs` bug class (docs/ORACLE.md B2).
+        src = Sb if fault == "read-before-write" else S
+        outs[:, i] = np.einsum("hkv,hk->hv", src, q[:, i])
+    outs = outs.transpose(1, 0, 2) * scale             # the WHOLE readout
+
+    # ---- FusedRMSNormSwishGate -----------------------------------------
+    # g_proj is a bare Sequential (Linear, Linear-with-bias) with NO activation
+    # between the two - lit_gpt/gdn2.py __init__ and its `self.g_proj(x)` call.
+    gate = (P["g_proj_1"] @ (P["g_proj_0"] @ x.T) + P["g_proj_1_b"][:, None]).T
+    gate = gate.reshape(t, HV, VH)
+    rms = np.sqrt((outs * outs).mean(-1, keepdims=True) + NORM_EPS)
+    outs = outs / rms * P["o_norm_w"] * silu(gate)
+    return (P["o_proj"] @ outs.reshape(t, VD).T).T
+
+
+def make_params(rng):
+    """The authors' own init: xavier_uniform gain 2**-2.5, zero biases,
+    A_log = log(U(1,16)), dt_bias from the dt parameterisation, o_norm = ones.
+    Paper App. D.5. Layer weights are stored in burn's [out, in] layout."""
+    gain = 2.0 ** -2.5
+    P = {}
+    for name, out_f, in_f in [
+        ("q_proj", KD, D), ("k_proj", KD, D), ("v_proj", VD, D),
+        ("f_proj_0", VH, D), ("f_proj_1", KD, VH),
+        ("b_proj", KD, D), ("w_proj", VD, D),
+        ("g_proj_0", VH, D), ("g_proj_1", VD, VH),
+        ("o_proj", D, VD),
+    ]:
+        P[name] = xavier(rng, out_f, in_f, gain)
+    # g_proj's bias is the ONE place this fixture departs from the authors'
+    # init, and only for conditioning. `lit_gpt/gdn2.py` zeroes every bias, which
+    # puts the output gate at silu(0) = 0 exactly: a freshly-initialised layer's
+    # output is then ~7e-4 where its pre-gate value is O(1), i.e. the output is a
+    # near-null quantity and a RELATIVE bar through it is meaningless (it reads
+    # 1e+0 for two implementations that differ by f32 noise). Moving the gate
+    # bias off silu's zero crossing fixes the conditioning. It changes no
+    # formula, no projection and no gate - only the scale the output is measured
+    # against. Measured: max|out| goes from 7.5e-04 to O(1).
+    P["g_proj_1_b"] = rng.uniform(0.5, 1.5, VD)
+
+    P["A_log"] = np.log(rng.uniform(1.0, 16.0, (H,)))
+    dt = np.clip(
+        np.exp(rng.uniform(0, 1, (KD,)) * (math.log(0.1) - math.log(0.001)) + math.log(0.001)),
+        1e-4, None,
+    )
+    P["dt_bias"] = dt + np.log(-np.expm1(-dt))
+    P["o_norm_w"] = np.ones(VH)
+    if USE_SHORT_CONV:
+        for name, c in [("q_conv_w", KD), ("k_conv_w", KD), ("v_conv_w", VD)]:
+            P[name] = rng.uniform(-0.5, 0.5, (c, CONV_W))
+    return P
+
+
+# --- fixture format ----------------------------------------------------------
+# All little-endian. Weights and inputs f32 (so both arms start from identical
+# bits); the OUTPUTS f64, which is the entire point of this layer.
+#
+# Linear weights are stored in burn's on-disk `Linear` layout,
+# `[d_input, d_output]` — the same convention as the sibling `ref_data.bin`, so
+# a `LinearConfig::new(shape[0], shape[1])` reproduces the tensor exactly. The
+# 1-D parameters and the depthwise conv weights keep their natural order.
+#   "GDN2F64\0" | u32 d,h,hk,hv | f64 expand_v | u8 use_sc, allow_neg
+#   | u8 n_tensors | { u32 namelen, name, u32 ndim, u32 numel, i32[ndim], f32[numel] }
+#   | u32 n_cases  | { u32 t, f32[d*t] x, f64[d*t] y }
+TENSOR_ORDER = [
+    "q_proj", "k_proj", "v_proj", "f_proj_0", "f_proj_1", "b_proj", "w_proj",
+    "g_proj_0", "g_proj_1", "g_proj_1_b", "A_log", "dt_bias", "o_norm_w", "o_proj",
+    "q_conv_w", "k_conv_w", "v_conv_w",
+]
+# The subset that is a burn `Linear`, and therefore stored [d_input, d_output].
+LINEARS = {
+    "q_proj", "k_proj", "v_proj", "f_proj_0", "f_proj_1", "b_proj", "w_proj",
+    "g_proj_0", "g_proj_1", "o_proj",
+}
+
+
+def make_inputs():
+    """The fixture's inputs, in fixture order, from ONE rng stream consumed once.
+
+    Everything that needs case i's input must go through this. It used to be
+    re-drawn per consumer, and `write_fault_fixture` drew only the case it
+    wanted as the stream's FIRST draw - so the "wrong formula" outputs were
+    computed on a different input than the "right formula" ones, and every fault
+    read O(1) for the wrong reason. The fault fixture now carries a hash of the
+    input it used and `tests/ref_f64.rs` checks it against the main fixture, so
+    that class of mistake fails loudly instead of looking like a huge margin.
+    """
+    rng = Rng(SEED)
+    return [rng.normal((t, D)).astype(np.float32) for t in SEQ_LENS]
+
+
+def fnv1a64(data: bytes) -> int:
+    h = 0xCBF29CE484222325
+    for b in data:
+        h = ((h ^ b) * 0x100000001B3) & MASK64
+    return h
+
+
+def write_fixture(path, P, fault):
+    cases = [(t, x, gdn2_forward(x.astype(np.float64), P, fault))
+             for (t, x) in zip(SEQ_LENS, make_inputs())]
+    with open(path, "wb") as f:
+        f.write(b"GDN2F64\0")
+        f.write(struct.pack("<4I", D, H, HK, HV))
+        f.write(struct.pack("<d", EXPAND_V))
+        f.write(bytes([int(USE_SHORT_CONV), int(ALLOW_NEG_EIGVAL), len(TENSOR_ORDER)]))
+        for name in TENSOR_ORDER:
+            a = np.ascontiguousarray(P[name], dtype=np.float32)
+            if name in LINEARS:
+                a = np.ascontiguousarray(a.T)
+            nb = name.encode()
+            f.write(struct.pack("<I", len(nb)) + nb)
+            f.write(struct.pack("<2I", a.ndim, a.size))
+            f.write(struct.pack(f"<{a.ndim}i", *a.shape))
+            f.write(a.astype("<f4").tobytes())
+        f.write(struct.pack("<I", len(cases)))
+        for t, x32, y in cases:
+            f.write(struct.pack("<I", t))
+            f.write(np.ascontiguousarray(x32, dtype="<f4").tobytes())
+            f.write(np.ascontiguousarray(y, dtype="<f8").tobytes())
+    return cases
+
+
+FAULTS = ["decay-sign", "transposed-proj", "no-write-gate", "no-erase-gate",
+          "read-before-write", "conv-padding", "no-scale"]
+
+# The case whose wrong-formula outputs get committed. The longest one: it is
+# the only length where a semantic error and f32 noise are both fully present
+# (a long state carry plus every cross-token conv tap).
+FAULT_CASE = len(SEQ_LENS) - 1
+
+
+def write_fault_fixture(path, P):
+    """The other side of the margin, committed.
+
+    `ref_f64.bin` says what the layer should produce. This says how far off a
+    WRONG formula lands, on the same weights and the SAME input. The Rust test
+    asserts our f32 output is within the bar of the first and outside the bar
+    of every one of these, which is what makes the bar falsifiable rather than
+    a self-consistency check - and it keeps that true without a second
+    implementation living in the tree.
+
+    The input hash is not decoration. The first version of this file re-drew
+    the RNG for this case instead of consuming the stream up to it, so these
+    outputs were computed on a DIFFERENT input and all seven faults read O(1)
+    for a reason that had nothing to do with the formulas. The test now
+    recomputes this hash from `ref_f64.bin` and refuses to compare if it
+    differs."""
+    t = SEQ_LENS[FAULT_CASE]
+    x = make_inputs()[FAULT_CASE]
+    h = fnv1a64(np.ascontiguousarray(x, dtype="<f4").tobytes())
+    with open(path, "wb") as f:
+        f.write(b"GDN2FLT\0")
+        f.write(struct.pack("<3IQ", FAULT_CASE, len(FAULTS), t, h))
+        for name in FAULTS:
+            nb = name.encode()
+            y = gdn2_forward(x.astype(np.float64), P, name)
+            f.write(struct.pack("<I", len(nb)) + nb)
+            f.write(np.ascontiguousarray(y, dtype="<f8").tobytes())
+    print(f"wrote {path}: {len(FAULTS)} wrong formulas on case {FAULT_CASE} (T={t}, "
+          f"input fnv1a64 = {h:#018x})")
+
+
+def stages(x, P):
+    """Every intermediate of the layer, in f64, for one case.
+
+    Returned in the same order `examples/ref_f64_stages.rs` dumps them, so
+    `--diff-stages` is a positional diff. The point is to name the FIRST stage
+    that disagrees: that is the defect, and everything after it is downstream
+    noise."""
+    t = x.shape[0]
+    out = {}
+    qp = (P["q_proj"] @ x.T).T
+    kp = (P["k_proj"] @ x.T).T
+    vp = (P["v_proj"] @ x.T).T
+    out["raw_q_proj"] = qp
+    out["raw_k_proj"] = kp
+    out["raw_v_proj"] = vp
+    out["f0"] = (P["f_proj_0"] @ x.T).T
+    out["f1"] = (P["f_proj_1"] @ (P["f_proj_0"] @ x.T)).T
+    out["gp0"] = (P["g_proj_0"] @ x.T).T
+    out["gp1"] = (P["g_proj_1"] @ (P["g_proj_0"] @ x.T) + P["g_proj_1_b"][:, None]).T
+    out["a_exp"] = np.repeat(np.exp(P["A_log"]), HK)
+    out["dt_bias"] = P["dt_bias"]
+    out["A_log"] = P["A_log"]
+    out["q_conv"] = short_conv(qp, P["q_conv_w"])
+    out["k_conv"] = short_conv(kp, P["k_conv_w"])
+    out["v_conv"] = short_conv(vp, P["v_conv_w"])
+    q, k, v = out["q_conv"], out["k_conv"], out["v_conv"]
+    b = sigmoid((P["b_proj"] @ x.T).T)
+    wg = sigmoid((P["w_proj"] @ x.T).T)
+    g_pre = P["f_proj_1"] @ (P["f_proj_0"] @ x.T)
+    g = -np.repeat(np.exp(P["A_log"]), HK)[:, None] * softplus(g_pre + P["dt_bias"][:, None])
+    out["g_recomputed"] = g.T          # [T,KD] == g_unpermuted
+    return out
+
+
+def diff_stages(path, P):
+    """Read the crate's dumped stages and report max |ours - f64| per stage."""
+    ours = {}
+    for line in open(path):
+        parts = line.split()
+        if not parts:
+            continue
+        ours[parts[0]] = np.array([float(v) for v in parts[1:]], dtype=np.float64)
+    xs = [x.astype(np.float64) for x in make_inputs()]
+    print(f"{'stage':<14} {'max|ours-ref|':>14} {'max|ref|':>12} {'rel':>10}")
+    for key, got in ours.items():
+        ci = int(key[1 : key.index("/")])
+        stage = key[key.index("/") + 1 :]
+        ref = stages(xs[ci], P)[stage]
+        # Only 2-D and 1-D stages are compared. `project` leaves the per-head
+        # tensors as permuted [B,H,T,D] views and this backend's `into_data()`
+        # on a strided view does not read in a stable order, so a 4-D row here
+        # is a false positive rather than a finding. See the example's header.
+        d = np.abs(got.reshape(ref.shape) - ref)
+        scale = max(np.abs(ref).max(), 1e-30)
+        print(f"{stage:<14} {d.max():>14.3e} {scale:>12.3e} {d.max()/scale:>10.3e}")
+
+
+def self_test(P):
+    """The margin. Prints max |wrong - right| / max |right| for each fault, so
+    the bar's two sides are measured rather than asserted in prose."""
+    rng = Rng(SEED + 1)
+    xs = [rng.normal((t, D)) for t in SEQ_LENS]
+    ref = np.concatenate([gdn2_forward(x, P) for x in xs])
+    denom = np.abs(ref).max()
+    rows = [("f32 reassociation (est.)", None)]
+    for fault in FAULTS:
+        got = np.concatenate([gdn2_forward(x, P, fault) for x in xs])
+        rel = np.abs(got - ref).max() / denom
+        rows.append((fault, rel))
+    print(f"reference output scale: max|out| = {denom:.6g}")
+    print(f"{'perturbation':<32} {'max rel dev':>12}")
+    for name, rel in rows:
+        print(f"{name:<32} {'(measured in Rust)':>12}" if rel is None else f"{name:<32} {rel:>12.3e}")
+    return ref
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", default="tests/ref_f64.bin")
+    ap.add_argument("--fault", default=None,
+                    choices=["decay-sign", "transposed-proj", "no-write-gate",
+                             "no-erase-gate", "read-before-write", "conv-padding",
+                             "no-scale"])
+    ap.add_argument("--faults-out", default="tests/ref_f64_faults.bin",
+                    help="where to write the wrong-formula fixture")
+    ap.add_argument("--self-test", action="store_true")
+    ap.add_argument("--diff-stages", metavar="FILE",
+                    help="diff the crate's dumped project() stages against f64")
+    args = ap.parse_args()
+
+    P = make_params(Rng(SEED))
+    if args.diff_stages:
+        diff_stages(args.diff_stages, P)
+        return
+    if args.self_test:
+        self_test(P)
+        return
+    cases = write_fixture(args.out, P, args.fault)
+    tag = f" WITH FAULT '{args.fault}'" if args.fault else ""
+    print(f"wrote {args.out}{tag}: {len(cases)} cases, d={D} h={H} hk={HK} hv={HV} "
+          f"expand_v={EXPAND_V}, T in {SEQ_LENS[0]}..{SEQ_LENS[-1]}")
+    if args.fault is None:
+        write_fault_fixture(args.faults_out, P)
+
+
+if __name__ == "__main__":
+    main()
