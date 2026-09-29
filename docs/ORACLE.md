@@ -127,14 +127,39 @@ This file narrows that to the two crates that carry the headline.
 byte-identically, and CI diffs the two — that is a real, well-built tier-(c)
 anchor, and it is the best infrastructure in the tree.
 
-It is **RED**. Recorded measurement: 1000 cases, `max_diff = 1.38e-2`,
-976/1000 failures at `EPSILON = 5e-4` — `vendor/burn-fused/TEST-AUDIT.md`
-FINDING 0, ndarray, 2026-09-27, snapshot `1fab19e`. The cause is localised but
-not diagnosed (a layout defect in the generator: token-major buffers read with
-head-major offsets, which is why exactly the 24 single-token cases pass). The
-`binary-tests` feature is deliberately not in `default`, and the consequence is
-measurable in an ordinary test run — see §5.1. Two further consequences that
-belong in any decision about this crate:
+It is **RED**, and the red reproduces exactly. Re-measured on this cell
+2026-09-29 at `57f324b`, ndarray, `--release`, from `wt/oracle`:
+
+```
+cargo test --release -p burn-gdn2 --features binary-tests --test bit_exact --test test_chunk
+  bit_exact::test_gdn2_1000_cases   1000 cases: max_diff = 1.38e-2, failures = 976/1000
+  test_chunk::test_chunk_vs_reference
+        chunk_size= 4: max_diff = 1.38e-2 FAIL     chunk_size=32: max_diff = 1.38e-2 FAIL
+        chunk_size= 8: max_diff = 1.38e-2 FAIL     chunk_size=64: max_diff = 1.38e-2 FAIL
+        chunk_size=16: max_diff = 1.38e-2 FAIL
+        Chunk all sizes: max_diff = 1.38e-2, failures = 4880
+```
+
+Those are the same figures `vendor/burn-fused/TEST-AUDIT.md` FINDING 0 records
+for 2026-09-27 at snapshot `1fab19e`, to three significant figures. The defect
+is stable, not a flake, and the tolerance is not the problem: 5e-4 is 28× below
+the observed max and the measured f32 transcription noise is 2e-6 to 2e-5.
+
+**One new observation, and it narrows the search.** `max_diff` is *identical*
+(1.38e-2) at chunk sizes 4, 8, 16, 32 and 64 — a 16× range. An error in the
+chunked-WY rewrite, in the triangular inversion, or in the chunk-boundary state
+carry would move when the chunk size moves. An error that is invariant under
+re-chunking is **not in the chunking**: it is per-token or per-projection, which
+is where `TEST-AUDIT.md` already localised it (the short conv's cross-token
+taps, and `fused_recurrent_forward`'s `slice_dim(2, t..t+1)` over the *permuted*
+`[B,HV,T,D]` views). A useful side effect: this **exonerates L2** — the ops
+batched-vs-loop rewrite is not implicated. The one measurement that settles the
+remaining fork is the one `TEST-AUDIT.md` names and nobody has run: print
+`q`/`k`/`v` at `t=1` for case 1 (`T=3`) on both sides. Matching `q/k/v` puts the
+divergence in that slice; differing `q/k/v` puts it in the generator's conv
+tap indexing.
+
+Two further consequences that belong in any decision about this crate:
 
 1. **The only layer that can see `project` currently sees nothing**, because the
    feature is not default and the suite is red. Every run of
