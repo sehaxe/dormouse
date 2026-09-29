@@ -1036,22 +1036,28 @@ Ranked applicability:
   compared two different initialisations and charged the difference to the arm;
   "3 seeds per arm" (§1.2) was not implementable, because all three seeds
   produced different initialisations regardless.
-  **The 409 043 figure is PROSE, NOT A MEASUREMENT — 2026-09-29.** It appears in
-  five files (`AB-PROTOCOL.md:93`, `this section`, `PLAN-2026-09-29.md:198`, and
-  two reviews) and in **no test and no log**. Its cited source, `4b42b6d`,
-  shipped a `device.seed()` call and a comment — 23 lines in one file, no test
-  and no measurement — so the number it is cited for was never produced by
-  anything a reader can re-run. **What IS measured:** `model_seam::two_models_
-  one_seed_are_bit_identical` builds two models from one seed and asserts
-  0 differing bytes *and* that two different seeds do differ. On the CPU
-  backend that test is **green — two models, one seed, bit-identical.** Every
-  parameter reaches `.init(device)` (`model.rs:48-64`), so a 4% residue on CPU
-  has no visible mechanism. Two readings are still open: the figure was taken
-  on CUDA, where the RNG is a different implementation, or it was mistaken.
-  **The cost of not knowing is the whole queue:** `AB-PROTOCOL.md:175` gates
-  the protocol on this going to zero, and no A/B can be trusted while a
-  same-seed repeat may not be the same run. Do not quote 409 043 as measured
-  until something reproduces it.
+  **WITHDRAWN 2026-09-30: "CPU is deterministic" was measured by a test that
+  was measuring itself.** The claim rested on
+  `model_seam::two_models_one_seed_are_bit_identical`, which built the model
+  TWICE and compared. `Device::seed()` **does not rewind a consumed stream**:
+  two fresh devices both seeded 7 draw the same bytes, but re-seeding to 7
+  after the stream has been consumed does not return to the start (measured
+  with a throwaway probe: `a == b` true, `b == c` false). `Device::flex()`
+  hands back a SHARED device, so the second build was never a same-seed build -
+  36 of 54 parameters differ, first at `embedding.weight`. The test went from
+  green to all-65 536-logits-differing overnight with no framework change in
+  between, which is what exposed it. **So: nothing is known about cross-process
+  CPU reproducibility either.** The test now asserts only what is checkable in
+  one process - that two DIFFERENT seeds do not collide - and reports the
+  in-process residue with its reason instead of asserting it away.
+
+  **What is sound:** the trainer seeds ONCE, before any parameter exists, on a
+  process that has drawn nothing (`crates/dormouse-train/src/lib.rs:843`). The
+  rewind problem is about seeding twice in one process, which the trainer does
+  not do. **What is not:** the cross-process measurement, which on CUDA gave
+  0.167 % back-to-back and 12.50 % minutes later (`docs/AB-PROTOCOL.md`), and
+  the 409 043 figure, which exists only as prose in five files and in no test.
+  Do not cite 409 043 as measured by anyone.
 - `DM_QUANT_DEBUG=1` remains the one env var (debug-only, prints every
   `LinearLike` quant format); `CUBECL_AUTOTUNE_LEVEL` is the cubecl runtime's
   own knob, exposed as `--autotune`. Everything else is a typed flag:

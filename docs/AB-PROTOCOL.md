@@ -107,9 +107,12 @@ region would be the same indices every time. The magnitudes are not rounding
 either: median |delta| 3.4e-8 against **max 2.07e+38**.
 
 **Four things: three established, one open.**
-1. **CPU is deterministic.** `model_seam::two_models_one_seed_are_bit_identical`
-   builds two models under one seed, asserts 0 differing bytes AND that two
-   different seeds differ. Green.
+1. ~~**CPU is deterministic.**~~ **WITHDRAWN 2026-09-30.** The claim rested
+   on a test that built the model twice and compared - and `Device::seed()`
+   does not rewind a consumed stream, so the second build was never a same-seed
+   build. Nothing is known about cross-process CPU reproducibility. See
+   `model_seam::seeded_init_is_a_pure_function_of_the_seed_on_a_clean_stream`,
+   which now asserts only that two different seeds do not collide.
 2. **CUDA is not**, and the magnitude depends on WHEN the run happened
    (0.17 % back-to-back, 12.5 % later). That points at machine state — the
    cubecl pool is documented high-water and never frees (`AGENTS.md` §2.2) —
