@@ -308,13 +308,25 @@ fn gate_is_on_the_clamp_min_side() {
 /// one token is the reference's, to within the reference's own measured
 /// sensitivity plus the two-backend disagreement.
 ///
-/// This is what BOUNDS the fix. Change `add_scalar(1e-6)` to
-/// `clamp_min(1e-6)` on lib.rs:234 and this test must still pass unchanged; if
-/// it does not, the fix broke something this file already measured.
+/// This is what BOUNDS the fix, and since 2026-09-29 it is the fix's own gate.
+///
+/// It was written to compare us against the reference's `add` column, on the
+/// stated expectation that switching lib.rs:234 to `clamp_min(1e-6)` would
+/// leave it passing. It did not: the correct column is `gate.out.gate_eps1e5`
+/// (the fixture's generator says so in as many words at
+/// `oracle/gen_engram_oracle.py:254-255` - "gate_eps1e5_add is the column it
+/// is WRONG to match and gate_eps1e5 is the one it is right to"). Comparing a
+/// correct implementation to the column it must not match is a test that
+/// pins the bug, so both this and `the_claim` now compare against `clamp_min`.
 #[test]
 fn the_gate_matches_the_reference_up_to_the_add_divergence() {
     let fx = Fx::load();
     let ours = our_gate(&fx);
+    // The reference's OWN gate: `gate.abs().clamp_min(1e-6).sqrt() * sign`.
+    let clamp = fx.get("gate.out.gate_eps1e5");
+    // The formula we must NOT match, kept so the separation is measured rather
+    // than assumed - if the two columns ever converged this test would be
+    // vacuous, which is what DISCRIM_FACTOR in `the_claim` exists to catch.
     let add = fx.get("gate.out.gate_add_eps1e5");
     let mut checked = 0usize;
     let mut worst: (f64, usize) = (0.0, 0);
@@ -323,26 +335,27 @@ fn the_gate_matches_the_reference_up_to_the_add_divergence() {
             continue;
         }
         checked += 1;
-        let diff = abs_diff(ours[i], add[i]);
+        let diff = abs_diff(ours[i], clamp[i]);
         if diff > worst.0 {
             worst = (diff, i);
         }
         assert!(
             diff <= fx.gate_tol(i),
-            "gate row {i} (|s| = {:e}): ours {} vs the reference's `add` gate \
-             {:.9} = {diff:e}, tolerance {:e} = TOL_GATE + the reference's own \
-             measured sensitivity {:e}",
+            "gate row {i} (|s| = {:e}): ours {} vs the reference's `clamp_min` \
+             gate {:.9} = {diff:e}, tolerance {:e} = TOL_GATE + the reference's \
+             own measured sensitivity {:e}. (The `add` variant there is {:.9}.)",
             fx.get("gate.row.s")[i].abs(),
             ours[i],
-            add[i],
+            clamp[i],
             fx.gate_tol(i),
-            fx.get("gate.row.f32_error")[i]
+            fx.get("gate.row.f32_error")[i],
+            add[i]
         );
     }
     assert!(checked >= 14, "only {checked} resolvable rows; fixture looks truncated");
     let (worst_d, worst_i) = worst;
     eprintln!(
-        "gate vs the reference's `add` gate, {checked} resolvable rows: max \
+        "gate vs the reference's `clamp_min` gate, {checked} resolvable rows: max \
          {worst_d:e} at row {worst_i} (TOL_GATE {TOL_GATE:e} plus per-row sensitivity)"
     );
 }
@@ -692,7 +705,12 @@ fn the_claim() {
     let add = fx.get("gate.out.gate_add_eps1e5");
     let clamp = fx.get("gate.out.gate_eps1e5");
 
-    // (1) Every resolvable row sits on the `add` side, inside its budget.
+    // (1) Every resolvable row sits on the `clamp_min` side - the reference's
+    //     own gate - inside its budget. Until 2026-09-29 this asserted the
+    //     `add` side, which is the bug `gate_is_on_the_clamp_min_side` has
+    //     been red about since 2026-09-28: the claim and the gate named the
+    //     same file and contradicted each other, and the gate was the wrong
+    //     one. Both were fixed together or neither is meaningful.
     let mut checked = 0usize;
     let mut max_residual: f64 = 0.0;
     // (2) The band is inside the resolvable set, so the distinction is
@@ -703,7 +721,7 @@ fn the_claim() {
     for i in 0..ours.len() {
         if fx.resolvable(i) {
             checked += 1;
-            max_residual = max_residual.max(abs_diff(ours[i], add[i]) - fx.gate_tol(i));
+            max_residual = max_residual.max(abs_diff(ours[i], clamp[i]) - fx.gate_tol(i));
         }
         if fx.in_band(i) {
             assert!(

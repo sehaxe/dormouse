@@ -228,10 +228,20 @@ pub fn compute_gate(key: Tensor<3>, query: Tensor<3>, d: usize) -> Tensor<3> {
     let query = query / query_rms;
     let scale = (d as f32).sqrt();
     let dot = (key * query).sum_dim(2).div_scalar(scale);
-    // Official reference (deepseek-ai/Engram, engram_demo_v1.py Engram.forward):
-    //   gate = sigmoid(sqrt(|s| + 1e-6) * sign(s)),  s = dot / sqrt(d)
+    // Official reference (deepseek-ai/Engram, engram_demo_v1.py:371-373, the
+    // copy committed under this crate's tests/oracle/):
+    //   gate = sigmoid(sqrt(|s| clamped to >= 1e-6) * sign(s)), s = dot/sqrt(d)
     // (the plain sigmoid(s) variant diverges for |s| > ~1)
-    let g = dot.clone().abs().add_scalar(1e-6).sqrt().mul(dot.sign());
+    //
+    // CLAMP, NOT ADD. `clamp_min(1e-6)`, not `+ 1e-6` - and the two differ
+    // only just above 1e-6, which is reachable: |s| is bounded by sqrt(D), so
+    // the band is not a fixture choice, it is the only place the formulas are
+    // separable. `add` raises every value below 1e-6 (a negative shift, so it
+    // even moves the sign-adjacent values the wrong way) and leaves everything
+    // above untouched, where `clamp_min` is the identity. Found by
+    // `tests/engram_oracle.rs::gate_is_on_the_clamp_min_side`, which had been
+    // RED since 2026-09-28 and outside the gate until 2026-09-29.
+    let g = dot.clone().abs().clamp_min(1e-6).sqrt().mul(dot.sign());
     activation::sigmoid(g)
 }
 
