@@ -90,8 +90,14 @@ step index, so a seed is a config difference only).
 functions of `(seed, step)` — before that fix two runs with identical flags
 differed in **34 730 605 of 43 725 616 checkpoint bytes**, so every A/B in the
 archive compared two different initialisations and charged the difference to
-the arm. **MEASURED 2026-09-29 ON CUDA, AND IT IS WORSE THAN 4 %.** Three
-zero-step runs of one binary, same flags, `--seed 7`, `small`, batch 2, seq
+the arm. **MEASURED 2026-09-29 ON CUDA — AND SUPERSEDED 2026-09-30 by a
+tensor-level measurement with a self-validating parser (`57237c3`,
+`tools/determinism.py`, `benches/determinism.tsv`).** The table below is kept
+for the record; every number in it was an artifact of measuring slot COUNTS
+and misparsing the file (tensor offsets read from base 0). The count is not a
+distance: the same nominal condition read 0.0000 % … 12.51 % across
+repetitions while relative Frobenius stayed ≤ 1.24e-08. Three zero-step runs
+of one binary, same flags, `--seed 7`, `small`, batch 2, seq
 128, `--no-kda --no-engram`, 8 KB corpus, compared as f32 slots of the
 checkpoint:
 
@@ -113,21 +119,40 @@ either: median |delta| 3.4e-8 against **max 2.07e+38**.
    build. Nothing is known about cross-process CPU reproducibility. See
    `model_seam::seeded_init_is_a_pure_function_of_the_seed_on_a_clean_stream`,
    which now asserts only that two different seeds do not collide.
-2. **CUDA is not**, and the magnitude depends on WHEN the run happened
+2. ~~**CUDA is not**, and the magnitude depends on WHEN the run happened
    (0.17 % back-to-back, 12.5 % later). That points at machine state — the
    cubecl pool is documented high-water and never frees (`AGENTS.md` §2.2) —
-   rather than at a fixed unseeded RNG in the init path.
+   rather than at a fixed unseeded RNG in the init path.~~ **SUPERSEDED
+   2026-09-30 (`57237c3`).** Measured at the tensor level across 42
+   comparisons: **same seed is reproducible cross-process** — relFro
+   ≤ 1.24e-08, max |δ| ≤ 5.9e-07; different seed relFro 1.414 (separation
+   1.1e8×); save→load→save bit-exact; no gap effect (ratio 1.026 between
+   under-200 s and over-800 s pairs). The only movers are the TSCT factors
+   (device-side Householder QR, autotuner-picked summation order) — 13.5 % of
+   the model, ≤ 7.35e-07 at 100 steps, no compounding. The residue observed on
+   09-29 was the slot-COUNT reading plus a file-parsing bug, not machine
+   state.
 3. **409 043 is not reproducible and must not be cited as measured.** It sits
    between two values the same experiment does not produce consistently, and
    its source `4b42b6d` shipped no test.
-4. **OPEN, and it changes the method: the checkpoint FILE is not a sound
+4. ~~**OPEN, and it changes the method: the checkpoint FILE is not a sound
    instrument.** It carries 0–4 NaN slots and ~475–501 slots at |v| >= 1e30,
    mostly at stable indices (475 of ~490 overlap between runs) with a varying
    remainder, so a byte-comparison of two checkpoints measures some of that
-   too. A trustworthy check compares the **tensors**, not the files.
+   too. A trustworthy check compares the **tensors**, not the files.~~
+   **CLOSED 2026-09-30.** The NaN/1e30 observations were the parser bug, not
+   the file: read correctly, all 8 runs carry **0 NaN and 0 slots at
+   |v| ≥ 1e30**. The method conclusion survives on its own merits — compare
+   tensors, not files — and that is exactly what `tools/determinism.py check`
+   does, with a self-validating parser whose guards each have a demonstrated
+   failure.
 
-Until 2 and 4 are closed, two runs under one seed are not the same run and the
-3-seed spread may carry a per-run component.
+**~~Until 2 and 4 are closed, two runs under one seed are not the same run and
+the 3-seed spread may carry a per-run component.~~ CLOSED 2026-09-30.** Two
+runs under one seed ARE the same run to 1.24e-08 relative Frobenius, and the
+cross-seed separation is 1.1e8× wider than the same-seed residue. **The 3-seed
+protocol of §1.2 is implementable as of today**; the per-arm cost stays
+unknown until the smoke run re-prices it (below).
 
 **~~Budget: 2000 steps at ~1.6 s = 53 min per run, so one arm = 2.7 GPU-hours.
 Four arms (control + 3) = ~11 GPU-hours.~~ STRUCK 2026-09-29. The 1.6 s/step

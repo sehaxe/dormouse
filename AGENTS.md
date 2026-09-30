@@ -1079,10 +1079,33 @@ Ranked applicability:
   **What is sound:** the trainer seeds ONCE, before any parameter exists, on a
   process that has drawn nothing (`crates/dormouse-train/src/lib.rs:843`). The
   rewind problem is about seeding twice in one process, which the trainer does
-  not do. **What is not:** the cross-process measurement, which on CUDA gave
-  0.167 % back-to-back and 12.50 % minutes later (`docs/AB-PROTOCOL.md`), and
-  the 409 043 figure, which exists only as prose in five files and in no test.
-  Do not cite 409 043 as measured by anyone.
+  not do.
+  **MEASURED 2026-09-30 (`57237c3`, `tools/determinism.py`, 42 comparisons,
+  tensor-level with a self-validating parser): `--seed` WORKS cross-process.**
+  Same seed, two processes: relative Frobenius ≤ **1.24e-08** (max |δ| ≤ 5.9e-07,
+  ~5 ulp of f32); different seed: relFro **1.414**, 99.92 % of slots move —
+  separation **1.1e8×**. Save→load→save in a fresh process: **bit-exact**.
+  Every tensor that ever moved in 42 comparisons is a **Tsct** tensor: the
+  factors come from a device-side Householder QR whose summation order the
+  cubecl autotuner picks at runtime (`burn-spectral` `qr_householder`,
+  lib.rs:688-715). The 86.5 % of the model outside TSCT never moved at all.
+  **"3 seeds per arm" (§1.2) is therefore implementable** — the gate is
+  `tools/determinism.py` (`benches/determinism.tsv`).
+  **Retracted with it:** the 0.167 % / 12.50 % / "max 2.07e+38" readings and
+  the "0–4 NaN + ~500 slots at |v| ≥ 1e30" file observations — the counts were
+  never a distance (the same nominal condition read 0.0000 % … 12.51 % across
+  repetitions while relFro stayed ≤ 1.24e-08), the gap effect did not survive
+  (≤200 s vs >800 s: ratio 1.026), and the NaN/1e30 figures were a parser bug
+  reading tensor offsets from base 0 (correctly read: 0 and 0, all 8 runs).
+  The 409 043 figure stays banned: prose in five files, no test, never.
+  Open, named not implied: the ladder stops at 100 steps; and a 20-step
+  anomaly where `aux.jepa_pred.norm.beta` and `loop_block.iter_embed` move
+  2–4 orders more than everything else, in both runs of the pair, absent at
+  0/50/100 — unexplained. Follow-up (owner decision, init-path numerics):
+  seed the TSCT factors directly instead of QR-ing on device, which would
+  make a bit-exact cross-process golden possible.
+  Gap effect, for the record: pairs grouped by wall-clock distance — under
+  200 s: relFro 1.088e-08; over 800 s: 1.116e-08; ratio 1.026. No gap effect.
 - **TWO NEWTON-SCHULZ COEFFICIENT SETS, ONE PAPER — found 2026-09-30, and
   the brief that caused the finding was wrong.** `burn-spectral` hardcodes the
   **PolarExpress** triple `(15/8, −5/4, 3/8) = (1.875, −1.25, 0.375)` twice
