@@ -42,6 +42,7 @@ Usage:  tools/oracle_gate.py [--verbose] [--scope burn-kda,burn-gdn2]
 """
 
 import os
+import pathlib
 import re
 import sys
 
@@ -51,7 +52,14 @@ CRATES = os.path.join(ROOT, "vendor", "burn-fused", "crates")
 # burn-rmsnorm joined the scope when `tests/rmsnorm_oracle.rs` landed: it is the
 # tree's first tier-(a) row, and a registry row nothing scans is a row that
 # cannot fail. Widening the scope is what makes its R1/R2/R3 checks live.
-DEFAULT_SCOPE = ("burn-kda", "burn-gdn2", "burn-rmsnorm")
+# SCOPE WAS 3 CRATES OF 20, WHICH MADE "0 violations" MEAN ALMOST NOTHING.
+# Measured 2026-09-30: 17 crates had ZERO rows, including burn-engram - whose
+# oracle is the most complete in the tree, and whose gate was red for a month
+# before anything could see it - plus burn-spectral, burn-muon-plus and
+# burn-dspark. Scope is now every crate under vendor/burn-fused/crates, so an
+# unregistered test anywhere is a failure rather than a fact nobody scans.
+_CRATES = pathlib.Path(__file__).resolve().parent.parent / "vendor" / "burn-fused" / "crates"
+DEFAULT_SCOPE = tuple(sorted(p.name for p in _CRATES.iterdir() if p.is_dir()))
 
 # Requires a hyphen or a space, so a BARE `bitforbit` (the burn-kda example
 # binary's name) is not itself read as a claim. A filename mention is not a
