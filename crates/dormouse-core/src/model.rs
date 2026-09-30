@@ -7,7 +7,7 @@ use burn_rmsnorm::RMSNorm;
 
 use crate::aux::AuxHeads;
 use crate::config::DormouseConfig;
-use crate::loop_block::LoopBlock;
+use crate::loop_block::{LoopBlock, RouteAux};
 use crate::param::LinearLike;
 
 #[derive(Module, Debug)]
@@ -46,6 +46,13 @@ pub struct DormouseModel {
     /// the arm off there is nothing to weight.
     #[module(skip)]
     pub mor_bce_weight: f32,
+    /// Load-balancing coefficient for the sparse-routing arm (`moe::lb_aux`).
+    /// 0.0 = off, and the only legal non-zero position is with `moe_topk > 0`
+    /// - `config::validate` refuses the combination rather than ignoring the
+    /// term. Deliberately NOT a large-MoE default: see
+    /// `config::schema::moe_lb_coef`.
+    #[module(skip)]
+    pub moe_lb_coef: f32,
     #[module(skip)]
     pub max_seq_len: usize,
 }
@@ -77,6 +84,7 @@ impl DormouseModel {
             aux_fb_weight: cfg.aux_fb_weight,
             aux_fb_horizon: cfg.aux_fb_horizon,
             mor_bce_weight: cfg.mor_bce_weight,
+            moe_lb_coef: cfg.moe_lb_coef,
             max_seq_len: cfg.max_seq_len,
         }
     }
@@ -113,7 +121,7 @@ impl DormouseModel {
         } else {
             x
         };
-        let (out_acc, _rec, _kda, _mor) = self.loop_block.forward_full_state::<B>(
+        let (out_acc, _rec, _kda, _route) = self.loop_block.forward_full_state::<B>(
             x, hashed_ids, host_rows, None, None, &self.lm_head,
         );
         out_acc
@@ -235,7 +243,7 @@ impl DormouseModel {
         // served off the label indices the loop consumed. [b,t] int64, 40 KB at
         // batch 10 x 512 - noise next to the [b,t,d] forward it feeds.
         let tgt = targets.clone().map(|tg| tg.reshape([b * t, 1]));
-        let (out_acc, rec, kda, mor_aux) =
+        let (out_acc, rec, kda, route) =
             self.loop_block
                 .forward_full_state::<B>(x, hashed_ids, host_rows, None, tgt, &self.lm_head);
         // loop activations may be bf16; the final norm+head compute in fp32
@@ -249,7 +257,7 @@ impl DormouseModel {
             .lm_head
             .forward::<B>(h.clone().reshape([b * t, self.d_model]))
             .reshape([b, t, self.vocab_size]);
-        let aux = self.aux_loss::<B>(&out_acc, teacher_latent, ids_raw, targets, &h, &logits, mor_aux);
+        let aux = self.aux_loss::<B>(&out_acc, teacher_latent, ids_raw, targets, &h, &logits, &route);
         (logits, rec, kda, aux)
     }
 
@@ -270,7 +278,7 @@ impl DormouseModel {
         targets: Option<Tensor<2, Int>>,
         h: &Tensor<3>,
         logits: &Tensor<3>,
-        mor_aux: Option<Tensor<1>>,
+        route: &RouteAux,
     ) -> Option<Tensor<1>>
     where
         DispatchTensor: DispatchKindConversion<B>
@@ -285,7 +293,14 @@ impl DormouseModel {
         // The future-byte head is its own way in and shares nothing with
         // `any`: it needs no teacher, no `dspark_k`, and its own counter.
         let fb = self.aux_fb_weight > 0.0;
-        if !any && !mor && !fb {
+        // The routing balancer, likewise. Gated on the WEIGHT here and on the
+        // ARM there (`RouteAux.moe_lb` is `None` unless `moe_topk > 0`), so a
+        // weight with no selection cannot produce a term - and the counter is
+        // bumped where the term is added, never where the weight is declared
+        // (the `probe::JEPA` defect: a counter bumped nowhere made the arm
+        // look alive while it contributed nothing).
+        let moe = self.moe_lb_coef > 0.0;
+        if !any && !mor && !fb && !moe {
             return None;
         }
         let ids = ids?;
@@ -294,9 +309,17 @@ impl DormouseModel {
         let mut total: Option<Tensor<1>> = None;
         // MoR first: the router's own BCE against its top-k recomputed on this
         // batch, the one auxiliary the MoR arm has under a pure-CE recipe.
-        if let Some(m) = mor_aux {
+        if let Some(m) = route.mor.clone() {
             crate::probe::note(crate::probe::MOR_BCE);
             total = Some(m.mul_scalar(self.mor_bce_weight)
+                + total.unwrap_or_else(|| Tensor::zeros([1], &dev)));
+        }
+        // The sparse-routing balancer: Switch/GShard's `E * sum f_e P_e`, which
+        // is 1 at uniform routing and E at collapse. Weighted HERE rather than
+        // in the loop block, with every other auxiliary weight.
+        if let Some(lb) = route.moe_lb.clone() {
+            crate::probe::note(crate::probe::MOE_LB);
+            total = Some(lb.mul_scalar(self.moe_lb_coef)
                 + total.unwrap_or_else(|| Tensor::zeros([1], &dev)));
         }
         if self.jepa_weight > 0.0 {
