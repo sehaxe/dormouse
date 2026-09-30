@@ -229,3 +229,13 @@ torchao, а ожидаемые значения в юнит-тесте испр�
 существующих запусков burn. Попутно: ns=5 vs 8, подтверждение retract-4.
 Ожидание: launch-bound 87% простоя — потенциал кратный, но v1 может дать и
 null с инструментальным доказательством — это тоже результат.
+
+## НОВЫЕ РУКИ ИЗ АРСЕНАЛА (2026-09-30 ~21:50, инвентаризация vendor)
+- **arm-MHC**: burn-mhc (Manifold-Constrained Hyper-Connections) — φ-рычаг 0.46→0.65
+  (2604.21106), крейт готов → ПОДНЯТЬ над hand-written input injection
+- **arm-ROPE**: burn-rope — проверить наличие RoPE в KDA-руке; без него пост-тренинг
+  ломается (Qwen3.8 §3.5). Один grep — сделать СЕЙЧАС
+- **arm-SWIGLU**: burn-swiglu — FFN-альтернатива, A/B против TSCT-активатора
+- **arm-PARCAE**: burn-parcae (spectral retention looping) — рука стабильности против
+  NaN-класса при оверфите
+- eggroll/es/ptrn — фаза self-evolve/SFT, НЕ претрейн; sct — уже внутри spectral
