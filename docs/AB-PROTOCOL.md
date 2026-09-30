@@ -123,15 +123,17 @@ either: median |delta| 3.4e-8 against **max 2.07e+38**.
    (0.17 % back-to-back, 12.5 % later). That points at machine state — the
    cubecl pool is documented high-water and never frees (`AGENTS.md` §2.2) —
    rather than at a fixed unseeded RNG in the init path.~~ **SUPERSEDED
-   2026-09-30 (`57237c3`).** Measured at the tensor level across 42
-   comparisons: **same seed is reproducible cross-process** — relFro
-   ≤ 1.24e-08, max |δ| ≤ 5.9e-07; different seed relFro 1.414 (separation
-   1.1e8×); save→load→save bit-exact; no gap effect (ratio 1.026 between
-   under-200 s and over-800 s pairs). The only movers are the TSCT factors
-   (device-side Householder QR, autotuner-picked summation order) — 13.5 % of
-   the model, ≤ 7.35e-07 at 100 steps, no compounding. The residue observed on
-   09-29 was the slot-COUNT reading plus a file-parsing bug, not machine
-   state.
+   2026-09-30 by two tensor-level instruments (`57237c3`, `58281c8`..`8da23bb`,
+   `tools/determinism/`).** Same seed across processes: all non-TSCT slots
+   bit-identical, TSCT factors ≤ 1.04e-06 relative (effective W), one pair
+   bit-identical at 860 s; different seed relFro 1.414–1.415 — separation
+   ~10⁶; no wall-clock gap effect (ratio 1.026). The seeded RNG stream is
+   proven correct (direct draws bit-identical across 9 processes). The
+   residue is nondeterministic reductions in `qr_householder`
+   (`burn-spectral/src/lib.rs:697-714`), entered at a random iteration —
+   13.5 % of the model, a §1.3 violation carried openly, not machine state
+   and not an unseeded draw. Compounding bound: 20 steps (the 50/100 rows
+   never ran).
 3. **409 043 is not reproducible and must not be cited as measured.** It sits
    between two values the same experiment does not produce consistently, and
    its source `4b42b6d` shipped no test.

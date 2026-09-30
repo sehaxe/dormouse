@@ -1080,32 +1080,40 @@ Ranked applicability:
   process that has drawn nothing (`crates/dormouse-train/src/lib.rs:843`). The
   rewind problem is about seeding twice in one process, which the trainer does
   not do.
-  **MEASURED 2026-09-30 (`57237c3`, `tools/determinism.py`, 42 comparisons,
-  tensor-level with a self-validating parser): `--seed` WORKS cross-process.**
-  Same seed, two processes: relative Frobenius ≤ **1.24e-08** (max |δ| ≤ 5.9e-07,
-  ~5 ulp of f32); different seed: relFro **1.414**, 99.92 % of slots move —
-  separation **1.1e8×**. Save→load→save in a fresh process: **bit-exact**.
-  Every tensor that ever moved in 42 comparisons is a **Tsct** tensor: the
-  factors come from a device-side Householder QR whose summation order the
-  cubecl autotuner picks at runtime (`burn-spectral` `qr_householder`,
-  lib.rs:688-715). The 86.5 % of the model outside TSCT never moved at all.
-  **"3 seeds per arm" (§1.2) is therefore implementable** — the gate is
-  `tools/determinism.py` (`benches/determinism.tsv`).
+  **MEASURED 2026-09-30 (`57237c3` + `58281c8`..`8da23bb` — TWO independent
+  instruments on this lane, tensor-level, self-validating parsers):
+  `--seed` WORKS cross-process.** Same seed, two processes: every non-TSCT
+  slot bit-identical (7 951 694 of 7 951 694), and one pair was bit-identical
+  at 860 s apart; the only movers are the TSCT factors, ≤ **1.04e-06**
+  relative on the effective weight `U·diag(s)·Vᵀ` (one instrument read
+  ≤ 1.24e-08 per-factor). Different seed: relFro **1.414–1.415**, 99.92 % of
+  slots — separation **~10⁶**. Save→load→save is bit-exact at the TENSOR
+  level; a FILE can never be byte-equal across processes (`ParamId` is a
+  process-global counter — two runs can share a data-section sha256 while
+  their records differ). The seeded RNG stream is **provably correct**:
+  7 951 694 direct-draw slots bit-identical across 9 processes. The TSCT
+  residue enters `qr_householder` (`burn-spectral/src/lib.rs:689`) at a
+  **random iteration** (0…55, median 2, 139/360 pairs fully identical); the
+  measured mechanism is nondeterministic reductions at `lib.rs:697, :704,
+  :711, :714` — the autotuner attribution is the recorded HYPOTHESIS, not
+  measured. This is a §1.3 violation at those four lines, carried openly.
+  **"3 seeds per arm" (§1.2) is therefore implementable** — gates:
+  `tools/determinism.py`, harness `tools/determinism/`.
   **Retracted with it:** the 0.167 % / 12.50 % / "max 2.07e+38" readings and
-  the "0–4 NaN + ~500 slots at |v| ≥ 1e30" file observations — the counts were
-  never a distance (the same nominal condition read 0.0000 % … 12.51 % across
-  repetitions while relFro stayed ≤ 1.24e-08), the gap effect did not survive
-  (≤200 s vs >800 s: ratio 1.026), and the NaN/1e30 figures were a parser bug
-  reading tensor offsets from base 0 (correctly read: 0 and 0, all 8 runs).
-  The 409 043 figure stays banned: prose in five files, no test, never.
-  Open, named not implied: the ladder stops at 100 steps; and a 20-step
-  anomaly where `aux.jepa_pred.norm.beta` and `loop_block.iter_embed` move
-  2–4 orders more than everything else, in both runs of the pair, absent at
-  0/50/100 — unexplained. Follow-up (owner decision, init-path numerics):
-  seed the TSCT factors directly instead of QR-ing on device, which would
-  make a bit-exact cross-process golden possible.
-  Gap effect, for the record: pairs grouped by wall-clock distance — under
-  200 s: relFro 1.088e-08; over 800 s: 1.116e-08; ratio 1.026. No gap effect.
+  the "0–4 NaN + ~500 slots at |v| ≥ 1e30" file observations — the counts
+  were never a distance (the same nominal condition read 0.0000 % … 12.51 %
+  across repetitions), the gap effect did not survive (≤200 s vs >800 s:
+  ratio 1.026), the 1e30 slots were **inter-tensor padding, zero inside any
+  named tensor**, and the 409 043 figure stays banned.
+  **Compounding: honest bound is 20 steps** — the first instrument's 50/100
+  ladder rows never ran (both runs died at step 0 under GPU contention; their
+  checkpoints are step-0 artifacts, caught by the second instrument from the
+  files themselves: header step 0, no `m.prev.bin`). The "20-step anomaly"
+  (`aux.jepa_pred.norm.beta`, `iter_embed`) is monotone float chaos seeded by
+  the 1-ULP QR difference, not an anomaly — dropped.
+  Follow-up (owner decision, init-path numerics): make TSCT init
+  deterministic (host-side QR or direct seeding) — also clears the §1.3
+  violation.
 - **TWO NEWTON-SCHULZ COEFFICIENT SETS, ONE PAPER — found 2026-09-30, and
   the brief that caused the finding was wrong.** `burn-spectral` hardcodes the
   **PolarExpress** triple `(15/8, −5/4, 3/8) = (1.875, −1.25, 0.375)` twice
