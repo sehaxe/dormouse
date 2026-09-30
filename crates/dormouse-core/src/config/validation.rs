@@ -82,6 +82,18 @@ pub fn validate(c: &DormouseConfig) -> Result<(), String> {
     if !(c.engram_lam_max > 0.0 && c.engram_lam_max <= 1.0) {
         return Err("engram_lam_max must be in (0, 1]: 0 would delete the arm, >1 is not a floor".into());
     }
+    // AttnRes and Gated Residual both REPLACE the residual accumulation, in
+    // the same statement of the loop (the `else` chain in `forward_full_state`).
+    // Both on is not a configuration with an interpretation: one of them would
+    // be silently ignored, and the reader of the run's log would have no way to
+    // tell which. Refused here, where the escape can be named (ADR-0011).
+    if c.use_attnres && c.use_gr {
+        return Err(
+            "use_attnres and use_gr both replace the loop's residual accumulation and only one \
+             can run: use_attnres = false (AttnRes vs ReZero) or use_gr = false (GR vs ReZero)."
+                .into(),
+        );
+    }
     Ok(())
 }
 

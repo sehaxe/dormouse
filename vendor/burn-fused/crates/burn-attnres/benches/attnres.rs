@@ -6,20 +6,28 @@
 //! absent and the ratio is ~1x - the harness itself is still validated.
 
 use burn::tensor::{activation, Distribution, Tensor};
-use burn_attnres::depth_attend;
+use burn_attnres::{depth_attend, ScoreForm};
 
 /// The naive 8-pass reference the fused path replaces (same math as
-/// `depth_attend`'s tensor fallback).
+/// `depth_attend`'s tensor fallback, in the DEFAULT score form - Eq. 2's
+/// unscaled `q . RMSNorm(h)`, so the ratio measures the launch count and not
+/// a difference of formulas).
 fn ref_depth_attend(history: &[Tensor<3>], query: &Tensor<1>) -> Tensor<3> {
     let n = history.len();
     let [b, t, d] = history[0].dims();
-    let scale = (d as f64).powf(-0.5);
+    let form = ScoreForm::default();
+    let scale = form.scale(d);
     let stacked: Vec<Tensor<4>> = history
         .iter()
         .map(|h| h.clone().unsqueeze_dim::<4>(0))
         .collect();
     let h_stack = Tensor::cat(stacked, 0);
-    let h_norm_sq = h_stack.clone().powf_scalar(2.0).sum_dim(3).add_scalar(1e-5);
+    let h_norm_sq = h_stack
+        .clone()
+        .powf_scalar(2.0)
+        .sum_dim(3)
+        .mul_scalar(form.norm_m(d))
+        .add_scalar(1e-5);
     let h_norm = h_stack.clone() / h_norm_sq.sqrt().reshape([n, b, t, 1usize]);
     let q = query.clone().reshape([1, 1, 1, d]);
     let scores = (q * h_norm).sum_dim(3).mul_scalar(scale);

@@ -106,6 +106,20 @@ pub struct DormouseConfig {
     #[serde(default = "d_true")] pub use_tsct: bool,
     #[serde(default = "d_true")] pub use_engram: bool,
     #[serde(default)] pub use_gr: bool,
+    /// Attention Residuals (arXiv:2603.15031), the learned replacement for the
+    /// loop's residual accumulation: the state after iteration `n` becomes a
+    /// softmax mixture over the token embedding and the block-body outputs of
+    /// iterations `0..=n`, with one learned pseudo-query per iteration slot
+    /// (`w_l`, §5). OFF by default, like `use_gr`, for checkpoint
+    /// compatibility - the arm's `d_model`-wide query vectors only exist when
+    /// it is on, so every existing checkpoint loads unchanged.
+    ///
+    /// Score convention: the paper's, `q . RMSNorm(k)` with no temperature -
+    /// `burn_attnres::ScoreForm::default()` is `Paper`. A `SqrtD` option
+    /// exists in the crate so the temperature is a nameable A/B rather than an
+    /// accident, but it is not wired to a config field: the first A/B this
+    /// arm needs is AttnRes vs ReZero, not AttnRes vs AttnRes.
+    #[serde(default)] pub use_attnres: bool,
     #[serde(default = "d_n_experts")] pub n_experts: usize,
     #[serde(default = "d_jepa_weight")] pub jepa_weight: f32,
     #[serde(default = "d_jepa_mask_frac")] pub jepa_mask_frac: f32,

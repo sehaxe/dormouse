@@ -33,26 +33,35 @@ pub const JEPA: usize = 7;
 pub const DSPARK: usize = 8;
 /// The MoR router BCE was added.
 pub const MOR_BCE: usize = 9;
+/// Attention Residuals replaced the residual accumulation (arXiv:2603.15031):
+/// one entry per loop iteration that ran the softmax-over-depth aggregation
+/// instead of the ReZero write. COUNTED, not implied: a config that says
+/// `use_attnres = true` and a loop that never reaches the arm are the same
+/// run as far as the loss curve is concerned, and nothing else on the eval
+/// line would say so.
+pub const ATTNRES: usize = 10;
 /// TSCT retraction, per-factor arm: one host-syncing `polar_orthogonalize`
 /// per factor. This is what ran in production until 2026-09-29 and it is
 /// still the default.
-pub const RETRACT_FACTOR: usize = 10;
+pub const RETRACT_FACTOR: usize = 11;
 /// TSCT retraction, grouped arm: `burn_spectral::retract_batched`, sync-free
 /// per shape group (`--retract-batched`). Counted because a fallback here is
 /// invisible in every other number: the batched arm computes the same
 /// matrices, so a run that silently took the slow arm prints the same loss.
-pub const RETRACT_BATCHED: usize = 11;
+pub const RETRACT_BATCHED: usize = 12;
 /// The future-byte auxiliary term was COMPUTED and added. Distinct from
 /// [`FUTURE_BYTE_ASKED`] because a horizon at or past the sequence length
 /// leaves zero valid positions: the arm is asked for, produces a real zero,
 /// and the printed `fb=<ran>/<asked>` is the only place a reader learns a
 /// 2k-step A/B was 2k steps of nothing.
-pub const FUTURE_BYTE: usize = 12;
+pub const FUTURE_BYTE: usize = 13;
 /// The future-byte arm was ENTERED with a non-zero weight. The `asked` half of
 /// `fb=<ran>/<asked>`; ADR-0019 COUNTED, so `0/<n>` on the eval line means the
 /// head was never reached rather than "the arm is off".
-pub const FUTURE_BYTE_ASKED: usize = 13;
-pub const N_ARMS: usize = 14;
+pub const FUTURE_BYTE_ASKED: usize = 14;
+pub const N_ARMS: usize = 15;
+pub const RETRACT_BATCHED: usize = 12;
+pub const N_ARMS: usize = 15;
 /// Arm name per index, for assertion messages that name the thing.
 pub const NAMES: [&str; N_ARMS] = [
     "iterations",
@@ -65,6 +74,7 @@ pub const NAMES: [&str; N_ARMS] = [
     "jepa",
     "dspark",
     "mor_bce",
+    "attnres",
     "retract_factor",
     "retract_batched",
     "future_byte",

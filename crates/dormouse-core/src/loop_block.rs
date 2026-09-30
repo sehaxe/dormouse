@@ -6,6 +6,7 @@ use burn::backend::DispatchKindConversion;
 use burn::module::{Module, Param};
 use burn::nn::{Linear, LinearConfig};
 use burn::tensor::{activation, Device, DispatchTensor, FloatDType, Int, Tensor};
+use burn_attnres::{depth_attend, AttnRes};
 use burn_engram::EngramModule;
 use burn_rmsnorm::RMSNorm;
 
@@ -94,6 +95,13 @@ pub struct LoopBlock {
     pub mem_dense: Linear,
     pub norm: RMSNorm,
     pub gr: Option<GatedResidual>,
+    /// Attention Residuals (arXiv:2603.15031): one learned pseudo-query `w_l`
+    /// per loop iteration slot (§5, "one RMSNorm and one pseudo-query vector
+    /// per layer"), zero-initialised so the first forward is an equal-weight
+    /// average. `None` unless `use_attnres`, which is what keeps every
+    /// existing checkpoint loadable: the parameters do not exist when the arm
+    /// is off, and the config snapshot refuses a resume that flips the flag.
+    pub attnres: Option<Vec<AttnRes>>,
     pub iter_embed: burn::module::Param<Tensor<2>>,
     pub residual_scale: burn::module::Param<Tensor<1>>,
     pub out_proj: LinearLike,
@@ -121,6 +129,10 @@ pub struct LoopBlock {
     pub depth_override: Option<usize>,
     #[module(skip)]
     pub use_engram: bool,
+    /// Read [`LoopBlock::attnres`]. Kept as a plain field (not `attnres.is_some()`)
+    /// so the branch is a config constant, like every other arm switch.
+    #[module(skip)]
+    pub use_attnres: bool,
     /// MoR routing arm (arXiv 2507.10524). Off by default; the fixed-depth
     /// mean readout is the default path.
     #[module(skip)]
@@ -216,6 +228,13 @@ impl LoopBlock {
             mem_dense: LinearConfig::new(d, d).with_bias(false).init(device),
             norm: RMSNorm::new(d, cfg.norm_eps, device),
             gr: cfg.use_gr.then(|| GatedResidual::new(d, device)),
+            // One pseudo-query per iteration slot. `ScoreForm` is left at its
+            // default, which IS the paper's: `q . RMSNorm(k)`, no temperature
+            // (arXiv:2603.15031 Eq. 2). Spelled out here because this is the
+            // line a reader checks to know which function the arm computes.
+            attnres: cfg
+                .use_attnres
+                .then(|| (0..cfg.max_iter).map(|_| AttnRes::new(d, device)).collect()),
             iter_embed,
             // ReZero's residual coefficient starts at 1 (identity init), NOT 0:
             // at 0 the block body contributes nothing AND its gradient is
@@ -232,6 +251,7 @@ impl LoopBlock {
             use_kda: cfg.use_kda,
             depth_override: None,
             use_engram: cfg.use_engram,
+            use_attnres: cfg.use_attnres,
             use_mor: cfg.use_mor,
             mor_k: cfg.mor_k,
             engram_slot_mask: mask,
@@ -267,6 +287,12 @@ impl LoopBlock {
         // embedding. The read is also re-taken after every write, which is
         // what makes the readout see the current iteration's deposit.
         let use_gr = self.gr.is_some();
+        let use_attnres = self.use_attnres;
+        assert!(
+            !(use_attnres && use_gr),
+            "use_attnres and use_gr both replace the residual accumulation; \
+             config::validate refuses this combination"
+        );
         let mut branches: Vec<Tensor<3>> = if use_gr {
             vec![h0.clone(); GR_BRANCHES]
         } else {
@@ -282,6 +308,12 @@ impl LoopBlock {
         } else {
             None
         };
+        // ATTNRES SOURCES (Eq. 3): `b_0 = h_1` is the token embedding and is a
+        // source of its own right, permanently - never summed into a later
+        // block. The rest of the vector is this loop's block-body outputs
+        // `f_i(h_i)`, one per executed iteration. Empty when the arm is off, so
+        // the default path allocates nothing for it.
+        let mut res: Vec<Tensor<3>> = if use_attnres { vec![h0.clone()] } else { Vec::new() };
         let mut kda_s: Option<Tensor<4>> = kda_state;
         // Fixed depth (ADR-0013): out_acc averages the per-iteration outputs.
         let mut out_acc = Tensor::<3>::zeros([b, t, d], &h.device());
@@ -326,6 +358,16 @@ impl LoopBlock {
         for iter in 0..iters {
             crate::probe::note(crate::probe::ITER);
             let row = iter;
+            // This slot's pseudo-query `w_l` (§5: one per layer). Read once
+            // per iteration, before the block body, so the query is a
+            // function of the slot and not of anything computed this step.
+            let slot_query = match use_attnres {
+                true => self.attnres.as_ref().expect("use_attnres => attnres")[row]
+                    .query
+                    .val()
+                    .clone(),
+                false => Tensor::<1>::zeros([d], &h.device()),
+            };
             let iter_ctx = self
                 .iter_embed
                 .val()
@@ -481,9 +523,27 @@ impl LoopBlock {
             }
             let ffn = ffn.mul(w_ffn).reshape([b, t, d]);
 
-            // ReZero residual (or GR write: per-branch scalar deposit, Eq. 33-34).
+            // ReZero residual, AttnRes aggregation, or GR write (per-branch
+            // scalar deposit, Eq. 33-34). These are three spellings of ONE
+            // statement - how iteration n's block-body output joins the
+            // residual stream - and `config::validate` refuses the two that
+            // cannot both run.
             let y = attn.reshape([b, t, d]) + engram_a.reshape([b, t, d]) + ffn;
-            if use_gr {
+            if use_attnres {
+                crate::probe::note(crate::probe::ATTNRES);
+                // Eq. 1/3/4: sources are the token embedding `b_0 = h_1` plus
+                // every layer output `f_i(h_i)` so far, INCLUDING this
+                // iteration's. The state that comes out is the state the
+                // readout reads and the next iteration consumes, so the
+                // loop's body still reaches its own CE at every depth - the
+                // placement that avoids the depth-(iters-1) model GR had.
+                //
+                // The history is a `Vec<Tensor<3>>` and never a `[N,b,t,d]`
+                // stack: dynamic slicing of a 4D autodiff tensor crashes
+                // cubecl on sm_120 (AGENTS.md 2.2), and `max_iter` is 2-4.
+                res.push(y.clone());
+                h = depth_attend(&res, slot_query);
+            } else if use_gr {
                 crate::probe::note(crate::probe::GR);
                 let gr = self.gr.as_ref().unwrap();
                 branches = gr.write::<B>(&branches, gr_state.as_ref().unwrap(), y);
@@ -497,7 +557,7 @@ impl LoopBlock {
                 let (x_next, st) = gr.read::<B>(&branches);
                 gr_state = Some(st);
                 h = x_next;
-            } else {
+            } else if !use_attnres {
                 let scale = self.residual_scale.val().clone().reshape([1, 1, 1]);
                 // Store the residual back in the activation dtype (bf16
                 // under --bf16): the sum itself is computed in fp32.
@@ -616,10 +676,28 @@ impl LoopBlock {
 mod tests {
     use super::*;
     use crate::config::DormouseConfig;
-    use burn::tensor::Device;
+    use burn::tensor::{Device, Distribution};
 
     fn dev() -> Device {
         Device::flex()
+    }
+
+    /// The backend the loop's `B: AutodiffBackend` is instantiated on: the CPU
+    /// (flex) backend under the dispatch layer, with the SAME checkpointing
+    /// strategy the trainer uses. `Device::flex()` alone would not satisfy the
+    /// bound, and picking `NoCheckpointing` here would test a backend the
+    /// trainer never runs.
+    type B = burn::backend::autodiff::Autodiff<
+        burn::backend::Flex,
+        burn::backend::autodiff::checkpoint::strategy::BalancedCheckpointing,
+    >;
+
+    /// The device the tests build on: the CPU backend under the dispatch layer,
+    /// so a tensor handed to `forward_full_state` has the same shape the
+    /// trainer's does.
+    #[allow(deprecated)]
+    fn adev() -> Device {
+        dev().autodiff()
     }
 
     /// Recover the mixture coefficient `a` in `out = a*mem + (1-a)*dense`
@@ -663,6 +741,194 @@ mod tests {
         let out = memory_floor_mix(t(mem), t(dense), t(1.0), 1.0);
         let a = recover_a(&out, mem, dense);
         assert!((a - 1.0).abs() < 1e-5, "lam_max=1 must be a pure memory read, got {a}");
+    }
+
+    /// ATTNRES: the readout MUST move when the aggregation changes, or the
+    /// arm ran and did nothing - which is what GR's 9b343d3 defect was (the
+    /// readout was taken from the state BEFORE the write, so the body was
+    /// computed and discarded at depth 1).
+    #[test]
+    fn attnres_moves_the_readout_at_every_depth() {
+        for depth in [1usize, 2, 3] {
+            let mut cfg = DormouseConfig::default();
+            cfg.d_model = 32;
+            cfg.n_heads = 2;
+            cfg.head_dim = 16;
+            cfg.d_ffn = 64;
+            cfg.max_iter = depth;
+            cfg.n_experts = 1;
+            cfg.rank = 8;
+            cfg.engram_rows = 256;
+            cfg.use_kda = false;
+            cfg.use_engram = false;
+            let mut plain = LoopBlock::new(&cfg, &adev());
+            let mut ar = LoopBlock::new(&DormouseConfig { use_attnres: true, ..cfg.clone() }, &adev());
+            let [b, t, d] = [2usize, 5, 32];
+            let x = Tensor::<3>::random([b, t, d], Distribution::Normal(0.0, 1.0), &adev());
+            let head = LinearLike::with_tsct(d, 16, 8, cfg.use_tsct, &adev());
+            let (o_rezero, _, _, _) =
+                plain.forward_full_state::<B>(x.clone(), None, None, None, None, &head);
+            let (o_attnres, _, _, _) =
+                ar.forward_full_state::<B>(x, None, None, None, None, &head);
+            let diff = (o_rezero - o_attnres).abs().max().into_scalar::<f32>();
+            assert!(
+                diff > 1e-6,
+                "depth {depth}: AttnRes changed no output (max {diff:.3e}) - the \
+                 aggregation would be running and being discarded, the GR defect"
+            );
+        }
+    }
+
+    /// §5's init invariant, ON THE MODEL: zero-initialised pseudo-queries make
+    /// the first AttnRes an EQUAL-WEIGHT AVERAGE of the embedding and the
+    /// block-body outputs, which is the property that makes the arm a
+    /// drop-in at step 0. Checked at depth 2 by recovering the mixture from
+    /// the run, not by reading the initializer.
+    #[test]
+    fn attnres_at_init_is_a_uniform_average_of_its_sources() {
+        let mut cfg = DormouseConfig::default();
+        cfg.d_model = 32;
+        cfg.n_heads = 2;
+        cfg.head_dim = 16;
+        cfg.d_ffn = 64;
+        cfg.max_iter = 1;
+        cfg.n_experts = 1;
+        cfg.rank = 8;
+        cfg.engram_rows = 256;
+        cfg.use_kda = false;
+        cfg.use_engram = false;
+        let ar = LoopBlock::new(&DormouseConfig { use_attnres: true, ..cfg.clone() }, &adev());
+        // Pin the zero init: if a future change randomizes the query, the
+        // uniform-average property is gone and the arm no longer starts where
+        // the paper says it starts. Every component, so a partially-zeroed
+        // vector is red too.
+        let q = ar.attnres.as_ref().expect("arm on")[0].query.val().clone();
+        let worst = q.abs().max().into_scalar::<f32>();
+        assert_eq!(worst, 0.0, "w_l must be zero-initialized (§5): uniform alpha at init");
+    }
+
+    /// THE FORM THE ARM WAS BUILT WITH — and this gate exists because the
+    /// falsification run found it missing.
+    ///
+    /// Perturbing `LoopBlock::new` to build `AttnRes::with_form(.., SqrtD)`
+    /// turned **every other gate in this file green**: the readout moved
+    /// (both forms move it), the counter fired (both aggregate), the init was
+    /// uniform (at `w_l = 0` every score is 0, so the temperature multiplies
+    /// into nothing). The model's own gates are structurally blind to the
+    /// score convention, because the convention only enters through a query
+    /// that starts at zero. The number is pinned in `burn-attnres`
+    /// (`paper_form_has_no_temperature_and_this_is_pinned`, literals
+    /// 0.9820138 / 0.7310586); this asserts the model is wired to the one
+    /// those literals describe — the link between the two files, and the
+    /// half that was missing.
+    #[test]
+    fn attnres_is_built_in_the_papers_score_form() {
+        let mut cfg = DormouseConfig::default();
+        cfg.d_model = 32;
+        cfg.max_iter = 2;
+        let on = LoopBlock::new(&DormouseConfig { use_attnres: true, ..cfg }, &adev());
+        for (i, a) in on.attnres.as_ref().expect("arm on").iter().enumerate() {
+            assert_eq!(
+                a.form,
+                burn_attnres::ScoreForm::Paper,
+                "slot {i}: the model arm must be the paper's `q . RMSNorm(k)`, no \
+                 temperature. Eq. 2 has no 1/sqrt(d); the crate's SqrtD form is kept \
+                 for the A/B that would name it, and wiring it here by accident would \
+                 make every future AttnRes number a different mechanism from the one \
+                 the paper describes"
+            );
+        }
+    }
+
+    /// The seam: with `use_attnres = false` the parameters must not EXIST, or
+    /// every existing checkpoint would be one parameter set away from loading
+    /// (and the A/B would be confounded by `d_model` extra trainable values
+    /// that no forward reads).
+    #[test]
+    fn attnres_off_means_no_parameters() {
+        let mut cfg = DormouseConfig::default();
+        cfg.d_model = 32;
+        cfg.n_heads = 2;
+        cfg.head_dim = 16;
+        cfg.d_ffn = 64;
+        cfg.max_iter = 3;
+        cfg.n_experts = 1;
+        cfg.rank = 8;
+        cfg.engram_rows = 256;
+        let b = LoopBlock::new(&cfg, &adev());
+        assert!(b.attnres.is_none(), "use_attnres defaults to false, so no query vectors");
+        assert!(!b.use_attnres);
+        // The default config itself, so a preset cannot turn this on by
+        // accident: the flag is off unless someone says so.
+        assert!(!DormouseConfig::default().use_attnres);
+        // And on, there is exactly one query per iteration slot.
+        let on = LoopBlock::new(&DormouseConfig { use_attnres: true, ..cfg }, &adev());
+        let qs = on.attnres.as_ref().expect("arm on");
+        assert_eq!(qs.len(), on.max_iter, "one pseudo-query per iteration slot (§5)");
+        assert!(qs.iter().all(|a| a.query.dims() == [32]), "each is a [d_model] vector");
+    }
+
+    /// ATTNRES and GR both REPLACE the residual accumulation, so a config that
+    /// asks for both has no interpretation. Refused in `config::validate`, and
+    /// re-checked at the branch, because a hand-built `LoopBlock` bypasses the
+    /// config path.
+    #[test]
+    fn attnres_and_gr_are_refused_together() {
+        let mut cfg = DormouseConfig::default();
+        cfg.d_model = 32;
+        cfg.n_heads = 2;
+        cfg.head_dim = 16;
+        cfg.d_ffn = 64;
+        cfg.max_iter = 2;
+        cfg.n_experts = 1;
+        cfg.rank = 8;
+        cfg.engram_rows = 256;
+        let both = DormouseConfig { use_attnres: true, use_gr: true, ..cfg.clone() };
+        let err = crate::config::validate(&both).expect_err("both residual arms must be refused");
+        assert!(err.contains("use_attnres") && err.contains("use_gr"), "the error must name both: {err}");
+        // Either alone is legal.
+        assert!(crate::config::validate(&DormouseConfig { use_attnres: true, ..cfg.clone() }).is_ok());
+        assert!(crate::config::validate(&DormouseConfig { use_gr: true, ..cfg.clone() }).is_ok());
+    }
+
+    /// THE COUNTER. `use_attnres = true` with a counter of 0 would be a run
+    /// that reports ReZero's loss under AttnRes's name - the defect ADR-0019
+    /// is about, in the one shape where nothing else would show it.
+    #[test]
+    fn attnres_counts_every_iteration_it_aggregates() {
+        let mut cfg = DormouseConfig::default();
+        cfg.d_model = 32;
+        cfg.n_heads = 2;
+        cfg.head_dim = 16;
+        cfg.d_ffn = 64;
+        cfg.max_iter = 4;
+        cfg.n_experts = 1;
+        cfg.rank = 8;
+        cfg.engram_rows = 256;
+        cfg.use_kda = false;
+        cfg.use_engram = false;
+        let head = LinearLike::with_tsct(32, 16, 8, cfg.use_tsct, &adev());
+        let x = Tensor::<3>::random([2, 5, 32], Distribution::Normal(0.0, 1.0), &adev());
+
+        crate::probe::reset();
+        let mut ar = LoopBlock::new(&DormouseConfig { use_attnres: true, ..cfg.clone() }, &adev());
+        let _ = ar.forward_full_state::<B>(x.clone(), None, None, None, None, &head);
+        assert_eq!(crate::probe::count(crate::probe::ATTNRES), 4, "one aggregation per iteration at depth 4");
+
+        // Off: zero. The ReZero path must not touch the counter, or the field
+        // on the eval line would read non-zero for a run that never aggregated.
+        crate::probe::reset();
+        let mut rz = LoopBlock::new(&cfg, &adev());
+        let _ = rz.forward_full_state::<B>(x, None, None, None, None, &head);
+        assert_eq!(crate::probe::count(crate::probe::ATTNRES), 0, "ReZero does not aggregate");
+        // Random depth is a truncation of what ran, and the counter must count
+        // what RAN: a truncated run that reported max_iter aggregations would
+        // be counting a model that was not evaluated.
+        crate::probe::reset();
+        let mut ar = LoopBlock::new(&DormouseConfig { use_attnres: true, ..cfg }, &adev());
+        ar.set_depth(Some(2));
+        let _ = ar.forward_full_state::<B>(Tensor::zeros([2, 5, 32], &adev()), None, None, None, None, &head);
+        assert_eq!(crate::probe::count(crate::probe::ATTNRES), 2, "depth 2 aggregated twice");
     }
 
     /// The block's wiring uses the configured floor, and the row budget
