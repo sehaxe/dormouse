@@ -202,7 +202,15 @@ torchao, а ожидаемые значения в юнит-тесте испр�
 2. ☐ KDA CUDA gradient-flow тест (§3.3, секунды на GPU) — доказать bwd>0 на train-пути
 3. ⏳ Контроль 2000 (идёт) → база в history.tsv по новому стандарту provenance
 4. ☐ A0: чистый CE (aux earns?)
-5. ☐ НОВАЯ рука: future-byte aux-голова (2404.19737) — ДЕШЕВЛЕ JEPA-ретуна, встаёт перед ним
+5. ✅ НОВАЯ рука: future-byte aux-голова (2404.19737) — ДЕШЕВЛЕ JEPA-ретуна, встаёт перед ним
+   (`0099ab2`, wt/future-byte, НЕ в main). Одна untied `d_model->vocab` LinearLike, CE на
+   байт в `t+k`, k=2, читает тот же T-усреднённый readout. `aux_fb_weight` по умолчанию
+   **0.0** и голова при 0.0 НЕ строится (`Option`, форма `use_gr`) → control-строка
+   queue 4 остаётся валидной, измеренные preset-параметры не поехали. Labels
+   `targets[q+k]`, `n = t-k-1` (последний элемент `targets` — wraparound, не читается).
+   6 гейтов, все показаны red→green (research/reviews/future-byte-2026-09-30.md); seam
+   `fb=<ran>/<asked>` на eval-строке. A/B зарегистрирован строкой **1b** в
+   docs/AB-PROTOCOL.md — НЕ запущен (GPU занят). Стоимость руки по-прежнему unknown.
 6. ☐ Ретракция каждый 4-й шаг (теоретически до ~28% throughput) + ns=5 vs 8
 7. ☐ T=2 vs T=4: по одинаковым байтам И по одинаковому времени (два A/B)
 8. ☐ input injection (φ-рычаг: hyperconnections 0.46→0.65 в 2604.21106) — отдельно от routing
