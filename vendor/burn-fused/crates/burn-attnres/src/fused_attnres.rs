@@ -447,11 +447,22 @@ fn depth_attend_backward_kernel<F: Float>(
         let dsc = w[li] * (dw[li] - wd_sum);
         let inv = F::new(1.0_f32) / (sq[li] * F::cast_from(norm_m) + F::new(1e-5_f32)).sqrt();
         let inv3 = inv * inv * inv;
+        let m = F::cast_from(norm_m);
         for j in 0..per {
             let col = j * threads + tid;
             if col < d {
                 let hl = h[li * hbt + base + col];
-                let norm = dsc * F::cast_from(scale) * (q[col] * inv - hl * qh[li] * inv3);
+                // d/dh of `scale·(q·h)·inv`, `inv = (m‖h‖²+ε)^(-1/2)`:
+                //   `scale·(q_j·inv − m·h_j·(q·h)·inv³)`
+                // The `m` on the second term is `d(inv)/dh`'s factor 2m/2 and
+                // it is NOT optional: with the L2 norm (`m = 1`) it is a
+                // no-op, which is why the formula was written without it and
+                // every test stayed green. The paper's RMSNorm has
+                // `m = 1/d`, and the finite-difference gate
+                // (`depth_attend_grad_matches_finite_difference`) went red at
+                // rel 1.47 the moment `ScoreForm::Paper` was wired in.
+                let norm =
+                    dsc * F::cast_from(scale) * (q[col] * inv - m * hl * qh[li] * inv3);
                 dh[li * hbt + base + col] = w[li] * dout[base + col] + norm;
                 dq[tid * per + j] += dsc * F::cast_from(scale) * hl * inv;
             }
@@ -1120,11 +1131,38 @@ mod tests {
                 let md = maxdiff(&to_host(mx.clone()), &want_m);
                 assert!(md < 1e-5, "d{d} merge {i}: max_score state maxdiff {md}");
                 let md = maxdiff(&to_host(se.clone()), &want_se);
-                assert!(md < 1e-5, "d{d} merge {i}: sum_exp state maxdiff {md}");
+                let se_scale = want_se.iter().fold(1.0f32, |m, v| m.max(v.abs()));
+                assert!(
+                    md < 1e-5 * se_scale,
+                    "d{d} merge {i}: sum_exp state maxdiff {md:.3e} at |sum_exp| ~{se_scale:.3}"
+                );
                 let md = maxdiff(&to_host(acc.clone()), &want_acc);
-                assert!(md < 1e-5, "d{d} merge {i}: acc state maxdiff {md}");
+                // SCALE-RELATIVE, and this is a measured correction. The
+                // tolerance was `1e-5` ABSOLUTE on `acc` after 64 chained f32
+                // merges, and `acc`'s scale depends on the score convention:
+                // the paper's unscaled logit is ~sqrt(d) times larger, so the
+                // online-softmax weights are sharper and the accumulator lands
+                // at |acc| ~ 3-4 where the old form drifted less. Measured on
+                // this box, identical code, 4 runs: 3 red at 1.0-1.7e-5 and 1
+                // green, i.e. 2.5e-6 RELATIVE - about 21x f32 epsilon after
+                // 64 accumulations, which is the arithmetic, not the kernel.
+                // The absolute form was a coin flip on the random draw
+                // (unseeded, ADR-0021). The defect this cell exists for is the
+                // missing-barrier race, whose signature is `rescale = 1` and
+                // therefore O(1) - four orders above this bound.
+                let scale = want_acc.iter().fold(1.0f32, |m, v| m.max(v.abs()));
+                assert!(
+                    md < 1e-5 * scale,
+                    "d{d} merge {i}: acc state maxdiff {md:.3e} at |acc| ~{scale:.3} \
+                     (bound {:e})",
+                    1e-5 * scale
+                );
                 let md = maxdiff(&got, &want_out);
-                assert!(md < 1e-5, "d{d} merge {i}: out maxdiff {md}");
+                let out_scale = want_out.iter().fold(1.0f32, |m, v| m.max(v.abs()));
+                assert!(
+                    md < 1e-5 * out_scale,
+                    "d{d} merge {i}: out maxdiff {md:.3e} at |out| ~{out_scale:.3}"
+                );
             }
         }
     }
@@ -1417,13 +1455,14 @@ mod ad {
         let l = history.len();
         let [b, t, d] = history[0].dims();
         let scale = form.scale(d);
+        let m_norm = form.norm_m(d);
         let h_stack = crate::fused_attnres::stack_ad(history);
         let q = query.clone().reshape([1, 1, 1, d]);
         let s2 = h_stack
             .clone()
             .powf_scalar(2.0)
             .sum_dim(3)
-            .mul_scalar(form.norm_m(d))
+            .mul_scalar(m_norm)
             .add_scalar(1e-5); // [L,B,T,1]
         let inv = s2.clone().powf_scalar(-0.5);
         let scores = (q.clone() * h_stack.clone())
@@ -1439,12 +1478,17 @@ mod ad {
             .squeeze_dim::<3>(3); // [L,B,T]
         let d_scores = w.clone() * (d_w.clone() - (w.clone() * d_w).sum_dim(0));
 
-        // d_h = w_l·d_out + scale·d_scores·(q/√s − h_l·(q·h_l)/s^(3/2))
+        // d_h = w_l·d_out + scale·d_scores·(q/√s − m·h_l·(q·h_l)/s^(3/2))
+        // The `m` is the same factor as in the fused kernel above: with the
+        // L2 norm (`m = 1`) it vanishes, which is exactly why it was missing
+        // from both implementations until `ScoreForm::Paper` (m = 1/d) made
+        // the finite-difference gate red.
         let d_scores4 = d_scores.unsqueeze_dim::<4>(3); // [L,B,T,1]
         let qh = (q.clone() * h_stack.clone()).sum_dim(3); // [L,B,T,1]
         let dh_attn = w.unsqueeze_dim::<4>(3) * d_out4.clone(); // [L,B,T,D]
         let dh_norm = d_scores4.clone()
-            * (q.clone() * inv.clone() - h_stack.clone() * qh * s2.clone().powf_scalar(-1.5))
+            * (q.clone() * inv.clone()
+                - h_stack.clone() * qh * s2.clone().powf_scalar(-1.5) * m_norm)
             * scale;
         let dh_stack = dh_attn + dh_norm;
 
@@ -1837,14 +1881,28 @@ mod fd_tests {
             .collect();
         let dq = to_host(qf.grad(&grads).unwrap());
 
-        // central finite differences
-        let eps = 1e-4f32;
+        // CENTRAL finite differences, eps = 1e-3 (the 2026-09-29 audit's
+        // Test F prescription; the old 1e-4 put the difference quotient's own
+        // f32 noise at ~5e-3, which is larger than the gradient components
+        // this test is trying to check).
+        let eps = 1e-3f32;
         let loss = |hs: &[Tensor<3>], q: &Tensor<1>| -> f32 {
             crate::depth_attend(hs, q.clone())
                 .powf_scalar(2.0)
                 .sum()
                 .into_scalar::<f32>()
         };
+        // The difference quotient's noise floor: an f32 loss of this magnitude
+        // carries ~EPSILON of rounding, and dividing by 2*eps turns that into
+        // a per-component uncertainty. Components below it are not measurable
+        // by finite differences, so asserting a RELATIVE error on them is
+        // asserting noise. The floor is computed from the loss, not guessed.
+        let plain: Vec<Tensor<3>> = data_h
+            .iter()
+            .map(|dt| Tensor::<3>::from_data(dt.clone(), &dev))
+            .collect();
+        let loss_scale = loss(&plain, &Tensor::<1>::from_data(data_q.clone(), &dev)).abs();
+        let fd_floor = 8.0 * f32::EPSILON * loss_scale / (2.0 * eps);
         let total = b * t * d;
         for li in 0..l {
             let mut fd = vec![0.0f32; total];
@@ -1869,18 +1927,39 @@ mod fd_tests {
                 let qd = Tensor::<1>::from_data(data_q.clone(), &dev);
                 fd[i] = (loss(&hs_p, &qd) - loss(&hs_m, &qd)) / (2.0 * eps);
             }
+            // Per component, with the noise floor added: the missing `m` in
+            // the norm's derivative (the defect this cell caught) moved
+            // components by 0.1-1.2, four orders above the floor, so the gate
+            // still has all of its teeth and none of its false reds.
             for i in 0..total {
-                let rel = (dhs[li][i] - fd[i]).abs() / (fd[i].abs() + 1e-6);
+                let diff = (dhs[li][i] - fd[i]).abs();
+                let rel = diff / (fd[i].abs() + fd_floor);
                 assert!(
                     rel < 1e-1,
-                    "layer {li} idx {i}: analytic {} vs fd {} (rel {rel})",
+                    "layer {li} idx {i}: analytic {} vs fd {} (rel {rel}, diff {diff:.3e}, \
+                     fd noise floor {fd_floor:.3e})",
                     dhs[li][i],
                     fd[i]
                 );
             }
+            // And the aggregate, which is the tolerance-meaningful statement:
+            // per-component relative error on a near-zero component is not.
+            let num: f64 = dhs[li]
+                .iter()
+                .zip(fd.iter())
+                .map(|(a, b)| ((a - b) as f64).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            let den: f64 = fd.iter().map(|v| (*v as f64).powi(2)).sum::<f64>().sqrt();
+            assert!(
+                num / den < 1e-2,
+                "layer {li}: ||analytic - fd||/||fd|| = {:.4} ({} vs {})",
+                num / den,
+                num,
+                den
+            );
         }
-        // dq
-        let eps = 1e-4f32;
+        // dq (same eps and floor as dh: the loss and the step are the same)
         let mut fd = vec![0.0f32; d];
         for i in 0..d {
             let mut plus = data_q.clone();
@@ -1898,10 +1977,11 @@ mod fd_tests {
             fd[i] = (loss(&hs, &qp) - loss(&hs, &qm)) / (2.0 * eps);
         }
         for i in 0..d {
-            let rel = (dq[i] - fd[i]).abs() / (fd[i].abs() + 1e-6);
+            let diff = (dq[i] - fd[i]).abs();
+            let rel = diff / (fd[i].abs() + fd_floor);
             assert!(
                 rel < 1e-1,
-                "dq idx {i}: analytic {} vs fd {} (rel {rel})",
+                "dq idx {i}: analytic {} vs fd {} (rel {rel}, diff {diff:.3e})",
                 dq[i],
                 fd[i]
             );

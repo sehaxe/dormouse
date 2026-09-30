@@ -135,6 +135,35 @@ and intra-block source groups at temperatures differing by `√d`. Both legs
 carry the form now. The existing `two_phase_merge_matches_full_attention`
 could not see it: it exercises `i = 0`, which bypasses the merge.
 
+**What making the form paper-faithful FOUND, and this is the important part.**
+The CUDA run of this lane turned two previously-green tests red, and the cause
+was a defect that had been in the crate since it was written:
+
+> The score is `s = scale·(q·h)·(m‖h‖²+ε)^(-1/2)`, so
+> `∂s/∂h_j = scale·(q_j·inv − m·h_j·(q·h)·inv³)`. **The `m` was missing** —
+> in the fused kernel (`fused_attnres.rs:454`) *and* in the tensor reference
+> (`:1447`). With the L2 norm `m = 1` the term vanishes, so the formula was
+> correct for the form the crate shipped and wrong for the paper's, and
+> nothing could see it. `ScoreForm::Paper` (`m = 1/d`) made
+> `depth_attend_grad_matches_finite_difference` red at **rel 1.47** and
+> `fused_backward_matches_burn_autodiff` red at **worst 1.17**.
+
+Both are fixed; the fused adjoint now agrees with **burn's own autodiff** of
+the forward, which is an independently computed derivative. Re-perturbing the
+`m` back out reproduces the red at **diff 1.17 against a 3.9e-4 noise floor**,
+so the gate is not soft. **Consequence for any A/B:** an AttnRes arm built on
+this crate before this commit would have trained the residual stream on a
+wrong gradient for every source except the one with `‖h‖²` small. No run in
+`~/logs/` used the arm, so nothing is retracted.
+
+A second finding from the same run, in the other direction: the crate's
+`merge_state_writeback_matches_host_reference` used a **1e-5 absolute**
+tolerance on 64 chained f32 merges, and went red 3 times out of 4 on
+identical code once the paper's sharper softmax moved `|acc|` to ~3-4 (2.5e-6
+relative ≈ 21× f32 epsilon). Re-based on a scale-relative bound, 5 green runs
+in a row. A gate that reports a defect the code does not have is the mirror
+image of one that cannot fail, and it was the second of the two in one hour.
+
 ---
 
 ## 4. Where AttnRes sits in the loop, and why there
@@ -249,6 +278,17 @@ branch. `probe::NAMES` carries `"attnres"`.
 - The three-convention numbers in §3 are arithmetic on the fixture above,
   computed by the gate in `lib.rs`; they are **ours**, reproducible by running
   the test, and they are not a measurement of anything the authors published.
+
+**Measured on this box, 2026-09-30, `wt/attnres-model`.**
+- `burn-attnres --features cuda,autodiff`: **19 passed / 0 failed** (3
+  `#[ignore]`d benchmarks), with `ScoreForm::Paper` as the default. Includes
+  both fused/tensor parity tests over **both** forms, the balanced-
+  checkpointing seam test, and the fused-adjoint-vs-burn-autodiff comparison.
+- `burn-attnres` ndarray: **10 passed / 0 failed**.
+- `dormouse-core -p dormouse-data -p dormouse-train --lib`: **59 / 15 / 50
+  passed, 0 failed**. `dormouse-core --features cuda --lib`: **59 passed**.
+- The derivative defect above, red on the pre-change code's successors and
+  green after the fix, with the magnitudes in the falsification record.
 
 **Transcription (our reading, no external implementation).** Every "the paper
 says" in §2. The score convention. The placement.

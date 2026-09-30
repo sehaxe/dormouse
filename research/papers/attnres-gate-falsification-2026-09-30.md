@@ -83,17 +83,94 @@ so a reader knows which two fields to choose between.
 
 ---
 
+## Gate 6 — a derivative the gates were green through (found by the CUDA run)
+
+`fused_attnres::fd_tests::depth_attend_grad_matches_finite_difference` and
+`fd_tests::fused_backward_matches_burn_autodiff`, run with `--features
+cuda,autodiff`.
+
+**This is the finding of the lane.** Both were **green on the pre-change
+code** (measured: checked out `a7c3cad`'s two files and ran them — 2 passed)
+and **red the moment `ScoreForm::Paper` was wired in**:
+
+```
+layer 0 idx 0: analytic 0.3739026 vs fd -0.7981062 (rel 1.4684854)
+fused vs burn raw autodiff worst=1.1717439
+```
+
+**The defect.** The score is `s = scale·(q·h)·(m‖h‖²+ε)^(-1/2)`, and
+`∂s/∂h_j = scale·(q_j·inv − m·h_j·(q·h)·inv³)`. **The `m` was missing** from
+the second term in *both* the fused kernel (`fused_attnres.rs:454`) and the
+tensor reference (`:1447`). With the L2 norm `m = 1` the term vanishes, which
+is why it was written without it and why every test in the crate stayed green
+for the crate's whole life. The paper's RMSNorm has `m = 1/d`, and the
+difference is not a rounding matter — it is a wrong derivative of the norm,
+in the arm's own backward.
+
+**Fixed in both places** (the fused kernel and the tensor reference — they
+were consistently wrong together, which is exactly the "two transcriptions of
+the same error" shape the audit warned about), then:
+
+| state | result |
+|---|---|
+| fixed | **green** — `fused_backward_matches_burn_autodiff` now passes, i.e. the fused adjoint agrees with **burn's own autodiff** of the forward, an independently computed derivative |
+| **re-perturb**: `m * hl * qh[li] * inv3` → `hl * qh[li] * inv3` (the pre-lane formula) | **RED again**, `diff 1.172e0` against an `fd noise floor` of `3.935e-4` — **3000× the floor**, `rel 1.47` |
+| restore | **green** |
+
+So the gate has teeth, and the defect it found was real, silent, and would
+have trained the arm on a wrong gradient.
+
+**The tolerance argument behind the fix, and it is a measurement.** The
+per-component relative check could not see a component of size 3e-4, because
+the central difference quotient's own f32 noise at `eps = 1e-4` on an
+O(10) loss is ~5e-3 — larger than the thing being measured. The audit's Test F
+prescription was already right: `eps = 1e-3`, and a noise floor computed from
+the loss scale (`8·ε_mach·|loss| / 2·eps`) instead of a guessed constant.
+The gate then carries **both**: per component with the floor added, and an
+aggregate `‖analytic − fd‖ / ‖fd‖ < 1e-2` over the whole gradient, which is
+the tolerance-meaningful statement. The re-perturbation above is red on both.
+
+## Gate 7 — a tolerance that was a coin flip (found by the same run)
+
+`fused_attnres::tests::merge_state_writeback_matches_host_reference`
+
+**3 red out of 4 runs on identical code**, at `acc` maxdiff 1.0–1.7e-5
+against a **1e-5 absolute** bound. Instrumented: `|acc| ~ 3–4` in the failing
+runs, so the relative error is 2.5e-6 ≈ 21× f32 epsilon after 64 chained
+merges. That is the arithmetic of accumulating 64 f32 updates, not a kernel
+error — and the cause is the score convention again: the paper's unscaled
+logit is ~`√d` times larger, the online-softmax weights are sharper, and the
+accumulator lands at a scale where a scale-blind bound sits inside the noise
+floor. The data is also **unseeded** (ADR-0021), so which runs went red was
+a lottery.
+
+**Re-based on a scale-relative bound** (`1e-5 · max(1, |want|∞)`) for the
+three accumulators, with the reason in the assert message. **5 consecutive
+green runs** after the change. The defect this cell exists for — the
+missing-barrier race, whose signature is `rescale = 1` and therefore O(1) —
+is four orders of magnitude above the new bound, so nothing was softened
+away.
+
+**What this is:** a gate that reported a defect the code did not have, four
+times in a row, for a week of history it could not have. Same class as the
+1/√d references, from the other direction: not a gate that cannot fail, but a
+gate that fails for a reason unrelated to what it names. The audit's own note
+on this cell ("this test passes with the barrier deleted") already said its
+coverage was not its gate; this is the second half of that sentence.
+
 ## What was NOT falsified, and stays unproven
 
-- **The CUDA fused path under the trainer's backend.** `burn-attnres` with
-  `--features cuda` compiles and its parity tests run in both score forms
-  (see the test tallies in the report), but the run was done with a training
-  job on the card, per §1.5. `fused_attnres` is one of the tree's working
-  kernels and the form is a runtime scalar in all three of them, so the
-  dispatch is unchanged in shape — but **"the fused path is reached under
-  `Autodiff<Cuda, BalancedCheckpointing>` with the paper's form" is a claim
-  this lane did not measure on a quiet card.** The `seam_counts` readout is
-  what settles it in one line on the next free GPU.
+- **The CUDA fused path under the trainer's backend, end to end.**
+  `burn-attnres --features cuda,autodiff` is **19 passed / 0 failed** with
+  the paper's form as the default, including both parity tests over BOTH
+  forms, the balanced-checkpointing seam test
+  (`balanced_checkpointing_reaches_the_seam_and_the_legacy_entry_does_not`,
+  the assertion that dormouse's backend gets *past* the seam downcasts), and
+  the fused-adjoint-vs-burn-autodiff comparison. `dormouse-core --features
+  cuda --lib` is **59 passed**. What is still not measured: an AttnRes
+  *training step* on this card, i.e. that the counter in a real `train_loop`
+  reads non-zero and the loss descends. The A/B row is the place that gets
+  measured, and it is not run.
 - **`BlockAttnRes`.** Untouched, still wrong against Eq. 6, deliberately not
   wired. See the integration doc §5 for the four fixes and the gate each
   needs.
