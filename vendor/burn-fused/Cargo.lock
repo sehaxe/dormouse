@@ -1093,6 +1093,7 @@ dependencies = [
  "burn-ndarray",
  "burn-tensor",
  "cubecl",
+ "futures-lite",
 ]
 
 [[package]]

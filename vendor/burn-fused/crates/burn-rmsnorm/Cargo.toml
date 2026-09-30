@@ -23,6 +23,7 @@ cubecl = { workspace = true, optional = true, features = ["std"] }
 [dev-dependencies]
 burn-ndarray = { workspace = true, features = ["blas-openblas"] }
 burn = { workspace = true, features = ["ndarray", "std"] }
+futures-lite = { workspace = true }
 
 # The gate that did not exist while the kernel was broken: an integration test
 # that ASSERTS THE ARM WAS TAKEN and compares the fused answer to a scalar f64
@@ -31,4 +32,22 @@ burn = { workspace = true, features = ["ndarray", "std"] }
 # building an empty target that prints a green `running 0 tests ... ok`.
 [[test]]
 name = "fused_kernel_gate"
+required-features = ["cuda"]
+
+# The same kernel against the tier-(a) upstream fixture (torch ATen +
+# flash-linear-attention), with the seam counters pinned per case.
+[[test]]
+name = "rmsnorm_kernel_cuda"
+required-features = ["cuda"]
+
+# The bisect instrument, and a PERMANENT one: each `#[test]` launches a
+# progressively richer kernel in its own process. See the file's header for what
+# each rung isolates; the rung that reproduced the lowering failure is the
+# minimal reproducer this crate is pinned by.
+[[test]]
+name = "lower_probe"
+required-features = ["cuda"]
+
+[[test]]
+name = "d2_isolate"
 required-features = ["cuda"]
