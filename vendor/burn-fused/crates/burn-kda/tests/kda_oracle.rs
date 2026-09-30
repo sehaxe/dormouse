@@ -687,6 +687,50 @@ fn read_scale_matches_fla_reference() {
 /// value head, and it multiplies both the key side and the value side
 /// (`naive.py:64`), so broadcasting it over both channel axes is the same
 /// number and not a shortcut.
+/// One `chunk_wy_forward` call on a fixture case, returning the output and the
+/// final state, both flat. Shared by the three chunked tests so the GVA repeat
+/// and the tensor layout live in exactly one place.
+fn run_chunk(blk: &Block, scale: f64) -> (Vec<f32>, Vec<f32>) {
+    let d = blk.dims(); // B T H HV K V BT
+    let (b, t, h, hv, k, v) = (d[0], d[1], d[2], d[3], d[4], d[5]);
+    let bt = d[6];
+    let (q, kk) = {
+        let q = bthd_to_bhtd(t4(&blk.nums("q"), [b, t, h, k]), b, h, t, k);
+        let kk = bthd_to_bhtd(t4(&blk.nums("k"), [b, t, h, k]), b, h, t, k);
+        // GVA: `chunk_wy_forward` derives `heads` from `q.shape` and then slices
+        // q, k, g AND w_gate on that same axis (gdn2's
+        // `chunk_wy_forward_batched`, forward.rs:212-213 and :231-236), so every
+        // one of the five tensors must already carry HV heads. That is what
+        // `KdaModule::project` does at src/lib.rs:525-537 (it repeats q, k, g,
+        // b_k and b_v across the group), and it is also FLA's `state_v_first`
+        // convention: q/k live on the qk-head axis and are `repeat_interleave`d
+        // to the value-head axis (naive.py:118-119).
+        if hv > h {
+            let rep = hv / h;
+            let r = |x: Tensor<4>| -> Tensor<4> {
+                x.unsqueeze_dim::<5>(1)
+                    .repeat(&[1, rep, 1, 1, 1])
+                    .reshape([b, hv, t, k])
+            };
+            (r(q), r(kk))
+        } else {
+            (q, kk)
+        }
+    };
+    let vv = bthd_to_bhtd(t4(&blk.nums("v"), [b, t, hv, v]), b, hv, t, v);
+    let g = bthd_to_bhtd(t4(&blk.nums("g"), [b, t, hv, k]), b, hv, t, k);
+    let beta = t3(&blk.nums("beta"), [b, t, hv])
+        .permute([0, 2, 1])
+        .reshape([b, hv, t, 1]);
+    let b_k = beta.clone().repeat(&[1, 1, 1, k]);
+    let w_gate = beta.repeat(&[1, 1, 1, v]);
+    let state = Tensor::<4>::zeros([b, hv, k, v], &dev());
+    let (o, s) = burn_gdn2::chunk_wy_forward(q, kk, vv, g, b_k, w_gate, state, scale, bt);
+    let got: Vec<f32> = o.permute([0, 2, 1, 3]).into_data().to_vec::<f32>().unwrap();
+    let got_s: Vec<f32> = s.into_data().to_vec::<f32>().unwrap();
+    (got, got_s)
+}
+
 #[test]
 fn chunked_wy_matches_fla_chunk_at_unit_scale() {
     use burn_gdn2::ChunkPath;
@@ -700,70 +744,101 @@ fn chunked_wy_matches_fla_chunk_at_unit_scale() {
         burn_gdn2::set_chunk_path(path);
         for name in ["chunk16_h1", "chunk16_h2", "chunk16_gva"] {
             let blk = get(&fx, "chunk", name);
-            let d = blk.dims(); // B T H HV K V BT
-            let (b, t, h, hv, k, v) = (d[0], d[1], d[2], d[3], d[4], d[5]);
-            let bt = d[6];
-            let (q, kk) = {
-                let q = bthd_to_bhtd(t4(&blk.nums("q"), [b, t, h, k]), b, h, t, k);
-                let kk = bthd_to_bhtd(t4(&blk.nums("k"), [b, t, h, k]), b, h, t, k);
-                // GVA: `chunk_wy_forward` derives `heads` from `q.shape` and then
-                // slices q, k, g AND w_gate on that same axis (gdn2's
-                // `chunk_wy_forward_batched`, forward.rs:212-213 and :231-236),
-                // so every one of the five tensors must already carry HV heads.
-                // That is what `KdaModule::project` does at src/lib.rs:525-537
-                // (it repeats q, k, g, b_k and b_v across the group), and it is
-                // also FLA's `state_v_first` convention: q/k live on the qk-head
-                // axis and are `repeat_interleave`d to the value-head axis
-                // (naive.py:118-119).
-                if hv > h {
-                    let rep = hv / h;
-                    let r = |x: Tensor<4>| -> Tensor<4> {
-                        x.unsqueeze_dim::<5>(1)
-                            .repeat(&[1, rep, 1, 1, 1])
-                            .reshape([b, hv, t, k])
-                    };
-                    (r(q), r(kk))
-                } else {
-                    (q, kk)
-                }
-            };
-            let vv = bthd_to_bhtd(t4(&blk.nums("v"), [b, t, hv, v]), b, hv, t, v);
-            let g = bthd_to_bhtd(t4(&blk.nums("g"), [b, t, hv, k]), b, hv, t, k);
-            let beta = t3(&blk.nums("beta"), [b, t, hv])
-                .permute([0, 2, 1])
-                .reshape([b, hv, t, 1]);
-            let b_k = beta.clone().repeat(&[1, 1, 1, k]);
-            let w_gate = beta.repeat(&[1, 1, 1, v]);
-            let state = Tensor::<4>::zeros([b, hv, k, v], &dev());
-
-            // scale = 1.0: the parameter that isolates everything EXCEPT the
-            // read scale, which the red test above owns.
-            let (o, s) = burn_gdn2::chunk_wy_forward(q, kk, vv, g, b_k, w_gate, state, 1.0, bt);
-            let got: Vec<f32> = o
-                .permute([0, 2, 1, 3])
-                .into_data()
-                .to_vec::<f32>()
-                .unwrap();
+            let (got, got_s) = run_chunk(&blk, 1.0);
             let (r, at) = num_diff(&got, &blk.nums("o"), ATOL_CHUNK, TOL_CHUNK);
             assert!(
                 r <= 1.0,
                 "chunk_wy_forward disagrees with FLA naive_chunk_kda(scale=1.0)\n  \
-                 arm {path:?} case {name}: worst rel {r:.3e} at {at} (got {} want {})",
+                 arm {path:?} case {name}: worst normalised {r:.3e} at {at} (got {} want {})",
                 got[at],
                 blk.nums("o")[at]
             );
-            let got_s: Vec<f32> = s.into_data().to_vec::<f32>().unwrap();
             let (r, at) = num_diff(&got_s, &blk.nums("S"), ATOL_CHUNK, TOL_CHUNK);
             assert!(
                 r <= 1.0,
                 "chunk_wy_forward final state disagrees with FLA naive_chunk_kda(scale=1.0)\n  \
-                 arm {path:?} case {name}: worst rel {r:.3e} at {at} (got {} want {})",
+                 arm {path:?} case {name}: worst normalised {r:.3e} at {at} (got {} want {})",
                 got_s[at],
                 blk.nums("S")[at]
             );
         }
     }
     burn_gdn2::set_chunk_path(ChunkPath::Batched);
+}
+
+/// The GREEN half of the read-scale pair, and the reason the red half below is
+/// worth reading: `chunk_wy_forward` **does** implement the read scale. Asked for
+/// `K**-0.5` it reproduces FLA's own `oK` row. So what burn-kda is missing is
+/// an ARGUMENT, not a mechanism — which is what makes the candidate fix one
+/// literal rather than a port.
+#[test]
+fn chunked_wy_honours_the_read_scale_when_asked() {
+    use burn_gdn2::ChunkPath;
+    static ARM: Mutex<()> = Mutex::new(());
+    let _guard = ARM.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = fixture();
+    for path in [ChunkPath::Batched, ChunkPath::Loop] {
+        burn_gdn2::set_chunk_path(path);
+        for name in ["chunk16_h1", "chunk16_h2", "chunk16_gva"] {
+            let blk = get(&fx, "chunk", name);
+            let k: f64 = blk.dims()[4] as f64;
+            let (got, _) = run_chunk(&blk, k.powf(-0.5));
+            let (r, at) = num_diff(&got, &blk.nums("oK"), ATOL_CHUNK, TOL_CHUNK);
+            assert!(
+                r <= 1.0,
+                "chunk_wy_forward(scale=K**-0.5) does not reproduce FLA's own default-scale \
+                 row\n  arm {path:?} case {name}: worst normalised {r:.3e} at {at} \
+                 (got {} want {})",
+                got[at],
+                blk.nums("oK")[at]
+            );
+        }
+    }
+    burn_gdn2::set_chunk_path(ChunkPath::Batched);
+}
+
+/// The RED half, on the CHUNKED arm: what burn-kda actually passes is `1.0`
+/// (`src/lib.rs:646`, `:653`), so it does not produce the row the official KDA
+/// layer produces. `read_scale_matches_fla_reference` is the same divergence on
+/// the recurrent arm; this one is the one a candidate fix turns green, and
+/// `falsify.sh`'s A6 is that demonstration.
+#[test]
+fn chunked_wy_applies_no_read_scale() {
+    use burn_gdn2::ChunkPath;
+    static ARM: Mutex<()> = Mutex::new(());
+    let _guard = ARM.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = fixture();
+    let mut report = String::new();
+    for path in [ChunkPath::Batched, ChunkPath::Loop] {
+        burn_gdn2::set_chunk_path(path);
+        for name in ["chunk16_h1", "chunk16_h2", "chunk16_gva"] {
+            let blk = get(&fx, "chunk", name);
+            let k: f32 = blk.dims()[4] as f32;
+            let (got, _) = run_chunk(&blk, 1.0);
+            let want = blk.nums("oK");
+            let (r, at) = num_diff(&got, &want, ATOL_CHUNK, TOL_CHUNK);
+            if r > 1.0 {
+                report.push_str(&format!(
+                    "  arm {path:?} case {name}: worst normalised {r:.3e} at {at}, ours {} vs \
+                     FLA {} (ratio {:.4}, K**-0.5 = {:.4})\n",
+                    got[at], want[at], got[at] / want[at], k.powf(-0.5)
+                ));
+            }
+        }
+    }
+    burn_gdn2::set_chunk_path(ChunkPath::Batched);
+    assert!(
+        report.is_empty(),
+        "burn-kda passes scale=1.0; FLA's KDA layer runs at K**-0.5 on {} chunk arm/case(s):\n\
+         {report}\n\
+         CAUSE: src/lib.rs:646,653 pass 1.0; src/fused.rs:9 states the reason and the reason \
+         is false against both upstreams.\n\
+         The MECHANISM EXISTS -- chunked_wy_honours_the_read_scale_when_asked is green -- so \
+         this is a missing argument, not a missing implementation.\n\
+         Not fixed here: a numerical change to a shipped model. See \
+         research/papers/kda-formula-audit-2026-09-30.md S3.2.",
+        report.lines().count()
+    );
 }
 
 /// A green margin is only evidence if it is not a tolerance fitted to it.

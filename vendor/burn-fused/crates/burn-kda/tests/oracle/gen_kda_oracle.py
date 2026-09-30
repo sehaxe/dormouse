@@ -218,10 +218,19 @@ def build_gate_cases():
     cases.append(("A_zero_nonzero_bias", z, a,
                   np.linspace(-6.91, -2.25, H * K).astype(np.float32)))
 
-    # 6. A_spread: every head a different A, including the clamp endpoints
-    #    (-10, 20) that `lib.rs:264` imposes. The clamp is OURS (no upstream
-    #    has it), so this case pins that the formula still holds AT the clamp
-    #    boundary rather than only in the interior.
+    # 6. A_clamp_endpoints: the heads sit AT the two clamp bounds `lib.rs:264`
+    #    imposes, (-10, 20). The clamp is OURS -- no upstream has one -- so this
+    #    case pins that the formula still holds AT the boundary rather than only
+    #    in the interior.
+    #
+    #    WHAT THIS CASE DELIBERATELY DOES NOT COVER, because it cannot: an A
+    #    OUTSIDE the clamp. Upstream has no clamp, so any A > 20 would make our
+    #    clamped answer differ from FLA's unclamped one and turn the green test
+    #    red on a deliberate, documented deviation. A fixture is not the place
+    #    to adjudicate a choice we made on purpose. The consequence is a real
+    #    coverage limit and it is recorded: **a mutant that WIDENS the clamp is
+    #    invisible to every arm of this oracle**, which is why `falsify.sh`'s A3
+    #    narrows the clamp instead (that one the greens do see).
     z, a = blk(rng.uniform(-3.0, 3.0, (B, T, H, K)), 0.0)
     a = np.array([0.0, -10.0], np.float32)
     cases.append(("A_clamp_endpoints", z, a, np.zeros(H * K, np.float32)))
@@ -353,14 +362,26 @@ def main():
         W(f"  scale1_S={fmt(S1.numpy())}")
         W(f"  scaleK_o={fmt(ok.numpy())}")
 
-    # ── 4: the chunked WY construction ──────────────────────────────────────
+    # ── 4: the chunked WY construction, at BOTH scales ──────────────────────
+    # Two rows per case, and the reason is the same as in section 3: the
+    # `scaleK_o` row is what makes the missing-read-scale red ATTRIBUTABLE and
+    # what lets the candidate fix be demonstrated as a mutant that turns it
+    # green. Without it the red would be "we differ from FLA" with no way to
+    # show the scale is the whole difference on the CHUNKED arm too (the
+    # recurrent arm has `fla_read_scale_is_the_whole_difference` for that).
     W("")
-    W("# ---- chunked WY: fla/ops/kda/naive.py::naive_chunk_kda, scale=1.0 ----")
+    W("# ---- chunked WY: fla/ops/kda/naive.py::naive_chunk_kda ----")
+    W("# `o` is scale=1.0 and `oK` is FLA's own K**-0.5 default, the scale")
+    W("# fla/layers/kda.py:262 runs at. `S` is the scale=1.0 final state.")
     for (name, B, T, H, HV, K, V, BT, q, k, v, g, beta) in build_chunk_cases():
         qt, kt, vt, gt, bt2 = t4(q), t4(k), t4(v), t4(g), t4(beta)
         o, S = R["naive_chunk_kda"](qt.clone(), kt.clone(), vt.clone(),
                                    gt.clone(), bt2.clone(), scale=1.0,
                                    output_final_state=True, chunk_size=BT)
+        oK, _ = R["naive_chunk_kda"](qt.clone(), kt.clone(), vt.clone(),
+                                     gt.clone(), bt2.clone(),
+                                     scale=K ** -0.5, output_final_state=True,
+                                     chunk_size=BT)
         W("")
         W(f"chunk {name}")
         W(f"  shape={B} {T} {H} {HV} {K} {V} {BT}")
@@ -370,6 +391,7 @@ def main():
         W(f"  g={fmt(g)}")
         W(f"  beta={fmt(beta)}")
         W(f"  o={fmt(o.numpy())}")
+        W(f"  oK={fmt(oK.numpy())}")
         W(f"  S={fmt(S.numpy())}")
 
     # ── the generator's own vacuity guards ────────────────────────────────────
