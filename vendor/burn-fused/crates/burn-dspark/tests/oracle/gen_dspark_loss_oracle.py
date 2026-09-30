@@ -1,12 +1,26 @@
 #!/usr/bin/env python3
 """Generate the DSpark-loss golden fixture by RUNNING DeepSeek's own loss.
 
+ON A CLEAN VENV, this is the whole recipe, and every package in it is
+REQUIRED -- the list is not "the obvious ones":
+
     $ uv venv --python 3.12 /tmp/opencode/oracle-venv
     $ VIRTUAL_ENV=/tmp/opencode/oracle-venv uv pip install \
-          --index-url https://download.pytorch.org/whl/cpu torch numpy
+          --index-url https://download.pytorch.org/whl/cpu torch numpy pyyaml transformers
     $ git clone https://github.com/deepseek-ai/DeepSpec.git   # need not be run again
     $ /tmp/opencode/oracle-venv/bin/python gen_dspark_loss_oracle.py \
           --deepspec /path/to/DeepSpec > ../fixtures/dspark_loss_oracle.txt
+
+WHY `pyyaml` AND `transformers` ARE ON THAT LINE, since omitting them is the
+one way this fails with an error that does not name them. `torch numpy` gets
+you a torch and nothing else, and the import that follows walks the upstream
+package: `deepspec/modeling/dspark/__init__.py` -> `common.py`, and from there
+`deepspec/utils/config.py` (`import yaml`) and
+`deepspec/modeling/dspark/gemma4/modeling.py` (`from transformers.cache_utils
+import Cache`). Both raise a bare `ModuleNotFoundError: No module named
+'yaml'` / `'transformers'` with a traceback that points at DeepSpec's import
+graph and not at the missing dependency. Measured on this box 2026-09-30: with
+`torch numpy` only, the generator dies before it emits a single case.
 
 WHAT RAN, AND WHY IT IS TIER (a)
 ---------------------------------
@@ -47,6 +61,64 @@ THE TWO UPSTREAM NUMBERS, and what each is for
    vendored source so the test can attribute a disagreement to ONE term
    instead of only seeing a total.
 
+AND THE OFFICIAL GRADIENTS, which are the only part of the reference a
+value-level comparison is blind to
+----------------------------------------------------------------------------
+`compute_dspark_loss` returns a live scalar, so `loss.backward()` gives
+DeepSeek's OWN `d/d(draft_logits)` and `d/d(confidence_pred)` by autograd, on
+the same pinned source, with no transcription of ours anywhere in the path.
+They are emitted as `grad_draft` / `grad_conf` and compared against ours in
+`dspark_loss_gradients_agree_with_the_official_loss`.
+
+This is the half of the reference a value oracle cannot see, and the reason
+matters: `loss.py:145` is `confidence_targets = accept_rate_3d.detach()`. An
+implementation that leaves that target attached computes a bit-identical
+FORWARD loss and a drafter gradient that differs by 20-101%. A fixture of
+values is not able to tell the two apart, so the fixture carries gradients.
+
+SELF-VALIDATING, but NOT by finite differences, and the reason is the
+single most useful thing this generator learned on 2026-09-30
+----------------------------------------------------------------------------
+A central difference of `out_official` CANNOT check `grad_draft`, and this is
+not a tuning problem. `loss.py:145` is `confidence_targets = accept_rate_3d
+.detach()`: the acceptance rate is computed from `draft_logits`, so upstream's
+FORWARD loss is a function of the drafter's own logits, while upstream's
+GRADIENT deliberately is not -- the detach is a stop-gradient and the returned
+scalar is not differentiable-consistent with the graph that produced it.
+Measured on `main`, d/d(draft[0]):
+
+    autograd through DeepSeek's own code        -0.00598767
+    ce + l1 terms only (target detached)         -0.00598767   <- identical
+    ce + l1 + a LIVE confidence target           -0.00991132
+    central difference of the forward scalar     -0.00991344   <- ~= the live one
+
+The central difference converges, stably over h in [1e-3, 0.2], to the LIVE
+target's gradient. So a finite-difference check of the reference gradient is
+not merely loose, it is checking a different function, and it would report the
+correct stop-gradient as broken. Two consequences, both load-bearing:
+
+  * the reference gradient here is admissible ONLY because it is autograd on
+    the pinned source -- there is no finite-difference route to it;
+  * the FIX in `src/lib.rs` is not a choice between two equally defensible
+    gradients. Ours was the LIVE one: we were training a term upstream does
+    not train, worth 20.5-100.9% of the drafter gradient by case.
+
+So the checks that are actually run, each with one job:
+
+  * `grad_draft` EXACTLY INVARIANT to the presence of a confidence head. The
+    conf term contributes nothing to the drafter's gradient when its target is
+    detached, so `grad_draft` with a head and `grad_draft` without one must be
+    the same tensor BIT FOR BIT. Exact, tolerance-free, and it is the property
+    under test: any implementation that leaks `c_star` into the graph fails it.
+  * `grad_draft` CROSS-CHECKED against this file's own transcription of the
+    three formulas, differentiated (tier (b) under a tier-(a) number, the same
+    arrangement `selfcheck` uses for the values). It cannot replace the
+    reference; it catches a mis-shaped, mis-indexed or transposed recording,
+    which nothing downstream would.
+  * `grad_conf` FINITE-DIFFERENCE CHECKED. This one is valid, because nothing
+    on the path from `confidence_pred` to the output is detached. A central
+    difference here is a real derivative and it agrees.
+
 NINE SIGNIFICANT DIGITS
 -----------------------
 `%.9g`, never `%g`. An f32 needs 9 to round-trip exactly; `f"{v:g}"` is six and
@@ -81,6 +153,21 @@ TORCH_VERSION = torch.__version__
 # honest f32 envelope. 1e-5 is 5x that and still ~4 orders of magnitude below
 # the smallest margin any case below actually has.
 TOL_REL = 1e-5
+
+# The Rust gate's bound on GRADIENTS, which live on a different scale from the
+# loss and need their own. Gradients here are O(1e-2 .. 1e-3) per element, so
+# a pure relative test is fine but a pure absolute one is not; both are carried
+# and the test asserts `|ours - ref| <= GRAD_ABS + GRAD_REL * |ref|`.
+#
+# DERIVED, not tuned to pass: the f32 envelope was MEASURED by running this
+# comparison with the detach in place (worst element over all 8 cases and all
+# 462 coordinates: see `research/reviews/verify-tails-2026-09-30.md`), and these
+# are the next power of ten above it. The margin in the OTHER direction is
+# also measured, so the bound's job is visible: with the `detach()` REMOVED
+# again, d/d(draft_logits) is wrong by 20.5% - 100.9% in L2 by case. A bound
+# that discriminates 21% needs no more than 1e-2; this one is 1e-4.
+GRAD_ABS = 1e-7
+GRAD_REL = 1e-4
 
 
 def g9(v) -> str:
@@ -302,6 +389,176 @@ def selfcheck(name, terms, official):
     return problems, {"ce": ce, "l1": l1, "conf": cf, "total": total}
 
 
+# ── the gradient, and the check that keeps it honest ────────────────────────────
+
+# Central-difference step for the `grad_conf` check. 0.05 is a compromise
+# between the f32 noise floor (which scales as 1/h) and the curvature of a
+# sigmoid in the logit (which scales as h). Valid HERE and only here: nothing
+# on the path from `confidence_pred` to the output is detached.
+FD_H = 0.05
+FD_REL = 5e-3
+FD_ABS = 2e-5
+# How many coordinates to probe, spread deterministically over the flattened
+# tensor so a wrong indexing cannot hide in the un-sampled 99%.
+FD_PROBES = 24
+
+# Cross-check tolerances for the transcription-vs-autograd comparison. f32
+# reductions in a different order, so this is an envelope, not an equality.
+XC_REL = 1e-3
+XC_ABS = 1e-5
+
+
+def official_scalar(dl, tid, em, bkm, at, conf):
+    """`compute_dspark_loss` on a fresh `DSparkForwardOutput`, as a float.
+
+    No `requires_grad` anywhere: this is the pure scalar the `grad_conf`
+    finite difference walks, and it must not be reading anything out of a
+    graph.
+    """
+    from deepspec.modeling.dspark.common import DSparkForwardOutput
+    from deepspec.modeling.dspark.loss import compute_dspark_loss
+    import torch.distributed as dist
+    assert dist.is_initialized(), "the process group must exist; see the docstring"
+    o = DSparkForwardOutput(
+        draft_logits=torch.from_numpy(dl),
+        target_ids=torch.from_numpy(tid),
+        eval_mask=torch.from_numpy(em),
+        block_keep_mask=torch.from_numpy(bkm),
+        confidence_pred=None if conf is None else torch.from_numpy(conf),
+        aligned_target_logits=torch.from_numpy(at),
+    )
+    return float(compute_dspark_loss(
+        outputs=o, loss_decay_gamma=GAMMA, ce_loss_alpha=CE_ALPHA,
+        l1_loss_alpha=L1_ALPHA, confidence_head_alpha=CONF_ALPHA))
+
+
+def grads_of(dl, tid, em, bkm, at, conf):
+    """DeepSeek's own d/d(draft_logits) and d/d(confidence_pred), by autograd.
+
+    The loss function is the pinned, unmodified, vendored source; this is
+    `Tensor.backward()` on its return value. There is no formula of ours in
+    here, which is the whole reason the gradient it produces is admissible as
+    a reference.
+    """
+    from deepspec.modeling.dspark.common import DSparkForwardOutput
+    from deepspec.modeling.dspark.loss import compute_dspark_loss
+
+    dl_t = torch.from_numpy(dl).clone().requires_grad_(True)
+    conf_t = None if conf is None else torch.from_numpy(conf).clone().requires_grad_(True)
+    o = DSparkForwardOutput(
+        draft_logits=dl_t,
+        target_ids=torch.from_numpy(tid),
+        eval_mask=torch.from_numpy(em),
+        block_keep_mask=torch.from_numpy(bkm),
+        confidence_pred=conf_t,
+        aligned_target_logits=torch.from_numpy(at),
+    )
+    loss = compute_dspark_loss(
+        outputs=o, loss_decay_gamma=GAMMA, ce_loss_alpha=CE_ALPHA,
+        l1_loss_alpha=L1_ALPHA, confidence_head_alpha=CONF_ALPHA)
+    loss.backward()
+    return (dl_t.grad.numpy().copy(),
+            None if conf_t is None else conf_t.grad.numpy().copy())
+
+
+def transcribed_grads(dl, tid, em, conf, at):
+    """The same three formulas, differentiated -- TIER (b), under a tier (a).
+
+    `attribute_terms` already exists for the values and is already
+    cross-checked against the official scalar; this is that transcription with
+    `requires_grad` on, so a recorded gradient can be checked for shape, index
+    and scale. It does NOT replace the reference: both sides agreeing with a
+    transcription proves nothing about the reference. What it catches is a
+    recording that is wrong in a way the reference number itself cannot show,
+    because the reference number and this one are stored in the same fixture
+    row and would agree in the fixture's bytes.
+    """
+    b, a, k, v = dl.shape
+    d = torch.from_numpy(dl).clone().requires_grad_(True)
+    c = None if conf is None else torch.from_numpy(conf).clone().requires_grad_(True)
+    pos = torch.arange(k, dtype=torch.float32).view(1, 1, -1)
+    w = torch.from_numpy(em) * torch.exp(-pos / GAMMA)
+    den = w.reshape(-1).sum() + 1e-6
+
+    ce = (F.cross_entropy(d.reshape(-1, v), torch.from_numpy(tid).reshape(-1),
+                          reduction="none") * w.reshape(-1)).sum()
+    # One graph, one backward, both leaves: `tv` is shared between the L1 term
+    # and the acceptance rate, exactly as upstream shares it.
+    tv = (torch.softmax(d, -1) - torch.softmax(torch.from_numpy(at), -1)).abs().sum(-1)
+    total = CE_ALPHA * ce / den + L1_ALPHA * (tv * w).sum() / den
+    if c is not None:
+        accept = (1.0 - 0.5 * tv).clamp(0.0, 1.0).detach()
+        cf = (F.binary_cross_entropy_with_logits(c, accept, reduction="none") * w).sum()
+        total = total + CONF_ALPHA * cf / den
+    total.backward()
+    return d.grad.numpy().copy(), (None if c is None else c.grad.numpy().copy())
+
+
+def check_grads(name, dl, tid, em, bkm, at, conf, g_draft, g_conf):
+    """The three checks, each with exactly one job. See the docstring.
+
+    Returns `(problems, report)` where `report` is a one-line-per-check
+    summary for stderr, so a green run still says how close each check was.
+    """
+    problems, report = [], []
+    x_draft, x_conf = transcribed_grads(dl, tid, em, conf, at)
+
+    # (1) EXACT invariance of grad_draft to the presence of a head. This is the
+    # property the detach creates, and it is a bit-for-bit comparison: no
+    # tolerance is offered and none should be.
+    headless, _ = grads_of(dl, tid, em, bkm, at, None)
+    if conf is not None and not np.array_equal(headless, g_draft):
+        n = int((headless != g_draft).sum())
+        worst = float(np.abs(headless - g_draft).max())
+        problems.append(
+            "%s: grad_draft differs at %d/%d coordinates (worst %g) between a head "
+            "and NO head, but loss.py:145 detaches the acceptance target, so the "
+            "confidence term must contribute NOTHING to the drafter's gradient"
+            % (name, n, g_draft.size, worst))
+    report.append("invariance %s" % ("exact" if not any("grad_draft differs" in p for p in problems) else "VIOLATED"))
+
+    # (2) The transcription, differentiated, must agree in scale and index.
+    for what, ref, mine in (("draft", g_draft, x_draft), ("conf", g_conf, x_conf)):
+        if ref is None:
+            continue
+        bad = np.abs(ref - mine) > (XC_ABS + XC_REL * np.abs(ref))
+        if bad.any():
+            i = int(np.argmax(np.abs(ref - mine) / (XC_ABS + XC_REL * np.abs(ref))))
+            problems.append(
+                "%s: grad_%s disagrees with this file's own transcription at %d "
+                "coordinates; worst at [%d] ref %.9g vs transcription %.9g -- the "
+                "recording is mis-shaped, mis-indexed or mis-scaled"
+                % (name, what, int(bad.sum()), i, ref.reshape(-1)[i], mine.reshape(-1)[i]))
+        report.append("xcheck %s worst %.2e" % (what, float(np.abs(ref - mine).max())))
+
+    # (3) grad_conf by central difference. Valid, unlike grad_draft, because
+    # nothing between confidence_pred and the output is detached.
+    if conf is not None and g_conf is not None:
+        flat = conf.reshape(-1)
+        n = flat.size
+        step = 1 + (n - 1) // FD_PROBES
+        checked, worst = 0, 0.0
+        for idx in range(0, n, step):
+            if checked >= FD_PROBES:
+                break
+            p, m = flat.copy(), flat.copy()
+            p[idx] += FD_H
+            m[idx] -= FD_H
+            fp = official_scalar(dl, tid, em, bkm, at, p.reshape(conf.shape))
+            fm = official_scalar(dl, tid, em, bkm, at, m.reshape(conf.shape))
+            fd = (fp - fm) / (2.0 * FD_H)
+            an = float(g_conf.reshape(-1)[idx])
+            if abs(fd - an) > FD_ABS + FD_REL * abs(an):
+                problems.append(
+                    "%s: d/d(conf[%d]) finite-difference %.9g but autograd %.9g"
+                    % (name, idx, fd, an))
+            worst = max(worst, abs(fd - an))
+            checked += 1
+        report.append("conf-vs-FD worst %.2e (%d probes)" % (worst, checked))
+
+    return problems, "  ".join(report)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--deepspec", required=True,
@@ -331,6 +588,7 @@ def main():
     from deepspec.modeling.dspark.loss import compute_dspark_loss
 
     rows = []
+    fd_report = []
     for c in build_cases():
         name, dl, tid, em, bkm, at, conf = c
         o = DSparkForwardOutput(
@@ -346,10 +604,18 @@ def main():
             l1_loss_alpha=L1_ALPHA, confidence_head_alpha=CONF_ALPHA))
         terms = attribute_terms(dl, tid, em, conf, at, bkm)
         problems, attributed = selfcheck(name, terms, official)
+        # The reference's OWN gradients, by autograd on the pinned source, plus
+        # the three checks that are actually valid for a stop-gradient.
+        g_draft, g_conf = grads_of(dl, tid, em, bkm, at, conf)
+        g_problems, g_report = check_grads(name, dl, tid, em, bkm, at, conf,
+                                           g_draft, g_conf)
+        problems += g_problems
+        fd_report.append("%s: %s" % (name, g_report))
         if problems:
             sys.stderr.write("\n".join("FIXTURE PROBLEM: " + p for p in problems) + "\n")
             sys.exit("refusing to emit")
-        rows.append((name, dl, tid, em, bkm, at, conf, official, terms, attributed))
+        rows.append((name, dl, tid, em, bkm, at, conf, official, terms, attributed,
+                     g_draft, g_conf))
 
     if args.dump:
         here = os.path.dirname(os.path.abspath(__file__))
@@ -376,8 +642,12 @@ def main():
     print("# numbers:  9 significant digits (%.9g) of the f32 the reference produced")
     print("#")
     print("# out_official is what DeepSeek's own compute_dspark_loss returned.")
-    print("# out_ce/out_l1/out_conf are the per-term values recomputed from the")
+    print("# out_ce/out_l1/out_conf are the same three terms recomputed from the")
     print("# SAME vendored primitives, so a disagreement is attributable to one term.")
+    print("# grad_draft/grad_conf are the SAME function's OWN autograd gradients,")
+    print("# d/d(draft_logits) and d/d(confidence_pred), cross-checked here against")
+    print("# a central difference of out_official -- they are the only half of the")
+    print("# reference a value comparison cannot see.")
     print("")
     print("meta.cases: %s" % " ".join(r[0] for r in rows))
     print("meta.upstream_sha256: %s" % sha)
@@ -388,8 +658,12 @@ def main():
     print("meta.conf_alpha: %s" % g9(CONF_ALPHA))
     print("meta.gamma: %s" % g9(GAMMA))
     print("meta.tol_rel: %s" % g9(TOL_REL))
+    print("meta.grad_abs: %s" % g9(GRAD_ABS))
+    print("meta.grad_rel: %s" % g9(GRAD_REL))
+    print("meta.grad_fd_rel: %s" % g9(FD_REL))
     print("")
-    for (name, dl, tid, em, bkm, at, conf, official, terms, attr) in rows:
+    for (name, dl, tid, em, bkm, at, conf, official, terms, attr,
+         g_draft, g_conf) in rows:
         print("case.%s.dims: %s" % (name, " ".join(str(v) for v in dl.shape)))
         print("case.%s.draft_logits: %s" % (name, fmt(dl)))
         print("case.%s.target_ids: %s" % (name, " ".join(str(int(v)) for v in np.asarray(tid).ravel())))
@@ -406,8 +680,17 @@ def main():
         print("case.%s.out_conf: %s" % (name, g9(attr["conf"])))
         for t in ("ce_num", "ce_den", "l1_num", "l1_den", "conf_num", "conf_den"):
             print("case.%s.%s: %s" % (name, t, g9(terms[t])))
+        print("case.%s.grad_draft: %s" % (name, fmt(g_draft)))
+        if g_conf is None:
+            print("case.%s.grad_conf: none" % name)
+        else:
+            print("case.%s.grad_conf: %s" % (name, fmt(g_conf)))
         print("")
     sys.stderr.write("emitted %d cases; every guard satisfied\n" % len(rows))
+    sys.stderr.write("gradient checks (a stop-gradient is not finite-differenceable; "
+                     "see the docstring):\n")
+    for line in fd_report:
+        sys.stderr.write("  %s\n" % line)
 
 
 if __name__ == "__main__":
