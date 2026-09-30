@@ -42,7 +42,17 @@ pub const RETRACT_FACTOR: usize = 10;
 /// invisible in every other number: the batched arm computes the same
 /// matrices, so a run that silently took the slow arm prints the same loss.
 pub const RETRACT_BATCHED: usize = 11;
-pub const N_ARMS: usize = 12;
+/// The future-byte auxiliary term was COMPUTED and added. Distinct from
+/// [`FUTURE_BYTE_ASKED`] because a horizon at or past the sequence length
+/// leaves zero valid positions: the arm is asked for, produces a real zero,
+/// and the printed `fb=<ran>/<asked>` is the only place a reader learns a
+/// 2k-step A/B was 2k steps of nothing.
+pub const FUTURE_BYTE: usize = 12;
+/// The future-byte arm was ENTERED with a non-zero weight. The `asked` half of
+/// `fb=<ran>/<asked>`; ADR-0019 COUNTED, so `0/<n>` on the eval line means the
+/// head was never reached rather than "the arm is off".
+pub const FUTURE_BYTE_ASKED: usize = 13;
+pub const N_ARMS: usize = 14;
 /// Arm name per index, for assertion messages that name the thing.
 pub const NAMES: [&str; N_ARMS] = [
     "iterations",
@@ -57,6 +67,8 @@ pub const NAMES: [&str; N_ARMS] = [
     "mor_bce",
     "retract_factor",
     "retract_batched",
+    "future_byte",
+    "future_byte_asked",
 ];
 
 thread_local! {

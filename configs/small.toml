@@ -20,6 +20,14 @@ jepa_mask_span = 8
 dspark_weight = 0.0
 dspark_k = 4
 dspark_stride = 16
+# Future-byte auxiliary head (our adaptation of arXiv 2404.19737's per-horizon
+# multi-token heads to a byte-level AR model). OFF: the weight is 0, so the
+# head is not even BUILT (AuxHeads.fb is None) and this recipe's parameters and
+# checkpoint are byte-identical to a build from before the arm existed. Turn it
+# on with `--set aux_fb_weight=0.1`; horizon is in BYTE POSITIONS and 0 is
+# refused (targets[q + 0] is the byte the main CE already predicts).
+aux_fb_weight = 0.0
+aux_fb_horizon = 2
 # Hashed n-gram memory (Engram). Capacity budget, not tuning knobs: the arm
 # was off because 8M rows/order was 99% of the model and monopolized the loss.
 # 25_000 rows/order x 3 orders x 32 dim = 2.4M memory params against a 7.5M

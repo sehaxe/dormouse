@@ -28,6 +28,23 @@ pub fn validate(c: &DormouseConfig) -> Result<(), String> {
         );
     }
     if c.mor_bce_weight < 0.0 { return Err("mor_bce_weight >=0".into()); }
+    // The future-byte head (queue v2 item 5). Both checks are LOUD because both
+    // wrong values compute a DIFFERENT objective without saying so, which is
+    // the ADR-0019 class: a negative weight is a sign flip on the aux term, and
+    // `aux_fb_horizon = 0` is the subtle one - the label for position q would
+    // be `targets[q]`, the byte the MAIN CE already predicts, so the term is a
+    // second CE on the next byte through an independent head. It trains, it
+    // descends, it costs a step, and it is not multi-token prediction at all.
+    if c.aux_fb_weight < 0.0 { return Err("aux_fb_weight >= 0".into()); }
+    if c.aux_fb_horizon < 1 {
+        return Err(format!(
+            "aux_fb_horizon {} must be >= 1: the label for position q is targets[q + k], so k = 0 \
+             supervises the head on the byte the MAIN CE already predicts - the term still computes \
+             and still descends, and it is not multi-token prediction. Use 2 (the default), or \
+             aux_fb_weight = 0 to turn the arm off.",
+            c.aux_fb_horizon
+        ));
+    }
     // The floor of one recursion is structural, so mor_k=0 is a config error
     // (loud, not clamped), and mor_k > max_iter is a set that cannot fill.
     if c.mor_k < 1 { return Err("mor_k must be >= 1 (floor of one recursion)".into()); }
@@ -113,6 +130,30 @@ mod tests {
         assert!(set_then_validate(&["act_quant=8", "act_group=0"]).is_ok(), "0 = per token");
         assert!(set_then_validate(&["act_quant=8", "act_group=64"]).is_ok(), "64 divides 768");
         assert!(set_then_validate(&["act_group=100"]).is_ok(), "inert without act_quant");
+    }
+
+    /// ADR-0019 LOUD, the subtle half of the pair: `--set aux_fb_horizon=0`
+    /// supervises the head on `targets[q]` - the byte the MAIN CE already
+    /// predicts - so the arm trains, descends, costs a step, and is not
+    /// multi-token prediction at all. It is a second CE on the next byte
+    /// through an independent parameter set, which is the most expensive way to
+    /// buy nothing. A horizon at or past `max_seq_len` is legal and returns an
+    /// exact zero (COUNTED: `fb=0/<n>` on the eval line), because a
+    /// short-sequence sweep is a legitimate thing to want.
+    #[test]
+    fn aux_fb_horizon_zero_is_refused() {
+        let err = set_then_validate(&["aux_fb_horizon=0"]).expect_err("horizon 0 must be refused");
+        assert!(err.contains("aux_fb_horizon"), "the error must name the field: {err}");
+        assert!(err.contains("targets[q + k]"), "the error must name the arithmetic: {err}");
+        assert!(set_then_validate(&["aux_fb_weight=-0.1"]).is_err(), "a negative weight is a sign flip on the term");
+        // The legal range is untouched: the check refuses the collapse, it does
+        // not shrink the range.
+        assert!(set_then_validate(&[]).is_ok(), "the defaults (weight 0, horizon 2)");
+        assert!(set_then_validate(&["aux_fb_horizon=1"]).is_ok(), "k = 1 is a second CE on the next byte - legal, and the doc says so");
+        assert!(set_then_validate(&["aux_fb_horizon=4", "aux_fb_weight=0.1"]).is_ok(), "the later arm's horizon");
+        // A horizon at or past the sequence length is NOT refused: it is a
+        // zero term with a counter, not a config error.
+        assert!(set_then_validate(&["aux_fb_horizon=600", "max_seq_len=512"]).is_ok(), "seq_len is the trainer's, not the config's business here");
     }
 
     /// Every shipped preset must still validate: a check that rejects a

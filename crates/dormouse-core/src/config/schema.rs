@@ -71,6 +71,8 @@ fn d_jepa_mask_span() -> usize { 8 }
 fn d_dspark_weight() -> f32 { 0.0 }
 fn d_dspark_k() -> usize { 4 }
 fn d_dspark_stride() -> usize { 16 }
+fn d_aux_fb_weight() -> f32 { 0.0 }
+fn d_aux_fb_horizon() -> usize { 2 }
 fn d_engram_rows() -> usize { 25_000 }
 fn d_engram_orders() -> Vec<usize> { vec![2, 3, 4] }
 fn d_engram_dim() -> usize { 32 }
@@ -111,6 +113,31 @@ pub struct DormouseConfig {
     #[serde(default = "d_dspark_weight")] pub dspark_weight: f32,
     #[serde(default = "d_dspark_k")] pub dspark_k: usize,
     #[serde(default = "d_dspark_stride")] pub dspark_stride: usize,
+    /// Weight of the FUTURE-BYTE auxiliary head (our adaptation of arXiv
+    /// 2404.19737's per-horizon multi-token heads to a byte-level AR model).
+    ///
+    /// **0.0 - OFF by default, and the head does not EXIST at 0.0**
+    /// (`AuxHeads::fb` is an `Option`, built iff this is non-zero, the same
+    /// `cfg.use_gr.then(...)` shape `LoopBlock::gr` uses). Two consequences,
+    /// both deliberate: a zero-weight run's parameter set, and therefore its
+    /// checkpoint, is byte-identical to a build from before this field existed
+    /// - so queue row 1 (pure CE) needs no re-baseline of its own - and an
+    /// off-arm model carries no 197 120-parameter head that no loss ever
+    /// touches, which would move every measured preset parameter count.
+    /// `0.0` is the A/B's off position and `--set aux_fb_weight=0.1` is its
+    /// on position; nothing in the shipped recipe turns it on.
+    #[serde(default = "d_aux_fb_weight")] pub aux_fb_weight: f32,
+    /// How far ahead the head predicts, in BYTE POSITIONS.
+    ///
+    /// `targets[q]` is the byte at `q + 1`, so the label for position `q` at
+    /// horizon `k` is `targets[q + k]`: the byte `k + 1` positions after the
+    /// one the main CE already asks for. `k = 1` would be a second copy of the
+    /// main CE through an independent head - the same target, two parameter
+    /// sets - so the default is **2**, and 0 is refused loudly by `validate`.
+    /// ONE horizon, not a set: a head per horizon is what 2404.19737 does and
+    /// what a capacity ladder would A/B, and it is not this arm. Horizon 4 is
+    /// a later row in the queue, not a field with a list in it.
+    #[serde(default = "d_aux_fb_horizon")] pub aux_fb_horizon: usize,
 
     // --- hashed n-gram memory (Engram): the arm's capacity budget ---
     /// Rows per n-gram order. A CAPACITY BUDGET, not a tuning knob: the arm

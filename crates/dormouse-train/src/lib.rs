@@ -1540,11 +1540,22 @@ pub fn train_loop(
                         probe::count(probe::ENGRAM) - eg_arms0,
                         probe::count(probe::ENGRAM_KEYS) - eg_rows0,
                     );
+                    // `fb=<ran>/<asked>`: the future-byte arm, over the TRAINING
+                    // forwards, not the eval's own. The eval forward passes no
+                    // labels (`targets = None`, which is what keeps the held-out
+                    // graph out of the tape), so it cannot run this arm - an
+                    // eval-local count would read `0/0` forever and a reader
+                    // would conclude the head is broken. `0/<n>` here is the
+                    // real defect shape: the arm was opened every step and never
+                    // produced a term, which is a horizon at or past the
+                    // sequence length.
+                    let (fb_ran, fb_asked) =
+                        (probe::count(probe::FUTURE_BYTE), probe::count(probe::FUTURE_BYTE_ASKED));
                     println!(
                         "step {step:6} EVAL ce={ece:.3} bpb={ebpb:.3}{} over {bytes} B (fixed window) \
                          fused kda={kda_f}/{kda_b} asked={kda_asked} bwd={kda_bwd} \
                          declined={kda_decl} ops={kda_ops} node_bwd={kda_node_bwd} \
-                         norm={}/{} muon_skipped={}/{} engram={eg_rows}/{eg_arms}",
+                         norm={}/{} muon_skipped={}/{} engram={eg_rows}/{eg_arms} fb={fb_ran}/{fb_asked}",
                         if is_best_eval { " BEST" } else { "" },
                         norm_asked.saturating_sub(norm_skipped),
                         norm_asked,
