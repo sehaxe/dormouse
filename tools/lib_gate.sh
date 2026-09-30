@@ -47,6 +47,31 @@ if pgrep -x cargo >/dev/null; then
 fi
 
 cd "$FORK" || exit 1
+
+# The f64 fixtures must be the output of the generator that ships beside them,
+# and this is the only place that can be checked. `ca45600` fixed a head-major
+# `g` layout bug in `crates/burn-gdn2/tools/gen_reference_f64.py` and
+# regenerated `ref_f64.bin` and `ref_f64_faults.bin` but NOT
+# `ref_f64_broad.bin`; the 1000-case sweep was left holding the bug, and both
+# `oracle_breadth` and `oracle_chunk` read it as a kernel defect for a day
+# (976/1000 cases, worst 8.940234e-01). No cargo test can see this, because the
+# committed bytes ARE what the test compares against - so it runs first, and it
+# needs only numpy, not a build.
+if command -v python3 >/dev/null 2>&1; then
+    echo "── burn-gdn2 f64 fixtures vs their generator ──"
+    # `fixture_rc`, not `rc`: the cargo cell below assigns `rc=$?` and would
+    # overwrite a failure recorded here.
+    fixture_rc=0
+    (cd crates/burn-gdn2 && python3 tools/check_f64_fixtures.py) || fixture_rc=1
+    echo
+else
+    echo "── burn-gdn2 f64 fixtures: SKIPPED, no python3. The oracle layer is"
+    echo "   UNVERIFIED in this run; the binary-tests cell below still compares"
+    echo "   against whatever bytes are committed."
+    echo
+    fixture_rc=0
+fi
+
 echo "── the fused library, every crate, default features, ndarray ──"
 cargo test --workspace \
     --exclude burn-fused-benches --exclude cpu-probe --exclude launch-probe \
@@ -71,6 +96,7 @@ rc2=$?
 [ "$rc2" -eq 0 ] || rc=$rc2
 
 echo
+[ "$fixture_rc" -eq 0 ] || rc=1
 if [ "$rc" -eq 0 ]; then
     echo "PASS  lib_gate: the fused library's CPU cell is green."
 else

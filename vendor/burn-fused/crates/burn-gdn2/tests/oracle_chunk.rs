@@ -34,48 +34,47 @@
 // was ~1e-2 - so the old per-case bound was effectively 1e-1 RELATIVE. The new
 // one is 1e-3 relative, i.e. 100x tighter in relative terms and 13x tighter in
 // absolute terms on the worst-conditioned case of this sweep (per-case output
-// scale 3.93e-02 min, 3.21e-01 median, 5.35e-01 max; 1e-3 relative on the
+// scale 3.93e-02 min, 3.29e-01 median, 5.49e-01 max; 1e-3 relative on the
 // smallest of those is 3.9e-05 absolute). Nothing was widened. The far side of
 // the bar is committed data, not prose: `tests/ref_f64_faults.bin` holds the
-// seven wrong formulas and `ref_f64.rs::the_bar_bites_a_wrong_formula` asserts
+// eight wrong formulas and `ref_f64.rs::the_bar_bites_a_wrong_formula` asserts
 // on every run that our output is at least 1e-1 relative from each of them;
-// re-measured over all 1000 cases of this sweep the nearest is 3.909822e-01
-// (`no-erase-gate` at T=8), 391x above the bar.
+// re-measured over all 1000 cases of this sweep the nearest is 4.084390e-01
+// (`output-gate-sigmoid` at T=2), 408x above the bar.
 //
-// REGENERATE.
+// REGENERATE - run the checker, not a byte-diff.
 //     cd vendor/burn-fused/crates/burn-gdn2
-//     python3 tools/gen_reference_f64.py --broad
-//     git diff --exit-code -- tests/ref_f64_broad.bin
+//     python3 tools/check_f64_fixtures.py
+// `git diff --exit-code` on the fixture is NOT the check and never was: the f64
+// outputs are numpy reductions whose summation order depends on array layout,
+// so a correct regeneration agrees to ~7e-16 rather than byte-for-byte, and the
+// byte-diff fails on a good fixture. `tests/oracle_breadth.rs`'s header carries
+// the measurements.
 //
 // STATUS, AND THE DEMONSTRATION THAT THIS TEST CAN FAIL. The status is in
-// `tests/oracle_breadth.rs`; this file is RED on the same pre-existing
-// state-carry defect. What I MEASURED here, and what I did not:
+// `tests/oracle_breadth.rs`, and the short version is that both of these tests
+// were red because `ref_f64_broad.bin` had stopped matching its generator
+// (`ca45600` fixed a head-major `g` layout bug in the generator and did not
+// regenerate this one fixture of three), NOT because of any kernel defect.
+// They share the root exactly: same file, same loader (`load_broad()`), same
+// weights, same `BAR`. What was measured, and what each number is:
 //
-//   * measured, this tree: the first failing case is chunk_size=4 case 1 (T=3)
-//     at 1.851e-01 - the same case and the same number the fused-recurrent arm
-//     reports. `cargo test -p burn-gdn2 --features binary-tests --test
-//     oracle_chunk`.
-//   * measured, with a throwaway measure-only harness over the whole 1000-case
-//     sweep at chunk_size=4: worst 8.9402e-01 at T=3, 976/1000 over the bar -
-//     the chunked arm reads the SAME as the fused arm - and with the pad
-//     injected, worst 4.9448e+00 at T=1, 1000/1000.
-//   * NOT measured: the worst over the sweep at chunk sizes 8, 16, 32 and 64.
-//     The harness ran one chunk size per build and I did not rebuild it four
-//     more times; `chunk_sizes_match_the_f64_oracle` will print all five once
-//     the state-carry defect is fixed. The old fixture's signature (an error
-//     invariant under re-chunking, which is how the 2026-09-27 audit exonerated
-//     the chunking) is consistent with the one size I did measure, but
-//     "consistent with" is not a measurement of four more sizes.
+//   * measured, then: the first failing case was chunk_size=4 case 1 (T=3) at
+//     1.851e-01, and 976/1000 cases over the bar. Those are the STALE FIXTURE's
+//     numbers, reproduced to five figures by
+//     `python3 tools/check_f64_fixtures.py` - the chunked arm was never the
+//     subject, it was reading the same stale bytes through the same bar.
+//   * measured: with the fixture regenerated from the current generator, both
+//     arms are inside the bar, at all five chunk sizes; the run prints each.
+//   * NOT measured, and not claimed: whether the chunked arm's OWN rounding sits
+//     comfortably inside 1e-3 at every chunk size, as a question separate from
+//     the fixture. That is what the printed per-size worst is for; read it.
 //
 // One note that IS specific to this file, and it is the reason the arm exists:
 // the chunked arm's rounding is a re-ordering of a DIFFERENT factorisation (the
 // chunked WY solve), not of the same loop, so its error shape is its own and
 // assuming the two arms follow each other would have been an assumption, not a
-// result. At the current bar the pre-existing defect swamps it, so this arm
-// cannot yet say anything about its own arithmetic. That is what one defect at
-// a time looks like from inside a test: you cannot see the second one until the
-// first is fixed, and the honest state of this arm today is "blocked", not
-// "passing".
+// result.
 #![allow(dead_code, deprecated)]
 
 include!("common/ref_f64.rs");
