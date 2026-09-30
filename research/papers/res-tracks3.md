@@ -1,0 +1,268 @@
+# modded-nanogpt Track 3 (Optimization Benchmark) — the current record, and what it means for our Muon+ setup
+
+**Fetch date: 2026-09-29 (UTC).** Read-only pass over GitHub raw files + the GitHub
+contents/tree REST API. No GPU, no cargo, no build. Every number below names the file it
+came from. UNRESOLVED where a source could not be reconciled.
+
+---
+
+## TL;DR
+
+1. **Muon+ genuinely does not appear.** Zero occurrences of `ColRow`, `Muon+` or `Muon++`
+   in any of the 62 `.py`/`.md` files under `records/track_3_optimization/` (excluding the
+   vendored third-party `distributed_shampoo` tree, which is Google's Shampoo library, not a
+   submission). Verified by fetching all 62 and string-matching. The tuned-Muon baseline
+   (#36) and the current record (#46) both use **plain Muon**: 12 Newton-Schulz iterations
+   + `update *= max(1, rows/cols)**0.5`, no post-polar normalization.
+2. **A direct comparison with our optimizer is NOT possible.** The benchmark's model is
+   `GPT(50304, 12, 768)` at **524 288 tokens/step**; ours is a 9.2 M byte-level model at
+   **4 096 tokens/step** (batch 8 × seq 512). The 46-row table contains no run of our
+   configuration, and its tuning constants are not ours. This is an **incomparable
+   leaderboard** and is reported as one.
+3. **Adoptable now, no new numerics:** radial brake + rescale-to-radius, the u/w floor,
+   RowFloor, Cautious Weight Decay, Tail-EMA eval readout. All are elementwise/reduction ops.
+   **Not adoptable:** SOAP (needs `torch.linalg.eigh` on GPU every step; `burn-tensor
+   0.22.0-pre.4` has **no `eigh` at all**), and the record's bf16 Newton-Schulz (unusable on
+   our backend — but that one is a one-line fp32 fallback, not a blocker).
+4. **The "neutral geometry modules" finding is the most directly useful thing here** — see
+   §5. Scale caveat is in the same paragraph and it matters: it was measured at **162 M
+   params / 524 k tokens per step / 2.9 k steps**, and only as a *bundled* removal, not a
+   paired ablation.
+
+---
+
+## 1. Provenance — every URL fetched, 2026-09-29
+
+| what | URL | read? |
+|---|---|---|
+| track directory listing | `https://github.com/KellerJordan/modded-nanogpt/tree/master/records/track_3_optimization` | yes (README inline) |
+| track README (raw, 43 672 B) | `https://raw.githubusercontent.com/KellerJordan/modded-nanogpt/master/records/track_3_optimization/README.md` | yes, full |
+| `results/` listing | `.../tree/master/records/track_3_optimization/results` + `api.github.com/.../contents/.../results` | yes |
+| repo recursive tree (2 316 blobs) | `api.github.com/repos/KellerJordan/modded-nanogpt/git/trees/master?recursive=1` | yes |
+| **record #46** README (12 200 B) + `train_gpt_cwd_SOTA.py` (43 933 B) | `.../results/20260619_cwd_rowfloor_tailema/{README.md,train_gpt_cwd_SOTA.py}` | yes, both full |
+| **record #44** README (9 560 B) + `train_gpt_clean_SOTA.py` (39 147 B) | `.../results/20260609_soap_f1_auxb2_clean/{README.md,train_gpt_clean_SOTA.py}` | yes, both |
+| **record #45** README (4 190 B) | `.../results/20260611_tailema_2720_submission/README.md` | yes, full |
+| sibling #45b README (4 769 B) | `.../results/20260611_tailema_2730_submission/README.md` | yes, full |
+| **record #36 tuned-Muon baseline** log | `.../results/20260610_tuned_baseline_3250/263ea3c4-2b13-4adf-8a71-0410386b20e1.txt` | yes, full (source + H100 8-GPU loss curve) |
+| all 62 `.py`/`.md` in the track | fetched in one pass, string-scanned for `ColRow`/`Muon+`/`Muon++`/`ns_steps`/`zeropower_via_newtonschulz5` | scanned, not read |
+| arXiv title checks | `arxiv.org/abs/2510.12402`, `arxiv.org/abs/2411.16085` | title metadata only |
+| our own config (read-only, local) | `crates/dormouse-train/src/optim.rs:82-94`, `configs/small.toml`, `vendor/burn-fused/crates/burn-muon-plus/src/lib.rs`, `burn-tensor-0.22.0-pre.4/src` | grepped |
+
+**Not read:** the per-seed `A40_seed*.txt` / `H100_*.txt` log bodies (each ~115 kB, 20 of
+them), `burn-sct`'s QR implementation beyond its signature, and the arXiv papers themselves.
+
+---
+
+## 2. What the current record (#46) actually is
+
+From `results/20260619_cwd_rowfloor_tailema/README.md` (TL;DR) and the docstring +
+`Muon.step()` of `train_gpt_cwd_SOTA.py`. Quoted, not paraphrased.
+
+**2690 steps, n=8 A40 (2×A40), mean val 3.278329, `(3.28 − mean)·√8 = 0.00473 ≥ 0.004`.**
+The tuned baseline (#36) is 3250 steps. The record README's own framing:
+
+> "**Not a new optimizer:** this is the clean **SOAP-Muon** base from PR #321 … with
+> **three small, independently-ablated levers** stacked on top, each on a different axis
+> chosen to survive the per-step **radius pin** (which re-pins each hidden matrix's global
+> Frobenius magnitude every step, so only **readout / directional / shape** changes persist)"
+
+Component by component, in the track's words, with what each is claimed to do:
+
+**(A) Tail-EMA eval readout** — *"an eval-time-only partial weight-EMA blend over the
+cooldown tail."* `ema += (w − ema)/150` over steps [2400, 2900] for every parameter
+**except the token embedding**; at validation, evaluate `w_eval = 0.4·w + 0.6·ema`.
+*"Training is untouched — only the weights used for the val forward change."* The rationale
+is the model's own: *"The partial (not full) blend cancels the late cross-valley oscillation
+while still tracking the descending floor (a full LAWA/SWA average lags; a forward BEMA push
+overshoots — both tested and rejected)."* Claimed **≈ −42 steps** (avg-cross), the single
+biggest lever. Constants are derived, not tuned: `τ = (t_end − S)/p = (2900−2720)/1.2 = 150`
+was *predicted* 142 and *measured* 150 on a `t_end = 2950` trajectory; `λ ≈ 0.55–0.6`.
+
+**(B) RowFloor** (the one genuinely new piece) — *"a per-output-**row** u/w-floor on the
+orthogonalized update (replaces the scalar floor)."* Code:
+`f_row = clamp(0.3825 * ‖row_w‖ / ‖row_u‖, min=1.0)^1.0; u ← u · f_row`. Claimed ≈ −18
+steps. **Caveat the record itself prints:** *"only **RowFloor's −18** spans different seed
+counts (n=4 → n=8), so treat it as an estimate."*
+
+**(C) Cautious Weight Decay**, `CWD = 0.025`, applied **after** the radius pin —
+`mask = 1[update·p > 0]` (the coordinates the step is already shrinking), then
+`p *= 1 − lr·CWD·mask`. Claimed ≈ −19 steps, *"Dose is an inverted-U: 0.0125 weak, 0.025
+optimum, 0.05 over-shrinks."* Rationale: *"Cautious ⇒ WD never fights a coord the optimizer
+is trying to grow (isotropic WD is a no-op on the Muon path; the sign-gated version is not);
+per-coordinate ⇒ a matrix **shape** change, the one axis the radius pin leaves untouched."*
+
+**The base they sit on** (README "Active techniques" + the code):
+- **SOAP-Muon on all hidden 2-D matrices** — *"Before Muon orthogonalization, the momentum
+  update is preconditioned using SOAP-style row/column gradient covariance statistics …
+  `precondition_frequency=1`, `beta2=.90`."* The eigenbasis is refreshed with
+  `torch.linalg.eigh` on the Gram matrices + a QR, **every step** (`soap_step % 1 == 0`).
+  Attention's SOAP direction is **trust-gated** against raw momentum/gradient alignment,
+  norm-preserving.
+- **Radial brake + radius rescale** (the "radius pin") — decompose the update into radial
+  and tangential parts, multiply the **outward** radial part by 0.5, then after the step
+  rescale the weight tensor to the radius the radial component *intended*, removing
+  tangential norm drift.
+- **u/w floor** `TARGET_UW = 0.3825` (per-row in #46).
+- **EMA-Nesterov outer wrapper** — moves the model along an EMA-of-update lookahead
+  **before** the forward/backward, so gradients are taken at the lookahead position; one
+  forward-backward per step (it satisfies the benchmark's rule). `lookahead = 0.3·lr/max_lr`,
+  EMA 0.99, active after a 300-step prefill to step 1950.
+- **PowerCool LR** `lr = min(lr0, c·(2900 − step)^1.2)`, plus a **momentum schedule**
+  0.85 → 0.95 over 300 steps then 0.95 → 0.85 over the last 200.
+- **Aux Adam**: embedding + output head on `AdamW` (no WD); 1-D params on a minimal
+  **bias-correction-free** Adam with a **β2 split** (gains 0.99, most biases 0.997,
+  `attn.proj.bias` 0.9965). The class docstring is explicit: *"this intentionally does NOT
+  apply the (1−beta^t) bias correction, so it is NOT the same as torch.optim.AdamW."*
+- **Newton-Schulz core**: `a,b,c = 2, −1.5, 0.5`, **12 iterations**, run in **bfloat16**
+  (`X = G.bfloat16()`), normalized by a Frobenius Gram estimate, then
+  `update *= max(1, rows/cols)**0.5`. **This is plain Muon. There is no ColRow step.**
+- **Init**: all `*proj*` zero-init; `mlp.fc` depth-scaled by `1 − 0.30·l/(L−1)`; RMSNorm gains
+  from CGI/Rademacher antithetic pairs, `α = 0.125`.
+
+The record README's honesty note is worth quoting verbatim, because it bounds how much of
+this is load-bearing:
+
+> "Several active details have yet to be proven independently beneficial. We do not yet know
+> whether the attention SOAP trust gate is helping. The final Muon momentum cooldown is
+> probably irrelevant … the cooldown is scheduled over steps 2700..2900, but the accepted
+> validation is at step 2690. PowerCool may also be doing little … it is unclear whether the
+> Rademacher gain init matters, whether the depth-dependent mlp.fc init matters beyond a
+> below-stat-sig ablation signal of about 0.00003 val loss, or whether attn.proj.bias beta2
+> .9965 is meaningfully different from … .997."
+
+**Two unresolved discrepancies inside the source itself** (reported, not silently fixed):
+- The #46 README cites Cautious Weight Decay as **arXiv:2510.12402**; the same submission's
+  script docstring cites **arXiv:2411.16085** for the same lever. Both IDs are real and are
+  *different papers* (titles: "Cautious Weight Decay" and "Cautious Optimizers: Improving
+  Training with One Line of Code"). UNRESOLVED which the mechanism is derived from; I read
+  neither paper.
+- The track README line 173 reads *"Figure 1. The current WR is a 20.8% speedup compared to
+  a well-tuned baseline."* 2690 vs the tuned baseline's 3250 is **17.2 %** fewer steps, and
+  no other baseline is named on that line. UNRESOLVED.
+
+---
+
+## 3. How our optimizer compares
+
+**Ours** (`crates/dormouse-train/src/optim.rs:82-94`, `configs/small.toml`):
+Muon+ (`burn-muon-plus`, arXiv:2602.21545) with `NormDir::ColRow`, `ns_steps = 8`,
+`NS_COEFFS = (3.4445, −4.775, 2.0315)`, routed: Muon+ ColRow on the 2-D linear maps
+(Engram key projections, low-rank TSCT `u`/`v`), head-wise Muon+ on attention Q/K
+(`[64, 768]` per head, 12 heads), plain Adam wd=0 on the n-gram tables, AdamW elsewhere.
+
+**A direct comparison is not possible.** Three independent reasons, any one of which is
+sufficient:
+
+1. **No shared row.** I fetched and string-scanned every `.py`/`.md` in the track: zero
+   `ColRow` / `Muon+` / `Muon++`. The 46-row table has no run of our configuration, so
+   there is no "Muon+ = N steps" number to compare our number against. Absence of a
+   competitor is not a result about the competitor.
+2. **Different Muon.** #36 and #46 use 12 NS iterations with `(2, −1.5, 0.5)` in bf16 and
+   the `max(1, m/n)^0.5` scale. We use 8 iterations of the Muon+ quintic
+   `(3.4445, −4.775, 2.0315)` plus the post-polar ColRow norm, which the track never runs.
+   `burn-fused/bench/RESEARCH_VERIFICATION.md:13` records that our lr scale was *corrected
+   to* `max(1, m/n)^0.5` to match the reference — so even the shared component differs in
+   iteration count and coefficients.
+3. **Incomparable scale and metric.** The track's axis is **steps to 3.28 val CE on
+   FineWeb-10B, bpe-tokenized**, at `GPT(50304, 12, 768)`, `batch = 8·64·1024 = 524 288`
+   tokens/step, seq 1024, a 2 900-step schedule (~1.5 B tokens). Ours is a **byte-level
+   256-vocab** model at 9 195 854 params with **4 096 tokens/step** — ~128× smaller batch,
+   and a different unit of loss entirely (BPB on a held-out eval tail, not CE to 3.28 on
+   FineWeb). The track's README even pre-registers the objection that *"when the
+   architecture changes we may need different optimization algorithms."*
+
+**What is comparable:** the *qualitative* shape. The record's stack is built on plain Muon +
+aux Adam, i.e. the same family as our `--opt muon` / `mix` baseline, and it reports that
+SOAP preconditioning + a u/w floor + a radius pin are the load-bearing parts while five
+"geometry" modules are not (§5). That is a hypothesis about our stack, not a measurement of
+it, and per ADR-0002 it dies unless it beats its own removal on held-out BPB.
+
+---
+
+## 4. What we could adopt, on *this* hardware
+
+Constraints assumed: 1× RTX 5060 Ti, 16 GB, fp32 (bf16 matmul unusable — no bf16 type in
+the LLVM dialect, AGENTS.md §2.1), warm step ~245 ms of which `opt` is 43–47 ms (**19 %**),
+workload launch-bound (mean GPU utilisation 13.3 %).
+
+The benchmark's own rule is the governing constraint on all of this: *"Unlike the main
+NanoGPT speedrun which seeks to minimize wallclock time by any means, here we aim to
+minimize step count … **methods that are slow in terms of wallclock are perfectly OK**."*
+Wallclock is explicitly the wrong objective for that leaderboard and is the right one for us.
+
+| module | adoptable? | why |
+|---|---|---|
+| **Tail-EMA eval readout** | **YES, cheapest real win on the list** | Eval-time only: one extra fp32 buffer per non-embed param (≈ 37 MB at 9.2 M params) and a blend+restore at eval cadence. Zero hot-path cost. Directly fixes a class we own: our eval already has a fixed-window protocol (§2.6) and this is orthogonal to it. |
+| **Cautious Weight Decay** | **YES** | Two extra elementwise kernels per 2-D param (`update·p > 0`, `p *= 1 − lr·CWD·mask`). No new numerics, no new state, fp32-native. Also replaces isotropic WD on the Muon group, which we run today. |
+| **RowFloor / u/w floor** | **YES** | Per-row norms + a clamp + a scale: 4 small kernels. Same shape as our existing TSCT `retract` (already 52–61 ms of a 245 ms step at batch 8, and *non-amortising* across batch — a warning sign for anything added here). |
+| **Radial brake + rescale-to-radius** | **YES, with care** | 4 extra elementwise ops per param. The brake is a scalar-coefficient decomposition; the rescale is a `mul_`. Both are launch-cheap but the box is launch-bound, so each is a fixed tax. Note the record's `p.add_` then `rescale_to_radius` is an **in-place weight mutation after the optimizer step** — safe for us, but it must not break the NaN firewall's in-place assumptions (ADR-0016). |
+| **EMA-Nesterov lookahead** | **MAYBE** | Needs **two extra full-model buffers** (`prev_params` + `lookahead_buffer`, ~74 MB at 9.2 M) and a per-step `p.copy_()` of the whole model, plus a per-param `add_`. Still one fwd/bwd, so it does not violate our zero-sync rule and the lookahead is a device op. But it is a full-model copy per step, which is exactly the launch/memory traffic §2.2 says the workload cannot absorb. |
+| **PowerCool LR schedule** | **YES, free** | Host-side scalar. Our `set_hparams` equivalent. Note the record's own caveat that it "may also be doing little in this record". |
+| **Aux Adam β2 split** | **YES, free** | Host-side hyperparameter per param family. No numerics change. |
+| **SOAP-Muon (the big one)** | **NO — hard blocker** | `precondition_frequency=1` means an `eigh` of the (m×m) and (n×n) Gram matrices **every step, for every hidden 2-D matrix**. `burn-tensor 0.22.0-pre.4` has **no `eigh`/`svd`/`cholesky` function at all** (grepped `src/`); the only QR we have is `burn-sct`'s, which is a host-side loop. On our shapes (d_model 768, rank 64, d_ffn 2048) the per-step Gram eigenbasis is both unimplementable here and far too expensive for a 19 %-of-step budget. **Not adoptable without writing a batched GPU symmetric-eigensolver.** |
+| **bf16 Newton-Schulz** | **NO, but trivially fixable** | The record runs NS in `bfloat16`; our backend has no bf16 type, so a literal port dies at kernel compile. Running the same 12 iterations in fp32 is a one-line change and is what we already do. **This is a porting detail, not a reason to reject the stack.** |
+| **The record's exact hyperparameters** | **NO** | `TARGET_UW = 0.3825`, `MUON_LR = 0.0375`, `CWD = 0.025`, `τ = 150`, `λ = 0.6` are tuned for 524 k tokens/step and a 2 900-step horizon at 162 M params. Our LR conventions already differ (`research/2026-09-26-small-lm-dynamics.md:77` argues our peak LR may be starved by ≥4×). Copying constants without a sweep is the same class of error as copying a record number. |
+
+**Ordering, if we do anything:** Tail-EMA readout first (eval-only, zero hot-path cost, and
+it improves the *instrument* every other arm is judged with), then CWD, then the floor/pin.
+SOAP is off the table until there is a GPU eigensolver. Each is a §1.2 A/B: 3 seeds,
+2 k+ steps, pure CE, and **against its own removal** — the radius pin and the floor are
+exactly the kind of "barnacle" the track itself documents as neither helping nor hurting.
+
+---
+
+## 5. What the "neutral geometry modules" finding means for simplification
+
+**This is the most directly on-point result in the track for the owner's goal**, and it is
+worth its own reading. Record #44 (`results/20260609_soap_f1_auxb2_clean/README.md`) states:
+
+> "…and **removes seven redundant geometry modules — including Circuit-Muon itself** — that
+> ablate neutral once the all-hidden, every-step SOAP is in."
+
+The seven, per that README: **Circuit-Muon** (per-head attn V↔O coupling),
+**Contra-Muon**, **Soft-Muon** (Schatten-soft orthogonalization), **Aurora** (wide-matrix
+row-rescale), the **attn-SOAP denominator floor**, the **V-SOAP-blend**, and
+**NorMuon-lite's per-row 2nd-moment half** (the Adafactor-like row/col variance
+preconditioner) plus dead `MUON_WEIGHT_DECAY` and dead code. The submitted script's
+docstring says the removals are *"functionally identical to running the source … with
+CONTRA_COEFF=0, CIRCUIT_OFF=1, AUX_CENTER_SHRINK=1.0"*. The claimed payoff is explicit and
+is **not a loss claim**: *"All while **shrinking the stack to 910 lines** (smaller and ~19 %
+faster per step)."* i.e. **998 → 910 lines (−88) and ~19 % faster per step at the same 2750
+(H100 n=20) / 2755 (A40 n=8) boundary.** #46 then went further: 981 lines total, and the
+#46 README describes the base as *"the clean SOAP-Muon stack … with Soft-Muon / Contra-Muon /
+Circuit-Muon / CenterShrink / Aurora removed."*
+
+**Three honest limits on how far that transfers.**
+
+1. **Scale.** This was measured at `GPT(50304, 12, 768)` — **≈ 162 M params by arithmetic
+   from the code's own shapes** (my computation, not a sourced number) — with
+   `batch = 524 288` tokens/step, seq 1024, 2 900 steps, on 8×H100 / 8×A40 / 1×GH200.
+   Ours is **9.2 M params at 4 096 tokens/step**: ~18× fewer parameters and ~128× smaller
+   batch. At 9.2 M params, batch 8, the GPU is **idle 87 % of a warm step** and the
+   optimizer is 19 % of it. A module that is free in wallclock at 162 M can be a large tax
+   here, and a module that is redundant on 12 dense transformer blocks is not obviously
+   redundant on a weight-shared loop block with 3 spectral experts.
+2. **The removals were not paired against a kept run.** The #44 README's own bookkeeping is
+   *"Change 4 [μ cooldown] and the removals below together account for the final ≈ −20 steps
+   (2775 → 2755)"* — the removals are bundled with a schedule change, and the removal
+   evidence offered is *"loss-neutral (verified identity / within GPU noise)"* plus, for
+   NorMuon-lite specifically, a **code-identity** argument (`NOR_BETA2=1.0 → identity`, i.e.
+   it was already inert). I found **no paired n-vs-n table isolating the seven removals
+   alone.** The defensible reading is: *they were free enough to delete*, not *"each one was
+   individually proven neutral at n=20."*
+3. **What actually replaced them.** #44's headline win came from the **local accuracy
+   levers** — aux-β2 split (≈ −45 steps), SOAP on all hidden matrices at freq=1 (≈ −30),
+   LR cooldown horizon 2980 → 2900 (≈ −25). The removals rode along with those. So the
+   honest statement is: **once the preconditioner is strong, several extra geometry modules
+   stop paying for themselves.** That is a statement about redundancy under a strong
+   preconditioner, not a general licence to delete geometry.
+
+**What this licenses for us, concretely.** The finding supports deleting machinery that is
+(a) duplicated in effect by a stronger preconditioner and (b) not load-bearing under a
+*removal* A/B. It does **not** support deleting anything on the strength of this table.
+Under ADR-0002 + the current state in AGENTS.md §3.3 (the attention arm's gradient is
+unverified, the eval's memory arm has no test, one A/B arm's cost is unknown), the
+prerequisite is a re-baselined control, and every arm must beat **its own removal** on
+held-out BPB in our eval window. The one free thing this buys us is a **prior**: read our
+own `burn-fused` optimizer modules with the expectation that some are barnacles, and give
+each one an explicit A/B-or-delete line rather than assuming it earns its place.

@@ -1,0 +1,434 @@
+# Is a weight-shared loop still the right way to spend depth? (fetched 2026-09-29)
+
+**Question.** dormouse spends its depth in one weight-shared `LoopBlock` applied `max_iter` times,
+with a per-iteration controller; PonderNet halting was deleted (ADR-0013) in favour of fixed depth.
+As of 2026-09-29, is that shape still right, and what has replaced it?
+
+**Method.** arXiv API + Semantic Scholar citation graph + full HTML for the two decisive papers.
+Fetched **2026-09-29** for everything below. 3 papers read in full text; ~14 read at abstract depth
+with the abstract quoted; ~120 citing papers of MoR enumerated by title. Repo read-only.
+
+---
+
+## 0. Provenance
+
+Full table at the end. The two read in full:
+
+| ref | id | version | date | how read |
+|---|---|---|---|---|
+| **A** | arXiv:2604.21106 — *How Much Is One Recurrence Worth? Iso-Depth Scaling Laws for Looped LMs* | v3 | 2026-05-07 (v1 2026-04-22) | full HTML |
+| **B** | arXiv:2608.15062 — *Gated Recurrent Transformers* | v4 | 2026-08-26 (v1 2026-08-15) | full HTML |
+
+Everything else is abstract-level. I say so per row. Two search results are themselves evidence:
+
+- `search_query=("depth-recurrent" OR "looped language model" OR "recurrent depth") AND ("byte-level" OR "byte level")`
+  → **`totalResults` = 0** (2026-09-29). No paper in the arXiv abstract index combines a byte-level
+  LM with depth recurrence.
+- `all:"looped transformer"` → 155 results; `all:"Mixture-of-Recursions"` → 5. MoR's citation graph
+  via Semantic Scholar returned 120 citing papers.
+
+---
+
+## 1. Verdict
+
+**No — and the reason is the opposite of the one we assumed.** The 2026 literature is consistent and
+mostly *negative* at matched **compute**: Schwethelm et al. [A] measure a recurrence-equivalence
+exponent **φ = 0.46** over 116 runs, meaning a block applied 4 times buys ~1.9 unique blocks' worth of
+capacity for 4 blocks' worth of FLOPs, and three further independent groups reproduce the sign at
+124M–774M. Every paper that reports looping *winning* wins at matched **parameters**, which is not our
+constraint — at 9.2M params on a card that idles 87% of a step, four unique blocks cost roughly the
+same wall-clock as one block applied four times, so the matched-compute result is the one that applies
+to us. The honest caveat is severe and I will not soften it: **every measurement below is at 30M–774M
+non-embedding parameters on a BPE-tokenized corpus, and no one has ever run this comparison on a
+byte-level model** — this is an extrapolation down ~3 orders of magnitude in size, and it earns our own
+A/B before it earns our architecture.
+
+---
+
+## 2. The two regimes, which is why the literature appears to disagree
+
+Almost every apparent contradiction in this literature dissolves once you name the constraint.
+
+| regime | what is held fixed | who reports it | who wins |
+|---|---|---|---|
+| **isoParams** | unique parameters; depth bought with FLOPs | Parcae [D], SMELT [E], Hyperloop [F], GRT isoParams [B], LoopMoE [G] | **looping**, +0.06 to +0.11 nats |
+| **isoFLOPs** | per-token FLOPs; params bought by sharing | Schwethelm [A], GRT isoFLOPs [B], Lee et al. [H], TaH2 [I], CART [J], Dual-Path [K] | **untied**, by 0.03–0.11 nats |
+
+`[B]` §2 states the split explicitly and traces it to Kaplan et al. 2020 [1]: *"recurrent models
+perform better at matched parameter count (isoParams) but worse at matched compute (isoFLOPs)."*
+That observation is six years old and is still the field's operating assumption. (I have this via [B]'s
+citation of it; I did **not** open Kaplan et al. — UNRESOLVED as a direct source.)
+
+**Which regime is dormouse in?** Neither cleanly, and this is the whole decision:
+
+- We are **not** parameter-bound. 9,195,854 params on a 16 GB card. The literature's isoParams win is
+  available to us for free only if we had spare parameters to spend — we do not, and growing 4× to
+  36.8M is what the isoParams regime would demand.
+- We are **not** compute-bound either. AGENTS.md §3.1 (measured 2026-09-29 by hand on this box):
+  warm step **~245 ms**, split `bwd 96-98 · retr 52-61 · fwd 46-48 · opt 43-47`, **GEMMs 2–5% of a
+  step**, and mean GPU utilisation **13.3%** with 79% of samples ≤5%. The workload is launch-bound.
+- So the real constraint is **wall-clock per step**, and under launch-boundness four *unique* blocks
+  and one block applied *four times* cost close to the same wall-clock — the extra arithmetic in the
+  untied arm is the 2–5% GEMM share, not the launch share. That puts us **nearer the isoFLOPs
+  regime than the isoParams one**, which is the regime where the answer is "untied."
+
+This is a **derived inference from our own measurements, not a published result** — see §6.
+
+---
+
+## 3. Candidate table
+
+Evidence type is stated per row. "Isolates the shape?" asks whether the comparison holds attention,
+tokenizer and data regime fixed and varies only weight sharing across depth.
+
+| # | paper | what it changes | scale | evidence | isolates the shape? |
+|---|---|---|---|---|---|
+| **A** | **Iso-Depth Scaling Laws** 2604.21106v3 [Schwethelm, Rückert, Kaissis] | nothing — *measures* the sharing cost. Joint law `L=E+A(N_once+r^φ N_rec)^-α+B D^-β`. r∈{1,2,4,8}, 20 effective layers, (ℓ_pre,ℓ_coda)=(2,2), d_model=64s, 6 budgets 4.64e17→2.15e19 FLOPs, **116 runs** | 30.3M–410M non-emb, FineWeb-Edu + Llama-2 32k, seq 2049, MuonH | **full text.** φ=**0.459**, 95% block-bootstrap CI **[0.41, 0.53]**; no resample reaches 0 or 1. Compute-optimal loss frontier trails the r=1 baseline by **[0.03,0.06] nats at r=2, [0.05,0.08] at r=4, [0.09,0.12] at r=8**. Extrapolation: s=34 on 47B tokens (~4e20 FLOPs) → r=4 trails by **0.061 nats**. *"replacing unique blocks with shared recurrences increases validation loss at matched training compute"* | **YES — this is the cleanest comparison in the literature.** Effective depth fixed at 20, per-token FLOPs matched at equal width, only N_once/N_rec split varies. Same data stream, same LR sweep (regret <0.005 nats). *Caveat: one architecture family, one recipe; authors state φ is not a property of looping in general.* |
+| **B** | **Gated Recurrent Transformer** 2608.15062v4 [Hegazy, Alanwar, Elhoushi] | prelude + shared core ×R + coda; per-**element** gate conditioned on (h^(r-1), h^(pre), noise); `r~Uniform{1..R}` depth sampling | GPT-2 small/medium/large, 124M/354M/774M dense equivalents, 20k steps, ~9.8B tokens, GPT-2 BPE 50,257, T=1024, nanoGPT | **full text.** isoFLOPs val loss — Small: **3.145±0.004 (3 seeds) vs dense 3.188±0.056** (GRT wins, narrowly); Medium **2.89 vs 2.84**; Large **2.77 vs 2.71** (dense leads 0.05/0.06). Downstream at large isoFLOPs: **42.08 vs 42.05** avg (tie). isoParams: **3.04/2.76/2.65 vs 3.15/2.84/2.71** (GRT wins 0.11/0.08/0.06). | **Mostly yes** — dense baselines trained from scratch under the identical recipe, four recurrent competitors retrained identically. *Confound: the gate is a new component; the ablation table below separates it.* |
+| **C** | **CART** 2606.01495v2 [Capps] | frozen K/V from a 6-block prelude; core cross-attends; learned LTI gate | 64-config screen @3,000 steps → 36 configs (P=6, R∈{6,8,10}, 3 seeds) @30,500 steps ≈1B tokens, d∈{256,512,768,1024}, **single consumer GPUs** | abstract. At the binding d=1024 test CART **loses 1–2% at stored-parameter parity and ~10% at effective-parameter parity**. Ablation splits the gap: **~5% from weight sharing**, ~5% from the prelude/anchor/core/coda framing. *"the recurrent-core machinery (hyper-connections, LTI gate, loop-index embedding) is individually vestigial."* *"Variable-R inference degrades on both sides of the trained R, a negative result for test-time depth scaling."* | **Yes, and the most relevant scale** (d≤1024, ~our order). Single author, no peer review, but the ablations are unusually honest and it is the only one that *attributes* the gap. |
+| **D** | **Parcae** 2604.12946 [Prairie, Novack, Berg-Kirkpatrick, Fu] | spectral-norm constraint on the loop *injection* parameters | to 1.3B | abstract. Loop instability traced to large spectral norms in injection params (residual explosion, loss spikes). Parcae: **up to 6.3% lower val ppl** than prior looped; at 1.3B **+2.99 CORE / +1.18 Core-Extended at fixed parameter and data budget**. | **No — isoParams only.** It *assumes* the win and fixes the stability. Its value to us is diagnostic: it names the mechanism by which looped models blow up. |
+| **E** | **SMELT** 2609.01343v3 [Wang, Zhang, Luo, Wu, Liu, Liu, Huang, Yan, Li] | loop the middle half of layers ×2 | four sizes to **54B** non-emb | abstract. Matches per-token FLOPs, non-emb params **and KV cache**; separate Chinchilla fits; **saves 6.8–18.0% of training FLOPs on the compute-optimal frontier**; largest on Code; second visit reduces the attention sink. | **The one apparent isoFLOPs win, and the exception that proves the rule:** it is **MoE**. See §4. |
+| **F** | **Hyperloop** 2604.21254v3 [Zeitoun, Torroba-Hennigen, Kim] | begin/middle/end; only middle recurs; **hyper-connections at the loop boundary** (K parallel residual lanes) | "various model scales" (unspecified in abstract) | abstract. Matches depth-matched Transformer and mHC baselines with **~50% fewer parameters**; survives PTQ. | **No — isoParams.** Its real value to us is the **same mechanism [A] credits with φ 0.45→0.65.** |
+| **G** | **LoopMoE** 2606.04438v2 [Chen, Li, Huang, Yin, Shang, Qin] — EMNLP 2026 | IterAdaLN: modulation conditioned on (iteration index, per-token state), resolving weight-sharing symmetry; capacity balancing to restore the attention:FFN active-param ratio | 3B, 9B | abstract. *"the first strictly controlled, head-to-head evaluation of a looped MoE against a Vanilla MoE under identical total parameters, per-token FLOPs, and active sublayer ratios."* Gain over matched vanilla MoE **>1 pt at 3B → ~3 pts at 9B**. | **Best-designed isoFLOPs+isoParams comparison in the positive camp — and it is MoE again.** Also: our per-iteration controller is a *coarser* version of their IterAdaLN. |
+| **H** | **Sparse Layers are Critical** 2605.09165v2 [Lee, Biloki, Hu, May] | none (measurement) | standard + MoE, with/without looping | abstract. *"looped models do not scale as favorably as standard transformers with unique layers."* **Dense looped models do not scale better; Looped-MoE does** — traced to routing divergence between loops letting different experts fire per pass. Loop boundaries are superior early-exit points. | **Yes** — a standard-vs-MoE × looped-vs-not factorial. Independent group, independent of [A]. |
+| **I** | **TaH2** 2609.35748v1 [You, Fu, Feng, Lv, Ning, Ding, Wang] — 2026-09-28 | lookahead depth supervision; per-token iteration decider on a post-trained looped backbone | Qwen-family, AIME, post-training | abstract. *"existing looped transformers often yield steeper slopes than their non-looped baseline, yet underperform it at matched compute."* On AIME: slope **2.74 vs 1.79** (+53%), **+3.4 pts** at matched test-time compute; +2.8 at depth 2 → +3.9 at depth 8. | **No — post-training/inference only, no pretraining comparison.** Included because it is the freshest statement (one day old) and it is the successor to the adaptive-depth work; it *confirms* the matched-compute deficit. |
+| **J** | **Foil** 2609.35751v1 [Wang, Ma, Hariri, Ganguly, Yang, Tong, Liu, Han, Chaudhary] — 2026-09-28 | **untie the attention** (own params per pass), flatten MoE experts, share only experts+routers | 20B and 100B tokens | abstract. *"Foil clearly outperforms the unflattened looped baseline"*; at 100B tokens the most-flattened Foil ends **0.012 nat below the baseline at equal parameters and compute**. | **No — triple-confounded** (expert flattening + attention untying + pass count at once). Direction is what matters: the newest MoE work on looping is about *partially untying* it. |
+| **K** | **Dual-Path** 2605.30202 [Frey, Shomali, Koehler, Ali] | deep (shared ×K) **and** wide (enlarged FFN, applied once) as parallel paths with per-token gates | two FLOP budgets | abstract. States the premise as given: *"at fixed FLOPs a looped model has strictly less capacity than a baseline transformer."* Surpasses iso-FLOP-matched models. Gates interpretable: function words/lexical content → wide; punctuation, symbols, arithmetic → deep. | **No, but it is the most direct architectural answer to [A] and the cheapest to steal.** |
+| **L** | **Attractor Models** 2605.12466 [Fein-Ashley, Rashidinejad] | replaces unrolling with **implicit-differentiation fixed-point solving**; iterations chosen by convergence; training memory constant in depth | 770M, plus 27M reasoning models | abstract. *"Attractor Models deliver a Pareto improvement over standard Transformers and stable looped models across sizes"* — up to 46.6% ppl / 19.7% acc. **A 770M Attractor beats a 1.3B Transformer trained on 2× the tokens.** "Specialized recursive reasoners collapse at larger sizes." Adds *equilibrium internalization* (solver removable at inference). | **No — new mechanism, not a shape ablation.** This is the most interesting *replacement* on the list. |
+| **M** | **Residual Scaling of Looped Transformers** 2606.18524v2 [Wang, Li, Zhang, Huang, Yan, Li] | ε = 1/N (factored λ/(N√L)) instead of the depth-prescribed 1/√L | loop counts, TBD (abstract) | abstract. Weight sharing makes residual updates **correlated across iterations**, so 1/√L *"is insufficient"*; 1/N improves trainability and loss across loop counts. **Optimal LR depends only on the number of unique layers L, not the loop count N** → direct hyperparameter transfer. | **No — a training/architecture recipe change.** **Directly actionable on our ReZero / Gated Residual.** |
+| **N** | **MoRE** 2609.18176v2 [Qiu, Acikalin, Lovelace, Belardi, Mulchandani, Gomes, Weinberger] — COLM 2026 | shares *expert pools* across adjacent layer groups; depth embeddings condition each layer's input before routing | 114M–1.15B | abstract. *"Recurrent Transformers achieve parameter efficiency by reusing layer weights, but typically lack the capacity for competitive language modeling."* Beats MoE **and SOTA weight-sharing** at matched compute **and** parameter budgets. | **Partial untying again** — reuse at group granularity with per-layer conditioning. |
+
+### 3b. What has cited MoR (2507.10524) since — 120 citing papers enumerated
+
+Full list in §8. What they concluded, filtered to verdicts:
+
+- **One clean head-to-head exists and MoR loses it.** [B] retrains MoR from scratch under an
+  identical recipe at isoFLOPs: **MoR 3.30 / 3.02 / 2.91** against GRT's 3.14 / 2.89 / 2.77 — **last
+  of five recurrent methods at every scale** (worse than heavy-tail Poisson depth sampling, Ouro, and
+  RRT). At isoParams MoR is 3.12 / 2.78 / 2.69, i.e. it also loses to GRT there (3.04 / 2.76 / 2.65).
+- **[A] cites MoR as a *baseline*, not a rival**: it lists per-token adaptive compute as future work,
+  and its own answer to MoR's regime is a different axis.
+- **The adaptive-depth line moved past MoR, not back to it.** TaH (2511.08577) → **TaH2** [I] is the
+  successor: same "think harder on the tokens that need it" thesis, but a *supervised lookahead decider*
+  on a *post-trained* backbone instead of a router trained end-to-end from scratch. [I]'s diagnosis —
+  *"many tokens do not benefit from extra iterations"* — is the finding, not a MoR improvement.
+- **Adaptation, not evaluation** dominates: bioMoR (omics), SoftMoR / MoR-Swin / MoR-ST (vision),
+  LoopMoE (MoE), T-LoopFormer. None is a clean verdict on the language-modeling claim.
+- **Nothing in the graph rehabilitates MoR at small scale.** That matters, because we are 15× below
+  MoR's smallest arm and MoR already loses to vanilla at 135M ([prior report, §1]).
+
+**Our `use_mor` arm is therefore the one item here where I would say the external evidence justifies
+not spending A/B budget at all** — third-party loss at every scale in the only clean comparison, a
+documented loss to vanilla at 135M, a non-causal top-k router whose aux BCE and per-depth token
+gather both conflict with our stack (the gather is dynamic token-subset indexing, the pattern that
+crashes cubecl on sm_120), and zero benefit against a launch-bound step. That is a *prior*, not a
+measurement — per the project's own rule, it stays a proposal until someone runs it.
+
+---
+
+## 4. The refutations
+
+This section is the point of the report. I am not softening it.
+
+### 4.1 The sharpest one: φ = 0.46, over 116 runs
+
+`[A]` holds **effective depth fixed at 20 layers** and per-token FLOPs matched, varying only how those
+20 layers are parameterised. Unique non-embedding params drop 3.2× as r grows (r=4 keeps ~41%).
+Result: the compute-optimal loss frontier **trails the untied baseline monotonically in r** —
+[0.03,0.06] nats at r=2, [0.05,0.08] at r=4, [0.09,0.12] at r=8 — and the gap does **not** close at
+scale: at 20× the top of the grid (s=34, 47B tokens) r=4 still trails by **0.061 nats**. In the
+authors' own framing: at r=4, a 410M looped model performs on par with a 580M untied model but incurs
+the training cost of a 1B one. Their interpretation is unambiguous: *"Our measurement says no, not
+under our recipe."*
+
+**The same paper tells us the two escapes**, and they matter more than the verdict:
+- **Hyperconnections (K=2 lanes, at the loop boundary) raise φ from 0.45 → 0.65** *and* lower
+  validation loss *and* narrow the compute-optimum. This is the only intervention in the literature
+  that improves the *shape* rather than trading one axis for another.
+- **Truncated backpropagation lowers φ to 0.38** while *lowering* validation loss — the exact trap
+  the paper warns about: the loss improves by buying more tokens, and the recurrence gets weaker. If
+  we ever adopt truncated BPTT to make the loop affordable, this is the number that says it did not work.
+
+### 4.2 Dense looping loses; only MoE looping scales
+
+`[H]`: *"looped models do not scale as favorably as standard transformers with unique layers"* — and
+the fix is not a better loop, it is **sparsity**: Looped-MoE scales better because *"different experts
+are activated on each pass through the same layers, recovering expressivity without additional
+parameters."* The two papers that *do* win at matched compute — `[E]` SMELT and `[G]` LoopMoE — are
+**both MoE**. `[E]` is explicit that it loops "the middle half of layers twice," not the whole stack.
+The convergence is uncomfortable for a dense 9M model: **in the dense regime, matched-compute
+looping has not been shown to win by anyone in 2026.**
+
+### 4.3 Gated Recurrent Transformer: the best-engineered pro-loop paper still loses at scale
+
+`[B]` is the paper closest to our architecture (prelude/core/coda + gating + depth sampling) and the
+clearest pro-looping case at small scale. Its own text: *"At medium and large scale the dense baseline
+leads at the standard budget, by 0.05 and 0.06 nats respectively."* At large scale the isoFLOPs model
+ties on downstream average (42.08 vs 42.05) while using 37% of the parameters — a real win on
+*memory*, a loss on *loss*.
+
+Its component ablation is the single most useful table in this report for us, and it is a **refutation
+of naive sharing**, not of gated sharing:
+
+| component added | Δ val loss |
+|---|---|
+| recurrence alone (nothing else) | **+0.107 nats — worse than the dense baseline** |
+| + prelude/coda boundaries | +0.035 |
+| + state noise at every step | +0.018 |
+| + prelude re-injection each recurrence | +0.022 |
+| + elementwise gate | **−0.048 (largest single contributor)** |
+
+**Bare weight sharing costs 0.107 nats.** Everything that distinguishes the recurrence steps buys that
+back. The same paper's CKA analysis then concedes the residual concern: *"representations across
+recurrence steps are more similar to one another than representations across layers in a standard
+transformer of matched depth, suggesting the shared block learns a broadly applicable transformation
+rather than depth-specialized ones"* — in the model built specifically to fix collapse.
+
+### 4.4 CART attributes the loss to weight sharing itself, at our scale, with a single consumer GPU
+
+`[C]`, d=1024, 3 seeds, 30,500 steps: **~5% of the gap is from weight sharing**, a further ~5% from the
+architectural framing, and — the sharpest sentence in this section — **the recurrent-core machinery is
+"individually vestigial."** It also reports a negative test-time result: *"Variable-R inference degrades
+on both sides of the trained R."* The Staging-1 ranking of R **reversed** at full training.
+
+### 4.5 The loop is unstable in ways we already know about, and it gets worse with depth
+
+- `[D]` Parcae: existing looped recipes suffer **residual explosion and loss spikes**; the cause is
+  large spectral norms in the loop *injection* parameters.
+- `[M]`: the standard depth-scaling rule ε = 1/√L **is insufficient for looped architectures** — weight
+  sharing correlates the residual updates, so you need ε = 1/N. That is a statement that the ordinary
+  deep-net recipe is *wrong* for a loop, and our ReZero/Gated Residual is in that territory.
+- Fully Looped Transformer 2605.18797v2: *"other baseline looped models collapse"* at 12 loop
+  iterations. (abstract)
+- Chained Recursion Models 2606.00605: a **proved** algorithmic implicit bias — a looped linear
+  transformer with LN provably converges to the power method. (abstract)
+
+### 4.6 A theoretical ceiling, stated as a limit on the *state*, not the weights
+
+2605.30757 (abstract): a **compressed** loop — one that carries a fixed-size state between
+iterations — *"is limited by the size of its recurrent state. Running the loop longer adds computation
+but does not by itself create a growing scratchpad"*, and under a standard complexity assumption such
+loops cannot decide P-complete problems under logspace reductions. Our loop is in this class: per the
+prior in-repo analysis of `loop_block.rs`, the residual stream is **reset to `h_ctx` each iteration**
+and what persists is the KDA attention state. So our loop is a fixed-state loop, and running it longer
+buys FLOPs, not memory.
+
+### 4.7 The two things that genuinely are working — and neither is a shared-weight loop
+
+- **Partial untying.** `[J]` Foil (2026-09-28) untyes the *attention* while sharing experts and
+  routers. `[N]` MoRE shares expert pools across adjacent layer groups with depth embeddings. `[M]`
+  argues LR should not move with loop count. `[K]` adds a wide parallel path so the "one block" is not
+  the only source of capacity. The direction of travel in 2026 is **less sharing, more conditioning**,
+  not more sharing.
+- **Not unrolling at all.** `[L]` Attractor Models replaces the unrolled loop with implicit-differentiation
+  fixed-point solving, and reports a Pareto improvement over *both* standard Transformers and *stable
+  looped models* — a 770M Attractor beating a 1.3B Transformer on 2× the tokens. "Specialized recursive
+  reasoners collapse at larger sizes." For a 9M byte model on a 16 GB card this is a long shot and
+  would be a rewrite; it is on the list because it is the only *replacement* with a headline result
+  against the loop itself.
+
+---
+
+## 5. What would settle it for us
+
+### 5.1 The trap in our own protocol, found in the literature
+
+`[C]` is the reason the cheap experiment below is dangerous: a 3,000-step screen ranked the loop
+counts in an order that **reversed** at 30,500 steps, and prelude depth dominated loop count
+outright. Our ladder is 200–500 step smoke → 2k confirm (AGENTS.md §1.2). That is **10–150× shorter
+than the point at which the only clean small-scale study saw its ranking flip.** Whatever the loop-count
+A/B returns at 2k steps is a measurement of 2k steps.
+
+### 5.2 The minimum experiment: one new arm, three seeds, fixed wall-clock
+
+Not a φ fit. We cannot afford the 116-run grid, and we should not pretend otherwise. The decision we
+actually face is binary and one config apart:
+
+| arm | architecture | wall-clock/step (est.) | what it answers |
+|---|---|---|---|
+| **A0** (control) | `small`, `max_iter=2`, 1 shared block — re-baseline | **245 ms** (measured) | is our own control clean |
+| **A1** | `small`, `max_iter=4`, 1 shared block applied 4× | **~390 ms** | the loop at full depth |
+| **A2** | 4 **unique** `LoopBlock`s, `max_iter=1` each (same 4-block-execution depth) | **~470–510 ms** (SPECULATION) | untied at the same depth |
+
+All three at **identical `batch` and `seq_len`**, so the eval window matches and the byte count on the
+eval line is quotable (§2.6). All three judged on **held-out BPB at equal wall-clock seconds**, not at
+equal steps — that is the constraint we have, and equal-steps would flatter A1/A2 by giving them more
+tokens.
+
+**Honest cost.** A0 2k steps = 8.2 min × 3 seeds = **25 min**. A1 2k steps = 13 min × 3 = **39 min**.
+A2 2k steps = 17 min × 3 = **51 min**. Total **≈ 1.8 GPU-hours**. A 10k-step version — long enough to
+be past `[C]`'s reversal, long enough for `[A]`'s noise floor — is **≈ 9 GPU-hours**, and that is the
+one I would actually run.
+
+**The error bar on those numbers is large and I will not hide it.** 245 ms is a **floor**: that
+measurement was taken with the attention backward *not executing* (`fused kda=<f>/0`, AGENTS.md §3.1),
+and §3.3 records the 25.8 s/step tensor-op KDA backward figure as having **no committed log**. If that
+figure holds, one A/B arm is ~14 GPU-h per 2k steps and the whole design is a weekend, not an evening.
+**Both blocks are gated on the same precondition `docs/AB-PROTOCOL.md` already states**: a new control
+must show `fused kda=<f>/<b>` with **b > 0** and a non-zero `engram=` field on the eval line, or
+every number this produces is void for the reason in §3.2 of AGENTS.md.
+
+**Implementation cost, stated plainly.** A2 has no flag. It needs a `n_blocks` field and a stack in
+`model.rs` (~30–60 lines), plus `L_Rec` degrading from per-iteration to a single CE. That is the entire
+price of the experiment, and it is the only code this research implies.
+
+### 5.3 If the loop survives, the four changes the evidence actually supports
+
+Ranked by measured effect, all cheap, all from papers read above:
+
+1. **Hyper-connections at the loop boundary (K=2).** φ **0.45 → 0.65** `[A]`; the only genuine
+   capacity gain measured anywhere `[F]`. Highest expected value per line of code.
+2. **ε = 1/N residual scaling** (factored λ/(N√L)) `[M]`, in place of whatever ReZero scalar we tuned
+   by hand. Bonus: the optimal LR then depends on unique layers, not loop count — free hyperparameter
+   transfer, which matters because we cannot afford LR sweeps.
+3. **A per-*element* gate, not a per-arm scalar.** `[B]`'s ablation: gate −0.048, the largest single
+   component; our controller emits three scalars (w_attn, w_mem, w_ffn) plus a softmax expert blend.
+   `[B]` and `[G]` (IterAdaLN) both argue the conditioning must be on (current state, iteration,
+   input) jointly, not on a global arm weight.
+4. **Prelude and coda around the shared core, with the prelude re-injected every iteration.** +0.035
+   and +0.022 in `[B]`'s ablation. We have neither — our loop is `max_iter=1`-shaped in effect.
+
+Keep `--rand-depth`: `[B]` uses `r~Uniform{1..R}` and reports it as a *free* regulariser plus a
+free early-exit curve, and the prior in-repo report already recommends it. **Do not build the halting
+head back** — `[I]`'s supervised-lookahead successor is post-training-only and needs a signal we do
+not have.
+
+### 5.4 Byte-level: where transfer is doubtful, and where it is not
+
+**The honest negative: zero papers.** arXiv full-text search for byte-level × depth-recurrent returns
+0 results. Every number in this document is a BPE-tokenizer, RoPE, ~2048-sequence, natural-text
+measurement. Specific things that may not transfer:
+
+- **Per-token difficulty is a different animal.** `[B]`'s headline mechanism is that *"tokens that are
+  more difficult for the model accumulate 10× more improvement across recurrence steps"* — measured on
+  GPT-2 BPE. A 256-vocab byte stream has enormous per-token difficulty variance (a space or newline
+  after a common word vs. a rare UTF-8 continuation), which would make that mechanism **stronger** if
+  anything. Whether iteration 3–4 helps a byte model at all is genuinely unmeasured.
+- **The optimal R is unknown and may be far from 2–4.** `[C]` found prelude depth dominates R and
+  that R's ranking flipped with training length. We have no prior for where the knee is at 9M bytes.
+- **One datum that is mildly reassuring:** 2605.05113v2 finds infinite-width signal-propagation theory
+  holds for recurrent depth `t = o(√n)` and breaks at `t ~ √n`, noting *"recurrent weight sharing makes
+  finite-width effects visible at substantially shorter depths than in feedforward networks."* At
+  d≈512–768, `√n ≈ 23–28` against our `t = 2–4`, we are deep in the subcritical regime where that
+  theory applies. Marked **SPECULATION** — I did not verify their `n` is our `d_model`.
+- **Not a loop question but adjacent:** 2605.09630 (Scratchpad Patching) is the only byte-level paper
+  in this neighbourhood, and it shows byte-patch size is a compute/KV lever with a real
+  quality/cost trade-off. It says nothing about recurrence shape.
+
+---
+
+## 6. VERIFIED (sourced) vs SPECULATION (my inference)
+
+### VERIFIED — every claim below traces to a source fetched 2026-09-29
+
+- **φ = 0.459, 95% CI [0.41, 0.53]**, from 116 runs, 20 effective layers, r∈{1,2,4,8}, 6 budgets
+  4.64e17–2.15e19 FLOPs; r=4 looped trails untied by [0.05,0.08] nats on the compute-optimal frontier
+  and by **0.061 nats** at 20× extrapolation. `[A]` full text, §4.3/§4.2/Table 2/App. I.
+- **Hyperconnections at the loop boundary raise φ from 0.45 to 0.65**; truncated BPTT lowers it to
+  0.38 (0.37 excluding r=2) while lowering val loss. `[A]` §5, Table 3.
+- **GRT isoFLOPs**: 3.145±0.004 vs 3.188±0.056 (small, wins); 2.89 vs 2.84 (medium); 2.77 vs 2.71
+  (large). **MoR 3.30/3.02/2.91, last of five recurrent arms at all three scales.** Bare recurrence
+  costs **+0.107 nats** vs the dense baseline; the per-element gate recovers **−0.048**. `[B]` full
+  text, Table 1 and Fig. 5.
+- **CART at d=1024**: loses 1–2% at stored-parameter parity, ~10% at effective-parameter parity;
+  **~5% of the gap from weight sharing**; recurrent-core machinery "individually vestigial"; **R's
+  ranking reversed between the 3,000-step screen and 30,500 steps.** `[C]` abstract.
+- **"Dense looped models do not scale better; Looped-MoE does."** `[H]` abstract. The two matched-compute
+  wins, SMELT and LoopMoE, are both MoE. `[E]`, `[G]` abstracts.
+- **"Existing looped transformers … underperform [the non-looped baseline] at matched compute."**
+  `[I]` abstract, 2026-09-28.
+- **"At fixed FLOPs a looped model has strictly less capacity than a baseline transformer."** `[K]`
+  abstract.
+- **ε = 1/√L is insufficient for looped architectures; use 1/N (or λ/(N√L)); optimal LR depends on
+  unique layers L, not loop count N.** `[M]` abstract.
+- **"Recurrent Transformers … typically lack the capacity for competitive language modeling."**
+  `[N]` abstract, COLM 2026.
+- **Zero papers combine byte-level LM with depth recurrence** (arXiv API, `totalResults` 0, 2026-09-29).
+- **Our own measurements** (AGENTS.md §3.1, hand-measured 2026-09-29): warm step 245 ms at 9,195,854
+  params, batch 8 × seq 512, depth 2, fp32, aux off, `--no-engram`; `bwd 96-98 · retr 52-61 · fwd 46-48
+  · opt 43-47`; GEMMs 2–5% of a step; mean GPU utilisation 13.3%, 79% of samples ≤5%.
+- **Our own precondition** (AGENTS.md §3.2–3.3, `docs/AB-PROTOCOL.md`): the attention arm has never
+  run a backward (`fused kda=3126/0`); the fix is verified to compile and **not** verified to train;
+  the 25.8 s/step tensor-op KDA figure has **no committed log**; paired-eval resolution of
+  0.002–0.005 BPB is **estimated, not verified**.
+
+### SPECULATION — my inference, not a published result
+
+- **"Our regime is isoFLOPs, not isoParams, because we are launch-bound."** The inference is mine: the
+  isoFLOPs/isoParams split is `[A]`/`[B]`'s; the claim that *we* sit on the isoFLOPs side combines it
+  with our 13.3% GPU utilisation and 2–5% GEMM share. `[A]`'s grid starts at 30.3M non-embedding
+  params and `[B]`'s smallest arm is 45M; extrapolating their sign down to 9.2M is **not licensed by
+  either paper**, and `[A]`'s own limitations section says φ is a property of architecture +
+  optimiser + recipe, not of looping.
+- **"Four untied blocks cost roughly the same wall-clock as one block applied four times."** Derived
+  from our own split: only `fwd+bwd` (≈144 ms of 245) scales with depth, while `retr` (52–61) and
+  `opt` (43–47) are per-parameter and would **4×** in the untied arm, giving A2 ≈ 470–510 ms rather
+  than a naive "free." **The per-parameter scaling of `retr` and `opt` under a 4× width is NOT
+  measured** — it is arithmetic on a single step's breakdown. `--retract-every 1000` measured 188 ms
+  vs 240 ms, so retraction is a knob and the experiment should turn it to a matched setting.
+- **"t = 2–4 is inside the subcritical regime of 2605.05113."** Their `n` may not be our `d_model`;
+  unverified.
+- **"We should not spend A/B budget on `use_mor`."** A prior from third-party evidence plus a stack
+  conflict, not a measurement. The project rule is A/B or death, and this is not a measurement.
+- **Confidence in the VERIFIED block: high** (three full texts read, quoted, consistent across
+  independent groups; the ISO regime split is the field's operating assumption and predates 2026 by
+  six years). **Confidence that it transfers to a 9.2M byte model: low** — zero direct measurements,
+  a 3-order-of-magnitude size extrapolation, and a data regime the whole literature is silent on.
+
+---
+
+## 7. Open questions I could not close
+
+- **UNRESOLVED** — the exact non-embedding parameter range of `[A]`'s grid. The paper states
+  `N ∈ {98.3, 59.8, 40.2, 30.3} M` at s=10 and `d_model = 64s`; the 410M figure is from the worked
+  r=4 example. I did not extract the full per-budget table (Appendix E).
+- **UNRESOLVED** — whether Kaplan et al. 2020 really made the isoParams/isoFLOPs split, or whether
+  `[B]`'s attribution to it is loose. I read it only as `[B]`'s characterisation.
+- **UNRESOLVED** — `[B]`'s three-seed variance for the medium and large arms (reported as ±0.004 for
+  small only). The medium/large deficits of 0.05/0.06 nats are *possibly* outside noise; I cannot
+  confirm from the text I read.
+- **UNRESOLVED** — the scale of `[F]` Hyperloop, `[M]` residual scaling, and `[E]`'s per-budget grid.
+  All three say "various scales" or similar in the abstract.
+- **NOT ATTEMPTED** — the ~65 remaining entries in the 155-result "looped transformer" arXiv list
+  (indices 90–155), and the non-arXiv venues. If this verdict is going to be load-bearing, someone
+  should read the tail of that list.
+- **NOT ATTEMPTED** — anything from 2025 or earlier except where `[A]`/`[B]` cite it. The Universal
+  Transformer and ALBERT lines are represented here only second-hand.
+
+---
+
+## 8. Sources
+
+Fetched **2026-09-29**. Read in full: **[A]**, **[B]**. All others abstract-only.
+
+- **[A]** Schwethelm, Rückert, Kaissis — *How Much Is One Recurrence Worth? Iso-Depth Scaling Laws for
+  Looped Language Models.* arXiv:2604.21106v3, 2026-05-07. `arxiv.org/html/2604.21106v3`
+- **[B]** Hegazy, Alanwar, Elhoushi — *Gated Recurrent Transformers: Expressive Depth through Recurrent
+  Modulation.* arXiv:2608.15062v4, 2026-08-26. `arxiv.org/html/2608.15062v4`
+- **[C]** Capps — *CART: Context-Anchored Recurrent Transformer.* arXiv:2606.01495v2, 2026-06-03
+- **[D]** Prairie, Novack, Berg-Kirkpatrick, Fu — *Parcae: Scaling Laws For Stable Looped Language
+  Models.* arXiv:2604.12946v1, 2026-04-14
+- **[E]** Wang, Zhang, Luo, Wu, Liu, Liu, Huang, Yan, Li — *SMELT: Scaling Laws for Compute-Matched MoE
+  Looped Transformers.* arXiv:2609.01343v3, 2026-09-11
+- **[F]** Zeitoun, Torroba-Hennigen, Kim — *Hyperloop Transformers.* arXiv:2604.21254v3, 2026-07-02
+- **[G]** Chen, Li, Huang, Yin, Shang, Qin — *LoopMoE.* arXiv:2606.04438v2, EMNLP 2026
+- **[H]** Lee, Biloki, Hu, May — *Sparse Layers are Critical to Scaling Looped Language Models.*
+  arXiv:2605.09165v2, 2026-06-30
+- **[I]** You, Fu, Feng, Lv, Ning, Ding, Wang — *Improving Test-Time Scaling with Adaptive Looped
+  Transformers.* arXiv:2609.35748v1, 2026-09-28
+- **[J]** Wang, Ma, Hariri, Ganguly, Yang, Tong, Liu, Han, Chaudhary — *How to Loop MoE.* arXiv:2609.35751v1, 2026-09-28
+- **[K]** Frey, Shomali, Koehler, Ali — *A Dual-Path Architecture for Scaling Compute and Capacity in
+  LLMs.* arXiv:2605.30202v1, 2026-05-28
+- **[L]** Fein-Ashley, Rashidinejad — *Solve the Loop: Attractor Models.* arXiv:2605.12466v1, 2026-05-12
+- **[M]** Wang, Li, Zhang, Huang, Yan, Li — *On the Residual Scaling of Looped Transformers.* arXiv:2606.18524v2, 2026-09-11
+- **[N]** Qiu, Acikalin, Lovelace, Belardi, Mulchandani, Gomes, Weinberger — *MoRE: Mixture of Reused
+  Experts.* arXiv:2609.18176v2, COLM 2026
+- Fully Looped Transformer 2605.18797v2 · Chained Recursion Models 2606.00605v1 · CoT vs Compressed
+  Looped 2605.30757v1 · Finite-Width Recurrence 2605.05113v2 · Scratchpad Patching 2605.09630v1 ·
+  Looped SSMs 2605.16048v1 · DéjàView 2605.30215v2 · LT2 2605.20670v2 · Huginn 2502.05171v2 ·
+  **MoR 2507.10524v3** (NeurIPS 2025) · Mixture-of-Depths 2404.02258 · PonderNet 2107.05407
+- MoR citation graph: Semantic Scholar `graph/v1/paper/arXiv:2507.10524/citations`, 120 citing papers
+  retrieved 2026-09-29. Titles only, except where noted inline.
+- Internal, read-only: `AGENTS.md` §2.1, §2.2, §2.6, §3.1, §3.2, §3.3, §3.4, §3.7;
+  `docs/AB-PROTOCOL.md`; `research/2026-09-26-ponder-replacement.md`;
+  `research/2026-09-27-adaptive-depth-safe.md`.
