@@ -44,10 +44,16 @@ pub struct MhcBlock {
 }
 
 impl MhcBlock {
-    /// `n_branches`: residual-stream expansion rate `n` (paper: 4).
+    /// `n_branches`: residual-stream expansion rate `n`. The base paper calls
+    /// this the "expansion rate" and ablates it (2409.19606 Tab. 1); `n = 1`
+    /// is measured there as *below* the Pre-Norm baseline, so a config asking
+    /// for zero streams is not a harmless edge case - silently training `n = 1`
+    /// would hand back the one rung the family is known to lose at. Refused
+    /// here rather than clamped.
     /// `d_model`: hidden dim `D = n*C`.
     pub fn new(n_branches: usize, d_model: usize, device: &Device) -> Self {
-        let n = n_branches.max(1);
+        assert!(n_branches >= 1, "n_branches (the expansion rate n) must be >= 1");
+        let n = n_branches;
         let normal = Initializer::Normal {
             mean: 0.0,
             std: 0.01,
