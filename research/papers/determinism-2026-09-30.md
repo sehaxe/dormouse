@@ -86,6 +86,27 @@ differs in **10.73 %** of slots — the *slot count* reproduces (10.7-12.5 %), t
 train and their "0 differing direct slots" is a zero-step reading wearing a
 step-50 label. Only steps 0, 5, 20 are usable from that sweep.
 
+### 1b. The checkpoint file is never byte-comparable, even when the parameters are
+
+Raw `sha256` of the whole model record differs across all five of my runs — but
+so does the hash of **only the data section** for four of them, and for
+`d3a`/`d3d` it is **identical** while the record is not:
+
+```
+data-section sha256 (named parameter bytes, metadata excluded)
+  d3a 46e8998ee8f19ae7ef812f89feabcacf    d3d 46e8998ee8f19ae7ef812f89feabcacf  /  identical parameter values
+  d3b 4c324f78...   d3c 8e036433...   d3e c44d52aa...
+metadata (first 600 B) equal for d3a/d3d? False
+data region equal for d3a/d3d?         True
+```
+
+The reason is `ParamId`, a **process-global counter** assigned at module
+construction and serialised into the CBOR metadata. So even a perfectly
+reproducible run produces a different *file*. `cmp`, `md5sum` and any
+byte-level checkpoint diff are therefore not merely noisy here — they are
+**structurally incapable** of being zero across processes. Compare parameter
+tensors (`dmck.py`), never files.
+
 ---
 
 ## 2. Deliverable 2 — the cause
