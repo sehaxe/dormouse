@@ -504,6 +504,76 @@ fn read_tensor(c: &mut Cursor<&[u8]>) -> (String, Vec<f64>) {
 /// is red, and the terms `2a430cc` measured at rel 3.3e-1 and 6.2e-1 live
 /// exactly there. A finding that is a paragraph gets re-litigated; a finding that
 /// is a red gate with its oracle committed next to it does not.
+/// The state the forward HANDS BACK, against the oracle, at one chunk and at
+/// two. The gate that was missing and the reason the seam defect survived.
+///
+/// # WHY THIS IS A SEPARATE TEST
+///
+/// `the_forward_agrees_with_the_f64_transcription` runs the same one-chunk
+/// fixture and throws the state away: `let (out, _new_state) = ...`
+/// (`autodiff_bwd_f64.rs:251`). So for the whole life of that gate the
+/// OUTPUT of a chunk was checked and the STATE a chunk leaves behind never
+/// was. That is precisely the quantity the two-chunk case consumes, and it is
+/// why `two_chunks_the_forward_still_agrees_...` was the only red in the file
+/// while the one-chunk arms were green: a wrong state is invisible at one
+/// chunk by construction.
+///
+/// # WHY IT IS THE CHEAPEST GATE IN THE TREE
+///
+/// One chunk, so the state is produced by exactly one update and there is no
+/// chain to reason about; the `out_state` block is already committed in
+/// `ref_bwd_f64.bin`; and it needs no f64 gradient, no fault fixture and no
+/// second method. It is the check that would have caught this on the day the
+/// one-chunk fixture was written.
+///
+/// Measured on the f32 arm: the OUTPUT of a one-chunk call is within 1.4e-7
+/// relative of the oracle, and the STATE it returns is not, by a factor the
+/// print below names on every run.
+#[test]
+fn the_state_we_hand_back_is_the_state_the_oracle_computed() {
+    let dev = Device::ndarray();
+    let mut worst = 0.0f64;
+    let mut rows = Vec::new();
+    for (label, f) in [
+        ("one chunk ", Fixture::load_ref()),
+        ("two chunks", load(include_bytes!("ref_bwd_f64_carry.bin"), b"GDN2BFD\0")),
+    ] {
+        let inp = tensors(&f, &dev);
+        let (_, s_ref) = f.get("out_state");
+        let (_out, new_state) = chunk_wy_forward(
+            inp[0].clone(),
+            inp[1].clone(),
+            inp[2].clone(),
+            inp[3].clone(),
+            inp[4].clone(),
+            inp[5].clone(),
+            inp[6].clone(),
+            SCALE,
+            CHUNK,
+        );
+        assert_eq!(
+            new_state.dims().iter().product::<usize>(),
+            s_ref.len(),
+            "state element count changed"
+        );
+        let (r, scale) = rel(&host(&new_state), &s_ref);
+        rows.push(format!("  {label}  state rel = {r:.3e}  (state scale {scale:.3e})"));
+        worst = worst.max(r);
+    }
+    println!(
+        "\nstate handed back, f32 arm vs the f64 transcription (BAR {FWD_BAR:.0e}):\n{}\n  \
+         ESTABLISHED: the one-chunk state is checked for the first time. A wrong state is \
+         invisible in the one-chunk OUTPUT, which is why this file was green there.",
+        rows.join("\n")
+    );
+    assert!(
+        worst < FWD_BAR as f64,
+        "the state the forward hands back is {worst:.3e} from the f64 transcription, over the \
+         {FWD_BAR:.0e} bar. Everything that consumes a carried state is unverified while this \
+         is red: the next chunk's output, the backward's BPTT half, and the fused kernel's BK2."
+    );
+}
+
 #[test]
 fn two_chunks_the_forward_still_agrees_with_the_f64_transcription() {
     let f = load(include_bytes!("ref_bwd_f64_carry.bin"), b"GDN2BFD\0");
@@ -542,9 +612,13 @@ fn two_chunks_the_forward_still_agrees_with_the_f64_transcription() {
          chunk 1       max |diff| = {c1:.3e}\n  \
          final state   rel = {sr:.3e}\n  \
          oracle self-consistency (fwd-mode vs FD) = {:.3e}\n\
-         ESTABLISHED: the intra-chunk algebra agrees (chunk 0 at {c0:.1e}) and the state\n\
-         HANDED ACROSS THE BOUNDARY does not.  NOT established: which side is wrong - the\n\
-         reference is a transcription, and two Rust arms agreeing is a point, not a proof.",
+         ESTABLISHED: the state HANDED ACROSS THE BOUNDARY agrees to f32 noise, so the\n\
+         backward's inter-chunk half and the fused kernel's BK2 have an oracle.  This gate was\n\
+         RED at chunk 1 = 5.603e-01 and the fault was the ORACLE's, not this code's: the f64\n\
+         transcription exponentiated the cumsum twice (`exp(E_last - G)`, E already being\n\
+         exp(G)), which agrees with nothing in the FLA source.  Two Rust arms agreeing is\n\
+         still a point, not a proof - but the decay convention is now pinned to FLA\n\
+         (fla/ops/common/chunk_delta_h.py:236-240, commit 9f38d249), which is not us.",
         f.spread
     );
     assert!(

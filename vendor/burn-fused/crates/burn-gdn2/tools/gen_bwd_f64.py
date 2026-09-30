@@ -255,10 +255,18 @@ def forward(inp, scale=SCALE, chunk=CHUNK, fault=None):
         m_inv = np.linalg.inv(np.eye(c) + akk)    # f64, a different algorithm
     W, U = np.matmul(m_inv, rhs_k), np.matmul(m_inv, rhs_v)
 
+    # BOTH operands of the chunk decay are in the LOG domain. `E` is exp(G), so
+    # using it here exponentiates the cumsum twice; the result is a valid f64
+    # number and a DIFFERENT function, which is how a state carry gets blamed on
+    # the wrong code for months. FLA exponentiates only the difference, on raw
+    # `g` (`fla/ops/common/chunk_delta_h.py:236-240`, commit 9f38d249).
+    g_last_log = G[:, :, :, c - 1:c, :]
     g_last = E[:, :, :, c - 1:c, :]
-    decay_last = np.exp(G - g_last) if fault == "decay-sign" else np.exp(g_last - G)
+    decay_last = (
+        np.exp(G - g_last_log) if fault == "decay-sign" else np.exp(g_last_log - G)
+    )
     if fault == "no-state-decay":
-        decay_last = decay_last * np.exp(-g_last)
+        decay_last = decay_last * np.exp(-g_last_log)
     k_dec = k5 * decay_last
 
     out = np.empty((Bt, Ht, nt, c, V))
