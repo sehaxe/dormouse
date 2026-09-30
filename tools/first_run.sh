@@ -28,12 +28,15 @@ if [ "${AVAIL:-0}" -lt 25 ]; then
   echo "LOUD: RAM avail ${AVAIL}G < 25 GB (§2.4). Escape: close the desktop or wait."; exit 1
 fi
 CORPUS_DIR=/mnt/e43497ab-0ff2-45b4-b45f-28de3339a53e/aria_data/pretrain/real
-EVAL=/mnt/e43497ab-0ff2-45b4-b45f-28de3339a53e/aria_data/pretrain/real_eval/eval_tail.bin
+# --eval takes a DIRECTORY (collect_files scans it, lib.rs:86); .bak is
+# filtered by extension. The eval window is eval_batches*batch*seq_len bytes,
+# printed on every eval line - quote it (§2.6).
+EVAL=/mnt/e43497ab-0ff2-45b4-b45f-28de3339a53e/aria_data/pretrain/real_eval
 if [ ! -r "$CORPUS_DIR/corpus.bin" ]; then
   echo "LOUD: corpus not readable: $CORPUS_DIR/corpus.bin — the drive must be mounted (§2.6)."; exit 1
 fi
-if [ ! -r "$EVAL" ]; then
-  echo "LOUD: eval tail not readable: $EVAL. Pre-carve numbers are not comparable — do not substitute (§2.6)."; exit 1
+if [ ! -d "$EVAL" ]; then
+  echo "LOUD: eval dir missing: $EVAL. Pre-carve numbers are not comparable - do not substitute (§2.6)."; exit 1
 fi
 if [ ! -x target/release/train ]; then
   echo "LOUD: no target/release/train — build first: tools/build_lock.sh run build -- cargo build --release -p dormouse-cli --features dormouse-train/cuda"; exit 1
