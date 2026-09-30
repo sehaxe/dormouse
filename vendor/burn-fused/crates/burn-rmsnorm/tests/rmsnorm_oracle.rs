@@ -136,11 +136,13 @@
 //!
 //! ## The fused CUDA kernel is NOT covered by any of this
 //!
-//! `fused::rmsnorm_cuda` never engages on the trainer's backend — an autodiff
-//! tensor cannot be handed a bare kernel (`docs/ORACLE.md` / AGENTS.md §3.3;
-//! the eval line prints `norm=0/N`). The arithmetic below is the **tensor
-//! path**. If the kernel's own reduction diverges, nothing here sees it; that
-//! is a named gap, not a silent one, and closing it needs a GPU window.
+//! The arithmetic below is the **tensor path**. The fused kernel has its own
+//! file, `rmsnorm_kernel_cuda.rs`: the same fixture, against the kernel's own
+//! output on a bare device, plus the gate on the trainer's `norm=0/N`. The
+//! kernel never engages on the trainer's backend because an autodiff tensor
+//! cannot be handed a bare kernel (`docs/ORACLE.md` / AGENTS.md §3.3; the eval
+//! line prints `norm=0/N`) — so it is that refusal, and not a missing test,
+//! that keeps the trainer's numerics on the path measured here.
 //!
 //! Run: `cargo test -p burn-rmsnorm --test rmsnorm_oracle`
 
