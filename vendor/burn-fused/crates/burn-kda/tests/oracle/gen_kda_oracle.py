@@ -70,7 +70,7 @@ import textwrap
 import numpy as np
 import torch
 import torch.nn.functional as F
-from einops import rearrange
+from einops import rearrange, repeat
 
 # ── the pins. sha256 asserted before anything is imported. ──────────────────
 FLA_REPO = "https://github.com/fla-org/flash-linear-attention"
@@ -78,6 +78,14 @@ FLA_SHA = "9f38d24980c46d46bd38614e743cdacd21906578"
 PINS = {
     "fla_ops_kda_gate.py": "7ea46d62149b8e28e0827e070fee327576de783cb981e3b855182f2b8198c16e",
     "fla_ops_kda_naive.py": "60a32285d4b67068ff633b48bbe8ab31028066d24f00d27e12199a88fc73f016",
+    # The RoPE reference. Same commit, `fla/modules/rotary.py`, extracted the
+    # same way (never re-typed): `rotate_half` (:21) and
+    # `rotary_embedding_ref` (:30) are the pure-PyTorch twin of the Triton
+    # `rotary_embedding_kernel` in the same file, and `RotaryEmbedding`
+    # (:327) is the nn.Module whose `_compute_inv_freq` (:410) and
+    # `_update_cos_sin_cache` (:419) build the cos/sin the reference consumes.
+    # Added 2026-10-01 by the `wt/rope-kda2` lane.
+    "fla_modules_rotary.py": "6e9d1051751257370fd5f4f95ed4798adab642e1c59a9c0a3540adab440c5115",
 }
 TORCH_VERSION = torch.__version__
 
@@ -135,19 +143,43 @@ def load_references(upstream_dir):
     """exec the pinned references. Nothing here is ours but the namespace."""
     gate = open(os.path.join(upstream_dir, "fla_ops_kda_gate.py")).read()
     naive = open(os.path.join(upstream_dir, "fla_ops_kda_naive.py")).read()
-    ns = {"torch": torch, "F": F, "rearrange": rearrange, "np": np}
+    rotary = open(os.path.join(upstream_dir, "fla_modules_rotary.py")).read()
+    ns = {"torch": torch, "F": F, "rearrange": rearrange, "repeat": repeat, "np": np}
     srcs = [
         extract_def(gate, "naive_kda_gate"),
         extract_def(gate, "naive_kda_lowerbound_gate"),
         extract_def(naive, "naive_recurrent_kda"),
         extract_def(naive, "naive_chunk_kda"),
+        extract_def(rotary, "rotate_half"),
+        extract_def(rotary, "rotary_embedding_ref"),
     ]
     for s in srcs:
         exec(compile(s, "<pinned-upstream>", "exec"), ns)
     for fn in ("naive_kda_gate", "naive_kda_lowerbound_gate",
-               "naive_recurrent_kda", "naive_chunk_kda"):
+               "naive_recurrent_kda", "naive_chunk_kda",
+               "rotate_half", "rotary_embedding_ref"):
         assert fn in ns, f"{fn} was not extracted"
     return ns
+
+
+def rope_cos_sin(t, dim, base=10000.0):
+    """Upstream's cos/sin, built by upstream's own two methods.
+
+    `RotaryEmbedding._compute_inv_freq` (`fla/modules/rotary.py:410-414`) is
+    `1.0 / base ** (arange(0, dim, 2) / dim)`, and
+    `_update_cos_sin_cache` (`:419-447`) is `freqs = outer(t, inv_freq)` then
+    `cos(freqs), sin(freqs)` on the `self.scale is None` branch — which is the
+    branch taken unless `scale_base` is passed, and nobody in the KDA or
+    attention layers passes it. Both are transcribed as arithmetic, NOT
+    extracted, and that is the one place in this generator where it happens:
+    they are one-line expressions inside a class, and the class cannot be
+    exec'd without triton. Guard 4 below is the check on them: a wrong exponent
+    or a missing factor 2 there makes every rope case wrong, and the guard
+    fails loudly instead of writing a fixture nobody can use.
+    """
+    inv_freq = 1.0 / (base ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
+    freqs = np.outer(np.arange(t, dtype=np.float32), inv_freq)
+    return np.cos(freqs).astype(np.float32), np.sin(freqs).astype(np.float32)
 
 
 def g9(v) -> str:
@@ -277,6 +309,42 @@ def build_chunk_cases():
     return cases
 
 
+def build_rope_cases():
+    """The RoPE variant: upstream's rotation on q/k, then the SAME chunked WY.
+
+    Three shapes, and each one is there for a different reason:
+
+    | case | T | BT (ours) | BT (FLA) | what it pins |
+    |---|---|---|---|---|
+    | `rope_short` | 16 | 16 | 16 | one tile, no boundary: the rotation alone, nothing else |
+    | `rope_t38` | 38 | 16 | 2 | our zero-padded 6-token tail (`gdn2/src/forward.rs:177-178`) against a near-exact reference. `naive_chunk_kda` asserts `T % BT == 0` (`naive.py:108`), so 38 needs a BT that divides it; 2 keeps the intra-tile cumsum tiny, which makes the REFERENCE the accurate side of the comparison and the measured difference OUR f32 noise |
+    | `rope_t64` | 64 | 16 | 16 | three exact tile boundaries (16/32/48) — the multiple-of-BT case the padding path does not cover, so together with `rope_t38` the two bracket the boundary |
+
+    `rope_t38` runs **two heads** and `rope_short` runs one, deliberately: a
+    rotation that leaked across the head boundary (rotating the `[B,T,H*HD]`
+    flat layout as if it were one head) is invisible at H=1.
+
+    The rotation is FLA's own `rotary_embedding_ref` at `interleaved=False`
+    with a FULL-head `cos`/`sin` (`ro_dim = D`), which is the only full-head
+    form upstream's reference supports. A partial rotation is a different
+    function and is not here — see the findings file, §3.
+    """
+    rng = np.random.default_rng(20261001)
+    cases = []
+    for (name, B, T, H, HV, K, V, BT_ours, BT_fla) in [
+        ("rope_short", 1, 16, 1, 1, 8, 8, 16, 16),
+        ("rope_t38", 1, 38, 2, 2, 8, 8, 16, 2),
+        ("rope_t64", 1, 64, 1, 1, 8, 8, 16, 16),
+    ]:
+        q = rng.standard_normal((B, T, H, K)).astype(np.float32)
+        k = rng.standard_normal((B, T, H, K)).astype(np.float32)
+        v = rng.standard_normal((B, T, HV, V)).astype(np.float32)
+        g = -rng.uniform(0.05, 4.0, (B, T, HV, K)).astype(np.float32)
+        beta = rng.uniform(0.05, 0.95, (B, T, HV)).astype(np.float32)
+        cases.append((name, B, T, H, HV, K, V, BT_ours, BT_fla, q, k, v, g, beta))
+    return cases
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--fla", required=True,
@@ -293,8 +361,12 @@ def main():
     check_pins(upstream)
     if args.verify_clone and args.fla:
         for name in PINS:
-            src = os.path.join(args.fla, "fla/ops/kda",
-                               name.replace("fla_ops_kda_", ""))
+            # `fla_ops_kda_*` live under fla/ops/kda, `fla_modules_*` under
+            # fla/modules; the flattened pin name carries the directory.
+            if name.startswith("fla_ops_kda_"):
+                src = os.path.join(args.fla, "fla/ops/kda", name[len("fla_ops_kda_"):])
+            else:
+                src = os.path.join(args.fla, "fla/modules", name[len("fla_modules_"):])
             if not os.path.exists(src):
                 print(f"CLONE FILE MISSING: {src}", file=sys.stderr)
                 sys.exit(2)
@@ -315,6 +387,7 @@ def main():
     W(f"# commit  {FLA_SHA}")
     W("# file    fla/ops/kda/gate.py   (naive_kda_gate, naive_kda_lowerbound_gate)")
     W("# file    fla/ops/kda/naive.py  (naive_recurrent_kda, naive_chunk_kda)")
+    W("# file    fla/modules/rotary.py (rotate_half, rotary_embedding_ref)")
     W("# sha256  " + " ".join(f"{k}={v[:16]}..." for k, v in PINS.items()))
     W(f"# torch   {TORCH_VERSION} (cpu)")
     W("# Each block: name, then `key=value` lines. Arrays are row-major f32 at")
@@ -394,6 +467,61 @@ def main():
         W(f"  oK={fmt(oK.numpy())}")
         W(f"  S={fmt(S.numpy())}")
 
+    # ── 5: the RoPE variant ─────────────────────────────────────────────────
+    # The rotation is upstream's `rotary_embedding_ref` — NOT ours — and the
+    # expected `o`/`S` come from the SAME `naive_chunk_kda` as section 4, fed
+    # the rotated q/k. `qrot`/`krot` are emitted as well, so a red on `o` is
+    # attributable: the test can tell "our rotation is wrong" from "the
+    # rotation is right and the chunked path mishandles it".
+    W("")
+    W("# ---- RoPE variant: fla/modules/rotary.py::rotary_embedding_ref, then")
+    W("# fla/ops/kda/naive.py::naive_chunk_kda on the ROTATED q/k. `qrot`/`krot`")
+    W("# are upstream's own rotated tensors; `o`/`S` are the chunked outputs fed")
+    W("# them. `bt_ours` is the chunk size we drive our path with, `bt_fla` the one")
+    W("# the reference ran at (`naive_chunk_kda` asserts T % BT == 0).")
+    rope_min_shift = None
+    rope_min_out_rel = None
+    for (name, B, T, H, HV, K, V, BT_ours, BT_fla, q, k, v, g, beta) in build_rope_cases():
+        cos, sin = rope_cos_sin(T, K)
+        # cos/sin go in EXACTLY as `RotaryEmbedding` hands them to the
+        # reference: `_cos_cached` is `cos(outer(t, inv_freq))`, i.e. `[T, D/2]`
+        # (`fla/modules/rotary.py:446`, `:492-500`). `rotary_embedding_ref`
+        # then does `repeat(cos, '... d -> ... 1 (2 d)')` -> `[T, 1, D]`, which
+        # broadcasts over the batch and head axes of a `[B,T,H,D]` q. Passing
+        # `[B,T,H,D/2]` instead makes the reference's own `torch.cat` fail on
+        # the 5-D/4-D mismatch -- upstream's shapes are load-bearing here.
+        cos_t = torch.tensor(cos)
+        sin_t = torch.tensor(sin)
+        qrot = R["rotary_embedding_ref"](t4(q), cos_t, sin_t).numpy()
+        krot = R["rotary_embedding_ref"](t4(k), cos_t, sin_t).numpy()
+        shift = float(max(np.abs(qrot - q).max(), np.abs(krot - k).max()))
+        rope_min_shift = shift if rope_min_shift is None else min(rope_min_shift, shift)
+        o, S = R["naive_chunk_kda"](t4(qrot), t4(krot), t4(v), t4(g), t4(beta),
+                                    scale=1.0, output_final_state=True,
+                                    chunk_size=BT_fla)
+        # Guard 4's second half, computed here because this is the only place
+        # that has both answers: what the OUTPUT looks like WITHOUT the
+        # rotation. A `use_rope` that did nothing would reproduce that, so the
+        # gap between the two is the discriminating power of the whole section.
+        o_off, _ = R["naive_chunk_kda"](t4(q), t4(k), t4(v), t4(g), t4(beta),
+                                        scale=1.0, output_final_state=True,
+                                        chunk_size=BT_fla)
+        rel = float(np.abs(o.numpy() - o_off.numpy()).max()
+                    / max(np.abs(o_off.numpy()).max(), 1e-30))
+        rope_min_out_rel = rel if rope_min_out_rel is None else min(rope_min_out_rel, rel)
+        W("")
+        W(f"rope {name}")
+        W(f"  shape={B} {T} {H} {HV} {K} {V} {BT_ours} {BT_fla}")
+        W(f"  q={fmt(q)}")
+        W(f"  k={fmt(k)}")
+        W(f"  qrot={fmt(qrot)}")
+        W(f"  krot={fmt(krot)}")
+        W(f"  v={fmt(v)}")
+        W(f"  g={fmt(g)}")
+        W(f"  beta={fmt(beta)}")
+        W(f"  o={fmt(o.numpy())}")
+        W(f"  S={fmt(S.numpy())}")
+
     # ── the generator's own vacuity guards ────────────────────────────────────
     # A fixture that cannot fail is not a fixture. All three of these FIRED
     # during development, which is why they are here and not in the commit
@@ -455,6 +583,34 @@ def main():
     if abs(alpha - 0.0771) > 5e-5:
         print(f"VACUITY GUARD 3: FLA's executed reference gives alpha={alpha:.6f} "
               f"at our init, but lib.rs:58 publishes 0.0771", file=sys.stderr)
+        ok = False
+
+    # (4) THE ROPE CASES MUST NOT BE VACUOUS, in two independent ways.
+    #     `rope_cos_sin` is the one piece of upstream arithmetic in this file
+    #     that is TRANSCRIBED rather than extracted (its two methods live inside
+    #     a class that cannot be exec'd without triton), and a transcribed
+    #     frequency — a dropped factor of 2 in `arange(0,dim,2)/dim`, or a `dim`
+    #     that should be `dim/2` — would not fail here, it would write a fixture
+    #     whose rope cases are all wrong. So:
+    #     (4a) the rotation must visibly move q/k. A full-head rotation at
+    #          these positions turns the highest frequency through 16 * 2*pi rad,
+    #          so entries move by O(1); under 1e-2 means the cos/sin are wrong.
+    #     (4b) THE OUTPUT must move, which is the check that actually matters:
+    #          the test feeds our rotated q/k to `chunk_wy_forward` and compares
+    #          `o` against the reference's. A `use_rope` that did nothing, or a
+    #          rotation applied to q but not k, would reproduce the UNROTATED
+    #          `o` to within noise and the test would be green while being
+    #          blind. Required separation is 1e-2 relative, i.e. 10x the
+    #          chunked arm's own 1e-3 tolerance. Measured 0.24 / 0.69 / 0.43.
+    if rope_min_shift is None or rope_min_shift < 1e-2:
+        print(f"VACUITY GUARD 4a: the rope cases barely rotate q/k "
+              f"(worst |rope(x)-x| = {rope_min_shift}), so they cannot fail",
+              file=sys.stderr)
+        ok = False
+    if rope_min_out_rel is None or rope_min_out_rel < 1e-2:
+        print(f"VACUITY GUARD 4b: the rope barely changes the OUTPUT "
+              f"(worst relative |o_rot - o_off| = {rope_min_out_rel}), so a "
+              f"no-op rope would pass", file=sys.stderr)
         ok = False
     if not ok:
         sys.exit(3)

@@ -111,6 +111,50 @@ the softplus — the candidate fix for the softplus red — and that red goes
 red is pinned to FLA's actual rule rather than to "not what we happen to have
 written".
 
+## Added 2026-10-01: the RoPE pin (`fla/modules/rotary.py`)
+
+The `wt/rope-kda2` lane added a third pinned file, at **the same commit** and
+under the same discipline:
+
+```
+6e9d1051751257370fd5f4f95ed4798adab642e1c59a9c0a3540adab440c5115  fla_modules_rotary.py
+```
+
+Extracted and `exec`'d exactly as the other two: `rotate_half`
+(`fla/modules/rotary.py:21`) and `rotary_embedding_ref` (`:30`) are the
+pure-PyTorch twin of the Triton `rotary_embedding_kernel` in the same file, and
+`gen_kda_oracle.py` asserts the sha256 before importing anything. The three
+`rope` blocks it adds to `fixtures/kda_oracle.txt` come from FLA's own rotation
+of the raw q/k followed by the already-pinned `naive_chunk_kda` on the rotated
+tensors.
+
+**Two things this oracle is NOT, said here because the RoPE row is the easiest
+one to overstate.**
+
+1. **`RotaryEmbedding`'s cos/sin is TRANSCRIBED, not extracted.**
+   `_compute_inv_freq` (`:410-414`) and `_update_cos_sin_cache` (`:419-447`) are
+   methods of a class that cannot be `exec`'d without triton, so
+   `gen_kda_oracle.py`'s `rope_cos_sin` writes them out as arithmetic. That is
+   the **only** transcription in this generator, and the tier-(a) claim for the
+   rope rests on a guard rather than on extraction: **VACUITY GUARD 4a/4b**.
+   4a requires the rotation to move q/k by >= 1e-2 (measured 4.7-5.5); 4b
+   requires the OUTPUT to move by >= 1e-2 relative to the un-rotated answer
+   (measured 0.24 / 0.69 / 0.43 on the three cases). A wrong frequency — a
+   dropped factor of 2, a `dim` that should be `dim/2` — fails both. If
+   someone later finds a way to exec the class, replace the transcription and
+   the guards become redundant rather than wrong.
+2. **FLA's official KDA layer has no RoPE, so there is no upstream KDA answer to
+   be faithful to.** `fla/layers/kda.py` at this commit contains zero
+   `rotary`/`rope` occurrences, and GatedDeltaNet has no `use_rope` either. What
+   is pinned here is **FLA's rotary**, used on a layer that upstream leaves
+   without it. That makes the arm a **cross-family transplant** and it is why
+   the placement question has an arithmetic answer rather than a citation one:
+   RoPE preserves the L2 norm, so at a full-head rotation
+   `l2(rope(x)) == rope(l2(x))` exactly and the order relative to the norm
+   cannot matter. A *partial* rotation is a different function and is not in
+   this fixture. The reasoning, with every line number:
+   `research/reviews/rope-2026-09-30.md`.
+
 ## The coverage limit this oracle does NOT cover
 
 Stated here because a tier-(a) row that overstates itself is worse than none.
@@ -131,3 +175,19 @@ deliberately drive `chunk_wy_forward` with an explicit scale so they compare the
 (`chunked_wy_honours_the_read_scale_when_asked`) is what proves the mechanism is
 already right. A mutant that appeared to "fix" the scale reds would be measuring
 the test rather than the code.
+
+**The rope blocks carry no GVA.** All three cases have `HV == H`. A rotation
+applied to the *value*-head axis, or to a repeated q, would be invisible here —
+`rope_t38` is two heads precisely because it is the case that separates
+"rotate within each head" from "rotate across the head boundary", and it does
+not separate "rotate before the GVA repeat" from "after", because there is no
+repeat. The flag's placement in `project` is above the repeat, which is correct
+(q/k are on the key-head axis there, `lib.rs`'s "GVA: the decay is
+parameterised on the KEY-head axis"), but nothing in the fixture checks it.
+
+**The rope arm is a forward-only claim.** `tests/kda_rope.rs` compares forward
+outputs. It says nothing about gradients: this project's fused chunked backward
+is a separate and still-open question, and a rotation that is not
+differentiated through is a *different* defect from a rotation that is wrong
+(AGENTS.md §3.2, the `8fa5d4c` retraction).
+

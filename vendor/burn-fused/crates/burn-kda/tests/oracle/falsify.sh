@@ -80,6 +80,15 @@ run() { # $1 = label ; runs the oracle and summarises pass/fail per test
     | grep -E '^    [a-z0-9_]+$' | sed 's/^/    RED: /'
 }
 
+run_rope() { # the RoPE arm's own gate (tests/kda_rope.rs)
+  local out
+  out="$(cd "$libws" && cargo test -p burn-kda --test kda_rope 2>&1)"
+  echo "$out" | grep -E '^test [a-z0-9_]+ \.\.\.' | sed 's/^/    /'
+  echo "$out" | grep -E '^test result:' | sed 's/^/    /'
+  echo "$out" | sed -n '/^failures:$/,/^test result/p' \
+    | grep -E '^    [a-z0-9_]+$' | sed 's/^/    RED: /'
+}
+
 perturb() { # $1 = label, $2 = file, $3 = anchor, $4 = replacement
   cp "$ORIG_L" "$LIB"; cp "$ORIG_F" "$FUSED"
   echo "=== MUTANT: $1"
@@ -90,9 +99,20 @@ perturb() { # $1 = label, $2 = file, $3 = anchor, $4 = replacement
   echo
 }
 
+perturb_rope() { # as `perturb`, but the gate it must break is tests/kda_rope.rs
+  cp "$ORIG_L" "$LIB"; cp "$ORIG_F" "$FUSED"
+  echo "=== MUTANT: $1"
+  patch "$LIB" "$2" "$3" || { run_rope; return 1; }
+  diff "$LIB" "$ORIG_L" | grep '^[<>]' | sed 's/^/    /'
+  run_rope
+  echo
+}
+
 echo "== 0. BASELINE (unperturbed) =="
 echo "-- burn-kda oracle: 5 green, 2 red ON PURPOSE (the softplus placement and the read scale)"
 run
+echo "-- the RoPE arm's own gate (tests/kda_rope.rs), expected all green"
+run_rope
 echo
 
 # ── A. mutants that must break a GREEN ──────────────────────────────────────
@@ -157,6 +177,42 @@ perturb "A5 Eq 1: decay moved to the value axis" "$LIB" \
 # The one thing that IS worth a mutant, because it is our code and not the
 # reference's, is the decay axis -- A5 above -- and it is there.
 
+# ── A-rope. mutants that must break the RoPE gate ─────────────────────────
+# The RoPE arm is a CROSS-FAMILY TRANSPLANT: FLA's official KDA layer has no
+# rope at all (fla/layers/kda.py @ 9f38d249, zero `rotary`/`rope` hits), so
+# there is no upstream layer to be unfaithful to. What there IS is FLA's own
+# `rotary_embedding_ref`, and that is what the gate is pinned to. These three
+# mutants are the three ways a hand-written RoPE is wrong in practice.
+
+# A6: THE FREQUENCY LOSES ITS FACTOR OF 2. `inv_freq = base^(-2i/D)`
+#     (fla/modules/rotary.py:410-414) pairs dim `i` with dim `i + D/2`, and the
+#     `2` is what makes the pairing. Dropping it turns a rotation into a
+#     different rotation that still preserves the norm -- which is why
+#     `rope_commutes_with_l2norm` STAYS GREEN here, and why the commutation
+#     test cannot be the gate. Only the FLA comparison sees it.
+perturb_rope "A6 rope: frequency loses its factor of 2" \
+  'let a = p as f32 * (ROPE_THETA as f32).powf(-(2.0 * i as f32) / head_dim as f32);' \
+  'let a = p as f32 * (ROPE_THETA as f32).powf(-(1.0 * i as f32) / head_dim as f32);'
+
+# A7: THE ROTATION IS APPLIED TO q AND NOT k. The pure-rotation test asks
+#     about `q` and `k` as separate fixture rows, so both of those stay green;
+#     what must go red is the module identity, because k comes back unrotated.
+#     This is the mutant that justifies `module_projects_both_q_and_k_rotated`
+#     existing at all: a gate built only on `apply_rope` cannot see a wiring
+#     that drops one of the two.
+perturb_rope "A7 rope: applied to q only" \
+  '(apply_rope(q_act, h, hk), apply_rope(k_act, h, hk))' \
+  '(apply_rope(q_act, h, hk), k_act)'
+
+# A8: A WRONG BASE. 10000.0 is upstream's default in two independent places
+#     (fla/models/hybrid.py:103 and the `RotaryEmbedding` signature), and a
+#     drifted constant is exactly the kind of silent change no formula review
+#     catches: the rotation is still orthogonal, still norm-preserving, still
+#     self-consistent, and wrong.
+perturb_rope "A8 rope: theta 10000 -> 1000" \
+  'pub const ROPE_THETA: f64 = 10000.0;' \
+  'pub const ROPE_THETA: f64 = 1000.0;'
+
 # ── B. mutants that "fix" a RED ─────────────────────────────────────────────
 # B1: the softplus form, corrected to FLA's. This one CAN be turned green,
 # because the softplus red drives `KdaDecay::forward`, i.e. our code. Expect
@@ -204,3 +260,5 @@ else
 fi
 echo "-- burn-kda oracle back to 5 green / 2 red:"
 run
+echo "-- the RoPE gate back to all green:"
+run_rope

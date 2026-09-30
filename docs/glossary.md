@@ -145,6 +145,29 @@ its recurrent `kda` state is threaded through iterations by
 instance serving every iteration*, which is also true of the experts and the
 readout.
 
+### RoPE on the attention arm (NoPE by default)
+
+Rotary position embedding on the KDA q/k, `use_rope` in `burn-kda`
+(`KdaConfig::use_rope`, applied in `KdaModule::project` before the q/k L2 norm),
+**off by default and adding zero parameters**. `rope_theta` is the constant
+`10000.0`, upstream's own default.
+
+**Off by default because FLA's official KDA layer has no RoPE at all.**
+`fla/layers/kda.py` @ `9f38d249` contains zero `rotary`/`rope` occurrences, and
+GatedDeltaNet has no `use_rope` either — so this arm is a **cross-family
+transplant**, not a reproduction, and its justification is post-training (the
+Qwen3.8 playbook: NoPE breaks SFT/RLVR), not pretrain parity. In Kimi Linear's
+hybrid the position comes from the interleaved full-attention layers
+(`fla/layers/attn.py:83,125`; `fla/models/hybrid.py:17-23`). Evidence, line
+numbers and the placement proof: `research/reviews/rope-2026-09-30.md`;
+A/B row 8 in `docs/AB-PROTOCOL.md`, **not run**.
+
+**Not** "positional encoding" in general — there is no learned or additive
+position embedding on this arm, and adding one is a different mechanism with a
+parameter cost. **Not** "the KDA has positions": with the flag off it has none,
+and the byte position reaches it only through the sequence order the recurrence
+sees.
+
 ### readout (out_proj)
 
 The per-iteration projection whose output is averaged into the model's hidden
