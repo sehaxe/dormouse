@@ -110,9 +110,19 @@ where
 /// FORMAT. The old `0.625` half-step emitted 0.75, which is not e2m1.
 pub const E2M1: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
 
-/// Round to the nearest e2m1 value, ties away from zero. `x` must already be
-/// in the format's range (the caller scales to +/-6); anything above 6
-/// saturates, anything below 0.25 is zero.
+/// Round to the nearest e2m1 value, **ties to the EVEN CODE** — the format is
+/// round-half-to-even, the same rule IEEE 754 and torchao's MX-FP4 conversion
+/// follow. `x` must already be in the format's range (the caller scales to
+/// +/-6); anything above 6 saturates, anything below 0.25 is zero.
+///
+/// "Even" means the parity of the code, and because [`E2M1`] holds one level
+/// per code, that is the parity of the index. The ties therefore do NOT all
+/// go the same way, which is why no single `>` or `>=` expresses the rule and
+/// why this comment used to be wrong: it said "ties away from zero", which is
+/// ties-UP, and disagrees with the reference at 4 of the 7 interior ties (see
+/// the ladder comment below for the table). Measured against
+/// `pytorch/ao@3972ed01`'s `to_mx` by `crates/dormouse-core/tests/
+/// e2m1_oracle.rs`, which reads the raw NIBBLES rather than decoded values.
 ///
 /// The previous implementation derived the level from a log2 exponent plus a
 /// mantissa step, which is where 0.75 came from, and the previous caller
@@ -214,8 +224,11 @@ mod tests {
     }
 
     /// A golden of the FORMAT, not of the code: for a grid of inputs, the
-    /// output must be the nearest member of [`E2M1`] (ties to the coarser
-    /// level) and nothing else. Written against the format's definition - 1
+    /// output must be the nearest member of [`E2M1`] and nothing else. On an
+    /// exact midpoint the answer is the member whose CODE is even, which
+    /// alternates along the ladder and is therefore *not* always the coarser
+    /// one — 0.75 and 3.5 go UP, the other five interior ties go DOWN.
+    /// Written against the format's definition - 1
     /// sign, 2 exponent (bias 1), 1 mantissa, so the magnitudes are exactly
     /// 0, .5, 1, 1.5, 2, 3, 4, 6 - and it fails for any other grid, which is
     /// what the old test could not do.

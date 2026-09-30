@@ -3,10 +3,18 @@
 #![cfg_attr(test, allow(deprecated))]
 //!
 //! Building blocks from [DSpark](https://arxiv.org/abs/2607.05147) (DeepSeek AI, 2026).
-//! NOT yet matched against the official
-//! [DeepSpec](https://github.com/deepseek-ai/DeepSpec) implementation — the
-//! 7 tests here are hand-derived and cannot detect a wrong loss term, a wrong
-//! `gamma`, or L1-on-logits instead of L1-on-probs:
+//!
+//! `dspark_loss` and `accept_rate_loss` are **matched against the official
+//! [DeepSpec](https://github.com/deepseek-ai/DeepSpec) implementation**, which
+//! is the strongest tier this crate has: `tests/dspark_loss_oracle.rs` compares
+//! against DeepSeek's `compute_dspark_loss` executed on CPU at commit
+//! `005e03b81cec38b7da6399833d609ee89a2587f2`, with the OFFICIAL alphas from
+//! DeepSpec's own config — not transcribed, run. It is that gate which found
+//! and fixed three defects in the confidence term (a wrong numerical space, a
+//! target that was not detached, and a kink in the BCE spelling), so the older
+//! claim that these tests "cannot detect a wrong loss term" is no longer true
+//! of them: it is exactly what they now do. The rest of the crate below is
+//! still hand-derived from the paper and has no reference of any kind.
 //!
 //! - `VanillaMarkov` — low-rank first-order transition bias `B = W1[x]W2` (Eq 5)
 //! - `GatedMarkovHead` — gated variant: `gate * W1[x]` with `sigmoid(W_g[h; W1[x]])`
