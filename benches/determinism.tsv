@@ -1,0 +1,6 @@
+date	what	seed	steps	reps	comparisons	differing-slots-pct	relFro	max-abs-delta	verdict	protocol
+2026-09-30T15:49Z	cross-process init, same seed	7	0	6	15	4.45-12.51	9.20e-09..1.24e-08	<=5.92e-07	PASS (gate relFro<=1e-5)	train --steps 0 --seed 7 --batch 2 --seq-len 128 --no-kda --no-engram, fresh ckpt dir per process, tensor-level via tools/determinism.py
+2026-09-30T16:11Z	cross-process init, DIFFERENT seed	8	0	2	12	99.92	1.414e+00	8.37e+00	PASS (gate relFro>=1e-1)	same, --seed 8 vs --seed 7; separation 1.1e8x
+2026-09-30T16:15Z	save -> load_ckpt -> save, new process	7	0	1	1	0.0000	0.0e+00	0.0e+00	BIT-EXACT	resume A's own ckpt in a fresh process, re-save, compare
+2026-09-30T16:18Z	does it compound? step ladder	7	0/5/20/50/100	10	5	4.62-19.06	9.85e-09..7.35e-07	<=5.14e-05	no compounding to 100 steps; 20-step row is an OPEN anomaly	2 runs per step count, same seed
+2026-09-30T16:35Z	stability of the slot COUNT at --steps 0	7	0	8	10	0.0000-12.41	0.0e+00..1.23e-08	<=4.77e-07	count is NOT a distance; every mover in 42 comparisons is a Tsct tensor	3 independent batches of reps; pairs span 65-258 s
