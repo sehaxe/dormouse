@@ -2428,11 +2428,6 @@ mod tests {
     }
 }
 
-#[cfg(test)]
-mod polar_diag {
-    use super::*;
-    use burn::tensor::{Device, Distribution};
-
     // ---------------------------------------------------------------------
     // The 2026-10-01 formula audit. Class-A gates: each one pins a number a
     // COMMENT now asserts, so the comment and the arithmetic cannot drift
@@ -2523,80 +2518,131 @@ mod polar_diag {
     #[test]
     fn the_sigma_estimate_is_a_lower_bound_and_the_1_05_factor_is_not_what_saves_it() {
         let dev = dev();
-        let mut below = 0usize;
-        let mut total = 0usize;
-        let mut worst_prescaled: f32 = 0.0;
-        for rows in [768usize, 512, 128] {
-            for _ in 0..24 {
-                let x = det_factor(rows, 64, &dev);
-                // the code's own sigma_max, read back out of the retraction by
-                // comparing the retracted factor's largest singular value to
-                // the 1.05 the code divides by
-                let r = polar_orthogonalize(x.clone(), 3);
-                let k = r.dims()[1] as f32;
-                let smax = (r
-                    .clone()
-                    .transpose()
-                    .matmul(r.clone())
-                    .sum()
-                    .into_scalar::<f32>()
-                    / k as f32)
-                    .sqrt();
-                // 3. every retracted factor lands on sigma_max = 1
-                assert!(
-                    (smax - 1.0).abs() < 1e-3,
-                    "retracted sigma_max {smax} != 1 at [{rows},64]"
-                );
-                // 1./2. the estimate itself: recompute it the way the code does
-                // and compare against the factor's TRUE spectral norm proxy.
-                let m = x.clone();
-                let g = m.clone().matmul(m.transpose());
-                let mut v = g.clone().sum_dim(1).squeeze_dim::<1>(1);
-                for _ in 0..POWER_ITERS {
-                    let vn = v.clone().mul(v.clone()).sum_dim(0).sqrt().clamp_min(1e-12);
-                    v = v.div(vn);
-                    v = g
-                        .clone()
-                        .matmul(v.clone().unsqueeze_dim::<2>(1))
-                        .squeeze_dim::<1>(1);
-                }
-                let gv = g
+        // A factor whose sigma_max is KNOWN EXACTLY, so "the estimate is low"
+        // and "the prescaled input is above 1" are measurements and not
+        // opinions. X = sum_i s_i * u_i with the u_i the DCT-II basis columns,
+        // which are orthonormal, so X's singular values ARE the s_i and
+        // sigma_max = s_0 = 1 by construction. No RNG, no eigendecomposition.
+        let basis = ortho_factor_768x64(&dev);
+        let run = |s: &[f32]| -> (f32, f32) {
+            // X with the prescribed singular values
+            let mut x = basis.clone().mul_scalar(0.0);
+            for (i, &si) in s.iter().enumerate() {
+                x = x.add(basis.clone().slice([0..768, i..i + 1]).mul_scalar(si));
+            }
+            // the estimate, computed exactly as lib.rs:229-248 does
+            let g = x.clone().matmul(x.clone().transpose());
+            let mut v = g.clone().sum_dim(1).squeeze_dim::<1>(1);
+            for _ in 0..POWER_ITERS {
+                let vn = v.clone().mul(v.clone()).sum_dim(0).sqrt().clamp_min(1e-12);
+                v = v.div(vn);
+                v = g
                     .clone()
                     .matmul(v.clone().unsqueeze_dim::<2>(1))
                     .squeeze_dim::<1>(1);
-                let vgv = v.clone().mul(gv).sum_dim(0);
-                let vv = v.clone().mul(v.clone()).sum_dim(0);
-                let est = vgv.div(vv.clamp_min(1e-14)).sqrt().into_scalar::<f32>();
-                // the Frobenius norm is an upper bound on sigma_max
-                let frob = m.clone().powf_scalar(2.0).sum().into_scalar::<f32>().sqrt();
-                total += 1;
-                if est <= frob {
-                    below += 1;
-                }
-                // the TRUE sigma_max is at least est and at most frob; the
-                // prescaled value the code actually feeds NS is
-                // sigma_true/(est*1.05), which is >= 1/1.05 and, whenever the
-                // estimate is low, ABOVE 1. On these fixtures the estimate is
-                // a few percent low, so the prescaled input is above 1.
-                let prescaled_lo = frob / (est * 1.05);
-                worst_prescaled = worst_prescaled.max(prescaled_lo.min(frob / (frob * 1.05)));
             }
-        }
-        // 1. a Rayleigh quotient never exceeds lambda_max, so the estimate
-        // cannot exceed the Frobenius bound on any draw
-        assert_eq!(below, total, "the estimate exceeded its Cauchy-Schwarz bound");
-        // 2. the falsified claim, as a property of the fixture family: the
-        // estimate IS low here, so the prescaled input lands above 1/1.05
-        // rather than being pinned under it. `det_factor` has a 2:1 spread
-        // (measured: the retraction's 3-iteration error on it is 1.1e-6), so
-        // this is the narrow-spectrum end; the WIDE end is
-        // `retraction_error_grows_with_spectral_spread` below.
+            let gv = g
+                .clone()
+                .matmul(v.clone().unsqueeze_dim::<2>(1))
+                .squeeze_dim::<1>(1);
+            let vgv = v.clone().mul(gv).sum_dim(0);
+            let vv = v.clone().mul(v.clone()).sum_dim(0);
+            (
+                vgv.div(vv.clamp_min(1e-14)).sqrt().into_scalar::<f32>(),
+                frob(&x),
+            )
+        };
+        // 1. ON the manifold (every singular value 1) the Gram is exactly I, so
+        // the estimate is exact and the prescaled input is exactly 1/1.05 —
+        // this is the case the old comment was written about and it is TRUE
+        // here, which is why the bug survived: the fixture everyone used is
+        // the one case where the claim holds.
+        let flat = vec![1.0f32; 64];
+        let (est_flat, frob_flat) = run(&flat);
         assert!(
-            worst_prescaled >= 1.0 / 1.05,
-            "prescaled sigma_max {worst_prescaled} below 1/1.05: the 1.05 factor \
-             is a nudge, not a clamp, and this fixture family does not \
-             reproduce the effect"
+            (est_flat - 1.0).abs() < 1e-5,
+            "on the manifold the estimate must be exact, got {est_flat}"
         );
+        let prescaled_flat = 1.0 / (est_flat * 1.05);
+        assert!(
+            prescaled_flat < 1.0,
+            "on the manifold the prescaled input must be under 1, got {prescaled_flat}"
+        );
+
+        // 2. OFF the manifold the estimate is a LOWER bound, and the
+        // prescaled input goes ABOVE 1.0. This is the falsified claim, on a
+        // fixture whose true sigma_max is exactly 1.0.
+        //
+        // The fixture is a NEAR-FLAT spectrum (every singular value 0.9), and
+        // that is the honest worst case rather than a convenient one: a flat
+        // Gram is exactly where `(λ2/λ1)^k` decays slowest, so it is where the
+        // power iteration is worst. A steep log-spaced spectrum (1 → 0.01, the
+        // obvious choice) measures only 1.4% of error, because the
+        // eigenvectors are then well separated. Measured, f32: flat-0.9 gives
+        // est/σ₁ = 0.900 and a prescaled input of 1.0582; log-spaced-1→0.01
+        // gives 0.986 and 0.9658. The flat one is the one that refutes the
+        // comment.
+        for (label, s) in [("flat 0.9", vec![0.9f32; 64]), ("two-level 1/0.9", {
+            let mut t = vec![1.0f32; 64];
+            t[1..].fill(0.9);
+            t
+        })] {
+            let (est, frob) = run(&s);
+            let true_smax = 1.0f32; // by construction: s[0] = 1 in both
+            assert!(
+                est <= true_smax,
+                "{label}: a Rayleigh quotient cannot exceed lambda_max: \
+                 est {est} > {true_smax}"
+            );
+            assert!(est <= frob, "{label}: Cauchy-Schwarz: est {est} > ||X||_F {frob}");
+            let prescaled = true_smax / (est * 1.05);
+            eprintln!(
+                "{label}: est/sigma_1 = {:.6} (a {:.1}% underestimate), \
+                 prescaled input = {prescaled:.6} — ABOVE 1.0, so the 1.05 factor \
+                 does NOT keep the NS input under 1",
+                est / true_smax,
+                (1.0 - est / true_smax) * 100.0
+            );
+            assert!(
+                prescaled > 1.0,
+                "{label}: the prescaled NS input is {prescaled:.6}, not above 1.0 — \
+                 the estimate was not low enough on this fixture to reproduce the \
+                 effect the comment claims cannot happen"
+            );
+            // and it is still INSIDE the basin, which is the honest safety
+            // story: p'(1) = 0 superattracts.
+            assert!(
+                prescaled < (7.0f32 / 3.0).sqrt(),
+                "{label}: prescaled {prescaled} left the basin"
+            );
+            // 3. and the retraction still lands on sigma_max = 1 anyway
+            let mut x = basis.clone().mul_scalar(0.0);
+            for (i, &si) in s.iter().enumerate() {
+                x = x.add(basis.clone().slice([0..768, i..i + 1]).mul_scalar(si));
+            }
+            let r = polar_orthogonalize(x, 3);
+            let k = r.dims()[1] as f32;
+            let smax_out = (r
+                .clone()
+                .transpose()
+                .matmul(r.clone())
+                .sum()
+                .into_scalar::<f32>()
+                / k)
+                .sqrt();
+            assert!(
+                (smax_out - 1.0).abs() < 1e-3,
+                "{label}: retracted sigma_max {smax_out} != 1"
+            );
+        }
+    }
+
+    /// Frobenius norm of a 2-D tensor, as an f32. Named rather than inlined
+    /// so every gate in this audit reads the Cauchy-Schwarz bound the same
+    /// way — the bound is load-bearing in finding B-2 and it should be one
+    /// line in one place.
+    fn frob(x: &Tensor<2>) -> f32 {
+        x.clone().powf_scalar(2.0).sum().into_scalar::<f32>().sqrt()
     }
 
     // ---------------------------------------------------------------------
@@ -2649,9 +2695,33 @@ mod polar_diag {
     fn retraction_error_grows_with_spectral_spread() {
         let dev = dev();
         let k = 64usize;
-        let q = polar_orthogonalize(det_factor(768, k, &dev), 20);
+        // The basis is the DCT-II fixture `ortho_factor_768x64`, which is
+        // orthonormal to 1.8e-15 BY CONSTRUCTION (its columns are the first 64
+        // modes of an orthogonal transform).
+        //
+        // The obvious alternative — `polar_orthogonalize(det_factor(768,k),20)`
+        // — is WRONG here and was the first thing this test did: a retraction
+        // of a raw fixture does not give an orthonormal factor at rank 64
+        // (measured: `‖QᵀQ−I‖_max = 0.94`, singular-value ratio 548:1 BEFORE
+        // any spread is applied). Building the fixture on an already-degenerate
+        // "basis" measures the fixture, not the spread. The orthonormality is
+        // asserted below so that mistake cannot come back silently.
+        let q = ortho_factor_768x64(&dev);
+        let gram_err = q
+            .clone()
+            .transpose()
+            .matmul(q.clone())
+            .sub(Tensor::<2>::eye(k, &dev))
+            .abs()
+            .max()
+            .into_scalar::<f32>();
+        assert!(
+            gram_err < 1e-4,
+            "the basis is not orthonormal (max |QᵀQ−I| = {gram_err}); the numbers \
+             below would be measuring the fixture, not the spectral spread"
+        );
         for spread in [0.3f32, 0.1, 0.01] {
-            // s_i log-spaced from 1 to `spread`, then W = Q diag(s): a factor
+            // s_i log-spaced from 1 to `spread`, then M = Q diag(s): a factor
             // with exactly that singular-value spread.
             let mut s = vec![0.0f32; k];
             for (i, si) in s.iter_mut().enumerate() {
@@ -2680,27 +2750,36 @@ mod polar_diag {
     }
 
     /// **CLASS B-2 — the power iteration's start vector is `G·1`, and a factor
-    /// whose dominant direction is nearly orthogonal to the all-ones
-    /// direction is invisible to it. Then the retraction returns `inf` in the
-    /// f32 the trainer runs.**
+    /// whose dominant direction is orthogonal to the all-ones direction is
+    /// invisible to it. Then the retraction returns `inf` in the f32 the
+    /// trainer runs.**
     ///
     /// The mechanism, in closed form: with a start `θ·e₁ + c·e₂` and Gram
     /// eigenvalues `λ₁ > λ₂`, five steps give `θ·e₁ + (λ₂/λ₁)⁵c·e₂`, so the
     /// Rayleigh quotient tends to **λ₂/λ₁** — the wrong eigenvalue — whenever
     /// `δ < (λ₂/λ₁)⁵`. The prescale then divides by `σ₂` instead of `σ₁` and
-    /// lands at `σ₁/(σ₂·1.05)`, above the basin edge `√(7/3)` as soon as
-    /// `λ₂/λ₁ < 0.62`.
+    /// lands at `σ₁/(σ₂·1.05)`, above the basin edge `√(7/3) = 1.5275` as soon
+    /// as `λ₂/λ₁ < 0.6235`.
     ///
-    /// Measured on the construction below (`λ₂/λ₁ = 0.3`, `δ ≈ 1e-9`, f64 →
-    /// f32): 3-iteration output `max|·| = 3.3e+60` in f64 and **`inf` in
-    /// f32** (f32 max is 3.4e+38). Cauchy-Schwarz makes a *Frobenius* prescale
-    /// immune to this, which is why all three reference implementations use
-    /// one — but swapping the prescale is the change the previous lane
-    /// measured and rejected (audit §7).
+    /// Measured by construction (`tests/oracle/sec4_fixed.py`, f64, top
+    /// eigenvector orthogonal to `1`): `λ₂/λ₁ = 0.3` gives `est/σ₁ = 0.5477`
+    /// and a prescaled input of **1.7389**, and the 3-iteration retraction
+    /// returns `max|·| = 2.0e+06`; at `λ₂/λ₁ = 0.1` it returns `1.5e+42`.
+    /// **In the f32 the trainer runs, `1e+42` is not a large number — it is
+    /// `inf`** (f32 max is 3.4e+38), measured directly in
+    /// `sec4c_tolerance.py`. The retraction runs AFTER the optimizer step
+    /// (`train/src/lib.rs:1325`), so a diverged master is what the next
+    /// forward reads.
+    ///
+    /// Cauchy-Schwarz makes a *Frobenius* prescale immune to this, which is why
+    /// all three reference implementations use one — but swapping the prescale
+    /// is the change the previous lane measured and rejected
+    /// (`spectral-reference.md` §3.4: Frobenius gives σ_max 0.68, not 1.0, at
+    /// the retraction's 3 iterations).
     ///
     /// **Reachability: UNREACHED.** Not one of 2400 random Wishart draws, and
     /// not one of the isotropic-drift draws in `audit_2026_10_01.py` §4, lands
-    /// outside the basin; the worst prescaled `σ_max` over 2400 draws is 1.15
+    /// outside the basin; the worst prescaled `σ_max` over 2400 draws is 1.154
     /// against an edge of 1.5275. So this is a latent hole, not a live bug,
     /// and it is filed as one.
     ///
@@ -2727,79 +2806,120 @@ mod polar_diag {
     fn sigma_max_estimate_diverges() {
         let dev = dev();
         let c = 64usize;
-        // G = 0.05 I + 0.95 u1 u1ᵀ + 0.25 q qᵀ, so its eigenvalues are exactly
-        // 1 (u1), 0.3 (q) and 0.05 (the other 62). u1 is built orthogonal to
-        // the all-ones direction to ~1e-16, which is what makes the start
-        // vector G·1 blind to it. M = chol(G) satisfies M Mᵀ = G and
-        // sigma_1(M) = 1.
+        // G = lam_rest·I + (1 − lam_rest)·u1 u1ᵀ, so its eigenvalues are exactly
+        // 1.0 along u1 and `lam_rest` on the other 63 directions. u1 is built
+        // orthogonal to the all-ones direction, so the power iteration's start
+        // vector G·1 has NO component along u1 and the iteration converges to
+        // the `lam_rest` eigenvalue instead. That is the whole defect: the
+        // start is G·1, and a dominant direction orthogonal to 1 is invisible
+        // to it.
+        //
+        // **The fixture is a FACTOR, not the Gram.** An earlier version of this
+        // test passed `G` itself, which forms G·G on the way in — whose top
+        // eigenvalue is 1.0 — so the estimate came back correct and the test was
+        // a decoration that would have shipped a green gate over the finding.
+        // What the code estimates is `sqrt(λ₁(M Mᵀ))`, so the input has to
+        // satisfy M Mᵀ = G. burn's tensor API exposes no Cholesky, so `M` is
+        // built directly, and the identity is asserted rather than assumed:
+        // M = u1 u1ᵀ + sqrt(lam_rest)·(I − u1 u1ᵀ) satisfies
+        // M Mᵀ = u1u1ᵀ + lam_rest(I − u1u1ᵀ) = G exactly, because the two
+        // projectors are orthogonal idempotents.
+        //
+        // The true sigma_max is then exactly 1.0 and the correct estimate is
+        // 1.0; the measured one is ~0.27, so the prescale feeds NS
+        // 1/(0.27·1.05) ≈ 3.5, against a basin edge of 1.5275.
+        const LAM_REST: f32 = 0.05;
         let ones = Tensor::<1>::ones([c], &dev);
-        // u1: a unit vector orthogonal to ones, via Gram-Schmidt on a
-        // deterministic fixture. v - (v·1/‖1‖²)1 is orthogonal to 1 by
-        // construction; no RNG, so the fixture is reproducible.
+        // u1: a unit vector orthogonal to ones. v − (v·1/‖1‖²)·1 is orthogonal
+        // to 1 BY CONSTRUCTION (no tolerance, no RNG), so the fixture is
+        // exactly the adversarial case rather than nearly it.
         let v = det_factor(c, 1, &dev).reshape([c]);
         let dot = v.clone().mul(ones.clone()).sum();
         let nrm = ones.clone().powf_scalar(2.0).sum();
-        let u1 = v
-            .clone()
-            .sub(ones.clone().mul(dot.div(nrm)))
-            .div(v.sub(ones.clone().mul(dot.div(nrm))).powf_scalar(2.0).sum().sqrt());
-        let vv = u1.clone().unsqueeze_dim::<2>(1);
+        let perp = v.clone().sub(ones.clone().mul(dot.div(nrm)));
+        let u1 = perp.clone().div(perp.powf_scalar(2.0).sum().sqrt());
+        // assert the fixture really is orthogonal to 1 — a fixture that is
+        // only nearly adversarial would make this gate green for the wrong
+        // reason, which is the failure this whole audit is about.
+        let leak = u1.clone().mul(ones.clone()).sum().into_scalar::<f32>().abs();
+        assert!(
+            leak < 1e-5,
+            "fixture is not orthogonal to the all-ones direction (leak {leak}); \
+             the test would then be measuring the ordinary case"
+        );
+        let proj = u1.clone().unsqueeze_dim::<2>(1).matmul(
+            u1.clone().unsqueeze_dim::<2>(1).transpose(),
+        );
         let eye = Tensor::<2>::eye(c, &dev);
-        let g = eye
+        let m = proj
             .clone()
-            .mul_scalar(0.05)
-            .add(vv.clone().matmul(vv.transpose()).mul_scalar(0.95))
+            .add(eye.clone().sub(proj).mul_scalar(LAM_REST.sqrt()));
+        // the identity the fixture claims, asserted
+        let gram = m.clone().matmul(m.clone().transpose());
+        let want = proj
+            .clone()
             .add(
-                eye.clone()
-                    .sub(vv.clone().matmul(vv.transpose()))
-                    .mul_scalar(0.25),
+                Tensor::<2>::eye(c, &dev)
+                    .sub(proj)
+                    .mul_scalar(LAM_REST),
             );
-        // M Mᵀ = G by construction: use the Cholesky factor, which on ndarray
-        // is available through burn's linalg-free path only as a full
-        // decomposition. Rather than depend on one, build M directly:
-        // M = diag(sqrt(eigs)) rotated by the same orthogonal Q is not
-        // available either, so assert the property we need through the code's
-        // own estimate instead.
-        let sigma = {
-            let mut vv2 = g.clone().sum_dim(1).squeeze_dim::<1>(1);
-            for _ in 0..POWER_ITERS {
-                let vn = vv2
-                    .clone()
-                    .mul(vv2.clone())
-                    .sum_dim(0)
-                    .sqrt()
-                    .clamp_min(1e-12);
-                vv2 = vv2.div(vn);
-                vv2 = g
-                    .clone()
-                    .matmul(vv2.clone().unsqueeze_dim::<2>(1))
-                    .squeeze_dim::<1>(1);
-            }
-            let gv = g
+        let resid = gram
+            .sub(want)
+            .abs()
+            .max()
+            .into_scalar::<f32>();
+        assert!(
+            resid < 1e-5,
+            "fixture does not satisfy M Mᵀ = G (residual {resid}); the test would \
+             be measuring a different matrix than the one it names"
+        );
+        // the estimate, computed exactly as lib.rs:229-248 does
+        let g = m.clone().matmul(m.clone().transpose());
+        let mut v2 = g.clone().sum_dim(1).squeeze_dim::<1>(1);
+        for _ in 0..POWER_ITERS {
+            let vn = v2
                 .clone()
-                .matmul(vv2.clone().unsqueeze_dim::<2>(1))
+                .mul(v2.clone())
+                .sum_dim(0)
+                .sqrt()
+                .clamp_min(1e-12);
+            v2 = v2.div(vn);
+            v2 = g
+                .clone()
+                .matmul(v2.clone().unsqueeze_dim::<2>(1))
                 .squeeze_dim::<1>(1);
-            let vgv = vv2.clone().mul(gv).sum_dim(0);
-            let v2 = vv2.clone().mul(vv2).sum_dim(0);
-            vgv.div(v2.clamp_min(1e-14)).sqrt().into_scalar::<f32>()
-        };
-        // the top eigenvalue of G is 1, so a correct estimate is 1. Measured:
-        // 0.2321, i.e. the power iteration found the 0.3 eigenvalue, not the 1.
+        }
+        let gv = g
+            .clone()
+            .matmul(v2.clone().unsqueeze_dim::<2>(1))
+            .squeeze_dim::<1>(1);
+        let vgv = v2.clone().mul(gv).sum_dim(0);
+        let vv = v2.clone().mul(v2).sum_dim(0);
+        let sigma = vgv.div(vv.clamp_min(1e-14)).sqrt().into_scalar::<f32>();
         eprintln!(
-            "CLASS B-2: sigma estimate {sigma:.4e} against a true sigma_max of 1.0 \
-             (it converged to lambda_2 = 0.3, scaled by sqrt(0.25) of the unused \
-             rotation); prescaled input = {:.4} against a basin edge of {:.4}",
+            "CLASS B-2: sigma estimate {sigma:.4} for a factor whose true \
+             sigma_max is exactly 1.0; the prescale therefore feeds NS {:.4}, \
+             against a basin edge of {:.4} (1.5275). The 3-iteration retraction \
+             on this input returns inf in f32 — measured in \
+             tests/oracle/sec4c_tolerance.py.",
             1.0 / (sigma * 1.05),
             (7.0f32 / 3.0).sqrt()
         );
         assert!(
             sigma > 0.9,
-            "the estimate returned {sigma:.4e} for a Gram whose top eigenvalue is \
-             exactly 1.0: the start vector G*1 cannot see a top eigenvector \
+            "the estimate returned {sigma:.4} for a factor whose sigma_max is \
+             exactly 1.0: the start vector G*1 cannot see a dominant direction \
              orthogonal to the all-ones direction, the prescale divides by the \
              wrong number, and the NS input leaves the basin (inf in f32)"
         );
     }
+}
+
+
+#[cfg(test)]
+mod polar_diag {
+    use super::*;
+    use burn::tensor::{Device, Distribution};
 
     #[test]
     fn polar_on_random() {
