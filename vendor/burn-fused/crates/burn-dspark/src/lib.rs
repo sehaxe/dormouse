@@ -210,24 +210,79 @@ pub fn dspark_loss(
     //
     // LOGIT FORM, and this is a fix rather than a style choice.
     // DeepSeek's `loss.py` calls `F.binary_cross_entropy_with_logits(conf,
-    // c_star)`, which is `max(x,0) - x*c + log(1 + exp(-|x|))` - finite at
-    // |logit| = 40, where the naive `sigmoid` then `log` runs out of precision.
-    // The old code did `sigmoid(x)` and then `log(p + 1e-7)`, which puts a hard
-    // CEILING of ln(1e7) = 16.1 on the term no matter how wrong the head is.
-    // Measured against the official loss at `DeepSpec@005e03b8`
+    // c_star)`. The old code did `sigmoid(x)` and then `log(p + 1e-7)`, which
+    // puts a hard CEILING of ln(1e7) = 16.1 on the term no matter how wrong the
+    // head is. Measured against the official loss at `DeepSpec@005e03b8`
     // (`tests/dspark_loss_oracle.rs`, run on CPU): the `saturated_conf` case
     // gave ours 9.309 against DeepSeek's 21.445. The CE and L1/TV terms agreed
     // on all eight cases, so this one term was the whole disagreement. At
     // |x|=40 the official form returns 40.00; the clamped one could not exceed
     // 16.1 at any x.
+    //
+    // AND THE TARGET IS DETACHED, which is the same reference and a second
+    // fix. `loss.py:145` is `confidence_targets = accept_rate_3d.detach()`: the
+    // analytical acceptance rate is a LABEL derived from the drafter's own
+    // output, not a second objective for it, so upstream back-propagates it
+    // nowhere. We built `c_star` from `draft_logits` on a live graph, which
+    // pulls `-cl * d(c_star)/d(draft_logits)` into the drafter's gradient -
+    // a gradient path that exists only to move a loss DOWN by making the
+    // drafter's own output look more like the target, and which has no
+    // counterpart in the paper's Eq. 11 or in the reference implementation.
+    //
+    // The FORWARD VALUE IS BIT-IDENTICAL either way, which is why the
+    // value-level oracle above was blind to it. It is a gradient-only defect
+    // and it is not small. Measured against the reference's own autograd on the
+    // fixture's eight inputs, the L2 norm of d(total)/d(draft_logits):
+    //
+    //   case              |g| no-detach   |g| detached    ratio
+    //   saturated_conf       1.227131       0.073771      16.6x too LARGE
+    //   block7_exact         0.118244       0.087681       1.35x
+    //   tiny_mask            0.131755       0.153709       1.17x
+    //   main                 0.056004       0.054848       1.02x
+    //   aligned_identical    0.034983       0.034983       1.00x  (accept = 1
+    //   big_logits           0.048648       0.048648       1.00x   clamps to a
+    //   all_masked_off        0.0            0.0          -         constant)
+    //   no_confidence_head   0.057351       0.057351       1.00x  (no head)
+    //
+    // Four of eight cases move, and `confidence_head_alpha` is the LARGEST of
+    // the three weights (1.0, against 0.1 and 0.9). The gate is
+    // `dspark_loss_gradients_agree_with_the_official_loss`, the only comparison
+    // in the crate that can see it: with the `.detach()` removed it reports
+    // 3270x to 279147x the tolerance on those same four cases, and every value
+    // test beside it stays green.
+    //
+    // AND THE SPELLING IS `(1-c)*x + softplus(-x)`, which is a THIRD fix and
+    // the only one the value oracle could never have found. The intermediate
+    // version wrote BCE the way it is usually written out,
+    // `max(x,0) - x*c + log(1 + exp(-|x|))`, which is correct as a VALUE and
+    // correct as a gradient everywhere except the two kinks it introduces
+    // itself. At `x == 0` exactly, burn's `relu_backward` zeroes the `relu`
+    // term (its mask is `output <= 0`, `burn-backend/src/backend/ops/
+    // activation.rs:55`) and `abs`'s subgradient at 0 is 0, so the derivative
+    // collapses to `-c` where the true derivative - and
+    // `binary_cross_entropy_with_logits`' - is `sigmoid(x) - c`. Measured on
+    // the fixture's `aligned_identical` case, which has `confidence_pred` all
+    // zeros: d/d(conf[0]) came out at -0.1723984 against DeepSeek's
+    // -0.08619919, exactly 2x, on 10 of 14 coordinates. It is a measure-zero
+    // set in training and a hard disagreement on a fixture row, and the
+    // gradient gate found it on the first run - which is the argument for
+    // having the gate.
+    //
+    // `(1-c)*x + softplus(-x)` is the algebra `binary_cross_entropy_with_logits`
+    // itself is written in (`logsigmoid` rearranged), so it cannot have a
+    // kink: it is smooth, its derivative is `(1-c) - sigmoid(-x) = sigmoid(x)
+    // - c` identically, and `softplus` is already the stable primitive (it
+    // switches to the identity above its threshold, so |x| = 40 gives 4.5e-18
+    // for a right sign and 40.00 for a wrong one). Three terms become two.
     let conf = match confidence_logits {
         None => Tensor::zeros([1], &draft_logits.device()),
         Some(cl) => {
-            let c_star = accept_rate_target(draft_logits, target_logits); // [B, L]
+            // `detach()`: see the block comment above. Every other tensor in
+            // this function stays attached; this one is a label.
+            let c_star = accept_rate_target(draft_logits, target_logits).detach(); // [B, L]
             let cl = cl.reshape([b, l]);
-            let bce_per = activation::relu(cl.clone())
-                .sub(cl.clone().mul(c_star.clone()))
-                .add(activation::softplus(cl.abs().neg(), 1.0));
+            let one_minus_c = c_star.neg().add_scalar(1.0);
+            let bce_per = cl.clone().mul(one_minus_c).add(activation::softplus(cl.neg(), 1.0));
             (bce_per * wm).sum().div(den)
         }
     };

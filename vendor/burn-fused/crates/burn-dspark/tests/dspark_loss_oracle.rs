@@ -53,9 +53,15 @@
 //!
 //! 1. **The denominator.** Upstream divides by `den + 1e-6` (four separate
 //!    times: `loss.py:239-252`). We divide by `den.clamp_min(1.0)`
-//!    (`src/lib.rs:184`). These agree whenever `den >= 1` and differ
-//!    everywhere else — and `all_masked_off` / `tiny_mask` are in the fixture
-//!    to make that region reachable rather than theoretical.
+//!    (`src/lib.rs:194`). They are the same number to within 1e-6 relative
+//!    whenever `den >= 1` and differ materially only when `den` is of order
+//!    1e-5 or below — which is NOT where any case in this fixture is, and
+//!    `no_fixture_case_reaches_the_denominator_difference` below is the
+//!    executable version of that sentence. (An earlier version of this comment
+//!    claimed `all_masked_off` / `tiny_mask` made the region reachable. They do
+//!    not: they sit at `den` = 0.0 and `den` = 1.0, where the two formulas
+//!    differ by 1.3e-7 and 1.0e-6 relative against a `TOL_REL` of 1e-5. The
+//!    latent divergence is real, the coverage claim was not.)
 //! 2. **The confidence term's numerical form.** Upstream uses
 //!    `binary_cross_entropy_with_logits`, the STABLE logit-space form, which
 //!    is finite at a confidence logit of ±40. Ours exponentiates a sigmoid
@@ -63,6 +69,16 @@
 //!    (`src/lib.rs:203-212`), which cannot represent that regime: it returns
 //!    ≈16.1 where upstream returns ≈0.0. `saturated_conf` is the case, and it
 //!    is in the fixture with |logit| = 40 on purpose.
+//!
+//! ## And the one difference a value comparison CANNOT see
+//!
+//! `loss.py:145` is `confidence_targets = accept_rate_3d.detach()`. The
+//! analytical acceptance rate is computed from `draft_logits`, so leaving it
+//! attached to the graph yields a **bit-identical forward loss** and a
+//! drafter gradient that is wrong by 20.5%–100.9% in L2 by case. The three
+//! value tests above are structurally blind to it; the fourth test,
+//! `dspark_loss_gradients_agrees_with_the_official_loss`, is built for it and
+//! is the reason the fixture now carries `grad_draft` / `grad_conf`.
 
 #![allow(deprecated)] // burn-ndarray: the backend the fixture was made on
 
@@ -91,6 +107,12 @@ struct Case {
     out_l1: f32,
     out_conf: f32,
     ce_den: f32,
+    /// DeepSeek's own `d/d(draft_logits)`, by autograd on the pinned source.
+    /// `None` only if the fixture predates the gradient rows.
+    grad_draft: Option<Vec<f32>>,
+    /// ... and `d/d(confidence_pred)`. `None` for `no_confidence_head`,
+    /// which has no head at all.
+    grad_conf: Option<Vec<f32>>,
 }
 
 fn fixture() -> (Vec<String>, HashMap<String, Case>, f32) {
@@ -156,6 +178,16 @@ fn fixture() -> (Vec<String>, HashMap<String, Case>, f32) {
             } else {
                 Some(f("confidence_pred"))
             };
+            // `grad_draft` is required, not optional: a fixture without it
+            // cannot run the gradient gate at all, and a test that silently
+            // skips is exactly the failure mode this file exists to remove.
+            // `grad_conf` is legitimately `none` for the headless case, so it
+            // is read through the same "none" spelling.
+            let grad_conf = if get("grad_conf") == "none" {
+                None
+            } else {
+                Some(f("grad_conf"))
+            };
             let case = Case {
                 name: name.clone(),
                 dims,
@@ -169,6 +201,8 @@ fn fixture() -> (Vec<String>, HashMap<String, Case>, f32) {
                 out_l1: get("out_l1").parse().unwrap(),
                 out_conf: get("out_conf").parse().unwrap(),
                 ce_den: get("ce_den").parse().unwrap(),
+                grad_draft: Some(f("grad_draft")),
+                grad_conf,
             };
             by_name.insert(name.clone(), case);
         }
@@ -209,7 +243,7 @@ fn t2i(data: Vec<i64>, dims: [usize; 2], device: &burn::tensor::Device) -> Tenso
 #[test]
 fn ce_and_tv_agree_with_the_official_loss() {
     let (names, cases, tol) = fixture();
-    let device = Default::default();
+    let device = burn::tensor::Device::ndarray();
     let mut mismatch: Vec<String> = Vec::new();
 
     for name in &names {
@@ -306,7 +340,7 @@ fn ce_and_tv_agree_with_the_official_loss() {
 #[test]
 fn the_confidence_term_agrees_with_the_official_loss() {
     let (names, cases, tol) = fixture();
-    let device = Default::default();
+    let device = burn::tensor::Device::ndarray();
     let mut mismatch: Vec<String> = Vec::new();
 
     for name in &names {
@@ -362,7 +396,7 @@ fn the_confidence_term_agrees_with_the_official_loss() {
 #[test]
 fn dspark_loss_agrees_with_the_official_loss() {
     let (names, cases, tol) = fixture();
-    let device = Default::default();
+    let device = burn::tensor::Device::ndarray();
     let mut mismatch: Vec<String> = Vec::new();
 
     for name in &names {
@@ -414,12 +448,226 @@ fn dspark_loss_agrees_with_the_official_loss() {
     );
 }
 
+/// # THE THIRD DISAGREEMENT, and the only one a value oracle cannot see
+///
+/// The fixture's `grad_draft` / `grad_conf` are DeepSeek's OWN gradients:
+/// `compute_dspark_loss`'s returned scalar, `.backward()`ed on the pinned
+/// vendored source. No formula of ours is in that path — it is `Tensor::grad`
+/// on code fetched at `DEEPSPEC_SHA` and run on this box.
+///
+/// ## What this catches that nothing else in this file can
+///
+/// `loss.py:145` is `confidence_targets = accept_rate_3d.detach()`. The
+/// acceptance rate is computed *from the drafter's own logits*, so leaving it
+/// attached gives a bit-identical FORWARD loss and a drafter gradient that
+/// upstream does not train. All three value tests above are green either way,
+/// by construction: they compare scalars, and the scalar is the same.
+///
+/// The forward value is the same on both sides, which is exactly why
+/// `8c3bd2a`'s own oracle, and the three tests beside this one, could not see
+/// it. This test is the instrument that can.
+///
+/// ## Why a central difference could NOT be the check, and this is not a nitpick
+///
+/// A stop-gradient makes the returned scalar non-differentiable-consistent with
+/// the graph that produced it, so a finite difference of the forward value
+/// converges to the gradient of a *different* function — the one with a LIVE
+/// target. Measured on `main`, d/d(draft[0]): the reference's autograd gives
+/// -0.00598767, the detached ce+l1 sum gives -0.00598767, the live three-term
+/// sum gives -0.00991132, and a stable central difference (h from 1e-3 to 0.2)
+/// gives -0.00991344. A finite-difference gate would therefore report the
+/// correct stop-gradient as broken. Hence autograd for the reference, and
+/// hence this test.
+///
+/// ## The bound, and what it has to beat
+///
+/// `GRAD_ABS`/`GRAD_REL` are read from the fixture, which got them from the
+/// generator. They are NOT a round number chosen to be safe: with the
+/// `detach()` in place the worst element over all 8 cases and all 366 drafter
+/// coordinates plus 111 head coordinates is **0** for the `aligned_identical`
+/// / `big_logits` cases and **<= 4.0e-05 absolute** on the head coordinates
+/// (a central difference's own f32 noise floor), against a bound of
+/// `1e-7 + 1e-4*|ref|`.
+///
+/// In the OTHER direction — the `detach()` removed again — `d/d(draft_logits)`
+/// is wrong by **20.5% to 100.9% in L2 by case**. So the bound has to
+/// discriminate 21% and does not need to be anywhere near that tight; the
+/// headroom is deliberate, because the failure mode this test exists for is
+/// catastrophic and the f32 arithmetic underneath it is not.
+///
+/// `grad_conf` is a NEGATIVE CONTROL and is expected to be green in both
+/// states: the detach is on the target, which is a function of the logits, not
+/// of `confidence_pred`, so `d(conf)/d(confidence_pred)` is unaffected by it.
+/// A gate where one quantity can fail and a matched one provably cannot is a
+/// gate that discriminates, rather than one that merely fails.
+#[test]
+fn dspark_loss_gradients_agree_with_the_official_loss() {
+    let (names, cases, _) = fixture();
+    let device = burn::tensor::Device::ndarray().autodiff();
+    let (gabs, grel) = grad_bounds();
+    let mut mismatch: Vec<String> = Vec::new();
+
+    for name in &names {
+        let c = &cases[name];
+        let [b, a, k, v] = c.dims;
+        assert_eq!(a, 1, "{name}: the generator holds A == 1; see the fixture tests");
+        let l = k;
+
+        let draft = t3(c.draft_logits.clone(), [b, l, v], &device).require_grad();
+        let draft_leaf = draft.clone();
+        let ids = t2i(c.target_ids.clone(), [b, l], &device);
+        let mask = Tensor::from_data(TensorData::new(c.eval_mask.clone(), [b, l]), &device);
+        // The target logits are a FROZEN teacher output, so they get no
+        // `require_grad` and no comparison: the trainer never back-propagates
+        // into them, so a gradient w.r.t. them is not a quantity it uses.
+        let target = t3(c.aligned_target_logits.clone(), [b, l, v], &device);
+        let conf = c
+            .confidence_pred
+            .clone()
+            .map(|v| t3(v, [b, l, 1], &device).require_grad());
+        let conf_leaf = conf.clone();
+
+        let (total, ..) = burn_dspark::dspark_loss(
+            draft, target, ids, conf, mask, 4.0,
+        );
+        let grads = total.backward();
+
+        for (what, got, want) in [
+            ("draft", draft_leaf.grad(&grads), c.grad_draft.as_ref()),
+            ("conf", conf_leaf.as_ref().and_then(|t| t.grad(&grads)), c.grad_conf.as_ref()),
+        ] {
+            let (Some(got), Some(want)) = (got, want) else {
+                // `grad_conf` is `none` exactly when the head is `none`, and
+                // `grad_draft` is never absent. Anything else is a fixture bug.
+                assert!(
+                    what == "conf" && c.confidence_pred.is_none(),
+                    "{name}: grad_{what} is missing on one side only"
+                );
+                continue;
+            };
+            let got: Vec<f32> = got.into_data().to_vec().expect("gradient read");
+            assert_eq!(got.len(), want.len(), "{name}: grad_{what} length");
+            let mut worst = 0.0f32;
+            let mut worst_at = 0usize;
+            let mut bad = 0usize;
+            for (i, (a, b)) in got.iter().zip(want.iter()).enumerate() {
+                let dev = (a - b).abs();
+                let allowed = gabs + grel * b.abs();
+                if dev > allowed {
+                    bad += 1;
+                    if dev / allowed > worst {
+                        worst = dev / allowed;
+                        worst_at = i;
+                    }
+                }
+            }
+            if bad > 0 {
+                let ours_at = got[worst_at];
+                let theirs_at = want[worst_at];
+                mismatch.push(format!(
+                    "  {name:<20} grad_{what:<5} {bad}/{} coordinates outside the \
+                     bound; worst at [{worst_at}] ours {ours_at:>13.6e}  \
+                     DeepSeek {theirs_at:>13.6e}  {worst:.1}x the bound",
+                    want.len()
+                ));
+            }
+        }
+    }
+
+    assert!(
+        mismatch.is_empty(),
+        "\n{} disagreement(s) on the GRADIENTS against DeepSeek's \
+         compute_dspark_loss at {DEEPSPEC_SHA}:\n{}\n\
+         Bound: |ours - DeepSeek| <= {gabs:.1e} + {grel:.1e} * |DeepSeek|.\n\
+         The forward value is IDENTICAL either way, which is why every value \
+         test in this file is blind to it. Read the test's doc comment: \
+         `loss.py:145` detaches the acceptance target, and a central \
+         difference cannot check a stop-gradient at all.",
+        mismatch.len(),
+        mismatch.join("\n"),
+    );
+}
+
+/// The gradient bound, read from the fixture header so it travels with the
+/// numbers it was measured against. Parsed once per call; the fixture is a
+/// few hundred kB and this is a test.
+fn grad_bounds() -> (f32, f32) {
+    let text = include_str!("fixtures/dspark_loss_oracle.txt");
+    let mut gabs = None;
+    let mut grel = None;
+    for line in text.lines() {
+        if let Some(v) = line.strip_prefix("meta.grad_abs:") {
+            gabs = Some(v.trim().parse().expect("meta.grad_abs"));
+        }
+        if let Some(v) = line.strip_prefix("meta.grad_rel:") {
+            grel = Some(v.trim().parse().expect("meta.grad_rel"));
+        }
+    }
+    (
+        gabs.expect("the fixture has no meta.grad_abs: regenerate the fixture"),
+        grel.expect("the fixture has no meta.grad_rel: regenerate the fixture"),
+    )
+}
+
+/// The denominator difference (`den + 1e-6` vs `den.clamp_min(1.0)`) is a
+/// REAL latent divergence, and the fixture does NOT cover it. This is the
+/// executable form of that admission, so the claim cannot rot into a coverage
+/// claim again — which is exactly what it did once.
+///
+/// A case discriminates the two denominators only if BOTH hold: some term's
+/// numerator is non-zero (otherwise `0/1e-6` and `0/1.0` are both exactly 0),
+/// and the denominators' relative disagreement `1e-6/den` is at or above the
+/// test's own `TOL_REL`. `wm.sum()` is `sum_k w_k * mask_k` with `w_0 = 1`, so
+/// a 0/1 mask can only reach 0 (all masked) or `>= 1.0`; at `den = 1.0` the
+/// disagreement is 1e-6, an order of magnitude under `TOL_REL = 1e-5`; and it
+/// only becomes material when `den` itself is of order 1e-5, i.e. a mask with
+/// values of order 1e-5, which is not a thing a caller has any reason to
+/// build. So: bounded, unreachable from the one live call site
+/// (`crates/dormouse-core/src/aux.rs` passes an all-ones mask, giving
+/// `wm.sum() >= 2.86`), and named. It is not measured away.
+#[test]
+fn no_fixture_case_reaches_the_denominator_difference() {
+    let (names, cases, tol) = fixture();
+    let mut worst = 0.0f32;
+    let mut worst_case = String::new();
+    for name in &names {
+        let c = &cases[name];
+        // `out_*` is the numerator DIVIDED by the upstream denominator, so
+        // `out_* == 0` is exactly "this term's numerator is zero" and the
+        // denominator cannot move it at all.
+        let numerator_is_zero = c.out_ce == 0.0 && c.out_l1 == 0.0 && c.out_conf == 0.0;
+        if numerator_is_zero {
+            continue;
+        }
+        // Upstream divides by `den + 1e-6`, we by `max(den, 1)`. The relative
+        // change in the term is `den/(den + 1e-6) - 1` for `den >= 1` and
+        // `1 - den` for `den < 1` (ours returns the numerator unchanged).
+        let gap = if c.ce_den >= 1.0 {
+            1e-6 / c.ce_den
+        } else {
+            1.0 - c.ce_den
+        };
+        if gap > worst {
+            worst = gap;
+            worst_case = name.clone();
+        }
+    }
+    assert!(
+        worst < tol,
+        "case {worst_case} has a non-zero numerator and the two denominators \
+         differ by {worst:.3e} relative, at or above TOL_REL = {tol:.1e} -- this \
+         fixture DOES now cover the denominator difference, so the module doc \
+         and the generator's own note are stale and must be rewritten."
+    );
+}
+
 /// The generator holds A == 1 on purpose, and the reason is load-bearing: the
 /// decay index differs for A > 1. Asserted here so a future regeneration that
 /// breaks the correspondence fails loudly instead of silently comparing two
 /// different functions.
 #[test]
 fn the_fixture_has_one_anchor_so_the_decay_index_lines_up() {
+
     let (_, cases, _) = fixture();
     for c in cases.values() {
         assert_eq!(c.dims[1], 1, "{}: A must be 1", c.name);

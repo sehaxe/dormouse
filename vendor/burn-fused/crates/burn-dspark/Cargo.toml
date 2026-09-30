@@ -19,7 +19,12 @@ burn-tensor = { workspace = true }
 
 [dev-dependencies]
 burn-ndarray = { workspace = true, features = ["blas-openblas"] }
-burn = { workspace = true, features = ["ndarray", "std"] }
+# `autodiff` is what lets `dspark_loss_gradients_agree_with_the_official_loss`
+# back-propagate. The value tests in the same file now name their device
+# EXPLICITLY (`Device::ndarray()`) because turning this feature on makes
+# `Device::default()` an autodiff device, and a golden comparison that silently
+# changes backend is a golden comparison nobody re-ran.
+burn = { workspace = true, features = ["ndarray", "std", "autodiff"] }
 
 # `dspark_loss` and `accept_rate_loss` are behind `training`, so the oracle
 # test cannot compile without it. `required-features` is what stops cargo
