@@ -8,6 +8,10 @@ mod device;
 mod runtime;
 
 pub use compiler::{CudaCompilationOptions, CudaCompiler, CudaRepresentation};
+/// How many kernel launches this backend executed. Defined in the private
+/// `compute::context` and re-exported here, so a consumer counts launches
+/// without reaching into a private module.
+pub use compute::context::launches;
 pub use device::*;
 pub use runtime::*;
 

@@ -66,6 +66,10 @@ path = "src/lib.rs"
 name = "graph"
 path = "tests/graph.rs"
 
+[[test]]
+name = "graph_step"
+path = "tests/graph_step.rs"
+
 [dependencies.bytemuck]
 version = "1.16.1"
 

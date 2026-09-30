@@ -38,6 +38,29 @@ use cubecl_server::compiler::{
     CompilationCache, CompilationRecording, compilation_store, store_compiled,
 };
 
+/// Every kernel launch this backend executed, since the process started.
+///
+/// One `fetch_add` at the single choke point every launch passes through
+/// (`CudaContext::execute_task`), so the count is a property of the workload
+/// and not of any one caller: burn ops, matmuls, the fused kernels and the
+/// autotuner's own candidates all pass through the same line.
+///
+/// **It is counted on the device thread**, so a value sampled from the host is
+/// a LOWER BOUND on what the host has enqueued — the device thread may still be
+/// behind. In a launch-bound loop the host runs ahead and the two nearly
+/// coincide; the honest claim is the lower bound.
+///
+/// The number this exists to decide: a CUDA graph replaces *N* launches with
+/// one dispatch, so a stage is only worth capturing if `N` is large. Without a
+/// count, "launch-bound" is an adjective.
+static LAUNCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many kernel launches the CUDA backend has executed. See [`LAUNCHES`] for
+/// what the number does and does not mean.
+pub fn launches() -> u64 {
+    LAUNCHES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[derive(Debug)]
 pub(crate) struct CudaContext {
     pub context: *mut CUctx_st,
@@ -516,6 +539,13 @@ impl CudaContext {
         dispatch_count: (u32, u32, u32),
         resources: &mut [*mut c_void],
     ) -> Result<(), LaunchError> {
+        // The launch counter, at the one place every kernel launch on this
+        // backend passes through (ADR-0011: an arm that cannot show it ran is
+        // the cardinal sin, and "how many launches" has no other honest
+        // source). `Relaxed` is enough: it is a count, not a synchronisation,
+        // and a host-side sample is a LOWER BOUND on what the host enqueued
+        // because the device thread may still be behind.
+        LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let kernel = self.modules.get(&kernel_id).unwrap();
         let cube_dim = kernel.cube_dim;
         // SAFETY: `kernel.func` is a valid function handle from a loaded module.
