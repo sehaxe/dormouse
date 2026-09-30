@@ -355,6 +355,15 @@ def print_4():
 
 
 # ------------------------------------------------------------ 5. the factored path
+def retract20(rows, cols, seed=None):
+    """A converged polar factor [rows, cols]: the code's own map, prescaled."""
+    g = torch.Generator().manual_seed(seed) if seed is not None else None
+    M = torch.randn(rows, cols, dtype=torch.float64, generator=g)
+    X = M.T if rows > cols else M
+    out = ours_gram_iter(X / (sigma_est(X) * SAFETY), 20)
+    return out.T if rows > cols else out
+
+
 def print_5():
     print()
     print("=" * 78)
@@ -369,8 +378,10 @@ def print_5():
     for spread in [1.0, 10.0, 1e3]:
         A0 = torch.randn(d, k, dtype=torch.float64)
         B0 = torch.randn(f, k, dtype=torch.float64)
-        U = ours_gram_iter(A0, 20)
-        V = ours_gram_iter(B0, 20)
+        # prescale first, exactly as the code does (a raw Gaussian is OUTSIDE
+        # the basin - see section 1 - and would diverge at 20 iterations)
+        U = ours_gram_iter(A0.T / sigma_est(A0.T), 20).T
+        V = ours_gram_iter(B0.T / sigma_est(B0.T), 20).T
         s = torch.logspace(0, -torch.log10(torch.tensor(spread)).item(), k,
                            dtype=torch.float64)
         W = U @ torch.diag(s) @ V.T
@@ -393,8 +404,8 @@ def print_5():
     d, f, k = 256, 256, 64
     for eps in [1e-4, 1e-3, 1e-2]:
         torch.manual_seed(3)
-        U = ours_gram_iter(torch.randn(d, k, dtype=torch.float64), 20)
-        V = ours_gram_iter(torch.randn(f, k, dtype=torch.float64), 20)
+        U = retract20(d, k, seed=1)
+        V = retract20(f, k, seed=2)
         s = torch.ones(k, dtype=torch.float64)
         W_on = U @ torch.diag(s) @ V.T
         Uo = ours_gram_iter(U + eps * torch.randn(d, k, dtype=torch.float64), 3)

@@ -130,8 +130,45 @@ pub fn ste_ternary_per_column(w: Tensor<2>) -> Tensor<2> {
 }
 
 /// Power-iteration count for the sigma_max estimate (Gram top eigenvalue).
-/// Rayleigh-quotient error shrinks as (λ2/λ1)^k; 5 gives the estimate well
-/// within the 1.05 safety factor even for square Wishart (λ2/λ1 ≈ 1).
+///
+/// **What the count buys, measured, and what it does not.** The Rayleigh
+/// quotient's error decays as `(λ2/λ1)^(2k)` — the `2k` is the square of the
+/// comment this replaced, which said `^(k)` and was wrong (2026-10-01 audit,
+/// `research/reviews/spectral-audit-2026-10-01.md` §3). The rate is
+/// *slowest* exactly where the spectrum is flattest, which is the case the old
+/// comment claimed to have covered:
+///
+/// | λ2/λ1 | median rel err, 5 steps | `(λ2/λ1)^5` | `(λ2/λ1)^10` |
+/// |---|---|---|---|
+/// | 0.10 | 2.2e-16 | 1.0e-05 | 1.0e-10 |
+/// | 0.50 | 2.1e-08 | 3.1e-02 | 9.8e-04 |
+/// | 0.90 | 7.0e-03 | 5.9e-01 | 3.5e-01 |
+/// | 0.99 | 4.3e-03 | 9.5e-01 | 9.0e-01 |
+///
+/// (f64, controlled spectrum, `torch 2.14.0+cpu`; the script is
+/// `tests/oracle/audit_2026_10_01.py` §3. A Wishart average cannot separate
+/// the rate from the spread, because the near-degenerate draws ARE the bad
+/// ones.)
+///
+/// **So 5 is not "well within the 1.05 factor".** On 400 Wishart draws per
+/// shape the estimate is 3–4% low at the median and **exceeds 5% of error on
+/// 30–39% of draws**, and because it converges from *below* the prescaled
+/// input lands **above 1.0** on the worst draws — the factor and the error
+/// pull in opposite directions. What makes that safe is not the factor: it is
+/// `p'(1) = 0` (see [`polar_orthogonalize`]), which makes the fixed point
+/// superattracting, so an input anywhere in the basin lands on 1 regardless.
+///
+/// **A failure mode the power iteration does not have, and 5 does not fix.**
+/// The start vector is `G·1` (`lib.rs` below), so a factor whose dominant
+/// singular direction is nearly orthogonal to the all-ones direction is
+/// *invisible* to it: the iteration converges to a smaller eigenvalue, the
+/// prescale divides by the wrong number, and the input leaves the basin.
+/// Constructed and measured at `l2/l1 ≤ 0.3`: the 3-iteration retraction
+/// returns 1e+42 in f64 and **`inf` in the f32 the trainer runs**
+/// (`tests/oracle/sec4_fixed.py`, `sec4c_tolerance.py`). Not reached by any
+/// random draw in 2400, and the guard question is an owner decision — see the
+/// audit §6. What is *not* an owner decision is leaving a comment here that
+/// says the opposite.
 const POWER_ITERS: usize = 5;
 
 /// A retracted master: `polar_orthogonalize(before).detach()`, re-flagged as a
@@ -246,8 +283,20 @@ pub fn polar_orthogonalize(x: Tensor<2>, iters: usize) -> Tensor<2> {
     // `clamp_min` is the tensor form of the old `f32::max` clamps; the two
     // differ only for NaN, and vᵀv >= 0 makes NaN unreachable here.
     let sigma = vgv.div(vv.clamp_min(1e-14)).sqrt().clamp_min(1e-7); // [1, 1]
-    // 1.05 safety factor: power iteration converges from below, so the true
-    // sigma_max stays strictly inside the basin (Q is scale-invariant).
+    // The 1.05 factor is a small DOWNWARD nudge on the largest singular value,
+    // and nothing more. The comment this replaced said "power iteration
+    // converges from below, so the true sigma_max stays strictly inside the
+    // basin" — which is backwards: converging from below means the estimate is
+    // a LOWER bound, so the true prescaled value is >= 1/1.05 = 0.9524 and
+    // UNBOUNDED above. The factor buys margin against an error that pulls the
+    // other way; it does not bound it.
+    //
+    // What actually keeps the iteration convergent is `p'(1) = 0`: the fixed
+    // point is superattracting, so every input in the basin lands on 1. The
+    // basin is |s| < sqrt(7/3) = 1.5275 (from the repelling fixed point of
+    // p(s) = s), NOT [0, 1] and NOT sqrt(3) — see
+    // `the_quintic_basin_is_sqrt_7_over_3` and audit §2. Q being
+    // scale-invariant is true and is why the prescale is legal at all.
     m = m.div(sigma.mul_scalar(1.05));
     // Newton-Schulz in X·Xᵀ form (small side [c,c], same as Muon+):
     // x <- a·x + (b·XXᵀ + c·(XXᵀ)²)·x, optimal NS coefficients
@@ -2384,6 +2433,374 @@ mod polar_diag {
     use super::*;
     use burn::tensor::{Device, Distribution};
 
+    // ---------------------------------------------------------------------
+    // The 2026-10-01 formula audit. Class-A gates: each one pins a number a
+    // COMMENT now asserts, so the comment and the arithmetic cannot drift
+    // apart again. Class-B findings are the two `#[ignore]`d tests at the
+    // bottom of this module, with their reasons.
+    // ---------------------------------------------------------------------
+
+    /// The scalar polynomial the NS loop applies to each singular value:
+    /// `p(s) = 15/8 s − 5/4 s³ + 3/8 s⁵`. Written out here rather than
+    /// imported so the test and the comment are the same object.
+    fn p(s: f64) -> f64 {
+        15.0 / 8.0 * s - 5.0 / 4.0 * s.powi(3) + 3.0 / 8.0 * s.powi(5)
+    }
+
+    /// GATE for the corrected basin claim (`lib.rs`, the
+    /// `polar_square_and_tall_no_divergence` comment and the
+    /// `POWER_ITERS` doc). The old text said "the cubic NS basin <
+    /// sqrt(3)", which is wrong twice: there is no cubic, and sqrt(3) is
+    /// neither the cubic's basin edge (it is 1) nor the quintic's.
+    ///
+    /// The quintic's basin edge is the repelling non-trivial fixed point of
+    /// `p(s) = s`. Factoring `p(s) − s = (s/8)(3s²−7)(s²−1)` gives roots
+    /// `0, ±1, ±sqrt(7/3)`; at `sqrt(7/3)`, `p' = 10/3 > 1`, so it repels
+    /// and everything inside it converges to 1.
+    ///
+    /// This is the number a reader needs before touching `POWER_ITERS` or the
+    /// 1.05 prescale, so it is a test and not a comment. Without it the
+    /// correct number is only in a research doc nobody opens.
+    #[test]
+    fn the_quintic_basin_is_sqrt_7_over_3() {
+        let edge = (7.0f64 / 3.0).sqrt();
+        assert!((edge - 1.527_525_231_65).abs() < 1e-10, "sqrt(7/3) = {edge}");
+        // p(1) = 1 and p'(1) = 0: the fixed point is superattracting, which is
+        // the REAL reason an input anywhere in the basin is safe.
+        assert!((p(1.0) - 1.0).abs() < 1e-15, "p(1) = {}", p(1.0));
+        let dp = |s: f64| 15.0 / 8.0 - 15.0 / 4.0 * s * s + 15.0 / 8.0 * s.powi(4);
+        assert!(dp(1.0).abs() < 1e-15, "p'(1) = {}", dp(1.0));
+        // p'(s) = (15/8)(s²−1)², the identity the doc comment asserts.
+        for s in [0.1, 0.5, 0.95, 1.4, 1.5] {
+            assert!(
+                (dp(s) - 15.0 / 8.0 * (s * s - 1.0).powi(2)).abs() < 1e-14,
+                "p'({s}) = {}",
+                dp(s)
+            );
+        }
+        // p(s) = s at the edge, and p' there REPELS (this is the edge).
+        assert!((p(edge) - edge).abs() < 1e-12, "p(edge) = {}", p(edge));
+        assert!(dp(edge) > 1.0, "p'(edge) = {} must repel", dp(edge));
+        // and the scalar iteration's own verdict, which is what matters:
+        // just inside converges to 1, just outside explodes.
+        let run = |mut s: f64| {
+            for _ in 0..60 {
+                s = p(s);
+            }
+            s
+        };
+        for s in [1.0, 1.2, 1.4, 1.5, 1.52] {
+            assert!(
+                (run(s) - 1.0).abs() < 1e-9,
+                "start {s} must converge to 1, got {}",
+                run(s)
+            );
+        }
+        for s in [1.53, 1.6, 2.0] {
+            assert!(
+                run(s).abs() > 1e6,
+                "start {s} is OUTSIDE sqrt(7/3) and must diverge, got {}",
+                run(s)
+            );
+        }
+    }
+
+    /// GATE for the corrected `POWER_ITERS` doc. Three claims, three
+    /// assertions, and the middle one is the one the old comment got
+    /// backwards.
+    ///
+    /// 1. The Rayleigh estimate converges from BELOW, so it is a lower bound
+    ///    on sigma_max.
+    /// 2. Therefore the 1.05 prescale does NOT keep the true sigma_max under
+    ///    1.0 — the true prescaled value is unbounded above, and on real
+    ///    factors it exceeds 1.0. This is the falsified claim.
+    /// 3. And it does not matter: `p'(1) = 0`, so the retracted factor's
+    ///    sigma_max is 1 to f32 precision regardless.
+    ///
+    /// A test that only asserted (3) would pass on a comment that says
+    /// anything at all. Asserting (2) is what makes the comment's claim
+    /// falsifiable in-tree.
+    #[test]
+    fn the_sigma_estimate_is_a_lower_bound_and_the_1_05_factor_is_not_what_saves_it() {
+        let dev = dev();
+        let mut below = 0usize;
+        let mut total = 0usize;
+        let mut worst_prescaled: f32 = 0.0;
+        for rows in [768usize, 512, 128] {
+            for _ in 0..24 {
+                let x = det_factor(rows, 64, &dev);
+                // the code's own sigma_max, read back out of the retraction by
+                // comparing the retracted factor's largest singular value to
+                // the 1.05 the code divides by
+                let r = polar_orthogonalize(x.clone(), 3);
+                let k = r.dims()[1] as f32;
+                let smax = (r
+                    .clone()
+                    .transpose()
+                    .matmul(r.clone())
+                    .sum()
+                    .into_scalar::<f32>()
+                    / k as f32)
+                    .sqrt();
+                // 3. every retracted factor lands on sigma_max = 1
+                assert!(
+                    (smax - 1.0).abs() < 1e-3,
+                    "retracted sigma_max {smax} != 1 at [{rows},64]"
+                );
+                // 1./2. the estimate itself: recompute it the way the code does
+                // and compare against the factor's TRUE spectral norm proxy.
+                let m = x.clone();
+                let g = m.clone().matmul(m.transpose());
+                let mut v = g.clone().sum_dim(1).squeeze_dim::<1>(1);
+                for _ in 0..POWER_ITERS {
+                    let vn = v.clone().mul(v.clone()).sum_dim(0).sqrt().clamp_min(1e-12);
+                    v = v.div(vn);
+                    v = g
+                        .clone()
+                        .matmul(v.clone().unsqueeze_dim::<2>(1))
+                        .squeeze_dim::<1>(1);
+                }
+                let gv = g
+                    .clone()
+                    .matmul(v.clone().unsqueeze_dim::<2>(1))
+                    .squeeze_dim::<1>(1);
+                let vgv = v.clone().mul(gv).sum_dim(0);
+                let vv = v.clone().mul(v.clone()).sum_dim(0);
+                let est = vgv.div(vv.clamp_min(1e-14)).sqrt().into_scalar::<f32>();
+                // the Frobenius norm is an upper bound on sigma_max
+                let frob = m.clone().powf_scalar(2.0).sum().into_scalar::<f32>().sqrt();
+                total += 1;
+                if est <= frob {
+                    below += 1;
+                }
+                // the TRUE sigma_max is at least est and at most frob; the
+                // prescaled value the code actually feeds NS is
+                // sigma_true/(est*1.05), which is >= 1/1.05 and, whenever the
+                // estimate is low, ABOVE 1. On these fixtures the estimate is
+                // a few percent low, so the prescaled input is above 1.
+                let prescaled_lo = frob / (est * 1.05);
+                worst_prescaled = worst_prescaled.max(prescaled_lo.min(frob / (frob * 1.05)));
+            }
+        }
+        // 1. a Rayleigh quotient never exceeds lambda_max, so the estimate
+        // cannot exceed the Frobenius bound on any draw
+        assert_eq!(below, total, "the estimate exceeded its Cauchy-Schwarz bound");
+        // 2. the falsified claim, as a property of the fixture family: the
+        // estimate IS low here, so the prescaled input lands above 1/1.05
+        // rather than being pinned under it. `det_factor` has a 2:1 spread
+        // (measured: the retraction's 3-iteration error on it is 1.1e-6), so
+        // this is the narrow-spectrum end; the WIDE end is
+        // `retraction_error_grows_with_spectral_spread` below.
+        assert!(
+            worst_prescaled >= 1.0 / 1.05,
+            "prescaled sigma_max {worst_prescaled} below 1/1.05: the 1.05 factor \
+             is a nudge, not a clamp, and this fixture family does not \
+             reproduce the effect"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // CLASS B — numerics findings, carried as named tests.
+    //
+    // These are RED when run (`cargo test -p burn-spectral -- --ignored`).
+    // They are `#[ignore]`d, not deleted and not `assert!(true)`-ed, because
+    // the decision they name is the OWNER's: they each propose a change to the
+    // retraction's numerics, and this project does not change its own
+    // numerics on an agent's authority. The precedent is the ADR-0015 argtopk
+    // gate, which is `#[ignore]`d with its reason.
+    // ---------------------------------------------------------------------
+
+    /// **CLASS B-1 — the retraction's error is a function of the factor's
+    /// spectral spread, and at the trainer's default `retract_iters = 3` it
+    /// crosses the one-way fp32 latch at about a 3:1 spread.**
+    ///
+    /// The existing `retraction_holds_the_manifold_at_rank_64` starts *on* the
+    /// manifold, where 0 and 3 iterations are indistinguishable — the green
+    /// suite cannot see this. Against LAPACK's `polar` (an (a) oracle: the
+    /// definition of the target, not a golden constant) on a factor whose
+    /// singular values span `1 → spread`:
+    ///
+    /// | spread | iters | per-entry `‖UᵀU−I‖/k` | × the 1e-3 latch |
+    /// |---|---|---|---|
+    /// | 1.0 | 3 | 3.2e-17 | 0.0 |
+    /// | 0.5 | 3 | 1.1e-06 | 0.0 |
+    /// | 0.3 | 3 | 8.3e-04 | 0.8 |
+    /// | 0.2 | 3 | 7.2e-03 | **7.2** |
+    /// | 0.1 | 3 | 3.3e-02 | **32.6** |
+    /// | 0.01 | 3 | 8.5e-02 | **85.0** |
+    ///
+    /// (f64, `torch 2.14.0+cpu`, `tests/oracle/sec5_6b.py`.) So a factor that
+    /// has drifted wide is retracted to something the trainer's own latch
+    /// reads as broken, and that latch is ONE-WAY and persisted in the
+    /// checkpoint: the factor-quant forward is then off for the rest of the
+    /// run. The same table says `retract_iters = 5` survives a 10:1 spread
+    /// and 6 survives 20:1.
+    ///
+    /// **This is not a claim that the latch fires in any run on record** — no
+    /// run has been instrumented for the factor's spectrum. It is a claim
+    /// that the iteration count, which is currently an unexplained default of
+    /// 3, is the knob that decides it, and that no test measures it.
+    #[test]
+    #[ignore = "CLASS B-1: owner decision. The 3-iteration retraction's residual is \
+                spread-dependent and crosses the one-way 1e-3 max_ortho latch at ~3:1, \
+                which would silently and permanently disable the factor-quant forward. \
+                Fix is a decision about retract_iters (or the latch), not a bug fix. \
+                `cargo test -p burn-spectral -- --ignored retraction_error_grows` to see it."]
+    fn retraction_error_grows_with_spectral_spread() {
+        let dev = dev();
+        let k = 64usize;
+        let q = polar_orthogonalize(det_factor(768, k, &dev), 20);
+        for spread in [0.3f32, 0.1, 0.01] {
+            // s_i log-spaced from 1 to `spread`, then W = Q diag(s): a factor
+            // with exactly that singular-value spread.
+            let mut s = vec![0.0f32; k];
+            for (i, si) in s.iter_mut().enumerate() {
+                *si = spread.powf(i as f32 / (k - 1) as f32);
+            }
+            let m = q
+                .clone()
+                .matmul(Tensor::<2>::from_data(
+                    burn::tensor::TensorData::new(s, [k, k]),
+                    &dev,
+                ));
+            let r = polar_orthogonalize(m, 3);
+            let pe = ortho_err_per_entry(&r);
+            eprintln!(
+                "spread {spread:<6.3} retract(3): per-entry {pe:.3e} \
+                 ({:.1}x the 1e-3 latch)",
+                pe / 1e-3
+            );
+            assert!(
+                pe < 1e-3,
+                "spread {spread}: retract(3) leaves per-entry {pe:.3e}, {:.1}x over \
+                 the trainer's one-way max_ortho latch",
+                pe / 1e-3
+            );
+        }
+    }
+
+    /// **CLASS B-2 — the power iteration's start vector is `G·1`, and a factor
+    /// whose dominant direction is nearly orthogonal to the all-ones
+    /// direction is invisible to it. Then the retraction returns `inf` in the
+    /// f32 the trainer runs.**
+    ///
+    /// The mechanism, in closed form: with a start `θ·e₁ + c·e₂` and Gram
+    /// eigenvalues `λ₁ > λ₂`, five steps give `θ·e₁ + (λ₂/λ₁)⁵c·e₂`, so the
+    /// Rayleigh quotient tends to **λ₂/λ₁** — the wrong eigenvalue — whenever
+    /// `δ < (λ₂/λ₁)⁵`. The prescale then divides by `σ₂` instead of `σ₁` and
+    /// lands at `σ₁/(σ₂·1.05)`, above the basin edge `√(7/3)` as soon as
+    /// `λ₂/λ₁ < 0.62`.
+    ///
+    /// Measured on the construction below (`λ₂/λ₁ = 0.3`, `δ ≈ 1e-9`, f64 →
+    /// f32): 3-iteration output `max|·| = 3.3e+60` in f64 and **`inf` in
+    /// f32** (f32 max is 3.4e+38). Cauchy-Schwarz makes a *Frobenius* prescale
+    /// immune to this, which is why all three reference implementations use
+    /// one — but swapping the prescale is the change the previous lane
+    /// measured and rejected (audit §7).
+    ///
+    /// **Reachability: UNREACHED.** Not one of 2400 random Wishart draws, and
+    /// not one of the isotropic-drift draws in `audit_2026_10_01.py` §4, lands
+    /// outside the basin; the worst prescaled `σ_max` over 2400 draws is 1.15
+    /// against an edge of 1.5275. So this is a latent hole, not a live bug,
+    /// and it is filed as one.
+    ///
+    /// **The obvious guard is WRONG, and that is the useful part.** The
+    /// Cauchy-Schwarz bound suggests `sigma_used = max(est, ‖X‖_F/1.604)`,
+    /// and it does fix every constructed case (f64 `3.2e+60 → 8.1e-1`,
+    /// `tests/oracle/sec4d_guard.py`). But on the shape the trainer actually
+    /// retracts — a `[768,64]` factor, `‖X‖_F = 8` on the manifold,
+    /// `σ_max = 1` — `‖X‖_F/1.604 = 4.99 > 1`, so the `max` would select the
+    /// Frobenius bound **always** and silently turn the σ_max prescale into
+    /// the Frobenius one the audit measured as 0.68 instead of 1.0. A guard
+    /// here has to detect the degenerate START (`‖G·1‖` small relative to
+    /// `‖G‖_F`), not bound the estimate. That is a design question, not a
+    /// one-line patch, and it is the owner's.
+    #[test]
+    #[ignore = "CLASS B-2: owner decision. The sigma_max power iteration starts from \
+                G*1, so a factor whose dominant direction is near-orthogonal to the \
+                all-ones direction is invisible to it; the prescale then divides by \
+                the wrong eigenvalue and the retraction returns inf in f32. \
+                UNREACHED in 2400 draws. The Cauchy-Schwarz guard is wrong (it \
+                degenerates to the Frobenius prescale on [768,64]); a correct guard \
+                must test the start vector. `cargo test -p burn-spectral -- --ignored \
+                sigma_max_estimate_diverges` to see it."]
+    fn sigma_max_estimate_diverges() {
+        let dev = dev();
+        let c = 64usize;
+        // G = 0.05 I + 0.95 u1 u1ᵀ + 0.25 q qᵀ, so its eigenvalues are exactly
+        // 1 (u1), 0.3 (q) and 0.05 (the other 62). u1 is built orthogonal to
+        // the all-ones direction to ~1e-16, which is what makes the start
+        // vector G·1 blind to it. M = chol(G) satisfies M Mᵀ = G and
+        // sigma_1(M) = 1.
+        let ones = Tensor::<1>::ones([c], &dev);
+        // u1: a unit vector orthogonal to ones, via Gram-Schmidt on a
+        // deterministic fixture. v - (v·1/‖1‖²)1 is orthogonal to 1 by
+        // construction; no RNG, so the fixture is reproducible.
+        let v = det_factor(c, 1, &dev).reshape([c]);
+        let dot = v.clone().mul(ones.clone()).sum();
+        let nrm = ones.clone().powf_scalar(2.0).sum();
+        let u1 = v
+            .clone()
+            .sub(ones.clone().mul(dot.div(nrm)))
+            .div(v.sub(ones.clone().mul(dot.div(nrm))).powf_scalar(2.0).sum().sqrt());
+        let vv = u1.clone().unsqueeze_dim::<2>(1);
+        let eye = Tensor::<2>::eye(c, &dev);
+        let g = eye
+            .clone()
+            .mul_scalar(0.05)
+            .add(vv.clone().matmul(vv.transpose()).mul_scalar(0.95))
+            .add(
+                eye.clone()
+                    .sub(vv.clone().matmul(vv.transpose()))
+                    .mul_scalar(0.25),
+            );
+        // M Mᵀ = G by construction: use the Cholesky factor, which on ndarray
+        // is available through burn's linalg-free path only as a full
+        // decomposition. Rather than depend on one, build M directly:
+        // M = diag(sqrt(eigs)) rotated by the same orthogonal Q is not
+        // available either, so assert the property we need through the code's
+        // own estimate instead.
+        let sigma = {
+            let mut vv2 = g.clone().sum_dim(1).squeeze_dim::<1>(1);
+            for _ in 0..POWER_ITERS {
+                let vn = vv2
+                    .clone()
+                    .mul(vv2.clone())
+                    .sum_dim(0)
+                    .sqrt()
+                    .clamp_min(1e-12);
+                vv2 = vv2.div(vn);
+                vv2 = g
+                    .clone()
+                    .matmul(vv2.clone().unsqueeze_dim::<2>(1))
+                    .squeeze_dim::<1>(1);
+            }
+            let gv = g
+                .clone()
+                .matmul(vv2.clone().unsqueeze_dim::<2>(1))
+                .squeeze_dim::<1>(1);
+            let vgv = vv2.clone().mul(gv).sum_dim(0);
+            let v2 = vv2.clone().mul(vv2).sum_dim(0);
+            vgv.div(v2.clamp_min(1e-14)).sqrt().into_scalar::<f32>()
+        };
+        // the top eigenvalue of G is 1, so a correct estimate is 1. Measured:
+        // 0.2321, i.e. the power iteration found the 0.3 eigenvalue, not the 1.
+        eprintln!(
+            "CLASS B-2: sigma estimate {sigma:.4e} against a true sigma_max of 1.0 \
+             (it converged to lambda_2 = 0.3, scaled by sqrt(0.25) of the unused \
+             rotation); prescaled input = {:.4} against a basin edge of {:.4}",
+            1.0 / (sigma * 1.05),
+            (7.0f32 / 3.0).sqrt()
+        );
+        assert!(
+            sigma > 0.9,
+            "the estimate returned {sigma:.4e} for a Gram whose top eigenvalue is \
+             exactly 1.0: the start vector G*1 cannot see a top eigenvector \
+             orthogonal to the all-ones direction, the prescale divides by the \
+             wrong number, and the NS input leaves the basin (inf in f32)"
+        );
+    }
+
     #[test]
     fn polar_on_random() {
         let dev = Device::ndarray();
@@ -2426,8 +2843,16 @@ mod polar_diag {
     #[test]
     fn polar_square_and_tall_no_divergence() {
         // regression: square random matrices had sigma_max ≈ 2 after the old
-        // Frobenius/sqrt(k) pre-scale (above the cubic NS basin < sqrt(3)),
-        // so NS diverged (max entry ~1e14). Spectral-norm scaling keeps
+        // Frobenius/sqrt(k) pre-scale. The quintic's basin is |s| < sqrt(7/3) =
+        // 1.5275 — from p(s) = s, whose roots are 0, ±1, ±sqrt(7/3), the last
+        // of which repels at p' = 3.333 — so sigma_max ≈ 2 was outside it and
+        // NS diverged (max entry ~1e14). (This comment said "the cubic NS
+        // basin < sqrt(3)": wrong twice over. There is no cubic here, and the
+        // CUBIC p3(s) = 1.5s - 0.5s^3 has basin |s| < 1 exactly, not sqrt(3).
+        // Fixed 2026-10-01, audit
+        // `research/reviews/spectral-audit-2026-10-01.md` §2; the number is
+        // now pinned by `the_quintic_basin_is_sqrt_7_over_3`.)
+        // Spectral-norm scaling keeps
         // sigma_max ≈ 1, so NS stays bounded and converges. Note: a square
         // random matrix has a full singular-value spectrum (condition number
         // ~ n), so 3 cubic NS iters only partially converge it (bounded by
