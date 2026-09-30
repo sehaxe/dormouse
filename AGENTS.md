@@ -681,9 +681,34 @@ The defenses are installed, not optional.
   declares the same policy from `ParamId`s and is exercised only by tests.
   They agree today. `GroupCounts` is declared in both crates. Until this is
   reconciled, always say which one you mean.
-- **The fused RMSNorm kernel never engages on the trainer's backend** — the eval
-  line shows `norm=0/N` because an autodiff tensor cannot be handed a bare
-  kernel. Counted, not silent; a fix belongs in the library, not in a gate here.
+- **The fused RMSNorm kernel — CORRECTED 2026-09-30, and the old sentence
+  understated it by a factor.** It does not merely "never engage on the
+  trainer's backend": **it never produced a number on ANY device in the life of
+  this project.** First launch on a bare CUDA tensor failed LLVM verification —
+  `Expected operand type llvm.ptr, but found builtin.integer` — because
+  `Shared::new_slice` was sized by a **runtime** value. Every kernel in this tree
+  that runs sizes its shared memory from `#[comptime]`
+  (`burn-attnres/src/fused_attnres.rs:127`,
+  `burn-gdn2/src/kernel/chunk_adjoint_cube.rs:61`); this one did not. Fixed in
+  `34c5631` with the same pattern and a single `pub const THREADS`. The
+  reachability story is also sharper than the old wording: the deciding input is
+  the device's **autodiff context** (`burn-dispatch-0.22.0-pre.4
+  src/tensor.rs:481-487` refuses the demotion unless
+  `DispatchAutodiffContext::Disabled`), so a bare `Device::cuda(0)` runs the
+  kernel and `Device::cuda(0).autodiff()` — every training forward and eval —
+  does not. `norm=0/N` reproduced from the trainer's own logs: 1560 asks per 500
+  steps, zero runs, 22 such readings across five logs, none with a non-zero first
+  field.
+- **WHAT THAT FIX IS NOT: gated.** Reverting `#[comptime] threads` to a runtime
+  value turns **zero tests red**, because no test runs the kernel — `BURN_DEVICE`
+  appears nowhere under `burn-rmsnorm` and its `Cargo.toml` has zero
+  `required-features`. So `34c5631` compiles and is verified by nothing. There
+  is also **no backward**: `rmsnorm_cuda` returns a fresh `Tensor::<2>::empty`
+  with raw handles written in, so the result carries no graph, and if the kernel
+  were ever reached from an autodiff input the arm would return a LEAF, receive
+  NO GRADIENT, and every loss curve would still look healthy — the `8fa5d4c`
+  defect verbatim. The dispatch guard is one `?` wide. **Until someone writes
+  that gate, edits to `fused.rs` are verifiable only by hand.**
 - **3 SILENT fallbacks remain** in ADR-0019's enumeration (41 sites total: 17
   LOUD, 11 COUNTED, 13 SILENT, of which 10 have been fixed and 3 are
   proposals; the table lists every site by file:line). The notable ones:
