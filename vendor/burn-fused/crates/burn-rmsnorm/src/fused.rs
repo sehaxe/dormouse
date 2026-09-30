@@ -56,6 +56,7 @@ use cubecl::prelude::*;
 /// chunk_adjoint_cube.rs:61`).
 pub const THREADS: u32 = 256;
 
+#[cfg(feature = "cuda")]
 #[cube(launch_unchecked)]
 fn rmsnorm_kernel<F: Float>(
     x: &[F],       // [B*T, D]
