@@ -316,6 +316,13 @@ isotropic-drift draws. The condition is a near-exact alignment of the
 dominant direction with the all-ones direction's orthogonal complement. So:
 **a latent hole, not a live bug, filed as one.**
 
+**In f32 the same fixture is measured, not extrapolated.** The landed gate
+builds the factor in f32 and reads the estimate at **0.2495** against a true
+`σ_max` of 1.0, so the prescaled input is **3.8172** against a basin edge of
+**1.5275**. What the 3-iteration NS iteration does with an input at 3.82 is
+the `inf` of the table above: measured f32 output is non-finite on every
+constructed case and finite at a 1e-4 overlap.
+
 **The obvious guard is WRONG, and that is the most useful part of the
 finding.** Cauchy–Schwarz (`σ_max ≤ ‖X‖_F`) suggests
 `sigma_used = max(est, ‖X‖_F/1.604)`. It **does** fix every constructed case
@@ -565,9 +572,45 @@ designed behaviour and naming them as defects would be wrong:**
 | gate | pins | green? |
 |---|---|---|
 | `the_quintic_basin_is_sqrt_7_over_3` | `p(1)=1`, `p'(1)=0`, `p'(s)=(15/8)(s²−1)²`, the edge `√(7/3)`, `p'(edge)=10/3>1` repels, scalar 1.52 converges and 1.53 diverges — **the number that replaced "√3"** | green |
-| `the_sigma_estimate_is_a_lower_bound_and_the_1_05_factor_is_not_what_saves_it` | the estimate never exceeds its Cauchy–Schwarz bound (so it is a lower bound in practice), the prescaled input is **not** pinned under `1/1.05` (**the refuted claim, now falsifiable in-tree**), and every retracted factor's σ_max is 1 | green |
+| `the_sigma_estimate_is_a_lower_bound_and_the_1_05_factor_is_not_what_saves_it` | on the manifold the estimate is exact and the prescaled input is under 1 (**the case the old comment was written about, and it is TRUE there — which is why the bug survived**); on a near-flat spectrum the estimate is **10.0% low** and the prescaled input is **1.0582, above 1.0** (**the refuted claim, now falsifiable in-tree**); and the retracted σ_max is 1 regardless | green |
 | `retraction_error_grows_with_spectral_spread` | B-1 | **red on purpose** (`#[ignore]`) |
 | `sigma_max_estimate_diverges` | B-2 | **red on purpose** (`#[ignore]`) |
+
+### 11.1 Three of the audit's own gates were measuring the wrong matrix
+
+Disclosed in full because it is the exact failure this document exists to
+prevent, it happened **three times in four gates**, and a numpy dry-run
+(`tests/oracle/gate_dryrun.py`, written for the mundane reason that a cold
+build slot costs 20 minutes of queue) caught all of them before cargo did.
+
+1. **B-2 passed the GRAM where the code estimates on a FACTOR.** The estimate
+   is `sqrt(λ₁(M Mᵀ))`, so the input must satisfy `M Mᵀ = G`. The first version
+   passed `G` itself, which forms `G·G` on the way in — whose top eigenvalue is
+   1.0 — so the estimate came back **correct** and the gate was a decoration
+   sitting on top of the finding. Fixed by building
+   `M = u1u1ᵀ + √λ_rest·(I − u1u1ᵀ)`, which satisfies `M Mᵀ = G` exactly
+   because the two projectors are orthogonal idempotents, and by **asserting**
+   `max|M Mᵀ − G| < 1e-5` rather than assuming it.
+2. **B-1 built its "orthonormal basis" by retracting a raw fixture**, which is
+   not orthonormal at rank 64: measured `max|QᵀQ − I| = 0.94` and a
+   singular-value ratio of **548:1 before any spread was applied**. All three
+   spreads printed the same number (121×). Replaced with the DCT fixture, with
+   the orthonormality asserted so it cannot come back silently.
+3. **The class-A estimate gate's off-manifold fixture was log-spaced**, where
+   the estimate is only **1.4%** low — precisely the case that would *not*
+   have refuted the comment, i.e. a cherry-picked fixture. A **near-flat**
+   spectrum is the honest worst case, because a flat Gram is exactly where
+   `(λ₂/λ₁)^k` decays slowest: **10.0%** low, prescaled input **1.0582**. The
+   log-spaced case is **kept in the test as a recorded counter-example** so
+   the choice is visible rather than convenient.
+
+And the dry-run itself had to learn the canonical transpose (`lib.rs:211-215`)
+before it agreed with the Rust. Without it the dry-run formed the `[768,768]`
+Gram instead of the `[64,64]` one and reproduced — by accident, and
+convincingly — **exactly the Frobenius-prescale failure this crate spent an
+audit disproving** (σ_max 0.68 instead of 1.0). A harness that disagrees with
+the code in the direction of a known historical bug is the most dangerous kind
+of harness, and it is invisible unless the disagreement is looked for.
 
 `tests/oracle/falsify.sh` perturbs each green gate and reverts:
 
