@@ -38,5 +38,14 @@ burn-ndarray = { workspace = true, features = ["blas-openblas"] }
 name = "bf16_matmul"
 required-features = ["cuda"]
 
+# Tier-(a) oracle against the Muon+ AUTHORS' own code
+# (K1seki221/MuonPlus @ 8a9ace12, pinned under tests/oracle/upstream/). No
+# feature gate: the expected values are committed bytes, so this runs on CPU in
+# CI with no Python present. The target MUST be declared - an undeclared test
+# file is not built at all and cargo prints nothing, which is how
+# `tools/test_targets.py` came to exist.
+[[test]]
+name = "muon_oracle"
+
 [package.metadata.docs.rs]
 all-features = true
