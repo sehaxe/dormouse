@@ -20,3 +20,14 @@ burn-tensor = { workspace = true }
 [dev-dependencies]
 burn-ndarray = { workspace = true, features = ["blas-openblas"] }
 burn = { workspace = true, features = ["ndarray", "std"] }
+
+# `dspark_loss` and `accept_rate_loss` are behind `training`, so the oracle
+# test cannot compile without it. `required-features` is what stops cargo
+# building the target at all in the default cell rather than failing it --
+# the same pattern burn-gdn2 uses for its `cuda`/`autodiff` targets, and the
+# reason a gate that does not pass a feature cannot see the tests behind it
+# (tools/lib_gate.sh says so at the `binary-tests` cell).
+[[test]]
+name = "dspark_loss_oracle"
+path = "tests/dspark_loss_oracle.rs"
+required-features = ["training"]
