@@ -979,6 +979,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "burn-attnres"
+version = "0.1.0"
+dependencies = [
+ "burn",
+ "burn-cubecl",
+ "burn-cuda",
+ "burn-tensor",
+ "cubecl",
+]
+
+[[package]]
 name = "burn-autodiff"
 version = "0.22.0-pre.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2858,6 +2869,7 @@ name = "dormouse-core"
 version = "0.1.0"
 dependencies = [
  "burn",
+ "burn-attnres",
  "burn-bitnet",
  "burn-cuda",
  "burn-dspark",

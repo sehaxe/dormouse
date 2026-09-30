@@ -192,6 +192,7 @@ fn executes(name: &str) {
     arm(cfg.use_engram, probe::ENGRAM_KEYS);
     arm(cfg.use_mor, probe::MOR);
     arm(cfg.use_gr, probe::GR);
+    arm(cfg.use_attnres, probe::ATTNRES);
     arm(fx.act_quant.is_some(), probe::ACT_QUANT);
     // The KDA state: with the arm on it is a real [b, heads, k, v] state; with
     // it off the loop substitutes a [b,1,1,1] placeholder. Shape, not a
@@ -389,6 +390,7 @@ fn a_preset_that_declares_an_arm_it_never_enters_fails_here() {
             (cfg.use_engram, probe::ENGRAM),
             (cfg.use_mor, probe::MOR),
             (cfg.use_gr, probe::GR),
+            (cfg.use_attnres, probe::ATTNRES),
             (fx.act_quant.is_some(), probe::ACT_QUANT),
             (cfg.jepa_weight > 0.0, probe::JEPA),
             (cfg.dspark_weight > 0.0 && cfg.dspark_k > 0, probe::DSPARK),
@@ -616,6 +618,23 @@ fn fields_no_preset_ships_still_take_effect() {
     assert_eq!(probe::count(probe::GR), plain.max_iter as u64, "use_gr must enter the gated residual every iteration");
     let d = (l0 - l2).abs().max().into_scalar::<f32>();
     assert!(d > 1e-6, "use_gr changed no logits: max |dlogit| = {d:.3e}");
+
+    // use_attnres: replaces the residual accumulation. Entered once per
+    // iteration (the aggregation is per-iteration, one query per slot), and
+    // the readout must MOVE - an AttnRes that ran and changed nothing would be
+    // the same class of defect as the GR arm was in 9b343d3.
+    let ar = DormouseConfig { use_attnres: true, ..plain.clone() };
+    let amodel = DormouseModel::new(&ar, &dev);
+    let bytes = batch_bytes(11, BATCH * SEQ);
+    let x = input_ids(&bytes, &dev);
+    let h = hashed_ids(&bytes, &dev);
+    probe::reset();
+    let l0 = amodel.forward::<B>(x.clone(), Some(h.clone()));
+    assert_eq!(probe::count(probe::ATTNRES), plain.max_iter as u64, "use_attnres must aggregate every iteration");
+    let p0 = DormouseModel::new(&plain, &dev);
+    let l1 = p0.forward::<B>(x, Some(h));
+    let d = (l0 - l1).abs().max().into_scalar::<f32>();
+    assert!(d > 1e-6, "use_attnres changed no logits: max |dlogit| = {d:.3e}");
 
     // use_tsct = false: dense experts, no TSCT factors anywhere, and every
     // parameter still declared to exactly one group.

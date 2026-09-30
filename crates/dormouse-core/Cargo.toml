@@ -22,6 +22,10 @@ burn-spectral = { path = "../../vendor/burn-fused/crates/burn-spectral" }
 # MoR routing mechanism (arXiv 2507.10524): the shared router + the repaired
 # top-k index primitive the loop's per-position routing rides on.
 burn-mor = { path = "../../vendor/burn-fused/crates/burn-mor" }
+# Attention Residuals (arXiv:2603.15031): the residual-stream arm, Full mode
+# over the loop's iteration states. Off by default (`use_attnres`); the crate
+# is in the build because the model reads it, not as a reference port.
+burn-attnres = { path = "../../vendor/burn-fused/crates/burn-attnres" }
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
@@ -40,6 +44,7 @@ cuda = [
     "burn-gdn2/autodiff",
     "burn-spectral/cuda",
     "burn-rmsnorm/cuda",
+    "burn-attnres/cuda",
 ]
 # CUDA-only probes: burn-cuda types and a CUDA context exist only with the
 # cuda feature.

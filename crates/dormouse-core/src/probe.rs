@@ -33,16 +33,23 @@ pub const JEPA: usize = 7;
 pub const DSPARK: usize = 8;
 /// The MoR router BCE was added.
 pub const MOR_BCE: usize = 9;
+/// Attention Residuals replaced the residual accumulation (arXiv:2603.15031):
+/// one entry per loop iteration that ran the softmax-over-depth aggregation
+/// instead of the ReZero write. COUNTED, not implied: a config that says
+/// `use_attnres = true` and a loop that never reaches the arm are the same
+/// run as far as the loss curve is concerned, and nothing else on the eval
+/// line would say so.
+pub const ATTNRES: usize = 10;
 /// TSCT retraction, per-factor arm: one host-syncing `polar_orthogonalize`
 /// per factor. This is what ran in production until 2026-09-29 and it is
 /// still the default.
-pub const RETRACT_FACTOR: usize = 10;
+pub const RETRACT_FACTOR: usize = 11;
 /// TSCT retraction, grouped arm: `burn_spectral::retract_batched`, sync-free
 /// per shape group (`--retract-batched`). Counted because a fallback here is
 /// invisible in every other number: the batched arm computes the same
 /// matrices, so a run that silently took the slow arm prints the same loss.
-pub const RETRACT_BATCHED: usize = 11;
-pub const N_ARMS: usize = 12;
+pub const RETRACT_BATCHED: usize = 12;
+pub const N_ARMS: usize = 13;
 /// Arm name per index, for assertion messages that name the thing.
 pub const NAMES: [&str; N_ARMS] = [
     "iterations",
@@ -55,6 +62,7 @@ pub const NAMES: [&str; N_ARMS] = [
     "jepa",
     "dspark",
     "mor_bce",
+    "attnres",
     "retract_factor",
     "retract_batched",
 ];

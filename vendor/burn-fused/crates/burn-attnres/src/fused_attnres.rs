@@ -15,6 +15,8 @@ use cubecl::prelude::*;
 use std::any::Any;
 use std::cell::RefCell;
 
+use crate::ScoreForm;
+
 const THREADS: u32 = 256;
 
 /// Layers per chunk in the chunked `depth_attend` (paper's N ≈ 8). Peak
@@ -109,6 +111,13 @@ fn attnres_scores_kernel<F: Float>(
     chunk: &mut [F],  // [G, B, T, D] row `row`
     row: u32,
     scale: f32,
+    // Multiplier on `sum(h^2)` inside the norm's root: `1/d` for the paper's
+    // RMSNorm (a mean, `ScoreForm::Paper`), `1` for a plain L2 norm
+    // (`ScoreForm::SqrtD`). A RUNTIME argument like `scale` on purpose - both
+    // are constants of the `ScoreForm`, and a kernel that only knew one of
+    // the two forms would compute a different function from the tensor path
+    // for the same declared form, with nothing to say so.
+    norm_m: f32,
     #[comptime] bt_count: u32, // B * T
     #[comptime] d: u32,
     #[comptime] threads: u32,
@@ -161,7 +170,7 @@ fn attnres_scores_kernel<F: Float>(
 
     if tid == 0 {
         scores[(row as usize) * bt_count + bt] =
-            dot * F::cast_from(scale) / (sq + F::new(1e-5_f32)).sqrt();
+            dot * F::cast_from(scale) / (sq * F::cast_from(norm_m) + F::new(1e-5_f32)).sqrt();
     }
 }
 
@@ -311,6 +320,13 @@ fn depth_attend_backward_kernel<F: Float>(
     dh: &mut [F],     // [L, B, T, D]
     dqpart: &mut [F], // [B, T, D]
     scale: f32,
+    // Multiplier on `sum(h^2)` inside the norm's root: `1/d` for the paper's
+    // RMSNorm (a mean, `ScoreForm::Paper`), `1` for a plain L2 norm
+    // (`ScoreForm::SqrtD`). A RUNTIME argument like `scale` on purpose - both
+    // are constants of the `ScoreForm`, and a kernel that only knew one of
+    // the two forms would compute a different function from the tensor path
+    // for the same declared form, with nothing to say so.
+    norm_m: f32,
     #[comptime] l: u32,
     #[comptime] bt_count: u32,
     #[comptime] d: u32,
@@ -380,14 +396,14 @@ fn depth_attend_backward_kernel<F: Float>(
     // scores + softmax over l
     let mut max_s = F::new(-3.0e38_f32);
     for li in 0..l {
-        let s = qh[li] * F::cast_from(scale) / (sq[li] + F::new(1e-5_f32)).sqrt();
+        let s = qh[li] * F::cast_from(scale) / (sq[li] * F::cast_from(norm_m) + F::new(1e-5_f32)).sqrt();
         if s > max_s {
             max_s = s;
         }
     }
     let mut sum_e = F::new(0.0_f32);
     for li in 0..l {
-        let s = qh[li] * F::cast_from(scale) / (sq[li] + F::new(1e-5_f32)).sqrt();
+        let s = qh[li] * F::cast_from(scale) / (sq[li] * F::cast_from(norm_m) + F::new(1e-5_f32)).sqrt();
         let e = (s - max_s).exp();
         w[li] = e;
         sum_e += e;
@@ -429,7 +445,7 @@ fn depth_attend_backward_kernel<F: Float>(
     }
     for li in 0..l {
         let dsc = w[li] * (dw[li] - wd_sum);
-        let inv = F::new(1.0_f32) / (sq[li] + F::new(1e-5_f32)).sqrt();
+        let inv = F::new(1.0_f32) / (sq[li] * F::cast_from(norm_m) + F::new(1e-5_f32)).sqrt();
         let inv3 = inv * inv * inv;
         for j in 0..per {
             let col = j * threads + tid;
@@ -455,6 +471,7 @@ pub fn depth_attend_backward_cuda(
     history: &[Tensor<3>],
     query: &Tensor<1>,
     d_out: &Tensor<3>,
+    form: ScoreForm,
 ) -> Option<(Vec<Tensor<3>>, Tensor<1>)> {
     use burn_cubecl::tensor::CubeTensor;
     type CudaBare = burn_cubecl::CubeBackend;
@@ -518,7 +535,8 @@ pub fn depth_attend_backward_cuda(
             BufferArg::from_raw_parts(dc.handle, bt * d),
             BufferArg::from_raw_parts(dhc.handle.clone(), l * bt * d),
             BufferArg::from_raw_parts(dqpc.handle.clone(), bt * d),
-            (d as f64).powf(-0.5) as f32,
+            form.scale(d),
+            form.norm_m(d),
             l as u32,
             bt as u32,
             d as u32,
@@ -552,6 +570,13 @@ fn source_score_kernel<F: Float>(
     q: &[F],       // [D]
     out: &mut [F], // [B, T]
     scale: f32,
+    // Multiplier on `sum(h^2)` inside the norm's root: `1/d` for the paper's
+    // RMSNorm (a mean, `ScoreForm::Paper`), `1` for a plain L2 norm
+    // (`ScoreForm::SqrtD`). A RUNTIME argument like `scale` on purpose - both
+    // are constants of the `ScoreForm`, and a kernel that only knew one of
+    // the two forms would compute a different function from the tensor path
+    // for the same declared form, with nothing to say so.
+    norm_m: f32,
     #[comptime] d: u32,
     #[comptime] threads: u32,
     #[comptime] per: u32,
@@ -600,7 +625,7 @@ fn source_score_kernel<F: Float>(
     let dot = red[0];
 
     if tid == 0 {
-        out[bt] = dot * F::cast_from(scale) / (sq + F::new(1e-5_f32)).sqrt();
+        out[bt] = dot * F::cast_from(scale) / (sq * F::cast_from(norm_m) + F::new(1e-5_f32)).sqrt();
     }
 }
 
@@ -662,7 +687,11 @@ fn merge_kernel<F: Float>(
     }
 }
 
-pub fn depth_attend_cuda(history: &[Tensor<3>], query: &Tensor<1>) -> Option<Tensor<3>> {
+pub fn depth_attend_cuda(
+    history: &[Tensor<3>],
+    query: &Tensor<1>,
+    form: ScoreForm,
+) -> Option<Tensor<3>> {
     let l = history.len();
     if l == 0 {
         return None;
@@ -686,7 +715,8 @@ pub fn depth_attend_cuda(history: &[Tensor<3>], query: &Tensor<1>) -> Option<Ten
     let client = hc[0].client.clone();
     let per = (d as u32).div_ceil(THREADS);
     let dim = CubeDim::new_3d(THREADS, 1, 1);
-    let scale = (d as f64).powf(-0.5) as f32;
+    let scale = form.scale(d);
+    let norm_m = form.norm_m(d);
     let bt = (b * t) as u32;
     let chunks = l.div_ceil(g);
     unsafe {
@@ -709,6 +739,7 @@ pub fn depth_attend_cuda(history: &[Tensor<3>], query: &Tensor<1>) -> Option<Ten
                     BufferArg::from_raw_parts(st.chunk.handle.clone(), g * b * t * d),
                     gi as u32,
                     scale,
+                    norm_m,
                     bt,
                     d as u32,
                     THREADS,
@@ -741,7 +772,11 @@ pub fn depth_attend_cuda(history: &[Tensor<3>], query: &Tensor<1>) -> Option<Ten
     Some(out)
 }
 
-pub fn source_score_cuda(query: &Tensor<1>, src: &Tensor<3>) -> Option<Tensor<3>> {
+pub fn source_score_cuda(
+    query: &Tensor<1>,
+    src: &Tensor<3>,
+    form: ScoreForm,
+) -> Option<Tensor<3>> {
     let [b, t, d] = src.dims();
     if d == 0 {
         return None;
@@ -753,7 +788,8 @@ pub fn source_score_cuda(query: &Tensor<1>, src: &Tensor<3>) -> Option<Tensor<3>
     let client = sc.client.clone();
     let per = (d as u32).div_ceil(THREADS);
     let dim = CubeDim::new_3d(THREADS, 1, 1);
-    let scale = (d as f64).powf(-0.5) as f32;
+    let scale = form.scale(d);
+    let norm_m = form.norm_m(d);
     unsafe {
         source_score_kernel::launch_unchecked::<f32>(
             &client,
@@ -763,6 +799,7 @@ pub fn source_score_cuda(query: &Tensor<1>, src: &Tensor<3>) -> Option<Tensor<3>
             BufferArg::from_raw_parts(qc.handle, d),
             BufferArg::from_raw_parts(oc.handle, b * t),
             scale,
+            norm_m,
             d as u32,
             THREADS,
             per,
@@ -816,7 +853,7 @@ pub fn merge_cuda(
 #[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;
-    use crate::{depth_attend, BlockAttnRes};
+    use crate::{depth_attend, depth_attend_form, BlockAttnRes, ScoreForm};
     use burn::module::{Param, ParamId};
     use burn::tensor::{activation, Device, Distribution, Tensor};
 
@@ -843,13 +880,28 @@ mod tests {
             .fold(0.0_f32, f32::max)
     }
 
-    /// Raw-op depth_attend on the same device as the fused call.
-    fn ref_depth_attend(history: &[Tensor<3>], query: &Tensor<1>) -> Tensor<3> {
+    /// Raw-op depth_attend on the same device as the fused call, in the
+    /// declared `ScoreForm`. The reference used to hard-code `d^-0.5` and an
+    /// L2 norm, which made every parity test below blind to a divergence from
+    /// Eq. 2: kernel and reference were the same transcription of the wrong
+    /// formula, so they agreed. It now takes the form as an argument, and the
+    /// tests run BOTH forms, so a kernel that ignored `norm_m` or `scale`
+    /// would be red rather than consistently wrong.
+    fn ref_depth_attend(
+        history: &[Tensor<3>],
+        query: &Tensor<1>,
+        form: ScoreForm,
+    ) -> Tensor<3> {
         let n = history.len();
         let [b, t, d] = history[0].dims();
-        let scale = (d as f64).powf(-0.5);
+        let scale = form.scale(d);
         let h_stack = stack(history);
-        let h_norm_sq = h_stack.clone().powf_scalar(2.0).sum_dim(3).add_scalar(1e-5);
+        let h_norm_sq = h_stack
+            .clone()
+            .powf_scalar(2.0)
+            .sum_dim(3)
+            .mul_scalar(form.norm_m(d))
+            .add_scalar(1e-5);
         let h_norm = h_stack.clone() / h_norm_sq.sqrt().reshape([n, b, t, 1usize]);
         let q = query.clone().reshape([1, 1, 1, d]);
         let scores = (q * h_norm).sum_dim(3).mul_scalar(scale);
@@ -872,14 +924,19 @@ mod tests {
                 .map(|_| Tensor::<3>::random([b, t, d], Distribution::Normal(0.0, 1.0), &cdev))
                 .collect();
             let q = Tensor::<1>::random([d], Distribution::Normal(0.0, 1.0), &cdev);
-            let expected = to_host(ref_depth_attend(&hist, &q));
-            assert!(
-                depth_attend_cuda(&hist, &q).is_some(),
-                "fused dispatch should engage on bare CUDA"
-            );
-            let got = to_host(depth_attend(&hist, q));
-            let md = maxdiff(&got, &expected);
-            assert!(md < 1e-4, "[{l},{b},{t},{d}] maxdiff {md}");
+            // BOTH forms, not one: the two conventions give outputs ~d apart
+            // in logit temperature, so a kernel that quietly applied the
+            // wrong one cannot pass both.
+            for form in [ScoreForm::Paper, ScoreForm::SqrtD] {
+                let expected = to_host(ref_depth_attend(&hist, &q, form));
+                assert!(
+                    depth_attend_cuda(&hist, &q, form).is_some(),
+                    "fused dispatch should engage on bare CUDA"
+                );
+                let got = to_host(depth_attend_form(&hist, q.clone(), form));
+                let md = maxdiff(&got, &expected);
+                assert!(md < 1e-4, "[{l},{b},{t},{d}] {form:?} maxdiff {md}");
+            }
         }
     }
 
@@ -889,22 +946,24 @@ mod tests {
         let (b, t, d) = (2usize, 8usize, 256usize);
         let src = Tensor::<3>::random([b, t, d], Distribution::Normal(0.0, 1.0), &cdev);
         let q = Tensor::<1>::random([d], Distribution::Normal(0.0, 1.0), &cdev);
-        let scale = (d as f64).powf(-0.5);
-        let norm = src.clone()
-            / src
-                .clone()
-                .powf_scalar(2.0)
-                .sum_dim(2)
-                .add_scalar(1e-5)
-                .sqrt();
-        let expected = to_host(
-            (q.clone().reshape([1, 1, d]) * norm)
-                .sum_dim(2)
-                .mul_scalar(scale),
-        );
-        let got = source_score_cuda(&q, &src).expect("kernel");
-        let md = maxdiff(&to_host(got), &expected);
-        assert!(md < 1e-4, "source_score maxdiff {md}");
+        for form in [ScoreForm::Paper, ScoreForm::SqrtD] {
+            let norm = src.clone()
+                / src
+                    .clone()
+                    .powf_scalar(2.0)
+                    .sum_dim(2)
+                    .mul_scalar(form.norm_m(d))
+                    .add_scalar(1e-5)
+                    .sqrt();
+            let expected = to_host(
+                (q.clone().reshape([1, 1, d]) * norm)
+                    .sum_dim(2)
+                    .mul_scalar(form.scale(d)),
+            );
+            let got = source_score_cuda(&q, &src, form).expect("kernel");
+            let md = maxdiff(&to_host(got), &expected);
+            assert!(md < 1e-4, "source_score {form:?} maxdiff {md}");
+        }
     }
 
     #[test]
@@ -993,8 +1052,11 @@ mod tests {
         let view = Tensor::<3>::random([b, t, d], Distribution::Normal(0.0, 1.0), &cdev)
             .permute([0, 2, 1]);
         let q = Tensor::<1>::random([d], Distribution::Normal(0.0, 1.0), &cdev);
-        let expected = to_host(crate::source_score(&q, &view));
-        let md = maxdiff(&to_host(source_score_cuda(&q, &view).unwrap()), &expected);
+        let expected = to_host(crate::source_score(&q, &view, ScoreForm::Paper));
+        let md = maxdiff(
+            &to_host(source_score_cuda(&q, &view, ScoreForm::Paper).unwrap()),
+            &expected,
+        );
         assert!(md < 1e-4, "strided input: maxdiff {md}");
     }
 
@@ -1025,7 +1087,7 @@ mod tests {
             let bt = b * t;
             for i in 0..64 {
                 let src = Tensor::<3>::random([b, t, d], Distribution::Normal(0.0, 1.0), &cdev);
-                let s = source_score_cuda(&q, &src).unwrap();
+                let s = source_score_cuda(&q, &src, ScoreForm::Paper).unwrap();
                 // The PRE-merge state and inputs, on the host, before the launch.
                 let f = to_host(acc.clone());
                 let m_old = to_host(mx.clone());
@@ -1078,18 +1140,18 @@ mod tests {
         let q = Tensor::<1>::random([d], Distribution::Normal(0.0, 1.0), &cdev);
         let dout = Tensor::<3>::random([b, t, d], Distribution::Normal(0.0, 1.0), &cdev);
         for _ in 0..2 {
-            let _ = depth_attend_backward_cuda(&hist, &q, &dout).unwrap();
+            let _ = depth_attend_backward_cuda(&hist, &q, &dout, ScoreForm::Paper).unwrap();
         }
         let t0 = std::time::Instant::now();
         for _ in 0..10 {
-            let r = depth_attend_backward_cuda(&hist, &q, &dout).unwrap();
+            let r = depth_attend_backward_cuda(&hist, &q, &dout, ScoreForm::Paper).unwrap();
             let _: f32 = r.0[0].clone().sum().into_scalar();
         }
         let tf = t0.elapsed() / 10;
         let t0 = std::time::Instant::now();
         for _ in 0..3 {
             let (dhs, dq) =
-                crate::fused_attnres::ad::depth_attend_backward_tensor(&hist, &q, &dout);
+                crate::fused_attnres::ad::depth_attend_backward_tensor(&hist, &q, &dout, ScoreForm::Paper);
             let _: f32 = (dhs[0].clone().sum() + dq.clone().sum()).into_scalar();
         }
         let tt = t0.elapsed() / 3;
@@ -1139,7 +1201,8 @@ mod tests {
                             BufferArg::from_raw_parts(nc.handle.clone(), l * b * t),
                             BufferArg::from_raw_parts(nc.handle.clone(), l * b * t * d),
                             0u32,
-                            (d as f64).powf(-0.5) as f32,
+                            ScoreForm::Paper.scale(d),
+                            ScoreForm::Paper.norm_m(d),
                             (b * t) as u32,
                             d as u32,
                             THREADS,
@@ -1162,7 +1225,8 @@ mod tests {
                         BufferArg::from_raw_parts(nc.handle.clone(), l * b * t),
                         BufferArg::from_raw_parts(nc.handle.clone(), l * b * t * d),
                         0u32,
-                        (d as f64).powf(-0.5) as f32,
+                        ScoreForm::Paper.scale(d),
+                        ScoreForm::Paper.norm_m(d),
                         (b * t) as u32,
                         d as u32,
                         THREADS,
@@ -1180,7 +1244,7 @@ mod tests {
                 let hnm = hs.clone() / hn.sqrt().reshape([l, b, t, 1usize]);
                 let sc = (q.clone().reshape([1, 1, 1, d]) * hnm)
                     .sum_dim(3)
-                    .mul_scalar((d as f64).powf(-0.5));
+                    .mul_scalar(ScoreForm::Paper.scale(d));
                 let w = activation::softmax(sc, 0);
                 let r = hs
                     .clone()
@@ -1266,6 +1330,7 @@ mod ad {
     use burn_autodiff::grads::Gradients;
     use burn_autodiff::ops::{Backward, Ops, OpsKind};
     use burn_autodiff::Autodiff;
+    use crate::ScoreForm;
     #[cfg(any(feature = "autodiff", test))]
     use crate::fused_attnres::note_entry_reached;
     #[cfg(feature = "cuda")]
@@ -1278,7 +1343,12 @@ mod ad {
     where
         DispatchTensor: DispatchKindConversion<B>,
     {
-        type State = usize; // L (number of history layers)
+        // L (number of history layers) AND the score convention: the backward
+        // has to differentiate the SAME function the forward computed, and a
+        // fused backward that re-derived `d^-0.5` internally while the forward
+        // ran the paper's unscaled score would be a correct derivative of the
+        // wrong function.
+        type State = (usize, ScoreForm);
 
         fn backward(
             self,
@@ -1286,7 +1356,7 @@ mod ad {
             grads: &mut Gradients,
             checkpointer: &mut Checkpointer,
         ) {
-            let l = ops.state;
+            let (l, form) = ops.state;
             let node = |i: usize| ops.parents[i].as_ref().expect("attnres input checkpointed");
             let q = Tensor::<1>::from_primitive::<B>(checkpointer.retrieve_node_output(node(l).id));
             let mut hs: Vec<Tensor<3>> = Vec::with_capacity(l);
@@ -1305,7 +1375,7 @@ mod ad {
                 // gate asks the right question. The entry below was the one
                 // pinned to `NoCheckpointing`.
                 if std::any::TypeId::of::<B>() == std::any::TypeId::of::<CudaBare>() {
-                    if let Some((dhs, dq)) = super::depth_attend_backward_cuda(&hs, &q, &d_out) {
+                    if let Some((dhs, dq)) = super::depth_attend_backward_cuda(&hs, &q, &d_out, form) {
                         note_fused_backward();
                         for (i, dh) in dhs.into_iter().enumerate() {
                             grads.register::<B>(
@@ -1321,7 +1391,7 @@ mod ad {
                     }
                 }
             }
-            let (dhs, dq) = depth_attend_backward_tensor(&hs, &q, &d_out);
+            let (dhs, dq) = depth_attend_backward_tensor(&hs, &q, &d_out, form);
             for (i, dh) in dhs.into_iter().enumerate() {
                 grads.register::<B>(
                     ops.parents[i].clone().unwrap().id,
@@ -1336,19 +1406,25 @@ mod ad {
     }
 
     /// Exact full-attention backward over the depth axis (tensor path).
-    /// scores_l = q·h_l·scale/√(Σh²+ε); w = softmax(scores, 0);
+    /// scores_l = q·h_l·scale/√(m·Σh²+ε); w = softmax(scores, 0);
     /// out = Σ w_l·h_l. Returns (d_h per layer, d_q).
     pub fn depth_attend_backward_tensor(
         history: &[Tensor<3>],
         query: &Tensor<1>,
         d_out: &Tensor<3>,
+        form: ScoreForm,
     ) -> (Vec<Tensor<3>>, Tensor<1>) {
         let l = history.len();
         let [b, t, d] = history[0].dims();
-        let scale = (d as f64).powf(-0.5);
+        let scale = form.scale(d);
         let h_stack = crate::fused_attnres::stack_ad(history);
         let q = query.clone().reshape([1, 1, 1, d]);
-        let s2 = h_stack.clone().powf_scalar(2.0).sum_dim(3).add_scalar(1e-5); // [L,B,T,1]
+        let s2 = h_stack
+            .clone()
+            .powf_scalar(2.0)
+            .sum_dim(3)
+            .mul_scalar(form.norm_m(d))
+            .add_scalar(1e-5); // [L,B,T,1]
         let inv = s2.clone().powf_scalar(-0.5);
         let scores = (q.clone() * h_stack.clone())
             .sum_dim(3)
@@ -1394,6 +1470,7 @@ mod ad {
     pub fn depth_attend_autodiff_s<Inner: Backend, S: CheckpointStrategy, const N: usize>(
         history: &[Tensor<3>],
         query: Tensor<1>,
+        form: ScoreForm,
     ) -> Option<Tensor<3>>
     where
         DispatchTensor: DispatchKindConversion<Autodiff<Inner, S>> + DispatchKindConversion<Inner>,
@@ -1419,19 +1496,19 @@ mod ad {
             {
                 type CudaBare = burn_cubecl::CubeBackend;
                 if std::any::TypeId::of::<Inner>() == std::any::TypeId::of::<CudaBare>() {
-                    if let Some(o) = super::depth_attend_cuda(&hs_t, &q_t) {
+                    if let Some(o) = super::depth_attend_cuda(&hs_t, &q_t, form) {
                         note_fused_forward();
                         o
                     } else {
-                        super::depth_attend_tensor_ad(&hs_t, q_t)
+                        super::depth_attend_tensor_ad(&hs_t, q_t, form)
                     }
                 } else {
-                    super::depth_attend_tensor_ad(&hs_t, q_t)
+                    super::depth_attend_tensor_ad(&hs_t, q_t, form)
                 }
             }
             #[cfg(not(feature = "cuda"))]
             {
-                super::depth_attend_tensor_ad(&hs_t, q_t)
+                super::depth_attend_tensor_ad(&hs_t, q_t, form)
             }
         };
 
@@ -1452,7 +1529,7 @@ mod ad {
                     let _ = prep.checkpoint(h);
                 }
                 let _ = prep.checkpoint(&qa);
-                prep.finish(l, out_prim)
+                prep.finish((l, form), out_prim)
             }
             OpsKind::UnTracked(prep) => prep.finish(out_prim),
         };
@@ -1463,11 +1540,12 @@ mod ad {
     pub fn depth_attend_autodiff<Inner: Backend, const N: usize>(
         history: &[Tensor<3>],
         query: Tensor<1>,
+        form: ScoreForm,
     ) -> Option<Tensor<3>>
     where
         DispatchTensor: DispatchKindConversion<Autodiff<Inner>> + DispatchKindConversion<Inner>,
     {
-        depth_attend_autodiff_s::<Inner, NoCheckpointing, N>(history, query)
+        depth_attend_autodiff_s::<Inner, NoCheckpointing, N>(history, query, form)
     }
 }
 
@@ -1487,12 +1565,21 @@ pub fn stack_ad(history: &[Tensor<3>]) -> Tensor<4> {
 /// Pure tensor-path depth_attend (autodiff fallback).
 #[cfg(any(feature = "autodiff", test))]
 #[allow(dead_code)] // compiled-but-dead under test+cuda without autodiff; used by the ad dispatch
-pub fn depth_attend_tensor_ad(history: &[Tensor<3>], query: Tensor<1>) -> Tensor<3> {
+pub fn depth_attend_tensor_ad(
+    history: &[Tensor<3>],
+    query: Tensor<1>,
+    form: ScoreForm,
+) -> Tensor<3> {
     let n = history.len();
     let [b, t, d] = history[0].dims();
-    let scale = (d as f64).powf(-0.5);
+    let scale = form.scale(d);
     let h_stack = stack_ad(history);
-    let h_norm_sq = h_stack.clone().powf_scalar(2.0).sum_dim(3).add_scalar(1e-5);
+    let h_norm_sq = h_stack
+        .clone()
+        .powf_scalar(2.0)
+        .sum_dim(3)
+        .mul_scalar(form.norm_m(d))
+        .add_scalar(1e-5);
     let h_norm = h_stack.clone() / h_norm_sq.sqrt().reshape([n, b, t, 1usize]);
     let q = query.reshape([1, 1, 1, d]);
     let scores = (q * h_norm).sum_dim(3).mul_scalar(scale);
@@ -1528,7 +1615,7 @@ mod seam_tests {
         where
             DispatchTensor: DispatchKindConversion<Ad<Nd, S>> + DispatchKindConversion<Nd>,
         {
-            depth_attend_autodiff_s::<Nd, S, 8>(h, q.clone())
+            depth_attend_autodiff_s::<Nd, S, 8>(h, q.clone(), ScoreForm::Paper)
         }
 
         let dev = Device::ndarray().autodiff().gradient_checkpointing();
@@ -1546,7 +1633,7 @@ mod seam_tests {
         );
 
         assert!(
-            depth_attend_autodiff::<Nd, 8>(&h, q.clone()).is_none(),
+            depth_attend_autodiff::<Nd, 8>(&h, q.clone(), ScoreForm::Paper).is_none(),
             "on a Balanced tensor the NoCheckpointing entry must refuse"
         );
         assert_eq!(
@@ -1600,7 +1687,8 @@ mod ad_tests {
         let hf: Vec<Tensor<3>> = hist.iter().map(|h| h.clone().require_grad()).collect();
         let qf = q.clone().require_grad();
         let outf =
-            crate::fused_attnres::depth_attend_autodiff::<CudaBare, 64>(&hf, qf.clone()).unwrap();
+            crate::fused_attnres::depth_attend_autodiff::<CudaBare, 64>(&hf, qf.clone(), ScoreForm::Paper)
+                .unwrap();
         let loss_f = outf.powf_scalar(2.0).sum();
         let grads_f = loss_f.backward();
         let dhf: Vec<Tensor<3>> = hf.iter().map(|h| h.grad(&grads_f).unwrap()).collect();
@@ -1639,15 +1727,16 @@ mod fd_tests {
             .collect()
     }
 
-    fn raw_depth_attend(hs: &[Tensor<3>], q: &Tensor<1>) -> Tensor<3> {
+    fn raw_depth_attend(hs: &[Tensor<3>], q: &Tensor<1>, form: ScoreForm) -> Tensor<3> {
         let n = hs.len();
         let [b, t, d] = hs[0].dims();
-        let scale = (d as f64).powf(-0.5);
+        let scale = form.scale(d);
         let h_stack = stack_ad(hs);
         let hn = h_stack
             .clone()
             .powf_scalar(2.0)
             .sum_dim(3)
+            .mul_scalar(form.norm_m(d))
             .add_scalar(1e-5)
             .sqrt();
         let hnm = h_stack.clone() / hn.reshape([n, b, t, 1usize]);
@@ -1699,7 +1788,7 @@ mod fd_tests {
             .map(|h| Tensor::<3>::from_data(h.clone().into_data(), &adev).require_grad())
             .collect();
         let qr = Tensor::<1>::from_data(q.clone().into_data(), &adev).require_grad();
-        let outr = raw_depth_attend(&hr, &qr);
+        let outr = raw_depth_attend(&hr, &qr, ScoreForm::Paper);
         let grads = outr.powf_scalar(2.0).sum().backward();
         let raw: Vec<f32> = hr[0]
             .grad(&grads)
