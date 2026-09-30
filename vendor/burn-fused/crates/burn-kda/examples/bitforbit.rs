@@ -59,6 +59,7 @@ fn main() {
         decay_fn: DecayFn::Sigmoid,
         g_min: 0.0, // selects the fixed G_MIN floor
         gate: GateMode::FullRank,
+        use_rope: false,
         chunk_size: 8,
         norm_eps: 1e-5,
     };

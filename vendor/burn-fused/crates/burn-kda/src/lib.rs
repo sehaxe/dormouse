@@ -154,6 +154,21 @@ pub struct KdaConfig {
     pub g_min: f64,
     /// Output gate parameterization.
     pub gate: GateMode,
+    /// Apply rotary position embedding to q/k **before** the L2 norm.
+    ///
+    /// OFF by default and **not** in either paper: FLA's official KDA layer
+    /// has no rope at all (`fla/layers/kda.py` at `9f38d249` contains zero
+    /// `rotary`/`rope` occurrences; GatedDeltaNet likewise has no `use_rope`).
+    /// Position in a Kimi-Linear-style hybrid comes from the *interleaved
+    /// full-attention* layers (`fla/layers/attn.py:83,125`,
+    /// `fla/models/hybrid.py:17-23`), which is a cross-family transplant into a
+    /// pure-KDA loop. Required for post-training, not for pretrain parity
+    /// (Qwen3.8 playbook, AGENTS.md §3.5 item 5: NoPE breaks SFT/RLVR).
+    ///
+    /// Adds **zero parameters** — rotary is a function of position, and FLA
+    /// holds only non-persistent buffers (`fla/modules/rotary.py:379,384`), so
+    /// no checkpoint format changes either.
+    pub use_rope: bool,
     pub chunk_size: usize,
     pub norm_eps: f64,
 }
@@ -171,6 +186,7 @@ impl Default for KdaConfig {
             decay_fn: DecayFn::Sigmoid,
             g_min: G_MIN,
             gate: GateMode::FullRank,
+            use_rope: false,
             chunk_size: 16,
             norm_eps: 1e-5,
         }
@@ -191,6 +207,7 @@ impl KdaConfig {
             decay_fn: DecayFn::Sigmoid,
             g_min: G_MIN,
             gate: GateMode::FullRank,
+            use_rope: false,
             chunk_size: cfg.chunk_size,
             norm_eps: cfg.norm_eps,
         }
@@ -202,10 +219,80 @@ use burn::backend::Backend;
 use burn::backend::DispatchKindConversion;
 use burn::module::{Module, Param};
 use burn::nn::{Initializer, Linear, LinearConfig};
-use burn::tensor::{activation, Device, DispatchTensor, Tensor};
+use burn::tensor::{activation, Device, DispatchTensor, Tensor, TensorData};
 use burn_gdn2::{chunk_wy_forward, l2_normalize, short_conv_1d, Gdn2Config};
 
 pub mod fused;
+
+/// RoPE base. Upstream's own default, from two places: the rotary module takes
+/// it as `RotaryEmbedding(dim, base=...)` (`fla/modules/rotary.py:327`) and the
+/// hybrid spec defaults it — `rope_theta = normalized.get('rope_theta', 10000.)`
+/// (`fla/models/hybrid.py:103`). A constant, not a knob, until something
+/// measures otherwise.
+pub const ROPE_THETA: f64 = 10000.0;
+
+/// Rotary embedding on `[B, T, H*D]`: one full-head rotation per head, at
+/// positions `0..T-1`.
+///
+/// This is `rotary_embedding_ref` (`fla/modules/rotary.py:30-36`) with
+/// `interleaved = False` and a full-head rotation (`ro_dim = D`), which reduces
+/// to `x1 = x[..D/2]`, `x2 = x[D/2..]`,
+/// `out = [x1*cos - x2*sin, x2*cos + x1*sin]` at
+/// `angle[t, i] = t * theta^(-2i/D)` — the frequencies of
+/// `fla/modules/rotary.py:410-414`. Positions start at 0 and there is no
+/// `seqlen_offset`: KDA carries a recurrent **state**, not a KV cache, so there
+/// is no cache length to offset by.
+///
+/// **Placed before the L2 norm, and at a full-head rotation the order is
+/// provably free.** FLA normalizes q/k *inside* the kernel
+/// (`fla/ops/kda/chunk.py:56-60`), so a layer-level rope necessarily lands
+/// ahead of the norm. The rotation is orthogonal, so `l2(rope(x)) == rope(l2(x))`
+/// exactly and the choice costs nothing — pinned by
+/// `tests/kda_oracle.rs::rope_commutes_with_l2norm`. A **partial** rotation is
+/// not free (upstream's reference carries an un-rotated tail, and an L2 norm
+/// over all head dims then mixes rotated and un-rotated coordinates), so this
+/// takes no fraction: a future partial rope must re-derive the order rather
+/// than inherit it.
+///
+/// Public because it is the oracle's seam: `tests/kda_oracle.rs` compares this
+/// against FLA's own `rotary_embedding_ref` tensor for tensor.
+pub fn apply_rope(x: Tensor<3>, n_heads: usize, head_dim: usize) -> Tensor<3> {
+    let [b, t, d] = x.shape().dims::<3>();
+    assert_eq!(d, n_heads * head_dim, "rope expects [B,T,H*HD]");
+    assert!(head_dim % 2 == 0, "rope needs an even head dim");
+    let dev = x.device();
+    let half = head_dim / 2;
+
+    // freqs = outer(positions, inv_freq), then cos/sin of it — upstream's own
+    // `_update_cos_sin_cache` with `scale = None` (the default,
+    // `fla/modules/rotary.py:419-447`) and its `_compute_inv_freq`
+    // (`:410-414`).
+    let mut cos_v = Vec::with_capacity(t * half);
+    let mut sin_v = Vec::with_capacity(t * half);
+    for p in 0..t {
+        for i in 0..half {
+            let a = p as f32 * (ROPE_THETA as f32).powf(-(2.0 * i as f32) / head_dim as f32);
+            cos_v.push(a.cos());
+            sin_v.push(a.sin());
+        }
+    }
+    let cos = Tensor::<2>::from_data(TensorData::new(cos_v, [t, half]), &dev)
+        .reshape([1, 1, t, half])
+        .expand([b, n_heads, t, half]);
+    let sin = Tensor::<2>::from_data(TensorData::new(sin_v, [t, half]), &dev)
+        .reshape([1, 1, t, half])
+        .expand([b, n_heads, t, half]);
+
+    // [B,T,H*HD] -> [B,H,T,HD], then the two halves the rotation mixes.
+    let x = x.reshape([b, t, n_heads, head_dim]).permute([0, 2, 1, 3]);
+    let x1 = x.clone().slice([0..b, 0..n_heads, 0..t, 0..half]);
+    let x2 = x.slice([0..b, 0..n_heads, 0..t, half..head_dim]);
+    let o1 = x1.clone() * cos.clone() - x2.clone() * sin.clone();
+    let o2 = x2 * cos + x1 * sin;
+    Tensor::cat(vec![o1, o2], 3)
+        .permute([0, 2, 1, 3])
+        .reshape([b, t, d])
+}
 
 // ─── Data-dependent decay (Eq 2/5) ────────────────────────────────────
 
@@ -410,6 +497,12 @@ pub struct KdaModule {
     pub v_head_dim: usize,
     #[module(skip)]
     pub use_short_conv: bool,
+    /// RoPE on q/k before the L2 norm. Off by default; see
+    /// [`KdaConfig::use_rope`]. Not a parameter and not a buffer — rotary
+    /// carries no weights, so this field is skipped by the derive and no
+    /// checkpoint is affected by the flag.
+    #[module(skip)]
+    pub use_rope: bool,
     #[module(skip)]
     pub chunk_size: usize,
     #[module(skip)]
@@ -496,6 +589,7 @@ impl KdaModule {
             n_v_heads: hv,
             v_head_dim: v_head,
             use_short_conv: cfg.use_short_conv,
+            use_rope: cfg.use_rope,
             chunk_size: cfg.chunk_size,
             norm_eps: cfg.norm_eps,
         }
@@ -563,8 +657,19 @@ impl KdaModule {
             activation::silu(v_raw)
         };
 
-        let q_norm = l2_normalize(q_act, 1e-6);
-        let k_norm = l2_normalize(k_act, 1e-6);
+        // RoPE before the L2 norm, matching FLA's dataflow: its layer hands raw
+        // q/k to the kernel and the kernel normalizes them
+        // (`fla/ops/kda/chunk.py:56-60`), so anything the layer adds to q/k sits
+        // ahead of the norm. See `apply_rope` for why the order is free at a
+        // full-head rotation. Off by default — FLA's official KDA is NoPE.
+        let (q_rot, k_rot) = if self.use_rope {
+            (apply_rope(q_act, h, hk), apply_rope(k_act, h, hk))
+        } else {
+            (q_act, k_act)
+        };
+
+        let q_norm = l2_normalize(q_rot, 1e-6);
+        let k_norm = l2_normalize(k_rot, 1e-6);
 
         let alpha = self.decay.forward(x.clone()); // [B, T, H, HD]
         let [_, _, _, hd] = alpha.shape().dims::<4>();
