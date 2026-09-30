@@ -682,11 +682,28 @@ The defenses are installed, not optional.
   (`decode_seam`, `decode_wiring`, both on the CPU backend). The cheapest real
   gate is to assert that the eval line's `engram=<rows>/<arms>` field is
   non-zero whenever `use_engram` is true, on a 2-batch CPU run.
-- **Whether the attention arm trains is unverified.** `8fa5d4c` compiles and
-  says so; the `DM_GDN2_BWD_TRACE=1` `ENTERED` line on `ChunkWy::backward` has
-  not been seen. Until it is, §3.2's second retraction stands for the *present*
-  code too, not only for history, and every cost estimate that assumed a
-  working attention backward is unmeasured.
+- ~~**Whether the attention arm trains is unverified.**~~ **ANSWERED YES on the
+  trainer's backend, 2026-10-01** (`d8fa449`, `tests/kda_param_grads_cuda.rs`):
+  all 11 KDA parameter groups receive non-zero, finite gradients on
+  `AdBal` at trainer shape — CPU NdArray and CUDA agree **bit-for-bit** on the
+  ops path; short-conv (a config the trainer has never run) got its first-ever
+  gradient evidence. Falsification: one `detach()` at `cuda_dispatch.rs:449`
+  kills 8/11 groups, the test NAMES them (the three survivors are exactly the
+  post-sever ops), restore is sha256-identical. §3.2's second retraction now
+  applies to HISTORY only, and the warm-step bwd share (~205 ms of ~480) is
+  real work, not headroom. **Two NEW findings came with the proof, both
+  carried, neither fixed:** (1) the **fused adjoint is wrong and
+  non-deterministic** — under `NoCheckpointing` it disagrees with a central
+  difference of its own forward by 4.5e-2..2.6e-1 on q/k/v, beta_proj,
+  decay.b_alpha, while the three post-op parameters match an independent CPU
+  autodiff at 2e-7; decay-path amax moves 7–27% between identical runs. The
+  test asserts flow + prints the disagreement. (2) **a fused forward launches
+  on the trainer's backend and its result is discarded** — ADR-0019's
+  silent-fallback shape; `fused kda=0/0` on the eval line means "not on this
+  path", not "the fast path is slow". Both are burn-gdn2-owner items with
+  file:line in `research/reviews/kda-gradflow-2026-09-30.md`. The
+  `DM_GDN2_BWD_TRACE` line was not release-visible; the numeric test replaces
+  it — the trace could never have proven gradient *arrival*.
 - **The A/B budget has not been re-costed.** `docs/AB-PROTOCOL.md` still prices
   a 2k-step arm at 53 min, derived from ~1.6 s/step on a run whose attention
   backward did not execute. The 25.8 s/step batch-8 figure that would replace
