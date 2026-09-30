@@ -60,8 +60,6 @@ pub const FUTURE_BYTE: usize = 13;
 /// head was never reached rather than "the arm is off".
 pub const FUTURE_BYTE_ASKED: usize = 14;
 pub const N_ARMS: usize = 15;
-pub const RETRACT_BATCHED: usize = 12;
-pub const N_ARMS: usize = 15;
 /// Arm name per index, for assertion messages that name the thing.
 pub const NAMES: [&str; N_ARMS] = [
     "iterations",
