@@ -286,6 +286,32 @@ pub fn init_pools(device: &Device) {
 #[cfg(not(feature = "cuda"))]
 pub fn init_pools(_device: &Device) {}
 
+/// How many kernel launches the CUDA backend has executed since process start.
+///
+/// The instrument behind every "this workload is launch-bound" claim in this
+/// repo: counted at the single choke point every launch passes through
+/// (`cubecl-cuda/src/compute/context.rs`), and self-validated against the number
+/// of launches a test makes
+/// (`cubecl-cuda/tests/graph_step.rs::launch_counter_counts_every_launch`).
+///
+/// **It is counted on the device thread**, so a value read from the host is a
+/// LOWER BOUND on what the host has enqueued — the device thread may still be
+/// behind. In a launch-bound loop the host runs ahead and the two nearly
+/// coincide, but the claim is the bound.
+///
+/// Zero off CUDA: the counter lives in the CUDA backend, and a run on another
+/// backend has no launches to count. That is the honest answer, not a stand-in.
+pub fn cubecl_launches() -> u64 {
+    #[cfg(feature = "cuda")]
+    {
+        cubecl_cuda::launches()
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        0
+    }
+}
+
 /// The cubecl client behind a `Device`, or `None` off CUDA. The same
 /// unwrap `init_pools` does, factored out because the graph seam needs it too
 /// and two copies of a backend downcast is how they drift.
@@ -1373,10 +1399,21 @@ pub fn train_loop(
                 let _: f32 = ll.clone().try_into_scalar().unwrap_or(0.0);
             }
             let total_ms = t_iter.elapsed().as_secs_f64() * 1000.0;
+            // The launch count, on the same line as the time it buys. This is
+            // the number that decides whether a CUDA graph is worth anything:
+            // a replay is ONE dispatch however many launches it contains, so
+            // the benefit is `launches - 1` and the cost is one copy per
+            // parameter per step (the pin a captured optimizer needs, because
+            // burn's is out-of-place and the parameter's address moves).
+            // Counted on the device thread, so it is a LOWER BOUND on what
+            // the host enqueued, and cumulative since process start: the
+            // per-step figure is the difference between two timer lines, which
+            // is why this is a count and not a rate.
+            let launches = cubecl_launches();
             println!(
                 "timer step {step}: total={total_ms:.0}ms data={data_ms:.1}ms fwd={fwd_ms:.0}ms \
                  bwd={bwd_ms:.0}ms (incl. loss sync + host-adam D2H) opt={opt_ms:.0}ms \
-                 retr={retr_ms:.1}ms ema={ema_ms:.1}ms gpu_step={:.0}ms",
+                 retr={retr_ms:.1}ms ema={ema_ms:.1}ms gpu_step={:.0}ms launches={launches}",
                 total_ms - data_ms
             );
         }
