@@ -70,7 +70,15 @@ Line numbers are at `3234ecc`.
 | 14 | **Per-chunk carry / state shape** | `lib.rs:615-617, 675-676, 712-717` | `[B, HV, head_dim, v_head_dim]`, dtype follows `q` | `naive.py:60` `S = k.new_zeros(B, HV, K, V)` | **AGREE (b).** `initial_state` is `+=`'d into a zero state, not assigned — same thing |
 
 **Tally: 14 sites — 8 AGREE, 4 DISAGREE (1 of them doc-only), 2 NO EXTERNAL
-REFERENCE (both deliberate and correctly labelled).**
+REFERENCE (both deliberate and correctly labelled).** Nothing below rests on a
+prior reading: every verdict marked (a) was checked against FLA's own code
+**after running it**, and `docs/ORACLE-TIERS.tsv`'s tier-(d) registration for
+`burn-kda/src/lib.rs` is superseded by the (a) row for
+`burn-kda/tests/kda_oracle.rs`. Nothing below rests on a
+prior reading: every verdict marked (a) was checked against FLA's own code after
+running it, and 's tier-(d) registration for
+ is superseded by the (a) row for
+.
 
 Of the 8 agreements, **4 are tier (a)** — checked against FLA's own code,
 executed: #1, #7, #9, #11.
@@ -384,13 +392,102 @@ distinction, which is the piece that makes "both are right" the answer.
 burn-kda runs sigmoid, and **that is correct for each**: they are different
 mechanisms with different reference implementations.
 
+**The record, in the words the rules require.** The sigmoid choice is
+**verified** — against `fla/layers/kda.py:191` at commit `9f38d249`, whose
+`FusedRMSNormGated(..., activation="sigmoid")` this lane read out of a clone,
+and against K3 §2.1.1 Eq 6 as a transcription. The SiLU arm is **not a
+correction**; it is a different mechanism's parameterisation, and adopting it
+for KDA would be an A/B arm, not a fix. The gdn2 comment that mislabelled the
+direction was a doc bug in the gdn2 crate, and the gdn2 lane owns it — nothing
+in burn-kda needed changing for it, which is the answer to the question as
+asked.
+
 ---
 
 ## 6. What landed (class A)
 
-See `git log` in this worktree. Each fix is a comment or a one-token change
-that cannot move a number in any configuration that currently runs, and each
-has a gate demonstrated red→green.
+Four commits in this worktree, on `wt/kda-formula` off `3234ecc`. **Nothing is
+merged and nothing is pushed.**
+
+| commit | what | red → green |
+|---|---|---|
+| `541a340` | the audit (§0–§5) — the inventory, the pins, the gate question | — |
+| `f71b802` | the pins + the generator + the fixture, with three vacuity guards | all three guards FIRED during development (§2.3, `PROVENANCE.md`) |
+| `0038bc8` | `tests/kda_oracle.rs` — the gate, 5 green / 2 red | 3 harness bugs, each found because it produced a plausible wrong number (§6.1) |
+| `6e76340` | `tests/oracle/falsify.sh` — 7 mutants | B1 turns a **red green** |
+| (this one) | the four class-A fixes + `PROVENANCE.md` + the (a) registry rows | `forward_recurrent_runs_with_expand_v_ne_1` demonstrated **red → green** |
+
+**The four class-A fixes, and why none of them can move a number in a
+configuration that currently runs:**
+
+1. **`lib.rs:17` and `lib.rs:296-297` (was `:267`)** — the module header and the
+   branch comment stated Kimi Linear's form as `-exp(A)·Softplus(z)`. The code
+   computes `-softplus(exp(A)·z)`. The comments were wrong about the code; they
+   now say so, name the upstream `file:line` for the form we do **not** compute,
+   and point at the red test. **Comment only.**
+2. **`lib.rs:634` (was `:570`)** and the module header — `w_gate = 1` was
+   documented; the call passes `b_v`. The code was right and the comment was
+   wrong. **Comment only.**
+3. **`fused.rs:9`** — "no softmax scale in KDA" is false against both upstreams.
+   The comment now carries the citations, the RMSNorm reason the model has not
+   noticed, and the pointer to the two red tests. **Comment only.**
+4. **`forward_recurrent`, `lib.rs:866` / `:884`** — the exact-per-token
+   **reference** used the key-side beta on two tensors that live on the value
+   axis. **One token, `b_k` → `b_v`.** `b_k` and `b_v` are the same per-head
+   scalar repeated over a channel axis, so they are bit-identical whenever
+   `head_dim == v_head_dim` — every configuration that runs today. The crate's
+   own 12 unit tests pass unchanged after the fix (measured), which is the
+   evidence that it is number-preserving.
+
+**The red→green demonstration for #4**, since it is the only one with a gate:
+
+```
+BEFORE:  let beta = b_k;   →  test forward_recurrent_runs_with_expand_v_ne_1 ... FAILED
+          Reason: The given shape doesn't have the same number of elements...
+AFTER:   let beta = b_v;   →  test forward_recurrent_runs_with_expand_v_ne_1 ... ok
+          test result: ok. 12 passed; 0 failed          (the crate's own suite)
+          test result: FAILED. 7 passed; 3 failed       (the oracle, 3 reds on purpose)
+```
+
+The gate also asserts the chunked path and the scan still **agree** at
+`expand_v = 2.0`, which is the property the fix had to preserve — a shape-only
+check would have passed a change that quietly altered the arithmetic.
+
+### 6.1 The three harness bugs, because they are the transferable part
+
+Every one of them produced a **plausible wrong number** rather than an error,
+which is exactly the failure mode the tier-(a) row exists to catch — and in two
+of the three, it initially looked like a defect in the code under test.
+
+| the bug | what it produced | how it was caught |
+|---|---|---|
+| the fixture fed `z - bias` into `KdaDecay::forward`, which adds `b_alpha` itself — so the bias was subtracted **twice** | two of six gate cases wrong; the four with `bias = 0` agreed perfectly | the generator's guard 3 fired: FLA's executed reference disagreed with the `0.0771` our docs publish |
+| the `beta` slice read axis 1 as time and axis 2 as head | multi-head cases read the **wrong head's** beta; `square_1head` agreed perfectly | a pure `b=1` case passing while `b=2` failed, and the failing value matching `b=0`'s answer exactly when traced in python |
+| the batch slice was `0..1` for every `bi` | batch 1 silently re-read **batch 0** | the reported value was traceable to another `(bi, ti, h)` in the fixture |
+
+And guard 1 of the generator was wrong in the same shape: it asserted FLA's two
+gate references agree at `A = 0`, which is false — `-softplus(z)` and
+`-5·sigmoid(z)` are two mechanisms, not two spellings. The guard was wrong; the
+extraction was fine. `tier-a-references.md` §7 predicted exactly this, and the
+prediction held on the first attempt.
+
+### 6.2 The coverage limit, stated because a tier-(a) row that overstates itself is worse than none
+
+**The `a_log` clamp is not covered and cannot be.** `lib.rs:293` clamps `A_h` to
+`[-10, 20]`; no source has a clamp, so a fixture case with `A` outside that range
+would make our deliberate clamped answer differ from FLA's and turn the *green*
+red. The consequence: **a mutant that widens the clamp is invisible to every arm
+of this oracle.** `falsify.sh`'s A3 narrows it instead — which the greens do
+see — and says why in place.
+
+**The recurrent path has nowhere to put the scale.** `kda_step` and
+`forward_recurrent` take no `scale` argument, so unlike the chunked call site
+there is no single literal that would fix them. The chunked reds therefore drive
+`chunk_wy_forward` with an **explicit** scale, deliberately, so that they compare
+the *mechanism* against FLA and not the wiring — and the green twin
+`chunked_wy_honours_the_read_scale_when_asked` is what proves the mechanism is
+already right. A mutant that appeared to "fix" the scale reds would be measuring
+the test rather than the code, and `falsify.sh` says so instead of shipping one.
 
 ---
 
@@ -400,7 +497,17 @@ has a gate demonstrated red→green.
 fidelity claim in the file"**. It is not (d). It cites three sources by
 arXiv id and one by `file:line`, ships an f64-oracle discipline in its
 neighbour, and four of its formulas are now checked against **executed**
-upstream code.
+upstream code. The registry now carries the (a) row, and the generator, the
+fixture and both pinned upstream files have rows of their own.
+
+**One thing this lane did not have to invent**, and it is why the crate was
+worth auditing at all: `docs/ORACLE-TIERS.tsv` already had the right question
+written down — *"if it names a function in this fork, the comparison is
+arm-vs-arm and the tier is (d), whatever the test's own name says."* Every
+existing burn-kda test names a function in this fork. The tier was **(d) for a
+structural reason, not because nobody had looked** — and that is also why the
+fix was to add a comparison against code that is not in this fork, rather than
+to write more tests.
 
 The transfer from `tier-a-references.md` §7 holds here and cost this lane two
 real findings: **a self-comparison cannot see a choice between two equally-valid

@@ -81,6 +81,7 @@
 use burn::backend::NdArray;
 use burn::module::Param;
 use burn::tensor::{Device, Tensor};
+use burn_kda::{KdaConfig, KdaModule};
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
@@ -841,7 +842,80 @@ fn chunked_wy_applies_no_read_scale() {
     );
 }
 
-/// A green margin is only evidence if it is not a tolerance fitted to it.
+// ── 4. a tier (d) shape gate, for a class-A fix in the reference scan ──────
+
+/// `forward_recurrent` used the KEY-side beta on two tensors that live on the
+/// VALUE axis (`src/lib.rs`, the `beta` binding and its comment). That is
+/// bit-identical while `head_dim == v_head_dim` and raises a broadcast error
+/// when they differ, so it was a latent break in the crate's own exact-per-token
+/// *reference* — the thing every chunk-path test compares against.
+///
+/// **This gate is tier (d), not (a), and it says so:** it exercises
+/// `expand_v = 2.0`, a configuration no upstream reference comparison covers and
+/// none of the FLA fixtures use. What it pins is a SHAPE, which needs no
+/// external reference — `erased` is `[B, H, 1, DV]` and `v_t` is
+/// `[B, H, 1, DV]`, and multiplying either by a `[B, H, 1, DK]` tensor is a type
+/// error. Red before the fix (a broadcast panic), green after, no number
+/// involved.
+///
+/// `expand_v` is unreachable from `KdaConfig` on the running model (dormouse
+/// leaves `num_v_heads: None` and `expand_v` at its 1.0 default), so this is a
+/// gate for the crate as shipped rather than for the model as trained.
+#[test]
+fn forward_recurrent_runs_with_expand_v_ne_1() {
+    let dev = dev();
+    let km = KdaModule::new(
+        &KdaConfig {
+            hidden_size: 64,
+            num_heads: 2,
+            head_dim: 8,
+            num_v_heads: None,
+            expand_v: 2.0, // v_head_dim = 16 != head_dim = 8
+            use_short_conv: false,
+            decay_fn: burn_kda::DecayFn::Sigmoid,
+            rank: 8,
+            chunk_size: 16,
+            ..Default::default()
+        },
+        0.9,
+        &dev,
+    );
+    assert_eq!(km.v_head_dim, 16);
+    assert_ne!(km.v_head_dim, km.head_dim);
+    let x = t3(
+        &(0..1 * 12 * 64)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 50.0)
+            .collect::<Vec<f32>>(),
+        [1, 12, 64],
+    );
+    let mut st: Option<Tensor<4>> = None;
+    // Before the fix this panicked inside burn's broadcast check: `[B,H,1,DK]`
+    // against `[B,H,1,DV]` with DK = 8 and DV = 16.
+    let out = km.forward_recurrent(x, &mut st, true);
+    assert_eq!(out.dims(), [1, 12, 64]);
+    let s = st.unwrap();
+    assert_eq!(s.dims(), [1, 2, 8, 16]);
+    // And it must be a FUNCTION, not just a shape: the chunked path and the scan
+    // still agree with each other at this shape, which is the property the fix
+    // had to preserve.
+    let out_chunk = km.forward_train::<NdArray>(t3(
+        &(0..1 * 12 * 64)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 50.0)
+            .collect::<Vec<f32>>(),
+        [1, 12, 64],
+    ));
+    let (r, at) = num_diff(
+        &out.into_data().to_vec::<f32>().unwrap(),
+        &out_chunk.into_data().to_vec::<f32>().unwrap(),
+        ATOL_CHAIN,
+        TOL_RECUR,
+    );
+    assert!(
+        r <= 1.0,
+        "at expand_v=2.0 the exact scan and the chunked path now disagree: normalised \
+         {r:.3e} at {at} -- the b_v fix changed a number, which it must not"
+    );
+}
 ///
 /// The assertion is on the **formula class only** — the decay gates, where both
 /// sides evaluate one `exp` and one sigmoid in the same order and the result

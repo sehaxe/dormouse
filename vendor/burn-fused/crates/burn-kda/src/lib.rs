@@ -14,14 +14,43 @@
 //! with data-dependent per-head write strength `beta_t^h = Sigmoid(W_beta^h x_t)`
 //! (K3 Eq 2) and channel-wise decay `alpha_t = exp(g_t)` from a low-rank logit
 //! `z_t = W_alpha^down(W_alpha^up x_t) + b_alpha`:
-//! - Kimi Linear: `g_t = -exp(A_h) * Softplus(z_t)` (unbounded below)
-//! - Kimi K3:     `g_t = g_min * Sigmoid(exp(A_h) z_t)`, fixed `g_min = -5`
+//! - Kimi K3 (**the running branch**): `g_t = g_min * Sigmoid(exp(A_h) z_t)`,
+//!   fixed `g_min = -5`. **Verified** against FLA's own executed reference
+//!   (`fla/ops/kda/gate.py::naive_kda_lowerbound_gate`, commit `9f38d249`) by
+//!   `tests/kda_oracle.rs::k3_bounded_decay_matches_fla_reference`.
+//! - Kimi Linear: `g_t = -exp(A_h) * Softplus(z_t)` (unbounded below). **This
+//!   is what the sources say and it is NOT what [`DecayFn::Softplus`]
+//!   computes** — that branch puts `exp(A_h)` *inside* the softplus. The two
+//!   are different functions; see the branch's own comment and
+//!   `tests/kda_oracle.rs::kimi_linear_softplus_decay_matches_fla_reference`,
+//!   which is RED ON PURPOSE. The branch is not the default and the fix is A/B
+//!   queue arm 5, so it is reported rather than changed.
 //!
-//! Training uses the chunked WY form (identical algebra to GDN-2 with
-//! `b = beta`, `g = log(alpha)`, `w_gate = 1`); decoding uses the exact
-//! chunked WY form (`forward_recurrent` is the exact per-token reference).
-//! A fused CUDA kernel path (`feature = "cuda"`) reuses the GDN-2 chunked
-//! kernels through the same WY mapping.
+//! Training uses the chunked WY form, which is the same algebra as GDN-2 under
+//! the mapping `b = beta` (key channels), `g = log(alpha)` (key channels),
+//! `w_gate = beta` (value channels) and `scale = 1.0`; see [`crate::fused`] for
+//! why `w_gate` is `beta` and not `1` (it was documented as `1` here until
+//! 2026-09-30, and the code was right and the comment was wrong). Decoding uses
+//! the exact chunked WY form (`forward_recurrent` is the exact per-token
+//! reference). A fused CUDA kernel path (`feature = "cuda"`) reuses the GDN-2
+//! chunked kernels through the same WY mapping.
+//!
+//! # `scale = 1.0` here, `head_k_dim**-0.5` in both references — OPEN
+//!
+//! FLA's `chunk_kda` and `fused_recurrent_kda` both default `scale = K ** -0.5`
+//! (`chunk.py:474`, `fused_recurrent.py:261`) and `fla/layers/kda.py:262` calls
+//! `chunk_kda` **without** a `scale` argument, so the official KDA layer runs
+//! at `head_k_dim**-0.5`. This crate passes `1.0`. The factor enters only the
+//! read `o = q·S`, never the state update, and the RMSNorm in [`KdaModule::output`]
+//! is invariant to a constant rescale of its input, so it is absorbed to
+//! `O(eps / mean(o²))` ≈ `O(1e-5)` in the running model — which is exactly why
+//! no test, loss curve or seed comparison here can see it. It is still a real
+//! divergence, and `tests/kda_oracle.rs` carries it as two RED-ON-PURPOSE tests
+//! (`read_scale_matches_fla_reference`, `chunked_wy_applies_no_read_scale`)
+//! with a green twin proving the mechanism already honours the scale when asked.
+//! Changing `1.0` moves every number derived from this crate, so it is the
+//! owner's call. Arithmetic and citations:
+//! `research/papers/kda-formula-audit-2026-09-30.md` §3.2.
 //!
 //! # Decay init: `a_log = -3`, `b_alpha = +1` is OURS, and it is not a citation
 //!
@@ -256,6 +285,17 @@ impl KdaDecay {
         // with NaN. A <= 20 keeps exp(A) ~ 4.8e8: decay still saturates to
         // alpha = 0/1 at the extremes, NaN becomes impossible. (Measured on
         // 5060 Ti 2026-08-29: unclamped NaN episodes at heavy overfit.)
+        //
+        // The clamp is OURS: no source has one, so the tier-(a) fixture
+        // deliberately contains no A outside [-10, 20] and cannot test it
+        // (`gen_kda_oracle.py`, case `A_clamp_endpoints`, says so in place).
+        //
+        // `a` below is A_h ITSELF after the clamp, not exp(A_h) -- the
+        // exponential is applied per branch. `falsify.sh`'s B1 got this wrong on
+        // its third attempt (it broadcast `mul(a)` where `mul(a.exp())` was
+        // meant) and the mutant COMPILED and flipped every sign. Recorded
+        // because a decision that looks fine and is not the reference's is the
+        // exact shape of the two divergences this crate currently carries.
         let a = self
             .a_log
             .val()
@@ -264,9 +304,33 @@ impl KdaDecay {
             .clamp(-10.0, 20.0);
         let scaled = z_h.mul(a.exp());
         let g = match self.decay_fn {
-            // Kimi Linear: g = -exp(A_h) * Softplus(z), alpha in (0, 1)
+            // Kimi Linear, AS THE SOURCES STATE IT: g = -exp(A_h) * Softplus(z).
+            //
+            // DIVERGES FROM THAT, and did so until 2026-09-30 when this comment
+            // was corrected to match the code rather than the reverse:
+            // `exp(A_h)` is INSIDE the softplus here, `-Softplus(exp(A_h) * z)`.
+            // FLA has it outside, in two independent transcriptions in one file
+            // -- the executed reference `naive_kda_gate` (`gate.py:50`) and the
+            // triton twin (`gate.py:167`, `b_yg = -exp(b_A) * softplus(b_g)`).
+            // The two are different functions, not a reparameterisation: they
+            // agree only at A = 0, and at this crate's own init (A = -3, z = +1)
+            // upstream gives alpha = 0.574 and this gives 0.512.
+            //
+            // No test in this crate can see it, because every comparison here is
+            // arm-vs-arm and both arms read this same function. It is caught by
+            // `tests/kda_oracle.rs::kimi_linear_softplus_decay_matches_fla_reference`,
+            // which is RED ON PURPOSE; `tests/oracle/falsify.sh` mutant B1 is
+            // the candidate fix and turns that red green.
+            //
+            // NOT FIXED HERE. This branch is not the default (`DecayFn::Sigmoid`
+            // is, and every checkpoint in the tree was trained with it), but it
+            // is the subject of A/B queue arm 5 and a numerical change to a
+            // shipped objective is the owner's call.
             DecayFn::Softplus => activation::softplus(scaled, 1.0).neg(),
-            // Kimi K3: g = g_min * Sigmoid(exp(A_h) z), alpha in (e^g_min, 1)
+            // Kimi K3, the RUNNING branch: g = g_min * Sigmoid(exp(A_h) z), with
+            // `g_min = -5` fixed. VERIFIED against FLA's executed
+            // `naive_kda_lowerbound_gate` (gate.py:81) including the bound:
+            // `tests/kda_oracle.rs::k3_bounded_decay_matches_fla_reference`.
             DecayFn::Sigmoid => activation::sigmoid(scaled).mul_scalar(self.g_min as f32),
         };
         g.exp()
@@ -567,8 +631,16 @@ impl KdaModule {
             .forward(gated.permute([0, 2, 1, 3]).reshape([b, t, hv * vd]))
     }
 
-    /// Training forward: chunked delta-rule (WY algebra, b = beta, w = 1)
-    /// over a zero-initialized state.
+    /// Training forward: chunked delta-rule (WY algebra, `b = beta` on the key
+    /// channels, `w_gate = beta` on the value channels) over a zero-initialized
+    /// state.
+    ///
+    /// This said `w = 1` until 2026-09-30 and was **wrong about the code**: the
+    /// call passes `b_v` in the `w_gate` position, and it has to. GDN-2's
+    /// chunked form forms `U = (I + L)^{-1} (w_gate ⊙ V)`
+    /// (`burn_gdn2/src/forward.rs:259`), and Eq 1's write term is `beta k vᵀ`, so
+    /// `w_gate = 1` would drop beta from the write entirely and compute a
+    /// different model. `src/fused.rs` had it right all along.
     ///
     /// Delegates to [`forward_train_state`](Self::forward_train_state) with
     /// `state: None` — identical behavior to the pre-carry implementation.
@@ -789,7 +861,22 @@ impl KdaModule {
         update_state: bool,
     ) -> Tensor<3> {
         let [batch, tokens, _] = x.shape().dims::<3>();
-        let (q, k, v, g, b_k, _b_v, gate) = self.project(x.clone());
+        // `b_v`, not `b_k`. Both are the same per-head scalar (Eq 2) repeated
+        // over a channel axis, so they are bit-identical whenever
+        // `head_dim == v_head_dim` — which is every configuration that runs
+        // today, `expand_v` defaulting to 1.0 and dormouse never setting it. But
+        // the two multiplications below are on the VALUE axis and the shapes
+        // only line up by that coincidence: `erased` is `[B, H, 1, DV]` and
+        // `v_t` is `[B, H, 1, DV]`, while `b_k` is `[B, H, 1, DK]`. Under
+        // `expand_v != 1.0` the old code raised a broadcast error rather than
+        // returning a wrong number, so this is a latent break and not a silent
+        // one — but it made the crate's own exact-per-token *reference* unusable
+        // one config away, and every chunk-path test compares against it.
+        //
+        // FLA gets the same thing right for the same reason: `naive.py:64`
+        // applies `b_i` to `k_i` AND to `v_i - (k_i * S).sum(-2)`, with `b_i`
+        // indexed by VALUE head.
+        let (q, k, v, g, _b_k, b_v, gate) = self.project(x.clone());
         let [_, hv, _, _] = v.shape().dims::<4>();
         let dev = q.device();
         let s = state
@@ -799,7 +886,9 @@ impl KdaModule {
                     .cast(q.dtype())
             });
 
-        let beta = b_k; // per-head scalar repeated over channels (Eq 2)
+        // The per-head scalar of Eq 2, repeated over the VALUE channels, which
+        // is the axis both multiplications below live on.
+        let beta = b_v; // [B, H, T, DV]
         let (out_4d, new_state) = if update_state {
             let mut s = s;
             let mut outs = Vec::with_capacity(tokens);
@@ -808,8 +897,9 @@ impl KdaModule {
                 let k_t = k.clone().slice_dim(2, t..t + 1);
                 let v_t = v.clone().slice_dim(2, t..t + 1);
                 let d_t = g.clone().slice_dim(2, t..t + 1).exp();
-                let beta_t = beta.clone().slice_dim(2, t..t + 1); // [B, H, 1, HK]
-                                                                  // S <- Diag(alpha_t) S  (Eq 1)
+                // S <- Diag(alpha_t) S  (Eq 1). `g` is on the KEY axis, so
+                // `swap_dims(2, 3)` is what scales S's key rows.
+                let beta_t = beta.clone().slice_dim(2, t..t + 1); // [B, H, 1, DV]
                 s = s * d_t.swap_dims(2, 3);
                 // erase: S <- S - beta k (k^T S)
                 let erased = (s.clone() * k_t.clone().swap_dims(2, 3))
