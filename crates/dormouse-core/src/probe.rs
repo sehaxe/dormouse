@@ -67,7 +67,23 @@ pub const FUTURE_BYTE_ASKED: usize = 14;
 /// a run that reports 0 wrote ReZero's residual and printed mHC's name, and
 /// nothing else on the eval line would say so.
 pub const MHC: usize = 15;
-pub const N_ARMS: usize = 16;
+/// The sparse-routing arm replaced the dense expert blend with a top-k
+/// selection (`moe::topk_blend`), counted ONCE PER EXECUTED ITERATION. The
+/// `sel` half of `moe=<lb>/<sel>` on the eval line. COUNTED, because the
+/// failure mode this arm has is invisible in the loss curve: a top-k that
+/// could not fill computes the dense blend - the control wearing the arm's
+/// label - and trains without ever routing anything.
+pub const MOE_ROUTE: usize = 16;
+/// The load-balancing term was COMPUTED AND ADDED to the loss, counted once
+/// per step: the `lb` half of `moe=<lb>/<sel>`. ADR-0019 COUNTED in two halves
+/// for the same reason `fb` is - `moe_lb_coef` is declared in the config and
+/// the counter is bumped where the term is ADDED, never where the weight is
+/// declared (the `probe::JEPA` defect was a counter bumped nowhere, so the
+/// field read like an objective while contributing nothing). `moe=0/<n>` is
+/// therefore exactly the collapse this arm must be able to see: a selection
+/// with no balancer behind it.
+pub const MOE_LB: usize = 17;
+pub const N_ARMS: usize = 18;
 /// Arm name per index, for assertion messages that name the thing.
 pub const NAMES: [&str; N_ARMS] = [
     "iterations",
@@ -86,6 +102,8 @@ pub const NAMES: [&str; N_ARMS] = [
     "future_byte",
     "future_byte_asked",
     "mhc",
+    "moe_select",
+    "moe_lb",
 ];
 
 thread_local! {

@@ -51,6 +51,60 @@ pub fn validate(c: &DormouseConfig) -> Result<(), String> {
     if c.use_mor && c.mor_k > c.max_iter {
         return Err(format!("mor_k {} > max_iter {}: the top-k set cannot fill", c.mor_k, c.max_iter));
     }
+    // Sparse expert routing over the FFN branch. Two LOUD checks, both the
+    // class where a wrong value computes a DIFFERENT objective without saying
+    // so (ADR-0019):
+    //
+    // 1. A top-k larger than the bank silently becomes the dense blend. That
+    //    is the control, wearing the arm's label - and the run's log would
+    //    print `moe=...` for a model that never routed anything. Refused,
+    //    naming the escape (`moe_topk = 0` or a larger `n_experts`).
+    // 2. A load-balance coefficient with routing OFF is a term with nothing to
+    //    balance. Ignored, it would be a config field that reads as an
+    //    objective and contributes nothing - the `aux_fb_weight`-without-a-head
+    //    defect, and the one shape of this this repo has already been bitten by
+    //    (`probe::JEPA` was bumped nowhere, so the field was a no-op while the
+    //    loss curve looked healthy).
+    if c.moe_topk > c.n_experts {
+        return Err(format!(
+            "moe_topk {} > n_experts {}: the top-k set cannot fill, and topk > n_experts silently \
+             runs the DENSE blend - the control wearing the arm's label. Use moe_topk = 0 (the \
+             dense default), moe_topk <= n_experts, or a larger n_experts.",
+            c.moe_topk, c.n_experts
+        ));
+    }
+    if c.moe_lb_coef < 0.0 {
+        return Err("moe_lb_coef >= 0".into());
+    }
+    if c.moe_lb_coef > 0.0 && c.moe_topk == 0 {
+        return Err(format!(
+            "moe_lb_coef {} with moe_topk = 0: the load-balancing term has no selection to balance, \
+             so it would be silently ignored while the config reads like an objective. Set \
+             moe_topk >= 1, or moe_lb_coef = 0.",
+            c.moe_lb_coef
+        ));
+    }
+    // DELIBERATELY NOT a refusal: `moe_topk > 0` with `moe_lb_coef == 0`.
+    //
+    // The risk is real - Switch §3.3 is the whole reason the term exists, and a
+    // collapsed router means every pass picks the same expert while the loss
+    // curve stays healthy. So this configuration is DELIVERABLE, and it is
+    // legal, for three reasons:
+    //
+    // 1. It is the arm's OWN REMOVAL under the A/B rule (AGENTS.md 1.2: every
+    //    mechanism beats its own removal). A routing arm that cannot be run
+    //    without its balancer cannot be measured against one.
+    // 2. Refusing it would force the operator to pass SOME coefficient, and
+    //    the sweep (research/reviews/moe-routing-2026-10-01.md §5) measures
+    //    that every value in the published range is three orders of magnitude
+    //    too weak at our token count. A refusal here would manufacture exactly
+    //    the "copied a large-MoE number" defect the external review named.
+    // 3. The risk is already VISIBLE without a refusal: `probe::MOE_ROUTE`
+    //    counts the selections and `probe::MOE_LB` counts the balancer terms
+    //    added, so the eval line's `moe=<lb>/<sel>` reads `0/<n>` for a
+    //    routed run with no balancer behind it. That is the repo's own
+    //    COUNTED mark for "a fallback happened and a reader can tell", which
+    //    is the correct instrument here - not a loud refusal of a legal run.
     if c.d_model % c.n_heads != 0 { return Err("d_model must be divisible by n_heads".into()); }
     // The act-quant group size. `quant_act` takes `g = min(act_group, d)` and
     // reshapes the [b*t, d] activations to [b, d/g, g], so a `g` that does not
@@ -202,7 +256,52 @@ mod tests {
         assert!(set_then_validate(&["aux_fb_horizon=600", "max_seq_len=512"]).is_ok(), "seq_len is the trainer's, not the config's business here");
     }
 
-    /// Every shipped preset must still validate: a check that rejects a
+    /// ADR-0019 LOUD for the routing arm, both halves. The dangerous one is
+    /// `moe_topk > n_experts`: `topk_blend` would clamp to the whole bank and
+    /// compute the DENSE blend, so the run trains the control while its config,
+    /// its counters and its `moe=` field all say the arm is on. The other is a
+    /// balancer with no selection to balance.
+    #[test]
+    fn moe_topk_that_cannot_fill_is_refused_and_the_defaults_are_off() {
+        // The default is OFF, which is what keeps every preset's parameters
+        // and checkpoint byte-identical to a build from before this field.
+        let d = DormouseConfig::default();
+        assert_eq!((d.moe_topk, d.moe_lb_coef), (0, 0.0), "the routing arm is off by default");
+
+        // `topk > bank` is the collapse: refuse it, naming the field and the
+        // escape.
+        let err = set_then_validate(&["moe_topk=5"])
+            .expect_err("a top-k larger than the expert bank must be refused");
+        assert!(err.contains("moe_topk"), "the error must name the field: {err}");
+        assert!(err.contains("DENSE"), "the error must name what it would silently run: {err}");
+
+        // A balancer with no selection: refuse rather than ignore.
+        let err = set_then_validate(&["moe_lb_coef=0.01"])
+            .expect_err("a balancer with routing off must be refused");
+        assert!(err.contains("moe_lb_coef"), "the error must name the field: {err}");
+        assert!(set_then_validate(&["moe_lb_coef=-0.1"]).is_err(), "a negative coefficient is a sign flip");
+
+        // ...and the collapse the other way: routing with NO balancer. This is
+        // LEGAL, and the reason it is not a refusal is the argument in the
+        // function body: it is the arm's own removal (the A/B control), and a
+        // refusal would force a coefficient the sweep measures as useless at
+        // our token count. The collapse stays VISIBLE through
+        // `probe::MOE_LB == 0` while `probe::MOE_ROUTE > 0`.
+        assert!(
+            set_then_validate(&["n_experts=4", "moe_topk=1"]).is_ok(),
+            "routing with no balancer is the arm's own removal and must be runnable"
+        );
+
+        // The legal range is untouched: this refuses the two collapses that are
+        // silently different networks, not the configurations that are merely
+        // bad ideas.
+        assert!(set_then_validate(&["n_experts=4", "moe_topk=1", "moe_lb_coef=0.01"]).is_ok(), "the FIRST configuration: 4 experts, top-1, balanced");
+        assert!(set_then_validate(&["n_experts=4", "moe_topk=2", "moe_lb_coef=0.01"]).is_ok(), "the SECOND configuration: top-2 at the same active FFN compute");
+        assert!(set_then_validate(&["n_experts=4", "moe_topk=4", "moe_lb_coef=0.01"]).is_ok(), "top-k == n_experts is the dense blend spelled out loud");
+        assert!(set_then_validate(&[]).is_ok(), "the shipped defaults");
+    }
+
+/// Every shipped preset must still validate: a check that rejects a
     /// config the project ships is a wrong check, and the honest answer is to
     /// say so rather than narrow the check to fit.
     #[test]

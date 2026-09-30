@@ -74,6 +74,23 @@ pub struct ExpertFFN {
     pub down: LinearLike,
 }
 
+/// What the loop's ROUTING arms hand back for the loss.
+///
+/// A struct rather than a second `Option` in the return tuple: the fourth
+/// element used to mean `mor_aux` alone, and adding a second arm's term to the
+/// same slot would give one value two meanings - the failure mode this repo's
+/// own glossary exists to prevent. Every field is `None` unless its arm ran, so
+/// the off-arm shape is exactly what it was.
+#[derive(Default)]
+pub struct RouteAux {
+    /// MoR's router-vs-its-own-top-k BCE (`mor::route`), UNSCALED - the caller
+    /// owns the weight (`mor_bce_weight`).
+    pub mor: Option<Tensor<1>>,
+    /// The sparse-routing load-balancing term (`moe::lb_aux`), UNSCALED and
+    /// averaged over the iterations that ran. `None` unless `moe_topk > 0`.
+    pub moe_lb: Option<Tensor<1>>,
+}
+
 impl ExpertFFN {
     pub fn new(d: usize, f: usize, rank: usize, use_tsct: bool, device: &Device) -> Self {
         Self {
@@ -174,6 +191,12 @@ pub struct LoopBlock {
     /// `mor::route`). Ignored when `use_mor` is off.
     #[module(skip)]
     pub mor_k: usize,
+    /// Sparse expert routing over the FFN branch: selected experts per token
+    /// per pass. **0 = the dense softmax blend, the default and the control.**
+    /// See `config::schema::moe_topk` for why 4 experts at k=1 is the first
+    /// configuration and what this does NOT buy (it is not a FLOP saving).
+    #[module(skip)]
+    pub moe_topk: usize,
     /// Slot-index mask for the in-VRAM tables: `engram_rows` rounded UP to a
     /// power of two, minus one. Masking (not dividing) keeps the address
     /// arithmetic to one op on the device and makes every index in range by
@@ -295,6 +318,7 @@ impl LoopBlock {
             use_mhc: cfg.use_mhc,
             use_mor: cfg.use_mor,
             mor_k: cfg.mor_k,
+            moe_topk: cfg.moe_topk,
             engram_slot_mask: mask,
             engram_lam_max: cfg.engram_lam_max,
             bf16: cfg.bf16,
@@ -313,7 +337,7 @@ impl LoopBlock {
         // Target byte indices [b*t, 1]: L_Rec gathers their log-probs.
         targets: Option<Tensor<2, Int>>,
         lm_head: &LinearLike,
-    ) -> (Tensor<3>, Tensor<1>, Tensor<4>, Option<Tensor<1>>)
+    ) -> (Tensor<3>, Tensor<1>, Tensor<4>, RouteAux)
     where
         DispatchTensor: DispatchKindConversion<B>
             + DispatchKindConversion<B::InnerBackend>
@@ -396,6 +420,10 @@ impl LoopBlock {
         let mut slot_scores: Vec<Tensor<3>> = Vec::with_capacity(iters);
         let mut step_outs: Vec<Tensor<3>> = Vec::with_capacity(iters);
         let mut ce_terms: Vec<Tensor<2>> = Vec::with_capacity(iters);
+        // One load-balancing term per executed iteration, averaged below. Empty
+        // when `moe_topk == 0`, which is how the off-arm gets `None` rather
+        // than a zero that a caller would have to guess the meaning of.
+        let mut lb_terms: Vec<Tensor<1>> = Vec::with_capacity(iters);
 
         for iter in 0..iters {
             crate::probe::note(crate::probe::ITER);
@@ -471,7 +499,44 @@ impl LoopBlock {
             let w_attn = activation::sigmoid(raw.clone().slice([0..b * t, 0..1]));
             let w_mem = activation::sigmoid(raw.clone().slice([0..b * t, 1..2]));
             let w_ffn = activation::sigmoid(raw.clone().slice([0..b * t, 2..3]));
-            let blend = activation::softmax(raw.slice([0..b * t, 3..3 + self.n_experts]), 1);
+            // THE EXPERT BLEND. Two spellings of one statement - how this
+            // token's expert weights are decided - and the config picks which:
+            //
+            // `moe_topk == 0` (DEFAULT): the dense softmax over ALL experts,
+            // exactly as this block has always done it. This line is
+            // unchanged, which is what makes the off-arm a bit-identical
+            // network and a byte-identical parameter set.
+            //
+            // `moe_topk > 0`: the top-k restricted and RENORMALIZED weights
+            // (`moe::topk_blend`). The renormalization is what keeps the two
+            // arms at the same output magnitude - a top-1 token's gate is
+            // exactly 1.0, the same scale as the single shared FFN the A/B
+            // control runs - so the row compares specialization, not scale.
+            //
+            // The router is NOT a new module: the controller's expert columns
+            // already receive `h_ctx = h + iter_embed[row]` (`add_iter` above,
+            // the controller input at `cat([h_ctx, h0])`), so the selection is
+            // already a function of (position, pass) and the arm adds NO
+            // parameters. `probe::MOE_ROUTE` counts it (ADR-0011: an arm that
+            // cannot show it ran is the cardinal sin here).
+            let expert_logits = raw.slice([0..b * t, 3..3 + self.n_experts]);
+            let blend = if self.moe_topk > 0 {
+                crate::probe::note(crate::probe::MOE_ROUTE);
+                let (g, m, probs) = crate::moe::topk_blend(expert_logits, self.moe_topk);
+                lb_terms.push(crate::moe::lb_aux(&probs, &m, self.n_experts));
+                g
+            } else {
+                activation::softmax(expert_logits, 1)
+            };
+            // THE ROUTING SEAM (arXiv 2605.09165 §6.1). This is the weight
+            // vector the FFN branch multiplies each expert's output by, per
+            // EXECUTED iteration - the number the loop-routing question is
+            // asked of. Disarmed by default: one thread-local check, no sync,
+            // no allocation (`mixture_probe`'s module docs). It is recorded on
+            // the FIXED-mixture path because that is the baseline the routing
+            // arm is measured against; the arm records its routed weights on
+            // the same line, so "the metric changed" compares like with like.
+            crate::mixture_probe::record(&blend);
 
             // Shared attention. `normed` above is the block-body input:
             // RMSNorm of h_ctx, identity under GR (the read already
@@ -713,7 +778,21 @@ impl LoopBlock {
         }
         let rec = rec.div_scalar(b as f32); // mean over batch
         let kda = kda_s.unwrap_or_else(|| Tensor::zeros([1, 1, 1, 1], &h.device()));
-        (out_acc, rec, kda, mor_aux)
+        // The balancer is averaged over the iterations that ran, so it is a
+        // per-iteration quantity summed into one loss term - and it is the
+        // MEAN over what actually executed, which is the same rule every other
+        // average in this loop follows (a truncated run must not report the
+        // untruncated depth's statistics).
+        let moe_lb = if lb_terms.is_empty() {
+            None
+        } else {
+            let mut acc = lb_terms[0].clone();
+            for t in &lb_terms[1..] {
+                acc = acc + t.clone();
+            }
+            Some(acc.div_scalar(lb_terms.len() as f32))
+        };
+        (out_acc, rec, kda, RouteAux { mor: mor_aux, moe_lb })
     }
 
     /// Random-depth arm: run only the first `n` iterations. `None` restores

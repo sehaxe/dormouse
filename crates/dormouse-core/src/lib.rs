@@ -8,6 +8,8 @@ mod dspark_oracle;
 pub mod future_byte;
 pub mod gr;
 pub mod loop_block;
+pub mod mixture_probe;
+pub mod moe;
 pub mod model;
 pub mod mor;
 pub mod param;

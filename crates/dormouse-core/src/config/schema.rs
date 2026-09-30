@@ -81,6 +81,8 @@ fn d_engram_lam_max() -> f32 { 0.5 }
 fn d_false() -> bool { false }
 fn d_mor_k() -> usize { 2 }
 fn d_mor_bce_weight() -> f32 { 0.05 }
+fn d_moe_topk() -> usize { 0 }
+fn d_moe_lb_coef() -> f32 { 0.0 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DormouseConfig {
@@ -316,6 +318,61 @@ pub struct DormouseConfig {
     /// Weight of the MoR BCE auxiliary, whose label is the router's own top-k
     /// recomputed on the current batch every step.
     #[serde(default = "d_mor_bce_weight")] pub mor_bce_weight: f32,
+
+    // --- sparse expert routing over the loop's FFN branch ---
+    /// Selected experts per token, per loop pass. **0 = OFF**, which is the
+    /// existing dense softmax blend over all `n_experts` TSCT FFNs, unchanged
+    /// - so the default build's parameters and checkpoint are byte-identical
+    /// to a build from before this field existed, and queue row 1 (pure CE)
+    /// needs no re-baseline.
+    ///
+    /// One field rather than a `use_moe` bool plus a `k`: a bool and an
+    /// integer that can disagree leave a third state between them, and
+    /// `true, 0` is a config with no interpretation - the class `validate`
+    /// refuses elsewhere (see `mor_k`).
+    ///
+    /// **First configuration is `k = 1` at `n_experts = 4`, not 8-16 top-2.**
+    /// The 8-expert top-2 evidence sits at 168M+ active parameters; at
+    /// `small`'s 9.2M the per-expert token population is the thing to worry
+    /// about, and halving the expert count buys it. `k = 2` is the SECOND A/B
+    /// configuration, at the same active FFN compute.
+    ///
+    /// What it buys at this stage is SPECIALIZATION at equal active
+    /// parameters, not speed: every expert is still computed and then masked,
+    /// so executed FLOPs are unchanged. See `moe.rs`.
+    #[serde(default = "d_moe_topk")] pub moe_topk: usize,
+    /// Coefficient on the Switch/GShard load-balancing term (`moe::lb_aux`,
+    /// range `[1, n_experts]`, minimized at exactly 1 when routing is
+    /// uniform).
+    ///
+    /// **0.0 - OFF by default, and the ONLY legal zero position is with
+    /// `moe_topk = 0`.** Both mismatches are LOUD in `validate`:
+    /// `moe_lb_coef > 0` with routing off is a term with no selection to
+    /// balance (silently ignored, i.e. the `aux_fb_weight`-without-a-head
+    /// defect), and `moe_topk > 0` with `moe_lb_coef == 0` is a top-k router
+    /// with NO balancer, which collapses onto a few experts - after which
+    /// every pass selects the same expert and the arm is the dense mixture
+    /// with a worse gradient, invisibly, because the loss curve stays healthy.
+    ///
+    /// **The default is deliberately ZERO, and that is a MEASUREMENT, not a
+    /// shrug.** Switch's 0.01 and GShard's 0.1 were tuned against a token
+    /// population we do not have, so the coefficient was swept on a hostile toy
+    /// batch (`moe.rs`'s
+    /// `load_balance_sweep_is_measured_against_the_task_gradient`): at 64 tokens
+    /// the balancer needs coef ~220 to match the task gradient, and at 0.01 /
+    /// 0.1 the router ends 100% on one expert - exactly as it does with no
+    /// balancer at all. The cause is structural: Switch's `P_i` is a MEAN over
+    /// tokens, so the balancer's gradient per token shrinks as the batch grows
+    /// while the task's does not, and the matching coefficient scales with the
+    /// token count - to ~1.4e4 at the trainer's ~4096-token batch, where the
+    /// term's VALUE would be ~1e4 against a CE of ~5.5.
+    ///
+    /// So the standard Switch form does not transfer to our scale, no constant
+    /// is shipped, and `moe_lb_coef` stays 0.0 with the arm off. Making the
+    /// term's normalization token-count-invariant so a constant coefficient
+    /// WOULD transfer is the named follow-up. Numbers and method:
+    /// `research/reviews/moe-routing-2026-10-01.md` 6.2.
+    #[serde(default = "d_moe_lb_coef")] pub moe_lb_coef: f32,
 }
 
 impl Default for DormouseConfig {

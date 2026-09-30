@@ -108,6 +108,12 @@ fn execution_fields(c: &DormouseConfig) -> Vec<(&'static str, String)> {
         ("mor_bce_weight", c.mor_bce_weight.to_string()),
         ("max_iter", c.max_iter.to_string()),
         ("n_experts", c.n_experts.to_string()),
+        // The sparse-routing arm decides which expert each token uses on each
+        // pass, so it changes what the model IS, not how it is run: a config
+        // that differed only here would train a different network and this
+        // tuple would call it the same run.
+        ("moe_topk", c.moe_topk.to_string()),
+        ("moe_lb_coef", c.moe_lb_coef.to_string()),
         ("engram_lam_max", c.engram_lam_max.to_string()),
         ("engram_dim", c.engram_dim.to_string()),
         ("jepa_weight", c.jepa_weight.to_string()),
@@ -194,6 +200,10 @@ fn executes(name: &str) {
     arm(cfg.use_gr, probe::GR);
     arm(cfg.use_attnres, probe::ATTNRES);
     arm(fx.act_quant.is_some(), probe::ACT_QUANT);
+    // The sparse-routing arm. `moe_topk > 0` must show the selection ran once
+    // per executed iteration: a top-k that could not fill computes the dense
+    // blend, so the arm trains the control while its config says otherwise.
+    arm(fx.moe_topk > 0, probe::MOE_ROUTE);
     // The KDA state: with the arm on it is a real [b, heads, k, v] state; with
     // it off the loop substitutes a [b,1,1,1] placeholder. Shape, not a
     // counter, because it is the returned value the trainer persists.
@@ -213,7 +223,13 @@ fn executes(name: &str) {
     assert_eq!(probe::count(probe::JEPA), STEPS as u64 * jepa_on as u64, "{name}: JEPA ran with weight {}", cfg.jepa_weight);
     assert_eq!(probe::count(probe::DSPARK), STEPS as u64 * dspark_on as u64, "{name}: DSpark ran with weight {}", cfg.dspark_weight);
     assert_eq!(probe::count(probe::MOR_BCE), STEPS as u64 * cfg.use_mor as u64, "{name}: the MoR BCE ran with weight {}", cfg.mor_bce_weight);
-    let any_aux = jepa_on || dspark_on || cfg.use_mor;
+    // The routing balancer, counted where the term is ADDED. A non-zero
+    // coefficient with no selection is refused by `validate`, so this is a
+    // check that the term reached the objective rather than that a flag was
+    // spelled right.
+    let moe_on = fx.moe_lb_coef > 0.0;
+    assert_eq!(probe::count(probe::MOE_LB), STEPS as u64 * moe_on as u64, "{name}: the routing balancer ran with weight {}", fx.moe_lb_coef);
+    let any_aux = jepa_on || dspark_on || cfg.use_mor || moe_on;
     match (any_aux, &aux) {
         (true, Some(a)) => assert!(finite(a), "{name}: aux is not finite"),
         (true, None) => panic!("{name}: every aux weight is on but aux is None"),
