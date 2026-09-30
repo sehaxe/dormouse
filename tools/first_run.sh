@@ -40,9 +40,10 @@ if [ ! -x target/release/train ]; then
 fi
 
 LOG=/home/sehaxe/logs/first_run_${STEPS}_$(date +%m%d_%H%M).log
+CKPT=first_run_${STEPS}
 mkdir -p /home/sehaxe/logs
 UTIL=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null || echo '?')
-echo "preconditions OK: gpu=${UTIL}% ram=${AVAIL}G steps=${STEPS}"
+echo "preconditions OK: gpu=${UTIL}% ram=${AVAIL}G steps=${STEPS} ckpt=${CKPT}"
 echo "log: $LOG   (eval line prints its own byte window — quote it, §2.6)"
 
 exec systemd-run --user --scope -p MemoryMax=40G \
@@ -55,6 +56,7 @@ exec systemd-run --user --scope -p MemoryMax=40G \
     --seq-len 512 \
     --no-engram \
     --steps "$STEPS" \
+    --ckpt-name "$CKPT" \
     --guard \
     --detach \
     --timers \
