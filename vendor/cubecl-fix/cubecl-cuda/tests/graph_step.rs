@@ -89,6 +89,96 @@ fn launches() -> u64 {
     cubecl_cuda::launches()
 }
 
+/// What a launch costs, and what a replay of the same launches costs, **on this
+/// box**.
+///
+/// The whole lane is a bet that `L` launches cost more than one dispatch of the
+/// same `L` launches. This measures both sides of that bet without needing the
+/// trainer at all: a burst of trivial kernels (the launch cost, which in a
+/// launch-bound step IS the step) against a burst of replays of a graph holding
+/// the same count.
+///
+/// Reported, not asserted: this is a property of the machine and the driver, not
+/// a contract, and a number that moves between runs is information rather than a
+/// failure. The one thing asserted is that the graph really did contain the
+/// launches it claims — measured with the counter, so a graph that silently
+/// recorded nothing cannot make this look good.
+#[test]
+fn a_replay_costs_one_dispatch_not_n_launches() {
+    let _guard = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    const PER_PASS: usize = 2000;
+    const PASSES: usize = 20;
+    let client = client();
+
+    let p = client.create_from_slice(&zeros());
+    let delta = client.create_from_slice(&zeros());
+    let out = client.empty(BYTES);
+    let one = |client: &Client| {
+        sub_into::launch(
+            client,
+            CubeCount::Static(1, 1, 1),
+            CubeDim::new(client, N),
+            unsafe { BufferArg::from_raw_parts(p.clone(), N) },
+            unsafe { BufferArg::from_raw_parts(delta.clone(), N) },
+            unsafe { BufferArg::from_raw_parts(out.clone(), N) },
+        );
+    };
+
+    // Warm the compile and the pool, then drain.
+    for _ in 0..PER_PASS {
+        one(&client);
+    }
+    client.read_one(out.clone()).unwrap();
+
+    // ── N launches, one at a time ─────────────────────────────────────────
+    let before_launches = launches();
+    let t0 = std::time::Instant::now();
+    for _ in 0..PASSES {
+        for _ in 0..PER_PASS {
+            one(&client);
+        }
+    }
+    client.read_one(out.clone()).unwrap();
+    let launched = t0.elapsed().as_secs_f64();
+    let counted = launches() - before_launches;
+
+    // ── the same work as one graph ────────────────────────────────────────
+    client.graph_prepare().expect("graph_prepare");
+    client.start_capture().expect("start_capture");
+    for _ in 0..PER_PASS {
+        one(&client);
+    }
+    let graph = client.stop_capture().expect("stop_capture");
+    client.read_one(out.clone()).unwrap();
+    let inside = launches() - before_launches - counted;
+
+    let before_replays = launches();
+    let t1 = std::time::Instant::now();
+    for _ in 0..PASSES {
+        unsafe { graph.replay() }.expect("replay");
+    }
+    client.read_one(out.clone()).unwrap();
+    let replayed = t1.elapsed().as_secs_f64();
+
+    assert_eq!(
+        inside, PER_PASS as u64,
+        "the graph must contain the launches it was given, or this comparison \
+         is between two different amounts of work"
+    );
+    assert_eq!(launches() - before_replays, 0, "a replay launches no kernels");
+
+    let n = (PASSES * PER_PASS) as f64;
+    println!(
+        "on this box: {n} launches = {launched:.1}ms ({:.2} us/launch), \
+         {PASSES} replays of a {PER_PASS}-launch graph = {replayed:.1}ms \
+         ({:.2} us/replay, {:.2} us per contained launch) -> {:.1}x",
+        launched * 1e3 / n,
+        replayed * 1e3 / PASSES as f64,
+        replayed * 1e3 / n,
+        launched / replayed.max(1e-9),
+    );
+}
+
 /// The instrument, self-validated: `n` launches move the counter by exactly `n`
 /// (after a drain, so the server thread has executed them).
 #[test]
