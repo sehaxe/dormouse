@@ -1,0 +1,58 @@
+# e2m1 grid and TIE RULE -- GENERATED, do not hand-edit.
+# generator: tests/oracle/gen_e2m1_oracle.py
+# upstream: https://github.com/pytorch/ao
+# commit:   3972ed015091f659418dedf12edb980a8ca56b53  (2026-09-25)
+# file 1:   torchao/prototype/mx_formats/fp_format_spec.py
+#           float4_e2m1_interesting_values  (the OCP MX FP4 grid,
+#           spec section 5.3.2, cited by URL in that file)
+# file 2:   torchao/prototype/mx_formats/mx_tensor.py::to_mx
+#           torchao's real block quantizer -- it decides the TIE RULE
+# torch:    2.14.0+cpu  (CPU)
+# spec:     https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf
+#
+# grid.magnitudes: the eight positive e2m1 levels, ascending.
+# 0.75 is ABSENT -- it is not a level of the format (AGENTS.md 3.2).
+# grid.tie_X: torchao's own answer at interior tie X.
+# grid.tie_X_rne: what round-half-to-EVEN gives, for comparison.
+# grid.tie_X_ties_up: what our `mask_fill(a >= lo)` gives.
+
+meta.torchao_commit: 3972ed015091f659418dedf12edb980a8ca56b53
+meta.torch_version: 2.14.0+cpu
+meta.scale: 1
+grid.magnitudes: 0 0.5 1 1.5 2 3 4 6
+grid.count: 8
+grid.has_0.75: no
+grid.subnormal: 0.5
+
+grid.tie_0p25: 0
+grid.tie_0p25_rne: 0
+grid.tie_0p25_ties_up: 0.5
+grid.tie_0p25_agrees: NO
+grid.tie_0p75: 1
+grid.tie_0p75_rne: 1
+grid.tie_0p75_ties_up: 1
+grid.tie_0p75_agrees: yes
+grid.tie_1p25: 1
+grid.tie_1p25_rne: 1
+grid.tie_1p25_ties_up: 1.5
+grid.tie_1p25_agrees: NO
+grid.tie_1p75: 2
+grid.tie_1p75_rne: 2
+grid.tie_1p75_ties_up: 2
+grid.tie_1p75_agrees: yes
+grid.tie_2p5: 2
+grid.tie_2p5_rne: 2
+grid.tie_2p5_ties_up: 3
+grid.tie_2p5_agrees: NO
+grid.tie_3p5: 4
+grid.tie_3p5_rne: 4
+grid.tie_3p5_ties_up: 4
+grid.tie_3p5_agrees: yes
+grid.tie_5: 4
+grid.tie_5_rne: 4
+grid.tie_5_ties_up: 6
+grid.tie_5_agrees: NO
+
+grid.torchao_is_round_half_to_even: yes
+grid.ties_where_ours_differs: 4
+grid.ties_where_ours_differs_list: 0.25 1.25 2.5 5
