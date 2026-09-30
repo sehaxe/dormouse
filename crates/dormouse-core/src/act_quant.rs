@@ -133,10 +133,35 @@ where
     // to 6.0 at [5.0, ...), which saturates. Below 0.25 no threshold fires and
     // the value stays zero. A two-sided mask would be the same thing spelled
     // with a Bool AND; the thresholds are already monotonic.
+    //
+    // TIES GO TO THE EVEN CODE, and that is a fix rather than a detail.
+    // The format is round-half-to-EVEN (IEEE 754's rule, which the hardware
+    // MX-FP4 conversion follows), so at a midpoint the value is the one whose
+    // CODE is even - and "even" alternates along the ladder, so no single
+    // `>` or `>=` expresses it. The old code used `>=` everywhere, i.e.
+    // ties-UP, which disagrees with the reference at 4 of the 7 interior ties:
+    //   0.25 -> 0.0   (ref)  vs 0.5   (ours)   i=1 odd  -> take the LOWER
+    //   0.75 -> 1.0   (ref)  vs 1.0   (agree)   i=2 even -> take the UPPER
+    //   1.25 -> 1.0   (ref)  vs 1.5   (ours)   i=3 odd
+    //   1.75 -> 2.0   (ref)  vs 2.0   (agree)   i=4 even
+    //   2.5  -> 2.0   (ref)  vs 3.0   (ours)   i=5 odd
+    //   3.5  -> 4.0   (ref)  vs 4.0   (agree)  i=6 even
+    //   5.0  -> 4.0   (ref)  vs 6.0   (ours)  i=7 odd  - a 50% error, at the
+    //                        top of the range where the block scale puts the
+    //                        most-used values.
+    // Measured against torchao's real MX-FP4 quantiser (`pytorch/ao@3972ed01`)
+    // by `crates/dormouse-core/tests/e2m1_oracle.rs`.
     let mut val = Tensor::zeros(dims, &device);
     for (i, level) in E2M1.iter().enumerate().skip(1) {
         let lo = 0.5 * (E2M1[i - 1] + level);
-        val = val.mask_fill(a.clone().greater_equal_scalar(lo), *level);
+        // i is the index of the UPPER level, i.e. the code we would claim.
+        // Even code -> claim it on a tie (`>=`); odd -> leave it (`>`).
+        let claimed = if i % 2 == 0 {
+            a.clone().greater_equal_scalar(lo)
+        } else {
+            a.clone().greater_scalar(lo)
+        };
+        val = val.mask_fill(claimed, *level);
     }
     sign.mul(val)
 }
@@ -211,10 +236,17 @@ mod tests {
             .iter()
             .map(|v| {
                 let a = v.abs();
-                // Nearest level, ties to the LOWER magnitude.
+                // Nearest level, TIES TO THE EVEN CODE - the format's own rule
+                // (IEEE round-half-to-even, which the hardware MX-FP4
+                // conversion follows), NOT "ties to the lower". The two differ
+                // at 4 of the 7 interior ties and this test previously encoded
+                // the wrong one, so it agreed with a `>=` ladder that disagrees
+                // with torchao's quantiser at 5.0 by 50 %. Verified end to end
+                // against the real thing in tests/e2m1_oracle.rs.
                 let mut best = 0.0f32;
-                for l in E2M1.iter().skip(1) {
-                    if a >= 0.5 * (best + l) {
+                for (i, l) in E2M1.iter().enumerate().skip(1) {
+                    let claim = a >= 0.5 * (best + l);
+                    if claim && (i % 2 == 0 || a > 0.5 * (best + l)) {
                         best = *l;
                     }
                 }
