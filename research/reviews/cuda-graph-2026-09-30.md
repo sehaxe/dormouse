@@ -306,11 +306,9 @@ order being LIFO, with no mechanism behind it, and pinning costs one launch per
 parameter per step and is *provably* right (bit-exact over 8 steps). Where a bet
 and a proof cost the same order of magnitude, take the proof.
 
-## 9. What is still missing, and it is the number that decides the lane
+## 9. What is still missing: `L`, the launch count of a real step
 
-**The launch count of a real training step, per stage.** The counter is in and
-self-validated; nothing has read it on the trainer. That number decides the
-whole lane, because the design is now:
+`L` decides the lane, because the design is now:
 
 ```
 cost of the graph  = P copies   (P = parameter tensors, one per parameter per step)
@@ -322,28 +320,63 @@ and **P is knowable from the module tree while L is not**. If `L` is in the
 hundreds the pin eats the win and this lane is a null; if `L` is in the tens of
 thousands it is the biggest speedup available on this box.
 
-Not done, and why: a cold `dormouse-train --features cuda` build needs ~40 GB
-(`vendor/burn-fused/target` alone is 37 GB) and `/home` has **17 GB free**
-(97% used). The instrument build that did fit is 6.2 GB, in the vendored
-cubecl workspace, which is where these results come from. So the trainer-side
-flag is written but **unbuilt and unmeasured**; landing it as measured needs a
-machine with the disk, or a freed worktree target.
+**State: instrumented, protocol written, number not taken.** The counter is wired
+into the timer line (`cubecl_launches()`, §11) and the run that reads it is one
+command. What blocked it, in order, and none of it is the mechanism:
+
+| blocker | what happened |
+|---|---|
+| disk | `/home` is at 97% with 16-17 GB free; the vendored cubecl build that produced §8 is 6.2 GB, and a cold `dormouse-train` CUDA build does not fit. Worked around by pointing `CARGO_TARGET_DIR` at the 1.8 TB data mount (673 GB free, 2.5 GB used by the release build). |
+| the wrong feature | the first release build came out on `Flex(Cpu)` — `dormouse-cli`'s default is `cpu`, not `cuda` — and printed `launches=0`, which is the honest answer off CUDA and would have read as "the instrument is broken". The repo already had the right invocation in `.cargo/config.toml` (`build-probe`). |
+| the shared card | §1.5's "one GPU process at a time" is being honoured by six other lanes running A/B arms back-to-back; this lane's run is 3 minutes and is queued for a gap. |
+| the build lock | six lanes queued behind one CPU test holding the lock for 36 min. The lock is doing its job (no build storm) at the cost of a lane whose whole point is the card. |
+
+**`L` is unaffected by GPU contention** — it is a count of launches and the launch
+structure does not depend on what else is on the card. The ms figures would be,
+so they are quoted only from runs with a quiet card.
 
 The honest summary of the lane so far: the mechanism is **proven to work and
 proven to be unsafe without a pin**; the size of the win is **unmeasured**, and
 it is one `cubecl_cuda::launches()` sample away on a card that is free.
 
-## 10. Reproduction
+## 10. The measurement protocol (fixed BEFORE the number, so it cannot be argued with later)
+
+Same shape as the control, on a free card, one process at a time, **release**:
+
+```
+--preset small --batch 8 --seq-len 512 --no-engram --timers --log-every 100 --steps 300
+```
+
+- **step 0 is excluded from every number.** It is 17 s against a 0.5 s warm step
+  and its launch count carries the autotuner's own candidate benchmarking
+  (`CUBECL_AUTOTUNE_LEVEL` moves it), so `L` is read as
+  `(launches@300 − launches@100) / 200` — the count between two warm steps.
+- `L` is cumulative-since-start, so the per-step figure is a **difference of two
+  timer lines**, not a rate. That is why the timer prints the raw count.
+- the pin's price `P` is one launch per parameter tensor, from the same run.
+
+## 11. Reproduction
 
 ```bash
+# the mechanism, the instrument and the escapes (needs the card)
 cd vendor/cubecl-fix
 /home/sehaxe/dormouse/tools/build_lock.sh run graph -- cargo test -p cubecl-cuda --test graph_step -- --test-threads=1 --nocapture
 /home/sehaxe/dormouse/tools/build_lock.sh run graph -- cargo test -p cubecl-cuda --test graph -- --test-threads=1
+
+# L, the number that decides the lane (release + the cuda feature, quiet card)
+cargo build-probe          # debug: launches are right, timings are not
+D=/mnt/e43497ab-0ff2-45b4-b45f-28de3339a53e/aria_data/pretrain
+./target/release/train --data $D/real --eval $D/real_eval --eval-every 100000 \
+  --preset small --batch 8 --seq-len 512 --no-engram \
+  --steps 300 --log-every 100 --ckpt-name lcprobe- --timers --seed 1 2>&1 | grep timer
+# L = (launches@300 - launches@100) / 200.  Step 0 is excluded: its count
+# carries the autotuner's own candidate benchmarking.
 ```
 
-Four tests, each owning one thing: `launch_counter_counts_every_launch` (the
-instrument against itself), `one_graph_every_step_is_reported_not_asserted` (the
-divergence, reported with a computed oracle), `recapturing_needs_the_old_graph_destroyed_and_a_fresh_prepare`
-(the lifecycle contract, both refusals), and
-`a_pinned_parameter_is_address_stable_and_costs_one_copy` (the escape that
-works, and its price).
+Four probe tests, each owning one thing: `launch_counter_counts_every_launch`
+(the instrument against itself), `one_graph_every_step_is_reported_not_asserted`
+(the divergence, reported with a computed oracle),
+`recapturing_needs_the_old_graph_destroyed_and_a_fresh_prepare` (the lifecycle
+contract, both refusals), and
+`a_pinned_parameter_is_address_stable_and_costs_one_copy` (the escape that works,
+and its price).
