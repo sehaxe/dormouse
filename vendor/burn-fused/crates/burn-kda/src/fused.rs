@@ -6,7 +6,7 @@
 //!   b              = beta_k            (erase strength, key channels)
 //!   w_gate         = beta_v            (write strength: KDA's pseudo-value is
 //!                                       U = (I+T')^{-1}(β⊙V), NOT V)
-//!   scale          = 1                 (no softmax scale in KDA)
+//!   scale          = 1                 (see the OPEN note below)
 //! With those inputs, `chunk_wy_forward` computes exactly
 //!   A  = Tril((Q⊙Γ)(K/Γ)^T)
 //!   W  = (I + T')^{-1}(β⊙Γ⊙K),  U = (I + T')^{-1}(β⊙V)
@@ -15,6 +15,37 @@
 //!
 //! The kernel is only used on the bare CUDA `CubeBackend`; everything else
 //! falls back to the tensor-ops chunk path.
+//!
+//! # `scale = 1` here is OPEN, and the reason this file used to give for it was FALSE
+//!
+//! This file said "no softmax scale in KDA". That is **false against both
+//! upstreams**:
+//!
+//! - `fla/ops/kda/chunk.py:474-475` and `fla/ops/kda/fused_recurrent.py:261-262`
+//!   both contain `if scale is None: scale = K ** -0.5`;
+//! - `fla/layers/kda.py:262-278` calls `chunk_kda(...)` with **no `scale`
+//!   argument**, so the official KDA layer runs at `head_k_dim**-0.5`;
+//! - `fla/ops/kda/naive.py:57` folds it into `q` before the recurrence loop.
+//!
+//! `burn-gdn2` itself does use `d_k**-0.5` (`gdn2/src/module.rs:299`); burn-kda
+//! is the only place in the library that overrides it to `1.0`.
+//!
+//! WHY THE MODEL HAS NOT NOTICED: the factor enters only the read `o = q·S`, so
+//! it is one constant on the attention output, and the very next thing this
+//! crate does is `KdaModule::output`'s RMSNorm, which is invariant to a
+//! constant rescale — `c·o / sqrt(mean((c·o)²) + eps) = o / sqrt(mean(o²) +
+//! eps/c²)` — so it is absorbed to `O(eps / mean(o²))` ≈ `O(1e-5)`. That is
+//! exactly why no loss curve, seed comparison or in-crate test can see it, and
+//! also why it is still real: anything reading the raw attention output sees a
+//! tensor `head_k_dim**0.5` too large (2.83× at K=8, 8× at K=64).
+//!
+//! The mechanism is not missing — `chunk_wy_forward` honours the scale when
+//! asked, and `tests/kda_oracle.rs::chunked_wy_honours_the_read_scale_when_asked`
+//! is green against FLA's own default-scale row. Only the ARGUMENT is. Two
+//! tests carry this as RED ON PURPOSE (`read_scale_matches_fla_reference`,
+//! `chunked_wy_applies_no_read_scale`). Changing `1.0` moves every number
+//! derived from this crate, so it is the owner's call.
+//! `research/papers/kda-formula-audit-2026-09-30.md` §3.2.
 
 #[cfg(feature = "cuda")]
 pub mod cuda {
