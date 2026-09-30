@@ -60,22 +60,24 @@
 //     the reader to read the number out of `ref_f64.rs`'s own run output. It
 //     cannot: that test is RED and panics at case 1, so the line is never
 //     printed. A claim a reader cannot get to is not a measurement.)
-//   * the nearest wrong formula. `tests/ref_f64_faults.bin` carries the SEVEN
+//   * the nearest wrong formula. `tests/ref_f64_faults.bin` carries the EIGHT
 //     wrong formulas for the same weights and input, and
 //     `ref_f64.rs::the_bar_bites_a_wrong_formula` asserts our output is at
 //     least `SEMANTIC_FLOOR = 1e-1` from every one of them on every run - so
 //     the bar cannot rot into a self-consistency check. Re-measured over THIS
-//     1000-case sweep (all seven faults, all 1000 cases, `python3 -
+//     1000-case sweep (all eight faults, all 1000 cases, `python3 -
 //     ` equivalent of `gdn2_forward(x, P, fault)`), the smallest margin is
-//     3.909822e-01 relative - `no-erase-gate` at T=8 - i.e. 391x above the bar.
-//     Per fault, worst over the sweep: decay-sign 2.34e+00, transposed-proj
-//     3.30e+00, no-write-gate 1.02e+00, no-erase-gate 3.91e-01,
-//     read-before-write 1.54e+00, conv-padding 4.94e+00, no-scale 2.69e+00.
+//     4.084390e-01 relative - `output-gate-sigmoid` at T=2 - i.e. 408x above
+//     the bar. Per fault, worst over the sweep: conv-padding 4.94e+00 (T=1),
+//     transposed-proj 3.30e+00 (T=1), no-scale 2.69e+00 (T=1), decay-sign
+//     2.06e+00 (T=36), read-before-write 1.51e+00 (T=2), no-write-gate
+//     1.02e+00 (T=1), no-erase-gate 5.27e-01 (T=35), output-gate-sigmoid
+//     4.08e-01 (T=2).
 //
 // IS 1e-3 RELATIVE A TIGHTENING? Yes, and the old number for the record:
 // `EPSILON = 5e-4` ABSOLUTE against `ref_data.bin`, whose output scale was
 // ~1e-2 - about 5% of the signal. This sweep's per-case output scale runs
-// 3.93e-02 (min) / 3.21e-01 (median) / 5.35e-01 (max), so 1e-3 relative is
+// 3.93e-02 (min) / 3.29e-01 (median) / 5.49e-01 (max), so 1e-3 relative is
 // 3.9e-05 ABSOLUTE on the worst-conditioned case - about 13x tighter than the
 // 5e-4 it replaces, and ~3200x tighter in relative terms. No tolerance was
 // widened anywhere in this change. The conditioning is not luck: the fixture
@@ -96,85 +98,100 @@
 // per-channel decay). Three layers, each with a different blind spot; this one
 // is the breadth, not the coverage.
 //
-// REGENERATE, AND HOW TO KNOW IT IS THE SAME BYTES.
-//     cd vendor/burn-fused/crates/burn-gdn2
+// REGENERATE, AND HOW TO KNOW IT IS THE SAME BYTES - BY RUNNING THE CHECKER,
+// NOT BY `git diff`. The recipe this file used to print was
 //     python3 tools/gen_reference_f64.py --broad
 //     git diff --exit-code -- tests/ref_f64_broad.bin    # must be empty
-// The generator is f64 NumPy with a splitmix64 + Box-Muller RNG, so it needs
-// numpy but no torch and no GPU; the committed bytes were produced by
-// `python3 tools/gen_reference_f64.py --broad` at numpy 2.5.3 and reproduced
-// byte-identically on a re-run. Unlike the deleted f32 generator this one CAN
-// be regenerated only against an f64 implementation, which is the point.
+// and it was WRONG. The generator is f64 NumPy with a splitmix64 + Box-Muller
+// RNG (numpy but no torch, no GPU) and the f32 weights and inputs DO reproduce
+// bit-exactly, so that half of the claim was fine. The f64 OUTPUTS do not: they
+// are numpy reductions whose summation order depends on the array's memory
+// layout, so a correct regeneration lands within ~7e-16 relative of the
+// committed bytes rather than on them. Measured against all three committed
+// f64 fixtures: `ref_f64.bin` <= 9.7e-16, `ref_f64_faults.bin` <= 4.4e-15. So
+// `git diff --exit-code` FAILS on a correct regeneration, and the person
+// following it learns to ignore it - which is one of the two ways this fixture
+// went stale for a day without anyone noticing.
 //
-// ======================= STATUS: RED, AND IT IS NOT THE RETARGET ============
+//     cd vendor/burn-fused/crates/burn-gdn2
+//     python3 tools/check_f64_fixtures.py
 //
-// The retarget is done. The suite is RED because it found a REAL, PRE-EXISTING
-// defect the moment it was pointed at an oracle that is not our own algorithm,
-// and that is the layer doing its job. Nothing here is skipped, ignored or
-// widened, and the bar is the f64 layer's own 1e-3, unchanged.
+// That is the check, and it runs in `tools/lib_gate.sh`. It regenerates all
+// three f64 fixtures into a temp dir and compares: weights and inputs must be
+// bit-identical (they come off a deterministic stream, so any difference is a
+// changed input), outputs to `OUT_TOL = 1e-12` - 3.6x above the worst observed
+// round-off and 4.1e+11 below the smallest wrong formula, i.e. with margin on
+// both sides. It is not a byte-diff because a byte-diff is not a measurement
+// of anything.
 //
-// MEASURED, this tree, `cargo test --release -p burn-gdn2 --features
-// binary-tests --test oracle_breadth --test oracle_chunk`:
-//     FusedRecurrent: worst 8.9402e-01 rel at T=3, 976/1000 cases over the bar
-//     Chunk (4/8/16/32/64): the same, worst 8.9402e-01 at T=3
-//     first failing case: 1 (T=3), 1.851e-01 rel
+// ======================== STATUS: IT WAS THE FIXTURE ==========================
 //
-// PRE-EXISTING, PROVEN BY REBUILDING THE BASE. `git stash` of every change in
-// this commit, same worktree, then
-// `cargo test --release -p burn-gdn2 --test ref_f64`:
-//     FAILED - FusedRecurrent case 1 (T=2): max relative deviation 9.227e-02
-// That is `dbfa4ca` with none of this work in it. The f64 layer's own test was
-// already red before this commit, and its header said so ("STATUS: RED"); the
-// two `binary-tests` tests were red for the separate, already-explained reason
-// in `0a6998a` (a stale fixture), which is what this commit removes.
+// This suite was red, and the reason recorded here for a day was WRONG. The
+// previous version of this block said it was red because it had "found a REAL,
+// PRE-EXISTING defect" in the state carry, and it pointed at a hand-dumped T=2
+// carry and at a probe of the readout. There is no such defect. The 1000-case
+// fixture had stopped being the output of its own generator, and the deviation
+// the whole investigation was measuring was the FIXTURE's, not the kernel's.
 //
-// WHERE THE DEFECT IS, TO THE MEASUREMENT. `tools/gen_reference_f64.py
-// --diff-stages` against `examples/ref_f64_stages.rs`, case 0 (T=1) and case 17
-// (T=70), 21 stage rows, all relative:
+// `ca45600` changed one line of the f64 generator's maths:
 //
-//     stage            T=1         T=70
-//     raw_q/k/v_proj   1.4-2.2e-07 2.2-3.3e-07
-//     q/k/v_conv       1.7-2.9e-07 1.4-1.9e-07   <- the pad, see below
-//     f0 f1 gp0 gp1    1.0-2.7e-07 1.0-2.7e-07
-//     g_recomputed     1.2e-07     2.9e-07
-//     a_exp dt_bias A_log 1.5e-08 - 2.7e-07
-//     q4d k4d g4d b4d v4d w4d gate4d  1.3-5.2e-07  1.6-3.9e-07
+//     -    g = g.T.reshape(H, t, HK)                     # head-major
+//     +    g = g.T.reshape(t, H, HK).transpose(1, 0, 2)  # token-major, then [H,T,HK]
 //
-// So EVERY stage of `project` - all seven per-head 4-D tensors included - is
-// right, and the defect is downstream of it. The per-head rows did not exist
-// before this commit: `diff_stages` compared only 2-D and 1-D stages, so the
-// diagnostic was blind to every per-head tensor, which is exactly where a
-// head-layout or GVA-repeat defect would live. The reason is in the example's
-// header - burn 0.22.0-pre.4 has no `contiguous()`, and an elementwise op is
-// the only way to force a dense readback out of a permuted view.
+// That is the `ff7cd57` defect described in the same commit's own comment
+// block - a head-major reshape of a token-major buffer, identical at t == 1 and
+// wrong at every t > 1. The commit regenerated `ref_f64.bin` and
+// `ref_f64_faults.bin` and did NOT regenerate `ref_f64_broad.bin`. One fixture
+// of the three was left holding the bug. Nothing in the tree could notice:
+// there was no check that a fixture matches its generator, and the only recipe
+// on record (`git diff --exit-code`) fails on a CORRECT regeneration too.
 //
-// THE CONV PAD FIX IS CONFIRMED CORRECT, which was the open question.
-// `0a6998a` changed `src/short_conv.rs` from replicate to zero padding and
-// `ref_f64.rs`'s header still carries the pre-fix numbers. Re-measured against
-// the f64 ZERO-pad oracle at both lengths: q_conv 1.683e-07 / 2.884e-07
-// (k_conv), v_conv 2.371e-07 at T=1, where the old table read 3.0e+00, 1.4e+00
-// and 2.0e+00. The fix is right; the fixture that disagreed with it was wrong.
+// PROOF, both directions, neither needing a GPU or a build.
+//   * Re-run the current generator and diff against the committed bytes: the
+//     WEIGHTS and INPUTS are bit-identical (max |A-B| = 0.0 across all 1000
+//     cases) and only the outputs move.
+//   * Re-run the generator with that ONE line reverted and diff again: all 1000
+//     cases agree to 4.1e-16 .. 9.7e-16 RELATIVE, i.e. f64 round-off. The
+//     committed `ref_f64_broad.bin` IS the pre-`ca45600` generator's output, to
+//     the last bit it can be pinned to.
+//   * `python3 tools/check_f64_fixtures.py` names it unaided: `ref_f64.bin` OK,
+//     `ref_f64_faults.bin` OK, `ref_f64_broad.bin` STALE - "OUTPUTS DIFFER:
+//     worst 8.940234e-01 rel at case 715 (T=3)".
 //
-// NOT YET LOCALISED, AND ONE NUMBER I DO NOT TRUST. Per token, over the 18-case
-// matrix: token 0 is always right (3.07e-07 at T=1 down to 3.49e-08 at T=64) and
-// every token from 1 on is O(1) wrong - so the fault is in the state carry, not
-// in `project` and not in the per-token output stage (which is pointwise in T,
-// and token 0 exercises it). Exactly 24 of the 1000 cases pass and they are
-// exactly the T=1 ones (`i % 42 == 0`), where `S` starts at zero and no carry
-// exists.
+// THE PREVIOUS BLOCK'S OWN NUMBERS WERE THE FIXTURE'S, TO FIVE FIGURES, AND
+// THAT IS WHAT SOLD THE MISDIAGNOSIS. Current generator vs the stale committed
+// bytes, all 1000 cases:
 //
-// Dumping the carry's four sub-steps by hand for T=2 (decay, erase, `v_new`,
-// and the resulting `S`), all four agree to <= 4.6e-07 at EVERY step, the
-// final `S` included - which leaves the readout as the only remaining suspect
-// and is by elimination, not by measurement. A separate probe that called the
-// crate's own `fused_recurrent_forward` reported a final state 1.34e-01 off on
-// the same input, which contradicts that and which I could NOT REPRODUCE. I am
-// not claiming either number. The next measurement a follow-up should make is
-// the readout `(state * q_t.swap_dims(2, 3)).sum_dim(2)` with a raw (NOT
-// squared) readback of `q_t`, because the probe that was supposed to settle it
-// squared before `sqrt` - which recovers `|x|`, not `x`, and made every signed
-// row read O(1). That is the bug in the probe, and it is why this header claims
-// no line.
+//     cases over BAR 1e-3:  976/1000                  <- its "976/1000 over the bar"
+//     worst                  8.940234e-01 at T=3      <- its "worst 8.9402e-01 at T=3"
+//     first failing case     1 (T=3), 1.851e-01 rel   <- its "case 1 (T=3), 1.851e-01"
+//     cases that pass        exactly the 24 with i % 42 == 0, all T=1
+//                                                          <- "exactly 24 of the 1000
+//                                                              cases pass and they are
+//                                                              exactly the T=1 ones"
+//
+// All four are properties of the stale fixture, and a throwaway harness reading
+// that same fixture reproduced all four while being read as a kernel
+// measurement. The T=1 coincidence is the fingerprint of the defect CLASS: a
+// head-major and a token-major split index identically at t == 1, so precisely
+// the degenerate cases agreed - which is what made a layout bug present as a
+// state-carry bug, and why "the fault is in the carry, `project` is clean" was
+// consistent with the evidence available and wrong anyway.
+//
+// PRODUCTION IS RIGHT. `src/module.rs`'s `to_4d` is
+// `reshape([b, tt, n, d]).permute([0, 2, 1, 3])` - token-major split, then
+// permute - i.e. the FIXED form, and the whole recurrence
+// (`src/kernel/fused_recurrent.rs`) transcribes Eq. 9/10 with the readout from
+// the state AFTER the write. Against the regenerated fixture this file is green.
+//
+// `0a6998a` IS EXONERATED AND WAS NEVER INVOLVED, and both facts are readable
+// in the source without running anything. Its GVA half lives inside
+// `if hv > h` and this fixture is H=4, HV=4, so that block never executes; its
+// conv-pad half moved production TOWARD this fixture (replicate -> zeros, and
+// the generator has zero-padded since `8162672`), so reverting it moves away.
+// The revert-scratch that would have settled it was never needed, and the
+// "T < kernel width" reading of the T=3 failure was a coincidence: T=3 is simply
+// the first case in the sweep, and the failing region is every T > 1.
 //
 // burn-ndarray is deprecated upstream; kept as the CPU test backend until the
 // burn-flex migration.
@@ -184,36 +201,48 @@
 // A test nobody has seen fail is the defect class this whole layer exists to
 // kill, so here is the number from each side, from commands in this repo.
 //
-// 1. REINTRODUCE THE PAD BUG. In `src/short_conv.rs`, the `None =>` arm of the
-//    cache match, replace the zero pad with the pre-`0a6998a` replicate:
+// 1. STALE FIXTURE - the side that was actually exercised, and the one that
+//    went unnoticed for a day. Revert the one generator line named in the
+//    STATUS block (`g.T.reshape(H, t, HK)`) and re-run
+//    `python3 tools/check_f64_fixtures.py`; it reports
+//        ref_f64.bin        OK
+//        ref_f64_faults.bin OK
+//        ref_f64_broad.bin  STALE - worst 8.940234e-01 rel at case 715 (T=3)
+//    and the test's own first failure reproduces at its documented value:
+//        case 1 (T=3): max relative deviation 1.851e-1 >= BAR 1e-3
+//                     (output scale 1.201e-1, i.e. 2.223e-2 absolute)
+//    976 of 1000 cases over the bar, and the 24 that pass are exactly the
+//    T=1 ones. Restoring the line and regenerating turns it green, and prints:
+//
+//        FusedRecurrent vs the f64 oracle, 1000 cases: worst 8.512e-07 rel at
+//        T=3 (scale 1.110e-1, 9.451e-08 abs) against BAR 1e-3
+//
+//    i.e. 1.851e-01 -> 8.512e-07, a factor of 2.2e5, and the remaining 8.5e-07 is
+//    f32 rounding (the same band the stage diffs in `ref_f64.rs` measure).
+//
+// 2. REINTRODUCE THE PAD BUG - the direction that proves the pad is still
+//    covered. In `src/short_conv.rs`, the `None =>` arm of the cache match,
+//    replace the zero pad with the pre-`0a6998a` replicate:
 //        let pad = Tensor::zeros([b, SHORT_CONV_CACHE, c], &x.device());
 //    ->
 //        let pad = x.clone().slice([0..b, 0..1, 0..c])
 //            .expand([b, SHORT_CONV_CACHE, c]);
-// 2. MEASURE, worst relative deviation over all 1000 cases, FusedRecurrent and
-//    Chunk/4, on the same fixture:
-//
-//        correct zero pad (this tree)   worst 8.9402e-01 at T=3   976/1000 over
-//        replicate pad injected         worst 4.9448e+00 at T=1  1000/1000 over
-//
-//    and the tests' own first failure moves with it:
-//        correct   -> case 1 (T=3), 1.851e-01 >= BAR 1e-3
-//        injected  -> case 0 (T=1), 1.164e+00  >= BAR 1e-3
-//
-//    Two things to notice, because both are the point. The magnitude goes up
-//    5.5x, and the FIRST FAILING CASE MOVES TO T=1 - the 24 cases the
-//    pre-existing state-carry defect leaves passing are exactly the ones that
-//    catch the pad, so a sweep that only ever reported "976/1000" would have
-//    hidden a whole error class at T=1. `4.9448e+00` also matches, to five
-//    figures, what the f64 generator predicts for its `conv-padding` fault
-//    measured over the same 1000 cases in Python (4.944795e+00), which is an
-//    independent check that the fault model and the test agree.
-// 3. RESTORE. `git checkout -- src/short_conv.rs` (or keep a copy before step 1;
+//    then measure, worst relative deviation over all 1000 cases:
+//        correct zero pad       worst 8.512e-07 at T=3        0/1000 over the bar
+//        replicate pad injected worst 4.9448e+00 at T=1      1000/1000 over
+//    and the test's own first failure moves to case 0 (T=1) at 1.164e+00, i.e.
+//    T=1 - the 24 degenerate cases a layout bug cannot touch are exactly the
+//    ones that catch the pad, so a sweep that only ever reported a count would
+//    have hidden a whole error class. `4.9448e+00` matches, to five figures,
+//    what the f64 generator predicts for its `conv-padding` fault over the same
+//    1000 cases in Python (4.944795e+00), which is an independent check that
+//    the fault model and the test agree.
+// 3. RESTORE. `git checkout -- src/short_conv.rs` (or keep a copy before step 2;
 //    do not leave the injected pad in a commit).
 //
 // The same demonstration for `tests/oracle_chunk.rs` needs no second run: it
 // reads the same fixture with the same bar through the same `build`, and the
-// Chunk numbers above were taken in the same two builds.
+// Chunk numbers above were taken in the same builds.
 #![allow(dead_code, deprecated)]
 
 include!("common/ref_f64.rs");
