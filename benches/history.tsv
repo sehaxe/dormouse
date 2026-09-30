@@ -136,3 +136,5 @@ date	commit	mode	step	throughput	mem	final-ce
 2026-09-29T17:40:00Z	feaf0da	warm-batch8-retract-per-factor	265ms	15.5Ktok/s	res=n/a	ce=3.236
 2026-09-29T17:41:00Z	feaf0da	warm-batch8-retract-batched	221ms	18.5Ktok/s	res=n/a	ce=3.232
 2026-09-30T16:20:08Z	48048ed	control-full-arch-small-b8-s512	~480ms-warm (idx 1500-1900; step0=22354ms autotune)	~65KB/s (8.19MB/2000 steps)	res=n/a	ce=2.676-best/eval-bpb=6.418@500,6.531@1000,6.387@1500 window=81920B seed=1 preset=small params=9197454(incl engram rows) aux=jepa0.05+koleo quant=fp8 opt=muon+ lr=cos1e-4 0NaN 0panics log=~/logs/first_run_2000_0930_1855.log ckpt=checkpoints/first_run_2000.best.bin
+2026-09-30T17:46:32Z	0e9817b	arm-A0-pure-CE-jepa0-dspark0	~480ms-warm	bid: 8.19MB/2000 steps	res=n/a	ce=2.666-best/eval-bpb=6.492@500,6.589@1000,6.437@1500 window=81920B seed=1 log=~/logs/first_run_2000_0930_1921.log ema=0.0ms confirms teacher off
+2026-09-30T17:46:32Z	0e9817b	arm-retract-every-4	~480ms-warm(retraction steps)/~461ms-avg	bid: 8.19MB/2000 steps	res=n/a	ce=2.659-best/eval-bpb=6.426@500,6.463@1000,6.329@1500 window=81920B seed=1 log=~/logs/first_run_2000_0930_1940.log retr_arm=factor:126@500 proves cadence 0NaN
