@@ -1,0 +1,63 @@
+==============================================================================
+STAGE 1 -- their offline stage, module default (as shipped at HEAD)
+==============================================================================
+  t=1  (8.2373124904955546, -23.157747414558187, 16.680568411445901)
+  t=2  (4.0824419990648311, -2.8930477353325843, 0.52528492569756424)
+  t=3  (3.926347992254648, -2.854746803476524, 0.53180224228949802)
+  t=4  (3.2982187133085188, -2.4245419810267101, 0.48632008358844137)
+  t=5  (2.2970369434552591, -1.636625581259032, 0.4002628455953629)
+  t=6  (1.8763805351440375, -1.2347896577722182, 0.35891887501668146)
+  t=7  (1.8564423485504604, -1.2132449880713188, 0.35680034877168715)
+  t=8  (1.8564366929791287, -1.2132397423614751, 0.35680064129754985)
+  t=9  (1.8564311669817635, -1.2132289081782586, 0.35679533096539567)
+  t=10 (1.8749954775664746, -1.2499909551547645, 0.37499547758829033)
+  note t=1 coefficients are large; the terminal triple is the dyadic
+  (15/8, -10/8, 3/8).  exact in binary: False
+
+  HEAD list vs the list PRINTED in 2505.16932 App. A / 2602.21545v3 D.3:
+    t=1  head=8.23731249049555       paper=8.28721201814563        reldiff=6.02e-03
+    t=2  head=4.08244199906483       paper=4.1070591115422         reldiff=5.99e-03
+    t=3  head=3.92634799225465       paper=3.94869085348229        reldiff=5.66e-03
+    t=4  head=3.29821871330852       paper=3.3184196573706         reldiff=6.09e-03
+    t=5  head=2.29703694345526       paper=2.30065201995482        reldiff=1.57e-03
+    t=6  head=1.87638053514404       paper=1.8913014077874         reldiff=7.89e-03
+    t=7  head=1.85644234855046       paper=1.87500148085345        reldiff=9.90e-03
+    t=8  head=1.85643669297913       paper=1.875                   reldiff=9.90e-03
+
+  PROOF the terminal triple is the analytic dyadic branch, not a decimal:
+    optimal_quintic(l=1        , u=1) -> (1.875, -1.25, 0.375)  == (15/8,-10/8,3/8): True
+    optimal_quintic(l=0.999999 , u=1) -> (1.875, -1.25, 0.375)  == (15/8,-10/8,3/8): True
+    optimal_quintic(l=0.999995 , u=1) -> (1.875, -1.25, 0.375)  == (15/8,-10/8,3/8): True
+    optimal_quintic(l=0.99999  , u=1) -> (1.8750096406712431, -1.250019281420504, 0.37500964074926108)  == (15/8,-10/8,3/8): False
+    optimal_quintic(l=0.999    , u=1) -> (1.87593823305953, -1.2518771702804066, 0.37593893729911898)  == (15/8,-10/8,3/8): False
+    optimal_quintic(l=0.9      , u=1) -> (1.9767664391972013, -1.4617286825190472, 0.48505344742862283)  == (15/8,-10/8,3/8): False
+
+==============================================================================
+STAGE 2 -- their ONLINE stage, RUN on this box
+==============================================================================
+
+--- 768x64 ON the manifold, rank 64 (sigma_max=1, fro=8.0000) ---
+  PolarExpress(steps=3)  per-entry||UtU-I||=1.0277e-01  sig_max=0.434790015  ||out-UVt||_F=4.630e+00   [torch vs numpy 1.75e-02]
+  OURS  (fixed triple)    per-entry||UtU-I||=5.3657e-17  sig_max=1.000000000  ||out-UVt||_F=8.781e-15
+  PolarExpress(steps=5)  per-entry||UtU-I||=1.9069e-02  sig_max=0.960014880  ||out-UVt||_F=6.805e-01   [torch vs numpy 2.45e-02]
+  OURS  (fixed triple)    per-entry||UtU-I||=2.5944e-17  sig_max=1.000000000  ||out-UVt||_F=8.868e-15
+
+--- 64x64 ON the manifold, rank 64 (sigma_max=1, fro=8.0000) ---
+  PolarExpress(steps=3)  per-entry||UtU-I||=1.0398e-01  sig_max=0.460447311  ||out-UVt||_F=4.731e+00   [torch vs numpy 4.61e-02]
+  OURS  (fixed triple)    per-entry||UtU-I||=5.1114e-17  sig_max=1.000000000  ||out-UVt||_F=8.464e-15
+  PolarExpress(steps=5)  per-entry||UtU-I||=1.7735e-02  sig_max=1.030973673  ||out-UVt||_F=6.192e-01   [torch vs numpy 6.17e-02]
+  OURS  (fixed triple)    per-entry||UtU-I||=5.1970e-17  sig_max=1.000000000  ||out-UVt||_F=8.539e-15
+
+--- 512x64 ON the manifold, rank 64 (sigma_max=1, fro=8.0000) ---
+  PolarExpress(steps=3)  per-entry||UtU-I||=1.0274e-01  sig_max=0.438186139  ||out-UVt||_F=4.628e+00   [torch vs numpy 2.06e-02]
+  OURS  (fixed triple)    per-entry||UtU-I||=6.3762e-17  sig_max=1.000000000  ||out-UVt||_F=8.737e-15
+  PolarExpress(steps=5)  per-entry||UtU-I||=1.9553e-02  sig_max=0.960481942  ||out-UVt||_F=6.957e-01   [torch vs numpy 3.31e-02]
+  OURS  (fixed triple)    per-entry||UtU-I||=3.1214e-17  sig_max=1.000000000  ||out-UVt||_F=8.855e-15
+
+==============================================================================
+OFF-manifold input (Wishart 768x64, i.e. what a real gradient looks like)
+==============================================================================
+  sigma_max=35.736286 sigma_min=1.957e+01 fro=222.2303 fro/sig_max=6.2186
+  steps=3  PolarExpress per-entry=1.1600e-01 sig_max=1.659985542 | OURS per-entry=7.2392e-08 sig_max=1.000000000
+  steps=5  PolarExpress per-entry=2.1890e-02 sig_max=1.132164001 | OURS per-entry=3.1010e-17 sig_max=1.000000000
+  steps=8  PolarExpress per-entry=9.6196e-04 sig_max=1.006446838 | OURS per-entry=2.1173e-17 sig_max=1.000000000

@@ -1,0 +1,30 @@
+========================================================================================
+TARGET 2 -- Keller Jordan's newtonschulz5 (THEIR bytes, RUN) vs our transcription
+========================================================================================
+  note: their line 6 is `X = G.bfloat16()`, ours keeps the input dtype.
+  bf16 on CPU is 8 mantissa bits, so agreement is only ~1e-2; that is the
+  cost of running THEIR shipped configuration, and is reported, not hidden.
+  (768, 64)    theirs per-entry=5.4278e-02 | ours(f64) per-entry=5.5038e-02 | max|diff|=6.174e-03  (bf16 floor)
+  (64, 768)    theirs per-entry=3.4845e-02 | ours(f64) per-entry=3.4851e-02 | max|diff|=8.266e-03  (bf16 floor)
+  (256, 256)   theirs per-entry=2.2118e-02 | ours(f64) per-entry=2.2030e-02 | max|diff|=6.890e-03  (bf16 floor)
+  (1000, 32)   theirs per-entry=3.4402e-02 | ours(f64) per-entry=3.5356e-02 | max|diff|=1.115e-02  (bf16 floor)
+  eps handling: theirs `X /= (X.norm() + 1e-7)`, ours `.clamp_min(1e-7)`.
+  identical for any matrix whose Frobenius norm exceeds 1e-7; they differ
+  only on a matrix small enough that the norm itself is below the floor.
+    ||G||_F = 6.377e-08 -> theirs denom 1.637737e-07, ours denom 1.000000e-07
+
+========================================================================================
+TARGET 3 -- the polar retraction against LAPACK dgesdd (external, not ours)
+========================================================================================
+  (768, 64)    rank64    sig_max: ours=33.383836801  LAPACK=35.994674478  rel=7.25e-02   retraction vs LAPACK polar, rel F = 7.8242e-08  sig_max(out)=1.000000000
+  (64, 768)    rank64    sig_max: ours=34.794356831  LAPACK=35.140901692  rel=9.86e-03   retraction vs LAPACK polar, rel F = 4.2654e-07  sig_max(out)=1.000000000
+  (256, 256)   rank256   sig_max: ours=30.578788363  LAPACK=32.024784409  rel=4.52e-02   retraction vs LAPACK polar, rel F = 2.7029e-01  sig_max(out)=1.000000000
+  (4096, 64)   rank64    sig_max: ours=67.910292998  LAPACK=71.601684952  rel=5.16e-02   retraction vs LAPACK polar, rel F = 3.1760e-15  sig_max(out)=1.000000000
+  (512, 128)   rank128   sig_max: ours=32.380505685  LAPACK=33.417475553  rel=3.10e-02   retraction vs LAPACK polar, rel F = 5.0907e-04  sig_max(out)=1.000000000
+  (768, 64)    rank32    sig_max: ours=33.260411509  LAPACK=35.801870834  rel=7.10e-02   retraction vs LAPACK polar, rel F = 8.2043e-08  sig_max(out)=1.000000000
+
+  the reference for the retraction is therefore NOT absent: it is
+  polar(X) = U V^T from LAPACK, i.e. the DEFINITION, and the question the
+  iteration answers is 'how close did we get to it'. What has no external
+  reference is the CHOICE of coefficients, iteration count and prescale --
+  those are design decisions, and no oracle can adjudicate them.

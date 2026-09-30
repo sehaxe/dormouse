@@ -1,0 +1,30 @@
+========================================================================================
+FINDING 1 (fixed) -- power-iteration sigma_max, 5 steps, vs LAPACK dgesdd
+200 independent draws per shape. Underestimate is positive by construction.
+========================================================================================
+  shape        med rel     p95 rel     MAX rel     frac>5%     max prescaled
+  (768, 64)    4.456e-02   7.614e-02   1.091e-01   0.355       1.068985     
+  (4096, 64)   4.561e-02   6.225e-02   6.952e-02   0.360       1.023536     
+  (512, 128)   4.742e-02   7.683e-02   1.028e-01   0.460       1.061516     
+  (256, 256)   4.816e-02   8.758e-02   9.966e-02   0.465       1.057800     
+  (128, 128)   4.291e-02   8.730e-02   1.100e-01   0.385       1.070081     
+  (64, 64)     3.459e-02   8.627e-02   1.238e-01   0.320       1.086897     
+  'frac>5%' is the fraction of draws where the 1.05 safety factor does NOT
+  cover the error, i.e. where the prescaled sigma_max lands above 1 and
+  strictly outside the basin of p on [0,1].
+
+========================================================================================
+FINDING 2 (fixed) -- retraction vs LAPACK polar, as a function of the
+input's spectral spread. 768x64 rank 64, sigma spread set explicitly.
+========================================================================================
+  sigma_min/max  iters=3   rel F vs LAPACK  per-entry (correct) sig_max(out)      
+  1e+00          3         1.1655e-15       3.9525e-17         1.000000000       
+  5e-01          3         1.9979e-06       4.9946e-07         1.000000000       
+  1e-01          3         1.4540e-01       3.0883e-02         1.000000000       
+  1e-02          3         5.4966e-01       8.3812e-02         1.000000000       
+  1e-03          3         7.1617e-01       9.8980e-02         1.000000000       
+  1e-04          3         7.9420e-01       1.0589e-01         1.000000000       
+  A TSCT factor is 768x64 with rank 64 and arrives on the manifold, so the
+  top row is the case the retraction is actually for; the rest is the
+  regime where the fixed terminal triple stops being enough, and where the
+  Polar Express schedule would be the right answer instead.

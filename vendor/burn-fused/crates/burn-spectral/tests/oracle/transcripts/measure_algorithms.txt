@@ -1,0 +1,35 @@
+
+=== 768x64 on-manifold (rank 64), 3 iterations ===
+  sigma_max(X0)=1.000000000  sigma_min(X0)=1.000e+00  fro=8.000000  fro/sig_max=8.000000
+  power-iteration sigma_max estimate: 1.000000000  (rel err 5.55e-16)
+  A: sigma_max prescale, fixed triple per-entry||UtU-I||=5.3657e-17  ||out-U Vt||_F=8.7812e-15  sig_max(out)=1.000000000
+  B: Frobenius prescale, fixed triple per-entry||UtU-I||=6.7958e-02  ||out-U Vt||_F=2.5958e+00  sig_max(out)=0.675523722
+  B2: Frobenius 1.01, fixed triple   per-entry||UtU-I||=6.4728e-02  ||out-U Vt||_F=2.4449e+00  sig_max(out)=0.694388893
+
+=== 768x64 on-manifold (rank 64), 5 iterations ===
+  sigma_max(X0)=1.000000000  sigma_min(X0)=1.000e+00  fro=8.000000  fro/sig_max=8.000000
+  power-iteration sigma_max estimate: 1.000000000  (rel err 6.66e-16)
+  A: sigma_max prescale, fixed triple per-entry||UtU-I||=2.7135e-17  ||out-U Vt||_F=9.0629e-15  sig_max(out)=1.000000000
+  B: Frobenius prescale, fixed triple per-entry||UtU-I||=1.7063e-04  ||out-U Vt||_F=5.4619e-03  sig_max(out)=0.999317263
+  B2: Frobenius 1.01, fixed triple   per-entry||UtU-I||=1.0519e-04  ||out-U Vt||_F=3.3669e-03  sig_max(out)=0.999579138
+
+=== 512x64 on-manifold (rank 64), 3 iterations ===
+  sigma_max(X0)=1.000000000  sigma_min(X0)=1.000e+00  fro=8.000000  fro/sig_max=8.000000
+  power-iteration sigma_max estimate: 1.000000000  (rel err 5.55e-16)
+  A: sigma_max prescale, fixed triple per-entry||UtU-I||=6.2884e-17  ||out-U Vt||_F=9.0424e-15  sig_max(out)=1.000000000
+  B: Frobenius prescale, fixed triple per-entry||UtU-I||=6.7958e-02  ||out-U Vt||_F=2.5958e+00  sig_max(out)=0.675523722
+  B2: Frobenius 1.01, fixed triple   per-entry||UtU-I||=6.4728e-02  ||out-U Vt||_F=2.4449e+00  sig_max(out)=0.694388893
+
+=== 64x64 on-manifold (rank 64), 3 iterations ===
+  sigma_max(X0)=1.000000000  sigma_min(X0)=1.000e+00  fro=8.000000  fro/sig_max=8.000000
+  power-iteration sigma_max estimate: 1.000000000  (rel err 5.55e-16)
+  A: sigma_max prescale, fixed triple per-entry||UtU-I||=5.1065e-17  ||out-U Vt||_F=8.5950e-15  sig_max(out)=1.000000000
+  B: Frobenius prescale, fixed triple per-entry||UtU-I||=6.7958e-02  ||out-U Vt||_F=2.5958e+00  sig_max(out)=0.675523722
+  B2: Frobenius 1.01, fixed triple   per-entry||UtU-I||=6.4728e-02  ||out-U Vt||_F=2.4449e+00  sig_max(out)=0.694388893
+
+=== 4096x64 on-manifold (rank 64), 3 iterations ===
+  sigma_max(X0)=1.000000000  sigma_min(X0)=1.000e+00  fro=8.000000  fro/sig_max=8.000000
+  power-iteration sigma_max estimate: 1.000000000  (rel err 4.44e-16)
+  A: sigma_max prescale, fixed triple per-entry||UtU-I||=3.2823e-17  ||out-U Vt||_F=9.0176e-15  sig_max(out)=1.000000000
+  B: Frobenius prescale, fixed triple per-entry||UtU-I||=6.7958e-02  ||out-U Vt||_F=2.5958e+00  sig_max(out)=0.675523722
+  B2: Frobenius 1.01, fixed triple   per-entry||UtU-I||=6.4728e-02  ||out-U Vt||_F=2.4449e+00  sig_max(out)=0.694388893
