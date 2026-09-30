@@ -226,8 +226,8 @@ fn gdn2_f32_agrees_with_the_f64_reference() {
         t.d, t.h, t.hk, t.hv, t.expand_v, t.hv * v_head, t.cases.len(), t.tensors.len()
     );
     for (label, module) in [
-        ("FusedRecurrent", build(&t, Gdn2Mode::FusedRecurrent, &device)),
-        ("Chunk", build(&t, Gdn2Mode::Chunk, &device)),
+        ("FusedRecurrent", build(&t, Gdn2Mode::FusedRecurrent, 64, &device)),
+        ("Chunk", build(&t, Gdn2Mode::Chunk, 64, &device)),
     ] {
         let mut worst = 0.0f64;
         let mut worst_t = 0usize;
@@ -297,7 +297,7 @@ fn the_bar_bites_a_wrong_formula() {
     );
 
     let device = Device::ndarray();
-    let module = build(&t, Gdn2Mode::FusedRecurrent, &device);
+    let module = build(&t, Gdn2Mode::FusedRecurrent, 64, &device);
     let input = Tensor::<3>::from_data(TensorData::new(x.clone(), [1, seq, t.d]), &device);
     let mut state: Option<burn_gdn2::Gdn2State> = None;
     let got = to_f32_vec(&module.forward::<NdArray>(input, &mut state, true));
