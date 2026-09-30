@@ -66,6 +66,16 @@ required-features = ["cuda", "autodiff"]
 name = "fused_cuda"
 required-features = ["cuda", "autodiff"]
 
+# `ops_grad_cuda` differentiates ONE parameter (`q_proj.weight`) against central
+# differences. `kda_param_grads_cuda` is the per-GROUP version: every KDA
+# parameter group, on both dispatch arms, each with its own named verdict. The
+# 8fa5d4c defect was a whole arm getting no gradient, and a gate that checks
+# one tensor of eleven cannot see a backward that reaches the first projection
+# and stops - which is the shape the failure takes.
+[[test]]
+name = "kda_param_grads_cuda"
+required-features = ["cuda", "autodiff"]
+
 [[test]]
 name = "ops_grad_cuda"
 required-features = ["cuda", "autodiff"]
