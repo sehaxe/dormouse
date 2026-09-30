@@ -167,11 +167,21 @@ pub fn accept_rate_target(draft_logits: Tensor<3>, target_logits: Tensor<3>) -> 
 /// Returns `(total, ce, tv, conf)` so the caller can log the components.
 #[cfg(feature = "training")]
 #[allow(clippy::too_many_arguments)]
+/// `confidence_logits` is `Option` because DeepSeek's own
+/// `compute_dspark_loss` takes `confidence_pred=None` and **skips the term
+/// entirely** in that case. Our previous signature took a mandatory
+/// `Tensor<3>`, so "no head" could only be spelled as a zero tensor — which the
+/// logit form correctly scores as p = 0.5 and charges 0.693 for. Measured
+/// against the official loss: ours 2.063 against DeepSeek's 1.370, rel 3.4e-1
+/// (`tests/dspark_loss_oracle.rs`, case `no_confidence_head`).
+///
+/// With no head the term is 0 and the others are unchanged, which is the
+/// reference's behaviour and the only way to express it honestly.
 pub fn dspark_loss(
     draft_logits: Tensor<3>,
     target_logits: Tensor<3>,
     target_ids: Tensor<2, Int>,
-    confidence_logits: Tensor<3>,
+    confidence_logits: Option<Tensor<3>>,
     mask: Tensor<2>,
     gamma: f64,
 ) -> (Tensor<1>, Tensor<1>, Tensor<1>, Tensor<1>) {
@@ -197,20 +207,30 @@ pub fn dspark_loss(
     let tv = (tv_per * wm.clone()).sum().div(den.clone());
 
     // Confidence BCE (Eq 11): target = analytical acceptance rate (Eq 8)
-    let c_star = accept_rate_target(draft_logits, target_logits); // [B, L]
-    let cp = activation::sigmoid(confidence_logits.reshape([b, l]));
-    let eps = 1e-7f32;
-    let bce_per = c_star
-        .clone()
-        .mul(cp.clone().add_scalar(eps).log())
-        .add(
-            c_star
-                .neg()
-                .add_scalar(1.0)
-                .mul(cp.neg().add_scalar(1.0 + eps).log()),
-        )
-        .neg();
-    let conf = (bce_per * wm).sum().div(den);
+    //
+    // LOGIT FORM, and this is a fix rather than a style choice.
+    // DeepSeek's `loss.py` calls `F.binary_cross_entropy_with_logits(conf,
+    // c_star)`, which is `max(x,0) - x*c + log(1 + exp(-|x|))` - finite at
+    // |logit| = 40, where the naive `sigmoid` then `log` runs out of precision.
+    // The old code did `sigmoid(x)` and then `log(p + 1e-7)`, which puts a hard
+    // CEILING of ln(1e7) = 16.1 on the term no matter how wrong the head is.
+    // Measured against the official loss at `DeepSpec@005e03b8`
+    // (`tests/dspark_loss_oracle.rs`, run on CPU): the `saturated_conf` case
+    // gave ours 9.309 against DeepSeek's 21.445. The CE and L1/TV terms agreed
+    // on all eight cases, so this one term was the whole disagreement. At
+    // |x|=40 the official form returns 40.00; the clamped one could not exceed
+    // 16.1 at any x.
+    let conf = match confidence_logits {
+        None => Tensor::zeros([1], &draft_logits.device()),
+        Some(cl) => {
+            let c_star = accept_rate_target(draft_logits, target_logits); // [B, L]
+            let cl = cl.reshape([b, l]);
+            let bce_per = activation::relu(cl.clone())
+                .sub(cl.clone().mul(c_star.clone()))
+                .add(activation::softplus(cl.abs().neg(), 1.0));
+            (bce_per * wm).sum().div(den)
+        }
+    };
 
     // Eq 12: 0.1*L_ce + 0.9*L_tv + 1.0*L_conf
     let total = ce.clone().mul_scalar(0.1) + tv.clone().mul_scalar(0.9) + conf.clone();
@@ -406,7 +426,7 @@ mod tests {
         );
         let conf = Tensor::<3>::random([b, l, 1], burn::tensor::Distribution::Default, &dev());
         let mask = Tensor::<2>::ones([b, l], &dev());
-        let (total, ce, tv, c) = dspark_loss(dl, tl, ids, conf, mask, 4.0);
+        let (total, ce, tv, c) = dspark_loss(dl, tl, ids, Some(conf), mask, 4.0);
         assert!(as_f32(total).is_finite());
         assert!(as_f32(ce) > 0.0);
         assert!(as_f32(tv) > 0.0);

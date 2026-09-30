@@ -226,14 +226,13 @@ fn ce_and_tv_agree_with_the_official_loss() {
         let target = t3(c.aligned_target_logits.clone(), [b, l, v], &device);
         let ids = t2i(c.target_ids.clone(), [b, l], &device);
         let mask = Tensor::from_data(TensorData::new(c.eval_mask.clone(), [b, l]), &device);
-        // Upstream's `confidence_pred` is `[B, A, K]`; ours wants `[B, L, 1]`.
-        let conf = Tensor::from_data(
-            TensorData::new(
-                c.confidence_pred.clone().unwrap_or_else(|| vec![0.0; b * l]),
-                [b, l, 1],
-            ),
-            &device,
-        );
+        // Upstream's `confidence_pred` is `[B, A, K]`; ours wants `[B, L, 1]`,
+        // and it is `None` when the fixture records no head at all - which is
+        // what the reference does, not a tensor of zeros.
+        let conf = c
+            .confidence_pred
+            .clone()
+            .map(|v| Tensor::from_data(TensorData::new(v, [b, l, 1]), &device));
 
         let (_total, ce, tv, _conf) = burn_dspark::dspark_loss(
             draft, target, ids, conf, mask,
@@ -318,17 +317,18 @@ fn the_confidence_term_agrees_with_the_official_loss() {
         let target = t3(c.aligned_target_logits.clone(), [b, l, v], &device);
         let ids = t2i(c.target_ids.clone(), [b, l], &device);
         let mask = Tensor::from_data(TensorData::new(c.eval_mask.clone(), [b, l]), &device);
-        // A missing head is spelled as zeros -- WHICH IS THE POINT: upstream
-        // skips the term, we score it. See cause 2 above.
-        let conf = Tensor::from_data(
-            TensorData::new(
-                c.confidence_pred.clone().unwrap_or_else(|| vec![0.0; b * l]),
-                [b, l, 1],
-            ),
-            &device,
-        );
+        // A missing head is now spelled as `None`, because that is what the
+        // upstream API takes and what the signature now accepts. The test
+        // previously passed ZEROS here ON PURPOSE, to expose the divergence -
+        // a zero tensor is a legitimate "the head says 0.5", not "no head", and
+        // charging 0.693 for the absence of a head is a bug. `the_confidence_
+        // term_agrees_with_the_official_loss` keeps the case.
+        let conf = c
+            .confidence_pred
+            .clone()
+            .map(|v| Tensor::from_data(TensorData::new(v, [b, l, 1]), &device));
         let (_total, _ce, _tv, conf_term) =
-            burn_dspark::dspark_loss(draft, target, ids, conf, mask, 4.0);
+            burn_dspark::dspark_loss(draft, target, ids, conf.clone(), mask, 4.0);
 
         let ours = scalar(conf_term);
         let theirs = c.out_conf;
@@ -375,15 +375,18 @@ fn dspark_loss_agrees_with_the_official_loss() {
         let target = t3(c.aligned_target_logits.clone(), [b, l, v], &device);
         let ids = t2i(c.target_ids.clone(), [b, l], &device);
         let mask = Tensor::from_data(TensorData::new(c.eval_mask.clone(), [b, l]), &device);
-        let conf = Tensor::from_data(
-            TensorData::new(
-                c.confidence_pred.clone().unwrap_or_else(|| vec![0.0; b * l]),
-                [b, l, 1],
-            ),
-            &device,
-        );
+        // `None` when the fixture records no head. The `unwrap_or_else(|| zeros)`
+        // this replaces was the LAST place the bug survived: it made the TOTAL
+        // test charge 0.693 = ln 2 for an absent head, which is exactly the
+        // divergence `the_confidence_term_agrees_with_the_official_loss` had
+        // already been fixed to catch. Three call sites had to change and the
+        // third was the one that mattered.
+        let conf = c
+            .confidence_pred
+            .clone()
+            .map(|v| Tensor::from_data(TensorData::new(v, [b, l, 1]), &device));
 
-        let (total, ..) = burn_dspark::dspark_loss(draft, target, ids, conf, mask, 4.0);
+        let (total, ..) = burn_dspark::dspark_loss(draft, target, ids, conf.clone(), mask, 4.0);
 
         let ours = scalar(total);
         let r = rel(ours, c.out_official);

@@ -470,8 +470,8 @@ fn probe_loss() -> (f32, f32, f32, f32) {
             burn::tensor::TensorData::new(target, [1, 1, v]), &dev),
         burn::tensor::Tensor::<2, burn::tensor::Int>::from_data(
             burn::tensor::TensorData::new(ids, [1, 1]), &dev),
-        burn::tensor::Tensor::<3>::from_data(
-            burn::tensor::TensorData::new(vec![0.3f32], [1, 1, 1]), &dev),
+        Some(burn::tensor::Tensor::<3>::from_data(
+            burn::tensor::TensorData::new(vec![0.3f32], [1, 1, 1]), &dev)),
         burn::tensor::Tensor::<2>::from_data(
             burn::tensor::TensorData::new(vec![1.0f32], [1, 1]), &dev),
         DSPARK_GAMMA,

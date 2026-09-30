@@ -361,11 +361,16 @@ where
         .prob(hidden_win.reshape([b * n, k, d]), Some(prev_emb))
         .reshape([b * n, k, 1]);
     let mask = Tensor::<2>::ones([b * n, k], &draft.device());
+    // `Some` unconditionally: the acceptance head is BUILT (markov-conditioned
+    // as of 1836ecb) and always has a value on this path. The `None` arm exists
+    // to match DeepSeek's API, where a model may run without a confidence head -
+    // charging 0.693 for an absent head was a real defect, and this call site is
+    // the one place where the head genuinely exists.
     let (total, _ce, _tv, _conf) = dspark_loss(
         draft,
         target_win.reshape([b * n, k, v]),
         target_ids.reshape([b * n, k]),
-        conf_logits,
+        Some(conf_logits),
         mask,
         DSPARK_GAMMA,
     );
