@@ -223,6 +223,45 @@ repopulate this column from any step-time reading that has no step index. -->
 | 6 | **hashed memory (Engram)** | default (in) vs `--no-engram` | RUN 2026-09-27 at the program's operating depth (`--max-iter 2`), pure CE, 3 seeds per arm, 2000 steps, batch 20 x s512. The arm ships at 25_000 rows/order x 3 orders x 32 dim = 2.4M memory params (24% of the model) behind a hard floor (`lam = min(w_mem, 0.5)`); verdict and numbers below | unknown |
 | 6b | **memory capacity ladder** | `--set engram_rows=100000` / `500000` | one seed per rung, not three: the measured slot-count curve (arXiv 2601.16531) peaks at 500K/order but on a 125M backbone - at ours 500K is 48M params = 86% of the model, the monopoly shape. Rung 6 says whether the arm earns its 24%; this says whether 24% is the right rung | unknown |
 | 7 | **AttnRes vs ReZero** | `--set use_attnres=true` | does the learned depth-attention residual earn its place against the fixed additive one at the same depth? **Full mode only** — the Block variant is not wired (it is still wrong against Eq. 6: see `research/papers/attnres-integration-2026-09-30.md` §5). 3 seeds per arm, 2000 steps, pure CE, **one batch size across both arms** so the eval window matches (§2.6). Read the `attnres` counter on the eval line before believing a number: a run that reports 0 aggregated ReZero's loss under AttnRes's name. **Not a pure weights swap** — at the mandated `w_l = 0` init iteration `n`'s state is the equal-weight mean of `n+1` sources, so the arm also changes the residual's init scale from `h + y·s` to a `1/(n+1)` average. That is the paper's stated init, and the comparison is honest about it | unknown |
+| 7b | **mHC vs ReZero** | `--set use_mhc=true` | does the CONSTRAINED residual-stream mixer earn its place against the fixed additive one at the same depth? This is the row the φ evidence points at: 2604.21106v3 §5.2 replaces a looped model's input injection with **K=2 "residual lanes across loops"** and refits the recurrence-equivalence exponent from **φ = 0.45 to 0.65** (baseline 0.46, 95% CI [0.41, 0.53]) while *lowering* validation loss and narrowing the compute optimum. **What is NOT measured by anyone: that number is for unconstrained Hyper-Connections (arXiv:2409.19606, Zhu et al., ICLR 2025), not for mHC** (2512.24880, DeepSeek), at 20M-1B widths on FineWeb-Edu tokens with MuonH, on prelude-recur-coda models with `N_once > 0` (we are fully looped). We are at 9.2M on BYTES. There is no published result for this cell and this row is what creates one. **n = 2 FIRST, one variation per launch** (external review, 2026-10-01): `mhc_streams` defaults to 2 because the φ study ran K = 2, and because the base paper's own expansion-rate ablation (2409.19606 Tab. 1) puts `n = 1` *below* the Pre-Norm baseline, `n = 4` at −0.030 V2 loss and `n = 8` at −0.033, i.e. the family buys `n = 4 → 8` for 0.003. `--set mhc_streams=4` is the follow-up row, and 2607.14530 finds the gains collapse past N = 4. **The latency half is a FIRST-CLASS half of this row's verdict — see "two verdicts" below; a BPB win bought with a step-time regression is not a win at our utilisation profile.** Read the `mhc` counter on the eval line first: 0 projected ReZero's residual under mHC's name. **Read `b_res` too** — 2603.20896 (s²HC, NeurIPS 2026) reports the doubly stochastic matrices "collapse around the identity initialization and diminish cross-stream interactions", which at T = 2-4 means the arm is a slower ReZero; `loop_block::tests::mhc_res_leaves_the_identity_when_the_bias_moves_and_stays_on_the_manifold` is the offline form of that check and a run whose `b_res` stays at init has told you the answer without 2 000 steps. **Confound, stated not hidden:** the init is a *drop-in*, not a swap — mHC at `b_res = 10I, b_post = 0` computes `h + y` to 2.5e-4 relative (measured), the same function ReZero computes at `residual_scale = 1` (`mhc_at_init_is_rezero_at_scale_one`), so the arms differ in the OPERATOR and in the step-0 function only within that measured error. `H_pre` is NOT wired (Eq. 3 applies it to the block's own input, which collapses the `n x C` stream to `C`; the paper's Tab. 1 puts `H_res` at −0.022 of the −0.027 total, so ~89 % of the measured effect is in what we do wire). **The base paper's single largest ablation is the axis we constrain hardest and the one we drop**: 2409.19606 Tab. 3 finds that freezing the width-connections `WC = [A_m A_r]` costs +0.021 V2 loss, more than freezing the depth-connections `B`; we replace `A_r` with the Birkhoff projection and do not wire `A_m` at all, so this row does not measure the base paper's effect, it measures a member of the family with one of its two load-bearing blocks changed. 3 seeds per arm, 2000 steps, pure CE, **one batch size across both arms** (§2.6) | unknown |
+
+### Row 7b has TWO verdicts, and only one of them is BPB
+
+The external review's condition is explicit: *"убедиться что экономия качества
+компенсирует рост latency"* — confirm the quality saving offsets the latency
+growth. At **13.3 % mean GPU utilisation** (AGENTS §3.1: 142/180 samples ≤ 5 %,
+measured 2026-09-29) that is not a formality for this arm, because mHC's cost is
+**launches, not FLOPs and not parameters**:
+
+- `SINKHORN_ITERS = 20` × 2 directions × 7 ops = **280 forward launches per
+  call** on a `[b, t, n, n]` tensor (`sinkhorn.rs:48-70`), plus a 40-step
+  hand-derived reverse unroll in the backward. Times `T` iterations per forward.
+- **The launch count does not depend on `n`.** `n` scales the element count of
+  each tiny tensor and the parameter count (measured on the instantiated block:
+  6 155 at `n = 2` on `small`, 0.067 % of it); the
+  number of kernels the host enqueues is fixed by the iteration count and the
+  op sequence. So `n = 2` is the right first rung for the reviewer's reasons
+  (cheapest, and the `K` the φ evidence used) but it is **not** cheaper in
+  launches than `n = 4` — a rung ladder in `n` will not buy the latency back.
+  What would is the fused kernel (`burn-mhc/cuda`), which is deliberately NOT
+  enabled on this dependency: it has an unfixed 1e-7 linear-domain floor in the
+  kernel (`sinkhorn_cuda.rs:89-111`) and a hand-derived adjoint that has never
+  been compared to anything but its own tensor path
+  (`research/reviews/mhc-2026-09-30.md` §4.1-4.3). The same week, burn-gdn2's
+  fused adjoint was measured *numerically wrong* (`d8fa449`).
+- So the row must report, separately: **held-out BPB vs the control's 3-seed
+  spread**, AND **Δ step ms and Δ % at a step index ≥ 50, on a quiet card, with
+  `--timers`, both arms at the same batch size** (a step-time reading with no step
+  index is a reading of the autotune cache, not of a step — AGENTS §2.2, the
+  retracted 23× figure).
+
+**Verdict rule, and it is stricter than the BPB rule above:** the arm lands
+only if BPB wins by more than the control's seed spread **and** the step-time
+delta is affordable at the program's operating depth. The reviewer's verdict at
+our scale — *"пока не внедрять"* — is honoured by the wiring being **off by
+default**: an `Option<MhcBlock>` that is `None` contributes no records to
+burnpack, every shipped preset loads unchanged, and the cost of a negative
+verdict is one flag.
 
 Rule for reading a result: an arm wins if its mean held-out BPB at the same step
 count is below the control's mean by more than the spread across the control's

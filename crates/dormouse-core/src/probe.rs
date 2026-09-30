@@ -59,7 +59,15 @@ pub const FUTURE_BYTE: usize = 13;
 /// `fb=<ran>/<asked>`; ADR-0019 COUNTED, so `0/<n>` on the eval line means the
 /// head was never reached rather than "the arm is off".
 pub const FUTURE_BYTE_ASKED: usize = 14;
-pub const N_ARMS: usize = 15;
+/// Manifold-Constrained Hyper-Connections (arXiv:2512.24880) replaced the
+/// residual accumulation: the per-iteration write projected its stream-mixing
+/// matrix onto the Birkhoff polytope instead of scaling the body by a learned
+/// scalar. One entry per executed iteration, same shape as the
+/// [`ATTNRES`] count it is mutually exclusive with - and for the same reason:
+/// a run that reports 0 wrote ReZero's residual and printed mHC's name, and
+/// nothing else on the eval line would say so.
+pub const MHC: usize = 15;
+pub const N_ARMS: usize = 16;
 /// Arm name per index, for assertion messages that name the thing.
 pub const NAMES: [&str; N_ARMS] = [
     "iterations",
@@ -77,6 +85,7 @@ pub const NAMES: [&str; N_ARMS] = [
     "retract_batched",
     "future_byte",
     "future_byte_asked",
+    "mhc",
 ];
 
 thread_local! {

@@ -26,6 +26,23 @@ burn-mor = { path = "../../vendor/burn-fused/crates/burn-mor" }
 # over the loop's iteration states. Off by default (`use_attnres`); the crate
 # is in the build because the model reads it, not as a reference port.
 burn-attnres = { path = "../../vendor/burn-fused/crates/burn-attnres" }
+# Manifold-Constrained Hyper-Connections (arXiv:2512.24880, DeepSeek): the
+# residual-stream arm whose H_res is Sinkhorn-projected onto the Birkhoff
+# polytope. The BASE mechanism is Hyper-Connections, arXiv:2409.19606 (Zhu et
+# al., ByteDance, ICLR 2025) - n residual streams, a learned (n+1)x(n+1)
+# connection matrix, and "expansion rate" n. burn-mhc is a transcription of
+# the CONSTRAINED member of that family, and the deltas (constraint, disjoint
+# slices instead of replicated copies, no tanh) are in
+# research/reviews/mhc-2026-09-30.md 1.2. Off by default (`use_mhc`); in the
+# build because the model reads it, not as a reference port.
+#
+# `cuda` is DELIBERATELY NOT enabled on this dependency. The crate's fused
+# Sinkhorn is reachable on the bare CubeBackend (the trainer's inner backend),
+# it has an unfixed 1e-7 row/column-sum floor and a fallback with no counter
+# (research/reviews/mhc-2026-09-30.md 4), so turning it on now would swap the
+# tensor path - the one the CPU gates pin - for an unmeasured kernel on a card
+# this lane does not own. Owed, with its preconditions named there.
+burn-mhc = { path = "../../vendor/burn-fused/crates/burn-mhc" }
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"

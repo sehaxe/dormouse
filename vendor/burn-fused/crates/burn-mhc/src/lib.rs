@@ -15,7 +15,30 @@
 //!   closure) - restores the identity-mapping property of residual streams
 //!
 //! Hyper-parameters follow App. A.1: gating factors alpha init = 0.01,
-//! Sinkhorn-Knopp t_max = 20.
+//! Sinkhorn-Knopp t_max = 20, expansion rate n = 4, Layer Norm eps = 1e-20
+//! (Table 5). Those four are the paper's. The static-bias initialisation
+//! (`b_pre = b_res = 10`, `b_post = 0`, `block.rs:7-8`) is OURS: the paper
+//! states no bias init, and 10 is chosen so `sigma(10) ~ 1` and
+//! `Sinkhorn(exp(diag 10)) ~ I`.
+//!
+//! Two readings of the paper matter, both decided in favour of the PRINTED
+//! equation:
+//!
+//! - **Eq. 7 has no `tanh`.** HC's Eq. 5 parameterises its mappings as
+//!   `alpha * tanh(theta x') + b`; mHC's Eq. 7 - and the kernel section's
+//!   Eq. 14-16, which is independent of the prose - is a plain linear
+//!   projection `alpha * (x' phi) + b`. The prose says "we follow the original
+//!   HC formulation"; the equations carry no `tanh`; this crate implements the
+//!   equations. The consequence is named rather than absorbed: `phi_*` here are
+//!   unbounded linear maps where HC's are `tanh`-squashed, which is why the
+//!   Sinkhorn input is unbounded and why `sinkhorn.rs` has to run in the log
+//!   domain at all.
+//! - **`H_pre` is not applied inside `forward`.** Eq. 3 is
+//!   `x' = H_res x + H_post^T F(H_pre x, W)` and `H_pre x` is
+//!   `[1,n] [n,C] = [1,C]`: it feeds the block's own function `F`, which lives
+//!   in the caller. `MhcBlock::forward` therefore implements Eq. 3's
+//!   `H_res x + H_post^T F` terms with `F`'s output handed in, and
+//!   `hyper_mappings` returns the `H_pre` a caller that CAN apply it needs.
 #![allow(clippy::single_range_in_vec_init, clippy::needless_range_loop)]
 // `autodiff` alone also compiles this module, and deliberately so: the fused
 // ADJOINT and its strategy seam live in it, and a gate that can only be
@@ -173,5 +196,116 @@ mod tests {
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect();
         assert!(pv.iter().all(|&x| (0.0..=1.0).contains(&x)));
+    }
+
+    // ---- the fixture that separates Eq. 3 from every wrong reading of it --
+
+    /// The block the hand computation below describes, with the DYNAMIC part
+    /// switched off so the whole operator is a function of the static biases:
+    /// `alpha_* = 0` kills the `x' phi` term of Eq. 7, leaving
+    /// `H_post = 2 sigma(b_post)` (Eq. 8) and `H_res = Sinkhorn(b_res)`
+    /// (Eq. 8-9) exactly.
+    fn hand_fixture(n: usize, b_post: [f32; 2], b_res: [[f32; 2]; 2]) -> MhcBlock {
+        let mut m = MhcBlock::new(n, 2 * n, &dev());
+        m.alpha_pre = burn::module::Param::from_tensor(Tensor::<1>::zeros([1], &dev()));
+        m.alpha_post = burn::module::Param::from_tensor(Tensor::<1>::zeros([1], &dev()));
+        m.alpha_res = burn::module::Param::from_tensor(Tensor::<1>::zeros([1], &dev()));
+        // `from_floats([b_post])` is rank 2, not rank 1 - burn's
+        // `From<[f32; N]> for TensorData` infers the rank from the nesting, so
+        // wrapping a `[f32; 2]` in another `[..]` builds dims `[1, 2]` and dies
+        // in `from_data` with "Given dimensions differ from the tensor rank".
+        // `TensorData::new` is the spelling that carries the shape explicitly.
+        m.b_post = burn::module::Param::from_tensor(Tensor::<1>::from_data(
+            burn::tensor::TensorData::new(b_post.to_vec(), [2]),
+            &dev(),
+        ));
+        m.b_res = burn::module::Param::from_tensor(Tensor::<2>::from_floats(b_res, &dev()));
+        m
+    }
+
+    /// EQ. 3, ON NUMBERS A HUMAN CAN CHECK. `n = 2` streams of width `C = 2`,
+    /// so `D = 4` and the whole residual is four numbers.
+    ///
+    /// `b_res = [[0, -ln4], [-ln4, 0]]` -> `M = exp(b_res) = [[1, 1/4], [1/4, 1]]`.
+    /// Sinkhorn's alternating normalization preserves the cross ratio
+    /// `M00 M11 / (M01 M10) = 16`, and a 2x2 doubly stochastic matrix
+    /// `[[p, 1-p], [q, 1-q]]` has cross ratio `p(1-q) / ((1-p) q)`, which is 16
+    /// exactly at `p = q = 4/5`. 20 iterations (the paper's `t_max`) reach it
+    /// to the last bit of f32, so the expected `H_res` is the exact literal
+    /// `[[0.8, 0.2], [0.2, 0.8]]` and there is no tolerance to argue about.
+    ///
+    /// `b_post = [-0.5, 1.5]` gives `H_post = 2 sigma(b_post) =
+    /// [0.75508134, 1.63514895]`. Eq. 3 then says, for each stream `j` and
+    /// each column `c`: `out[j,c] = sum_i H_res[j,i] x[i,c] + H_post[j] y[j,c]`,
+    /// with `x = [[1,2],[3,4]]` and `y = [[10,20],[30,40]]`. All four numbers,
+    /// row-major (which is what `reshape([b,t,n,C])` gives back):
+    ///
+    /// | | `c = 0` | `c = 1` |
+    /// |---|---|---|
+    /// | `j = 0` | `0.8·1 + 0.2·3 + 0.75508134·10` = **8.95081338** | `0.8·2 + 0.2·4 + 0.75508134·20` = 17.50162675 |
+    /// | `j = 1` | `0.2·1 + 0.8·3 + 1.63514895·30` = 51.65446857 | `0.2·2 + 0.8·4 + 1.63514895·40` = 69.00595810 |
+    ///
+    /// WHY A FIXTURE AND NOT "the output moved" (the AttnRes lesson, 511daa5:
+    /// their first gate was blind to a `d^-0.5` scale and an L2 norm together,
+    /// a d-fold logit compression that every "did it change?" assertion
+    /// passed). The wrong readings of Eq. 3 that a plausible transcription
+    /// makes, on `out[0,0]`:
+    ///
+    /// | reading of Eq. 3 | `out[0,0]` | gap | relative |
+    /// |---|---|---|---|
+    /// | **as printed** | **8.950813** | — | — |
+    /// | `H_post = sigma(.)`, the factor 2 of Eq. 8 dropped | 5.175407 | −3.775406 | 42.2 % |
+    /// | `H_res = b_res`, the Sinkhorn of Eq. 9 dropped | 3.391930 | −5.558883 | 62.1 % |
+    /// | `H_post` indexed off by one stream | 17.751490 | +8.800677 | 98.3 % |
+    ///
+    /// On an output of order 10 that is 42%, 62% and 98% relative - two orders
+    /// of magnitude above any tolerance a test could be accused of choosing to
+    /// fit. A gate that only asserted "the readout moved" is green under all
+    /// four. The last row is not decoration: it is the mistake THIS FILE made
+    /// in its own expected values, which is why the four literals are written
+    /// out as the arithmetic above rather than as bare numbers.
+    ///
+    /// **What this fixture provably cannot separate**, so nobody reads more
+    /// into it: `H_res` transposed. The fixture's `b_res` is symmetric, so
+    /// `H_res^T = H_res` and the wrong reading is the right answer. Catching a
+    /// transposed `H_res` needs a non-symmetric `b_res`, which changes the
+    /// hand-arithmetic and is a second fixture, not a tweak of this one.
+    #[test]
+    fn eq3_residual_is_the_papers_equation_on_a_hand_computed_fixture() {
+        let ln4 = 4f32.ln();
+        let m = hand_fixture(2, [-0.5, 1.5], [[0.0, -ln4], [-ln4, 0.0]]);
+        let h = Tensor::<3>::from_floats([[[1.0, 2.0, 3.0, 4.0]]], &dev());
+        let y = Tensor::<3>::from_floats([[[10.0, 20.0, 30.0, 40.0]]], &dev());
+        let out: Vec<f32> = m
+            .forward(h, std::slice::from_ref(&y))
+            .into_data()
+            .try_to_vec()
+            .expect("readable [1,1,4]");
+        for (i, want) in [
+            8.950813375962909f32,
+            17.50162675192582,
+            51.65446857161862,
+            69.00595809549148,
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert!(
+                (out[i] - want).abs() < 1e-5,
+                "Eq. 3 out[{i}] = {}, hand-computed {want}",
+                out[i]
+            );
+        }
+        // And the mapping itself, not just its effect: the fixture's whole
+        // point is that H_res is the PROJECTION, so assert the projection.
+        let (_, _, res) = m.hyper_mappings(&Tensor::<3>::ones([1, 1, 4], &dev()));
+        let r: Vec<f32> = res.into_data().try_to_vec().expect("[1,1,2,2]");
+        for (i, want) in [0.8f32, 0.2, 0.2, 0.8].iter().enumerate() {
+            assert!(
+                (r[i] - want).abs() < 1e-5,
+                "H_res[{i}] = {}, want {want} - the Sinkhorn of Eq. 9 did not run",
+                r[i]
+            );
+        }
     }
 }

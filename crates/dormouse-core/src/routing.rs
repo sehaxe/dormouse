@@ -264,12 +264,17 @@ impl Routed for LoopBlock {
         route_linear(into, &self.out_proj, Role::Readout, factors_fallback);
         self.shared_attn.route(into, factors_fallback);
         self.engram.route(into, factors_fallback);
-        // Controller, mem_dense, norm, GR, AttnRes pseudo-queries, iter_embed,
-        // residual_scale, the MoR router: routers, scalars, vectors and norms
-        // are AdamW (orthogonalizing them is meaningless or harmful). The
-        // AttnRes query is a `[d]` vector per iteration slot, so it lands here
-        // with `residual_scale` rather than in a group of its own - the same
-        // reasoning as the 1-D TSCT scale leaf.
+        // Controller, mem_dense, norm, GR, AttnRes pseudo-queries, mHC's
+        // hyper-network, iter_embed, residual_scale, the MoR router: routers,
+        // scalars, vectors and norms are AdamW (orthogonalizing them is
+        // meaningless or harmful). The AttnRes query is a `[d]` vector per
+        // iteration slot, so it lands here with `residual_scale` rather than in
+        // a group of its own - the same reasoning as the 1-D TSCT scale leaf.
+        // mHC's three projections (`[D, n]`, `[D, n]`, `[D, n^2]`) land here
+        // for the same reason ReZero's scalar and the controller's gates do:
+        // they are GATES, not weight matrices, and the paper's own
+        // parameterization puts a nonlinearity (sigmoid, Sinkhorn) between the
+        // parameter and the operator, so there is no matrix to polar-rotate.
         into.rest_of(self);
     }
 }

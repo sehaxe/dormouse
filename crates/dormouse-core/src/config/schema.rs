@@ -65,6 +65,7 @@ fn d_rank() -> usize { 64 }
 fn d_norm_eps() -> f32 { 0.001 }
 fn d_true() -> bool { true }
 fn d_n_experts() -> usize { 3 }
+fn d_mhc_streams() -> usize { 2 }
 fn d_jepa_weight() -> f32 { 0.05 }
 fn d_jepa_mask_frac() -> f32 { 0.15 }
 fn d_jepa_mask_span() -> usize { 8 }
@@ -120,6 +121,57 @@ pub struct DormouseConfig {
     /// accident, but it is not wired to a config field: the first A/B this
     /// arm needs is AttnRes vs ReZero, not AttnRes vs AttnRes.
     #[serde(default)] pub use_attnres: bool,
+    /// Manifold-Constrained Hyper-Connections (arXiv:2512.24880, DeepSeek),
+    /// the third learned replacement for the loop's residual accumulation and
+    /// the only one with a CONSTRAINT on the operator: the per-token `H_res`
+    /// is projected onto the Birkhoff polytope (Sinkhorn-Knopp, Eq. 9), so it
+    /// is doubly stochastic and `H_res x_l` is a convex combination of the
+    /// streams - the identity-mapping property that plain Hyper-Connections
+    /// (arXiv:2409.19606, Zhu et al., ICLR 2025) destroy and that unrolls to a
+    /// doubly stochastic composite over any depth. OFF by default, like
+    /// `use_gr` and `use_attnres`, for checkpoint compatibility: the block
+    /// exists only when the flag is on.
+    ///
+    /// Placed at the LOOP BOUNDARY (the per-iteration write), not between
+    /// sublayers, because that is where the phi evidence was measured:
+    /// 2604.21106v3 §5.2 replaces the input injection with K=2
+    /// "residual lanes across loops" and reads phi 0.45 -> 0.65. One shared
+    /// `MhcBlock` is applied at every iteration, weight-shared like the block
+    /// itself, so the composite the manifold argument is about is `H_res^T`.
+    #[serde(default)] pub use_mhc: bool,
+    /// The residual-stream expansion rate `n` (Eq. 6-8: `x_l` is read as
+    /// `n` streams of width `D/n`, and `H_res` is `n x n`).
+    ///
+    /// **Default 2, and the papers agree on that rung.** The phi study
+    /// (2604.21106v3 §5.2) ran exactly `K = 2`; the base paper's own
+    /// expansion-rate ablation (2409.19606 Tab. 1) has `n = 1` *below* the
+    /// Pre-Norm baseline and `n = 8` adding almost nothing over `n = 4`, so the
+    /// family buys its gain over `n = 2` at triple the launch count for no
+    /// measured return; and 2607.14530 finds the gains collapse past `N = 4`.
+    /// One variation per launch (external review, 2026-10-01): `n = 4` is the
+    /// paper's own App. A.1 setting and is a flag away - `--set
+    /// mhc_streams=4` - as the follow-up row, not the first one.
+    ///
+    /// **And the cost is NOT in `n`, which is worth knowing before spending
+    /// money on the ladder.** The Sinkhorn issues a FIXED number of launches
+    /// per call - `SINKHORN_ITERS = 20` x 2 directions x 7 ops = 280 forward
+    /// (`sinkhorn.rs:48-70`), plus a 40-step hand-derived reverse unroll - and
+    /// that count is independent of `n`: `n` scales the ELEMENT count of each
+    /// tiny `[b,t,n,n]` tensor and the parameter count (measured: 6 155 at
+    /// `n = 2` on `small`, 0.067 % of its 9 197 390);
+    /// not how many kernels the host has to enqueue. So `n = 2` is the right
+    /// first rung for the reviewer's reasons (cheapest, and the K the phi
+    /// evidence used) but it is NOT cheaper in launches than `n = 4`. On a box
+    /// whose mean GPU utilisation is 13.3 % (AGENTS §3.1) the launch count is
+    /// the arm's whole cost, and it is reducible only by the fused kernel
+    /// (`burn-mhc/cuda`, deliberately not enabled - see the findings file §6),
+    /// never by a smaller `n`. Measure it: AB-PROTOCOL row 7b prices step time
+    /// separately from quality for exactly this reason.
+    ///
+    /// Must divide `d_model` (`MhcBlock` reshapes the hidden state to
+    /// `[b, t, n, D/n]` and `validate` refuses a non-divisor LOUDLY rather
+    /// than panicking in the first forward).
+    #[serde(default = "d_mhc_streams")] pub mhc_streams: usize,
     #[serde(default = "d_n_experts")] pub n_experts: usize,
     #[serde(default = "d_jepa_weight")] pub jepa_weight: f32,
     #[serde(default = "d_jepa_mask_frac")] pub jepa_mask_frac: f32,

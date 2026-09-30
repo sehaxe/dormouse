@@ -1,13 +1,15 @@
 //! loop - mini UniversalLoop: controller + shared attention (KDA) +
 //! expert TSCT FFNs + Engram + e_k (iteration embedding) + ReZero residual
-//! scale. Fixed depth (ADR-0013): every iteration counts equally, the loss
-//! is an honest unweighted CE.
+//! scale (or, mutually exclusively, the GR / AttnRes / mHC replacement for
+//! that one statement). Fixed depth (ADR-0013): every iteration counts
+//! equally, the loss is an honest unweighted CE.
 use burn::backend::DispatchKindConversion;
 use burn::module::{Module, Param};
 use burn::nn::{Linear, LinearConfig};
 use burn::tensor::{activation, Device, DispatchTensor, FloatDType, Int, Tensor};
 use burn_attnres::{depth_attend, AttnRes};
 use burn_engram::EngramModule;
+use burn_mhc::MhcBlock;
 use burn_rmsnorm::RMSNorm;
 
 use crate::attention::AdaptiveAttention;
@@ -102,6 +104,33 @@ pub struct LoopBlock {
     /// existing checkpoint loadable: the parameters do not exist when the arm
     /// is off, and the config snapshot refuses a resume that flips the flag.
     pub attnres: Option<Vec<AttnRes>>,
+    /// Manifold-Constrained Hyper-Connections (arXiv:2512.24880): ONE shared
+    /// `MhcBlock`, applied at every iteration's residual write, the way the
+    /// loop shares everything else. It is Eq. 3 with the block body's output
+    /// read as `n` per-stream outputs: `h' = H_res h + H_post . y` with
+    /// `H_res` Sinkhorn-projected onto the Birkhoff polytope (Eq. 8-9), so
+    /// `H_res h` is a convex combination of the `n` streams and the composite
+    /// over the loop's `T` iterations - `H_res^T` under the sharing - is
+    /// doubly stochastic too. `None` unless `use_mhc`.
+    ///
+    /// SHARED, not one per iteration slot, and that is the decision: the
+    /// manifold's stability argument is about the COMPOSITE `prod H_res`
+    /// (2512.24880 Eq. 4 and §4.1), which a shared block realises as a power
+    /// of one doubly stochastic matrix - still in the Birkhoff polytope, since
+    /// that set is closed under multiplication - while per-slot matrices would
+    /// make the residual mechanism the only un-shared thing in a weight-shared
+    /// loop. `H_pre` is NOT wired: Eq. 3 puts it on the block's own input,
+    /// which collapses the `n x C` stream to `C`, and our body runs at full
+    /// width `D`. The paper's Tab. 1 ablation puts `H_res` at -0.022 of the
+    /// -0.027 total, so the two terms we do wire are ~89% of the measured
+    /// effect (research/reviews/mhc-2026-09-30.md §3).
+    ///
+    /// `n = mhc_streams` defaults to **2** (the base paper 2409.19606 calls the
+    /// same quantity the "expansion rate" and Tab. 1 ablates it; 2604.21106v3
+    /// §5.2 ran K = 2). At our launch-bound profile the `n x n` Sinkhorn is a
+    /// launch-count cost, not a parameter cost, which is why the small rung
+    /// comes first - see [`crate::config::DormouseConfig::mhc_streams`].
+    pub mhc: Option<MhcBlock>,
     pub iter_embed: burn::module::Param<Tensor<2>>,
     pub residual_scale: burn::module::Param<Tensor<1>>,
     pub out_proj: LinearLike,
@@ -133,6 +162,10 @@ pub struct LoopBlock {
     /// so the branch is a config constant, like every other arm switch.
     #[module(skip)]
     pub use_attnres: bool,
+    /// Read [`LoopBlock::mhc`]. Plain field, same reason as `use_attnres`:
+    /// the branch is a config constant, not a shape test.
+    #[module(skip)]
+    pub use_mhc: bool,
     /// MoR routing arm (arXiv 2507.10524). Off by default; the fixed-depth
     /// mean readout is the default path.
     #[module(skip)]
@@ -235,6 +268,13 @@ impl LoopBlock {
             attnres: cfg
                 .use_attnres
                 .then(|| (0..cfg.max_iter).map(|_| AttnRes::new(d, device)).collect()),
+            // One shared block, applied once per iteration. `mhc_streams` is
+            // the expansion rate `n`; `validate` refuses a non-divisor of
+            // `d_model` LOUDLY, so the reshape inside `forward` cannot be the
+            // thing that tells the user which flag was wrong.
+            mhc: cfg
+                .use_mhc
+                .then(|| MhcBlock::new(cfg.mhc_streams, d, device)),
             iter_embed,
             // ReZero's residual coefficient starts at 1 (identity init), NOT 0:
             // at 0 the block body contributes nothing AND its gradient is
@@ -252,6 +292,7 @@ impl LoopBlock {
             depth_override: None,
             use_engram: cfg.use_engram,
             use_attnres: cfg.use_attnres,
+            use_mhc: cfg.use_mhc,
             use_mor: cfg.use_mor,
             mor_k: cfg.mor_k,
             engram_slot_mask: mask,
@@ -288,10 +329,11 @@ impl LoopBlock {
         // what makes the readout see the current iteration's deposit.
         let use_gr = self.gr.is_some();
         let use_attnres = self.use_attnres;
+        let use_mhc = self.use_mhc;
         assert!(
-            !(use_attnres && use_gr),
-            "use_attnres and use_gr both replace the residual accumulation; \
-             config::validate refuses this combination"
+            !(use_attnres && use_gr) && !(use_attnres && use_mhc) && !(use_gr && use_mhc),
+            "use_attnres, use_gr and use_mhc each replace the residual accumulation; \
+             config::validate refuses any two of them together"
         );
         let mut branches: Vec<Tensor<3>> = if use_gr {
             vec![h0.clone(); GR_BRANCHES]
@@ -523,11 +565,11 @@ impl LoopBlock {
             }
             let ffn = ffn.mul(w_ffn).reshape([b, t, d]);
 
-            // ReZero residual, AttnRes aggregation, or GR write (per-branch
-            // scalar deposit, Eq. 33-34). These are three spellings of ONE
-            // statement - how iteration n's block-body output joins the
-            // residual stream - and `config::validate` refuses the two that
-            // cannot both run.
+            // ReZero residual, AttnRes aggregation, GR write, or the mHC
+            // manifold projection (per-branch scalar deposit, Eq. 33-34).
+            // These are four spellings of ONE statement - how iteration n's
+            // block-body output joins the residual stream - and
+            // `config::validate` refuses the pairs that cannot both run.
             let y = attn.reshape([b, t, d]) + engram_a.reshape([b, t, d]) + ffn;
             if use_attnres {
                 crate::probe::note(crate::probe::ATTNRES);
@@ -557,6 +599,33 @@ impl LoopBlock {
                 let (x_next, st) = gr.read::<B>(&branches);
                 gr_state = Some(st);
                 h = x_next;
+            } else if use_mhc {
+                crate::probe::note(crate::probe::MHC);
+                // Eq. 3, at the loop boundary: `h' = H_res h + H_post . y`.
+                // The base is `h_ctx`, the SAME state ReZero's branch adds
+                // `y` to, so the A/B against ReZero differs in the residual
+                // OPERATOR and in nothing else - the iteration embedding, the
+                // block body and the readout are identical.
+                //
+                // `MhcBlock` reshapes the hidden state to `[b, t, n, D/n]` and
+                // Sinkhorn-projects a per-token `n x n` mix, so this is a
+                // handful of TINY kernels per iteration, not a GEMM: on this
+                // launch-bound box it is the arm's cost, and it is measured
+                // with the A/B rather than guessed here
+                // (research/reviews/mhc-2026-09-30.md §6).
+                //
+                // fp32 in, fp32 out (the rule every Linear here follows: mixed
+                // bf16 x fp32 NaNs on this stack), then the residual write goes
+                // back into the activation dtype.
+                let h_next = self
+                    .mhc
+                    .as_ref()
+                    .expect("use_mhc => mhc")
+                    .forward(
+                        if bf16 { h_ctx.clone().cast(FloatDType::F32) } else { h_ctx.clone() },
+                        &[if bf16 { y.clone().cast(FloatDType::F32) } else { y.clone() }],
+                    );
+                h = h_next.cast(h_ctx.dtype());
             } else if !use_attnres {
                 let scale = self.residual_scale.val().clone().reshape([1, 1, 1]);
                 // Store the residual back in the activation dtype (bf16
@@ -929,6 +998,742 @@ mod tests {
         ar.set_depth(Some(2));
         let _ = ar.forward_full_state::<B>(Tensor::zeros([2, 5, 32], &adev()), None, None, None, None, &head);
         assert_eq!(crate::probe::count(crate::probe::ATTNRES), 2, "depth 2 aggregated twice");
+    }
+
+    // ---- mHC (arXiv:2512.24880) ------------------------------------------------
+
+    /// The one fixture every mHC gate below is built on: a narrow, fast block
+    /// with the attention and memory arms off, so what differs between the arms
+    /// is the residual statement and nothing else.
+    fn mhc_cfg(depth: usize) -> DormouseConfig {
+        let mut cfg = DormouseConfig::default();
+        cfg.d_model = 32;
+        cfg.n_heads = 2;
+        cfg.head_dim = 16;
+        cfg.d_ffn = 64;
+        cfg.max_iter = depth;
+        cfg.n_experts = 1;
+        cfg.rank = 8;
+        cfg.engram_rows = 256;
+        cfg.use_kda = false;
+        cfg.use_engram = false;
+        cfg
+    }
+
+    fn mhc_head(cfg: &DormouseConfig) -> LinearLike {
+        LinearLike::with_tsct(cfg.d_model, 16, 8, cfg.use_tsct, &adev())
+    }
+
+    /// `MhcBlock::STATIC_INIT`, named here so the identity bound in
+    /// `mhc_res_leaves_the_identity...` can be PREDICTED (`(n-1) e^-10`) rather
+    /// than fitted. The crate keeps it private; the number is its own and is
+    /// asserted to still be 10, so a change upstream cannot silently retune
+    /// this gate's meaning.
+    const STATIC_INIT_REF: f64 = 10.0;
+
+    /// A `[1]` tensor from one number, for the `Param::from_tensor` knobs. Not
+    /// `from_floats([[x]])`: that is rank 2 and burns says so at runtime.
+    fn p1(x: f32) -> Param<Tensor<1>> {
+        Param::from_tensor(Tensor::<1>::from_data(
+            burn::tensor::TensorData::new(vec![x], [1]),
+            &adev(),
+        ))
+    }
+
+    /// THE MANIFOLD, ON THE MAPPINGS THE MODEL ACTUALLY BUILDS. This is the
+    /// form-fidelity gate, and it is deliberately NOT "the readout moved":
+    /// `attnres_moves_the_readout_at_every_depth` is the shape of gate that
+    /// stayed green through 511daa5's `d^-0.5` scale and L2 norm together - a
+    /// d-fold logit compression that changes the number and passes. What
+    /// distinguishes mHC from BOTH of its rivals is a property of the OPERATOR,
+    /// not of the output, and this asserts it in both directions:
+    ///
+    /// - **forward gain** = max |row sum| of `H_res` (Eq. 6: `H_res 1 = 1`),
+    /// - **backward gain** = max |column sum| (`1^T H_res = 1^T`),
+    ///
+    /// which are the paper's own Amax Gain Magnitude metrics (2512.24880 §3.1,
+    /// Fig. 7) and the two things ReZero (a scalar, no matrix) and AttnRes (a
+    /// softmax over sources, no stream mixing) simply do not have. Sinkhorn at
+    /// the paper's `t_max = 20` is an APPROXIMATE projection, so the columns
+    /// are the loose direction and the rows the tight one - §5.4 says exactly
+    /// that, and the gate says so rather than pretending one number serves
+    /// both.
+    #[test]
+    fn mhc_res_is_doubly_stochastic_in_both_directions() {
+        let cfg = mhc_cfg(2);
+        let blk = LoopBlock::new(&DormouseConfig { use_mhc: true, ..cfg.clone() }, &adev());
+        let mhc = blk.mhc.as_ref().expect("use_mhc => mhc");
+        assert_eq!(mhc.n_branches, 2, "the default expansion rate is n = 2");
+        let h = Tensor::<3>::random([2, 7, 32], Distribution::Normal(0.0, 1.0), &adev());
+        let (_, _, res) = mhc.hyper_mappings(&h);
+        assert_eq!(res.dims(), [2, 7, 2, 2], "H_res is [b, t, n, n]");
+        let r: Vec<f32> = res.into_data().try_to_vec().expect("[2,7,2,2] readable");
+        let (mut row_max, mut col_max) = (0.0f32, 0.0f32);
+        let mut min_entry = f32::MAX;
+        for bt in 0..(2 * 7) {
+            let m = &r[bt * 4..bt * 4 + 4];
+            for i in 0..2 {
+                let row: f32 = (0..2).map(|j| m[i * 2 + j]).sum();
+                let col: f32 = (0..2).map(|j| m[j * 2 + i]).sum();
+                row_max = row_max.max((row - 1.0).abs());
+                col_max = col_max.max((col - 1.0).abs());
+            }
+            min_entry = min_entry.min(m.iter().copied().fold(f32::MAX, f32::min));
+        }
+        assert!(
+            row_max < 1e-3,
+            "forward gain: max |rowsum(H_res) - 1| = {row_max:.3e}. The last \
+             normalization of Eq. 9 makes this exact, so anything above 1e-3 is \
+             a broken projection, not an approximation"
+        );
+        assert!(
+            col_max < 5e-2,
+            "backward gain: max |colsum(H_res) - 1| = {col_max:.3e}. The column \
+             pass runs FIRST inside the last iteration's pair and the row pass \
+             second, so at t_max = 20 this is the direction that has not \
+             converged - the paper measures the same asymmetry in Fig. 7(a)"
+        );
+        assert!(
+            min_entry >= 0.0,
+            "H_res must be non-negative (Eq. 6): {min_entry}"
+        );
+    }
+
+    /// THE MECHANISM, NOT ITS INIT. Two assertions in one, because they are one
+    /// question - "does `H_res` actually mix the streams?" - asked at both ends
+    /// of the trajectory, and the middle is the only place it can fail:
+    ///
+    /// 1. **At the paper's init it is the identity.** `b_res = 10 I` makes
+    ///    `Sinkhorn(exp(10 I)) ~ I`, and that is the POINT of the constraint
+    ///    (2512.24880 §4.1: it "restores the identity mapping property"), not
+    ///    a defect. So identity-at-init is asserted, and asserted to be close.
+    /// 2. **Off that init it leaves the identity while staying on the
+    ///    manifold.** This is the assertion that matters, and it is the
+    ///    published failure mode: 2603.20896 (s²HC, NeurIPS 2026) reports that
+    ///    under the doubly stochastic constraint "learned matrices collapse
+    ///    around the identity initialization and diminish cross-stream
+    ///    interactions". If our `b_res` perturbation left the composite AT the
+    ///    identity, the arm would be a slower ReZero and the A/B would be
+    ///    measuring nothing. The distance from the identity is measured, the
+    ///    manifold is re-checked after the perturbation, and the T-fold
+    ///    COMPOSITE is checked too - which is the quantity the paper's whole
+    ///    stability argument is about (Eq. 4), and the one that stays doubly
+    ///    stochastic under a shared block because the Birkhoff polytope is
+    ///    closed under multiplication.
+    ///
+    /// `N` is the configured `mhc_streams` (= 2), read from the block rather
+    /// than repeated, so this gate is a check of the CONFIGURED expansion rate
+    /// and not of a literal: `--set mhc_streams=4` has to move it too.
+    #[test]
+    fn mhc_res_leaves_the_identity_when_the_bias_moves_and_stays_on_the_manifold() {
+        let cfg = mhc_cfg(4);
+        let mut blk = LoopBlock::new(&DormouseConfig { use_mhc: true, ..cfg.clone() }, &adev());
+        let h = Tensor::<3>::random([1, 3, 32], Distribution::Normal(0.0, 1.0), &adev());
+        let n = blk.mhc.as_ref().expect("arm on").n_branches;
+        const N: usize = 2;
+        assert_eq!(n, N, "this gate's predicted literals are for n = 2");
+        const NN: usize = N * N;
+
+        // (1) at init: the identity. The bound is not a guess - `STATIC_INIT =
+        // 10` puts the off-diagonal ratio at `e^-10 = 4.54e-5`, and a row of
+        // `n` has `n - 1` of them, so the largest entry error is
+        // `(n-1) e^-10 = 4.54e-5` at n = 2 before the dynamic term contributes
+        // anything.
+        let h_res = |blk: &LoopBlock| -> Vec<f32> {
+            blk.mhc
+                .as_ref()
+                .expect("arm on")
+                .hyper_mappings(&h)
+                .2
+                .into_data()
+                .try_to_vec()
+                .expect("[1,3,n,n]")
+        };
+        let ident = |m: &[f32]| -> f64 {
+            let mut worst: f64 = 0.0;
+            for bt in 0..3 {
+                for i in 0..N {
+                    for j in 0..N {
+                        let want = if i == j { 1.0 } else { 0.0 };
+                        worst = worst.max((m[bt * NN + i * N + j] as f64 - want).abs());
+                    }
+                }
+            }
+            worst
+        };
+        let at_init = ident(&h_res(&blk));
+        println!(
+            "mhc H_res at init: max |entry - I| = {at_init:.3e} (predicted (n-1) \
+             e^-STATIC_INIT = {:.3e})",
+            (n - 1) as f64 * (-(STATIC_INIT_REF)).exp()
+        );
+        assert!(
+            at_init < 1e-3,
+            "H_res at the paper's init is not the identity (max entry error {at_init:.3e}, \
+             predicted (n-1) e^-STATIC_INIT = {:.3e}): the arm would start as a mixing \
+             operator it cannot undo",
+            (n - 1) as f64 * (-(STATIC_INIT_REF)).exp()
+        );
+
+        // (2) perturbed: the manifold holds and the streams MIX.
+        // `b_res = 2 (J - I)` - zero diagonal, a strong off-diagonal. The
+        // predicted readings, computed from Eq. 9 before this test was
+        // written: distance from the identity **0.8808**, off-diagonal mass
+        // **1.7616**, both row and column sums 1 to 1e-6.
+        //
+        // A NOTE ON WHAT "PERTURBED" MAY MEAN, because the first attempt at
+        // this gate was wrong in an instructive way: adding +/-1.75 to the
+        // init's `b_res = 10 I` moves the DIAGONAL to 12.5 and leaves the
+        // off-diagonals near 0, which is a *more* extreme identity, not a less
+        // one. It reads `2.6e-4` at n = 2 (and `3.5e-4` at n = 4) and looks like
+        // identity degeneration. Near `diag = 10` the map is exponentially
+        // stiff - one unit on a single off-diagonal moves `H_res` by ~2e-4 -
+        // which is a fact about the ARM (§6 of the findings file) and the
+        // reason the perturbation here has to be big enough to be visible.
+        let mhc = blk.mhc.as_mut().expect("arm on");
+        mhc.b_res = Param::from_tensor(Tensor::<2>::from_floats(
+            [[0.0, 2.0], [2.0, 0.0]],
+            &adev(),
+        ));
+        mhc.b_res = Param::from_tensor(Tensor::<2>::from_floats(
+            [[0.0, 2.0], [2.0, 0.0]],
+            &adev(),
+        ));
+        let moved = h_res(&blk);
+        let dist = ident(&moved);
+        assert!(
+            dist > 0.5,
+            "b_res = 2(J-I) left H_res at the identity (max entry error {dist:.3e}, \
+             predicted 0.8808). That is 2603.20896's identity degeneration: the \
+             arm would be a ReZero with a Sinkhorn in the way"
+        );
+        // And the manifold still holds at the perturbed point - the constraint
+        // is what makes the mixing safe, so a gate that checked one without
+        // the other would pass an unconstrained mixing matrix.
+        for bt in 0..3 {
+            let m = &moved[bt * NN..bt * NN + NN];
+            for i in 0..N {
+                let row: f32 = (0..N).map(|j| m[i * N + j]).sum();
+                let col: f32 = (0..N).map(|j| m[j * N + i]).sum();
+                assert!(
+                    (row - 1.0).abs() < 1e-3 && (col - 1.0).abs() < 5e-2,
+                    "perturbed H_res left the Birkhoff polytope: rowsum {row}, colsum {col}"
+                );
+            }
+        }
+        // The COMPOSITE over the loop's T iterations. With one shared block the
+        // paper's `prod_i H_res^i` (Eq. 4) is a POWER of a doubly stochastic
+        // matrix, hence still doubly stochastic - that is the closure property
+        // the entire stability argument rests on, and at T = 2-4 it is the only
+        // part of the mechanism that our depth even exercises.
+        //
+        // The second half is the paper's §4.1 point 3: repeated application
+        // "tends to increase the mixing of information across streams
+        // monotonically". The fixed point of a doubly stochastic matrix under
+        // multiplication is the uniform `J/n`, so the honest form of that claim
+        // is **the composite's distance to `J/n` shrinks with T** - NOT that
+        // its off-diagonal mass grows, which is the version this gate used to
+        // assert and which is FALSE at n = 2.
+        //
+        // Why, and it is a real prediction for the A/B rather than a fixture
+        // quibble: a symmetric `H_res` has a second eigenvalue
+        // `2 * exp(0) ... ` - measured, `{1, -0.7616}` at n = 2 - so `H_res^T`
+        // ALTERNATES about the fixed point instead of approaching it from one
+        // side. Off-diagonal mass at n = 2 over T = 1..5: 1.7616, 0.4200,
+        // 1.4417, 0.6636, 1.2562. A two-stream residual CAN overshoot the
+        // uniform mix and come back, and at our `T = 2-4` that means the
+        // composite is LESS mixed than a single pass. What does hold at every T
+        // is the distance to `J/n` (0.7616, 0.5800, 0.4417, 0.3364, 0.2562 -
+        // monotone, because `|lambda| < 1` so `|lambda|^T` is), so that is what
+        // is asserted, and the oscillation is asserted to exist so a change
+        // that made it go away would be a change, not a fix.
+        let hr = Tensor::<2>::from_floats(
+            [[moved[0], moved[1]], [moved[2], moved[3]]],
+            &adev(),
+        );
+        let mut comp = hr.clone();
+        for _ in 1..cfg.max_iter {
+            comp = comp.clone().matmul(hr.clone());
+        }
+        let c: Vec<f32> = comp.into_data().try_to_vec().expect("[n,n]");
+        for i in 0..N {
+            let row: f32 = (0..N).map(|j| c[i * N + j]).sum();
+            let col: f32 = (0..N).map(|j| c[j * N + i]).sum();
+            assert!(
+                (row - 1.0).abs() < 1e-2 && (col - 1.0).abs() < 1e-2,
+                "the T={} composite is not doubly stochastic (rowsum {row}, colsum \
+                 {col}): the closure property the whole stability argument rests on",
+                cfg.max_iter
+            );
+        }
+        // Off-diagonal mass of the uniform `J/n` is `n(n-1)/n = n - 1`. Both
+        // sides are ONE position: `moved` holds all `n_bt = 3` and `c` is a
+        // single `n x n`, so summing the whole buffer on one side and not the
+        // other would compare a 3x quantity against a 1x one - an assertion
+        // that still passes and means nothing.
+        let first = &moved[..NN];
+        let off = |m: &[f32]| -> f32 {
+            m.iter().sum::<f32>() - (0..N).map(|i| m[i * N + i]).sum::<f32>()
+        };
+        let (o1, o4, uniform) = (off(first), off(&c), (N - 1) as f32);
+        let (d1, d4) = ((o1 - uniform).abs(), (o4 - uniform).abs());
+        println!(
+            "mhc H_res perturbed: max |entry - I| = {dist:.4} (predicted 0.8808), \
+             off-diagonal mass {o1:.4} -> {o4:.4} over T={} (uniform J/n = {uniform}, \
+             predicted 1.7616 -> 0.6636); distance to J/n {d1:.4} -> {d4:.4} \
+             (predicted 0.7616 -> 0.3364)",
+            cfg.max_iter
+        );
+        assert!(
+            d4 < d1,
+            "the composite is no closer to the uniform mixing matrix than one pass \
+             (distance {d1:.4} -> {d4:.4}, predicted 0.7616 -> 0.3364). A loop that \
+             does not converge toward uniform mixing is not what the arm is for"
+        );
+        assert!(
+            o4 > 1e-3 && d4 > 0.0,
+            "the composite is at or below the identity (off-diagonal mass {o4:.4}): \
+             the streams are not mixing at all, so the arm is a slower ReZero"
+        );
+    }
+
+    /// A DROP-IN AT STEP 0, WITH THE SIZE OF THE STEP STATED. The crate's init
+    /// (`b_res = 10 I`, `b_post = 0` -> `H_post = 2 sigma(0) = 1`) makes the
+    /// mHC write `h + y`, which is ReZero's write at its own init
+    /// (`residual_scale = 1`). So the A/B starts from the same function both
+    /// arms start from, up to the initialisation's own error - and this gate is
+    /// what makes that a measured number instead of a claim.
+    ///
+    /// **ONE block, both branches.** The obvious spelling - build a ReZero model
+    /// and an mHC model and compare - is VACUOUS here, and the trap is worth
+    /// naming: `LoopBlock::new` draws every weight from the device RNG, and two
+    /// constructions in one process get two different sets (the 2026-09-30
+    /// finding: `Device::seed` does not rewind a consumed stream, and
+    /// `Device::flex()` is shared). That version passes with a relative
+    /// difference of **1.686** - which is two different networks, not two
+    /// residual operators. Toggling `use_mhc` on ONE block is the experiment:
+    /// same weights, same block body, same readout, one statement apart.
+    ///
+    /// It also has teeth: `H_post = sigma(.)` without Eq. 8's factor 2 would
+    /// make this `h + y/2` (a 50% error), a missing Sinkhorn `h + 10 I y` (an
+    /// order of magnitude), a transposed `H_post` a 33% re-weighting. A
+    /// tolerance of 1e-2 is two orders below the smallest of those.
+    #[test]
+    fn mhc_at_init_is_rezero_at_scale_one() {
+        let cfg = mhc_cfg(2);
+        let mut blk = LoopBlock::new(&DormouseConfig { use_mhc: true, ..cfg.clone() }, &adev());
+        let head = mhc_head(&cfg);
+        let x = Tensor::<3>::random([2, 5, 32], Distribution::Normal(0.0, 1.0), &adev());
+        let (o_mh, _, _, _) =
+            blk.forward_full_state::<B>(x.clone(), None, None, None, None, &head);
+        // The scalar ReZero is about to be compared against must BE 1.
+        assert_eq!(blk.residual_scale.val().clone().into_scalar::<f32>(), 1.0);
+        // Same object, ReZero's statement. `mhc` stays allocated (so the
+        // parameter set is identical and only the branch differs), and the
+        // counter says which branch ran.
+        blk.use_mhc = false;
+        crate::probe::reset();
+        let (o_rz, _, _, _) = blk.forward_full_state::<B>(x, None, None, None, None, &head);
+        assert_eq!(crate::probe::count(crate::probe::MHC), 0, "the toggle did not take");
+
+        let scale = o_rz.clone().abs().max().into_scalar::<f32>();
+        let rel = (o_rz.clone() - o_mh).abs().max().into_scalar::<f32>() / scale;
+        println!(
+            "mhc@init vs ReZero@scale1 on identical weights: relative {rel:.3e} \
+             (bounds: > 1e-6 so an inert arm fails, < 1e-2)"
+        );
+        assert!(
+            rel < 1e-2,
+            "mHC at init is not ReZero at residual_scale = 1: relative {rel:.3e}"
+        );
+        // Named, because a bound nobody printed is a guess: the init's own
+        // error is set by `H_post = 2 sigma(b_post + alpha x' phi_post)`, and
+        // `b_post = 0` with `alpha = 0.01` puts it within ~0.5% of 1, and by
+        // `H_res` being the identity to `(n-1) e^-10 = 1.4e-4`.
+        assert!(
+            rel > 1e-6,
+            "mHC at init is BITWISE ReZero ({rel:.3e}): the Sinkhorn and the \
+             hyper-network are not in the write at all, so the arm is inert"
+        );
+    }
+
+    /// TWO-SIDED SEPARATION: this is the "zero-default identity" claim in the
+    /// only form one process can witness. ReZero's knob must move the ReZero
+    /// arm and NOT the mHC arm; mHC's knob must move the mHC arm and not the
+    /// ReZero arm. A branch-ordering slip - the new `else if` swallowing the
+    /// ReZero statement, or ReZero's `residual_scale` leaking into the mHC
+    /// write - is invisible to "did the output change" and fatal here.
+    ///
+    /// What this CANNOT claim, stated so nobody reads more into it: a
+    /// bitwise-equal CE against a build from before this flag existed is a
+    /// CROSS-PROCESS fact (two RNG streams, two `ParamId` counters) and belongs
+    /// to `tools/determinism.py`. What is provable in one process is the
+    /// parameter set - an `Option<MhcBlock>` that is `None` contributes no
+    /// records - and this knob separation.
+    #[test]
+    fn mhc_and_rezero_each_move_only_their_own_write() {
+        let cfg = mhc_cfg(2);
+        let head = mhc_head(&cfg);
+        let x = Tensor::<3>::random([2, 5, 32], Distribution::Normal(0.0, 1.0), &adev());
+        let run = |blk: &mut LoopBlock| -> Tensor<3> {
+            blk.forward_full_state::<B>(x.clone(), None, None, None, None, &head).0
+        };
+        let far = |a: &Tensor<3>, b: &Tensor<3>| -> f32 {
+            (a.clone() - b.clone()).abs().max().into_scalar::<f32>()
+        };
+
+        // ReZero arm: moving its scalar moves it, and moving mHC's block cannot
+        // even be expressed (the block does not exist).
+        let mut rz = LoopBlock::new(&cfg, &adev());
+        assert!(rz.mhc.is_none(), "use_mhc = false must not BUILD the block");
+        let rz_a = run(&mut rz);
+        rz.residual_scale = p1(0.5);
+        let rz_b = run(&mut rz);
+        assert!(
+            far(&rz_a, &rz_b) > 1e-6,
+            "residual_scale moved and the ReZero arm did not: the write is not the \
+             branch this test thinks it is"
+        );
+
+        // mHC arm: residual_scale is INERT there, and b_res is the live knob.
+        let mut mh = LoopBlock::new(&DormouseConfig { use_mhc: true, ..cfg }, &adev());
+        let mh_a = run(&mut mh);
+        mh.residual_scale = p1(0.5);
+        let mh_b = run(&mut mh);
+        assert_eq!(
+            far(&mh_a, &mh_b),
+            0.0,
+            "residual_scale reached the mHC write: the A/B against ReZero would \
+             not be a single-factor comparison"
+        );
+        let mhc = mh.mhc.as_mut().expect("arm on");
+        mhc.b_res = Param::from_tensor(Tensor::<2>::from_floats(
+            [[0.0, 2.0], [2.0, 0.0]],
+            &adev(),
+        ));
+        let mh_c = run(&mut mh);
+        assert!(
+            far(&mh_b, &mh_c) > 1e-6,
+            "b_res moved and the mHC arm did not: the manifold projection is not \
+             in the write"
+        );
+    }
+
+    /// GRADIENTS, PER PARAMETER GROUP, WITH THE MAGNITUDES. `forward_full_state`
+    /// is instantiated on `Autodiff<Flex, BalancedCheckpointing>` - the
+    /// trainer's own backend - because that is where `8fa5d4c` lived: a node
+    /// that came back `UnTracked`, ran thousands of forwards and trained
+    /// nothing, with a healthy loss curve throughout.
+    ///
+    /// The gate is per-parameter rather than "the loss has a gradient", because
+    /// the per-parameter version is the one that catches a DETACHED ARM. It
+    /// also pins the one parameter that is SUPPOSED to have no gradient:
+    /// `phi_pre` builds `H_pre`, which Eq. 3 applies to the block's own input
+    /// and this wiring does not compute (see [`LoopBlock::mhc`]). A dead
+    /// 1 536-parameter matrix in a model whose A/B is about whether the arm
+    /// earns its place is a defect, and the cheap fix is to know about it.
+    #[test]
+    fn mhc_gradients_reach_every_wired_parameter() {
+        let cfg = mhc_cfg(2);
+        let blk = LoopBlock::new(&DormouseConfig { use_mhc: true, ..cfg.clone() }, &adev());
+        let head = mhc_head(&cfg);
+        let x = Tensor::<3>::random([2, 5, 32], Distribution::Normal(0.0, 1.0), &adev());
+        // TARGETS, or `L_Rec` is never accumulated: `forward_full_state` only
+        // builds a CE term `if let Some(tgt) = &targets`, so with `None` the
+        // returned `rec` is the zero it started as - a leaf, and `backward()`
+        // refuses it. The gate would then be measuring burn's error message.
+        let tgt = Tensor::<2, Int>::zeros([2 * 5, 1], &adev());
+        let (_, rec, _, _) =
+            blk.forward_full_state::<B>(x, None, None, None, Some(tgt), &head);
+        let grads = rec.backward();
+        let mhc = blk.mhc.as_ref().expect("arm on");
+        // `b_res` is the one that matters: it is the whole mechanism, and
+        // 2603.20896's identity degeneration is exactly a `b_res` that stops
+        // moving.
+        fn mag<const D: usize>(
+            p: &Param<Tensor<D>>,
+            grads: &burn::tensor::Gradients,
+        ) -> (f32, usize) {
+            let g = p
+                .grad(grads)
+                .unwrap_or_else(|| panic!("parameter carries no gradient slot: the mHC write is a leaf"));
+            let v: Vec<f32> = g.into_data().try_to_vec().expect("readable gradient");
+            (
+                v.iter().fold(0.0f32, |m, x| m.max(x.abs())),
+                v.len(),
+            )
+        }
+        for (name, (m, len)) in [
+            ("b_res", mag(&mhc.b_res, &grads)),
+            ("b_post", mag(&mhc.b_post, &grads)),
+            ("alpha_res", mag(&mhc.alpha_res, &grads)),
+            ("alpha_post", mag(&mhc.alpha_post, &grads)),
+            ("phi_res", mag(&mhc.phi_res, &grads)),
+            ("phi_post", mag(&mhc.phi_post, &grads)),
+        ] {
+            println!("mhc grad {name}: max |g| = {m:.3e} over {len} entries");
+            assert!(
+                m > 0.0 && m.is_finite(),
+                "{name}: max |grad| = {m:.3e} over {len} entries - zero means the arm \
+                 is not being trained, non-finite means it is being trained badly"
+            );
+        }
+        // The three parameters Eq. 3 needs and this wiring does not use
+        // (`H_pre`'s half: `phi_pre`, its gate `alpha_pre`, its static bias
+        // `b_pre`). `forward` never reads them, so they are not in the graph at
+        // all and `grad()` returns `None` rather than zeros - which is the
+        // stronger form of the same statement and worth asserting exactly: a
+        // reader who finds 1 792 dead parameters in a gradient dump should find
+        // them named here first, and a future change that starts using H_pre
+        // trips this message instead of silently doubling the arm.
+        for (name, present) in [
+            ("phi_pre", mhc.phi_pre.grad(&grads).is_some()),
+            ("alpha_pre", mhc.alpha_pre.grad(&grads).is_some()),
+            ("b_pre", mhc.b_pre.grad(&grads).is_some()),
+        ] {
+            assert!(
+                !present,
+                "{name} is IN the graph, so something started using H_pre. The \
+                 wiring, `research/reviews/mhc-2026-09-30.md` 3.3 and this test all \
+                 say it does not - reconcile them before trusting a gradient dump"
+            );
+        }
+    }
+
+    /// THE THREE ARMS ARE THREE FUNCTIONS, ON ONE SET OF INPUTS. ReZero,
+    /// AttnRes and mHC replace the same statement, so a wiring slip that made
+    /// two of them the same function would be a valid loss curve and a
+    /// meaningless A/B. The comparison is at the OPERATOR level - the three
+    /// residual writes, on the same `h` and the same `y` - because that is the
+    /// claim, and because the model-level spelling is vacuous: three
+    /// `LoopBlock::new` calls draw three different weight sets from the device
+    /// RNG (see `mhc_at_init_is_rezero_at_scale_one`), so the model-level
+    /// version of this test passes with any three arms, including three copies
+    /// of the same one.
+    ///
+    /// The two levels answer different halves and both are kept:
+    /// - **operator level (this test)**: on one `h`, one `y`, the mHC write at
+    ///   its init is ReZero's to 1e-2 and both are a long way from AttnRes's
+    ///   equal-weight mean; move `b_res` off the init and mHC separates from
+    ///   ReZero by O(1). Numbers, not "it changed".
+    /// - **model level**
+    ///   (`mhc_moves_the_readout_at_every_depth`): the flag changes the model's
+    ///   own output at every depth, which is the cheap half and the one
+    ///   `attnres_moves_the_readout_at_every_depth` already established as
+    ///   necessary-but-not-sufficient.
+    #[test]
+    fn the_three_residual_operators_are_three_functions() {
+        let cfg = mhc_cfg(2);
+        let blk = LoopBlock::new(&DormouseConfig { use_mhc: true, ..cfg.clone() }, &adev());
+        let mhc = blk.mhc.as_ref().expect("arm on");
+        let d = 32usize;
+        let h = Tensor::<3>::random([2, 5, d], Distribution::Normal(0.0, 1.0), &adev());
+        let y = Tensor::<3>::random([2, 5, d], Distribution::Normal(0.0, 1.0), &adev());
+        let gap = |a: &Tensor<3>, b: &Tensor<3>| -> f32 {
+            (a.clone() - b.clone()).abs().max().into_scalar::<f32>()
+        };
+        // ReZero at its init: `h + y·s`, `s = 1`.
+        let rz = h.clone() + y.clone();
+        // AttnRes at its init: the equal-weight mean of the token embedding and
+        // this iteration's body (`w_l = 0` -> a uniform softmax), fed the same
+        // two states the other two are fed.
+        let ar = depth_attend(&[h.clone(), y.clone()], Tensor::<1>::zeros([d], &adev()));
+        // mHC at its init.
+        let mh = mhc.forward(h.clone(), std::slice::from_ref(&y));
+        let scale = rz.clone().abs().max().into_scalar::<f32>();
+
+        let (mh_rz, mh_ar, ar_rz) = (
+            gap(&mh, &rz) / scale,
+            gap(&mh, &ar) / scale,
+            gap(&ar, &rz) / scale,
+        );
+        assert!(
+            mh_rz < 1e-2,
+            "mHC at init is not ReZero at scale 1: relative {mh_rz:.3e}"
+        );
+        assert!(
+            mh_ar > 0.1,
+            "mHC at init is AttnRes (relative {mh_ar:.3e}): two different residual \
+             operators, one function"
+        );
+        assert!(
+            ar_rz > 0.1,
+            "AttnRes is ReZero (relative {ar_rz:.3e}): the FIXTURE is degenerate and \
+             the two comparisons above prove nothing"
+        );
+
+        // Off the init, mHC separates from ReZero by O(1) - the number the A/B
+        // will be measuring, quoted before it is run. The perturbation is
+        // `2 (J - I)` for the reason `mhc_res_leaves_the_identity...` gives:
+        // scaling the DIAGONAL (`6 I`) makes the map MORE of an identity, not
+        // less, and reads 6.2e-3 where the point of the gate is an O(1) gap.
+        let mut moved = LoopBlock::new(&DormouseConfig { use_mhc: true, ..cfg }, &adev());
+        let m = moved.mhc.as_mut().expect("arm on");
+        m.b_res = Param::from_tensor(Tensor::<2>::from_floats(
+            [[0.0, 2.0], [2.0, 0.0]],
+            &adev(),
+        ));
+        let mh2 = moved.mhc.as_ref().expect("arm on").forward(h, std::slice::from_ref(&y));
+        let sep = gap(&mh2, &rz) / scale;
+        println!(
+            "mhc operator separations (relative to max|h+y|): mHC@init vs ReZero \
+             {mh_rz:.3e}, mHC@init vs AttnRes {mh_ar:.3e}, AttnRes vs ReZero \
+             {ar_rz:.3e}, mHC@2(J-I) vs ReZero {sep:.3e}"
+        );
+        assert!(
+            sep > 0.05,
+            "b_res = 2(J-I) did not separate mHC from ReZero (relative {sep:.3e}): \
+             the projection is not in the write"
+        );
+    }
+
+    /// The model-level half: the flag changes the model's own output, at every
+    /// depth, and the counter follows. Cheap, and the necessary condition the
+    /// AttnRes arm established; the sufficiency lives in
+    /// `the_three_residual_operators_are_three_functions` and in
+    /// `mhc_res_is_doubly_stochastic_in_both_directions`.
+    #[test]
+    fn mhc_moves_the_readout_at_every_depth() {
+        for depth in [1usize, 2, 4] {
+            let cfg = mhc_cfg(depth);
+            let mut blk = LoopBlock::new(&DormouseConfig { use_mhc: true, ..cfg }, &adev());
+            let head = mhc_head(&mhc_cfg(depth));
+            let x = Tensor::<3>::random([2, 5, 32], Distribution::Normal(0.0, 1.0), &adev());
+            // Same object, both branches: two `LoopBlock::new` calls would
+            // differ by their initialisation, not by their residual operator.
+            crate::probe::reset();
+            let (on, _, _, _) =
+                blk.forward_full_state::<B>(x.clone(), None, None, None, None, &head);
+            assert_eq!(crate::probe::count(crate::probe::MHC), depth as u64);
+            blk.use_mhc = false;
+            let (off, _, _, _) =
+                blk.forward_full_state::<B>(x.clone(), None, None, None, None, &head);
+            crate::probe::reset();
+            blk.forward_full_state::<B>(Tensor::zeros([2, 5, 32], &adev()), None, None, None, None, &head);
+            assert_eq!(crate::probe::count(crate::probe::MHC), 0, "the ReZero branch does not project");
+            let diff = (on - off).abs().max().into_scalar::<f32>();
+            assert!(
+                diff > 1e-6,
+                "depth {depth}: use_mhc changed no output (max {diff:.3e}) - the arm ran \
+                 and its result was discarded, which is GR's 9b343d3 defect"
+            );
+        }
+    }
+
+    /// THE COUNTER, and the refusals, and the flag's default - the three things
+    /// that make `use_mhc` an arm rather than a decoration.
+    #[test]
+    fn mhc_counts_every_iteration_and_is_refused_alongside_the_others() {
+        let cfg = mhc_cfg(4);
+        let head = mhc_head(&cfg);
+        let x = Tensor::<3>::random([2, 5, 32], Distribution::Normal(0.0, 1.0), &adev());
+
+        crate::probe::reset();
+        let mh = LoopBlock::new(&DormouseConfig { use_mhc: true, ..cfg.clone() }, &adev());
+        let _ = mh.forward_full_state::<B>(x.clone(), None, None, None, None, &head);
+        assert_eq!(crate::probe::count(crate::probe::MHC), 4, "one projection per iteration at depth 4");
+        crate::probe::reset();
+        let mut mh = LoopBlock::new(&DormouseConfig { use_mhc: true, ..cfg.clone() }, &adev());
+        mh.set_depth(Some(2));
+        let _ = mh.forward_full_state::<B>(x.clone(), None, None, None, None, &head);
+        assert_eq!(crate::probe::count(crate::probe::MHC), 2, "the counter counts what RAN");
+        crate::probe::reset();
+        let rz = LoopBlock::new(&cfg, &adev());
+        let _ = rz.forward_full_state::<B>(x, None, None, None, None, &head);
+        assert_eq!(crate::probe::count(crate::probe::MHC), 0, "ReZero does not project");
+
+        // The default is off, so the parameters do not exist and every shipped
+        // checkpoint still loads.
+        assert!(!DormouseConfig::default().use_mhc);
+        assert!(LoopBlock::new(&cfg, &adev()).mhc.is_none());
+        // What the arm costs, MEASURED on the instantiated block rather than
+        // arithmetic on the paper's shapes: `2 D n + D n^2 + 2n + n^2 + 3`
+        // (phi_pre, phi_post, phi_res, the three alpha scalars, b_pre, b_post,
+        // b_res). The arithmetic and the fixture width disagreed in this
+        // file's own notes - `small` is `d_model = 768`, not 384 - and the
+        // whole point of `preset_exec` is that a count is a measurement.
+        //
+        // `MhcBlock::new` directly, NOT a `small` `LoopBlock`: two of those
+        // cost 489 s of this suite by themselves, for a number that is a
+        // function of three shapes and nothing else. Measured on this machine.
+        let small = crate::config::load_config("small").expect("the small preset loads");
+        for n in [2usize, 4] {
+            let mhc = MhcBlock::new(n, small.d_model, &adev());
+            // Two groups, not one array: `phi_*`/`b_res` are `Param<Tensor<2>>`
+            // and `alpha_*`/`b_pre`/`b_post` are `Param<Tensor<1>>`, and a Rust
+            // array literal takes its element type from the first entry, so one
+            // list of all nine is a type error rather than a count.
+            let count2: usize = [&mhc.phi_pre, &mhc.phi_post, &mhc.phi_res, &mhc.b_res]
+                .iter()
+                .map(|p| p.val().clone().dims().iter().product::<usize>())
+                .sum();
+            let count1: usize = [
+                &mhc.alpha_pre,
+                &mhc.alpha_post,
+                &mhc.alpha_res,
+                &mhc.b_pre,
+                &mhc.b_post,
+            ]
+            .iter()
+            .map(|p| p.val().clone().dims().iter().product::<usize>())
+            .sum();
+            let count = count1 + count2;
+            let want = 2 * small.d_model * n + small.d_model * n * n + 2 * n + n * n + 3;
+            println!("mhc n={n} on small (d_model={}): {count} params", small.d_model);
+            assert_eq!(count, want, "the paper's shapes and the built block disagree");
+            if n == 2 {
+                assert!(
+                    count * 200 < 9_197_390,
+                    "the arm must stay a rounding error against small's 9 197 390: {count}"
+                );
+            }
+        }
+
+        // Mutually exclusive with BOTH of the arms it competes with, and the
+        // error names every flag that is on.
+        for other in ["use_gr", "use_attnres"] {
+            let c = DormouseConfig { use_mhc: true, ..cfg.clone() };
+            let both = if other == "use_gr" {
+                DormouseConfig { use_gr: true, ..c }
+            } else {
+                DormouseConfig { use_attnres: true, ..c }
+            };
+            let err = crate::config::validate(&both).expect_err("two residual arms must be refused");
+            assert!(
+                err.contains("use_mhc") && err.contains(other),
+                "the refusal must name both flags: {err}"
+            );
+        }
+        // Each alone is legal, and mHC alone at the default n = 2 divides the
+        // fixture's d_model = 32.
+        for on in [
+            DormouseConfig { use_mhc: true, ..cfg.clone() },
+            DormouseConfig { use_gr: true, ..cfg.clone() },
+            DormouseConfig { use_attnres: true, ..cfg.clone() },
+        ] {
+            assert!(crate::config::validate(&on).is_ok(), "one arm alone must validate");
+        }
+        // A non-divisor is LOUD at startup, not a reshape panic in the first
+        // forward: 32 % 3 != 0, and 3 streams would be a valid-looking config
+        // that trains nothing but crashes.
+        let err = crate::config::validate(&DormouseConfig { use_mhc: true, mhc_streams: 3, ..cfg })
+            .expect_err("3 does not divide 32");
+        assert!(
+            err.contains("mhc_streams") && err.contains("32"),
+            "the refusal must name the field and the width: {err}"
+        );
+        // `n = 0` is refused too: `MhcBlock::new` would `max(1)` it silently,
+        // so a config asking for zero streams would train the n = 1 arm - which
+        // 2409.19606 Tab. 1 measures as WORSE than the Pre-Norm baseline.
+        let err = crate::config::validate(&DormouseConfig { use_mhc: true, mhc_streams: 0, ..mhc_cfg(2) })
+            .expect_err("0 streams is not a configuration");
+        assert!(err.contains("mhc_streams"), "the refusal must name the field: {err}");
+        // n = 4 (the base paper's App. Tab. 1 rung) is a flag away and also
+        // legal - the follow-up row, not this one.
+        assert!(
+            crate::config::validate(&DormouseConfig { use_mhc: true, mhc_streams: 4, ..mhc_cfg(2) })
+                .is_ok()
+        );
     }
 
     /// The block's wiring uses the configured floor, and the row budget

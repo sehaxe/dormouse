@@ -87,6 +87,19 @@ fn sinkhorn_kernel<F: Float>(
             j += 1;
         }
         let mut rn = rs;
+        // KNOWN DEFECT, by inspection, and covered by NO test
+        // (research/reviews/mhc-2026-09-30.md 5.1): this floor is a SILENT
+        // divergence from the tensor path, which runs the same normalization in
+        // the log domain and has no floor at all. `sinkhorn.rs:12-21` is the
+        // whole reason the tensor path is written that way - a row sum that
+        // underflows to zero makes the column pass emit inf and the next pass
+        // NaN - and this line reinstates the failure the rewrite exists to
+        // prevent, on every row (and column, at `cn` below) whose true sum is
+        // under 1e-7. A row that is genuinely 1e-20 is divided by 1e-7 and
+        // comes out 1e13 times too large; the tensor path returns the 1e-20.
+        // Not reachable from `MhcBlock` at init (`b_res = 10 I` puts the
+        // diagonal at e^10), and the ADR-0011 mark it needs is COUNTED or
+        // LOUD, not the SILENT one it currently carries.
         if rn < F::new(1e-7_f32) {
             rn = F::new(1e-7_f32);
         }
@@ -560,6 +573,112 @@ mod seam_tests {
         assert!(reach::<NoCheckpointing>(&xp).is_some());
         assert!(reach::<BalancedCheckpointing>(&xp).is_none());
     }
+
+    /// "THE SEAM REACHED" IS NOT "THE GRADIENT FLOWS", and the gap between
+    /// those two sentences is `8fa5d4c`: burn-gdn2's hand-rolled node came back
+    /// `UnTracked` under `BalancedCheckpointing`, the arms ran thousands of
+    /// forwards, the loss curve looked healthy, and the attention arm stayed at
+    /// initialisation for the whole history of that project. The test above
+    /// only ever proved `reach().is_some()`.
+    ///
+    /// What this adds, and the limit of what it can add: on a CPU-only build
+    /// `sinkhorn_knopp` never reaches `sinkhorn_autodiff_s` at all (the probe
+    /// in `sinkhorn.rs:23-45` is `cfg(all(cuda, autodiff))`), so this gate pins
+    /// the TENSOR path - that the answer the fused node would replace really is
+    /// differentiable under the trainer's own strategy. It cannot certify the
+    /// fused node; `fused_node_carries_a_gradient` below is that gate, and it
+    /// needs a card.
+    #[test]
+    fn the_tensor_path_carries_a_gradient_under_both_strategies() {
+        fn grad_of<S: CheckpointStrategy>() -> Vec<f32>
+        where
+            DispatchTensor: DispatchKindConversion<Ad<Nd, S>> + DispatchKindConversion<Nd>,
+        {
+            let dev = Device::ndarray().autodiff().gradient_checkpointing();
+            // A NON-CONSTANT input. `ones` makes the sinkhorn's output
+            // constant in every entry, so `dL/dlogits` is legitimately zero and
+            // this gate would be green for the wrong reason - the same shape as
+            // the constant fixture that let 511daa5's score-form defect through.
+            let x = Tensor::<4>::from_floats(
+                [[[[0.9, 0.3, -0.7, 1.1], [0.2, -0.4, 0.9, 0.1]]]],
+                &dev,
+            )
+            .require_grad();
+            let out = sinkhorn_autodiff_s::<Nd, S>(x.clone(), 2).expect("the seam accepts this");
+            let grads = out.powf_scalar(2.0).sum().backward();
+            let g = x.grad(&grads).expect("a leaf input must carry a gradient");
+            g.into_data()
+                .bytes
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                .collect()
+        }
+        for (label, g) in [
+            ("BalancedCheckpointing", grad_of::<BalancedCheckpointing>()),
+            ("NoCheckpointing", grad_of::<NoCheckpointing>()),
+        ] {
+            assert!(
+                g.iter().any(|v| v.abs() > 1e-8),
+                "{label}: the sinkhorn's gradient is identically zero - the output is a \
+                 leaf and nothing here trains"
+            );
+            assert!(
+                g.iter().all(|v| v.is_finite()),
+                "{label}: non-finite gradient {g:?}"
+            );
+        }
+    }
+}
+
+/// THE FUSED NODE'S OWN GRADIENT GATE. It is `#[ignore]`d and it is NOT
+/// compiled in a CPU build, because a `#[cfg(test)]` that resolves to nothing
+/// is the `burn-rmsnorm` defect (34c5631 shipped that way) and a gate nobody
+/// can run is not a gate. It exists as the COMMAND:
+///
+/// ```text
+/// cargo test -p burn-mhc --features cuda,autodiff -- --ignored fused_node_carries_a_gradient
+/// ```
+///
+/// What it must assert, clause by clause, and why each is load-bearing:
+/// 1. `seam_counts().0` advanced - already proven on CPU, cheap to re-check;
+/// 2. **the gradient is non-zero and finite** - the `8fa5d4c` clause, and the
+///    only one that cannot be checked anywhere else in this crate;
+/// 3. it matches the TENSOR path's gradient under a RELATIVE tolerance.
+///    `sinkhorn_fused_backward_matches_tensor` below uses `md < 1e-3` ABSOLUTE
+///    on a quantity whose scale is set by `n` and `iters`: the same number
+///    passes at n=4 and fails at n=16 for a kernel that is exactly as correct.
+///    That is the "absolute tolerance on a value that moved scale" class;
+/// 4. both directions of the Birkhoff constraint at 20 iterations, measured
+///    not assumed. The paper's Fig. 7(a) says the FORWARD gain (max absolute
+///    ROW sum) sits at ~1 while the BACKWARD gain (max absolute COLUMN sum)
+///    deviates, and §5.4 says the composite deviation grows with depth
+///    (max ~1.6). So a single absolute `1e-2` on both is a guess about a number
+///    nobody in this crate has measured.
+#[cfg(all(test, feature = "cuda", feature = "autodiff"))]
+#[ignore = "needs a GPU: cargo test -p burn-mhc --features cuda,autodiff -- --ignored"]
+fn fused_node_carries_a_gradient() {
+    let dev = Device::default();
+    let (b, t, n) = (2usize, 4usize, 4usize);
+    let iters = crate::SINKHORN_ITERS;
+    let logits = Tensor::<4>::random([b, t, n, n], Distribution::Normal(0.0, 1.0), &dev);
+    let lf = logits.clone().require_grad();
+    let grads = crate::sinkhorn_knopp(lf.clone(), iters)
+        .powf_scalar(2.0)
+        .sum()
+        .backward();
+    let g = lf
+        .grad(&grads)
+        .expect("a fused-node leaf would arrive here with no gradient at all");
+    let v: Vec<f32> = g
+        .into_data()
+        .bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+    assert!(
+        v.iter().any(|x| x.abs() > 1e-8) && v.iter().all(|x| x.is_finite()),
+        "fused sinkhorn: gradient identically zero or non-finite - the 8fa5d4c shape"
+    );
 }
 
 #[cfg(all(test, feature = "autodiff", feature = "cuda"))]

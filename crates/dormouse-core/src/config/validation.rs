@@ -82,17 +82,51 @@ pub fn validate(c: &DormouseConfig) -> Result<(), String> {
     if !(c.engram_lam_max > 0.0 && c.engram_lam_max <= 1.0) {
         return Err("engram_lam_max must be in (0, 1]: 0 would delete the arm, >1 is not a floor".into());
     }
-    // AttnRes and Gated Residual both REPLACE the residual accumulation, in
+    // AttnRes, Gated Residual and mHC all REPLACE the residual accumulation, in
     // the same statement of the loop (the `else` chain in `forward_full_state`).
-    // Both on is not a configuration with an interpretation: one of them would
-    // be silently ignored, and the reader of the run's log would have no way to
-    // tell which. Refused here, where the escape can be named (ADR-0011).
-    if c.use_attnres && c.use_gr {
-        return Err(
-            "use_attnres and use_gr both replace the loop's residual accumulation and only one \
-             can run: use_attnres = false (AttnRes vs ReZero) or use_gr = false (GR vs ReZero)."
-                .into(),
-        );
+    // Any two of them on is not a configuration with an interpretation: one of
+    // them would be silently ignored, and the reader of the run's log would
+    // have no way to tell which. Refused here, where the escape can be named
+    // (ADR-0011). One check over the three, so adding a fourth arm cannot
+    // leave a pair unguarded.
+    let residual_arms = [
+        ("use_attnres", c.use_attnres),
+        ("use_gr", c.use_gr),
+        ("use_mhc", c.use_mhc),
+    ];
+    let on: Vec<&str> = residual_arms
+        .iter()
+        .filter(|(_, is_on)| *is_on)
+        .map(|(name, _)| *name)
+        .collect();
+    if on.len() > 1 {
+        return Err(format!(
+            "{} all replace the loop's residual accumulation and only one can run: \
+             set all but one to false. Each is a one-flag swap against ReZero, so the \
+             comparison that means something is the arm against the additive residual \
+             (use_attnres / use_gr / use_mhc = false), not two arms against each other.",
+            on.join(" and ")
+        ));
+    }
+    // `MhcBlock` reshapes the hidden state to `[b, t, n, D/n]` in its first
+    // forward, so a non-divisor `n` is a shape panic a long way from the flag
+    // that caused it. The same class as `act_group` above, and the same
+    // reason for a loud check instead of a clamp: a clamped `n` trains a
+    // mechanism the config does not name.
+    if c.use_mhc {
+        if c.mhc_streams == 0 {
+            return Err("mhc_streams must be >= 1".into());
+        }
+        if c.d_model % c.mhc_streams != 0 {
+            return Err(format!(
+                "mhc_streams {} must divide d_model {}: the residual stream is read as \
+                 n streams of width d_model/n, so a non-divisor fails the reshape in the \
+                 first forward. Default 2 is the K the phi study (2604.21106v3 5.2) ran \
+                 and the base paper's own n=4 (2409.19606 App. Tab. 1) is --set \
+                 mhc_streams=4.",
+                c.mhc_streams, c.d_model
+            ));
+        }
     }
     Ok(())
 }
