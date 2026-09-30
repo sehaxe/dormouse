@@ -141,8 +141,14 @@ def forward_dual(inp, scale, c, nt, causal, strict):
     akk = matmul(bk * E, swap(kog, 3, 4)) * strict
     mi = inv_unit_lower(akk, c)
     W, U = matmul(mi, bk * E), matmul(mi, w5 * v5)
-    g_last = E[:, :, :, c - 1:c, :]
-    k_dec = k5 * exp(g_last - G)
+    # LOG domain, both operands. `E` is exp(G); using it here would exponentiate
+    # the cumsum twice, and the error is invisible in f64 arithmetic while
+    # changing the function by O(1). FLA does the same thing
+    # (`fla/ops/common/chunk_delta_h.py:236-240`, commit 9f38d249): it loads
+    # the raw `g` for `b_g_last` and exponentiates only the difference.
+    g_last_log = G[:, :, :, c - 1:c, :]
+    g_last = exp(g_last_log)
+    k_dec = k5 * exp(g_last_log - G)
 
     state = _d(inp["state"])
     traj, outs = [state], []
