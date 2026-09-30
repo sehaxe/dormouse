@@ -224,6 +224,34 @@ the file that says so is that one function.
   seen and never frees them → long runs OOM. `train_loop` calls
   `memory_cleanup()` every 500 steps; `init_pools` (ExclusivePages) must run
   before the first allocation. The pool is NOT enabled by default.
+- **AttnRes is wired, Full mode only, off by default** (`use_attnres`, 2026-09-30,
+  owner decision; `26badd2`, `84844a6`). `loop_block.rs` replaces the ReZero write
+  with a softmax mixture over `{token embedding, this iteration's body}` —
+  arXiv:2603.15031 Eq. 1/3/4, one learned pseudo-query per iteration slot. The state
+  LEAVING iteration n is the mixture, so every iteration's readout contains that
+  iteration's body: the placement that avoids the depth-(iters-1) model GR had in
+  `9b343d3`. `use_attnres` + `use_gr` is refused in `config::validate`. `probe::ATTNRES`
+  counts it and `preset_exec` asserts the count AND that the logits move; the **eval
+  line does not print it yet** (owed, integration doc §6). A/B = queue row 7, not run.
+  - **The score convention is the paper's**: `q·RMSNorm(k)` with **no `1/√d`**
+    (`ScoreForm::Paper`, the default). The crate shipped `d^-0.5` and an L2 norm —
+    together a `d`-fold logit compression, both silent. On a fixture built to separate
+    them, `out[0] = 0.9820138` (paper) / `0.8807971` (no scale, L2) / `0.7310586`
+    (ours), pinned as literals. Both routes stay expressible (`ScoreForm::SqrtD`) and
+    the form is a runtime scalar through all three CUDA kernels and the autodiff state.
+  - **Two defects the paper-faithful wiring FOUND, both latent since the crate was
+    written, both fixed in `84844a6`:** (1) the norm's derivative was missing its `m`
+    — `∂s/∂h = scale·(q·inv − m·h·(q·h)·inv³)`, a no-op at the L2 norm, so every test
+    was green, and `rel 1.47` wrong at the paper's `m = 1/d`; (2)
+    `merge_state_writeback_matches_host_reference` asserted 1e-5 **absolute** on 64
+    chained f32 merges and went red 3-in-4 on identical code once the sharper softmax
+    moved `|acc|` to ~3-4 (2.5e-6 relative ≈ 21× f32 epsilon). **A gate that cannot
+    fail and a gate that fails for a reason unrelated to what it names are the same
+    defect from two directions; both were in this crate.**
+  - **No external reference exists** (the authors' repo is 6 files, 0 source), so this
+    is tier-(b) transcription. `BlockAttnRes` is still wrong against Eq. 6 (D5-D9 of the
+    2026-09-29 audit) and is NOT wired; at our depth (2-4) Full *is* Block, so the work
+    worth doing is the four fixes plus a gate each, not the wiring.
 - `LinearLike` pads `out_features` to a multiple of 4 (cubek matmul
   vectorization, N%4==0) and slices back; keep the slice on all new heads.
 - The Engram kernels are f32-only (ILLEGAL_ADDRESS on bf16, measured

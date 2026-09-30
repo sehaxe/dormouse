@@ -1,11 +1,24 @@
 # burn-attnres - Attention Residuals for Burn
 
-> **Not in the dormouse build.** No crate under `crates/dormouse-{core,data,train,cli}/`
-> depends on this one, directly or transitively; the only incoming edges are the
-> library's own `burn-fused` facade and the `burn-fused-benches` probe. Kept as a
-> **reference port**: `docs/PLAN-minimal-core.md` §M2 names this crate as one of the
-> residual-stream A/B arms (alongside `burn-mhc` and the in-model ReZero/GR), and
-> that A/B has not been run. Fate table and reasoning: `docs/library-crate-fate.md`.
+> **IN the dormouse build, as a feature.** Owner decision 2026-09-30 18:45:
+> this crate was a deletion candidate and is now the mechanism behind
+> `use_attnres` in `dormouse-core` (`crates/dormouse-core/src/loop_block.rs`),
+> which replaces the loop's ReZero residual accumulation with a softmax mixture
+> over `{token embedding, block-body outputs so far}` — Eq. 1/3/4. **Off by
+> default** (checkpoint compatibility, the `use_gr` pattern), one learned
+> pseudo-query per iteration slot, and **Full mode only**: `BlockAttnRes` is
+> still wrong against Eq. 6 and is deliberately not wired.
+>
+> **No author code exists** — `MoonshotAI/Attention-Residuals` is 6 files and
+> has never shipped source — so everything here is a tier-(b) transcription
+> against the PDF, not a verification. The equation-by-equation record, the
+> `1/sqrt(d)` decision and its measurement, and the two derivative defects this
+> wiring exposed are in
+> `research/papers/attnres-integration-2026-09-30.md`. The A/B against ReZero
+> is queue row 7 in `docs/AB-PROTOCOL.md` and has **not** been run.
+>
+> The fate table entry that said "reference port" is stale on this point:
+> `docs/library-crate-fate.md`.
 
 [![CI](https://github.com/sehaxe/burn-attnres/actions/workflows/ci.yml/badge.svg)](https://github.com/sehaxe/burn-attnres/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/burn-attnres)](https://crates.io/crates/burn-attnres)
