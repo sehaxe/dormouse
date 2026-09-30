@@ -48,6 +48,18 @@ pub struct AuxHeads {
     /// now, and there is no partial-load flag in this trainer to paper over
     /// it with.
     pub conf: AcceptRatePredictor,
+    /// The FUTURE-BYTE head: an independent `d_model -> vocab` linear,
+    /// supervised with CE on the byte at `t + k`. Its weight and its loss live
+    /// in [`crate::future_byte`]; this field is only where the parameters are
+    /// kept so they are serialized with the model.
+    ///
+    /// `Option`, built iff `cfg.aux_fb_weight > 0` (the same
+    /// `cfg.use_gr.then(..)` shape `LoopBlock::gr` uses) - so an off-arm model
+    /// is byte-identical to a build from before the arm existed, which is what
+    /// keeps queue row 1 (pure CE) a valid control and every measured preset
+    /// parameter count in `tests/preset_exec.rs` true. `None` with a non-zero
+    /// weight is a LOUD error at the call site (`model.rs`), not a skipped term.
+    pub fb: Option<crate::param::LinearLike>,
 }
 
 impl AuxHeads {
@@ -59,6 +71,12 @@ impl AuxHeads {
             // head conditions on - the conditioning input of Eq. 7, not a
             // second embedding of its own.
             conf: AcceptRatePredictor::with_markov(d_model, rank, device),
+            // Left `None` here and attached by the model, which is the only
+            // place that knows the weight. `AuxHeads::new` is called by tests
+            // and by `dspark_oracle` with no config in hand, and giving every
+            // one of them a fourth arm to thread is how a signature stops
+            // meaning anything.
+            fb: None,
         }
     }
 }

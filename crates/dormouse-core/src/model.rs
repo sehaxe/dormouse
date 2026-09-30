@@ -35,6 +35,12 @@ pub struct DormouseModel {
     pub dspark_k: usize,
     #[module(skip)]
     pub dspark_stride: usize,
+    /// Future-byte auxiliary head: weight and horizon, in BYTE POSITIONS
+    /// (`crate::future_byte` for what the term is and which labels it reads).
+    #[module(skip)]
+    pub aux_fb_weight: f32,
+    #[module(skip)]
+    pub aux_fb_horizon: usize,
     /// MoR router BCE weight (arXiv 2507.10524). The label is the router's
     /// own top-k recomputed on the current batch, so it cannot go stale; with
     /// the arm off there is nothing to weight.
@@ -48,12 +54,17 @@ impl DormouseModel {
     pub fn new(cfg: &DormouseConfig, device: &Device) -> Self {
         let d = cfg.d_model;
         let v = cfg.vocab;
+        let mut aux = AuxHeads::new(d, v, cfg.rank, device);
+        // The future-byte head exists iff its weight is non-zero - the same
+        // conditional construction as `LoopBlock::gr`, and the reason a
+        // zero-weight run's parameters and checkpoint are today's.
+        aux.fb = (cfg.aux_fb_weight > 0.0).then(|| LinearLike::dense(d, v, device));
         Self {
             embedding: EmbeddingConfig::new(v, d).init(device),
             loop_block: LoopBlock::new(cfg, device),
             norm: RMSNorm::new(d, cfg.norm_eps, device),
             lm_head: LinearLike::with_tsct(d, v, cfg.rank.min(d).min(v), cfg.use_tsct, device),
-            aux: AuxHeads::new(d, v, cfg.rank, device),
+            aux,
             vocab_size: v,
             d_model: d,
             bf16: cfg.bf16,
@@ -63,6 +74,8 @@ impl DormouseModel {
             dspark_weight: cfg.dspark_weight,
             dspark_k: cfg.dspark_k,
             dspark_stride: cfg.dspark_stride,
+            aux_fb_weight: cfg.aux_fb_weight,
+            aux_fb_horizon: cfg.aux_fb_horizon,
             mor_bce_weight: cfg.mor_bce_weight,
             max_seq_len: cfg.max_seq_len,
         }
@@ -217,7 +230,11 @@ impl DormouseModel {
         };
         let [b, t, _d] = x.dims();
         // Indices for the in-loop L_Rec gather (no one-hot [b*t,v] tensor).
-        let tgt = targets.map(|tg| tg.reshape([b * t, 1]));
+        // `targets` is cloned for the aux terms: the future-byte head is the
+        // one arm whose LABEL is `targets` read at an offset, so it cannot be
+        // served off the label indices the loop consumed. [b,t] int64, 40 KB at
+        // batch 10 x 512 - noise next to the [b,t,d] forward it feeds.
+        let tgt = targets.clone().map(|tg| tg.reshape([b * t, 1]));
         let (out_acc, rec, kda, mor_aux) =
             self.loop_block
                 .forward_full_state::<B>(x, hashed_ids, host_rows, None, tgt, &self.lm_head);
@@ -232,20 +249,25 @@ impl DormouseModel {
             .lm_head
             .forward::<B>(h.clone().reshape([b * t, self.d_model]))
             .reshape([b, t, self.vocab_size]);
-        let aux = self.aux_loss::<B>(&out_acc, teacher_latent, ids_raw, &h, &logits, mor_aux);
+        let aux = self.aux_loss::<B>(&out_acc, teacher_latent, ids_raw, targets, &h, &logits, mor_aux);
         (logits, rec, kda, aux)
     }
 
-    /// Weight-combined auxiliary loss (JEPA + DSpark). None when every aux
-    /// weight is 0, when there are no targets, or when JEPA is on but no
-    /// teacher latent was supplied. `teacher_latent` is either the live EMA
-    /// teacher's out_acc (online) or a precomputed frozen target (offline);
-    /// both are detached here - the latent is a stop-grad target.
+    /// Weight-combined auxiliary loss (JEPA + DSpark + MoR BCE + the
+    /// future-byte term). None when every aux weight is 0, when there are no
+    /// targets, or when JEPA is on but no teacher latent was supplied.
+    /// `teacher_latent` is either the live EMA teacher's out_acc (online) or a
+    /// precomputed frozen target (offline); both are detached here - the latent
+    /// is a stop-grad target. `ids` is the sequence the model CONSUMED
+    /// (DSpark's window tokens) and `targets` the one-byte-shifted LABEL
+    /// sequence - the future-byte head's labels, and the two are not
+    /// interchangeable, which is what `8fa5d4c`-class bugs look like.
     fn aux_loss<B: burn::backend::AutodiffBackend>(
         &self,
         student_latent: &Tensor<3>,
         teacher_latent: Option<Tensor<3>>,
         ids: Option<Tensor<2, Int>>,
+        targets: Option<Tensor<2, Int>>,
         h: &Tensor<3>,
         logits: &Tensor<3>,
         mor_aux: Option<Tensor<1>>,
@@ -260,10 +282,14 @@ impl DormouseModel {
         // condition, so no arm changes behaviour when MoR is off.
         let any = (self.jepa_weight > 0.0 || self.dspark_weight > 0.0) && self.dspark_k > 0;
         let mor = self.mor_bce_weight > 0.0;
-        if !any && !mor {
+        // The future-byte head is its own way in and shares nothing with
+        // `any`: it needs no teacher, no `dspark_k`, and its own counter.
+        let fb = self.aux_fb_weight > 0.0;
+        if !any && !mor && !fb {
             return None;
         }
         let ids = ids?;
+        let targets = targets?;
         let dev = h.device();
         let mut total: Option<Tensor<1>> = None;
         // MoR first: the router's own BCE against its top-k recomputed on this
@@ -305,6 +331,24 @@ impl DormouseModel {
             );
             crate::probe::note(crate::probe::DSPARK);
             total = Some(d.mul_scalar(self.dspark_weight)
+                + total.unwrap_or_else(|| Tensor::zeros([1], &dev)));
+        }
+        if fb {
+            // COUNTED in two halves (ADR-0019): `asked` is bumped here, at the
+            // branch the config opened, and `ran` inside the loss, only when
+            // there was at least one valid position. `fb=0/<n>` on the eval
+            // line therefore means "a horizon at or past the sequence length",
+            // which is a config that trains for thousands of steps and
+            // produces no objective - the shape of defect nobody can see in a
+            // healthy-looking loss curve.
+            crate::probe::note(crate::probe::FUTURE_BYTE_ASKED);
+            let head = self.aux.fb.as_ref().expect(
+                "aux_fb_weight > 0 but AuxHeads.fb is None: the head is built iff the weight was \
+                 non-zero at construction (DormouseModel::new), so this model was built with \
+                 aux_fb_weight = 0. Rebuild the model from the config, or set aux_fb_weight = 0.",
+            );
+            let f = crate::future_byte::future_byte_loss::<B>(head, h.clone(), targets, self.aux_fb_horizon);
+            total = Some(f.mul_scalar(self.aux_fb_weight)
                 + total.unwrap_or_else(|| Tensor::zeros([1], &dev)));
         }
         total
