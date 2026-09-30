@@ -135,3 +135,4 @@ date	commit	mode	step	throughput	mem	final-ce
 2026-09-29T04:12:00Z	6891e23	warm-batch32	826ms	19.8Ktok/s	res=5908MiB	ce=5.38
 2026-09-29T17:40:00Z	feaf0da	warm-batch8-retract-per-factor	265ms	15.5Ktok/s	res=n/a	ce=3.236
 2026-09-29T17:41:00Z	feaf0da	warm-batch8-retract-batched	221ms	18.5Ktok/s	res=n/a	ce=3.232
+2026-09-30T16:20:08Z	48048ed	control-full-arch-small-b8-s512	~480ms-warm (idx 1500-1900; step0=22354ms autotune)	~65KB/s (8.19MB/2000 steps)	res=n/a	ce=2.676-best/eval-bpb=6.418@500,6.531@1000,6.387@1500 window=81920B seed=1 preset=small params=9197454(incl engram rows) aux=jepa0.05+koleo quant=fp8 opt=muon+ lr=cos1e-4 0NaN 0panics log=~/logs/first_run_2000_0930_1855.log ckpt=checkpoints/first_run_2000.best.bin
