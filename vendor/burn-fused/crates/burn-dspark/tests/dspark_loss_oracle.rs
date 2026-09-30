@@ -49,11 +49,19 @@
 //! result, and §3.3 of AGENTS.md already records that no DSpark number this
 //! project has ever produced survives the window fix.
 //!
+//! ## What produced every expected number, including the gradients
+//!
+//! The `grad_draft` / `grad_conf` rows are the same pinned source
+//! back-propagated (`compute_dspark_loss(...).backward()`), so they carry the
+//! same provenance as the scalars above and the same date, torch build and
+//! process-group contract.
+//!
 //! ## The two differences this test is built to see
 //!
 //! 1. **The denominator.** Upstream divides by `den + 1e-6` (four separate
 //!    times: `loss.py:239-252`). We divide by `den.clamp_min(1.0)`
-//!    (`src/lib.rs:194`). They are the same number to within 1e-6 relative
+//!    (`src/lib.rs`, the `let den = ...` line). They are the same number to
+//!    within 1e-6 relative
 //!    whenever `den >= 1` and differ materially only when `den` is of order
 //!    1e-5 or below — which is NOT where any case in this fixture is, and
 //!    `no_fixture_case_reaches_the_denominator_difference` below is the
@@ -64,11 +72,12 @@
 //!    latent divergence is real, the coverage claim was not.)
 //! 2. **The confidence term's numerical form.** Upstream uses
 //!    `binary_cross_entropy_with_logits`, the STABLE logit-space form, which
-//!    is finite at a confidence logit of ±40. Ours exponentiates a sigmoid
-//!    first and clamps the probability into `[1e-7, 1-1e-7]`
-//!    (`src/lib.rs:203-212`), which cannot represent that regime: it returns
-//!    ≈16.1 where upstream returns ≈0.0. `saturated_conf` is the case, and it
-//!    is in the fixture with |logit| = 40 on purpose.
+//!    is finite at a confidence logit of ±40. The code now does the same,
+//!    written `(1-c)*x + softplus(-x)` — the algebra upstream is written in.
+//!    Before `8c3bd2a` it exponentiated a sigmoid first and clamped the
+//!    probability into `[1e-7, 1-1e-7]`, which cannot represent that regime:
+//!    it returned ≈16.1 where upstream returns ≈0.0. `saturated_conf` is the
+//!    case, and it is in the fixture with |logit| = 40 on purpose.
 //!
 //! ## And the one difference a value comparison CANNOT see
 //!
@@ -304,39 +313,39 @@ fn ce_and_tv_agree_with_the_official_loss() {
     );
 }
 
-/// # THE DEFECT THIS FILE IS POINTED AT
+/// # THE DEFECT THIS FILE WAS POINTED AT — FIXED, and it is green
 ///
-/// **RED ON PURPOSE**, and it is the first tier-(a) disagreement this project
-/// has ever recorded for this tap. Two independent causes, both in
-/// `dspark_loss` (`src/lib.rs:202-213`), both named by DeepSeek's own code:
+/// This test was **RED ON PURPOSE** when it was written, and it was the first
+/// tier-(a) disagreement this project ever recorded for this tap. Two
+/// independent causes, both in `dspark_loss`, both named by DeepSeek's own
+/// code:
 ///
 /// 1. **The confidence term is computed in the wrong numerical space.**
 ///    Upstream uses `binary_cross_entropy_with_logits`
 ///    (`loss.py:151-156`) — the STABLE logit-space form, which is finite and
 ///    correct at a confidence logit of ±40, returning ≈0 for a correct sign
-///    and ≈40 for a wrong one. We exponentiate a sigmoid FIRST and then clamp
-///    the probability into `[1e-7, 1-1e-7]`, which cannot represent that
-///    regime at all: it returns ≈8.1 where upstream returns ≈20.3
-///    (`saturated_conf`, a 60 % error). The clamp is a *silent* degradation in
-///    exactly the sense ADR-0019 names — it returns a plausible number.
-/// 2. **The `None` confidence head is not expressible.** Upstream's
+///    and ≈40 for a wrong one. The code exponentiated a sigmoid FIRST and then
+///    clamped the probability into `[1e-7, 1-1e-7]`, which cannot represent
+///    that regime at all: it returned ≈8.1 where upstream returns ≈20.3
+///    (`saturated_conf`, a 60 % error). The clamp was a *silent* degradation
+///    in exactly the sense ADR-0019 names — it returned a plausible number.
+/// 2. **The `None` confidence head was not expressible.** Upstream's
 ///    `confidence_pred` is `Optional` and a missing head SKIPS the term
 ///    entirely (`loss.py:140`, `has_confidence` false ⇒ no confidence term at
-///    all). Our signature takes a mandatory `Tensor`, so "no head" can only be
-///    spelled as a tensor of zeros, which our code then scores as a *confident*
-///    predictor at p = 0.5 and charges ≈0.693 of loss for it. Upstream
-///    charges exactly 0 (`no_confidence_head`).
+///    all). The signature took a mandatory `Tensor`, so "no head" could only
+///    be spelled as a tensor of zeros, which the code then scored as a
+///    *confident* predictor at p = 0.5 and charged ≈0.693 of loss for it.
+///    Upstream charges exactly 0 (`no_confidence_head`).
 ///
-/// The fix is one line each — pass the logit to a `binary_cross_entropy`
-/// that takes logits, and make the head `Option<Tensor>` — and it is NOT made
-/// here, because this lane's task is the evidence and the fix is the owner's:
-/// §1.1 (loud failures, no silent degradation) is what both lines violate, and
-/// the arithmetic of the objective is a numerical change, which this project
-/// records as a report rather than an edit (`.bulba/goal.md`: "Числовая
-/// правка — отчёт, не редактирование").
+/// Both are fixed, in `8c3bd2a`, and this test is the evidence that they are:
+/// `saturated_conf` reads ours 9.308561325 against DeepSeek's 21.44469833
+/// before the fix and agrees to `TOL_REL` after. **Re-reverting the fix turns
+/// this test red again at exactly those two cases** — the demonstration, not
+/// the claim, is `oracle/mutate_kernel.sh`'s M1-M3 plus a recorded re-revert.
 ///
-/// When it is fixed, this test goes green and the totals in
-/// `dspark_loss_agrees_with_the_official_loss` below become assertable.
+/// A third defect turned up later and is NOT visible to this test, because it
+/// only moves a gradient: see
+/// `dspark_loss_gradients_agree_with_the_official_loss` and `src/lib.rs`.
 #[test]
 fn the_confidence_term_agrees_with_the_official_loss() {
     let (names, cases, tol) = fixture();

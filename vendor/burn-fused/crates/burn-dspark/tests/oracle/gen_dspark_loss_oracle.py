@@ -6,10 +6,39 @@ REQUIRED -- the list is not "the obvious ones":
 
     $ uv venv --python 3.12 /tmp/opencode/oracle-venv
     $ VIRTUAL_ENV=/tmp/opencode/oracle-venv uv pip install \
-          --index-url https://download.pytorch.org/whl/cpu torch numpy pyyaml transformers
+          --index-url https://download.pytorch.org/whl/cpu torch==2.14.0+cpu
+    $ VIRTUAL_ENV=/tmp/opencode/oracle-venv uv pip install numpy pyyaml transformers
     $ git clone https://github.com/deepseek-ai/DeepSpec.git   # need not be run again
     $ /tmp/opencode/oracle-venv/bin/python gen_dspark_loss_oracle.py \
           --deepspec /path/to/DeepSpec > ../fixtures/dspark_loss_oracle.txt
+
+TWO COMMANDS, NOT ONE, AND THAT IS THE PART THAT BITES
+-------------------------------------------------------
+`uv pip install --index-url https://download.pytorch.org/whl/cpu torch numpy
+pyyaml transformers` does NOT work, and the error does not say why:
+
+    error: No solution found when resolving dependencies
+      cause: Because pyyaml was not found in the package registry and you
+      require pyyaml, we can conclude that your requirements are unsatisfiable.
+
+`--index-url` REPLACES the index rather than adding to it, so the CPU wheel
+host is the only place the resolver looks, and it carries torch and numpy and
+nothing else. Two installs is the fix: torch from the wheel index, everything
+else from PyPI. `--extra-index-url` also resolves it, but it silently relaxes
+dependency-confusion protection, and that is not a flag to put in a
+reproducibility recipe.
+
+THE TORCH VERSION IS PINNED, AND THE PIN IS WORTH IT
+---------------------------------------------------
+Verified on a clean venv built from these exact four commands, 2026-09-30:
+the output is byte-identical to the committed fixture except the one
+`meta.torch_version` line. Unpinned, the resolver picks 2.14.1+cpu today and
+whatever is newest tomorrow; all 8 cases' values and all 477 gradient
+coordinates came out bit-for-bit the same on both, which is itself worth
+recording -- but a golden that diffs by one line every few weeks trains
+everyone to ignore fixture diffs, which is the expensive failure mode. So:
+pin it. If a future torch genuinely moves a number, that is a finding and it
+belongs in a commit message, not in a routine regeneration.
 
 WHY `pyyaml` AND `transformers` ARE ON THAT LINE, since omitting them is the
 one way this fails with an error that does not name them. `torch numpy` gets
@@ -124,6 +153,21 @@ NINE SIGNIFICANT DIGITS
 `%.9g`, never `%g`. An f32 needs 9 to round-trip exactly; `f"{v:g}"` is six and
 silently truncated every column of the rmsnorm fixture to 0.49975 overnight,
 failing a test on CORRECT code.
+
+WHAT THIS GENERATOR REFUSES TO WRITE, which is the point of running it
+---------------------------------------------------------------------
+Four guards, all of which abort before a single case is printed:
+  * `selfcheck` -- its own per-term attribution must reproduce the official
+    scalar to 1e-4 relative, so a transcription slip shows up as a refusal
+    rather than as a golden file;
+  * check 1, invariance -- `grad_draft` must be BIT IDENTICAL with and without
+    a confidence head, which is what `loss.py:145`'s `.detach()` buys;
+  * check 2, cross-check -- the recorded gradients must match this file's own
+    differentiated transcription to 1e-3 relative, which catches a
+    mis-shaped or mis-indexed recording;
+  * check 3, finite difference -- `grad_conf` must match a central difference
+    of the official scalar. Only `grad_conf` is checked this way and the reason
+    is in the header below: a stop-gradient cannot be finite-differenced.
 """
 
 import argparse
@@ -159,13 +203,31 @@ TOL_REL = 1e-5
 # a pure relative test is fine but a pure absolute one is not; both are carried
 # and the test asserts `|ours - ref| <= GRAD_ABS + GRAD_REL * |ref|`.
 #
-# DERIVED, not tuned to pass: the f32 envelope was MEASURED by running this
-# comparison with the detach in place (worst element over all 8 cases and all
-# 462 coordinates: see `research/reviews/verify-tails-2026-09-30.md`), and these
-# are the next power of ten above it. The margin in the OTHER direction is
-# also measured, so the bound's job is visible: with the `detach()` REMOVED
-# again, d/d(draft_logits) is wrong by 20.5% - 100.9% in L2 by case. A bound
-# that discriminates 21% needs no more than 1e-2; this one is 1e-4.
+# DERIVED, not tuned to pass. The f32 envelope was MEASURED, in both
+# directions, on this box 2026-09-30, and the numbers are in
+# `research/reviews/verify-tails-2026-09-30.md`:
+#
+#   WITH the detach in place (the bound must pass this):
+#     worst d/d(draft_logits) deviation over all 8 cases and all 366 drafter
+#     coordinates, against `grad_draft`: 0 on aligned_identical / big_logits
+#     (the clamp and the saturated softmax each make the contribution vanish)
+#     and <= 3.7e-09 absolute on the rest. Against a bound of 1e-7 + 1e-4*|ref|
+#     that is ~2 decades of headroom, which is where f32 arithmetic puts it.
+#
+#   WITHOUT it (the bound must catch this -- a bound that only has to pass is
+#   not a gate):
+#     main            448/448 coordinates out, worst 10748x the bound
+#     tiny_mask        32/448,               worst  3270x
+#     saturated_conf  320/448,               worst 279147x
+#     block7_exact    224/224,               worst  7967x
+#     the other four cases agree either way, by construction
+#     (all_masked_off: the mask zeroes it; aligned_identical and big_logits:
+#     `accept_rate` clamps to 1 and its gradient is 0)
+#     In L2, |d/d(draft_logits)| on saturated_conf is 1.227131 un-detached
+#     against 0.073771 detached: 16.6x too large.
+#
+# So the bound has to discriminate 3270x and needs no more than 1e-3 to do it.
+# It is 1e-4.
 GRAD_ABS = 1e-7
 GRAD_REL = 1e-4
 
@@ -182,8 +244,16 @@ def build_cases():
     """Cases chosen so a WRONG term is visible in a TERM, not only in a total.
 
     The official loss has three terms (CE, L1/TV, confidence BCE) and three
-    weight conventions (the per-position decay w_k, the mask, and the
-    `+1e-6` in the denominators). Each case below breaks one of them.
+    weight conventions (the per-position decay w_k, the mask, and the `+1e-6`
+    in the denominators). Each case below is aimed at one of them -- and
+    where a case CANNOT see the thing it looks like it is aimed at, that is
+    said in its own comment rather than left for the next reader to assume.
+
+    Two of the eight cases (all_masked_off, aligned_identical) reach zero
+    gradient, and one (no_confidence_head) has no confidence head at all. That
+    is not padding: they are the NEGATIVE CONTROLS for the gradient gate. An
+    implementation that builds a numeric indicator from the target when the
+    target is clamped, or that charges for an absent head, moves them.
     """
     rng = np.random.default_rng(20260930)
     cases = []
@@ -212,13 +282,16 @@ def build_cases():
     ))
 
     # 2. all_masked_off: eval_mask is ALL ZERO. The official code divides by
-    #    `ce_loss_den + 1e-6` -- i.e. by 1e-6, not by a clamped 1.0. A
-    #    `clamp_min(1.0)` on the denominator is the single most likely
-    #    transcription slip in this function and this case is the one that
-    #    sees it: the official answer is ~0 and a clamped denominator returns
-    #    an exactly-0 numerator over 1.0, which agrees -- so this case is
-    #    NOT discriminating on its own. It is here to pin the no-NaN
-    #    contract (0/1e-6 = 0, not 0/0 = NaN).
+    #    `ce_loss_den + 1e-6` -- i.e. by 1e-6, not by a clamped 1.0. It is here
+    #    to pin the no-NaN contract (0/1e-6 = 0, not 0/0 = NaN) and it is
+    #    explicitly NOT discriminating on the denominator: every numerator is
+    #    exactly 0, so 0/1e-6 and 0/1.0 agree to the bit however different the
+    #    denominators are. MEASURED, all eight cases: no case has a non-zero
+    #    numerator with `wm.sum() < 1`, and the largest relative gap between
+    #    the two denominators over any case that DOES have a non-zero numerator
+    #    is 1.0e-6 -- a tenth of TOL_REL. `no_fixture_case_reaches_the_
+    #    denominator_difference` in the test is that fact, executable, so it
+    #    cannot rot back into a coverage claim.
     cases.append((
         "all_masked_off",
         rng.standard_normal((b, a, k, v)).astype(np.float32),
@@ -234,8 +307,14 @@ def build_cases():
     #    and 0 elsewhere, so the decay weights cannot be cancelled: a loss
     #    that forgot `loss_decay_gamma` entirely still returns a finite number
     #    here, and the two differ in the CE and L1 terms by the ratio of the
-    #    mean weight to w_0 = 1. It is also the case where `+1e-6` is 1e-6
-    #    RELATIVE to a denominator of 1.0 and is therefore visible.
+    #    mean weight to w_0 = 1.
+    #
+    #    This is the closest any case comes to the denominator difference, and
+    #    it is NOT close enough: `+1e-6` against a denominator of 1.0 is
+    #    1.0e-6 relative, against TOL_REL = 1e-5. The material region needs
+    #    `wm.sum()` of order 1e-5, i.e. a mask whose entries are of order 1e-5,
+    #    which no caller has a reason to build. It is here for the decay and
+    #    the mask, not for the denominator.
     m = np.zeros((b, a, k), dtype=np.float32)
     m[0, 0, 0] = 1.0
     cases.append((

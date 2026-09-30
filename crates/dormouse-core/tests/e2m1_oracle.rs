@@ -158,24 +158,28 @@ fn the_reference_is_round_half_to_even_at_every_interior_tie() {
 
 /// # THE DEFECT THIS FILE IS POINTED AT
 ///
-/// **RED ON PURPOSE.** Our `fp4_round` breaks exact ties **up** the grid;
-/// torchao (and the format's hardware, and IEEE 754) breaks them toward the
-/// **even code**. At 0.25, 1.25, 2.5 and 5.0 the two return different levels,
-/// and at 5.0 the error is 4.0 against 6.0.
+/// This test was **RED ON PURPOSE** when it was written. `fp4_round` broke
+/// exact ties **up** the grid; torchao (and the format's hardware, and
+/// IEEE 754) breaks them toward the **even code**. At 0.25, 1.25, 2.5 and 5.0
+/// the two returned different levels, and at 5.0 the error was 4.0 against
+/// 6.0.
 ///
 /// Measured on this box, 2026-09-30, from the fixture: 4 of the grid's 7
-/// interior tie points disagree. The consequence for training is that every
-/// `--act-quant fp4` step quantizes a measurable fraction of its
-/// activations to a different level than the format specifies, in a
-/// direction (upward, toward 6) that biases the magnitude — and the error is
-/// largest exactly at the top of the range, where the block scale puts the
-/// most-used values.
+/// interior tie points disagreed. The consequence for training was that every
+/// `--act-quant fp4` step quantized a measurable fraction of its activations
+/// to a different level than the format specifies, in a direction (upward,
+/// toward 6) that biases the magnitude — and the error was largest exactly at
+/// the top of the range, where the block scale puts the most-used values.
 ///
-/// Not fixed here: this is a numerical change to a shipped objective, which
-/// this project records as a report rather than an edit. The fix is to make
-/// the ladder `a > lo` (strict) so an exact tie falls through to the coarser
-/// level, then verify which of the two neighbours is the even code — or
-/// simply to select by even code, which is what the format specifies.
+/// **Fixed, in `dc5d667`, and this test is the evidence.** The ladder now
+/// selects by even CODE rather than by direction, because "even" alternates
+/// along the ladder and no single `>` or `>=` expresses it — `act_quant.rs`
+/// carries the seven-tie table and the reasoning. **Re-reverting `dc5d667`
+/// turns this test red at exactly the four ties named above**; that is a
+/// recorded measurement, not a claim.
+///
+/// The mutation sweep that proves it is `tests/oracle/mutate_kernel.sh` in
+/// `burn-dspark`, whose M4/M5/M6 mutants are this file's subject.
 #[test]
 fn fp4_ties_match_the_formats_rule() {
     let fx = fixture();
@@ -239,13 +243,13 @@ fn fp4_ties_match_the_formats_rule() {
     assert!(
         wrong.is_empty(),
         "\n{} of the e2m1 grid's interior tie points are rounded to the WRONG \
-         level by `fp4_round` (crates/dormouse-core/src/act_quant.rs:137-140), \
+         level by `fp4_round` (crates/dormouse-core/src/act_quant.rs), \
          against torchao's quantizer at {TORCHAO_SHA}:\n{}\n\
          The format breaks ties toward the EVEN CODE (round-half-to-even, IEEE \
-         754); our ladder is `mask_fill(a >= lo)`, which breaks every tie UP. \
-         At 5.0 that is 4.0 against 6.0 -- a 50% error, at the top of the range \
-         where the block scale puts the most-used values. Not fixed here: a \
-         numerical change to a shipped objective is the owner's call.",
+         754). Our ladder selects by even code, so a failure here means that \
+         selection is broken -- most likely reverted to a plain `>=`, which \
+         breaks every tie UP and is wrong at 0.25, 1.25, 2.5 and 5.0 (at 5.0 \
+         that is 4.0 against 6.0, a 50% error, at the top of the range).",
         wrong.len(),
         wrong.join("\n"),
     );
