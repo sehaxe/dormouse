@@ -453,6 +453,21 @@ The gate also asserts the chunked path and the scan still **agree** at
 `expand_v = 2.0`, which is the property the fix had to preserve — a shape-only
 check would have passed a change that quietly altered the arithmetic.
 
+**`tools/lib_gate.sh` is RED on this branch, and neither red is mine.** It
+reports `burn-gdn2`'s `oracle_breadth::gdn2_1000_cases_match_the_f64_oracle`
+and `oracle_chunk::chunk_sizes_match_the_f64_oracle` failing. `git diff
+3234ecc HEAD -- vendor/burn-fused/crates/burn-gdn2` is **empty** — this lane
+touched no burn-gdn2 file — and burn-kda's own cell is 12/12 green plus the
+oracle's 7 green / 3 red-on-purpose. So the honest statement is: **the library's
+CPU cell is red on `3234ecc` and my branch does not change that**, and the two
+reds belong to whichever lane owns burn-gdn2's f64 oracle. Reported, not fixed,
+not filtered.
+
+`tools/oracle_gate.py`: 115 registered, 185 scanned, **2 violations**, 8 waived.
+Both violations are in other lanes — a stale `burn-muon-plus` row for a `.bin`
+that is gone, and an unregistered `burn-rmsnorm/tests/fused_kernel_gate.rs`.
+Every file this lane added or touched is registered and clean.
+
 ### 6.1 The three harness bugs, because they are the transferable part
 
 Every one of them produced a **plausible wrong number** rather than an error,
