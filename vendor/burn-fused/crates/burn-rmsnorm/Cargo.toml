@@ -11,7 +11,7 @@ readme = "README.md"
 [features]
 default = ["std"]
 std = ["burn/std", "burn-tensor/std"]
-cuda = ["dep:burn-cuda", "dep:burn-cubecl", "dep:cubecl", "burn/std", "burn/cuda", "burn-tensor/cuda", "burn/extension"]
+cuda = ["dep:burn-cuda", "dep:burn-cubecl", "dep:cubecl", "burn/std", "burn/cuda", "burn-tensor/cuda", "burn/extension", "burn/autodiff"]
 
 [dependencies]
 burn = { workspace = true }
@@ -23,3 +23,12 @@ cubecl = { workspace = true, optional = true, features = ["std"] }
 [dev-dependencies]
 burn-ndarray = { workspace = true, features = ["blas-openblas"] }
 burn = { workspace = true, features = ["ndarray", "std"] }
+
+# The gate that did not exist while the kernel was broken: an integration test
+# that ASSERTS THE ARM WAS TAKEN and compares the fused answer to a scalar f64
+# definition, and one that pins the dispatch guard which keeps the backward-less
+# kernel away from an autodiff device. `required-features` is what stops cargo
+# building an empty target that prints a green `running 0 tests ... ok`.
+[[test]]
+name = "fused_kernel_gate"
+required-features = ["cuda"]

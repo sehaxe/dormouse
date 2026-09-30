@@ -44,6 +44,18 @@ use std::any::Any;
 use cubecl::prelude::*;
 
 #[cfg(feature = "cuda")]
+/// One source of truth for the lane count. It is a `#[comptime]` PARAMETER, not
+/// a local: `Shared::new_slice` sizes the shared-memory allocation, and on this
+/// backend a runtime-sized one fails LLVM lowering with
+/// `Expected operand type llvm.ptr, but found builtin.integer` before a byte is
+/// written. `34c5631` did not fix this - it left `let threads = 256usize;` in
+/// the body, so `new_slice` still saw a runtime value, and
+/// `tests/fused_kernel_gate.rs` reproduced the identical failure. Every working
+/// kernel in this tree takes the width as `#[comptime]`
+/// (`burn-attnres/src/fused_attnres.rs:127`, `burn-gdn2/src/kernel/
+/// chunk_adjoint_cube.rs:61`).
+pub const THREADS: u32 = 256;
+
 #[cube(launch_unchecked)]
 fn rmsnorm_kernel<F: Float>(
     x: &[F],       // [B*T, D]
@@ -51,11 +63,12 @@ fn rmsnorm_kernel<F: Float>(
     out: &mut [F], // [B*T, D]
     eps: f32,
     #[comptime] d: u32,
+    #[comptime] threads: u32,
 ) {
     let row = CUBE_POS_X as usize;
     let tid = UNIT_POS_X as usize;
     let d = d as usize;
-    let threads = 256usize;
+    let threads = threads as usize;
     let base = row * d;
     let mut partial = Shared::<[F]>::new_slice(threads);
 
@@ -135,12 +148,13 @@ where
         rmsnorm_kernel::launch_unchecked::<f32>(
             &client,
             CubeCount::Static(rows as u32, 1, 1),
-            CubeDim::new_3d(256, 1, 1),
+            CubeDim::new_3d(THREADS, 1, 1),
             BufferArg::from_raw_parts(x_c.handle, rows * d),
             BufferArg::from_raw_parts(w_c.handle, d),
             BufferArg::from_raw_parts(out_c.handle, rows * d),
             eps,
             d as u32,
+            THREADS,
         );
     }
     Some(out)
