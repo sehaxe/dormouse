@@ -1058,6 +1058,39 @@ Ranked applicability:
   0.167 % back-to-back and 12.50 % minutes later (`docs/AB-PROTOCOL.md`), and
   the 409 043 figure, which exists only as prose in five files and in no test.
   Do not cite 409 043 as measured by anyone.
+- **TWO NEWTON-SCHULZ COEFFICIENT SETS, ONE PAPER — found 2026-09-30, and
+  the brief that caused the finding was wrong.** `burn-spectral` hardcodes the
+  **PolarExpress** triple `(15/8, −5/4, 3/8) = (1.875, −1.25, 0.375)` twice
+  (`src/lib.rs:254` and `:305`, as exact rationals), cited to arXiv:2602.21545v3
+  **Appendix D.3**. `burn-muon-plus` uses the **Jordan** triple
+  `(3.4445, −4.7750, 2.0315)`, cited to the same paper's **Appendix D.1** and to
+  §3.1's "the same configuration as in Jordan et al. (2024)". Both citations are
+  correct; they are different quantities and the two crates do the same job
+  with different polynomials. I asserted they were one thing and told an agent
+  so; it found otherwise by reading the paper rather than our comments. **Both
+  doc comments are right, the crate pair is the thing to look at.**
+
+  Three more findings, all from **running the authors' own code**
+  (`NoahAmsel/PolarExpress` @ `71cc379`, pinned byte-for-byte):
+  1. `optimal_quintic` returns **our** `(1.875, −1.25, 0.375)` **bit-exactly**,
+     and all three are dyadic so no 9-digit golden is needed for them.
+  2. The authors' HEAD generator **disagrees with the table printed in both of
+     their papers** (~6e-3 from entry 1), and no setting reproduces the table.
+     Their code also applies only the LAST schedule entry `iters` times where
+     the reference applies the first T entries once each. **In fairness to our
+     code, the fixed triple BEAT the schedule at 3 iterations at every
+     condition number tested** — so the comment's implied reliance on the
+     schedule is the wrong part, not the arithmetic.
+  3. **The 3-iteration retraction is 14.5 % from `polar(X)` at a 10:1 spectral
+     spread**, while sitting 1.17e-15 from the manifold. And the `POWER_ITERS`
+     justification is **false as measured**: over 200 draws 32–47 % exceed the
+     5 % the 1.05 factor is stated to cover (prescaled sigma_max to 1.087).
+     Benign in effect — `p'(1)=0`, so sigma_max out is 1.000000000 regardless —
+     but the comment names a mechanism that does not hold.
+
+  Also recorded, not acted on: **no reference implementation does a power
+  iteration**; all three use Frobenius. The refusal to remove ours is
+  re-derived independently and stands.
 - `DM_QUANT_DEBUG=1` remains the one env var (debug-only, prints every
   `LinearLike` quant format); `CUBECL_AUTOTUNE_LEVEL` is the cubecl runtime's
   own knob, exposed as `--autotune`. Everything else is a typed flag:
