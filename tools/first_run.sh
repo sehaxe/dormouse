@@ -18,7 +18,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-STEPS="${1:?usage: first_run.sh <steps> (500=smoke, 2000=control)}"
+STEPS="${1:?usage: first_run.sh <steps> [extra train flags...] (500=smoke, 2000=control)}"
+shift 2>/dev/null || true
+EXTRA="${*:-}"
 
 if pgrep -x train >/dev/null 2>&1 || pgrep -f "target/release/train" >/dev/null 2>&1; then
   echo "LOUD: a train process is already running — one heavy thing at a time (§1.5). Escape: wait or pgrep -ax train."; exit 1
@@ -43,7 +45,7 @@ if [ ! -x target/release/train ]; then
 fi
 
 LOG=/home/sehaxe/logs/first_run_${STEPS}_$(date +%m%d_%H%M).log
-CKPT=first_run_${STEPS}
+CKPT="first_run_${STEPS}$(echo "$EXTRA" | tr -c "a-zA-Z0-9" "-" | cut -c1-40)"
 mkdir -p /home/sehaxe/logs
 UTIL=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null || echo '?')
 echo "preconditions OK: gpu=${UTIL}% ram=${AVAIL}G steps=${STEPS} ckpt=${CKPT}"
@@ -63,4 +65,5 @@ exec systemd-run --user --scope -p MemoryMax=40G \
     --guard \
     --detach \
     --timers \
-    --log "$LOG"
+    --log "$LOG" \
+    $EXTRA
