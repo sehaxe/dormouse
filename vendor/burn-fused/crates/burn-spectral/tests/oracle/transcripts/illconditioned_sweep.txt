@@ -1,0 +1,36 @@
+============================================================================================
+ILL-CONDITIONED SWEEP  (768x64, rank 64, sigma_max = 1, sigma_min = 1/kappa)
+============================================================================================
+kappa    fro/sigmax  | OURS(3)       SCHED-fro(3)  their_code(3) | OURS(5)     SCHED-fro(5)
+1e+00    8.0000      | 5.3657e-17    1.0525e-01    1.0277e-01    | 2.5944e-17  1.1835e-02 
+1e+01    3.7489      | 3.3347e-02    1.4235e-01    1.4120e-01    | 2.6235e-04  2.0117e-02 
+1e+02    2.7114      | 8.4484e-02    1.5449e-01    1.5462e-01    | 5.5630e-02  2.1067e-02 
+1e+03    2.2535      | 9.9025e-02    1.4241e-01    1.4272e-01    | 8.3750e-02  3.4528e-02 
+1e+04    1.9861      | 1.0666e-01    1.3624e-01    1.3589e-01    | 9.6338e-02  6.5752e-02 
+1e+06    1.6782      | 1.1290e-01    1.4135e-01    1.3937e-01    | 1.0654e-01  8.8827e-02 
+
+============================================================================================
+SAME, at iters=3, as a FRACTION of the 1e-3 one-way max_ortho latch
+============================================================================================
+  kappa=1e+00     OURS  6.082e-14 x the latch  | SCHED-fro  1.052e+02 x the latch (LATCHES)
+  kappa=1e+02     OURS  8.523e+01 x the latch (LATCHES) | SCHED-fro  1.545e+02 x the latch (LATCHES)
+  kappa=1e+04     OURS  1.066e+02 x the latch (LATCHES) | SCHED-fro  1.362e+02 x the latch (LATCHES)
+  kappa=1e+06     OURS  1.129e+02 x the latch (LATCHES) | SCHED-fro  1.414e+02 x the latch (LATCHES)
+
+============================================================================================
+CROSS-CHECK of the transcribed loop against PUBLISHED numbers
+Ethan Epperly, 'A Neat Not-Randomized Algorithm: Polar Express' (2025-06-07),
+ran the UNSCALED printed list in MATLAB on randn(100)/25 and printed
+||X_t - polar||_F per iteration. Different seed, so NOT bit-exact; the
+point is the decay SHAPE and the machine-precision landing.
+============================================================================================
+  ours, seed 20260930:            theirs, published (MATLAB):
+    iter 1   6.666017e+00                9.921347e-01
+    iter 2   6.340259e+00                9.676980e-01
+    iter 3   5.515687e+00                8.725474e-01
+    iter 4   3.999648e+00                5.821937e-01
+    iter 5   8.687107e-01                1.551595e-01
+    iter 6   8.878585e-03                5.885490e-03
+    iter 7   7.732343e-09                2.286853e-07
+    iter 8   2.936274e-14                1.113148e-14
+  final: mine 2.936e-14  theirs 1.113148e-14  -> the transcription lands at machine precision too
