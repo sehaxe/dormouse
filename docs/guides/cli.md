@@ -200,7 +200,7 @@ that converts it. That refusal is the point (ADR-0011): a 34 GB read to obtain
 30 MB of weights is the cardinal sin wearing a plausible face. See
 [the `.dmexp` guide](dmexp.md).
 
-## Known-bad help strings
+## Known-bad help strings — RESOLVED 2026-10-01 (`2d05cea`): the four strings below were fixed; kept as the record of what was wrong
 
 - `--rand-depth`'s help text names **`--gen-max-iter`**, which does not exist.
   The CALM-lite confidence exit from ADR-0013 is not implemented either.

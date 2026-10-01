@@ -162,7 +162,7 @@ struct Args {
     stress_every: Option<usize>,
 
     // --- memory ---
-    /// Host-RAM n-gram tables (CPU Adam, prefetched rows).
+    /// Host-RAM n-gram tables (CPU Nesterov+Sinkhorn (the flag name is historical), prefetched rows).
     #[arg(long)]
     engram_ram: bool,
     #[arg(long)]
