@@ -15,7 +15,8 @@ struct Args {
     /// Held-out eval directory (optional).
     #[arg(long)]
     eval: Option<String>,
-    /// Model preset: nano | small | swift50 | base | one_b (name or path to .toml).
+    /// Model preset: nano | small | swift50 | base | one_b | mor | nano-fused | p150
+    /// (a name in configs/ or a path to a .toml; all eight files load).
     #[arg(long, default_value = "small")]
     preset: String,
     /// Config file path (alias for --preset when a path is given).
@@ -85,7 +86,9 @@ struct Args {
     #[arg(long)]
     jepa_weight: Option<f32>,
     /// DSpark aux weight (DeepSeek draft head, instead of MTP). 0 = off;
-    /// default: preset (0.1).
+    /// default: preset (0.0 — it ships off in every preset and in the schema;
+    /// turn it on with `--set dspark_weight=0.1`). No DSpark measurement
+    /// exists: the window-shift fix of 2026-09-29 voided every earlier one.
     #[arg(long)]
     dspark_weight: Option<f32>,
     /// DSpark draft depth K (default: preset, 4).
@@ -117,11 +120,15 @@ struct Args {
     /// (deterministic from the step index) so the model is trained to be
     /// correct at EVERY depth. Adaptive depth without a learned halting head,
     /// so there is nothing to collapse (ADR-0013 rank 2). The depth at
-    /// inference stays max_iter; --gen-max-iter picks it lower.
+    /// inference stays max_iter; there is no flag to lower it.
     #[arg(long)]
     rand_depth: bool,
-    /// Batches averaged per held-out eval (20 = 100 KB). The eval window is
-    /// fixed and rewound every time, so numbers are comparable across runs.
+    /// Batches averaged per held-out eval. The scored window is
+    /// `n × batch × seq_len` BYTES — 20 × 10 × 512 = 102 400, 20 × 2 × 512 =
+    /// 20 480 — NOT a fixed size: it is rewound before every eval, so two
+    /// evals of one run agree, but two runs at different batch sizes scored
+    /// different amounts of text. The byte count on the eval line is the
+    /// authority; quote it with the number (AGENTS.md 2.6).
     #[arg(long)]
     eval_batches: Option<usize>,
     /// Also print the held-out BPB at depths 1..=max_iter at every eval (no
