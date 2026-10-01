@@ -244,6 +244,28 @@ file and cannot fail that way; the script now asserts
 of the shape `.bulba/memory.md` keeps collecting: an instrument that cannot
 distinguish success from failure, including one written to prove a gate works.
 
+### 5c-bis. The two-chunk fixture is not a copy of the one-chunk one, and the carry is LIVE
+
+Worth stating because the generator's own comment carries a trap: `SHAPES` is a
+module-level dict built at import, so changing `T` alone leaves every tensor at
+the old length and the "two-chunk" fixture becomes a **byte-identical copy of
+the one-chunk one** (`gen_bwd_f64.py:466-471` says so and rebuilds it). Read off
+the committed bytes, not the generator's intent:
+
+```
+fixture T=32, chunk=16  ->  nt=2 chunks
+             |dq|      |dk|      |dv|      |dg|      |db|      |dw|      |dstate|
+one chunk    6.2621e-1 8.7567e-1 4.8952e-1 4.8440e-1 4.7473e-1 5.6964e-1 9.6643e-1
+two chunks   7.1506e-1 9.6675e-1 6.4498e-1 6.5037e-1 4.8249e-1 9.1705e-1 1.3806e+0
+```
+
+Every one of the seven differs, so this is a different function and not a
+resized array. And the BPTT chain is not inert inside it: `|dk|` on chunk 0 is
+9.6675e-1 and on chunk 1 is 8.0853e-1, **ratio 0.836** — chunk 1's `dk` receives
+state-carry contributions that chunk 0's does not, which is exactly what BK2 and
+`d_s_shift` exist to produce. A fixture where those matched to 3 digits would
+pass an adjoint with the whole carry deleted, and this is not that fixture.
+
 ### 5d. Regression: the whole burn-gdn2 CPU cell is green, including the two that were red
 
 `0e9817b` recorded `tools/lib_gate.sh` RED on burn-gdn2 with two named tests
