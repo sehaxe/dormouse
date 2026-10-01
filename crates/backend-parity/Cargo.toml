@@ -36,6 +36,10 @@ burn-cuda = { version = "0.22.0-pre.4", default-features = false, features = [
     "std",
     "autotune",
 ] }
+# cubecl's autotune fallbacks are `log::warn!` lines (vendored
+# cubecl-runtime/src/tune/schedule.rs `Candidate::fail`); a test binary installs
+# no logger, so without this dep the fallback is invisible in a run.
+log = "0.4"
 
 [features]
 default = []

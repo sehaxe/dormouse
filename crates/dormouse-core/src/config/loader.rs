@@ -1,3 +1,38 @@
+//! Where a preset becomes a [`DormouseConfig`], and the one place in this
+//! crate that touches the filesystem.
+//!
+//! PRESETS ARE DATA (ADR-0005). `configs/*.toml` is the entire registry: no
+//! Rust table, no builtin list, no `match` on a preset name. Adding a preset is
+//! adding a file, and a file can be produced by a sweep. The only config baked
+//! into the binary is the schema's own serde defaults ([`super::schema`]), and
+//! those are `small` - so a missing preset file is a loud `Err`, never a
+//! silently-defaulted run.
+//!
+//! THE SEARCH ORDER, and why a NAME is a name at all. `--preset small` is
+//! tried against, in order: `./configs/small.toml`, `./configs/small`, the
+//! repo's `configs/` reached through the compile-time `CARGO_MANIFEST_DIR` (so
+//! the binary finds the presets it was built with whatever the cwd is), four
+//! paths relative to the executable, and `~/.config/dormouse/`. A value
+//! containing a slash or ending in `.toml` skips the search and is an EXPLICIT
+//! PATH, read directly.
+//!
+//! **KNOWN SILENT FALLBACK, recorded rather than fixed.** In the SEARCH path a
+//! candidate that exists but fails to read or fails to parse is dropped with
+//! both error modes discarded (`try_file` below: `read_to_string(p).ok()?`
+//! then `parse_str(&s).ok()`), so `--preset small` with a syntax error in
+//! `./configs/small.toml` falls through to the repo copy and runs a config
+//! nobody asked for, with no warning on any stream. That is ADR-0019's SILENT
+//! class - a defect - and the asymmetry is the finding: the EXPLICIT-PATH
+//! branch returns the parse error, so the same function treats the same
+//! failure loudly or silently depending on how the preset was spelled. Cheapest
+//! fix: collect the failures and mention them in the terminal `Err`, which
+//! already names every place it tried. Not done here; this lane is docs-only.
+//!
+//! COST. One `read_to_string` + one `toml::from_str` per run for an explicit
+//! path; the same per CANDIDATE for a name, which is at most 7 tiny files
+//! before the repo's is reached. Both are once per run, against a step that
+//! costs 0.8 s.
+
 use std::path::{Path, PathBuf};
 use super::schema::DormouseConfig;
 
@@ -7,9 +42,18 @@ fn parse_str(s: &str) -> Result<DormouseConfig, String> {
     toml::from_str(s).map_err(|e| format!("toml parse: {e}"))
 }
 
-fn try_file(p: &Path) -> Option<DormouseConfig> {
-    let s = std::fs::read_to_string(p).ok()?;
-    parse_str(&s).ok()
+/// `None` = candidate absent (the normal shape of a search path, silent);
+/// `Some(Err)` = candidate PRESENT but unusable. COUNTED (ADR-0019 row 26):
+/// the caller names the file and the reason instead of silently training on a
+/// different file than the first one it found — the same failure the explicit
+/// path already reports loudly.
+fn try_file(p: &Path) -> Option<Result<DormouseConfig, String>> {
+    let s = match std::fs::read_to_string(p) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => return Some(Err(format!("read: {e}"))),
+    };
+    Some(parse_str(&s))
 }
 
 fn candidates(name: &str) -> Vec<PathBuf> {
@@ -41,6 +85,11 @@ fn candidates(name: &str) -> Vec<PathBuf> {
 /// data: plain TOML under configs/ (cwd, the repo via CARGO_MANIFEST_DIR,
 /// the exe dir) or ~/.config/dormouse. Schema defaults are the only config
 /// baked into the binary (ADR-0005); there is no Rust preset registry.
+///
+/// A bare name that is found NOWHERE is an `Err` listing every path tried, not
+/// a default: the first path in the list wins, and "no preset" is a typo, not
+/// a configuration. The silent case is the opposite one - a candidate that
+/// exists and does not parse, which the search drops; see the module docs.
 pub fn load_config(name_or_path: &str) -> Result<DormouseConfig, String> {
     if is_explicit(name_or_path) {
         let p = Path::new(name_or_path);
@@ -49,7 +98,16 @@ pub fn load_config(name_or_path: &str) -> Result<DormouseConfig, String> {
     }
     let name = name_or_path.trim_end_matches(".toml");
     for p in candidates(name) {
-        if let Some(cfg) = try_file(&p) { return Ok(cfg); }
+        match try_file(&p) {
+            Some(Ok(cfg)) => return Ok(cfg),
+            // COUNTED (ADR-0019): a present-but-broken preset is named with its
+            // reason before the search moves on to the next candidate.
+            Some(Err(e)) => eprintln!(
+                "[config] preset candidate {} unusable ({e}); trying next",
+                p.display()
+            ),
+            None => {}
+        }
     }
     Err(format!("unknown preset or config not found: {name_or_path:?} (tried configs/, repo configs via manifest path, exe dir, ~/.config/dormouse)"))
 }
@@ -116,6 +174,23 @@ mod tests {
     #[test]
     fn unknown_preset_errs() {
         assert!(load_config("no_such_preset_xyz").is_err());
+    }
+
+    /// A candidate that exists but is broken is REPORTED (Some(Err) with the
+    /// reason), not silently skipped (ADR-0019 row 26); an absent candidate
+    /// stays a silent normal miss of the search path.
+    #[test]
+    fn broken_candidate_is_reported_absent_is_not() {
+        let dir = std::env::temp_dir().join(format!("dormouse_loader_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let broken = dir.join("broken.toml");
+        std::fs::write(&broken, "d_model = 768\nd_model = = broken\n").unwrap();
+        match try_file(&broken) {
+            Some(Err(msg)) => assert!(msg.contains("toml parse"), "reason must name the parse: {msg}"),
+            other => panic!("broken candidate must be Some(Err), got {other:?}"),
+        }
+        assert!(try_file(&dir.join("absent.toml")).is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
     #[test]
     fn presets_match_original_values() {

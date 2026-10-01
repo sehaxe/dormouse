@@ -60,6 +60,19 @@ fn quant_debug_on() -> bool {
     *DBG.get_or_init(|| std::env::var("DM_QUANT_DEBUG").is_ok())
 }
 
+/// COUNTED (ADR-0019 row 29; docs/reviews/doc-coverage-2026-10-01.md §3.3):
+/// the bf16-compute request is dropped on a non-CUDA build — the bf16 matmul
+/// op does not exist there, the fp32 path returns, the answer is correct — and
+/// this line is the only evidence that it happened. Once per process: the
+/// call site runs on every forward.
+#[cfg(not(feature = "cuda"))]
+fn bf16_compute_dropped_once() {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("[param] bf16_compute requested on non-cuda: fp32 path (counted, once)");
+    }
+}
+
 /// One projection: spectral or dense, both padded, both sliced back.
 #[derive(Module, Debug)]
 pub struct LinearLike {
@@ -155,13 +168,12 @@ impl LinearLike {
     /// `x [n, in] -> y [n, out]`, with the padding sliced back off.
     ///
     /// The dispatch has four arms, and they are a config decision each, not a
-    /// fallback: bf16 compute on/off, factor quant != Fp32 or not. Note the one
-    /// place a difference IS a silent degradation: on a non-CUDA build with
-    /// `bf16_compute` on, the bf16 matmul op does not exist and the quant path
-    /// runs instead with the graph still fp32. That is a **silent** fallback by
-    /// the ADR-0019 classification — the right answer, no counter — and it is
-    /// one of the three still-open sites; recorded in
-    /// `docs/reviews/doc-coverage-2026-10-01.md`, not fixed here.
+    /// fallback: bf16 compute on/off, factor quant != Fp32 or not. The one
+    /// place a difference IS a degradation: on a non-CUDA build with
+    /// `bf16_compute` on, the bf16 matmul op does not exist and the fp32 path
+    /// runs instead — the right answer, COUNTED (one stderr line per process,
+    /// `bf16_compute_dropped_once`); was SILENT until
+    /// docs/reviews/doc-coverage-2026-10-01.md §3.3.
     ///
     /// `DM_QUANT_DEBUG=1` prints the format of every linear on every forward.
     /// Debug-only and not on any hot path that is measured.
@@ -186,6 +198,7 @@ impl LinearLike {
                     }
                     #[cfg(not(feature = "cuda"))]
                     {
+                        bf16_compute_dropped_once();
                         if l.quant != burn_spectral::QuantFormat::Fp32 {
                             l.forward_quant::<B>(x)
                         } else {
@@ -401,4 +414,35 @@ impl TsctDiag {
 /// `-` for a missing reading, else two significant digits of exponent form.
 fn opt_f32(v: Option<f32>) -> String {
     v.map_or_else(|| "-".to_string(), |x| format!("{x:.2e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::tensor::TensorData;
+
+    /// The non-CUDA bf16-compute arm: the request is dropped (COUNTED, one
+    /// stderr line per process — rerun with `--nocapture` to read it) and the
+    /// fp32 path returns. The drop must not panic on the CPU test backend nor
+    /// move the answer (ADR-0019 row 29; doc-coverage §3.3).
+    #[test]
+    fn bf16_compute_on_cpu_is_the_fp32_answer_and_says_so() {
+        let device = Device::flex().autodiff();
+        let mut ll = LinearLike::new(8, 4, 4, &device);
+        let x = Tensor::<2>::from_data(
+            TensorData::new(vec![1.0f32, 0.5, -1.0, 2.0, 0.0, -0.5, 1.5, -2.0], [1, 8]),
+            &device,
+        );
+        // The crate's canonical CPU test backend (gr.rs:193, aux.rs:429).
+        type B = burn::backend::Autodiff<
+            burn::backend::Flex,
+            burn::backend::autodiff::checkpoint::strategy::BalancedCheckpointing,
+        >;
+        let fp32 = ll.forward::<B>(x.clone());
+        ll.set_bf16_compute(true);
+        let bf16 = ll.forward::<B>(x);
+        assert_eq!(bf16.dims(), [1, 4]);
+        let err: f32 = (bf16 - fp32).abs().max().into_scalar();
+        assert!(err < 1e-5, "cpu bf16-compute arm diverged from fp32: {err}");
+    }
 }

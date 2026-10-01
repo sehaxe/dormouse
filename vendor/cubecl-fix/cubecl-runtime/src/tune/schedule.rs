@@ -507,6 +507,16 @@ impl Candidate {
     }
 
     fn fail(&mut self, error: AutotuneError) {
+        // ADR-0019: a candidate that dies while another one wins the autotune
+        // is a silent fallback - the winner executes, the answer stays right,
+        // and nothing said the faster candidate never ran (the f16
+        // tensor-core candidate lived exactly this way for its whole life).
+        // This line is what makes the fallback COUNTED: `live` is false
+        // already, so it fires once per failed candidate, never in a loop.
+        log::warn!(
+            "autotune: candidate '{}' failed and was skipped: {error}",
+            self.name
+        );
         self.error = Some(error);
         self.live = false;
     }

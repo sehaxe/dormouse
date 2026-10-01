@@ -736,6 +736,7 @@ dependencies = [
  "burn-mor",
  "burn-ndarray",
  "burn-tensor",
+ "log",
 ]
 
 [[package]]
