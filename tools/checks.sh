@@ -93,12 +93,11 @@ T0=$(date +%s.%N)
 
 run() { # run NAME CMD... : time it, log it, one verdict line; FAIL prints the tail
     local name=$1; shift
-    local t0 rc dt
+    local rc dt
     printf '[checks] %-13s running  %s\n' "$name" "$*"
-    t0=$(date +%s.%N)
     "$@" >"$LOG/$name.log" 2>&1
     rc=$?
-    dt=$(awk -v a="$t0" -v b="$(date +%s.%N)" 'BEGIN{printf "%.1fs", b-a}')
+    dt=$(awk -v a="$CUR_T0" -v b="$(date +%s.%N)" 'BEGIN{printf "%.1fs", b-a}')
     if [ "$rc" -eq 0 ]; then
         N_PASS=$((N_PASS+1))
         printf '[checks] %-13s PASS   %8s  %s\n' "$name" "$dt" "$*"
@@ -110,18 +109,22 @@ run() { # run NAME CMD... : time it, log it, one verdict line; FAIL prints the t
 }
 
 skip() { # skip NAME REASON
+    local dt
+    dt=$(awk -v a="$CUR_T0" -v b="$(date +%s.%N)" 'BEGIN{printf "%.1fs", b-a}')
     N_SKIP=$((N_SKIP+1))
-    printf '[checks] %-13s SKIP             %s\n' "$1" "$2"
+    printf '[checks] %-13s SKIP   %8s  %s\n' "$1" "$dt" "$2"
 }
 
 for name in $SELECTED; do
+    CUR_T0=$(date +%s.%N)
     case $name in
         lib-tests)
             run "$name" tools/build_lock.sh run checks -- \
                 cargo test -p dormouse-core -p dormouse-data -p dormouse-train --lib
             ;;
         doc-warnings)
-            run "$name" env RUSTFLAGS="-D warnings" \
+            run "$name" tools/build_lock.sh run doc-warnings -- \
+                env RUSTFLAGS="-D warnings" \
                 cargo doc --no-deps -p dormouse-core -p dormouse-data -p dormouse-cli
             ;;
         doc-refs)
