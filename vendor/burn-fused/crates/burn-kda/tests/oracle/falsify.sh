@@ -82,11 +82,15 @@ run() { # $1 = label ; runs the oracle and summarises pass/fail per test
 
 run_rope() { # the RoPE arm's own gate (tests/kda_rope.rs)
   local out
-  out="$(cd "$libws" && cargo test -p burn-kda --test kda_rope 2>&1)"
+  # `--nocapture`: the rope tests print their measured margin per case, and a
+  # gate whose numbers are swallowed by the harness is a gate nobody reads.
+  out="$(cd "$libws" && cargo test -p burn-kda --test kda_rope -- --nocapture 2>&1)"
   echo "$out" | grep -E '^test [a-z0-9_]+ \.\.\.' | sed 's/^/    /'
   echo "$out" | grep -E '^test result:' | sed 's/^/    /'
   echo "$out" | sed -n '/^failures:$/,/^test result/p' \
     | grep -E '^    [a-z0-9_]+$' | sed 's/^/    RED: /'
+  # the measured margins the rope tests print, indented with the rest
+  echo "$out" | grep -E 'worst normalised' | grep -v 'disagrees' | sed 's/^/    /'
 }
 
 perturb() { # $1 = label, $2 = file, $3 = anchor, $4 = replacement
