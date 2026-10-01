@@ -95,7 +95,7 @@ f16 patch speedup | NEVER MEASURED on hardware |
 `--eval-depths` window | KNOWN WRONG, reads a different window than the `bpb` above it |
 `--dspark-k 0` | KNOWN WRONG, becomes k=1 at the default, and kills JEPA at `mor_bce_weight=0` |
 DSpark one-position shift | KNOWN, documented, deliberately unfixed — needs its own A/B |
-18 library crates unwired | KNOWN, fates recorded in docs/library-crate-fate.md |
+18 library crates unwired | KNOWN, fates recorded in docs/architecture/library-crate-fate.md |
 zero A/B verdicts in the project | TRUE, and every one is listed in AGENTS.md 3.2 |
 
 ## Two rules that follow from the table

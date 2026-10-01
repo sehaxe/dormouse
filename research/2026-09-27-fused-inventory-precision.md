@@ -219,7 +219,7 @@ per-SM policy lives in our own code: `crates/dormouse-train/src/lib.rs:317 quant
   `Backward` that does fp32 matmuls. Our own probe records that it does not work:
   `crates/dormouse-core/examples/gemm_probe.rs:50` — *"bf16 tensor-core path: BROKEN on pre.4 +
   cuda (its own tests in burn-spectral fail at burn-cubecl ops/tensor.rs:150), so it is not timed
-  here - see docs/PLAN.md OPTIMIZATION BLOCKERS"*. The probe gates the path behind
+  here - see docs/architecture/PLAN.md OPTIMIZATION BLOCKERS"*. The probe gates the path behind
   `GEMM_PROBE_BF16`. So `forward_quant_bf16` — reachable from production via
   `param.rs:92` whenever `--bf16` is on and the per-entry `bf16_compute` flag is set
   (`dormouse-train/src/lib.rs:473`) — calls a function whose own test in the same crate fails.

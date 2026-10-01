@@ -108,7 +108,7 @@ The stage *logic* is tokenizer-agnostic. Rule-based verifiers (exact match, rege
 - **From MiMo-7B (not V2.6)**: the proof that RL pays at small scale *only after the base is pretrained for the skill* — dormouse's lever is pretraining corpus/code density first, post-training second. And the dense-reward trick (score test cases by difficulty) for coding RL.
 - **From INTELLECT-3**: don't build RL environments from scratch — verifiers/Environments Hub reward functions are text-level and adaptable to byte-decoded outputs.
 - **From SimpleRL-Zoo**: expect base-model-specific quirks; format reward is a tuning knob, not a constant; response length growth ≠ capability growth.
-- **From MiMo-V2.6 / MOPD2**: the direction post-training is heading (mixed RL + on-policy distillation after RL) matches the distill/self-evolve stages already in dormouse's POST_TRAINING.md — nothing there needs revision, the frontier just validated the order.
+- **From MiMo-V2.6 / MOPD2**: the direction post-training is heading (mixed RL + on-policy distillation after RL) matches the distill/self-evolve stages already in dormouse's docs/architecture/post-training.md — nothing there needs revision, the frontier just validated the order.
 
 ### Honest uncertainty
 

@@ -801,17 +801,17 @@ one exists because breaking it cost a run, a week, or a claim.
 |---|---|
 | [`AGENTS.md`](AGENTS.md) | agent-facing repo state: measured numbers, CUDA quirks, every knob |
 | [`docs/glossary.md`](docs/glossary.md) | the vocabulary ("fused", "arm", "sidecar", "iteration", "Engram") and the live list of places a document and the code disagree |
-| [`docs/PLAN.md`](docs/PLAN.md) | program plan, phase ladder, verdicts, north star |
+| [`docs/architecture/PLAN.md`](docs/architecture/PLAN.md) | program plan, phase ladder, verdicts, north star |
 | [`docs/protocols/AB-PROTOCOL.md`](docs/protocols/AB-PROTOCOL.md) | the measurement instrument and the A/B queue (unrun) |
 | [`docs/adr/`](docs/adr/) | ADR-0001..0022 — every recorded decision, including the retracted ones |
 | [`docs/audit-2026-09-25.md`](docs/audit-2026-09-25.md) | codebase verdict audit: kill list, missing A/Bs |
-| [`docs/design-minimal.md`](docs/design-minimal.md) | the minimal-architecture target |
-| [`docs/mixture-arms.md`](docs/mixture-arms.md) | three priced training arms |
+| [`docs/architecture/design-minimal.md`](docs/architecture/design-minimal.md) | the minimal-architecture target |
+| [`docs/architecture/mixture-arms.md`](docs/architecture/mixture-arms.md) | three priced training arms |
 | [`research/2026-09-27-oracle-audit.md`](research/2026-09-27-oracle-audit.md) | what the library's verification claims are actually worth (read this before trusting any of them) |
 | [`research/2026-09-27-pytorch-baseline.md`](research/2026-09-27-pytorch-baseline.md) | every number in (a), with the two ways it can mislead you |
 | [`research/2026-09-27-scale-ladder.md`](research/2026-09-27-scale-ladder.md) | the 1B arithmetic in (e) |
 | [`research/2026-09-27-domain-anchors.md`](research/2026-09-27-domain-anchors.md) | per-domain n-gram bars |
-| [`POST_TRAINING.md`](POST_TRAINING.md), [`bf16_KERNEL_PLAN.md`](bf16_KERNEL_PLAN.md) | post-training loop, precision plans (in Russian) |
+| [`docs/architecture/post-training.md`](docs/architecture/post-training.md), [`docs/architecture/bf16-plan.md`](docs/architecture/bf16-plan.md) | post-training loop, precision plans (in Russian) |
 
 ## License
 

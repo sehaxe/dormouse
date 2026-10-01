@@ -51,7 +51,7 @@ fn main() {
         let f32_ms = time_ms(iters, warmup, || a.clone().matmul(w.clone()));
         // bf16 tensor-core path: BROKEN on pre.4 + cuda (its own tests in
         // burn-spectral fail at burn-cubecl ops/tensor.rs:150), so it is not
-        // timed here - see docs/PLAN.md OPTIMIZATION BLOCKERS. Kept behind a
+        // timed here - see docs/architecture/PLAN.md OPTIMIZATION BLOCKERS. Kept behind a
         // flag so the probe documents the blocker next to the numbers.
         let bf16_ms: Option<f64> = if std::env::var("GEMM_PROBE_BF16").is_ok() {
             Some(time_ms(iters, warmup, || bf16_matmul::<Bare>(a.clone(), w.clone())))

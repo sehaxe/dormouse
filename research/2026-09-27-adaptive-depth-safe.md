@@ -630,5 +630,5 @@ without a task suite — settling is the regime where extra depth is free.
 - Internal: `crates/dormouse-core/src/loop_block.rs` (iterations, per-iteration CE, mean readout,
   `set_depth`), `crates/dormouse-core/src/model.rs` (norm→lm_head readout), `crates/dormouse-train/
   src/lib.rs` (`sample_depth`, rand-depth step, the eval block: rewind, `eval_batches=20`, targets=None),
-  `docs/adr/0013-fixed-depth.md`, `docs/PLAN.md`,
+  `docs/adr/0013-fixed-depth.md`, `docs/architecture/PLAN.md`,
   `research/2026-09-26-ponder-replacement.md`.

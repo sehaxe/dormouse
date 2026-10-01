@@ -72,7 +72,7 @@ The v2 stack, each piece tied to a source:
    block — token-sparse recursion, KV-residual quantization; 1.64x/6x
    reported, training-free.
 6. **Post-training (phase 6): Rufus-Air ordering** (2609.29421) — verifiable
-   rewards first, judges later; matches POST_TRAINING.md.
+   rewards first, judges later; matches docs/architecture/post-training.md.
 
 ## HELD-OUT EVAL PROTOCOL (fixed 2026-09-27 - the A/B criterion was unsound)
 
@@ -358,7 +358,7 @@ first RLVR domain (no sub-100M precedent exists).
 4. **Rufus-Air (2609.29421)** — an 8-stage post-training recipe (SFT ->
    verifiable-reward RL stages -> RLHF) on a 106B base. Phase-6 template for
    our post-training ladder; the reward-reliability ordering principle
-   matches POST_TRAINING.md.
+   matches docs/architecture/post-training.md.
 
 ## CRITICAL FINDING 2026-09-26: the Engram eats the core's gradient
 
@@ -392,7 +392,7 @@ through the verification harness (tests + bench + A/B). Implications, in
 order: (1) the official fp32 baseline on corpus v2, (2) a code-domain corpus
 mixture (bytes need no architecture change), (3) SFT on code tasks, (4) the
 RLVR self-evolve loop with cargo-test/bench as the reward oracle
-(POST_TRAINING.md §self-evolve). Every speed/size win below directly buys
+(docs/architecture/post-training.md §self-evolve). Every speed/size win below directly buys
 this loop: faster steps = more RLVR rollouts per wall-clock hour.
 
 ## Mission
@@ -519,7 +519,7 @@ Goal: a chatbot that reasons, not one that recites. Ordered:
 1. **SFT on reasoning traces** in a byte-level chat format.
 2. **RLVR**: verifiable graders (math, code, logic). Critical thinking is installed here; memorized text earns nothing from a verifier.
 3. **Distillation** from a reasoning teacher near 2.5x student size, reverse KL on-policy (arXiv:2502.08606, 2306.13649): transfers thinking patterns at a fraction of RL compute.
-4. **Self-evolve**: verifier-filtered rollouts (the EGGROLL line in POST_TRAINING.md).
+4. **Self-evolve**: verifier-filtered rollouts (the EGGROLL line in docs/architecture/post-training.md).
 
 RSI ladder, one rung at a time, each with an entry condition:
 

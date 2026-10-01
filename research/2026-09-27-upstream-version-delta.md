@@ -62,7 +62,7 @@ the vendored kernel is ~5 lines in a crate that must then be re-vendored on ever
 
 ### 1.2 bf16 matmul — **STILL PRESENT upstream, and upstream calls it unfixed in a comment**
 
-The reference in our own docs (`docs/PLAN.md:256-257`, `crates/dormouse-core/examples/gemm_probe.rs:50`)
+The reference in our own docs (`docs/architecture/PLAN.md:256-257`, `crates/dormouse-core/examples/gemm_probe.rs:50`)
 "burn-cubecl ops/tensor.rs:150" is exact. In `burn-cubecl 0.22.0-pre.4`, `src/ops/tensor.rs:148-151`:
 
 ```rust
@@ -112,7 +112,7 @@ The three real routes, cheapest first:
 
 | Route | Cost | Note |
 | --- | --- | --- |
-| (a) cuBLAS `gemm_ex` for the big GEMMs, bypass cubecl's IR | 1-3 d | `crates/cublas-poc` already exists; measured on this card at **43.7 TFLOP/s** f16/f32-accum vs cubecl f32 3.5-7.6 (`.bulba/memory.md` 2026-09-27). This is `docs/PLAN.md:261-263` option (iii) and it is the only route that buys speed, not just correctness. |
+| (a) cuBLAS `gemm_ex` for the big GEMMs, bypass cubecl's IR | 1-3 d | `crates/cublas-poc` already exists; measured on this card at **43.7 TFLOP/s** f16/f32-accum vs cubecl f32 3.5-7.6 (`.bulba/memory.md` 2026-09-27). This is `docs/architecture/PLAN.md:261-263` option (iii) and it is the only route that buys speed, not just correctness. |
 | (b) `CudaBackend::Cpp` for bf16 | ~0 d to try | NVRTC lowers real `__nv_bfloat16`. Our note says this path is broken/slow (150 s/step) — treat as already measured-and-rejected. |
 | (c) add a bf16 type to the pliron LLVM dialect | 1-2 w | Vendoring `pliron-llvm` (a crates.io dep) to add a type. Highest risk, buys a kernel we must maintain. |
 
@@ -438,7 +438,7 @@ Written down rather than reasoned around, per the brief.
 1. **The exact error text/panic of the bf16 matmul failure on pre.4.** The *mechanism* is verified by
    code read (`restrict_to_llvm_backend` removes bf16 → no strategy → `.unwrap()` at
    `burn-cubecl/src/ops/tensor.rs:150`), but no GPU run was made, so "fails its own two tests" is
-   carried over from `docs/PLAN.md:256-257`, not reproduced here.
+   carried over from `docs/architecture/PLAN.md:256-257`, not reproduced here.
 2. **Whether the f16 `SizedType` panic is reached specifically through `nvptx/matrix.rs:501-502`.** That
    is the only f16-width query found in the matrix lowering, and the type mapping plus the missing
    impl are both confirmed, but the exact call path was not executed.

@@ -1,4 +1,4 @@
-# dormouse preset: p150 - the 150M-program flagship (see docs/PLAN.md).
+# dormouse preset: p150 - the 150M-program flagship (see docs/architecture/PLAN.md).
 # Overrides only; missing keys = schema defaults (== small). Flat per ADR-0005.
 d_model = 4096
 n_heads = 64

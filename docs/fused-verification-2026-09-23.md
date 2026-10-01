@@ -2,7 +2,7 @@
 
 Date: 2026-09-23. Branch: `fused-grad-coverage`. Agent 3 verification pass over
 the agent-1 WIP (`1ef0028`) plus the agent-2/3 gate commit (`65ff46c`).
-Acceptance criteria from `docs/PLAN.md` phase 1 item 1 (a/b/c).
+Acceptance criteria from `docs/architecture/PLAN.md` phase 1 item 1 (a/b/c).
 
 ## Criterion (a): grad coverage == burn path - GREEN
 

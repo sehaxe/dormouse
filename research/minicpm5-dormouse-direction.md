@@ -4,7 +4,7 @@
 
 ## TL;DR
 
-MiniCPM5-2B реален и свеж (OpenBMB, сентябрь 2026): 2.5B dense, Apache-2.0, avg **53.9** по 34 бенчмаркам — SOTA в классе 2B и выше всех 4B в наборе сравнения. Открыл **все чекпоинты** (Base/Midtrain/SFT/final + DSpark draft) и **весь тренировочный корпус** (UltraData: pretrain/SFT/RL). Данные — **только EN+ZH, русского нет** — для нашего RU-чат-бота напрямую годится pretrain-часть и рецепты, но не SFT/RL-часть. Главная практическая находка: **MiniCPM5-2B влезает в наши 16 GB (BF16 ≈ 5 GB) и может работать frozen-учителем** (KD/JEPA/OPD) для dormouse — это готовый путь к качеству без смены архитектуры. Рецепт post-training (tiered data → deep-thinking SFT → RL-учителя → OPD-слияние) — проверенная версия того, что набросано в POST_TRAINING.md.
+MiniCPM5-2B реален и свеж (OpenBMB, сентябрь 2026): 2.5B dense, Apache-2.0, avg **53.9** по 34 бенчмаркам — SOTA в классе 2B и выше всех 4B в наборе сравнения. Открыл **все чекпоинты** (Base/Midtrain/SFT/final + DSpark draft) и **весь тренировочный корпус** (UltraData: pretrain/SFT/RL). Данные — **только EN+ZH, русского нет** — для нашего RU-чат-бота напрямую годится pretrain-часть и рецепты, но не SFT/RL-часть. Главная практическая находка: **MiniCPM5-2B влезает в наши 16 GB (BF16 ≈ 5 GB) и может работать frozen-учителем** (KD/JEPA/OPD) для dormouse — это готовый путь к качеству без смены архитектуры. Рецепт post-training (tiered data → deep-thinking SFT → RL-учителя → OPD-слияние) — проверенная версия того, что набросано в docs/architecture/post-training.md.
 
 ## 1. Что такое MiniCPM5-2B (проверено)
 
@@ -55,7 +55,7 @@ MiniCPM5-2B BF16 ≈ 5 GB — **влезает в 16 GB рядом со student'
 1. **Сейчас**: закончить fused-ядра (M3–M6) — без них 48 итераций нежизнеспособны, а всё остальное ортогонально.
 2. **Параллельно, дёшево**: поднять MiniCPM5-2B локально как teacher; прототип KD-лосса (логиты на batch, reverse KL) рядом с существующим JEPA/DSpark.
 3. **После fused**: претрейн chat1 на 48 итерациях + random-depth; данные — rudialog + подмес Ultra-FineWeb-L3 EN/ZH для рассуждений.
-4. **Пост-трейн по рецепту MiniCPM5**: RU deep-thinking SFT (собрать/перевести) → RL-учителя по доменам (POST_TRAINING.md уже это скелетит) → OPD-слияние от MiniCPM5-экспертов где применимо.
+4. **Пост-трейн по рецепту MiniCPM5**: RU deep-thinking SFT (собрать/перевести) → RL-учителя по доменам (docs/architecture/post-training.md уже это скелетит) → OPD-слияние от MiniCPM5-экспертов где применимо.
 5. **A/B из анализа, которое стоит взять**: Engram на ранний вход vs в лупе (один прогон), random-depth vs фиксированный N.
 
 ## Ссылки

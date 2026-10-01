@@ -133,12 +133,12 @@ and `best_of_k_sampled_stays_in_range` guards the index range.
 
 **Wiring.** **Zero.**
 
-**Verdict: POST-TRAINING-ONLY** (self-evolve / best-of-N stage, `POST_TRAINING.md` §C
+**Verdict: POST-TRAINING-ONLY** (self-evolve / best-of-N stage, `docs/architecture/post-training.md` §C
 "Task-time: K=8 noisy rollouts (PonderNet Q-head) + pick by Q"). Two caveats for whoever
 picks it up: it is an **inference-time** recipe (it cannot be trained into the base model),
 and its `QHead` has **nowhere to plug in** — `loop_block.rs:118` says the depth is set per
 step and *"there is no learned halting here"*, and line 475 records that *"the PonderNet
-variant lost its A/B"*. `POST_TRAINING.md`'s "PonderNet Q-head" refers to a component that
+variant lost its A/B"*. `docs/architecture/post-training.md`'s "PonderNet Q-head" refers to a component that
 was cut, so this is a **new head**, not a reuse.
 
 ---
@@ -454,7 +454,7 @@ has a "seed-regeneration API" is false, and EGGROLL rollouts here are not reprod
 
 **Wiring.** **Zero.**
 
-**Verdict: POST-TRAINING-ONLY** (exploration stage; `POST_TRAINING.md` §"EGGROLL —
+**Verdict: POST-TRAINING-ONLY** (exploration stage; `docs/architecture/post-training.md` §"EGGROLL —
 exploration for controllers", "PPO exploits policy, EGGROLL explores routers"). It is a
 black-box optimiser and cannot be in a backprop base model.
 

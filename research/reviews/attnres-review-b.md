@@ -304,7 +304,7 @@ made under a bar that has no achievable form for this paper.
 ## 5. Is `burn-attnres` worth the work?
 
 **Facts, all verified from this tree.** 2402 lines (517 `lib.rs` + 1821 `fused_attnres.rs`
-+ 64 bench). Fate class **REFERENCE** (`docs/library-crate-fate.md:62`). Zero incoming edges
++ 64 bench). Fate class **REFERENCE** (`docs/architecture/library-crate-fate.md:62`). Zero incoming edges
 from `crates/dormouse-*` — grep over every `.toml` finds none, and `Cargo.toml:12` excludes
 `vendor/burn-fused` from the workspace. It *is* compiled by CI
 (`.github/workflows/fused-library.yml:163`, `--no-run` only). It **fails its own recorded

@@ -92,7 +92,7 @@ dependency on the other crates does not make them reachable.
 All eight shared the same three properties, which is what made the case: **no
 incoming path-dependency edge from any manifest in the repo except the
 `burn-fused` facade; no test of any other crate naming them; and no line in
-`docs/`, `configs/`, `POST_TRAINING.md` or the A/B queue asking for them.** The
+`docs/`, `configs/`, `docs/architecture/post-training.md` or the A/B queue asking for them.** The
 "no reason to stay" half is the judgement, and it is per-crate below — but in
 each case it is a judgement the repository has already made and written down,
 not one I invented.
@@ -112,7 +112,7 @@ the fact recorded where the test was.
 | `burn-fastblt` | Its own finding already ran and became a wired crate. `.bulba/memory.md`: "BLT ablation: hash n-grams work as INPUT features, n=3-4 first, diminishing returns past 300-500K rows" — that sentence *is* `burn-engram`. Keeping the port keeps the result, not the code. |
 | `burn-mod` | Per-token depth routing is `burn-mor`'s job in this product, and `burn-mor` is wired (`crates/dormouse-core/Cargo.toml`). The repo's depth arms are `--rand-depth` and `use_mor`, both un-run, and ADR-0013 already deleted learned halting. A third router is the one ADR-0002 deletes. |
 | `burn-byteflow` | A competing *whole model* (local encoder → coding-rate downsampling → global transformer → upsampling → decoder). Adopting it is not a mechanism swap, it is replacing `dormouse-core`. Nothing in the plan says that, so by default it does not happen. |
-| `burn-antihall` | 302 lines of hallucination detection and neuron-level suppression. No plan, config, flag or doc in this repo mentions it. `POST_TRAINING.md` does not either. |
+| `burn-antihall` | 302 lines of hallucination detection and neuron-level suppression. No plan, config, flag or doc in this repo mentions it. `docs/architecture/post-training.md` does not either. |
 | `burn-nope` | It removes positional encoding. dormouse's attention arm has none of the machinery to add, remove or compare — wiring it would mean first building RoPE, which is `burn-rope`'s fate, and then A/B-ing an ablation of it. Nothing asks for that. |
 | `burn-ttt` | A test-time *training loss* for long-context inference. The product is a trainer and a 256-byte generator; the inference-time adaptation loop it belongs to does not exist. It also carried the one claim ADR-0020 named as false ("Matched to the official implementation", §Relabelling) — the claim died with the crate, which is the cleanest possible resolution. |
 
@@ -169,7 +169,7 @@ is missing, so the next reader does not assume a kept crate is a live one.
   the single largest deletion available in the library, and it is left standing
   because both edges live in an `examples/` and a `benches/` manifest, neither
   of which this pass owns** — cutting them is a ten-line change for whoever
-  does. Related: `bf16_KERNEL_PLAN.md:31`
+  does. Related: `docs/architecture/bf16-plan.md:31`
   names `burn-sct` for a "TSCT bf16 retract", and that plan is against a
   capability `AGENTS.md:187` says this machine does not have at all.
 
@@ -180,7 +180,7 @@ dormouse build, so nobody reads a port as a product arm.
 | crate | the reason it stays |
 |---|---|
 | `burn-attnres`, `burn-mhc` | the residual-stream A/B. `PLAN-minimal-core.md` §M2: four rivals (ReZero, GR, mHC, AttnRes) and "A/B-ing the residual stream is currently a diff inside the model". Two of the four live here. Deleting them makes that A/B impossible to run without re-porting 3439 lines. |
-| `burn-eggroll`, `burn-es` | `POST_TRAINING.md:40` "EGGROLL — exploration for controllers". That phase does not exist. They overlap each other; one should go when it starts. |
+| `burn-eggroll`, `burn-es` | `docs/architecture/post-training.md:40` "EGGROLL — exploration for controllers". That phase does not exist. They overlap each other; one should go when it starts. |
 | `burn-ptrn` | test-time scaling aimed at exactly this architecture (a parameter-shared loop). Blocked on a decision, not on a port: it scores rollouts with a learned Q-head, and **ADR-0013 deleted that Q-head with PonderNet**; `AGENTS.md:645` says the selection rule must be re-specified first. |
 | `burn-situ`, `burn-swiglu` | measured by `benches/cpu_probe`; `burn-swiglu` in particular is a dependency for a line of `burn::activation::silu`, i.e. a probe of something the product does not use. |
 

@@ -193,7 +193,7 @@ Two further relabellings that are not falsehoods but read as claims:
   `test-time-training/e2e` (`ttt/model/loss.py`)". No test compares against that file;
   the four tests are zero-when-perfect and masked-mean checks. Relabel to
   "transcribed from `ttt/model/loss.py`; not yet compared against it".
-  **RESOLVED BY DELETION 2026-09-28** (`docs/library-crate-fate.md`): `burn-ttt` was
+  **RESOLVED BY DELETION 2026-09-28** (`docs/architecture/library-crate-fate.md`): `burn-ttt` was
   unreachable from `crates/dormouse-*` and had no other reason to exist, so it was
   removed — the claim needed no relabelling because it no longer exists. The finding
   stays here because the class is not retired: every remaining crate still has to

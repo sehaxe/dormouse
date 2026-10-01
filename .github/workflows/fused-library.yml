@@ -2,7 +2,7 @@ name: fused-library
 
 # The gate for `vendor/burn-fused` — the fused-kernel library (20 crates; was
 # 28 until 2026-09-28, when 8 unreachable crates were deleted — the per-crate
-# fate table is docs/library-crate-fate.md).
+# fate table is docs/architecture/library-crate-fate.md).
 #
 # WHY THIS FILE EXISTS. `vendor/burn-fused` has no `.git` of its own and the
 # root `Cargo.toml` `exclude`s it (its crates are separate cargo workspace

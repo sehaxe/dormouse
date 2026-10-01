@@ -315,7 +315,7 @@ appropriately labelled as claims-to-be-falsified rather than green tests.
 
 ### 3.3 Severity, in context
 
-`docs/library-crate-fate.md:62` records `burn-attnres` as fate class **b / REFERENCE**, and
+`docs/architecture/library-crate-fate.md:62` records `burn-attnres` as fate class **b / REFERENCE**, and
 `crates/burn-attnres/README.md:3`–`:8` states it is **not in the dormouse build** (no incoming edges
 from `dormouse-{core,data,train,cli}`; the residual-stream A/B named at `PLAN-minimal-core.md` §M2
 has never been run). So **none of the nine bugs has ever executed inside a training run**, and no
@@ -590,7 +590,7 @@ transcription error.
   sources (D16), the Alg. 1 line-12 online merge algebra (D17), zero-init of `w_l` (D14), the `n == 1`
   short-circuit (D18).
 * `burn-attnres` is **not in the dormouse build** (`crates/burn-attnres/README.md:3`–`:8`,
-  `docs/library-crate-fate.md:62`, class **b / REFERENCE**), so none of the nine bugs has ever run in
+  `docs/architecture/library-crate-fate.md:62`, class **b / REFERENCE**), so none of the nine bugs has ever run in
   training and **no dormouse number is retracted by this audit**.
 
 ## SPECULATION (my inference)
@@ -608,7 +608,7 @@ transcription error.
   either removed or written down — and the fact that the doc comment presents it as the definition of
   the mechanism, with no paper citation, is the kind of thing ADR-0020 exists for.
 * **Severity ranking assumes a future A/B on the residual stream** (`PLAN-minimal-core.md` §M2). If the
-  crate is deleted per `docs/library-crate-fate.md`, D1–D9 cost nothing and §4's list is moot. If it is
+  crate is deleted per `docs/architecture/library-crate-fate.md`, D1–D9 cost nothing and §4's list is moot. If it is
   kept as the AttnRes arm, D5–D8 mean the arm measures a mechanism that is **not AttnRes** — it is a
   plain residual at block boundaries with a partial-sum mix inside blocks — so an A/B run today would
   be charging a wrong mechanism's numbers to the paper.
