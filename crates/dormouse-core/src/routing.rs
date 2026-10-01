@@ -19,6 +19,14 @@
 //!   so a new arm cannot slip in unnoticed;
 //! - a new [`Role`] or [`LinearParam`] does not compile until the policy
 //!   match says where it trains.
+//!
+//! **There is no second implementation.** This file is what the trainer calls
+//! (`dormouse-train::optim::optimizer_groups` -> [`routing`]) and what
+//! installs the groups. An earlier version of this note claimed the opposite
+//! and pointed at a path-marker copy in `optim.rs`; that copy was deleted by
+//! `831e3a0` on 2026-09-28, and the stale sentence was carried into a LATER
+//! docs commit (`d81d920`, 2026-10-01). See
+//! `docs/reviews/dedup-optimizer-2026-10-01.md`.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -55,6 +63,10 @@ impl Group {
 }
 
 /// Parameter count per group, for the startup banner and the tests.
+///
+/// The repo's ONE counts type. `dormouse-train` used to declare a second
+/// `GroupCounts` with the same four fields and no docs; it now re-exports
+/// this one, so the banner and the declaration cannot drift apart in shape.
 ///
 /// A count of 0 is a finding, not a formatting detail: [`Routing::check`]
 /// refuses to start when the `Table` or `Muon` group is empty, because an empty
@@ -121,15 +133,20 @@ pub fn route_linear(into: &mut Routing, lin: &LinearLike, role: Role, factors_fa
     }
 }
 
-/// Every param of a module subtree as `(path, id)`. Paths are for error
-/// messages only - no routing decision is ever made from one.
+/// Every float param of a module subtree as `(path, id, rank)`. Paths are for
+/// error messages only - no routing decision is ever made from one.
+///
+/// THE repo's one module walker: the trainer needs the rank (`check_installed`
+/// refuses a 1D param in a Muon+ group) and the declaration does not, so the
+/// rank rides along in the same tuple rather than in a second visitor doing an
+/// identical stack-then-join walk.
 #[derive(Default)]
-struct IdCollector {
+struct ParamCollector {
     stack: Vec<String>,
-    out: Vec<(String, ParamId)>,
+    out: Vec<(String, ParamId, usize)>,
 }
 
-impl ModuleVisitor for IdCollector {
+impl ModuleVisitor for ParamCollector {
     fn enter_module(&mut self, name: &str, _container: &str) {
         self.stack.push(name.to_string());
     }
@@ -137,8 +154,18 @@ impl ModuleVisitor for IdCollector {
         self.stack.pop();
     }
     fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<D>>) {
-        self.out.push((self.stack.join("."), param.id));
+        self.out.push((self.stack.join("."), param.id, D));
     }
+}
+
+/// Every float parameter of `model` as `(path, id, rank)`.
+///
+/// The one walk. `dormouse-train::param_paths` re-exports this rather than
+/// keeping its own copy of the traversal.
+pub fn param_paths(model: &DormouseModel) -> Vec<(String, ParamId, usize)> {
+    let mut c = ParamCollector::default();
+    model.visit(&mut c);
+    c.out
 }
 
 /// The declared routing: one id list per group.
@@ -158,9 +185,9 @@ impl Routing {
     /// unless someone routes it, and it is still CHECKED (below), never
     /// invisible.
     fn rest_of<M: Module>(&mut self, module: &M) {
-        let mut c = IdCollector::default();
+        let mut c = ParamCollector::default();
         module.visit(&mut c);
-        for (_, id) in c.out {
+        for (_, id, _) in c.out {
             if self.claimed(id) {
                 continue;
             }
@@ -203,9 +230,10 @@ impl Routing {
     /// DECLARATION - not a second derivation of the policy from names - so it
     /// cannot disagree with the group builder by construction.
     pub fn check(&self, model: &DormouseModel) -> Result<GroupCounts, String> {
-        let mut c = IdCollector::default();
+        let mut c = ParamCollector::default();
         model.visit(&mut c);
-        let path_of: HashMap<ParamId, String> = c.out.iter().map(|(p, id)| (*id, p.clone())).collect();
+        let path_of: HashMap<ParamId, String> =
+            c.out.iter().map(|(p, id, _)| (*id, p.clone())).collect();
         let mut declared: HashMap<ParamId, Group> = HashMap::with_capacity(path_of.len());
         for (group, ids) in &self.groups {
             for id in ids {
@@ -236,7 +264,7 @@ impl Routing {
                     .to_string(),
             );
         }
-        for (path, id) in &c.out {
+        for (path, id, _) in &c.out {
             if !declared.contains_key(id) {
                 return Err(format!("{path}: no declared optimizer group"));
             }
@@ -262,10 +290,13 @@ impl Routing {
 /// TSCT `u`/`v` factors drop out of the Muon+ group and go to the fallback
 /// optimizer, which is the A/B for whether the factors belong in Muon+ at all.
 ///
-/// Note this trait is the ID-based DECLARATION. The policy that actually runs
-/// is the path-marker implementation in `dormouse-train/src/optim.rs`, and
-/// they agree today; until that is reconciled, say which one you mean
-/// (AGENTS.md §3.3).
+/// This trait IS the live policy — there is no second copy. `831e3a0`
+/// (2026-09-28) deleted the trainer's path-marker policy that used to build
+/// the groups from strings; `dormouse-train::optim` now ASSEMBLES what this
+/// declares, into `ParamGroup`s by id. If you are reading an older note that
+/// calls this "exercised only by tests" and names a path-marker twin in
+/// `optim.rs`, that note predates the cut and is wrong (it was reintroduced
+/// into prose by `d81d920`, after the code was already fixed).
 pub trait Routed {
     /// Declare this subtree's parameters into `into`. Called once per module
     /// tree at startup; must be total (every parameter in exactly one group),
