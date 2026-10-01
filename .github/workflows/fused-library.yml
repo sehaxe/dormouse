@@ -112,7 +112,7 @@ jobs:
   # padded the short conv's left edge exactly as the kernel wrongly did - which
   # is how a real defect (`0a6998a`) stayed green in this very job.
   ref-data-reproducible:
-    name: "fused-lib :: ref_f64_broad.bin regenerates byte-identically (a fixture that drifted from its generator)"
+    name: "fused-lib :: ref_f64_broad.bin is what its generator emits (a fixture that drifted from its generator)"
     runs-on: ubuntu-latest
     timeout-minutes: 30
     defaults:
@@ -126,18 +126,43 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: numpy
-        run: pip install numpy
-      # Both f64 fixtures, and the committed wrong-formula companion, so a
+      # PINNED, and measured. This step was red on 5 of the last 10 runs OF THE
+      # IDENTICAL COMMIT - green, red, red, red, green, green, red, green, red,
+      # green going back - so the axis was never the version: a green and a red
+      # run of the same sha both installed `numpy-2.5.3-cp312-cp312-manylinux`.
+      # It is the HOST. The f64 outputs are numpy reductions whose summation
+      # order is picked by the runtime CPU dispatch, and the generator's
+      # matmuls go through an OpenBLAS whose own build string says
+      # `DYNAMIC_ARCH` (measured here: `OpenBLAS 0.3.34.106.0 USE64BITINT
+      # DYNAMIC_ARCH`), i.e. it selects its kernels per host CPU. Two runners,
+      # two orders, two last bits. Re-measured on this box, and the axes that
+      # could have been pinned are all zero-width here: numpy 2.5.3 under
+      # python 3.14 and 3.12 give byte-identical fixtures, and
+      # OMP_NUM_THREADS=1 changes nothing.
+      - name: numpy, pinned to the version the committed bytes were made with
+        run: pip install "numpy==2.5.3"
+      # Single-threaded BLAS: the other half of the same axis, and free.
+      - name: one BLAS thread (determinism of the reductions)
+        run: echo "OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1" >> "$GITHUB_ENV"
+      # BOTH f64 fixtures, and the committed wrong-formula companion, so a
       # generator edit cannot quietly move the negative control either.
-      - name: regenerate
-        run: |
-          python3 tools/gen_reference_f64.py --broad
-          python3 tools/gen_reference_f64.py
-      - name: the committed fixtures must be exactly what the generator emits
-        run: |
-          git diff --exit-code -- tests/ref_f64_broad.bin
-          git diff --exit-code -- tests/ref_f64.bin tests/ref_f64_faults.bin
+      #
+      # NOT `git diff --exit-code`, and that is the measured correction, not a
+      # softening: byte-equality was this job's contract on 2026-09-27 and it
+      # was FALSE - a correct regeneration on a different host is not
+      # byte-identical, which is why the same commit passed and failed all day.
+      # `check_f64_fixtures.py` is the tool the repo already ships and
+      # `tools/lib_gate.sh` already runs, and it splits the contract where the
+      # arithmetic actually splits it: the f32 weights and inputs are compared
+      # BIT-EXACTLY (the RNG is stdlib integer math, so any difference there is
+      # a changed input, not rounding), and only the f64 OUTPUTS get 1e-12
+      # relative - measured round-off on this generator is <= 4.4e-15
+      # (typically ~7e-16) and the SMALLEST wrong formula sits 4.1e+11 further
+      # out, so the bar cannot pass a semantic change and cannot trip on
+      # rounding. It also regenerates into a temp dir, so the working tree is
+      # never mutated and the comparison cannot pass by being unable to run.
+      - name: the committed fixtures must be what this generator emits
+        run: python3 tools/check_f64_fixtures.py --verbose
 
   # 4. the flagship claim: burn against the f64 oracle
   # GREEN as of 2026-09-29, --release, ndarray: 1000 cases on the
