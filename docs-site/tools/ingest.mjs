@@ -41,6 +41,26 @@ path (a retraction note is \`.bulba/memory.md:15\`, not a paraphrase). They are 
 scratch pad, not a reference: they grow at the bottom and are never edited for
 style.`,
 	},
+	{
+		path: 'research/notes',
+		title: 'Notes',
+		intro: `Dated notes, **newest first**. A note from yesterday is evidence about today's
+tree; a note from 2026-09-21 is history. Nothing here is maintained — each file
+is what was believed on its date, with the measurements attached.`,
+	},
+	{
+		path: 'research/papers',
+		title: 'Papers & specs',
+		intro: `One page per paper: our transcription of a formula, or our reading of an
+upstream reference implementation. Reference material — read these when you need
+the equation, not when you need the status.`,
+	},
+	{
+		path: 'research/decisions',
+		title: 'Decisions',
+		intro: `The owner's decision sheets: inputs to a decision, not records of one. A
+recorded decision is an [ADR](/adr/).`,
+	},
 ];
 
 // ── report counters ──────────────────────────────────────────────────────────
@@ -171,14 +191,49 @@ function readSlice(src, slice) {
 		to = lines.findIndex((l, i) => i > from && slice.to.test(l));
 		if (to < 0) die(`slice "to" not found in ${src}: ${slice.to}`);
 	}
+	// Memoised because the heading pass reads every slice a second time, and a
+	// count of reads would report 15 slices as 30.
+	if (sliceCache.has(bodyKey(src, slice))) return sliceCache.get(bodyKey(src, slice));
+	const body = lines.slice(from, to).join('\n').replace(/\n{3,}/g, '\n\n').trimEnd() + '\n';
+	sliceCache.set(bodyKey(src, slice), body);
 	stats.sliced++;
-	const body = lines.slice(from, to).join('\n');
-	return body.replace(/\n{3,}/g, '\n\n').trimEnd() + '\n';
+	return body;
 }
+
+const bodyKey = (src, slice) => (slice ? `${src}::${slice.from}::${slice.to ?? ''}` : src);
+const sliceCache = new Map();
 
 // ── link rewriting ───────────────────────────────────────────────────────────
 
 const LINK = /\]\(([^)\s]+)((?:\s+"[^"]*")?)\)/g;
+
+/** github-slugger, which is what Astro uses for heading ids. */
+function slugify(heading) {
+	return heading
+		.trim()
+		.toLowerCase()
+		.replace(/[^\p{L}\p{N}\s-]/gu, '')
+		.replace(/\s+/g, '-');
+}
+
+/**
+ * `#anchor` links inside a SLICED source are the one case a per-file rewrite
+ * cannot fix: `](#presets)` in README.md means "the Presets heading of README.md",
+ * but README.md is eight pages here, and on the wrong one that anchor is dead.
+ * So: pre-read every slice, record which page owns which heading, and let the
+ * rewriter send the link to the page that actually has the heading.
+ */
+function indexHeadings() {
+	const owner = new Map(); // "src#slug" -> page URL
+	for (const p of plan) {
+		const body = readSlice(p.src, p.slice);
+		for (const line of body.split('\n')) {
+			const m = /^(#{1,6})\s+(.+?)\s*$/.exec(line);
+			if (m) owner.set(`${p.src}#${slugify(m[2])}`, urlOf(p.out));
+		}
+	}
+	return owner;
+}
 
 function rewriteLinks(body, src) {
 	const fromDir = path.posix.dirname(src);
@@ -192,7 +247,17 @@ function rewriteLinks(body, src) {
 				continue;
 			}
 			out += part.replace(LINK, (m, target) => {
-				if (/^(#|https?:|mailto:|ftp:|tel:|\/|~)/.test(target)) return m;
+				if (/^#/.test(target)) {
+					// A heading of this file. Whole-file pages keep it as-is;
+					// a slice sends it to the page that owns the heading.
+					const own = headingOwner.get(`${src}#${decodeURIComponent(target.slice(1))}`);
+					if (own && own !== current) {
+						stats.linkSite++;
+						return m.replace(target, own + target);
+					}
+					return m;
+				}
+				if (/^(https?:|mailto:|ftp:|tel:|\/|~)/.test(target)) return m;
 				if (/[${}<>|]/.test(target)) return m; // a template, not a path
 				const hash = target.indexOf('#');
 				const rel = hash < 0 ? target : target.slice(0, hash);
@@ -230,7 +295,7 @@ function rewriteLinks(body, src) {
 
 // ── title / description ──────────────────────────────────────────────────────
 
-function titleAndBody(body, fallback, label) {
+function titleAndBody(body, fallback, label, fromSlice) {
 	const segs = segments(body);
 	let title = null;
 	let drop = null; // [segmentIndex, lineIndex]
@@ -244,6 +309,19 @@ function titleAndBody(body, fallback, label) {
 			}
 		});
 	});
+	// A SLICE starts at the `##` heading that names it, and that heading is the
+	// page's title. Without this, every README slice is titled "README" in the
+	// sidebar — which is how two pages both called "README" got in.
+	if (title === null && fromSlice) {
+		for (const s of segs) {
+			if (s.code) continue;
+			const m = /^#{2,3}\s+(.+?)\s*$/.exec(s.lines[0] ?? '');
+			if (m) {
+				title = plain(m[1]);
+				break;
+			}
+		}
+	}
 	if (drop) {
 		// Remove the source's own h1: Starlight renders the frontmatter title as
 		// the page heading, and two h1s on one page is a defect, not a feature.
@@ -252,8 +330,8 @@ function titleAndBody(body, fallback, label) {
 			.map((s) => s.lines.join('\n'))
 			.join('\n')
 			.replace(/^\n+/, '');
-	} else if (fallback) {
-		// The manifest (or a renderer) named the title; nothing to report.
+	} else if (fallback || title) {
+		// The manifest, a renderer, or the slice's own heading named it.
 	} else {
 		stats.noHeading.push(label);
 	}
@@ -302,7 +380,9 @@ function renderTsv(src) {
 	const out = [comments.join('\n\n'), '', `## The register — ${body.length} comparisons`, ''];
 	for (const row of body) {
 		const rec = Object.fromEntries(head.map((h, i) => [h, cell(row[i])]));
-		out.push(`### \`${rec.file}\``, '');
+		// Plain h3, not backticked: Starlight renders inline code inside a heading
+		// as a large wrapping mono box, and there are 127 of these.
+		out.push(`### ${rec.file}`, '');
 		for (const k of head) {
 			if (!k || k === 'file' || !rec[k]) continue;
 			out.push(`- **${k}** — ${rec[k]}`);
@@ -365,7 +445,21 @@ function write(out, front, body) {
 	stats.pages++;
 }
 
-rmSync(OUT, { recursive: true, force: true });
+// Clear only the generated .md files, never the directory tree: `npm run dev`
+// watches this directory, and replacing the tree under a running dev server
+// leaves it serving a stale route list until it is restarted.
+(function clearGenerated(dir) {
+	if (!existsSync(dir)) return;
+	for (const e of readdirSync(dir, { withFileTypes: true })) {
+		const p = path.join(dir, e.name);
+		if (e.isDirectory()) {
+			clearGenerated(p);
+			if (readdirSync(p).length === 0) rmSync(p, { recursive: true, force: true });
+		} else if (e.name.endsWith('.md')) {
+			rmSync(p, { force: true });
+		}
+	}
+})(OUT);
 mkdirSync(OUT, { recursive: true });
 
 // authored pages (the landing page) come through untouched.
@@ -378,10 +472,16 @@ for (const rel of authored) {
 	write(rel.replace(/\.md$/, ''), m[1], raw.slice(m[0].length).trimStart());
 }
 
+// Which page owns which heading of which source. Built before any page is
+// written, because a slice's link to a sibling slice can only be resolved once
+// every sibling has been read.
+const headingOwner = indexHeadings();
+let current = '';
+
 // the pages
 for (const p of plan) {
 	let body = readSlice(p.src, p.slice);
-	const url = urlOf(p.out);
+	current = urlOf(p.out);
 	body = rewriteLinks(body, p.src);
 
 	let toc = true;
@@ -398,7 +498,7 @@ for (const p of plan) {
 		stats.rendered++;
 	}
 
-	const t = titleAndBody(body, p.title ?? derivedTitle, p.src);
+	const t = titleAndBody(body, p.title ?? derivedTitle, p.src, Boolean(p.slice));
 	p.resolvedTitle = t.title;
 	const front = [
 		`title: ${yaml(t.title)}`,

@@ -13,9 +13,11 @@ hero:
     - text: How the model works
       link: /architecture/model/
       icon: right-arrow
+      variant: secondary
     - text: What was retracted
       link: /archive/broken/
       icon: open-book
+      variant: secondary
 ---
 
 ## A knowledge base with a retraction policy

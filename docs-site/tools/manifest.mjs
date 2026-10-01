@@ -300,6 +300,6 @@ export const globs = [
 
 // Pages this site owns. The landing page and nothing else: everything else is a
 // view of a canonical file.
-export const authored = ['index.md'];
+export const authored = ['index.md', '404.md'];
 
 export default { repo, branch, sections, pages, globs, dirIndex, srcIndex, authored };
