@@ -237,3 +237,43 @@ jobs:
           name: lcov
           path: lcov.info
           retention-days: 30
+
+  # ── 5. docs ────────────────────────────────────────────────────────────────
+  # rustdoc builds. `broken_intra_doc_links = "deny"` and
+  # `invalid_html_tags = "deny"` already live in the root `[workspace.lints.
+  # rustdoc]` table and every member opts in with `[lints] workspace = true`,
+  # so this job's real content is not the build - it is that a doc link which
+  # does not resolve is now a BUILD FAILURE anywhere a crate is built, and this
+  # is the job that shows it.
+  #
+  # dormouse-train is NOT here: it is the heavy crate, it has an active lane,
+  # and adding it is a one-line change when that lane lands. Naming the
+  # omission is the point - a gate that silently covers three of four crates
+  # reads as coverage of four.
+  #
+  # GREEN on landing 2026-10-01 (`cargo doc --no-deps -p dormouse-core
+  # -p dormouse-data -p dormouse-cli`, rustc 1.98.1): 57 s, exit 0, 7 rustdoc
+  # `missing documentation` warnings from the two lint tables above and nothing
+  # denied. Those warnings are NOT a gate and deliberately so: `missing_docs`
+  # is a style lint, and this repo's docs are in AGENTS.md / docs/ rather than
+  # in per-item rustdoc. See docs/reviews/ci-quality-2026-10-01.md.
+  #
+  # NOT HERE: the docs-site build. It is already a job - `build` in
+  # docs-site.yml, running `npm ci && npm run ingest && npm run build
+  # && npm run check` and failing on any dead internal href. Adding it here
+  # would build the same 151-page site twice on every push to main. What that
+  # job does NOT cover is recorded in the findings file: its `paths:` filter
+  # means a PR that only touches a crate's doc comments runs no docs gate at
+  # all, because the filter names docs paths and not `crates/**`.
+  docs:
+    name: "docs :: rustdoc for core + data + cli (a doc link that does not resolve is a build failure)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: install mold (repo config links through it)
+        run: sudo apt-get update && sudo apt-get install -y mold
+      - name: rustdoc
+        run: cargo doc --no-deps -p dormouse-core -p dormouse-data -p dormouse-cli
