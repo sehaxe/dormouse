@@ -70,7 +70,7 @@ newline).
 
 What the script fixes, and why: `--preset small` (the flagship on 16 GB and
 the schema default — [presets](presets.md)), `--batch 8 --seq-len 512`,
-`--no-engram`, `--eval-every 500`, `--guard --detach --timers --log`. The
+`--no-engram`, `--eval-every 500`, `--detach --timers --log`. The
 control family every current verdict rests on is exactly this recipe plus a
 seed (`docs/reviews/ab-wave-2026-10-01.md:68-79`). `--no-engram` keeps the
 first run on the pure-model path: the hashed-memory arm has its own eval

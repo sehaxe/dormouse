@@ -169,14 +169,14 @@ line instead.
 | `--stress-every <n>` | 50 | stress report cadence |
 | `--log <file>` | none | append stdout+stderr to this file. Logs belong in `/home/sehaxe/logs/`, not `/tmp` (a 32 GB tmpfs that ate a 33.5 GB sidecar once) |
 | `--detach` | off | daemonize: ignore SIGHUP, fork to background |
-| `--guard` | off | on NaN loss or panic: wait 30 s, re-exec with a fresh CUDA context, resume from the last checkpoint. Capped at 3 restarts (`crates/dormouse-cli/src/bin/train.rs:386-388`) |
 
-`--guard` is the **recovery action for a loud failure**, not a substitute for
-fixing it (ADR-0011). Two things it will not do: restart a run with **no resume
-state** (a fresh run that has never checkpointed has nothing to resume), and
-survive a rebuild — `cargo build-train` replaces `target/release/train`, so the
-re-exec fails with ENOENT exactly when the recovery is needed (measured
-2026-09-27).
+There is no process-level auto-restart: a failure exits non-zero and the
+operator resumes with the same `--ckpt-name`. The `--guard` wrapper that
+re-exec'd from a pinned image was removed 2026-10-02 — its detached parent
+exited 0, so orchestrators read a crashed run as a finished one
+(`docs/reviews/unguard-2026-10-02.md`). The in-loop NaN firewall (loss masked,
+gradients sanitized, the step skipped) is unconditional and was never behind a
+flag (ADR-0011).
 
 `DM_QUANT_DEBUG=1` is the one remaining environment variable, debug-only, and
 prints every `LinearLike` quant format. Everything else is a typed flag — with

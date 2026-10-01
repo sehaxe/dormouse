@@ -555,14 +555,14 @@ training-step stamp; the `.ngram` one is a known open gap (ADR-0021 item 7).
 
 ### guard
 
-The in-process NaN/panic recovery: wait 30 s, re-exec from a pinned executable
-image with a fresh CUDA context, resume from the last checkpoint.
-
-`--guard` (`crates/dormouse-cli/src/bin/train.rs:167`), the pinned image at
-`train.rs:255-290`.
-
-**Not** the NaN firewall (that is in-process, per step, and masks the step to a
-no-op — `mask_nonfinite`, `lib.rs:281`). **Not** a retry loop in the shell.
+REMOVED 2026-10-02. The `--guard` flag was the process-level NaN/panic
+recovery: wait 30 s, re-exec from a pinned executable image under
+`target/release/guard-image/`, resume from the last checkpoint, capped at 3
+restarts. Deleted after its detached parent exited 0 and orchestrators read a
+crashed run as a finished one (`docs/reviews/unguard-2026-10-02.md`). A failure
+now exits non-zero; the NaN firewall (in-process, per step, the step masked to
+a no-op — `mask_nonfinite`, `lib.rs:281`) is unconditional and was never
+behind the flag. Dated documents still name it; that is history, not a knob.
 
 ### seed
 

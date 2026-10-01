@@ -104,7 +104,11 @@ the right answer.** A branch is taken, a fallback runs the same function, and th
 run is correct but a year slower. Data that does not exist stops the run and is
 never synthesized (pretrain v21 trained on constant `b'x'`); shape mismatches
 assert; assertions average ≥2 per non-trivial function (NASA P10 Rule 5). The
-recovery action for a loud failure is `--guard`.
+NaN firewall is unconditional — a masked step is skipped on device, and a
+failure that survives it stops the run for a human: the `--guard` auto-restart
+wrapper was removed 2026-10-02 (its detached parent exited 0, orchestrators
+read failure as success, fifteen runs stacked on one GPU —
+`docs/reviews/unguard-2026-10-02.md`).
 
 A fused/accelerated arm must be able to show it ran: the eval line prints the
 seam counters (`fused kda=fwd/bwd norm=ran/asked muon_skipped=mom/finalize`),
@@ -1250,7 +1254,7 @@ Ranked applicability:
 - `DM_QUANT_DEBUG=1` remains the one env var (debug-only, prints every
   `LinearLike` quant format); `CUBECL_AUTOTUNE_LEVEL` is the cubecl runtime's
   own knob, exposed as `--autotune`. Everything else is a typed flag:
-  `--timers`, `--memlog`, `--quant-check`, `--log`, `--detach`, `--guard` (see
+  `--timers`, `--memlog`, `--quant-check`, `--log`, `--detach` (see
   `--help`).
 
 ## 3.8 API and performance state (2026-09-27; do not revert)
@@ -1286,5 +1290,5 @@ Ranked applicability:
 - Launch line for the flagship recipe:
   `./target/release/train --data <corpus dir> --eval <held-out> --eval-every 500
   --preset small --batch 10 --seq-len 512 --engram-ram --engram-slots 48000000
-  --host-adam-every 1 --guard --detach --log <file>` — and, per §1.5, under
+  --host-adam-every 1 --detach --log <file>` — and, per §1.5, under
   `systemd-run --user --scope -p MemoryMax=40G`.

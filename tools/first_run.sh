@@ -62,7 +62,6 @@ exec systemd-run --user --scope -p MemoryMax=40G \
     --no-engram \
     --steps "$STEPS" \
     --ckpt-name "$CKPT" \
-    --guard \
     --detach \
     --timers \
     --log "$LOG" \

@@ -115,7 +115,7 @@ caught in its own brief:
   comparison.
 
 The control's recipe, read off its config snapshot: `--preset small --batch 8
---seq-len 512 --no-engram --steps 2000 --eval-every 500 --guard --detach
+--seq-len 512 --no-engram --steps 2000 --eval-every 500 --detach
 --timers`, aux at preset defaults (jepa 0.05 + KoLeo, dspark 0.0),
 `eval_batches 20`, `lr 1e-4 cosine`, `opt mix` (Muon+ ns=8), quant auto → Fp8,
 `max_iter 4`, 9 197 454 params (`docs/reviews/ab-wave-2026-10-01.md` §0.3).
