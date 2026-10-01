@@ -48,7 +48,7 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REGISTRY = os.path.join(ROOT, "docs", "protocols", "ORACLE-TIERS.tsv")
-CRATES = os.path.join(ROOT, "vendor", "burn-fused", "crates")
+CRATES = os.path.join(ROOT, "vendor", "dormouse-fused", "crates")
 # burn-rmsnorm joined the scope when `tests/rmsnorm_oracle.rs` landed: it is the
 # tree's first tier-(a) row, and a registry row nothing scans is a row that
 # cannot fail. Widening the scope is what makes its R1/R2/R3 checks live.
