@@ -200,6 +200,17 @@ cannot produce.
 
 Chance rate for a 4-way top-1 is 0.2500.
 
+**These are means over 8 draws, and the run-to-run spread is part of the
+number, not noise to be hidden.** Four consecutive runs of the gate gave
+cross-pass top-1 agreement 0.9766 / 0.9805 / 0.9766 / 0.9766 (dense) and
+0.9590 / 0.9531 / 0.9609 / 0.9648 (routed), with disjoint% 0.0000 (dense,
+every time) and 0.0410 / 0.0469 / 0.0391 / 0.0352 (routed). Quote the dense
+agreement as **~0.977-0.981** and the routed as **~0.953-0.965**: the ORDERING
+is stable across every run (dense agreement is always the higher of the two,
+and dense disjoint% is always exactly 0), while the individual digits are a
+property of the draws. A single-run digit quoted to four places would be a
+number this fixture cannot support.
+
 **THE HEADLINE, and it is two numbers, not one.** The existing mixture is
 **input-dependent** (0.7285 flips against a 0.25 chance rate: the expert
 weights genuinely move when the text moves) and **pass-INDEPENDENT** (0.9766
