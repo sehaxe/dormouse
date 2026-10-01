@@ -170,3 +170,70 @@ jobs:
       - name: unused dependencies
         continue-on-error: true
         run: cargo machete crates/
+
+  # ── 4. coverage ────────────────────────────────────────────────────────────
+  # How much of the three library crates the lib test suites actually execute.
+  # `--lib` and not the whole workspace: the seam tests under crates/*/tests/
+  # are separate binaries and folding them in would answer a different question
+  # ("what do the unit tests cover") than the one this number is for ("how much
+  # of the library does `cargo test --lib` reach").
+  #
+  # NO THRESHOLD, ON PURPOSE, and the number is printed so the threshold can be
+  # chosen from a measurement instead of a guess: a floor invented before the
+  # first reading is a floor nobody can satisfy or defend. What this job buys
+  # today is the lcov artifact and the number in the log, both of which turn
+  # "coverage fell" from an opinion into a diff on the next run. See the
+  # coverage row in docs/reviews/ci-quality-2026-10-01.md for the reading this
+  # landed with and where the untested mass is.
+  #
+  # The instrumented build is a SEPARATE target directory (cargo-llvm-cov's
+  # default, `target/llvm-cov-target`), so it never invalidates the plain
+  # `target/` the other jobs share, and Swatinem/rust-cache's default key does
+  # not cover it - which is the trade: this job pays a full cold build of the
+  # dependency tree on every run.
+  coverage:
+    name: "coverage :: llvm-cov over the three lib test suites (measurement, no gate yet)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # llvm-tools-preview is what supplies `llvm-profdata`/`llvm-cov` for
+          # this toolchain; without the component cargo-llvm-cov refuses to
+          # start rather than measuring nothing.
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      # coverage instrumentation links the test binaries, and this repo's
+      # .cargo/config.toml sets `-C link-arg=-fuse-ld=mold` for
+      # x86_64-unknown-linux-gnu, so without mold every link fails with
+      # collect2's "cannot find ld". Same step, same reason, as the cpu job.
+      - name: install mold (repo config links through it)
+        run: sudo apt-get update && sudo apt-get install -y mold
+      # 0.9.1 is the current release; `fallback: none` makes a missing prebuilt
+      # binary a failure instead of a silent source build of an unmeasured
+      # version. The action checks the release's SHA256.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov@0.9.1
+          fallback: none
+      - name: instrument, run the three lib suites, report
+        run: |
+          cargo llvm-cov --lib -p dormouse-core -p dormouse-data -p dormouse-train \
+            --summary-only --lcov --output-path lcov.info
+      - name: the number, in the log
+        # Re-print the TOTAL out of the lcov file rather than trusting that the
+        # table above scrolled past. lcov's per-file records carry `LF:<lines
+        # found>` and `LH:<lines hit>`; summing both across records gives the
+        # number, and the file is the artifact - so the two cannot disagree.
+        run: |
+          awk -F: '
+            /^LF:/ { found += $2 }
+            /^LH:/ { hit += $2 }
+            END { printf "coverage: %d/%d lines = %.2f%%\n", hit, found, 100 * hit / found }
+          ' lcov.info
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lcov
+          path: lcov.info
+          retention-days: 30
