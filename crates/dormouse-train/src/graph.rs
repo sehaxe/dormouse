@@ -275,16 +275,24 @@ pub struct Stats {
     pub replays: u64,
     pub captures: u64,
     pub refusals: u64,
+    /// Set after [`MAX_REFUSALS`]: the capture is not attempted again. A refused
+    /// capture has already grown the persistent pool by one working set (the
+    /// priming pass keeps every slice it touched), so a run that retries every
+    /// step and is refused every step would grow that pool until it OOMs.
+    /// Stopping is loud — it is in the report line — and correct, because an
+    /// ungraphed step trains exactly what a replayed one would.
+    pub disabled: bool,
     pub last_refusal: Option<String>,
 }
 
 impl Stats {
     pub fn line(&self) -> String {
         format!(
-            "graph: captured {} replayed {} refused {}{}",
+            "graph: captured {} replayed {} refused {}{}{}",
             self.captures,
             self.replays,
             self.refusals,
+            if self.disabled { " DISABLED after repeated refusals" } else { "" },
             match &self.last_refusal {
                 Some(r) => format!(" last refusal: {r}"),
                 None => String::new(),
@@ -292,6 +300,9 @@ impl Stats {
         )
     }
 }
+
+/// How many refusals before the seam stops trying. See [`Stats::disabled`].
+const MAX_REFUSALS: u64 = 20;
 
 /// Copy `src` into `dst`'s existing buffer: one launch, no allocation.
 ///
@@ -537,7 +548,7 @@ impl Seam {
         self.graph = None;
         #[cfg(feature = "cuda")]
         {
-            if !ungraphed {
+            if !ungraphed && !self.stats.disabled {
                 if let Some(client) = &self.client {
                     if let Err(e) = client.graph_prepare() {
                         self.grads = Some(body());
@@ -581,6 +592,14 @@ impl Seam {
                 "graph: capture REFUSED ({reason}). Continuing UNGRAPHED: correct, and as slow \
                  as before --graph-capture. A refusal that names a memory node means the window \
                  grew the pool — it must allocate nothing new, so capture later in the run."
+            );
+        }
+        if self.stats.refusals == MAX_REFUSALS {
+            self.stats.disabled = true;
+            println!(
+                "graph: {MAX_REFUSALS} refusals, so the capture is DISABLED for the rest of this \
+                 run. Each attempt grew the persistent pool by a working set; retrying forever \
+                 would OOM. The run continues ungraphed and trains exactly what it would have."
             );
         }
         self.stats.last_refusal = Some(reason);
