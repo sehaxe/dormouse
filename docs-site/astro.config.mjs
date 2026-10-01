@@ -6,14 +6,24 @@
 // interactive and writes a template this config would immediately replace.
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
+import mermaid from 'astro-mermaid';
 import manifest from './tools/manifest.mjs';
 
 const { repo } = manifest;
 
 export default defineConfig({
 	site: `${repo}`,
+	// GitHub Pages project site: served under /dormouse/ — without this every asset 404s.
+	base: '/dormouse',
 	trailingSlash: 'always',
 	integrations: [
+		// Mermaid renders ```mermaid fences client-side. The owner directive is
+		// that ASCII box-drawing diagrams are always broken (a code block is
+		// monospace-proportional to the reader's font and nothing lines up), so
+		// this is the lane that makes a diagram worth writing. A mermaid fence
+		// that mermaid cannot parse still renders as its own source, so a bad
+		// diagram is a visible bad diagram rather than a silent one.
+		mermaid({ theme: 'neutral', autoTheme: true }),
 		starlight({
 			title: 'dormouse',
 			description:

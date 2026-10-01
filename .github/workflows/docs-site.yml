@@ -1,0 +1,61 @@
+name: docs-site
+
+# The knowledge base, deployed: docs-site renders the canonical markdown
+# (AGENTS.md, CONTEXT.md, docs/, research/) into a Starlight site and ships
+# it to GitHub Pages. The `npm run check` gate walks every href in dist/ and
+# fails on one that does not resolve — a dead link in the docs is a red CI,
+# same as a dead test.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs-site/**'
+      - 'docs/**'
+      - 'research/**'
+      - 'README.md'
+      - 'AGENTS.md'
+      - 'CONTEXT.md'
+      - '.bulba/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: docs-site/package-lock.json
+      - name: ingest + build + gate
+        working-directory: docs-site
+        run: |
+          npm ci --no-audit --no-fund
+          npm run ingest
+          npm run build
+          npm run check
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs-site/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
