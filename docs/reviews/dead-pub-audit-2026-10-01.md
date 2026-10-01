@@ -89,6 +89,10 @@ second reader: `cholesky_host_par` is the only `unsafe` block in the audit's top
 
 ## 2. Dead-but-documented: 1 item, 12 lines
 
+**DELETED 2026-10-01** — function and doc line together, in the config-seams
+lane (`docs/reviews/config-seams-2026-10-01.md`); `grep train_eval_split
+crates/ tools/` is 0. The record below is the finding as made.
+
 `dormouse_data::train_eval_split` (`crates/dormouse-data/src/lib.rs:192`) is
 called by nothing and mentioned exactly once, at `lib.rs:16`:
 
