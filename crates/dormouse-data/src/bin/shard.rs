@@ -5,7 +5,7 @@
 //! order, which here meant domain blocks (math walls, title-list junk) —
 //! train CE collapsed on the local domain while held-out eval stayed hard.
 //!
-//! Usage: shard <corpus-in> <out-dir> <n-shards>
+//! Usage: `shard <corpus-in> <out-dir> <n-shards>`
 //! Docs are separated by 2+ consecutive newlines (the filter's separator);
 //! each output doc is written verbatim followed by "\n\n".
 

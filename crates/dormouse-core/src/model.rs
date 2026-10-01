@@ -127,7 +127,7 @@ impl DormouseModel {
         out_acc
     }
 
-    /// Returns (logits, L_Rec [1], kda, aux Option<[1]>). When
+    /// Returns (logits, L_Rec \[1\], kda, aux Option<\[1\]>). When
     /// `targets` is Some, the per-step reconstruction loss is accumulated
     /// inside the loop block so the model never slices a 4D autodiff tensor
     /// (cubecl/sm_120 stability). `host_rows` carries pre-gathered n-gram

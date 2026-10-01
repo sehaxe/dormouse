@@ -985,7 +985,7 @@ struct Cli {
     dedup_cap: usize,
     log_every_docs: u64,
     /// validation helper: score blank-line-separated docs of this file and
-    /// print "idx<TAB>P(hq)" lines to stderr instead of filtering a corpus
+    /// print `idx<TAB>P(hq)` lines to stderr instead of filtering a corpus
     score_docs: Option<String>,
 }
 

@@ -13,26 +13,29 @@
 //! unigram for unseen contexts.
 //!
 //! Usage:
-//!   cargo run --release -p dormouse-data --bin anchors -- <dir-or-file> [flags]
-//!     --bytes 2000000     how much to read (0 = all)
-//!     --holdout 0.25      trailing fraction reserved for scoring
-//!     --order 5           n-gram order for the strongest baseline
-//!     --skip-header       drop FASTA '>' lines from the byte stream
-//!     --fit <dir-or-file> fit the counters on ANOTHER corpus and score the
-//!                         positional one. This is the only way to get the bar
-//!                         for the exact bytes the trainer's eval reads: its
-//!                         eval is the FIRST 100 KB of the eval dir, while an
-//!                         internal --holdout split scores the TRAILING
-//!                         quarter, so the two numbers were never comparable
-//!                         (review 2026-09-27). Measured 2026-09-28: --fit on
-//!                         the filtered corpus scores the eval tail at
-//!                         unigram 5.011 / 5-gram 2.588, against 5.115 / 3.001
-//!                         for the in-corpus split of the same file - the
-//!                         in-corpus bar is the EASIER one, and it still moves
-//!                         with --bytes (1M vs 2M: 2.826 vs 2.849). --bytes
-//!                         bounds the fit corpus too, so a 100 KB --fit scores
-//!                         3.624: the bar is a property of the fit size, and
-//!                         the header line says which one it was.
+//!
+//! ```text
+//! cargo run --release -p dormouse-data --bin anchors -- <dir-or-file> [flags]
+//!   --bytes 2000000     how much to read (0 = all)
+//!   --holdout 0.25      trailing fraction reserved for scoring
+//!   --order 5           n-gram order for the strongest baseline
+//!   --skip-header       drop FASTA '>' lines from the byte stream
+//!   --fit <dir-or-file> fit the counters on ANOTHER corpus and score the
+//!                       positional one. This is the only way to get the bar
+//!                       for the exact bytes the trainer's eval reads: its
+//!                       eval is the FIRST 100 KB of the eval dir, while an
+//!                       internal --holdout split scores the TRAILING
+//!                       quarter, so the two numbers were never comparable
+//!                       (review 2026-09-27). Measured 2026-09-28: --fit on
+//!                       the filtered corpus scores the eval tail at
+//!                       unigram 5.011 / 5-gram 2.588, against 5.115 / 3.001
+//!                       for the in-corpus split of the same file - the
+//!                       in-corpus bar is the EASIER one, and it still moves
+//!                       with --bytes (1M vs 2M: 2.826 vs 2.849). --bytes
+//!                       bounds the fit corpus too, so a 100 KB --fit scores
+//!                       3.624: the bar is a property of the fit size, and
+//!                       the header line says which one it was.
+//! ```
 //!
 //! Note on genomics: a genome is bytes, so this tool works on it unchanged -
 //! no tokenizer, no conversion. The floor is ln(4) = 1.39 bits/byte for pure

@@ -9,6 +9,9 @@ license.workspace = true
 # crates the trainer links.
 publish = false
 
+[lints]
+workspace = true
+
 [dependencies]
 burn = { version = "0.22.0-pre.4", default-features = false, features = ["std", "extension", "cuda"] }
 burn-cuda = { version = "0.22.0-pre.4", default-features = false, features = ["std", "autotune"] }
@@ -25,7 +28,7 @@ half = { version = "2.7", default-features = false }
 [features]
 default = []
 # Section 4 (zero-copy on cubecl's own stream) needs the cubecl patch in
-# docs/research/2026-09-27-cublas-integration-poc-renamed.md, which is deliberately not in
+# docs/research/2026-09-27-cublas-integration-poc.md, which is deliberately not in
 # the tree - so this is OFF by default and a plain `cargo check` still builds.
 # Sections 0-3 of the measurement need no patch and run either way.
 cublas-native = []

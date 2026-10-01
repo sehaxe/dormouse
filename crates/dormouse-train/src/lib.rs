@@ -385,7 +385,7 @@ impl ModuleVisitor for GradSanitizer<'_> {
     }
 }
 
-/// Zero the non-finite gradients in place. See [`GradSanitizer`].
+/// Zero the non-finite gradients in place. See `GradSanitizer`.
 pub fn sanitize_grads(grads: &mut burn::tensor::Gradients, model: &DormouseModel) {
     model.visit(&mut GradSanitizer { grads });
 }

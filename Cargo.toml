@@ -15,6 +15,23 @@ resolver = "2"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+
+# Burn-style ([workspace.lints] + `[lints] workspace = true` in each member, the
+# shape burn's root Cargo.toml uses). Two rustdoc denies, both cheap and both
+# about a claim being readable rather than about style: a doc link that does not
+# resolve is a broken pointer, and an HTML-ish token in prose is a doc comment
+# that renders wrong.
+#
+# The clippy table is present and EMPTY on purpose. It is the one place clippy
+# policy can live for every crate at once, and it is intentionally not filled
+# in until the clippy gate that reads it exists - a lint table nothing runs is
+# the ADR-0019 SILENT shape, and .github/workflows/ (where the gate goes) is not
+# this file's business.
+[workspace.lints.clippy]
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "deny"
+invalid_html_tags = "deny"
 [profile.release]
 lto = "thin"
 # codegen-units = 1 serializes LLVM codegen per crate: with 20 cores the CPU

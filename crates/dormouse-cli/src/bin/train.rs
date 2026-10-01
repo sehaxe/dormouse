@@ -42,7 +42,7 @@ struct Args {
     wd: Option<f64>,
     #[arg(long)]
     grad_clip: Option<f64>,
-    /// Checkpoint file name (<name>.bin in --ckpt-dir; resume reuses it).
+    /// Checkpoint file name (`<name>.bin` in --ckpt-dir; resume reuses it).
     #[arg(long)]
     ckpt_name: Option<String>,
     #[arg(long, default_value = "checkpoints")]

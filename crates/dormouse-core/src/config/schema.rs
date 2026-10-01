@@ -252,7 +252,7 @@ pub struct DormouseConfig {
     /// had per-key support (the corpus exhausts the 16.8M 3-gram space 2750x
     /// over) while n=5 and n=8 were ~5775-way averages - 512M dead
     /// parameters, 2/3 of the table. 2/3/4 is DeepSeek's own shipped set
-    /// over compressed tokens (V4.1-Flash n in {2,3,4}, Engram-27B [2,3])
+    /// over compressed tokens (V4.1-Flash n in {2,3,4}, Engram-27B \[2,3\])
     /// and the deepest order whose key space (256^4 = 4.3e9) a 46 GB byte
     /// corpus can populate; n>=5 spaces (1.1e12) are hopeless. The VALUES
     /// are what `dormouse_data::ORDERS` hashes; the COUNT is what the model

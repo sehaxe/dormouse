@@ -10,6 +10,10 @@ publish = false
 # building and running when `dormouse-core` is mid-refactor. It depends on
 # burn-tensor and the two backends and on nothing else - the whole gate
 # compiles in seconds against an already-built burn stack.
+
+[lints]
+workspace = true
+
 [dependencies]
 burn-tensor = { version = "0.22.0-pre.4", default-features = false, features = [
     "std",

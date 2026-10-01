@@ -13,7 +13,7 @@
 //! to measure both with the same instrument - a gate that used a different
 //! one would be comparing two numbers from two programs.
 //!
-//! COST. [`record`] is one thread-local `Option` check per loop iteration and
+//! COST. `record()` is one thread-local `Option` check per loop iteration and
 //! nothing at all when disarmed: no device sync, no allocation, no counter on
 //! the eval line. Disarmed is the default, and it is what every production
 //! forward sees. [`take`] is where the host read happens, and only a test or

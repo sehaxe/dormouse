@@ -39,7 +39,7 @@ pub fn fnv(b: &[u8]) -> u64 {
 /// 3-gram key space 2750x over) and n=5/n=8 were ~5775-way averages, i.e.
 /// 512M parameters carrying no more information than the mean of their
 /// members. It is DeepSeek's own shipped set over compressed tokens
-/// (V4.1-Flash n in {2,3,4}; Engram-27B [2,3]) and the deepest order whose
+/// (V4.1-Flash n in {2,3,4}; Engram-27B \[2,3\]) and the deepest order whose
 /// key space (256^4 = 4.3e9) a 46 GB byte corpus can still populate.
 pub const ORDERS: [usize; 3] = [2, 3, 4];
 
