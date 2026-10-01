@@ -178,10 +178,18 @@ fn fixture() -> (Vec<String>, HashMap<String, Case>, f32) {
                     .clone()
             };
             let dims: [usize; 4] = {
-                let v: Vec<usize> = get("dims").split_whitespace().map(|s| s.parse().unwrap()).collect();
+                let v: Vec<usize> = get("dims")
+                    .split_whitespace()
+                    .map(|s| s.parse().unwrap())
+                    .collect();
                 [v[0], v[1], v[2], v[3]]
             };
-            let f = |k: &str| -> Vec<f32> { get(k).split_whitespace().map(|s| s.parse().unwrap()).collect() };
+            let f = |k: &str| -> Vec<f32> {
+                get(k)
+                    .split_whitespace()
+                    .map(|s| s.parse().unwrap())
+                    .collect()
+            };
             let conf = if get("confidence_pred") == "none" {
                 None
             } else {
@@ -201,7 +209,10 @@ fn fixture() -> (Vec<String>, HashMap<String, Case>, f32) {
                 name: name.clone(),
                 dims,
                 draft_logits: f("draft_logits"),
-                target_ids: get("target_ids").split_whitespace().map(|s| s.parse().unwrap()).collect(),
+                target_ids: get("target_ids")
+                    .split_whitespace()
+                    .map(|s| s.parse().unwrap())
+                    .collect(),
                 eval_mask: f("eval_mask"),
                 aligned_target_logits: f("aligned_target_logits"),
                 confidence_pred: conf,
@@ -278,8 +289,7 @@ fn ce_and_tv_agree_with_the_official_loss() {
             .map(|v| Tensor::from_data(TensorData::new(v, [b, l, 1]), &device));
 
         let (_total, ce, tv, _conf) = burn_dspark::dspark_loss(
-            draft, target, ids, conf, mask,
-            4.0, // the official loss_decay_gamma
+            draft, target, ids, conf, mask, 4.0, // the official loss_decay_gamma
         );
 
         // ONLY the two terms that agree. The confidence term is excluded here
@@ -354,7 +364,7 @@ fn the_confidence_term_agrees_with_the_official_loss() {
 
     for name in &names {
         let c = &cases[name];
-        let [b, _a, k, v] = c.dims;  // A == 1; see the fixture tests
+        let [b, _a, k, v] = c.dims; // A == 1; see the fixture tests
         let l = k;
         let draft = t3(c.draft_logits.clone(), [b, l, v], &device);
         let target = t3(c.aligned_target_logits.clone(), [b, l, v], &device);
@@ -519,7 +529,10 @@ fn dspark_loss_gradients_agree_with_the_official_loss() {
     for name in &names {
         let c = &cases[name];
         let [b, a, k, v] = c.dims;
-        assert_eq!(a, 1, "{name}: the generator holds A == 1; see the fixture tests");
+        assert_eq!(
+            a, 1,
+            "{name}: the generator holds A == 1; see the fixture tests"
+        );
         let l = k;
 
         let draft = t3(c.draft_logits.clone(), [b, l, v], &device).require_grad();
@@ -536,14 +549,16 @@ fn dspark_loss_gradients_agree_with_the_official_loss() {
             .map(|v| t3(v, [b, l, 1], &device).require_grad());
         let conf_leaf = conf.clone();
 
-        let (total, ..) = burn_dspark::dspark_loss(
-            draft, target, ids, conf, mask, 4.0,
-        );
+        let (total, ..) = burn_dspark::dspark_loss(draft, target, ids, conf, mask, 4.0);
         let grads = total.backward();
 
         for (what, got, want) in [
             ("draft", draft_leaf.grad(&grads), c.grad_draft.as_ref()),
-            ("conf", conf_leaf.as_ref().and_then(|t| t.grad(&grads)), c.grad_conf.as_ref()),
+            (
+                "conf",
+                conf_leaf.as_ref().and_then(|t| t.grad(&grads)),
+                c.grad_conf.as_ref(),
+            ),
         ] {
             let (Some(got), Some(want)) = (got, want) else {
                 // `grad_conf` is `none` exactly when the head is `none`, and
@@ -676,7 +691,6 @@ fn no_fixture_case_reaches_the_denominator_difference() {
 /// different functions.
 #[test]
 fn the_fixture_has_one_anchor_so_the_decay_index_lines_up() {
-
     let (_, cases, _) = fixture();
     for c in cases.values() {
         assert_eq!(c.dims[1], 1, "{}: A must be 1", c.name);
@@ -730,7 +744,9 @@ fn an_entirely_masked_block_is_zero_and_not_nan() {
 #[test]
 fn identical_draft_and_target_give_exactly_zero_tv() {
     let (_, cases, _) = fixture();
-    let c = cases.get("aligned_identical").expect("aligned_identical case");
+    let c = cases
+        .get("aligned_identical")
+        .expect("aligned_identical case");
     assert_eq!(
         c.out_l1, 0.0,
         "TV must be exactly 0 when draft and target agree"

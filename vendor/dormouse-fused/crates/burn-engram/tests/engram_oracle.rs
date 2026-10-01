@@ -103,10 +103,10 @@ fn fixture() -> HashMap<String, Vec<f64>> {
             _ => key.to_string(),
         };
         let entry = out.entry(key).or_default();
-        entry.extend(
-            body.split_whitespace()
-                .map(|v| v.parse::<f64>().unwrap_or_else(|_| panic!("bad number {v:?}"))),
-        );
+        entry.extend(body.split_whitespace().map(|v| {
+            v.parse::<f64>()
+                .unwrap_or_else(|_| panic!("bad number {v:?}"))
+        }));
     }
     out
 }
@@ -126,7 +126,12 @@ impl Fx {
     }
     fn one(&self, key: &str) -> f64 {
         let v = self.get(key);
-        assert_eq!(v.len(), 1, "{key} should be a scalar, got {} values", v.len());
+        assert_eq!(
+            v.len(),
+            1,
+            "{key} should be a scalar, got {} values",
+            v.len()
+        );
         v[0]
     }
     fn at(&self, key: &str, i: usize) -> f64 {
@@ -184,7 +189,10 @@ fn abs_diff(a: f32, b: f64) -> f64 {
 
 fn max_abs_diff(a: &[f32], b: &[f64]) -> f64 {
     assert_eq!(a.len(), b.len(), "length {} vs {}", a.len(), b.len());
-    a.iter().zip(b).map(|(x, y)| abs_diff(*x, *y)).fold(0.0, f64::max)
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| abs_diff(*x, *y))
+        .fold(0.0, f64::max)
 }
 
 fn our_gate(fx: &Fx) -> Vec<f32> {
@@ -230,7 +238,10 @@ fn prime_ladder_matches_the_reference_exactly() {
         );
         checked += 1;
     }
-    assert!(checked >= 4, "only {checked} ladders checked; fixture looks truncated");
+    assert!(
+        checked >= 4,
+        "only {checked} ladders checked; fixture looks truncated"
+    );
 }
 
 /// The reference shares ONE `seen_primes` set across every layer it hashes
@@ -301,7 +312,10 @@ fn gate_is_on_the_clamp_min_side() {
             fx.gate_tol(i)
         );
     }
-    assert!(band >= 4, "only {band} band rows; the fixture no longer discriminates");
+    assert!(
+        band >= 4,
+        "only {band} band rows; the fixture no longer discriminates"
+    );
 }
 
 /// The green half of the same comparison: everything about the gate except that
@@ -352,7 +366,10 @@ fn the_gate_matches_the_reference_up_to_the_add_divergence() {
             add[i]
         );
     }
-    assert!(checked >= 14, "only {checked} resolvable rows; fixture looks truncated");
+    assert!(
+        checked >= 14,
+        "only {checked} resolvable rows; fixture looks truncated"
+    );
     let (worst_d, worst_i) = worst;
     eprintln!(
         "gate vs the reference's `clamp_min` gate, {checked} resolvable rows: max \
@@ -399,10 +416,19 @@ fn the_reference_gate_is_sign_unstable_below_1e_minus_7() {
         "no row below |s| = {RESOLVABLE_S:e} reproduces the sign instability; \
          this test's name is no longer supported by the fixture"
     );
-    let flip = err.iter().position(|e| *e > 1e-4).expect("a row with the instability");
+    let flip = err
+        .iter()
+        .position(|e| *e > 1e-4)
+        .expect("a row with the instability");
     let g = gates[flip];
-    assert!((g - 0.5).abs() > 1e-5, "the unstable row should sit off 0.5; it is {g:.9}");
-    eprintln!("unstable row {flip}: |s| {:e}, the reference's gate {g:.9}", s[flip].abs());
+    assert!(
+        (g - 0.5).abs() > 1e-5,
+        "the unstable row should sit off 0.5; it is {g:.9}"
+    );
+    eprintln!(
+        "unstable row {flip}: |s| {:e}, the reference's gate {g:.9}",
+        s[flip].abs()
+    );
 }
 
 /// The RMS eps IS a divergence, and this sizes it instead of hiding it.
@@ -518,7 +544,11 @@ fn oracle_module(fx: &Fx) -> (EngramModule, Tensor<3>, Tensor<4>) {
         fx.at("meta.conv_kernel", 0) as usize,
         fx.at("meta.conv_kernel", 1) as usize,
     );
-    assert_eq!(tables * embed, 192, "total_embed must match the fixture's Linears");
+    assert_eq!(
+        tables * embed,
+        192,
+        "total_embed must match the fixture's Linears"
+    );
 
     let table_sizes: Vec<usize> = fx
         .ints("module.table_sizes")
@@ -526,8 +556,8 @@ fn oracle_module(fx: &Fx) -> (EngramModule, Tensor<3>, Tensor<4>) {
         .map(|v| *v as usize)
         .collect();
     assert_eq!(table_sizes.len(), tables);
-    let base = EngramModule::new(&table_sizes, embed, hidden, hc, &dev())
-        .with_short_conv(k, dil, &dev());
+    let base =
+        EngramModule::new(&table_sizes, embed, hidden, hc, &dev()).with_short_conv(k, dil, &dev());
 
     // Params are queued in `EngramModule`'s DECLARATION order, which is the
     // derive's traversal order: memory, key_projs[0..hc), value_proj,
@@ -637,7 +667,11 @@ fn reference_has_learnable_norm_gains_and_linear_biases_and_burn_has_none() {
         "the reference's parameter inventory changed; recount from l.148-151, \
          l.355-356 and l.351-354 with hc_mult = 4, hidden = 1024"
     );
-    assert_eq!(fx.one("meta.ref_norm_count"), 9.0, "3 norm groups x 3 heads");
+    assert_eq!(
+        fx.one("meta.ref_norm_count"),
+        9.0,
+        "3 norm groups x 3 heads"
+    );
 
     // burn-engram's own inventory, counted the same way. `EngramModule` has no
     // norm parameters and no Linear biases, so both are 0; if anyone adds
@@ -735,7 +769,10 @@ fn the_claim() {
             min_ratio = min_ratio.min(sep / fx.gate_tol(i));
         }
     }
-    assert!(max_residual <= 0.0, "a resolvable gate row exceeded its tolerance");
+    assert!(
+        max_residual <= 0.0,
+        "a resolvable gate row exceeded its tolerance"
+    );
     assert!(checked >= 14, "only {checked} resolvable rows");
     assert!(band >= 4, "the discriminating band is down to {band} rows");
     assert!(

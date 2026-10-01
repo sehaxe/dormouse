@@ -31,10 +31,9 @@ macro_rules! fwt_probe {
         type AutodiffAlias<S> = burn_autodiff::Autodiff<CudaBare, S>;
         assert_conv::<NoCheckpointing>();
         assert_conv::<BalancedCheckpointing>();
-        if let Some(r) = crate::fwt_cuda::fwt_autodiff_s::<CudaBare, NoCheckpointing>(
-            $x.clone(),
-            $p,
-        ) {
+        if let Some(r) =
+            crate::fwt_cuda::fwt_autodiff_s::<CudaBare, NoCheckpointing>($x.clone(), $p)
+        {
             Some(r)
         } else {
             crate::fwt_cuda::fwt_autodiff_s::<CudaBare, BalancedCheckpointing>($x.clone(), $p)

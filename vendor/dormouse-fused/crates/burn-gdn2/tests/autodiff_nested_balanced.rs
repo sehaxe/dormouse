@@ -23,7 +23,9 @@
 use burn::backend::{Autodiff, AutodiffBackend, DispatchKindConversion, NdArray};
 use burn::tensor::activation::sigmoid;
 use burn::tensor::{Device, DispatchTensor, Distribution, Tensor};
-use burn_autodiff::checkpoint::strategy::{BalancedCheckpointing, CheckpointStrategy, NoCheckpointing};
+use burn_autodiff::checkpoint::strategy::{
+    BalancedCheckpointing, CheckpointStrategy, NoCheckpointing,
+};
 use burn_gdn2::chunk_wy_forward_autodiff_s;
 
 const RELATOL: f32 = 1e-3;
@@ -88,7 +90,11 @@ where
         .expect("a bare ndarray tensor");
     let node = <Autodiff<NdArray, S> as AutodiffBackend>::from_inner(bare);
     let t = Tensor::from_primitive::<Autodiff<NdArray, S>>(node).require_grad();
-    assert_eq!(t.device(), *device, "the lift must land on the caller's device");
+    assert_eq!(
+        t.device(),
+        *device,
+        "the lift must land on the caller's device"
+    );
     t
 }
 
@@ -143,11 +149,7 @@ where
         project_to_4d(sigmoid(k_l.clone()).mul_scalar(0.5), heads, k),
         project_to_4d(v_l.clone().mul_scalar(0.5), heads, v),
         // the decay gate through a log, like `alpha.log()`
-        project_to_4d(
-            g_l.clone().mul_scalar(0.5).powf_scalar(2.0).log(),
-            heads,
-            k,
-        ),
+        project_to_4d(g_l.clone().mul_scalar(0.5).powf_scalar(2.0).log(), heads, k),
         project_to_4d(sigmoid(b_l.clone()), heads, k),
         project_to_4d(sigmoid(w_l.clone()), heads, v),
         s_l.clone().mul_scalar(0.1),
@@ -270,7 +272,8 @@ fn the_trainers_view_is_a_real_transposition() {
 /// must give the same loss and the same gradients as the same graph under
 /// `NoCheckpointing`, which recomputes nothing.
 #[test]
-fn nested_balanced_graph_matches_no_checkpointing() {    let (batch, heads, time, k, v, chunk) = (2usize, 2usize, 32usize, 4usize, 3usize, 16usize);
+fn nested_balanced_graph_matches_no_checkpointing() {
+    let (batch, heads, time, k, v, chunk) = (2usize, 2usize, 32usize, 4usize, 3usize, 16usize);
     let raw = raw_inputs(batch, heads, time, k, v);
 
     let (loss_bal, grads_bal) = {
@@ -447,7 +450,12 @@ fn the_op_builds_a_tracked_node_on_a_projection_graph_and_the_gradient_reaches_e
         .sum()
         .add(ops_out.sum().mul_scalar(0.5))
         .backward();
-    let grads = out.clone().powf_scalar(2.0).sum().add(out.sum().mul_scalar(0.5)).backward();
+    let grads = out
+        .clone()
+        .powf_scalar(2.0)
+        .sum()
+        .add(out.sum().mul_scalar(0.5))
+        .backward();
     let mut worst = 0.0f32;
     let mut mags = Vec::new();
     for (i, t) in g.leaves.iter().enumerate() {

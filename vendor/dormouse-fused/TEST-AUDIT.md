@@ -169,6 +169,12 @@ this reason. That is the point of writing it down rather than deleting the
 tests; the fix belongs to whoever owns burn-spectral (either the test devices or
 a `set_require_grad` that tolerates a non-autodiff backend).
 
+**CLOSED 2026-10-02** (wt/ci-final): the three fixtures now build on
+`Device::ndarray().autodiff()` — the device the retraction targets — and assert
+instead of panicking in setup; `retract_keeps_masters_tracked` was already the
+pattern. The `ndarray-all-crates` job's KNOWN RED note is removed in the same
+change.
+
 ### 3. No test anywhere runs `Autodiff<Cuda, BalancedCheckpointing>`
 
 That is the configuration dormouse trains in, and it is the one with the

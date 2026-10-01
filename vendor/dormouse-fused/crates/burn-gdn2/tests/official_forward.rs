@@ -74,7 +74,8 @@ fn silu(x: f64) -> f64 {
 /// both, and the erase reads the *decayed* state. The two forms are the same
 /// map; `fused_recurrent_forward` (the operational form) is what this file and
 /// the implementation both run.
-pub const RECURRENCE_NOTE: &str = "Eq 9 == Eq 10 regrouped; both decay first, then erase on the decayed state";
+pub const RECURRENCE_NOTE: &str =
+    "Eq 9 == Eq 10 regrouped; both decay first, then erase on the decayed state";
 
 const TOL: f32 = 1e-5;
 
@@ -263,7 +264,9 @@ impl P {
             dt_bias: (0..kd)
                 .map(|_| {
                     let u = rng.unit();
-                    let dt = (u * (0.1f64.ln() - 0.001f64.ln()) + 0.001f64.ln()).exp().max(1e-4);
+                    let dt = (u * (0.1f64.ln() - 0.001f64.ln()) + 0.001f64.ln())
+                        .exp()
+                        .max(1e-4);
                     dt + (-(-dt).exp_m1()).ln()
                 })
                 .collect(),
@@ -312,16 +315,8 @@ fn official_project(
         }
     };
 
-    let q_t = conv(
-        linear(x, &p.q_proj, None, d, kd),
-        &p.q_conv_w,
-        kd,
-    );
-    let k_t = conv(
-        linear(x, &p.k_proj, None, d, kd),
-        &p.k_conv_w,
-        kd,
-    );
+    let q_t = conv(linear(x, &p.q_proj, None, d, kd), &p.q_conv_w, kd);
+    let k_t = conv(linear(x, &p.k_proj, None, d, kd), &p.k_conv_w, kd);
     let v_t = conv(linear(x, &p.v_proj, None, d, vd), &p.v_conv_w, vd);
 
     let mut q = to_heads(t, &q_t, h, hv, hk);
@@ -682,11 +677,14 @@ fn official_forward_localiser() {
         let mut rng = Rng::new(0x10CA_1E ^ c.t as u64);
         let p = P::new(&mut rng, c.d, c.h, c.hk, c.hv, c.v_head);
         let x = rng.normal_vec(c.t * c.d);
-        let module = build(&p, &device, c.use_short_conv, c.allow_neg_eigval, c.chunk_size);
-        let input = Tensor::<3>::from_data(
-            TensorData::new(x.clone(), vec![1, c.t, c.d]),
+        let module = build(
+            &p,
             &device,
+            c.use_short_conv,
+            c.allow_neg_eigval,
+            c.chunk_size,
         );
+        let input = Tensor::<3>::from_data(TensorData::new(x.clone(), vec![1, c.t, c.d]), &device);
         let (got, _cache) = module.project(input.clone(), None);
         let pr = official_project(&p, &x, c.t, c.use_short_conv, c.allow_neg_eigval, true);
 
@@ -744,10 +742,7 @@ fn gva_head_repeat_preserves_values_on_this_backend() {
     for (t, h, rep, n) in [(13usize, 2usize, 2usize, 16usize), (70, 4, 2, 16)] {
         let mut rng = Rng::new(0x9E37 + t as u64);
         let src = rng.normal_vec(t * h * n);
-        let tok = Tensor::<3>::from_data(
-            TensorData::new(src.clone(), vec![1, t, h * n]),
-            &device,
-        );
+        let tok = Tensor::<3>::from_data(TensorData::new(src.clone(), vec![1, t, h * n]), &device);
         // value head vh should carry key head vh / rep
         let want = |vh: usize, ti: usize, i: usize| src[(ti * h + vh / rep) * n + i];
 
@@ -807,7 +802,9 @@ fn gva_head_repeat_preserves_values_on_this_backend() {
         let score = |got: Vec<f64>, kh_of: &dyn Fn(usize) -> usize| -> f64 {
             (0..h * rep)
                 .flat_map(move |vh| (0..t).flat_map(move |ti| (0..n).map(move |i| (vh, ti, i))))
-                .map(|(vh, ti, i)| (got[(vh * t + ti) * n + i] - src[(ti * h + kh_of(vh)) * n + i]).abs())
+                .map(|(vh, ti, i)| {
+                    (got[(vh * t + ti) * n + i] - src[(ti * h + kh_of(vh)) * n + i]).abs()
+                })
                 .fold(0.0f64, f64::max)
         };
         let by_rep = |vh: usize| vh / rep;
@@ -839,14 +836,19 @@ fn gva_head_repeat_preserves_values_on_this_backend() {
         println!("  t={t} h={h} rep={rep} n={n}:");
         println!("     permute                            |Δ| = {d_permute:.2e}");
         println!("     permute+repeat (5D)                |Δ| = {d_repeat5:.2e}");
-        println!("     permute+repeat+reshape             |Δ| = {d_full:.2e}  <- what the layer DID");
+        println!(
+            "     permute+repeat+reshape             |Δ| = {d_full:.2e}  <- what the layer DID"
+        );
         println!("     cat(rep) along head                |Δ| = {d_cat:.2e} vs vh/rep, {d_cat_mod:.2e} vs vh%h");
         println!("     repeat_dim(1, rep)                 |Δ| = {d_repeat_dim:.2e} vs vh/rep, {d_repeat_dim_mod:.2e} vs vh%h");
         println!("     unsqueeze(2)+repeat_dim(2)+reshape  |Δ| = {d_il:.2e} vs vh/rep, {d_il_mod:.2e} vs vh%h");
         println!("     ...same, off the permuted view      |Δ| = {d_il_strided:.2e} vs vh/rep");
 
         assert!(d_permute < 1e-6, "permute alone is lossy: {d_permute:.2e}");
-        assert!(d_repeat5 < 1e-6, "the 5-D repeat alone is lossy: {d_repeat5:.2e}");
+        assert!(
+            d_repeat5 < 1e-6,
+            "the 5-D repeat alone is lossy: {d_repeat5:.2e}"
+        );
         assert!(
             d_il_strided < 1e-6,
             "unsqueeze(2)+repeat_dim+reshape is not the GDN-2 head mapping off a permuted \
@@ -862,10 +864,19 @@ fn gva_head_repeat_preserves_values_on_this_backend() {
         );
         // Tiling is value-preserving but the WRONG head list. Asserted so the
         // reason the adjacent-axis form was chosen is checkable, not folklore.
-        assert!(d_cat_mod < 1e-6, "cat is no longer the interleaved tiling: {d_cat_mod:.2e}");
-        assert!(d_repeat_dim_mod < 1e-6, "repeat_dim is no longer a tiling: {d_repeat_dim_mod:.2e}");
+        assert!(
+            d_cat_mod < 1e-6,
+            "cat is no longer the interleaved tiling: {d_cat_mod:.2e}"
+        );
+        assert!(
+            d_repeat_dim_mod < 1e-6,
+            "repeat_dim is no longer a tiling: {d_repeat_dim_mod:.2e}"
+        );
         assert!(d_cat > 1e-3, "cat now gives vh/rep: {d_cat:.2e}");
-        assert!(d_repeat_dim > 1e-3, "repeat_dim now gives vh/rep: {d_repeat_dim:.2e}");
+        assert!(
+            d_repeat_dim > 1e-3,
+            "repeat_dim now gives vh/rep: {d_repeat_dim:.2e}"
+        );
     }
 }
 
@@ -898,7 +909,13 @@ fn official_forward_matrix() {
         let mut rng = Rng::new(0x5EED ^ (c.t as u64) << 8 ^ c.h as u64);
         let p = P::new(&mut rng, c.d, c.h, c.hk, c.hv, c.v_head);
         let x = rng.normal_vec(c.t * c.d);
-        let module = build(&p, &device, c.use_short_conv, c.allow_neg_eigval, c.chunk_size);
+        let module = build(
+            &p,
+            &device,
+            c.use_short_conv,
+            c.allow_neg_eigval,
+            c.chunk_size,
+        );
         let want = official_forward(
             &p,
             &x,
@@ -907,10 +924,7 @@ fn official_forward_matrix() {
             c.allow_neg_eigval,
             true, // zero pad: what the reference actually does
         );
-        let input = Tensor::<3>::from_data(
-            TensorData::new(x.clone(), vec![1, c.t, c.d]),
-            &device,
-        );
+        let input = Tensor::<3>::from_data(TensorData::new(x.clone(), vec![1, c.t, c.d]), &device);
 
         let train_out = module.forward_train::<NdArray>(input.clone());
         let d_train = max_abs_diff(&train_out, &want, c.t, c.d);
@@ -919,10 +933,7 @@ fn official_forward_matrix() {
         let infer_out = module.forward::<NdArray>(input.clone(), &mut state, true);
         let d_infer = max_abs_diff(&infer_out, &want, c.t, c.d);
 
-        println!(
-            "  {:<28} train={d_train:.2e} infer={d_infer:.2e}",
-            c.name
-        );
+        println!("  {:<28} train={d_train:.2e} infer={d_infer:.2e}", c.name);
         for (tag, d) in [("train", d_train), ("infer", d_infer)] {
             if d > worst {
                 worst = d;
@@ -1062,7 +1073,10 @@ fn chunk_size_is_a_schedule_choice_not_a_mathematical_one() {
             println!("  t={t} chunk {c:>2}: |Δ| vs chunk64 = {v:.2e}");
             worst = worst.max(v);
         }
-        assert!(worst < 1e-3, "t={t}: chunk size changed the answer by {worst:.2e}");
+        assert!(
+            worst < 1e-3,
+            "t={t}: chunk size changed the answer by {worst:.2e}"
+        );
     }
 }
 
@@ -1093,21 +1107,27 @@ fn the_scan_alone_is_bit_identical_stepwise_and_whole() {
     );
     let g = Tensor::from_data(
         TensorData::new(
-            (0..b * h * t * k).map(|i| -0.01 - 0.14 * (i % 97) as f64 / 97.0).collect::<Vec<f64>>(),
+            (0..b * h * t * k)
+                .map(|i| -0.01 - 0.14 * (i % 97) as f64 / 97.0)
+                .collect::<Vec<f64>>(),
             vec![b, h, t, k],
         ),
         &device,
     );
     let er = Tensor::from_data(
         TensorData::new(
-            (0..b * h * t * k).map(|i| 0.05 + 0.9 * (i % 89) as f64 / 89.0).collect::<Vec<f64>>(),
+            (0..b * h * t * k)
+                .map(|i| 0.05 + 0.9 * (i % 89) as f64 / 89.0)
+                .collect::<Vec<f64>>(),
             vec![b, h, t, k],
         ),
         &device,
     );
     let w = Tensor::from_data(
         TensorData::new(
-            (0..b * h * t * vd).map(|i| 0.05 + 0.9 * (i % 83) as f64 / 83.0).collect::<Vec<f64>>(),
+            (0..b * h * t * vd)
+                .map(|i| 0.05 + 0.9 * (i % 83) as f64 / 83.0)
+                .collect::<Vec<f64>>(),
             vec![b, h, t, vd],
         ),
         &device,
@@ -1118,8 +1138,16 @@ fn the_scan_alone_is_bit_identical_stepwise_and_whole() {
     );
     let scale = 0.25;
 
-    let (whole_out, whole_st) =
-        fused_recurrent_forward(q.clone(), kt.clone(), v.clone(), g.clone(), er.clone(), w.clone(), st.clone(), scale);
+    let (whole_out, whole_st) = fused_recurrent_forward(
+        q.clone(),
+        kt.clone(),
+        v.clone(),
+        g.clone(),
+        er.clone(),
+        w.clone(),
+        st.clone(),
+        scale,
+    );
 
     let mut carry = st;
     let mut outs: Vec<Tensor<4>> = Vec::new();
@@ -1142,8 +1170,14 @@ fn the_scan_alone_is_bit_identical_stepwise_and_whole() {
     let d_out = max4(&step_out, &whole_out);
     let d_st = max4(&carry, &whole_st);
     println!("scan whole vs stepwise: out {d_out:.3e}, state {d_st:.3e}");
-    assert_eq!(d_out, 0.0, "the scan's output differs stepwise vs whole: {d_out:.3e}");
-    assert_eq!(d_st, 0.0, "the scan's state differs stepwise vs whole: {d_st:.3e}");
+    assert_eq!(
+        d_out, 0.0,
+        "the scan's output differs stepwise vs whole: {d_out:.3e}"
+    );
+    assert_eq!(
+        d_st, 0.0,
+        "the scan's state differs stepwise vs whole: {d_st:.3e}"
+    );
 }
 
 fn max4(a: &Tensor<4>, b: &Tensor<4>) -> f32 {
@@ -1155,7 +1189,10 @@ fn max4(a: &Tensor<4>, b: &Tensor<4>) -> f32 {
             .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
             .collect()
     };
-    f(a).iter().zip(f(b)).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
+    f(a).iter()
+        .zip(f(b))
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f32::max)
 }
 
 /// The same property through the whole layer, on a configuration whose output
@@ -1219,7 +1256,9 @@ fn decode_matches_prefill_including_a_fresh_state() {
                 .chunks_exact(4)
                 .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
                 .fold(0.0, f32::max);
-            println!("  t={t} short_conv={use_sc}: prefill vs stepwise = {v:.2e}  (|y|max {y_max:.2e})");
+            println!(
+                "  t={t} short_conv={use_sc}: prefill vs stepwise = {v:.2e}  (|y|max {y_max:.2e})"
+            );
             results.push((t, use_sc, v));
         }
     }
@@ -1249,5 +1288,8 @@ fn max_abs_diff_data(a: &burn::tensor::TensorData, b: &burn::tensor::TensorData,
     };
     let (x, y) = (g(a), g(b));
     assert_eq!(x.len(), n, "comparison length");
-    x.iter().zip(&y).map(|(p, q)| (p - q).abs()).fold(0.0, f32::max)
+    x.iter()
+        .zip(&y)
+        .map(|(p, q)| (p - q).abs())
+        .fold(0.0, f32::max)
 }

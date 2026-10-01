@@ -46,7 +46,10 @@ fn main() {
             .collect()
     };
     let mk = |n: usize, dims: [usize; 4]| -> Tensor<4> {
-        Tensor::<4>::from_data(burn::tensor::TensorData::new(rand(n, -1.0, 1.0), dims), &dev)
+        Tensor::<4>::from_data(
+            burn::tensor::TensorData::new(rand(n, -1.0, 1.0), dims),
+            &dev,
+        )
     };
     let q = mk(b * t * h * hk, [b, h, t, hk]);
     let k = mk(b * t * h * hk, [b, h, t, hk]);

@@ -28,16 +28,24 @@ struct Io {
 
 fn down2(t: Tensor<2>) -> CubeTensor {
     let prim = t.clone().try_into_primitive::<B>().unwrap();
-    (&prim as &dyn Any).downcast_ref::<CubeTensor>().unwrap().clone()
+    (&prim as &dyn Any)
+        .downcast_ref::<CubeTensor>()
+        .unwrap()
+        .clone()
 }
 fn down1(t: Tensor<1>) -> CubeTensor {
     let prim = t.clone().try_into_primitive::<B>().unwrap();
-    (&prim as &dyn Any).downcast_ref::<CubeTensor>().unwrap().clone()
+    (&prim as &dyn Any)
+        .downcast_ref::<CubeTensor>()
+        .unwrap()
+        .clone()
 }
 
 fn crate_io() -> Io {
     let dev = Device::cuda(0);
-    let xvals: Vec<f32> = (0..ROWS * D).map(|i| (i as f32 * 0.37).sin() * 3.0).collect();
+    let xvals: Vec<f32> = (0..ROWS * D)
+        .map(|i| (i as f32 * 0.37).sin() * 3.0)
+        .collect();
     let wvals: Vec<f32> = (0..D).map(|i| 0.5 + 0.25 * i as f32).collect();
     let xt = Tensor::<2>::from_data(TensorData::new(xvals.clone(), [ROWS, D]), &dev);
     let wt = Tensor::<1>::from_data(TensorData::new(wvals.clone(), [D]), &dev);
@@ -48,22 +56,42 @@ fn crate_io() -> Io {
     let client = xc.client.clone();
     let wc = down1(wt);
     let outc = down2(outt.clone());
-    Io { out: outt, outc, client, x: xc, w: wc, xvals, wvals }
+    Io {
+        out: outt,
+        outc,
+        client,
+        x: xc,
+        w: wc,
+        xvals,
+        wvals,
+    }
 }
 
 impl Io {
     fn read(&self) -> Vec<f32> {
-        self.out.clone().into_data().bytes.chunks_exact(4)
-            .map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()
+        self.out
+            .clone()
+            .into_data()
+            .bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect()
     }
     fn want(&self) -> Vec<f32> {
         let eps = 1e-5f32;
-        (0..ROWS).map(|r| {
-            let row = &self.xvals[r * D..(r + 1) * D];
-            let ss: f64 = row.iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
-            (0..D).map(|i| (f64::from(row[i]) / (ss / D as f64 + f64::from(eps)).sqrt()
-                * f64::from(self.wvals[i])) as f32).collect::<Vec<_>>()
-        }).flatten().collect()
+        (0..ROWS)
+            .map(|r| {
+                let row = &self.xvals[r * D..(r + 1) * D];
+                let ss: f64 = row.iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
+                (0..D)
+                    .map(|i| {
+                        (f64::from(row[i]) / (ss / D as f64 + f64::from(eps)).sqrt()
+                            * f64::from(self.wvals[i])) as f32
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .flatten()
+            .collect()
     }
     fn report(&self, rung: &str) {
         let got = self.read();
@@ -78,54 +106,93 @@ impl Io {
 
 // A: the real kernel — tree reduction, conditional sqrt, broadcast.
 #[cube(launch_unchecked)]
-fn ka<F: Float>(x: &[F], w: &[F], out: &mut [F], eps: f32,
-    #[comptime] d: u32, #[comptime] threads: u32, #[comptime] lg: u32) {
+fn ka<F: Float>(
+    x: &[F],
+    w: &[F],
+    out: &mut [F],
+    eps: f32,
+    #[comptime] d: u32,
+    #[comptime] threads: u32,
+    #[comptime] lg: u32,
+) {
     let row = CUBE_POS_X as usize;
     let tid = UNIT_POS_X as usize;
-    let d = d as usize; let threads = threads as usize; let lg = lg as usize;
+    let d = d as usize;
+    let threads = threads as usize;
+    let lg = lg as usize;
     let base = row * d;
     let mut partial = Shared::<[F]>::new_slice(threads);
     let mut sum = F::new(0.0_f32);
     let mut i = tid;
-    while i < d { let v = x[base + i]; sum += v * v; i += threads; }
+    while i < d {
+        let v = x[base + i];
+        sum += v * v;
+        i += threads;
+    }
     partial[tid] = sum;
     sync_cube();
     for k in 0..lg {
         let s = threads >> (k + 1);
-        if tid < s { let o = partial[tid + s]; partial[tid] += o; }
+        if tid < s {
+            let o = partial[tid + s];
+            partial[tid] += o;
+        }
         sync_cube();
     }
-    if tid == 0 { partial[0] = (partial[0] / F::cast_from(d as f32) + F::cast_from(eps)).sqrt(); }
+    if tid == 0 {
+        partial[0] = (partial[0] / F::cast_from(d as f32) + F::cast_from(eps)).sqrt();
+    }
     sync_cube();
     let inv = F::new(1.0_f32) / partial[0];
     let mut i = tid;
-    while i < d { out[base + i] = x[base + i] * inv * w[i]; i += threads; }
+    while i < d {
+        out[base + i] = x[base + i] * inv * w[i];
+        i += threads;
+    }
 }
 
 // B: tree reduction, but NO conditional write — every thread does the sqrt on
 // its own copy of partial[0].
 #[cube(launch_unchecked)]
-fn kb<F: Float>(x: &[F], w: &[F], out: &mut [F], eps: f32,
-    #[comptime] d: u32, #[comptime] threads: u32, #[comptime] lg: u32) {
+fn kb<F: Float>(
+    x: &[F],
+    w: &[F],
+    out: &mut [F],
+    eps: f32,
+    #[comptime] d: u32,
+    #[comptime] threads: u32,
+    #[comptime] lg: u32,
+) {
     let row = CUBE_POS_X as usize;
     let tid = UNIT_POS_X as usize;
-    let d = d as usize; let threads = threads as usize; let lg = lg as usize;
+    let d = d as usize;
+    let threads = threads as usize;
+    let lg = lg as usize;
     let base = row * d;
     let mut partial = Shared::<[F]>::new_slice(threads);
     let mut sum = F::new(0.0_f32);
     let mut i = tid;
-    while i < d { let v = x[base + i]; sum += v * v; i += threads; }
+    while i < d {
+        let v = x[base + i];
+        sum += v * v;
+        i += threads;
+    }
     partial[tid] = sum;
     sync_cube();
     for k in 0..lg {
         let s = threads >> (k + 1);
-        if tid < s { let o = partial[tid + s]; partial[tid] += o; }
+        if tid < s {
+            let o = partial[tid + s];
+            partial[tid] += o;
+        }
         sync_cube();
     }
-    let inv = F::new(1.0_f32) /
-        (partial[0] / F::cast_from(d as f32) + F::cast_from(eps)).sqrt();
+    let inv = F::new(1.0_f32) / (partial[0] / F::cast_from(d as f32) + F::cast_from(eps)).sqrt();
     let mut i = tid;
-    while i < d { out[base + i] = x[base + i] * inv * w[i]; i += threads; }
+    while i < d {
+        out[base + i] = x[base + i] * inv * w[i];
+        i += threads;
+    }
 }
 
 // C: NO shared memory, NO barrier — thread 0 does the whole row.
@@ -137,39 +204,67 @@ fn kc<F: Float>(x: &[F], w: &[F], out: &mut [F], eps: f32, #[comptime] d: u32) {
     if UNIT_POS_X == 0u32 {
         let mut s = F::new(0.0_f32);
         let mut i = 0;
-        while i < d { let v = x[base + i]; s += v * v; i += 1; }
+        while i < d {
+            let v = x[base + i];
+            s += v * v;
+            i += 1;
+        }
         let inv = F::new(1.0_f32) / (s / F::cast_from(d as f32) + F::cast_from(eps)).sqrt();
         let mut i = 0;
-        while i < d { out[base + i] = x[base + i] * inv * w[i]; i += 1; }
+        while i < d {
+            out[base + i] = x[base + i] * inv * w[i];
+            i += 1;
+        }
     }
 }
 
 // D: shared reduce + broadcast, but the OUTPUT is written serially by thread 0
 // (so the strided output loop is not in the picture at all).
 #[cube(launch_unchecked)]
-fn kd<F: Float>(x: &[F], w: &[F], out: &mut [F], eps: f32,
-    #[comptime] d: u32, #[comptime] threads: u32, #[comptime] lg: u32) {
+fn kd<F: Float>(
+    x: &[F],
+    w: &[F],
+    out: &mut [F],
+    eps: f32,
+    #[comptime] d: u32,
+    #[comptime] threads: u32,
+    #[comptime] lg: u32,
+) {
     let row = CUBE_POS_X as usize;
     let tid = UNIT_POS_X as usize;
-    let d = d as usize; let threads = threads as usize; let lg = lg as usize;
+    let d = d as usize;
+    let threads = threads as usize;
+    let lg = lg as usize;
     let base = row * d;
     let mut partial = Shared::<[F]>::new_slice(threads);
     let mut sum = F::new(0.0_f32);
     let mut i = tid;
-    while i < d { let v = x[base + i]; sum += v * v; i += threads; }
+    while i < d {
+        let v = x[base + i];
+        sum += v * v;
+        i += threads;
+    }
     partial[tid] = sum;
     sync_cube();
     for k in 0..lg {
         let s = threads >> (k + 1);
-        if tid < s { let o = partial[tid + s]; partial[tid] += o; }
+        if tid < s {
+            let o = partial[tid + s];
+            partial[tid] += o;
+        }
         sync_cube();
     }
-    if tid == 0 { partial[0] = (partial[0] / F::cast_from(d as f32) + F::cast_from(eps)).sqrt(); }
+    if tid == 0 {
+        partial[0] = (partial[0] / F::cast_from(d as f32) + F::cast_from(eps)).sqrt();
+    }
     sync_cube();
     if tid == 0 {
         let inv = F::new(1.0_f32) / partial[0];
         let mut i = 0;
-        while i < d { out[base + i] = x[base + i] * inv * w[i]; i += 1; }
+        while i < d {
+            out[base + i] = x[base + i] * inv * w[i];
+            i += 1;
+        }
     }
 }
 
@@ -204,11 +299,16 @@ fn isolate_d2() {
     let client = t.client.clone();
     unsafe {
         kb::launch_unchecked::<f32>(
-            &client, CubeCount::Static(ROWS as u32, 1, 1), CubeDim::new_3d(THREADS, 1, 1),
+            &client,
+            CubeCount::Static(ROWS as u32, 1, 1),
+            CubeDim::new_3d(THREADS, 1, 1),
             BufferArg::from_raw_parts(t.x.handle.clone(), ROWS * D),
             BufferArg::from_raw_parts(t.w.handle.clone(), D),
             BufferArg::from_raw_parts(t.outc.handle.clone(), ROWS * D),
-            1e-5, D as u32, THREADS, LOG_THREADS,
+            1e-5,
+            D as u32,
+            THREADS,
+            LOG_THREADS,
         );
     }
     t.report("B tree+no-cond+bcast+strided");
@@ -216,11 +316,14 @@ fn isolate_d2() {
     let client = t.client.clone();
     unsafe {
         kc::launch_unchecked::<f32>(
-            &client, CubeCount::Static(ROWS as u32, 1, 1), CubeDim::new_3d(THREADS, 1, 1),
+            &client,
+            CubeCount::Static(ROWS as u32, 1, 1),
+            CubeDim::new_3d(THREADS, 1, 1),
             BufferArg::from_raw_parts(t.x.handle.clone(), ROWS * D),
             BufferArg::from_raw_parts(t.w.handle.clone(), D),
             BufferArg::from_raw_parts(t.outc.handle.clone(), ROWS * D),
-            1e-5, D as u32,
+            1e-5,
+            D as u32,
         );
     }
     t.report("C no-shared, thread0 serial");
@@ -242,9 +345,16 @@ fn g1<F: Float>(out: &mut [F]) {
 #[test]
 fn grid_sweep() {
     let dev = Device::cuda(0);
-    for &(ncubes, nthreads) in
-        &[(4u32, 256u32), (4, 64), (4, 1), (8, 256), (12, 256), (2, 256), (3, 256), (5, 256)]
-    {
+    for &(ncubes, nthreads) in &[
+        (4u32, 256u32),
+        (4, 64),
+        (4, 1),
+        (8, 256),
+        (12, 256),
+        (2, 256),
+        (3, 256),
+        (5, 256),
+    ] {
         let t = Tensor::<1>::full([ncubes as usize], -999.0f32, &dev);
         let tc = down1(t.clone());
         let client = tc.client.clone();
@@ -305,7 +415,10 @@ fn grid_runtime_count() {
             .map(|v| if *v == want { '1' } else { '.' })
             .collect();
         eprintln!("  runtime cubes={ncubes:<3} ran {ran}/{ncubes}  {mask}");
-        assert_eq!(ran, ncubes as usize, "a {ncubes}-cube grid ran only {ran} cubes");
+        assert_eq!(
+            ran, ncubes as usize,
+            "a {ncubes}-cube grid ran only {ran} cubes"
+        );
     }
 }
 
@@ -369,14 +482,22 @@ fn walk_from_working_side() {
     let dev = Device::cuda(0);
     let mk = |t: &Tensor<2>| down2(t.clone());
     for which in ["g3", "g4", "g5", "g6"] {
-        let xvals: Vec<f32> = (0..ROWS * D).map(|i| (i as f32 * 0.37).sin() * 3.0).collect();
+        let xvals: Vec<f32> = (0..ROWS * D)
+            .map(|i| (i as f32 * 0.37).sin() * 3.0)
+            .collect();
         let wvals: Vec<f32> = (0..D).map(|i| 0.5 + 0.25 * i as f32).collect();
         let t = Tensor::<2>::full([ROWS, D], -999.0f32, &dev);
-        let xc = mk(&Tensor::<2>::from_data(TensorData::new(xvals, [ROWS, D]), &dev));
+        let xc = mk(&Tensor::<2>::from_data(
+            TensorData::new(xvals, [ROWS, D]),
+            &dev,
+        ));
         let wc = down1(Tensor::<1>::from_data(TensorData::new(wvals, [D]), &dev));
         let tc = down2(t.clone());
         let client = xc.client.clone();
-        let grid = (CubeCount::Static(ROWS as u32, 1, 1), CubeDim::new_3d(THREADS, 1, 1));
+        let grid = (
+            CubeCount::Static(ROWS as u32, 1, 1),
+            CubeDim::new_3d(THREADS, 1, 1),
+        );
         unsafe {
             let a = BufferArg::from_raw_parts(xc.handle.clone(), ROWS * D);
             let b = BufferArg::from_raw_parts(wc.handle.clone(), D);
@@ -422,12 +543,22 @@ fn h4<F: Float>(x: &[F], _w: &[F], out: &mut [F], #[comptime] d: u32) {
 #[test]
 fn buffer_count_vs_row_index() {
     let dev = Device::cuda(0);
-    let xvals: Vec<f32> = (0..ROWS * D).map(|i| (i as f32 * 0.37).sin() * 3.0).collect();
+    let xvals: Vec<f32> = (0..ROWS * D)
+        .map(|i| (i as f32 * 0.37).sin() * 3.0)
+        .collect();
     let wvals: Vec<f32> = (0..D).map(|i| 0.5 + 0.25 * i as f32).collect();
-    let xc = down2(Tensor::<2>::from_data(TensorData::new(xvals, [ROWS, D]), &dev));
+    let xc = down2(Tensor::<2>::from_data(
+        TensorData::new(xvals, [ROWS, D]),
+        &dev,
+    ));
     let wc = down1(Tensor::<1>::from_data(TensorData::new(wvals, [D]), &dev));
     let client = xc.client.clone();
-    let g = || (CubeCount::Static(ROWS as u32, 1, 1), CubeDim::new_3d(THREADS, 1, 1));
+    let g = || {
+        (
+            CubeCount::Static(ROWS as u32, 1, 1),
+            CubeDim::new_3d(THREADS, 1, 1),
+        )
+    };
 
     let show = |t: &Tensor<2>, name: &str| {
         let got: Vec<f32> = t.clone().into_data().try_to_vec().unwrap();
@@ -513,7 +644,10 @@ fn two_buffers_length_sweep() {
         }
         let got: Vec<f32> = t.into_data().try_to_vec().unwrap();
         let ran = got.iter().filter(|v| **v == 1.0).count();
-        let mask: String = got.iter().map(|v| if *v == 1.0 { '1' } else { '.' }).collect();
+        let mask: String = got
+            .iter()
+            .map(|v| if *v == 1.0 { '1' } else { '.' })
+            .collect();
         eprintln!("  2 buffers, out len {len:>3}, grid 4 cubes: ran {ran}/4  {mask}");
     }
     // And the one-buffer control, same sweep.
@@ -551,12 +685,22 @@ fn j1<F: Float>(x: &[F], w: &[F], out: &mut [F], #[comptime] d: u32) {
 #[test]
 fn output_rank_matters() {
     let dev = Device::cuda(0);
-    let xvals: Vec<f32> = (0..ROWS * D).map(|i| (i as f32 * 0.37).sin() * 3.0).collect();
+    let xvals: Vec<f32> = (0..ROWS * D)
+        .map(|i| (i as f32 * 0.37).sin() * 3.0)
+        .collect();
     let wvals: Vec<f32> = (0..D).map(|i| 0.5 + 0.25 * i as f32).collect();
-    let xc = down2(Tensor::<2>::from_data(TensorData::new(xvals, [ROWS, D]), &dev));
+    let xc = down2(Tensor::<2>::from_data(
+        TensorData::new(xvals, [ROWS, D]),
+        &dev,
+    ));
     let wc = down1(Tensor::<1>::from_data(TensorData::new(wvals, [D]), &dev));
     let client = xc.client.clone();
-    let g = || (CubeCount::Static(ROWS as u32, 1, 1), CubeDim::new_3d(THREADS, 1, 1));
+    let g = || {
+        (
+            CubeCount::Static(ROWS as u32, 1, 1),
+            CubeDim::new_3d(THREADS, 1, 1),
+        )
+    };
     let n = ROWS * D;
 
     // j1 with a 1-D output of the SAME element count.
@@ -574,7 +718,10 @@ fn output_rank_matters() {
         );
     }
     let got1: Vec<f32> = t1.into_data().try_to_vec().unwrap();
-    let m1: String = got1.iter().map(|v| if *v == -999.0 { '.' } else { '1' }).collect();
+    let m1: String = got1
+        .iter()
+        .map(|v| if *v == -999.0 { '.' } else { '1' })
+        .collect();
     eprintln!("  j1 with a 1-D out [{}]: {m1}  {got1:?}", n);
 
     // j1 with a 2-D output of shape [ROWS, D] — the identical launch otherwise.
@@ -592,7 +739,10 @@ fn output_rank_matters() {
         );
     }
     let got2: Vec<f32> = t2.into_data().try_to_vec().unwrap();
-    let m2: String = got2.iter().map(|v| if *v == -999.0 { '.' } else { '1' }).collect();
+    let m2: String = got2
+        .iter()
+        .map(|v| if *v == -999.0 { '.' } else { '1' })
+        .collect();
     eprintln!("  j1 with a 2-D out [{},{}]: {m2}  {got2:?}", ROWS, D);
 
     // And a 2-D output that is NOT 2x2: [8, 1] — same element count again.
@@ -610,7 +760,10 @@ fn output_rank_matters() {
         );
     }
     let got3: Vec<f32> = t3.into_data().try_to_vec().unwrap();
-    let m3: String = got3.iter().map(|v| if *v == -999.0 { '.' } else { '1' }).collect();
+    let m3: String = got3
+        .iter()
+        .map(|v| if *v == -999.0 { '.' } else { '1' })
+        .collect();
     eprintln!("  j1 with a 2-D out [{n},1]: {m3}  {got3:?}");
 }
 
@@ -630,9 +783,14 @@ fn j2<F: Float>(x: &[F], w: &[F], out: &mut [F], #[comptime] d: u32) {
 #[test]
 fn is_it_a_race() {
     let dev = Device::cuda(0);
-    let xvals: Vec<f32> = (0..ROWS * D).map(|i| (i as f32 * 0.37).sin() * 3.0).collect();
+    let xvals: Vec<f32> = (0..ROWS * D)
+        .map(|i| (i as f32 * 0.37).sin() * 3.0)
+        .collect();
     let wvals: Vec<f32> = (0..D).map(|i| 0.5 + 0.25 * i as f32).collect();
-    let xc = down2(Tensor::<2>::from_data(TensorData::new(xvals, [ROWS, D]), &dev));
+    let xc = down2(Tensor::<2>::from_data(
+        TensorData::new(xvals, [ROWS, D]),
+        &dev,
+    ));
     let wc = down1(Tensor::<1>::from_data(TensorData::new(wvals, [D]), &dev));
     let client = xc.client.clone();
     let n = ROWS * D;
@@ -657,7 +815,9 @@ fn is_it_a_race() {
     let got: Vec<f32> = t.clone().into_data().try_to_vec().unwrap();
     eprintln!("  read 4 (after client.sync()):  {got:?}");
     eprintln!("  expected 1.5 + x[{{0,2,4,6}}] = {:?}", {
-        let x: Vec<f32> = (0..ROWS * D).map(|i| (i as f32 * 0.37).sin() * 3.0).collect();
+        let x: Vec<f32> = (0..ROWS * D)
+            .map(|i| (i as f32 * 0.37).sin() * 3.0)
+            .collect();
         (0..ROWS).map(|r| 1.5 + x[r * D]).collect::<Vec<f32>>()
     });
 }
@@ -745,7 +905,11 @@ fn cubedim_sweep_on_failing_shapes() {
                     "  shape [{:>2},{:>2}] dim {dim:>4} grid {ncubes}: ran {ran}/{ncubes}{}",
                     shape[0],
                     shape[1],
-                    if ran == ncubes as usize { "" } else { "   <-- TRUNCATED" }
+                    if ran == ncubes as usize {
+                        ""
+                    } else {
+                        "   <-- TRUNCATED"
+                    }
                 );
             }
         }

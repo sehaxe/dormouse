@@ -28,8 +28,8 @@
 
 #![cfg(feature = "cuda")]
 
-use burn::backend::autodiff::Autodiff;
 use burn::backend::autodiff::checkpoint::strategy::{BalancedCheckpointing, NoCheckpointing};
+use burn::backend::autodiff::Autodiff;
 use burn::module::Module;
 use burn::tensor::{Device, Tensor, TensorData};
 use burn_kda::{KdaConfig, KdaModule};
@@ -74,11 +74,7 @@ fn main() {
     let data: Vec<f32> = (0..B * T * D).map(|_| next()).collect();
     let data_short: Vec<f32> = (0..B * 64 * D).map(|_| next()).collect();
     let x = |t: usize, d: &[f32], dev: &Device| {
-        Tensor::<3>::from_data(
-            TensorData::new(d.to_vec(), [B, t, D]),
-            dev,
-        )
-        .require_grad()
+        Tensor::<3>::from_data(TensorData::new(d.to_vec(), [B, t, D]), dev).require_grad()
     };
 
     // One call, with the host/GPU split at every boundary. `into_data` is a

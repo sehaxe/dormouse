@@ -93,7 +93,9 @@ pub use module::{rms_norm_gate_per_head, GatedDeltaNet2, Gdn2State, ProjectedInp
 pub use short_conv::{short_conv_1d, SHORT_CONV_CACHE, SHORT_CONV_KERNEL};
 
 #[cfg(feature = "autodiff")]
-pub use autodiff::{chunk_autodiff_or_plain, chunk_wy_forward_autodiff, chunk_wy_forward_autodiff_s};
+pub use autodiff::{
+    chunk_autodiff_or_plain, chunk_wy_forward_autodiff, chunk_wy_forward_autodiff_s,
+};
 
 // Which arm ran, and how to ask. These three need only `Backend`, so they
 // exist in a `cuda`-only build too - and a `cuda`-only build is what a

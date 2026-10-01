@@ -85,7 +85,10 @@ pub fn fused_launches_per_call() -> f64 {
 
 /// The launch labels recorded since the last reset, in issue order.
 pub fn fused_launch_log() -> Vec<&'static str> {
-    FUSED_LAUNCH_LOG.lock().map(|g| g.clone()).unwrap_or_default()
+    FUSED_LAUNCH_LOG
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default()
 }
 
 pub fn reset_fused_launches() {
@@ -232,7 +235,10 @@ pub fn dump(what: &str) {
     let t = table();
     let total: u64 = t.iter().map(|e| e.2).sum();
     let calls: u64 = t.iter().map(|e| e.1).sum();
-    println!("── {what}: {calls} fresh buffers, {:.1} MB", total as f64 / 1e6);
+    println!(
+        "── {what}: {calls} fresh buffers, {:.1} MB",
+        total as f64 / 1e6
+    );
     println!("{:>6} {:>10} {:>12}  site", "calls", "MB", "MB/call");
     for (label, n, bytes) in &t {
         println!(

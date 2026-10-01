@@ -262,7 +262,14 @@ fn gdn2_1000_cases_match_the_f64_oracle() {
     println!(
         "fixture ref_f64_broad.bin: d={} h={} hk={} hv={} expand_v={} -> value head \
          {v_head}, VD={}, {} cases, {} tensors",
-        t.d, t.h, t.hk, t.hv, t.expand_v, t.hv * v_head, t.cases.len(), t.tensors.len()
+        t.d,
+        t.h,
+        t.hk,
+        t.hv,
+        t.expand_v,
+        t.hv * v_head,
+        t.cases.len(),
+        t.tensors.len()
     );
 
     let module = build(&t, Gdn2Mode::FusedRecurrent, 64, &device);
@@ -270,8 +277,7 @@ fn gdn2_1000_cases_match_the_f64_oracle() {
     let mut worst_t = 0usize;
     let mut worst_scale = 0.0f64;
     for (i, (seq, x, ref_y)) in t.cases.iter().enumerate() {
-        let input =
-            Tensor::<3>::from_data(TensorData::new(x.clone(), [1, *seq, t.d]), &device);
+        let input = Tensor::<3>::from_data(TensorData::new(x.clone(), [1, *seq, t.d]), &device);
         let mut state: Option<burn_gdn2::Gdn2State> = None;
         let out = module.forward::<NdArray>(input, &mut state, true);
         let got = to_f32_vec(&out);

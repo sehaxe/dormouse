@@ -174,7 +174,12 @@ fn fixture() -> BTreeMap<(String, String), Block> {
             continue;
         }
         if let Some(k) = key.take() {
-            out.insert(k, Block { fields: std::mem::take(&mut fields) });
+            out.insert(
+                k,
+                Block {
+                    fields: std::mem::take(&mut fields),
+                },
+            );
         }
         let mut it = t.split_whitespace();
         let kind = it.next().expect("empty block header").to_string();
@@ -183,7 +188,11 @@ fn fixture() -> BTreeMap<(String, String), Block> {
     if let Some(k) = key.take() {
         out.insert(k, Block { fields });
     }
-    assert!(out.len() >= 12, "fixture parse failed: {} blocks", out.len());
+    assert!(
+        out.len() >= 12,
+        "fixture parse failed: {} blocks",
+        out.len()
+    );
     out
 }
 
@@ -205,16 +214,10 @@ impl CloneOwned for &Block {
 }
 
 fn t3(v: &[f32], d: [usize; 3]) -> Tensor<3> {
-    Tensor::<3, _>::from_data(
-        burn::tensor::TensorData::new(v.to_vec(), d),
-        &dev(),
-    )
+    Tensor::<3, _>::from_data(burn::tensor::TensorData::new(v.to_vec(), d), &dev())
 }
 fn t4(v: &[f32], d: [usize; 4]) -> Tensor<4> {
-    Tensor::<4, _>::from_data(
-        burn::tensor::TensorData::new(v.to_vec(), d),
-        &dev(),
-    )
+    Tensor::<4, _>::from_data(burn::tensor::TensorData::new(v.to_vec(), d), &dev())
 }
 
 /// `[B, T, H, D]` (FLA's layout) -> `[B, H, T, D]` (ours).
@@ -359,12 +362,7 @@ fn k3_bounded_decay_matches_fla_reference() {
         );
         // `forward` returns alpha = exp(g); compare in g-space, which is the
         // better-conditioned of the two.
-        let got: Vec<f32> = m
-            .forward(x)
-            .log()
-            .into_data()
-            .to_vec::<f32>()
-            .unwrap();
+        let got: Vec<f32> = m.forward(x).log().into_data().to_vec::<f32>().unwrap();
         let want = blk.nums("fla_lowerbound_g");
         let (r, at) = num_diff(&got, &want, ATOL_G, TOL_GATE);
         worst = worst.max(r);
@@ -374,7 +372,8 @@ fn k3_bounded_decay_matches_fla_reference() {
              case {name}  worst normalised {r:.3e} at flat index {at} (got {} want {})\n  \
              ours: g = g_min*sigmoid(exp(A)*z) at lib.rs:270\n  \
              FLA:  g = lower_bound*sigmoid(exp(A_log)*(g+dt_bias)), gate.py:81",
-            got[at], want[at]
+            got[at],
+            want[at]
         );
     }
     // Normalised: 1.0 is the tolerance, so this IS the margin as a ratio.
@@ -440,12 +439,7 @@ fn kimi_linear_softplus_decay_matches_fla_reference() {
             burn_kda::DecayFn::Softplus,
             burn_kda::G_MIN,
         );
-        let got: Vec<f32> = m
-            .forward(x)
-            .log()
-            .into_data()
-            .to_vec::<f32>()
-            .unwrap();
+        let got: Vec<f32> = m.forward(x).log().into_data().to_vec::<f32>().unwrap();
         let want = blk.nums("fla_softplus_g");
         let (r, at) = num_diff(&got, &want, ATOL_G, TOL_GATE);
         if r > 1.0 {
@@ -499,8 +493,7 @@ fn kda_step_matches_fla_recurrent_at_unit_scale() {
         // FLA hands back `o` as [B, T, HV, V], so the reference arrays are read
         // in that layout and `beta` is permuted ONCE here into [B, HV, T, 1] to
         // match everything else in this test.
-        let beta = t4(&blk.nums("beta"), [b, t, hv, 1])
-            .permute([0, 2, 1, 3]);
+        let beta = t4(&blk.nums("beta"), [b, t, hv, 1]).permute([0, 2, 1, 3]);
         let want_o = blk.nums("scale1_o");
         let want_s = blk.nums("scale1_S");
 
@@ -564,8 +557,7 @@ fn kda_step_matches_fla_recurrent_at_unit_scale() {
                     state = s;
                     let got: Vec<f32> = o.into_data().to_vec::<f32>().unwrap();
                     let off = ((bi * t + ti) * hv + h) * v;
-                    let (r, at) =
-                        num_diff(&got, &want_o[off..off + v], ATOL_CHAIN, TOL_RECUR);
+                    let (r, at) = num_diff(&got, &want_o[off..off + v], ATOL_CHAIN, TOL_RECUR);
                     assert!(
                         r <= 1.0,
                         "kda_step output disagrees with FLA naive_recurrent_kda(scale=1)\n  \
@@ -577,8 +569,7 @@ fn kda_step_matches_fla_recurrent_at_unit_scale() {
                 }
                 let got_s: Vec<f32> = state.into_data().to_vec::<f32>().unwrap();
                 let off = (bi * hv + h) * k * v;
-                let (r, at) =
-                    num_diff(&got_s, &want_s[off..off + k * v], ATOL_CHAIN, TOL_RECUR);
+                let (r, at) = num_diff(&got_s, &want_s[off..off + k * v], ATOL_CHAIN, TOL_RECUR);
                 assert!(
                     r <= 1.0,
                     "kda_step final state disagrees with FLA naive_recurrent_kda(scale=1)\n  \
@@ -659,7 +650,10 @@ fn read_scale_matches_fla_reference() {
             report.push_str(&format!(
                 "  case {name}: worst rel {r:.3e} at {at}, ours {} vs FLA {} (ratio {:.4}, \
                  K**-0.5 = {:.4})\n",
-                got[at], want[at], got[at] / want[at], k.powf(-0.5)
+                got[at],
+                want[at],
+                got[at] / want[at],
+                k.powf(-0.5)
             ));
         }
     }
@@ -822,7 +816,10 @@ fn chunked_wy_applies_no_read_scale() {
                 report.push_str(&format!(
                     "  arm {path:?} case {name}: worst normalised {r:.3e} at {at}, ours {} vs \
                      FLA {} (ratio {:.4}, K**-0.5 = {:.4})\n",
-                    got[at], want[at], got[at] / want[at], k.powf(-0.5)
+                    got[at],
+                    want[at],
+                    got[at] / want[at],
+                    k.powf(-0.5)
                 ));
             }
         }
@@ -952,7 +949,10 @@ fn green_margins_are_reported_and_the_formula_class_is_far_above_tolerance() {
             burn_kda::G_MIN,
         );
         let got: Vec<f32> = m.forward(x).log().into_data().to_vec::<f32>().unwrap();
-        gate_margins.push((name, num_diff(&got, &blk.nums("fla_lowerbound_g"), ATOL_G, TOL_GATE).0));
+        gate_margins.push((
+            name,
+            num_diff(&got, &blk.nums("fla_lowerbound_g"), ATOL_G, TOL_GATE).0,
+        ));
     }
 
     // The scale attribution, on FLA's own two rows.
@@ -961,7 +961,10 @@ fn green_margins_are_reported_and_the_formula_class_is_far_above_tolerance() {
         let k: f32 = blk.dims()[4] as f32;
         let s = k.powf(-0.5);
         let want: Vec<f32> = blk.nums("scale1_o").iter().map(|x| x * s).collect();
-        chain_margins.push((name, num_diff(&blk.nums("scaleK_o"), &want, ATOL_CHAIN, TOL_RECUR).0));
+        chain_margins.push((
+            name,
+            num_diff(&blk.nums("scaleK_o"), &want, ATOL_CHAIN, TOL_RECUR).0,
+        ));
     }
 
     // The ratios are already NORMALISED: `num_diff` returns

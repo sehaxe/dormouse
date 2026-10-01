@@ -36,8 +36,7 @@ fn main() {
         if ci != 0 && ci != t.cases.len() - 1 {
             continue;
         }
-        let input =
-            Tensor::<3>::from_data(TensorData::new(x.clone(), [1, *seq, t.d]), &device);
+        let input = Tensor::<3>::from_data(TensorData::new(x.clone(), [1, *seq, t.d]), &device);
 
         // raw projections, pre-conv
         let (qr, kr, vr) = (
@@ -45,9 +44,21 @@ fn main() {
             m.k_proj.forward(input.clone()),
             m.v_proj.forward(input.clone()),
         );
-        dump(&mut out, &format!("c{ci}/raw_q_proj"), &qr.clone().into_data().bytes);
-        dump(&mut out, &format!("c{ci}/raw_k_proj"), &kr.clone().into_data().bytes);
-        dump(&mut out, &format!("c{ci}/raw_v_proj"), &vr.clone().into_data().bytes);
+        dump(
+            &mut out,
+            &format!("c{ci}/raw_q_proj"),
+            &qr.clone().into_data().bytes,
+        );
+        dump(
+            &mut out,
+            &format!("c{ci}/raw_k_proj"),
+            &kr.clone().into_data().bytes,
+        );
+        dump(
+            &mut out,
+            &format!("c{ci}/raw_v_proj"),
+            &vr.clone().into_data().bytes,
+        );
 
         // the conv, straight out of the crate's own short_conv_1d
         for (n, (p, w)) in [
@@ -56,7 +67,11 @@ fn main() {
             ("v_conv", (&vr, &m.v_conv_w)),
         ] {
             let (y, _) = short_conv_1d(p.clone(), w.val(), None::<&Tensor<3>>);
-            dump(&mut out, &format!("c{ci}/{n}"), &y.clone().into_data().bytes);
+            dump(
+                &mut out,
+                &format!("c{ci}/{n}"),
+                &y.clone().into_data().bytes,
+            );
         }
 
         // everything project() hands to the recurrence and the readout
@@ -99,10 +114,8 @@ fn main() {
                 &o.clone().into_data().bytes,
             );
         }
-        let g_recomputed = -(a_exp.clone() * softplus(
-            f1.clone() + m.dt_bias.val().reshape([1, 1, kd]),
-            1.0,
-        ));
+        let g_recomputed =
+            -(a_exp.clone() * softplus(f1.clone() + m.dt_bias.val().reshape([1, 1, kd]), 1.0));
         dump(
             &mut out,
             &format!("c{ci}/g_recomputed"),

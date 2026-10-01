@@ -812,17 +812,7 @@ impl KdaModule {
                 {
                     (o, s)
                 } else {
-                    chunk_wy_forward(
-                        q,
-                        k,
-                        v,
-                        g,
-                        b_k.clone(),
-                        b_v,
-                        state,
-                        1.0,
-                        self.chunk_size,
-                    )
+                    chunk_wy_forward(q, k, v, g, b_k.clone(), b_v, state, 1.0, self.chunk_size)
                 }
             }
             #[cfg(not(feature = "cuda"))]
@@ -886,12 +876,9 @@ impl KdaModule {
         let (q, k, v, g, b_k, b_v, gate) = self.project(x.clone());
         let [_, hv, _, _] = v.shape().dims::<4>();
         let dev = q.device();
-        let s = state
-            .take()
-            .unwrap_or_else(|| {
-                Tensor::<4>::zeros([batch, hv, self.head_dim, self.v_head_dim], &dev)
-                    .cast(q.dtype())
-            });
+        let s = state.take().unwrap_or_else(|| {
+            Tensor::<4>::zeros([batch, hv, self.head_dim, self.v_head_dim], &dev).cast(q.dtype())
+        });
 
         let (out_4d, new_state) = if update_state {
             let mut outs = Vec::with_capacity(tokens.div_ceil(self.chunk_size));
@@ -984,12 +971,9 @@ impl KdaModule {
         let (q, k, v, g, _b_k, b_v, gate) = self.project(x.clone());
         let [_, hv, _, _] = v.shape().dims::<4>();
         let dev = q.device();
-        let s = state
-            .take()
-            .unwrap_or_else(|| {
-                Tensor::<4>::zeros([batch, hv, self.head_dim, self.v_head_dim], &dev)
-                    .cast(q.dtype())
-            });
+        let s = state.take().unwrap_or_else(|| {
+            Tensor::<4>::zeros([batch, hv, self.head_dim, self.v_head_dim], &dev).cast(q.dtype())
+        });
 
         // The per-head scalar of Eq 2, repeated over the VALUE channels, which
         // is the axis both multiplications below live on.

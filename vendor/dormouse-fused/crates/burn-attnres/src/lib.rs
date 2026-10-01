@@ -134,12 +134,7 @@ impl BlockAttnRes {
         Self::with_form(d_model, block_size, device, ScoreForm::default())
     }
 
-    pub fn with_form(
-        d_model: usize,
-        block_size: usize,
-        device: &Device,
-        form: ScoreForm,
-    ) -> Self {
+    pub fn with_form(d_model: usize, block_size: usize, device: &Device, form: ScoreForm) -> Self {
         Self {
             // Paper §5: pseudo-queries MUST be initialized to zero.
             query: Initializer::Zeros.init([d_model], device),
@@ -196,11 +191,7 @@ pub fn depth_attend(history: &[Tensor<3>], query: Tensor<1>) -> Tensor<3> {
 /// the tensor path cannot disagree about it (a kernel that only knew the
 /// `SqrtD` form would silently compute a different function on GPU than on
 /// CPU - the ADR-0019 failure mode with a cross-backend signature).
-pub fn depth_attend_form(
-    history: &[Tensor<3>],
-    query: Tensor<1>,
-    form: ScoreForm,
-) -> Tensor<3> {
+pub fn depth_attend_form(history: &[Tensor<3>], query: Tensor<1>, form: ScoreForm) -> Tensor<3> {
     let n = history.len();
     if n == 1 {
         return history[0].clone();
@@ -250,7 +241,12 @@ pub fn depth_attend_form(
     // Tensor fallback (non-CUDA backend or fused dispatch unavailable).
     // `m` is the mean-vs-sum multiplier: ScoreForm::Paper divides the squared
     // norm by d (a true RMSNorm, Zhang & Sennrich [66]), SqrtD does not.
-    let h_norm_sq = h_stack.clone().powf_scalar(2.0).sum_dim(3).mul_scalar(m).add_scalar(1e-5);
+    let h_norm_sq = h_stack
+        .clone()
+        .powf_scalar(2.0)
+        .sum_dim(3)
+        .mul_scalar(m)
+        .add_scalar(1e-5);
     let [nh, bh, th, _ns] = h_norm_sq.dims();
     let h_norm = h_stack.clone() / h_norm_sq.sqrt().reshape([nh, bh, th, 1usize]);
 
@@ -506,9 +502,7 @@ mod tests {
     #[test]
     fn zero_query_is_an_equal_weight_average_at_init() {
         let d = 8;
-        let hist: Vec<Tensor<3>> = (0..5)
-            .map(|_| random_h(2, 3, d))
-            .collect();
+        let hist: Vec<Tensor<3>> = (0..5).map(|_| random_h(2, 3, d)).collect();
         let mean = hist
             .iter()
             .fold(Tensor::<3>::zeros([2, 3, d], &dev()), |a, h| a + h.clone())
@@ -519,7 +513,10 @@ mod tests {
             let v: Vec<f32> = (out - mean.clone()).into_data().to_vec().unwrap();
             let d: Vec<f32> = v.iter().map(|x| x.abs()).collect();
             let worst = d.iter().cloned().fold(0.0_f32, f32::max);
-            assert!(worst < 1e-6, "{form:?}: zero query must average, off by {worst}");
+            assert!(
+                worst < 1e-6,
+                "{form:?}: zero query must average, off by {worst}"
+            );
         }
     }
 

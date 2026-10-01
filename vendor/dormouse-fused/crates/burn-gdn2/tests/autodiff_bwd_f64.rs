@@ -95,8 +95,8 @@ use std::io::Cursor;
 
 use burn::backend::{Autodiff, NdArray};
 use burn::tensor::{Device, Tensor, TensorData};
-use burn_gdn2::{chunk_wy_forward, chunk_wy_forward_autodiff_s};
 use burn_autodiff::checkpoint::strategy::{BalancedCheckpointing, NoCheckpointing};
+use burn_gdn2::{chunk_wy_forward, chunk_wy_forward_autodiff_s};
 
 /// The crate's own default, `k.shape[-1] ** -0.5` = 1/sqrt(8) = 0.35355339059327373,
 /// which is what the generator used.  A different scale is a different function
@@ -157,14 +157,17 @@ fn load(data: &[u8], magic: &[u8; 8]) -> Fixture {
         let shape: Vec<usize> = (0..ndim).map(|_| rd_u32(&mut c) as usize).collect();
         let numel: usize = shape.iter().product();
         let mut v = vec![0f64; numel];
-        let bytes =
-            unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, numel * 8) };
+        let bytes = unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, numel * 8) };
         std::io::Read::read_exact(&mut c, bytes).unwrap();
         blocks.push((name, shape, v));
     }
     let mut sp = [0u8; 8];
     std::io::Read::read_exact(&mut c, &mut sp).unwrap();
-    assert_eq!(c.position() as usize, data.len(), "trailing bytes in the fixture");
+    assert_eq!(
+        c.position() as usize,
+        data.len(),
+        "trailing bytes in the fixture"
+    );
     Fixture {
         blocks,
         spread: f64::from_le_bytes(sp),
@@ -263,11 +266,15 @@ fn the_forward_agrees_with_the_f64_transcription() {
     println!(
         "f32 forward vs f64 transcription: rel={r:.3e} (output scale {scale:.3e}, BAR {FWD_BAR:.0e})"
     );
-    println!("loss <out,d_out> = {:.9e} (f64 {:.9e})", {
-        let d: Vec<f32> = d_out.iter().map(|x| *x as f32).collect();
-        let dt = Tensor::<4>::from_data(TensorData::new(d, out_shape.clone()), &dev);
-        (out.clone() * dt).sum().into_scalar::<f32>()
-    }, f.get("loss").1[0]);
+    println!(
+        "loss <out,d_out> = {:.9e} (f64 {:.9e})",
+        {
+            let d: Vec<f32> = d_out.iter().map(|x| *x as f32).collect();
+            let dt = Tensor::<4>::from_data(TensorData::new(d, out_shape.clone()), &dev);
+            (out.clone() * dt).sum().into_scalar::<f32>()
+        },
+        f.get("loss").1[0]
+    );
     assert!(
         r < FWD_BAR as f64,
         "our f32 forward is {r:.3e} from the f64 transcription (BAR {FWD_BAR:.0e}). \
@@ -345,7 +352,8 @@ fn the_adjoint_agrees_with_the_f64_oracle_term_by_term() {
         "the adjoint is wrong on input {}: rel={:.3e} against the f64 oracle \
          (BAR {GRAD_BAR:.0e}). The per-term table above says which terms are \
          right; this is the adjoint's gradient, not a tolerance question.",
-        worst.1, worst.0
+        worst.1,
+        worst.0
     );
 }
 
@@ -399,7 +407,11 @@ fn the_bar_separates_every_wrong_formula() {
             let (tname, v) = read_tensor(&mut c);
             let inp = tname.strip_prefix('d').unwrap_or(&tname).to_string();
             let (shape, want) = f.get(&tname);
-            assert_eq!(shape, f.get(&format!("d{inp}")).0, "fault tensor shape differs");
+            assert_eq!(
+                shape,
+                f.get(&format!("d{inp}")).0,
+                "fault tensor shape differs"
+            );
             let (r, _) = rel(&v, &want);
             if r > worst_here.0 {
                 worst_here = (r, inp);
@@ -536,7 +548,10 @@ fn the_state_we_hand_back_is_the_state_the_oracle_computed() {
     let mut rows = Vec::new();
     for (label, f) in [
         ("one chunk ", Fixture::load_ref()),
-        ("two chunks", load(include_bytes!("ref_bwd_f64_carry.bin"), b"GDN2BFD\0")),
+        (
+            "two chunks",
+            load(include_bytes!("ref_bwd_f64_carry.bin"), b"GDN2BFD\0"),
+        ),
     ] {
         let inp = tensors(&f, &dev);
         let (_, s_ref) = f.get("out_state");
@@ -557,7 +572,9 @@ fn the_state_we_hand_back_is_the_state_the_oracle_computed() {
             "state element count changed"
         );
         let (r, scale) = rel(&host(&new_state), &s_ref);
-        rows.push(format!("  {label}  state rel = {r:.3e}  (state scale {scale:.3e})"));
+        rows.push(format!(
+            "  {label}  state rel = {r:.3e}  (state scale {scale:.3e})"
+        ));
         worst = worst.max(r);
     }
     println!(

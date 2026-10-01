@@ -178,7 +178,10 @@ fn rel(a: &[f64], b: &[f64]) -> (f64, f64) {
 #[test]
 fn the_fused_kernels_agree_with_the_f64_oracle_term_by_term() {
     for (label, data) in [
-        ("ONE CHUNK (BK1 only)", &include_bytes!("ref_bwd_f64.bin")[..]),
+        (
+            "ONE CHUNK (BK1 only)",
+            &include_bytes!("ref_bwd_f64.bin")[..],
+        ),
         (
             "TWO CHUNKS (BK1 + BK2 + the d_s_shift glue)",
             &include_bytes!("ref_bwd_f64_carry.bin")[..],
@@ -236,14 +239,7 @@ fn run(label: &str, data: &[u8]) {
         gexp: io.gexp,
     };
     let g = fused_chunk_backward::<CudaBare>(
-        &fbi,
-        &inp[1],
-        &inp[2],
-        &inp[4],
-        &inp[5],
-        &d_out,
-        SCALE,
-        CHUNK,
+        &fbi, &inp[1], &inp[2], &inp[4], &inp[5], &d_out, SCALE, CHUNK,
     )
     .expect("the fused adjoint must engage on the bare CUDA backend");
     let fused = [
@@ -283,7 +279,8 @@ fn run(label: &str, data: &[u8]) {
         "[{label}] the fused kernel adjoint is wrong on input {}: rel={:.3e} against the f64 \
          oracle (BAR {GRAD_BAR:.0e}). This is a KERNEL number against a gradient computed by \
          a different method, not a tolerance question.",
-        worst.1, worst.0
+        worst.1,
+        worst.0
     );
     let _ = (Distribution::Normal(0.0, 1.0),);
 }

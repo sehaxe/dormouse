@@ -91,11 +91,12 @@ pub fn situ_glu(gate_up: Tensor<2>, hidden: usize, beta_gate: f64, beta_up: f64)
         ) {
             return out;
         }
-        if let Some(out) = crate::fused_situ::situ_glu_autodiff_s::<
-            CudaBare,
-            BalancedCheckpointing,
-        >(gate_up.clone(), hidden, beta_gate, beta_up)
-        {
+        if let Some(out) = crate::fused_situ::situ_glu_autodiff_s::<CudaBare, BalancedCheckpointing>(
+            gate_up.clone(),
+            hidden,
+            beta_gate,
+            beta_up,
+        ) {
             return out;
         }
     }
@@ -291,7 +292,12 @@ mod tests {
     /// is roughly SwiGLU-shaped near zero, cap or no cap.
     #[test]
     fn situ_is_a_small_perturbation_of_swiglu_near_the_origin() {
-        let got = f32s(situ_glu(gate_up(&[(1.0, 1.0)]), 1, K3_GATE_BETA, K3_UP_BETA))[0];
+        let got = f32s(situ_glu(
+            gate_up(&[(1.0, 1.0)]),
+            1,
+            K3_GATE_BETA,
+            K3_UP_BETA,
+        ))[0];
         let swiglu = sigmoid(1.0);
         let d = rel(got, swiglu);
         assert!(
