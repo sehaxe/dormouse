@@ -12,7 +12,7 @@
 #   ImportError: cannot import name '_static_cache_update' from
 #   'transformers.cache_utils'
 # So nothing here is a claim of numeric agreement. See
-# research/papers/tier-a-references.md for the three divergences found by
+# docs/archive/research/tier-a-references.md for the three divergences found by
 # READING this file, and for what a runnable fixture would have to isolate.
 # do not edit; re-copy from the pinned commit above.
 

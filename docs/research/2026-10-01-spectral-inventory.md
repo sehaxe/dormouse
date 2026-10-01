@@ -1,7 +1,7 @@
 # Math-site inventory: the spectral stack (burn-spectral, burn-sct, burn-muon-plus)
 
 **2026-10-01, audit pass.** One row per math site, in the order the code runs.
-Read with [`reviews/spectral-audit-2026-10-01.md`](reviews/spectral-audit-2026-10-01.md),
+Read with [`reviews/spectral-audit-2026-10-01.md`](../reviews/spectral-audit-2026-10-01.md),
 which carries the verdicts, the seam analysis and the class-B instrumentation.
 Reproduce the instrument with `rustc -O -o /tmp/polar_probe tools/polar_probe.rs`.
 

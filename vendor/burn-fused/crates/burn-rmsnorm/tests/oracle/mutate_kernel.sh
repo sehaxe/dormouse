@@ -2,7 +2,7 @@
 # PROVE THE ORACLE CAN FAIL.
 #
 # A test that has only ever been green is not evidence that it can fail, and
-# docs/ORACLE.md is about tests that agree with the code under test. This
+# docs/protocols/ORACLE.md is about tests that agree with the code under test. This
 # perturbs the KERNEL (src/lib.rs), one wrong formula at a time, runs the suite,
 # and records which test goes red and by how much. Then it restores the kernel
 # and checks the md5.

@@ -221,6 +221,6 @@ that pass) rather than re-derived. Two re-verified by me here via the GitHub tre
   said made it uncompilable; that file is being rewritten. I did not build it.
 - I ran no tests and no GPU work, so the library's actual pass/fail state is NOT
   VERIFIED by me. Every "BROKEN"/"RED" attribution is quoted from
-  `TEST-AUDIT.md` or `research/2026-09-27-fused-inventory-*.md`, not re-measured.
+  `TEST-AUDIT.md` or `docs/archive/research/2026-09-27-fused-inventory-attention.md`, not re-measured.
 - I changed nothing in `vendor/` or `crates/`. Two files created: this report and
   `docs/adr/0020-oracle-discipline.md`.

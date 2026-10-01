@@ -3,7 +3,7 @@
 //
 // WHY THIS IS THE SAME ORACLE AS `tests/oracle_breadth.rs`. Both used to read
 // `tests/ref_data.bin`, an **f32 transcription of burn-gdn2's own algorithm**
-// produced by `tools/gen_reference.rs`. `docs/ORACLE.md` §2: a self-
+// produced by `tools/gen_reference.rs`. `docs/protocols/ORACLE.md` §2: a self-
 // transcription can only prove self-consistency, because two arms that share a
 // misunderstanding agree. It was not hypothetical - the short conv's
 // replicate-pad (`0a6998a`, fixed) was replicate-padded by BOTH reference

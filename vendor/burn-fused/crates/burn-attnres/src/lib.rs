@@ -158,7 +158,7 @@ impl BlockAttnRes {
     /// KNOWN WRONG against Eq. 6, and not fixed here: the streaming state
     /// folds the embedding into block 1 instead of keeping `b_0 = h_1` as its
     /// own permanently-attended source, and the first sublayer of a block
-    /// returns the previous block unchanged. See `research/papers/attnres.md`
+    /// returns the previous block unchanged. See `docs/papers/attnres.md`
     /// D5/D6/D7/D8 and the integration doc's follow-ups. The FULL variant
     /// (`depth_attend_form`) is the one this crate is trusted for; the model
     /// arm does not call this one.
@@ -611,7 +611,7 @@ mod tests {
 /// ```
 ///
 /// The scale is applied to BOTH legs. It used to reach Phase 1 only
-/// (`research/papers/attnres.md` D4), which compared the inter-block and the
+/// (`docs/papers/attnres.md` D4), which compared the inter-block and the
 /// intra-block source group at temperatures differing by `sqrt(d)` and so
 /// mis-weighted the merge itself; `two_phase_merge_matches_full_attention`
 /// could not see it because it exercises `i = 0`, which bypasses the merge.

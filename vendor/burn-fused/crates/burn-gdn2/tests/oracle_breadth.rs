@@ -9,7 +9,7 @@
 //
 // WHAT IT USED TO BE, AND WHY THAT WAS WORTH NOTHING. It read
 // `tests/ref_data.bin`, produced by `tools/gen_reference.rs` - an **f32
-// transcription of burn-gdn2's own algorithm**. `docs/ORACLE.md` §2 is the
+// transcription of burn-gdn2's own algorithm**. `docs/protocols/ORACLE.md` §2 is the
 // reason that is not a reference: two independent transcriptions of one
 // recurrence agree when they are both right AND when they share a
 // misunderstanding, so the test could only ever prove self-consistency. It was
@@ -31,7 +31,7 @@
 // is **tier (b)**: a transcription, so a shared *misreading* of the paper would
 // survive it. It is NOT the original authors' output bytes - those need
 // NVlabs/GatedDeltaNet-2's Triton kernel actually run, which is
-// `docs/ORACLE.md` §8 candidate (2) and has not been attempted. The words
+// `docs/protocols/ORACLE.md` §8 candidate (2) and has not been attempted. The words
 // "bit-exact" and "bit-for-bit" are not used about this test and must not be;
 // that is why the target is named `oracle_breadth` and not `bit_exact`, which
 // is what this file was called until 2026-09-29 and was never.

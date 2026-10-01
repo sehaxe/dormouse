@@ -10,7 +10,7 @@
 //! - f32 export reproduces the source logits BIT-EXACTLY (nothing to narrow),
 //!   so any drift in the container is the container's;
 //! - f16 and bf16 land inside the tolerance measured on a trained model
-//!   (docs/adr/0023) - the numbers below are that measurement, not a guess;
+//!   (docs/adr/0023-inference-export.md) - the numbers below are that measurement, not a guess;
 //! - the file is the header plus exactly 2 bytes per parameter, so the size
 //!   claim in the README is asserted arithmetic that cannot rot;
 //! - the header carries the config, so the file describes its own shape;
@@ -92,7 +92,7 @@ fn header_len(raw: &[u8]) -> usize {
 
 /// Measured max |logit delta| of each format against the fp32 model, on
 /// HELD-OUT text at the `small` preset (9.20M params, 16 windows of 256 B from
-/// `real_eval_v2/eval_tail.bin`, a 20-step run; docs/adr/0023 carries the full
+/// `real_eval_v2/eval_tail.bin`, a 20-step run; docs/adr/0023-inference-export.md carries the full
 /// table and the program that produced it):
 ///
 ///     f16  1.247e-1     bf16  1.025e-1      (logits |max| 1.11)

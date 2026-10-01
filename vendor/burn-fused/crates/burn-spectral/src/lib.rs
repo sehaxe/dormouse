@@ -403,7 +403,7 @@ pub fn ortho_error(u: &Tensor<2>) -> f32 {
 /// The per-ENTRY orthonormality error `||XᵀX - I||_F / rank`.
 ///
 /// The convention the trainer's one-way `max_ortho` latch uses (`param.rs`,
-/// and `docs/AGENTS.md` §2.3). It is per entry because the raw F-norm sums
+/// and `AGENTS.md` §2.3). It is per entry because the raw F-norm sums
 /// `k²` Gram entries and so scales ~`k`: on a `k = 64` factor the NS-3
 /// retraction's own convergence floor is ~4e-3 raw (~6e-5 per entry), so a
 /// raw-norm threshold would fire the fp32 fallback on every fresh run.

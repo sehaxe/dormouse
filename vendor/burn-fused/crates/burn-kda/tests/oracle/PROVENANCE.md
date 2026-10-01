@@ -30,7 +30,7 @@ nobody had taken it.
 **The pin is byte-identical and machine-checked.** `gen_kda_oracle.py` asserts
 the sha256 of both files before it imports anything and exits 2 with `PIN
 ROTED` on a mismatch. No line of upstream source was edited, not even to add
-this provenance header — which is why `docs/ORACLE-TIERS.tsv` carries a written
+this provenance header — which is why `docs/protocols/ORACLE-TIERS.tsv` carries a written
 waiver on these two rows instead of a `github.com` URL in the file: the URL is
 here, and the sha256 is enforced at generation time.
 

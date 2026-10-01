@@ -4,7 +4,7 @@
 > depends on this one; the only incoming edges are the `burn-fused` facade and the
 > `burn-fused-benches` probe. Kept as a **reference port**: `docs/archive/architecture/PLAN-minimal-core.md`
 > §M2 names it as a residual-stream A/B arm, and that A/B has not been run. Fate
-> table and reasoning: `docs/library-crate-fate.md`.
+> table and reasoning: `docs/architecture/library-crate-fate.md`.
 
 > CI: this badge's workflow was deleted (`4963c3a`) — the gate is `../../.github/workflows/fused-library.yml`, and it has no GPU job (for CUDA: `tools/gpu-gate.sh`).
 [![Crates.io](https://img.shields.io/crates/v/burn-mhc)](https://crates.io/crates/burn-mhc)

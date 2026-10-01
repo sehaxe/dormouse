@@ -645,7 +645,7 @@ The three rungs of the A/B ladder: a 200-500 step smoke filters NaN, speed and
 early slope; a 2k+ step confirm produces a BPB verdict; a long gate measures BPB
 at distance (512k-1M positions) after each context extension.
 
-`docs/adr/0002-ab-or-death.md`; the long gate in `docs/adr/0004`.
+`docs/adr/0002-ab-or-death.md`; the long gate in `docs/adr/0004-context-ladder.md`.
 
 **Not** interchangeable: a smoke survivor is a candidate, not a result, and
 nothing has yet passed a long gate.

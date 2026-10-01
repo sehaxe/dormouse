@@ -48,7 +48,7 @@ pub fn short_conv_1d(
             // `other=0.0` (`fla/modules/conv/triton/kernels.py`), and whose
             // decode path starts from `cache = x.new_zeros(...)`
             // (`fla/modules/conv/short_conv.py::step`). See
-            // `research/papers/gdn-kda.md` §2.5 / §4.1.
+            // `docs/papers/gdn-kda.md` §2.5 / §4.1.
             //
             // It used to replicate the first token, which both reference
             // generators also did, so the 1000-case fixture was structurally

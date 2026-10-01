@@ -1,6 +1,6 @@
 # External oracle research for `burn-spectral`'s Newton–Schulz orthogonalisation
 
-**Read `research/papers/spectral-reference.md` first.** This directory is the
+**Read `docs/papers/spectral-reference.md` first.** This directory is the
 evidence it cites.
 
 ## What is here

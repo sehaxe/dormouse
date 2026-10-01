@@ -8,7 +8,7 @@
 // scale, the short conv's zero padding, and the exact form of the L2 norm).
 //
 // WHY IT EXISTS. Every other numeric test in this crate compares our code to
-// our code. `docs/ORACLE.md` §2 shows why that is not enough: a bug above the
+// our code. `docs/protocols/ORACLE.md` §2 shows why that is not enough: a bug above the
 // fused/ops branch point — i.e. inside `project` or `output` — moves both arms
 // together and the difference is exactly zero. `tests/ref_data.bin` was the one
 // layer that could see `project`, and it is RED (1.38e-2, 976/1000) behind a
@@ -18,7 +18,7 @@
 //
 // TIER, HONESTLY. This is **(b)**, not (a). It is a transcription, so a shared
 // *misreading* of the paper would survive it. It is not the authors' own bytes;
-// those need NVlabs' Triton kernel actually run (`docs/ORACLE.md` §8 candidate
+// those need NVlabs' Triton kernel actually run (`docs/protocols/ORACLE.md` §8 candidate
 // (2), not attempted). Neither "bit-exact" nor "bit-for-bit" is used
 // about anything here and must not be.
 //

@@ -1,6 +1,6 @@
 //! # burn-kda against FLA's OWN KDA references, run.
 //!
-//! **Tier (a).** `docs/ORACLE-TIERS.tsv` registered `burn-kda/src/lib.rs` as
+//! **Tier (a).** `docs/protocols/ORACLE-TIERS.tsv` registered `burn-kda/src/lib.rs` as
 //! tier **(d)** — "n/a, no fidelity claim in the file". That was wrong. This
 //! file is what it should have said.
 //!
@@ -42,7 +42,7 @@
 //! A red test that a maintainer can read and act on is the deliverable; a
 //! numerical change to a shipped model is the owner's call, so the two
 //! divergences are **reported**, not fixed. See
-//! `research/papers/kda-formula-audit-2026-09-30.md` §3.1 and §3.2.
+//! `docs/reviews/2026-09-30-kda-formula-audit.md` §3.1 and §3.2.
 //!
 //! **Baseline: 5 green, 2 red on purpose**, and the two reds are the only
 //! failures in the file. `tests/oracle/falsify.sh` demonstrates that each green
@@ -464,7 +464,7 @@ fn kimi_linear_softplus_decay_matches_fla_reference() {
          The module docs at src/lib.rs:17 and src/lib.rs:267 state the OUTSIDE form, so\n\
          the comments are also wrong about the code. Class A to fix the comment;\n\
          class B (a numerical change to the Kimi-Linear branch, = A/B arm 5) to fix the\n\
-         code. NOT fixed here: see research/papers/kda-formula-audit-2026-09-30.md S3.1",
+         code. NOT fixed here: see docs/reviews/2026-09-30-kda-formula-audit.md S3.1",
         report.lines().count()
     );
 }
@@ -670,7 +670,7 @@ fn read_scale_matches_fla_reference() {
          CAUSE: src/lib.rs:646,653 pass 1.0 as `scale`; kda_step / forward_recurrent have no \
          scale term; src/fused.rs:9 states the reason and the reason is wrong.\n\
          Not fixed here: a numerical change to a shipped model. See \
-         research/papers/kda-formula-audit-2026-09-30.md S3.2.",
+         docs/reviews/2026-09-30-kda-formula-audit.md S3.2.",
         report.lines().count()
     );
 }
@@ -837,7 +837,7 @@ fn chunked_wy_applies_no_read_scale() {
          The MECHANISM EXISTS -- chunked_wy_honours_the_read_scale_when_asked is green -- so \
          this is a missing argument, not a missing implementation.\n\
          Not fixed here: a numerical change to a shipped model. See \
-         research/papers/kda-formula-audit-2026-09-30.md S3.2.",
+         docs/reviews/2026-09-30-kda-formula-audit.md S3.2.",
         report.lines().count()
     );
 }

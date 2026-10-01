@@ -356,7 +356,7 @@ head-major offsets, which agrees with the correct indexing only at T=1 — which
 is why exactly the 24 single-token cases passed. `ff7cd57` fixed it, and the
 numbers now are 1000 cases, max_diff 2.32e-7, 0 failures. The 1.38e-2 carried
 by `0a6998a`'s message, and by this paragraph until 2026-09-29, was a defect in
-the reference and not in this crate — see `research/papers/gdn-kda.md` §4.1
+the reference and not in this crate — see `docs/papers/gdn-kda.md` §4.1
 and §7.1.
 
 The two `#[ignore]`d CUDA gates are the only tests that would compare the fused

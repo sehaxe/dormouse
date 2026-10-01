@@ -45,7 +45,7 @@
 //! tests carry this as RED ON PURPOSE (`read_scale_matches_fla_reference`,
 //! `chunked_wy_applies_no_read_scale`). Changing `1.0` moves every number
 //! derived from this crate, so it is the owner's call.
-//! `research/papers/kda-formula-audit-2026-09-30.md` §3.2.
+//! `docs/reviews/2026-09-30-kda-formula-audit.md` §3.2.
 
 #[cfg(feature = "cuda")]
 pub mod cuda {

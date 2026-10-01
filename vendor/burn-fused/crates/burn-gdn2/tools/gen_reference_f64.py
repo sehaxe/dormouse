@@ -6,7 +6,7 @@ WHAT THIS IS, AND WHAT IT IS NOT.
 This is an **f64 transcription of the paper's equations**, written out one
 token at a time, plus a committed fixture of its outputs. It exists because
 every other test in this crate compares our code to our code
-(`vendor/burn-fused/TEST-AUDIT.md`, `docs/ORACLE.md` §2): a bug above the
+(`vendor/burn-fused/TEST-AUDIT.md`, `docs/protocols/ORACLE.md` §2): a bug above the
 fused/ops branch point moves both arms together and the difference is exactly
 zero. This layer is the first one whose expected value does not come from a
 second implementation of the same code.
@@ -14,7 +14,7 @@ second implementation of the same code.
 **It is tier (b), not tier (a).** It is a transcription, so a shared
 *misreading* of the paper survives it. It is not the authors' own bytes; those
 need `NVlabs/GatedDeltaNet-2`'s Triton kernel actually run, which is
-`docs/ORACLE.md` §8 candidate (2) and was not attempted here. What it buys is
+`docs/protocols/ORACLE.md` §8 candidate (2) and was not attempted here. What it buys is
 the removal of one confound: with f64 at the top of the stack, a discrepancy is
 no longer ambiguous between "our maths" and "f32 conditioning".
 
@@ -78,7 +78,7 @@ PROVENANCE, line by line. Every non-obvious line cites where it comes from:
             => sigmoid.
         So the two credible upstreams DISAGREE, and they disagree at the LAYER
         (`fla/layers/gdn2.py`), not inside the kernel. `src/module.rs` and
-        `research/papers/output-gate-silu-vs-sigmoid.md` carry the finding; it is
+        `docs/papers/output-gate-silu-vs-sigmoid.md` carry the finding; it is
         an unresolved technology A/B arm and is deliberately NOT settled here.
         What is settled is that the choice is not silent: `output-gate-sigmoid`
         is one of the committed wrong formulas, so the distance between the two
@@ -363,7 +363,7 @@ def gdn2_forward(x, P, fault=None):
             z = v[:, i]
         S = Sb + k[:, i][:, :, None] * (z - r)[:, None, :]   # S̄ + k (z-r)^T
         # The readout is S^T q, from the state AFTER the write. Reading S̄^T q
-        # instead is the `gr.rs` bug class (docs/ORACLE.md B2).
+        # instead is the `gr.rs` bug class (docs/protocols/ORACLE.md B2).
         src = Sb if fault == "read-before-write" else S
         outs[:, i] = np.einsum("hkv,hk->hv", src, q[:, i])
     outs = outs.transpose(1, 0, 2) * scale             # the WHOLE readout

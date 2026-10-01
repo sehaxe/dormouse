@@ -1,6 +1,7 @@
 # muon-tsct — two independent reviews, one lane
 
-Merged 2026-10-01 from `research/reviews/muon-tsct-review-a.md` and `research/reviews/muon-tsct-review-b.md`. The halves were written independently
+Merged 2026-10-01 from the `muon-tsct-review-a.md` and `muon-tsct-review-b.md` halves, both at
+`5cfdbda`, which is where a reader finds each one whole. The halves were written independently
 and neither read the other (A: Independent review of `docs/papers/muon-plus.md` and `docs/papers/tsct.md`; B: Review B — muon-plus.md / tsct.md, engineering-consequence pass),
 which is why both verdicts are kept: where they agree the finding is settled,
 where they disagree the disagreement is the finding. Nothing was reworded.

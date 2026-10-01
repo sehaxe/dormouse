@@ -1,7 +1,7 @@
 // Diagnostic: dump every stage of `GatedDeltaNet2::project` for two cases, so
 // the f64 reference's own stages can be diffed against them one at a time.
 //
-// WHY THIS EXISTS. `docs/ORACLE.md` §5 names the measurement that would settle
+// WHY THIS EXISTS. `docs/protocols/ORACLE.md` §5 names the measurement that would settle
 // where our output and a reference disagree — "print q/k/v at t=1 ... on both
 // sides" — and records that nobody has run it. Two arms of a differential test
 // that share a projection stage cannot see a bug in it; this is the way out,

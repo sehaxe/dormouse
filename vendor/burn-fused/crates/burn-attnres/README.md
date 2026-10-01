@@ -14,11 +14,11 @@
 > against the PDF, not a verification. The equation-by-equation record, the
 > `1/sqrt(d)` decision and its measurement, and the two derivative defects this
 > wiring exposed are in
-> `research/papers/attnres-integration-2026-09-30.md`. The A/B against ReZero
-> is queue row 7 in `docs/AB-PROTOCOL.md` and has **not** been run.
+> `docs/research/2026-09-30-attnres-integration.md`. The A/B against ReZero
+> is queue row 7 in `docs/protocols/AB-PROTOCOL.md` and has **not** been run.
 >
 > The fate table entry that said "reference port" is stale on this point:
-> `docs/library-crate-fate.md`.
+> `docs/architecture/library-crate-fate.md`.
 
 > CI: this badge's workflow was deleted (`4963c3a`) — the gate is `../../.github/workflows/fused-library.yml`, and it has no GPU job (for CUDA: `tools/gpu-gate.sh`).
 [![Crates.io](https://img.shields.io/crates/v/burn-attnres)](https://crates.io/crates/burn-attnres)

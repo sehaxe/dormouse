@@ -120,7 +120,7 @@ ROWS = [
      "arXiv:2605.22791 Eq 9/10/11/12 and §3.5, re-derived in f64 per token in THIS file - a transcription, and a no-fixture one, so it is runnable rather than committed",
      "PAPER-SEMANTICS across 10 configs x 2 entry points; its own short conv, its own head-major layout, its own reduction order (it shares no code with the chunked path); TOL = 1e-5, measured 5.04e-09",
      "the authors' own Triton kernel (never run); the 4-D/strided stages the example dumps",
-     "the f64 layer (ref_f64.rs) is the fixture-based sibling of this one; the two disagree in TIER, not in verdict - this file has no committed bytes, so a reader can run it, and ref_f64.rs is the one CI can diff. `research/papers/gdn-kda.md` carries the arXiv id because the file cites the equations through that report rather than the paper directly."),
+     "the f64 layer (ref_f64.rs) is the fixture-based sibling of this one; the two disagree in TIER, not in verdict - this file has no committed bytes, so a reader can run it, and ref_f64.rs is the one CI can diff. `docs/papers/gdn-kda.md` carries the arXiv id because the file cites the equations through that report rather than the paper directly."),
     ("burn-gdn2/tests/ref_f64.rs", "b",
      "`tests/ref_f64.bin`, emitted by `tools/gen_reference_f64.py`, itself an f64 transcription of arXiv:2605.22791 Eq 9-12 with the three non-paper lines (the 1/sqrt(K) scale, the short conv's ZERO left pad, the L2-norm eps inside the sqrt) each citing the file it came from",
      "PAPER-SEMANTICS; `project`; `short_conv_1d`; `output`; the STATE carry; both dispatch arms; 18 cases T=1..70",

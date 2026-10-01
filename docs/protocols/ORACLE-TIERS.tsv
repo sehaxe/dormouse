@@ -1,6 +1,6 @@
 # ORACLE-TIERS.tsv - what every reference comparison in burn-kda / burn-gdn2 is
 # ACTUALLY compared against. Read by tools/oracle_gate.py; the prose form is
-# docs/ORACLE.md. Tiers are ADR-0020's: (a) AUTHORS (b) TRANSCRIPTION
+# docs/protocols/ORACLE.md. Tiers are ADR-0020's: (a) AUTHORS (b) TRANSCRIPTION
 # (c) TRANSCRIPTION-OF-TRANSCRIPTION (d) NOTHING. (x) = not a correctness test.
 #
 # "target" is the thing the expected value came from. If it names a function in

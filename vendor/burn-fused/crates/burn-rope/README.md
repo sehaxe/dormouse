@@ -4,7 +4,7 @@
 > depends on this one. It is a `[dev-dependencies]` entry of `burn-spectral` (one
 > example, `tsct_diag.rs`) and a `path =` dependency of the library's own
 > `benches/cpu_probe`, so the library's CI builds it and nothing that trains does.
-> **Recommendation: WIRE** — see `docs/library-crate-fate.md`. The model has no
+> **Recommendation: WIRE** — see `docs/architecture/library-crate-fate.md`. The model has no
 > positional encoding at all today, and `AGENTS.md:586` says the attention arm
 > keeps RoPE. Left in place rather than deleted because the bench and the example
 > name it.

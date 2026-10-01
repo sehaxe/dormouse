@@ -7,7 +7,7 @@
 > `[dev-dependencies]` entry of `burn-spectral` (one example), so this builds in the
 > library's CI and in no training run. **Recommendation: DELETE** once the
 > `tsct_diag` example and the bench probe stop naming it — left in place because
-> those are live path dependencies. See `docs/library-crate-fate.md`.
+> those are live path dependencies. See `docs/architecture/library-crate-fate.md`.
 
 > CI: this badge's workflow was deleted (`4963c3a`) — the gate is `../../.github/workflows/fused-library.yml`, and it has no GPU job (for CUDA: `tools/gpu-gate.sh`).
 [![Crates.io](https://img.shields.io/crates/v/burn-sct)](https://crates.io/crates/burn-sct)

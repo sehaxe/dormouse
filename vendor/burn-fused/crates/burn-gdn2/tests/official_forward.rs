@@ -13,8 +13,8 @@
 //! from that report: **fp64 algebraic properties, no fixture, runnable here.**
 //!
 //! It is written from the equations, not from the implementation:
-//!   - Eq 9 / Eq 10 (Gated Delta Rule-2) — `research/papers/gdn-kda.md` §2.2,
-//!     `research/papers/spec-gdn2-official.md` §3.1
+//!   - Eq 9 / Eq 10 (Gated Delta Rule-2) — `docs/papers/gdn-kda.md` §2.2,
+//!     `docs/papers/spec-gdn2-official.md` §3.1
 //!   - Eq 11 (gates), Eq 12 (log-decay), §3.5 (block design) — `gdn-kda.md` §2.2
 //!   - the short-conv padding — `gdn-kda.md` §2.5: the reference is
 //!     `causal_conv1d` with `other=0.0` on the left-pad branch, i.e. **zeros**.

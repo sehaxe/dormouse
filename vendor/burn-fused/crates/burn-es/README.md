@@ -4,7 +4,7 @@
 > depends on this one; the only incoming edge is the `burn-fused` facade. Kept as a
 > **reference port** for the same post-training phase as `burn-eggroll`. The two crates
 > overlap — both implement the EGGROLL rank-1 perturbation — and only one of them
-> should survive that phase. Fate table: `docs/library-crate-fate.md`.
+> should survive that phase. Fate table: `docs/architecture/library-crate-fate.md`.
 
 > CI: this badge's workflow was deleted (`4963c3a`) — the gate is `../../.github/workflows/fused-library.yml`, and it has no GPU job (for CUDA: `tools/gpu-gate.sh`).
 [![Crates.io](https://img.shields.io/crates/v/burn-es)](https://crates.io/crates/burn-es)

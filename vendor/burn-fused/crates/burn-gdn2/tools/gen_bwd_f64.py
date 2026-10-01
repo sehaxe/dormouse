@@ -10,7 +10,7 @@ chunked-WY FORWARD.  There are three ways to answer that and two are worthless:
   (a) adjoint vs. burn's autograd over the ops path.  WORTHLESS: both sides are
       our own forward, differentiated by the same framework, so a misreading of
       the specification is symmetric and cancels.  This is the defect
-      `docs/ORACLE.md` §2 is about.
+      `docs/protocols/ORACLE.md` §2 is about.
   (b) adjoint vs. the fused CUDA kernels.  Better — it crosses an algorithm
       boundary — but still (a) on the forward side.
   (c) a gradient computed by a DIFFERENT METHOD.  This file.
@@ -70,7 +70,7 @@ BEFORE it looks at any gradient: the forward-agreement number bounds the
 transcription risk, and the gradients are the derivative of the function that
 number certifies.  Tier (b) for the forward, tier (d) for the method of
 differentiation.  There is no tier-(a) layer in this tree
-(`docs/ORACLE.md` §3) and this is not one.
+(`docs/protocols/ORACLE.md` §3) and this is not one.
 
 PROVENANCE.  Transcribed from
 `vendor/burn-fused/crates/burn-gdn2/src/forward.rs::chunk_wy_forward_batched`,

@@ -6,7 +6,7 @@
 // burn's autograd over our own ops path.  That crosses an algorithm boundary
 // and it is a real test, but BOTH sides are our forward, differentiated by the
 // same framework, so a misreading of the specification is symmetric across them
-// and cancels (`docs/ORACLE.md` §2).  Its reference is tier (d).
+// and cancels (`docs/protocols/ORACLE.md` §2).  Its reference is tier (d).
 //
 // This file's references are `tests/ref_bwd_f64.bin` (one chunk) and
 // `tests/ref_bwd_f64_carry.bin` (two chunks): forward-mode AD in f64 over a

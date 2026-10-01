@@ -56,7 +56,7 @@ on the positive side. The two disagree at 4 of the 7 interior ties:
 5.0 it is 4.0 vs 6.0 -- a 50 % error on that input.
 
 This is a defect in `dormouse-core`, NOT in burn-bitnet: `burn-bitnet` has no
-e2m1 at all. See research/papers/tier-a-references.md.
+e2m1 at all. See docs/archive/research/tier-a-references.md.
 
 NINE SIGNIFICANT DIGITS. `%.9g`, never `%g` -- an f32 needs 9 to round-trip
 exactly.

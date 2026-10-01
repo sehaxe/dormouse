@@ -6,7 +6,7 @@
 //! NOT a bit-for-bit comparison, despite this binary's name: both sides are two
 //! of our own formulations of the same recurrence, so it is a self-consistency
 //! dump and there is no external reference. Nothing here asserts anything; the
-//! cross-check is the off-tree FLA/PyTorch run it feeds. See docs/ORACLE.md.
+//! cross-check is the off-tree FLA/PyTorch run it feeds. See docs/protocols/ORACLE.md.
 //!   cargo run --release -p burn-kda --example bitforbit
 
 use burn::prelude::*;

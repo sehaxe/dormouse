@@ -5,7 +5,7 @@
 > **Recommendation: WIRE** — this is the one unwired crate aimed at a problem this
 > project has open: spectral control of a parameter-shared loop (`AGENTS.md:256`).
 > Not wired here because the call site is in `crates/`, which this pass does not own.
-> `docs/library-crate-fate.md` names the call site and the A/B that would earn it.
+> `docs/architecture/library-crate-fate.md` names the call site and the A/B that would earn it.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Burn](https://img.shields.io/badge/Burn-0.22-orange.svg)](https://burn.dev)

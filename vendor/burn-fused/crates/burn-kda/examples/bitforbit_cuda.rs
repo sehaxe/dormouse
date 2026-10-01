@@ -7,7 +7,7 @@
 //! NOT a bit-for-bit comparison, despite this binary's name: the per-token
 //! reference is `burn_kda`'s own `forward_recurrent`, so both sides are ours and
 //! there is no external reference. The printed max-abs diff is the number to
-//! read; the assertion lives in tests/fused_cuda.rs. See docs/ORACLE.md.
+//! read; the assertion lives in tests/fused_cuda.rs. See docs/protocols/ORACLE.md.
 //!   cargo run --release -p burn-kda --example bitforbit_cuda --features cuda
 #![cfg(feature = "cuda")]
 

@@ -60,7 +60,7 @@ tools/            gen_facade.py, gpu-gate.sh, test-feature-matrix.sh
 
 There were 28 crates until 2026-09-28; eight unreachable ones were deleted. The
 per-crate fate table — what each was for, how reachability was measured, why
-each deletion landed — is `docs/library-crate-fate.md` in the dormouse repository.
+each deletion landed — is `docs/architecture/library-crate-fate.md` in the dormouse repository.
 
 ## Use it
 
@@ -113,7 +113,7 @@ they can be trusted:
 |---|---|
 | [`burn-fused/INTEGRATION.md`](burn-fused/INTEGRATION.md) | how to depend on this and what breaks. Current. |
 | [`TEST-AUDIT.md`](TEST-AUDIT.md) | what the tests actually assert, per crate. Dated 2026-09-27, before the deletions. |
-| `docs/ORACLE.md` + `docs/ORACLE-TIERS.tsv` (dormouse repo) | per-comparison tier for `burn-kda`/`burn-gdn2`: **(a)** compared against the authors' own code, **(b)** a transcription, **(c)** a transcription of a transcription, **(d)** nothing external exists, **(x)** not a correctness test. Currently 47 (a), 22 (b), 1 (c), 27 (d), 30 (x). `tools/oracle_gate.py` reads the tsv. |
+| `docs/protocols/ORACLE.md` + `docs/protocols/ORACLE-TIERS.tsv` (dormouse repo) | per-comparison tier for `burn-kda`/`burn-gdn2`: **(a)** compared against the authors' own code, **(b)** a transcription, **(c)** a transcription of a transcription, **(d)** nothing external exists, **(x)** not a correctness test. Currently 47 (a), 22 (b), 1 (c), 27 (d), 30 (x). `tools/oracle_gate.py` reads the tsv. |
 | `bench/RESEARCH_VERIFICATION.md` | dated 2026-08-09, and it has rows for crates that no longer exist. |
 
 Several benches read the clock with no device flush inside the timed loop, so

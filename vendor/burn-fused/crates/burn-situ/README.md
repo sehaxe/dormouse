@@ -4,7 +4,7 @@
 > normal `[dependencies]` entry of `crates/dormouse-core`, read by the expert
 > FFN when `use_situ` is true (`crates/dormouse-core/src/loop_block.rs`, the
 > `use_situ` branch of the expert loop). It was a reference port until then and
-> this banner said so; fate table: `docs/library-crate-fate.md`.
+> this banner said so; fate table: `docs/architecture/library-crate-fate.md`.
 >
 > **Default features only — the fused CUDA kernel below is NOT reachable from
 > the trainer.** It has never executed in any job in this repo

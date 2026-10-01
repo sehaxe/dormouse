@@ -119,7 +119,7 @@ mismatched resumes.
 [`vendor/burn-fused/`](vendor/burn-fused) is our own 20-crate technology
 library — KDA, Engram, spectral/TSCT, Muon+, RMSNorm, JEPA, DSpark, BitNet,
 RoPE, MHC, SiTU and more — each crate with its paper reference and a
-verification tier ([`docs/ORACLE-TIERS.tsv`](docs/ORACLE-TIERS.tsv)). The repo
+verification tier ([`docs/protocols/ORACLE-TIERS.tsv`](docs/protocols/ORACLE-TIERS.tsv)). The repo
 also vendors patched forks of five cubecl/cubek crates (the root
 `Cargo.toml` `[patch.crates-io]` is the authority).
 

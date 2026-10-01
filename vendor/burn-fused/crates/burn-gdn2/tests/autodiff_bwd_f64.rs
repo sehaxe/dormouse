@@ -11,7 +11,7 @@
 // exercised against a kernel. `tests/fused_adjoint_vs_ops.rs` fixed the arm but
 // kept the same ceiling — its reference is burn's autograd over our own ops
 // path, so a MISREADING of the specification is symmetric across both sides and
-// cancels (`docs/ORACLE.md` §2).
+// cancels (`docs/protocols/ORACLE.md` §2).
 //
 // This file's reference is a gradient computed by a DIFFERENT METHOD: forward-
 // mode AD in f64 (`tools/fwd_mode.py`), cross-checked inside the generator by
@@ -27,7 +27,7 @@
 // `src/forward.rs::chunk_wy_forward_batched` with a different matrix
 // inversion), so a shared misreading of the specification would survive. It is
 // not the authors' own bytes; there is no tier-(a) layer in this tree
-// (`docs/ORACLE.md` §3) and this is not one. What it buys is a reference whose
+// (`docs/protocols/ORACLE.md` §3) and this is not one. What it buys is a reference whose
 // expected value does not come from a second implementation of the same
 // DERIVATIVE — which is the property the previous tests lacked. The tolerances
 // below are relative bars with a measured margin on BOTH sides, never a claim of
@@ -64,7 +64,7 @@
 // All 3200 coordinates of all seven inputs. `tests/autodiff_chunk.rs:200` and
 // `tests/ops_batched_autodiff.rs` probe one or six coordinates at a 5% bar; a
 // backward that is wrong at 99% of its coordinates and right at the probed one
-// passes those (`docs/ORACLE.md` §6 B9). The whole tensor is 32x8x8 per
+// passes those (`docs/protocols/ORACLE.md` §6 B9). The whole tensor is 32x8x8 per
 // token-side input at this shape, so there is no reason to sample.
 //
 // # THE FAR SIDE OF THE BAR IS DATA
@@ -494,7 +494,7 @@ fn read_tensor(c: &mut Cursor<&[u8]>) -> (String, Vec<f64>) {
 /// `b_k = kg = k*exp2(gn - gk)`), which is a point in favour of the
 /// transcription and against the Rust, and it is a point, not a measurement.
 /// Settling it needs the authors' own kernel run, which is
-/// `docs/ORACLE.md` §8 candidate (2) and was not attempted.
+/// `docs/protocols/ORACLE.md` §8 candidate (2) and was not attempted.
 ///
 /// # Why it is a test and not a paragraph
 ///

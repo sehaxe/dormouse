@@ -15,7 +15,7 @@ adopting a library that cannot run here and costs more to integrate than the por
 | `ADOPT` | call it at runtime — reachable on our stack and better than the port |
 | `REFERENCE` | do not call it, but verify against its source instead of a hand transcription |
 | `PORT-STANDS` | nothing better exists, or the alternative is not reachable here |
-| `DELETE` | nothing external exists **and** the crate is not worth keeping (cross-referenced against `research/2026-09-27-fused-inventory-*.md`) |
+| `DELETE` | nothing external exists **and** the crate is not worth keeping (cross-referenced against `docs/archive/research/2026-09-27-fused-inventory-attention.md` (and its two siblings)) |
 
 **Evidence rule.** Primary sources only. Every URL in the per-crate section was opened during
 this pass unless the row says `NOT VERIFIED`. The complete list of what was opened is in

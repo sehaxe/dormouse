@@ -109,7 +109,7 @@ fn attention_arms_compose() {
 
     // NoPE (`burn-nope`) used to be exercised here. It was deleted 2026-09-28
     // as unreachable from `crates/dormouse-*` with no reason to stay — see
-    // `docs/library-crate-fate.md` in the dormouse repository. Worth recording
+    // `docs/architecture/library-crate-fate.md` in the dormouse repository. Worth recording
     // that this test was the only thing making it look alive.
 }
 

@@ -162,7 +162,7 @@ source, not through a page invented here.
 
 ### 4. ADR — `adr` (24 pages)
 
-`docs/adr/0001…0023`, one page each, in numeric order. The sidebar label is the
+`docs/adr/0001-bpb-scorecard.md` … `docs/adr/0023-inference-export.md`, one page each, in numeric order. The sidebar label is the
 record number and the page title is the decision statement, because the two are
 different jobs: ADR-0001's first line is "BPB at fixed budget is the score" and
 ADR-0023's is "ADR-0023: the inference export…", so neither heading is

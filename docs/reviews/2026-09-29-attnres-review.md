@@ -1,6 +1,7 @@
 # attnres — two independent reviews, one lane
 
-Merged 2026-10-01 from `research/reviews/attnres-review-a.md` and `research/reviews/attnres-review-b.md`. The halves were written independently
+Merged 2026-10-01 from the `attnres-review-a.md` and `attnres-review-b.md` halves, both at
+`5cfdbda`, which is where a reader finds each one whole. The halves were written independently
 and neither read the other (A: Review of `docs/papers/attnres.md` — independent verification; B: Reviewer B — would following `docs/papers/attnres.md` actually fix `burn-attnres`?),
 which is why both verdicts are kept: where they agree the finding is settled,
 where they disagree the disagreement is the finding. Nothing was reworded.

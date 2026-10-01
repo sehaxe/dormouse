@@ -1,6 +1,6 @@
 //! Is a KDA training step the KERNEL or the ALLOCATOR?
 //!
-//! `docs/research/2026-09-27-kda-sota-ceiling-renamed.md` §2.5 puts the whole question on
+//! `docs/research/2026-09-27-kda-sota-ceiling.md` §2.5 puts the whole question on
 //! one number: the fused chunk kernels' own floor is ~80-100 us, we measure
 //! ~120 ms per call, and the hypothesis is that 248 MB of fresh scratch per
 //! forward misses the cubecl pool. This harness is the test that document asks

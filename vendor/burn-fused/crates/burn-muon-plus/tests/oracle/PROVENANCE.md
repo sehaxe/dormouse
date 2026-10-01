@@ -29,7 +29,7 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  utils/optim/__
 They are byte-identical to
 `https://codeload.github.com/K1seki221/MuonPlus/tar.gz/8a9ace123afedaab8ba75ea0b19315594ae1da7c`.
 **No line of upstream source was edited, including to add a provenance header**,
-which is why `docs/ORACLE-TIERS.tsv` carries a written waiver on these four rows
+which is why `docs/protocols/ORACLE-TIERS.tsv` carries a written waiver on these four rows
 instead of a `github.com` URL in the file: the URL is here, and the sha256 is
 enforced at generation time.
 

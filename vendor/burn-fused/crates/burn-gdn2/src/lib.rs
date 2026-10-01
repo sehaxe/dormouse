@@ -56,7 +56,7 @@
 //!   (it is a fork-CI marker no crate reads); `tools/lib_gate.sh` passes it
 //!   explicitly. It replaced an f32 transcription of this crate's OWN algorithm,
 //!   which could only ever prove self-consistency and had replicate-padded the
-//!   short conv exactly as the kernel wrongly did. See `docs/ORACLE.md` §2-§3
+//!   short conv exactly as the kernel wrongly did. See `docs/protocols/ORACLE.md` §2-§3
 //!   and the header of `tests/oracle_breadth.rs`.
 
 pub mod alloc_trace;

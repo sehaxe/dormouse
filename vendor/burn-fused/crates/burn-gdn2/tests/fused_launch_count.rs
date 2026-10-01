@@ -12,7 +12,7 @@
 //! adjoint is the only consumer of.
 //!
 //! The reference is two hand-written kernels
-//! (`research/papers/spec-flashkda.md` §1: `fwd_kernel1.cuh` 587 lines +
+//! (`docs/papers/spec-flashkda.md` §1: `fwd_kernel1.cuh` 587 lines +
 //! `fwd_kernel2.cuh` 840 lines), so three was one too many on the module path.
 //!
 //! Run: cargo test --release --features "cuda,autodiff" --test fused_launch_count -- --nocapture

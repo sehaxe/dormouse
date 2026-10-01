@@ -4,7 +4,7 @@
 > depends on this one; the incoming edges are `benches/cpu_probe` and the `burn-fused`
 > facade. The FFN it would replace is a line of `burn::activation::silu`, so adopting
 > it would add a dependency to save nothing. Kept as a **reference port** because the
-> probe measures its fused kernel; fate table: `docs/library-crate-fate.md`.
+> probe measures its fused kernel; fate table: `docs/architecture/library-crate-fate.md`.
 
 > CI: this badge's workflow was deleted (`4963c3a`) — the gate is `../../.github/workflows/fused-library.yml`, and it has no GPU job (for CUDA: `tools/gpu-gate.sh`).
 [![Crates.io](https://img.shields.io/crates/v/burn-swiglu)](https://crates.io/crates/burn-swiglu)

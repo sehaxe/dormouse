@@ -50,7 +50,7 @@
 //! with a green twin proving the mechanism already honours the scale when asked.
 //! Changing `1.0` moves every number derived from this crate, so it is the
 //! owner's call. Arithmetic and citations:
-//! `research/papers/kda-formula-audit-2026-09-30.md` §3.2.
+//! `docs/reviews/2026-09-30-kda-formula-audit.md` §3.2.
 //!
 //! # Decay init: `a_log = -3`, `b_alpha = +1` is OURS, and it is not a citation
 //!

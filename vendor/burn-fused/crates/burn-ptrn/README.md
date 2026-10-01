@@ -6,7 +6,7 @@
 > parameter-shared loop, but the mechanism as written scores rollouts with a
 > **learned Q-head that ADR-0013 deleted with PonderNet** — `AGENTS.md:645` records
 > that the selection rule must be re-specified before this crate can be used at all.
-> Fate table: `docs/library-crate-fate.md`.
+> Fate table: `docs/architecture/library-crate-fate.md`.
 
 > CI: this badge's workflow was deleted (`4963c3a`) — the gate is `../../.github/workflows/fused-library.yml`, and it has no GPU job (for CUDA: `tools/gpu-gate.sh`).
 [![Crates.io](https://img.shields.io/crates/v/burn-ptrn)](https://crates.io/crates/burn-ptrn)
