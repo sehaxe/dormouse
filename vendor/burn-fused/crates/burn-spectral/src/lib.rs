@@ -129,6 +129,25 @@ pub fn ste_ternary_per_column(w: Tensor<2>) -> Tensor<2> {
     w.clone().add(t.sub(w).detach())
 }
 
+/// The quintic's coefficients: `p(s) = NS_A·s + NS_B·s³ + NS_C·s⁵`.
+///
+/// `(15/8, −5/4, 3/8)` — PolarExpress's optimal quintic, cited at the two
+/// loops below and pinned as (a) against the authors' own `optimal_quintic`
+/// (`research/papers/spectral-reference.md` §1.2). All three are **dyadic**, so
+/// `f32` represents them exactly and no tolerance is involved anywhere.
+///
+/// One definition, three uses: `polar_orthogonalize`,
+/// `polar_orthogonalize_batched`, and the test-only
+/// `polar_orthogonalize_host_read` that pins the sync-free rewrite. They were
+/// three literals until 2026-10-01, which meant the audit's gate for the
+/// polynomial had to re-spell the polynomial to test it — so a change to the
+/// production coefficients could not turn it red, and the gate that exists to
+/// pin them was blind to them. Read
+/// `the_quintic_basin_is_sqrt_7_over_3`, which now reads THESE constants.
+const NS_A: f32 = 15.0 / 8.0;
+const NS_B: f32 = -5.0 / 4.0;
+const NS_C: f32 = 3.0 / 8.0;
+
 /// Power-iteration count for the sigma_max estimate (Gram top eigenvalue).
 ///
 /// **What the count buys, measured, and what it does not.** The Rayleigh
@@ -300,7 +319,7 @@ pub fn polar_orthogonalize(x: Tensor<2>, iters: usize) -> Tensor<2> {
     m = m.div(sigma.mul_scalar(1.05));
     // Newton-Schulz in X·Xᵀ form (small side [c,c], same as Muon+):
     // x <- a·x + (b·XXᵀ + c·(XXᵀ)²)·x, optimal NS coefficients
-    let (a, b, c) = (15.0f32 / 8.0, -5.0f32 / 4.0, 3.0f32 / 8.0);
+    let (a, b, c) = (NS_A, NS_B, NS_C);
     for _ in 0..iters {
         let xx = m.clone().matmul(m.clone().transpose()); // [r, r]
         let xx2 = xx.clone().matmul(xx.clone());
@@ -351,7 +370,7 @@ pub fn polar_orthogonalize_batched(x: Tensor<3>, iters: usize) -> Tensor<3> {
     let vv = v.clone().mul(v).sum_dim(1).sum_dim(2);
     let sigma = vgv.div(vv.clamp_min(1e-14)).sqrt().clamp_min(1e-7);
     m = m.div(sigma.mul_scalar(1.05));
-    let (a, b, c) = (15.0f32 / 8.0, -5.0f32 / 4.0, 3.0f32 / 8.0);
+    let (a, b, c) = (NS_A, NS_B, NS_C);
     for _ in 0..iters {
         let xx = m.clone().matmul(m.clone().transpose());
         let xx2 = xx.clone().matmul(xx.clone());
@@ -1601,7 +1620,7 @@ mod tests {
         let vv = v.clone().mul(v.clone()).sum().into_scalar::<f32>();
         let sigma = (vgv / vv.max(1e-14)).sqrt().max(1e-7);
         m = m.div_scalar(sigma * 1.05);
-        let (a, b, c) = (15.0f32 / 8.0, -5.0f32 / 4.0, 3.0f32 / 8.0);
+        let (a, b, c) = (NS_A, NS_B, NS_C);
         for _ in 0..iters {
             let xx = m.clone().matmul(m.clone().transpose()); // [r, r]
             let xx2 = xx.clone().matmul(xx.clone());
@@ -2426,7 +2445,6 @@ mod tests {
         let gs: Vec<f32> = m.s.grad(&grads).unwrap().into_data().try_to_vec().unwrap();
         assert!(gs.iter().any(|&x| x.abs() > 1e-8), "all-zero gradient on s");
     }
-}
 
     // ---------------------------------------------------------------------
     // The 2026-10-01 formula audit. Class-A gates: each one pins a number a
@@ -2435,11 +2453,23 @@ mod tests {
     // bottom of this module, with their reasons.
     // ---------------------------------------------------------------------
 
-    /// The scalar polynomial the NS loop applies to each singular value:
-    /// `p(s) = 15/8 s − 5/4 s³ + 3/8 s⁵`. Written out here rather than
-    /// imported so the test and the comment are the same object.
+    /// The scalar polynomial the NS loop applies to each singular value,
+    /// `p(s) = a·s + b·s³ + c·s⁵`, built from the PRODUCTION constants.
+    ///
+    /// **Read from [`NS_A`]/[`NS_B`]/[`NS_C``, not re-spelled.** This started
+    /// life as a literal copy of the same three numbers, and the copy is what
+    /// made the gate a decoration: the first falsification run (`falsify.sh`
+    /// section A) perturbed the production coefficients and this function did
+    /// not move, so `the_quintic_basin_is_sqrt_7_over_3` stayed GREEN on a
+    /// quintic the crate no longer had. A gate for a constant that tests a
+    /// private copy of it is a gate for the copy.
     fn p(s: f64) -> f64 {
-        15.0 / 8.0 * s - 5.0 / 4.0 * s.powi(3) + 3.0 / 8.0 * s.powi(5)
+        // NS_B is already negative (-5/4), so the signs are the CONSTANT'S, not
+        // the operator's: this reads a*s + b*s^3 + c*s^5. Writing `- b*s^3` (as
+        // the previous literal `15/8 s - 5/4 s^3 + ...` invites) silently turns
+        // -5/4 into +5/4 and the gate caught exactly that on its first run.
+        let (a, b, c) = (NS_A as f64, NS_B as f64, NS_C as f64);
+        a * s + b * s.powi(3) + c * s.powi(5)
     }
 
     /// GATE for the corrected basin claim (`lib.rs`, the
@@ -2460,10 +2490,17 @@ mod tests {
     fn the_quintic_basin_is_sqrt_7_over_3() {
         let edge = (7.0f64 / 3.0).sqrt();
         assert!((edge - 1.527_525_231_65).abs() < 1e-10, "sqrt(7/3) = {edge}");
+        // The three production constants ARE the dyadic rationals, exactly.
+        // Everything below asserts with a tolerance because the arithmetic is
+        // f64; this line is why the tolerances are 1e-15 and not 1e-3.
+        assert_eq!((NS_A, NS_B, NS_C), (1.875, -1.25, 0.375), "the quintic's coefficients moved");
         // p(1) = 1 and p'(1) = 0: the fixed point is superattracting, which is
         // the REAL reason an input anywhere in the basin is safe.
         assert!((p(1.0) - 1.0).abs() < 1e-15, "p(1) = {}", p(1.0));
-        let dp = |s: f64| 15.0 / 8.0 - 15.0 / 4.0 * s * s + 15.0 / 8.0 * s.powi(4);
+        let dp = |s: f64| {
+            let (a, b, c) = (NS_A as f64, NS_B as f64, NS_C as f64);
+            a + 3.0 * b * s * s + 5.0 * c * s.powi(4)
+        };
         assert!(dp(1.0).abs() < 1e-15, "p'(1) = {}", dp(1.0));
         // p'(s) = (15/8)(s²−1)², the identity the doc comment asserts.
         for s in [0.1, 0.5, 0.95, 1.4, 1.5] {
@@ -2478,9 +2515,17 @@ mod tests {
         assert!(dp(edge) > 1.0, "p'(edge) = {} must repel", dp(edge));
         // and the scalar iteration's own verdict, which is what matters:
         // just inside converges to 1, just outside explodes.
+        //
+        // "Explodes" is tested as `!finite || |x| > 1e6`. Sixty iterations of a
+        // quintic past the basin edge overflow f64 to `inf` and then to `NaN`
+        // (inf - inf), and both are divergence — asserting on the magnitude
+        // alone would fail on the very cases it exists to catch.
         let run = |mut s: f64| {
             for _ in 0..60 {
                 s = p(s);
+                if !s.is_finite() {
+                    return s;
+                }
             }
             s
         };
@@ -2492,10 +2537,10 @@ mod tests {
             );
         }
         for s in [1.53, 1.6, 2.0] {
+            let x = run(s);
             assert!(
-                run(s).abs() > 1e6,
-                "start {s} is OUTSIDE sqrt(7/3) and must diverge, got {}",
-                run(s)
+                !x.is_finite() || x.abs() > 1e6,
+                "start {s} is OUTSIDE sqrt(7/3) and must diverge, got {x}"
             );
         }
     }
@@ -2525,13 +2570,47 @@ mod tests {
         // sigma_max = s_0 = 1 by construction. No RNG, no eigendecomposition.
         let basis = ortho_factor_768x64(&dev);
         let run = |s: &[f32]| -> (f32, f32) {
-            // X with the prescribed singular values
-            let mut x = basis.clone().mul_scalar(0.0);
+            // X with the prescribed singular values: EACH COLUMN gets its own
+            // scale. `x = x.add(basis.slice(..).mul_scalar(si))` — the obvious
+            // spelling — adds a [768,1] into a [768,64] and therefore fills
+            // every column with the running sum, making X 64x too large; it
+            // was caught by the numpy dry-run, and the estimate it produced
+            // (64.0 for a true sigma_max of 1.0) is the tell.
+            let mut x = Tensor::<2>::zeros([768, 64], &dev);
             for (i, &si) in s.iter().enumerate() {
-                x = x.add(basis.clone().slice([0..768, i..i + 1]).mul_scalar(si));
+                x = x.slice_assign(
+                    [0..768, i..i + 1],
+                    basis.clone().slice([0..768, i..i + 1]).mul_scalar(si),
+                );
             }
-            // the estimate, computed exactly as lib.rs:229-248 does
-            let g = x.clone().matmul(x.clone().transpose());
+            // the fixture claims X's singular values ARE s; assert it, because
+            // a fixture that does not is what made the first version of this
+            // gate a decoration
+            let g = x.clone().transpose().matmul(x.clone());
+            for (i, &si) in s.iter().enumerate() {
+                let d = g.clone().slice([i..i + 1, i..i + 1]).into_scalar::<f32>();
+                assert!(
+                    (d - si * si).abs() < 1e-4 * si * si,
+                    "fixture column {i} has (XᵀX)_ii = {d}, not s_i^2 = {}",
+                    si * si
+                );
+            }
+            // the estimate, computed exactly as lib.rs:208-248 does — INCLUDING
+            // the canonical transpose at lib.rs:211-215. A `[768,64]` factor
+            // is transposed first so the Gram is the `[64,64]` small-side one.
+            // Skipping that step forms the `[768,768]` Gram instead, which is a
+            // DIFFERENT matrix with a different spectrum: its top eigenvalue is
+            // still 1.0, so the estimate comes back exact and the gate goes
+            // green over the finding. That is the third instance of this exact
+            // error in this audit (the others in the numpy dry-run and in this
+            // test's fixture construction), which is why it is now asserted
+            // rather than assumed.
+            let canonical = if x.dims()[0] > x.dims()[1] {
+                x.clone().swap_dims(0, 1)
+            } else {
+                x.clone()
+            };
+            let g = canonical.clone().matmul(canonical.transpose());
             let mut v = g.clone().sum_dim(1).squeeze_dim::<1>(1);
             for _ in 0..POWER_ITERS {
                 let vn = v.clone().mul(v.clone()).sum_dim(0).sqrt().clamp_min(1e-12);
@@ -2563,6 +2642,10 @@ mod tests {
             (est_flat - 1.0).abs() < 1e-5,
             "on the manifold the estimate must be exact, got {est_flat}"
         );
+        assert!(
+            est_flat <= frob_flat,
+            "Cauchy-Schwarz bounds a Rayleigh quotient by ||X||_F: est {est_flat} > {frob_flat}"
+        );
         let prescaled_flat = 1.0 / (est_flat * 1.05);
         assert!(
             prescaled_flat < 1.0,
@@ -2573,22 +2656,29 @@ mod tests {
         // prescaled input goes ABOVE 1.0. This is the falsified claim, on a
         // fixture whose true sigma_max is exactly 1.0.
         //
-        // The fixture is a NEAR-FLAT spectrum (every singular value 0.9), and
-        // that is the honest worst case rather than a convenient one: a flat
-        // Gram is exactly where `(λ2/λ1)^k` decays slowest, so it is where the
-        // power iteration is worst. A steep log-spaced spectrum (1 → 0.01, the
-        // obvious choice) measures only 1.4% of error, because the
-        // eigenvectors are then well separated. Measured, f32: flat-0.9 gives
-        // est/σ₁ = 0.900 and a prescaled input of 1.0582; log-spaced-1→0.01
-        // gives 0.986 and 0.9658. The flat one is the one that refutes the
-        // comment.
-        for (label, s) in [("flat 0.9", vec![0.9f32; 64]), ("two-level 1/0.9", {
-            let mut t = vec![1.0f32; 64];
-            t[1..].fill(0.9);
-            t
-        })] {
+        // The fixture is a NEAR-FLAT spectrum with `s_0 = 1.0` and every other
+        // singular value 0.9, so the factor's true sigma_max is exactly 1.0.
+        //
+        // Near-flat, not steep, because a flat Gram is exactly where
+        // `(λ2/λ1)^k` decays slowest — it is where the power iteration is
+        // worst. The obvious alternative, a log-spaced spectrum 1 → 0.01,
+        // measures only **1.4%** of error in f32 (est 0.986, prescaled 0.9658)
+        // and would NOT have refuted the comment. It is recorded here as the
+        // counter-example rather than used, so the choice is visible.
+        //
+        // And it is not "all singular values 0.9" — that was the first attempt
+        // and it CANNOT fail: the whole matrix is then a scalar multiple of an
+        // orthonormal factor, the Gram is 0.81·I, and the estimate is exact
+        // whatever sigma_max is (it reads 0.900000000, and the prescale is
+        // 1/1.05 by construction). A fixture that cannot fail is a fixture to
+        // delete. The two-level fixture measures f32 est/σ₁ = 0.917352 and a
+        // prescaled input of 1.038185; `tests/oracle/sec4_fixed.py` §4 is the
+        // f64 sweep behind "30–39 % of draws over 5 %".
+        let mut two_level = vec![0.9f32; 64];
+        two_level[0] = 1.0;
+        for (label, s) in [("two-level 1/0.9", two_level)] {
             let (est, frob) = run(&s);
-            let true_smax = 1.0f32; // by construction: s[0] = 1 in both
+            let true_smax = s[0]; // = 1.0 by construction
             assert!(
                 est <= true_smax,
                 "{label}: a Rayleigh quotient cannot exceed lambda_max: \
@@ -2604,6 +2694,11 @@ mod tests {
                 (1.0 - est / true_smax) * 100.0
             );
             assert!(
+                est < true_smax,
+                "{label}: this fixture must UNDER-estimate or it cannot refute the \
+                 comment; it returned {est} against a true {true_smax}"
+            );
+            assert!(
                 prescaled > 1.0,
                 "{label}: the prescaled NS input is {prescaled:.6}, not above 1.0 — \
                  the estimate was not low enough on this fixture to reproduce the \
@@ -2616,9 +2711,14 @@ mod tests {
                 "{label}: prescaled {prescaled} left the basin"
             );
             // 3. and the retraction still lands on sigma_max = 1 anyway
-            let mut x = basis.clone().mul_scalar(0.0);
+            // (same per-column construction as `run`; see the note there on why
+            // `add` of a [768,1] is wrong)
+            let mut x = Tensor::<2>::zeros([768, 64], &dev);
             for (i, &si) in s.iter().enumerate() {
-                x = x.add(basis.clone().slice([0..768, i..i + 1]).mul_scalar(si));
+                x = x.slice_assign(
+                    [0..768, i..i + 1],
+                    basis.clone().slice([0..768, i..i + 1]).mul_scalar(si),
+                );
             }
             let r = polar_orthogonalize(x, 3);
             let k = r.dims()[1] as f32;
@@ -2727,12 +2827,17 @@ mod tests {
             for (i, si) in s.iter_mut().enumerate() {
                 *si = spread.powf(i as f32 / (k - 1) as f32);
             }
-            let m = q
-                .clone()
-                .matmul(Tensor::<2>::from_data(
-                    burn::tensor::TensorData::new(s, [k, k]),
-                    &dev,
-                ));
+            let mut diag = Tensor::<2>::zeros([k, k], &dev);
+            for (i, &si) in s.iter().enumerate() {
+                diag = diag.slice_assign(
+                    [i..i + 1, i..i + 1],
+                    Tensor::<2>::from_data(
+                        burn::tensor::TensorData::new(vec![si], [1, 1]),
+                        &dev,
+                    ),
+                );
+            }
+            let m = q.clone().matmul(diag);
             let r = polar_orthogonalize(m, 3);
             let pe = ortho_err_per_entry(&r);
             eprintln!(
@@ -2853,7 +2958,7 @@ mod tests {
         let eye = Tensor::<2>::eye(c, &dev);
         let m = proj
             .clone()
-            .add(eye.clone().sub(proj).mul_scalar(LAM_REST.sqrt()));
+            .add(eye.clone().sub(proj.clone()).mul_scalar(LAM_REST.sqrt()));
         // the identity the fixture claims, asserted
         let gram = m.clone().matmul(m.clone().transpose());
         let want = proj
@@ -2973,20 +3078,34 @@ mod polar_diag {
         // `research/reviews/spectral-audit-2026-10-01.md` §2; the number is
         // now pinned by `the_quintic_basin_is_sqrt_7_over_3`.)
         // Spectral-norm scaling keeps
-        // sigma_max ≈ 1, so NS stays bounded and converges. Note: a square
-        // random matrix has a full singular-value spectrum (condition number
-        // ~ n), so 3 cubic NS iters only partially converge it (bounded by
-        // sqrt(512) ≈ 23, vs 1e14 diverged); enough iters give a fully
-        // orthonormal Q. Tall/wide cases (σ concentrated ≈ 1) are orthonormal
-        // in 3 iters.
+        // sigma_max ≈ 1, so NS stays bounded and converges. A square matrix has
+        // a full singular-value spectrum (condition number ~ n), so a few NS
+        // iterations only PARTIALLY converge it, and **how many is a function of
+        // the draw's condition number, not a constant**. Tall/wide cases (σ
+        // concentrated ≈ 1) are orthonormal in 3 iterations.
+        //
+        // The convergence assertion here USED to be the absolute `e20 < 1e-2`,
+        // on a `Tensor::random` draw, and it was red on the 2026-10-01 audit
+        // run. That is not a flake in the retraction: burn's global RNG is never
+        // seeded (AGENTS.md 3.7), so the draw differs per process, and measured
+        // over 20 independent `[512,512]` draws in f64 the 20-iteration error is
+        // **1.7e-14 at the median but up to 1.2e-1** — 5% of draws miss 1e-2.
+        // So the absolute bound was never a property of the algorithm at 20
+        // iterations; it was a property of one lucky draw. It is now relative,
+        // which IS draw-independent and still fails the regression it guards:
+        // divergence is a jump, not a gradual worsening.
         let dev = Device::ndarray();
-        // square: no divergence at 3 iters, orthonormal at 20
+        // square: no divergence at 3 iters, and 20 iters is orders better
         let x = Tensor::<2>::random([512, 512], Distribution::Normal(0.0, 1.0), &dev);
         let e3 = ortho_error(&polar_orthogonalize(x.clone(), 3));
         let e20 = ortho_error(&polar_orthogonalize(x, 20));
         println!("polar [512x512] err(3)={e3:.3e} err(20)={e20:.3e}");
         assert!(e3 < 100.0, "square 3-iter diverged: {e3}");
-        assert!(e20 < 1e-2, "square 20-iter not orthonormal: {e20}");
+        assert!(
+            e20 < e3 / 100.0,
+            "20 iterations must be far better than 3 on a square matrix \
+             (it is the convergence the retraction is FOR): {e3} -> {e20}"
+        );
         // tall/wide: orthonormal in 3 iters (wide checked via its transpose,
         // since a [64,512] polar factor has orthonormal rows, not columns)
         for [m, n] in [[4096, 512], [512, 64]] {

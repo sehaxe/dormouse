@@ -44,6 +44,14 @@ def gram_iter(M, iters):
     return M
 
 
+def dct_orthonormal(n, k):
+    """The first k DCT-II modes: orthonormal BY CONSTRUCTION, no RNG."""
+    i = torch.arange(n, dtype=torch.float64).unsqueeze(1)
+    j = torch.arange(k, dtype=torch.float64).unsqueeze(0)
+    scale = torch.where(j == 0, n**-0.5, (2.0 / n) ** 0.5)
+    return scale * torch.cos(torch.pi * (2 * i + 1) * j / (2 * n))
+
+
 def make(l2, delta, lam_rest=0.05, seed=0):
     g = torch.Generator().manual_seed(seed)
     one = torch.ones(K, 1, dtype=torch.float64)
@@ -86,12 +94,18 @@ def main():
         g = torch.Generator().manual_seed(seed)
         M = torch.randn(K, 4, dtype=torch.float64, generator=g)
         cases.append(("gauss", M))
+    # and the ONE case the audit's verdict rests on: an ORTHONORMAL [768,64]
+    # factor, i.e. exactly what the retraction receives in the steady state.
+    # sigma_max = 1 and ||X||_F = sqrt(64) = 8, so ||X||_F/1.604 = 4.99 > 1 and
+    # the `max` must select the Frobenius bound ALWAYS. The other gauss rows
+    # are [64,4] and would NOT show that, which is why this row exists.
+    cases.append(("onmanifold", dct_orthonormal(768, 64)))
 
     n_worse = 0
     for c in cases:
-        if c[0] == "gauss":
+        if c[0] in ("gauss", "onmanifold"):
             M = c[1]
-            lbl = f"gauss[{K}x4] seed{c[1].shape[0]}"
+            lbl = f"{c[0]}[{M.shape[0]}x{M.shape[1]}]"
         else:
             l2, delta = c
             M = make(l2, delta, seed=5)
@@ -102,8 +116,10 @@ def main():
         guarded = max(est, frob / GUARD)
         o_now = gram_iter(M / (now * SAFETY), 3)
         o_g = gram_iter(M / (guarded * SAFETY), 3)
-        # quality: per-entry ortho of the guarded result
-        pe = ((o_g.T @ o_g - torch.eye(K, dtype=torch.float64)).norm() / K).item()
+        # (there was a per-entry ortho_error of the guarded result here, unused
+        # and, on the [K,4] rows, a shape crash against torch.eye(K) - the
+        # question this script answers is WHICH DIVISOR WINS, not how good the
+        # output is, so it is gone rather than fixed.)
         same = abs(guarded - est) < 1e-12
         if not same:
             n_worse += 1
@@ -113,9 +129,16 @@ def main():
             f"{'' if same else '  <- guard engaged'}"
         )
     print()
-    print(f"  the guard engaged on {n_worse}/{len(cases)} cases.")
-    print("  On the four well-behaved Gaussian factors it must NOT engage, or it")
-    print("  is silently the Frobenius prescale the audit says not to remove.")
+    print(f"  MEASURED: the guard engaged on {n_worse}/{len(cases)} cases.")
+    print("  Including every WELL-BEHAVED factor: the four [64,4] Gaussians and")
+    print("  the orthonormal [768,64] (sigma_max = 1 exactly, ||X||_F = 8, so")
+    print("  ||X||_F/1.604 = 4.99 wins the max against a correct estimate of 1).")
+    print("  THAT is the finding the guard was proposed against: it does not only")
+    print("  catch the diverging cases, it silently replaces the sigma_max")
+    print("  prescale with the Frobenius one on the shape the trainer actually")
+    print("  retracts - so it converges, and converges to the wrong place. The")
+    print("  two `out` columns above are entry magnitudes, not sigma_max; the")
+    print("  sigma_max consequence is measured in spectral-reference.md 3.4.")
     print()
     print("  AND the cost: one extra Frobenius norm per factor, which is a")
     print("  reduction on an already-reduced tensor - the same shape of op as")

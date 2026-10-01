@@ -572,7 +572,7 @@ designed behaviour and naming them as defects would be wrong:**
 | gate | pins | green? |
 |---|---|---|
 | `the_quintic_basin_is_sqrt_7_over_3` | `p(1)=1`, `p'(1)=0`, `p'(s)=(15/8)(s²−1)²`, the edge `√(7/3)`, `p'(edge)=10/3>1` repels, scalar 1.52 converges and 1.53 diverges — **the number that replaced "√3"** | green |
-| `the_sigma_estimate_is_a_lower_bound_and_the_1_05_factor_is_not_what_saves_it` | on the manifold the estimate is exact and the prescaled input is under 1 (**the case the old comment was written about, and it is TRUE there — which is why the bug survived**); on a near-flat spectrum the estimate is **10.0% low** and the prescaled input is **1.0582, above 1.0** (**the refuted claim, now falsifiable in-tree**); and the retracted σ_max is 1 regardless | green |
+| `the_sigma_estimate_is_a_lower_bound_and_the_1_05_factor_is_not_what_saves_it` | on the manifold the estimate is exact and the prescaled input is under 1 (**the case the old comment was written about, and it is TRUE there — which is why the bug survived**); on a near-flat two-level spectrum (`s = 1, 0.9 x 63`) the estimate is **8.3% low** and the prescaled input is **1.0382, above 1.0** (**the refuted claim, now falsifiable in-tree**); and the retracted σ_max is 1 regardless | green |
 | `retraction_error_grows_with_spectral_spread` | B-1 | **red on purpose** (`#[ignore]`) |
 | `sigma_max_estimate_diverges` | B-2 | **red on purpose** (`#[ignore]`) |
 
@@ -600,9 +600,25 @@ build slot costs 20 minutes of queue) caught all of them before cargo did.
    the estimate is only **1.4%** low — precisely the case that would *not*
    have refuted the comment, i.e. a cherry-picked fixture. A **near-flat**
    spectrum is the honest worst case, because a flat Gram is exactly where
-   `(λ₂/λ₁)^k` decays slowest: **10.0%** low, prescaled input **1.0582**. The
-   log-spaced case is **kept in the test as a recorded counter-example** so
-   the choice is visible rather than convenient.
+   `(λ₂/λ₁)^k` decays slowest. **Both** candidate fixtures were then measured
+   (f32, `s[0] = 1` in each, so the factor's true σ_max is exactly 1):
+
+   | fixture | est/σ₁ | prescaled | can it refute? |
+   |---|---|---|---|
+   | log-spaced 1 → 0.01 | 0.9861 | 0.9658 | **no** — the input stays under 1 |
+   | every `s = 0.9` | 0.9000 | 1.0582 | **no, and for a worse reason** (below) |
+   | `s[0] = 1`, rest 0.9 | 0.9174 | **1.0382** | **yes** — this is the landed fixture |
+
+   The middle row is why the landed fixture is two-level and not "all 0.9".
+   An all-0.9 factor is a scalar multiple of an orthonormal one, its Gram is
+   exactly `0.81·I`, and the estimate is therefore **exact whatever σ_max is**
+   — it read 0.900000000 on the nose. It produces the most dramatic number in
+   the table and **cannot fail**: a fixture that cannot fail is a fixture to
+   delete. The log-spaced case is kept as a **recorded counter-example in the
+   test's own comment**, with its number, so the choice is visible rather than
+   convenient — and the landed fixture asserts `est < true_smax` explicitly, so
+   a future "improvement" to a fixture that stops under-estimating trips the
+   gate instead of quietly making it unrefutable.
 
 And the dry-run itself had to learn the canonical transpose (`lib.rs:211-215`)
 before it agreed with the Rust. Without it the dry-run formed the `[768,768]`
@@ -614,21 +630,32 @@ of harness, and it is invisible unless the disagreement is looked for.
 
 `tests/oracle/falsify.sh` perturbs each green gate and reverts:
 
-- **A** — the quintic's `c` coefficient by 1e-3, in **both** the scalar and
-  the batched arm (the script asserts it found 2 occurrences, so a refactor
-  that adds a third arm cannot silently skip the perturbation). Expected red
-  on the basin gate *and* on the manifold gate.
-- **B** — the 1.05 factor → 1.00. **Expected to stay green, and the reason is
-  the finding**: `p'(1)=0` means the factor is a nudge, not a guarantee, so a
-  test asserting it mattered would be asserting the refuted claim. This is
-  the one gate whose *green* result is the evidence.
+- **A** — the quintic's `c` coefficient by 1e-3, at its **one** definition
+  (`NS_C`), which the scalar arm, the batched arm and the basin gate all read.
+  Expected red on the basin gate *and* on the manifold gate.
+- **B** — the 1.05 prescale factor → 1.00 in the **sync-free arm only** (2
+  sites, asserted), leaving the host-read fixture at 1.05. Expected **red**:
+  `sync_free_retraction_is_bit_identical_to_the_host_read_one` compares the two
+  elementwise, and one arm moving is the mutation it exists to catch.
+  *This bullet was wrong twice and both corrections are in §13.4.* The first
+  version predicted **green** ("the factor is only a nudge, so nothing should
+  notice") — which is a property of the ALGORITHM, not of this gate, and it
+  predicted green of a gate that had never been asked about the factor. The
+  second version perturbed **both** arms and therefore could not fail at all.
 - **C** — the class-A gate rewritten to assert the **refuted** claim.
   Expected **red**: a gate that cannot fail on the thing it exists to deny is
   not a gate.
-- **D** — both class-B tests run explicitly. Expected **red with their
-  stated magnitudes**; an `#[ignore]`d test that would pass is a decoration.
+- **D** — both class-B tests run explicitly with `--ignored --nocapture`.
+  Expected **red with their stated magnitudes**; an `#[ignore]`d test that would
+  pass is a decoration, and so is one that goes red on an assertion other than
+  the one it names (the script greps for the message, not for a non-zero exit).
 - **E** — the restore is checked by **sha256**, not by exit code, and then the
   suite must be green.
+
+Every one of these perturbations asserts the **exact number of sites** it edits.
+That is not decoration either: it is what stopped section B's first version
+from being a no-op by accident, and it is why A now edits a constant that
+exists once instead of a literal that existed three times.
 
 ---
 
@@ -665,3 +692,166 @@ Named, so the next reader does not over-read it:
    already-registered** finding (AGENTS.md §3.7, the 1-ULP QR residue) and was
    not re-investigated.
 
+
+---
+
+## 13. The landing — 2026-10-01, on `main`
+
+The four commits of `wt/spectral-audit` (`4a68f72`, `93d82a1`, `0b580a7`,
+`c78e36e`) landed as three cherry-picks, because `4a68f72` and `7811191` are
+**the same commit**: identical tree content for both of its files, verified with
+`git diff 4a68f72 main -- <both files>` (empty). `7811191` is already on `main`,
+so re-landing it would have put a duplicate of the same content in the history
+twice. The three that follow it are the work.
+
+### 13.1 The twin, and the file it overwrote
+
+Two lanes wrote `research/reviews/spectral-audit-2026-10-01.md`, **two
+different documents**, 97 seconds apart, with nothing to detect the collision:
+
+| | `3e1812b` | `7811191` (twin) | this lane |
+|---|---|---|---|
+| subject | `burn-sct` and the seam between the crates | the NS retraction's formulas | findings 1–5 of the formulas |
+| lines | 494 | 218 | 667 |
+| tools | `tools/polar_probe.rs` | `audit_2026_10_01.py` | 5 more oracles + `falsify.sh` |
+
+`7811191` **replaced** `3e1812b`'s 494 lines with its own 218 — an add/add that
+git resolved silently because the second writer did not read the first. The lost
+494 lines are `burn-sct`'s site-by-site descent, the seam finding (zero non-dev
+call sites, no crate under `crates/` depends on `burn-sct`), and the retraction's
+cost/benefit pricing. Restored byte-for-byte from `3e1812b` as
+[`spectral-stack-audit-2026-10-01.md`](spectral-stack-audit-2026-10-01.md),
+under the name its own H1 gives it. **Not a union**: the two documents are about
+different crates and a union would be 1000 lines about two things.
+
+Preserved from the twin, unchanged: `tools/polar_probe.rs`,
+`research/spectral-inventory-2026-10-01.md`, and the twin's `audit_2026_10_01.py`
+— which is byte-identical to this lane's copy **except** for the §5 fixture fix
+this lane made (`print_5` retracted a raw Gaussian, which is *outside* the basin
+and diverges at 20 iterations, so the comparison measured a diverged basis). The
+branch's copy is the union.
+
+### 13.2 Per-file decisions
+
+| file | decision | why |
+|---|---|---|
+| `research/reviews/spectral-audit-2026-10-01.md` | **branch** | findings 1–5 + the gate register; the twin's 218 lines are a strict prefix of it (§0–§4 are identical) |
+| `research/reviews/spectral-stack-audit-2026-10-01.md` | **restored from `3e1812b`** | the content the twin overwrote; see §13.1 |
+| `burn-spectral/tests/oracle/audit_2026_10_01.py` | **union (branch = twin + 19 lines)** | the branch is a superset: same file, plus the §5 fixture fix |
+| `burn-spectral/tests/oracle/{sec4_fixed,sec4c_tolerance,sec4d_guard,sec5_6b,gate_dryrun}.py` | **branch** | new; the twin has none |
+| `burn-spectral/tests/oracle/falsify.sh` | **branch + §13.3** | new; the twin has none |
+| `burn-spectral/src/lib.rs` | **branch + §13.4** | the twin's `7811191` did not touch it; the audit's 3 comment corrections + 4 gates + 2 red-on-purpose tests are all here |
+| `docs/ORACLE-TIERS.tsv` | **hand-inserted, 7 rows** | R1 coverage for the six new `.py` files. `tools/gen_oracle_tiers.py` was NOT run — see the file's own header, which records that it has destroyed 22 rows once |
+| `tools/polar_probe.rs`, `research/spectral-inventory-2026-10-01.md` | **main, untouched** | the twin's instruments; the branch never had them |
+
+### 13.3 `SIGMA_OVERSHOOT` — a correction to the landing brief
+
+The brief for this landing said to keep "`SIGMA_OVERSHOOT` const + the rewritten
+POWER_ITERS/1.05 comments from the tsct-diag lane `8a9bd7c`/`2254c7c`". **Main
+never gained either**: `git grep SIGMA_OVERSHOOT main` returns nothing, and
+`git log 8f97411d..main -- vendor/burn-fused/crates/burn-spectral/` lists only
+`7811191` (docs). The const is on `wt/tsct-diag`, which is **unlanded**, and its
+`lib.rs` hunk is a different-lane commit.
+
+So: the comment wording is unified, in favour of **this** document's version,
+because it is the deeper one — it replaces tsct-diag's rewrite with the measured
+table (`(λ2/λ1)^(2k)`, 30–39 % of draws over 5 %, 2400 draws of reachability)
+where tsct-diag's says "the estimate is NOT accurate to 5 % in general". Both are
+true; only one carries the numbers. The **const** was deliberately NOT folded in:
+it is a numerics-identical rename of a magic number in another lane's unlanded
+commit, and taking it here would make that lane's cherry-pick conflict on a hunk
+it wrote for exactly this reason. **Resolution for whoever lands tsct-diag:**
+keep `SIGMA_OVERSHOOT`, take this document's comment text for FINDING 2/3, and
+drop the `use super::ortho_error_per_entry as ortho_err_per_entry` alias at
+`lib.rs:1433` in favour of the test-local helper — both branches' tests call the
+same two names.
+
+### 13.4 The falsify fix: two defects, and the script's contract now holds
+
+The WIP in the worktree fixed the matching bug (`expect_red` filtered on
+`tests::polar_diag::$test` with `--exact`, which matches no test name in the
+file, so A and B reported NOT-DETECTED on every run). **That part was right and
+was kept.** Running it exposed two further defects, one of them the same class
+of blindness one level up:
+
+1. **The basin gate tested a private COPY of the quintic.** `p(s)` was written
+   out in the test as `15/8 s − 5/4 s³ + 3/8 s⁵`, so perturbing the production
+   coefficients could not reach it — the gate pinned a copy, not the constant.
+   The three spellings are now ONE (`NS_A`/`NS_B`/`NS_C`, used by the scalar
+   arm, the batched arm and the test-only host-read fixture) and `p` reads them,
+   with `assert_eq!((NS_A, NS_B, NS_C), (1.875, -1.25, 0.375))` so the dyadic
+   exactness the tolerances assume is itself asserted.
+2. **Section B perturbed both arms of a bit-identity.** The sync-free path is
+   compared ELEMENTWISE against a host-read *fixture*; moving `1.05 → 1.00` in
+   both leaves the identity intact, so the mutant could not fail **by
+   construction**. One arm is the mutation that gate exists to catch.
+3. `sec4d_guard.py` **crashed** (`torch.eye(K)` against a `[K,4]` result), i.e.
+   the evidence for B-2's "the Cauchy–Schwarz guard is wrong" never printed its
+   verdict. Fixed, and the case the verdict actually rests on was missing: an
+   orthonormal `[768,64]` factor. Measured: the guard engages on **21/21**
+   cases including all four well-behaved Gaussians, because `‖X‖_F/1.604 =
+   4.99 > 1` beats a correct estimate of 1. It converges, to the wrong place.
+4. `polar_square_and_tall_no_divergence` asserted `e20 < 1e-2` on a
+   `Tensor::random` draw, and the unseeded RNG (AGENTS.md §3.7) makes that a
+   property of one lucky draw: 1.7e-14 at the median over 20 f64 draws but up
+   to 1.2e-1, 5 % of draws missing 1e-2. Now relative (`e20 < e3/100`), which is
+   draw-independent and still fails the regression it guards.
+5. And then the gate caught **the landing itself**: rewriting `p(s)` to read
+   `NS_B` instead of the literal `−5/4` produced `a·s − b·s³`, which turns
+   `−5/4` into `+5/4`, and `the_quintic_basin_is_sqrt_7_over_3` went red on its
+   first run with `p(1) = 2.375`. A sign is exactly the class of thing a gate
+   for a polynomial is for, and it is worth recording that the error was in the
+   *fix*, not in the tree being landed.
+
+`bash crates/burn-spectral/tests/oracle/falsify.sh` from `vendor/burn-fused`:
+**every mutant DETECTED on its own assertion, restore byte-identical by sha256,
+suite green after restore.** See §13.5 for the tallies.
+
+### 13.5 What was measured at the landing
+
+All of it on this box, 2026-10-01, CPU only (`vendor/burn-fused` is its own
+cargo workspace, so the command is run from there):
+
+```
+cargo test -p burn-spectral --lib      44 passed, 0 failed, 2 ignored
+                                      (the two class-B gates, red on purpose)
+cargo test -p burn-spectral --lib -- --ignored
+                                      0 passed, 2 FAILED - which is the point
+bash tests/oracle/falsify.sh           A(1e-3) A(1e-2) B C D(x2) ALL DETECTED,
+                                      E: restore byte-identical
+                                      (sha256 03ab620da65035fa00a7f21e863e76cf6d264051089299bca2ede05edee39d89)
+                                      exit 0
+```
+
+Python oracles, all standalone, interpreter
+`/tmp/opencode/oracle-venv/bin/python` (python 3.12.14, torch 2.14.0+cpu,
+numpy 2.5.2):
+
+```
+gate_dryrun.py     class-A gates green: basin=True estimate=True;
+                   class-B red on purpose: B-1=True B-2=True
+sec4_fixed.py      0/4000 random draws outside the basin, worst prescaled
+                   1.1549 against an edge of 1.5275 -> B-2 is LATENT
+sec4c_tolerance.py f64 max|out| ~ 3.3e+60 and f32 INF at l2/l1 <= 0.3; a
+                   Frobenius prescale lands at 0.95 / 0.61 on the same factors
+sec4d_guard.py     the Cauchy-Schwarz guard engages on 21/21 cases, including
+                   all four well-behaved [64,4] Gaussians and the orthonormal
+                   [768,64] -> the guard is WRONG (it converges to the wrong
+                   place), which is why B-2 records it as a non-fix
+sec5_6b.py         0.8x / 32.6x / 85.0x the one-way 1e-3 latch at spectral
+                   spreads 0.3 / 0.1 / 0.01 -> class B-1
+audit_2026_10_01.py  runs clean; findings 1-3 come out of it
+```
+
+And the registry, which is the one gate this landing can move:
+
+```
+tools/oracle_gate.py   127 registered, 196 scanned, 2 violations, 8 waived
+```
+Both remaining violations are **pre-existing and in other lanes**: a stale
+`burn-muon-plus/tests/oracle/muon_oracle.bin` row and an unregistered
+`burn-kda/tests/kda_param_grads_cuda.rs`. Before this landing the same gate
+reported **4**, one of which (`burn-spectral/tests/oracle/audit_2026_10_01.py`
+unregistered, from the twin's `7811191`) was this lane's to fix. The generator
+was not run; the seven rows were hand-inserted, which is what the file's own
+header asks for.
