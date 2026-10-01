@@ -130,8 +130,10 @@ pub fn ste_ternary_per_column(w: Tensor<2>) -> Tensor<2> {
 }
 
 /// Power-iteration count for the sigma_max estimate (Gram top eigenvalue).
-/// Rayleigh-quotient error shrinks as (λ2/λ1)^k; 5 gives the estimate well
-/// within the 1.05 safety factor even for square Wishart (λ2/λ1 ≈ 1).
+/// Rayleigh-quotient error shrinks as (λ2/λ1)^k, so 5 is ample for a
+/// well-separated Gram - but the estimate is NOT accurate to 5% in general
+/// (see the `SIGMA_OVERSHOOT` note on `polar_orthogonalize`), and nothing
+/// here depends on it being.
 const POWER_ITERS: usize = 5;
 
 /// A retracted master: `polar_orthogonalize(before).detach()`, re-flagged as a
@@ -205,6 +207,42 @@ fn polar_retracked(before: &Tensor<2>, iters: usize) -> Tensor<2> {
 /// `retraction_holds_the_manifold_at_rank_64` and
 /// `retraction_puts_sigma_max_at_one` are the tests that fail if anyone
 /// swaps this for a Frobenius prescale.
+///
+/// **The 1.05 factor is an empirical margin, not a guarantee.** An earlier
+/// version of this comment justified it as "power iteration converges from
+/// below, so the true `σ_max` stays strictly inside the basin" and stated the
+/// 5 % figure as the covered error. That justification is FALSE AS MEASURED
+/// (2026-09-30): over 200 random `[768,64]` factors the estimate is
+/// **worse than 5 % on 32–47 % of draws**, and the prescaled `σ_max` reached
+/// **1.087**, not 1.05. What is actually true, and is what the factor rests
+/// on:
+///
+/// 1. **Cubic suppression at the fixed point.** Expanding about `s = 1`,
+///    `p(1+e) − 1 = (5/2)·e³ + (15/8)·e⁴ + (3/8)·e⁵` — the linear and
+///    quadratic terms cancel exactly (`p′(1) = 0`), so an error `e` is
+///    damped cubically, not geometrically. This is why a mis-estimated
+///    `σ_max` is benign: the measured prescaled values up to 1.087 still
+///    return `σ = 1.000000000` out, because the last iteration lands
+///    essentially on the fixed point.
+/// 2. **The basin, which is the real safety property.** `p(s) − s = 0` at
+///    `s² = 1` and `s² = 7/3`, and the sign is negative in between, so the
+///    attracting interval is `0 < x₀ < √(7/3) ≈ 1.5275`. A prescale of
+///    `1.05` therefore tolerates an estimate as bad as
+///    `1.5275 / 1.05 = 0.687`, i.e. a **31 % underestimate** of `σ_max`
+///    before the iteration diverges. That is 6× the error the factor was
+///    documented as covering.
+/// 3. **`POWER_ITERS` bounds the estimate, not the factor.** 5 Rayleigh
+///    steps shrink the error as `(λ₂/λ₁)^k`; it is `p′(1) = 0` that absorbs
+///    the residue.
+///
+/// The offline optimum for a known factor-spread interval is
+/// `c* = argmin_c max_{x∈[ℓ,u]} |p³(x/c) − 1|`, and it is deliberately NOT
+/// learned: `c` multiplies the whole factor, so a gradient on it turns the
+/// retraction's scale normalisation into a **gain-control mechanism** (it
+/// would let the optimizer shrink the factor to cut the loss, defeating the
+/// retraction's purpose entirely). It is measurable offline from saved
+/// factors if the 1.05 margin ever stops being enough.
+const SIGMA_OVERSHOOT: f32 = 1.05;
 pub fn polar_orthogonalize(x: Tensor<2>, iters: usize) -> Tensor<2> {
     let dims = x.dims();
     let (rows, cols) = (dims[0], dims[1]);
@@ -246,9 +284,12 @@ pub fn polar_orthogonalize(x: Tensor<2>, iters: usize) -> Tensor<2> {
     // `clamp_min` is the tensor form of the old `f32::max` clamps; the two
     // differ only for NaN, and vᵀv >= 0 makes NaN unreachable here.
     let sigma = vgv.div(vv.clamp_min(1e-14)).sqrt().clamp_min(1e-7); // [1, 1]
-    // 1.05 safety factor: power iteration converges from below, so the true
-    // sigma_max stays strictly inside the basin (Q is scale-invariant).
-    m = m.div(sigma.mul_scalar(1.05));
+    // SIGMA_OVERSHOOT: an empirical margin, NOT a "5% of the power-iteration
+    // error" guarantee - the estimate exceeds 5% on 32-47% of draws. What
+    // holds is the basin: p(s)-s vanishes at s^2 = 1 and s^2 = 7/3, so the
+    // start may sit anywhere in 0 < x0 < sqrt(7/3) ~ 1.5275 and still
+    // converge, which this factor buys to a 31% underestimate of sigma_max.
+    m = m.div(sigma.mul_scalar(SIGMA_OVERSHOOT));
     // Newton-Schulz in X·Xᵀ form (small side [c,c], same as Muon+):
     // x <- a·x + (b·XXᵀ + c·(XXᵀ)²)·x, optimal NS coefficients
     let (a, b, c) = (15.0f32 / 8.0, -5.0f32 / 4.0, 3.0f32 / 8.0);
@@ -301,7 +342,7 @@ pub fn polar_orthogonalize_batched(x: Tensor<3>, iters: usize) -> Tensor<3> {
     let vgv = v.clone().mul(gv).sum_dim(1).sum_dim(2); // [B, 1, 1]
     let vv = v.clone().mul(v).sum_dim(1).sum_dim(2);
     let sigma = vgv.div(vv.clamp_min(1e-14)).sqrt().clamp_min(1e-7);
-    m = m.div(sigma.mul_scalar(1.05));
+    m = m.div(sigma.mul_scalar(SIGMA_OVERSHOOT));
     let (a, b, c) = (15.0f32 / 8.0, -5.0f32 / 4.0, 3.0f32 / 8.0);
     for _ in 0..iters {
         let xx = m.clone().matmul(m.clone().transpose());
@@ -357,6 +398,68 @@ pub fn ortho_error(u: &Tensor<2>) -> f32 {
         .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
         .sum::<f32>()
         .sqrt()
+}
+
+/// The per-ENTRY orthonormality error `||XᵀX - I||_F / rank`.
+///
+/// The convention the trainer's one-way `max_ortho` latch uses (`param.rs`,
+/// and `docs/AGENTS.md` §2.3). It is per entry because the raw F-norm sums
+/// `k²` Gram entries and so scales ~`k`: on a `k = 64` factor the NS-3
+/// retraction's own convergence floor is ~4e-3 raw (~6e-5 per entry), so a
+/// raw-norm threshold would fire the fp32 fallback on every fresh run.
+pub fn ortho_error_per_entry(u: &Tensor<2>) -> f32 {
+    ortho_error(u) / u.dims()[1].max(1) as f32
+}
+
+/// The Gram error of the factor the FORWARD actually multiplies by, at the
+/// current ternary annealing `alpha`.
+///
+/// **Why this is not `ortho_error_per_entry` on the same tensor**: annealing
+/// can hold the fp masters exactly on the manifold while the effective
+/// factor leaves it, because `ste_ternary_annealed` shrinks every entry
+/// toward `sign(w)·mean(|w|)` with a dead zone, and that map is not
+/// orthogonal. Measured on a freshly built `[768,64]` fp32 factor: the
+/// masters read **8.1e-8** per entry while this reads **7.96e-2** at
+/// `alpha = 1` — a gap of ~10⁶. A metric on the masters therefore cannot
+/// see forward degradation by construction, and neither can one on the raw
+/// ternary projection: at `alpha = 0` the two coincide, and that equality is
+/// the cross-check the trainer's eval line relies on.
+///
+/// Uses [`ste_ternary_annealed`], the SAME function `SpectralLinear::forward`
+/// calls, at `alpha` read from the layer: measuring anything else is the
+/// "looks perfect while the forward degrades" failure this exists to catch.
+pub fn ortho_error_forward(u: &Tensor<2>, alpha: f32) -> f32 {
+    ortho_error_per_entry(&ste_ternary_annealed(u.clone(), alpha))
+}
+
+/// The learnable `|s|` spectrum: `(max, min, count of near-off ranks)`.
+///
+/// A dead zone in the ternary projection kills a rank that `s` cannot
+/// recover: the rank's column becomes ~0, so `s_i` stops mattering and its
+/// gradient stops arriving. Nothing else in the log shows it. `near_off` is
+/// the tolerance: the count of `|s_i| < near_off` is the reviewer's "почти
+/// выключенные ранги". The caller picks the tolerance
+/// (`dormouse_core::TsctDiag::NEAR_OFF` = 1e-3, three orders below the
+/// per-entry magnitude of an orthonormal `[768,64]` factor, ~1/√768 ≈
+/// 3.6e-2), so this function has no policy in it — a metric that hardcoded
+/// its own threshold would be a second place to change the answer.
+pub fn spectrum_stats(s: &Tensor<1>, near_off: f32) -> (f32, f32, usize) {
+    let bytes = s.clone().abs().into_data().bytes;
+    let vals: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    let mut smax = 0.0f32;
+    let mut smin = f32::INFINITY;
+    let mut off = 0usize;
+    for v in &vals {
+        smax = smax.max(*v);
+        smin = smin.min(*v);
+        if *v < near_off {
+            off += 1;
+        }
+    }
+    (smax, smin, off)
 }
 
 /// Quantization format for TSCT U/V factors.
@@ -1333,12 +1436,166 @@ mod tests {
         assert!(after < 1e-3, "polar must restore orthonormality: {after}");
     }
 
+    // ---- the three pre-100k diagnostics (reviewer checklist item 2) ----
+    //
+    // Each gate is a RED→GREEN demonstration: a metric is pinned by
+    // perturbing a fixture by a COMPUTED amount and asserting the metric
+    // moves by the amount the arithmetic says, not by a literal. A literal
+    // pins the implementation; a computed delta pins the MEASUREMENT, which
+    // is the thing a reader of the eval line depends on.
+
+    /// The orthonormal fixture, at the trainer's rank. See
+    /// [`ortho_factor_768x64`].
+    fn manifold_64(dev: &Device) -> Tensor<2> {
+        ortho_factor_768x64(dev)
+    }
+
+    /// A `[768, 64]` factor whose Gram error is EXACTLY known in closed
+    /// form: the first `k` rows carry `diag(1+eps)`, every other entry is
+    /// zero. So `UᵀU = (1+eps)²·I` with no cross terms at all, and
+    ///
+    /// ```text
+    /// ||UᵀU − I||_F      = sqrt(k) · ((1+eps)² − 1)
+    /// per entry          = ((1+eps)² − 1) / sqrt(k)
+    /// ```
+    ///
+    /// A perturbation of an EXISTING orthonormal factor cannot be used here:
+    /// it moves the off-diagonal Gram entries by `eps·U_ij`, so the expected
+    /// value would depend on the fixture's own cross terms rather than on the
+    /// metric. This fixture has none, which is what makes the expected number
+    /// a property of the MEASUREMENT.
+    fn known_gram_error_768x64(dev: &Device, eps: f32) -> (Tensor<2>, f32) {
+        const N: usize = 768;
+        const K: usize = 64;
+        let mut data = vec![0.0f32; N * K];
+        for i in 0..K {
+            data[i * K + i] = 1.0 + eps;
+        }
+        let per_entry = ((1.0 + eps) * (1.0 + eps) - 1.0) / (K as f32).sqrt();
+        (
+            Tensor::<2>::from_data(burn::tensor::TensorData::new(data, [N, K]), dev),
+            per_entry,
+        )
+    }
+
+    /// (1a) The masters' per-entry Gram error reports a KNOWN perturbation.
+    ///
+    /// Red→green by construction: `eps = 0` is exactly orthonormal (the
+    /// metric must read 0), and `eps = 0.05` has a per-entry error of
+    /// `0.1025 / 8 = 1.28125e-2` computed in closed form above. A metric
+    /// that ignored the perturbation, or divided by the wrong quantity,
+    /// cannot produce that number from a fixture whose Gram diagonal is
+    /// exactly `(1+eps)²`.
+    #[test]
+    fn ortho_per_entry_reports_a_known_perturbation() {
+        let dev = dev();
+        let (exact, expect0) = known_gram_error_768x64(&dev, 0.0);
+        assert_eq!(expect0, 0.0);
+        let got0 = ortho_error_per_entry(&exact);
+        assert!(got0 < 1e-7, "an exactly orthonormal factor must read ~0, got {got0:.3e}");
+
+        const EPS: f32 = 0.05;
+        let (pert, expect) = known_gram_error_768x64(&dev, EPS);
+        let got = ortho_error_per_entry(&pert);
+        assert!(
+            (got - expect).abs() < 1e-4 * expect,
+            "metric must report the closed-form per-entry error {expect:.6e}, got {got:.6e}"
+        );
+        // Red by construction: the unperturbed read cannot produce it.
+        assert!(got > 1000.0 * got0);
+        // And per entry is the RAW F-norm over the rank, which is the whole
+        // convention the trainer's 1e-3 latch is quoted against.
+        let raw = ortho_error(&pert);
+        assert!((got - raw / 64.0).abs() < 1e-9);
+        assert!(
+            (raw - (64.0f32).sqrt() * 0.1025).abs() < 1e-3,
+            "the raw F-norm must match sqrt(k)·((1+eps)²−1) = {expect_raw}, got {raw}",
+            expect_raw = (64.0f32).sqrt() * 0.1025
+        );
+    }
+
+    /// (1b) Zero-error factors read ~0: a retraction applied to an already
+    /// orthonormal factor must not report drift, or every eval line carries a
+    /// number that means nothing.
+    #[test]
+    fn ortho_per_entry_is_zero_on_the_manifold() {
+        let dev = dev();
+        let u = manifold_64(&dev);
+        let e = ortho_error_per_entry(&polar_orthogonalize(u.clone(), 3));
+        assert!(e < 1e-5, "retraction must hold the manifold, got {e:.3e}");
+    }
+
+    /// (2) The FORWARD factor's Gram error, at the annealing `alpha` the
+    /// forward uses.
+    ///
+    /// Three properties, each of which is the reason this metric exists:
+    /// - at `alpha = 0` it EQUALS the masters' metric (the cross-check: the
+    ///   two code paths agree when the ternary term is switched off);
+    /// - at `alpha = 1` it is strictly LARGER, because the ternary projection
+    ///   with its `0.7·mean` dead zone is not an orthogonal map — this is
+    ///   the "masters perfect, forward degraded" case the metric must see;
+    /// - it moves MONOTONICALLY with `alpha`, so a run's rising number is
+    ///   attributable to annealing rather than to noise.
+    #[test]
+    fn ortho_forward_departures_from_the_masters_as_alpha_rises() {
+        let dev = dev();
+        let u = manifold_64(&dev);
+        let masters = ortho_error_per_entry(&u);
+        let at0 = ortho_error_forward(&u, 0.0);
+        assert!(
+            (at0 - masters).abs() < 1e-12,
+            "alpha = 0 must reproduce the masters metric exactly: {at0:.6e} vs {masters:.6e}"
+        );
+        let at1 = ortho_error_forward(&u, 1.0);
+        assert!(
+            at1 > 100.0 * masters,
+            "alpha = 1 must show the ternary projection leaving the manifold: \
+             forward {at1:.3e} vs masters {masters:.3e}"
+        );
+        let half = ortho_error_forward(&u, 0.5);
+        assert!(
+            masters <= half && half < at1,
+            "must be monotone in alpha: {masters:.3e} <= {half:.3e} < {at1:.3e}"
+        );
+        // Red by construction: the masters' own metric CANNOT distinguish
+        // alpha = 0 from alpha = 1 - it is the same number twice. That is
+        // the defect this series exists to expose.
+        assert_eq!(masters, ortho_error_per_entry(&u));
+    }
+
+    /// (3) The `|s|` spectrum: max, min, and the near-off count.
+    ///
+    /// Fixture with three known magnitudes including one below the tolerance,
+    /// so a wrong count or an unsigned/NaN handling bug is a specific failure
+    /// rather than a tolerance discussion.
+    #[test]
+    fn spectrum_stats_reports_max_min_and_dead_ranks() {
+        let dev = dev();
+        let s = Tensor::<1>::from_data(
+            burn::tensor::TensorData::new(vec![2.0f32, 1e-4, -0.5, 0.0, 1.25], [5]),
+            &dev,
+        );
+        // |s| : 2.0, 1e-4, 0.5, 0.0, 1.25 -> max 2.0, min 0.0, one below 1e-3.
+        let (smax, smin, off) = spectrum_stats(&s, 1e-3);
+        assert_eq!((smax, smin, off), (2.0, 0.0, 2), "got ({smax}, {smin}, {off})");
+        // The tolerance is a knob and it moves ONLY the count - max and min
+        // are properties of the spectrum, not of the threshold. `tol = 1e-4`
+        // excludes the 1e-4 value (the comparison is strict `<`), and
+        // `tol = 1.0` admits the two smallest as well.
+        assert_eq!(spectrum_stats(&s, 1e-4).2, 1);
+        assert_eq!(spectrum_stats(&s, 1.0).2, 3);
+        // Red by construction: all-alive factors report zero dead ranks, so
+        // a metric that returned a constant could not pass the row above.
+        let alive = Tensor::<1>::from_data(burn::tensor::TensorData::new(vec![1.0f32, 2.0], [2]), &dev);
+        assert_eq!(spectrum_stats(&alive, 1e-3).2, 0);
+    }
+
     /// The `max_ortho` metric, per entry: `‖UᵀU−I‖_F / rank`. Same
     /// definition as the one the trainer's one-way fp32 latch uses
-    /// (`train/src/lib.rs`), and the threshold below is that latch's.
-    fn ortho_err_per_entry(u: &Tensor<2>) -> f32 {
-        ortho_error(u) / u.dims()[1] as f32
-    }
+    /// (`train/src/lib.rs`), and the threshold below is that latch's. An
+    /// alias for the library function the trainer now calls directly, so the
+    /// two cannot drift.
+    use super::ortho_error_per_entry as ortho_err_per_entry;
 
     /// An exactly orthonormal `[768, 64]` factor - the trainer's factor
     /// shape at `rank = 64`. The first 64 modes of the n=768 DCT-II basis
@@ -1551,7 +1808,7 @@ mod tests {
         let vgv = v.clone().mul(gv).sum().into_scalar::<f32>();
         let vv = v.clone().mul(v.clone()).sum().into_scalar::<f32>();
         let sigma = (vgv / vv.max(1e-14)).sqrt().max(1e-7);
-        m = m.div_scalar(sigma * 1.05);
+        m = m.div_scalar(sigma * SIGMA_OVERSHOOT);
         let (a, b, c) = (15.0f32 / 8.0, -5.0f32 / 4.0, 3.0f32 / 8.0);
         for _ in 0..iters {
             let xx = m.clone().matmul(m.clone().transpose()); // [r, r]
