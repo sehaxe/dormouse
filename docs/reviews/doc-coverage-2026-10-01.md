@@ -104,8 +104,9 @@ gone.
 owns the enforcement. This lane supplies the lint attributes and the command;
 the job wires it.
 
-`cargo test -p dormouse-core -p dormouse-data --lib` green — nothing but comments
-changed, which the test run is there to prove rather than assert.
+`cargo test -p dormouse-core -p dormouse-data --lib` green — **86 + 15 = 101
+tests, 0 failed** (115.17 s + 0.05 s). Every diff hunk in this lane is a
+comment; the test run is what proves that rather than asserting it.
 
 ---
 
