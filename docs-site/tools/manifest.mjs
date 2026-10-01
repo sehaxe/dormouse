@@ -299,6 +299,7 @@ export const pages = [
 	// assembled from the protocols, the rulebook and the reviews - no new
 	// numbers, every figure carried with its source.
 	{ src: 'docs/guides/train-your-first.md', out: 'tooling/train-your-first', title: 'Train your first model', nav: 'First run' },
+	{ src: 'docs/guides/determinism.md', out: 'tooling/determinism', title: 'Determinism: why --seed was the easy part', nav: 'Determinism' },
 ];
 
 // Everything the manifest does not enumerate, discovered and ordered here.
