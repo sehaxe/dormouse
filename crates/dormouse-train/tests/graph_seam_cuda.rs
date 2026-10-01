@@ -508,3 +508,42 @@ fn a_replay_launches_no_kernels() {
         pin_copies
     );
 }
+/// Can a graph-pinned Int input live on the PLAIN (non-autodiff) device?
+///
+/// The pin needs a raw cubecl `Handle` to write host bytes into, and
+/// `try_into_primitive` refuses any tensor whose autodiff context is not
+/// `Disabled` — which every Int tensor the trainer builds is. A tensor created
+/// on `Device::cuda(0)` (no `.autodiff()`) is Disabled, so its handle is
+/// reachable... if the model will accept an Int tensor from that device at all.
+///
+/// This is the whole input pin in one question, so it is asked directly rather
+/// than discovered as a refusal inside a training step.
+#[test]
+fn a_plain_device_int_tensor_is_accepted_by_the_forward() {
+    let plain = burn::tensor::Device::cuda(0);
+    let dev = device();
+    let (model, _t) = build();
+    let x_plain: Tensor<2, Int> = Tensor::zeros([BATCH, SEQ], &plain);
+    let h_plain: Tensor<3, Int> = Tensor::zeros([BATCH, SEQ, 3], &plain);
+    let y_plain: Tensor<2, Int> = Tensor::zeros([BATCH, SEQ], &plain);
+    let (_logits, rec, _kda, _aux) =
+        model.forward_with_hidden::<Backend>(x_plain, Some(h_plain), None, Some(y_plain), None);
+    // A non-zero loss, so the test cannot pass on a forward that silently
+    // ignored its inputs (all-zero ids give a real but different CE).
+    let loss: f32 = rec.into_scalar();
+    assert!(loss.is_finite(), "the plain-device forward produced {loss}");
+    // And the same call on the autodiff device, for contrast.
+    let x_dev: Tensor<2, Int> = Tensor::zeros([BATCH, SEQ], &dev);
+    let (_l2, rec2, _k2, _a2) = model.forward_with_hidden::<Backend>(
+        x_dev,
+        Some(Tensor::zeros([BATCH, SEQ, 3], &dev)),
+        None,
+        Some(Tensor::zeros([BATCH, SEQ], &dev)),
+        None,
+    );
+    let loss2: f32 = rec2.into_scalar();
+    assert!(
+        (loss - loss2).abs() < 1e-6,
+        "the same zeros on two devices must give the same loss: {loss} vs {loss2}"
+    );
+}

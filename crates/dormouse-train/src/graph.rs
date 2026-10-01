@@ -342,17 +342,36 @@ pub fn copy_into_int<const D: usize>(
 /// The per-step input tensors, each pinned to a buffer that never moves.
 ///
 /// `x`, `y` and `hashed_ids` are built from host bytes every step, so a
-/// captured graph would read last step's batch — the `8fa5d4c` shape again,
-/// one layer down. These are allocated ONCE and filled by copy, which is one
-/// launch per tensor per step against the window's thousands.
+/// captured graph would read last step's batch — the `8fa5d4c` shape again, one
+/// layer down. These are allocated ONCE and filled by copy: one launch per
+/// tensor per step against the window's 21,433.
 ///
-/// `None` for the Engram keys when the run has no in-VRAM table: the window
-/// then does not read them at all, and pinning a tensor nothing reads would be
-/// ceremony.
+/// **The pins live on the PLAIN (non-autodiff) CUDA device, and that is load
+/// bearing, not a style choice.** Filling a pin in place needs the tensor's raw
+/// cubecl `Handle`, and `Tensor::try_into_primitive` refuses any tensor whose
+/// autodiff context is not `Disabled` — which every tensor the trainer builds on
+/// `Device::cuda(0).autodiff()` is (`burn-dispatch/src/tensor.rs:481`). An Int
+/// tensor built on `Device::cuda(0)` has that context, so the copy kernel sees
+/// both sides; and the forward accepts it, measured by
+/// `graph_seam_cuda::a_plain_device_int_tensor_is_accepted_by_the_forward`.
+///
+/// `h` is `None` when the run has no in-VRAM table: the window then does not
+/// read the keys at all, and pinning a tensor nothing reads would be ceremony.
 pub struct InputPins {
     pub x: Tensor<2, burn::tensor::Int>,
     pub y: Tensor<2, burn::tensor::Int>,
     pub h: Option<Tensor<3, burn::tensor::Int>>,
+}
+
+/// The plain CUDA device the input pins live on: device 0, the same client and
+/// the same pool — only the autodiff context differs. `None` off CUDA.
+#[cfg(feature = "cuda")]
+pub fn plain_device() -> Option<burn::tensor::Device> {
+    Some(burn::tensor::Device::cuda(0))
+}
+#[cfg(not(feature = "cuda"))]
+pub fn plain_device() -> Option<burn::tensor::Device> {
+    None
 }
 
 impl InputPins {
@@ -363,9 +382,10 @@ impl InputPins {
         y: &Tensor<2, burn::tensor::Int>,
         h: Option<&Tensor<3, burn::tensor::Int>>,
     ) -> Self {
-        let x = Tensor::zeros(first.dims(), &first.device());
-        let yp = Tensor::zeros(y.dims(), &y.device());
-        let hp = h.map(|t| Tensor::zeros(t.dims(), &t.device()));
+        let dev = plain_device().unwrap_or_else(|| first.device());
+        let x = Tensor::zeros(first.dims(), &dev);
+        let yp = Tensor::zeros(y.dims(), &dev);
+        let hp = h.map(|t| Tensor::zeros(t.dims(), &dev));
         Self { x, y: yp, h: hp }
     }
 
