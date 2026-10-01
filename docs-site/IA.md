@@ -283,11 +283,11 @@ point-in-time reading with every number attached.
 - **Diagrams are mermaid, and ASCII box-drawing is banned in this site's own
   pages.** The owner directive: a `┌─┐│└┘` diagram in markdown is always broken,
   because a code block is laid out in the reader's font and nothing lines up.
-  `astro-mermaid` renders a ` ```mermaid ` fence client-side and is wired in
-  `astro.config.mjs` **after** starlight — it registers its mdast plugin on the
-  processor starlight installs, so listed before starlight it finds no processor
-  and every fence ships as a highlighted code block with a green build.
-  `npm run check` therefore ends with `tools/check-mermaid.mjs`, which counts
+  `astro-mermaid@2.1.0` + `mermaid@12.0.0` render a ` ```mermaid ` fence
+  client-side; Astro runs every integration's config hook, so the listing order
+  in `astro.config.mjs` is not the lever (measured both ways). The hook logs
+  each fence it transforms and nothing turns that log into a failure, so
+  `npm run check` ends with `tools/check-mermaid.mjs`, which counts
   `<pre class="mermaid">` (the hook ran) against `data-language="mermaid"` (a
   fence it missed) and fails on either being wrong. Measured on this repo:
   3 rendered, 0 missed, `CONTEXT.md` §"The shape" and the README's front-page
