@@ -2,13 +2,66 @@
 //! once, in the per-field serde defaults below; `Default` derives from them
 //! by deserializing an empty table. There is no sectioned mirror - preset
 //! TOMLs are flat tables of these same fields.
+//!
+//! # Invariants
+//!
+//! * **`DormouseConfig::default() == small.toml`**, and that is a test
+//!   (`default_equals_small_preset`), checked in both directions. The `d_*`
+//!   functions in this file are the only written copy of a default.
+//! * **A field here always changes the network.** Step/schedule/optimizer
+//!   knobs live in `dormouse-train`'s config seam, because they are exempt
+//!   from the resume config-equality check (ADR-0005/0021): extending a run is
+//!   a legal resume, so putting `steps` here would forbid it.
+//! * **Fields that add parameters default OFF**, and they build their module
+//!   with an `Option` or behind a flag, so an off-arm model is
+//!   byte-identical to a build from before the arm existed. That is what keeps
+//!   the pure-CE control a valid control and the measured preset parameter
+//!   counts in `tests/preset_exec.rs` true. The arms: `use_gr`,
+//!   `use_attnres`, `use_mhc`, `use_situ`, `use_mor`, and
+//!   `aux_fb_weight > 0`.
+//! * **Parsing is single-sourced.** [`ActQuant`] has one `FromStr`, and serde,
+//!   `--set` and the CLI all route through it, so a value that is illegal in a
+//!   flag is illegal in a TOML file.
+//!
+//! # What this module does NOT check
+//!
+//! Cross-field legality lives in [`super::validation`], not here. This module
+//! parses and defaults; it does not refuse. An `Err` from `toml::from_str`
+//! means the text is not a config at all.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::{self, Visitor}};
 use std::str::FromStr;
 use crate::act_quant::ActFormat;
 
+/// Activation quantization format, as the CONFIG spells it.
+///
+/// Config-level, so it is a two-variant enum rather than
+/// [`ActFormat`]: the model's enum carries the four shipped formats and the
+/// `None`-means-auto decision lives in the trainer. Only what a TOML file or a
+/// `--set` value can say is here, which is why `bf16` is absent — the trainer
+/// picks bf16-vs-fp8-vs-fp32 from the device and `--quant`.
+///
+/// One parser ([`FromStr`], ADR-0005): `fp4` | `4` | `8`, case-insensitive,
+/// `int4`/`int8` accepted as aliases. Anything else is `Err` naming what was
+/// expected — a silent fp32 default here would be a run that trained in fp32
+/// while its config said it did not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ActQuant { Fp4, Int(u32) }
+pub enum ActQuant {
+    /// The e2m1 grid (8 magnitudes: 0, .5, 1, 1.5, 2, 3, 4, 6), scaled per
+    /// block onto the FORMAT's max. Note what this does NOT cover: the
+    /// attention path is unconditionally upgraded to at least 8 bits
+    /// ([`crate::act_quant::ActFormat::attn`]), so `--act-quant fp4` has never
+    /// run 4-bit attention — the FFN path only. Every pre-2026-09-28 fp4
+    /// number is also invalid for a second, independent reason: `fp4` was not
+    /// e2m1 at all then (it emitted a nonexistent 0.75 level and scaled blocks
+    /// onto 1 instead of 6, making ~3 of 8 levels reachable).
+    Fp4,
+    /// Uniform integer quantization at this width in bits, 4 or 8. BitNet
+    /// a4.8-style: the forward path quantizes with a straight-through
+    /// estimator and the graph stays f32, so the arithmetic is unchanged and
+    /// only the values are rounded.
+    Int(u32),
+}
 impl From<ActQuant> for ActFormat {
     fn from(q: ActQuant) -> Self { match q { ActQuant::Fp4 => ActFormat::Fp4, ActQuant::Int(b) => ActFormat::Int(b) } }
 }
@@ -81,20 +134,96 @@ fn d_false() -> bool { false }
 fn d_mor_k() -> usize { 2 }
 fn d_mor_bce_weight() -> f32 { 0.05 }
 
+/// The flat model schema: every knob that changes the network, in one table.
+///
+/// # What this type is NOT
+///
+/// It is not the run's configuration. `steps`, `log_every`, `ckpt_every`,
+/// `lr`, `eval`, `eval_every` and the optimizer choice live in
+/// `dormouse-train`'s config seam, and that split is load-bearing: those keys
+/// are exempt from the resume config-equality check, because extending a run
+/// is a legal resume and a config here would be compared against the snapshot
+/// on every restart (ADR-0005/0021).
+///
+/// # The three ways a field here can be set
+///
+/// A preset TOML (the normal way), a `--set key=value` override (which wins,
+/// and resolves through the same parsers), or the default. The defaults are
+/// the `small` preset — `default_equals_small_preset` fails if they drift.
+///
+/// # Legality
+///
+/// Deserialization here does not refuse anything cross-field. Every "these two
+/// cannot both be on" and "this value would silently compute a different
+/// objective" rule is in [`super::validation`], called once after the config
+/// is fully resolved.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DormouseConfig {
+    /// Store and compute activations in bfloat16. **Slower than fp32 on this
+    /// box**, not faster: the LLVM dialect has no bf16 type, so the backend
+    /// deletes bf16 from its advertised element types and strips the bf16
+    /// tensor-core families — `--bf16` stores bf16 and computes fp32 through
+    /// cast copies (AGENTS.md §2.1, ADR-0016 bug 2). Do not "fix" a slow
+    /// `--bf16` run by turning this off without saying so in the log: the
+    /// comparison changes meaning.
     #[serde(default = "d_bf16")] pub bf16: bool,
+    /// Activation quantization format, or `None` for auto. `None` is NOT
+    /// "off": the trainer resolves it (bf16 mode -> Bf16; sm_120 -> Fp8;
+    /// else Fp32), and `--quant` is the way to pin it. See [`ActQuant`].
     #[serde(default)] pub act_quant: Option<ActQuant>,
+    /// Block size for activation quantization, in elements along `d_model`.
+    /// `0` means one scale per token (a single group covering the whole row).
+    /// Anything else must DIVIDE `d_model`: the quantizer reshapes `[b*t, d]`
+    /// to `[b, d/g, g]`, so a non-divisor fails the reshape on the first
+    /// forward — a shape panic a long way from the flag. Checked by
+    /// [`super::validate`].
     #[serde(default = "d_act_group")] pub act_group: usize,
+    /// Residual-stream width. Must be divisible by `n_heads`, by `act_group`
+    /// when that is set, and by `mhc_streams` when mHC is on — each of those
+    /// reshapes the hidden state, so the check belongs at config time rather
+    /// than at first forward.
     #[serde(default = "d_d_model")] pub d_model: usize,
+    /// Attention heads in the KDA arm. `d_model = n_heads * head_dim` is the
+    /// relation that holds on every shipped preset (768 = 12 * 64).
     #[serde(default = "d_n_heads")] pub n_heads: usize,
+    /// Per-head width in the KDA arm, independent of `d_model` so the two can
+    /// be swept without changing the stream width.
     #[serde(default = "d_head_dim")] pub head_dim: usize,
+    /// Expert FFN inner width. With `use_tsct` on this is the rank space's
+    /// output width, and the FFN's parameter cost binds at `r * d_ffn` per
+    /// expert rather than `d_model * d_ffn`, which is why `use_situ` costs
+    /// only +4.28% on `small` when it widens the projection to `2 * d_ffn`.
     #[serde(default = "d_d_ffn")] pub d_ffn: usize,
+    /// Token vocabulary. **256, and it is bytes**: dormouse is a byte-level
+    /// LM with no tokenizer, so this is fixed by the task and not a tuning
+    /// knob. It is a field because `serve`/`generate` need it, not because
+    /// anyone should change it.
     #[serde(default = "d_vocab")] pub vocab: usize,
+    /// The longest sequence the model will be asked about, in BYTE positions.
+    /// Used for RoPE table sizing and by the trainer's shape checks. A batch
+    /// longer than this is a shape error, not a truncation.
     #[serde(default = "d_max_seq_len")] pub max_seq_len: usize,
+    /// **Loop depth**: how many times the weight-shared block runs. This is the
+    /// model's compute knob and the cheapest big lever in the A/B queue (depth
+    /// 2 vs 4). There is no halt head and no PonderNet: depth is fixed, and
+    /// `L_Rec` is the honest unweighted mean CE over all iterations
+    /// (ADR-0013). `--rand-depth` samples it per step and `--set
+    /// use_mor=true` routes per position instead; both are un-A/B'd.
     #[serde(default = "d_max_iter")] pub max_iter: usize,
+    /// TSCT spectral rank: every [`crate::param::LinearLike`] stores `U[d, r]`
+    /// and `V[r, f]` instead of a `[d, f]` matrix, so `rank` sets the
+    /// compression ratio of the whole model. `rank` must stay small enough
+    /// that `r*f < d*f` or the "spectral" path is more expensive than the dense
+    /// one it replaces.
     #[serde(default = "d_rank")] pub rank: usize,
+    /// RMSNorm epsilon. 1e-3 is the shipped value, three orders above the
+    /// f32 default, which is a deliberate stability choice for the fp32 runs
+    /// on this box rather than a paper number.
     #[serde(default = "d_norm_eps")] pub norm_eps: f32,
+    /// The KDA attention arm. Default ON, and `--no-kda` is the bisect flag:
+    /// turning it off gives the model with NO attention arm at all, which is
+    /// the one configuration in the archive whose held-out BPB is a number for
+    /// the network that produced it (AGENTS.md §3.1).
     #[serde(default = "d_true")] pub use_kda: bool,
     /// Spectral (low-rank TSCT) linears vs plain dense ones. The spectral
     /// path is what makes the FFN 2048-wide on `small` (9 197 390 params,
@@ -104,7 +233,35 @@ pub struct DormouseConfig {
     /// machinery and ~1000 lines (at a matched param budget the FFN gets
     /// narrower, which is the comparison that actually means something).
     #[serde(default = "d_true")] pub use_tsct: bool,
+    /// The hashed n-gram memory (Engram, arXiv 2601.07372): FNV-hashed 2/3/4-gram
+    /// keys into per-order tables, one shared value projection over all orders,
+    /// and a hard floor `min(w_mem, engram_lam_max)` on the memory branch's
+    /// share of the block output.
+    ///
+    /// Default ON, `--no-engram` is the bisect. **This arm was switched off in
+    /// the A/B queue's first control for a capacity reason, not a quality
+    /// reason** — at 8M rows/order it was 99% of the model and monopolized the
+    /// loss — see [`Self::engram_rows`] for the numbers and for the
+    /// disagreement about the right capacity that is written down rather than
+    /// averaged away.
     #[serde(default = "d_true")] pub use_engram: bool,
+    /// Gated Residual (arXiv Qwen3.8-Flash-Next, Eq 31-34): the residual
+    /// stream is read through a low-rank sigmoid gate and written with one
+    /// scalar per branch, replacing ReZero's additive scale.
+    ///
+    /// OFF by default (owner decision, checkpoint compatibility). The arm has
+    /// **never been A/B'd**, and the four equation defects the audit found on
+    /// 2026-09-28 (a missing sigmoid and factor 2 on the write, a missing
+    /// `1/nr` inside the SiLU on the read, and a readout taken one iteration
+    /// behind) were all fixed in the same commit — so there is no number, good
+    /// or bad, in this project's history. Placement is ours, not the report's:
+    /// one GR per loop ITERATION of a weight-shared block against the report's
+    /// one GR per sublayer of a 56-sublayer stack, which is a transposition, so
+    /// the report's -0.026 does not transfer unmeasured.
+    ///
+    /// Mutually exclusive with `use_attnres` and `use_mhc` — all three replace
+    /// the same statement in the loop, and two on would mean one is silently
+    /// ignored. Refused by [`super::validate`].
     #[serde(default)] pub use_gr: bool,
     /// Attention Residuals (arXiv:2603.15031), the learned replacement for the
     /// loop's residual accumulation: the state after iteration `n` becomes a
@@ -120,7 +277,21 @@ pub struct DormouseConfig {
     /// accident, but it is not wired to a config field: the first A/B this
     /// arm needs is AttnRes vs ReZero, not AttnRes vs AttnRes.
     #[serde(default)] pub use_attnres: bool,
+    /// multi-hyper-connections (arXiv 2409.19606): the residual stream is
+    /// split into `mhc_streams` streams that are mixed by a learned matrix
+    /// instead of being added, replacing the loop's ReZero write.
+    ///
+    /// OFF by default, like `use_gr` and `use_attnres`, and mutually exclusive
+    /// with both — one check over all three lives in [`super::validate`] so a
+    /// fourth arm cannot leave a pair unguarded. Note this arm's shipped
+    /// `mhc_streams` default of 2 is the K the phi study (2604.21106v3 §5.2)
+    /// ran; the base paper's own n=4 is `--set mhc_streams=4`.
     #[serde(default)] pub use_mhc: bool,
+    /// Streams the residual stream is split into when `use_mhc` is on. **Must
+    /// divide `d_model`** and be `>= 1`: `MhcBlock` reshapes the hidden state
+    /// to `[b, t, n, d_model/n]` in its first forward, so a non-divisor is a
+    /// shape panic a long way from the flag — the same class as `act_group`,
+    /// and the same reason it is a loud check rather than a clamp.
     #[serde(default = "d_mhc_streams")] pub mhc_streams: usize,
     /// SiTU-GLU in the expert FFN (arXiv:2607.24653v2 Eq 12, Kimi K3):
     /// `beta1*tanh(Wg x/beta1) * Sigmoid(Wg x) * beta2*tanh(Wu x/beta2)` at
@@ -138,14 +309,66 @@ pub struct DormouseConfig {
     /// §2.3.2. Off is bitwise identical: see `situ_off_is_bitwise_the_old_model`
     /// and the unchanged `preset_exec` counts.
     #[serde(default)] pub use_situ: bool,
+    /// Experts selected per token in the sparse-routing FFN arm
+    /// (Switch-style). **`0` is the dense default** — the whole bank is blended,
+    /// which is the arm's own removal and therefore its control. A top-k
+    /// larger than `n_experts` is REFUSED rather than clamped, because the
+    /// silent result is the dense blend wearing the arm's label: the run would
+    /// print `moe=` counters for a model that never routed anything.
     #[serde(default = "d_moe_topk")] pub moe_topk: usize,
+    /// Switch §3.3 load-balancing coefficient. **`0.0` by default, and 0 with
+    /// `moe_topk > 0` is DELIBERATELY LEGAL** — it is the arm without its
+    /// balancer, which §1.2 requires in order to measure the arm at all, and
+    /// the external review found every published coefficient three orders of
+    /// magnitude too weak at our token count. The risk is countable rather than
+    /// refusable: `probe::MOE_LB` prints `moe=<lb>/<sel>` = `0/<n>` for a
+    /// routed run with no balancer. Setting it `> 0` with `moe_topk = 0` IS
+    /// refused: a term with no selection to balance is a field that reads like
+    /// an objective and contributes nothing.
     #[serde(default = "d_moe_lb_coef")] pub moe_lb_coef: f32,
+    /// Experts in the FFN bank. Every expert carries its own TSCT factors, so
+    /// this is a direct multiplier on the FFN's parameter count and on the
+    /// routing decision's width. `moe_topk` must not exceed it.
     #[serde(default = "d_n_experts")] pub n_experts: usize,
+    /// Weight of the JEPA auxiliary term (masked latent prediction against an
+    /// EMA teacher + KoLeo), on top of the CE. **ON by default at 0.05.**
+    /// `0.0` is the pure-CE baseline and queue row 1; the measured verdict is
+    /// JEPA+KoLeo over pure CE, 3/3 seeds (`d8062d1`) — but every A/B
+    /// conclusion from before 2026-09-27 is retracted, because the teacher was
+    /// being fed the label sequence.
     #[serde(default = "d_jepa_weight")] pub jepa_weight: f32,
+    /// Expected fraction of masked positions for the JEPA span mask, in
+    /// `(0, 1)`. The span rule inverts the per-position start rate so the
+    /// EXPECTED FRACTION is exactly this, so the field means what it says.
     #[serde(default = "d_jepa_mask_frac")] pub jepa_mask_frac: f32,
+    /// Length of each masked span, in byte positions. A start masks itself and
+    /// the `span - 1` positions after it, which is what makes a masked
+    /// position unpredictable from a masked neighbour — the point of masking.
+    /// A span of 8 at a 0.15 fraction is data2vec's ballpark.
     #[serde(default = "d_jepa_mask_span")] pub jepa_mask_span: usize,
+    /// Weight of the DSpark draft-head term. **0.0 in the shipped default**,
+    /// and the shipped production recipe also sets it 0 — the first DSpark
+    /// measurement this project has ever made, because the window was one
+    /// position shifted until 2026-09-29 (it read the byte it was asked to
+    /// predict). No DSpark number survives that, so nothing here is a
+    /// continuation of a previous one.
     #[serde(default = "d_dspark_weight")] pub dspark_weight: f32,
+    /// How many future bytes the draft head corrects at once (`k`). The term's
+    /// cost scales with it, and `k` must leave room for at least one anchor
+    /// inside the sequence: the anchor count is `floor((t - k - 1) / stride)`.
     #[serde(default = "d_dspark_k")] pub dspark_k: usize,
+    /// The DSpark window's anchor SPACING, in byte positions — a sampling
+    /// density, not a count. `1` is a window at every position; the default
+    /// `16` is ~6% of them, giving 31 anchors at `k=4`, `seq_len=512`. `0` is
+    /// REFUSED: it collapses the k-step window into k copies of one CE.
+    ///
+    /// Why striding and not the paper's random sampling: sampling is a second
+    /// RNG stream, and burn's global RNG is never seeded, which is the exact
+    /// defect that forced the JEPA mask to be rebuilt from `(seed, step)`
+    /// (ADR-0021) — two runs of one config drew different anchor sets, so no
+    /// A/B was reproducible and a resume changed the objective. This is a
+    /// determinism fix and has **never been A/B'd against sampling**; the
+    /// honest claim is "deterministic and documented", not "equivalent".
     #[serde(default = "d_dspark_stride")] pub dspark_stride: usize,
     /// Weight of the FUTURE-BYTE auxiliary head (our adaptation of arXiv
     /// 2404.19737's per-horizon multi-token heads to a byte-level AR model).
@@ -252,7 +475,7 @@ pub struct DormouseConfig {
     /// had per-key support (the corpus exhausts the 16.8M 3-gram space 2750x
     /// over) while n=5 and n=8 were ~5775-way averages - 512M dead
     /// parameters, 2/3 of the table. 2/3/4 is DeepSeek's own shipped set
-    /// over compressed tokens (V4.1-Flash n in {2,3,4}, Engram-27B [2,3])
+    /// over compressed tokens (V4.1-Flash n in 2,3,4; Engram-27B 2,3)
     /// and the deepest order whose key space (256^4 = 4.3e9) a 46 GB byte
     /// corpus can populate; n>=5 spaces (1.1e12) are hopeless. The VALUES
     /// are what `dormouse_data::ORDERS` hashes; the COUNT is what the model

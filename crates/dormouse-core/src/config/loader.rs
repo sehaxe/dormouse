@@ -1,17 +1,59 @@
+//! Presets are DATA: plain TOML files, found on disk. There is no Rust preset
+//! registry (ADR-0005), so a preset can be added without touching this crate
+//! and a reader of a run's config can go read the file that produced it.
+//!
+//! # The search, and what it costs
+//!
+//! [`load_config`] tries a fixed list of paths and takes the FIRST file that
+//! reads AND parses, in this order: `configs/<name>.toml` and
+//! `configs/<name>` relative to the cwd, the repo's own `configs/` via
+//! `CARGO_MANIFEST_DIR` (a compile-time constant, so this works from any cwd),
+//! four paths relative to the executable, then
+//! `~/.config/dormouse/<name>.toml` and `~/.config/dormouse/<name>`.
+//!
+//! A string containing a `/`, a `\`, or ending in `.toml` is treated as an
+//! EXPLICIT path and read directly — no search, and a missing file is an `Err`
+//! naming the path.
+//!
+//! # Known silent gap (2026-10-01)
+//!
+//! In the SEARCH path, a candidate that exists but fails to read or fails to
+//! parse is skipped **silently** (`try_file` drops the error), so
+//! `--preset small` with a broken `configs/small.toml` in the cwd falls
+//! through to the repo copy and runs a config nobody asked for, with no
+//! warning. The explicit-path branch has no such hole: it returns the parse
+//! error. Recorded in `docs/reviews/doc-coverage-2026-10-01.md`; not
+//! fixed here (docs lane, and a behaviour change is not a doc comment).
+//!
+//! Nothing is validated here. `load_config` parses; the caller owns
+//! [`super::validate`], and `load_config` does not call it, because the
+//! `--set` overrides that most often break a preset are applied AFTER this
+//! returns.
+
 use std::path::{Path, PathBuf};
 use super::schema::DormouseConfig;
 
+/// Does this string name a file rather than a preset? A separator or an
+/// explicit extension, and nothing else — so a preset named `foo/bar` cannot
+/// exist, which is the tradeoff for never guessing.
 fn is_explicit(s: &str) -> bool { s.contains('/') || s.contains('\\') || s.ends_with(".toml") }
 
+/// Parse one TOML document. `Err` carries toml's own message, so the failing
+/// line and key are in it.
 fn parse_str(s: &str) -> Result<DormouseConfig, String> {
     toml::from_str(s).map_err(|e| format!("toml parse: {e}"))
 }
 
+/// Read and parse one candidate, discarding BOTH failure modes. See the module
+/// docs: this is the silent gap, named rather than papered over.
 fn try_file(p: &Path) -> Option<DormouseConfig> {
     let s = std::fs::read_to_string(p).ok()?;
     parse_str(&s).ok()
 }
 
+/// The ordered search list. Order is the contract: cwd beats the repo copy
+/// beats the install dir beats `$HOME`, so a local edit to a preset shadows
+/// the checked-in one without a flag.
 fn candidates(name: &str) -> Vec<PathBuf> {
     let mut v = Vec::new();
     // cwd relative

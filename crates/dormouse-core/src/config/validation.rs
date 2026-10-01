@@ -1,7 +1,60 @@
+//! The LOUD gate for a resolved [`DormouseConfig`].
+//!
+//! # What belongs here and what does not
+//!
+//! A refusal belongs here exactly when the bad value would compute a
+//! DIFFERENT thing without saying so (AGENTS.md §1.1, ADR-0019). Three shapes
+//! qualify, and all three appear below:
+//!
+//! * **It computes a different objective.** `aux_fb_horizon = 0` makes the
+//!   future-byte head a second CE on the byte the main CE already predicts;
+//!   `dspark_stride = 0` collapses the k-step draft window to k copies of one
+//!   CE; `mor_k = 0` empties the recursion set. All three still descend.
+//! * **It is the control wearing the arm's label.** `moe_topk > n_experts`
+//!   silently runs the dense blend, and `moe_lb_coef > 0` with routing off is
+//!   an objective that contributes nothing.
+//! * **It fails far from the flag.** `act_group` and `mhc_streams` reshape the
+//!   hidden state on the first forward, so a non-divisor panics deep inside a
+//!   kernel with a shape error nobody can trace back to a config line.
+//!
+//! What does NOT belong here is a rule that only expresses a preference. The
+//! longest comment in this file is the one case that was deliberately NOT
+//! refused (`moe_topk > 0` with `moe_lb_coef == 0`) — it is the arm's own
+//! removal, and the risk is already countable (`probe::MOE_LB` prints `0`).
+//! A refusal there would have forced an operator to pass a coefficient that
+//! the sweep says is three orders of magnitude too weak.
+//!
+//! # Order and shape
+//!
+//! Returns `Err` on the FIRST failure, so the message names one problem, not
+//! all of them — a config with six bad fields takes six fix-and-rerun cycles
+//! by design, because a combined message hides which one the operator
+//! actually had. Pure: takes `&`, returns `Result`, mutates nothing.
+
 use super::schema::DormouseConfig;
 #[cfg(test)]
 use super::schema::ActQuant;
 
+/// Check every invariant the rest of the crate relies on, or name the first
+/// one that is broken.
+///
+/// `Err(String)` is a message meant to be read by a person at a terminal: it
+/// names the field, the value, and the escape. There is no error type, no
+/// error code and no partial-validity state — a config is either acceptable or
+/// the run does not start.
+///
+/// # Coverage this function does NOT have (and where it lives instead)
+///
+/// * Cross-arm compatibility that is not a conflict: nothing here checks that
+///   `use_tsct` and a given `--quant` make sense together, only that two
+///   residual-replacement arms are not both on.
+/// * Anything about the DATA: shard presence, corpus size and train/eval
+///   disjointness are `dormouse-data`'s business, and they are enforced at
+///   stream construction, not here.
+/// * Optimization and step schedule. Those fields are not in
+///   [`DormouseConfig`] at all (ADR-0005/0021): they belong to
+///   `dormouse-train`'s seam and are exempt from the resume
+///   config-equality check, because extending a run is a legal resume.
 pub fn validate(c: &DormouseConfig) -> Result<(), String> {
     macro_rules! gt0 {
         ($v:expr, $name:expr) => { if $v == 0 { return Err(format!("{} must be >0", $name)); } };
