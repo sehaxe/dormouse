@@ -6,7 +6,7 @@
 > it would add a dependency to save nothing. Kept as a **reference port** because the
 > probe measures its fused kernel; fate table: `docs/library-crate-fate.md`.
 
-[![CI](https://github.com/sehaxe/burn-swiglu/actions/workflows/ci.yml/badge.svg)](https://github.com/sehaxe/burn-swiglu/actions/workflows/ci.yml)
+> CI: this badge's workflow was deleted (`4963c3a`) — the gate is `../../.github/workflows/fused-library.yml`, and it has no GPU job (for CUDA: `tools/gpu-gate.sh`).
 [![Crates.io](https://img.shields.io/crates/v/burn-swiglu)](https://crates.io/crates/burn-swiglu)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Burn](https://img.shields.io/badge/Burn-0.22-orange.svg)](https://burn.dev)

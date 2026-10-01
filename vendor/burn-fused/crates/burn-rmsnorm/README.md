@@ -1,6 +1,6 @@
 # burn-rmsnorm - RMS Normalization for Burn
 
-[![CI](https://github.com/sehaxe/burn-rmsnorm/actions/workflows/ci.yml/badge.svg)](https://github.com/sehaxe/burn-rmsnorm/actions/workflows/ci.yml)
+> CI: this badge's workflow was deleted (`4963c3a`) — the gate is `../../.github/workflows/fused-library.yml`, and it has no GPU job (for CUDA: `tools/gpu-gate.sh`).
 [![Crates.io](https://img.shields.io/crates/v/burn-rmsnorm)](https://crates.io/crates/burn-rmsnorm)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Burn](https://img.shields.io/badge/Burn-0.22-orange.svg)](https://burn.dev)

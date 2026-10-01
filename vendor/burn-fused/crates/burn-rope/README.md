@@ -9,7 +9,7 @@
 > keeps RoPE. Left in place rather than deleted because the bench and the example
 > name it.
 
-[![CI](https://github.com/sehaxe/burn-rope/actions/workflows/ci.yml/badge.svg)](https://github.com/sehaxe/burn-rope/actions/workflows/ci.yml)
+> CI: this badge's workflow was deleted (`4963c3a`) — the gate is `../../.github/workflows/fused-library.yml`, and it has no GPU job (for CUDA: `tools/gpu-gate.sh`).
 [![Crates.io](https://img.shields.io/crates/v/burn-rope)](https://crates.io/crates/burn-rope)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Burn](https://img.shields.io/badge/Burn-0.22-orange.svg)](https://burn.dev)
