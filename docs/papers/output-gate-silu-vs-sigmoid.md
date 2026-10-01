@@ -30,7 +30,7 @@ it.** `tools/gen_reference_f64.py` transcribes the FLA file, which selects the
 *other* branch, while the kernel implements NVlabs. So the f64 fixture and the
 kernel would agree on this line even if the kernel were wrong — a
 transcription agreeing with a shared misunderstanding, which is exactly tier
-(c) in `docs/ORACLE.md` §3. Every other column of `ref_f64.bin` is unaffected;
+(c) in `docs/protocols/ORACLE.md` §3. Every other column of `ref_f64.bin` is unaffected;
 this one is structurally blind.
 
 ## The neighbouring arm already picks the other side
@@ -51,7 +51,7 @@ one.
 
 ## What would settle it
 
-ADR-0002 / `docs/AB-PROTOCOL.md`: this is a named arm, held-out BPB, 3 seeds,
+ADR-0002 / `docs/protocols/AB-PROTOCOL.md`: this is a named arm, held-out BPB, 3 seeds,
 one batch size so the eval window matches. **Not run.** No number is quoted
 here because none has been measured — the effect on BPB is unknown to this
 project, and the honest statement is that it has never been A/B'd.

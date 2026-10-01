@@ -138,7 +138,7 @@ All pass on all 8 cases; worst residuals are 0.0 (invariance and cross-check on
 6 cases) and 4.04e-05 absolute on the conf FD. The cross-check is explicitly a
 **tier (b) instrument under a tier (a) number** — it cannot prove the reference,
 only that the recording is not mis-shaped. Recorded in
-`docs/ORACLE-TIERS.tsv` and in the generator's docstring.
+`docs/protocols/ORACLE-TIERS.tsv` and in the generator's docstring.
 
 ### 1.4 The gate, and its red→green demonstration
 

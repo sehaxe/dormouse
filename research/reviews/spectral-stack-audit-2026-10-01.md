@@ -481,7 +481,7 @@ of GPU once the current run finishes (§1.5).
 5. **The retraction ladder as an A/B**: `--retract-iters {3,4,5}` × 3 seeds at
    2k steps, one batch size (§2.6). Buys: whether 3 is a cliff in practice
    (F3). The per-arm cost is currently **unknown** (§3.3's open item), not the
-   2.7 GPU-h `docs/AB-PROTOCOL.md` still prices it at.
+   2.7 GPU-h `docs/protocols/AB-PROTOCOL.md` still prices it at.
 6. **Not this lane, reported per §1.6**: `param.rs:1` (F12),
    `model.rs:416-417` (F9), `burn-spectral/src/lib.rs:19-20` (F8) and `:54`
    (F13) are one-line doc corrections in files other lanes may hold. Plus the

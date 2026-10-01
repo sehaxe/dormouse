@@ -1,7 +1,7 @@
 # ORACLE — what is actually being verified in `burn-kda` and `burn-gdn2`
 
 Written 2026-09-29 at `wt/oracle`, off `eeb3b73`. The machine-readable half of
-this file is `docs/ORACLE-TIERS.tsv`; the gate that reads it is
+this file is `docs/protocols/ORACLE-TIERS.tsv`; the gate that reads it is
 `tools/oracle_gate.py`. The false-confidence audit that already existed and is
 *not* duplicated here is `vendor/burn-fused/TEST-AUDIT.md`.
 

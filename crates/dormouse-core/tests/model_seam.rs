@@ -226,7 +226,7 @@ fn determinism() {
 /// added the `device.seed(cfg.seed)` call. That commit shipped the call and a
 /// comment; it shipped no test, so "the seed governs the init" has been prose
 /// since. The number usually quoted for what is left - 409 043 differing
-/// values, ~4% of the model - appears ONLY in docs/AB-PROTOCOL.md:93 and
+/// values, ~4% of the model - appears ONLY in docs/protocols/AB-PROTOCOL.md:93 and
 /// docs/PLAN-2026-09-29.md:198. It was never measured in a test, and a reader
 /// has no way to check it. This test is the measurement, and it runs on CPU in
 /// seconds.
@@ -257,7 +257,7 @@ fn determinism() {
 /// which is verified by drawing the reference values from a device seeded
 /// immediately beforehand - the same way the trainer does it. The
 /// cross-process half is measured separately (three zero-step CUDA runs,
-/// `docs/AB-PROTOCOL.md`) and is NOT green.
+/// `docs/protocols/AB-PROTOCOL.md`) and is NOT green.
 #[test]
 fn seeded_init_is_a_pure_function_of_the_seed_on_a_clean_stream() {
     let cfg = mini_nano();
@@ -335,7 +335,7 @@ fn seeded_init_is_a_pure_function_of_the_seed_on_a_clean_stream() {
         "SEED NOTE: {wdiff} of {} parameters differ between two in-process builds \
          (first at {wdiff_at:?}). EXPECTED: Device::seed() does not rewind a \
          consumed stream, so the second build is not a same-seed build. The \
-         cross-process question is measured in docs/AB-PROTOCOL.md and is NOT green.",
+         cross-process question is measured in docs/protocols/AB-PROTOCOL.md and is NOT green.",
         w1.len()
     );
     let d9 = device();

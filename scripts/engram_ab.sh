@@ -1,7 +1,7 @@
 #!/bin/bash
 # Engram A/B: control (arm off) vs treatment (the SHIPPED default arm), 3 seeds
 # per arm, 2000 steps, batch 20 x seq 512, pure CE, fp32, at the program's
-# operating depth (--max-iter 2, docs/AB-PROTOCOL.md 2026-09-27). The decision
+# operating depth (--max-iter 2, docs/protocols/AB-PROTOCOL.md 2026-09-27). The decision
 # rule is in that file: the treatment wins only if its mean held-out BPB beats
 # the control's mean by more than the control's own spread across its 3 seeds.
 #

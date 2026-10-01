@@ -27,7 +27,7 @@ does not.
 - **The retraction is genuinely unverified as an improvement** — the only test
   (`tsct_retract_restores_ortho`) proves it restores orthonormality, i.e. that it does
   what it says, not that doing it is better than not doing it. **Confirmed from the tree:**
-  the TSCT-vs-dense A/B has never been run (`docs/AB-PROTOCOL.md:113`, queue item 2).
+  the TSCT-vs-dense A/B has never been run (`docs/protocols/AB-PROTOCOL.md:113`, queue item 2).
 
 ---
 
@@ -271,7 +271,7 @@ cheaper. `--factors-fallback` moves the expert factors to the fallback optimizer
 Read from the tree, not assumed.
 
 1. **Has TSCT ever been A/B'd against a dense FFN? NO.**
-   `docs/AB-PROTOCOL.md:113` — queue item 2, `--set use_tsct=false`, "do the TSCT factors,
+   `docs/protocols/AB-PROTOCOL.md:113` — queue item 2, `--set use_tsct=false`, "do the TSCT factors,
    the polar retraction and the quant machinery earn ~1000 lines?". The file's own header
    (`:8-9`) says **"No arm in this queue has been judged"**. The A/B is *constructible*
    (`LinearLike::dense` exists, `param.rs:60-73`, and the comment there says the dense

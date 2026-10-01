@@ -266,7 +266,7 @@ part ours — would be defensible. This is a naming decision, not mine to make.
   constraint's stated purpose (`param.rs:174-175`) is quantized-forward conditioning,
   which P3 never had to solve. If we drop the retraction and the factor quant degrades,
   the 52.8 ms was buying something after all. **This is exactly the TSCT-vs-dense A/B that
-  `docs/AB-PROTOCOL.md` has never run — the literature cannot settle it for us.**
+  `docs/protocols/AB-PROTOCOL.md` has never run — the literature cannot settle it for us.**
 - **SPECULATION: a Cayley retraction (P4) would beat our current NS at k=64**, replacing
   5 power iterations + 7 syncs with a 128×128 inverse per factor. Basis: P2 names it as
   the cheaper alternative; the 2p ≪ n condition holds comfortably at our shapes. **No

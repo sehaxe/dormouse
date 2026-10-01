@@ -95,7 +95,7 @@ A fused/accelerated arm must be able to show it ran: the eval line prints the
 seam counters (`fused kda=fwd/bwd norm=ran/asked muon_skipped=mom/finalize`),
 and `probe.rs` counts every arm entry. If you add an arm, add its counter.
 
-### 1.2 A/B or death (ADR-0002, `docs/AB-PROTOCOL.md`)
+### 1.2 A/B or death (ADR-0002, `docs/protocols/AB-PROTOCOL.md`)
 
 Every mechanism beats **its own removal** on held-out BPB at a fixed step budget,
 or it is deleted. **A tie deletes the mechanism.** The ladder: 200-500 step
@@ -434,7 +434,7 @@ The defenses are installed, not optional.
   and `--eval-batches` alone does not fix the window: quoting "20 batches" or
   "100 KB" without `batch × seq_len` is not a number. The formula is right in
   `docs/glossary.md` ("eval tail") and was wrong as a constant here, in §3.1,
-  in `docs/AB-PROTOCOL.md:14` and in `README.md` — four documents carried
+  in `docs/protocols/AB-PROTOCOL.md:14` and in `README.md` — four documents carried
   "100 KB" for a run that scored 20 480 B.
 - **The anchors are a property of the fit, not of the corpus.** The bar moves
   with the fit corpus, the fit size and the scored window; `anchors.rs:22-35`
@@ -492,12 +492,12 @@ The defenses are installed, not optional.
 | batch ladder, warm (batch / step / tokens per s) | **8 / 244 ms / 16.8K · 16 / 440 ms / 18.6K · 32 / 826 ms / 19.8K · 64 / OOM** | Measured 2026-09-29, quiet card, release, small 9 195 854 params, depth 2, fp32, aux off, `--no-engram`, `CUBECL_AUTOTUNE_LEVEL=3`. Batch 64 dies at `server.rs:144` reserving 100 MB. Throughput gain from batch 8 → 32 is **+18%** and diminishing (+11%, then +6.5%), so a bigger batch is NOT the answer to idle-GPU — it buys gradient quality, not speed. This also **corrects** `history.tsv:54`'s "throughput is flat from batch 8 to 16": measured, it is +11%. |
 | the TSCT retraction is a FIXED cost, independent of batch | `retr` = **52.8 / 53.3 / 64.6 ms** at batch 8 / 16 / 32, against step times that grow 244 → 826 ms | Measured 2026-09-29. 8× the data for 1.2× the retraction: it is per-parameter Newton-Schulz over every TSCT factor, and it does not amortise. 22% of a step at batch 8, 7.8% at batch 32. `--retract-every 1000` gives `retr=0.0` and a 188 ms step (vs 240), so the 52 ms is real. **In no document before today, and never examined.** Same shape as `opt`: many small launches. |
 | eval window size | `eval_batches × batch × seq_len`; 102 400 B at batch 10, 20 480 B at batch 2, printed on every eval line | `train/src/lib.rs:1417`, §2.6 |
-| a 2k-step A/B run | ~1.6 s/step → 53 min/run, 2.7 GPU-h per arm. **This budget assumed an attention arm that did no backward work**; the re-cost is in §3.3 and is not measured | `docs/AB-PROTOCOL.md` |
+| a 2k-step A/B run | ~1.6 s/step → 53 min/run, 2.7 GPU-h per arm. **This budget assumed an attention arm that did no backward work**; the re-cost is in §3.3 and is not measured | `docs/protocols/AB-PROTOCOL.md` |
 | VRAM-validated on 16 GB | `small` batch 10 s512 with a 48M-row Engram; `base` fits at batch 3 and OOMs at batch 6 (the JEPA teacher is a second full forward) | AGENTS history, 2026-09 |
 | host-table Adam cadence cost | every-step vs 0: +2.3% step time (10884 vs 10637 ms) — the pipeline drain is the sync wait, not the copy | small/batch3/s512 smoke, 2026-09-04 |
 | GEMM ceilings on this GPU | cuBLAS f16 43.7 TFLOP/s, cuBLAS fp32 13.2, cubecl f32 3.5-7.6 | §2.2 |
 | eval anchors | **four readings, none on a trainer eval window** — unigram 5.398 / 5-gram 2.911, unigram 5.170 / 5-gram 2.572, `--fit` unigram 5.011 / 5-gram 2.588, and 2.826 vs 2.849 for one file at two `--bytes` | §2.6, `anchors.rs:22-35`. Uniform 8.000 by definition. A bar is a property of the fit, so no anchor here is reusable as published |
-| paired-eval resolution | estimated 0.002-0.005 BPB, **not verified** — measure it before believing a win that small | `docs/AB-PROTOCOL.md` |
+| paired-eval resolution | estimated 0.002-0.005 BPB, **not verified** — measure it before believing a win that small | `docs/protocols/AB-PROTOCOL.md` |
 
 ## 3.2 Retracted — do not cite these
 
@@ -585,7 +585,7 @@ The defenses are installed, not optional.
     **not reproduced here, with no committed log and no `benches/history.tsv`
     row**: the tensor-op path at batch 8 measured **25.8 s/step** against
     **3076 ms** without the arm. If that holds, the A/B budget in
-    `docs/AB-PROTOCOL.md` (53 min per 2k-step run) is wrong by more than an
+    `docs/protocols/AB-PROTOCOL.md` (53 min per 2k-step run) is wrong by more than an
     order of magnitude and the queue has to be re-costed before it is run. The
     `4628`-era note that the same op costs `3628 ms` fwd+bwd (`README.md:77`) is
     a different shape and is not a substitute.
@@ -654,7 +654,7 @@ The defenses are installed, not optional.
   measurement on a quiet GPU. It is also the *only* step-time measurement of
   removing the attention arm, and the arm was not training at the time, so it
   does not price the arm the fixed one costs.
-- **Every A/B verdict in `docs/AB-PROTOCOL.md`.** Not one arm has been judged.
+- **Every A/B verdict in `docs/protocols/AB-PROTOCOL.md`.** Not one arm has been judged.
   The instrument was wrong for the Engram arm (above), the attention arm in
   every control was frozen at initialisation (above), and no two runs in the
   archive share a window size. The queue is a list of experiments to *run*, not
@@ -711,7 +711,7 @@ The defenses are installed, not optional.
   file:line in `research/reviews/kda-gradflow-2026-09-30.md`. The
   `DM_GDN2_BWD_TRACE` line was not release-visible; the numeric test replaces
   it — the trace could never have proven gradient *arrival*.
-- **The A/B budget has not been re-costed.** `docs/AB-PROTOCOL.md` still prices
+- **The A/B budget has not been re-costed.** `docs/protocols/AB-PROTOCOL.md` still prices
   a 2k-step arm at 53 min, derived from ~1.6 s/step on a run whose attention
   backward did not execute. The 25.8 s/step batch-8 figure that would replace
   it has no committed log and no `benches/history.tsv` row, so the honest state
@@ -850,7 +850,7 @@ way to confirm a new control is clean — read them before the first A/B number
 is believed.
 
 The A/B queue with flags, costs and what each arm decides is
-[`docs/AB-PROTOCOL.md`](docs/AB-PROTOCOL.md). Summary: control → pure CE (do the
+[`docs/protocols/AB-PROTOCOL.md`](docs/protocols/AB-PROTOCOL.md). Summary: control → pure CE (do the
 aux heads earn their share of the step) → dense FFN (do TSCT, the retraction
 and the quant machinery earn ~1000 lines) → working set (4 epochs over 4.8 GB
 vs one pass over 19 GB) → rand depth → **depth 2 vs 4**, the cheapest big lever

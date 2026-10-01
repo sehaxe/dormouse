@@ -19,7 +19,7 @@ CPU/ndarray only; the GPU is running A/B arms.
 | config | `aux_fb_weight` (default **0.0**, OFF) and `aux_fb_horizon` (default **2**, `>= 1`, 0 refused) |
 | weight sharing with DSpark | **none** — no `W1`, no draft window, no acceptance head, no shared tensor |
 | seam | `probe::FUTURE_BYTE` (ran) / `probe::FUTURE_BYTE_ASKED` (asked), printed `fb=<ran>/<asked>` on the eval line |
-| A/B | row **1b** in `docs/AB-PROTOCOL.md` |
+| A/B | row **1b** in `docs/protocols/AB-PROTOCOL.md` |
 
 Files: `crates/dormouse-core/src/future_byte.rs` (new, 6 tests),
 `aux.rs` (+1 field, +1 `None`, zero signature churn), `model.rs` (+2 skip
@@ -27,7 +27,7 @@ fields, +1 construction line, +1 branch in `aux_loss`),
 `config/schema.rs`, `config/override.rs`, `config/validation.rs`,
 `probe.rs`, `lib.rs`, `configs/small.toml`,
 `crates/dormouse-train/src/lib.rs` (4 lines: one `let`, one format arg),
-`docs/AB-PROTOCOL.md`.
+`docs/protocols/AB-PROTOCOL.md`.
 
 ## The two shape decisions, in the two lines they deserve
 
@@ -180,7 +180,7 @@ check cannot be mistaken for a narrowing one.
   parameters read back off the device).
 - The A/B row's cost column is **unknown**, like every other row in that table:
   the queue's per-arm cost has not been re-costed since the attention
-  backward was fixed (AB-PROTOCOL, `docs/AB-PROTOCOL.md`).
+  backward was fixed (AB-PROTOCOL, `docs/protocols/AB-PROTOCOL.md`).
 
 ## Conflicts expected with the other aux lane
 

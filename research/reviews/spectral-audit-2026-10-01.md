@@ -752,7 +752,7 @@ branch's copy is the union.
 | `burn-spectral/tests/oracle/{sec4_fixed,sec4c_tolerance,sec4d_guard,sec5_6b,gate_dryrun}.py` | **branch** | new; the twin has none |
 | `burn-spectral/tests/oracle/falsify.sh` | **branch + §13.3** | new; the twin has none |
 | `burn-spectral/src/lib.rs` | **branch + §13.4** | the twin's `7811191` did not touch it; the audit's 3 comment corrections + 4 gates + 2 red-on-purpose tests are all here |
-| `docs/ORACLE-TIERS.tsv` | **hand-inserted, 7 rows** | R1 coverage for the six new `.py` files. `tools/gen_oracle_tiers.py` was NOT run — see the file's own header, which records that it has destroyed 22 rows once |
+| `docs/protocols/ORACLE-TIERS.tsv` | **hand-inserted, 7 rows** | R1 coverage for the six new `.py` files. `tools/gen_oracle_tiers.py` was NOT run — see the file's own header, which records that it has destroyed 22 rows once |
 | `tools/polar_probe.rs`, `research/spectral-inventory-2026-10-01.md` | **main, untouched** | the twin's instruments; the branch never had them |
 
 ### 13.3 `SIGMA_OVERSHOOT` — a correction to the landing brief

@@ -143,7 +143,7 @@ is missing, so the next reader does not assume a kept crate is a live one.
   a documented gap with a crate already written for it. Call site: the KDA
   query/key projection in `attention.rs`, inside the dtype cast-to-fp32 rule
   (§2.2). Earning it: a 3-seed / 2k-step A/B on held-out BPB against the
-  no-position control, per `docs/AB-PROTOCOL.md`. Not done here — the call site
+  no-position control, per `docs/protocols/AB-PROTOCOL.md`. Not done here — the call site
   is in `crates/`, which three other worktrees hold.
 - **`burn-parcae` (317).** Constrains the loop's state-retention spectral norm,
   which is aimed straight at the open instability in `AGENTS.md:256` ("the

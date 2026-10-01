@@ -5,7 +5,7 @@ the list of what is currently unverified — because a rule that is not written
 down is not followed, and "we checked it once by eye" is how 25858 ms/step
 became a number three people believed.
 
-> **For the fused library, read `docs/ORACLE.md` first.** It is the companion to
+> **For the fused library, read `docs/protocols/ORACLE.md` first.** It is the companion to
 > this file and answers a question this one does not: for `burn-kda` and
 > `burn-gdn2`, *which defect class each existing test can and cannot catch*, and
 > which classes **no** test in those crates can catch. The short version, which
@@ -15,7 +15,7 @@ became a number three people believed.
 > **zero** difference. The only layer that can see that region is the
 > `ref_data.bin` transcription, and it is currently red and behind a
 > non-default feature. The machine-readable table is
-> `docs/ORACLE-TIERS.tsv`; `tools/oracle_gate.py` exits 1 on a claim of
+> `docs/protocols/ORACLE-TIERS.tsv`; `tools/oracle_gate.py` exits 1 on a claim of
 > bit-exactness against an arm-vs-arm comparison.
 
 ## The rule

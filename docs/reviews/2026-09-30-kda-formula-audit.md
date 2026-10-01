@@ -6,7 +6,7 @@
 tensor-path and kernel implementations burn-kda *calls*); no burn-gdn2 file is
 edited, that is another lane's.
 
-**Verdict vocabulary** (ADR-0020, as `docs/ORACLE-TIERS.tsv` uses it):
+**Verdict vocabulary** (ADR-0020, as `docs/protocols/ORACLE-TIERS.tsv` uses it):
 
 | word | meaning here |
 |---|---|
@@ -43,7 +43,7 @@ lane's inventory splits cleanly:
   it. What I did instead is the thing that audit could not do: **run the
   authors' code** (§2).
 
-`docs/ORACLE-TIERS.tsv` registered `burn-kda/src/lib.rs` as tier **(d) —
+`docs/protocols/ORACLE-TIERS.tsv` registered `burn-kda/src/lib.rs` as tier **(d) —
 "n/a, no fidelity claim in the file"**. §2 is what moves it.
 
 ---
@@ -72,7 +72,7 @@ Line numbers are at `3234ecc`.
 **Tally: 14 sites — 8 AGREE, 4 DISAGREE (1 of them doc-only), 2 NO EXTERNAL
 REFERENCE (both deliberate and correctly labelled).** Nothing below rests on a
 prior reading: every verdict marked (a) was checked against FLA's own code
-**after running it**, and `docs/ORACLE-TIERS.tsv`'s tier-(d) registration for
+**after running it**, and `docs/protocols/ORACLE-TIERS.tsv`'s tier-(d) registration for
 `burn-kda/src/lib.rs` is superseded by the (a) row for
 `burn-kda/tests/kda_oracle.rs`. Nothing below rests on a
 prior reading: every verdict marked (a) was checked against FLA's own code after
@@ -508,7 +508,7 @@ the test rather than the code, and `falsify.sh` says so instead of shipping one.
 
 ## 7. The gate question's own meta-answer, and one thing worth saying
 
-`burn-kda` was registered in `docs/ORACLE-TIERS.tsv` as tier **(d) — "n/a, no
+`burn-kda` was registered in `docs/protocols/ORACLE-TIERS.tsv` as tier **(d) — "n/a, no
 fidelity claim in the file"**. It is not (d). It cites three sources by
 arXiv id and one by `file:line`, ships an f64-oracle discipline in its
 neighbour, and four of its formulas are now checked against **executed**
@@ -516,7 +516,7 @@ upstream code. The registry now carries the (a) row, and the generator, the
 fixture and both pinned upstream files have rows of their own.
 
 **One thing this lane did not have to invent**, and it is why the crate was
-worth auditing at all: `docs/ORACLE-TIERS.tsv` already had the right question
+worth auditing at all: `docs/protocols/ORACLE-TIERS.tsv` already had the right question
 written down — *"if it names a function in this fork, the comparison is
 arm-vs-arm and the tier is (d), whatever the test's own name says."* Every
 existing burn-kda test names a function in this fork. The tier was **(d) for a

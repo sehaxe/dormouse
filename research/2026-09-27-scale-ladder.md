@@ -127,7 +127,7 @@ arithmetic gives ~2.5 h for 150M tokens at 16.8k tok/s, batch 8**), 20-30M for
 a few days. That is also the regime where every architectural question is still
 answerable, because held-out BPB moves visibly at that scale. Chasing 1B before
 the 7.5M model beats a 24-line 5-gram counter (2.572 BPB — and note that bar was
-**not measured on a trainer eval window**; see `docs/AB-PROTOCOL.md` and
+**not measured on a trainer eval window**; see `docs/protocols/AB-PROTOCOL.md` and
 `anchors.rs:22-35`) is optimizing the wrong term.
 
 ## What multiplies the whole table

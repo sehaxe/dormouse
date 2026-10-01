@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# MoR vs fixed-depth control, per docs/AB-PROTOCOL.md: 3 seeds per arm, 2000
+# MoR vs fixed-depth control, per docs/protocols/AB-PROTOCOL.md: 3 seeds per arm, 2000
 # steps, batch 20 x seq 512, pure CE, fp32, --eval-every 250 --eval-depths.
 #
 # NOT RUN AS-IS on 2026-09-29, for three measured reasons, all checked by
 # this script rather than assumed:
 #
-#  1. COST IS UNKNOWN. docs/AB-PROTOCOL.md prices a 2k-step arm at 53 min from
+#  1. COST IS UNKNOWN. docs/protocols/AB-PROTOCOL.md prices a 2k-step arm at 53 min from
 #     a ~1.6 s/step run whose attention backward never executed (AGENTS.md
 #     §3.2/§3.3). The working tensor-op KDA backward measured 25.8 s/step at
 #     batch 8. `preflight` below measures the real number at THIS shape before

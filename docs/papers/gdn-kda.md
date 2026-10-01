@@ -33,7 +33,7 @@ crates for arXiv ids returns exactly three, and none of them is `2601.16531`:
 
 `2601.16531` appears **only** in the *Engram* line of the repo:
 `crates/dormouse-core/src/config/schema.rs:122`, `configs/small.toml:29`,
-`docs/AB-PROTOCOL.md:119`, `README.md:82`,
+`docs/protocols/AB-PROTOCOL.md:119`, `README.md:82`,
 `research/2026-09-27-pkm-engram-deepseek.md`. In every one of those places it
 is used for what it actually is: a single-author Engram-preprint, cited as
 weak evidence, for the 500K-slot saturation curve and the gate anti-correlation.

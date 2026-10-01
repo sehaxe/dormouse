@@ -226,7 +226,7 @@ read v3's §1–§3 and assumed the appendices matched. Every downstream claim a
 **Claim 2 — TRUE.** `https://github.com/K1seki221/MuonPlus` → HTTP 200; GitHub API
 returns `{"id": 1166260539, "full_name": "K1seki221/MuonPlus", "private": false}`.
 
-**Claim 6 — TRUE.** `docs/AB-PROTOCOL.md:113` is queue item 2
+**Claim 6 — TRUE.** `docs/protocols/AB-PROTOCOL.md:113` is queue item 2
 (`--set use_tsct=false`, "do the TSCT factors, the polar retraction and the quant
 machinery earn ~1000 lines?"); the file's own header at `:8-9` reads "**No arm in
 this queue has been judged**". `train/src/lib.rs:2026-2041`

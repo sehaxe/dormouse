@@ -11,7 +11,7 @@ touched. `research/papers/*.md`, the vendor crates and the tree are as the autho
 **Read:** `docs/papers/muon-plus.md`, `docs/papers/tsct.md`,
 `vendor/burn-fused/crates/burn-spectral/src/lib.rs`, `vendor/burn-fused/crates/burn-muon-plus/`,
 `crates/dormouse-core/src/{param,loop_block,routing}.rs`, `crates/dormouse-train/src/{lib,optim}.rs`,
-`docs/AB-PROTOCOL.md`, `benches/history.tsv`.
+`docs/protocols/AB-PROTOCOL.md`, `benches/history.tsv`.
 
 **Assumptions I am judging against, stated so they can be rejected:**
 
@@ -341,7 +341,7 @@ answer on this card and the wrong answer on a H100 is a latent bug, which is exa
 
 ## 3. The minimum experiment that would decide TSCT, and what it costs
 
-`tsct.md` §4.1 and `docs/AB-PROTOCOL.md:113` both say the TSCT-vs-dense A/B is unrun. I think
+`tsct.md` §4.1 and `docs/protocols/AB-PROTOCOL.md:113` both say the TSCT-vs-dense A/B is unrun. I think
 both name the wrong *first* experiment. In cost order:
 
 ### E1 — does 3 cubic steps actually reach the manifold at our shapes? (CPU, < 5 min, 0 GPU)
@@ -400,7 +400,7 @@ least three things at once:
    paper's own Table 1 puts Muon+ vs Muon at −0.41 to −2.02 loss — a *known, large, published*
    effect. The arm cannot separate a known large effect from an unknown speculative one.
 
-`docs/AB-PROTOCOL.md:113` is aware of the parameter-budget confound ("a narrower FFN at the
+`docs/protocols/AB-PROTOCOL.md:113` is aware of the parameter-budget confound ("a narrower FFN at the
 same param budget") and **says nothing about the optimizer confound**, which is the larger of
 the two.
 

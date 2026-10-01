@@ -208,7 +208,7 @@ our loop is weight-shared, so iteration slot ≠ layer. One query per slot
 (`[max_iter][d_model]` parameters) is the faithful reading of "per layer" at
 unrolled depth `max_iter`, and it is what `Vec<AttnRes>` holds. A single
 shared query would be a smaller model and a different mechanism; it is not
-offered, and `docs/AB-PROTOCOL.md` does not ask for it.
+offered, and `docs/protocols/AB-PROTOCOL.md` does not ask for it.
 
 **No 4D tensor is materialised** (AGENTS §2.2: dynamic slicing of a 4D
 autodiff tensor is `CUDA_ERROR_ILLEGAL_ADDRESS` on sm_120). The history is a

@@ -869,7 +869,7 @@ pub fn train_loop(
     // `Device::seed` was never called, so every parameter drew from process
     // entropy. Three things follow, and all three are load-bearing:
     //
-    //   - no bit-exact golden is possible, which is why docs/VERIFICATION.md
+    //   - no bit-exact golden is possible, which is why docs/protocols/VERIFICATION.md
     //     layer 2 had no way to exist;
     //   - ADR-0002's "3 seeds per arm, and a win must beat the spread of the
     //     control's own seeds" was NOT IMPLEMENTABLE as written, because

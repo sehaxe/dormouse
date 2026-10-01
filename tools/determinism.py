@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Cross-process determinism check for a dormouse checkpoint.
 
-WHAT THIS IS FOR. `AGENTS.md` 3.7 and `docs/AB-PROTOCOL.md` carry a
+WHAT THIS IS FOR. `AGENTS.md` 3.7 and `docs/protocols/AB-PROTOCOL.md` carry a
 cross-process reproducibility claim for `--seed`. This is the check behind the
 replacement number, and it is a standalone script because the property is
 cross-PROCESS: you cannot test it by building a model twice inside one process

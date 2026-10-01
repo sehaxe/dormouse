@@ -278,4 +278,4 @@ Knowing what is *not* in the model is part of the model:
    the whole architecture in 260 lines;
 4. [`AGENTS.md`](AGENTS.md) §1 RULES and §2 MACHINE FACTS, before the first GPU
    run;
-5. `docs/AB-PROTOCOL.md` — how a mechanism gets judged, and what is in the queue.
+5. `docs/protocols/AB-PROTOCOL.md` — how a mechanism gets judged, and what is in the queue.

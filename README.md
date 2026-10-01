@@ -91,7 +91,7 @@ still true; where the two disagree, this subsection wins.
   memory-disabled eval (`7adda92`) — §(a)'s retraction table has both. The six
   arms landed 2026-09-30/10-01 (MHC, SiTU, RoPE, MoE, AttnRes, future-byte) are
   in the queue **today**, 3 seeds × 2k steps each, and per
-  [`docs/AB-PROTOCOL.md`](docs/AB-PROTOCOL.md) **a tie deletes the mechanism**.
+  [`docs/protocols/AB-PROTOCOL.md`](docs/protocols/AB-PROTOCOL.md) **a tie deletes the mechanism**.
   The protocol's old cost line (2.7 GPU-h/arm) is void; at the measured
   ~500 ms/step a 2k-step run is ~17 min, so an arm is ~1 GPU-h.
   The Engram arm — 2.4 M memory parameters,
@@ -392,7 +392,7 @@ One sentence per mechanism, and why it is there:
 Every mechanism that is not the model lives in
 [`vendor/burn-fused/crates/`](vendor/burn-fused/crates) — 20 crates of our own
 technology library, each with its paper reference and its own verification
-tier ([`docs/ORACLE-TIERS.tsv`](docs/ORACLE-TIERS.tsv)). They are **not**
+tier ([`docs/protocols/ORACLE-TIERS.tsv`](docs/protocols/ORACLE-TIERS.tsv)). They are **not**
 dependencies of burn; the repo also vendors patched forks of five cubecl/cubek
 crates (`[patch.crates-io]` in the root `Cargo.toml` — the only authority for
 the count).
@@ -694,7 +694,7 @@ reader of the logs will eventually need:
 | [`tools/determinism.py`](tools/determinism.py) + `tools/determinism/` | the cross-process seed harness: two independent tensor-level instruments; same seed → non-TSCT slots bit-identical across processes (7 951 694/7 951 694), different seed → relFro 1.414, separation ~10⁶ |
 | `tests/oracle/*.py` | standalone python oracles for the spectral math (central differences, basin checks, guard discrimination) — run without Rust |
 | [`tools/falsify_fused_adjoint.sh`](tools/falsify_fused_adjoint.sh) | 6 injected mutants, all DETECTED on their own assertion, byte-identical restore — the gate-testing-the-gate pattern |
-| [`tools/oracle_gate.py`](tools/oracle_gate.py) + [`docs/ORACLE-TIERS.tsv`](docs/ORACLE-TIERS.tsv) | per-crate verification tier register; hand-edited only — the generator destroyed 22 rows once |
+| [`tools/oracle_gate.py`](tools/oracle_gate.py) + [`docs/protocols/ORACLE-TIERS.tsv`](docs/protocols/ORACLE-TIERS.tsv) | per-crate verification tier register; hand-edited only — the generator destroyed 22 rows once |
 | [`tools/spot_check.py`](tools/spot_check.py) | claims-vs-artifact spot checks over the docs |
 | `crates/dormouse-data/src/bin/anchors.rs` | the 5-gram bar; `--fit` scores the bar on the model's own eval file — the only comparable way |
 
@@ -802,7 +802,7 @@ one exists because breaking it cost a run, a week, or a claim.
 | [`AGENTS.md`](AGENTS.md) | agent-facing repo state: measured numbers, CUDA quirks, every knob |
 | [`docs/glossary.md`](docs/glossary.md) | the vocabulary ("fused", "arm", "sidecar", "iteration", "Engram") and the live list of places a document and the code disagree |
 | [`docs/PLAN.md`](docs/PLAN.md) | program plan, phase ladder, verdicts, north star |
-| [`docs/AB-PROTOCOL.md`](docs/AB-PROTOCOL.md) | the measurement instrument and the A/B queue (unrun) |
+| [`docs/protocols/AB-PROTOCOL.md`](docs/protocols/AB-PROTOCOL.md) | the measurement instrument and the A/B queue (unrun) |
 | [`docs/adr/`](docs/adr/) | ADR-0001..0022 — every recorded decision, including the retracted ones |
 | [`docs/audit-2026-09-25.md`](docs/audit-2026-09-25.md) | codebase verdict audit: kill list, missing A/Bs |
 | [`docs/design-minimal.md`](docs/design-minimal.md) | the minimal-architecture target |

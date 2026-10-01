@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regenerate docs/ORACLE-TIERS.tsv from the table below.
+"""Regenerate docs/protocols/ORACLE-TIERS.tsv from the table below.
 
 Kept as a script because the TSV is the one artifact in this lane that must be
 line-exact, and a hand-edited tab-separated file loses rows.
@@ -243,7 +243,7 @@ ROWS = [
 
 HEADER = """# ORACLE-TIERS.tsv - what every reference comparison in burn-kda / burn-gdn2 is
 # ACTUALLY compared against. Read by tools/oracle_gate.py; the prose form is
-# docs/ORACLE.md. Tiers are ADR-0020's: (a) AUTHORS (b) TRANSCRIPTION
+# docs/protocols/ORACLE.md. Tiers are ADR-0020's: (a) AUTHORS (b) TRANSCRIPTION
 # (c) TRANSCRIPTION-OF-TRANSCRIPTION (d) NOTHING. (x) = not a correctness test.
 #
 # "target" is the thing the expected value came from. If it names a function in
@@ -267,7 +267,7 @@ def main():
             assert "\t" not in cell and "\n" not in cell, cell[:40]
         full = "vendor/burn-fused/crates/" + rel
         out.append("\t".join((full, tier, target, catches, cannot, waiver)) + "\n")
-    p = os.path.join(root, "docs", "ORACLE-TIERS.tsv")
+    p = os.path.join(root, "docs", "protocols", "ORACLE-TIERS.tsv")
     with open(p, "w", encoding="utf-8") as fh:
         fh.writelines(out)
     print("wrote %s: %d rows" % (p, len(ROWS)))

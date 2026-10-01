@@ -269,7 +269,7 @@ numerically-dead-at-init readout to the residual stream.
    produced with, and AGENTS.md §3.4 already requires the control to be re-baselined
    *before* any arm is judged. Shipping this as an unmeasured "fix" repeats the exact
    failure AGENTS.md §3.2 catalogues — a change to a network charged to a mechanism that
-   was never separated from its control. It belongs in `docs/AB-PROTOCOL.md` as an arm
+   was never separated from its control. It belongs in `docs/protocols/AB-PROTOCOL.md` as an arm
    with 3 seeds, not in a bugfix commit.
 2. **Keep ours, delete the claim.** Fix the comment at `lib.rs:166-169` and `AGENTS.md:274,
    837-839` to say what is true — "chosen locally; *not* a Moonshot or FLA recipe; measured

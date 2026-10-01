@@ -31,7 +31,7 @@ pass's claims (§7).
 >    latent-space predictor. This is the nearest published analogue to a LoopBlock with a
 >    controller, and it is a negative one.
 > 4. **The price is measured, and it is not the unsourced "26% of the step" in
->    `docs/AB-PROTOCOL.md:216`.** The real, repo-sourced cost is **VRAM, not time**: with
+>    `docs/protocols/AB-PROTOCOL.md:216`.** The real, repo-sourced cost is **VRAM, not time**: with
 >    aux off the card takes **batch 16 in 5908 MiB = 37% of 16 GB**; with the JEPA teacher
 >    on, **batch 4 OOMs** (`benches/history.tsv:51-56`). The EMA update itself is
 >    **3.9–5.4 ms of a 2601–2851 ms warm step = 0.14–0.21%**
@@ -182,7 +182,7 @@ of that sentence for us — see §3.1.**
 | EMA teacher update | **3.9 / 4.2 / 5.4 / 4.3 ms** of 2665 / 2851 / 2601 / 2729 ms warm steps → **0.14–0.21%** | `~/logs/ab8m_ab8m_iter4.log:10-16` (aux on; `ema` timer non-zero) |
 | **VRAM, the real price** | aux off: **batch 16 = 5908 MiB = 37% of 16 GB**. With the JEPA teacher on: **batch 4 OOMs.** | `benches/history.tsv:51-56`, 2026-09-28, `422414c` |
 | teacher forward | **not separately timed.** SPECULATION: ≈ +1 fwd. On the 9.2M warm profile fwd is 46–48 ms of 245 ms (19%), so ≈ **+19% step time** if it is counted in `fwd`, or **+0** if the timer excludes it. **Unresolved — do not quote a step-cost number until `--timers` is read on an aux-on run.** | — |
-| "26% of the step" in `docs/AB-PROTOCOL.md:216` | **UNSOURCED.** No derivation in the repo. Under AGENTS §1.4 this number should be struck or derived. | — |
+| "26% of the step" in `docs/protocols/AB-PROTOCOL.md:216` | **UNSOURCED.** No derivation in the repo. Under AGENTS §1.4 this number should be struck or derived. | — |
 
 The VRAM row is the finding that changes the decision. **At 16 GB, the JEPA teacher costs us
 batch size, and batch size is the knob that buys gradient quality** (AGENTS §3.1: the batch
@@ -434,7 +434,7 @@ result, and this brief changes that only by naming the arms.
 
 ## 6. The A/B that would settle it
 
-Consistent with `docs/AB-PROTOCOL.md` (3 seeds, 2k steps, one batch size across all arms so
+Consistent with `docs/protocols/AB-PROTOCOL.md` (3 seeds, 2k steps, one batch size across all arms so
 the eval window matches, window printed, pure CE baseline, 200-500 step smoke first).
 
 ### 6.1 Preconditions — run these first, they are free and they gate everything
@@ -490,7 +490,7 @@ Then, and only then, one seed per rung, no 3-seed requirement:
 
 ### 6.4 Budget, honestly
 
-Per-arm cost is **still unknown** (`docs/AB-PROTOCOL.md:202-203` withdrew the 1.6 s/step
+Per-arm cost is **still unknown** (`docs/protocols/AB-PROTOCOL.md:202-203` withdrew the 1.6 s/step
 figure, and the 25.8 s/step replacement has no committed log). The one in-shape datapoint is
 1068 ms/step at `small`+`mor`, batch 20, pure CE — but that run printed `fused kda=64/0`, so
 it is a floor, not a budget. **4 arms × 3 seeds × 2000 steps, plus P1-P3.** If the teacher's
@@ -509,7 +509,7 @@ document. Verified against primary sources today.
 | **C1** | §5: *"I-JEPA (2301.08243) — has context-prediction with a target encoder but **no EMA momentum**; using it as the citation would have been wrong. The crate did not."* (also row J-list §0) | I-JEPA §3: *"The parameters of the predictor ϕ and context encoder θ are learned through gradient-based optimization, while the parameters of the target encoder θ̄ are updated via an **exponential moving average** of the context-encoder parameters. The use of an exponential moving average target-encoder has proven essential for training JEAs with Vision Transformers, **we find the same to be true for I-JEPA**."* App. A: *"We use a momentum value of 0.996, and linearly increase this value to 1.0 throughout pretraining."* | **I-JEPA and data2vec 2.0 agree on the EMA teacher.** The real distinction is (i) target = average-pooled **target blocks** vs average of the top-K blocks, and (ii) the mask pattern. The variant taxonomy in the owner's brief ("I-JEPA-style target-encoder … vs ours") rests on a distinction that is not the EMA. |
 | **C2** | row **J4** / §2.3: *"data2vec 2.0 does not mask … **BUG — citation misattribution.** A BEiT/I-JEPA-style masked loss sold as data2vec 2.0."* Verdict: the crate "is marketing data2vec 2.0's name over a loss data2vec 2.0 does not have." | The abstract's *"We do not encode masked tokens"* refers to the **teacher** encoding the **unmasked** sample. The method section is explicit: *"we create latent contextualized representations with a teacher model based on **unmasked** training examples which are regressed by a student model whose input is a **masked version** of the sample"*; *"The training task is for the student network to regress these targets based on the masked version of the sample"*; and the multi-mask mechanism reuses one target across **M different masked versions**. | **The naming is right; the reasoning was wrong, and it reached the opposite conclusion.** data2vec 2.0 masks the student input. So the real defect is not "we mask, the paper doesn't" — it is **"we do not mask the input and the paper does"** (§3.3 R2). This *strengthens* the retune case and removes a misattribution. |
 | **C3** | row **J5**: instance normalization is the largest delta, marked **SPECULATION** because the paper body was not read | Now **VERIFIED**: *"Before averaging, activations are normalized using instance normalization (Ulyanov et al., 2016)."* NLP/vision tables list `IN → AVG → LN`. Also: the loss is **L2**, and *"This is a simplification compared to the Smooth L1 loss used in Baevski et al. (2022)"* — so `jepa.md`'s "smooth-L1 (Huber, β=2.0)" is the **v1** loss, not 2.0's. | R1 is no longer a hypothesis. Also `jepa.md` mis-transcribed the loss family: 2.0 uses **L2**, ours is **L1**, neither is smooth-L1. |
-| **C4** | `docs/AB-PROTOCOL.md:216` "do the aux losses earn their 26% of the step?" | No derivation anywhere in the repo | **Strike or derive** (AGENTS §1.4). The measured costs are 0.14-0.21% (EMA) and a **halved legal batch** (VRAM). |
+| **C4** | `docs/protocols/AB-PROTOCOL.md:216` "do the aux losses earn their 26% of the step?" | No derivation anywhere in the repo | **Strike or derive** (AGENTS §1.4). The measured costs are 0.14-0.21% (EMA) and a **halved legal batch** (VRAM). |
 
 ---
 
@@ -538,7 +538,7 @@ All fetched 2026-09-30. Version and date as returned by the arXiv API.
 **Repo sources cited:** `crates/dormouse-core/src/{model.rs:86-106,150-156}`, `aux.rs:25,29,176-179,224-232`;
 `vendor/burn-fused/crates/burn-jepa/src/{losses.rs:11-20,63-97, mask.rs:9-25, predictor.rs}`;
 `benches/history.tsv:51-56`; `~/logs/ab8m_ab8m_iter4.log:10-16`; `~/logs/train_nokda.log:91`;
-`docs/AB-PROTOCOL.md:185-230`; `docs/audit-2026-09-25.md:29,62,64,87`; `docs/papers/jepa.md`.
+`docs/protocols/AB-PROTOCOL.md:185-230`; `docs/audit-2026-09-25.md:29,62,64,87`; `docs/papers/jepa.md`.
 
 ---
 

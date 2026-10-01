@@ -9,7 +9,7 @@ The rule this mechanises, verbatim from docs/adr/0020-oracle-discipline.md:
     permitted phrasing is "matches our transcription of <arXiv> to <tolerance>".
 
 ADR-0020 wrote that grep out and nobody built it. This is that grep, plus the
-one thing a grep cannot do: it consults docs/ORACLE-TIERS.tsv, which records
+one thing a grep cannot do: it consults docs/protocols/ORACLE-TIERS.tsv, which records
 what each file is ACTUALLY compared against. A file whose declared tier is not
 (a) and which says "bit-for-bit" anyway is a false claim, and this exits 1.
 
@@ -47,7 +47,7 @@ import re
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-REGISTRY = os.path.join(ROOT, "docs", "ORACLE-TIERS.tsv")
+REGISTRY = os.path.join(ROOT, "docs", "protocols", "ORACLE-TIERS.tsv")
 CRATES = os.path.join(ROOT, "vendor", "burn-fused", "crates")
 # burn-rmsnorm joined the scope when `tests/rmsnorm_oracle.rs` landed: it is the
 # tree's first tier-(a) row, and a registry row nothing scans is a row that

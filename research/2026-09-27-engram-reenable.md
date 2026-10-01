@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-27 · **Status:** implementation landed, A/B queued
 **Parent:** `research/2026-09-27-pkm-engram-deepseek.md` (the mechanism survey
-this decision is built on) · **Rule:** `docs/AB-PROTOCOL.md`
+this decision is built on) · **Rule:** `docs/protocols/AB-PROTOCOL.md`
 
 ## 1. The decision, in one line
 
@@ -146,11 +146,11 @@ next to the test that could detect a change.
 
 ## 5. The A/B
 
-Protocol (`docs/AB-PROTOCOL.md`), unmodified: control = arm off, treatment =
+Protocol (`docs/protocols/AB-PROTOCOL.md`), unmodified: control = arm off, treatment =
 arm on at 500K rows/order, **3 seeds per arm**, 2000 steps, batch 20 x seq
 512, `--jepa-weight 0 --dspark-weight 0` (pure CE, so the arm is judged
 alone), fp32, host-RAM tables with per-step CPU Nesterov+Sinkhorn, scored on
 the fixed held-out window with `--eval-every 250 --eval-batches 10
 --eval-depths`. The bar is the n-gram counter on the same window.
 
-RESULTS: see `docs/AB-PROTOCOL.md` (the queue row is the verdict of record).
+RESULTS: see `docs/protocols/AB-PROTOCOL.md` (the queue row is the verdict of record).

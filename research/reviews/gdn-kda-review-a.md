@@ -51,7 +51,7 @@ Five occurrences repo-wide, all on the Engram line, all used as a slot-saturatio
 curve. **The report's premise-refutation is correct.**
 
 **But its list is incomplete.** The report enumerates `schema.rs:122`,
-`configs/small.toml:29`, `docs/AB-PROTOCOL.md:119`, `README.md:82`, and the
+`configs/small.toml:29`, `docs/protocols/AB-PROTOCOL.md:119`, `README.md:82`, and the
 PKM research doc. There is a sixth:
 
 ```
