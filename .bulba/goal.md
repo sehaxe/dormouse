@@ -338,3 +338,11 @@ f32-кондиционирование ~1e-4 decay-градиента). CUDA-п�
 (после 100k) в wt/kda-adjoint. Включение fused-пути в тренер — после
 зелёного CUDA-прогона. Маш-факт: 38 параллельных ld.mold → I/O pressure 86%
 при CPU/RAM 0 — сборки тестов линкуют 20 бинарников параллельно.
+
+## РЕШЕНО (владелец, 2026-10-01 вечер): burn-fused → переименовать в dormouse-fused
+Имя «burn-fused» ложно (наша библиотека, не форк burn; §1.7). Выполнить ПОСЛЕ
+посадки активных дорожек (graph-trainer, ab-wave, docs-site инжестирует пути
+прямо сейчас): git mv vendor/burn-fused → vendor/dormouse-fused + обновить
+корневой exclude, fused-library.yml (working-directory, workspaces, пути в
+комментариях), README/AGENTS, research-ссылки. Механическая дорожка, один
+коммит. Урок двойников: канонические пути MD не трогать, кроме этого переименования.
