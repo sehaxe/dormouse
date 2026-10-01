@@ -87,3 +87,42 @@ jobs:
         continue-on-error: true
         run: |
           cargo clippy -p dormouse-core -p dormouse-data -p dormouse-train -p dormouse-cli --all-targets -- -D warnings
+
+  # ── 2. supply-chain ────────────────────────────────────────────────────────
+  # Advisories, licenses, duplicate versions, and where dependencies come from.
+  # The policy is deny.toml at the repo root; this job is the only thing that
+  # reads it, which is the point — a policy file nothing runs is a document.
+  #
+  # GREEN on landing, 2026-10-01, after two lockfile bumps this job forced:
+  #   RUSTSEC-2026-0285  rustls 0.23.43 -> 0.23.45   (TLS 1.3 record boundary)
+  #   yanked             chacha20 0.10.1 -> 0.10.2   (via rand 0.10 -> burn)
+  # Both are transitive (rustls via ureq in tracel-llvm-bundler's BUILD deps,
+  # chacha20 via rand 0.10 pulled by burn-backend), so neither is a decision
+  # about our code; they were two `cargo update --precise` lines and the whole
+  # diff is four lines of Cargo.lock.
+  #
+  # `bans.multiple-versions` (43 crates carry more than one version) and
+  # `bans.wildcards` are `warn` on first landing with the reasons and the
+  # closing recipe in deny.toml. Both are COUNTED, not silent: the count is in
+  # the job log and in docs/reviews/ci-quality-2026-10-01.md.
+  supply-chain:
+    name: "supply chain :: advisories, licenses, sources, duplicates (green 2026-10-01)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      # The official action, which pins cargo-deny 0.20.2 inside its own
+      # image. No rust toolchain step: the action's container carries its own,
+      # and it only runs `cargo metadata` — nothing here compiles.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          # `--all-features` is the default and it is load-bearing here: the
+          # cuda feature's edges (cubecl-cuda, cublas, cudarc) are only in the
+          # graph when it is on, so without it this job would certify a graph
+          # the trainer never builds.
+          arguments: --all-features
+          manifest-path: ./Cargo.toml
+          log-level: warn
