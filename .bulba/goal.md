@@ -400,3 +400,9 @@ codecov/codecov-action@v5 (public repo, token не нужен) в coverage job +
 (gh run list / gh run view --json conclusion) до отчёта «готово». Красный CI =
 дорожка не закрыта. Монитор-паттерн: фоновый sleep-цикл по gh run list с
 пробуждением по завершении.
+
+## НОВЫЙ БАГ (docs-wave2, 2026-10-01 вечер): host-таблицы vs engram_dim
+train/src/lib.rs:1007,1009 — host-таблицы хардкодят dim=32+seed вместо
+cfg.engram_dim: `--set engram_dim≠32` тихо рассинхронизирует модель и хост.
+Класс SILENT. Фикс — волна 3 (lib.rs, после graph-continuation).
+Там же: unused Module import :17, unused assignments 1118-1136-1309-1328.
