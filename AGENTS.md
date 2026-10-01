@@ -235,18 +235,27 @@ the file that says so is that one function.
   mode). The one primitive that works is bf16 *storage* as `u16` bit patterns
   (integer ops + bitcast, pinned against f64 in
   `vendor/dormouse-fused/crates/burn-gdn2/tests/lowp_bf16_cuda.rs`).
-- **f16 matmul is CORRECT but silently slow** (ADR-0016 bug 3) — it was reported
-  as failing outright and is not. The answer matches fp32 to 1e-2, but the f16
-  **tensor-core** candidate died at compile time with `Expected type
-  builtin.fp16 to implement dyn SizedType` and the autotuner falls back to a
-  non-accelerated routine without a word. **The `SizedType` fix has since
-  LANDED in the vendored copy** (`cubecl-ir src/types/scalar.rs:240`, carried
-  by the root `[patch.crates-io]` — §2.5 says so; this section said "not
-  landed" until 2026-10-01, which contradicted §2.5). Whether the f16
-  tensor-core path now **compiles, is correct, and is fast through burn is
-  UNTESTED since the patch** — if it works, the 43.7 TFLOP/s cuBLAS-class f16
-  figure becomes reachable through burn instead of only through
-  `crates/cublas-poc`'s zero-copy route. Verify before any f16 claim.
+- **f16 tensor-core through burn: ALIVE and fast — measured 2026-10-01**
+  (ADR-0016 bug 3). History: the candidate died at compile time with
+  `Expected type builtin.fp16 to implement dyn SizedType`, the autotuner fell
+  back silently, and f16 was CORRECT but slower than fp32. The `SizedType` fix
+  landed in the vendored cubecl-ir (`src/types/scalar.rs:240`, root
+  `[patch.crates-io]`), and the gate ran green: **f16 40.05 TFLOP/s at
+  5120×768×2048 (0.40 ms) vs cuBLAS 41.4 — 91-97 % of the ceiling — and
+  39.75 TFLOP/s at 5120×2048×8192 (4.32 ms) vs the 43.7 ceiling — 91 %**;
+  sibling fp32 arms 8.24 / 8.89 TFLOP/s, so the win is 4.5-4.8×; correctness
+  (1e-2 vs the fp32 result of the same product) green on both shapes.
+  `docs/reviews/f16-tensor-core-2026-10-01.md` has the table and the two
+  caveats that go with it: **(1) the fix is visible only through the ROOT
+  workspace graph** — `vendor/dormouse-fused` has its own workspace and no
+  `[patch.crates-io]`, so a test built there still runs the unpatched stack;
+  **(2) the winning kernel autotunes per shape** — ~20 candidate families
+  refuse with "No tile size is available"/"TMA is not available" (now a
+  COUNTED warn from `Candidate::fail`) and what wins at one shape need not
+  win at another, so quote the shape with the rate. Gate:
+  `cargo test --release -p backend-parity --features cuda --test
+  f16_gemm_perf -- --nocapture --ignored --exact <arm>` (one dtype per
+  process).
 
 ## 2.2 Shapes and the allocator
 
