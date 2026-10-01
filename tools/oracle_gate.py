@@ -58,7 +58,7 @@ CRATES = os.path.join(ROOT, "vendor", "dormouse-fused", "crates")
 # before anything could see it - plus burn-spectral, burn-muon-plus and
 # burn-dspark. Scope is now every crate under vendor/dormouse-fused/crates, so an
 # unregistered test anywhere is a failure rather than a fact nobody scans.
-_CRATES = pathlib.Path(__file__).resolve().parent.parent / "vendor" / "burn-fused" / "crates"
+_CRATES = pathlib.Path(__file__).resolve().parent.parent / "vendor" / "dormouse-fused" / "crates"
 DEFAULT_SCOPE = tuple(sorted(p.name for p in _CRATES.iterdir() if p.is_dir()))
 
 # Requires a hyphen or a space, so a BARE `bitforbit` (the burn-kda example
