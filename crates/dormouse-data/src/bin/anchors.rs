@@ -13,12 +13,14 @@
 //! unigram for unseen contexts.
 //!
 //! Usage:
-//!   cargo run --release -p dormouse-data --bin anchors -- <dir-or-file> [flags]
+//!   cargo run --release -p dormouse-data --bin anchors -- `<dir-or-file>` `[flags]`
+//!
+//! (`dir-or-file` and `flags` are placeholders, not shell syntax)
 //!     --bytes 2000000     how much to read (0 = all)
 //!     --holdout 0.25      trailing fraction reserved for scoring
 //!     --order 5           n-gram order for the strongest baseline
 //!     --skip-header       drop FASTA '>' lines from the byte stream
-//!     --fit <dir-or-file> fit the counters on ANOTHER corpus and score the
+//!     --fit `<dir-or-file>` fit the counters on ANOTHER corpus and score the
 //!                         positional one. This is the only way to get the bar
 //!                         for the exact bytes the trainer's eval reads: its
 //!                         eval is the FIRST 100 KB of the eval dir, while an
