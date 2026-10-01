@@ -7,9 +7,18 @@ fn parse_str(s: &str) -> Result<DormouseConfig, String> {
     toml::from_str(s).map_err(|e| format!("toml parse: {e}"))
 }
 
-fn try_file(p: &Path) -> Option<DormouseConfig> {
-    let s = std::fs::read_to_string(p).ok()?;
-    parse_str(&s).ok()
+/// `None` = candidate absent (the normal shape of a search path, silent);
+/// `Some(Err)` = candidate PRESENT but unusable. COUNTED (ADR-0019 row 26):
+/// the caller names the file and the reason instead of silently training on a
+/// different file than the first one it found — the same failure the explicit
+/// path already reports loudly.
+fn try_file(p: &Path) -> Option<Result<DormouseConfig, String>> {
+    let s = match std::fs::read_to_string(p) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => return Some(Err(format!("read: {e}"))),
+    };
+    Some(parse_str(&s))
 }
 
 fn candidates(name: &str) -> Vec<PathBuf> {
@@ -49,7 +58,16 @@ pub fn load_config(name_or_path: &str) -> Result<DormouseConfig, String> {
     }
     let name = name_or_path.trim_end_matches(".toml");
     for p in candidates(name) {
-        if let Some(cfg) = try_file(&p) { return Ok(cfg); }
+        match try_file(&p) {
+            Some(Ok(cfg)) => return Ok(cfg),
+            // COUNTED (ADR-0019): a present-but-broken preset is named with its
+            // reason before the search moves on to the next candidate.
+            Some(Err(e)) => eprintln!(
+                "[config] preset candidate {} unusable ({e}); trying next",
+                p.display()
+            ),
+            None => {}
+        }
     }
     Err(format!("unknown preset or config not found: {name_or_path:?} (tried configs/, repo configs via manifest path, exe dir, ~/.config/dormouse)"))
 }
@@ -116,6 +134,23 @@ mod tests {
     #[test]
     fn unknown_preset_errs() {
         assert!(load_config("no_such_preset_xyz").is_err());
+    }
+
+    /// A candidate that exists but is broken is REPORTED (Some(Err) with the
+    /// reason), not silently skipped (ADR-0019 row 26); an absent candidate
+    /// stays a silent normal miss of the search path.
+    #[test]
+    fn broken_candidate_is_reported_absent_is_not() {
+        let dir = std::env::temp_dir().join(format!("dormouse_loader_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let broken = dir.join("broken.toml");
+        std::fs::write(&broken, "d_model = 768\nd_model = = broken\n").unwrap();
+        match try_file(&broken) {
+            Some(Err(msg)) => assert!(msg.contains("toml parse"), "reason must name the parse: {msg}"),
+            other => panic!("broken candidate must be Some(Err), got {other:?}"),
+        }
+        assert!(try_file(&dir.join("absent.toml")).is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
     #[test]
     fn presets_match_original_values() {
