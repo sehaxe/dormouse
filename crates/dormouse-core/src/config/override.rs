@@ -62,6 +62,10 @@ pub fn apply_overrides(cfg: &mut DormouseConfig, ov: &[Override]) -> Result<(), 
             "use_engram" => cfg.use_engram = parse_bool(v)?,
             "use_gr" => cfg.use_gr = parse_bool(v)?,
             "use_mor" => cfg.use_mor = parse_bool(v)?,
+            "use_situ" => cfg.use_situ = parse_bool(v)?,
+            "use_attnres" => cfg.use_attnres = parse_bool(v)?,
+            "use_mhc" => cfg.use_mhc = parse_bool(v)?,
+            "mhc_streams" => cfg.mhc_streams = v.parse().map_err(|e| format!("mhc_streams: {e}"))?,
             "act_quant" => cfg.act_quant = match v.to_ascii_lowercase().as_str() {
                 "none" | "null" | "off" | "" => None,
                 // The one act-quant parser: ActQuant::from_str (ADR-0005).
@@ -71,4 +75,28 @@ pub fn apply_overrides(cfg: &mut DormouseConfig, ov: &[Override]) -> Result<(), 
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::schema::DormouseConfig;
+    use super::{apply_overrides, parse_overrides};
+
+    fn one(set: &str) -> Result<DormouseConfig, String> {
+        let mut c = DormouseConfig::default();
+        let ov = parse_overrides(&[set.to_string()])?;
+        apply_overrides(&mut c, &ov)?;
+        Ok(c)
+    }
+
+    /// The queue's A/B arms were reachable only from a preset TOML — every
+    /// other field resolves from --set, these four must too
+    /// (docs/reviews/doc-coverage-2026-10-01.md §3.1).
+    #[test]
+    fn arm_flags_resolve_from_set() {
+        assert!(one("use_situ=true").unwrap().use_situ);
+        assert!(one("use_attnres=true").unwrap().use_attnres);
+        assert!(one("use_mhc=true").unwrap().use_mhc);
+        assert_eq!(one("mhc_streams=4").unwrap().mhc_streams, 4);
+    }
 }
