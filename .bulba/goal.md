@@ -346,3 +346,23 @@ f32-кондиционирование ~1e-4 decay-градиента). CUDA-п�
 корневой exclude, fused-library.yml (working-directory, workspaces, пути в
 комментариях), README/AGENTS, research-ссылки. Механическая дорожка, один
 коммит. Урок двойников: канонические пути MD не трогать, кроме этого переименования.
+
+## ДОКУМЕНТАЦИЯ: консолидация в docs/ (владелец, 2026-10-01 вечер) — ПОСЛЕ посадки docs-site
+Проблема: research MD в 4 местах (research/, research/reviews/, research/papers/, docs/,
+корень), 3 схемы имён (36 дата-первым / 6 тема-голая / papers тема-дата наоборот).
+Цель: ОДИН корень docs/, агенты ищут в одном месте.
+Структура: docs/adr/ (есть) · docs/protocols/ (AB-PROTOCOL, ORACLE, ORACLE-TIERS.tsv,
+VERIFICATION, stress) · docs/research/ (находки) · docs/reviews/ (ревью дорожек) ·
+docs/decisions/ (class-b лист) · docs/guides/ (тулинг, first-run) · docs/archive/
+(отозванное) · docs/glossary.md (путь не менять — на него ссылки везде).
+Имена: ВСЕ файлы research/reviews/decisions → YYYY-MM-DD-slug.md (sortable, без
+исключений); papers → arXivID-slug.pdf.
+Оригиналы: docs/papers/ — скачать arXiv PDF каждого цитируемого пейпера (ID записаны
+в доках), + cp ~/Downloads/tech_report.pdf (цитируется в AGENTS §3.5!), +
+provenance.tsv (файл → источник → sha256, §1.4). Внешний код (PolarExpress @71cc379,
+FLA) — Snapshot: URL + commit + sha256, без вендоринга кода.
+Оставить в корне: README.md, AGENTS.md, CONTEXT.md (агентская конвенция).
+Обязательно: обновить ВСЕ ссылки (grep по research/ и docs/ путям), manifest
+docs-site + пересборка сайта, AGENTS.md — один абзац «доки в docs/». Один коммит
+на тип перемещения (papers / reviews / research / protocols). Урок двойников:
+каждый файл переезжает ОДИН раз, старый путь не оставляет заглушек.
