@@ -4,6 +4,27 @@
 //! on the pre.4 stack and off in every preset since ADR-0012. The wrapper
 //! struct stays for one reason only - it keeps the checkpoint param prefix
 //! `loop_block.shared_attn.gdn2.*` stable across the cut.
+//!
+//! # Invariants and failure modes
+//!
+//! * **Everything measurable here is a counter, not a value.** Both functions
+//!   in this module return launch counts. A count of 0 is not "fast", it is
+//!   "did not run", and the pair that matters is `asked` vs `fused_fwd` — a
+//!   fused forward with a fused backward of 0 is a forward that returned a
+//!   leaf, which trained nothing and looked healthy (the `8fa5d4c` defect).
+//! * **No host sync.** Neither function reads a tensor; they read atomics the
+//!   library incremented on the device. Safe to call in a hot loop's log path
+//!   (AGENTS.md §1.3).
+//! * **The fused path is not reachable on the trainer's backend**, and the
+//!   counters are how a reader finds out. `burn-dispatch` refuses the
+//!   autodiff→bare demotion unless the dispatch autodiff context is
+//!   `Disabled`, so every training forward and every eval takes the tensor-ops
+//!   route. `norm_asked == norm_skipped` is the same statement about
+//!   `burn-rmsnorm`, and it held on every reading in this project's history
+//!   (1560 asks per 500 steps, 0 runs).
+//! * **A fused forward that runs and is discarded is a defect**, not a speedup.
+//!   That was found on 2026-09-30 and is still open; it is why the counters
+//!   are per-direction rather than a single "ran" flag.
 use burn::tensor::Device;
 use burn_kda::KdaModule;
 
@@ -45,17 +66,47 @@ pub fn kda_seam_counts() -> (u64, u64, u64, u64, u64, u64) {
     burn_gdn2::seam_counts()
 }
 
+/// The gdn2 seam in FULL, on a build with no CUDA: six zeros.
+///
+/// The same counter set as the CUDA build, so a reader of a non-CUDA training
+/// log sees `0/0/0/...` and can conclude "this backend has no fused path",
+/// rather than having the field absent.
 #[cfg(not(all(feature = "cuda", feature = "std")))]
 pub fn kda_seam_counts() -> (u64, u64, u64, u64, u64, u64) {
     (0, 0, 0, 0, 0, 0)
 }
 
+/// The attention wrapper: KDA (Kimi Delta Attention) as the crate's one and
+/// only attention arm.
+///
+/// Deliberately a one-field struct rather than a re-export of
+/// [`burn_kda::KdaModule`], and that is the whole reason it exists: the
+/// checkpoint parameter prefix `loop_block.shared_attn.gdn2.*` is part of the
+/// on-disk format, so the path from the model's attribute to the file's name
+/// has to survive the MSA arm's deletion (ADR-0014). Renaming this field would
+/// make every existing checkpoint refuse to load.
+///
+/// Cost, from a warm-step measurement (2026-09-30, `d8fa449`): the KDA
+/// backward is ~205 ms of a ~480 ms step at 9.2M params, depth 2 — the single
+/// largest term, and it is per-sequence-length work, not per-parameter.
 #[derive(Debug, burn::module::Module)]
 pub struct AdaptiveAttention {
+    /// The KDA module. Named for the checkpoint prefix, not for its contents
+    /// (burn-kda's gated-delta kernel). Do not rename.
     pub gdn2: KdaModule,
 }
 
 impl AdaptiveAttention {
+    /// Build the arm at `(d_model, n_heads, head_dim)`.
+    ///
+    /// Two fields are set by this repo's measurement rather than by the paper:
+    /// `use_short_conv` is OFF (report §2.1.1 asks for it; it made fp32 +
+    /// AdamW NaN at ~step 60 on this box on 2026-08-29, while the same recipe
+    /// without it ran 150+ steps clean — the instability is untraced inside
+    /// burn-kda, so it stays off), and `chunk_size` is 16.
+    ///
+    /// `KdaModule::new`'s second argument is the dropout rate, 0.0: dormouse
+    /// has no dropout anywhere.
     pub fn new(d_model: usize, n_heads: usize, head_dim: usize, device: &Device) -> Self {
         let kda_cfg = burn_kda::KdaConfig {
             hidden_size: d_model,

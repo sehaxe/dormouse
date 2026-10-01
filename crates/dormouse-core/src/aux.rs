@@ -32,7 +32,17 @@ const KOLEO_WEIGHT: f32 = 0.1;
 /// checkpoint predates them.
 #[derive(Module, Debug)]
 pub struct AuxHeads {
+    /// The masked-latent predictor: `d_model -> d_model` over the student's
+    /// own hidden states, supervised with L1 against the EMA teacher's
+    /// DETACHED latents at masked positions. Params only; the teacher itself
+    /// lives in the trainer's step loop and is advanced by
+    /// [`ema_update`] after every optimizer step.
     pub jepa_pred: JepaPredictor,
+    /// The DSpark draft head: a small RNN over the next `k` positions that
+    /// corrects the frozen backbone logits (DeepSeek-style future correction,
+    /// used instead of MTP). At inference the same head gives free
+    /// speculative decoding; during training it shapes multi-token
+    /// predictiveness through the hidden states it is handed.
     pub dspark: RNNHead,
     /// The acceptance head, paper Eq. 7: `sigmoid(w^T[h_k ; W1[x_{k-1}]])`.
     /// Markov-CONDITIONED, and that is the whole point: the previous draft
@@ -63,6 +73,14 @@ pub struct AuxHeads {
 }
 
 impl AuxHeads {
+    /// Build the three always-on heads at `(d_model, vocab, rank)`.
+    ///
+    /// `fb` is left `None` on purpose and attached by the model, which is the
+    /// only place that knows the config weight: this constructor is called by
+    /// tests and by `dspark_oracle` with no config in hand, and threading a
+    /// fourth arm through every one of them is how a signature stops meaning
+    /// anything. A model with `aux_fb_weight > 0` and `fb == None` is a LOUD
+    /// error at the call site (`model.rs`), never a skipped term.
     pub fn new(d_model: usize, vocab: usize, rank: usize, device: &burn::tensor::Device) -> Self {
         Self {
             jepa_pred: JepaPredictor::new(d_model, device),
@@ -81,24 +99,26 @@ impl AuxHeads {
     }
 }
 
-/// The `(seed, step)` the JEPA mask stream is currently drawing from. Set once
-/// per step by the trainer before the forward (ADR-0021).
-///
-/// The mask used to come from burn's GLOBAL RNG, which is never seeded: two
-/// runs of the same config drew different masks, so no A/B was reproducible
-/// and a resume changed the objective. The trainer knows the step index and
-/// the config's seed; the model does not, and threading a step parameter
-/// through every forward signature (and every caller of it) buys nothing the
-/// mask does not already get from the batch it is masking. Hence the seam.
-/// It is a pair of cells, not an RNG: no state to carry, nothing to restore.
-///
-/// PER THREAD, not process-global. A global `AtomicU64` pair made the mask a
-/// function of `(seed, step, whatever any other thread last stored)`: the
-/// test harness runs tests on separate threads, and with both mask tests
-/// in flight `mask_is_a_function_of_seed_and_step` failed 15 runs in 40
-/// while passing 30/30 when run alone. The trainer's step loop is one thread,
-/// so a thread-local is the same stream there - and here it is a *different*
-/// run, which is what the test means.
+// The `(seed, step)` the JEPA mask stream is currently drawing from. Set once
+// per step by the trainer before the forward (ADR-0021). A plain comment, not a
+// doc comment: `thread_local!` is a macro invocation and rustdoc does not
+// generate documentation for one.
+//
+// The mask used to come from burn's GLOBAL RNG, which is never seeded: two
+// runs of the same config drew different masks, so no A/B was reproducible
+// and a resume changed the objective. The trainer knows the step index and
+// the config's seed; the model does not, and threading a step parameter
+// through every forward signature (and every caller of it) buys nothing the
+// mask does not already get from the batch it is masking. Hence the seam.
+// It is a pair of cells, not an RNG: no state to carry, nothing to restore.
+//
+// PER THREAD, not process-global. A global `AtomicU64` pair made the mask a
+// function of `(seed, step, whatever any other thread last stored)`: the
+// test harness runs tests on separate threads, and with both mask tests
+// in flight `mask_is_a_function_of_seed_and_step` failed 15 runs in 40
+// while passing 30/30 when run alone. The trainer's step loop is one thread,
+// so a thread-local is the same stream there - and here it is a *different*
+// run, which is what the test means.
 thread_local! {
     static MASK_STREAM: Cell<(u64, u64)> = const { Cell::new((1, 0)) };
 }
