@@ -33,12 +33,12 @@ being in the product:
 
 | class | what it means | crates |
 |---|---|---|
-| **W** | a normal `[dependencies]` entry of a crate under `crates/dormouse-*` | 10 |
-| **d** | a `[dev-dependencies]` entry of a **wired** crate — a test or an example, never a training run | 3 (`burn-sct`, `burn-rope`, `burn-situ`) |
-| **b** | a normal `path =` of a bench package inside the library (`burn-fused-benches`, `benches/cpu_probe`) — built by the library's CI, linked by nothing that trains | 6 (`burn-attnres`, `burn-mhc`, `burn-rope`, `burn-sct`, `burn-situ`, `burn-swiglu`) |
+| **W** | a normal `[dependencies]` entry of a crate under `crates/dormouse-*` | 11 |
+| **d** | a `[dev-dependencies]` entry of a **wired** crate — a test or an example, never a training run | 2 (`burn-sct`, `burn-rope`) |
+| **b** | a normal `path =` of a bench package inside the library (`burn-fused-benches`, `benches/cpu_probe`) — built by the library's CI, linked by nothing that trains | 5 (`burn-attnres`, `burn-mhc`, `burn-rope`, `burn-sct`, `burn-swiglu`) |
 | **–** | no incoming edge except the `burn-fused` facade, which **nothing in the product depends on either** | 12 |
 
-The classes overlap: all three `d` crates also have a `b` edge, so 10 + 6 + 12 = 28.
+The classes overlap: both `d` crates also have a `b` edge, so 11 + 5 + 12 = 28.
 
 Classes `d` and `b` are **not** being in the product. A crate in them is built
 by the library's own CI (`.github/workflows/fused-library.yml`, which runs from
@@ -66,7 +66,7 @@ dependency on the other crates does not make them reachable.
 | `burn-rope` | 1131 | 0 | d, b | **WIRE** | the attention arm has **no positional encoding at all** today |
 | `burn-muon-plus` | 1055 | 336 | **W** | keep | the default optimizer |
 | `burn-dspark` | 867 | 0 | **W** | keep | the draft head (replaced MTP) |
-| `burn-situ` | 823 | 0 | d, b | REFERENCE | gated activation; the FFN uses `activation::silu` |
+| `burn-situ` | 823 | 0 | **W** | keep | the expert FFN's activation arm (`use_situ`, arXiv:2607.24653v2 Eq 12), off by default. Wired 2026-10-01; the row it replaced said "REFERENCE — the FFN uses `activation::silu`", which was true until then. **Its fused CUDA kernel is still unreachable** (default features only; `gpu-gate.sh:73-77` says it has never run in any job) |
 | `burn-engram` | 687 | 0 | **W** | keep | the hashed n-gram memory arm |
 | `burn-mor` | 530 | 0 | **W** | keep | the per-position router + top-k primitive |
 | `burn-jepa` | 443 | 0 | **W** | keep | the EMA-teacher latent objective |

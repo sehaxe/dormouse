@@ -1,10 +1,25 @@
 # burn-situ - SiTU-GLU Activation for Burn
 
-> **Not in the dormouse build.** No crate under `crates/dormouse-{core,data,train,cli}/`
-> depends on this one; the incoming edges are `[dev-dependencies]` of `burn-spectral`,
-> `benches/cpu_probe` and `burn-fused-benches`. dormouse's FFN uses burn's own
-> `activation::silu` (`crates/dormouse-core/src/loop_block.rs:467`), not this gated
-> variant. Kept as a **reference port**; fate table: `docs/library-crate-fate.md`.
+> **Wired into dormouse (2026-10-01), OFF by default.** This crate is now a
+> normal `[dependencies]` entry of `crates/dormouse-core`, read by the expert
+> FFN when `use_situ` is true (`crates/dormouse-core/src/loop_block.rs`, the
+> `use_situ` branch of the expert loop). It was a reference port until then and
+> this banner said so; fate table: `docs/library-crate-fate.md`.
+>
+> **Default features only — the fused CUDA kernel below is NOT reachable from
+> the trainer.** It has never executed in any job in this repo
+> (`vendor/burn-fused/tools/gpu-gate.sh:73-77` names burn-situ among the crates
+> whose GPU tests have never run), and the burn-rmsnorm precedent is a kernel
+> that compiled for its whole life and never ran. Enabling `burn-situ/cuda`
+> needs a CUDA gate that compares the fused output against the tensor path on
+> the form fixture first — the tensor path IS the reference form, and it costs
+> ~66 extra kernel launches per step (~1% of a warm step).
+>
+> **Use `K3_GATE_BETA` / `K3_UP_BETA`, not 1.0.** Kimi K3 runs β₁ = 4 (gate) and
+> β₂ = 25 (up) — `moonshotai/Kimi-K3@main` `config.json`
+> (`activation_situ_beta`, `activation_situ_linear_beta`) and arXiv:2607.24653v2
+> §2.3.2. The `situ_glu` defaults and `SituAndMul.__init__`'s own `beta=1.0`
+> are the library's, not the model's.
 
 [![CI](https://github.com/sehaxe/burn-situ/actions/workflows/ci.yml/badge.svg)](https://github.com/sehaxe/burn-situ/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/burn-situ)](https://crates.io/crates/burn-situ)
@@ -27,10 +42,13 @@ cargo add burn-situ
 ## Quick start
 
 ```rust
-use burn_situ::{softcap, situ_glu};
+use burn_situ::{situ_glu, softcap, K3_GATE_BETA, K3_UP_BETA};
 
-let capped = softcap(activations, 1.0);         // tanh soft-cap
-let gated = situ_glu(gate_up, hidden, 1.0, 1.0); // SiTU-gated FFN
+// K3's own values. `situ_glu(.., 1.0, 1.0)` is the library default and is NOT
+// what Kimi K3 runs: beta1 = 4 on the gate, beta2 = 25 on the up branch.
+let capped = softcap(activations, K3_GATE_BETA);                    // tanh soft-cap
+let gated = situ_glu(gate_up, hidden, K3_GATE_BETA, K3_UP_BETA);    // SiTU-gated FFN
+// `gate_up` is [N, 2*hidden]: Eq (12) reads Wg x and Wu x separately.
 ```
 
 ## API
@@ -39,6 +57,8 @@ let gated = situ_glu(gate_up, hidden, 1.0, 1.0); // SiTU-gated FFN
 |--------|------|
 | `softcap(x, beta)` | `beta * tanh(x / beta)` |
 | `situ_glu(gu, h, bg, bu)` | Bounded gating: softcap(gate)·sigmoid(gate) · softcap(up) |
+| `K3_GATE_BETA` | `4.0` — Kimi K3's gate cap. **Pass this, not `1.0`** |
+| `K3_UP_BETA` | `25.0` — Kimi K3's up cap. Same |
 
 
 ## Performance (RTX 3090, CUDA, burn 0.22)
@@ -46,6 +66,12 @@ let gated = situ_glu(gate_up, hidden, 1.0, 1.0); // SiTU-gated FFN
 | Config | Tensor path | Fused | Speedup |
 |--------|-------------|-------|---------|
 | N=2048, H=5120 | 32.0 ms | **14.3 ms** | **2.2×** |
+
+**These figures have no config, date or commit behind them, and the fused
+column describes a path that has never executed in any job in this repo**
+(`gpu-gate.sh:73-77`). Treat the table as the author's claim about a kernel
+nobody here has watched run, not as a measurement of ours. The tensor path IS
+gated (against Moonshot's own numbers) and is what dormouse runs.
 
 The whole SiTU-GLU equation (two softcaps + Swish gate factor) is one
 elementwise launch instead of ~7 tensor passes. Fused dispatch requires
