@@ -284,6 +284,17 @@ export const pages = [
 
 	// ── Tooling ──────────────────────────────────────────────────────────────
 	{ src: 'docs/guides/build-time.md', out: 'tooling/build-time' },
+
+	// ── Guides ───────────────────────────────────────────────────────────────
+	// Restored 2026-10-01. Four pages whose only source was a README section
+	// the README-rewrite (93ba203) deleted: the preset table, the flag table,
+	// the .dmexp format, and the working-rules checklist. Each is generated
+	// from its canonical file in docs/guides/, which is the ONE place a guide
+	// lives - these lines index that directory, they are not a second copy.
+	{ src: 'docs/guides/presets.md', out: 'tooling/presets', title: 'Presets: what each one costs and is for', nav: 'Presets' },
+	{ src: 'docs/guides/cli.md', out: 'tooling/cli', title: 'Every flag on train', nav: 'CLI flags' },
+	{ src: 'docs/guides/dmexp.md', out: 'tooling/dmexp', title: 'The model file: .dmexp', nav: 'The .dmexp file' },
+	{ src: 'docs/guides/first-pr.md', out: 'tooling/first-pr', title: 'Your first pull request', nav: 'First PR' },
 ];
 
 // Everything the manifest does not enumerate, discovered and ordered here.
