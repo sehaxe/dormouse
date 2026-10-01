@@ -74,7 +74,32 @@ testable and A/B-able (ADR-0017).
 ## Tasks
 
 - [ ] C0. Land or revert the in-flight MoR work (the tree does not compile).
-- [ ] C1. `refactor!: vendor/burn-fused → dormouse-fused` (script, one commit).
+- [x] C1. `refactor!: vendor/burn-fused → dormouse-fused` (script, one commit).
+      **Landed 2026-10-01, owner-approved (goal.md, «РЕШЕНО»).** The DIRECTORY
+      only: `vendor/burn-fused` → `vendor/dormouse-fused`, 315 tracked files by
+      `git mv` (293 detected as renames). **Crate names are unchanged** —
+      `burn-kda`, `burn-gdn2`, `burn-spectral` and the `burn-fused` facade
+      PACKAGE keep their names; that is a separate decision with a far larger
+      blast radius (published arXiv references, the two-routing-implementations
+      debt in §3.3), and the owner's approval named the directory.
+      Rewritten: root `exclude` + 16 path deps in 4 manifests, `fused-library.yml`
+      (working-directory ×5, workspaces ×4, one nested `crates/burn-gdn2`), the
+      library's 22 internal self-references, `tools/{build_lock,lib_gate,wt,
+      test_targets,falsify_fused_adjoint,fused_matrix,migrate-dormouse-fused}.sh`
+      + `{check_doc_refs,oracle_gate,gen_oracle_tiers,fused_matrix_static}.py` +
+      `polar_probe.rs`, `.editorconfig`, `.github/CODEOWNERS`,
+      `vendor/cubecl-fix/LICENSE`, 2 comment lines in `ci.yml`, 2 in
+      `crates/dormouse-core/{src/loop_block.rs,tests/e2m1_oracle.rs}` (the
+      latter is load-bearing: an `include_str!`), 1 in
+      `crates/dormouse-train/examples/kda_alloc_probe.rs`, then 70 documents.
+      `git grep vendor/burn-fused` → **0** outside `.bulba/` (agent scratch, and
+      goal.md must keep the old name as the record of what was decided).
+      `git grep -c vendor/dormouse-fused` → 390 occurrences / 118 files.
+      Deviation from the task line: **three commits, not one**, per the lane
+      brief (vendor → docs → site) and because a concurrent lane's `git commit`
+      swept the staged vendor commit into `d2b0da0`. Gates: doc-refs (7 failures,
+      all pre-existing — proven by stashing), docs-site ingest/build/check green,
+      `cargo check -p dormouse-train --features cuda` green.
 - [ ] C2. `refactor(core)!: delete what lost its A/B` (D1-D4, D7, D8; ~1 620 LOC).
 - [ ] C3. `feat: dormouse-ema` (60 LOC). — parallel lane A
 - [ ] C4. `refactor!: LinearLike → dormouse-linear` (165). — lane A
