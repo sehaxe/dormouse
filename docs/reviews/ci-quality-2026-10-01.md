@@ -2,8 +2,9 @@
 
 **Date:** 2026-10-01. **Toolchain for every local reading below:** rustc /
 rustfmt / clippy **1.98.1**, cargo-deny **0.20.2**, cargo-machete **0.9.2**,
-actionlint **1.7.12**, LLVM 22.1.8. **Commits:** `1f9f4b0`..`8dc070c` on `main`. Every number here was produced by the command printed next to it; none
-is estimated.
+actionlint **1.7.12**, LLVM 22.1.8. **Commits:** `1f9f4b0`..`6725563` on
+`main`. Every number here was produced by the command printed next to it, or
+read out of a CI run named by its id; none is estimated.
 
 This is the findings file for six jobs added to `.github/workflows/ci.yml`. It
 exists because two of them are RED ON LANDING and a red gate with no number
@@ -28,6 +29,35 @@ Both "soft" jobs carry `continue-on-error: true` and the count in the **job
 name**, so a reader of the Actions page sees the debt without opening a log.
 That is the ADR-0019 COUNTED mark: the degradation happens and something says
 so out loud.
+
+### Two things that were wrong in the first version, found by reading the runs
+
+Neither was visible locally and both are the class of defect this repo keeps
+paying for, so they are recorded here rather than only in the commits.
+
+**1. `continue-on-error` on a STEP reports the step as `success`.** Run
+36866436388: both lint steps were red in the log — the rustfmt step's log holds
+629 `Diff in` hunks — and the API returned `conclusion: success` for both. A
+green tick beside a red gate is worse than no gate, because it is read as a
+pass. Moved to the **job**, which is where `cuda-compile` already had it: the
+steps keep their own `failure` and the run is not blocked. Verified on run
+36868907213.
+
+**2. A failing step SKIPS every step after it.** Run 36868694110, after the fix
+above made the rustfmt failure visible for the first time:
+
+```
+5 rustfmt -> failure
+6 clippy  -> skipped
+```
+
+So half the job reported nothing. That is `fused-library.yml`'s failure mode
+arriving by another route — its `ndarray check+test` job dies at step 6 for
+exactly this reason — and a gate that does not run is indistinguishable from a
+gate that passes. Fixed with `if: ${{ !cancelled() }}` on the clippy step, which
+keeps the "still refuse to run on a cancelled job" property that `always()`
+would have traded away. Verified on run 36868907213, where both steps report
+`failure`.
 
 ---
 
