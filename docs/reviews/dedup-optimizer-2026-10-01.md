@@ -142,7 +142,7 @@ failing to compile instead of silently training on AdamW.
    `validate_routing` (it would then assert every group is *servable*) or
    delete it. 3 lines either way; needs an owner decision on whether the
    tripwire is wanted.
-2. **`docs/adr/0017`** describes the id-based declaration as the mechanism.
+2. **`docs/adr/0017-dormouse-fused.md`** describes the id-based declaration as the mechanism.
    That is now correct and no ADR change is needed — but the ADR should say
    the trainer *calls* it, since the "two implementations" framing came from
    here.
