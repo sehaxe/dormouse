@@ -1223,24 +1223,12 @@ pub fn train_loop(
         }
         let t_iter = std::time::Instant::now();
         let (bytes, hashes) = (std::mem::replace(&mut pbytes, Vec::new()), std::mem::replace(&mut phashes, Vec::new()));
-        // With the graph on, the input tensors are built on the PLAIN device,
-        // because that is the only way a pin over them can be filled in place:
-        // `try_into_primitive` refuses any tensor whose autodiff context is
-        // Enabled (`burn-dispatch/src/tensor.rs:481`), and the forward accepts
-        // a plain-device Int tensor (measured, see `graph::InputPins`). Same
-        // device 0, same client, same pool - only the context differs.
-        let input_device = if graph_on {
-            graph::plain_device().unwrap_or_else(|| device.clone())
-        } else {
-            device.clone()
-        };
         let t_io = std::time::Instant::now();
-        let (x, h) = bytes_to_tensors::<Backend>(&bytes, &hashes, cfg.seq_len, cfg.batch, &input_device);
+        let (x, h) = bytes_to_tensors::<Backend>(&bytes, &hashes, cfg.seq_len, cfg.batch, &device);
         let data_ms = t_io.elapsed().as_secs_f64() * 1000.0;
         // targets = next byte (shifted by one position)
         let shifted = std::mem::take(&mut pshift);
-        let y: Tensor<2, Int> =
-            Tensor::from_data(TensorData::new(shifted, [cfg.batch, cfg.seq_len]), &input_device);
+        let y: Tensor<2, Int> = Tensor::from_data(TensorData::new(shifted, [cfg.batch, cfg.seq_len]), &device);
         // The input pins, from the FIRST batch's shapes: a captured graph has
         // one shape, so the buffers are allocated once and every later batch is
         // copied into them.

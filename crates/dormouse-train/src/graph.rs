@@ -220,7 +220,7 @@ impl ModuleMapper for PinMapper<'_> {
                     self.failed = true;
                     return Param::from_mapped_value(id, tensor, mapper);
                 };
-                if let Err(why) = master.put(&tensor) {
+                if let Err(why) = master.put(&as_constant_float(&tensor)) {
                     self.failed = true;
                     self.why = Some(format!("parameter {id:?}: {why}"));
                     return Param::from_mapped_value(id, tensor, mapper);
@@ -306,6 +306,42 @@ impl Stats {
 /// How many refusals before the seam stops trying. See [`Stats::disabled`].
 const MAX_REFUSALS: u64 = 20;
 
+/// The same BUFFER as a float `t`, with burn's autodiff context marked `Disabled`, so
+/// `Tensor::try_into_primitive` will hand out its raw cubecl handle.
+///
+/// **Why this is needed, exactly.** `try_into_primitive` refuses any tensor
+/// whose autodiff context is not `Disabled`
+/// (`burn-dispatch/src/tensor.rs:481`), and every tensor the trainer holds is
+/// `Enabled(Disabled)`: a parameter needs gradients, and an Int input tensor is
+/// created on `Device::cuda(0).autodiff()`. burn's Int tensors have no
+/// `detach()` (it is float-only), so there is no other route to a handle - which
+/// is why the first two versions of the pin refused with
+/// `BackendMismatch("Expected concrete Cube backend with disabled autodiff
+/// context")`.
+///
+/// **Why this is sound.** `DispatchTensor.autodiff` is a `pub` field and
+/// `Tensor::into_dispatch` / `from_dispatch` are public, so this is the same
+/// thing burn itself does to an op input: a `Disabled` context means "treat
+/// this buffer as a constant" (the context-merge rule, `tensor.rs:216-220`).
+/// Nothing about the data, the device or the allocation changes; the returned
+/// tensor is never fed back into a burn op, only to a raw kernel that copies the
+/// same bytes. If a future burn makes the field private this stops compiling,
+/// loudly, which is the right way to find out.
+fn as_constant_float<const D: usize>(t: &Tensor<D>) -> Tensor<D> {
+    let mut d = t.clone().into_dispatch();
+    d.autodiff = burn_dispatch::DispatchAutodiffContext::Disabled;
+    Tensor::from_dispatch(d)
+}
+
+/// [`as_constant_float`] for Int tensors. One helper per kind, not one generic:
+/// burn's `Basic` bound is `pub(crate)`, so a caller cannot name a bound that
+/// covers both kinds and `into_dispatch` is defined per kind.
+fn as_constant_int<const D: usize>(t: &Tensor<D, burn::tensor::Int>) -> Tensor<D, burn::tensor::Int> {
+    let mut d = t.clone().into_dispatch();
+    d.autodiff = burn_dispatch::DispatchAutodiffContext::Disabled;
+    Tensor::from_dispatch(d)
+}
+
 /// Copy `src` into `dst`'s existing buffer: one launch, no allocation.
 ///
 /// A CUDA-graph pin is exactly this operation and nothing else — the graph has
@@ -346,14 +382,11 @@ pub fn copy_into_int<const D: usize>(
 /// layer down. These are allocated ONCE and filled by copy: one launch per
 /// tensor per step against the window's 21,433.
 ///
-/// **The pins live on the PLAIN (non-autodiff) CUDA device, and that is load
-/// bearing, not a style choice.** Filling a pin in place needs the tensor's raw
-/// cubecl `Handle`, and `Tensor::try_into_primitive` refuses any tensor whose
-/// autodiff context is not `Disabled` — which every tensor the trainer builds on
-/// `Device::cuda(0).autodiff()` is (`burn-dispatch/src/tensor.rs:481`). An Int
-/// tensor built on `Device::cuda(0)` has that context, so the copy kernel sees
-/// both sides; and the forward accepts it, measured by
-/// `graph_seam_cuda::a_plain_device_int_tensor_is_accepted_by_the_forward`.
+/// **Both sides of the copy go through [`as_constant_float`] / [`as_constant_int`]**,
+/// because a raw cubecl
+/// `Handle` is only reachable from a tensor whose autodiff context is
+/// `Disabled`, and neither an Int input nor a parameter built by the optimizer
+/// is. That is the whole reason this pin has a helper in it.
 ///
 /// `h` is `None` when the run has no in-VRAM table: the window then does not
 /// read the keys at all, and pinning a tensor nothing reads would be ceremony.
@@ -361,17 +394,6 @@ pub struct InputPins {
     pub x: Tensor<2, burn::tensor::Int>,
     pub y: Tensor<2, burn::tensor::Int>,
     pub h: Option<Tensor<3, burn::tensor::Int>>,
-}
-
-/// The plain CUDA device the input pins live on: device 0, the same client and
-/// the same pool — only the autodiff context differs. `None` off CUDA.
-#[cfg(feature = "cuda")]
-pub fn plain_device() -> Option<burn::tensor::Device> {
-    Some(burn::tensor::Device::cuda(0))
-}
-#[cfg(not(feature = "cuda"))]
-pub fn plain_device() -> Option<burn::tensor::Device> {
-    None
 }
 
 impl InputPins {
@@ -382,10 +404,9 @@ impl InputPins {
         y: &Tensor<2, burn::tensor::Int>,
         h: Option<&Tensor<3, burn::tensor::Int>>,
     ) -> Self {
-        let dev = plain_device().unwrap_or_else(|| first.device());
-        let x = Tensor::zeros(first.dims(), &dev);
-        let yp = Tensor::zeros(y.dims(), &dev);
-        let hp = h.map(|t| Tensor::zeros(t.dims(), &dev));
+        let x = Tensor::zeros(first.dims(), &first.device());
+        let yp = Tensor::zeros(y.dims(), &y.device());
+        let hp = h.map(|t| Tensor::zeros(t.dims(), &t.device()));
         Self { x, y: yp, h: hp }
     }
 
@@ -406,15 +427,18 @@ impl InputPins {
                 self.x.dims()[1] * self.x.dims()[0]
             ));
         }
-        if let Err(e) = copy_into_int(x, &self.x) {
+        if let Err(e) = copy_into_int(&as_constant_int(x), &as_constant_int(&self.x)) {
             return Err(format!("graph capture: could not pin x: {e}"));
         }
-        if let Err(e) = copy_into_int(y, &self.y) {
+        if let Err(e) = copy_into_int(&as_constant_int(y), &as_constant_int(&self.y)) {
             return Err(format!("graph capture: could not pin y: {e}"));
         }
         let hp = match (h, &self.h) {
             (Some(src), Some(_)) => {
-                if let Err(e) = copy_into_int(src, self.h.as_ref().expect("matched above")) {
+                if let Err(e) = copy_into_int(
+                    &as_constant_int(src),
+                    &as_constant_int(self.h.as_ref().expect("matched above")),
+                ) {
                     return Err(format!("graph capture: could not pin hashed_ids: {e}"));
                 }
                 Some(self.h.clone().expect("matched above"))
