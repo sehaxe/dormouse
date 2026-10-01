@@ -1,0 +1,19 @@
+{
+  "name": "dormouse-docs-site",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "The dormouse knowledge base: a Starlight view over the canonical docs, research, reviews and ADRs. Generated, never hand-edited.",
+  "scripts": {
+    "ingest": "node tools/ingest.mjs",
+    "dev": "npm run ingest && astro dev",
+    "start": "npm run dev",
+    "build": "npm run ingest && astro build",
+    "preview": "astro preview",
+    "astro": "astro"
+  },
+  "dependencies": {
+    "@astrojs/starlight": "0.42.5",
+    "astro": "7.3.5"
+  }
+}

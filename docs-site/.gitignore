@@ -1,0 +1,16 @@
+# Installed by npm install.
+node_modules/
+
+# astro build output.
+dist/
+.astro/
+
+# GENERATED. Every page under src/content/docs/ is built from the canonical
+# markdown at the repository root by tools/ingest.mjs (npm run ingest). It is
+# gitignored on purpose: it is a view, and a committed view is a second copy of
+# the source that can go stale without anyone noticing.
+src/content/docs/
+
+# Lockfile is committed; these are not.
+*.log
+.DS_Store
