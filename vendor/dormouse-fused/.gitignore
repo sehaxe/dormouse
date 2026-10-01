@@ -34,3 +34,7 @@ crates/*/target
 !crates/burn-gdn2/tests/ref_bwd_f64_carry.bin
 Cargo.lock.bak
 .bulba/
+
+# The oracle fixtures ARE the tier-(a) artifacts - always tracked,
+# whatever pattern above matches them.
+!crates/*/tests/**/*.bin
