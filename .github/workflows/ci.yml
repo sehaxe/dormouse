@@ -307,8 +307,17 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      # actionlint drives two external checkers and silently skips either one
+      # that is missing (measured, see the last step). shellcheck is an apt
+      # package on the runner image; pyflakes is NOT - it is a PyPI package and
+      # `apt-get install pyflakes` fails the whole step, which is how this job's
+      # own first run went red. `pipx` is preinstalled on ubuntu-latest, so it
+      # is the shortest correct install and it pins nothing that apt would.
       - name: the checkers actionlint drives
-        run: sudo apt-get update && sudo apt-get install -y shellcheck pyflakes
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+          pipx install pyflakes
       - name: actionlint 1.7.12 (sha256-verified)
         run: |
           set -euo pipefail
@@ -324,17 +333,20 @@ jobs:
         # naming them by hand is how a new workflow escapes the gate.
         run: ./actionlint
       - name: "shellcheck was on PATH, or the run: bodies went unchecked"
-        # actionlint finds an absent shellcheck SILENTLY: measured on 1.7.12
-        # here, a workflow with `run: echo $HOME` reports SC2086 when
-        # shellcheck is on PATH and reports NOTHING - not a note, not an error,
-        # same exit code - when it is not. So a green actionlint run cannot
-        # distinguish "every run: body is shellchecked" from "no run: body was
-        # ever checked", which is the ADR-0019 SILENT shape inside a linter.
-        # The check is therefore explicit: actionlint resolves shellcheck off
-        # PATH, so proving it is on PATH in the same step proves the bodies
-        # were linted.
+        # actionlint finds an absent checker SILENTLY: measured on 1.7.12 here,
+        # a workflow with `run: echo $HOME` reports SC2086 when shellcheck is
+        # on PATH and reports NOTHING - not a note, not an error, same exit
+        # code - when it is not. So a green actionlint run cannot distinguish
+        # "every run: body is shellchecked" from "no run: body was ever
+        # checked", which is the ADR-0019 SILENT shape living inside a linter.
+        # The check is therefore explicit: actionlint resolves both checkers
+        # off PATH, so proving they are on PATH in this step proves the bodies
+        # were linted. pyflakes is here for `shell: python` run bodies, of
+        # which this repo currently has none - it is installed so that adding
+        # one does not silently add zero checking.
         run: |
           set -euo pipefail
           command -v shellcheck
           shellcheck --version | head -2
           command -v pyflakes
+          pyflakes --version
