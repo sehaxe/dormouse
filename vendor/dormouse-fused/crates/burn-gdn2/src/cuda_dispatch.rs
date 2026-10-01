@@ -31,12 +31,21 @@
 //! [`chunk_dispatch`] is all three, wired for the chunked WY op, and it
 //! REPORTS which arm ran: a `None` cannot tell "computed" from "fell back".
 
-use burn::backend::{AutodiffBackend, BackendTypes};
-use burn::backend::{Backend, DispatchKindConversion};
+// FEATURE SPLIT, and the reason the module is compiled under
+// `any(cuda, autodiff)` at all (see `lib.rs`). The counters below are read by
+// the fused kernels (`cuda`) AND by the fused autodiff node (`autodiff`), so
+// they carry NO gate; only the seam helpers that name `burn_autodiff` types do.
+// `Backend` is the only one of these an UNGATED item needs - `backend_matches`
+// is callable from every build - so it stays ungated, and the rest follow the
+// `burn_autodiff`-typed helpers they belong to.
+#[cfg(feature = "autodiff")]
+use burn::backend::{AutodiffBackend, BackendTypes, DispatchKindConversion};
+use burn::backend::Backend;
+#[cfg(feature = "autodiff")]
 use burn::tensor::{DispatchTensor, Tensor};
-use burn_autodiff::checkpoint::strategy::{
-    BalancedCheckpointing, CheckpointStrategy, NoCheckpointing,
-};
+#[cfg(feature = "autodiff")]
+use burn_autodiff::checkpoint::strategy::CheckpointStrategy;
+#[cfg(feature = "autodiff")]
 use burn_autodiff::Autodiff;
 
 /// Which arm ran. A bare `Option`/`bool` cannot distinguish "computed" from
@@ -94,6 +103,7 @@ pub fn backend_matches<B: Backend>() -> bool {
 /// The autodiff primitive of `Autodiff<Inner, S>` — `burn_autodiff` keeps its
 /// `AutodiffTensor` type crate-private, so the only public spelling is the
 /// associated type.
+#[cfg(feature = "autodiff")]
 pub type AdNode<Inner, S> = <Autodiff<Inner, S> as BackendTypes>::FloatTensorPrimitive;
 
 /// The autodiff PRIMITIVE, whatever the strategy: `None` when the tensor is
@@ -101,6 +111,7 @@ pub type AdNode<Inner, S> = <Autodiff<Inner, S> as BackendTypes>::FloatTensorPri
 /// primitive to a tensor whose autodiff context is enabled, so this — not
 /// `try_into_primitive::<Inner>` — is the only legal way in, and it is the
 /// half of the bug no `TypeId` could have caught.
+#[cfg(feature = "autodiff")]
 pub fn autodiff_node<Inner: Backend, S: CheckpointStrategy, const D: usize>(
     t: &Tensor<D>,
 ) -> Option<AdNode<Inner, S>>
@@ -112,6 +123,7 @@ where
 
 /// The bare tensor a kernel can take, from an autodiff primitive: the same
 /// bytes with a DISABLED autodiff context.
+#[cfg(feature = "autodiff")]
 pub fn bare_from_node<Inner: Backend, S: CheckpointStrategy, const D: usize>(
     node: &AdNode<Inner, S>,
 ) -> Tensor<D>
@@ -139,6 +151,7 @@ where
 /// Case 1 cannot hand a kernel the wrong bytes: a bare conversion either
 /// yields a genuine hardware tensor or errors, and an error in case 1 is not
 /// swallowed — case 2 runs and reports its own reason.
+#[cfg(feature = "autodiff")]
 pub fn try_strip<Inner: Backend, S: CheckpointStrategy, const D: usize>(
     t: &Tensor<D>,
 ) -> Result<Tensor<D>, String>
@@ -163,6 +176,7 @@ where
 
 /// The autodiff layer off: a tensor on `Autodiff<Inner, S>` becomes a bare
 /// `Tensor<Inner>`, whatever the strategy. `None` when it is not on one.
+#[cfg(feature = "autodiff")]
 pub fn strip<Inner: Backend, S: CheckpointStrategy, const D: usize>(
     t: &Tensor<D>,
 ) -> Option<Tensor<D>>
@@ -176,6 +190,7 @@ where
 /// strategy the caller asked for, not a hardcoded `NoCheckpointing`. An op
 /// that needs a real backward builds its own node instead; see
 /// [`crate::autodiff::chunk_wy_forward_autodiff_s`].
+#[cfg(feature = "autodiff")]
 pub fn rebuild<Inner: Backend, S: CheckpointStrategy, const D: usize>(t: &Tensor<D>) -> Tensor<D>
 where
     DispatchTensor: DispatchKindConversion<Autodiff<Inner, S>> + DispatchKindConversion<Inner>,
@@ -189,10 +204,26 @@ where
     )
 }
 
-#[cfg(feature = "cuda")]
+// NO FEATURE GATE on this module, and that is the whole fix for the E0433 the
+// `cuda-compiles` job found. `chunk_cube.rs` and `chunk_adjoint_cube.rs` are
+// `#[cfg(feature = "cuda")]` and call `note_fused_forward`/`note_fused_backward`
+// past every launch gate; `autodiff.rs` is `#[cfg(feature = "autodiff")]` and
+// calls `note_untracked`, `note_tensor_branch`, `note_backward_node`,
+// `note_fused_declined` and `fused_forced_off`. Gating this module on `cuda`
+// satisfied the second caller and broke the first; gating it on `autodiff`
+// (the old state of `lib.rs`) did the reverse. A counter is what makes an arm
+// visible (ADR-0019), so it must exist in every build that can CALL it - and
+// gating a call site instead would be the SILENT failure this crate documents
+// twice. Only the items that name `CudaBare` or `burn_autodiff` are gated, each
+// individually: the `CudaBare` import below, and `FusedCudaAutodiff` and
+// `chunk_dispatch` at the bottom.
 mod fused {
+    #[cfg(all(feature = "cuda", feature = "autodiff"))]
     use super::*;
+    #[cfg(all(feature = "cuda", feature = "autodiff"))]
     use crate::kernel::chunk_cube::cuda::CudaBare;
+    #[cfg(all(feature = "cuda", feature = "autodiff"))]
+    use burn_autodiff::checkpoint::strategy::{BalancedCheckpointing, NoCheckpointing};
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
     static FUSED_FWD: AtomicU64 = AtomicU64::new(0);
@@ -356,6 +387,7 @@ mod fused {
     /// for `DispatchTensor` itself so a caller that only knows
     /// `DispatchTensor: DispatchKindConversion<B>` — the bound every burn op
     /// carries — can reach the fused path without naming a strategy.
+    #[cfg(all(feature = "cuda", feature = "autodiff"))]
     pub trait FusedCudaAutodiff:
         DispatchKindConversion<CudaBare>
         + DispatchKindConversion<Autodiff<CudaBare, NoCheckpointing>>
@@ -363,6 +395,7 @@ mod fused {
     {
     }
 
+    #[cfg(all(feature = "cuda", feature = "autodiff"))]
     impl FusedCudaAutodiff for DispatchTensor {}
 
     /// The fused chunked WY chunk op from ANY autodiff backend over the bare
@@ -373,6 +406,7 @@ mod fused {
     /// the kernels themselves see the BARE backend, where
     /// `is_cuda::<Inner>()` is correct and needs no strategy-agnostic
     /// gymnastics.
+    #[cfg(all(feature = "cuda", feature = "autodiff"))]
     #[allow(clippy::too_many_arguments)]
     pub fn chunk_dispatch<B: Backend>(
         q: Tensor<4>,
@@ -450,5 +484,6 @@ mod fused {
     }
 }
 
-#[cfg(feature = "cuda")]
+// Ungated for the same reason the module is: the counters are the seam, and
+// `chunk_cube.rs` reaches them through this path with `cuda` alone.
 pub use fused::*;

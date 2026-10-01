@@ -11,6 +11,7 @@ use std::any::Any;
 #[cfg(feature = "cuda")]
 use cubecl::prelude::*;
 
+#[cfg(feature = "cuda")]
 #[cube(launch_unchecked)]
 fn rope_kernel<F: Float>(
     x: &[F],       // [B, T, NH, HD]
@@ -63,6 +64,7 @@ fn rope_kernel<F: Float>(
     }
 }
 
+#[cfg(feature = "cuda")]
 #[cube(launch_unchecked)]
 fn rope_backward_kernel<F: Float>(
     dout: &[F],   // [B, T, NH, HD]
@@ -166,6 +168,7 @@ where
 }
 
 /// Fused RoPE on the bare CUDA backend. Returns `None` otherwise.
+#[cfg(feature = "cuda")]
 pub fn rope_cuda<B: Backend>(x: Tensor<4>, cos: Tensor<2>, sin: Tensor<2>) -> Option<Tensor<4>>
 where
     burn::tensor::DispatchTensor: burn::backend::DispatchKindConversion<B>,

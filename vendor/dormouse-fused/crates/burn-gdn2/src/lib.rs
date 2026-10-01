@@ -67,7 +67,19 @@ pub mod l2norm;
 pub mod module;
 pub mod short_conv;
 
-#[cfg(feature = "autodiff")]
+// The seam's COUNTERS are called from two halves of the crate that are gated
+// differently - the fused KERNELS by `cuda` (`kernel/chunk_cube.rs`,
+// `kernel/chunk_adjoint_cube.rs`) and the fused autodiff NODE by `autodiff`
+// (`autodiff.rs`). Gating this module on one of them made the counters
+// unreachable from the other, which is not a slow build but a COMPILE ERROR
+// (E0433) in `cuda` without `autodiff` and in `autodiff` without `cuda` - and
+// it did: `cargo check -p burn-gdn2 --features cuda` has not compiled since the
+// counters moved, and the CI job that reports it (`cuda-compiles` in
+// `.github/workflows/fused-library.yml`) has been red in every run it has ever
+// had. `any(...)` is the fix and `all(...)` would be the same bug wearing a
+// hat: the seam is what makes an arm visible, so a build that cannot count it
+// is a build that cannot report it.
+#[cfg(any(feature = "cuda", feature = "autodiff"))]
 pub mod cuda_dispatch;
 
 #[cfg(feature = "autodiff")]
@@ -83,8 +95,18 @@ pub use short_conv::{short_conv_1d, SHORT_CONV_CACHE, SHORT_CONV_KERNEL};
 #[cfg(feature = "autodiff")]
 pub use autodiff::{chunk_autodiff_or_plain, chunk_wy_forward_autodiff, chunk_wy_forward_autodiff_s};
 
+// Which arm ran, and how to ask. These three need only `Backend`, so they
+// exist in a `cuda`-only build too - and a `cuda`-only build is what a
+// downstream crate gets: `crates/burn-kda/src/fused.rs:118-122` is gated on
+// `cuda` and names `burn_gdn2::Fused` / `burn_gdn2::Fallback`, so under the
+// old `autodiff`-only gate this re-export took `cargo check -p burn-kda
+// --features cuda`, the facade's `std,cuda` combination and
+// `cargo check -p burn-fused-benches` down with it.
+#[cfg(any(feature = "cuda", feature = "autodiff"))]
+pub use cuda_dispatch::{backend_matches, Fallback, Fused};
+
 #[cfg(feature = "autodiff")]
-pub use cuda_dispatch::{backend_matches, rebuild, strip, AdNode, Fallback, Fused};
+pub use cuda_dispatch::{rebuild, strip, AdNode};
 
 #[cfg(all(feature = "cuda", feature = "autodiff"))]
 pub use cuda_dispatch::{
