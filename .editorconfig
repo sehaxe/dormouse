@@ -1,0 +1,74 @@
+# What this file is: the tree's ACTUAL conventions, measured 2026-10-01, so an
+# editor or an agent does not "help" by introducing a second style. Nothing here
+# is aspirational - every value below is what the tracked files already do, and
+# where the tree disagrees with itself the exception is named rather than
+# silently overridden.
+#
+# WHAT WAS MEASURED (828 tracked files).
+#   LF endings          everywhere except 15 binary files (11 PDFs under
+#                       docs/papers/, 4 .bin f64 reference fixtures under
+#                       vendor/burn-fused/) - binary, so exempt by nature.
+#   4-space indent      all Rust, TOML, markdown, shell and 68 of 69 Python
+#                       files.
+#   final newline       30 tracked files lack one. Not fixed here: a whitespace
+#                       sweep across 30 files in a lane about repo metadata
+#                       would bury the actual change in noise, and rustfmt
+#                       (`insert_final_newline`, on by default) owns this for
+#                       every file it formats. See the findings file.
+#
+# WHY NOT a single [indent_style] for python: tools/check_doc_refs.py is
+# tab-indented and the other 68 python files are not. One rule cannot describe
+# that, so the python section is declared per-glob and the outlier is named
+# rather than lied about.
+
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+[*.py]
+indent_size = 4
+
+# The one tab-indented Python file. Declared so an editor opened on it does not
+# convert 94 lines on save.
+[tools/check_doc_refs.py]
+indent_style = tab
+indent_size = 4
+
+# Markdown: no hard-wrap enforcement, and no trailing-whitespace trim. Two
+# measured reasons: the documents are hand-wrapped at ~80 so a `max_line_length`
+# would make every editor fight the author over prose, and five tracked .md
+# files carry indented code blocks whose blank lines are 4 spaces (see
+# .bulba/stsb.md:26) - trimming whitespace there deletes the code block.
+[*.md]
+trim_trailing_whitespace = false
+
+# Binary reference fixtures and papers. Never touched, never trimmed - a
+# trailing-whitespace pass over these is a corrupted file, not a cleanup.
+[*.{bin,pdf,png,jpg,jpeg,gif,ico,woff,woff2}]
+insert_final_newline = false
+trim_trailing_whitespace = false
+charset = unset
+
+# Generated, vendored and build output: `unset` withdraws the two rules above
+# rather than restating them, so editing the [*] block cannot leave these three
+# silently contradicting it. These trees have their own conventions and are not
+# ours to restyle - node_modules is 400 MB of someone else's code, and the
+# vendored workspaces keep upstream formatting on purpose, because a diff
+# against upstream is how a vendored patch is reviewed.
+[docs-site/**]
+insert_final_newline = unset
+trim_trailing_whitespace = unset
+
+[target/**]
+insert_final_newline = unset
+trim_trailing_whitespace = unset
+
+[vendor/**]
+insert_final_newline = unset
+trim_trailing_whitespace = unset

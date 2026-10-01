@@ -1,0 +1,11 @@
+# Every line is owned by the repository owner. Written for the ONE case this
+# file serves on a single-maintainer repository: GitHub's "Files changed"
+# review queue, where the reviewer needs to know that a change under
+# vendor/burn-fused/ (a vendored fork we carry and patch) is as deliberate as
+# one in crates/ - and not to be rubber-stamped because it looks like vendored
+# code.
+#
+# It is NOT a substitute for the build-lock and worktree rules (AGENTS.md §2.4,
+# tools/wt.sh) and it does not assign review work to anyone else: there is no
+# second maintainer, which is the honest reason the rest of this file is short.
+*       @sehaxe
