@@ -16,6 +16,43 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 
+# ONE place to bump the upstream. burn carries a table like this for every
+# dependency; the version-bearing ones that are actually duplicated across our
+# six manifests are here, and only those - an entry with one caller is
+# indirection with no second reader to catch the drift.
+#
+# WHY this table rather than leaving 15 copies of "0.22.0-pre.4": a version
+# bump that misses one manifest does not fail. Cargo resolves the miss as TWO
+# versions of burn in one graph, which on this tree means a second cubecl
+# build, a second set of type ids, and 41 GB of target dir (AGENTS.md 2.4
+# records that cost). The same silent-miss shape as the `[patch.crates-io]`
+# list below, which AGENTS.md 2.5 already names as "the only authority" - this
+# is the same rule applied to versions. `cargo tree -e features` over all six
+# members is byte-identical before and after this table landed.
+#
+# NOT here: the vendored `burn-*` crates, which are path deps and carry no
+# version at all; and the `cubecl-*` crates, one caller each. Both are single
+# readers, and a table entry with a single reader cannot catch anything.
+[workspace.dependencies]
+burn = { version = "0.22.0-pre.4", default-features = false }
+burn-tensor = { version = "0.22.0-pre.4", default-features = false }
+burn-cuda = { version = "0.22.0-pre.4", default-features = false }
+serde = { version = "1", features = ["derive"] }
+rand = "0.8"
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+# `=` on purpose, and it is the reason this crate exists in the table: a caret
+# here could resolve a second cudarc next to the pinned copy in cublas-poc and
+# put two CUDA driver types in one binary. cublas-poc:56 says why.
+cudarc = { version = "=0.19.9", default-features = false }
+# `half` is deliberately NOT in this table. Its two callers want different
+# default features (cublas-poc: none, dormouse-train: all), and cargo IGNORES a
+# member's `default-features = false` when the workspace entry does not set it
+# - so the table silently adds a `default` feature edge to cublas-poc. Measured:
+# `cargo tree -e features` grew by exactly one `half feature "default"`. Two
+# callers with conflicting intent are not a shared version; they are two
+# declarations that happen to name the same crate.
+
 # Burn-style ([workspace.lints] + `[lints] workspace = true` in each member, the
 # shape burn's root Cargo.toml uses). Two rustdoc denies, both cheap and both
 # about a claim being readable rather than about style: a doc link that does not

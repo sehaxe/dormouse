@@ -8,10 +8,10 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-burn = { version = "0.22.0-pre.4", default-features = false, features = ["std", "extension"] }
-burn-tensor = { version = "0.22.0-pre.4", default-features = false }
+burn = { workspace = true, features = ["std", "extension"] }
+burn-tensor = { workspace = true }
 burn-nn = { version = "0.22.0-pre.4", default-features = false }
-burn-cuda = { version = "0.22.0-pre.4", default-features = false, features = ["std", "autotune"] }
+burn-cuda = { workspace = true, features = ["std", "autotune"] }
 burn-kda = { path = "../../vendor/burn-fused/crates/burn-kda" }
 # The fused-kernel seam counters (ADR-0019): burn-kda's fused dispatch hands
 # its launch counts to burn-gdn2, which is the crate that owns them.
@@ -38,9 +38,9 @@ burn-attnres = { path = "../../vendor/burn-fused/crates/burn-attnres" }
 # CUDA gate that compares the fused output to the tensor path first; see
 # docs/reviews/situ-2026-09-30.md §7.
 burn-situ = { path = "../../vendor/burn-fused/crates/burn-situ" }
-rand = "0.8"
-serde = { version = "1", features = ["derive"] }
-toml = "0.8"
+rand = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+toml = { workspace = true }
 
 [features]
 default = ["std"]

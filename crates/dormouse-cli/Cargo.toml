@@ -16,11 +16,11 @@ cuda = ["dormouse-core/cuda", "dormouse-train/cuda"]
 dormouse-core = { path = "../dormouse-core" }
 dormouse-data = { path = "../dormouse-data" }
 dormouse-train = { path = "../dormouse-train", default-features = false }
-clap = { version = "4", features = ["derive"] }
+clap = { workspace = true, features = ["derive"] }
 libc = "0.2"
-rand = "0.8"
+rand = { workspace = true }
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }
-serde = { version = "1", features = ["derive"] }
+serde = { workspace = true, features = ["derive"] }
 serde_json = "1"
-burn = { version = "0.22.0-pre.4", default-features = false, features = ["std"] }
+burn = { workspace = true, features = ["std"] }

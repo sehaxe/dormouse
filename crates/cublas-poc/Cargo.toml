@@ -13,8 +13,8 @@ publish = false
 workspace = true
 
 [dependencies]
-burn = { version = "0.22.0-pre.4", default-features = false, features = ["std", "extension", "cuda"] }
-burn-cuda = { version = "0.22.0-pre.4", default-features = false, features = ["std", "autotune"] }
+burn = { workspace = true, features = ["std", "extension", "cuda"] }
+burn-cuda = { workspace = true, features = ["std", "autotune"] }
 # `cubecl` only for the two patched types the zero-copy section names
 # (`cubecl::cuda::CudaServer`); every other crate is reachable through burn.
 cubecl = { version = "0.11.0-pre.4", default-features = false, features = ["std", "cuda"] }
@@ -22,7 +22,7 @@ cubecl = { version = "0.11.0-pre.4", default-features = false, features = ["std"
 # resolved, so the probe cannot pull a second copy into the graph; note the
 # `cublas` cargo feature is deliberately NOT enabled (it would recompile every
 # cubecl crate in the tree, and four dlopen'd symbols do the same job).
-cudarc = { version = "=0.19.9", default-features = false, features = ["std", "driver"] }
+cudarc = { workspace = true, features = ["std", "driver"] }
 half = { version = "2.7", default-features = false }
 
 [features]
