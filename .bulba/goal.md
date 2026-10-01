@@ -389,3 +389,8 @@ Starlight), не встал за 10 минут — схем нет; (3) поло
 файлах менять по ходу, массовая переписка 387 файлов — отдельная дорожка.
 Применить: docs-site (передать сразу после посадки в его sessionID) + дорожка
 консолидации docs/.
+
+## CI: Codecov (владелец, 2026-10-01) — довесок к ci-quality lane
+После посадки ci-quality (coverage job с llvm-cov): добавить шаг
+codecov/codecov-action@v5 (public repo, token не нужен) в coverage job +
+бейдж покрытия в README рядом с CI-бейджем.
