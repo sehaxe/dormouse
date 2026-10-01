@@ -13,10 +13,9 @@
 //! ignored flag.
 //!
 //! **FOUR SCHEMA FIELDS ARE UNREACHABLE FROM `--set`, recorded not fixed.**
-//! `use_situ`, `use_attnres`, `use_mhc` and `mhc_streams` have no arm in the
-//! `use_situ`, `use_attnres`, `use_moe` and `moe_streams` have no arm in the
-//! match below, so `--set use_situ=true` returns
-//! `Err("unknown config key \"use_situ\"")` - LOUD, not silent, so nothing
+//! Arm coverage note (2026-10-01): use_situ/use_attnres/use_mhc/mhc_streams
+//! and moe_topk/moe_lb_coef all have arms; an unknown key still returns
+//! `Err("unknown config key ...")` - LOUD, not silent, so nothing
 //! trains differently from what was asked. But those four are then reachable
 //! ONLY from a preset TOML, which is an inconsistency with every other field
 //! and a trap for anyone doing an A/B from the command line: SiTU-GLU, AttnRes
