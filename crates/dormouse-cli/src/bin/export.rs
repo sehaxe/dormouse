@@ -22,17 +22,28 @@ struct Args {
 enum Cmd {
     /// Write `<ckpt-dir>/<ckpt-name>.bin` as an inference export.
     Run {
-        #[arg(long, default_value = "checkpoints")] ckpt_dir: PathBuf,
-        #[arg(long, default_value = "latest", help = "checkpoint file name (<name>.bin)")] ckpt_name: String,
+        #[arg(long, default_value = "checkpoints")]
+        ckpt_dir: PathBuf,
+        #[arg(
+            long,
+            default_value = "latest",
+            help = "checkpoint file name (<name>.bin)"
+        )]
+        ckpt_name: String,
         /// Weight format: bf16 | f16 | f32. See README "The model file".
-        #[arg(long, default_value = "bf16")] dtype: String,
+        #[arg(long, default_value = "bf16")]
+        dtype: String,
         /// Output path. Defaults to `<ckpt-dir>/<ckpt-name>.<dtype>.dmexp`.
-        #[arg(long)] out: Option<PathBuf>,
+        #[arg(long)]
+        out: Option<PathBuf>,
         /// Only used when the run left no `<ckpt-name>.config.toml` next to the
         /// checkpoint. A preset is a guess about a shape; the snapshot is not.
-        #[arg(long, default_value = "small")] preset: String,
-        #[arg(long)] config: Option<String>,
-        #[arg(long = "set", value_name = "KEY=VALUE")] set: Vec<String>,
+        #[arg(long, default_value = "small")]
+        preset: String,
+        #[arg(long)]
+        config: Option<String>,
+        #[arg(long = "set", value_name = "KEY=VALUE")]
+        set: Vec<String>,
     },
     /// Describe an export, and verify its checksum.
     Info { path: PathBuf },
@@ -46,14 +57,26 @@ fn die(e: String) -> ! {
 fn main() {
     let a = Args::parse();
     match a.cmd {
-        Cmd::Run { ckpt_dir, ckpt_name, dtype, out, preset, config, set } => {
+        Cmd::Run {
+            ckpt_dir,
+            ckpt_name,
+            dtype,
+            out,
+            preset,
+            config,
+            set,
+        } => {
             let dtype = DType::parse(&dtype).unwrap_or_else(|e| die(e));
             let ckpt = ckpt_dir.join(format!("{ckpt_name}.bin"));
             let out = out.unwrap_or_else(|| {
-                ckpt_dir.join(format!("{ckpt_name}.{}.dmexp", format!("{dtype:?}").to_lowercase()))
+                ckpt_dir.join(format!(
+                    "{ckpt_name}.{}.dmexp",
+                    format!("{dtype:?}").to_lowercase()
+                ))
             });
             let preset = config.as_deref().unwrap_or(&preset);
-            let r = export::export_ckpt(&ckpt, Some(preset), &set, dtype, &out).unwrap_or_else(|e| die(e));
+            let r = export::export_ckpt(&ckpt, Some(preset), &set, dtype, &out)
+                .unwrap_or_else(|e| die(e));
             let kb = r.file_bytes as f64 / 1024.0;
             println!("export: {} ({dtype:?})", r.path);
             println!("  params      {}", r.num_params);
@@ -67,7 +90,10 @@ fn main() {
             }
             println!("  max |w|     {:.6e}", r.max_abs);
             println!("  min |w|>0   {:.6e}", r.min_nonzero_abs);
-            println!("  flushed     {} (below the format's smallest normal, now 0)", r.flushed);
+            println!(
+                "  flushed     {} (below the format's smallest normal, now 0)",
+                r.flushed
+            );
             println!("  load with   generate --export {} ...", r.path);
         }
         Cmd::Info { path } => {

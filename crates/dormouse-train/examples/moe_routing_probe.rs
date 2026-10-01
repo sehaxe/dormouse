@@ -102,15 +102,19 @@ fn batch(bytes: &[u8], dev: &Device) -> (Tensor<2, Int>, Tensor<3, Int>, Tensor<
         .collect();
     (
         Tensor::from_data(TensorData::new(ids, [b, t]), dev),
-        Tensor::from_data(TensorData::new(dormouse_data::raw_keys(bytes), [b, t, 3]), dev),
+        Tensor::from_data(
+            TensorData::new(dormouse_data::raw_keys(bytes), [b, t, 3]),
+            dev,
+        ),
         Tensor::from_data(TensorData::new(y, [b, t]), dev),
     )
 }
 
 fn read_corpus(a: &Args) -> Vec<u8> {
-    let path = a.corpus.clone().unwrap_or_else(|| {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../AGENTS.md")
-    });
+    let path = a
+        .corpus
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../AGENTS.md"));
     let bytes = std::fs::read(&path)
         .unwrap_or_else(|e| panic!("corpus {} unreadable: {e}", path.display()));
     assert!(
@@ -132,7 +136,10 @@ fn read_corpus(a: &Args) -> Vec<u8> {
 
 /// One capture: arm, forward, take. The capture is the mixture the FFN
 /// branch actually used, per executed iteration.
-fn capture(m: &DormouseModel, b: &(Tensor<2, Int>, Tensor<3, Int>, Tensor<2, Int>)) -> Vec<Tensor<2>> {
+fn capture(
+    m: &DormouseModel,
+    b: &(Tensor<2, Int>, Tensor<3, Int>, Tensor<2, Int>),
+) -> Vec<Tensor<2>> {
     mixture_probe::arm();
     let (_logits, _rec, _kda, _aux) = m.forward_with_hidden::<dormouse_train::Backend>(
         b.0.clone(),
@@ -148,10 +155,7 @@ fn print_stats(s: &MixtureStats, label: &str, e: usize) {
     println!("--- mixture @ {label}");
     for (i, m) in s.mean.iter().enumerate() {
         let w: Vec<String> = m.iter().map(|x| format!("{x:.3}")).collect();
-        println!(
-            "  iter {i}  mean[{w}]  (uniform {:.3})",
-            1.0 / e as f64
-        );
+        println!("  iter {i}  mean[{w}]  (uniform {:.3})", 1.0 / e as f64);
     }
     if s.cross_iter_cosine.is_empty() {
         println!("  depth 1: no cross-iteration pair to compare");
@@ -307,14 +311,21 @@ fn main() {
             None,
         );
         let loss = model.loss::<dormouse_train::Backend>(rec);
-        let l: f32 = loss.clone().into_data().try_to_vec().expect("loss readback")[0];
+        let l: f32 = loss
+            .clone()
+            .into_data()
+            .try_to_vec()
+            .expect("loss readback")[0];
         let grads = burn::optim::GradientsParams::from_grads(loss.backward(), &model);
         model.retract_tsct(3);
         model = optim.step(a.lr, model, grads);
         assert!(l.is_finite(), "step {step}: loss {l} is not finite");
         // Leave the sink disarmed between steps: the step forward above is
         // NOT a measurement, and a capture left armed would silently grow.
-        assert!(!mixture_probe::armed(), "the step forward must not record a mixture");
+        assert!(
+            !mixture_probe::armed(),
+            "the step forward must not record a mixture"
+        );
     }
     println!("done. The mixture tables above are the instrument; the gate that reuses it is");
     println!("`crates/dormouse-core/tests/moe_routing_seam.rs`.");

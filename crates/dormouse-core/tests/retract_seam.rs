@@ -122,12 +122,10 @@ fn batched_retract(model: &mut DormouseModel, iters: usize) -> usize {
         let mut refs: Vec<&mut Tensor<2>> = vals.iter_mut().collect();
         burn_spectral::retract_batched(&mut refs, iters);
     }
-    for (slot, (((id, map), was_tracked), val)) in slots.iter_mut().zip(
-        ids.into_iter()
-            .zip(maps)
-            .zip(tracked)
-            .zip(vals),
-    ) {
+    for (slot, (((id, map), was_tracked), val)) in slots
+        .iter_mut()
+        .zip(ids.into_iter().zip(maps).zip(tracked).zip(vals))
+    {
         let val = val.detach();
         let val = if was_tracked {
             val.set_require_grad(true)
@@ -240,7 +238,8 @@ fn batched_matches_the_per_factor_path() {
     println!(
         "retraction differential: {} factors, worst |per_factor - batched| = {worst:.3e} \
          at factor {worst_i} {:?}, max |before - after| = {moved:.3e}",
-        a.len(), a[worst_i].dims()
+        a.len(),
+        a[worst_i].dims()
     );
 
     // 1. The values agree. This is the whole point of the arm.

@@ -65,7 +65,8 @@ fn shipped_presets() -> Vec<String> {
 
 fn preset(name: &str) -> DormouseConfig {
     let path = configs_dir().join(format!("{name}.toml"));
-    let c = load_config(path.to_str().expect("utf-8 path")).unwrap_or_else(|e| panic!("{name}: {e}"));
+    let c =
+        load_config(path.to_str().expect("utf-8 path")).unwrap_or_else(|e| panic!("{name}: {e}"));
     dormouse_core::config::validate(&c).unwrap_or_else(|e| panic!("{name} must validate: {e}"));
     c
 }
@@ -154,11 +155,21 @@ fn executes(name: &str) {
     probe::reset();
     let mut last = None;
     for _ in 0..STEPS {
-        last = Some(model.forward_with_hidden::<B>(x.clone(), Some(h.clone()), None, Some(y.clone()), Some(&teacher)));
+        last = Some(model.forward_with_hidden::<B>(
+            x.clone(),
+            Some(h.clone()),
+            None,
+            Some(y.clone()),
+            Some(&teacher),
+        ));
     }
     let (_logits, rec, kda, aux) = last.expect("three steps ran");
     let finite = |t: &Tensor<1>| {
-        let v: Vec<f32> = t.clone().into_data().try_to_vec().expect("readable [1] tensor");
+        let v: Vec<f32> = t
+            .clone()
+            .into_data()
+            .try_to_vec()
+            .expect("readable [1] tensor");
         v.iter().all(|x| x.is_finite())
     };
     assert!(finite(&rec), "{name}: loss is not finite");
@@ -209,9 +220,17 @@ fn executes(name: &str) {
     // counter, because it is the returned value the trainer persists.
     if cfg.use_kda {
         assert_eq!(kda.dims()[0], BATCH, "{name}: kda state batch dim");
-        assert!(kda.dims().iter().skip(1).any(|d| *d > 1), "{name}: kda state is the placeholder shape {:?}", kda.dims());
+        assert!(
+            kda.dims().iter().skip(1).any(|d| *d > 1),
+            "{name}: kda state is the placeholder shape {:?}",
+            kda.dims()
+        );
     } else {
-        assert_eq!(kda.dims(), [BATCH, 1, 1, 1], "{name}: the KDA arm is off, so there is no state");
+        assert_eq!(
+            kda.dims(),
+            [BATCH, 1, 1, 1],
+            "{name}: the KDA arm is off, so there is no state"
+        );
     }
 
     // ---- AUX OBJECTIVES: ran, with the configured weights ----------------
@@ -220,15 +239,35 @@ fn executes(name: &str) {
     // then None unless the MoR BCE is on.
     let jepa_on = cfg.jepa_weight > 0.0;
     let dspark_on = cfg.dspark_weight > 0.0 && cfg.dspark_k > 0;
-    assert_eq!(probe::count(probe::JEPA), STEPS as u64 * jepa_on as u64, "{name}: JEPA ran with weight {}", cfg.jepa_weight);
-    assert_eq!(probe::count(probe::DSPARK), STEPS as u64 * dspark_on as u64, "{name}: DSpark ran with weight {}", cfg.dspark_weight);
-    assert_eq!(probe::count(probe::MOR_BCE), STEPS as u64 * cfg.use_mor as u64, "{name}: the MoR BCE ran with weight {}", cfg.mor_bce_weight);
+    assert_eq!(
+        probe::count(probe::JEPA),
+        STEPS as u64 * jepa_on as u64,
+        "{name}: JEPA ran with weight {}",
+        cfg.jepa_weight
+    );
+    assert_eq!(
+        probe::count(probe::DSPARK),
+        STEPS as u64 * dspark_on as u64,
+        "{name}: DSpark ran with weight {}",
+        cfg.dspark_weight
+    );
+    assert_eq!(
+        probe::count(probe::MOR_BCE),
+        STEPS as u64 * cfg.use_mor as u64,
+        "{name}: the MoR BCE ran with weight {}",
+        cfg.mor_bce_weight
+    );
     // The routing balancer, counted where the term is ADDED. A non-zero
     // coefficient with no selection is refused by `validate`, so this is a
     // check that the term reached the objective rather than that a flag was
     // spelled right.
     let moe_on = fx.moe_lb_coef > 0.0;
-    assert_eq!(probe::count(probe::MOE_LB), STEPS as u64 * moe_on as u64, "{name}: the routing balancer ran with weight {}", fx.moe_lb_coef);
+    assert_eq!(
+        probe::count(probe::MOE_LB),
+        STEPS as u64 * moe_on as u64,
+        "{name}: the routing balancer ran with weight {}",
+        fx.moe_lb_coef
+    );
     let any_aux = jepa_on || dspark_on || cfg.use_mor || moe_on;
     match (any_aux, &aux) {
         (true, Some(a)) => assert!(finite(a), "{name}: aux is not finite"),
@@ -245,11 +284,17 @@ fn executes(name: &str) {
         m.jepa_weight = 0.0;
         m.mor_bce_weight = 0.0;
         m.dspark_weight = 1.0;
-        let unit = m.forward_with_hidden::<B>(x.clone(), Some(h.clone()), None, Some(y.clone()), None).3
-            .expect("dspark only").into_scalar::<f32>();
+        let unit = m
+            .forward_with_hidden::<B>(x.clone(), Some(h.clone()), None, Some(y.clone()), None)
+            .3
+            .expect("dspark only")
+            .into_scalar::<f32>();
         m.dspark_weight = cfg.dspark_weight;
-        let scaled = m.forward_with_hidden::<B>(x.clone(), Some(h.clone()), None, Some(y.clone()), None).3
-            .expect("dspark only").into_scalar::<f32>();
+        let scaled = m
+            .forward_with_hidden::<B>(x.clone(), Some(h.clone()), None, Some(y.clone()), None)
+            .3
+            .expect("dspark only")
+            .into_scalar::<f32>();
         assert!(
             (scaled - cfg.dspark_weight * unit).abs() < 1e-4 * unit.abs().max(1.0),
             "{name}: dspark_weight={} is not the multiplier applied (unit {unit:.6}, scaled {scaled:.6})",
@@ -270,8 +315,17 @@ fn executes(name: &str) {
         // counts asserted above are untouched.
         let mut ref_m = model.clone();
         ref_m.dspark_weight = 1.0;
-        let with = ref_m.forward_with_hidden::<B>(x.clone(), Some(h.clone()), None, Some(y.clone()), Some(&teacher)).3
-            .expect("jepa on").into_scalar::<f32>();
+        let with = ref_m
+            .forward_with_hidden::<B>(
+                x.clone(),
+                Some(h.clone()),
+                None,
+                Some(y.clone()),
+                Some(&teacher),
+            )
+            .3
+            .expect("jepa on")
+            .into_scalar::<f32>();
         // "No teacher" leaves DSpark's term, not "JEPA alone". Every preset
         // ships dspark_weight = 0.0 (DeepSeek's own MTP ablation reports the
         // head bits-per-byte neutral, and our protocol measures BPB), so on a
@@ -279,13 +333,19 @@ fn executes(name: &str) {
         // is correctly `None` - `any` at model.rs:254 needs a non-zero weight
         // plus dspark_k > 0. Hence `ref_m` above, which enables the arm for
         // BOTH sides so the subtraction isolates the teacher.
-        let without = ref_m.forward_with_hidden::<B>(x.clone(), Some(h.clone()), None, Some(y.clone()), None).3
-            .expect("dspark only").into_scalar::<f32>();
+        let without = ref_m
+            .forward_with_hidden::<B>(x.clone(), Some(h.clone()), None, Some(y.clone()), None)
+            .3
+            .expect("dspark only")
+            .into_scalar::<f32>();
         assert!(
             with >= without - 1e-4,
             "{name}: the JEPA term is not an addition ({with:.6} with teacher vs {without:.6} without)"
         );
-        println!("{name}: jepa contributes {:.6} (mask drawn per call, not pinnable)", with - without);
+        println!(
+            "{name}: jepa contributes {:.6} (mask drawn per call, not pinnable)",
+            with - without
+        );
     }
 
     // ---- DEPTH: the loop ran the configured number of iterations ----------
@@ -294,12 +354,20 @@ fn executes(name: &str) {
     // --rand-depth) must actually truncate the loop, not just be accepted.
     probe::reset();
     let _ = model.forward::<B>(x.clone(), Some(h.clone()));
-    assert_eq!(probe::count(probe::ITER), fx.max_iter as u64, "{name}: one teacher-free forward must be max_iter iterations");
+    assert_eq!(
+        probe::count(probe::ITER),
+        fx.max_iter as u64,
+        "{name}: one teacher-free forward must be max_iter iterations"
+    );
     let mut shallow = model.clone();
     shallow.set_loop_depth(Some(2));
     probe::reset();
     let _ = shallow.forward::<B>(x, Some(h));
-    assert_eq!(probe::count(probe::ITER), 2, "{name}: set_loop_depth(2) did not truncate the loop");
+    assert_eq!(
+        probe::count(probe::ITER),
+        2,
+        "{name}: set_loop_depth(2) did not truncate the loop"
+    );
     probe::reset();
     println!("{name}: ok, max_iter={} experts={} arms=kda:{} engram:{} gr:{} mor:{} jepa:{} dspark:{} ({} ms)",
         fx.max_iter, fx.n_experts, cfg.use_kda, cfg.use_engram, cfg.use_gr, cfg.use_mor,
@@ -357,14 +425,28 @@ fn nano_fused_executes() {
 /// `configs/` without one is the exact hole this file exists to close, so the
 /// list is checked against the directory, not trusted.
 const COVERED: &[&str] = &[
-    "base", "mor", "nano", "nano-fused", "one_b", "p150", "small", "swift50",
+    "base",
+    "mor",
+    "nano",
+    "nano-fused",
+    "one_b",
+    "p150",
+    "small",
+    "swift50",
 ];
 
 #[test]
 fn every_shipped_preset_has_an_execution_test() {
     let shipped = shipped_presets();
-    assert!(!shipped.is_empty(), "no presets found in {}", configs_dir().display());
-    let missing: Vec<&String> = shipped.iter().filter(|p| !COVERED.contains(&p.as_str())).collect();
+    assert!(
+        !shipped.is_empty(),
+        "no presets found in {}",
+        configs_dir().display()
+    );
+    let missing: Vec<&String> = shipped
+        .iter()
+        .filter(|p| !COVERED.contains(&p.as_str()))
+        .collect();
     assert!(
         missing.is_empty(),
         "presets with no execution test: {missing:?} - add a `fn <name>_executes() {{ executes(\"<name>\") }}` \
@@ -453,7 +535,10 @@ impl ModuleVisitor for Cost {
         let n: usize = param.val().clone().dims().iter().product();
         // `loop_block.engram.memory` is the table; `engram.key_projs` /
         // `engram.value_proj` are projections of the hidden state onto it.
-        let is_table = self.stack.windows(2).any(|w| w[0] == "engram" && w[1] == "memory");
+        let is_table = self
+            .stack
+            .windows(2)
+            .any(|w| w[0] == "engram" && w[1] == "memory");
         if is_table {
             self.memory += n;
         } else {
@@ -472,7 +557,11 @@ struct CostSplit {
 fn cost_of(model: &DormouseModel) -> CostSplit {
     let mut c = Cost::default();
     model.visit(&mut c);
-    CostSplit { compute: c.compute, memory: c.memory, groups: c.groups }
+    CostSplit {
+        compute: c.compute,
+        memory: c.memory,
+        groups: c.groups,
+    }
 }
 
 /// THE COST of one preset, on the real instantiated model, with every claim
@@ -495,12 +584,15 @@ fn cost_of_preset(name: &str) -> CostSplit {
     // (the in-model read masks the hash), so the measured row count must be
     // AT LEAST the config's - if it is not, the config is not the capacity and
     // the cost line below is fiction.
-    let (tables, _mask) = dormouse_core::loop_block::engram_tables(cfg.engram_rows, cfg.engram_orders.len());
+    let (tables, _mask) =
+        dormouse_core::loop_block::engram_tables(cfg.engram_rows, cfg.engram_orders.len());
     let min_rows: usize = tables.iter().sum::<usize>() * cfg.engram_dim;
     assert!(
         c.memory >= min_rows,
         "{name}: measured {} memory params, below the config's own {min_rows} ({} rows x {} dim)",
-        c.memory, tables[0], cfg.engram_dim
+        c.memory,
+        tables[0],
+        cfg.engram_dim
     );
     let share = c.memory as f64 / total as f64;
     println!(
@@ -517,17 +609,33 @@ fn cost_of_preset(name: &str) -> CostSplit {
         "{name}: {:.1}% of its {} parameters are n-gram memory rows ({} rows vs {} compute) - \
          that is the monopoly shape: a lookup table with a model attached, and the reason a run \
          gets rescued by a flag instead of a config",
-        share * 100.0, k(total), k(c.memory), k(c.compute)
+        share * 100.0,
+        k(total),
+        k(c.memory),
+        k(c.compute)
     );
     // Every parameter of every shipped preset is declared to an optimizer
     // group, exactly once - and the counts follow the preset's topology, not
     // literals.
     let r = dormouse_core::routing::routing(&model, false);
-    let g = r.check(&model).unwrap_or_else(|e| panic!("{name}: routing: {e}"));
-    assert_eq!(g.muon, 4 * cfg.n_experts + 3, "{name}: Muon+ group must follow n_experts");
-    assert_eq!(g.qk, 2, "{name}: the head-wise Q/K group is the KDA q and k");
+    let g = r
+        .check(&model)
+        .unwrap_or_else(|e| panic!("{name}: routing: {e}"));
+    assert_eq!(
+        g.muon,
+        4 * cfg.n_experts + 3,
+        "{name}: Muon+ group must follow n_experts"
+    );
+    assert_eq!(
+        g.qk, 2,
+        "{name}: the head-wise Q/K group is the KDA q and k"
+    );
     assert_eq!(g.tables, 1, "{name}: the n-gram table is one parameter");
-    assert_eq!(g.muon + g.qk + g.tables + g.rest, c.groups, "{name}: the groups must cover every parameter");
+    assert_eq!(
+        g.muon + g.qk + g.tables + g.rest,
+        c.groups,
+        "{name}: the groups must cover every parameter"
+    );
     c
 }
 
@@ -569,7 +677,10 @@ fn every_preset_states_its_cost_and_no_preset_is_a_lookup_table() {
 fn mor_differs_from_small_in_the_three_mor_lines_only() {
     let small = preset("small");
     let mut mor = preset("mor");
-    assert!(small.use_mor == false && mor.use_mor == true, "the A/B pair: small off, mor on");
+    assert!(
+        !small.use_mor && mor.use_mor,
+        "the A/B pair: small off, mor on"
+    );
     mor.use_mor = small.use_mor;
     assert_eq!(small, mor, "configs/mor.toml must differ from configs/small.toml in use_mor, mor_k and mor_bce_weight ONLY");
 }
@@ -593,7 +704,16 @@ fn the_wide_presets_cost_what_they_say_they_cost() {
 /// line is read by a person deciding which preset to run.
 fn k(n: usize) -> String {
     let s = n.to_string();
-    s.chars().rev().collect::<Vec<_>>().chunks(3).map(|c| c.iter().collect::<String>()).collect::<Vec<_>>().join("_").chars().rev().collect()
+    s.chars()
+        .rev()
+        .collect::<Vec<_>>()
+        .chunks(3)
+        .map(|c| c.iter().collect::<String>())
+        .collect::<Vec<_>>()
+        .join("_")
+        .chars()
+        .rev()
+        .collect()
 }
 
 // --- the fields no preset sets: proven live, not assumed ------------------
@@ -617,21 +737,42 @@ fn fields_no_preset_ships_still_take_effect() {
     let h = hashed_ids(&bytes, &dev);
     probe::reset();
     let l0 = model.forward::<B>(x.clone(), Some(h.clone()));
-    assert_eq!(probe::count(probe::ACT_QUANT), 0, "no preset ships act_quant; the default must be off");
-    let quant = DormouseConfig { act_quant: Some(dormouse_core::ActQuant::Int(8)), ..plain.clone() };
+    assert_eq!(
+        probe::count(probe::ACT_QUANT),
+        0,
+        "no preset ships act_quant; the default must be off"
+    );
+    let quant = DormouseConfig {
+        act_quant: Some(dormouse_core::ActQuant::Int(8)),
+        ..plain.clone()
+    };
     let qmodel = DormouseModel::new(&quant, &dev);
     probe::reset();
     let l1 = qmodel.forward::<B>(x.clone(), Some(h.clone()));
-    assert_eq!(probe::count(probe::ACT_QUANT), plain.max_iter as u64, "act_quant=8 must quantize every iteration's FFN input");
+    assert_eq!(
+        probe::count(probe::ACT_QUANT),
+        plain.max_iter as u64,
+        "act_quant=8 must quantize every iteration's FFN input"
+    );
     let d = (l0.clone() - l1).abs().max().into_scalar::<f32>();
-    assert!(d > 1e-6, "act_quant reached no logits: max |dlogit| = {d:.3e}");
+    assert!(
+        d > 1e-6,
+        "act_quant reached no logits: max |dlogit| = {d:.3e}"
+    );
 
     // use_gr: entered every iteration, and the readout differs.
-    let gr = DormouseConfig { use_gr: true, ..plain.clone() };
+    let gr = DormouseConfig {
+        use_gr: true,
+        ..plain.clone()
+    };
     let gmodel = DormouseModel::new(&gr, &dev);
     probe::reset();
     let l2 = gmodel.forward::<B>(x, Some(h));
-    assert_eq!(probe::count(probe::GR), plain.max_iter as u64, "use_gr must enter the gated residual every iteration");
+    assert_eq!(
+        probe::count(probe::GR),
+        plain.max_iter as u64,
+        "use_gr must enter the gated residual every iteration"
+    );
     let d = (l0 - l2).abs().max().into_scalar::<f32>();
     assert!(d > 1e-6, "use_gr changed no logits: max |dlogit| = {d:.3e}");
 
@@ -639,26 +780,44 @@ fn fields_no_preset_ships_still_take_effect() {
     // iteration (the aggregation is per-iteration, one query per slot), and
     // the readout must MOVE - an AttnRes that ran and changed nothing would be
     // the same class of defect as the GR arm was in 9b343d3.
-    let ar = DormouseConfig { use_attnres: true, ..plain.clone() };
+    let ar = DormouseConfig {
+        use_attnres: true,
+        ..plain.clone()
+    };
     let amodel = DormouseModel::new(&ar, &dev);
     let bytes = batch_bytes(11, BATCH * SEQ);
     let x = input_ids(&bytes, &dev);
     let h = hashed_ids(&bytes, &dev);
     probe::reset();
     let l0 = amodel.forward::<B>(x.clone(), Some(h.clone()));
-    assert_eq!(probe::count(probe::ATTNRES), plain.max_iter as u64, "use_attnres must aggregate every iteration");
+    assert_eq!(
+        probe::count(probe::ATTNRES),
+        plain.max_iter as u64,
+        "use_attnres must aggregate every iteration"
+    );
     let p0 = DormouseModel::new(&plain, &dev);
     let l1 = p0.forward::<B>(x, Some(h));
     let d = (l0 - l1).abs().max().into_scalar::<f32>();
-    assert!(d > 1e-6, "use_attnres changed no logits: max |dlogit| = {d:.3e}");
+    assert!(
+        d > 1e-6,
+        "use_attnres changed no logits: max |dlogit| = {d:.3e}"
+    );
 
     // use_tsct = false: dense experts, no TSCT factors anywhere, and every
     // parameter still declared to exactly one group.
-    let dense = DormouseConfig { use_tsct: false, ..plain.clone() };
+    let dense = DormouseConfig {
+        use_tsct: false,
+        ..plain.clone()
+    };
     let dmodel = DormouseModel::new(&dense, &dev);
     let r = dormouse_core::routing::routing(&dmodel, false);
-    let g = r.check(&dmodel).expect("the dense arm must be fully declared too");
-    assert!(g.rest > 0, "the dense arm must route the expert weights to the fallback");
+    let g = r
+        .check(&dmodel)
+        .expect("the dense arm must be fully declared too");
+    assert!(
+        g.rest > 0,
+        "the dense arm must route the expert weights to the fallback"
+    );
     let spectral = dormouse_core::routing::routing(&model, false)
         .check(&model)
         .expect("declared");
@@ -668,7 +827,10 @@ fn fields_no_preset_ships_still_take_effect() {
         g.muon,
         spectral.muon
     );
-    assert_eq!(g.qk, 2, "the head-wise Q/K group is the KDA q and k either way");
+    assert_eq!(
+        g.qk, 2,
+        "the head-wise Q/K group is the KDA q and k either way"
+    );
 }
 
 // --- the CUDA half: the fused gate, at the model --------------------------
@@ -690,7 +852,10 @@ fn fields_no_preset_ships_still_take_effect() {
 fn on_cuda_a_preset_attention_arm_actually_reaches_the_fused_kernels() {
     let dev = Device::cuda(0).autodiff();
     let cfg = preset("small");
-    assert!(cfg.use_kda, "the preset under test must declare the KDA arm");
+    assert!(
+        cfg.use_kda,
+        "the preset under test must declare the KDA arm"
+    );
     let fx = fixture(&cfg);
     let model = DormouseModel::new(&fx, &dev);
     let bytes = batch_bytes(3, BATCH * SEQ);
@@ -721,9 +886,16 @@ fn on_cuda_a_preset_attention_arm_actually_reaches_the_fused_kernels() {
         "fused kda fwd/bwd {kda_f}/{kda_b}; fused rmsnorm engaged {}/{} ({})",
         norm_asked.saturating_sub(norm_skipped),
         norm_asked,
-        if norm_asked == norm_skipped { "never engaged" } else { "engaged" }
+        if norm_asked == norm_skipped {
+            "never engaged"
+        } else {
+            "engaged"
+        }
     );
-    assert!(norm_skipped <= norm_asked, "the RMSNorm seam counter is inconsistent: {norm_asked}/{norm_skipped}");
+    assert!(
+        norm_skipped <= norm_asked,
+        "the RMSNorm seam counter is inconsistent: {norm_asked}/{norm_skipped}"
+    );
 }
 
 // --- fixtures ------------------------------------------------------------

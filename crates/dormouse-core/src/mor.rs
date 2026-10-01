@@ -207,6 +207,10 @@ mod tests {
             &host_label(bumped[1], 2),
             "a new batch must re-derive the label"
         );
-        assert_ne!(&got2[0..4], &got2[4..8], "distinct rows must not share a label");
+        assert_ne!(
+            &got2[0..4],
+            &got2[4..8],
+            "distinct rows must not share a label"
+        );
     }
 }

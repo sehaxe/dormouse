@@ -14,10 +14,10 @@
 //!   states, shaping multi-token predictiveness; at inference the same head
 //!   gives free speculative decoding.
 
+use burn::backend::DispatchKindConversion;
 use burn::module::{Module, ModuleMapper, ModuleVisitor, Param};
 use burn::tensor::{Bool, DispatchTensor, Int, Tensor};
-use burn::backend::DispatchKindConversion;
-use burn_dspark::{AcceptRatePredictor, RNNHead, dspark_loss};
+use burn_dspark::{dspark_loss, AcceptRatePredictor, RNNHead};
 use burn_jepa::{jepa_l1_loss, koleo_loss, JepaPredictor};
 use std::cell::Cell;
 
@@ -153,12 +153,10 @@ pub fn mask_stream(t: usize, mask_frac: f32, mask_span: usize) -> Vec<bool> {
 pub fn mask_from(seed: u64, step: u64, t: usize, mask_frac: f32, mask_span: usize) -> Vec<bool> {
     let span = mask_span.max(1);
     let rate = 1.0 - (1.0 - mask_frac.clamp(0.0, 1.0)).powf(1.0 / span as f32);
-    let key = seed
-        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        .wrapping_add(step);
+    let key = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(step);
     let mut out = vec![false; t];
     let mut starts = 0usize;
-    for i in 0..t {
+    for (i, slot) in out.iter_mut().enumerate() {
         // splitmix64 over (key, i): a stateless draw, so position i does not
         // depend on how many draws came before it.
         let mut z = key
@@ -177,10 +175,8 @@ pub fn mask_from(seed: u64, step: u64, t: usize, mask_frac: f32, mask_span: usiz
             // the union is span+1, and measures 0.215 for a 0.2 mask).
             starts = span;
         }
-        out[i] = starts > 0;
-        if starts > 0 {
-            starts -= 1;
-        }
+        *slot = starts > 0;
+        starts = starts.saturating_sub(1);
     }
     out
 }
@@ -332,12 +328,15 @@ where
     let k = k.max(1);
     // Anchors p_i = i*stride (see the doc above for what stride is): with the
     // whole draft window inside the sequence, `n = floor((t-k-1)/stride)`.
-    let n = if t > k + 1 { (t - k - 1) / stride.max(1) } else { 0 };
+    let n = if t > k + 1 {
+        (t - k - 1) / stride.max(1)
+    } else {
+        0
+    };
     if n == 0 {
         return Tensor::zeros([1], &hidden.device());
     }
-    let anchors = Tensor::<1, Int>::arange(0..n as i64, &hidden.device())
-        .mul_scalar(stride as i64);
+    let anchors = Tensor::<1, Int>::arange(0..n as i64, &hidden.device()).mul_scalar(stride as i64);
     let frozen = logits.detach();
 
     // Teacher-forced windows: step `s` sees position p+s (gold prev token +
@@ -352,15 +351,16 @@ where
         let g2: Tensor<2, Int> = pos.clone().unsqueeze_dim::<2>(0).expand([b, n]);
         let g3: Tensor<3, Int> = g2.clone().unsqueeze_dim::<3>(2).expand([b, n, d]);
         let gv: Tensor<3, Int> = g2.clone().unsqueeze_dim::<3>(2).expand([b, n, v]);
-        let nxt: Tensor<2, Int> = pos
-            .add_scalar(1)
-            .unsqueeze_dim::<2>(0)
-            .expand([b, n]);
+        let nxt: Tensor<2, Int> = pos.add_scalar(1).unsqueeze_dim::<2>(0).expand([b, n]);
         token_cols.push(ids.clone().gather(1, g2));
         hidden_cols.push(hidden.clone().gather(1, g3));
         base_cols.push(frozen.clone().gather(1, gv));
         id_cols.push(ids.clone().gather(1, nxt.clone()));
-        target_cols.push(frozen.clone().gather(1, nxt.unsqueeze_dim::<3>(2).expand([b, n, v])));
+        target_cols.push(
+            frozen
+                .clone()
+                .gather(1, nxt.unsqueeze_dim::<3>(2).expand([b, n, v])),
+        );
     }
     let stack4 = |cols: Vec<Tensor<3>>| -> Tensor<4> {
         let len = cols.len();
@@ -369,16 +369,20 @@ where
         Tensor::cat(stacked, 2).reshape([bb, nn, len, w])
     };
     let token_ids: Tensor<3, Int> = {
-        let stacked: Vec<Tensor<3, Int>> =
-            token_cols.into_iter().map(|c| c.unsqueeze_dim::<3>(2)).collect();
+        let stacked: Vec<Tensor<3, Int>> = token_cols
+            .into_iter()
+            .map(|c| c.unsqueeze_dim::<3>(2))
+            .collect();
         let [bb, nn, _] = stacked[0].dims();
         Tensor::cat(stacked, 2).reshape([bb, nn, k])
     };
     let hidden_win = stack4(hidden_cols);
     let base_win = stack4(base_cols);
     let target_ids: Tensor<3, Int> = {
-        let stacked: Vec<Tensor<3, Int>> =
-            id_cols.into_iter().map(|c| c.unsqueeze_dim::<3>(2)).collect();
+        let stacked: Vec<Tensor<3, Int>> = id_cols
+            .into_iter()
+            .map(|c| c.unsqueeze_dim::<3>(2))
+            .collect();
         let [bb, nn, _] = stacked[0].dims();
         Tensor::cat(stacked, 2).reshape([bb, nn, k])
     };
@@ -419,8 +423,8 @@ where
 mod tests {
     use super::*;
     use crate::{DormouseConfig, DormouseModel};
-    use burn::backend::autodiff::Autodiff;
     use burn::backend::autodiff::checkpoint::strategy::BalancedCheckpointing;
+    use burn::backend::autodiff::Autodiff;
     use burn::tensor::{Device, Distribution, TensorData};
 
     /// The backend alias the train crate uses for `--features cpu`;
@@ -464,7 +468,9 @@ mod tests {
         let mut s = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
         (0..n)
             .map(|_| {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 ((s >> 33) % 256) as i64
             })
             .collect()
@@ -498,7 +504,11 @@ mod tests {
         let t = cfg.max_seq_len;
         let x = bytes(0xD5, t);
         // The real trainer's labelling: y[q] = x[q+1].
-        let y_shift: Vec<i64> = x[1..].iter().chain(std::iter::once(&x[0])).copied().collect();
+        let y_shift: Vec<i64> = x[1..]
+            .iter()
+            .chain(std::iter::once(&x[0]))
+            .copied()
+            .collect();
         // A second, unrelated labelling of the same input.
         let y_other = bytes(0x1F, t);
 
@@ -515,7 +525,10 @@ mod tests {
             (a - b).abs() < 1e-6,
             "the DSpark term read the LABELS: {a} vs {b} for the same input"
         );
-        assert!(a.is_finite() && a != 0.0, "the term is vacuous at {a}, so invariance is free");
+        assert!(
+            a.is_finite() && a != 0.0,
+            "the term is vacuous at {a}, so invariance is free"
+        );
         // Non-vacuity in the other direction: it IS a function of the input
         // the backbone consumed (an always-zero aux would pass the above).
         // The two tolerances sit on purpose and neither sits on a value:
@@ -567,7 +580,10 @@ mod tests {
             cfg.dspark_stride,
         );
         let got = l.into_scalar::<f32>();
-        assert!(got.is_finite() && got > 0.0, "the window must produce a real term, got {got}");
+        assert!(
+            got.is_finite() && got > 0.0,
+            "the window must produce a real term, got {got}"
+        );
     }
 
     /// Half 1: the head `AuxHeads` builds cannot run without the token at
@@ -582,7 +598,10 @@ mod tests {
         let heads = AuxHeads::new(cfg.d_model, cfg.vocab, cfg.rank, &dev);
         let h = Tensor::<3>::zeros([1, 2, cfg.d_model], &dev);
         assert_eq!(
-            heads.conf.prob(h.clone(), Some(Tensor::zeros([1, 2, cfg.rank], &dev))).dims(),
+            heads
+                .conf
+                .prob(h.clone(), Some(Tensor::zeros([1, 2, cfg.rank], &dev)))
+                .dims(),
             [1, 2, 1]
         );
         let _ = heads.conf.logit(h, None);
@@ -617,10 +636,18 @@ mod tests {
                 .unwrap()
         };
         let (a, b) = (logit(1), logit(9));
-        let moved: f32 = (0..a.len()).map(|i| (a[i] - b[i]).abs()).fold(0.0, f32::max);
-        assert!(moved > 1e-4, "the markov head ignores W1[x]: {a:?} vs {b:?}");
-        let hidden_only: Vec<f32> =
-            AcceptRatePredictor::new(D, &dev).prob(h, None).into_data().try_to_vec().unwrap();
+        let moved: f32 = (0..a.len())
+            .map(|i| (a[i] - b[i]).abs())
+            .fold(0.0, f32::max);
+        assert!(
+            moved > 1e-4,
+            "the markov head ignores W1[x]: {a:?} vs {b:?}"
+        );
+        let hidden_only: Vec<f32> = AcceptRatePredictor::new(D, &dev)
+            .prob(h, None)
+            .into_data()
+            .try_to_vec()
+            .unwrap();
         assert!(
             hidden_only.iter().all(|x| (x - 0.5).abs() < 1e-6),
             "a bias-free hidden-only head on a ZERO hidden state is sigmoid(0): {hidden_only:?}"
@@ -672,7 +699,8 @@ mod tests {
         let heads = AuxHeads::new(cfg.d_model, cfg.vocab, cfg.rank, &dev);
         let (k, v) = (cfg.dspark_k, cfg.vocab);
         let run = |t: usize, stride: usize| -> f32 {
-            let hidden = Tensor::<3>::random([1, t, cfg.d_model], Distribution::Normal(0.0, 1.0), &dev);
+            let hidden =
+                Tensor::<3>::random([1, t, cfg.d_model], Distribution::Normal(0.0, 1.0), &dev);
             let logits = Tensor::<3>::random([1, t, v], Distribution::Normal(0.0, 1.0), &dev);
             let ids = Tensor::from_data(TensorData::new(bytes(0x77, t), [1, t]), &dev);
             dspark_aux_loss(&heads.dspark, &heads.conf, hidden, logits, ids, k, stride)
@@ -680,14 +708,28 @@ mod tests {
         };
         let stride = 16usize;
         // n = 0 below t = k + 1 + stride, and the term is then exactly zero.
-        assert_eq!(run(k + stride, stride), 0.0, "t = k + stride leaves (stride-1)/stride = 0");
-        assert!(run(k + stride + 1, stride) > 0.0, "t = k + stride + 1 fits the first window");
+        assert_eq!(
+            run(k + stride, stride),
+            0.0,
+            "t = k + stride leaves (stride-1)/stride = 0"
+        );
+        assert!(
+            run(k + stride + 1, stride) > 0.0,
+            "t = k + stride + 1 fits the first window"
+        );
         // The doc's arithmetic, t = 512 / k = 4 / stride = 16 -> 31 anchors.
         assert_eq!((512 - 4 - 1) / 16, 31, "the anchor count the doc quotes");
         // One position short of spanning the gap is no window; exactly
         // spanning it is the single window at p = 0.
-        assert_eq!(run(64, 64), 0.0, "stride wider than t - k - 1 leaves nothing");
-        assert!(run(64, 59) > 0.0, "stride == t - k - 1 must leave the single window at p = 0");
+        assert_eq!(
+            run(64, 64),
+            0.0,
+            "stride wider than t - k - 1 leaves nothing"
+        );
+        assert!(
+            run(64, 59) > 0.0,
+            "stride == t - k - 1 must leave the single window at p = 0"
+        );
     }
 
     /// THE PRICE OF EQ. 7, measured rather than asserted. `aux.conf` grew
@@ -719,7 +761,10 @@ mod tests {
             .try_load_record(record)
             .expect_err("a [d_model, 1] conf must be refused, not loaded into [d_model + rank, 1]")
             .to_string();
-        assert!(err.contains("conf"), "the error must name the field it refused: {err}");
+        assert!(
+            err.contains("conf"),
+            "the error must name the field it refused: {err}"
+        );
     }
 
     /// ADR-0021: the mask is a pure function of `(seed, step)`. The whole
@@ -737,17 +782,33 @@ mod tests {
         // Same (seed, step) twice: identical, on any backend, with no RNG
         // state involved. This is what makes a resume and an A/B replay.
         set_mask_stream(7, 100);
-        assert_eq!(a, mask_stream(t, frac, span), "same (seed, step) must redraw the same mask");
+        assert_eq!(
+            a,
+            mask_stream(t, frac, span),
+            "same (seed, step) must redraw the same mask"
+        );
         // The next step must NOT be the same mask, or every step trains on
         // the same masked positions.
         set_mask_stream(7, 101);
-        assert_ne!(a, mask_stream(t, frac, span), "consecutive steps must differ");
+        assert_ne!(
+            a,
+            mask_stream(t, frac, span),
+            "consecutive steps must differ"
+        );
         // A different seed is a different run.
         set_mask_stream(8, 100);
-        assert_ne!(a, mask_stream(t, frac, span), "a different seed must differ");
+        assert_ne!(
+            a,
+            mask_stream(t, frac, span),
+            "a different seed must differ"
+        );
         // ...and the seam is wired to the no-ambient-state function, which is
         // what makes the property survive into a second process.
-        assert_eq!(a, mask_from(7, 100, t, frac, span), "the seam must feed mask_from");
+        assert_eq!(
+            a,
+            mask_from(7, 100, t, frac, span),
+            "the seam must feed mask_from"
+        );
     }
 
     /// Two threads, two runs, one process: each must get its own
@@ -769,9 +830,20 @@ mod tests {
         })
         .join()
         .unwrap();
-        assert_eq!(other.0, mask_from(9, 9, t, 0.2, 4), "other thread's own step");
-        assert_eq!(other.1, mine, "another thread's step must not move this run's mask");
-        assert_eq!(mask_stream(t, 0.2, 4), mine, "this thread's step must survive the spawn");
+        assert_eq!(
+            other.0,
+            mask_from(9, 9, t, 0.2, 4),
+            "other thread's own step"
+        );
+        assert_eq!(
+            other.1, mine,
+            "another thread's step must not move this run's mask"
+        );
+        assert_eq!(
+            mask_stream(t, 0.2, 4),
+            mine,
+            "this thread's step must survive the spawn"
+        );
     }
 
     /// The cross-process half. `mask_from` reads nothing but its arguments and
@@ -786,7 +858,10 @@ mod tests {
         assert_eq!(m.len(), 64);
         // A constant mask would satisfy any golden; require the actual mix.
         let ones = m.iter().filter(|b| **b).count();
-        assert!((8..=56).contains(&ones), "pinned mask is not a mix: {ones}/64 true");
+        assert!(
+            (8..=56).contains(&ones),
+            "pinned mask is not a mix: {ones}/64 true"
+        );
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
         for b in &m {
             h ^= u64::from(*b);
@@ -795,7 +870,10 @@ mod tests {
         // Regenerate after ANY deliberate change to the derivation, and say so
         // in the commit: a changed golden here means the mask of every past
         // run is no longer the mask of the next one.
-        assert_eq!(h, GOLDEN_MASK_FNV, "mask derivation changed; re-pin deliberately");
+        assert_eq!(
+            h, GOLDEN_MASK_FNV,
+            "mask derivation changed; re-pin deliberately"
+        );
     }
     const GOLDEN_MASK_FNV: u64 = 8732553446442614006;
 
@@ -819,12 +897,18 @@ mod tests {
             }
         }
         let frac = frac / 200.0;
-        assert!((frac - 0.2).abs() < 0.01, "masked fraction {frac} vs the requested 0.2");
+        assert!(
+            (frac - 0.2).abs() < 0.01,
+            "masked fraction {frac} vs the requested 0.2"
+        );
         assert!(runs > 100, "suspiciously few masked runs: {runs}");
         let mean = len as f32 / runs as f32;
         // Runs merge when two starts land within `span`, so the mean is above
         // `span` (4.6 measured); the identity that matters is the FRACTION.
-        assert!(mean > 4.0 && mean < 5.5, "mean run length {mean} vs the requested span 4");
+        assert!(
+            mean > 4.0 && mean < 5.5,
+            "mean run length {mean} vs the requested span 4"
+        );
         // Degenerate configs must not panic or invert the sense.
         set_mask_stream(3, 1);
         assert_eq!(mask_stream(8, 0.0, 4), vec![false; 8]);

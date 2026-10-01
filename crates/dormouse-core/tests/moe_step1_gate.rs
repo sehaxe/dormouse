@@ -23,7 +23,6 @@
 /// 3. **INPUT DEPENDENCE.** Two different inputs, same weights, same pass: if
 ///    the top-1 never moves, the mixture is a function of the pass alone and no
 ///    amount of routing will make it a router.
-
 use burn::tensor::{Distribution, Tensor};
 use dormouse_core::config::validate;
 use dormouse_core::loop_block::LoopBlock;
@@ -79,7 +78,11 @@ fn stats_of(block: &LoopBlock, x: Tensor<3>, head: &LinearLike) -> MixtureStats 
     mixture_probe::arm();
     let _ = block.forward_full_state::<B>(x, None, None, None, None, head);
     let cap = mixture_probe::take().expect("armed before the forward");
-    assert_eq!(cap.len(), block.max_iter, "one capture per executed iteration");
+    assert_eq!(
+        cap.len(),
+        block.max_iter,
+        "one capture per executed iteration"
+    );
     mixture_probe::stats(&cap)
 }
 
@@ -120,11 +123,22 @@ fn the_overlap_metric_moves_when_routing_lands() {
         mean(&routed, |s| s.mean_support),
     );
 
-    println!("STEP 1, cross-pass routing overlap at {EXPERTS} experts, depth 4, {BATCH}x{SEQ} positions");
-    println!("  {} positions x 8 draws per arm, CPU/ndarray, this commit", BATCH * SEQ);
+    println!(
+        "STEP 1, cross-pass routing overlap at {EXPERTS} experts, depth 4, {BATCH}x{SEQ} positions"
+    );
+    println!(
+        "  {} positions x 8 draws per arm, CPU/ndarray, this commit",
+        BATCH * SEQ
+    );
     println!("  {:>26} {:>12} {:>12}", "metric", "DENSE", "ROUTED k=1");
-    println!("  {:>26} {:>12.4} {:>12.4}", "cross-pass top-1 agreement", d_agree, r_agree);
-    println!("  {:>26} {:>12.4} {:>12.4}", "cross-pass weight cosine", d_cos, r_cos);
+    println!(
+        "  {:>26} {:>12.4} {:>12.4}",
+        "cross-pass top-1 agreement", d_agree, r_agree
+    );
+    println!(
+        "  {:>26} {:>12.4} {:>12.4}",
+        "cross-pass weight cosine", d_cos, r_cos
+    );
     println!(
         "  {:>26} {:>12.4} {:>12.4}",
         "ANCHOR PAIR identical", d_ident, r_ident
@@ -179,7 +193,13 @@ fn the_overlap_metric_moves_when_routing_lands() {
         "  FINDING: routed disjoint {:.4} vs the paper's 0.25-0.53 band. Ours is {} the band, so \
          the anchors do NOT transfer - as expected across scale, and stated rather than tuned to.",
         r_disj,
-        if r_disj < 0.25 { "BELOW" } else if r_disj > 0.53 { "ABOVE" } else { "inside" }
+        if r_disj < 0.25 {
+            "BELOW"
+        } else if r_disj > 0.53 {
+            "ABOVE"
+        } else {
+            "inside"
+        }
     );
     println!(
         "  FINDING: at k=1 routing changes the SUPPORT (4 -> 1), not WHICH expert wins - softmax \
@@ -190,11 +210,19 @@ fn the_overlap_metric_moves_when_routing_lands() {
     println!();
     println!(
         "  dense load share per expert: {:?}",
-        dense[0].load.iter().map(|x| (x * 1000.0).round() / 1000.0).collect::<Vec<_>>()
+        dense[0]
+            .load
+            .iter()
+            .map(|x| (x * 1000.0).round() / 1000.0)
+            .collect::<Vec<_>>()
     );
     println!(
         "  routed load share per expert: {:?}",
-        routed[0].load.iter().map(|x| (x * 1000.0).round() / 1000.0).collect::<Vec<_>>()
+        routed[0]
+            .load
+            .iter()
+            .map(|x| (x * 1000.0).round() / 1000.0)
+            .collect::<Vec<_>>()
     );
 }
 

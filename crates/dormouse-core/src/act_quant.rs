@@ -87,10 +87,10 @@ where
     };
     let scale = scale.clamp_min(1e-8).div_scalar(fmax);
     let norm = x.clone().div(scale.clone()); // in [-fmax, fmax]
-    // `q` comes back in the FORMAT'S OWN UNITS (an e2m1 level, or an integer
-    // level count) and is dequantized by the same `scale`, so the int path is
-    // bit-identical to the old `round(norm*l)/l * block_max` spelling: the
-    // format change is confined to Fp4.
+                                             // `q` comes back in the FORMAT'S OWN UNITS (an e2m1 level, or an integer
+                                             // level count) and is dequantized by the same `scale`, so the int path is
+                                             // bit-identical to the old `round(norm*l)/l * block_max` spelling: the
+                                             // format change is confined to Fp4.
     let q = match fmt {
         ActFormat::Fp4 => fp4_round::<B>(norm),
         ActFormat::Int(bits) => {
@@ -188,7 +188,10 @@ mod tests {
         let x: Tensor<2> = Tensor::random([16, 64], Distribution::Normal(0.0, 1.0), &dev);
         let q = quant_act::<Flex>(x.clone(), ActFormat::Int(4), 0);
         let v: Vec<f32> = q.into_data().try_to_vec().unwrap();
-        assert!(v.iter().all(|x| x.is_finite()), "quantized acts must be finite");
+        assert!(
+            v.iter().all(|x| x.is_finite()),
+            "quantized acts must be finite"
+        );
         let orig: Vec<f32> = x.into_data().try_to_vec().unwrap();
         let mut max_d = 0.0f32;
         for (a, b) in orig.iter().zip(v.iter()) {
@@ -214,7 +217,10 @@ mod tests {
         }
         // And the negative mirror, which is where a lost sign shows up.
         let x: Tensor<2> = Tensor::from_data(
-            burn::tensor::TensorData::new(vals.iter().map(|v| -v).collect::<Vec<_>>(), [1, vals.len()]),
+            burn::tensor::TensorData::new(
+                vals.iter().map(|v| -v).collect::<Vec<_>>(),
+                [1, vals.len()],
+            ),
             &dev,
         );
         let out: Vec<f32> = fp4_round::<Flex>(x).into_data().try_to_vec().unwrap();

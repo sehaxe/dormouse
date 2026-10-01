@@ -29,10 +29,10 @@
 //!   cargo run --release -p dormouse-train --example kda_alloc_probe \
 //!       --no-default-features --features cuda
 
-use burn::backend::autodiff::Autodiff;
 use burn::backend::autodiff::checkpoint::strategy::{BalancedCheckpointing, NoCheckpointing};
+use burn::backend::autodiff::Autodiff;
 use burn::tensor::{Device, Tensor, TensorData};
-use burn_dispatch::{DispatchDevice, devices::CubeDevice};
+use burn_dispatch::{devices::CubeDevice, DispatchDevice};
 use cubecl_cuda::CudaRuntime;
 use cubecl_runtime::runtime::Runtime as _;
 use dormouse_core::attention::AdaptiveAttention;
@@ -93,9 +93,8 @@ fn main() {
         (st % 10000) as f32 / 10000.0 - 0.5
     };
     let data: Vec<f32> = (0..b * T * D).map(|_| next()).collect();
-    let x = || {
-        Tensor::<3>::from_data(TensorData::new(data.clone(), [b, T, D]), &adev).require_grad()
-    };
+    let x =
+        || Tensor::<3>::from_data(TensorData::new(data.clone(), [b, T, D]), &adev).require_grad();
 
     println!(
         "KDA allocator probe: b={b} t={T} d={D} heads={H} K=V={HK} chunk={CHUNK} \
@@ -243,7 +242,9 @@ fn main() {
         u_after.number_allocs as i64 - u_before.number_allocs as i64,
         mb(u_before.bytes_reserved),
         mb(u_after.bytes_reserved),
-        mb(u_after.bytes_reserved.saturating_sub(u_before.bytes_reserved)),
+        mb(u_after
+            .bytes_reserved
+            .saturating_sub(u_before.bytes_reserved)),
     );
 
     println!(

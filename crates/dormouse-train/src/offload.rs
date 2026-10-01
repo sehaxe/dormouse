@@ -33,6 +33,10 @@ const SINKHORN_ITERS: usize = 2;
 /// Layout magic ("2MGN" little-endian). v1 files (Adam m+v) start with the
 /// step counter and can never collide with this; a mismatch fails the load
 /// loudly instead of misreading the state.
+// clippy reads the trailing `32` of a hex literal as a mistyped `i32` suffix;
+// the value is the magic, not a decimal, and `0x004D_474E` would be a
+// different byte pattern.
+#[allow(clippy::mistyped_literal_suffixes)]
 const LAYOUT_MAGIC: u32 = 0x4D_47_4E_32;
 
 /// 3 tables, one per n-gram order (`dormouse_data::ORDERS = [2, 3, 4]`),
@@ -155,7 +159,7 @@ impl HostNgram {
                     MOMENTUM * self.m[mi] + (1.0 - MOMENTUM) * grads[k * self.dim + c];
             }
         }
-        if self.step % SINKHORN_EVERY == 0 {
+        if self.step.is_multiple_of(SINKHORN_EVERY) {
             sinkhorn_l1(&mut block, n, self.dim, SINKHORN_ITERS);
         }
         for (k, &r) in indices.iter().enumerate() {
@@ -168,6 +172,10 @@ impl HostNgram {
 
     /// Serialize the tables + momentum state (checkpointing; ~row_bytes *
     /// rows). Layout: [magic u32][step u64][tables][m].
+    // Unread today: nothing writes the sidecar yet (ADR-0021 item 7 defers
+    // the sidecar pairing decision). The round-trip test below is its
+    // consumer, and deleting the writer orphans the reader.
+    #[allow(dead_code)]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(12 + self.tables.len() * 4 * 2);
         buf.extend_from_slice(&LAYOUT_MAGIC.to_le_bytes());
@@ -210,11 +218,12 @@ impl HostNgram {
             return None;
         }
         let step = u64::from_le_bytes(bytes[4..12].try_into().ok()?);
-        let mut it = bytes[12..].chunks_exact(4);
+        let (chunks, _) = bytes[12..].as_chunks::<4>();
+        let mut it = chunks.iter();
         let mut read = |n: usize| -> Option<Vec<f32>> {
             let mut v = Vec::with_capacity(n);
             for _ in 0..n {
-                let b: [u8; 4] = it.next()?.try_into().ok()?;
+                let b: [u8; 4] = *it.next()?;
                 v.push(f32::from_le_bytes(b));
             }
             Some(v)
@@ -271,6 +280,42 @@ fn sinkhorn_l1(block: &mut [f32], rows: usize, cols: usize, iters: usize) {
     }
 }
 
+/// Gather the batch's rows from RAM into an autodiff leaf and expand them
+/// to the `[b, t, 3*dim]` embedding the model consumes. With `track=false`
+/// (eval) the leaf is skipped and only the embedding is returned. Also
+/// returns the unique absolute row indices (the CPU momentum update
+/// consumes exactly these; recomputing `unique_rows` per step would double
+/// the work).
+pub fn rows_for_batch<B: Backend>(
+    host: &HostNgram,
+    hashes: &[i64],
+    b: usize,
+    t: usize,
+    device: &burn::tensor::Device,
+    track: bool,
+) -> (Option<Param<Tensor<2>>>, Tensor<3>, Vec<i64>)
+where
+    DispatchTensor: DispatchKindConversion<B>,
+{
+    let (uniq, pos) = host.unique_rows(hashes);
+    let mut rows = Vec::new();
+    host.gather(&uniq, &mut rows);
+    let rows_t: Tensor<2> =
+        Tensor::from_data(TensorData::new(rows, [uniq.len(), host.dim]), device);
+    let p = track.then(|| {
+        let r = rows_t.clone().require_grad();
+        Param::from_tensor(r)
+    });
+    let src = match &p {
+        Some(pp) => pp.val(),
+        None => rows_t,
+    };
+    let pos_t: Tensor<1, Int> = Tensor::from_data(TensorData::new(pos, [b * t * 3]), device);
+    let idx2 = pos_t.unsqueeze_dim::<2>(1).repeat(&[1, host.dim]);
+    let embed = src.gather(0, idx2).reshape([b, t, 3 * host.dim]);
+    (p, embed, uniq)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,11 +332,18 @@ mod tests {
         let hashes: Vec<i64> = vec![-1, -2, -3, -65, -1000, i32::MIN as i64];
         let (uniq, pos) = h.unique_rows(&hashes);
         assert_eq!(pos.len(), hashes.len());
-        assert!(uniq.iter().all(|&r| (0..h.total_rows() as i64).contains(&r)), "{uniq:?}");
+        assert!(
+            uniq.iter()
+                .all(|&r| (0..h.total_rows() as i64).contains(&r)),
+            "{uniq:?}"
+        );
         // Same rows as the non-negative remainder.
         let nonneg: Vec<i64> = hashes.iter().map(|&x| x.rem_euclid(1 << 31)).collect();
         let (uniq2, _) = h.unique_rows(&nonneg);
-        assert_eq!(uniq, uniq2, "negative hashes must reduce like their unsigned twins");
+        assert_eq!(
+            uniq, uniq2,
+            "negative hashes must reduce like their unsigned twins"
+        );
         // And the gather is in bounds, which is the actual crash.
         let mut rows = Vec::new();
         h.gather(&uniq, &mut rows);
@@ -358,11 +410,19 @@ mod tests {
             .collect();
         let orig: f32 = block.iter().map(|x| x.abs()).sum();
         sinkhorn_l1(&mut block, rows, cols, 8);
-        let row_l1 = |r: usize| block[r * cols..(r + 1) * cols].iter().map(|x| x.abs()).sum::<f32>();
+        let row_l1 = |r: usize| {
+            block[r * cols..(r + 1) * cols]
+                .iter()
+                .map(|x| x.abs())
+                .sum::<f32>()
+        };
         let col_l1 = |c: usize| (0..rows).map(|r| block[r * cols + c].abs()).sum::<f32>();
         let row_sums: Vec<f32> = (0..rows).map(row_l1).collect();
         let col_sums: Vec<f32> = (0..cols).map(col_l1).collect();
-        let spread = |v: &[f32]| v.iter().cloned().fold(f32::MIN, f32::max) / v.iter().cloned().fold(f32::MAX, f32::max).max(1e-12);
+        let spread = |v: &[f32]| {
+            v.iter().cloned().fold(f32::MIN, f32::max)
+                / v.iter().cloned().fold(f32::MAX, f32::max).max(1e-12)
+        };
         assert!(
             spread(&row_sums) < 3.0,
             "row L1 sums must balance: {row_sums:?}"
@@ -378,39 +438,4 @@ mod tests {
         );
         assert!(block.iter().all(|x| x.is_finite()));
     }
-}
-
-/// Gather the batch's rows from RAM into an autodiff leaf and expand them
-/// to the `[b, t, 3*dim]` embedding the model consumes. With `track=false`
-/// (eval) the leaf is skipped and only the embedding is returned. Also
-/// returns the unique absolute row indices (the CPU momentum update
-/// consumes exactly these; recomputing `unique_rows` per step would double
-/// the work).
-pub fn rows_for_batch<B: Backend>(
-    host: &HostNgram,
-    hashes: &[i64],
-    b: usize,
-    t: usize,
-    device: &burn::tensor::Device,
-    track: bool,
-) -> (Option<Param<Tensor<2>>>, Tensor<3>, Vec<i64>)
-where
-    DispatchTensor: DispatchKindConversion<B>,
-{
-    let (uniq, pos) = host.unique_rows(hashes);
-    let mut rows = Vec::new();
-    host.gather(&uniq, &mut rows);
-    let rows_t: Tensor<2> = Tensor::from_data(TensorData::new(rows, [uniq.len(), host.dim]), device);
-    let p = track.then(|| {
-        let r = rows_t.clone().require_grad();
-        Param::from_tensor(r.into())
-    });
-    let src = match &p {
-        Some(pp) => pp.val(),
-        None => rows_t,
-    };
-    let pos_t: Tensor<1, Int> = Tensor::from_data(TensorData::new(pos, [b * t * 3]), device);
-    let idx2 = pos_t.unsqueeze_dim::<2>(1).repeat(&[1, host.dim]);
-    let embed = src.gather(0, idx2).reshape([b, t, 3 * host.dim]);
-    (p, embed, uniq)
 }

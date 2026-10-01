@@ -27,7 +27,6 @@
 /// a bug at `k = 1`, but an expert that is masked out on EVERY row of EVERY
 /// step is the router collapsing, and that is the load-balancing term's job -
 /// see `moe.rs`'s sweep, which measures that the term's gradient is non-zero.
-
 use burn::tensor::{Distribution, Int, Tensor, TensorData};
 use dormouse_core::config::validate;
 use dormouse_core::loop_block::LoopBlock;
@@ -70,12 +69,17 @@ fn cfg(topk: usize) -> DormouseConfig {
 
 fn ids_and_targets(b: usize, t: usize) -> (Tensor<2, Int>, Tensor<2, Int>) {
     let x = Tensor::<2, Int>::from_data(
-        TensorData::new((0..(b * t)).map(|i| (i % 251) as i64).collect::<Vec<_>>(), [b, t]),
+        TensorData::new(
+            (0..(b * t)).map(|i| (i % 251) as i64).collect::<Vec<_>>(),
+            [b, t],
+        ),
         &adev(),
     );
     let y = Tensor::<2, Int>::from_data(
         TensorData::new(
-            (0..(b * t)).map(|i| (i % 251 + 1) as i64).collect::<Vec<_>>(),
+            (0..(b * t))
+                .map(|i| (i % 251 + 1) as i64)
+                .collect::<Vec<_>>(),
             [b, t],
         ),
         &adev(),
@@ -86,7 +90,7 @@ fn ids_and_targets(b: usize, t: usize) -> (Tensor<2, Int>, Tensor<2, Int>) {
 /// One backward through the routed loop, returning the controller's expert-column
 /// gradient, the gate-column gradient, and one norm per expert.
 fn backward_report(topk: usize) -> (f64, f64, Vec<f64>) {
-    let mut block = LoopBlock::new(&cfg(topk), &adev());
+    let block = LoopBlock::new(&cfg(topk), &adev());
     // `forward_full_state`'s first argument is the HIDDEN STATE [b, t, d], not
     // byte ids: the loop is the model's body, the embedding lives above it.
     // And its `targets` is ALREADY flattened to [b*t, 1] - `DormouseModel`
@@ -111,8 +115,15 @@ fn backward_report(topk: usize) -> (f64, f64, Vec<f64>) {
     // gates and `3..3+E` are the expert blend. Both slices are read from the
     // SAME gradient tensor, which is what makes this a wiring test rather than
     // two independent ones.
-    let cw = block.controller.weight.grad(&grads).expect("the controller trains");
-    let cw: Vec<f32> = cw.into_data().try_to_vec().expect("controller grad readable");
+    let cw = block
+        .controller
+        .weight
+        .grad(&grads)
+        .expect("the controller trains");
+    let cw: Vec<f32> = cw
+        .into_data()
+        .try_to_vec()
+        .expect("controller grad readable");
     let [_rows, cols] = block.controller.weight.val().dims();
     let col_mass = |lo: usize, hi: usize| -> f64 {
         cw.chunks(cols)
@@ -163,15 +174,24 @@ fn the_router_columns_and_every_expert_carry_gradient() {
     println!(
         "k = {EXPERTS} (all live): gate columns L2 {gates:.3e}, router columns L2 {router:.3e}, \
          per-expert L2 {:?}",
-        per_expert.iter().map(|g| (g * 1e3).round() / 1e3).collect::<Vec<_>>()
+        per_expert
+            .iter()
+            .map(|g| (g * 1e3).round() / 1e3)
+            .collect::<Vec<_>>()
     );
 }
 
 #[test]
 fn at_top1_the_selected_experts_train_and_the_masked_ones_are_zero() {
     let (gates, router, per_expert) = backward_report(1);
-    assert!(router > 1e-9, "the router's expert columns must still train at k = 1 ({router:.3e})");
-    assert!(gates > 1e-9, "the arm gates must still train at k = 1 ({gates:.3e})");
+    assert!(
+        router > 1e-9,
+        "the router's expert columns must still train at k = 1 ({router:.3e})"
+    );
+    assert!(
+        gates > 1e-9,
+        "the arm gates must still train at k = 1 ({gates:.3e})"
+    );
     let live = per_expert.iter().filter(|g| **g > 1e-12).count();
     assert!(
         live >= 1,

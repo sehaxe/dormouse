@@ -548,7 +548,7 @@ mod tests {
         let cfg = cfg();
         let model = DormouseModel::new(&cfg, &dev());
         let mut r = routing(&model, false);
-        let mut ids = r.groups.get_mut(&Group::Muon).expect("declared");
+        let ids = r.groups.get_mut(&Group::Muon).expect("declared");
         let dropped = ids.pop().expect("non-empty");
         let err = r.check(&model).expect_err("an unclaimed param must fail");
         assert!(err.contains("no declared optimizer group"), "unexpected error: {err}");

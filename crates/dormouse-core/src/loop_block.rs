@@ -144,7 +144,14 @@ impl ExpertFFN {
     /// always been (a `d -> f` up-projection named after two projections);
     /// `situ_off_leaves_the_parameter_set_alone` holds the off arm to the old
     /// shape.
-    pub fn new(d: usize, f: usize, rank: usize, use_tsct: bool, situ: bool, device: &Device) -> Self {
+    pub fn new(
+        d: usize,
+        f: usize,
+        rank: usize,
+        use_tsct: bool,
+        situ: bool,
+        device: &Device,
+    ) -> Self {
         let mid = if situ { 2 * f } else { f };
         Self {
             gate_up: LinearLike::with_tsct(d, mid, rank, use_tsct, device),
@@ -466,11 +473,16 @@ impl LoopBlock {
         let f = cfg.d_ffn;
         // Controller: [h_ctx, h0] (2d) -> weights for attn/mem/ffn + expert blend
         let n_ctrl = 3 + cfg.n_experts;
-        let ctrl_pad = if !n_ctrl.is_multiple_of(4) { n_ctrl.next_multiple_of(4) } else { n_ctrl };
-        let controller = LinearConfig::new(d * 2, ctrl_pad).with_bias(false).init(device);
-        let mut iter_embed = burn::tensor::Tensor::<2>::zeros([cfg.max_iter, d], device);
-        iter_embed = iter_embed.into();
-        let iter_embed = burn::module::Param::from_tensor(iter_embed.clone().into());
+        let ctrl_pad = if !n_ctrl.is_multiple_of(4) {
+            n_ctrl.next_multiple_of(4)
+        } else {
+            n_ctrl
+        };
+        let controller = LinearConfig::new(d * 2, ctrl_pad)
+            .with_bias(false)
+            .init(device);
+        let iter_embed = burn::tensor::Tensor::<2>::zeros([cfg.max_iter, d], device);
+        let iter_embed = burn::module::Param::from_tensor(iter_embed.clone());
         // One table per n-gram order, `engram_rows` rounded up to a power of
         // two (the slot index is masked on device, see engram_slot_mask).
         let (tables, mask) = engram_tables(cfg.engram_rows, cfg.engram_orders.len());
@@ -610,7 +622,11 @@ impl LoopBlock {
         let use_situ = self.use_situ;
         assert_eq!(
             self.expert_ffns[0].gate_up.out_features,
-            if use_situ { 2 * self.ffn_hidden } else { self.ffn_hidden },
+            if use_situ {
+                2 * self.ffn_hidden
+            } else {
+                self.ffn_hidden
+            },
             "use_situ = {use_situ} but the experts' gate_up is {} wide, so it was built for \
              the other arm: set use_situ in the config (so ExpertFFN::new sizes gate_up \
              accordingly) rather than flipping the field after construction",
@@ -641,7 +657,11 @@ impl LoopBlock {
         // block. The rest of the vector is this loop's block-body outputs
         // `f_i(h_i)`, one per executed iteration. Empty when the arm is off, so
         // the default path allocates nothing for it.
-        let mut res: Vec<Tensor<3>> = if use_attnres { vec![h0.clone()] } else { Vec::new() };
+        let mut res: Vec<Tensor<3>> = if use_attnres {
+            vec![h0.clone()]
+        } else {
+            Vec::new()
+        };
         let mut kda_s: Option<Tensor<4>> = kda_state;
         // Fixed depth (ADR-0013): out_acc averages the per-iteration outputs.
         let mut out_acc = Tensor::<3>::zeros([b, t, d], &h.device());
@@ -736,8 +756,10 @@ impl LoopBlock {
             };
             let attn_fmt = act_fmt.map(|(f, g)| (f.attn(), g));
             let normed_attn = match attn_fmt {
-                Some((f, g)) => crate::act_quant::quant_act::<B>(normed_f.clone().reshape([b * t, d]), f, g)
-                    .reshape([b, t, d]),
+                Some((f, g)) => {
+                    crate::act_quant::quant_act::<B>(normed_f.clone().reshape([b * t, d]), f, g)
+                        .reshape([b, t, d])
+                }
                 None => normed_f.clone(),
             };
             let normed_ffn = match act_fmt {
@@ -805,9 +827,16 @@ impl LoopBlock {
             // normalized).
             let (gdn2_out, s_new) = if use_kda {
                 crate::probe::note(crate::probe::KDA);
-                self.shared_attn.gdn2.forward_train_state::<B>(normed_attn.clone(), kda_s.take())
+                self.shared_attn
+                    .gdn2
+                    .forward_train_state::<B>(normed_attn.clone(), kda_s.take())
             } else {
-                (Tensor::zeros([b, t, d], &h.device()), kda_s.take().unwrap_or_else(|| Tensor::zeros([b, 1, 1, 1], &h.device())))
+                (
+                    Tensor::zeros([b, t, d], &h.device()),
+                    kda_s
+                        .take()
+                        .unwrap_or_else(|| Tensor::zeros([b, 1, 1, 1], &h.device())),
+                )
             };
             kda_s = Some(s_new);
             let attn = gdn2_out.reshape([b * t, d]).mul(w_attn);
@@ -851,7 +880,10 @@ impl LoopBlock {
                             // `engram_tables`).
                             Some(
                                 self.engram
-                                    .forward(hashed.clone().bitwise_and_scalar(self.engram_slot_mask), eg_in)
+                                    .forward(
+                                        hashed.clone().bitwise_and_scalar(self.engram_slot_mask),
+                                        eg_in,
+                                    )
                                     .reshape([b * t, d]),
                             )
                         }
@@ -962,14 +994,18 @@ impl LoopBlock {
                 // fp32 in, fp32 out (the rule every Linear here follows: mixed
                 // bf16 x fp32 NaNs on this stack), then the residual write goes
                 // back into the activation dtype.
-                let h_next = self
-                    .mhc
-                    .as_ref()
-                    .expect("use_mhc => mhc")
-                    .forward(
-                        if bf16 { h_ctx.clone().cast(FloatDType::F32) } else { h_ctx.clone() },
-                        &[if bf16 { y.clone().cast(FloatDType::F32) } else { y.clone() }],
-                    );
+                let h_next = self.mhc.as_ref().expect("use_mhc => mhc").forward(
+                    if bf16 {
+                        h_ctx.clone().cast(FloatDType::F32)
+                    } else {
+                        h_ctx.clone()
+                    },
+                    &[if bf16 {
+                        y.clone().cast(FloatDType::F32)
+                    } else {
+                        y.clone()
+                    }],
+                );
                 h = h_next.cast(h_ctx.dtype());
             } else if !use_attnres {
                 let scale = self.residual_scale.val().clone().reshape([1, 1, 1]);
@@ -987,21 +1023,32 @@ impl LoopBlock {
             // slots, and the top-k cannot be known before the last slot's
             // score exists. Holding them costs nothing — the autograd graph
             // pins them either way.
-            let step_out = self.out_proj.forward::<B>(h.clone().reshape([b * t, d])).reshape([b, t, d]);
+            let step_out = self
+                .out_proj
+                .forward::<B>(h.clone().reshape([b * t, d]))
+                .reshape([b, t, d]);
             if use_mor {
                 crate::probe::note(crate::probe::MOR);
                 // MoR router: the shared linear scorer reads THIS iteration's
                 // input state (arXiv 2507.10524's per-step linear router).
-                let hs = if bf16 { h_ctx.clone().cast(FloatDType::F32) } else { h_ctx.clone() };
+                let hs = if bf16 {
+                    h_ctx.clone().cast(FloatDType::F32)
+                } else {
+                    h_ctx.clone()
+                };
                 slot_scores.push(self.mor_router.scores(hs));
             }
             step_outs.push(step_out.clone());
             if let Some(tgt) = &targets {
-                let so = if bf16 { step_out.clone().cast(FloatDType::F32) } else { step_out.clone() };
+                let so = if bf16 {
+                    step_out.clone().cast(FloatDType::F32)
+                } else {
+                    step_out.clone()
+                };
                 let logits_n = lm_head.forward::<B>(so.reshape([b * t, d])); // [b*t, v]
-                // Gather the target column of the log-softmax instead of an
-                // elementwise one-hot product: no [b*t,v] fp32 temporary per
-                // iteration (max_iter of them per step otherwise).
+                                                                             // Gather the target column of the log-softmax instead of an
+                                                                             // elementwise one-hot product: no [b*t,v] fp32 temporary per
+                                                                             // iteration (max_iter of them per step otherwise).
                 let ce = burn::tensor::activation::log_softmax(logits_n, 1)
                     .gather(1, tgt.clone())
                     .neg()
@@ -1029,31 +1076,32 @@ impl LoopBlock {
             let (m, bce) = mor::route(sc, self.mor_k);
             (m, Some(bce))
         } else {
-            (
-                Tensor::<3>::ones([b, t, iters], &h.device()),
-                None,
-            )
+            (Tensor::<3>::ones([b, t, iters], &h.device()), None)
         };
         // The divisor is the count of selected slots, known on the host (k is
         // a config constant) — reading it off the mask would sync the device
         // every step for a number we already have.
-        let ksel = if use_mor { mor::eff_k(self.mor_k, iters) } else { iters };
+        let ksel = if use_mor {
+            mor::eff_k(self.mor_k, iters)
+        } else {
+            iters
+        };
         let w = 1.0f32 / ksel as f32;
-        for n in 0..iters {
+        for (n, s_out) in step_outs.iter().take(iters).enumerate() {
             // Mixed-dtype (f32 mask x bf16 activation) NaNs on this stack, so
             // the gate lands in the readout's own dtype.
             let g = mask.clone().slice([0..b, 0..t, n..n + 1]);
-            let g = g.cast(step_outs[n].dtype());
-            out_acc = out_acc + step_outs[n].clone().mul(g.clone()).mul_scalar(w);
+            let g = g.cast(s_out.dtype());
+            out_acc = out_acc + s_out.clone().mul(g.clone()).mul_scalar(w);
             if let Some(ce) = ce_terms.get(n) {
-                rec = rec + ce
-                    .clone()
-                    .mul(g.reshape([b, t]))
-                    .sum_dim(1)
-                    .div_scalar(t as f32)
-                    .sum_dim(0)
-                    .reshape([1])
-                    .mul_scalar(w);
+                rec = rec
+                    + ce.clone()
+                        .mul(g.reshape([b, t]))
+                        .sum_dim(1)
+                        .div_scalar(t as f32)
+                        .sum_dim(0)
+                        .reshape([1])
+                        .mul_scalar(w);
             }
         }
         let rec = rec.div_scalar(b as f32); // mean over batch
@@ -1072,7 +1120,15 @@ impl LoopBlock {
             }
             Some(acc.div_scalar(lb_terms.len() as f32))
         };
-        (out_acc, rec, kda, RouteAux { mor: mor_aux, moe_lb })
+        (
+            out_acc,
+            rec,
+            kda,
+            RouteAux {
+                mor: mor_aux,
+                moe_lb,
+            },
+        )
     }
 
     /// Random-depth arm: run only the first `n` iterations. `None` restores
@@ -1128,6 +1184,26 @@ mod tests {
         dev().autodiff()
     }
 
+    /// The CPU-fixture config at loop depth `depth`: the widest shape these
+    /// tests instantiate, with the arms that would drag in a different gate
+    /// off. Tests that need the DEFAULTS for an arm (kda/engram on) build
+    /// their literal by hand instead of layering onto this.
+    fn small_cfg(depth: usize) -> DormouseConfig {
+        DormouseConfig {
+            d_model: 32,
+            n_heads: 2,
+            head_dim: 16,
+            d_ffn: 64,
+            max_iter: depth,
+            n_experts: 1,
+            rank: 8,
+            engram_rows: 256,
+            use_kda: false,
+            use_engram: false,
+            ..Default::default()
+        }
+    }
+
     /// Recover the mixture coefficient `a` in `out = a*mem + (1-a)*dense`
     /// from the two inputs: `a = (out - dense) / (mem - dense)`. Asserting on
     /// the RECOVERED coefficient is what makes this a test of the floor
@@ -1156,19 +1232,28 @@ mod tests {
             a <= lam_max,
             "floor violated: saturated controller gave a = {a} > lam_max {lam_max}"
         );
-        assert!((a - lam_max).abs() < 1e-5, "saturated w_mem must sit AT the cap, got {a}");
+        assert!(
+            (a - lam_max).abs() < 1e-5,
+            "saturated w_mem must sit AT the cap, got {a}"
+        );
 
         // Below the cap the learned value still works - the clamp is a
         // ceiling, not a constant.
         let out = memory_floor_mix(t(mem), t(dense), t(0.1), lam_max);
         let a = recover_a(&out, mem, dense);
-        assert!((a - 0.1).abs() < 1e-5, "below the cap the mix must follow w_mem, got {a}");
+        assert!(
+            (a - 0.1).abs() < 1e-5,
+            "below the cap the mix must follow w_mem, got {a}"
+        );
 
         // lam_max = 1.0 is the old behaviour (a direct row copy, no floor) -
         // the degenerate case this test exists to forbid by default.
         let out = memory_floor_mix(t(mem), t(dense), t(1.0), 1.0);
         let a = recover_a(&out, mem, dense);
-        assert!((a - 1.0).abs() < 1e-5, "lam_max=1 must be a pure memory read, got {a}");
+        assert!(
+            (a - 1.0).abs() < 1e-5,
+            "lam_max=1 must be a pure memory read, got {a}"
+        );
     }
 
     /// ATTNRES: the readout MUST move when the aggregation changes, or the
@@ -1178,26 +1263,21 @@ mod tests {
     #[test]
     fn attnres_moves_the_readout_at_every_depth() {
         for depth in [1usize, 2, 3] {
-            let mut cfg = DormouseConfig::default();
-            cfg.d_model = 32;
-            cfg.n_heads = 2;
-            cfg.head_dim = 16;
-            cfg.d_ffn = 64;
-            cfg.max_iter = depth;
-            cfg.n_experts = 1;
-            cfg.rank = 8;
-            cfg.engram_rows = 256;
-            cfg.use_kda = false;
-            cfg.use_engram = false;
-            let mut plain = LoopBlock::new(&cfg, &adev());
-            let mut ar = LoopBlock::new(&DormouseConfig { use_attnres: true, ..cfg.clone() }, &adev());
+            let cfg = small_cfg(depth);
+            let plain = LoopBlock::new(&cfg, &adev());
+            let ar = LoopBlock::new(
+                &DormouseConfig {
+                    use_attnres: true,
+                    ..cfg.clone()
+                },
+                &adev(),
+            );
             let [b, t, d] = [2usize, 5, 32];
             let x = Tensor::<3>::random([b, t, d], Distribution::Normal(0.0, 1.0), &adev());
             let head = LinearLike::with_tsct(d, 16, 8, cfg.use_tsct, &adev());
             let (o_rezero, _, _, _) =
                 plain.forward_full_state::<B>(x.clone(), None, None, None, None, &head);
-            let (o_attnres, _, _, _) =
-                ar.forward_full_state::<B>(x, None, None, None, None, &head);
+            let (o_attnres, _, _, _) = ar.forward_full_state::<B>(x, None, None, None, None, &head);
             let diff = (o_rezero - o_attnres).abs().max().into_scalar::<f32>();
             assert!(
                 diff > 1e-6,
@@ -1214,25 +1294,24 @@ mod tests {
     /// the run, not by reading the initializer.
     #[test]
     fn attnres_at_init_is_a_uniform_average_of_its_sources() {
-        let mut cfg = DormouseConfig::default();
-        cfg.d_model = 32;
-        cfg.n_heads = 2;
-        cfg.head_dim = 16;
-        cfg.d_ffn = 64;
-        cfg.max_iter = 1;
-        cfg.n_experts = 1;
-        cfg.rank = 8;
-        cfg.engram_rows = 256;
-        cfg.use_kda = false;
-        cfg.use_engram = false;
-        let ar = LoopBlock::new(&DormouseConfig { use_attnres: true, ..cfg.clone() }, &adev());
+        let cfg = small_cfg(1);
+        let ar = LoopBlock::new(
+            &DormouseConfig {
+                use_attnres: true,
+                ..cfg.clone()
+            },
+            &adev(),
+        );
         // Pin the zero init: if a future change randomizes the query, the
         // uniform-average property is gone and the arm no longer starts where
         // the paper says it starts. Every component, so a partially-zeroed
         // vector is red too.
         let q = ar.attnres.as_ref().expect("arm on")[0].query.val().clone();
         let worst = q.abs().max().into_scalar::<f32>();
-        assert_eq!(worst, 0.0, "w_l must be zero-initialized (§5): uniform alpha at init");
+        assert_eq!(
+            worst, 0.0,
+            "w_l must be zero-initialized (§5): uniform alpha at init"
+        );
     }
 
     /// THE FORM THE ARM WAS BUILT WITH — and this gate exists because the
@@ -1251,10 +1330,18 @@ mod tests {
     /// half that was missing.
     #[test]
     fn attnres_is_built_in_the_papers_score_form() {
-        let mut cfg = DormouseConfig::default();
-        cfg.d_model = 32;
-        cfg.max_iter = 2;
-        let on = LoopBlock::new(&DormouseConfig { use_attnres: true, ..cfg }, &adev());
+        let cfg = DormouseConfig {
+            d_model: 32,
+            max_iter: 2,
+            ..Default::default()
+        };
+        let on = LoopBlock::new(
+            &DormouseConfig {
+                use_attnres: true,
+                ..cfg
+            },
+            &adev(),
+        );
         for (i, a) in on.attnres.as_ref().expect("arm on").iter().enumerate() {
             assert_eq!(
                 a.form,
@@ -1274,26 +1361,44 @@ mod tests {
     /// that no forward reads).
     #[test]
     fn attnres_off_means_no_parameters() {
-        let mut cfg = DormouseConfig::default();
-        cfg.d_model = 32;
-        cfg.n_heads = 2;
-        cfg.head_dim = 16;
-        cfg.d_ffn = 64;
-        cfg.max_iter = 3;
-        cfg.n_experts = 1;
-        cfg.rank = 8;
-        cfg.engram_rows = 256;
+        let cfg = DormouseConfig {
+            d_model: 32,
+            n_heads: 2,
+            head_dim: 16,
+            d_ffn: 64,
+            max_iter: 3,
+            n_experts: 1,
+            rank: 8,
+            engram_rows: 256,
+            ..Default::default()
+        };
         let b = LoopBlock::new(&cfg, &adev());
-        assert!(b.attnres.is_none(), "use_attnres defaults to false, so no query vectors");
+        assert!(
+            b.attnres.is_none(),
+            "use_attnres defaults to false, so no query vectors"
+        );
         assert!(!b.use_attnres);
         // The default config itself, so a preset cannot turn this on by
         // accident: the flag is off unless someone says so.
         assert!(!DormouseConfig::default().use_attnres);
         // And on, there is exactly one query per iteration slot.
-        let on = LoopBlock::new(&DormouseConfig { use_attnres: true, ..cfg }, &adev());
+        let on = LoopBlock::new(
+            &DormouseConfig {
+                use_attnres: true,
+                ..cfg
+            },
+            &adev(),
+        );
         let qs = on.attnres.as_ref().expect("arm on");
-        assert_eq!(qs.len(), on.max_iter, "one pseudo-query per iteration slot (§5)");
-        assert!(qs.iter().all(|a| a.query.dims() == [32]), "each is a [d_model] vector");
+        assert_eq!(
+            qs.len(),
+            on.max_iter,
+            "one pseudo-query per iteration slot (§5)"
+        );
+        assert!(
+            qs.iter().all(|a| a.query.dims() == [32]),
+            "each is a [d_model] vector"
+        );
     }
 
     /// ATTNRES and GR both REPLACE the residual accumulation, so a config that
@@ -1302,21 +1407,38 @@ mod tests {
     /// config path.
     #[test]
     fn attnres_and_gr_are_refused_together() {
-        let mut cfg = DormouseConfig::default();
-        cfg.d_model = 32;
-        cfg.n_heads = 2;
-        cfg.head_dim = 16;
-        cfg.d_ffn = 64;
-        cfg.max_iter = 2;
-        cfg.n_experts = 1;
-        cfg.rank = 8;
-        cfg.engram_rows = 256;
-        let both = DormouseConfig { use_attnres: true, use_gr: true, ..cfg.clone() };
+        let cfg = DormouseConfig {
+            d_model: 32,
+            n_heads: 2,
+            head_dim: 16,
+            d_ffn: 64,
+            max_iter: 2,
+            n_experts: 1,
+            rank: 8,
+            engram_rows: 256,
+            ..Default::default()
+        };
+        let both = DormouseConfig {
+            use_attnres: true,
+            use_gr: true,
+            ..cfg.clone()
+        };
         let err = crate::config::validate(&both).expect_err("both residual arms must be refused");
-        assert!(err.contains("use_attnres") && err.contains("use_gr"), "the error must name both: {err}");
+        assert!(
+            err.contains("use_attnres") && err.contains("use_gr"),
+            "the error must name both: {err}"
+        );
         // Either alone is legal.
-        assert!(crate::config::validate(&DormouseConfig { use_attnres: true, ..cfg.clone() }).is_ok());
-        assert!(crate::config::validate(&DormouseConfig { use_gr: true, ..cfg.clone() }).is_ok());
+        assert!(crate::config::validate(&DormouseConfig {
+            use_attnres: true,
+            ..cfg.clone()
+        })
+        .is_ok());
+        assert!(crate::config::validate(&DormouseConfig {
+            use_gr: true,
+            ..cfg.clone()
+        })
+        .is_ok());
     }
 
     /// THE COUNTER. `use_attnres = true` with a counter of 0 would be a run
@@ -1324,39 +1446,60 @@ mod tests {
     /// is about, in the one shape where nothing else would show it.
     #[test]
     fn attnres_counts_every_iteration_it_aggregates() {
-        let mut cfg = DormouseConfig::default();
-        cfg.d_model = 32;
-        cfg.n_heads = 2;
-        cfg.head_dim = 16;
-        cfg.d_ffn = 64;
-        cfg.max_iter = 4;
-        cfg.n_experts = 1;
-        cfg.rank = 8;
-        cfg.engram_rows = 256;
-        cfg.use_kda = false;
-        cfg.use_engram = false;
+        let cfg = small_cfg(4);
         let head = LinearLike::with_tsct(32, 16, 8, cfg.use_tsct, &adev());
         let x = Tensor::<3>::random([2, 5, 32], Distribution::Normal(0.0, 1.0), &adev());
 
         crate::probe::reset();
-        let mut ar = LoopBlock::new(&DormouseConfig { use_attnres: true, ..cfg.clone() }, &adev());
+        let ar = LoopBlock::new(
+            &DormouseConfig {
+                use_attnres: true,
+                ..cfg.clone()
+            },
+            &adev(),
+        );
         let _ = ar.forward_full_state::<B>(x.clone(), None, None, None, None, &head);
-        assert_eq!(crate::probe::count(crate::probe::ATTNRES), 4, "one aggregation per iteration at depth 4");
+        assert_eq!(
+            crate::probe::count(crate::probe::ATTNRES),
+            4,
+            "one aggregation per iteration at depth 4"
+        );
 
         // Off: zero. The ReZero path must not touch the counter, or the field
         // on the eval line would read non-zero for a run that never aggregated.
         crate::probe::reset();
-        let mut rz = LoopBlock::new(&cfg, &adev());
+        let rz = LoopBlock::new(&cfg, &adev());
         let _ = rz.forward_full_state::<B>(x, None, None, None, None, &head);
-        assert_eq!(crate::probe::count(crate::probe::ATTNRES), 0, "ReZero does not aggregate");
+        assert_eq!(
+            crate::probe::count(crate::probe::ATTNRES),
+            0,
+            "ReZero does not aggregate"
+        );
         // Random depth is a truncation of what ran, and the counter must count
         // what RAN: a truncated run that reported max_iter aggregations would
         // be counting a model that was not evaluated.
         crate::probe::reset();
-        let mut ar = LoopBlock::new(&DormouseConfig { use_attnres: true, ..cfg }, &adev());
+        let mut ar = LoopBlock::new(
+            &DormouseConfig {
+                use_attnres: true,
+                ..cfg
+            },
+            &adev(),
+        );
         ar.set_depth(Some(2));
-        let _ = ar.forward_full_state::<B>(Tensor::zeros([2, 5, 32], &adev()), None, None, None, None, &head);
-        assert_eq!(crate::probe::count(crate::probe::ATTNRES), 2, "depth 2 aggregated twice");
+        let _ = ar.forward_full_state::<B>(
+            Tensor::zeros([2, 5, 32], &adev()),
+            None,
+            None,
+            None,
+            None,
+            &head,
+        );
+        assert_eq!(
+            crate::probe::count(crate::probe::ATTNRES),
+            2,
+            "depth 2 aggregated twice"
+        );
     }
 
     // ---- mHC (arXiv:2512.24880) ------------------------------------------------
@@ -1365,18 +1508,7 @@ mod tests {
     /// with the attention and memory arms off, so what differs between the arms
     /// is the residual statement and nothing else.
     fn mhc_cfg(depth: usize) -> DormouseConfig {
-        let mut cfg = DormouseConfig::default();
-        cfg.d_model = 32;
-        cfg.n_heads = 2;
-        cfg.head_dim = 16;
-        cfg.d_ffn = 64;
-        cfg.max_iter = depth;
-        cfg.n_experts = 1;
-        cfg.rank = 8;
-        cfg.engram_rows = 256;
-        cfg.use_kda = false;
-        cfg.use_engram = false;
-        cfg
+        small_cfg(depth)
     }
 
     // SITU (arXiv:2607.24653v2 Eq 12). The FORM is gated in the mechanism
@@ -1393,21 +1525,22 @@ mod tests {
     /// gradient numbers are about the activation, and KDA/Engram only add
     /// other arms' counters to the same forward.
     fn situ_cfg() -> DormouseConfig {
-        let mut cfg = DormouseConfig::default();
-        cfg.d_model = 32;
-        cfg.n_heads = 2;
-        cfg.head_dim = 16;
-        // A multiple of 4, so `LinearLike`'s `N % 4 == 0` padding
-        // (param.rs:49) leaves the width exactly `f` and `2f` and the
-        // width assertions below are about the arm, not about the pad.
-        cfg.d_ffn = 64;
-        cfg.n_experts = 2;
-        cfg.rank = 8;
-        cfg.engram_rows = 256;
-        cfg.max_iter = 2;
-        cfg.use_kda = false;
-        cfg.use_engram = false;
-        cfg
+        DormouseConfig {
+            d_model: 32,
+            n_heads: 2,
+            head_dim: 16,
+            // A multiple of 4, so `LinearLike`'s `N % 4 == 0` padding
+            // (param.rs:49) leaves the width exactly `f` and `2f` and the
+            // width assertions below are about the arm, not about the pad.
+            d_ffn: 64,
+            n_experts: 2,
+            rank: 8,
+            engram_rows: 256,
+            max_iter: 2,
+            use_kda: false,
+            use_engram: false,
+            ..Default::default()
+        }
     }
 
     fn mhc_head(cfg: &DormouseConfig) -> LinearLike {
@@ -1451,7 +1584,13 @@ mod tests {
     #[test]
     fn mhc_res_is_doubly_stochastic_in_both_directions() {
         let cfg = mhc_cfg(2);
-        let blk = LoopBlock::new(&DormouseConfig { use_mhc: true, ..cfg.clone() }, &adev());
+        let blk = LoopBlock::new(
+            &DormouseConfig {
+                use_mhc: true,
+                ..cfg.clone()
+            },
+            &adev(),
+        );
         let mhc = blk.mhc.as_ref().expect("use_mhc => mhc");
         assert_eq!(mhc.n_branches, 2, "the default expansion rate is n = 2");
         let h = Tensor::<3>::random([2, 7, 32], Distribution::Normal(0.0, 1.0), &adev());
@@ -1517,7 +1656,13 @@ mod tests {
     #[test]
     fn mhc_res_leaves_the_identity_when_the_bias_moves_and_stays_on_the_manifold() {
         let cfg = mhc_cfg(4);
-        let mut blk = LoopBlock::new(&DormouseConfig { use_mhc: true, ..cfg.clone() }, &adev());
+        let mut blk = LoopBlock::new(
+            &DormouseConfig {
+                use_mhc: true,
+                ..cfg.clone()
+            },
+            &adev(),
+        );
         let h = Tensor::<3>::random([1, 3, 32], Distribution::Normal(0.0, 1.0), &adev());
         let n = blk.mhc.as_ref().expect("arm on").n_branches;
         const N: usize = 2;
@@ -1581,14 +1726,8 @@ mod tests {
         // which is a fact about the ARM (§6 of the findings file) and the
         // reason the perturbation here has to be big enough to be visible.
         let mhc = blk.mhc.as_mut().expect("arm on");
-        mhc.b_res = Param::from_tensor(Tensor::<2>::from_floats(
-            [[0.0, 2.0], [2.0, 0.0]],
-            &adev(),
-        ));
-        mhc.b_res = Param::from_tensor(Tensor::<2>::from_floats(
-            [[0.0, 2.0], [2.0, 0.0]],
-            &adev(),
-        ));
+        mhc.b_res = Param::from_tensor(Tensor::<2>::from_floats([[0.0, 2.0], [2.0, 0.0]], &adev()));
+        mhc.b_res = Param::from_tensor(Tensor::<2>::from_floats([[0.0, 2.0], [2.0, 0.0]], &adev()));
         let moved = h_res(&blk);
         let dist = ident(&moved);
         assert!(
@@ -1637,10 +1776,7 @@ mod tests {
         // monotone, because `|lambda| < 1` so `|lambda|^T` is), so that is what
         // is asserted, and the oscillation is asserted to exist so a change
         // that made it go away would be a change, not a fix.
-        let hr = Tensor::<2>::from_floats(
-            [[moved[0], moved[1]], [moved[2], moved[3]]],
-            &adev(),
-        );
+        let hr = Tensor::<2>::from_floats([[moved[0], moved[1]], [moved[2], moved[3]]], &adev());
         let mut comp = hr.clone();
         for _ in 1..cfg.max_iter {
             comp = comp.clone().matmul(hr.clone());
@@ -1711,11 +1847,16 @@ mod tests {
     #[test]
     fn mhc_at_init_is_rezero_at_scale_one() {
         let cfg = mhc_cfg(2);
-        let mut blk = LoopBlock::new(&DormouseConfig { use_mhc: true, ..cfg.clone() }, &adev());
+        let mut blk = LoopBlock::new(
+            &DormouseConfig {
+                use_mhc: true,
+                ..cfg.clone()
+            },
+            &adev(),
+        );
         let head = mhc_head(&cfg);
         let x = Tensor::<3>::random([2, 5, 32], Distribution::Normal(0.0, 1.0), &adev());
-        let (o_mh, _, _, _) =
-            blk.forward_full_state::<B>(x.clone(), None, None, None, None, &head);
+        let (o_mh, _, _, _) = blk.forward_full_state::<B>(x.clone(), None, None, None, None, &head);
         // The scalar ReZero is about to be compared against must BE 1.
         assert_eq!(blk.residual_scale.val().clone().into_scalar::<f32>(), 1.0);
         // Same object, ReZero's statement. `mhc` stays allocated (so the
@@ -1724,7 +1865,11 @@ mod tests {
         blk.use_mhc = false;
         crate::probe::reset();
         let (o_rz, _, _, _) = blk.forward_full_state::<B>(x, None, None, None, None, &head);
-        assert_eq!(crate::probe::count(crate::probe::MHC), 0, "the toggle did not take");
+        assert_eq!(
+            crate::probe::count(crate::probe::MHC),
+            0,
+            "the toggle did not take"
+        );
 
         let scale = o_rz.clone().abs().max().into_scalar::<f32>();
         let rel = (o_rz.clone() - o_mh).abs().max().into_scalar::<f32>() / scale;
@@ -1766,7 +1911,8 @@ mod tests {
         let head = mhc_head(&cfg);
         let x = Tensor::<3>::random([2, 5, 32], Distribution::Normal(0.0, 1.0), &adev());
         let run = |blk: &mut LoopBlock| -> Tensor<3> {
-            blk.forward_full_state::<B>(x.clone(), None, None, None, None, &head).0
+            blk.forward_full_state::<B>(x.clone(), None, None, None, None, &head)
+                .0
         };
         let far = |a: &Tensor<3>, b: &Tensor<3>| -> f32 {
             (a.clone() - b.clone()).abs().max().into_scalar::<f32>()
@@ -1786,7 +1932,13 @@ mod tests {
         );
 
         // mHC arm: residual_scale is INERT there, and b_res is the live knob.
-        let mut mh = LoopBlock::new(&DormouseConfig { use_mhc: true, ..cfg }, &adev());
+        let mut mh = LoopBlock::new(
+            &DormouseConfig {
+                use_mhc: true,
+                ..cfg
+            },
+            &adev(),
+        );
         let mh_a = run(&mut mh);
         mh.residual_scale = p1(0.5);
         let mh_b = run(&mut mh);
@@ -1797,10 +1949,7 @@ mod tests {
              not be a single-factor comparison"
         );
         let mhc = mh.mhc.as_mut().expect("arm on");
-        mhc.b_res = Param::from_tensor(Tensor::<2>::from_floats(
-            [[0.0, 2.0], [2.0, 0.0]],
-            &adev(),
-        ));
+        mhc.b_res = Param::from_tensor(Tensor::<2>::from_floats([[0.0, 2.0], [2.0, 0.0]], &adev()));
         let mh_c = run(&mut mh);
         assert!(
             far(&mh_b, &mh_c) > 1e-6,
@@ -1825,7 +1974,13 @@ mod tests {
     #[test]
     fn mhc_gradients_reach_every_wired_parameter() {
         let cfg = mhc_cfg(2);
-        let blk = LoopBlock::new(&DormouseConfig { use_mhc: true, ..cfg.clone() }, &adev());
+        let blk = LoopBlock::new(
+            &DormouseConfig {
+                use_mhc: true,
+                ..cfg.clone()
+            },
+            &adev(),
+        );
         let head = mhc_head(&cfg);
         let x = Tensor::<3>::random([2, 5, 32], Distribution::Normal(0.0, 1.0), &adev());
         // TARGETS, or `L_Rec` is never accumulated: `forward_full_state` only
@@ -1833,8 +1988,7 @@ mod tests {
         // returned `rec` is the zero it started as - a leaf, and `backward()`
         // refuses it. The gate would then be measuring burn's error message.
         let tgt = Tensor::<2, Int>::zeros([2 * 5, 1], &adev());
-        let (_, rec, _, _) =
-            blk.forward_full_state::<B>(x, None, None, None, Some(tgt), &head);
+        let (_, rec, _, _) = blk.forward_full_state::<B>(x, None, None, None, Some(tgt), &head);
         let grads = rec.backward();
         let mhc = blk.mhc.as_ref().expect("arm on");
         // `b_res` is the one that matters: it is the whole mechanism, and
@@ -1844,14 +1998,11 @@ mod tests {
             p: &Param<Tensor<D>>,
             grads: &burn::tensor::Gradients,
         ) -> (f32, usize) {
-            let g = p
-                .grad(grads)
-                .unwrap_or_else(|| panic!("parameter carries no gradient slot: the mHC write is a leaf"));
+            let g = p.grad(grads).unwrap_or_else(|| {
+                panic!("parameter carries no gradient slot: the mHC write is a leaf")
+            });
             let v: Vec<f32> = g.into_data().try_to_vec().expect("readable gradient");
-            (
-                v.iter().fold(0.0f32, |m, x| m.max(x.abs())),
-                v.len(),
-            )
+            (v.iter().fold(0.0f32, |m, x| m.max(x.abs())), v.len())
         }
         for (name, (m, len)) in [
             ("b_res", mag(&mhc.b_res, &grads)),
@@ -1914,7 +2065,13 @@ mod tests {
     #[test]
     fn the_three_residual_operators_are_three_functions() {
         let cfg = mhc_cfg(2);
-        let blk = LoopBlock::new(&DormouseConfig { use_mhc: true, ..cfg.clone() }, &adev());
+        let blk = LoopBlock::new(
+            &DormouseConfig {
+                use_mhc: true,
+                ..cfg.clone()
+            },
+            &adev(),
+        );
         let mhc = blk.mhc.as_ref().expect("arm on");
         let d = 32usize;
         let h = Tensor::<3>::random([2, 5, d], Distribution::Normal(0.0, 1.0), &adev());
@@ -1957,13 +2114,20 @@ mod tests {
         // `2 (J - I)` for the reason `mhc_res_leaves_the_identity...` gives:
         // scaling the DIAGONAL (`6 I`) makes the map MORE of an identity, not
         // less, and reads 6.2e-3 where the point of the gate is an O(1) gap.
-        let mut moved = LoopBlock::new(&DormouseConfig { use_mhc: true, ..cfg }, &adev());
-        let m = moved.mhc.as_mut().expect("arm on");
-        m.b_res = Param::from_tensor(Tensor::<2>::from_floats(
-            [[0.0, 2.0], [2.0, 0.0]],
+        let mut moved = LoopBlock::new(
+            &DormouseConfig {
+                use_mhc: true,
+                ..cfg
+            },
             &adev(),
-        ));
-        let mh2 = moved.mhc.as_ref().expect("arm on").forward(h, std::slice::from_ref(&y));
+        );
+        let m = moved.mhc.as_mut().expect("arm on");
+        m.b_res = Param::from_tensor(Tensor::<2>::from_floats([[0.0, 2.0], [2.0, 0.0]], &adev()));
+        let mh2 = moved
+            .mhc
+            .as_ref()
+            .expect("arm on")
+            .forward(h, std::slice::from_ref(&y));
         let sep = gap(&mh2, &rz) / scale;
         println!(
             "mhc operator separations (relative to max|h+y|): mHC@init vs ReZero \
@@ -1986,7 +2150,13 @@ mod tests {
     fn mhc_moves_the_readout_at_every_depth() {
         for depth in [1usize, 2, 4] {
             let cfg = mhc_cfg(depth);
-            let mut blk = LoopBlock::new(&DormouseConfig { use_mhc: true, ..cfg }, &adev());
+            let mut blk = LoopBlock::new(
+                &DormouseConfig {
+                    use_mhc: true,
+                    ..cfg
+                },
+                &adev(),
+            );
             let head = mhc_head(&mhc_cfg(depth));
             let x = Tensor::<3>::random([2, 5, 32], Distribution::Normal(0.0, 1.0), &adev());
             // Same object, both branches: two `LoopBlock::new` calls would
@@ -1999,8 +2169,19 @@ mod tests {
             let (off, _, _, _) =
                 blk.forward_full_state::<B>(x.clone(), None, None, None, None, &head);
             crate::probe::reset();
-            blk.forward_full_state::<B>(Tensor::zeros([2, 5, 32], &adev()), None, None, None, None, &head);
-            assert_eq!(crate::probe::count(crate::probe::MHC), 0, "the ReZero branch does not project");
+            blk.forward_full_state::<B>(
+                Tensor::zeros([2, 5, 32], &adev()),
+                None,
+                None,
+                None,
+                None,
+                &head,
+            );
+            assert_eq!(
+                crate::probe::count(crate::probe::MHC),
+                0,
+                "the ReZero branch does not project"
+            );
             let diff = (on - off).abs().max().into_scalar::<f32>();
             assert!(
                 diff > 1e-6,
@@ -2019,18 +2200,42 @@ mod tests {
         let x = Tensor::<3>::random([2, 5, 32], Distribution::Normal(0.0, 1.0), &adev());
 
         crate::probe::reset();
-        let mh = LoopBlock::new(&DormouseConfig { use_mhc: true, ..cfg.clone() }, &adev());
+        let mh = LoopBlock::new(
+            &DormouseConfig {
+                use_mhc: true,
+                ..cfg.clone()
+            },
+            &adev(),
+        );
         let _ = mh.forward_full_state::<B>(x.clone(), None, None, None, None, &head);
-        assert_eq!(crate::probe::count(crate::probe::MHC), 4, "one projection per iteration at depth 4");
+        assert_eq!(
+            crate::probe::count(crate::probe::MHC),
+            4,
+            "one projection per iteration at depth 4"
+        );
         crate::probe::reset();
-        let mut mh = LoopBlock::new(&DormouseConfig { use_mhc: true, ..cfg.clone() }, &adev());
+        let mut mh = LoopBlock::new(
+            &DormouseConfig {
+                use_mhc: true,
+                ..cfg.clone()
+            },
+            &adev(),
+        );
         mh.set_depth(Some(2));
         let _ = mh.forward_full_state::<B>(x.clone(), None, None, None, None, &head);
-        assert_eq!(crate::probe::count(crate::probe::MHC), 2, "the counter counts what RAN");
+        assert_eq!(
+            crate::probe::count(crate::probe::MHC),
+            2,
+            "the counter counts what RAN"
+        );
         crate::probe::reset();
         let rz = LoopBlock::new(&cfg, &adev());
         let _ = rz.forward_full_state::<B>(x, None, None, None, None, &head);
-        assert_eq!(crate::probe::count(crate::probe::MHC), 0, "ReZero does not project");
+        assert_eq!(
+            crate::probe::count(crate::probe::MHC),
+            0,
+            "ReZero does not project"
+        );
 
         // The default is off, so the parameters do not exist and every shipped
         // checkpoint still loads.
@@ -2069,8 +2274,14 @@ mod tests {
             .sum();
             let count = count1 + count2;
             let want = 2 * small.d_model * n + small.d_model * n * n + 2 * n + n * n + 3;
-            println!("mhc n={n} on small (d_model={}): {count} params", small.d_model);
-            assert_eq!(count, want, "the paper's shapes and the built block disagree");
+            println!(
+                "mhc n={n} on small (d_model={}): {count} params",
+                small.d_model
+            );
+            assert_eq!(
+                count, want,
+                "the paper's shapes and the built block disagree"
+            );
             if n == 2 {
                 assert!(
                     count * 200 < 9_197_390,
@@ -2082,13 +2293,20 @@ mod tests {
         // Mutually exclusive with BOTH of the arms it competes with, and the
         // error names every flag that is on.
         for other in ["use_gr", "use_attnres"] {
-            let c = DormouseConfig { use_mhc: true, ..cfg.clone() };
+            let c = DormouseConfig {
+                use_mhc: true,
+                ..cfg.clone()
+            };
             let both = if other == "use_gr" {
                 DormouseConfig { use_gr: true, ..c }
             } else {
-                DormouseConfig { use_attnres: true, ..c }
+                DormouseConfig {
+                    use_attnres: true,
+                    ..c
+                }
             };
-            let err = crate::config::validate(&both).expect_err("two residual arms must be refused");
+            let err =
+                crate::config::validate(&both).expect_err("two residual arms must be refused");
             assert!(
                 err.contains("use_mhc") && err.contains(other),
                 "the refusal must name both flags: {err}"
@@ -2097,17 +2315,33 @@ mod tests {
         // Each alone is legal, and mHC alone at the default n = 2 divides the
         // fixture's d_model = 32.
         for on in [
-            DormouseConfig { use_mhc: true, ..cfg.clone() },
-            DormouseConfig { use_gr: true, ..cfg.clone() },
-            DormouseConfig { use_attnres: true, ..cfg.clone() },
+            DormouseConfig {
+                use_mhc: true,
+                ..cfg.clone()
+            },
+            DormouseConfig {
+                use_gr: true,
+                ..cfg.clone()
+            },
+            DormouseConfig {
+                use_attnres: true,
+                ..cfg.clone()
+            },
         ] {
-            assert!(crate::config::validate(&on).is_ok(), "one arm alone must validate");
+            assert!(
+                crate::config::validate(&on).is_ok(),
+                "one arm alone must validate"
+            );
         }
         // A non-divisor is LOUD at startup, not a reshape panic in the first
         // forward: 32 % 3 != 0, and 3 streams would be a valid-looking config
         // that trains nothing but crashes.
-        let err = crate::config::validate(&DormouseConfig { use_mhc: true, mhc_streams: 3, ..cfg })
-            .expect_err("3 does not divide 32");
+        let err = crate::config::validate(&DormouseConfig {
+            use_mhc: true,
+            mhc_streams: 3,
+            ..cfg
+        })
+        .expect_err("3 does not divide 32");
         assert!(
             err.contains("mhc_streams") && err.contains("32"),
             "the refusal must name the field and the width: {err}"
@@ -2115,15 +2349,24 @@ mod tests {
         // `n = 0` is refused too: `MhcBlock::new` would `max(1)` it silently,
         // so a config asking for zero streams would train the n = 1 arm - which
         // 2409.19606 Tab. 1 measures as WORSE than the Pre-Norm baseline.
-        let err = crate::config::validate(&DormouseConfig { use_mhc: true, mhc_streams: 0, ..mhc_cfg(2) })
-            .expect_err("0 streams is not a configuration");
-        assert!(err.contains("mhc_streams"), "the refusal must name the field: {err}");
+        let err = crate::config::validate(&DormouseConfig {
+            use_mhc: true,
+            mhc_streams: 0,
+            ..mhc_cfg(2)
+        })
+        .expect_err("0 streams is not a configuration");
+        assert!(
+            err.contains("mhc_streams"),
+            "the refusal must name the field: {err}"
+        );
         // n = 4 (the base paper's App. Tab. 1 rung) is a flag away and also
         // legal - the follow-up row, not this one.
-        assert!(
-            crate::config::validate(&DormouseConfig { use_mhc: true, mhc_streams: 4, ..mhc_cfg(2) })
-                .is_ok()
-        );
+        assert!(crate::config::validate(&DormouseConfig {
+            use_mhc: true,
+            mhc_streams: 4,
+            ..mhc_cfg(2)
+        })
+        .is_ok());
     }
 
     /// OFF IS THE OLD MODEL. `use_situ = false` must leave the parameter set
@@ -2160,14 +2403,28 @@ mod tests {
         // And the flag is `serde(default)`: a snapshot written before the field
         // existed parses, and reads as off.
         let old_snapshot = "d_model = 32\nn_experts = 2\nmax_iter = 2\n";
-        let parsed: DormouseConfig = toml::from_str(old_snapshot).expect("a pre-situ snapshot parses");
-        assert!(!parsed.use_situ, "a config without the field is the OFF arm");
+        let parsed: DormouseConfig =
+            toml::from_str(old_snapshot).expect("a pre-situ snapshot parses");
+        assert!(
+            !parsed.use_situ,
+            "a config without the field is the OFF arm"
+        );
 
         // On: `d -> 2f`, exactly. This is the whole parameter delta of the arm
         // and it is why the A/B is width-confounded (schema.rs).
-        let on = LoopBlock::new(&DormouseConfig { use_situ: true, ..cfg.clone() }, &adev());
+        let on = LoopBlock::new(
+            &DormouseConfig {
+                use_situ: true,
+                ..cfg.clone()
+            },
+            &adev(),
+        );
         for e in &on.expert_ffns {
-            assert_eq!(e.gate_up.out_features, 2 * cfg.d_ffn, "Eq (12) needs Wg and Wu separately");
+            assert_eq!(
+                e.gate_up.out_features,
+                2 * cfg.d_ffn,
+                "Eq (12) needs Wg and Wu separately"
+            );
         }
         // The cost of the arm, on the gate's own geometry, from the factors'
         // element counts: TSCT adds `rank * f` per expert when the width goes
@@ -2181,7 +2438,8 @@ mod tests {
             })
             .sum::<usize>();
         assert_eq!(
-            delta, cfg.n_experts * cfg.rank * cfg.d_ffn,
+            delta,
+            cfg.n_experts * cfg.rank * cfg.d_ffn,
             "the arm costs rank*d_ffn per expert, and that is the confound the A/B row names"
         );
     }
@@ -2213,7 +2471,13 @@ mod tests {
         let x = Tensor::<3>::random([2, 5, cfg.d_model], Distribution::Normal(0.0, 1.0), &adev());
 
         crate::probe::reset();
-        let mut on = LoopBlock::new(&DormouseConfig { use_situ: true, ..cfg.clone() }, &adev());
+        let mut on = LoopBlock::new(
+            &DormouseConfig {
+                use_situ: true,
+                ..cfg.clone()
+            },
+            &adev(),
+        );
         let _ = on.forward_full_state::<B>(x.clone(), None, None, None, None, &head);
         assert_eq!(
             crate::probe::count(crate::probe::SITU),
@@ -2224,9 +2488,13 @@ mod tests {
         // Off: zero. The silu path must not touch the counter, or the field
         // would read non-zero for a run that never activated the arm.
         crate::probe::reset();
-        let mut off = LoopBlock::new(&cfg, &adev());
+        let off = LoopBlock::new(&cfg, &adev());
         let _ = off.forward_full_state::<B>(x.clone(), None, None, None, None, &head);
-        assert_eq!(crate::probe::count(crate::probe::SITU), 0, "silu does not run SiTU");
+        assert_eq!(
+            crate::probe::count(crate::probe::SITU),
+            0,
+            "silu does not run SiTU"
+        );
 
         // Truncated depth counts what RAN, like every other counter here.
         crate::probe::reset();
@@ -2248,7 +2516,13 @@ mod tests {
     #[test]
     fn situ_bounds_the_activation_the_silu_path_left_unbounded() {
         let cfg = situ_cfg();
-        let on = LoopBlock::new(&DormouseConfig { use_situ: true, ..cfg.clone() }, &adev());
+        let on = LoopBlock::new(
+            &DormouseConfig {
+                use_situ: true,
+                ..cfg.clone()
+            },
+            &adev(),
+        );
         let expert = &on.expert_ffns[0];
         let n = 64usize;
         // `gate_up` is `d_model -> 2*d_ffn`, so the input is d_model-wide and
@@ -2258,7 +2532,11 @@ mod tests {
         // lives in, and the regime Eq (19)'s bound is claimed for.
         let probe = Tensor::<2>::random([n, cfg.d_model], Distribution::Normal(0.0, 1.0), &adev());
         let mid = expert.gate_up.forward::<B>(probe);
-        assert_eq!(mid.dims(), [n, 2 * cfg.d_ffn], "the up-projection is d_model -> 2*d_ffn");
+        assert_eq!(
+            mid.dims(),
+            [n, 2 * cfg.d_ffn],
+            "the up-projection is d_model -> 2*d_ffn"
+        );
         // Put the intermediate at a NAMED magnitude, 10x the bound, instead of
         // hoping the random TSCT factors land there: the comparison is then a
         // statement about the activation and not about the initializer.
@@ -2280,7 +2558,11 @@ mod tests {
         // and the arm it replaces read one `d_ffn`-wide tensor, so it is
         // `silu` on this tensor's gate half: the same coordinates, unbounded.
         let via_silu = activation::silu(mid.slice([0..n, 0..cfg.d_ffn]));
-        assert_eq!(via_situ.dims(), via_silu.dims(), "the comparator is elementwise");
+        assert_eq!(
+            via_situ.dims(),
+            via_silu.dims(),
+            "the comparator is elementwise"
+        );
         let bound = (burn_situ::K3_GATE_BETA * burn_situ::K3_UP_BETA) as f32;
         let peak_situ = via_situ.clone().abs().max().into_scalar::<f32>();
         let peak_silu = via_silu.clone().abs().max().into_scalar::<f32>();
@@ -2298,7 +2580,10 @@ mod tests {
         );
         // And they are different functions, not the same one twice.
         let diff = (via_situ - via_silu).abs().max().into_scalar::<f32>();
-        assert!(diff > 1.0, "the two activations differ by only {diff} on a hot input");
+        assert!(
+            diff > 1.0,
+            "the two activations differ by only {diff} on a hot input"
+        );
     }
 
     /// THE GRADIENT SURVIVES THE CAP. `tanh` saturates, so this is the honest
@@ -2320,7 +2605,13 @@ mod tests {
     #[test]
     fn situ_gradient_survives_the_cap_where_the_cap_operates() {
         let cfg = situ_cfg();
-        let on = LoopBlock::new(&DormouseConfig { use_situ: true, ..cfg }, &adev());
+        let on = LoopBlock::new(
+            &DormouseConfig {
+                use_situ: true,
+                ..cfg
+            },
+            &adev(),
+        );
         let expert = &on.expert_ffns[0];
         let f = cfg.d_ffn;
         let n = 8usize;
@@ -2350,7 +2641,9 @@ mod tests {
             // magnitude of the path and not which way it points.
             let loss = out.clone().powf_scalar(2.0).sum();
             let grads = loss.backward();
-            let g = input.grad(&grads).expect("a require_grad leaf has a gradient");
+            let g = input
+                .grad(&grads)
+                .expect("a require_grad leaf has a gradient");
             let peak = g.clone().abs().max().into_scalar::<f32>();
             let out_peak = out.clone().abs().max().into_scalar::<f32>();
             // RELATIVE gradient: an absolute threshold would be a statement
@@ -2384,24 +2677,24 @@ mod tests {
         // The 500_000 -> 524_288 rounding (raw FNV hashes are masked on
         // device, not divided), and the degenerate cases.
         let (tables, mask) = engram_tables(500_000, 3);
-        assert_eq!(tables, vec![524_288; 3], "500_000 rounds up to the next power of two");
+        assert_eq!(
+            tables,
+            vec![524_288; 3],
+            "500_000 rounds up to the next power of two"
+        );
         assert_eq!(mask, 524_287);
         assert_eq!(engram_tables(25_000, 3), (vec![32_768; 3], 32_767));
         assert_eq!(engram_tables(1024, 3), (vec![1024; 3], 1023));
         assert_eq!(engram_tables(1, 1), (vec![1], 0));
 
-        let mut cfg = DormouseConfig::default();
-        cfg.d_model = 32;
-        cfg.n_heads = 2;
-        cfg.head_dim = 16;
-        cfg.d_ffn = 64;
-        cfg.max_iter = 1;
-        cfg.n_experts = 1;
-        cfg.rank = 8;
+        let mut cfg = small_cfg(1);
         cfg.engram_rows = 1024;
         cfg.engram_lam_max = 0.25;
         let b = LoopBlock::new(&cfg, &dev());
-        assert_eq!(b.engram_lam_max, 0.25, "the block must carry the configured floor");
+        assert_eq!(
+            b.engram_lam_max, 0.25,
+            "the block must carry the configured floor"
+        );
         assert_eq!(b.engram_slot_mask, 1023);
 
         // The floor is a floor: validate() refuses 0 (deletes the arm) and
@@ -2414,7 +2707,10 @@ mod tests {
         assert!(crate::config::validate(&cfg).is_err());
         cfg.engram_lam_max = 0.5;
         cfg.engram_orders = vec![3, 5];
-        assert!(crate::config::validate(&cfg).is_err(), "the order COUNT is pinned to 3");
+        assert!(
+            crate::config::validate(&cfg).is_err(),
+            "the order COUNT is pinned to 3"
+        );
         cfg.engram_orders = vec![2, 3, 4];
         cfg.engram_rows = 0;
         assert!(crate::config::validate(&cfg).is_err());
@@ -2462,7 +2758,10 @@ mod tests {
         assert_eq!(3 * 500_000 * c.engram_dim, 48_000_000);
         let monopoly = 3.0 * 500_000.0 * c.engram_dim as f64
             / (3 * 500_000 * c.engram_dim + BACKBONE_SMALL) as f64;
-        assert!(monopoly > 0.8, "the 500K point is the monopoly shape at our scale");
+        assert!(
+            monopoly > 0.8,
+            "the 500K point is the monopoly shape at our scale"
+        );
         // In VRAM the rows round up to a power of two: 25_000 -> 32_768.
         let (tables, mask) = engram_tables(c.engram_rows, c.engram_orders.len());
         assert_eq!(tables, vec![32_768; 3]);

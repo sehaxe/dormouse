@@ -189,7 +189,9 @@ impl FtModel {
     /// truncated output matrix, which is a confident wrong number.
     pub fn load(path: &str) -> Result<FtModel, LoadError> {
         let f = File::open(path).map_err(|e| LoadError::Format(format!("open {path}: {e}")))?;
-        let mut c = Cursor { inner: BufReader::with_capacity(1 << 20, f) };
+        let mut c = Cursor {
+            inner: BufReader::with_capacity(1 << 20, f),
+        };
 
         let magic = c.i32()?;
         if magic != FT_MAGIC {
@@ -432,7 +434,7 @@ impl FtModel {
     /// Dictionary::addWordNgrams. C++ accumulates in uint64 after SIGN-
     /// extending each int32 hash, multiplies by 116049371, mods by bucket.
     fn add_word_ngrams(&self, line: &mut Vec<i32>, hashes: &[i32]) {
-        let n = self.args.word_ngrams as i32;
+        let n = self.args.word_ngrams;
         if n <= 1 {
             return;
         }
@@ -949,6 +951,9 @@ fn snippet(bytes: &[u8], max: usize) -> String {
     json_escape(&String::from_utf8_lossy(&bytes[..end]))
 }
 
+// Nine provenance fields of one stats record; the bin has one caller and a
+// grouping struct would only relocate the same names.
+#[allow(clippy::too_many_arguments)]
 fn write_stats(
     path: &str,
     st: &Stats,
@@ -972,7 +977,10 @@ fn write_stats(
     j.push_str("{\n");
     j.push_str(&format!("  \"final\": {},\n", is_final));
     j.push_str(&format!("  \"input\": \"{}\",\n", json_escape(&cli.input)));
-    j.push_str(&format!("  \"output\": \"{}\",\n", json_escape(&cli.output)));
+    j.push_str(&format!(
+        "  \"output\": \"{}\",\n",
+        json_escape(&cli.output)
+    ));
     j.push_str(&format!("  \"model\": \"{}\",\n", json_escape(&cli.model)));
     j.push_str(&format!("  \"model_labels\": {:?},\n", labels));
     j.push_str(&format!("  \"threshold\": {},\n", cli.threshold));
@@ -981,20 +989,32 @@ fn write_stats(
     j.push_str(&format!("  \"input_bytes_read\": {input_bytes_read},\n"));
     j.push_str(&format!("  \"docs_seen\": {},\n", st.docs_seen));
     j.push_str(&format!("  \"docs_kept\": {},\n", st.docs_kept));
-    j.push_str(&format!("  \"docs_dropped_score\": {},\n", st.docs_dropped_score));
-    j.push_str(&format!("  \"docs_dropped_dup\": {},\n", st.docs_dropped_dup));
+    j.push_str(&format!(
+        "  \"docs_dropped_score\": {},\n",
+        st.docs_dropped_score
+    ));
+    j.push_str(&format!(
+        "  \"docs_dropped_dup\": {},\n",
+        st.docs_dropped_dup
+    ));
     j.push_str(&format!("  \"docs_no_score\": {},\n", st.docs_no_score));
     j.push_str(&format!("  \"dedup_capped\": {},\n", dedup.capped));
     j.push_str(&format!("  \"dedup_cap\": {},\n", dedup.cap));
     j.push_str(&format!("  \"dedup_entries\": {},\n", dedup.seen.len()));
-    j.push_str(&format!("  \"dedup_capped_at_doc\": {},\n", dedup.capped_at_doc));
+    j.push_str(&format!(
+        "  \"dedup_capped_at_doc\": {},\n",
+        dedup.capped_at_doc
+    ));
     j.push_str(&format!("  \"bytes_seen\": {},\n", st.bytes_seen));
     j.push_str(&format!("  \"bytes_written\": {},\n", st.bytes_written));
     j.push_str(&format!(
         "  \"keep_rate\": {},\n",
         st.docs_kept as f64 / st.docs_seen.max(1) as f64
     ));
-    j.push_str(&format!("  \"mean_score\": {},\n", st.score_sum / st.scored.max(1) as f64));
+    j.push_str(&format!(
+        "  \"mean_score\": {},\n",
+        st.score_sum / st.scored.max(1) as f64
+    ));
     j.push_str(&format!(
         "  \"scored_docs\": {},\n  \"keep_at_0.3\": {},\n  \"keep_at_0.5\": {},\n  \"keep_at_0.7\": {},\n",
         st.scored, st.keep_at[0], st.keep_at[1], st.keep_at[2]
@@ -1085,13 +1105,19 @@ fn parse_args() -> Result<Cli, String> {
             "--stats" => c.stats = Some(val(&mut it)?),
             "--examples" => c.examples = Some(val(&mut it)?),
             "--examples-per-class" => {
-                c.examples_per_class =
-                    val(&mut it)?.parse().map_err(|_| "--examples-per-class usize")?
+                c.examples_per_class = val(&mut it)?
+                    .parse()
+                    .map_err(|_| "--examples-per-class usize")?
             }
             "--chunk-mb" => {
-                c.chunk_bytes = (val(&mut it)?.parse::<usize>().map_err(|_| "--chunk-mb usize")?) << 20
+                c.chunk_bytes = (val(&mut it)?
+                    .parse::<usize>()
+                    .map_err(|_| "--chunk-mb usize")?)
+                    << 20
             }
-            "--dedup-cap" => c.dedup_cap = val(&mut it)?.parse().map_err(|_| "--dedup-cap usize")?,
+            "--dedup-cap" => {
+                c.dedup_cap = val(&mut it)?.parse().map_err(|_| "--dedup-cap usize")?
+            }
             "--log-every-docs" => {
                 c.log_every_docs = val(&mut it)?.parse().map_err(|_| "--log-every-docs u64")?
             }
@@ -1184,14 +1210,14 @@ impl<'a> Pipeline<'a> {
         if !self.want_examples {
             return;
         }
-        let have = self
-            .examples
-            .iter()
-            .filter(|(e, _)| e.kind == kind)
-            .count();
+        let have = self.examples.iter().filter(|(e, _)| e.kind == kind).count();
         if have < self.examples_per_class {
             self.examples.push((
-                Example { kind, score, n: doc.len() },
+                Example {
+                    kind,
+                    score,
+                    n: doc.len(),
+                },
                 doc[..doc.len().min(200)].to_vec(),
             ));
         }
@@ -1261,7 +1287,10 @@ fn main() {
         });
         for (i, doc) in text.split("\n\n").enumerate() {
             let s = model.score(doc);
-            println!("{i}\t{}", s.map(|v| v.to_string()).unwrap_or_else(|| "none".into()));
+            println!(
+                "{i}\t{}",
+                s.map(|v| v.to_string()).unwrap_or_else(|| "none".into())
+            );
         }
         return;
     }
@@ -1290,7 +1319,9 @@ nwords={} nlabels={} hq_row={} labels={:?}",
         model.nlabels,
         model.hq_row,
         (0..model.nlabels as usize)
-            .map(|i| String::from_utf8_lossy(&model.words[model.nwords as usize + i].0).into_owned())
+            .map(
+                |i| String::from_utf8_lossy(&model.words[model.nwords as usize + i].0).into_owned()
+            )
             .collect::<Vec<_>>()
     );
 
@@ -1434,9 +1465,17 @@ nwords={} nlabels={} hq_row={} labels={:?}",
         if let Some(sp) = &cli.stats {
             if el >= next_stats {
                 next_stats = el + 30.0;
-                if let Err(e) =
-                    write_stats(sp, &pipeline.st, &cli, &model, &pipeline.dedup, pipeline.st.input_bytes_read, total_in, el, false)
-                {
+                if let Err(e) = write_stats(
+                    sp,
+                    &pipeline.st,
+                    &cli,
+                    &model,
+                    &pipeline.dedup,
+                    pipeline.st.input_bytes_read,
+                    total_in,
+                    el,
+                    false,
+                ) {
                     eprintln!("filter: stats write: {e}");
                 }
             }
@@ -1495,7 +1534,17 @@ straddle_dropped={} ({}MB)",
     );
 
     if let Some(sp) = &cli.stats {
-        match write_stats(sp, st, &cli, &model, &pipeline.dedup, st.input_bytes_read, total_in, el, true) {
+        match write_stats(
+            sp,
+            st,
+            &cli,
+            &model,
+            &pipeline.dedup,
+            st.input_bytes_read,
+            total_in,
+            el,
+            true,
+        ) {
             Ok(()) => eprintln!("[filter] stats: {sp}"),
             Err(e) => eprintln!("filter: stats write: {e}"),
         }
@@ -1506,9 +1555,11 @@ straddle_dropped={} ({}MB)",
             j.push_str(&format!(
                 "{{\"kind\":\"{}\",\"score\":{},\"bytes\":{},\"snippet\":\"{}\"}}\n",
                 e.kind,
-                e.score.map(|v| v.to_string()).unwrap_or_else(|| "null".into()),
+                e.score
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "null".into()),
                 e.n,
-                snippet(&snip, 200)
+                snippet(snip, 200)
             ));
         }
         match std::fs::write(ep, j) {
@@ -1550,7 +1601,10 @@ mod tests {
             (b"the", 0xb40eb21c),
             (b"Hello, world!", 0xed90f094),
             // привет
-            (b"\xd0\xbf\xd1\x80\xd0\xb8\xd0\xb2\xd0\xb5\xd1\x82", 0xf069a77f),
+            (
+                b"\xd0\xbf\xd1\x80\xd0\xb8\xd0\xb2\xd0\xb5\xd1\x82",
+                0xf069a77f,
+            ),
             (b"\xff\xfe\x01", 0x3e92b7c3),
         ];
         for (input, want) in cases {
@@ -1575,13 +1629,14 @@ mod tests {
         let docs = std::cell::RefCell::new(Vec::new());
         {
             let mut act = |d: &[u8], _s: u64| -> Option<Region> {
-                docs.borrow_mut().push(String::from_utf8_lossy(d).into_owned());
+                docs.borrow_mut()
+                    .push(String::from_utf8_lossy(d).into_owned());
                 Some(Region::Head)
             };
             for b in b"aa\nbb\n\ncc\n\n\ndd" {
-                let _ = sp.push(*b, &mut out, &mut tail, &mut act).unwrap();
+                sp.push(*b, &mut out, &mut tail, &mut act).unwrap();
             }
-            let _ = sp.finish(&mut out, &mut tail, &mut act).unwrap();
+            sp.finish(&mut out, &mut tail, &mut act).unwrap();
         }
         // "aa\nbb" (single newline stays inside), then "cc", then "dd"
         assert_eq!(docs.borrow().len(), 3);
@@ -1605,9 +1660,9 @@ mod tests {
                 }
             };
             for b in b"keep1\n\ndrop\n\nkeep2\n\n" {
-                let _ = sp.push(*b, &mut out, &mut tail, &mut act).unwrap();
+                sp.push(*b, &mut out, &mut tail, &mut act).unwrap();
             }
-            let _ = sp.finish(&mut out, &mut tail, &mut act).unwrap();
+            sp.finish(&mut out, &mut tail, &mut act).unwrap();
         }
         assert_eq!(out, b"keep1\n\nkeep2");
     }
@@ -1624,10 +1679,10 @@ mod tests {
                 Some(Region::Head)
             };
             for b in b"only-doc\nwith lines" {
-                let _ = sp.push(*b, &mut out, &mut tail, &mut act).unwrap();
+                sp.push(*b, &mut out, &mut tail, &mut act).unwrap();
             }
             assert_eq!(count.get(), 0);
-            let _ = sp.finish(&mut out, &mut tail, &mut act).unwrap();
+            sp.finish(&mut out, &mut tail, &mut act).unwrap();
         }
         assert_eq!(count.get(), 1);
         assert_eq!(out, b"only-doc\nwith lines");
@@ -1657,9 +1712,9 @@ mod tests {
                 }
             };
             for &b in bytes {
-                let _ = sp.push(b, &mut head, &mut tail, &mut act).unwrap();
+                sp.push(b, &mut head, &mut tail, &mut act).unwrap();
             }
-            let _ = sp.finish(&mut head, &mut tail, &mut act).unwrap();
+            sp.finish(&mut head, &mut tail, &mut act).unwrap();
         }
         assert_eq!(seen.get(), 5);
         assert_eq!(head, b"head1\n\nhead2");

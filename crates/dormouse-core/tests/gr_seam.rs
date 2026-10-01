@@ -151,7 +151,10 @@ fn the_rezero_readout_also_contains_the_body_at_every_depth() {
     let dev = device();
     let b = batch(&dev);
     for depth in 1..=3 {
-        let cfg = DormouseConfig { use_gr: false, ..gr_cfg() };
+        let cfg = DormouseConfig {
+            use_gr: false,
+            ..gr_cfg()
+        };
         let mut model = DormouseModel::new(&cfg, &dev);
         model.loop_block.set_depth(Some(depth));
         let with_body = logits(&model, &b);

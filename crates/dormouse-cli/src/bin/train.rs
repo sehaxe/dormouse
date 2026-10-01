@@ -342,7 +342,11 @@ fn main() {
     // before the guard re-exec too - dup2'd fds survive exec.
     if let Some(path) = &a.log {
         #[cfg(unix)]
-        match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
             Ok(f) => unsafe {
                 use std::os::unix::io::AsRawFd;
                 libc::dup2(f.as_raw_fd(), 1);
@@ -406,8 +410,12 @@ fn main() {
                 use std::os::unix::process::CommandExt;
                 // The pinned image if we have one, else our own path (which
                 // works as long as nothing rebuilt the binary under us).
-                let exe = std::env::var("DORMOUSE_GUARD_EXE")
-                    .unwrap_or_else(|_| std::env::current_exe().expect("current_exe").display().to_string());
+                let exe = std::env::var("DORMOUSE_GUARD_EXE").unwrap_or_else(|_| {
+                    std::env::current_exe()
+                        .expect("current_exe")
+                        .display()
+                        .to_string()
+                });
                 let err = std::process::Command::new(exe)
                     .args(std::env::args_os().skip(1))
                     .env("DORMOUSE_GUARD_RESTARTS", (restarts + 1).to_string())

@@ -33,10 +33,12 @@
 //! before the repo's is reached. Both are once per run, against a step that
 //! costs 0.8 s.
 
-use std::path::{Path, PathBuf};
 use super::schema::DormouseConfig;
+use std::path::{Path, PathBuf};
 
-fn is_explicit(s: &str) -> bool { s.contains('/') || s.contains('\\') || s.ends_with(".toml") }
+fn is_explicit(s: &str) -> bool {
+    s.contains('/') || s.contains('\\') || s.ends_with(".toml")
+}
 
 fn parse_str(s: &str) -> Result<DormouseConfig, String> {
     toml::from_str(s).map_err(|e| format!("toml parse: {e}"))
@@ -62,7 +64,9 @@ fn candidates(name: &str) -> Vec<PathBuf> {
     v.push(PathBuf::from(format!("configs/{name}.toml")));
     v.push(PathBuf::from(format!("configs/{name}")));
     // CARGO_MANIFEST_DIR at compile time (crate dir -> repo root)
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs").join(format!("{name}.toml"));
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../configs")
+        .join(format!("{name}.toml"));
     v.push(manifest);
     // exe dir relatives
     if let Ok(exe) = std::env::current_exe() {
@@ -75,7 +79,9 @@ fn candidates(name: &str) -> Vec<PathBuf> {
     }
     // ~/.config/dormouse
     if let Ok(home) = std::env::var("HOME") {
-        v.push(PathBuf::from(format!("{home}/.config/dormouse/{name}.toml")));
+        v.push(PathBuf::from(format!(
+            "{home}/.config/dormouse/{name}.toml"
+        )));
         v.push(PathBuf::from(format!("{home}/.config/dormouse/{name}")));
     }
     v
@@ -131,7 +137,9 @@ mod tests {
     fn small_preset_file_matches_expectations() {
         let manifest = format!("{}/../../configs/small.toml", env!("CARGO_MANIFEST_DIR"));
         let c = load_config(&manifest).expect("configs/small.toml");
-        assert_eq!(c.d_model, 768); assert_eq!(c.n_heads, 12); assert_eq!(c.max_iter, 4);
+        assert_eq!(c.d_model, 768);
+        assert_eq!(c.n_heads, 12);
+        assert_eq!(c.max_iter, 4);
     }
     #[test]
     fn load_by_name_uses_builtin_or_file() {
@@ -144,7 +152,10 @@ mod tests {
     /// nano-fused (loadable by path only) must stay parseable and flat.
     #[test]
     fn nano_fused_file_parses() {
-        let manifest = format!("{}/../../configs/nano-fused.toml", env!("CARGO_MANIFEST_DIR"));
+        let manifest = format!(
+            "{}/../../configs/nano-fused.toml",
+            env!("CARGO_MANIFEST_DIR")
+        );
         let c = load_config(&manifest).expect("configs/nano-fused.toml");
         assert!(!c.use_kda && !c.use_engram);
         assert_eq!(c.d_model, 512);
@@ -166,7 +177,8 @@ mod tests {
         let c = apply("small", &["max_iter=12"]).expect("override");
         assert_eq!(c.max_iter, 12);
         let c2 = apply("small", &["max_iter=4", "jepa_weight=0.0"]).unwrap();
-        assert_eq!(c2.max_iter, 4); assert_eq!(c2.jepa_weight, 0.0);
+        assert_eq!(c2.max_iter, 4);
+        assert_eq!(c2.jepa_weight, 0.0);
         // valid d_model override keeps divisibility
         let c3 = apply("small", &["d_model=840"]).unwrap();
         assert_eq!(c3.d_model, 840);
@@ -186,7 +198,10 @@ mod tests {
         let broken = dir.join("broken.toml");
         std::fs::write(&broken, "d_model = 768\nd_model = = broken\n").unwrap();
         match try_file(&broken) {
-            Some(Err(msg)) => assert!(msg.contains("toml parse"), "reason must name the parse: {msg}"),
+            Some(Err(msg)) => assert!(
+                msg.contains("toml parse"),
+                "reason must name the parse: {msg}"
+            ),
             other => panic!("broken candidate must be Some(Err), got {other:?}"),
         }
         assert!(try_file(&dir.join("absent.toml")).is_none());
@@ -195,18 +210,29 @@ mod tests {
     #[test]
     fn presets_match_original_values() {
         let n = load_config("nano").unwrap();
-        assert_eq!(n.d_model, 512); assert_eq!(n.rank, 96); assert_eq!(n.n_experts, 3); assert_eq!(n.max_iter, 4);
+        assert_eq!(n.d_model, 512);
+        assert_eq!(n.rank, 96);
+        assert_eq!(n.n_experts, 3);
+        assert_eq!(n.max_iter, 4);
         let s = load_config("small").unwrap();
-        assert_eq!(s.d_model, 768); assert_eq!(s.rank, 64); assert_eq!(s.max_iter, 4);
+        assert_eq!(s.d_model, 768);
+        assert_eq!(s.rank, 64);
+        assert_eq!(s.max_iter, 4);
         let b = load_config("base").unwrap();
-        assert_eq!(b.d_model, 1024); assert_eq!(b.d_ffn, 2816); assert_eq!(b.max_seq_len, 1024);
+        assert_eq!(b.d_model, 1024);
+        assert_eq!(b.d_ffn, 2816);
+        assert_eq!(b.max_seq_len, 1024);
         let sw = load_config("swift50").unwrap();
-        assert_eq!(sw.d_ffn, 4096); assert_eq!(sw.n_experts, 8); assert_eq!(sw.jepa_weight, 0.0);
+        assert_eq!(sw.d_ffn, 4096);
+        assert_eq!(sw.n_experts, 8);
+        assert_eq!(sw.jepa_weight, 0.0);
         assert_eq!(sw.dspark_weight, 0.0);
         let o = load_config("one_b").unwrap();
-        assert_eq!(o.d_model, 2048); assert_eq!(o.max_seq_len, 2048); assert_eq!(o.max_iter, 12);
+        assert_eq!(o.d_model, 2048);
+        assert_eq!(o.max_seq_len, 2048);
+        assert_eq!(o.max_iter, 12);
         assert_eq!(o.n_experts, 4);
-        for name in ["nano","small","base","swift50","one_b"] {
+        for name in ["nano", "small", "base", "swift50", "one_b"] {
             let c = load_config(name).unwrap();
             super::super::validation::validate(&c).expect(name);
         }

@@ -35,24 +35,35 @@ use dormouse_train::export::{self, DType};
 
 #[derive(clap::Parser, Debug)]
 struct Args {
-    #[arg(long)] train: Option<PathBuf>,
-    #[arg(long)] eval: PathBuf,
-    #[arg(long, default_value = "nano")] preset: String,
-    #[arg(long, default_value = "20")] steps: usize,
-    #[arg(long, default_value = "8")] batch: usize,
-    #[arg(long, default_value = "512")] seq_len: usize,
-    #[arg(long, default_value = "1e-4")] lr: f64,
+    #[arg(long)]
+    train: Option<PathBuf>,
+    #[arg(long)]
+    eval: PathBuf,
+    #[arg(long, default_value = "nano")]
+    preset: String,
+    #[arg(long, default_value = "20")]
+    steps: usize,
+    #[arg(long, default_value = "8")]
+    batch: usize,
+    #[arg(long, default_value = "512")]
+    seq_len: usize,
+    #[arg(long, default_value = "1e-4")]
+    lr: f64,
     /// Skip phase 1 and measure an existing `--ckpt-dir/--ckpt-name`.
-    #[arg(long)] ckpt_dir: Option<PathBuf>,
-    #[arg(long, default_value = "measured")] ckpt_name: String,
-    #[arg(long, default_value = "16")] windows: usize,
+    #[arg(long)]
+    ckpt_dir: Option<PathBuf>,
+    #[arg(long, default_value = "measured")]
+    ckpt_name: String,
+    #[arg(long, default_value = "16")]
+    windows: usize,
 }
 
 fn main() {
     let a = <Args as clap::Parser>::parse();
-    let dir = a.ckpt_dir.clone().unwrap_or_else(|| {
-        std::env::temp_dir().join("dm-export-divergence")
-    });
+    let dir = a
+        .ckpt_dir
+        .clone()
+        .unwrap_or_else(|| std::env::temp_dir().join("dm-export-divergence"));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("ckpt dir");
 
@@ -62,7 +73,9 @@ fn main() {
     } else {
         let snap = dir.join(format!("{}.config.toml", a.ckpt_name));
         let text = std::fs::read_to_string(&snap).expect("the run wrote a config snapshot");
-        dormouse_train::RunCfg::from_snapshot(&text).expect("the snapshot parses").model
+        dormouse_train::RunCfg::from_snapshot(&text)
+            .expect("the snapshot parses")
+            .model
     };
 
     let bytes = std::fs::read(&ckpt).expect("the checkpoint exists");
@@ -83,10 +96,10 @@ fn main() {
         .map(|i| &eval[i * stride..i * stride + a.seq_len])
         .collect();
 
-    let ref_logits: Vec<Vec<f32>> =
-        windows.iter()
-            .map(|w| decode::next_byte_logits::<dormouse_train::Backend>(&fp32, w))
-            .collect();
+    let ref_logits: Vec<Vec<f32>> = windows
+        .iter()
+        .map(|w| decode::next_byte_logits::<dormouse_train::Backend>(&fp32, w))
+        .collect();
     assert!(
         ref_logits.iter().flatten().all(|x| x.is_finite()),
         "the fp32 reference must be finite or every number below is noise"
@@ -94,9 +107,22 @@ fn main() {
     let vocab = ref_logits[0].len();
     let absmax = ref_logits[0].iter().fold(0.0f32, |a, b| a.max(b.abs()));
 
-    println!("checkpoint   {} ({} B container)", ckpt.display(), bytes.len());
-    println!("preset       {}  params {n_params}  tensors {}", a.preset, export::tensors_of(&fp32).len());
-    println!("held-out     {} windows x {} B from {}", windows.len(), a.seq_len, a.eval.display());
+    println!(
+        "checkpoint   {} ({} B container)",
+        ckpt.display(),
+        bytes.len()
+    );
+    println!(
+        "preset       {}  params {n_params}  tensors {}",
+        a.preset,
+        export::tensors_of(&fp32).len()
+    );
+    println!(
+        "held-out     {} windows x {} B from {}",
+        windows.len(),
+        a.seq_len,
+        a.eval.display()
+    );
     println!("logits       |max| {absmax:.3} (vocab {vocab})");
     println!();
     println!(
@@ -105,7 +131,11 @@ fn main() {
     );
 
     for dtype in [DType::F32, DType::F16, DType::Bf16] {
-        let out = dir.join(format!("{}.{}.dmexp", a.ckpt_name, format!("{dtype:?}").to_lowercase()));
+        let out = dir.join(format!(
+            "{}.{}.dmexp",
+            a.ckpt_name,
+            format!("{dtype:?}").to_lowercase()
+        ));
         let r = export::export_ckpt(&ckpt, Some(&a.preset), &[], dtype, &out)
             .unwrap_or_else(|e| panic!("{dtype:?}: {e}"));
         let (m, _, _) = export::read(&out).unwrap_or_else(|e| panic!("{dtype:?}: {e}"));
@@ -158,10 +188,25 @@ fn train_n_steps(a: &Args, dir: &PathBuf, ckpt: &Path) -> DormouseConfig {
         c.dspark_weight = 0.0;
         c
     };
-    let train = TrainCfg { steps: a.steps, batch: a.batch, seq_len: a.seq_len, lr: a.lr, opt: "adamw".into(), ..Default::default() };
-    let corpus = std::fs::read(a.train.as_ref().expect("--train is required to train")).expect("the corpus exists");
+    let train = TrainCfg {
+        steps: a.steps,
+        batch: a.batch,
+        seq_len: a.seq_len,
+        lr: a.lr,
+        opt: "adamw".into(),
+        ..Default::default()
+    };
+    let corpus = std::fs::read(a.train.as_ref().expect("--train is required to train"))
+        .expect("the corpus exists");
     let dev = dormouse_train::device();
-    println!("training     {} batch {} seq {} steps {} on {} B of corpus", a.preset, a.batch, a.seq_len, a.steps, corpus.len());
+    println!(
+        "training     {} batch {} seq {} steps {} on {} B of corpus",
+        a.preset,
+        a.batch,
+        a.seq_len,
+        a.steps,
+        corpus.len()
+    );
     let mut model = DormouseModel::new(&cfg, &dev);
     let mut optim = build_optim(&model, &train);
     let chunk = a.batch * a.seq_len;
@@ -172,7 +217,11 @@ fn train_n_steps(a: &Args, dir: &PathBuf, ckpt: &Path) -> DormouseConfig {
         let (_logits, rec, _kda, _aux) =
             model.forward_with_hidden::<dormouse_train::Backend>(x, Some(h), None, Some(y), None);
         let loss = model.loss::<dormouse_train::Backend>(rec);
-        let l: f32 = loss.clone().into_data().try_to_vec().expect("loss readback")[0];
+        let l: f32 = loss
+            .clone()
+            .into_data()
+            .try_to_vec()
+            .expect("loss readback")[0];
         let grads = burn::optim::GradientsParams::from_grads(loss.backward(), &model);
         // The polar retraction the trainer does every step: the TSCT U/V
         // masters drift without it and the forward degenerates. (A 20-step run
@@ -181,15 +230,39 @@ fn train_n_steps(a: &Args, dir: &PathBuf, ckpt: &Path) -> DormouseConfig {
         // applied inside `optim.step` by the policy, not here.
         model.retract_tsct(train.retract_iters);
         model = optim.step(a.lr, model, grads);
-        assert!(l.is_finite(), "step {step}: loss is {l} - these weights are not exportable");
-        println!("  step {step:>3} loss {l:.4}  ({:.1}s)", t0.elapsed().as_secs_f32());
+        assert!(
+            l.is_finite(),
+            "step {step}: loss is {l} - these weights are not exportable"
+        );
+        println!(
+            "  step {step:>3} loss {l:.4}  ({:.1}s)",
+            t0.elapsed().as_secs_f32()
+        );
     }
-    save_ckpt(dir, &ckpt.file_stem().unwrap().to_string_lossy(), &model, &optim, None, false, a.steps as u64, 0.0)
-        .expect("the checkpoint saves");
+    save_ckpt(
+        dir,
+        &ckpt.file_stem().unwrap().to_string_lossy(),
+        &model,
+        &optim,
+        None,
+        false,
+        a.steps as u64,
+        0.0,
+    )
+    .expect("the checkpoint saves");
     let name = ckpt.file_stem().unwrap().to_string_lossy().to_string();
-    let run = RunCfg { source: a.preset.clone(), model: cfg.clone(), train };
-    std::fs::write(dir.join(format!("{name}.config.toml")), run.snapshot_toml()).expect("the snapshot writes");
-    println!("checkpoint   {} written in {:.1}s", ckpt.display(), t0.elapsed().as_secs_f32());
+    let run = RunCfg {
+        source: a.preset.clone(),
+        model: cfg.clone(),
+        train,
+    };
+    std::fs::write(dir.join(format!("{name}.config.toml")), run.snapshot_toml())
+        .expect("the snapshot writes");
+    println!(
+        "checkpoint   {} written in {:.1}s",
+        ckpt.display(),
+        t0.elapsed().as_secs_f32()
+    );
     cfg
 }
 
@@ -202,13 +275,24 @@ fn train_n_steps(a: &Args, dir: &PathBuf, ckpt: &Path) -> DormouseConfig {
 /// one the model was trained on: a 20-step model trained through it, and a
 /// measured "export divergence" computed against a decode path that read no
 /// rows at all. One derivation, one key space.
-fn batch(bytes: &[u8], dev: &burn::tensor::Device) -> (Tensor<2, Int>, Tensor<3, Int>, Tensor<2, Int>) {
+fn batch(
+    bytes: &[u8],
+    dev: &burn::tensor::Device,
+) -> (Tensor<2, Int>, Tensor<3, Int>, Tensor<2, Int>) {
     let (b, t) = (1usize, bytes.len());
     let ids: Vec<i64> = bytes.iter().map(|&x| x as i64).collect();
-    let y: Vec<i64> = bytes.iter().skip(1).map(|&x| x as i64).chain(std::iter::once(bytes[0] as i64)).collect();
+    let y: Vec<i64> = bytes
+        .iter()
+        .skip(1)
+        .map(|&x| x as i64)
+        .chain(std::iter::once(bytes[0] as i64))
+        .collect();
     (
         Tensor::from_data(TensorData::new(ids, [b, t]), dev),
-        Tensor::from_data(TensorData::new(dormouse_data::raw_keys(bytes), [b, t, 3]), dev),
+        Tensor::from_data(
+            TensorData::new(dormouse_data::raw_keys(bytes), [b, t, 3]),
+            dev,
+        ),
         Tensor::from_data(TensorData::new(y, [b, t]), dev),
     )
 }
@@ -216,7 +300,13 @@ fn batch(bytes: &[u8], dev: &burn::tensor::Device) -> (Tensor<2, Int>, Tensor<3,
 fn argmax(v: &[f32]) -> usize {
     v.iter()
         .enumerate()
-        .fold((0usize, f32::NEG_INFINITY), |acc, (i, &x)| if x > acc.1 { (i, x) } else { acc })
+        .fold((0usize, f32::NEG_INFINITY), |acc, (i, &x)| {
+            if x > acc.1 {
+                (i, x)
+            } else {
+                acc
+            }
+        })
         .0
 }
 

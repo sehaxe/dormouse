@@ -42,20 +42,20 @@ jobs:
   # rustfmt + clippy on the crates this workflow already builds. Nothing here
   # needs a GPU, so nothing here enables a cuda feature.
   #
-  # BOTH STEPS ARE RED ON LANDING AND BOTH ARE RED ON PURPOSE, with the count
-  # measured on this box, rustc/rustfmt/clippy 1.98.1, 2026-10-01 (full list:
-  # docs/reviews/ci-quality-2026-10-01.md):
+  # HALF-CLOSED as of 2026-10-02. clippy is GREEN: the 114 diagnostics of
+  # 2026-10-01 (docs/reviews/ci-quality-2026-10-01.md §2) are fixed or
+  # allowed-with-a-reason (offload.rs LAYOUT_MAGIC hex literal,
+  # dspark_oracle's ADR-0020-asserting test name, the write-only `nan_reads`
+  # counter in the in-flight lib.rs region — its consumer is ADR-0021 item 4),
+  # and the step runs with `-D warnings`.
   #
-  #   fmt     629 hunks across 54 files in the four crates (`cargo fmt -p ...`)
-  #   clippy  114 unique diagnostics: 18 clippy lints + 4 rustc lints
-  #
-  # `continue-on-error: true`, and that is the finding, not a hedge. A gate
-  # that is red on its first run and stays red until 629 formatting hunks are
-  # fixed is a gate nobody reads — the exact decoration AGENTS.md §1.1 calls a
-  # defect and fused-library.yml's header calls "a decoration with a status
-  # light". The number is the deliverable; the fix is `cargo fmt` and a
-  # `clippy --fix` pass, both of which are mechanical and belong in their own
-  # commits, not folded into a CI change.
+  # fmt is red on exactly TWO files, both owned by lanes with uncommitted
+  # work in them (`wt/graph` holds train/src/lib.rs, whose reformat would
+  # rebase-bomb that lane; core/src/routing.rs is the second): every other
+  # file in the four crates is rustfmt-clean. `continue-on-error` STAYS until
+  # those two lanes land and `cargo fmt -p dormouse-core -p dormouse-data
+  # -p dormouse-train -p dormouse-cli` runs over them — then drop it and this
+  # job is closed like unused-deps.
   #
   # `continue-on-error` is on the JOB, not on the steps, and that placement is
   # load-bearing. Measured on run 36866436388 (2026-10-01): with it on the
@@ -63,14 +63,8 @@ jobs:
   # green tick beside a red gate, which is the decoration the paragraph above
   # claims to be avoiding. On the job, each step keeps its own `failure` and
   # the run is not blocked. Same shape as the `cuda-compile` job above.
-  #
-  # TO CLOSE fmt: run `cargo fmt -p dormouse-core -p dormouse-data
-  # -p dormouse-train -p dormouse-cli` in one commit and delete
-  # `continue-on-error` on this JOB.
-  # TO CLOSE clippy: same, with `cargo clippy --fix`, then work the 24 the
-  # autofixer cannot (the ones with a per-file list in the findings file).
   lint:
-    name: "core :: rustfmt + clippy (measured 2026-10-01: 629 fmt hunks, 114 clippy diagnostics)"
+    name: "core :: rustfmt + clippy (clippy GREEN 2026-10-02; fmt green except train/src/lib.rs + core/src/routing.rs, two in-flight lane files)"
     runs-on: ubuntu-latest
     timeout-minutes: 60
     continue-on-error: true

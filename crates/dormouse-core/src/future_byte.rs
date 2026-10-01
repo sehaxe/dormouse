@@ -70,7 +70,7 @@
 //! failure mode is not exotic; the gate is the vaccine.
 
 use burn::backend::DispatchKindConversion;
-use burn::tensor::{DispatchTensor, Int, Tensor, activation::log_softmax};
+use burn::tensor::{activation::log_softmax, DispatchTensor, Int, Tensor};
 
 use crate::param::LinearLike;
 
@@ -137,8 +137,8 @@ mod tests {
     use super::*;
     use crate::param::LinearLikeInner;
     use crate::{DormouseConfig, DormouseModel};
-    use burn::backend::autodiff::Autodiff;
     use burn::backend::autodiff::checkpoint::strategy::BalancedCheckpointing;
+    use burn::backend::autodiff::Autodiff;
     use burn::module::{Module, ModuleVisitor, Param};
     use burn::tensor::{Device, TensorData};
 
@@ -176,7 +176,9 @@ mod tests {
         let mut s = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
         (0..n)
             .map(|_| {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 ((s >> 33) % 256) as i64
             })
             .collect()
@@ -186,13 +188,20 @@ mod tests {
     /// gates mutate, so `(v + 37) % 16` is a different byte and not an
     /// out-of-range gather.
     fn hidden(t: usize, d: usize, dev: &Device) -> Tensor<3> {
-        let v: Vec<f32> = bytes(0xB7, t * d).iter().map(|&x| x as f32 * 0.01 - 1.0).collect();
+        let v: Vec<f32> = bytes(0xB7, t * d)
+            .iter()
+            .map(|&x| x as f32 * 0.01 - 1.0)
+            .collect();
         Tensor::from_data(TensorData::new(v, [1, t, d]), dev)
     }
 
     /// The trainer's labelling: `y[q] = x[q+1]`, last entry a wraparound.
     fn labels(x: &[i64]) -> Vec<i64> {
-        x[1..].iter().chain(std::iter::once(&x[0])).copied().collect()
+        x[1..]
+            .iter()
+            .chain(std::iter::once(&x[0]))
+            .copied()
+            .collect()
     }
 
     fn dense(head: &LinearLike) -> &burn::nn::Linear {
@@ -220,15 +229,26 @@ mod tests {
         let dev = Device::flex().autodiff();
         let (t, k, d) = (12usize, 2usize, 8usize);
         let cfg = mini(t);
-        let head = DormouseModel::new(&cfg, &dev).aux.fb.expect("weight > 0 builds the head");
+        let head = DormouseModel::new(&cfg, &dev)
+            .aux
+            .fb
+            .expect("weight > 0 builds the head");
         let h = hidden(t, d, &dev);
         let y0 = labels(&bytes(0x2C, t));
         let run = |y: Vec<i64>| -> f32 {
-            future_byte_loss::<B>(&head, h.clone(), Tensor::from_data(TensorData::new(y, [1, t]), &dev), k)
-                .into_scalar::<f32>()
+            future_byte_loss::<B>(
+                &head,
+                h.clone(),
+                Tensor::from_data(TensorData::new(y, [1, t]), &dev),
+                k,
+            )
+            .into_scalar::<f32>()
         };
         let base = run(y0.clone());
-        assert!(base.is_finite() && base > 0.0, "the term must be a real loss, got {base}");
+        assert!(
+            base.is_finite() && base > 0.0,
+            "the term must be a real loss, got {base}"
+        );
         let mut read: Vec<(usize, f32)> = Vec::new();
         let mut skipped: Vec<(usize, f32)> = Vec::new();
         for i in 0..t {
@@ -238,10 +258,17 @@ mod tests {
             let moved = (got - base).abs();
             if i >= k && i <= t - 2 {
                 read.push((i, moved));
-                assert!(moved > 1e-6, "targets[{i}] IS a label at k={k} (read at q={i}) but the loss ignored it");
+                assert!(
+                    moved > 1e-6,
+                    "targets[{i}] IS a label at k={k} (read at q={i}) but the loss ignored it"
+                );
             } else {
                 skipped.push((i, moved));
-                assert_eq!(got.to_bits(), base.to_bits(), "targets[{i}] must not be read at all");
+                assert_eq!(
+                    got.to_bits(),
+                    base.to_bits(),
+                    "targets[{i}] must not be read at all"
+                );
             }
         }
         println!(
@@ -255,8 +282,16 @@ mod tests {
         // The map itself, not just the two halves: exactly n = t - k - 1 labels
         // are read, and the entries outside are `targets[0..k]` (a label only at
         // k = 0) plus the wraparound at `targets[t-1]`.
-        assert_eq!(read.len(), valid_positions(t, k), "the number of labels read is t - k - 1");
-        assert_eq!(skipped, vec![(0, 0.0), (1, 0.0), (t - 1, 0.0)], "the skipped set is the documented one");
+        assert_eq!(
+            read.len(),
+            valid_positions(t, k),
+            "the number of labels read is t - k - 1"
+        );
+        assert_eq!(
+            skipped,
+            vec![(0, 0.0), (1, 0.0), (t - 1, 0.0)],
+            "the skipped set is the documented one"
+        );
     }
 
     /// The same property at the MODEL level, plus the two things only the model
@@ -279,12 +314,19 @@ mod tests {
         let teacher = crate::aux::ema_update(model.clone(), &model, 0.0);
         let x = bytes(0x51, t);
         let y = labels(&x);
-        let run = |m: &DormouseModel, ids: &[i64], labels: &[i64], teacher: Option<&DormouseModel>| -> f32 {
+        let run = |m: &DormouseModel,
+                   ids: &[i64],
+                   labels: &[i64],
+                   teacher: Option<&DormouseModel>|
+         -> f32 {
             m.forward_with_hidden::<B>(
                 Tensor::from_data(TensorData::new(ids.to_vec(), [1, t]), &dev),
                 None,
                 None,
-                Some(Tensor::from_data(TensorData::new(labels.to_vec(), [1, t]), &dev)),
+                Some(Tensor::from_data(
+                    TensorData::new(labels.to_vec(), [1, t]),
+                    &dev,
+                )),
                 teacher,
             )
             .3
@@ -292,7 +334,10 @@ mod tests {
             .into_scalar::<f32>()
         };
         let a = run(&model, &x, &y, None);
-        assert!(a.is_finite() && a > 0.0, "the term is vacuous at {a}, so every check below is free");
+        assert!(
+            a.is_finite() && a > 0.0,
+            "the term is vacuous at {a}, so every check below is free"
+        );
         // (1) The multiplier is the configured weight, EXACTLY. No RNG in this
         // term (no mask, no sampling), so unlike the JEPA gate this one is a
         // bitwise observation, not an inequality.
@@ -360,12 +405,22 @@ mod tests {
     fn future_byte_loss_matches_an_f64_host_reference_at_the_length_boundary() {
         let dev = Device::flex().autodiff();
         let (b, t, d, v) = (2usize, 9usize, 8usize, 256usize);
-        let cfg = DormouseConfig { d_model: d, vocab: v, ..mini(t) };
+        let cfg = DormouseConfig {
+            d_model: d,
+            vocab: v,
+            ..mini(t)
+        };
         let model = DormouseModel::new(&cfg, &dev);
-        let head = model.aux.fb.expect("cfg.aux_fb_weight > 0 must build the head");
+        let head = model
+            .aux
+            .fb
+            .expect("cfg.aux_fb_weight > 0 must build the head");
         // Two batches, so the `[b, n]` reshape and the per-row mean are actually
         // exercised (b = 1 would hide a transposition in either).
-        let hv: Vec<f32> = bytes(0x6B, b * t * d).iter().map(|&x| x as f32 * 0.01 - 1.0).collect();
+        let hv: Vec<f32> = bytes(0x6B, b * t * d)
+            .iter()
+            .map(|&x| x as f32 * 0.01 - 1.0)
+            .collect();
         let h = Tensor::from_data(TensorData::new(hv.clone(), [b, t, d]), &dev);
         let x = bytes(0x71, b * t);
         let mut y: Vec<i64> = Vec::with_capacity(b * t);
@@ -375,16 +430,33 @@ mod tests {
 
         // f64 reference, from the head's OWN parameters read back off the device.
         let lin = dense(&head);
-        let w: Vec<f32> = lin.weight.val().clone().into_data().try_to_vec().expect("readable weight");
-        let bias: Vec<f32> =
-            lin.bias.as_ref().expect("the dense head has a bias").val().clone().into_data().try_to_vec().expect("readable bias");
+        let w: Vec<f32> = lin
+            .weight
+            .val()
+            .clone()
+            .into_data()
+            .try_to_vec()
+            .expect("readable weight");
+        let bias: Vec<f32> = lin
+            .bias
+            .as_ref()
+            .expect("the dense head has a bias")
+            .val()
+            .clone()
+            .into_data()
+            .try_to_vec()
+            .expect("readable bias");
         // burn's `nn::Linear` default layout is `Row` with the weight stored
         // `[d_input, d_output]` and applied as `x @ W`, so element `j * v + c`
         // multiplies `h[j]` into logit `c`. Pinned here because getting it
         // backwards is a SILENT 6.5e-3 disagreement in this very test - the
         // numbers look like noise until you find the transposition, and the
         // first draft of this gate had exactly that bug.
-        assert_eq!(lin.weight.dims(), [d, v], "the weight is [d_input, d_output]");
+        assert_eq!(
+            lin.weight.dims(),
+            [d, v],
+            "the weight is [d_input, d_output]"
+        );
         assert_eq!(bias.len(), v, "one bias per output class");
         let hf: Vec<f64> = hv.iter().map(|&x| f64::from(x)).collect();
         let n = valid_positions(t, cfg.aux_fb_horizon);
@@ -395,7 +467,9 @@ mod tests {
                 let label = y[r * t + q + k] as usize;
                 let z: Vec<f64> = (0..v)
                     .map(|c| {
-                        (0..d).map(|j| f64::from(w[j * v + c]) * hf[(r * t + q) * d + j]).sum::<f64>()
+                        (0..d)
+                            .map(|j| f64::from(w[j * v + c]) * hf[(r * t + q) * d + j])
+                            .sum::<f64>()
                             + f64::from(bias[c])
                     })
                     .collect();
@@ -405,10 +479,18 @@ mod tests {
             }
         }
         let want = acc / (b * n) as f64;
-        let got = future_byte_loss::<B>(&head, h, Tensor::from_data(TensorData::new(y, [b, t]), &dev), k)
-            .into_scalar::<f32>();
+        let got = future_byte_loss::<B>(
+            &head,
+            h,
+            Tensor::from_data(TensorData::new(y, [b, t]), &dev),
+            k,
+        )
+        .into_scalar::<f32>();
         let rel = ((f64::from(got) - want) / want).abs();
-        assert!(rel < 1e-5, "device {got:.8} vs the f64 host reference {want:.8}: rel {rel:.2e}");
+        assert!(
+            rel < 1e-5,
+            "device {got:.8} vs the f64 host reference {want:.8}: rel {rel:.2e}"
+        );
         println!("future_byte_loss vs f64 host reference: {got:.8} vs {want:.8}, rel {rel:.2e} (n = {n})");
 
         // The length boundary: a sequence of exactly `k` bytes has no valid
@@ -417,9 +499,14 @@ mod tests {
         // a 2k-step A/B at `seq_len <= k` is visibly a 2k-step A/B of nothing.
         let short = k;
         let ran_before = crate::probe::count(crate::probe::FUTURE_BYTE);
-        assert!(ran_before > 0, "the t = 9 term above must have counted itself");
+        assert!(
+            ran_before > 0,
+            "the t = 9 term above must have counted itself"
+        );
         let xs = bytes(0x11, b * short);
-        let ys: Vec<i64> = (0..b).flat_map(|r| labels(&xs[r * short..(r + 1) * short])).collect();
+        let ys: Vec<i64> = (0..b)
+            .flat_map(|r| labels(&xs[r * short..(r + 1) * short]))
+            .collect();
         let zero = future_byte_loss::<B>(
             &head,
             Tensor::<3>::zeros([b, short, d], &dev),
@@ -427,7 +514,11 @@ mod tests {
             k,
         )
         .into_scalar::<f32>();
-        assert_eq!(zero.to_bits(), 0.0f32.to_bits(), "t = k must return an exact zero, not a small term");
+        assert_eq!(
+            zero.to_bits(),
+            0.0f32.to_bits(),
+            "t = k must return an exact zero, not a small term"
+        );
         assert_eq!(
             crate::probe::count(crate::probe::FUTURE_BYTE),
             ran_before,
@@ -453,20 +544,42 @@ mod tests {
         let on = DormouseModel::new(&mini(t), &dev);
         // The default is the off position, and it is the DEFAULT that must be
         // off: a recipe nobody edited must not carry an untrained head.
-        assert_eq!(DormouseConfig::default().aux_fb_weight, 0.0, "the default must be OFF");
-        assert_eq!(DormouseConfig::default().aux_fb_horizon, 2, "the default horizon is 2");
-        let cfg_off = DormouseConfig { aux_fb_weight: 0.0, ..mini(t) };
+        assert_eq!(
+            DormouseConfig::default().aux_fb_weight,
+            0.0,
+            "the default must be OFF"
+        );
+        assert_eq!(
+            DormouseConfig::default().aux_fb_horizon,
+            2,
+            "the default horizon is 2"
+        );
+        let cfg_off = DormouseConfig {
+            aux_fb_weight: 0.0,
+            ..mini(t)
+        };
         let plain = DormouseModel::new(&cfg_off, &dev);
-        assert!(plain.aux.fb.is_none(), "weight 0 must not build a head: it would be dead parameters");
+        assert!(
+            plain.aux.fb.is_none(),
+            "weight 0 must not build a head: it would be dead parameters"
+        );
         assert!(on.aux.fb.is_some(), "weight > 0 must build it");
         // The head is the WHOLE parameter difference between the two models -
         // nothing else moved, which is the byte-identical claim in its
         // strongest form this crate can check.
         let head_params = cfg_off.vocab * cfg_off.d_model + cfg_off.vocab;
-        assert_eq!(count_params(&plain) + head_params, count_params(&on), "the head is the whole difference");
+        assert_eq!(
+            count_params(&plain) + head_params,
+            count_params(&on),
+            "the head is the whole difference"
+        );
         // ... and the 197 120 the schema comment quotes is that arithmetic at
         // `small`'s widths, not a number from a different place.
-        assert_eq!(FB_PARAMS_AT_SMALL, 256 * 768 + 256, "the quoted price of the arm on `small`");
+        assert_eq!(
+            FB_PARAMS_AT_SMALL,
+            256 * 768 + 256,
+            "the quoted price of the arm on `small`"
+        );
 
         // (2) the main CE, bitwise, with the arm on and then off - on the SAME
         // model, so the parameter draw is identical and any difference is the
@@ -475,29 +588,54 @@ mod tests {
         let x = bytes(0x3F, t);
         let y = labels(&x);
         let step = |m: &DormouseModel| -> (f32, Option<f32>) {
-            let (_, r, _, a) = m
-                .forward_with_hidden::<B>(
-                    Tensor::from_data(TensorData::new(x.clone(), [1, t]), &dev),
-                    None,
-                    None,
-                    Some(Tensor::from_data(TensorData::new(y.clone(), [1, t]), &dev)),
-                    None,
-                );
+            let (_, r, _, a) = m.forward_with_hidden::<B>(
+                Tensor::from_data(TensorData::new(x.clone(), [1, t]), &dev),
+                None,
+                None,
+                Some(Tensor::from_data(TensorData::new(y.clone(), [1, t]), &dev)),
+                None,
+            );
             (r.into_scalar::<f32>(), a.map(|a| a.into_scalar::<f32>()))
         };
         crate::probe::reset();
         let (ce_on, aux_on) = step(&model);
-        assert!(aux_on.is_some_and(|a| a > 0.0), "weight > 0 must return a real term");
-        assert_eq!(crate::probe::count(crate::probe::FUTURE_BYTE), 1, "the term ran once");
-        assert_eq!(crate::probe::count(crate::probe::FUTURE_BYTE_ASKED), 1, "and it was asked for once");
+        assert!(
+            aux_on.is_some_and(|a| a > 0.0),
+            "weight > 0 must return a real term"
+        );
+        assert_eq!(
+            crate::probe::count(crate::probe::FUTURE_BYTE),
+            1,
+            "the term ran once"
+        );
+        assert_eq!(
+            crate::probe::count(crate::probe::FUTURE_BYTE_ASKED),
+            1,
+            "and it was asked for once"
+        );
         let mut muted = model.clone();
         muted.aux_fb_weight = 0.0;
         let (ce_off, aux_off) = step(&muted);
-        assert_eq!(ce_on.to_bits(), ce_off.to_bits(), "the arm moved the MAIN CE: {ce_on} vs {ce_off}");
-        assert_eq!(aux_off, None, "weight 0 on a labelled forward must return no aux at all");
+        assert_eq!(
+            ce_on.to_bits(),
+            ce_off.to_bits(),
+            "the arm moved the MAIN CE: {ce_on} vs {ce_off}"
+        );
+        assert_eq!(
+            aux_off, None,
+            "weight 0 on a labelled forward must return no aux at all"
+        );
         // A muted arm is not a silently-running one: the counters do not move.
-        assert_eq!(crate::probe::count(crate::probe::FUTURE_BYTE), 1, "the muted forward must not bump `ran`");
-        assert_eq!(crate::probe::count(crate::probe::FUTURE_BYTE_ASKED), 1, "nor `asked`");
+        assert_eq!(
+            crate::probe::count(crate::probe::FUTURE_BYTE),
+            1,
+            "the muted forward must not bump `ran`"
+        );
+        assert_eq!(
+            crate::probe::count(crate::probe::FUTURE_BYTE_ASKED),
+            1,
+            "nor `asked`"
+        );
     }
 
     /// The claim in the module docs, measured through the LIVE model forward:
@@ -542,25 +680,45 @@ mod tests {
                 self.stack.pop();
             }
             fn visit_float<const D: usize>(&mut self, p: &Param<Tensor<D>>) {
-                let n = p.grad(self.grads).map(|g| g.abs().max().into_scalar::<f32>());
+                let n = p
+                    .grad(self.grads)
+                    .map(|g| g.abs().max().into_scalar::<f32>());
                 self.out.push((self.stack.join("."), n));
             }
         }
-        let mut rows = Rows { stack: Vec::new(), grads: &grads, out: Vec::new() };
+        let mut rows = Rows {
+            stack: Vec::new(),
+            grads: &grads,
+            out: Vec::new(),
+        };
         model.visit(&mut rows);
         let find = |prefix: &str| -> Vec<(&str, Option<f32>)> {
-            rows.out.iter().filter(|(p, _)| p.starts_with(prefix)).map(|(p, n)| (p.as_str(), *n)).collect()
+            rows.out
+                .iter()
+                .filter(|(p, _)| p.starts_with(prefix))
+                .map(|(p, n)| (p.as_str(), *n))
+                .collect()
         };
         let head_rows = find("aux.fb");
-        assert!(!head_rows.is_empty(), "the head must own parameters under aux.fb: {:?}", rows.out);
+        assert!(
+            !head_rows.is_empty(),
+            "the head must own parameters under aux.fb: {:?}",
+            rows.out
+        );
         assert!(
             head_rows.iter().any(|(_, n)| n.is_some_and(|v| v > 0.0)),
             "the future-byte head receives no gradient: {head_rows:?}"
         );
         // `None`, not zero: the main head is not in the subgraph at all.
         let lm = find("lm_head");
-        assert!(!lm.is_empty(), "the fixture must have a main head to be wrong about");
-        assert!(lm.iter().all(|(_, n)| n.is_none()), "the future-byte term reached lm_head: {lm:?}");
+        assert!(
+            !lm.is_empty(),
+            "the fixture must have a main head to be wrong about"
+        );
+        assert!(
+            lm.iter().all(|(_, n)| n.is_none()),
+            "the future-byte term reached lm_head: {lm:?}"
+        );
         // The backbone. `residual_scale` is 0 at init (ReZero), so the block
         // body sits on the graph with a zero gradient; what must be non-zero is
         // at least one parameter of the block or of the readout above it.
@@ -574,7 +732,10 @@ mod tests {
              lm_head {}/{} with one",
             head_rows.iter().filter(|(_, n)| n.is_some()).count(),
             head_rows.len(),
-            block.iter().filter(|(_, n)| n.is_some_and(|v| v > 0.0)).count(),
+            block
+                .iter()
+                .filter(|(_, n)| n.is_some_and(|v| v > 0.0))
+                .count(),
             block.len(),
             lm.iter().filter(|(_, n)| n.is_some()).count(),
             lm.len(),
@@ -597,7 +758,13 @@ mod tests {
     fn an_off_arm_record_refuses_to_load_into_an_on_arm_model() {
         let dev = Device::flex();
         let t = 12usize;
-        let off = DormouseModel::new(&DormouseConfig { aux_fb_weight: 0.0, ..mini(t) }, &dev);
+        let off = DormouseModel::new(
+            &DormouseConfig {
+                aux_fb_weight: 0.0,
+                ..mini(t)
+            },
+            &dev,
+        );
         let record = off.into_record();
         let on = DormouseModel::new(&mini(t), &dev);
         match on.try_load_record(record) {

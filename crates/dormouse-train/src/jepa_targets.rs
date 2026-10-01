@@ -102,7 +102,8 @@ impl JepaTargets {
     /// Scan the sidecar and build the hash -> offset index. Errors loudly on
     /// a truncated file (every record must be complete).
     pub fn open(path: &std::path::Path, device: &burn::tensor::Device) -> Result<Self, String> {
-        let raw = std::fs::File::open(path).map_err(|e| format!("jepa targets {}: {e}", path.display()))?;
+        let raw = std::fs::File::open(path)
+            .map_err(|e| format!("jepa targets {}: {e}", path.display()))?;
         let mut r = BufReader::new(raw);
         let mut index = HashMap::new();
         const HEADER: usize = 8 + 4 + 4 + 4;
@@ -113,34 +114,41 @@ impl JepaTargets {
                 break; // clean EOF
             }
             let mut rest = [0u8; HEADER - 8];
-            r.read_exact(&mut rest)
-                .map_err(|_| format!("jepa targets {}: truncated record at {pos}", path.display()))?;
+            r.read_exact(&mut rest).map_err(|_| {
+                format!("jepa targets {}: truncated record at {pos}", path.display())
+            })?;
             let hash = u64::from_le_bytes(hdr);
             let b = u32::from_le_bytes(rest[0..4].try_into().unwrap()) as u64;
             let t = u32::from_le_bytes(rest[4..8].try_into().unwrap()) as u64;
             let d = u32::from_le_bytes(rest[8..12].try_into().unwrap()) as u64;
             let payload = b * t * d * 4;
-            std::io::copy(
-                &mut r.by_ref().take(payload),
-                &mut std::io::sink(),
-            )
-            .map_err(|e| e.to_string())?;
+            std::io::copy(&mut r.by_ref().take(payload), &mut std::io::sink())
+                .map_err(|e| e.to_string())?;
             index.entry(hash).or_insert(pos);
         }
         if index.is_empty() {
             return Err(format!("jepa targets {}: no records", path.display()));
         }
         let file = BufReader::new(std::fs::File::open(path).map_err(|e| e.to_string())?);
-        println!("jepa targets: {} records from {}", index.len(), path.display());
-        Ok(Self { file, index, device: device.clone() })
+        println!(
+            "jepa targets: {} records from {}",
+            index.len(),
+            path.display()
+        );
+        Ok(Self {
+            file,
+            index,
+            device: device.clone(),
+        })
     }
 
-    /// How many distinct chunks the sidecar holds. Printed at open, and it is
-    /// the number a reader compares against the precompute step count: fewer
-    /// records than steps means the precompute pass was cut short.
-    ///
-    /// Deliberately no `is_empty`: the empty case is already a LOUD `Err` at
-    /// open ("no records"), so an `is_empty` here could only ever be false.
+    /// How many distinct chunks the sidecar holds — the number a reader
+    /// compares against the precompute step count: fewer records than steps
+    /// means the precompute pass was cut short. `open()` already prints the
+    /// count (from the index directly), and the lib target itself has no
+    /// caller — the accessor is for the reader side, which is why dead_code
+    /// is allowed here and not deleted.
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.index.len()
     }
@@ -166,10 +174,11 @@ impl JepaTargets {
         let n = b * t * d;
         let mut raw = vec![0u8; n * 4];
         self.file.read_exact(&mut raw).map_err(|e| e.to_string())?;
-        let vals: Vec<f32> = raw
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-            .collect();
-        Ok(Tensor::from_data(TensorData::new(vals, [b, t, d]), &self.device))
+        let (chunks, _) = raw.as_chunks::<4>();
+        let vals: Vec<f32> = chunks.iter().map(|c| f32::from_le_bytes(*c)).collect();
+        Ok(Tensor::from_data(
+            TensorData::new(vals, [b, t, d]),
+            &self.device,
+        ))
     }
 }

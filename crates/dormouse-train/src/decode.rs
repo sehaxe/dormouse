@@ -89,7 +89,10 @@ where
         TensorData::new(keys, [1, t, dormouse_data::ORDERS.len()]),
         &device,
     );
-    let (arms, keys_read) = (probe::count(probe::ENGRAM), probe::count(probe::ENGRAM_KEYS));
+    let (arms, keys_read) = (
+        probe::count(probe::ENGRAM),
+        probe::count(probe::ENGRAM_KEYS),
+    );
     let logits = model.forward::<B>(x, Some(hashed));
     // The backstop. No keys take `loop_block`'s inert branch, which counts the
     // branch and not the row read: the exact shape of the bug this module

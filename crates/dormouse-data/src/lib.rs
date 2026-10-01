@@ -144,8 +144,7 @@ pub fn collect_files(root: &Path) -> Vec<PathBuf> {
     // because the corpus builder writes plain shards, and reading compressed
     // bytes as text would train on noise.
     let text_exts = [
-        "parquet", "txt", "jsonl", "json", "md", "html", "xml", "csv", "fa", "fna", "fasta",
-        "ffn",
+        "parquet", "txt", "jsonl", "json", "md", "html", "xml", "csv", "fa", "fna", "fasta", "ffn",
     ];
     let bin_exts = [
         "png", "jpg", "jpeg", "gif", "webp", "bmp", "bin", "wasm", "zst", "gz",
@@ -322,18 +321,17 @@ fn open_source(path: &Path) -> Option<Source> {
         .map(|e| e.to_string_lossy().eq_ignore_ascii_case("parquet"))
         .unwrap_or(false);
     let r = if is_parquet {
-        std::fs::File::open(path)
-            .and_then(|f| {
-                parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(f)
-                    .and_then(|b| b.build())
-                    .map(|reader| Source::Parquet {
-                        reader,
-                        batch: Vec::new(),
-                        pos: 0,
-                        path: path.to_path_buf(),
-                    })
-                    .map_err(std::io::Error::other)
-            })
+        std::fs::File::open(path).and_then(|f| {
+            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(f)
+                .and_then(|b| b.build())
+                .map(|reader| Source::Parquet {
+                    reader,
+                    batch: Vec::new(),
+                    pos: 0,
+                    path: path.to_path_buf(),
+                })
+                .map_err(std::io::Error::other)
+        })
     } else {
         std::fs::File::open(path).map(|f| Source::Text(BufReader::new(f)))
     };
@@ -444,7 +442,7 @@ enum Source {
 }
 
 impl Source {
-    fn read(&mut self, tmp: &mut Vec<u8>) -> std::io::Result<usize> {
+    fn read(&mut self, tmp: &mut [u8]) -> std::io::Result<usize> {
         match self {
             Source::Text(r) => r.read(tmp),
             Source::Parquet {
@@ -562,7 +560,10 @@ impl ByteStream {
         assert!(!files.is_empty(), "ByteStream needs a non-empty file list");
         // A sleeping/unmounted drive lists files but serves no bytes; catch it
         // at construction instead of training on a silent constant stream.
-        let total: u64 = files.iter().map(|f| f.metadata().map(|m| m.len()).unwrap_or(0)).sum();
+        let total: u64 = files
+            .iter()
+            .map(|f| f.metadata().map(|m| m.len()).unwrap_or(0))
+            .sum();
         let floor = (seq_len * batch * 4) as u64;
         assert!(
             total >= floor,
@@ -618,7 +619,8 @@ impl ByteStream {
         self.file_idx = 0;
         shuffle_files(
             &mut self.files,
-            self.seed.wrapping_add(self.epoch.wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+            self.seed
+                .wrapping_add(self.epoch.wrapping_mul(0x9E37_79B9_7F4A_7C15)),
         );
         while self.file_idx < self.files.len() {
             if let Some(r) = open_source(&self.files[self.file_idx]) {
@@ -851,10 +853,14 @@ mod tests {
     fn raw_hashes_are_unreduced_and_reduction_is_the_callers() {
         let dir = std::env::temp_dir().join(format!("dormouse_hash_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let pattern: Vec<u8> = (0..256u32).map(|i| (i * 29 % 251) as u8).cycle().take(1 << 16).collect();
+        let pattern: Vec<u8> = (0..256u32)
+            .map(|i| (i * 29 % 251) as u8)
+            .cycle()
+            .take(1 << 16)
+            .collect();
         std::fs::write(dir.join("corpus.bin"), &pattern).unwrap();
         let (seq, batch) = (8usize, 2usize);
-        let mut s = ByteStream::new(seq, batch, &dir);
+        let s = ByteStream::new(seq, batch, &dir);
         let raw = s.hashes_raw(&pattern[..seq * batch]);
         assert_eq!(raw.len(), batch * seq * ORDERS.len());
         // `hashes_raw` IS `raw_keys` per batch row, one row at a time. Pinned
@@ -865,7 +871,10 @@ mod tests {
             let row = &pattern[b * seq..(b + 1) * seq];
             let one = raw_keys(row);
             assert_eq!(one.len(), seq * ORDERS.len());
-            assert_eq!(&raw[b * seq * ORDERS.len()..(b + 1) * seq * ORDERS.len()], &one[..]);
+            assert_eq!(
+                &raw[b * seq * ORDERS.len()..(b + 1) * seq * ORDERS.len()],
+                &one[..]
+            );
         }
         // Unreduced, and 31 bits so `Int` (i32 on burn-flex) holds every value
         // without a panic. This assertion CHANGED on 2026-09-28: the old
@@ -878,7 +887,10 @@ mod tests {
             raw.iter().all(|&h| (0..(1i64 << 31)).contains(&h)),
             "raw hashes fit in i32 (the type `Int` actually is on burn-flex)"
         );
-        assert!(raw.iter().any(|&h| h > 4096), "raw hashes must NOT be pre-reduced");
+        assert!(
+            raw.iter().any(|&h| h > 4096),
+            "raw hashes must NOT be pre-reduced"
+        );
         assert!(
             raw.iter().all(|&h| (h as i32) >= 0),
             "every raw hash must survive the i32 cast the trainer performs"
@@ -889,9 +901,13 @@ mod tests {
         let red = s.hashes(&pattern[..seq * batch], &tables);
         assert_eq!(red.len(), raw.len());
         for (i, (&r, &g)) in red.iter().zip(raw.iter()).enumerate() {
-            assert_eq!(r, g.rem_euclid(tables[i % ORDERS.len()] as i64), "column {i}");
+            assert_eq!(
+                r,
+                g.rem_euclid(tables[i % ORDERS.len()] as i64),
+                "column {i}"
+            );
         }
-        assert!(red.iter().all(|&h| h >= 0 && h < 524_288));
+        assert!(red.iter().all(|&h| (0..524_288).contains(&h)));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -904,7 +920,10 @@ mod tests {
         assert_eq!(ORDERS, [2, 3, 4]);
         let mut sorted = ORDERS;
         sorted.sort_unstable();
-        assert_eq!(sorted, ORDERS, "orders must be ascending (table order == column order)");
+        assert_eq!(
+            sorted, ORDERS,
+            "orders must be ascending (table order == column order)"
+        );
     }
 
     #[test]
@@ -947,7 +966,11 @@ mod tests {
     fn skip_bytes_resumes_exactly() {
         let dir = std::env::temp_dir().join(format!("dormouse_skip_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let pattern: Vec<u8> = (0..256u32).map(|i| (i * 7 % 251) as u8).cycle().take(1 << 20).collect();
+        let pattern: Vec<u8> = (0..256u32)
+            .map(|i| (i * 7 % 251) as u8)
+            .cycle()
+            .take(1 << 20)
+            .collect();
         let f = dir.join("corpus.bin");
         std::fs::write(&f, &pattern).unwrap();
         let (seq, batch) = (8usize, 2usize);
@@ -956,7 +979,10 @@ mod tests {
         s.skip_bytes(skip);
         let (bytes, _) = s.next_batch();
         assert_eq!(bytes.len(), seq * batch);
-        assert_eq!(bytes[..], pattern[skip as usize..skip as usize + seq * batch]);
+        assert_eq!(
+            bytes[..],
+            pattern[skip as usize..skip as usize + seq * batch]
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -968,7 +994,11 @@ mod tests {
     fn rewind_restarts_the_same_window() {
         let dir = std::env::temp_dir().join(format!("dormouse_rewind_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let pattern: Vec<u8> = (0..256u32).map(|i| (i * 13 % 241) as u8).cycle().take(1 << 20).collect();
+        let pattern: Vec<u8> = (0..256u32)
+            .map(|i| (i * 13 % 241) as u8)
+            .cycle()
+            .take(1 << 20)
+            .collect();
         std::fs::write(dir.join("corpus.bin"), &pattern).unwrap();
         let (seq, batch) = (8usize, 2usize);
         let mut s = ByteStream::new(seq, batch, &dir);
@@ -1016,7 +1046,11 @@ mod tests {
     #[should_panic(expected = "wrapped to epoch")]
     fn a_skip_past_the_end_of_the_corpus_is_loud() {
         let dir = tmpdir("skip_past_end");
-        let pattern: Vec<u8> = (0..256u32).map(|i| (i * 7 % 251) as u8).cycle().take(1 << 20).collect();
+        let pattern: Vec<u8> = (0..256u32)
+            .map(|i| (i * 7 % 251) as u8)
+            .cycle()
+            .take(1 << 20)
+            .collect();
         std::fs::write(dir.join("corpus.bin"), &pattern).unwrap();
         let mut s = ByteStream::new(8, 2, &dir);
         s.skip_bytes(2 << 20); // the corpus holds 1 MiB
@@ -1051,12 +1085,8 @@ mod tests {
             std::fs::create_dir_all(dir.join(name)).unwrap();
             std::fs::write(dir.join(name).join("shard.bin"), vec![byte; 1 << 16]).unwrap();
         }
-        let (mut train, eval) = ByteStream::train_and_eval(
-            8,
-            2,
-            &dir.join("data"),
-            Some(&dir.join("eval")),
-        );
+        let (mut train, eval) =
+            ByteStream::train_and_eval(8, 2, &dir.join("data"), Some(&dir.join("eval")));
         let (bytes, _) = train.next_batch();
         assert_eq!(bytes, vec![7u8; 16]);
         let mut eval = eval.expect("an eval root must yield a stream");
@@ -1170,19 +1200,17 @@ mod tests {
         ));
         // tags: dictionary-encoded string - the physical array is a dictionary,
         // so a downcast to StringArray cannot see it at all.
-        let tags = Arc::new(DictionaryArray::try_new(
-            Int32Array::from(vec![1, 0]),
-            strs(&["marine biology", "cephalopod"]),
-        )
-        .unwrap());
+        let tags = Arc::new(
+            DictionaryArray::try_new(
+                Int32Array::from(vec![1, 0]),
+                strs(&["marine biology", "cephalopod"]),
+            )
+            .unwrap(),
+        );
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, true),
             Field::new("document", document.data_type().clone(), true),
-            Field::new(
-                "annotations",
-                annotations.data_type().clone(),
-                true,
-            ),
+            Field::new("annotations", annotations.data_type().clone(), true),
             Field::new("tags", tags.data_type().clone(), true),
         ]));
         let batch = RecordBatch::try_new(
@@ -1195,12 +1223,9 @@ mod tests {
             ],
         )
         .unwrap();
-        let mut w = parquet::arrow::ArrowWriter::try_new(
-            std::fs::File::create(&f).unwrap(),
-            schema,
-            None,
-        )
-        .unwrap();
+        let mut w =
+            parquet::arrow::ArrowWriter::try_new(std::fs::File::create(&f).unwrap(), schema, None)
+                .unwrap();
         w.write(&batch).unwrap();
         w.close().unwrap();
 
@@ -1245,4 +1270,3 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
-

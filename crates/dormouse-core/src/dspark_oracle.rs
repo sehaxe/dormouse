@@ -34,6 +34,17 @@ use crate::config::DormouseConfig;
 
 const FIXTURE: &str = include_str!("../tests/fixtures/dspark_oracle.txt");
 
+/// The one f32 decode rule for TensorData bytes: little-endian over exact
+/// 4-byte chunks (`as_chunks`, not `chunks_exact`, so the const size is a
+/// type and the remainder is a compile-time-visible `().1`).
+fn le_f32s(bytes: &[u8]) -> impl Iterator<Item = f32> + '_ {
+    bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
+}
+
 fn fixture() -> HashMap<String, String> {
     let mut out = HashMap::new();
     for line in FIXTURE.lines() {
@@ -95,21 +106,24 @@ fn gamma_matches_the_official_config_and_so_does_its_shape() {
     // library the loss calls: burn_dspark::position_weights(block, gamma).
     let block = num(&f, "config.block_size") as usize;
     let dev = burn::tensor::Device::flex();
-    let w = burn_dspark::position_weights(block, DSPARK_GAMMA, &dev)
-        .into_data()
-        .bytes
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-        .collect::<Vec<_>>();
+    let w = {
+        let raw = burn_dspark::position_weights(block, DSPARK_GAMMA, &dev).into_data();
+        le_f32s(&raw.bytes).collect::<Vec<_>>()
+    };
     assert_eq!(w.len(), block, "position_weights returned the wrong length");
     for (k, got) in w.iter().enumerate() {
         let want = (-(k as f64) / DSPARK_GAMMA).exp() as f32;
-        assert!((got - want).abs() <= 1e-7, "w_{k} = {got} vs exp(-k/gamma) = {want}");
+        assert!(
+            (got - want).abs() <= 1e-7,
+            "w_{k} = {got} vs exp(-k/gamma) = {want}"
+        );
     }
     assert!((w[0] - 1.0).abs() < 1e-7, "w_0 must be 1");
     eprintln!(
         "gamma {official} over the official block_size of {block}: w = {:?}",
-        w.iter().map(|v| (v * 1e4).round() / 1e4).collect::<Vec<_>>()
+        w.iter()
+            .map(|v| (v * 1e4).round() / 1e4)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -173,25 +187,31 @@ fn accept_rate_target_matches_the_official_formula() {
         burn::tensor::Tensor::<3>::from_data(burn::tensor::TensorData::new(v, [1, 1, 8]), &dev)
     };
     let scalar = |t: burn::tensor::Tensor<2>| {
-        t.into_data()
-            .bytes
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-            .next()
-            .unwrap()
+        let d = t.into_data();
+        let first = le_f32s(&d.bytes).next().unwrap();
+        first
     };
     let base: Vec<f32> = (0..8).map(|i| i as f32 * 0.7 - 2.0).collect();
     // A constant shift leaves the softmax unchanged, so the target is 1.0. On
     // raw LOGITS the same shift is a huge L1 distance and it would collapse.
     let shifted = base.iter().map(|v| v + 40.0).collect::<Vec<_>>();
-    let same = scalar(burn_dspark::accept_rate_target(first(base.clone()), first(shifted)));
+    let same = scalar(burn_dspark::accept_rate_target(
+        first(base.clone()),
+        first(shifted),
+    ));
     assert!(
         (same - 1.0).abs() < 1e-5,
         "a constant logit shift must leave the acceptance target at 1.0, got {same}: \
          the target is not on softmax probs"
     );
-    let self_t = scalar(burn_dspark::accept_rate_target(first(base.clone()), first(base)));
-    assert!((self_t - 1.0).abs() < 1e-5, "identical distributions must give 1.0, got {self_t}");
+    let self_t = scalar(burn_dspark::accept_rate_target(
+        first(base.clone()),
+        first(base),
+    ));
+    assert!(
+        (self_t - 1.0).abs() < 1e-5,
+        "identical distributions must give 1.0, got {self_t}"
+    );
     // Disjoint one-hots have L1 = 2, so 1 - 0.5*2 = 0: the clamp is reachable,
     // which is the whole reason for the 0.5 coefficient.
     let mut hot = vec![0.0f32; 8];
@@ -204,7 +224,9 @@ fn accept_rate_target_matches_the_official_formula() {
         "disjoint one-hots have L1 = 2, so the target is clamp(0, 0, 1) = 0, got {z}: \
          the 0.5 coefficient moved"
     );
-    eprintln!("accept_rate_target: shift-invariant (so softmax), 1.0 on identical, 0.0 on disjoint");
+    eprintln!(
+        "accept_rate_target: shift-invariant (so softmax), 1.0 on identical, 0.0 on disjoint"
+    );
 }
 
 // ─── What we do NOT match, each with a name and a place ──────────────────
@@ -218,7 +240,10 @@ fn dspark_k_is_not_block_size_and_dspark_stride_has_no_counterpart() {
     let block = num(&f, "config.block_size");
     assert_eq!(block, 7.0, "the official block_size moved");
     let (line, text) = evidence(&f, "common", "block_size_doc");
-    assert_eq!(line, 19, "block_size's docstring moved in DeepSpec's common.py");
+    assert_eq!(
+        line, 19,
+        "block_size's docstring moved in DeepSpec's common.py"
+    );
     assert!(
         text.contains("number of draft positions per anchor"),
         "block_size is no longer documented as the draft block length \
@@ -237,9 +262,16 @@ fn dspark_k_is_not_block_size_and_dspark_stride_has_no_counterpart() {
         "dspark_k now equals the official block_size ({block}); the difference \
          this test records is gone and the comment above is stale"
     );
-    assert_eq!(cfg.dspark_k, 4, "dspark_k's default moved; update the finding");
+    assert_eq!(
+        cfg.dspark_k, 4,
+        "dspark_k's default moved; update the finding"
+    );
     assert_eq!(cfg.dspark_stride, 16, "dspark_stride's default moved");
-    assert_eq!(num(&f, "config.num_anchors"), 512.0, "DeepSpec's num_anchors moved");
+    assert_eq!(
+        num(&f, "config.num_anchors"),
+        512.0,
+        "DeepSpec's num_anchors moved"
+    );
     let ours = anchors(512, cfg.dspark_k, cfg.dspark_stride);
     eprintln!(
         "block_size {block} = draft positions per anchor, so it maps to \
@@ -247,8 +279,7 @@ fn dspark_k_is_not_block_size_and_dspark_stride_has_no_counterpart() {
          no stride: it SAMPLES num_anchors = 512 anchors per sequence, where we \
          take every {}th position. At seq_len 512 with k = {} that is {} anchors \
          at {:?} against their fixed 512.",
-        cfg.dspark_k, cfg.dspark_stride, cfg.dspark_stride, cfg.dspark_k,
-        ours.0, ours.2
+        cfg.dspark_k, cfg.dspark_stride, cfg.dspark_stride, cfg.dspark_k, ours.0, ours.2
     );
 }
 
@@ -265,10 +296,19 @@ fn the_markov_head_is_rnn_where_the_official_config_says_vanilla() {
         Some("'vanilla'")
     );
     let (line, text) = evidence(&f, "markov", "vanilla");
-    assert_eq!(line, 294, "the head dispatch moved in DeepSpec's markov_head.py");
-    assert!(text.contains("vanilla"), "l.{line} is no longer the vanilla branch");
+    assert_eq!(
+        line, 294,
+        "the head dispatch moved in DeepSpec's markov_head.py"
+    );
+    assert!(
+        text.contains("vanilla"),
+        "l.{line} is no longer the vanilla branch"
+    );
     let (rnn_line, rnn_text) = evidence(&f, "markov", "rnn");
-    assert!(rnn_text.contains("class RNNHead"), "DeepSpec lost its RNNHead (l.{rnn_line})");
+    assert!(
+        rnn_text.contains("class RNNHead"),
+        "DeepSpec lost its RNNHead (l.{rnn_line})"
+    );
     // The finding this test was written for is FIXED (1836ecb, 2026-09-29):
     // AuxHeads::new now builds the markov-conditioned predictor, so what
     // DeepSpec's `confidence_head_with_markov = True` asks for is what we
@@ -293,10 +333,14 @@ fn the_markov_head_is_rnn_where_the_official_config_says_vanilla() {
 /// Markov embeddings. burn-dspark's `with_markov(input_dim, markov_rank)` is
 /// the conditioned variant and is not called anywhere in the tree.
 #[test]
+// The name asserts the ADR-0020 claim the test exists to prove; renaming it
+// would weaken the sentence into a hedged one.
+#[allow(non_snake_case)]
 fn the_confidence_head_IS_markov_conditioned() {
     let f = fixture();
     assert_eq!(
-        f.get("config.confidence_head_with_markov").map(String::as_str),
+        f.get("config.confidence_head_with_markov")
+            .map(String::as_str),
         Some("True")
     );
     let (line, text) = evidence(&f, "loss", "bce");
@@ -368,7 +412,9 @@ fn dspark_stride_is_the_anchor_spacing() {
     assert_eq!(spacing, 16, "the anchor spacing moved");
     assert_eq!(
         positions,
-        (0..n).map(|i| i as i64 * spacing as i64).collect::<Vec<_>>(),
+        (0..n)
+            .map(|i| i as i64 * spacing as i64)
+            .collect::<Vec<_>>(),
         "anchors are no longer i*stride"
     );
     eprintln!(
@@ -384,8 +430,16 @@ fn dspark_stride_is_the_anchor_spacing() {
 /// `(n_anchors, stride, positions)` for the arithmetic `dspark_aux_loss`
 /// performs: `n = (t - k - 1) / stride`, anchors at `i * stride`.
 fn anchors(t: usize, k: usize, stride: usize) -> (usize, usize, Vec<i64>) {
-    let n = if t > k + 1 { (t - k - 1) / stride.max(1) } else { 0 };
-    (n, stride, (0..n).map(|i| i as i64 * stride as i64).collect())
+    let n = if t > k + 1 {
+        (t - k - 1) / stride.max(1)
+    } else {
+        0
+    };
+    (
+        n,
+        stride,
+        (0..n).map(|i| i as i64 * stride as i64).collect(),
+    )
 }
 
 /// The head types `AuxHeads::new` actually builds, named from the type rather
@@ -403,10 +457,16 @@ fn aux_head_types() -> (&'static str, &'static str) {
     // predictor and the call agree). Probing beats reading a field, and it is
     // the only way to see it without editing burn-dspark.
     let h = burn::tensor::Tensor::<3>::zeros([1, 1, c.d_model], &burn::tensor::Device::flex());
-    let hidden_only = !expect_panic(move || { aux.conf.logit(h, None); });
+    let hidden_only = !expect_panic(move || {
+        aux.conf.logit(h, None);
+    });
     (
         Box::leak(dspark.into_boxed_str()),
-        if hidden_only { "hidden-only" } else { "markov-conditioned" },
+        if hidden_only {
+            "hidden-only"
+        } else {
+            "markov-conditioned"
+        },
     )
 }
 
@@ -430,13 +490,17 @@ fn with_markov_call_sites() -> usize {
     let conditioned = burn_dspark::AcceptRatePredictor::with_markov(8, 4, &dev);
     let h_first = h.clone();
     assert!(
-        expect_panic(move || { conditioned.logit(h_first, None); }),
+        expect_panic(move || {
+            conditioned.logit(h_first, None);
+        }),
         "a Markov-conditioned predictor must REJECT a call with no Markov \
          embeddings; burn-dspark's logit asserts they agree, so if this passes \
          the conditioning is no longer observable and the finding is stale"
     );
     let plain = burn_dspark::AcceptRatePredictor::new(8, &dev);
-    let plain_accepts = !expect_panic(move || { plain.logit(h, None); });
+    let plain_accepts = !expect_panic(move || {
+        plain.logit(h, None);
+    });
     assert!(
         plain_accepts,
         "the hidden-only predictor must ACCEPT a hidden-only call"
@@ -464,25 +528,29 @@ fn probe_loss() -> (f32, f32, f32, f32) {
     let target: Vec<f32> = (0..v).map(|i| 1.0 - (i as f32) * 0.3).collect();
     let ids: Vec<i64> = vec![2i64]; // one supervised position
     let (t, ce, tv, conf) = burn_dspark::dspark_loss(
+        burn::tensor::Tensor::<3>::from_data(burn::tensor::TensorData::new(draft, [1, 1, v]), &dev),
         burn::tensor::Tensor::<3>::from_data(
-            burn::tensor::TensorData::new(draft, [1, 1, v]), &dev),
-        burn::tensor::Tensor::<3>::from_data(
-            burn::tensor::TensorData::new(target, [1, 1, v]), &dev),
+            burn::tensor::TensorData::new(target, [1, 1, v]),
+            &dev,
+        ),
         burn::tensor::Tensor::<2, burn::tensor::Int>::from_data(
-            burn::tensor::TensorData::new(ids, [1, 1]), &dev),
+            burn::tensor::TensorData::new(ids, [1, 1]),
+            &dev,
+        ),
         Some(burn::tensor::Tensor::<3>::from_data(
-            burn::tensor::TensorData::new(vec![0.3f32], [1, 1, 1]), &dev)),
+            burn::tensor::TensorData::new(vec![0.3f32], [1, 1, 1]),
+            &dev,
+        )),
         burn::tensor::Tensor::<2>::from_data(
-            burn::tensor::TensorData::new(vec![1.0f32], [1, 1]), &dev),
+            burn::tensor::TensorData::new(vec![1.0f32], [1, 1]),
+            &dev,
+        ),
         DSPARK_GAMMA,
     );
     let g = |x: burn::tensor::Tensor<1>| {
-        x.into_data()
-            .bytes
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-            .next()
-            .unwrap()
+        let d = x.into_data();
+        let first = le_f32s(&d.bytes).next().unwrap();
+        first
     };
     (g(t), g(ce), g(tv), g(conf))
 }
