@@ -627,17 +627,12 @@ fn map(module: DormouseModel, pins: &mut Pins, action: PinAction) -> DormouseMod
 /// or feeds it an unpinned per-step tensor would make the captured graph a
 /// different computation than the run claims to be doing, silently.
 pub fn check(cfg: &crate::RunCfg) -> Result<(), String> {
-    #[cfg(not(feature = "cuda"))]
-    if cfg.train.graph_capture {
-        return Err(
-            "--graph-capture needs the cuda feature: there is no graph on another backend, and \
-             silently training without one would be a flag that does nothing."
-                .into(),
-        );
-    }
     if !cfg.train.graph_capture {
         return Ok(());
     }
+    // The arm refusals come FIRST so each one is reachable (and testable) off
+    // CUDA: on a CPU build the "needs the cuda feature" refusal would otherwise
+    // swallow all three and the arm gates would never run.
     if cfg.train.rand_depth {
         return Err(
             "--graph-capture refuses --rand-depth: the captured graph bakes ONE loop depth, and \
@@ -661,6 +656,13 @@ pub fn check(cfg: &crate::RunCfg) -> Result<(), String> {
                 .into(),
         );
     }
+    #[cfg(not(feature = "cuda"))]
+    return Err(
+        "--graph-capture needs the cuda feature: there is no graph on another backend, and \
+         silently training without one would be a flag that does nothing."
+            .into(),
+    );
+    #[cfg(feature = "cuda")]
     Ok(())
 }
 

@@ -218,6 +218,49 @@ mod tests {
     /// every field the struct has. A skipped field shows up as a deficit
     /// here, whatever its name and whatever it does; adding a field without
     /// adding it to the snapshot (or vice versa) fails the count.
+    /// `--graph-capture` is a LOUD refusal beside every arm that would make the
+    /// captured window a different computation than the run claims to be
+    /// doing. Three gates, one per arm, each naming the arm (ADR-0011: a
+    /// fallback is excused by the caller being able to say which arm ran).
+    #[test]
+    fn graph_capture_refuses_the_arms_it_cannot_capture() {
+        let named = |t: TrainCfg| {
+            resolve("small", &[], t).expect_err("--graph-capture must refuse this arm")
+        };
+        let e = named(TrainCfg { graph_capture: true, rand_depth: true, ..Default::default() });
+        assert!(e.contains("rand-depth"), "{e}");
+        let e = named(TrainCfg { graph_capture: true, engram_ram: true, ..Default::default() });
+        assert!(e.contains("engram-ram"), "{e}");
+        // Offline JEPA targets are a per-chunk upload v1 does not pin.
+        let e = named(TrainCfg {
+            graph_capture: true,
+            jepa_targets: Some(std::path::PathBuf::from("t.bin")),
+            ..Default::default()
+        });
+        assert!(e.contains("jepa-targets"), "{e}");
+    }
+
+    /// The flag alone resolves ON CUDA: the refusals above are about the other
+    /// arm, not about the flag. Off CUDA the flag alone is the refusal the
+    /// other test owns.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn graph_capture_alone_resolves_on_cuda() {
+        resolve("small", &[], TrainCfg { graph_capture: true, ..Default::default() })
+            .expect("--graph-capture on its own is legal on CUDA");
+    }
+
+    /// Off CUDA there is no graph, and a flag that cannot do what it says is
+    /// not a flag. On a CUDA build this cell is compiled away (the refusal is
+    /// then unreachable, which is the point).
+    #[cfg(not(feature = "cuda"))]
+    #[test]
+    fn graph_capture_is_refused_off_cuda() {
+        let e = resolve("small", &[], TrainCfg { graph_capture: true, ..Default::default() })
+            .expect_err("there is no graph off CUDA");
+        assert!(e.contains("cuda"), "{e}");
+    }
+
     #[test]
     fn snapshot_carries_every_train_field() {
         // The field list, written out. This is the price of the guarantee and
