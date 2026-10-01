@@ -22,7 +22,7 @@ The divergence is **only** the output gate.
 
 ## What we do, and why it is not verified
 
-`vendor/dormouse-fused/crates/burn-gdn2/src/module.rs` applies `silu(gate)` — the
+`vendor/dormouse-fused/crates/dormouse-gdn2/src/module.rs` applies `silu(gate)` — the
 **NVlabs** choice, i.e. the original GDN-2 reference.
 
 **The reason this is a finding and not a footnote: our own oracle cannot see
@@ -35,7 +35,7 @@ this one is structurally blind.
 
 ## The neighbouring arm already picks the other side
 
-`burn-kda` applies `RMSNorm(o) ⊙ sigmoid(W_g x) ⊙ w_norm` per arXiv:2607.24653
+`dormouse-kda` applies `RMSNorm(o) ⊙ sigmoid(W_g x) ⊙ w_norm` per arXiv:2607.24653
 §2.1.1 Eq. 6 — `gdn-kda.md` row 30, "verified against the paper". So the two
 crates in this repository currently disagree with each other on the output
 gate, deliberately and on the record. That is not necessarily wrong: KDA and

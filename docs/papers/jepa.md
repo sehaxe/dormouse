@@ -1,7 +1,7 @@
 # JEPA — paper verification
 
 **Fetch date:** 2026-09-29. **Tree:** `eeb3b73`, working dir `/home/sehaxe/dormouse`.
-**Subject:** `vendor/dormouse-fused/crates/burn-jepa/` + the call sites in
+**Subject:** `vendor/dormouse-fused/crates/dormouse-jepa/` + the call sites in
 `crates/dormouse-core/src/{aux.rs, model.rs}` and
 `crates/dormouse-train/src/lib.rs`.
 
@@ -9,7 +9,7 @@
 
 ## 0. Which paper is this? — **data2vec 2.0**, and the crate says so correctly
 
-`burn-jepa/src/lib.rs:5` says *"data2vec 2.0-style self-supervised learning"* and
+`dormouse-jepa/src/lib.rs:5` says *"data2vec 2.0-style self-supervised learning"* and
 `lib.rs:13` maps `EmaTarget / JepaPredictor / mask_indices / jepa_l1_loss` to
 **[2212.07525]**. That is the right paper: Baevski, Babu, Hsu, Auli, *Efficient
 Self-supervised Learning with Contextualized Target Representations for Vision,
@@ -95,7 +95,7 @@ tensor and could diverge silently. **UNVERIFIABLE from the tree.**
 
 ### 2.1 The loss
 
-**Ours — `burn-jepa/src/losses.rs:11-20`:**
+**Ours — `dormouse-jepa/src/losses.rs:11-20`:**
 
 ```rust
 pub fn jepa_l1_loss(pred, target, mask) {
@@ -135,7 +135,7 @@ Worth one line at `aux.rs:25`.
 
 ### 2.3 Masking strategy
 
-**Ours — `burn-jepa/src/mask.rs:9-25`:** Bernoulli starts dilated causally into
+**Ours — `dormouse-jepa/src/mask.rs:9-25`:** Bernoulli starts dilated causally into
 contiguous spans, with the start rate inverted so the expected masked fraction
 is exactly `mask_frac`:
 
@@ -266,7 +266,7 @@ defect is the **label**, not necessarily the mechanism.
 
 ## 6. Recommended gold-vector test
 
-`burn-jepa` has 12 unit tests, all shape- or finiteness-shaped. None pins a
+`dormouse-jepa` has 12 unit tests, all shape- or finiteness-shaped. None pins a
 value against a reference. Three to add, all CPU, all cheap:
 
 ```rust

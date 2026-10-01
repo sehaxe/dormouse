@@ -1,4 +1,4 @@
-# Math-site inventory: the spectral stack (burn-spectral, burn-sct, burn-muon-plus)
+# Math-site inventory: the spectral stack (dormouse-spectral, dormouse-sct, dormouse-muon-plus)
 
 **2026-10-01, audit pass.** One row per math site, in the order the code runs.
 Read with [`reviews/spectral-audit-2026-10-01.md`](../reviews/spectral-audit-2026-10-01.md),
@@ -20,7 +20,7 @@ site has no gate — which is itself a finding, not a neutral.
 
 ---
 
-## 1. burn-spectral — the retraction chain (the trainer's live path)
+## 1. dormouse-spectral — the retraction chain (the trainer's live path)
 
 | # | site | file:line | what it computes | source claim | tier | gate | verdict |
 |---|---|---|---|---|---|---|---|
@@ -30,9 +30,9 @@ site has no gate — which is itself a finding, not a neutral.
 | S4 | `polar_retracked` | `src/lib.rs:154-162` | `polar(before).detach()`, re-flag `require_grad` only if `before` had it | burn-optim silently downgrades a stored non-leaf to an untracked leaf | **(c)** | `retract_mirrors_master_tracking` (1628), `retract_keeps_masters_tracked` (1649) | correct, and the doc explains why forcing the flag is wrong twice over (hard panic on a non-autodiff backend; un-freezes a caller's frozen master) |
 | S5 | `SpectralLinear::retract` | `src/lib.rs:662-669` | the per-step entry point: U then V, `Param::from_mapped_value` with the **same** ParamId and mapper | — | **(c)** | `tsct_retract_restores_ortho` (core) | correct. Preserving ParamId is load-bearing: fresh ids would silently reset every factor's optimizer momentum (`model.rs:429-437`) |
 | S6 | `SpectralMoE::retract` | `src/lib.rs:1275-1282` | same, for the MoE arm | — | **(c)** | — (arm unwired) | correct by copy; unexercised in any run |
-| S7 | `ortho_error` | `src/lib.rs:344-360` | `‖UᵀU−I‖_F`, **raw**, plus a host read | — | **(c)** | — | correct, but a **naming/convention trap**: the raw F-norm here, and the *per-entry* convention that the latch's 1e-3 is stated in lives in the **caller** (`param.rs:210-213` divides by k). Same trap in `burn-sct`'s `ortho_error` (C4). See F7 |
+| S7 | `ortho_error` | `src/lib.rs:344-360` | `‖UᵀU−I‖_F`, **raw**, plus a host read | — | **(c)** | — | correct, but a **naming/convention trap**: the raw F-norm here, and the *per-entry* convention that the latch's 1e-3 is stated in lives in the **caller** (`param.rs:210-213` divides by k). Same trap in `dormouse-sct`'s `ortho_error` (C4). See F7 |
 | S8 | `qr_householder` | `src/lib.rs:689-718` | on-device Householder QR, **orthonormal init only** | LAPACK `dgeqrf` scheme, our transcription | **(b)** | — | correct as far as it goes, and it is the **documented source of the cross-process TSCT residue** (AGENTS.md 3.7: nondeterministic reductions at a *random iteration* 0…55, median 2). It reads 7 host scalars per column and materialises an `m×m` eye per column — O(n·m²) work and 67 MB for a `[4096,64]` factor, once per run. See F4 |
-| S9 | `ternarize` | `src/lib.rs:51-56` | `sign(w)·mean(|w|)`, dead zone at `0.7·mean` | BitNet b1.58 (arXiv:2504.12285) for the absmean-STE; **the 0.7 dead zone is attributed to a "burn-es convention"** | **(a)** for the ternary form / **(c)** for the 0.7 | — for the 0.7 | the 0.7 is a number with no external reference and no gate. It decides which 30% of entries are zeroed, in every forward. See F8 |
+| S9 | `ternarize` | `src/lib.rs:51-56` | `sign(w)·mean(|w|)`, dead zone at `0.7·mean` | BitNet b1.58 (arXiv:2504.12285) for the absmean-STE; **the 0.7 dead zone is attributed to a "dormouse-es convention"** | **(a)** for the ternary form / **(c)** for the 0.7 | — for the 0.7 | the 0.7 is a number with no external reference and no gate. It decides which 30% of entries are zeroed, in every forward. See F8 |
 | S10 | `ste_ternary`, `ste_ternary_annealed` | `src/lib.rs:60-82` | STE wrappers | BitNet b1.58 | **(a)** | — | correct |
 | S11 | `ternarize_stochastic`, `ste_ternary_stochastic` | `src/lib.rs:95-113` | S3T: `sign(w)·scale·Bernoulli(|w|/scale)` | arXiv:2412.04787 | **(a-cite)** | — | correct; **not on the trainer's path** (`small.toml` sets no stochastic flag) |
 | S12 | `ternarize_per_column` | `src/lib.rs:119-124` | per-column `mean(|col|)` instead of one global mean | our adaptation | **(c)** | — | correct; `per_column` is off for `small` |
@@ -42,7 +42,7 @@ site has no gate — which is itself a finding, not a neutral.
 | S16 | `moe_fused.rs` | `src/moe_fused.rs` (3243 lines) | fused rank-1 ternary MoE | our construction | **(c)** | — | not in the model |
 | S17 | `infer.rs::pack_ternary` | `src/infer.rs:16+` | 2-bit pack for inference | — | **(c)** | — | generation path, not training |
 
-## 2. burn-muon-plus — the third layer, for the record
+## 2. dormouse-muon-plus — the third layer, for the record
 
 | # | site | file:line | what it computes | source claim | tier | gate | verdict |
 |---|---|---|---|---|---|---|---|
@@ -51,12 +51,12 @@ site has no gate — which is itself a finding, not a neutral.
 | M3 | `norm_col` / `norm_row` / `ColRow` | `src/lib.rs:343-380` | Eq. (3)–(7) of the paper; the live order is `ColRow` | arXiv:2602.21545 Eq. (7) | **(a)** | `normalization_matches_the_paper_equations` | correct. **Load-bearing for the drift arithmetic in the class-B section**: ColRow makes every row of the update unit-L2, so `‖ΔU‖_F = lr·√k = 8e-4` at `lr=1e-4, k=64` |
 | M4 | `lr_scaled = lr * (m/n).max(1).sqrt()` | `src/lib.rs:479` | Jordan's `max(1, m/n)^0.5`; the paper's Eq. (4) has no `max` | deviation, documented in place | **(c)** (declared deviation) | — | correct and honestly labelled |
 
-## 3. burn-sct — the foundation layer. **Not in the dormouse build, and duplicated in it**
+## 3. dormouse-sct — the foundation layer. **Not in the dormouse build, and duplicated in it**
 
-Everything in this section is reachable only from `burn-spectral`'s
+Everything in this section is reachable only from `dormouse-spectral`'s
 `[dev-dependencies]` + `examples/tsct_diag.rs`. **No training run has ever
-executed a line of this crate** (grep: the only non-`burn-sct` references to it
-in the whole vendor tree are `burn-spectral/Cargo.toml:33` and that example).
+executed a line of this crate** (grep: the only non-`dormouse-sct` references to it
+in the whole vendor tree are `dormouse-spectral/Cargo.toml:33` and that example).
 
 | # | site | file:line | what it computes | source claim | tier | gate | verdict |
 |---|---|---|---|---|---|---|---|
@@ -94,5 +94,5 @@ in the whole vendor tree are `burn-spectral/Cargo.toml:33` and that example).
 
 | # | seam | file:line | what composes | verdict |
 |---|---|---|---|---|
-| X1 | `LinearLike` → `SpectralLinear` | `crates/dormouse-core/src/param.rs:6` | the trainer's TSCT linear **is** `burn_spectral::SpectralLinear`; the retraction it runs is `SpectralLinear::retract` → `polar_retracked` → `polar_orthogonalize`, i.e. **S1**, on 16 factors per step | **live, and it is the only one.** The module doc on `param.rs:1` says "TSCT linear via **burn-sct** `SpectralLinear`" — wrong crate, and the third name in a chain that also has `burn-spectral`'s own header calling itself `burn-tsct` |
-| X2 | `SpectralLinear::retract` → `burn_sct::orthogonalize` | — | **does not exist.** `retract` takes no backend parameter at all, so it cannot call `burn_sct::orthogonalize::<B>`, and `burn_sct::qr_cuda::is_cuda::<B>()` compares `B`'s TypeId against the **bare** `CubeBackend` while the trainer's device is `Autodiff { device: Cube(Cuda(0)) }` — the same reachability wall as `burn-rmsnorm` (AGENTS.md 3.3) | the retraction the trainer runs is **not** the QR retraction the SCT paper specifies; it is a Newton-Schulz substitute that the crate's own header calls "replaces the CPU QR of SCT, which cost 40-50% of a step" |
+| X1 | `LinearLike` → `SpectralLinear` | `crates/dormouse-core/src/param.rs:6` | the trainer's TSCT linear **is** `dormouse_spectral::SpectralLinear`; the retraction it runs is `SpectralLinear::retract` → `polar_retracked` → `polar_orthogonalize`, i.e. **S1**, on 16 factors per step | **live, and it is the only one.** The module doc on `param.rs:1` says "TSCT linear via **dormouse-sct** `SpectralLinear`" — wrong crate, and the third name in a chain that also has `dormouse-spectral`'s own header calling itself `burn-tsct` |
+| X2 | `SpectralLinear::retract` → `dormouse_sct::orthogonalize` | — | **does not exist.** `retract` takes no backend parameter at all, so it cannot call `dormouse_sct::orthogonalize::<B>`, and `dormouse_sct::qr_cuda::is_cuda::<B>()` compares `B`'s TypeId against the **bare** `CubeBackend` while the trainer's device is `Autodiff { device: Cube(Cuda(0)) }` — the same reachability wall as `dormouse-rmsnorm` (AGENTS.md 3.3) | the retraction the trainer runs is **not** the QR retraction the SCT paper specifies; it is a Newton-Schulz substitute that the crate's own header calls "replaces the CPU QR of SCT, which cost 40-50% of a step" |

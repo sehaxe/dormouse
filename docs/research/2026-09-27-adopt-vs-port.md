@@ -36,21 +36,21 @@ crates.io is reachable and cheap.
 
 Checked against each crate's own doc comment and `Cargo.toml`, not the task list:
 
-- The library is **28 crates, not 26** (`vendor/dormouse-fused/crates/`), plus the `burn-fused`
+- The library is **28 crates, not 26** (`vendor/dormouse-fused/crates/`), plus the `dormouse-fused`
   meta-crate. The task list names 28 and matches the directory exactly.
-- `burn-gdn2` has **no arXiv in the crate** (correct as stated), but the mechanism it ports
+- `dormouse-gdn2` has **no arXiv in the crate** (correct as stated), but the mechanism it ports
   **does** have a paper that the crate never cites: **arXiv 2605.22791**, "Gated DeltaNet-2:
   Decoupling Erase and Write in Linear Attention" (NVlabs). Its `tests/gen_reference.py` cites
   the *repo* (`NVlabs/GatedDeltaNet-2`) but not the paper.
 - `burn-byteflow` is **2603.03583** (ByteFlow, Deng et al., ICLR 2026) — not in the task list.
 - `burn-diffusionblocks` is **2506.14202** (DiffusionBlocks, Sakana AI, ICLR 2026) — not in
   the task list.
-- `burn-jepa` cites a **third** paper not in the task list: **2304.07193** (DINOv2 / KoLeo).
+- `dormouse-jepa` cites a **third** paper not in the task list: **2304.07193** (DINOv2 / KoLeo).
 - `burn-ttt` cites **2407.04620** (original TTT) alongside 2512.23675.
-- `burn-rope` cites **2104.09864** (RoFormer) and **2309.00071** (YaRN) — neither in the task list.
-- `burn-spectral` cites **seven** papers, of which 2412.04787 (stochastic-rounding DQT) and
+- `dormouse-rope` cites **2104.09864** (RoFormer) and **2309.00071** (YaRN) — neither in the task list.
+- `dormouse-spectral` cites **seven** papers, of which 2412.04787 (stochastic-rounding DQT) and
   2202.09368 (MoE expert-choice routing) were not in the task list. All seven verified real.
-- `burn-sct` has no arXiv in its doc comment at all; it is the 2604.00733 mechanism.
+- `dormouse-sct` has no arXiv in its doc comment at all; it is the 2604.00733 mechanism.
 
 All 31 arXiv IDs cited across the 28 crates were opened on arxiv.org and confirmed to exist
 with the title the crate claims. **Zero invented papers in the crate docs.**
@@ -64,12 +64,12 @@ Measured from `crates/*/Cargo.toml` and `grep -rhoE "\bburn_(kda|...)"` over `cr
 | | crates | src LOC |
 |---|---|---|
 | **Wired** (a `use burn_*` in `crates/dormouse-*`) | 9 | **14,988** |
-| Wired transitively (`burn-gdn2` via `burn-kda`) | +1 | included above |
+| Wired transitively (`dormouse-gdn2` via `dormouse-kda`) | +1 | included above |
 | **Zero call sites anywhere in the workspace** | 18 | **12,597** |
 
-The nine actually-referenced crates, by reference count in our source: `burn_spectral` 22,
-`burn_muon_plus` 4, `burn_rmsnorm` 3, `burn_mor` 3, `burn_bitnet` 3, `burn_kda` 2,
-`burn_dspark` 2, `burn_jepa` 1, `burn_engram` 1.
+The nine actually-referenced crates, by reference count in our source: `dormouse_spectral` 22,
+`dormouse_muon_plus` 4, `dormouse_rmsnorm` 3, `dormouse_mor` 3, `dormouse_bitnet` 3, `dormouse_kda` 2,
+`dormouse_dspark` 2, `dormouse_jepa` 1, `dormouse_engram` 1.
 
 **46% of the library has zero call sites.** This is the same conclusion the three inventory
 files reached from the other direction (WIRED / IMPLEMENTED-UNUSED / SUPERSEDED / BROKEN), so
@@ -87,7 +87,7 @@ that is the finding, not a failure to search.
 
 ---
 
-#### `burn-rmsnorm` — 235 LOC — **ADOPT `burn::nn::RmsNorm`**
+#### `dormouse-rmsnorm` — 235 LOC — **ADOPT `burn::nn::RmsNorm`**
 
 1. **External implementation?** Yes, and it is **already a dependency**. `burn-nn`
    0.22.0-pre.4 ships `RmsNorm` / `RmsNormConfig` at
@@ -100,7 +100,7 @@ that is the finding, not a failure to search.
    implementation, so there is no second-source question at all.
 4. **Verdict: ADOPT.**
 
-**The one real risk, checked and cleared.** `burn-rmsnorm`'s own comment records a
+**The one real risk, checked and cleared.** `dormouse-rmsnorm`'s own comment records a
 first-hand burn bug: *"pre.3 required require_grad here (Param::initialized inherits the flag;
 without it the weight froze — model_seam gradient_flow, 2026-09-21)"*. If that still applied,
 naively swapping to `burn::nn::RmsNorm` would silently freeze every norm weight. I traced it:
@@ -115,12 +115,12 @@ pre.3 bug that upstream fixed; our 8-line device-branching workaround is now dea
 And our port's only differentiator is gone anyway: the inventory's universal blocker applies
 to it — the fused cube is gated on `TypeId::of::<Inner>() == TypeId::of::<CudaBare>()`, and
 the trainer's backend is `Autodiff<Cuda, BalancedCheckpointing>`, so **the kernel in
-`burn-rmsnorm` has never launched in production**. The crate is named for a fusion that does
+`dormouse-rmsnorm` has never launched in production**. The crate is named for a fusion that does
 not fire. Adopting `burn::nn::RmsNorm` makes the name match the behaviour.
 
 ---
 
-#### `burn-rope` — 975 LOC — **ADOPT `burn::nn::RotaryEncoding`**
+#### `dormouse-rope` — 975 LOC — **ADOPT `burn::nn::RotaryEncoding`**
 
 1. **External implementation?** Yes, already a dependency. `burn-nn`
    0.22.0-pre.4 ships `RotaryEncoding` / `RotaryEncodingConfig` at
@@ -129,7 +129,7 @@ not fire. Adopting `burn::nn::RmsNorm` makes the name match the behaviour.
    the YaRN hook, so the port's headline extension is **subsumed by an API upstream already
    provides**, not reimplemented.
 2. **Can it run on our stack?** Yes — same `burn::nn` generic-over-`B` situation.
-3. **Better reference?** Yes. The inventory singles out `burn-rope` as holding the library's
+3. **Better reference?** Yes. The inventory singles out `dormouse-rope` as holding the library's
    best numerical discipline *and* its only admitted precision bug: an inverted YaRN ramp once
    shipped with a green test suite because an f32 `cos` collapses to 1.0 below ~3e-4 rad. That
    is 975 lines of ours containing a real, documented precision failure mode. The frequency
@@ -137,14 +137,14 @@ not fire. Adopting `burn::nn::RmsNorm` makes the name match the behaviour.
    rotation) is where the value is.
 4. **Verdict: ADOPT** — for the frequency math, the tests, and the YaRN API.
 
-**Honest caveat, stated because it cuts against the verdict.** `burn-rope` owns the library's
+**Honest caveat, stated because it cuts against the verdict.** `dormouse-rope` owns the library's
 only genuinely good fused autodiff op: `rope_autodiff<Inner>` is a real custom op with a
 forward `rope_kernel`, a backward `rope_backward_kernel`, registered through
 `burn_autodiff::ops::Backward`, and no matmul anywhere so it is structurally immune to all
 three of our precision blockers. `burn::nn::RotaryEncoding` has no fused path. **If RoPE is
 ever wired into the attention arm, do not throw the kernel away** — take burn-nn's frequency
 table, YaRN scaling and test discipline, and keep `rope_cuda.rs`'s two kernels. Because
-`burn-rope` currently has **zero call sites**, the decision is free today: delete 975 lines of
+`dormouse-rope` currently has **zero call sites**, the decision is free today: delete 975 lines of
 unverifiable frequency math, and if the kernel is ever needed, recover it from git.
 
 ---
@@ -158,7 +158,7 @@ ever wired a test to it.
 
 ---
 
-#### `burn-kda` — 1232 LOC, **WIRED (2 call sites, the only attention arm)** — **REFERENCE**
+#### `dormouse-kda` — 1232 LOC, **WIRED (2 call sites, the only attention arm)** — **REFERENCE**
 
 1. **External implementation?** **Yes, and it is the strongest artifact found in this whole
    pass.** `MoonshotAI/FlashKDA` (1263★, Cuda) — *"FlashKDA: high-performance Kimi Delta
@@ -181,7 +181,7 @@ ever wired a test to it.
    forward-only.** Every single file is `fwd*` — `fwd_kernel1.cuh`, `fwd_kernel2.cuh`,
    `benchmarks/bench_fwd.py`, `tests/test_fwd.py`, `tests/test_fwd_full.py`. The README says
    to call `chunk_kda` under `torch.inference_mode()`. **There is no backward kernel**, and
-   `burn-kda` is wired into the *training* loop. FlashKDA could never be our training kernel.
+   `dormouse-kda` is wired into the *training* loop. FlashKDA could never be our training kernel.
 3. **Better reference?** **Yes, and this is the headline of the report.** FlashKDA ships
    `tests/torch_ref.py` (10 KB, opened) — a PyTorch reference written *specifically to match
    the kernel bit-for-bit*. It reproduces the warp-shuffle tree-reduction order
@@ -193,7 +193,7 @@ ever wired a test to it.
 
 ---
 
-#### `burn-gdn2` — 2219 src + 3296 test LOC, **WIRED as burn-kda's engine** — **REFERENCE**
+#### `dormouse-gdn2` — 2219 src + 3296 test LOC, **WIRED as dormouse-kda's engine** — **REFERENCE**
 
 1. **External implementation?** **Yes, official, and already half-used.**
    `NVlabs/GatedDeltaNet-2` (opened: README + full trees API) — *"Official PyTorch
@@ -219,7 +219,7 @@ ever wired a test to it.
 
 ---
 
-#### `burn-engram` — 586 LOC, **WIRED (1 call site)** — **REFERENCE**
+#### `dormouse-engram` — 586 LOC, **WIRED (1 call site)** — **REFERENCE**
 
 1. **External implementation?** **Yes, official, but thin.** `deepseek-ai/Engram` (4701★,
    opened: README + trees API + `engram_demo_v1.py`). 10 files, 2 MB — README, `Engram_paper.pdf`,
@@ -241,7 +241,7 @@ ever wired a test to it.
 
 ---
 
-#### `burn-dspark` — 865 LOC, **WIRED (2 call sites)** — **REFERENCE**
+#### `dormouse-dspark` — 865 LOC, **WIRED (2 call sites)** — **REFERENCE**
 
 1. **External implementation?** **Yes, official, and full-stack.**
    `deepseek-ai/DeepSpec` (7167★, Python) — *"DeepSpec: a full-stack codebase for training
@@ -261,7 +261,7 @@ ever wired a test to it.
 
 ---
 
-#### `burn-mhc` — 1011 LOC, **zero call sites** — **REFERENCE**
+#### `dormouse-mhc` — 1011 LOC, **zero call sites** — **REFERENCE**
 
 1. **External implementation?** **Yes — I nearly concluded otherwise, and was wrong.** I
    checked the obvious places and found nothing: `deepseek-ai`'s 39-repo listing has no mHC
@@ -284,7 +284,7 @@ ever wired a test to it.
    CUDA ≥12.9, PyTorch ≥2.3, CUTLASS ≥4.0, C++20. **sm_120 is not in that set** — this is the
    exact wall our stack hits elsewhere (no tcgen05/TMEM/WGMMA). So: not a runtime candidate,
    ever, on this box.
-3. **Better reference?** **Yes, and it closes a real hole.** Per the inventory, burn-mhc is
+3. **Better reference?** **Yes, and it closes a real hole.** Per the inventory, dormouse-mhc is
    "IMPLEMENTED-UNUSED — best verified, zero used", i.e. verified against hand-written
    formula assertions. It has *no* external oracle today. `ref_mhc.py` plus
    `hyperconnection.hpp` is DeepSeek's own reference for the mechanism, including the
@@ -293,7 +293,7 @@ ever wired a test to it.
 
 ---
 
-#### `burn-bitnet` — 1437 LOC, **WIRED (3 direct + 5 indirect)** — **REFERENCE**
+#### `dormouse-bitnet` — 1437 LOC, **WIRED (3 direct + 5 indirect)** — **REFERENCE**
 
 1. **External implementation?** **Yes, official, and unusually well-suited as an oracle.**
    `microsoft/BitNet` (40347★, C++) — *"Official inference framework for 1-bit LLMs"*, opened
@@ -316,7 +316,7 @@ ever wired a test to it.
 
 ---
 
-#### `burn-sct` — 2738 src + 259 test LOC, **zero call sites, SUPERSEDED by burn-spectral** — **REFERENCE**
+#### `dormouse-sct` — 2738 src + 259 test LOC, **zero call sites, SUPERSEDED by dormouse-spectral** — **REFERENCE**
 
 1. **External implementation?** **Yes, official.** `EctoSpace/SCT` — the URL in arXiv 2604.00733's
    own comment field ("Code at https://github.com/EctoSpace/SCT"). Opened: 44 files, 4.1 MB;
@@ -327,7 +327,7 @@ ever wired a test to it.
 2. **Can it run on our stack?** No — Python/PyTorch, built around a full nanoGPT-scale
    training codebase.
 3. **Better reference?** **Yes, and the crate is already aiming at it.**
-   `burn-sct/tests/cmp_reference.rs` exists; the upgrade is to point it at the authors'
+   `dormouse-sct/tests/cmp_reference.rs` exists; the upgrade is to point it at the authors'
    `spectral_layer.py` rather than our own transcription.
 4. **Verdict: REFERENCE** (for the oracle) — but note the crate itself is superseded: with
    EctoSpace/SCT existing, the `DELETE` condition ("nothing external exists") does not hold,
@@ -336,7 +336,7 @@ ever wired a test to it.
 
 ---
 
-#### `burn-jepa` — 443 LOC, **WIRED (1 call site; 1/3 of the crate unwired)** — **REFERENCE**
+#### `dormouse-jepa` — 443 LOC, **WIRED (1 call site; 1/3 of the crate unwired)** — **REFERENCE**
 
 1. **External implementation?** **Split.**
    - **KoLeo (2304.07193):** `facebookresearch/dinov2` (13377★) exists — probed and confirmed
@@ -351,7 +351,7 @@ ever wired a test to it.
 2. **Can it run on our stack?** No — all Python.
 3. **Better reference?** For KoLeo, yes and cheaply: DINOv2's loss is a dozen lines. For
    data2vec 2.0, **NOT VERIFIED** — see above. Note the inventory's own better finding:
-   `burn-jepa/src/losses.rs` documents three reproducible backend landmines and that is worth
+   `dormouse-jepa/src/losses.rs` documents three reproducible backend landmines and that is worth
    more than an oracle.
 4. **Verdict: REFERENCE**, with the data2vec leg explicitly unverified.
 
@@ -376,7 +376,7 @@ ever wired a test to it.
 
 ---
 
-#### `burn-eggroll` — 327 LOC, **zero call sites** — **REFERENCE**
+#### `dormouse-eggroll` — 327 LOC, **zero call sites** — **REFERENCE**
 
 1. **External implementation?** **Yes, official.** arXiv 2511.16652's comment gives only
    "Website at https://eshyperscale.github.io/", so I followed that (opened). It links
@@ -384,10 +384,10 @@ ever wired a test to it.
    at the Hyperscale"*, probed live) and `ESHyperscale/nano-egg` (184★). Both confirmed.
 2. **Can it run on our stack?** No — JAX.
 3. **Better reference?** **Yes, and it settles a documented open question in our own code.**
-   The normalising constant is exactly where our two ES crates disagree: `burn-eggroll`'s
-   doc says the paper uses the normalised `(σ/√r)·A·Bᵀ` (entry std ≈ σ), while `burn-es`'s doc
+   The normalising constant is exactly where our two ES crates disagree: `dormouse-eggroll`'s
+   doc says the paper uses the normalised `(σ/√r)·A·Bᵀ` (entry std ≈ σ), while `dormouse-es`'s doc
    says its own convenience `eggroll_mutate` "scales as `σ·A·Bᵀ` (entry std ≈ σ·√rank)" and
-   tells the reader to prefer `burn-eggroll` for real ES loops. **That is an unresolved
+   tells the reader to prefer `dormouse-eggroll` for real ES loops. **That is an unresolved
    factor-of-√r between two of our crates, and the authors' source settles it.**
 4. **Verdict: REFERENCE** — read the source, settle the σ convention, delete one of the two.
 
@@ -401,7 +401,7 @@ library is better".
 
 ---
 
-#### `burn-attnres` — 2060 LOC, **zero call sites, BROKEN** — **PORT-STANDS**
+#### `dormouse-attnres` — 2060 LOC, **zero call sites, BROKEN** — **PORT-STANDS**
 
 1. **External implementation? NO — and this is verified, not assumed.** `MoonshotAI/Attention-Residuals`
    (3516★, the paper's own org, the highest-starred repo in this entire pass) contains
@@ -422,7 +422,7 @@ library is better".
 
 ---
 
-#### `burn-mor` — 744 LOC, **WIRED (3 call sites), BROKEN** — **PORT-STANDS**
+#### `dormouse-mor` — 744 LOC, **WIRED (3 call sites), BROKEN** — **PORT-STANDS**
 
 1. **External implementation?** **Yes, official** — `raymin0223/mixture_of_recursions`, named
    in arXiv 2507.10524's own comment ("codes at https://github.com/raymin0223/mixture_of_recursions")
@@ -446,7 +446,7 @@ library is better".
 
 ---
 
-#### `burn-muon-plus` — 1055 src + 327 test LOC, **WIRED (4 call sites), the default optimizer** — **PORT-STANDS**
+#### `dormouse-muon-plus` — 1055 src + 327 test LOC, **WIRED (4 call sites), the default optimizer** — **PORT-STANDS**
 
 1. **External implementation?** **Yes, official.** `K1seki221/MuonPlus`, named in the paper
    body itself (2602.21545: "We provide our code here: https://github.com/K1seki221/MuonPlus"),
@@ -469,7 +469,7 @@ library is better".
 
 ---
 
-#### `burn-spectral` — 6172 src LOC (the largest crate), **WIRED 22×, BROKEN** — **PORT-STANDS**
+#### `dormouse-spectral` — 6172 src LOC (the largest crate), **WIRED 22×, BROKEN** — **PORT-STANDS**
 
 1. **External implementation?** **Yes** — `EctoSpace/SCT`, same repo as above, the paper's own
    named code link. Python.
@@ -494,7 +494,7 @@ library is better".
 
 ---
 
-#### `burn-situ` — 675 LOC, **zero call sites** — **PORT-STANDS** (no upstream code exists)
+#### `dormouse-situ` — 675 LOC, **zero call sites** — **PORT-STANDS** (no upstream code exists)
 
 1. **External implementation? NO — verified.** SiTU-GLU is from Kimi K3 (2607.24653), and
    `MoonshotAI/Kimi-K3` (8863★) contains **4 files, 1.9 MB: `LICENSE`, `README.md`,
@@ -509,7 +509,7 @@ library is better".
 
 ---
 
-#### `burn-parcae` — 317 LOC, **zero call sites** — **PORT-STANDS**
+#### `dormouse-parcae` — 317 LOC, **zero call sites** — **PORT-STANDS**
 
 1. **External implementation?** **Yes, official, and unusually well-packaged.**
    `SandyResearch/parcae` (opened; project page `sandyresearch.github.io/parcae` and
@@ -581,11 +581,11 @@ external already covers it, or a sibling crate supersedes it. Total **1,640 src 
 
 | crate | LOC | why DELETE | external check |
 |---|---|---|---|
-| `burn-swiglu` | 187 | Zero wiring, and `loop_block.rs:317-321` already implements the gate inline — TSCT/`LinearLike`-aware, so `burn::nn::activation::SwiGlu` (151 lines, present in burn-nn, semantics identical) is *not* a drop-in. The crate holds plain `burn::nn::Linear`, a pre-`LinearLike` leftover. Its 2 tests are shape-only and its kernel never launches. | `burn::nn::activation::SwiGlu` covers the semantics. 2002.05202 has no better code. |
-| `burn-mod` | 411 | Zero wiring. The inventory: **"DUPLICATE-OF burn-mor"** — top-k token selection + gather/scatter is the same code. Only `ModPredictor` is unique, and nothing calls it. | arXiv 2404.02258's comment field is **empty**; I found no official Google DeepMind MoD repo (`google-research/t5x` exists, 3000★, but I did not open it for MoD — **NOT VERIFIED** whether MoD code ships in T5X). Nothing to defer to. |
+| `dormouse-swiglu` | 187 | Zero wiring, and `loop_block.rs:317-321` already implements the gate inline — TSCT/`LinearLike`-aware, so `burn::nn::activation::SwiGlu` (151 lines, present in burn-nn, semantics identical) is *not* a drop-in. The crate holds plain `burn::nn::Linear`, a pre-`LinearLike` leftover. Its 2 tests are shape-only and its kernel never launches. | `burn::nn::activation::SwiGlu` covers the semantics. 2002.05202 has no better code. |
+| `burn-mod` | 411 | Zero wiring. The inventory: **"DUPLICATE-OF dormouse-mor"** — top-k token selection + gather/scatter is the same code. Only `ModPredictor` is unique, and nothing calls it. | arXiv 2404.02258's comment field is **empty**; I found no official Google DeepMind MoD repo (`google-research/t5x` exists, 3000★, but I did not open it for MoD — **NOT VERIFIED** whether MoD code ships in T5X). Nothing to defer to. |
 | `burn-mtp` | 196 | Zero wiring. `AGENTS.md` states it outright: replaced by DSpark. | arXiv 2404.19737 (Gloeckle et al.) comment is **empty**; no official release. The mechanism is superseded internally. |
-| `burn-ptrn` | 399 | Zero wiring, post-training-only per the inventory, and **the crate is 399 lines of noise-injection + argmax-over-K**, which is the whole content of the paper. | arXiv 2605.19943's comment is **empty**. GitHub search returned exactly one hit: `JerMa88/PTRM`, **1 star, a Jupyter notebook** — not a credible reference. If we ever want PTRN, the ~20 lines it would take to write are cheaper than maintaining 399. |
-| `burn-es` | 345 | Zero wiring. **Self-declared duplicate**: its own doc comment says burn-eggroll "implements the paper's normalized form ... **Prefer burn-eggroll for real ES loops**; the function here stays for quick experiments and its test." | arXiv 1703.03864 (OpenAI ES) comment is **empty**; OpenAI never released code. See the `burn-eggroll` row: the source settles the σ convention, then delete this one. |
+| `dormouse-ptrn` | 399 | Zero wiring, post-training-only per the inventory, and **the crate is 399 lines of noise-injection + argmax-over-K**, which is the whole content of the paper. | arXiv 2605.19943's comment is **empty**. GitHub search returned exactly one hit: `JerMa88/PTRM`, **1 star, a Jupyter notebook** — not a credible reference. If we ever want PTRN, the ~20 lines it would take to write are cheaper than maintaining 399. |
+| `dormouse-es` | 345 | Zero wiring. **Self-declared duplicate**: its own doc comment says dormouse-eggroll "implements the paper's normalized form ... **Prefer dormouse-eggroll for real ES loops**; the function here stays for quick experiments and its test." | arXiv 1703.03864 (OpenAI ES) comment is **empty**; OpenAI never released code. See the `dormouse-eggroll` row: the source settles the σ convention, then delete this one. |
 | `burn-nope` | 102 | Zero wiring. One function. The inventory: the premise is contradicted (AGENTS.md: *"NoPE → endless generation after post-training"*, and RoPE is required in the attention arm). | **Verified: no upstream code exists** — `MoonshotAI/Kimi-K3` is 4 files, PDF only. Nothing to defer to *or* to check against. 102 lines of un-callable, unverifiable code. |
 
 ---
@@ -608,7 +608,7 @@ CPU optimal-transport solvers with no bearing on a fused GPU Birkhoff projection
 
 ---
 
-**#1 — `burn-rmsnorm` → `burn::nn::RmsNorm`** (already a dependency)
+**#1 — `dormouse-rmsnorm` → `burn::nn::RmsNorm`** (already a dependency)
 
 | | |
 |---|---|
@@ -619,13 +619,13 @@ CPU optimal-transport solvers with no bearing on a fused GPU Birkhoff projection
 | speed | **0** — and honestly so. The fused kernel cannot run: it is gated on `TypeId::of::<Inner>() == TypeId::of::<CudaBare>()` and the trainer is `Autodiff<Cuda, BalancedCheckpointing>`. This adopt trades a fusion that never fires for a dependency we already pay for. |
 | risk of the swap | **Cleared, not assumed.** `burn-core-0.22.0-pre.4/src/module/param/tensor.rs:129-133` — `Param::from_tensor` wraps with `set_require_grad(value, true)`, and `set_require_grad` is a documented no-op on non-autodiff devices (`base.rs:244`). burn-core's own `test_module_val_train_stateful` asserts the behaviour. |
 
-**#2 — `burn-rope` → `burn::nn::RotaryEncoding`** (already a dependency)
+**#2 — `dormouse-rope` → `burn::nn::RotaryEncoding`** (already a dependency)
 
 | | |
 |---|---|
 | LOC deleted | **975** |
 | call sites to change | **0** — the crate is unwired, so this is a pure delete |
-| dependency edges removed | 0 from our crates (it was a dev-dep of `burn-spectral`, used by one example) |
+| dependency edges removed | 0 from our crates (it was a dev-dep of `dormouse-spectral`, used by one example) |
 | correctness risk removed | 975 lines of frequency math that **once shipped an inverted YaRN ramp with a green test suite** (the inventory's own quote: an f32 `cos` collapses to 1.0 below ~3e-4 rad, so an `acos∘cos` round-trip in the verification itself lies). That is the library's only admitted precision-bug-shipped-green, and it is in the code we would be deleting. |
 | speed | **0 today**; the fused `rope_autodiff` op has **no external equivalent** (`burn::nn::RotaryEncoding` has no fused path) and no matmul, so it is immune to all three of our precision blockers. **If RoPE is ever wired, keep `rope_cuda.rs`'s two kernels and take only the frequency table, YaRN scaling and tests from burn-nn.** |
 | feature coverage | YaRN is **subsumed by an upstream API**: `RotaryEncodingConfig::init_with_frequency_scaling(f)` exists specifically to plug in RoPE extensions. |
@@ -639,17 +639,17 @@ subsumed**, so neither list costs us a running behaviour.
 ## 4. RANKED LIST OF ORACLE UPGRADES
 
 The flagship claim is "bit-for-bit against the reference implementation". Per the inventory's
-own cross-cutting note: *"Zero bit-for-bit reference harnesses"* outside `burn-gdn2`, and
+own cross-cutting note: *"Zero bit-for-bit reference harnesses"* outside `dormouse-gdn2`, and
 *"the closest are hand-transcribed formula assertions"*. So today that claim, applied to
-`burn-kda`, `burn-engram`, `burn-dspark`, `burn-mhc`, `burn-sct`, `burn-bitnet` and
-`burn-jepa`, means **bit-for-bit against our own transcription** — a much weaker statement,
+`dormouse-kda`, `dormouse-engram`, `dormouse-dspark`, `dormouse-mhc`, `dormouse-sct`, `dormouse-bitnet` and
+`dormouse-jepa`, means **bit-for-bit against our own transcription** — a much weaker statement,
 because a transcription error is symmetric: we get the same wrong answer from both sides of
 the comparison and the test goes green. Eight of these upgrades have the authors' own source
 available. Ranked by fidelity gained per unit of cost:
 
 ---
 
-**#1 — `burn-kda` → `MoonshotAI/FlashKDA` `tests/torch_ref.py`** (fidelity gained: enormous; cost: lowest)
+**#1 — `dormouse-kda` → `MoonshotAI/FlashKDA` `tests/torch_ref.py`** (fidelity gained: enormous; cost: lowest)
 
 The strongest artifact found in this pass. Opened, and it is a PyTorch reference written
 *specifically to match the kernel bit-for-bit*: it reproduces the kernel's warp-shuffle
@@ -659,7 +659,7 @@ sigmoid. That is not a reference PyTorch; that is a **bit-matching** one.
 
 - **What we compare against today:** a hand transcription of arXiv 2510.26692/2607.24653 plus
   our own recurrent-vs-chunk self-consistency. The inventory lists no parity harness for
-  `burn-kda`'s fused path (and notes it is dead anyway behind the
+  `dormouse-kda`'s fused path (and notes it is dead anyway behind the
   `Autodiff<Cuda, Balanced>` TypeId gate).
 - **Cost:** strip the single `load_inline` CUDA sigmoid helper (replace with
   `torch.sigmoid`), run on **CPU** — no GPU, no CUDA, no sidecar — emit ~10 tensors per
@@ -667,18 +667,18 @@ sigmoid. That is not a reference PyTorch; that is a **bit-matching** one.
 - **Bonus, free:** `docs/20260420-flashkda-v1-deep-dive.md` answers the design questions our
   port had to guess at — why `CHUNK = 16` (bf16 range of `exp(cumsum(g))` at the `g_min = -5`
   floor), why a 16×16 inversion by forward substitution, and the SM80 MMA path. Our
-  `AGENTS.md` says "FlashKDA math already matches burn-kda"; this doc is where that claim can
+  `AGENTS.md` says "FlashKDA math already matches dormouse-kda"; this doc is where that claim can
   be checked instead of asserted.
 - **Limit, stated:** FlashKDA is **forward-only**, so this covers the forward recurrence and
-  **not** the backward — which is the part `burn-kda` is actually wired for. The backward
+  **not** the backward — which is the part `dormouse-kda` is actually wired for. The backward
   remains un-orphaned. Honest accounting.
 
 ---
 
-**#2 — `burn-mhc` → `deepseek-ai/DeepGEMM` `third-party/tilelang_ops/ref_mhc.py` + `csrc/apis/hyperconnection.hpp`** (fidelity gained: from *nothing* to official; cost: low)
+**#2 — `dormouse-mhc` → `deepseek-ai/DeepGEMM` `third-party/tilelang_ops/ref_mhc.py` + `csrc/apis/hyperconnection.hpp`** (fidelity gained: from *nothing* to official; cost: low)
 
 - **What we compare against today:** hand-written formula assertions. The inventory calls
-  burn-mhc "best verified" among the unwired crates, but "verified" here means verified
+  dormouse-mhc "best verified" among the unwired crates, but "verified" here means verified
   against **our own reading of the paper** — this crate currently has **no external oracle
   whatsoever**. It is the only live crate in the library with none.
 - **Why I nearly missed it:** DeepSeek has no mHC repo, and I grepped
@@ -696,7 +696,7 @@ sigmoid. That is not a reference PyTorch; that is a **bit-matching** one.
 
 ---
 
-**#3 — `burn-dspark` → `deepseek-ai/DeepSpec` `deepspec/modeling/dspark/{loss.py, markov_head.py, common.py}`** (fidelity gained: turns a claim into a test; cost: low-medium)
+**#3 — `dormouse-dspark` → `deepseek-ai/DeepSpec` `deepspec/modeling/dspark/{loss.py, markov_head.py, common.py}`** (fidelity gained: turns a claim into a test; cost: low-medium)
 
 - **What we compare against today:** nothing. The crate's doc comment says "matched against
   the official DeepSpec implementation" and quotes Eq. 9-12 — that is a **claim with no test
@@ -713,7 +713,7 @@ sigmoid. That is not a reference PyTorch; that is a **bit-matching** one.
 
 ---
 
-**#4 — `burn-gdn2` → `NVlabs/GatedDeltaNet-2` `lit_gpt/gdn2_ops/{chunk_gdn2.py, fused_recurrent_gdn2.py}`** (fidelity gained: closes the last indirection; cost: **lowest of all** — the harness already exists)
+**#4 — `dormouse-gdn2` → `NVlabs/GatedDeltaNet-2` `lit_gpt/gdn2_ops/{chunk_gdn2.py, fused_recurrent_gdn2.py}`** (fidelity gained: closes the last indirection; cost: **lowest of all** — the harness already exists)
 
 The **only** crate in the library with a real bit-exact harness, so the marginal cost is the
 smallest available: `tests/gen_reference.py` already emits 1000 cases into
@@ -728,7 +728,7 @@ cites only the repo.
 
 ---
 
-**#5 — `burn-engram` → `deepseek-ai/Engram` `engram_demo_v1.py`** (fidelity gained: high; cost: medium — needs a tokenizer)
+**#5 — `dormouse-engram` → `deepseek-ai/Engram` `engram_demo_v1.py`** (fidelity gained: high; cost: medium — needs a tokenizer)
 
 The official Engram module implementation, opened and confirmed real (the file's own
 disclaimer scopes out attention/MoE/hyper-connections and keeps exactly the part we ported).
@@ -741,16 +741,16 @@ a third thing with no oracle.
 
 ---
 
-**#6 — `burn-sct` / `burn-spectral` → `EctoSpace/SCT` `spectral_compact_training/spectral_layer.py`** (fidelity gained: medium; cost: low)
+**#6 — `dormouse-sct` / `dormouse-spectral` → `EctoSpace/SCT` `spectral_compact_training/spectral_layer.py`** (fidelity gained: medium; cost: low)
 
-`burn-sct/tests/cmp_reference.rs` already exists — repoint it at the authors' file rather than
+`dormouse-sct/tests/cmp_reference.rs` already exists — repoint it at the authors' file rather than
 our transcription. The paper's own comment field names the repo, so there is no discovery
 cost. Note the repo also ships a convergence report, a rank sweep, and **SteamDeck** results,
 which is the closest published precedent to our 16 GB consumer box.
 
 ---
 
-**#7 — `burn-bitnet` → `microsoft/BitNet` `gpu/model.py` + `AAzdi/Sparse-BitNet` `llm/arch/model.py`** (fidelity gained: medium; cost: low)
+**#7 — `dormouse-bitnet` → `microsoft/BitNet` `gpu/model.py` + `AAzdi/Sparse-BitNet` `llm/arch/model.py`** (fidelity gained: medium; cost: low)
 
 `gpu/model.py` is the official b1.58 PyTorch reference; `Sparse-BitNet` is the official code
 for the 2603.05168 N:M half our crate claims (confirmed by README: "N:M Structured Sparsity",
@@ -760,11 +760,11 @@ implementations are **inference-only**, so this is a forward-path oracle and not
 
 ---
 
-**#8 — `burn-eggroll` → `ESHyperscale/HyperscaleES`** (fidelity gained: settles a live disagreement; cost: near-zero)
+**#8 — `dormouse-eggroll` → `ESHyperscale/HyperscaleES`** (fidelity gained: settles a live disagreement; cost: near-zero)
 
 375★, Jax, reached from the arXiv comment's website link. Its value is not parity — it is
-**settling a factor-of-√r between two of our own crates**: `burn-eggroll` uses the paper's
-normalised `(σ/√r)·A·Bᵀ`, `burn-es` documents its own as `σ·A·Bᵀ` and defers. Read the
+**settling a factor-of-√r between two of our own crates**: `dormouse-eggroll` uses the paper's
+normalised `(σ/√r)·A·Bᵀ`, `dormouse-es` documents its own as `σ·A·Bᵀ` and defers. Read the
 source, pick one, delete the other.
 
 ---
@@ -777,7 +777,7 @@ inventory, Engram supersedes it on both addressing axes and the trainer uses nei
 
 ---
 
-**#10 — `burn-jepa` → `facebookresearch/dinov2` for KoLeo** (fidelity gained: low; cost: lowest)
+**#10 — `dormouse-jepa` → `facebookresearch/dinov2` for KoLeo** (fidelity gained: low; cost: lowest)
 
 KoLeo's `koleo_loss` in DINOv2 is a dozen lines and our port is already faithful. Listed for
 completeness. **The data2vec-2.0 leg is NOT VERIFIED** — see §5.
@@ -792,29 +792,29 @@ Stated plainly rather than papered over.
    `.../data2vec-2.0` and `.../data2vec2` **all 404** through the GitHub API, and the arXiv
    comment field is empty. `facebookresearch/fairseq` (32219★, live) is the historical home of
    data2vec 1.0, but **I did not open its data2vec module** to check for 2.0. So
-   `burn-jepa`'s JEPA leg has no confirmed oracle. This is the largest open gap in §4.
+   `dormouse-jepa`'s JEPA leg has no confirmed oracle. This is the largest open gap in §4.
 2. **Mixture-of-Depths (2404.02258): no official Google DeepMind repo found.** The arXiv
    comment is empty and my GitHub search returned nothing. `google-research/t5x` (3000★) exists
    and I did not open it for MoD. A well-known MoD implementation is widely believed to live in
    T5X/JAX — **I did not verify that, so I am not asserting it.** This is why `burn-mod` is
    filed `DELETE` on duplicate-within-our-library grounds rather than on "no external exists":
    if an external *does* exist, the delete is still right (the crate is a duplicate of
-   `burn-mor` and unwired), but the *reason* would change.
+   `dormouse-mor` and unwired), but the *reason* would change.
 3. **`burn-byteflow` (2603.03583) and FastBLT (2605.08044): absence of code NOT VERIFIED.**
    Both arXiv comments are empty; my GitHub repository search returned `total_count 0` for
    both. I treat that as "I could not find it", not "it does not exist" — this environment's
    GitHub search API is demonstrably weak on full-text (it also returned 0 for `data2vec`).
-   `burn-ptrn` (2605.19943) is the same shape of answer, with the added detail that the only
+   `dormouse-ptrn` (2605.19943) is the same shape of answer, with the added detail that the only
    hit was a **1-star Jupyter notebook**, which is not a credible reference either way.
-4. **`burn-mor` is wired 3× and does not compile** (`E0599: no method named int` ×2 in
+4. **`dormouse-mor` is wired 3× and does not compile** (`E0599: no method named int` ×2 in
    `src/topk_gather.rs`, per the inventory). I did not run a build to confirm. If true, this
    is the most urgent item in this report and it is not an adopt/port question at all.
 5. **The Muon+ counter-result is reported, not reproduced.** `modded-nanogpt` discussion #239
    claims `col_row` Muon+ *increased* loss by ~0.005 in their setup. I read the thread; I did
-   not run it. Since `burn-muon-plus` is our **default optimizer** at 4 call sites, this is
+   not run it. Since `dormouse-muon-plus` is our **default optimizer** at 4 call sites, this is
    worth a 20-minute check on our own box before we trust the port's `ns_steps = 8` /
    `ColRow` defaults — the paper says 8, the repo's configs say 5.
-6. **`burn-spectral` cites 7 papers; I verified 5 individually** (2604.00733, 2504.12285,
+6. **`dormouse-spectral` cites 7 papers; I verified 5 individually** (2604.00733, 2504.12285,
    2504.18415, 2603.05168, 2602.21545) plus 2412.04787 and 2202.09368 in the final batch —
    all seven real. I did not re-derive which of them the crate's *code* actually implements.
 7. **I did not verify the FLA Blackwell issues** (#945/#953 corruption, #999/#1000 hangs) or
@@ -869,7 +869,7 @@ grepped), `deepseek-ai` org listing (39 repos), `MoonshotAI` org listing (43 rep
 `microsoft/BitNet` @ `main` README (binary layout; tree opened instead).
 
 **Our own source read for this pass:** `vendor/dormouse-fused/crates/*/src/lib.rs` doc comments
-(all 28), all 28 `Cargo.toml` dependency blocks, `burn-kda`'s and `burn-gdn2`'s test harnesses
+(all 28), all 28 `Cargo.toml` dependency blocks, `dormouse-kda`'s and `dormouse-gdn2`'s test harnesses
 (`tests/gen_reference.py`, `tests/ref_data.bin` 7.1 MB, `tests/bit_exact.rs`),
 `crates/*/Cargo.toml`, and the `use burn_*` reference counts over `crates/*/src`.
 Local registry sources: `burn-nn-0.22.0-pre.4/src/{modules/norm/rms.rs,

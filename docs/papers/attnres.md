@@ -1,4 +1,4 @@
-# Attention Residuals (arXiv:2603.15031) vs `vendor/dormouse-fused/crates/burn-attnres/`
+# Attention Residuals (arXiv:2603.15031) vs `vendor/dormouse-fused/crates/dormouse-attnres/`
 
 **Scope.** Paper-fidelity audit of one crate. No code was built or run (no GPU on this box, and the
 box is busy). Every "what we do" claim below is read out of the source at the line numbers given; every
@@ -28,7 +28,7 @@ scaled formula.
 | license | CC BY-NC-ND 4.0 |
 | authors' repo | https://github.com/MoonshotAI/Attention-Residuals (default branch `master`, HEAD `85e22310`, 4 commits, 3.5k stars, 205 forks) |
 | date fetched | **2026-09-29** (paper, repo, third-party ports) |
-| crate audited | `vendor/dormouse-fused/crates/burn-attnres/` — `src/lib.rs` (517 lines), `src/fused_attnres.rs` (1821 lines), `README.md`, `benches/attnres.rs` |
+| crate audited | `vendor/dormouse-fused/crates/dormouse-attnres/` — `src/lib.rs` (517 lines), `src/fused_attnres.rs` (1821 lines), `README.md`, `benches/attnres.rs` |
 
 ### Does original source code exist? **No.**
 
@@ -55,7 +55,7 @@ blob assets/training_dynamics.png 186168
 **Therefore the paper is being used as the specification, and there is no executable oracle.** The
 closest thing to a reference implementation is the **22-line PyTorch pseudocode in Fig. 2 of the PDF,
 which is duplicated verbatim in the authors' repo README** (https://github.com/MoonshotAI/Attention-Residuals#pytorch-style-pseudocode).
-That is the only thing `burn-attnres` was ported from, and it is 22 lines of Python with no types,
+That is the only thing `dormouse-attnres` was ported from, and it is 22 lines of Python with no types,
 no shapes beyond comments, and no numerical values.
 
 ### Third-party reimplementations (NOT oracles — independent transcriptions of the same 22 lines)
@@ -239,7 +239,7 @@ into block 0's cell. **Our streaming `BlockAttnRes` violates this** (D5 below).
 
 ## 3. Delta table
 
-`file:line` are in `vendor/dormouse-fused/crates/burn-attnres/`.
+`file:line` are in `vendor/dormouse-fused/crates/dormouse-attnres/`.
 **BUG** = our output is a different function from the paper's on ordinary inputs.
 **BENIGN** = different spelling, same function.
 **PAPER-AMBIGUITY** = the paper contradicts itself; we picked the reading the text supports.
@@ -315,8 +315,8 @@ appropriately labelled as claims-to-be-falsified rather than green tests.
 
 ### 3.3 Severity, in context
 
-`docs/architecture/library-crate-fate.md:62` records `burn-attnres` as fate class **b / REFERENCE**, and
-`crates/burn-attnres/README.md:3`–`:8` states it is **not in the dormouse build** (no incoming edges
+`docs/architecture/library-crate-fate.md:62` records `dormouse-attnres` as fate class **b / REFERENCE**, and
+`crates/dormouse-attnres/README.md:3`–`:8` states it is **not in the dormouse build** (no incoming edges
 from `dormouse-{core,data,train,cli}`; the residual-stream A/B named at `PLAN-minimal-core.md` §M2
 has never been run). So **none of the nine bugs has ever executed inside a training run**, and no
 retraction of a dormouse number follows from this audit. The cost of leaving them is that the crate
@@ -332,7 +332,7 @@ This is the list I was asked not to skip. Ordered by how much it would change an
 
 1. **The Fig. 2 `forward` loop.** Two AttnRes points per transformer layer — `attn_res_proj`/`attn_res_norm`
    before attention, `mlp_res_proj`/`mlp_res_norm` before the MLP — plus the boundary bookkeeping and
-   the `partial_block = None` reset. There is no sublayer loop anywhere in `burn-attnres`; the crate is
+   the `partial_block = None` reset. There is no sublayer loop anywhere in `dormouse-attnres`; the crate is
    5 free functions and 2 structs. This is the *paper's* model, and none of it is here.
 2. **`b_0 = h_1` as a first-class, permanently-attended source** (Eq. 6, §3.2, Table 5 fn 2, Fig. 8).
    Handled only if a caller remembers to pass it, unenforced (D10), and actively destroyed by the
@@ -589,7 +589,7 @@ transcription error.
 * Five formulas match the paper exactly: keys normalised / values raw (D15), joint softmax over all
   sources (D16), the Alg. 1 line-12 online merge algebra (D17), zero-init of `w_l` (D14), the `n == 1`
   short-circuit (D18).
-* `burn-attnres` is **not in the dormouse build** (`crates/burn-attnres/README.md:3`–`:8`,
+* `dormouse-attnres` is **not in the dormouse build** (`crates/dormouse-attnres/README.md:3`–`:8`,
   `docs/architecture/library-crate-fate.md:62`, class **b / REFERENCE**), so none of the nine bugs has ever run in
   training and **no dormouse number is retracted by this audit**.
 
@@ -622,7 +622,7 @@ transcription error.
    if no, delete it and re-point `ref_depth_attend` (`fused_attnres.rs:847`) at the same commit, or the
    deletion is invisible to CI.
 2. Does `BlockAttnRes::step` have any caller that depends on the D5/D6/D7 semantics? It has none in
-   this repo, but the crate is published (`crates.io/crates/burn-attnres`, per its README badge) and the
+   this repo, but the crate is published (`crates.io/crates/dormouse-attnres`, per its README badge) and the
    git history was not walked for external users.
 3. `two_phase_attend` is the only function that tracks Eq. 6 + Alg. 1 reasonably closely, and it is a
    free function with a `[S,d] × [N,d]` signature that does not compose with the crate's `[B,T,D]`

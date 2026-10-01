@@ -391,7 +391,7 @@ change two entries in it without rewriting nine.
   `allow-wildcard-paths = true` does **not** rescue it in a crate that could be
   published (it only applies to `publish = false` crates). Five crates here
   could be published — `dormouse-cli`, `dormouse-core`, `dormouse-train`, and
-  `burn-kda` / `burn-spectral` in the vendored library. The closing recipe is
+  `dormouse-kda` / `dormouse-spectral` in the vendored library. The closing recipe is
   `publish = false` in five `[package]` blocks, which is a statement about this
   repo's release policy and lands in files other lanes are editing, so it is the
   owner's call. Warn-only until then, with the recipe in `deny.toml`.

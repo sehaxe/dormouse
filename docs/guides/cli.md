@@ -58,8 +58,8 @@ a legal resume, changing the objective is not.
 same seed gives 7 951 694 of 7 951 694 non-TSCT slots bit-identical across 9
 processes; different seeds separate by relFro ≈ 1.414. The TSCT factors move
 ≤1.04e-06 relative, entering at `qr_householder`
-(`vendor/dormouse-fused/crates/burn-spectral/src/lib.rs:792`; the `:689` line
-AGENTS.md §3.7 quotes predates the `burn-fused` → `dormouse-fused` rename).
+(`vendor/dormouse-fused/crates/dormouse-spectral/src/lib.rs:792`; the `:689` line
+AGENTS.md §3.7 quotes predates the `dormouse-fused` → `dormouse-fused` rename).
 
 ## Precision and quantization
 

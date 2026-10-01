@@ -1,0 +1,73 @@
+[package]
+name = "dormouse-sct"
+version = "0.1.4"
+edition = "2021"
+license = "MIT"
+description = "Spectral Compact Training - permanent truncated SVD with Stiefel QR retraction for Burn"
+keywords = ["burn", "sct", "spectral", "svd", "low-rank"]
+repository = "https://github.com/sehaxe/burn-sct"
+homepage = "https://github.com/sehaxe/burn-sct"
+readme = "README.md"
+
+[features]
+default = ["std"]
+std = ["burn/std", "burn-tensor/std"]
+serde = ["dep:serde"]
+autodiff = ["burn/autodiff"]
+# `binary-tests` was removed 2026-09-27 with tests/cmp_reference.rs: it gated a
+# harness whose fixture and generator were both absent, so it could only ever
+# report PASS having asserted nothing. See README "Reference comparison".
+cuda = ["dep:burn-cuda", "dep:burn-cubecl", "dep:cubecl", "dep:cubecl-common", "dep:futures-lite", "burn/cuda", "burn-tensor/cuda"]
+
+[dependencies]
+burn = { workspace = true, features = ["extension"] }
+burn-nn = { workspace = true }
+burn-tensor = { workspace = true }
+burn-cuda = { workspace = true, optional = true }
+burn-cubecl = { workspace = true, optional = true }
+cubecl = { workspace = true, optional = true, features = ["std"] }
+cubecl-common = { workspace = true, optional = true }
+futures-lite = { workspace = true, optional = true }
+serde = { workspace = true, optional = true, features = ["derive"] }
+num-traits = { workspace = true }
+
+[dev-dependencies]
+burn-ndarray = { workspace = true, features = ["blas-openblas"] }
+burn = { workspace = true, features = ["ndarray", "autodiff", "cuda", "extension"] }
+
+[[example]]
+name = "bench_gpu"
+required-features = ["cuda"]
+
+[[example]]
+name = "bench_ops"
+required-features = ["cuda"]
+
+[[example]]
+name = "gpu_check"
+required-features = ["cuda"]
+
+[[example]]
+name = "gpu_mm"
+required-features = ["cuda"]
+
+[[example]]
+name = "gpu_svd"
+required-features = ["cuda"]
+
+[[example]]
+name = "gpu_svd2"
+required-features = ["cuda"]
+
+[[example]]
+name = "mm_probe"
+required-features = ["cuda"]
+
+# The one `[[test]]`-worthy file this crate had, and it was the one that was
+# missed: `tests/cuda_retract.rs` is `#![cfg(feature = "cuda")]` with no target,
+# so `cargo test -p dormouse-sct` built it, compiled it away and printed a green
+# `running 0 tests ... ok`. Same rule as 243a003, guarded by
+# `tools/test_targets.py`.
+[[test]]
+name = "cuda_retract"
+required-features = ["cuda"]

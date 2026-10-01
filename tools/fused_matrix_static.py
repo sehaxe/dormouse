@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Static half of the burn-fused quality matrix: LOC, test LOC, markers, doc lies.
+"""Static half of the dormouse-fused quality matrix: LOC, test LOC, markers, doc lies.
 
 Test LOC is brace-matched, not "files that mention #[test]" (that over-counts
 badly: a 100-line module with 3 one-line tests scores 97% test LOC).
@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 
 WS = Path("/home/sehaxe/dormouse/vendor/dormouse-fused")
-CONCURRENT = {"burn-kda", "burn-gdn2", "burn-engram", "burn-mor", "burn-spectral"}
+CONCURRENT = {"dormouse-kda", "dormouse-gdn2", "dormouse-engram", "dormouse-mor", "dormouse-spectral"}
 MARKERS = re.compile(r"\bunimplemented!|\btodo!|\bFIXME\b|\bunreachable!|\bTODO\b")
 
 

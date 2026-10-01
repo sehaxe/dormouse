@@ -45,14 +45,14 @@ curl -sL "https://export.arxiv.org/api/query?id_list=2601.16531"
 ```
 
 Real, single-author, Engram-scoped. The report's core assertion — *neither
-`burn-gdn2` nor `burn-kda` cites it* — I confirmed by grepping both crate trees
+`dormouse-gdn2` nor `dormouse-kda` cites it* — I confirmed by grepping both crate trees
 for any arXiv id. The complete set is:
 
 ```
-burn-gdn2/README.md:10        2605.22791
-burn-kda/src/lib.rs:5         2510.26692
-burn-kda/src/lib.rs:6         2607.24653
-burn-kda/README.md:9-10       (the same two)
+dormouse-gdn2/README.md:10        2605.22791
+dormouse-kda/src/lib.rs:5         2510.26692
+dormouse-kda/src/lib.rs:6         2607.24653
+dormouse-kda/README.md:9-10       (the same two)
 ```
 
 Five occurrences repo-wide, all on the Engram line, all used as a slot-saturation
@@ -113,7 +113,7 @@ else:
 **`zeros` is exactly the K3-aligned branch.** FlashKDA
 (`tests/torch_ref.py:161-165`) takes `A_log`/`dt_bias` as arguments and asserts
 `A_log.dtype == torch.float32`. `bench_fwd.py:58` uses `torch.rand(H)`. No `−3`
-anywhere. Every clause of `burn-kda/src/lib.rs:166-170` is unsupported.
+anywhere. Every clause of `dormouse-kda/src/lib.rs:166-170` is unsupported.
 
 **Citation defect: confirmed. This is a real ADR-0020 violation.**
 
@@ -147,7 +147,7 @@ The report never read the one document that records why this value is here.
 > extended the clean window (110+ steps, Muon+, fp32, 0 NaN on 2026-08-29,
 > against 45-127 before).
 
-And `burn-kda/src/lib.rs:188-194` carries the clamp with a dated measurement
+And `dormouse-kda/src/lib.rs:188-194` carries the clamp with a dated measurement
 behind it. So the author chose `−3` and `+1.0` to land `σ ≈ 0.5 → α ≈ 0.08`,
 knew what they were doing, and confirmed it moved the NaN window. The
 **values are a documented stabilisation choice. Only the attribution sentence
@@ -200,7 +200,7 @@ fla/modules/conv/short_conv.py:219   cache = x.new_zeros(N, D, W)
 `ShortConvolution(nn.Conv1d)` never calls `nn.Conv1d.forward`; it dispatches to
 FLA's Triton `causal_conv1d`. Left pad = **zeros**, on prefill and on decode.
 
-Ours (`burn-gdn2/src/short_conv.rs:44-46`) replicates the first token. The
+Ours (`dormouse-gdn2/src/short_conv.rs:44-46`) replicates the first token. The
 report's arithmetic is right: divergence confined to positions 0,1,2; at `T=1`
 the reference gives `y = w₃·x₀` and we give `y = (w₀+w₁+w₂+w₃)·x₀`. I checked
 the weight layout too — tap `i` multiplies `x[t+i]`, which matches
@@ -215,13 +215,13 @@ tools/gen_reference.rs:134   let src = if ti + i < 3 { 0 } else { ti + i - 3 };
 ```
 
 Both transcribe the bug. `gen_reference.py:82-83` even says so: *"replicate
-padding (first token), matching burn-gdn2 (and this repo's reference data)."*
+padding (first token), matching dormouse-gdn2 (and this repo's reference data)."*
 A fixture generated from the implementation cannot find a divergence from the
 implementation.
 
 **Live impact: zero, as the report says.** `crates/dormouse-core/src/attention.rs:68`
 → `use_short_conv: false`, with the reason inline. The crate defaults are still
-`true` (`burn-gdn2/src/config.rs:122`, `burn-kda/src/lib.rs:76`), so the report
+`true` (`dormouse-gdn2/src/config.rs:122`, `dormouse-kda/src/lib.rs:76`), so the report
 is right that the crate would ship a wrong conv to anyone who takes the default.
 
 ---
@@ -234,7 +234,7 @@ GDN-2 App. D.1, verbatim:
 > kernels. This is important because the local cumulative sum
 > `G_r = Σ_{i≤r} g_i` is a path-length-dependent quantity.
 
-`burn-gdn2/src/module.rs:507-516` has no cast anywhere on the decay path:
+`dormouse-gdn2/src/module.rs:507-516` has no cast anywhere on the decay path:
 
 ```rust
 let dt_b = self.dt_bias.val().reshape([1, 1, kd]);
@@ -284,11 +284,11 @@ defect class.
 ### 7. Claim 7 — chunk sizes — VERIFIED
 
 - GDN-2 App. C.2, verbatim: *"The chunk size is fixed to C = 64."*
-  Code: `burn-gdn2/src/config.rs:126` = 64 ✓
+  Code: `dormouse-gdn2/src/config.rs:126` = 64 ✓
 - FlashKDA `tests/torch_ref.py:154`: `CHUNK = 16`.
-  Code: `burn-kda/src/lib.rs:81` = 16 ✓
+  Code: `dormouse-kda/src/lib.rs:81` = 16 ✓
 - `g_min = −5`, verbatim in K3 §2.1.1, corroborated by
-  `bench_fwd.py:35 LOWER_BOUND = -5.0` and `burn-kda/src/lib.rs:26 G_MIN`.
+  `bench_fwd.py:35 LOWER_BOUND = -5.0` and `dormouse-kda/src/lib.rs:26 G_MIN`.
 - The two-crates-two-chunk-sizes point is right and worth making.
 
 ---
@@ -299,7 +299,7 @@ Every one I checked holds. The report is not padding this section.
 
 | row | claim | file:line (verified) | result |
 |---|---|---|---|
-| 8 | `scale = d_k^{-0.5}` | `burn-gdn2/src/module.rs:299` `(hk as f64).powf(-0.5)` | ✅ |
+| 8 | `scale = d_k^{-0.5}` | `dormouse-gdn2/src/module.rs:299` `(hk as f64).powf(-0.5)` | ✅ |
 | 10 | `A_log = log U(1,16)` | `module.rs:206-208` `Uniform(1.0.ln(), 16.0.ln())` | ✅ |
 | 11 | `inv_dt = dt + log(−expm1(−dt))`, `dt~logU(.001,.1)` | `module.rs:212-221`; FLA `kda.py:180-184` is literally the same two lines | ✅ |
 | 12 | conv init `U(−0.5, 0.5)` | `module.rs:202`; `1/√fan_in = 1/2` for fan_in 4 — the comment's non-obvious claim is **correct** | ✅ |
@@ -344,9 +344,9 @@ fla/layers/kda.py:174
 Ours, both crates:
 
 ```
-burn-kda/src/lib.rs:165   b_alpha: Tensor::ones([n_heads * head_dim])   # [H*K]
-burn-kda/src/lib.rs:170   a_log:  Tensor::full([n_heads, 1], -3.0)      # [H, 1]
-burn-gdn2/src/module.rs:207-221   dt_bias [kd = H*HK],  a_log [h]
+dormouse-kda/src/lib.rs:165   b_alpha: Tensor::ones([n_heads * head_dim])   # [H*K]
+dormouse-kda/src/lib.rs:170   a_log:  Tensor::full([n_heads, 1], -3.0)      # [H, 1]
+dormouse-gdn2/src/module.rs:207-221   dt_bias [kd = H*HK],  a_log [h]
 ```
 
 Under GVA (`HV > H`) we allocate `H` log-scales and `H·K` biases where the
@@ -357,25 +357,25 @@ row 33) without noticing the latter is a *shape* difference.
 
 **Blast radius today: zero.** `crates/dormouse-core/src/attention.rs` never
 sets `num_v_heads`, so `hv = h` and `rep = 1`. But both crates ship GVA as a
-headline feature, `burn-gdn2/README.md:132` lists `num_v_heads` as a config
+headline feature, `dormouse-gdn2/README.md:132` lists `num_v_heads` as a config
 knob, and under GVA the "MATCH" on rows 5/33 is wrong.
 
-#### 9.2 `burn-kda` has no upstream-fidelity test at all
+#### 9.2 `dormouse-kda` has no upstream-fidelity test at all
 
-The report criticises `burn-gdn2`'s fixture for being self-consistent. It
-never says that `burn-kda` — **the crate dormouse actually instantiates** —
+The report criticises `dormouse-gdn2`'s fixture for being self-consistent. It
+never says that `dormouse-kda` — **the crate dormouse actually instantiates** —
 has no fixture of any kind:
 
 ```
-find burn-kda -name "*.bin" -o -name "*gold*" -o -name "*fixture*"   → nothing
-find burn-kda -name "gen_reference*"                                 → nothing
-burn-kda/tests/  → bench_cuda.rs cuda_gate.rs fused_cuda.rs ops_grad_cuda.rs
+find dormouse-kda -name "*.bin" -o -name "*gold*" -o -name "*fixture*"   → nothing
+find dormouse-kda -name "gen_reference*"                                 → nothing
+dormouse-kda/tests/  → bench_cuda.rs cuda_gate.rs fused_cuda.rs ops_grad_cuda.rs
 ```
 
 No `ref_data.bin`, no transcription, no upstream comparison. So the two
 defects in this report — the fabricated citation and the inherited conv
 padding — live in the one crate with zero cross-implementation coverage. §7
-spends fourteen paragraphs redesigning `burn-gdn2`'s test strategy and never
+spends fourteen paragraphs redesigning `dormouse-gdn2`'s test strategy and never
 states that the harder problem is the crate with no test at all.
 
 #### 9.3 The comment's "neutral α≈0.5" is an apples-to-oranges baseline
@@ -400,17 +400,17 @@ urgent when neither can currently fire.
 
 #### 9.5 The README table was misread
 
-§8 open question 4 quotes burn-gdn2's README as claiming both *"1000-case
+§8 open question 4 quotes dormouse-gdn2's README as claiming both *"1000-case
 comparison against an independent transcription"* **and** *"Verification: none
-shipped."* It is a two-column table (`burn-gdn2` | `NVlabs reference`); the
+shipped."* It is a two-column table (`dormouse-gdn2` | `NVlabs reference`); the
 right-hand cell belongs to NVIDIA. This mangles the very row the report credits
 in §1.2 as *"exactly the ADR-0020 form. Credit where due."*
 
-#### 9.6 `burn-gdn2` is not the live path
+#### 9.6 `dormouse-gdn2` is not the live path
 
-`crates/dormouse-core/src/attention.rs` builds `burn_kda::KdaModule`, and
-`kda_seam_counts()` is an alias for `burn_gdn2::seam_counts()`. Nothing in
-dormouse instantiates `burn-gdn2`. Twenty-one of the report's delta rows
+`crates/dormouse-core/src/attention.rs` builds `dormouse_kda::KdaModule`, and
+`kda_seam_counts()` is an alias for `dormouse_gdn2::seam_counts()`. Nothing in
+dormouse instantiates `dormouse-gdn2`. Twenty-one of the report's delta rows
 describe a crate that no training run touches — `chunk_size=64`,
 `min_decay`, `allow_neg_eigval`, the whole `ChunkPath` switch. The report never
 says so, and a reader would reasonably come away thinking the chunk-64 default
@@ -464,7 +464,7 @@ sets `num_v_heads`. Nothing in §5.1/§5.3 reaches this — §5.1 lists
   2026-08-29**, i.e. was not adopted *because of* the NaN measurement →
   finding 2 in §3.3 weakens from "deliberate and measured" to "coincidental".
   It would not rescue the citation.
-- **A `KimiConfig`-equivalent in burn-kda that expands `a_log`/`b_alpha` to the
+- **A `KimiConfig`-equivalent in dormouse-kda that expands `a_log`/`b_alpha` to the
   value-head axis when `num_v_heads > num_heads`** → finding 3 is void. I found
   no such code in `lib.rs:165-170` or `module.rs:206-221`.
 - Reproduce the arithmetic:
@@ -473,9 +473,9 @@ sets `num_v_heads`. Nothing in §5.1/§5.3 reaches this — §5.1 lists
   and §3.2 falls.
 
 **Unverified, with the command that would settle it.** Whether the
-hand-derived chunk adjoint in `burn-gdn2/src/autodiff.rs` carries the
+hand-derived chunk adjoint in `dormouse-gdn2/src/autodiff.rs` carries the
 L2-normalization VJP (the report flags this and I concur it is open):
-`cargo test -p burn-gdn2 --features cuda --test fused_adjoint_vs_ops` on a GPU
+`cargo test -p dormouse-gdn2 --features cuda --test fused_adjoint_vs_ops` on a GPU
 box. Out of scope here — no GPU, no build.
 
 ## Reviewer B — Review B — the CODE, not the paper
@@ -513,11 +513,11 @@ and is not a function of `chunk_size` at all.**
 `short_conv_1d` is called in exactly two places, both on the full `[B, T, C]` projection,
 before any reshaping into chunks and before `chunk_size` is read:
 
-- `vendor/dormouse-fused/crates/burn-gdn2/src/module.rs:492-503` — inside `project()`. The
+- `vendor/dormouse-fused/crates/dormouse-gdn2/src/module.rs:492-503` — inside `project()`. The
   conv runs at `:494-499`; `project()` returns at `:566`; the chunk path is not invoked
   until `forward_train_core` calls it at `module.rs:442-452`, i.e. *after* `project()`
   has already returned at `:417`.
-- `vendor/dormouse-fused/crates/burn-kda/src/lib.rs:416-430` — same shape: conv on the full
+- `vendor/dormouse-fused/crates/dormouse-kda/src/lib.rs:416-430` — same shape: conv on the full
   `[B, T, C]` tensor at `:416-430`, `to_4d` only at `:447-449`.
 
 `short_conv_1d` takes no `chunk_size` argument (`short_conv.rs:22-26`). Its left pad is
@@ -553,7 +553,7 @@ extra config, no new code" is true and irrelevant: the test is not the test.
 #### What *would* catch it, and it is one line
 
 `short_conv_1d` has **no direct unit test anywhere** — `grep -rn "short_conv_1d" tests/`
-in `burn-gdn2` returns nothing. The function with the BUG has zero direct coverage. The
+in `dormouse-gdn2` returns nothing. The function with the BUG has zero direct coverage. The
 gate is a direct f64 test on the function with a hand-computed expectation:
 
 - `T=1`, `cache=None`: reference `y = w₃·x₀`; ours `y = (w₀+w₁+w₂+w₃)·x₀`.
@@ -701,7 +701,7 @@ The report computed the `b=0` case and attributed it to `b≈−5`. Concretely, 
 
 `b_alpha` range confirmed from `gen_reference.py:55-59` / `gen_reference.rs:193-201`
 (`dt ~ exp(U(ln0.001, ln0.1))`, `inv_dt = dt + log(−expm1(−dt))` → −6.908 … −2.352);
-`burn-kda` uses `Tensor::ones` at `src/lib.rs:165`.
+`dormouse-kda` uses `Tensor::ones` at `src/lib.rs:165`.
 
 **The consequence is not "they coincide by accident".** Ours starts with 7.7% per-token
 retention; the K3/FLA init starts with 65–99%. The recurrent state underflows to
@@ -725,8 +725,8 @@ regime the code never starts in.
 
 #### 3.3 It is live in dormouse, right now
 
-`crates/dormouse-core/src/attention.rs:60-71` builds `burn_kda::KdaConfig` with
-`..Default::default()`, and `KdaConfig::default()` (`burn-kda/src/lib.rs:68-85`) sets
+`crates/dormouse-core/src/attention.rs:60-71` builds `dormouse_kda::KdaConfig` with
+`..Default::default()`, and `KdaConfig::default()` (`dormouse-kda/src/lib.rs:68-85`) sets
 `decay_fn: DecayFn::Sigmoid` and `g_min: G_MIN`. `KdaDecay::new` then sets
 `a_log = −3.0` (`lib.rs:170`) and `b_alpha = ones` (`lib.rs:165`). **`AdaptiveAttention`
 holds a `KdaModule` (`attention.rs:55`) and that is what `loop_block.rs:384-386` calls.**
@@ -791,7 +791,7 @@ under replicate and `|w₃|` under zero-pad. Over 200k draws the ratio has media
 p90 8.2, p99 80; **30.3% of channels exceed 3×** and 16.9% exceed 5×. With `VD = 96` that
 is ~26–32 value channels at positions 0–2 whose activation is 3× the reference's *at
 initialisation* — and `v` is the one projection that is **not** L2-normalised
-(`module.rs:540-542` normalises q and k only; `burn-kda/src/lib.rs:432-433` likewise), so
+(`module.rs:540-542` normalises q and k only; `dormouse-kda/src/lib.rs:432-433` likewise), so
 it reaches the state unattenuated. **This is a hypothesis, explicitly not a claim** — the
 revert was never bisected and the weights had moved by step 60. It is, however, free to
 test and it would be a shame to re-enable the conv without having checked it.
@@ -806,11 +806,11 @@ dependency and by whether the defect can be observed at all today:
 | order | item | why here |
 |---|---|---|
 | **1** | **the layout bug in `tools/gen_reference.rs`** (`v`, `w_gate` read head-major at `:340`) | nothing else in the fixture is observable until this lands. It owns 976/1000 of the residual and its 24 passing cases are the *only* cases where the padding cancels. Must land first, **and must come with a `ref_data.bin` regeneration**. |
-| **2** | **re-enable the fixture tests** | All three fixture tests are behind `#[cfg(feature = "binary-tests")]` (`bit_exact.rs:150`, `test_chunk.rs:19`, `test_chunk.rs:213`) and `binary-tests` is **not** in `default = ["std"]`** (`Cargo.toml`). `cargo test -p burn-gdn2` runs **zero** of them. This is why nothing caught the padding: not blindness, **absence**. |
+| **2** | **re-enable the fixture tests** | All three fixture tests are behind `#[cfg(feature = "binary-tests")]` (`bit_exact.rs:150`, `test_chunk.rs:19`, `test_chunk.rs:213`) and `binary-tests` is **not** in `default = ["std"]`** (`Cargo.toml`). `cargo test -p dormouse-gdn2` runs **zero** of them. This is why nothing caught the padding: not blindness, **absence**. |
 | **3** | **ungate `test_chunk_matches_fused_with_real_decay`** (`test_chunk.rs:212-262`) | It uses **no fixture** — it is a pure chunk-vs-fused-recurrent comparison on random tensors, asserting `d_out < 1e-4` and `d_state < 1e-4`. The single most valuable recurrence gate in the crate, costing milliseconds on CPU, disabled by a flag whose only purpose is to gate the two fixture tests. **This one needs no step 1 and no step 2** — it is a pure availability fix and could be #0. |
 | **4** | **the short-conv padding** (`short_conv.rs:43-47`, `gen_reference.py:85`, `gen_reference.rs:134`) | real, but **not observable until 1 and 2 land**. Fixing it before 1 changes no test result. |
 | **5** | **the `None` vs `Some(Gdn2State::zeros)` conv-cache inconsistency** (`module.rs:104-119` vs `short_conv.rs:42`) | same root cause as 4, and it is the version of 4 that is provable from this repo alone with no upstream reference. Should be fixed *in the same commit* as 4 — they are the same line of reasoning. |
-| **6** | **the `a_log`/`b_alpha` citation** (`burn-kda/src/lib.rs:166-169`, `AGENTS.md:274, 837-839`) | **independent of 1–5**. Comment-only fix; zero numerical risk; do it whenever. The *value* change is an A/B arm, not this row. |
+| **6** | **the `a_log`/`b_alpha` citation** (`dormouse-kda/src/lib.rs:166-169`, `AGENTS.md:274, 837-839`) | **independent of 1–5**. Comment-only fix; zero numerical risk; do it whenever. The *value* change is an A/B arm, not this row. |
 | **7** | **fp32 decay gate under `--bf16`** (report §5.3 item 1) | latent: only bites under `--bf16`, and it is unanswerable read-only. Real, but the fix belongs in a dtype audit of the `γ = exp(cumsum g)` chain, not in this batch. |
 | **8** | **`tests/autodiff.rs:39` dead loop** (§5.2 below) | one-line fix, no dependency, but low urgency on its own — it becomes valuable the moment `use_short_conv` is re-enabled, because it is currently the crate's *only* conv test. |
 
@@ -819,7 +819,7 @@ dependency and by whether the defect can be observed at all today:
 **The report's "impact today is zero" for the padding is correct** — but its stated reason
 (replicate-vs-zero is numerically small) is the wrong reason, and the stronger reason,
 that both crates' **published defaults** are `use_short_conv: true`
-(`config.rs:122`, `burn-kda/src/lib.rs:76`) and ship the wrong conv to every external
+(`config.rs:122`, `dormouse-kda/src/lib.rs:76`) and ship the wrong conv to every external
 user, is not stated at all.
 
 ---
@@ -940,7 +940,7 @@ fixed:
    matters most, because **K3's central numerical claim is a bf16 claim**: the `(−80, 0)`
    cum-decay over a 16-token tile and the `e^80 < bf16 range` reciprocal argument
    (`gdn-kda.md:212-215`). Both crates compute `g` in the params' dtype
-   (`burn-gdn2/src/module.rs:508-516`; `burn-kda/src/lib.rs:180-201`), so under the
+   (`dormouse-gdn2/src/module.rs:508-516`; `dormouse-kda/src/lib.rs:180-201`), so under the
    trainer's `--bf16` the whole `γ = exp(cumsum g)` chain — and therefore the
    `g_min = −5` lower bound that is otherwise a verified match — is outside the regime the
    paper reasoned about. Following the report in full leaves this exactly where it was,
@@ -967,7 +967,7 @@ Read-only, no build, no GPU.
 
 - **Traced by hand, both branches:** `short_conv.rs:22-64`, `module.rs:104-119`,
   `module.rs:291-292`, `module.rs:346-353`, `module.rs:469-583`,
-  `burn-kda/src/lib.rs:412-449`. Established: conv is upstream of chunking in both
+  `dormouse-kda/src/lib.rs:412-449`. Established: conv is upstream of chunking in both
   crates; `None` and `Some(Gdn2State::zeros)` give different `T=1` answers.
 - **Counted in the environment:** `cargo`-independent greps for `short_conv_1d` in
   `tests/` (0 hits), for `#[cfg(feature = "binary-tests")]` (3 sites), and

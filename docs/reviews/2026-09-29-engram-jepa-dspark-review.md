@@ -254,7 +254,7 @@ The reference ships the Markov-conditioned head **on by a boolean**. Our fix is
 `AcceptRatePredictor::with_markov(d_model, rank, device)` — and `rank` is
 already a parameter of `AuxHeads::new(d_model, vocab, rank, device)`
 (`aux.rs:41`). The panic guards for the other direction already exist
-(`burn-dspark/src/lib.rs:103-115`). This is a constructor argument, not an
+(`dormouse-dspark/src/lib.rs:103-115`). This is a constructor argument, not an
 architecture gap, and the report's severity language does not survive the
 fetch.
 
@@ -339,7 +339,7 @@ normalization** (Ulyanov et al., 2016)."* Table 8 gives the recipe as
 `K (layers to average) 10 / 18 / 32`.
 
 Our code: `losses.rs:11-20` is plain L1 with no normalisation, and
-`grep -rn "normal\|Normal" vendor/dormouse-fused/crates/burn-jepa/src/ crates/dormouse-core/src/aux.rs`
+`grep -rn "normal\|Normal" vendor/dormouse-fused/crates/dormouse-jepa/src/ crates/dormouse-core/src/aux.rs`
 returns **nothing**. Zero normalisation steps on the path, where the paper has
 two or three. **Confirmed, and the largest JEPA delta is real.**
 
@@ -375,7 +375,7 @@ exactly the kind of three-way judgement the other two reports do not attempt.
 | **norm gains** | demo `:148-151,355-356` | **not in the table** | **yes — see §4.1** |
 
 **The bigger miss: a second oracle, of exactly the same kind, exists for DSpark
-and was never opened.** 2607.05147v1 names the repository. `burn-dspark`'s own
+and was never opened.** 2607.05147v1 names the repository. `dormouse-dspark`'s own
 doc comments name three functions inside it — `DeepSpec loss.py`,
 `DeepSpec _compute_accept_rate_3d`, `DeepSpec compute_dspark_loss`. The
 repository is public and complete:
@@ -436,7 +436,7 @@ Also overturned by reading the paper body (30 seconds):
 | E3 short conv + zero-init | BENIGN | **agree** | Eq 5 verbatim; demo does *not* zero-init |
 | E6 hasher | BENIGN | **agree** | `hasher.rs:142-148` vs demo `:285-293` |
 | E7 `min_ngram` permits 1 | BENIGN, unasserted | **agree** | `hasher.rs:89` `assert!(min_ngram >= 1)` |
-| E8 hasher unused | BUG (dead weight) | **agree, and it is worse** | `grep -rn "NgramHasher\|burn_engram::hasher" crates/` → empty |
+| E8 hasher unused | BUG (dead weight) | **agree, and it is worse** | `grep -rn "NgramHasher\|dormouse_engram::hasher" crates/` → empty |
 | E9 `Sec. 2.4 eq. 6` citation | BENIGN, exact | **agree** | §2.4 is "Integration with Multi-branch Architecture"; Eq 6 is there; shared `W_V`, `M` distinct `W_K` verbatim |
 | E11 | BUG | **overturned → wording** | §1 above |
 | E15 4-gram orders | DELIBERATE | **agree** | §6.2: *"slightly suboptimal under a fixed 1.6B budget — likely because it dilutes capacity from the more frequent 2/3-gram patterns — though we do not rule [out]"* |
@@ -463,7 +463,7 @@ self.norm1 = nn.ModuleList([nn.RMSNorm(backbone_config.hidden_size) for _ in ran
 self.norm2 = nn.ModuleList([nn.RMSNorm(backbone_config.hidden_size) for _ in range(hc_mult)]) # :356
 ```
 
-Ours has none. `burn-engram/src/lib.rs:214-236` `compute_gate` is a bare
+Ours has none. `dormouse-engram/src/lib.rs:214-236` `compute_gate` is a bare
 `key / sqrt(mean(key²) + 1e-5)` with no parameter; `lib.rs:199-205` is
 `out / sqrt(out.powf(2).mean_dim(3) + 1e-5)` — also bare. At `hc_mult = 4,
 hidden = 1024` that is **2 × 4 × 1024 = 8 192 learnable parameters removed from
@@ -629,7 +629,7 @@ delta. It survived the report by accident, carried on a wrong premise.
 #### 2. The DSpark oracle was never opened, and it inverts D2 and deflates D9
 
 2607.05147v1 names `github.com/deepseek-ai/DeepSpec`.
-`burn-dspark/src/lib.rs:135,144,158` cites three functions *in it by name*.
+`dormouse-dspark/src/lib.rs:135,144,158` cites three functions *in it by name*.
 `dspark.md` §0 quotes the sentence naming the repo and does not go.
 
 `config/dspark/dspark_qwen3_4b.py`:
@@ -650,7 +650,7 @@ confidence_head_with_markov = True
 - **D9 deflates.** The reference exposes the paper's Eq 7 head as a boolean that
   defaults on. Our fix is `AcceptRatePredictor::with_markov(d_model, rank, device)`
   with `rank` already threaded into `AuxHeads::new`; the reverse-direction
-  panics already exist at `burn-dspark/src/lib.rs:103-115`. It is a
+  panics already exist at `dormouse-dspark/src/lib.rs:103-115`. It is a
   constructor argument, not a missing mechanism.
 - **D9's stated harm is backwards** regardless: the paper's non-anticipation
   argument runs *through* the Markov feature, so removing it is strictly safer
@@ -751,10 +751,10 @@ curl -sSL https://arxiv.org/html/2212.07525v2 | sed 's/<[^>]*>/ /g' \
 # §4.2 — the live addressing path
 grep -n 'bitwise_and_scalar\|next_power_of_two' crates/dormouse-core/src/loop_block.rs
 grep -n 'fnv' crates/dormouse-data/src/lib.rs | head -3
-grep -rn 'NgramHasher\|burn_engram::hasher' crates/ --include=*.rs   # empty = dead
+grep -rn 'NgramHasher\|dormouse_engram::hasher' crates/ --include=*.rs   # empty = dead
 
 # §4.1 — no learnable gain in the gate
-sed -n '199,236p' vendor/dormouse-fused/crates/burn-engram/src/lib.rs
+sed -n '199,236p' vendor/dormouse-fused/crates/dormouse-engram/src/lib.rs
 
 # §4.4 — the report's proposed constant
 python3 -c "import math;k=2.0000024999984376;d=1.9999950000125;\
@@ -807,10 +807,10 @@ traceable to a named file.
 
 ```
 $ grep -rn "engram_demo_v1" --include=*.rs .
-vendor/dormouse-fused/crates/burn-engram/src/lib.rs:231:   // Official reference (deepseek-ai/Engram, engram_demo_v1.py Engram.forward):
-vendor/dormouse-fused/crates/burn-engram/src/hasher.rs:1:    //! CPU n-gram hashing for Engram (deepseek-ai/Engram, arxiv 2601.07372).
-vendor/dormouse-fused/crates/burn-engram/src/hasher.rs:4:    //! `engram_demo_v1.py`: for every n-gram order in `min_ngram..=max_ngram`
-vendor/dormouse-fused/crates/burn-engram/src/hasher.rs:236:  /// Deliberately absent: a bit-exact comparison with `engram_demo_v1.py`.
+vendor/dormouse-fused/crates/dormouse-engram/src/lib.rs:231:   // Official reference (deepseek-ai/Engram, engram_demo_v1.py Engram.forward):
+vendor/dormouse-fused/crates/dormouse-engram/src/hasher.rs:1:    //! CPU n-gram hashing for Engram (deepseek-ai/Engram, arxiv 2601.07372).
+vendor/dormouse-fused/crates/dormouse-engram/src/hasher.rs:4:    //! `engram_demo_v1.py`: for every n-gram order in `min_ngram..=max_ngram`
+vendor/dormouse-fused/crates/dormouse-engram/src/hasher.rs:236:  /// Deliberately absent: a bit-exact comparison with `engram_demo_v1.py`.
 ```
 
 Five hits, all comments. Zero tests. There is no `crates/dormouse-core/tests/engram_gold.rs`
@@ -827,7 +827,7 @@ implementation downloaded by two research passes and compared to **zero** times.
 
 #### 1.2 The one test that claims to be the gate is a restatement
 
-`burn-engram/src/lib.rs:300-330`, `gate_matches_reference_formula`:
+`dormouse-engram/src/lib.rs:300-330`, `gate_matches_reference_formula`:
 
 ```rust
 let expected = 1.0 / (1.0 + (-(2.0f32 + 1e-6).sqrt()).exp());
@@ -859,14 +859,14 @@ inventory*, only at its gate line. Three divergences, in descending order of imp
 
 | # | reference | ours | where | consequence |
 |---|---|---|---|---|
-| **A** | `self.norm1/norm2 = ModuleList([nn.RMSNorm(hidden_size) …])` (`engram_demo_v1.py:355-356`) — `elementwise_affine=True` by default, so each has a **learnable per-channel gain**, applied to key and query before the dot (`:368, :370`) | none. `burn-engram` never constructs an `RMSNorm`; `lib.rs:215-228` hand-rolls `x / sqrt(mean(x²)+1e-5)` | `lib.rs:214-236` | the gate is a **strictly smaller function class**. `σ(sign·√(⟨γ_k⊙k̂, γ_h⊙ĥ⟩/√d))` ≠ `σ(sign·√(⟨k̂, ĥ⟩/√d))` for any learned γ. Not absorbable: a diagonal reweighting is not reachable by an inner product of unit-RMS vectors. |
+| **A** | `self.norm1/norm2 = ModuleList([nn.RMSNorm(hidden_size) …])` (`engram_demo_v1.py:355-356`) — `elementwise_affine=True` by default, so each has a **learnable per-channel gain**, applied to key and query before the dot (`:368, :370`) | none. `dormouse-engram` never constructs an `RMSNorm`; `lib.rs:215-228` hand-rolls `x / sqrt(mean(x²)+1e-5)` | `lib.rs:214-236` | the gate is a **strictly smaller function class**. `σ(sign·√(⟨γ_k⊙k̂, γ_h⊙ĥ⟩/√d))` ≠ `σ(sign·√(⟨k̂, ĥ⟩/√d))` for any learned γ. Not absorbable: a diagonal reweighting is not reachable by an inner product of unit-RMS vectors. |
 | **B** | `value_proj = nn.Linear(mem, hidden)` and `key_projs = [nn.Linear(mem, hidden)]` — **bias=True** by default (`:351-354`) | `.with_bias(false)` on both | `lib.rs:136-148` | `value = gate ⊙ (W_V e + b_V)` vs `gate ⊙ W_V e`. `b_V` is constant across positions but `gate` is not, so it contributes a position-varying vector. Not absorbable. |
 | **C** | `gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()` (`:372`) — a **clamp** | `dot.abs().add_scalar(1e-6).sqrt()` — an **add** | `lib.rs:234` | numerically ~0 in the normal regime, but the code comment at `lib.rs:231-232` transcribes the file it cites as `sqrt(|s| + 1e-6)`, i.e. it restates *our* code and cites the reference for it. That is the §1.4 failure in its smallest possible form. |
 
 **A and B are real structural deviations that nobody in the tree has named** — not the
 report, not `docs/`, not a code comment. Both are defensible (the paper's Eq 3/4 has
 neither a bias nor a gain, and following the paper is the right instinct at 9.2 M
-params). Neither is *declared*, which is the whole of the owner's rule. `burn-engram`'s
+params). Neither is *declared*, which is the whole of the owner's rule. `dormouse-engram`'s
 parameter inventory is missing 2·hc·d + hc·d + d parameters per Engram layer relative
 to the reference — 3 072 at d=768, negligible in count, load-bearing in function class.
 
@@ -909,8 +909,8 @@ obligation discharged properly.
 The shape of the gap is therefore exactly one sentence: **the tree can prove the memory
 branch ran and read a row, and cannot prove that the row, the gate applied to it, or the
 mix it produced is numerically the reference's.** A counter answers "did it run"; nothing
-answers "did it compute the right thing". That is precisely the class the `burn-dspark`
-header (`lib.rs:6-9`) and the `burn-engram` hasher header (`hasher.rs:236`) already
+answers "did it compute the right thing". That is precisely the class the `dormouse-dspark`
+header (`lib.rs:6-9`) and the `dormouse-engram` hasher header (`hasher.rs:236`) already
 admit to in prose and then do nothing about.
 
 #### 1.7 The oracle is *partial*, and that is a finding, not a caveat
@@ -942,8 +942,8 @@ draws it.
 
 ```
 $ grep -rn with_short_conv --include=*.rs .
-burn-engram/src/lib.rs:155:  pub fn with_short_conv(...)
-burn-engram/src/lib.rs:283:  ... .with_short_conv(4, 3, &dev())        <- its own shape test
+dormouse-engram/src/lib.rs:155:  pub fn with_short_conv(...)
+dormouse-engram/src/lib.rs:283:  ... .with_short_conv(4, 3, &dev())        <- its own shape test
 
 $ grep -rn NgramHasher --include=*.rs .        # 6 hits, all in hasher.rs's own tests
 ```
@@ -984,14 +984,14 @@ https://raw.githubusercontent.com/deepseek-ai/Engram/main/engram_demo_v1.py
 sha256 9d082070654df217e21bbca9926a4267bdf2cce7777aa6739747c24de30d2044   (422 lines, 15017 bytes, fetched 2026-09-29)
 ```
 
-**Where it goes:** `vendor/dormouse-fused/crates/burn-engram/tests/gate_oracle.rs` (an
+**Where it goes:** `vendor/dormouse-fused/crates/dormouse-engram/tests/gate_oracle.rs` (an
 integration test, not a unit test — the point is that it does not have `compute_gate`
 in scope to restate it), plus the fixture as a `const` array in the same file so the
 test and the data cannot drift apart. CPU, `Device::ndarray()`, no GPU.
 
 #### Test 1 — `gate_matches_reference_on_the_regime_where_they_differ`
 
-**Compares:** `burn_engram::compute_gate(key, query, d)` against an **f64 host
+**Compares:** `dormouse_engram::compute_gate(key, query, d)` against an **f64 host
 re-implementation of `engram_demo_v1.py:371-373` transcribed verbatim** — `clamp_min`,
 not `add` — fed *the same literal f32 fixtures* for `key` and `query`.
 
@@ -1395,7 +1395,7 @@ allows **50 %** — which is how a 43.8 % `nano` passes a test whose stated purp
    all 256. The real defect is that the Markov feature at step `s+1` *is* the CE target
    of step `s`.
 
-**Runners-up, in one line each.** `burn-engram`'s `hasher.rs` and `with_short_conv`
+**Runners-up, in one line each.** `dormouse-engram`'s `hasher.rs` and `with_short_conv`
 have no production callers, and two of the report's three recommended gold tests would
 certify them; the `per-branch`-vs-`per-concatenation` norm "divergence" they are meant
 to name is not a divergence (`nn.RMSNorm(D)` and `mean_dim(3)` are the same function).

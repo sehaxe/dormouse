@@ -227,14 +227,14 @@ the file that says so is that one function.
   deletes it from the advertised element types on purpose and strips the bf16
   tensor-core families, and even reading a bf16 buffer back as f32 dies at
   kernel-compile time with `Type cube.bf16 does not have a conversion to LLVM
-  type implemented`. That is why burn-spectral's own bf16 test fails at
+  type implemented`. That is why dormouse-spectral's own bf16 test fails at
   `burn-cubecl ops/tensor.rs:150`, and why **every bf16 run on this box is
   SLOWER than fp32** — `--bf16` stores bf16 and computes fp32 through cast
   copies, and there is no tensor-core bf16 to compute with. Do not paper over it
   with a silent fp32 fallback dressed as bf16 (that is the ADR-0019 failure
   mode). The one primitive that works is bf16 *storage* as `u16` bit patterns
   (integer ops + bitcast, pinned against f64 in
-  `vendor/dormouse-fused/crates/burn-gdn2/tests/lowp_bf16_cuda.rs`).
+  `vendor/dormouse-fused/crates/dormouse-gdn2/tests/lowp_bf16_cuda.rs`).
 - **f16 matmul is CORRECT but silently slow** (ADR-0016 bug 3) — it was reported
   as failing outright and is not. The answer matches fp32 to 1e-2, but the f16
   **tensor-core** candidate dies at compile time with `Expected type
@@ -335,14 +335,14 @@ the file that says so is that one function.
 NaN episodes appear in ANY config (fp32 + adamw included; `--quant fp32 --opt
 adamw` 150-step-clean runs were lucky seeds) once the model **overfits hard** —
 with the 0.85 MB test corpus loss hits ~0.5 by step 50 and the KDA recurrence
-goes NaN (a_log overflow fixed with a clamp in burn-kda 2026-08-29; the deeper
+goes NaN (a_log overflow fixed with a clamp in dormouse-kda 2026-08-29; the deeper
 overflow path is not isolated — a bisect showed `--no-kda` stays clean through
 deep overfit). Our own decay init (`a_log=-3`, `b_alpha=1.0`) + clamp
 measurably extended the clean window (110+ steps, Muon+, fp32, 0 NaN on
 2026-08-29, against 45-127 before). **That pair is not from any paper** —
 Kimi K3 §2.1.1 says `A_h = 0`, FLA uses `log(U(1,16))` (`kda.py:178`, or
 `zeros` under `safe_gate`), and FlashKDA has no `kda.py`; see
-`vendor/dormouse-fused/crates/burn-kda/src/lib.rs` module docs for the per-source
+`vendor/dormouse-fused/crates/dormouse-kda/src/lib.rs` module docs for the per-source
 table and for why the bias **sign** (not `A`) caps initial retention at
 `e^{g_min/2}`. That record also does not isolate `a_log` from the clamp, so
 cite it as our measurement, not as Moonshot's. Fp8 quant (the sm_120 default)
@@ -353,7 +353,7 @@ it further. **OOM flood follows NaN episodes** (~10-50 steps later);
 NaN-skip does NOT call cleanup.
 
 - **TSCT ortho is WIRED** (2026-09-02, do not re-investigate). `LinearLike::retract(iters)`
-  does a real polar retraction (burn-spectral, keeps autodiff tracking);
+  does a real polar retraction (dormouse-spectral, keeps autodiff tracking);
   `train_loop` calls `model.retract_tsct(cfg.retract_iters)` every step
   (default every 1 step, NS 3 iters; `--retract-every`/`--retract-iters`), lm_head
   included. Covered by the `tsct_retract_restores_ortho` test.
@@ -405,7 +405,7 @@ The defenses are installed, not optional.
 
 ## 2.5 Build and toolchain
 
-- Machine-local deps are GONE (2026-09-22): `burn-fused` (3.5 MB source),
+- Machine-local deps are GONE (2026-09-22): `dormouse-fused` (3.5 MB source),
   `cubecl-fix` (1.8 MB) and `cubek-fix` (added 2026-09-28, `422414c`) are
   vendored under `vendor/` and the workspace root `exclude`s all three (they are
   their own workspace roots; without the exclude, cargo resolves their crates'
@@ -745,7 +745,7 @@ The defenses are installed, not optional.
   test asserts flow + prints the disagreement. (2) **a fused forward launches
   on the trainer's backend and its result is discarded** — ADR-0019's
   silent-fallback shape; `fused kda=0/0` on the eval line means "not on this
-  path", not "the fast path is slow". Both are burn-gdn2-owner items with
+  path", not "the fast path is slow". Both are dormouse-gdn2-owner items with
   file:line in `docs/reviews/kda-gradflow-2026-09-30.md`. The
   `DM_GDN2_BWD_TRACE` line was not release-visible; the numeric test replaces
   it — the trace could never have proven gradient *arrival*.
@@ -778,8 +778,8 @@ The defenses are installed, not optional.
   `Expected operand type llvm.ptr, but found builtin.integer` — because
   `Shared::new_slice` was sized by a **runtime** value. Every kernel in this tree
   that runs sizes its shared memory from `#[comptime]`
-  (`burn-attnres/src/fused_attnres.rs:127`,
-  `burn-gdn2/src/kernel/chunk_adjoint_cube.rs:61`); this one did not. Fixed in
+  (`dormouse-attnres/src/fused_attnres.rs:127`,
+  `dormouse-gdn2/src/kernel/chunk_adjoint_cube.rs:61`); this one did not. Fixed in
   `34c5631` with the same pattern and a single `pub const THREADS`. The
   reachability story is also sharper than the old wording: the deciding input is
   the device's **autodiff context** (`burn-dispatch-0.22.0-pre.4
@@ -791,7 +791,7 @@ The defenses are installed, not optional.
   field.
 - **WHAT THAT FIX IS NOT: gated.** Reverting `#[comptime] threads` to a runtime
   value turns **zero tests red**, because no test runs the kernel — `BURN_DEVICE`
-  appears nowhere under `burn-rmsnorm` and its `Cargo.toml` has zero
+  appears nowhere under `dormouse-rmsnorm` and its `Cargo.toml` has zero
   `required-features`. So `34c5631` compiles and is verified by nothing. There
   is also **no backward**: `rmsnorm_cuda` returns a fresh `Tensor::<2>::empty`
   with raw handles written in, so the result carries no graph, and if the kernel
@@ -991,7 +991,7 @@ payoff for a 16 GB GPU + 64 GB RAM box. **Status per item in brackets:**
    NoPE → endless generation after post-training). `use_short_conv` (the
    report's local-bias choice) was tried and REVERTED: it made fp32+AdamW NaN
    at ~step 60 on this box while the same recipe ran 150+ steps clean without it
-   (measured 2026-08-29) — trace inside burn-kda before re-enabling. KDA state
+   (measured 2026-08-29) — trace inside dormouse-kda before re-enabling. KDA state
    dtype follows the inputs (bf16 under `--bf16`, fp32 otherwise — Moonshot
    FlashKDA trains bf16 state). **Decay init does NOT match the report**:
    `A_h = -3` / `b_alpha = +1.0` (α ≈ 0.077 at start) is our own measured
@@ -999,9 +999,9 @@ payoff for a 16 GB GPU + 64 GB RAM box. **Status per item in brackets:**
    which is negative and reaches α ≈ 0.95). Under the K3 sigmoid a
    non-negative `z` caps α at `e^{g_min/2} = 0.0821`, so **the bias sign, not
    `A`, is the lever** — and neither knob alone gets there. Arithmetic with
-   sources: `burn-kda/src/lib.rs` module docs. This is A/B queue arm 5, and it
+   sources: `dormouse-kda/src/lib.rs` module docs. This is A/B queue arm 5, and it
    is a technology REPLACE, not a knob. FlashKDA math (K3 decay, chunked WY,
-   chunk 16) already matches burn-kda; their CUTLASS kernels are the remaining
+   chunk 16) already matches dormouse-kda; their CUTLASS kernels are the remaining
    perf delta.
 6. **Hyperparameters & stability**: with Muon+GR, batch-size warmup is wasted
    (−18.8% extra steps, no gain) — start at target batch/LR; optimal LR/batch
@@ -1122,10 +1122,10 @@ Ranked applicability:
   comparable. The byte count on the eval line is the authority; quote it (§2.6).
 - `--jepa-weight` / `--dspark-weight` / `--dspark-k` — auxiliary objectives on top
   of CE (`core/src/aux.rs`, ON by default at 0.05 / 0.1 / K=4): JEPA =
-  data2vec-style masked latent prediction against an EMA teacher (burn-jepa;
+  data2vec-style masked latent prediction against an EMA teacher (dormouse-jepa;
   momentum 0.999, teacher advanced after every optimizer step) + KoLeo
   anti-collapse; DSpark = DeepSeek-style draft head correcting frozen logits into
-  the next-K tokens (burn-dspark, used instead of MTP; gamma 4.0). Aux value is
+  the next-K tokens (dormouse-dspark, used instead of MTP; gamma 4.0). Aux value is
   logged as `aux=` on log steps. Set both weights to 0 for the pure-CE baseline.
   Three things about the DSpark term that are not visible from the flags, all
   fixed/documented 2026-09-29: the window is teacher-forced from the **consumed**
@@ -1182,7 +1182,7 @@ Ranked applicability:
   process-global counter — two runs can share a data-section sha256 while
   their records differ). The seeded RNG stream is **provably correct**:
   7 951 694 direct-draw slots bit-identical across 9 processes. The TSCT
-  residue enters `qr_householder` (`burn-spectral/src/lib.rs:792`) at a
+  residue enters `qr_householder` (`dormouse-spectral/src/lib.rs:792`) at a
   **random iteration** (0…55, median 2, 139/360 pairs fully identical); the
   measured mechanism is nondeterministic reductions at `lib.rs:697, :704,
   :711, :714` — the autotuner attribution is the recorded HYPOTHESIS, not
@@ -1205,10 +1205,10 @@ Ranked applicability:
   deterministic (host-side QR or direct seeding) — also clears the §1.3
   violation.
 - **TWO NEWTON-SCHULZ COEFFICIENT SETS, ONE PAPER — found 2026-09-30, and
-  the brief that caused the finding was wrong.** `burn-spectral` hardcodes the
+  the brief that caused the finding was wrong.** `dormouse-spectral` hardcodes the
   **PolarExpress** triple `(15/8, −5/4, 3/8) = (1.875, −1.25, 0.375)` twice
   (`src/lib.rs:254` and `:305`, as exact rationals), cited to arXiv:2602.21545v3
-  **Appendix D.3**. `burn-muon-plus` uses the **Jordan** triple
+  **Appendix D.3**. `dormouse-muon-plus` uses the **Jordan** triple
   `(3.4445, −4.7750, 2.0315)`, cited to the same paper's **Appendix D.1** and to
   §3.1's "the same configuration as in Jordan et al. (2024)". Both citations are
   correct; they are different quantities and the two crates do the same job

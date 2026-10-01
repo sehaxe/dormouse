@@ -1,5 +1,5 @@
 [package]
-name = "burn-fused-benches"
+name = "dormouse-fused-benches"
 version.workspace = true
 edition.workspace = true
 publish = false
@@ -9,13 +9,13 @@ burn = { workspace = true, features = ["std", "cuda"] }
 burn-tensor = { workspace = true }
 burn-cubecl = { workspace = true, features = ["std"] }
 cubecl = { workspace = true, features = ["std", "cuda"] }
-burn-attnres = { path = "../crates/burn-attnres", features = ["cuda"] }
-burn-bitnet = { path = "../crates/burn-bitnet", features = ["cuda"] }
-burn-mhc = { path = "../crates/burn-mhc", features = ["cuda"] }
-burn-rope = { path = "../crates/burn-rope", features = ["cuda"] }
-burn-situ = { path = "../crates/burn-situ", features = ["cuda"] }
-burn-muon-plus = { path = "../crates/burn-muon-plus", features = ["cuda"] }
-burn-gdn2 = { path = "../crates/burn-gdn2", features = ["cuda"] }
-burn-kda = { path = "../crates/burn-kda", features = ["cuda"] }
-burn-sct = { path = "../crates/burn-sct", features = ["cuda"] }
+dormouse-attnres = { path = "../crates/dormouse-attnres", features = ["cuda"] }
+dormouse-bitnet = { path = "../crates/dormouse-bitnet", features = ["cuda"] }
+dormouse-mhc = { path = "../crates/dormouse-mhc", features = ["cuda"] }
+dormouse-rope = { path = "../crates/dormouse-rope", features = ["cuda"] }
+dormouse-situ = { path = "../crates/dormouse-situ", features = ["cuda"] }
+dormouse-muon-plus = { path = "../crates/dormouse-muon-plus", features = ["cuda"] }
+dormouse-gdn2 = { path = "../crates/dormouse-gdn2", features = ["cuda"] }
+dormouse-kda = { path = "../crates/dormouse-kda", features = ["cuda"] }
+dormouse-sct = { path = "../crates/dormouse-sct", features = ["cuda"] }
 serde_json = "1"

@@ -1,4 +1,4 @@
-# ORACLE — what is actually being verified in `burn-kda` and `burn-gdn2`
+# ORACLE — what is actually being verified in `dormouse-kda` and `dormouse-gdn2`
 
 Written 2026-09-29 at `wt/oracle`, off `eeb3b73`. The machine-readable half of
 this file is `docs/protocols/ORACLE-TIERS.tsv`; the gate that reads it is
@@ -24,7 +24,7 @@ wrong answers that agree.
 This is not an opinion about test design. It is a property of the call graph,
 and it was read out of the tree, not assumed.
 
-### `burn-gdn2`
+### `dormouse-gdn2`
 
 | what | where |
 |---|---|
@@ -38,7 +38,7 @@ and it was read out of the tree, not assumed.
 The two arms therefore diverge at exactly one place, `chunk_wy_dispatch`, and
 are the *same function* everywhere else.
 
-### `burn-kda`
+### `dormouse-kda`
 
 | entry point | line | calls `project` | calls `output` |
 |---|---|---|---|
@@ -71,11 +71,11 @@ under test?
 
 | # | layer | file | independent over | tier | provenance |
 |---|---|---|---|---|---|
-| L1 | exact scan vs chunked form | `burn-kda/tests/cuda_gate.rs:132`, `fused_cuda.rs:20,40` | the **scan algorithm** (the chunked-WY rewrite). NOT the projections | (d) | two of our own formulations of Eq. 1 |
-| L2 | batched ops vs loop ops | `burn-gdn2/tests/ops_batched_diff.rs` (9 cases) | the finite-Neumann rewrite, ragged tails, `TILE` routing | (d) | the untouched production arm |
+| L1 | exact scan vs chunked form | `dormouse-kda/tests/cuda_gate.rs:132`, `fused_cuda.rs:20,40` | the **scan algorithm** (the chunked-WY rewrite). NOT the projections | (d) | two of our own formulations of Eq. 1 |
+| L2 | batched ops vs loop ops | `dormouse-gdn2/tests/ops_batched_diff.rs` (9 cases) | the finite-Neumann rewrite, ragged tails, `TILE` routing | (d) | the untouched production arm |
 | L3 | fused CUDA vs ops | `fused_chunk_verify.rs`, `fused_adjoint_vs_ops.rs`, `bench_cuda.rs:204` | the **kernels** (indexing, shared memory, the adjoint) | (d) | our own ops path |
 | L4 | custom-node adjoint vs per-op autograd | `autodiff_chunk.rs:144` | the **analytic backward** | (d) | a second formulation of the same derivative |
-| L5 | **central finite differences** | `burn-kda/tests/ops_grad_cuda.rs`, `ops_batched_grad_cuda.rs`, `ops_batched_autodiff.rs`, `autodiff_chunk.rs:200` | the **method of differentiation** — not a formulation, a different way to compute the same number | (d) | numerics, not code |
+| L5 | **central finite differences** | `dormouse-kda/tests/ops_grad_cuda.rs`, `ops_batched_grad_cuda.rs`, `ops_batched_autodiff.rs`, `autodiff_chunk.rs:200` | the **method of differentiation** — not a formulation, a different way to compute the same number | (d) | numerics, not code |
 | L6 | host rank-5 references | `b5_seam_probe.rs` | rank-5 view semantics on ndarray | (d) | a scalar-index model, same file |
 | L7 | seam counters / arm reachability | `cuda_gate.rs`, `autodiff_cuda_gate.rs` | *which arm ran* — not any number | (d) | counters |
 | L8 | **paper transcription** | `bit_exact.rs`, `test_chunk.rs`, `ref_data.bin` | **`project`, `output`, the short conv, the recurrence itself** | **(c)** | our transcription of NVlabs `lit_gpt/gdn2.py` |
@@ -87,13 +87,13 @@ does not come from a second implementation. Finite differences are a different
 *method*, not a different *program*: a wrong adjoint, a missing gradient, and a
 gradient of a different function all fail it, and an arm-vs-arm comparison fails
 none of those. This is the layer that caught the frozen attention arm, and
-`burn-kda/tests/ops_grad_cuda.rs` says so in its own header. It is still tier
+`dormouse-kda/tests/ops_grad_cuda.rs` says so in its own header. It is still tier
 (d) — it validates the derivative of *our* function, not our function.
 
 ### What no layer can catch, by construction
 
 - **L1–L7 are all (d).** Every one of them compares our code to our code. ADR-0020
-  already said this about `burn-kda`'s suite ("`burn-kda`'s entire test suite is
+  already said this about `dormouse-kda`'s suite ("`dormouse-kda`'s entire test suite is
   this") and it is equally true of L2 and L3.
 - **L8 is the only layer that reaches `project` and `output`** — and it is red
   and off by default (§5).
@@ -131,7 +131,7 @@ It is **RED**, and the red reproduces exactly. Re-measured on this cell
 2026-09-29 at `57f324b`, ndarray, `--release`, from `wt/oracle`:
 
 ```
-cargo test --release -p burn-gdn2 --features binary-tests --test bit_exact --test test_chunk
+cargo test --release -p dormouse-gdn2 --features binary-tests --test bit_exact --test test_chunk
   bit_exact::test_gdn2_1000_cases   1000 cases: max_diff = 1.38e-2, failures = 976/1000
   test_chunk::test_chunk_vs_reference
         chunk_size= 4: max_diff = 1.38e-2 FAIL     chunk_size=32: max_diff = 1.38e-2 FAIL
@@ -163,7 +163,7 @@ Two further consequences that belong in any decision about this crate:
 
 1. **The only layer that can see `project` currently sees nothing**, because the
    feature is not default and the suite is red. Every run of
-   `cargo test -p burn-gdn2` is blind to the whole projection stack.
+   `cargo test -p dormouse-gdn2` is blind to the whole projection stack.
 2. The CI job that runs it is named *"1000 bit-exact cases vs the paper
    reference"* (`.github/workflows/fused-library.yml:129`) — a tier-(a) claim
    about a tier-(c) fixture, in the job name, which is the string people paste
@@ -172,7 +172,7 @@ Two further consequences that belong in any decision about this crate:
 
 ### 5.1 The default CPU cell is blind to it, and that is measurable
 
-`cargo test -p burn-gdn2 -p burn-kda --features autodiff` on this box, 2026-09-29,
+`cargo test -p dormouse-gdn2 -p dormouse-kda --features autodiff` on this box, 2026-09-29,
 runs `tests/bit_exact.rs` and reports:
 
 ```
@@ -182,9 +182,9 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 **Two.** The 1000-case test is not among them. `bit_exact.rs` also contains
 `bench_ndarray_short` and `bench_ndarray_single`, and those are the two that
 run. `test_gdn2_1000_cases` is behind `#[cfg(feature = "binary-tests")]`, so
-every ordinary `cargo test -p burn-gdn2` on this crate executes **zero** lines
+every ordinary `cargo test -p dormouse-gdn2` on this crate executes **zero** lines
 of the only layer in the tree that can see `project`. A green test run on
-`burn-gdn2` is not evidence about the projection stack, and reading it as such
+`dormouse-gdn2` is not evidence about the projection stack, and reading it as such
 is the most likely way this crate gets trusted by accident.
 
 ---
@@ -215,7 +215,7 @@ B10 is out of scope and is stated so nobody thinks this file closes it.
 ### 6.1 A red test that no CI job runs (measured on the CPU cell, 2026-09-29)
 
 ```
-cargo test -p burn-gdn2 -p burn-kda --features autodiff --no-fail-fast
+cargo test -p dormouse-gdn2 -p dormouse-kda --features autodiff --no-fail-fast
   autodiff_nested_balanced::the_op_declines_a_nested_graph_and_the_ops_path_carries_the_gradient
   FAILED at tests/autodiff_nested_balanced.rs:339
   "the op built a node over all-intermediate inputs: its output is a LEAF,
@@ -235,7 +235,7 @@ It is ungated for a mechanical reason, not a decision. The file is
 `#![cfg(feature = "autodiff")]`. CI's default CPU job
 (`fused-library.yml:62`) runs `cargo test --workspace` with **no** autodiff
 feature, so the file compiles out; and the feature-matrix job's autodiff step
-for `burn-gdn2` (`:94`) is `cargo check`, not `cargo test`. **No job in
+for `dormouse-gdn2` (`:94`) is `cargo check`, not `cargo test`. **No job in
 `fused-library.yml` executes this test on any backend.**
 
 Why it belongs in this document: the assertion is that a *gate* refuses. A gate
@@ -266,8 +266,8 @@ and that accepting these inputs is the known-bad path.
   the filename is what `cargo test --test bit_exact` prints and what gets quoted.
 
 Wording fixed in this lane by the gate going red on it:
-`burn-gdn2/src/lib.rs:49` (ADR-0020 listed this defect in the README and missed
-the doc comment), `b5_seam_probe.rs:11`, and the two `burn-kda` `bitforbit`
+`dormouse-gdn2/src/lib.rs:49` (ADR-0020 listed this defect in the README and missed
+the doc comment), `b5_seam_probe.rs:11`, and the two `dormouse-kda` `bitforbit`
 docstrings. Three rows are waived with a written reason, because the files belong
 to another lane: `bit_exact.rs`, `gen_reference.py`, and `lowp_bf16_cuda.rs`
 (the last is the one *legitimate* use of the word outside tier (a) — its expected
@@ -276,13 +276,13 @@ value is `half::bf16::from_f32`, a third-party implementation of IEEE-754).
 Run it: `python3 tools/oracle_gate.py`. It is not in CI yet; that is one line in
 `fused-library.yml` and it belongs to whoever owns the workflow.
 
-The gate's scope grew to three crates on 2026-09-29 (`burn-rmsnorm` joined,
+The gate's scope grew to three crates on 2026-09-29 (`dormouse-rmsnorm` joined,
 when `tests/rmsnorm_oracle.rs` became the tree's first tier-(a) row). A
 registry row nothing scans is a row that cannot fail, so widening the scope is
 what makes that row's R1/R2/R3 checks live rather than decorative: 61 files are
 scanned now, 54 before.
 
-**It is currently RED on five R1s, and none of them are new.** `burn-gdn2`'s
+**It is currently RED on five R1s, and none of them are new.** `dormouse-gdn2`'s
 `tests/ref_f64.rs`, `tests/common/ref_f64.rs`, `tests/official_forward.rs`,
 `tests/fused_launch_count.rs` and `examples/ref_f64_stages.rs` are tracked at
 `HEAD` and have no registry row. Verified by running this lane's own gate
@@ -354,7 +354,7 @@ first; the loss curve is a good project and a different one.
 Extend the gate to all 28 crates in this lane. Run against the whole repo
 (excluding `vendor/cubecl-fix`, `target/`, `graphify-out/`) the gate's own
 detector finds **67 positive fidelity-claim lines across 26 files**; six are in
-`burn-kda`/`burn-gdn2` and three of those six are waived above. Fixing the rest
+`dormouse-kda`/`dormouse-gdn2` and three of those six are waived above. Fixing the rest
 is a documentation project, not an oracle project, and it will collide with
 four other lanes. `--scope` on the gate takes a crate list — widening it is one
 argument once somebody owns the wording.

@@ -31,7 +31,7 @@ burn = { version = "0.22.0-pre.4", default-features = false, features = [
 burn-ndarray = { version = "0.22.0-pre.4", features = ["blas-openblas"] }
 # the subject of the ADR-0015 gate: the top-k -> gather primitive, whose
 # `argtopk` is the kernel the gate is about.
-burn-mor = { path = "../../vendor/dormouse-fused/crates/burn-mor" }
+dormouse-mor = { path = "../../vendor/dormouse-fused/crates/dormouse-mor" }
 burn-cuda = { version = "0.22.0-pre.4", default-features = false, features = [
     "std",
     "autotune",

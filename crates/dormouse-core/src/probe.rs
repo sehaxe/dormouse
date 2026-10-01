@@ -71,7 +71,7 @@ pub const ATTNRES: usize = 10;
 /// per factor. This is what ran in production until 2026-09-29 and it is
 /// still the default.
 pub const RETRACT_FACTOR: usize = 11;
-/// TSCT retraction, grouped arm: `burn_spectral::retract_batched`, sync-free
+/// TSCT retraction, grouped arm: `dormouse_spectral::retract_batched`, sync-free
 /// per shape group (`--retract-batched`). Counted because a fallback here is
 /// invisible in every other number: the batched arm computes the same
 /// matrices, so a run that silently took the slow arm prints the same loss.

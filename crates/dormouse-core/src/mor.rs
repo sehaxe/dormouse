@@ -1,8 +1,8 @@
 //! MoR - Mixture-of-Recursions (arXiv 2507.10524) routing for the loop.
 //!
-//! The routing MECHANISM lives in `burn-mor` (vendored): the shared linear
+//! The routing MECHANISM lives in `dormouse-mor` (vendored): the shared linear
 //! router ([`MoRRouter`]) and the top-k-index primitive
-//! ([`burn_mor::topk_indices`]). This module is the WIRING: how the loop's
+//! ([`dormouse_mor::topk_indices`]). This module is the WIRING: how the loop's
 //! iteration slots become a per-position top-k, and the four structural
 //! ingredients that make MoR stable where PonderNet's probabilistic halting
 //! collapsed (ADR-0013).
@@ -23,12 +23,12 @@
 use burn::tensor::activation::softplus;
 use burn::tensor::{Int, Tensor};
 
-/// The shared linear router, re-exported from `burn-mor` (arXiv 2507.10524).
+/// The shared linear router, re-exported from `dormouse-mor` (arXiv 2507.10524).
 ///
 /// Re-exported so `loop_block.rs` and the routing declaration can name it
 /// without depending on the vendored crate directly — the mechanism lives in
 /// the library, this module is the wiring.
-pub use burn_mor::MoRRouter;
+pub use dormouse_mor::MoRRouter;
 
 /// Effective `k`: never below 1 (ingredient 3), never above the number of
 /// slots that actually ran. The clamp to `n` is the depth-override path
@@ -54,14 +54,14 @@ pub fn route(scores: Tensor<3>, k: usize) -> (Tensor<3>, Tensor<1>) {
     let [b, t, n] = scores.dims();
     let k = eff_k(k, n);
     let dev = scores.device();
-    // THE shared primitive: burn-mor's top-k-indices over the candidate axis.
+    // THE shared primitive: dormouse-mor's top-k-indices over the candidate axis.
     // This is the crate's committed one - `argsort_descending` + narrow, which
     // exists precisely because cubecl's argtopk reduce emitted garbage indices
     // (`topk.rs:9`, our sm_120 ILLEGAL_ADDRESS). The newer argtopk-based
     // `topk_indices_last` (ADR-0015, the repaired cubek-reduce) is the
     // intended replacement and is a one-line swap here; at wiring time it did
     // not compile (`.int()` on an already-Int `argtopk` result).
-    let idx = burn_mor::topk_indices(scores.clone().reshape([b * t, n]), k, 1);
+    let idx = dormouse_mor::topk_indices(scores.clone().reshape([b * t, n]), k, 1);
     // Binary membership from those indices with NO gather, NO scatter, NO
     // host round trip and NO bool->float cast (that cast is broken on cubecl,
     // AGENTS.md 2026-09-27): one-hot the picks with `mask_fill` on a FLOAT

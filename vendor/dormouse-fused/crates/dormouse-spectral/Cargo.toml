@@ -1,0 +1,50 @@
+[package]
+name = "dormouse-spectral"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Ternary Spectral Compact Training — BitNet-style ternary SVD weights with rank-1 ternary MoE routing"
+keywords = ["burn", "ternary", "svd", "spectral", "moe"]
+repository = "https://github.com/sehaxe/burn-spectral"
+readme = "README.md"
+
+[features]
+default = ["std"]
+std = ["burn/std", "burn-tensor/std"]
+cuda = ["burn/cuda", "burn-tensor/cuda", "burn/extension", "dep:burn-cubecl", "dep:cubecl", "dep:burn-cuda", "dep:futures-lite", "burn/autodiff"]
+
+[dependencies]
+burn = { workspace = true }
+burn-tensor = { workspace = true }
+burn-nn = { workspace = true }
+burn-cubecl = { workspace = true, optional = true, features = ["std"] }
+cubecl = { workspace = true, optional = true, features = ["std", "cuda"] }
+dormouse-bitnet = { path = "../dormouse-bitnet", default-features = false }
+burn-autodiff = { workspace = true, features = ["std"] }
+burn-cuda = { workspace = true, optional = true }
+futures-lite = { workspace = true, optional = true }
+
+[dev-dependencies]
+burn-ndarray = { workspace = true, features = ["blas-openblas"] }
+burn-autodiff = { workspace = true, features = ["std"] }
+burn-optim = { workspace = true, features = ["std"] }
+burn-nn = { workspace = true, features = ["std"] }
+dormouse-bitnet = { path = "../dormouse-bitnet" }
+dormouse-sct = { path = "../dormouse-sct" }
+dormouse-muon-plus = { path = "../dormouse-muon-plus" }
+dormouse-rope = { path = "../dormouse-rope" }
+dormouse-situ = { path = "../dormouse-situ" }
+dormouse-kda = { path = "../dormouse-kda", features = ["autodiff"] }
+burn = { workspace = true, features = ["ndarray", "std", "autodiff", "extension"] }
+
+[[example]]
+name = "linear_timing"
+required-features = ["cuda"]
+
+[[example]]
+name = "moe_timing"
+required-features = ["cuda"]
+
+[[example]]
+name = "moe_timing2"
+required-features = ["cuda"]

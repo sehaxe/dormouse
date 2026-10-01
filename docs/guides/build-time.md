@@ -21,9 +21,9 @@ release profile's LTO buys nothing measurable for the loop itself
 - 753 packages, of which `burn-*` + `cubecl-*` + `pliron` dominate.
 - `[profile.release] lto = "thin"` is a whole-graph link. That is the bulk of
   the wall clock and it is paid on **every relink**, not once.
-- The vendored `burn-fused` crates (28) and `cubecl-fix` (3) are **path**
+- The vendored `dormouse-fused` crates (28) and `cubecl-fix` (3) are **path**
   dependencies, so their fingerprint is per-worktree. Editing one recompiles
-  it and everything downstream of it (`burn-kda` → `dormouse-core` →
+  it and everything downstream of it (`dormouse-kda` → `dormouse-core` →
   `dormouse-train` → `dormouse-cli`), which is the whole chain. A `touch` on
   one vendored file is a 5-minute event.
 

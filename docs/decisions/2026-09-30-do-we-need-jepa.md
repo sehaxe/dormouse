@@ -223,7 +223,7 @@ batch is not a rounding error in a 3-seed A/B.
 - Teacher = **the same architecture, same depth, EMA 0.999**, run on the **same
   unmasked input** (`model.rs:150-156`). The teacher-input defect is fixed and gated
   (`tests/jepa_teacher_seam.rs`).
-- The mask (`burn-jepa/src/mask.rs`, 15% span-8) is threaded into
+- The mask (`dormouse-jepa/src/mask.rs`, 15% span-8) is threaded into
   `jepa_l1_loss` as a **loss-position selector**. `pred.forward(student_latent)` runs the
   **full, unmasked** sequence (`aux.rs:177`). **Nothing is hidden from the model.**
 - Loss is **L1 on raw latents**; there is no normalisation anywhere on the path.
@@ -395,7 +395,7 @@ different (also unevidenced) premise.
 
 **VERIFIED (sourced, primary):**
 - Our implementation's four properties in §3.0 — read from `model.rs`, `aux.rs`,
-  `burn-jepa/src/{losses,mask,predictor}.rs` on this tree.
+  `dormouse-jepa/src/{losses,mask,predictor}.rs` on this tree.
 - data2vec 2.0 normalises targets with instance norm; target = mean of top-K teacher blocks
   over the **unmasked** sample; **student input is masked**; teacher momentum ramps
   `τ₀→τ_e` over `τ_n` updates; multi-mask M amortises the teacher; L2 loss
@@ -536,7 +536,7 @@ All fetched 2026-09-30. Version and date as returned by the arXiv API.
 | `2602.03604` | v3 | 2026-02-03 (upd 2026-04-08) | A Lightweight Library for Energy-Based JEPAs | §3.2(d) — the EBM variant; rejected for this decision, queue separately |
 
 **Repo sources cited:** `crates/dormouse-core/src/{model.rs:86-106,150-156}`, `aux.rs:25,29,176-179,224-232`;
-`vendor/dormouse-fused/crates/burn-jepa/src/{losses.rs:11-20,63-97, mask.rs:9-25, predictor.rs}`;
+`vendor/dormouse-fused/crates/dormouse-jepa/src/{losses.rs:11-20,63-97, mask.rs:9-25, predictor.rs}`;
 `benches/history.tsv:51-56`; `~/logs/ab8m_ab8m_iter4.log:10-16`; `~/logs/train_nokda.log:91`;
 `docs/protocols/AB-PROTOCOL.md:185-230`; `docs/archive/audit-2026-09-25.md:29,62,64,87`; `docs/papers/jepa.md`.
 

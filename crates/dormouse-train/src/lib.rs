@@ -95,7 +95,7 @@ pub struct TrainCfg {
     pub retract_every: usize,
     pub retract_iters: usize,
     /// Retract the TSCT masters in ONE grouped pass per factor shape
-    /// (`burn_spectral::retract_batched`, sync-free) instead of one
+    /// (`dormouse_spectral::retract_batched`, sync-free) instead of one
     /// host-syncing Newton-Schulz per factor.
     ///
     /// Default FALSE = the per-factor path, which is what every run in the
@@ -427,8 +427,8 @@ pub fn wsd_factor(step: u64, total: u64, base_lr: f64) -> f64 {
 /// sm_86 (Ampere, 3090) -> Bf16/Fp16, everything else -> Fp32.
 /// --quant fp32|bf16|fp16|fp8|fp4 forces a format (emulation anywhere).
 #[cfg(feature = "cuda")]
-pub fn quant_format(device: &Device, forced: Option<&str>, bf16: bool) -> burn_spectral::QuantFormat {
-    use burn_spectral::QuantFormat;
+pub fn quant_format(device: &Device, forced: Option<&str>, bf16: bool) -> dormouse_spectral::QuantFormat {
+    use dormouse_spectral::QuantFormat;
     if let Some(v) = forced {
         return match v {
             "fp32" => QuantFormat::Fp32,
@@ -456,8 +456,8 @@ pub fn quant_format(device: &Device, forced: Option<&str>, bf16: bool) -> burn_s
     }
 }
 #[cfg(not(feature = "cuda"))]
-pub fn quant_format(_device: &Device, _forced: Option<&str>, _bf16: bool) -> burn_spectral::QuantFormat {
-    burn_spectral::QuantFormat::Fp32
+pub fn quant_format(_device: &Device, _forced: Option<&str>, _bf16: bool) -> dormouse_spectral::QuantFormat {
+    dormouse_spectral::QuantFormat::Fp32
 }
 
 #[cfg(feature = "cuda")]
@@ -683,7 +683,7 @@ fn build_model(
     dorm_cfg: &DormouseConfig,
     cfg: &TrainCfg,
     device: &Device,
-) -> (DormouseModel, burn_spectral::QuantFormat) {
+) -> (DormouseModel, dormouse_spectral::QuantFormat) {
     let mut model = DormouseModel::new(dorm_cfg, device);
     let qfmt = quant_format(device, cfg.quant.as_deref(), dorm_cfg.bf16);
     apply_compute_settings(&mut model, qfmt, dorm_cfg.bf16, false);
@@ -699,11 +699,11 @@ fn build_model(
 /// latch the run committed to and can never undo.
 fn apply_compute_settings(
     model: &mut DormouseModel,
-    qfmt: burn_spectral::QuantFormat,
+    qfmt: dormouse_spectral::QuantFormat,
     bf16: bool,
     ortho_fp32: bool,
 ) {
-    if qfmt != burn_spectral::QuantFormat::Fp32 {
+    if qfmt != dormouse_spectral::QuantFormat::Fp32 {
         model.loop_block.set_quant_all(qfmt);
         println!("quant format: {qfmt:?} ({} bits)", qfmt.bits());
     }
@@ -711,7 +711,7 @@ fn apply_compute_settings(
         // True bf16 compute: matmuls run on bf16 (tensor cores) through the
         // custom autodiff op; the graph and backward stay fp32.
         println!("fp32 factor fallback: latched, factors run fp32");
-        model.set_quant_all(burn_spectral::QuantFormat::Fp32);
+        model.set_quant_all(dormouse_spectral::QuantFormat::Fp32);
         return;
     }
     if bf16 {
@@ -789,7 +789,7 @@ pub fn precompute_jepa_targets(
     if cfg.warmup {
         let _ = stream.next_batch();
     }
-    if cfg.quant_check && qfmt != burn_spectral::QuantFormat::Fp32 {
+    if cfg.quant_check && qfmt != dormouse_spectral::QuantFormat::Fp32 {
         let _ = stream.next_batch();
     }
     let mut w = jepa_targets::JepaTargetWriter::create(out).map_err(|e| e.to_string())?;
@@ -939,7 +939,7 @@ pub fn train_loop(
     // run lands `pre` batches behind and re-trains on data it has seen
     // (ADR-0021).
     let pre_batches = cfg.warmup as u64
-        + (cfg.quant_check && qfmt != burn_spectral::QuantFormat::Fp32) as u64;
+        + (cfg.quant_check && qfmt != dormouse_spectral::QuantFormat::Fp32) as u64;
     // ADR-0010's rule is filter-time and structural, but nothing could ENFORCE
     // it: `collect_files` recurses into every subdirectory, so pointing
     // `--data` at the parent of an eval tree trains on the held-out bytes
@@ -1056,7 +1056,7 @@ pub fn train_loop(
     // quant fidelity check: quantized model vs fp32 reference on one batch.
     // --quant-check prints max/mean logit deviation + loss delta so Fp8/Fp4
     // viability is measured, not assumed.
-    if cfg.quant_check && qfmt != burn_spectral::QuantFormat::Fp32 && step == 0 {
+    if cfg.quant_check && qfmt != dormouse_spectral::QuantFormat::Fp32 && step == 0 {
         let (bytes, hashes) = stream.next_batch();
         let (x, h) = bytes_to_tensors::<Backend>(&bytes, &hashes, cfg.seq_len, cfg.batch, &device);
         let shifted: Vec<i64> = bytes.iter().skip(1).chain(std::iter::once(&bytes[0])).map(|&b| b as i64).collect();
@@ -1064,7 +1064,7 @@ pub fn train_loop(
         let (lq, rec_q, _kq, _aq) = model.forward_with_hidden::<Backend>(x.clone(), Some(h.clone()), None, Some(y.clone()), None);
         let loss_q: f32 = model.loss::<Backend>(rec_q).try_into_scalar().unwrap_or(f32::NAN);
         let mut ref_model = model.clone();
-        ref_model.loop_block.set_quant_all(burn_spectral::QuantFormat::Fp32);
+        ref_model.loop_block.set_quant_all(dormouse_spectral::QuantFormat::Fp32);
         let (lr, rec_r, _kr, _ar) = ref_model.forward_with_hidden::<Backend>(x, Some(h), None, Some(y), None);
         let loss_r: f32 = ref_model.loss::<Backend>(rec_r).try_into_scalar().unwrap_or(f32::NAN);
         let vq: Vec<f32> = lq.into_data().try_to_vec().unwrap_or_default();
@@ -1092,7 +1092,7 @@ pub fn train_loop(
             &model.loop_block.expert_ffns[0].gate_up.inner
         {
             let u = l.u.val();
-            let q = burn_bitnet::quantize_tensor::<Backend>(u.clone(), qfmt.bits());
+            let q = dormouse_bitnet::quantize_tensor::<Backend>(u.clone(), qfmt.bits());
             let v: Vec<f32> = (u - q).into_data().try_to_vec().unwrap_or_default();
             let max_q = v.iter().fold(0.0f32, |a, x| a.max(x.abs()));
             let mean_q = v.iter().sum::<f32>() / v.len().max(1) as f32;
@@ -1409,7 +1409,7 @@ pub fn train_loop(
             let ortho = model.max_ortho();
             if ortho > 1e-3 {
                 println!("max_ortho {ortho:.2e} > 1e-3 - fallback fp32 factors");
-                model.set_quant_all(burn_spectral::QuantFormat::Fp32);
+                model.set_quant_all(dormouse_spectral::QuantFormat::Fp32);
                 ortho_fp32 = true;
             }
         }
@@ -2809,7 +2809,7 @@ mod tests {
             "precomputed target must equal the online teacher latent: {dv:.2e} (scale {scale:.2e})"
         );
         // (2) The aux consumes the target tensor it is handed. The masked L1
-        // draws a fresh random mask per call (burn-jepa `mask_indices`);
+        // draws a fresh random mask per call (dormouse-jepa `mask_indices`);
         // when both draws land empty the L1 term is 0.0 in both calls and
         // the two aux values coincide bitwise. P(both empty) ~ 5-7% — a
         // pre-existing flake (reproduced 2/40 on burn pre.3 as well), not a
@@ -3070,7 +3070,7 @@ mod tests {
         let (updated, state) = opt.step(lr, w, grad.clone(), None);
         assert!(state.unwrap().mu_momentum.is_some(), "momentum state must be kept");
         let update = updated.mul_scalar(-(1.0 / lr as f32));
-        let muon = burn_muon_plus::MuonPlusConfig::new()
+        let muon = dormouse_muon_plus::MuonPlusConfig::new()
             .with_norm_dir(crate::optim::MUON_NORM_DIR)
             .with_ns_steps(crate::optim::MUON_NS_STEPS)
             .build();

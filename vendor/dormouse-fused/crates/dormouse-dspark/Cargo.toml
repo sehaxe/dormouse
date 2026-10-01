@@ -1,0 +1,38 @@
+[package]
+name = "dormouse-dspark"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "DSpark speculative decoding for Burn (DeepSeek AI, arXiv 2607.05147)"
+keywords = ["burn", "dspark", "speculative", "decoding", "llm"]
+repository = "https://github.com/sehaxe/burn-dspark"
+readme = "README.md"
+
+[features]
+default = ["std"]
+std = ["burn/std", "burn-tensor/std"]
+training = []
+
+[dependencies]
+burn = { workspace = true }
+burn-tensor = { workspace = true }
+
+[dev-dependencies]
+burn-ndarray = { workspace = true, features = ["blas-openblas"] }
+# `autodiff` is what lets `dspark_loss_gradients_agree_with_the_official_loss`
+# back-propagate. The value tests in the same file now name their device
+# EXPLICITLY (`Device::ndarray()`) because turning this feature on makes
+# `Device::default()` an autodiff device, and a golden comparison that silently
+# changes backend is a golden comparison nobody re-ran.
+burn = { workspace = true, features = ["ndarray", "std", "autodiff"] }
+
+# `dspark_loss` and `accept_rate_loss` are behind `training`, so the oracle
+# test cannot compile without it. `required-features` is what stops cargo
+# building the target at all in the default cell rather than failing it --
+# the same pattern dormouse-gdn2 uses for its `cuda`/`autodiff` targets, and the
+# reason a gate that does not pass a feature cannot see the tests behind it
+# (tools/lib_gate.sh says so at the `binary-tests` cell).
+[[test]]
+name = "dspark_loss_oracle"
+path = "tests/dspark_loss_oracle.rs"
+required-features = ["training"]

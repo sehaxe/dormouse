@@ -115,7 +115,7 @@ pub struct DormouseConfig {
     /// it is on, so every existing checkpoint loads unchanged.
     ///
     /// Score convention: the paper's, `q . RMSNorm(k)` with no temperature -
-    /// `burn_attnres::ScoreForm::default()` is `Paper`. A `SqrtD` option
+    /// `dormouse_attnres::ScoreForm::default()` is `Paper`. A `SqrtD` option
     /// exists in the crate so the temperature is a nameable A/B rather than an
     /// accident, but it is not wired to a config field: the first A/B this
     /// arm needs is AttnRes vs ReZero, not AttnRes vs AttnRes.
@@ -124,7 +124,7 @@ pub struct DormouseConfig {
     #[serde(default = "d_mhc_streams")] pub mhc_streams: usize,
     /// SiTU-GLU in the expert FFN (arXiv:2607.24653v2 Eq 12, Kimi K3):
     /// `beta1*tanh(Wg x/beta1) * Sigmoid(Wg x) * beta2*tanh(Wu x/beta2)` at
-    /// K3's own `beta1 = 4`, `beta2 = 25` (`burn_situ::K3_GATE_BETA` /
+    /// K3's own `beta1 = 4`, `beta2 = 25` (`dormouse_situ::K3_GATE_BETA` /
     /// `K3_UP_BETA`, which are constants - beta is fixed in the paper, not
     /// learned and not swept).
     ///

@@ -201,7 +201,7 @@ fn at_top1_the_selected_experts_train_and_the_masked_ones_are_zero() {
 
 /// TIE BEHAVIOUR, defined and pinned.
 ///
-/// `topk_blend`'s selection is `burn_mor::topk_indices`, i.e. one
+/// `topk_blend`'s selection is `dormouse_mor::topk_indices`, i.e. one
 /// `argsort_descending` + `narrow`, and that primitive's own doc says the
 /// selected SET among equal values may differ between impls and backends. So
 /// the promise this module makes is deliberately narrow and is exactly what the

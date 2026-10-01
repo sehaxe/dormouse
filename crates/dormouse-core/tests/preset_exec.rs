@@ -336,7 +336,7 @@ fn p150_executes() {
 /// below skips these by name (it would otherwise pass vacuously: a panicking
 /// forward enters nothing, and "entered nothing" is indistinguishable from
 /// "entered nothing because every arm is off"). The failure is real and it is
-/// not in this file: `burn_mor::topk_indices` returns an index tensor whose
+/// not in this file: `dormouse_mor::topk_indices` returns an index tensor whose
 /// storage is I64 while `Tensor<D, Int>` is i32 on burn-flex, and `mor::route`
 ///'s `equal` against the slot arange refuses to mix them ("expected I32, got
 /// I64", burn-flex tensor.rs:170). So `mor` cannot execute a single step here
@@ -344,7 +344,7 @@ fn p150_executes() {
 const UNVERIFIABLE: &[&str] = &["mor"];
 
 #[test]
-#[ignore = "the MoR arm panics on the CPU backend: burn-mor topk_indices is I64 where Tensor<D, Int> is i32"]
+#[ignore = "the MoR arm panics on the CPU backend: dormouse-mor topk_indices is I64 where Tensor<D, Int> is i32"]
 fn mor_executes() {
     executes("mor");
 }

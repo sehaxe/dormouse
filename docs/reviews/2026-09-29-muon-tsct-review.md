@@ -15,7 +15,7 @@ fetched directly (arXiv HTML for `2602.21545v1/v3` and `2604.00733`, GitHub API 
 **Headline:** claim 3 is **confirmed and proved** (the branch is unsatisfiable, no
 counterexample exists). Claim 5's **verdict survives but its evidence is factually
 wrong** — the paper *does* print the coefficients, in v3, and one of them is the
-exact triple `burn-spectral` uses. Claim 7's dependency half is **refuted**. The
+exact triple `dormouse-spectral` uses. Claim 7's dependency half is **refuted**. The
 report's biggest miss is a live, unguarded, 112-host-sync-per-step path it found but
 did not count.
 
@@ -27,11 +27,11 @@ did not count.
 |---|---|---|
 | 1 | every arXiv id cited resolves | **TRUE** — 10/10 HTTP 200, titles match |
 | 2 | `github.com/K1seki221/MuonPlus` is the paper's code and exists | **TRUE** |
-| 3 | `burn-muon-plus/src/lib.rs:146` `if nc*4 < nr` is unsatisfiable; the factored branch and `ns_combine_cuda` are dead | **TRUE — proved below** |
+| 3 | `dormouse-muon-plus/src/lib.rs:146` `if nc*4 < nr` is unsatisfiable; the factored branch and `ns_combine_cuda` are dead | **TRUE — proved below** |
 | 4 | the `3.6x on [8192,512]` comment is backwards on FLOPs | **TRUE in direction, report's own number is wrong** (1.4545x, not 1.48x) |
-| 5 | `burn-spectral:164-166` mis-cites Muon+ §1; the paper "prints no NS coefficients" | **VERDICT TRUE, EVIDENCE FALSE** — v3 App. D.1 and D.3 print both coefficient families, D.3 terminating at exactly `(1.875, −1.25, 0.375)` |
+| 5 | `dormouse-spectral:164-166` mis-cites Muon+ §1; the paper "prints no NS coefficients" | **VERDICT TRUE, EVIDENCE FALSE** — v3 App. D.1 and D.3 print both coefficient families, D.3 terminating at exactly `(1.875, −1.25, 0.375)` |
 | 6 | TSCT has never been shown to help | **TRUE** |
-| 7 | `burn-sct` is a declared dependency with zero call sites; `param.rs:1` stale | **SPLIT** — `param.rs:1` stale: TRUE. Dead dependency: **FALSE** (it is a `[dev-dependencies]` entry and `examples/tsct_diag.rs` uses it) |
+| 7 | `dormouse-sct` is a declared dependency with zero call sites; `param.rs:1` stale | **SPLIT** — `param.rs:1` stale: TRUE. Dead dependency: **FALSE** (it is a `[dev-dependencies]` entry and `examples/tsct_diag.rs` uses it) |
 | 8 | `retract_batched` is called only from tests | **TRUE** — and the report understates the consequence by ~2 orders of magnitude |
 | 9 | the `37%` is v3-only and is time-to-target-loss | **TRUE** — and the string is in the *crate* README, not the project README |
 
@@ -42,7 +42,7 @@ did not count.
 **CONFIRMED. The condition is unsatisfiable. No counterexample exists, and none
 can exist.**
 
-`vendor/dormouse-fused/crates/burn-muon-plus/src/lib.rs:127-146`:
+`vendor/dormouse-fused/crates/dormouse-muon-plus/src/lib.rs:127-146`:
 
 ```rust
 127:  pub fn orthogonalize<const D: usize>(&self, g: Tensor<D>) -> Tensor<D> {
@@ -178,7 +178,7 @@ fabricated-looking citation in a real paper's shape").
 **A–G**. v1 text 40,814 chars; v3 text 82,430 chars.
 
 **So the verdict stands and the diagnosis inverts.** The defect at
-`burn-spectral/src/lib.rs:164-166` is real — a mis-citation is a mis-citation under
+`dormouse-spectral/src/lib.rs:164-166` is real — a mis-citation is a mis-citation under
 ADR-0020. But:
 
 - the coefficient triple `(15/8, −5/4, 3/8) = (1.875, −1.25, 0.375)` is **printed in
@@ -248,7 +248,7 @@ fires in production; the test exercises the non-transposed branch). So the test 
 not even cover the shape that ships.
 
 **Claim 8 — TRUE, and worse than reported.** `grep -rn retract_batched` over the
-whole repo (including `crates/`): hits at `burn-spectral/src/lib.rs:225` (doc
+whole repo (including `crates/`): hits at `dormouse-spectral/src/lib.rs:225` (doc
 cross-ref), `:275` (definition), `:1327`/`:1348`/`:1371`/`:1380`/`:1422`/`:1432`
 (all inside `#[cfg(test)]`). **Zero production call sites.** The "7 `into_scalar`
 per factor" count is also correct — I counted the call sites in
@@ -266,7 +266,7 @@ per-step" — correct, and the table makes it sharper than the report did.
 
 **But the file is wrong.** `README.md` (project root) contains **no** occurrence of
 `37%` or `37.1`. The string lives at
-`vendor/dormouse-fused/crates/burn-muon-plus/README.md:30`. Likewise the retracted
+`vendor/dormouse-fused/crates/dormouse-muon-plus/README.md:30`. Likewise the retracted
 `96×/84×`/`3.6×` numbers are in that same **crate** README (`:61-62`, `:75-78`), not
 in the project `README.md`'s "Performance" section — which is the two-row
 `benches/history.tsv` canary table. `muon-plus.md:183` and `:184` both attribute to
@@ -277,37 +277,37 @@ wrong file. The *verdicts* survive; the *citations* do not.
 
 ### 5. Claim 7 — split verdict, with the dependency half **refuted**
 
-**TRUE:** `burn-sct/src/qr.rs` does implement the paper's `sign(diag(R))` continuity
+**TRUE:** `dormouse-sct/src/qr.rs` does implement the paper's `sign(diag(R))` continuity
 correction (`:18-19` names it, `:300-301` and `:351-352` implement it), and
 `crates/dormouse-core/src/param.rs:1` does read
-`//! param - TSCT linear via burn-sct SpectralLinear` while `param.rs:9` imports
-`burn_spectral::SpectralLinear`. T11 is a correct BUG.
+`//! param - TSCT linear via dormouse-sct SpectralLinear` while `param.rs:9` imports
+`dormouse_spectral::SpectralLinear`. T11 is a correct BUG.
 
-**FALSE: the "dead dependency" (T10).** `burn-spectral/Cargo.toml:33` is:
+**FALSE: the "dead dependency" (T10).** `dormouse-spectral/Cargo.toml:33` is:
 
 ```
 27: [dev-dependencies]
 ...
-33: burn-sct = { path = "../burn-sct" }
+33: dormouse-sct = { path = "../dormouse-sct" }
 ```
 
 It is a **`[dev-dependencies]`** entry, not a `[dependencies]` entry — the section
 opens at `:27` and the `[dependencies]` block ends at `:25`. Three consequences the
-report misses because its grep was scoped to `burn-spectral/src/**/*.rs` and so never
+report misses because its grep was scoped to `dormouse-spectral/src/**/*.rs` and so never
 saw `examples/`:
 
-1. **It does not drag `burn-sct` into any downstream build graph.** A dev-dependency
-   is not built for anything that depends on `burn-spectral`. The report's
+1. **It does not drag `dormouse-sct` into any downstream build graph.** A dev-dependency
+   is not built for anything that depends on `dormouse-spectral`. The report's
    "**removable today, zero code change**" and "it also drags a second, divergent
    retraction implementation into the build graph" are both false statements about
    how Cargo resolves dev-dependencies.
-2. **It is not unused.** `burn-spectral/examples/tsct_diag.rs:61-62, 83-88, 105-110`
-   constructs `burn_sct::SctLinear` and `burn_sct::SctConfig` and runs them against
+2. **It is not unused.** `dormouse-spectral/examples/tsct_diag.rs:61-62, 83-88, 105-110`
+   constructs `dormouse_sct::SctLinear` and `dormouse_sct::SctConfig` and runs them against
    `SpectralLinear` in a mini-GPT ("does TSCT actually learn? … dense vs
    SpectralLinear vs SpectralMoE, same params budget"). That is a **live, working
    consumer** of the exact-Stiefel oracle.
 3. **It is already the shape the report recommends.** `tsct.md:344-347` says "keep
-   `burn-sct` as a *test-only* oracle and stop linking it into `burn-spectral`". A
+   `dormouse-sct` as a *test-only* oracle and stop linking it into `dormouse-spectral`". A
    dev-dependency consumed by an example **is** a test-only oracle. T10 is
    flagging the recommended state as a defect.
 
@@ -383,7 +383,7 @@ The call count:
   experts for `small` (`configs/small.toml:16`) — × `{gate_up, down}` + `out_proj`
   = **7** `LinearLike`.
 - `DormouseModel::retract_tsct` (`model.rs:367-370`) adds `self.lm_head` = **8**.
-- `SpectralLinear::retract` (`burn-spectral/src/lib.rs:612-619`) retracts **u and v**.
+- `SpectralLinear::retract` (`dormouse-spectral/src/lib.rs:612-619`) retracts **u and v**.
 - → **16 factors × 7 = 112 blocking D2H reads per step**, at
   `retract_every: 1` (`train/src/lib.rs:160`) — i.e. **every step, unguarded**.
 
@@ -414,7 +414,7 @@ and the code says otherwise.)
   README's own stated limit — "zero *reads* is not zero *synchronization*" — but
   112 reads is not "zero reads".)
 - **The fix already exists and is already tested.** `retract_batched`
-  (`burn-spectral/src/lib.rs:275-292`) groups factors by shape, stacks to
+  (`dormouse-spectral/src/lib.rs:275-292`) groups factors by shape, stacks to
   `[B,m,k]`, and calls `polar_orthogonalize_batched` (`:226-268`), which keeps
   every norm as a `[B,1,1]` broadcast and has **zero** host syncs. It is
   production-unreachable. The report correctly diagnosed the missing wire-up; it
@@ -441,7 +441,7 @@ divergence case is documented".
 
 #### 7.3 The crate README documents a formula the code does not implement
 
-`burn-muon-plus/README.md:21` prints the paper's update rule:
+`dormouse-muon-plus/README.md:21` prints the paper's update rule:
 
 ```
 W_t  = W_{t-1} - η·√(m/n)·O_t
@@ -457,7 +457,7 @@ was not.
 
 #### 7.4 The 3.6x claim exists in two places, and the report flagged one
 
-`burn-muon-plus/README.md:75-78` repeats the factored-branch claim in prose
+`dormouse-muon-plus/README.md:75-78` repeats the factored-branch claim in prose
 ("claimed 3.6× faster on [8192,512] with a lower peak footprint (never materializes
 (XXᵀ)²)") *after* retracting it 7 lines earlier. D2 flags only `lib.rs:142-145`. The
 "never materializes `(XXᵀ)²`" half is a real (and correct) memory argument that
@@ -469,12 +469,12 @@ survives the retraction — it is the only true part of the claim — so the fix
 `routing.rs:78-80`: *"8 NS iters on the `[d,d]` projections added ~40 s/step, while
 the factored `[d,r]`/`[r,f]` form is ~1000x cheaper"*, echoed in `AGENTS.md` §2.3.
 D11 accepts it as "a machine fact". Under **ADR-0020 rule 1** — the rule this very
-report is enforcing against `burn-spectral` — a measurement is a measurement only
+report is enforcing against `dormouse-spectral` — a measurement is a measurement only
 with **config, date and commit**. This one has none, and it is the sole justification
 for keeping Muon+ off every `[d,d]` projection, i.e. it decides the optimizer policy
 for the whole model. It is also stated **at 8 iterations**, so it is entangled with
 D4: change `ns_steps` to the paper's 5 and the number behind the policy is stale.
-The report should have held `burn-spectral` and `routing.rs` to the same standard.
+The report should have held `dormouse-spectral` and `routing.rs` to the same standard.
 
 ---
 
@@ -483,7 +483,7 @@ The report should have held `burn-spectral` and `routing.rs` to the same standar
 1. **§3 — the report's central evidence for its most severe *TSCT* finding is false,
    and its fix makes provenance worse.** Muon+ v3 App. D.1 and D.3 print
    `(3.4445, −4.7750, 2.0315)` and a PolarExpress schedule terminating at
-   `(1.875, −1.25, 0.375)`. `burn-spectral` uses exactly that triple. The bug is a
+   `(1.875, −1.25, 0.375)`. `dormouse-spectral` uses exactly that triple. The bug is a
    wrong section pointer (§1 → App. D.3) and a wrong method name (Muon+ → PolarExpress
    / Amsel et al. `2505.16932`), not a fabricated formula in a real paper's shape.
    The report's own instruction — "drop the Muon+ id" — discards the only verifiable
@@ -496,7 +496,7 @@ The report should have held `burn-spectral` and `routing.rs` to the same standar
    note, ranked #4. It is the most consequential single fact in this subtree after
    the `nc*4 < nr` dead branch — and it is the one that costs step time *today*, in
    every run, at `retract_every = 1`.
-3. **§5 — T10 is a false BUG.** `burn-spectral/Cargo.toml:33` is a
+3. **§5 — T10 is a false BUG.** `dormouse-spectral/Cargo.toml:33` is a
    **`[dev-dependencies]`** entry, consumed by `examples/tsct_diag.rs`, which runs
    the exact-`safe_qr` oracle against `SpectralLinear`. A dev-dependency does not
    enter any downstream build graph, so "dead weight in the build graph" and
@@ -516,8 +516,8 @@ both branches issue three matmuls.
 | finding | settling command |
 |---|---|
 | 112 syncs/step, and their step-time cost | `./target/release/train --preset small --batch 8 --seq-len 512 --retract-every 1000` vs default, `--timers`, warm steps 50/100/150, quiet card, `CUBECL_AUTOTUNE_LEVEL=3` |
-| `retract_batched` ≡ per-factor path at production shapes | `cargo test -p burn-spectral --features cuda ns` (the `retract_batched_deterministic` test already exists at `:1371`; extend it to `[768,64]`, `[2048,64]`, `[768,256]`) |
-| NS-3 vs the exact `safe_qr` oracle (the report's own cheapest unrun check) | one test in `burn-spectral/tests/` calling `burn_sct::qr::qr_cpu` — the dev-dep already exists, which is the whole point of §5 |
+| `retract_batched` ≡ per-factor path at production shapes | `cargo test -p dormouse-spectral --features cuda ns` (the `retract_batched_deterministic` test already exists at `:1371`; extend it to `[768,64]`, `[2048,64]`, `[768,256]`) |
+| NS-3 vs the exact `safe_qr` oracle (the report's own cheapest unrun check) | one test in `dormouse-spectral/tests/` calling `dormouse_sct::qr::qr_cpu` — the dev-dep already exists, which is the whole point of §5 |
 | power-iteration start-vector divergence (§7.2) | construct `m` with a top singular vector orthogonal to `1`; assert `polar_orthogonalize` output is finite |
 | `~40 s/step` at 8 iters (§7.5) | `--set use_tsct=false` on one preset, `--timers`, warm steps — this is also AB queue item 2 |
 
@@ -532,7 +532,7 @@ re-derived the numbers instead.
 touched. `docs/papers/*.md`, the vendor crates and the tree are as the author left them.
 
 **Read:** `docs/papers/muon-plus.md`, `docs/papers/tsct.md`,
-`vendor/dormouse-fused/crates/burn-spectral/src/lib.rs`, `vendor/dormouse-fused/crates/burn-muon-plus/`,
+`vendor/dormouse-fused/crates/dormouse-spectral/src/lib.rs`, `vendor/dormouse-fused/crates/dormouse-muon-plus/`,
 `crates/dormouse-core/src/{param,loop_block,routing}.rs`, `crates/dormouse-train/src/{lib,optim}.rs`,
 `docs/protocols/AB-PROTOCOL.md`, `benches/history.tsv`.
 
@@ -586,7 +586,7 @@ NS works on the small side. `retract_every=1` ⇒ all 14, every step, forever.
 
 #### 1.2 Sync count — the report's "7" is right, and 5 of the 7 are in one loop
 
-`polar_orthogonalize` (`burn-spectral/src/lib.rs:168-217`) has exactly three `into_scalar`
+`polar_orthogonalize` (`dormouse-spectral/src/lib.rs:168-217`) has exactly three `into_scalar`
 sites, and one is inside the power loop:
 
 | line | site | iterations | syncs |
@@ -597,7 +597,7 @@ sites, and one is inside the power loop:
 | | | | **7** |
 
 **7 per factor × 14 factors = 98 blocking device→host round-trips per training step, every
-step, with no counter anywhere.** For contrast, `burn-muon-plus` has **zero** `into_scalar` in
+step, with no counter anywhere.** For contrast, `dormouse-muon-plus` has **zero** `into_scalar` in
 its entire hot path (`grep` over `lib.rs` + `fused_kernels.rs`: the only hits are inside
 `#[test]` bodies at `fused_kernels.rs:228,361,372,383`). The optimizer runs the *same*
 Newton-Schulz iteration on the *same 14 tensors* and is sync-free, because it normalizes with
@@ -731,7 +731,7 @@ stays above the basin and NS diverges (measured: polar([512,512], 3) -> max entr
 Three things wrong with that, in increasing order of consequence:
 
 1. **The code does not do a `‖X‖_F/√k` prescale.** `:202` divides by `σ·1.05` from the power
-   iteration; the *Muon* path at `burn-muon-plus/src/lib.rs:137` divides by plain `‖X‖_F`. The
+   iteration; the *Muon* path at `dormouse-muon-plus/src/lib.rs:137` divides by plain `‖X‖_F`. The
    comment is defending against a prescale that is not in the code. The measured 1e14 is a
    historical bug whose trigger is absent.
 2. **Plain Frobenius is not just adequate, it is sufficient by Cauchy–Schwarz.** After
@@ -768,7 +768,7 @@ already uses:
 
 **Falsifier, and it is cheap:** on CPU, compare `ortho_error` after 3 cubic steps with a
 Frobenius prescale against the same with the power-iteration prescale, at `[768,64]` and
-`[2048,64]`, against `burn_sct`'s exact `safe_qr`. If the Frobenius variant's residual is
+`[2048,64]`, against `dormouse_sct`'s exact `safe_qr`. If the Frobenius variant's residual is
 materially worse, restore the power iteration and **add a counter for it** (ADR-0011: an
 unmeasured improvement in a hot path is indistinguishable from a no-op). Runs in seconds on
 `Device::ndarray()`, needs no GPU, and discharges `tsct.md` §4.3 at the same time.
@@ -780,7 +780,7 @@ saving from 85% to 88% of the ceiling by handing B a shorter per-factor op list 
 
 ### 2. The dead branch: delete it, but the report's "fix" and the report's reason are both wrong
 
-`muon-plus.md` D1 is correct that `nc * 4 < nr` at `burn-muon-plus/src/lib.rs:146` is
+`muon-plus.md` D1 is correct that `nc * 4 < nr` at `dormouse-muon-plus/src/lib.rs:146` is
 unsatisfiable — `nr`/`nc` are read at `:141` from `x` *after* the canonical transpose at
 `:130-134`, so `nr ≤ nc` always, and `4nc < nr ≤ nc` has no solution. I confirm it. `D1` also
 correctly identifies that the fused `ns_combine_cuda` call at `:154` is consequently dead in
@@ -870,7 +870,7 @@ both name the wrong *first* experiment. In cost order:
 #### E1 — does 3 cubic steps actually reach the manifold at our shapes? (CPU, < 5 min, 0 GPU)
 
 `tsct.md` §4.3 says this is the cheapest unrun check. I agree and would put it first,
-extended to pin **both** prescale variants (§1.7) against `burn_sct`'s exact `safe_qr`:
+extended to pin **both** prescale variants (§1.7) against `dormouse_sct`'s exact `safe_qr`:
 
 ```
 [768,64], [2048,64] × {Frobenius prescale, power-iteration prescale} × 3 iters
@@ -880,7 +880,7 @@ extended to pin **both** prescale variants (§1.7) against `burn_sct`'s exact `s
 This decides whether the retraction is a retraction, and it decides §1.7 at the same time. It
 costs nothing and it gates everything below: **if 3 cubic steps do not reach the manifold at
 `[768,64]`, the retraction is not a retraction, and the whole A/B measures three arbitrary
-programs.** Note the reference already exists in-tree (`burn-sct/qr.rs:509`), so this is a
+programs.** Note the reference already exists in-tree (`dormouse-sct/qr.rs:509`), so this is a
 test, not a project.
 
 #### E2 — is the existing ortho test measuring a retraction or a function? (CPU, < 5 min, 0 GPU)
@@ -976,7 +976,7 @@ the question is only what the rule permits *given* that.
 | **D4** | `ns_steps = 8` vs paper's 5 | **FORBIDDEN** | Reference is the paper: 5, everywhere, explicitly. A different document (the Qwen report) is not a reference *implementation*; it cannot discharge a bit-for-bit rule. Either revert to 5 or check against Qwen's actual code. |
 | **D11** | routing is a *subset* of the paper's | **outside the rule's grammar** | The paper's routing is a hyperparameter choice, not a correctness property. There is no reference implementation to be bit-for-bit with about *which* parameters get which optimizer. The 40 s/step measurement is a machine fact and a fair justification. **The owner should exempt routing by name** — otherwise the rule will be argued about every cycle. |
 | **T2** | **cubic (15/8,−5/4,3/8) × 3** vs Muon+ quintic × 5 | **FORBIDDEN** *(and see below)* | The two converge to different points by construction — the cubic reaches `UVᵀ`, the quintic deliberately does not. No tolerance, no iteration count, makes them bit-identical. |
-| **T3** | **σ_max power iteration + Rayleigh × 1.05** vs the optimizer's Frobenius prescale | **FORBIDDEN, and the reference is in the tree** | `burn-muon-plus/src/lib.rs:137` performs plain Frobenius on the same objects, ~130 lines away in the same vendor workspace. Two NS implementations of the same object, in the same crate, disagreeing. This is precisely the failure the owner's rule exists to stop, and it is the one that costs 7/7 syncs and 39/68 launches per factor per step. |
+| **T3** | **σ_max power iteration + Rayleigh × 1.05** vs the optimizer's Frobenius prescale | **FORBIDDEN, and the reference is in the tree** | `dormouse-muon-plus/src/lib.rs:137` performs plain Frobenius on the same objects, ~130 lines away in the same vendor workspace. Two NS implementations of the same object, in the same crate, disagreeing. This is precisely the failure the owner's rule exists to stop, and it is the one that costs 7/7 syncs and 39/68 launches per factor per step. |
 | **T5** | per-entry `‖UᵀU−I‖_F / k` | **PERMITTED** | The metric is ours; no upstream defines it. The normalisation is a documented bug fix against a dated measurement, not a deviation from a source. |
 | **T7** | QR-of-random init instead of SVD | **PERMITTED** | There is no dense matrix to take an SVD of. Nothing to deviate from. |
 | **T13** | retraction cadence + one-way persisted fp32 latch | **PERMITTED** | Ours, no upstream. And it is the one that still needs E3 to justify its cost. |
@@ -987,7 +987,7 @@ source**, and the honest resolution is not to change the math — it is to **del
 (T1/D5, the reports' joint #1 and #2 severity). The retraction is not a Muon+ component; it
 occupies SCT's Eq. (5) slot and is implemented by our own method. Once "Muon+ §1" is off the
 comment, the rule has no purchase on T2 — and the burden moves to a *different* rule, "verified
-against a reference", whose natural oracle is `burn-sct`'s `safe_qr`. That check is a
+against a reference", whose natural oracle is `dormouse-sct`'s `safe_qr`. That check is a
 **tolerance**, not a bit-for-bit test, because an approximate 3-step retraction can never be
 bit-for-bit against an exact one.
 
@@ -1044,7 +1044,7 @@ and I do not think any of them is closed by a comment or a unit test:
 
 ### 6. Top-3 findings
 
-1. **The σ_max power iteration (`burn-spectral/src/lib.rs:178-201`) is provably unnecessary,
+1. **The σ_max power iteration (`dormouse-spectral/src/lib.rs:178-201`) is provably unnecessary,
    is the largest single removable cost in the retraction, and is the item the owner's
    bit-for-bit rule forbids.** Frobenius normalisation gives `σ_max ≤ 1` by Cauchy–Schwarz;
    the cubic `(15/8,−5/4,3/8)` has basin exactly `[0,1]` with a double root at 1
@@ -1054,7 +1054,7 @@ and I do not think any of them is closed by a comment or a unit test:
    leaves the `Param`/tracking path untouched, which `retract_batched` does not.
    *(`tsct.md` T3 rates this as "the reason NS is viable here at all". It is not: the code
    does not use the `‖X‖_F/√k` prescale the comment defends against, and the live Muon path
-   at `burn-muon-plus/src/lib.rs:137` uses plain Frobenius with no problem.)*
+   at `dormouse-muon-plus/src/lib.rs:137` uses plain Frobenius with no problem.)*
 
 2. **Wiring `retract_batched` as the report recommends would silently freeze every TSCT
    master.** It takes `&mut [&mut Tensor<2>]` (`:275`), cannot call

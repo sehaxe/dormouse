@@ -42,10 +42,10 @@ use burn::backend::DispatchKindConversion;
 use burn::module::{Module, Param};
 use burn::nn::{Linear, LinearConfig};
 use burn::tensor::{activation, Device, DispatchTensor, FloatDType, Int, Tensor};
-use burn_attnres::{depth_attend, AttnRes};
-use burn_engram::EngramModule;
-use burn_mhc::MhcBlock;
-use burn_rmsnorm::RMSNorm;
+use dormouse_attnres::{depth_attend, AttnRes};
+use dormouse_engram::EngramModule;
+use dormouse_mhc::MhcBlock;
+use dormouse_rmsnorm::RMSNorm;
 
 use crate::attention::AdaptiveAttention;
 use crate::config::{ActQuant, DormouseConfig};
@@ -387,7 +387,7 @@ pub struct LoopBlock {
 
 impl LoopBlock {
     /// Apply a quantization format to every TSCT factor (stage-2 switch).
-    pub fn set_quant_all(&mut self, quant: burn_spectral::QuantFormat) {
+    pub fn set_quant_all(&mut self, quant: dormouse_spectral::QuantFormat) {
         for f in &mut self.expert_ffns {
             f.gate_up.set_quant(quant);
             f.down.set_quant(quant);
@@ -838,7 +838,7 @@ impl LoopBlock {
                     }
                     None => match &hashed_ids {
                         Some(hashed) => {
-                            // burn-engram kernels are f32-only (ILLEGAL_ADDRESS
+                            // dormouse-engram kernels are f32-only (ILLEGAL_ADDRESS
                             // on bf16, measured 2026-08-29).
                             let eg_in = if bf16 {
                                 h_ctx.clone().reshape([b, t, 1, d]).cast(FloatDType::F32)
@@ -896,11 +896,11 @@ impl LoopBlock {
                 let mid_f32 = if bf16 { mid.cast(FloatDType::F32) } else { mid };
                 let mid = if use_situ {
                     crate::probe::note(crate::probe::SITU);
-                    burn_situ::situ_glu(
+                    dormouse_situ::situ_glu(
                         mid_f32,
                         self.ffn_hidden,
-                        burn_situ::K3_GATE_BETA,
-                        burn_situ::K3_UP_BETA,
+                        dormouse_situ::K3_GATE_BETA,
+                        dormouse_situ::K3_UP_BETA,
                     )
                 } else {
                     activation::silu(mid_f32)
@@ -1244,7 +1244,7 @@ mod tests {
     /// uniform (at `w_l = 0` every score is 0, so the temperature multiplies
     /// into nothing). The model's own gates are structurally blind to the
     /// score convention, because the convention only enters through a query
-    /// that starts at zero. The number is pinned in `burn-attnres`
+    /// that starts at zero. The number is pinned in `dormouse-attnres`
     /// (`paper_form_has_no_temperature_and_this_is_pinned`, literals
     /// 0.9820138 / 0.7310586); this asserts the model is wired to the one
     /// those literals describe — the link between the two files, and the
@@ -1258,7 +1258,7 @@ mod tests {
         for (i, a) in on.attnres.as_ref().expect("arm on").iter().enumerate() {
             assert_eq!(
                 a.form,
-                burn_attnres::ScoreForm::Paper,
+                dormouse_attnres::ScoreForm::Paper,
                 "slot {i}: the model arm must be the paper's `q . RMSNorm(k)`, no \
                  temperature. Eq. 2 has no 1/sqrt(d); the crate's SqrtD form is kept \
                  for the A/B that would name it, and wiring it here by accident would \
@@ -1381,7 +1381,7 @@ mod tests {
 
     // SITU (arXiv:2607.24653v2 Eq 12). The FORM is gated in the mechanism
     // crate, against Moonshot's own numbers - see
-    // vendor/dormouse-fused/crates/burn-situ/src/lib.rs and
+    // vendor/dormouse-fused/crates/dormouse-situ/src/lib.rs and
     // docs/reviews/situ-2026-09-30.md. What is gated HERE is the wiring:
     // that the flag is load-bearing, that the counter sees the arm, and that
     // the gradient survives the cap. The form gate cannot see any of it: a
@@ -2262,7 +2262,7 @@ mod tests {
         // Put the intermediate at a NAMED magnitude, 10x the bound, instead of
         // hoping the random TSCT factors land there: the comparison is then a
         // statement about the activation and not about the initializer.
-        const HOT: f32 = 10.0 * (burn_situ::K3_GATE_BETA * burn_situ::K3_UP_BETA) as f32;
+        const HOT: f32 = 10.0 * (dormouse_situ::K3_GATE_BETA * dormouse_situ::K3_UP_BETA) as f32;
         let scale = HOT / mid.clone().abs().max().into_scalar::<f32>();
         let mid = mid.mul_scalar(scale);
         let mid_peak = mid.clone().abs().max().into_scalar::<f32>();
@@ -2270,18 +2270,18 @@ mod tests {
             (mid_peak - HOT).abs() < 0.01 * HOT,
             "the rescale put the intermediate at {mid_peak}, not the {HOT} it asked for"
         );
-        let via_situ = burn_situ::situ_glu(
+        let via_situ = dormouse_situ::situ_glu(
             mid.clone(),
             cfg.d_ffn,
-            burn_situ::K3_GATE_BETA,
-            burn_situ::K3_UP_BETA,
+            dormouse_situ::K3_GATE_BETA,
+            dormouse_situ::K3_UP_BETA,
         );
         // The comparator has to be the same SHAPE to be compared elementwise,
         // and the arm it replaces read one `d_ffn`-wide tensor, so it is
         // `silu` on this tensor's gate half: the same coordinates, unbounded.
         let via_silu = activation::silu(mid.slice([0..n, 0..cfg.d_ffn]));
         assert_eq!(via_situ.dims(), via_silu.dims(), "the comparator is elementwise");
-        let bound = (burn_situ::K3_GATE_BETA * burn_situ::K3_UP_BETA) as f32;
+        let bound = (dormouse_situ::K3_GATE_BETA * dormouse_situ::K3_UP_BETA) as f32;
         let peak_situ = via_situ.clone().abs().max().into_scalar::<f32>();
         let peak_silu = via_silu.clone().abs().max().into_scalar::<f32>();
         assert!(
@@ -2309,7 +2309,7 @@ mod tests {
     /// threshold would be a statement about this fixture's scale and not about
     /// the arm.
     ///
-    /// The reference numbers (f64, `tools/gen_ref.py` in burn-situ, cross-checked
+    /// The reference numbers (f64, `tools/gen_ref.py` in dormouse-situ, cross-checked
     /// against the crate's own CUDA backward): the GATE factor's derivative
     /// falls from 0.73 at g=0.5 to 1.8e-4 at g=20 and to 8.2e-9 at g=40, i.e.
     /// the cap costs a factor of ~1/sech^2 and the branch is numerically DEAD
@@ -2324,8 +2324,8 @@ mod tests {
         let expert = &on.expert_ffns[0];
         let f = cfg.d_ffn;
         let n = 8usize;
-        let b1 = burn_situ::K3_GATE_BETA as f32;
-        let b2 = burn_situ::K3_UP_BETA as f32;
+        let b1 = dormouse_situ::K3_GATE_BETA as f32;
+        let b2 = dormouse_situ::K3_UP_BETA as f32;
 
         // The gate half swept over 0.25x .. 5x beta1 and the up half over the
         // matching 0.25x .. 5x beta2, with the up sign alternating so the
@@ -2340,11 +2340,11 @@ mod tests {
             let input = Tensor::<1>::from_floats(cells.as_slice(), &adev())
                 .reshape([n, 2 * f])
                 .require_grad();
-            let out = expert.down.forward::<B>(burn_situ::situ_glu(
+            let out = expert.down.forward::<B>(dormouse_situ::situ_glu(
                 input.clone(),
                 f,
-                burn_situ::K3_GATE_BETA,
-                burn_situ::K3_UP_BETA,
+                dormouse_situ::K3_GATE_BETA,
+                dormouse_situ::K3_UP_BETA,
             ));
             // Sum of squares: a scalar with no sign, so the test measures the
             // magnitude of the path and not which way it points.

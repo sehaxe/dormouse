@@ -92,10 +92,10 @@ fn gamma_matches_the_official_config_and_so_does_its_shape() {
         "DeepSpec's decay is no longer exp(-k/gamma) (l.{line}: {text})"
     );
     // The values themselves, over the OFFICIAL block length, through the
-    // library the loss calls: burn_dspark::position_weights(block, gamma).
+    // library the loss calls: dormouse_dspark::position_weights(block, gamma).
     let block = num(&f, "config.block_size") as usize;
     let dev = burn::tensor::Device::flex();
-    let w = burn_dspark::position_weights(block, DSPARK_GAMMA, &dev)
+    let w = dormouse_dspark::position_weights(block, DSPARK_GAMMA, &dev)
         .into_data()
         .bytes
         .chunks_exact(4)
@@ -115,7 +115,7 @@ fn gamma_matches_the_official_config_and_so_does_its_shape() {
 
 /// The loss mix: `ce_loss_alpha 0.1`, `l1_loss_alpha 0.9`,
 /// `confidence_head_alpha 1.0`. These are HARDCODED in
-/// `burn_dspark::dspark_loss` (lib.rs:216) rather than configurable, so the
+/// `dormouse_dspark::dspark_loss` (lib.rs:216) rather than configurable, so the
 /// test asserts the hardcoded text and says so rather than pretending they are
 /// a config seam.
 #[test]
@@ -134,7 +134,7 @@ fn loss_mix_matches_the_official_config() {
     // constant, so it is checked BEHAVIOURALLY: the returned components must
     // recombine with the official coefficients. That is stronger than reading
     // the numbers off the source, and it is the only way to assert them
-    // without editing burn-dspark.
+    // without editing dormouse-dspark.
     let (total, ce, tv, conf) = probe_loss();
     let want = ce * 0.1 + tv * 0.9 + conf * 1.0;
     assert!(
@@ -143,7 +143,7 @@ fn loss_mix_matches_the_official_config() {
          (ce {ce}, tv {tv}, conf {conf})"
     );
     eprintln!(
-        "burn-dspark hardcodes (ce, l1, conf) = (0.1, 0.9, 1.0) at lib.rs:216; the \
+        "dormouse-dspark hardcodes (ce, l1, conf) = (0.1, 0.9, 1.0) at lib.rs:216; the \
          official config says (0.1, 0.9, 1.0) and the coefficients are NOT \
          configurable on our side. Probed: total {total} = 0.1*{ce} + 0.9*{tv} + \
          1.0*{conf} to {:.1e}.",
@@ -153,7 +153,7 @@ fn loss_mix_matches_the_official_config() {
 
 /// The acceptance-rate target, Eq 8: `clamp(1 - 0.5*||p_draft - p_target||_1, 0, 1)`
 /// (loss.py:69), on SOFTMAX PROBS rather than on logits - the oracle's own text
-/// says `draft_probs`. burn-dspark's `accept_rate_target` is that formula.
+/// says `draft_probs`. dormouse-dspark's `accept_rate_target` is that formula.
 #[test]
 fn accept_rate_target_matches_the_official_formula() {
     let f = fixture();
@@ -184,13 +184,13 @@ fn accept_rate_target_matches_the_official_formula() {
     // A constant shift leaves the softmax unchanged, so the target is 1.0. On
     // raw LOGITS the same shift is a huge L1 distance and it would collapse.
     let shifted = base.iter().map(|v| v + 40.0).collect::<Vec<_>>();
-    let same = scalar(burn_dspark::accept_rate_target(first(base.clone()), first(shifted)));
+    let same = scalar(dormouse_dspark::accept_rate_target(first(base.clone()), first(shifted)));
     assert!(
         (same - 1.0).abs() < 1e-5,
         "a constant logit shift must leave the acceptance target at 1.0, got {same}: \
          the target is not on softmax probs"
     );
-    let self_t = scalar(burn_dspark::accept_rate_target(first(base.clone()), first(base)));
+    let self_t = scalar(dormouse_dspark::accept_rate_target(first(base.clone()), first(base)));
     assert!((self_t - 1.0).abs() < 1e-5, "identical distributions must give 1.0, got {self_t}");
     // Disjoint one-hots have L1 = 2, so 1 - 0.5*2 = 0: the clamp is reachable,
     // which is the whole reason for the 0.5 coefficient.
@@ -198,7 +198,7 @@ fn accept_rate_target_matches_the_official_formula() {
     hot[0] = 40.0;
     let mut cold = vec![0.0f32; 8];
     cold[7] = 40.0;
-    let z = scalar(burn_dspark::accept_rate_target(first(hot), first(cold)));
+    let z = scalar(dormouse_dspark::accept_rate_target(first(hot), first(cold)));
     assert!(
         z.abs() < 1e-3,
         "disjoint one-hots have L1 = 2, so the target is clamp(0, 0, 1) = 0, got {z}: \
@@ -255,7 +255,7 @@ fn dspark_k_is_not_block_size_and_dspark_stride_has_no_counterpart() {
 /// `markov_head_type = 'vanilla'` selects `VanillaMarkov` (markov_head.py:294),
 /// a memoryless first-order transition bias. `AuxHeads::new` builds an
 /// `RNNHead` (aux.rs:45) - markov_head.py:125, a GRU-like recurrent state
-/// across the block. burn-dspark ships BOTH, so this is a wiring choice, not a
+/// across the block. dormouse-dspark ships BOTH, so this is a wiring choice, not a
 /// missing feature. The type name is read out of the live module.
 #[test]
 fn the_markov_head_is_rnn_where_the_official_config_says_vanilla() {
@@ -281,7 +281,7 @@ fn the_markov_head_is_rnn_where_the_official_config_says_vanilla() {
          (markov_head.py:{line}), a memoryless first-order transition bias. \
          dormouse-core/src/aux.rs's AuxHeads::new builds an RNNHead \
          (markov_head.py:{rnn_line}), a GRU-like state carried across the block. \
-         burn-dspark ships VanillaMarkov, GatedMarkovHead and RNNHead."
+         dormouse-dspark ships VanillaMarkov, GatedMarkovHead and RNNHead."
     );
 }
 
@@ -290,7 +290,7 @@ fn the_markov_head_is_rnn_where_the_official_config_says_vanilla() {
 /// so the previous token's Markov embedding is part of the head's input.
 /// `AuxHeads::new` builds `AcceptRatePredictor::new(d_model, ...)` (aux.rs:47),
 /// the hidden-state-only variant, and `dspark_aux_loss` passes `None` for the
-/// Markov embeddings. burn-dspark's `with_markov(input_dim, markov_rank)` is
+/// Markov embeddings. dormouse-dspark's `with_markov(input_dim, markov_rank)` is
 /// the conditioned variant and is not called anywhere in the tree.
 #[test]
 fn the_confidence_head_IS_markov_conditioned() {
@@ -399,9 +399,9 @@ fn aux_head_types() -> (&'static str, &'static str) {
         .unwrap_or("?")
         .to_string();
     // The conditioning is observable, not a private flag: `logit(h, None)`
-    // succeeds only on the hidden-only variant (burn-dspark asserts the
+    // succeeds only on the hidden-only variant (dormouse-dspark asserts the
     // predictor and the call agree). Probing beats reading a field, and it is
-    // the only way to see it without editing burn-dspark.
+    // the only way to see it without editing dormouse-dspark.
     let h = burn::tensor::Tensor::<3>::zeros([1, 1, c.d_model], &burn::tensor::Device::flex());
     let hidden_only = !expect_panic(move || { aux.conf.logit(h, None); });
     (
@@ -411,7 +411,7 @@ fn aux_head_types() -> (&'static str, &'static str) {
 }
 
 /// The Markov conditioning is observable BEHAVIOURALLY, which is the only way
-/// to see it without editing burn-dspark: `AcceptRatePredictor::logit` takes
+/// to see it without editing dormouse-dspark: `AcceptRatePredictor::logit` takes
 /// `Option` Markov embeddings and asserts that the predictor and the call
 /// agree (lib.rs:104-119). So the conditioned variant REJECTS `None` and the
 /// plain one ACCEPTS it, and that difference is the finding.
@@ -427,15 +427,15 @@ fn aux_head_types() -> (&'static str, &'static str) {
 fn with_markov_call_sites() -> usize {
     let dev = burn::tensor::Device::flex();
     let h = burn::tensor::Tensor::<3>::zeros([1, 1, 8], &dev);
-    let conditioned = burn_dspark::AcceptRatePredictor::with_markov(8, 4, &dev);
+    let conditioned = dormouse_dspark::AcceptRatePredictor::with_markov(8, 4, &dev);
     let h_first = h.clone();
     assert!(
         expect_panic(move || { conditioned.logit(h_first, None); }),
         "a Markov-conditioned predictor must REJECT a call with no Markov \
-         embeddings; burn-dspark's logit asserts they agree, so if this passes \
+         embeddings; dormouse-dspark's logit asserts they agree, so if this passes \
          the conditioning is no longer observable and the finding is stale"
     );
-    let plain = burn_dspark::AcceptRatePredictor::new(8, &dev);
+    let plain = dormouse_dspark::AcceptRatePredictor::new(8, &dev);
     let plain_accepts = !expect_panic(move || { plain.logit(h, None); });
     assert!(
         plain_accepts,
@@ -455,7 +455,7 @@ fn expect_panic(f: impl FnOnce()) -> bool {
     out
 }
 
-/// One call through `burn_dspark::dspark_loss` on fixed inputs, returning the
+/// One call through `dormouse_dspark::dspark_loss` on fixed inputs, returning the
 /// total and its three components so the caller can check the mixture.
 fn probe_loss() -> (f32, f32, f32, f32) {
     let dev = burn::tensor::Device::flex();
@@ -463,7 +463,7 @@ fn probe_loss() -> (f32, f32, f32, f32) {
     let draft: Vec<f32> = (0..v).map(|i| (i as f32) * 0.5 - 1.0).collect();
     let target: Vec<f32> = (0..v).map(|i| 1.0 - (i as f32) * 0.3).collect();
     let ids: Vec<i64> = vec![2i64]; // one supervised position
-    let (t, ce, tv, conf) = burn_dspark::dspark_loss(
+    let (t, ce, tv, conf) = dormouse_dspark::dspark_loss(
         burn::tensor::Tensor::<3>::from_data(
             burn::tensor::TensorData::new(draft, [1, 1, v]), &dev),
         burn::tensor::Tensor::<3>::from_data(

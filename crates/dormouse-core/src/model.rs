@@ -47,7 +47,7 @@ use burn::backend::DispatchKindConversion;
 use burn::module::{Module, Param, ParamId, ParamMapper};
 use burn::nn::{Embedding, EmbeddingConfig};
 use burn::tensor::{Device, DispatchTensor, FloatDType, Int, Tensor};
-use burn_rmsnorm::RMSNorm;
+use dormouse_rmsnorm::RMSNorm;
 
 use crate::aux::AuxHeads;
 use crate::config::DormouseConfig;
@@ -539,7 +539,7 @@ impl DormouseModel {
 
     /// Apply a quantization format to every TSCT factor in the model
     /// (experts, readout projections, lm_head).
-    pub fn set_quant_all(&mut self, quant: burn_spectral::QuantFormat) {
+    pub fn set_quant_all(&mut self, quant: dormouse_spectral::QuantFormat) {
         self.loop_block.set_quant_all(quant);
         self.loop_block.out_proj.set_quant(quant);
         self.lm_head.set_quant(quant);
@@ -563,7 +563,7 @@ impl DormouseModel {
 
     /// The same retraction as [`Self::retract_tsct`], grouped: factors are
     /// stacked by shape and each group is one sync-free batched Newton-Schulz
-    /// call (`burn_spectral::retract_batched`) instead of one host-syncing
+    /// call (`dormouse_spectral::retract_batched`) instead of one host-syncing
     /// `polar_orthogonalize` per factor.
     ///
     /// Two invariants are copied from the scalar path on purpose, because
@@ -596,7 +596,7 @@ impl DormouseModel {
         }
         {
             let mut refs: Vec<&mut Tensor<2>> = vals.iter_mut().collect();
-            burn_spectral::retract_batched(&mut refs, iters);
+            dormouse_spectral::retract_batched(&mut refs, iters);
         }
         for (slot, (((id, map), was_tracked), val)) in slots
             .iter_mut()

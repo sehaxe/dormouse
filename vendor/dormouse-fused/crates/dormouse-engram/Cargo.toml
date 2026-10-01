@@ -1,0 +1,21 @@
+[package]
+name = "dormouse-engram"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Conditional memory for Burn — n-gram hash embeddings with multi-head gated fusion"
+keywords = ["burn"]
+repository = "https://github.com/sehaxe/burn-engram"
+readme = "README.md"
+
+[features]
+default = ["std"]
+std = ["burn/std", "burn-tensor/std", "burn/extension"]
+
+[dependencies]
+burn = { workspace = true }
+burn-tensor = { workspace = true }
+
+[dev-dependencies]
+burn-ndarray = { workspace = true, features = ["blas-openblas"] }
+burn = { workspace = true, features = ["ndarray", "std"] }

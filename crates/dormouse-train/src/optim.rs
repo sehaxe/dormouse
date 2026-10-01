@@ -1,4 +1,4 @@
-//! Optimizer policy: Muon+ (burn-fused) with the Qwen3.8-Flash-Next §3.1
+//! Optimizer policy: Muon+ (dormouse-fused) with the Qwen3.8-Flash-Next §3.1
 //! param routing.
 //!
 //! **The policy lives in [`dormouse_core::routing`]**, next to the arms it
@@ -58,7 +58,7 @@ use burn::{
     optim::{AdanConfig, AdamConfig, AdamWConfig, LearningRate, Optimizer},
     tensor::{Device, ElementConversion, Tensor},
 };
-use burn_muon_plus::{MuonPlus, MuonPlusConfig, MuonPlusState, NormDir};
+use dormouse_muon_plus::{MuonPlus, MuonPlusConfig, MuonPlusState, NormDir};
 use dormouse_core::routing::{self, Group};
 use dormouse_core::DormouseModel;
 use std::sync::atomic::Ordering::Relaxed;
@@ -83,8 +83,8 @@ use crate::{Optim, TrainCfg};
 /// the head-wise Q/K group is ON in every run, `qk_heads` is always resolved).
 pub fn fused_kernels_skipped() -> (u64, u64) {
     (
-        SKIPPED_MOMENTUM.load(Relaxed) + burn_muon_plus::fused_skipped().0,
-        SKIPPED_FINALIZE.load(Relaxed) + burn_muon_plus::fused_skipped().1,
+        SKIPPED_MOMENTUM.load(Relaxed) + dormouse_muon_plus::fused_skipped().0,
+        SKIPPED_FINALIZE.load(Relaxed) + dormouse_muon_plus::fused_skipped().1,
     )
 }
 /// Present on every build so [`fused_kernels_skipped`] has one answer: with
@@ -155,14 +155,14 @@ fn muon_plus_cfg(cfg: &TrainCfg) -> MuonPlusConfig {
 ///
 /// This reimplements the Muon 2D branch, which is how it came to miss the
 /// zero-gradient rule: `MuonPlus::step` gates its update on
-/// [`burn_muon_plus::signal_mask`] so a masked (NaN-firewall) step moves
+/// [`dormouse_muon_plus::signal_mask`] so a masked (NaN-firewall) step moves
 /// nothing, and this must apply the *same* mask from the *same* function. It
 /// did not, and `qk_heads` is always resolved (`cfg.rs:54`), so the Q/K
 /// weights took a full-magnitude step in the stale momentum direction on
 /// every masked step while the rest of the model correctly did not.
 /// Pinned by `headwise_zero_gradient_does_not_move_the_parameter`.
 ///
-/// Q/K here are separate Linears (burn-kda gdn2), so the per-head split is
+/// Q/K here are separate Linears (dormouse-kda gdn2), so the per-head split is
 /// unambiguous - there is no fused `[d, 3d]` qkv to disambiguate.
 #[derive(Clone)]
 pub struct HeadWiseMuon {
@@ -217,7 +217,7 @@ impl Optimizer for HeadWiseMuon {
                 let mut mm = m.clone();
                 #[cfg(feature = "cuda")]
                 {
-                    if !burn_muon_plus::fused_kernels::momentum_cuda(&mut mm, &grad, mu) {
+                    if !dormouse_muon_plus::fused_kernels::momentum_cuda(&mut mm, &grad, mu) {
                         SKIPPED_MOMENTUM.fetch_add(1, Relaxed); // tensor path, counted
                         mm = mm
                             .clone()
@@ -252,7 +252,7 @@ impl Optimizer for HeadWiseMuon {
         // `lr_scaled` in the stale direction. Decoupled weight decay is NOT
         // gated, exactly as in `MuonPlus::step` - a zero gradient is a no-op
         // on the update, not on the decay.
-        let g_active = burn_muon_plus::signal_mask(&grad);
+        let g_active = dormouse_muon_plus::signal_mask(&grad);
         let update = Tensor::cat(parts, 0).mul(g_active.unsqueeze());
 
         // Same tail as MuonPlus 2D. The Bernstein factor uses the FULL
@@ -261,14 +261,14 @@ impl Optimizer for HeadWiseMuon {
         // cases), so the per-param step size is what full Muon would pick.
         // `max(1, m/n)^0.5` vs the paper's `sqrt(m/n)` is inert here: the Q/K
         // weight is `[n_heads*head_dim, d]`, square for every preset, so both
-        // forms are 1.0. See `burn-muon-plus`'s `lr_scaled` comment.
+        // forms are 1.0. See `dormouse-muon-plus`'s `lr_scaled` comment.
         let (m, n) = (rows as f64, cols as f64);
         let lr_scaled = lr * (m / n).max(1.0).sqrt();
         let wd = (self.weight_decay as f32 * lr_scaled as f32).min(0.999);
         let mut updated = tensor.clone();
         #[cfg(feature = "cuda")]
         {
-            if !burn_muon_plus::fused_kernels::finalize_cuda(
+            if !dormouse_muon_plus::fused_kernels::finalize_cuda(
                 &mut updated,
                 &update,
                 lr_scaled as f32,
@@ -579,7 +579,7 @@ mod tests {
 
     /// THE BUG. The NaN firewall zeroes every gradient on device, so a masked
     /// step must be a no-op for the head-wise Q/K group exactly as it is for
-    /// the Muon+ group (`burn-muon-plus/tests/zero_grad.rs`). It was not: the
+    /// the Muon+ group (`dormouse-muon-plus/tests/zero_grad.rs`). It was not: the
     /// momentum decays to `mu·M`, `orthogonalize` normalizes it back to unit
     /// Frobenius norm, and the weight moved by `lr_scaled` in the stale
     /// direction. `qk_heads` is always resolved, so this was every run.
@@ -591,7 +591,7 @@ mod tests {
     /// `orthogonalize(0)` is 0, so the second step is a no-op with or without
     /// the gate. Written the other way round this test passes green with the
     /// mask deleted, which is exactly what happened to the sibling test in
-    /// `burn-muon-plus` (see the note in that file). The leak needs a LIVE
+    /// `dormouse-muon-plus` (see the note in that file). The leak needs a LIVE
     /// momentum, and two masked steps so the decayed-and-still-nonzero case is
     /// covered too.
     #[test]
@@ -656,8 +656,8 @@ mod tests {
         assert_eq!(
             (after.0, after.1),
             (
-                SKIPPED_MOMENTUM.load(Relaxed) + burn_muon_plus::fused_skipped().0,
-                SKIPPED_FINALIZE.load(Relaxed) + burn_muon_plus::fused_skipped().1,
+                SKIPPED_MOMENTUM.load(Relaxed) + dormouse_muon_plus::fused_skipped().0,
+                SKIPPED_FINALIZE.load(Relaxed) + dormouse_muon_plus::fused_skipped().1,
             ),
             "the seam must be the sum of HeadWiseMuon's and MuonPlus::step's"
         );
@@ -760,7 +760,7 @@ mod tests {
     /// `m ≥ n`, which is where `max(1, m/n)^0.5` and `sqrt(m/n)` coincide.
     ///
     /// A wide member is not a failure of the optimizer, it is a failure of this
-    /// argument: it would mean the `lr_scaled` comment in `burn-muon-plus` (and
+    /// argument: it would mean the `lr_scaled` comment in `dormouse-muon-plus` (and
     /// the `D3` deviation being inert) is no longer true, and the deviation
     /// would have to be re-adjudicated rather than assumed.
     #[test]

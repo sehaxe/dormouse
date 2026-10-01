@@ -23,7 +23,7 @@ defects found in a day were this class, and none of them announced itself:
 | found | symptom | cost |
 | --- | --- | --- |
 | `ByteStream::rewind` after the ring drained (2026-09-27) | eval scored a different window than the line above it claimed | cross-run A/Bs were noise (6.443 vs 6.551 for one checkpoint) |
-| fused gated-delta dispatch compared a full backend type (`vendor/burn-kda/src/fused.rs:35`) | the fast path was dead for a year; the tensor path is the same function | a year of "why is this slow" |
+| fused gated-delta dispatch compared a full backend type (`vendor/dormouse-kda/src/fused.rs:35`) | the fast path was dead for a year; the tensor path is the same function | a year of "why is this slow" |
 | the NaN firewall's "raw" loss read the MASKED value (burn `clone()` shares the device buffer; `mask_fill` is in-place on CUDA at two handles) | a NaN step logged `ce=0.000`, `best` stuck at 0 forever | the firewall blinded itself |
 | the parquet branch of `Source::read` returned a length it never copied | any `.parquet` corpus panicked or ingested garbage | books + qa (4.5 GB) were never trainable |
 
@@ -62,16 +62,16 @@ ADR**; `(was SILENT)` marks the ones this commit changed.
 | 13 | `data/src/lib.rs` (`read_bytes` end) returned an empty vec when every file failed — a BPB for a corpus never read | **LOUD** (was SILENT) |
 | 14 | `data/src/lib.rs` (`ensure_reader`): `.ok()` on every `File::open` and parquet builder, twice (first epoch + reshuffle) | **COUNTED** (was SILENT; now `open_source` names the shard on stderr) |
 | **library — fused/accelerated paths** | | |
-| 15 | `burn-rmsnorm/src/lib.rs` (`RMSNorm::forward`: `if let Some(out) = rmsnorm_cuda(..)`), else tensor ops. On the trainer's autodiff backend the fused kernel cannot take an autodiff tensor, so **it never engages** | **COUNTED** (was SILENT; `asked`/`skipped` at `fused.rs:16`) |
-| 16 | `burn-rmsnorm/src/fused.rs` (`rmsnorm_cuda` bails) `None` on non-CUDA tensor / wrong dtype / empty | COUNTED (joins #15) |
-| 17 | `vendor/burn-kda/src/lib.rs:551-583` `kda_fused_chunk_reported(..).into_option()` → `chunk_wy_forward` else-arm | **COUNTED** (the library already reports `Fused`/`Fallback` and keeps `burn_gdn2::fused_calls()`; only the LOG print was missing) — *off-limits crate, reported only* |
-| 18 | `vendor/burn-gdn2/src/kernel/chunk_cube.rs:788`, `chunk_adjoint_cube.rs:411`, `fused_recurrent_cube.rs:91`, `module.rs:52`, `autodiff.rs:86,418` — `is_cuda::<B>()` is the bare-`TypeId` gate, correct only for a bare backend; from an autodiff wrapper it returns `None` | **COUNTED** via #17's seam — *off-limits crate* |
-| 19 | `vendor/burn-gdn2/src/cuda_dispatch.rs:222` `backend_matches` → `Fallback::NotCuda` (named, counted) | COUNTED (the pattern to copy) |
-| 20 | `vendor/burn-sct/src/lib.rs:66,101,160,344` + `qr_cuda.rs:59,84` — `is_cuda` on the QR path | SILENT — *dead crate on our path (burn-sct is not a dormouse dep); no fix taken* |
-| 21 | `vendor/burn-spectral/src/gpu.rs:137,142` and `moe_fused.rs:80-92,1048-1051,1506-1517` — `try_into_primitive::<CB>().ok()?` / downcast `?` on a fused matmul | SILENT (no counter) — *report only, crate is mid-edit by others* |
-| 22 | `vendor/burn-attnres/src/fused_attnres.rs:1127,1239`, `burn-bitnet/src/fwt_cuda.rs:343,394,429`, `burn-mhc/src/sinkhorn_cuda.rs:320,360`, `burn-rope/src/rope_cuda.rs:348,397`, `burn-situ/src/fused_situ.rs:227,264` — the raw `TypeId::of::<B>() == TypeId::of::<CudaBare>()` gate, the exact bug of evidence #2, still in these crates | SILENT — *off-limits crates, report only. `burn-bitnet` IS on our path (`weight_quant_ternary_nm` at `burn-spectral/src/lib.rs:480,494` and `quantize_tensor` at `:563,567`), but the `TypeId` gates are in its `fwt_cuda` module, not in the weight-quant fns the TSCT forward calls — so the claim for our path is narrower: the FWT kernels are dead, and whether the quant kernels are needs a 5-minute read of `fwt_cuda.rs`'s callers, not a guess.* |
-| 23 | `vendor/burn-muon-plus/src/fused_kernels.rs:135,171` `-> bool` = "the fused kernel did not run" | COUNTED at the call site (#5/#6) |
-| 24 | `vendor/burn-dspark/src/lib.rs:107` `None =>` head disabled by config | LOUD (config-driven, documented) |
+| 15 | `dormouse-rmsnorm/src/lib.rs` (`RMSNorm::forward`: `if let Some(out) = rmsnorm_cuda(..)`), else tensor ops. On the trainer's autodiff backend the fused kernel cannot take an autodiff tensor, so **it never engages** | **COUNTED** (was SILENT; `asked`/`skipped` at `fused.rs:16`) |
+| 16 | `dormouse-rmsnorm/src/fused.rs` (`rmsnorm_cuda` bails) `None` on non-CUDA tensor / wrong dtype / empty | COUNTED (joins #15) |
+| 17 | `vendor/dormouse-kda/src/lib.rs:551-583` `kda_fused_chunk_reported(..).into_option()` → `chunk_wy_forward` else-arm | **COUNTED** (the library already reports `Fused`/`Fallback` and keeps `dormouse_gdn2::fused_calls()`; only the LOG print was missing) — *off-limits crate, reported only* |
+| 18 | `vendor/dormouse-gdn2/src/kernel/chunk_cube.rs:788`, `chunk_adjoint_cube.rs:411`, `fused_recurrent_cube.rs:91`, `module.rs:52`, `autodiff.rs:86,418` — `is_cuda::<B>()` is the bare-`TypeId` gate, correct only for a bare backend; from an autodiff wrapper it returns `None` | **COUNTED** via #17's seam — *off-limits crate* |
+| 19 | `vendor/dormouse-gdn2/src/cuda_dispatch.rs:222` `backend_matches` → `Fallback::NotCuda` (named, counted) | COUNTED (the pattern to copy) |
+| 20 | `vendor/dormouse-sct/src/lib.rs:66,101,160,344` + `qr_cuda.rs:59,84` — `is_cuda` on the QR path | SILENT — *dead crate on our path (dormouse-sct is not a dormouse dep); no fix taken* |
+| 21 | `vendor/dormouse-spectral/src/gpu.rs:137,142` and `moe_fused.rs:80-92,1048-1051,1506-1517` — `try_into_primitive::<CB>().ok()?` / downcast `?` on a fused matmul | SILENT (no counter) — *report only, crate is mid-edit by others* |
+| 22 | `vendor/dormouse-attnres/src/fused_attnres.rs:1127,1239`, `dormouse-bitnet/src/fwt_cuda.rs:343,394,429`, `dormouse-mhc/src/sinkhorn_cuda.rs:320,360`, `dormouse-rope/src/rope_cuda.rs:348,397`, `dormouse-situ/src/fused_situ.rs:227,264` — the raw `TypeId::of::<B>() == TypeId::of::<CudaBare>()` gate, the exact bug of evidence #2, still in these crates | SILENT — *off-limits crates, report only. `dormouse-bitnet` IS on our path (`weight_quant_ternary_nm` at `dormouse-spectral/src/lib.rs:480,494` and `quantize_tensor` at `:563,567`), but the `TypeId` gates are in its `fwt_cuda` module, not in the weight-quant fns the TSCT forward calls — so the claim for our path is narrower: the FWT kernels are dead, and whether the quant kernels are needs a 5-minute read of `fwt_cuda.rs`'s callers, not a guess.* |
+| 23 | `vendor/dormouse-muon-plus/src/fused_kernels.rs:135,171` `-> bool` = "the fused kernel did not run" | COUNTED at the call site (#5/#6) |
+| 24 | `vendor/dormouse-dspark/src/lib.rs:107` `None =>` head disabled by config | LOUD (config-driven, documented) |
 | **config / data validation** | | |
 | 25 | `dormouse-core/src/config/validation.rs:21` `if c.d_ffn % 2 != 0 { /* SwiGLU needs even */ }` — an `if` with an empty body: a validation that validates nothing, for a SwiGLU the expert FFN does not have (`gate_up: d→f`, `down: f→d`) | **deleted** (was SILENT: it looked like validation) |
 | 26 | `dormouse-core/src/config/loader.rs:11-12` `read_to_string(p).ok()?` + `parse_str(&s).ok()` per candidate; a present-but-broken preset is skipped and the search continues | COUNTED (the miss reports every path tried) — *acceptable, but see proposals* |
@@ -131,7 +131,7 @@ see the correction below, which is the more useful half of that edit.
 5. `optim.rs` (momentum_cuda / finalize_cuda) — the fused Muon kernel dead in every run, silently.
 6. `stress.rs::grad_norm` — the firewall's only host-side signal, overloaded with a
    second meaning.
-7. `burn_rmsnorm::RMSNorm::forward` — the fused norm kernel dead in every forward.
+7. `dormouse_rmsnorm::RMSNorm::forward` — the fused norm kernel dead in every forward.
 8. `quant_format` — `--quant fp8x` training a whole run in fp32.
 9. `model.rs::aux_loss` — an aux term switching itself off.
 10. `aux.rs::dspark_aux_loss` — DSpark with no window and no gradient, reported as a
@@ -149,14 +149,14 @@ step  1000 EVAL ce=5.412 bpb=7.806 over 102400 B (fixed window) fused kda=812/81
 ```
 
 `kda=fwd/bwd` are launch counters the library already keeps
-(`burn_gdn2::fused_calls()`), `norm=ran/asked` is new in
-`burn-rmsnorm::fused::calls()`, and `muon_skipped` is the head-wise Muon
+(`dormouse_gdn2::fused_calls()`), `norm=ran/asked` is new in
+`dormouse-rmsnorm::fused::calls()`, and `muon_skipped` is the head-wise Muon
 counter. `norm=0/1620` is today's truth: the fused norm kernel does not engage
 on the trainer's backend. Before this line existed, that was unknowable
 without a profiler.
 
 The library already has the pattern to copy, in
-`vendor/dormouse-fused/crates/burn-gdn2/src/cuda_dispatch.rs`: `Fused`/`Fallback`
+`vendor/dormouse-fused/crates/dormouse-gdn2/src/cuda_dispatch.rs`: `Fused`/`Fallback`
 says *which arm ran and why*, and `fused_calls()` counts launches. Use it; do
 not add a third convention.
 
@@ -187,7 +187,7 @@ not add a third convention.
    `no_gradient_is_nan_not_a_clean_zero`.
 5. **Un-stuffing the `TypeId` gates in the five off-limits crates** (site 22).
    Another agent is in each of them. The finding is recorded here so the next
-   person in `burn-bitnet` learns that its kernels are dead on our backend.
+   person in `dormouse-bitnet` learns that its kernels are dead on our backend.
 
 ## Checking new code against this ADR
 

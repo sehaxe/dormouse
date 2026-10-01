@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A feature-gated test file with no `required-features` runs ZERO tests and says `ok`.
 
-Rule (burn-muon-plus, 243a003): a file-level `#![cfg(feature = "cuda")]` AND a
+Rule (dormouse-muon-plus, 243a003): a file-level `#![cfg(feature = "cuda")]` AND a
 `[[test]] required-features = [...]` are BOTH needed. Either one alone leaves a
 target that builds to an empty binary and prints `running 0 tests ... ok` - a
 green line over a test that does not exist, indistinguishable from a pass.

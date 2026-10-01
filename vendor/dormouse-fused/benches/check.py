@@ -33,7 +33,7 @@ for key in sorted(new):
     if delta > eff_tol:
         fails.append((key, v, b))
 
-print("burn-fused perf report (tolerance %+.0f%%):" % (tol * 100))
+print("dormouse-fused perf report (tolerance %+.0f%%):" % (tol * 100))
 print("\n".join(rows))
 if fails:
     print("\nFAIL: regressions detected:")

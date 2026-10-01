@@ -1,6 +1,6 @@
 //! Auxiliary objectives on top of the autoregressive CE (helpers, not the
-//! objective): JEPA latent prediction (data2vec 2.0 via burn-jepa) and the
-//! DSpark draft head (DeepSeek-style future correction via burn-dspark,
+//! objective): JEPA latent prediction (data2vec 2.0 via dormouse-jepa) and the
+//! DSpark draft head (DeepSeek-style future correction via dormouse-dspark,
 //! used instead of MTP).
 //!
 //! - JEPA: an EMA teacher encoder (weights held in the train loop) produces
@@ -17,8 +17,8 @@
 use burn::module::{Module, ModuleMapper, ModuleVisitor, Param};
 use burn::tensor::{Bool, DispatchTensor, Int, Tensor};
 use burn::backend::DispatchKindConversion;
-use burn_dspark::{AcceptRatePredictor, RNNHead, dspark_loss};
-use burn_jepa::{jepa_l1_loss, koleo_loss, JepaPredictor};
+use dormouse_dspark::{AcceptRatePredictor, RNNHead, dspark_loss};
+use dormouse_jepa::{jepa_l1_loss, koleo_loss, JepaPredictor};
 use std::cell::Cell;
 
 /// EMA teacher momentum (data2vec 2.0 ballpark).
@@ -128,7 +128,7 @@ pub fn set_mask_stream(seed: u64, step: u64) {
     MASK_STREAM.with(|c| c.set((seed, step)));
 }
 
-/// Bernoulli-start span-dilated mask, identical to `burn_jepa::mask_indices`
+/// Bernoulli-start span-dilated mask, identical to `dormouse_jepa::mask_indices`
 /// in distribution and semantics but drawn from `(seed, step, index)` instead
 /// of global RNG state: same inputs, same mask, on any backend, forever.
 pub fn mask_stream(t: usize, mask_frac: f32, mask_span: usize) -> Vec<bool> {
@@ -169,7 +169,7 @@ pub fn mask_from(seed: u64, step: u64, t: usize, mask_frac: f32, mask_span: usiz
         z ^= z >> 31;
         if ((z >> 40) as f32) / ((1u32 << 24) as f32) < rate {
             // A start covers `span` positions ENDING AT ITSELF: exactly the
-            // cumsum difference `burn_jepa::mask_indices` computes, and what
+            // cumsum difference `dormouse_jepa::mask_indices` computes, and what
             // makes the expected masked fraction exactly mask_frac
             // (1 - (1 - rate)^span == mask_frac). `max`, not `+=`: a start
             // landing inside an open run MERGES with it rather than pushing
@@ -316,7 +316,7 @@ pub fn ema_update<M: Module>(teacher: M, student: &M, momentum: f64) -> M {
 /// paper's estimator, and it has never been A/B'd against sampling — the
 /// honest statement is "deterministic and documented", not "equivalent".
 pub fn dspark_aux_loss(
-    dspark: &burn_dspark::RNNHead,
+    dspark: &dormouse_dspark::RNNHead,
     conf: &AcceptRatePredictor,
     hidden: Tensor<3>,
     logits: Tensor<3>,
@@ -590,7 +590,7 @@ mod tests {
 
     /// Eq. 7's mechanism, asserted from this side of the boundary: the
     /// acceptance logit must MOVE with the previous token, and the
-    /// hidden-only head must be a constant. `burn_dspark`'s own
+    /// hidden-only head must be a constant. `dormouse_dspark`'s own
     /// `accept_rate_predictor_reads_the_previous_token` says the same thing
     /// at the type; this copy is the one the repo's gate actually runs
     /// (`tools/wt.sh test` builds the vendor crates as dependencies, never
@@ -604,7 +604,7 @@ mod tests {
         const D: usize = 8;
         const R: usize = 4;
         let dev = Device::flex();
-        let markov = burn_dspark::VanillaMarkov::new(64, R, &dev);
+        let markov = dormouse_dspark::VanillaMarkov::new(64, R, &dev);
         let p = AcceptRatePredictor::with_markov(D, R, &dev);
         let h = Tensor::<3>::zeros([1, 3, D], &dev);
         let token = |i: i64| -> Tensor<2, Int> {

@@ -293,7 +293,7 @@ Ranked, by regime:
    incomplete upstream: every shape probed panics with "Expected type
    builtin.fp16 to implement dyn SizedType" (cubecl-ir-0.11.0-pre.4
    interfaces/mod.rs:402 - the fp16 scalar has no SizedType impl), and bf16 is
-   worse (burn-spectral's bf16_matmul fails its own two tests on pre.4+cuda,
+   worse (dormouse-spectral's bf16_matmul fails its own two tests on pre.4+cuda,
    burn-cubecl ops/tensor.rs:150). So on this stack BOTH tensor-core GEMM
    paths are dead end-to-end, and the f32-only path costs us the 4-8x that
    LLMQ's numbers assume. Fix order: (i) check whether a newer cubecl/burn
@@ -418,7 +418,7 @@ Maximum capability per gigabyte on one 16 GB GPU (RTX 5060 Ti) plus 64 GB host R
 
 ### Inference budget (the delivery contract, phase 5 + bench ladder)
 
-Weights at inference live in the component's own format, never bf16: fp8 factors (verified in production), ternary dense via burn-bitnet, int8 Engram rows.
+Weights at inference live in the component's own format, never bf16: fp8 factors (verified in production), ternary dense via dormouse-bitnet, int8 Engram rows.
 
 | Metric | Target (flagship: p150 core + 48M-row Engram int8, 1M ctx) |
 |---|---|

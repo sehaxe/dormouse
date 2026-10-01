@@ -20,7 +20,7 @@
 //!    `torch.float4_e2m1fn_x2`.
 //!
 //! The generator is
-//! `vendor/dormouse-fused/crates/burn-bitnet/tests/oracle/gen_e2m1_oracle.py`,
+//! `vendor/dormouse-fused/crates/dormouse-bitnet/tests/oracle/gen_e2m1_oracle.py`,
 //! the values are in that crate's
 //! `tests/fixtures/e2m1_oracle.txt`, and **this test needs no network**.
 //!
@@ -59,7 +59,7 @@
 //! for tier (a) over tier (d), in one test.
 //!
 //! This test is RED on purpose for the same reason and with the same
-//! convention as `burn-gdn2/tests/fused_adjoint_f64.rs`: it is a defect
+//! convention as `dormouse-gdn2/tests/fused_adjoint_f64.rs`: it is a defect
 //! report that fails until someone fixes `fp4_round`. The fix is to break
 //! exact ties toward the even code, which is a numerical change to a shipped
 //! objective and therefore the owner's call (`.bulba/goal.md`: "Числовая
@@ -84,7 +84,7 @@ const TORCHAO_SHA: &str = "3972ed015091f659418dedf12edb980a8ca56b53";
 
 fn fixture() -> HashMap<String, String> {
     let text = include_str!(
-        "../../../vendor/dormouse-fused/crates/burn-bitnet/tests/fixtures/e2m1_oracle.txt"
+        "../../../vendor/dormouse-fused/crates/dormouse-bitnet/tests/fixtures/e2m1_oracle.txt"
     );
     let mut out = HashMap::new();
     for line in text.lines() {
@@ -179,7 +179,7 @@ fn the_reference_is_round_half_to_even_at_every_interior_tie() {
 /// recorded measurement, not a claim.
 ///
 /// The mutation sweep that proves it is `tests/oracle/mutate_kernel.sh` in
-/// `burn-dspark`, whose M4/M5/M6 mutants are this file's subject.
+/// `dormouse-dspark`, whose M4/M5/M6 mutants are this file's subject.
 #[test]
 fn fp4_ties_match_the_formats_rule() {
     let fx = fixture();

@@ -5,14 +5,14 @@ attention arm receives gradients. `8fa5d4c` fixed the gate; its own commit
 message says the gradient-flowing check was NOT done, and it still was not.
 
 Lane: worktree `wt/kda-gradflow`, off `a071ecd`.
-Deliverable: `vendor/dormouse-fused/crates/burn-kda/tests/kda_param_grads_cuda.rs`.
+Deliverable: `vendor/dormouse-fused/crates/dormouse-kda/tests/kda_param_grads_cuda.rs`.
 
 ## The seam, as read (2026-09-30)
 
 `crates/dormouse-core/src/loop_block.rs:397` →
 `KdaModule::forward_train_state::<B>(normed_attn, kda_s.take())` →
-`self.project(x)` → `burn_kda::fused::cuda::kda_fused_chunk_reported::<B>` →
-(not bare cuda) → `burn_gdn2::chunk_dispatch::<B>`.
+`self.project(x)` → `dormouse_kda::fused::cuda::kda_fused_chunk_reported::<B>` →
+(not bare cuda) → `dormouse_gdn2::chunk_dispatch::<B>`.
 
 `chunk_dispatch` (`cuda_dispatch.rs:365-441`) on the trainer's backend
 `Autodiff<CudaBare, BalancedCheckpointing>`:
@@ -32,25 +32,25 @@ Deliverable: `vendor/dormouse-fused/crates/burn-kda/tests/kda_param_grads_cuda.r
 LEAF-free op in two cases: `!any_tracked`, or `DM_FUSED_KDA=0`. Both now fall
 through to step 4, which is a real gradient. That is the fix.
 
-The counters that say which arm ran — `burn_gdn2::seam_counts()` returns
+The counters that say which arm ran — `dormouse_gdn2::seam_counts()` returns
 `(asked, fused_fwd, fused_bwd, declined, ops_path, custom_node_bwd)`. The
 decisive one for "did a backward run inside the op" is `custom_node_bwd`
 (index 5), incremented by `note_backward_node()` on entry to `ChunkWy::backward`
 — which is also the hook that `DM_GDN2_BWD_TRACE=1` prints `ENTERED` from.
 
-## Why the test is in burn-kda, not burn-gdn2
+## Why the test is in dormouse-kda, not dormouse-gdn2
 
-The brief asked for `burn-gdn2/tests/`. The arm the trainer runs is
-`burn_kda::KdaModule` (`crates/dormouse-core/src/attention.rs:55`) and its
+The brief asked for `dormouse-gdn2/tests/`. The arm the trainer runs is
+`dormouse_kda::KdaModule` (`crates/dormouse-core/src/attention.rs:55`) and its
 parameter names are the ones the brief lists — `a_log` / `b_alpha` are
-`KdaDecay`'s. burn-gdn2's own `GatedDeltaNet2` has `a_log` + `dt_bias` and no
-`b_alpha`; it is not what the trainer builds, and burn-gdn2 cannot depend on
-burn-kda without a cycle. So the test lives in burn-kda, which can reach both
+`KdaDecay`'s. dormouse-gdn2's own `GatedDeltaNet2` has `a_log` + `dt_bias` and no
+`b_alpha`; it is not what the trainer builds, and dormouse-gdn2 cannot depend on
+dormouse-kda without a cycle. So the test lives in dormouse-kda, which can reach both
 the module and the seam counters it already depends on.
 
 ## What already existed, and what it left open
 
-`burn-kda/tests/ops_grad_cuda.rs` (the strong gate) differentiates exactly one
+`dormouse-kda/tests/ops_grad_cuda.rs` (the strong gate) differentiates exactly one
 parameter, `q_proj.weight`, against central differences at `h = 1e-2` with
 `REL_BAR = 5e-2`, and asserts `ops_path > 0 || fused_bwd > 0`. That is a real
 test of one tensor. It leaves open the class the defect actually lives in: a
@@ -148,7 +148,7 @@ because the projections' outputs are checkpoint leaves, and the decline is what
 makes the ops path carry the gradient — a correct fix that trades the fused
 kernel for correctness.
 
-`burn-kda/tests/cuda_gate.rs` already gates the decline; run 1 confirms it on a
+`dormouse-kda/tests/cuda_gate.rs` already gates the decline; run 1 confirms it on a
 real module rather than a synthetic fixture, which is what was missing.
 
 **Consequence for this lane's tests:** the "two arms" are two checkpointing
@@ -161,7 +161,7 @@ a second label on one program.
 
 ## The falsification patch (prepared, applied after GREEN)
 
-`burn-gdn2/src/cuda_dispatch.rs:449`, one line:
+`dormouse-gdn2/src/cuda_dispatch.rs:449`, one line:
 
 ```diff
 -        Fused::Fused((o, s))
@@ -213,7 +213,7 @@ backend never reaches the fused op. It does mean the fused path is not a
 candidate for A/B until its adjoint is fixed, and that `8fa5d4c`'s fix should
 not be read as "the fused path works".
 
-Filed as a follow-up with `file:line` for the burn-gdn2 owner (§1.6: not this
+Filed as a follow-up with `file:line` for the dormouse-gdn2 owner (§1.6: not this
 lane's file). The test asserts FLOW on that arm and PRINTS the disagreement on
 every run, so the fused arm can never be reported as numerically verified.
 
@@ -225,7 +225,7 @@ once, ONE fused chunk kernel launched, the op declined twice, the ops path
 carried the step, and the custom node's backward never ran. A fused forward
 whose output nothing consumes is a fused path that runs and is thrown away —
 the exact shape of a silent fallback (ADR-0019's third mark), and worth the
-burn-gdn2 owner's attention. What this file asserts is unaffected either way:
+dormouse-gdn2 owner's attention. What this file asserts is unaffected either way:
 whichever arm runs, every group gets a correct gradient.
 
 ## Result (green) — the trainer's backend, `AdBal`, trainer parameter shape
@@ -319,7 +319,7 @@ recurrence agree to 1e-7 with an independent CPU autodiff, run after run, while
 every parameter reaching the op's INPUTS does not. A noisy forward would move
 the downstream three too.
 
-What it costs, and what it means for the project: `burn-gdn2`'s fused adjoint
+What it costs, and what it means for the project: `dormouse-gdn2`'s fused adjoint
 cannot be A/B'd, and no fused number on it can be quoted, until both the
 non-determinism and the offset are explained. This is the same finding §3.2
 recorded as "the fused adjoint kernels have never been numerically compared to
@@ -330,7 +330,7 @@ Falsification, the trace, and the commit: below.
 ## THE FALSIFICATION — red, with the group named, then restored byte-identical
 
 The break is one line, on the arm the trainer runs
-(`burn-gdn2/src/cuda_dispatch.rs:449`, the ops path):
+(`dormouse-gdn2/src/cuda_dispatch.rs:449`, the ops path):
 
 ```diff
          note_fused_declined();

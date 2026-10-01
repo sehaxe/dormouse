@@ -113,7 +113,7 @@ being zero across processes. Compare parameter tensors, never files.
 amplified over its 64 sequential iterations. Not the memory pool, not the
 allocator, not an unseeded draw.**
 
-`vendor/dormouse-fused/crates/burn-spectral/src/lib.rs:457-469` — every TSCT factor
+`vendor/dormouse-fused/crates/dormouse-spectral/src/lib.rs:457-469` — every TSCT factor
 is the Q of a QR of a random normal matrix:
 
 ```rust
@@ -150,7 +150,7 @@ in TSCT factors (nothing else in model init runs an iterative factorisation).
 
 **No unseeded draw exists to report.** The defect is a nondeterministic
 *reduction*; the sites are the `.sum()`/`matmul` calls at
-`burn-spectral/src/lib.rs:697`, `:704`, `:711`, `:714`.
+`dormouse-spectral/src/lib.rs:697`, `:704`, `:711`, `:714`.
 
 **Confidence, stated precisely.** That the divergence is a reduction-order
 difference inside this loop is measured (points 1-4). That it is specifically

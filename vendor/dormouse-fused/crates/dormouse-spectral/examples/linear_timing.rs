@@ -1,0 +1,93 @@
+//! SpectralLinear fused training kernels vs dense at real sizes: forward and
+//! forward+backward wall-clock at B=16384.
+//! Run: cargo run --release -p dormouse-spectral --features cuda --example linear_timing
+//!
+//! The per-kernel breakdown this used to print under `TSCT_TIMING=1` is gone
+//! with the `dormouse_spectral::fused` module: the collector it read
+//! (`clear_step_timing` / `take_step_timing`) was deleted with the module and
+//! nothing replaced it, so the env var now selects nothing. The wall-clock arms
+//! below are unaffected - they need no instrumentation.
+use burn::module::Module;
+use burn::nn::{Linear, LinearConfig};
+use burn::tensor::{Device, Distribution, Tensor};
+use dormouse_spectral::SpectralLinear;
+
+fn bench(label: &str, m: usize, n: usize, k: usize, b: usize, iters: usize) {
+    let dev = Device::cuda(0).autodiff();
+    let mut s = SpectralLinear::new(m, n, k, &dev);
+    let d = LinearConfig::new(m, n).init(&dev);
+    let x = Tensor::<2>::random([b, m], Distribution::Normal(0.0, 1.0), &dev);
+    // warmup both paths, drained: the one-time kernel JIT compile must not
+    // land inside the timed loops
+    let y = s.forward(x.clone());
+    let g = y.powf_scalar(2.0).sum().backward();
+    let _: f32 = s.u.grad(&g).unwrap().sum().into_scalar();
+    let _ = d.forward(x.clone());
+
+    let t = std::time::Instant::now();
+    for _ in 0..iters {
+        let y = s.forward(x.clone());
+        let _: f32 = y.sum().into_scalar();
+    }
+    let fused_fwd = t.elapsed().as_secs_f64() / iters as f64;
+
+    let t = std::time::Instant::now();
+    for _ in 0..iters {
+        let y = s.forward(x.clone());
+        let grads = y.powf_scalar(2.0).sum().backward();
+        let _: f32 = s.u.grad(&grads).unwrap().sum().into_scalar();
+    }
+    let fused_fb = t.elapsed().as_secs_f64() / iters as f64;
+
+    s.set_fused(false);
+    let t = std::time::Instant::now();
+    for _ in 0..iters {
+        let y = s.forward(x.clone());
+        let _: f32 = y.sum().into_scalar();
+    }
+    let old_fwd = t.elapsed().as_secs_f64() / iters as f64;
+    s.set_fused(true);
+
+    let t = std::time::Instant::now();
+    for _ in 0..iters {
+        let y = d.forward(x.clone());
+        let _: f32 = y.sum().into_scalar();
+    }
+    let dense = t.elapsed().as_secs_f64() / iters as f64;
+
+    let t = std::time::Instant::now();
+    for _ in 0..iters {
+        let y = d.forward(x.clone());
+        let grads = y.powf_scalar(2.0).sum().backward();
+        let _: f32 = d.weight.grad(&grads).unwrap().sum().into_scalar();
+    }
+    let dense_fb = t.elapsed().as_secs_f64() / iters as f64;
+
+    println!("== {label}: m={m} k={k} n={n} B={b} ==");
+    println!(
+        "  fused fwd:     {:8.4} ms   fused fwd+bwd: {:8.4} ms",
+        fused_fwd * 1e3,
+        fused_fb * 1e3
+    );
+    println!(
+        "  dense fwd:     {:8.4} ms   dense fwd+bwd: {:8.4} ms",
+        dense * 1e3,
+        dense_fb * 1e3
+    );
+    println!(
+        "  old path fwd:  {:8.4} ms (TSCT tensor ops)",
+        old_fwd * 1e3
+    );
+    println!(
+        "  fused fwd {:.2}x faster than dense; fused fwd+bwd {:.2}x faster than dense fwd",
+        dense / fused_fwd,
+        dense / fused_fb
+    );
+}
+
+fn main() {
+    let iters = 10;
+    let b = 16384usize;
+    bench("plan dims", 512, 4096, 32, b, iters);
+    bench("mission dims", 768, 3072, 32, b, iters);
+}

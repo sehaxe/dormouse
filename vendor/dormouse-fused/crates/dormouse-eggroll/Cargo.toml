@@ -1,0 +1,21 @@
+[package]
+name = "dormouse-eggroll"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "EGGROLL — low-rank evolutionary strategies for Burn (arXiv:2511.16652)"
+keywords = ["burn"]
+repository = "https://github.com/sehaxe/burn-eggroll"
+readme = "README.md"
+
+[features]
+default = ["std"]
+std = ["burn/std", "burn-tensor/std"]
+
+[dependencies]
+burn = { workspace = true }
+burn-tensor = { workspace = true }
+
+[dev-dependencies]
+burn-ndarray = { workspace = true, features = ["blas-openblas"] }
+burn = { workspace = true, features = ["ndarray", "std"] }

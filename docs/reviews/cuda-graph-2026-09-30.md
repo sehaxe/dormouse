@@ -85,7 +85,7 @@ ungraphed. That is 4× the window the abandoned attempt aimed at.
 **Correction to a comment I would otherwise have repeated:** `probe.rs` describes
 `RETRACT_FACTOR` as "one host-syncing `polar_orthogonalize` per factor", which
 would have put the retraction outside the window. That is **stale**:
-`burn-spectral/src/lib.rs:208-233` is sync-free since 2026-09-29 ("112 host reads
+`dormouse-spectral/src/lib.rs:208-233` is sync-free since 2026-09-29 ("112 host reads
 per training step ... now takes none"). A doc-vs-code disagreement in the
 direction that would have cost us 26 ms of window (§1.7: report it, don't
 invent a third answer).
@@ -166,7 +166,7 @@ design below is therefore §6 **with the pin row mandatory**, not optional.
 Two facts make the window the **whole step** and make the graph one dispatch:
 
 - **The path is sync-free.** Every `into_scalar` / `into_data` /
-  `try_into_scalar` in `train/src/optim.rs`, `burn-muon-plus/src/fused_kernels.rs`
+  `try_into_scalar` in `train/src/optim.rs`, `dormouse-muon-plus/src/fused_kernels.rs`
   and `core/src/loop_block.rs` is inside a `mod tests` (optim.rs:551,
   fused_kernels.rs:208, loop_block.rs:616). The production
   fwd → bwd → opt → retr → ema path reads nothing back.

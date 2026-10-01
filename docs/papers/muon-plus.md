@@ -1,6 +1,6 @@
-# Muon+ — arXiv:2602.21545 — verification, literal transcription, delta vs `burn-muon-plus`
+# Muon+ — arXiv:2602.21545 — verification, literal transcription, delta vs `dormouse-muon-plus`
 
-**Fetch date: 2026-09-29.** Read-only pass over `vendor/dormouse-fused/crates/burn-muon-plus/`
+**Fetch date: 2026-09-29.** Read-only pass over `vendor/dormouse-fused/crates/dormouse-muon-plus/`
 and `crates/dormouse-train/src/optim.rs`. No GPU, no build, no test.
 
 ## TL;DR
@@ -12,7 +12,7 @@ and `crates/dormouse-train/src/optim.rs`. No GPU, no build, no test.
 2. **Two real BUGs found**, one of them severe (a dead code path in `orthogonalize` that
    makes the claimed speedup unreachable — see D1).
 3. **A provenance error**: the `37%` speedup number our README quotes exists only in **v3**,
-   not in the v1 most code comments were written against. And `burn-spectral`'s polar
+   not in the v1 most code comments were written against. And `dormouse-spectral`'s polar
    retraction cites 2602.21545 §1 for a formula that is **not in that paper** (D5).
 4. Our `ns_steps=8` vs the paper's **5** is a **deliberate, documented** deviation, not a
    bug. The "optimizer is 19% of a step" figure is orthogonal to the paper and unaffected.
@@ -161,7 +161,7 @@ explicitly says "Muon+ has nearly the same per-step runtime and memory cost as M
 
 ## 3. Delta table
 
-`file:line` against `vendor/dormouse-fused/crates/burn-muon-plus/src/` and
+`file:line` against `vendor/dormouse-fused/crates/dormouse-muon-plus/src/` and
 `crates/dormouse-train/src/optim.rs`. Verdicts: **BUG** / **DELIBERATE** / **BENIGN** /
 **UNVERIFIABLE**.
 
@@ -171,12 +171,12 @@ explicitly says "Muon+ has nearly the same per-step runtime and memory cost as M
 | D2 | `lib.rs:142-145` comment | — | Comment claims factored is "measured 3.6x on [8192,512] via two `[c,c]@[c,r]` matmuls instead of `[c,c]@[c,c] + [c,c]@[c,r]`". FLOP count: factored = 3·(`2·nr²·nc`); direct = `2·nr²·nc + nr³`. At `nr=512, nc=8192` factored is **1.48× MORE** flops. The claim is backwards even as arithmetic. | **BUG** (stale/unreachable claim; the README already retracts the measurement as unmeasured) |
 | D3 | `lib.rs:303-308` | Paper Eq. (4) + Alg. 1 line 10: `lr * (m/n)**0.5` | `lr * (m/n).max(1.0).sqrt()` — i.e. `max(1, m/n)^0.5` | **DELIBERATE** — matches Jordan's `muon.py` (`update *= max(1, m/n)**0.5`), documented at `:303-305` and in `bench/RESEARCH_VERIFICATION.md:13`. It is a **deviation from the Muon+ paper**, correctly sourced to Jordan instead. |
 | D4 | `optim.rs:82` `MUON_NS_STEPS = 8` | Paper: **5**, everywhere, explicitly (§3) | 8 | **DELIBERATE** — comment at `:80-81` names the real source (the Qwen3.8-Flash-Next report §3.1, not Muon+). Correctly attributed. |
-| D5 | `burn-spectral/src/lib.rs:164-166` doc comment | Muon+ §1 defines `Ortho(·)` abstractly and **prints no NS coefficients** | Comment says "Newton-Schulz polar iteration (Muon+ 2602.21545 §1)" — but the code below uses **cubic** coefficients `(15/8, −5/4, 3/8)` (`:205`, `:256`), which are **not** Muon+'s quintic `(3.4445, −4.775, 2.0315)` | **BUG** (mis-citation; see `tsct.md` §3) |
+| D5 | `dormouse-spectral/src/lib.rs:164-166` doc comment | Muon+ §1 defines `Ortho(·)` abstractly and **prints no NS coefficients** | Comment says "Newton-Schulz polar iteration (Muon+ 2602.21545 §1)" — but the code below uses **cubic** coefficients `(15/8, −5/4, 3/8)` (`:205`, `:256`), which are **not** Muon+'s quintic `(3.4445, −4.775, 2.0315)` | **BUG** (mis-citation; see `tsct.md` §3) |
 | D6 | `lib.rs:61` `NS_COEFFS = (3.4445, -4.775, 2.0315)` | Jordan `muon.py`: `a, b, c = (3.4445, -4.7750, 2.0315)` | exact match | **BENIGN** ✅ |
 | D7 | `lib.rs:215-234` `norm_col`/`norm_row` | Alg. 1: `denom = (X.square().sum(dim) + eps).sqrt()`, `eps = 1e-8` | `.sqrt().clamp_min(1e-7)` | **BENIGN** — different epsilon placement (add-then-sqrt vs clamp-after-sqrt). Only differs when a norm is below ~1e-4, where the result is ~0 either way. `optim.rs:86` calls ColRow, so this is the live path. |
 | D8 | `lib.rs:197-211` `ColRow`/`RowCol` | Eq. (7)/(8): `col_row := row(col(X))`, `row_col := col(row(X))` | `ColRow => norm_row(norm_col(x))`; `RowCol => norm_col(norm_row(x))` | **BENIGN** ✅ exact match, including composition order. |
 | D9 | `lib.rs:274-297` momentum | Eq. (4): `M = μ·M_{t-1} + (1−μ)·G` | identical, no Nesterov | **BENIGN** ✅ (note: Jordan's `muon_update` defaults to `nesterov=True` and lerps `grad` toward `momentum`; the **paper drops Nesterov** and so do we — we follow the paper.) |
-| D10 | `lib.rs:271` `if D == 2` | Paper routing: Muon+ on "all parameters except embeddings, unembeddings, normalization layers, positional encodings" | **Rank-based**: every 2-D tensor gets Muon+. On its own this would send the **2-D embedding** to Muon+, which the paper forbids. | **BENIGN** — in the live trainer this never happens: `routing.rs:96` routes `(Head, …)` and `rest_of(gdn2)` to `Group::Rest` and the embedding to the base optimizer; `burn-muon-plus` is a library whose `D==2` branch is only reached for params the trainer put in `Group::Muon`. `check_installed` (a 1-D param in Muon+ is a loud error) backs it. |
+| D10 | `lib.rs:271` `if D == 2` | Paper routing: Muon+ on "all parameters except embeddings, unembeddings, normalization layers, positional encodings" | **Rank-based**: every 2-D tensor gets Muon+. On its own this would send the **2-D embedding** to Muon+, which the paper forbids. | **BENIGN** — in the live trainer this never happens: `routing.rs:96` routes `(Head, …)` and `rest_of(gdn2)` to `Group::Rest` and the embedding to the base optimizer; `dormouse-muon-plus` is a library whose `D==2` branch is only reached for params the trainer put in `Group::Muon`. `check_installed` (a 1-D param in Muon+ is a loud error) backs it. |
 | D11 | `optim.rs:90-101` `group_of` | Paper: Muon+ on weight matrices, AdamW on embeddings/head/norms/positional | Policy: Muon+ on **only the small TSCT factors** + head-wise Q/K; AdamW on embeddings, head, routers, gates, convs, dense `[m,n]` | **DELIBERATE** — a *narrower* group than the paper's, justified by measured fp32 NS cost on `[d,d]` (`~40 s/step`, `routing.rs:76-80`). Deviation is documented and the reason is a machine fact, not a paper claim. |
 | D12 | `lib.rs:192` `normalize` returns `x` unchanged when `norm_dir = None` | Paper always normalizes | gated off by config | **BENIGN** — `MuonPlusConfig::norm_dir` defaults to `None` (`:87`), so the crate's *default* is plain Muon, and `optim.rs:86` is what turns ColRow on. A/B-able by construction, which is what ADR-0002 wants. |
 | D13 | `lib.rs:262-269` `g_active` mask | Not in the paper | A zero grad ⇒ zero update, decided on device | **DELIBERATE** — project rule ADR-0018 r2; long comment at `:249-261`. Correctly built with `mask_fill` on a float tensor, not a bool→float indicator. |
@@ -188,7 +188,7 @@ explicitly says "Muon+ has nearly the same per-step runtime and memory cost as M
 ### The `batched` vs `loop` 4.1–4.8× measurement
 
 Not checked against the paper — the paper contains no batching discussion and Jordan's
-`muon.py` has no batched path. `burn-spectral/src/lib.rs:225-290` (`retract_batched` /
+`muon.py` has no batched path. `dormouse-spectral/src/lib.rs:225-290` (`retract_batched` /
 `polar_orthogonalize_batched`) is the sync-free batched formulation, and it is
 **identical math to the scalar path by construction** (same coefficients, same loop) —
 only the σ_max estimation and the norms are batched. A 4.1–4.8× ratio on ops with
@@ -235,7 +235,7 @@ Verdict: BENIGN, orthogonal.**
    so that kernel is dead in production despite being tested at `fused_kernels.rs:344`)
    plus an unsatisfiable condition that reads like a guard. **Fix is one line** — either
    delete the branch or invert to `nc * 4 > nr` and re-measure with a device flush.
-2. **D5 — `burn-spectral` cites Muon+ §1 for a cubic it does not have there.** Cross-file,
+2. **D5 — `dormouse-spectral` cites Muon+ §1 for a cubic it does not have there.** Cross-file,
    handled in `tsct.md`.
 3. **D2 / D14 — stale measurement claim, version-less citation.** Both cheap to fix.
 4. **D3 / D4 / D11 — deliberate, documented deviations.** Correct as they stand; listed so

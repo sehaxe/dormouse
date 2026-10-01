@@ -1,9 +1,9 @@
 /target
 crates/*/target
 # `ref_data/` is NOT ignored: a test fixture nobody can regenerate is not a
-# reproducibility claim. burn-gdn2's oracle fixtures are committed (the
-# exceptions below) and burn-sct's is wanted the same way once its generator
-# exists — see crates/burn-gdn2/TEST-AUDIT.md.
+# reproducibility claim. dormouse-gdn2's oracle fixtures are committed (the
+# exceptions below) and dormouse-sct's is wanted the same way once its generator
+# exists — see crates/dormouse-gdn2/TEST-AUDIT.md.
 **/*.bin
 # The f64 reference fixtures, same reason and one more: `tests/ref_f64.rs` must
 # run in CI without Python or NumPy present at all, so the expected values have
@@ -19,9 +19,9 @@ crates/*/target
 # every reader but the one who ran the generator, and nothing local complains:
 # the `include_bytes!` resolves on the author's disk. `git check-ignore -v <new
 # fixture>` before trusting a green run.
-!crates/burn-gdn2/tests/ref_f64.bin
-!crates/burn-gdn2/tests/ref_f64_faults.bin
-!crates/burn-gdn2/tests/ref_f64_broad.bin
+!crates/dormouse-gdn2/tests/ref_f64.bin
+!crates/dormouse-gdn2/tests/ref_f64_faults.bin
+!crates/dormouse-gdn2/tests/ref_f64_broad.bin
 # The f64 GRADIENT oracle for the chunked-WY backward, same reason: its
 # expected values come from NumPy, and `tests/autodiff_bwd_f64.rs` must run in
 # CI with no Python present. `ref_bwd_f64.bin` is the oracle;
@@ -29,9 +29,9 @@ crates/*/target
 # `ref_bwd_f64_carry.bin` is the ORACLE FOR THE STATE-CARRY DEFECT below, so
 # the diagnosis carries its own expected values rather than only a number in
 # a commit message.
-!crates/burn-gdn2/tests/ref_bwd_f64.bin
-!crates/burn-gdn2/tests/ref_bwd_f64_faults.bin
-!crates/burn-gdn2/tests/ref_bwd_f64_carry.bin
+!crates/dormouse-gdn2/tests/ref_bwd_f64.bin
+!crates/dormouse-gdn2/tests/ref_bwd_f64_faults.bin
+!crates/dormouse-gdn2/tests/ref_bwd_f64_carry.bin
 Cargo.lock.bak
 .bulba/
 

@@ -40,7 +40,7 @@ use std::time::Instant;
 
 /// The trainer's backend, verbatim from crates/dormouse-train/src/lib.rs.
 type Ad = Autodiff<burn_cuda::Cuda, BalancedCheckpointing>;
-/// The same math behind burn-kda's single fused autodiff node.
+/// The same math behind dormouse-kda's single fused autodiff node.
 type NoCkpt = Autodiff<burn_cuda::Cuda, NoCheckpointing>;
 
 /// The production shape: `small` preset, batch 10, seq 512, 12 heads,
@@ -158,7 +158,7 @@ fn main() {
     let (reserved_fwd, reserved_bwd, t_fwd, t_bwd) = call("call 3 (warm)");
 
     // ── the same math behind ONE fused autodiff node ─────────────────
-    // burn-kda's fused-op dispatch is a TypeId check on the WHOLE backend type
+    // dormouse-kda's fused-op dispatch is a TypeId check on the WHOLE backend type
     // (`Autodiff<CudaBare>` = NoCheckpointing), so the trainer's
     // `Autodiff<Cuda, Balanced>` misses it and runs the ~150-ops-per-chunk
     // tensor path. A module on a NoCheckpointing device is the only way to

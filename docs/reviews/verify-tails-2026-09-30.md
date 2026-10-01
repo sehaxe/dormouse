@@ -168,12 +168,12 @@ test, `cp` restore, `md5sum -c`. Restored byte-identical
 throughout — the audit's own process note records that one going the other way
 and producing a false "the restore did not work".
 
-**Suites:** `dspark_loss_oracle` 10/10 (was 8, +2 new), `burn-dspark --lib`
+**Suites:** `dspark_loss_oracle` 10/10 (was 8, +2 new), `dormouse-dspark --lib`
 17/17, `dormouse-core --lib` 53/53, `e2m1_oracle` 4/4, `act_quant` 7/7,
 `cargo check --workspace` clean.
 
 **One device change with a reason:** `burn`'s `autodiff` feature is now a
-dev-dependency of `burn-dspark` for the gradient test. That makes
+dev-dependency of `dormouse-dspark` for the gradient test. That makes
 `Device::default()` an autodiff device, so the three pre-existing value tests
 now name `Device::ndarray()` explicitly. A golden comparison that silently
 changes backend is a golden comparison nobody re-ran.
@@ -190,7 +190,7 @@ audit's word. Six were real; the seventh (`mutate_kernel.sh`) is item 3.
 |---|---|---|---|
 | 1 | `act_quant.rs:113` | **doc wrong** — reworded | said "ties away from zero" (= ties-UP). The rule has been ties-to-**even-code** since `dc5d667`, 40 lines below, with the seven-tie table beside it. I re-derived the tie behaviour from the ladder rather than trusting either comment: at all seven interior ties our level equals the even-code member. Reworded to say why there is no "towards" direction at all — even-code **alternates**, so 0.75 and 3.5 go up and the other five go down. |
 | 2 | `act_quant.rs:217` | **doc wrong** — reworded | said "ties to the coarser level". Right about five of seven, wrong about 0.75 and 3.5. Reworded to "the member whose code is even, which alternates". |
-| 3 | `burn-dspark/src/lib.rs:6-9` | **doc wrong** — reworded | said "NOT yet matched against the official DeepSpec implementation — the 7 tests here are hand-derived and **cannot detect a wrong loss term**". The crate has a tier-(a) oracle that ran DeepSeek's own loss, and it has now found and fixed **three** wrong loss terms. Reworded to name the oracle, what it caught, and — the sentence that was still true — that the rest of the crate is hand-derived from the paper with no reference of any kind. |
+| 3 | `dormouse-dspark/src/lib.rs:6-9` | **doc wrong** — reworded | said "NOT yet matched against the official DeepSpec implementation — the 7 tests here are hand-derived and **cannot detect a wrong loss term**". The crate has a tier-(a) oracle that ran DeepSeek's own loss, and it has now found and fixed **three** wrong loss terms. Reworded to name the oracle, what it caught, and — the sentence that was still true — that the rest of the crate is hand-derived from the paper with no reference of any kind. |
 | 4 | `e2m1_oracle.rs:161` | **doc wrong** — reworded | "RED ON PURPOSE … Not fixed here … the fix is the owner's". Fixed in `dc5d667`. Reworded to record the defect, its measurement, the fixing commit, and that **re-reverting `dc5d667` turns the test red at exactly the four named ties**. A red-on-purpose marker left in a green test is worse than none: the next reader is told the code is broken when it is not. |
 | 5 | `dspark_loss_oracle.rs:275` | **doc wrong** — reworded | same shape as 4, for `8c3bd2a`, including the stale claim that the fix "is NOT made here, because this lane's task is the evidence and the fix is the owner's". Both fixes are made; the re-revert numbers are recorded. |
 | 6 | `dspark_loss_oracle.rs:56-62` | **doc wrong, and it was a coverage claim the fixture did not deliver** — reworded in two places, and made executable | see below. |
@@ -332,7 +332,7 @@ only place the command lived.
 ## 5. Follow-ups, not mine
 
 1. **`tools/oracle_gate.py` reports 1 violation and it is pre-existing.** The
-   `burn-muon-plus/tests/oracle/muon_oracle.bin` row points at a file that is
+   `dormouse-muon-plus/tests/oracle/muon_oracle.bin` row points at a file that is
    not in the tree. Verified pre-existing by stashing my change and re-running
    (same 1 violation). Other lane's row; I did not touch it.
 2. **The `den + 1e-6` divergence is still in the code**, bounded and unreachable.
@@ -340,7 +340,7 @@ only place the command lived.
    change to a shipped objective for no benefit at the only live call site. The
    doc and the new test both name it rather than hide it.
 3. **AGENTS.md §3.2 needs a row for this lane.** The AGENTS.md text at the time
-   of writing still describes `burn-dspark`'s `dspark_loss` without the detach
+   of writing still describes `dormouse-dspark`'s `dspark_loss` without the detach
    and the gradient gate, and its `--dspark-weight` bullet lists two fixed
    things and not the third. I did not edit AGENTS.md: another lane owns it and
    §1.6 says not to edit files an agent is in.
@@ -355,31 +355,31 @@ cd /home/sehaxe/dormouse-wt/verify-tails
 
 # item 1 — the suites
 tools/build_lock.sh run t -- bash -c 'cd vendor/dormouse-fused && \
-  cargo test -p burn-dspark --features training --test dspark_loss_oracle'
+  cargo test -p dormouse-dspark --features training --test dspark_loss_oracle'
 tools/build_lock.sh run t -- bash -c 'cd vendor/dormouse-fused && \
-  cargo test -p burn-dspark --features training --lib'
+  cargo test -p dormouse-dspark --features training --lib'
 
 # item 1 — the RED demonstration (cp snapshot, md5 before and after)
-SRC=vendor/dormouse-fused/crates/burn-dspark/src/lib.rs
+SRC=vendor/dormouse-fused/crates/dormouse-dspark/src/lib.rs
 cp "$SRC" /tmp/lib.rs.bak && md5sum "$SRC"
 python3 - <<'PY'
-p="vendor/dormouse-fused/crates/burn-dspark/src/lib.rs"
+p="vendor/dormouse-fused/crates/dormouse-dspark/src/lib.rs"
 s=open(p).read()
 a="accept_rate_target(draft_logits, target_logits).detach()"
 assert s.count(a)==1
 open(p,"w").write(s.replace(a,"accept_rate_target(draft_logits, target_logits)"))
 PY
 tools/build_lock.sh run t -- bash -c 'cd vendor/dormouse-fused && \
-  cargo test -p burn-dspark --features training --test dspark_loss_oracle'
+  cargo test -p dormouse-dspark --features training --test dspark_loss_oracle'
 cp /tmp/lib.rs.bak "$SRC" && md5sum "$SRC"   # 353e0c09bd67479431ec27be2547a39e
 
 # item 1 — regenerate the fixture from a clean venv, following the docstring
-cd vendor/dormouse-fused/crates/burn-dspark/tests/oracle
+cd vendor/dormouse-fused/crates/dormouse-dspark/tests/oracle
 /tmp/opencode/fresh2/bin/python gen_dspark_loss_oracle.py --deepspec /tmp/opencode/fresh2-ds \
   > /tmp/regen.txt && md5sum /tmp/regen.txt ../fixtures/dspark_loss_oracle.txt
 
 # item 3 — the full sweep
-tools/build_lock.sh run m -- bash vendor/dormouse-fused/crates/burn-dspark/tests/oracle/mutate_kernel.sh
+tools/build_lock.sh run m -- bash vendor/dormouse-fused/crates/dormouse-dspark/tests/oracle/mutate_kernel.sh
 
 # item 2 / 4 — gates
 tools/build_lock.sh run t -- bash -c 'cd /home/sehaxe/dormouse-wt/verify-tails && \

@@ -40,7 +40,7 @@
 use burn::backend::DispatchKindConversion;
 use burn::module::Module;
 use burn::tensor::{activation, Device, DispatchTensor, Tensor};
-use burn_rmsnorm::RMSNorm;
+use dormouse_rmsnorm::RMSNorm;
 
 use crate::param::LinearLike;
 

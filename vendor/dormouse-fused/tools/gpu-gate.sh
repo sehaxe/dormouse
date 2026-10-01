@@ -20,7 +20,7 @@
 #
 # This script therefore does what a runner would have done, and it fails loudly:
 #   1. refuses to pass without a visible CUDA device,
-#   2. sets BURN_DEVICE=cuda, without which burn-rope's and burn-situ's cuda
+#   2. sets BURN_DEVICE=cuda, without which dormouse-rope's and dormouse-situ's cuda
 #      tests `return` early and report PASS having asserted nothing,
 #   3. asserts the expected number of tests actually RAN, so a silently
 #      cfg'd-out or `#[ignore]`d test cannot read as a pass,
@@ -56,7 +56,7 @@ export CUDARC_CUDA_VERSION="${CUDARC_CUDA_VERSION:-12050}"
 #      verification, and must never be reported as one.
 echo "── gated_delta_chunk_path_runs_at_the_production_shape (B=10 H=12 T=512 k=v=64, chunk 64) ──"
 out=$(mktemp)
-cargo test -p burn-fused --release --features cuda,autodiff \
+cargo test -p dormouse-fused --release --features cuda,autodiff \
   --test gpu_production_shape -- --nocapture 2>&1 | tee "$out"
 rc=${PIPESTATUS[0]}
 rm -f "$out"
@@ -70,19 +70,19 @@ ran=$(grep -oE 'test result: ok\. [0-9]+ passed' <<<"$out" | grep -oE '[0-9]+ pa
 echo
 echo "── what this gate does NOT cover (do not mistake it for the whole library) ──"
 cat <<'EOF'
-  * the other 12 cuda crates' GPU tests (burn-attnres, burn-bitnet, burn-kda,
-    burn-mhc, burn-mor, burn-muon-plus, burn-rmsnorm, burn-rope, burn-sct,
-    burn-situ, burn-spectral, burn-swiglu). They have never run in any
-    executed job either; several are known-red (burn-spectral's three
-    `retract` panics, burn-attnres self-records BROKEN), so folding them in
+  * the other 12 cuda crates' GPU tests (dormouse-attnres, dormouse-bitnet, dormouse-kda,
+    dormouse-mhc, dormouse-mor, dormouse-muon-plus, dormouse-rmsnorm, dormouse-rope, dormouse-sct,
+    dormouse-situ, dormouse-spectral, dormouse-swiglu). They have never run in any
+    executed job either; several are known-red (dormouse-spectral's three
+    `retract` panics, dormouse-attnres self-records BROKEN), so folding them in
     now would make this gate permanently red and therefore not run.
-  * burn-sct's reference comparison. `tests/cmp_reference.rs` still cannot run:
+  * dormouse-sct's reference comparison. `tests/cmp_reference.rs` still cannot run:
     no `tests/gen_reference.py`, no `tests/ref_data/*.bin`, and `binary-tests`
-    is not a default feature. See crates/burn-sct/.gitignore.
+    is not a default feature. See crates/dormouse-sct/.gitignore.
   * a performance gate. `vendor/dormouse-fused/.github/workflows/bench.yml` was
     deleted with the rest of the never-runnable workflows: it needed a
     self-hosted GPU runner and it `git push`ed from the runner. The honest
-    local equivalent is `cargo run -p burn-fused-benches --release` and reading
+    local equivalent is `cargo run -p dormouse-fused-benches --release` and reading
     the numbers; nothing compares them to bench/baselines.json automatically.
 EOF
 echo

@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use burn::module::{Module, ModuleVisitor, Param, ParamGroup, ParamId};
 use burn::tensor::Tensor;
-use burn_engram::EngramModule;
+use dormouse_engram::EngramModule;
 
 use crate::attention::AdaptiveAttention;
 use crate::loop_block::{ExpertFFN, LoopBlock};
@@ -338,7 +338,7 @@ impl Routed for AdaptiveAttention {
 impl Routed for EngramModule {
     fn route(&self, into: &mut Routing, _factors_fallback: bool) {
         // ponytail: the one path match left in the repo, because
-        // burn-engram keeps its fields private and its key projections are
+        // dormouse-engram keeps its fields private and its key projections are
         // indistinguishable from its value projection by type or shape (both
         // are a bias-free `nn::Linear` [3*32, d]). The patterns are matched
         // against paths RELATIVE to the engram, in the file that owns the

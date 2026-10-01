@@ -1,7 +1,7 @@
 //! Differential test for the TSCT retraction: the per-factor path the trainer
 //! has always run (`LinearLike::retract` -> `SpectralLinear::retract` ->
 //! `polar_retracked`, one host-syncing `polar_orthogonalize` per factor) and
-//! the grouped one (`burn_spectral::retract_batched`, factors stacked by shape
+//! the grouped one (`dormouse_spectral::retract_batched`, factors stacked by shape
 //! into sync-free batched Newton-Schulz) must produce THE SAME masters from THE
 //! SAME inputs, on a real model's real factor set.
 //!
@@ -92,7 +92,7 @@ fn master_slots(model: &mut DormouseModel) -> Vec<&mut Param<Tensor<2>>> {
 
 /// Take every master's value out of its `Param`, retract them all in ONE
 /// grouped call, and write them back - the bookkeeping the production entry
-/// point has to do, written here against `burn_spectral::retract_batched`
+/// point has to do, written here against `dormouse_spectral::retract_batched`
 /// directly.
 ///
 /// Two invariants are copied from the scalar path on purpose, because they are
@@ -120,7 +120,7 @@ fn batched_retract(model: &mut DormouseModel, iters: usize) -> usize {
     let n = vals.len();
     {
         let mut refs: Vec<&mut Tensor<2>> = vals.iter_mut().collect();
-        burn_spectral::retract_batched(&mut refs, iters);
+        dormouse_spectral::retract_batched(&mut refs, iters);
     }
     for (slot, (((id, map), was_tracked), val)) in slots.iter_mut().zip(
         ids.into_iter()

@@ -9,9 +9,9 @@ tree.
    It is not a vendor: every one of its crates is ours. Under `vendor/` it was a
    lie, and the `burn-*` crate names falsely implied upstream burn crates that
    someone could find on crates.io - which is exactly the confusion that made a
-   researcher conclude "burn-fused is a dependency we import" instead of "this is
+   researcher conclude "dormouse-fused is a dependency we import" instead of "this is
    our technology library".
-2. Crate names follow: `burn-kda` -> `dormouse-kda`, `burn-gdn2` ->
+2. Crate names follow: `dormouse-kda` -> `dormouse-kda`, `dormouse-gdn2` ->
    `dormouse-gdn2`, and so on for all 26 crates. One namespace, ours.
 3. **Every mechanism and every kernel lives in the library, never inside the
    model.** `dormouse-core` keeps only the model, the loop, the config and the
@@ -38,7 +38,7 @@ tree.
 
 | today | destination | why |
 |-------|-------------|-----|
-| `src/act_quant.rs` (170) | `dormouse-bitnet` | its own doc comment says it "adds the activation side" to the quantizers already in burn-bitnet; it is one mechanism split across two homes |
+| `src/act_quant.rs` (170) | `dormouse-bitnet` | its own doc comment says it "adds the activation side" to the quantizers already in dormouse-bitnet; it is one mechanism split across two homes |
 | `src/param.rs` (165) | new `dormouse-linear` | `LinearLike` + TSCT factors + per-SM quant selection + polar retraction is a technology, not a model detail |
 | `src/gr.rs` (117) | new `dormouse-residual` (or a module in `dormouse-mhc`, see below) | Gated Residual is a published mechanism (Qwen3.8-Flash-Next) and is comparable to mHC and AttnRes |
 | `src/aux.rs` (229) | `dormouse-jepa` / `dormouse-dspark` (the loss) + a thin composition helper in core | same reasoning: the losses belong with their implementations |
@@ -52,9 +52,9 @@ of them:
 - ReZero (in `loop_block.rs`, scale init 1.0)
 - Gated Residual (in `gr.rs`, `use_gr`, never A/B'd)
 - mHC - Manifold-Constrained Hyper-Connections, DeepSeek 2512.24880, already
-  implemented in `burn-mhc`
+  implemented in `dormouse-mhc`
 - AttnRes - Attention Residuals, 2603.15031, already implemented in
-  `burn-attnres` (2060 lines, fused CUDA kernel)
+  `dormouse-attnres` (2060 lines, fused CUDA kernel)
 
 The residual stream is where a shared-weight loop is most sensitive, and it is
 the one axis where we have a free, already-written alternative. That comparison

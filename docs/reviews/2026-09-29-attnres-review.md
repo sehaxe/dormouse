@@ -2,7 +2,7 @@
 
 Merged 2026-10-01 from the `attnres-review-a.md` and `attnres-review-b.md` halves, both at
 `5cfdbda`, which is where a reader finds each one whole. The halves were written independently
-and neither read the other (A: Review of `docs/papers/attnres.md` — independent verification; B: Reviewer B — would following `docs/papers/attnres.md` actually fix `burn-attnres`?),
+and neither read the other (A: Review of `docs/papers/attnres.md` — independent verification; B: Reviewer B — would following `docs/papers/attnres.md` actually fix `dormouse-attnres`?),
 which is why both verdicts are kept: where they agree the finding is settled,
 where they disagree the disagreement is the finding. Nothing was reworded.
 
@@ -12,7 +12,7 @@ Reviewer: adversarial reviewer, spawned session. Date: 2026-09-29.
 Methods actually used: `pdftotext -layout` on a fresh download of `arXiv:2603.15031v1`,
 GitHub REST API (`trees`, `branches`, `tags`, `releases`, `commits`, `issues`), `curl` of
 third-party sources, and line-by-line reading of
-`vendor/dormouse-fused/crates/burn-attnres/src/{lib.rs,fused_attnres.rs}`.
+`vendor/dormouse-fused/crates/dormouse-attnres/src/{lib.rs,fused_attnres.rs}`.
 **No code was built or run.** Every "I traced" below is a source trace, and each one names
 the command that would settle it empirically.
 
@@ -81,8 +81,8 @@ Three corrections to the report's own numbers:
   1821 = **2338**. `docs/archive/architecture/PLAN-minimal-core.md:90` says 2060. Three documents, three numbers,
   none re-measured. AGENTS.md §1.4: "a measurement is a measurement only with the config, the
   date and the commit it was taken at."
-* `crates/burn-attnres/README.md:3–:8` (§3.3) is a **wrong path** — the file is
-  `vendor/dormouse-fused/crates/burn-attnres/README.md`. Its content is as quoted (3–8 does say
+* `crates/dormouse-attnres/README.md:3–:8` (§3.3) is a **wrong path** — the file is
+  `vendor/dormouse-fused/crates/dormouse-attnres/README.md`. Its content is as quoted (3–8 does say
   "Not in the dormouse build").
 
 #### 1.3 Claim 3 — CONFIRMED, every line reference real
@@ -206,11 +206,11 @@ The headline "the crate is not a port" survives; the arithmetic does not.
 #### 1.9 Claim 9 — CONFIRMED
 
 `crates/dormouse-core/Cargo.toml` and every other `crates/dormouse-*/Cargo.toml`: **no
-reference to `burn-attnres`**. The workspace root `Cargo.toml:12` has
+reference to `dormouse-attnres`**. The workspace root `Cargo.toml:12` has
 `exclude = ["vendor/dormouse-fused", "vendor/cubecl-fix", "vendor/cubek-fix"]` and `members` =
 `cublas-poc, dormouse-core, dormouse-data, dormouse-train, dormouse-cli, backend-parity`. The
-only inbound edges to `burn-attnres` are inside its own workspace: `vendor/dormouse-fused/Cargo.toml:4`,
-`vendor/dormouse-fused/burn-fused/Cargo.toml:19,31,52,79`, `vendor/dormouse-fused/benches/Cargo.toml:12`.
+only inbound edges to `dormouse-attnres` are inside its own workspace: `vendor/dormouse-fused/Cargo.toml:4`,
+`vendor/dormouse-fused/dormouse-fused/Cargo.toml:19,31,52,79`, `vendor/dormouse-fused/benches/Cargo.toml:12`.
 `docs/architecture/library-crate-fate.md:62` records fate `b / REFERENCE`; `docs/archive/architecture/PLAN-minimal-core.md:90`
 (§M2) names it as a residual-stream A/B arm that has not been run. **No dormouse number is
 retracted. This claim is the most important one in the report and it is correct.**
@@ -426,7 +426,7 @@ Consequence: `depth_attend_backward_tensor` (`fused_attnres.rs:1341-1385`), the 
 non-CUDA fallback used at `:1324` whenever the `TypeId` gate at `:1307` fails, has **no
 numerical test at all**. Its only callers are that fallback and a bench (`:1092`).
 
-This is the defect class `AGENTS.md` §3.2 already records for `burn-gdn2`:
+This is the defect class `AGENTS.md` §3.2 already records for `dormouse-gdn2`:
 *"`fused_chunk_verify.rs:132` … compared that tensor adjoint against the tensor path, i.e.
 **verified the tensor adjoint twice**."* Same mistake, different crate, still live.
 
@@ -468,7 +468,7 @@ Two problems, both invisible to the report:
 * `m1 = scores.max_dim(1)` at `:430` is a **reduction over a zero-length axis** when `n == 0`.
   Its value is backend-dependent. If it is `-inf`, `w1 = exp(-inf - -inf) = NaN` and the
   result is `NaN`, not `0`. **UNVERIFIED** — settle with
-  `cargo test -p burn-attnres --features cuda two_phase` after adding
+  `cargo test -p dormouse-attnres --features cuda two_phase` after adding
   `two_phase_attend(Tensor::zeros([4,8]), Tensor::zeros([0,8]))` and asserting the output is
   either the correct Eq.-6 answer or a named error.
 
@@ -498,7 +498,7 @@ is a **plausible lead on the report's own open question 1**: K3 §2.2 is ordinar
 *sequence-wise* attention, where `1/√d` is the standard convention. If the author ported from
 K3's attention block and then wired it to 2603.15031's text, the `1/√d` is a habit from the
 wrong paper, not a considered temperature argument. **UNVERIFIED** as intent — settle by
-`git log -p --follow -- vendor/dormouse-fused/crates/burn-attnres/src/fused_attnres.rs | head -200`
+`git log -p --follow -- vendor/dormouse-fused/crates/dormouse-attnres/src/fused_attnres.rs | head -200`
 and looking at the introducing commit's message; the repo's log for the crate starts at
 `d1a76fe` (vendoring), so the original authoring history may not be reachable.
 
@@ -548,7 +548,7 @@ Besides the above, the report's own text contains these, all verified:
 2. **"12 open issues"** = 13 open + 1 closed. §1.2.
 3. **"2268 lines"** in §3.3 vs its own §1 measurement of 2338; `PLAN-minimal-core.md:90` says
    2060. §1.2.
-4. **`crates/burn-attnres/README.md:3–:8`** — wrong path. §1.2.
+4. **`crates/dormouse-attnres/README.md:3–:8`** — wrong path. §1.2.
 5. **D3's remedy factor is `√d`; it is `d`.** And D3 is not an independent observable. §1.5.
 6. **D2's "different ε placement"** is false — both put ε inside the root. §1.4.
 7. **D6's "degenerate to a standard residual connection at every block boundary"** is an
@@ -638,9 +638,9 @@ paper reference, and (c) asserts that at step 3 the source set is `[b_0, b_1, f_
 **excludes `f_3` itself** from the mixture. If `out_3` is a function of `f_3` (i.e. §3.2 is
 wrong), the self-loop is absent and the crate's `step` is closer to the paper than I have
 traced. Settles §3.2, and re-ranks D5/D6/D7 in one run. Command:
-`cargo test -p burn-attnres --lib step_source_set` (no GPU, no `cuda` feature).
+`cargo test -p dormouse-attnres --lib step_source_set` (no GPU, no `cuda` feature).
 
-## Reviewer B — Reviewer B — would following `docs/papers/attnres.md` actually fix `burn-attnres`?
+## Reviewer B — Reviewer B — would following `docs/papers/attnres.md` actually fix `dormouse-attnres`?
 
 **Angle:** I assume every claim in the report is TRUE and ask only whether acting on it
 produces a correct crate. Independent of reviewer A; I did not read their file.
@@ -653,13 +653,13 @@ from files already in the tree, and four prior in-repo audits the report does no
 
 **What I could not verify — UNVERIFIED:**
 * the current pass/fail of `streaming_fused_matches_tensor_path` (the one recorded-red
-  CUDA test). Command: `cd vendor/dormouse-fused && cargo test -p burn-attnres --features
+  CUDA test). Command: `cd vendor/dormouse-fused && cargo test -p dormouse-attnres --features
   cuda,autodiff --lib streaming_fused_matches_tensor_path`. Needs a GPU; not permitted here.
-* whether the `1/√d` was ever a deliberate decision. `git log -S'powf(-0.5)' -- vendor/dormouse-fused/crates/burn-attnres`
-  returns exactly one commit, `d1a76fe` ("self-contained repo: vendor burn-fused …"), i.e.
+* whether the `1/√d` was ever a deliberate decision. `git log -S'powf(-0.5)' -- vendor/dormouse-fused/crates/dormouse-attnres`
+  returns exactly one commit, `d1a76fe` ("self-contained repo: vendor dormouse-fused …"), i.e.
   **the crate's pre-vendor history is not in this repo at all**. The question is unanswerable
   from this tree; it needs `git log -S` against the upstream clone named in the crate's
-  README badge (`github.com/sehaxe/burn-attnres`).
+  README badge (`github.com/sehaxe/dormouse-attnres`).
 
 ---
 
@@ -920,7 +920,7 @@ wrong later, invisible to every test that only checks init.
 
 * **(a) Delete the scale, adopt the paper's formula.** One change. It also deletes D4 as
   unrepresentable, and the training cost is **zero**, because no run has ever used the
-  crate — verified: no `Cargo.toml` under `crates/` references `burn-attnres` (grep over
+  crate — verified: no `Cargo.toml` under `crates/` references `dormouse-attnres` (grep over
   every `.toml`), and the workspace `exclude` at `Cargo.toml:12` keeps `vendor/dormouse-fused`
   out of the product build entirely. This is the only option that satisfies the owner's rule
   as written.
@@ -943,7 +943,7 @@ made under a bar that has no achievable form for this paper.
 
 ---
 
-### 5. Is `burn-attnres` worth the work?
+### 5. Is `dormouse-attnres` worth the work?
 
 **Facts, all verified from this tree.** 2402 lines (517 `lib.rs` + 1821 `fused_attnres.rs`
 + 64 bench). Fate class **REFERENCE** (`docs/architecture/library-crate-fate.md:62`). Zero incoming edges
@@ -1051,9 +1051,9 @@ open question 3 nominates as the survivor. Its block representations are wrong a
 source, before the scale, the norm, or anything else. Report it as **D10**; it is a tenth
 BUG, and it is in the function the report would keep.
 
-*Minor, for the record:* `attnres.md:319` cites `crates/burn-attnres/README.md:3-8`. The
+*Minor, for the record:* `attnres.md:319` cites `crates/dormouse-attnres/README.md:3-8`. The
 path does not exist; the file is
-`vendor/dormouse-fused/crates/burn-attnres/README.md:3-8` (AGENTS.md §2.5: `vendor/` is
+`vendor/dormouse-fused/crates/dormouse-attnres/README.md:3-8` (AGENTS.md §2.5: `vendor/` is
 canonical). And §5's "should stay red until the deviation is removed" conflicts with
 AGENTS.md's "failing test = bug in code — fix code, never skip/delete tests"; the correct
 form is `#[ignore]` **with a named ADR reference**, or fix the code and make it green.

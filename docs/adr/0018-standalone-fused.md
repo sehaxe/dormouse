@@ -11,7 +11,7 @@ does not require dormouse to compile, and a change in it must not be able to
 break the model's build.
 
 The concrete failure that forced this: a half-written instrumentation file in
-`burn-gdn2` (`alloc_trace.rs`, two compile errors) made `cargo check
+`dormouse-gdn2` (`alloc_trace.rs`, two compile errors) made `cargo check
 -p dormouse-core` fail, which blocked twelve agents' commits and made the model
 unbuildable for the duration. A technology library must not be able to take the
 model down.
@@ -54,7 +54,7 @@ against the GPU on every step, and the whole workload is launch-bound: the
 firewall now masks the loss on device, sanitizes the gradients on device, and
 derives its own accounting from the gradient norm the host already reads at log
 cadence. Where a decision genuinely depends on a device value, the decision is
-made ON the device (see the zero-gradient rule in `burn-muon-plus`: a zero
+made ON the device (see the zero-gradient rule in `dormouse-muon-plus`: a zero
 gradient means zero update, computed with a `mask_fill` rather than a host
 branch).
 
@@ -81,7 +81,7 @@ reaches it.
 - Writing a kernel before the roofline arithmetic says the kernel is the
   bottleneck (documented: `docs/research/2026-09-27-kda-sota-ceiling.md` - the op is
   memory bound at 3.1 FLOP/byte against a machine balance of 24).
-- Implementing a mechanism that already exists in the fork. `burn-mor` and
-  `burn-attnres` were both fully implemented while two agents were about to
+- Implementing a mechanism that already exists in the fork. `dormouse-mor` and
+  `dormouse-attnres` were both fully implemented while two agents were about to
   write them from scratch.
 - Touching `dormouse-core` from a library crate, in any direction.

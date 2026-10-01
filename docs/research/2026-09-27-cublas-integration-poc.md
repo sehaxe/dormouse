@@ -264,7 +264,7 @@ All with `CUBLAS_GEMM_DEFAULT` (= -1), fp32 accumulator, `C` always f32:
    start before this. It is 110 additive lines with defaulted methods, so a
    backend that does not implement them is unaffected.
 2. **Wrap one burn op.** `cublas_matmul(a: CubeTensor, b: CubeTensor) ->
-   CubeTensor` in `burn-spectral` (it already depends on `cubecl` + `burn` and
+   CubeTensor` in `dormouse-spectral` (it already depends on `cubecl` + `burn` and
    owns `bf16_ops.rs`): resolve `(a, b)` plus a fresh
    `client.empty_tensor([m,n], 4)` handle in **one** `native_handles` call,
    `GemmEx` on the startup-cached stream, and return

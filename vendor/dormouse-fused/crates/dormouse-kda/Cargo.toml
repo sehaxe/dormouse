@@ -1,0 +1,81 @@
+[package]
+name = "dormouse-kda"
+version = "0.5.0"
+edition = "2021"
+license = "MIT"
+description = "Kimi Delta Attention for Burn - data-dependent write strength, channel-wise decay (Kimi Linear + K3), fused CUDA chunk path"
+keywords = ["burn", "kda", "delta", "attention", "recurrent"]
+repository = "https://github.com/sehaxe/burn-kda"
+homepage = "https://github.com/sehaxe/burn-kda"
+readme = "README.md"
+
+[features]
+default = ["std"]
+std = ["burn/std", "burn-tensor/std", "dormouse-gdn2/std"]
+autodiff = ["burn/autodiff", "dormouse-gdn2/autodiff", "dep:burn-autodiff"]
+cuda = ["dep:burn-cuda", "dep:burn-cubecl", "dep:cubecl", "burn/cuda", "burn-tensor/cuda", "dormouse-gdn2/cuda"]
+
+[dependencies]
+burn = { workspace = true }
+burn-tensor = { workspace = true }
+dormouse-gdn2 = { path = "../dormouse-gdn2", default-features = false }
+burn-autodiff = { workspace = true, optional = true, features = ["std"] }
+burn-cuda = { workspace = true, optional = true }
+burn-cubecl = { workspace = true, optional = true }
+cubecl = { workspace = true, optional = true, features = ["std"] }
+
+[dev-dependencies]
+burn-ndarray = { workspace = true, features = ["blas-openblas"] }
+burn = { workspace = true, features = ["ndarray", "autodiff", "cuda", "extension"] }
+
+# `cargo test` builds examples, so without these the three `#![cfg(feature =
+# "cuda")]` examples compile to an empty crate and the crate's own documented
+# command fails with E0601 `main` function not found.
+[[example]]
+name = "bitforbit_cuda"
+required-features = ["cuda"]
+
+[[example]]
+name = "kda_bench"
+required-features = ["cuda"]
+
+[[example]]
+name = "kda_step_probe"
+required-features = ["cuda"]
+
+# Same rule for the test targets, and it is the same defect: a file-level
+# `#![cfg(feature = "cuda")]` alone still leaves cargo building the target on
+# the default cell, so `cargo test -p dormouse-kda` printed FOUR `running 0 tests
+# ... ok` lines - green over a test that does not exist. `required-features` is
+# what stops cargo from building the empty target at all. Both are needed
+# (243a003). `tools/test_targets.py` fails the build if a gated file appears
+# without one.
+#
+# `fused_cuda.rs` names `autodiff` too: it gates its gradient arm per-test
+# (`fused_train_grads_flow_cuda`), so with only `cuda` the target would build,
+# report green, and silently drop that arm - the same lie one level down.
+[[test]]
+name = "bench_cuda"
+required-features = ["cuda", "autodiff"]
+
+[[test]]
+name = "cuda_gate"
+required-features = ["cuda", "autodiff"]
+
+[[test]]
+name = "fused_cuda"
+required-features = ["cuda", "autodiff"]
+
+# `ops_grad_cuda` differentiates ONE parameter (`q_proj.weight`) against central
+# differences. `kda_param_grads_cuda` is the per-GROUP version: every KDA
+# parameter group, on both dispatch arms, each with its own named verdict. The
+# 8fa5d4c defect was a whole arm getting no gradient, and a gate that checks
+# one tensor of eleven cannot see a backward that reaches the first projection
+# and stops - which is the shape the failure takes.
+[[test]]
+name = "kda_param_grads_cuda"
+required-features = ["cuda", "autodiff"]
+
+[[test]]
+name = "ops_grad_cuda"
+required-features = ["cuda", "autodiff"]

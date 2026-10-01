@@ -2,7 +2,7 @@
 //! orthonormal TSCT factors? Prints max/mean quantization error on U.
 //! cargo run --release -p dormouse-core --features cuda --example quant_probe
 use burn::tensor::Device;
-use burn_spectral::SpectralLinear;
+use dormouse_spectral::SpectralLinear;
 
 /// Same autodiff backend the trainer uses (forward_with_hidden needs an
 /// AutodiffBackend; plain Cuda is not one).
@@ -16,7 +16,7 @@ fn main() {
     let lin = SpectralLinear::new(768, 2048, 64, &device);
     let u = lin.u.val();
     for bits in [4usize, 8] {
-        let q = burn_bitnet::quantize_tensor::<burn_cuda::Cuda>(u.clone(), bits);
+        let q = dormouse_bitnet::quantize_tensor::<burn_cuda::Cuda>(u.clone(), bits);
         let vu: Vec<f32> = u.clone().into_data().try_to_vec().unwrap();
         let vq: Vec<f32> = q.into_data().try_to_vec().unwrap();
         let mut max_d = 0.0f32;
@@ -37,7 +37,7 @@ fn main() {
         );
     }
     // STE roundtrip used by forward_quant: w + (q - w).detach()
-    let q = burn_bitnet::quantize_tensor::<burn_cuda::Cuda>(u.clone(), 4);
+    let q = dormouse_bitnet::quantize_tensor::<burn_cuda::Cuda>(u.clone(), 4);
     let ste = u.clone() + (q - u.clone()).detach();
     let vste: Vec<f32> = ste.into_data().try_to_vec().unwrap();
     let vu: Vec<f32> = u.into_data().try_to_vec().unwrap();
@@ -56,7 +56,7 @@ fn main() {
     );
     let y_plain = lin.forward(x.clone());
     let mut linq = lin.clone();
-    linq.set_quant(burn_spectral::QuantFormat::Fp4);
+    linq.set_quant(dormouse_spectral::QuantFormat::Fp4);
     let y_q = linq.forward_quant::<burn_cuda::Cuda>(x);
     let vp: Vec<f32> = y_plain.into_data().try_to_vec().unwrap();
     let vq: Vec<f32> = y_q.into_data().try_to_vec().unwrap();
@@ -67,7 +67,7 @@ fn main() {
     let cfg = dormouse_core::DormouseConfig::default();
     let m_plain = dormouse_core::DormouseModel::new(&cfg, &device);
     let mut m_quant = m_plain.clone();
-    m_quant.loop_block.set_quant_all(burn_spectral::QuantFormat::Fp4);
+    m_quant.loop_block.set_quant_all(dormouse_spectral::QuantFormat::Fp4);
     let ids: Vec<i64> = (0..(2 * 64)).map(|i| (i % 250) as i64).collect();
     let xb: burn::tensor::Tensor<2, burn::tensor::Int> =
         burn::tensor::Tensor::from_data(burn::tensor::TensorData::new(ids.clone(), [2, 64]), &device);

@@ -81,7 +81,7 @@ routine is not.
 
 ## Root cause
 
-`burn-spectral`'s `SpectralLinear::new` (`vendor/dormouse-fused/crates/burn-spectral/src/lib.rs:456-469`)
+`dormouse-spectral`'s `SpectralLinear::new` (`vendor/dormouse-fused/crates/dormouse-spectral/src/lib.rs:456-469`)
 initialises each factor as **the Q of a Householder QR of a random normal
 matrix**, and `qr_householder` (`lib.rs:688-715`) is:
 
@@ -143,7 +143,7 @@ cannot be diffed byte-for-byte, and no layer-2 golden file can exist for a
 model whose TSCT factors are produced by a device QR. If a bit-exact artifact
 is ever needed, the fix is one routine: seed the QR's factors directly (they
 are orthonormal by construction after one retraction anyway) or run the init
-QR on the host. That is a change to `burn-spectral`, a crate another lane owns,
+QR on the host. That is a change to `dormouse-spectral`, a crate another lane owns,
 and I have not touched it.
 
 ## The instrument, and the mistake I made in it

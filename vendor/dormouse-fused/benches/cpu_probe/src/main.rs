@@ -4,8 +4,8 @@ fn main() {
     let dev = Device::cpu();
     let (b, t, nh, hd) = (2usize, 16, 4, 32);
     let x = Tensor::<4>::random([b, t, nh, hd], Distribution::Normal(0.0, 1.0), &dev);
-    let (cos, sin) = burn_rope::precompute_freqs(hd, t, 10000.0, &dev);
-    let _ = burn_rope::apply_rope_4d::<B>(x.clone(), cos.clone(), sin.clone());
+    let (cos, sin) = dormouse_rope::precompute_freqs(hd, t, 10000.0, &dev);
+    let _ = dormouse_rope::apply_rope_4d::<B>(x.clone(), cos.clone(), sin.clone());
     let half = hd / 2;
     let x1 = x.clone().slice([0..b, 0..t, 0..nh, 0..half]);
     let x2 = x.clone().slice([0..b, 0..t, 0..nh, half..hd]);
@@ -18,7 +18,7 @@ fn main() {
         ],
         3,
     );
-    let fused_out = burn_rope::apply_rope_4d::<B>(x.clone(), cos, sin);
+    let fused_out = dormouse_rope::apply_rope_4d::<B>(x.clone(), cos, sin);
     let diff: f32 = (fused_out - ref_out).abs().max().into_scalar();
     println!(
         "cubecl-cpu rope: diff = {:.3e} {}",
@@ -30,7 +30,7 @@ fn main() {
     {
         let (n, h) = (64usize, 32);
         let gu = Tensor::<2>::random([n, 2 * h], Distribution::Normal(0.0, 1.0), &dev);
-        let f = burn_situ::situ_glu(gu.clone(), h, 1.0, 1.5);
+        let f = dormouse_situ::situ_glu(gu.clone(), h, 1.0, 1.5);
         let g = gu.clone().slice([0..n, 0..h]);
         let u = gu.slice([0..n, h..2 * h]);
         let ref_s = g
@@ -49,7 +49,7 @@ fn main() {
 
     // --- rmsnorm fused on cubecl-cpu ---
     {
-        let norm = burn_rmsnorm::RMSNorm::new(32, 1e-5, &dev);
+        let norm = dormouse_rmsnorm::RMSNorm::new(32, 1e-5, &dev);
         let x = Tensor::<3>::random([1, 8, 32], Distribution::Default, &dev);
         let y = norm.forward(x.clone());
         let w = norm.weight.val();
@@ -71,7 +71,7 @@ fn main() {
     // --- swiglu fused on cubecl-cpu ---
     {
         let gu = Tensor::<3>::random([1, 8, 64], Distribution::Default, &dev);
-        let y = burn_swiglu::swiglu_gate(gu.clone());
+        let y = dormouse_swiglu::swiglu_gate(gu.clone());
         let g = gu.clone().slice([0..1, 0..8, 0..32]);
         let u = gu.slice([0..1, 0..8, 32..64]);
         let ref_y = burn::tensor::activation::silu(g).mul(u);

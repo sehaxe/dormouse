@@ -84,11 +84,11 @@ and `HEAD`'s root manifest differs from the working one:
 
 | | `HEAD` (`d96d155`) | working tree |
 |---|---|---|
-| `exclude` | `burn-fused`, `cubecl-fix` | + `cubek-fix`, `burn-cubecl` |
+| `exclude` | `dormouse-fused`, `cubecl-fix` | + `cubek-fix`, `burn-cubecl` |
 | `[patch.crates-io]` | cubecl-runtime/server/cuda | + `cubek-reduce`, `burn-cubecl` |
 | `burn-cubecl` in `Cargo.lock` | `source = "registry+…crates.io-index"` | **no `source`** ⇒ vendored path crate |
 | `dormouse-core` dev-dep | `burn-ndarray … features = ["blas-openblas"]` | removed (BLAS-free `burn/flex`) |
-| `dormouse-core` deps | — | + `burn-gdn2`, `burn-mor` (path) |
+| `dormouse-core` deps | — | + `dormouse-gdn2`, `dormouse-mor` (path) |
 | members | 5 crates | + `crates/backend-parity` |
 
 So a worktree off `HEAD` resolves **`burn-cubecl` and `cubek-reduce` from
@@ -114,10 +114,10 @@ Compiling cubecl-server  v0.11.0-pre.4 (…/discipline-probe/vendor/cubecl-fix/c
 Compiling cubecl-cuda    v0.11.0-pre.4 (…/discipline-probe/vendor/cubecl-fix/cubecl-cuda)
 ```
 
-The three patched crates — the ones `burn-nn`, `burn-spectral`, `burn-kda` and
+The three patched crates — the ones `burn-nn`, `dormouse-spectral`, `dormouse-kda` and
 all of `dormouse-*` sit on — rebuild from scratch, and later in the same cold
-run the vendored `burn-fused` crates do the same
-(`Compiling burn-bitnet v0.1.0 (…/discipline-probe/vendor/dormouse-fused/crates/burn-bitnet)`).
+run the vendored `dormouse-fused` crates do the same
+(`Compiling dormouse-bitnet v0.1.0 (…/discipline-probe/vendor/dormouse-fused/crates/dormouse-bitnet)`).
 A shared dir reuses the *bottom* of the graph, which is the cheap part.
 
 And the bottom-layer reuse is not even reliable. The same probe re-`Check`ed
@@ -132,7 +132,7 @@ The good news: it does not **corrupt** anything. Different fingerprint ⇒
 different artifact directory; the main tree's vendored artifacts are never
 overwritten. The cost is duplication, not damage — and the duplication is
 already enormous. That one `target/` holds **50 distinct `cubecl-runtime`
-fingerprint variants, 65 `burn-rmsnorm`, 69 `burn-tensor`**. Combined with
+fingerprint variants, 65 `dormouse-rmsnorm`, 69 `burn-tensor`**. Combined with
 worktrees that differ in `Cargo.lock` and feature set, each worktree build
 invalidates the others' registry artifacts and forces a rebuild back, in a
 loop, with N agents. **A shared target dir does not make parallel work
@@ -162,7 +162,7 @@ trivial no-op change (`NOOP.md`, untracked), real command
 | shared tree, warm | 4 s | **FAILED to compile** (its own test target) |
 
 **`HEAD` `d96d155` does not compile at all.** The build dies in
-`vendor/dormouse-fused/crates/burn-muon-plus/src/lib.rs` with two `E0308`s
+`vendor/dormouse-fused/crates/dormouse-muon-plus/src/lib.rs` with two `E0308`s
 (`g_active.reshape([1, 1])` handed to `mul` — `expected D, found 2`, at
 `:298` and `:364`). That file is `M` in the shared tree: the fix
 (`.mul(g_active.unsqueeze())`) exists but is **uncommitted**, which is why a
@@ -180,7 +180,7 @@ So the honest number is not "a worktree costs N minutes". It is:
 > **A worktree costs ≥ 23 minutes before it can even fail, and today it cannot
 > pass at all, because the branch point is broken.** A successful cold
 > `build + test` was not observable on this commit: the 1387 s covers 351
-> compiled crates and stops at `burn-muon-plus`, before the test targets of
+> compiled crates and stops at `dormouse-muon-plus`, before the test targets of
 > `dormouse-core`/`dormouse-train` and their three test binaries are built and
 > linked. The 25–35 min figure is an **extrapolation from that partial run, not
 > a measurement** — treat it as a floor to argue with, not a promise.
@@ -200,7 +200,7 @@ tools/wt.sh list
 ```
 
 `--lib` is not optional: bare `cargo test` also builds `examples/`, and this
-tree has unbuildable ones (three cuda-gated examples in `burn-kda`, fixed only
+tree has unbuildable ones (three cuda-gated examples in `dormouse-kda`, fixed only
 by commit `77bf807`, and `examples/quant_probe.rs` needs `--features cuda`).
 
 `wt.sh test` **waits for other cargo processes to exit and refuses to start

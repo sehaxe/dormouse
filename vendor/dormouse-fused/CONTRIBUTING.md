@@ -23,7 +23,7 @@
    to the tensor chain. Never let a fused path silently return wrong results.
 5. The kernel is `f32`-only (`launch_unchecked::<f32>` hand-computes its byte
    length). If your fused entry point cannot be sure of the input dtype,
-   check it and fall back, the way `burn-gdn2`/`burn-rmsnorm`/`burn-swiglu`
+   check it and fall back, the way `dormouse-gdn2`/`dormouse-rmsnorm`/`dormouse-swiglu`
    do - `INTEGRATION.md` keeps the table of which members check and which
    will hand garbage to a `bf16` buffer.
 6. Gradient support: burn-autodiff `Ops`/`Backward`/`Checkpointer`, const-generic
@@ -53,7 +53,7 @@
   projects) but MUST share dependency versions through
   `[workspace.dependencies]` (`dep = { workspace = true, features = [...] }`).
 - Workspace MSRV is 1.85; a leaf crate may raise `rust-version` locally when
-  it genuinely needs newer rustc (currently: burn-gdn2 → 1.95) — note it here.
+  it genuinely needs newer rustc (currently: dormouse-gdn2 → 1.95) — note it here.
 - GPU-side gotchas documented in this repo's CI are load-bearing: `H%8==0`
   alignment for coalesced writes, `a/b == (a/b)*b` integer division, deferred
   `random`/`zeros` materialization.

@@ -1,17 +1,17 @@
 // Standalone instrument for the spectral audit (2026-10-01).
 //
-// WHAT: a transcription of burn-spectral's polar retraction (src/lib.rs:208-266)
+// WHAT: a transcription of dormouse-spectral's polar retraction (src/lib.rs:208-266)
 // and of the Stiefel metric (param.rs:205 / lib.rs:1340), in f32, at dormouse
 // `small`'s real factor shapes. It prices the per-step retraction and answers
 // "what does it defend against, and can that happen at our shapes".
 //
-// WHY STANDALONE: `cargo test -p burn-spectral` from vendor/dormouse-fused is a
+// WHY STANDALONE: `cargo test -p dormouse-spectral` from vendor/dormouse-fused is a
 // 686-package / 41 GB / ~1400 s cold build (AGENTS.md 2.5, and the 2026-09-29
 // memory entry about the freeze three parallel agents caused). This file needs
 // no cargo, no burn, and no vendor target dir: 0.4 s to compile.
 //
 // HONESTY TIER: tier (b) transcription of our own code. The ONLY external
-// anchor is burn-spectral's own doc-comment table (src/lib.rs:188-191), which
+// anchor is dormouse-spectral's own doc-comment table (src/lib.rs:188-191), which
 // section A reproduces. If those four numbers move, this file is wrong and
 // every number after them is void -- that is why they are asserted in prose
 // rather than in code: a green assert on a wrong transcription is a green lie.
@@ -88,7 +88,7 @@ fn sigma_max(m: &[f32], rows: usize, k: usize) -> f32 {
     vgv.sqrt()
 }
 
-/// burn-spectral lib.rs:229-266, sigma_max prescale, verbatim op order.
+/// dormouse-spectral lib.rs:229-266, sigma_max prescale, verbatim op order.
 fn polar_sigma_max(x: &[f32], rows: usize, k: usize, iters: usize, power: usize) -> M {
     let (mut m, c, r, transposed) = if rows > k {
         (transpose(x, rows, k), k, rows, true)
@@ -264,7 +264,7 @@ fn main() {
     let (rows, k) = (768usize, 64usize);
     let u = ortho_factor(rows, k, 0x1234_5678_9abc_def1);
 
-    println!("== A. ANCHOR vs burn-spectral lib.rs:188-191 (f32, [768,64], 3 NS iters)");
+    println!("== A. ANCHOR vs dormouse-spectral lib.rs:188-191 (f32, [768,64], 3 NS iters)");
     let pf = polar_frobenius(&u, rows, k, 3);
     let ps = polar_sigma_max(&u, rows, k, 3, 5);
     println!(

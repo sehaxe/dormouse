@@ -147,7 +147,7 @@ readout.
 
 ### RoPE on the attention arm (NoPE by default)
 
-Rotary position embedding on the KDA q/k, `use_rope` in `burn-kda`
+Rotary position embedding on the KDA q/k, `use_rope` in `dormouse-kda`
 (`KdaConfig::use_rope`, applied in `KdaModule::project` before the q/k L2 norm),
 **off by default and adding zero parameters**. `rope_theta` is the constant
 `10000.0`, upstream's own default.
@@ -211,7 +211,7 @@ not transfer to it unmeasured.
 `loop_block.rs`'s `forward_full_state`; the loop's ordering test is
 `crates/dormouse-core/tests/gr_seam.rs`.
 
-**Not** mHC (`burn-mhc`), not AttnRes (`burn-attnres`) — both are implemented in
+**Not** mHC (`dormouse-mhc`), not AttnRes (`dormouse-attnres`) — both are implemented in
 the library and neither is wired; ADR-0017 lists the four residual
 implementations side by side. **Not** "gated MLP" (the expert FFN's gate is a
 different mechanism). **Not** on by default: `use_gr = false` in every preset
@@ -219,7 +219,7 @@ different mechanism). **Not** on by default: `use_gr = false` in every preset
 
 ### TSCT / expert / LinearLike
 
-The low-rank spectral linear (`burn_sct::SpectralLinear`, masters `u`, `s`, `v`)
+The low-rank spectral linear (`dormouse_sct::SpectralLinear`, masters `u`, `s`, `v`)
 behind every wide projection: each expert's `gate_up`/`down`, the loop readout,
 the `lm_head`, and GR's `wd`/`wu`/`ww`. `LinearLike` is the thin wrapper that
 pads `out_features` to a multiple of 4, picks a quant format, and retracts.
@@ -251,7 +251,7 @@ use_tsct=false` builds the dense variant, and that A/B is live.
    invalidated** (it was a ~3-level quantizer wearing a 4-bit label). The `4`
    and `8` paths are unchanged — same grid, same output.
 3. **Weight quant** — the ternary/NM quantizers inside the library
-   (`burn-bitnet`), reached through the TSCT factors.
+   (`dormouse-bitnet`), reached through the TSCT factors.
 
 **Not** interchangeable, and **not** a precision setting: `--quant` is the
 *forward* path only, so checkpoints are format-agnostic and `--quant fp32`
@@ -658,12 +658,12 @@ nothing has yet passed a long gate.
 
 | meaning | what it is | where | state |
 |---|---|---|---|
-| **fused kernel** (correct today) | a library op that does the whole computation in one CUDA kernel instead of a chain of eager tensor ops, with a `Fused`/`Fallback` seam that says which ran | `burn_gdn2`, `burn_rmsnorm::fused`, `burn_muon_plus::fused_kernels`, `burn_spectral`; counted at `crates/dormouse-core/src/attention.rs:20` (`fused_seam_counts`) and `crates/dormouse-train/src/optim.rs:59` (`fused_kernels_skipped`) | **live**, and deliberately countable, because the fallback computes the same function and nothing else would show it (ADR-0019) |
+| **fused kernel** (correct today) | a library op that does the whole computation in one CUDA kernel instead of a chain of eager tensor ops, with a `Fused`/`Fallback` seam that says which ran | `dormouse_gdn2`, `dormouse_rmsnorm::fused`, `dormouse_muon_plus::fused_kernels`, `dormouse_spectral`; counted at `crates/dormouse-core/src/attention.rs:20` (`fused_seam_counts`) and `crates/dormouse-train/src/optim.rs:59` (`fused_kernels_skipped`) | **live**, and deliberately countable, because the fallback computes the same function and nothing else would show it (ADR-0019) |
 | **the whole-loop `fused/` module** | a hand-written CUDA autodiff op for the entire ponder loop, ~7.4k LOC, once `crates/dormouse-core/src/fused/` | **deleted.** The directory is gone, the `DM_FUSED` env var is gone (`grep -rn DM_FUSED crates/` is empty) | measured **9.21 s/step against burn's 7.05** at flagship (`docs/archive/research/2026-09-23-fused-flagship50.md:52-53`), 1.3x slower; the earlier "1.7-2.0x faster" number from ADR-0003 is **retracted** in ADR-0009 |
 
 Which one is correct: **the library kernel.** The whole-loop op is gone; the
 kernel is the live concept, and the counters that exist to prove a kernel ran
-(`fused_seam_counts`, `fused_kernels_skipped`, `burn_gdn2::fused_calls`) all
+(`fused_seam_counts`, `fused_kernels_skipped`, `dormouse_gdn2::fused_calls`) all
 mean the library kind.
 
 What still invites the confusion, and what I did **not** rename (other agents
@@ -678,9 +678,9 @@ are in these files):
   `crates/dormouse-core/src/fused/` and about rungs/kill switches that the
   deletion pre-empted. ADR-0009's "Either rung failing its number deletes all
   ~7.4k LOC" is now history.
-- **`crates/dormouse-core/src/lib.rs:1`** — "all-bf16 mini Aria on burn-fused
+- **`crates/dormouse-core/src/lib.rs:1`** — "all-bf16 mini Aria on dormouse-fused
   kernels": both the dtype claim and the project name are stale, and
-  "burn-fused" here means the library, not the module.
+  "dormouse-fused" here means the library, not the module.
 
 ---
 
@@ -708,7 +708,7 @@ still needs an owner's decision, and the fix may be a code change.
 | 11 | PonderNet in a flag help string | `--max-iter` is the loop depth | "PonderNet loop depth (default: preset)" (`train.rs:73`) | **OPEN** (one-line doc fix) |
 | 12 | `--gen-max-iter` | the flag does not exist (`generate.rs` has 9 flags, none is it) | "at inference stays max_iter; --gen-max-iter picks it lower" (`train.rs:114`) | **OPEN** — either the flag or the sentence |
 | 13 | `bool -> float` cast | correct on this backend, verified at n=1..1000 on raw and dispatch paths (ADR-0016 bug 1) | "The `Bool -> float` cast is broken on this backend (it returns 0.0 for `true`)" — the doc comment on `GradSanitizer`, `crates/dormouse-train/src/lib.rs:300-302` | **OPEN** — a retracted claim living in a code comment is the exact ADR-0020 failure |
-| 14 | `mini Aria` | dormouse | `crates/dormouse-core/src/lib.rs:1` — "all-bf16 mini Aria on burn-fused kernels" | **OPEN** (a stale project name *and* a stale dtype claim, on the crate root) |
+| 14 | `mini Aria` | dormouse | `crates/dormouse-core/src/lib.rs:1` — "all-bf16 mini Aria on dormouse-fused kernels" | **OPEN** (a stale project name *and* a stale dtype claim, on the crate root) |
 | 15 | patching | not implemented; no `patch` token anywhere in the model | **Patching** was a `CONTEXT.md` glossary entry with a verdict pending (old `CONTEXT.md:33`) | **FIXED** (entry deleted — a pending verdict on an unimplemented idea is not vocabulary) |
 | 16 | routing policy | `optim.rs` markers build the optimizer at runtime; `routing.rs`'s id-based declaration runs in tests only | "Muon+ mixed optimizer (policy + groups in `src/optim.rs`)" is right, but `routing.rs` is documented as *the* mechanism (ADR-0017) and the two are never reconciled; `GroupCounts` is declared twice (`routing.rs:56`, `optim.rs:362`) | **OPEN** — the docs now name both and say which one runs, but the duplication is a code question |
 | 17 | stride | `dspark_stride` is a config field (`schema.rs:112`), no documented meaning anywhere | no document mentioned it | **OPEN** |

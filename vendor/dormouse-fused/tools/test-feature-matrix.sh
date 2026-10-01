@@ -47,13 +47,13 @@ tested() {
 
 fail=0
 for combo in "${COMBOS[@]}"; do
-  label="burn-fused ${combo:-<default>}"
+  label="dormouse-fused ${combo:-<default>}"
   if tested "$combo"; then
     # shellcheck disable=SC2086
-    cmd=(cargo test -p burn-fused --lib --test facade $combo)
+    cmd=(cargo test -p dormouse-fused --lib --test facade $combo)
   else
     # shellcheck disable=SC2086
-    cmd=(cargo check -p burn-fused $combo)
+    cmd=(cargo check -p dormouse-fused $combo)
   fi
   if out=$("${cmd[@]}" 2>&1); then
     echo "PASS  $label"

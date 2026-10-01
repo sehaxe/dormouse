@@ -14,13 +14,13 @@ as such rather than filled in.
 
 ## 0. What state of the tree I measured (the gate moved twice while I worked)
 
-The fused-dispatch gate in `vendor/dormouse-fused/crates/burn-kda/` was being rewritten by another agent
+The fused-dispatch gate in `vendor/dormouse-fused/crates/dormouse-kda/` was being rewritten by another agent
 *during* this benchmark. Three states existed today:
 
 | state | gate | reachable from the trainer? |
 |---|---|---|
 | A (when I started, 18:40 build) | `is_autodiff_cuda`: `TypeId::of::<B>() == TypeId::of::<Autodiff<CudaBare>>()` (`fused.rs:35`) | **NO** — the trainer's backend is `Autodiff<burn_cuda::Cuda, BalancedCheckpointing>` (`crates/dormouse-train/src/lib.rs:33-36`) and `Autodiff<B, C = NoCheckpointing>` (`burn-autodiff-0.22.0-pre.4/src/backend.rs:25`) makes those two different types |
-| B (18:46 build) | `backend_matches::<B>()` = `B::name(...).contains("cuda")` (`burn-gdn2/src/cuda_dispatch.rs:88`) | yes, any wrapper |
+| B (18:46 build) | `backend_matches::<B>()` = `B::name(...).contains("cuda")` (`dormouse-gdn2/src/cuda_dispatch.rs:88`) | yes, any wrapper |
 | C (HEAD `a131ca4` + uncommitted, when I finished) | `kda_fused_chunk_reported::<B>()` — bare CUDA or any autodiff wrapper, else tensor ops | yes |
 
 **Everything I measured for "ours" is gate-independent**: `kda_bench` and `alloc_probe` call the
@@ -31,7 +31,7 @@ takes the fused path — that is the other agent's verification, not a claim I m
 The one-line gate that kept the kernels out of training in state A, for the record:
 
 ```rust
-// vendor/dormouse-fused/crates/burn-kda/src/fused.rs:35  (state A)
+// vendor/dormouse-fused/crates/dormouse-kda/src/fused.rs:35  (state A)
 TypeId::of::<B>() == TypeId::of::<burn::backend::autodiff::Autodiff<CudaBare>>()   // == NoCheckpointing
 ```
 
@@ -52,8 +52,8 @@ inductor go non-finite there, so the benchmark would have been timing a kernel p
 ### The baseline is the same math, verified
 
 My PyTorch implementation is a line-by-line port of
-`vendor/dormouse-fused/crates/burn-gdn2/src/forward.rs:57` (`chunk_wy_forward_impl`, the `c <= 16` fast
-tile path), and it reproduces **burn-kda's own fused CUDA kernel output** on the dumped tensors:
+`vendor/dormouse-fused/crates/dormouse-gdn2/src/forward.rs:57` (`chunk_wy_forward_impl`, the `c <= 16` fast
+tile path), and it reproduces **dormouse-kda's own fused CUDA kernel output** on the dumped tensors:
 
 ```
 fp32 port vs fused kernel: rel err (max-abs) 1.872e-07   (out)

@@ -53,7 +53,7 @@ PY
   done
 done
 # the meta-crate
-if [[ -d burn-fused ]]; then git mv burn-fused dormouse-fused; fi
+if [[ -d dormouse-fused ]]; then git mv dormouse-fused dormouse-fused; fi
 
 echo "== 3. rewrite imports and path deps across the workspace"
 cd "$ROOT"

@@ -38,7 +38,7 @@ Exit 0 = clean, or waived-only. Exit 1 = a real violation. Rows with a non-empty
 WAIVER are reported as DEBT and do not fail the gate; that is the only escape
 hatch and it puts the debt in a diff, on purpose.
 
-Usage:  tools/oracle_gate.py [--verbose] [--scope burn-kda,burn-gdn2]
+Usage:  tools/oracle_gate.py [--verbose] [--scope dormouse-kda,dormouse-gdn2]
 """
 
 import os
@@ -48,20 +48,20 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REGISTRY = os.path.join(ROOT, "docs", "protocols", "ORACLE-TIERS.tsv")
-CRATES = os.path.join(ROOT, "vendor", "burn-fused", "crates")
-# burn-rmsnorm joined the scope when `tests/rmsnorm_oracle.rs` landed: it is the
+CRATES = os.path.join(ROOT, "vendor", "dormouse-fused", "crates")
+# dormouse-rmsnorm joined the scope when `tests/rmsnorm_oracle.rs` landed: it is the
 # tree's first tier-(a) row, and a registry row nothing scans is a row that
 # cannot fail. Widening the scope is what makes its R1/R2/R3 checks live.
 # SCOPE WAS 3 CRATES OF 20, WHICH MADE "0 violations" MEAN ALMOST NOTHING.
-# Measured 2026-09-30: 17 crates had ZERO rows, including burn-engram - whose
+# Measured 2026-09-30: 17 crates had ZERO rows, including dormouse-engram - whose
 # oracle is the most complete in the tree, and whose gate was red for a month
-# before anything could see it - plus burn-spectral, burn-muon-plus and
-# burn-dspark. Scope is now every crate under vendor/dormouse-fused/crates, so an
+# before anything could see it - plus dormouse-spectral, dormouse-muon-plus and
+# dormouse-dspark. Scope is now every crate under vendor/dormouse-fused/crates, so an
 # unregistered test anywhere is a failure rather than a fact nobody scans.
-_CRATES = pathlib.Path(__file__).resolve().parent.parent / "vendor" / "burn-fused" / "crates"
+_CRATES = pathlib.Path(__file__).resolve().parent.parent / "vendor" / "dormouse-fused" / "crates"
 DEFAULT_SCOPE = tuple(sorted(p.name for p in _CRATES.iterdir() if p.is_dir()))
 
-# Requires a hyphen or a space, so a BARE `bitforbit` (the burn-kda example
+# Requires a hyphen or a space, so a BARE `bitforbit` (the dormouse-kda example
 # binary's name) is not itself read as a claim. A filename mention is not a
 # claim either -- `see tests/bit_exact.rs` is a pointer, not an assertion.
 CLAIM_RE = re.compile(r"bit[\s\-]for[\s\-]bit|bit[\s\-]exact", re.IGNORECASE)

@@ -1,6 +1,6 @@
 # AttnRes in the model — formula verification and integration record
 
-**Lane:** wire `burn-attnres` (arXiv:2603.15031) into `dormouse-core`'s loop.
+**Lane:** wire `dormouse-attnres` (arXiv:2603.15031) into `dormouse-core`'s loop.
 **Date:** 2026-09-30. **Branch:** `wt/attnres-model`, off `a7c3cad`.
 **Verdict up front:** the mechanism is wired behind `use_attnres` (off by
 default), the score convention is settled to the **paper's** form, and the
@@ -19,7 +19,7 @@ have put a known-bad function in the model.
 | PDF read | `Attention_Residuals.pdf` from `MoonshotAI/Attention-Residuals` @ `85e2231`, **md5 `f8351f26bce4c33b2880dee3d101f4b0`**, 952 700 B, read with `pdftotext -layout` into 1436 lines |
 | author code | **none.** The repository is 6 files: this PDF, `README.md`, 4 PNGs. Measured 2026-09-30 via the GitHub trees API; re-confirmed by the README copy pinned in the crate at `tests/oracle/upstream/attnres_README.md` |
 | the only executable spec | Fig. 2, 22 lines of PyTorch, identical in the paper and the README |
-| our crate before this lane | `vendor/dormouse-fused/crates/burn-attnres/` — `src/lib.rs` 517, `src/fused_attnres.rs` 1821 |
+| our crate before this lane | `vendor/dormouse-fused/crates/dormouse-attnres/` — `src/lib.rs` 517, `src/fused_attnres.rs` 1821 |
 | the prior audit | `docs/papers/attnres.md` (2026-09-29) — 19 deltas, 9 of them BUG |
 
 **Therefore: tier-(b), transcription.** Every "the paper says" below quotes
@@ -36,7 +36,7 @@ Left column: the paper. Right: the code that runs it, after this lane.
 | # | paper | our code | status |
 |---|---|---|---|
 | **Eq. 1** | `h_l = α_{0→l}·h_1 + Σ_{i=1}^{l-1} α_{i→l}·f_i(h_i)`, `Σ α = 1` | `loop_block.rs` AttnRes branch: sources are `[h0, y_0 … y_iter]`, output is their softmax mixture | **transcribed**; placement is ours, see §4 |
-| **Eq. 2** | `α_{i→l} = ϕ(q_l,k_i) / Σ_j ϕ(q_l,k_j)`, `ϕ(q,k) = exp qᵀ RMSNorm(k)` | `burn-attnres/src/lib.rs` `depth_attend_form` (score + `softmax(scores, 0)` over the source axis) | **transcribed, and the score convention is now the paper's** — it was not, see §3 |
+| **Eq. 2** | `α_{i→l} = ϕ(q_l,k_i) / Σ_j ϕ(q_l,k_j)`, `ϕ(q,k) = exp qᵀ RMSNorm(k)` | `dormouse-attnres/src/lib.rs` `depth_attend_form` (score + `softmax(scores, 0)` over the source axis) | **transcribed, and the score convention is now the paper's** — it was not, see §3 |
 | **Eq. 3** | `q_l = w_l`; `k_i = v_i = h_1` if `i=0`, `f_i(h_i)` if `1≤i≤l−1` | `slot_query` (per-slot `w_l`), `res = vec![h0]` then one push per iteration | **transcribed** |
 | **Eq. 4** | `h_l = Σ_{i=0}^{l-1} α_{i→l}·v_i` | `depth_attend_form` weighted sum over the source axis | **transcribed** |
 | **§5** | "one RMSNorm and one pseudo-query vector `w_l ∈ R^d` per layer" | `attnres: Option<Vec<AttnRes>>`, one `AttnRes` per iteration slot, `query: Param<Tensor<1>>` of length `d_model` | **transcribed**; the paper's *learned* RMSNorm gain is not implemented — see §5 |
@@ -104,7 +104,7 @@ confused: `B=T=1`, `L=2`, `d=4`, `h_0 = e_0`, `h_1 = e_1`, `w = 2·e_0`.
 `1/sqrt(1/4 + 1e-5) · 2 = 4.000002`. The three answers are separated by
 **0.10 and 0.15** — four orders of magnitude above a `1e-5` tolerance, so the
 assertion has no tolerance argument in it. Pinned as literals in
-`burn-attnres/src/lib.rs::tests::paper_form_has_no_temperature_and_this_is_pinned`;
+`dormouse-attnres/src/lib.rs::tests::paper_form_has_no_temperature_and_this_is_pinned`;
 it is the crate's own gate and it is **red** if either convention changes.
 
 **The decision: `ScoreForm::Paper` is the default, and the model arm uses
@@ -226,7 +226,7 @@ dispatch, not to this integration.
 ## 5. The Block variant is not wired, and what it would take
 
 Wiring `BlockAttnRes` needs four fixes, each ~5-15 lines in
-`burn-attnres/src/lib.rs`, plus a gate for each (prior audit §5 tests C, G, H):
+`dormouse-attnres/src/lib.rs`, plus a gate for each (prior audit §5 tests C, G, H):
 
 | delta | what | a gate that catches it |
 |---|---|---|
@@ -280,11 +280,11 @@ branch. `probe::NAMES` carries `"attnres"`.
   the test, and they are not a measurement of anything the authors published.
 
 **Measured on this box, 2026-09-30, `wt/attnres-model`.**
-- `burn-attnres --features cuda,autodiff`: **19 passed / 0 failed** (3
+- `dormouse-attnres --features cuda,autodiff`: **19 passed / 0 failed** (3
   `#[ignore]`d benchmarks), with `ScoreForm::Paper` as the default. Includes
   both fused/tensor parity tests over **both** forms, the balanced-
   checkpointing seam test, and the fused-adjoint-vs-burn-autodiff comparison.
-- `burn-attnres` ndarray: **10 passed / 0 failed**.
+- `dormouse-attnres` ndarray: **10 passed / 0 failed**.
 - `dormouse-core -p dormouse-data -p dormouse-train --lib`: **59 / 15 / 50
   passed, 0 failed**. `dormouse-core --features cuda --lib`: **59 passed**.
 - The derivative defect above, red on the pre-change code's successors and

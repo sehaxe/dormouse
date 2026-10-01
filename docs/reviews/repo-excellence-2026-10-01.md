@@ -124,7 +124,7 @@ the tree already complies — it is a target, and the file says so.
 
 burn's is 23 KB and exists because burn copied whole files (PyTorch's MNIST
 example, wgpu's CI config). We have exactly **one** place where upstream code
-was adapted: `vendor/dormouse-fused/crates/burn-sct/src/qr.rs:10-16`, which says in
+was adapted: `vendor/dormouse-fused/crates/dormouse-sct/src/qr.rs:10-16`, which says in
 its own module doc that it is adapted from `burn-rs/burn`
 `crates/burn-tensor/src/tensor/linalg/qr.rs`, authored by the burn-rs
 maintainers, MIT/Apache-2.0. The attribution is **in the source, at the
@@ -135,13 +135,13 @@ notices file that nobody reads. The two vendored forks carry their upstream
 and `vendor/dormouse-fused/LICENSE:24-31` states its own scope.
 
 **One real disagreement found, not fixed, because it is another owner's file:**
-`burn-sct`'s README says the adaptation is "MIT" while `qr.rs:12` says
+`dormouse-sct`'s README says the adaptation is "MIT" while `qr.rs:12` says
 "MIT/Apache-2.0", and burn's own root manifest says `license = "MIT OR Apache-2.0"`.
 Dual-licensed upstream means the derived work may be distributed under **either**;
 saying only "MIT" is the more restrictive choice, so it is not wrong — but two
 files in one crate answering the same question differently is the defect class
 `docs/glossary.md` exists for. Reported at
-`vendor/dormouse-fused/crates/burn-sct/README.md:62` vs `src/qr.rs:12`.
+`vendor/dormouse-fused/crates/dormouse-sct/README.md:62` vs `src/qr.rs:12`.
 
 Also worth recording: **the upstream path in that attribution no longer
 exists.** `crates/burn-tensor/src/tensor/linalg/qr.rs` is 404 on burn `main`;
@@ -215,7 +215,7 @@ follow-up, and it is the shape burn's `cargo run-checks` should take here.
    actually enforces, so the table and the gate cannot disagree.
 3. **`tools/checks.sh`** — one command over the whole check set under
    `build_lock.sh`; the local stand-in for burn's `cargo run-checks`.
-4. **`burn-sct` licence disagreement** — `README.md:62` ("MIT") vs `src/qr.rs:12`
+4. **`dormouse-sct` licence disagreement** — `README.md:62` ("MIT") vs `src/qr.rs:12`
    ("MIT/Apache-2.0"), and a citation pointing at an upstream path that has moved
    to `crates/burn-linalg/src/functions/qr.rs`. Vendor-lane owner's call (§3.4).
 5. **30 tracked files without a final newline** — rustfmt clears them as it goes;

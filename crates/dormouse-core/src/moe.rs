@@ -21,7 +21,7 @@
 //!
 //! # The primitives are REUSED, not rewritten (ladder rung 2)
 //!
-//! `burn_mor::topk_indices` is the crate's committed top-k - one
+//! `dormouse_mor::topk_indices` is the crate's committed top-k - one
 //! `argsort_descending` + `narrow`, avoiding `argtopk` because cubecl
 //! 0.11.0-pre.2 has a documented garbage-index defect. `mor::route` already
 //! turns those indices into a 0/1 membership mask with the sanctioned
@@ -59,7 +59,7 @@ pub fn topk_blend(logits: Tensor<2>, k: usize) -> (Tensor<2>, Tensor<2>, Tensor<
     );
     let dev = logits.device();
     // THE shared primitive, from the crate that owns it.
-    let idx = burn_mor::topk_indices(logits.clone(), k, 1); // [n, k]
+    let idx = dormouse_mor::topk_indices(logits.clone(), k, 1); // [n, k]
     // Binary membership from those indices, the `mor::route` construction:
     // one-hot the picks with `mask_fill` on a FLOAT tensor and sum the k rows.
     // `sum_dim` is keepdim in burn 0.22, so the sum is [n, 1, e] and the

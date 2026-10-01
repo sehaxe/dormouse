@@ -1,0 +1,33 @@
+[package]
+name = "dormouse-situ"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "SiTU-GLU activation for Burn - Sigmoid-Tanh Unit gated linear (Kimi K3)"
+keywords = ["burn", "situ", "activation", "glu", "transformer"]
+repository = "https://github.com/sehaxe/burn-situ"
+homepage = "https://github.com/sehaxe/burn-situ"
+readme = "README.md"
+
+[features]
+default = ["std"]
+std = ["burn/std", "burn-tensor/std", "burn/cpu"]
+cuda = ["dep:burn-cuda", "dep:burn-cubecl", "dep:cubecl", "burn/cuda", "burn-tensor/cuda"]
+autodiff = ["burn/autodiff", "burn-tensor/std", "dep:burn-autodiff"]
+
+[dependencies]
+burn = { workspace = true, features = ["std", "extension"] }
+burn-tensor = { workspace = true }
+burn-autodiff = { workspace = true, optional = true, features = ["std"] }
+burn-cuda = { workspace = true, optional = true }
+burn-cubecl = { workspace = true, optional = true }
+cubecl = { workspace = true, optional = true, features = ["std"] }
+
+[dev-dependencies]
+burn-ndarray = { workspace = true, features = ["blas-openblas"] }
+burn-autodiff = { workspace = true, features = ["std"] }
+burn-cuda = { workspace = true }
+burn = { workspace = true, features = ["ndarray", "autodiff", "cuda", "extension"] }
+
+[package.metadata.docs.rs]
+all-features = true

@@ -16,7 +16,7 @@ name: fused-library
 # gated by a run that could fail.
 #
 # Every job below therefore sets `working-directory: vendor/dormouse-fused` and runs
-# cargo FROM INSIDE the fork. Running `cargo test -p burn-gdn2` from the root
+# cargo FROM INSIDE the fork. Running `cargo test -p dormouse-gdn2` from the root
 # fails with "package not found" — that is the exclude working as intended, not
 # a code problem. Do not "fix" it by dropping the exclude.
 #
@@ -35,7 +35,7 @@ env:
 
 jobs:
   # 1. every crate, on the ndarray backend, in one command
-  # KNOWN RED on its first run: burn-spectral's `polar_retracts`,
+  # KNOWN RED on its first run: dormouse-spectral's `polar_retracts`,
   # `to_inference_matches_trained_layer` and
   # `to_inference_matches_per_column_layer` panic in `retract` before they
   # assert, because `Tensor::set_require_grad(true)` on a non-autodiff device
@@ -59,11 +59,11 @@ jobs:
       - name: install mold (repo config links through it)
         run: sudo apt-get update && sudo apt-get install -y mold
       - name: check every target of every crate (lib + tests + examples)
-        run: cargo check --workspace --all-targets --exclude burn-fused-benches --exclude cpu-probe --exclude launch-probe
+        run: cargo check --workspace --all-targets --exclude dormouse-fused-benches --exclude cpu-probe --exclude launch-probe
       - name: test every crate on ndarray
-        run: cargo test --workspace --exclude burn-fused-benches --exclude cpu-probe --exclude launch-probe
+        run: cargo test --workspace --exclude dormouse-fused-benches --exclude cpu-probe --exclude launch-probe
       - name: clippy, warnings are errors
-        run: cargo clippy --workspace --all-targets --exclude burn-fused-benches --exclude cpu-probe --exclude launch-probe -- -D warnings
+        run: cargo clippy --workspace --all-targets --exclude dormouse-fused-benches --exclude cpu-probe --exclude launch-probe -- -D warnings
       - name: rustfmt
         run: cargo fmt --all -- --check
 
@@ -87,27 +87,27 @@ jobs:
         # The re-export list and the feature flags are GENERATED from the
         # member manifests (tools/gen_facade.py), and this is the gate that
         # keeps them honest: 13 crates declare `cuda`, the hand-written list
-        # named 12 (burn-mor missing) for months, and nothing noticed. The
+        # named 12 (dormouse-mor missing) for months, and nothing noticed. The
         # script also checks the generated files and builds every combination
         # a user can type; the two common ones run the test suite, which is
         # what resolves all 20 re-exports.
         run: tools/test-feature-matrix.sh
       - name: leaf crates, every combination a README tells users to type
         run: |
-          cargo check -p burn-gdn2 --no-default-features
-          cargo check -p burn-gdn2
-          cargo check -p burn-gdn2 --features autodiff
-          cargo check -p burn-gdn2 --features binary-tests
-          cargo check -p burn-kda --no-default-features
-          cargo check -p burn-kda --features autodiff
-          cargo check -p burn-sct --features autodiff
+          cargo check -p dormouse-gdn2 --no-default-features
+          cargo check -p dormouse-gdn2
+          cargo check -p dormouse-gdn2 --features autodiff
+          cargo check -p dormouse-gdn2 --features binary-tests
+          cargo check -p dormouse-kda --no-default-features
+          cargo check -p dormouse-kda --features autodiff
+          cargo check -p dormouse-sct --features autodiff
 
   # 3. the flagship claim: the reference fixture is regenerable and unchanged
   #
   # The generator is now `tools/gen_reference_f64.py` (f64 NumPy, no torch), and
   # the fixture is `tests/ref_f64_broad.bin` - the 1000-case breadth sweep. The
   # f32 self-transcription this job used to police (`tools/gen_reference.rs` ->
-  # `tests/ref_data.bin`) is DELETED: it was an f32 transcription of burn-gdn2's
+  # `tests/ref_data.bin`) is DELETED: it was an f32 transcription of dormouse-gdn2's
   # OWN algorithm, so it could only ever prove self-consistency, and it replicate-
   # padded the short conv's left edge exactly as the kernel wrongly did - which
   # is how a real defect (`0a6998a`) stayed green in this very job.
@@ -117,7 +117,7 @@ jobs:
     timeout-minutes: 30
     defaults:
       run:
-        working-directory: vendor/dormouse-fused/crates/burn-gdn2
+        working-directory: vendor/dormouse-fused/crates/dormouse-gdn2
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -164,8 +164,8 @@ jobs:
       - name: install mold (repo config links through it)
         run: sudo apt-get update && sudo apt-get install -y mold
       # --release: the 1000-case scan is minutes in an opt-0 build.
-      - name: burn-gdn2, fused recurrent and chunked, vs the f64 oracle
-        run: cargo test --release -p burn-gdn2 --features binary-tests --test oracle_breadth --test oracle_chunk
+      - name: dormouse-gdn2, fused recurrent and chunked, vs the f64 oracle
+        run: cargo test --release -p dormouse-gdn2 --features binary-tests --test oracle_breadth --test oracle_chunk
 
   # 5. cuda compiles, on a CPU runner
   cuda-compiles:
@@ -187,16 +187,16 @@ jobs:
       # because `--features cuda` on a crate without it is a silent no-op.
       - name: every cuda crate, compile-only, both with and without autodiff
         run: |
-          for c in burn-attnres burn-bitnet burn-gdn2 burn-kda burn-mhc burn-mor \
-                   burn-muon-plus burn-rmsnorm burn-rope burn-sct burn-situ \
-                   burn-spectral burn-swiglu; do
+          for c in dormouse-attnres dormouse-bitnet dormouse-gdn2 dormouse-kda dormouse-mhc dormouse-mor \
+                   dormouse-muon-plus dormouse-rmsnorm dormouse-rope dormouse-sct dormouse-situ \
+                   dormouse-spectral dormouse-swiglu; do
             cargo check -p "$c" --features cuda
             cargo check -p "$c" --features cuda,autodiff
             cargo test -p "$c" --features cuda,autodiff --no-run
           done
       - name: the GPU probe packages build
         run: |
-          cargo check -p burn-fused-benches
+          cargo check -p dormouse-fused-benches
           cargo check -p cpu-probe
           cargo check -p launch-probe
 
@@ -228,7 +228,7 @@ jobs:
   # It refuses to pass without a visible CUDA device, sets BURN_DEVICE=cuda so
   # the `if env::var("BURN_DEVICE") != "cuda" { return; }` guards cannot report
   # PASS having asserted nothing, and fails if the test count is not what it
-  # expects. `burn-fused/tests/gpu_production_shape.rs` is the assertion: the
+  # expects. `dormouse-fused/tests/gpu_production_shape.rs` is the assertion: the
   # gated-delta chunk path at the shape dormouse trains (batch 10, seq 512,
   # 12 heads x 64) through `Autodiff<CudaBare, BalancedCheckpointing>`, the
   # trainer's backend, asserting the fused forward AND adjoint kernels LAUNCHED

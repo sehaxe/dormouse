@@ -123,7 +123,7 @@ Three independent in-tree confirmations:
    `matmul.cmma` / `matmul.mma` configs (same function, lines 435-454), so no
    selector can pick one even if it existed.
 
-So burn-spectral's own bf16 test failing at `burn-cubecl ops/tensor.rs:150`
+So dormouse-spectral's own bf16 test failing at `burn-cubecl ops/tensor.rs:150`
 (`float_matmul`) is a backend correctly saying "I have no bf16". **A silent
 fp32 fallback dressed up as bf16 is the one thing not to do here**: it makes
 `--bf16` a lie with a 2-3 digit error bar and no error message, which is
@@ -140,12 +140,12 @@ is there; only the type is missing.
 16 bits of its f32, so `f32::reinterpret(u32 << 16)` in and round-to-nearest-even
 truncation out, which is integer ops plus a bitcast and no bf16 value ever enters
 the dialect. Pinned against f64 on the host in
-`vendor/dormouse-fused/crates/burn-gdn2/tests/lowp_bf16_cuda.rs` (not ours; that
+`vendor/dormouse-fused/crates/dormouse-gdn2/tests/lowp_bf16_cuda.rs` (not ours; that
 agent's probe). That is the primitive any bf16 compute path here must be built
 from.
 
 The two gate tests for it are `#[ignore]`d **by design**, the same convention as
-burn-spectral's own probe: they are a report, not a requirement, and a
+dormouse-spectral's own probe: they are a report, not a requirement, and a
 permanently red test is not a gate. They flip to green the day a bf16 type
 lands:
 `cargo test -p backend-parity --features cuda --test backend_parity -- --ignored`

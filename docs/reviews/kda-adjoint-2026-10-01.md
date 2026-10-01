@@ -107,7 +107,7 @@ between "the kernel races" and "the instrument cannot see this magnitude".
 
 ## 4b. MACHINE, 2026-10-01 11:45-12:00 — a `--tests` build is IO-poison on this box
 
-`cargo build --tests` for burn-gdn2 + burn-kda is **20 test binaries, and cargo
+`cargo build --tests` for dormouse-gdn2 + dormouse-kda is **20 test binaries, and cargo
 links them in parallel**: 20 `rustc` → 19 `collect2` → 38 `ld.mold`. Measured
 while it ran:
 
@@ -266,14 +266,14 @@ state-carry contributions that chunk 0's does not, which is exactly what BK2 and
 `d_s_shift` exist to produce. A fixture where those matched to 3 digits would
 pass an adjoint with the whole carry deleted, and this is not that fixture.
 
-### 5d. Regression: the whole burn-gdn2 CPU cell is green, including the two that were red
+### 5d. Regression: the whole dormouse-gdn2 CPU cell is green, including the two that were red
 
-`0e9817b` recorded `tools/lib_gate.sh` RED on burn-gdn2 with two named tests
-belonging to "whoever owns burn-gdn2's f64 oracle". Both are green on this
+`0e9817b` recorded `tools/lib_gate.sh` RED on dormouse-gdn2 with two named tests
+belonging to "whoever owns dormouse-gdn2's f64 oracle". Both are green on this
 branch, and neither is mine:
 
 ```
-cargo test -p burn-gdn2 --features binary-tests,autodiff
+cargo test -p dormouse-gdn2 --features binary-tests,autodiff
   41 passed / 0 failed across 12 binaries
   oracle_breadth::gdn2_1000_cases_match_the_f64_oracle   ok   (was red on 0e9817b)
   oracle_chunk::chunk_sizes_match_the_f64_oracle         ok   (was red on 0e9817b)

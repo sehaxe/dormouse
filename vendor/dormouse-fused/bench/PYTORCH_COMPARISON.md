@@ -1,4 +1,4 @@
-# burn-fused vs PyTorch: head-to-head on RTX 3090
+# dormouse-fused vs PyTorch: head-to-head on RTX 3090
 
 > **Status 2026-10-01.** Measured 2026-08-09; the numbers below are unchanged
 > and are not re-measured by any CI job in this copy. The crate list changed
@@ -14,7 +14,7 @@
 Measured 2026-08-09 on the same RTX 3090, same shapes as `benches/src/main.rs`.
 Both sides use min-of-runs with CUDA sync. PyTorch 2.6.0+cu124.
 
-| op | burn-fused (ms) | PyTorch reference (ms) | burn-fused vs torch |
+| op | dormouse-fused (ms) | PyTorch reference (ms) | dormouse-fused vs torch |
 |----|----------------:|-----------------------:|--------------------:|
 | RoPE (4×2048×32×128) | 0.33 | 1.46 (HF transformers style) | **4.4× faster** |
 | FWT (256×512) | 0.015 | 0.031 (Hadamard matmul) | **2.1× faster** |
@@ -65,7 +65,7 @@ used as the PyTorch side of each benchmark.
 
 ```
 /home/sehaxe/bench_torch.py   # PyTorch side (min-of-runs, same shapes)
-BURN_DEVICE=cuda cargo run -p burn-fused-benches --release
+BURN_DEVICE=cuda cargo run -p dormouse-fused-benches --release
 ```
 
 ## New fused kernels (ported crates, 2026-08-09)

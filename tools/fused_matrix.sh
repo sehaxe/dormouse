@@ -16,12 +16,12 @@ if [ "$#" -gt 0 ]; then
   CRATES=("$@")
 else
   mapfile -t CRATES < <(
-    sed -n '/^members/,/^]/p' Cargo.toml | grep -oE '"[^"]+"' | tr -d '"' | grep -v '^benches' | grep -v '^burn-fused$'
+    sed -n '/^members/,/^]/p' Cargo.toml | grep -oE '"[^"]+"' | tr -d '"' | grep -v '^benches' | grep -v '^dormouse-fused$'
   )
 fi
 
-# burn-kda, burn-gdn2, burn-engram are being edited by other agents right now.
-CONCURRENT=(burn-kda burn-gdn2 burn-engram burn-mor burn-spectral)
+# dormouse-kda, dormouse-gdn2, dormouse-engram are being edited by other agents right now.
+CONCURRENT=(dormouse-kda dormouse-gdn2 dormouse-engram dormouse-mor dormouse-spectral)
 
 has_cuda_feature() {
   grep -qE '^cuda\s*=' "$1/Cargo.toml" 2>/dev/null

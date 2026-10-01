@@ -57,7 +57,7 @@ multiple-versions = "warn"
 # dependency with no `version` key as a wildcard, and
 # `allow-wildcard-paths` does NOT rescue it in a crate that could be published
 # (it only applies to `publish = false` crates). Five crates here could be
-# published — dormouse-cli/core/train and vendor's burn-kda/burn-spectral — and
+# published — dormouse-cli/core/train and vendor's dormouse-kda/dormouse-spectral — and
 # between them they hold 22 path deps written that way. Fixing it means adding
 # `publish = false` to five manifests, which is a statement about this repo's
 # release policy and lands in files that other lanes are editing right now, so

@@ -1,4 +1,4 @@
-//! dormouse-core - all-bf16 mini Aria on burn-fused kernels (CUDA)
+//! dormouse-core - all-bf16 mini Aria on dormouse-fused kernels (CUDA)
 //!
 //! # What this crate is
 //!

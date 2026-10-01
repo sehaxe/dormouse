@@ -28,7 +28,7 @@ assignees: ''
 <!-- The test that goes red if the mechanism is wrong, before any A/B is run.
      Name it and the file it lives in. "It compiles" is not a gate, and a gate
      that cannot fail is the defect class AGENTS.md §3.3 records for the
-     burn-rmsnorm fused path - it stayed green for a year while the arm ran
+     dormouse-rmsnorm fused path - it stayed green for a year while the arm ran
      zero times. -->
 
 **Where it stands today**

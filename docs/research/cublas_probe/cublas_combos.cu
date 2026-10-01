@@ -2,7 +2,7 @@
 // driver accept, and what do they actually run at?
 //
 // Why this matters for dormouse: the stack's own tensor-core paths are dead
-// (bf16 fails burn-spectral's tests on pre.4; f16 panics in cubecl-ir), and a
+// (bf16 fails dormouse-spectral's tests on pre.4; f16 panics in cubecl-ir), and a
 // hand-rolled WMMA kernel lost to a tiled fp32 SGEMM (8.4 vs 10.2 TFLOP/s).
 // cuBLAS is the tuned path every framework actually uses. The interesting
 // rows:

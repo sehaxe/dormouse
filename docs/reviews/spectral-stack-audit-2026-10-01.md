@@ -1,16 +1,16 @@
-# Audit: the spectral stack — `burn-spectral`, `burn-sct`, and the seam between them
+# Audit: the spectral stack — `dormouse-spectral`, `dormouse-sct`, and the seam between them
 
 > **WHY THIS FILE HAS A NEW NAME (2026-10-01, landing of `wt/spectral-audit`).**
 > This document was written as `docs/reviews/spectral-audit-2026-10-01.md`
 > and landed as `3e1812b` (committed 00:55:09). The twin lane's `7811191`
 > was authored 35 s EARLIER (00:54:34) and committed 97 s later (00:56:46),
 > wrote to **the same path** with a different document (the formula audit of
-> `burn-spectral`, findings 1–3), and replaced these 494 lines with 218.
+> `dormouse-spectral`, findings 1–3), and replaced these 494 lines with 218.
 > Nothing was merged and nothing was flagged: two independent lanes, one
 > filename. The content is now this file, restored byte-for-byte from
 > `3e1812b`, under the name its own H1 gives it; the formula audit keeps the
 > original path and is the deeper document. **The two are different subjects**
-> — this one is `burn-sct` and the seam between the crates, that one is the
+> — this one is `dormouse-sct` and the seam between the crates, that one is the
 > NS retraction's formulas — so a union would have been a 1000-line document
 > about two things. Verified with `git show 3e1812b:…` (494 lines, identical).
 
@@ -24,7 +24,7 @@ file:line, source claim and honesty tier:
 **What was run.** One `rustc -O` single-file probe (0.4 s, no cargo, no burn, no
 vendor target dir) that transcribes the retraction and the Stiefel metric in f32
 and prices them at `small`'s real factor shapes. Its only external anchor is
-`burn-spectral/src/lib.rs:188-191`'s own doc-comment table, and it **reproduces
+`dormouse-spectral/src/lib.rs:188-191`'s own doc-comment table, and it **reproduces
 it** — see §3.1. Everything else in this document is read out of the tree, out
 of the three 2k-step logs from last night, and out of AGENTS.md.
 
@@ -35,7 +35,7 @@ of the three 2k-step logs from last night, and out of AGENTS.md.
   GPU). §1.5: one heavy thing at a time. The one measurement this audit most
   wants — a run with the retraction switched off — is therefore a *named
   command* in §5, not a number.
-- **No `cargo test -p burn-spectral` / `-p burn-sct`.** A cold build of
+- **No `cargo test -p dormouse-spectral` / `-p dormouse-sct`.** A cold build of
   `vendor/dormouse-fused` is 686 packages / 41 GB / ~1400 s, and the 2026-09-29
   memory entry records the freeze that five parallel agents caused by each
   launching one. The probe exists precisely so that the audit's arithmetic
@@ -50,51 +50,51 @@ of the three 2k-step logs from last night, and out of AGENTS.md.
 
 | # | finding | severity | one line |
 |---|---|---|---|
-| **F1** | **`burn-sct` is not the foundation layer under `burn-spectral`. There is no seam: zero call sites.** | **high (premise)** | the two crates are independent implementations of the same idea; the trainer runs `burn-spectral`'s tensor-op Newton-Schulz, and `burn-sct`'s Householder QR + 6 CUDA kernels have never executed in a run |
+| **F1** | **`dormouse-sct` is not the foundation layer under `dormouse-spectral`. There is no seam: zero call sites.** | **high (premise)** | the two crates are independent implementations of the same idea; the trainer runs `dormouse-spectral`'s tensor-op Newton-Schulz, and `dormouse-sct`'s Householder QR + 6 CUDA kernels have never executed in a run |
 | **F2** | **The retracted-head drift is real and the latch would fire in ~8–60 steps without the retraction** | **high (proves the retraction earns its keep)** | the `lm_head` factor trains with **AdamW** (`routing.rs:98`), whose per-step `‖ΔU‖_F = 2.2e-2` is 28× the Muon+ factors' `8e-4`; crossed against the `1e-3` one-way latch that is 8 steps (systematic) to 63 (random walk) |
 | **F3** | **`--retract-iters 3` is a cliff, not a dial** | **high** | 3 NS iterations leave `2.3e-8`/entry at a 1:1 spectral spread, `1.1e-5` at 2:1, **`1.9e-3` at 3:1 — already past the latch** — and `8.4e-2` (84×) at 10:1. Nothing measures the spread, and the latch threshold is 2× inside the failure point. **The "6e-5 floor" that justifies the 1e-3 threshold is wrong and is written in three places** (AGENTS §2.3, `param.rs:200-204`, `lib.rs:1344-1347`) |
 | **F4** | **The retraction is 5.3% of a warm step and 0.18% arithmetic** | **medium (the cost, measured)** | 25.7–26.0 ms of a 487 ms step, ≈880 launches, 0.61 GFLOP = 46 µs at cuBLAS fp32 → **~540× launch overhead**, 29 µs per launch |
 | **F5** | **The signal that would show the retraction degrading is computed every 500 steps and thrown away** | **medium** | `model.max_ortho()` (`lib.rs:1350-1357`) only *prints* when it exceeds the latch. A retraction silently degrading from `2e-8` to `2e-6` is indistinguishable from a healthy one in every log ever written |
 | **F6** | **The sync-free batched retraction is off by default and never used** | **medium (free win)** | `retract_batched: false` (`lib.rs:175`); `retr_arm=batched:0` in every log. At `small` it is 4 calls instead of 16 (3 distinct shapes) — the same 5.3%, ~5× fewer launches |
-| **F7** | **`qr_householder` is the init, it host-reads 7 scalars per column, and it is the documented source of the cross-process TSCT residue** | **medium** | `burn-spectral/src/lib.rs:689`, called at `:462`/`:469`. AGENTS.md 3.7 attributes the 1-ULP init difference to nondeterministic reductions inside it, at a *random iteration* 0…55 |
+| **F7** | **`qr_householder` is the init, it host-reads 7 scalars per column, and it is the documented source of the cross-process TSCT residue** | **medium** | `dormouse-spectral/src/lib.rs:689`, called at `:462`/`:469`. AGENTS.md 3.7 attributes the 1-ULP init difference to nondeterministic reductions inside it, at a *random iteration* 0…55 |
 | **F8** | **The retraction doc's cost claim is 8× stale** | **low** | "replaces the CPU QR of SCT, which cost 40-50% of a step" (`lib.rs:19-20`) vs **5.3% measured tonight**. Same shape as the retracted "the optimizer is 77% of a step" |
 | **F9** | **`model.rs:416-417` claims the un-retracted forward "degrades into NaN"** | **low, but it is a §1.4 claim** | arithmetic says it cannot: per-row-absmax factor quantisation is **equivariant** to per-row scaling, so drift can only reach all-zero weights (CE → `ln 256` = 5.5452, finite). No run, no log, no citation |
 | **F10** | **745 lines of f64 SVD with zero tests, in a crate with zero users** | **low (dead crate)** | `host_svd.rs` has 0 `#[test]`; `cholesky_host_par`, `qr`, and 5 CUDA kernels are dead (~300 lines) |
-| **F11** | **Two gates in `burn-sct` cannot fail on a real error** | **low** | `retract_restores_ortho` and `sign_correction` assert `|diag(UᵀU) − 1| < 0.1` |
-| **F12** | **Three names for one linear, one of them wrong in a file the trainer owns** | **low (§1.7)** | `param.rs:1` says "TSCT linear via **burn-sct** `SpectralLinear`"; the import at `:6` is `burn_spectral::SpectralLinear`; `burn-spectral/src/lib.rs:1` calls itself **`burn-tsct`** |
-| **F13** | **The `0.7` ternary dead zone has no source and no gate** | **low** | `lib.rs:54` attributes it to a "burn-es convention". It decides which ~30% of entries are zeroed, in every ternary forward, and is a **(c)**-tier number in an (a)-tier function |
+| **F11** | **Two gates in `dormouse-sct` cannot fail on a real error** | **low** | `retract_restores_ortho` and `sign_correction` assert `|diag(UᵀU) − 1| < 0.1` |
+| **F12** | **Three names for one linear, one of them wrong in a file the trainer owns** | **low (§1.7)** | `param.rs:1` says "TSCT linear via **dormouse-sct** `SpectralLinear`"; the import at `:6` is `dormouse_spectral::SpectralLinear`; `dormouse-spectral/src/lib.rs:1` calls itself **`burn-tsct`** |
+| **F13** | **The `0.7` ternary dead zone has no source and no gate** | **low** | `lib.rs:54` attributes it to a "dormouse-es convention". It decides which ~30% of entries are zeroed, in every ternary forward, and is a **(c)**-tier number in an (a)-tier function |
 | **F14** | **The landed `--retract-every 4` decision (`d8a21b9`) rests on a half-the-spread, n=1 difference — and it cuts the retraction to ~6.5 ms, which nobody claimed** | **high (it landed 20 min into this pass)** | 6.329 vs 6.387 is one seed each with a 0.108 three-arm spread. The *saving* (32 min over 100k steps) is the defensible half; the *quality* half is not evidence. See §3.5 |
 
 ---
 
 ## 1. The seam (brief item 2): there isn't one, and that is the finding
 
-The brief's premise — "TSCT is a superstructure over SCT, `burn-sct` is the
-foundation layer under `burn-spectral`" — is **false in this tree**, and the
+The brief's premise — "TSCT is a superstructure over SCT, `dormouse-sct` is the
+foundation layer under `dormouse-spectral`" — is **false in this tree**, and the
 falsehood is load-bearing enough to be worth the first section.
 
 ```
-crates/dormouse-core/src/param.rs:6      use burn_spectral::SpectralLinear;
+crates/dormouse-core/src/param.rs:6      use dormouse_spectral::SpectralLinear;
 crates/dormouse-core/src/model.rs:418     model.retract_tsct(iters)
-vendor/.../burn-spectral/src/lib.rs:662  SpectralLinear::retract
-vendor/.../burn-spectral/src/lib.rs:154  polar_retracked
-vendor/.../burn-spectral/src/lib.rs:208  polar_orthogonalize        <- the live path
+vendor/.../dormouse-spectral/src/lib.rs:662  SpectralLinear::retract
+vendor/.../dormouse-spectral/src/lib.rs:154  polar_retracked
+vendor/.../dormouse-spectral/src/lib.rs:208  polar_orthogonalize        <- the live path
 ```
 
 That is the whole of it. Every other edge:
 
 | edge | status |
 |---|---|
-| `burn-spectral` → `burn-sct` | **`[dev-dependencies]` only** (`burn-spectral/Cargo.toml:33`) plus one example, `examples/tsct_diag.rs:61-110`. Zero `src/` call sites. |
-| `burn-sct` → `burn-spectral` | none, in either direction |
-| `burn-sct` → the trainer | **none.** No crate under `crates/` depends on `burn-sct`. |
+| `dormouse-spectral` → `dormouse-sct` | **`[dev-dependencies]` only** (`dormouse-spectral/Cargo.toml:33`) plus one example, `examples/tsct_diag.rs:61-110`. Zero `src/` call sites. |
+| `dormouse-sct` → `dormouse-spectral` | none, in either direction |
+| `dormouse-sct` → the trainer | **none.** No crate under `crates/` depends on `dormouse-sct`. |
 
 So the question "is the composition what each crate's docs claim?" has a blunt
 answer: **the composition is nil, and both crates document themselves as if it
-were not.** `burn-sct`'s README is the honest one — it says, in its first
+were not.** `dormouse-sct`'s README is the honest one — it says, in its first
 paragraph, "**Not in the dormouse build, and duplicated in it** … Recommendation:
-DELETE" — and `burn-spectral`'s header says the opposite, quietly, by calling
-itself `burn-tsct` and never mentioning that a crate named `burn-sct` with the
+DELETE" — and `dormouse-spectral`'s header says the opposite, quietly, by calling
+itself `burn-tsct` and never mentioning that a crate named `dormouse-sct` with the
 same `SctLinear` shape exists two directories away.
 
 **This is exactly the failure mode the brief was worried about** — a shared
@@ -104,8 +104,8 @@ trainer runs is credited to an implementation that never runs. Three concrete
 instances, all of which will be believed by the next reader:
 
 1. `param.rs:1` — the file that *owns* the TSCT linear says it comes from
-   `burn-sct`. It comes from `burn-spectral`. (F12)
-2. `burn-spectral/src/lib.rs:19-20` — "GPU-only Newton-Schulz polar retraction
+   `dormouse-sct`. It comes from `dormouse-spectral`. (F12)
+2. `dormouse-spectral/src/lib.rs:19-20` — "GPU-only Newton-Schulz polar retraction
    for the masters (**replaces the CPU QR of SCT**, which cost 40-50% of a
    step)". True as history, false as cost: it is 5.3% now, and the "CPU QR of
    SCT" it replaced is in a crate the trainer has never called. (F8)
@@ -118,7 +118,7 @@ instances, all of which will be believed by the next reader:
 transcriptions of SCT 2604.00733 that were never reconciled, which is also why
 they disagree about the retraction's *kind* while both citing the paper.
 
-**The one thing worth keeping from `burn-sct`** is a kernel, and it is
+**The one thing worth keeping from `dormouse-sct`** is a kernel, and it is
 unreachable for a named reason: `qr_cuda::retract_cuda` (K8) does the whole
 retraction in **one launch** after a `k×k` host Cholesky, versus the trainer's
 ~54 launches per factor. It is gated on `is_cuda::<B>()`, which compares `B`'s
@@ -126,13 +126,13 @@ retraction in **one launch** after a `k×k` host Cholesky, versus the trainer's
 `Autodiff { device: Cube(Cuda(0)) }`, so the gate is false. And
 `SpectralLinear::retract` has **no backend type parameter at all**, so it could
 not call it even if the gate were open. That is the same wall as
-`burn-rmsnorm`'s fused kernel (AGENTS.md 3.3) and the same one the parked fusion
+`dormouse-rmsnorm`'s fused kernel (AGENTS.md 3.3) and the same one the parked fusion
 flip would remove — so the fix is not local, and the audit records the wall
 rather than pretending otherwise.
 
 ---
 
-## 2. `burn-sct/src` (brief item 1): the descent
+## 2. `dormouse-sct/src` (brief item 1): the descent
 
 Full table in the inventory (§3 there). What the descent found, in order of how
 much it should change a reader's behaviour:
@@ -290,7 +290,7 @@ and not where anyone was looking.**
 
 `routing.rs:95-98` sends `(Expert | Readout, Factor)` to **Muon+** and
 `(Head, Factor)` to **AdamW** ("Rest"). Muon+'s `ColRow` normalisation
-(`burn-muon-plus/src/lib.rs:343-380`, live order pinned at
+(`dormouse-muon-plus/src/lib.rs:343-380`, live order pinned at
 `optim.rs:134`) makes every row of the update unit-L2, so
 `‖ΔU‖_F = lr·√k = 8e-4`. AdamW's per-coordinate step is ~`lr` over an
 `[768,64]` factor, so `‖ΔU‖_F = 1e-4·√49152 = 2.2e-2` — **28× larger**, on the
@@ -355,7 +355,7 @@ consequences:
   ~43 000× for the Muon factors, not 16×. The "the floor is uncomfortably close
   to the threshold" argument does not hold at our shapes. **The stale figure
   lives in three places** — AGENTS.md §2.3, `param.rs:200-204` and
-  `burn-spectral/src/lib.rs:1344-1347` — so correcting it is three edits, and
+  `dormouse-spectral/src/lib.rs:1344-1347` — so correcting it is three edits, and
   until they agree, a reader who checks one of them finds a number my probe
   contradicts.
 - The real exposure is the **spread**, and nothing measures it. A factor that
@@ -433,8 +433,8 @@ Ordered by what I would do next. Nothing here is fixed; `param.rs` and
 
 | # | finding | evidence | what would settle it |
 |---|---|---|---|
-| **F1** | no seam: `burn-sct` has zero non-dev call sites and no trainer dependency | grep over `vendor/dormouse-fused` + `crates/`; `burn-spectral/Cargo.toml:33` | nothing to settle — it is a fact. What it *decides*: delete `burn-sct` (and with it 745 untested SVD lines and ~300 dead ones) or keep it as a kernel donor for the retraction. The `library-crate-fate.md` recommendation already says DELETE; the counter-argument is K8's one-launch kernel |
-| **F2** | the head factor's un-retracted drift crosses the latch in ~8–60 steps | probe §D, from `routing.rs:98` + `optim.rs:134` + `burn-muon-plus:343-380` | **one 500-step run with `--retract-every 1000000`** and read whether `max_ortho` prints, and at what value. This is the single most informative cheap experiment in the queue |
+| **F1** | no seam: `dormouse-sct` has zero non-dev call sites and no trainer dependency | grep over `vendor/dormouse-fused` + `crates/`; `dormouse-spectral/Cargo.toml:33` | nothing to settle — it is a fact. What it *decides*: delete `dormouse-sct` (and with it 745 untested SVD lines and ~300 dead ones) or keep it as a kernel donor for the retraction. The `library-crate-fate.md` recommendation already says DELETE; the counter-argument is K8's one-launch kernel |
+| **F2** | the head factor's un-retracted drift crosses the latch in ~8–60 steps | probe §D, from `routing.rs:98` + `optim.rs:134` + `dormouse-muon-plus:343-380` | **one 500-step run with `--retract-every 1000000`** and read whether `max_ortho` prints, and at what value. This is the single most informative cheap experiment in the queue |
 | **F3** | `--retract-iters 3` fails above a ~2:1 spectral spread | probe §F | print σ_max/σ_min of one retracted factor per 500 steps. If it is ≪2, the 3 iterations are safe and the risk is theoretical; if it approaches 2, a 4th NS iteration is +6 of 54 launches/factor, i.e. **+2.9 ms = +0.6% of a step** |
 | **F4** | 5.3% of a warm step, 0.18% arithmetic, ~880 launches | 57 timer readings across 3 logs + probe §E | `--retract-batched`: 16 calls → 4, ~5× fewer launches. One flag, no code |
 | **F5** | `max_ortho` is computed every 500 steps and printed only on failure | `train/src/lib.rs:1350-1357` | print it always under `--timers`. Three characters, and it converts F3 from unanswerable to answered |
@@ -443,9 +443,9 @@ Ordered by what I would do next. Nothing here is fixed; `param.rs` and
 | **F8** | "40-50% of a step" in a doc comment, 5.3% measured | `lib.rs:19-20` vs the logs | none — it is stale, and it will be quoted |
 | **F9** | "degrades into NaN" has no evidence and arithmetic says it cannot | `model.rs:416-417`; per-row absmax equivariance | a NaN run, or downgrade the sentence to what is true: the forward degenerates to all-zero weights, CE → 5.5452 |
 | **F10** | 745 untested f64 SVD lines + ~300 dead lines, zero users | `host_svd.rs` (0 tests); dead-call grep | delete. A test for code with no caller is a test for nothing |
-| **F11** | two `burn-sct` gates with 0.1 tolerances | `lib.rs:529`, `:672` | moot if F1 deletes the crate |
+| **F11** | two `dormouse-sct` gates with 0.1 tolerances | `lib.rs:529`, `:672` | moot if F1 deletes the crate |
 | **F12** | `param.rs:1` names the wrong crate | `param.rs:1` vs `:6` | one word. §1.7 |
-| **F13** | the `0.7` dead zone is a (c)-tier constant with no gate | `lib.rs:54` | find the burn-es source, or write it down as ours |
+| **F13** | the `0.7` dead zone is a (c)-tier constant with no gate | `lib.rs:54` | find the dormouse-es source, or write it down as ours |
 
 ---
 
@@ -474,7 +474,7 @@ of GPU once the current run finishes (§1.5).
    fires between steps 8 and 500, and the run's quality is *worse or equal* —
    in which case the retraction's justification is the quantisation arm, not the
    quality arm, and that sentence should be written down.
-4. **Decide `burn-sct`'s fate** (F1). If DELETE, the four follow-ups below are
+4. **Decide `dormouse-sct`'s fate** (F1). If DELETE, the four follow-ups below are
    free. If KEEP-as-kernel-donor, the honest form of the fix is the fused
    retraction on the trainer's device — blocked by the fusion flip
    (ADR-0018/PLAN), so it is a *plan* item, not a task.
@@ -483,10 +483,10 @@ of GPU once the current run finishes (§1.5).
    (F3). The per-arm cost is currently **unknown** (§3.3's open item), not the
    2.7 GPU-h `docs/protocols/AB-PROTOCOL.md` still prices it at.
 6. **Not this lane, reported per §1.6**: `param.rs:1` (F12),
-   `model.rs:416-417` (F9), `burn-spectral/src/lib.rs:19-20` (F8) and `:54`
+   `model.rs:416-417` (F9), `dormouse-spectral/src/lib.rs:19-20` (F8) and `:54`
    (F13) are one-line doc corrections in files other lanes may hold. Plus the
    **three copies of the stale retraction floor** (F3): AGENTS.md §2.3,
-   `param.rs:200-204`, `burn-spectral/src/lib.rs:1344-1347` — and per §1.7
+   `param.rs:200-204`, `dormouse-spectral/src/lib.rs:1344-1347` — and per §1.7
    those three must be fixed together or the rulebook keeps contradicting the
    measurement.
 

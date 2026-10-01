@@ -52,7 +52,7 @@ against an independent host-side softmax of the same controller output.
 
 ## 2. Where the routing primitive comes from (ladder rung 2: reuse)
 
-`burn_mor::topk_indices` (`vendor/dormouse-fused/crates/burn-mor/src/topk.rs`) is
+`dormouse_mor::topk_indices` (`vendor/dormouse-fused/crates/dormouse-mor/src/topk.rs`) is
 the crate's committed top-k: one `argsort_descending` + `narrow`, deliberately
 avoiding `argtopk` because cubecl 0.11.0-pre.2 has a documented garbage-index
 defect. `mor::route` (`crates/dormouse-core/src/mor.rs:59-84`) already turns
@@ -286,7 +286,7 @@ the converse — an expert that wins no position is masked to exactly zero, by
 construction (`d/d out_e = gate_e = 0`), not by defect. Asserting an exact set
 would be asserting the RNG.
 
-**Tie behaviour, defined.** The selection is `burn_mor::topk_indices` — one
+**Tie behaviour, defined.** The selection is `dormouse_mor::topk_indices` — one
 `argsort_descending` + `narrow` — and that primitive's own doc says the selected
 SET among equal values may differ between impls and backends. So the promise is
 deliberately narrow and is exactly what is tested: **the COUNT is always exactly

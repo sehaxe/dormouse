@@ -8,7 +8,7 @@
 
 <!-- Required for anything non-trivial. Name the test/command and what it
      asserts. "It compiles" is not a gate; a gate that cannot fail is the
-     defect class AGENTS.md §3.3 records for burn-rmsnorm's fused path.
+     defect class AGENTS.md §3.3 records for dormouse-rmsnorm's fused path.
      Non-trivial logic (a branch, a loop, a parser, a money/security path)
      leaves ONE runnable check behind. -->
 

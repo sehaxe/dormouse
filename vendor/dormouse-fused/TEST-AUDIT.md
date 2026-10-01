@@ -3,7 +3,7 @@
 > **Status 2026-10-01.** Everything below was true as of the 2026-09-27 snapshot
 > it names; the crate list changed 2026-09-28. One section is not merely stale
 > but describes files that no longer exist: **"The bit-exact harness"** is about
-> `crates/burn-gdn2/tests/ref_data.bin` and `tools/gen_reference.rs`, both
+> `crates/dormouse-gdn2/tests/ref_data.bin` and `tools/gen_reference.rs`, both
 > DELETED. The fixture is now `tests/ref_f64_broad.bin` (1000 cases, f64
 > NumPy, no torch) and the generator `tools/gen_reference_f64.py`; the f32
 > self-transcription was removed because it could only prove self-consistency
@@ -29,7 +29,7 @@ the ten per-crate ones have since been deleted (`4963c3a`), which is the right
 call — dead config invites the belief that a crate is gated. The gate that runs
 is **`../../.github/workflows/fused-library.yml`** (root of dormouse), which
 builds the fork from inside `vendor/dormouse-fused` because the exclude makes
-`cargo test -p burn-gdn2` from the root a guaranteed "package not found".
+`cargo test -p dormouse-gdn2` from the root a guaranteed "package not found".
 
 Why the root job and not a separate repository for the fork: the fork's crates
 are consumed by `path =` from `dormouse-core`, and 7 of them are load-bearing
@@ -43,8 +43,8 @@ to do inside a test-and-CI change.
 
 ## The bit-exact harness
 
-`crates/burn-gdn2/tests/ref_data.bin` is now committed (6.8 MiB, 1000 cases)
-and regenerable byte-for-byte by `crates/burn-gdn2/tools/gen_reference.rs`
+`crates/dormouse-gdn2/tests/ref_data.bin` is now committed (6.8 MiB, 1000 cases)
+and regenerable byte-for-byte by `crates/dormouse-gdn2/tools/gen_reference.rs`
 (std-only, `rustc tools/gen_reference.rs`; splitmix64 + Box-Muller seeded 1337,
 sequential f32, no thread-count dependence, so the bytes do not depend on the
 platform, the core count or the rustc version - two runs `cmp` clean). CI
@@ -61,7 +61,7 @@ localized the fault to "the short conv's cross-token taps, and the state
 carry-over" and named burn's `fused_recurrent_forward` per-token
 `slice_dim(2, t..t+1)` over permuted `[B, HV, T, D]` views as the likely
 culprit. The fault was in `tools/gen_reference.rs` and had nothing to do with
-either. `binary-tests` is now back in burn-gdn2's default features, and the CI
+either. `binary-tests` is now back in dormouse-gdn2's default features, and the CI
 job (`fused-lib :: 1000 bit-exact cases vs the paper reference`) still gates
 the merge.
 
@@ -133,9 +133,9 @@ the two. Fixing it is not required for green and was not done.
 
 ## FINDINGS — false confidence, for the crate owners
 
-### 1. `burn-rmsnorm`: the "GPU" test runs no GPU code, and is a tautology
+### 1. `dormouse-rmsnorm`: the "GPU" test runs no GPU code, and is a tautology
 
-`crates/burn-rmsnorm/src/lib.rs:95` — `#[cfg(all(test, feature = "cuda"))] mod
+`crates/dormouse-rmsnorm/src/lib.rs:95` — `#[cfg(all(test, feature = "cuda"))] mod
 cuda_tests`, whose `dev()` at `:100-102` returns `Device::ndarray()`. So the
 module only *compiles* with `--features cuda`; every test in it runs on ndarray,
 i.e. it exercises the tensor path. Worse, `fused_matches_tensor` (`:104-120`)
@@ -145,9 +145,9 @@ cannot fail for any reason related to the fused CUDA kernel, and the old CI ran
 it as the GPU gate for this crate. The real check needs `Device::cuda(0)` and a
 reference that is not a copy of the code under test.
 
-### 2. `burn-spectral`: three tests panic before they assert
+### 2. `dormouse-spectral`: three tests panic before they assert
 
-`crates/burn-spectral/src/lib.rs:1227-1228` — the `mod tests` `dev()` is plain
+`crates/dormouse-spectral/src/lib.rs:1227-1228` — the `mod tests` `dev()` is plain
 `Device::ndarray()`, and both `SpectralLinear::retract` (`:586`, calling
 `set_require_grad(true)` at `:595` and `:600`) and `SpectralMoE::retract`
 (`:1208`, at `:1212` and `:1217`) re-track the masters that way. On this burn
@@ -166,36 +166,36 @@ call sites construct on the non-autodiff device and call `retract`:
 `Device::ndarray().autodiff()`.) **KNOWN RED**: the new `ndarray-all-crates` job
 runs `cargo test --workspace`, so it will be red on its first run for exactly
 this reason. That is the point of writing it down rather than deleting the
-tests; the fix belongs to whoever owns burn-spectral (either the test devices or
+tests; the fix belongs to whoever owns dormouse-spectral (either the test devices or
 a `set_require_grad` that tolerates a non-autodiff backend).
 
 ### 3. No test anywhere runs `Autodiff<Cuda, BalancedCheckpointing>`
 
 That is the configuration dormouse trains in, and it is the one with the
-checkpointing-aware fused backward (`burn-gdn2/src/autodiff.rs:360-390` exists
+checkpointing-aware fused backward (`dormouse-gdn2/src/autodiff.rs:360-390` exists
 precisely because the default `Autodiff` graph cannot accept the balanced
 checkpoint tensors, `:370`). The only place the type appears is
-`crates/burn-gdn2/tests/alloc_probe.rs:29` (`type AdBal = Autodiff<CudaBare,
+`crates/dormouse-gdn2/tests/alloc_probe.rs:29` (`type AdBal = Autodiff<CudaBare,
 BalancedCheckpointing>`), in a file where **all four tests are `#[ignore]`d** —
 so it is a probe nobody runs. Every other CUDA test instantiates a bare or
 default-checkpointing backend:
 
 | crate | CUDA-executing tests | backend |
 |---|---|---|
-| burn-gdn2 | `tests/fused_chunk_verify.rs:28`, `tests/lowp_bf16_cuda.rs:43` | `type B = CudaBare` (bare) |
-| burn-kda | `tests/fused_cuda.rs:21,41,68` / `:117` | `CudaBare`, `Autodiff<CudaBare>` (NoCheckpointing) |
-| burn-sct | `tests/cuda_retract.rs:18` | `Device::cuda(0)`, `retract::<CudaBare>()` |
-| burn-spectral | `src/lib.rs:1810` (1), `src/moe_fused.rs:1623` module (13) | `Device::cuda(0)`; `Device::cuda(0).autodiff()` at `:1670`, `:1732` |
-| burn-spectral | `src/bf16_ops.rs:90` module (2) | `type Bare = burn_cubecl::CubeBackend` (`:98`), `type AD = Autodiff<Bare>` (`:95`) — default checkpointing |
-| burn-attnres | `src/fused_attnres.rs:806` module (9) | `Device::default()` (`:855`, `:878`, `:902`) |
-| burn-mhc | `src/sinkhorn_cuda.rs:218` module (5) | `Device::default()` (`:225`, `:254`) |
-| burn-muon-plus | `src/fused_kernels.rs:207` module (4), `tests/bf16_matmul.rs:6` (5) | `Device::default()` (`:212`), `Device::default().autodiff()` (`:12`) |
-| burn-bitnet | `src/fwt_cuda.rs:528` module (1) | `Device::default()` — and that one test is `bitnet_bench` (`:535`), a benchmark, not a correctness check |
-| burn-rope | `src/rope_cuda.rs:218` module (4) | bare, and `rope_matches_ref` (`:242`) **silently returns unless `BURN_DEVICE=cuda`** (`:246`) |
-| burn-situ | `src/fused_situ.rs:312` module (6) | **silently skips unless `BURN_DEVICE=cuda`** (`cuda_enabled`, `:316`; 5 skip sites `:372,391,430,457,491`) |
-| burn-mor | `src/topk_gather.rs:235` | `Device::cuda(0)` via the `devices()` list (`:223-229`); the same test also runs on ndarray |
-| burn-swiglu | **none** | `src/fused.rs:39 swiglu_cuda` is only called from the dispatch at `src/lib.rs:24` — the fused CUDA path is never executed by a test |
-| burn-rmsnorm | `src/lib.rs:104` (1) | `Device::ndarray()` — see FINDING 1 |
+| dormouse-gdn2 | `tests/fused_chunk_verify.rs:28`, `tests/lowp_bf16_cuda.rs:43` | `type B = CudaBare` (bare) |
+| dormouse-kda | `tests/fused_cuda.rs:21,41,68` / `:117` | `CudaBare`, `Autodiff<CudaBare>` (NoCheckpointing) |
+| dormouse-sct | `tests/cuda_retract.rs:18` | `Device::cuda(0)`, `retract::<CudaBare>()` |
+| dormouse-spectral | `src/lib.rs:1810` (1), `src/moe_fused.rs:1623` module (13) | `Device::cuda(0)`; `Device::cuda(0).autodiff()` at `:1670`, `:1732` |
+| dormouse-spectral | `src/bf16_ops.rs:90` module (2) | `type Bare = burn_cubecl::CubeBackend` (`:98`), `type AD = Autodiff<Bare>` (`:95`) — default checkpointing |
+| dormouse-attnres | `src/fused_attnres.rs:806` module (9) | `Device::default()` (`:855`, `:878`, `:902`) |
+| dormouse-mhc | `src/sinkhorn_cuda.rs:218` module (5) | `Device::default()` (`:225`, `:254`) |
+| dormouse-muon-plus | `src/fused_kernels.rs:207` module (4), `tests/bf16_matmul.rs:6` (5) | `Device::default()` (`:212`), `Device::default().autodiff()` (`:12`) |
+| dormouse-bitnet | `src/fwt_cuda.rs:528` module (1) | `Device::default()` — and that one test is `bitnet_bench` (`:535`), a benchmark, not a correctness check |
+| dormouse-rope | `src/rope_cuda.rs:218` module (4) | bare, and `rope_matches_ref` (`:242`) **silently returns unless `BURN_DEVICE=cuda`** (`:246`) |
+| dormouse-situ | `src/fused_situ.rs:312` module (6) | **silently skips unless `BURN_DEVICE=cuda`** (`cuda_enabled`, `:316`; 5 skip sites `:372,391,430,457,491`) |
+| dormouse-mor | `src/topk_gather.rs:235` | `Device::cuda(0)` via the `devices()` list (`:223-229`); the same test also runs on ndarray |
+| dormouse-swiglu | **none** | `src/fused.rs:39 swiglu_cuda` is only called from the dispatch at `src/lib.rs:24` — the fused CUDA path is never executed by a test |
+| dormouse-rmsnorm | `src/lib.rs:104` (1) | `Device::ndarray()` — see FINDING 1 |
 
 Two things follow. `Device::default()` (attnres, mhc, muon-plus, bitnet) is the
 burn 0.22 runtime's default dispatch device
@@ -208,11 +208,11 @@ run them set `BURN_DEVICE: cuda`; the crates should fail loudly instead.
 
 ## Follow-ups, not done here
 
-- **`burn-sct` has the same disease, worse.** `tests/cmp_reference.rs:52` reads
+- **`dormouse-sct` has the same disease, worse.** `tests/cmp_reference.rs:52` reads
   `tests/ref_data/{tiny,small,med,large}.bin`, that directory is gone, and
   `gen_reference.py` — referenced by `README.md:77` — does not exist in the
   crate at all. `binary-tests` there has never been runnable. Needs a generator
-  port like burn-gdn2's, and the fixture committed.
+  port like dormouse-gdn2's, and the fixture committed.
 - ~~Ten per-crate workflows are the same fiction.~~ **Done**: deleted in
   `4963c3a` along with the fork-level one, with the GPU job replaced by a
   local command (a polling runner on this box would sit next to the trainer and
@@ -230,6 +230,6 @@ run them set `BURN_DEVICE: cuda`; the crates should fail loudly instead.
   the signal) — the honest reason is no longer "an unexplained gap to tighten
   around", it is that an absolute threshold on a fixture with a known output
   scale is the weaker instrument.
-- **`burn-gdn2`'s `python3 tests/gen_reference.py` path in `README.md:262-265`**
+- **`dormouse-gdn2`'s `python3 tests/gen_reference.py` path in `README.md:262-265`**
   still tells a reader to run the torch script. It is the readable reference and
   it stays, but the runnable one is now `tools/gen_reference.rs`.

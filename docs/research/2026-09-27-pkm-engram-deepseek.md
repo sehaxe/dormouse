@@ -114,13 +114,13 @@ o_t = g_t · v̂_t  +  (1 − g_t) · v_t          g_t = σ(Linear(RMSNorm(h_t))
 | Address | `row = table_base(t) + (fnv(ngram) % slots[t])` | `dormouse-train/src/offload.rs:94-101` |
 | Host table | `HostNgram::new([S,S,S], 32, seed)` — 3 tables × `--engram-slots` × dim **32** | `dormouse-train/src/lib.rs:603-605` |
 | In-GPU table | `[4096,4096,4096]`, dim 32 | `dormouse-core/src/loop_block.rs:120` |
-| Gate | `σ(sign(s)·√(|s|+1e-6))`, `s = ⟨RMSNorm(W_K e), RMSNorm(h)⟩/√d`, per hc-copy | `vendor/dormouse-fused/crates/burn-engram/src/lib.rs:214-233` |
-| Integration | `y = attn·w_attn + engram·w_mem + ffn·w_ffn` — a **sum**, plus optional zero-init depthwise short conv | `dormouse-core/src/loop_block.rs:323`; `burn-engram/src/lib.rs:159-164` |
+| Gate | `σ(sign(s)·√(|s|+1e-6))`, `s = ⟨RMSNorm(W_K e), RMSNorm(h)⟩/√d`, per hc-copy | `vendor/dormouse-fused/crates/dormouse-engram/src/lib.rs:214-233` |
+| Integration | `y = attn·w_attn + engram·w_mem + ffn·w_ffn` — a **sum**, plus optional zero-init depthwise short conv | `dormouse-core/src/loop_block.rs:323`; `dormouse-engram/src/lib.rs:159-164` |
 | Row optimizer | external host Nesterov + Sinkhorn | `dormouse-train/src/offload.rs` |
 
 Two things this corrects or sharpens versus the brief:
 
-- **The module port is faithful; the hasher is not.** `burn-engram`'s gate, branch structure, shared value proj, and zero-init conv match `engram_demo_v1.py` line-for-line (and the *production* V4.1 kernel, §3.3). But `burn-engram/src/hasher.rs` — which *is* a faithful port of the reference's odd-multiplier XOR-mod-prime polynomial hash — is **not on the training path**; the training path uses the FNV hash in the data crate. Same addressing family (deterministic, collision-noisy, ~50% collision rate at n=3 with 8M rows), different constant.
+- **The module port is faithful; the hasher is not.** `dormouse-engram`'s gate, branch structure, shared value proj, and zero-init conv match `engram_demo_v1.py` line-for-line (and the *production* V4.1 kernel, §3.3). But `dormouse-engram/src/hasher.rs` — which *is* a faithful port of the reference's odd-multiplier XOR-mod-prime polynomial hash — is **not on the training path**; the training path uses the FNV hash in the data crate. Same addressing family (deterministic, collision-noisy, ~50% collision rate at n=3 with 8M rows), different constant.
 - **There already is a per-token-unaware global λ.** `w_mem` is the controller's per-iteration memory weight. It is a *scalar per loop iteration*, shared by all tokens — it can scale the memory branch globally but cannot discriminate per token. That is exactly the granularity kNN-LM's tuned λ operates at, and it is already wired. The kNN-LM interpolation guarantee is therefore a **one-line change**, not a new mechanism.
 
 ### 2.2 The capacity arithmetic (checkable; the interpretation is mine)
@@ -258,7 +258,7 @@ Verbatim mechanics:
 ### Option B — keep the hash, add kNN-LM-style convex interpolation + the capacity budget · **RANK 1**
 
 - **What changes:** (1) replace the *sum* `y = attn + engram + ffn` with a convex mix on the memory branch — `engram_branch = λ·(gate·W_V e) + (1−λ)·(dense value path)`, i.e. FwPKM eq. 12. We already have `w_mem` (a per-iteration scalar) doing the first half of this; we need the *dense* `(1−λ)` term and the λ to be a tunable constant swept on eval BPB, not on train CE. (2) Drop the n=8 arm (512M of the 768M params are a 5,775-way average). (3) Cut the table to ~500K slots/order — the measured optimum. (4) Enforce the budget: memory ≤ 10–20% of total params.
-- **LOC:** **~40–70.** The convex mix and the n=8 drop are edits inside the existing `forward_embeds` (`burn-engram/src/lib.rs:182-210`); the dense value path is one `Linear(d, d)` reused from the backbone; λ sweep and the slot/order knobs are config. Everything else — hash, gate, row optimizer — stays.
+- **LOC:** **~40–70.** The convex mix and the n=8 drop are edits inside the existing `forward_embeds` (`dormouse-engram/src/lib.rs:182-210`); the dense value path is one `Linear(d, d)` reused from the backbone; λ sweep and the slot/order knobs are config. Everything else — hash, gate, row optimizer — stays.
 - **Bit-for-bit verifiable against:** `SakanaAI/fast-weight-product-key-memory` eq. 12 (the convex form), `facebookresearch/XLM xlm/model/memory/memory.py:196-203` (`F.embedding_bag(..., per_sample_weights=scores)` — a weighted-sum read, same primitive), `1911.00172` eq. 3 for the λ-in-probability-space formulation, and `2601.16531` Table 3 for the 300K/500K/800K slot curve.
 - **Collapse resistance:** the `(1−λ)` term is a hard floor — the memory can never be more than λ of the branch, so CE cannot be driven to 0 by the table alone and `∂L/∂h` cannot vanish. λ=0.25 (kNN-LM's tuned optimum on WT-103) is the starting point. The capacity cut removes the ratio pathology. The n=8 drop removes the dilution. This is the only option whose core guarantee is a *hard bound* rather than a learned one.
 
@@ -306,7 +306,7 @@ Verbatim mechanics:
 | V4 has no Engram; has static hash routing for first 3 MoE layers | arXiv **2606.19348** v1 downloaded; `grep -c -i engram` = 0; hash-routing §at lines 347/1379/1399 |
 | Gate anti-correlation with loss, preference fixation, hot→cold flip, 300K/500K/800K slot curve, collisions=regularization | arXiv **2601.16531** v1, full text, Tables 1–3, 7, §5.3–5.4, §6.3, §7–8 |
 | Second capacity-ratio data point: >30B embeddings on 68.5B, ≤50% budget, N=3–5, K≥2 | arXiv **2601.21204** v2, abstract + reported findings |
-| dormouse's own Engram: FNV 3/5/8-gram, table sizes, gate, residual form, host optimizer | read-only inspection of `crates/dormouse-data/src/lib.rs`, `crates/dormouse-train/src/{lib,offload}.rs`, `crates/dormouse-core/src/loop_block.rs`, `vendor/dormouse-fused/crates/burn-engram/src/{lib,hasher}.rs` |
+| dormouse's own Engram: FNV 3/5/8-gram, table sizes, gate, residual form, host optimizer | read-only inspection of `crates/dormouse-data/src/lib.rs`, `crates/dormouse-train/src/{lib,offload}.rs`, `crates/dormouse-core/src/loop_block.rs`, `vendor/dormouse-fused/crates/dormouse-engram/src/{lib,hasher}.rs` |
 
 ### NOT VERIFIED (stated plainly)
 

@@ -1,12 +1,12 @@
-# External reference for the Newton–Schulz orthogonalisation in `burn-spectral`
+# External reference for the Newton–Schulz orthogonalisation in `dormouse-spectral`
 
 **Status: COMPLETE as of 2026-09-30.** Research only — no Rust, no cargo, no
 builds. Everything below was run; the transcript is in
-`vendor/dormouse-fused/crates/burn-spectral/tests/oracle/`.
+`vendor/dormouse-fused/crates/dormouse-spectral/tests/oracle/`.
 
 **Interpreter for every RUN below**: `/tmp/opencode/oracle-venv/bin/python`,
 python 3.12.14, `torch==2.14.0+cpu`, `numpy==2.5.2`, CPU only. That venv was
-created on this box by the `burn-rmsnorm` oracle lane; it was used
+created on this box by the `dormouse-rmsnorm` oracle lane; it was used
 **read-only** and nothing was installed into it. Following the RMSNorm
 precedent: torch's arithmetic is COMPILED C++ and therefore not quotable, so
 the wheel and version are recorded instead of any number claimed to come out of
@@ -20,7 +20,7 @@ named 'torch'` and that is recorded rather than worked around.)
    generator returns it *bit-exactly* — but the **source the code under test
    cites is not the source that implements it**, and the way it is used
    (fixed, every iteration) is not what that source does. §1.
-2. `burn-muon-plus::orthogonalize` is a faithful transcription of a
+2. `dormouse-muon-plus::orthogonalize` is a faithful transcription of a
    **real, running, (a)** reference: Keller Jordan's `newtonschulz5`. §2.
 3. The retraction's **definition** has a running external reference (LAPACK
    `dgesdd` via numpy), and it found two things our own tests cannot. §3.
@@ -37,31 +37,31 @@ named 'torch'` and that is recorded rather than worked around.)
 
 ### 0.1 The premise in the task brief is wrong about our own code — corrected
 
-The brief says: *"Our `NS_COEFFS` in `vendor/dormouse-fused/crates/burn-muon-plus/src/lib.rs`
+The brief says: *"Our `NS_COEFFS` in `vendor/dormouse-fused/crates/dormouse-muon-plus/src/lib.rs`
 ends at exactly `(1.875, −1.25, 0.375)`."*
 
 **It does not.** Measured by reading the file:
 
 | site | line | coefficients |
 |---|---|---|
-| `burn-muon-plus/src/lib.rs:189` `NS_COEFFS` | 189 | **`(3.4445, -4.775, 2.0315)`** — the *Jordan* triple |
-| `burn-spectral/src/lib.rs:254` | 254 | `(15.0f32/8.0, -5.0f32/4.0, 3.0f32/8.0)` = **`(1.875, −1.25, 0.375)`** |
-| `burn-spectral/src/lib.rs:305` (batched) | 305 | same, re-spelled |
+| `dormouse-muon-plus/src/lib.rs:189` `NS_COEFFS` | 189 | **`(3.4445, -4.775, 2.0315)`** — the *Jordan* triple |
+| `dormouse-spectral/src/lib.rs:254` | 254 | `(15.0f32/8.0, -5.0f32/4.0, 3.0f32/8.0)` = **`(1.875, −1.25, 0.375)`** |
+| `dormouse-spectral/src/lib.rs:305` (batched) | 305 | same, re-spelled |
 
 So the two crates encode **two different coefficient sets from two different
 appendices of two different papers**, and the `(1.875, …)` triple is the one in
-`burn-spectral`, hardcoded at two sites and not named `NS_COEFFS`. This is a
+`dormouse-spectral`, hardcoded at two sites and not named `NS_COEFFS`. This is a
 glossary item (AGENTS.md §1.7): "the NS coefficients" currently means two
 things in this repo, and the brief inherited the wrong one.
 
 **Both doc comments are correct about their own source** — I checked each
 against the paper rather than against the other doc comment:
 
-- `burn-muon-plus:181-188` cites v3 App. D.1 "Jordan Coefficients" for
+- `dormouse-muon-plus:181-188` cites v3 App. D.1 "Jordan Coefficients" for
   `(3.4445, −4.7750, 2.0315)`. **CONFIRMED verbatim** in the v3 HTML:
   section `A4.SS1` = *"D.1 Jordan Coefficients [15] — In [15], the
   coefficients are set to (a,b,c) = (3.4445, −4.7750, 2.0315)."*
-- `burn-spectral:169-175` cites v3 App. D.3 "PolarExpress Coefficients" for
+- `dormouse-spectral:169-175` cites v3 App. D.3 "PolarExpress Coefficients" for
   `{(aₜ,bₜ,cₜ)}ₜ₌₁⁸` ending at `(1.875, −1.25, 0.375)`. **CONFIRMED** in the
   v3 HTML: section `A4.SS3` = *"D.3 PolarExpress Coefficients [2]"* with that
   8-tuple, captioned *"with subsequent coefficients numerically equal to
@@ -71,13 +71,13 @@ against the paper rather than against the other doc comment:
   (v3 = 9, all in D.3). The string `PolarExpress` does appear 3× in v1 and v2,
   so "no NS coefficients" is right and "no mention at all" would not be.
 
-### 0.2 `burn-spectral::polar_orthogonalize` (`lib.rs:208-266`)
+### 0.2 `dormouse-spectral::polar_orthogonalize` (`lib.rs:208-266`)
 
 Prescale: 5-step power iteration on the Gram + Rayleigh quotient, divide by
 `sigma · 1.05`. Then `iters` applications of **one fixed** triple
 `(15/8, −5/4, 3/8)`. Retraction = that, `.detach()`ed.
 
-### 0.3 `burn-muon-plus::orthogonalize` (`lib.rs:283-305`)
+### 0.3 `dormouse-muon-plus::orthogonalize` (`lib.rs:283-305`)
 
 `orient_and_normalize` (266-276): transpose if taller, divide by
 `‖·‖_F.clamp_min(1e-7)`. Then `ns_steps` (default 5) applications of
@@ -182,7 +182,7 @@ authors' code" for the printed numbers — is exactly the kind of reference that
 agrees with whatever we happen to have written.
 
 **(c) FINDING — the usage is not what the source does, and the doc comment
-implies it is.** `burn-spectral:169-175` presents `(1.875, −1.25, 0.375)` as
+implies it is.** `dormouse-spectral:169-175` presents `(1.875, −1.25, 0.375)` as
 "the last entry of the PolarExpress schedule … which prints
 `{(aₜ,bₜ,cₜ)}ₜ₌₁⁸`". True. What the code then does is apply that entry
 **`iters` times, unchanged**. The reference applies the first `T` entries,
@@ -274,7 +274,7 @@ value.
 ### 2.2 What RUNNING it says
 
 `run_targets_2_and_3.py` runs **their bytes** (bf16 as shipped) against a
-transcription of `burn-muon-plus`'s `orient_and_normalize` + `orthogonalize`,
+transcription of `dormouse-muon-plus`'s `orient_and_normalize` + `orthogonalize`,
 5 steps, f64:
 
 | shape | theirs per-entry | our transcription (f64) | max abs diff |
@@ -504,7 +504,7 @@ Stated so the next reader does not over-read this document:
   condition number tested (§1.3c). Nothing here argues for changing it.
 - The `eps` placement difference vs Keller Jordan is benign and ours is the
   more conservative (§2.2).
-- `burn-muon-plus::orthogonalize` reproduced the reference to the bf16 floor
+- `dormouse-muon-plus::orthogonalize` reproduced the reference to the bf16 floor
   on four shapes. No defect found in it at all.
 
 ---
@@ -513,7 +513,7 @@ Stated so the next reader does not over-read this document:
 
 Everything fetched 2026-09-30 (UTC) from `/home/sehaxe/dormouse-wt/spectral-oracle`
 at base commit `c3314e9`, branch `wt/spectral-oracle`. Pinned under
-`vendor/dormouse-fused/crates/burn-spectral/tests/oracle/upstream/`.
+`vendor/dormouse-fused/crates/dormouse-spectral/tests/oracle/upstream/`.
 
 | file | sha256 | origin | pin |
 |---|---|---|---|
@@ -537,7 +537,7 @@ Papers (fetched, **not** pinned — no reproducible artifact exists for either):
 
 Script transcripts committed beside these, all re-runnable with
 `/tmp/opencode/oracle-venv/bin/python` from
-`vendor/dormouse-fused/crates/burn-spectral/tests/oracle/`:
+`vendor/dormouse-fused/crates/dormouse-spectral/tests/oracle/`:
 
 | script | sha256 | what it establishes |
 |---|---|---|

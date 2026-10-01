@@ -6,8 +6,8 @@ down is not followed, and "we checked it once by eye" is how 25858 ms/step
 became a number three people believed.
 
 > **For the fused library, read `docs/protocols/ORACLE.md` first.** It is the companion to
-> this file and answers a question this one does not: for `burn-kda` and
-> `burn-gdn2`, *which defect class each existing test can and cannot catch*, and
+> this file and answers a question this one does not: for `dormouse-kda` and
+> `dormouse-gdn2`, *which defect class each existing test can and cannot catch*, and
 > which classes **no** test in those crates can catch. The short version, which
 > changes how the tables below should be read: the tensor-ops path and the fused
 > path share one `project` and one `output`, so a bug above the branch point
@@ -27,7 +27,7 @@ that happens to run faster.
 
 ## What already exists, and is the pattern to follow
 
-`vendor/dormouse-fused/crates/burn-gdn2/` already does this properly and has done
+`vendor/dormouse-fused/crates/dormouse-gdn2/` already does this properly and has done
 since before this session:
 
 - `tests/ref_data.bin` — 7 MB of committed reference activations

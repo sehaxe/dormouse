@@ -1,34 +1,34 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/burn-attnres",
-    "crates/burn-bitnet",
-    "crates/burn-gdn2",
-    "crates/burn-kda",
-    "crates/burn-mhc",
-    "crates/burn-muon-plus",
-    "crates/burn-rope",
-    "crates/burn-sct",
-    "crates/burn-situ",
-    "crates/burn-spectral",
-    "crates/burn-rmsnorm",
-    "crates/burn-swiglu",
-    "crates/burn-mor",
-    "crates/burn-dspark",
-    "crates/burn-parcae",
-    "crates/burn-jepa",
-    "crates/burn-ptrn",
-    "crates/burn-eggroll",
-    "crates/burn-es",
-    "crates/burn-engram",
-    "burn-fused",
+    "crates/dormouse-attnres",
+    "crates/dormouse-bitnet",
+    "crates/dormouse-gdn2",
+    "crates/dormouse-kda",
+    "crates/dormouse-mhc",
+    "crates/dormouse-muon-plus",
+    "crates/dormouse-rope",
+    "crates/dormouse-sct",
+    "crates/dormouse-situ",
+    "crates/dormouse-spectral",
+    "crates/dormouse-rmsnorm",
+    "crates/dormouse-swiglu",
+    "crates/dormouse-mor",
+    "crates/dormouse-dspark",
+    "crates/dormouse-parcae",
+    "crates/dormouse-jepa",
+    "crates/dormouse-ptrn",
+    "crates/dormouse-eggroll",
+    "crates/dormouse-es",
+    "crates/dormouse-engram",
+    "dormouse-fused",
     "benches",
     "benches/cpu_probe",
     "benches/launch_probe",
 
 ]
 # keep the default build fast: only the meta-crate by default
-default-members = ["burn-fused"]
+default-members = ["dormouse-fused"]
 
 [workspace.package]
 version = "0.1.0"

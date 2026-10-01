@@ -425,7 +425,7 @@ fn kda_long_stability() {
 ///
 /// Two documented exceptions - anything else missing fails the test:
 /// - the two RMSNorm gains (`loop_block.norm.weight`, `norm.weight`):
-///   burn-rmsnorm builds them with `Param::initialized(.., Tensor::ones)`
+///   dormouse-rmsnorm builds them with `Param::initialized(.., Tensor::ones)`
 ///   instead of `Param::from_tensor`, so the param inherits the tensor's
 ///   `require_grad = false` and can never receive a gradient. That is an
 ///   upstream bug this test pins: gains stay at 1.0 forever.
@@ -502,7 +502,7 @@ fn gradient_flow() {
         .map(|(p, _, _)| p.as_str())
         .collect();
     // Documented grad-free params (see the test doc): the RMSNorm gains
-    // (burn-rmsnorm require_grad bug). Anything else missing is a regression.
+    // (dormouse-rmsnorm require_grad bug). Anything else missing is a regression.
     //
     // The MoR router joins them by DESIGN, not by defect: `LoopBlock.mor_router`
     // is documented as "always present (769 params, routed to AdamW...);
@@ -527,7 +527,7 @@ fn gradient_flow() {
         unexpected.len()
     );
     println!(
-        "gradient_flow: {} params grad-free (2 RMSNorm gains: burn-rmsnorm require_grad bug)",
+        "gradient_flow: {} params grad-free (2 RMSNorm gains: dormouse-rmsnorm require_grad bug)",
         missing.len()
     );
     let nonfinite: Vec<&str> = probe

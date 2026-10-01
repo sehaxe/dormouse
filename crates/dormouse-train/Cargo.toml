@@ -12,7 +12,7 @@ default = ["cpu"]
 # The CPU backend is burn-flex: pure Rust, no BLAS, and unlike the deprecated
 # burn-ndarray it supports f16/bf16.
 cpu = ["burn/flex"]
-cuda = ["burn/cuda", "burn/autodiff", "dormouse-core/cuda", "burn-muon-plus/cuda"]
+cuda = ["burn/cuda", "burn/autodiff", "dormouse-core/cuda", "dormouse-muon-plus/cuda"]
 
 [dev-dependencies]
 # The divergence measurement is a program, not a test (a trained model is a
@@ -24,9 +24,9 @@ clap = { workspace = true, features = ["derive"] }
 [dependencies]
 dormouse-core = { path = "../dormouse-core" }
 dormouse-data = { path = "../dormouse-data" }
-burn-spectral = { path = "../../vendor/dormouse-fused/crates/burn-spectral" }
-burn-bitnet = { path = "../../vendor/dormouse-fused/crates/burn-bitnet" }
-burn-muon-plus = { path = "../../vendor/dormouse-fused/crates/burn-muon-plus" }
+dormouse-spectral = { path = "../../vendor/dormouse-fused/crates/dormouse-spectral" }
+dormouse-bitnet = { path = "../../vendor/dormouse-fused/crates/dormouse-bitnet" }
+dormouse-muon-plus = { path = "../../vendor/dormouse-fused/crates/dormouse-muon-plus" }
 serde = { workspace = true, features = ["derive"] }
 toml = { workspace = true }
 # The export's two primitives, both already in this build graph through burn

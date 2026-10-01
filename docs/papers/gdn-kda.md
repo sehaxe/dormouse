@@ -1,12 +1,12 @@
-# GatedDeltaNet-2 and KDA: provenance, and a line-by-line check of `burn-gdn2` / `burn-kda`
+# GatedDeltaNet-2 and KDA: provenance, and a line-by-line check of `dormouse-gdn2` / `dormouse-kda`
 
 **Fetch date: 2026-09-29.** Every arXiv id below was resolved through the arXiv
 API (`export.arxiv.org/api/query?id_list=…`) and, where available, the arXiv
 HTML full text and the authors' own source repositories. No claim in §1–§6
 rests on a snippet: each was read from the primary document.
 
-Scope: `vendor/dormouse-fused/crates/burn-gdn2/` and
-`vendor/dormouse-fused/crates/burn-kda/`. Read-only; no file in either crate was
+Scope: `vendor/dormouse-fused/crates/dormouse-gdn2/` and
+`vendor/dormouse-fused/crates/dormouse-kda/`. Read-only; no file in either crate was
 touched (`gen_reference.rs` / `gen_reference.py` were read, never edited).
 
 ---
@@ -25,11 +25,11 @@ misattribution, and it is a misattribution with a specific, checkable cause.
 | **URL** | <https://arxiv.org/abs/2601.16531> |
 | **is it about GDN / KDA?** | **No.** Zero overlap. |
 
-**The citation is not on `burn-gdn2` or `burn-kda` at all.** Grepping both
+**The citation is not on `dormouse-gdn2` or `dormouse-kda` at all.** Grepping both
 crates for arXiv ids returns exactly three, and none of them is `2601.16531`:
 
-- `burn-gdn2/README.md:10` — `2605.22791` (Gated DeltaNet-2)
-- `burn-kda/src/lib.rs:5-7` — `2510.26692` (Kimi Linear), `2607.24653` (Kimi K3)
+- `dormouse-gdn2/README.md:10` — `2605.22791` (Gated DeltaNet-2)
+- `dormouse-kda/src/lib.rs:5-7` — `2510.26692` (Kimi Linear), `2607.24653` (Kimi K3)
 
 `2601.16531` appears **only** in the *Engram* line of the repo:
 `crates/dormouse-core/src/config/schema.rs:122`, `configs/small.toml:29`,
@@ -46,7 +46,7 @@ the GDN/KDA crates claim `2601.16531` — is false, and I checked before
 reporting it as such.
 
 What *is* fabricated is a different, smaller thing, and it is real: see
-**§5, delta rows 25 and 26**. `burn-kda/src/lib.rs:166-170` cites
+**§5, delta rows 25 and 26**. `dormouse-kda/src/lib.rs:166-170` cites
 "Moonshot/FLA init (FlashKDA torch_ref, kda.py): A_log = -3" and that citation
 names a file that does not exist, in a repository, with values that are in
 neither the paper nor the code. That is a genuine retracted-claim-class
@@ -76,13 +76,13 @@ question below is answerable from a primary source rather than a guess.
 
 | claim | status |
 |---|---|
-| `burn-gdn2/README.md:10` → `2605.22791` + `NVlabs/GatedDeltaNet-2` | ✅ **verified**, both halves |
-| `burn-kda/src/lib.rs:5` → `2510.26692` | ✅ **verified** |
-| `burn-kda/src/lib.rs:6` → `2607.24653`, "§2.1.1, Eqs 1-6 — lower-bounded decay, full-rank output gate" | ✅ **verified**; §2.1.1 has exactly subsections "Chunkwise parallel form" / "Lower-bounded decay" / "Full-rank gate", and Eqs 3,4,5,6 |
-| `burn-kda/src/lib.rs:166` → "Moonshot/FLA init (FlashKDA torch_ref, kda.py): A_log = -3" | ❌ **FALSE CITATION** — see §5 row 25 |
+| `dormouse-gdn2/README.md:10` → `2605.22791` + `NVlabs/GatedDeltaNet-2` | ✅ **verified**, both halves |
+| `dormouse-kda/src/lib.rs:5` → `2510.26692` | ✅ **verified** |
+| `dormouse-kda/src/lib.rs:6` → `2607.24653`, "§2.1.1, Eqs 1-6 — lower-bounded decay, full-rank output gate" | ✅ **verified**; §2.1.1 has exactly subsections "Chunkwise parallel form" / "Lower-bounded decay" / "Full-rank gate", and Eqs 3,4,5,6 |
+| `dormouse-kda/src/lib.rs:166` → "Moonshot/FLA init (FlashKDA torch_ref, kda.py): A_log = -3" | ❌ **FALSE CITATION** — see §5 row 25 |
 | `AGENTS.md:274,837` → "decay init matches the Moonshot/FLA recipe (`a_log=-3`, `b_alpha=1.0`)" | ❌ **UNSUPPORTED** — same defect, propagated to the rulebook |
 | `AGENTS.md:839` → "FlashKDA math (K3 decay, chunked WY, chunk 16)" | ✅ **verified** (chunk 16 is literal) |
-| `burn-gdn2/README.md:22` → "1000-case comparison against an independent transcription" | ✅ **honest** — `tools/gen_reference.rs:24` says outright "The fixture is a transcription, not the original authors' bytes". This is exactly the ADR-0020 form. Credit where due. |
+| `dormouse-gdn2/README.md:22` → "1000-case comparison against an independent transcription" | ✅ **honest** — `tools/gen_reference.rs:24` says outright "The fixture is a transcription, not the original authors' bytes". This is exactly the ADR-0020 form. Credit where due. |
 
 ---
 
@@ -113,12 +113,12 @@ S_t = S_{t−1} + β_t k_t (v_t − S_{t−1}ᵀ k_t)ᵀ
 **Eq 6 — Gated DeltaNet.** `S_t = α_t (I − β_t k_t k_tᵀ) S_{t−1} + β_t k_t v_tᵀ`
 (both gates scalar per head).
 
-**Eq 7 — KDA. This is the recurrence `burn-kda` implements.**
+**Eq 7 — KDA. This is the recurrence `dormouse-kda` implements.**
 ```
 S_t = (I − β_t k_t k_tᵀ) D_t S_{t−1} + β_t k_t v_tᵀ,    D_t = Diag(α_t),  α_t ∈ (0,1]^{d_k}
 ```
 
-### 2.2 Gated Delta Rule-2 — the recurrence `burn-gdn2` implements (GDN-2 §3.1, Eqs 8–10)
+### 2.2 Gated Delta Rule-2 — the recurrence `dormouse-gdn2` implements (GDN-2 §3.1, Eqs 8–10)
 
 **Eq 8** — the two channel-wise gates:
 ```
@@ -194,7 +194,7 @@ dT = −tril(Aᵀ dA Aᵀ, −1)
 App. B.5 states this explicitly and it is the paper's one necessary backward
 change.
 
-### 2.4 The KDA/K3 gates (`burn-kda`)
+### 2.4 The KDA/K3 gates (`dormouse-kda`)
 
 **Kimi Linear (arXiv 2510.26692) — negative-Softplus, unbounded:**
 ```
@@ -268,7 +268,7 @@ the sum, not per-tap.** That is the whole specification.
 Verdicts: **MATCH** (equivalent), **BUG** (wrong), **DELIBERATE** (knowing
 divergence, documented), **BENIGN** (differs but cannot change a number), **UNVERIFIABLE**.
 
-### 3.1 `burn-gdn2` — vs arXiv 2605.22791 + NVlabs/GatedDeltaNet-2
+### 3.1 `dormouse-gdn2` — vs arXiv 2605.22791 + NVlabs/GatedDeltaNet-2
 
 | # | what | our `file:line` | paper / reference | verdict |
 |---|---|---|---|---|
@@ -294,7 +294,7 @@ divergence, documented), **BENIGN** (differs but cannot change a number), **UNVE
 | 20 | read-only forward (`update_state=false`) | `src/module.rs:355-366` | Not in the paper | **DELIBERATE** — documented as prefill |
 | 21 | batched chunk arm limited to `chunk_size ≤ 16` | `src/forward.rs:7,72-82,206-211` | Ref is stable at 64 (it forms **differences** `exp2(g_r − g_s)`, never an absolute reciprocal) | **DELIBERATE** — a real numerical limit of the absolute-reciprocal form; README:160-164 states the `exp(cumsum g) < −88` reason. **Note the default `chunk_size=64` therefore routes to the `Loop` arm**, so the batched arm is off by default. Worth a line in the README. |
 
-### 3.2 `burn-kda` — vs arXiv 2510.26692 + 2607.24653 + MoonshotAI/FlashKDA
+### 3.2 `dormouse-kda` — vs arXiv 2510.26692 + 2607.24653 + MoonshotAI/FlashKDA
 
 | # | what | our `file:line` | paper / reference | verdict |
 |---|---|---|---|---|
@@ -308,7 +308,7 @@ divergence, documented), **BENIGN** (differs but cannot change a number), **UNVE
 | 29 | β on both axes (erase and write) | `src/lib.rs:445-446` broadcasts `b_k` and `b_v` | GDN-2 Eq 7: `β_t` multiplies both | **MATCH** (this is the KDA↔GDN-2 mapping the header comment at `lib.rs:20-22` claims) |
 | 30 | **full-rank sigmoid output gate, Eq 6** | `src/lib.rs:483-484,494-500` `RMSNorm(o) ⊙ sigmoid(W_g x) ⊙ w_norm → o_proj` | 2607.24653 §2.1.1 **Eq 6 verbatim**; FLA `FusedRMSNormGated(activation="sigmoid")` | **MATCH — verified against the paper** |
 | 31 | **chunk size = 16** | `src/lib.rs:81` | FlashKDA `tests/torch_ref.py`: `CHUNK = 16`. K3 §2.1.1: "16-token tile", cum. log-decay in `(−80,0)` | **MATCH — verified** |
-| 32 | short conv | reuses `burn_gdn2::short_conv_1d` | zero-pad, per row 13 | **BUG (inherited)** — same defect as row 14 |
+| 32 | short conv | reuses `dormouse_gdn2::short_conv_1d` | zero-pad, per row 13 | **BUG (inherited)** — same defect as row 14 |
 | 33 | GVA repeat of q,k,g,b | `src/lib.rs:456-469` | FLA `kda.py` (`state_v_first`, per-value-head `gate_dim`) | **MATCH** |
 
 **Totals: 33 rows. 27 MATCH · 1 BUG-class false citation ×2 rows · 1 BUG ×2
@@ -406,7 +406,7 @@ init, or drop the citation.
 
 ## 5. Everything in the paper we do not implement / vice versa
 
-### 5.1 In the paper, not in `burn-gdn2`
+### 5.1 In the paper, not in `dormouse-gdn2`
 
 | item | why it is absent | should it be? |
 |---|---|---|
@@ -420,7 +420,7 @@ init, or drop the citation.
 | Grouped-value `H_v > H` state layout `state_v_first` | we do GVA, layout ours | **check** — §5.3 |
 | Hybrid SWA + the 1.3B/100B recipe | a model, not a layer | no |
 
-### 5.2 In `burn-gdn2`, not in the paper
+### 5.2 In `dormouse-gdn2`, not in the paper
 
 `min_decay` (correctly declared an extension), the read-only forward branch,
 the `ChunkPath::{Batched,Loop}` switch + `DM_GDN2_OPS` env var, the
@@ -459,13 +459,13 @@ free, which is what makes the ≤16 batched limit reachable at all).
 |---|---|---|
 | **GDN-2** | **C = 64** | 2605.22791 App. C.2, verbatim: *"The chunk size is fixed to C=64."* Confirmed in code: `chunk_gdn2.py` → `chunk_size: int = 64`; `chunk_gdn2_fwd_intra` → `BT = chunk_size`, `BC = 16`. |
 | **GDN-2 sub-chunk** | **BC = 16** | same file, `BC = 16` — a *sub*-tile, not the chunk |
-| **ours, burn-gdn2** | **64** (`src/config.rs:126`) | ✅ matches GDN-2 |
+| **ours, dormouse-gdn2** | **64** (`src/config.rs:126`) | ✅ matches GDN-2 |
 | **KDA / FlashKDA** | **16** | `MoonshotAI/FlashKDA/tests/torch_ref.py`: `CHUNK = 16` |
 | **K3** | **16-token tile** | 2607.24653 §2.1.1: *"the cumulative log-decay over a 16-token tile lies in (−80, 0)"* |
-| **ours, burn-kda** | **16** (`src/lib.rs:81`) | ✅ matches FlashKDA / K3 |
+| **ours, dormouse-kda** | **16** (`src/lib.rs:81`) | ✅ matches FlashKDA / K3 |
 
-**The "chunk 16" claim in AGENTS.md is correct — for `burn-kda`, and only for
-`burn-kda`.** It does not apply to `burn-gdn2`, whose source says 64 and which
+**The "chunk 16" claim in AGENTS.md is correct — for `dormouse-kda`, and only for
+`dormouse-kda`.** It does not apply to `dormouse-gdn2`, whose source says 64 and which
 uses 64. Two crates, two sources, two chunk sizes, both right. This is worth
 writing down, because "chunk 16" and "chunk 64" appearing in the same repo
 looks like an inconsistency and is not one.
@@ -486,7 +486,7 @@ log-scale and `g_min = −5` is fixed."* Corroborated in code by
 FLA `fla/layers/kda.py`: *"With `-5`, the per-step decay `exp(g) ≈ 0.0067` at
 minimum — negligible impact on quality."*
 
-**Our `G_MIN: f64 = -5.0` (`burn-kda/src/lib.rs:26`) is correct and correctly
+**Our `G_MIN: f64 = -5.0` (`dormouse-kda/src/lib.rs:26`) is correct and correctly
 cited.** Row 23 in the delta table.
 
 ---
@@ -580,7 +580,7 @@ seams:
 
 - `2601.16531` resolves to *A Collision-Free Hot-Tier Extension for
   Engram-Style Conditional Memory*, Tao Lin — and is cited **nowhere** in
-  `burn-gdn2` or `burn-kda`. (arXiv API, two independent endpoints.)
+  `dormouse-gdn2` or `dormouse-kda`. (arXiv API, two independent endpoints.)
 - `2605.22791`, `2510.26692`, `2607.24653` all resolve, to the titles and
   author lists quoted. (arXiv API.)
 - `NVlabs/GatedDeltaNet-2`, `fla-org/flash-linear-attention`, `MoonshotAI/FlashKDA`,
@@ -637,7 +637,7 @@ seams:
    identity test after their change lands** — if they fix the generator's
    padding, our `short_conv.rs` becomes the odd one out, not the other way
    round.
-4. `burn-gdn2/README.md:22` claims "1000-case comparison against an independent
+4. `dormouse-gdn2/README.md:22` claims "1000-case comparison against an independent
    transcription … **Verification: none shipped**" for the reference. Given
    §4.1, that table's honest reading is: *self-consistency, 1000 cases,
    tolerance 5e-4, upstream fidelity untested.* Worth a README line.
@@ -646,7 +646,7 @@ seams:
 
 ## 9. One-paragraph summary
 
-Every arXiv id in `burn-gdn2` and `burn-kda` resolves, and the two source
+Every arXiv id in `dormouse-gdn2` and `dormouse-kda` resolves, and the two source
 repositories those crates name — NVlabs/GatedDeltaNet-2 and Moonshot/FLA
 (`fla-org/flash-linear-attention`, `MoonshotAI/FlashKDA`) — are real,
 public, and were read in full for this report. The Gated Delta Rule-2

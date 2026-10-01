@@ -29,7 +29,7 @@
 //! Run: `cargo test -p backend-parity --features cuda --test topk_gather_parity`
 
 use burn::tensor::{Device, Tensor, TensorData};
-use burn_mor::{topk_gather, topk_indices_last};
+use dormouse_mor::{topk_gather, topk_indices_last};
 
 /// One row's contract: the picked indices, the score row they come from, the
 /// value row they name, and what the gather actually produced.

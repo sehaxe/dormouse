@@ -1,7 +1,7 @@
 # Engram / hashed n-gram memory — paper verification
 
 **Fetch date:** 2026-09-29. **Tree:** `eeb3b73`, working dir `/home/sehaxe/dormouse`.
-**Subject:** `vendor/dormouse-fused/crates/burn-engram/` + the call site in
+**Subject:** `vendor/dormouse-fused/crates/dormouse-engram/` + the call site in
 `crates/dormouse-core/{loop_block.rs, config/schema.rs}`.
 
 ---
@@ -190,7 +190,7 @@ direction in this literature is gate→0, not gate→1.
 | E5 | `lib.rs:63-69` offsets + one fused gather | Eq 2 concat | ✓ **BENIGN.** Demo's `MultiHeadEmbedding` does `input_ids + offsets` then one `nn.Embedding`. Identical, including the pre-offset-not-divide choice. |
 | E6 | `hasher.rs:136-151` `mix = m₀; mix ^= m_k`; `rem_euclid(p)` | Eq 1 "multiplicative-XOR hash", prime sizes | ✓ **BENIGN.** Demo `_get_ngram_hashes`: `mix = tokens[0]*m[0]; for k in 1..n: mix ^= tokens[k]*m[k]; head_hash = mix % mod`. Structurally identical. `rem_euclid` is safer than Python `%` for negatives. The splitmix64-vs-PCG64 substitution is **declared in the header** and the test file explicitly declines to claim bit-fidelity. Good discipline. |
 | E7 | `hasher.rs:81-116` `min_ngram` is a parameter | Eq 2: `n = 2 … N`; demo: `range(2, max+1)` — **never 1** | **BENIGN** (our caller uses 2,3,4) but the constructor permits `min_ngram = 1`, which no source sanctions. Unasserted. |
-| E8 | `hasher.rs` is **entirely unused by dormouse** | — | **BUG (dead weight, not a defect).** `crates/` calls neither `NgramHasher` nor any `burn_engram::hasher` symbol. The real keys come from `dormouse-data/src/lib.rs:44` `ORDERS = [2,3,4]` + FNV. So the carefully-ported, honestly-disclaimed reference hasher is **not in the training path** and its 5 property tests certify nothing about what trains. |
+| E8 | `hasher.rs` is **entirely unused by dormouse** | — | **BUG (dead weight, not a defect).** `crates/` calls neither `NgramHasher` nor any `dormouse_engram::hasher` symbol. The real keys come from `dormouse-data/src/lib.rs:44` `ORDERS = [2,3,4]` + FNV. So the carefully-ported, honestly-disclaimed reference hasher is **not in the training path** and its 5 property tests certify nothing about what trains. |
 | E9 | `config/schema.rs:159` cites "2601.07372 Sec. 2.4 eq. 6" for *one shared value projection over all orders* | Eq 6 + the sentence after it: shared `W_V`, `M` distinct `W_K` | ✓ **BENIGN — the citation is exact and precise.** One of the few citations in this repo that lands exactly. |
 | E10 | `loop_block.rs:51-57` cites FwPKM eq 12 and kNN-LM eq 3 | both verified verbatim | ✓ **BENIGN — the quotes are correct.** |
 | E11 | `loop_block.rs:64` `λ = w_mem.clamp(0, lam_max)`; comment says *"λ is a tuned CONSTANT, not a learned value - same claim"* | kNN-LM eq 3: `λ` is **tuned on held-out data, never learned** | **BUG — the comment asserts a property the code does not have.** `w_mem` is the controller's *learned* per-iteration weight (loop_block.rs:42-49 describes it as learned). Clamping bounds it above; it does not make it a constant. kNN-LM's guarantee is a **hard** `λ`; ours is a **learned** `λ ≤ 0.5`. The two are not "the same claim". The floor under the branch (`1 − λ_max` dense) is real and is the part that does hold. |
@@ -243,7 +243,7 @@ direction in this literature is gate→0, not gate→1.
 
 ## 8. Recommended gold-vector test
 
-`burn-engram/src/lib.rs` has 5 shape tests + 1 gate test, and the gate test
+`dormouse-engram/src/lib.rs` has 5 shape tests + 1 gate test, and the gate test
 (`gate_matches_reference_formula`, lib.rs:300-330) asserts a value it computed
 *by restating the implementation* — a copied constant that moves with the bug.
 **It does not pin against the reference.**

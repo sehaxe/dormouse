@@ -580,19 +580,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "burn-attnres"
-version = "0.1.0"
-dependencies = [
- "burn",
- "burn-autodiff",
- "burn-cubecl",
- "burn-cuda",
- "burn-ndarray",
- "burn-tensor",
- "cubecl",
-]
-
-[[package]]
 name = "burn-autodiff"
 version = "0.22.0-pre.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -636,19 +623,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
-]
-
-[[package]]
-name = "burn-bitnet"
-version = "0.1.0"
-dependencies = [
- "burn",
- "burn-autodiff",
- "burn-cubecl",
- "burn-cuda",
- "burn-ndarray",
- "burn-tensor",
- "cubecl",
 ]
 
 [[package]]
@@ -772,46 +746,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "burn-dspark"
-version = "0.1.0"
-dependencies = [
- "burn",
- "burn-ndarray",
- "burn-tensor",
-]
-
-[[package]]
-name = "burn-eggroll"
-version = "0.1.0"
-dependencies = [
- "burn",
- "burn-ndarray",
- "burn-tensor",
-]
-
-[[package]]
 name = "burn-einsum"
 version = "0.22.0-pre.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b341a4c808379eaaf8cef0a9f3e842457c7d74db26fc99c5c34da3dfe7ef3d7"
-
-[[package]]
-name = "burn-engram"
-version = "0.1.0"
-dependencies = [
- "burn",
- "burn-ndarray",
- "burn-tensor",
-]
-
-[[package]]
-name = "burn-es"
-version = "0.1.0"
-dependencies = [
- "burn",
- "burn-ndarray",
- "burn-tensor",
-]
 
 [[package]]
 name = "burn-flex"
@@ -832,56 +770,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "burn-fused"
-version = "0.1.0"
-dependencies = [
- "burn",
- "burn-attnres",
- "burn-autodiff",
- "burn-bitnet",
- "burn-cuda",
- "burn-dspark",
- "burn-eggroll",
- "burn-engram",
- "burn-es",
- "burn-gdn2",
- "burn-jepa",
- "burn-kda",
- "burn-mhc",
- "burn-mor",
- "burn-muon-plus",
- "burn-ndarray",
- "burn-parcae",
- "burn-ptrn",
- "burn-rmsnorm",
- "burn-rope",
- "burn-sct",
- "burn-situ",
- "burn-spectral",
- "burn-swiglu",
-]
-
-[[package]]
-name = "burn-fused-benches"
-version = "0.1.0"
-dependencies = [
- "burn",
- "burn-attnres",
- "burn-bitnet",
- "burn-cubecl",
- "burn-gdn2",
- "burn-kda",
- "burn-mhc",
- "burn-muon-plus",
- "burn-rope",
- "burn-sct",
- "burn-situ",
- "burn-tensor",
- "cubecl",
- "serde_json",
-]
-
-[[package]]
 name = "burn-fusion"
 version = "0.22.0-pre.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -899,22 +787,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "burn-gdn2"
-version = "0.7.5"
-dependencies = [
- "burn",
- "burn-autodiff",
- "burn-cubecl",
- "burn-cuda",
- "burn-ndarray",
- "burn-nn",
- "burn-tensor",
- "cubecl",
- "cubecl-runtime",
- "half",
-]
-
-[[package]]
 name = "burn-ir"
 version = "0.22.0-pre.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -924,29 +796,6 @@ dependencies = [
  "burn-std",
  "hashbrown 0.16.1",
  "serde",
-]
-
-[[package]]
-name = "burn-jepa"
-version = "0.1.0"
-dependencies = [
- "burn",
- "burn-ndarray",
- "burn-tensor",
-]
-
-[[package]]
-name = "burn-kda"
-version = "0.5.0"
-dependencies = [
- "burn",
- "burn-autodiff",
- "burn-cubecl",
- "burn-cuda",
- "burn-gdn2",
- "burn-ndarray",
- "burn-tensor",
- "cubecl",
 ]
 
 [[package]]
@@ -960,44 +809,6 @@ dependencies = [
  "burn-fusion",
  "burn-std",
  "num-traits",
-]
-
-[[package]]
-name = "burn-mhc"
-version = "0.2.0"
-dependencies = [
- "burn",
- "burn-autodiff",
- "burn-cubecl",
- "burn-cuda",
- "burn-ndarray",
- "burn-tensor",
- "cubecl",
-]
-
-[[package]]
-name = "burn-mor"
-version = "0.1.1"
-dependencies = [
- "burn",
- "burn-ndarray",
- "burn-tensor",
-]
-
-[[package]]
-name = "burn-muon-plus"
-version = "0.1.0"
-dependencies = [
- "burn",
- "burn-autodiff",
- "burn-cubecl",
- "burn-cuda",
- "burn-ndarray",
- "burn-pack",
- "burn-tensor",
- "cubecl",
- "derive-new 0.6.0",
- "serde",
 ]
 
 [[package]]
@@ -1066,37 +877,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "burn-parcae"
-version = "0.1.0"
-dependencies = [
- "burn",
- "burn-ndarray",
- "burn-tensor",
-]
-
-[[package]]
-name = "burn-ptrn"
-version = "0.1.0"
-dependencies = [
- "burn",
- "burn-ndarray",
- "burn-tensor",
-]
-
-[[package]]
-name = "burn-rmsnorm"
-version = "0.1.0"
-dependencies = [
- "burn",
- "burn-cubecl",
- "burn-cuda",
- "burn-ndarray",
- "burn-tensor",
- "cubecl",
- "futures-lite",
-]
-
-[[package]]
 name = "burn-rocm"
 version = "0.22.0-pre.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1105,36 +885,6 @@ dependencies = [
  "burn-backend",
  "burn-cubecl",
  "cubecl",
-]
-
-[[package]]
-name = "burn-rope"
-version = "0.2.0"
-dependencies = [
- "burn",
- "burn-autodiff",
- "burn-cubecl",
- "burn-cuda",
- "burn-ndarray",
- "burn-tensor",
- "cubecl",
-]
-
-[[package]]
-name = "burn-sct"
-version = "0.1.4"
-dependencies = [
- "burn",
- "burn-cubecl",
- "burn-cuda",
- "burn-ndarray",
- "burn-nn",
- "burn-tensor",
- "cubecl",
- "cubecl-common",
- "futures-lite",
- "num-traits",
- "serde",
 ]
 
 [[package]]
@@ -1148,41 +898,6 @@ dependencies = [
  "burn-cubecl",
  "burn-fusion",
  "burn-std",
-]
-
-[[package]]
-name = "burn-situ"
-version = "0.1.0"
-dependencies = [
- "burn",
- "burn-autodiff",
- "burn-cubecl",
- "burn-cuda",
- "burn-ndarray",
- "burn-tensor",
- "cubecl",
-]
-
-[[package]]
-name = "burn-spectral"
-version = "0.1.0"
-dependencies = [
- "burn",
- "burn-autodiff",
- "burn-bitnet",
- "burn-cubecl",
- "burn-cuda",
- "burn-kda",
- "burn-muon-plus",
- "burn-ndarray",
- "burn-nn",
- "burn-optim",
- "burn-rope",
- "burn-sct",
- "burn-situ",
- "burn-tensor",
- "cubecl",
- "futures-lite",
 ]
 
 [[package]]
@@ -1227,18 +942,6 @@ dependencies = [
  "regex",
  "safetensors 0.7.0",
  "textdistance",
-]
-
-[[package]]
-name = "burn-swiglu"
-version = "0.1.0"
-dependencies = [
- "burn",
- "burn-cubecl",
- "burn-cuda",
- "burn-ndarray",
- "burn-tensor",
- "cubecl",
 ]
 
 [[package]]
@@ -1599,11 +1302,11 @@ version = "0.0.0"
 dependencies = [
  "burn",
  "burn-cubecl",
- "burn-rmsnorm",
- "burn-rope",
- "burn-situ",
- "burn-swiglu",
  "cubecl",
+ "dormouse-rmsnorm",
+ "dormouse-rope",
+ "dormouse-situ",
+ "dormouse-swiglu",
 ]
 
 [[package]]
@@ -2604,6 +2307,303 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d4b8a88685455ed29a21542a33abd9cb6510b6b129abadabdcef0f4c55bc8f61"
 dependencies = [
  "litrs",
+]
+
+[[package]]
+name = "dormouse-attnres"
+version = "0.1.0"
+dependencies = [
+ "burn",
+ "burn-autodiff",
+ "burn-cubecl",
+ "burn-cuda",
+ "burn-ndarray",
+ "burn-tensor",
+ "cubecl",
+]
+
+[[package]]
+name = "dormouse-bitnet"
+version = "0.1.0"
+dependencies = [
+ "burn",
+ "burn-autodiff",
+ "burn-cubecl",
+ "burn-cuda",
+ "burn-ndarray",
+ "burn-tensor",
+ "cubecl",
+]
+
+[[package]]
+name = "dormouse-dspark"
+version = "0.1.0"
+dependencies = [
+ "burn",
+ "burn-ndarray",
+ "burn-tensor",
+]
+
+[[package]]
+name = "dormouse-eggroll"
+version = "0.1.0"
+dependencies = [
+ "burn",
+ "burn-ndarray",
+ "burn-tensor",
+]
+
+[[package]]
+name = "dormouse-engram"
+version = "0.1.0"
+dependencies = [
+ "burn",
+ "burn-ndarray",
+ "burn-tensor",
+]
+
+[[package]]
+name = "dormouse-es"
+version = "0.1.0"
+dependencies = [
+ "burn",
+ "burn-ndarray",
+ "burn-tensor",
+]
+
+[[package]]
+name = "dormouse-fused"
+version = "0.1.0"
+dependencies = [
+ "burn",
+ "burn-autodiff",
+ "burn-cuda",
+ "burn-ndarray",
+ "dormouse-attnres",
+ "dormouse-bitnet",
+ "dormouse-dspark",
+ "dormouse-eggroll",
+ "dormouse-engram",
+ "dormouse-es",
+ "dormouse-gdn2",
+ "dormouse-jepa",
+ "dormouse-kda",
+ "dormouse-mhc",
+ "dormouse-mor",
+ "dormouse-muon-plus",
+ "dormouse-parcae",
+ "dormouse-ptrn",
+ "dormouse-rmsnorm",
+ "dormouse-rope",
+ "dormouse-sct",
+ "dormouse-situ",
+ "dormouse-spectral",
+ "dormouse-swiglu",
+]
+
+[[package]]
+name = "dormouse-fused-benches"
+version = "0.1.0"
+dependencies = [
+ "burn",
+ "burn-cubecl",
+ "burn-tensor",
+ "cubecl",
+ "dormouse-attnres",
+ "dormouse-bitnet",
+ "dormouse-gdn2",
+ "dormouse-kda",
+ "dormouse-mhc",
+ "dormouse-muon-plus",
+ "dormouse-rope",
+ "dormouse-sct",
+ "dormouse-situ",
+ "serde_json",
+]
+
+[[package]]
+name = "dormouse-gdn2"
+version = "0.7.5"
+dependencies = [
+ "burn",
+ "burn-autodiff",
+ "burn-cubecl",
+ "burn-cuda",
+ "burn-ndarray",
+ "burn-nn",
+ "burn-tensor",
+ "cubecl",
+ "cubecl-runtime",
+ "half",
+]
+
+[[package]]
+name = "dormouse-jepa"
+version = "0.1.0"
+dependencies = [
+ "burn",
+ "burn-ndarray",
+ "burn-tensor",
+]
+
+[[package]]
+name = "dormouse-kda"
+version = "0.5.0"
+dependencies = [
+ "burn",
+ "burn-autodiff",
+ "burn-cubecl",
+ "burn-cuda",
+ "burn-ndarray",
+ "burn-tensor",
+ "cubecl",
+ "dormouse-gdn2",
+]
+
+[[package]]
+name = "dormouse-mhc"
+version = "0.2.0"
+dependencies = [
+ "burn",
+ "burn-autodiff",
+ "burn-cubecl",
+ "burn-cuda",
+ "burn-ndarray",
+ "burn-tensor",
+ "cubecl",
+]
+
+[[package]]
+name = "dormouse-mor"
+version = "0.1.1"
+dependencies = [
+ "burn",
+ "burn-ndarray",
+ "burn-tensor",
+]
+
+[[package]]
+name = "dormouse-muon-plus"
+version = "0.1.0"
+dependencies = [
+ "burn",
+ "burn-autodiff",
+ "burn-cubecl",
+ "burn-cuda",
+ "burn-ndarray",
+ "burn-pack",
+ "burn-tensor",
+ "cubecl",
+ "derive-new 0.6.0",
+ "serde",
+]
+
+[[package]]
+name = "dormouse-parcae"
+version = "0.1.0"
+dependencies = [
+ "burn",
+ "burn-ndarray",
+ "burn-tensor",
+]
+
+[[package]]
+name = "dormouse-ptrn"
+version = "0.1.0"
+dependencies = [
+ "burn",
+ "burn-ndarray",
+ "burn-tensor",
+]
+
+[[package]]
+name = "dormouse-rmsnorm"
+version = "0.1.0"
+dependencies = [
+ "burn",
+ "burn-cubecl",
+ "burn-cuda",
+ "burn-ndarray",
+ "burn-tensor",
+ "cubecl",
+ "futures-lite",
+]
+
+[[package]]
+name = "dormouse-rope"
+version = "0.2.0"
+dependencies = [
+ "burn",
+ "burn-autodiff",
+ "burn-cubecl",
+ "burn-cuda",
+ "burn-ndarray",
+ "burn-tensor",
+ "cubecl",
+]
+
+[[package]]
+name = "dormouse-sct"
+version = "0.1.4"
+dependencies = [
+ "burn",
+ "burn-cubecl",
+ "burn-cuda",
+ "burn-ndarray",
+ "burn-nn",
+ "burn-tensor",
+ "cubecl",
+ "cubecl-common",
+ "futures-lite",
+ "num-traits",
+ "serde",
+]
+
+[[package]]
+name = "dormouse-situ"
+version = "0.1.0"
+dependencies = [
+ "burn",
+ "burn-autodiff",
+ "burn-cubecl",
+ "burn-cuda",
+ "burn-ndarray",
+ "burn-tensor",
+ "cubecl",
+]
+
+[[package]]
+name = "dormouse-spectral"
+version = "0.1.0"
+dependencies = [
+ "burn",
+ "burn-autodiff",
+ "burn-cubecl",
+ "burn-cuda",
+ "burn-ndarray",
+ "burn-nn",
+ "burn-optim",
+ "burn-tensor",
+ "cubecl",
+ "dormouse-bitnet",
+ "dormouse-kda",
+ "dormouse-muon-plus",
+ "dormouse-rope",
+ "dormouse-sct",
+ "dormouse-situ",
+ "futures-lite",
+]
+
+[[package]]
+name = "dormouse-swiglu"
+version = "0.1.0"
+dependencies = [
+ "burn",
+ "burn-cubecl",
+ "burn-cuda",
+ "burn-ndarray",
+ "burn-tensor",
+ "cubecl",
 ]
 
 [[package]]

@@ -33,7 +33,7 @@ date	commit	mode	step	throughput	mem	final-ce
 #    free attention arm saves 25% of the step, not 16x.
 # 2. The batched ops path is a REAL win where it applies and nowhere else:
 #    fwd 109 vs 224 ms, and the arm's marginal forward cost 61 vs 176 ms - 2.9x
-#    cheaper. The op-level A/B in burn-gdn2 puts it at 4.1-4.8x over three
+#    cheaper. The op-level A/B in dormouse-gdn2 puts it at 4.1-4.8x over three
 #    runs, and the differential test agrees with the loop to 9.1e-6 including
 #    a hostile case (||L||_inf = 10.97), with identical gradients (2.40e-2
 #    both arms, on the f32 finite-difference noise floor).

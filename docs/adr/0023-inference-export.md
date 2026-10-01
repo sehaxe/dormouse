@@ -58,7 +58,7 @@ ADR-0016 is why:
   types and strips the bf16 tensor-core families; even reading a bf16 buffer
   back as f32 dies at kernel-compile time. What works is bf16 *storage* as
   `u16` bit patterns, pinned against f64 in
-  `vendor/dormouse-fused/crates/burn-gdn2/tests/lowp_bf16_cuda.rs`. The export uses
+  `vendor/dormouse-fused/crates/dormouse-gdn2/tests/lowp_bf16_cuda.rs`. The export uses
   exactly that primitive and nothing more.
 - **f16 matmul works but is silently slow** - the f16 tensor-core candidate
   dies at compile time and the autotuner falls back without a word.

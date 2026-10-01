@@ -1,9 +1,9 @@
-# burn-kda formula audit — every math site against its primary source
+# dormouse-kda formula audit — every math site against its primary source
 
 **Worktree** `wt/kda-formula`, off `3234ecc`, 2026-09-30. CPU only, no GPU.
-**Scope** `vendor/dormouse-fused/crates/burn-kda/` — `src/lib.rs` (1184 lines) and
-`src/fused.rs` (118 lines). Read-only cross-checks into `burn-gdn2` (the
-tensor-path and kernel implementations burn-kda *calls*); no burn-gdn2 file is
+**Scope** `vendor/dormouse-fused/crates/dormouse-kda/` — `src/lib.rs` (1184 lines) and
+`src/fused.rs` (118 lines). Read-only cross-checks into `dormouse-gdn2` (the
+tensor-path and kernel implementations dormouse-kda *calls*); no dormouse-gdn2 file is
 edited, that is another lane's.
 
 **Verdict vocabulary** (ADR-0020, as `docs/protocols/ORACLE-TIERS.tsv` uses it):
@@ -20,7 +20,7 @@ edited, that is another lane's.
 ## 0. The shape of the crate, which the brief got wrong
 
 The task brief describes "tensor path `forward.rs` AND kernel path `kernel/`".
-**Neither exists.** burn-kda is two files:
+**Neither exists.** dormouse-kda is two files:
 
 ```
 src/lib.rs    1184 lines   every projection, the decay, the output gate,
@@ -29,21 +29,21 @@ src/fused.rs   118 lines    the CUDA dispatch seam ONLY -- no math
 ```
 
 There is no `kernel/` directory, and the chunked WY recurrence is not *in*
-burn-kda at all: it is `burn_gdn2::chunk_wy_forward` (`gdn2/src/forward.rs:139`
+dormouse-kda at all: it is `dormouse_gdn2::chunk_wy_forward` (`gdn2/src/forward.rs:139`
 and `:350`, 679 lines) plus `gdn2/src/kernel/chunk_cube.rs` (1327 lines). So the
 lane's inventory splits cleanly:
 
-- **burn-kda owns 9 math sites** (decay ×2 forms, q/k L2 norm, output gate,
+- **dormouse-kda owns 9 math sites** (decay ×2 forms, q/k L2 norm, output gate,
   output RMSNorm, beta, short conv dispatch, `kda_step`, the `forward_recurrent`
   scan). Those are the table in §1.
-- **burn-gdn2 owns the chunked WY construction, the state update and the
+- **dormouse-gdn2 owns the chunked WY construction, the state update and the
   per-chunk carry** — the other three the brief lists. A previous read-only
   audit already produced a 33-row delta table for them
   (`docs/papers/gdn-kda.md` §3.1, fetch date 2026-09-29). I did not redo
   it. What I did instead is the thing that audit could not do: **run the
   authors' code** (§2).
 
-`docs/protocols/ORACLE-TIERS.tsv` registered `burn-kda/src/lib.rs` as tier **(d) —
+`docs/protocols/ORACLE-TIERS.tsv` registered `dormouse-kda/src/lib.rs` as tier **(d) —
 "n/a, no fidelity claim in the file"**. §2 is what moves it.
 
 ---
@@ -63,7 +63,7 @@ Line numbers are at `3234ecc`.
 | 7 | **Output gate — activation** | `lib.rs:547` | `sigmoid(W_g x)` | K3 §2.1.1 **Eq 6**: `y = W_o[Sigmoid(W_g x) ⊙ RMSNorm(õ)]`. FLA `fla/layers/kda.py:191` `FusedRMSNormGated(head_v_dim, activation="sigmoid")` | **AGREE (a) — and §5 settles the live question.** Code and doc agree, and both agree with the source |
 | 8 | **Output RMSNorm + gate order** | `lib.rs:554-568` | `o_proj(RMSNorm(o) ⊙ sigmoid(W_g x) ⊙ w_norm)` | K3 Eq 6, same order (norm, then gate) | **AGREE (b).** `mean_dim(3)` is over `head_v_dim`, so the norm is per value head — correct. Note this norm is **scale-invariant** in `o`, which is why finding #10 is nearly invisible in the running model (§3.2) |
 | 9 | **`beta_t = sigmoid(W_beta x_t)`** | `lib.rs:512` | per-head scalar, then `repeat` over key (`lib.rs:514`) and value (`lib.rs:515`) channels | K3 **Eq 2**. FLA `gate.py:181` `b_yb = tl.sigmoid(tl.load(p_b,...))` inside the same gate kernel | **AGREE (a).** FLA's `beta` is `[B,T,HV]` (a per-value-head scalar) and multiplies BOTH `k_i` and the write (`naive.py:64` `b_i[...,None]*k_i`, `v_i - (k_i[...,None]*S).sum(-2)`) — so broadcasting one scalar over both channel axes is the same number, not a shortcut |
-| 10 | **The read scale** | `lib.rs:646,653` pass `1.0`; `fused.rs:9` says "`scale = 1` (no softmax scale in KDA)" | no `K^{-1/2}` anywhere in burn-kda; `kda_step` and `forward_recurrent` have no scale at all | FLA `chunk_kda` (`chunk.py:474-475`) and `fused_recurrent_kda` (`fused_recurrent.py:261-262`) **both default `scale = K ** -0.5`**, and `fla/layers/kda.py:262` calls `chunk_kda` **without** passing `scale`, so the default is what the official layer runs | **DISAGREE (a) — the strongest finding in this lane.** See §3.2 |
+| 10 | **The read scale** | `lib.rs:646,653` pass `1.0`; `fused.rs:9` says "`scale = 1` (no softmax scale in KDA)" | no `K^{-1/2}` anywhere in dormouse-kda; `kda_step` and `forward_recurrent` have no scale at all | FLA `chunk_kda` (`chunk.py:474-475`) and `fused_recurrent_kda` (`fused_recurrent.py:261-262`) **both default `scale = K ** -0.5`**, and `fla/layers/kda.py:262` calls `chunk_kda` **without** passing `scale`, so the default is what the official layer runs | **DISAGREE (a) — the strongest finding in this lane.** See §3.2 |
 | 11 | **`kda_step` — Eq 1** | `lib.rs:284-307` | decay → erase → write → read, per token | Eq 1 `S_t=(I−βkk^T)Diag(α)S_{t−1}+βkv^T`, `o_t=S_t^T q_t` (`lib.rs:11-12`) | **AGREE (a)** against `naive_recurrent_kda` (`naive.py:62-66`). Term by term in §2.2 |
 | 12 | **`forward_recurrent` — Eq 1 scan** | `lib.rs:806-824` | same, as a token loop | same | **AGREE (a)** for `head_dim == v_head_dim`; **latent defect** for `expand_v != 1` — it destructures `_b_v` and uses `b_k` (key-channel beta) on the VALUE axis at `lib.rs:817,820`. See §3.3 |
 | 13 | **`w_gate` / `b_v` mapping** | `lib.rs:643-646` | `chunk_wy_forward(q,k,v,g,b_k,b_v,state,1.0,chunk)` — so `w_gate = b_v` and `scale = 1.0` | `lib.rs:21` and `lib.rs:570` say **`w_gate = 1`**. `fused.rs:7-8` says **`w_gate = beta_v`** and gives the reason | **DISAGREE (class A, doc only).** The **code is right** and two of the three comments are wrong. `gdn2/src/forward.rs:259` `u = m_inv.matmul(w5 * v5)` is `U=(I+L)^{-1}(w_gate ⊙ V)`, which is `beta⊙V` — exactly what `fused.rs` says and what Eq 1's `βkv^T` needs. `lib.rs`'s header is the liar. See §3.4 |
@@ -73,8 +73,8 @@ Line numbers are at `3234ecc`.
 REFERENCE (both deliberate and correctly labelled).** Nothing below rests on a
 prior reading: every verdict marked (a) was checked against FLA's own code
 **after running it**, and `docs/protocols/ORACLE-TIERS.tsv`'s tier-(d) registration for
-`burn-kda/src/lib.rs` is superseded by the (a) row for
-`burn-kda/tests/kda_oracle.rs`. Nothing below rests on a
+`dormouse-kda/src/lib.rs` is superseded by the (a) row for
+`dormouse-kda/tests/kda_oracle.rs`. Nothing below rests on a
 prior reading: every verdict marked (a) was checked against FLA's own code after
 running it, and 's tier-(d) registration for
  is superseded by the (a) row for
@@ -215,15 +215,15 @@ scale term at all; and `fused.rs:9` asserts the reason:
 > `scale = 1` (no softmax scale in KDA)
 
 That reason is **false against both upstreams.** GDN-2 does use
-`d_k^{-1/2}` — `burn-gdn2` itself sets it, at `gdn2/src/module.rs:299`, and
+`d_k^{-1/2}` — `dormouse-gdn2` itself sets it, at `gdn2/src/module.rs:299`, and
 `gdn-kda.md` row 8 records it as a MATCH against the GDN-2 reference. So the
 *crate below* applies the scale and the *crate above* overrides it to 1.0.
-burn-kda is the only place in the library that does this.
+dormouse-kda is the only place in the library that does this.
 
 **Why the model has not collapsed, and why that is not an excuse.** The scale
 enters **only** the read: `o = q·S`. It does not touch the state update, so it
 is a single constant factor on the attention output. The very next thing
-burn-kda does to that output is `output()` (`lib.rs:554-568`), which is
+dormouse-kda does to that output is `output()` (`lib.rs:554-568`), which is
 `RMSNorm(o) = o / sqrt(mean(o²) + eps)`, and an RMS norm is **invariant** to a
 constant rescale of its input:
 
@@ -366,12 +366,12 @@ arm 5's subject, so it is reported and not edited.
 | FLA **KDA** layer, `fla/layers/kda.py:191` @ `9f38d249` | `FusedRMSNormGated(self.head_v_dim, activation="sigmoid", eps=norm_eps)` | **sigmoid** |
 | NVlabs **GDN-2**, `lit_gpt/gdn2.py:39,212` @ `a5552fe3` | `FusedRMSNormSwishGate(self.head_v_dim, eps=norm_eps)` | **SiLU** |
 | K3 §2.1.1 **Eq 6** | `y = W_o [ Sigmoid(W_g x) ⊙ RMSNorm(õ) ]` | **sigmoid** |
-| **burn-kda** | `activation::sigmoid(gate_logit)` @ `lib.rs:547` | **sigmoid** |
+| **dormouse-kda** | `activation::sigmoid(gate_logit)` @ `lib.rs:547` | **sigmoid** |
 
 So the apparent contradiction is not one: **they are two different mechanisms.**
 GDN-2 and KDA are separate papers with separate reference implementations and
-they chose different output gates. KDA's own reference — the one burn-kda
-cites for everything else — is **sigmoid**, and so is the equation burn-kda
+they chose different output gates. KDA's own reference — the one dormouse-kda
+cites for everything else — is **sigmoid**, and so is the equation dormouse-kda
 cites by number.
 
 **Are our CODE and DOC consistent?** Yes, and they were already:
@@ -388,8 +388,8 @@ A/B arm, not a correction. `docs/papers/output-gate-silu-vs-sigmoid.md`
 is the existing document on it; this section adds the FLA-KDA-vs-NVlabs-GDN2
 distinction, which is the piece that makes "both are right" the answer.
 
-`burn-gdn2` runs SiLU (`gdn2/src/module.rs:632` `normed * w * silu(gate)`) and
-burn-kda runs sigmoid, and **that is correct for each**: they are different
+`dormouse-gdn2` runs SiLU (`gdn2/src/module.rs:632` `normed * w * silu(gate)`) and
+dormouse-kda runs sigmoid, and **that is correct for each**: they are different
 mechanisms with different reference implementations.
 
 **The record, in the words the rules require.** The sigmoid choice is
@@ -399,7 +399,7 @@ and against K3 §2.1.1 Eq 6 as a transcription. The SiLU arm is **not a
 correction**; it is a different mechanism's parameterisation, and adopting it
 for KDA would be an A/B arm, not a fix. The gdn2 comment that mislabelled the
 direction was a doc bug in the gdn2 crate, and the gdn2 lane owns it — nothing
-in burn-kda needed changing for it, which is the answer to the question as
+in dormouse-kda needed changing for it, which is the answer to the question as
 asked.
 
 ---
@@ -454,18 +454,18 @@ The gate also asserts the chunked path and the scan still **agree** at
 check would have passed a change that quietly altered the arithmetic.
 
 **`tools/lib_gate.sh` is RED on this branch, and neither red is mine.** It
-reports `burn-gdn2`'s `oracle_breadth::gdn2_1000_cases_match_the_f64_oracle`
+reports `dormouse-gdn2`'s `oracle_breadth::gdn2_1000_cases_match_the_f64_oracle`
 and `oracle_chunk::chunk_sizes_match_the_f64_oracle` failing. `git diff
-3234ecc HEAD -- vendor/dormouse-fused/crates/burn-gdn2` is **empty** — this lane
-touched no burn-gdn2 file — and burn-kda's own cell is 12/12 green plus the
+3234ecc HEAD -- vendor/dormouse-fused/crates/dormouse-gdn2` is **empty** — this lane
+touched no dormouse-gdn2 file — and dormouse-kda's own cell is 12/12 green plus the
 oracle's 7 green / 3 red-on-purpose. So the honest statement is: **the library's
 CPU cell is red on `3234ecc` and my branch does not change that**, and the two
-reds belong to whichever lane owns burn-gdn2's f64 oracle. Reported, not fixed,
+reds belong to whichever lane owns dormouse-gdn2's f64 oracle. Reported, not fixed,
 not filtered.
 
 `tools/oracle_gate.py`: 115 registered, 185 scanned, **2 violations**, 8 waived.
-Both violations are in other lanes — a stale `burn-muon-plus` row for a `.bin`
-that is gone, and an unregistered `burn-rmsnorm/tests/fused_kernel_gate.rs`.
+Both violations are in other lanes — a stale `dormouse-muon-plus` row for a `.bin`
+that is gone, and an unregistered `dormouse-rmsnorm/tests/fused_kernel_gate.rs`.
 Every file this lane added or touched is registered and clean.
 
 ### 6.1 The three harness bugs, because they are the transferable part
@@ -508,7 +508,7 @@ the test rather than the code, and `falsify.sh` says so instead of shipping one.
 
 ## 7. The gate question's own meta-answer, and one thing worth saying
 
-`burn-kda` was registered in `docs/protocols/ORACLE-TIERS.tsv` as tier **(d) — "n/a, no
+`dormouse-kda` was registered in `docs/protocols/ORACLE-TIERS.tsv` as tier **(d) — "n/a, no
 fidelity claim in the file"**. It is not (d). It cites three sources by
 arXiv id and one by `file:line`, ships an f64-oracle discipline in its
 neighbour, and four of its formulas are now checked against **executed**
@@ -519,7 +519,7 @@ fixture and both pinned upstream files have rows of their own.
 worth auditing at all: `docs/protocols/ORACLE-TIERS.tsv` already had the right question
 written down — *"if it names a function in this fork, the comparison is
 arm-vs-arm and the tier is (d), whatever the test's own name says."* Every
-existing burn-kda test names a function in this fork. The tier was **(d) for a
+existing dormouse-kda test names a function in this fork. The tier was **(d) for a
 structural reason, not because nobody had looked** — and that is also why the
 fix was to add a comparison against code that is not in this fork, rather than
 to write more tests.

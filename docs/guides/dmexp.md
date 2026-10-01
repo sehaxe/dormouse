@@ -131,7 +131,7 @@ widening are integer bit manipulation on the host
 (`crates/dormouse-train/src/export.rs:85`, `:93`) — nothing in the export or the
 load asks the backend for a narrow float tensor. The `u16`-bit-pattern storage
 primitive the export uses is the one pinned against f64 in
-`vendor/dormouse-fused/crates/burn-gdn2/tests/lowp_bf16_cuda.rs`. A weight file does
+`vendor/dormouse-fused/crates/dormouse-gdn2/tests/lowp_bf16_cuda.rs`. A weight file does
 not need a matmul; that is what makes `bf16` safe to ship even though bf16
 compute is not.
 

@@ -16,7 +16,7 @@ lesson, applied: a gate that cannot fail is not evidence.
 
 ## Gate 1 — the score convention (the lane's open question)
 
-`burn-attnres/src/lib.rs::tests::paper_form_has_no_temperature_and_this_is_pinned`
+`dormouse-attnres/src/lib.rs::tests::paper_form_has_no_temperature_and_this_is_pinned`
 
 Fixture: `B=T=1`, `L=2`, `d=4`, `h_0 = e_0`, `h_1 = e_1`, `w = 2·e_0`.
 Expected `out[0]`: **0.9820138** (paper), 0.7310586 (the old `SqrtD` form).
@@ -49,7 +49,7 @@ and the loss curve looks fine". The count assertion alone would have stayed
 
 ## Gate 3 — the aggregation is a real softmax mixture, not an average
 
-`burn-attnres/src/lib.rs::tests::zero_query_is_an_equal_weight_average_at_init`
+`dormouse-attnres/src/lib.rs::tests::zero_query_is_an_equal_weight_average_at_init`
 plus the recovered-mixture check below.
 
 At `w_l = 0` every score is 0, so **both** conventions give a uniform
@@ -161,7 +161,7 @@ coverage was not its gate; this is the second half of that sentence.
 ## What was NOT falsified, and stays unproven
 
 - **The CUDA fused path under the trainer's backend, end to end.**
-  `burn-attnres --features cuda,autodiff` is **19 passed / 0 failed** with
+  `dormouse-attnres --features cuda,autodiff` is **19 passed / 0 failed** with
   the paper's form as the default, including both parity tests over BOTH
   forms, the balanced-checkpointing seam test
   (`balanced_checkpointing_reaches_the_seam_and_the_legacy_entry_does_not`,

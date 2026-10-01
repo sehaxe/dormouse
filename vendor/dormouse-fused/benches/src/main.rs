@@ -1,4 +1,4 @@
-//! Fused-kernel performance harness for the burn-fused workspace.
+//! Fused-kernel performance harness for the dormouse-fused workspace.
 //!
 //! Runs each crate's fused forward on the CUDA backend and prints a JSON
 //! report. The CI compares the fused timings against `bench/baselines.json`
@@ -6,7 +6,7 @@
 //!
 //! The backend is ambient in burn 0.22: run with `BURN_DEVICE=cuda`.
 //!
-//! Usage: `BURN_DEVICE=cuda cargo run -p burn-fused-benches --release`
+//! Usage: `BURN_DEVICE=cuda cargo run -p dormouse-fused-benches --release`
 
 use burn::tensor::{Device, Distribution, Tensor};
 use std::collections::BTreeMap;
@@ -56,13 +56,13 @@ fn main() {
     {
         let (b, t, nh, hd) = (4usize, 2048, 32, 128);
         let x = Tensor::<4>::random([b, t, nh, hd], Distribution::Normal(0.0, 1.0), &dev);
-        let (cos, sin) = burn_rope::precompute_freqs(hd, t, 10000.0, &dev);
+        let (cos, sin) = dormouse_rope::precompute_freqs(hd, t, 10000.0, &dev);
         out.insert(
             "rope.fused_ms".into(),
             time(20, || {
                 // no clones: apply_rope_4d consumes by value and does not
                 // mutate, so clone-free timing measures the kernel alone
-                let _ = burn_rope::apply_rope_4d::<B>(x.clone(), cos.clone(), sin.clone());
+                let _ = dormouse_rope::apply_rope_4d::<B>(x.clone(), cos.clone(), sin.clone());
             })
             .into(),
         );
@@ -75,7 +75,7 @@ fn main() {
         out.insert(
             "situ.fused_ms".into(),
             time(20, || {
-                let _ = burn_situ::situ_glu(gu.clone(), h, 1.0, 1.5);
+                let _ = dormouse_situ::situ_glu(gu.clone(), h, 1.0, 1.5);
             })
             .into(),
         );
@@ -88,7 +88,7 @@ fn main() {
         out.insert(
             "bitnet_fwt.fused_ms".into(),
             time(200, || {
-                let _ = burn_bitnet::fast_walsh_hadamard(x.clone());
+                let _ = dormouse_bitnet::fast_walsh_hadamard(x.clone());
             })
             .into(),
         );
@@ -101,7 +101,7 @@ fn main() {
         out.insert(
             "mhc_sinkhorn.fused_ms".into(),
             time(20, || {
-                let _ = burn_mhc::sinkhorn_knopp(logits.clone(), 20);
+                let _ = dormouse_mhc::sinkhorn_knopp(logits.clone(), 20);
             })
             .into(),
         );
@@ -117,7 +117,7 @@ fn main() {
         out.insert(
             "attnres.fused_ms".into(),
             time(10, || {
-                let _ = burn_attnres::depth_attend(&hist, q.clone());
+                let _ = dormouse_attnres::depth_attend(&hist, q.clone());
             })
             .into(),
         );
@@ -130,7 +130,7 @@ fn main() {
         out.insert(
             "muon_norm.fused_ms".into(),
             time(200, || {
-                let _ = burn_muon_plus::fused_kernels::norm_colrow_cuda::<2>(&mut x, 1e-6);
+                let _ = dormouse_muon_plus::fused_kernels::norm_colrow_cuda::<2>(&mut x, 1e-6);
             })
             .into(),
         );
@@ -150,7 +150,7 @@ fn main() {
         out.insert(
             "gdn2_prefill.fused_ms".into(),
             time(20, || {
-                let r = burn_gdn2::kernel::chunk_cube::cuda::fused_chunk_forward::<B>(
+                let r = dormouse_gdn2::kernel::chunk_cube::cuda::fused_chunk_forward::<B>(
                     q.clone(),
                     k.clone(),
                     v.clone(),
@@ -182,7 +182,7 @@ fn main() {
         out.insert(
             "kda_prefill.fused_ms".into(),
             time(20, || {
-                let r = burn_kda::fused::cuda::kda_fused_chunk::<B>(
+                let r = dormouse_kda::fused::cuda::kda_fused_chunk::<B>(
                     q.clone(),
                     k.clone(),
                     v.clone(),
@@ -206,7 +206,7 @@ fn main() {
             "sct_qr.fused_ms".into(),
             time(2, || {
                 // sweeps=15: the crate's own benchmark convention (bench_ops.rs)
-                let _ = burn_sct::qr_cuda::from_dense_cuda::<B>(w.clone(), rank, 15);
+                let _ = dormouse_sct::qr_cuda::from_dense_cuda::<B>(w.clone(), rank, 15);
             })
             .into(),
         );

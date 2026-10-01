@@ -1,4 +1,4 @@
-# Formula audit of `burn-spectral` — the TSCT retraction
+# Formula audit of `dormouse-spectral` — the TSCT retraction
 
 **Date:** 2026-10-01. **Lane:** formula audit, first ever on this crate.
 **Worktree:** `wt/spectral-audit` off `8f97411`. **Base commit for every
@@ -10,7 +10,7 @@ C++ and is **not** quotable: the wheel and version are recorded instead.
 
 **What was already verified and is NOT redone here:** the PolarExpress triple
 `(15/8, −5/4, 3/8)` is bit-exact vs the authors' own `optimal_quintic` at
-`NoahAmsel/PolarExpress @ 71cc379`; the Jordan triple in `burn-muon-plus` is a
+`NoahAmsel/PolarExpress @ 71cc379`; the Jordan triple in `dormouse-muon-plus` is a
 different quantity from the same paper and is not an error. Those are
 `docs/papers/spectral-reference.md` §1.2/§2.2 and they stand.
 
@@ -676,7 +676,7 @@ Named, so the next reader does not over-read it:
    *wider* on the trainer's backend, but the *reachability* is unmeasured
    there.
 3. **The PolarExpress triple was not re-verified** (already (a) at
-   `71cc379`), and neither was the Jordan triple in `burn-muon-plus` (§1.2/§2.2
+   `71cc379`), and neither was the Jordan triple in `dormouse-muon-plus` (§1.2/§2.2
    of the prior document). The brief listed them as already done and they are
    not redone.
 4. **The PolarExpress *schedule* was not compared against the fixed triple at
@@ -722,14 +722,14 @@ different documents**, 97 seconds apart, with nothing to detect the collision:
 
 | | `3e1812b` | `7811191` (twin) | this lane |
 |---|---|---|---|
-| subject | `burn-sct` and the seam between the crates | the NS retraction's formulas | findings 1–5 of the formulas |
+| subject | `dormouse-sct` and the seam between the crates | the NS retraction's formulas | findings 1–5 of the formulas |
 | lines | 494 | 218 | 667 |
 | tools | `tools/polar_probe.rs` | `audit_2026_10_01.py` | 5 more oracles + `falsify.sh` |
 
 `7811191` **replaced** `3e1812b`'s 494 lines with its own 218 — an add/add that
 git resolved silently because the second writer did not read the first. The lost
-494 lines are `burn-sct`'s site-by-site descent, the seam finding (zero non-dev
-call sites, no crate under `crates/` depends on `burn-sct`), and the retraction's
+494 lines are `dormouse-sct`'s site-by-site descent, the seam finding (zero non-dev
+call sites, no crate under `crates/` depends on `dormouse-sct`), and the retraction's
 cost/benefit pricing. Restored byte-for-byte from `3e1812b` as
 [`spectral-stack-audit-2026-10-01.md`](spectral-stack-audit-2026-10-01.md),
 under the name its own H1 gives it. **Not a union**: the two documents are about
@@ -748,10 +748,10 @@ branch's copy is the union.
 |---|---|---|
 | `docs/reviews/spectral-audit-2026-10-01.md` | **branch** | findings 1–5 + the gate register; the twin's 218 lines are a strict prefix of it (§0–§4 are identical) |
 | `docs/reviews/spectral-stack-audit-2026-10-01.md` | **restored from `3e1812b`** | the content the twin overwrote; see §13.1 |
-| `burn-spectral/tests/oracle/audit_2026_10_01.py` | **union (branch = twin + 19 lines)** | the branch is a superset: same file, plus the §5 fixture fix |
-| `burn-spectral/tests/oracle/{sec4_fixed,sec4c_tolerance,sec4d_guard,sec5_6b,gate_dryrun}.py` | **branch** | new; the twin has none |
-| `burn-spectral/tests/oracle/falsify.sh` | **branch + §13.3** | new; the twin has none |
-| `burn-spectral/src/lib.rs` | **branch + §13.4** | the twin's `7811191` did not touch it; the audit's 3 comment corrections + 4 gates + 2 red-on-purpose tests are all here |
+| `dormouse-spectral/tests/oracle/audit_2026_10_01.py` | **union (branch = twin + 19 lines)** | the branch is a superset: same file, plus the §5 fixture fix |
+| `dormouse-spectral/tests/oracle/{sec4_fixed,sec4c_tolerance,sec4d_guard,sec5_6b,gate_dryrun}.py` | **branch** | new; the twin has none |
+| `dormouse-spectral/tests/oracle/falsify.sh` | **branch + §13.3** | new; the twin has none |
+| `dormouse-spectral/src/lib.rs` | **branch + §13.4** | the twin's `7811191` did not touch it; the audit's 3 comment corrections + 4 gates + 2 red-on-purpose tests are all here |
 | `docs/protocols/ORACLE-TIERS.tsv` | **hand-inserted, 7 rows** | R1 coverage for the six new `.py` files. `tools/gen_oracle_tiers.py` was NOT run — see the file's own header, which records that it has destroyed 22 rows once |
 | `tools/polar_probe.rs`, `docs/research/2026-10-01-spectral-inventory.md` | **main, untouched** | the twin's instruments; the branch never had them |
 
@@ -760,7 +760,7 @@ branch's copy is the union.
 The brief for this landing said to keep "`SIGMA_OVERSHOOT` const + the rewritten
 POWER_ITERS/1.05 comments from the tsct-diag lane `8a9bd7c`/`2254c7c`". **Main
 never gained either**: `git grep SIGMA_OVERSHOOT main` returns nothing, and
-`git log 8f97411d..main -- vendor/dormouse-fused/crates/burn-spectral/` lists only
+`git log 8f97411d..main -- vendor/dormouse-fused/crates/dormouse-spectral/` lists only
 `7811191` (docs). The const is on `wt/tsct-diag`, which is **unlanded**, and its
 `lib.rs` hunk is a different-lane commit.
 
@@ -814,7 +814,7 @@ of blindness one level up:
    for a polynomial is for, and it is worth recording that the error was in the
    *fix*, not in the tree being landed.
 
-`bash crates/burn-spectral/tests/oracle/falsify.sh` from `vendor/dormouse-fused`:
+`bash crates/dormouse-spectral/tests/oracle/falsify.sh` from `vendor/dormouse-fused`:
 **every mutant DETECTED on its own assertion, restore byte-identical by sha256,
 suite green after restore.** See §13.5 for the tallies.
 
@@ -824,9 +824,9 @@ All of it on this box, 2026-10-01, CPU only (`vendor/dormouse-fused` is its own
 cargo workspace, so the command is run from there):
 
 ```
-cargo test -p burn-spectral --lib      44 passed, 0 failed, 2 ignored
+cargo test -p dormouse-spectral --lib      44 passed, 0 failed, 2 ignored
                                       (the two class-B gates, red on purpose)
-cargo test -p burn-spectral --lib -- --ignored
+cargo test -p dormouse-spectral --lib -- --ignored
                                       0 passed, 2 FAILED - which is the point
 bash tests/oracle/falsify.sh           A(1e-3) A(1e-2) B C D(x2) ALL DETECTED,
                                       E: restore byte-identical
@@ -860,11 +860,11 @@ And the registry, which is the one gate this landing can move:
 tools/oracle_gate.py   ON MAIN, after this landing:
                        127 registered, 199 scanned, 3 violations, 8 waived
 ```
-All three are **pre-existing and in another lane** (`burn-kda`, unregistered:
+All three are **pre-existing and in another lane** (`dormouse-kda`, unregistered:
 `tests/kda_param_grads_cuda.rs`, `tests/kda_rope.rs`,
 `tests/oracle/upstream/fla_modules_rotary.py`). Before this landing the same
 gate reported **4**, and the fourth was this lane's to fix:
-`burn-spectral/tests/oracle/audit_2026_10_01.py`, unregistered, from the twin's
+`dormouse-spectral/tests/oracle/audit_2026_10_01.py`, unregistered, from the twin's
 `7811191`. `tools/gen_oracle_tiers.py` was **not** run; the seven rows were
 hand-inserted, which is what that file's own header asks for.
 

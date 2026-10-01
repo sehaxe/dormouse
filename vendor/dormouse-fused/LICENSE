@@ -23,7 +23,7 @@ SOFTWARE.
 
 ## scope
 
-This covers dormouse's OWN crates (burn-kda, burn-gdn2, burn-rope, burn-mor,
+This covers dormouse's OWN crates (dormouse-kda, dormouse-gdn2, dormouse-rope, dormouse-mor,
 ...), which are original work published here under MIT — see
 `docs/adr/0017-dormouse-fused.md` for why they live in this directory instead of
 being burn-rs dependencies. It does NOT cover upstream burn-rs code vendored

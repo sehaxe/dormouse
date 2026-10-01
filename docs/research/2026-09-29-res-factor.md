@@ -3,7 +3,7 @@
 **Fetch date: 2026-09-29.** Literature-only pass. No GPU, no cargo, no build, no test.
 Code read read-only: `crates/dormouse-core/src/param.rs`,
 `crates/dormouse-core/src/loop_block.rs`,
-`vendor/dormouse-fused/crates/burn-spectral/src/lib.rs`.
+`vendor/dormouse-fused/crates/dormouse-spectral/src/lib.rs`.
 
 **Scope note.** `docs/papers/tsct.md` (same tree) already establishes the lineage and
 the code deltas. This file answers a different, narrower question: *as of 2026-09-29,
@@ -118,14 +118,14 @@ host synchronisations — and that is not a literature finding, it is already in
 
 ### 4.1 The measured cost is mostly an implementation artefact, and we already wrote the fix
 
-Our `polar_orthogonalize` (`burn-spectral/src/lib.rs:168-217`) is called per factor from
+Our `polar_orthogonalize` (`dormouse-spectral/src/lib.rs:168-217`) is called per factor from
 `SpectralLinear::retract` (`:613-621`). It contains, per factor: 5 power iterations,
 **each with one `into_scalar::<f32>()`** (`lib.rs:186`), plus two more at `:197` and
 `:198` — **7 host syncs per factor**. 16 factors → **112 per step**. Every one of them is
 a CPU-GPU round trip inside a workload that is launch-bound anyway (AGENTS.md §3.1: mean
 GPU utilisation 13.3%).
 
-`burn-spectral/src/lib.rs:226-292` already contains `polar_orthogonalize_batched` and
+`dormouse-spectral/src/lib.rs:226-292` already contains `polar_orthogonalize_batched` and
 `retract_batched`, whose own doc comment states the fix in as many words: *"the norm is a
 `[B,1,1]` tensor broadcast across the batch instead of an extracted scalar. … so there is
 not a single host↔device sync (the scalar path syncs 7× per factor)."* They are tested
@@ -138,7 +138,7 @@ shape so mixed shapes never pad each other, and it is the identical math (`:256-
 `:205-211` — same `(a,b,c)`, same 1.05 sigma safety factor). P1 App. D independently
 measures the same effect from the other direction: batching their retraction gave
 **14.4-24.9×**. **SPECULATION: this should recover most of the 52.8 ms. I have not run
-it, and another agent is editing `burn-spectral` right now, so this is a claim to
+it, and another agent is editing `dormouse-spectral` right now, so this is a claim to
 measure, not a claim to trust.** Note also that `--retract-every 1000` already gives
 `retr=0.0` at 188 ms (AGENTS.md §3.1), which bounds the win: the total addressable is
 52.8 ms, not the whole step.
@@ -163,7 +163,7 @@ orthonormality constraint, no factorization) is weak evidence that the bet is wi
 but BitNet is a different architecture and I am not transferring its result.**
 
 **Cost: real.** It replaces AdamW on the factors with a Muon-style optimizer (we already
-run Muon+, `burn-muon-plus`, so the machinery exists), and it invalidates every TSCT
+run Muon+, `dormouse-muon-plus`, so the machinery exists), and it invalidates every TSCT
 number. It is an A/B, not a refactor.
 
 ### 4.3 If the constraint must stay and the parametrization must change
@@ -187,14 +187,14 @@ strictly larger changes than §4.1.**
 
 1. **The parameterization is not ours.** `LinearLike` factors every 2D weight as
    `U·diag(s)·Vᵀ` with `U ∈ ℝ^{in×k}`, `V ∈ ℝ^{out×k}` orthonormal columns and `s ∈ ℝ^k`
-   (`param.rs:15-17`, `burn-spectral/src/lib.rs:343-348`, forward at `:338-341`,
+   (`param.rs:15-17`, `dormouse-spectral/src/lib.rs:343-348`, forward at `:338-341`,
    `:488`). That is a truncated SVD parameterization with the singular values split
    evenly across the two factors — the definition of the thing.
    - **SCT (P2)** publishes `W = U·diag(s)·Vᵀ`, U and V orthonormal, for **permanent
      pretrained weights**, with a per-step Stiefel retraction. This is TSCT with QR
      instead of Newton-Schulz. It is not in our model path, but it *is* in our tree:
-     `param.rs:1` names `burn_sct::SpectralLinear` as the origin, and
-     `burn-spectral/Cargo.toml:33` still declares `burn-sct` with zero source references.
+     `param.rs:1` names `dormouse_sct::SpectralLinear` as the origin, and
+     `dormouse-spectral/Cargo.toml:33` still declares `dormouse-sct` with zero source references.
    - **StelLA (P1)** publishes the same three factors with the same two Stiefel
      constraints and a per-step **polar** retraction — our exact retraction, in a NeurIPS
      2025 Spotlight.
@@ -244,7 +244,7 @@ part ours — would be defensible. This is a naming decision, not mine to make.
 - **P1's polar-vs-exponential-map ablation is a tie**: 86.72 vs 86.76 average accuracy,
   polar chosen for cost (§5.5, Table 6).
 - **Our code does 7 host syncs per factor**: 5 in the power-iteration loop
-  (`burn-spectral/src/lib.rs:186`) + 2 more at `:197-198`; 16 factors → 112.
+  (`dormouse-spectral/src/lib.rs:186`) + 2 more at `:197-198`; 16 factors → 112.
 - **Our tree already contains the sync-free fix**:
   `polar_orthogonalize_batched` (`lib.rs:226`) and `retract_batched` (`:275`) are
   implemented, tested (`:1327`, `:1371`), carry the identical NS coefficients, and are
@@ -258,7 +258,7 @@ part ours — would be defensible. This is a naming decision, not mine to make.
   recover most of the 52.8 ms.** Basis: the batched path is the same math with the
   syncs removed, and P1 measured a 14.4-24.9× batching speedup on the equivalent
   operation. **Not measured here. No GPU, no build. Another agent is editing
-  `burn-spectral` concurrently.** This is a hypothesis with a one-command test
+  `dormouse-spectral` concurrently.** This is a hypothesis with a one-command test
   (`--timers` at step 50/100/150, same run shape as AGENTS.md §3.1), not a result.
 - **SPECULATION: the constraint is probably not load-bearing at the level the 22% cost
   implies** — because P3 removes it and still trains well, and BitNet trains ternary

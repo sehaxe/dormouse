@@ -13,7 +13,7 @@
 #  2. THE SHARED top-k GATE IS RED on sm_120: `cargo test -p backend-parity
 #     --features cuda --test topk_gather_parity` fails "masked: 2 row(s) picked
 #     the wrong k" (2026-09-29). MoR's wiring does NOT ride that primitive -
-#     mor.rs uses burn-mor's argsort-based `topk_indices` - but no A/B verdict
+#     mor.rs uses dormouse-mor's argsort-based `topk_indices` - but no A/B verdict
 #     should be read until the gate is green.
 #  3. THE CONTROL MUST BE CLEAN. Every control on record predates 7adda92
 #     (eval measured a memory-disabled forward) and 8fa5d4c (attention arm had

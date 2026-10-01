@@ -46,7 +46,7 @@
 > must not be relied on:
 >
 > - **"The fused kernels are engaged."** They were not, in any training step.
->   burn-kda's dispatch was a `TypeId` test against `Autodiff<CudaBare>` (=
+>   dormouse-kda's dispatch was a `TypeId` test against `Autodiff<CudaBare>` (=
 >   NoCheckpointing); the trainer runs `Autodiff<Cuda, BalancedCheckpointing>`,
 >   which fails that test by construction, so every step ran the ~150-op-per-
 >   chunk **tensor** path. The §2.4 "1300x gap" and §3(a)'s "already built, and
@@ -80,7 +80,7 @@ derived from `nvidia-smi` specs.
 ## 0. TL;DR — the answer nobody wants
 
 The fused cubecl forward **and backward kernels for this exact computation already exist in
-the tree** (`vendor/dormouse-fused/crates/burn-gdn2/src/kernel/chunk_cube.rs` 1243 lines,
+the tree** (`vendor/dormouse-fused/crates/dormouse-gdn2/src/kernel/chunk_cube.rs` 1243 lines,
 `chunk_adjoint_cube.rs` 691 lines), they *are* engaged on the training backend
 (`Autodiff<Cuda>` → `chunk_autodiff_or_plain::<CudaBare>`), and they dispatch **3 launches
 forward, 2 backward**. Route (a) as posed — "write a fused backward kernel in cubecl" — is
@@ -259,7 +259,7 @@ as the channel-wise erase `b_t` and write `w_t` gates are added, *"retains pract
 efficiency while paying a modest constant cost."* Kernels are in FLA (`fla/ops/gdn2`, MIT) even
 though the reference repo is NC-licensed. Mechanically, GDN-2 is **our `chunk_cube.rs` with
 `b` and `w_gate` per-channel instead of scalar** — i.e. **we have already implemented the
-GDN-2 kernel**; `burn-gdn2` is the GDN-2 formulation and KDA is its special case. The extra
+GDN-2 kernel**; `dormouse-gdn2` is the GDN-2 formulation and KDA is its special case. The extra
 work is the gate-aware backward accumulation (paper Eqs. 27+): the scalar `β` can be hoisted
 out of `dA`'s accumulation, and that shortcut **breaks** under per-channel gates. That is a
 real, small, well-specified change — and it is a *quality* change, not a speed one.
@@ -510,7 +510,7 @@ roofline of a kernel we already wrote.**
 ### 4.2 Do these, in this order
 
 1. **Measure the 3 fused launches in isolation at b=10, with a device sync inside the timed
-   region.** `burn-kda/examples/kda_step_probe.rs` already does exactly this and already
+   region.** `dormouse-kda/examples/kda_step_probe.rs` already does exactly this and already
    documents why the previous bench was wrong. 1 hour, no new code, no GPU contention risk
    beyond 60 s. **Everything below is contingent on this number.**
 2. **If the probe says ~1 ms (my expectation):** the 1445 ms is allocation/pool. Then the
@@ -547,7 +547,7 @@ roofline of a kernel we already wrote.**
 | A Python/Triton sidecar for FLA | PCIe floor is 14 ms/call vs a 1.35 ms/call GPU budget (10x over, before any compute); plus a dtype boundary, plus three pinned upstream Blackwell workarounds and one open silent-corruption bug. |
 | Porting FlashKDA | Forward only, SM90+, K=V=128, prefill. It does not store per-chunk state, which is the one thing training cannot do without. There is nothing to port. |
 | Growing `chunk` past 16 | f32 underflow: `K/exp(cumsum(g))` dies at cumsum(g) < −88, i.e. chunk > 17 at the K3 floor `g = −5`. FlashKDA picked 16 for this same reason. `chunk=16` is correct and final. |
-| GDN-2 as a *speed* project | It is a quality project. We already implement the GDN-2 kernel (`burn-gdn2` is the GDN-2 formulation; KDA is its special case). Only the gate-aware backward accumulation (paper Eqs. 27+) is new: ~300-800 lines, H100 cost 38.0 → 36.1 Kt/s. Do it for the RULER numbers (53.11 vs 52.28, MK-NIAH 37.8 vs 28.0), not for speed. |
+| GDN-2 as a *speed* project | It is a quality project. We already implement the GDN-2 kernel (`dormouse-gdn2` is the GDN-2 formulation; KDA is its special case). Only the gate-aware backward accumulation (paper Eqs. 27+) is new: ~300-800 lines, H100 cost 38.0 → 36.1 Kt/s. Do it for the RULER numbers (53.11 vs 52.28, MK-NIAH 37.8 vs 28.0), not for speed. |
 
 ### 4.4 One-line answers
 

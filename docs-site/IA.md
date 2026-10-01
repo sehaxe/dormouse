@@ -148,8 +148,8 @@ The measurement instrument. If a number in this repo exists, one of these pages
 is the reason it is allowed to be written down.
 
 - `docs/protocols/AB-PROTOCOL.md` — the A/B queue and the rule that decides an arm
-- `docs/protocols/ORACLE.md` — which defect class each existing test in `burn-kda` /
-  `burn-gdn2` can and cannot catch
+- `docs/protocols/ORACLE.md` — which defect class each existing test in `dormouse-kda` /
+  `dormouse-gdn2` can and cannot catch
 - `docs/protocols/ORACLE-TIERS.tsv` — **rendered as 127 blocks**, one per comparison,
   because 128 rows × 6 columns of sentences is unreadable as a table; the
   `.tsv` itself is linked as the artifact `tools/oracle_gate.py` reads

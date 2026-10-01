@@ -1,7 +1,7 @@
 # DSpark — paper verification
 
 **Fetch date:** 2026-09-29. **Tree:** `eeb3b73`, working dir `/home/sehaxe/dormouse`.
-**Subject:** `vendor/dormouse-fused/crates/burn-dspark/` + the call sites in
+**Subject:** `vendor/dormouse-fused/crates/dormouse-dspark/` + the call sites in
 `crates/dormouse-core/src/{aux.rs, model.rs}`.
 
 ---
@@ -14,7 +14,7 @@
 
 Code repo named by the paper: `https://github.com/deepseek-ai/DeepSpec`
 ("an algorithm-driven training repository for speculative decoding").
-`burn-dspark/src/lib.rs:5-9` cites the paper, names DeepSpec, and **says in the
+`dormouse-dspark/src/lib.rs:5-9` cites the paper, names DeepSpec, and **says in the
 crate header that it is NOT matched against DeepSpec**. That self-declaration is
 the single most useful sentence in the file and it is honest.
 
@@ -249,7 +249,7 @@ the result to none of them.**
 
 ## 7. Recommended gold-vector test
 
-`burn-dspark` has 7 tests: 5 shape, 1 decay-monotonicity, 1 bounds. **None
+`dormouse-dspark` has 7 tests: 5 shape, 1 decay-monotonicity, 1 bounds. **None
 checks a value against a reference.** The one that gets closest
 (`accept_rate_target_bounds`, `lib.rs:334-351`) hand-derives `1/V` and gets it
 right. Add:

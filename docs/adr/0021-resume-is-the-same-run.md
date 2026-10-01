@@ -108,7 +108,7 @@ after the load as well as before it.
 `crates/dormouse-core/src/aux.rs`: `mask_stream(t, mask_frac, mask_span)` draws
 Bernoulli starts from a splitmix64 of `(seed, step, index)` on the host and
 dilates them causally into spans — the same distribution and the same semantics as
-`burn_jepa::mask_indices`, which it replaces at the one call site. `set_mask_stream`
+`dormouse_jepa::mask_indices`, which it replaces at the one call site. `set_mask_stream`
 is a pair of atomics, set once per step by the trainer: no RNG state to carry
 across a resume, and nothing to restore.
 

@@ -2,7 +2,7 @@
 //! 4-bit activations + 1.58-bit weights trained from scratch with STE.
 //!
 //! The weight side already exists (SpectralLinear's ternary/2-bit STE
-//! quantizers in burn-bitnet). This module adds the activation side with
+//! quantizers in dormouse-bitnet). This module adds the activation side with
 //! straight-through estimators, applied before the matmuls. The quantizers
 //! are f32 tensor ops in the autodiff graph (round has no gradient, so STE
 //! is x + (xq - x).detach()), which sidesteps the stack's bf16-backward

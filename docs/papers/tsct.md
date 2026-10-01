@@ -1,14 +1,14 @@
 # TSCT — our own invention. Lineage, precise definition, and delta vs the published mechanisms.
 
-**Fetch date: 2026-09-29.** Read-only pass over `vendor/dormouse-fused/crates/burn-spectral/`,
-`vendor/dormouse-fused/crates/burn-sct/`, `crates/dormouse-core/src/param.rs`,
+**Fetch date: 2026-09-29.** Read-only pass over `vendor/dormouse-fused/crates/dormouse-spectral/`,
+`vendor/dormouse-fused/crates/dormouse-sct/`, `crates/dormouse-core/src/param.rs`,
 `crates/dormouse-core/src/loop_block.rs`, `crates/dormouse-core/src/routing.rs`,
 `crates/dormouse-train/src/lib.rs`. No GPU, no build, no test.
 
 **Owner instruction honored:** TSCT is *ours*. There is no TSCT paper and none is sought.
 What follows is (1) the verified lineage it is built on, (2) a precise reading of what the
 code actually is, (3) the delta against the closest published mechanisms, (4) an honest
-list of what is unverified, and (5) what `burn-sct` (the old branch) still does that TSCT
+list of what is unverified, and (5) what `dormouse-sct` (the old branch) still does that TSCT
 does not.
 
 ## TL;DR
@@ -19,10 +19,10 @@ does not.
   quantizer family (ternary/2-bit/N:M/fp8/fp4) on the factors.** The parameterization and
   the retraction are *not* novel; the quantizer stack and the fused/batched GPU retraction
   are.
-- **One real BUG:** `burn-spectral/src/lib.rs:164-166` cites Muon+ §1 for a **cubic** NS
+- **One real BUG:** `dormouse-spectral/src/lib.rs:164-166` cites Muon+ §1 for a **cubic** NS
   iteration that appears nowhere in that paper, and the cited §1 does not contain NS
   coefficients at all.
-- **One real finding:** `burn-sct` is a declared dependency of `burn-spectral`
+- **One real finding:** `dormouse-sct` is a declared dependency of `dormouse-spectral`
   (`Cargo.toml:33`) with **zero** source references. Dead dependency.
 - **The retraction is genuinely unverified as an improvement** — the only test
   (`tsct_retract_restores_ortho`) proves it restores orthonormality, i.e. that it does
@@ -98,7 +98,7 @@ bottleneck**; rank 128 the sweet spot; GPU memory −46% at rank 32, throughput 
 
 ### 2.1 The factorization
 
-`SpectralLinear` — `burn-spectral/src/lib.rs:343-398`:
+`SpectralLinear` — `dormouse-spectral/src/lib.rs:343-398`:
 
 ```rust
 pub struct SpectralLinear {
@@ -158,7 +158,7 @@ so the head's "low-rank" saving is 0 by construction. Worth knowing.
 
 ### 2.3 The retraction — NS polar, not Stiefel QR
 
-`burn-spectral/src/lib.rs:164-222`, `pub fn polar_orthogonalize(x, iters)`:
+`dormouse-spectral/src/lib.rs:164-222`, `pub fn polar_orthogonalize(x, iters)`:
 1. If `rows > cols`, transpose (canonical wide form) — `:168-173`.
 2. `g = m·mᵀ` on the small side `[c,c]` — `:178`.
 3. **σ_max by power iteration** (5 iters, `POWER_ITERS` at `:135`) with a Rayleigh
@@ -191,9 +191,9 @@ reachable at current ranks, so it is latent, not live.
 
 `param.rs:190-201`:
 ```rust
-(burn_spectral::ortho_error(&u) / ku).max(burn_spectral::ortho_error(&v) / kv)
+(dormouse_spectral::ortho_error(&u) / ku).max(dormouse_spectral::ortho_error(&v) / kv)
 ```
-with `ku = u.dims()[1]`, `kv = v.dims()[1]` (the rank). `burn-spectral/src/lib.rs:295-315`
+with `ku = u.dims()[1]`, `kv = v.dims()[1]` (the rank). `dormouse-spectral/src/lib.rs:295-315`
 computes `‖UᵀU − I‖_F` **on the host** via `into_data()` — a full device→host readback.
 
 - **Threshold:** `1e-3`, checked at `train/src/lib.rs:1331-1337`, **every 500 steps**.
@@ -249,17 +249,17 @@ cheaper. `--factors-fallback` moves the expert factors to the fallback optimizer
 
 | # | file:line | Published mechanism says | TSCT does | Verdict |
 |---|---|---|---|---|
-| **T1** | `burn-spectral/src/lib.rs:164-166` | Muon+ (2602.21545) §1 defines `Ortho(·)` **abstractly** and prints **no NS coefficients**; its own coefficients live in Jordan's `muon.py` as the **quintic** `(3.4445, −4.775, 2.0315)` | Doc comment says "Newton-Schulz polar iteration (**Muon+ 2602.21545 §1**) … with the optimal cubic coefficients"; the code uses `(15/8, −5/4, 3/8)` (`:205`, `:256`) — **not Muon+'s, and not in the cited paper** | **BUG** (mis-citation). The *math* is fine and deliberate (cubic, σ_max-scaled, for a **retraction** not an optimizer preconditioner); only the attribution is wrong. Fix: cite Higham 2008 / "optimal cubic", drop the Muon+ id. |
-| **T2** | `burn-spectral/src/lib.rs:205`, `:256` | Muon+ = quintic `(3.4445, −4.775, 2.0315)`, 5 steps | cubic `(15/8, −5/4, 3/8)`, `iters=3` by default | **DELIBERATE** and *correct for the purpose*: a retraction wants the nearest semi-orthogonal matrix (cubic converges to exact `UVᵀ`); Muon+ deliberately uses a quintic that does **not** reach `UVᵀ` (Jordan's own docstring: `S_ii ~ Uniform(0.5,1.5)`, "turns out not to hurt"). Using the quintic here would be the bug. Distinct role, distinct coefficients — but see T1, the code claims the wrong provenance. |
-| **T3** | `burn-spectral/src/lib.rs:178-201` (σ_max power iteration) | SCT Eq. (5) is QR, which needs no scaling | NS needs σ<√3; prescaled by Rayleigh-quotient σ_max × 1.05 | **DELIBERATE** — and it is *better* than a plain Frobenius prescale, with the divergence case documented (`:174-177`). This is our own contribution to the retraction and is the reason NS is viable here at all. |
-| **T4** | `burn-spectral/src/lib.rs:612-619` | SCT Eq. (5): `Q,R = QR(U); U ← Q·sign(diag(R))`, after **every** optimizer step | `iters`-step NS polar, default `retract_every=1, retract_iters=3` | **DELIBERATE** (replace). NS avoids the `O(mk²)` QR and the host round-trip. Cost: an *approximate* retraction (3 cubic steps), not the exact QR. **Convergence is not guaranteed at 3 steps** — see §4. |
-| **T5** | `burn-spectral/src/lib.rs:295-315` `ortho_error` | SCT (and `burn-sct/lib.rs:120-139`) both compute `‖UᵀU − I‖_F` **raw** | same raw metric here, but the **caller** divides by k (`param.rs:196-200`) | **DELIBERATE** — the normalization is the documented 2026-09-04 bug fix, not present upstream. Correct and load-bearing. |
-| **T6** | `burn-spectral/src/lib.rs:553-557` | SCT Eqs. (2)-(4): `y = (x·U) ⊙ s · Vᵀ` | identical, same order, same comment | **BENIGN** ✅ — the forward *is* SCT's. Not a delta. |
-| **T7** | `burn-spectral/src/lib.rs:405-439` (QR-of-random init, `s=1`) | SCT initializes from a real SVD of a weight | no dense matrix exists; orthonormal random via Householder QR | **DELIBERATE** (unavoidable) — consequence of training natively in spectral form. |
-| **T8** | `burn-spectral/src/lib.rs:441-613` (quantizer family) | **SCT has no quantization of any kind.** `burn-sct` has ~2 hits for "tern/quant". | ternary / annealed / stochastic / per-column / asymmetric / 2-bit / N:M / fp8 / fp4 / bf16 on the factors | **OURS — the main non-SCT content.** Lineage is BitNet (`2504.12285`, `2504.18415`) + stochastic rounding (`2412.04787`) + Sparse-BitNet (`2603.05168`). |
-| **T9** | `burn-spectral/src/lib.rs:227-292` (`polar_orthogonalize_batched`, `retract_batched`) | no published analogue here | group-by-shape, stack to `[B,m,k]`, one sync-free call; the scalar path has 7 `into_scalar` per factor | **OURS.** Mathically identical by construction. But **never called by the trainer** — see §4. |
-| **T10** | `burn-spectral/Cargo.toml:33` `burn-sct = { path = "../burn-sct" }` | — | `grep` over `burn-spectral/src/**/*.rs` finds **zero** `burn_sct` / `sct::` references | **BUG** (minor): dead dependency. It also drags a second, divergent retraction implementation into the build graph. |
-| **T11** | `crates/dormouse-core/src/param.rs:1` | — | header comment says "TSCT linear **via burn-sct SpectralLinear**" — it is not; it is `burn_spectral::SpectralLinear` (`param.rs:9`) | **BUG** (stale comment) — the same confusion T10 encodes, in prose. Directly contradicts the owner's "sct is the old paper-based one, we invented tsct". |
+| **T1** | `dormouse-spectral/src/lib.rs:164-166` | Muon+ (2602.21545) §1 defines `Ortho(·)` **abstractly** and prints **no NS coefficients**; its own coefficients live in Jordan's `muon.py` as the **quintic** `(3.4445, −4.775, 2.0315)` | Doc comment says "Newton-Schulz polar iteration (**Muon+ 2602.21545 §1**) … with the optimal cubic coefficients"; the code uses `(15/8, −5/4, 3/8)` (`:205`, `:256`) — **not Muon+'s, and not in the cited paper** | **BUG** (mis-citation). The *math* is fine and deliberate (cubic, σ_max-scaled, for a **retraction** not an optimizer preconditioner); only the attribution is wrong. Fix: cite Higham 2008 / "optimal cubic", drop the Muon+ id. |
+| **T2** | `dormouse-spectral/src/lib.rs:205`, `:256` | Muon+ = quintic `(3.4445, −4.775, 2.0315)`, 5 steps | cubic `(15/8, −5/4, 3/8)`, `iters=3` by default | **DELIBERATE** and *correct for the purpose*: a retraction wants the nearest semi-orthogonal matrix (cubic converges to exact `UVᵀ`); Muon+ deliberately uses a quintic that does **not** reach `UVᵀ` (Jordan's own docstring: `S_ii ~ Uniform(0.5,1.5)`, "turns out not to hurt"). Using the quintic here would be the bug. Distinct role, distinct coefficients — but see T1, the code claims the wrong provenance. |
+| **T3** | `dormouse-spectral/src/lib.rs:178-201` (σ_max power iteration) | SCT Eq. (5) is QR, which needs no scaling | NS needs σ<√3; prescaled by Rayleigh-quotient σ_max × 1.05 | **DELIBERATE** — and it is *better* than a plain Frobenius prescale, with the divergence case documented (`:174-177`). This is our own contribution to the retraction and is the reason NS is viable here at all. |
+| **T4** | `dormouse-spectral/src/lib.rs:612-619` | SCT Eq. (5): `Q,R = QR(U); U ← Q·sign(diag(R))`, after **every** optimizer step | `iters`-step NS polar, default `retract_every=1, retract_iters=3` | **DELIBERATE** (replace). NS avoids the `O(mk²)` QR and the host round-trip. Cost: an *approximate* retraction (3 cubic steps), not the exact QR. **Convergence is not guaranteed at 3 steps** — see §4. |
+| **T5** | `dormouse-spectral/src/lib.rs:295-315` `ortho_error` | SCT (and `dormouse-sct/lib.rs:120-139`) both compute `‖UᵀU − I‖_F` **raw** | same raw metric here, but the **caller** divides by k (`param.rs:196-200`) | **DELIBERATE** — the normalization is the documented 2026-09-04 bug fix, not present upstream. Correct and load-bearing. |
+| **T6** | `dormouse-spectral/src/lib.rs:553-557` | SCT Eqs. (2)-(4): `y = (x·U) ⊙ s · Vᵀ` | identical, same order, same comment | **BENIGN** ✅ — the forward *is* SCT's. Not a delta. |
+| **T7** | `dormouse-spectral/src/lib.rs:405-439` (QR-of-random init, `s=1`) | SCT initializes from a real SVD of a weight | no dense matrix exists; orthonormal random via Householder QR | **DELIBERATE** (unavoidable) — consequence of training natively in spectral form. |
+| **T8** | `dormouse-spectral/src/lib.rs:441-613` (quantizer family) | **SCT has no quantization of any kind.** `dormouse-sct` has ~2 hits for "tern/quant". | ternary / annealed / stochastic / per-column / asymmetric / 2-bit / N:M / fp8 / fp4 / bf16 on the factors | **OURS — the main non-SCT content.** Lineage is BitNet (`2504.12285`, `2504.18415`) + stochastic rounding (`2412.04787`) + Sparse-BitNet (`2603.05168`). |
+| **T9** | `dormouse-spectral/src/lib.rs:227-292` (`polar_orthogonalize_batched`, `retract_batched`) | no published analogue here | group-by-shape, stack to `[B,m,k]`, one sync-free call; the scalar path has 7 `into_scalar` per factor | **OURS.** Mathically identical by construction. But **never called by the trainer** — see §4. |
+| **T10** | `dormouse-spectral/Cargo.toml:33` `dormouse-sct = { path = "../dormouse-sct" }` | — | `grep` over `dormouse-spectral/src/**/*.rs` finds **zero** `dormouse_sct` / `sct::` references | **BUG** (minor): dead dependency. It also drags a second, divergent retraction implementation into the build graph. |
+| **T11** | `crates/dormouse-core/src/param.rs:1` | — | header comment says "TSCT linear **via dormouse-sct SpectralLinear**" — it is not; it is `dormouse_spectral::SpectralLinear` (`param.rs:9`) | **BUG** (stale comment) — the same confusion T10 encodes, in prose. Directly contradicts the owner's "sct is the old paper-based one, we invented tsct". |
 | **T12** | `model.rs:55` `cfg.rank.min(d).min(v)` | — | `lm_head` is `[768, 256]` at rank **256** = full rank | **BENIGN** (correct by the min-clamp) but worth knowing: the head is not compressed at all, and it is routed to AdamW anyway (`routing.rs:96`). |
 | **T13** | `train/src/lib.rs:1315-1317` + `:1331-1337` | SCT: retract every step, no monitor, no fallback | retract every step (default) + 500-step monitor + **one-way persisted fp32 latch** | **OURS** — and it is the correct ADR-0011 shape (COUNTED, printed, persisted). Stronger than the paper's design. |
 | **T14** | `research/…-fused-inventory-precision.md:522` (prior reading) | — | `SpectralLinear::forward` never reads `self.fused`; 33/36 spectral tests fail; `SpectralMoE` never constructed | **UNVERIFIABLE in this pass** (I did not re-run or re-read the inventory). Carried forward as a prior, not re-confirmed. |
@@ -283,12 +283,12 @@ Read from the tree, not assumed.
    or BPB. **No evidence in the tree that it helps.**
 3. **Does 3 cubic NS steps actually converge to the Stiefel manifold at our shapes?**
    The metric exists and the latch would catch drift, but the 3-step retraction is
-   *approximate* and no test compares it to the exact QR. `burn-sct` has the exact
+   *approximate* and no test compares it to the exact QR. `dormouse-sct` has the exact
    `safe_qr` (`qr.rs:509` implements the `sign(diag(R))` correction; `qr_cuda.rs:559`
    `retract_cuda`) — **the exact reference is in the tree and is not used to check the
    approximate one.** That comparison is the cheapest unrun check available.
 4. **`retract_batched` is dead in production.** `grep` finds it only in its own definition
-   and its own tests (`burn-spectral/src/lib.rs:275, 1327-1432`); the trainer goes through
+   and its own tests (`dormouse-spectral/src/lib.rs:275, 1327-1432`); the trainer goes through
    `SpectralLinear::retract` → `polar_retracked` → `polar_orthogonalize`, the **7-`into_scalar`
    per factor** path. The claimed sync saving is not being collected. This is the same
    class as the `batched` vs `loop` 4.1–4.8× figure: real math, unwired call site.
@@ -304,9 +304,9 @@ Read from the tree, not assumed.
 
 ---
 
-## 5. `burn-sct` — the old branch. What it does that TSCT does not.
+## 5. `dormouse-sct` — the old branch. What it does that TSCT does not.
 
-`burn-sct` is a faithful, careful implementation of **SCT 2604.00733 as published**:
+`dormouse-sct` is a faithful, careful implementation of **SCT 2604.00733 as published**:
 `W = U·diag(s)·Vᵀ` (Eq. 1), `y = (x·U) ⊙ s · Vᵀ` (Eqs. 2-4), **exact Stiefel QR retraction
 with the `sign(diag(R))` continuity correction** (Eq. 5, `qr.rs:509`; CUDA path
 `qr_cuda.rs:559`), plus a fused CUDA forward (`qr_cuda.rs`), threaded CPU retraction
@@ -314,7 +314,7 @@ with the `sign(diag(R))` continuity correction** (Eq. 5, `qr.rs:509`; CUDA path
 (`lib.rs:225-232`). Its retraction is **exact and orthogonal**, where TSCT's is 3
 approximate cubic steps.
 
-| capability | `burn-sct` | `burn-spectral` (TSCT) |
+| capability | `dormouse-sct` | `dormouse-spectral` (TSCT) |
 |---|---|---|
 | parameterization `U·diag(s)·Vᵀ` | ✅ | ✅ (same) |
 | forward | ✅ SCT order | ✅ SCT order |
@@ -327,10 +327,10 @@ approximate cubic steps.
 | `compression_ratio` reporting | ✅ | ❌ (has `param_count`/`flops`, no ratio) |
 | forward is exercised on autodiff | ✅ | ❌ (prior reading: 33/36 tests fail, see T14) |
 
-**Does anything still need `burn-sct`?**
+**Does anything still need `dormouse-sct`?**
 
-- **In the training path: no.** `burn-spectral` declares it (`Cargo.toml:33`) and never
-  calls it; `dormouse-core` depends only on `burn-spectral` (`param.rs:9`). It is dead
+- **In the training path: no.** `dormouse-spectral` declares it (`Cargo.toml:33`) and never
+  calls it; `dormouse-core` depends only on `dormouse-spectral` (`param.rs:9`). It is dead
   weight in the build graph — **removable today, zero code change** (T10).
 - **As a reference, yes, and it is the most valuable thing in it.** It is the only
   *exact* Stiefel retraction in the tree, and it is a faithful transcription of the
@@ -338,11 +338,11 @@ approximate cubic steps.
   oracle for check 3 in §4 (NS-3 vs `safe_qr` at our shapes), which is currently the
   cheapest unrun verification in the whole TSCT story.
 - **One capability TSCT genuinely lacks: `from_dense`.** If a future arm wants to start
-  from a pretrained dense checkpoint in spectral form, that lives only in `burn-sct`.
+  from a pretrained dense checkpoint in spectral form, that lives only in `dormouse-sct`.
   Not needed for any queued arm today.
 
-**Recommendation (not acted on — read-only pass):** keep `burn-sct` as a *test-only*
-oracle and stop linking it into `burn-spectral`; add one test that pins NS-3 against
+**Recommendation (not acted on — read-only pass):** keep `dormouse-sct` as a *test-only*
+oracle and stop linking it into `dormouse-spectral`; add one test that pins NS-3 against
 `safe_qr` on a `[768,64]` factor. That single test discharges item 3 of §4, which is the
 only part of the retraction claim currently resting on nothing.
 
@@ -350,15 +350,15 @@ only part of the retraction claim currently resting on nothing.
 
 ## 6. Severity ranking (subject 2)
 
-1. **T1 — `burn-spectral:164-166` cites Muon+ §1 for a cubic NS that is not in that
+1. **T1 — `dormouse-spectral:164-166` cites Muon+ §1 for a cubic NS that is not in that
    paper.** A fabricated-looking citation in a *real* paper's shape: exactly the failure
    mode ADR-0020 exists to stop, and it is one line to fix. (The math is right; the
    provenance is wrong.)
 2. **§4.2 + §4.3 — the retraction has never been shown to help, and never compared to
    the exact retraction sitting unused in the same vendor tree.** The A/B is unrun
    (queue item 2), and the one test that exists only proves the function is a function.
-3. **T10 + T11 — `burn-sct` is a live Cargo dependency with zero call sites, and
-   `param.rs:1` still describes TSCT as "via burn-sct".** Two minutes to fix, and it
+3. **T10 + T11 — `dormouse-sct` is a live Cargo dependency with zero call sites, and
+   `param.rs:1` still describes TSCT as "via dormouse-sct".** Two minutes to fix, and it
    removes the exact ambiguity the owner asked about.
 4. **§4.4 — `retract_batched` is unwired**, so the sync-free path and its 4.1–4.8×
    class of saving are not in production, and no counter says so.

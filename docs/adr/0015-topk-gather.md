@@ -55,8 +55,8 @@ index" — without noticing that `-inf` reaches the same state through a
 That is why this presented as "pre.4 changed the topk/indexing semantics" in
 ADR-0012 and why it looked like a property of the indexer rather than of the
 reduce: **no caller in the tree ever exercised `argtopk` on a masked row.**
-`burn-mor` had already routed around it with a full `argsort_descending` +
-`narrow` (`burn-mor/src/topk.rs`), which is immune because a sort returns a
+`dormouse-mor` had already routed around it with a full `argsort_descending` +
+`narrow` (`dormouse-mor/src/topk.rs`), which is immune because a sort returns a
 permutation. The bug survived a CPU-only test suite, an arm cut (ADR-0014) and a
 mechanism rejection (ADR-0013) with nothing in the tree able to see it.
 
@@ -92,7 +92,7 @@ measured" below.
 
 ## What now works
 
-`burn-mor/src/topk_gather.rs` exposes the primitive the three mechanisms were
+`dormouse-mor/src/topk_gather.rs` exposes the primitive the three mechanisms were
 all waiting on:
 
 - `topk_gather(scores, values, k)` — `[b,q,n]` scores against `[b,q,n,m]` value
@@ -172,7 +172,7 @@ All three were cut or rejected *because of this primitive*, not on their merits:
   stand, and re-adding the arm is its own agent's job.
 - **MoR / mixture-of-recursions** (2507.10524, rejected in ADR-0013 for "its
   per-depth gathers are sm_120-hostile" — this is what that meant).
-  `burn-mor` is in the tree and now has a primitive whose output cannot fault.
+  `dormouse-mor` is in the tree and now has a primitive whose output cannot fault.
   Its router scores are *unmasked* (every token is a candidate), so it is the
   one of the three that does not wait on the open defect above — which is
   consistent with the "rank the slots per position" arm already landing in

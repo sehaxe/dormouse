@@ -42,7 +42,7 @@ was filling in the items they left bare.
 
 **The remaining 13.8% is 26 `pub use` re-exports and `pub mod` lines, which
 rustdoc's own `missing_docs` does not require and which are documented at their
-definition site** — `pub use burn_mor::MoRRouter` carries a doc explaining what
+definition site** — `pub use dormouse_mor::MoRRouter` carries a doc explaining what
 the router is and why it is re-exported here, but a script that looks for `///`
 immediately above the `use` line counts it as bare. rustdoc's judgement is the
 one the gate enforces, and it is now **zero** undocumented public items.

@@ -281,7 +281,7 @@ fn f16_gemm_cuda() {
 /// dies first, with `Type cube.bf16 does not have a conversion to LLVM type
 /// implemented`.
 ///
-/// `#[ignore]`d BY DESIGN, the same convention as burn-spectral's own bf16
+/// `#[ignore]`d BY DESIGN, the same convention as dormouse-spectral's own bf16
 /// probe: this is a report, not a requirement, and a permanently red test is
 /// not a gate. Run it when you want the proof the gap is still there:
 /// `cargo test -p backend-parity --features cuda --test backend_parity -- --ignored`

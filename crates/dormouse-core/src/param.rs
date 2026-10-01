@@ -1,4 +1,4 @@
-//! param - TSCT linear via burn-sct SpectralLinear, pad to multiple of 4,
+//! param - TSCT linear via dormouse-sct SpectralLinear, pad to multiple of 4,
 //! NM knob, BF16 env (mirrors aria semantics; fresh mini composition)
 //!
 //! # What [`LinearLike`] is for
@@ -34,7 +34,7 @@
 use burn::module::{Module, Param, ParamId};
 use burn::tensor::{Device, DispatchTensor, Tensor};
 use burn::backend::DispatchKindConversion;
-use burn_spectral::SpectralLinear;
+use dormouse_spectral::SpectralLinear;
 
 /// What one of a [`LinearLike`]'s parameters IS, structurally - no optimizer
 /// opinion here. The policy is a function of (this, the linear's `Role`) in
@@ -81,7 +81,7 @@ pub struct LinearLike {
 /// [`LinearLike::with_tsct`].
 #[derive(Module, Debug)]
 pub enum LinearLikeInner {
-    /// Spectral low-rank (TSCT) via `burn-spectral`: a `[in, k]` and a
+    /// Spectral low-rank (TSCT) via `dormouse-spectral`: a `[in, k]` and a
     /// `[k, out]` factor with a `[k]` singular-scale vector between them, so
     /// the parameter count is `k*(in+out+1)` rather than `in*out`. This is what
     /// makes a 2048-wide FFN affordable on a 9.2M-parameter model. Retracted
@@ -186,13 +186,13 @@ impl LinearLike {
                     }
                     #[cfg(not(feature = "cuda"))]
                     {
-                        if l.quant != burn_spectral::QuantFormat::Fp32 {
+                        if l.quant != dormouse_spectral::QuantFormat::Fp32 {
                             l.forward_quant::<B>(x)
                         } else {
                             l.forward(x)
                         }
                     }
-                } else if l.quant != burn_spectral::QuantFormat::Fp32 {
+                } else if l.quant != dormouse_spectral::QuantFormat::Fp32 {
                     l.forward_quant::<B>(x)
                 } else {
                     l.forward(x)
@@ -232,7 +232,7 @@ impl LinearLike {
     }
 
     /// Set the quantized factor format on the TSCT arm (no-op otherwise).
-    pub fn set_quant(&mut self, quant: burn_spectral::QuantFormat) {
+    pub fn set_quant(&mut self, quant: dormouse_spectral::QuantFormat) {
         if let LinearLikeInner::Tsct(l) = &mut self.inner {
             l.set_quant(quant);
         }
@@ -245,7 +245,7 @@ impl LinearLike {
         }
     }
 
-    /// Polar-retract the TSCT masters U/V to orthonormal (burn-spectral NS,
+    /// Polar-retract the TSCT masters U/V to orthonormal (dormouse-spectral NS,
     /// on device, keeps autodiff tracking). No-op for the dense variant.
     /// Without periodic retract the factors drift and the quantized forward
     /// degrades (bf16_KERNEL_PLAN: retract every 1 step, monitor max_ortho).
@@ -292,8 +292,8 @@ impl LinearLike {
                 let v = l.v.val();
                 let ku = u.dims()[1].max(1) as f32;
                 let kv = v.dims()[1].max(1) as f32;
-                (burn_spectral::ortho_error(&u) / ku)
-                    .max(burn_spectral::ortho_error(&v) / kv)
+                (dormouse_spectral::ortho_error(&u) / ku)
+                    .max(dormouse_spectral::ortho_error(&v) / kv)
             }
             _ => 0.0,
         }
@@ -309,9 +309,9 @@ impl LinearLike {
         let (u, v) = (l.u.val(), l.v.val());
         agg.fwd = agg
             .fwd
-            .max(burn_spectral::ortho_error_forward(&u, l.alpha))
-            .max(burn_spectral::ortho_error_forward(&v, l.alpha));
-        let (smax, smin, off) = burn_spectral::spectrum_stats(&l.s.val(), TsctDiag::NEAR_OFF);
+            .max(dormouse_spectral::ortho_error_forward(&u, l.alpha))
+            .max(dormouse_spectral::ortho_error_forward(&v, l.alpha));
+        let (smax, smin, off) = dormouse_spectral::spectrum_stats(&l.s.val(), TsctDiag::NEAR_OFF);
         agg.s_max = agg.s_max.max(smax);
         agg.s_min = agg.s_min.min(smin);
         agg.off += off as u32;
@@ -327,7 +327,7 @@ impl LinearLike {
 #[derive(Clone, Copy, Debug)]
 pub struct TsctDiag {
     /// Worst per-entry Gram error of the factor the FORWARD multiplies by,
-    /// at each layer's own ternary annealing `alpha` — `burn_spectral`'s
+    /// at each layer's own ternary annealing `alpha` — `dormouse_spectral`'s
     /// `ortho_error_forward`, the same function `SpectralLinear::forward`
     /// calls. At `alpha = 0` this equals the masters' metric exactly, which
     /// is the cross-check the eval line's pair of numbers rests on.

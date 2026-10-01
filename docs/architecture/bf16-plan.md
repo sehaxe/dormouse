@@ -18,7 +18,7 @@
 
 ## 3. Оптимизатор
 
-- Muon+ подключён (burn-fused, OPT=mix): 2D линейные карты, ns=8, ColRow; n-gram таблицы на Adam wd=0; остальное AdamW (Adan — OPT=mix-adan). Политика + validate_routing в `train/src/optim.rs`.
+- Muon+ подключён (dormouse-fused, OPT=mix): 2D линейные карты, ns=8, ColRow; n-gram таблицы на Adam wd=0; остальное AdamW (Adan — OPT=mix-adan). Политика + validate_routing в `train/src/optim.rs`.
 - AdamW/Muon moments bf16 + stochastic rounding
 - Loss scaling 1024 for CE/JEPA/KoLeo
 - MuonQ 4-bit later 7× saving
@@ -27,8 +27,8 @@
 
 - `cubek-matmul`: tiled bf16 (M/N/K%vs tails already fixed), naive bf16
 - `cubek-quant`: bf16 quant/dequant
-- `burn-kda`, `burn-msa`, `burn-engram`: bf16 forward
-- `burn-sct`: TSCT bf16 retract
+- `dormouse-kda`, `burn-msa`, `dormouse-engram`: bf16 forward
+- `dormouse-sct`: TSCT bf16 retract
 
 ## 5. Риски
 

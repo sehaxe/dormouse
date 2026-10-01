@@ -134,7 +134,7 @@ are byte-identical to a build from before the arm shipped.
   presets (`swift50`, `one_b`, `p150`), which cost minutes each to instantiate on
   the CPU backend.
 - `mor` is **`#[ignore]`d by a real failure, not by cost**: the MoR arm panics on
-  the CPU backend because `burn_mor::topk_indices` returns I64 where
+  the CPU backend because `dormouse_mor::topk_indices` returns I64 where
   `Tensor<D, Int>` is i32 (burn-flex `tensor.rs:170`). Its cost is asserted
   anyway, from the resolved configs — `mor` must differ from `small` in exactly
   three scalars — so the A/B pair cannot drift into comparing two different
