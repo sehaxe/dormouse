@@ -14,6 +14,7 @@
 //!
 //! **FOUR SCHEMA FIELDS ARE UNREACHABLE FROM `--set`, recorded not fixed.**
 //! `use_situ`, `use_attnres`, `use_mhc` and `mhc_streams` have no arm in the
+//! `use_situ`, `use_attnres`, `use_moe` and `moe_streams` have no arm in the
 //! match below, so `--set use_situ=true` returns
 //! `Err("unknown config key \"use_situ\"")` - LOUD, not silent, so nothing
 //! trains differently from what was asked. But those four are then reachable
