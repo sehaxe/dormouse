@@ -4,10 +4,12 @@
 
 /* 1. The tables in this repo are file:line registers — `train/src/lib.rs:729-737`
    is one token in Markdown's eyes and refuses to wrap. Left alone it gives every
-   table a horizontal scrollbar on a laptop and hides half the row. */
+   table a horizontal scrollbar on a laptop and hides half the row. `break-word`
+   (not `anywhere`) so ordinary text wraps at spaces and only a single
+   over-long path breaks mid-token, which keeps the columns readable. */
 .sl-markdown-content :is(table) :is(code) {
 	white-space: normal;
-	overflow-wrap: anywhere;
+	overflow-wrap: break-word;
 }
 
 /* 2. Long fences are common here (a training launch line, a `file:line` list)

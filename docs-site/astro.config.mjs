@@ -18,29 +18,27 @@ export default defineConfig({
 			title: 'dormouse',
 			description:
 				'A byte-level language-model trainer that fits on one workstation — published with the measurements that justify it and the ones that refute it.',
-			// English is the default and nothing is translated: 387 documents
-			// exist in two languages and a machine translation of them would be a
-			// second source of truth in a second language. See IA.md.
-			defaultLocale: 'en',
+			// English, and nothing is translated. `defaultLocale` is deliberately
+			// NOT set: it is Starlight's switch for i18n ROUTING, and setting it
+			// makes Astro look for an `i18n` content collection this site does not
+			// have, warning on every build ("collection i18n does not exist or is
+			// empty"). Without it the root locale is English and URLs are unprefixed
+			// — the same result, no warning. ~180 documents exist in two languages
+			// and a machine translation of them would be a second source of truth in
+			// a second language; see IA.md.
 			social: [{ icon: 'github', label: 'GitHub', href: repo }],
 			// "Edit page" is per-page: the ingest step writes `editUrl` in each
 			// generated page's frontmatter, pointing at the CANONICAL file on
 			// GitHub and never at the generated one (which is gitignored).
 			customCss: ['./src/styles/custom.css'],
+			// Starlight's default is /favicon.svg, which is the extension it accepts;
+			// public/favicon.svg IS the hamster, so the link resolves instead of
+			// dangling on all 181 pages.
+			favicon: '/favicon.svg',
 			components: {
 				// The site has one author and one repo; a footer credit is noise.
 				Footer: undefined,
 			},
-			head: [
-				{
-					tag: 'link',
-					attrs: {
-						rel: 'icon',
-						type: 'image/svg+xml',
-						href: 'data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22%3E%3Ctext y=%22.9em%22 font-size=%2290%22%3E%F0%9F%90%B9%3C/text%3E%3C/svg%3E',
-					},
-				},
-			],
 		}),
 	],
 });

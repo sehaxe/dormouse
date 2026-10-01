@@ -10,6 +10,7 @@
     "start": "npm run dev",
     "build": "npm run ingest && astro build",
     "preview": "astro preview",
+    "check": "node tools/check.mjs",
     "astro": "astro"
   },
   "dependencies": {
