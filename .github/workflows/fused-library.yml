@@ -79,7 +79,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: vendor/burn-fused
-      - name: the facade: generated files in sync + every feature combination
+      - name: "the facade: generated files in sync + every feature combination"
         # The re-export list and the feature flags are GENERATED from the
         # member manifests (tools/gen_facade.py), and this is the gate that
         # keeps them honest: 13 crates declare `cuda`, the hand-written list

@@ -6,7 +6,7 @@
 with the measurements that justify it and the ones that refute it.**
 
 [![CI](https://github.com/sehaxe/dormouse/actions/workflows/ci.yml/badge.svg)](https://github.com/sehaxe/dormouse/actions/workflows/ci.yml)
-[![License: AGPL-3.0-only](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org)
 [![CUDA](https://img.shields.io/badge/CUDA-sm_120-green.svg)](https://developer.nvidia.com/cuda-gpus)
 [![burn](https://img.shields.io/badge/burn-0.22.0--pre.4-red.svg)](https://github.com/burn-rs/burn)
@@ -815,18 +815,17 @@ one exists because breaking it cost a run, a week, or a claim.
 
 ## License
 
-**AGPL-3.0-only** — see [`LICENSE`](LICENSE) for the full text, and
-`Cargo.toml`'s `license = "AGPL-3.0"` (which every crate manifest inherits).
+**MIT** — see [`LICENSE`](LICENSE) for the full text, and
+`Cargo.toml`'s `license = "MIT"` (which every crate manifest inherits).
 Copyright (c) 2026 sehaxe.
 
-Why AGPL and not MIT: the project is a derived work carrying patched forks of
-[burn](https://github.com/tracel-ai/burn) and
-[cubecl](https://github.com/cubecl/cubecl), both MIT, and it is built around the
-premise that a model "codes its own updates, merged only through the
-verification harness" — network-mediated modification. AGPL is the license that
-covers that case, it is compatible with linking the MIT/Apache upstream
-components, and it was the deliberate choice already recorded in every crate
-manifest.
+The license history is worth knowing: the file shipped as MIT (2026-08-28),
+was switched to AGPL-3.0 on 2026-09-28 to match what the crate manifests
+already declared, and was returned to **MIT on 2026-10-01 by owner decision**.
+The vendored forks of [burn](https://github.com/tracel-ai/burn) and
+[cubecl](https://github.com/cubecl/cubecl) keep their upstream MIT/Apache
+notices (restored in `4a472a8`); distributing them under MIT changes nothing
+for them and their notices travel with the copies.
 
 Third-party components vendored in this tree, with their own licenses and
 notices, which must be preserved:
