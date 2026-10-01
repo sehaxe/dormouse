@@ -1,9 +1,11 @@
 # The graph seam in the training loop — v1: fwd+bwd captured, the tail not
 
 Lane: owner's directive "0 GPU sync, fix the 400 ms". Status at the time of
-writing: **the seam is wired, the number `L` is not yet measured** (the 100k
-production run owns the card), so the win is *unquantified* and every claim
-below is either read from the tree or marked as pending.
+writing: **the seam is wired and CPU-green (52/52), the CUDA gates and every
+number are NOT yet run** — a 100k production run owns the card until ~14:40
+(`first_run_100000_1001_0202.log`, step 92.5k of 100k at 13:41). So this file
+records what was built and why, and marks every claim that waits on a
+measurement instead of making it.
 
 Read first: `research/reviews/cuda-graph-2026-09-30.md` (the handover) and
 `vendor/cubecl-fix/cubecl-cuda/tests/graph_step.rs` (the mechanism, 5/5 on this
@@ -98,6 +100,41 @@ one dispatch. A refused capture is COUNTED with its reason printed once and the
 run continues ungraphed (`seam.report()` prints captures/replays/refusals at the
 end) — a capture that failed quietly would be the `8fa5d4c` shape.
 
+### 3.1 The capture protocol, found by reading the pool (and it is not obvious)
+
+The first version of this seam went `graph_prepare → start_capture → body`, and
+**every capture in every run would have been refused.** Reading
+`memory_manage.rs` says why:
+
+- `capture_begin` forces `mode = Persistent`, so every allocation inside the
+  window goes to the **persistent** pool (exact-sized slices) — not the
+  `ExclusivePages` pool `init_pools` installs for the rest of the run.
+- The persistent pool is EMPTY at that moment, because the trainer never opens a
+  persistent window outside a capture. So the recorded pass allocates everything:
+  every allocation is a memory node, and `stop_capture` rejects the graph
+  (`cubecl-cuda/src/compute/capture.rs:110-120`) — with a message that says "the
+  window grew the pool", which is true and caused by the seam, not by the pool.
+- The protocol that avoids it is in `graph_prepare`'s own doc and in
+  `graph_step.rs`: **prepare, then warm up, then capture**. `graph_prepare`
+  opens a PRIMING window in which `capture_touch` RETAINS every slice the pass
+  touches, so one unrecorded pass grows the pool to that pass's full working set
+  instead of its transient peak; `start_capture` ends priming
+  (`Window::begin` → `capture_priming_end`) and releases those slices as free, and
+  the recorded pass reuses them.
+
+So the seam runs the window `CAPTURE_WARMUP = 1` time(s) unrecorded between
+prepare and capture, which makes the window closure `Fn` rather than `FnOnce`.
+That is the whole reason the closure is `Fn`, and the reason `loss_log` /
+`aux_log` come back through `RefCell`s.
+
+### 3.2 A refusal is not free, so there is a valve
+
+Each attempt grows the persistent pool by a working set (priming retains what it
+touches). A run that is refused on every step would grow that pool until it
+OOMs, which is worse than being slow. After `MAX_REFUSALS = 20` the seam stops
+attempting, says `DISABLED` in the report, and continues ungraphed — correct,
+because an ungraphed step trains exactly what a replayed one would.
+
 ## 4. Refusals, not fallbacks (ADR-0011)
 
 `graph::check` runs in `resolve`, before any GPU work, and refuses:
@@ -114,16 +151,45 @@ end) — a capture that failed quietly would be the `8fa5d4c` shape.
 The handover records two false greens by the previous agent (an oracle that
 happened to equal the stale-pointer output, and a units bug). So:
 
-- `graph::stats_line_names_the_three_numbers_and_the_refusal` — the report
-  names every number, including a null.
-- `graph::a_master_keeps_its_rank_and_refuses_one_it_cannot_carry` — the
+- `graph::stats_line_names_the_three_numbers_and_the_refusal` — green. The
+  report names every number, including a null.
+- `graph::a_master_keeps_its_rank_and_refuses_one_it_cannot_carry` — green. The
   rank-erased master round-trips at its own rank and refuses another (no
   reshape anywhere, because a reshaped master that moved is an unpinned graph).
+- `cargo test -p dormouse-train --lib` — **52/52 green**, so the seam's
+  integration into `train_loop` did not break the 50 tests that were already
+  there (including the config-snapshot gate, which is what forced the new field
+  into the snapshot — see §8).
 - `burn-muon-plus::copy_into_writes_the_existing_buffer_and_leaves_the_source_alone`
-  — the copy is bit-exact and does not consume the source (CUDA; needs a card).
-- Pending on a card: **replay vs fresh launch agree on a fixed input**,
-  **bit-exactness over N replays**, and the **500-step control-vs-graph step-time
-  slice** into `benches/history.tsv` with the step index quoted.
+  — written, **not run** (CUDA).
+- `tests/graph_seam_cuda.rs` — four gates, **built, not run**:
+  1. `the_stale_pointer_trap_is_reproduced_without_the_pin` — the NEGATIVE. The
+     same run without the pin must DISAGREE with fresh launches. It asserts a
+     signature (`> 1e-3` relative), never a magnitude, because a specific wrong
+     number is a hand-written oracle — the mistake this lane already made once.
+     If it ever goes red, the finding is "the pin is unnecessary on this
+     backend", which is worth knowing.
+  2. `a_pinned_replay_agrees_with_fresh_launches_to_f32_noise` — the
+     differential, against the software run of the same steps.
+  3. `replays_are_bit_identical_to_the_first_replay` — N replays, `== 0.0` on
+     the worst relative difference.
+  4. `a_replay_launches_no_kernels` — the mechanism through the trainer's path.
+
+  Every oracle is computed by running the other arm. The window in the test is
+  the same shape as the trainer's and re-derives its own gradients; it is not
+  the trainer's 1400-line loop, which is not callable from a test (the same
+  wall §3.3 of AGENTS names for the eval call site).
+
+## 8. Two things the repo's own gates caught
+
+- `cfg::tests::snapshot_carries_every_train_field` went red on the new field,
+  which is that test doing its job: a new `TrainCfg` field must be asked about.
+  Answer: **in the snapshot** (ADR-0021) — a resume that turned the flag on
+  would compare two execution paths across one step count.
+- `cube_of` only downcast float tensors, so the Int pin (`x`, `y`, the hashed
+  keys are `Tensor<_, Int>`) did not compile: `try_into_primitive` is bounded on
+  `K: BackendPrimitive<B>`, so one generic over the kind cannot serve both.
+  Two four-line functions instead of one that cannot typecheck.
 
 ## 6. Open, in the order the evidence says
 
@@ -131,17 +197,25 @@ happened to equal the stale-pointer output, and a units bug). So:
    difference. Decision rule (fixed before the number, §10 of the handover):
    `L > ~200` ⇒ the graph is the step; `L < ~200` ⇒ null, report and stop. The
    arithmetic already in the tree says `L` is ~14.5k (460 ms ÷ 34.4 µs), but
-   that is an inference from a per-launch cost, not a count.
-2. **Does the window allocate?** `stop_capture` rejects any allocation inside the
-   window (a memory node makes the graph un-relaunchable). In steady state the
-   persistent pool should serve every temporary from a free slice of the same
-   size, but the backward under `BalancedCheckpointing` allocates a lot. The
-   refusal message names the cause, so this is answered by the first run rather
-   than by an argument.
-3. **The autotuner** may sync inside the window; a refused capture says so.
-4. **VRAM**: the retained slices are the step's working set, held for as long as
-   the graph lives. At batch 8 that is a large fraction of 16 GB — the first
-   thing to watch if a graphed run OOMs where an ungraphed one did not.
+   that is an inference from a per-launch cost, not a count. **NOT TAKEN.**
+2. **Does the window allocate?** §3.1 says it must not, and the refusal message
+   names the cause, so this is answered by the first run rather than by an
+   argument. **NOT TAKEN.**
+3. **The four CUDA gates** (§5). **NOT TAKEN** — the test binary builds, the
+   card is busy.
+4. **Control vs graph over 500 steps.** `--timers` now prints a warm-step mean
+   (steps ≥50, because step 0 is the autotune step at 23× a warm step, AGENTS
+   §3.1) on **every** run, so both arms are read with the same instrument.
+   **NOT TAKEN.**
+5. **The autotuner** may sync inside the window; a refused capture says so.
+6. **VRAM**: the retained slices are the step's working set, held for as long as
+   the graph lives, and every refused attempt adds one (§3.2). At batch 8 that
+   is a large fraction of 16 GB — the first thing to watch if a graphed run OOMs
+   where an ungraphed one did not.
+7. **A v2 that captures the tail** (`opt`, `retr`, `ema`, ~15% of the launches)
+   needs the optimizer's moments pinned, which means reaching into
+   `ModuleOptimizer`'s private state or reimplementing the optimizer. That is a
+   separate decision with its own cost; §1 is why v1 stops here.
 
 ## 7. Files
 
