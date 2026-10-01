@@ -208,16 +208,25 @@ jobs:
           workspaces: vendor/dormouse-fused
       - name: install mold (repo config links through it)
         run: sudo apt-get update && sudo apt-get install -y mold
-      # The 13 crates that declare a `cuda` feature. Kept as an explicit list
-      # because `--features cuda` on a crate without it is a silent no-op.
-      - name: every cuda crate, compile-only, both with and without autodiff
+      # DERIVED, not written here, and the old hand-written list was wrong in two
+      # ways that each killed the step: it named `burn-mor`, which declares no
+      # `cuda` feature, and it asked `cuda,autodiff` of burn-muon-plus,
+      # burn-rmsnorm, burn-spectral and burn-swiglu, which declare no `autodiff`.
+      # Cargo REJECTS a feature a package does not have - the old comment called it
+      # "a silent no-op", and that belief is why the loop died on its fourth
+      # crate and the nine behind it were never compiled at all.
+      # `tools/gen_facade.py --cuda-matrix` reads every member manifest and prints
+      # only combinations that exist: 12 crates, 20 combinations today.
+      # `--all-targets` rather than `cargo test --no-run`: this job's own comment
+      # says what it is ("the crate COMPILES and cannot fail on a CUDA-only bug"),
+      # `--all-targets` covers lib + tests + examples + benches, and it does not
+      # spend the step linking 20 test binaries to prove the same thing.
+      - name: every cuda crate, every combination it declares, all targets
         run: |
-          for c in burn-attnres burn-bitnet burn-gdn2 burn-kda burn-mhc burn-mor \
-                   burn-muon-plus burn-rmsnorm burn-rope burn-sct burn-situ \
-                   burn-spectral burn-swiglu; do
-            cargo check -p "$c" --features cuda
-            cargo check -p "$c" --features cuda,autodiff
-            cargo test -p "$c" --features cuda,autodiff --no-run
+          set -euo pipefail
+          python3 tools/gen_facade.py --cuda-matrix | while read -r c f; do
+            echo "== $c [$f]"
+            cargo check -p "$c" --features "$f" --all-targets
           done
       - name: the GPU probe packages build
         run: |
