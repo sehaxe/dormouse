@@ -2233,4 +2233,4 @@ mod tests {
         assert_eq!(tables, vec![32_768; 3]);
         assert_eq!(mask, 32_767);
     }
-}
+}}

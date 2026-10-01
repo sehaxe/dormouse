@@ -21,6 +21,7 @@ burn-dspark = { path = "../../vendor/burn-fused/crates/burn-dspark", features = 
 burn-spectral = { path = "../../vendor/burn-fused/crates/burn-spectral" }
 # MoR routing mechanism (arXiv 2507.10524): the shared router + the repaired
 # top-k index primitive the loop's per-position routing rides on.
+burn-mhc = { path = "../../vendor/burn-fused/crates/burn-mhc" }
 burn-mor = { path = "../../vendor/burn-fused/crates/burn-mor" }
 # Attention Residuals (arXiv:2603.15031): the residual-stream arm, Full mode
 # over the loop's iteration states. Off by default (`use_attnres`); the crate

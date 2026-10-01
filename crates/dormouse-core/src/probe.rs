@@ -105,6 +105,7 @@ pub const NAMES: [&str; N_ARMS] = [
     "mhc",
     "moe_select",
     "moe_lb",
+    "situ",
 ];
 
 thread_local! {

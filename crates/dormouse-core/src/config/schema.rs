@@ -120,6 +120,8 @@ pub struct DormouseConfig {
     /// accident, but it is not wired to a config field: the first A/B this
     /// arm needs is AttnRes vs ReZero, not AttnRes vs AttnRes.
     #[serde(default)] pub use_attnres: bool,
+    #[serde(default)] pub use_mhc: bool,
+    #[serde(default = "d_mhc_streams")] pub mhc_streams: usize,
     /// SiTU-GLU in the expert FFN (arXiv:2607.24653v2 Eq 12, Kimi K3):
     /// `beta1*tanh(Wg x/beta1) * Sigmoid(Wg x) * beta2*tanh(Wu x/beta2)` at
     /// K3's own `beta1 = 4`, `beta2 = 25` (`burn_situ::K3_GATE_BETA` /
@@ -136,6 +138,8 @@ pub struct DormouseConfig {
     /// §2.3.2. Off is bitwise identical: see `situ_off_is_bitwise_the_old_model`
     /// and the unchanged `preset_exec` counts.
     #[serde(default)] pub use_situ: bool,
+    #[serde(default = "d_moe_topk")] pub moe_topk: usize,
+    #[serde(default = "d_moe_lb_coef")] pub moe_lb_coef: f32,
     #[serde(default = "d_n_experts")] pub n_experts: usize,
     #[serde(default = "d_jepa_weight")] pub jepa_weight: f32,
     #[serde(default = "d_jepa_mask_frac")] pub jepa_mask_frac: f32,
@@ -358,3 +362,7 @@ mod tests {
         assert_eq!(c.act_quant, Some(ActQuant::Int(8)));
     }
 }
+
+fn d_mhc_streams() -> usize { 2 }
+fn d_moe_topk() -> usize { 0 }
+fn d_moe_lb_coef() -> f32 { 0.0 }
