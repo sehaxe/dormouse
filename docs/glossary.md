@@ -420,30 +420,39 @@ parameter is declared exactly once at `:180`.
 
 **Not** `ParamGroup` (burn's own type, `burn::module::ParamGroup`) — that is the
 framework mechanism; `Group` is our policy. **Not** "the Muon group" in the CLI
-log, which comes from the *other* implementation (below).
+log, which is the same policy counted off the INSTALLED `ParamGroup`s
+(`optim.rs::check_installed`) rather than off the declaration — the two must
+agree and a loud gate says so, but they are counted by different code.
 
-### markers (path-string routing, the live implementation)
+### markers (path-string routing) — DELETED, kept as a name
 
-The **other** vocabulary, and the one the trainer actually builds its optimizer
-from: `MUON_PATH_MARKERS` (`"expert_ffns."`, `"engram.key_projs"`,
-`"out_proj.inner"`), `ENGRAM_TABLE_MARKER` (`"engram.memory"`), `QK_HEAD_MARKERS`
-(`"gdn2.q_proj"`, `"gdn2.k_proj"`), and the predicates `is_muon_param`,
-`is_engram_table_param`, `is_qk_param`.
+The former second vocabulary: `MUON_PATH_MARKERS` (`"expert_ffns."`,
+`"engram.key_projs"`, `"out_proj.inner"`), `ENGRAM_TABLE_MARKER`
+(`"engram.memory"`), `QK_HEAD_MARKERS` (`"gdn2.q_proj"`, `"gdn2.k_proj"`), and
+the predicates `is_muon_param`, `is_engram_table_param`, `is_qk_param`.
 
-`crates/dormouse-train/src/optim.rs:84`, `:96`, `:142`, `:101`, `:123`, `:145`;
-consumed by `build_optim_mode` (`:301`) and checked by `validate_routing`
-(`:416`), which is what `train_loop` calls at startup
-(`crates/dormouse-train/src/lib.rs:795`).
+**None of these symbols exist.** They were the trainer's own copy of the
+optimizer policy, matching module **path strings**, and they are gone as of
+`831e3a0` (2026-09-28). `grep -rn "MUON_PATH_MARKERS\|is_muon_param" --include=*.rs
+crates/` returns one hit, and it is a comment remembering a divergence.
 
-**Disambiguation, and it matters.** Two implementations of the same policy
-exist. The **id-based** one (`routing.rs`, ADR-0017) is exercised only by tests
-(`crates/dormouse-core/tests/preset_exec.rs:494`, and the module's own tests).
-The **path-string** one (`optim.rs`) is what `build_optim` and
-`validate_routing` use at runtime, and `GroupCounts` is re-declared there
-(`optim.rs:362`) alongside core's (`routing.rs:56`) with the same four fields.
-They currently agree on every parameter; the day they do not, the optimizer
-wins and the test's verdict is the one that is wrong. Say which one you mean,
-always: "routing.rs" or "optim.rs", never just "the group".
+They were wrong, not merely redundant: the live marker set excluded
+`inner.Dense.bias` but not `inner.Dense.weight`, so with
+`--set use_tsct=false` a dense expert's full `[d,d]` weight reached Muon+ and
+fp32 Newton-Schulz — the ~40 s/step case §2.3 records as solved, reachable
+through a documented A/B flag. Every log line was counted off the markers, so
+no run said so.
+
+**Why the entry stays:** the divergence was real and silent, and it is the
+reason [[group]] is built from `ParamId`s. Deleted vocabulary is still
+confusable vocabulary; see `docs/reviews/dedup-optimizer-2026-10-01.md`.
+
+**Do not say there are two optimizer policies.** There is one. `routing.rs`
+declares it and `dormouse-train::optim` installs it (`optim.rs::optimizer_groups`
+calls `routing::routing`). If a note tells you the id-based declaration is
+"exercised only by tests" and the markers are what run, that note predates
+2026-09-28 and is wrong — that claim was reintroduced into prose by `d81d920`
+(2026-10-01), after the code fix it describes.
 
 ### Muon+ / HeadWiseMuon / the fallback
 
@@ -466,7 +475,8 @@ The A/B knob that moves the expert TSCT factors from Muon+ to the base
 optimizer, leaving the declaration valid.
 
 `--factors-fallback` (`crates/dormouse-cli/src/bin/train.rs:60`), implemented
-once in each policy (`routing.rs:95`, `optim.rs:292`).
+ONCE, as the `group_of` branch in `routing.rs` — which is the policy the
+trainer installs.
 
 **Not** a quant fallback: `factors_fallback` (which params) and the one-way
 `max_ortho` fp32 fallback (which *forward*, and which latches forever) are
@@ -710,7 +720,7 @@ still needs an owner's decision, and the fix may be a code change.
 | 13 | `bool -> float` cast | correct on this backend, verified at n=1..1000 on raw and dispatch paths (ADR-0016 bug 1) | "The `Bool -> float` cast is broken on this backend (it returns 0.0 for `true`)" — the doc comment on `GradSanitizer`, `crates/dormouse-train/src/lib.rs:300-302` | **OPEN** — a retracted claim living in a code comment is the exact ADR-0020 failure |
 | 14 | `mini Aria` | dormouse | `crates/dormouse-core/src/lib.rs:1` — "all-bf16 mini Aria on burn-fused kernels" | **OPEN** (a stale project name *and* a stale dtype claim, on the crate root) |
 | 15 | patching | not implemented; no `patch` token anywhere in the model | **Patching** was a `CONTEXT.md` glossary entry with a verdict pending (old `CONTEXT.md:33`) | **FIXED** (entry deleted — a pending verdict on an unimplemented idea is not vocabulary) |
-| 16 | routing policy | `optim.rs` markers build the optimizer at runtime; `routing.rs`'s id-based declaration runs in tests only | "Muon+ mixed optimizer (policy + groups in `src/optim.rs`)" is right, but `routing.rs` is documented as *the* mechanism (ADR-0017) and the two are never reconciled; `GroupCounts` is declared twice (`routing.rs:56`, `optim.rs:362`) | **OPEN** — the docs now name both and say which one runs, but the duplication is a code question |
+| 16 | routing policy | ONE policy: `routing.rs` declares it from `ParamId`s, `dormouse-train::optim` installs it. The path-marker copy in `optim.rs` was deleted by `831e3a0` (2026-09-28) | "Muon+ mixed optimizer (policy + groups in `src/optim.rs`)" plus a glossary section presenting the markers as "the live implementation", and the claim that `routing.rs` was "exercised only by tests" — reintroduced into prose by `d81d920` (2026-10-01), AFTER the code fix | **FIXED** (2026-10-01) — the second `GroupCounts` and the second module walker are cut (`docs/reviews/dedup-optimizer-2026-10-01.md`); the false "two implementations" text is gone from `routing.rs`, `optim.rs`, `AGENTS.md` §3.3, the glossary and `docs/papers/muon-plus.md` D17 |
 | 17 | stride | `dspark_stride` is a config field (`schema.rs:112`), no documented meaning anywhere | no document mentioned it | **OPEN** |
 | 18 | ADR index | 22 ADRs | "ADR-0001..0012" (`README.md:199` docs table) | **OPEN** (`README.md`) |
 | 19 | `nano-fused` | KDA+Engram+aux off; `DM_FUSED` exists nowhere in the tree | "KDA+Engram+aux off, single-node path", and the file's own header comment names the deleted env var (`configs/nano-fused.toml:2`, `README.md:99`) | **OPEN** — proposed rename `nano-arms-off`; not renamed here, and `cfg.rs:349` pins the current name in a test |

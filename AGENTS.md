@@ -766,11 +766,12 @@ The defenses are installed, not optional.
   how a "verified" claim becomes unverifiable. Check the diff, not the message
   — and when a message and a diff disagree, the disagreement is a defect in its
   own right.
-- **Two implementations of the optimizer policy.** `train/src/optim.rs` builds
-  the optimizer from path-string markers and is what runs; `core/src/routing.rs`
-  declares the same policy from `ParamId`s and is exercised only by tests.
-  They agree today. `GroupCounts` is declared in both crates. Until this is
-  reconciled, always say which one you mean.
+- **Two implementations of the optimizer policy — RESOLVED 2026-09-28
+  (`831e3a0`), and this entry outlived the fix.** The path-marker copy in
+  `train/src/optim.rs` is deleted; `core/src/routing.rs` is the live policy
+  (`optim.rs::optimizer_groups` calls it) and there is no twin. What was left
+  after the cut — a second `GroupCounts` and a second module walker — is gone
+  too (`docs/reviews/dedup-optimizer-2026-10-01.md`).
 - **The fused RMSNorm kernel — CORRECTED 2026-09-30, and the old sentence
   understated it by a factor.** It does not merely "never engage on the
   trainer's backend": **it never produced a number on ANY device in the life of
