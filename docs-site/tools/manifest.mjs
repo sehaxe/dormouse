@@ -210,7 +210,7 @@ export const dirIndex = {
 	'docs/papers/': '/research/papers/',
 	'docs/guides/': '/tooling/',
 	'docs/archive/': '/archive/',
-	'vendor/burn-fused/crates/': '/architecture/library-crate-fate/',
+	'vendor/dormouse-fused/crates/': '/architecture/library-crate-fate/',
 };
 
 // Where a LINK to a file that is only ingested as slices should go: the file's
