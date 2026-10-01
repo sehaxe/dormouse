@@ -263,6 +263,39 @@ neither of which is "tune k":
    expert per pass, chosen by that pass's state, beat one that averages four?
    That is a real question with the dense mixture as the control.
 
+### 6.1b Gradient flow and tie behaviour — the gates that were MISSING
+
+Two of the brief's gates had no test, and both are now in
+`crates/dormouse-core/tests/moe_grad_seam.rs`.
+
+**Gradient flow** (the `8fa5d4c` class, and the reason it is worth a file: the
+routing arm adds NO parameters, so "the router trains" has to be checked on the
+controller's EXISTING expert columns, next to a control that must also be live).
+Measured on the ndarray backend, `k = n_experts` so every expert is selected on
+every row — L2 norms of the parameter gradients:
+
+| quantity | L2 |
+|---|---:|
+| controller arm-gate columns `[0..3]` (the control) | 3.366e-02 |
+| controller **router** columns `[3..3+E]` | 5.198e-02 |
+| per-expert `gate_up` weight | 0.037 / 0.039 / 0.040 / 0.036 |
+
+At `k = 1` all four experts still received gradient on the fixture draw
+(32 positions over 4 experts covers the whole bank), so the k-dependent claim is
+the converse — an expert that wins no position is masked to exactly zero, by
+construction (`d/d out_e = gate_e = 0`), not by defect. Asserting an exact set
+would be asserting the RNG.
+
+**Tie behaviour, defined.** The selection is `burn_mor::topk_indices` — one
+`argsort_descending` + `narrow` — and that primitive's own doc says the selected
+SET among equal values may differ between impls and backends. So the promise is
+deliberately narrow and is exactly what is tested: **the COUNT is always exactly
+`k`, never `k±1`, including on a row where all `E` scores are equal**; WHICH
+tied expert wins is unspecified and nothing asserts it. A `k±1` leak would be
+silent and total — a row selecting 0 experts gets a zero FFN output and one
+selecting all `E` is the dense blend, so both are the control wearing the arm's
+label.
+
 ### 6.2 The load-balancing coefficient — swept, and the sweep says NO
 
 `cargo test -p dormouse-core --lib moe -- --nocapture`. Hostile batch: 64 rows,
