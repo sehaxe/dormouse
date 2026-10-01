@@ -915,7 +915,7 @@ payoff for a 16 GB GPU + 64 GB RAM box. **Status per item in brackets:**
    the report's −0.026 and its zero-spike result do not transfer unmeasured.
    **Every GR-shaped number before this commit is invalid**, and there were
    none: `use_gr = false` in all eight configs, so no preset, log or A/B ever
-   ran it (`docs/audit-2026-09-25.md` already ruled it "A/B or delete").
+   ran it (`docs/archive/audit-2026-09-25.md` already ruled it "A/B or delete").
 3. **Muon+** [wired, the default optimizer]. Muon + post-polar ColRow
    normalization, fused CUDA kernels, hybrid 2D→Muon+/1D→AdamW, with the
    report's param-group routing: Muon+ ColRow on 2D linear maps; AdamW for

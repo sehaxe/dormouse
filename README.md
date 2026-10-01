@@ -804,7 +804,7 @@ one exists because breaking it cost a run, a week, or a claim.
 | [`docs/architecture/PLAN.md`](docs/architecture/PLAN.md) | program plan, phase ladder, verdicts, north star |
 | [`docs/protocols/AB-PROTOCOL.md`](docs/protocols/AB-PROTOCOL.md) | the measurement instrument and the A/B queue (unrun) |
 | [`docs/adr/`](docs/adr/) | ADR-0001..0022 — every recorded decision, including the retracted ones |
-| [`docs/audit-2026-09-25.md`](docs/audit-2026-09-25.md) | codebase verdict audit: kill list, missing A/Bs |
+| [`docs/archive/audit-2026-09-25.md`](docs/archive/audit-2026-09-25.md) | codebase verdict audit: kill list, missing A/Bs |
 | [`docs/architecture/design-minimal.md`](docs/architecture/design-minimal.md) | the minimal-architecture target |
 | [`docs/architecture/mixture-arms.md`](docs/architecture/mixture-arms.md) | three priced training arms |
 | [`docs/research/2026-09-27-oracle-audit-renamed.md`](docs/research/2026-09-27-oracle-audit-renamed.md) | what the library's verification claims are actually worth (read this before trusting any of them) |

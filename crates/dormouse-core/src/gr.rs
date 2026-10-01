@@ -31,7 +31,7 @@
 //! not the report's placement.
 //!
 //! Nothing here has been A/B'd. The verdict owed is GR vs ReZero at a matched
-//! budget (`docs/audit-2026-09-25.md:31`); until it runs, the numbers in the
+//! budget (`docs/archive/audit-2026-09-25.md:31`); until it runs, the numbers in the
 //! report are not ours to spend.
 //!
 //! All slicing happens on 2D/3D tensors only: dynamic slicing of a 4D

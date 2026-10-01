@@ -227,7 +227,7 @@ fn determinism() {
 /// comment; it shipped no test, so "the seed governs the init" has been prose
 /// since. The number usually quoted for what is left - 409 043 differing
 /// values, ~4% of the model - appears ONLY in docs/protocols/AB-PROTOCOL.md:93 and
-/// docs/PLAN-2026-09-29.md:198. It was never measured in a test, and a reader
+/// docs/archive/architecture/PLAN-2026-09-29.md:198. It was never measured in a test, and a reader
 /// has no way to check it. This test is the measurement, and it runs on CPU in
 /// seconds.
 ///
