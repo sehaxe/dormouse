@@ -9,7 +9,7 @@
 //!
 //! The blocker is that a burn tensor's buffer is a cubecl `Handle`, not a
 //! device pointer, and cubecl-runtime 0.11.0-pre.4 has no client API that
-//! resolves one (docs/research/2026-09-27-cublas-integration-poc-renamed.md has the patch
+//! resolves one (docs/research/2026-09-27-cublas-integration-poc.md has the patch
 //! and the measured zero-copy result). This probe measures what the UNBLOCKED
 //! version can do, which is what decides whether the patch is worth its risk:
 //!
@@ -26,7 +26,7 @@
 //! Run: cargo run --release -p cublas-poc
 //!
 //! Section 4 (zero-copy on cubecl's own stream) needs the ~110-line cubecl
-//! patch in docs/research/2026-09-27-cublas-integration-poc-renamed.md, which is
+//! patch in docs/research/2026-09-27-cublas-integration-poc.md, which is
 //! deliberately NOT in the tree, so it is behind the off-by-default
 //! `cublas-native` feature: `cargo run --release -p cublas-poc --features
 //! cublas-native`. Sections 0-3 need no patch and run either way.
@@ -93,7 +93,7 @@ mod poc {
         /// Only the patched zero-copy variant needs this: re-pointing cuBLAS at
         /// cubecl's own stream is the whole reason for the pointer patch. Kept
         /// here (and in `on_stream`) so the patched build of this probe is a
-        /// one-line change - docs/research/2026-09-27-cublas-integration-poc-renamed.md.
+        /// one-line change - docs/research/2026-09-27-cublas-integration-poc.md.
         #[allow(dead_code)]
         set_stream: unsafe extern "C" fn(*mut c_void, CUstream) -> c_int,
         destroy: unsafe extern "C" fn(*mut c_void) -> c_int,
@@ -811,7 +811,7 @@ fn main() {
     eprintln!(
         "cublas-poc: sections 0-3 measured without any patch.\n\
          Section 4 (zero-copy on cubecl's stream) needs the cubecl patch in \
-         docs/research/2026-09-27-cublas-integration-poc-renamed.md:\n\
+         docs/research/2026-09-27-cublas-integration-poc.md:\n\
          cargo run --release -p cublas-poc --features cublas-native"
     );
 }
