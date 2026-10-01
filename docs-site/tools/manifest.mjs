@@ -300,6 +300,7 @@ export const pages = [
 	// numbers, every figure carried with its source.
 	{ src: 'docs/guides/train-your-first.md', out: 'tooling/train-your-first', title: 'Train your first model', nav: 'First run' },
 	{ src: 'docs/guides/determinism.md', out: 'tooling/determinism', title: 'Determinism: why --seed was the easy part', nav: 'Determinism' },
+	{ src: 'docs/guides/ab-testing.md', out: 'tooling/ab-testing', title: 'A/B testing: how an arm is judged here', nav: 'A/B testing' },
 ];
 
 // Everything the manifest does not enumerate, discovered and ordered here.
