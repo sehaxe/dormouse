@@ -244,6 +244,25 @@ file and cannot fail that way; the script now asserts
 of the shape `.bulba/memory.md` keeps collecting: an instrument that cannot
 distinguish success from failure, including one written to prove a gate works.
 
+### 5d. Regression: the whole burn-gdn2 CPU cell is green, including the two that were red
+
+`0e9817b` recorded `tools/lib_gate.sh` RED on burn-gdn2 with two named tests
+belonging to "whoever owns burn-gdn2's f64 oracle". Both are green on this
+branch, and neither is mine:
+
+```
+cargo test -p burn-gdn2 --features binary-tests,autodiff
+  41 passed / 0 failed across 12 binaries
+  oracle_breadth::gdn2_1000_cases_match_the_f64_oracle   ok   (was red on 0e9817b)
+  oracle_chunk::chunk_sizes_match_the_f64_oracle         ok   (was red on 0e9817b)
+  autodiff_bwd_f64 (5) including two_chunks_...           ok
+  fused_adjoint_f64  CUDA-gated, not run here
+```
+
+`859f350` is why: it regenerated `ref_f64_broad.bin`, the stale fixture that
+made the 1000-case sweep red. So the cell's two reds closed in a commit that is
+already on main, and the only thing missing was a run after it.
+
 ## 6. Status of the brief's items 4 and 5 (the path and the prize)
 
 Not started, and deliberately: **item 4 (enable the fused path in the trainer)
