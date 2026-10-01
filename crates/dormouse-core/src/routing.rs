@@ -48,15 +48,29 @@ pub enum Group {
 }
 
 impl Group {
+    /// Every group a trainer must be able to serve. The set is CLOSED: the
+    /// array's length is the count the enum claims, so adding a [`Group`]
+    /// variant does not compile until the trainer is taught to serve it.
     pub const ALL: [Group; 4] = [Group::Muon, Group::QkHeadWise, Group::Table, Group::Rest];
 }
 
 /// Parameter count per group, for the startup banner and the tests.
+///
+/// A count of 0 is a finding, not a formatting detail: [`Routing::check`]
+/// refuses to start when the `Table` or `Muon` group is empty, because an empty
+/// group is an arm that silently stopped being built — the shape that produced
+/// a run reporting `muon=0` in its own banner while training everything on
+/// AdamW.
 #[derive(Default, Debug, PartialEq, Eq)]
 pub struct GroupCounts {
+    /// Parameters on Muon+ ColRow with Newton-Schulz (`ns_steps = 8`).
     pub muon: usize,
+    /// Attention Q/K parameters on head-wise Muon+ (report §3.1).
     pub qk: usize,
+    /// n-gram table rows, on plain Adam with weight decay off (report §2.3).
     pub tables: usize,
+    /// Everything else: the base optimizer (`--opt mix` puts 1-D and
+    /// embeddings here, which is Adan/AdamW depending on the flag).
     pub rest: usize,
 }
 
@@ -169,6 +183,9 @@ impl Routing {
         ParamGroup::from_ids(self.groups.get(&group).cloned().unwrap_or_default())
     }
 
+    /// How many parameters this routing declares for `group`. `0` for a group
+    /// nobody claimed anything for, which [`Routing::check`] treats as a
+    /// startup error for `Table` and `Muon`.
     pub fn count(&self, group: Group) -> usize {
         self.groups.get(&group).map_or(0, Vec::len)
     }
@@ -234,7 +251,25 @@ impl Routing {
 }
 
 /// A module that declares where its parameters train.
+///
+/// Implementors push into the [`Routing`] they are handed: each claims the
+/// parameters that need a non-default optimizer, then declares the remainder
+/// of its own subtree as [`Group::Rest`]. That last part is the load-bearing
+/// half — a new parameter added inside an existing arm is TRAINED (by the base
+/// optimizer) and CHECKED, never invisible.
+///
+/// `factors_fallback` is the `--factors-fallback` switch: when set, the expert
+/// TSCT `u`/`v` factors drop out of the Muon+ group and go to the fallback
+/// optimizer, which is the A/B for whether the factors belong in Muon+ at all.
+///
+/// Note this trait is the ID-based DECLARATION. The policy that actually runs
+/// is the path-marker implementation in `dormouse-train/src/optim.rs`, and
+/// they agree today; until that is reconciled, say which one you mean
+/// (AGENTS.md §3.3).
 pub trait Routed {
+    /// Declare this subtree's parameters into `into`. Called once per module
+    /// tree at startup; must be total (every parameter in exactly one group),
+    /// which [`Routing::check`] then asserts against the live model.
     fn route(&self, into: &mut Routing, factors_fallback: bool);
 }
 

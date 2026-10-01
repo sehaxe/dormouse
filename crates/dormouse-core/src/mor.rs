@@ -23,6 +23,11 @@
 use burn::tensor::activation::softplus;
 use burn::tensor::{Int, Tensor};
 
+/// The shared linear router, re-exported from `burn-mor` (arXiv 2507.10524).
+///
+/// Re-exported so `loop_block.rs` and the routing declaration can name it
+/// without depending on the vendored crate directly — the mechanism lives in
+/// the library, this module is the wiring.
 pub use burn_mor::MoRRouter;
 
 /// Effective `k`: never below 1 (ingredient 3), never above the number of

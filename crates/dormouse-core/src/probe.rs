@@ -10,6 +10,33 @@
 //! Plain integers, incremented at the branch, thread-local so a parallel test
 //! run cannot cross-contaminate. No device tensor, no sync, no abstraction
 //! layer: `note` at the branch, `count` in the test.
+//!
+//! # The rule this module exists to enforce
+//!
+//! **Count on the host, at the branch, where the decision was made.** Every
+//! constant below is bumped where an arm is actually TAKEN or an objective
+//! actually ADDED — never where it is declared, and never built from a bool on
+//! the device. `probe::JEPA` is the counter that was bumped nowhere, so
+//! `jepa_weight` read like an objective while contributing nothing, with a
+//! perfectly healthy loss curve. That is the whole failure mode this module is
+//! the instrument for.
+//!
+//! # What a reader is meant to do with a zero
+//!
+//! A zero is not "fast" and not "off" — it is **the arm did not run**, and it
+//! is only distinguishable from "off" by pairing it with the config. That is
+//! why several arms come in pairs (`FUTURE_BYTE` vs `FUTURE_BYTE_ASKED`,
+//! `RETRACT_FACTOR` vs `RETRACT_BATCHED`, `MOE_LB` vs `MOE_ROUTE`) and why
+//! [`counts`] returns zeroed entries rather than only the arms that fired: a
+//! printout that hides the zeros is a printout that cannot report a dead arm.
+//!
+//! # Cost
+//!
+//! One thread-local increment per arm entry. On the trainer's single-threaded
+//! step loop that is a handful of host instructions per iteration — no device
+//! work, no synchronization (§1.3). It is deliberately not free-proof: the
+//! counters are read at the trainer's declared cadence (log/eval steps), never
+//! per step.
 
 use std::cell::Cell;
 
@@ -83,7 +110,16 @@ pub const MOE_ROUTE: usize = 16;
 /// therefore exactly the collapse this arm must be able to see: a selection
 /// with no balancer behind it.
 pub const MOE_LB: usize = 17;
+/// SiTU-GLU (arXiv:2607.24653v2 Eq 12) ran in the expert FFN instead of
+/// SwiGLU. One entry per executed iteration. COUNTED for the reason every
+/// other arm here is: `use_situ` is a config flag, and a run whose log named
+/// it while the elementwise `silu` actually ran would look entirely healthy.
+/// A ZERO here with `use_situ = true` means the arm did not run.
 pub const SITU: usize = 18;
+/// How many arms [`NAMES`] and the counter array hold. **Adding an arm means
+/// bumping this**, and the array is `[Cell<u64>; N_ARMS]`, so the compiler
+/// refuses a `NAMES` entry that does not fit — an arm cannot be named without
+/// being countable.
 pub const N_ARMS: usize = 19;
 /// Arm name per index, for assertion messages that name the thing.
 pub const NAMES: [&str; N_ARMS] = [
