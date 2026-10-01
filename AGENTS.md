@@ -638,8 +638,15 @@ The defenses are installed, not optional.
   learning (ADR-0013).
 - **Every aux-vs-pure-CE A/B conclusion before 2026-09-27.** The EMA teacher was
   being fed the label sequence, so the JEPA target was wrong in every run since
-  the aux heads shipped. DSpark's window tokens have the same one-position shift
-  and are **not** fixed — named, not silently carried.
+  the aux heads shipped. DSpark's window shift **is** fixed (§3.3, 2026-09-29);
+  verify-tails then found two more defects in the same expression, both fixed
+  with gates (`research/reviews/verify-tails-2026-09-30.md`): `dspark_loss` did
+  not **detach** the confidence target (the acceptance head back-propagated
+  into its own target — DeepSeek's rule is a detached `c*`), and the BCE was
+  spelled as the usual `log(σ)+log(1−σ)` pair while the correct stable form is
+  `c·(−softplus(−z)) + (1−c)·(−softplus(z))`; the original gradient fixture had
+  **no gradients at all** (asserted on zero tensors). Post-fix verdict that
+  stands: JEPA+KoLeo beats pure CE 3/3 seeds (`d8062d1`).
 - **The `max_ortho` fallback story before 2026-09-04**: the fp32 fallback fired
   on every fresh run, so no pre-fix run actually used the factor-quant forward.
 - **The 2026-09-27 `--no-kda` 956 → 188 ms ablation**: measured alongside a live
