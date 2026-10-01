@@ -435,10 +435,13 @@ D=/mnt/e43497ab-0ff2-45b4-b45f-28de3339a53e/aria_data/pretrain
 # carries the autotuner's own candidate benchmarking.
 ```
 
-Four probe tests, each owning one thing: `launch_counter_counts_every_launch`
+Five probe tests, each owning one thing: `launch_counter_counts_every_launch`
 (the instrument against itself), `one_graph_every_step_is_reported_not_asserted`
 (the divergence, reported with a computed oracle),
 `recapturing_needs_the_old_graph_destroyed_and_a_fresh_prepare` (the lifecycle
-contract, both refusals), and
+contract, both refusals),
 `a_pinned_parameter_is_address_stable_and_costs_one_copy` (the escape that works,
-and its price).
+and its price), and `a_replay_costs_one_dispatch_not_n_launches` (the host/device
+cost split). 5 passed, 0 failed, on this card, 2026-10-01.
+
+`graph.rs` is the regression: 5 passed, 0 failed, unchanged by the counter.
