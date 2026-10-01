@@ -4,5 +4,11 @@
 checkpoints/
 /runs/
 target/
-graphify-out/cache/
 __pycache__/
+
+# Tool output, not source. `.playwright-mcp/` is the browser-MCP session log
+# (console-*.log, page-*.yml) and `graphify-out/` is the knowledge graph the
+# graphify skill writes. Both were tracked once: a tracked file is unaffected by
+# .gitignore, so the rule below only bites after `git rm --cached`.
+.playwright-mcp/
+graphify-out/
