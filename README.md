@@ -30,6 +30,22 @@ verdict and the artifact are both named.
 16 GB (sm_120, consumer Blackwell, 170 SM, 1792 GB/s), 62 GB RAM, Linux,
 rustc 1.98.1, burn 0.22.0-pre.4 + vendored cubecl.
 
+### (0) Newest first — 2026-10-01
+
+| what | number / state | provenance |
+|---|---|---|
+| **First A/B verdict in project history** | **JEPA+KoLeo beats pure CE 3/3 seeds** — control mean 6.343 vs pure-CE 6.425 held-out BPB, full seed separation | 2k steps, batch 8 s512, `d8062d1`; rows in [`benches/history.tsv`](benches/history.tsv). The aux heads stay ON at 0.05/0.1 |
+| Seed spread of the control family | 2k-step finals **6.314 / 6.329 / 6.387 / 6.396 / 6.437 / 6.443** across 7 runs — spread ~0.13, so a single arm-vs-control pair decides nothing (§1.2) | same shape; every run's config snapshot in `checkpoints/` |
+| **100k official run** | **in flight**: step ~92k/100k at ~500 ms/step, best held-out **5.615** (over an **81 920 B** window), train best 2.415, 0 NaN, `--retract-every 4` | `~/logs/first_run_100000_1001_0202.log`; final row lands in `benches/history.tsv` |
+| Six mechanism arms landed, all with gates, all OFF by default | MHC (hyper-connections), SiTU-GLU (Kimi K3), RoPE-in-KDA, MoE top-1 (4 experts), AttnRes (arXiv 2603.15031), future-byte aux — **the 3-seed A/B wave is running today** | one landing commit each, `probe.rs` counts 19 arms |
+| KDA gradient question **closed** | all 11 KDA parameter groups receive non-zero, finite gradients on the trainer's backend; CPU NdArray and CUDA agree bit-for-bit on the ops path | `d8fa449`, `tests/kda_param_grads_cuda.rs`; falsified by a `detach()` at `cuda_dispatch.rs:449` killing 8/11 groups |
+| The "fused adjoint is wrong" finding **dissolved** | the old gates measured ONE chunk against a reference fixed the same day (a double-`exp` in the generator); both fixtures (1-chunk + 2-chunk, all 7 gradients, oracle error 2.3e-12) now sit behind one gate, and the gate demonstrably detects the injected fault (rel 1.000) | `research/reviews/kda-adjoint-2026-10-01.md`, `tools/falsify_fused_adjoint.sh` |
+| CUDA graph capture mechanism **proven** | captured-step replay is bit-exact over 8 replays, **0 kernel launches across 8 replays**, price = 1 launch per parameter per step; the pin is MANDATORY — a captured step without it reads stale pointers silently ("got −3, correct −6") | `vendor/cubecl-fix/cubecl-cuda/tests/graph_step.rs`; trainer integration in flight |
+| burn-spectral formula audit (first ever) | findings 1–5 landed: three class-A comment defects with gates, two class-B failure modes; 6-mutant falsifier all-DETECTED; python oracles `tests/oracle/` | `a438c91`, `research/reviews/spectral-audit-2026-10-01.md` |
+
+Everything below was written before this subsection and is kept because it is
+still true; where the two disagree, this subsection wins.
+
 ### (a) What is measured
 
 | claim | number | when / shape / how |
@@ -67,15 +83,18 @@ rustc 1.98.1, burn 0.22.0-pre.4 + vendored cubecl.
   value is a hand-copy that moves with the bug, 9 that silently skip or panic
   before asserting, 1 permanently unrunnable, 14 CUDA-executing on a runner that
   does not exist). Same audit, §3.
-- **No mechanism in the model has an A/B verdict.** The protocol requires
-  3 seeds per arm at 2000 steps ([`docs/AB-PROTOCOL.md`](docs/AB-PROTOCOL.md));
-  the queue is written down and unrun, and **its per-arm cost is unknown**:
-  the 1.6 s/step it was budgeted at came from a run whose attention backward
-  did not execute, and the 25.8 s/step that would replace it has no committed
-  log (both struck in `benches/history.tsv`). What *is* measured, at the queue's
-  own shape, is a 1068 ms warm step (`tools/mor_ab.sh` preflight, 2026-09-29) —
-  also with `fused kda=64/0`, so also a floor. Every warm number on record is
-  a floor until the attention backward runs once. The Engram arm — 2.4 M memory parameters,
+- **Exactly one mechanism has an A/B verdict — the aux heads (2026-10-01).**
+  JEPA+KoLeo at 0.05 beats pure CE **3/3 seeds** with full separation (control
+  mean 6.343 vs 6.425, `d8062d1`). The verdict required re-baselining first:
+  every run before `8fa5d4c`'s fix had an attention arm frozen at
+  initialisation, and the Engram arm's only comparison was scored by a
+  memory-disabled eval (`7adda92`) — §(a)'s retraction table has both. The six
+  arms landed 2026-09-30/10-01 (MHC, SiTU, RoPE, MoE, AttnRes, future-byte) are
+  in the queue **today**, 3 seeds × 2k steps each, and per
+  [`docs/AB-PROTOCOL.md`](docs/AB-PROTOCOL.md) **a tie deletes the mechanism**.
+  The protocol's old cost line (2.7 GPU-h/arm) is void; at the measured
+  ~500 ms/step a 2k-step run is ~17 min, so an arm is ~1 GPU-h.
+  The Engram arm — 2.4 M memory parameters,
   24 % of `small`, on by default in every preset — **was** compared to
   `--no-engram` once, and the comparison is void: the eval threw the n-gram
   keys away on the in-VRAM path (`7adda92`), so the Engram run's held-out 6.453
@@ -98,9 +117,18 @@ rustc 1.98.1, burn 0.22.0-pre.4 + vendored cubecl.
   with attention frozen at initialisation, and **the fused forward made
   attention look nearly free (+22 ms) precisely because it was doing no
   backward work.** The fix makes the op decline (`fused kda=0/0` in a training
-  pass) and lets burn build the graph; it is verified to compile and **not
-  verified to train** — `DM_GDN2_BWD_TRACE=1` should print `ENTERED` on
-  `ChunkWy::backward` and that line has not been seen yet.
+  pass) and lets burn build the graph. **The gradient question is now closed**
+  (`d8fa449`, `tests/kda_param_grads_cuda.rs`): all 11 KDA parameter groups
+  receive non-zero, finite gradients on the trainer's backend; CPU NdArray and
+  CUDA agree bit-for-bit on the ops path; the falsification is a one-line
+  `detach()` that kills 8/11 groups *and names them*. The separate claim that
+  the fused **adjoint** was numerically wrong dissolved the same way a
+  retraction should: the old gate compared one chunk against a reference whose
+  generator had a double-`exp` — fixed the same day, regenerated at 2.3e-12,
+  and both chunk fixtures now sit behind one gate that demonstrably detects the
+  injected fault (`research/reviews/kda-adjoint-2026-10-01.md`). The trainer
+  *declining* the fused op under checkpointing is correct behaviour, not a
+  fallback — a fused path that skips backward work is a different program.
 - **No fused multi-head attention exists in this stack at all.** dormouse's only
   attention arm is the gated-delta recurrence; `burn-cubecl` 0.22.0-pre.4 ships
   no fused attention kernel. Where PyTorch has one (mem-efficient, 0.656 ms at
@@ -251,12 +279,17 @@ Four blockers, all measured or code-verified:
    is now measured rather than inferred: what dominates is the number of
    launches, not FLOPs. The
    lever that attacks launches directly is **CUDA graph capture/replay**,
-   confirmed working on this GPU (`vendor/cubecl-fix/cubecl-cuda/tests/graph.rs`,
-   5/5). A seam that captures the optimizer + retraction tail and replays it is
-   built and compiles; **it is not yet measured, and the in-place parameter
-   update inside a replay is exactly the part that has to be proven.** A capture
-   window refuses reads, syncs and profiles, so a step that reads the loss
-   scalar for the NaN firewall runs ungraphed by construction.
+   confirmed working on this GPU, and the mechanism is now **proven, not just
+   compiled**: a captured *step* replayed 8 times is bit-exact with **zero
+   kernel launches**, at the price of one launch per parameter per step to
+   re-pin — and the pin is mandatory, because a captured step over an
+   out-of-place optimizer reads stale pointers and returns plausible garbage
+   (`vendor/cubecl-fix/cubecl-cuda/tests/graph_step.rs`, the "−3 vs −6"
+   fixture). The trainer wiring (whole-compute-span capture on non-log steps,
+   loss read outside the window) is in flight; the decisive number is **L**,
+   launches per warm step (now printed on the timer line as
+   `cubecl_launches()`): L > ~200 means the graph is the step, L < ~200 means
+   it is not worth the complexity.
 4. **The model is too small to use the card.** ~19.8 K tok/s at batch 32 is
    close to what this card does on a 9.2 M-parameter model at all. The ceiling is
    model size and launch count together, and neither is fixed by making the code
@@ -353,6 +386,39 @@ One sentence per mechanism, and why it is there:
   checkpoint is refused at load rather than silently reshaped.
 
 ---
+
+## The vendored kernel library (burn-fused)
+
+Every mechanism that is not the model lives in
+[`vendor/burn-fused/crates/`](vendor/burn-fused/crates) — 20 crates of our own
+technology library, each with its paper reference and its own verification
+tier ([`docs/ORACLE-TIERS.tsv`](docs/ORACLE-TIERS.tsv)). They are **not**
+dependencies of burn; the repo also vendors patched forks of five cubecl/cubek
+crates (`[patch.crates-io]` in the root `Cargo.toml` — the only authority for
+the count).
+
+| crate | what it is |
+|---|---|
+| `burn-kda` | Kimi Delta Attention — data-dependent write strength, channel-wise decay (Kimi Linear + K3), fused CUDA chunk path |
+| `burn-gdn2` | Gated DeltaNet 2 — linear recurrent token mixer, channel-wise erase/write gates |
+| `burn-spectral` | Ternary Spectral Compact Training — BitNet-style ternary SVD weights, rank-1 ternary MoE routing; the NS quintic + basin gates |
+| `burn-sct` | Spectral Compact Training — permanent truncated SVD with Stiefel QR retraction (not in the build; delete-or-keep pending) |
+| `burn-muon-plus` | Muon+ optimizer — NS polar orthogonalization + post-polar ColRow normalization, hybrid AdamW fallback |
+| `burn-rmsnorm` | RMSNorm with a fused CUDA kernel (first real launch 2026-09-30, `34c5631`) |
+| `burn-situ` | SiTU-GLU activation — Sigmoid-Tanh Unit gated linear (Kimi K3's stability choice) |
+| `burn-swiglu` | SiLU-gated linear (the reference FFN the SiTU arm replaces) |
+| `burn-rope` | Rotary position embeddings with YaRN extrapolation |
+| `burn-mhc` | Manifold-constrained hyper-connections — multi-branch residual with identity preservation (DeepSeek) |
+| `burn-attnres` | Attention residuals — learned depth-wise attention over layer outputs (arXiv 2603.15031) |
+| `burn-mor` | Mixture-of-Recursions routing (recursion-slot ranking) |
+| `burn-engram` | Conditional memory — n-gram hash embeddings with multi-head gated fusion (the Engram arm) |
+| `burn-jepa` | data2vec 2.0-style EMA teacher + masked latent prediction (the JEPA aux) |
+| `burn-dspark` | DSpark speculative decoding draft head (DeepSeek, arXiv 2607.05147) |
+| `burn-bitnet` | BitNet quantization family — ternary, 8/4-bit absmax/absmean, Fast Walsh-Hadamard rotation |
+| `burn-eggroll` | EGGROLL — low-rank evolutionary strategies (arXiv 2511.16652) |
+| `burn-es` | Evolution strategies |
+| `burn-parcae` | Stable looping via spectral retention |
+| `burn-ptrn` | Probabilistic Tiny Recursive Model — test-time scaling for recursive models |
 
 ## Presets
 
@@ -613,6 +679,24 @@ advertises it (`crates/dormouse-cli/src/bin/train.rs:114`).
   `vendor/burn-fused/tools/gpu-gate.sh`.
 
 ---
+
+## Tooling
+
+Everything operational lives in [`tools/`](tools) — these are the programs a
+reader of the logs will eventually need:
+
+| tool | what it does |
+|---|---|
+| [`tools/first_run.sh`](tools/first_run.sh) | one-command training launch: preset + flags, checkpoint name derived from the flags, log to `~/logs/` (persistent — `/tmp` is a 32 GB tmpfs that dies on reboot and once ate a 33.5 GB sidecar) |
+| [`tools/trainboard.py`](tools/trainboard.py) | plots any run log (loss, held-out BPB, step-time stack, throughput) to a static HTML board; `--follow` tails a live run |
+| [`tools/wt.sh`](tools/wt.sh) | one task per git worktree (ADR-0022) — `wt.sh new <lane>` branches from a compiling commit; a shared checkout makes `cargo test` a lottery |
+| [`tools/build_lock.sh`](tools/build_lock.sh) | serializes every cargo invocation across agents and worktrees; builds count as heavy work (§1.5) |
+| [`tools/determinism.py`](tools/determinism.py) + `tools/determinism/` | the cross-process seed harness: two independent tensor-level instruments; same seed → non-TSCT slots bit-identical across processes (7 951 694/7 951 694), different seed → relFro 1.414, separation ~10⁶ |
+| `tests/oracle/*.py` | standalone python oracles for the spectral math (central differences, basin checks, guard discrimination) — run without Rust |
+| [`tools/falsify_fused_adjoint.sh`](tools/falsify_fused_adjoint.sh) | 6 injected mutants, all DETECTED on their own assertion, byte-identical restore — the gate-testing-the-gate pattern |
+| [`tools/oracle_gate.py`](tools/oracle_gate.py) + [`docs/ORACLE-TIERS.tsv`](docs/ORACLE-TIERS.tsv) | per-crate verification tier register; hand-edited only — the generator destroyed 22 rows once |
+| [`tools/spot_check.py`](tools/spot_check.py) | claims-vs-artifact spot checks over the docs |
+| `crates/dormouse-data/src/bin/anchors.rs` | the 5-gram bar; `--fit` scores the bar on the model's own eval file — the only comparable way |
 
 ## Data pipeline
 

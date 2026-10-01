@@ -1280,6 +1280,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "burn-mhc"
+version = "0.2.0"
+dependencies = [
+ "burn",
+ "burn-tensor",
+]
+
+[[package]]
 name = "burn-mor"
 version = "0.1.1"
 dependencies = [
@@ -2885,6 +2893,7 @@ dependencies = [
  "burn-gdn2",
  "burn-jepa",
  "burn-kda",
+ "burn-mhc",
  "burn-mor",
  "burn-nn",
  "burn-rmsnorm",
