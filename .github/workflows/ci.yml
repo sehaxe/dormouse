@@ -46,24 +46,31 @@ jobs:
   # measured on this box, rustc/rustfmt/clippy 1.98.1, 2026-10-01 (full list:
   # docs/reviews/ci-quality-2026-10-01.md):
   #
-  #   fmt     651 hunks across 54 files in the four crates (`cargo fmt -p ...`)
+  #   fmt     629 hunks across 54 files in the four crates (`cargo fmt -p ...`)
   #   clippy  114 unique diagnostics: 18 clippy lints + 4 rustc lints
   #
-  # `continue-on-error: true` on both, and that is the finding, not a hedge. A
-  # gate that is red on its first run and stays red until 651 formatting hunks
-  # are fixed is a gate nobody reads — the exact decoration AGENTS.md §1.1
-  # calls a defect and fused-library.yml's header calls "a decoration with a
-  # status light". The number is the deliverable; the fix is `cargo fmt` and a
+  # `continue-on-error: true`, and that is the finding, not a hedge. A gate
+  # that is red on its first run and stays red until 629 formatting hunks are
+  # fixed is a gate nobody reads — the exact decoration AGENTS.md §1.1 calls a
+  # defect and fused-library.yml's header calls "a decoration with a status
+  # light". The number is the deliverable; the fix is `cargo fmt` and a
   # `clippy --fix` pass, both of which are mechanical and belong in their own
   # commits, not folded into a CI change.
   #
+  # `continue-on-error` is on the JOB, not on the steps, and that placement is
+  # load-bearing. Measured on run 36866436388 (2026-10-01): with it on the
+  # steps, GitHub reported BOTH failing steps as `conclusion: success` — a
+  # green tick beside a red gate, which is the decoration the paragraph above
+  # claims to be avoiding. On the job, each step keeps its own `failure` and
+  # the run is not blocked. Same shape as the `cuda-compile` job above.
+  #
   # TO CLOSE fmt: run `cargo fmt -p dormouse-core -p dormouse-data
   # -p dormouse-train -p dormouse-cli` in one commit and delete
-  # `continue-on-error` on that step.
+  # `continue-on-error` on this JOB.
   # TO CLOSE clippy: same, with `cargo clippy --fix`, then work the 24 the
   # autofixer cannot (the ones with a per-file list in the findings file).
   lint:
-    name: "core :: rustfmt + clippy (measured 2026-10-01: 651 fmt hunks, 114 clippy diagnostics)"
+    name: "core :: rustfmt + clippy (measured 2026-10-01: 629 fmt hunks, 114 clippy diagnostics)"
     runs-on: ubuntu-latest
     timeout-minutes: 60
     continue-on-error: true
@@ -80,11 +87,9 @@ jobs:
         # their own gate (fused-library.yml) and upstream's formatting is
         # deliberately preserved (.editorconfig). Naming the crates here keeps
         # this job's number about this repo's code.
-        continue-on-error: true
         run: |
           cargo fmt -p dormouse-core -p dormouse-data -p dormouse-train -p dormouse-cli -- --check
       - name: clippy
-        continue-on-error: true
         run: |
           cargo clippy -p dormouse-core -p dormouse-data -p dormouse-train -p dormouse-cli --all-targets -- -D warnings
 
@@ -168,7 +173,6 @@ jobs:
       # vendor/dormouse-fused's 20 crates and their benches, which are a separate
       # workspace with their own workflow.
       - name: unused dependencies
-        continue-on-error: true
         run: cargo machete crates/
 
   # ── 4. coverage ────────────────────────────────────────────────────────────
