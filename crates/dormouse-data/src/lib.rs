@@ -13,8 +13,6 @@
 //!   ever-growing buffer).
 //! - File order is shuffled with a seeded Fisher-Yates (no external RNG dep);
 //!   the order is reshuffled every epoch for cheap cross-epoch diversity.
-//! - [`train_eval_split`] returns a stable held-out tail so eval sees unseen
-//!   data.
 //!
 //! # The contracts a caller must not break
 //!
@@ -185,21 +183,6 @@ fn shuffle_files(files: &mut [PathBuf], mut seed: u64) {
         let r = (s ^ (s >> 31)) % (i as u64 + 1);
         files.swap(i, r as usize);
     }
-}
-
-/// Split collected files into `(train, eval)` by a deterministic held-out
-/// fraction taken from the sorted list's tail (stable across runs).
-pub fn train_eval_split(root: &Path, eval_frac: f64) -> (Vec<PathBuf>, Vec<PathBuf>) {
-    let mut files = collect_files(root);
-    if files.is_empty() {
-        return (files, Vec::new());
-    }
-    let eval_n = ((files.len() as f64 * eval_frac.clamp(0.0, 1.0)) as usize)
-        .max(1)
-        .min(files.len() - 1);
-    let split_at = files.len() - eval_n;
-    let eval = files.split_off(split_at);
-    (files, eval)
 }
 
 /// A bounded-memory stream of raw bytes, reshuffled per epoch.

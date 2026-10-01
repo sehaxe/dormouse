@@ -202,16 +202,20 @@ open gap (ADR-0021 item 7).
 
 ### Recovery
 
-Two independent mechanisms, and the difference matters:
+One mechanism, in-process, and the difference from the deleted wrapper matters:
 
-- the **NaN firewall** is in-process and per step: a non-finite loss is masked to
+- the **NaN firewall** is per step: a non-finite loss is masked to
   0 *on device* and every non-finite gradient is zeroed on device, so the step
   becomes a no-op with no host synchronization. The host learns a step was
   masked from the gradient norm it already reads at log cadence. More than 8 in
   one log window is a hard stop.
-- **guard** (`--guard`) is the process-level recovery: on NaN loss or panic, wait
-  30 s, re-exec from a pinned executable image with a fresh CUDA context, and
-  resume from the last checkpoint.
+
+The old process-level `--guard` wrapper (wait 30 s, re-exec from a pinned
+executable image, resume from the last checkpoint) was removed 2026-10-02: with
+`--detach` its parent exited 0 immediately, so orchestrators read a crashed run
+as a finished one and stacked fifteen runs on one GPU
+(`docs/reviews/unguard-2026-10-02.md`). A persistent failure now stops the run
+with a non-zero exit; the operator resumes with the same `--ckpt-name`.
 
 A step's only stochastic input is the JEPA span mask, a pure function of
 `(seed, step)`. That is what makes an A/B replay and a resume continue the same

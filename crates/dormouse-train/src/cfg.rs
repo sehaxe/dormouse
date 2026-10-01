@@ -17,7 +17,15 @@ pub struct RunCfg {
     /// snapshot.
     #[serde(default)]
     pub source: String,
+    /// The model half, post-merge and post-[`validate`](dormouse_core::config::validate):
+    /// preset + `--set` + the typed flags that name a model field. This is
+    /// half of what a checkpoint snapshot hashes, so a resume that changed it
+    /// is a different run and refuses loudly (ADR-0005/ADR-0021).
     pub model: DormouseConfig,
+    /// The train half: optimizer, cadences, seam switches. Snapshotted with
+    /// the same rule as `model`, except for the progress keys
+    /// (`steps`, `log_every`, `ckpt_every`, `eval`, `eval_every`), which
+    /// `RunCfg::diff_keys` exempts — extending a run is a legal resume.
     pub train: TrainCfg,
 }
 

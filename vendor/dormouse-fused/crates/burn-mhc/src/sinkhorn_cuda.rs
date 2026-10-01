@@ -657,6 +657,13 @@ mod seam_tests {
 #[cfg(all(test, feature = "cuda", feature = "autodiff"))]
 #[ignore = "needs a GPU: cargo test -p burn-mhc --features cuda,autodiff -- --ignored"]
 fn fused_node_carries_a_gradient() {
+    // Imported here, not at the module head: this test is compiled ONLY by
+    // `cargo check --all-targets --features cuda,autodiff` (and never run - it
+    // is `#[ignore]`d for wanting a GPU), which until today was the first
+    // command in this crate's life that ever saw it. At module scope the
+    // import would be an unused-import warning in every other combination.
+    use burn::tensor::{Device, Distribution};
+
     let dev = Device::default();
     let (b, t, n) = (2usize, 4usize, 4usize);
     let iters = crate::SINKHORN_ITERS;

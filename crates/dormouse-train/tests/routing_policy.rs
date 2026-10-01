@@ -176,3 +176,42 @@ fn the_group_build_is_loud_and_reachable() {
     }
     assert!(owned > 0 && rest > 0, "the fixture split {owned} owned / {rest} rest - one side is empty, so the coverage check is half-blind");
 }
+
+/// One walker, one counts type. Both used to be declared twice — a second
+/// `GroupCounts` in `optim.rs` and a second `ModuleVisitor` doing the identical
+/// stack-then-join over the same tree — which is the twin
+/// `docs/reviews/dedup-optimizer-2026-10-01.md` is about.
+///
+/// Asserting the TYPE IDENTITY is the gate, because a re-declaration
+/// compiles silently and every test above would keep passing while the two
+/// copies drift: that is precisely how the path-marker policy survived a whole
+/// refactor with the tests green and the runtime wrong. Re-adding either
+/// declaration in `optim.rs` turns this red.
+#[test]
+fn the_declaration_is_declared_once() {
+    // The same type under both names, so a second `struct GroupCounts` in
+    // `optim.rs` is a compile error at the `use`, not a silent shadow.
+    let _same_counts: fn(&dormouse_core::routing::GroupCounts) -> &dormouse_train::GroupCounts =
+        |c| c;
+    // The same function under both names: two `ModuleVisitor` impls are two
+    // walks, and the second one is free to disagree about which parameters
+    // exist. Equality is decided on the walk, not on the signature.
+    let model = DormouseModel::new(&cfg(), &device());
+    let from_train = param_paths(&model);
+    let from_core = dormouse_core::routing::param_paths(&model);
+    assert_eq!(
+        from_train.len(),
+        from_core.len(),
+        "two module walkers disagree on how many parameters the model has"
+    );
+    for ((p1, i1, r1), (p2, i2, r2)) in from_train.iter().zip(&from_core) {
+        assert_eq!((p1, i1, r1), (p2, i2, r2), "two module walkers disagree on a parameter");
+    }
+    // And the walk still finds the arms, so an empty result cannot make the
+    // equality above vacuously true.
+    assert!(from_core.len() > 10, "the walk returned {} params", from_core.len());
+    assert!(
+        from_core.iter().any(|(_, _, r)| *r == 2) && from_core.iter().any(|(_, _, r)| *r == 1),
+        "no rank-1 parameter: the fixture is not the model this test thinks"
+    );
+}

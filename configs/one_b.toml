@@ -22,10 +22,14 @@ dspark_k = 4
 dspark_stride = 16
 
 # Hashed n-gram memory (Engram), the 2026-09-27 re-enable. 25_000 rows/order x
-# 3 orders x 32 dim = 2.4M memory params; see configs/small.toml for why the
+# 3 orders x 32 dim; each table rounds UP to a power of two, so what is built is
+# 3 x 32 768 x 32 = 3 145 728 memory params. See configs/small.toml for why the
 # budget is the DeepSeek allocation ratio (20-25% of the model) and not the
 # 500K/order that the iso-parameter curve peaks at on a 16x larger backbone.
-# At this preset's width the same 2.4M is 0.2% of the model.
+# This preset's share is NOT measured: this width is behind
+# `cargo test -p dormouse-core --test preset_exec -- --ignored`, which prints
+# it. The rows are the same 3 145 728 every preset pays; the shares measured
+# 2026-10-01 are nano 43.7%, small 34.2%, base 24.1% (docs/guides/presets.md).
 engram_rows = 25000
 engram_orders = [2, 3, 4]
 engram_dim = 32

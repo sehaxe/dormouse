@@ -253,21 +253,34 @@ jobs:
   # rustdoc builds. `broken_intra_doc_links = "deny"` and
   # `invalid_html_tags = "deny"` already live in the root `[workspace.lints.
   # rustdoc]` table and every member opts in with `[lints] workspace = true`,
-  # so this job's real content is not the build - it is that a doc link which
-  # does not resolve is now a BUILD FAILURE anywhere a crate is built, and this
-  # is the job that shows it.
+  # so a doc link which does not resolve is a BUILD FAILURE anywhere a crate
+  # is built, and this is the job that shows it.
   #
-  # dormouse-train is NOT here: it is the heavy crate, it has an active lane,
-  # and adding it is a one-line change when that lane lands. Naming the
-  # omission is the point - a gate that silently covers three of four crates
-  # reads as coverage of four.
+  # RUSTDOCFLAGS, not RUSTFLAGS (2026-10-01, docs wave 2): `-D warnings` must
+  # gate the DOC surface, and RUSTFLAGS would also deny warnings in every
+  # rustc rlib build of the dep graph - dormouse-train's rlib carries 8
+  # pre-existing warnings, 6 of them in `lib.rs`, whose lane is in flight.
+  # When that lane lands and zeroes them, flipping this to RUSTFLAGS is the
+  # follow-up. Until then the 8 warnings are visible (non-fatal) in this
+  # job's log, which is COUNTED, not SILENT.
   #
-  # GREEN on landing 2026-10-01 (`cargo doc --no-deps -p dormouse-core
-  # -p dormouse-data -p dormouse-cli`, rustc 1.98.1): 57 s, exit 0, 7 rustdoc
-  # `missing documentation` warnings from the two lint tables above and nothing
-  # denied. Those warnings are NOT a gate and deliberately so: `missing_docs`
-  # is a style lint, and this repo's docs are in AGENTS.md / docs/ rather than
-  # in per-item rustdoc. See docs/reviews/ci-quality-2026-10-01.md.
+  # `missing_docs` is now DENIED here for every crate whose lib.rs carries
+  # the lint: dormouse-core and dormouse-data do (`#![warn(missing_docs)]`),
+  # so an undocumented pub item in them fails this job. The owner directive
+  # that landed the per-item rustdoc reversed the old "NOT a gate and
+  # deliberately so" policy of ci-quality-2026-10-01 - that rationale is
+  # retired, and the 40 missing_docs it was green through (all in
+  # config/override.rs + config/schema.rs, measured
+  # `RUSTFLAGS="-D warnings" cargo doc -p dormouse-core -p dormouse-train`,
+  # docs/reviews/doc-coverage-wave2-2026-10-01.md §1) are closed.
+  #
+  # dormouse-train IS here now, but its own `missing_docs` is NOT enforced:
+  # the attribute lives in its lib.rs (3 113 lines), whose lane is in
+  # flight, and adding a lint to a file another lane owns is how merge
+  # conflicts are manufactured. Naming the omission is the point - a gate
+  # that silently covers three of four crates' lint surface reads as
+  # coverage of four. Adding the attribute is that lane's one-line
+  # follow-up.
   #
   # NOT HERE: the docs-site build. It is already a job - `build` in
   # docs-site.yml, running `npm ci && npm run ingest && npm run build
@@ -277,7 +290,7 @@ jobs:
   # means a PR that only touches a crate's doc comments runs no docs gate at
   # all, because the filter names docs paths and not `crates/**`.
   docs:
-    name: "docs :: rustdoc for core + data + cli (a doc link that does not resolve is a build failure)"
+    name: "docs :: rustdoc for core + data + train + cli (a doc link that does not resolve, or an undocumented pub item in a crate that carries the lint, is a build failure)"
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -287,7 +300,7 @@ jobs:
       - name: install mold (repo config links through it)
         run: sudo apt-get update && sudo apt-get install -y mold
       - name: rustdoc
-        run: cargo doc --no-deps -p dormouse-core -p dormouse-data -p dormouse-cli
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p dormouse-core -p dormouse-data -p dormouse-train -p dormouse-cli
 
   # ── 6. workflow-lint ───────────────────────────────────────────────────────
   # The fuse for the failure this file has already had once. `ae0505d` is the

@@ -74,7 +74,7 @@ pub use config::{ActQuant, DormouseConfig};
 pub use loop_block::{ExpertFFN, LoopBlock};
 pub use model::DormouseModel;
 pub use param::{LinearLike, TsctDiag};
-pub use routing::{Group, GroupCounts, Role, Routed, Routing};
+pub use routing::{param_paths, Group, GroupCounts, Role, Routed, Routing};
 
 /// FNV-1a 64-bit digest of a byte slice.
 ///

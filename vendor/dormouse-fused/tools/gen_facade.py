@@ -277,7 +277,30 @@ def main() -> int:
         action="store_true",
         help="exit 1 if any generated file is stale (used by CI and by a test)",
     )
+    ap.add_argument(
+        "--cuda-matrix",
+        action="store_true",
+        help="print `<crate> <features>` per line for every member that declares "
+        "`cuda`, and exit - the input to CI job `cuda-compiles`, which used to "
+        "carry a hand-written list of 13 crates",
+    )
     args = ap.parse_args()
+    if args.cuda_matrix:
+        # Why this exists, in one line: the job's list named `burn-mor`, which
+        # does not declare `cuda`, and asked `cuda,autodiff` of four crates
+        # that do not declare `autodiff`. Cargo rejects a feature a package does
+        # not have (it is not the "silent no-op" the old comment claimed), so the
+        # loop died on the fourth crate and the nine behind it were never
+        # checked. Derived from the manifests, it cannot rot.
+        for m in members():
+            if "cuda" not in m["features"]:
+                continue
+            combos = [["cuda"]]
+            if "autodiff" in m["features"]:
+                combos.append(["cuda", "autodiff"])
+            for combo in combos:
+                print(m["name"], ",".join(combo))
+        return 0
     stale = []
     for path, text in wanted().items():
         current = path.read_text() if path.exists() else None

@@ -11,6 +11,12 @@
 //! and fp32 Newton-Schulz, the ~40 s/step case the declaration exists to avoid.
 //! The only count in the log was the marker's own, so nothing said so.
 //!
+//! That copy is GONE (`831e3a0`, 2026-09-28) — grep finds no marker symbol in
+//! the tree. An older note here said the path markers were what ran and that
+//! `routing.rs` was "exercised only by tests"; that was true before the cut
+//! and is false now, in this direction and in every document that repeats it.
+//! `docs/reviews/dedup-optimizer-2026-10-01.md`.
+//!
 //! What is here now:
 //! - [`optimizer_groups`] turns the declaration into the three
 //!   [`ParamGroup`]s the optimizer installs, by id. A rename cannot move a
@@ -54,12 +60,16 @@
 
 use burn::{
     grad_clipping::GradientClippingConfig,
-    module::{Module, ModuleVisitor, Param, ParamGroup},
+    module::{Module, ParamGroup},
     optim::{AdanConfig, AdamConfig, AdamWConfig, LearningRate, Optimizer},
     tensor::{Device, ElementConversion, Tensor},
 };
 use burn_muon_plus::{MuonPlus, MuonPlusConfig, MuonPlusState, NormDir};
 use dormouse_core::routing::{self, Group};
+// Re-exported, not re-declared: core owns this type and its field docs (see
+// `GroupCounts` there), and `lib.rs` re-exports it from this module, so it has
+// to stay public through here.
+pub use dormouse_core::routing::GroupCounts;
 use dormouse_core::DormouseModel;
 use std::sync::atomic::Ordering::Relaxed;
 
@@ -306,11 +316,18 @@ impl Optimizer for HeadWiseMuon {
 /// declaration. This is the only place a group is assembled; the decision of
 /// which group a parameter is in lives in [`routing::group_of`].
 pub struct Installed {
+    /// The low-rank TSCT `u`/`v` factors and the Engram key projections —
+    /// the "small matrices that act as linear maps" group (module docs).
+    /// Muon+ ColRow, NS 8; the group is never empty when the arms exist,
+    /// which `Routing::check` (not this file) refuses loudly.
     pub muon: ParamGroup,
     /// `None` when head-wise Q/K routing is off: those two parameters then
     /// train on the base optimizer, so the group is not installed and must
     /// not be counted.
     pub qk: Option<ParamGroup>,
+    /// The n-gram tables. Plain Adam, weight decay disabled (report §2.3):
+    /// rows are trained by sparse per-key noise, and orthogonalizing a
+    /// lookup table's rows against each other has no meaning.
     pub table: ParamGroup,
 }
 
@@ -433,46 +450,17 @@ pub fn check_installed(
     Ok(counts)
 }
 
-/// Count parameters per optimizer group (Muon+ / head-wise Q/K / Adam tables
-/// / base-optimizer rest), counted off the INSTALLED groups. Used by the
-/// startup banner and the routing tests.
-#[derive(Default, Debug)]
-pub struct GroupCounts {
-    pub muon: usize,
-    pub qk: usize,
-    pub tables: usize,
-    pub rest: usize,
-}
-
-/// Every float param of the live model: `(path, id, rank)`. Paths are for
-/// error messages only - no routing decision is ever made from one.
-#[derive(Default)]
-struct PathCollector {
-    stack: Vec<String>,
-    out: Vec<(String, burn::module::ParamId, usize)>,
-}
-
-impl ModuleVisitor for PathCollector {
-    fn enter_module(&mut self, name: &str, _container: &str) {
-        self.stack.push(name.to_string());
-    }
-    fn exit_module(&mut self, _name: &str, _container: &str) {
-        self.stack.pop();
-    }
-    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<D>>) {
-        self.out.push((self.stack.join("."), param.id, D));
-    }
-}
-
 /// Every float parameter of `model` as `(path, id, rank)`. Paths are for
 /// error messages and for tests that want to say WHICH parameter a group
 /// decision is about - no routing decision is ever made from one, which is
-/// the property the marker table violated.
-pub fn param_paths(model: &DormouseModel) -> Vec<(String, burn::module::ParamId, usize)> {
-    let mut c = PathCollector::default();
-    model.visit(&mut c);
-    c.out
-}
+/// the property the deleted marker table violated.
+///
+/// One collector for the whole repo: it lives in `dormouse-core::routing`,
+/// next to the declaration that walks the same tree, because two
+/// `ModuleVisitor`s doing the identical stack-then-join walk is the twin this
+/// lane was opened to cut. Re-exported rather than reimplemented so a third
+/// walk cannot appear.
+pub use dormouse_core::routing::param_paths;
 
 /// Build the optimizer for `mode`, the pure core of [`build_optim`].
 pub(crate) fn build_optim_mode(model: &DormouseModel, cfg: &TrainCfg, mode: &str) -> Optim {

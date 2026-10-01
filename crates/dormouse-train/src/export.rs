@@ -63,6 +63,13 @@ pub enum DType {
 }
 
 impl DType {
+    /// Parse a `--dtype` string. LOUD on anything else, naming the accepted
+    /// set - an unknown format name must not fall back to f32 and produce a
+    /// file twice the size that looks like the one that was asked for.
+    ///
+    /// The aliases are the union of what the flag's help, the README and the
+    /// trainer's own `--quant` spelling use, so `fp16`/`half`/`float16` all
+    /// reach [`DType::F16`].
     pub fn parse(s: &str) -> Result<Self, String> {
         match s.to_ascii_lowercase().as_str() {
             "f32" | "fp32" | "float32" => Ok(DType::F32),
@@ -72,6 +79,9 @@ impl DType {
         }
     }
 
+    /// Bytes per stored value. The load path's stride: `dims.product() *
+    /// bytes` is where the next tensor starts, so a wrong answer here would
+    /// read every tensor at the wrong offset rather than fail.
     pub fn bytes(self) -> usize {
         match self {
             DType::F32 => 4,
@@ -90,6 +100,11 @@ impl DType {
         }
     }
 
+    /// The inverse of [`DType::narrow`]: stored bits -> `f32`. Exact and
+    /// lossless - widening an f16 or a bf16 always lands on a representable
+    /// f32 - so the exported model is fp32 arithmetic over weights that
+    /// round-tripped through the narrow format. That is the whole reason the
+    /// narrowing happens on the host (module docs, "WHY THE NARROWING").
     pub fn widen(self, bits: u16) -> f32 {
         match self {
             DType::F32 => f32::from_bits(u32::from(bits)),
@@ -121,7 +136,12 @@ impl DType {
 /// file's bytes back to the model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TensorEntry {
+    /// The burn module path, identical to the name the loader matches by —
+    /// and the reason a model's field order is not a file format.
     pub name: String,
+    /// Shape, row-major. The tensor's slice of the payload is
+    /// `dims.product() * dtype.bytes()` long, entries in list order, so this
+    /// plus [`Header::dtype`] is the whole offset arithmetic.
     pub dims: Vec<usize>,
     /// Non-finite values AFTER narrowing. Always 0 in a file that exists -
     /// [`encode`] refuses to write one - so a reader can trust it.
@@ -134,26 +154,43 @@ pub struct TensorEntry {
 pub struct Header {
     /// The magic's version byte, echoed so a reader can report it.
     pub format: u8,
+    /// The one value dtype for the whole file: every tensor is stored in it,
+    /// there is no per-tensor dtype, and the reader widens with
+    /// [`DType::widen`] and nothing else.
     pub dtype: DType,
     /// Where this came from: the checkpoint it was made from, and the step.
     pub source: String,
+    /// The checkpoint step the weights are from. Informational (an export
+    /// never resumes training), but it is what makes two exports of one run
+    /// distinguishable on a machine that has never seen the run.
     pub step: u64,
-    /// Total scalar parameters, and their count in bytes. Both are what a
-    /// stranger checks the download against.
+    /// Total scalar parameters written; the number a stranger checks the
+    /// download's size against (`num_params * dtype.bytes()` ≈ payload).
     pub num_params: u64,
+    /// Distinct tensors, one [`TensorEntry`] each in visit order. The loader
+    /// refuses the file when this list and the model its own `config` builds
+    /// disagree about names or shapes.
     pub num_tensors: usize,
     /// Weights whose magnitude fell below the format's smallest normal and
     /// were flushed to zero. The honest cost of a narrow exponent, counted
     /// rather than assumed.
     pub flushed: u64,
-    /// Largest magnitude in the model, and the smallest non-zero one. The two
-    /// numbers that decide whether f16's exponent range is wide enough.
+    /// Largest magnitude in the model, measured AFTER narrowing (encode
+    /// measures the packed values), so it is the range the file actually
+    /// holds rather than the range the f32 masters held.
     pub max_abs: f32,
+    /// Smallest NON-zero magnitude, same measurement: the number that decides
+    /// whether the format's smallest normal is above real weights (whose
+    /// flush count is [`Header::flushed`]). `0.0` for an all-zero model,
+    /// because there is no non-zero value to report.
     pub min_nonzero_abs: f32,
     /// The full model config, as the preset TOML. The shape travels with the
     /// weights because a reader that has to be told the shape separately can be
     /// told the wrong one.
     pub config: String,
+    /// One entry per tensor, in visit (module-path) order: the map from the
+    /// payload's bytes back to the model. `dormouse export --info` reads the
+    /// header alone and never decompresses the payload to list these.
     pub tensors: Vec<TensorEntry>,
 }
 
@@ -161,14 +198,28 @@ pub struct Header {
 /// the format choice is a claim about numbers, so the numbers ship with it.
 #[derive(Debug, Clone)]
 pub struct Report {
+    /// The stored format, as requested — `encode` never substitutes one (a
+    /// value that does not fit is a loud `Err`, never a silently wider file).
     pub dtype: DType,
+    /// Size of the written file, the numerator for the ratio against
+    /// [`Report::source_bytes`].
     pub file_bytes: u64,
+    /// Total scalars, read back through the header after a full `decode` of
+    /// the just-written bytes — the report is measured on the artifact, not
+    /// on the encoder's intentions.
     pub num_params: u64,
     /// Bytes of the training container this was made from, for the ratio.
     pub source_bytes: u64,
+    /// The header's flush count, repeated so the command's printout does not
+    /// have to re-parse the file it just wrote.
     pub flushed: u64,
+    /// The measured range, the same numbers the header carries.
     pub max_abs: f32,
+    /// Smallest non-zero magnitude after narrowing; `0.0` for an all-zero
+    /// model. Same measurement as [`Header::min_nonzero_abs`].
     pub min_nonzero_abs: f32,
+    /// Where the file landed — printed so the command's last line names the
+    /// artifact and not just its numbers.
     pub path: String,
 }
 

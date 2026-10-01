@@ -42,7 +42,8 @@ cost.
 1. **Every degradation is LOUD, COUNTED, or a defect.** A silent fallback
    usually computes the *right answer*, so the run looks fine and is a year
    slow. Missing data stops the run and is never synthesized; shape mismatches
-   assert; `--guard` is the recovery action, not a substitute for the error.
+   assert; a tripped assertion stops the run for a human — resuming with the
+   same `--ckpt-name` is the recovery action, not a substitute for the error.
    §1.1, and the three marks are the whole taxonomy.
 2. **A bit-for-bit or "verified" claim names its external source.** "Verified
    against the reference" is not a claim. Naming the file, or saying plainly
