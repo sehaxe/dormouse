@@ -9,7 +9,7 @@ host-table update instead of failing, a short read was space-padded, a v1
 sidecar was reported and then discarded, `max_ortho` drift and the drift check
 were the only loud mechanisms.
 
-Decision: NASA P10 Rule 5 (docs/research/2026-09-25-nasa-burn-rust-practices-renamed.md) —
+Decision: NASA P10 Rule 5 (docs/research/2026-09-25-nasa-burn-rust-practices.md) —
 assertion density >= 2 per non-trivial function on average, and every assertion
 failure routes to a named recovery action (the `--guard` checkpoint-and-resume
 is that action; a startup config error is a hard error with the offending path

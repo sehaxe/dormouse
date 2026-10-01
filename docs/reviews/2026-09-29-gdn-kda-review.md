@@ -62,7 +62,7 @@ curve. **The report's premise-refutation is correct.**
 PKM research doc. There is a sixth:
 
 ```
-docs/research/2026-09-27-engram-reenable-renamed.md:19
+docs/research/2026-09-27-engram-reenable.md:19
 ```
 
 On the headline claim — the one this report exists to settle — the file
@@ -456,7 +456,7 @@ sets `num_v_heads`. Nothing in §5.1/§5.3 reaches this — §5.1 lists
 
 ### 11. What would falsify this review
 
-- **`grep -rn "2601.16531" docs/research/2026-09-27-engram-reenable-renamed.md`** returns
+- **`grep -rn "2601.16531" docs/research/2026-09-27-engram-reenable.md`** returns
   nothing → finding 1 in §1 (the missing sixth occurrence) is void; the
   provenance verdict stands regardless.
 - **An `AGENTS.md` history entry showing the `−3`/`+1.0` pair predates

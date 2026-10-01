@@ -636,7 +636,7 @@ the gate before and after every optimization.
 
 **Not** a smoke (a smoke screens NaN and slope; a canary measures step time).
 **Not** the *fake-loss canary* of the adaptive-depth research, which is an
-invariant check on a loss curve (`docs/research/2026-09-27-adaptive-depth-safe-renamed.md`).
+invariant check on a loss curve (`docs/research/2026-09-27-adaptive-depth-safe.md`).
 Two words, two things, one repo.
 
 ### smoke / confirm / long gate

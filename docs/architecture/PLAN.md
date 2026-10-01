@@ -1,6 +1,6 @@
 # dormouse program plan
 
-Started 2026-09-21 from the architecture grill session. Decisions live in `docs/adr/`, shared language lives in `CONTEXT.md`, evidence lives in `docs/research/2026-09-21-per-gb-sota-renamed.md`. Update this file as phases close; do not re-litigate recorded ADRs without new evidence.
+Started 2026-09-21 from the architecture grill session. Decisions live in `docs/adr/`, shared language lives in `CONTEXT.md`, evidence lives in `docs/research/2026-09-21-per-gb-sota.md`. Update this file as phases close; do not re-litigate recorded ADRs without new evidence.
 
 ## ARCHITECTURE v2.1 (2026-09-26, scale-gated completeness — owner directive)
 

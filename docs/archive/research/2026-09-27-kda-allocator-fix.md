@@ -1,7 +1,7 @@
 # KDA at the production shape: the allocator is NOT the cost
 
 Date: 2026-09-27. Subagent deliverable. Companion to (and correction of)
-`docs/research/2026-09-27-kda-sota-ceiling-renamed.md`.
+`docs/research/2026-09-27-kda-sota-ceiling.md`.
 
 > **Step-time caveat, 2026-09-29.** This document's own probe measurements
 > (99 % host dispatch, GPU on 1-20 ms of a 470-635 ms call) are **not** step

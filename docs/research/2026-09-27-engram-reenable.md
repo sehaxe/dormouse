@@ -1,7 +1,7 @@
 # Engram re-enabled at a capacity budget, with a hard floor on the memory
 
 **Date:** 2026-09-27 · **Status:** implementation landed, A/B queued
-**Parent:** `docs/research/2026-09-27-pkm-engram-deepseek-renamed.md` (the mechanism survey
+**Parent:** `docs/research/2026-09-27-pkm-engram-deepseek.md` (the mechanism survey
 this decision is built on) · **Rule:** `docs/protocols/AB-PROTOCOL.md`
 
 ## 1. The decision, in one line

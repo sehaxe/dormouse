@@ -42,7 +42,7 @@ only 0.001, far smaller than the measurement standard deviation (0.008–0.012),
 and is not statistically significant." The repo's "the curve is FLAT from 300K
 to 500K … and says nothing below 300K" is a fair reading. **No cherry-pick.**
 
-The `α`-bucket claim in `docs/research/2026-09-27-pkm-engram-deepseek-renamed.md:147`
+The `α`-bucket claim in `docs/research/2026-09-27-pkm-engram-deepseek.md:147`
 ("α 0.2–0.4 ⇒ loss 3.90, α 0.8–1.0 ⇒ loss 5.28; ~70% of the high-α bucket is
 high-frequency") checks out against the paper's §5.4.2 prose: "Low α (0–0.4)
 positions have loss around 3.9, while high α (0.8–1.0) positions have loss as

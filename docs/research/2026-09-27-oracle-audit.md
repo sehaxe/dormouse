@@ -177,7 +177,7 @@ limits — except that its GPU job has no runner.
 
 ## 4. Cost to raise WEAK → STRONG
 
-Sources taken from `docs/research/2026-09-27-adopt-vs-port-renamed.md` §4 (already opened during
+Sources taken from `docs/research/2026-09-27-adopt-vs-port.md` §4 (already opened during
 that pass) rather than re-derived. Two re-verified by me here via the GitHub trees API.
 
 | rank | crate | cost | the external source that would be the oracle |

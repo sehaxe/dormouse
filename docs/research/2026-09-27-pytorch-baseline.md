@@ -108,7 +108,7 @@ code we wrote.**
 
 Also: our fused kernel reaches **572 GB/s of the 1792 GB/s peak (32% of the memory roofline)**, and
 its best single run (0.790 ms) is 49% of roofline. It is 2.2x off the HBM floor, not 1300x — the
-`docs/research/2026-09-27-kda-sota-ceiling-renamed.md` alarm about a 1300x gap was measuring the **tensor path**,
+`docs/research/2026-09-27-kda-sota-ceiling.md` alarm about a 1300x gap was measuring the **tensor path**,
 not the kernel. The kernel was always fine; the dispatcher was not calling it.
 
 The 11-allocation / 170 MB fused path against 1512 allocations / 420 MB of the tensor path is the
@@ -185,7 +185,7 @@ while another agent ran production `train` jobs and 15-22 concurrent `rustc` pro
 What I can say from the per-op numbers above, without pretending it is a step measurement: the
 trainer ran KDA through the tensor path at **1108.6 + 2519.7 = 3628 ms per call**, at 4 loop
 iterations, which is the same order as the `1445 ms of KDA in an 1810 ms step` recorded in
-`docs/research/2026-09-27-kda-sota-ceiling-renamed.md` — that earlier figure was taken with a warm allocator
+`docs/research/2026-09-27-kda-sota-ceiling.md` — that earlier figure was taken with a warm allocator
 inside a running step, mine is a cold-pool single call, so **treat the two as the same phenomenon
 measured at different pool temperatures, not as a contradiction**. The step-level `--timers`
 fwd/bwd/opt/retr/ema breakdown, and the PyTorch equivalent, remain unmeasured.
