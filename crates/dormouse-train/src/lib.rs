@@ -160,12 +160,14 @@ pub struct TrainCfg {
     pub seed: u64,
     /// Capture the forward+backward window into a CUDA graph and replay it
     /// (see [`graph`]). Off by default: it changes WHICH kernels run (a
-    /// capture refuses an allocation, a read, and a sync, so the steps that do
+    /// capture refuses an allocation, a read and a sync, so the steps that do
     /// any of those run ungraphed), and an A/B of a run that used it is an A/B
-    /// of a different execution, not of a different model. Not in the
-    /// snapshot for the same reason `timers` is not: it does not change what
-    /// is trained, and a resume that turned it on would be comparing two
-    /// execution paths across one step count.
+    /// of a different execution, not of a different model.
+    ///
+    /// IN THE SNAPSHOT (ADR-0021), which is the reason it is: a resume that
+    /// turned the flag on would compare two execution paths across one step
+    /// count, and the flip must reach the drift check rather than sit in the
+    /// command line.
     pub graph_capture: bool,
 }
 

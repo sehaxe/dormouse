@@ -198,7 +198,6 @@ struct PinMapper<'a> {
 
 impl ModuleMapper for PinMapper<'_> {
     fn map_float<const D: usize>(&mut self, param: Param<Tensor<D>>) -> Param<Tensor<D>> {
-        let id = param.id;
         let (id, tensor, mapper) = param.consume();
         match self.action {
             PinAction::Arm => {
@@ -565,7 +564,7 @@ impl Seam {
     }
 }
 
-fn map(mut module: DormouseModel, pins: &mut Pins, action: PinAction) -> DormouseModel {
+fn map(module: DormouseModel, pins: &mut Pins, action: PinAction) -> DormouseModel {
     module.map(&mut PinMapper { action, pins, failed: false })
 }
 

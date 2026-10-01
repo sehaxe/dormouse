@@ -38,8 +38,8 @@
 use std::collections::HashMap;
 
 use burn::{
-    module::{Module, ModuleMapper, ModuleVisitor, Param, ParamId},
-    optim::{AdamWConfig, ModuleOptimizer, Optimizer as _},
+    module::{Module, ModuleVisitor, Param},
+    optim::{AdamWConfig, ModuleOptimizer},
     tensor::{Int, Tensor},
 };
 use dormouse_core::DormouseConfig;
@@ -134,7 +134,6 @@ struct Sanitizer<'a> {
 
 impl ModuleVisitor for Sanitizer<'_> {
     fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<D>>) {
-        let id = param.id;
         // `grad_replace`, not `grad_remove` + a re-insert: `Gradients` has no
         // public `register`, and removing would take the gradient out of the
         // container the SEAM holds.
@@ -143,7 +142,6 @@ impl ModuleVisitor for Sanitizer<'_> {
             let clean = g.mask_fill(finite.bool_not(), 0.0);
             param.val().grad_replace(self.grads, clean);
         }
-        let _ = id;
     }
 }
 
@@ -431,13 +429,14 @@ fn replays_are_bit_identical_to_the_first_replay() {
     assert!(seam.stats.replays >= 1, "{}", seam.report());
     let (final_params, _) = params(&model);
     let (worst, key) = worst_diff(&final_params, &first, &dev);
-    println!("{STEPS - 1} replays vs the first: worst relative difference {worst:.3e} at {key}");
+    let replays = STEPS - 1;
+    println!("{replays} replays vs the first: worst relative difference {worst:.3e} at {key}");
     assert_eq!(
         worst, 0.0,
         "a replay re-runs the recorded kernels against the same buffers, so the parameters after \
-         {SEPS} steps must be BIT-IDENTICAL to the capture step's. A non-zero difference is a \
-         race inside the window (or a pin that did not hold) — the class `burn-spectral` \
-         documents at lib.rs:697-714."
+         {replays} further steps must be BIT-IDENTICAL to the capture step's. A non-zero \
+         difference is a race inside the window (or a pin that did not hold) — the class \
+         `burn-spectral` documents at lib.rs:697-714."
     );
 }
 
@@ -475,7 +474,7 @@ fn a_replay_launches_no_kernels() {
     // counter reads what RAN, and without a drain a launch-bound window would
     // be undercounted. The embedding is read (not written) by every one of
     // these steps, so nothing in the window changes it.
-    let probe: f32 = model.embedding.weight.val()[0][0].into_scalar();
+    let probe: f32 = model.embedding.weight.val().abs().max().into_scalar();
     let before = dormouse_train::cubecl_launches();
     for step in 3..5 {
         let (x, y, h) = batch(step, &dev);
@@ -487,7 +486,7 @@ fn a_replay_launches_no_kernels() {
             .expect("seam step");
     }
     let after = dormouse_train::cubecl_launches();
-    let held: f32 = probe + model.embedding.weight.val()[0][0].into_scalar();
+    let held: f32 = probe + model.embedding.weight.val().abs().max().into_scalar::<f32>();
     println!(
         "2 replayed steps moved the launch counter by {} (the pin's per-step copies + the \
          input feeds are the launches around it); probe {held}",

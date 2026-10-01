@@ -107,7 +107,21 @@ fn copy_into_i32_kernel(src: &[i32], dst: &mut [i32]) {
     }
 }
 
+/// The bare cubecl tensor behind a burn FLOAT tensor.
+///
+/// Separate from [`cube_of_int`] because `try_into_primitive` is bounded on
+/// `K: BackendPrimitive<B>`, so one generic over the kind cannot call it for
+/// both: the four lines are duplicated rather than fought.
 fn cube_of<const D: usize>(t: &Tensor<D>) -> Option<CubeTensor> {
+    type B = burn_cubecl::CubeBackend;
+    let prim = t.clone().try_into_primitive::<B>().ok()?;
+    let c = (&prim as &dyn Any).downcast_ref::<CubeTensor>()?;
+    Some(c.clone())
+}
+
+/// The same downcast for an Int tensor. A graph is fed `x`, the shifted `y` and
+/// the hashed n-gram keys every replay, and those are Int.
+fn cube_of_int<const D: usize>(t: &Tensor<D, burn::tensor::Int>) -> Option<CubeTensor> {
     type B = burn_cubecl::CubeBackend;
     let prim = t.clone().try_into_primitive::<B>().ok()?;
     let c = (&prim as &dyn Any).downcast_ref::<CubeTensor>()?;
@@ -127,7 +141,7 @@ pub fn copy_into_i32_cuda<const D: usize>(
     if n == 0 || src.dims() != dst.dims() {
         return false;
     }
-    let (Some(sc), Some(dc)) = (cube_of(src), cube_of(dst)) else {
+    let (Some(sc), Some(dc)) = (cube_of_int(src), cube_of_int(dst)) else {
         return false;
     };
     let client = sc.client.clone();
