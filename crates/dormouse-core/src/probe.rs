@@ -59,7 +59,15 @@ pub const FUTURE_BYTE: usize = 13;
 /// `fb=<ran>/<asked>`; ADR-0019 COUNTED, so `0/<n>` on the eval line means the
 /// head was never reached rather than "the arm is off".
 pub const FUTURE_BYTE_ASKED: usize = 14;
-pub const N_ARMS: usize = 15;
+/// SiTU-GLU ran in the expert FFN (arXiv:2607.24653v2 Eq 12). COUNTED, once
+/// per EXPERT per loop iteration, because that is the granularity at which the
+/// arm is a real substitution: `n_experts * max_iter` for a full forward. The
+/// failure this exists to catch is the GR `9b343d3` shape - the activation
+/// computed, the output discarded - which no loss curve would report and which
+/// a `use_situ = true` config snapshot would otherwise describe as a run of the
+/// arm.
+pub const SITU: usize = 15;
+pub const N_ARMS: usize = 16;
 /// Arm name per index, for assertion messages that name the thing.
 pub const NAMES: [&str; N_ARMS] = [
     "iterations",
@@ -77,6 +85,7 @@ pub const NAMES: [&str; N_ARMS] = [
     "retract_batched",
     "future_byte",
     "future_byte_asked",
+    "situ",
 ];
 
 thread_local! {

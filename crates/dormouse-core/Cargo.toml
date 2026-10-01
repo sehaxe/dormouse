@@ -26,6 +26,14 @@ burn-mor = { path = "../../vendor/burn-fused/crates/burn-mor" }
 # over the loop's iteration states. Off by default (`use_attnres`); the crate
 # is in the build because the model reads it, not as a reference port.
 burn-attnres = { path = "../../vendor/burn-fused/crates/burn-attnres" }
+# SiTU-GLU (arXiv:2607.24653v2 Eq 12, Kimi K3): the expert FFN's activation
+# arm, off by default (`use_situ`). DEFAULT FEATURES ONLY, deliberately - the
+# tensor path IS the reference form, and burn-situ's fused kernel has never
+# executed in any job in this repo (vendor/burn-fused/tools/gpu-gate.sh:73-77),
+# which is the burn-rmsnorm situation exactly. Enabling `burn-situ/cuda` needs a
+# CUDA gate that compares the fused output to the tensor path first; see
+# research/reviews/situ-2026-09-30.md §7.
+burn-situ = { path = "../../vendor/burn-fused/crates/burn-situ" }
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"

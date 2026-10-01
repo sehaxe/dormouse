@@ -120,6 +120,22 @@ pub struct DormouseConfig {
     /// accident, but it is not wired to a config field: the first A/B this
     /// arm needs is AttnRes vs ReZero, not AttnRes vs AttnRes.
     #[serde(default)] pub use_attnres: bool,
+    /// SiTU-GLU in the expert FFN (arXiv:2607.24653v2 Eq 12, Kimi K3):
+    /// `beta1*tanh(Wg x/beta1) * Sigmoid(Wg x) * beta2*tanh(Wu x/beta2)` at
+    /// K3's own `beta1 = 4`, `beta2 = 25` (`burn_situ::K3_GATE_BETA` /
+    /// `K3_UP_BETA`, which are constants - beta is fixed in the paper, not
+    /// learned and not swept).
+    ///
+    /// OFF by default. **This is not a pure activation swap**: Eq 12 reads
+    /// `Wg x` and `Wu x` separately, so `ExpertFFN::gate_up` becomes
+    /// `d_model -> 2*d_ffn` when the flag is on (a `d -> f` projection that was
+    /// named after two projections finally being two). On `small` that is
+    /// +393 216 parameters, **+4.28%**, because TSCT binds (`r*f` per expert,
+    /// not `d*f`); the honest A/B therefore needs a width-matched control,
+    /// which is SwiGLU at the same `2f` - the paper's own comparison in
+    /// §2.3.2. Off is bitwise identical: see `situ_off_is_bitwise_the_old_model`
+    /// and the unchanged `preset_exec` counts.
+    #[serde(default)] pub use_situ: bool,
     #[serde(default = "d_n_experts")] pub n_experts: usize,
     #[serde(default = "d_jepa_weight")] pub jepa_weight: f32,
     #[serde(default = "d_jepa_mask_frac")] pub jepa_mask_frac: f32,
