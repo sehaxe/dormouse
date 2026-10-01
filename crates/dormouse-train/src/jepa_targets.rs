@@ -18,11 +18,23 @@ use burn::tensor::{Tensor, TensorData};
 
 use dormouse_data::fnv;
 
+/// The WRITER half: a streaming appender for the sidecar. One instance per
+/// precompute pass, and it never holds more than the 1 MB buffer, so a
+/// precompute over a whole corpus costs a constant amount of RAM on top of the
+/// model.
+///
+/// `pub` in a private module (`mod jepa_targets`), so this is crate-internal:
+/// the pair is reached through `precompute_jepa_targets` and the trainer's
+/// `--jepa-targets` path, not by name.
 pub struct JepaTargetWriter {
     w: BufWriter<std::fs::File>,
 }
 
 impl JepaTargetWriter {
+    /// Create (or TRUNCATE) the sidecar, making the parent directory if it is
+    /// missing. Truncating is deliberate: a precompute pass is a whole-file
+    /// job, and appending to a previous pass would produce a file whose index
+    /// resolves a hash to a stale record.
     pub fn create(path: &std::path::Path) -> std::io::Result<Self> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
@@ -33,6 +45,16 @@ impl JepaTargetWriter {
     }
 
     /// One record: chunk bytes (hash key) + teacher latent `[b, t, d]`.
+    ///
+    /// The key is the FNV hash of the CHUNK BYTES, not a counter, which is
+    /// what lets the reader find a record after the stream has moved (the
+    /// module docs' second paragraph). The dims are written into the record
+    /// rather than into a file header, so a sidecar can hold records from more
+    /// than one shape and each carries its own.
+    ///
+    /// LOUD on a shape that disagrees with the payload: `latent.len()` is
+    /// asserted against `b*t*d`, because a mismatch would be written as a
+    /// short record and the reader would find the NEXT record's bytes here.
     pub fn push(
         &mut self,
         chunk_bytes: &[u8],
@@ -52,12 +74,24 @@ impl JepaTargetWriter {
         Ok(())
     }
 
+    /// Push the 1 MB buffer out. Called once at the end of a precompute pass:
+    /// a pass that is killed before this loses up to a buffer of records, and
+    /// the resulting file is then TRUNCATED-relative - its last record is
+    /// partial, which [`JepaTargets::open`] refuses loudly rather than reading.
     pub fn flush(&mut self) -> std::io::Result<()> {
         self.w.flush()
     }
 }
 
-/// Frozen JEPA targets keyed by the training chunk's byte hash.
+/// Frozen JEPA targets, keyed by the training chunk's byte hash, read from a
+/// sidecar. The replacement for a per-step EMA-teacher forward: one forward per
+/// batch at precompute time instead of a second full forward per step, which
+/// is what OOMed batch 10 on 16 GB.
+///
+/// The index is a `hash -> file offset` map built once at open, so a lookup
+/// is a hash and a seek and training holds ONE record in RAM no matter how big
+/// the sidecar is. `pub` in a private module: reached through the trainer's
+/// `--jepa-targets` path, not by name.
 pub struct JepaTargets {
     file: BufReader<std::fs::File>,
     index: HashMap<u64, u64>,
@@ -101,6 +135,12 @@ impl JepaTargets {
         Ok(Self { file, index, device: device.clone() })
     }
 
+    /// How many distinct chunks the sidecar holds. Printed at open, and it is
+    /// the number a reader compares against the precompute step count: fewer
+    /// records than steps means the precompute pass was cut short.
+    ///
+    /// Deliberately no `is_empty`: the empty case is already a LOUD `Err` at
+    /// open ("no records"), so an `is_empty` here could only ever be false.
     pub fn len(&self) -> usize {
         self.index.len()
     }

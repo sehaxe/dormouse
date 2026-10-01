@@ -35,9 +35,19 @@ const SINKHORN_ITERS: usize = 2;
 /// loudly instead of misreading the state.
 const LAYOUT_MAGIC: u32 = 0x4D_47_4E_32;
 
-/// 3 tables (3/5/8-gram), `dim` columns each.
+/// 3 tables, one per n-gram order (`dormouse_data::ORDERS = [2, 3, 4]`),
+/// `dim` columns each.
 pub struct HostNgram {
+    /// Capacity per order, `slots[order_index]` for the 2/3/4-gram table.
+    /// A key lands at `rem_euclid(hash, slots)`, so this is a collision
+    /// rate, not an address space: the trainer passes `engram_slots` for
+    /// all three (`lib.rs`), production 48M rows total, desktop
+    /// verification 8M (§2.4 of AGENTS.md).
     pub slots: [usize; 3],
+    /// Row width in f32 elements. The trainer constructs with the literal
+    /// `32`, which is `engram_dim`'s schema default — a preset that changes
+    /// `engram_dim` does NOT move these tables (recorded in
+    /// `docs/reviews/doc-coverage-wave2-2026-10-01.md`, not fixed here).
     pub dim: usize,
     tables: Vec<f32>, // concatenated [sum(slots), dim]
     m: Vec<f32>,      // momentum, same layout (the only optimizer state)
@@ -80,6 +90,9 @@ impl HostNgram {
         self.slots[..t].iter().sum()
     }
 
+    /// Rows across all three tables — the number that sizes the RAM budget
+    /// (256 B/row: table + momentum, §2.4) and the row count the sidecar's
+    /// Nesterov section must hold.
     pub fn total_rows(&self) -> usize {
         self.slots.iter().sum()
     }

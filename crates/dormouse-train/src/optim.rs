@@ -316,11 +316,18 @@ impl Optimizer for HeadWiseMuon {
 /// declaration. This is the only place a group is assembled; the decision of
 /// which group a parameter is in lives in [`routing::group_of`].
 pub struct Installed {
+    /// The low-rank TSCT `u`/`v` factors and the Engram key projections —
+    /// the "small matrices that act as linear maps" group (module docs).
+    /// Muon+ ColRow, NS 8; the group is never empty when the arms exist,
+    /// which `Routing::check` (not this file) refuses loudly.
     pub muon: ParamGroup,
     /// `None` when head-wise Q/K routing is off: those two parameters then
     /// train on the base optimizer, so the group is not installed and must
     /// not be counted.
     pub qk: Option<ParamGroup>,
+    /// The n-gram tables. Plain Adam, weight decay disabled (report §2.3):
+    /// rows are trained by sparse per-key noise, and orthogonalizing a
+    /// lookup table's rows against each other has no meaning.
     pub table: ParamGroup,
 }
 
