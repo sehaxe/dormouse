@@ -12,7 +12,7 @@
 //! - [`ActFormat::Fp4`]: **e2m1**, the OCP MX FP4 grid: 1 sign, 2 exponent
 //!   (bias 1), 1 mantissa, so the magnitudes are 0, 0.5, 1, 1.5, 2, 3, 4, 6 -
 //!   16 codes, 4 bits. There is no 0.75; the only subnormal is 0.5.
-//! - [`ActFormat::Int(bits)`]: symmetric integer (int4 levels 7, int8 127).
+//! - [`ActFormat::Int`]: symmetric integer (int4 levels 7, int8 127).
 //!
 //! The scale maps a block's max onto the FORMAT's max ([`ActFormat::max_value`]),
 //! not onto 1. Normalizing to [-1, 1] and calling that "fp4" is the bug this

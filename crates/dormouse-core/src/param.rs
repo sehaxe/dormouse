@@ -1,5 +1,36 @@
 //! param - TSCT linear via burn-sct SpectralLinear, pad to multiple of 4,
 //! NM knob, BF16 env (mirrors aria semantics; fresh mini composition)
+//!
+//! # What [`LinearLike`] is for
+//!
+//! Every projection in dormouse is one of these, so that one place owns the
+//! three properties they share: the spectral (low-rank TSCT) factorization
+//! with its optional factor quantization, the `out_features` padding cubek's
+//! matmul vectorization needs (`N % 4 == 0`), and the precision switches. A
+//! linear that is not a `LinearLike` is a deliberate exception and should say
+//! so.
+//!
+//! # Invariants
+//!
+//! * **Pads on construction, slices on every forward.** `out_features` is
+//!   padded UP to a multiple of 4 (except `out_features == 1`, a scalar
+//!   projection, where padding would be 4x the parameters for nothing), and the
+//!   result is sliced back on the way out. The extra columns are never read
+//!   downstream — they exist so the matmul's N dimension vectorizes. Keep the
+//!   slice: without it the padded columns leak into the next layer and the
+//!   model is quietly wider than its parameter count says.
+//! * **Masters are always fp32.** `--quant` picks the FORWARD path only, so a
+//!   checkpoint is format-agnostic and re-running with `--quant fp32`
+//!   reproduces an earlier run exactly.
+//! * **The retraction is a real polar retraction** through
+//!   [`LinearLike::retract`], and it keeps autodiff tracking, which is why it
+//!   can run inside the step loop. Its cost is per-PARAMETER and does not
+//!   amortize with batch: measured 52.8 / 53.3 / 64.6 ms at batch 8 / 16 / 32
+//!   against step times of 244 / 440 / 826 ms — 22% of a step at batch 8,
+//!   7.8% at batch 32.
+//! * **Mixed dtypes NaN on this stack.** Every caller casts to fp32 before a
+//!   `LinearLike` and back after; the bf16 matmul path keeps an fp32 graph.
+
 use burn::module::{Module, Param, ParamId};
 use burn::tensor::{Device, DispatchTensor, Tensor};
 use burn::backend::DispatchKindConversion;
@@ -29,20 +60,51 @@ fn quant_debug_on() -> bool {
     *DBG.get_or_init(|| std::env::var("DM_QUANT_DEBUG").is_ok())
 }
 
+/// One projection: spectral or dense, both padded, both sliced back.
 #[derive(Module, Debug)]
 pub struct LinearLike {
+    /// Which of the two parameterizations this linear actually holds. The enum
+    /// is part of the checkpoint: a `Dense` variant cannot load a `Tsct`
+    /// record, and burnpack refuses the shape mismatch naming the path.
     pub inner: LinearLikeInner,
+    /// The REAL (unpadded) output width. The inner module may be up to 3
+    /// columns wider; this is what the forward slices back to and what every
+    /// downstream shape is computed from.
     #[module(skip)]
     pub out_features: usize,
 }
 
+/// The two parameterizations a [`LinearLike`] can hold.
+///
+/// An enum rather than a config flag so the shape of a model is decided at
+/// construction and cannot drift afterwards: `use_tsct` is read once, by
+/// [`LinearLike::with_tsct`].
 #[derive(Module, Debug)]
 pub enum LinearLikeInner {
+    /// Spectral low-rank (TSCT) via `burn-spectral`: a `[in, k]` and a
+    /// `[k, out]` factor with a `[k]` singular-scale vector between them, so
+    /// the parameter count is `k*(in+out+1)` rather than `in*out`. This is what
+    /// makes a 2048-wide FFN affordable on a 9.2M-parameter model. Retracted
+    /// polar every step (default cadence 1) to hold the factors near
+    /// orthogonality, and the factors can be forward-quantized independently
+    /// of the fp32 masters.
     Tsct(SpectralLinear),
+    /// A plain `[out, in]` weight plus bias. The A/B counterpart of the
+    /// spectral path, and the control it has to beat to earn its ~1000 lines.
+    /// Reachable since 2026-09-28; before that the variant existed and nothing
+    /// constructed it, which made the A/B unanswerable.
     Dense(burn::nn::Linear),
 }
 
 impl LinearLike {
+    /// A spectral (`Tsct`) linear, `in_features -> out_features` at rank `rank`.
+    ///
+    /// `out_features` is padded up to a multiple of 4 for the matmul and
+    /// sliced back in [`Self::forward`]; `out_features == 1` is left alone.
+    /// `rank` is NOT clamped here — the caller owns that decision, and
+    /// [`crate::model::DormouseModel::new`] clamps the head's rank to
+    /// `min(rank, d_model, vocab)` for the specific reason that a rank above
+    /// either dimension is not a factorization.
     pub fn new(in_features: usize, out_features: usize, rank: usize, device: &Device) -> Self {
         // Pad to multiple of 4: cubek matmul vectorization needs N%4==0
         // (aria probe: N=2,3,5,6,7 dirty under initcheck).
@@ -90,6 +152,19 @@ impl LinearLike {
         }
     }
 
+    /// `x [n, in] -> y [n, out]`, with the padding sliced back off.
+    ///
+    /// The dispatch has four arms, and they are a config decision each, not a
+    /// fallback: bf16 compute on/off, factor quant != Fp32 or not. Note the one
+    /// place a difference IS a silent degradation: on a non-CUDA build with
+    /// `bf16_compute` on, the bf16 matmul op does not exist and the quant path
+    /// runs instead with the graph still fp32. That is a **silent** fallback by
+    /// the ADR-0019 classification — the right answer, no counter — and it is
+    /// one of the three still-open sites; recorded in
+    /// `docs/reviews/doc-coverage-2026-10-01.md`, not fixed here.
+    ///
+    /// `DM_QUANT_DEBUG=1` prints the format of every linear on every forward.
+    /// Debug-only and not on any hot path that is measured.
     pub fn forward<B: burn::backend::AutodiffBackend>(&self, x: Tensor<2>) -> Tensor<2>
     where
         DispatchTensor: DispatchKindConversion<B>

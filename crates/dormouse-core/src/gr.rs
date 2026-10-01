@@ -47,22 +47,53 @@ use crate::param::LinearLike;
 /// Number of residual branches (report: nr = 4).
 pub const GR_BRANCHES: usize = 4;
 
+/// The Gated Residual operator: `nr = 4` normalized branches, a low-rank
+/// read gate, one positive write scalar per branch.
+///
+/// Replaces ReZero's additive residual scale, and `loop_block.rs` skips its own
+/// pre-norm while this is present (the read normalizes, which is the report's
+/// "Eq. 24 loses its Norm"). Never A/B'd — see the module docs.
 #[derive(Module, Debug)]
 pub struct GatedResidual {
+    /// One RMSNorm per branch, applied to that branch's residual state before
+    /// BOTH the read and the write. `nr` of them, so the branches are
+    /// normalized independently rather than as one concatenated tensor.
     pub branch_norms: Vec<RMSNorm>,
     /// Read bottleneck: `W_d` [nr*d, r] (r = d/8), `W_u` [r, nr*d] (Eq. 31).
+    /// Both are [`LinearLike`], hence spectral, and `r = max(d/8, 4)` with a
+    /// floor so a tiny `d_model` still has a usable bottleneck.
     pub wd: LinearLike,
+    /// The up half of the read bottleneck, `r -> nr*d`. Named for the report's
+    /// Eq. 31, not for its shape.
     pub wu: LinearLike,
-    /// Write scalars: `W_w` [nr*d, nr] (Eq. 33).
+    /// Write scalars: `W_w` [nr*d, nr] (Eq. 33). One column per branch, and
+    /// `2 * sigmoid` of it, so every write scalar is in `(0, 2)` and POSITIVE
+    /// — the property that lets a block reinforce or damp a branch but never
+    /// cancel the one it wrote.
     pub ww: LinearLike,
 }
 
 /// Per-branch normalized views, reused by read and write.
+///
+/// A plain struct, not a `Module`: it is computed per forward and holds no
+/// parameters. The reuse matters — normalizing the branches twice per iteration
+/// (once for the read, once for the write) would double a per-iteration cost
+/// for nothing, and the write must read the SAME normalized views the read did.
 pub struct GrState {
+    /// `nr` tensors of `[b, t, d]`, each `RMSNorm(branch_i)`. Produced once per
+    /// iteration by [`GatedResidual::read`] and consumed by both
+    /// [`GatedResidual::read`] and [`GatedResidual::write`].
     pub normed: Vec<Tensor<3>>,
 }
 
 impl GatedResidual {
+    /// Build the operator at residual width `d`, with [`GR_BRANCHES`]
+    /// branches.
+    ///
+    /// The bottleneck rank is `max(d/8, 4)` — the report's `d/8`, with a floor
+    /// so a narrow `d_model` does not collapse it to a rank-1 gate (which would
+    /// make the read nearly a constant). Epsilon is 1e-3, matching the loop's
+    /// `norm_eps` default rather than the f32 default.
     pub fn new(d: usize, device: &Device) -> Self {
         let nd = GR_BRANCHES * d;
         let r = (d / 8).max(4);
