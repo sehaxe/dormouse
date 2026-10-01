@@ -193,10 +193,6 @@ struct Args {
     /// Daemonize: ignore SIGHUP, fork to background.
     #[arg(long)]
     detach: bool,
-    /// On NaN loss / panic: wait 30s, re-exec (fresh CUDA context) and
-    /// resume from the last checkpoint.
-    #[arg(long)]
-    guard: bool,
 }
 
 /// Build the resolved run from the flags: defaults -> preset -> --set ->
@@ -275,48 +271,9 @@ fn execute(a: &Args, run: dormouse_train::RunCfg) -> Result<(), String> {
 fn main() {
     let a = Args::parse();
 
-    // Pin a stable executable image before anything else, but only when the
-    // guard is in play. `cargo build-train` REPLACES target/release/train, so a
-    // running process's /proc/self/exe resolves to a deleted inode and the
-    // guard's re-exec fails with ENOENT - exactly when the recovery is needed
-    // (measured 2026-09-27: official_v5f died, guard could not restart it, and
-    // the crash loop went unnoticed). A sibling image file that cargo does not
-    // know about survives rebuilds, and the re-exec points at it.
-    if a.guard {
-        const IMAGE_ENV: &str = "DORMOUSE_GUARD_EXE";
-        if std::env::var(IMAGE_ENV).is_err() {
-            let exe = std::env::current_exe().expect("current_exe");
-            // A SUBDIRECTORY, and the file must stay named `train`: the
-            // machine's ram-guard kills the heaviest process whose comm is
-            // exactly "train" (~/bin/ram-guard.sh), so an image named
-            // anything else would silently disable the memory guard for every
-            // --guard run. cargo does not own this directory.
-            let dir = exe.with_file_name("guard-image");
-            let image = dir.join("train");
-            // pid-suffixed tmp: two concurrent launches sharing a fixed
-            // `train.tmp` can publish a truncated image through the rename.
-            let tmp = dir.join(format!("train.tmp.{}", std::process::id()));
-            // Best-effort: a read-only target/ must fall back to current_exe,
-            // not panic before the config is even validated.
-            let pinned = std::fs::create_dir_all(&dir).is_ok()
-                && std::fs::copy(&exe, &tmp).is_ok()
-                && std::fs::rename(&tmp, &image).is_ok();
-            if !pinned {
-                eprintln!("guard: could not pin an executable image, using the live path");
-            }
-            use std::os::unix::process::CommandExt;
-            let err = std::process::Command::new(&image)
-                .args(std::env::args_os().skip(1))
-                .env(IMAGE_ENV, &image)
-                .exec();
-            eprintln!("guard image exec failed: {err}");
-            std::process::exit(1);
-        }
-    }
-
-    // Resolve the config BEFORE detach/guard wrapping: a bad preset, --set
+    // Resolve the config BEFORE detaching: a bad preset, --set
     // key or flag value must fail in the foreground where the user can see
-    // it, not in a detached log file or a guard re-exec loop.
+    // it, not in a detached log file.
     let run = match build_run(&a) {
         Ok(r) => r,
         Err(e) => {
@@ -338,8 +295,7 @@ fn main() {
         }
     }
 
-    // Log redirection: both streams into one append-only file. Must happen
-    // before the guard re-exec too - dup2'd fds survive exec.
+    // Log redirection: both streams into one append-only file.
     if let Some(path) = &a.log {
         #[cfg(unix)]
         match std::fs::OpenOptions::new().create(true).append(true).open(path) {
@@ -358,67 +314,13 @@ fn main() {
         std::env::set_var("CUBECL_AUTOTUNE_LEVEL", level);
     }
 
-    let guard = a.guard;
-    // Resume state must exist for a restart to make sense: a fresh run that
-    // dies before its first checkpoint (bad config, OOM at startup) would
-    // otherwise re-exec into the same crash forever.
-    let resumable = std::path::Path::new(&a.ckpt_dir)
-        .join(format!("{}.bin", run.train.ckpt_name))
-        .is_file();
-    // Panics (e.g. CUDA OOM deep in cubecl) must reach the guard too, so the
-    // run is wrapped in catch_unwind; a re-exec'd process rebuilds the CUDA
-    // context and memory pools - neither is safe to reuse after a device
-    // error, which is why the guard re-launches instead of looping in-process.
-    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || execute(&a, run)))
-        .unwrap_or_else(|p| {
-            let msg = p
-                .downcast_ref::<String>()
-                .cloned()
-                .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
-                .unwrap_or_else(|| "panic".into());
-            Err(format!("panic: {msg}"))
-        });
-    match res {
-        Ok(()) => {}
-        Err(e) => {
-            eprintln!("train failed: {e}");
-            let restarts: u32 = std::env::var("DORMOUSE_GUARD_RESTARTS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0);
-            // An in-loop Err is now reachable for a PERMANENT condition (a
-            // non-finite held-out eval = a broken allocator), and the guard
-            // re-exec'd every 30 s forever - which also manufactures the
-            // "two GPU processes at once" that corrupted the pool in the first
-            // place (review 2026-09-27). Cap the chain: after 3 restarts the
-            // operator has to look.
-            if guard && resumable && restarts < 3 {
-                // The guard re-execs with the ORIGINAL argv, so the new
-                // process re-runs resolve() on identical inputs. resolve is
-                // deterministic in argv (no env or randomness feeds the
-                // config), which is exactly what lets the on-disk snapshot
-                // drift check pass across restarts.
-                eprintln!(
-                    "guard: restarting in 30s (resume from last checkpoint, restart {} of 3)",
-                    restarts + 1
-                );
-                std::thread::sleep(std::time::Duration::from_secs(30));
-                use std::os::unix::process::CommandExt;
-                // The pinned image if we have one, else our own path (which
-                // works as long as nothing rebuilt the binary under us).
-                let exe = std::env::var("DORMOUSE_GUARD_EXE")
-                    .unwrap_or_else(|_| std::env::current_exe().expect("current_exe").display().to_string());
-                let err = std::process::Command::new(exe)
-                    .args(std::env::args_os().skip(1))
-                    .env("DORMOUSE_GUARD_RESTARTS", (restarts + 1).to_string())
-                    .exec();
-                eprintln!("guard: re-exec failed: {err}");
-            } else if guard {
-                eprintln!(
-                    "guard: giving up (resumable={resumable}, restarts={restarts}) - a persistent failure needs a human"
-                );
-            }
-            std::process::exit(1);
-        }
+    // No auto-restart: a failure exits non-zero and the operator decides.
+    // The --guard re-exec wrapper (restart from a pinned image, capped at 3)
+    // was removed 2026-10-02 - its detached parent exited 0, so orchestrators
+    // read a dead run as a finished one and stacked 15 runs on one GPU. The
+    // NaN firewall inside train_loop is unconditional and needs no wrapper.
+    if let Err(e) = execute(&a, run) {
+        eprintln!("train failed: {e}");
+        std::process::exit(1);
     }
 }
