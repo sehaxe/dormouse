@@ -1,0 +1,31 @@
+/* Custom CSS. Three rules, and each one exists because Starlight's default
+   failed on THIS content, not because more CSS is nicer.
+   Do not grow this file without naming the default it replaces. */
+
+/* 1. The tables in this repo are file:line registers — `train/src/lib.rs:729-737`
+   is one token in Markdown's eyes and refuses to wrap. Left alone it gives every
+   table a horizontal scrollbar on a laptop and hides half the row. */
+.sl-markdown-content :is(table) :is(code) {
+	white-space: normal;
+	overflow-wrap: anywhere;
+}
+
+/* 2. Long fences are common here (a training launch line, a `file:line` list)
+   and the default clip is correct; this only adds the left padding the scroll
+   needs so a line does not touch the fence edge while scrolling. */
+.sl-markdown-content :is(pre) {
+	scrollbar-width: thin;
+}
+
+/* 3. Russian documents render side by side with English ones. Starlight's font
+   stack has no Cyrillic face of its own and the browser falls back per glyph,
+   which picks a serif for Cyrillic and a sans for Latin inside one sentence.
+   Naming the same stack for both keeps a line typographically consistent. */
+:root {
+	--sl-font:
+		'Inter var', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue',
+		Arial, 'Noto Sans', 'Liberation Sans', sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji',
+		'Segoe UI Symbol', 'Noto Color Emoji';
+	--sl-font-mono: ui-monospace, 'SFMono-Regular', 'Cascadia Mono', 'JetBrains Mono', Menlo,
+		Consolas, 'DejaVu Sans Mono', monospace;
+}
