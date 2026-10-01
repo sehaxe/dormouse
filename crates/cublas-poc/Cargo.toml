@@ -25,6 +25,17 @@ cubecl = { version = "0.11.0-pre.4", default-features = false, features = ["std"
 cudarc = { workspace = true, features = ["std", "driver"] }
 half = { version = "2.7", default-features = false }
 
+# `burn_cuda` appears zero times in this crate's source - it reaches every
+# cuda type through `burn::tensor::Device::cuda`, which cargo-machete's grep
+# cannot see. It stays because it is the ONLY declaration that turns the
+# autotuner on: measured with `cargo tree -e features`, dropping this line
+# removes `burn-cuda feature "autotune"` and with it
+# `burn-cubecl feature "autotune"` (773 -> 771 edges). The probe measures
+# routing cost, so a silently un-autotuned kernel graph would make its number
+# describe a different program.
+[package.metadata.cargo-machete]
+ignored = ["burn-cuda"]
+
 [features]
 default = []
 # Section 4 (zero-copy on cubecl's own stream) needs the cubecl patch in

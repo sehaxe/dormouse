@@ -144,25 +144,27 @@ jobs:
   # The failure mode is not "dead code" — it is a manifest that lies about what
   # the crate needs, so a dependency bump changes a build nobody re-tests.
   #
-  # WARN-ONLY on landing: 10 findings in this repo's own crates, measured
-  # 2026-10-01 (`cargo machete crates/`), listed in
-  # docs/reviews/ci-quality-2026-10-01.md. Four of the six are cargo-machete's
-  # known blind spot, not real findings: `burn-tensor` / `burn-nn` /
-  # `burn-cuda` are reached through the `burn` facade re-export
-  # (`use burn::tensor::…`), which a literal grep for `burn_tensor` cannot see.
-  # `rand` in dormouse-core/dormouse-train is real — the `--rand-depth` arm
-  # lives in dormouse-train/src/cfg.rs and uses no RNG. The remaining three
-  # (`serde_json`, `dormouse-data`, `burn` in dormouse-cli) are real too and
-  # are a one-line deletion each.
+  # GREEN as of 2026-10-02: the 10 findings of 2026-10-01
+  # (docs/reviews/ci-quality-2026-10-01.md §4) are closed. Eight deleted
+  # (`burn` / `dormouse-data` / `serde_json` in dormouse-cli; `rand` in
+  # dormouse-core and dormouse-train — genuinely dead, the `--rand-depth` arm
+  # samples from the step index, not an RNG; `burn-tensor` in dormouse-train
+  # and backend-parity and `burn-nn` in dormouse-core — all reached through the
+  # `burn` facade, and `cargo tree -e features` is unchanged without them).
+  # Two kept with a named reason in
+  # `[package.metadata.cargo-machete] ignored` (burn-tensor in dormouse-core:
+  # its `std` feature names `burn-tensor/std`, so the declaration cannot go;
+  # burn-cuda in cublas-poc: the only declaration that turns the autotuner on,
+  # measured 773 -> 771 edges without it).
   #
-  # TO CLOSE: delete the three real entries in dormouse-cli, add
-  # `[package.metadata.cargo-machete] ignored = [...]` for the four facade
-  # re-exports with that reason, then drop `continue-on-error`.
+  # cargo-machete's blind spot stands: it greps for the crate name and cannot
+  # see a `burn::tensor::…` facade path, so a new facade-only dependency will
+  # need its own `ignored` entry with that reason — an entry without a reason
+  # is the ADR-0019 SILENT shape.
   unused-deps:
-    name: "unused deps :: cargo-machete, warn-only (10 findings in crates/, 4 of them facade false positives)"
+    name: "unused deps :: cargo-machete (0 findings — the 10 of 2026-10-01 closed, 4 of them as reasoned facade entries)"
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
