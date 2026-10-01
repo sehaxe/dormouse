@@ -119,13 +119,37 @@ fn cube_of<const D: usize>(t: &Tensor<D>) -> Option<CubeTensor> {
     Some(c.clone())
 }
 
+/// [`cube_of`] that says WHY it failed. The copy paths use this one: a pin
+/// that cannot be built has to name its cause (ADR-0011), and "not a bare
+/// cubecl tensor" is not an actionable message when the real answer is a dtype
+/// mismatch four frames down in burn's `BackendPrimitive`.
+fn cube_of_why<const D: usize>(t: &Tensor<D>) -> Result<CubeTensor, String> {
+    type B = burn_cubecl::CubeBackend;
+    let prim = t
+        .clone()
+        .try_into_primitive::<B>()
+        .map_err(|e| format!("float tensor is not a bare cubecl tensor: {e:?}"))?;
+    let c = (&prim as &dyn Any).downcast_ref::<CubeTensor>().ok_or_else(|| {
+        format!("float primitive is a {}, not a CubeTensor", std::any::type_name_of_val(&prim))
+    })?;
+    Ok(c.clone())
+}
+
 /// The same downcast for an Int tensor. A graph is fed `x`, the shifted `y` and
 /// the hashed n-gram keys every replay, and those are Int.
-fn cube_of_int<const D: usize>(t: &Tensor<D, burn::tensor::Int>) -> Option<CubeTensor> {
+fn cube_of_int<const D: usize>(
+    t: &Tensor<D, burn::tensor::Int>,
+) -> Result<CubeTensor, String> {
     type B = burn_cubecl::CubeBackend;
-    let prim = t.clone().try_into_primitive::<B>().ok()?;
-    let c = (&prim as &dyn Any).downcast_ref::<CubeTensor>()?;
-    Some(c.clone())
+    let prim = t
+        .clone()
+        .try_into_primitive::<B>()
+        .map_err(|e| format!("Int tensor is not a bare cubecl tensor: {e:?}"))?;
+    let c = (&prim as &dyn Any)
+        .downcast_ref::<CubeTensor>()
+        .ok_or_else(|| format!("Int primitive is a {}, not a CubeTensor", std::any::type_name_of_val(&prim)))?
+        .clone();
+    Ok(c)
 }
 
 /// Copy `src` into `dst` in place, where both are Int tensors.
@@ -136,14 +160,15 @@ fn cube_of_int<const D: usize>(t: &Tensor<D, burn::tensor::Int>) -> Option<CubeT
 pub fn copy_into_i32_cuda<const D: usize>(
     src: &Tensor<D, burn::tensor::Int>,
     dst: &Tensor<D, burn::tensor::Int>,
-) -> bool {
+) -> Result<(), String> {
     let n: usize = src.dims().iter().product();
-    if n == 0 || src.dims() != dst.dims() {
-        return false;
+    if n == 0 {
+        return Err("empty tensor".into());
     }
-    let (Some(sc), Some(dc)) = (cube_of_int(src), cube_of_int(dst)) else {
-        return false;
-    };
+    if src.dims() != dst.dims() {
+        return Err(format!("shape mismatch {:?} vs {:?}", src.dims(), dst.dims()));
+    }
+    let (sc, dc) = (cube_of_int(src)?, cube_of_int(dst)?);
     let client = sc.client.clone();
     let threads = 256u32;
     unsafe {
@@ -155,20 +180,21 @@ pub fn copy_into_i32_cuda<const D: usize>(
             BufferArg::from_raw_parts(dc.handle, n),
         );
     }
-    true
+    Ok(())
 }
 
 /// Copy `src` into `dst` in place. `false` when either tensor is not a bare
 /// cubecl f32 tensor on this backend — the caller must then refuse the
 /// graph rather than pretend the pin exists (ADR-0011).
-pub fn copy_into_cuda<const D: usize>(src: &Tensor<D>, dst: &Tensor<D>) -> bool {
+pub fn copy_into_cuda<const D: usize>(src: &Tensor<D>, dst: &Tensor<D>) -> Result<(), String> {
     let n: usize = src.dims().iter().product();
-    if n == 0 || src.dims() != dst.dims() {
-        return false;
+    if n == 0 {
+        return Err("empty tensor".into());
     }
-    let (Some(sc), Some(dc)) = (cube_of(src), cube_of(dst)) else {
-        return false;
-    };
+    if src.dims() != dst.dims() {
+        return Err(format!("shape mismatch {:?} vs {:?}", src.dims(), dst.dims()));
+    }
+    let (sc, dc) = (cube_of_why(src)?, cube_of_why(dst)?);
     let client = sc.client.clone();
     let threads = 256u32;
     unsafe {
@@ -180,7 +206,7 @@ pub fn copy_into_cuda<const D: usize>(src: &Tensor<D>, dst: &Tensor<D>) -> bool 
             BufferArg::from_raw_parts(dc.handle, n),
         );
     }
-    true
+    Ok(())
 }
 
 /// Fused NS polynomial combine: `x ← a·x + b·t1 + c·t2`. Returns false when

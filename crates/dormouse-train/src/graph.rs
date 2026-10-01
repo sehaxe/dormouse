@@ -110,7 +110,7 @@ impl Master {
     /// the enum arm fixes ONE rank while the caller's `D` is only known as a
     /// type parameter. Matching them inside the arm is what makes this four
     /// monomorphic calls instead of four mismatched-type errors.
-    fn put(&self, now: &dyn Any) -> bool {
+    fn put(&self, now: &dyn Any) -> Result<(), String> {
         macro_rules! arm {
             ($t:ty, $v:expr) => {{
                 match (
@@ -118,7 +118,7 @@ impl Master {
                     ($v as &dyn Any).downcast_ref::<$t>(),
                 ) {
                     (Some(a), Some(b)) => copy_into(a, b),
-                    _ => false,
+                    _ => Err("master and parameter are not the same rank".into()),
                 }
             }};
         }
@@ -192,8 +192,9 @@ enum PinAction {
 struct PinMapper<'a> {
     action: PinAction,
     pins: &'a mut Pins,
-    /// Set by [`PinAction::Refresh`] if any copy was refused.
+    /// Set by [`PinAction::Refresh`] if any copy was refused, and WHY.
     failed: bool,
+    why: Option<String>,
 }
 
 impl ModuleMapper for PinMapper<'_> {
@@ -219,8 +220,9 @@ impl ModuleMapper for PinMapper<'_> {
                     self.failed = true;
                     return Param::from_mapped_value(id, tensor, mapper);
                 };
-                if !master.put(&tensor) {
+                if let Err(why) = master.put(&tensor) {
                     self.failed = true;
+                    self.why = Some(format!("parameter {id:?}: {why}"));
                     return Param::from_mapped_value(id, tensor, mapper);
                 }
                 match master.get::<D>() {
@@ -313,12 +315,12 @@ const MAX_REFUSALS: u64 = 20;
 /// metadata op whose buffer behaviour is a backend detail. `false` off CUDA,
 /// where there is no graph to pin for.
 #[cfg(feature = "cuda")]
-pub fn copy_into<const D: usize>(src: &Tensor<D>, dst: &Tensor<D>) -> bool {
+pub fn copy_into<const D: usize>(src: &Tensor<D>, dst: &Tensor<D>) -> Result<(), String> {
     burn_muon_plus::fused_kernels::copy_into_cuda(src, dst)
 }
 #[cfg(not(feature = "cuda"))]
-pub fn copy_into<const D: usize>(_src: &Tensor<D>, _dst: &Tensor<D>) -> bool {
-    false
+pub fn copy_into<const D: usize>(_src: &Tensor<D>, _dst: &Tensor<D>) -> Result<(), String> {
+    Err("no CUDA backend, so no graph to pin for".into())
 }
 
 /// The same pin for the Int inputs: `x`, the shifted `y`, the hashed keys.
@@ -326,15 +328,15 @@ pub fn copy_into<const D: usize>(_src: &Tensor<D>, _dst: &Tensor<D>) -> bool {
 pub fn copy_into_int<const D: usize>(
     src: &Tensor<D, burn::tensor::Int>,
     dst: &Tensor<D, burn::tensor::Int>,
-) -> bool {
+) -> Result<(), String> {
     burn_muon_plus::fused_kernels::copy_into_i32_cuda(src, dst)
 }
 #[cfg(not(feature = "cuda"))]
 pub fn copy_into_int<const D: usize>(
     _src: &Tensor<D, burn::tensor::Int>,
     _dst: &Tensor<D, burn::tensor::Int>,
-) -> bool {
-    false
+) -> Result<(), String> {
+    Err("no CUDA backend, so no graph to pin for".into())
 }
 
 /// The per-step input tensors, each pinned to a buffer that never moves.
@@ -384,16 +386,16 @@ impl InputPins {
                 self.x.dims()[1] * self.x.dims()[0]
             ));
         }
-        if !copy_into_int(x, &self.x) {
-            return Err("graph capture: could not pin x (copy refused)".into());
+        if let Err(e) = copy_into_int(x, &self.x) {
+            return Err(format!("graph capture: could not pin x: {e}"));
         }
-        if !copy_into_int(y, &self.y) {
-            return Err("graph capture: could not pin y (copy refused)".into());
+        if let Err(e) = copy_into_int(y, &self.y) {
+            return Err(format!("graph capture: could not pin y: {e}"));
         }
         let hp = match (h, &self.h) {
             (Some(src), Some(_)) => {
-                if !copy_into_int(src, self.h.as_ref().expect("matched above")) {
-                    return Err("graph capture: could not pin hashed_ids (copy refused)".into());
+                if let Err(e) = copy_into_int(src, self.h.as_ref().expect("matched above")) {
+                    return Err(format!("graph capture: could not pin hashed_ids: {e}"));
                 }
                 Some(self.h.clone().expect("matched above"))
             }
@@ -499,13 +501,14 @@ impl Seam {
     ) -> (DormouseModel, Result<(), String>) {
         let pins = if teacher { &mut self.teacher_pins } else { &mut self.model_pins };
         self.pin_launches += pins.copies() as u64;
-        let mut m = PinMapper { action: PinAction::Refresh, pins, failed: false };
+        let unsupported = pins.unsupported_rank;
+        let mut m = PinMapper { action: PinAction::Refresh, pins, failed: false, why: None };
         let module = module.map(&mut m);
         if m.failed {
-            let why = pins
-                .unsupported_rank
+            let why = unsupported
                 .map(|r| format!("parameter of rank {r} has no pin representation"))
-                .unwrap_or_else(|| "a copy_into was refused (not a bare cubecl f32 tensor?)".into());
+                .or(m.why)
+                .unwrap_or_else(|| "a copy_into was refused".into());
             return (module, Err(why));
         }
         (module, Ok(()))
@@ -618,7 +621,7 @@ impl Seam {
 }
 
 fn map(module: DormouseModel, pins: &mut Pins, action: PinAction) -> DormouseModel {
-    module.map(&mut PinMapper { action, pins, failed: false })
+    module.map(&mut PinMapper { action, pins, failed: false, why: None })
 }
 
 /// Which arms `--graph-capture` cannot be combined with, named.
@@ -697,8 +700,8 @@ mod tests {
         // primitive refuses (there is no cubecl handle) and that refusal is the
         // honest answer; on CUDA it must succeed. Either way it may not panic.
         #[cfg(not(feature = "cuda"))]
-        assert!(!m.put(&t), "off CUDA a copy_into cannot succeed");
+        assert!(m.put(&t).is_err(), "off CUDA a copy_into cannot succeed");
         #[cfg(feature = "cuda")]
-        assert!(m.put(&t), "on CUDA the pin copy must succeed");
+        m.put(&t).expect("on CUDA the pin copy must succeed");
     }
 }
