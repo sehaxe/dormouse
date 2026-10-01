@@ -188,11 +188,14 @@ part:
 | 1 | **green** — unpinned diverges by **1.98e0** relative at `aux.dspark.joint_proj.weight`; 2.98e0 at `loop_block.mor_router.proj.bias`; 1.015e1 on a third run | red: `could not pin x` | **The trap is real on the trainer's own path**, not just on the toy. The pin is mandatory, and the negative is reproducible (three runs, three different parameters first to break, all ≈ 1-10 relative). |
 | 2 | green (same shape) | red, now with burn's own words: `BackendMismatch("Expected concrete Cube backend with disabled autodiff context, got Enabled(Disabled)")` | **A raw handle is unreachable from an autodiff tensor.** Int inputs have no `detach()` (float-only), so the plain-device experiment. |
 | 3 | green | red on the FLOAT pin, same message | The same wall for parameters: `optim.step`'s output is `Enabled` too. The answer is `as_constant` (§7): `DispatchTensor.autodiff` is a pub field. |
+| 4 | green (3.285e0 at `loop_block.mor_router.proj.bias`) | red on the float pin, **after** `as_constant` compiled | One level deeper than the context: `DispatchTensorKind::Autodiff` is a `Box<DispatchTensorKind>`, so a tracked float sits two levels above the concrete `Cube` variant. The Int half of the same test file went green on the previous run, which is what said the two sides differ. Fix written (`as_constant_float` unwraps the box), **not yet compiled**. |
 
-Two of the three runs also changed WHICH parameter the unpinned run broke
-first, which is itself the finding: a stale-pointer graph does not fail in one
-place, it fails wherever the optimizer's free list happened to hand the old
-buffer to something else. A reader looking for "the" symptom will not find it.
+Every run so far changed WHICH parameter the unpinned graph broke first
+(`aux.dspark.joint_proj.weight`, `loop_block.mor_router.proj.bias` twice,
+`aux.jepa_pred.proj.weight`), and the magnitude was always 1-10 RELATIVE. That
+variety is itself the finding: a stale-pointer graph does not fail in one place,
+it fails wherever the optimizer's free list happened to hand the old buffer to
+something else. A reader looking for "the" symptom will not find it.
 
 ## 8. Two things the repo's own gates caught
 
@@ -218,12 +221,20 @@ buffer to something else. A reader looking for "the" symptom will not find it.
    was in the right place and 47% low.
 2. **Does the window allocate?** §3.1 says it must not, and the refusal message
    names the cause, so this is answered by the first graphed run. **NOT TAKEN.**
-3. **The positive gates** (§5). **NOT GREEN** — see §5.1 for what each one said
-   on the first run and what changed since.
+3. **The positive gates** (§5). **NOT GREEN** — see §5.1. The last fix
+   (`as_constant_float` also unwrapping `DispatchTensorKind::Autodiff`, which is
+   a `Box<DispatchTensorKind>`) is written and committed but **not compiled and
+   not run**: the build lock was held by four other lanes for the last hour of
+   this session. One command settles it:
+   ```bash
+   CARGO_TARGET_DIR=/mnt/e43497ab-0ff2-45b4-b45f-28de3339a53e/dt-graph \
+     tools/build_lock.sh run graph -- cargo test -p dormouse-train \
+     --features cuda --test graph_seam_cuda -- --test-threads=1 --nocapture
+   ```
 4. **Control vs graph over 500 steps.** `--timers` now prints a warm-step mean
    (steps ≥50, because step 0 is the autotune step at 23× a warm step, AGENTS
    §3.1) on **every** run, so both arms are read with the same instrument, and
-   both binaries are built. **NOT TAKEN** — blocked on gate 2/3.
+   both binaries are built. **NOT TAKEN** — blocked on gate 3.
 5. **The autotuner** may sync inside the window; a refused capture says so.
 6. **VRAM**: the retained slices are the step's working set, held for as long as
    the graph lives, and every refused attempt adds one (§3.2). At batch 8 that
