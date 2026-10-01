@@ -19,7 +19,7 @@
 addresses the retraction decision in `d8a21b9` directly). Read-only except for one new instrument
 (`tools/polar_probe.rs`) and these two files. Site-by-site inventory with
 file:line, source claim and honesty tier:
-[`research/spectral-inventory-2026-10-01.md`](../spectral-inventory-2026-10-01.md).
+[`docs/research/2026-10-01-spectral-inventory.md`](../spectral-inventory-2026-10-01.md).
 
 **What was run.** One `rustc -O` single-file probe (0.4 s, no cargo, no burn, no
 vendor target dir) that transcribes the retraction and the Stiefel metric in f32

@@ -1,6 +1,6 @@
 # Mixture arms: the anchors, acted on
 
-`research/2026-09-27-domain-anchors.md` measured the training mixture and left
+`docs/research/2026-09-27-domain-anchors-renamed.md` measured the training mixture and left
 it unbuilt. This is the build. Full record, with every byte count, every window
 and every anchor:
 

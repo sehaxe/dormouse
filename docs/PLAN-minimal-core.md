@@ -340,7 +340,7 @@ The evidence supports **one**:
   (`fused kda=<f>/0`) and at step 0. Warm, the forward is 46-48 ms of a 245 ms
   step — **19 %**. And each iteration's 17 tensors / 248 MB of scratch (~1
   GB/step at four iterations) was the *wrong* explanation: the allocator was
-  falsified directly (`research/2026-09-27-kda-allocator-fix.md`), and the cost
+  falsified directly (`docs/archive/research/2026-09-27-kda-allocator-fix.md`), and the cost
   is host-side op dispatch, now confirmed a second way — the GPU is 13.3 %
   utilised with 79 % of samples at <=5 %. So: not a 465 ms launch-overhead
   floor (not a measured constant; the warm step is 245 ms) and not 80 % of

@@ -576,7 +576,7 @@ without a task suite — settling is the regime where extra depth is free.
   cited looped LM is subword (49K / 32K vocab). Byte difficulty is plausibly *more* skewed
   (space/newline after common words vs rare UTF-8 continuations), which would help TaH-style skipping
   — but that is a hypothesis, and Rung 0 measures it directly.
-* **NOT RE-VERIFIED IN THIS SESSION** (inherited from `research/2026-09-26-ponder-replacement.md`,
+* **NOT RE-VERIFIED IN THIS SESSION** (inherited from `docs/archive/research/2026-09-26-ponder-replacement.md`,
   not re-opened): DeepLoop 2607.13491, SMELT 2609.01343, Training-Free Looped 2605.23872, Hyperloop
   2604.21254, LoopUS 2605.11011, Mixture-of-Depths 2404.02258, PALBERT 2204.03276, PonderNet
   2107.05407, Arrabal-Campos 2608.22347, Huginn's own Fig. 6 numbers (I verified the caption and the
@@ -631,4 +631,4 @@ without a task suite — settling is the regime where extra depth is free.
   `set_depth`), `crates/dormouse-core/src/model.rs` (norm→lm_head readout), `crates/dormouse-train/
   src/lib.rs` (`sample_depth`, rand-depth step, the eval block: rewind, `eval_batches=20`, targets=None),
   `docs/adr/0013-fixed-depth.md`, `docs/architecture/PLAN.md`,
-  `research/2026-09-26-ponder-replacement.md`.
+  `docs/archive/research/2026-09-26-ponder-replacement.md`.

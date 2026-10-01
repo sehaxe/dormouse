@@ -34,7 +34,7 @@ Consequence: under the backend the trainer runs, `burn-kda` silently takes
 crate here that runs in production has its kernel disabled by a one-token type
 difference. `burn-attnres` and `burn-mhc` are unaffected in practice because nothing
 calls them at all. This agrees with, and extends, the existing
-`research/2026-09-27-attenres.md` §1.2 (independently derived).
+`docs/archive/research/2026-09-27-attenres.md` §1.2 (independently derived).
 
 ---
 

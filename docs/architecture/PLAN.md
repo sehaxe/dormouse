@@ -1,6 +1,6 @@
 # dormouse program plan
 
-Started 2026-09-21 from the architecture grill session. Decisions live in `docs/adr/`, shared language lives in `CONTEXT.md`, evidence lives in `research/2026-09-21-per-gb-sota.md`. Update this file as phases close; do not re-litigate recorded ADRs without new evidence.
+Started 2026-09-21 from the architecture grill session. Decisions live in `docs/adr/`, shared language lives in `CONTEXT.md`, evidence lives in `docs/research/2026-09-21-per-gb-sota-renamed.md`. Update this file as phases close; do not re-litigate recorded ADRs without new evidence.
 
 ## ARCHITECTURE v2.1 (2026-09-26, scale-gated completeness — owner directive)
 
@@ -151,7 +151,7 @@ A/B (GPU slot needed): fixed-4 (official_v5, running) vs `--rand-depth`, judged
 on held-out BPB. The inference-side partner is a confidence exit in
 `generate` (~20 lines), not yet written.
 
-## POST-TRAINING VERDICT 2026-09-27 (research/2026-09-27-posttraining-compare.md)
+## POST-TRAINING VERDICT 2026-09-27 (docs/archive/research/2026-09-27-posttraining-compare.md)
 
 Answers the owner's question "is Rufus-Air the best?" - **no, it is the
 best-documented, and its 8-stage serial shape is already obsolete**: INTELLECT-3,
@@ -239,7 +239,7 @@ unanswerable; `is_dense_bias` also had to be taught to the routing policy,
 which caught the 1D dense bias in Muon+ - and the rule now lives in ONE
 predicate used by both the group builder and the validator, which had drifted).
 
-## OPTIMIZATION 2026-09-27 (measured; full data in research/2026-09-27-optimization-1b.md)
+## OPTIMIZATION 2026-09-27 (measured; full data in docs/archive/research/2026-09-27-optimization-1b.md)
 
 > **Step-time figures in this section are WITHDRAWN 2026-09-29.** They are
 > **step-0 readings**. Warm, release, quiet card, `CUBECL_AUTOTUNE_LEVEL=3`,

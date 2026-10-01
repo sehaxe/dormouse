@@ -736,7 +736,7 @@ under the name its own H1 gives it. **Not a union**: the two documents are about
 different crates and a union would be 1000 lines about two things.
 
 Preserved from the twin, unchanged: `tools/polar_probe.rs`,
-`research/spectral-inventory-2026-10-01.md`, and the twin's `audit_2026_10_01.py`
+`docs/research/2026-10-01-spectral-inventory.md`, and the twin's `audit_2026_10_01.py`
 — which is byte-identical to this lane's copy **except** for the §5 fixture fix
 this lane made (`print_5` retracted a raw Gaussian, which is *outside* the basin
 and diverges at 20 iterations, so the comparison measured a diverged basis). The
@@ -753,7 +753,7 @@ branch's copy is the union.
 | `burn-spectral/tests/oracle/falsify.sh` | **branch + §13.3** | new; the twin has none |
 | `burn-spectral/src/lib.rs` | **branch + §13.4** | the twin's `7811191` did not touch it; the audit's 3 comment corrections + 4 gates + 2 red-on-purpose tests are all here |
 | `docs/protocols/ORACLE-TIERS.tsv` | **hand-inserted, 7 rows** | R1 coverage for the six new `.py` files. `tools/gen_oracle_tiers.py` was NOT run — see the file's own header, which records that it has destroyed 22 rows once |
-| `tools/polar_probe.rs`, `research/spectral-inventory-2026-10-01.md` | **main, untouched** | the twin's instruments; the branch never had them |
+| `tools/polar_probe.rs`, `docs/research/2026-10-01-spectral-inventory.md` | **main, untouched** | the twin's instruments; the branch never had them |
 
 ### 13.3 `SIGMA_OVERSHOOT` — a correction to the landing brief
 

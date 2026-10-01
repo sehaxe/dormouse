@@ -2,7 +2,7 @@
 
 **Our situation (given):** 7.5M-param byte LM (vocab 256), one shared looped block (max_iter=4), online single-pass over 20 GB (each byte once). Train CE → 0.1 (Engram memorization), held-out BPB 7.6–8.0 ≈ uniform (8.000). We hold ~130× the Chinchilla-optimal unique data. Question: is single-pass online the wrong *recipe*?
 
-**Method:** primary sources only — arXiv abs+HTML full texts opened via arXiv API/browse, official GitHub READMEs fetched raw. Every number below was read off the cited source this session; three items verified in the sibling pass are cited `[S#]` → `research/2026-09-26-small-lm-dynamics.md` (which lists the opened URL per entry). Websearch was down (HTTP 403); discovery ran through the arXiv API instead.
+**Method:** primary sources only — arXiv abs+HTML full texts opened via arXiv API/browse, official GitHub READMEs fetched raw. Every number below was read off the cited source this session; three items verified in the sibling pass are cited `[S#]` → `docs/archive/research/2026-09-26-small-lm-dynamics.md` (which lists the opened URL per entry). Websearch was down (HTTP 403); discovery ran through the arXiv API instead.
 
 ---
 
@@ -138,4 +138,4 @@ Neural byte-model anchors (all opened this session):
 17. TinyStories — arxiv.org/abs/2305.07759, arxiv.org/html/2305.07759v2
 18. modded-nanogpt README + record history — raw.githubusercontent.com/KellerJordan/modded-nanogpt/master/README.md; NorMuon arXiv:2510.05491
 19. Self-Play Pretraining with Zero Data — arxiv.org/abs/2609.30063, arxiv.org/html/2609.30063v1 (§2.2 reward, §3.1 recipe, A.1–A.2, Table 5); kernel repo github.com/amorehead/jvp_flash_attention
-20. [S1] Chinchilla; [S2] ByT5; [S4] nanoGPT shakespeare-char; [S6] Shannon 1951; [S9] kNN-LM; [S10] ST-MoE z-loss; [S11/S16] Moonlight + Muon lr anchors; [S15] QK-norm — opened and cited in `research/2026-09-26-small-lm-dynamics.md`
+20. [S1] Chinchilla; [S2] ByT5; [S4] nanoGPT shakespeare-char; [S6] Shannon 1951; [S9] kNN-LM; [S10] ST-MoE z-loss; [S11/S16] Moonlight + Muon lr anchors; [S15] QK-norm — opened and cited in `docs/archive/research/2026-09-26-small-lm-dynamics.md`

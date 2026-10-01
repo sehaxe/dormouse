@@ -78,7 +78,7 @@ naive version of it.
 ## The statistical requirement: >= 3 seeds
 
 At 151M, an independent study found **seed variance larger than every recipe
-difference it measured** (research/2026-09-27-posttraining-compare.md, citing
+difference it measured** (docs/archive/research/2026-09-27-posttraining-compare.md, citing
 ufakzeka-1). Consequence: a single arm vs a single control does not decide
 anything at our scale. Every A/B is **3 seeds per arm**, same data order
 (the stream is seeded deterministically, and `sample_depth` is a function of the
@@ -299,7 +299,7 @@ Two independent lines of evidence now point the same way, and both are measured:
 
 - **Cost.** Each loop iteration is a FULL-sequence gated-delta pass, and that
   pass allocates 17 fresh tensors / 248 MB of saved scratch
-  (research/2026-09-27-kda-sota-ceiling.md). Four iterations is ~1 GB/step of
+  (docs/research/2026-09-27-kda-sota-ceiling-renamed.md). Four iterations is ~1 GB/step of
   allocator traffic against a 7 ms arithmetic budget and a cubecl pool that is
   high-water and never frees. That is why KDA was measured at ~80% of a step,
   and why a *perfect* KDA kernel would still have left the step at ~365 ms:

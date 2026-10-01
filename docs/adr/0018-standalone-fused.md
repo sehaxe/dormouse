@@ -79,7 +79,7 @@ reaches it.
 ## What this forbids
 
 - Writing a kernel before the roofline arithmetic says the kernel is the
-  bottleneck (documented: `research/2026-09-27-kda-sota-ceiling.md` - the op is
+  bottleneck (documented: `docs/research/2026-09-27-kda-sota-ceiling-renamed.md` - the op is
   memory bound at 3.1 FLOP/byte against a machine balance of 24).
 - Implementing a mechanism that already exists in the fork. `burn-mor` and
   `burn-attnres` were both fully implemented while two agents were about to

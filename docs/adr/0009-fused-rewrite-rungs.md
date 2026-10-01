@@ -2,7 +2,7 @@
 
 ADR-0003 measured fused and it lost (1.25x slower at flagship; the 1.7-2.0x
 smoke number was pre-fix and is retracted). The 2026-09-25 analysis
-(research/2026-09-25-fused-rewrite-plan.md) quantified three causes: the
+(docs/archive/research/2026-09-25-fused-rewrite-plan.md) quantified three causes: the
 `arms_inner_adjoint` re-run per loop iteration (~1-1.5 s of the 2.16 s deficit),
 a full weight-grad D2H round trip every step (~30 blocking transactions, ~60 MB
 PCIe), and hand-rolled fp32 FFMA matmuls against burn's autotuned tensor-core

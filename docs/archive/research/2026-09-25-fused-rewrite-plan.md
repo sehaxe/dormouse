@@ -4,10 +4,10 @@ Date: 2026-09-25. Inputs: burn @ /tmp/opencode/burn (shallow main), cubek 0.3.0-
 cubecl 0.11.0-pre.3 from the cargo registry (what we compile against; cubecl-runtime/cubecl-cuda
 from `vendor/cubecl-fix`), our `crates/dormouse-core/src/fused/` (mod 1629, backward 1768,
 kernels 1553, tests 2487 = 7.4k LOC), `docs/fused-verification-2026-09-23.md`,
-`research/2026-09-23-fused-flagship50.md`. Flagship geometry for all numbers: b=10 t=512
+`docs/archive/research/2026-09-23-fused-flagship50.md`. Flagship geometry for all numbers: b=10 t=512
 (bt=5120), d=768, r=64, f=2048, v=256, nexp=3, N=8 iterations (configs/small.toml).
 
-Measured baseline (research/2026-09-23-fused-flagship50.md:48-58): fused 9.21 s/step vs
+Measured baseline (docs/archive/research/2026-09-23-fused-flagship50.md:48-58): fused 9.21 s/step vs
 burn 7.05 s/step — 1.3x SLOWER, both arms paying the identical burn-side aux stack.
 
 ---
@@ -298,7 +298,7 @@ both arms; the burn arm runs with the fusion feature ON once pre.4 lands.
   launch-bound step, §1.4), else **delete**.
 - **Delete means delete**: all of crates/dormouse-core/src/fused/ (7.4k LOC incl.
   tests), the DM_FUSED gate in train/src/lib.rs, and the flag plumbing; keep
-  docs/fused-verification-2026-09-23.md + research/2026-09-23-fused-flagship50.md as
+  docs/fused-verification-2026-09-23.md + docs/archive/research/2026-09-23-fused-flagship50.md as
   the record. The one thing worth salvaging into burn-kda/msa upstream: the raw
   adjoint-launch wrappers from Rung 1 (they're useful without our op).
 
@@ -324,7 +324,7 @@ Burn (shallow clone /tmp/opencode/burn, main):
 
 Dormouse:
 - fused/ sources: crates/dormouse-core/src/fused/{mod.rs,backward.rs,kernels.rs} (line refs inline, §2/§3)
-- Flagship A/B: research/2026-09-23-fused-flagship50.md:48-58; grad-coverage + structural diagnosis: docs/fused-verification-2026-09-23.md:57-116
+- Flagship A/B: docs/archive/research/2026-09-23-fused-flagship50.md:48-58; grad-coverage + structural diagnosis: docs/fused-verification-2026-09-23.md:57-116
 - KDA state API: vendor/burn-fused/crates/burn-kda/src/lib.rs:503-530
 - GPU constraints: AGENTS.md (4D-slice ban, bf16 fp32-cast rule, KDA f32-only, launch-bound step, pool doctrine)
 - Preset: configs/small.toml

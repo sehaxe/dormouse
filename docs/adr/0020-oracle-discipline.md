@@ -12,12 +12,12 @@ transcription, the crate says "transcription", and where there is no reference i
 ADR-0018 rule 1 said the port is "verified bit-for-bit (or to a stated tolerance)
 against the ORIGINAL implementation wherever the authors shipped code". Read as a
 statement about the library, that is false today. Measured on `vendor/burn-fused/`
-at `23f2b1c` (evidence: `research/2026-09-27-oracle-audit.md`):
+at `23f2b1c` (evidence: `docs/research/2026-09-27-oracle-audit-renamed.md`):
 
 > **0 of 28 crates verify any numeric output against an authors' own source code.
 > 0 of the 3 crates that use the phrase "bit-for-bit" have an oracle from the
 > authors.** Ten crates have an available external oracle (the `REFERENCE` list in
-> `research/2026-09-27-adopt-vs-port.md`); **none of the ten has wired a test to it.**
+> `docs/research/2026-09-27-adopt-vs-port-renamed.md`); **none of the ten has wired a test to it.**
 
 The rule is not being weakened to match reality. Reality is being made to match the
 rule, and until then the words in a README are wrong and are the words that get quoted.
@@ -50,7 +50,7 @@ Two additions the audit forced:
 
 **The one genuine exception, stated so it is not abused:** where the authors' artifact
 *is* the pseudocode and nothing else exists, (b) is not a weaker oracle. Per
-`research/2026-09-27-adopt-vs-port.md` §2, Muon+ (2602.21545) ships its update rule as
+`docs/research/2026-09-27-adopt-vs-port-renamed.md` §2, Muon+ (2602.21545) ships its update rule as
 a 17-line Algorithm 1 and the repo adds only a `Keller` polar-method variant. For
 `burn-muon-plus` a transcription of the pseudocode *is* the reference. Nothing else in
 the library may claim this.

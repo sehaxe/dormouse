@@ -89,7 +89,7 @@ pub struct TrainCfg {
     /// extra forward per depth, NO training: it answers "is the model actually
     /// depth-robust, and how much headroom would an early exit have?" before
     /// we spend a GPU-day on adaptive depth (measure first - see
-    /// research/2026-09-27-adaptive-depth-safe.md). In the snapshot: it
+    /// docs/research/2026-09-27-adaptive-depth-safe-renamed.md). In the snapshot: it
     /// changes what the eval line reports.
     pub eval_depths: bool,
     pub retract_every: usize,

@@ -35,7 +35,7 @@ reads every tensor 1408 floats early and produces a clean-looking table of
 wrong numbers (it reports only ~400 absurd values, all in the first tensor,
 where the window lands on the record header). The assertion in `tensors()`
 rejects any base that leaves a value >= 1e6, so a wrong solve raises instead of
-lying. See research/2026-09-30-cross-process-repro.md.
+lying. See docs/research/2026-09-30-cross-process-repro-renamed.md.
 """
 import argparse
 import hashlib

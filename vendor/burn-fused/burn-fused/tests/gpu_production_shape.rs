@@ -32,7 +32,7 @@
 //! same case lands in `fused_chunk_verify.rs`'s shape table.
 //!
 //! Tolerances are pre-registered from the numbers this tree already argues
-//! for, NOT chosen to make this pass (`research/2026-09-27-oracle-audit.md`
+//! for, NOT chosen to make this pass (`docs/research/2026-09-27-oracle-audit-renamed.md`
 //! §3, checklist item 3):
 //!   - forward/state 1e-3 — fp32 reassociation across chunk boundaries;
 //!     `fused_chunk_verify.rs:124` uses 1e-3 for the same K=V=64 family at

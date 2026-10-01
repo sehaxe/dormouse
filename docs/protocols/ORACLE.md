@@ -116,7 +116,7 @@ differential test can see it.
 
 **There is no tier-(a) layer in this tree.** The project's own audit says the
 same at library scope: *"0 of 28 crates verify any numeric output against an
-authors' own source code"* (`ADR-0020`, evidence `research/2026-09-27-oracle-audit.md`).
+authors' own source code"* (`ADR-0020`, evidence `docs/research/2026-09-27-oracle-audit-renamed.md`).
 This file narrows that to the two crates that carry the headline.
 
 ---

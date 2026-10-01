@@ -313,7 +313,7 @@ formulations against `AbdelStark/attnres`'s four files line by line.** That is a
 and it settles D1, D2, D4, D5, D6, D7 with no transcendental argument and no tolerance
 debate.
 
-**And the repo already knew.** `research/2026-09-27-attenres.md:32` (two days earlier, same
+**And the repo already knew.** `docs/archive/research/2026-09-27-attenres.md:32` (two days earlier, same
 tree): *"One Rust port exists upstream (`AbdelStark/attnres`, 54 stars) — ours is the more
 complete one."* The new report neither cites that document nor engages with the port it names.
 Two research docs on the same crate now coexist with **three different line counts** (2060 /
@@ -489,7 +489,7 @@ resolved for the crate to work at all.
 * `fused_attnres.rs:95` — `/// Chunked Full AttnRes (Kimi K3 §2.2, exact math, bounded memory).`
 
 **Kimi K3 is arXiv 2607.24653** (per `docs/papers/gdn-kda.md:67` and
-`research/2026-09-27-fused-inventory-attention.md:157`, both in this repo). So the fused
+`docs/archive/research/2026-09-27-fused-inventory-attention.md:157`, both in this repo). So the fused
 kernel file — 1821 of the crate's 2338 lines, and the file the report audits most heavily —
 attributes the mechanism to a different arXiv paper than the crate header does, with a
 section number attached. That is an AGENTS.md §1.7 "one word, one meaning" violation, and it
@@ -626,7 +626,7 @@ unexplained `1/√d`), and the test named `..._matches_tensor` cannot fail.
 8. **Fix the four arithmetic/citation slips** (7 blobs / 13 issues / 2338 lines / the README
    path), delete D2's ε clause, fix D3's `d` vs `√d`, and resolve the §3.1-vs-SPECULATION
    contradiction on `streaming_matches_full_recompute` (it is green).
-9. **Add a supersession line for `research/2026-09-27-attenres.md`**, and reconcile the three
+9. **Add a supersession line for `docs/archive/research/2026-09-27-attenres.md`**, and reconcile the three
    line counts (2060 / 2268 / 2338) so two documents on one crate do not disagree.
 
 ### 7. Single experiment that would falsify this review
@@ -949,9 +949,9 @@ made under a bar that has no achievable form for this paper.
 from `crates/dormouse-*` — grep over every `.toml` finds none, and `Cargo.toml:12` excludes
 `vendor/burn-fused` from the workspace. It *is* compiled by CI
 (`.github/workflows/fused-library.yml:163`, `--no-run` only). It **fails its own recorded
-CUDA configuration**: `research/2026-09-27-fused-build-matrix.md:50` — `FAIL 11+1f/2ig` —
+CUDA configuration**: `docs/archive/research/2026-09-27-fused-build-matrix.md:50` — `FAIL 11+1f/2ig` —
 with the panic quoted at `:179-186`. It is already labelled **BROKEN** twice
-(`research/2026-09-27-fused-inventory-attention.md:90`, `:404` of `adopt-vs-port.md`) and
+(`docs/archive/research/2026-09-27-fused-inventory-attention.md:90`, `:404` of `adopt-vs-port.md`) and
 **UNVERIFIED (d)** once (`oracle-audit.md:65`, "also self-recorded BROKEN").
 
 **Cost of the report's plan, done properly:** one contract change + four source-set fixes +
@@ -995,12 +995,12 @@ contradicted claim is the one that matters most here.** `attnres.md:13-15` — *
 CUDA kernels are internally consistent with the tensor path (so the existing parity tests
 are green)"* — and `attnres.md:311-312` — *"the residual-state read→write hazard is
 genuinely closed in the current tree"*. Meanwhile:
-`research/2026-09-27-fused-inventory-attention.md:70-93` records
+`docs/archive/research/2026-09-27-fused-inventory-attention.md:70-93` records
 `streaming_fused_matches_tensor_path` **FAILED**, `step 3: maxdiff 0.83`, *"reproducible,
 same step and magnitude across runs"*, and localises it: *"The isolated components pass
 (`source_score_fused_matches_tensor`, `merge_fused_matches_tensor`), so the bug is in the
 **composition** … not in either kernel alone."*
-`research/2026-09-27-fused-build-matrix.md:50` + `:179-186` record the same failure at
+`docs/archive/research/2026-09-27-fused-build-matrix.md:50` + `:179-186` record the same failure at
 `maxdiff 0.94786954`. `adopt-vs-port.md:404` and `oracle-audit.md:65` both say BROKEN /
 UNVERIFIED (d). The report cites **none of them** (grep for `2026-09-27` in
 `attnres.md`: no hits) and does not list `streaming_fused_matches_tensor_path` among the

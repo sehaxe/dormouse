@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-27 · **Method:** primary sources only, 12 rounds. Every arXiv PDF was downloaded and read with `pdftotext -layout`; every repo file was fetched raw and read in full. Load-bearing claims carry a section/line/equation anchor. Anything unconfirmed is marked **NOT VERIFIED**.
 
-**Relationship to the 2026-09-26 note** (`research/2026-09-26-pkm-engram-deepseek.md`): that file's conclusions on PKM mechanics and on the DeepSeek Engram mechanism **re-check out**. This round adds four things it did not have:
+**Relationship to the 2026-09-26 note** (`docs/archive/research/2026-09-26-pkm-engram-deepseek.md`): that file's conclusions on PKM mechanics and on the DeepSeek Engram mechanism **re-check out**. This round adds four things it did not have:
 
 1. **A published, measured instance of our exact pathology** in Engram-style memory — arXiv 2601.16531, which finds the gate is **anti-correlated with per-token loss**. This is the single most important new source.
 2. **A published saturation curve for hashed n-gram slot count** (same paper): 300K → 500K helps, 500K → 800K *hurts*.

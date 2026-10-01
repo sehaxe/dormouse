@@ -59,7 +59,7 @@
 | arithmetic share of a step | ~16 % (was quoted as 2-5 % on a step-0 denominator) | `gemm_probe`: fp32 GEMMs 3.5-7.6 TFLOP/s, ~40 ms of GEMM against a **245 ms** warm step |
 | fixed cost per step | ~~~465 ms~~ **not a measured constant** — the warm step is 244 ms | 4x tokens at fixed launch count costs only 1.47x time; warm ladder is 244/440/826 ms at batch 8/16/32 |
 | GPU utilisation, warm | **13.3 % mean, 79 % of samples at <=5 %** | `nvidia-smi` at 2 Hz over 150 warm steps at batch 32, 2026-09-29. Launch-bound, **measured** |
-| the same GPU with cuBLAS f16 GEMM (5120x2048x8192) | 43.7 TFLOP/s | `research/cublas_probe/`, 3.3-4x cuBLAS fp32, 4.1e-4 max rel err — **unaffected by the step-time retraction** |
+| the same GPU with cuBLAS f16 GEMM (5120x2048x8192) | 43.7 TFLOP/s | `docs/research/cublas_probe/`, 3.3-4x cuBLAS fp32, 4.1e-4 max rel err — **unaffected by the step-time retraction** |
 
 Reference point for the ceiling: LLMQ (arXiv 2512.15306) benchmarks this exact
 card - 0.5B at 13.0k tok/s bf16 (85% MFU), 1.5B at 3.9k (78%), 7B at 0.9k (79%),

@@ -40,7 +40,7 @@
 >
 > ## ⚠️ CORRECTED 2026-09-27 — read this first
 >
-> `research/2026-09-27-kda-allocator-fix.md` measured the §2.5 hypothesis this
+> `docs/archive/research/2026-09-27-kda-allocator-fix.md` measured the §2.5 hypothesis this
 > document was built on, at the production shape, on the trainer's own patched
 > cubecl, with real `Client::sync()` barriers. Three claims below are false and
 > must not be relied on:
@@ -443,7 +443,7 @@ forbidden** at the K3 floor `g = −5`; that is why FlashKDA also picked 16.
 I verified all three premises: **cudarc 0.19.10 ships `cublas` and `cublaslt` modules**;
 **cubecl's `Stream.sys` is `cudarc::driver::sys::CUstream`**; **`GpuResource { pub ptr: u64,
 binding, size }` exists** in the vendored `cubecl-cuda/src/compute/storage/gpu.rs`. The
-missing piece is exactly what `research/2026-09-27-optimization-1b.md` already specifies: a
+missing piece is exactly what `docs/archive/research/2026-09-27-optimization-1b.md` already specifies: a
 client-side `Handle → GpuResource` RPC.
 
 But the roofline says the route cannot help *this* op:

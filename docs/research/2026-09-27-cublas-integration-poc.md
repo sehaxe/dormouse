@@ -3,7 +3,7 @@
 **Date:** 2026-09-27 · **Spike:** `crates/cublas-poc/` (`cargo run --release -p cublas-poc`)
 · **Log:** `/home/sehaxe/logs/cublas_poc_2026-09-27.log`
 · **The patch is in this report and is NOT in the tree** (§2, also as
-`research/2026-09-27-cublas-pointer-patch.diff`).
+`docs/research/2026-09-27-cublas-pointer-patch.diff`).
 
 ## 0. Verdict
 
@@ -64,7 +64,7 @@ Two findings change existing beliefs:
 
 ## 2. The patch (110 lines, 5 files) — NOT COMMITTED
 
-`research/2026-09-27-cublas-pointer-patch.diff`, applied to
+`docs/research/2026-09-27-cublas-pointer-patch.diff`, applied to
 `vendor/cubecl-fix/`, verified to compile and to make §6 work. It is additive:
 two defaulted trait methods, one impl, one client wrapper, two re-exports. No
 existing behaviour changes (a backend that does not answer gets `None`, exactly
@@ -131,7 +131,7 @@ query would be affordable too, but a startup-cached one is free.
 
 ## 3. The row-major call convention (MEASURED, and the documented one is wrong)
 
-`research/2026-09-27-optimization-1b.md` records
+`docs/archive/research/2026-09-27-optimization-1b.md` records
 `GemmEx(OP_T, OP_N, m=N, n=M, k=K, A=B, lda=K, B=A, ldb=K, C, ldc=N)`. **That
 call is accepted by the driver and computes the wrong answer** (§0 row 11 of the
 probe's convention table: `maxabs 6.86`). The probe walks all 16

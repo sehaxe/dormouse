@@ -636,7 +636,7 @@ the gate before and after every optimization.
 
 **Not** a smoke (a smoke screens NaN and slope; a canary measures step time).
 **Not** the *fake-loss canary* of the adaptive-depth research, which is an
-invariant check on a loss curve (`research/2026-09-27-adaptive-depth-safe.md`).
+invariant check on a loss curve (`docs/research/2026-09-27-adaptive-depth-safe-renamed.md`).
 Two words, two things, one repo.
 
 ### smoke / confirm / long gate
@@ -659,7 +659,7 @@ nothing has yet passed a long gate.
 | meaning | what it is | where | state |
 |---|---|---|---|
 | **fused kernel** (correct today) | a library op that does the whole computation in one CUDA kernel instead of a chain of eager tensor ops, with a `Fused`/`Fallback` seam that says which ran | `burn_gdn2`, `burn_rmsnorm::fused`, `burn_muon_plus::fused_kernels`, `burn_spectral`; counted at `crates/dormouse-core/src/attention.rs:20` (`fused_seam_counts`) and `crates/dormouse-train/src/optim.rs:59` (`fused_kernels_skipped`) | **live**, and deliberately countable, because the fallback computes the same function and nothing else would show it (ADR-0019) |
-| **the whole-loop `fused/` module** | a hand-written CUDA autodiff op for the entire ponder loop, ~7.4k LOC, once `crates/dormouse-core/src/fused/` | **deleted.** The directory is gone, the `DM_FUSED` env var is gone (`grep -rn DM_FUSED crates/` is empty) | measured **9.21 s/step against burn's 7.05** at flagship (`research/2026-09-23-fused-flagship50.md:52-53`), 1.3x slower; the earlier "1.7-2.0x faster" number from ADR-0003 is **retracted** in ADR-0009 |
+| **the whole-loop `fused/` module** | a hand-written CUDA autodiff op for the entire ponder loop, ~7.4k LOC, once `crates/dormouse-core/src/fused/` | **deleted.** The directory is gone, the `DM_FUSED` env var is gone (`grep -rn DM_FUSED crates/` is empty) | measured **9.21 s/step against burn's 7.05** at flagship (`docs/archive/research/2026-09-23-fused-flagship50.md:52-53`), 1.3x slower; the earlier "1.7-2.0x faster" number from ADR-0003 is **retracted** in ADR-0009 |
 
 Which one is correct: **the library kernel.** The whole-loop op is gone; the
 kernel is the live concept, and the counters that exist to prove a kernel ran

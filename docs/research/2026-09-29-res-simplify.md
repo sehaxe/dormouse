@@ -72,7 +72,7 @@ Equally load-bearing, and mostly *not* the same shape as our arms.
 | Candidate | Why rejected |
 |---|---|
 | DeepSeek-V3-Lite, Mini, Qwen small, OLMo | No A/B their own removal was found; the queue ran out of budget for per-model reports |
-| "Byte-level / ByT5 / character models need more arms" | ByT5's finding is about *data efficiency* at 4× less text, not component deletion, and I did not re-resolve its arXiv id in this pass — so I am not citing it here. The project's own `research/2026-09-26-small-lm-dynamics.md` already carries it with a verified id. Not a deletion source |
+| "Byte-level / ByT5 / character models need more arms" | ByT5's finding is about *data efficiency* at 4× less text, not component deletion, and I did not re-resolve its arXiv id in this pass — so I am not citing it here. The project's own `docs/archive/research/2026-09-26-small-lm-dynamics.md` already carries it with a verified id. Not a deletion source |
 | 2604.24938 "Rethinking Layer Redundancy: Calibration Matters More Than Search" | Real and relevant (layer-pruning search is not where the win is; calibration is) but it re-prunes *existing* 7 B-class models. Same post-hoc-pruning regime as row 1 of §3, and it inherits the generative-task caveat |
 | TALE 2510.22767, LayerChop 2305.14864, Reassessing Layer Pruning 2411.15558, Just CHOP | Four more post-hoc layer-pruning papers. All require fine-tuning/healing to recover, all evaluated on the same QA metrics. Adding four more rows of the same evidence class would not change a single conclusion |
 | 2605.30202 "A Dual-Path Architecture" | Correct and on-topic ("at fixed FLOPs a looped model has strictly less capacity than a baseline transformer") but it is a *proposal* of a new block, not an ablation of an existing one |
@@ -95,7 +95,7 @@ deepest sources here agree:
    will report `use_dspark` as worthless — and that result would be **correct and
    misleading at the same time**.
 2. **Our own capacity position.** By Chinchilla's ≈20 tokens/param (the figure the
-   project already carries in `research/2026-09-26-small-lm-dynamics.md`), 9.2 M params
+   project already carries in `docs/archive/research/2026-09-26-small-lm-dynamics.md`), 9.2 M params
    wants ≈184 M tokens ≈ **184 MB** of single-pass data. At 19,500 steps × 5,120 B the
    best recorded run had seen ≈**100 MB**, i.e. ~54% of the compute-optimal budget —
    and its curve had already regressed (4.997 at step 6,500 → 5.450 at 19,500).

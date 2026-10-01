@@ -627,7 +627,7 @@ The defenses are installed, not optional.
   never been A/B'd, which is the debt this does not discharge.**
 - **"fused is 1.7-2.0× faster than burn" (ADR-0003).** Retracted in ADR-0009. At
   flagship the whole-loop fused op measured **9.21 s/step against burn's 7.05**
-  — 1.3× *slower* (`research/2026-09-23-fused-flagship50.md:52-53`). The
+  — 1.3× *slower* (`docs/archive/research/2026-09-23-fused-flagship50.md:52-53`). The
   `fused/` module and the `DM_FUSED` switch are now **deleted**; its kill
   switch in ADR-0009 is moot. What survives under the name "fused" is the
   library's own fused kernels, which are live and counted.

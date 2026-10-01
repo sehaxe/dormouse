@@ -877,6 +877,6 @@ modules/rope_encoding.rs, activation/swiglu.rs, activation/glu.rs, modules/atten
 `burn-core-0.22.0-pre.4/src/module/param/{tensor.rs,base.rs}`, `burn-optim-0.22.0-pre.4`
 (optimiser list — confirmed **no Muon**).
 
-**Cross-referenced, not re-derived:** `research/2026-09-27-fused-inventory-attention.md`,
+**Cross-referenced, not re-derived:** `docs/archive/research/2026-09-27-fused-inventory-attention.md`,
 `-memory-objectives.md`, `-precision.md` (per-crate WIRED/UNUSED/SUPERSEDED/BROKEN verdicts,
 LOC counts, the `TypeId` gate analysis, the call-site table).

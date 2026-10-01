@@ -214,7 +214,7 @@ every future run), (b) unlock bf16 GEMM via cuBLAS before any 1B attempt,
 
 ## Addendum: the cuBLAS measurement (the actual 1B answer)
 
-Two more experiments, both on this box, source in `research/cublas_probe/`:
+Two more experiments, both on this box, source in `docs/research/cublas_probe/`:
 
 1. **A hand-rolled WMMA kernel is not a free win.** 100 lines of classic
    `wmma::mma_sync` (f16 fragments, f32 accumulator) on the 1B FFN shape:

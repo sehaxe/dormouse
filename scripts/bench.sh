@@ -6,7 +6,7 @@
 #   scripts/bench.sh flagship # small, aux on, 48M slots, batch 10 s512, 50 steps (~20 GB RSS)
 #
 # Preflight: one train process max, RAM headroom per mode. The metrics line is
-# the regression gate for docs/PLAN.md's performance budget.
+# the regression gate for docs/architecture/PLAN.md's performance budget.
 set -eu
 cd "$(dirname "$0")/.."
 MODE="${1:-canary}"

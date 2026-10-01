@@ -50,7 +50,7 @@ still true; where the two disagree, this subsection wins.
 
 | claim | number | when / shape / how |
 |---|---|---|
-| Fused gated-delta (KDA) kernel, forward | **1.212 ms** vs `torch.compile` 54.5 ms = **45×**; vs PyTorch eager-best 160.1 ms = 132× | 2026-09-27. b=10, t=512, h=12, K=V=64, chunk=16, fp32, 10 runs × 200 iters, real `a_log=-3` decay. torch 2.11.0+cu128. [`research/2026-09-27-pytorch-baseline.md`](research/2026-09-27-pytorch-baseline.md) §1 |
+| Fused gated-delta (KDA) kernel, forward | **1.212 ms** vs `torch.compile` 54.5 ms = **45×**; vs PyTorch eager-best 160.1 ms = 132× | 2026-09-27. b=10, t=512, h=12, K=V=64, chunk=16, fp32, 10 runs × 200 iters, real `a_log=-3` decay. torch 2.11.0+cu128. [`docs/research/2026-09-27-pytorch-baseline-renamed.md`](docs/research/2026-09-27-pytorch-baseline-renamed.md) §1 |
 | …same op, forward+backward | **RETRACTED — do not cite.** It read **25.9 ms** vs PyTorch eager-best 290.3 ms = **11.2×**, 138× fewer allocations, 2.5× less VRAM. The device was built as `Device::autodiff(...)` = NoCheckpointing, so the measured backward contained the *tensor* adjoint, and the verification test compared that tensor adjoint against the tensor path — verified the tensor adjoint twice. Only the FORWARD row above survives | retracted 2026-09-28, `AGENTS.md` §3.2 (last bullet). The fused adjoint kernels have still never been numerically compared to anything |
 | f16 GEMM, our path vs cuBLAS | **7.4× behind** (0.389 ms / 41.4 TFLOP/s cuBLAS vs 2.880 ms / 5.6 TFLOP/s ours) | 2026-09-27, `[5120,768]×[768,2048]`, zero-copy on cubecl's own stream, `max rel err 2.7e-4`. `crates/cublas-poc`; log `~/logs/cublas_poc_2026-09-27.log` |
 | fp32 GEMM, our path vs cuBLAS | **no ratio claimed** — 4.8 / 47.1 / 47.7 / 51.7 / 71.1 ms for one fixed matmul in the *same binary* (15× spread, power-capped) | 2026-09-27. At the median we are 4.4× behind; at the fastest sample 2.3× ahead. The measurement does not resolve it, so neither number is published as fact |
@@ -72,7 +72,7 @@ still true; where the two disagree, this subsection wins.
 - **0 of 28 library crates check any numeric output against an *authors' own*
   source code.** Six crates assert in their docs that they match an
   implementation; none of the six has a test wired to one. Full per-crate table
-  with provenance and tolerances: [`research/2026-09-27-oracle-audit.md`](research/2026-09-27-oracle-audit.md).
+  with provenance and tolerances: [`docs/research/2026-09-27-oracle-audit-renamed.md`](docs/research/2026-09-27-oracle-audit-renamed.md).
   The honest sentence: *the library verifies fused kernels against our own
   tensor fallback, and transcriptions of papers against our own expectations of
   those papers.* That catches real drift. It is not "bit-for-bit against the
@@ -228,11 +228,11 @@ The 5-gram line is not a strawman: on the corpus the model is trained on, a
 4-gram beats it by ~4.9 BPB, and on the text domains a 5-gram sits at 2.25–2.66
 while the *agentic* slice collapses to 0.938 at 0.0 % unseen 5-gram contexts —
 i.e. 21 GB of the available data is memorizable at order 5 and teaches format,
-not language ([`research/2026-09-27-domain-anchors.md`](research/2026-09-27-domain-anchors.md)).
+not language ([`docs/research/2026-09-27-domain-anchors-renamed.md`](docs/research/2026-09-27-domain-anchors-renamed.md)).
 
 This is the number that matters, and it is the reason the project's own
 milestone ladder reads "7.5 M beats a 24-line counter" as rung 1
-([`research/2026-09-27-scale-ladder.md`](research/2026-09-27-scale-ladder.md)).
+([`docs/research/2026-09-27-scale-ladder-renamed.md`](docs/research/2026-09-27-scale-ladder-renamed.md)).
 **Any capability claim about this model is premature until that number moves.**
 
 ### (e) What blocks a 1 B-parameter core model, in numbers
@@ -244,7 +244,7 @@ measured 9.2 M operating point — **~245 ms warm**, 4096 tokens/step at batch 8
 — the same card does 0.5 B at 13.0 k tok/s and 1.5 B at 3.9 k tok/s in the only
 published benchmark of this
 exact GPU (LLMQ, arXiv 2512.15306, 78–85 % MFU). Our own arithmetic, from
-measured throughput (`research/2026-09-27-scale-ladder.md`):
+measured throughput (`docs/research/2026-09-27-scale-ladder-renamed.md`):
 
 | | 7.5 M (now) | 1 B |
 |---|---|---|
@@ -254,7 +254,7 @@ measured throughput (`research/2026-09-27-scale-ladder.md`):
 
 The 7.5 M column was struck on 2026-09-29 (see row 3 of the table in (a)). The
 1 B column is a roofline and stands; its **wall clock** did not, and the
-discrepancy is named above rather than smoothed over. `research/2026-09-27-scale-ladder.md`
+discrepancy is named above rather than smoothed over. `docs/research/2026-09-27-scale-ladder-renamed.md`
 carries the full withdrawal.
 
 Four blockers, all measured or code-verified:
@@ -807,10 +807,10 @@ one exists because breaking it cost a run, a week, or a claim.
 | [`docs/audit-2026-09-25.md`](docs/audit-2026-09-25.md) | codebase verdict audit: kill list, missing A/Bs |
 | [`docs/architecture/design-minimal.md`](docs/architecture/design-minimal.md) | the minimal-architecture target |
 | [`docs/architecture/mixture-arms.md`](docs/architecture/mixture-arms.md) | three priced training arms |
-| [`research/2026-09-27-oracle-audit.md`](research/2026-09-27-oracle-audit.md) | what the library's verification claims are actually worth (read this before trusting any of them) |
-| [`research/2026-09-27-pytorch-baseline.md`](research/2026-09-27-pytorch-baseline.md) | every number in (a), with the two ways it can mislead you |
-| [`research/2026-09-27-scale-ladder.md`](research/2026-09-27-scale-ladder.md) | the 1B arithmetic in (e) |
-| [`research/2026-09-27-domain-anchors.md`](research/2026-09-27-domain-anchors.md) | per-domain n-gram bars |
+| [`docs/research/2026-09-27-oracle-audit-renamed.md`](docs/research/2026-09-27-oracle-audit-renamed.md) | what the library's verification claims are actually worth (read this before trusting any of them) |
+| [`docs/research/2026-09-27-pytorch-baseline-renamed.md`](docs/research/2026-09-27-pytorch-baseline-renamed.md) | every number in (a), with the two ways it can mislead you |
+| [`docs/research/2026-09-27-scale-ladder-renamed.md`](docs/research/2026-09-27-scale-ladder-renamed.md) | the 1B arithmetic in (e) |
+| [`docs/research/2026-09-27-domain-anchors-renamed.md`](docs/research/2026-09-27-domain-anchors-renamed.md) | per-domain n-gram bars |
 | [`docs/architecture/post-training.md`](docs/architecture/post-training.md), [`docs/architecture/bf16-plan.md`](docs/architecture/bf16-plan.md) | post-training loop, precision plans (in Russian) |
 
 ## License

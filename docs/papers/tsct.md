@@ -225,7 +225,7 @@ computes `‖UᵀU − I‖_F` **on the host** via `into_data()` — a full devi
 
 Also `SpectralMoE` (`lib.rs:690-760`): rank-1 ternary experts `[in, M·r]` / `[out, M·r]`,
 top-k router, optional **Expert-Choice** routing (`2202.09368`). `moe_fused.rs` (3243 lines)
-is the fused CUDA path. **Per `research/2026-09-27-fused-inventory-precision.md:522`,
+is the fused CUDA path. **Per `docs/archive/research/2026-09-27-fused-inventory-precision.md:522`,
 `SpectralLinear::forward` never reads `self.fused` and `SpectralMoE` is never constructed
 — I did not re-verify that inventory in this pass; treat it as a prior reading.**
 
