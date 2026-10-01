@@ -1138,7 +1138,20 @@ mod tests {
     /// with the attention and memory arms off, so what differs between the arms
     /// is the residual statement and nothing else.
     fn mhc_cfg(depth: usize) -> DormouseConfig {
-    // ---------------------------------------------------------------------
+        let mut cfg = DormouseConfig::default();
+        cfg.d_model = 32;
+        cfg.n_heads = 2;
+        cfg.head_dim = 16;
+        cfg.d_ffn = 64;
+        cfg.max_iter = depth;
+        cfg.n_experts = 1;
+        cfg.rank = 8;
+        cfg.engram_rows = 256;
+        cfg.use_kda = false;
+        cfg.use_engram = false;
+        cfg
+    }
+
     // SITU (arXiv:2607.24653v2 Eq 12). The FORM is gated in the mechanism
     // crate, against Moonshot's own numbers - see
     // vendor/burn-fused/crates/burn-situ/src/lib.rs and
@@ -1157,11 +1170,6 @@ mod tests {
         cfg.d_model = 32;
         cfg.n_heads = 2;
         cfg.head_dim = 16;
-        cfg.d_ffn = 64;
-        cfg.max_iter = depth;
-        cfg.n_experts = 1;
-        cfg.rank = 8;
-        cfg.engram_rows = 256;
         // A multiple of 4, so `LinearLike`'s `N % 4 == 0` padding
         // (param.rs:49) leaves the width exactly `f` and `2f` and the
         // width assertions below are about the arm, not about the pad.
@@ -2233,4 +2241,4 @@ mod tests {
         assert_eq!(tables, vec![32_768; 3]);
         assert_eq!(mask, 32_767);
     }
-}}
+}
