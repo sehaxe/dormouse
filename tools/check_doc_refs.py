@@ -147,7 +147,8 @@ def main() -> int:
 				if exists(path):
 					checked += 1
 					continue
-				# A bare `docs/x.md` may be relative to the citing file.
+				# A bare path may be relative to the citing file rather than to the
+				# repo root, so a second chance before it is called missing.
 				if (ROOT / Path(f).parent / path).exists():
 					checked += 1
 					continue

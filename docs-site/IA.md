@@ -215,6 +215,11 @@ names the case where later measurement dissolved a review's finding
 each other produce a disagreement, and that disagreement is the finding — a
 `review-a` / `review-b` pair in a sidebar is four pages where one is meant.
 
+One review was archived in the same pass: `landing-2026-09-30`, which recorded
+that seven lanes' commits were already on main under other hashes and that
+cherry-picking them would regress it. That finding IS the git history, and it is
+in `docs/archive/reviews/` where the archive rule keeps it.
+
 Three documents are still globbed from `research/` — `ab-wave-2026-10-01.md`,
 `hygiene-2026-10-01.md` and `research/decisions/class-b-2026-10-01.md` — because
 the ab-wave lane was writing them when the consolidation ran. The two globs that
