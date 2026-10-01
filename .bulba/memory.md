@@ -146,3 +146,7 @@ OpenBLAS, собранный `DYNAMIC_ARCH` ( measured: `OpenBLAS 0.3.34.106.0 .
 `CARGO_TERM_COLOR: always` не находит ничего** (ошибка приходит как `\e[1m\e[91merror[E0433]`).
 `tools/test-feature-matrix.sh` печатал `FAIL` без единой строки причины. Обе джобы были красные
 сутки, и читать пришлось сырой лог.
+
+**Docs-gate anatomy (2026-10-01, docs-wave2):** `RUSTDOCFLAGS="-D warnings"` gates the doc surface; `RUSTFLAGS` would also deny the train rlib's 8 rustc warnings (6 in lib.rs, wave 3's file) and can't go green until that lane lands. CI's docs job was blind twice: no `-D`, no `-p dormouse-train`. Wave 1's review landed on main while its code commit (`e56cdb9`, config-seam docs) did not — report without diff is ADR-0020 in documentation form; the 40 missing_docs it was green through are closed on `wt/docs-wave2`.
+
+**Config-seams lane (2026-10-01, wt/config-seams):** the four doc-coverage §3.1-§3.3 + dead-pub §2 fixes landed as 179bdf3..ad3147f; loader warn is COUNTED not LOUD (the dangerous case is when another candidate loads — a terminal Err never fires there). red→green trick that needs no throwaway code: run the OLD test binary from a scratch cwd holding a broken configs/small.toml (cwd candidates come first in `candidates()`); before = silence, after = the warn.
