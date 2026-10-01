@@ -398,6 +398,23 @@ impl InputPins {
     }
 }
 
+/// How many times the window runs BEFORE the recorded pass.
+///
+/// Not a tuning knob: it is the capture protocol. `graph_prepare` opens a
+/// PRIMING window in which every allocation is forced into the persistent pool
+/// and RETAINED (`capture_touch`), so one pass grows the pool to that pass's
+/// full working set instead of its transient peak. `start_capture` ends priming
+/// (`Window::begin` → `capture_priming_end`) and releases those slices as free,
+/// and the recorded pass then REUSES them.
+///
+/// Without the warmup the recorded pass allocates everything, every allocation
+/// is a memory node, and `stop_capture` refuses the capture with the reason
+/// spelled out — which is the failure mode this constant exists to prevent.
+/// One pass is the documented minimum (`graph_step.rs` uses two on a toy);
+/// if a capture is refused anyway the next attempt runs one more, so the pool
+/// keeps whatever it grew and the seam heals instead of failing.
+const CAPTURE_WARMUP: usize = 1;
+
 /// What the seam needs from a captured graph; the `cfg` split exists only so
 /// the CPU build carries no CUDA type.
 pub trait GraphReplay {
@@ -497,10 +514,13 @@ impl Seam {
     /// back cannot be inside a capture window. The window's gradients stay in
     /// the seam so a replay hands the optimizer the same ones with no host work
     /// at all.
+    ///
+    /// `body` is `Fn`, not `FnOnce`: a capture runs it [`CAPTURE_WARMUP`]
+    /// times to populate the pool and then once more inside the recording.
     pub fn step(
         &mut self,
         ungraphed: bool,
-        body: impl FnOnce() -> Gradients,
+        body: impl Fn() -> Gradients,
     ) -> Result<(), String> {
         if !ungraphed {
             if let Some(graph) = &self.graph {
@@ -522,6 +542,14 @@ impl Seam {
                     if let Err(e) = client.graph_prepare() {
                         self.grads = Some(body());
                         return self.refused(format!("graph_prepare: {e:?}"));
+                    }
+                    // The warmup, OUTSIDE the recording: this is the pass that
+                    // grows the persistent pool to the window's working set, so
+                    // the recorded pass reuses slices instead of allocating
+                    // (an allocation inside the window is a memory node, and a
+                    // memory node makes the graph un-relaunchable).
+                    for _ in 0..CAPTURE_WARMUP {
+                        let _ = body();
                     }
                     if let Err(e) = client.start_capture() {
                         self.grads = Some(body());
@@ -560,7 +588,13 @@ impl Seam {
     }
 
     pub fn report(&self) -> String {
-        format!("{} pin={} launches", self.stats.line(), self.pin_launches)
+        format!(
+            "{} ({} replayed of {} graphed steps, pin={} launches)",
+            self.stats.line(),
+            self.stats.replays,
+            self.stats.replays + self.stats.captures,
+            self.pin_launches
+        )
     }
 }
 

@@ -1163,8 +1163,11 @@ pub fn train_loop(
     // LOG steps (`timer_step = step % log_every`), which are exactly the steps
     // that run ungraphed, so it can never time a replayed step. The honest
     // number for this flag is the mean over a slice, measured here.
+    //
+    // From step 50, not from 0: step 0 is the autotune step (5.5 s against a
+    // 0.46 s warm step, 23x) and a mean that includes it measures the tuner.
     let step_at_entry = step;
-    let t_loop = std::time::Instant::now();
+    let mut t_warm: Option<std::time::Instant> = None;
     // One-way fp32 fallback state, RESTORED from the checkpoint above: a run
     // that latched it did so because its factors drifted, and re-running the
     // quantized forward for even one step re-quantizes exactly the factors the
@@ -1215,6 +1218,9 @@ pub fn train_loop(
         // here is what makes "no measurement" print as `-`.
         tsct_bef = None;
         tsct_aft = None;
+        if step >= step_at_entry + 50 && t_warm.is_none() {
+            t_warm = Some(std::time::Instant::now());
+        }
         let t_iter = std::time::Instant::now();
         let (bytes, hashes) = (std::mem::replace(&mut pbytes, Vec::new()), std::mem::replace(&mut phashes, Vec::new()));
         let t_io = std::time::Instant::now();
@@ -1309,6 +1315,11 @@ pub fn train_loop(
             Some(t) => Some(t.get(&bytes)?),
             None => None,
         };
+        // Cloned because the window closure is `Fn` (a capture runs it for the
+        // warmup and again inside the recording), and `--jepa-targets` is
+        // refused with `--graph-capture` anyway — this only keeps the two code
+        // paths identical.
+        let jepa_target = jepa_target.clone();
         // The window: forward -> loss -> NaN-mask -> backward -> sanitize.
         // Everything the graph captures is inside this closure and nothing
         // else is, which is what makes the capture sound.
@@ -1321,10 +1332,14 @@ pub fn train_loop(
                 if host_rows.is_some() { None } else { Some(h.clone()) },
             )
         };
-        let mut loss_log = None;
-        let mut aux_log = None;
+        // `RefCell` because the window closure is `Fn` (a capture runs it for
+        // the warmup and again inside the recording) and these two are the
+        // values it reports OUT. Both are idempotent across those runs — same
+        // step, same inputs, same cadence — so the last write is the right one.
+        let loss_log = std::cell::RefCell::new(None);
+        let aux_log = std::cell::RefCell::new(None);
         seam.step(ungraphed, || {
-            let (_logits, rec_ce, _kda, aux) = if let Some(tg) = jepa_target {
+            let (_logits, rec_ce, _kda, aux) = if let Some(tg) = jepa_target.clone() {
                 model.forward_with_jepa_targets::<Backend>(
                     x.clone(),
                     // RAM-offload path drives the Engram from host_rows; uploading
@@ -1346,7 +1361,7 @@ pub fn train_loop(
             let mut loss = model.loss::<Backend>(rec_ce);
             // Aux is read only on log steps; skip the clone (an extra autodiff
             // node) elsewhere.
-            aux_log = if step % cfg.log_every as u64 == 0 { aux.clone() } else { None };
+            *aux_log.borrow_mut() = if step % cfg.log_every as u64 == 0 { aux.clone() } else { None };
             if let Some(a) = aux {
                 loss = loss + a;
             }
@@ -1354,7 +1369,7 @@ pub fn train_loop(
             // scalar at log cadence, host-table grads at the host-Adam cadence,
             // timers) so forward/backward/step of adjacent steps overlap on the
             // GPU. The scalar read rides along free inside the grads D2H.
-            loss_log = if step % cfg.log_every as u64 == 0
+            *loss_log.borrow_mut() = if step % cfg.log_every as u64 == 0
                 || host_adam_step
                 || (cfg.timers && timer_step)
             {
@@ -1386,6 +1401,8 @@ pub fn train_loop(
             sanitize_grads(&mut raw_grads, &model);
             raw_grads
         })?;
+        let loss_log = loss_log.into_inner();
+        let aux_log = aux_log.into_inner();
         let fwd_ms = t_fwd.elapsed().as_secs_f64() * 1000.0;
         let t_bwd = std::time::Instant::now();
         let lr = match stress.as_ref() {
@@ -1896,22 +1913,22 @@ pub fn train_loop(
     save_ckpt(&dir, &cfg.ckpt_name, &model, &optim, teacher.as_ref(), ortho_fp32, step, ce)
         .map_err(|e| format!("final checkpoint save failed: {e}"))?;
     save_ngram(&dir, &cfg.ckpt_name, host.as_ref(), step)?;
-    // The graph's own verdict, printed whatever the flag said: a lane that
-    // captured once and replayed nothing must read as the null it is, not as a
-    // run that quietly did the same work as before.
-    if graph_on {
-        let ran = step - step_at_entry;
-        let secs = t_loop.elapsed().as_secs_f64();
-        println!(
-            "graph: {} steps in {:.1}s = {:.1} ms/step ({} replayed, {} ungraphed, {} refused). {}",
-            ran,
-            secs,
-            secs * 1e3 / ran.max(1) as f64,
-            seam.stats.replays,
-            ran.saturating_sub(seam.stats.replays),
-            seam.stats.refusals,
-            seam.report(),
-        );
+    // The warm-step mean, on every run that asked for timers, so a control and a
+    // graphed arm are read with the SAME instrument. The graph's own verdict
+    // rides with it: a lane that captured once and replayed nothing must read
+    // as the null it is, not as a run that quietly did the same work as before.
+    if cfg.timers {
+        if let Some(t) = t_warm {
+            let ran = step.saturating_sub(step_at_entry + 50).max(1);
+            println!(
+                "warm steps {}..{}: {:.1}s = {:.1} ms/step{}",
+                step_at_entry + 50,
+                step,
+                t.elapsed().as_secs_f64(),
+                t.elapsed().as_secs_f64() * 1e3 / ran as f64,
+                if graph_on { format!(" | {}", seam.report()) } else { String::new() },
+            );
+        }
     }
     println!(
         "done steps={step} best ce={best:.3} | {}",
