@@ -1182,7 +1182,7 @@ Ranked applicability:
   process-global counter — two runs can share a data-section sha256 while
   their records differ). The seeded RNG stream is **provably correct**:
   7 951 694 direct-draw slots bit-identical across 9 processes. The TSCT
-  residue enters `qr_householder` (`burn-spectral/src/lib.rs:689`) at a
+  residue enters `qr_householder` (`burn-spectral/src/lib.rs:792`) at a
   **random iteration** (0…55, median 2, 139/360 pairs fully identical); the
   measured mechanism is nondeterministic reductions at `lib.rs:697, :704,
   :711, :714` — the autotuner attribution is the recorded HYPOTHESIS, not
