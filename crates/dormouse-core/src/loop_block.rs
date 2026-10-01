@@ -277,6 +277,17 @@ impl LoopBlock {
         m.max(self.out_proj.max_ortho())
     }
 
+    /// Fold the block's TSCT forward diagnostics into `agg`, worst-case over
+    /// every factor (the `max_ortho` convention). Syncs the device once per
+    /// factor; cadence only — see [`LinearLike::fold_tsct_diag`].
+    pub fn fold_tsct_diag(&self, agg: &mut crate::param::TsctDiag) {
+        for f in &self.expert_ffns {
+            f.gate_up.fold_tsct_diag(agg);
+            f.down.fold_tsct_diag(agg);
+        }
+        self.out_proj.fold_tsct_diag(agg);
+    }
+
     pub fn new(cfg: &DormouseConfig, device: &Device) -> Self {
         let d = cfg.d_model;
         let f = cfg.d_ffn;

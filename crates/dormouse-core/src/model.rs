@@ -511,6 +511,26 @@ impl DormouseModel {
         self.loop_block.max_ortho().max(self.lm_head.max_ortho())
     }
 
+    /// The TSCT forward-path diagnostics: the Gram error of the factor the
+    /// forward actually multiplies by at the current annealing `alpha`, and
+    /// the `|s|` spectrum's min/max/near-off count. Worst-case over every
+    /// factor in the model.
+    ///
+    /// Read ONLY at the trainer's eval boundary: every factor costs a device
+    /// sync, and a per-step read of ~30 factors drains the pipeline (§1.3).
+    pub fn tsct_diag(&self) -> crate::param::TsctDiag {
+        let mut agg = crate::param::TsctDiag::default();
+        self.fold_tsct_diag(&mut agg);
+        agg
+    }
+
+    /// The fold half of [`Self::tsct_diag`], so the model and the block share
+    /// one traversal (and the lm_head is not forgotten by one of them).
+    pub fn fold_tsct_diag(&self, agg: &mut crate::param::TsctDiag) {
+        self.loop_block.fold_tsct_diag(agg);
+        self.lm_head.fold_tsct_diag(agg);
+    }
+
     // NOTE: there is deliberately NO `forward_bytes(bytes) -> logits` here.
     // It was deleted 2026-09-28 and it is the bug this comment is here to stop
     // recurring. A bytes->logits entry point in the model has to derive the

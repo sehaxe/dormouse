@@ -1111,6 +1111,12 @@ pub fn train_loop(
     // already exact — the monitor would have nothing to guard, so skip it
     // entirely (it costs 30+ device syncs per check).
     let mut ortho_fp32 = saved_ortho || cfg.quant.as_deref() == Some("fp32");
+    // The retraction's BEFORE/AFTER Gram error pair, for the eval line.
+    // `None` on every step that is not an eval step, and on an eval step
+    // where `retract_every` did not fire — the field then reads `-` rather
+    // than printing two identical numbers that look like a measurement.
+    let mut tsct_bef: Option<f32> = None;
+    let mut tsct_aft: Option<f32> = None;
     if saved_ortho && cfg.quant.as_deref() != Some("fp32") {
         println!("fp32 factor fallback restored from the checkpoint (one-way, still latched)");
     }
@@ -1135,6 +1141,19 @@ pub fn train_loop(
     // seeded, never repeated, and different on every run of the same config.
     dormouse_core::aux::set_mask_stream(cfg.seed, step);
     while step < cfg.steps as u64 {
+        // The eval-step predicate, named once: the TSCT diagnostics bracket
+        // the retraction above and print in the eval block below, and both
+        // must agree on which steps those are. `step > 0` is the eval's own
+        // guard (a step-0 eval would score an untrained model on the same
+        // window and look like a result).
+        let on_eval_step = cfg.eval_every > 0 && step > 0 && step % cfg.eval_every as u64 == 0;
+        // Reset per step: the retraction block only writes them on a step
+        // where it fires, so without this a step whose retraction is skipped
+        // would inherit the PREVIOUS step's pair and print it against this
+        // step's eval line. Both are read in the same iteration, so clearing
+        // here is what makes "no measurement" print as `-`.
+        tsct_bef = None;
+        tsct_aft = None;
         let t_iter = std::time::Instant::now();
         let (bytes, hashes) = (std::mem::replace(&mut pbytes, Vec::new()), std::mem::replace(&mut phashes, Vec::new()));
         let t_io = std::time::Instant::now();
@@ -1354,11 +1373,24 @@ pub fn train_loop(
         // drift at cadence and fall back to fp32 factors when it exceeds the
         // plan's 1e-3 threshold. --retract-every / --retract-iters override.
         if step % cfg.retract_every.max(1) as u64 == 0 {
+            // TSCT retraction diagnostic, BEFORE side (pre-100k checklist 2a).
+            // `max_ortho` IS the per-entry masters metric, so this costs no
+            // new metric - it is the same read the latch below makes, taken
+            // one call earlier so the pair brackets the retraction. Only on
+            // eval steps: it is a host read of 30+ factors, and the eval is
+            // the declared sync cadence (§1.3). With `retract_every = 4` and
+            // `eval_every = 500` this reads the drift the retraction has to
+            // remove, which is the number the reviewer's question is about.
+            // Assignment, not `let`: a shadowing `let` here compiles, leaves
+            // the outer `tsct_bef` at `None`, and prints `-` forever.
+            tsct_bef = on_eval_step.then(|| model.max_ortho());
             if cfg.retract_batched {
                 model.retract_tsct_batched(cfg.retract_iters);
             } else {
                 model.retract_tsct(cfg.retract_iters);
             }
+            // AFTER side, at the same cadence.
+            tsct_aft = on_eval_step.then(|| model.max_ortho());
         }
         let retr_ms = t_retr.elapsed().as_secs_f64() * 1000.0;
         let t_ema = std::time::Instant::now();
@@ -1588,11 +1620,20 @@ pub fn train_loop(
                     // sequence length.
                     let (fb_ran, fb_asked) =
                         (probe::count(probe::FUTURE_BYTE), probe::count(probe::FUTURE_BYTE_ASKED));
+                    // `tsct=`, the retraction + forward-factor diagnostics
+                    // (pre-100k checklist 2). RARE cadence: this walk reads
+                    // every TSCT factor back, so it is a declared-cadence
+                    // host read at the eval boundary and nothing else (§1.3).
+                    let tsct_field = model
+                        .tsct_diag()
+                        .field(tsct_bef, tsct_aft)
+                        .unwrap_or_default();
                     println!(
                         "step {step:6} EVAL ce={ece:.3} bpb={ebpb:.3}{} over {bytes} B (fixed window) \
                          fused kda={kda_f}/{kda_b} asked={kda_asked} bwd={kda_bwd} \
                          declined={kda_decl} ops={kda_ops} node_bwd={kda_node_bwd} \
-                         norm={}/{} muon_skipped={}/{} engram={eg_rows}/{eg_arms} fb={fb_ran}/{fb_asked}",
+                         norm={}/{} muon_skipped={}/{} engram={eg_rows}/{eg_arms} fb={fb_ran}/{fb_asked} \
+                         {tsct_field}",
                         if is_best_eval { " BEST" } else { "" },
                         norm_asked.saturating_sub(norm_skipped),
                         norm_asked,
@@ -1997,6 +2038,56 @@ mod tests {
         assert!(run.path("b.bin").is_file(), "the run must still have saved its last step");
     }
 
+    /// The `tsct=` diagnostics must survive the REAL 2-batch CPU eval path, not
+    /// only the model in isolation.
+    ///
+    /// `TsctDiag::field` is a pure function and its exact format is pinned in
+    /// `tsct_field_format_is_golden_and_alpha_zero_is_the_cross_check`; what
+    /// this adds is the thing a pure-function test cannot see — that the walk
+    /// runs on a live model inside the 1400-line `train_loop`, on the eval
+    /// step, over every TSCT factor including the ones the block fold and the
+    /// lm_head fold each own. A fold that forgets `lm_head`, or reads a factor
+    /// the eval's `valid()` snapshot has already released, passes the unit
+    /// test and panics at step 1 of every run. The `Run` harness is already
+    /// `batch: 2, eval_batches: 2, eval_every: 1`, so this is the two-batch
+    /// CPU run and nothing about it is a stand-in.
+    #[test]
+    fn tsct_diag_runs_on_a_real_two_batch_cpu_eval() {
+        let run = Run::new("tsctdiag", 2);
+        run.go(Some(&run.eval)).expect("the tsct walk must not break the run");
+        // The run scored, so the eval block executed; and a best artifact
+        // exists, so the held-out path after the print also ran.
+        let (bpb, step) = read_bpb(&run).expect("the run must have produced a held-out score");
+        assert!(bpb.is_finite() && step > 0, "bpb {bpb} at step {step}");
+        // `retract_every` defaults to 1, so both sides of the pair are `Some`
+        // on an eval step — the field is fully populated on the default
+        // config, which is the configuration tonight's 100k run uses.
+        assert!(cfg_retract_every_default_is_one());
+        // SCOPE, stated so nobody reads more into this test than it proves:
+        // it does NOT inspect the printed line (the harness swallows a
+        // test's `println!`, and building a release binary to read a log is
+        // not a gate). The exact FORMAT is pinned where the format is
+        // written — `TsctDiag::field`, one function, one place — by
+        // `tsct_field_format_is_golden_and_alpha_zero_is_the_cross_check`.
+        // What only a real run can catch is the walk itself.
+    }
+
+    /// `retract_every` is 1 by default. Asserted rather than read from the
+    /// field: if someone moves the default to 4 (the external review asks for
+    /// every-4th), the eval line starts printing `-` for both retraction
+    /// sides unless 4 divides `eval_every` — and THAT is the moment this
+    /// pairing breaks, so the condition has to be visible in a test rather
+    /// than discovered in a 100k log.
+    fn cfg_retract_every_default_is_one() -> bool {
+        assert_eq!(
+            TrainCfg::default().retract_every, 1,
+            "the tsct bef/aft pair is fully populated only because retract_every is 1; \
+             if this moved, check that eval_every % retract_every == 0 or the eval line \
+             will print `-` for both sides on every eval"
+        );
+        true
+    }
+
     /// The other direction, or the sidecar is a one-way trap: a better eval
     /// MUST replace the artifact, and the recorded score must move with it.
     /// A pre-seeded 12.0 (above the uniform ceiling of 8.0) is beaten by every
@@ -2089,6 +2180,82 @@ mod tests {
             "the best artifact must travel with its n-gram sidecar: the loader reads a missing \
              one as freshly seeded rows, i.e. a different model"
         );
+    }
+
+    /// The `tsct=` eval-line field: exact format, on a real 2-batch CPU
+    /// model, with the `alpha = 0` cross-check the format's meaning rests on.
+    ///
+    /// `alpha = 0` is not a knob this repo sets anywhere (grep: no caller of
+    /// `set_alpha`), so it is used here as the ONE place where the two code
+    /// paths provably agree: `ste_ternary_annealed(w, 0) == w` identically,
+    /// so the forward-factor metric MUST equal the masters' metric to the
+    /// last bit. A field whose two numbers could disagree for a structural
+    /// reason (wrong alpha, wrong tensor, a quant format folded into the
+    /// wrong place) is a field nobody can read; this pins that they cannot.
+    #[test]
+    fn tsct_field_format_is_golden_and_alpha_zero_is_the_cross_check() {
+        let dev = device();
+        // No TSCT factors at all -> no field. `--set use_tsct=false` prints
+        // nothing rather than a row of zeros, and that is the assertion.
+        let dense = LinearLike::dense(32, 32, &dev);
+        let mut agg = dormouse_core::TsctDiag::default();
+        dense.fold_tsct_diag(&mut agg);
+        assert_eq!(agg.field(None, None), None, "a dense linear has no tsct field");
+
+        let mut model = DormouseModel::new(&test_cfg(), &dev);
+        set_tsct_alpha(&mut model, 0.0);
+        let masters = model.max_ortho();
+        let d = model.tsct_diag();
+        assert!(
+            (d.fwd - masters).abs() <= 1e-12 * masters.max(1e-12),
+            "at alpha = 0 the forward factor IS the master: fwd {:.6e} vs max_ortho {:.6e}",
+            d.fwd,
+            masters
+        );
+        assert_eq!(d.alpha, 0.0);
+        assert!(d.s_min.is_finite(), "a TSCT model must report a finite s_min");
+        assert_eq!(d.off, 0, "a freshly initialised s is all ones: no dead ranks");
+
+        // The exact string. Format is
+        // `tsct=<bef>/<aft>/<fwd>/<smin>/<smax>/<off>@a=<alpha>`.
+        let f = d.field(Some(1.0), Some(0.5)).expect("a TSCT model has a field");
+        assert_eq!(
+            f,
+            format!(
+                "tsct=1.00e0/5.00e-1/{:.2e}/{:.3e}/{:.3e}/0@a=0.00",
+                d.fwd, d.s_min, d.s_max
+            )
+        );
+        // A missing side is `-`, never a number: two identical numbers printed
+        // as a pair read as a measurement and mean "we did not measure it".
+        assert!(d.field(None, Some(0.5)).unwrap().starts_with("tsct=-/5.00e-1/"));
+        assert!(d.field(Some(1.0), None).unwrap().starts_with("tsct=1.00e0/-/"));
+        // And at the shipped alpha = 1 the two metrics DISAGREE by orders of
+        // magnitude - the reason the field carries both.
+        let mut model1 = DormouseModel::new(&test_cfg(), &dev);
+        set_tsct_alpha(&mut model1, 1.0);
+        let fwd1 = model1.tsct_diag().fwd;
+        assert!(
+            fwd1 > 100.0 * masters,
+            "alpha = 1 must move the forward factor off the manifold: {fwd1:.3e} vs masters {masters:.3e}"
+        );
+    }
+
+    /// Walk every TSCT layer in the model and set its annealing `alpha`.
+    /// Test-only: the trainer has no alpha schedule today, so this is how a
+    /// test reaches the annealing regime the diagnostic exists to measure.
+    fn set_tsct_alpha(model: &mut DormouseModel, a: f32) {
+        let mut set = |l: &mut LinearLike| {
+            if let LinearLikeInner::Tsct(t) = &mut l.inner {
+                t.set_alpha(a);
+            }
+        };
+        for f in &mut model.loop_block.expert_ffns {
+            set(&mut f.gate_up);
+            set(&mut f.down);
+        }
+        set(&mut model.loop_block.out_proj);
+        set(&mut model.lm_head);
     }
 
     /// Retract must pull drifted TSCT masters back to orthonormal: corrupt

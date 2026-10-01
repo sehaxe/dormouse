@@ -21,7 +21,7 @@ pub use aux::{AuxHeads, TEACHER_MOMENTUM};
 pub use config::{ActQuant, DormouseConfig};
 pub use loop_block::{ExpertFFN, LoopBlock};
 pub use model::DormouseModel;
-pub use param::LinearLike;
+pub use param::{LinearLike, TsctDiag};
 pub use routing::{Group, GroupCounts, Role, Routed, Routing};
 
 pub fn fnv_hash(bytes: &[u8]) -> u64 {
