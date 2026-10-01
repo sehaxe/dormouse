@@ -76,7 +76,7 @@ NEG_RE = re.compile(r"\b(?:not|no|never|neither|despite|without)\b", re.IGNORECA
 
 GITHUB_RE = re.compile(r"github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 ARXIV_RE = re.compile(r"arxiv\.org/abs/\d{4}\.\d{4,5}|arxiv:\d{4}\.\d{4,5}")
-FIXTURE_RE = re.compile(r"ref_data\.bin|gen_reference")
+FIXTURE_RE = re.compile(r"ref_[a-z0-9_]+\.bin|gen_[a-z0-9_]+\.py")
 
 
 def die(msg):
