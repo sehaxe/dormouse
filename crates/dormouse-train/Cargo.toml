@@ -54,3 +54,12 @@ rand = { workspace = true }
 [[example]]
 name = "kda_alloc_probe"
 required-features = ["cuda"]
+
+# The graph seam's gates need a real card: a graph capture, a replay, and a
+# differential against fresh launches. Declared explicitly because a file-level
+# `#![cfg(feature = "cuda")]` alone builds an EMPTY test binary and prints a
+# green "0 tests" — the false green that hid `kda_param_grads_cuda`'s absence
+# for a day (memory.md, 2026-09-29).
+[[test]]
+name = "graph_seam_cuda"
+required-features = ["cuda"]

@@ -77,11 +77,96 @@ fn finalize_kernel<F: Float>(
     }
 }
 
+/// `dst = src`, an element-for-element device-to-device copy into an
+/// EXISTING buffer — one launch, zero allocations.
+///
+/// It exists for the trainer's CUDA-graph pin (`dormouse-train/src/graph.rs`),
+/// which has to move a fresh parameter into a master buffer whose address a
+/// captured graph has already baked. burn has no copy into existing storage
+/// that can be relied on to stay in place: `slice_assign` goes through the
+/// autodiff node and returns whatever the backend allocated, so the "master"
+/// would quietly change address and the pin would be a fiction.
+///
+/// Lives here, next to the other elementwise CUDA primitives, because this is
+/// where the `cube_of` downcast already is; it is not a Muon update and does
+/// not claim to be one.
+#[cube(launch_unchecked)]
+fn copy_into_kernel<F: Float>(src: &[F], dst: &mut [F]) {
+    if ABSOLUTE_POS < dst.len() {
+        dst[ABSOLUTE_POS] = src[ABSOLUTE_POS];
+    }
+}
+
+/// `dst = src` for the Int tensors a graph is fed: the input ids, the shifted
+/// targets, and the hashed n-gram keys. Same primitive, same reason as
+/// `copy_into_kernel` — see [`copy_into_cuda`].
+#[cube(launch_unchecked)]
+fn copy_into_i32_kernel(src: &[i32], dst: &mut [i32]) {
+    if ABSOLUTE_POS < dst.len() {
+        dst[ABSOLUTE_POS] = src[ABSOLUTE_POS];
+    }
+}
+
 fn cube_of<const D: usize>(t: &Tensor<D>) -> Option<CubeTensor> {
     type B = burn_cubecl::CubeBackend;
     let prim = t.clone().try_into_primitive::<B>().ok()?;
     let c = (&prim as &dyn Any).downcast_ref::<CubeTensor>()?;
     Some(c.clone())
+}
+
+/// Copy `src` into `dst` in place, where both are Int tensors.
+///
+/// Int is a separate kernel from the float one because the CUDA `Int` dtype is
+/// i32 and a `Float` kernel cannot be handed its buffer — the same reason
+/// `#[cube]` needs the concrete type.
+pub fn copy_into_i32_cuda<const D: usize>(
+    src: &Tensor<D, burn::tensor::Int>,
+    dst: &Tensor<D, burn::tensor::Int>,
+) -> bool {
+    let n: usize = src.dims().iter().product();
+    if n == 0 || src.dims() != dst.dims() {
+        return false;
+    }
+    let (Some(sc), Some(dc)) = (cube_of(src), cube_of(dst)) else {
+        return false;
+    };
+    let client = sc.client.clone();
+    let threads = 256u32;
+    unsafe {
+        copy_into_i32_kernel::launch_unchecked(
+            &client,
+            CubeCount::Static((n as u32).div_ceil(threads), 1, 1),
+            CubeDim::new_3d(threads, 1, 1),
+            BufferArg::from_raw_parts(sc.handle, n),
+            BufferArg::from_raw_parts(dc.handle, n),
+        );
+    }
+    true
+}
+
+/// Copy `src` into `dst` in place. `false` when either tensor is not a bare
+/// cubecl f32 tensor on this backend — the caller must then refuse the
+/// graph rather than pretend the pin exists (ADR-0011).
+pub fn copy_into_cuda<const D: usize>(src: &Tensor<D>, dst: &Tensor<D>) -> bool {
+    let n: usize = src.dims().iter().product();
+    if n == 0 || src.dims() != dst.dims() {
+        return false;
+    }
+    let (Some(sc), Some(dc)) = (cube_of(src), cube_of(dst)) else {
+        return false;
+    };
+    let client = sc.client.clone();
+    let threads = 256u32;
+    unsafe {
+        copy_into_kernel::launch_unchecked::<f32>(
+            &client,
+            CubeCount::Static((n as u32).div_ceil(threads), 1, 1),
+            CubeDim::new_3d(threads, 1, 1),
+            BufferArg::from_raw_parts(sc.handle, n),
+            BufferArg::from_raw_parts(dc.handle, n),
+        );
+    }
+    true
 }
 
 /// Fused NS polynomial combine: `x ← a·x + b·t1 + c·t2`. Returns false when
@@ -228,6 +313,16 @@ mod tests {
             let diff: f32 = (x - x_ref).abs().max().into_scalar::<f32>();
             assert!(diff < 1e-4, "norm_colrow diff {diff} [{r}x{c}]");
         }
+    }
+
+    #[test]
+    fn copy_into_writes_the_existing_buffer_and_leaves_the_source_alone() {
+        let dev = cuda_dev();
+        let src: Tensor<2> = Tensor::random([37, 11], Distribution::Normal(0.0, 1.0), &dev);
+        let dst: Tensor<2> = Tensor::zeros([37, 11], &dev);
+        assert!(copy_into_cuda(&src, &dst), "the copy kernel must run on a bare cubecl tensor");
+        // Bit-exact, not close: a copy is a copy.
+        assert_eq!(dst.clone().into_data().to_vec::<f32>(), src.clone().into_data().to_vec::<f32>());
     }
 
     #[test]

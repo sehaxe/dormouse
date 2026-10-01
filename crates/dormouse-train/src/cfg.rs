@@ -70,6 +70,10 @@ pub fn resolve(preset: &str, set: &[String], mut train: TrainCfg) -> Result<RunC
     }
     // 4. Validate the merged config (the train path previously never did).
     dormouse_core::config::validate(&model)?;
+    // 4b. `--graph-capture` against the arms that would make the captured
+    // window a different computation than the run claims to be doing: one named
+    // error each, before any GPU work (`graph::check`).
+    crate::graph::check(&RunCfg { source: preset.to_string(), model: model.clone(), train: train.clone() })?;
     Ok(RunCfg { source: preset.to_string(), model, train })
 }
 

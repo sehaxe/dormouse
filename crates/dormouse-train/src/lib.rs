@@ -4,6 +4,7 @@
 mod cfg;
 pub mod decode;
 pub mod export;
+pub mod graph;
 mod jepa_targets;
 mod offload;
 mod optim;
@@ -15,7 +16,7 @@ use std::path::{Path, PathBuf};
 use burn::{
     backend::Backend as BurnBackend,
     module::{Module, ModuleVisitor, Param},
-    optim::{GradientsParams, OptimizerRecord},
+    optim::OptimizerRecord,
     store::ModuleRecord,
     tensor::{Bytes, Device, Int, Tensor, TensorData},
 };
@@ -157,6 +158,15 @@ pub struct TrainCfg {
     /// exactly and a resume continues the same sequence. In the snapshot -
     /// a different seed is a different run.
     pub seed: u64,
+    /// Capture the forward+backward window into a CUDA graph and replay it
+    /// (see [`graph`]). Off by default: it changes WHICH kernels run (a
+    /// capture refuses an allocation, a read, and a sync, so the steps that do
+    /// any of those run ungraphed), and an A/B of a run that used it is an A/B
+    /// of a different execution, not of a different model. Not in the
+    /// snapshot for the same reason `timers` is not: it does not change what
+    /// is trained, and a resume that turned it on would be comparing two
+    /// execution paths across one step count.
+    pub graph_capture: bool,
 }
 
 impl Default for TrainCfg {
@@ -181,6 +191,7 @@ impl Default for TrainCfg {
             jepa_weight: None, dspark_weight: None, dspark_k: None,
             qk_heads: None, jepa_targets: None,
             seed: 1,
+            graph_capture: false,
         }
     }
 }
@@ -317,6 +328,14 @@ pub fn cubecl_launches() -> u64 {
 /// and two copies of a backend downcast is how they drift.
 #[cfg(feature = "cuda")]
 pub fn cubecl_client(device: &Device) -> cubecl_runtime::client::Client {
+    cubecl_client_opt(device).expect("a CUDA device has a cubecl client")
+}
+
+/// [`cubecl_client`] as an `Option`, for the seam's one field that is `None`
+/// off CUDA. Panics on a CUDA device that has no client, which is the same
+/// panic `cubecl_client` has always had.
+#[cfg(feature = "cuda")]
+pub fn cubecl_client_opt(device: &Device) -> Option<cubecl_runtime::client::Client> {
     use burn_dispatch::devices::CubeDevice;
     use burn_dispatch::DispatchDevice;
     use cubecl_cuda::CudaRuntime;
@@ -331,7 +350,11 @@ pub fn cubecl_client(device: &Device) -> cubecl_runtime::client::Client {
             other => panic!("expected CUDA device, got {other:?}"),
         }
     }
-    CudaRuntime::client(unwrap(device.as_dispatch()))
+    Some(CudaRuntime::client(unwrap(device.as_dispatch())))
+}
+#[cfg(not(feature = "cuda"))]
+pub fn cubecl_client_opt(_device: &Device) -> Option<cubecl_runtime::client::Client> {
+    None
 }
 
 /// The NaN firewall (2026-09-27). A non-finite loss must never reach the
@@ -1104,6 +1127,42 @@ pub fn train_loop(
     let (mut pbytes, mut phashes) = stream.next_batch();
     let mut         pshift: Vec<i64> = pbytes.iter().skip(1).chain(std::iter::once(&pbytes[0])).map(|&b| b as i64).collect();
     let mut ce = f32::NAN;
+    // ── CUDA graph seam (`--graph-capture`, off by default) ───────────────
+    // Armed after the model and the teacher exist, so the pin covers every
+    // address the window reads. The INPUT pins need one batch's shapes, which
+    // only the loop has, so they are allocated from the first batch below.
+    let graph_on = cfg.graph_capture;
+    let mut seam = if graph_on {
+        let client = cubecl_client_opt(&device);
+        let mut seam = graph::Seam::new(client);
+        let (m, t) = seam.arm(model, teacher);
+        model = m;
+        teacher = t;
+        println!(
+            "graph capture armed: {} pinned parameters, {} pinned teacher parameters. \
+             Log/eval/500-step/host-adam steps run ungraphed and force a re-capture.",
+            seam.model_pins.copies(),
+            seam.teacher_pins.copies(),
+        );
+        seam
+    } else {
+        graph::Seam::new(None)
+    };
+    let mut inputs: Option<graph::InputPins> = None;
+    if graph_on {
+        if let Some(r) = seam.model_pins.unsupported_rank {
+            return Err(format!(
+                "--graph-capture: a parameter has rank {r} and the pin carries ranks 1-4. Capture \
+                 refused before the first step."
+            ));
+        }
+    }
+    // Wall clock around the whole loop: the per-step timer line only prints on
+    // LOG steps (`timer_step = step % log_every`), which are exactly the steps
+    // that run ungraphed, so it can never time a replayed step. The honest
+    // number for this flag is the mean over a slice, measured here.
+    let step_at_entry = step;
+    let t_loop = std::time::Instant::now();
     // One-way fp32 fallback state, RESTORED from the checkpoint above: a run
     // that latched it did so because its factors drifted, and re-running the
     // quantized forward for even one step re-quantizes exactly the factors the
@@ -1162,6 +1221,16 @@ pub fn train_loop(
         // targets = next byte (shifted by one position)
         let shifted = std::mem::take(&mut pshift);
         let y: Tensor<2, Int> = Tensor::from_data(TensorData::new(shifted, [cfg.batch, cfg.seq_len]), &device);
+        // The input pins, from the FIRST batch's shapes: a captured graph has
+        // one shape, so the buffers are allocated once and every later batch is
+        // copied into them.
+        if graph_on && inputs.is_none() {
+            inputs = Some(graph::InputPins::new(
+                &x,
+                &y,
+                if dorm_cfg.use_engram && !cfg.engram_ram { Some(&h) } else { None },
+            ));
+        }
         // prepare next batch right away (host->device copy is async). The
         // shift targets MUST be built from the prefetched batch: building
         // them from the consumed one trains every step after the first on
@@ -1194,11 +1263,39 @@ pub fn train_loop(
             None => (None, None, None),
         };
 
+        // Host tables train at their own cadence (the report's rule: Adam on
+        // the RAM tables every step), not piggybacked on the log cadence -
+        // at log_every=100 they got 1/100 of their updates.
+        let host_adam_step = cfg.host_adam_every > 0
+            && step % cfg.host_adam_every as u64 == 0
+            && rows_param.is_some();
+        // One cadence for the timer and for the loss copy that feeds it, or the
+        // timer reports a step whose loss was never read back. Both used to say
+        // `step % 50` independently, and they now say the same thing.
+        let timer_step = step == 0 || (cfg.log_every > 0 && step % cfg.log_every as u64 == 0);
+        // A CUDA graph can only capture a window with NO host round-trip in it
+        // (`cubecl-runtime/src/client.rs:1288-1296` refuses a read, a sync or a
+        // handle write). Every step that reads anything back therefore runs
+        // ungraphed and forces a re-capture: the loss scalar, the host-table
+        // grads, the grad norm, `max_ortho`, and the eval/checkpoint forwards
+        // that follow. Everything else in a step is sync-free (§1.3), so on the
+        // steps in between the whole window is one dispatch.
+        //
+        // `step % 500` is in the list for the two 500-step instruments
+        // (`max_ortho`, `memory_cleanup`), both of which sync.
+        let ungraphed = !graph_on
+            || step % cfg.log_every as u64 == 0
+            || host_adam_step
+            || (cfg.timers && timer_step)
+            || step % 500 == 0
+            || (cfg.eval_every > 0 && step % cfg.eval_every as u64 == 0 && step > 0)
+            || (cfg.memlog && step % cfg.log_every as u64 == 0);
         let t_fwd = std::time::Instant::now();
         // Random-depth arm (ADR-0013 rank 2): T is a deterministic mix of the
         // step index, so an A/B run replays exactly and a resume continues the
         // same sequence. Both averages inside the loop divide by what ran, so
-        // each step is an honest model at depth T.
+        // each step is an honest model at depth T. Refused with
+        // --graph-capture (`graph::check`): a captured graph has ONE depth.
         if cfg.rand_depth {
             let t = sample_depth(step, model.loop_block.max_iter);
             model.set_loop_depth(Some(t));
@@ -1210,81 +1307,85 @@ pub fn train_loop(
             Some(t) => Some(t.get(&bytes)?),
             None => None,
         };
-        let (_logits, rec_ce, _kda, aux) = if let Some(tg) = jepa_target {
-            model.forward_with_jepa_targets::<Backend>(
-                x,
-                // RAM-offload path drives the Engram from host_rows; uploading
-                // hashed_ids too would be a dead per-step H2D copy.
-                if host_rows.is_some() { None } else { Some(h) },
-                host_rows,
-                Some(y),
-                Some(tg),
-            )
+        // The window: forward -> loss -> NaN-mask -> backward -> sanitize.
+        // Everything the graph captures is inside this closure and nothing
+        // else is, which is what makes the capture sound.
+        let (x, y, h_for_fwd) = if let Some(pins) = inputs.as_mut() {
+            pins.feed(&x, &y, if host_rows.is_some() { None } else { Some(&h) })?
         } else {
-            model.forward_with_hidden::<Backend>(
-                x,
-                if host_rows.is_some() { None } else { Some(h) },
-                host_rows,
-                Some(y),
-                teacher.as_ref(),
+            (
+                x.clone(),
+                y.clone(),
+                if host_rows.is_some() { None } else { Some(h.clone()) },
             )
         };
-        let mut loss = model.loss::<Backend>(rec_ce);
-        // Host tables train at their own cadence (the report's rule: Adam on
-        // the RAM tables every step), not piggybacked on the log cadence -
-        // at log_every=100 they got 1/100 of their updates.
-        let host_adam_step = cfg.host_adam_every > 0
-            && step % cfg.host_adam_every as u64 == 0
-            && rows_param.is_some();
-        // Aux is read only on log steps; skip the clone (an extra autodiff
-        // node) elsewhere.
-        let aux_log = if step % cfg.log_every as u64 == 0 {
-            aux.clone()
-        } else {
-            None
-        };
-        if let Some(a) = aux {
-            loss = loss + a;
-        }
-        // The device syncs only on steps that read something back (loss
-        // scalar at log cadence, host-table grads at the host-Adam cadence,
-        // timers) so forward/backward/step of adjacent steps overlap on the
-        // GPU. The scalar read rides along free inside the grads D2H.
-        // One cadence for the timer and for the loss copy that feeds it, or the
-        // timer reports a step whose loss was never read back. Both used to say
-        // `step % 50` independently, and they now say the same thing.
-        let timer_step = step == 0 || (cfg.log_every > 0 && step % cfg.log_every as u64 == 0);
-        let loss_log = if step % cfg.log_every as u64 == 0
-            || host_adam_step
-            || (cfg.timers && timer_step)
-        {
-            Some(loss.clone())
-        } else {
-            None
-        };
-        // ── In-software NaN firewall ──────────────────────────────────────
-        // A non-finite loss used to be INVISIBLE between log steps: the
-        // scalar is only read every log_every steps, so backward produced
-        // NaN grads, the optimizer wrote them into the weights, and the
-        // guard then replayed the poisoned region from a stale ckpt forever
-        // (measured 2026-09-26 on official_v4: NaN at step 1550, then 1700,
-        // ckpt stuck at 1000, zero progress across three restarts). The
-        // recovery now lives inside the process and stays honest: see
-        // `mask_nonfinite`. The log copy above is the RAW loss, so a spike
-        // still prints as NaN/inf.
-        // The firewall, with ZERO host-device synchronization (owner rule
-        // 2026-09-27). Masking the loss scalar is not enough: a NaN from an
-        // intermediate activation back-propagates anyway, because the chain
-        // rule multiplies the masked zero seed by the Jacobian and NaN*0 = NaN.
-        // So the loss is masked on device AND the gradients are sanitized on
-        // device. The host learns a step was masked from the gradient norm it
-        // already reads at log cadence (an exactly-zero grad norm means every
-        // gradient was non-finite), so the accounting costs no sync either.
-        let loss = mask_nonfinite(loss);
-        let t_bwd = std::time::Instant::now();
+        let mut loss_log = None;
+        let mut aux_log = None;
+        seam.step(ungraphed, || {
+            let (_logits, rec_ce, _kda, aux) = if let Some(tg) = jepa_target {
+                model.forward_with_jepa_targets::<Backend>(
+                    x.clone(),
+                    // RAM-offload path drives the Engram from host_rows; uploading
+                    // hashed_ids too would be a dead per-step H2D copy.
+                    if host_rows.is_some() { None } else { h_for_fwd.clone() },
+                    host_rows.clone(),
+                    Some(y.clone()),
+                    Some(tg),
+                )
+            } else {
+                model.forward_with_hidden::<Backend>(
+                    x.clone(),
+                    if host_rows.is_some() { None } else { h_for_fwd.clone() },
+                    host_rows.clone(),
+                    Some(y.clone()),
+                    teacher.as_ref(),
+                )
+            };
+            let mut loss = model.loss::<Backend>(rec_ce);
+            // Aux is read only on log steps; skip the clone (an extra autodiff
+            // node) elsewhere.
+            aux_log = if step % cfg.log_every as u64 == 0 { aux.clone() } else { None };
+            if let Some(a) = aux {
+                loss = loss + a;
+            }
+            // The device syncs only on steps that read something back (loss
+            // scalar at log cadence, host-table grads at the host-Adam cadence,
+            // timers) so forward/backward/step of adjacent steps overlap on the
+            // GPU. The scalar read rides along free inside the grads D2H.
+            loss_log = if step % cfg.log_every as u64 == 0
+                || host_adam_step
+                || (cfg.timers && timer_step)
+            {
+                Some(loss.clone())
+            } else {
+                None
+            };
+            // ── In-software NaN firewall ────────────────────────────────────
+            // A non-finite loss used to be INVISIBLE between log steps: the
+            // scalar is only read every log_every steps, so backward produced
+            // NaN grads, the optimizer wrote them into the weights, and the
+            // guard then replayed the poisoned region from a stale ckpt forever
+            // (measured 2026-09-26 on official_v4: NaN at step 1550, then 1700,
+            // ckpt stuck at 1000, zero progress across three restarts). The
+            // recovery now lives inside the process and stays honest: see
+            // `mask_nonfinite`. The log copy above is the RAW loss, so a spike
+            // still prints as NaN/inf.
+            // The firewall, with ZERO host-device synchronization (owner rule
+            // 2026-09-27). Masking the loss scalar is not enough: a NaN from an
+            // intermediate activation back-propagates anyway, because the chain
+            // rule multiplies the masked zero seed by the Jacobian and NaN*0 =
+            // NaN. So the loss is masked on device AND the gradients are
+            // sanitized on device. The host learns a step was masked from the
+            // gradient norm it already reads at log cadence (an exactly-zero
+            // grad norm means every gradient was non-finite), so the accounting
+            // costs no sync either.
+            let loss = mask_nonfinite(loss);
+            let mut raw_grads = loss.backward();
+            sanitize_grads(&mut raw_grads, &model);
+            raw_grads
+        })?;
         let fwd_ms = t_fwd.elapsed().as_secs_f64() * 1000.0;
-        let mut raw_grads = loss.backward();
-        sanitize_grads(&mut raw_grads, &model);
+        let t_bwd = std::time::Instant::now();
         let lr = match stress.as_ref() {
             // Constant LR at a multiple of the optimum (report §3.3).
             Some(s) => s.lr(cfg.lr),
@@ -1330,7 +1431,7 @@ pub fn train_loop(
                 if let (Some(h), Some(p), Some(uniq)) =
                     (host.as_mut(), &rows_param, uniq_rows.as_ref())
                 {
-                    if let Some(g) = p.grad(&raw_grads) {
+                    if let Some(g) = p.grad(seam.grads().expect("the window ran this step")) {
                         let mut g_vec: Vec<f32> = g.into_data().try_to_vec().unwrap_or_default();
                         assert!(
                             g_vec.len() == uniq.len() * h.dim,
@@ -1353,7 +1454,7 @@ pub fn train_loop(
                 }
             }
             if step % cfg.log_every as u64 == 0 {
-                let gn = grad_norm(&model, &raw_grads);
+                let gn = grad_norm(&model, seam.grads().expect("the window ran this step"));
                 if gn == 0.0 {
                     masked_since_read += 1;
                 }
@@ -1364,8 +1465,21 @@ pub fn train_loop(
         }
         let bwd_ms = t_bwd.elapsed().as_secs_f64() * 1000.0;
         let t_opt = std::time::Instant::now();
-        let grads = GradientsParams::from_grads(raw_grads, &model);
+        // BORROWED, not consumed: a graph replay runs no host code, so there is
+        // one `Gradients` for the life of the capture and `from_grads` (which
+        // calls `grad_remove`) would leave every replay after the first with an
+        // empty optimizer input — a silently frozen parameter set, the shape of
+        // `8fa5d4c`. Same tensors, same update.
+        let grads = graph::grads_params(seam.grads().expect("the window ran this step"), &model);
         model = optim.step(lr, model, grads);
+        // The pin: burn's optimizer returned FRESH tensors, and the graph has
+        // the previous addresses baked. One copy per parameter puts this step's
+        // result back where the next replay will read it.
+        if graph_on {
+            let (m, r) = seam.refresh(model, false);
+            model = m;
+            r?;
+        }
         let opt_ms = t_opt.elapsed().as_secs_f64() * 1000.0;
         let t_retr = std::time::Instant::now();
         // TSCT ortho maintenance (bf16_KERNEL_PLAN): retract the U/V masters
@@ -1396,6 +1510,14 @@ pub fn train_loop(
         let t_ema = std::time::Instant::now();
         if let Some(t) = teacher.take() {
             teacher = Some(dormouse_core::aux::ema_update(t, &model, dormouse_core::aux::TEACHER_MOMENTUM));
+            // The teacher is read INSIDE the window, so it is pinned exactly like
+            // the model: `ema_update` rebuilds every `Param`, so its address
+            // moves every step.
+            if graph_on {
+                let (m, r) = seam.refresh(teacher.take().expect("just taken"), true);
+                teacher = Some(m);
+                r?;
+            }
         }
         let _ = lr;
         let ema_ms = t_ema.elapsed().as_secs_f64() * 1000.0;
@@ -1445,8 +1567,10 @@ pub fn train_loop(
             println!(
                 "timer step {step}: total={total_ms:.0}ms data={data_ms:.1}ms fwd={fwd_ms:.0}ms \
                  bwd={bwd_ms:.0}ms (incl. loss sync + host-adam D2H) opt={opt_ms:.0}ms \
-                 retr={retr_ms:.1}ms ema={ema_ms:.1}ms gpu_step={:.0}ms launches={launches}",
-                total_ms - data_ms
+                 retr={retr_ms:.1}ms ema={ema_ms:.1}ms gpu_step={:.0}ms launches={launches} \
+                 graph=replayed:{}",
+                total_ms - data_ms,
+                seam.stats.replays,
             );
         }
         if step % cfg.log_every as u64 == 0 {
@@ -1770,6 +1894,23 @@ pub fn train_loop(
     save_ckpt(&dir, &cfg.ckpt_name, &model, &optim, teacher.as_ref(), ortho_fp32, step, ce)
         .map_err(|e| format!("final checkpoint save failed: {e}"))?;
     save_ngram(&dir, &cfg.ckpt_name, host.as_ref(), step)?;
+    // The graph's own verdict, printed whatever the flag said: a lane that
+    // captured once and replayed nothing must read as the null it is, not as a
+    // run that quietly did the same work as before.
+    if graph_on {
+        let ran = step - step_at_entry;
+        let secs = t_loop.elapsed().as_secs_f64();
+        println!(
+            "graph: {} steps in {:.1}s = {:.1} ms/step ({} replayed, {} ungraphed, {} refused). {}",
+            ran,
+            secs,
+            secs * 1e3 / ran.max(1) as f64,
+            seam.stats.replays,
+            ran.saturating_sub(seam.stats.replays),
+            seam.stats.refusals,
+            seam.report(),
+        );
+    }
     println!(
         "done steps={step} best ce={best:.3} | {}",
         best_artifact_summary(best_eval_bpb, best_eval_step, &cfg.ckpt_name)
@@ -1807,6 +1948,7 @@ pub fn load_model_weights(dir: &Path, name: &str, cfg: DormouseConfig) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
+    use burn::optim::GradientsParams;
     use dormouse_core::param::{LinearLike, LinearLikeInner};
     use dormouse_data::fnv;
 

@@ -174,6 +174,13 @@ struct Args {
     /// One-off quant-fidelity probe on the first step.
     #[arg(long)]
     quant_check: bool,
+    /// Capture the forward+backward window into a CUDA graph and replay it
+    /// (one dispatch per step instead of ~14k launches). Off by default; the
+    /// steps that read anything back run ungraphed, and the run reports
+    /// captures / replays / refusals. Refused with --rand-depth, --engram-ram
+    /// and --jepa-targets.
+    #[arg(long)]
+    graph_capture: bool,
     /// cubecl autotune level (minimal | medium | full); passed to the
     /// runtime, which reads it from the process environment.
     #[arg(long)]
@@ -241,6 +248,7 @@ fn build_run(a: &Args) -> Result<dormouse_train::RunCfg, String> {
     train.quant_check |= a.quant_check;
     train.timers |= a.timers;
     train.memlog |= a.memlog;
+    train.graph_capture |= a.graph_capture;
     // warmup keeps its schema default (true) - no flag on purpose.
     dormouse_train::resolve(preset_name, &a.set, train)
 }
