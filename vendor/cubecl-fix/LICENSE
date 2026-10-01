@@ -42,6 +42,8 @@ Patches applied by dormouse:
 - `cubecl-cuda` — no local patch; carried so the vendored unit is one tree and
   the root `[patch.crates-io]` has one path per crate.
 
-The repository as a whole is AGPL-3.0-only (see the root `LICENSE`). These
-vendored directories keep their upstream terms, which is what the root
-`vendor/burn-fused/LICENSE` scope note describes.
+The repository as a whole is MIT (see the root `LICENSE`, owner decision
+2026-10-01). These vendored directories keep their upstream terms — MIT **or**
+Apache-2.0 for the cubecl crates, which is what the per-crate `LICENSE-MIT` /
+`LICENSE-APACHE` files state — and the root `vendor/burn-fused/LICENSE` scope
+note describes that vendored unit.
