@@ -1,6 +1,6 @@
 # Review B — the CODE, not the paper
 
-Second independent review of `research/papers/gdn-kda.md`. Angle: the engineering
+Second independent review of `docs/papers/gdn-kda.md`. Angle: the engineering
 conclusions. I assume every citation in the report is correct and do not re-check the
 papers. I assume nothing in the report. Read-only: no `cargo build`, no `cargo test`, no
 GPU. Everything below is derived from source in this tree plus arithmetic I computed by

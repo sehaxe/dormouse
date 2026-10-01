@@ -39,7 +39,7 @@ lane's inventory splits cleanly:
 - **burn-gdn2 owns the chunked WY construction, the state update and the
   per-chunk carry** — the other three the brief lists. A previous read-only
   audit already produced a 33-row delta table for them
-  (`research/papers/gdn-kda.md` §3.1, fetch date 2026-09-29). I did not redo
+  (`docs/papers/gdn-kda.md` §3.1, fetch date 2026-09-29). I did not redo
   it. What I did instead is the thing that audit could not do: **run the
   authors' code** (§2).
 
@@ -384,7 +384,7 @@ cites by number.
 `fla/layers/kda.py:191` at commit `9f38d249` (tier a) and against K3 Eq 6
 (tier b). The SiLU arm is not an open question about *which is running* — it is
 the **`GDN-2` mechanism's** choice, and adopting it for KDA would be an
-A/B arm, not a correction. `research/papers/output-gate-silu-vs-sigmoid.md`
+A/B arm, not a correction. `docs/papers/output-gate-silu-vs-sigmoid.md`
 is the existing document on it; this section adds the FLA-KDA-vs-NVlabs-GDN2
 distinction, which is the piece that makes "both are right" the answer.
 

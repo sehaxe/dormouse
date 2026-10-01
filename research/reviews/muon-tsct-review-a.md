@@ -1,4 +1,4 @@
-# Independent review of `research/papers/muon-plus.md` and `research/papers/tsct.md`
+# Independent review of `docs/papers/muon-plus.md` and `docs/papers/tsct.md`
 
 **Reviewer pass, 2026-09-29.** Read-only. No GPU, no build, no test. Primary sources
 fetched directly (arXiv HTML for `2602.21545v1/v3` and `2604.00733`, GitHub API for

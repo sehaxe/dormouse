@@ -8,7 +8,7 @@ re-derived the numbers instead.
 **Not done:** no GPU, no `cargo build`, no `cargo test`. No file other than this one was
 touched. `research/papers/*.md`, the vendor crates and the tree are as the author left them.
 
-**Read:** `research/papers/muon-plus.md`, `research/papers/tsct.md`,
+**Read:** `docs/papers/muon-plus.md`, `docs/papers/tsct.md`,
 `vendor/burn-fused/crates/burn-spectral/src/lib.rs`, `vendor/burn-fused/crates/burn-muon-plus/`,
 `crates/dormouse-core/src/{param,loop_block,routing}.rs`, `crates/dormouse-train/src/{lib,optim}.rs`,
 `docs/AB-PROTOCOL.md`, `benches/history.tsv`.

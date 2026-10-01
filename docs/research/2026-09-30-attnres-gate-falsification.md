@@ -7,7 +7,7 @@ shown; none is a description of what the command would do.
 
 The point of this file is that **three of these gates were green before this
 lane and could not have failed** — the audit in
-`research/papers/attnres.md` §3.1 established that every reference in the
+`docs/papers/attnres.md` §3.1 established that every reference in the
 fused path re-derived our own scaled formula, so "kernel matches tensor" was a
 consistency check between two transcriptions of the same wrong thing. Tonight's
 lesson, applied: a gate that cannot fail is not evidence.

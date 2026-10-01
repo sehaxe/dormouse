@@ -1,4 +1,4 @@
-# Reviewer B — would following `research/papers/attnres.md` actually fix `burn-attnres`?
+# Reviewer B — would following `docs/papers/attnres.md` actually fix `burn-attnres`?
 
 **Angle:** I assume every claim in the report is TRUE and ask only whether acting on it
 produces a correct crate. Independent of reviewer A; I did not read their file.

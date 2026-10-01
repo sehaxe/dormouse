@@ -20,7 +20,7 @@ have put a known-bad function in the model.
 | author code | **none.** The repository is 6 files: this PDF, `README.md`, 4 PNGs. Measured 2026-09-30 via the GitHub trees API; re-confirmed by the README copy pinned in the crate at `tests/oracle/upstream/attnres_README.md` |
 | the only executable spec | Fig. 2, 22 lines of PyTorch, identical in the paper and the README |
 | our crate before this lane | `vendor/burn-fused/crates/burn-attnres/` — `src/lib.rs` 517, `src/fused_attnres.rs` 1821 |
-| the prior audit | `research/papers/attnres.md` (2026-09-29) — 19 deltas, 9 of them BUG |
+| the prior audit | `docs/papers/attnres.md` (2026-09-29) — 19 deltas, 9 of them BUG |
 
 **Therefore: tier-(b), transcription.** Every "the paper says" below quotes
 the PDF named above. No line of this document may be read as verification

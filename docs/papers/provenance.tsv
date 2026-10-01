@@ -1,0 +1,24 @@
+# provenance.tsv - every original source behind a claim in this directory.
+#
+# AGENTS.md §1.4: a claim may say "verified" or "bit-for-bit" ONLY if it names the
+# external file the reference came from. This file IS that naming, one row per
+# original. A row is added when a document is fetched and never edited to
+# "refresh" a hash - a new version of a paper is a NEW row, because the old
+# transcription was made against the old text.
+#
+# Read a transcription's own header for what was read (full text, abstract only,
+# the authors' code). Tier language lives in docs/protocols/ORACLE.md.
+#
+# columns  file | kind | source | version | source_date | bytes | sha256 | fetched
+file	kind	source	version	source_date	bytes	sha256	fetched
+2212.07525-data2vec-2.0.pdf	paper	https://arxiv.org/abs/2212.07525	v2	2023-06-15	876692	d180ad5a84c606c1b09e008a8d0a1c753c7d9cfe081c451ef0146cdbdfa0571b	2026-10-01
+2505.16932-polar-express.pdf	paper	https://arxiv.org/abs/2505.16932	v5	2026-05-04	1543444	9e7badb9f4fd51cb87ba1fe1e49e6b8c3278f55496d014d5969743351e82eb3e	2026-10-01
+2601.16531-engram.pdf	paper	https://arxiv.org/abs/2601.16531	v2	2026-01-26	550949	2921ec8d82ec2901df5f1fc210b6adfde3380a40bc937da672c19ae37138127a	2026-10-01
+2602.21545-muon-plus.pdf	paper	https://arxiv.org/abs/2602.21545	v3	2026-05-14	9843907	c923d6f9d0b070b16075889dae54f5983cf9e48f6f7045eeecaa9c4fc44f7425	2026-10-01
+2603.15031-attention-residuals.pdf	paper	https://arxiv.org/abs/2603.15031	v1	2026-03-16	1065095	444673994328f7be8aee9d96fb240596b6f254f06ebaa53a2673413a244198c9	2026-10-01
+2604.00733-sct.pdf	paper	https://arxiv.org/abs/2604.00733	v2	2026-04-05	493846	7e5a29fbc7db4fb3194e3814b0c47eb72f1df5537edf2941ed2bb99a98ef7b7d	2026-10-01
+2605.07554-proteinjepa.pdf	paper	https://arxiv.org/abs/2605.07554	v2	2026-09-23	494868	49b694323e101755f36b333880f2d63e862bd37b33dc389db04b04054c4d61e2	2026-10-01
+2605.22791-gated-delta-net-2.pdf	paper	https://arxiv.org/abs/2605.22791	v1	2026-05-21	567107	b0c577f4cbf71d207a688422514ec11a106fa38880b4d212b55494e362dcc2b7	2026-10-01
+2607.05147-dspark.pdf	paper	https://arxiv.org/abs/2607.05147	v1	2026-07-06	1055890	522036b0cc16ad4678bd7c278dd0a0ab4da31170af7b97c2041067cc09a8289a	2026-10-01
+2607.24653-kimi-k3.pdf	paper	https://arxiv.org/abs/2607.24653	v2	2026-08-07	1790685	1a21e4d15de52eb0d4cf09cdbffc6248c497ba6897572cc5574af237c13da51d	2026-10-01
+tech_report-qwen3.8-flash-next.pdf	report	~/Downloads/tech_report.pdf (Qwen3.8-Flash-Next technical report)	-	-	2366146	04f263446d74a35cb7cea368574e0c561f3b05c133be2c777ac884404063655d	2026-10-01

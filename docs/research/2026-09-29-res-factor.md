@@ -5,7 +5,7 @@ Code read read-only: `crates/dormouse-core/src/param.rs`,
 `crates/dormouse-core/src/loop_block.rs`,
 `vendor/burn-fused/crates/burn-spectral/src/lib.rs`.
 
-**Scope note.** `research/papers/tsct.md` (same tree) already establishes the lineage and
+**Scope note.** `docs/papers/tsct.md` (same tree) already establishes the lineage and
 the code deltas. This file answers a different, narrower question: *as of 2026-09-29,
 does the literature have a better way to do trainable low-rank factorization of a dense
 layer, where the bar is removing the per-step retraction?* Where the two overlap on
@@ -202,7 +202,7 @@ strictly larger changes than §4.1.**
 2. **The retraction is not ours.** NS polar retraction onto the Stiefel manifold is
    standard Riemannian machinery (Absil–Mahony–Sepulchre 2008) and is what P1 uses.
 
-**What may still be ours** (and per `research/papers/tsct.md` is the real delta): the
+**What may still be ours** (and per `docs/papers/tsct.md` is the real delta): the
 **quantizer family on the factors** — ternary/2-bit/N:M/fp8/fp4 with STE through the
 orthonormal masters — and the fused/batched GPU retraction. **I found no paper that
 combines a low-bit quantized forward with a Stiefel-constrained factorization.** BitNet

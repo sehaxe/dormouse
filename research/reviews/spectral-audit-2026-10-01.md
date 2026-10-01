@@ -12,7 +12,7 @@ C++ and is **not** quotable: the wheel and version are recorded instead.
 `(15/8, −5/4, 3/8)` is bit-exact vs the authors' own `optimal_quintic` at
 `NoahAmsel/PolarExpress @ 71cc379`; the Jordan triple in `burn-muon-plus` is a
 different quantity from the same paper and is not an error. Those are
-`research/papers/spectral-reference.md` §1.2/§2.2 and they stand.
+`docs/papers/spectral-reference.md` §1.2/§2.2 and they stand.
 
 **Provenance bar (§1.4).** "verified" is used only with repo + commit + file +
 line + date. "transcription" means our own code, re-expressed in torch to be

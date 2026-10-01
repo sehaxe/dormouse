@@ -14,7 +14,7 @@
 //! parameters is queue row 1b.
 //!
 //! It is also NOT the JEPA retune, and the choice between them is recorded in
-//! `research/papers/jepa-decision-2026-09-30.md`: CE against a real future
+//! `docs/decisions/2026-09-30-do-we-need-jepa.md`: CE against a real future
 //! byte preserves the ambiguity of the continuation (a byte has one right
 //! answer but many reasonable ones, and CE scores the whole 256-way
 //! distribution), where a latent-target regression L1s against one EMA

@@ -1,7 +1,7 @@
 # Do we need JEPA? — keep / retune / replace / delete
 
 **Date:** 2026-09-30 · **Tree:** read-only pass, nothing committed, no code touched ·
-**Prior pass:** `research/papers/jepa.md` (2026-09-29) verified the teacher-input fix and
+**Prior pass:** `docs/papers/jepa.md` (2026-09-29) verified the teacher-input fix and
 catalogued code-vs-paper deltas. This brief is the **decision** and it corrects two of that
 pass's claims (§7).
 
@@ -499,7 +499,7 @@ worst combination; that is itself an argument for measuring P3 first.
 
 ---
 
-## 7. Corrections to `research/papers/jepa.md` (2026-09-29 pass)
+## 7. Corrections to `docs/papers/jepa.md` (2026-09-29 pass)
 
 Both of these are load-bearing for the variant taxonomy, and both are wrong in the existing
 document. Verified against primary sources today.
@@ -538,7 +538,7 @@ All fetched 2026-09-30. Version and date as returned by the arXiv API.
 **Repo sources cited:** `crates/dormouse-core/src/{model.rs:86-106,150-156}`, `aux.rs:25,29,176-179,224-232`;
 `vendor/burn-fused/crates/burn-jepa/src/{losses.rs:11-20,63-97, mask.rs:9-25, predictor.rs}`;
 `benches/history.tsv:51-56`; `~/logs/ab8m_ab8m_iter4.log:10-16`; `~/logs/train_nokda.log:91`;
-`docs/AB-PROTOCOL.md:185-230`; `docs/audit-2026-09-25.md:29,62,64,87`; `research/papers/jepa.md`.
+`docs/AB-PROTOCOL.md:185-230`; `docs/audit-2026-09-25.md:29,62,64,87`; `docs/papers/jepa.md`.
 
 ---
 

@@ -1,4 +1,4 @@
-# Independent review of `research/papers/gdn-kda.md`
+# Independent review of `docs/papers/gdn-kda.md`
 
 Reviewer: independent subagent. Date: 2026-09-29. No GPU, no build, no test runs.
 Evidence: arXiv API, arXiv HTML full texts, `raw.githubusercontent.com` at

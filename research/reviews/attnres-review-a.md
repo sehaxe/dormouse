@@ -1,4 +1,4 @@
-# Review of `research/papers/attnres.md` — independent verification
+# Review of `docs/papers/attnres.md` — independent verification
 
 Reviewer: adversarial reviewer, spawned session. Date: 2026-09-29.
 Methods actually used: `pdftotext -layout` on a fresh download of `arXiv:2603.15031v1`,
@@ -481,7 +481,7 @@ resolved for the crate to work at all.
 * `fused_attnres.rs:1` — `//! Fused CUDA kernels for Attention Residuals (Kimi K3 §2.2).`
 * `fused_attnres.rs:95` — `/// Chunked Full AttnRes (Kimi K3 §2.2, exact math, bounded memory).`
 
-**Kimi K3 is arXiv 2607.24653** (per `research/papers/gdn-kda.md:67` and
+**Kimi K3 is arXiv 2607.24653** (per `docs/papers/gdn-kda.md:67` and
 `research/2026-09-27-fused-inventory-attention.md:157`, both in this repo). So the fused
 kernel file — 1821 of the crate's 2338 lines, and the file the report audits most heavily —
 attributes the mechanism to a different arXiv paper than the crate header does, with a
