@@ -265,7 +265,7 @@ def main():
     for rel, tier, target, catches, cannot, waiver in ROWS:
         for cell in (rel, tier, target, catches, cannot, waiver):
             assert "\t" not in cell and "\n" not in cell, cell[:40]
-        full = "vendor/burn-fused/crates/" + rel
+        full = "vendor/dormouse-fused/crates/" + rel
         out.append("\t".join((full, tier, target, catches, cannot, waiver)) + "\n")
     p = os.path.join(root, "docs", "protocols", "ORACLE-TIERS.tsv")
     with open(p, "w", encoding="utf-8") as fh:

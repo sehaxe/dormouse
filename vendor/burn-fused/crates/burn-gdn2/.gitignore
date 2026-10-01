@@ -1,6 +1,0 @@
-/target
-Cargo.lock
-# `*.bin` is gone on purpose: it was hiding tests/ref_data.bin, the reference
-# the bit-exact suite asserts against. The rule now lives one level up, in
-# vendor/burn-fused/.gitignore, with an explicit exception for that file — a
-# rule here would be deeper and would silently win over that exception.

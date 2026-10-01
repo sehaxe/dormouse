@@ -19,12 +19,12 @@
 # place, so a crash here cannot leave the tree with a wrong oracle.
 set -uo pipefail
 WT=/home/sehaxe/dormouse-wt/kda-adjoint
-GEN=$WT/vendor/burn-fused/crates/burn-gdn2/tools/gen_bwd_f64.py
-FIX=$WT/vendor/burn-fused/crates/burn-gdn2/tests/ref_bwd_f64_carry.bin
+GEN=$WT/vendor/dormouse-fused/crates/burn-gdn2/tools/gen_bwd_f64.py
+FIX=$WT/vendor/dormouse-fused/crates/burn-gdn2/tests/ref_bwd_f64_carry.bin
 TGT=/mnt/e43497ab-0ff2-45b4-b45f-28de3339a53e/kdagf-target
 LOCK=/home/sehaxe/dormouse/tools/build_lock.sh
 
-cd "$WT/vendor/burn-fused" || exit 1
+cd "$WT/vendor/dormouse-fused" || exit 1
 sha_before=$(sha256sum "$FIX" | cut -d' ' -f1)
 echo "committed carry fixture sha256: $sha_before"
 
@@ -55,7 +55,7 @@ PY
     # (`tests/ref_bwd_f64.bin`), so it has to run from the crate root or it
     # dies on a missing directory. Both defaults are redirected into /tmp so a
     # partial run cannot touch a committed fixture.
-    ( cd "$WT/vendor/burn-fused/crates/burn-gdn2" && \
+    ( cd "$WT/vendor/dormouse-fused/crates/burn-gdn2" && \
       python3 tools/gen_bwd_f64.py \
           --out /tmp/opencode/one_corrupt.bin \
           --faults-out /tmp/opencode/faults_corrupt.bin \
@@ -78,9 +78,9 @@ PY
     # .orig already deleted — i.e. the restore silently did nothing while
     # printing nothing wrong. git is the authority here and needs no backup file.
     rm -f "$GEN.orig"
-    cd "$WT" && git checkout -- vendor/burn-fused/crates/burn-gdn2/tools/gen_bwd_f64.py \
-                            vendor/burn-fused/crates/burn-gdn2/tests/ref_bwd_f64_carry.bin
-    if git diff --quiet -- vendor/burn-fused/crates/burn-gdn2/tools/gen_bwd_f64.py; then
+    cd "$WT" && git checkout -- vendor/dormouse-fused/crates/burn-gdn2/tools/gen_bwd_f64.py \
+                            vendor/dormouse-fused/crates/burn-gdn2/tests/ref_bwd_f64_carry.bin
+    if git diff --quiet -- vendor/dormouse-fused/crates/burn-gdn2/tools/gen_bwd_f64.py; then
         echo "generator restored from git (clean)"
     else
         echo "RESTORE FAILED: the generator still differs from HEAD"; exit 1
@@ -90,7 +90,7 @@ PY
     [ "$sha_before" = "$sha_after" ] && echo "RESTORED byte-identical" || { echo "RESTORE FAILED"; exit 1; }
     if [ "${2:-}" = "--run" ]; then
         echo "=== EXPECTED: both arms green again ==="
-        cd "$WT/vendor/burn-fused"
+        cd "$WT/vendor/dormouse-fused"
         env CARGO_TARGET_DIR=$TGT $LOCK run falsify-restore -- \
             cargo test -p burn-gdn2 --features cuda,autodiff \
             --test fused_adjoint_f64 -- --nocapture 2>&1 | tail -30

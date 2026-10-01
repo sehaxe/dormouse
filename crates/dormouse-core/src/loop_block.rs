@@ -1381,7 +1381,7 @@ mod tests {
 
     // SITU (arXiv:2607.24653v2 Eq 12). The FORM is gated in the mechanism
     // crate, against Moonshot's own numbers - see
-    // vendor/burn-fused/crates/burn-situ/src/lib.rs and
+    // vendor/dormouse-fused/crates/burn-situ/src/lib.rs and
     // docs/reviews/situ-2026-09-30.md. What is gated HERE is the wiring:
     // that the flag is load-bearing, that the counter sees the arm, and that
     // the gradient survives the cap. The form gate cannot see any of it: a

@@ -1,0 +1,155 @@
+# oracle transcript — burn-muon-plus tier-(a)
+
+Run 2026-09-30 on this box (CPU only, no GPU). Every number below is the output of
+a command in this transcript; nothing is quoted from memory.
+
+## 1. the pin
+
+```
+$ curl -sL https://api.github.com/repos/K1seki221/MuonPlus/commits?per_page=1
+HEAD sha: 8a9ace123afedaab8ba75ea0b19315594ae1da7c  date 2026-02-26T17:05:37Z
+```
+
+## 2. gen_oracle.py (runs the authors' code)
+
+```
+$ .venv/bin/python tests/oracle/gen_oracle.py
+pin: 4 files verified byte-identical to K1seki221/MuonPlus@8a9ace12
+torch 2.14.0+cpu, eager (@torch.compile disabled)
+   16x8   col      in|max|=1.0000  out|max|=0.4346
+   16x8   row      in|max|=1.0000  out|max|=0.6447
+   16x8   col_row  in|max|=1.0000  out|max|=0.6503
+   16x8   row_col  in|max|=1.0000  out|max|=0.4016
+   32x8   col      in|max|=1.0000  out|max|=0.3107
+   32x8   row      in|max|=1.0000  out|max|=0.6447
+   32x8   col_row  in|max|=1.0000  out|max|=0.6478
+   32x8   row_col  in|max|=1.0000  out|max|=0.2896
+   64x16  col      in|max|=1.0000  out|max|=0.2200
+   64x16  row      in|max|=1.0000  out|max|=0.4773
+   64x16  col_row  in|max|=1.0000  out|max|=0.4763
+   64x16  row_col  in|max|=1.0000  out|max|=0.2071
+    8x8   col      in|max|=1.0000  out|max|=0.5944
+    8x8   row      in|max|=1.0000  out|max|=0.6447
+    8x8   col_row  in|max|=1.0000  out|max|=0.6425
+    8x8   row_col  in|max|=1.0000  out|max|=0.5468
+    8x32  col      in|max|=1.0000  out|max|=0.6454
+    8x32  row      in|max|=1.0000  out|max|=0.3156
+    8x32  col_row  in|max|=1.0000  out|max|=0.2888
+    8x32  row_col  in|max|=1.0000  out|max|=0.6501
+   16x16  col      in|max|=1.0000  out|max|=0.4343
+   16x16  row      in|max|=1.0000  out|max|=0.4767
+   16x16  col_row  in|max|=1.0000  out|max|=0.4796
+   16x16  row_col  in|max|=1.0000  out|max|=0.4158
+  128x64  col      in|max|=1.0000  out|max|=0.1560
+  128x64  row      in|max|=1.0000  out|max|=0.2239
+  128x64  col_row  in|max|=1.0000  out|max|=0.2243
+  128x64  row_col  in|max|=1.0000  out|max|=0.1565
+    4x3   col      in|max|=1.0000  out|max|=0.6859
+    4x3   row      in|max|=1.0000  out|max|=0.8051
+    4x3   col_row  in|max|=1.0000  out|max|=0.7547
+    4x3   row_col  in|max|=1.0000  out|max|=0.5211
+wrote /home/sehaxe/dormouse-wt/muon-oracle/vendor/dormouse-fused/crates/burn-muon-plus/tests/oracle/muon_oracle.bin (326540 bytes, 32 cases)
+```
+
+## 3. Why the Newton-Schulz ITERATION has no numeric gate
+
+The authors run Newton-Schulz in bfloat16 (`muon_plus.py:55`, `X = G.bfloat16()`);
+we run f32. So `noise` below is the dtype difference the authors' own code carries,
+and `signal` is what a 1e-4 RELATIVE error in `a` does to the output. A gate needs
+signal >> noise.
+
+```
+$ python3 measure_ns_snr.py   # f32 control = the authors' arithmetic, dtype changed
+./tests/oracle/.venv/bin/python: can't open file '/home/sehaxe/dormouse-wt/muon-oracle/vendor/dormouse-fused/crates/burn-muon-plus/tests/oracle/measure_ns_snr.py': [Errno 2] No such file or directory
+```
+
+## 3. Why the Newton-Schulz ITERATION has no numeric gate
+
+The authors run Newton-Schulz in bfloat16 (`muon_plus.py:55`, `X = G.bfloat16()`);
+we run f32. So `noise` below is the dtype difference the authors' own code carries,
+and `signal` is what a 1e-4 RELATIVE error in `a` does to the output. A gate needs
+signal >> noise.
+
+```
+$ .venv/bin/python tests/oracle/measure_ns_snr.py
+shape      |out|max   noise(bf16)   signal(da=1e-4)   signal(dc=1e-4)   ratio_a  ratio_c
+--------------------------------------------------------------------------------------------
+ns_steps = 1
+  8x8      0.6371   3.543e-03        2.229e-05        1.016e-05    0.006   0.003
+ 16x8      0.5057   3.997e-03        1.562e-05        4.083e-06    0.004   0.001
+ 32x8      0.4386   2.549e-03        1.094e-05        3.755e-06    0.004   0.001
+  8x32     0.3940   1.968e-03        1.094e-05        2.354e-06    0.006   0.001
+ 64x16     0.1942   1.726e-03        5.424e-06        6.929e-07    0.003   0.000
+ns_steps = 2
+  8x8      0.4865   1.594e-02        1.642e-04        1.394e-04    0.010   0.009
+ 16x8      0.7683   9.521e-03        1.102e-04        8.172e-05    0.012   0.009
+ 32x8      0.9063   7.812e-03        6.920e-05        5.746e-05    0.009   0.007
+  8x32     0.8256   6.787e-03        6.229e-05        5.323e-05    0.009   0.008
+ 64x16     0.5326   5.021e-03        2.971e-05        2.192e-05    0.006   0.004
+ns_steps = 3
+  8x8      0.4741   2.130e-02        2.263e-04        2.066e-04    0.011   0.010
+ 16x8      0.6044   1.836e-02        1.898e-04        1.500e-04    0.010   0.008
+ 32x8      0.6563   1.560e-02        2.105e-04        1.802e-04    0.013   0.012
+  8x32     0.5491   2.337e-02        1.702e-04        1.528e-04    0.007   0.007
+ 64x16     0.3976   1.570e-02        7.999e-05        8.023e-05    0.005   0.005
+ns_steps = 5
+  8x8      0.4770   2.032e-01        5.810e-04        5.226e-04    0.003   0.003
+ 16x8      0.6394   2.126e-01        3.206e-04        2.593e-04    0.002   0.001
+ 32x8      0.7110   2.340e-02        3.968e-04        3.541e-04    0.017   0.015
+  8x32     0.5499   4.032e-02        2.515e-04        1.988e-04    0.006   0.005
+ 64x16     0.4050   4.506e-02        1.498e-04        1.389e-04    0.003   0.003
+--------------------------------------------------------------------------------------------
+worst signal/noise over every shape and step count = 0.0004
+A bar that passes every row is above the signal, so it cannot distinguish a
+wrong coefficient from the authors' dtype choice. The constant is gated
+instead, at zero tolerance, against the literal in muon_plus.py:56.
+```
+
+## 4. the gate is proven able to fail
+
+Four perturbations, each reverted, each expected to turn a test red. C2 is the
+opposite: a perturbation the fixture is KNOWN not to see, recorded with the
+reason, because a limit nobody wrote down is indistinguishable from a pass.
+
+```
+$ bash crates/burn-muon-plus/tests/oracle/falsify.sh
+build_lock: ACQUIRED by 1872099 (muon-oracle)
+=== A. one digit wrong in NS_COEFFS (2.0315 -> 2.0316) ===
+DETECTED  NS_COEFFS last digit
+          expected: the f32 nearest 2.0315 vs the f32 nearest 2.0316
+thread 'ns_coeffs_are_the_authors_literal' (1872276) panicked at crates/burn-muon-plus/tests/muon_oracle.rs:158:5:
+assertion `left == right` failed: NS_COEFFS (3.4445, -4.775, 2.0316) is not the f32 nearest to the authors' literal (3.4445, -4.775, 2.0315) at K1seki221/MuonPlus@8a9ace12 utils/optim/muon_plus.py:56
+  left: (3.4445, -4.775, 2.0316)
+ right: (3.4445, -4.775, 2.0315)
+
+=== B. the composition order swapped: ColRow becomes row-then-col ===
+  swapped 2 occurrences
+DETECTED  ColRow composition order
+          expected: max|ours - authors| on the col_row cases = 2.54e-1, i.e. the order signal
+thread 'normalize_matches_the_authors_implementation' (1872559) panicked at crates/burn-muon-plus/tests/muon_oracle.rs:291:9:
+ColRow on 16x8: max|ours - K1seki221/MuonPlus@8a9ace12 apply_post_polar_norm| = 2.542078e-1, bar 3e-5 (derivation: 16*k*u, k=32, u=2^-24, the f32 reassociation term)
+
+=== C. the norm_col axis transposed: sum_dim(D-2) -> sum_dim(D-1) ===
+  norm_col now reduces over the row axis
+DETECTED  norm_col axis transposed
+          expected: an O(1) difference: the authors unit-normalize columns, we would unit-normalize rows
+thread 'normalize_matches_the_authors_implementation' (1872904) panicked at crates/burn-muon-plus/tests/muon_oracle.rs:291:9:
+Col on 16x8: max|ours - K1seki221/MuonPlus@8a9ace12 apply_post_polar_norm| = 5.149305e-1, bar 3e-5 (derivation: 16*k*u, k=32, u=2^-24, the f32 reassociation term)
+
+=== C2. the eps floor moved three decades (clamp_min(1e-7) -> 1e-4) ===
+    EXPECTED TO STAY GREEN, and this is a statement about the FIXTURE, not a
+    pass. The floor only binds when an axis norm falls between 1e-7 and 1e-4.
+GREEN (as expected, and here is why)  the eps floor value
+          every fixture axis norm is >= 2.0e-3 (grid values are k/498-1, k in 0..996), so the floor never binds and any floor in that range gives the identical output. It is also out of the authors' reach: their rule is sqrt(v^2+1e-7) with the epsilon INSIDE the root, ours is max(v,1e-7) outside it. Where the floor binds the two are different functions — at v=1e-6 they differ by 5e4 relative — so no single bar can be both tight enough to catch a transposed axis (C) and loose enough to admit tiny-norm inputs. Inputs with a tiny axis norm are therefore EXCLUDED, which is a stated limitation and not a silent hole.
+
+=== D. the pinned upstream file is edited by one byte ===
+DETECTED  the pin check
+          expected: gen_oracle.py exits non-zero and says PIN ROTED
+gen_oracle: PIN ROTED for utils/optim/muon_plus.py
+  expected 665ea6cb1f6f631f7839c430f2f2c8cbd62dd7e6b8a24fb752f1211c57ab2cab
+  got      29c7b439cdb9d9ccbc38a5d501344dcbe9e451c1475d1e63063664ad4fa721be
+
+=== E. everything restored: the suite must be GREEN again ===
+GREEN  the restore is clean
+build_lock: RELEASED
+```

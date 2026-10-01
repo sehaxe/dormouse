@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# THE CPU gate for the fused library (vendor/burn-fused). One command:
+# THE CPU gate for the fused library (vendor/dormouse-fused). One command:
 #
 #     tools/lib_gate.sh [worktree-root]     # default: the repo this script is in
 #
 # WHY IT IS A SCRIPT AND NOT A SECOND `-p` ON tools/wt.sh's TEST_CMD.
-# `vendor/burn-fused` is a SEPARATE cargo workspace: the root Cargo.toml
+# `vendor/dormouse-fused` is a SEPARATE cargo workspace: the root Cargo.toml
 # `exclude`s it, because its crates inherit `workspace = true` from their own
 # root and would otherwise resolve against ours. `cargo -p` cannot reach across
 # an exclude - from the root, `cargo test -p burn-gdn2` is a guaranteed "package
@@ -25,7 +25,7 @@
 # WHAT IT DOES NOT RUN, ON PURPOSE. No `cuda` feature, so no GPU is touched and
 # none of the 18 `required-features = ["cuda", ...]` targets is even built -
 # cargo SKIPS them, it does not pass them. tools/test_targets.py is the guard
-# that proves each of those targets is declared at all; vendor/burn-fused/tools/
+# that proves each of those targets is declared at all; vendor/dormouse-fused/tools/
 # gpu-gate.sh is the GPU half, and it refuses to pass without a visible device.
 # There is deliberately no second `--features autodiff` cell: measured, it
 # re-ran all 10 of burn-gdn2/burn-kda's binaries a second time for 781 s and
@@ -36,7 +36,7 @@
 # was to FIND the red ones.
 set -uo pipefail
 ROOT=${1:-$(cd "$(dirname "$0")/.." && pwd)}
-FORK="$ROOT/vendor/burn-fused"
+FORK="$ROOT/vendor/dormouse-fused"
 [ -d "$FORK" ] || { echo "lib_gate: no $FORK - run me from a dormouse checkout" >&2; exit 1; }
 
 # One heavy thing at a time (AGENTS.md 1.5). wt.sh has already done this when it

@@ -14,7 +14,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-WS = Path("/home/sehaxe/dormouse/vendor/burn-fused")
+WS = Path("/home/sehaxe/dormouse/vendor/dormouse-fused")
 CONCURRENT = {"burn-kda", "burn-gdn2", "burn-engram", "burn-mor", "burn-spectral"}
 MARKERS = re.compile(r"\bunimplemented!|\btodo!|\bFIXME\b|\bunreachable!|\bTODO\b")
 

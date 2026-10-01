@@ -41,7 +41,7 @@ PREFIXES = (
 	"docs/",
 	"research/",
 	"crates/",
-	"vendor/burn-fused/",
+	"vendor/dormouse-fused/",
 	"vendor/cubecl-fix/",
 	"tools/",
 	"scripts/",

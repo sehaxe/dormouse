@@ -1,7 +1,7 @@
 # Every line is owned by the repository owner. Written for the ONE case this
 # file serves on a single-maintainer repository: GitHub's "Files changed"
 # review queue, where the reviewer needs to know that a change under
-# vendor/burn-fused/ (a vendored fork we carry and patch) is as deliberate as
+# vendor/dormouse-fused/ (a vendored fork we carry and patch) is as deliberate as
 # one in crates/ - and not to be rubber-stamped because it looks like vendored
 # code.
 #

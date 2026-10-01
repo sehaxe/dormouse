@@ -12,32 +12,32 @@ burn = { workspace = true, features = ["std", "extension"] }
 burn-tensor = { workspace = true }
 burn-nn = { version = "0.22.0-pre.4", default-features = false }
 burn-cuda = { workspace = true, features = ["std", "autotune"] }
-burn-kda = { path = "../../vendor/burn-fused/crates/burn-kda" }
+burn-kda = { path = "../../vendor/dormouse-fused/crates/burn-kda" }
 # The fused-kernel seam counters (ADR-0019): burn-kda's fused dispatch hands
 # its launch counts to burn-gdn2, which is the crate that owns them.
-burn-gdn2 = { path = "../../vendor/burn-fused/crates/burn-gdn2", default-features = false }
-burn-bitnet = { path = "../../vendor/burn-fused/crates/burn-bitnet" }
-burn-engram = { path = "../../vendor/burn-fused/crates/burn-engram" }
-burn-rmsnorm = { path = "../../vendor/burn-fused/crates/burn-rmsnorm" }
-burn-jepa = { path = "../../vendor/burn-fused/crates/burn-jepa" }
-burn-dspark = { path = "../../vendor/burn-fused/crates/burn-dspark", features = ["training"] }
-burn-spectral = { path = "../../vendor/burn-fused/crates/burn-spectral" }
+burn-gdn2 = { path = "../../vendor/dormouse-fused/crates/burn-gdn2", default-features = false }
+burn-bitnet = { path = "../../vendor/dormouse-fused/crates/burn-bitnet" }
+burn-engram = { path = "../../vendor/dormouse-fused/crates/burn-engram" }
+burn-rmsnorm = { path = "../../vendor/dormouse-fused/crates/burn-rmsnorm" }
+burn-jepa = { path = "../../vendor/dormouse-fused/crates/burn-jepa" }
+burn-dspark = { path = "../../vendor/dormouse-fused/crates/burn-dspark", features = ["training"] }
+burn-spectral = { path = "../../vendor/dormouse-fused/crates/burn-spectral" }
 # MoR routing mechanism (arXiv 2507.10524): the shared router + the repaired
 # top-k index primitive the loop's per-position routing rides on.
-burn-mhc = { path = "../../vendor/burn-fused/crates/burn-mhc" }
-burn-mor = { path = "../../vendor/burn-fused/crates/burn-mor" }
+burn-mhc = { path = "../../vendor/dormouse-fused/crates/burn-mhc" }
+burn-mor = { path = "../../vendor/dormouse-fused/crates/burn-mor" }
 # Attention Residuals (arXiv:2603.15031): the residual-stream arm, Full mode
 # over the loop's iteration states. Off by default (`use_attnres`); the crate
 # is in the build because the model reads it, not as a reference port.
-burn-attnres = { path = "../../vendor/burn-fused/crates/burn-attnres" }
+burn-attnres = { path = "../../vendor/dormouse-fused/crates/burn-attnres" }
 # SiTU-GLU (arXiv:2607.24653v2 Eq 12, Kimi K3): the expert FFN's activation
 # arm, off by default (`use_situ`). DEFAULT FEATURES ONLY, deliberately - the
 # tensor path IS the reference form, and burn-situ's fused kernel has never
-# executed in any job in this repo (vendor/burn-fused/tools/gpu-gate.sh:73-77),
+# executed in any job in this repo (vendor/dormouse-fused/tools/gpu-gate.sh:73-77),
 # which is the burn-rmsnorm situation exactly. Enabling `burn-situ/cuda` needs a
 # CUDA gate that compares the fused output to the tensor path first; see
 # docs/reviews/situ-2026-09-30.md §7.
-burn-situ = { path = "../../vendor/burn-fused/crates/burn-situ" }
+burn-situ = { path = "../../vendor/dormouse-fused/crates/burn-situ" }
 rand = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 toml = { workspace = true }

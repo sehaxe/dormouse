@@ -5,7 +5,7 @@
 // `small`'s real factor shapes. It prices the per-step retraction and answers
 // "what does it defend against, and can that happen at our shapes".
 //
-// WHY STANDALONE: `cargo test -p burn-spectral` from vendor/burn-fused is a
+// WHY STANDALONE: `cargo test -p burn-spectral` from vendor/dormouse-fused is a
 // 686-package / 41 GB / ~1400 s cold build (AGENTS.md 2.5, and the 2026-09-29
 // memory entry about the freeze three parallel agents caused). This file needs
 // no cargo, no burn, and no vendor target dir: 0.4 s to compile.

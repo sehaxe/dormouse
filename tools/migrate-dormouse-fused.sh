@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ADR-0017: rename vendor/burn-fused -> dormouse-fused, and burn-* crates ->
+# ADR-0017: rename vendor/dormouse-fused -> dormouse-fused, and burn-* crates ->
 # dormouse-*. A pure rename: no behavior change. Run it on a QUIET tree - it
 # rewrites the git path of every file in the fork, so any agent with uncommitted
 # work inside it will have its paths invalidated.
@@ -20,7 +20,7 @@ if pgrep -x train >/dev/null; then
   exit 1
 fi
 
-OLD=vendor/burn-fused
+OLD=vendor/dormouse-fused
 NEW=dormouse-fused
 [[ -d $OLD ]] || { echo "no $OLD (already migrated?)" >&2; exit 1; }
 
@@ -76,7 +76,7 @@ cargo test -p dormouse-core -p dormouse-data -p dormouse-train --lib
 
 echo "== 6. commit"
 git add -A
-git commit -q -m "refactor!: vendor/burn-fused -> dormouse-fused, burn-* crates -> dormouse-*
+git commit -q -m "refactor!: vendor/dormouse-fused -> dormouse-fused, burn-* crates -> dormouse-*
 
 Pure rename, no behavior change (ADR-0017). The fork is ours - every one of
 its 26 crates is our own code - so living under vendor/ and wearing the burn-*

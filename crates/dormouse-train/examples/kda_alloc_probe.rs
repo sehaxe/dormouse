@@ -6,7 +6,7 @@
 //! forward misses the cubecl pool. This is the test that document asks for.
 //!
 //! It is built HERE, in the trainer's own dependency graph, because a harness
-//! built inside `vendor/burn-fused` links *unpatched* registry cubecl (no
+//! built inside `vendor/dormouse-fused` links *unpatched* registry cubecl (no
 //! `[patch.crates-io]` in that workspace) and that allocator is a different
 //! one - the whole question is about this allocator.
 //!

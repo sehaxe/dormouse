@@ -20,7 +20,7 @@
 //!    `torch.float4_e2m1fn_x2`.
 //!
 //! The generator is
-//! `vendor/burn-fused/crates/burn-bitnet/tests/oracle/gen_e2m1_oracle.py`,
+//! `vendor/dormouse-fused/crates/burn-bitnet/tests/oracle/gen_e2m1_oracle.py`,
 //! the values are in that crate's
 //! `tests/fixtures/e2m1_oracle.txt`, and **this test needs no network**.
 //!
@@ -84,7 +84,7 @@ const TORCHAO_SHA: &str = "3972ed015091f659418dedf12edb980a8ca56b53";
 
 fn fixture() -> HashMap<String, String> {
     let text = include_str!(
-        "../../../vendor/burn-fused/crates/burn-bitnet/tests/fixtures/e2m1_oracle.txt"
+        "../../../vendor/dormouse-fused/crates/burn-bitnet/tests/fixtures/e2m1_oracle.txt"
     );
     let mut out = HashMap::new();
     for line in text.lines() {

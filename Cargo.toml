@@ -9,7 +9,7 @@ members = [
 ]
 # vendored fork workspaces: they are their own workspace roots; without this
 # cargo resolves their crates' `workspace = true` inheritance against OUR root.
-exclude = ["vendor/burn-fused", "vendor/cubecl-fix", "vendor/cubek-fix"]
+exclude = ["vendor/dormouse-fused", "vendor/cubecl-fix", "vendor/cubek-fix"]
 resolver = "2"
 [workspace.package]
 version = "0.1.0"

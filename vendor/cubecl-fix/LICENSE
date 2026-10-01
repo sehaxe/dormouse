@@ -45,5 +45,5 @@ Patches applied by dormouse:
 The repository as a whole is MIT (see the root `LICENSE`, owner decision
 2026-10-01). These vendored directories keep their upstream terms — MIT **or**
 Apache-2.0 for the cubecl crates, which is what the per-crate `LICENSE-MIT` /
-`LICENSE-APACHE` files state — and the root `vendor/burn-fused/LICENSE` scope
+`LICENSE-APACHE` files state — and the root `vendor/dormouse-fused/LICENSE` scope
 note describes that vendored unit.

@@ -1,10 +1,10 @@
 name: fused-library
 
-# The gate for `vendor/burn-fused` — the fused-kernel library (20 crates; was
+# The gate for `vendor/dormouse-fused` — the fused-kernel library (20 crates; was
 # 28 until 2026-09-28, when 8 unreachable crates were deleted — the per-crate
 # fate table is docs/architecture/library-crate-fate.md).
 #
-# WHY THIS FILE EXISTS. `vendor/burn-fused` has no `.git` of its own and the
+# WHY THIS FILE EXISTS. `vendor/dormouse-fused` has no `.git` of its own and the
 # root `Cargo.toml` `exclude`s it (its crates are separate cargo workspace
 # roots; without the exclude, their `workspace = true` inheritance resolves
 # against OUR root and fails). So the fork's own `.github/workflows/ci.yml` has
@@ -15,7 +15,7 @@ name: fused-library
 # root never compiles on their own). Net effect: no crate in the library was
 # gated by a run that could fail.
 #
-# Every job below therefore sets `working-directory: vendor/burn-fused` and runs
+# Every job below therefore sets `working-directory: vendor/dormouse-fused` and runs
 # cargo FROM INSIDE the fork. Running `cargo test -p burn-gdn2` from the root
 # fails with "package not found" — that is the exclude working as intended, not
 # a code problem. Do not "fix" it by dropping the exclude.
@@ -40,7 +40,7 @@ jobs:
   # `to_inference_matches_per_column_layer` panic in `retract` before they
   # assert, because `Tensor::set_require_grad(true)` on a non-autodiff device
   # is an assert on burn 0.22. Precise cause and line numbers:
-  # vendor/burn-fused/TEST-AUDIT.md, finding 2. Left red on purpose — the fix
+  # vendor/dormouse-fused/TEST-AUDIT.md, finding 2. Left red on purpose — the fix
   # belongs to whoever owns that crate, and a job that hides it is the failure
   # mode this rewrite exists to end.
   ndarray-all-crates:
@@ -49,13 +49,13 @@ jobs:
     timeout-minutes: 90
     defaults:
       run:
-        working-directory: vendor/burn-fused
+        working-directory: vendor/dormouse-fused
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: vendor/burn-fused
+          workspaces: vendor/dormouse-fused
       - name: install mold (repo config links through it)
         run: sudo apt-get update && sudo apt-get install -y mold
       - name: check every target of every crate (lib + tests + examples)
@@ -74,13 +74,13 @@ jobs:
     timeout-minutes: 60
     defaults:
       run:
-        working-directory: vendor/burn-fused
+        working-directory: vendor/dormouse-fused
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: vendor/burn-fused
+          workspaces: vendor/dormouse-fused
       - name: install mold (repo config links through it)
         run: sudo apt-get update && sudo apt-get install -y mold
       - name: "the facade: generated files in sync + every feature combination"
@@ -117,7 +117,7 @@ jobs:
     timeout-minutes: 30
     defaults:
       run:
-        working-directory: vendor/burn-fused/crates/burn-gdn2
+        working-directory: vendor/dormouse-fused/crates/burn-gdn2
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -154,13 +154,13 @@ jobs:
     timeout-minutes: 90
     defaults:
       run:
-        working-directory: vendor/burn-fused
+        working-directory: vendor/dormouse-fused
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: vendor/burn-fused
+          workspaces: vendor/dormouse-fused
       - name: install mold (repo config links through it)
         run: sudo apt-get update && sudo apt-get install -y mold
       # --release: the 1000-case scan is minutes in an opt-0 build.
@@ -174,13 +174,13 @@ jobs:
     timeout-minutes: 90
     defaults:
       run:
-        working-directory: vendor/burn-fused
+        working-directory: vendor/dormouse-fused
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: vendor/burn-fused
+          workspaces: vendor/dormouse-fused
       - name: install mold (repo config links through it)
         run: sudo apt-get update && sudo apt-get install -y mold
       # The 13 crates that declare a `cuda` feature. Kept as an explicit list
@@ -223,7 +223,7 @@ jobs:
   # So the GPU check is a command a contributor runs on the GPU box, and it is
   # a real one — it compiles AND runs AND reports per test:
   #
-  #     vendor/burn-fused/tools/gpu-gate.sh
+  #     vendor/dormouse-fused/tools/gpu-gate.sh
   #
   # It refuses to pass without a visible CUDA device, sets BURN_DEVICE=cuda so
   # the `if env::var("BURN_DEVICE") != "cuda" { return; }` guards cannot report

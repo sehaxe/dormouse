@@ -24,9 +24,9 @@ clap = { workspace = true, features = ["derive"] }
 [dependencies]
 dormouse-core = { path = "../dormouse-core" }
 dormouse-data = { path = "../dormouse-data" }
-burn-spectral = { path = "../../vendor/burn-fused/crates/burn-spectral" }
-burn-bitnet = { path = "../../vendor/burn-fused/crates/burn-bitnet" }
-burn-muon-plus = { path = "../../vendor/burn-fused/crates/burn-muon-plus" }
+burn-spectral = { path = "../../vendor/dormouse-fused/crates/burn-spectral" }
+burn-bitnet = { path = "../../vendor/dormouse-fused/crates/burn-bitnet" }
+burn-muon-plus = { path = "../../vendor/dormouse-fused/crates/burn-muon-plus" }
 serde = { workspace = true, features = ["derive"] }
 toml = { workspace = true }
 # The export's two primitives, both already in this build graph through burn

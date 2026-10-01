@@ -7,7 +7,7 @@
 # WHAT WAS MEASURED (828 tracked files).
 #   LF endings          everywhere except 15 binary files (11 PDFs under
 #                       docs/papers/, 4 .bin f64 reference fixtures under
-#                       vendor/burn-fused/) - binary, so exempt by nature.
+#                       vendor/dormouse-fused/) - binary, so exempt by nature.
 #   4-space indent      all Rust, TOML, markdown, shell and 68 of 69 Python
 #                       files.
 #   final newline       30 tracked files lack one. Not fixed here: a whitespace

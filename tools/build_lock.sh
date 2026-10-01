@@ -2,7 +2,7 @@
 # THE BUILD LOCK. Serialises HEAVY cargo work; nothing else.
 #
 # WHY THIS EXISTS. On 2026-09-29 five agents were launched at once and every one
-# needed a cold `vendor/burn-fused` build: 686 packages, ~1400 s, 41 GB of
+# needed a cold `vendor/dormouse-fused` build: 686 packages, ~1400 s, 41 GB of
 # target dir. Result: 4 cargos, 10 rustc at 4.5-5.5 GB each, available RAM 11 GB
 # against a 25 GB threshold, /proc/pressure/memory some at 8.32 %, swap 22 GB,
 # /home at 95 %. That is a pre-freeze, and AGENTS.md 2.4 records three

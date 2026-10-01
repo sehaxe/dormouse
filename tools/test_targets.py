@@ -6,7 +6,7 @@ Rule (burn-muon-plus, 243a003): a file-level `#![cfg(feature = "cuda")]` AND a
 target that builds to an empty binary and prints `running 0 tests ... ok` - a
 green line over a test that does not exist, indistinguishable from a pass.
 
-This is the guard for that class across `vendor/burn-fused`: for every
+This is the guard for that class across `vendor/dormouse-fused`: for every
 `tests/*.rs` and `examples/*.rs` that compiles to zero tests on the default
 feature set, the crate's Cargo.toml must declare the target and its
 `required-features` must cover every non-default feature the file's own `cfg`
@@ -21,7 +21,7 @@ import re
 import sys
 from pathlib import Path
 
-CRATES = Path(__file__).resolve().parents[1] / "vendor/burn-fused/crates"
+CRATES = Path(__file__).resolve().parents[1] / "vendor/dormouse-fused/crates"
 FEATURE = re.compile(r'feature\s*=\s*"([^"]+)"')  # a cfg predicate
 QUOTED = re.compile(r'"([^"]+)"')  # a bare name in a [...] list
 DECL = re.compile(r"^([A-Za-z0-9_-]+)\s*=", re.M)  # a feature declaration

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Baseline quality matrix probe for vendor/burn-fused (READ-ONLY).
+# Baseline quality matrix probe for vendor/dormouse-fused (READ-ONLY).
 # Usage: tools/fused_matrix.sh <phase> [crate ...]
 #   phases: check | test | cuda-check | cuda-test | examples | static
 # Results are TSV on stdout: crate<TAB>status<TAB>detail
 # Every cargo invocation is serial (one lock on the target dir) and timeboxed.
 set -uo pipefail
 
-WS=/home/sehaxe/dormouse/vendor/burn-fused
+WS=/home/sehaxe/dormouse/vendor/dormouse-fused
 cd "$WS" || exit 1
 
 PHASE="${1:?phase required}"

@@ -11,7 +11,7 @@
 #   tools/wt.sh list          what exists
 #
 # `test` runs TWO gates: TEST_CMD below (our three crates, `--lib` only) and
-# tools/lib_gate.sh (vendor/burn-fused, a separate cargo workspace, every crate
+# tools/lib_gate.sh (vendor/dormouse-fused, a separate cargo workspace, every crate
 # on ndarray). Either red fails the worktree. lib_gate.sh also runs standalone.
 #
 # Builds are SERIAL. One heavy thing at a time (AGENTS.md doctrine 4): a cold
@@ -77,7 +77,7 @@ test)
     cd "$path" || die "cd failed"
     s=$(date +%s); $TEST_CMD -j 4; rc=$?
     echo "wt: $(( $(date +%s) - s ))s, exit $rc"
-    # The 21 crates of vendor/burn-fused are a SEPARATE cargo workspace (the
+    # The 21 crates of vendor/dormouse-fused are a SEPARATE cargo workspace (the
     # root Cargo.toml excludes it), so `-p` cannot reach them: the crossing is
     # a second cargo run from inside the fork. Without this branch the whole
     # technology library - including the 31 integration targets the `--lib`
