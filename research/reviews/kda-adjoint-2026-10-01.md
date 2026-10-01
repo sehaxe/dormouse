@@ -177,10 +177,72 @@ converts a paragraph into a test. Its scope note has to be rewritten with it,
 because "one chunk, so BK1 only" is the sentence that let a 16-chunk
 disagreement be filed as a kernel defect.
 
-Falsification (the rule from `.bulba/memory.md` 2026-09-30, and the reason
-`34c5631` shipped unverified): re-introduce `c305ec5`'s double-exp in the
-generator and confirm the two-chunk arm goes red — a gate that cannot fail is
-not a gate.
+### 5a. The oracle is regenerable, and the committed bytes are its output
+
+Before trusting a fixture that four lanes have now argued about, regenerate it
+and compare (`859f350`'s lesson: no cargo test can see a fixture disagreeing
+with its generator, because the committed bytes ARE what the test compares
+against):
+
+```
+python3 tools/gen_bwd_f64.py --out /tmp/... --faults-out /tmp/... --carry-out /tmp/...
+regenerated vs committed ref_bwd_f64_carry.bin: worst rel 7.478e-16 on db
+```
+
+**7.5e-16 is f64 round-off** — the committed two-chunk oracle is the current
+generator's output, all 18 blocks, and it is reproducible on CPU with no GPU.
+The generator also self-checks: it refuses to write unless forward-mode AD and
+central finite differences agree, and on the good run it reports
+`|fd - fwd-mode|max = 2.044e-12`.
+
+### 5b. FALSIFICATION: the gate's oracle demonstrably moves (`tools/falsify_fused_adjoint.sh`)
+
+Injected `c305ec5`'s bug back into the generator — one identifier,
+`np.exp(g_last_log - G)` -> `np.exp(g_last - G)`, where `g_last` is already
+`exp(G_last)`, i.e. the cumsum exponentiated twice — and regenerated **only the
+carry fixture**:
+
+| block | good vs regenerated | corrupted vs good |
+|---|---|---|
+| `out` | 1.849e+00 | 2.231e+00 |
+| `out_state` | 7.339e+00 | 8.218e+00 |
+| `dq dk dv dg db dw dstate` | 2.4e-16 .. 7.5e-16 | **1.000e+00 (all seven)** |
+| `loss` | 3.009570909726e+00 | 4.424118680193e+00 |
+| generator's own fd-vs-forward-mode | 2.044e-12 | **3.001e+00** |
+
+Three things this establishes, and the third is the one that matters:
+
+1. **The oracle is not a constant.** A double exp in one identifier moves all
+   seven gradients to rel 1.0 and the loss by 47%. So a green run of the
+   two-chunk arm is a statement about *this* oracle, and the fixture is not
+   carrying a stale function.
+2. **The generator catches its own corruption** (`3.001e+00` against its own
+   `FD_VS_FWDMODE_BAR = 1e-9`) before the fixture is ever written. That is the
+   gate `859f350` had to add by hand, working from the inside.
+3. **The two-chunk arm is the one that sees it.** The forward assertion inside
+   each arm (`fwd < 1e-3`) fires on the corrupted fixture at 1.849e+00
+   *before* any gradient is compared, and it fires in the arm whose fixture was
+   corrupted. The one-chunk arm, on its own untouched fixture, stays green —
+   which is the `T==1` fingerprint `859f350` documents for a head-major layout
+   bug, and the reason a one-chunk-only gate could not have caught this class.
+
+**Not yet observed: the CUDA green run of the two-chunk arm.** The card is owned
+by the 100k production run (step 81800/100000 at 12:10, ~480 ms/step, so
+~14:30, not the 12:15 the brief estimated). One `ld.mold` leak and a
+`--tests` build cost ~25 min of that window; §4b. The generator half of the
+falsification above needs no GPU and is done; the test half is the same binary
+that already builds clean.
+
+### 5c. A bug in my own falsification script, worth recording
+
+The first `--restore` did `cp "$GEN.orig" "$GEN" && rm -f "$GEN.orig"` — and on
+the second `--regen` the `.orig` had already been overwritten with the
+*corrupted* text, so the restore restored corruption and deleted the only good
+copy. It printed nothing wrong. Restoring from **git** instead needs no backup
+file and cannot fail that way; the script now asserts
+`git diff --quiet -- gen_bwd_f64.py` before continuing. Third instance tonight
+of the shape `.bulba/memory.md` keeps collecting: an instrument that cannot
+distinguish success from failure, including one written to prove a gate works.
 
 ## 6. Status of the brief's items 4 and 5 (the path and the prize)
 
