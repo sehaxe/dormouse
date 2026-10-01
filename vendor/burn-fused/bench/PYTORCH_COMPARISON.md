@@ -1,5 +1,16 @@
 # burn-fused vs PyTorch: head-to-head on RTX 3090
 
+> **Status 2026-10-01.** Measured 2026-08-09; the numbers below are unchanged
+> and are not re-measured by any CI job in this copy. The crate list changed
+> 2026-09-28 (28 → 20). **The `Sparse attn top-k` row is void** — it measures
+> `burn-msa`, deleted 2026-09-27 (ADR-0014); it is kept because deleting a
+> measurement is not the same as deleting the fact that it was taken, and
+> because a reader who finds the number in `bench/baselines.json`
+> (`msa_sparse.fused_ms`) deserves to learn here that the crate is gone. Two
+> more caveats from the library README: several benches read the clock with no
+> device flush inside the timed loop, and no GPU in the last two years is a
+> 3090.
+
 Measured 2026-08-09 on the same RTX 3090, same shapes as `benches/src/main.rs`.
 Both sides use min-of-runs with CUDA sync. PyTorch 2.6.0+cu124.
 

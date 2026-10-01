@@ -1,5 +1,13 @@
 # Contributing
 
+> **Status 2026-10-01.** The process below was written when the workspace had
+> 28 crates; it has 20. Everything in it still holds — adding a crate is still
+> three steps and `gen_facade.py --check` still fails the build on drift. What
+> changed: the crate list, and the gate. The per-crate `.github/workflows` this
+> used to imply no longer exist (deleted `4963c3a`); the one that runs is
+> `../../.github/workflows/fused-library.yml`, from inside this directory, and
+> it has no `cuda-tests` job. For the GPU check, `tools/gpu-gate.sh`.
+
 ## Adding a technology
 
 1. New crate `crates/burn-<name>` on Burn 0.22, edition 2021.

@@ -1,5 +1,14 @@
 # Integrating burn-fused
 
+> **Status 2026-10-01.** Checked against the tree, not inherited: the crate
+> count, the `burn` pin, the 13-`cuda`/8-`autodiff` feature counts and both
+> "known-broken" defects below were re-read and all still hold. Three
+> `file:line` pointers had drifted with the code and are corrected below
+> (`chunk_cube.rs`, `burn-rmsnorm/fused.rs`, `burn-kda/lib.rs`). This file is
+> the facade's **crates.io readme** (`readme = "INTEGRATION.md"`, `Cargo.toml:12`)
+> — it ships to users, so it does not get a "may be stale" banner in place of a
+> fix.
+
 20 fused-kernel and ops crates for [Burn](https://burn.dev) 0.22, one
 dependency, one `burn` version, three feature flags. Not affiliated with the
 official burn project; MIT.
@@ -154,8 +163,8 @@ stated here rather than left to be discovered:
 
 | member | fused | non-f32 input |
 |--------|-------|---------------|
-| `burn-gdn2`, and `burn-kda` through it | chunk fwd + adjoint bwd | **checks** `DType::F32` and falls back to the tensor path (`burn-gdn2/src/kernel/chunk_cube.rs:853`). Safe. |
-| `burn-rmsnorm` | RMSNorm | **checks** both operands, falls back (`burn-rmsnorm/src/fused.rs:95`). Safe. |
+| `burn-gdn2`, and `burn-kda` through it | chunk fwd + adjoint bwd | **checks** `DType::F32` and falls back to the tensor path (`burn-gdn2/src/kernel/chunk_cube.rs:865`). Safe. |
+| `burn-rmsnorm` | RMSNorm | **checks** both operands, falls back (`burn-rmsnorm/src/fused.rs:223`). Safe. |
 | `burn-swiglu` | SwiGLU gate | **checks**, falls back (`burn-swiglu/src/fused.rs:56`). Safe. |
 | `burn-spectral` | TSCT factors | **casts** f32 for the kernel and back, so bf16 works. |
 | `burn-rope` | RoPE fwd + bwd | no check. Pass f32. |
@@ -165,7 +174,7 @@ stated here rather than left to be discovered:
 | `burn-muon-plus` | Newton–Schulz + momentum | operates on f32 parameters (masters are always f32). |
 | `burn-sct` | QR / retraction | no check. Pass f32. |
 | `burn-mor` | none of its own (`cuda` only enables burn's CUDA backend) | — |
-| the other 17 | no fused kernels | dtype-agnostic; plain tensor ops. |
+| the other 8 | no fused kernels | dtype-agnostic; plain tensor ops. |
 
 In short: **f32 in, f32 out, on any member with a fused kernel.** If you train
 in bf16, either keep the fused members' inputs in f32 (they are small
@@ -188,7 +197,7 @@ sequence length that differs from the head count:
 - `burn-gdn2/src/module.rs:368` — the `update_state == false` branch already
   permutes to `[B, T, H, D]` at line 365 and line 368 permutes again, so
   `rms_norm_gate_per_head` gets `[B, H, T, D]` against a `[B, T, H, D]` gate.
-- `burn-kda/src/lib.rs:708` — the same arm computes `q.matmul(state)` and
+- `burn-kda/src/lib.rs:1022` — the same arm computes `q.matmul(state)` and
   permutes; it also ignores `k`, `v` and the gates, so it is not the
   recurrence at all.
 

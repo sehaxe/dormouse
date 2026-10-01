@@ -1,5 +1,18 @@
 # Research & reference verification
 
+> **Status 2026-10-01.** Last updated 2026-08-09. The crate list changed
+> 2026-09-28: **20 crates, not 28** — and **six rows below verify crates that no
+> longer exist** (`burn-msa` deleted 2026-09-27 per ADR-0014; `burn-mtp`,
+> `burn-fastblt`, `burn-antihall`, `burn-nope`, `burn-mod`, `burn-ttt` deleted
+> 2026-09-28 as unreachable, fate table `docs/library-crate-fate.md` in the
+> dormouse repo). A row here is a claim about the code as it stood on
+> 2026-08-09; the verification was real when made and it says nothing about the
+> 14 surviving crates since. For the comparisons that *are* maintained, the
+> per-comparison oracle tier — authors' code vs transcription vs nothing — is
+> `docs/ORACLE-TIERS.tsv` in the dormouse repository, with the prose in
+> `docs/ORACLE.md`. That is the document to read before calling anything here
+> verified; this table has no tier column and cannot tell a (b) from a (d).
+
 Every crate is verified against (a) the research paper it implements and
 (b) the original / most popular reference code, for correctness, memory and
 performance. Status per crate, last updated 2026-08-09.

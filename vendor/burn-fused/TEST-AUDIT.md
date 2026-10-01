@@ -1,5 +1,16 @@
 # TEST-AUDIT — what the library's tests actually assert
 
+> **Status 2026-10-01.** Everything below was true as of the 2026-09-27 snapshot
+> it names; the crate list changed 2026-09-28. One section is not merely stale
+> but describes files that no longer exist: **"The bit-exact harness"** is about
+> `crates/burn-gdn2/tests/ref_data.bin` and `tools/gen_reference.rs`, both
+> DELETED. The fixture is now `tests/ref_f64_broad.bin` (1000 cases, f64
+> NumPy, no torch) and the generator `tools/gen_reference_f64.py`; the f32
+> self-transcription was removed because it could only prove self-consistency
+> and it replicate-padded the short conv's left edge exactly as the kernel
+> wrongly did. The CI job that checks it is `fused-library.yml`'s
+> `ref-data-reproducible`. Read that section as history.
+
 Written 2026-09-27, snapshot `1fab19e`. Scope: the CI gate and the
 reproducibility of the bit-for-bit claim, for the 28 crates under `crates/`
 as they stood at that snapshot. Eight of them (`burn-antihall`, `burn-byteflow`,
