@@ -83,7 +83,8 @@ pub const MOE_ROUTE: usize = 16;
 /// therefore exactly the collapse this arm must be able to see: a selection
 /// with no balancer behind it.
 pub const MOE_LB: usize = 17;
-pub const N_ARMS: usize = 18;
+pub const SITU: usize = 18;
+pub const N_ARMS: usize = 19;
 /// Arm name per index, for assertion messages that name the thing.
 pub const NAMES: [&str; N_ARMS] = [
     "iterations",

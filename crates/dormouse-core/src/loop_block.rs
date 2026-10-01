@@ -92,9 +92,16 @@ pub struct RouteAux {
 }
 
 impl ExpertFFN {
-    pub fn new(d: usize, f: usize, rank: usize, use_tsct: bool, device: &Device) -> Self {
+    /// `situ` makes `gate_up` a `d -> 2f` projection, because Eq (12) reads
+    /// `Wg x` and `Wu x` as separate inputs. With `situ = false` the
+    /// projection stays `d -> f` and the field's name is the misnomer it has
+    /// always been (a `d -> f` up-projection named after two projections);
+    /// `situ_off_leaves_the_parameter_set_alone` holds the off arm to the old
+    /// shape.
+    pub fn new(d: usize, f: usize, rank: usize, use_tsct: bool, situ: bool, device: &Device) -> Self {
+        let mid = if situ { 2 * f } else { f };
         Self {
-            gate_up: LinearLike::with_tsct(d, f, rank, use_tsct, device),
+            gate_up: LinearLike::with_tsct(d, mid, rank, use_tsct, device),
             down: LinearLike::with_tsct(f, d, rank, use_tsct, device),
         }
     }
@@ -183,6 +190,13 @@ pub struct LoopBlock {
     /// the branch is a config constant, not a shape test.
     #[module(skip)]
     pub use_mhc: bool,
+    /// SiTU-GLU in the expert FFN (arXiv:2607.24653v2 Eq 12). A plain field,
+    /// like every other arm switch - NOT `gate_up.dims()` inferred, because
+    /// the shape it implies and the activation that reads it are two claims
+    /// and only one of them is the config. Off means the elementwise
+    /// `activation::silu` this repo ran before, bit for bit.
+    #[module(skip)]
+    pub use_situ: bool,
     /// MoR routing arm (arXiv 2507.10524). Off by default; the fixed-depth
     /// mean readout is the default path.
     #[module(skip)]
@@ -279,7 +293,9 @@ impl LoopBlock {
         Self {
             controller,
             shared_attn: AdaptiveAttention::new(d, cfg.n_heads, cfg.head_dim, device),
-            expert_ffns: (0..cfg.n_experts).map(|_| ExpertFFN::new(d, f, cfg.rank, cfg.use_tsct, device)).collect(),
+            expert_ffns: (0..cfg.n_experts)
+                .map(|_| ExpertFFN::new(d, f, cfg.rank, cfg.use_tsct, cfg.use_situ, device))
+                .collect(),
             engram: EngramModule::new(&tables, cfg.engram_dim, d, 1, device),
             mem_dense: LinearConfig::new(d, d).with_bias(false).init(device),
             norm: RMSNorm::new(d, cfg.norm_eps, device),
@@ -316,6 +332,7 @@ impl LoopBlock {
             use_engram: cfg.use_engram,
             use_attnres: cfg.use_attnres,
             use_mhc: cfg.use_mhc,
+            use_situ: cfg.use_situ,
             use_mor: cfg.use_mor,
             mor_k: cfg.mor_k,
             moe_topk: cfg.moe_topk,
@@ -354,6 +371,24 @@ impl LoopBlock {
         let use_gr = self.gr.is_some();
         let use_attnres = self.use_attnres;
         let use_mhc = self.use_mhc;
+        // Read once, next to the other arm switches. The `2 * ffn_hidden`
+        // contract is the one the `gate_up` width was built to (`ExpertFFN::new`
+        // with `situ = true`); the assert below is what holds the two together.
+        // Re-checked at the branch rather than trusted, like the
+        // `use_attnres`/`use_gr` pair: every field here is `pub`, so a
+        // hand-built or post-hoc-mutated `LoopBlock` can carry a flag its
+        // parameters do not match, and Eq (12) reading a `d -> f` tensor is an
+        // out-of-range slice - loud, but a panic from inside burn with no
+        // mention of `use_situ` (ADR-0011: name the cause AND the escape).
+        let use_situ = self.use_situ;
+        assert_eq!(
+            self.expert_ffns[0].gate_up.out_features,
+            if use_situ { 2 * self.ffn_hidden } else { self.ffn_hidden },
+            "use_situ = {use_situ} but the experts' gate_up is {} wide, so it was built for \
+             the other arm: set use_situ in the config (so ExpertFFN::new sizes gate_up \
+             accordingly) rather than flipping the field after construction",
+            self.expert_ffns[0].gate_up.out_features
+        );
         assert!(
             !(use_attnres && use_gr) && !(use_attnres && use_mhc) && !(use_gr && use_mhc),
             "use_attnres, use_gr and use_mhc each replace the residual accumulation; \
@@ -620,11 +655,29 @@ impl LoopBlock {
                 Tensor::zeros([b * t, d], &h.device())
             };
 
-            // Expert FFN: softmax blend of n_experts TSCT gate_up/silu/down
+            // Expert FFN: softmax blend of n_experts TSCT gate_up/silu/down.
+            // `use_situ` swaps the elementwise SiLU for SiTU-GLU
+            // (arXiv:2607.24653v2 Eq 12), which is why `gate_up` is `d -> 2f`
+            // on that arm: Eq 12 reads `Wg x` and `Wu x` separately. The cast
+            // to f32 is the same rule every forward here follows (mixed-dtype
+            // bf16 activations x fp32 weights NaN on this stack), and SiTU's
+            // output is bounded to +-beta1*beta2, so nothing downstream of this
+            // can inherit an unbounded activation.
             let mut ffn = Tensor::zeros([b * t, d], &h.device());
             for e in 0..self.n_experts {
                 let mid = self.expert_ffns[e].gate_up.forward::<B>(normed_ffn.clone());
-                let mid = activation::silu(if bf16 { mid.cast(FloatDType::F32) } else { mid });
+                let mid_f32 = if bf16 { mid.cast(FloatDType::F32) } else { mid };
+                let mid = if use_situ {
+                    crate::probe::note(crate::probe::SITU);
+                    burn_situ::situ_glu(
+                        mid_f32,
+                        self.ffn_hidden,
+                        burn_situ::K3_GATE_BETA,
+                        burn_situ::K3_UP_BETA,
+                    )
+                } else {
+                    activation::silu(mid_f32)
+                };
                 let out = self.expert_ffns[e].down.forward::<B>(mid);
                 ffn = ffn + out.mul(blend.clone().slice([0..b * t, e..e + 1]));
             }
@@ -1085,6 +1138,21 @@ mod tests {
     /// with the attention and memory arms off, so what differs between the arms
     /// is the residual statement and nothing else.
     fn mhc_cfg(depth: usize) -> DormouseConfig {
+    // ---------------------------------------------------------------------
+    // SITU (arXiv:2607.24653v2 Eq 12). The FORM is gated in the mechanism
+    // crate, against Moonshot's own numbers - see
+    // vendor/burn-fused/crates/burn-situ/src/lib.rs and
+    // research/reviews/situ-2026-09-30.md. What is gated HERE is the wiring:
+    // that the flag is load-bearing, that the counter sees the arm, and that
+    // the gradient survives the cap. The form gate cannot see any of it: a
+    // perfectly-formed SiTU wired to nothing is a green crate and a run that
+    // measured SiLU.
+    // ---------------------------------------------------------------------
+
+    /// `d_ffn` and `n_experts` for the gates below, and the arms off: the
+    /// gradient numbers are about the activation, and KDA/Engram only add
+    /// other arms' counters to the same forward.
+    fn situ_cfg() -> DormouseConfig {
         let mut cfg = DormouseConfig::default();
         cfg.d_model = 32;
         cfg.n_heads = 2;
@@ -1094,6 +1162,14 @@ mod tests {
         cfg.n_experts = 1;
         cfg.rank = 8;
         cfg.engram_rows = 256;
+        // A multiple of 4, so `LinearLike`'s `N % 4 == 0` padding
+        // (param.rs:49) leaves the width exactly `f` and `2f` and the
+        // width assertions below are about the arm, not about the pad.
+        cfg.d_ffn = 64;
+        cfg.n_experts = 2;
+        cfg.rank = 8;
+        cfg.engram_rows = 256;
+        cfg.max_iter = 2;
         cfg.use_kda = false;
         cfg.use_engram = false;
         cfg
@@ -1813,6 +1889,256 @@ mod tests {
             crate::config::validate(&DormouseConfig { use_mhc: true, mhc_streams: 4, ..mhc_cfg(2) })
                 .is_ok()
         );
+    }
+
+    /// OFF IS THE OLD MODEL. `use_situ = false` must leave the parameter set
+    /// alone, because every existing checkpoint is that parameter set: the
+    /// up-projection stays `d -> f` (not `d -> 2f`), so the FFN's parameter
+    /// count and every `gate_up` factor are bit-identical to a build from
+    /// before this field existed.
+    ///
+    /// **What this test is NOT.** A cross-build bitwise comparison of two
+    /// forward passes, which is the obvious thing to reach for and is not
+    /// available: `Device::seed` does not rewind a consumed stream, so a second
+    /// `LoopBlock::new` on the shared flex device draws DIFFERENT weights and
+    /// comparing them would measure the RNG, not the flag (AGENTS.md §3.7 - the
+    /// "CPU is deterministic" claim, withdrawn 2026-09-30). The identity
+    /// claim is therefore carried by the parameter set here, by the exact
+    /// preset counts in `preset_exec` (11/0, unchanged), and by the fact that
+    /// the new field is `#[serde(default)]`, so no config snapshot that predates
+    /// it can fail to parse.
+    #[test]
+    fn situ_off_leaves_the_parameter_set_alone() {
+        let cfg = situ_cfg();
+        let off = LoopBlock::new(&cfg, &adev());
+        for e in &off.expert_ffns {
+            assert_eq!(
+                e.gate_up.out_features, cfg.d_ffn,
+                "use_situ = false must keep the up-projection d -> d_ffn; Eq (12) reads two \
+                 projections and silu reads one"
+            );
+        }
+        assert!(!off.use_situ);
+        // The default config itself, so a preset cannot turn this on by
+        // accident.
+        assert!(!DormouseConfig::default().use_situ);
+        // And the flag is `serde(default)`: a snapshot written before the field
+        // existed parses, and reads as off.
+        let old_snapshot = "d_model = 32\nn_experts = 2\nmax_iter = 2\n";
+        let parsed: DormouseConfig = toml::from_str(old_snapshot).expect("a pre-situ snapshot parses");
+        assert!(!parsed.use_situ, "a config without the field is the OFF arm");
+
+        // On: `d -> 2f`, exactly. This is the whole parameter delta of the arm
+        // and it is why the A/B is width-confounded (schema.rs).
+        let on = LoopBlock::new(&DormouseConfig { use_situ: true, ..cfg.clone() }, &adev());
+        for e in &on.expert_ffns {
+            assert_eq!(e.gate_up.out_features, 2 * cfg.d_ffn, "Eq (12) needs Wg and Wu separately");
+        }
+        // The cost of the arm, on the gate's own geometry, from the factors'
+        // element counts: TSCT adds `rank * f` per expert when the width goes
+        // from f to 2f. (On `small`, r=64 f=2048 n=3: +393 216, +4.28%.)
+        let delta = on
+            .expert_ffns
+            .iter()
+            .map(|e| {
+                burn::module::Module::num_params(&e.gate_up)
+                    - burn::module::Module::num_params(&off.expert_ffns[0].gate_up)
+            })
+            .sum::<usize>();
+        assert_eq!(
+            delta, cfg.n_experts * cfg.rank * cfg.d_ffn,
+            "the arm costs rank*d_ffn per expert, and that is the confound the A/B row names"
+        );
+    }
+
+    /// THE LOUD GUARD IS LOUD, AND NAMES ITS CAUSE. Every field on
+    /// `LoopBlock` is `pub`, so `use_situ` can be flipped after construction -
+    /// and then Eq (12) reads a `d -> f` tensor, which is an out-of-range slice
+    /// inside burn: a panic that mentions shapes and never mentions the flag.
+    /// This asserts the message names `use_situ` and the escape.
+    #[test]
+    #[should_panic(expected = "use_situ")]
+    fn situ_flag_and_width_cannot_disagree() {
+        let cfg = situ_cfg();
+        let mut blk = LoopBlock::new(&cfg, &adev());
+        // The parameters are the OFF arm's; claiming the ON arm is the lie.
+        blk.use_situ = true;
+        let head = LinearLike::with_tsct(cfg.d_model, 16, cfg.rank, cfg.use_tsct, &adev());
+        let x = Tensor::<3>::zeros([2, 5, cfg.d_model], &adev());
+        let _ = blk.forward_full_state::<B>(x, None, None, None, None, &head);
+    }
+
+    /// THE ARM IS OBSERVABLE, and its counter is exact. `use_situ = true` with a
+    /// zero counter is a run that measured SiLU under SiTU's name - the
+    /// ADR-0019 shape, and the GR `9b343d3` defect in a new place.
+    #[test]
+    fn situ_counts_every_expert_it_activates() {
+        let cfg = situ_cfg();
+        let head = LinearLike::with_tsct(cfg.d_model, 16, cfg.rank, cfg.use_tsct, &adev());
+        let x = Tensor::<3>::random([2, 5, cfg.d_model], Distribution::Normal(0.0, 1.0), &adev());
+
+        crate::probe::reset();
+        let mut on = LoopBlock::new(&DormouseConfig { use_situ: true, ..cfg.clone() }, &adev());
+        let _ = on.forward_full_state::<B>(x.clone(), None, None, None, None, &head);
+        assert_eq!(
+            crate::probe::count(crate::probe::SITU),
+            (cfg.n_experts * cfg.max_iter) as u64,
+            "one SiTU per expert per iteration: n_experts * max_iter"
+        );
+
+        // Off: zero. The silu path must not touch the counter, or the field
+        // would read non-zero for a run that never activated the arm.
+        crate::probe::reset();
+        let mut off = LoopBlock::new(&cfg, &adev());
+        let _ = off.forward_full_state::<B>(x.clone(), None, None, None, None, &head);
+        assert_eq!(crate::probe::count(crate::probe::SITU), 0, "silu does not run SiTU");
+
+        // Truncated depth counts what RAN, like every other counter here.
+        crate::probe::reset();
+        on.set_depth(Some(1));
+        let _ = on.forward_full_state::<B>(x, None, None, None, None, &head);
+        assert_eq!(
+            crate::probe::count(crate::probe::SITU),
+            cfg.n_experts as u64,
+            "depth 1 activated n_experts times, not n_experts * max_iter"
+        );
+    }
+
+    /// THE FLAG IS LOAD-BEARING, on the block's OWN weights - so no
+    /// cross-model comparison and no RNG confound. The intermediate the
+    /// up-projection actually produces is fed to both activations: the one the
+    /// config names must be BOUNDED by `beta1*beta2` and the one it replaced
+    /// must not be. A `use_situ` that was computed and discarded, or that fed
+    /// `situ_glu` a `[b*t, f]` tensor, could not pass this.
+    #[test]
+    fn situ_bounds_the_activation_the_silu_path_left_unbounded() {
+        let cfg = situ_cfg();
+        let on = LoopBlock::new(&DormouseConfig { use_situ: true, ..cfg.clone() }, &adev());
+        let expert = &on.expert_ffns[0];
+        let n = 64usize;
+        // `gate_up` is `d_model -> 2*d_ffn`, so the input is d_model-wide and
+        // the BOUNDED tensor is its output. A deliberately hot input: an
+        // RMSNormed hidden state is O(1), so this is far outside the training
+        // regime - the overfit condition AGENTS.md §2.3 says the NaN class
+        // lives in, and the regime Eq (19)'s bound is claimed for.
+        let probe = Tensor::<2>::random([n, cfg.d_model], Distribution::Normal(0.0, 1.0), &adev());
+        let mid = expert.gate_up.forward::<B>(probe);
+        assert_eq!(mid.dims(), [n, 2 * cfg.d_ffn], "the up-projection is d_model -> 2*d_ffn");
+        // Put the intermediate at a NAMED magnitude, 10x the bound, instead of
+        // hoping the random TSCT factors land there: the comparison is then a
+        // statement about the activation and not about the initializer.
+        const HOT: f32 = 10.0 * (burn_situ::K3_GATE_BETA * burn_situ::K3_UP_BETA) as f32;
+        let scale = HOT / mid.clone().abs().max().into_scalar::<f32>();
+        let mid = mid.mul_scalar(scale);
+        let mid_peak = mid.clone().abs().max().into_scalar::<f32>();
+        assert!(
+            (mid_peak - HOT).abs() < 0.01 * HOT,
+            "the rescale put the intermediate at {mid_peak}, not the {HOT} it asked for"
+        );
+        let via_situ = burn_situ::situ_glu(
+            mid.clone(),
+            cfg.d_ffn,
+            burn_situ::K3_GATE_BETA,
+            burn_situ::K3_UP_BETA,
+        );
+        // The comparator has to be the same SHAPE to be compared elementwise,
+        // and the arm it replaces read one `d_ffn`-wide tensor, so it is
+        // `silu` on this tensor's gate half: the same coordinates, unbounded.
+        let via_silu = activation::silu(mid.slice([0..n, 0..cfg.d_ffn]));
+        assert_eq!(via_situ.dims(), via_silu.dims(), "the comparator is elementwise");
+        let bound = (burn_situ::K3_GATE_BETA * burn_situ::K3_UP_BETA) as f32;
+        let peak_situ = via_situ.clone().abs().max().into_scalar::<f32>();
+        let peak_silu = via_silu.clone().abs().max().into_scalar::<f32>();
+        assert!(
+            peak_situ <= bound * (1.0 + 1e-5),
+            "SiTU gave {peak_situ}, past the Eq (19) bound {bound}"
+        );
+        // 5x, not 10x: |silu|'s peak is not at |mid|'s peak (a large NEGATIVE
+        // pre-activation saturates to ~0), so the honest comparator is the
+        // largest positive coordinate, and on this fixture that lands at 9.2x.
+        assert!(
+            peak_silu > 5.0 * bound,
+            "the silu comparator peaked at only {peak_silu}, {bound} away from the bound - a \
+             fixture too cold to tell a bounded activation from an unbounded one"
+        );
+        // And they are different functions, not the same one twice.
+        let diff = (via_situ - via_silu).abs().max().into_scalar::<f32>();
+        assert!(diff > 1.0, "the two activations differ by only {diff} on a hot input");
+    }
+
+    /// THE GRADIENT SURVIVES THE CAP. `tanh` saturates, so this is the honest
+    /// question about the mechanism: the forward is bounded, and bounded
+    /// forward and vanishing gradient are the same fact. Measured on the real
+    /// path - up-projection, cap, down-projection, backward - and asserted on
+    /// RELATIVE gradient (d/dinput over |output|), because an absolute
+    /// threshold would be a statement about this fixture's scale and not about
+    /// the arm.
+    ///
+    /// The reference numbers (f64, `tools/gen_ref.py` in burn-situ, cross-checked
+    /// against the crate's own CUDA backward): the GATE factor's derivative
+    /// falls from 0.73 at g=0.5 to 1.8e-4 at g=20 and to 8.2e-9 at g=40, i.e.
+    /// the cap costs a factor of ~1/sech^2 and the branch is numerically DEAD
+    /// past ~10*beta. Over the band where the cap is doing its job (1-5 beta)
+    /// the gradient is 1.6e-1 to 4.5e-5 relative, which is 2.7 to 6 orders
+    /// above f32 eps (1.19e-7). So the gate asserts the band the arm operates
+    /// in is alive, and records the decay for the A/B to interpret.
+    #[test]
+    fn situ_gradient_survives_the_cap_where_the_cap_operates() {
+        let cfg = situ_cfg();
+        let on = LoopBlock::new(&DormouseConfig { use_situ: true, ..cfg }, &adev());
+        let expert = &on.expert_ffns[0];
+        let f = cfg.d_ffn;
+        let n = 8usize;
+        let b1 = burn_situ::K3_GATE_BETA as f32;
+        let b2 = burn_situ::K3_UP_BETA as f32;
+
+        // The gate half swept over 0.25x .. 5x beta1 and the up half over the
+        // matching 0.25x .. 5x beta2, with the up sign alternating so the
+        // negative Swish tail is in the sweep. Each row is `[n, 2f]`: f gate
+        // pre-activations, then f up ones - the layout Eq (12) reads.
+        for &mult in &[0.25f32, 0.5, 1.0, 2.0, 5.0] {
+            let mut cells = Vec::with_capacity(n * 2 * f);
+            for _ in 0..n {
+                cells.extend(std::iter::repeat_n(mult * b1, f));
+                cells.extend((0..f).map(|j| if j % 2 == 0 { mult * b2 } else { -mult * b2 }));
+            }
+            let input = Tensor::<1>::from_floats(cells.as_slice(), &adev())
+                .reshape([n, 2 * f])
+                .require_grad();
+            let out = expert.down.forward::<B>(burn_situ::situ_glu(
+                input.clone(),
+                f,
+                burn_situ::K3_GATE_BETA,
+                burn_situ::K3_UP_BETA,
+            ));
+            // Sum of squares: a scalar with no sign, so the test measures the
+            // magnitude of the path and not which way it points.
+            let loss = out.clone().powf_scalar(2.0).sum();
+            let grads = loss.backward();
+            let g = input.grad(&grads).expect("a require_grad leaf has a gradient");
+            let peak = g.clone().abs().max().into_scalar::<f32>();
+            let out_peak = out.clone().abs().max().into_scalar::<f32>();
+            // RELATIVE gradient: an absolute threshold would be a statement
+            // about this fixture's scale, not about the arm. The floor is the
+            // measured d/dinput/|out| of the same quantity one octave further
+            // out the cap (tools/gen_ref.py), halved, so a regression that
+            // costs the arm an order of magnitude of gradient trips it.
+            let rel = peak / out_peak.max(1e-30);
+            assert!(
+                peak.is_finite() && rel > 1e-6,
+                "at {mult}x beta (gate {:.2}, up {:.2}): d/dinput peaked at {peak:.3e} against                  |out| = {out_peak:.3e}, i.e. {rel:.3e} relative - the cap killed the gradient \
+                 inside the band the arm operates in",
+                mult * b1,
+                mult * b2
+            );
+            // f32 eps is 1.19e-7: a relative gradient under it cannot move the
+            // output by one ulp, which is the "numerically dead" line the
+            // findings file quotes at 10x beta.
+            eprintln!(
+                "situ grad sweep: {mult:>4}x beta1 -> |d/dinput|/|out| = {rel:.3e} \
+                 (|out| = {out_peak:.4e})"
+            );
+        }
     }
 
     /// The block's wiring uses the configured floor, and the row budget

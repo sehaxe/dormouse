@@ -65,7 +65,6 @@ fn d_rank() -> usize { 64 }
 fn d_norm_eps() -> f32 { 0.001 }
 fn d_true() -> bool { true }
 fn d_n_experts() -> usize { 3 }
-fn d_mhc_streams() -> usize { 2 }
 fn d_jepa_weight() -> f32 { 0.05 }
 fn d_jepa_mask_frac() -> f32 { 0.15 }
 fn d_jepa_mask_span() -> usize { 8 }
@@ -81,8 +80,6 @@ fn d_engram_lam_max() -> f32 { 0.5 }
 fn d_false() -> bool { false }
 fn d_mor_k() -> usize { 2 }
 fn d_mor_bce_weight() -> f32 { 0.05 }
-fn d_moe_topk() -> usize { 0 }
-fn d_moe_lb_coef() -> f32 { 0.0 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DormouseConfig {
@@ -123,57 +120,22 @@ pub struct DormouseConfig {
     /// accident, but it is not wired to a config field: the first A/B this
     /// arm needs is AttnRes vs ReZero, not AttnRes vs AttnRes.
     #[serde(default)] pub use_attnres: bool,
-    /// Manifold-Constrained Hyper-Connections (arXiv:2512.24880, DeepSeek),
-    /// the third learned replacement for the loop's residual accumulation and
-    /// the only one with a CONSTRAINT on the operator: the per-token `H_res`
-    /// is projected onto the Birkhoff polytope (Sinkhorn-Knopp, Eq. 9), so it
-    /// is doubly stochastic and `H_res x_l` is a convex combination of the
-    /// streams - the identity-mapping property that plain Hyper-Connections
-    /// (arXiv:2409.19606, Zhu et al., ICLR 2025) destroy and that unrolls to a
-    /// doubly stochastic composite over any depth. OFF by default, like
-    /// `use_gr` and `use_attnres`, for checkpoint compatibility: the block
-    /// exists only when the flag is on.
+    /// SiTU-GLU in the expert FFN (arXiv:2607.24653v2 Eq 12, Kimi K3):
+    /// `beta1*tanh(Wg x/beta1) * Sigmoid(Wg x) * beta2*tanh(Wu x/beta2)` at
+    /// K3's own `beta1 = 4`, `beta2 = 25` (`burn_situ::K3_GATE_BETA` /
+    /// `K3_UP_BETA`, which are constants - beta is fixed in the paper, not
+    /// learned and not swept).
     ///
-    /// Placed at the LOOP BOUNDARY (the per-iteration write), not between
-    /// sublayers, because that is where the phi evidence was measured:
-    /// 2604.21106v3 §5.2 replaces the input injection with K=2
-    /// "residual lanes across loops" and reads phi 0.45 -> 0.65. One shared
-    /// `MhcBlock` is applied at every iteration, weight-shared like the block
-    /// itself, so the composite the manifold argument is about is `H_res^T`.
-    #[serde(default)] pub use_mhc: bool,
-    /// The residual-stream expansion rate `n` (Eq. 6-8: `x_l` is read as
-    /// `n` streams of width `D/n`, and `H_res` is `n x n`).
-    ///
-    /// **Default 2, and the papers agree on that rung.** The phi study
-    /// (2604.21106v3 §5.2) ran exactly `K = 2`; the base paper's own
-    /// expansion-rate ablation (2409.19606 Tab. 1) has `n = 1` *below* the
-    /// Pre-Norm baseline and `n = 8` adding almost nothing over `n = 4`, so the
-    /// family buys its gain over `n = 2` at triple the launch count for no
-    /// measured return; and 2607.14530 finds the gains collapse past `N = 4`.
-    /// One variation per launch (external review, 2026-10-01): `n = 4` is the
-    /// paper's own App. A.1 setting and is a flag away - `--set
-    /// mhc_streams=4` - as the follow-up row, not the first one.
-    ///
-    /// **And the cost is NOT in `n`, which is worth knowing before spending
-    /// money on the ladder.** The Sinkhorn issues a FIXED number of launches
-    /// per call - `SINKHORN_ITERS = 20` x 2 directions x 7 ops = 280 forward
-    /// (`sinkhorn.rs:48-70`), plus a 40-step hand-derived reverse unroll - and
-    /// that count is independent of `n`: `n` scales the ELEMENT count of each
-    /// tiny `[b,t,n,n]` tensor and the parameter count (measured: 6 155 at
-    /// `n = 2` on `small`, 0.067 % of its 9 197 390);
-    /// not how many kernels the host has to enqueue. So `n = 2` is the right
-    /// first rung for the reviewer's reasons (cheapest, and the K the phi
-    /// evidence used) but it is NOT cheaper in launches than `n = 4`. On a box
-    /// whose mean GPU utilisation is 13.3 % (AGENTS §3.1) the launch count is
-    /// the arm's whole cost, and it is reducible only by the fused kernel
-    /// (`burn-mhc/cuda`, deliberately not enabled - see the findings file §6),
-    /// never by a smaller `n`. Measure it: AB-PROTOCOL row 7b prices step time
-    /// separately from quality for exactly this reason.
-    ///
-    /// Must divide `d_model` (`MhcBlock` reshapes the hidden state to
-    /// `[b, t, n, D/n]` and `validate` refuses a non-divisor LOUDLY rather
-    /// than panicking in the first forward).
-    #[serde(default = "d_mhc_streams")] pub mhc_streams: usize,
+    /// OFF by default. **This is not a pure activation swap**: Eq 12 reads
+    /// `Wg x` and `Wu x` separately, so `ExpertFFN::gate_up` becomes
+    /// `d_model -> 2*d_ffn` when the flag is on (a `d -> f` projection that was
+    /// named after two projections finally being two). On `small` that is
+    /// +393 216 parameters, **+4.28%**, because TSCT binds (`r*f` per expert,
+    /// not `d*f`); the honest A/B therefore needs a width-matched control,
+    /// which is SwiGLU at the same `2f` - the paper's own comparison in
+    /// §2.3.2. Off is bitwise identical: see `situ_off_is_bitwise_the_old_model`
+    /// and the unchanged `preset_exec` counts.
+    #[serde(default)] pub use_situ: bool,
     #[serde(default = "d_n_experts")] pub n_experts: usize,
     #[serde(default = "d_jepa_weight")] pub jepa_weight: f32,
     #[serde(default = "d_jepa_mask_frac")] pub jepa_mask_frac: f32,
@@ -318,61 +280,6 @@ pub struct DormouseConfig {
     /// Weight of the MoR BCE auxiliary, whose label is the router's own top-k
     /// recomputed on the current batch every step.
     #[serde(default = "d_mor_bce_weight")] pub mor_bce_weight: f32,
-
-    // --- sparse expert routing over the loop's FFN branch ---
-    /// Selected experts per token, per loop pass. **0 = OFF**, which is the
-    /// existing dense softmax blend over all `n_experts` TSCT FFNs, unchanged
-    /// - so the default build's parameters and checkpoint are byte-identical
-    /// to a build from before this field existed, and queue row 1 (pure CE)
-    /// needs no re-baseline.
-    ///
-    /// One field rather than a `use_moe` bool plus a `k`: a bool and an
-    /// integer that can disagree leave a third state between them, and
-    /// `true, 0` is a config with no interpretation - the class `validate`
-    /// refuses elsewhere (see `mor_k`).
-    ///
-    /// **First configuration is `k = 1` at `n_experts = 4`, not 8-16 top-2.**
-    /// The 8-expert top-2 evidence sits at 168M+ active parameters; at
-    /// `small`'s 9.2M the per-expert token population is the thing to worry
-    /// about, and halving the expert count buys it. `k = 2` is the SECOND A/B
-    /// configuration, at the same active FFN compute.
-    ///
-    /// What it buys at this stage is SPECIALIZATION at equal active
-    /// parameters, not speed: every expert is still computed and then masked,
-    /// so executed FLOPs are unchanged. See `moe.rs`.
-    #[serde(default = "d_moe_topk")] pub moe_topk: usize,
-    /// Coefficient on the Switch/GShard load-balancing term (`moe::lb_aux`,
-    /// range `[1, n_experts]`, minimized at exactly 1 when routing is
-    /// uniform).
-    ///
-    /// **0.0 - OFF by default, and the ONLY legal zero position is with
-    /// `moe_topk = 0`.** Both mismatches are LOUD in `validate`:
-    /// `moe_lb_coef > 0` with routing off is a term with no selection to
-    /// balance (silently ignored, i.e. the `aux_fb_weight`-without-a-head
-    /// defect), and `moe_topk > 0` with `moe_lb_coef == 0` is a top-k router
-    /// with NO balancer, which collapses onto a few experts - after which
-    /// every pass selects the same expert and the arm is the dense mixture
-    /// with a worse gradient, invisibly, because the loss curve stays healthy.
-    ///
-    /// **The default is deliberately ZERO, and that is a MEASUREMENT, not a
-    /// shrug.** Switch's 0.01 and GShard's 0.1 were tuned against a token
-    /// population we do not have, so the coefficient was swept on a hostile toy
-    /// batch (`moe.rs`'s
-    /// `load_balance_sweep_is_measured_against_the_task_gradient`): at 64 tokens
-    /// the balancer needs coef ~220 to match the task gradient, and at 0.01 /
-    /// 0.1 the router ends 100% on one expert - exactly as it does with no
-    /// balancer at all. The cause is structural: Switch's `P_i` is a MEAN over
-    /// tokens, so the balancer's gradient per token shrinks as the batch grows
-    /// while the task's does not, and the matching coefficient scales with the
-    /// token count - to ~1.4e4 at the trainer's ~4096-token batch, where the
-    /// term's VALUE would be ~1e4 against a CE of ~5.5.
-    ///
-    /// So the standard Switch form does not transfer to our scale, no constant
-    /// is shipped, and `moe_lb_coef` stays 0.0 with the arm off. Making the
-    /// term's normalization token-count-invariant so a constant coefficient
-    /// WOULD transfer is the named follow-up. Numbers and method:
-    /// `research/reviews/moe-routing-2026-10-01.md` 6.2.
-    #[serde(default = "d_moe_lb_coef")] pub moe_lb_coef: f32,
 }
 
 impl Default for DormouseConfig {

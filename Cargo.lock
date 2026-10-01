@@ -1411,6 +1411,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "burn-situ"
+version = "0.1.0"
+dependencies = [
+ "burn",
+ "burn-tensor",
+]
+
+[[package]]
 name = "burn-spectral"
 version = "0.1.0"
 dependencies = [
@@ -2889,6 +2897,7 @@ dependencies = [
  "burn-mor",
  "burn-nn",
  "burn-rmsnorm",
+ "burn-situ",
  "burn-spectral",
  "burn-tensor",
  "rand 0.8.8",
