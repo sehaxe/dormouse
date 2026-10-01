@@ -24,6 +24,11 @@
 #                 than this local one (a separate lane fixes CI); this is the
 #                 local truth. Also under build_lock: it compiles, and the
 #                 lock's whole reason to exist is unsynchronised cargo work.
+#                 BLAST RADIUS: cargo doc compiles the crates' dependency
+#                 closure under the same RUSTFLAGS, so a warning anywhere in
+#                 the closure (dormouse-train, a dep of cli, is in it) fails
+#                 this check too - measured 2026-10-02, 8 such warnings; that
+#                 is the gate working, not a bug in it.
 #   doc-refs      python3 tools/check_doc_refs.py - every repo path a document
 #                 names must exist (the 2026-10-01 docs consolidation gate).
 #   dead-pub      python3 tools/dead_pub_audit.py - the dead-`pub` audit. No
