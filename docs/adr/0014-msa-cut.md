@@ -10,7 +10,7 @@ diagnostic - with `use_msa = false` in every preset and no run that ever
 executed it. Off is not the same as gone: a disabled arm still gets renamed,
 still breaks the routing validator, and still has to be reasoned about.
 
-Decision: delete it. `vendor/burn-fused/crates/burn-msa`, `use_msa` /
+Decision: delete it. `vendor/dormouse-fused/crates/burn-msa`, `use_msa` /
 `msa_topk` / `msa_block` in the config schema and presets, `--no-msa`, the
 `AdaptiveAttention::blend` router, and the QK_KV optimizer group go away. The
 attention block is KDA only; the loop's `w_attn` controller weight still gates

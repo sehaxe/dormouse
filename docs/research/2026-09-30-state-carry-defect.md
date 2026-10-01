@@ -45,7 +45,7 @@ S[kk][v] = S[kk][v]·g_last[kk] + Σ_r kgd[r][kk]·v_new[r][v]
 где `kgd[r] = k_r · exp(g_last) / exp(g_r)` (`:117`), `g_last[kk] = exp(g_left)`
 (`:120`) — **однофакторное**, по размерности `kk`, без отдельного слагаемого.
 
-Поиск по `vendor/burn-fused/crates/burn-gdn2/src/` на `gk` / `kg_decay` /
+Поиск по `vendor/dormouse-fused/crates/burn-gdn2/src/` на `gk` / `kg_decay` /
 `gk_last` / `STATE_V_FIRST`: **нуль совпадений.** Раздельного затухания по
 размерностям ключа у нас нет **вовсе**, и флага выбора такого режима тоже нет.
 

@@ -1,7 +1,7 @@
 # TSCT — our own invention. Lineage, precise definition, and delta vs the published mechanisms.
 
-**Fetch date: 2026-09-29.** Read-only pass over `vendor/burn-fused/crates/burn-spectral/`,
-`vendor/burn-fused/crates/burn-sct/`, `crates/dormouse-core/src/param.rs`,
+**Fetch date: 2026-09-29.** Read-only pass over `vendor/dormouse-fused/crates/burn-spectral/`,
+`vendor/dormouse-fused/crates/burn-sct/`, `crates/dormouse-core/src/param.rs`,
 `crates/dormouse-core/src/loop_block.rs`, `crates/dormouse-core/src/routing.rs`,
 `crates/dormouse-train/src/lib.rs`. No GPU, no build, no test.
 

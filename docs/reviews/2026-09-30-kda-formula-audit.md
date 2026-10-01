@@ -1,7 +1,7 @@
 # burn-kda formula audit — every math site against its primary source
 
 **Worktree** `wt/kda-formula`, off `3234ecc`, 2026-09-30. CPU only, no GPU.
-**Scope** `vendor/burn-fused/crates/burn-kda/` — `src/lib.rs` (1184 lines) and
+**Scope** `vendor/dormouse-fused/crates/burn-kda/` — `src/lib.rs` (1184 lines) and
 `src/fused.rs` (118 lines). Read-only cross-checks into `burn-gdn2` (the
 tensor-path and kernel implementations burn-kda *calls*); no burn-gdn2 file is
 edited, that is another lane's.
@@ -456,7 +456,7 @@ check would have passed a change that quietly altered the arithmetic.
 **`tools/lib_gate.sh` is RED on this branch, and neither red is mine.** It
 reports `burn-gdn2`'s `oracle_breadth::gdn2_1000_cases_match_the_f64_oracle`
 and `oracle_chunk::chunk_sizes_match_the_f64_oracle` failing. `git diff
-3234ecc HEAD -- vendor/burn-fused/crates/burn-gdn2` is **empty** — this lane
+3234ecc HEAD -- vendor/dormouse-fused/crates/burn-gdn2` is **empty** — this lane
 touched no burn-gdn2 file — and burn-kda's own cell is 12/12 green plus the
 oracle's 7 green / 3 red-on-purpose. So the honest statement is: **the library's
 CPU cell is red on `3234ecc` and my branch does not change that**, and the two

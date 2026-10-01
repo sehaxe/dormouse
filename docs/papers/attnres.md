@@ -1,4 +1,4 @@
-# Attention Residuals (arXiv:2603.15031) vs `vendor/burn-fused/crates/burn-attnres/`
+# Attention Residuals (arXiv:2603.15031) vs `vendor/dormouse-fused/crates/burn-attnres/`
 
 **Scope.** Paper-fidelity audit of one crate. No code was built or run (no GPU on this box, and the
 box is busy). Every "what we do" claim below is read out of the source at the line numbers given; every
@@ -28,7 +28,7 @@ scaled formula.
 | license | CC BY-NC-ND 4.0 |
 | authors' repo | https://github.com/MoonshotAI/Attention-Residuals (default branch `master`, HEAD `85e22310`, 4 commits, 3.5k stars, 205 forks) |
 | date fetched | **2026-09-29** (paper, repo, third-party ports) |
-| crate audited | `vendor/burn-fused/crates/burn-attnres/` — `src/lib.rs` (517 lines), `src/fused_attnres.rs` (1821 lines), `README.md`, `benches/attnres.rs` |
+| crate audited | `vendor/dormouse-fused/crates/burn-attnres/` — `src/lib.rs` (517 lines), `src/fused_attnres.rs` (1821 lines), `README.md`, `benches/attnres.rs` |
 
 ### Does original source code exist? **No.**
 
@@ -239,7 +239,7 @@ into block 0's cell. **Our streaming `BlockAttnRes` violates this** (D5 below).
 
 ## 3. Delta table
 
-`file:line` are in `vendor/burn-fused/crates/burn-attnres/`.
+`file:line` are in `vendor/dormouse-fused/crates/burn-attnres/`.
 **BUG** = our output is a different function from the paper's on ordinary inputs.
 **BENIGN** = different spelling, same function.
 **PAPER-AMBIGUITY** = the paper contradicts itself; we picked the reading the text supports.

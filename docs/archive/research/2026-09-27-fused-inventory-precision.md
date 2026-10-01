@@ -1,7 +1,7 @@
 # burn-fused inventory — slice: PRECISION + small op crates
 
 Date 2026-09-27. Scope: `burn-bitnet`, `burn-sct`, `burn-spectral`, `burn-rmsnorm`, `burn-rope`,
-`burn-swiglu` (6 of the 26 crates in `vendor/burn-fused/`, the crate to be renamed
+`burn-swiglu` (6 of the 26 crates in `vendor/dormouse-fused/`, the crate to be renamed
 `dormouse-fused/` per ADR-0017). All arXiv IDs below were fetched from arxiv.org and confirmed.
 
 Read-only pass. Nothing modified. All GPU claims are traced statically against
@@ -450,7 +450,7 @@ direction from what one would assume.**
 |---|---|---|---|
 | `quant_act` scale+normalize+round+clamp+rescale+STE, `Int(8)`, `group=0` | 45-80 (~20 of the useful ones) | `quant/activations.rs:10-24` `activation_quant_8bit` | **DUPLICATE.** Same algorithm: per-row `abs().max_dim(1).clamp_min(ε)`, `·127`, `round()`, `clamp(-128,127)`, `÷127`, `·scale`, then the identical `x.add(y.sub(base))` STE. Only deltas: epsilon `1e-8` vs `1e-5`, and rank 2 vs rank 3. |
 | `quant_act` `Int(4)` | 68-75 | `quant/activations.rs:120` `quantize_tensor(x, 4)` | **NEAR-DUPLICATE, DIVERGENT.** act_quant: absmax scale, `clamp(−l, l)` with `l = 2^(4−1)−1 = 7` → range [−7,7]. bitnet: **absmean** scale, `clamp(−8, 7)` → range [−8,7]. Two different 4-bit conventions behind the same user-facing flag. |
-| `fp4_round` (e2m1 float4: log2 bucketing, mantissa threshold 1.25, 0.5 bucket, 0.25 zero cutoff) | 84-130 (**47 lines**) | **nothing** | **UNIQUE.** `grep -rniE 'e2m1|fp4|nibble' vendor/burn-fused/crates/` returns exactly one hit, and it is an unrelated mention of MXFP4 in `burn-situ/src/lib.rs:14`. e2m1 does not exist anywhere in the 26-crate library. |
+| `fp4_round` (e2m1 float4: log2 bucketing, mantissa threshold 1.25, 0.5 bucket, 0.25 zero cutoff) | 84-130 (**47 lines**) | **nothing** | **UNIQUE.** `grep -rniE 'e2m1|fp4|nibble' vendor/dormouse-fused/crates/` returns exactly one hit, and it is an unrelated mention of MXFP4 in `burn-situ/src/lib.rs:14`. e2m1 does not exist anywhere in the 26-crate library. |
 | per-group scale branch (`reshape([b, d/g, g])` … `max_dim(2)` … `.repeat(&[1,1,g])` … `reshape([b,d])`) | 54-64 (11 lines) | **nothing** | **UNIQUE.** burn-bitnet has per-row (dim 1) and per-token only; the string `group` appears in it once, in an unrelated N:M doc comment (`sparse.rs:21`). |
 | `ActFormat::attn()` (promote to ≥8 bits for the attention path) | 34-39 | **nothing** | **UNIQUE.** |
 | `ActFormat` enum | 24-29 | **nothing** | **UNIQUE** (bitnet takes a bare `bits: usize` and infers the format). |

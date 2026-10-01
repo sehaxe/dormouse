@@ -367,7 +367,7 @@ Days assume one engineer, and "GPU smoke" means one training run to first log li
 * **Cost:** 1-2 d to re-vendor `burn-cubecl`/`cubecl-*` at `main`, **plus** re-reviewing 57 commits,
   **plus** absorbing 2 breaking changes: `e2014871` "make TensorData fields private" and `af8b3306`
   "remove `into_tiled` from the public API". **Both look free for us** — `git grep "TensorData {"` and
-  `into_tiled` return **zero hits** across `crates/` and `vendor/burn-fused/`. Estimate 2-3 d total,
+  `into_tiled` return **zero hits** across `crates/` and `vendor/dormouse-fused/`. Estimate 2-3 d total,
   and it grows linearly with every week we wait.
 * **What it would fix: none of the three bugs.** All three are present on main (§1.4). The four
   remaining cubecl commits are unrelated to them.

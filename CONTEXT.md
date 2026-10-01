@@ -40,7 +40,7 @@ Four layers, each owning its vocabulary:
 |---|---|---|
 | **stream** | `dormouse-data` | bytes, the n-gram hashes, the held-out window |
 | **model** | `dormouse-core` | the block, its arms, the config schema, the aux losses |
-| **technology library** | `vendor/burn-fused/` (26 crates, all ours) | every mechanism and kernel that is not the model: KDA, gdn2, spectral, muon-plus, rmsnorm, bitnet, jepa, dspark, mor, … |
+| **technology library** | `vendor/dormouse-fused/` (26 crates, all ours) | every mechanism and kernel that is not the model: KDA, gdn2, spectral, muon-plus, rmsnorm, bitnet, jepa, dspark, mor, … |
 | **run** | `dormouse-train` + `dormouse-cli` | the step, the optimizer policy, checkpoints, resume, recovery |
 
 The library is *ours*, not a dependency: it is vendored in-tree precisely so

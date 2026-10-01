@@ -1,7 +1,7 @@
 # JEPA — paper verification
 
 **Fetch date:** 2026-09-29. **Tree:** `eeb3b73`, working dir `/home/sehaxe/dormouse`.
-**Subject:** `vendor/burn-fused/crates/burn-jepa/` + the call sites in
+**Subject:** `vendor/dormouse-fused/crates/burn-jepa/` + the call sites in
 `crates/dormouse-core/src/{aux.rs, model.rs}` and
 `crates/dormouse-train/src/lib.rs`.
 

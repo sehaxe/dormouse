@@ -114,7 +114,7 @@ o_t = g_t · v̂_t  +  (1 − g_t) · v_t          g_t = σ(Linear(RMSNorm(h_t))
 | Address | `row = table_base(t) + (fnv(ngram) % slots[t])` | `dormouse-train/src/offload.rs:94-101` |
 | Host table | `HostNgram::new([S,S,S], 32, seed)` — 3 tables × `--engram-slots` × dim **32** | `dormouse-train/src/lib.rs:603-605` |
 | In-GPU table | `[4096,4096,4096]`, dim 32 | `dormouse-core/src/loop_block.rs:120` |
-| Gate | `σ(sign(s)·√(|s|+1e-6))`, `s = ⟨RMSNorm(W_K e), RMSNorm(h)⟩/√d`, per hc-copy | `vendor/burn-fused/crates/burn-engram/src/lib.rs:214-233` |
+| Gate | `σ(sign(s)·√(|s|+1e-6))`, `s = ⟨RMSNorm(W_K e), RMSNorm(h)⟩/√d`, per hc-copy | `vendor/dormouse-fused/crates/burn-engram/src/lib.rs:214-233` |
 | Integration | `y = attn·w_attn + engram·w_mem + ffn·w_ffn` — a **sum**, plus optional zero-init depthwise short conv | `dormouse-core/src/loop_block.rs:323`; `burn-engram/src/lib.rs:159-164` |
 | Row optimizer | external host Nesterov + Sinkhorn | `dormouse-train/src/offload.rs` |
 
@@ -306,7 +306,7 @@ Verbatim mechanics:
 | V4 has no Engram; has static hash routing for first 3 MoE layers | arXiv **2606.19348** v1 downloaded; `grep -c -i engram` = 0; hash-routing §at lines 347/1379/1399 |
 | Gate anti-correlation with loss, preference fixation, hot→cold flip, 300K/500K/800K slot curve, collisions=regularization | arXiv **2601.16531** v1, full text, Tables 1–3, 7, §5.3–5.4, §6.3, §7–8 |
 | Second capacity-ratio data point: >30B embeddings on 68.5B, ≤50% budget, N=3–5, K≥2 | arXiv **2601.21204** v2, abstract + reported findings |
-| dormouse's own Engram: FNV 3/5/8-gram, table sizes, gate, residual form, host optimizer | read-only inspection of `crates/dormouse-data/src/lib.rs`, `crates/dormouse-train/src/{lib,offload}.rs`, `crates/dormouse-core/src/loop_block.rs`, `vendor/burn-fused/crates/burn-engram/src/{lib,hasher}.rs` |
+| dormouse's own Engram: FNV 3/5/8-gram, table sizes, gate, residual form, host optimizer | read-only inspection of `crates/dormouse-data/src/lib.rs`, `crates/dormouse-train/src/{lib,offload}.rs`, `crates/dormouse-core/src/loop_block.rs`, `vendor/dormouse-fused/crates/burn-engram/src/{lib,hasher}.rs` |
 
 ### NOT VERIFIED (stated plainly)
 

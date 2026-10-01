@@ -58,7 +58,7 @@ Source: [arXiv 2601.00671](https://arxiv.org/abs/2601.00671) (Zhao & Jones, Saka
 
 ## 2. Our Engram's failure, mapped mechanism-by-mechanism
 
-What dormouse had (read from `vendor/burn-fused/crates/burn-engram/src/lib.rs`, `crates/dormouse-train/src/offload.rs`): FNV-hashed byte 3/5/8-grams → direct row in 24M-row host-RAM tables → per-head sigmoid gate (RMSNorm key·query / √d, compressed: σ(√(|s|+ε)·sign s)) → value_proj → added to the residual; rows trained by an external CPU Nesterov+Sinkhorn optimizer from D2H'd gradients (~15K row-touches/step).
+What dormouse had (read from `vendor/dormouse-fused/crates/burn-engram/src/lib.rs`, `crates/dormouse-train/src/offload.rs`): FNV-hashed byte 3/5/8-grams → direct row in 24M-row host-RAM tables → per-head sigmoid gate (RMSNorm key·query / √d, compressed: σ(√(|s|+ε)·sign s)) → value_proj → added to the residual; rows trained by an external CPU Nesterov+Sinkhorn optimizer from D2H'd gradients (~15K row-touches/step).
 
 Observed failure (`.bulba/memory.md` 2026-09-26): train CE → ~0.17, held-out stuck ~5.5. The memory explained the targets itself; the core starved.
 
@@ -99,7 +99,7 @@ gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
 gate = gate.sigmoid()
 ```
 
-— identical to `compute_gate()` in `vendor/burn-fused/crates/burn-engram/src/lib.rs` (which even documents why the plain sigmoid diverges). The demo's `MultiHeadEmbedding` (offset-addressed single table over prime-sized per-head tables) and XOR-multiply-mod-prime multi-hash also match our `hasher.rs` approach. Our port is faithful; this file is the canonical reference for any re-verification.
+— identical to `compute_gate()` in `vendor/dormouse-fused/crates/burn-engram/src/lib.rs` (which even documents why the plain sigmoid diverges). The demo's `MultiHeadEmbedding` (offset-addressed single table over prime-sized per-head tables) and XOR-multiply-mod-prime multi-hash also match our `hasher.rs` approach. Our port is faithful; this file is the canonical reference for any re-verification.
 
 ### 3.3 The row optimizer: dormouse's Nesterov+Sinkhorn is real — with one deviation
 

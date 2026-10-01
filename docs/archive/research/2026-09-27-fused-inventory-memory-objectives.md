@@ -4,7 +4,7 @@ Date 2026-09-27. Slice owner: subagent. Read-only on code; nothing built that is
 concurrent edit; no training run; no GPU work (another process held the GPU at 47 + 162 MiB
 throughout, so all verification was CPU).
 
-**Method.** Read `vendor/burn-fused/crates/*/src/**` (not the doc comments), grepped
+**Method.** Read `vendor/dormouse-fused/crates/*/src/**` (not the doc comments), grepped
 `crates/dormouse-*` for wiring, ran `cargo test` on every crate in the slice except
 `burn-engram`, checked the one fused-CUDA crate's feature/dispatch path by hand plus
 `cargo check --features cuda,autodiff`, and verified **all 18 arXiv IDs in one call against
@@ -497,7 +497,7 @@ build to just this crate.
 
 **Does dormouse use it? No.** Zero references in any `crates/dormouse-*/Cargo.toml`;
 `burn-fused` has **0 entries** in the root `Cargo.lock`. Every wired member is depended on by
-explicit `path = "../../vendor/burn-fused/crates/..."`. The meta-crate is pure dead weight
+explicit `path = "../../vendor/dormouse-fused/crates/..."`. The meta-crate is pure dead weight
 *for this repo* — the integration test of a facade nobody calls.
 
 **Does it build? No.**

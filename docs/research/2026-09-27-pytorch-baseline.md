@@ -14,7 +14,7 @@ as such rather than filled in.
 
 ## 0. What state of the tree I measured (the gate moved twice while I worked)
 
-The fused-dispatch gate in `vendor/burn-fused/crates/burn-kda/` was being rewritten by another agent
+The fused-dispatch gate in `vendor/dormouse-fused/crates/burn-kda/` was being rewritten by another agent
 *during* this benchmark. Three states existed today:
 
 | state | gate | reachable from the trainer? |
@@ -31,7 +31,7 @@ takes the fused path — that is the other agent's verification, not a claim I m
 The one-line gate that kept the kernels out of training in state A, for the record:
 
 ```rust
-// vendor/burn-fused/crates/burn-kda/src/fused.rs:35  (state A)
+// vendor/dormouse-fused/crates/burn-kda/src/fused.rs:35  (state A)
 TypeId::of::<B>() == TypeId::of::<burn::backend::autodiff::Autodiff<CudaBare>>()   // == NoCheckpointing
 ```
 
@@ -52,7 +52,7 @@ inductor go non-finite there, so the benchmark would have been timing a kernel p
 ### The baseline is the same math, verified
 
 My PyTorch implementation is a line-by-line port of
-`vendor/burn-fused/crates/burn-gdn2/src/forward.rs:57` (`chunk_wy_forward_impl`, the `c <= 16` fast
+`vendor/dormouse-fused/crates/burn-gdn2/src/forward.rs:57` (`chunk_wy_forward_impl`, the `c <= 16` fast
 tile path), and it reproduces **burn-kda's own fused CUDA kernel output** on the dumped tensors:
 
 ```

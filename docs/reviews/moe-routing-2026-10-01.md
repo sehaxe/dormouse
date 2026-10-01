@@ -52,7 +52,7 @@ against an independent host-side softmax of the same controller output.
 
 ## 2. Where the routing primitive comes from (ladder rung 2: reuse)
 
-`burn_mor::topk_indices` (`vendor/burn-fused/crates/burn-mor/src/topk.rs`) is
+`burn_mor::topk_indices` (`vendor/dormouse-fused/crates/burn-mor/src/topk.rs`) is
 the crate's committed top-k: one `argsort_descending` + `narrow`, deliberately
 avoiding `argtopk` because cubecl 0.11.0-pre.2 has a documented garbage-index
 defect. `mor::route` (`crates/dormouse-core/src/mor.rs:59-84`) already turns

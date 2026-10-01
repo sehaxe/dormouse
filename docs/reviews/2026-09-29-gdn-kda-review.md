@@ -513,11 +513,11 @@ and is not a function of `chunk_size` at all.**
 `short_conv_1d` is called in exactly two places, both on the full `[B, T, C]` projection,
 before any reshaping into chunks and before `chunk_size` is read:
 
-- `vendor/burn-fused/crates/burn-gdn2/src/module.rs:492-503` — inside `project()`. The
+- `vendor/dormouse-fused/crates/burn-gdn2/src/module.rs:492-503` — inside `project()`. The
   conv runs at `:494-499`; `project()` returns at `:566`; the chunk path is not invoked
   until `forward_train_core` calls it at `module.rs:442-452`, i.e. *after* `project()`
   has already returned at `:417`.
-- `vendor/burn-fused/crates/burn-kda/src/lib.rs:416-430` — same shape: conv on the full
+- `vendor/dormouse-fused/crates/burn-kda/src/lib.rs:416-430` — same shape: conv on the full
   `[B, T, C]` tensor at `:416-430`, `to_4d` only at `:447-449`.
 
 `short_conv_1d` takes no `chunk_size` argument (`short_conv.rs:22-26`). Its left pad is

@@ -27,7 +27,7 @@ that happens to run faster.
 
 ## What already exists, and is the pattern to follow
 
-`vendor/burn-fused/crates/burn-gdn2/` already does this properly and has done
+`vendor/dormouse-fused/crates/burn-gdn2/` already does this properly and has done
 since before this session:
 
 - `tests/ref_data.bin` — 7 MB of committed reference activations

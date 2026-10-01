@@ -36,7 +36,7 @@ of the three 2k-step logs from last night, and out of AGENTS.md.
   wants — a run with the retraction switched off — is therefore a *named
   command* in §5, not a number.
 - **No `cargo test -p burn-spectral` / `-p burn-sct`.** A cold build of
-  `vendor/burn-fused` is 686 packages / 41 GB / ~1400 s, and the 2026-09-29
+  `vendor/dormouse-fused` is 686 packages / 41 GB / ~1400 s, and the 2026-09-29
   memory entry records the freeze that five parallel agents caused by each
   launching one. The probe exists precisely so that the audit's arithmetic
   needs no build. **Consequence: every in-crate test name quoted below is quoted
@@ -433,7 +433,7 @@ Ordered by what I would do next. Nothing here is fixed; `param.rs` and
 
 | # | finding | evidence | what would settle it |
 |---|---|---|---|
-| **F1** | no seam: `burn-sct` has zero non-dev call sites and no trainer dependency | grep over `vendor/burn-fused` + `crates/`; `burn-spectral/Cargo.toml:33` | nothing to settle — it is a fact. What it *decides*: delete `burn-sct` (and with it 745 untested SVD lines and ~300 dead ones) or keep it as a kernel donor for the retraction. The `library-crate-fate.md` recommendation already says DELETE; the counter-argument is K8's one-launch kernel |
+| **F1** | no seam: `burn-sct` has zero non-dev call sites and no trainer dependency | grep over `vendor/dormouse-fused` + `crates/`; `burn-spectral/Cargo.toml:33` | nothing to settle — it is a fact. What it *decides*: delete `burn-sct` (and with it 745 untested SVD lines and ~300 dead ones) or keep it as a kernel donor for the retraction. The `library-crate-fate.md` recommendation already says DELETE; the counter-argument is K8's one-launch kernel |
 | **F2** | the head factor's un-retracted drift crosses the latch in ~8–60 steps | probe §D, from `routing.rs:98` + `optim.rs:134` + `burn-muon-plus:343-380` | **one 500-step run with `--retract-every 1000000`** and read whether `max_ortho` prints, and at what value. This is the single most informative cheap experiment in the queue |
 | **F3** | `--retract-iters 3` fails above a ~2:1 spectral spread | probe §F | print σ_max/σ_min of one retracted factor per 500 steps. If it is ≪2, the 3 iterations are safe and the risk is theoretical; if it approaches 2, a 4th NS iteration is +6 of 54 launches/factor, i.e. **+2.9 ms = +0.6% of a step** |
 | **F4** | 5.3% of a warm step, 0.18% arithmetic, ~880 launches | 57 timer readings across 3 logs + probe §E | `--retract-batched`: 16 calls → 4, ~5× fewer launches. One flag, no code |

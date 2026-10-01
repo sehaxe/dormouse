@@ -22,7 +22,7 @@ writers kept landing). On the record:
   for all three model crates, so **no test in the tree could run**.
   `docs/archive/architecture/design-review-model-2026-09-27.md` opens by recording that its whole
   review is `NOTHING IS RUNTIME-VERIFIED` for exactly that reason.
-* A generated facade line in `vendor/burn-fused/Cargo.toml` broke **every
+* A generated facade line in `vendor/dormouse-fused/Cargo.toml` broke **every
   cargo command in the tree** for ~30 min — `cargo metadata` fails ⇒ every
   `check`/`test` fails (`docs/archive/research/2026-09-27-fused-build-matrix.md`,
   "Environment hazards").
@@ -117,7 +117,7 @@ Compiling cubecl-cuda    v0.11.0-pre.4 (…/discipline-probe/vendor/cubecl-fix/c
 The three patched crates — the ones `burn-nn`, `burn-spectral`, `burn-kda` and
 all of `dormouse-*` sit on — rebuild from scratch, and later in the same cold
 run the vendored `burn-fused` crates do the same
-(`Compiling burn-bitnet v0.1.0 (…/discipline-probe/vendor/burn-fused/crates/burn-bitnet)`).
+(`Compiling burn-bitnet v0.1.0 (…/discipline-probe/vendor/dormouse-fused/crates/burn-bitnet)`).
 A shared dir reuses the *bottom* of the graph, which is the cheap part.
 
 And the bottom-layer reuse is not even reliable. The same probe re-`Check`ed
@@ -162,7 +162,7 @@ trivial no-op change (`NOOP.md`, untracked), real command
 | shared tree, warm | 4 s | **FAILED to compile** (its own test target) |
 
 **`HEAD` `d96d155` does not compile at all.** The build dies in
-`vendor/burn-fused/crates/burn-muon-plus/src/lib.rs` with two `E0308`s
+`vendor/dormouse-fused/crates/burn-muon-plus/src/lib.rs` with two `E0308`s
 (`g_active.reshape([1, 1])` handed to `mul` — `expected D, found 2`, at
 `:298` and `:364`). That file is `M` in the shared tree: the fix
 (`.mul(g_active.unsqueeze())`) exists but is **uncommitted**, which is why a
@@ -212,7 +212,7 @@ heaviest process and takes an in-flight agent's work with it.
 
 **Prevented, concretely:**
 
-* **The workspace-break window.** A half-written `vendor/burn-fused/Cargo.toml`
+* **The workspace-break window.** A half-written `vendor/dormouse-fused/Cargo.toml`
   cannot reach another agent's checkout. The 30-minute `cargo metadata` outage
   and the "no test in any of the three crates can run" window both end at the
   worktree boundary. Largest and best-evidenced win.

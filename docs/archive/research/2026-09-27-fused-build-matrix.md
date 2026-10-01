@@ -4,7 +4,7 @@ Read-only measurement. **Nothing was fixed.** The only files added are this one
 and the two probe helpers `tools/fused_matrix.sh`, `tools/fused_matrix_static.py`
 (nothing committed).
 
-Reproduce from inside `vendor/burn-fused/` — it is its own workspace root, the
+Reproduce from inside `vendor/dormouse-fused/` — it is its own workspace root, the
 outer workspace `exclude`s it on purpose (outer `Cargo.toml:8-10`):
 ```
 tools/fused_matrix.sh <check|test|cuda-check|cuda-test|examples> [crate...]
@@ -13,7 +13,7 @@ python3 tools/fused_matrix_static.py
 
 ## Scope correction: 32 members, not 26
 
-`vendor/burn-fused/Cargo.toml` `members` has **32** entries: **28 leaf crates**
+`vendor/dormouse-fused/Cargo.toml` `members` has **32** entries: **28 leaf crates**
 under `crates/`, the `burn-fused` meta-crate, and 3 bench/probe packages
 (`benches`→`burn-fused-benches`, `benches/cpu_probe`→`cpu-probe`,
 `benches/launch_probe`→`launch-probe`). All 32 are covered below; the headline

@@ -3,7 +3,7 @@
 **Fetch date: 2026-09-29.** Literature-only pass. No GPU, no cargo, no build, no test.
 Code read read-only: `crates/dormouse-core/src/param.rs`,
 `crates/dormouse-core/src/loop_block.rs`,
-`vendor/burn-fused/crates/burn-spectral/src/lib.rs`.
+`vendor/dormouse-fused/crates/burn-spectral/src/lib.rs`.
 
 **Scope note.** `docs/papers/tsct.md` (same tree) already establishes the lineage and
 the code deltas. This file answers a different, narrower question: *as of 2026-09-29,

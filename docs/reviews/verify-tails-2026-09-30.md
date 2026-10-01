@@ -354,32 +354,32 @@ tools/wt.sh new verify-tails            # off e31e335
 cd /home/sehaxe/dormouse-wt/verify-tails
 
 # item 1 — the suites
-tools/build_lock.sh run t -- bash -c 'cd vendor/burn-fused && \
+tools/build_lock.sh run t -- bash -c 'cd vendor/dormouse-fused && \
   cargo test -p burn-dspark --features training --test dspark_loss_oracle'
-tools/build_lock.sh run t -- bash -c 'cd vendor/burn-fused && \
+tools/build_lock.sh run t -- bash -c 'cd vendor/dormouse-fused && \
   cargo test -p burn-dspark --features training --lib'
 
 # item 1 — the RED demonstration (cp snapshot, md5 before and after)
-SRC=vendor/burn-fused/crates/burn-dspark/src/lib.rs
+SRC=vendor/dormouse-fused/crates/burn-dspark/src/lib.rs
 cp "$SRC" /tmp/lib.rs.bak && md5sum "$SRC"
 python3 - <<'PY'
-p="vendor/burn-fused/crates/burn-dspark/src/lib.rs"
+p="vendor/dormouse-fused/crates/burn-dspark/src/lib.rs"
 s=open(p).read()
 a="accept_rate_target(draft_logits, target_logits).detach()"
 assert s.count(a)==1
 open(p,"w").write(s.replace(a,"accept_rate_target(draft_logits, target_logits)"))
 PY
-tools/build_lock.sh run t -- bash -c 'cd vendor/burn-fused && \
+tools/build_lock.sh run t -- bash -c 'cd vendor/dormouse-fused && \
   cargo test -p burn-dspark --features training --test dspark_loss_oracle'
 cp /tmp/lib.rs.bak "$SRC" && md5sum "$SRC"   # 353e0c09bd67479431ec27be2547a39e
 
 # item 1 — regenerate the fixture from a clean venv, following the docstring
-cd vendor/burn-fused/crates/burn-dspark/tests/oracle
+cd vendor/dormouse-fused/crates/burn-dspark/tests/oracle
 /tmp/opencode/fresh2/bin/python gen_dspark_loss_oracle.py --deepspec /tmp/opencode/fresh2-ds \
   > /tmp/regen.txt && md5sum /tmp/regen.txt ../fixtures/dspark_loss_oracle.txt
 
 # item 3 — the full sweep
-tools/build_lock.sh run m -- bash vendor/burn-fused/crates/burn-dspark/tests/oracle/mutate_kernel.sh
+tools/build_lock.sh run m -- bash vendor/dormouse-fused/crates/burn-dspark/tests/oracle/mutate_kernel.sh
 
 # item 2 / 4 — gates
 tools/build_lock.sh run t -- bash -c 'cd /home/sehaxe/dormouse-wt/verify-tails && \

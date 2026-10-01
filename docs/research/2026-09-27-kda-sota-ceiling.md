@@ -80,7 +80,7 @@ derived from `nvidia-smi` specs.
 ## 0. TL;DR — the answer nobody wants
 
 The fused cubecl forward **and backward kernels for this exact computation already exist in
-the tree** (`vendor/burn-fused/crates/burn-gdn2/src/kernel/chunk_cube.rs` 1243 lines,
+the tree** (`vendor/dormouse-fused/crates/burn-gdn2/src/kernel/chunk_cube.rs` 1243 lines,
 `chunk_adjoint_cube.rs` 691 lines), they *are* engaged on the training backend
 (`Autodiff<Cuda>` → `chunk_autodiff_or_plain::<CudaBare>`), and they dispatch **3 launches
 forward, 2 backward**. Route (a) as posed — "write a fused backward kernel in cubecl" — is

@@ -4,7 +4,7 @@ Date: 2026-09-27. Status: accepted, partially landed.
 
 ## The decision
 
-`dormouse-fused` (currently `vendor/burn-fused/`, 26 crates, all ours) is a
+`dormouse-fused` (currently `vendor/dormouse-fused/`, 26 crates, all ours) is a
 **standalone project**, not a dependency of the model. It has its own
 workspace, its own test suite, its own gate, and its own benchmarks. Work on it
 does not require dormouse to compile, and a change in it must not be able to

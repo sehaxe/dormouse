@@ -1,6 +1,6 @@
 # Muon+ — arXiv:2602.21545 — verification, literal transcription, delta vs `burn-muon-plus`
 
-**Fetch date: 2026-09-29.** Read-only pass over `vendor/burn-fused/crates/burn-muon-plus/`
+**Fetch date: 2026-09-29.** Read-only pass over `vendor/dormouse-fused/crates/burn-muon-plus/`
 and `crates/dormouse-train/src/optim.rs`. No GPU, no build, no test.
 
 ## TL;DR
@@ -161,7 +161,7 @@ explicitly says "Muon+ has nearly the same per-step runtime and memory cost as M
 
 ## 3. Delta table
 
-`file:line` against `vendor/burn-fused/crates/burn-muon-plus/src/` and
+`file:line` against `vendor/dormouse-fused/crates/burn-muon-plus/src/` and
 `crates/dormouse-train/src/optim.rs`. Verdicts: **BUG** / **DELIBERATE** / **BENIGN** /
 **UNVERIFIABLE**.
 

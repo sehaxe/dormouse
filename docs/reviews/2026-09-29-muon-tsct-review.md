@@ -42,7 +42,7 @@ did not count.
 **CONFIRMED. The condition is unsatisfiable. No counterexample exists, and none
 can exist.**
 
-`vendor/burn-fused/crates/burn-muon-plus/src/lib.rs:127-146`:
+`vendor/dormouse-fused/crates/burn-muon-plus/src/lib.rs:127-146`:
 
 ```rust
 127:  pub fn orthogonalize<const D: usize>(&self, g: Tensor<D>) -> Tensor<D> {
@@ -266,7 +266,7 @@ per-step" — correct, and the table makes it sharper than the report did.
 
 **But the file is wrong.** `README.md` (project root) contains **no** occurrence of
 `37%` or `37.1`. The string lives at
-`vendor/burn-fused/crates/burn-muon-plus/README.md:30`. Likewise the retracted
+`vendor/dormouse-fused/crates/burn-muon-plus/README.md:30`. Likewise the retracted
 `96×/84×`/`3.6×` numbers are in that same **crate** README (`:61-62`, `:75-78`), not
 in the project `README.md`'s "Performance" section — which is the two-row
 `benches/history.tsv` canary table. `muon-plus.md:183` and `:184` both attribute to
@@ -532,7 +532,7 @@ re-derived the numbers instead.
 touched. `docs/papers/*.md`, the vendor crates and the tree are as the author left them.
 
 **Read:** `docs/papers/muon-plus.md`, `docs/papers/tsct.md`,
-`vendor/burn-fused/crates/burn-spectral/src/lib.rs`, `vendor/burn-fused/crates/burn-muon-plus/`,
+`vendor/dormouse-fused/crates/burn-spectral/src/lib.rs`, `vendor/dormouse-fused/crates/burn-muon-plus/`,
 `crates/dormouse-core/src/{param,loop_block,routing}.rs`, `crates/dormouse-train/src/{lib,optim}.rs`,
 `docs/protocols/AB-PROTOCOL.md`, `benches/history.tsv`.
 

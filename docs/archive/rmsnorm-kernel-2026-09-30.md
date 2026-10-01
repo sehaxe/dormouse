@@ -291,7 +291,7 @@ the lowering regression.
   reproducer and the exclusion table; the mechanism inside cubecl is not
   isolated, and `MIN_FUSED_D = 4` is an envelope, not a law.
 * **The runtime is not the trainer's.** The CUDA tests compile in the
-  `vendor/burn-fused` workspace, where the repo root's `[patch.crates-io]` (which
+  `vendor/dormouse-fused` workspace, where the repo root's `[patch.crates-io]` (which
   maps five vendored cubecl crates) does not apply, so the kernel ran on the
   **registry `cubecl 0.11.0-pre.4`** while the trainer runs the vendored fork.
   The arithmetic under test is our own source and does not depend on the runtime
@@ -311,7 +311,7 @@ the lowering regression.
 ## 7. Reproduce
 
 ```bash
-cd vendor/burn-fused
+cd vendor/dormouse-fused
 # the gate, the numbers, and the d<4 refusal
 cargo test -p burn-rmsnorm --features cuda --test fused_kernel_gate -- --nocapture
 # the tier-(a) oracle against the kernel's own output

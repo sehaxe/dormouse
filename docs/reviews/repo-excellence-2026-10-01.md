@@ -124,7 +124,7 @@ the tree already complies — it is a target, and the file says so.
 
 burn's is 23 KB and exists because burn copied whole files (PyTorch's MNIST
 example, wgpu's CI config). We have exactly **one** place where upstream code
-was adapted: `vendor/burn-fused/crates/burn-sct/src/qr.rs:10-16`, which says in
+was adapted: `vendor/dormouse-fused/crates/burn-sct/src/qr.rs:10-16`, which says in
 its own module doc that it is adapted from `burn-rs/burn`
 `crates/burn-tensor/src/tensor/linalg/qr.rs`, authored by the burn-rs
 maintainers, MIT/Apache-2.0. The attribution is **in the source, at the
@@ -132,7 +132,7 @@ function, with the licence** — which is stronger than a file 400 lines away in
 notices file that nobody reads. The two vendored forks carry their upstream
 `LICENSE` files verbatim (`vendor/cubecl-fix/LICENSE`,
 `vendor/cubek-fix/LICENSE`: "Nathaniel Simard & CubeCL Framework Contributors"),
-and `vendor/burn-fused/LICENSE:24-31` states its own scope.
+and `vendor/dormouse-fused/LICENSE:24-31` states its own scope.
 
 **One real disagreement found, not fixed, because it is another owner's file:**
 `burn-sct`'s README says the adaptation is "MIT" while `qr.rs:12` says
@@ -141,7 +141,7 @@ Dual-licensed upstream means the derived work may be distributed under **either*
 saying only "MIT" is the more restrictive choice, so it is not wrong — but two
 files in one crate answering the same question differently is the defect class
 `docs/glossary.md` exists for. Reported at
-`vendor/burn-fused/crates/burn-sct/README.md:62` vs `src/qr.rs:12`.
+`vendor/dormouse-fused/crates/burn-sct/README.md:62` vs `src/qr.rs:12`.
 
 Also worth recording: **the upstream path in that attribution no longer
 exists.** `crates/burn-tensor/src/tensor/linalg/qr.rs` is 404 on burn `main`;

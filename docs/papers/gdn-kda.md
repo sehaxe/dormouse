@@ -5,8 +5,8 @@ API (`export.arxiv.org/api/query?id_list=…`) and, where available, the arXiv
 HTML full text and the authors' own source repositories. No claim in §1–§6
 rests on a snippet: each was read from the primary document.
 
-Scope: `vendor/burn-fused/crates/burn-gdn2/` and
-`vendor/burn-fused/crates/burn-kda/`. Read-only; no file in either crate was
+Scope: `vendor/dormouse-fused/crates/burn-gdn2/` and
+`vendor/dormouse-fused/crates/burn-kda/`. Read-only; no file in either crate was
 touched (`gen_reference.rs` / `gen_reference.py` were read, never edited).
 
 ---

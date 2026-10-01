@@ -5,7 +5,7 @@ attention arm receives gradients. `8fa5d4c` fixed the gate; its own commit
 message says the gradient-flowing check was NOT done, and it still was not.
 
 Lane: worktree `wt/kda-gradflow`, off `a071ecd`.
-Deliverable: `vendor/burn-fused/crates/burn-kda/tests/kda_param_grads_cuda.rs`.
+Deliverable: `vendor/dormouse-fused/crates/burn-kda/tests/kda_param_grads_cuda.rs`.
 
 ## The seam, as read (2026-09-30)
 

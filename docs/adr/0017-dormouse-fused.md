@@ -5,7 +5,7 @@ tree.
 
 ## The decision
 
-1. `vendor/burn-fused/` is renamed to `dormouse-fused/` at the repository root.
+1. `vendor/dormouse-fused/` is renamed to `dormouse-fused/` at the repository root.
    It is not a vendor: every one of its crates is ours. Under `vendor/` it was a
    lie, and the `burn-*` crate names falsely implied upstream burn crates that
    someone could find on crates.io - which is exactly the confusion that made a
@@ -62,7 +62,7 @@ is queued; the library split is what makes it a config flag instead of a rewrite
 
 ## Execution order (why it is not done yet)
 
-Eleven agents are currently editing files inside `vendor/burn-fused/crates/*` and
+Eleven agents are currently editing files inside `vendor/dormouse-fused/crates/*` and
 `crates/dormouse-*`. A repository-wide rename changes the git path of every file
 those agents are writing, so their in-flight `git add <path>` calls would stage
 the wrong files or resurrect deleted paths, and their commits would be corrupted.
@@ -70,7 +70,7 @@ The migration is therefore scripted (`tools/migrate-dormouse-fused.sh`) and runs
 in one shot on a quiet tree, with the full test suite as its gate.
 
 Order of operations, when it runs:
-1. `git mv vendor/burn-fused dormouse-fused`
+1. `git mv vendor/dormouse-fused dormouse-fused`
 2. rename each crate directory and its `package.name` / `[lib].name`
 3. rewrite every import and every path dependency across the workspace
 4. fix the root `Cargo.toml` `exclude` list (the vendored crates are their own

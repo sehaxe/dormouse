@@ -156,7 +156,7 @@ on the trainer's backend. Before this line existed, that was unknowable
 without a profiler.
 
 The library already has the pattern to copy, in
-`vendor/burn-fused/crates/burn-gdn2/src/cuda_dispatch.rs`: `Fused`/`Fallback`
+`vendor/dormouse-fused/crates/burn-gdn2/src/cuda_dispatch.rs`: `Fused`/`Fallback`
 says *which arm ran and why*, and `fused_calls()` counts launches. Use it; do
 not add a third convention.
 

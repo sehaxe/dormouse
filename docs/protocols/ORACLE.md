@@ -3,7 +3,7 @@
 Written 2026-09-29 at `wt/oracle`, off `eeb3b73`. The machine-readable half of
 this file is `docs/protocols/ORACLE-TIERS.tsv`; the gate that reads it is
 `tools/oracle_gate.py`. The false-confidence audit that already existed and is
-*not* duplicated here is `vendor/burn-fused/TEST-AUDIT.md`.
+*not* duplicated here is `vendor/dormouse-fused/TEST-AUDIT.md`.
 
 Read this before calling anything in these two crates "verified".
 
@@ -140,7 +140,7 @@ cargo test --release -p burn-gdn2 --features binary-tests --test bit_exact --tes
         Chunk all sizes: max_diff = 1.38e-2, failures = 4880
 ```
 
-Those are the same figures `vendor/burn-fused/TEST-AUDIT.md` FINDING 0 records
+Those are the same figures `vendor/dormouse-fused/TEST-AUDIT.md` FINDING 0 records
 for 2026-09-27 at snapshot `1fab19e`, to three significant figures. The defect
 is stable, not a flake, and the tolerance is not the problem: 5e-4 is 28× below
 the observed max and the measured f32 transcription noise is 2e-6 to 2e-5.

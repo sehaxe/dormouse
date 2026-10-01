@@ -11,7 +11,7 @@ transcription, the crate says "transcription", and where there is no reference i
 
 ADR-0018 rule 1 said the port is "verified bit-for-bit (or to a stated tolerance)
 against the ORIGINAL implementation wherever the authors shipped code". Read as a
-statement about the library, that is false today. Measured on `vendor/burn-fused/`
+statement about the library, that is false today. Measured on `vendor/dormouse-fused/`
 at `23f2b1c` (evidence: `docs/research/2026-09-27-oracle-audit.md`):
 
 > **0 of 28 crates verify any numeric output against an authors' own source code.

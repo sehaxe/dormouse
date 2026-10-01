@@ -83,7 +83,7 @@ start of the program**").
 ### 1.6 Extension crates and the fusion flag (the #5673 story)
 
 Backend-extension ops (our vendored burn-kda/msa/engram/rmsnorm/spectral/dspark/jepa
-under vendor/burn-fused/crates/) cross the dispatch layer through
+under vendor/dormouse-fused/crates/) cross the dispatch layer through
 `#[backend_extension]`-generated code (burn-backend-extension/src/lib.rs:65-86). To ride
 the fusion stream an extension registers a metadata callback describing outputs from
 input `TensorSpec`s — `FusionValueAdapter` (burn-fusion/src/custom.rs:6-110); execution
@@ -218,7 +218,7 @@ CPU steps); kernels are enqueued and the pipeline stays full.
 The arms forward already saves per iteration into the workspace: `normed` (mod.rs:1447),
 `h_ctx` (:1446), gate columns in `raw` (:1451), and the arm outputs `kda_vec/msa_vec/
 engram_vec/attn_vec/gate_vec` (mod.rs:1475-1489). Missing: **KDA's recurrent state `S`** —
-`forward_train_state` returns `(out, S)` (vendor/burn-fused/crates/burn-kda/src/lib.rs:509,
+`forward_train_state` returns `(out, S)` (vendor/dormouse-fused/crates/burn-kda/src/lib.rs:509,
 530) and the raw forward drops it (`forward_train`, mod.rs:1529). Add an `S` buffer per
 iteration (b×heads×state_dim, small vs bt×d), filled by switching the raw KDA call to
 `forward_train_state` + the same copy pattern.
@@ -325,6 +325,6 @@ Burn (shallow clone /tmp/opencode/burn, main):
 Dormouse:
 - fused/ sources: crates/dormouse-core/src/fused/{mod.rs,backward.rs,kernels.rs} (line refs inline, §2/§3)
 - Flagship A/B: docs/archive/research/2026-09-23-fused-flagship50.md:48-58; grad-coverage + structural diagnosis: docs/archive/fused-verification-2026-09-23.md:57-116
-- KDA state API: vendor/burn-fused/crates/burn-kda/src/lib.rs:503-530
+- KDA state API: vendor/dormouse-fused/crates/burn-kda/src/lib.rs:503-530
 - GPU constraints: AGENTS.md (4D-slice ban, bf16 fp32-cast rule, KDA f32-only, launch-bound step, pool doctrine)
 - Preset: configs/small.toml

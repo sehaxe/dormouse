@@ -81,7 +81,7 @@ routine is not.
 
 ## Root cause
 
-`burn-spectral`'s `SpectralLinear::new` (`vendor/burn-fused/crates/burn-spectral/src/lib.rs:456-469`)
+`burn-spectral`'s `SpectralLinear::new` (`vendor/dormouse-fused/crates/burn-spectral/src/lib.rs:456-469`)
 initialises each factor as **the Q of a Householder QR of a random normal
 matrix**, and `qr_householder` (`lib.rs:688-715`) is:
 

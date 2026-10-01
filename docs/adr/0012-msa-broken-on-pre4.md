@@ -6,7 +6,7 @@ of its paths: the hand-written fused kernel (gather reads up to 11.5 GB past a
 tensor-op fallback (burn gather with the same garbage indices). The garbage is
 upstream of gather — pre.4's changed topk/indexing semantics feed wild block
 indices; pre.3's reshape materialization hid this by copying inputs. Minimal
-repro: vendor/burn-fused/crates/burn-msa/examples/msa_repro.rs (pass 1 dies,
+repro: vendor/dormouse-fused/crates/burn-msa/examples/msa_repro.rs (pass 1 dies,
 pass 0 clean).
 
 Decision: MSA ships disabled on pre.4. The fused kernel is env-gated off

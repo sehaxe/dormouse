@@ -63,7 +63,7 @@ them are still open.
   (`src/cfg.rs`).
 - `crates/dormouse-cli` — bins `train`, `generate`, `serve` (checkpoints dir +
   `--ckpt-name`, preset). BPB scoring lives in `dormouse-train` (`pub fn bpb`).
-- `vendor/burn-fused/crates/*` — **our own** technology library, 28 crates
+- `vendor/dormouse-fused/crates/*` — **our own** technology library, 28 crates
   (KDA, gdn2, spectral, sct, muon-plus, rmsnorm, bitnet, jepa, dspark, mor, …),
   not a dependency. Every mechanism and kernel that is not the model lives
   here, with its own paper reference and its own A/B (ADR-0017, ADR-0018). A
@@ -234,7 +234,7 @@ the file that says so is that one function.
   with a silent fp32 fallback dressed as bf16 (that is the ADR-0019 failure
   mode). The one primitive that works is bf16 *storage* as `u16` bit patterns
   (integer ops + bitcast, pinned against f64 in
-  `vendor/burn-fused/crates/burn-gdn2/tests/lowp_bf16_cuda.rs`).
+  `vendor/dormouse-fused/crates/burn-gdn2/tests/lowp_bf16_cuda.rs`).
 - **f16 matmul is CORRECT but silently slow** (ADR-0016 bug 3) — it was reported
   as failing outright and is not. The answer matches fp32 to 1e-2, but the f16
   **tensor-core** candidate dies at compile time with `Expected type
@@ -242,7 +242,7 @@ the file that says so is that one function.
   non-accelerated routine without a word. f16 is one interface short: pliron's
   `builtin.fp16` implements `FloatTypeInterface` and not the `SizedType` that
   `cubecl-opt`'s shared-memory sizing queries
-  (`vendor/burn-fused/crates/cubecl-opt/src/lib.rs:36-40`). The fix is ~10 lines
+  (`vendor/dormouse-fused/crates/cubecl-opt/src/lib.rs:36-40`). The fix is ~10 lines
   in **cubecl-ir** (impl `SizedType` for pliron's `FP16Type`, legal because the
   trait is local) and belongs upstream; until it lands the 43.7 TFLOP/s cuBLAS f16
   number (memory.md:17) is not reachable *through burn* — route it through cuBLAS
@@ -342,7 +342,7 @@ measurably extended the clean window (110+ steps, Muon+, fp32, 0 NaN on
 2026-08-29, against 45-127 before). **That pair is not from any paper** —
 Kimi K3 §2.1.1 says `A_h = 0`, FLA uses `log(U(1,16))` (`kda.py:178`, or
 `zeros` under `safe_gate`), and FlashKDA has no `kda.py`; see
-`vendor/burn-fused/crates/burn-kda/src/lib.rs` module docs for the per-source
+`vendor/dormouse-fused/crates/burn-kda/src/lib.rs` module docs for the per-source
 table and for why the bias **sign** (not `A`) caps initial retention at
 `e^{g_min/2}`. That record also does not isolate `a_log` from the clamp, so
 cite it as our measurement, not as Moonshot's. Fp8 quant (the sm_120 default)

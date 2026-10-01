@@ -339,7 +339,7 @@ normalization** (Ulyanov et al., 2016)."* Table 8 gives the recipe as
 `K (layers to average) 10 / 18 / 32`.
 
 Our code: `losses.rs:11-20` is plain L1 with no normalisation, and
-`grep -rn "normal\|Normal" vendor/burn-fused/crates/burn-jepa/src/ crates/dormouse-core/src/aux.rs`
+`grep -rn "normal\|Normal" vendor/dormouse-fused/crates/burn-jepa/src/ crates/dormouse-core/src/aux.rs`
 returns **nothing**. Zero normalisation steps on the path, where the paper has
 two or three. **Confirmed, and the largest JEPA delta is real.**
 
@@ -754,7 +754,7 @@ grep -n 'fnv' crates/dormouse-data/src/lib.rs | head -3
 grep -rn 'NgramHasher\|burn_engram::hasher' crates/ --include=*.rs   # empty = dead
 
 # §4.1 — no learnable gain in the gate
-sed -n '199,236p' vendor/burn-fused/crates/burn-engram/src/lib.rs
+sed -n '199,236p' vendor/dormouse-fused/crates/burn-engram/src/lib.rs
 
 # §4.4 — the report's proposed constant
 python3 -c "import math;k=2.0000024999984376;d=1.9999950000125;\
@@ -807,10 +807,10 @@ traceable to a named file.
 
 ```
 $ grep -rn "engram_demo_v1" --include=*.rs .
-vendor/burn-fused/crates/burn-engram/src/lib.rs:231:   // Official reference (deepseek-ai/Engram, engram_demo_v1.py Engram.forward):
-vendor/burn-fused/crates/burn-engram/src/hasher.rs:1:    //! CPU n-gram hashing for Engram (deepseek-ai/Engram, arxiv 2601.07372).
-vendor/burn-fused/crates/burn-engram/src/hasher.rs:4:    //! `engram_demo_v1.py`: for every n-gram order in `min_ngram..=max_ngram`
-vendor/burn-fused/crates/burn-engram/src/hasher.rs:236:  /// Deliberately absent: a bit-exact comparison with `engram_demo_v1.py`.
+vendor/dormouse-fused/crates/burn-engram/src/lib.rs:231:   // Official reference (deepseek-ai/Engram, engram_demo_v1.py Engram.forward):
+vendor/dormouse-fused/crates/burn-engram/src/hasher.rs:1:    //! CPU n-gram hashing for Engram (deepseek-ai/Engram, arxiv 2601.07372).
+vendor/dormouse-fused/crates/burn-engram/src/hasher.rs:4:    //! `engram_demo_v1.py`: for every n-gram order in `min_ngram..=max_ngram`
+vendor/dormouse-fused/crates/burn-engram/src/hasher.rs:236:  /// Deliberately absent: a bit-exact comparison with `engram_demo_v1.py`.
 ```
 
 Five hits, all comments. Zero tests. There is no `crates/dormouse-core/tests/engram_gold.rs`
@@ -984,7 +984,7 @@ https://raw.githubusercontent.com/deepseek-ai/Engram/main/engram_demo_v1.py
 sha256 9d082070654df217e21bbca9926a4267bdf2cce7777aa6739747c24de30d2044   (422 lines, 15017 bytes, fetched 2026-09-29)
 ```
 
-**Where it goes:** `vendor/burn-fused/crates/burn-engram/tests/gate_oracle.rs` (an
+**Where it goes:** `vendor/dormouse-fused/crates/burn-engram/tests/gate_oracle.rs` (an
 integration test, not a unit test — the point is that it does not have `compute_gate`
 in scope to restate it), plus the fixture as a `const` array in the same file so the
 test and the data cannot drift apart. CPU, `Device::ndarray()`, no GPU.

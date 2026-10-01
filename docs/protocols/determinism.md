@@ -113,7 +113,7 @@ being zero across processes. Compare parameter tensors, never files.
 amplified over its 64 sequential iterations. Not the memory pool, not the
 allocator, not an unseeded draw.**
 
-`vendor/burn-fused/crates/burn-spectral/src/lib.rs:457-469` — every TSCT factor
+`vendor/dormouse-fused/crates/burn-spectral/src/lib.rs:457-469` — every TSCT factor
 is the Q of a QR of a random normal matrix:
 
 ```rust

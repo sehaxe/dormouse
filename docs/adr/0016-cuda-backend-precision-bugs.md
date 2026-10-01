@@ -140,7 +140,7 @@ is there; only the type is missing.
 16 bits of its f32, so `f32::reinterpret(u32 << 16)` in and round-to-nearest-even
 truncation out, which is integer ops plus a bitcast and no bf16 value ever enters
 the dialect. Pinned against f64 on the host in
-`vendor/burn-fused/crates/burn-gdn2/tests/lowp_bf16_cuda.rs` (not ours; that
+`vendor/dormouse-fused/crates/burn-gdn2/tests/lowp_bf16_cuda.rs` (not ours; that
 agent's probe). That is the primitive any bf16 compute path here must be built
 from.
 

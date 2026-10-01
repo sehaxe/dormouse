@@ -1,7 +1,7 @@
 # Fused-library inventory: ATTENTION / RECURRENCE / RESIDUAL-STREAM crates
 
 Date: 2026-09-27. Slice owner: inventory subagent for ADR-0017.
-Scope: `vendor/burn-fused/crates/{burn-attnres, burn-gdn2, burn-kda, burn-mhc, burn-mod, burn-mor, burn-nope}`.
+Scope: `vendor/dormouse-fused/crates/{burn-attnres, burn-gdn2, burn-kda, burn-mhc, burn-mod, burn-mor, burn-nope}`.
 Nothing in the repo was modified; nothing was committed. Only GPU work: four short
 test-suite runs (< 60 s each) after `nvidia-smi --query-compute-apps` showed no
 other compute process. No training run was started.

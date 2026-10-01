@@ -1,7 +1,7 @@
 # PLAN — the minimal core: what leaves `dormouse-core`, and what dies
 
 Snapshot: `d651eb1`, working tree 2026-09-27T14:59Z. **The tree was moving while
-this was written** — 8 files under `crates/` and 8 under `vendor/burn-fused` are
+this was written** — 8 files under `crates/` and 8 under `vendor/dormouse-fused` are
 uncommitted, and `burn-gdn2` does not currently compile. Every LOC count below is
 `wc -l` on that snapshot, not HEAD. Moves that touch an in-flight file are marked
 **WAIT** and say which agent.
@@ -249,7 +249,7 @@ No GPU runs in this plan except where noted; the CUDA `check` does not need one.
 | # | commit | what moves / changes | what breaks | gate | parallel? |
 |---|---|---|---|---|---|
 | **C0** | *in flight, elsewhere* | Land or **revert** the MoR work (§0). Recommendation: revert per D1. | the tree does not compile | same | **blocks everything** |
-| **C1** | `refactor!: vendor/burn-fused → dormouse-fused` | `tools/migrate-dormouse-fused.sh`, one shot, 1 commit, pure rename, no behaviour change. | every path dep, every import, the root `exclude` list | script's own steps 5-6 | serial, **needs a quiet tree** (impossible today: 16 dirty files) |
+| **C1** | `refactor!: vendor/dormouse-fused → dormouse-fused` | `tools/migrate-dormouse-fused.sh`, one shot, 1 commit, pure rename, no behaviour change. | every path dep, every import, the root `exclude` list | script's own steps 5-6 | serial, **needs a quiet tree** (impossible today: 16 dirty files) |
 | **C2** | `refactor(core)!: delete the mechanisms that lost` | D1-D4, D7, D8 (≈1 690 LOC out) | `mor_router` field, 3 config keys, 3 core deps, `fnv_hash`, `nano-fused`, the ckpt header dup | same | **WAIT** — touches `schema.rs`/`override.rs`/`validation.rs`/`lib.rs`, the same files the in-flight Engram agent edits |
 | **C3** | `feat: dormouse-ema` | `aux.rs` → new crate, `aux.rs` re-exports | 2 call sites (`model.rs`, `train/lib.rs`) | same | **parallel with C4** (different files) |
 | **C4** | `refactor!: LinearLike → dormouse-linear` | `git mv param.rs` + import rewrite in `model.rs`, `loop_block.rs`, `gr.rs`, `train/lib.rs` | 6 import sites + 2 tests | same | parallel with C3; **serial** after C2 (same `lib.rs`) |

@@ -22,7 +22,7 @@ The divergence is **only** the output gate.
 
 ## What we do, and why it is not verified
 
-`vendor/burn-fused/crates/burn-gdn2/src/module.rs` applies `silu(gate)` — the
+`vendor/dormouse-fused/crates/burn-gdn2/src/module.rs` applies `silu(gate)` — the
 **NVlabs** choice, i.e. the original GDN-2 reference.
 
 **The reason this is a finding and not a footnote: our own oracle cannot see

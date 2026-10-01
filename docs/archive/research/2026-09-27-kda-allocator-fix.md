@@ -111,7 +111,7 @@ Same rows, `client.memory_usage()` at the same three points.
 
 The `TypeId` gate means the trainer ran the tensor chunk path. The same call
 behind one fused autodiff node, warm, `b=10 t=512`, measured in
-`vendor/burn-fused/crates/burn-kda/examples/kda_step_probe.rs`:
+`vendor/dormouse-fused/crates/burn-kda/examples/kda_step_probe.rs`:
 
 | path | fwd | bwd | pair |
 |---|---|---|---|
@@ -125,7 +125,7 @@ cost in both, ~60% lower on the fused path. The fused forward is also the
 
 Two caveats, stated because they matter:
 
-* This A/B is from the `vendor/burn-fused` build, which links **unpatched
+* This A/B is from the `vendor/dormouse-fused` build, which links **unpatched
   registry cubecl** (that workspace has no `[patch.crates-io]`). The ratio is
   the transferable number; the absolutes are not. The §1/§2 tables are from
   the dormouse build (patched) because the allocator is precisely what differs.
@@ -196,7 +196,7 @@ be relied on.
 
 ## 7. Method notes, for whoever re-runs this
 
-* **Run the harness inside the dormouse workspace.** In `vendor/burn-fused`,
+* **Run the harness inside the dormouse workspace.** In `vendor/dormouse-fused`,
   one elementwise `mul` on a 24 576-element tensor measures **295 µs**; on the
   patched build the same class of op is far cheaper. Both builds' absolute
   numbers are unusable for op-count conclusions if you mix them, and the probe

@@ -1,6 +1,6 @@
 # Oracle audit: what the library's verification claims are actually worth
 
-Date: 2026-09-27. Slice: headline-claim audit of `vendor/burn-fused/`.
+Date: 2026-09-27. Slice: headline-claim audit of `vendor/dormouse-fused/`.
 Read-only. No code changed, no GPU run. Snapshot `23f2b1c` + working tree.
 
 **The claim under audit.** ADR-0018 rule 1: *"the port is verified bit-for-bit (or to a
@@ -18,7 +18,7 @@ claims are outright false and are listed with replacement wording in ADR-0020.
 
 | question | answer |
 |---|---|
-| Crates under `vendor/burn-fused/crates/` | **28** (+ the `burn-fused` facade) |
+| Crates under `vendor/dormouse-fused/crates/` | **28** (+ the `burn-fused` facade) |
 | Crates using the phrase "bit-for-bit" / "bit-exact" | **3** — `burn-gdn2`, `burn-sct`, `burn-kda` |
 | …of those, with an oracle derived from an **authors'** source | **0** |
 | Crates that **assert** they match an authors' *implementation* | **6** — `burn-gdn2`, `burn-sct`, `burn-dspark`, `burn-engram`, `burn-fastblt`, `burn-ttt` |
@@ -167,7 +167,7 @@ they are correctly-ignored probes, not a false gate.
 ### 3f. The inherited fiction
 
 Ten per-crate workflows exist (`crates/*/.github/workflows/ci.yml` for attnres,
-bitnet, gdn2, kda, mhc, rope, sct, situ, plus `bench.yml`). `vendor/burn-fused` has
+bitnet, gdn2, kda, mhc, rope, sct, situ, plus `bench.yml`). `vendor/dormouse-fused` has
 no `.git` and is `exclude`d from the root workspace, so **none has ever executed**.
 They cannot gate anything and their presence invites the belief that they do. The real
 gate is `../../.github/workflows/fused-library.yml`, which is honest about its own
@@ -213,7 +213,7 @@ that pass) rather than re-derived. Two re-verified by me here via the GitHub tre
 
 - `burn-gdn2`, `burn-kda`, `burn-mor`, `burn-spectral` have modified sources;
   `burn-gdn2/src/cuda_dispatch.rs`, `burn-gdn2/tests/{autodiff_cuda_gate,lowp_bf16_cuda,zz_scratch_probe}.rs`,
-  `burn-kda/tests/cuda_gate.rs`, `burn-mor/src/topk_gather.rs` and `vendor/burn-fused/tools/`
+  `burn-kda/tests/cuda_gate.rs`, `burn-mor/src/topk_gather.rs` and `vendor/dormouse-fused/tools/`
   are **untracked** — other agents are mid-work. I read them as they are and flag that
   their state is not final. In particular `autodiff_cuda_gate.rs` is a genuine
   improvement over what `TEST-AUDIT.md` recorded and I credited it as such.

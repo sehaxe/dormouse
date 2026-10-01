@@ -12,7 +12,7 @@ Reviewer: adversarial reviewer, spawned session. Date: 2026-09-29.
 Methods actually used: `pdftotext -layout` on a fresh download of `arXiv:2603.15031v1`,
 GitHub REST API (`trees`, `branches`, `tags`, `releases`, `commits`, `issues`), `curl` of
 third-party sources, and line-by-line reading of
-`vendor/burn-fused/crates/burn-attnres/src/{lib.rs,fused_attnres.rs}`.
+`vendor/dormouse-fused/crates/burn-attnres/src/{lib.rs,fused_attnres.rs}`.
 **No code was built or run.** Every "I traced" below is a source trace, and each one names
 the command that would settle it empirically.
 
@@ -82,7 +82,7 @@ Three corrections to the report's own numbers:
   none re-measured. AGENTS.md §1.4: "a measurement is a measurement only with the config, the
   date and the commit it was taken at."
 * `crates/burn-attnres/README.md:3–:8` (§3.3) is a **wrong path** — the file is
-  `vendor/burn-fused/crates/burn-attnres/README.md`. Its content is as quoted (3–8 does say
+  `vendor/dormouse-fused/crates/burn-attnres/README.md`. Its content is as quoted (3–8 does say
   "Not in the dormouse build").
 
 #### 1.3 Claim 3 — CONFIRMED, every line reference real
@@ -207,10 +207,10 @@ The headline "the crate is not a port" survives; the arithmetic does not.
 
 `crates/dormouse-core/Cargo.toml` and every other `crates/dormouse-*/Cargo.toml`: **no
 reference to `burn-attnres`**. The workspace root `Cargo.toml:12` has
-`exclude = ["vendor/burn-fused", "vendor/cubecl-fix", "vendor/cubek-fix"]` and `members` =
+`exclude = ["vendor/dormouse-fused", "vendor/cubecl-fix", "vendor/cubek-fix"]` and `members` =
 `cublas-poc, dormouse-core, dormouse-data, dormouse-train, dormouse-cli, backend-parity`. The
-only inbound edges to `burn-attnres` are inside its own workspace: `vendor/burn-fused/Cargo.toml:4`,
-`vendor/burn-fused/burn-fused/Cargo.toml:19,31,52,79`, `vendor/burn-fused/benches/Cargo.toml:12`.
+only inbound edges to `burn-attnres` are inside its own workspace: `vendor/dormouse-fused/Cargo.toml:4`,
+`vendor/dormouse-fused/burn-fused/Cargo.toml:19,31,52,79`, `vendor/dormouse-fused/benches/Cargo.toml:12`.
 `docs/architecture/library-crate-fate.md:62` records fate `b / REFERENCE`; `docs/archive/architecture/PLAN-minimal-core.md:90`
 (§M2) names it as a residual-stream A/B arm that has not been run. **No dormouse number is
 retracted. This claim is the most important one in the report and it is correct.**
@@ -498,7 +498,7 @@ is a **plausible lead on the report's own open question 1**: K3 §2.2 is ordinar
 *sequence-wise* attention, where `1/√d` is the standard convention. If the author ported from
 K3's attention block and then wired it to 2603.15031's text, the `1/√d` is a habit from the
 wrong paper, not a considered temperature argument. **UNVERIFIED** as intent — settle by
-`git log -p --follow -- vendor/burn-fused/crates/burn-attnres/src/fused_attnres.rs | head -200`
+`git log -p --follow -- vendor/dormouse-fused/crates/burn-attnres/src/fused_attnres.rs | head -200`
 and looking at the introducing commit's message; the repo's log for the crate starts at
 `d1a76fe` (vendoring), so the original authoring history may not be reachable.
 
@@ -653,9 +653,9 @@ from files already in the tree, and four prior in-repo audits the report does no
 
 **What I could not verify — UNVERIFIED:**
 * the current pass/fail of `streaming_fused_matches_tensor_path` (the one recorded-red
-  CUDA test). Command: `cd vendor/burn-fused && cargo test -p burn-attnres --features
+  CUDA test). Command: `cd vendor/dormouse-fused && cargo test -p burn-attnres --features
   cuda,autodiff --lib streaming_fused_matches_tensor_path`. Needs a GPU; not permitted here.
-* whether the `1/√d` was ever a deliberate decision. `git log -S'powf(-0.5)' -- vendor/burn-fused/crates/burn-attnres`
+* whether the `1/√d` was ever a deliberate decision. `git log -S'powf(-0.5)' -- vendor/dormouse-fused/crates/burn-attnres`
   returns exactly one commit, `d1a76fe` ("self-contained repo: vendor burn-fused …"), i.e.
   **the crate's pre-vendor history is not in this repo at all**. The question is unanswerable
   from this tree; it needs `git log -S` against the upstream clone named in the crate's
@@ -921,7 +921,7 @@ wrong later, invisible to every test that only checks init.
 * **(a) Delete the scale, adopt the paper's formula.** One change. It also deletes D4 as
   unrepresentable, and the training cost is **zero**, because no run has ever used the
   crate — verified: no `Cargo.toml` under `crates/` references `burn-attnres` (grep over
-  every `.toml`), and the workspace `exclude` at `Cargo.toml:12` keeps `vendor/burn-fused`
+  every `.toml`), and the workspace `exclude` at `Cargo.toml:12` keeps `vendor/dormouse-fused`
   out of the product build entirely. This is the only option that satisfies the owner's rule
   as written.
 * **(b) Keep it, and request the exception explicitly and in writing** — with the
@@ -948,7 +948,7 @@ made under a bar that has no achievable form for this paper.
 **Facts, all verified from this tree.** 2402 lines (517 `lib.rs` + 1821 `fused_attnres.rs`
 + 64 bench). Fate class **REFERENCE** (`docs/architecture/library-crate-fate.md:62`). Zero incoming edges
 from `crates/dormouse-*` — grep over every `.toml` finds none, and `Cargo.toml:12` excludes
-`vendor/burn-fused` from the workspace. It *is* compiled by CI
+`vendor/dormouse-fused` from the workspace. It *is* compiled by CI
 (`.github/workflows/fused-library.yml:163`, `--no-run` only). It **fails its own recorded
 CUDA configuration**: `docs/archive/research/2026-09-27-fused-build-matrix.md:50` — `FAIL 11+1f/2ig` —
 with the panic quoted at `:179-186`. It is already labelled **BROKEN** twice
@@ -1053,7 +1053,7 @@ BUG, and it is in the function the report would keep.
 
 *Minor, for the record:* `attnres.md:319` cites `crates/burn-attnres/README.md:3-8`. The
 path does not exist; the file is
-`vendor/burn-fused/crates/burn-attnres/README.md:3-8` (AGENTS.md §2.5: `vendor/` is
+`vendor/dormouse-fused/crates/burn-attnres/README.md:3-8` (AGENTS.md §2.5: `vendor/` is
 canonical). And §5's "should stay red until the deviation is removed" conflicts with
 AGENTS.md's "failing test = bug in code — fix code, never skip/delete tests"; the correct
 form is `#[ignore]` **with a named ADR reference**, or fix the code and make it green.

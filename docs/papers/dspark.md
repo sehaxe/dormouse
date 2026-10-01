@@ -1,7 +1,7 @@
 # DSpark — paper verification
 
 **Fetch date:** 2026-09-29. **Tree:** `eeb3b73`, working dir `/home/sehaxe/dormouse`.
-**Subject:** `vendor/burn-fused/crates/burn-dspark/` + the call sites in
+**Subject:** `vendor/dormouse-fused/crates/burn-dspark/` + the call sites in
 `crates/dormouse-core/src/{aux.rs, model.rs}`.
 
 ---

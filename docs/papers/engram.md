@@ -1,7 +1,7 @@
 # Engram / hashed n-gram memory — paper verification
 
 **Fetch date:** 2026-09-29. **Tree:** `eeb3b73`, working dir `/home/sehaxe/dormouse`.
-**Subject:** `vendor/burn-fused/crates/burn-engram/` + the call site in
+**Subject:** `vendor/dormouse-fused/crates/burn-engram/` + the call site in
 `crates/dormouse-core/{loop_block.rs, config/schema.rs}`.
 
 ---

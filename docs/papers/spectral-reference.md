@@ -2,7 +2,7 @@
 
 **Status: COMPLETE as of 2026-09-30.** Research only — no Rust, no cargo, no
 builds. Everything below was run; the transcript is in
-`vendor/burn-fused/crates/burn-spectral/tests/oracle/`.
+`vendor/dormouse-fused/crates/burn-spectral/tests/oracle/`.
 
 **Interpreter for every RUN below**: `/tmp/opencode/oracle-venv/bin/python`,
 python 3.12.14, `torch==2.14.0+cpu`, `numpy==2.5.2`, CPU only. That venv was
@@ -37,7 +37,7 @@ named 'torch'` and that is recorded rather than worked around.)
 
 ### 0.1 The premise in the task brief is wrong about our own code — corrected
 
-The brief says: *"Our `NS_COEFFS` in `vendor/burn-fused/crates/burn-muon-plus/src/lib.rs`
+The brief says: *"Our `NS_COEFFS` in `vendor/dormouse-fused/crates/burn-muon-plus/src/lib.rs`
 ends at exactly `(1.875, −1.25, 0.375)`."*
 
 **It does not.** Measured by reading the file:
@@ -513,7 +513,7 @@ Stated so the next reader does not over-read this document:
 
 Everything fetched 2026-09-30 (UTC) from `/home/sehaxe/dormouse-wt/spectral-oracle`
 at base commit `c3314e9`, branch `wt/spectral-oracle`. Pinned under
-`vendor/burn-fused/crates/burn-spectral/tests/oracle/upstream/`.
+`vendor/dormouse-fused/crates/burn-spectral/tests/oracle/upstream/`.
 
 | file | sha256 | origin | pin |
 |---|---|---|---|
@@ -537,7 +537,7 @@ Papers (fetched, **not** pinned — no reproducible artifact exists for either):
 
 Script transcripts committed beside these, all re-runnable with
 `/tmp/opencode/oracle-venv/bin/python` from
-`vendor/burn-fused/crates/burn-spectral/tests/oracle/`:
+`vendor/dormouse-fused/crates/burn-spectral/tests/oracle/`:
 
 | script | sha256 | what it establishes |
 |---|---|---|

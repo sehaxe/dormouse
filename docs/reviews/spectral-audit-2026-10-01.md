@@ -760,7 +760,7 @@ branch's copy is the union.
 The brief for this landing said to keep "`SIGMA_OVERSHOOT` const + the rewritten
 POWER_ITERS/1.05 comments from the tsct-diag lane `8a9bd7c`/`2254c7c`". **Main
 never gained either**: `git grep SIGMA_OVERSHOOT main` returns nothing, and
-`git log 8f97411d..main -- vendor/burn-fused/crates/burn-spectral/` lists only
+`git log 8f97411d..main -- vendor/dormouse-fused/crates/burn-spectral/` lists only
 `7811191` (docs). The const is on `wt/tsct-diag`, which is **unlanded**, and its
 `lib.rs` hunk is a different-lane commit.
 
@@ -814,13 +814,13 @@ of blindness one level up:
    for a polynomial is for, and it is worth recording that the error was in the
    *fix*, not in the tree being landed.
 
-`bash crates/burn-spectral/tests/oracle/falsify.sh` from `vendor/burn-fused`:
+`bash crates/burn-spectral/tests/oracle/falsify.sh` from `vendor/dormouse-fused`:
 **every mutant DETECTED on its own assertion, restore byte-identical by sha256,
 suite green after restore.** See §13.5 for the tallies.
 
 ### 13.5 What was measured at the landing
 
-All of it on this box, 2026-10-01, CPU only (`vendor/burn-fused` is its own
+All of it on this box, 2026-10-01, CPU only (`vendor/dormouse-fused` is its own
 cargo workspace, so the command is run from there):
 
 ```

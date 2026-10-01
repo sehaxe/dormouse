@@ -36,7 +36,7 @@ crates.io is reachable and cheap.
 
 Checked against each crate's own doc comment and `Cargo.toml`, not the task list:
 
-- The library is **28 crates, not 26** (`vendor/burn-fused/crates/`), plus the `burn-fused`
+- The library is **28 crates, not 26** (`vendor/dormouse-fused/crates/`), plus the `burn-fused`
   meta-crate. The task list names 28 and matches the directory exactly.
 - `burn-gdn2` has **no arXiv in the crate** (correct as stated), but the mechanism it ports
   **does** have a paper that the crate never cites: **arXiv 2605.22791**, "Gated DeltaNet-2:
@@ -868,7 +868,7 @@ grepped), `deepseek-ai` org listing (39 repos), `MoonshotAI` org listing (43 rep
 `1bitml/BitNet`, `1bitml/BitNet-pytorch`, `1bitml/BitNet-b1.58`, `thu-ml/BitNet`,
 `microsoft/BitNet` @ `main` README (binary layout; tree opened instead).
 
-**Our own source read for this pass:** `vendor/burn-fused/crates/*/src/lib.rs` doc comments
+**Our own source read for this pass:** `vendor/dormouse-fused/crates/*/src/lib.rs` doc comments
 (all 28), all 28 `Cargo.toml` dependency blocks, `burn-kda`'s and `burn-gdn2`'s test harnesses
 (`tests/gen_reference.py`, `tests/ref_data.bin` 7.1 MB, `tests/bit_exact.rs`),
 `crates/*/Cargo.toml`, and the `use burn_*` reference counts over `crates/*/src`.

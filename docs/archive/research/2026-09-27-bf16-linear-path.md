@@ -57,7 +57,7 @@ There is exactly **one** dtype decision in the whole gated-delta path:
 
 | where | what it decides |
 |---|---|
-| `vendor/burn-fused/crates/burn-gdn2/src/kernel/chunk_cube.rs:838-841` (after another agent's 2026-09-27 edit; the gate text is unchanged) | `if !matches!(q.dtype(), DType::F32) { return None; }` — the fused kernels or the tensor-ops chunk loop |
+| `vendor/dormouse-fused/crates/burn-gdn2/src/kernel/chunk_cube.rs:838-841` (after another agent's 2026-09-27 edit; the gate text is unchanged) | `if !matches!(q.dtype(), DType::F32) { return None; }` — the fused kernels or the tensor-ops chunk loop |
 
 Everything downstream of it is `launch_unchecked::<f32>` on buffers the gate
 has already vouched for:
@@ -139,7 +139,7 @@ fallback that never happens because the arm is fed f32.
 ## 2. What I implemented
 
 One new file, no edits to any shared source:
-`vendor/burn-fused/crates/burn-gdn2/tests/lowp_bf16_cuda.rs`.
+`vendor/dormouse-fused/crates/burn-gdn2/tests/lowp_bf16_cuda.rs`.
 
 ### 2.1 `bf16_storage_with_f32_accumulation` - the capability, measured
 
@@ -346,8 +346,8 @@ the documented escape hatch, do not build it.**
 ### 6.3 If someone does build it anyway - the diff sketch
 
 ```diff
---- a/vendor/burn-fused/crates/burn-gdn2/src/kernel/chunk_cube.rs
-+++ b/vendor/burn-fused/crates/burn-gdn2/src/kernel/chunk_cube_bf16.rs   (new file)
+--- a/vendor/dormouse-fused/crates/burn-gdn2/src/kernel/chunk_cube.rs
++++ b/vendor/dormouse-fused/crates/burn-gdn2/src/kernel/chunk_cube_bf16.rs   (new file)
 +// storage type is u16 (bf16 bits), arithmetic type is F. One `#[cube]` kernel
 +// serves f32 (S = f32-as-u16? no) ... concretely: generic over the ARITHMETIC
 +// type, u16-typed boundary buffers, per-site `bf16_to_f32` / `f32_to_bf16`.
@@ -462,7 +462,7 @@ transcription** (the CPU harness and a per-token scan), not NVlabs' own bytes.
 the generator, not in burn: it read token-major buffers with head-major
 offsets, which is invisible at T=1 and wrong for every t >= 1. Fixed
 2026-09-29, and the gate is green at max_diff 2.32e-7 with the tolerance
-unchanged; see `vendor/burn-fused/TEST-AUDIT.md` FINDING 0. The bf16 numbers
+unchanged; see `vendor/dormouse-fused/TEST-AUDIT.md` FINDING 0. The bf16 numbers
 above are unaffected either way: they compare fused against the CPU harness,
 not against that fixture.
 
