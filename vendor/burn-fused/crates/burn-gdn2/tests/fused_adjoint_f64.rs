@@ -8,13 +8,15 @@
 // same framework, so a misreading of the specification is symmetric across them
 // and cancels (`docs/ORACLE.md` §2).  Its reference is tier (d).
 //
-// This file's reference is `tests/ref_bwd_f64.bin`: forward-mode AD in f64 over
-// a transcription of the forward, cross-checked inside the generator against
-// full-tensor central finite differences.  Those two agree to 1.2e-12, and the
-// forward itself is asserted against the same fixture at 1.4e-7 by
-// `tests/autodiff_bwd_f64.rs`.  A wrong adjoint, a missing gradient, a dropped
-// term, a transposed contraction, a sign error and a gradient of a different
-// function ALL fail this and none of them fails an arm-vs-arm comparison.
+// This file's references are `tests/ref_bwd_f64.bin` (one chunk) and
+// `tests/ref_bwd_f64_carry.bin` (two chunks): forward-mode AD in f64 over a
+// transcription of the forward, cross-checked inside the generator against
+// full-tensor central finite differences.  Those two agree to 1.2e-12 and
+// 2.3e-12 respectively, and the forward itself is asserted against the same
+// fixtures by `tests/autodiff_bwd_f64.rs`.  A wrong adjoint, a missing gradient,
+// a dropped term, a transposed contraction, a sign error and a gradient of a
+// different function ALL fail this and none of them fails an arm-vs-arm
+// comparison.
 //
 // # THE DEFECT THIS FILE IS POINTED AT
 //
@@ -25,19 +27,30 @@
 // is that comparison.  If the fused adjoint is right, the counter it asserts is
 // finally earned; if it is wrong, the number is here.
 //
-// # WHAT ONE CHUNK DOES NOT COVER, AND IT IS THE IMPORTANT PART
+// # SCOPE: BK1 AND BK2, AND WHY IT WASN'T ALWAYS
 //
-// The fixture is a single chunk (see `tools/gen_bwd_f64.py`), so this exercises
-// BK1 — the token-parallel intra-chunk adjoint — on all seven gradients, on all
-// coordinates.  It does NOT exercise BK2, the sequential reverse recurrence over
-// the chunks, nor the `d_k_bptt` / `d_e_bptt` / `d_s_shift` glue.  Those are
-// exactly the terms `2a430cc` measured at rel 3.3e-1 (d_k) and 6.2e-1 (d_g)
-// before its fix, and they are the ones with no oracle here, because the
-// forward's chunk carry does not match the f64 transcription on a two-chunk
-// sequence at all (measured 8.3e-1 relative; see
-// `tests/autodiff_bwd_f64.rs`).  **Do not read a green run of this file as
-// "the fused backward is correct".**  It is "the fused INTRA-chunk adjoint is
-// correct against an independent oracle".
+// This file runs TWICE, at one chunk and at two, from two committed f64
+// fixtures.  At one chunk (`ref_bwd_f64.bin`) it exercises BK1 — the
+// token-parallel intra-chunk adjoint — on all seven gradients, on all
+// coordinates.  At two chunks (`ref_bwd_f64_carry.bin`, T=32) it also exercises
+// BK2, the sequential reverse recurrence over the chunks, and the
+// `d_k_bptt` / `d_e_bptt` / `d_s_shift` glue.  Those are exactly the terms
+// `2a430cc` measured at rel 3.3e-1 (d_k) and 6.2e-1 (d_g) before its fix.
+//
+// It used to run at one chunk only, and the header said why: the two-chunk
+// forward "does not match the f64 transcription at all (measured 8.3e-1)".  That
+// reason was WRONG and was retracted by `c305ec5` (09-30 18:17), which located
+// the fault in `tools/gen_bwd_f64.py:258` — `np.exp(g_last - G)` where
+// `g_last` was already `exp(G_last)`, a double exp in the REFERENCE, no
+// production code involved.  After the fix: chunk 1 5.603e-01 -> 3.327e-08,
+// final state 8.930e-01 -> 2.621e-07.  `c305ec5` regenerated the two-chunk
+// fixture and used it for the state gate; nobody pointed this file at it, so
+// the ungated half of the backward kept a green gate and a scope note that read
+// like a measurement.
+//
+// **Do not read a green run of the ONE-chunk arm as "the fused backward is
+// correct"** — that is the mistake `d8fa449` inherited, filing a 16-chunk
+// disagreement against a kernel that had only ever been checked at one chunk.
 //
 // # RUN
 //
@@ -79,14 +92,13 @@ fn rd_name(c: &mut Cursor<&[u8]>) -> String {
     String::from_utf8(b).unwrap()
 }
 
-fn load() -> Fixture {
-    let data = include_bytes!("ref_bwd_f64.bin");
+fn load(data: &[u8]) -> Fixture {
     // `include_bytes!` yields `&[u8; N]`; `Cursor::new` over the SLICE is what
     // gives the `&[u8]` the rd_* readers take. Same shape as ref_f64.rs.
-    let mut c = Cursor::new(&data[..]);
+    let mut c = Cursor::new(data);
     let mut m = [0u8; 8];
     c.read_exact(&mut m).unwrap();
-    assert_eq!(&m, b"GDN2BFD\0", "ref_bwd_f64.bin is not this format");
+    assert_eq!(&m, b"GDN2BFD\0", "not a GDN2BFD fixture");
     let n = rd_u32(&mut c) as usize;
     let mut blocks = Vec::with_capacity(n);
     for _ in 0..n {
@@ -140,12 +152,44 @@ fn rel(a: &[f64], b: &[f64]) -> (f64, f64) {
 }
 
 /// The seven fused-kernel gradients against the f64 oracle, per term, on every
-/// coordinate.
+/// coordinate, at ONE chunk and at TWO.
 ///
 /// Run: `cargo test -p burn-gdn2 --features cuda,autodiff --test fused_adjoint_f64 -- --nocapture`
+///
+/// TWO arms, from two committed fixtures, because they are two different
+/// functions and the difference is the whole point:
+///
+/// * `ref_bwd_f64.bin` — T=16, chunk=16, ONE chunk. This is BK1, the
+///   token-parallel intra-chunk adjoint, and nothing else. It has been green
+///   since `814847b`.
+/// * `ref_bwd_f64_carry.bin` — T=32, chunk=16, TWO chunks. This is BK1 **and
+///   BK2**, the sequential reverse recurrence over the state, **and the
+///   `d_k_bptt` / `d_e_bptt` / `d_s_shift` glue**. That is the half where the
+///   terms `2a430cc` measured at rel 3.3e-1 (d_k) and 6.2e-1 (d_g) lived.
+///
+/// The second arm is what this file could not have when it was written: its own
+/// header gave the reason — "the forward's chunk carry does not match the f64
+/// transcription on a two-chunk sequence at all (measured 8.3e-1)". That reason
+/// was RETRACTED by `c305ec5` (09-30 18:17), which found the double-`exp` in
+/// `tools/gen_bwd_f64.py:258` — one line of the REFERENCE, no production code
+/// changed — and took chunk 1 from 5.603e-01 to 3.327e-08. The scope was never
+/// widened afterwards, so for 5h38m the ungated half was described as blocked
+/// while its oracle sat on disk regenerated and unused.
 #[test]
 fn the_fused_kernels_agree_with_the_f64_oracle_term_by_term() {
-    let f = load();
+    for (label, data) in [
+        ("ONE CHUNK (BK1 only)", &include_bytes!("ref_bwd_f64.bin")[..]),
+        (
+            "TWO CHUNKS (BK1 + BK2 + the d_s_shift glue)",
+            &include_bytes!("ref_bwd_f64_carry.bin")[..],
+        ),
+    ] {
+        run(label, data);
+    }
+}
+
+fn run(label: &str, data: &[u8]) {
+    let f = load(data);
     let dev: burn::tensor::Device = Default::default();
     let inp: [Tensor<4>; 7] = std::array::from_fn(|i| f.input(NAMES[i], &dev));
     let (_, d_out) = f.get("d_out");
@@ -172,10 +216,10 @@ fn the_fused_kernels_agree_with_the_f64_oracle_term_by_term() {
     .expect("the fused forward must engage on the bare CUDA backend");
     let (_, out_ref) = f.get("out");
     let (fwd, fwd_scale) = rel(&vals(&fused_out), &out_ref);
-    println!("\nfused forward vs the f64 transcription: rel={fwd:.3e} (output scale {fwd_scale:.3e})");
+    println!("\n=== {label} ===\nfused forward vs the f64 transcription: rel={fwd:.3e} (output scale {fwd_scale:.3e})");
     assert!(
         fwd < 1e-3,
-        "the fused forward is {fwd:.3e} from the f64 transcription. The adjoint below \
+        "[{label}] the fused forward is {fwd:.3e} from the f64 transcription. The adjoint below \
          differentiates the exported buffers, so a disagreement here means the two sides \
          are different functions and the gradient numbers would be meaningless."
     );
@@ -231,15 +275,14 @@ fn the_fused_kernels_agree_with_the_f64_oracle_term_by_term() {
         }
     }
     println!(
-        "\noracle self-consistency: forward-mode AD vs central differences, 1.2e-12 relative\n\
-         our bar: {GRAD_BAR:.0e} (the f32 side).  SCOPE: one chunk, so BK1 only — BK2 and the\n\
-         d_k_bptt/d_e_bptt/d_s_shift glue are NOT covered here; see the file header."
+        "\noracle self-consistency: forward-mode AD vs central differences, ~1e-12 relative\n\
+         our bar: {GRAD_BAR:.0e} (the f32 side).  SCOPE of this arm: {label}."
     );
     assert!(
         worst.0 < GRAD_BAR as f64,
-        "the fused kernel adjoint is wrong on input {}: rel={:.3e} against the f64 oracle \
-         (BAR {GRAD_BAR:.0e}). This is a KERNEL number against a gradient computed by a \
-         different method, not a tolerance question.",
+        "[{label}] the fused kernel adjoint is wrong on input {}: rel={:.3e} against the f64 \
+         oracle (BAR {GRAD_BAR:.0e}). This is a KERNEL number against a gradient computed by \
+         a different method, not a tolerance question.",
         worst.1, worst.0
     );
     let _ = (Distribution::Normal(0.0, 1.0),);
