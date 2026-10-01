@@ -1,10 +1,52 @@
+//! `--set key=value`: the third layer of the merge, and the only one that is
+//! per-run rather than per-file.
+//!
+//! WHY A THIRD LAYER. The merge order is defaults -> preset TOML -> `--set` ->
+//! typed flags -> validate, and the ordering is the feature: an A/B is one
+//! command line over a shared preset, so the arm's value must be the last
+//! thing that touches the field. Presets are data and cannot encode "and on
+//! this run, only this run".
+//!
+//! WHAT A KEY MAY BE. The `match` in [`apply_overrides`] is the whole
+//! enumeration of reachable fields, and it is checked against the schema by
+//! the type system: an unknown key is a loud `Err` naming it, never a silently
+//! ignored flag.
+//!
+//! **FOUR SCHEMA FIELDS ARE UNREACHABLE FROM `--set`, recorded not fixed.**
+//! `use_situ`, `use_attnres`, `use_mhc` and `mhc_streams` have no arm in the
+//! match below, so `--set use_situ=true` returns
+//! `Err("unknown config key \"use_situ\"")` - LOUD, not silent, so nothing
+//! trains differently from what was asked. But those four are then reachable
+//! ONLY from a preset TOML, which is an inconsistency with every other field
+//! and a trap for anyone doing an A/B from the command line: SiTU-GLU, AttnRes
+//! and mHC are all queue rows and all three currently need a file edit under
+//! `configs/`. Fix is four arms in the match, ~6 lines. Not done here (docs
+//! lane).
+//!
+//! COST. One `split_once` and one `match` per `--set`; a run passes a handful.
+
 use super::schema::ActQuant;
 use super::schema::DormouseConfig;
 use std::str::FromStr;
 
+/// One `--set key=value` pair, already split and trimmed. Both halves are
+/// strings: the value is parsed by the arm that knows the field's type, so a
+/// bad value is reported by the field rather than by a generic parser.
 #[derive(Debug, Clone)]
-pub struct Override { pub key: String, pub value: String }
+pub struct Override {
+    /// The key as written, before normalisation. Kept verbatim because the
+    /// error messages quote it: a user who typed `d-model=512` should be told
+    /// about `d-model`, not about the key this resolved to.
+    pub key: String,
+    /// The right-hand side, trimmed, still unparsed.
+    pub value: String,
+}
 
+/// Split `key=value` strings into [`Override`]s, in the order given.
+///
+/// LOUD on the two shapes that are certainly a mistake: no `=` at all, and an
+/// empty key (`=4`, ` =4`). Order is preserved because two `--set`s for the
+/// same key are last-wins and that has to be the order the command line reads.
 pub fn parse_overrides(raw: &[String]) -> Result<Vec<Override>, String> {
     let mut out = Vec::new();
     for s in raw {
@@ -17,10 +59,28 @@ pub fn parse_overrides(raw: &[String]) -> Result<Vec<Override>, String> {
     Ok(out)
 }
 
+/// `true`/`false` for every bool field, spelled four ways each. Case
+/// insensitive. The set is deliberately wider than Rust's `bool::from_str`
+/// (which takes only two) because a shell user types `on`.
 fn parse_bool(v: &str) -> Result<bool, String> {
     match v.to_ascii_lowercase().as_str() { "true"|"1"|"yes"|"on" => Ok(true), "false"|"0"|"no"|"off" => Ok(false), _ => Err(format!("bool expected true/false, got {v:?}")) }
 }
 
+/// Write the overrides onto `cfg`, in order, so a later `--set` for the same
+/// key wins. Keys are matched on the LAST dot-separated segment and
+/// lowercased, so `model.d_model` and `D_MODEL` both reach `d_model`: the
+/// section prefix is accepted and discarded because the trainer's flags carry
+/// a prefix the model config does not.
+///
+/// Every unknown key is a LOUD `Err` naming the key as written. That is the
+/// point of the exhaustive `match` rather than a `getattr`-style lookup: a typo
+/// in an A/B command line must not run the control and call it the arm.
+///
+/// `act_quant` is the one field whose parser lives elsewhere - `ActQuant`'s
+/// `FromStr` (ADR-0005) - so serde, `--set` and the CLI cannot disagree about
+/// what `fp4` means. It additionally accepts `none`/`null`/`off`/empty, which
+/// mean "the arm is off", because the field is an `Option` and there is no
+/// other way to write the absence from a command line.
 pub fn apply_overrides(cfg: &mut DormouseConfig, ov: &[Override]) -> Result<(), String> {
     for o in ov {
         let key = o.key.split('.').last().unwrap_or(&o.key).to_ascii_lowercase();

@@ -1,7 +1,68 @@
+//! The coherence check: every rule a merged [`DormouseConfig`] has to satisfy
+//! before a model is built from it (ADR-0005).
+//!
+//! ONE FUNCTION, and that is the design. The rules are cross-field (a
+//! top-k that must fit the bank, a horizon that must fit the window, a
+//! capacity that must stay a minority of the model), so they cannot live on
+//! the fields, and splitting them across call sites is how a rule ends up
+//! checked on the training path and not on the eval path. `resolve` calls
+//! [`validate`] once, at the end of the merge.
+//!
+//! WHAT THE RULES ARE FOR. Nearly all of them exist because the wrong value
+//! computes a DIFFERENT NETWORK and says nothing about it (ADR-0019). The four
+//! shapes, with the check that catches each:
+//!
+//! 1. **A shape error a long way from the flag.** `act_group` and
+//!    `mhc_streams` must divide `d_model`, or the first forward's reshape
+//!    fails; `engram_orders` must have exactly 3 entries, or the trainer's
+//!    `[b, t, 3]` hash tensor is a shape mismatch. These are LOUD rather than
+//!    clamped because a clamped divisor trains a mechanism the config does not
+//!    name.
+//! 2. **A silent collapse into the control.** `moe_topk > n_experts` makes the
+//!    top-k set the dense blend, and `dspark_stride = 0` makes the k-step
+//!    draft window k copies of one cross-entropy: the run trains, the loss
+//!    descends, and the config no longer describes the objective. Refused,
+//!    naming the escape.
+//! 3. **A term with nothing to act on.** `moe_lb_coef > 0` with
+//!    `moe_topk = 0` is a load-balancing loss with no selection to balance -
+//!    a field that reads like an objective and contributes nothing, the
+//!    `probe::JEPA`-never-bumped shape this repo has already been bitten by.
+//! 4. **Two arms claiming one statement.** AttnRes, Gated Residual and mHC all
+//!    REPLACE the loop's residual accumulation, in the same `else` chain, so
+//!    any two on means one is silently ignored. One check over all three, so
+//!    adding a fourth cannot leave a pair unguarded.
+//!
+//! WHAT IS DELIBERATELY NOT A REFUSAL, and why: `moe_topk > 0` with
+//! `moe_lb_coef == 0`. A collapsed router is a real risk, but that
+//! configuration IS the arm's own removal under the A/B rule (AGENTS.md §1.2),
+//! the published coefficient range is three orders of magnitude too weak at our
+//! token count (so a refusal would manufacture a "copied a large-MoE number"
+//! defect), and `probe::MOE_ROUTE`/`MOE_LB` already make the state VISIBLE on
+//! the eval line as `moe=<lb>/<sel>` - the repo's own COUNTED mark, which is the
+//! correct instrument for a legal run.
+//!
+//! NOT CHECKED HERE, and each for a reason: values the loop can adapt to
+//! (`max_iter`, `rank`), values with a per-layer effect and no config-level
+//! rule (`lr`, `wd`, `grad_clip` - the train layer's, not the model's), and
+//! anything the filesystem owns (a preset that does not exist - that is
+//! [`super::load_config`]'s error).
+//!
+//! COST. ~30 scalar comparisons, no allocation: nothing next to a 0.8 s step,
+//! and it is paid once per run.
+
 use super::schema::DormouseConfig;
 #[cfg(test)]
 use super::schema::ActQuant;
 
+/// Check every cross-field rule the model cannot enforce for itself. `Ok(())`
+/// means the config is coherent, not that it is GOOD - validation has no
+/// opinion on a learning rate.
+///
+/// Every `Err` names the field and, where a wrong value would compute a
+/// different objective rather than crash, the escape. Called once by
+/// `dormouse_train::resolve` after the merge; the model constructors do not
+/// call it, because a library that validates its own input on every call
+/// cannot be used to reproduce a run that predates a new rule.
 pub fn validate(c: &DormouseConfig) -> Result<(), String> {
     macro_rules! gt0 {
         ($v:expr, $name:expr) => { if $v == 0 { return Err(format!("{} must be >0", $name)); } };

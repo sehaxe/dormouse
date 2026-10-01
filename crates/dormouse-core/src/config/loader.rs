@@ -1,3 +1,38 @@
+//! Where a preset becomes a [`DormouseConfig`], and the one place in this
+//! crate that touches the filesystem.
+//!
+//! PRESETS ARE DATA (ADR-0005). `configs/*.toml` is the entire registry: no
+//! Rust table, no builtin list, no `match` on a preset name. Adding a preset is
+//! adding a file, and a file can be produced by a sweep. The only config baked
+//! into the binary is the schema's own serde defaults ([`super::schema`]), and
+//! those are `small` - so a missing preset file is a loud `Err`, never a
+//! silently-defaulted run.
+//!
+//! THE SEARCH ORDER, and why a NAME is a name at all. `--preset small` is
+//! tried against, in order: `./configs/small.toml`, `./configs/small`, the
+//! repo's `configs/` reached through the compile-time `CARGO_MANIFEST_DIR` (so
+//! the binary finds the presets it was built with whatever the cwd is), four
+//! paths relative to the executable, and `~/.config/dormouse/`. A value
+//! containing a slash or ending in `.toml` skips the search and is an EXPLICIT
+//! PATH, read directly.
+//!
+//! **KNOWN SILENT FALLBACK, recorded rather than fixed.** In the SEARCH path a
+//! candidate that exists but fails to read or fails to parse is dropped with
+//! both error modes discarded (`try_file` below: `read_to_string(p).ok()?`
+//! then `parse_str(&s).ok()`), so `--preset small` with a syntax error in
+//! `./configs/small.toml` falls through to the repo copy and runs a config
+//! nobody asked for, with no warning on any stream. That is ADR-0019's SILENT
+//! class - a defect - and the asymmetry is the finding: the EXPLICIT-PATH
+//! branch returns the parse error, so the same function treats the same
+//! failure loudly or silently depending on how the preset was spelled. Cheapest
+//! fix: collect the failures and mention them in the terminal `Err`, which
+//! already names every place it tried. Not done here; this lane is docs-only.
+//!
+//! COST. One `read_to_string` + one `toml::from_str` per run for an explicit
+//! path; the same per CANDIDATE for a name, which is at most 7 tiny files
+//! before the repo's is reached. Both are once per run, against a step that
+//! costs 0.8 s.
+
 use std::path::{Path, PathBuf};
 use super::schema::DormouseConfig;
 
@@ -41,6 +76,11 @@ fn candidates(name: &str) -> Vec<PathBuf> {
 /// data: plain TOML under configs/ (cwd, the repo via CARGO_MANIFEST_DIR,
 /// the exe dir) or ~/.config/dormouse. Schema defaults are the only config
 /// baked into the binary (ADR-0005); there is no Rust preset registry.
+///
+/// A bare name that is found NOWHERE is an `Err` listing every path tried, not
+/// a default: the first path in the list wins, and "no preset" is a typo, not
+/// a configuration. The silent case is the opposite one - a candidate that
+/// exists and does not parse, which the search drops; see the module docs.
 pub fn load_config(name_or_path: &str) -> Result<DormouseConfig, String> {
     if is_explicit(name_or_path) {
         let p = Path::new(name_or_path);
