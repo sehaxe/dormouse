@@ -1,7 +1,7 @@
 # Audit: the spectral stack — `burn-spectral`, `burn-sct`, and the seam between them
 
 > **WHY THIS FILE HAS A NEW NAME (2026-10-01, landing of `wt/spectral-audit`).**
-> This document was written as `research/reviews/spectral-audit-2026-10-01.md`
+> This document was written as `docs/reviews/spectral-audit-2026-10-01.md`
 > and landed as `3e1812b` (committed 00:55:09). The twin lane's `7811191`
 > was authored 35 s EARLIER (00:54:34) and committed 97 s later (00:56:46),
 > wrote to **the same path** with a different document (the formula audit of

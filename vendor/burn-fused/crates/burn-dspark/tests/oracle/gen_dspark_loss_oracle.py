@@ -205,7 +205,7 @@ TOL_REL = 1e-5
 #
 # DERIVED, not tuned to pass. The f32 envelope was MEASURED, in both
 # directions, on this box 2026-09-30, and the numbers are in
-# `research/reviews/verify-tails-2026-09-30.md`:
+# `docs/reviews/verify-tails-2026-09-30.md`:
 #
 #   WITH the detach in place (the bound must pass this):
 #     worst d/d(draft_logits) deviation over all 8 cases and all 366 drafter

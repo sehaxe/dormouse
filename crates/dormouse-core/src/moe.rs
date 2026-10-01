@@ -118,7 +118,7 @@ pub fn topk_blend(logits: Tensor<2>, k: usize) -> (Tensor<2>, Tensor<2>, Tensor<
 /// So the term lives in `[1, E]` = `[1, 4]` at `n_experts = 4`, and the
 /// coefficient question is "what fraction of the task gradient may the
 /// balancer apply", not "what does the literature say" - see the sweep in
-/// `research/reviews/moe-routing-2026-10-01.md` §5.
+/// `docs/reviews/moe-routing-2026-10-01.md` §5.
 pub fn lb_aux(probs: &Tensor<2>, mask: &Tensor<2>, n_experts: usize) -> Tensor<1> {
     assert_eq!(
         probs.dims(),

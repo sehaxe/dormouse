@@ -39,9 +39,9 @@ rustc 1.98.1, burn 0.22.0-pre.4 + vendored cubecl.
 | **100k official run** | **in flight**: step ~92k/100k at ~500 ms/step, best held-out **5.615** (over an **81 920 B** window), train best 2.415, 0 NaN, `--retract-every 4` | `~/logs/first_run_100000_1001_0202.log`; final row lands in `benches/history.tsv` |
 | Six mechanism arms landed, all with gates, all OFF by default | MHC (hyper-connections), SiTU-GLU (Kimi K3), RoPE-in-KDA, MoE top-1 (4 experts), AttnRes (arXiv 2603.15031), future-byte aux — **the 3-seed A/B wave is running today** | one landing commit each, `probe.rs` counts 19 arms |
 | KDA gradient question **closed** | all 11 KDA parameter groups receive non-zero, finite gradients on the trainer's backend; CPU NdArray and CUDA agree bit-for-bit on the ops path | `d8fa449`, `tests/kda_param_grads_cuda.rs`; falsified by a `detach()` at `cuda_dispatch.rs:449` killing 8/11 groups |
-| The "fused adjoint is wrong" finding **dissolved** | the old gates measured ONE chunk against a reference fixed the same day (a double-`exp` in the generator); both fixtures (1-chunk + 2-chunk, all 7 gradients, oracle error 2.3e-12) now sit behind one gate, and the gate demonstrably detects the injected fault (rel 1.000) | `research/reviews/kda-adjoint-2026-10-01.md`, `tools/falsify_fused_adjoint.sh` |
+| The "fused adjoint is wrong" finding **dissolved** | the old gates measured ONE chunk against a reference fixed the same day (a double-`exp` in the generator); both fixtures (1-chunk + 2-chunk, all 7 gradients, oracle error 2.3e-12) now sit behind one gate, and the gate demonstrably detects the injected fault (rel 1.000) | `docs/reviews/kda-adjoint-2026-10-01.md`, `tools/falsify_fused_adjoint.sh` |
 | CUDA graph capture mechanism **proven** | captured-step replay is bit-exact over 8 replays, **0 kernel launches across 8 replays**, price = 1 launch per parameter per step; the pin is MANDATORY — a captured step without it reads stale pointers silently ("got −3, correct −6") | `vendor/cubecl-fix/cubecl-cuda/tests/graph_step.rs`; trainer integration in flight |
-| burn-spectral formula audit (first ever) | findings 1–5 landed: three class-A comment defects with gates, two class-B failure modes; 6-mutant falsifier all-DETECTED; python oracles `tests/oracle/` | `a438c91`, `research/reviews/spectral-audit-2026-10-01.md` |
+| burn-spectral formula audit (first ever) | findings 1–5 landed: three class-A comment defects with gates, two class-B failure modes; 6-mutant falsifier all-DETECTED; python oracles `tests/oracle/` | `a438c91`, `docs/reviews/spectral-audit-2026-10-01.md` |
 
 Everything below was written before this subsection and is kept because it is
 still true; where the two disagree, this subsection wins.
@@ -126,7 +126,7 @@ still true; where the two disagree, this subsection wins.
   retraction should: the old gate compared one chunk against a reference whose
   generator had a double-`exp` — fixed the same day, regenerated at 2.3e-12,
   and both chunk fixtures now sit behind one gate that demonstrably detects the
-  injected fault (`research/reviews/kda-adjoint-2026-10-01.md`). The trainer
+  injected fault (`docs/reviews/kda-adjoint-2026-10-01.md`). The trainer
   *declining* the fused op under checkpointing is correct behaviour, not a
   fallback — a fused path that skips backward work is a different program.
 - **No fused multi-head attention exists in this stack at all.** dormouse's only

@@ -153,7 +153,7 @@ one to overstate.**
    `l2(rope(x)) == rope(l2(x))` exactly and the order relative to the norm
    cannot matter. A *partial* rotation is a different function and is not in
    this fixture. The reasoning, with every line number:
-   `research/reviews/rope-2026-09-30.md`.
+   `docs/reviews/rope-2026-09-30.md`.
 
 ## The coverage limit this oracle does NOT cover
 

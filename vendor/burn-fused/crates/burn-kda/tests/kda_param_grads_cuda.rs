@@ -28,7 +28,7 @@
 //! The layout of the groups also makes a falsification legible. `o_gate` and
 //! `o_proj` are applied AFTER the chunk recurrence, so a break inside the chunk
 //! op leaves those two with a gradient and takes it away from the other nine.
-//! `research/reviews/kda-gradflow-2026-09-30.md` records the run: breaking the
+//! `docs/reviews/kda-gradflow-2026-09-30.md` records the run: breaking the
 //! op's output into a leaf turns exactly those two green.
 //!
 //! ## Where this file lives, and why not in burn-gdn2
@@ -855,7 +855,7 @@ fn every_group_gets_a_matching_gradient_on_the_trainers_backend() {
 ///
 /// WHAT IS ASSERTED HERE IS FLOW, NOT NUMERICS, and the difference is a
 /// measured finding rather than a convenience — see
-/// `research/reviews/kda-gradflow-2026-09-30.md`:
+/// `docs/reviews/kda-gradflow-2026-09-30.md`:
 ///
 /// On the fused arm the gradients do NOT match central differences of the fused
 /// arm's OWN forward. Measured on this fixture: 4–6% on q/k/v_proj, **2.5e-1 on
@@ -919,7 +919,7 @@ fn every_group_gets_a_gradient_on_the_fused_arm() {
         "\n*** THE FUSED ADJOINT'S NUMERICS ARE NOT ASSERTED, and here is the \
          disagreement, recomputed: {}\n    {} of {} groups are outside {CPU_BAR:.0e}. FLOW is \
          asserted above; the numbers are here so this arm can never be reported as \
-         numerically verified. research/reviews/kda-gradflow-2026-09-30.md",
+         numerically verified. docs/reviews/kda-gradflow-2026-09-30.md",
         if bad.is_empty() { "NONE — the fused adjoint now agrees".into() } else { bad.join("\n    ") },
         bad.len(),
         v.len()

@@ -11,7 +11,7 @@
 //! weights have moved, and a trained model is a moving target (the precedent
 //! is `examples/export_divergence.rs`). What it prints is exactly what
 //! `crates/dormouse-core/src/mixture_probe.rs` computes, so the number in
-//! `research/reviews/moe-routing-2026-10-01.md` and the number the routing
+//! `docs/reviews/moe-routing-2026-10-01.md` and the number the routing
 //! arm's gate later compares against come from one instrument.
 //!
 //! CPU/ndarray on purpose: it must be able to run beside a GPU training run

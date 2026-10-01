@@ -147,7 +147,7 @@ pub struct LoopBlock {
     /// which collapses the `n x C` stream to `C`, and our body runs at full
     /// width `D`. The paper's Tab. 1 ablation puts `H_res` at -0.022 of the
     /// -0.027 total, so the two terms we do wire are ~89% of the measured
-    /// effect (research/reviews/mhc-2026-09-30.md §3).
+    /// effect (docs/reviews/mhc-2026-09-30.md §3).
     ///
     /// `n = mhc_streams` defaults to **2** (the base paper 2409.19606 calls the
     /// same quantity the "expansion rate" and Tab. 1 ablates it; 2604.21106v3
@@ -741,7 +741,7 @@ impl LoopBlock {
                 // handful of TINY kernels per iteration, not a GEMM: on this
                 // launch-bound box it is the arm's cost, and it is measured
                 // with the A/B rather than guessed here
-                // (research/reviews/mhc-2026-09-30.md §6).
+                // (docs/reviews/mhc-2026-09-30.md §6).
                 //
                 // fp32 in, fp32 out (the rule every Linear here follows: mixed
                 // bf16 x fp32 NaNs on this stack), then the residual write goes
@@ -1166,7 +1166,7 @@ mod tests {
     // SITU (arXiv:2607.24653v2 Eq 12). The FORM is gated in the mechanism
     // crate, against Moonshot's own numbers - see
     // vendor/burn-fused/crates/burn-situ/src/lib.rs and
-    // research/reviews/situ-2026-09-30.md. What is gated HERE is the wiring:
+    // docs/reviews/situ-2026-09-30.md. What is gated HERE is the wiring:
     // that the flag is load-bearing, that the counter sees the arm, and that
     // the gradient survives the cap. The form gate cannot see any of it: a
     // perfectly-formed SiTU wired to nothing is a green crate and a run that
@@ -1668,7 +1668,7 @@ mod tests {
             assert!(
                 !present,
                 "{name} is IN the graph, so something started using H_pre. The \
-                 wiring, `research/reviews/mhc-2026-09-30.md` 3.3 and this test all \
+                 wiring, `docs/reviews/mhc-2026-09-30.md` 3.3 and this test all \
                  say it does not - reconcile them before trusting a gradient dump"
             );
         }

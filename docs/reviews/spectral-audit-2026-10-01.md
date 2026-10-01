@@ -717,7 +717,7 @@ deliberate. Two reasons, both measured rather than preferred:
 
 ### 13.1 The twin, and the file it overwrote
 
-Two lanes wrote `research/reviews/spectral-audit-2026-10-01.md`, **two
+Two lanes wrote `docs/reviews/spectral-audit-2026-10-01.md`, **two
 different documents**, 97 seconds apart, with nothing to detect the collision:
 
 | | `3e1812b` | `7811191` (twin) | this lane |
@@ -746,8 +746,8 @@ branch's copy is the union.
 
 | file | decision | why |
 |---|---|---|
-| `research/reviews/spectral-audit-2026-10-01.md` | **branch** | findings 1–5 + the gate register; the twin's 218 lines are a strict prefix of it (§0–§4 are identical) |
-| `research/reviews/spectral-stack-audit-2026-10-01.md` | **restored from `3e1812b`** | the content the twin overwrote; see §13.1 |
+| `docs/reviews/spectral-audit-2026-10-01.md` | **branch** | findings 1–5 + the gate register; the twin's 218 lines are a strict prefix of it (§0–§4 are identical) |
+| `docs/reviews/spectral-stack-audit-2026-10-01.md` | **restored from `3e1812b`** | the content the twin overwrote; see §13.1 |
 | `burn-spectral/tests/oracle/audit_2026_10_01.py` | **union (branch = twin + 19 lines)** | the branch is a superset: same file, plus the §5 fixture fix |
 | `burn-spectral/tests/oracle/{sec4_fixed,sec4c_tolerance,sec4d_guard,sec5_6b,gate_dryrun}.py` | **branch** | new; the twin has none |
 | `burn-spectral/tests/oracle/falsify.sh` | **branch + §13.3** | new; the twin has none |

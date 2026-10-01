@@ -640,7 +640,7 @@ The defenses are installed, not optional.
   being fed the label sequence, so the JEPA target was wrong in every run since
   the aux heads shipped. DSpark's window shift **is** fixed (§3.3, 2026-09-29);
   verify-tails then found two more defects in the same expression, both fixed
-  with gates (`research/reviews/verify-tails-2026-09-30.md`): `dspark_loss` did
+  with gates (`docs/reviews/verify-tails-2026-09-30.md`): `dspark_loss` did
   not **detach** the confidence target (the acceptance head back-propagated
   into its own target — DeepSeek's rule is a detached `c*`), and the BCE was
   spelled as the usual `log(σ)+log(1−σ)` pair while the correct stable form is
@@ -708,7 +708,7 @@ The defenses are installed, not optional.
   on the trainer's backend and its result is discarded** — ADR-0019's
   silent-fallback shape; `fused kda=0/0` on the eval line means "not on this
   path", not "the fast path is slow". Both are burn-gdn2-owner items with
-  file:line in `research/reviews/kda-gradflow-2026-09-30.md`. The
+  file:line in `docs/reviews/kda-gradflow-2026-09-30.md`. The
   `DM_GDN2_BWD_TRACE` line was not release-visible; the numeric test replaces
   it — the trace could never have proven gradient *arrival*.
 - **The A/B budget has not been re-costed.** `docs/protocols/AB-PROTOCOL.md` still prices

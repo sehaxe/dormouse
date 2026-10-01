@@ -159,7 +159,7 @@ transplant**, not a reproduction, and its justification is post-training (the
 Qwen3.8 playbook: NoPE breaks SFT/RLVR), not pretrain parity. In Kimi Linear's
 hybrid the position comes from the interleaved full-attention layers
 (`fla/layers/attn.py:83,125`; `fla/models/hybrid.py:17-23`). Evidence, line
-numbers and the placement proof: `research/reviews/rope-2026-09-30.md`;
+numbers and the placement proof: `docs/reviews/rope-2026-09-30.md`;
 A/B row 8 in `docs/protocols/AB-PROTOCOL.md`, **not run**.
 
 **Not** "positional encoding" in general — there is no learned or additive

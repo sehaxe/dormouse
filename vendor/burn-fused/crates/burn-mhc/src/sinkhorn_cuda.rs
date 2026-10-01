@@ -88,7 +88,7 @@ fn sinkhorn_kernel<F: Float>(
         }
         let mut rn = rs;
         // KNOWN DEFECT, by inspection, and covered by NO test
-        // (research/reviews/mhc-2026-09-30.md 5.1): this floor is a SILENT
+        // (docs/reviews/mhc-2026-09-30.md 5.1): this floor is a SILENT
         // divergence from the tensor path, which runs the same normalization in
         // the log domain and has no floor at all. `sinkhorn.rs:12-21` is the
         // whole reason the tensor path is written that way - a row sum that

@@ -95,7 +95,7 @@ pub fn validate(c: &DormouseConfig) -> Result<(), String> {
     //    mechanism beats its own removal). A routing arm that cannot be run
     //    without its balancer cannot be measured against one.
     // 2. Refusing it would force the operator to pass SOME coefficient, and
-    //    the sweep (research/reviews/moe-routing-2026-10-01.md §5) measures
+    //    the sweep (docs/reviews/moe-routing-2026-10-01.md §5) measures
     //    that every value in the published range is three orders of magnitude
     //    too weak at our token count. A refusal here would manufacture exactly
     //    the "copied a large-MoE number" defect the external review named.

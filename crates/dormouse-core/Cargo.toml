@@ -33,7 +33,7 @@ burn-attnres = { path = "../../vendor/burn-fused/crates/burn-attnres" }
 # executed in any job in this repo (vendor/burn-fused/tools/gpu-gate.sh:73-77),
 # which is the burn-rmsnorm situation exactly. Enabling `burn-situ/cuda` needs a
 # CUDA gate that compares the fused output to the tensor path first; see
-# research/reviews/situ-2026-09-30.md §7.
+# docs/reviews/situ-2026-09-30.md §7.
 burn-situ = { path = "../../vendor/burn-fused/crates/burn-situ" }
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }

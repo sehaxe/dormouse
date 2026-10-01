@@ -177,7 +177,7 @@ fn polar_retracked(before: &Tensor<2>, iters: usize) -> Tensor<2> {
 /// paper's §1. Fetched from `https://arxiv.org/html/2602.21545v3`.
 ///
 /// **Why the sigma_max power iteration is here** (it is not removable, and
-/// `research/reviews/muon-tsct-review-b.md` §1.7 gets this wrong): the cubic
+/// `docs/reviews/2026-09-29-muon-tsct-review.md` §1.7 gets this wrong): the cubic
 /// `p(s) = 1.875s − 1.25s³ + 0.375s⁵` has `p′(s) = 1.875(s²−1)² ≥ 0`, `p(1) = 1`
 /// and `p(s) − s > 0` on `(0,1)`, so its basin is `[0,1]` and Cauchy–Schwarz
 /// (`σ_max ≤ ‖X‖_F`) proves a **Frobenius prescale cannot make it diverge**.
