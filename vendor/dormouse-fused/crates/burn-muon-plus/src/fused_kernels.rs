@@ -355,14 +355,50 @@ mod tests {
         }
     }
 
+    /// The pin's primitive, on the path it is actually built for: **bare**
+    /// cubecl tensors, which is what `graph::as_constant_float` /
+    /// `as_constant_int` hand to it after unwrapping the two autodiff enums.
+    ///
+    /// This test had never run. It was written as
+    /// `assert!(copy_into_cuda(..))` while `copy_into_cuda` returns
+    /// `Result<(), String>`, so it did not COMPILE — the one test that could
+    /// have caught a copy kernel that launches and writes nothing was a
+    /// compile error inside a `#[cfg(feature = "cuda")]` test module, which
+    /// nothing builds on the CPU default. A gate that cannot compile is not a
+    /// gate.
     #[test]
     fn copy_into_writes_the_existing_buffer_and_leaves_the_source_alone() {
         let dev = cuda_dev();
         let src: Tensor<2> = Tensor::random([37, 11], Distribution::Normal(0.0, 1.0), &dev);
         let dst: Tensor<2> = Tensor::zeros([37, 11], &dev);
-        assert!(copy_into_cuda(&src, &dst), "the copy kernel must run on a bare cubecl tensor");
-        // Bit-exact, not close: a copy is a copy.
-        assert_eq!(dst.clone().into_data().to_vec::<f32>(), src.clone().into_data().to_vec::<f32>());
+        let before = src.clone().into_data().to_vec::<f32>();
+        copy_into_cuda(&src, &dst).expect("the copy kernel must run on a bare cubecl tensor");
+        // Bit-exact, not close: a copy is a copy. A kernel that launched and
+        // wrote nothing fails here, which is the whole reason the test exists.
+        assert_eq!(dst.clone().into_data().to_vec::<f32>(), before);
+        assert_eq!(
+            src.clone().into_data().to_vec::<f32>(),
+            before,
+            "the source must be left alone"
+        );
+    }
+
+    /// The same primitive for Int, which is what `x`, `y` and the hashed keys
+    /// are pinned with. Separate because the CUDA `Int` dtype is i32 and a
+    /// `Float` kernel cannot be handed its buffer.
+    #[test]
+    fn copy_into_i32_writes_the_existing_buffer() {
+        let dev = cuda_dev();
+        let src: Tensor<2, burn::tensor::Int> = Tensor::from_data(
+            burn::tensor::TensorData::new((0..(7 * 5)).collect::<Vec<i32>>(), [7, 5]),
+            &dev,
+        );
+        let dst: Tensor<2, burn::tensor::Int> = Tensor::zeros([7, 5], &dev);
+        copy_into_i32_cuda(&src, &dst).expect("the Int copy kernel must run");
+        assert_eq!(
+            dst.into_data().to_vec::<i32>(),
+            (0..(7 * 5)).collect::<Vec<i32>>()
+        );
     }
 
     #[test]

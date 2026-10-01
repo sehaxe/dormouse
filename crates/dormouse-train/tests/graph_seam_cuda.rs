@@ -49,7 +49,10 @@ type Backend = dormouse_train::Backend;
 
 const BATCH: usize = 2;
 const SEQ: usize = 32;
-const STEPS: usize = 4;
+/// 8 steps, so the graphed arm captures once and REPLAYS 7 — a single replay
+/// would satisfy `replays >= 1` while proving nothing about repeatability, and
+/// gate 3's claim is about N of them.
+const STEPS: usize = 8;
 
 fn device() -> burn::tensor::Device {
     burn::tensor::Device::cuda(0).autodiff()
@@ -224,34 +227,66 @@ fn opt_borrowing(
     grads: &burn::tensor::Gradients,
 ) -> DormouseModelT {
     let g = graph::grads_params(grads, &model);
+    println!("opt_borrowing: registered {} gradient tensors", g.len());
     optim.step(lr, model, g)
 }
 
-/// Both arms, same data, same optimizer: N ungraphed steps.
-fn run_software(steps: usize) -> HashMap<String, Tensor<1>> {
+/// Two models with IDENTICAL values, for the two arms of a differential.
+///
+/// **`build()` twice is not the same model.** `Device::seed` does not rewind a
+/// consumed stream, so two builds in one process draw different weights — 36 of
+/// 54 parameters differ at `small`, and the withdrawn claim in AGENTS §3.7 is
+/// exactly this. The first version of this file called `build()` inside
+/// `run_software` and again inside `run_graphed`, so every differential it
+/// reported was dominated by initialisation, not by the arm: the "graphed vs
+/// software" 1.98e0 and the "unpinned diverges" 3.96e0 are both the magnitude
+/// of two random draws of the same config. Neither number meant what its gate
+/// said, and the negative gate would have gone green on a graph that was never
+/// used.
+///
+/// `clone` copies the parameter VALUES; `fork` would re-randomise. The arms must
+/// start from the same weights, so it is `clone`.
+fn build_pair() -> (DormouseModelT, DormouseModelT) {
+    let (model, _t) = build();
+    let copy = model.clone();
+    (model, copy)
+}
+
+/// N ungraphed steps from `model`, returning the parameters after the first step
+/// and at the end — the movement pair, so a caller can ask "did it train?"
+/// without assuming it.
+fn run_software(model: DormouseModelT, steps: usize) -> (HashMap<String, Tensor<1>>, HashMap<String, Tensor<1>>) {
     let dev = device();
-    let (mut model, _t) = build();
+    let mut model = model;
     let mut optim = AdamWConfig::new().init();
+    let mut after_first: Option<HashMap<String, Tensor<1>>> = None;
     for step in 0..steps {
         let (x, y, h) = batch(step, &dev);
         let grads = window(&model, None, x, y, Some(h));
         model = opt_consuming(&mut optim, 1e-3, model, grads);
+        if step == 0 {
+            after_first = Some(params(&model).0);
+        }
     }
-    params(&model).0
+    (after_first.expect("step 0 ran"), params(&model).0)
 }
 
 /// The graphed arm, with the pin. `pin` = false is the negative control.
-fn run_graphed(steps: usize, pin: bool) -> (HashMap<String, Tensor<1>>, Seam) {
+fn run_graphed(
+    model: DormouseModelT,
+    steps: usize,
+    pin: bool,
+) -> (HashMap<String, Tensor<1>>, HashMap<String, Tensor<1>>, Seam) {
     let dev = device();
-    let (mut model, teacher) = build();
+    let mut model = model;
     let mut optim = AdamWConfig::new().init();
     let mut seam = Seam::new(dormouse_train::cubecl_client_opt(&dev));
     if pin {
-        let (m, t) = seam.arm(model, teacher);
+        let (m, _t) = seam.arm(model, None);
         model = m;
-        let _ = t;
     }
     let mut pins: Option<InputPins> = None;
+    let mut after_first: Option<HashMap<String, Tensor<1>>> = None;
     // The batch the pin copies FROM must live on the plain device: the copy
     // kernel needs a raw handle on both sides, and an autodiff-context tensor
     // has none (`graph::InputPins`'s doc says why).
@@ -263,11 +298,18 @@ fn run_graphed(steps: usize, pin: bool) -> (HashMap<String, Tensor<1>>, Seam) {
         } else {
             (x, y, Some(h))
         };
-        // Step 0 and every odd step run ungraphed; the even ones replay, so a
-        // graph that replayed a step it should not have is caught by the
-        // differential, and a graph that never captured is caught by the
-        // counter assertion below.
-        let ungraphed = step % 2 == 0;
+        // Step 0 runs ungraphed, every step after it is GRAPHED (capture on the
+        // first, replays after). `ungraphed = true` means "run fresh launches",
+        // so the flag is the INVERSE of what the comment used to say: the first
+        // version passed `step % 2 == 0`, which marked every EVEN step — the
+        // half the test called the replaying half — as ungraphed. The gate
+        // reported `captured 1 replayed 0` and two "replayed" steps cost 7 559
+        // launches, which is the same shape as a graph that was never used.
+        // Alternating also destroys the graph on every ungraphed step
+        // (`Seam::step` sets `self.graph = None`), so a 50/50 cadence can never
+        // replay anything at all — the trainer's own cadence is ~99% graphed
+        // (`lib.rs:1294`), and this now matches it.
+        let ungraphed = step == 0;
         seam.step(ungraphed, || window(&model, None, x.clone(), y.clone(), h.clone()))
             .expect("seam step");
         if pin {
@@ -284,8 +326,11 @@ fn run_graphed(steps: usize, pin: bool) -> (HashMap<String, Tensor<1>>, Seam) {
             let grads = seam.grads().expect("the window ran");
             model = opt_borrowing(&mut optim, 1e-3, model, grads);
         }
+        if step == 0 {
+            after_first = Some(params(&model).0);
+        }
     }
-    (params(&model).0, seam)
+    (after_first.expect("step 0 ran"), params(&model).0, seam)
 }
 
 /// The largest relative difference between two parameter sets, and where it is.
@@ -338,8 +383,9 @@ fn dumpsum(p: &HashMap<String, Tensor<1>>, dev: &burn::tensor::Device) -> f32 {
 #[test]
 fn a_pinned_replay_agrees_with_fresh_launches_to_f32_noise() {
     let dev = device();
-    let (got, seam) = run_graphed(STEPS, true);
-    let want = run_software(STEPS);
+    let (graphed_model, software_model) = build_pair();
+    let (_first_g, got, seam) = run_graphed(graphed_model, STEPS, true);
+    let (_first_s, want) = run_software(software_model, STEPS);
 
     assert!(
         seam.stats.captures > 0,
@@ -351,11 +397,17 @@ fn a_pinned_replay_agrees_with_fresh_launches_to_f32_noise() {
         "nothing was replayed, so the arms never diverged in the first place: {}",
         seam.report()
     );
+    // A guard against the gate passing on two models that are both trivially
+    // zero (an empty comparison is not agreement), and against the failure the
+    // first version of this file had for four runs: two models that never
+    // trained, whose difference is only their initialisation.
+    let mass = dumpsum(&want, &dev);
+    assert!(mass > 0.0, "the comparison is vacuous: every parameter is zero");
 
     let (worst, key) = worst_diff(&got, &want, &dev);
     println!(
-        "graphed {STEPS} steps vs software {STEPS}: worst relative parameter difference \
-         {worst:.3e} at {key}; {}",
+        "graphed {STEPS} steps vs software {STEPS} from the SAME weights: worst relative \
+         parameter difference {worst:.3e} at {key}; {}",
         seam.report()
     );
     assert!(
@@ -364,10 +416,6 @@ fn a_pinned_replay_agrees_with_fresh_launches_to_f32_noise() {
          {worst:.3e} at {key}. Above 1e-5 means the window read a stale buffer — a pin that \
          covers the wrong tensor, an unpinned input, or a replay of the wrong step."
     );
-    // A guard against the gate passing on two models that are both trivially
-    // zero (an empty comparison is not agreement).
-    let mass = dumpsum(&want, &dev);
-    assert!(mass > 0.0, "the comparison is vacuous: every parameter is zero");
 }
 
 /// Gate 1: the negative. WITHOUT the pin, a graph replayed every other step must
@@ -380,8 +428,9 @@ fn a_pinned_replay_agrees_with_fresh_launches_to_f32_noise() {
 #[test]
 fn the_stale_pointer_trap_is_reproduced_without_the_pin() {
     let dev = device();
-    let (unpinned, _) = run_graphed(STEPS, false);
-    let want = run_software(STEPS);
+    let (graphed_model, software_model) = build_pair();
+    let (unpinned_first, unpinned, _seam) = run_graphed(graphed_model, STEPS, false);
+    let (_first_s, want) = run_software(software_model, STEPS);
     let (worst, key) = worst_diff(&unpinned, &want, &dev);
     println!(
         "WITHOUT the pin: worst relative difference {worst:.3e} at {key} \
@@ -394,52 +443,98 @@ fn the_stale_pointer_trap_is_reproduced_without_the_pin() {
          is unnecessary and this whole file's premise is wrong. Print this number before \
          believing the pin is required."
     );
+    // Both arms start from the same weights and both must be shown to be
+    // TRAINING, or "the arms disagree" is only "the arms are different models":
+    // that is what this gate measured for its first four runs, when each arm
+    // called `build()` and drew its own random initialisation.
+    let (moved, moved_key) = worst_diff(&unpinned, &unpinned_first, &dev);
+    println!("the unpinned arm moved {moved:.3e} from its own first step, at {moved_key}");
+    assert!(
+        moved > 0.0,
+        "the unpinned arm did not train either, so its disagreement above is not evidence about \
+         stale pointers: it is a model that never moved."
+    );
+    let (soft_moved, _) = worst_diff(&want, &_first_s, &dev);
+    println!("the software arm moved {soft_moved:.3e} from its own first step");
+    assert!(
+        soft_moved > 0.0,
+        "the software arm did not train, so nothing in this file is a differential."
+    );
 }
 
-/// Gate 3: bit-exactness across replays. Same seed, same data, graph on every
-/// step: if the model is not bit-identical at the end as it was after the first
-/// capture, something in the window is racing (the `burn-spectral` class).
+/// The graphed arm, run end to end, returning the parameters after the capture
+/// step, the final parameters, and the seam — the same arm as
+/// `run_graphed(_, STEPS, true)`, kept under the name the gate reads best.
+///
+/// The parameters are read TWICE — after the first step and at the end — because
+/// the only sound "did it train?" baseline is the run's OWN first step. A second
+/// `build()` is not: two models built in one process do not share an initializer
+/// (AGENTS §3.7, `two_models_one_seed_are_bit_identical` — 36 of 54 parameters
+/// differ), so comparing against a fresh build reports "movement" for a run that
+/// never moved a weight.
+fn run_replayed(model: DormouseModelT) -> (HashMap<String, Tensor<1>>, HashMap<String, Tensor<1>>, Seam) {
+    run_graphed(model, STEPS, true)
+}
+
+/// Gate 3, in two halves, because the first version of it was a false green.
+///
+/// **What it claimed:** "after N replays the parameters must be BIT-IDENTICAL to
+/// the capture step's". That is not a property of a correct graph — the
+/// optimizer runs OUTSIDE the window and moves every parameter on every step,
+/// so a correct graphed run *must* differ from its own first step. The first
+/// version of this gate therefore went green at exactly `0.0` on a run in which
+/// **nothing trained at all**: `worst == 0.0` was the signature of a frozen
+/// parameter set, and the assert could not tell that from determinism. It is the
+/// `8fa5d4c` shape pointed the other way — a gate that passes for a reason
+/// opposite to the one it names.
+///
+/// **What it claims now, and both halves are needed:**
+/// 1. the graphed arm actually TRAINS — the parameters move away from its own
+///    first step (this is the half the first version got backwards), and
+/// 2. two identical graphed runs end BIT-IDENTICAL — replay is deterministic,
+///    which is the `burn-spectral` race class this was written for
+///    (`lib.rs:697-714`).
 #[test]
-fn replays_are_bit_identical_to_the_first_replay() {
+fn replays_train_and_are_reproducible() {
     let dev = device();
-    // Capture once, then replay: no ungraphed step at all after the capture.
-    let (mut model, _t) = build();
-    let mut optim = AdamWConfig::new().init();
-    let mut seam = Seam::new(dormouse_train::cubecl_client_opt(&dev));
-    let (m, t) = seam.arm(model, None);
-    model = m;
-    let _ = t;
-    let mut pins: Option<InputPins> = None;
-    let mut after_first: Option<HashMap<String, Tensor<1>>> = None;
-    for step in 0..STEPS {
-        let (x, y, h) = batch(step, &dev);
-        let (x, y, h) = {
-            let p = pins.get_or_insert_with(|| InputPins::new(&x, &y, Some(&h)));
-            p.feed(&x, &y, Some(&h)).expect("pin feeds")
-        };
-        seam.step(step > 0, || window(&model, None, x.clone(), y.clone(), h.clone()))
-            .expect("seam step");
-        let grads = seam.grads().expect("the window ran");
-        model = opt_borrowing(&mut optim, 1e-3, model, grads);
-        let (m, r) = seam.refresh(model, false);
-        model = m;
-        r.expect("pin holds");
-        if step == 0 {
-            after_first = Some(params(&model).0);
-        }
-    }
-    let first = after_first.expect("step 0 ran");
-    assert!(seam.stats.replays >= 1, "{}", seam.report());
-    let (final_params, _) = params(&model);
-    let (worst, key) = worst_diff(&final_params, &first, &dev);
-    let replays = STEPS - 1;
-    println!("{replays} replays vs the first: worst relative difference {worst:.3e} at {key}");
+    let (model_a, model_b) = build_pair();
+    let (first_a, final_a, seam_a) = run_replayed(model_a);
+    let (_first_b, final_b, seam_b) = run_replayed(model_b);
+
+    assert!(
+        seam_a.stats.replays >= 1 && seam_b.stats.replays >= 1,
+        "nothing was replayed, so this gate proved nothing: {} / {}",
+        seam_a.report(),
+        seam_b.report()
+    );
+
+    // (1) it trains. The optimizer runs outside the window, so a correct graphed
+    // run MUST end 7 updates away from its own capture step. Exactly 0.0 here
+    // means the optimizer never saw a gradient.
+    let mass = dumpsum(&final_a, &dev);
+    assert!(mass > 0.0, "the comparison is vacuous: every parameter is zero");
+    let (moved, moved_key) = worst_diff(&final_a, &first_a, &dev);
+    println!(
+        "{STEPS} graphed steps vs the run's own capture step: worst relative movement \
+         {moved:.3e} at {moved_key}; {}",
+        seam_a.report()
+    );
+    assert!(
+        moved > 0.0,
+        "a graphed arm whose parameters did not move has not trained: the optimizer saw no \
+         gradients, or the replay does not rewrite the buffers the capture step wrote. The \
+         parameters are bit-identical to the capture step's."
+    );
+
+    // (2) it is reproducible. Same seed, same data, same graph → same numbers.
+    let (drift, key) = worst_diff(&final_a, &final_b, &dev);
+    println!("two identical graphed runs: worst relative difference {drift:.3e} at {key}");
     assert_eq!(
-        worst, 0.0,
-        "a replay re-runs the recorded kernels against the same buffers, so the parameters after \
-         {replays} further steps must be BIT-IDENTICAL to the capture step's. A non-zero \
-         difference is a race inside the window (or a pin that did not hold) — the class \
-         `burn-spectral` documents at lib.rs:697-714."
+        drift, 0.0,
+        "two identical graphed runs ended {drift:.3e} apart at {key}. A replay re-runs the \
+         recorded kernels against the same buffers, so a nonzero difference is a race inside \
+         the window (or a pin that did not hold) — the class `burn-spectral` documents at \
+         lib.rs:697-714."
     );
 }
 
@@ -465,7 +560,10 @@ fn a_replay_launches_no_kernels() {
             let p = pins.get_or_insert_with(|| InputPins::new(&x, &y, Some(&h)));
             p.feed(&x, &y, Some(&h)).expect("pin feeds")
         };
-        seam.step(step > 0, || window(&model, None, x.clone(), y.clone(), h.clone()))
+        // Step 0 captures, steps 1-2 replay: `ungraphed` is "run fresh", so
+        // `step == 0` and not `step > 0` (the first version ran all three steps
+        // fresh and the two "replays" it then measured cost 7 559 launches).
+        seam.step(step == 0, || window(&model, None, x.clone(), y.clone(), h.clone()))
             .expect("seam step");
         let grads = seam.grads().expect("the window ran");
         model = opt_borrowing(&mut optim, 1e-3, model, grads);
@@ -485,7 +583,11 @@ fn a_replay_launches_no_kernels() {
             let p = pins.as_mut().expect("pinned");
             p.feed(&x, &y, Some(&h)).expect("pin feeds")
         };
-        seam.step(step > 0, || window(&model, None, x.clone(), y.clone(), h.clone()))
+        // REPLAY, which is the point of the measurement: `ungraphed` is false.
+        // The first version passed `step > 0` (true), so this loop measured two
+        // more fresh steps and the 7 559 it reported was the window's own launch
+        // count, not a replay's.
+        seam.step(false, || window(&model, None, x.clone(), y.clone(), h.clone()))
             .expect("seam step");
     }
     let after = dormouse_train::cubecl_launches();

@@ -110,6 +110,14 @@ impl Master {
     /// the enum arm fixes ONE rank while the caller's `D` is only known as a
     /// type parameter. Matching them inside the arm is what makes this four
     /// monomorphic calls instead of four mismatched-type errors.
+    ///
+    /// **Both sides go through [`as_constant_float`], not just the source.** The
+    /// master was built once at `Arm` time from the live parameter, so its own
+    /// kind is `DispatchTensorKind::Autodiff(..)` just like the parameter's, and
+    /// `try_into_primitive` refuses it with
+    /// `KindMismatch("Expected Float primitive, got variant: Autodiff")`. That
+    /// is what the first float-pin run said, with the source already unwrapped:
+    /// the fix had been applied to one side of a two-sided copy.
     fn put(&self, now: &dyn Any) -> Result<(), String> {
         macro_rules! arm {
             ($t:ty, $v:expr) => {{
@@ -117,7 +125,7 @@ impl Master {
                     (now as &dyn Any).downcast_ref::<$t>(),
                     ($v as &dyn Any).downcast_ref::<$t>(),
                 ) {
-                    (Some(a), Some(b)) => copy_into(a, b),
+                    (Some(a), Some(b)) => copy_into(&as_constant_float(a), &as_constant_float(b)),
                     _ => Err("master and parameter are not the same rank".into()),
                 }
             }};
@@ -327,20 +335,47 @@ const MAX_REFUSALS: u64 = 20;
 /// tensor is never fed back into a burn op, only to a raw kernel that copies the
 /// same bytes. If a future burn makes the field private this stops compiling,
 /// loudly, which is the right way to find out.
+///
+/// The unwraps below are a read of burn's type, not a trick: they take the
+/// handle out of the two enums that wrap it and put the SAME handle back in the
+/// variant a float belongs in. The buffer, its address and its contents are
+/// untouched — `into_primitive` moves the `CubeTensor` out and hands it straight
+/// back.
 fn as_constant_float<const D: usize>(t: &Tensor<D>) -> Tensor<D> {
     // Destructured and rebuilt, not mutated in place: the `kind` arm MOVES out
     // of the enum, so the struct is partially moved by the time
     // `from_dispatch` wants it whole.
     let burn_dispatch::DispatchTensor { kind, mut autodiff } = t.clone().into_dispatch();
     autodiff = burn_dispatch::DispatchAutodiffContext::Disabled;
-    // AND unwrap the autodiff BOX: `DispatchTensorKind::Autodiff(Box<Kind>)`,
-    // so a tracked float sits two levels above the concrete `Cube` variant that
-    // `try_into_backend` matches on. An Int tensor is already `Cube` (ints do
-    // not track), which is why `as_constant_int` has no unwrap to do - and why
-    // the Int half of the pin worked while the float half did not: the same
-    // call, one green and one red.
+    // TWO nested unwraps, and the first version of this did one of them and
+    // still failed, which is what the gate history in the review records. A
+    // tracked float is `Autodiff(Box<Kind>)` — and what is INSIDE the box is
+    // `Cube(BackendTensor<Cube>)`, whose `BackendTensor` is ITSELF an enum with
+    // an `Autodiff` variant. So a tracked float is three enums deep:
+    //
+    //   Autodiff(Box<Autodiff>)   <- DispatchTensorKind, the box
+    //     -> Cube(BackendTensor::Autodiff(FloatTensor<Autodiff<Cube>>))
+    //                                     <- BackendTensor, a second enum
+    //
+    // and `try_into_primitive` matches on the INNERMOST one, refusing anything
+    // that is not `BackendTensor::Float`
+    // (`burn-tensor/src/tensor/api/extension.rs:167`). Unwrapping only the box
+    // leaves `BackendTensor::Autodiff` and the error is exactly
+    // `KindMismatch("Expected Float primitive, got variant: Autodiff")` —
+    // the message the run reported. An Int tensor is `BackendTensor::Int` at
+    // the innermost level already (ints do not track), which is why
+    // `as_constant_int` has nothing to unwrap and the Int half of the pin was
+    // green while the float half was red: the same call, two answers.
     let kind = match kind {
         burn_dispatch::DispatchTensorKind::Autodiff(inner) => *inner,
+        other => return Tensor::from_dispatch(burn_dispatch::DispatchTensor { kind: other, autodiff }),
+    };
+    let kind = match kind {
+        burn_dispatch::DispatchTensorKind::Cube(burn_dispatch::BackendTensor::Autodiff(f)) => {
+            burn_dispatch::DispatchTensorKind::Cube(burn_dispatch::BackendTensor::Float(
+                f.into_primitive(),
+            ))
+        }
         other => other,
     };
     Tensor::from_dispatch(burn_dispatch::DispatchTensor { kind, autodiff })
