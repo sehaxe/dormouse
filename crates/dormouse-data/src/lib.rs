@@ -1,18 +1,66 @@
 //! dormouse-data - streaming byte dataset.
 //!
-//! `ByteStream` is a bounded-memory, file-order-shuffled stream of raw bytes
+//! [`ByteStream`] is a bounded-memory, file-order-shuffled stream of raw bytes
 //! for next-byte-language-model pretraining, plus FNV n-gram hashes used by the
 //! Engram memory. A deterministic train/eval file split is exposed so training
 //! can report held-out perplexity.
 //!
-//! Design notes:
+//! # Design notes
+//!
 //! - Files are read incrementally in chunks; bytes live in a ring buffer that
 //!   is compacted after each batch, so memory stays bounded regardless of
 //!   dataset size (the previous implementation slurped whole files into an
 //!   ever-growing buffer).
 //! - File order is shuffled with a seeded Fisher-Yates (no external RNG dep);
 //!   the order is reshuffled every epoch for cheap cross-epoch diversity.
-//! - `train_eval_split` returns a stable held-out tail so eval sees unseen data.
+//! - [`train_eval_split`] returns a stable held-out tail so eval sees unseen
+//!   data.
+//!
+//! # The contracts a caller must not break
+//!
+//! This crate is where "the bytes the model trains on" is decided, and every
+//! interesting bug in this project's history that was NOT about the model was
+//! about this crate. Four rules, each of which exists because breaking it is
+//! silent:
+//!
+//! * **One definition of the file set, one definition of the bytes.**
+//!   [`collect_files`] and [`read_bytes`] exist so a second reader of the same
+//!   directory cannot disagree by construction — the anchors tool had its own
+//!   unfiltered walk, and on `real_eval/` (which holds a `eval_tail.bin.30m.bak`)
+//!   it reported "2 files" and would have folded a 30 MB pre-carve backup into a
+//!   measurement whose trainer-side stream sees one.
+//! * **A read ERROR is not an EOF.** Treating one as the other ends a file
+//!   early and the caller measures a corpus shorter than the one it asked for,
+//!   with no sign of it (ADR-0019). Every failure to open or read a shard is
+//!   COUNTED on stderr and named by path.
+//! * **Nothing is synthesized.** The parquet decoder walks the column TREE by
+//!   data type and reads only string-typed columns; a numeric column is never
+//!   cast to text. It recurses, because the decoder it replaced downcast the
+//!   top-level columns to `StringArray` and dropped everything else with no
+//!   counter — `mix/qa` gave up 2 534 708 673 B on disk and 283 KB to the
+//!   loader (0.011%: the `id` column, the only top-level string) and the run
+//!   trained on ids while reporting a confident loss curve.
+//! * **The eval tree must not be reachable from the training tree.**
+//!   [`ByteStream::train_and_eval`] refuses that by name, because
+//!   [`collect_files`] recurses: `--data` at the parent of the eval directory
+//!   collects the eval bytes as training data and every held-out number the run
+//!   prints is optimistic by an unmeasured amount (ADR-0010).
+//!
+//! # Cost, in one paragraph
+//!
+//! A 64 MB ring refilled in 8 MB chunks touches the disk about once per 10k
+//! steps instead of once per step, because the backing store may be an idle
+//! drive whose first read costs ~200 ms and 4 KB reads would starve the GPU.
+//! Everything else in the hot path is a memcpy: `next_batch` hands back
+//! `batch * seq_len` bytes and one FNV pass over them.
+//!
+//! # Gate
+//!
+//! `#![warn(missing_docs)]` and `#![warn(rustdoc::broken_intra_doc_links)]` are
+//! on, and `RUSTFLAGS="-D warnings" cargo doc --no-deps -p dormouse-core -p
+//! dormouse-data` is green.
+#![warn(missing_docs)]
+#![warn(rustdoc::broken_intra_doc_links)]
 
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -20,6 +68,14 @@ use std::path::{Path, PathBuf};
 use arrow::array::Array;
 use arrow::datatypes::DataType;
 
+/// FNV-1a 64-bit digest. The primitive under [`raw_keys`].
+///
+/// Public because the shard router in `bin/shard.rs` routes documents by
+/// `FNV(doc)` and must agree with it, and because a reader comparing the two
+/// derivations needs to see the offsets. **It is not the memory key**: the
+/// keys are [`raw_keys`]' low 31 bits, and the trainer's decode seam goes
+/// through [`raw_keys`] for exactly that reason — a second copy of the key
+/// derivation is a key the model was never trained on.
 pub fn fnv(b: &[u8]) -> u64 {
     let mut h = 1469598103934665603u64;
     for &x in b {
@@ -39,7 +95,7 @@ pub fn fnv(b: &[u8]) -> u64 {
 /// 3-gram key space 2750x over) and n=5/n=8 were ~5775-way averages, i.e.
 /// 512M parameters carrying no more information than the mean of their
 /// members. It is DeepSeek's own shipped set over compressed tokens
-/// (V4.1-Flash n in {2,3,4}; Engram-27B \[2,3\]) and the deepest order whose
+/// (V4.1-Flash n in 2,3,4; Engram-27B 2,3) and the deepest order whose
 /// key space (256^4 = 4.3e9) a 46 GB byte corpus can still populate.
 pub const ORDERS: [usize; 3] = [2, 3, 4];
 
@@ -146,16 +202,64 @@ pub fn train_eval_split(root: &Path, eval_frac: f64) -> (Vec<PathBuf>, Vec<PathB
     (files, eval)
 }
 
+/// A bounded-memory stream of raw bytes, reshuffled per epoch.
+///
+/// # The three guarantees a caller depends on
+///
+/// 1. **Bounded memory.** A 64 MB ring, refilled in 8 MB chunks and compacted
+///    once its consumed prefix passes half. Memory does not depend on corpus
+///    size, which is what lets a 46 GB corpus train on a 16 GB card.
+/// 2. **A resume does not re-read.** [`Self::skip_bytes`] fast-forwards exactly
+///    (`n` bytes consumed, nothing skipped twice, nothing lost), and a skip that
+///    runs off the end of the corpus is LOUD rather than short — the pretrain-v2
+///    collapse was a `break` here that resumed a run at the head of the corpus
+///    it had already trained on, with nothing in the log.
+/// 3. **Eval sees the same window every time**, via [`Self::rewind`]. Without it
+///    every eval call reads the NEXT slice: one checkpoint scored 6.443 on one
+///    pass and 6.551 on the next, purely from stream position, which makes every
+///    cross-run comparison noise. The guarantee is void once the ring has
+///    dropped its head (`drained`), and `rewind` refuses rather than silently
+///    scoring a different window.
+///
+/// # Failure modes, all loud
+///
+/// No readable files under the root; a corpus smaller than `4 * batch *
+/// seq_len` bytes; a read that fails mid-stream (a read ERROR is not an EOF);
+/// a ring that cannot be filled without wrapping into the next epoch; a short
+/// read of one batch. Every one of them names the cause.
 pub struct ByteStream {
+    /// Positions per row of a batch, in BYTES. The vocabulary is bytes, so a
+    /// "position" is a byte and every sequence length in this crate is a byte
+    /// count.
     seq_len: usize,
+    /// Rows per batch. Multiplies `seq_len` into every batch size and every
+    /// minimum-corpus check.
     batch: usize,
+    /// The shuffled file list. Reshuffled in place at every epoch boundary,
+    /// seeded by `seed + epoch * GOLDEN`, so epoch N's order is a function of
+    /// the seed and the epoch index — not of how many bytes were read.
     files: Vec<PathBuf>,
+    /// Index into `files` of the shard currently open or next to open.
     file_idx: usize,
+    /// The open shard, or `None` between files. `None` is what makes
+    /// `ensure_reader` re-open (and re-say so) on the next refill.
     reader: Option<Source>,
+    /// The ring: 64 MB of bytes, of which `buf[pos..]` is unread.
     buf: Vec<u8>,
+    /// Read cursor into `buf`. Reset to 0 by compaction, by [`Self::rewind`],
+    /// and by [`Self::skip_bytes`]'s drain — the three places the consumed
+    /// prefix can leave the ring.
     pos: usize,
+    /// Ring capacity, 64 MB, fixed at construction. The compaction threshold
+    /// is `capacity / 2`.
     capacity: usize,
+    /// The shuffle seed, kept so epoch N can derive its own without threading
+    /// a counter through the shuffle.
     seed: u64,
+    /// How many times the file list has been exhausted and restarted. Also the
+    /// tripwire for "a refill wanted more bytes than the corpus had": wrapping
+    /// during a refill is the pretrain-v2 collapse and it panics rather than
+    /// serving the corpus again.
     epoch: u64,
     /// Set by the two places that drop the ring's consumed prefix
     /// ([`Self::next_bytes`] and [`Self::skip_bytes`]); after that a rewind()

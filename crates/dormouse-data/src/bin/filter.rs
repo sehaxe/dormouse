@@ -40,29 +40,64 @@ use std::time::Instant;
 const FT_MAGIC: i32 = 793712314;
 const FT_VERSION: i32 = 12;
 
+/// The `Args` block of a fastText `.bin`: 13 i32 fields plus a trailing
+/// `f64` (subword sampling threshold), in the file's exact order. Transcribed
+/// from `fasttext.cc::saveModel`/`Args::save`, and read back verbatim rather
+/// than interpreted — inference needs only `dim`, `bucket`, `minn`, `maxn`,
+/// `word_ngrams` and `model`; the rest exist because the layout requires them.
 #[derive(Debug, Clone, Copy)]
 pub struct FtArgs {
+    /// Embedding width. Rows `0..dim` of `input` are the word vectors.
     pub dim: i32,
+    /// Context window size for word n-grams (unused by inference).
     pub ws: i32,
+    /// Training epochs (unused by inference).
     pub epoch: i32,
+    /// Training min-count (unused by inference).
     pub min_count: i32,
+    /// Negative samples (unused by inference).
     pub neg: i32,
+    /// Max `n` in word n-grams. `> 1` means hashed word n-grams contribute to
+    /// the hidden vector, so inference must add them.
     pub word_ngrams: i32,
+    /// 0 = softmax, 1 = hs, 2 = ns, 3 = ova. Decides the output nonlinearity.
     pub loss: i32,
+    /// 0 = cbow, 1 = sg, 2 = sup. `2` is the classification model DCLM ships.
     pub model: i32,
+    /// Hash bucket count for n-grams: the input matrix has `nwords + bucket`
+    /// rows.
     pub bucket: i32,
+    /// Min length of a character n-gram. `0` disables them.
     pub minn: i32,
+    /// Max length of a character n-gram. `0` disables them.
     pub maxn: i32,
+    /// Learning-rate schedule (unused by inference).
     pub lr_update_rate: i32,
+    /// Subword sampling threshold. The ONLY `f64` in the block, which is why
+    /// the layout is 13 i32 then one f64 rather than 14 i32.
     pub t: f64,
 }
 
+/// A loaded fastText classifier, in the file's own layout.
+///
+/// The matrices are plain `Vec<f32>` rather than a tensor type: this is a
+/// std-only binary, the whole model is read once, and a `Vec` row-slice is
+/// what the scoring loop wants. There is no BLAS here and no pretence of one —
+/// one document at a time, batch 1.
 pub struct FtModel {
+    /// The `Args` block, kept because the scoring path reads `dim`, `bucket`,
+    /// `word_ngrams`, `minn`/`maxn` and `model` from it.
     pub args: FtArgs,
     /// (word bytes, count, type) per dictionary entry; type 0 = word, 1 = label.
     pub words: Vec<(Vec<u8>, i64, u8)>,
+    /// Word bytes -> entry index. A SEPARATE hash from fastText's, on purpose:
+    /// the file's own `word2int_` is only consulted for pruning (`prune_size`
+    /// above); scoring needs a full lookup and fastText's signed-FNV hash is
+    /// the thing being reproduced elsewhere, so this map is exact.
     pub word2id: HashMap<Vec<u8>, i32>,
+    /// Number of word entries. Input-matrix rows `[0, nwords)` are vocabulary.
     pub nwords: i32,
+    /// Number of labels. Output-matrix rows, one per `__label__*`.
     pub nlabels: i32,
     /// pruneidx_size_ from the file (-1 = never pruned).
     prune_size: i64,
@@ -77,8 +112,19 @@ pub struct FtModel {
     subwords: Vec<Vec<i32>>,
 }
 
+/// Why a `.bin` would not load. Two kinds because they call for different
+/// responses: `Io` is a path/permission problem, `Format` means the file is
+/// not a dense fastText model this reader understands (wrong magic, a version
+/// above [`FT_VERSION`], a quantized matrix, truncated).
+///
+/// Deliberately NOT a silent fallback: a classifier that fails to load must
+/// stop the filter, because a filter that ran with no classifier is a corpus
+/// nobody filtered — and the corpus looks the same on disk afterwards.
 pub enum LoadError {
+    /// The file could not be opened or read: the message is the OS error.
     Io(String),
+    /// The file opened but is not a model this reader understands: the message
+    /// names the field or the value that did not match.
     Format(String),
 }
 
@@ -130,6 +176,17 @@ impl<R: Read> Cursor<R> {
 }
 
 impl FtModel {
+    /// Read a dense fastText `.bin` from `path`.
+    ///
+    /// LOUD on every failure mode this reader can detect: magic mismatch (with
+    /// the expected value in the message), a version above [`FT_VERSION`], a
+    /// quantized input matrix (`quant_ = true` — quantized `.ftz` models are
+    /// REFUSED, not approximated), and any truncation, which surfaces as an
+    /// `Io` from `read_exact`.
+    ///
+    /// One model at a time, read whole. There is no streaming variant and no
+    /// partial load: a half-read model would score documents against a
+    /// truncated output matrix, which is a confident wrong number.
     pub fn load(path: &str) -> Result<FtModel, LoadError> {
         let f = File::open(path).map_err(|e| LoadError::Format(format!("open {path}: {e}")))?;
         let mut c = Cursor { inner: BufReader::with_capacity(1 << 20, f) };
