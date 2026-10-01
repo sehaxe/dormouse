@@ -237,16 +237,16 @@ the file that says so is that one function.
   `vendor/dormouse-fused/crates/burn-gdn2/tests/lowp_bf16_cuda.rs`).
 - **f16 matmul is CORRECT but silently slow** (ADR-0016 bug 3) — it was reported
   as failing outright and is not. The answer matches fp32 to 1e-2, but the f16
-  **tensor-core** candidate dies at compile time with `Expected type
+  **tensor-core** candidate died at compile time with `Expected type
   builtin.fp16 to implement dyn SizedType` and the autotuner falls back to a
-  non-accelerated routine without a word. f16 is one interface short: pliron's
-  `builtin.fp16` implements `FloatTypeInterface` and not the `SizedType` that
-  `cubecl-opt`'s shared-memory sizing queries
-  (`vendor/dormouse-fused/crates/cubecl-opt/src/lib.rs:36-40`). The fix is ~10 lines
-  in **cubecl-ir** (impl `SizedType` for pliron's `FP16Type`, legal because the
-  trait is local) and belongs upstream; until it lands the 43.7 TFLOP/s cuBLAS f16
-  number (memory.md:17) is not reachable *through burn* — route it through cuBLAS
-  directly, as `crates/cublas-poc` does.
+  non-accelerated routine without a word. **The `SizedType` fix has since
+  LANDED in the vendored copy** (`cubecl-ir src/types/scalar.rs:240`, carried
+  by the root `[patch.crates-io]` — §2.5 says so; this section said "not
+  landed" until 2026-10-01, which contradicted §2.5). Whether the f16
+  tensor-core path now **compiles, is correct, and is fast through burn is
+  UNTESTED since the patch** — if it works, the 43.7 TFLOP/s cuBLAS-class f16
+  figure becomes reachable through burn instead of only through
+  `crates/cublas-poc`'s zero-copy route. Verify before any f16 claim.
 
 ## 2.2 Shapes and the allocator
 
