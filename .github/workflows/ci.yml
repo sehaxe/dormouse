@@ -126,3 +126,47 @@ jobs:
           arguments: --all-features
           manifest-path: ./Cargo.toml
           log-level: warn
+
+  # ── 3. unused-deps ─────────────────────────────────────────────────────────
+  # Dependencies declared in a manifest and referenced by no source line.
+  # The failure mode is not "dead code" — it is a manifest that lies about what
+  # the crate needs, so a dependency bump changes a build nobody re-tests.
+  #
+  # WARN-ONLY on landing: 10 findings in this repo's own crates, measured
+  # 2026-10-01 (`cargo machete crates/`), listed in
+  # docs/reviews/ci-quality-2026-10-01.md. Four of the six are cargo-machete's
+  # known blind spot, not real findings: `burn-tensor` / `burn-nn` /
+  # `burn-cuda` are reached through the `burn` facade re-export
+  # (`use burn::tensor::…`), which a literal grep for `burn_tensor` cannot see.
+  # `rand` in dormouse-core/dormouse-train is real — the `--rand-depth` arm
+  # lives in dormouse-train/src/cfg.rs and uses no RNG. The remaining three
+  # (`serde_json`, `dormouse-data`, `burn` in dormouse-cli) are real too and
+  # are a one-line deletion each.
+  #
+  # TO CLOSE: delete the three real entries in dormouse-cli, add
+  # `[package.metadata.cargo-machete] ignored = [...]` for the four facade
+  # re-exports with that reason, then drop `continue-on-error`.
+  unused-deps:
+    name: "unused deps :: cargo-machete, warn-only (10 findings in crates/, 4 of them facade false positives)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # 0.9.2 is the current release and the one this repo's findings were
+      # measured with (2026-10-01). `fallback: none` means the job FAILS if
+      # the prebuilt binary is unavailable rather than quietly compiling the
+      # tool from source - a version that drifts under a gate is the ADR-0019
+      # SILENT shape. The action verifies the release's SHA256.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-machete@0.9.2
+          fallback: none
+      # `crates/` not the repo root: bare `cargo machete` also walks
+      # vendor/burn-fused's 20 crates and their benches, which are a separate
+      # workspace with their own workflow.
+      - name: unused dependencies
+        continue-on-error: true
+        run: cargo machete crates/
