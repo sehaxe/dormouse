@@ -125,10 +125,17 @@ also vendors patched forks of five cubecl/cubek crates (the root
 
 ## Documentation
 
+**Every document lives under [`docs/`](docs/),** one directory per kind, one
+naming rule — [`docs/README.md`](docs/README.md) is the map and the only page
+you need to find anything. The repo root keeps four files: this one,
+[`AGENTS.md`](AGENTS.md) (the rulebook: how to work here, machine facts,
+measured status, retractions — read §1 before your first edit),
+[`CONTEXT.md`](CONTEXT.md) (the system map) and
+[`CONTRIBUTING.md`](CONTRIBUTING.md) (how to work here in practice).
+
 | document | what it is |
 |---|---|
-| [`AGENTS.md`](AGENTS.md) | **the rulebook**: how to work here, machine facts, measured status, retractions — read §1 before your first edit |
-| [`CONTEXT.md`](CONTEXT.md) | domain map and vocabulary |
+| [`docs/README.md`](docs/README.md) | **the map** — which directory a new document belongs in |
 | [`docs/glossary.md`](docs/glossary.md) | one term, one meaning (+ the list of doc-vs-code disagreements) |
 | [`docs/adr/`](docs/adr) | architecture decision records |
 | [`docs/protocols/`](docs/protocols) | A/B protocol, oracle tiers, verification rules |
@@ -138,9 +145,10 @@ also vendors patched forks of five cubecl/cubek crates (the root
 
 ## Contributing
 
-Read [`AGENTS.md`](AGENTS.md) §1 first — loud failures, A/B or death, zero
-host-device sync, one claim one evidence. PRs that change a number carry the
-number's provenance; PRs that add a mechanism carry the gate that can fail.
+[`CONTRIBUTING.md`](CONTRIBUTING.md) is the entry point: which command answers
+which question, the worktree and build-lock rules, and the four rules that have
+already cost a run. [`AGENTS.md`](AGENTS.md) §1 is the rulebook it defers to —
+loud failures, A/B or death, zero host-device sync, one claim one evidence.
 
 ## License
 

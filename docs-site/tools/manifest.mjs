@@ -232,6 +232,11 @@ export const pages = [
 	{ src: 'README.md', out: 'start-here/quick-start', slice: { from: /^## Quick start$/, to: /^## Architecture$/ }, title: 'Quick start' },
 	{ src: 'README.md', out: 'start-here/license', slice: { from: /^## License$/ }, title: 'License' },
 	{ src: 'AGENTS.md', out: 'start-here/agents', title: 'The agent rulebook', nav: 'The agent rulebook' },
+	// CONTRIBUTING.md is the practice-level companion to AGENTS.md §1: which
+	// command answers which question, and the worktree / build-lock rules. It
+	// defers to AGENTS.md for the rules themselves rather than restating them,
+	// so the two cannot drift into disagreeing.
+	{ src: 'CONTRIBUTING.md', out: 'start-here/contributing', title: 'Contributing: the commands', nav: 'Contributing' },
 	{ src: 'docs/architecture/PLAN.md', out: 'start-here/program-plan', title: 'Program plan' },
 	// The map of docs/ itself: where a new document goes and how it is named.
 	{ src: 'docs/README.md', out: 'start-here/docs-map', title: 'Where every document lives', nav: 'The docs map' },
