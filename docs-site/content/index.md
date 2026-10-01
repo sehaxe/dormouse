@@ -38,7 +38,7 @@ explains why this project is built that way.
 | if you want | go to |
 |---|---|
 | the current measured state, newest first | [Status](/start-here/status/) |
-| the one number that decides whether the model learned language | [Has any checkpoint beaten a 5-gram byte counter?](/archive/five-gram/) |
+| the one number that decides whether the model learned language | [AGENTS.md §2.6](https://github.com/sehaxe/dormouse/blob/main/AGENTS.md) — no held-out number in the archive beats a 5-gram counter |
 | to hold the system in your head | [The system map](/architecture/context/) |
 | the words, before anything else | [The glossary](/architecture/glossary/) |
 | to know what a claim in this repo is allowed to say | [Protocols](/protocols/) |

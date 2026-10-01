@@ -42,6 +42,15 @@ const html = [];
 
 // ── 1. internal links ────────────────────────────────────────────────────────
 
+// The deployment base, read from astro.config.mjs rather than hardcoded here.
+//
+// A GitHub Pages project site is served under /<repo>/, so every href Astro
+// emits carries that prefix. Stripping it before resolving against dist/ is what
+// makes this gate work under a base AND without one - the version before
+// `base` existed assumed no prefix and reported every internal link in the build
+// as broken the moment one was configured.
+const BASE = (/^\s*base:\s*'([^']*)'/m.exec(readFileSync(path.join(SITE, 'astro.config.mjs'), 'utf8')) ?? [])[1] ?? '';
+
 const idsOf = new Map(); // dist path -> Set of ids
 for (const file of html) {
 	const src = readFileSync(file, 'utf8');
@@ -65,12 +74,20 @@ for (const file of html) {
 		}
 		const [rel, frag] = url.split('#');
 		if (rel.startsWith('/')) {
+			// A root-absolute href that does NOT start with the configured base is
+			// a link that 404s in deployment, which is exactly what this gate is
+			// for. Report it rather than resolving it against the wrong root.
+			if (BASE && !rel.startsWith(`${BASE}/`) && rel !== BASE) {
+				broken.push(`${path.relative(DIST, file)} -> ${url}`);
+				continue;
+			}
+			const inSite = BASE ? rel.slice(BASE.length) || '/' : rel;
 			checked++;
 			// Starlight serves the custom 404 from the built-in /404 route, which
 			// emits dist/404.html — there is no /404/index.html.
 			const target = path.join(
 				DIST,
-				rel === '/404/' || rel === '/404' ? '404.html' : rel.endsWith('/') ? `${rel}index.html` : rel,
+				inSite === '/404/' || inSite === '/404' ? '404.html' : inSite.endsWith('/') ? `${inSite}index.html` : inSite,
 			);
 			if (!existsSync(target)) {
 				broken.push(`${path.relative(DIST, file)} -> ${url}`);
@@ -85,9 +102,14 @@ for (const file of html) {
 
 // ── 2. content spot-checks, one per section ─────────────────────────────────
 
+// Each case names a module, a URL and a string that can only be there if the
+// ingest step ran on the right canonical file. Three moved with the docs
+// consolidation (2026-10-01) and two changed source: the status page is now
+// README's "## Results" slice, and the archive registers are slices of AGENTS.md
+// §3.2/§3.3 because the front-page README no longer carries them.
 const CASES = [
 	['landing', 'index.html', 'A knowledge base with a retraction policy'],
-	['start-here', 'start-here/status/index.html', 'STATUS'],
+	['start-here', 'start-here/status/index.html', 'Held-out BPB'],
 	['architecture', 'architecture/model/index.html', 'LoopBlock'],
 	['protocols', 'protocols/ab-protocol/index.html', 'A/B protocol'],
 	['adr', 'adr/0011-loud-failures/index.html', 'P10 Rule 5'],
@@ -95,10 +117,14 @@ const CASES = [
 	['reviews', 'reviews/ab-wave-2026-10-01/index.html', 'A/B seed wave'],
 	['tooling', 'tooling/wt/index.html', 'worktree'],
 	['archive', 'archive/broken/index.html', 'BROKEN'],
+	// One per directory this consolidation created, so a manifest that forgets
+	// to name a new home is a red gate rather than a missing page.
+	['map', 'start-here/docs-map/index.html', 'glossary'],
+	['papers', 'research/papers/provenance/index.html', 'sha256'],
 ];
 
 let failed = 0;
-console.log('check: %d html files in dist/', html.length);
+console.log('check: %d html files in dist/ (base %s)', html.length, BASE || '/');
 for (const [section, rel, needle] of CASES) {
 	const file = path.join(DIST, rel);
 	const ok = existsSync(file) && readFileSync(file, 'utf8').includes(needle);

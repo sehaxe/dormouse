@@ -207,6 +207,40 @@ const sliceCache = new Map();
 
 const LINK = /\]\(([^)\s]+)((?:\s+"[^"]*")?)\)/g;
 
+// The deployment base, read from astro.config.mjs rather than hardcoded here.
+//
+// Astro prefixes `base` onto the routes and assets IT generates (the sidebar,
+// the CSS, the scripts) but NOT onto a root-absolute markdown link inside a
+// document body. Under a base every one of those links would 404 in
+// deployment, so the GENERATED pages - which are gitignored and this lane's own
+// output - get their root-absolute links prefixed on the way out. Reading the
+// value instead of hardcoding it makes this a no-op for a site served from the
+// root, which is how it behaved before `base` existed.
+const BASE = (/^\s*base:\s*'([^']*)'/m.exec(readFileSync(path.join(SITE, 'astro.config.mjs'), 'utf8')) ?? [])[1] ?? '';
+
+/**
+ * Prefix a root-absolute link target that is not already prefixed: a markdown
+ * link in a body, or a `link:` value in Starlight frontmatter (the authored
+ * pages carry their hero and card targets there, and Astro does not prefix
+ * those either).
+ */
+function applyBase(body) {
+	if (!BASE) return body;
+	const md = (m, target) => (target.startsWith(`${BASE}/`) ? m : m.replace(target, `${BASE}${target}`));
+	return body
+		.split('\n')
+		.map((line) =>
+			segments(line).some((s) => s.code)
+				? line
+				: line
+						.replace(/\]\((\/(?!\/)[^)\s]*)/g, md)
+						.replace(/^(\s*link:\s*)(\/(?!\/)[^\s'"]*)/m, (m, key, target) =>
+							target.startsWith(`${BASE}/`) ? m : `${key}${BASE}${target}`,
+						),
+		)
+		.join('\n');
+}
+
 /** github-slugger, which is what Astro uses for heading ids. */
 function slugify(heading) {
 	return heading
@@ -441,7 +475,9 @@ function renderHeader(src) {
 function write(out, front, body) {
 	const file = path.join(OUT, `${out}.md`);
 	mkdirSync(path.dirname(file), { recursive: true });
-	writeFileSync(file, `---\n${front}\n---\n\n${body.replace(/\s*$/, '')}\n`, 'utf8');
+	// The frontmatter too: an authored page's hero/action `link:` values are
+	// root-absolute in the source and Astro does not prefix them.
+	writeFileSync(file, `---\n${applyBase(front)}\n---\n\n${applyBase(body).replace(/\s*$/, '')}\n`, 'utf8');
 	stats.pages++;
 }
 

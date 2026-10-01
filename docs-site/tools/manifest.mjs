@@ -39,9 +39,9 @@ that judgement — including the parts where the judgement went against the code
 
 If you are here for one number, it is on the [status page](/start-here/status/).
 If you are here because you are about to *build* on this repo, read
-[the working rules](/start-here/working-rules/) and
-[the agent rulebook](/start-here/agents/) first; both exist because breaking them
-cost a run, a week, or a claim.
+[the agent rulebook](/start-here/agents/) §1 first; it exists because breaking it
+cost a run, a week, or a claim. [Where every document lives](/start-here/docs-map/)
+is the map of this site back to the files it is generated from.
 
 **The culture on display here is unusual and deliberate.** This project publishes
 retractions next to the claims they retract, marks a number *unverified* when the
@@ -174,18 +174,22 @@ exists because a shared checkout makes \`cargo test\` a lottery.`,
 		order: 8,
 		intro: `## What was claimed, and what was taken back
 
-A retraction is only useful if it is findable, so this section exists: the
-unverified-claims register, the known-wrong register, and the five-gram question
-that keeps every quality number honest.
+A retraction is only useful if it is findable, so this section exists. Two of its
+pages are **slices of [the agent rulebook](/start-here/agents/)** — §3.2, every
+retracted claim, and §3.3, what is broken or open — because that register moved
+out of README when README became a front page, and a register of retractions
+belongs to the rulebook (§1.4) rather than to a marketing page. They are slices,
+not copies: there is still exactly one §3.2.
 
-**The full retracted-claims register is a subsection of
-[the agent rulebook](/start-here/agents/) §3.2** — it is not duplicated here,
-because a copy is a copy that goes stale. It is linked rather than copied for the
-same reason the whole site is generated rather than written.
+The quality bar itself is in AGENTS.md §2.6 (the anchor readings, and the
+statement that no held-out number in the archive beats a 5-gram byte counter).
 
-The four documents below are audits of the tree at a date, kept whole because
-their value is precisely that they are a point-in-time reading with every number
-attached.`,
+The four audits below are audits of the tree at a date, kept whole because their
+value is precisely that they are a point-in-time reading with every number
+attached. **What is in this section's canonical directory, and the rule that
+nothing in it may be cited as evidence, is the archive's own README**
+([what is in here](/archive/what-is-archived/)) — \`docs/archive/\` also holds the
+pruned history the site does not publish.`,
 	},
 ];
 
@@ -195,6 +199,17 @@ export const dirIndex = {
 	'research/reviews/': '/reviews/',
 	'research/papers/': '/research/papers/',
 	'research/decisions/': '/research/decisions/',
+	// docs/ is the one root every document lives under. A link to a directory
+	// lands on that directory's section rather than on a 404.
+	'docs/': '/start-here/docs-map/',
+	'docs/architecture/': '/architecture/',
+	'docs/protocols/': '/protocols/',
+	'docs/research/': '/research/notes/',
+	'docs/reviews/': '/reviews/',
+	'docs/decisions/': '/research/decisions/',
+	'docs/papers/': '/research/papers/',
+	'docs/guides/': '/tooling/',
+	'docs/archive/': '/archive/',
 	'vendor/burn-fused/crates/': '/architecture/library-crate-fate/',
 };
 
@@ -207,13 +222,19 @@ export const srcIndex = {
 
 export const pages = [
 	// ── Start here ───────────────────────────────────────────────────────────
-	{ src: 'README.md', out: 'start-here/status', slice: { from: /^## STATUS$/, to: /^### \(b\)/ }, title: 'Status', nav: 'Status' },
-	{ src: 'README.md', out: 'start-here/quick-start', slice: { from: /^## Quick start$/, to: /^## The model file/ }, title: 'Quick start' },
-	{ src: 'README.md', out: 'start-here/cli-flags', slice: { from: /^### Every flag on `train`$/, to: /^## Tooling$/ }, title: 'Every flag on train', nav: 'CLI flags' },
-	{ src: 'README.md', out: 'start-here/working-rules', slice: { from: /^## Working rules/, to: /^## Docs$/ }, title: 'Working rules', nav: 'Working rules' },
+	// README.md was rewritten on 2026-10-01 as a front page (93ba203): eight
+	// sections instead of the dev-log's twenty. The slices follow the sections
+	// that exist; five pages whose ONLY source was a deleted section are gone
+	// rather than re-anchored onto text that is not what it says - see the
+	// site's IA.md for which content moved where.
+	{ src: 'README.md', out: 'start-here/what-is-this', slice: { from: /^## What is this$/, to: /^## Results$/ }, title: 'What this is', nav: 'What this is' },
+	{ src: 'README.md', out: 'start-here/status', slice: { from: /^## Results$/, to: /^## Quick start$/ }, title: 'Status: the measured numbers', nav: 'Status' },
+	{ src: 'README.md', out: 'start-here/quick-start', slice: { from: /^## Quick start$/, to: /^## Architecture$/ }, title: 'Quick start' },
 	{ src: 'README.md', out: 'start-here/license', slice: { from: /^## License$/ }, title: 'License' },
 	{ src: 'AGENTS.md', out: 'start-here/agents', title: 'The agent rulebook', nav: 'The agent rulebook' },
-	{ src: 'docs/PLAN.md', out: 'start-here/program-plan', title: 'Program plan' },
+	{ src: 'docs/architecture/PLAN.md', out: 'start-here/program-plan', title: 'Program plan' },
+	// The map of docs/ itself: where a new document goes and how it is named.
+	{ src: 'docs/README.md', out: 'start-here/docs-map', title: 'Where every document lives', nav: 'The docs map' },
 	// Working notes the repo's own documents reference by path.
 	{ src: '.bulba/memory.md', out: 'start-here/notes/memory', title: 'Working memory', nav: 'Working memory' },
 	{ src: '.bulba/plan.md', out: 'start-here/notes/plan', title: 'Working plan', nav: 'Working plan' },
@@ -224,38 +245,40 @@ export const pages = [
 	{ src: 'CONTEXT.md', out: 'architecture/context', title: 'The system map', nav: 'The system map' },
 	{ src: 'docs/glossary.md', out: 'architecture/glossary' },
 	{ src: 'README.md', out: 'architecture/model', slice: { from: /^## Architecture$/, to: /^## The vendored kernel library/ }, title: 'The model walk', nav: 'The model walk' },
-	{ src: 'README.md', out: 'architecture/vendored-library', slice: { from: /^## The vendored kernel library/, to: /^## Presets$/ }, title: 'The vendored kernel library', nav: 'The kernel library' },
-	{ src: 'README.md', out: 'architecture/presets', slice: { from: /^## Presets$/, to: /^## Quick start$/ } },
-	{ src: 'README.md', out: 'architecture/model-file-dmexp', slice: { from: /^## The model file/, to: /^### Every flag/ }, title: 'The model file: .dmexp', nav: 'The .dmexp model file' },
-	{ src: 'docs/design-minimal.md', out: 'architecture/design-minimal' },
-	{ src: 'docs/design-review-model-2026-09-27.md', out: 'architecture/design-review-model' },
-	{ src: 'docs/PLAN-minimal-core.md', out: 'architecture/plan-minimal-core' },
-	{ src: 'docs/mixture-arms.md', out: 'architecture/mixture-arms' },
-	{ src: 'docs/library-crate-fate.md', out: 'architecture/library-crate-fate' },
-	{ src: 'POST_TRAINING.md', out: 'architecture/post-training' },
-	{ src: 'bf16_KERNEL_PLAN.md', out: 'architecture/bf16-plan' },
+	{ src: 'README.md', out: 'architecture/vendored-library', slice: { from: /^## The vendored kernel library/, to: /^## Documentation$/ }, title: 'The vendored kernel library', nav: 'The kernel library' },
+	{ src: 'docs/architecture/design-minimal.md', out: 'architecture/design-minimal' },
+	{ src: 'docs/architecture/mixture-arms.md', out: 'architecture/mixture-arms' },
+	{ src: 'docs/architecture/library-crate-fate.md', out: 'architecture/library-crate-fate' },
+	{ src: 'docs/architecture/post-training.md', out: 'architecture/post-training' },
+	{ src: 'docs/architecture/bf16-plan.md', out: 'architecture/bf16-plan' },
 
 	// ── Protocols ────────────────────────────────────────────────────────────
-	{ src: 'docs/AB-PROTOCOL.md', out: 'protocols/ab-protocol' },
-	{ src: 'docs/ORACLE.md', out: 'protocols/oracle' },
-	{ src: 'docs/ORACLE-TIERS.tsv', out: 'protocols/oracle-tiers', title: 'Oracle tiers', nav: 'Oracle tiers', render: 'tsv' },
-	{ src: 'docs/VERIFICATION.md', out: 'protocols/verification', title: 'Verification' },
-	{ src: 'research/papers/determinism-2026-09-30.md', out: 'protocols/determinism' },
+	{ src: 'docs/protocols/AB-PROTOCOL.md', out: 'protocols/ab-protocol' },
+	{ src: 'docs/protocols/ORACLE.md', out: 'protocols/oracle' },
+	{ src: 'docs/protocols/ORACLE-TIERS.tsv', out: 'protocols/oracle-tiers', title: 'Oracle tiers', nav: 'Oracle tiers', render: 'tsv' },
+	{ src: 'docs/protocols/VERIFICATION.md', out: 'protocols/verification', title: 'Verification' },
+	{ src: 'docs/protocols/determinism.md', out: 'protocols/determinism' },
+
+	// ── Papers ────────────────────────────────────────────────────────────────
+	// The provenance register is a .tsv, not prose: one row per original, naming
+	// the arXiv version and its sha256. Rendered like the oracle tiers.
+	{ src: 'docs/papers/provenance.tsv', out: 'research/papers/provenance', title: 'Paper provenance', nav: 'Provenance (sha256)', render: 'tsv' },
 
 	// ── Archive ──────────────────────────────────────────────────────────────
-	{ src: 'README.md', out: 'archive/unverified', slice: { from: /^### \(b\)/, to: /^### \(c\)/ }, title: 'Implemented but UNVERIFIED', nav: 'Implemented but UNVERIFIED' },
-	{ src: 'README.md', out: 'archive/broken', slice: { from: /^### \(c\)/, to: /^### \(d\)/ }, title: 'BROKEN or KNOWN-WRONG', nav: 'BROKEN or KNOWN-WRONG' },
-	{ src: 'README.md', out: 'archive/five-gram', slice: { from: /^### \(d\)/, to: /^### \(e\)/ }, title: 'Has any checkpoint beaten a 5-gram byte counter?', nav: 'The 5-gram question' },
-	{ src: 'docs/audit-2026-09-25.md', out: 'archive/audit-2026-09-25' },
-	{ src: 'docs/FINDINGS-2026-09-29.md', out: 'archive/findings-2026-09-29' },
-	{ src: 'docs/fused-verification-2026-09-23.md', out: 'archive/fused-verification-2026-09-23' },
-	{ src: 'docs/rmsnorm-kernel-2026-09-30.md', out: 'archive/rmsnorm-kernel-2026-09-30' },
+	// The three registers the old README carried as §(b)/(c)/(d) moved into
+	// AGENTS.md when README became a front page. Same content, one copy, and the
+	// rulebook is where a retraction belongs anyway (§1.4).
+	{ src: 'AGENTS.md', out: 'archive/retracted', slice: { from: /^## 3\.2 Retracted/, to: /^## 3\.3 / }, title: 'Every retracted claim', nav: 'Retracted claims' },
+	{ src: 'AGENTS.md', out: 'archive/broken', slice: { from: /^## 3\.3 /, to: /^## 3\.4 / }, title: 'BROKEN or KNOWN-WRONG', nav: 'BROKEN or KNOWN-WRONG' },
+	{ src: 'docs/archive/audit-2026-09-25.md', out: 'archive/audit-2026-09-25' },
+	{ src: 'docs/archive/findings-2026-09-29.md', out: 'archive/findings-2026-09-29' },
+	{ src: 'docs/archive/fused-verification-2026-09-23.md', out: 'archive/fused-verification-2026-09-23' },
+	{ src: 'docs/archive/rmsnorm-kernel-2026-09-30.md', out: 'archive/rmsnorm-kernel-2026-09-30' },
+	// The archive README: what may not be cited, and what earns a place here.
+	{ src: 'docs/archive/README.md', out: 'archive/what-is-archived', title: 'History, not truth', nav: 'What is in here' },
 
 	// ── Tooling ──────────────────────────────────────────────────────────────
-	{ src: 'README.md', out: 'tooling/overview', slice: { from: /^## Tooling$/, to: /^## Data pipeline$/ }, title: 'The tool table', nav: 'The tool table' },
-	{ src: 'README.md', out: 'tooling/data-pipeline', slice: { from: /^## Data pipeline$/, to: /^## Performance$/ } },
-	{ src: 'README.md', out: 'tooling/performance', slice: { from: /^## Performance$/, to: /^## Working rules/ } },
-	{ src: 'docs/BUILD-TIME.md', out: 'tooling/build-time' },
+	{ src: 'docs/guides/build-time.md', out: 'tooling/build-time' },
 ];
 
 // Everything the manifest does not enumerate, discovered and ordered here.
@@ -283,10 +306,18 @@ export const globs = [
 		nav: (f) => `ADR-${f.slice(0, 4)}`,
 		listLabel: 'nav+title',
 	},
-	{ dir: 'research', out: 'research/notes', match: /\.md$/, order: 'date-desc', nav: compact },
-	{ dir: 'research/papers', out: 'research/papers', match: /\.md$/, nav: topic },
-	{ dir: 'research/decisions', out: 'research/decisions', match: /\.md$/, nav: topic },
+	{ dir: 'docs/research', out: 'research/notes', match: /\.md$/, order: 'date-desc', nav: compact },
+	// Papers: the transcriptions, plus the provenance register - a .tsv
+	// (file -> source -> sha256) that renders the way the oracle tiers do.
+	{ dir: 'docs/papers', out: 'research/papers', match: /\.md$/, nav: topic },
+	{ dir: 'docs/decisions', out: 'research/decisions', match: /\.md$/, nav: topic },
+	{ dir: 'docs/reviews', out: 'reviews', match: /\.md$/, order: 'name-desc', nav: compact },
+	// TRANSIENT (2026-10-01): three documents the ab-wave lane is writing right
+	// now still live in research/. They move into docs/reviews/ and
+	// docs/decisions/ when that lane lands; then these two globs are deleted,
+	// which is why they are named here rather than left implicit.
 	{ dir: 'research/reviews', out: 'reviews', match: /\.md$/, order: 'name-desc', nav: compact },
+	{ dir: 'research/decisions', out: 'research/decisions', match: /\.md$/, nav: topic },
 	// A tool page IS the tool's own header comment. See tools/ingest.mjs.
 	{
 		dir: 'tools',
