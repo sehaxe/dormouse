@@ -5,7 +5,11 @@ a warm step, so the work is launch-bound and a graph replay is the only lever
 that attacks that directly. Everything below is measured or read out of the
 tree; nothing is asserted from a comment.
 
-Status: **IN PROGRESS** — see §6 for what is done and what is blocked.
+Status: **the mechanism is done and measured; the size of the win is not.**
+§8 has 5/5 green on the card, a launch counter, a proof that a captured step is
+silently wrong without a pin, and the per-launch host cost that explains the idle
+card. §9 has the one number that decides whether this lane is a 10x win or a null,
+and the command that takes it.
 
 ---
 
@@ -305,6 +309,43 @@ phase and alternating costs nothing — but it is a bet on the pool's free-list
 order being LIFO, with no mechanism behind it, and pinning costs one launch per
 parameter per step and is *provably* right (bit-exact over 8 steps). Where a bet
 and a proof cost the same order of magnitude, take the proof.
+
+### 8.7 What a launch costs on this box — the reason the card is idle 87%
+
+`a_replay_costs_one_dispatch_not_n_launches`, 40,000 trivial launches, one at a
+time, versus the same 40,000 as 20 replays of one 2,000-launch graph:
+
+```
+40,000 launches, one at a time:
+  enqueue 1374.3ms (34.4 us each, HOST) + drain 2.9ms (0.1 us each, DEVICE)
+the same 40,000 as 20 replays of one 2000-launch graph:
+  enqueue 0.84ms (41.9 us each, HOST) + drain 55.2ms (DEVICE)
+=> 24.6x end to end
+```
+
+**34.4 µs of HOST time per launch, against 0.1 µs of DEVICE time to run it.** The
+GPU is ~340× faster than the host can feed it. That is §3.1's "mean utilisation
+13.3%, 79% of samples ≤5%" reduced to a mechanism: the step time is not compute,
+it is the host walking the runtime one launch at a time. And a replay collapses
+that walk into one dispatch worth ~42 µs.
+
+This is the strongest thing the lane produced, and it is a *mechanism*
+measurement — no trainer, no model, no assumptions beyond "a bare cubecl
+`::launch` of an 8-element kernel is the cheapest path through the runtime".
+
+**What it implies, and how firmly.** A 500 ms step at 34.4 µs of host time per
+launch is ~14,500 launches — but that is an **inference from a per-launch cost,
+not a count of launches**, and the two are not the same thing: a burn op does
+more host work per launch than a bare `::launch` (autotune lookup, tensor
+allocation, dispatch bookkeeping), so the real `L` could be lower with each
+launch costing more. The direction of the error is known, the size is not. `L`
+itself is one `cubecl_launches()` sample away (§9) and is still unmeasured.
+
+The pin's price against that: the optimizer banner names 54 groups, so `P` is
+order 100 launches ≈ 3.4 ms of host time against a ~500 ms step. If `L` is
+anywhere near the inference, the pin is ~1% of the step and the graph is the
+step. **If `L` comes back in the hundreds, this is a null and the effort goes
+elsewhere** — that is the number to take next, and it is the only thing left.
 
 ## 9. What is still missing: `L`, the launch count of a real step
 

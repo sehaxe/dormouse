@@ -131,6 +131,10 @@ fn a_replay_costs_one_dispatch_not_n_launches() {
     client.read_one(out.clone()).unwrap();
 
     // ── N launches, one at a time ─────────────────────────────────────────
+    // Enqueue and execution are timed SEPARATELY, because they answer different
+    // questions and conflating them is how a launch-bound workload gets
+    // misdiagnosed as a compute-bound one: the host's enqueue cost is what a
+    // graph removes, and the device's execution cost is what it does not.
     let before_launches = launches();
     let t0 = std::time::Instant::now();
     for _ in 0..PASSES {
@@ -138,8 +142,11 @@ fn a_replay_costs_one_dispatch_not_n_launches() {
             one(&client);
         }
     }
+    let enqueued = t0.elapsed().as_secs_f64();
+    let t_drain = std::time::Instant::now();
     client.read_one(out.clone()).unwrap();
-    let launched = t0.elapsed().as_secs_f64();
+    let drained = t_drain.elapsed().as_secs_f64();
+    let launched = enqueued + drained;
     let counted = launches() - before_launches;
 
     // ── the same work as one graph ────────────────────────────────────────
@@ -157,8 +164,11 @@ fn a_replay_costs_one_dispatch_not_n_launches() {
     for _ in 0..PASSES {
         unsafe { graph.replay() }.expect("replay");
     }
+    let replay_enqueued = t1.elapsed().as_secs_f64();
+    let t_rdrain = std::time::Instant::now();
     client.read_one(out.clone()).unwrap();
-    let replayed = t1.elapsed().as_secs_f64();
+    let replay_drained = t_rdrain.elapsed().as_secs_f64();
+    let replayed = replay_enqueued + replay_drained;
 
     assert_eq!(
         inside, PER_PASS as u64,
@@ -168,14 +178,51 @@ fn a_replay_costs_one_dispatch_not_n_launches() {
     assert_eq!(launches() - before_replays, 0, "a replay launches no kernels");
 
     let n = (PASSES * PER_PASS) as f64;
+    let (enqueue_ms, drain_ms, total_ms) = (enqueued * 1e3, drained * 1e3, launched * 1e3);
+    let (replay_enqueue_ms, replay_drain_ms, replay_total_ms) = (
+        replay_enqueued * 1e3,
+        replay_drained * 1e3,
+        replayed * 1e3,
+    );
+    // A sanity check on the TIMING, not on the code: 40,000 kernel executions
+    // cannot drain in under a millisecond, so if the drain reads ~0 the wall
+    // clock here is timing the runtime's own batching rather than the driver
+    // and the ratio it prints is not a win estimate. Printed loudly, because
+    // the tempting thing to do with a 25x number is to quote it.
+    let credible = drained > 1e-3;
     println!(
-        "on this box: {n} launches = {launched:.1}ms ({:.2} us/launch), \
-         {PASSES} replays of a {PER_PASS}-launch graph = {replayed:.1}ms \
-         ({:.2} us/replay, {:.2} us per contained launch) -> {:.1}x",
-        launched * 1e3 / n,
-        replayed * 1e3 / PASSES as f64,
-        replayed * 1e3 / n,
+        "on this box, {n} trivial launches, one at a time: \
+         enqueue {enqueue_ms:.1}ms ({:.1} us each, HOST) + \
+         drain {drain_ms:.1}ms ({:.1} us each, DEVICE) = {total_ms:.1}ms",
+        enqueued * 1e6 / n,
+        drained * 1e6 / n,
+    );
+    println!(
+        "the same {n} as {PASSES} replays of one {PER_PASS}-launch graph: \
+         enqueue {replay_enqueue_ms:.2}ms ({:.1} us each, HOST) + \
+         drain {replay_drain_ms:.1}ms (DEVICE) = {replay_total_ms:.1}ms",
+        replay_enqueued * 1e6 / PASSES as f64,
+    );
+    if !credible {
+        println!(
+            "NOT A PER-LAUNCH COST: {n} kernels drained in {drain_ms:.1}ms is below \
+             what the hardware can execute, so this clock is timing the runtime's \
+             batching (or a sync that does not wait), not the driver. The counter \
+             says {counted} tasks reached the server, so either the runtime drops \
+             or coalesces them before the device, or the read is not the barrier it \
+             looks like. The ratio below is then NOT an estimate of what a graph \
+             saves on a real step."
+        );
+    }
+    println!(
+        "=> {:.1}x end to end. The part a graph removes is the ENQUEUE side: \
+         {:.1} us per launch of HOST time against {:.1} us per \
+         dispatch. This is a bare cubecl `::launch` of an 8-element kernel - the \
+         cheapest path through the runtime - so it is an ANCHOR for the per-launch \
+         host cost, not a measurement of a burn op's.",
         launched / replayed.max(1e-9),
+        enqueued * 1e6 / n,
+        replay_enqueued * 1e6 / PASSES as f64,
     );
 }
 
