@@ -369,12 +369,33 @@ command. What blocked it, in order, and none of it is the mechanism:
 |---|---|
 | disk | `/home` is at 97% with 16-17 GB free; the vendored cubecl build that produced §8 is 6.2 GB, and a cold `dormouse-train` CUDA build does not fit. Worked around by pointing `CARGO_TARGET_DIR` at the 1.8 TB data mount (673 GB free, 2.5 GB used by the release build). |
 | the wrong feature | the first release build came out on `Flex(Cpu)` — `dormouse-cli`'s default is `cpu`, not `cuda` — and printed `launches=0`, which is the honest answer off CUDA and would have read as "the instrument is broken". The repo already had the right invocation in `.cargo/config.toml` (`build-probe`). |
-| the shared card | §1.5's "one GPU process at a time" is being honoured by six other lanes running A/B arms back-to-back; this lane's run is 3 minutes and is queued for a gap. |
-| the build lock | six lanes queued behind one CPU test holding the lock for 36 min. The lock is doing its job (no build storm) at the cost of a lane whose whole point is the card. |
+| the shared card | **a 100,000-step production run took the card at 02:02 and is at step 23,100 with ~9.6 h left** (`~/logs/first_run_100000_1001_0202.log`, 450 ms/step). §1.5's "one GPU process at a time" is not negotiable and this lane's measurement is 3 minutes, so it waits for a gap that is not coming tonight. |
+| the build lock | six lanes queued behind one CPU test holding the lock for 36 min; the CUDA release build this lane needed took **100 minutes to reach the front** and 7 min to compile. The lock is doing its job (no build storm) at the cost of a lane whose whole point is the card. |
 
 **`L` is unaffected by GPU contention** — it is a count of launches and the launch
-structure does not depend on what else is on the card. The ms figures would be,
-so they are quoted only from runs with a quiet card.
+structure does not depend on what else is on the card. So the next card window,
+however long it is, is only 3 minutes of work.
+
+### 9.1 The cheapest possible way to finish this lane
+
+The counter is already in the trainer and already on the timer line, and it costs
+one relaxed atomic add per launch — so **the production binary can carry it at no
+cost**, and the next 100k run's timer line then reports `L` for free:
+
+```bash
+# the CUDA release build this lane made is still on the data mount
+# (CARGO_TARGET_DIR=/mnt/e43497ab-.../dt-graph), so there is no rebuild:
+D=/mnt/e43497ab-0ff2-45b4-b45f-28de3339a53e/aria_data/pretrain
+/mnt/e43497ab-0ff2-45b4-b45f-28de3339a53e/dt-graph/release/train \
+  --data $D/real --eval $D/real_eval --eval-every 100000 \
+  --preset small --batch 8 --seq-len 512 --no-engram \
+  --steps 300 --log-every 100 --ckpt-name lcprobe- --timers --seed 1 2>&1 | grep timer
+# L = (launches@300 - launches@100) / 200
+```
+
+Read it as: **if `L` > ~200 the pin is noise and the graph is the step; if `L`
+comes back under ~200 the pin eats the win and this lane is a null.** Nothing
+else in the repo has to change for that number to exist.
 
 The honest summary of the lane so far: the mechanism is **proven to work and
 proven to be unsafe without a pin**; the size of the win is **unmeasured**, and
