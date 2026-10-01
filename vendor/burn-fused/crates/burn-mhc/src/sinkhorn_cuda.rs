@@ -588,13 +588,31 @@ mod seam_tests {
     /// differentiable under the trainer's own strategy. It cannot certify the
     /// fused node; `fused_node_carries_a_gradient` below is that gate, and it
     /// needs a card.
+    ///
+    /// **It calls the PUBLIC `sinkhorn_knopp`, not the seam entry, and that is
+    /// load-bearing twice over.** The seam is only reached under `cfg(cuda)`, so
+    /// on CPU this is the whole path; and the first version of this test called
+    /// `sinkhorn_autodiff_s` directly, which made the test above go RED with
+    /// `left: 2, right: 1` - `ENTRY` is a process-global `AtomicU64`, not
+    /// thread-local, so two tests that touch the seam cannot both assert on it
+    /// while cargo runs them in parallel. **That is a latent defect in these
+    /// counters and it is why `dormouse-core`'s `probe.rs` uses thread-local
+    /// `Cell`s for the same reason** ("thread-local so a parallel test run cannot
+    /// cross-contaminate"). Not fixed here: it is this crate's counter design,
+    /// not the test's. Recorded, and the test no longer depends on it.
     #[test]
     fn the_tensor_path_carries_a_gradient_under_both_strategies() {
-        fn grad_of<S: CheckpointStrategy>() -> Vec<f32>
+        // The device MUST match the strategy: a tensor on a
+        // `gradient_checkpointing()` device does not downcast to
+        // `Autodiff<Nd, NoCheckpointing>`, so pairing the two returns `None`
+        // from the downcast and the gate dies on its own fixture. (The first
+        // version did exactly that.)
+        fn grad_of<S: CheckpointStrategy>(balanced: bool) -> Vec<f32>
         where
             DispatchTensor: DispatchKindConversion<Ad<Nd, S>> + DispatchKindConversion<Nd>,
         {
-            let dev = Device::ndarray().autodiff().gradient_checkpointing();
+            let base = Device::ndarray().autodiff();
+            let dev = if balanced { base.gradient_checkpointing() } else { base };
             // A NON-CONSTANT input. `ones` makes the sinkhorn's output
             // constant in every entry, so `dL/dlogits` is legitimately zero and
             // this gate would be green for the wrong reason - the same shape as
@@ -604,7 +622,7 @@ mod seam_tests {
                 &dev,
             )
             .require_grad();
-            let out = sinkhorn_autodiff_s::<Nd, S>(x.clone(), 2).expect("the seam accepts this");
+            let out = crate::sinkhorn_knopp(x.clone(), 2);
             let grads = out.powf_scalar(2.0).sum().backward();
             let g = x.grad(&grads).expect("a leaf input must carry a gradient");
             g.into_data()
@@ -614,8 +632,8 @@ mod seam_tests {
                 .collect()
         }
         for (label, g) in [
-            ("BalancedCheckpointing", grad_of::<BalancedCheckpointing>()),
-            ("NoCheckpointing", grad_of::<NoCheckpointing>()),
+            ("BalancedCheckpointing", grad_of::<BalancedCheckpointing>(true)),
+            ("NoCheckpointing", grad_of::<NoCheckpointing>(false)),
         ] {
             assert!(
                 g.iter().any(|v| v.abs() > 1e-8),
