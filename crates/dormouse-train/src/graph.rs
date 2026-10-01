@@ -328,9 +328,22 @@ const MAX_REFUSALS: u64 = 20;
 /// same bytes. If a future burn makes the field private this stops compiling,
 /// loudly, which is the right way to find out.
 fn as_constant_float<const D: usize>(t: &Tensor<D>) -> Tensor<D> {
-    let mut d = t.clone().into_dispatch();
-    d.autodiff = burn_dispatch::DispatchAutodiffContext::Disabled;
-    Tensor::from_dispatch(d)
+    // Destructured and rebuilt, not mutated in place: the `kind` arm MOVES out
+    // of the enum, so the struct is partially moved by the time
+    // `from_dispatch` wants it whole.
+    let burn_dispatch::DispatchTensor { kind, mut autodiff } = t.clone().into_dispatch();
+    autodiff = burn_dispatch::DispatchAutodiffContext::Disabled;
+    // AND unwrap the autodiff BOX: `DispatchTensorKind::Autodiff(Box<Kind>)`,
+    // so a tracked float sits two levels above the concrete `Cube` variant that
+    // `try_into_backend` matches on. An Int tensor is already `Cube` (ints do
+    // not track), which is why `as_constant_int` has no unwrap to do - and why
+    // the Int half of the pin worked while the float half did not: the same
+    // call, one green and one red.
+    let kind = match kind {
+        burn_dispatch::DispatchTensorKind::Autodiff(inner) => *inner,
+        other => other,
+    };
+    Tensor::from_dispatch(burn_dispatch::DispatchTensor { kind, autodiff })
 }
 
 /// [`as_constant_float`] for Int tensors. One helper per kind, not one generic:
