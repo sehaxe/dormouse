@@ -3,7 +3,7 @@
 Date: 2026-09-25. Inputs: burn @ /tmp/opencode/burn (shallow main), cubek 0.3.0-pre.3 +
 cubecl 0.11.0-pre.3 from the cargo registry (what we compile against; cubecl-runtime/cubecl-cuda
 from `vendor/cubecl-fix`), our `crates/dormouse-core/src/fused/` (mod 1629, backward 1768,
-kernels 1553, tests 2487 = 7.4k LOC), `docs/fused-verification-2026-09-23.md`,
+kernels 1553, tests 2487 = 7.4k LOC), `docs/archive/fused-verification-2026-09-23.md`,
 `docs/archive/research/2026-09-23-fused-flagship50.md`. Flagship geometry for all numbers: b=10 t=512
 (bt=5120), d=768, r=64, f=2048, v=256, nexp=3, N=8 iterations (configs/small.toml).
 
@@ -106,7 +106,7 @@ CPU steps); kernels are enqueued and the pipeline stays full.
    `forward_train_state`+MSA+Engram, :213-250), `loss_n.backward()` (:251), and TWO
    device syncs around it (:1408, :1426). N=8 ⇒ 8 extra arms forwards, 8 AD graph
    builds, 16 pipeline drains per step. This is the diagnosed flagship killer
-   (docs/fused-verification-2026-09-23.md:78-86).
+   (docs/archive/fused-verification-2026-09-23.md:78-86).
 2. **Grad registration is a D2H→host→H2D round trip of every weight grad, every step**
    — backward.rs:984-1036 (`ponder_backward`) and :1725-1766 (`..._arms_direct`): ~26
    grads `client.read()` (blocking) then `Tensor::from_data` re-upload, total ~2×30 MB
@@ -156,7 +156,7 @@ CPU steps); kernels are enqueued and the pipeline stays full.
     already drifted (grad-snapshot bug handling differs).
 13. **f32-only, `launch_unchecked::<f32>` hardcoded at every call site** — blocks the
     bf16 storage path (AGENTS.md kernel plan) and the Fp8-forward A/B inside fused;
-    docs/fused-verification-2026-09-23.md:111-113 lists it as plan M5.
+    docs/archive/fused-verification-2026-09-23.md:111-113 lists it as plan M5.
 14. **Fusion-flag blocker** — enabling burn's `fusion` feature fails to compile on
     pre.3 because the vendored extension crates' `#[backend_extension]` glue predates
     the `DispatchAutodiffContext` contract (§1.6). Unlocked by the pre.4 merge; our op
@@ -298,7 +298,7 @@ both arms; the burn arm runs with the fusion feature ON once pre.4 lands.
   launch-bound step, §1.4), else **delete**.
 - **Delete means delete**: all of crates/dormouse-core/src/fused/ (7.4k LOC incl.
   tests), the DM_FUSED gate in train/src/lib.rs, and the flag plumbing; keep
-  docs/fused-verification-2026-09-23.md + docs/archive/research/2026-09-23-fused-flagship50.md as
+  docs/archive/fused-verification-2026-09-23.md + docs/archive/research/2026-09-23-fused-flagship50.md as
   the record. The one thing worth salvaging into burn-kda/msa upstream: the raw
   adjoint-launch wrappers from Rung 1 (they're useful without our op).
 
@@ -324,7 +324,7 @@ Burn (shallow clone /tmp/opencode/burn, main):
 
 Dormouse:
 - fused/ sources: crates/dormouse-core/src/fused/{mod.rs,backward.rs,kernels.rs} (line refs inline, §2/§3)
-- Flagship A/B: docs/archive/research/2026-09-23-fused-flagship50.md:48-58; grad-coverage + structural diagnosis: docs/fused-verification-2026-09-23.md:57-116
+- Flagship A/B: docs/archive/research/2026-09-23-fused-flagship50.md:48-58; grad-coverage + structural diagnosis: docs/archive/fused-verification-2026-09-23.md:57-116
 - KDA state API: vendor/burn-fused/crates/burn-kda/src/lib.rs:503-530
 - GPU constraints: AGENTS.md (4D-slice ban, bf16 fp32-cast rule, KDA f32-only, launch-bound step, pool doctrine)
 - Preset: configs/small.toml

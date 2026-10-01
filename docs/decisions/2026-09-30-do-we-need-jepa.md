@@ -538,7 +538,7 @@ All fetched 2026-09-30. Version and date as returned by the arXiv API.
 **Repo sources cited:** `crates/dormouse-core/src/{model.rs:86-106,150-156}`, `aux.rs:25,29,176-179,224-232`;
 `vendor/burn-fused/crates/burn-jepa/src/{losses.rs:11-20,63-97, mask.rs:9-25, predictor.rs}`;
 `benches/history.tsv:51-56`; `~/logs/ab8m_ab8m_iter4.log:10-16`; `~/logs/train_nokda.log:91`;
-`docs/protocols/AB-PROTOCOL.md:185-230`; `docs/audit-2026-09-25.md:29,62,64,87`; `docs/papers/jepa.md`.
+`docs/protocols/AB-PROTOCOL.md:185-230`; `docs/archive/audit-2026-09-25.md:29,62,64,87`; `docs/papers/jepa.md`.
 
 ---
 

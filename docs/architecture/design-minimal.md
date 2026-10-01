@@ -2,7 +2,7 @@
 
 Question: cut 90% of the code, keep all functionality and performance. Answer with
 numbers, not adjectives. Baseline: 15,513 LOC across 4 crates (fused-grad-coverage
-@ 9605896). Verdicts: docs/audit-2026-09-25.md.
+@ 9605896). Verdicts: docs/archive/audit-2026-09-25.md.
 
 ## 1. The honest math
 

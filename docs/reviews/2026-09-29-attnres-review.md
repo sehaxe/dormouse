@@ -77,7 +77,7 @@ Three corrections to the report's own numbers:
   block labelled VERIFIED.
 * **"2268 lines"** in §3.3 is a **stale figure copied from `docs/architecture/library-crate-fate.md`**
   (recorded "at `422414c`"). The report's own §1 measures `lib.rs` 517 + `fused_attnres.rs`
-  1821 = **2338**. `docs/PLAN-minimal-core.md:90` says 2060. Three documents, three numbers,
+  1821 = **2338**. `docs/archive/architecture/PLAN-minimal-core.md:90` says 2060. Three documents, three numbers,
   none re-measured. AGENTS.md §1.4: "a measurement is a measurement only with the config, the
   date and the commit it was taken at."
 * `crates/burn-attnres/README.md:3–:8` (§3.3) is a **wrong path** — the file is
@@ -210,7 +210,7 @@ reference to `burn-attnres`**. The workspace root `Cargo.toml:12` has
 `cublas-poc, dormouse-core, dormouse-data, dormouse-train, dormouse-cli, backend-parity`. The
 only inbound edges to `burn-attnres` are inside its own workspace: `vendor/burn-fused/Cargo.toml:4`,
 `vendor/burn-fused/burn-fused/Cargo.toml:19,31,52,79`, `vendor/burn-fused/benches/Cargo.toml:12`.
-`docs/architecture/library-crate-fate.md:62` records fate `b / REFERENCE`; `docs/PLAN-minimal-core.md:90`
+`docs/architecture/library-crate-fate.md:62` records fate `b / REFERENCE`; `docs/archive/architecture/PLAN-minimal-core.md:90`
 (§M2) names it as a residual-stream A/B arm that has not been run. **No dormouse number is
 retracted. This claim is the most important one in the report and it is correct.**
 
@@ -515,7 +515,7 @@ and looking at the introducing commit's message; the repo's log for the crate st
   total `(N/S + 5)d` ≈ 5.5d at L=128, N=8, S=16, m=4 — versus 3d for standard residual and
   34d for mHC. The crate has `benches/attnres.rs` measuring *wall clock*, and no memory-traffic
   counter. Not in the report's list.
-* **`docs/PLAN-minimal-core.md:90` is not cited in §3.3** even though §3.3 argues about
+* **`docs/archive/architecture/PLAN-minimal-core.md:90` is not cited in §3.3** even though §3.3 argues about
   severity *in the context of that A/B*. The report cites `library-crate-fate.md:62` and the
   README but not the plan line that names the arm.
 * **A doc/code contradiction inside the crate, not in the table:** `lib.rs:419` says
@@ -958,7 +958,7 @@ with the panic quoted at `:179-186`. It is already labelled **BROKEN** twice
 one state fix + one scale deletion + six kernel signature changes + eight tests + a CUDA
 re-validation that **no job in this repo can currently perform**.
 
-**Benefit:** one A/B arm named at `docs/PLAN-minimal-core.md:90` §M2, never run, on a
+**Benefit:** one A/B arm named at `docs/archive/architecture/PLAN-minimal-core.md:90` §M2, never run, on a
 mechanism whose paper-reported margin is +0.005 on the best ablation set and whose own
 multihead variant is a wash (1.752 vs 1.746). AGENTS.md §1.2: a tie deletes the mechanism.
 

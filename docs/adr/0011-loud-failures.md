@@ -22,4 +22,4 @@ Landmarks: `collect_files`/`from_files` asserts + corpus size floor
 (commit 9605896), the refill dry-assert and short-read assert (data/lib.rs),
 host-grad shape assert and sidecar hard error (train/lib.rs), dead-field
 validation removed rather than kept as false confidence
-(docs/audit-2026-09-25.md §3.10).
+(docs/archive/audit-2026-09-25.md §3.10).

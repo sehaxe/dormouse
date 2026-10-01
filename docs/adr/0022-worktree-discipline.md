@@ -20,7 +20,7 @@ writers kept landing). On the record:
 
 * One in-flight edit to `crates/dormouse-data/src/lib.rs` broke `cargo check`
   for all three model crates, so **no test in the tree could run**.
-  `docs/design-review-model-2026-09-27.md` opens by recording that its whole
+  `docs/archive/architecture/design-review-model-2026-09-27.md` opens by recording that its whole
   review is `NOTHING IS RUNTIME-VERIFIED` for exactly that reason.
 * A generated facade line in `vendor/burn-fused/Cargo.toml` broke **every
   cargo command in the tree** for ~30 min — `cargo metadata` fails ⇒ every

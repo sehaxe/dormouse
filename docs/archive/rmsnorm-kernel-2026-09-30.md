@@ -13,7 +13,7 @@ is the more important of the two.
 Everything below was measured on this box, on the GPU, on 2026-09-30. No number
 in this file is transcribed from a report, including the reports written earlier
 tonight: the diagnosis in the previous lane's
-`docs/rmsnorm-kernel-2026-09-30.md` §2 is **retracted by the bisect in §2
+`docs/archive/rmsnorm-kernel-2026-09-30.md` §2 is **retracted by the bisect in §2
 below**, and its probe had never compiled (7 errors), which is why its §3 was
 empty.
 
