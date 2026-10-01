@@ -132,44 +132,41 @@ steps latches an irreversible fp32 fallback if they drift.
 
 One **step** is one optimizer update at one depth:
 
+| stage | what happens |
+|---|---|
+| inputs | `input_ids [b,t]` (embedding, bf16 under `--bf16`) · `hashed_ids [b,t,3]` (raw FNV; the model masks the slot index) · `host_rows [b,t,3*32]` (`--engram-ram`; `hashed_ids` then unused) |
+| loop | `LoopBlock.forward_full_state(x, hashed_ids, host_rows, targets, lm_head)` — pseudocode below |
+| head | `norm(out_acc) → lm_head → logits` — fp32 even under `--bf16` |
+| aux | `aux = w_jepa·JEPA + w_dspark·DSpark + w_mor·BCE`; `loss = rec + aux` |
+| backward | mask non-finite on device → backward → sanitize grads on device (§1.3: no host sync) |
+| optim | `optim.step` (Muon+ / head-wise / Adam-tables / AdamW-rest) → `retract_tsct` every `--retract-every` → `ema_update` the teacher → `max_ortho` every 500 steps (the one-way fp32 latch) |
+| cadence | `log_every`: ce/bpb line, aux, pool stats, fused seam counters · `eval_every`: held-out BPB on a rewound window (+ depth curve) · `ckpt_every`: save_ckpt + save_ngram · every 500: `memory_cleanup` |
+
+```mermaid
+flowchart TD
+    A["bytes → input_ids · hashed_ids · host_rows"] --> B["LoopBlock.forward_full_state"]
+    B --> C["norm(out_acc) → lm_head → logits (fp32)"]
+    C --> D["loss = rec + aux"]
+    D --> E["mask non-finite → backward → sanitize grads (device)"]
+    E --> F["optim.step → retract_tsct → ema_update"]
+    F --> G["cadence: log · eval · ckpt · memory_cleanup"]
 ```
-bytes ──► [b,t] input_ids        (embedding, cast to bf16 under --bf16)
-      ├─► [b,t,3] hashed_ids     (raw FNV; the model masks the slot index)
-      └─► [b,t,3*32] host_rows   (--engram-ram; hashed_ids is then unused)
-                    │
-                    ▼
-        LoopBlock.forward_full_state(x, hashed_ids, host_rows, targets, lm_head)
-          for iter in 0..iters:
-            h_ctx = h + e_k[iter]                (or GR read)
-            normed = RMSNorm(h_ctx)              (identity under GR)
-            w_attn, w_mem, w_ffn, blend = controller([h_ctx, h0])
-            kda_state = KDA(normed, kda_state)   (threaded across iterations)
-            mem_branch = min(w_mem, lam_max)*engram_read + (1-)*mem_dense(normed)
-            ffn = Σ_e blend_e * expert_e(normed) * w_ffn
-            h = h_ctx + y * residual_scale      (or GR write)
-            step_out[iter] = out_proj(h)
-            ce[iter] = -log_softmax(lm_head(step_out))[target]   ← inside the loop
-          out_acc = mean(gate * step_out)        gate = all-ones, or MoR's top-k
-          rec     = mean(gate * ce)               unweighted: no p_n, no KL
-                    │
-                    ▼
-        norm(out_acc) ─► lm_head ─► logits      (fp32 even under --bf16)
-        aux = w_jepa*JEPA + w_dspark*DSpark + w_mor*BCE
-        loss = rec + aux
-                    │
-                    ▼
-        mask non-finite (device) ─► backward ─► sanitize grads (device)
-                    │
-                    ▼
-        optim.step (Muon+ / head-wise / Adam-tables / AdamW-rest)
-        retract_tsct   every --retract-every
-        ema_update     the teacher, after the step
-        max_ortho      every 500 steps → the one-way fp32 latch
-                    │
-        every log_every:      ce/bpb line, aux, pool stats, fused seam counters
-        every eval_every:     held-out BPB on a rewound window (+ depth curve)
-        every ckpt_every:     save_ckpt + save_ngram
-        every 500:            memory_cleanup
+
+The loop body, as pseudocode:
+
+```text
+for iter in 0..iters:
+    h_ctx = h + e_k[iter]                  # or GR read
+    normed = RMSNorm(h_ctx)                # identity under GR
+    w_attn, w_mem, w_ffn, blend = controller([h_ctx, h0])
+    kda_state = KDA(normed, kda_state)     # threaded across iterations
+    mem = min(w_mem, lam_max)*engram_read + (1-w_mem)*mem_dense(normed)
+    ffn = Σ blend_e * expert_e(normed) * w_ffn
+    h = h_ctx + y * residual_scale         # or GR write
+    step_out[iter] = out_proj(h)
+    ce[iter] = -log_softmax(lm_head(step_out))[target]   # inside the loop
+out_acc = mean(gate * step_out)            # gate = all-ones, or MoR's top-k
+rec = mean(gate * ce)                      # unweighted: no p_n, no KL
 ```
 
 The per-iteration CE is computed **inside** the loop and accumulated, because
