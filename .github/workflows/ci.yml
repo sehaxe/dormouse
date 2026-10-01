@@ -90,6 +90,13 @@ jobs:
         run: |
           cargo fmt -p dormouse-core -p dormouse-data -p dormouse-train -p dormouse-cli -- --check
       - name: clippy
+        # `!cancelled()` and not the default `success()`: run 36868694110
+        # measured what the default does here - rustfmt fails, and every step
+        # after it is SKIPPED, so the clippy half of this job never reported at
+        # all. That is the fused-library.yml failure mode by another route: a
+        # gate that does not run is indistinguishable from a gate that passes.
+        # `!cancelled()` still refuses to run on a cancelled job.
+        if: ${{ !cancelled() }}
         run: |
           cargo clippy -p dormouse-core -p dormouse-data -p dormouse-train -p dormouse-cli --all-targets -- -D warnings
 
