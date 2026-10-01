@@ -1,11 +1,9 @@
 # The graph seam in the training loop — v1: fwd+bwd captured, the tail not
 
-Lane: owner's directive "0 GPU sync, fix the 400 ms". Status at the time of
-writing: **the seam is wired and CPU-green (52/52), the CUDA gates and every
-number are NOT yet run** — a 100k production run owns the card until ~14:40
-(`first_run_100000_1001_0202.log`, step 92.5k of 100k at 13:41). So this file
-records what was built and why, and marks every claim that waits on a
-measurement instead of making it.
+Lane: owner's directive "0 GPU sync, fix the 400 ms". Status: **`L` is measured
+and the pin's necessity is measured on the trainer's own path; the positive
+gate and the 500-step A/B are not.** Numbers below carry their command and the
+commit they were taken at.
 
 Read first: `research/reviews/cuda-graph-2026-09-30.md` (the handover) and
 `vendor/cubecl-fix/cubecl-cuda/tests/graph_step.rs` (the mechanism, 5/5 on this
@@ -180,6 +178,22 @@ happened to equal the stale-pointer output, and a units bug). So:
   the trainer's 1400-line loop, which is not callable from a test (the same
   wall §3.3 of AGENTS names for the eval call site).
 
+### 5.1 What the gates said on their first run, and what each refusal taught
+
+The CUDA gates ran three times on 2026-10-01 and the history is the useful
+part:
+
+| run | negative | positive | what it found |
+|---|---|---|---|
+| 1 | **green** — unpinned diverges by **1.98e0** relative at `aux.dspark.joint_proj.weight`; 2.98e0 at `loop_block.mor_router.proj.bias`; 1.015e1 on a third run | red: `could not pin x` | **The trap is real on the trainer's own path**, not just on the toy. The pin is mandatory, and the negative is reproducible (three runs, three different parameters first to break, all ≈ 1-10 relative). |
+| 2 | green (same shape) | red, now with burn's own words: `BackendMismatch("Expected concrete Cube backend with disabled autodiff context, got Enabled(Disabled)")` | **A raw handle is unreachable from an autodiff tensor.** Int inputs have no `detach()` (float-only), so the plain-device experiment. |
+| 3 | green | red on the FLOAT pin, same message | The same wall for parameters: `optim.step`'s output is `Enabled` too. The answer is `as_constant` (§7): `DispatchTensor.autodiff` is a pub field. |
+
+Two of the three runs also changed WHICH parameter the unpinned run broke
+first, which is itself the finding: a stale-pointer graph does not fail in one
+place, it fails wherever the optimizer's free list happened to hand the old
+buffer to something else. A reader looking for "the" symptom will not find it.
+
 ## 8. Two things the repo's own gates caught
 
 - `cfg::tests::snapshot_carries_every_train_field` went red on the new field,
@@ -193,20 +207,23 @@ happened to equal the stale-pointer output, and a units bug). So:
 
 ## 6. Open, in the order the evidence says
 
-1. **`L`** — launches per warm step, from the timer line's `launches=`
-   difference. Decision rule (fixed before the number, §10 of the handover):
-   `L > ~200` ⇒ the graph is the step; `L < ~200` ⇒ null, report and stop. The
-   arithmetic already in the tree says `L` is ~14.5k (460 ms ÷ 34.4 µs), but
-   that is an inference from a per-launch cost, not a count. **NOT TAKEN.**
+1. ~~**`L`**~~ — **TAKEN, 2026-10-01 15:00, the 100k run's card.** `--preset
+   small --batch 8 --seq-len 512 --no-engram --steps 300 --log-every 100
+   --timers`, release, this binary. `L = (launches@200 − launches@100)/100 =
+   (4 410 168 − 2 266 805)/100` = **21 434 launches per warm step** (the
+   handover's `@300 − @100` form is unavailable: 300 is not a log step for
+   `--log-every 100`, so the timer never prints it). The decision rule, fixed
+   before the number: `> ~200` ⇒ the graph is the step. **It is 107× the
+   threshold**, and the handover's own inference (~14.5k from 460 ms ÷ 34.4 µs)
+   was in the right place and 47% low.
 2. **Does the window allocate?** §3.1 says it must not, and the refusal message
-   names the cause, so this is answered by the first run rather than by an
-   argument. **NOT TAKEN.**
-3. **The four CUDA gates** (§5). **NOT TAKEN** — the test binary builds, the
-   card is busy.
+   names the cause, so this is answered by the first graphed run. **NOT TAKEN.**
+3. **The positive gates** (§5). **NOT GREEN** — see §5.1 for what each one said
+   on the first run and what changed since.
 4. **Control vs graph over 500 steps.** `--timers` now prints a warm-step mean
    (steps ≥50, because step 0 is the autotune step at 23× a warm step, AGENTS
-   §3.1) on **every** run, so both arms are read with the same instrument.
-   **NOT TAKEN.**
+   §3.1) on **every** run, so both arms are read with the same instrument, and
+   both binaries are built. **NOT TAKEN** — blocked on gate 2/3.
 5. **The autotuner** may sync inside the window; a refused capture says so.
 6. **VRAM**: the retained slices are the step's working set, held for as long as
    the graph lives, and every refused attempt adds one (§3.2). At batch 8 that
@@ -217,9 +234,27 @@ happened to equal the stale-pointer output, and a units bug). So:
    `ModuleOptimizer`'s private state or reimplementing the optimizer. That is a
    separate decision with its own cost; §1 is why v1 stops here.
 
+## 6.1 What `L = 21 434` buys, in arithmetic
+
+A replay is one dispatch (~42 µs of host time, measured) instead of 21 434
+launches. The host is spending 517 ms / 21 434 = **24.1 µs per launch** on this
+run — lower than the 34.4 µs a bare `::launch` costs, because a real op does more
+work per launch than the anchor kernel does. Device time is ~60 ms (13.3%
+utilisation, §3.1). So the arithmetic says a captured window turns a ~517 ms
+step into roughly (60 ms of device work + one dispatch + the pin's ~111 copies),
+i.e. **a 4-8× step-time win is what the mechanism promises**, and the promise is
+arithmetic, not measurement: no A/B has been run. The pin's price against `L` is
+`111 / 21 434` = **0.5%** of the launches it removes.
+
 ## 7. Files
 
-- `crates/dormouse-train/src/graph.rs` — the seam (new).
+- `crates/dormouse-train/src/graph.rs` — the seam (new). `as_constant_float` /
+  `as_constant_int` are the pin's reason to exist in one sentence: burn's
+  `Tensor::try_into_primitive` refuses any tensor whose autodiff context is
+  `Enabled`, and a captured graph needs the raw device address, so the seam
+  marks the tensor `Disabled` — which is what burn itself means by that word —
+  for the length of one copy kernel. Data, device and allocation are untouched;
+  the result never goes back into a burn op.
 - `crates/dormouse-train/src/lib.rs` — `TrainCfg::graph_capture`, the arm, the
   window closure, the pin refreshes, the timer/report lines.
 - `crates/dormouse-train/src/cfg.rs` — `graph::check` in `resolve`.
