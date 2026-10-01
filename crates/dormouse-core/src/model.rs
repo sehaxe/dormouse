@@ -1,4 +1,48 @@
 //! model - Embedding -> LoopBlock -> RMSNorm -> lm_head, all-bf16 capable
+//!
+//! # The whole architecture, and where each piece lives
+//!
+//! ```text
+//! input_ids [b, t] --Embedding(v, d)--> h0
+//!   h0 --> LoopBlock (weight-shared, max_iter passes) --> out_acc [b, t, d]
+//!   out_acc --> RMSNorm --> lm_head (LinearLike, d -> v) --> logits [b, t, v]
+//! ```
+//!
+//! The loop carries three losses: the honest unweighted CE over iterations
+//! (`L_Rec`, ADR-0013 — no PonderNet, no halt head, no KL term), and the
+//! optional auxiliary terms from [`crate::aux`] (JEPA+KoLeo, DSpark,
+//! future-byte, MoR BCE, MoE load-balance). Only `L_Rec` is the objective;
+//! the others are additions with their own weights, all zeroable.
+//!
+//! # Invariants this type holds
+//!
+//! * **`lm_head` and the final norm run in fp32 even under `--bf16`.** bf16
+//!   logits NaN, and it is the single most common shape of "the loss went NaN
+//!   at step 3" (AGENTS.md §2.2). Loop-internal `L_Rec` logits are fp32 for
+//!   the same reason.
+//! * **No host-device synchronization** in any forward here. Every branch is on
+//!   a `#[module(skip)]` config field, never on a device value
+//!   (ADR-0018 rule 2). The one decision that needs a device value is made on
+//!   the device.
+//! * **An off auxiliary arm does not exist**, not merely has weight 0: the
+//!   future-byte head is `Option` and built iff `aux_fb_weight > 0`, so a
+//!   pure-CE run's parameter set and checkpoint are byte-identical to a build
+//!   from before the arm shipped. That is what keeps the pure-CE control valid.
+//! * **`max_seq_len` is a capacity statement, not a truncation.** A longer
+//!   sequence is a shape error, never a silent crop — silent cropping is how a
+//!   "512-token context" run quietly trains on 512 of 4096.
+//!
+//! # The three forward shapes
+//!
+//! [`DormouseModel::forward`] is logits only (inference, tests, the quant
+//! probe). [`DormouseModel::forward_latent`] is the pre-head latent only — the
+//! EMA teacher's pass, no `lm_head`, no losses.
+//! [`DormouseModel::forward_with_hidden`] is the real one:
+//! logits plus every loss term plus the carried KDA state. They share
+//! `forward_with_hidden` internally; the two thin wrappers exist so a caller
+//! cannot accidentally build a graph it does not want (the teacher's pass in
+//! particular must not be grad-tracked).
+
 use burn::backend::DispatchKindConversion;
 use burn::module::{Module, Param, ParamId, ParamMapper};
 use burn::nn::{Embedding, EmbeddingConfig};
@@ -10,35 +54,82 @@ use crate::config::DormouseConfig;
 use crate::loop_block::{LoopBlock, RouteAux};
 use crate::param::LinearLike;
 
+/// The model: an embedding, a weight-shared loop, a norm, a head, and the
+/// auxiliary heads — plus the config constants the forward needs.
+///
+/// Every field is `pub` because `#[derive(Module)]` walks the field list to
+/// build the checkpoint record, and the `#[module(skip)]` ones because the
+/// forward reads config constants rather than being handed the config. The
+/// module tree IS the checkpoint format: renaming or reordering a
+/// parameter-bearing field changes every `.bin` on disk. The non-parameter
+/// fields can change without invalidating a checkpoint, and the resume
+/// config-equality check (ADR-0005/0021) is what stops them changing silently.
 #[derive(Module, Debug)]
 pub struct DormouseModel {
+    /// Byte -> residual vector, `[vocab, d_model]`. 256 rows: the vocabulary is
+    /// bytes, not tokens, so there is no tokenizer and no vocabulary growth
+    /// problem.
     pub embedding: Embedding,
+    /// The weight-shared loop. One instance, run `max_iter` times — not
+    /// `max_iter` blocks. Its `e_k` iteration embedding is what distinguishes
+    /// the passes.
     pub loop_block: LoopBlock,
+    /// Final RMSNorm, applied to `out_acc` before the head. **fp32 even under
+    /// `--bf16`**: bf16 logits NaN, and the norm is where that starts.
     pub norm: RMSNorm,
+    /// `d_model -> vocab`. Spectral (TSCT) when `use_tsct`, with rank
+    /// `min(rank, d_model, vocab)` — the head is `d_model x 256`, so an
+    /// unclamped `rank` above either dimension is not a compression at all but
+    /// a wider matrix wearing a rank's name.
     pub lm_head: LinearLike,
+    /// The auxiliary heads (JEPA predictor, DSpark draft + acceptance,
+    /// future-byte). ON by default; the weights live in the `#[module(skip)]`
+    /// fields below.
     pub aux: AuxHeads,
+    /// `vocab`, for the shape assertions and the generate path.
     #[module(skip)]
     pub vocab_size: usize,
+    /// `d_model`, for the reshape back to `[b, t, d]`.
     #[module(skip)]
     pub d_model: usize,
+    /// Cast activations to bf16 at the arm boundaries. **Slower than fp32 on
+    /// this backend** — there is no bf16 tensor-core path (§2.1) — and
+    /// mixed-dtype ops NaN, which is why the head and the final norm stay fp32.
     #[module(skip)]
     pub bf16: bool,
+    /// JEPA term weight. `0.0` is the pure-CE baseline (A/B queue row 1).
     #[module(skip)]
     pub jepa_weight: f32,
+    /// Expected masked fraction for the JEPA span mask; see
+    /// [`crate::aux::mask_from`] for why the field means what it says.
     #[module(skip)]
     pub jepa_mask_frac: f32,
+    /// Masked span length in byte positions.
     #[module(skip)]
     pub jepa_mask_span: usize,
+    /// DSpark term weight. `0.0` in the shipped recipe — the first DSpark
+    /// measurement this project has made, because the window was one position
+    /// shifted until 2026-09-29.
     #[module(skip)]
     pub dspark_weight: f32,
+    /// DSpark draft horizon `k`.
     #[module(skip)]
     pub dspark_k: usize,
+    /// DSpark anchor spacing in byte positions. Refused at 0: it collapses the
+    /// k-step window into k copies of one CE.
     #[module(skip)]
     pub dspark_stride: usize,
     /// Future-byte auxiliary head: weight and horizon, in BYTE POSITIONS
     /// (`crate::future_byte` for what the term is and which labels it reads).
     #[module(skip)]
     pub aux_fb_weight: f32,
+    /// How far ahead the future-byte head predicts, in byte positions. **Must be
+    /// `>= 1`** and defaults to 2: the label for position `q` is
+    /// `targets[q + k]`, so `k = 0` supervises the head on the byte the MAIN
+    /// CE already predicts — a second CE through an independent head, which
+    /// trains, descends, costs a step, and is not multi-token prediction.
+    /// Refused by `config::validate`. One horizon, not a set: a head per
+    /// horizon is a later row in the A/B queue, not a field with a list in it.
     #[module(skip)]
     pub aux_fb_horizon: usize,
     /// MoR router BCE weight (arXiv 2507.10524). The label is the router's
@@ -53,11 +144,29 @@ pub struct DormouseModel {
     /// `config::schema::moe_lb_coef`.
     #[module(skip)]
     pub moe_lb_coef: f32,
+    /// Longest sequence the model will be asked about, in byte positions. A
+    /// capacity statement: RoPE table size and the trainer's shape checks read
+    /// it, and a longer sequence is a shape error rather than a silent crop.
     #[module(skip)]
     pub max_seq_len: usize,
 }
 
 impl DormouseModel {
+    /// Build the model from a validated config.
+    ///
+    /// Does not call [`crate::config::validate`] — the caller owns that, and
+    /// the trainer calls it once on the fully-resolved config.
+    ///
+    /// Two construction decisions a reader should know:
+    ///
+    /// * The future-byte head is attached **iff** `aux_fb_weight > 0`, matching
+    ///   the `cfg.use_gr.then(..)` shape in [`LoopBlock::new`]. An off-arm
+    ///   model is therefore byte-identical to a build from before the arm
+    ///   existed, which is what keeps queue row 1 (pure CE) a valid control and
+    ///   the measured preset parameter counts true.
+    /// * `lm_head`'s rank is clamped to `min(rank, d_model, vocab)`. Without
+    ///   the clamp a `rank` above the head's own dimensions is not a low-rank
+    ///   factorization at all — it is a wider matrix with a rank's name on it.
     pub fn new(cfg: &DormouseConfig, device: &Device) -> Self {
         let d = cfg.d_model;
         let v = cfg.vocab;
@@ -89,6 +198,12 @@ impl DormouseModel {
         }
     }
 
+    /// Logits only: `[b, t]` byte ids in, `[b, t, vocab]` logits out.
+    ///
+    /// The inference/test/quant-probe shape — no targets, so `L_Rec` is zero
+    /// and no auxiliary term is built. Use
+    /// [`Self::forward_with_hidden`] when you need a loss, and
+    /// [`Self::forward_latent`] for the EMA teacher's pass.
     pub fn forward<B: burn::backend::AutodiffBackend>(
         &self,
         input_ids: Tensor<2, Int>,
@@ -127,7 +242,9 @@ impl DormouseModel {
         out_acc
     }
 
-    /// Returns (logits, L_Rec \[1\], kda, aux Option<\[1\]>). When
+    /// The real forward: logits, every loss term, and the carried KDA state.
+    ///
+    /// Returns `(logits, L_Rec [1], kda, aux Option<[1]>)`. When
     /// `targets` is Some, the per-step reconstruction loss is accumulated
     /// inside the loop block so the model never slices a 4D autodiff tensor
     /// (cubecl/sm_120 stability). `host_rows` carries pre-gathered n-gram
@@ -544,6 +661,11 @@ impl DormouseModel {
     // call now lives where the model and the data crate meet:
     // `dormouse_train::decode::next_byte_logits`.
 
+    /// The longest sequence this model will accept, in byte positions.
+    ///
+    /// A getter for the `#[module(skip)]` field, because `generate`/`serve`
+    /// need it and reading a field of the same name off a borrowed model is
+    /// the sort of thing a refactor silently stops doing.
     pub fn max_seq_len(&self) -> usize {
         self.max_seq_len
     }

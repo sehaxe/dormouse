@@ -1,0 +1,119 @@
+# cargo-deny config. Read by the `supply-chain` job in .github/workflows/ci.yml,
+# which is the only thing that runs it — a policy file nothing checks is
+# documentation pretending to be a gate.
+#
+# WHAT IT COVERS. The graph cargo resolves from the ROOT manifest, which
+# includes the vendored forks under vendor/ because dormouse-core pulls them in
+# by explicit `path =` deps. They are NOT workspace members (the root
+# `exclude`s all three vendor roots — see the root Cargo.toml), so `cargo deny`
+# reaches them through the dependency edges rather than as roots; that is why
+# `targets` below lists no crate names.
+#
+# NOTE: there is no `version` key. cargo-deny 0.20 removed it — it is not a
+# config-format version, it was the old `severity-threshold`/`unlicensed`
+# dialect marker, and a file carrying it now fails to deserialize outright.
+
+[graph]
+# The one target we build. Without this, cargo-deny walks every target-specific
+# dependency cargo knows about (windows-sys, web-sys, ...) and reports licenses
+# and advisories for code that is never compiled on this box — which is where
+# `cfg_block` (no license field at all) would otherwise show up as a red gate
+# about a crate nothing links.
+#
+# WHY THIS IS NOT A LIST OF CRATE NAMES: the vendored forks under vendor/ are
+# reached through `path =` dependency edges from dormouse-core, not as roots, so
+# naming them here would be wrong and leaving them out does not exclude them.
+targets = [
+    "x86_64-unknown-linux-gnu",
+]
+# `--all-features` is passed on the command line by the action, which is what
+# makes the cuda feature's dependency edges (cubecl-cuda, cublas, cudarc) part of
+# the graph. Without it the check would pass on a graph the trainer never builds.
+all-features = true
+
+[advisories]
+# `unsound`/`vulnerability` are errors by default in 0.20 (the old
+# `severity-threshold` field is gone) and stay that way. What is tuned here is
+# `unmaintained`, which is `all` by default and would fail on any transitive
+# crate nobody has touched in a year — this repo's dependency tree is pinned to
+# burn/cubecl pre-releases, so `all` is guaranteed red today and buys nothing.
+# `workspace` restricts it to direct dependencies, which is the class where an
+# unmaintained crate is actually our decision.
+unmaintained = "workspace"
+yanked = "deny"
+# Nothing is ignored. Every entry here is a decision to accept a known advisory
+# in the tree, with a reason; the first one is added when one is needed.
+ignore = []
+
+[bans]
+# warn-only on first landing: this tree carries several duplicate versions
+# (measured 2026-10-01, listed in
+# docs/reviews/ci-quality-2026-10-01.md) and turning this to `deny` before they
+# are triaged would be a red gate nobody reads.
+multiple-versions = "warn"
+# A wildcard version (`serde = "*"`) in a manifest is a silent upgrade of every
+# build until it breaks one, so the intent here is `deny`. It is `warn` on first
+# landing for a mechanical reason worth naming: cargo-deny reads a `path =`
+# dependency with no `version` key as a wildcard, and
+# `allow-wildcard-paths` does NOT rescue it in a crate that could be published
+# (it only applies to `publish = false` crates). Five crates here could be
+# published — dormouse-cli/core/train and vendor's burn-kda/burn-spectral — and
+# between them they hold 22 path deps written that way. Fixing it means adding
+# `publish = false` to five manifests, which is a statement about this repo's
+# release policy and lands in files that other lanes are editing right now, so
+# it is the owner's call, not this job's.
+#
+# To close it: add `publish = false` to those five `[package]` blocks, then flip
+# this to "deny". Nothing else changes and no finding disappears silently — the
+# warn-only readings are listed in docs/reviews/ci-quality-2026-10-01.md.
+wildcards = "warn"
+allow-wildcard-paths = true
+
+[sources]
+# Every dependency must come from crates.io or be a path in this repo. A git
+# dependency is an unpinnable external input; there are zero today.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+[licenses]
+# Permissive only, and the list is EXACTLY what the tree contains — measured
+# 2026-10-01 from `cargo metadata --all-features` over all 756 packages, as a
+# count of distinct SPDX operands, so adding a license here is visible as a
+# number and removing one that is still used is a red gate:
+#   MIT 659 · Apache-2.0 527 · Unicode-3.0 25 · Zlib 23 · BSD-3-Clause 15
+#   Unlicense 11 · Apache-2.0 WITH LLVM-exception 8 · ISC 6 · BSD-2-Clause 5
+#   MPL-2.0 3 · CC0-1.0 3 · LGPL-2.1-or-later 2 · BSL-1.0 2
+#   CDLA-Permissive-2.0 2 · 0BSD 1 · NCSA 1
+# One package carries no license field at all (`cfg_block 0.1.1`, reached only
+# on a non-linux target, so the linux-gnu graph does not include it). If a
+# target is ever added that pulls it in, cargo-deny fails it loudly and the
+# entry has to be a decision with a reason, not an omission.
+#
+# MPL-2.0 is weak-copyleft (file-level). It arrives only through
+# `colored` / `option-ext` / `buildid` — build-time or CLI-formatting tooling,
+# never linked into a shipped artefact — which is why it is allowed rather than
+# excepted per crate.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "LGPL-2.1-or-later",
+    "MIT",
+    "MPL-2.0",
+    "NCSA",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+    "0BSD",
+]
+# We publish nothing, so our own unpublished crates carry no license obligation
+# worth checking here.
+private = { ignore = true }
+# An allowed license nobody uses is a decision that was made and not needed.
+unused-allowed-license = "warn"

@@ -3,6 +3,41 @@
 //! scale (or, mutually exclusively, the GR / AttnRes / mHC replacement for
 //! that one statement). Fixed depth (ADR-0013): every iteration counts
 //! equally, the loss is an honest unweighted CE.
+//!
+//! # Invariants this file holds, and what breaks each one
+//!
+//! * **`L_Rec` is accumulated inside [`LoopBlock::forward_full_state`], per
+//!   iteration, on `[b*t, d]` reshapes.** Never materialized as `[N, b, t, d]`
+//!   and sliced: a dynamic slice of a 4-D autodiff tensor crashes cubecl on
+//!   sm_120 with `CUDA_ERROR_ILLEGAL_ADDRESS` (AGENTS.md §2.2). This is the
+//!   single most load-bearing structural fact in the file.
+//! * **No host-device synchronization.** Every branch below is on a
+//!   `#[module(skip)]` config field, so a branch costs nothing per step, and
+//!   nothing reads a tensor back to make a decision (ADR-0018 rule 2). The
+//!   asserts at the top of the forward inspect CONFIG-derived fields, never
+//!   device values.
+//! * **One residual mechanism at a time.** ReZero, GR, AttnRes and mHC each
+//!   replace the SAME statement in the loop; `config::validate` refuses any
+//!   pair and the forward re-asserts it, because every field is `pub` and a
+//!   hand-built block can carry a flag its parameters do not match.
+//! * **The memory branch has a structural floor**, not a learned one:
+//!   [`memory_floor_mix`] caps the memory's coefficient at `lam_max`, so the
+//!   backbone's share of that branch cannot fall below `1 - lam_max` whatever
+//!   the controller learns. Before that floor the arm was a scaled row copy,
+//!   which is how a lookup table became 99% of the model and explained the
+//!   targets.
+//! * **The in-VRAM memory masks its slot index** (`hash & engram_slot_mask`)
+//!   rather than dividing, which is why the tables round UP to a power of two
+//!   and why the data crate emits RAW FNV keys on this path.
+//!
+//! # Cost
+//!
+//! This is the expensive half of a step. Each iteration is a full-sequence
+//! gated-delta pass allocating ~17 fresh tensors, and it does not amortize with
+//! batch size; the measured warm-step split at 9.2M params / depth 2 / batch 8
+//! puts the KDA backward at ~205 ms of a ~480 ms step, with the TSCT
+//! retraction a further ~53 ms of fixed per-parameter cost. GEMMs are a small
+//! fraction. Judge changes here on launches and scratch bytes, not FLOPs.
 use burn::backend::DispatchKindConversion;
 use burn::module::{Module, Param};
 use burn::nn::{Linear, LinearConfig};
@@ -68,9 +103,20 @@ pub fn memory_floor_mix(
     memory.mul(lam.clone()) + dense.mul(lam.neg().add_scalar(1.0))
 }
 
+/// One expert of the FFN bank: the SwiGLU-shaped pair, both spectral.
+///
+/// There is no shared expert and no dense FFN when `n_experts > 1` — the
+/// controller's softmax blend over experts is the mixture, and with
+/// `moe_topk = 0` that blend is dense, which is the arm's control. Every
+/// expert is a separate [`LinearLike`] and therefore carries its own TSCT
+/// factors, its own quant format and its own slot in the retraction walk.
 #[derive(Module, Debug)]
 pub struct ExpertFFN {
+    /// `d_model -> f` normally, `d_model -> 2f` when `use_situ` is on (Eq 12
+    /// reads `Wg x` and `Wu x` as separate inputs). See [`ExpertFFN::new`].
     pub gate_up: LinearLike,
+    /// `f -> d_model`. The down projection; the activation lives between the
+    /// two, not here.
     pub down: LinearLike,
 }
 
@@ -107,11 +153,63 @@ impl ExpertFFN {
     }
 }
 
+/// The weight-shared loop body, run `max_iter` times with the SAME weights.
+///
+/// # What one iteration does, in order
+///
+/// 1. the **controller** reads `[norm(h), h0]` and emits three gates
+///    (`w_attn`, `w_mem`, `w_ffn`, all sigmoid) plus a softmax blend over the
+///    `n_experts` FFNs — so the mixture weights are a function of the state,
+///    computed per position, not a config constant;
+/// 2. the **shared attention** (KDA) and the **experts** run, each scaled by
+///    its gate;
+/// 3. the **Engram** memory read joins as a convex mixture with a hard floor
+///    ([`memory_floor_mix`]);
+/// 4. the body is deposited into the residual stream by exactly ONE of ReZero
+///    ([`LoopBlock::residual_scale`]), Gated Residual
+///    ([`LoopBlock::gr`]), Attention Residuals ([`LoopBlock::attnres`]) or mHC
+///    ([`LoopBlock::mhc`]) — mutually exclusive, refused in
+///    `config::validate`;
+/// 5. the readout adds the iteration embedding [`Self::iter_embed`].
+///
+/// # Invariants
+///
+/// * **Fixed depth.** There is no halt head and no PonderNet: every iteration
+///   counts equally and `L_Rec` is the unweighted mean CE over them
+///   (ADR-0013). `depth_override` (random depth) and `use_mor` (per-position
+///   routing) are the two arms that vary it, and neither is A/B'd.
+/// * **`L_Rec` is accumulated INSIDE this function**, per iteration, on
+///   `[b*t, d]` reshapes. It is never materialized as `[N, b, t, d]` and
+///   sliced: a dynamic slice of a 4-D autodiff tensor crashes cubecl on
+///   sm_120 with `CUDA_ERROR_ILLEGAL_ADDRESS` (AGENTS.md §2.2). Keep it that
+///   way — this is the single most load-bearing structural fact in the file.
+/// * **No host sync anywhere in the forward.** Arm switches are plain fields
+///   read on the host, so a branch costs nothing per step; nothing reads a
+///   tensor back to decide (ADR-0018 rule 2). The three `assert`s at the top
+///   inspect CONFIG-derived fields, never device values.
+/// * **Off arms do not exist.** `gr`, `attnres`, `mhc` are `Option`s built
+///   from the config flag, so an off-arm model is byte-identical to a build
+///   from before the arm shipped and every existing checkpoint loads.
+/// * The field set is the checkpoint's field set: `#[derive(Module)]` names
+///   every parameter, and `#[module(skip)]` fields are config constants the
+///   model carries rather than reads from the config at forward time.
 #[derive(Module, Debug)]
 pub struct LoopBlock {
+    /// `[h_norm ; h0] -> [w_attn, w_mem, w_ffn, expert blend]`, no bias. Padded
+    /// on the right to a multiple of 4 because cubek's matmul vectorizes on
+    /// `N % 4 == 0` (AGENTS.md §2.2) and the slice back is on the caller.
     pub controller: Linear,
+    /// The KDA arm, wrapped for checkpoint-path stability. Weight-SHARED across
+    /// iterations like everything else here.
     pub shared_attn: AdaptiveAttention,
+    /// `n_experts` independent expert FFNs. The controller's softmax blend
+    /// mixes them; with `moe_topk > 0` a top-k selection replaces the blend
+    /// per token.
     pub expert_ffns: Vec<ExpertFFN>,
+    /// The hashed n-gram memory tables (in-VRAM). `None`-shaped by
+    /// [`Self::use_engram`], not by an `Option`: the module always exists so
+    /// an off-arm checkpoint keeps its (unused) rows, and the forward takes an
+    /// inert branch instead of a different module tree.
     pub engram: EngramModule,
     /// The dense half of the memory branch's convex mixture: a plain
     /// `d_model -> d_model` projection of the SAME hidden state the memory
@@ -119,7 +217,15 @@ pub struct LoopBlock {
     /// the reason the backbone can no longer be starved (see
     /// [`memory_floor_mix`]).
     pub mem_dense: Linear,
+    /// Pre-norm applied to `h` at the top of each iteration, before the
+    /// controller and the arms. One RMSNorm for the whole loop, shared — this
+    /// is a weight-shared block, so a per-sublayer norm would be the one thing
+    /// that is not.
     pub norm: RMSNorm,
+    /// Gated Residual arm (arXiv Qwen3.8-Flash-Next Eq 31-34). `None` unless
+    /// `use_gr`. Never A/B'd, and the four equation defects the 2026-09-28
+    /// audit found were all fixed before any number existed — see
+    /// [`crate::config::DormouseConfig::use_gr`].
     pub gr: Option<GatedResidual>,
     /// Attention Residuals (arXiv:2603.15031): one learned pseudo-query `w_l`
     /// per loop iteration slot (§5, "one RMSNorm and one pseudo-query vector
@@ -155,22 +261,53 @@ pub struct LoopBlock {
     /// launch-count cost, not a parameter cost, which is why the small rung
     /// comes first - see [`crate::config::DormouseConfig::mhc_streams`].
     pub mhc: Option<MhcBlock>,
+    /// `e_k`, the per-iteration-slot embedding added at the readout:
+    /// `[max_iter, d_model]`. Its presence is what makes the `T` iterations
+    /// distinguishable at all — the body is weight-shared, so without it the
+    /// `T` passes would compute the same function `T` times. Zero-initialised,
+    /// so at step 0 the readout is the plain mean over iterations and no arm
+    /// gets a head start from it.
     pub iter_embed: burn::module::Param<Tensor<2>>,
+    /// ReZero's residual coefficient, ONE scalar for the whole loop, init 1.0
+    /// and **not** 0: at 0 the block body contributes nothing AND `dL/dy` is
+    /// exactly zero, so the KDA arm, the experts and the controller's gates
+    /// would all start with no gradient and the model would be a linear map of
+    /// the byte embedding until the scalar moved. Ignored when
+    /// `use_gr`/`use_attnres`/`use_mhc` is on, since those replace the write.
     pub residual_scale: burn::module::Param<Tensor<1>>,
+    /// The readout projection, `d_model -> d_model`, applied to the averaged
+    /// hidden states before the final RMSNorm and `lm_head`. Spectral like
+    /// every other linear, and the third member of the retraction walk.
     pub out_proj: LinearLike,
     /// MoR router: the shared linear scorer of arXiv 2507.10524, one score
     /// per (position, iteration slot). Always present (769 params, routed to
     /// AdamW by the optimizer policy - routers are not Muon+ candidates);
     /// `use_mor` decides whether it is read.
     pub mor_router: MoRRouter,
+    /// Loop depth, copied from the config so the forward does not have to be
+    /// handed the config. Changing it after construction does NOT resize
+    /// `iter_embed` or the `attnres` slot vector, so it is a config-time
+    /// constant, not a runtime knob.
     #[module(skip)]
     pub max_iter: usize,
+    /// Residual-stream width. A `#[module(skip)]` copy of `DormouseConfig::
+    /// d_model`, kept next to the shapes it has to agree with.
     #[module(skip)]
     pub d_model: usize,
+    /// `DormouseConfig::d_ffn`. The `use_situ` assert in the forward holds
+    /// `gate_up.out_features` against `2 * ffn_hidden`, because the field that
+    /// says which activation runs is not the same claim as the width the
+    /// projection was built with.
     #[module(skip)]
     pub ffn_hidden: usize,
+    /// `DormouseConfig::n_experts`. The controller's blend width and the
+    /// length of [`Self::expert_ffns`] are two claims; this is the one the
+    /// forward reads.
     #[module(skip)]
     pub n_experts: usize,
+    /// The KDA arm switch. `false` = a model with NO attention arm, which is
+    /// the one configuration whose held-out BPB in the archive is a number for
+    /// the network that produced it (`--no-kda`; AGENTS.md §3.1).
     #[module(skip)]
     pub use_kda: bool,
     /// Random-depth arm (ADR-0013 rank 2): run only the first `n` iterations
@@ -180,6 +317,11 @@ pub struct LoopBlock {
     /// there is nothing to collapse.
     #[module(skip)]
     pub depth_override: Option<usize>,
+    /// The memory arm switch. `false` makes the forward take the inert
+    /// branch — and the inert branch is the CORRECT forward for a model with
+    /// no memory in it, which is why this is not the bug it was in the eval
+    /// path (AGENTS.md §3.2: `hashed_ids = None` is right here and wrong in a
+    /// measurement).
     #[module(skip)]
     pub use_engram: bool,
     /// Read [`LoopBlock::attnres`]. Kept as a plain field (not `attnres.is_some()`)
@@ -222,10 +364,23 @@ pub struct LoopBlock {
     /// dense half of the branch never carries less than `1 - lam_max`.
     #[module(skip)]
     pub engram_lam_max: f32,
+    /// Cast activations to bf16 at the arm boundaries. **Slower than fp32 on
+    /// this backend** (no bf16 tensor-core path exists; §2.1), and mixed-dtype
+    /// ops NaN, which is why every forward casts to f32 before a Linear and
+    /// back after the residual write. `None` = fp32 everywhere.
     #[module(skip)]
     pub bf16: bool,
+    /// Activation quantization format for the FFN branch. `None` = the
+    /// trainer's auto resolution, not "off": the trainer decides before it
+    /// builds the model. The ATTENTION path is unconditionally at least 8
+    /// bits regardless of what this says
+    /// ([`crate::act_quant::ActFormat::attn`]), so `Fp4` has never run 4-bit
+    /// attention.
     #[module(skip)]
     pub act_quant: Option<ActQuant>,
+    /// Block size for that quantization. `0` = one scale per token. Must
+    /// divide `d_model`; refused in `config::validate` because the failure
+    /// would otherwise be a reshape error on the first forward.
     #[module(skip)]
     pub act_group: usize,
 }
@@ -288,6 +443,24 @@ impl LoopBlock {
         self.out_proj.fold_tsct_diag(agg);
     }
 
+    /// Build the block from a validated config.
+    ///
+    /// Does NOT call [`crate::config::validate`] — the caller owns that, and
+    /// the trainer calls it once on the fully-resolved config (after
+    /// `--set`). Two invariants this constructor establishes that a
+    /// post-hoc mutation of the fields would break, both re-asserted in
+    /// [`Self::forward_full_state`] because every field here is `pub`:
+    ///
+    /// * `use_situ` and the experts' `gate_up` width must agree (`f` vs
+    ///   `2 * f`), or Eq 12 reads a `d -> f` tensor as a `d -> 2f` one;
+    /// * the three residual-replacement arms must not be combined.
+    ///
+    /// The `Option` arms are built from the config flags and are `None`
+    /// otherwise, which is what makes an off-arm model byte-identical to a
+    /// build from before the arm existed.
+    ///
+    /// ReZero's `residual_scale` inits to **1**, not 0, and the reason is
+    /// written at the field: at 0 the whole body has exactly zero gradient.
     pub fn new(cfg: &DormouseConfig, device: &Device) -> Self {
         let d = cfg.d_model;
         let f = cfg.d_ffn;
@@ -355,6 +528,49 @@ impl LoopBlock {
         }
     }
 
+    /// Run the loop `n` times and return `(logits, L_Rec, kda_state, route_aux)`.
+    ///
+    /// `n` is [`Self::max_iter`] unless [`Self::depth_override`] shortens it
+    /// (the random-depth arm). The iteration count is a loop bound, not a
+    /// tensor dimension — the step hiddens are never stacked, which is the
+    /// sm_120 crash-avoidance rule stated at the struct.
+    ///
+    /// # Arguments that are `Option` because the path is optional
+    ///
+    /// * `hashed_ids` `[b, t, 3]` — RAW FNV keys for the in-VRAM memory; `None`
+    ///   when `use_engram` is false, and that `None` is the CORRECT forward for
+    ///   a model with no memory in it. It is NOT correct in a measurement: the
+    ///   eval once passed `None` unconditionally and so scored a
+    ///   memory-disabled network while claiming to score the trained one
+    ///   (AGENTS.md §3.2). Pass real keys whenever the arm is on.
+    /// * `host_rows` `[b, t, 96]` f32 — gathered rows for the RAM-offload
+    ///   tables; `None` on the in-VRAM path.
+    /// * `kda_state` `[b, t, n_heads, head_dim]` — the KDA recurrence carried
+    ///   across chunks, so one sequence longer than `max_seq_len` is served by
+    ///   successive calls rather than one enormous tensor. `None` starts fresh.
+    /// * `targets` `[b*t, 1]` byte indices — when present, the per-iteration CE
+    ///   is gathered from `log_softmax` at these positions and averaged into
+    ///   `L_Rec`. `None` (an eval/decode forward) returns a **zero** `L_Rec`
+    ///   rather than the previous iteration's value, so an eval cannot
+    ///   accidentally train on a stale loss.
+    ///
+    /// # Cost (this is where a step goes)
+    ///
+    /// From a warm-step profile at 9.2M params, depth 2, batch 8 (measured
+    /// 2026-10-01, `d8fa449`): the KDA backward is ~205 ms of a ~480 ms step.
+    /// Each iteration is a full-sequence gated-delta pass allocating ~17 fresh
+    /// tensors, and that does NOT amortize with batch size. The TSCT retraction
+    /// is a separate ~53 ms of fixed per-parameter cost. GEMMs are a small
+    /// fraction of a step. So: this function is launch- and allocation-bound,
+    /// and a change here should be judged on launches and scratch bytes.
+    ///
+    /// # Failure modes
+    ///
+    /// Panics, LOUDLY and naming the cause, on a `use_situ`/`gate_up` width
+    /// mismatch or on two residual-replacement arms at once. Everything else
+    /// that could degrade is a branch on a `#[module(skip)]` field, which is a
+    /// host-side config constant and free — there is no silent kernel fallback
+    /// in this function.
     #[allow(clippy::type_complexity)]
     pub fn forward_full_state<B: burn::backend::AutodiffBackend>(
         &self,
