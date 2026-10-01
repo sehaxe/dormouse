@@ -68,6 +68,21 @@ them are still open.
   not a dependency. Every mechanism and kernel that is not the model lives
   here, with its own paper reference and its own A/B (ADR-0017, ADR-0018). A
   `fused kernel` in this repo always means *this* library.
+- `docs/` — **every document except three.** The root keeps `README.md`,
+  `AGENTS.md` (this file) and `CONTEXT.md`; `docs/glossary.md` keeps its path
+  because every document links it. Everything else is under one of nine
+  directories, one per kind: `adr/` (decisions) · `protocols/` (the instrument a
+  number must satisfy) · `research/` (dated findings, `YYYY-MM-DD-slug.md`) ·
+  `reviews/` (hostile reads of a lane) · `decisions/` (the owner's sheets) ·
+  `architecture/` (design) · `guides/` (running a thing here) · `papers/` (other
+  people's formulas, **the PDFs**, and `provenance.tsv`) · `archive/`.
+  **`docs/archive/` is history, not truth: never cite it as evidence in an
+  argument** (§1.4) — a live document contradicting one of those means the
+  archived one is wrong. Its README says what earns a place there.
+  **[`docs/README.md`](docs/README.md) is the map.** Adding a document means
+  adding a line to `docs-site/tools/manifest.mjs`, and
+  `python3 tools/check_doc_refs.py` fails if any document names a path that is
+  not on disk.
 
 ---
 
@@ -153,6 +168,29 @@ default, **fix one of them; never invent a third name.** Report the
 disagreement — the list at the end of the glossary is a live deliverable, and
 it is the same class of defect as a retracted verification claim, in the
 vocabulary instead of the numbers.
+
+### 1.8 Where a document goes
+
+**One root: `docs/`.** The exceptions are the three files at the repo root
+(`README.md`, `AGENTS.md`, `CONTEXT.md` — the agent convention) and
+`docs/glossary.md`, whose path is load-bearing because every document links it.
+
+A new document goes in exactly one of the nine directories and nowhere else; the
+table is in [`docs/README.md`](docs/README.md), and it is short because the rule
+is "one kind per directory", not "one document per topic". Three things follow
+from it that cost a run to learn the hard way:
+
+- **A file moves once.** No stub is left at the old path, and every reference to
+  it is rewritten in the same commit — `python3 tools/check_doc_refs.py` is what
+  proves that, and it must be green before the commit lands.
+- **A superseded document goes to `docs/archive/`, and its live replacement is
+  named in the commit that archived it.** Archive is not a bin: §1.4's evidence
+  rule still applies there, which is why an archived file may be cited as *how a
+  number was taken* and never as a reason to believe it.
+- **The knowledge base is a view, not a second copy.**
+  `docs-site/tools/manifest.mjs` is the information architecture as data: a new
+  document is a manifest line plus a green `npm run check`, not a page written by
+  hand.
 
 ---
 
