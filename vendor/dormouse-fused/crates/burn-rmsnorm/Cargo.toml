@@ -11,11 +11,12 @@ readme = "README.md"
 [features]
 default = ["std"]
 std = ["burn/std", "burn-tensor/std"]
-cuda = ["dep:burn-cuda", "dep:burn-cubecl", "dep:cubecl", "burn/std", "burn/cuda", "burn-tensor/cuda", "burn/extension", "burn/autodiff"]
+cuda = ["dep:burn-cuda", "dep:burn-cubecl", "dep:cubecl", "dep:burn-autodiff", "burn/std", "burn/cuda", "burn-tensor/cuda", "burn/extension", "burn/autodiff"]
 
 [dependencies]
 burn = { workspace = true }
 burn-tensor = { workspace = true }
+burn-autodiff = { workspace = true, optional = true }
 burn-cuda = { workspace = true, optional = true }
 burn-cubecl = { workspace = true, optional = true }
 cubecl = { workspace = true, optional = true, features = ["std"] }
@@ -46,6 +47,13 @@ required-features = ["cuda"]
 # minimal reproducer this crate is pinned by.
 [[test]]
 name = "lower_probe"
+required-features = ["cuda"]
+
+# The gate the dispatch guard made impossible: the fused kernel as ONE
+# autodiff node on the trainer's backend, gradients vs the tensor path, the
+# counter that says the node arm ran, and the kill switch's counted decline.
+[[test]]
+name = "autodiff_node_cuda"
 required-features = ["cuda"]
 
 [[test]]

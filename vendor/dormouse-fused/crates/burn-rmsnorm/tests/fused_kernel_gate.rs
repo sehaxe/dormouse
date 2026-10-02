@@ -191,31 +191,56 @@ fn the_fused_kernel_is_taken_on_cuda_and_matches_the_scalar_definition() {
     }
 }
 
-/// The dispatch guard. On an AUTODIFF device the kernel must DECLINE, because it
-/// has no backward and would return a leaf — `norm=0/N` from the trainer's own
-/// logs, as a gate rather than a doc string.
+/// The dispatch guard, INVERTED by the autodiff node (2026-10-02). On an
+/// AUTODIFF device the module must now TAKE the fused arm — through
+/// `crate::ops`'s tracked node, which attaches the graph the bare launch
+/// never had. The old test here pinned the decline (`norm=0/N`), because a
+/// bare result in a tracked graph was a LEAF and trained nothing; the node
+/// removes that reason, so the pin flips: one ask, zero skips, NODE_RAN, and
+/// a backward that reaches the input.
 #[test]
-fn the_fused_kernel_declines_on_an_autodiff_device() {
+fn the_fused_kernel_takes_the_node_on_an_autodiff_device() {
     let _g = SEAM.lock().unwrap_or_else(|e| e.into_inner());
     let dev = Device::cuda(0).autodiff();
-    let before = burn_rmsnorm::fused::calls();
-    let t: Tensor<3> = Tensor::random([1, 4, 64], Distribution::Default, &dev);
-    let out = RMSNorm::new(64, 1e-5, &dev).forward(t);
-    let after = burn_rmsnorm::fused::calls();
+    let before = burn_rmsnorm::fused::arm_counts();
+    let t: Tensor<3> = Tensor::random([1, 4, 64], Distribution::Default, &dev).require_grad();
+    let out = RMSNorm::new(64, 1e-5, &dev).forward(t.clone());
+    let after = burn_rmsnorm::fused::arm_counts();
 
     assert_eq!(
+        after.0,
+        before.0 + 1,
+        "the fused arm was not asked once on the autodiff device"
+    );
+    assert_eq!(
         after.1,
-        before.1 + 1,
-        "the fused arm was TAKEN on an autodiff device. It has no backward - \\
-         rmsnorm_cuda returns a fresh Tensor::empty with raw handles written in, so \\
-         the result carries no graph and the arm would receive NO GRADIENT while \\
-         the loss curve still looked healthy."
+        before.1,
+        "the fused arm DECLINED on an autodiff device - the node must engage here, \
+         otherwise the arm is dead on the trainer's backend again"
+    );
+    assert_eq!(
+        after.2,
+        before.2 + 1,
+        "the arm ran, but not through the NODE - on an autodiff backend the bare \
+         demotion is refused, so a launch that is not the node's is a bug in the seam"
     );
     assert_eq!(
         out.dims(),
         [1, 4, 64],
-        "the fallback must still produce the right shape"
+        "the fused path must produce the right shape"
     );
+    // The reason the old decline existed: a fused result with no graph is a
+    // leaf and trains nothing. The node's answer must carry one.
+    let grads = out.powf_scalar(2.0).sum().backward();
+    let gx = t
+        .grad(&grads)
+        .expect("no gradient through the fused node - the result is a leaf, the 8fa5d4c defect");
+    let finite = gx
+        .into_data()
+        .bytes
+        .chunks_exact(4)
+        .all(|c| f32::from_le_bytes(c.try_into().unwrap()).is_finite());
+    assert!(finite, "non-finite gradient through the fused node");
 }
 
 /// The `d < 4` refusal in `fused.rs`, as a gate rather than a hope.

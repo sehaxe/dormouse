@@ -43,16 +43,35 @@ impl RMSNorm {
         #[cfg(feature = "cuda")]
         {
             let [b, t, _] = x.dims();
-            if let Some(out) = crate::fused::rmsnorm_cuda::<burn_cubecl::CubeBackend>(
-                x.clone().reshape([b * t, d]),
-                self.weight.val().clone(),
-                self.eps,
-            ) {
-                return out.reshape([b, t, d]);
+            let x2d = x.clone().reshape([b * t, d]);
+            let w = self.weight.val().clone();
+            // ONE ask per module forward, whatever fused arm takes it. The
+            // node arm (`crate::ops`) is first: on the training/eval backend
+            // the input carries an autodiff context, the bare demotion is
+            // refused (burn-dispatch `src/tensor.rs:481-487`), and before
+            // 2026-10-02 that made this whole arm read `norm=0/N` forever.
+            // The bare arm below still serves genuinely bare callers. The
+            // kill switch (`DM_RMSNORM_FUSED=0`) declines BOTH but still
+            // counts the ask and the skip, so the A/B is one binary and an
+            // env var, and the eval line tells the reader which arm ran.
+            crate::fused::ASKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if !crate::fused::fused_forced_off() {
+                if let Some(out) = crate::ops::rmsnorm_node_autodiff::<burn_cubecl::CubeBackend>(
+                    x2d.clone(),
+                    w.clone(),
+                    self.eps,
+                ) {
+                    crate::fused::NODE_RAN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return out.reshape([b, t, d]);
+                }
+                if let Some(out) =
+                    crate::fused::rmsnorm_launch::<burn_cubecl::CubeBackend>(x2d, w, self.eps)
+                {
+                    return out.reshape([b, t, d]);
+                }
             }
             // The tensor path below is CORRECT, so the only honest way to see
-            // a dead fused kernel is a counter (ADR-0019): on dormouse's
-            // training backend this line is the normal case, not an error.
+            // a dead fused kernel is a counter (ADR-0019).
             crate::fused::SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         // eps inside the sqrt (LLaMA/HF convention): x / sqrt(mean(x^2) + eps)
@@ -147,3 +166,7 @@ mod tests {
     }
 }
 pub mod fused;
+#[cfg(feature = "cuda")]
+pub mod cuda_dispatch;
+#[cfg(feature = "cuda")]
+pub mod ops;

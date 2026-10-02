@@ -3,10 +3,9 @@
 //!
 //! The seam accounting lives here (ADR-0019): `rmsnorm_cuda` returning `None`
 //! is a CORRECT tensor-ops answer, so a kernel that never engages looks
-//! exactly like one that does - on the trainer's backend it does not engage
-//! (the model's norm input is an autodiff tensor, not a bare `CubeTensor`).
-//! `(asked, skipped)` is the pair that says so out loud; the trainer prints it
-//! on the eval line.
+//! exactly like one that does. Since 2026-10-02 the autodiff node arm
+//! (`crate::ops`) engages on the trainer's backend, and `arm_counts()`
+//! returns `(asked, skipped, node_ran)`.
 
 /// `(times the fused kernel was asked for, times it was skipped for the
 /// tensor path)`. `asked == skipped` is a DEAD kernel; `asked == 0` is a
@@ -31,6 +30,29 @@ pub static SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 #[cfg(not(feature = "cuda"))]
 pub fn calls() -> (u64, u64) {
     (0, 0)
+}
+
+/// The autodiff NODE arm (`crate::ops`): launches of the fused kernel through
+/// the tracked node on a training/eval backend. The doctrine is one counter
+/// per arm — `asked - skipped` cannot tell this arm from the bare arm, and on
+/// the trainer's backend only this arm can run at all.
+#[cfg(feature = "cuda")]
+pub static NODE_RAN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(asked, skipped, node_ran)` — the third field is 0 without the cuda
+/// feature, like the first two.
+#[cfg(feature = "cuda")]
+pub fn arm_counts() -> (u64, u64, u64) {
+    (
+        ASKED.load(std::sync::atomic::Ordering::Relaxed),
+        SKIPPED.load(std::sync::atomic::Ordering::Relaxed),
+        NODE_RAN.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn arm_counts() -> (u64, u64, u64) {
+    (0, 0, 0)
 }
 
 #[cfg(feature = "cuda")]
@@ -146,26 +168,50 @@ fn rmsnorm_kernel<F: Float>(
     }
 }
 
+/// Kill switch: `DM_RMSNORM_FUSED=0` forces both fused arms (bare + autodiff
+/// node) to decline, so the A/B of the node against the tensor path is one
+/// binary and an env var. The decline is COUNTED — an ask under the switch
+/// still increments ASKED and then SKIPPED, so the eval line reads it.
+#[cfg(feature = "cuda")]
+pub fn fused_forced_off() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| {
+        std::env::var("DM_RMSNORM_FUSED").as_deref() == Ok("0")
+    })
+}
+
 /// Fused RMSNorm on the bare CUDA backend. Returns `None` when the tensor is
 /// not on CUDA (caller falls back to the tensor path).
 ///
-/// **THERE IS NO BACKWARD, and that is the whole story of this function's
-/// reach.** `out` is a fresh `Tensor::empty` and the launch writes raw handles
-/// into it, so the result carries no graph: were this reached from an autodiff
-/// input, the arm would hand back a leaf, receive no gradient, and every loss
-/// curve would still look healthy — the `burn_gdn2` defect. The only thing
-/// standing between the trainer and that is `try_into_primitive`'s refusal,
-/// because `DispatchKindConversion` rejects any dispatch tensor whose `autodiff`
-/// field is not `Disabled` (burn-dispatch `src/tensor.rs:481-487`). So: wiring
-/// this into a training forward means writing the adjoint first, not relaxing
-/// a `?`. Measured both ways in `tests/rmsnorm_kernel_cuda.rs`.
+/// The counter contract: ASKED is incremented HERE, at the only public entry
+/// that asks for the fused kernel from outside the module
+/// (`RMSNorm::forward` counts the ask itself and calls
+/// [`rmsnorm_launch`], so a forward that tries the node arm first is still
+/// one ask).
 #[cfg(feature = "cuda")]
 pub fn rmsnorm_cuda<B: Backend>(x: Tensor<2>, weight: Tensor<1>, eps: f32) -> Option<Tensor<2>>
 where
     burn::tensor::DispatchTensor: burn::backend::DispatchKindConversion<B>,
 {
-    use burn_cubecl::tensor::CubeTensor;
     ASKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    rmsnorm_launch::<B>(x, weight, eps)
+}
+
+/// The launch, without the ask counter: bare tensors in, fused kernel out,
+/// `None` on any refusal (not CUDA, d < [`MIN_FUSED_D`], non-f32).
+///
+/// The launch is BACKWARD-LESS by itself (`out` is a fresh `Tensor::empty`
+/// with raw handles written in) — reaching it from an autodiff graph through
+/// [`crate::ops`] is what attaches the graph; a bare call from a tracked
+/// tensor is the `8fa5d4c` leaf defect, and the dispatch layer's context
+/// refusal (burn-dispatch `src/tensor.rs:481-487`) is what keeps that from
+/// happening by accident.
+#[cfg(feature = "cuda")]
+pub fn rmsnorm_launch<B: Backend>(x: Tensor<2>, weight: Tensor<1>, eps: f32) -> Option<Tensor<2>>
+where
+    burn::tensor::DispatchTensor: burn::backend::DispatchKindConversion<B>,
+{
+    use burn_cubecl::tensor::CubeTensor;
     let cube = |t: Tensor<2>| -> Option<CubeTensor> {
         let prim = t.clone().try_into_primitive::<B>().ok()?;
         let c = (&prim as &dyn Any).downcast_ref::<CubeTensor>()?;
