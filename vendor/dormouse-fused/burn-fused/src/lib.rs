@@ -40,6 +40,7 @@ pub use burn_autodiff;
 
 pub use burn_attnres;
 pub use burn_bitnet;
+pub use burn_byteflow;
 pub use burn_dspark;
 pub use burn_eggroll;
 pub use burn_engram;

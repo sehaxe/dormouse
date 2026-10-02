@@ -48,6 +48,7 @@ cuda = [
 std = [
     "burn-attnres/std",
     "burn-bitnet/std",
+    "burn-byteflow/std",
     "burn-dspark/std",
     "burn-eggroll/std",
     "burn-engram/std",
@@ -70,9 +71,14 @@ training = [
     "burn-dspark/training",
 ]
 
+wgpu = [
+    "burn-rmsnorm/wgpu",
+]
+
 [dependencies]
 burn-attnres = { path = "../crates/burn-attnres", default-features = false }
 burn-bitnet = { path = "../crates/burn-bitnet", default-features = false }
+burn-byteflow = { path = "../crates/burn-byteflow", default-features = false }
 burn-dspark = { path = "../crates/burn-dspark", default-features = false }
 burn-eggroll = { path = "../crates/burn-eggroll", default-features = false }
 burn-engram = { path = "../crates/burn-engram", default-features = false }
