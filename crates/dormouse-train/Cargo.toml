@@ -65,3 +65,10 @@ required-features = ["cuda"]
 [[test]]
 name = "graph_seam_cuda"
 required-features = ["cuda"]
+
+# The stage seam's gate (capture -> replay -> bit-identical latents) needs the
+# card, for the same reason and with the same false-green guard as
+# `graph_seam_cuda` above.
+[[test]]
+name = "stage_capture_cuda"
+required-features = ["cuda"]

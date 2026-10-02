@@ -1424,7 +1424,11 @@ name = "burn-situ"
 version = "0.1.0"
 dependencies = [
  "burn",
+ "burn-autodiff",
+ "burn-cubecl",
+ "burn-cuda",
  "burn-tensor",
+ "cubecl",
 ]
 
 [[package]]

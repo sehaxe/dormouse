@@ -70,6 +70,8 @@ cuda = [
     "burn-spectral/cuda",
     "burn-rmsnorm/cuda",
     "burn-attnres/cuda",
+    "burn-situ/cuda",
+    "burn-situ/autodiff",
 ]
 # CUDA-only probes: burn-cuda types and a CUDA context exist only with the
 # cuda feature.

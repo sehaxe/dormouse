@@ -285,12 +285,17 @@ pub struct Stats {
     pub replays: u64,
     pub captures: u64,
     pub refusals: u64,
-    /// Set after [`MAX_REFUSALS`]: the capture is not attempted again. A refused
-    /// capture has already grown the persistent pool by one working set (the
-    /// priming pass keeps every slice it touched), so a run that retries every
-    /// step and is refused every step would grow that pool until it OOMs.
-    /// Stopping is loud — it is in the report line — and correct, because an
-    /// ungraphed step trains exactly what a replayed one would.
+    /// Refusals since the last successful capture: the budget is CONSECUTIVE
+    /// failures, so one good capture gives the seam a fresh count.
+    pub refusals_in_row: u64,
+    /// Set at [`MAX_REFUSALS`] consecutive failures: the capture is not
+    /// attempted again, so the pool stops growing. A refused capture has
+    /// already pinned its whole working set in the persistent pool
+    /// (`capture_end` → `retain_touched`), so a run that retries every step
+    /// and is refused every step grows that pool by a working set per step
+    /// until it OOMs — measured on this box: the whole-step capture refused
+    /// with 2331 memory nodes, retried, and the pool grew ×20 into
+    /// ILLEGAL_ADDRESS (`~/logs/gbench2_graph.log`, 2026-10-02).
     pub disabled: bool,
     pub last_refusal: Option<String>,
 }
@@ -309,10 +314,51 @@ impl Stats {
             }
         )
     }
+
+    /// Whether a capture may be attempted at all. `graph_prepare` — the call
+    /// that arms the pool the refusals grow — is reachable ONLY under this
+    /// gate, so `false` here is the whole of "no third attempt, no pool
+    /// growth".
+    pub(crate) fn capture_allowed(&self) -> bool {
+        !self.disabled && self.refusals_in_row < MAX_REFUSALS
+    }
+
+    /// A capture succeeded: the consecutive-failure budget resets.
+    pub(crate) fn captured(&mut self) {
+        self.refusals_in_row = 0;
+    }
+
+    /// One refused capture. Loud per ADR-0019: the first refusal prints its
+    /// reason verbatim; the one that exhausts the budget prints WHY the seam
+    /// stops and never grows the pool again.
+    pub(crate) fn refused(&mut self, reason: String) {
+        self.refusals += 1;
+        self.refusals_in_row += 1;
+        if self.refusals_in_row == 1 {
+            println!(
+                "graph: capture REFUSED ({reason}). One more attempt will be made; a second \
+                 consecutive failure disables the capture for the rest of the run."
+            );
+        }
+        if self.refusals_in_row >= MAX_REFUSALS {
+            self.disabled = true;
+            println!(
+                "graph: {MAX_REFUSALS} failed captures in a row - capture DISABLED for the rest \
+                 of this run. A refused capture has already pinned its working set in the \
+                 persistent pool, so every further attempt would grow the pool toward OOM / \
+                 ILLEGAL_ADDRESS. The run continues ungraphed and trains exactly what it would \
+                 have. Last refusal: {reason}"
+            );
+        }
+        self.last_refusal = Some(reason);
+    }
 }
 
-/// How many refusals before the seam stops trying. See [`Stats::disabled`].
-const MAX_REFUSALS: u64 = 20;
+/// How many CONSECUTIVE failed captures before the seam stops trying. Two, not
+/// twenty: each refused capture pins one working set in the persistent pool,
+/// and twenty attempts is how the whole-step capture OOM'd the card
+/// (`~/logs/gbench2_graph.log`, 2026-10-02). See [`Stats::disabled`].
+const MAX_REFUSALS: u64 = 2;
 
 /// The same BUFFER as a float `t`, with burn's autodiff context marked `Disabled`, so
 /// `Tensor::try_into_primitive` will hand out its raw cubecl handle.
@@ -384,7 +430,7 @@ fn as_constant_float<const D: usize>(t: &Tensor<D>) -> Tensor<D> {
 /// [`as_constant_float`] for Int tensors. One helper per kind, not one generic:
 /// burn's `Basic` bound is `pub(crate)`, so a caller cannot name a bound that
 /// covers both kinds and `into_dispatch` is defined per kind.
-fn as_constant_int<const D: usize>(t: &Tensor<D, burn::tensor::Int>) -> Tensor<D, burn::tensor::Int> {
+pub(crate) fn as_constant_int<const D: usize>(t: &Tensor<D, burn::tensor::Int>) -> Tensor<D, burn::tensor::Int> {
     let mut d = t.clone().into_dispatch();
     d.autodiff = burn_dispatch::DispatchAutodiffContext::Disabled;
     Tensor::from_dispatch(d)
@@ -620,7 +666,10 @@ impl Seam {
         model: DormouseModel,
         teacher: Option<DormouseModel>,
     ) -> (DormouseModel, Option<DormouseModel>) {
-        (map(model, &mut self.model_pins, PinAction::Arm), teacher.map(|t| map(t, &mut self.teacher_pins, PinAction::Arm)))
+        (
+            arm_pins(model, &mut self.model_pins),
+            teacher.map(|t| arm_pins(t, &mut self.teacher_pins)),
+        )
     }
 
     /// Copy every parameter of `module` into its master and re-point it there.
@@ -636,17 +685,7 @@ impl Seam {
     ) -> (DormouseModel, Result<(), String>) {
         let pins = if teacher { &mut self.teacher_pins } else { &mut self.model_pins };
         self.pin_launches += pins.copies() as u64;
-        let unsupported = pins.unsupported_rank;
-        let mut m = PinMapper { action: PinAction::Refresh, pins, failed: false, why: None };
-        let module = module.map(&mut m);
-        if m.failed {
-            let why = unsupported
-                .map(|r| format!("parameter of rank {r} has no pin representation"))
-                .or(m.why)
-                .unwrap_or_else(|| "a copy_into was refused".into());
-            return (module, Err(why));
-        }
-        (module, Ok(()))
+        refresh_pins(module, pins)
     }
 
     pub fn armed(&self) -> bool {
@@ -686,7 +725,7 @@ impl Seam {
         self.graph = None;
         #[cfg(feature = "cuda")]
         {
-            if !ungraphed && !self.stats.disabled {
+            if !ungraphed && self.stats.capture_allowed() {
                 if let Some(client) = &self.client {
                     if let Err(e) = client.graph_prepare() {
                         self.grads = Some(body());
@@ -714,6 +753,7 @@ impl Seam {
                         Ok(graph) => {
                             self.graph = Some(Arc::new(graph));
                             self.stats.captures += 1;
+                            self.stats.captured();
                             // CUDA stream capture RECORDS work; it does not
                             // execute it. The gradients `body()` handed back
                             // are the buffers' PRE-capture contents — measured
@@ -743,23 +783,7 @@ impl Seam {
     }
 
     fn refused(&mut self, reason: String) -> Result<(), String> {
-        self.stats.refusals += 1;
-        if self.stats.refusals == 1 {
-            println!(
-                "graph: capture REFUSED ({reason}). Continuing UNGRAPHED: correct, and as slow \
-                 as before --graph-capture. A refusal that names a memory node means the window \
-                 grew the pool — it must allocate nothing new, so capture later in the run."
-            );
-        }
-        if self.stats.refusals == MAX_REFUSALS {
-            self.stats.disabled = true;
-            println!(
-                "graph: {MAX_REFUSALS} refusals, so the capture is DISABLED for the rest of this \
-                 run. Each attempt grew the persistent pool by a working set; retrying forever \
-                 would OOM. The run continues ungraphed and trains exactly what it would have."
-            );
-        }
-        self.stats.last_refusal = Some(reason);
+        self.stats.refused(reason);
         Ok(())
     }
 
@@ -774,8 +798,26 @@ impl Seam {
     }
 }
 
-fn map(module: DormouseModel, pins: &mut Pins, action: PinAction) -> DormouseModel {
-    module.map(&mut PinMapper { action, pins, failed: false, why: None })
+/// Pin one module's float parameters to master buffers. `pub(crate)` so the
+/// stage seam can arm the teacher alone (the whole-step seam pins both models).
+pub(crate) fn arm_pins<M: Module>(module: M, pins: &mut Pins) -> M {
+    module.map(&mut PinMapper { action: PinAction::Arm, pins, failed: false, why: None })
+}
+
+/// Copy every parameter of `module` into its master and re-point it there —
+/// the shared body of [`Seam::refresh`] and the stage seam's teacher refresh.
+pub(crate) fn refresh_pins<M: Module>(module: M, pins: &mut Pins) -> (M, Result<(), String>) {
+    let unsupported = pins.unsupported_rank;
+    let mut m = PinMapper { action: PinAction::Refresh, pins, failed: false, why: None };
+    let module = module.map(&mut m);
+    if m.failed {
+        let why = unsupported
+            .map(|r| format!("parameter of rank {r} has no pin representation"))
+            .or(m.why)
+            .unwrap_or_else(|| "a copy_into was refused".into());
+        return (module, Err(why));
+    }
+    (module, Ok(()))
 }
 
 /// Which arms `--graph-capture` cannot be combined with, named.
@@ -858,6 +900,49 @@ mod tests {
         #[cfg(feature = "cuda")]
         m.put(&t).expect("on CUDA the pin copy must succeed");
     }
+    /// THE REFUSAL BUDGET (2026-10-02): two consecutive failed captures
+    /// disable the seam, so there is no third attempt — and `graph_prepare`,
+    /// the call that grows the pool a refused capture pins into, is reachable
+    /// ONLY under `capture_allowed`. Twenty retries is what grew the pool ×20
+    /// into ILLEGAL_ADDRESS (`~/logs/gbench2_graph.log`).
+    #[test]
+    fn two_failed_captures_disable_the_seam_and_stop_the_pool_growth() {
+        let mut s = Stats::default();
+        assert!(s.capture_allowed(), "the first attempt must be allowed");
+        s.refused("stop_capture: 2331 memory node(s)".into());
+        assert!(s.capture_allowed(), "one failure leaves exactly one more attempt");
+        s.refused("stop_capture: 2331 memory node(s)".into());
+        assert!(s.disabled, "the second consecutive failure must disable");
+        assert!(
+            !s.capture_allowed(),
+            "a third attempt would pin a third working set in the pool — the gate must be shut"
+        );
+        // Idempotent: whatever calls refused() after the disable must not
+        // revive the seam or clear the budget state.
+        s.refused("late refusal".into());
+        assert!(s.disabled && !s.capture_allowed());
+        assert_eq!(s.refusals, 3, "refusals are still counted for the report line");
+        assert!(s.line().contains("DISABLED after repeated refusals"), "{}", s.line());
+    }
+
+    /// The budget is CONSECUTIVE failures: one successful capture resets it,
+    /// so an intermittent refusal does not brick the seam while two in a row
+    /// still do.
+    #[test]
+    fn a_successful_capture_resets_the_refusal_budget() {
+        let mut s = Stats::default();
+        s.refused("transient".into());
+        s.captured();
+        assert!(s.capture_allowed() && s.refusals_in_row == 0);
+        s.refused("later refusal".into());
+        assert!(
+            s.capture_allowed(),
+            "one refusal after a success is not a streak"
+        );
+        s.refused("second in a row".into());
+        assert!(s.disabled, "two CONSECUTIVE failures must still disable");
+    }
+
     /// The keys gate, quiet half (2026-10-02, the `gbench_graph2` refusal): a
     /// window that consumes no keys (`--no-engram`) takes a step that still
     /// SUPPLIES the stream's unconditional FNV keys — passes, drops.

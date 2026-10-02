@@ -192,6 +192,13 @@ struct Args {
     /// and --jepa-targets.
     #[arg(long)]
     graph_capture: bool,
+    /// Capture ONE stage - the EMA teacher's forward (the JEPA latents) - into
+    /// a CUDA graph and replay it every step (one dispatch instead of ~4.4k
+    /// launches). Off by default; the stage is bit-exact, so the objective is
+    /// unchanged. Requires JEPA on and --no-engram; refused with
+    /// --graph-capture, --engram-ram and --jepa-targets.
+    #[arg(long)]
+    graph_stage: bool,
     /// cubecl autotune level (minimal | medium | full); passed to the
     /// runtime, which reads it from the process environment.
     #[arg(long)]
@@ -257,6 +264,7 @@ fn build_run(a: &Args) -> Result<dormouse_train::RunCfg, String> {
     train.timers |= a.timers;
     train.memlog |= a.memlog;
     train.graph_capture |= a.graph_capture;
+    train.graph_stage |= a.graph_stage;
     // warmup keeps its schema default (true) - no flag on purpose.
     dormouse_train::resolve(preset_name, &a.set, train)
 }
