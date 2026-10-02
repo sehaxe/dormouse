@@ -18,39 +18,45 @@
 //!   fixed `g_min = -5`. **Verified** against FLA's own executed reference
 //!   (`fla/ops/kda/gate.py::naive_kda_lowerbound_gate`, commit `9f38d249`) by
 //!   `tests/kda_oracle.rs::k3_bounded_decay_matches_fla_reference`.
-//! - Kimi Linear: `g_t = -exp(A_h) * Softplus(z_t)` (unbounded below). **This
-//!   is what the sources say and it is NOT what [`DecayFn::Softplus`]
-//!   computes** — that branch puts `exp(A_h)` *inside* the softplus. The two
-//!   are different functions; see the branch's own comment and
-//!   `tests/kda_oracle.rs::kimi_linear_softplus_decay_matches_fla_reference`,
-//!   which is RED ON PURPOSE. The branch is not the default and the fix is A/B
-//!   queue arm 5, so it is reported rather than changed.
+//! - Kimi Linear (**FIXED 2026-10-02**, owner-approved class B): `g_t =
+//!   -exp(A_h) * Softplus(z_t)` (unbounded below). This is what
+//!   [`DecayFn::Softplus`] computes SINCE 2026-10-02 — it compares against
+//!   FLA's executed `naive_kda_gate` (`gate.py:50`) and the triton twin
+//!   (`gate.py:167`). Until then the branch computed
+//!   `-Softplus(exp(A_h) * z)`, a different function that agreed with the
+//!   reference only at A = 0; the divergence was carried as a RED-ON-PURPOSE
+//!   oracle test (`kimi_linear_softplus_decay_matches_fla_reference`, now
+//!   green) and the fix is documented in `docs/reviews/kdafix-2026-10-02.md`.
 //!
 //! Training uses the chunked WY form, which is the same algebra as GDN-2 under
 //! the mapping `b = beta` (key channels), `g = log(alpha)` (key channels),
-//! `w_gate = beta` (value channels) and `scale = 1.0`; see [`crate::fused`] for
+//! `w_gate = beta` (value channels) and `scale = head_k_dim**-0.5`
+//! (`fla_read_scale`); see [`crate::fused`] for
 //! why `w_gate` is `beta` and not `1` (it was documented as `1` here until
 //! 2026-09-30, and the code was right and the comment was wrong). Decoding uses
 //! the exact chunked WY form (`forward_recurrent` is the exact per-token
 //! reference). A fused CUDA kernel path (`feature = "cuda"`) reuses the GDN-2
 //! chunked kernels through the same WY mapping.
 //!
-//! # `scale = 1.0` here, `head_k_dim**-0.5` in both references — OPEN
+//! # `scale = 1.0` here vs `head_k_dim**-0.5` in both references — FIXED 2026-10-02
 //!
 //! FLA's `chunk_kda` and `fused_recurrent_kda` both default `scale = K ** -0.5`
 //! (`chunk.py:474`, `fused_recurrent.py:261`) and `fla/layers/kda.py:262` calls
 //! `chunk_kda` **without** a `scale` argument, so the official KDA layer runs
-//! at `head_k_dim**-0.5`. This crate passes `1.0`. The factor enters only the
-//! read `o = q·S`, never the state update, and the RMSNorm in [`KdaModule::output`]
-//! is invariant to a constant rescale of its input, so it is absorbed to
-//! `O(eps / mean(o²))` ≈ `O(1e-5)` in the running model — which is exactly why
-//! no test, loss curve or seed comparison here can see it. It is still a real
-//! divergence, and `tests/kda_oracle.rs` carries it as two RED-ON-PURPOSE tests
+//! at `head_k_dim**-0.5`. Until that date this crate passed `1.0`; the constant
+//! now lives in ONE function — [`fla_read_scale`] — and every path (tensor
+//! chunk, fused kernels, recurrent scan) takes it through there. The factor
+//! enters only the read `o = q·S` (and the intra-chunk scores), never the state
+//! update, and the RMSNorm in [`KdaModule::output`] is invariant to a constant
+//! rescale of its input, so it is absorbed to `O(eps / mean(o²))` ≈ `O(1e-5)`
+//! in the running model — which is exactly why no loss curve or seed
+//! comparison in the model can see it, and also why the fix moves no trained
+//! checkpoint's behavior beyond that eps floor (the *fixtures* move by
+//! `K**0.5`). Owner-approved class B; the two RED-ON-PURPOSE tests
 //! (`read_scale_matches_fla_reference`, `chunked_wy_applies_no_read_scale`)
-//! with a green twin proving the mechanism already honours the scale when asked.
-//! Changing `1.0` moves every number derived from this crate, so it is the
-//! owner's call. Arithmetic and citations:
-//! `docs/reviews/2026-09-30-kda-formula-audit.md` §3.2.
+//! are green as of the fix. Arithmetic and citations:
+//! `docs/reviews/2026-09-30-kda-formula-audit.md` §3.2 and
+//! `docs/reviews/kdafix-2026-10-02.md`.
 //!
 //! # Decay init: `a_log = -3`, `b_alpha = +1` is OURS, and it is not a citation
 //!
@@ -389,39 +395,54 @@ impl KdaDecay {
             .clone()
             .reshape([1, 1, n_heads, 1])
             .clamp(-10.0, 20.0);
-        let scaled = z_h.mul(a.exp());
+        let exp_a = a.exp();
         let g = match self.decay_fn {
-            // Kimi Linear, AS THE SOURCES STATE IT: g = -exp(A_h) * Softplus(z).
+            // Kimi Linear, AS THE SOURCES STATE IT AND AS EXECUTED:
+            // g = -exp(A_h) * Softplus(z). Two independent transcriptions in
+            // one original file: the executed reference `naive_kda_gate`
+            // (`gate.py:50`, `g = -A_log.exp() * F.softplus(g + dt_bias)`) and
+            // the triton twin (`gate.py:167`, `b_yg = -exp(b_A) *
+            // softplus(b_g)`). Order is the reference's: the scale is applied
+            // AFTER the softplus, which matters because the two are different
+            // functions, not a reparameterisation (they agree only at A = 0).
+            // Green against FLA's executed row:
+            // `tests/kda_oracle.rs::kimi_linear_softplus_decay_matches_fla_reference`.
             //
-            // DIVERGES FROM THAT, and did so until 2026-09-30 when this comment
-            // was corrected to match the code rather than the reverse:
-            // `exp(A_h)` is INSIDE the softplus here, `-Softplus(exp(A_h) * z)`.
-            // FLA has it outside, in two independent transcriptions in one file
-            // -- the executed reference `naive_kda_gate` (`gate.py:50`) and the
-            // triton twin (`gate.py:167`, `b_yg = -exp(b_A) * softplus(b_g)`).
-            // The two are different functions, not a reparameterisation: they
-            // agree only at A = 0, and at this crate's own init (A = -3, z = +1)
-            // upstream gives alpha = 0.574 and this gives 0.512.
-            //
-            // No test in this crate can see it, because every comparison here is
-            // arm-vs-arm and both arms read this same function. It is caught by
-            // `tests/kda_oracle.rs::kimi_linear_softplus_decay_matches_fla_reference`,
-            // which is RED ON PURPOSE; `tests/oracle/falsify.sh` mutant B1 is
-            // the candidate fix and turns that red green.
-            //
-            // NOT FIXED HERE. This branch is not the default (`DecayFn::Sigmoid`
-            // is, and every checkpoint in the tree was trained with it), but it
-            // is the subject of A/B queue arm 5 and a numerical change to a
-            // shipped objective is the owner's call.
-            DecayFn::Softplus => activation::softplus(scaled, 1.0).neg(),
+            // At this crate's own init (A = -3, z = +1) the form gives
+            // alpha = 0.937 (see the module-docs init table). `g` is unbounded
+            // below, so `alpha = exp(g)` can underflow to 0 -- saturation, and
+            // NaN-impossible because g <= 0 elementwise (exp(A) > 0, softplus >
+            // 0). The `a` clamp still matters here only for the OTHER branch
+            // and for grad-time exp overflow, so it stays.
+            DecayFn::Softplus => activation::softplus(z_h, 1.0).mul(exp_a.neg()),
             // Kimi K3, the RUNNING branch: g = g_min * Sigmoid(exp(A_h) z), with
             // `g_min = -5` fixed. VERIFIED against FLA's executed
             // `naive_kda_lowerbound_gate` (gate.py:81) including the bound:
             // `tests/kda_oracle.rs::k3_bounded_decay_matches_fla_reference`.
-            DecayFn::Sigmoid => activation::sigmoid(scaled).mul_scalar(self.g_min as f32),
+            DecayFn::Sigmoid => activation::sigmoid(z_h.mul(exp_a))
+                .mul_scalar(self.g_min as f32),
         };
         g.exp()
     }
+}
+
+/// The read scale FLA's official KDA layer runs at (`head_k_dim**-0.5`), in
+/// ONE place. Both upstreams default it and pass it explicitly:
+/// `fla/ops/kda/chunk.py:474-475` and `fla/ops/kda/fused_recurrent.py:261-262`
+/// both contain `if scale is None: scale = K ** -0.5`, and
+/// `fla/layers/kda.py:262-278` calls `chunk_kda(...)` with **no `scale`**
+/// argument — so the default is what the shipped layer runs. FLA's
+/// `naive_recurrent_kda` folds the same constant into `q` before the token
+/// loop (`naive.py:57`), and `burn-gdn2` uses `d_k**-0.5` the same way
+/// (`gdn2/src/module.rs:299`) — burn-kda overriding it to `1.0` (until
+/// 2026-10-02) was the divergence, carried as two RED-ON-PURPOSE oracle tests.
+/// The factor enters only the read/output side (`o = q·S`, and the intra-chunk
+/// scores); the RMSNorm in [`KdaModule::output`] absorbs a constant rescale to
+/// `O(eps / mean(o²))` ≈ `O(1e-5)`, which is why no loss curve or seed
+/// comparison in the model can see it. Fixed owner-approved, class B;
+/// `docs/reviews/kdafix-2026-10-02.md`.
+pub fn fla_read_scale(head_k_dim: usize) -> f64 {
+    (head_k_dim as f64).powf(-0.5)
 }
 
 // ─── Exact single-step recurrence (Eq 1) ──────────────────────────────
@@ -593,6 +614,13 @@ impl KdaModule {
             chunk_size: cfg.chunk_size,
             norm_eps: cfg.norm_eps,
         }
+    }
+
+    /// The read scale this layer passes the chunked and op paths:
+    /// [`fla_read_scale`] at `head_dim`. One function so the mutant that
+    /// drifts the constant is pinnable (`tests/oracle/falsify.sh` A6).
+    pub fn k_scale(&self) -> f64 {
+        fla_read_scale(self.head_dim)
     }
 
     /// Projections + decay (K3 block design). Returns `(q, k, v, log_decay,
@@ -812,12 +840,24 @@ impl KdaModule {
                 {
                     (o, s)
                 } else {
-                    chunk_wy_forward(q, k, v, g, b_k.clone(), b_v, state, 1.0, self.chunk_size)
+                    chunk_wy_forward(
+                        q,
+                        k,
+                        v,
+                        g,
+                        b_k,
+                        b_v,
+                        state,
+                        self.k_scale(),
+                        self.chunk_size,
+                    )
                 }
             }
             #[cfg(not(feature = "cuda"))]
             {
-                chunk_wy_forward(q, k, v, g, b_k.clone(), b_v, state, 1.0, self.chunk_size)
+                chunk_wy_forward(
+                    q, k, v, g, b_k, b_v, state, self.k_scale(), self.chunk_size,
+                )
             }
         };
         (self.output(out, gate), new_state)
@@ -849,7 +889,7 @@ impl KdaModule {
             b_k,
             b_v,
             state,
-            1.0,
+            self.k_scale(),
             self.chunk_size,
         );
         self.output(o, gate)
@@ -887,7 +927,7 @@ impl KdaModule {
             while t < tokens {
                 let e = (t + self.chunk_size).min(tokens);
                 let sl = [0..batch, 0..hv, t..e];
-                let (o_c, s_c) = {
+                            let (o_c, s_c) = {
                     #[cfg(feature = "cuda")]
                     {
                         if let Some(r) = fused::cuda::kda_fused_chunk::<B>(
@@ -910,7 +950,7 @@ impl KdaModule {
                                 b_k.clone().slice(sl.clone()),
                                 b_v.clone().slice(sl.clone()),
                                 s,
-                                1.0,
+                                self.k_scale(),
                                 self.chunk_size,
                             )
                         }
@@ -925,7 +965,7 @@ impl KdaModule {
                             b_k.clone().slice(sl.clone()),
                             b_v.clone().slice(sl.clone()),
                             s,
-                            1.0,
+                            self.k_scale(),
                             self.chunk_size,
                         )
                     }
@@ -936,7 +976,13 @@ impl KdaModule {
             }
             (Tensor::cat(outs, 2), s)
         } else {
-            let out = q.matmul(s.clone()).permute([0, 2, 1, 3]);
+            // The read-only prefill read. FLA folds the read scale into `q`
+            // before the recurrence (naive.py:57) and q touches nothing else
+            // here, so the fold is the same constant at the same place.
+            let out = q
+                .mul_scalar(self.k_scale())
+                .matmul(s.clone())
+                .permute([0, 2, 1, 3]);
             (out, s)
         };
         *state = Some(new_state);
@@ -969,6 +1015,10 @@ impl KdaModule {
         // applies `b_i` to `k_i` AND to `v_i - (k_i * S).sum(-2)`, with `b_i`
         // indexed by VALUE head.
         let (q, k, v, g, _b_k, b_v, gate) = self.project(x.clone());
+        // FLA folds the read scale into `q` before the token loop
+        // (`naive.py:57`), and `q` touches only the read here (the erase and
+        // write terms are k/v), so the fold lands at the same place.
+        let q = q.mul_scalar(self.k_scale());
         let [_, hv, _, _] = v.shape().dims::<4>();
         let dev = q.device();
         let s = state.take().unwrap_or_else(|| {

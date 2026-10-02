@@ -6,7 +6,7 @@
 //!   b              = beta_k            (erase strength, key channels)
 //!   w_gate         = beta_v            (write strength: KDA's pseudo-value is
 //!                                       U = (I+T')^{-1}(β⊙V), NOT V)
-//!   scale          = 1                 (see the OPEN note below)
+//!   scale          = head_k_dim**-0.5  (FLA's default, both upstreams)
 //! With those inputs, `chunk_wy_forward` computes exactly
 //!   A  = Tril((Q⊙Γ)(K/Γ)^T)
 //!   W  = (I + T')^{-1}(β⊙Γ⊙K),  U = (I + T')^{-1}(β⊙V)
@@ -16,10 +16,10 @@
 //! The kernel is only used on the bare CUDA `CubeBackend`; everything else
 //! falls back to the tensor-ops chunk path.
 //!
-//! # `scale = 1` here is OPEN, and the reason this file used to give for it was FALSE
+//! # `scale = head_k_dim**-0.5`, FIXED 2026-10-02
 //!
-//! This file said "no softmax scale in KDA". That is **false against both
-//! upstreams**:
+//! This file used to hard-code `scale = 1.0` and claimed "no softmax scale in
+//! KDA". That claim was **false against both upstreams**:
 //!
 //! - `fla/ops/kda/chunk.py:474-475` and `fla/ops/kda/fused_recurrent.py:261-262`
 //!   both contain `if scale is None: scale = K ** -0.5`;
@@ -27,8 +27,13 @@
 //!   argument**, so the official KDA layer runs at `head_k_dim**-0.5`;
 //! - `fla/ops/kda/naive.py:57` folds it into `q` before the recurrence loop.
 //!
-//! `burn-gdn2` itself does use `d_k**-0.5` (`gdn2/src/module.rs:299`); burn-kda
-//! is the only place in the library that overrides it to `1.0`.
+//! `burn-gdn2` itself uses `d_k**-0.5` (`gdn2/src/module.rs:299`); burn-kda
+//! was the only place in the library that overrode it to `1.0`. FIXED
+//! owner-approved, class B (was two RED-ON-PURPOSE oracle tests, then
+//! `#[ignore]`d on branch wt/kdaci — never merged): the constant now lives in
+//! ONE function, `crate::fla_read_scale` (src/lib.rs), the dispatch arms below
+//! derive it from `q`'s own K, and the doc-divergence history is in
+//! `docs/reviews/kdafix-2026-10-02.md`.
 //!
 //! WHY THE MODEL HAS NOT NOTICED: the factor enters only the read `o = q·S`, so
 //! it is one constant on the attention output, and the very next thing this
@@ -37,15 +42,17 @@
 //! eps/c²)` — so it is absorbed to `O(eps / mean(o²))` ≈ `O(1e-5)`. That is
 //! exactly why no loss curve, seed comparison or in-crate test can see it, and
 //! also why it is still real: anything reading the raw attention output sees a
-//! tensor `head_k_dim**0.5` too large (2.83× at K=8, 8× at K=64).
+//! tensor `head_k_dim**0.5` too large (2.83× at K=8, 8× at K=64), but the
+//! module's own RMSNorm absorbs it. Anything reading the RAW attention output
+//! (an external scorer, a probe) sees the corrected scale from 2026-10-02 on.
 //!
-//! The mechanism is not missing — `chunk_wy_forward` honours the scale when
-//! asked, and `tests/kda_oracle.rs::chunked_wy_honours_the_read_scale_when_asked`
-//! is green against FLA's own default-scale row. Only the ARGUMENT is. Two
-//! tests carry this as RED ON PURPOSE (`read_scale_matches_fla_reference`,
-//! `chunked_wy_applies_no_read_scale`). Changing `1.0` moves every number
-//! derived from this crate, so it is the owner's call.
-//! `docs/reviews/2026-09-30-kda-formula-audit.md` §3.2.
+//! The mechanism was never missing — `chunk_wy_forward` honours the scale when
+//! asked (`tests/kda_oracle.rs::chunked_wy_applies_the_fla_read_scale`,
+//! former `chunked_wy_honours_the_read_scale_when_asked`), and the oracle
+//! tests `(read_scale_matches_fla_reference`,
+//! `chunked_wy_applies_the_fla_read_scale`) have been green as a pair since
+//! the fix. `docs/reviews/2026-09-30-kda-formula-audit.md` §3.2 is the audit
+//! this fix closes.
 
 #[cfg(feature = "cuda")]
 pub mod cuda {
@@ -120,6 +127,11 @@ pub mod cuda {
         DispatchTensor: DispatchKindConversion<B>,
     {
         use burn_gdn2::{Fallback, Fused};
+        // The read scale FLA's official KDA layer runs at, folded the way the
+        // gdn2 kernels fold it (causal mask + read) — see `fla_read_scale`
+        // (src/lib.rs). `q` is `[B, H, T, K]`, so K is its last dim.
+        let [_, _, _, k_dim] = q.shape().dims::<4>();
+        let scale = crate::fla_read_scale(k_dim);
         if is_bare_cuda::<B>() {
             // Numerical limit of the reused GDN-2 kernel: K/exp(cumsum(g))
             // underflows f32 once cumsum(g) < -88, i.e. chunk > 17 at the K3
@@ -128,7 +140,7 @@ pub mod cuda {
                 return Fused::Fallback(Fallback::KernelLimits);
             }
             return match burn_gdn2::kernel::chunk_cube::cuda::fused_chunk_forward::<B>(
-                q, k, v, log_alpha, beta_k, beta_v, state, 1.0, chunk_size,
+                q, k, v, log_alpha, beta_k, beta_v, state, scale, chunk_size,
             ) {
                 Some(r) => Fused::Fused(r),
                 None => Fused::Fallback(Fallback::KernelLimits),
@@ -137,12 +149,12 @@ pub mod cuda {
         #[cfg(feature = "autodiff")]
         {
             burn_gdn2::chunk_dispatch::<B>(
-                q, k, v, log_alpha, beta_k, beta_v, state, 1.0, chunk_size,
+                q, k, v, log_alpha, beta_k, beta_v, state, scale, chunk_size,
             )
         }
         #[cfg(not(feature = "autodiff"))]
         {
-            let _ = (q, k, v, log_alpha, beta_k, beta_v, state, chunk_size);
+            let _ = (q, k, v, log_alpha, beta_k, beta_v, state, chunk_size, k_dim);
             Fused::Fallback(Fallback::NotCuda)
         }
     }

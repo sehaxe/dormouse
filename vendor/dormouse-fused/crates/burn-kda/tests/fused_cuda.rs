@@ -89,8 +89,17 @@ fn fused_matches_tensor_chunk() {
     )
     .expect("fused path must apply on CudaBare");
 
-    let (tensor_out, _) =
-        burn_gdn2::chunk_wy_forward(q, k, v, log_alpha, beta.clone(), beta, state, 1.0, 16);
+    let (tensor_out, _) = burn_gdn2::chunk_wy_forward(
+        q,
+        k,
+        v,
+        log_alpha,
+        beta.clone(),
+        beta,
+        state,
+        burn_kda::fla_read_scale(q.shape().dims::<4>()[3]),
+        16,
+    );
 
     let dmax: f32 = (fused_out - tensor_out)
         .abs()

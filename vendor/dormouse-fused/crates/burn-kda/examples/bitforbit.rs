@@ -104,7 +104,8 @@ fn main() {
     let (q2, k2, v2, g2, bk2, bv2, _) = km.project_for_test(x.clone());
     let st0 =
         Tensor::<4>::zeros([b, cfg.num_heads, cfg.head_dim, cfg.head_dim], &dev).cast(q2.dtype());
-    let (o_raw, state_chunk) = chunk_wy_forward(q2, k2, v2, g2, bk2, bv2, st0, 1.0, cfg.chunk_size);
+    let (o_raw, state_chunk) =
+        chunk_wy_forward(q2, k2, v2, g2, bk2, bv2, st0, burn_kda::fla_read_scale(cfg.head_dim), cfg.chunk_size);
     dump(&o_raw, "o_raw");
     dump(&state_chunk, "state_chunk");
 

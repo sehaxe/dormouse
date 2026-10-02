@@ -46,7 +46,10 @@ THE FOUR REFERENCES, and what each is for
    `lower_bound = -5.0`. This is the RUNNING decay form.
 2. `naive_kda_gate` (gate.py:27-52)             vs our `DecayFn::Softplus`.
    Upstream: `-A_log.exp() * F.softplus(g + dt_bias)`. Note `exp(A)` is
-   OUTSIDE the softplus. Our `lib.rs:268` computes `-softplus(exp(A) * z)`.
+   OUTSIDE the softplus. Until 2026-10-02 our branch computed
+   `-softplus(exp(A) * z)` — fixed to the outside form that day
+   (docs/reviews/kdafix-2026-10-02.md); this comment block is the fix's own
+   history.
 3. `naive_recurrent_kda` (naive.py:13-68)      vs our `kda_step` (Eq 1), at
    `scale=1.0` AND at `scale=K**-0.5`. Upstream applies the scale to `q`
    before the loop (`naive.py:57`) with `scale = K ** -0.5` as the DEFAULT
@@ -199,8 +202,8 @@ def t4(a):
 # so that one case is an exact-agreement case (A=0), which is what makes the
 # rest of the fixture discriminating rather than uniformly off.
 #
-#   upstream softplus form:  g = -exp(A) * softplus(z)
-#   ours:                    g = -softplus(exp(A) * z)
+#   FLA softplus form:       g = -exp(A) * softplus(z)
+#   (pre-fix branch, retracted): g = -softplus(exp(A) * z)
 #
 # At A=0 both are -softplus(z): identical. So case `A_zero` is the fixture's
 # own control -- if it ever fails, the harness is wrong, not the formula.
