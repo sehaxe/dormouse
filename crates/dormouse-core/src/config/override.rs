@@ -169,6 +169,51 @@ pub fn apply_overrides(cfg: &mut DormouseConfig, ov: &[Override]) -> Result<(), 
             "use_situ" => cfg.use_situ = parse_bool(v)?,
             "use_attnres" => cfg.use_attnres = parse_bool(v)?,
             "use_mhc" => cfg.use_mhc = parse_bool(v)?,
+            "use_byteflow" => cfg.use_byteflow = parse_bool(v)?,
+            "byteflow_d_local" => {
+                cfg.byteflow_d_local = v.parse().map_err(|e| format!("byteflow_d_local: {e}"))?
+            }
+            "byteflow_d_global" => {
+                cfg.byteflow_d_global = v.parse().map_err(|e| format!("byteflow_d_global: {e}"))?
+            }
+            "byteflow_k_tokens" => {
+                cfg.byteflow_k_tokens = v.parse().map_err(|e| format!("byteflow_k_tokens: {e}"))?
+            }
+            "byteflow_e_layers" => {
+                cfg.byteflow_e_layers = v.parse().map_err(|e| format!("byteflow_e_layers: {e}"))?
+            }
+            "byteflow_g_layers" => {
+                cfg.byteflow_g_layers = v.parse().map_err(|e| format!("byteflow_g_layers: {e}"))?
+            }
+            "byteflow_heads_local" => {
+                cfg.byteflow_heads_local =
+                    v.parse().map_err(|e| format!("byteflow_heads_local: {e}"))?
+            }
+            "byteflow_heads_global" => {
+                cfg.byteflow_heads_global =
+                    v.parse().map_err(|e| format!("byteflow_heads_global: {e}"))?
+            }
+            "byteflow_w_local" => {
+                cfg.byteflow_w_local = v.parse().map_err(|e| format!("byteflow_w_local: {e}"))?
+            }
+            "byteflow_d_ff_local" => {
+                cfg.byteflow_d_ff_local =
+                    v.parse().map_err(|e| format!("byteflow_d_ff_local: {e}"))?
+            }
+            "byteflow_d_ff_global" => {
+                cfg.byteflow_d_ff_global =
+                    v.parse().map_err(|e| format!("byteflow_d_ff_global: {e}"))?
+            }
+            "byteflow_bins" => {
+                cfg.byteflow_bins = v.parse().map_err(|e| format!("byteflow_bins: {e}"))?
+            }
+            "byteflow_eps2" => {
+                cfg.byteflow_eps2 = v.parse().map_err(|e| format!("byteflow_eps2: {e}"))?
+            }
+            "byteflow_logdet" => cfg.byteflow_logdet = parse_bool(v)?,
+            "byteflow_max_bytes" => {
+                cfg.byteflow_max_bytes = v.parse().map_err(|e| format!("byteflow_max_bytes: {e}"))?
+            }
             "mhc_streams" => {
                 cfg.mhc_streams = v.parse().map_err(|e| format!("mhc_streams: {e}"))?
             }

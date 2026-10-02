@@ -18,7 +18,7 @@ pub enum RateMode {
 }
 
 /// Cholesky log-determinant of a symmetric positive-definite matrix.
-fn logdet_spd(m: &[f64], n: usize) -> Option<f64> {
+pub(crate) fn logdet_spd(m: &[f64], n: usize) -> Option<f64> {
     let mut l = vec![0.0; n * n];
     for i in 0..n {
         for j in 0..=i {

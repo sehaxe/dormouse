@@ -586,6 +586,76 @@ pub struct DormouseConfig {
     /// recomputed on the current batch every step.
     #[serde(default = "d_mor_bce_weight")]
     pub mor_bce_weight: f32,
+
+    // --- ByteFlow (arXiv 2603.03583): the byte-compression architecture arm ---
+    /// **Replace the DormouseModel with ByteFlow Net** — the paper's
+    /// five-stage hierarchy (local SWA+Canon encoder → coding-rate Top-K
+    /// chunker → global transformer → multi-linear upsampling with large
+    /// residual → symmetric decoder), trained for byte-level CE and scored in
+    /// BPB. OFF by default: this is not an arm of the loop but a different
+    /// model, so the trainer dispatches to `dormouse_train::byteflow::train_loop`
+    /// and every dormouse-only knob (KDA, Engram, JEPA, aux heads, TSCT
+    /// retraction, the mix optimizer routing) is refused loudly rather than
+    /// silently ignored.
+    ///
+    /// The patcher is the paper's own (§3.2): marginal coding rate
+    /// `ΔR_t = R(h_1:t) − R(h_1:t−1)` over the LOCAL ENCODER's hidden states,
+    /// Top-K borders with BOS forced, chronological — not a fixed stride and
+    /// not entropy (that comparison is the paper's Table 3). The streaming
+    /// form lives in `burn_byteflow::RatePatcher`.
+    #[serde(default)]
+    pub use_byteflow: bool,
+    /// Local width `d_local` — the chunker scores ΔR over hidden states of
+    /// this width, and the decoder's head reads it.
+    #[serde(default = "d_bf_d_local")]
+    pub byteflow_d_local: usize,
+    /// Global width `d_global` (paper §3.3: `d_global ≫ d_local`, the deep and
+    /// wide stage the compressed sequence pays for).
+    #[serde(default = "d_bf_d_global")]
+    pub byteflow_d_global: usize,
+    /// Global sequence length K after chunking — the compression knob. The
+    /// paper's own Table-4 ablation holds 0.86 BPB at ratio 2.56 and calls the
+    /// ratio non-fragile across 4096/2400/1600.
+    #[serde(default = "d_bf_k_tokens")]
+    pub byteflow_k_tokens: usize,
+    /// Encoder depth E; reused by the decoder (§3.5 "identical architecture").
+    #[serde(default = "d_bf_e_layers")]
+    pub byteflow_e_layers: usize,
+    /// Global transformer depth G (paper Table 5: `[6, 20]` layers at 600M).
+    #[serde(default = "d_bf_g_layers")]
+    pub byteflow_g_layers: usize,
+    /// Local attention heads. `d_local / n_heads_local` is the head width.
+    #[serde(default = "d_bf_heads_local")]
+    pub byteflow_heads_local: usize,
+    /// Global attention heads.
+    #[serde(default = "d_bf_heads_global")]
+    pub byteflow_heads_global: usize,
+    /// Sliding-window size `w_local` of the local encoder/decoder.
+    #[serde(default = "d_bf_w_local")]
+    pub byteflow_w_local: usize,
+    /// Local FFN width (SwiGLU).
+    #[serde(default = "d_bf_d_ff_local")]
+    pub byteflow_d_ff_local: usize,
+    /// Global FFN width.
+    #[serde(default = "d_bf_d_ff_global")]
+    pub byteflow_d_ff_global: usize,
+    /// Shared upsampling bins B (paper default 16, §3.4).
+    #[serde(default = "d_bf_bins")]
+    pub byteflow_bins: usize,
+    /// Noise variance ε² of the coding rate, eq. (11). The paper does not
+    /// state its value; 0.5 is the crate default.
+    #[serde(default = "d_bf_eps2")]
+    pub byteflow_eps2: f64,
+    /// Score the chunker with the EXACT log-det rate (eq. 11) instead of the
+    /// Appendix B L2 fast path. Off by default: L2 is the paper's own
+    /// streaming path and Table 4 prices it at ~0.01 BPB of loss; the exact
+    /// route is a host-synced O(T·d³) per row.
+    #[serde(default)]
+    pub byteflow_logdet: bool,
+    /// Byte-sequence length the RoPE tables are built for. `--seq-len` above
+    /// this is a loud error, not a silent crop.
+    #[serde(default = "d_bf_max_bytes")]
+    pub byteflow_max_bytes: usize,
 }
 
 impl Default for DormouseConfig {
@@ -606,6 +676,47 @@ fn d_moe_topk() -> usize {
 }
 fn d_moe_lb_coef() -> f32 {
     0.0
+}
+// The ByteFlow Net build the findings doc (byteflow-rate-2026-10-02.md §5)
+// calls byteflow_9m: paper Table 5's structure scaled to `small`-class size.
+fn d_bf_d_local() -> usize {
+    96
+}
+fn d_bf_d_global() -> usize {
+    768
+}
+fn d_bf_k_tokens() -> usize {
+    128
+}
+fn d_bf_e_layers() -> usize {
+    2
+}
+fn d_bf_g_layers() -> usize {
+    2
+}
+fn d_bf_heads_local() -> usize {
+    4
+}
+fn d_bf_heads_global() -> usize {
+    8
+}
+fn d_bf_w_local() -> usize {
+    256
+}
+fn d_bf_d_ff_local() -> usize {
+    256
+}
+fn d_bf_d_ff_global() -> usize {
+    2048
+}
+fn d_bf_bins() -> usize {
+    16
+}
+fn d_bf_eps2() -> f64 {
+    0.5
+}
+fn d_bf_max_bytes() -> usize {
+    512
 }
 
 #[cfg(test)]

@@ -272,5 +272,78 @@ pub fn validate(c: &DormouseConfig) -> Result<(), String> {
             ));
         }
     }
+    // ByteFlow replaces the whole model, so the dormouse arms have nothing to
+    // attach to: leaving them set would carry dead knobs in the snapshot and
+    // let a reader believe the trained model had them. One check over the
+    // whole set, naming every flag found on (the same shape as the residual
+    // triple above). use_tsct and quant are dormouse-layer knobs the byteflow
+    // path simply does not read - the trainer's arm line says so (COUNTED)
+    // rather than refusing a preset that carries them.
+    if c.use_byteflow {
+        let arms: [(&str, bool); 7] = [
+            ("use_kda", c.use_kda),
+            ("use_engram", c.use_engram),
+            ("use_mor", c.use_mor),
+            ("use_gr", c.use_gr),
+            ("use_attnres", c.use_attnres),
+            ("use_mhc", c.use_mhc),
+            ("use_situ", c.use_situ),
+        ];
+        let on: Vec<&str> = arms.iter().filter(|(_, on)| *on).map(|(n, _)| *n).collect();
+        if !on.is_empty() {
+            return Err(format!(
+                "use_byteflow replaces the DormouseModel with ByteFlow Net, and [{}] have no \
+                 equivalent there: the net is a local encoder -> coding-rate chunker -> global \
+                 transformer -> upsampling -> decoder. Set them to false, or run the arms on the \
+                 dormouse model (drop --byteflow).",
+                on.join(", ")
+            ));
+        }
+        let aux: [(&str, f32); 4] = [
+            ("jepa_weight", c.jepa_weight),
+            ("dspark_weight", c.dspark_weight),
+            ("aux_fb_weight", c.aux_fb_weight),
+            ("mor_bce_weight", c.mor_bce_weight),
+        ];
+        let on: Vec<&str> = aux
+            .iter()
+            .filter(|(_, w)| *w > 0.0)
+            .map(|(n, _)| *n)
+            .collect();
+        if !on.is_empty() {
+            return Err(format!(
+                "use_byteflow trains byte-level CE only: ByteFlowNet carries no aux heads, so \
+                 [{}] would be silently ignored (the ADR-0019 defect). Set them to 0, or drop \
+                 --byteflow.",
+                on.join(", ")
+            ));
+        }
+        if c.moe_topk > 0 {
+            return Err(format!(
+                "use_byteflow with moe_topk = {}: ByteFlowNet has no expert bank, so the field \
+                 is a dead knob. Set moe_topk = 0, or drop --byteflow.",
+                c.moe_topk
+            ));
+        }
+        // The RoPE tables are built for max_bytes positions; a longer window
+        // must fail here with the field named, not at the first forward.
+        if c.max_seq_len > c.byteflow_max_bytes {
+            return Err(format!(
+                "max_seq_len {} > byteflow_max_bytes {}: the chunker's RoPE table covers \
+                 byteflow_max_bytes positions, so a longer sequence is a loud forward assert \
+                 today. Raise byteflow_max_bytes with the model.",
+                c.max_seq_len, c.byteflow_max_bytes
+            ));
+        }
+        if c.byteflow_k_tokens == 0 {
+            return Err("byteflow_k_tokens must be >= 1 (at least the BOS boundary)".into());
+        }
+        if c.byteflow_eps2 <= 0.0 {
+            return Err("byteflow_eps2 must be > 0 (it divides d inside the logdet)".into());
+        }
+        if c.byteflow_bins == 0 {
+            return Err("byteflow_bins must be >= 1".into());
+        }
+    }
     Ok(())
 }

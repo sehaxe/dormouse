@@ -79,6 +79,10 @@ struct Args {
     no_kda: bool,
     #[arg(long)]
     no_engram: bool,
+    /// Train ByteFlow Net (arXiv 2603.03583) instead of the DormouseModel:
+    /// the coding-rate patcher arm. Hyperparams via --set byteflow_*.
+    #[arg(long)]
+    byteflow: bool,
 
     // --- auxiliary objectives (helpers on top of CE) ---
     /// JEPA aux weight (EMA-teacher masked latent prediction). 0 = off;
@@ -231,6 +235,7 @@ fn build_run(a: &Args) -> Result<dormouse_train::RunCfg, String> {
     train.max_iter = a.max_iter.or(train.max_iter);
     train.no_kda |= a.no_kda;
     train.no_engram |= a.no_engram;
+    train.byteflow |= a.byteflow;
     train.jepa_weight = a.jepa_weight.or(train.jepa_weight);
     train.dspark_weight = a.dspark_weight.or(train.dspark_weight);
     train.dspark_k = a.dspark_k.or(train.dspark_k);

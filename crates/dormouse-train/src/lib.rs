@@ -2,6 +2,7 @@
 //! optimizer (see `optim`), burnpack checkpoints with custom name, resume,
 //! opencode harness.
 pub mod atlas;
+pub mod byteflow;
 mod cfg;
 pub mod decode;
 pub mod export;
@@ -141,6 +142,10 @@ pub struct TrainCfg {
     /// Disable a model arm for A/B (KDA / Engram).
     pub no_kda: bool,
     pub no_engram: bool,
+    /// Switch the trainer to ByteFlow Net (`model.use_byteflow`, the
+    /// ByteFlow arm). In the snapshot like every objective knob: a resume
+    /// that flips it is a different model, and the drift check sees it.
+    pub byteflow: bool,
     /// Auxiliary-loss weight overrides; None keeps the preset value.
     pub jepa_weight: Option<f32>,
     pub dspark_weight: Option<f32>,
@@ -189,7 +194,7 @@ impl Default for TrainCfg {
             engram_ram: false, engram_slots: 1_000_000, host_adam_every: 1,
             warmup: true, quant_check: false, timers: false, memlog: false,
             bf16: None, act_quant: None, act_group: None, max_iter: None,
-            no_kda: false, no_engram: false,
+            no_kda: false, no_engram: false, byteflow: false,
             jepa_weight: None, dspark_weight: None, dspark_k: None,
             qk_heads: None, jepa_targets: None,
             seed: 1,
@@ -911,6 +916,23 @@ pub fn train_loop(
     // protocol says the seed IS, so a different value in the config is now a
     // different run in the strongest sense: a different model.
     device.seed(cfg.seed);
+    // THE BYTEFLOW DISPATCH. `use_byteflow` replaces the model, so the
+    // dormouse loop does not build one: the arm's own loop takes over HERE,
+    // after the snapshot and after the seed (seed-before-any-parameter is the
+    // 2026-09-28 rule), and the config snapshot above covers its resume
+    // discipline. `check` inside refuses every dormouse-only knob loudly.
+    if dorm_cfg.use_byteflow {
+        return byteflow::train_loop(
+            RunCfg {
+                source: preset,
+                model: dorm_cfg,
+                train: cfg,
+            },
+            data,
+            Some(dir.clone()),
+            eval_data,
+        );
+    }
     let (mut model, qfmt) = build_model(&dorm_cfg, &cfg, &device);
     let mut optim = build_optim(&model, &cfg);
     // Fail fast if the routing policy no longer matches the model (stale

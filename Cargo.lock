@@ -1044,6 +1044,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "burn-byteflow"
+version = "0.1.0"
+dependencies = [
+ "burn",
+ "burn-swiglu",
+ "burn-tensor",
+]
+
+[[package]]
 name = "burn-core"
 version = "0.22.0-pre.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1475,6 +1484,14 @@ dependencies = [
  "regex",
  "safetensors 0.7.0",
  "textdistance",
+]
+
+[[package]]
+name = "burn-swiglu"
+version = "0.1.0"
+dependencies = [
+ "burn",
+ "burn-tensor",
 ]
 
 [[package]]
@@ -2914,6 +2931,7 @@ version = "0.1.0"
 dependencies = [
  "burn",
  "burn-bitnet",
+ "burn-byteflow",
  "burn-cuda",
  "burn-dispatch",
  "burn-muon-plus",
