@@ -58,7 +58,7 @@ dependency on the other crates does not make them reachable.
 |---|---:|---:|:---:|---|---|
 | `burn-spectral` | 6329 | 2122 | **W** | keep | TSCT linears + MoE router; every `LinearLike` in the model |
 | `burn-gdn2` | 4871 | 4085 | **W** | keep | the gated-delta kernel `burn-kda` is built on |
-| `burn-sct` | 2739 | 458 | d, b | **DELETE** (blocked) | non-ternary original of what `burn-spectral` does in the product |
+| `burn-sct` | 2739 | 458 | d, b | **DELETED 2026-10-02** | non-ternary original of what `burn-spectral` does in the product |
 | `burn-attnres` | 2268 | 64 | b | REFERENCE | residual A/B arm named at `PLAN-minimal-core.md` §M2 |
 | `burn-bitnet` | 2088 | 0 | **W** | keep | ternary weight quant called from `burn-spectral` |
 | `burn-kda` | 1232 | 845 | **W** | keep | the attention arm |
@@ -71,7 +71,7 @@ dependency on the other crates does not make them reachable.
 | `burn-mor` | 530 | 0 | **W** | keep | the per-position router + top-k primitive |
 | `burn-jepa` | 443 | 0 | **W** | keep | the EMA-teacher latent objective |
 | `burn-ptrn` | 399 | 0 | – | REFERENCE | test-time scaling of a loop; its Q-head was deleted (ADR-0013) |
-| `burn-es` | 345 | 0 | – | REFERENCE | ES primitives for the unbuilt post-training phase |
+| `burn-es` | 345 | 0 | – | **DELETED 2026-10-02** | self-declared duplicate of `burn-eggroll` |
 | `burn-eggroll` | 327 | 0 | – | REFERENCE | ditto; overlaps `burn-es` |
 | `burn-parcae` | 317 | 0 | – | **WIRE** | spectral control of a loop — the one unwired crate aimed at an open problem |
 | `burn-rmsnorm` | 296 | 0 | **W** | keep | the pre-head norm |
