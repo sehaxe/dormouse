@@ -43,7 +43,7 @@ BACKEND_REEXPORTS = [
 # feature -> why it stays private
 NOT_PUBLIC = {
     "binary-tests": (
-        "burn-gdn2/burn-sct declare it as an empty marker for the fork's own "
+        "burn-gdn2 declares it as an empty marker for the fork's own "
         "GPU CI to build test binaries; nothing in the workspace reads it"
     ),
 }

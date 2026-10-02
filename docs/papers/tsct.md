@@ -5,6 +5,14 @@
 `crates/dormouse-core/src/loop_block.rs`, `crates/dormouse-core/src/routing.rs`,
 `crates/dormouse-train/src/lib.rs`. No GPU, no build, no test.
 
+
+> **2026-10-02:** the crate analysed as `burn-sct` (section 5) was deleted — it
+> never executed in the dormouse build and `burn-spectral` fully supersedes it. The
+> `from_dense` importer and the exact `safe_qr` oracle discussed below no longer
+> exist in-tree; both were cited as "the cheapest unrun check", and the crate was
+> evaluated and found dead. Archived as A/B history: nothing else in this file
+> depends on it.
+
 **Owner instruction honored:** TSCT is *ours*. There is no TSCT paper and none is sought.
 What follows is (1) the verified lineage it is built on, (2) a precise reading of what the
 code actually is, (3) the delta against the closest published mechanisms, (4) an honest

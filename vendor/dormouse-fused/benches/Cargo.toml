@@ -17,5 +17,4 @@ burn-situ = { path = "../crates/burn-situ", features = ["cuda"] }
 burn-muon-plus = { path = "../crates/burn-muon-plus", features = ["cuda"] }
 burn-gdn2 = { path = "../crates/burn-gdn2", features = ["cuda"] }
 burn-kda = { path = "../crates/burn-kda", features = ["cuda"] }
-burn-sct = { path = "../crates/burn-sct", features = ["cuda"] }
 serde_json = "1"

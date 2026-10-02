@@ -58,8 +58,6 @@ fn window(corpus: &[u8], i: usize, seq: usize) -> Vec<i64> {
 struct Mixture {
     dense_a: Option<Linear>,
     dense_b: Option<Linear>,
-    sct_a: Option<burn_sct::SctLinear>,
-    sct_b: Option<burn_sct::SctLinear>,
     tsct_a: Option<SpectralLinear>,
     tsct_b: Option<SpectralLinear>,
     tsct_c: Option<SpectralLinear>,
@@ -77,53 +75,7 @@ struct Mixture {
 impl Mixture {
     fn new(kind: &str, d: usize, device: &Device) -> Self {
         match kind {
-            "sct8" => Self {
-                dense_a: None,
-                dense_b: None,
-                sct_a: Some(burn_sct::SctLinear::new(
-                    &burn_sct::SctConfig::new(d, 4 * d, 8),
-                    device,
-                )),
-                sct_b: Some(burn_sct::SctLinear::new(
-                    &burn_sct::SctConfig::new(4 * d, d, 8),
-                    device,
-                )),
-                tsct_a: None,
-                tsct_b: None,
-                tsct_c: None,
-                tsct_d: None,
-                tsct_e: None,
-                tsct_f: None,
-                moe_a: None,
-                moe_b: None,
-                situ: false,
-                bitnet: false,
-            },
-            "sct16" => Self {
-                dense_a: None,
-                dense_b: None,
-                sct_a: Some(burn_sct::SctLinear::new(
-                    &burn_sct::SctConfig::new(d, 4 * d, 16),
-                    device,
-                )),
-                sct_b: Some(burn_sct::SctLinear::new(
-                    &burn_sct::SctConfig::new(4 * d, d, 16),
-                    device,
-                )),
-                tsct_a: None,
-                tsct_b: None,
-                tsct_c: None,
-                tsct_d: None,
-                tsct_e: None,
-                tsct_f: None,
-                moe_a: None,
-                moe_b: None,
-                situ: false,
-                bitnet: false,
-            },
             "tsct_cascade" => Self {
-                sct_a: None,
-                sct_b: None,
                 // cascade: rank-1 + rank-2 + rank-4 + rank-8 in parallel,
                 // (1+2+4+8)*(64+256) = 4800 params vs dense 16K (3.4x less)
                 dense_a: None,
@@ -142,8 +94,6 @@ impl Mixture {
             "dense" => Self {
                 dense_a: Some(LinearConfig::new(d, 4 * d).init(device)),
                 dense_b: Some(LinearConfig::new(4 * d, d).init(device)),
-                sct_a: None,
-                sct_b: None,
                 tsct_a: None,
                 tsct_b: None,
                 tsct_c: None,
@@ -162,8 +112,6 @@ impl Mixture {
             "bitnet2" => Self {
                 dense_a: Some(LinearConfig::new(d, 4 * d).init(device)),
                 dense_b: Some(LinearConfig::new(4 * d, d).init(device)),
-                sct_a: None,
-                sct_b: None,
                 tsct_a: None,
                 tsct_b: None,
                 tsct_c: None,
@@ -181,8 +129,6 @@ impl Mixture {
             "situ" => Self {
                 dense_a: Some(LinearConfig::new(d, 2 * 4 * d).init(device)),
                 dense_b: Some(LinearConfig::new(4 * d, d).init(device)),
-                sct_a: None,
-                sct_b: None,
                 tsct_a: None,
                 tsct_b: None,
                 tsct_c: None,
@@ -197,8 +143,6 @@ impl Mixture {
             "tsct4" => Self {
                 dense_a: None,
                 dense_b: None,
-                sct_a: None,
-                sct_b: None,
                 tsct_a: Some(SpectralLinear::new(d, 4 * d, 4, device)),
                 tsct_b: Some(SpectralLinear::new(4 * d, d, 4, device)),
                 tsct_c: None,
@@ -213,8 +157,6 @@ impl Mixture {
             "tsct2_stoch" => Self {
                 dense_a: None,
                 dense_b: None,
-                sct_a: None,
-                sct_b: None,
                 tsct_a: Some({
                     let mut l = SpectralLinear::new(d, 4 * d, 2, device);
                     l.set_stochastic(true);
@@ -237,8 +179,6 @@ impl Mixture {
             "tsct2_percol" => Self {
                 dense_a: None,
                 dense_b: None,
-                sct_a: None,
-                sct_b: None,
                 tsct_a: Some({
                     let mut l = SpectralLinear::new(d, 4 * d, 2, device);
                     l.set_per_column(true);
@@ -261,8 +201,6 @@ impl Mixture {
             "tsct2_combo2" => Self {
                 dense_a: None,
                 dense_b: None,
-                sct_a: None,
-                sct_b: None,
                 tsct_a: Some({
                     let mut l = SpectralLinear::new(d, 4 * d, 2, device);
                     l.set_stochastic(true);
@@ -287,8 +225,6 @@ impl Mixture {
             "tsct2_combo" => Self {
                 dense_a: None,
                 dense_b: None,
-                sct_a: None,
-                sct_b: None,
                 tsct_a: Some({
                     let mut l = SpectralLinear::new(d, 4 * d, 2, device);
                     l.set_stochastic(true);
@@ -313,8 +249,6 @@ impl Mixture {
             "tsct2" => Self {
                 dense_a: None,
                 dense_b: None,
-                sct_a: None,
-                sct_b: None,
                 tsct_a: Some(SpectralLinear::new(d, 4 * d, 2, device)),
                 tsct_b: Some(SpectralLinear::new(4 * d, d, 2, device)),
                 tsct_c: None,
@@ -331,8 +265,6 @@ impl Mixture {
             "tsct2_2bit" => Self {
                 dense_a: None,
                 dense_b: None,
-                sct_a: None,
-                sct_b: None,
                 tsct_a: Some({
                     let mut l = SpectralLinear::new(d, 4 * d, 2, device);
                     l.set_2bit(true);
@@ -357,8 +289,6 @@ impl Mixture {
             "tsct2_asym" => Self {
                 dense_a: None,
                 dense_b: None,
-                sct_a: None,
-                sct_b: None,
                 tsct_a: Some({
                     let mut l = SpectralLinear::new(d, 4 * d, 2, device);
                     l.set_asym(true);
@@ -384,8 +314,6 @@ impl Mixture {
             "tsct2_efb" => Self {
                 dense_a: None,
                 dense_b: None,
-                sct_a: None,
-                sct_b: None,
                 tsct_a: Some(SpectralLinear::new(d, 4 * d, 2, device)),
                 tsct_b: Some(SpectralLinear::new(4 * d, d, 2, device)),
                 tsct_c: None,
@@ -400,8 +328,6 @@ impl Mixture {
             "tsct1" => Self {
                 dense_a: None,
                 dense_b: None,
-                sct_a: None,
-                sct_b: None,
                 tsct_a: Some(SpectralLinear::new(d, 4 * d, 1, device)),
                 tsct_b: Some(SpectralLinear::new(4 * d, d, 1, device)),
                 tsct_c: None,
@@ -416,8 +342,6 @@ impl Mixture {
             "tsct8" => Self {
                 dense_a: None,
                 dense_b: None,
-                sct_a: None,
-                sct_b: None,
                 tsct_a: Some(SpectralLinear::new(d, 4 * d, 8, device)),
                 tsct_b: Some(SpectralLinear::new(4 * d, d, 8, device)),
                 tsct_c: None,
@@ -433,8 +357,6 @@ impl Mixture {
             "tsct8_2bit" => Self {
                 dense_a: None,
                 dense_b: None,
-                sct_a: None,
-                sct_b: None,
                 tsct_a: Some({
                     let mut l = SpectralLinear::new(d, 4 * d, 8, device);
                     l.set_2bit(true);
@@ -457,8 +379,6 @@ impl Mixture {
             "tsct_anneal" => Self {
                 dense_a: None,
                 dense_b: None,
-                sct_a: None,
-                sct_b: None,
                 tsct_a: Some(SpectralLinear::new(d, 4 * d, 16, device)),
                 tsct_b: Some(SpectralLinear::new(4 * d, d, 16, device)),
                 tsct_c: None,
@@ -474,8 +394,6 @@ impl Mixture {
                 // complement: rank-2 + rank-8 in parallel (LOST-style)
                 dense_a: None,
                 dense_b: None,
-                sct_a: None,
-                sct_b: None,
                 tsct_a: Some(SpectralLinear::new(d, 4 * d, 2, device)),
                 tsct_b: Some(SpectralLinear::new(4 * d, d, 2, device)),
                 tsct_c: None,
@@ -491,8 +409,6 @@ impl Mixture {
                 // iso-param vs dense: rank 50 -> 50*(64+256) = 16K params
                 dense_a: None,
                 dense_b: None,
-                sct_a: None,
-                sct_b: None,
                 tsct_a: Some(SpectralLinear::new(d, 4 * d, 50, device)),
                 tsct_b: Some(SpectralLinear::new(4 * d, d, 50, device)),
                 tsct_c: None,
@@ -507,8 +423,6 @@ impl Mixture {
             "tsct32" => Self {
                 dense_a: None,
                 dense_b: None,
-                sct_a: None,
-                sct_b: None,
                 tsct_a: Some(SpectralLinear::new(d, 4 * d, 32, device)),
                 tsct_b: Some(SpectralLinear::new(4 * d, d, 32, device)),
                 tsct_c: None,
@@ -523,8 +437,6 @@ impl Mixture {
             "tsct" => Self {
                 dense_a: None,
                 dense_b: None,
-                sct_a: None,
-                sct_b: None,
                 tsct_a: Some(SpectralLinear::new(d, 4 * d, 16, device)),
                 tsct_b: Some(SpectralLinear::new(4 * d, d, 16, device)),
                 tsct_c: None,
@@ -539,8 +451,6 @@ impl Mixture {
             "tsctmoe" => Self {
                 dense_a: None,
                 dense_b: None,
-                sct_a: None,
-                sct_b: None,
                 tsct_a: None,
                 tsct_b: None,
                 tsct_c: None,
@@ -557,8 +467,6 @@ impl Mixture {
                 // adaptive: 16 clusters x 32 experts, top-4 of 512 patterns
                 dense_a: None,
                 dense_b: None,
-                sct_a: None,
-                sct_b: None,
                 tsct_a: None,
                 tsct_b: None,
                 tsct_c: None,
@@ -578,8 +486,6 @@ impl Mixture {
                 // (comparisons, SpectralMoE::topk_cost) on the same line.
                 dense_a: None,
                 dense_b: None,
-                sct_a: None,
-                sct_b: None,
                 tsct_a: None,
                 tsct_b: None,
                 tsct_c: None,
@@ -605,8 +511,6 @@ impl Mixture {
             "tsctmoe_r16" => Self {
                 dense_a: None,
                 dense_b: None,
-                sct_a: None,
-                sct_b: None,
                 tsct_a: None,
                 tsct_b: None,
                 tsct_c: None,
@@ -621,8 +525,6 @@ impl Mixture {
             "tsctmoe_r32" => Self {
                 dense_a: None,
                 dense_b: None,
-                sct_a: None,
-                sct_b: None,
                 tsct_a: None,
                 tsct_b: None,
                 tsct_c: None,
@@ -637,8 +539,6 @@ impl Mixture {
             "tsctmoe_r64" => Self {
                 dense_a: None,
                 dense_b: None,
-                sct_a: None,
-                sct_b: None,
                 tsct_a: None,
                 tsct_b: None,
                 tsct_c: None,
@@ -654,8 +554,6 @@ impl Mixture {
             "tsct2_r32" => Self {
                 dense_a: None,
                 dense_b: None,
-                sct_a: None,
-                sct_b: None,
                 tsct_a: Some(SpectralLinear::new(d, 4 * d, 32, device)),
                 tsct_b: Some(SpectralLinear::new(4 * d, d, 32, device)),
                 tsct_c: None,
@@ -677,10 +575,7 @@ impl Mixture {
     {
         let cascade = self.tsct_c.is_some();
         let both = self.tsct_a.is_some() && self.moe_a.is_some();
-        let sct = self.sct_a.is_some();
-        let h = if sct {
-            activation::gelu(self.sct_a.as_ref().unwrap().forward::<B>(x.clone()))
-        } else if cascade {
+        let h = if cascade {
             let mut acc = self.tsct_a.as_ref().unwrap().forward(x.clone());
             acc = acc.add(self.tsct_c.as_ref().unwrap().forward(x.clone()));
             acc = acc.add(self.tsct_e.as_ref().unwrap().forward(x.clone()));
@@ -715,9 +610,7 @@ impl Mixture {
         } else {
             activation::gelu(self.moe_a.as_ref().unwrap().forward(x.clone()))
         };
-        if sct {
-            self.sct_b.as_ref().unwrap().forward::<B>(h)
-        } else if cascade {
+        if cascade {
             let mut acc = self.tsct_b.as_ref().unwrap().forward(h.clone());
             acc = acc.add(self.tsct_d.as_ref().unwrap().forward(h.clone()));
             acc = acc.add(self.tsct_f.as_ref().unwrap().forward(h.clone()));
@@ -974,12 +867,12 @@ fn make_val_corpus(n: usize) -> Vec<u8> {
 }
 
 /// Param path markers for the FFN LR group (substring match): the
-/// spectral/ternary factors (tsct_*, moe_a/b, sct_a/b) and the dense MLP
+/// spectral/ternary factors (tsct_*, moe_a/b) and the dense MLP
 /// weights (dense_a/b). Everything else (emb, attns, lns, ln, head) keeps
 /// the base LR. Per-component LR is the SCT 2604.00733 fix for its ~3-loss
 /// gap vs dense: FFN factors want a higher LR than the dense parts.
-const FFN_PATH_MARKERS: [&str; 7] = [
-    "dense_a", "dense_b", "sct_a", "sct_b", "tsct_", "moe_a", "moe_b",
+const FFN_PATH_MARKERS: [&str; 5] = [
+    "dense_a", "dense_b", "tsct_", "moe_a", "moe_b",
 ];
 
 /// True when a module param path belongs to the FFN group (spectral/
@@ -996,14 +889,14 @@ fn ffn_param_group() -> ParamGroup {
 }
 
 /// Param path markers for the OPT_MIX Muon+ group: the 2D spectral masters
-/// (tsct_*/sct_* u/v, moe_* u/v) and the MoE router linears (proj,
+/// (tsct_*/moe_* u/v) and the MoE router linears (proj,
 /// cluster_key, expert_key all live under moe_a/b). The 1D scale vector `s`
 /// is excluded so it stays on the base AdamW (Muon+ would run its own AdamW
 /// fallback on it, but the plan keeps every 1D param on the base optimizer).
 /// Plain dense MLP weights (dense_a/b) are 2D but not spectral: AdamW is
 /// fine for them and they stay in the fallback.
-const MUON_PATH_MARKERS: [&str; 10] = [
-    "tsct_a", "tsct_b", "tsct_c", "tsct_d", "tsct_e", "tsct_f", "sct_a", "sct_b", "moe_a", "moe_b",
+const MUON_PATH_MARKERS: [&str; 8] = [
+    "tsct_a", "tsct_b", "tsct_c", "tsct_d", "tsct_e", "tsct_f", "moe_a", "moe_b",
 ];
 
 /// True when a module param path belongs to the Muon+ group (2D spectral
@@ -1016,7 +909,7 @@ fn is_muon_param(path: &str) -> bool {
 
 fn muon_param_group() -> ParamGroup {
     // Exclude the 1D scale leaf (path ends in ".s"): keep it on AdamW. A
-    // plain ".s" predicate would also hit "heads.3.sct_*" (module separator
+    // plain ".s" predicate would also hit "heads.3.tsct_b" (module separator
     // dot before the s), so the exclude is end-anchored.
     ParamGroup::from_any_predicates(MUON_PATH_MARKERS.to_vec())
         .exclude(ParamGroup::from_regex(r"\.s$").expect("valid regex"))
@@ -1091,7 +984,7 @@ fn train(kind: &str, steps: usize, lr: f64) -> (f32, f32) {
     if use_muon {
         println!("  opt: Muon+ ColRow (all params)");
     } else if use_mix {
-        println!("  opt: AdamW (1D s, norms, emb, head, dense) + Muon+ ColRow (tsct_*/sct_*/moe_* u/v, MoE router)");
+        println!("  opt: AdamW (1D s, norms, emb, head, dense) + Muon+ ColRow (tsct_*/moe_* u/v, MoE router)");
     } else {
         println!("  opt: AdamW (all params)");
     }
@@ -1150,9 +1043,6 @@ fn train(kind: &str, steps: usize, lr: f64) -> (f32, f32) {
         for l in [&h.dense_a, &h.dense_b].into_iter().flatten() {
             let d = l.weight.val().dims();
             flops_token += d[0] * d[1];
-        }
-        for l in [&h.sct_a, &h.sct_b].into_iter().flatten() {
-            flops_token += l.rank * (l.in_features + l.out_features);
         }
         for l in [
             &h.tsct_a, &h.tsct_b, &h.tsct_c, &h.tsct_d, &h.tsct_e, &h.tsct_f,
@@ -1362,18 +1252,6 @@ fn train(kind: &str, steps: usize, lr: f64) -> (f32, f32) {
                 }
             }
         }
-        // SCT: its own QR retraction (SCT requires it every step; here
-        // every 50 steps to keep the comparison fair on step cost)
-        if step % 50 == 49 && kind.starts_with("sct") {
-            for h in &mut model.heads {
-                if let Some(a) = &mut h.sct_a {
-                    a.retract::<SctBackend>();
-                }
-                if let Some(b) = &mut h.sct_b {
-                    b.retract::<SctBackend>();
-                }
-            }
-        }
         if step % 50 == 0 {
             println!(
                 "  {kind} step {step}: loss {lv:.4} (step {:.2}s, total {:.1}s)",
@@ -1413,7 +1291,7 @@ fn train(kind: &str, steps: usize, lr: f64) -> (f32, f32) {
         // the per-step timing in the main loop stays undistorted
         let x = Tensor::<2>::random([16384, d], Distribution::Default, &device);
         let mut parts: Vec<String> = Vec::new();
-        // (a) ste_ternary on the first layer's masters (tsct_a, else moe_a, else sct_a)
+        // (a) ste_ternary on the first layer's masters (tsct_a, else moe_a)
         let uv = model.heads[0]
             .tsct_a
             .as_ref()
@@ -1421,12 +1299,6 @@ fn train(kind: &str, steps: usize, lr: f64) -> (f32, f32) {
             .or_else(|| {
                 model.heads[0]
                     .moe_a
-                    .as_ref()
-                    .map(|a| (a.u.val(), a.v.val()))
-            })
-            .or_else(|| {
-                model.heads[0]
-                    .sct_a
                     .as_ref()
                     .map(|a| (a.u.val(), a.v.val()))
             });
@@ -1702,8 +1574,6 @@ mod tests {
             "heads.0.tsct_f.s",
             "heads.1.moe_a.u",
             "heads.2.moe_b.v",
-            "heads.3.sct_a.weight",
-            "heads.3.sct_b.weight",
             "heads.0.dense_a.weight",
             "heads.1.dense_b.weight",
             // bitnet2 is a quantized dense: same dense_a/dense_b paths, so its
@@ -1740,8 +1610,6 @@ mod tests {
             "heads.0.tsct_f.v",
             "heads.1.moe_a.u",
             "heads.2.moe_b.v",
-            "heads.3.sct_a.u",
-            "heads.3.sct_b.v",
             // MoE router linears are 2D and live under moe_a/b
             "heads.0.moe_a.proj.weight",
             "heads.1.moe_b.cluster_key.weight",
@@ -1754,7 +1622,6 @@ mod tests {
             "heads.0.tsct_a.s",
             "heads.0.tsct_f.s",
             "heads.1.moe_a.s",
-            "heads.3.sct_b.s",
             // dense MLP weights, embeddings, attention, norms, head
             "heads.0.dense_a.weight",
             "heads.1.dense_b.weight",

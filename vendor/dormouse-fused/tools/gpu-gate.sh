@@ -70,15 +70,12 @@ ran=$(grep -oE 'test result: ok\. [0-9]+ passed' <<<"$out" | grep -oE '[0-9]+ pa
 echo
 echo "── what this gate does NOT cover (do not mistake it for the whole library) ──"
 cat <<'EOF'
-  * the other 12 cuda crates' GPU tests (burn-attnres, burn-bitnet, burn-kda,
-    burn-mhc, burn-mor, burn-muon-plus, burn-rmsnorm, burn-rope, burn-sct,
+  * the other 11 cuda crates' GPU tests (burn-attnres, burn-bitnet, burn-kda,
+    burn-mhc, burn-mor, burn-muon-plus, burn-rmsnorm, burn-rope,
     burn-situ, burn-spectral, burn-swiglu). They have never run in any
     executed job either; several are known-red (burn-spectral's three
     `retract` panics, burn-attnres self-records BROKEN), so folding them in
     now would make this gate permanently red and therefore not run.
-  * burn-sct's reference comparison. `tests/cmp_reference.rs` still cannot run:
-    no `tests/gen_reference.py`, no `tests/ref_data/*.bin`, and `binary-tests`
-    is not a default feature. See crates/burn-sct/.gitignore.
   * a performance gate. `vendor/dormouse-fused/.github/workflows/bench.yml` was
     deleted with the rest of the never-runnable workflows: it needed a
     self-hosted GPU runner and it `git push`ed from the runner. The honest
