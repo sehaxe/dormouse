@@ -1,6 +1,7 @@
 //! dormouse-train - CUDA training loop: Autodiff backend, Muon+ mixed
 //! optimizer (see `optim`), burnpack checkpoints with custom name, resume,
 //! opencode harness.
+pub mod atlas;
 mod cfg;
 pub mod decode;
 pub mod export;
@@ -1153,6 +1154,9 @@ pub fn train_loop(
     // (ADR-0021). Before this, the mask came off burn's global RNG: never
     // seeded, never repeated, and different on every run of the same config.
     dormouse_core::aux::set_mask_stream(cfg.seed, step);
+    // Launch atlas (DM_LAUNCH_ATLAS=1): per-stage launch deltas around the
+    // stage timers below. Inert without the env var.
+    let mut atlas = atlas::LaunchAtlas::from_env();
     while step < cfg.steps as u64 {
         // The eval-step predicate, named once: the TSCT diagnostics bracket
         // the retraction above and print in the eval block below, and both
@@ -1296,6 +1300,7 @@ pub fn train_loop(
         let loss = mask_nonfinite(loss);
         let t_bwd = std::time::Instant::now();
         let fwd_ms = t_fwd.elapsed().as_secs_f64() * 1000.0;
+        atlas.mark(step, "fwd", fwd_ms as f32);
         let mut raw_grads = loss.backward();
         sanitize_grads(&mut raw_grads, &model);
         let lr = match stress.as_ref() {
@@ -1380,10 +1385,12 @@ pub fn train_loop(
             }
         }
         let bwd_ms = t_bwd.elapsed().as_secs_f64() * 1000.0;
+        atlas.mark(step, "bwd", bwd_ms as f32);
         let t_opt = std::time::Instant::now();
         let grads = GradientsParams::from_grads(raw_grads, &model);
         model = optim.step(lr, model, grads);
         let opt_ms = t_opt.elapsed().as_secs_f64() * 1000.0;
+        atlas.mark(step, "opt", opt_ms as f32);
         let t_retr = std::time::Instant::now();
         // TSCT ortho maintenance (bf16_KERNEL_PLAN): retract the U/V masters
         // every step so the quantized forward stays faithful; monitor the
@@ -1410,12 +1417,15 @@ pub fn train_loop(
             tsct_aft = on_eval_step.then(|| model.max_ortho());
         }
         let retr_ms = t_retr.elapsed().as_secs_f64() * 1000.0;
+        atlas.mark(step, "retr", retr_ms as f32);
         let t_ema = std::time::Instant::now();
         if let Some(t) = teacher.take() {
             teacher = Some(dormouse_core::aux::ema_update(t, &model, dormouse_core::aux::TEACHER_MOMENTUM));
         }
         let _ = lr;
         let ema_ms = t_ema.elapsed().as_secs_f64() * 1000.0;
+        atlas.mark(step, "ema", ema_ms as f32);
+        atlas.step_done();
         // max_ortho reads every TSCT factor (30+ device syncs) - cadence,
         // not per-50-steps: each check drains the pipeline. The metric is
         // per-entry (F-norm/k) so the plan's 1e-3 threshold sits above the
@@ -1791,6 +1801,7 @@ pub fn train_loop(
         "done steps={step} best ce={best:.3} | {}",
         best_artifact_summary(best_eval_bpb, best_eval_step, &cfg.ckpt_name)
     );
+    atlas.finish(cfg.steps as u64);
     Ok(())
 }
 
