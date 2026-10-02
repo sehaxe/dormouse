@@ -310,3 +310,91 @@ insist on the divergence.
 Decision recorded per the brief: gates not green → `wt/graph-trainer`
 stays unmerged, `--graph-capture` ships in nothing, this file is the
 blocker report.
+
+---
+
+## Continuation 3 — 2026-10-02, gates green after the pin-through-optimizer rewrite (afternoon operator)
+
+**The merge record.** Morning's 3 red gates all narrowed to one defect: CUDA stream capture RECORDS and does not EXECUTE — `stop_capture` handed out pre-capture buffers while the replays computed the real step (iter_embed grad exactly 0.0 pre-capture; the same graph's first replay matched a fresh window to six decimals). Fix: execute the recording with one replay after `stop_capture` (`graph.rs`, `Seam::step`), inputs pinned, step 0 always plain. All four gates green on the toy fixture (batch 2 / seq 32, d_model 64), landed as `6760e08`, merged to main as `2ccff38`; numbers in `6760e08`'s message. `inplace.rs` (the extended-window rewrite) is NOT registered — its deliverable is v2, not this lane's.
+
+---
+
+## Continuation 4 — 2026-10-02, the key-window gate: supplied ≠ consumed, and the real shape refuses to capture
+
+Lane: the owner convoy's afternoon brief — the graph arm had refused loudly
+(`train failed: graph capture: this step has hashed keys and the pinned
+window has none`) on the only bench the seam ever faced.
+
+### The defect
+
+`ByteStream::next_batch` computes the FNV n-gram keys UNCONDITIONALLY
+(dormouse-data, ORDERS=[2,3,4]) — every step of every run carries keys
+whether or not the model reads them. `lib.rs` built `InputPins` with a
+key buffer iff `use_engram && !engram_ram` (the consumed verdict, right),
+but handed `feed` the supplied keys (`host_rows.is_none()` — always true in
+graph mode, since `--engram-ram` is refused beside it). The gate then
+refused a pair that no legal config was in: nothing consumed, everything
+supplied. The refusal was the WRONG PAIR compared, and it made
+`--graph-capture` impossible beside the flag every bench passes.
+
+### The fix (`a8ce80c` + `620f7c6`, worktree wt/graphfix)
+
+`InputPins` carries `keys_consumed` (decided once, at arm time, from the
+model's own consumption); `feed` DECIDES on it:
+- consuming window + keys supplied → copy, hand over (normal run);
+- consuming window + no keys this step → **loud refusal** — there is no
+  correct way to run it; the captured forward reads a key buffer, so a
+  keys-less feed means the memory arm trains on whatever the buffer held
+  (the `7adda92` shape moved to the capture seam);
+- non-consuming window + keys supplied → **dropped, passes** — the correct
+  memory-less program; the armed line prints `key window FED|none` once
+  (COUNTED, ADR-0019) so the log reader can tell which arm ran.
+
+Passes: the key-less pin takes supplied keys and hands `None` (the true
+trainer shape); a consuming window refuses a key-less step by name; the
+new CUDA gate `the_noengram_key_contract_captures_and_replays` runs the
+whole shape (captures 1, replays 2, refusals 0). The three non-flaky gates
+of the four stay green on the same run.
+
+### The re-measure — and the blocker it found
+
+500 steps × 2 arms, ONE binary (small / batch 8 / seq 512 / --no-engram /
+retract-every 4 / timers, seed 1, the first-round recipe verbatim):
+- **control 485.8 ms/step** warm (`~/logs/gbench2_control.log`; 218.6 s
+  over steps 50..500; ce@400 3.123; launches 84 388 098 cumulative — the
+  atlas's ~22 248/step confirmed in round 1). vs. the first round's
+  control 469.0 (the pre-fix binary, same flags) — same order, the lane's
+  control stands.
+- **graph arm: no number.** The keys refusal is gone (`graph capture
+  armed: ... key window none` printed, feed passed — the fixed half is
+  proven), but the capture itself is REFUSED on the real shape:
+  `capture recorded 2331 memory node(s)` — the recorded pass ALLOCATES,
+  2 331 slices per window, while the toy capture at batch 2/seq 32
+  allocated none. This is §6.2's open question answered adversely: **the
+  priming pass did not cover the real window's allocations** — the
+  persistent-pool contract (§3.1) does not hold at small/batch-8/seq-512.
+  20 refusals → the seam DISABLED, the run continued ungraphed, the pool's
+  retained working sets × 20 blew past 16 GB and the run degraded into a
+  CUDA_ERROR_ILLEGAL_ADDRESS reserve-fail storm (killed at step ~10 of
+  500; `~/logs/gbench2_graph.log`, 1.9 MB of panics). §3.2's valve design
+  (disable after 20, continue ungraphed) is not OOM-safe against the
+  residual pool itself.
+
+**Verdict: NOT to prod.** `--graph-capture` cannot capture the trainer's
+real window; the keys fix only exposed the next gate. The blocker is a
+seam/pool-owner decision (priming coverage or a pool that serves captures
+under the trainer's allocation pattern); the illegal-address storm after
+disable belongs to the same decision. Control baseline for the next round:
+485.8 ms/step.
+
+Pre-existing, not this lane's (reported, file:line):
+- `crates/dormouse-train/src/optim.rs:643` —
+  `optim::tests::the_eval_counter_covers_both_muon_implementations` is red
+  on a plain `cargo test -p dormouse-train --lib --features cuda` of HEAD
+  `2ccff38` (verified with my files stashed): "(0, 0) -> (0, 2)".
+- `tests/graph_seam_cuda.rs` negative
+  (`the_stale_pointer_trap_is_reproduced_without_the_pin`) died with
+  `CUDA_ERROR_ILLEGAL_ADDRESS` / `cuEventCreate status 700` twice before
+  its assert — the crash-instability recorded in §5.1/Continuation's
+  opening paragraph, recomputed green from the merge-ref.
+
