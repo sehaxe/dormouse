@@ -21,4 +21,6 @@ file	kind	source	version	source_date	bytes	sha256	fetched
 2605.22791-gated-delta-net-2.pdf	paper	https://arxiv.org/abs/2605.22791	v1	2026-05-21	567107	b0c577f4cbf71d207a688422514ec11a106fa38880b4d212b55494e362dcc2b7	2026-10-01
 2607.05147-dspark.pdf	paper	https://arxiv.org/abs/2607.05147	v1	2026-07-06	1055890	522036b0cc16ad4678bd7c278dd0a0ab4da31170af7b97c2041067cc09a8289a	2026-10-01
 2607.24653-kimi-k3.pdf	paper	https://arxiv.org/abs/2607.24653	v2	2026-08-07	1790685	1a21e4d15de52eb0d4cf09cdbffc6248c497ba6897572cc5574af237c13da51d	2026-10-01
-tech_report-qwen3.8-flash-next.pdf	report	~/Downloads/tech_report.pdf (Qwen3.8-Flash-Next technical report)	-	-	2366146	04f263446d74a35cb7cea368574e0c561f3b05c133be2c777ac884404063655d	2026-10-01
+tech_report-qwen3.8-flash-next.pdf	report	~/Downloads/tech_report.pdf (Qwen3.8-Flash-Next technical report)	-	-	2366146	04f263446d74a35cb7cea368574e0c561f3b05c133be2c777ac884404063655d	2026-10-01context-lms-2609.37725.pdf	https://arxiv.org/abs/2609.37725	v1	ac5c926814434d8ad2f499183cd2a81e53b4c14f327587f99980ade9157db01b
+looped-dit-2609.40305.pdf	https://arxiv.org/abs/2609.40305	v1	bc97f24d5703911433e04b1dfdedbc8f11f931de8a4158cc3592f5335563eaef
+loopcd-2610.02185.pdf	https://arxiv.org/abs/2610.02185	v1	ea3f4126a96cfe11b752c7ccfc6aa6b14c844952488ccfeac5ebd939517cd334
