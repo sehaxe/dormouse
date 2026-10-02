@@ -6,6 +6,7 @@ mod cfg;
 pub mod decode;
 pub mod export;
 pub mod graph;
+pub mod stage;
 mod jepa_targets;
 mod offload;
 mod optim;
@@ -169,6 +170,13 @@ pub struct TrainCfg {
     /// count, and the flip must reach the drift check rather than sit in the
     /// command line.
     pub graph_capture: bool,
+    /// Capture ONE stage - the EMA teacher's forward, the JEPA latents - into
+    /// a CUDA graph and replay it every step (see [`stage`]). Off by default;
+    /// changes no math (the replayed stage is bit-exact), only how many
+    /// launches enqueue it. IN THE SNAPSHOT for the same reason as
+    /// `graph_capture`. Refused with `--graph-capture`, `--engram-ram`,
+    /// `--jepa-targets`, the keyed Engram arm, and `jepa_weight = 0`.
+    pub graph_stage: bool,
 }
 
 impl Default for TrainCfg {
@@ -194,6 +202,7 @@ impl Default for TrainCfg {
             qk_heads: None, jepa_targets: None,
             seed: 1,
             graph_capture: false,
+            graph_stage: false,
         }
     }
 }
@@ -1173,6 +1182,36 @@ pub fn train_loop(
             ));
         }
     }
+    // ── CUDA graph STAGE seam (`--graph-stage`, off by default) ────────────
+    // Captures the EMA teacher's forward — the JEPA latents — and replays it
+    // every step (see [`stage`]). Armed after the teacher exists, so the pin
+    // covers every parameter address the captured forward reads.
+    let stage_on = cfg.graph_stage;
+    let mut stage: Option<stage::StageSeam> = if stage_on {
+        let Some(t) = teacher.as_ref() else {
+            return Err("--graph-stage: the run has no EMA teacher (jepa_weight = 0), so there is \
+                        no stage to capture and nothing consumes the latents."
+                .into());
+        };
+        let client = cubecl_client_opt(&device);
+        let mut s = stage::StageSeam::new(client);
+        let t = s.arm(t.clone());
+        teacher = Some(t);
+        if let Some(r) = s.unsupported_rank() {
+            return Err(format!(
+                "--graph-stage: a teacher parameter has rank {r} and the pin carries ranks 1-4."
+            ));
+        }
+        debug_assert!(s.armed());
+        println!(
+            "graph stage armed: the EMA teacher's forward ({} pinned parameters) is captured once \
+             and replayed every graphed step; log/eval/500-step cadences run it normally.",
+            s.param_copies(),
+        );
+        Some(s)
+    } else {
+        None
+    };
     // Wall clock around the whole loop: the per-step timer line only prints on
     // LOG steps (`timer_step = step % log_every`), which are exactly the steps
     // that run ungraphed, so it can never time a replayed step. The honest
@@ -1364,12 +1403,38 @@ pub fn train_loop(
         // step, same inputs, same cadence — so the last write is the right one.
         let loss_log = std::cell::RefCell::new(None);
         let aux_log = std::cell::RefCell::new(None);
+        // The STAGE's latents (`--graph-stage`): captured once, replayed every
+        // graphed step (see [`stage`]). Computed BEFORE the window, because the
+        // teacher's forward must not run twice in a step; the window closure
+        // then consumes them instead of a live teacher.
+        let stage_latents = match stage.as_mut() {
+            Some(s) => {
+                let t = teacher.as_ref().expect("armed only with a teacher");
+                let h_t = if host_rows.is_some() { None } else { Some(h.clone()) };
+                Some(s.step(ungraphed, &x, |xin| {
+                    t.forward_latent::<Backend>(xin, h_t.clone(), None)
+                })?)
+            }
+            None => None,
+        };
         seam.step(ungraphed, || {
             let (_logits, rec_ce, _kda, aux) = if let Some(tg) = jepa_target.clone() {
                 model.forward_with_jepa_targets::<Backend>(
                     x.clone(),
                     // RAM-offload path drives the Engram from host_rows; uploading
                     // hashed_ids too would be a dead per-step H2D copy.
+                    if host_rows.is_some() { None } else { h_for_fwd.clone() },
+                    host_rows.clone(),
+                    Some(y.clone()),
+                    Some(tg),
+                )
+            } else if let Some(tg) = stage_latents.clone() {
+                // The stage's latents: the same stop-grad target the EMA
+                // teacher's in-window forward would have produced (gate (b)
+                // pins the replay bit-exact against it), so the JEPA term is
+                // the same objective computed with one replay dispatch.
+                model.forward_with_jepa_targets::<Backend>(
+                    x.clone(),
                     if host_rows.is_some() { None } else { h_for_fwd.clone() },
                     host_rows.clone(),
                     Some(y.clone()),
@@ -1561,7 +1626,16 @@ pub fn train_loop(
         atlas.mark(step, "retr", retr_ms as f32);
         let t_ema = std::time::Instant::now();
         if let Some(t) = teacher.take() {
-            teacher = Some(dormouse_core::aux::ema_update(t, &model, dormouse_core::aux::TEACHER_MOMENTUM));
+            let mut t = dormouse_core::aux::ema_update(t, &model, dormouse_core::aux::TEACHER_MOMENTUM);
+            // The stage reads the teacher THROUGH its pinned masters, so the
+            // EMA'd values must be copied back into them before the next
+            // replay - the same copy the whole-step seam's pin makes.
+            if let Some(s) = stage.as_mut() {
+                let (t2, r) = s.refresh(t);
+                t = t2;
+                r?;
+            }
+            teacher = Some(t);
             // The teacher is read INSIDE the window, so it is pinned exactly like
             // the model: `ema_update` rebuilds every `Param`, so its address
             // moves every step.
@@ -1961,7 +2035,13 @@ pub fn train_loop(
                 step,
                 t.elapsed().as_secs_f64(),
                 t.elapsed().as_secs_f64() * 1e3 / ran as f64,
-                if graph_on { format!(" | {}", seam.report()) } else { String::new() },
+                if graph_on {
+                    format!(" | {}", seam.report())
+                } else if let Some(s) = &stage {
+                    format!(" | {}", s.report())
+                } else {
+                    String::new()
+                },
             );
         }
     }
