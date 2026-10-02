@@ -1,139 +1,154 @@
-#
-# ---------------------------------------------------------------------------
-#      0     5549ms    97  1007   4053   392    0.0
-#    100      240ms    48    96     43    52    0.0
-# 10809ms) was read at STEP 0 ONLY. I promoted it to the AGENTS.md rulebook as
-# +11%. A bigger batch buys gradient quality here, not speed.
-#    150      250ms    46    98     47    58    0.0
-# +18% throughput for 4x the memory, and diminishing (+11%, then +6.5%). This
-#   1. A step-time reading with no step index is not a measurement of a step.
-# 1. THE OPTIMIZER IS 77% OF THE STEP. 8303 of 10809 ms. Not the attention arm
+date	commit	mode	step	throughput	mem	final-ce
 2026-09-25T22:21:14Z	bdddbaf	canary	4081ms	1.23KB/s	res=n/a	ce=5.141
 2026-09-26T05:56:36Z	b00ae06	canary	150548ms	0.03KB/s	res=n/a	ce=5.074
+# --- 2026-09-28, the attention arm's cost, and what the step is actually made of
+# ---------------------------------------------------------------------------
+# RETRACTION. The rows I put here earlier today -
+#   ops-with-attention 25858ms, ops-no-attention 3076ms, fused-forward 3098ms
+# - are WRONG and are struck. 25858 was measured with three compilers on the
+# box (load 7-19), in the dev profile, and with `--eval-every` enabled. The same
+# loop arm at the same shape measures ~1.6 s/step on a quiet machine in release.
+# A 16x error, in the pessimistic direction, and I repeated it to the owner as
+# a fact before checking it. The 3.076 s no-attention figure is wrong the same
+# way. Both are gone rather than restated, because I have no clean way to
+# reproduce the exact conditions, and "measured under contention" is not a
+# measurement.
+#
+# WHAT IS CLEAN, from `--timers` on a quiet card, release build, small preset
+# (9,195,854 params), batch 8 x seq 512, depth 2, fp32, aux off, --no-engram.
+# Step 0, ms, read off the timer line the trainer already prints:
+#
+#   arm      total   fwd   bwd    opt
+#   batched  10809    109  1824  8303
+#   loop     10493    224  1538  8180
+#   no-kda    7864     48  1466  5799
+#
+# Three things in that table, and the first is the only reason to keep it:
+#
+# 1. THE OPTIMIZER IS 77% OF THE STEP. 8303 of 10809 ms. Not the attention arm
+#    - the optimizer, Muon+ Newton-Schulz over 9.2M params. This is where the
+#    time is, and until tonight nobody had looked at it, because the attention
+#    arm LOOKED like the cost (see the 25858 row above) and every optimisation
+#    effort went there. The arm's forward is 61 ms of a 10809 ms step. Even a
+#    free attention arm saves 25% of the step, not 16x.
+# 2. The batched ops path is a REAL win where it applies and nowhere else:
+#    fwd 109 vs 224 ms, and the arm's marginal forward cost 61 vs 176 ms - 2.9x
+#    cheaper. The op-level A/B in burn-gdn2 puts it at 4.1-4.8x over three
+#    runs, and the differential test agrees with the loop to 9.1e-6 including
+#    a hostile case (||L||_inf = 10.97), with identical gradients (2.40e-2
+#    both arms, on the f32 finite-difference noise floor).
+# 3. ITS BACKWARD IS 19% SLOWER (1824 vs 1538 ms), which is why the whole-step
+#    difference is a wash (1627 vs 1695 ms wall-clock). The 4.4x on the arm
+#    does not survive contact with the backward. Not yet diagnosed; the
+#    Neumann inversion is batched, so the backward through it may be carrying
+#    5-D intermediates the loop never materialised.
+#
+# A step time is not a claim; it is an instrument reading, and the instrument is
+# `--timers` on a quiet card. Quote the config with it or quote nothing.
+2026-09-28T20:40:00Z	e143f67	timers-batched-ops	10809ms	3.03KB/s	res=5908MiB	ce=5.530
+2026-09-28T20:40:00Z	e143f67	timers-loop-ops	10493ms	3.12KB/s	res=5908MiB	ce=5.532
+2026-09-28T20:40:00Z	e143f67	timers-no-attention	7864ms	4.17KB/s	res=5908MiB	ce=5.536
+# VRAM, from the batch ladder, 60 steps each, aux off. Corrects a claim that
+# was repeated here and in several docs: "batch 4 OOMs on 16 GB" is true only
+# with the JEPA teacher on (a second full forward). With aux off the card takes
+# batch 16 in 5908 MiB, 37% of 16 GB. Throughput is flat from batch 8 to 16,
+# which is what a launch-bound workload does - a bigger batch buys gradient
+# quality here, not speed.
 2026-09-28T13:40:00Z	422414c	vram-probe-b4	1420ms	n/a	peak=3008MiB	n/a
 2026-09-28T13:52:00Z	422414c	vram-probe-b8	3098ms	n/a	peak=3664MiB	n/a
 2026-09-28T13:58:00Z	422414c	vram-probe-b12	2760ms	n/a	peak=4760MiB	n/a
 2026-09-28T14:04:00Z	422414c	vram-probe-b16	2738ms	n/a	peak=5908MiB	n/a
-2026-09-28T20:40:00Z	e143f67	timers-batched-ops	10809ms	3.03KB/s	res=5908MiB	ce=5.530
-2026-09-28T20:40:00Z	e143f67	timers-loop-ops	10493ms	3.12KB/s	res=5908MiB	ce=5.532
-2026-09-28T20:40:00Z	e143f67	timers-no-attention	7864ms	4.17KB/s	res=5908MiB	ce=5.536
-# --- 2026-09-28, the attention arm's cost, and what the step is actually made of
-2026-09-29T03:41:00Z	6891e23	step0-autotune-L0	8204ms	n/a	res=5908MiB	n/a
-2026-09-29T03:41:00Z	6891e23	step0-autotune-L3	5579ms	n/a	res=5908MiB	n/a
-2026-09-29T03:58:00Z	6891e23	cold-step-s0	5549ms	n/a	res=5908MiB	ce=5.54
+# --- 2026-09-29, THE 10 809 ms READING ABOVE IS A STEP-0 ARTIFACT
+# ---------------------------------------------------------------------------
+# The block at lines 22-27 ("the optimizer is 77% of the step", opt=8303ms of
+# 10809ms) was read at STEP 0 ONLY. I promoted it to the AGENTS.md rulebook as
+# the project's optimization target without replicating it, on the strength of a
+# comment inside this file. It is wrong. Replicated by hand, quiet card, release,
+# small (9 195 854 params), batch 8 x seq 512, depth 2, fp32, aux off, --no-engram,
+# CUBECL_AUTOTUNE_LEVEL=3, --timers:
+#
+#   step      total    fwd    bwd    opt    retr    ema
+#      0     5549ms    97  1007   4053   392    0.0
+#     50      249ms    46    98     43    61    0.0
+#    100      240ms    48    96     43    52    0.0
+#    150      250ms    46    98     47    58    0.0
+#
+# A WARM STEP IS ~245 ms, and opt is 43 ms of it (18%), not 4053 (73%). The
+# whole of the cold cost is the cubecl autotune cache: every candidate kernel is
+# benchmarked at runtime over the first steps. opt alone warms 94x.
+#
+# TWO RULES THAT GENERALISE, both learned the expensive way here:
+#   1. A step-time reading with no step index is not a measurement of a step.
+#   2. `--timers` prints on `step % 50 == 0` only (train/src/lib.rs:1316). It is
+#      NOT tied to --log-every, so every short run in this project's history has
+#      reported step 0 and nothing else - which is exactly how a 23x error
+#      survived in a TSV and reached the rulebook.
+#
+# What survives the retraction: the ~465 ms "fixed cost" floor (§2.2) is the
+# RIGHT ORDER and was vindicated, not contradicted. The "KDA ~80% of a step"
+# attribution stays dead - the warm forward is 46-48 ms, i.e. 19%.
+#
+# THE REAL WARM PROFILE, and the actual optimization targets in order:
+#   bwd  96-98 ms (40%)  - and the attention backward does not run at all
+#                         (fused kda=<f>/0), so this is an incomplete backward
+#   retr 52-61 ms (22%)  - the TSCT polar retraction, in no doc, never examined
+#   fwd  46-48 ms (19%)
+#   opt  43-47 ms (19%)
+# ema is 0.0 because aux was off for this reading.
+2026-09-29T03:58:00Z	6891e23	warm-step-s50	249ms	n/a	res=5908MiB	ce=5.42
 2026-09-29T03:58:00Z	6891e23	warm-step-s100	240ms	n/a	res=5908MiB	ce=5.40
 2026-09-29T03:58:00Z	6891e23	warm-step-s150	250ms	n/a	res=5908MiB	ce=5.38
-2026-09-29T03:58:00Z	6891e23	warm-step-s50	249ms	n/a	res=5908MiB	ce=5.42
+2026-09-29T03:58:00Z	6891e23	cold-step-s0	5549ms	n/a	res=5908MiB	ce=5.54
+# Step-0 opt is also a reading of the TUNING SETTING, not the workload: with the
+# same config, CUBECL_AUTOTUNE_LEVEL=0 gives opt=5946ms and level=3 gives 3993ms.
+2026-09-29T03:41:00Z	6891e23	step0-autotune-L0	8204ms	n/a	res=5908MiB	n/a
+2026-09-29T03:41:00Z	6891e23	step0-autotune-L3	5579ms	n/a	res=5908MiB	n/a
+# --- 2026-09-29, WHY THE GPU IS IDLE: the workload is launch-bound
+# ---------------------------------------------------------------------------
+# The answer to "get the card to 100%". Sampled nvidia-smi utilization.gpu at
+# 2 Hz for 90 s across a 150-step warm run, batch 32, 9 195 854 params, depth 2,
+# fp32, aux off, --no-engram, autotune L3. Raw: /tmp/opencode/util2.log.
+#   warm window (samples 21+, n=180):  mean 13.3%,  142/180 at <=5%,
+#                                    24/180 at >50%,  3 samples at 100%
+# The card is idle ~87% of a warm step. The kernels are too small and too many:
+# this is launch overhead, not a lack of arithmetic.
+#
+# The lever that attacks launch overhead directly is CUDA graph capture/replay,
+# and it is CONFIRMED WORKING ON THIS GPU - vendor/cubecl-fix/cubecl-cuda/tests/
+# graph.rs is 5/5 green here (capture+replay, input rewrite, intermediate
+# recycling, pool-growth refusal, many-launches with dynamic metadata). Client API:
+# graph_prepare -> start_capture -> stop_capture -> Graph::replay.
+# NOT YET BUILT. The blocker is documented at client.rs:1288-1296: inside a
+# capture window the stream refuses reads, syncs and handle writes, and a
+# training step must do all three. So the first version captures ONE stage that
+# needs no host round-trip - not the whole step.
+#
+# Batch ladder, warm, same config, step time / tokens-per-second:
+#   8 -> 244ms / 16.8K      16 -> 440ms / 18.6K
+#  32 -> 826ms / 19.8K      64 -> OOM (server.rs:144, 100MB reserve)
+# +18% throughput for 4x the memory, and diminishing (+11%, then +6.5%). This
+# CORRECTS the "throughput is flat from batch 8 to 16" claim at line 54: it is
+# +11%. A bigger batch buys gradient quality here, not speed.
 2026-09-29T04:12:00Z	6891e23	gpu-util-batch32	828ms	19.8Ktok/s	gpu-util-mean=13.3%	pct<=5%=79%
+2026-09-29T04:12:00Z	6891e23	warm-batch8	244ms	16.8Ktok/s	res=5908MiB	ce=5.42
 2026-09-29T04:12:00Z	6891e23	warm-batch16	440ms	18.6Ktok/s	res=5908MiB	ce=5.40
 2026-09-29T04:12:00Z	6891e23	warm-batch32	826ms	19.8Ktok/s	res=5908MiB	ce=5.38
-2026-09-29T04:12:00Z	6891e23	warm-batch8	244ms	16.8Ktok/s	res=5908MiB	ce=5.42
 2026-09-29T17:40:00Z	feaf0da	warm-batch8-retract-per-factor	265ms	15.5Ktok/s	res=n/a	ce=3.236
 2026-09-29T17:41:00Z	feaf0da	warm-batch8-retract-batched	221ms	18.5Ktok/s	res=n/a	ce=3.232
-# --- 2026-09-29, THE 10 809 ms READING ABOVE IS A STEP-0 ARTIFACT
-# --- 2026-09-29, WHY THE GPU IS IDLE: the workload is launch-bound
 2026-09-30T16:20:08Z	48048ed	control-full-arch-small-b8-s512	~480ms-warm (idx 1500-1900; step0=22354ms autotune)	~65KB/s (8.19MB/2000 steps)	res=n/a	ce=2.676-best/eval-bpb=6.418@500,6.531@1000,6.387@1500 window=81920B seed=1 preset=small params=9197454(incl engram rows) aux=jepa0.05+koleo quant=fp8 opt=muon+ lr=cos1e-4 0NaN 0panics log=~/logs/first_run_2000_0930_1855.log ckpt=checkpoints/first_run_2000.best.bin
 2026-09-30T17:46:32Z	0e9817b	arm-A0-pure-CE-jepa0-dspark0	~480ms-warm	bid: 8.19MB/2000 steps	res=n/a	ce=2.666-best/eval-bpb=6.492@500,6.589@1000,6.437@1500 window=81920B seed=1 log=~/logs/first_run_2000_0930_1921.log ema=0.0ms confirms teacher off
 2026-09-30T17:46:32Z	0e9817b	arm-retract-every-4	~480ms-warm(retraction steps)/~461ms-avg	bid: 8.19MB/2000 steps	res=n/a	ce=2.659-best/eval-bpb=6.426@500,6.463@1000,6.329@1500 window=81920B seed=1 log=~/logs/first_run_2000_0930_1940.log retr_arm=factor:126@500 proves cadence 0NaN
-2026-10-01T08:15:10Z	9326967	a0-pure-CE-3seed	25min-avg	8.19MB/run	res=n/a	bpb=6.437/6.443/6.396 (mean 6.425) window=81920B VERDICT: loses to aux 3/3 — aux arms EARN their place (JEPA researcher's weight-0 rec REVERSED by data)
 2026-10-01T08:15:10Z	9326967	control-3seed	25min-avg	8.19MB/run	res=n/a	bpb=6.387/6.314/6.329 (mean 6.343) window=81920B aux=jepa0.05+koleo VERDICT: beats pure-CE 3/3 seeds, full separation
+2026-10-01T08:15:10Z	9326967	a0-pure-CE-3seed	25min-avg	8.19MB/run	res=n/a	bpb=6.437/6.443/6.396 (mean 6.425) window=81920B VERDICT: loses to aux 3/3 — aux arms EARN their place (JEPA researcher's weight-0 rec REVERSED by data)
 2026-10-01T11:43:00Z	a7c3cad	first-100k-production-small-b8-s512-retract4	100000 done 2026-10-01 02:02->14:42 (12h40m, ~456ms/step avg; warm steps 463-515ms; 0 NaN/panic/guard-restart)	81920B x 200 eval windows = 16.4MB of scored text/run; run read ~800MB of the 46.2GB corpus	res=n/a	held-out bpb: BEST 5.5452847 @ step 86000; final 5.729 @ 99500; curve 6.480@500 6.042@40500 5.769@50500 5.720@75500 5.603@85500 -> past 86k it stops descending (best-of-a-plateau, not a late win). train ce best=2.415. window=81920B preset=small params=9197454 aux=jepa0.05+koleo(dspark0) no-engram quant=fp8 opt=muon+ ns=8 lr=cos1e-4 wd0.01 clip1.0 warmup retract_every=4 retract_iters=3 seed=1 max_iter=4 rank=64 n_experts=3 eval_every=500 eval_batches=20 batch=8 seq_len=512 log=~/logs/first_run_100000_1001_0202.log ckpt=checkpoints/first_run_100000--retract-every-4-.best.bin export=checkpoints/first_run_100000--retract-every-4-.f32.dmexp. NOTE the binary predates the six arm landings (built 09-30 18:31 off a7c3cad), so this run cannot contain any of them. fused kda=398012/0 bwd=0: the fused FORWARD ran and its result is discarded (ADR-0019 shape, §3.3), so the attention arm trained on the ops path.
 2026-10-01T15:19:00Z	fd61da7	arm-mhc-3seed	23-24min/run (573ms/step warm, ran beside other lanes' CPU work - see the DEGRADED LAUNCH rows in ~/logs/abwave_runs.tsv)	81920B x 4 evals/run = 327680B scored/run	res=n/a	held-out bpb = 6.413 / 6.313 / 6.370 (seeds 1/2/3) mean 6.3653 sd 0.0502 range 0.100. CONTROL aux-ON 3seed = 6.387/6.314/6.329 mean 6.3433 -> delta +0.0220 against the control's own seed RANGE 0.0730 (§1.2 bar) = TIE, and §1.2 says a tie deletes the mechanism. window=81920B preset=small.toml+use_mhc=true+mhc_streams=2 (--set use_mhc is NOT in config/override.rs's key list, so the documented invocation never reached the trainer) params=9203609 (+6155 = +0.067%% over the control's 9197454, matching mhc-2026-09-30.md's quoted cost) batch=8 seq_len=512 retract_every=4 steps=2000 seed=1/2/3 max_iter=4 n_experts=3 aux=jepa0.05+koleo quant=fp8 opt=muon+ ns=8 lr=cos1e-4 0 NaN 0 panics 3/3 runs completed. logs=~/logs/ab_2000_mhc_s{1,2,3}_*.log ckpt=checkpoints/ab2000_mhc_s{1,2,3}.best.bin. NOTE: the 3seed control family was run at retract_every=1; this arm at 4 (owner working mode). Paired same-seed deltas vs that family: +0.026 / -0.001 / +0.041.
 2026-10-01T22:10:00Z	69433d4	f16-tensor-core-gate	f16=40.05TFLOP/s@0.40ms(5120x768x2048,91-97%-of-cuBLAS-41.4,4.9x-vs-fp32-8.24)+39.75TFLOP/s@4.32ms(5120x2048x8192,91%-of-43.7);fp32-arms=8.24/8.89	backend-parity/f16_gemm_perf min-of-3x10-drained-iters,quiet-card,logs=~/logs/f16tc-*.log	res=n/a	VERDICT: SizedType-patch WORKS - f16 tensor-core ALIVE through burn, correctness-1e-2 green both shapes, SizedType-panic gone from all logs. CAVEATS: fix visible ONLY via ROOT workspace graph (vendor/dormouse-fused has own workspace, no [patch], registry cubecl-ir = unpatched stack); winning kernel autotunes per shape (~20 candidates skip with No-tile-size/TMA - now COUNTED by warn in Candidate::fail); poisoned-runner guard rewritten ms>1.0 -> TFLOP/s ceiling 60/25 (old form panicked on the real 0.474ms win)
-2026-10-02T04:05:00Z	8dd8398	wt/graph-trainer-gates	4 CUDA gates, 1/4 green (75s test, build 5m45 dt-graph)	n/a	n/a	res=n/a	BLOCKER: a_pinned_replay_agrees 8.9e-1 rel at iter_embed; replays_train_and_are_reproducible: 6 replays leave params BIT-IDENTICAL to capture step - a window excluding an out-of-place optimizer cannot train; negative gate now crashes CUDA_ERROR_ILLEGAL_ADDRESS instead of clean signature. a_replay_launches_no_kernels green (6 launches/replay). --graph-capture NOT merged; verdict in research/reviews/graph-trainer-2026-10-01.md continuation
-2026-10-02T04:12:00Z	af9def1	probe-b8-fp16-vs-fp32-+-batch-ladder	150 steps/cell, warm step-100 timers	465/441/894/930 ms (b8-fp32/b8-fp16/b16-fp32/b16-fp16); b32 OOM step-0 (aux JEPA 2nd forward)	tok/s 8809/9288/9163/8809	3.9GB @b8	VERDICT: f16 ships AT BATCH 8 ONLY (-5.2%, fwd 185->162, slope identical ce@100 3.846=3.846, 0 NaN, quant format Fp16 confirmed); at b16 the win inverts (bwd 504->534). Night mode = b8 + --quant fp16 (9288 tok/s, +5.4% vs b8 fp32). logs=~/logs/probe_{b8f32,b8f16,b16,b32,b16f16}.log
 2026-10-02T04:25:00Z	af9def1	wave3-attnres-3seed-FRESH	2000 steps x3 (s2r/s3r fresh re-runs 03:12-03:52 after the 02:05 ENOSPC kill + a no-train-resume s3)	~475-482ms/step warm	81920B x 3 evals/run	res=n/a	held-out bpb = 6.191 / 6.346 / 6.453 mean 6.3300 range 0.262 (3.6x the control's 0.0730). CONTROL mean 6.3433, bar 6.2703 -> +0.060 = TIE -> DELETED per §1.2. Paired same-seed deltas: -0.196 / +0.032 / +0.124; s1's 6.191 was seed spread, not signal. params=9200526 (+3072, engaged). quant=fp8 factors, batch=8, retract_every=4. logs=~/logs/ab2000_attnres_s{1,2r,3r}.log
 2026-10-02T04:25:00Z	af9def1	wave3-fb-3seed-FRESH	2000 steps x3 (02:17-03:07, all fresh: step-0 ce 6.141-6.150)	~460-490ms/step warm	81920B x 3 evals/run	res=n/a	held-out bpb = 6.406 / 6.391 / 6.463 mean 6.4200 range 0.072 -> +0.150 vs bar 6.2703 = TIE -> DELETED (widest loss of the wave; train CE best 2.998-3.040 worst of any completed arm). fb=1503/1503 engaged, params=9394318 (+196864). logs=~/logs/ab2000_fbs1_s{1,2,3}.log
+2026-10-02T04:05:00Z	8dd8398	wt/graph-trainer-gates	4 CUDA gates, 1/4 green (75s test, build 5m45 dt-graph)	n/a	n/a	res=n/a	BLOCKER: a_pinned_replay_agrees 8.9e-1 rel at iter_embed; replays_train_and_are_reproducible: 6 replays leave params BIT-IDENTICAL to capture step - a window excluding an out-of-place optimizer cannot train; negative gate now crashes CUDA_ERROR_ILLEGAL_ADDRESS instead of clean signature. a_replay_launches_no_kernels green (6 launches/replay). --graph-capture NOT merged; verdict in research/reviews/graph-trainer-2026-10-01.md continuation
+2026-10-02T04:12:00Z	af9def1	probe-b8-fp16-vs-fp32-+-batch-ladder	150 steps/cell, warm step-100 timers	465/441/894/930 ms (b8-fp32/b8-fp16/b16-fp32/b16-fp16); b32 OOM step-0 (aux JEPA 2nd forward)	tok/s 8809/9288/9163/8809	3.9GB @b8	VERDICT: f16 ships AT BATCH 8 ONLY (-5.2%, fwd 185->162, slope identical ce@100 3.846=3.846, 0 NaN, quant format Fp16 confirmed); at b16 the win inverts (bwd 504->534). Night mode = b8 + --quant fp16 (9288 tok/s, +5.4% vs b8 fp32). logs=~/logs/probe_{b8f32,b8f16,b16,b32,b16f16}.log
 2026-10-02T09:20:00Z	e55a4c2	night_20261002-small-b8-s512-fp16	44000 done 2026-10-02 04:18->09:16 (4.97h, warm 440-445ms/step, ~0.414s/step incl evals, ~9200 tok/s sustained, 0 NaN, monitor ~/logs/night_mon.log all-green)	81920B x 87 eval windows	res=n/a	held-out bpb: BEST 5.908 @ 36500; train ce best 2.512. PAIRED vs first-100k-production (same seed 1, batch 8, window, schedule shape; the one variable = factor quant fp16 vs fp8): matched-step evals interleave inside +-0.1-0.2 eval noise (500: 6.469/6.480, 5000: 6.483/6.323, 30000: 6.119/6.111, 36500: 5.908/~5.95, 42000: 6.108/5.705) - fp16 NOT a quality regression at -5% ms/step. preset=small params=9197454 (no arms - all wave-3 arms tied per §1.2) aux=jepa0.05+koleo(dspark0) no-engram quant=FP16(opt) opt=muon+ ns=8 lr=cos1e-4 warmup retract_every=4 steps=44000 batch=8 seq_len=512 eval_every=500 log=~/logs/night_2026-10-02.log ckpt=checkpoints/night_20261002.best.bin. Not comparable to 5.545@86k (half the steps); the f16-at-100k question needs this run at --steps 100000 (~12.6h).
-2026-10-02T21:26:00Z	bbf439d	graph-stage-gate-b	capture(teacher fwd) -> replay -> latents BIT-identical (f32 to_bits) to the uncaptured forward on the capture batch AND on a new batch through the pin; fixture-varies assert so a stale graph cannot pass	stage_capture_cuda.rs 1/1 green 54.9s, CudaBare+Autodiff trainer shape d64 h4 iter3, use_engram=false (the stage refuses the keyed arm)	res=n/a	VERDICT: the stage replay is bit-exact; the main-loop KDA fwd stage the brief asked for first is NOT honestly capturable (a replay runs no host code, so no per-step autodiff nodes -> the 8fa5d4c frozen-arm shape); the teacher's forward is gradient-free by construction (ema_update ends .no_grad()) and BIGGER (atlas row 4: 4401.7 launches, of which KDA copy 3099.4)
 2026-10-03T00:35:00Z	354a738	bfab-byteflow-vs-byte-control-200step	200 steps x4 arms (bf x2 seeds, ctl x2 seeds; sequential, all fresh): bf 2.8-4.5min/run ~53-83ms/step, ctl 10-16min/run ~450-500ms/step on the SAME 4096B/step seam (equal bytes = equal steps, measured: both loops stream batch*seq_len through ByteStream::next_batch)	bf tp ~62KB/s, ctl ~8.7KB/s	bf 2.7GB, ctl ~4GB	VERDICT WIN->FLIPPED: held-out BPB over the SAME fixed 81920B window: bf s1 4.488@200/4.823@100, s2 4.539@200/4.898@100 (mean@200 4.514, range 0.051); ctl s1 6.714@100, s2 6.595@100 (mean 6.655, range 0.119 - the dormouse loop prints no eval@200; compare @100) -> bf wins by ~2.15BPB at equal bytes/wallwindow, ~30x the ctl seed spread. CAVEATS: params NOT matched (bf 15923968 vs ctl 9197454, +73%); smoke budget 0.82MB vs family 8.19MB at 2k - 2k x3seed confirm owed. Flip executed: schema default use_byteflow=true + every dormouse preset gains explicit use_byteflow=false (configs/{small,nano,base,swift50,one_b,p150,mor,nano-fused}.toml); findings + 1M refusal map: docs/reviews/byteflow-ab-2026-10-02.md. logs=~/logs/bfab_20261002_{bf,ctl}_{s1,s2}.log GATES train-lib 60/60 core-lib 89/89 data 15/15 byteflow_smoke 2/2 doc-refs green
-#                                    24/180 at >50%,  3 samples at 100%
-# 2 Hz for 90 s across a 150-step warm run, batch 32, 9 195 854 params, depth 2,
-# 2. The batched ops path is a REAL win where it applies and nowhere else:
-#   2. `--timers` prints on `step % 50 == 0` only (train/src/lib.rs:1316). It is
-#  32 -> 826ms / 19.8K      64 -> OOM (server.rs:144, 100MB reserve)
-# 3. ITS BACKWARD IS 19% SLOWER (1824 vs 1538 ms), which is why the whole-step
-#     50      249ms    46    98     43    61    0.0
-#    5-D intermediates the loop never materialised.
-#   8 -> 244ms / 16.8K      16 -> 440ms / 18.6K
-# (9,195,854 params), batch 8 x seq 512, depth 2, fp32, aux off, --no-engram.
-# A 16x error, in the pessimistic direction, and I repeated it to the owner as
-# a fact before checking it. The 3.076 s no-attention figure is wrong the same
-#    a hostile case (||L||_inf = 10.97), with identical gradients (2.40e-2
-# and it is CONFIRMED WORKING ON THIS GPU - vendor/cubecl-fix/cubecl-cuda/tests/
-# - are WRONG and are struck. 25858 was measured with three compilers on the
-#    arm LOOKED like the cost (see the 25858 row above) and every optimisation
-#   arm      total   fwd   bwd    opt
-# A step time is not a claim; it is an instrument reading, and the instrument is
-# attribution stays dead - the warm forward is 46-48 ms, i.e. 19%.
-# A WARM STEP IS ~245 ms, and opt is 43 ms of it (18%), not 4053 (73%). The
-# batch 16 in 5908 MiB, 37% of 16 GB. Throughput is flat from batch 8 to 16,
-#   batched  10809    109  1824  8303
-# Batch ladder, warm, same config, step time / tokens-per-second:
-# benchmarked at runtime over the first steps. opt alone warms 94x.
-#    both arms, on the f32 finite-difference noise floor).
-# box (load 7-19), in the dev profile, and with `--eval-every` enabled. The same
-#   bwd  96-98 ms (40%)  - and the attention backward does not run at all
-# capture window the stream refuses reads, syncs and handle writes, and a
-#    cheaper. The op-level A/B in burn-gdn2 puts it at 4.1-4.8x over three
-# comment inside this file. It is wrong. Replicated by hand, quiet card, release,
-# CORRECTS the "throughput is flat from batch 8 to 16" claim at line 54: it is
-# CUBECL_AUTOTUNE_LEVEL=3, --timers:
-date	commit	mode	step	throughput	mem	final-ce
-#    difference is a wash (1627 vs 1695 ms wall-clock). The 4.4x on the arm
-#    does not survive contact with the backward. Not yet diagnosed; the
-#    effort went there. The arm's forward is 61 ms of a 10809 ms step. Even a
-# ema is 0.0 because aux was off for this reading.
-# fp32, aux off, --no-engram, autotune L3. Raw: /tmp/opencode/util2.log.
-#    free attention arm saves 25% of the step, not 16x.
-#                         (fused kda=<f>/0), so this is an incomplete backward
-#    fwd 109 vs 224 ms, and the arm's marginal forward cost 61 vs 176 ms - 2.9x
-#   fwd  46-48 ms (19%)
-# graph_prepare -> start_capture -> stop_capture -> Graph::replay.
-# graph.rs is 5/5 green here (capture+replay, input rewrite, intermediate
-#   loop     10493    224  1538  8180
-# loop arm at the same shape measures ~1.6 s/step on a quiet machine in release.
-# measurement.
-# needs no host round-trip - not the whole step.
-#    Neumann inversion is batched, so the backward through it may be carrying
-#   no-kda    7864     48  1466  5799
-#      NOT tied to --log-every, so every short run in this project's history has
-# NOT YET BUILT. The blocker is documented at client.rs:1288-1296: inside a
-#   ops-with-attention 25858ms, ops-no-attention 3076ms, fused-forward 3098ms
-#   opt  43-47 ms (19%)
-# quality here, not speed.
-# recycling, pool-growth refusal, many-launches with dynamic metadata). Client API:
-#      reported step 0 and nothing else - which is exactly how a 23x error
-# reproduce the exact conditions, and "measured under contention" is not a
-#   retr 52-61 ms (22%)  - the TSCT polar retraction, in no doc, never examined
-# RETRACTION. The rows I put here earlier today -
-# RIGHT ORDER and was vindicated, not contradicted. The "KDA ~80% of a step"
-#    runs, and the differential test agrees with the loop to 9.1e-6 including
-# same config, CUBECL_AUTOTUNE_LEVEL=0 gives opt=5946ms and level=3 gives 3993ms.
-# small (9 195 854 params), batch 8 x seq 512, depth 2, fp32, aux off, --no-engram,
-# Step 0, ms, read off the timer line the trainer already prints:
-# Step-0 opt is also a reading of the TUNING SETTING, not the workload: with the
-#   step      total    fwd    bwd    opt    retr    ema
-#      survived in a TSV and reached the rulebook.
-# The answer to "get the card to 100%". Sampled nvidia-smi utilization.gpu at
-# The block at lines 22-27 ("the optimizer is 77% of the step", opt=8303ms of
-# The card is idle ~87% of a warm step. The kernels are too small and too many:
-# The lever that attacks launch overhead directly is CUDA graph capture/replay,
-#    - the optimizer, Muon+ Newton-Schulz over 9.2M params. This is where the
-# the project's optimization target without replicating it, on the strength of a
-# THE REAL WARM PROFILE, and the actual optimization targets in order:
-# this is launch overhead, not a lack of arithmetic.
-# Three things in that table, and the first is the only reason to keep it:
-#    time is, and until tonight nobody had looked at it, because the attention
-# `--timers` on a quiet card. Quote the config with it or quote nothing.
-# training step must do all three. So the first version captures ONE stage that
-# TWO RULES THAT GENERALISE, both learned the expensive way here:
-# VRAM, from the batch ladder, 60 steps each, aux off. Corrects a claim that
-#   warm window (samples 21+, n=180):  mean 13.3%,  142/180 at <=5%,
-# was repeated here and in several docs: "batch 4 OOMs on 16 GB" is true only
-# way. Both are gone rather than restated, because I have no clean way to
-# WHAT IS CLEAN, from `--timers` on a quiet card, release build, small preset
-# What survives the retraction: the ~465 ms "fixed cost" floor (§2.2) is the
-# which is what a launch-bound workload does - a bigger batch buys gradient
-# whole of the cold cost is the cubecl autotune cache: every candidate kernel is
-# with the JEPA teacher on (a second full forward). With aux off the card takes
+2026-10-02T21:24:00Z	bbf439d	graph-stage-budget-fix	MAX_REFUSALS 20->2 CONSECUTIVE (a success resets); refused() moved to Stats so the stage seam shares it; graph_prepare reachable only under capture_allowed() -> no third attempt is structural	unit: two_failed_captures_disable_the_seam_and_stop_the_pool_growth + a_successful_capture_resets_the_refusal_budget (cargo test -p dormouse-train --lib, 64/64 on rebased main)	res=n/a	VERDICT: the whole-step lane's pool x20 -> ILLEGAL_ADDRESS failure mode (gbench2_graph.log, 2331 memory nodes x 20 attempts) is now structurally impossible; the seam disables after 2 consecutive failures with a one-time loud print
+2026-10-02T21:26:00Z	bbf439d	graph-stage-gate-b	capture(teacher fwd) -> replay -> latents BIT-identical (f32 to_bits) to the uncaptured forward on the capture batch AND on a new batch through the pin; fixture-varies assert so a stale graph cannot pass	stage_capture_cuda.rs 1/1 green 54.9s, CudaBare+Autodiff trainer shape d64 h4 iter3, use_engram=false (the stage refuses the keyed arm)	res=n/a	VERDICT: the stage replay is bit-exact; the main-loop KDA fwd stage the brief asked for first is NOT honestly capturable (a replay runs no host code, so no per-step autodiff nodes -> the 8fa5d4c frozen-arm shape); the teacher's forward is gradient-free by construction (ema_update ends .no_grad()) and BIGGER (atlas row 4: 4401.7 launches, of which KDA copy 3099.4)
+2026-10-02T21:30:00Z	bbf439d	graph-stage-ab-500	500 steps x2 arms, same binary (bbf439d), same session, quiet card, CUBECL_AUTOTUNE_LEVEL=3, small/b8/s512/--no-engram/retract-every 4/seed 1/lr 1e-4/quant auto-Fp8/muon+ ns8	jepa 0.05+dspark0, eval_every 50000 (no evals), --timers, warm = binary's own steps 50..500 wall mean; logs ~/logs/gs500_{plain,plain2,stage}.log	3.9GB @b8	plain 453.1 ms/step (first run 460.6 - cross-process autotune spread ~7ms) vs stage 423.0 -> **-30.1 ms/step (-6.6%)**, bar was >=10; launches/step 21.5k -> ~17.4k (-4.1k = the teacher fwd replayed, atlas row 4 said 4.4k); stage report 'captured 1 replayed 495 refused 0 fed 500'; ce curves agree within cross-process autotune noise (plain-vs-plain itself drifts 0.039 at step 400, stage-vs-plain <=0.006)	VERDICT: stage in prod = YES for the A/B recipe (JEPA on + --no-engram; stage::check refuses the keyed engram arm and jepa_weight=0 loudly). One capture for the LIFE of the run (the whole-step seam re-captures per ungraphed step; this stage holds no gradients so nothing invalidates the graph - PersistentPool::cleanup frees free slices only). Follow-up: pin hashed_ids and lift the keyed-arm refusal; same seam for the eval forwards if they ever run per-step
