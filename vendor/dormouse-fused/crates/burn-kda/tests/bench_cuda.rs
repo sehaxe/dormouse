@@ -68,7 +68,7 @@ fn bench_cuda() {
             ba.clone(),
             wa.clone(),
             sa.clone(),
-            1.0,
+            burn_kda::fla_read_scale(hk),
             16,
         );
         for _ in 0..3 {
@@ -80,7 +80,7 @@ fn bench_cuda() {
                 ba.clone(),
                 wa.clone(),
                 sa.clone(),
-                1.0,
+                burn_kda::fla_read_scale(hk),
                 16,
             )
             .unwrap()
@@ -121,7 +121,7 @@ fn bench_cuda() {
                 ba.clone(),
                 wa.clone(),
                 sa.clone(),
-                1.0,
+                burn_kda::fla_read_scale(hk),
                 16,
             )
             .unwrap()

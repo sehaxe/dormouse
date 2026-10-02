@@ -106,7 +106,12 @@ fn main() {
     let mut s = Tensor::<4>::zeros([b, hv, hk, vd], &dev);
     let mut outs = Vec::with_capacity(t);
     for tt in 0..t {
-        let q_t = q.clone().slice_dim(2, tt..tt + 1);
+        // path R mirrors `forward_recurrent`'s token loop, which folds the
+        // read scale into `q` at its read (FLA's naive fold, naive.py:57).
+        let q_t = q
+            .clone()
+            .slice_dim(2, tt..tt + 1)
+            .mul_scalar(burn_kda::fla_read_scale(hk));
         let k_t = k.clone().slice_dim(2, tt..tt + 1);
         let v_t = v.clone().slice_dim(2, tt..tt + 1);
         let d_t = g.clone().slice_dim(2, tt..tt + 1).exp();

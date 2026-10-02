@@ -36,20 +36,17 @@
 //! | `kda_step_matches_fla_recurrent_at_unit_scale` | **green** | Eq 1 itself, term by term, against FLA's own scan |
 //! | `fla_read_scale_is_the_whole_difference` | **green** | upstream's two fixture rows differ by exactly `K**-0.5` and nothing else, which is what makes the red test below attributable |
 //! | `chunked_wy_matches_fla_chunk_at_unit_scale` | **green** | the chunked WY construction itself, on **both** of gdn2's chunk arms |
-//! | `kimi_linear_softplus_decay_matches_fla_reference` | **RED ON PURPOSE** | `lib.rs:268` computes `-softplus(exp(A)*z)`; FLA computes `-exp(A)*softplus(z)`, in both the naive and the triton twin |
-//! | `read_scale_matches_fla_reference` | **RED ON PURPOSE** | FLA's `chunk_kda` defaults `scale = K**-0.5` and `fla/layers/kda.py:262` passes no `scale`, so the official layer runs at `head_k_dim**-0.5`. We pass `1.0`, and `fused.rs:9` asserts the reason ("no softmax scale in KDA"), which is false against both upstreams. |
+//! | `kimi_linear_softplus_decay_matches_fla_reference` | **green (fixed 2026-10-02)** | the Softplus arm computes FLA's form, `g = -exp(A_h)·Softplus(z)` (`gate.py:50`, triton twin `gate.py:167`). Until 2026-10-02 it computed `-Softplus(exp(A_h)·z)`, a RED-ON-PURPOSE gate |
+//! | `read_scale_matches_fla_reference` | **green (fixed 2026-10-02)** | FLA's `chunk_kda` defaults `scale = K**-0.5` and `fla/layers/kda.py:262` passes no `scale`, so the official layer runs at `head_k_dim**-0.5`. Since the fix the layer passes exactly that (`fla_read_scale`), everywhere |
 //!
-//! A red test that a maintainer can read and act on is the deliverable; a
-//! numerical change to a shipped model is the owner's call, so the two
-//! divergences are **reported**, not fixed. See
-//! `docs/reviews/2026-09-30-kda-formula-audit.md` §3.1 and §3.2.
-//!
-//! **Baseline: 5 green, 2 red on purpose**, and the two reds are the only
-//! failures in the file. `tests/oracle/falsify.sh` demonstrates that each green
-//! arm can be broken on demand, in both directions: a mutant that breaks a
-//! green, and — the more valuable one — a mutant that "fixes" a red, which
-//! proves the red is pinned to the reference's rule and not merely to "not our
-//! formula".
+//! **CLOSED 2026-10-02:** both divergences are fixed (owner-approved class B;
+//! the two reds were the gate that made the fix reviewable) and the file is
+//! green end to end. The red-on-purpose mechanism remains the record of WHY
+//! each change is correct: each fixed test is pinned to FLA's executed file,
+//! and `tests/oracle/falsify.sh` still demonstrates each arm can fail — a
+//! mutant that breaks a green, and a mutant that re-inverts a fix (which is
+//! the old "turn the red green" demonstration, read the other way). The full
+//! history and smoke numbers: `docs/reviews/kdafix-2026-10-02.md`.
 //!
 //! ## What a red test here costs, and why it is worth it
 //!
@@ -399,27 +396,24 @@ fn k3_bounded_decay_matches_fla_reference() {
 
 #[test]
 fn kimi_linear_softplus_decay_matches_fla_reference() {
-    // RED ON PURPOSE. src/lib.rs:268 computes
-    //     DecayFn::Softplus => activation::softplus(scaled, 1.0).neg(),
-    // i.e. g = -softplus(exp(A) * z).
-    // FLA computes, in fla/ops/kda/gate.py:50 (`naive_kda_gate`, executed here)
+    // **GREEN since 2026-10-02** (owner-approved class B fix; was RED ON
+    // PURPOSE from b485ad9 until then, carrying the divergence as a reported
+    // gate). The fixed arm computes, as FLA does,
+    //     g = -exp(A_h) * Softplus(z),
+    // i.e. `exp(A)` is OUTSIDE, exactly as
+    //     fla/ops/kda/gate.py:50 (`naive_kda_gate`, executed here)
     // and again in the triton twin at gate.py:167,
     //     g = -exp(A_log) * F.softplus(g + dt_bias),
-    // i.e. g = -exp(A) * softplus(z).  `exp(A)` is OUTSIDE.
     //
     // These are different functions, not a reparameterisation. They agree at
     // A = 0 and separate monotonically in |A|; at the crate's own init
-    // (A = -3, z = +1) upstream gives alpha = 0.5743 and this gives 0.5120,
-    // and the ORDER of the two answers flips with the sign of A.
+    // (A = -3, z = +1) this form gives alpha = 0.937 (pre-fix: 0.512).
     //
-    // No test in the crate can see this: the chunk path and the per-token scan
-    // both read the same `KdaDecay::forward`, and `kda_decay_bounds` /
-    // `kda_decay_is_data_dependent` assert the range and the data-dependence,
-    // which both forms satisfy.
-    //
-    // The fix moves the numbers of a shipped (if non-default) branch, which is
-    // A/B queue arm 5. It is the owner's call, so this test names the cause and
-    // stays red.
+    // No other test in the crate can see this: the chunk path and the
+    // per-token scan both read the same `KdaDecay::forward`, and
+    // `kda_decay_bounds` / `kda_decay_is_data_dependent` assert the range and
+    // the data-dependence, which both forms satisfy. The history:
+    // `docs/reviews/kdafix-2026-10-02.md`.
     let fx = fixture();
     let mut report = String::new();
     for name in [
@@ -453,12 +447,9 @@ fn kimi_linear_softplus_decay_matches_fla_reference() {
         report.is_empty(),
         "DecayFn::Softplus disagrees with FLA's naive_kda_gate (exec'd) on {} case(s):\n\
          {report}\n\
-         CAUSE: src/lib.rs:268 puts exp(A) INSIDE the softplus; FLA puts it OUTSIDE, in\n\
-         both the naive reference (gate.py:50) and the triton kernel (gate.py:167).\n\
-         The module docs at src/lib.rs:17 and src/lib.rs:267 state the OUTSIDE form, so\n\
-         the comments are also wrong about the code. Class A to fix the comment;\n\
-         class B (a numerical change to the Kimi-Linear branch, = A/B arm 5) to fix the\n\
-         code. NOT fixed here: see docs/reviews/2026-09-30-kda-formula-audit.md S3.1",
+         CAUSE: the Softplus arm must compute g = -exp(A_h) * Softplus(z) -- exp(A) OUTSIDE,\n\
+         as in both the naive reference (gate.py:50) and the triton kernel (gate.py:167).\n\
+         History: docs/reviews/kdafix-2026-10-02.md.",
         report.lines().count()
     );
 }
@@ -607,7 +598,11 @@ fn fla_read_scale_is_the_whole_difference() {
 
 #[test]
 fn read_scale_matches_fla_reference() {
-    // RED ON PURPOSE. FLA applies a read scale and burn-kda does not.
+    // **GREEN since 2026-10-02** (owner-approved class B fix; was RED ON
+    // PURPOSE from b485ad9 until then). What it pins after the fix — and why
+    // it is not just the unit-scale test above run again: the read scale is
+    // FLA's DEFAULT, applied where FLA applies it, folded into `q` before the
+    // recurrence (`naive.py:57`) —
     //
     //   fla/ops/kda/chunk.py:474-475      if scale is None: scale = K ** -0.5
     //   fla/ops/kda/fused_recurrent.py:261-262   if scale is None:
@@ -615,58 +610,91 @@ fn read_scale_matches_fla_reference() {
     //   fla/layers/kda.py:262-278         chunk_kda(...)  -- NO scale= argument
     //   fla/ops/kda/naive.py:57            q = q.repeat_interleave(G, dim=2) * scale
     //
-    // So the official KDA layer runs at head_k_dim**-0.5. We pass 1.0 into
-    // `chunk_wy_forward` (src/lib.rs:646, :653), `kda_step` and
-    // `forward_recurrent` carry no scale at all, and `src/fused.rs:9` asserts
-    // the reason -- "scale = 1 (no softmax scale in KDA)" -- which is false
-    // against both upstreams. burn-gdn2 itself DOES use d_k**-0.5
-    // (gdn2/src/module.rs:299); burn-kda is the only place that overrides it.
+    // — and the constant comes from OUR published function
+    // (`burn_kda::fla_read_scale`), so a drift of either the function or the
+    // firewall it guards lands here. burn-gdn2 uses d_k**-0.5 the same way.
     //
-    // WHY THE MODEL HAS NOT NOTICED, which is the interesting half: the scale
+    // WHY THE MODEL NEVER NOTICED, which stays true after the fix: the scale
     // enters ONLY the read `o = q·S` and never the state update, so it is one
     // constant on the attention output. The next thing burn-kda does to that
-    // output is `output()` (src/lib.rs:554-568), an RMSNorm, and an RMS norm is
-    // invariant to a constant rescale:
+    // output is `output()`, an RMSNorm, and an RMS norm is invariant to a
+    // constant rescale:
     //     c·o / sqrt(mean((c·o)²) + eps)  =  o / sqrt(mean(o²) + eps/c²)
-    // so the factor is absorbed to O(eps / mean(o²)) ~ O(1e-5). That is exactly
-    // why no loss curve, no seed comparison and no test in the crate can see
-    // it -- and also why it is still a real divergence: anything reading the
-    // raw attention output is reading a tensor that is head_k_dim**0.5 too
-    // large (2.83x at K=8, 8x at K=64).
-    //
-    // The fix is one literal and it moves every number in the archive derived
-    // from this crate, so it is the owner's call, not this lane's.
+    // so the factor is absorbed to O(eps / mean(o²)) ~ O(1e-5) and no loss
+    // curve, seed comparison or in-model test can see it. The scale still
+    // matters to anything reading the raw attention output.
     let fx = fixture();
-    let mut report = String::new();
     for name in ["square_1head", "square_2head", "gva_1to2"] {
         let blk = get(&fx, "recur", name);
-        let k: f32 = blk.dims()[4] as f32;
-        // our answer is `scale1_o` (kda_step has no scale; the test above shows
-        // it reproduces that row), FLA's default-scale answer is `scaleK_o`.
-        let got = blk.nums("scale1_o");
-        let want = blk.nums("scaleK_o");
-        let (r, at) = num_diff(&got, &want, ATOL_CHAIN, TOL_RECUR);
-        if r > 1.0 {
-            report.push_str(&format!(
-                "  case {name}: worst rel {r:.3e} at {at}, ours {} vs FLA {} (ratio {:.4}, \
-                 K**-0.5 = {:.4})\n",
-                got[at],
-                want[at],
-                got[at] / want[at],
-                k.powf(-0.5)
-            ));
+        let d = blk.dims(); // B T H HV K V
+        let (b, t, h, hv, k, v) = (d[0], d[1], d[2], d[3], d[4], d[5]);
+        let scale = burn_kda::fla_read_scale(k);
+        let q = bthd_to_bhtd(t4(&blk.nums("q"), [b, t, h, k]), b, h, t, k);
+        let kk = bthd_to_bhtd(t4(&blk.nums("k"), [b, t, h, k]), b, h, t, k);
+        let vv = bthd_to_bhtd(t4(&blk.nums("v"), [b, t, hv, v]), b, hv, t, v);
+        let g = bthd_to_bhtd(t4(&blk.nums("g"), [b, t, hv, k]), b, hv, t, k);
+        let beta = t4(&blk.nums("beta"), [b, t, hv, 1]).permute([0, 2, 1, 3]);
+        // FLA's default-scale row (chunk_kda's `scale = K**-0.5` default,
+        // what the official layer runs). NOTE: only `scaleK_o` exists — the
+        // generator compares STATES across the two scale runs and found them
+        // identical (the scale is read-side only), so the state column is
+        // written once (`scale1_S`) and pinned by the unit-scale test above.
+        let want_o = blk.nums("scaleK_o");
+        let rep = hv / h;
+        let (q, kk) = if rep > 1 {
+            (
+                q.unsqueeze_dim::<5>(1)
+                    .repeat(&[1, rep, 1, 1, 1])
+                    .reshape([b, hv, t, k]),
+                kk.unsqueeze_dim::<5>(1)
+                    .repeat(&[1, rep, 1, 1, 1])
+                    .reshape([b, hv, t, k]),
+            )
+        } else {
+            (q, kk)
+        };
+        for bi in 0..b {
+            for h in 0..hv {
+                let mut state = Tensor::<4>::zeros([1, 1, k, v], &dev());
+                for ti in 0..t {
+                    let sl = [bi..bi + 1, h..h + 1, ti..ti + 1, 0..k];
+                    // The fold is FLA's own (`naive.py:57`): q * scale before
+                    // the step, the constant from OUR function.
+                    let q_t = q
+                        .clone()
+                        .slice(sl.clone())
+                        .mul_scalar(scale)
+                        .reshape([1, 1, k]);
+                    let k_t = kk.clone().slice(sl.clone()).reshape([1, 1, k]);
+                    let v_t = vv
+                        .clone()
+                        .slice([bi..bi + 1, h..h + 1, ti..ti + 1, 0..v])
+                        .reshape([1, 1, v]);
+                    let d_t = g.clone().slice(sl).exp().reshape([1, k]);
+                    let beta_t: f32 = beta
+                        .clone()
+                        .slice([bi..bi + 1, h..h + 1, ti..ti + 1, 0..1])
+                        .into_data()
+                        .to_vec::<f32>()
+                        .unwrap()[0];
+                    let (s, o) =
+                        burn_kda::kda_step::<NdArray>(state, d_t, q_t, k_t, v_t, beta_t as f64);
+                    state = s;
+                    let got: Vec<f32> = o.into_data().to_vec::<f32>().unwrap();
+                    let off = ((bi * t + ti) * hv + h) * v;
+                    let (r, at) = num_diff(&got, &want_o[off..off + v], ATOL_CHAIN, TOL_RECUR);
+                    assert!(
+                        r <= 1.0,
+                        "kda_step(q scaled by fla_read_scale) disagrees with FLA's default-\
+                         scale run naive_recurrent_kda\n  case {name} b{bi} h{h} t{ti}: worst \
+                         normalised {r:.3e} at chan {at} (got {} want {})",
+                        got[at],
+                        want_o[off + at]
+                    );
+                }
+            }
         }
     }
-    assert!(
-        report.is_empty(),
-        "burn-kda applies no read scale; FLA's KDA layer runs at scale = K**-0.5 on {} \
-         case(s):\n{report}\n\
-         CAUSE: src/lib.rs:646,653 pass 1.0 as `scale`; kda_step / forward_recurrent have no \
-         scale term; src/fused.rs:9 states the reason and the reason is wrong.\n\
-         Not fixed here: a numerical change to a shipped model. See \
-         docs/reviews/2026-09-30-kda-formula-audit.md S3.2.",
-        report.lines().count()
-    );
 }
 
 // ── 3. the chunked WY construction vs FLA's executed chunk reference ───────
@@ -761,13 +789,16 @@ fn chunked_wy_matches_fla_chunk_at_unit_scale() {
     burn_gdn2::set_chunk_path(ChunkPath::Batched);
 }
 
-/// The GREEN half of the read-scale pair, and the reason the red half below is
-/// worth reading: `chunk_wy_forward` **does** implement the read scale. Asked for
-/// `K**-0.5` it reproduces FLA's own `oK` row. So what burn-kda is missing is
-/// an ARGUMENT, not a mechanism — which is what makes the candidate fix one
-/// literal rather than a port.
+/// The chunked arm of the read-scale fix, GREEN since 2026-10-02 (was
+/// `chunked_wy_applies_no_read_scale`, RED ON PURPOSE until then): burn-kda
+/// passes FLA's own default — `head_k_dim**-0.5`, from the ONE published
+/// function `fla_read_scale` — and reproduces FLA's `oK` row on both chunk
+/// arms. (The former green twin, `chunked_wy_honours_the_read_scale_when_asked`,
+/// differed from this only in where the constant came from — a fixture literal
+/// instead of the module's own function — and was folded into this test rather
+/// than kept as a duplicate.)
 #[test]
-fn chunked_wy_honours_the_read_scale_when_asked() {
+fn chunked_wy_applies_the_fla_read_scale() {
     use burn_gdn2::ChunkPath;
     static ARM: Mutex<()> = Mutex::new(());
     let _guard = ARM.lock().unwrap_or_else(|e| e.into_inner());
@@ -776,12 +807,12 @@ fn chunked_wy_honours_the_read_scale_when_asked() {
         burn_gdn2::set_chunk_path(path);
         for name in ["chunk16_h1", "chunk16_h2", "chunk16_gva"] {
             let blk = get(&fx, "chunk", name);
-            let k: f64 = blk.dims()[4] as f64;
-            let (got, _) = run_chunk(&blk, k.powf(-0.5));
+            let k: usize = blk.dims()[4];
+            let (got, _) = run_chunk(&blk, burn_kda::fla_read_scale(k));
             let (r, at) = num_diff(&got, &blk.nums("oK"), ATOL_CHUNK, TOL_CHUNK);
             assert!(
                 r <= 1.0,
-                "chunk_wy_forward(scale=K**-0.5) does not reproduce FLA's own default-scale \
+                "burn-kda's own read-scale constant does not reproduce FLA's default-scale \
                  row\n  arm {path:?} case {name}: worst normalised {r:.3e} at {at} \
                  (got {} want {})",
                 got[at],
@@ -790,53 +821,6 @@ fn chunked_wy_honours_the_read_scale_when_asked() {
         }
     }
     burn_gdn2::set_chunk_path(ChunkPath::Batched);
-}
-
-/// The RED half, on the CHUNKED arm: what burn-kda actually passes is `1.0`
-/// (`src/lib.rs:646`, `:653`), so it does not produce the row the official KDA
-/// layer produces. `read_scale_matches_fla_reference` is the same divergence on
-/// the recurrent arm; this one is the one a candidate fix turns green, and
-/// `falsify.sh`'s A6 is that demonstration.
-#[test]
-fn chunked_wy_applies_no_read_scale() {
-    use burn_gdn2::ChunkPath;
-    static ARM: Mutex<()> = Mutex::new(());
-    let _guard = ARM.lock().unwrap_or_else(|e| e.into_inner());
-    let fx = fixture();
-    let mut report = String::new();
-    for path in [ChunkPath::Batched, ChunkPath::Loop] {
-        burn_gdn2::set_chunk_path(path);
-        for name in ["chunk16_h1", "chunk16_h2", "chunk16_gva"] {
-            let blk = get(&fx, "chunk", name);
-            let k: f32 = blk.dims()[4] as f32;
-            let (got, _) = run_chunk(&blk, 1.0);
-            let want = blk.nums("oK");
-            let (r, at) = num_diff(&got, &want, ATOL_CHUNK, TOL_CHUNK);
-            if r > 1.0 {
-                report.push_str(&format!(
-                    "  arm {path:?} case {name}: worst normalised {r:.3e} at {at}, ours {} vs \
-                     FLA {} (ratio {:.4}, K**-0.5 = {:.4})\n",
-                    got[at],
-                    want[at],
-                    got[at] / want[at],
-                    k.powf(-0.5)
-                ));
-            }
-        }
-    }
-    burn_gdn2::set_chunk_path(ChunkPath::Batched);
-    assert!(
-        report.is_empty(),
-        "burn-kda passes scale=1.0; FLA's KDA layer runs at K**-0.5 on {} chunk arm/case(s):\n\
-         {report}\n\
-         CAUSE: src/lib.rs:646,653 pass 1.0; src/fused.rs:9 states the reason and the reason \
-         is false against both upstreams.\n\
-         The MECHANISM EXISTS -- chunked_wy_honours_the_read_scale_when_asked is green -- so \
-         this is a missing argument, not a missing implementation.\n\
-         Not fixed here: a numerical change to a shipped model. See \
-         docs/reviews/2026-09-30-kda-formula-audit.md S3.2.",
-        report.lines().count()
-    );
 }
 
 // ── 4. a tier (d) shape gate, for a class-A fix in the reference scan ──────
