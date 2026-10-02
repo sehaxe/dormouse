@@ -77,11 +77,136 @@ fn finalize_kernel<F: Float>(
     }
 }
 
+/// `dst = src`, an element-for-element device-to-device copy into an
+/// EXISTING buffer — one launch, zero allocations.
+///
+/// It exists for the trainer's CUDA-graph pin (`dormouse-train/src/graph.rs`),
+/// which has to move a fresh parameter into a master buffer whose address a
+/// captured graph has already baked. burn has no copy into existing storage
+/// that can be relied on to stay in place: `slice_assign` goes through the
+/// autodiff node and returns whatever the backend allocated, so the "master"
+/// would quietly change address and the pin would be a fiction.
+///
+/// Lives here, next to the other elementwise CUDA primitives, because this is
+/// where the `cube_of` downcast already is; it is not a Muon update and does
+/// not claim to be one.
+#[cube(launch_unchecked)]
+fn copy_into_kernel<F: Float>(src: &[F], dst: &mut [F]) {
+    if ABSOLUTE_POS < dst.len() {
+        dst[ABSOLUTE_POS] = src[ABSOLUTE_POS];
+    }
+}
+
+/// `dst = src` for the Int tensors a graph is fed: the input ids, the shifted
+/// targets, and the hashed n-gram keys. Same primitive, same reason as
+/// `copy_into_kernel` — see [`copy_into_cuda`].
+#[cube(launch_unchecked)]
+fn copy_into_i32_kernel(src: &[i32], dst: &mut [i32]) {
+    if ABSOLUTE_POS < dst.len() {
+        dst[ABSOLUTE_POS] = src[ABSOLUTE_POS];
+    }
+}
+
+/// The bare cubecl tensor behind a burn FLOAT tensor.
+///
+/// Separate from [`cube_of_int`] because `try_into_primitive` is bounded on
+/// `K: BackendPrimitive<B>`, so one generic over the kind cannot call it for
+/// both: the four lines are duplicated rather than fought.
 fn cube_of<const D: usize>(t: &Tensor<D>) -> Option<CubeTensor> {
     type B = burn_cubecl::CubeBackend;
     let prim = t.clone().try_into_primitive::<B>().ok()?;
     let c = (&prim as &dyn Any).downcast_ref::<CubeTensor>()?;
     Some(c.clone())
+}
+
+/// [`cube_of`] that says WHY it failed. The copy paths use this one: a pin
+/// that cannot be built has to name its cause (ADR-0011), and "not a bare
+/// cubecl tensor" is not an actionable message when the real answer is a dtype
+/// mismatch four frames down in burn's `BackendPrimitive`.
+fn cube_of_why<const D: usize>(t: &Tensor<D>) -> Result<CubeTensor, String> {
+    type B = burn_cubecl::CubeBackend;
+    let prim = t
+        .clone()
+        .try_into_primitive::<B>()
+        .map_err(|e| format!("float tensor is not a bare cubecl tensor: {e:?}"))?;
+    let c = (&prim as &dyn Any).downcast_ref::<CubeTensor>().ok_or_else(|| {
+        format!("float primitive is a {}, not a CubeTensor", std::any::type_name_of_val(&prim))
+    })?;
+    Ok(c.clone())
+}
+
+/// The same downcast for an Int tensor. A graph is fed `x`, the shifted `y` and
+/// the hashed n-gram keys every replay, and those are Int.
+fn cube_of_int<const D: usize>(
+    t: &Tensor<D, burn::tensor::Int>,
+) -> Result<CubeTensor, String> {
+    type B = burn_cubecl::CubeBackend;
+    let prim = t
+        .clone()
+        .try_into_primitive::<B>()
+        .map_err(|e| format!("Int tensor is not a bare cubecl tensor: {e:?}"))?;
+    let c = (&prim as &dyn Any)
+        .downcast_ref::<CubeTensor>()
+        .ok_or_else(|| format!("Int primitive is a {}, not a CubeTensor", std::any::type_name_of_val(&prim)))?
+        .clone();
+    Ok(c)
+}
+
+/// Copy `src` into `dst` in place, where both are Int tensors.
+///
+/// Int is a separate kernel from the float one because the CUDA `Int` dtype is
+/// i32 and a `Float` kernel cannot be handed its buffer — the same reason
+/// `#[cube]` needs the concrete type.
+pub fn copy_into_i32_cuda<const D: usize>(
+    src: &Tensor<D, burn::tensor::Int>,
+    dst: &Tensor<D, burn::tensor::Int>,
+) -> Result<(), String> {
+    let n: usize = src.dims().iter().product();
+    if n == 0 {
+        return Err("empty tensor".into());
+    }
+    if src.dims() != dst.dims() {
+        return Err(format!("shape mismatch {:?} vs {:?}", src.dims(), dst.dims()));
+    }
+    let (sc, dc) = (cube_of_int(src)?, cube_of_int(dst)?);
+    let client = sc.client.clone();
+    let threads = 256u32;
+    unsafe {
+        copy_into_i32_kernel::launch_unchecked(
+            &client,
+            CubeCount::Static((n as u32).div_ceil(threads), 1, 1),
+            CubeDim::new_3d(threads, 1, 1),
+            BufferArg::from_raw_parts(sc.handle, n),
+            BufferArg::from_raw_parts(dc.handle, n),
+        );
+    }
+    Ok(())
+}
+
+/// Copy `src` into `dst` in place. `false` when either tensor is not a bare
+/// cubecl f32 tensor on this backend — the caller must then refuse the
+/// graph rather than pretend the pin exists (ADR-0011).
+pub fn copy_into_cuda<const D: usize>(src: &Tensor<D>, dst: &Tensor<D>) -> Result<(), String> {
+    let n: usize = src.dims().iter().product();
+    if n == 0 {
+        return Err("empty tensor".into());
+    }
+    if src.dims() != dst.dims() {
+        return Err(format!("shape mismatch {:?} vs {:?}", src.dims(), dst.dims()));
+    }
+    let (sc, dc) = (cube_of_why(src)?, cube_of_why(dst)?);
+    let client = sc.client.clone();
+    let threads = 256u32;
+    unsafe {
+        copy_into_kernel::launch_unchecked::<f32>(
+            &client,
+            CubeCount::Static((n as u32).div_ceil(threads), 1, 1),
+            CubeDim::new_3d(threads, 1, 1),
+            BufferArg::from_raw_parts(sc.handle, n),
+            BufferArg::from_raw_parts(dc.handle, n),
+        );
+    }
+    Ok(())
 }
 
 /// Fused NS polynomial combine: `x ← a·x + b·t1 + c·t2`. Returns false when
@@ -228,6 +353,52 @@ mod tests {
             let diff: f32 = (x - x_ref).abs().max().into_scalar::<f32>();
             assert!(diff < 1e-4, "norm_colrow diff {diff} [{r}x{c}]");
         }
+    }
+
+    /// The pin's primitive, on the path it is actually built for: **bare**
+    /// cubecl tensors, which is what `graph::as_constant_float` /
+    /// `as_constant_int` hand to it after unwrapping the two autodiff enums.
+    ///
+    /// This test had never run. It was written as
+    /// `assert!(copy_into_cuda(..))` while `copy_into_cuda` returns
+    /// `Result<(), String>`, so it did not COMPILE — the one test that could
+    /// have caught a copy kernel that launches and writes nothing was a
+    /// compile error inside a `#[cfg(feature = "cuda")]` test module, which
+    /// nothing builds on the CPU default. A gate that cannot compile is not a
+    /// gate.
+    #[test]
+    fn copy_into_writes_the_existing_buffer_and_leaves_the_source_alone() {
+        let dev = cuda_dev();
+        let src: Tensor<2> = Tensor::random([37, 11], Distribution::Normal(0.0, 1.0), &dev);
+        let dst: Tensor<2> = Tensor::zeros([37, 11], &dev);
+        let before = src.clone().into_data().try_to_vec::<f32>().expect("src readback");
+        copy_into_cuda(&src, &dst).expect("the copy kernel must run on a bare cubecl tensor");
+        // Bit-exact, not close: a copy is a copy. A kernel that launched and
+        // wrote nothing fails here, which is the whole reason the test exists.
+        assert_eq!(dst.clone().into_data().try_to_vec::<f32>().expect("dst readback"), before);
+        assert_eq!(
+            src.clone().into_data().try_to_vec::<f32>().expect("src readback 2"),
+            before,
+            "the source must be left alone"
+        );
+    }
+
+    /// The same primitive for Int, which is what `x`, `y` and the hashed keys
+    /// are pinned with. Separate because the CUDA `Int` dtype is i32 and a
+    /// `Float` kernel cannot be handed its buffer.
+    #[test]
+    fn copy_into_i32_writes_the_existing_buffer() {
+        let dev = cuda_dev();
+        let src: Tensor<2, burn::tensor::Int> = Tensor::from_data(
+            burn::tensor::TensorData::new((0..(7 * 5)).collect::<Vec<i32>>(), [7, 5]),
+            &dev,
+        );
+        let dst: Tensor<2, burn::tensor::Int> = Tensor::zeros([7, 5], &dev);
+        copy_into_i32_cuda(&src, &dst).expect("the Int copy kernel must run");
+        assert_eq!(
+            dst.into_data().try_to_vec::<i32>().expect("dst readback"),
+            (0..(7 * 5)).collect::<Vec<i32>>()
+        );
     }
 
     #[test]

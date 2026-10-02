@@ -96,11 +96,11 @@ pub fn resolve(preset: &str, set: &[String], mut train: TrainCfg) -> Result<RunC
     }
     // 4. Validate the merged config (the train path previously never did).
     dormouse_core::config::validate(&model)?;
-    Ok(RunCfg {
-        source: preset.to_string(),
-        model,
-        train,
-    })
+    // 4b. `--graph-capture` against the arms that would make the captured
+    // window a different computation than the run claims to be doing: one named
+    // error each, before any GPU work (`graph::check`).
+    crate::graph::check(&RunCfg { source: preset.to_string(), model: model.clone(), train: train.clone() })?;
+    Ok(RunCfg { source: preset.to_string(), model, train })
 }
 
 impl RunCfg {
@@ -272,53 +272,64 @@ mod tests {
     /// every field the struct has. A skipped field shows up as a deficit
     /// here, whatever its name and whatever it does; adding a field without
     /// adding it to the snapshot (or vice versa) fails the count.
+    /// `--graph-capture` is a LOUD refusal beside every arm that would make the
+    /// captured window a different computation than the run claims to be
+    /// doing. Three gates, one per arm, each naming the arm (ADR-0011: a
+    /// fallback is excused by the caller being able to say which arm ran).
+    #[test]
+    fn graph_capture_refuses_the_arms_it_cannot_capture() {
+        let named = |t: TrainCfg| {
+            resolve("small", &[], t).expect_err("--graph-capture must refuse this arm")
+        };
+        let e = named(TrainCfg { graph_capture: true, rand_depth: true, ..Default::default() });
+        assert!(e.contains("rand-depth"), "{e}");
+        let e = named(TrainCfg { graph_capture: true, engram_ram: true, ..Default::default() });
+        assert!(e.contains("engram-ram"), "{e}");
+        // Offline JEPA targets are a per-chunk upload v1 does not pin.
+        let e = named(TrainCfg {
+            graph_capture: true,
+            jepa_targets: Some(std::path::PathBuf::from("t.bin")),
+            ..Default::default()
+        });
+        assert!(e.contains("jepa-targets"), "{e}");
+    }
+
+    /// The flag alone resolves ON CUDA: the refusals above are about the other
+    /// arm, not about the flag. Off CUDA the flag alone is the refusal the
+    /// other test owns.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn graph_capture_alone_resolves_on_cuda() {
+        resolve("small", &[], TrainCfg { graph_capture: true, ..Default::default() })
+            .expect("--graph-capture on its own is legal on CUDA");
+    }
+
+    /// Off CUDA there is no graph, and a flag that cannot do what it says is
+    /// not a flag. On a CUDA build this cell is compiled away (the refusal is
+    /// then unreachable, which is the point).
+    #[cfg(not(feature = "cuda"))]
+    #[test]
+    fn graph_capture_is_refused_off_cuda() {
+        let e = resolve("small", &[], TrainCfg { graph_capture: true, ..Default::default() })
+            .expect_err("there is no graph off CUDA");
+        assert!(e.contains("cuda"), "{e}");
+    }
+
     #[test]
     fn snapshot_carries_every_train_field() {
         // The field list, written out. This is the price of the guarantee and
         // it is paid ONCE: a new TrainCfg field must be added here, which is
         // exactly the moment the author has to ask "does this belong in the
         // snapshot?" - the question the skip hid.
-        const FIELDS: [&str; 40] = [
-            "steps",
-            "ckpt_every",
-            "log_every",
-            "seq_len",
-            "batch",
-            "lr",
-            "wd",
-            "grad_clip",
-            "ckpt_name",
-            "eval_every",
-            "opt",
-            "quant",
-            "factors_fallback",
-            "rand_depth",
-            "eval_batches",
-            "eval_depths",
-            "retract_every",
-            "retract_iters",
-            "retract_batched",
-            "stress",
-            "stress_lr",
-            "stress_every",
-            "engram_ram",
-            "engram_slots",
-            "host_adam_every",
-            "warmup",
-            "quant_check",
-            "timers",
-            "memlog",
-            "bf16",
-            "act_quant",
-            "act_group",
-            "max_iter",
-            "no_kda",
-            "no_engram",
-            "jepa_weight",
-            "dspark_weight",
-            "dspark_k",
-            "jepa_targets",
-            "seed",
+        const FIELDS: [&str; 41] = [
+            "steps", "ckpt_every", "log_every", "seq_len", "batch", "lr", "wd",
+            "grad_clip", "ckpt_name", "eval_every", "opt", "quant",
+            "factors_fallback", "rand_depth", "eval_batches", "eval_depths",
+            "retract_every", "retract_iters", "retract_batched", "stress", "stress_lr",
+            "stress_every", "engram_ram", "engram_slots", "host_adam_every",
+            "warmup", "quant_check", "timers", "memlog", "bf16", "act_quant",
+            "act_group", "max_iter", "no_kda", "no_engram", "jepa_weight",
+            "dspark_weight", "dspark_k", "jepa_targets", "seed", "graph_capture",
         ];
         // An Option field that is None is omitted by the TOML serializer, so
         // a skipped Option is invisible to the round trip too. Set them.
