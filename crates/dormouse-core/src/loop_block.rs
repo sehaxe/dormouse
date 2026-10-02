@@ -715,11 +715,23 @@ impl LoopBlock {
             // This slot's pseudo-query `w_l` (§5: one per layer). Read once
             // per iteration, before the block body, so the query is a
             // function of the slot and not of anything computed this step.
+            // FIDELITY F-F7 (2026-10-02): the fold adds ref [66]'s RMSNorm
+            // gain, `q_eff = γ ⊙ w_l`, so the score is `γ ⊙ w_l · RMSNorm(k)`
+            // - the paper's affine norm. Init ones × query zero = the old
+            // exact function at step 0 (the uniform-average gate below stays
+            // the truth about init). AttnRes::forward does the SAME fold; this
+            // call site reads the raw params directly, so it must fold too.
             let slot_query = match use_attnres {
-                true => self.attnres.as_ref().expect("use_attnres => attnres")[row]
-                    .query
-                    .val()
-                    .clone(),
+                true => {
+                    let ar = self.attnres.as_ref().expect("use_attnres => attnres")[row]
+                        .query
+                        .val()
+                        .clone();
+                    self.attnres.as_ref().expect("use_attnres => attnres")[row]
+                        .gain
+                        .val()
+                        .mul(ar)
+                }
                 false => Tensor::<1>::zeros([d], &h.device()),
             };
             let iter_ctx = self

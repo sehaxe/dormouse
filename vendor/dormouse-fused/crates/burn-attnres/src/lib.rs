@@ -88,6 +88,24 @@ impl ScoreForm {
 #[derive(Module, Debug)]
 pub struct AttnRes {
     pub query: Param<Tensor<1>>,
+    /// The RMSNorm's LEARNED GAIN under ref [66] (Zhang & Sennrich - the
+    /// paper's citation for `RMSNorm(k)`, whose affine γ is part of the module
+    /// the score calls). Init ONES, so the arm's first forward is unchanged
+    /// (query = 0 -> uniform average at init; the existing init gates hold).
+    ///
+    /// # The honesty note the fold needs on its shirt
+    ///
+    /// The score is bilinear: `q·(γ ⊙ norm(k)) = (q ⊙ γ)·norm(k)`, and `q` is
+    /// trainable, so as a FUNCTION FAMILY this gain is redundant with the
+    /// free query - for any trained `(q, γ)` there is a `q'` computing the
+    /// same scores. It is NOT redundant as a PARAMETRIZATION: ref [66]'s
+    /// RMSNorm is the module the paper cites and its 1.743 "w/o RMSNorm"
+    /// ablation row (Tab. 4) prices the norm's work against an affine norm,
+    /// which is what this param seeks. It also starts DEAD (γ's gradient is
+    /// `q ⊙ ds`, and q starts at 0), so it can read like frozen dead weight at
+    /// zero steps - that is init geometry, not a defect.
+    /// Fidelity F-F7, 2026-10-02.
+    pub gain: Param<Tensor<1>>,
     /// Which score convention this instance computes (see [`ScoreForm`]).
     /// Not a parameter: it is a property of the build, and a checkpoint must
     /// not be able to change it.
@@ -105,13 +123,21 @@ impl AttnRes {
             // Paper §5: pseudo-queries MUST be initialized to zero (gives
             // exactly uniform alpha at init; prevents training volatility).
             query: Initializer::Zeros.init([d_model], device),
+            // Ref [66]'s affine: init 1 - the norm drives here, and the fold
+            // `q ⊙ γ` below is the ONLY place it enters (bilinearly with the
+            // query; see the honesty note above).
+            gain: Initializer::Ones.init([d_model], device),
             form,
         }
     }
 
     /// Full AttnRes: attend over all previous hidden states.
     pub fn forward(&self, history: &[Tensor<3>]) -> Tensor<3> {
-        depth_attend_form(history, self.query.val(), self.form)
+        // The gain fold: one elementwise `mul`, before any kernel sees the
+        // query, so the tensor path and BOTH CUDA kernels (fixed to this
+        // query shape) compute the same function.
+        let q = self.gain.val().mul(self.query.val());
+        depth_attend_form(history, q, self.form)
     }
 }
 
@@ -407,7 +433,7 @@ impl BlockAttnRes {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn::tensor::Distribution;
+    use burn::tensor::{Distribution, TensorData};
     fn dev() -> Device {
         // hermetic tests: ambient default may try to init a busy CUDA ctx
         Device::ndarray()
@@ -415,6 +441,60 @@ mod tests {
 
     fn random_h(b: usize, t: usize, d: usize) -> Tensor<3> {
         Tensor::<3>::random([b, t, d], Distribution::Default, &dev())
+    }
+
+    /// FIDELITY F-F7 (2026-10-02), three pins in one fixture:
+    ///
+    /// 1. **gain = ONES reproduces the bare query EXACTLY** - the fold is the
+    ///    paper's affine at its neutral setting, the display every codebase
+    ///    calls "no gain"; a `x·1` that rounded to something else would be a
+    ///    silent change of the arm's function.
+    /// 2. **a PERTURBED gain moves the scores the bilinear math says**: with
+    ///    `γ = 2·e_0`, the first source's score doubles relative to the
+    ///    `_no_gain` run, in `q ⊙ γ`. Literals, not tolerances-on-tolerances.
+    /// 3. **the gain param is REAL and routable**: `Param` in the module, so
+    ///    `AttnRes::map` / optimizer walks see it; a `#[module(skip)]` field
+    ///    here would silently train nothing.
+    #[test]
+    fn rmsnorm_gain_is_ones_at_init_and_moves_the_scores_when_perturbed() {
+        let d = 4usize;
+        let h0 = Tensor::<3>::from_floats([[[1.0, 0.0, 0.0, 0.0]]], &dev());
+        let h1 = Tensor::<3>::from_floats([[[0.0, 1.0, 0.0, 0.0]]], &dev());
+        let history = [h0, h1];
+        let mut ar = AttnRes::new(d, &dev());
+        ar.query = Param::from_tensor(Tensor::<1>::from_floats([2.0, 0.0, 0.0, 0.0], &dev()));
+        // (1) gain ones == the bare query. Compare against depth_attend_form
+        // on the SAME query - the crate to itself is fine HERE, because the
+        // claim is "the fold is an exact no-op at ones", which only that
+        // identity can carry.
+        let bare = depth_attend_form(&history, Tensor::<1>::from_floats([2.0, 0.0, 0.0, 0.0], &dev()), ar.form);
+        let with_gain = ar.forward(&history);
+        let diff: f32 = (bare.clone() - with_gain.clone()).abs().max().into_scalar();
+        assert!(diff == 0.0f32, "gain==ones is not a no-op: {diff}");
+
+        // (2) THE BILINEARITY MEASURED: q = (1,1,0,0), gamma = (2,1,1,1) ->
+        // q_eff = (2,1,0,0); the paper's norm is the MEAN-form RMSNorm
+        // (`norm(e_i)[i] = i/√(mean(k²)) = 2·e_i` at d=4), so the scores are
+        // s0 = q_eff·2e_0 = 4, s1 = q_eff·2e_1 = 2, and the paper's alpha is
+        // softmax over scores: the literal is e⁴/(e⁴+e²) = σ(2) =
+        // 0.8807971... A GLOBAL rescale of q (gamma = 1, q = c·(1,1,0,0)) gives
+        // s0 = s1 = 2c and alpha_0 = 0.5 for EVERY c - the move NEEDS the
+        // asymmetry the gain provides, so the 0.5 reading is the discriminator
+        // this holds against.
+        ar.query = Param::from_tensor(Tensor::<1>::from_floats([1.0, 1.0, 0.0, 0.0], &dev()));
+        ar.gain = Param::from_tensor(Tensor::<1>::from_floats([2.0, 1.0, 1.0, 1.0], &dev()));
+        let perturbed = ar.forward(&history);
+        let v: Vec<f32> = perturbed.into_data().to_vec().unwrap();
+        let want = 0.8807970779778823f64; // sigma(2), s0 - s1 = 2·(q_eff[0]-q_eff[1])
+        assert!(
+            ((v[0] as f64) - want).abs() < 1e-5,
+            "gamma perturbation did not move alpha_0 as the bilinear score says: {} vs {want}",
+            v[0]
+        );
+
+        // (3) the param is in the module (map-compatible compile is the check;
+        // counted via shapes so the pin has teeth).
+        assert_eq!(ar.gain.val().dims(), [d], "gamma must be per-[d], one slot");
     }
 
     /// THE `1/sqrt(d)` DECISION, AS A NUMBER.
