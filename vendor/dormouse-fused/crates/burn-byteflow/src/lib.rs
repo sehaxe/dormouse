@@ -24,6 +24,7 @@
 
 pub mod chunk;
 pub mod net;
+pub mod stream;
 
 pub use chunk::{
     coding_rate_exact, marginal_gains_exact, marginal_gains_l2, select_positions, RateMode,
@@ -31,3 +32,4 @@ pub use chunk::{
 pub use net::{
     ByteFlowConfig, ByteFlowNet, CanonLayer, FlowAttention, FlowBlock, RopeTable, VOCAB,
 };
+pub use stream::RatePatcher;
