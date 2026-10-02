@@ -133,3 +133,26 @@ edit changes only attributes and comments. `cargo fmt`/`cargo test` could not ru
 locally — the box's rustc is broken for fresh compiles (see separate finding), so
 compilation and the green job are verified by the fused-library workflow on the pushed
 branch. Gate: the ndarray job green, `kda_oracle` reporting `7 passed; 3 ignored`.
+
+## Second cause found on the verification run (36979996862)
+
+With kda_oracle's reds ignored, the ndarray job failed on a **different** test —
+`burn-gdn2/tests/ops_batched_autodiff.rs::the_custom_node_backward_reads_a_padded_scratch`
+(analytic adjoint vs central differences, rel 6.15e-2 over the 5e-2 bar) — which had
+**passed** on run 36945094092 six hours earlier with no code change in between. Since
+cargo stops at the first failing test binary and burn-gdn2 sorts before burn-kda, this
+flake would have hidden every kda_oracle result on any run where it fired.
+
+The axis: `burn-ndarray` builds here with `blas-openblas`, and multi-threaded OpenBLAS
+reorders f32 reductions call to call. The margin arithmetic puts the gate right in
+that noise: loss ≈ 77, FD amplification 1/2h = 50 (h = 1e-2), so ~2 ulp of f32
+reduction noise lands the relative error at ~6e-2 against a 5e-2 bar. The workflow
+already recorded this exact axis for the f64 fixture generator ("Single-threaded
+BLAS: the other half of the same axis") but the ndarray test job never got the cap.
+
+Fix: `OMP_NUM_THREADS=1` + `OPENBLAS_NUM_THREADS=1` on the ndarray job. Not a
+weakened gate — the same formula, measured without the scheduler in the loop. If the
+test still fails deterministically with one thread, that is a real cross-host kernel
+selection drift (OpenBLAS DYNAMIC_ARCH) and belongs to the burn-gdn2 owner, not this
+lane; it would show as the same assert with a stable number rather than a coin flip.
+

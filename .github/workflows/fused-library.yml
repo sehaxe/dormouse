@@ -60,6 +60,16 @@ jobs:
     defaults:
       run:
         working-directory: vendor/dormouse-fused
+    env:
+      # burn-ndarray here builds with blas-openblas, and a multi-threaded
+      # OpenBLAS reorders f32 reductions from call to call. The fd-vs-analytic
+      # margin in ops_batched_autodiff (bar 5e-2, amplification 1/2h = 50) sits
+      # close enough to that noise that it passed on one runner (36945094092,
+      # 00:35) and failed on another (36979996862, 08:02) with no code change.
+      # One thread: the reduction order stops being the scheduler's choice.
+      # Same axis, same fix, as the ref-data job records below.
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
