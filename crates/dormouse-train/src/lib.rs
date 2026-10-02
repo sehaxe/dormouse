@@ -2730,6 +2730,9 @@ mod tests {
             d_ffn: 256,
             max_iter: 4,
             rank: 16,
+            // The schema default is the byteflow net as of 2026-10-02; these
+            // fixtures test the DORMOUSE loop, so it is pinned off.
+            use_byteflow: false,
             // Aux ON for this fixture, explicitly. Every shipped preset has
             // dspark_weight = 0.0 as of 2026-09-29 - DeepSeek's own MTP
             // ablation reports the head bits-per-byte neutral, and our

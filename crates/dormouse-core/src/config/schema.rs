@@ -103,6 +103,14 @@ impl<'de> Deserialize<'de> for ActQuant {
 fn d_bf16() -> bool {
     false
 }
+/// The ONE field where the schema default is not the `small` value: the
+/// byteflow arm won its 2026-10-02 A/B (two seeds, equal bytes, one window),
+/// so a flat config that does not name a net gets the winner (survivor of
+/// §1.2, "A/B or death"). Every dormouse preset lists `use_byteflow = false`
+/// explicitly to keep its meaning.
+fn d_use_byteflow() -> bool {
+    true
+}
 fn d_act_group() -> usize {
     0
 }
@@ -592,18 +600,22 @@ pub struct DormouseConfig {
     /// five-stage hierarchy (local SWA+Canon encoder → coding-rate Top-K
     /// chunker → global transformer → multi-linear upsampling with large
     /// residual → symmetric decoder), trained for byte-level CE and scored in
-    /// BPB. OFF by default: this is not an arm of the loop but a different
-    /// model, so the trainer dispatches to `dormouse_train::byteflow::train_loop`
-    /// and every dormouse-only knob (KDA, Engram, JEPA, aux heads, TSCT
-    /// retraction, the mix optimizer routing) is refused loudly rather than
-    /// silently ignored.
+    /// BPB. ON by default as of 2026-10-02 (byteflow A/B, 2 seeds: 4.488/4.539
+    /// vs the byte control's 6.714/6.595 held-out BPB over the same 81920 B
+    /// window at equal bytes, `docs/reviews/byteflow-ab-2026-10-02.md`): this is
+    /// not an arm of the loop but a different model, so the trainer dispatches
+    /// to `dormouse_train::byteflow::train_loop` and every dormouse-only knob
+    /// (KDA, Engram, JEPA, aux heads, TSCT retraction, the mix optimizer
+    /// routing) is refused loudly rather than silently ignored. The dormouse
+    /// presets carry `use_byteflow = false` explicitly — a flat preset missing
+    /// the field gets the winning net, not the silent predecessor.
     ///
     /// The patcher is the paper's own (§3.2): marginal coding rate
     /// `ΔR_t = R(h_1:t) − R(h_1:t−1)` over the LOCAL ENCODER's hidden states,
     /// Top-K borders with BOS forced, chronological — not a fixed stride and
     /// not entropy (that comparison is the paper's Table 3). The streaming
     /// form lives in `burn_byteflow::RatePatcher`.
-    #[serde(default)]
+    #[serde(default = "d_use_byteflow")]
     pub use_byteflow: bool,
     /// Local width `d_local` — the chunker scores ΔR over hidden states of
     /// this width, and the decoder's head reads it.
@@ -732,7 +744,18 @@ mod tests {
         let s: DormouseConfig =
             toml::from_str(&std::fs::read_to_string(&manifest).expect("configs/small.toml exists"))
                 .expect("configs/small.toml parses");
-        assert_eq!(d, s);
+        // The one field where the schema default is NOT the small value: the
+        // 2026-10-02 byteflow A/B flipped the default net (winner takes the
+        // default; `small` carries `use_byteflow = false` to keep its meaning).
+        assert_eq!(
+            d.use_byteflow, true,
+            "the schema default must be the winning byteflow net"
+        );
+        let mut s = s;
+        let mut d = d;
+        s.use_byteflow = false;
+        d.use_byteflow = false;
+        assert_eq!(d, s, "default must equal small on every other field");
     }
 
     /// Missing fields in a flat TOML fall back to the schema defaults.
