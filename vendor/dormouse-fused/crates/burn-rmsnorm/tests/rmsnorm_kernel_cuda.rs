@@ -25,14 +25,14 @@
 //! | shape | asked | ran |
 //! |---|---|---|
 //! | bare `Device::cuda(0)` | +1 | **+1** — the kernel's own output |
-//! | `Device::cuda(0).autodiff()` | +1 | **+0** — the tensor path |
+//! | `Device::cuda(0).autodiff()` | +1 | **+1** — the autodiff node arm, since 2026-10-02 |
 //!
-//! The second row is the trainer. It is the `norm=0/N` field on the eval line:
-//! `~/logs/train_nokda.log:13` reads `norm=0/1569` at step 500, and
-//! `norm=0/3129` at step 1000 (`~/logs/train_nokda.log:19`) — 1560 asks per 500
-//! steps, **zero** of them run, on the real binary on a real GPU. That is a
-//! reproduction of the claim, not a re-derivation of it. `the_fused_kernel_declines_on_an_autodiff_tensor`
-//! keeps it true, so the claim is a gate and not a doc string.
+//! The second row WAS the trainer reading `norm=0/N` (`~/logs/train_nokda.log:13`,
+//! `norm=0/1569` at step 500, `norm=0/3129` at step 1000 — 1560 asks per 500
+//! steps, zero runs, on the real binary on a real GPU). The autodiff node
+//! (`src/ops.rs`) ended that: the same ask now runs the kernel with a graph
+//! attached. `the_fused_kernel_runs_on_an_autodiff_tensor` keeps it that way,
+//! so the claim is a gate and not a doc string.
 //!
 //! ## The numbers
 //!
@@ -364,7 +364,7 @@ fn eps_reaches_the_fused_kernel() {
 /// with the two upstreams is the sibling's claim, restated on the arm that
 /// would be taken if this kernel ever engaged.
 #[test]
-fn the_fused_kernel_declines_on_an_autodiff_tensor() {
+fn the_fused_kernel_runs_on_an_autodiff_tensor() {
     let _g = SEAM.lock().unwrap_or_else(|e| e.into_inner());
     let fx = Fx::load();
     let dev = autodiff_cuda();
@@ -377,22 +377,18 @@ fn the_fused_kernel_declines_on_an_autodiff_tensor() {
     assert_eq!(asked1 - asked0, 1, "the kernel was not asked once");
     assert_eq!(
         ran1 - ran0,
-        0,
-        "the fused kernel RAN on an autodiff tensor (asked={asked1} ran={ran1}). \
-         If that is deliberate, two things have to land with it: a BACKWARD \
-         (fused.rs returns a fresh plain `Tensor::empty`, so the result carries \
-         no graph and the arm would train nothing — the gdn2 failure mode), and \
-         a re-baselined control, because every held-out BPB on record was \
-         measured on the tensor path."
+        1,
+        "the fused kernel did NOT run on an autodiff tensor (asked={asked1} ran={ran1}). \
+         Before 2026-10-02 that was the whole story — the node arm now carries the \
+         graph the bare launch never had, so norm= must count a run."
     );
     assert!(
         fx.rel_diff("main", &ours, "out_torch") <= TOL_REL,
-        "the declined path disagrees with the reference, so the fallback is not \
-         a correct answer"
+        "the node arm's output disagrees with the reference"
     );
     eprintln!(
         "autodiff device: asked {asked1}, ran {ran1} (delta asked {} ran {}) — the \
-         trainer's shape, the reason the eval line reads norm=0/N",
+         node arm engaged",
         asked1 - asked0,
         ran1 - ran0
     );
@@ -403,7 +399,7 @@ fn the_fused_kernel_declines_on_an_autodiff_tensor() {
 /// strips the autodiff context decides whether the eval line's `norm=` field
 /// could ever be non-zero, so it is measured rather than assumed.
 #[test]
-fn the_fused_kernel_declines_on_the_trainers_eval_snapshot() {
+fn the_fused_kernel_runs_on_the_trainers_eval_snapshot() {
     let _g = SEAM.lock().unwrap_or_else(|e| e.into_inner());
     let fx = Fx::load();
     let dev = autodiff_cuda();
@@ -419,10 +415,10 @@ fn the_fused_kernel_declines_on_the_trainers_eval_snapshot() {
     assert_eq!(asked1 - asked0, 1, "the kernel was not asked once");
     assert_eq!(
         ran1 - ran0,
-        0,
-        "the fused kernel RAN inside a `valid()` snapshot. The eval line's \
-         `norm=0/N` would then understate it, and AGENTS.md 3.3 would be \
-         describing the training forward only."
+        1,
+        "the fused kernel did NOT run inside a `valid()` snapshot \
+         (asked={asked1} ran={ran1}). The eval line's `norm=` would read 0/N \
+         while the kernel ships."
     );
     assert!(
         fx.rel_diff("main", &ours, "out_torch") <= TOL_REL,
