@@ -810,6 +810,13 @@ pub fn precompute_jepa_targets(
     let cfg = &run.train;
     let device = device();
     init_pools(&device);
+    // SEED exactly like the train loop (lib.rs:913): the precompute model's
+    // init must be the same-seed init the trainer builds, or the sidecar's
+    // teacher is a different network than the run it serves - same defect
+    // class as the pre-2026-09-28 seed bug (every A/B comparing two random
+    // inits). Without this, TWO precompute passes of one config also produce
+    // different targets: process entropy, not a defined object.
+    device.seed(cfg.seed);
     let (model, qfmt) = build_model(dorm_cfg, cfg, &device);
     let mut stream = dormouse_data::ByteStream::new(cfg.seq_len, cfg.batch, data);
     // Mirror the train loop's pre-loop stream consumption (the warmup
