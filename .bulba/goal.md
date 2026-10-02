@@ -406,3 +406,12 @@ train/src/lib.rs:1007,1009 — host-таблицы хардкодят dim=32+see
 cfg.engram_dim: `--set engram_dim≠32` тихо рассинхронизирует модель и хост.
 Класс SILENT. Фикс — волна 3 (lib.rs, после graph-continuation).
 Там же: unused Module import :17, unused assignments 1118-1136-1309-1328.
+
+## SITU-ARM: OOM автопсия готова, фикс ARMED (2026-10-02, wt/situ-oom)
+Причина: тензор-путь (fused скомпилирован вон, Cargo.toml:39), ~11 промежуточных
+× 3 эксперта × 4 итерации = +4.2 GiB живых активаций/шаг → пул 16 GB кончился
+на шагах 200-400. Числа волны по situ VOID. Фикс = 2 строки (burn-situ/cuda+
+autodiff в cuda-фичу) — НЕТ, пока не позелёнет гейт: три #[ignore]-теста
+burn-situ (situ_fused_matches_tensor, fused_backward_matches_tensor_backward,
+fd-test) ни разу не запускались — GPU-прогон гейта после дневного прогона,
+потом флип. ADR-0019: у арма нет situ-поля в eval-строке (добавить).
