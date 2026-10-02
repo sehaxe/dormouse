@@ -446,3 +446,14 @@ fwd+bwd+opt+retr+ema = 99.2% запусков (атлас), (3) replay. След
 «in-place optimizer + расширенное окно», гейты те же + opt-эквивалентность.
 Ответ 400→60: 60 = математика (f16 уже в), 340 = налог запусков, снимается
 только этой ступенью.
+
+## KDA_ORACLE: красные тесты = RED ON PURPOSE, не CI-дефект (проверено по дереву)
+kda_oracle.rs:39-40 + b485ad9: (1) softplus-decay: мы считаем
+-softplus(exp(A)·z), FLA — -exp(A)·softplus(z) — это arm 5 очереди (K3-decay,
+REPLACE-решение владельца); (2) read_scale: FLA дефолтит scale=K^-0.5, мы
+передаём 1.0 с ассертом «no softmax scale in KDA», ложным против обоих
+апстримов (ratio 2.8284 = √8 точно). Оба — класс-B решения владельца из списка.
+Lane kdaci залила REL_BAR 5e-2→0.25 (d53229d, origin/wt/kdaci, НЕ смержен) —
+ослабление допуска требует ревью (отчёт дорожки деградировал, лимит контекста).
+Фикс ndarray-джобы: пометить 3 теста known-red в fused-library.yml (как
+burn-spectral) + решения владельца по arm 5 и read_scale.
