@@ -272,3 +272,41 @@ arithmetic, not measurement: no A/B has been run. The pin's price against `L` is
 - `crates/dormouse-cli/src/bin/train.rs` — `--graph-capture`.
 - `vendor/burn-fused/crates/burn-muon-plus/src/fused_kernels.rs` —
   `copy_into_cuda`, `copy_into_i32_cuda`.
+---
+
+## Continuation — 2026-10-02, the gates finally ran (morning operator)
+
+The settling command of §6.3 ran at 03:55 on the free card (build 5m45 in
+`/mnt/…/dt-graph`, test 75 s, `c2e580b`). **Result: 1 of 4 green. No green
+light for `--graph-capture`; the branch does NOT merge.**
+
+| gate | result |
+|---|---|
+| `a_replay_launches_no_kernels` | **green** — a replay moves the launch counter by 6 (the pin's per-step copies + input feeds), everything else replays |
+| `a_pinned_replay_agrees_with_fresh_launches_to_f32_noise` | **red** — 8.917e-1 relative at `loop_block.iter_embed[3,64]` after 7 graphed steps (`captured 1 replayed 6 refused 0, pin=384 launches`) |
+| `replays_train_and_are_reproducible` | **red, and this is the loud one** — 6 replays leave the parameters **bit-identical to the capture step** (0.000e0 movement, "(none)"): the replayed window trains nothing |
+| `the_stale_pointer_trap_is_reproduced_without_the_pin` | **red, wrong reason** — the unpinned arm no longer diverges by a clean signature; it dies with `CUDA_ERROR_ILLEGAL_ADDRESS` at the first read ("The bytes were never written (failure #271231)"). The trap is real but the gate cannot always measure it as a number |
+
+**Reading (hypothesis, clearly marked):** the two red positives are one
+defect. `pin=384` over 7 steps ≈ 55 address refreshes per step against
+38 gradient tensors + params + inputs — and the reproducibility gate says
+weight updates from the outside `optim.step` never enter the captured
+window at all: the replay recomputes with the capture step's buffers
+while burn's out-of-place optimizer allocates fresh ones each step. That
+is §1's own wall, now measured: **a window that excludes the optimizer
+cannot train a model whose optimizer is out-of-place.** The fix is
+either the optimizer inside the window (the moment-pinning rewrite §7
+defers) or feeding the optimizer from the retained grad buffers — both
+owner-lane decisions with real cost, neither a morning fix.
+
+Also recorded: the negative gate's instability (a clean 1-10 relative
+signature on 2026-10-01, an illegal-address crash today on identical
+logic) means *measuring* the trap is itself nondeterministic — a stale
+pointer lands wherever the pool's free list hands the buffer, and
+sometimes the answer is a dead context, not a wrong number. Any future
+version of that gate should assert on the crash OR the divergence, not
+insist on the divergence.
+
+Decision recorded per the brief: gates not green → `wt/graph-trainer`
+stays unmerged, `--graph-capture` ships in nothing, this file is the
+blocker report.
