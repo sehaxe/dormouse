@@ -76,6 +76,9 @@ fn fused_matches_tensor_chunk() {
     let log_alpha = proj.3;
     let beta = proj.4;
     let state = Tensor::<4>::zeros([1, 4, 32, 32], &dev);
+    // The head dim must be read BEFORE `q` moves into the fused call below;
+    // reading it at the chunk_wy call site borrows a moved value.
+    let head_k_dim = q.shape().dims::<4>()[3];
 
     let (fused_out, _) = burn_kda::fused::cuda::kda_fused_chunk::<Bare>(
         q.clone(),
@@ -97,7 +100,7 @@ fn fused_matches_tensor_chunk() {
         beta.clone(),
         beta,
         state,
-        burn_kda::fla_read_scale(q.shape().dims::<4>()[3]),
+        burn_kda::fla_read_scale(head_k_dim),
         16,
     );
 
