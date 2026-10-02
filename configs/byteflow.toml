@@ -1,0 +1,62 @@
+# ByteFlow preset (arXiv 2603.03583) — the byte-compression arm, owner's
+# Этап-1 baseline. use_byteflow=true replaces the DormouseModel with the
+# crate's five-stage ByteFlow Net, so the dormouse arm fields below are NOT
+# read on this path (the schema-default values that keep `small`'s arms off
+# here are chosen so validate's byteflow refusals stay quiet: no KDA, no
+# Engram, no aux, no MoE). The byteflow_* numbers are the byteflow_9m build
+# from docs/reviews/byteflow-rate-2026-10-02.md §5 — paper Table 5's BFlowNet
+# structure scaled to small-class size; the params the step-0 arm line prints
+# are the measured count (the A/B's honest second row is a same-budget control,
+# not this table).
+bf16 = false
+act_group = 0
+# Dormouse fields the byteflow path does not read, at the values that keep
+# every dormouse arm OFF (validate refuses use_byteflow with any arm on):
+d_model = 768
+n_heads = 12
+head_dim = 64
+d_ffn = 2048
+vocab = 256
+max_seq_len = 512
+max_iter = 4
+rank = 64
+norm_eps = 0.001
+use_kda = false
+use_engram = false
+use_gr = false
+use_attnres = false
+use_mhc = false
+use_situ = false
+n_experts = 3
+moe_topk = 0
+jepa_weight = 0.0
+jepa_mask_frac = 0.15
+jepa_mask_span = 8
+dspark_weight = 0.0
+dspark_k = 4
+dspark_stride = 16
+aux_fb_weight = 0.0
+aux_fb_horizon = 2
+engram_rows = 25000
+engram_orders = [2, 3, 4]
+engram_dim = 32
+engram_lam_max = 0.5
+use_mor = false
+mor_k = 2
+mor_bce_weight = 0.0
+# --- the byteflow side ---
+use_byteflow = true
+byteflow_d_local = 96
+byteflow_d_global = 768
+byteflow_k_tokens = 128
+byteflow_e_layers = 2
+byteflow_g_layers = 2
+byteflow_heads_local = 4
+byteflow_heads_global = 8
+byteflow_w_local = 256
+byteflow_d_ff_local = 256
+byteflow_d_ff_global = 2048
+byteflow_bins = 16
+byteflow_eps2 = 0.5
+byteflow_logdet = false
+byteflow_max_bytes = 512

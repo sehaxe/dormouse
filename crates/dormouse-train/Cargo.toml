@@ -27,6 +27,10 @@ dormouse-data = { path = "../dormouse-data" }
 burn-spectral = { path = "../../vendor/dormouse-fused/crates/burn-spectral" }
 burn-bitnet = { path = "../../vendor/dormouse-fused/crates/burn-bitnet" }
 burn-muon-plus = { path = "../../vendor/dormouse-fused/crates/burn-muon-plus" }
+# The ByteFlow arm (`use_byteflow`): the paper's five-stage net lives here,
+# and the trainer's byteflow loop builds and trains it. Same burn pin as the
+# rest of the workspace (the vendored workspace resolves the same 0.22.0-pre.4).
+burn-byteflow = { path = "../../vendor/dormouse-fused/crates/burn-byteflow" }
 serde = { workspace = true, features = ["derive"] }
 toml = { workspace = true }
 # The export's two primitives, both already in this build graph through burn

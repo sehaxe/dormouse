@@ -58,6 +58,9 @@ pub fn resolve(preset: &str, set: &[String], mut train: TrainCfg) -> Result<RunC
     if train.no_engram {
         model.use_engram = false;
     }
+    if train.byteflow {
+        model.use_byteflow = true;
+    }
     if let Some(w) = train.jepa_weight {
         model.jepa_weight = w;
     }
@@ -321,14 +324,14 @@ mod tests {
         // it is paid ONCE: a new TrainCfg field must be added here, which is
         // exactly the moment the author has to ask "does this belong in the
         // snapshot?" - the question the skip hid.
-        const FIELDS: [&str; 41] = [
+        const FIELDS: [&str; 42] = [
             "steps", "ckpt_every", "log_every", "seq_len", "batch", "lr", "wd",
             "grad_clip", "ckpt_name", "eval_every", "opt", "quant",
             "factors_fallback", "rand_depth", "eval_batches", "eval_depths",
             "retract_every", "retract_iters", "retract_batched", "stress", "stress_lr",
             "stress_every", "engram_ram", "engram_slots", "host_adam_every",
             "warmup", "quant_check", "timers", "memlog", "bf16", "act_quant",
-            "act_group", "max_iter", "no_kda", "no_engram", "jepa_weight",
+            "act_group", "max_iter", "no_kda", "no_engram", "byteflow", "jepa_weight",
             "dspark_weight", "dspark_k", "jepa_targets", "seed", "graph_capture",
         ];
         // An Option field that is None is omitted by the TOML serializer, so
