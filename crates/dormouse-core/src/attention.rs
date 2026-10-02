@@ -15,13 +15,19 @@
 //! * **No host sync.** Neither function reads a tensor; they read atomics the
 //!   library incremented on the device. Safe to call in a hot loop's log path
 //!   (AGENTS.md §1.3).
-//! * **The fused path is not reachable on the trainer's backend**, and the
-//!   counters are how a reader finds out. `burn-dispatch` refuses the
-//!   autodiff→bare demotion unless the dispatch autodiff context is
-//!   `Disabled`, so every training forward and every eval takes the tensor-ops
-//!   route. `norm_asked == norm_skipped` is the same statement about
-//!   `burn-rmsnorm`, and it held on every reading in this project's history
-//!   (1560 asks per 500 steps, 0 runs).
+//! * **The fused path WAS not reachable on the trainer's backend** — until
+//!   2026-10-02, in two independent ways, both fixed that day. The dispatch
+//!   guard (`burn-dispatch` refusing the autodiff→bare demotion unless the
+//!   context is `Disabled`) was routed around with custom autodiff nodes
+//!   (`burn-rmsnorm/src/ops.rs`, `burn-gdn2/src/autodiff.rs`); the trainer's
+//!   Backend TYPE naming `BalancedCheckpointing` against a `Disabled` device
+//!   discarded every fused result at the final cast and is now
+//!   `NoCheckpointing` (`dormouse-train/src/lib.rs`). Since then
+//!   `norm_asked > norm_skipped` is the healthy training state, and
+//!   `norm_asked == norm_skipped` — which held on every reading in this
+//!   project's history (1560 asks per 500 steps, 0 runs) — is a REGRESSION
+//!   signal, not the norm. Eval forwards still skip (counted): their tensors
+//!   are untracked, the node declines, the bare arm refuses the context.
 //! * **A fused forward that runs and is discarded is a defect**, not a speedup.
 //!   That was found on 2026-09-30 and is still open; it is why the counters
 //!   are per-direction rather than a single "ran" flag.
