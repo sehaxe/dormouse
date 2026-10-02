@@ -5,7 +5,7 @@ and the pin's necessity is measured on the trainer's own path; the positive
 gate and the 500-step A/B are not.** Numbers below carry their command and the
 commit they were taken at.
 
-Read first: `research/reviews/cuda-graph-2026-09-30.md` (the handover) and
+Read first: `docs/reviews/cuda-graph-2026-09-30.md` (the handover) and
 `vendor/cubecl-fix/cubecl-cuda/tests/graph_step.rs` (the mechanism, 5/5 on this
 card). This file records what changed in the trainer and why the window is
 smaller than the handover's.
