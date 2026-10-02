@@ -149,8 +149,10 @@ Gates (CPU): library workspace check per CI's command
 (`cargo check --workspace --all-targets --exclude burn-fused-benches
 --exclude cpu-probe --exclude launch-probe`) — green, 4m38s;
 `cargo check -p dormouse-train --features dormouse-train/cuda` —
-[result below, filled in after the run]; `python3 tools/check_doc_refs.py` —
-0 missing; `npm run check` in docs-site — [below].
+green (3m24s, one pre-existing unused-import warning in burn-spectral);
+`python3 tools/check_doc_refs.py` — 0 named paths missing;
+`npm run check` in docs-site (after `npm run build`) — check: ok,
+check-mermaid: ok. Library gate: 4m38s, warnings only.
 
 Line count against target: 3439 + 444 = **3883 removed** (CI reset plus
 tsct_diag/bench trims bring the tracked total to ~3885+).
