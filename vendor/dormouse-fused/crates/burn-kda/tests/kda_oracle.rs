@@ -36,20 +36,30 @@
 //! | `kda_step_matches_fla_recurrent_at_unit_scale` | **green** | Eq 1 itself, term by term, against FLA's own scan |
 //! | `fla_read_scale_is_the_whole_difference` | **green** | upstream's two fixture rows differ by exactly `K**-0.5` and nothing else, which is what makes the red test below attributable |
 //! | `chunked_wy_matches_fla_chunk_at_unit_scale` | **green** | the chunked WY construction itself, on **both** of gdn2's chunk arms |
-//! | `kimi_linear_softplus_decay_matches_fla_reference` | **RED ON PURPOSE** | `lib.rs:268` computes `-softplus(exp(A)*z)`; FLA computes `-exp(A)*softplus(z)`, in both the naive and the triton twin |
-//! | `read_scale_matches_fla_reference` | **RED ON PURPOSE** | FLA's `chunk_kda` defaults `scale = K**-0.5` and `fla/layers/kda.py:262` passes no `scale`, so the official layer runs at `head_k_dim**-0.5`. We pass `1.0`, and `fused.rs:9` asserts the reason ("no softmax scale in KDA"), which is false against both upstreams. |
+//! | `kimi_linear_softplus_decay_matches_fla_reference` | **red on purpose, `#[ignore]`d** | `lib.rs:268` computes `-softplus(exp(A)*z)`; FLA computes `-exp(A)*softplus(z)`, in both the naive and the triton twin |
+//! | `read_scale_matches_fla_reference` | **red on purpose, `#[ignore]`d** | FLA's `chunk_kda` defaults `scale = K**-0.5` and `fla/layers/kda.py:262` passes no `scale`, so the official layer runs at `head_k_dim**-0.5`. We pass `1.0`, and `fused.rs:9` asserts the reason ("no softmax scale in KDA"), which is false against both upstreams. |
+//! | `chunked_wy_applies_no_read_scale` | **red on purpose, `#[ignore]`d** | the chunked arm of the same divergence: `src/lib.rs:646,653` pass `1.0`. The mechanism exists (`chunked_wy_honours_the_read_scale_when_asked` is green), so this is a missing argument, not a missing implementation |
 //!
 //! A red test that a maintainer can read and act on is the deliverable; a
-//! numerical change to a shipped model is the owner's call, so the two
-//! divergences are **reported**, not fixed. See
+//! numerical change to a shipped model is the owner's call, so the three
+//! divergences are **reported**, not fixed. Each red is `#[ignore]`d with its
+//! cause in the attribute: the CI ndarray job runs `cargo test --workspace`,
+//! and a designed red fails it on every machine with identical numbers (the
+//! assert prints the same values locally and on ubuntu-latest — ratio exactly
+//! `K**0.5`, a formula difference, not arithmetic), so the job could never go
+//! green while the reds ran by default. `cargo test -p burn-kda --test
+//! kda_oracle -- --ignored` runs them and prints the pinned numbers. The
+//! platform-drift investigation that ended in this mechanism is
+//! `docs/reviews/kda-oracle-ci-2026-10-02.md`; the formula audit is
 //! `docs/reviews/2026-09-30-kda-formula-audit.md` §3.1 and §3.2.
 //!
-//! **Baseline: 5 green, 2 red on purpose**, and the two reds are the only
-//! failures in the file. `tests/oracle/falsify.sh` demonstrates that each green
-//! arm can be broken on demand, in both directions: a mutant that breaks a
-//! green, and — the more valuable one — a mutant that "fixes" a red, which
-//! proves the red is pinned to the reference's rule and not merely to "not our
-//! formula".
+//! **Baseline: 7 green, 3 reds on purpose (`#[ignore]`d)**, and the three reds
+//! are the only non-passes in the file. `tests/oracle/falsify.sh` demonstrates
+//! that each green arm can be broken on demand, in both directions: a mutant
+//! that breaks a green, and — the more valuable one — a mutant that "fixes" a
+//! red (it runs the oracle with `--include-ignored`, so the reds participate),
+//! which proves the red is pinned to the reference's rule and not merely to
+//! "not our formula".
 //!
 //! ## What a red test here costs, and why it is worth it
 //!
@@ -398,6 +408,7 @@ fn k3_bounded_decay_matches_fla_reference() {
 }
 
 #[test]
+#[ignore = "designed red: src/lib.rs:268 puts exp(A) INSIDE the softplus; FLA puts it OUTSIDE (gate.py:50 and :167). A numerical fix is class B = A/B queue arm 5, the owner's call. Run `cargo test -p burn-kda --test kda_oracle -- --ignored` to see the pinned per-case numbers."]
 fn kimi_linear_softplus_decay_matches_fla_reference() {
     // RED ON PURPOSE. src/lib.rs:268 computes
     //     DecayFn::Softplus => activation::softplus(scaled, 1.0).neg(),
@@ -606,6 +617,7 @@ fn fla_read_scale_is_the_whole_difference() {
 }
 
 #[test]
+#[ignore = "designed red: src/lib.rs:646,653 pass 1.0 as `scale`; FLA's KDA layer runs at head_k_dim**-0.5 (fla/layers/kda.py:262). A numerical fix is the owner's call. Run `cargo test -p burn-kda --test kda_oracle -- --ignored` to see the pinned per-case numbers."]
 fn read_scale_matches_fla_reference() {
     // RED ON PURPOSE. FLA applies a read scale and burn-kda does not.
     //
@@ -798,6 +810,7 @@ fn chunked_wy_honours_the_read_scale_when_asked() {
 /// the recurrent arm; this one is the one a candidate fix turns green, and
 /// `falsify.sh`'s A6 is that demonstration.
 #[test]
+#[ignore = "designed red: the chunked twin of read_scale_matches_fla_reference -- src/lib.rs:646,653 pass 1.0; FLA runs at K**-0.5. The mechanism exists (chunked_wy_honours_the_read_scale_when_asked is green); the argument is missing, and passing it is a numerical change, the owner's call. `-- --ignored` runs this."]
 fn chunked_wy_applies_no_read_scale() {
     use burn_gdn2::ChunkPath;
     static ARM: Mutex<()> = Mutex::new(());

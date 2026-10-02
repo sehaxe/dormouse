@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # PROVE THE burn-kda ORACLE CAN FAIL, IN BOTH DIRECTIONS.
 #
-# A test that has only ever been green is not evidence that it can fail. Two of
-# the five green arms in `tests/kda_oracle.rs` are only green because our code
+# A test that has only ever been green is not evidence that it can fail. The
+# green arms in `tests/kda_oracle.rs` are only green because our code
 # currently agrees with FLA's executed code; this script is what stops that
 # claim from being inherited unexamined.
 #
@@ -11,7 +11,7 @@
 #   A. MUTANTS THAT BREAK A GREEN. Perturb our source and show the corresponding
 #      green arm goes red. This is the ordinary "can it fail" demonstration.
 #
-#   B. MUTANTS THAT "FIX" A RED. The two red tests are red because our code
+#   B. MUTANTS THAT "FIX" A RED. The three red tests are red because our code
 #      disagrees with FLA. A mutant that moves our code TOWARD FLA's formula
 #      turns a red green. That is the strongest statement available: it proves
 #      the red is pinned to the reference's actual rule and not merely to "not
@@ -32,8 +32,10 @@
 #   * the final `cmp` reports whether the tree is back.
 #
 # Usage:  bash tests/oracle/falsify.sh
-# Expected: baseline 5 green / 2 red; every A-mutant >= 1 red; every B-mutant
-#           turns its target red green; tree restored.
+# Expected: baseline 7 green / 3 red (the three designed reds are `#[ignore]`d
+#           in a plain run; this script passes `--include-ignored` so they take
+#           part); every A-mutant >= 1 red; every B-mutant turns its target red
+#           green; tree restored.
 set -u
 
 here="$(dirname "$(readlink -f "$0")")"   # .../burn-kda/tests/oracle
@@ -72,7 +74,10 @@ PY
 
 run() { # $1 = label ; runs the oracle and summarises pass/fail per test
   local out
-  out="$(cd "$libws" && cargo test -p burn-kda --test kda_oracle 2>&1)"
+  # `--include-ignored`: the three designed reds are `#[ignore]`d so the CI
+  # ndarray job stays green; this harness needs them RUNNING or the B-mutants
+  # ("fix a red") would have nothing to demonstrate.
+  out="$(cd "$libws" && cargo test -p burn-kda --test kda_oracle -- --include-ignored 2>&1)"
   echo "$out" | grep -E '^test [a-z0-9_]+ \.\.\.' | sed 's/^/    /'
   echo "$out" | grep -E '^test result:' | sed 's/^/    /'
   # name the reds, so a mutant that "fixed" one is visible rather than inferred
