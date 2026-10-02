@@ -60,7 +60,7 @@
 
 use burn::{
     grad_clipping::GradientClippingConfig,
-    module::{Module, ParamGroup},
+    module::ParamGroup,
     optim::{AdamConfig, AdamWConfig, AdanConfig, LearningRate, Optimizer},
     tensor::{Device, ElementConversion, Tensor},
 };
@@ -540,6 +540,10 @@ pub fn validate_routing(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `model.visit` below comes from the Module trait; the trait has no
+    // non-test caller in this crate, so a top-level import reads unused on
+    // the lib build (newer rustc flags it, CI clippy runs one).
+    use burn::module::Module as _;
     use burn::tensor::{Distribution, TensorData};
 
     /// The weight the trainer installs Q/K into is `[n_heads*head_dim, d]`.

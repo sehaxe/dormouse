@@ -155,7 +155,7 @@ fn print_stats(s: &MixtureStats, label: &str, e: usize) {
     println!("--- mixture @ {label}");
     for (i, m) in s.mean.iter().enumerate() {
         let w: Vec<String> = m.iter().map(|x| format!("{x:.3}")).collect();
-        println!("  iter {i}  mean[{w}]  (uniform {:.3})", 1.0 / e as f64);
+        println!("  iter {i}  mean[{}]  (uniform {:.3})", w.join(", "), 1.0 / e as f64);
     }
     if s.cross_iter_cosine.is_empty() {
         println!("  depth 1: no cross-iteration pair to compare");
@@ -199,7 +199,8 @@ fn print_stats(s: &MixtureStats, label: &str, e: usize) {
     );
     let load: Vec<String> = s.load.iter().map(|x| format!("{:.4}", x)).collect();
     println!(
-        "  load     [{load}]  effective experts {:.3} of {e}  (1.000 = one expert takes everything, {e} = uniform)",
+        "  load     [{}]  effective experts {:.3} of {e}  (1.000 = one expert takes everything, {e} = uniform)",
+        load.join(", "),
         s.effective_experts
     );
 }

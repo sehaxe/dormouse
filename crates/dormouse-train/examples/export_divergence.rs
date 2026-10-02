@@ -176,7 +176,7 @@ fn main() {
 /// Phase 1: a short real run. This is a real checkpoint, produced by the real
 /// trainer, at a real step count - the point is a model whose weights have
 /// moved off their init distribution, not a converged one.
-fn train_n_steps(a: &Args, dir: &PathBuf, ckpt: &Path) -> DormouseConfig {
+fn train_n_steps(a: &Args, dir: &Path, ckpt: &Path) -> DormouseConfig {
     use dormouse_train::{build_optim, save_ckpt, RunCfg, TrainCfg};
     let t0 = std::time::Instant::now();
     let cfg: DormouseConfig = {
