@@ -62,7 +62,7 @@ use burn::{
     grad_clipping::GradientClippingConfig,
     module::ParamGroup,
     optim::{AdamConfig, AdamWConfig, AdanConfig, LearningRate, Optimizer},
-    tensor::{Device, ElementConversion, Tensor},
+    tensor::{Device, ElementConversion, Shape, Tensor},
 };
 use burn_muon_plus::{MuonPlus, MuonPlusConfig, MuonPlusState, NormDir};
 use dormouse_core::routing::{self, Group};
@@ -150,6 +150,41 @@ fn muon_plus_cfg(cfg: &TrainCfg) -> MuonPlusConfig {
         .with_weight_decay(cfg.wd)
 }
 
+/// Newton-Schulz over the stacked `[n_heads, dh, cols]` momentum in one
+/// matmul chain. Identical math to `n_heads` × `MuonPlus::orthogonalize`
+/// on the 2-D slices (same Jordan triple, same per-slice Frobenius
+/// normalization), but one tensor-op chain instead of `n_heads` — at the
+/// trainer's Q/K shape the per-head loop was the opt stage's largest
+/// launch block. Pinned equivalent by `headwise_batched_ns_matches_per_head`.
+fn orthogonalize_batched(
+    m: Tensor<3>,
+    ns_steps: usize,
+    ns_coeffs: (f32, f32, f32),
+) -> Tensor<3> {
+    let [_, dh, cols] = m.dims();
+    let transposed = dh > cols;
+    let mut x = if transposed { m.swap_dims(1, 2) } else { m };
+    // Per-slice Frobenius norm (the scalar path reduces the whole 2-D
+    // slice; here the slice readings must not cross slices).
+    let norm = x
+        .clone()
+        .mul(x.clone())
+        .sum_dim(1)
+        .sum_dim(2)
+        .sqrt()
+        .clamp_min(1e-7);
+    x = x.div(norm);
+    let (a, b, c) = ns_coeffs;
+    for _ in 0..ns_steps {
+        let xt = x.clone().swap_dims(1, 2);
+        let xx = x.clone().matmul(xt); // X X^T
+        let xx2 = xx.clone().matmul(xx.clone()); // (X X^T)²
+        let poly = xx.mul_scalar(b).add(xx2.mul_scalar(c));
+        x = x.clone().mul_scalar(a).add(poly.matmul(x.clone()));
+    }
+    if transposed { x.swap_dims(1, 2) } else { x }
+}
+
 /// Head-wise Muon+ for the attention Q/K projections (Qwen3.8-Flash-Next
 /// §3.1: "split fused params per head BEFORE orthogonalization - fusing
 /// mixes singular directions"). The `[n_heads*head_dim, d]` weight is
@@ -180,6 +215,8 @@ pub struct HeadWiseMuon {
     n_heads: usize,
     momentum: f64,
     weight_decay: f64,
+    ns_steps: usize,
+    ns_coeffs: (f32, f32, f32),
 }
 
 impl HeadWiseMuon {
@@ -191,6 +228,8 @@ impl HeadWiseMuon {
             muon: muon_cfg.build(),
             n_heads,
             weight_decay: cfg.wd,
+            ns_steps: muon_cfg.ns_steps,
+            ns_coeffs: muon_cfg.ns_coeffs,
         }
     }
 }
@@ -247,15 +286,13 @@ impl Optimizer for HeadWiseMuon {
             None => grad.clone().mul_scalar(1.0 - mu),
         };
 
-        // One NS preconditioner per head (2D slices keep the fused muon+
-        // kernels - which assume a 2D layout - on their fast path), then
-        // concatenate back.
+        // One stacked NS over [n_heads, dh, cols] instead of n_heads
+        // separate 2-D NS loops: identical math per slice, one matmul
+        // chain's launches instead of n_heads of them (the opt stage's
+        // largest launch block at this shape).
         let dh = rows / self.n_heads;
-        let mut parts = Vec::with_capacity(self.n_heads);
-        for h in 0..self.n_heads {
-            let block = momentum.clone().slice([h * dh..(h + 1) * dh, 0..cols]);
-            parts.push(self.muon.normalize(self.muon.orthogonalize(block)));
-        }
+        let stacked = momentum.clone().reshape([self.n_heads, dh, cols]);
+        let ortho = orthogonalize_batched(stacked, self.ns_steps, self.ns_coeffs);
         // The zero-gradient rule, from the crate that owns it: NS normalizes
         // the DECAYED momentum back to unit Frobenius norm, so without this
         // gate a step the trainer masked as a no-op still moved Q/K by a full
@@ -263,7 +300,14 @@ impl Optimizer for HeadWiseMuon {
         // gated, exactly as in `MuonPlus::step` - a zero gradient is a no-op
         // on the update, not on the decay.
         let g_active = burn_muon_plus::signal_mask(&grad);
-        let update = Tensor::cat(parts, 0).mul(g_active.unsqueeze());
+        // D == 2 at this point (the D != 2 branch returned above), and a
+        // `Shape` argument lets the reshape target this generic rank -
+        // `[usize; 2]` pins D2 = 2, which does not unify with `D`.
+        let update: Tensor<D> = self
+            .muon
+            .normalize(ortho)
+            .reshape(Shape::from([rows, cols]))
+            .mul(g_active.unsqueeze());
 
         // Same tail as MuonPlus 2D. The Bernstein factor uses the FULL
         // dims: per-head NS output carries the same total Frobenius norm
@@ -671,6 +715,51 @@ mod tests {
             before.into_bytes(),
             after.into_data().into_bytes(),
             "a non-zero gradient did not move the head-wise Q/K weight"
+        );
+    }
+
+    /// The batched NS must equal the per-head loop it replaced: same
+    /// init, same Jordan triple, same per-slice Frobenius norm, just one
+    /// matmul chain. The loop is still how `orthogonalize_batched` is
+    /// specified, so a wiring/reshape bug (heads interleaved, a slice
+    /// spanning two heads) reads as a large diff here.
+    #[test]
+    fn headwise_batched_ns_matches_per_head() {
+        let dev = crate::device();
+        let vals: Vec<f32> = (0..ROWS * COLS)
+            .map(|i| ((i.wrapping_mul(97) % 631) as f32 / 315.0) - 1.0)
+            .collect();
+        let m = Tensor::<2>::from_data(TensorData::new(vals, [ROWS, COLS]), &dev);
+        let muon = muon_plus_cfg(&TrainCfg { wd: 0.0, ..Default::default() }).build();
+        let dh = ROWS / HEADS;
+        let mut parts = Vec::new();
+        for h in 0..HEADS {
+            let block = m.clone().slice([h * dh..(h + 1) * dh, 0..COLS]);
+            parts.push(muon.orthogonalize(block));
+        }
+        let per_head = Tensor::cat(parts, 0).into_data();
+        let batched = orthogonalize_batched(
+            m.reshape([HEADS, dh, COLS]),
+            MUON_NS_STEPS,
+            burn_muon_plus::NS_COEFFS,
+        )
+        .reshape([ROWS, COLS])
+        .into_data();
+        let a = per_head.as_slice::<f32>().unwrap();
+        let b = batched.as_slice::<f32>().unwrap();
+        let max_diff = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        // 1e-3, not ulp: the batched [12,64,768] matmuls reduce in a
+        // different order than the 12 per-head 2-D ones on the CUDA
+        // backend, and 8 NS iterations amplify a ulp-level seed to ~1e-4
+        // (measured). What this test fences is a wiring error - heads
+        // interleaved, a slice spanning two heads - which reads O(1).
+        assert!(
+            max_diff < 1e-3,
+            "batched NS differs from the per-head loop by {max_diff}"
         );
     }
 
