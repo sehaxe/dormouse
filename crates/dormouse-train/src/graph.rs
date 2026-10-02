@@ -446,31 +446,62 @@ pub fn copy_into_int<const D: usize>(
 /// `Disabled`, and neither an Int input nor a parameter built by the optimizer
 /// is. That is the whole reason this pin has a helper in it.
 ///
-/// `h` is `None` when the run has no in-VRAM table: the window then does not
-/// read the keys at all, and pinning a tensor nothing reads would be ceremony.
+/// `h` is `None` when the window does not CONSUME keys: a key buffer nothing
+/// reads would be ceremony on the `--no-engram` shape.
+///
+/// # The keys gate keys on consumption, not supply (2026-10-02)
+///
+/// The byte stream ALWAYS produces FNV keys (`ByteStream::next_batch` computes
+/// `hashes_raw` unconditionally, ORDERS=[2,3,4]), so every step arrives with
+/// keys in hand whether or not the model reads them. The window's key-ness is
+/// therefore a fact about the MODEL (`keys_consumed` — the Engram arm fed from
+/// the in-VRAM tables), not about the batch:
+///
+/// - `keys_consumed = true` and a step arrives with keys — the normal run,
+///   one copy per step.
+/// - `keys_consumed = true` and a step arrives with none — **a loud refusal**
+///   (`feed`). There is no correct way to run it: the captured forward reads a
+///   key buffer, so feeding nothing means the memory arm trains on whatever
+///   the buffer already held (the `7adda92` shape — a measured eval running a
+///   different program than the trained one).
+/// - `keys_consumed = false` and keys are supplied — dropped, not refused.
+///   The model never reads them (`loop_block` takes its `use_engram` branch
+///   before `hashed_ids`), so `None` keys ARE the correct forward, and the
+///   first graph-mode run that had this backwards refused every capture with
+///   "this step has hashed keys and the pinned window has none" while the
+///   run's config was `--no-engram`. The armed line prints
+///   `key window FED|none` once, so the reader of the log can tell which arm
+///   ran without re-deriving the config (ADR-0019).
 pub struct InputPins {
     pub x: Tensor<2, burn::tensor::Int>,
     pub y: Tensor<2, burn::tensor::Int>,
     pub h: Option<Tensor<3, burn::tensor::Int>>,
+    /// Whether the window reads the keys, fixed at arm time from the run's
+    /// own consumption (`use_engram` and not the host-offload path).
+    keys_consumed: bool,
 }
 
 impl InputPins {
-    /// Allocate the buffers from the first batch's shapes. `with_engram_keys`
-    /// says whether the window will read hashed keys at all.
+    /// Allocate the buffers from the first batch's shapes. `h` is the first
+    /// batch's keys (the stream always supplies them — it is the shape
+    /// carrier here); `keys_consumed` decides whether the window pins a key
+    /// buffer at all, and that verdict is the model's, not the stream's.
     pub fn new(
         first: &Tensor<2, burn::tensor::Int>,
         y: &Tensor<2, burn::tensor::Int>,
-        h: Option<&Tensor<3, burn::tensor::Int>>,
+        h: &Tensor<3, burn::tensor::Int>,
+        keys_consumed: bool,
     ) -> Self {
         let x = Tensor::zeros(first.dims(), &first.device());
         let yp = Tensor::zeros(y.dims(), &y.device());
-        let hp = h.map(|t| Tensor::zeros(t.dims(), &t.device()));
-        Self { x, y: yp, h: hp }
+        let hp = keys_consumed.then(|| Tensor::zeros(h.dims(), &h.device()));
+        Self { x, y: yp, h: hp, keys_consumed }
     }
 
     /// Copy this step's batch into the pinned buffers and hand them over.
-    /// `Err` names which tensor could not be pinned, because a graph fed a
-    /// buffer that moves is the silent failure this module exists to prevent.
+    /// `Err` names what could not be pinned or consumed, because a graph fed
+    /// a buffer that moves — or handed keys a window refuses to read — is the
+    /// silent failure this module exists to prevent.
     pub fn feed(
         &mut self,
         x: &Tensor<2, burn::tensor::Int>,
@@ -491,25 +522,36 @@ impl InputPins {
         if let Err(e) = copy_into_int(&as_constant_int(y), &as_constant_int(&self.y)) {
             return Err(format!("graph capture: could not pin y: {e}"));
         }
-        let hp = match (h, &self.h) {
-            (Some(src), Some(_)) => {
+        if !self.keys_consumed {
+            // The model reads no keys this run (no Engram arm, or the arm fed
+            // from host rows): the supplied keys are dead weight and the
+            // memory-less forward is the CORRECT program, so drop them. The
+            // armed line already printed `key window none` — the reader can
+            // tell which arm every step took.
+            return Ok((self.x.clone(), self.y.clone(), None));
+        }
+        match h {
+            Some(src) => {
                 if let Err(e) = copy_into_int(
                     &as_constant_int(src),
-                    &as_constant_int(self.h.as_ref().expect("matched above")),
+                    &as_constant_int(self.h.as_ref().expect("keyed arm built the buffer")),
                 ) {
                     return Err(format!("graph capture: could not pin hashed_ids: {e}"));
                 }
-                Some(self.h.clone().expect("matched above"))
             }
-            (None, _) => None,
-            (Some(_), None) => {
+            None => {
                 return Err(
-                    "graph capture: this step has hashed keys and the pinned window has none"
+                    "graph capture: the window consumes hashed keys but this step supplies \
+                     none — replaying it would train a memory-less model on a keyed run"
                         .into(),
-                )
+                );
             }
-        };
-        Ok((self.x.clone(), self.y.clone(), hp))
+        }
+        Ok((
+            self.x.clone(),
+            self.y.clone(),
+            Some(self.h.clone().expect("keyed arm built the buffer")),
+        ))
     }
 }
 

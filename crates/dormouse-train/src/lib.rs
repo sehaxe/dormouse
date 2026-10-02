@@ -1027,6 +1027,14 @@ pub fn train_loop(
         }
     }
     let mut stress = cfg.stress.then(|| StressMonitor::new(cfg.stress_lr, cfg.stress_every));
+    // What the window CONSUMES, decided once: the Engram arm fed from the
+    // in-VRAM tables (host.is_none() below is exactly this — engram_ram owns
+    // `host`). NOT what the byte stream supplies — it always supplies FNV keys
+    // (next_batch computes them unconditionally), so under --no-engram every
+    // step carries keys the model never reads. The graph seam keys its window's
+    // shape off this, not off the caller's on-the-fly verdicts (the
+    // gbench_graph2 refusal).
+    let keys_consumed = dorm_cfg.use_engram && !cfg.engram_ram;
     // RAM-offload n-gram tables (report §2.3): --engram-ram keeps the
     // tables in host memory (millions of slots in the 64 GB RAM), trains
     // them with CPU Adam, and copies only the batch's rows to the GPU.
@@ -1145,10 +1153,12 @@ pub fn train_loop(
         model = m;
         teacher = t;
         println!(
-            "graph capture armed: {} pinned parameters, {} pinned teacher parameters. \
+            "graph capture armed: {} pinned parameters, {} pinned teacher parameters, \
+             key window {}. \
              Log/eval/500-step/host-adam steps run ungraphed and force a re-capture.",
             seam.model_pins.copies(),
             seam.teacher_pins.copies(),
+            if keys_consumed { "FED" } else { "none (--no-engram or host-row path)" },
         );
         seam
     } else {
@@ -1250,11 +1260,7 @@ pub fn train_loop(
         // one shape, so the buffers are allocated once and every later batch is
         // copied into them.
         if graph_on && inputs.is_none() {
-            inputs = Some(graph::InputPins::new(
-                &x,
-                &y,
-                if dorm_cfg.use_engram && !cfg.engram_ram { Some(&h) } else { None },
-            ));
+            inputs = Some(graph::InputPins::new(&x, &y, &h, keys_consumed));
         }
         // prepare next batch right away (host->device copy is async). The
         // shift targets MUST be built from the prefetched batch: building
@@ -1341,7 +1347,10 @@ pub fn train_loop(
         // Everything the graph captures is inside this closure and nothing
         // else is, which is what makes the capture sound.
         let (x, y, h_for_fwd) = if let Some(pins) = inputs.as_mut() {
-            pins.feed(&x, &y, if host_rows.is_some() { None } else { Some(&h) })?
+            // The pin decides CONSUMPTION (keys_consumed at arm time); feed
+            // still hands over the step's SUPPLIED keys and it drops them
+            // itself when the window reads none.
+            pins.feed(&x, &y, Some(&h))?
         } else {
             (
                 x.clone(),

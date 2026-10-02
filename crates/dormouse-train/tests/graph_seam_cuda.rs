@@ -304,7 +304,7 @@ fn run_graphed(
     for step in 0..steps {
         let (x, y, h) = batch(step, &dev);
         let (x, y, h) = if pin {
-            let p = pins.get_or_insert_with(|| InputPins::new(&x, &y, Some(&h)));
+            let p = pins.get_or_insert_with(|| InputPins::new(&x, &y, &h, true));
             p.feed(&x, &y, Some(&h)).expect("pin feeds")
         } else {
             (x, y, Some(h))
@@ -513,7 +513,7 @@ fn a_pinned_replays_gradients_are_bit_identical_to_fresh_launches() {
     for (step, ungraphed, label) in plan {
         let (x, y, h) = batch(step, &dev);
         let (x, y, h) = {
-            let p = pins.get_or_insert_with(|| InputPins::new(&x, &y, Some(&h)));
+            let p = pins.get_or_insert_with(|| InputPins::new(&x, &y, &h, true));
             p.feed(&x, &y, Some(&h)).expect("pin feeds")
         };
         seam.step(ungraphed, || {
@@ -693,7 +693,7 @@ fn a_replay_launches_no_kernels() {
     for step in 0..3 {
         let (x, y, h) = batch(step, &dev);
         let (x, y, h) = {
-            let p = pins.get_or_insert_with(|| InputPins::new(&x, &y, Some(&h)));
+            let p = pins.get_or_insert_with(|| InputPins::new(&x, &y, &h, true));
             p.feed(&x, &y, Some(&h)).expect("pin feeds")
         };
         // Step 0 runs plain (no graph yet), step 1 captures (and replays once
@@ -795,7 +795,7 @@ fn probe_which_steps_produce_zero_gradients() {
     for step in 0..4 {
         let (x, y, h) = batch(step, &dev);
         let (x, y, h) = {
-            let p = pins.get_or_insert_with(|| InputPins::new(&x, &y, Some(&h)));
+            let p = pins.get_or_insert_with(|| InputPins::new(&x, &y, &h, true));
             p.feed(&x, &y, Some(&h)).expect("pin feeds")
         };
         let kind = if step == 0 { "plain" } else if step == 1 { "capture" } else { "replay" };
@@ -894,7 +894,7 @@ fn probe_replay_matches_fresh_window() {
     for (step, ungraphed, label) in plan {
         let (x, y, h) = batch(step, &dev);
         let (x, y, h) = {
-            let p = pins.get_or_insert_with(|| InputPins::new(&x, &y, Some(&h)));
+            let p = pins.get_or_insert_with(|| InputPins::new(&x, &y, &h, true));
             p.feed(&x, &y, Some(&h)).expect("pin feeds")
         };
         seam.step(ungraphed, || {
