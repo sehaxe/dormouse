@@ -66,7 +66,12 @@ fn files_of(target: &str) -> Vec<PathBuf> {
 /// `N file(s) [name, name, (+K more)]` — a bar is a number only if you know
 /// which files it came from.
 fn names(files: &[PathBuf]) -> String {
-    let n = |p: &PathBuf| p.file_name().unwrap_or(p.as_os_str()).to_string_lossy().into_owned();
+    let n = |p: &PathBuf| {
+        p.file_name()
+            .unwrap_or(p.as_os_str())
+            .to_string_lossy()
+            .into_owned()
+    };
     let head: Vec<String> = files.iter().take(3).map(n).collect();
     if files.len() > 3 {
         format!("{}, +{} more", head.join(", "), files.len() - 3)
@@ -84,9 +89,14 @@ fn read_corpus(files: &[PathBuf], limit: usize) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::new();
     for f in files {
         if f.extension().map(|e| e == "gz").unwrap_or(false) {
-            out.extend_from_slice(&gunzip_to_vec(f).unwrap_or_else(|e| panic!("gunzip {}: {e}", f.display())));
+            out.extend_from_slice(
+                &gunzip_to_vec(f).unwrap_or_else(|e| panic!("gunzip {}: {e}", f.display())),
+            );
         } else {
-            out.extend_from_slice(&dormouse_data::read_bytes(std::slice::from_ref(f), limit.saturating_sub(out.len())));
+            out.extend_from_slice(&dormouse_data::read_bytes(
+                std::slice::from_ref(f),
+                limit.saturating_sub(out.len()),
+            ));
         }
         if limit > 0 && out.len() >= limit {
             break;
@@ -132,12 +142,30 @@ fn main() {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--bytes" => { bytes = args[i + 1].parse().unwrap(); i += 2; }
-            "--holdout" => { holdout = args[i + 1].parse().unwrap(); i += 2; }
-            "--order" => { order = args[i + 1].parse().unwrap(); i += 2; }
-            "--skip-header" => { skip_header = true; i += 1; }
-            "--fit" => { fit = Some(args[i + 1].clone()); i += 2; }
-            other => { eprintln!("unknown flag {other}"); std::process::exit(2); }
+            "--bytes" => {
+                bytes = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--holdout" => {
+                holdout = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--order" => {
+                order = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--skip-header" => {
+                skip_header = true;
+                i += 1;
+            }
+            "--fit" => {
+                fit = Some(args[i + 1].clone());
+                i += 2;
+            }
+            other => {
+                eprintln!("unknown flag {other}");
+                std::process::exit(2);
+            }
         }
     }
     // 0 fits no held-out window at all (every baseline divides 0 by 0 and
@@ -168,7 +196,11 @@ fn main() {
             .flat_map(|l| l.to_vec())
             .collect();
     }
-    assert!(data.len() > 10_000, "corpus too small for an anchor: {} B", data.len());
+    assert!(
+        data.len() > 10_000,
+        "corpus too small for an anchor: {} B",
+        data.len()
+    );
     // With --fit, the positional corpus is the SCORING window and the counters
     // are fitted on the other one - the trainer's own split, not our own.
     let mut fit_data: Vec<u8> = Vec::new();
@@ -251,11 +283,15 @@ fn main() {
 
     // unigram on train, scored on held-out
     let mut uni = [0u64; 256];
-    for &b in train { uni[b as usize] += 1; }
+    for &b in train {
+        uni[b as usize] += 1;
+    }
     let n = train.len() as f64;
     let uni_p = |b: u8| (uni[b as usize] as f64 + 1.0) / (n + 256.0);
     let mut h1 = 0.0f64;
-    for &b in test { h1 -= uni_p(b).log2(); }
+    for &b in test {
+        h1 -= uni_p(b).log2();
+    }
     let h1 = h1 / test.len() as f64;
     println!("unigram            {:>8.3} BPB", h1);
 
@@ -263,7 +299,10 @@ fn main() {
     let ctx: HashMap<Vec<u8>, HashMap<u8, u64>> = {
         let mut m: HashMap<Vec<u8>, HashMap<u8, u64>> = HashMap::new();
         for w in train.windows(order) {
-            *m.entry(w[..order - 1].to_vec()).or_default().entry(w[order - 1]).or_insert(0) += 1;
+            *m.entry(w[..order - 1].to_vec())
+                .or_default()
+                .entry(w[order - 1])
+                .or_insert(0) += 1;
         }
         m
     };
@@ -277,7 +316,10 @@ fn main() {
                 let tot: u64 = ctx[c].values().sum();
                 0.75 * (cnt as f64 / tot as f64) + 0.25 * uni_p(x)
             }
-            None => { misses += 1; uni_p(x) }
+            None => {
+                misses += 1;
+                uni_p(x)
+            }
         };
         hn -= p.max(1e-12).log2();
     }

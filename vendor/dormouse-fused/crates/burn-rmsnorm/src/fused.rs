@@ -1,6 +1,13 @@
 //! Fused RMSNorm CUDA kernel: x / sqrt(mean(x^2) + eps) * w in one launch
 //! (vs ~5 tensor passes). One cube per row, 256 threads, shared reduction.
 //!
+//! The launch is RUNTIME-AGNOSTIC: `CubeTensor` erases the cubecl runtime and
+//! the DEVICE picks it (`Device::cuda(0)` → PTX through LLVM; `Device::wgpu`
+//! → WGSL through cubecl-wgpu, i.e. AMD/Intel/lavapipe). The `wgpu` feature
+//! compiles this file unchanged and runs the kernel on wgpu — measured
+//! 2026-10-02, max rel err 0.0 vs the scalar reference on lavapipe
+//! (`tests/rmsnorm_kernel_wgpu.rs`). The name `rmsnorm_cuda` is historical.
+//!
 //! The seam accounting lives here (ADR-0019): `rmsnorm_cuda` returning `None`
 //! is a CORRECT tensor-ops answer, so a kernel that never engages looks
 //! exactly like one that does - on the trainer's backend it does not engage
@@ -12,7 +19,7 @@
 /// tensor path)`. `asked == skipped` is a DEAD kernel; `asked == 0` is a
 /// build without the cuda feature. Both are incremented on the two sides of
 /// the one `if let` in [`crate::RMSNorm::forward`], so they cannot disagree.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "wgpu"))]
 pub fn calls() -> (u64, u64) {
     (
         ASKED.load(std::sync::atomic::Ordering::Relaxed),
@@ -21,26 +28,26 @@ pub fn calls() -> (u64, u64) {
 }
 
 /// Seam counters (ADR-0019): one increment per ask, one per fallback.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "wgpu"))]
 pub static ASKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "wgpu"))]
 pub static SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// No fused path exists without the cuda feature, so nothing was asked and
 /// nothing was skipped. The trainer's eval line prints this as `0/0`.
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(any(feature = "cuda", feature = "wgpu")))]
 pub fn calls() -> (u64, u64) {
     (0, 0)
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "wgpu"))]
 use burn::backend::Backend;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "wgpu"))]
 use burn::tensor::Tensor;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "wgpu"))]
 use std::any::Any;
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "wgpu"))]
 use cubecl::prelude::*;
 
 /// Threads per cube. `#[comptime]` because `Shared::new_slice` sizes the
@@ -48,24 +55,23 @@ use cubecl::prelude::*;
 /// not be able to disagree. **Keeping it `#[comptime]` was NOT the fix**, though
 /// it was twice claimed to be (`34c5631`, then `9ac0377`) — the measurement is in
 /// `tests/lower_probe.rs` and the loop header below is the fix.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "wgpu"))]
 pub const THREADS: u32 = 256;
 /// `log2(THREADS)`, carried as its own `#[comptime]` parameter because the
 /// reduction's trip count has to be comptime — see the loop in
 /// [`rmsnorm_kernel`]. `fused_attnres.rs` carries the same quantity as
 /// `log_threads` for the same reason.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "wgpu"))]
 pub const LOG_THREADS: u32 = THREADS.trailing_zeros();
 
 /// The narrowest feature width the fused arm will accept, and the reason is a
 /// measured defect rather than a limitation of the algorithm — see the `d < 4`
 /// guard in [`rmsnorm_cuda`]. `d >= MIN_FUSED_D` is the only class measured to
 /// write all its cubes.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "wgpu"))]
 pub const MIN_FUSED_D: usize = 4;
 
-
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "wgpu"))]
 #[cube(launch_unchecked)]
 fn rmsnorm_kernel<F: Float>(
     x: &[F],       // [B*T, D]
@@ -147,8 +153,9 @@ fn rmsnorm_kernel<F: Float>(
     }
 }
 
-/// Fused RMSNorm on the bare CUDA backend. Returns `None` when the tensor is
-/// not on CUDA (caller falls back to the tensor path).
+/// Fused RMSNorm on the bare cubecl backend (CUDA, wgpu — whatever runtime the
+/// tensor's device names). Returns `None` when the tensor is not a cubecl
+/// tensor (caller falls back to the tensor path).
 ///
 /// **THERE IS NO BACKWARD, and that is the whole story of this function's
 /// reach.** `out` is a fresh `Tensor::empty` and the launch writes raw handles
@@ -160,7 +167,7 @@ fn rmsnorm_kernel<F: Float>(
 /// field is not `Disabled` (burn-dispatch `src/tensor.rs:481-487`). So: wiring
 /// this into a training forward means writing the adjoint first, not relaxing
 /// a `?`. Measured both ways in `tests/rmsnorm_kernel_cuda.rs`.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "wgpu"))]
 pub fn rmsnorm_cuda<B: Backend>(x: Tensor<2>, weight: Tensor<1>, eps: f32) -> Option<Tensor<2>>
 where
     burn::tensor::DispatchTensor: burn::backend::DispatchKindConversion<B>,

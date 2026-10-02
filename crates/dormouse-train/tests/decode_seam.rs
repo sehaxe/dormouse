@@ -56,7 +56,10 @@ fn input() -> Vec<u8> {
 #[test]
 fn decode_seam_matches_the_train_forward() {
     let cfg = cfg();
-    assert!(cfg.use_engram, "nano runs the Engram arm, and that is the arm under test");
+    assert!(
+        cfg.use_engram,
+        "nano runs the Engram arm, and that is the arm under test"
+    );
     let model = DormouseModel::new(&cfg, &dormouse_train::device());
     let bytes = input();
     let t = bytes.len();
@@ -64,12 +67,13 @@ fn decode_seam_matches_the_train_forward() {
     // The reference: exactly what the training step and the held-out eval do
     // on the in-VRAM path - ids, the raw keys, no targets.
     let ids: Vec<i64> = bytes.iter().map(|&b| b as i64).collect();
-    let x: Tensor<2, Int> = Tensor::from_data(
-        TensorData::new(ids, [1, t]),
-        &dormouse_train::device(),
-    );
+    let x: Tensor<2, Int> =
+        Tensor::from_data(TensorData::new(ids, [1, t]), &dormouse_train::device());
     let hashed: Tensor<3, Int> = Tensor::from_data(
-        TensorData::new(dormouse_data::raw_keys(&bytes), [1, t, dormouse_data::ORDERS.len()]),
+        TensorData::new(
+            dormouse_data::raw_keys(&bytes),
+            [1, t, dormouse_data::ORDERS.len()],
+        ),
         &dormouse_train::device(),
     );
     let (logits, ..) =
@@ -85,7 +89,11 @@ fn decode_seam_matches_the_train_forward() {
     probe::reset();
     let decoded = decode::next_byte_logits::<dormouse_train::Backend>(&model, &bytes);
 
-    assert_eq!(decoded.len(), reference.len(), "decode returned the wrong shape");
+    assert_eq!(
+        decoded.len(),
+        reference.len(),
+        "decode returned the wrong shape"
+    );
     let d = decoded
         .iter()
         .zip(&reference)
@@ -114,12 +122,14 @@ fn decode_reads_the_memory_rows_the_training_forward_reads() {
     let decoded_keys = probe::count(probe::ENGRAM_KEYS);
     let decoded_arms = probe::count(probe::ENGRAM);
     assert_eq!(
-        decoded_keys,
-        cfg.max_iter as u64,
+        decoded_keys, cfg.max_iter as u64,
         "decode read {decoded_keys} rows over {decoded_arms} branch entries; one per iteration is \
          what the trained forward does"
     );
-    assert_eq!(decoded_arms, cfg.max_iter as u64, "the memory branch ran once per iteration");
+    assert_eq!(
+        decoded_arms, cfg.max_iter as u64,
+        "the memory branch ran once per iteration"
+    );
 
     // The inert arm, spelled out: no keys, so no row read. This is the shape
     // `forward_bytes` had, and it is why the check above is not optional.
@@ -163,14 +173,22 @@ fn both_memory_arms_read_when_they_are_given_something() {
     let x: Tensor<2, Int> =
         Tensor::from_data(TensorData::new(ids, [1, t]), &dormouse_train::device());
     let keys: Tensor<3, Int> = Tensor::from_data(
-        TensorData::new(dormouse_data::raw_keys(&bytes), [1, t, dormouse_data::ORDERS.len()]),
+        TensorData::new(
+            dormouse_data::raw_keys(&bytes),
+            [1, t, dormouse_data::ORDERS.len()],
+        ),
         &dormouse_train::device(),
     );
 
     // The in-VRAM shape: keys, no rows.
     probe::reset();
-    let (_logits, ..) =
-        model.forward_with_hidden::<dormouse_train::Backend>(x.clone(), Some(keys), None, None, None);
+    let (_logits, ..) = model.forward_with_hidden::<dormouse_train::Backend>(
+        x.clone(),
+        Some(keys),
+        None,
+        None,
+        None,
+    );
     assert_eq!(
         probe::count(probe::ENGRAM_KEYS),
         cfg.max_iter as u64,
@@ -206,8 +224,14 @@ fn a_ram_trained_memory_is_refused_loudly() {
     ram.engram_rows = 1;
     let err = decode::refuse_unservable_memory(&ram)
         .expect_err("a one-row memory must be refused, not served");
-    assert!(err.contains(".ngram"), "the message must name the missing sidecar: {err}");
-    assert!(err.contains("--engram-ram"), "the message must name the cause: {err}");
+    assert!(
+        err.contains(".ngram"),
+        "the message must name the missing sidecar: {err}"
+    );
+    assert!(
+        err.contains("--engram-ram"),
+        "the message must name the cause: {err}"
+    );
 
     // The two shapes that ARE servable, so the refusal is not a blanket ban.
     let mut no_memory = cfg();

@@ -54,7 +54,9 @@ fn main() {
         // timed here - see docs/architecture/PLAN.md OPTIMIZATION BLOCKERS. Kept behind a
         // flag so the probe documents the blocker next to the numbers.
         let bf16_ms: Option<f64> = if std::env::var("GEMM_PROBE_BF16").is_ok() {
-            Some(time_ms(iters, warmup, || bf16_matmul::<Bare>(a.clone(), w.clone())))
+            Some(time_ms(iters, warmup, || {
+                bf16_matmul::<Bare>(a.clone(), w.clone())
+            }))
         } else {
             None
         };
@@ -76,7 +78,10 @@ fn main() {
             f32_ms,
             bf16_ms.unwrap_or(f64::NAN),
             cast_ms,
-            match bf16_ms { Some(b) => format!("{:.2}x", f32_ms / b), None => "broken".into() },
+            match bf16_ms {
+                Some(b) => format!("{:.2}x", f32_ms / b),
+                None => "broken".into(),
+            },
             flops / (f32_ms * 1e-3) / 1e12
         );
     }

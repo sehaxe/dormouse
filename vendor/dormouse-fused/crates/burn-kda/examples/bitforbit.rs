@@ -29,7 +29,13 @@ fn dump(t: &Tensor<4>, name: &str) {
     let dims = t.shape().dims::<4>();
     std::fs::write(
         format!("/tmp/opencode/kda_bfb/{name}.shape"),
-        format!("{}", dims.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(" ")),
+        format!(
+            "{}",
+            dims.iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
     )
     .expect("write shape");
     write_f32(name, &t.clone().into_data().to_vec::<f32>().expect("f32"));
@@ -39,7 +45,13 @@ fn dump3(t: &Tensor<3>, name: &str) {
     let dims = t.shape().dims::<3>();
     std::fs::write(
         format!("/tmp/opencode/kda_bfb/{name}.shape"),
-        format!("{}", dims.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(" ")),
+        format!(
+            "{}",
+            dims.iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
     )
     .expect("write shape");
     write_f32(name, &t.clone().into_data().to_vec::<f32>().expect("f32"));
@@ -90,17 +102,15 @@ fn main() {
 
     // path 2: chunked tensor path, RAW (before the output norm/gate/proj)
     let (q2, k2, v2, g2, bk2, bv2, _) = km.project_for_test(x.clone());
-    let st0 = Tensor::<4>::zeros([b, cfg.num_heads, cfg.head_dim, cfg.head_dim], &dev)
-        .cast(q2.dtype());
-    let (o_raw, state_chunk) =
-        chunk_wy_forward(q2, k2, v2, g2, bk2, bv2, st0, 1.0, cfg.chunk_size);
+    let st0 =
+        Tensor::<4>::zeros([b, cfg.num_heads, cfg.head_dim, cfg.head_dim], &dev).cast(q2.dtype());
+    let (o_raw, state_chunk) = chunk_wy_forward(q2, k2, v2, g2, bk2, bv2, st0, 1.0, cfg.chunk_size);
     dump(&o_raw, "o_raw");
     dump(&state_chunk, "state_chunk");
 
     // path 3: the full path (with output()) for end-to-end comparison
     let st3: Option<Tensor<4>> = None;
-    let (o_chunk, state_chunk3) =
-        km.forward_train_state::<burn::backend::NdArray>(x.clone(), st3);
+    let (o_chunk, state_chunk3) = km.forward_train_state::<burn::backend::NdArray>(x.clone(), st3);
     dump3(&o_chunk, "out_chunk");
     dump(&state_chunk3, "state_chunk3");
 
@@ -110,11 +120,7 @@ fn main() {
         &km.o_norm_w.val().to_data().to_vec::<f32>().expect("w"),
     );
     let wd = km.o_proj.weight.val().to_data().to_vec::<f32>().expect("w");
-    std::fs::write(
-        "/tmp/opencode/kda_bfb/o_proj_weight.shape",
-        format!("2"),
-    )
-    .expect("write shape");
+    std::fs::write("/tmp/opencode/kda_bfb/o_proj_weight.shape", format!("2")).expect("write shape");
     write_f32("o_proj_weight", &wd);
 
     println!("dumped to /tmp/opencode/kda_bfb");

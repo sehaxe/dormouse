@@ -219,7 +219,7 @@ different mechanism). **Not** on by default: `use_gr = false` in every preset
 
 ### TSCT / expert / LinearLike
 
-The low-rank spectral linear (`burn_sct::SpectralLinear`, masters `u`, `s`, `v`)
+The low-rank spectral linear (`burn_spectral::SpectralLinear`, masters `u`, `s`, `v`)
 behind every wide projection: each expert's `gate_up`/`down`, the loop readout,
 the `lm_head`, and GR's `wd`/`wu`/`ww`. `LinearLike` is the thin wrapper that
 pads `out_features` to a multiple of 4, picks a quant format, and retracts.

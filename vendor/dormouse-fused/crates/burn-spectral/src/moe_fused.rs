@@ -1124,12 +1124,7 @@ where
     let we_d = dense(we_t);
     let (c_idx, idx, g) = router_cuda(&x_d, &wp_d, &wc_d, &we_d, p, c, e, k)?;
     let g_prim = g.try_into_primitive::<CB>().unwrap();
-    let nodes = [
-        xa.node(),
-        wpa.node(),
-        wca.node(),
-        wea.node(),
-    ];
+    let nodes = [xa.node(), wpa.node(), wca.node(), wea.node()];
     let prep = RoutFwdOp.prepare::<S>(nodes);
     let g_adt = match prep.compute_bound().stateful() {
         OpsKind::Tracked(mut prep) => {
@@ -1626,13 +1621,7 @@ where
         &client, &x_d, &u_d, &v_d, &s_d, &idx_d, &g_d, b, dim_in, m, dim_out, k, rank,
     )?;
     let out_prim = out_t.try_into_primitive::<CB>().unwrap();
-    let nodes = [
-        xa.node(),
-        ua.node(),
-        va.node(),
-        sa.node(),
-        ga.node(),
-    ];
+    let nodes = [xa.node(), ua.node(), va.node(), sa.node(), ga.node()];
     let prep = MoeFwdOp.prepare::<S>(nodes);
     let out_adt = match prep.compute_bound().stateful() {
         OpsKind::Tracked(mut prep) => {
@@ -1751,9 +1740,7 @@ mod seam_tests {
     where
         DispatchTensor: DispatchKindConversion<Autodiff<Nd, S>> + DispatchKindConversion<Nd>,
     {
-        x.clone()
-            .try_into_primitive::<Autodiff<Nd, S>>()
-            .is_ok()
+        x.clone().try_into_primitive::<Autodiff<Nd, S>>().is_ok()
     }
 
     #[test]

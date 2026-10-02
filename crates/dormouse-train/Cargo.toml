@@ -35,7 +35,6 @@ toml = { workspace = true }
 half = "2"
 crc32fast = "1"
 burn = { workspace = true, features = ["std", "autodiff", "optim"] }
-burn-tensor = { workspace = true }
 burn-cuda = { workspace = true, features = ["std", "autotune"] }
 burn-dispatch = { version = "0.22.0-pre.4", default-features = false }
 cubecl-runtime = { version = "0.11.0-pre.4", default-features = false }
@@ -44,7 +43,6 @@ cubecl-cuda = { version = "0.11.0-pre.4", default-features = false }
 # future) and this is the only blocking executor on the stack.
 cubecl-environment = { version = "0.11.0-pre.4", default-features = false }
 cudarc = { workspace = true, features = ["driver"] }
-rand = { workspace = true }
 # Uses `Device::cuda(0)`, which only exists with the `cuda` feature. Without
 # this a plain `cargo check --all-targets` fails on it, and cargo stops
 # reporting targets after the first failure - so one ungated example hides

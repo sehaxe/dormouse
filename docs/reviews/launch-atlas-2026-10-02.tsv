@@ -1,0 +1,91 @@
+# per-run warm stage means (launches/step, ms/step actual, ms@24us)
+# run=base total=21427.2
+base	fwd	9002.5	237.5	216.1
+base	bwd	7026.3	245.8	168.6
+base	opt	3921.0	70.3	94.1
+base	retr	1311.5	25.1	31.5
+base	ema	165.9	2.8	4.0
+# run=nokda total=7385.6
+nokda	fwd	2757.0	149.1	66.2
+nokda	opt	1854.3	110.5	44.5
+nokda	retr	1315.6	84.7	31.6
+nokda	bwd	1296.4	79.8	31.1
+nokda	ema	162.3	8.0	3.9
+# run=jepa0 total=16645.0
+jepa0	bwd	6889.2	194.4	165.3
+jepa0	fwd	4600.8	126.7	110.4
+jepa0	opt	3845.4	80.8	92.3
+jepa0	retr	1309.6	35.5	31.4
+jepa0	ema	0.0	0.0	0.0
+# run=exp1 total=18215.8
+exp1	fwd	7780.5	236.8	186.7
+exp1	bwd	6631.7	186.0	159.2
+exp1	opt	3019.6	50.3	72.5
+exp1	retr	656.4	14.2	15.8
+exp1	ema	127.6	2.3	3.1
+# run=iter2 total=13649.0
+iter2	fwd	4552.2	105.7	109.3
+iter2	opt	3921.2	71.7	94.1
+iter2	bwd	3687.2	89.7	88.5
+iter2	retr	1320.7	26.7	31.7
+iter2	ema	167.7	2.9	4.0
+# run=cross total=5860.1
+cross	opt	1892.3	76.4	45.4
+cross	fwd	1454.7	23.4	34.9
+cross	retr	1359.5	25.3	32.6
+cross	bwd	1153.6	20.9	27.7
+cross	ema	0.0	0.0	0.0
+# run=engramon total=22378.8
+engramon	fwd	9346.8	907.3	224.3
+engramon	bwd	7488.4	681.9	179.7
+engramon	opt	4074.1	301.3	97.8
+engramon	retr	1307.1	124.0	31.4
+engramon	ema	162.4	14.1	3.9
+
+# arm deltas vs base (launches/step by stage; negative = removed by the toggle)
+# arm=nokda total_delta=-14041.6 (-65.5% of base)
+nokda	fwd	-6245.5	-149.9
+nokda	bwd	-5729.9	-137.5
+nokda	opt	-2066.7	-49.6
+nokda	ema	-3.6	-0.1
+nokda	retr	+4.1	+0.1
+# arm=jepa0 total_delta=-4782.2 (-22.3% of base)
+jepa0	fwd	-4401.7	-105.6
+jepa0	ema	-165.9	-4.0
+jepa0	bwd	-137.1	-3.3
+jepa0	opt	-75.6	-1.8
+jepa0	retr	-1.9	-0.0
+# arm=exp1 total_delta=-3211.4 (-15.0% of base)
+exp1	fwd	-1222.0	-29.3
+exp1	opt	-901.4	-21.6
+exp1	retr	-655.1	-15.7
+exp1	bwd	-394.6	-9.5
+exp1	ema	-38.3	-0.9
+# arm=iter2 total_delta=-7778.2 (-36.3% of base)
+iter2	fwd	-4450.3	-106.8
+iter2	bwd	-3339.1	-80.1
+iter2	ema	+1.8	+0.0
+iter2	retr	+9.2	+0.2
+# arm=cross total_delta=-15567.1 (-72.7% of base)
+cross	fwd	-7547.8	-181.1
+cross	bwd	-5872.7	-140.9
+cross	opt	-2028.7	-48.7
+cross	ema	-165.9	-4.0
+cross	retr	+48.0	+1.2
+# arm=engramon total_delta=+951.6 (+4.4% of base)
+engramon	retr	-4.4	-0.1
+engramon	ema	-3.5	-0.1
+engramon	opt	+153.1	+3.7
+engramon	fwd	+344.3	+8.3
+engramon	bwd	+462.1	+11.1
+
+# main/teacher KDA split (cross = --no-kda --jepa-weight 0)
+# cell	stage	launches_per_step
+main_kda_fwd	fwd	3146.1
+teacher_kda_fwd	fwd	3099.4
+main_nonkda_fwd_incl_const	fwd	1454.7
+teacher_nonkda_fwd	fwd	1302.3
+main_kda_bwd	bwd	5735.6
+aux_heads_bwd	bwd	137.1
+main_nonkda_bwd_incl_const	bwd	1153.6
+aux_heads_opt	opt	75.6

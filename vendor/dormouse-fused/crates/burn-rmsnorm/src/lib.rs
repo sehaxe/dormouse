@@ -40,7 +40,7 @@ impl RMSNorm {
 
     pub fn forward(&self, x: Tensor<3>) -> Tensor<3> {
         let [_, _, d] = x.dims();
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "wgpu"))]
         {
             let [b, t, _] = x.dims();
             if let Some(out) = crate::fused::rmsnorm_cuda::<burn_cubecl::CubeBackend>(

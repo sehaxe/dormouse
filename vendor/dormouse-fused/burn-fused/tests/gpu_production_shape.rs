@@ -63,8 +63,8 @@
 
 use burn::backend::{AutodiffBackend, BackendTypes};
 use burn::tensor::{Device, Distribution, Tensor};
-use burn_fused::burn_autodiff::Autodiff;
 use burn_fused::burn_autodiff::checkpoint::strategy::BalancedCheckpointing;
+use burn_fused::burn_autodiff::Autodiff;
 use burn_fused::burn_gdn2::{
     backend_matches, chunk_dispatch, chunk_wy_forward, fused_calls, reset_fused_calls, CudaBare,
     Fused,
@@ -250,13 +250,19 @@ fn gated_delta_chunk_path_runs_at_the_production_shape() {
 
     // The gradients, the same comparison, off the forward already computed.
     let ref_grads = (plain_out.powf_scalar(2.0).sum() + plain_st.powf_scalar(2.0).sum()).backward();
-    for (name, t) in ["q", "k", "v", "g", "b", "w", "s0"].iter().zip(inputs.iter()) {
+    for (name, t) in ["q", "k", "v", "g", "b", "w", "s0"]
+        .iter()
+        .zip(inputs.iter())
+    {
         let rel = rel_diff(
             t.grad(&grads).unwrap().clone(),
             t.grad(&ref_grads).unwrap().clone(),
         );
         println!("{name}: grad rel={rel:.2e}");
         let tol = if *name == "k" { 1e-1 } else { 1e-2 };
-        assert!(rel < tol, "{name}: grad mismatch rel={rel:.2e} (tol {tol:.0e})");
+        assert!(
+            rel < tol,
+            "{name}: grad mismatch rel={rel:.2e} (tol {tol:.0e})"
+        );
     }
 }

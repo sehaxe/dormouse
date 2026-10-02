@@ -41,7 +41,8 @@ fn install_pool(c: &burn_cubecl::cubecl::client::Client) {
     let _ = burn_cubecl::cubecl::client::Client::install_memory_pools(c, &cfg);
 }
 
-fn env_usize(k: &str, d: usize) -> usize {    std::env::var(k)
+fn env_usize(k: &str, d: usize) -> usize {
+    std::env::var(k)
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(d)
@@ -73,10 +74,12 @@ fn chunk() -> usize {
 fn client() -> burn_cubecl::cubecl::client::Client {
     let dev: burn::tensor::Device = Default::default();
     let t = Tensor::<1>::zeros([1], &dev);
-    let prim = t.try_into_primitive::<CudaBare>().ok().expect("cuda tensor");
-    let cube: &burn_cubecl::tensor::CubeTensor = (&prim as &dyn Any)
-        .downcast_ref()
-        .expect("CubeTensor");
+    let prim = t
+        .try_into_primitive::<CudaBare>()
+        .ok()
+        .expect("cuda tensor");
+    let cube: &burn_cubecl::tensor::CubeTensor =
+        (&prim as &dyn Any).downcast_ref().expect("CubeTensor");
     cube.client.clone()
 }
 
@@ -166,21 +169,37 @@ fn measure(
     let iters_bwd = alloc_trace::chunk_iterations() - iters_fwd;
 
     println!("\n=== {what} ===");
-    println!("shape b={} t={} h={} K={} V={} chunk={}", b(), t(), h(), k(), v(), chunk());
+    println!(
+        "shape b={} t={} h={} K={} V={} chunk={}",
+        b(),
+        t(),
+        h(),
+        k(),
+        v(),
+        chunk()
+    );
     println!(
         "{:<9} {:>9} {:>8} {:>10} {:>12}",
         "phase", "ms", "+allocs", "+MB live", "+MB reserved"
     );
     println!(
         "{:<9} {:>9.3} {:>8} {:>10.2} {:>12.2}",
-        "forward", fwd_ms, d_fwd.allocs, mb(d_fwd.in_use), mb(d_fwd.reserved)
+        "forward",
+        fwd_ms,
+        d_fwd.allocs,
+        mb(d_fwd.in_use),
+        mb(d_fwd.reserved)
     );
     println!(
         "{:<9} {:>9.3} {:>8} {:>10.2} {:>12.2}",
-        "backward", bwd_ms, d_bwd.allocs, mb(d_bwd.in_use), mb(d_bwd.reserved)
+        "backward",
+        bwd_ms,
+        d_bwd.allocs,
+        mb(d_bwd.in_use),
+        mb(d_bwd.reserved)
     );
-    let traced: u64 = fwd_sites.iter().map(|e| e.2).sum::<u64>()
-        + bwd_sites.iter().map(|e| e.2).sum::<u64>();
+    let traced: u64 =
+        fwd_sites.iter().map(|e| e.2).sum::<u64>() + bwd_sites.iter().map(|e| e.2).sum::<u64>();
     let measured = d_fwd.in_use.max(0) as u64 + d_bwd.in_use.max(0) as u64;
     println!(
         "accounted: traced {:.2} MB of {:.2} MB live ({:.0}%)",
@@ -239,23 +258,19 @@ fn inputs(dev: &burn::tensor::Device) -> [Tensor<4>; 7] {
 fn alloc_fused_node() {
     let c = client();
     install_pool(&c);
-    measure(
-        "fused node, Autodiff<Cuda> (NoCheckpointing)",
-        &c,
-        |inp| {
-            chunk_autodiff_or_plain::<CudaBare>(
-                inp[0].clone(),
-                inp[1].clone(),
-                inp[2].clone(),
-                inp[3].clone(),
-                inp[4].clone(),
-                inp[5].clone(),
-                inp[6].clone(),
-                1.0,
-                chunk(),
-            )
-        },
-    );
+    measure("fused node, Autodiff<Cuda> (NoCheckpointing)", &c, |inp| {
+        chunk_autodiff_or_plain::<CudaBare>(
+            inp[0].clone(),
+            inp[1].clone(),
+            inp[2].clone(),
+            inp[3].clone(),
+            inp[4].clone(),
+            inp[5].clone(),
+            inp[6].clone(),
+            1.0,
+            chunk(),
+        )
+    });
 }
 
 /// The trainer's exact backend. `burn-kda`'s `is_autodiff_cuda` guard compares

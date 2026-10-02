@@ -35,8 +35,8 @@
 
 use burn::backend::{Backend, DispatchKindConversion};
 use burn::tensor::{Device, DispatchTensor, Distribution, FloatDType, Tensor};
-use burn_gdn2::CudaBare;
 use burn_gdn2::kernel::chunk_cube::cuda::fused_chunk_forward_scratch;
+use burn_gdn2::CudaBare;
 use cubecl::prelude::*;
 use std::any::Any;
 
@@ -49,12 +49,12 @@ type B = CudaBare;
 /// contains no bf16 value, so the LLVM backend can lower all of it.
 #[cube(launch_unchecked)]
 fn bf16_dot_kernel(
-    lhs: &[u16],    // [rows, k] bf16 bits
-    rhs: &[u16],    // [rows, k] bf16 bits
+    lhs: &[u16],     // [rows, k] bf16 bits
+    rhs: &[u16],     // [rows, k] bf16 bits
     out: &mut [f32], // [rows] the f32 accumulator result
     rt: &mut [u16],  // [2*rows] f32 -> bf16, round-to-nearest-even; one word
-                     // per f32 element's low half, so the host readback stays
-                     // a plain f32 read
+    // per f32 element's low half, so the host readback stays
+    // a plain f32 read
     #[comptime] k: u32,
 ) {
     let row = CUBE_POS_X as usize;
@@ -172,10 +172,9 @@ fn bf16_storage_with_f32_accumulation() {
         }
         want[r] = s;
     }
-    let max_rel = want
-        .iter()
-        .zip(got.iter())
-        .fold(0f64, |m, (w, g)| m.max((w - *g as f64).abs() / w.abs().max(1e-6)));
+    let max_rel = want.iter().zip(got.iter()).fold(0f64, |m, (w, g)| {
+        m.max((w - *g as f64).abs() / w.abs().max(1e-6))
+    });
     println!("bf16 storage + f32 acc: max rel err vs f64 = {max_rel:.3e} over {rows}x{k} dots");
     // bf16 eps is 2^-8 = 3.9e-3. Landing under 1e-5 proves the accumulator is
     // f32 and the operands were expanded to f32, not accumulated in bf16.
@@ -190,8 +189,7 @@ fn bf16_storage_with_f32_accumulation() {
         let host = f32::from(half::bf16::from_f32(got[r]));
         let host_word = (host.to_bits() >> 16) as u16;
         assert_eq!(
-            rt_got[r],
-            host_word,
+            rt_got[r], host_word,
             "row {r}: kernel bf16 word {:#06x} != host RNE {:#06x} ({host:e})",
             rt_got[r], host_word,
         );
@@ -223,9 +221,8 @@ fn fused_chunk_gate_is_f32_only() {
     let cs = 16usize;
 
     let f = mk();
-    let fused_f32 = fused_chunk_forward_scratch::<B>(
-        f.0, f.1, f.2, f.3, f.4, f.5, state.clone(), 1.0, cs,
-    );
+    let fused_f32 =
+        fused_chunk_forward_scratch::<B>(f.0, f.1, f.2, f.3, f.4, f.5, state.clone(), 1.0, cs);
     assert!(fused_f32.is_some(), "f32 must take the fused kernels");
     println!("fused gate: f32            -> fused kernels (3 launches per sequence)");
 
@@ -255,8 +252,7 @@ fn fused_chunk_gate_is_f32_only() {
     // the K/exp(cumsum g) factor in f32.
     let big = 32usize;
     let f = mk();
-    let f_big =
-        fused_chunk_forward_scratch::<B>(f.0, f.1, f.2, f.3, f.4, f.5, state, 1.0, big);
+    let f_big = fused_chunk_forward_scratch::<B>(f.0, f.1, f.2, f.3, f.4, f.5, state, 1.0, big);
     assert!(f_big.is_none(), "chunk 32 must fall back (underflow limit)");
     println!("fused gate: chunk 32       -> tensor-ops fallback (f32 underflow below -88)");
 }

@@ -143,10 +143,15 @@ fn the_chunk_op_produces_a_real_parameter_gradient_on_cuda() {
     let base = km.clone();
     let w0 = host(&base.q_proj.weight.val());
     let shape = [c.hidden_size, c.num_heads * c.head_dim];
-    assert_eq!(w0.len(), shape[0] * shape[1], "unexpected q_proj.weight shape");
+    assert_eq!(
+        w0.len(),
+        shape[0] * shape[1],
+        "unexpected q_proj.weight shape"
+    );
     let loss_at = |w: Vec<f32>| -> f32 {
         let mut m = base.clone();
-        m.q_proj.weight = Param::from_tensor(Tensor::<2>::from_data(TensorData::new(w, shape), &ad));
+        m.q_proj.weight =
+            Param::from_tensor(Tensor::<2>::from_data(TensorData::new(w, shape), &ad));
         let (yy, ss) = m.forward_train_state::<AdBal>(x.clone(), None);
         yy.powf_scalar(2.0)
             .sum()

@@ -227,14 +227,12 @@ fn sinkhorn_backward_cuda(
     if n * n * 2 + iters * 2 * n > 12000 {
         return None;
     }
-    let cube =
-        |x: &Tensor<4>| -> Option<burn_cubecl::tensor::CubeTensor> {
-            type B = burn_cubecl::CubeBackend;
-            let prim = x.clone().try_into_primitive::<B>().ok()?;
-            let c = (&prim as &dyn std::any::Any)
-                .downcast_ref::<burn_cubecl::tensor::CubeTensor>()?;
-            Some(c.clone())
-        };
+    let cube = |x: &Tensor<4>| -> Option<burn_cubecl::tensor::CubeTensor> {
+        type B = burn_cubecl::CubeBackend;
+        let prim = x.clone().try_into_primitive::<B>().ok()?;
+        let c = (&prim as &dyn std::any::Any).downcast_ref::<burn_cubecl::tensor::CubeTensor>()?;
+        Some(c.clone())
+    };
     let lc = cube(logits)?;
     let dc = cube(d_out)?;
     let dlogits = Tensor::<4>::empty([b, t, n, n], &logits.device());
@@ -268,9 +266,7 @@ pub fn sinkhorn_cuda(x: &mut Tensor<4>, iters: usize) -> bool {
     let Some(prim) = prim else {
         return false;
     };
-    let Some(xc) = (&prim as &dyn Any)
-        .downcast_ref::<burn_cubecl::tensor::CubeTensor>()
-    else {
+    let Some(xc) = (&prim as &dyn Any).downcast_ref::<burn_cubecl::tensor::CubeTensor>() else {
         return false;
     };
     let client = xc.client.clone();
@@ -358,6 +354,9 @@ mod tests {
 
 #[cfg(feature = "autodiff")]
 mod ad {
+    use crate::sinkhorn_cuda::note_entry_reached;
+    #[cfg(feature = "cuda")]
+    use crate::sinkhorn_cuda::{note_fused_backward, note_fused_forward};
     use burn::backend::{Backend, DispatchKindConversion};
     use burn::tensor::{DispatchTensor, Tensor};
     use burn_autodiff::checkpoint::base::Checkpointer;
@@ -365,9 +364,6 @@ mod ad {
     use burn_autodiff::grads::Gradients;
     use burn_autodiff::ops::{Backward, Ops, OpsKind};
     use burn_autodiff::Autodiff;
-    use crate::sinkhorn_cuda::note_entry_reached;
-    #[cfg(feature = "cuda")]
-    use crate::sinkhorn_cuda::{note_fused_backward, note_fused_forward};
 
     #[derive(Debug)]
     struct SinkhornOp;
@@ -529,8 +525,10 @@ mod seam_tests {
     use super::*;
     use burn::backend::DispatchKindConversion;
     use burn::tensor::{Device, DispatchTensor};
+    use burn_autodiff::checkpoint::strategy::{
+        BalancedCheckpointing, CheckpointStrategy, NoCheckpointing,
+    };
     use burn_autodiff::Autodiff as Ad;
-    use burn_autodiff::checkpoint::strategy::{BalancedCheckpointing, CheckpointStrategy, NoCheckpointing};
 
     type Nd = burn_ndarray::NdArray;
 
@@ -547,7 +545,9 @@ mod seam_tests {
         let x = Tensor::<4>::ones([2, 2, 4, 4], &dev);
 
         reset_seam_counts();
-        let base = seam_counts().expect("autodiff feature is on in this test").0;
+        let base = seam_counts()
+            .expect("autodiff feature is on in this test")
+            .0;
 
         assert!(reach::<BalancedCheckpointing>(&x).is_some());
         assert_eq!(
@@ -599,11 +599,9 @@ mod seam_tests {
             // constant in every entry, so `dL/dlogits` is legitimately zero and
             // this gate would be green for the wrong reason - the same shape as
             // the constant fixture that let 511daa5's score-form defect through.
-            let x = Tensor::<4>::from_floats(
-                [[[[0.9, 0.3, -0.7, 1.1], [0.2, -0.4, 0.9, 0.1]]]],
-                &dev,
-            )
-            .require_grad();
+            let x =
+                Tensor::<4>::from_floats([[[[0.9, 0.3, -0.7, 1.1], [0.2, -0.4, 0.9, 0.1]]]], &dev)
+                    .require_grad();
             let out = sinkhorn_autodiff_s::<Nd, S>(x.clone(), 2).expect("the seam accepts this");
             let grads = out.powf_scalar(2.0).sum().backward();
             let g = x.grad(&grads).expect("a leaf input must carry a gradient");

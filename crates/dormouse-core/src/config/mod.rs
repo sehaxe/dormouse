@@ -34,11 +34,11 @@
 //! lives with the trainer because the exempt key list is a property of resume.
 
 pub mod loader;
+pub mod r#override;
 pub mod schema;
 pub mod validation;
-pub mod r#override;
 
 pub use loader::load_config;
+pub use r#override::{apply_overrides, parse_overrides, Override};
 pub use schema::{ActQuant, DormouseConfig};
 pub use validation::validate;
-pub use r#override::{apply_overrides, parse_overrides, Override};

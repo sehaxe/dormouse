@@ -37,7 +37,15 @@ fn inputs(
     k: usize,
     v: usize,
     dev: &Device,
-) -> (Tensor<4>, Tensor<4>, Tensor<4>, Tensor<4>, Tensor<4>, Tensor<4>, Tensor<4>) {
+) -> (
+    Tensor<4>,
+    Tensor<4>,
+    Tensor<4>,
+    Tensor<4>,
+    Tensor<4>,
+    Tensor<4>,
+    Tensor<4>,
+) {
     let r4 = |shape: [usize; 4], m: f64, s: f64| {
         Tensor::<4>::random(shape, Distribution::Normal(m, s), dev)
     };
@@ -135,12 +143,20 @@ fn the_two_entry_points_agree_on_the_forward() {
     let (q, kk, vv, g, bb, w, st) = inputs(b, h, t, k, v, &dev);
     let scale = (k as f64).powf(-0.5);
 
-    let (out_a, state_a) =
-        fused_chunk_forward::<B>(q.clone(), kk.clone(), vv.clone(), g.clone(), bb.clone(), w.clone(), st.clone(), scale, c)
-            .expect("fused forward declined");
-    let (out_b, state_b, _io) =
-        fused_chunk_forward_scratch::<B>(q, kk, vv, g, bb, w, st, scale, c)
-            .expect("fused forward declined");
+    let (out_a, state_a) = fused_chunk_forward::<B>(
+        q.clone(),
+        kk.clone(),
+        vv.clone(),
+        g.clone(),
+        bb.clone(),
+        w.clone(),
+        st.clone(),
+        scale,
+        c,
+    )
+    .expect("fused forward declined");
+    let (out_b, state_b, _io) = fused_chunk_forward_scratch::<B>(q, kk, vv, g, bb, w, st, scale, c)
+        .expect("fused forward declined");
 
     let d_out = (out_a.clone() - out_b.clone())
         .abs()
@@ -159,6 +175,12 @@ fn the_two_entry_points_agree_on_the_forward() {
         .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
         .fold(0.0f32, f32::max);
     println!("module vs scratch entry: out {d_out:.3e}, state {d_st:.3e}");
-    assert_eq!(d_out, 0.0, "out differs between the two entry points: {d_out:.3e}");
-    assert_eq!(d_st, 0.0, "state differs between the two entry points: {d_st:.3e}");
+    assert_eq!(
+        d_out, 0.0,
+        "out differs between the two entry points: {d_out:.3e}"
+    );
+    assert_eq!(
+        d_st, 0.0,
+        "state differs between the two entry points: {d_st:.3e}"
+    );
 }

@@ -93,11 +93,7 @@ fn aux_of(v: Option<burn::tensor::Tensor<1>>) -> f32 {
 /// Mean |a - b| elementwise. Well-conditioned, unlike an L1 mean over the two
 /// candidates (a random-sign sum, which cancels).
 fn mean_abs_diff(a: &Tensor<3>, b: &Tensor<3>) -> f32 {
-    a.clone()
-        .sub(b.clone())
-        .abs()
-        .mean()
-        .into_scalar::<f32>()
+    a.clone().sub(b.clone()).abs().mean().into_scalar::<f32>()
 }
 
 /// Teacher and student are the same network (EMA at momentum 0, the train
@@ -126,7 +122,13 @@ fn teacher_target_is_the_student_latent() {
     let reference = |t: Tensor<3>| -> f32 {
         aux_of(
             model
-                .forward_with_jepa_targets::<B>(x.clone(), Some(h.clone()), None, Some(y.clone()), Some(t))
+                .forward_with_jepa_targets::<B>(
+                    x.clone(),
+                    Some(h.clone()),
+                    None,
+                    Some(y.clone()),
+                    Some(t),
+                )
                 .3,
         )
     };
@@ -136,7 +138,9 @@ fn teacher_target_is_the_student_latent() {
     // latent, 10x): the aux channel must be SENSITIVE to the teacher latent,
     // or "online == correct" above could be two constants in a dead channel.
     let loud = reference(
-        model.forward_latent::<B>(x.clone(), Some(h.clone()), None).mul_scalar(10.0),
+        model
+            .forward_latent::<B>(x.clone(), Some(h.clone()), None)
+            .mul_scalar(10.0),
     );
     // ... and the two candidate INPUTS must be far apart as latents, so the
     // substitution under test is a real one. This is elementwise, so unlike an
@@ -158,7 +162,13 @@ fn teacher_target_is_the_student_latent() {
 
     let got = aux_of(
         model
-            .forward_with_hidden::<B>(x.clone(), Some(h.clone()), None, Some(y.clone()), Some(&teacher))
+            .forward_with_hidden::<B>(
+                x.clone(),
+                Some(h.clone()),
+                None,
+                Some(y.clone()),
+                Some(&teacher),
+            )
             .3,
     );
 
@@ -207,8 +217,7 @@ fn teacher_engram_arm_runs() {
     let _ = model.forward_with_hidden::<B>(x.clone(), Some(h.clone()), None, Some(y.clone()), None);
     let student = probe::count(probe::ENGRAM_KEYS);
     assert_eq!(
-        student,
-        cfg.max_iter as u64,
+        student, cfg.max_iter as u64,
         "the student's Engram arm must read a row per iteration, else this \
          test proves nothing (arm off, or the keys were dropped)"
     );

@@ -1,4 +1,4 @@
-//! param - TSCT linear via burn-sct SpectralLinear, pad to multiple of 4,
+//! param - TSCT linear via burn-spectral SpectralLinear, pad to multiple of 4,
 //! NM knob, BF16 env (mirrors aria semantics; fresh mini composition)
 //!
 //! # What [`LinearLike`] is for
@@ -31,9 +31,9 @@
 //! * **Mixed dtypes NaN on this stack.** Every caller casts to fp32 before a
 //!   `LinearLike` and back after; the bf16 matmul path keeps an fp32 graph.
 
+use burn::backend::DispatchKindConversion;
 use burn::module::{Module, Param, ParamId};
 use burn::tensor::{Device, DispatchTensor, Tensor};
-use burn::backend::DispatchKindConversion;
 use burn_spectral::SpectralLinear;
 
 /// What one of a [`LinearLike`]'s parameters IS, structurally - no optimizer
@@ -145,7 +145,9 @@ impl LinearLike {
             out_features
         };
         Self {
-            inner: LinearLikeInner::Dense(burn::nn::LinearConfig::new(in_features, padded).init(device)),
+            inner: LinearLikeInner::Dense(
+                burn::nn::LinearConfig::new(in_features, padded).init(device),
+            ),
             out_features,
         }
     }
@@ -186,7 +188,10 @@ impl LinearLike {
         let y = match &self.inner {
             LinearLikeInner::Tsct(l) => {
                 if quant_debug_on() {
-                    println!("[ll] quant={:?} out={} bf16_compute={}", l.quant, l.out_features, l.bf16_compute);
+                    println!(
+                        "[ll] quant={:?} out={} bf16_compute={}",
+                        l.quant, l.out_features, l.bf16_compute
+                    );
                 }
                 if l.bf16_compute {
                     // bf16 matmuls (tensor cores) with the fp32 autodiff
@@ -227,7 +232,10 @@ impl LinearLike {
     /// WITHOUT `..` on purpose: a new leaf here is a compile error, not a
     /// parameter nobody declared a group for.
     pub fn param_kinds(&self) -> Vec<(ParamId, LinearParam)> {
-        let Self { inner, out_features: _ } = self;
+        let Self {
+            inner,
+            out_features: _,
+        } = self;
         match inner {
             LinearLikeInner::Tsct(l) => vec![
                 (l.u.id, LinearParam::Factor),
@@ -305,8 +313,7 @@ impl LinearLike {
                 let v = l.v.val();
                 let ku = u.dims()[1].max(1) as f32;
                 let kv = v.dims()[1].max(1) as f32;
-                (burn_spectral::ortho_error(&u) / ku)
-                    .max(burn_spectral::ortho_error(&v) / kv)
+                (burn_spectral::ortho_error(&u) / ku).max(burn_spectral::ortho_error(&v) / kv)
             }
             _ => 0.0,
         }
@@ -317,7 +324,9 @@ impl LinearLike {
     /// whole model is dense — the eval line reads that as "no TSCT here" and
     /// prints no field rather than printing `inf`.
     pub fn fold_tsct_diag(&self, agg: &mut TsctDiag) {
-        let LinearLikeInner::Tsct(l) = &self.inner else { return };
+        let LinearLikeInner::Tsct(l) = &self.inner else {
+            return;
+        };
         agg.alpha = agg.alpha.max(l.alpha);
         let (u, v) = (l.u.val(), l.v.val());
         agg.fwd = agg
@@ -371,7 +380,13 @@ impl Default for TsctDiag {
     /// distinguishable from it. A derive would hand out the 0 that
     /// [`Self::field`] reads as "a model with no TSCT factors".
     fn default() -> Self {
-        Self { fwd: 0.0, s_min: f32::INFINITY, s_max: 0.0, off: 0, alpha: 0.0 }
+        Self {
+            fwd: 0.0,
+            s_min: f32::INFINITY,
+            s_max: 0.0,
+            off: 0,
+            alpha: 0.0,
+        }
     }
 }
 

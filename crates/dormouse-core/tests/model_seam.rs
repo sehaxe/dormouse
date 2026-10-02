@@ -32,8 +32,11 @@ fn device() -> Device {
 /// arms, vocab 256) stays nano; only the widths shrink. use_gr stays false
 /// and bf16 stays off (CPU is fp32-only anyway).
 fn nano_cfg() -> DormouseConfig {
-    dormouse_core::config::load_config(concat!(env!("CARGO_MANIFEST_DIR"), "/../../configs/nano.toml"))
-        .expect("configs/nano.toml loads")
+    dormouse_core::config::load_config(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../configs/nano.toml"
+    ))
+    .expect("configs/nano.toml loads")
 }
 
 fn mini_nano() -> DormouseConfig {
@@ -152,9 +155,7 @@ fn grad_norm(model: &DormouseModel, grads: &burn::tensor::Gradients) -> f32 {
     }
     let mut v = NormVisitor { grads, acc: None };
     model.visit(&mut v);
-    v.acc
-        .map(|t| t.sqrt().into_scalar::<f32>())
-        .unwrap_or(0.0)
+    v.acc.map(|t| t.sqrt().into_scalar::<f32>()).unwrap_or(0.0)
 }
 
 /// Mini-nano, batch 2 s128 random bytes: the full forward seam runs, every
@@ -173,8 +174,7 @@ fn forward_smoke() {
 
     // No teacher: the JEPA term drops (needs the EMA copy) but DSpark keeps
     // `aux` alive at nano's dspark_weight = 0.1.
-    let (logits, rec, kda, aux) =
-        model.forward_with_hidden::<B>(x, Some(h), None, Some(y), None);
+    let (logits, rec, kda, aux) = model.forward_with_hidden::<B>(x, Some(h), None, Some(y), None);
 
     assert_eq!(logits.dims(), [b, s, cfg.vocab]);
     assert_eq!(rec.dims(), [1]);
@@ -300,7 +300,8 @@ fn seeded_init_is_a_pure_function_of_the_seed_on_a_clean_stream() {
                 self.stack.pop();
             }
             fn visit_float<const D: usize>(&mut self, p: &Param<Tensor<D>>) {
-                self.out.push((self.stack.join("."), p.val().into_data().bytes.to_vec()));
+                self.out
+                    .push((self.stack.join("."), p.val().into_data().bytes.to_vec()));
             }
         }
         let mut c = C::default();
@@ -313,7 +314,10 @@ fn seeded_init_is_a_pure_function_of_the_seed_on_a_clean_stream() {
         w2.len(),
         "the two builds disagree on how many float parameters there are"
     );
-    assert!(!w1.is_empty(), "the visitor found no float parameters at all");
+    assert!(
+        !w1.is_empty(),
+        "the visitor found no float parameters at all"
+    );
     let mut wdiff = 0usize;
     let mut wdiff_at = String::new();
     for ((n1, b1), (n2, b2)) in w1.iter().zip(w2.iter()) {
@@ -354,7 +358,8 @@ fn seeded_init_is_a_pure_function_of_the_seed_on_a_clean_stream() {
                 self.stack.pop();
             }
             fn visit_float<const D: usize>(&mut self, p: &Param<Tensor<D>>) {
-                self.out.push((self.stack.join("."), p.val().into_data().bytes.to_vec()));
+                self.out
+                    .push((self.stack.join("."), p.val().into_data().bytes.to_vec()));
             }
         }
         let mut c = C::default();
@@ -373,12 +378,11 @@ fn seeded_init_is_a_pure_function_of_the_seed_on_a_clean_stream() {
          comparing the same model twice",
         w1.len()
     );
-    let fwd = |m: &DormouseModel| m.forward::<B>(x.clone(), Some(h.clone())).into_data();
+    let _fwd = |m: &DormouseModel| m.forward::<B>(x.clone(), Some(h.clone())).into_data();
     // The forward is NOT compared across the two builds: the weights differ
     // (consumed stream, above), so a logits comparison here would measure the
     // weights, not the forward. Forward determinism on a FIXED model is already
     // pinned by the `determinism` test above, which runs one model twice.
-
 }
 
 /// Full nano preset, single sequence s8192, forward AND backward through
@@ -398,8 +402,7 @@ fn kda_long_stability() {
     let h = hashed_ids(&bytes, b, s, &dev);
     let y = targets(&bytes, b, s, &dev);
 
-    let (logits, rec, kda, aux) =
-        model.forward_with_hidden::<B>(x, Some(h), None, Some(y), None);
+    let (logits, rec, kda, aux) = model.forward_with_hidden::<B>(x, Some(h), None, Some(y), None);
     assert_all_finite("logits", &logits);
     assert_all_finite("rec", &rec);
     assert_all_finite("kda", &kda);
@@ -491,10 +494,7 @@ fn gradient_flow() {
         rows: Vec::new(),
     };
     model.visit(&mut probe);
-    assert!(
-        !probe.rows.is_empty(),
-        "model reports no float parameters"
-    );
+    assert!(!probe.rows.is_empty(), "model reports no float parameters");
     let missing: Vec<&str> = probe
         .rows
         .iter()
@@ -519,7 +519,7 @@ fn gradient_flow() {
     let unexpected: Vec<&str> = missing
         .iter()
         .filter(|p| !KNOWN_GRAD_FREE.contains(p))
-        .map(|p| *p)
+        .copied()
         .collect();
     assert!(
         unexpected.is_empty(),
@@ -708,8 +708,7 @@ fn engram_host_rows() {
         .map(|_| (rng.next() % 2000) as f32 / 1000.0 - 1.0)
         .collect();
     let rnd = Tensor::<3>::from_data(TensorData::new(rows, [b, s, ROW_DIM]), &dev);
-    let (lr, _rec, _k, _aux) =
-        model.forward_with_hidden::<B>(x, None, Some(rnd), None, None);
+    let (lr, _rec, _k, _aux) = model.forward_with_hidden::<B>(x, None, Some(rnd), None, None);
     assert_all_finite("logits(random rows)", &lr);
 
     let d = (lz - lr).abs().max().into_scalar::<f32>();
@@ -752,8 +751,7 @@ fn engram_addressing_path_receives_gradient() {
     let h = hashed_ids(&bytes, b, s, &dev);
     let y = targets(&bytes, b, s, &dev);
 
-    let (_logits, rec, _kda, aux) =
-        model.forward_with_hidden::<B>(x, Some(h), None, Some(y), None);
+    let (_logits, rec, _kda, aux) = model.forward_with_hidden::<B>(x, Some(h), None, Some(y), None);
     let mut loss = model.loss::<B>(rec);
     if let Some(a) = aux {
         loss = loss + a;
@@ -775,7 +773,7 @@ fn engram_addressing_path_receives_gradient() {
         }
         fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<D>>) {
             let path = self.stack.join(".");
-            if self.want.iter().any(|w| path == *w) {
+            if self.want.contains(&path) {
                 let g = param
                     .grad(self.grads)
                     .map(|g| g.powf_scalar(2.0).sum().into_scalar::<f32>())
@@ -788,9 +786,19 @@ fn engram_addressing_path_receives_gradient() {
         "loop_block.engram.key_projs.0.weight".to_string(),
         "loop_block.mem_dense.weight".to_string(),
     ];
-    let mut p = Probe { stack: vec![], grads: &grads, want: want.clone(), found: vec![] };
+    let mut p = Probe {
+        stack: vec![],
+        grads: &grads,
+        want: want.clone(),
+        found: vec![],
+    };
     model.visit(&mut p);
-    assert_eq!(p.found.len(), want.len(), "visitor missed a param: {:?} vs {want:?}", p.found.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>());
+    assert_eq!(
+        p.found.len(),
+        want.len(),
+        "visitor missed a param: {:?} vs {want:?}",
+        p.found.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>()
+    );
     for (name, sq) in p.found {
         assert!(
             sq > 1e-12,

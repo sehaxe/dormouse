@@ -28,7 +28,7 @@
 - `cubek-matmul`: tiled bf16 (M/N/K%vs tails already fixed), naive bf16
 - `cubek-quant`: bf16 quant/dequant
 - `burn-kda`, `burn-msa`, `burn-engram`: bf16 forward
-- `burn-sct`: TSCT bf16 retract
+- ~~`burn-sct`~~ deleted 2026-10-02; TSCT bf16 retract lives in `burn-spectral`
 
 ## 5. Риски
 

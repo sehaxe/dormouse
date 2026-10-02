@@ -73,6 +73,10 @@ KNOWN_DEAD = {
 	"research/reviews/fix-verification-2026-09-30.md": "an audit read out of a worktree (wt/fixverify) and named here as provenance; its four findings are closed in docs/reviews/verify-tails-2026-09-30.md",
 	"research/papers/spec-bwd.md": "a spec transcribed in a lane that was cut before it committed; the backward is gated from docs/papers/gdn-kda.md",
 	"tools/gen_reference.rs": "renamed to tools/gen_reference_f64.py; two gate comments still carry the old name",
+	"vendor/dormouse-fused/crates/burn-sct/src/qr.rs": "the crate was deleted 2026-10-02; the audit that names it is a dated record",
+	"vendor/dormouse-fused/crates/burn-sct/src/qr_cuda.rs": "the crate was deleted 2026-10-02; the audit that names it is a dated record",
+	"vendor/dormouse-fused/crates/burn-sct": "the crate was deleted 2026-10-02; dated reviews and ADRs keep the name on purpose",
+	"vendor/dormouse-fused/crates/burn-es": "the crate was deleted 2026-10-02; dated reviews and ADRs keep the name on purpose",
 }
 
 # `path` / `path:line` / `path:12` / `path:12-34`, or a glob, or `a/{b,c}`.

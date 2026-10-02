@@ -47,7 +47,7 @@ fn tsct_fused_env_enabled() -> bool {
 }
 
 /// Absmean ternary projection (BitNet b1.58 STE): `sign(w) * mean(|w|)`
-/// with a dead zone at `0.7·mean` (burn-es convention).
+/// with a dead zone at `0.7·mean` (no external reference exists for this threshold).
 pub fn ternarize(w: Tensor<2>) -> Tensor<2> {
     let mag = w.clone().abs();
     let mean = mag.clone().mean().unsqueeze_dims(&[0, 0]);
@@ -281,14 +281,14 @@ pub fn polar_orthogonalize(x: Tensor<2>, iters: usize) -> Tensor<2> {
         .squeeze_dim::<1>(1);
     let vgv = v.clone().mul(gv).sum_dim(0).unsqueeze_dim::<2>(0); // [1, 1]
     let vv = v.clone().mul(v.clone()).sum_dim(0).unsqueeze_dim::<2>(0); // [1, 1]
-    // `clamp_min` is the tensor form of the old `f32::max` clamps; the two
-    // differ only for NaN, and vᵀv >= 0 makes NaN unreachable here.
+                                                                        // `clamp_min` is the tensor form of the old `f32::max` clamps; the two
+                                                                        // differ only for NaN, and vᵀv >= 0 makes NaN unreachable here.
     let sigma = vgv.div(vv.clamp_min(1e-14)).sqrt().clamp_min(1e-7); // [1, 1]
-    // SIGMA_OVERSHOOT: an empirical margin, NOT a "5% of the power-iteration
-    // error" guarantee - the estimate exceeds 5% on 32-47% of draws. What
-    // holds is the basin: p(s)-s vanishes at s^2 = 1 and s^2 = 7/3, so the
-    // start may sit anywhere in 0 < x0 < sqrt(7/3) ~ 1.5275 and still
-    // converge, which this factor buys to a 31% underestimate of sigma_max.
+                                                                     // SIGMA_OVERSHOOT: an empirical margin, NOT a "5% of the power-iteration
+                                                                     // error" guarantee - the estimate exceeds 5% on 32-47% of draws. What
+                                                                     // holds is the basin: p(s)-s vanishes at s^2 = 1 and s^2 = 7/3, so the
+                                                                     // start may sit anywhere in 0 < x0 < sqrt(7/3) ~ 1.5275 and still
+                                                                     // converge, which this factor buys to a 31% underestimate of sigma_max.
     m = m.div(sigma.mul_scalar(SIGMA_OVERSHOOT));
     // Newton-Schulz in X·Xᵀ form (small side [c,c], same as Muon+):
     // x <- a·x + (b·XXᵀ + c·(XXᵀ)²)·x, optimal NS coefficients
@@ -712,16 +712,11 @@ impl SpectralLinear {
     /// forward). Weight factors are quantized exactly as in
     /// [`forward_quant`](Self::forward_quant).
     #[cfg(feature = "cuda")]
-    pub fn forward_quant_bf16<B: burn::backend::AutodiffBackend>(
-        &self,
-        x: Tensor<2>,
-    ) -> Tensor<2>
+    pub fn forward_quant_bf16<B: burn::backend::AutodiffBackend>(&self, x: Tensor<2>) -> Tensor<2>
     where
         burn::tensor::DispatchTensor: burn::backend::DispatchKindConversion<B>
             + burn::backend::DispatchKindConversion<B::InnerBackend>
-            + burn::backend::DispatchKindConversion<
-                burn_autodiff::Autodiff<B::InnerBackend>,
-            >,
+            + burn::backend::DispatchKindConversion<burn_autodiff::Autodiff<B::InnerBackend>>,
     {
         let u = self.quant_factor::<B>(self.u.val());
         let v = self.quant_factor::<B>(self.v.val());
@@ -736,8 +731,12 @@ impl SpectralLinear {
     {
         match self.quant {
             QuantFormat::Fp32 => w,
-            QuantFormat::Bf16 => w.cast(burn::tensor::FloatDType::BF16).cast(burn::tensor::FloatDType::F32),
-            QuantFormat::Fp16 => w.cast(burn::tensor::FloatDType::F16).cast(burn::tensor::FloatDType::F32),
+            QuantFormat::Bf16 => w
+                .cast(burn::tensor::FloatDType::BF16)
+                .cast(burn::tensor::FloatDType::F32),
+            QuantFormat::Fp16 => w
+                .cast(burn::tensor::FloatDType::F16)
+                .cast(burn::tensor::FloatDType::F32),
             QuantFormat::Fp8 => {
                 let q = burn_bitnet::quantize_tensor::<B>(w.clone(), 8);
                 w.clone() + (q - w).detach() // STE
@@ -748,7 +747,10 @@ impl SpectralLinear {
                 if std::env::var("DM_QUANT_DEBUG").is_ok() {
                     let vw: Vec<f32> = w.clone().into_data().try_to_vec().unwrap_or_default();
                     let vs: Vec<f32> = ste.clone().into_data().try_to_vec().unwrap_or_default();
-                    let md = vw.iter().zip(&vs).fold(0.0f32, |a, (x, y)| a.max((x - y).abs()));
+                    let md = vw
+                        .iter()
+                        .zip(&vs)
+                        .fold(0.0f32, |a, (x, y)| a.max((x - y).abs()));
                     println!("[fq] Fp4 ste-vs-w max={md:.6}");
                 }
                 ste
@@ -1422,9 +1424,14 @@ mod tests {
 
     #[test]
     fn polar_retracts() {
-        let mut m = SpectralLinear::new(64, 128, 8, &dev());
+        // The fixture must be an autodiff device: retract re-tracks the
+        // masters with `set_require_grad`, which on burn 0.22 is an assert on
+        // a non-autodiff device — this test used to panic before it asserted
+        // (TEST-AUDIT finding 2).
+        let adev = Device::ndarray().autodiff();
+        let mut m = SpectralLinear::new(64, 128, 8, &adev);
         // corrupt the masters
-        let noise = Tensor::<2>::random([64, 8], Distribution::Normal(0.0, 1.0), &dev());
+        let noise = Tensor::<2>::random([64, 8], Distribution::Normal(0.0, 1.0), &adev);
         m.u = Param::from_tensor(m.u.val().add(noise.mul_scalar(0.5)));
         let before = ortho_error(&m.u.val());
         m.retract(5);
@@ -1492,7 +1499,10 @@ mod tests {
         let (exact, expect0) = known_gram_error_768x64(&dev, 0.0);
         assert_eq!(expect0, 0.0);
         let got0 = ortho_error_per_entry(&exact);
-        assert!(got0 < 1e-7, "an exactly orthonormal factor must read ~0, got {got0:.3e}");
+        assert!(
+            got0 < 1e-7,
+            "an exactly orthonormal factor must read ~0, got {got0:.3e}"
+        );
 
         const EPS: f32 = 0.05;
         let (pert, expect) = known_gram_error_768x64(&dev, EPS);
@@ -1577,7 +1587,11 @@ mod tests {
         );
         // |s| : 2.0, 1e-4, 0.5, 0.0, 1.25 -> max 2.0, min 0.0, one below 1e-3.
         let (smax, smin, off) = spectrum_stats(&s, 1e-3);
-        assert_eq!((smax, smin, off), (2.0, 0.0, 2), "got ({smax}, {smin}, {off})");
+        assert_eq!(
+            (smax, smin, off),
+            (2.0, 0.0, 2),
+            "got ({smax}, {smin}, {off})"
+        );
         // The tolerance is a knob and it moves ONLY the count - max and min
         // are properties of the spectrum, not of the threshold. `tol = 1e-4`
         // excludes the 1e-4 value (the comparison is strict `<`), and
@@ -1586,7 +1600,8 @@ mod tests {
         assert_eq!(spectrum_stats(&s, 1.0).2, 3);
         // Red by construction: all-alive factors report zero dead ranks, so
         // a metric that returned a constant could not pass the row above.
-        let alive = Tensor::<1>::from_data(burn::tensor::TensorData::new(vec![1.0f32, 2.0], [2]), &dev);
+        let alive =
+            Tensor::<1>::from_data(burn::tensor::TensorData::new(vec![1.0f32, 2.0], [2]), &dev);
         assert_eq!(spectrum_stats(&alive, 1e-3).2, 0);
     }
 
@@ -1617,8 +1632,7 @@ mod tests {
                     (2.0 / N as f32).sqrt()
                 };
                 data[i * K + j] = scale
-                    * ((std::f32::consts::PI * (2 * i + 1) as f32 * j as f32)
-                        / (2 * N) as f32)
+                    * ((std::f32::consts::PI * (2 * i + 1) as f32 * j as f32) / (2 * N) as f32)
                         .cos();
             }
         }
@@ -1664,7 +1678,12 @@ mod tests {
         // second pass must not move the factor. A Frobenius prescale moves
         // it by 30%.
         let twice = polar_orthogonalize(once.clone(), 3);
-        let drift = twice.clone().sub(once.clone()).abs().max().into_scalar::<f32>();
+        let drift = twice
+            .clone()
+            .sub(once.clone())
+            .abs()
+            .max()
+            .into_scalar::<f32>();
         assert!(
             drift < 1e-4,
             "a second retraction must be a no-op on the manifold, max drift {drift:.3e}"
@@ -1672,7 +1691,10 @@ mod tests {
         // And it must still pull a scaled factor back (the job), at this rank.
         let scaled = polar_orthogonalize(u.mul_scalar(3.0), 3);
         let es = ortho_err_per_entry(&scaled);
-        assert!(es < 1e-3, "retraction must pull 3x off the manifold: {es:.3e}");
+        assert!(
+            es < 1e-3,
+            "retraction must pull 3x off the manifold: {es:.3e}"
+        );
         // Scale is preserved, not merely direction: a retraction does not
         // shrink the factor. `‖X‖_F ~ sqrt(rank)` is what "on the manifold"
         // means for a tall factor.
@@ -1716,13 +1738,7 @@ mod tests {
         let dev = dev();
         let s = polar_orthogonalize(ortho_factor_768x64(&dev), 3);
         let k = s.dims()[1] as f32;
-        let rms = s
-            .clone()
-            .transpose()
-            .matmul(s)
-            .sum()
-            .into_scalar::<f32>()
-            / k;
+        let rms = s.clone().transpose().matmul(s).sum().into_scalar::<f32>() / k;
         let sigma_max = rms.sqrt();
         assert!(
             (sigma_max - 1.0).abs() < 1e-2,
@@ -1830,8 +1846,8 @@ mod tests {
         let mut d = vec![0.0f32; rows * cols];
         for i in 0..rows {
             for j in 0..cols {
-                d[i * cols + j] = ((i * 7 + j * 13) as f32).sin() * 0.5
-                    + ((i * 3 + j * 5) as f32).cos();
+                d[i * cols + j] =
+                    ((i * 7 + j * 13) as f32).sin() * 0.5 + ((i * 3 + j * 5) as f32).cos();
             }
         }
         Tensor::<2>::from_data(burn::tensor::TensorData::new(d, [rows, cols]), dev)
@@ -2942,7 +2958,10 @@ mod inference_tests {
 
     #[test]
     fn to_inference_matches_trained_layer() {
-        let dev = Device::ndarray();
+        // Autodiff fixture: `retract(5)` below re-tracks the masters and
+        // asserts on a non-autodiff device (TEST-AUDIT finding 2); the freeze
+        // must match the TRAINED layer, so the retraction has to actually run.
+        let dev = Device::ndarray().autodiff();
         let (m, k, n) = (64usize, 8usize, 128usize);
         let mut layer = SpectralLinear::new(m, n, k, &dev);
         // train a few steps-ish: perturb masters, retract, then freeze
@@ -2994,7 +3013,9 @@ mod inference_tests {
 
     #[test]
     fn to_inference_matches_per_column_layer() {
-        let dev = Device::ndarray();
+        // Autodiff fixture, same reason as to_inference_matches_trained_layer
+        // (TEST-AUDIT finding 2).
+        let dev = Device::ndarray().autodiff();
         let (m, k, n) = (64usize, 8usize, 128usize);
         let mut layer = SpectralLinear::new(m, n, k, &dev);
         layer.set_per_column(true);

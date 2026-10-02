@@ -140,8 +140,8 @@ pub struct DormouseModel {
     /// Load-balancing coefficient for the sparse-routing arm (`moe::lb_aux`).
     /// 0.0 = off, and the only legal non-zero position is with `moe_topk > 0`
     /// - `config::validate` refuses the combination rather than ignoring the
-    /// term. Deliberately NOT a large-MoE default: see
-    /// `config::schema::moe_lb_coef`.
+    ///   term. Deliberately NOT a large-MoE default: see
+    ///   `config::schema::moe_lb_coef`.
     #[module(skip)]
     pub moe_lb_coef: f32,
     /// Longest sequence the model will be asked about, in byte positions. A
@@ -214,7 +214,8 @@ impl DormouseModel {
             + DispatchKindConversion<B::InnerBackend>
             + DispatchKindConversion<burn::backend::Autodiff<B::InnerBackend>>,
     {
-        self.forward_with_hidden::<B>(input_ids, hashed_ids, None, None, None).0
+        self.forward_with_hidden::<B>(input_ids, hashed_ids, None, None, None)
+            .0
     }
 
     /// Teacher pass: the pre-head accumulated latent `out_acc` only (no
@@ -237,7 +238,12 @@ impl DormouseModel {
             x
         };
         let (out_acc, _rec, _kda, _route) = self.loop_block.forward_full_state::<B>(
-            x, hashed_ids, host_rows, None, None, &self.lm_head,
+            x,
+            hashed_ids,
+            host_rows,
+            None,
+            None,
+            &self.lm_head,
         );
         out_acc
     }
@@ -292,9 +298,7 @@ impl DormouseModel {
                 host_rows.clone().map(|r| r.detach()),
             )
         });
-        self.forward_with_latent::<B>(
-            input_ids, hashed_ids, host_rows, targets, teacher_latent,
-        )
+        self.forward_with_latent::<B>(input_ids, hashed_ids, host_rows, targets, teacher_latent)
     }
 
     /// Same as [`Self::forward_with_hidden`], but the JEPA target latent is
@@ -314,9 +318,7 @@ impl DormouseModel {
             + DispatchKindConversion<B::InnerBackend>
             + DispatchKindConversion<burn::backend::Autodiff<B::InnerBackend>>,
     {
-        self.forward_with_latent::<B>(
-            input_ids, hashed_ids, host_rows, targets, jepa_target,
-        )
+        self.forward_with_latent::<B>(input_ids, hashed_ids, host_rows, targets, jepa_target)
     }
 
     fn forward_with_latent<B: burn::backend::AutodiffBackend>(
@@ -360,9 +362,14 @@ impl DormouseModel {
         // served off the label indices the loop consumed. [b,t] int64, 40 KB at
         // batch 10 x 512 - noise next to the [b,t,d] forward it feeds.
         let tgt = targets.clone().map(|tg| tg.reshape([b * t, 1]));
-        let (out_acc, rec, kda, route) =
-            self.loop_block
-                .forward_full_state::<B>(x, hashed_ids, host_rows, None, tgt, &self.lm_head);
+        let (out_acc, rec, kda, route) = self.loop_block.forward_full_state::<B>(
+            x,
+            hashed_ids,
+            host_rows,
+            None,
+            tgt,
+            &self.lm_head,
+        );
         // loop activations may be bf16; the final norm+head compute in fp32
         // (bf16 logits make the softmax/CE numerically unstable -> NaN).
         let h = if self.bf16 {
@@ -374,7 +381,15 @@ impl DormouseModel {
             .lm_head
             .forward::<B>(h.clone().reshape([b * t, self.d_model]))
             .reshape([b, t, self.vocab_size]);
-        let aux = self.aux_loss::<B>(&out_acc, teacher_latent, ids_raw, targets, &h, &logits, &route);
+        let aux = self.aux_loss::<B>(
+            &out_acc,
+            teacher_latent,
+            ids_raw,
+            targets,
+            &h,
+            &logits,
+            &route,
+        );
         (logits, rec, kda, aux)
     }
 
@@ -387,6 +402,10 @@ impl DormouseModel {
     /// (DSpark's window tokens) and `targets` the one-byte-shifted LABEL
     /// sequence - the future-byte head's labels, and the two are not
     /// interchangeable, which is what `8fa5d4c`-class bugs look like.
+    // The parameter list IS the aux contract: each aux term reads a different
+    // subset (JEPA the latents, DSpark ids+hidden+logits, the future-byte head
+    // targets), so a grouping struct would only relocate the same eight names.
+    #[allow(clippy::too_many_arguments)]
     fn aux_loss<B: burn::backend::AutodiffBackend>(
         &self,
         student_latent: &Tensor<3>,
@@ -428,16 +447,19 @@ impl DormouseModel {
         // batch, the one auxiliary the MoR arm has under a pure-CE recipe.
         if let Some(m) = route.mor.clone() {
             crate::probe::note(crate::probe::MOR_BCE);
-            total = Some(m.mul_scalar(self.mor_bce_weight)
-                + total.unwrap_or_else(|| Tensor::zeros([1], &dev)));
+            total = Some(
+                m.mul_scalar(self.mor_bce_weight)
+                    + total.unwrap_or_else(|| Tensor::zeros([1], &dev)),
+            );
         }
         // The sparse-routing balancer: Switch/GShard's `E * sum f_e P_e`, which
         // is 1 at uniform routing and E at collapse. Weighted HERE rather than
         // in the loop block, with every other auxiliary weight.
         if let Some(lb) = route.moe_lb.clone() {
             crate::probe::note(crate::probe::MOE_LB);
-            total = Some(lb.mul_scalar(self.moe_lb_coef)
-                + total.unwrap_or_else(|| Tensor::zeros([1], &dev)));
+            total = Some(
+                lb.mul_scalar(self.moe_lb_coef) + total.unwrap_or_else(|| Tensor::zeros([1], &dev)),
+            );
         }
         if self.jepa_weight > 0.0 {
             if let Some(tl) = teacher_latent {
@@ -455,8 +477,10 @@ impl DormouseModel {
                 // no-op. Bumped here, where the term is actually added - not
                 // where the weight is declared.
                 crate::probe::note(crate::probe::JEPA);
-                total = Some(j.mul_scalar(self.jepa_weight)
-                    + total.unwrap_or_else(|| Tensor::zeros([1], &dev)));
+                total = Some(
+                    j.mul_scalar(self.jepa_weight)
+                        + total.unwrap_or_else(|| Tensor::zeros([1], &dev)),
+                );
             }
         }
         if self.dspark_weight > 0.0 {
@@ -470,8 +494,10 @@ impl DormouseModel {
                 self.dspark_stride,
             );
             crate::probe::note(crate::probe::DSPARK);
-            total = Some(d.mul_scalar(self.dspark_weight)
-                + total.unwrap_or_else(|| Tensor::zeros([1], &dev)));
+            total = Some(
+                d.mul_scalar(self.dspark_weight)
+                    + total.unwrap_or_else(|| Tensor::zeros([1], &dev)),
+            );
         }
         if fb {
             // COUNTED in two halves (ADR-0019): `asked` is bumped here, at the
@@ -487,9 +513,16 @@ impl DormouseModel {
                  non-zero at construction (DormouseModel::new), so this model was built with \
                  aux_fb_weight = 0. Rebuild the model from the config, or set aux_fb_weight = 0.",
             );
-            let f = crate::future_byte::future_byte_loss::<B>(head, h.clone(), targets, self.aux_fb_horizon);
-            total = Some(f.mul_scalar(self.aux_fb_weight)
-                + total.unwrap_or_else(|| Tensor::zeros([1], &dev)));
+            let f = crate::future_byte::future_byte_loss::<B>(
+                head,
+                h.clone(),
+                targets,
+                self.aux_fb_horizon,
+            );
+            total = Some(
+                f.mul_scalar(self.aux_fb_weight)
+                    + total.unwrap_or_else(|| Tensor::zeros([1], &dev)),
+            );
         }
         total
     }
@@ -506,16 +539,42 @@ impl DormouseModel {
         // guard - the one that refuses a corrupt checkpoint at load time -
         // reported "clean" for weights it never looked at (ADR-0019).
         let read = |v: Result<Vec<f32>, burn::tensor::DataError>| -> Vec<f32> {
-            v.expect("finite_scan: reading a parameter back from the device failed - \
-                      the checkpoint cannot be judged, refusing to say it is clean")
+            v.expect(
+                "finite_scan: reading a parameter back from the device failed - \
+                      the checkpoint cannot be judged, refusing to say it is clean",
+            )
         };
         let vecs = [
-            read(self.embedding.weight.val().clone().into_data().try_to_vec::<f32>()),
-            read(self.norm.weight.val().clone().into_data().try_to_vec::<f32>()),
-            read(self.loop_block.residual_scale.val().clone().into_data().try_to_vec::<f32>()),
+            read(
+                self.embedding
+                    .weight
+                    .val()
+                    .clone()
+                    .into_data()
+                    .try_to_vec::<f32>(),
+            ),
+            read(
+                self.norm
+                    .weight
+                    .val()
+                    .clone()
+                    .into_data()
+                    .try_to_vec::<f32>(),
+            ),
+            read(
+                self.loop_block
+                    .residual_scale
+                    .val()
+                    .clone()
+                    .into_data()
+                    .try_to_vec::<f32>(),
+            ),
         ];
         let checked = vecs.iter().map(|v| v.len()).sum();
-        let bad = vecs.iter().map(|v| v.iter().filter(|x| !x.is_finite()).count()).sum();
+        let bad = vecs
+            .iter()
+            .map(|v| v.iter().filter(|x| !x.is_finite()).count())
+            .sum();
         (checked, bad)
     }
 

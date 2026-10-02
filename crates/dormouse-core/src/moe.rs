@@ -60,11 +60,11 @@ pub fn topk_blend(logits: Tensor<2>, k: usize) -> (Tensor<2>, Tensor<2>, Tensor<
     let dev = logits.device();
     // THE shared primitive, from the crate that owns it.
     let idx = burn_mor::topk_indices(logits.clone(), k, 1); // [n, k]
-    // Binary membership from those indices, the `mor::route` construction:
-    // one-hot the picks with `mask_fill` on a FLOAT tensor and sum the k rows.
-    // `sum_dim` is keepdim in burn 0.22, so the sum is [n, 1, e] and the
-    // reshape below is exact. Both Int tensors come from the same device, so
-    // they share its Int dtype.
+                                                            // Binary membership from those indices, the `mor::route` construction:
+                                                            // one-hot the picks with `mask_fill` on a FLOAT tensor and sum the k rows.
+                                                            // `sum_dim` is keepdim in burn 0.22, so the sum is [n, 1, e] and the
+                                                            // reshape below is exact. Both Int tensors come from the same device, so
+                                                            // they share its Int dtype.
     let ar = Tensor::<1, Int>::arange(0..e as i64, &dev).reshape([1, 1, e]);
     let eq = idx.reshape([n, k, 1]).equal(ar); // [n, k, e]
     let mask = Tensor::<3>::zeros([n, k, e], &dev)
@@ -165,10 +165,7 @@ mod tests {
 
     fn t(rows: &[[f32; 4]]) -> Tensor<2> {
         let flat: Vec<f32> = rows.iter().flatten().copied().collect();
-        Tensor::<2>::from_data(
-            TensorData::new(flat, [rows.len(), 4]),
-            &dev(),
-        )
+        Tensor::<2>::from_data(TensorData::new(flat, [rows.len(), 4]), &dev())
     }
 
     /// A no-tie fixture, so the expected top-k is unambiguous on every
@@ -219,7 +216,7 @@ mod tests {
             let m: Vec<f32> = mask.into_data().try_to_vec().expect("mask readable");
             let g: Vec<f32> = gates.into_data().try_to_vec().expect("gates readable");
             for r in 0..rows.len() {
-                let want_mask: Vec<f32> = sets[r].iter().map(|x| (*x as f32)).collect();
+                let want_mask: Vec<f32> = sets[r].iter().map(|x| *x as f32).collect();
                 assert_eq!(
                     &m[r * 4..r * 4 + 4],
                     &want_mask[..],
@@ -242,7 +239,10 @@ mod tests {
                 );
                 // Renormalized: the surviving gates sum to 1.
                 let s: f32 = got.iter().sum();
-                assert!((s - 1.0).abs() < 1e-5, "k={k} row {r}: gates sum {s}, must be 1");
+                assert!(
+                    (s - 1.0).abs() < 1e-5,
+                    "k={k} row {r}: gates sum {s}, must be 1"
+                );
             }
         }
     }
@@ -258,10 +258,17 @@ mod tests {
         let (gates, mask, _) = topk_blend(t(&rows), 1);
         let g: Vec<f32> = gates.into_data().try_to_vec().unwrap();
         let m: Vec<f32> = mask.into_data().try_to_vec().unwrap();
-        let winner = |r: usize| (0..4).max_by(|a, b| rows[r][*a].total_cmp(&rows[r][*b])).unwrap();
+        let winner = |r: usize| {
+            (0..4)
+                .max_by(|a, b| rows[r][*a].total_cmp(&rows[r][*b]))
+                .unwrap()
+        };
         for r in 0..rows.len() {
             assert_eq!(m[r * 4 + winner(r)], 1.0, "the argmax expert is selected");
-            assert!((g[r * 4 + winner(r)] - 1.0).abs() < 1e-6, "top-1 gate is exactly 1");
+            assert!(
+                (g[r * 4 + winner(r)] - 1.0).abs() < 1e-6,
+                "top-1 gate is exactly 1"
+            );
             for c in 0..4 {
                 if c != winner(r) {
                     assert_eq!(g[r * 4 + c], 0.0, "a non-selected expert carries nothing");
@@ -351,7 +358,11 @@ mod tests {
             balanced < leaning && leaning < collapsed,
             "the balancer must rise with concentration: {balanced} < {leaning} < {collapsed}"
         );
-        for (name, v) in [("balanced", balanced), ("leaning", leaning), ("collapsed", collapsed)] {
+        for (name, v) in [
+            ("balanced", balanced),
+            ("leaning", leaning),
+            ("collapsed", collapsed),
+        ] {
             assert!(
                 (1.0..=e as f32).contains(&v),
                 "{name} = {v} is outside the term's range [1, E={e}]"
@@ -393,229 +404,228 @@ mod tests {
         .is_ok());
     }
 
-/// THE COLLAPSE GUARD, and the coefficient sweep it produces.
-///
-/// A top-k router with no balancer behind it collapses: every token ends up on
-/// one expert, the loop's passes stop being different, and the arm becomes the
-/// dense mixture with a worse gradient. That is Switch's reason for the term
-/// (Fedus et al., JMLR 23(1):120-5232, 2022 §3.3). Note what validation does
-/// and does NOT do: `config::validation` refuses a non-zero `moe_lb_coef` with
-/// the arm OFF (a term with no selection to balance), and does NOT require the
-/// coefficient to be non-zero with the arm ON - the arm's default is the router
-/// with no balancer, which is the arm's own removal and therefore the control an
-/// A/B wants to be able to run.
-///
-/// # WHY THE SWEEP CANNOT PRODUCE A DEFAULT, and measures that instead
-///
-/// The obvious deliverable - "sweep on a hostile batch, ship the winner" - is
-/// unsound here, for a reason this test exists to make visible:
-///
-/// `L_LB = E * sum_e f_e P_e` averages over TOKENS, so the gradient it applies
-/// to any one token's logits is `O(E / tokens_per_batch)`. It is diluted by
-/// the batch size, and therefore the coefficient that balances a 64-row toy
-/// batch is not the coefficient that balances the trainer's ~4 000-token one;
-/// it moves by the same factor. A number swept on a toy batch is a number
-/// about the toy batch.
-///
-/// So what is measured is the scale-free quantity - the balancer's gradient
-/// norm as a FRACTION of the task gradient's - and the coefficient at which the
-/// two balance (`coef_crit = 1 / ratio`). That transfers; a raw coefficient
-/// does not. The default therefore stays **0.0**, the arm is OFF, and the two
-/// swept values are reported as readings.
-#[test]
-fn load_balance_sweep_is_measured_against_the_task_gradient() {
-    const ROWS: usize = 64;
-    const E: usize = 4;
-    const STEPS: usize = 40;
-    // The hostile pressure: every row WANTS expert 0. This is what collapse
-    // looks like from the router's side.
-    let want = |j: usize| if j == 0 { 1.0f32 } else { -0.25f32 };
+    /// THE COLLAPSE GUARD, and the coefficient sweep it produces.
+    ///
+    /// A top-k router with no balancer behind it collapses: every token ends up on
+    /// one expert, the loop's passes stop being different, and the arm becomes the
+    /// dense mixture with a worse gradient. That is Switch's reason for the term
+    /// (Fedus et al., JMLR 23(1):120-5232, 2022 §3.3). Note what validation does
+    /// and does NOT do: `config::validation` refuses a non-zero `moe_lb_coef` with
+    /// the arm OFF (a term with no selection to balance), and does NOT require the
+    /// coefficient to be non-zero with the arm ON - the arm's default is the router
+    /// with no balancer, which is the arm's own removal and therefore the control an
+    /// A/B wants to be able to run.
+    ///
+    /// # WHY THE SWEEP CANNOT PRODUCE A DEFAULT, and measures that instead
+    ///
+    /// The obvious deliverable - "sweep on a hostile batch, ship the winner" - is
+    /// unsound here, for a reason this test exists to make visible:
+    ///
+    /// `L_LB = E * sum_e f_e P_e` averages over TOKENS, so the gradient it applies
+    /// to any one token's logits is `O(E / tokens_per_batch)`. It is diluted by
+    /// the batch size, and therefore the coefficient that balances a 64-row toy
+    /// batch is not the coefficient that balances the trainer's ~4 000-token one;
+    /// it moves by the same factor. A number swept on a toy batch is a number
+    /// about the toy batch.
+    ///
+    /// So what is measured is the scale-free quantity - the balancer's gradient
+    /// norm as a FRACTION of the task gradient's - and the coefficient at which the
+    /// two balance (`coef_crit = 1 / ratio`). That transfers; a raw coefficient
+    /// does not. The default therefore stays **0.0**, the arm is OFF, and the two
+    /// swept values are reported as readings.
+    #[test]
+    fn load_balance_sweep_is_measured_against_the_task_gradient() {
+        const ROWS: usize = 64;
+        const E: usize = 4;
+        const STEPS: usize = 40;
+        // The hostile pressure: every row WANTS expert 0. This is what collapse
+        // looks like from the router's side.
+        let want = |j: usize| if j == 0 { 1.0f32 } else { -0.25f32 };
 
-    // Per-row logits, DETERMINISTIC and ROW-VARYING.
-    //
-    // Row-varying is not cosmetic. The selection is a per-row argmax, so a
-    // batch of 64 IDENTICAL rows can only ever all pick the same expert - no
-    // coefficient, however large, could spread that load, and the "sweep"
-    // would be measuring a batch that has no tokens to distribute. Load
-    // balancing is about the distribution ACROSS tokens, so the batch has to
-    // vary across tokens.
-    //
-    // The scramble is a hash, not burn's global RNG: that stream is never
-    // seeded (AGENTS.md 3.7), so an RNG here would make the test irreproducible.
-    // `h >> 40` is 24 bits, so `/ 2^24` is the full range: the jitter lands in
-    // [-1, 1). Dividing by 1024 instead would have made it ±16000 - and a
-    // jitter that dwarfs the logit gap makes the argmax effectively a coin
-    // flip, which lands the load at uniform by accident and makes
-    // `L_LB == 1` a constant with an exactly zero gradient.
-    let jitter = |r: usize, j: usize| -> f32 {
-        let h = (r as u64)
-            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-            .rotate_left(17)
-            ^ (j as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        (h >> 40) as f32 / 8_388_608.0 - 0.5
-    };
-    // The HOSTILE but not degenerate regime: expert 0 leads by a margin SMALLER
-    // than the row-to-row spread, so most tokens want expert 0 and some do
-    // not. Both halves matter. All rows identical is the degenerate case (no
-    // load to distribute); all rows wanting expert 0 with a wide margin gives
-    // `f = one-hot`, `P` still depends on the logits, and a gradient - but a
-    // fixture the balancer has to fight through from a standing start. The
-    // margin is what makes this the hard case.
-    let mut init = vec![0.0f32; ROWS * E];
-    for r in 0..ROWS {
-        for j in 0..E {
-            // Parenthesised on purpose. Written as
-            // `if j == 0 { 3.0 } else { 0.0 } + jitter(r, j)` the `+ jitter`
-            // binds to the ELSE branch only, every row gets the same expert-0
-            // logit, and the batch collapses to 64 identical copies - the exact
-            // degeneracy the comment above is about. It then read as "the
-            // balancer's gradient is zero", which was the batch, not the term.
-            init[r * E + j] = jitter(r, j) + if j == 0 { 0.30 } else { 0.0 };
-        }
-    }
-
-    // Load spread after `STEPS` steps at a given coefficient. Read back
-    // through the REAL selection, not through the state vector.
-    let simulate = |coef: f32| -> (f32, f32) {
-        let mut v = init.clone();
-        for _ in 0..STEPS {
-            let leaf = Tensor::<2>::from_data(TensorData::new(v.clone(), [ROWS, E]), &adev())
-                .require_grad();
-            let (_gates, mask, probs) = topk_blend(leaf.clone(), 1);
-            let g = if coef == 0.0 {
-                vec![0.0f32; ROWS * E]
-            } else {
-                leaf.grad(&lb_aux(&probs, &mask, E).mul_scalar(coef).backward())
-                    .expect("the balancer must reach the router logits")
-                    .into_data()
-                    .try_to_vec()
-                    .expect("grad readable")
-            };
-            for r in 0..ROWS {
-                for j in 0..E {
-                    // `g` already carries the coefficient (it is the gradient
-                    // of `coef * L_LB`), so it is subtracted as-is.
-                    v[r * E + j] += 0.5 * (want(j) - g[r * E + j]);
-                }
+        // Per-row logits, DETERMINISTIC and ROW-VARYING.
+        //
+        // Row-varying is not cosmetic. The selection is a per-row argmax, so a
+        // batch of 64 IDENTICAL rows can only ever all pick the same expert - no
+        // coefficient, however large, could spread that load, and the "sweep"
+        // would be measuring a batch that has no tokens to distribute. Load
+        // balancing is about the distribution ACROSS tokens, so the batch has to
+        // vary across tokens.
+        //
+        // The scramble is a hash, not burn's global RNG: that stream is never
+        // seeded (AGENTS.md 3.7), so an RNG here would make the test irreproducible.
+        // `h >> 40` is 24 bits, so `/ 2^24` is the full range: the jitter lands in
+        // [-1, 1). Dividing by 1024 instead would have made it ±16000 - and a
+        // jitter that dwarfs the logit gap makes the argmax effectively a coin
+        // flip, which lands the load at uniform by accident and makes
+        // `L_LB == 1` a constant with an exactly zero gradient.
+        let jitter = |r: usize, j: usize| -> f32 {
+            let h = (r as u64)
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .rotate_left(17)
+                ^ (j as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            (h >> 40) as f32 / 8_388_608.0 - 0.5
+        };
+        // The HOSTILE but not degenerate regime: expert 0 leads by a margin SMALLER
+        // than the row-to-row spread, so most tokens want expert 0 and some do
+        // not. Both halves matter. All rows identical is the degenerate case (no
+        // load to distribute); all rows wanting expert 0 with a wide margin gives
+        // `f = one-hot`, `P` still depends on the logits, and a gradient - but a
+        // fixture the balancer has to fight through from a standing start. The
+        // margin is what makes this the hard case.
+        let mut init = vec![0.0f32; ROWS * E];
+        for r in 0..ROWS {
+            for j in 0..E {
+                // Parenthesised on purpose. Written as
+                // `if j == 0 { 3.0 } else { 0.0 } + jitter(r, j)` the `+ jitter`
+                // binds to the ELSE branch only, every row gets the same expert-0
+                // logit, and the batch collapses to 64 identical copies - the exact
+                // degeneracy the comment above is about. It then read as "the
+                // balancer's gradient is zero", which was the batch, not the term.
+                init[r * E + j] = jitter(r, j) + if j == 0 { 0.30 } else { 0.0 };
             }
         }
-        let leaf = Tensor::<2>::from_data(TensorData::new(v, [ROWS, E]), &dev());
-        let (_, mask, _) = topk_blend(leaf, 1);
-        let m: Vec<f32> = mask.into_data().try_to_vec().expect("mask readable");
-        // Per-EXPERT share: rows whose selection column j is live. Counting
-        // every 1.0 in the flat buffer instead (ignoring `j`) gives the SAME
-        // number for all four experts, which makes the spread identically zero
-        // and the "collapse" reading an artifact.
-        let counts: Vec<f32> = (0..E)
-            .map(|j| {
-                m.chunks(E).filter(|row| row[j] == 1.0).count() as f32 / ROWS as f32
-            })
-            .collect();
-        let hi = counts.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        // `lo` seeds with POSITIVE infinity. Seeding it with `NEG_INFINITY`
-        // makes `f32::min` return -inf for any non-empty set, so the spread is
-        // `hi - (-inf) = inf` and a whole sweep compares infinities.
-        let lo = counts.iter().cloned().fold(f32::INFINITY, f32::min);
-        (hi - lo, counts[0])
-    };
 
-    // ---- 1. The balancer's gradient is real, and reaches the router --------
-    let leaf = Tensor::<2>::from_data(TensorData::new(init.clone(), [ROWS, E]), &adev())
-        .require_grad();
-    let (_gates, mask, probs) = topk_blend(leaf.clone(), 1);
-    let g_lb: Vec<f32> = leaf
-        .grad(&lb_aux(&probs, &mask, E).backward())
-        .expect("the balancer must reach the router logits")
-        .into_data()
-        .try_to_vec()
-        .expect("grad readable");
-    let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let task: Vec<f32> = (0..ROWS).flat_map(|_| (0..E).map(|j| want(j))).collect();
-    let g_lb_norm = norm(&g_lb);
-    assert!(
+        // Load spread after `STEPS` steps at a given coefficient. Read back
+        // through the REAL selection, not through the state vector.
+        let simulate = |coef: f32| -> (f32, f32) {
+            let mut v = init.clone();
+            for _ in 0..STEPS {
+                let leaf = Tensor::<2>::from_data(TensorData::new(v.clone(), [ROWS, E]), &adev())
+                    .require_grad();
+                let (_gates, mask, probs) = topk_blend(leaf.clone(), 1);
+                let g = if coef == 0.0 {
+                    vec![0.0f32; ROWS * E]
+                } else {
+                    leaf.grad(&lb_aux(&probs, &mask, E).mul_scalar(coef).backward())
+                        .expect("the balancer must reach the router logits")
+                        .into_data()
+                        .try_to_vec()
+                        .expect("grad readable")
+                };
+                for r in 0..ROWS {
+                    for j in 0..E {
+                        // `g` already carries the coefficient (it is the gradient
+                        // of `coef * L_LB`), so it is subtracted as-is.
+                        v[r * E + j] += 0.5 * (want(j) - g[r * E + j]);
+                    }
+                }
+            }
+            let leaf = Tensor::<2>::from_data(TensorData::new(v, [ROWS, E]), &dev());
+            let (_, mask, _) = topk_blend(leaf, 1);
+            let m: Vec<f32> = mask.into_data().try_to_vec().expect("mask readable");
+            // Per-EXPERT share: rows whose selection column j is live. Counting
+            // every 1.0 in the flat buffer instead (ignoring `j`) gives the SAME
+            // number for all four experts, which makes the spread identically zero
+            // and the "collapse" reading an artifact.
+            let counts: Vec<f32> = (0..E)
+                .map(|j| m.chunks(E).filter(|row| row[j] == 1.0).count() as f32 / ROWS as f32)
+                .collect();
+            let hi = counts.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            // `lo` seeds with POSITIVE infinity. Seeding it with `NEG_INFINITY`
+            // makes `f32::min` return -inf for any non-empty set, so the spread is
+            // `hi - (-inf) = inf` and a whole sweep compares infinities.
+            let lo = counts.iter().cloned().fold(f32::INFINITY, f32::min);
+            (hi - lo, counts[0])
+        };
+
+        // ---- 1. The balancer's gradient is real, and reaches the router --------
+        let leaf = Tensor::<2>::from_data(TensorData::new(init.clone(), [ROWS, E]), &adev())
+            .require_grad();
+        let (_gates, mask, probs) = topk_blend(leaf.clone(), 1);
+        let g_lb: Vec<f32> = leaf
+            .grad(&lb_aux(&probs, &mask, E).backward())
+            .expect("the balancer must reach the router logits")
+            .into_data()
+            .try_to_vec()
+            .expect("grad readable");
+        let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let task: Vec<f32> = (0..ROWS).flat_map(|_| (0..E).map(&want)).collect();
+        let g_lb_norm = norm(&g_lb);
+        assert!(
         g_lb_norm > 0.0,
         "the balancer's gradient is exactly zero: the term would be decorative and invisible in          every loss curve"
     );
-    // The scale-free reading: what fraction of the task gradient the balancer
-    // applies per unit coefficient. THIS is what a coefficient scales.
-    let ratio = g_lb_norm / norm(&task);
-    let coef_crit = 1.0 / ratio;
-    println!("load-balance coefficient sweep - HOSTILE batch, {ROWS} rows x {E} experts, top-1,");
-    println!("  {STEPS} steps, task gradient unopposed, deterministic per-row logits");
-    println!("  ||grad L_LB||            {g_lb_norm:.6}");
-    println!("  ||grad task||            {:.6}", norm(&task));
-    println!("  ratio per unit coef      {ratio:.6}   <- what a coefficient scales");
-    println!("  coef_crit = 1/ratio      {coef_crit:.4}   (balancer matches the task)");
+        // The scale-free reading: what fraction of the task gradient the balancer
+        // applies per unit coefficient. THIS is what a coefficient scales.
+        let ratio = g_lb_norm / norm(&task);
+        let coef_crit = 1.0 / ratio;
+        println!(
+            "load-balance coefficient sweep - HOSTILE batch, {ROWS} rows x {E} experts, top-1,"
+        );
+        println!("  {STEPS} steps, task gradient unopposed, deterministic per-row logits");
+        println!("  ||grad L_LB||            {g_lb_norm:.6}");
+        println!("  ||grad task||            {:.6}", norm(&task));
+        println!("  ratio per unit coef      {ratio:.6}   <- what a coefficient scales");
+        println!("  coef_crit = 1/ratio      {coef_crit:.4}   (balancer matches the task)");
 
-    // ---- 2. The hostile control really collapses ---------------------------
-    let (off_spread, off_collapse) = simulate(0.0);
-    assert!(
-        off_collapse > 0.9,
-        "the hostile control must actually collapse (expert 0 share {off_collapse}), or the \
+        // ---- 2. The hostile control really collapses ---------------------------
+        let (_off_spread, off_collapse) = simulate(0.0);
+        assert!(
+            off_collapse > 0.9,
+            "the hostile control must actually collapse (expert 0 share {off_collapse}), or the \
          sweep below is measuring nothing"
-    );
-    println!();
-    println!("  {:>10} {:>10} {:>12}", "coef", "spread", "on expert 0");
+        );
+        println!();
+        println!("  {:>10} {:>10} {:>12}", "coef", "spread", "on expert 0");
 
-    // ---- 3. The sweep: {small, medium} REPORTED, and found insufficient ----
-    // `small` and `medium` are the brief's two positions. The measurement says
-    // neither can move this router, and the assertion below is that they CANNOT
-    // - a negative result, asserted so nobody re-runs the sweep hoping for a
-    // different answer, and explained by `ratio` above rather than by taste.
-    let crit = (coef_crit * 2.0).min(1.0e4);
-    let mut table: Vec<(f32, f32, f32, &str)> = Vec::new();
-    for (label, coef) in [
-        ("off", 0.0f32),
-        ("small", 0.01),
-        ("medium", 0.1),
-        ("2x critical", crit),
-    ] {
-        let (spread, collapse) = simulate(coef);
-        println!("  {:>10} {:>10.4} {:>12.4}", label, spread, collapse);
-        table.push((coef, spread, collapse, label));
-    }
-    let row = |label: &str| table.iter().find(|t| t.3 == label).expect("row present");
-    let off = row("off").1;
-    assert!(
+        // ---- 3. The sweep: {small, medium} REPORTED, and found insufficient ----
+        // `small` and `medium` are the brief's two positions. The measurement says
+        // neither can move this router, and the assertion below is that they CANNOT
+        // - a negative result, asserted so nobody re-runs the sweep hoping for a
+        // different answer, and explained by `ratio` above rather than by taste.
+        let crit = (coef_crit * 2.0).min(1.0e4);
+        let mut table: Vec<(f32, f32, f32, &str)> = Vec::new();
+        for (label, coef) in [
+            ("off", 0.0f32),
+            ("small", 0.01),
+            ("medium", 0.1),
+            ("2x critical", crit),
+        ] {
+            let (spread, collapse) = simulate(coef);
+            println!("  {:>10} {:>10.4} {:>12.4}", label, spread, collapse);
+            table.push((coef, spread, collapse, label));
+        }
+        let row = |label: &str| table.iter().find(|t| t.3 == label).expect("row present");
+        let off = row("off").1;
+        assert!(
         row("off").2 > 0.9,
         "the no-balancer control must actually collapse (expert 0 share {}), or the sweep below is measuring nothing",
         row("off").2
     );
-    assert!(
-        off > 0.5,
-        "the no-balancer control must be badly spread, got {off}"
-    );
-
-    // THE HEADLINE, as an assertion. {small, medium} - the brief's two
-    // positions, and the neighbourhood of every published value - leave this
-    // router fully collapsed. That is a measurement with a mechanism behind it:
-    // `L_LB` averages over tokens, so at 64 rows the balancer applies ~0.45 %
-    // of the task gradient per unit coefficient, and nothing in the
-    // literature's range closes a 200x gap. Copying one would have produced a
-    // run that LOOKS balanced because nothing was reported.
-    for l in ["small", "medium"] {
-        let r = row(l);
         assert!(
+            off > 0.5,
+            "the no-balancer control must be badly spread, got {off}"
+        );
+
+        // THE HEADLINE, as an assertion. {small, medium} - the brief's two
+        // positions, and the neighbourhood of every published value - leave this
+        // router fully collapsed. That is a measurement with a mechanism behind it:
+        // `L_LB` averages over tokens, so at 64 rows the balancer applies ~0.45 %
+        // of the task gradient per unit coefficient, and nothing in the
+        // literature's range closes a 200x gap. Copying one would have produced a
+        // run that LOOKS balanced because nothing was reported.
+        for l in ["small", "medium"] {
+            let r = row(l);
+            assert!(
             r.1 >= off - 1e-6,
             "coef {} ({}) was expected to be INSUFFICIENT at this token count (spread {} vs the {} control) - if it now beats the control, the dilution argument above is wrong and the coefficient needs re-deriving",
             r.0, l, r.1, off
         );
-    }
-    // ...and the term is NOT decorative: at the critical coefficient it does
-    // beat no balancer. Without this, the negative above would be
-    // indistinguishable from "the term does nothing".
-    let crit_row = row("2x critical");
-    assert!(
+        }
+        // ...and the term is NOT decorative: at the critical coefficient it does
+        // beat no balancer. Without this, the negative above would be
+        // indistinguishable from "the term does nothing".
+        let crit_row = row("2x critical");
+        assert!(
         crit_row.1 < off - 0.05,
         "even at 2x the critical coefficient ({}) the balancer could not move the distribution (spread {} vs {off}): the term cannot affect the router here",
         crit_row.0, crit_row.1
     );
-    println!();
-    println!("  RESULT: {{small=0.01, medium=0.1}} do NOT rescue this router; it needs coef ~{coef_crit:.0}");
-    println!("  at {ROWS} tokens. The gap is the E/tokens dilution, so the coefficient the trainer's");
-    println!("  ~4096-token batch would need is ~64x larger again. NO coefficient is shipped:");
-    println!("  moe_lb_coef stays 0.0 and the arm is off, because no value transfers and an");
-    println!("  unswept default would be a number copied from a regime we are not in.");
-
-}
+        println!();
+        println!("  RESULT: {{small=0.01, medium=0.1}} do NOT rescue this router; it needs coef ~{coef_crit:.0}");
+        println!("  at {ROWS} tokens. The gap is the E/tokens dilution, so the coefficient the trainer's");
+        println!("  ~4096-token batch would need is ~64x larger again. NO coefficient is shipped:");
+        println!("  moe_lb_coef stays 0.0 and the arm is off, because no value transfers and an");
+        println!("  unswept default would be a number copied from a regime we are not in.");
+    }
 }

@@ -43,7 +43,11 @@ fn narrow_matmul_matches_fp32(cast: FloatDType, eps: f32) {
     let an = a.cast(cast);
     // The dtype claim itself: burn-ndarray refused here, so assert the cast
     // produced the requested dtype rather than silently keeping f32.
-    assert_eq!(an.dtype(), DType::from(cast), "cast produced the wrong dtype");
+    assert_eq!(
+        an.dtype(),
+        DType::from(cast),
+        "cast produced the wrong dtype"
+    );
     let got: f32 = an.matmul(b.cast(cast)).cast(FloatDType::F32).into_scalar();
     assert!(
         (got - reference).abs() <= eps * reference.abs().max(1.0),

@@ -59,7 +59,6 @@ versions. Check `cargo tree -d | grep burn` first if you see that.
 | `std` | **yes** | the runtime features every member has. No fused kernels, no autodiff. |
 | `cuda` | no | the fused kernels of the 13 members that have them, and the `burn_cuda` re-export. |
 | `autodiff` | no | the fused *backward* ops of the 8 members that have them, and the `burn_autodiff` re-export. |
-| `serde` | no | `burn-sct` serialization. |
 | `training` | no | `burn-dspark`'s training-mode code (the draft head). |
 
 `cuda` and `autodiff` are independent on purpose: inference wants the fused
@@ -172,7 +171,6 @@ stated here rather than left to be discovered:
 | `burn-situ` | SiTU-GLU fwd + bwd | no check, and `hidden % 8 == 0` (or `hidden == 4`) is required or it falls back. Pass f32. |
 | `burn-attnres` | depth-attend fwd + bwd | no check. Pass f32. |
 | `burn-muon-plus` | Newton–Schulz + momentum | operates on f32 parameters (masters are always f32). |
-| `burn-sct` | QR / retraction | no check. Pass f32. |
 | `burn-mor` | none of its own (`cuda` only enables burn's CUDA backend) | — |
 | the other 8 | no fused kernels | dtype-agnostic; plain tensor ops. |
 

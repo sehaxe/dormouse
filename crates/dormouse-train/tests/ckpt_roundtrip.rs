@@ -23,8 +23,11 @@ fn device() -> Device {
 /// backend). The seam contract - burnpack bytes out, identical logits in -
 /// is width-independent.
 fn nano_cfg() -> DormouseConfig {
-    dormouse_core::config::load_config(concat!(env!("CARGO_MANIFEST_DIR"), "/../../configs/nano.toml"))
-        .expect("configs/nano.toml loads")
+    dormouse_core::config::load_config(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../configs/nano.toml"
+    ))
+    .expect("configs/nano.toml loads")
 }
 
 fn mini_nano() -> DormouseConfig {
@@ -98,11 +101,11 @@ fn ckpt_roundtrip_identical_logits() {
         .expect("logits readable");
     assert!(v1.iter().all(|x| x.is_finite()), "logits non-finite");
     let d = (l1 - l2).abs().max().into_scalar::<f32>();
-    println!("ckpt_roundtrip: max |dlogit| = {d:.3e} ({} ms)", t0.elapsed().as_millis());
-    assert!(
-        d < 1e-5,
-        "reloaded model diverges: max |dlogit| = {d:.3e}"
+    println!(
+        "ckpt_roundtrip: max |dlogit| = {d:.3e} ({} ms)",
+        t0.elapsed().as_millis()
     );
+    assert!(d < 1e-5, "reloaded model diverges: max |dlogit| = {d:.3e}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -117,7 +120,10 @@ fn ckpt_carries_the_state_the_config_cannot() {
     let cfg = mini_nano();
     let dev = device();
     let model = DormouseModel::new(&cfg, &dev);
-    let optim_cfg = TrainCfg { steps: 3, ..Default::default() };
+    let optim_cfg = TrainCfg {
+        steps: 3,
+        ..Default::default()
+    };
     let optim = build_optim(&model, &optim_cfg);
 
     // A teacher deliberately at distance from the student, and the one-way
@@ -138,8 +144,13 @@ fn ckpt_carries_the_state_the_config_cannot() {
     let mut m2 = DormouseModel::new(&cfg, &dev);
     let mut o2 = build_optim(&m2, &optim_cfg);
     let loaded = load_ckpt(&dir, "st", &cfg, &mut m2, &mut o2).expect("load_ckpt");
-    assert!(loaded.ortho_fp32, "the one-way fp32-factor fallback must survive a save/load");
-    let t2 = loaded.teacher.expect("the EMA teacher must be in the container");
+    assert!(
+        loaded.ortho_fp32,
+        "the one-way fp32-factor fallback must survive a save/load"
+    );
+    let t2 = loaded
+        .teacher
+        .expect("the EMA teacher must be in the container");
     let read = |m: &DormouseModel| {
         m.embedding
             .weight
@@ -149,7 +160,15 @@ fn ckpt_carries_the_state_the_config_cannot() {
             .try_to_vec::<f32>()
             .expect("embedding readable")
     };
-    assert_eq!(read(&t2), read(&teacher), "the restored teacher must equal the saved one");
-    assert_ne!(read(&t2), read(&model), "the teacher must not be a copy of the student");
+    assert_eq!(
+        read(&t2),
+        read(&teacher),
+        "the restored teacher must equal the saved one"
+    );
+    assert_ne!(
+        read(&t2),
+        read(&model),
+        "the teacher must not be a copy of the student"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

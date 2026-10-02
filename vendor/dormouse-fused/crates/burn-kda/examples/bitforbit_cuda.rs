@@ -49,7 +49,10 @@ fn dump4(t: &Tensor<4>, name: &str) {
     let dims = t.shape().dims::<4>();
     std::fs::write(
         format!("{OUT}/{name}.shape"),
-        dims.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(" "),
+        dims.iter()
+            .map(|d| d.to_string())
+            .collect::<Vec<_>>()
+            .join(" "),
     )
     .expect("shape");
     write_f32(
@@ -87,9 +90,17 @@ fn main() {
 
     // ── path F: fused CUDA chunk kernel ──────────────────────────────
     let st0 = Tensor::<4>::zeros([b, hv, hk, vd], &dev);
-    let (out_fused, state_fused) =
-        kda_fused_chunk::<CudaBare>(q.clone(), k.clone(), v.clone(), g.clone(), b_k.clone(), b_v, st0, chunk)
-            .expect("fused path must apply on CudaBare");
+    let (out_fused, state_fused) = kda_fused_chunk::<CudaBare>(
+        q.clone(),
+        k.clone(),
+        v.clone(),
+        g.clone(),
+        b_k.clone(),
+        b_v,
+        st0,
+        chunk,
+    )
+    .expect("fused path must apply on CudaBare");
 
     // ── path R: per-token reference on CUDA (forward_recurrent's loop) ──
     let mut s = Tensor::<4>::zeros([b, hv, hk, vd], &dev);
@@ -118,10 +129,26 @@ fn main() {
     dump4(&state_ref, "state_ref_cuda");
 
     // ── compare: fused vs CUDA reference vs CPU reference ────────────
-    let of = out_fused.clone().into_data().try_to_vec::<f32>().expect("f32");
-    let or = out_ref.clone().into_data().try_to_vec::<f32>().expect("f32");
-    let sf = state_fused.clone().into_data().try_to_vec::<f32>().expect("f32");
-    let sr = state_ref.clone().into_data().try_to_vec::<f32>().expect("f32");
+    let of = out_fused
+        .clone()
+        .into_data()
+        .try_to_vec::<f32>()
+        .expect("f32");
+    let or = out_ref
+        .clone()
+        .into_data()
+        .try_to_vec::<f32>()
+        .expect("f32");
+    let sf = state_fused
+        .clone()
+        .into_data()
+        .try_to_vec::<f32>()
+        .expect("f32");
+    let sr = state_ref
+        .clone()
+        .into_data()
+        .try_to_vec::<f32>()
+        .expect("f32");
     dmax(&of, &or, "out   fused vs ref_cuda");
     dmax(&sf, &sr, "state fused vs ref_cuda");
 

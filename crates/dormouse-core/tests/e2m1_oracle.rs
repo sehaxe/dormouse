@@ -114,7 +114,12 @@ fn the_e2m1_grid_is_torchaos_grid() {
         theirs,
         "our E2M1 differs from torchao's own table at {TORCHAO_SHA}"
     );
-    assert_eq!(theirs.len(), 8, "e2m1 has 8 positive magnitudes, not {}", theirs.len());
+    assert_eq!(
+        theirs.len(),
+        8,
+        "e2m1 has 8 positive magnitudes, not {}",
+        theirs.len()
+    );
     assert!(
         !theirs.iter().any(|v| (*v - 0.75).abs() < 1e-9),
         "0.75 reappeared in the grid -- it is not an e2m1 level (AGENTS.md 3.2)"
@@ -263,7 +268,10 @@ fn the_tie_points_are_well_formed() {
     let mut prev = f32::NEG_INFINITY;
     for i in 1..E2M1.len() {
         let tie = 0.5 * (E2M1[i - 1] + E2M1[i]);
-        assert!(tie > E2M1[i - 1] && tie < E2M1[i], "tie {tie} is not interior");
+        assert!(
+            tie > E2M1[i - 1] && tie < E2M1[i],
+            "tie {tie} is not interior"
+        );
         assert!(tie.is_finite());
         assert!(tie > prev, "tie points must be distinct and ascending");
         prev = tie;

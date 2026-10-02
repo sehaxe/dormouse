@@ -241,7 +241,13 @@ struct Group {
 
 impl Group {
     fn rms(&self) -> f64 {
-        (self.val.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / self.val.len() as f64).sqrt()
+        (self
+            .val
+            .iter()
+            .map(|v| (*v as f64) * (*v as f64))
+            .sum::<f64>()
+            / self.val.len() as f64)
+            .sqrt()
     }
 }
 
@@ -284,58 +290,95 @@ fn p<const D: usize>(
 /// reader audits against the struct — stopped matching.
 fn params(m: &KdaModule, grads: Option<&Grads>) -> Vec<(Group, Option<Vec<f32>>)> {
     let mut v: Vec<(Group, Option<Vec<f32>>)> = vec![
-        p("q_proj.weight", &m.q_proj.weight, grads,
-          |m, v, s, d| { m.q_proj.weight = Param::from_tensor(t2(v, s, d)); }),
-        p("k_proj.weight", &m.k_proj.weight, grads,
-          |m, v, s, d| { m.k_proj.weight = Param::from_tensor(t2(v, s, d)); }),
-        p("v_proj.weight", &m.v_proj.weight, grads,
-          |m, v, s, d| { m.v_proj.weight = Param::from_tensor(t2(v, s, d)); }),
-        p("decay.w_up.weight", &m.decay.w_up.weight, grads,
-          |m, v, s, d| { m.decay.w_up.weight = Param::from_tensor(t2(v, s, d)); }),
-        p("decay.w_down.weight", &m.decay.w_down.weight, grads,
-          |m, v, s, d| { m.decay.w_down.weight = Param::from_tensor(t2(v, s, d)); }),
-        p("decay.b_alpha", &m.decay.b_alpha, grads,
-          |m, v, s, d| { m.decay.b_alpha = Param::from_tensor(t1(v, s, d)); }),
-        p("decay.a_log", &m.decay.a_log, grads,
-          |m, v, s, d| { m.decay.a_log = Param::from_tensor(t2(v, s, d)); }),
-        p("beta_proj.weight", &m.beta_proj.weight, grads,
-          |m, v, s, d| { m.beta_proj.weight = Param::from_tensor(t2(v, s, d)); }),
-        p("o_norm_w", &m.o_norm_w, grads,
-          |m, v, s, d| { m.o_norm_w = Param::from_tensor(t1(v, s, d)); }),
-        p("o_proj.weight", &m.o_proj.weight, grads,
-          |m, v, s, d| { m.o_proj.weight = Param::from_tensor(t2(v, s, d)); }),
+        p("q_proj.weight", &m.q_proj.weight, grads, |m, v, s, d| {
+            m.q_proj.weight = Param::from_tensor(t2(v, s, d));
+        }),
+        p("k_proj.weight", &m.k_proj.weight, grads, |m, v, s, d| {
+            m.k_proj.weight = Param::from_tensor(t2(v, s, d));
+        }),
+        p("v_proj.weight", &m.v_proj.weight, grads, |m, v, s, d| {
+            m.v_proj.weight = Param::from_tensor(t2(v, s, d));
+        }),
+        p(
+            "decay.w_up.weight",
+            &m.decay.w_up.weight,
+            grads,
+            |m, v, s, d| {
+                m.decay.w_up.weight = Param::from_tensor(t2(v, s, d));
+            },
+        ),
+        p(
+            "decay.w_down.weight",
+            &m.decay.w_down.weight,
+            grads,
+            |m, v, s, d| {
+                m.decay.w_down.weight = Param::from_tensor(t2(v, s, d));
+            },
+        ),
+        p("decay.b_alpha", &m.decay.b_alpha, grads, |m, v, s, d| {
+            m.decay.b_alpha = Param::from_tensor(t1(v, s, d));
+        }),
+        p("decay.a_log", &m.decay.a_log, grads, |m, v, s, d| {
+            m.decay.a_log = Param::from_tensor(t2(v, s, d));
+        }),
+        p(
+            "beta_proj.weight",
+            &m.beta_proj.weight,
+            grads,
+            |m, v, s, d| {
+                m.beta_proj.weight = Param::from_tensor(t2(v, s, d));
+            },
+        ),
+        p("o_norm_w", &m.o_norm_w, grads, |m, v, s, d| {
+            m.o_norm_w = Param::from_tensor(t1(v, s, d));
+        }),
+        p("o_proj.weight", &m.o_proj.weight, grads, |m, v, s, d| {
+            m.o_proj.weight = Param::from_tensor(t2(v, s, d));
+        }),
     ];
 
     // The output gate. `GateMode::FullRank` (the trainer's default) has one
     // matrix; `LowRank` has a pair. Both are this arm under one flag, so both
     // are listed and the absent one is asserted, not skipped.
     if let Some(g) = &m.o_gate {
-        v.push(p("o_gate.weight", &g.weight, grads,
-          |m, v, s, d| { let mut l = m.o_gate.clone().unwrap(); l.weight = Param::from_tensor(t2(v, s, d)); m.o_gate = Some(l); }));
+        v.push(p("o_gate.weight", &g.weight, grads, |m, v, s, d| {
+            let mut l = m.o_gate.clone().unwrap();
+            l.weight = Param::from_tensor(t2(v, s, d));
+            m.o_gate = Some(l);
+        }));
     }
     if let Some(g) = &m.o_gate_up {
-        v.push(p("o_gate_up.weight", &g.weight, grads,
-          |m, v, s, d| { let mut l = m.o_gate_up.clone().unwrap(); l.weight = Param::from_tensor(t2(v, s, d)); m.o_gate_up = Some(l); }));
+        v.push(p("o_gate_up.weight", &g.weight, grads, |m, v, s, d| {
+            let mut l = m.o_gate_up.clone().unwrap();
+            l.weight = Param::from_tensor(t2(v, s, d));
+            m.o_gate_up = Some(l);
+        }));
     }
     if let Some(g) = &m.o_gate_down {
-        v.push(p("o_gate_down.weight", &g.weight, grads,
-          |m, v, s, d| { let mut l = m.o_gate_down.clone().unwrap(); l.weight = Param::from_tensor(t2(v, s, d)); m.o_gate_down = Some(l); }));
+        v.push(p("o_gate_down.weight", &g.weight, grads, |m, v, s, d| {
+            let mut l = m.o_gate_down.clone().unwrap();
+            l.weight = Param::from_tensor(t2(v, s, d));
+            m.o_gate_down = Some(l);
+        }));
     }
 
     // The short conv. `None` on the trainer's shape, so there the prompt's
     // "and the short conv if present" resolves to three parameters that do not
     // exist — the short-conv test below is the config where they do.
     if let Some(q) = &m.q_conv_w {
-        v.push(p("q_conv_w", q, grads,
-          |m, v, s, d| { m.q_conv_w = Some(Param::from_tensor(t2(v, s, d))); }));
+        v.push(p("q_conv_w", q, grads, |m, v, s, d| {
+            m.q_conv_w = Some(Param::from_tensor(t2(v, s, d)));
+        }));
     }
     if let Some(k) = &m.k_conv_w {
-        v.push(p("k_conv_w", k, grads,
-          |m, v, s, d| { m.k_conv_w = Some(Param::from_tensor(t2(v, s, d))); }));
+        v.push(p("k_conv_w", k, grads, |m, v, s, d| {
+            m.k_conv_w = Some(Param::from_tensor(t2(v, s, d)));
+        }));
     }
     if let Some(vw) = &m.v_conv_w {
-        v.push(p("v_conv_w", vw, grads,
-          |m, v, s, d| { m.v_conv_w = Some(Param::from_tensor(t2(v, s, d))); }));
+        v.push(p("v_conv_w", vw, grads, |m, v, s, d| {
+            m.v_conv_w = Some(Param::from_tensor(t2(v, s, d)));
+        }));
     }
 
     v
@@ -395,13 +438,12 @@ fn fd_step(prm: &Group, gmax: f64, loss: f64) -> (f64, &'static str) {
 /// Coordinates: the analytic argmax, then `N_SPREAD` spread over the tensor.
 /// Deterministic, and printed, so a rerun checks the same ones.
 fn coords(g: &[f32]) -> Vec<usize> {
-    let mut c = vec![
-        g.iter()
-            .enumerate()
-            .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
-            .map(|(i, _)| i)
-            .unwrap_or(0),
-    ];
+    let mut c = vec![g
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
+        .map(|(i, _)| i)
+        .unwrap_or(0)];
     let step = (g.len() / N_SPREAD).max(1);
     // dedup: a group with fewer entries than coordinates would otherwise print
     // the same index twice and look like more evidence than it is.
@@ -460,7 +502,16 @@ where
     // Reference 1: central differences, at this group's own derived step.
     let fd = reference_fd::<S>(cuda, x, prm, &grad, loss, dev, amax as f64);
 
-    Verdict { name, non_zero: amax > 0.0, finite, amax, cpu_rel, cpu_maxdiff, cpu_amax, fd }
+    Verdict {
+        name,
+        non_zero: amax > 0.0,
+        finite,
+        amax,
+        cpu_rel,
+        cpu_maxdiff,
+        cpu_amax,
+        fd,
+    }
 }
 
 /// `max|a − b| / max|b|` over the whole tensor — the measure every other
@@ -475,7 +526,11 @@ where
 /// 1e-6. Relative to the tensor's own scale, an entry is judged by how much it
 /// contributes to the gradient, which is the question.
 fn worst_rel(a: &[f32], b: &[f32]) -> (f64, f64, f64) {
-    assert_eq!(a.len(), b.len(), "gradient shapes differ between references");
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "gradient shapes differ between references"
+    );
     let scale = b.iter().fold(0.0f64, |m, y| m.max((*y as f64).abs()));
     let worst = a
         .iter()
@@ -538,14 +593,7 @@ where
     Ok((h, worst))
 }
 
-fn fd_at<S>(
-    base: &KdaModule,
-    x: &Tensor<3>,
-    prm: &Group,
-    idx: usize,
-    dev: &Device,
-    h: f64,
-) -> f64
+fn fd_at<S>(base: &KdaModule, x: &Tensor<3>, prm: &Group, idx: usize, dev: &Device, h: f64) -> f64
 where
     S: burn_autodiff::checkpoint::strategy::CheckpointStrategy,
     burn::tensor::DispatchTensor: burn::backend::DispatchKindConversion<Autodiff<CudaBare, S>>,
@@ -625,10 +673,7 @@ fn input(f: &Fixture) -> (Tensor<3>, Tensor<3>) {
 /// The CPU `NdArray` reference: the same module with the same weights, the
 /// same input values, and its own autodiff graph on a different device and a
 /// different chunk implementation. Returns the gradient per parameter name.
-fn cpu_reference(
-    f: &Fixture,
-    xs: &Tensor<3>,
-) -> (f64, Vec<(&'static str, Vec<f32>)>) {
+fn cpu_reference(f: &Fixture, xs: &Tensor<3>) -> (f64, Vec<(&'static str, Vec<f32>)>) {
     // The reference must be on a DIFFERENT DEVICE, asserted rather than
     // assumed: `Device::default()` is a function call, and if it ever named a
     // GPU this would be a second CUDA run with the same kernels — the
@@ -647,16 +692,30 @@ fn cpu_reference(
     println!("CPU reference backend: {dev_name}");
     let mut m = KdaModule::new(&f.cfg, 0.9, &f.cpu.clone().autodiff());
     for (prm, _) in params(&f.m, None) {
-        (prm.set)(&mut m, prm.val.clone(), &prm.shape, &f.cpu.clone().autodiff());
+        (prm.set)(
+            &mut m,
+            prm.val.clone(),
+            &prm.shape,
+            &f.cpu.clone().autodiff(),
+        );
     }
-    let (y, s) = m.forward_train_state::<Autodiff<NdArray, BalancedCheckpointing>>(xs.clone(), None);
+    let (y, s) =
+        m.forward_train_state::<Autodiff<NdArray, BalancedCheckpointing>>(xs.clone(), None);
     let sq = |v: Vec<f32>| v.iter().map(|t| (*t as f64) * (*t as f64)).sum::<f64>();
     let loss = sq(host(&y.clone())) + sq(host(&s.clone()));
-    let grads = y.powf_scalar(2.0).sum().add(s.powf_scalar(2.0).sum()).backward();
+    let grads = y
+        .powf_scalar(2.0)
+        .sum()
+        .add(s.powf_scalar(2.0).sum())
+        .backward();
     let out = params(&m, Some(&grads))
         .into_iter()
         .map(|(prm, g)| {
-            assert!(g.is_some(), "the CPU reference produced no gradient for {}", prm.name);
+            assert!(
+                g.is_some(),
+                "the CPU reference produced no gradient for {}",
+                prm.name
+            );
             (prm.name, g.unwrap())
         })
         .collect();
@@ -686,8 +745,13 @@ where
     burn::tensor::DispatchTensor: burn::backend::DispatchKindConversion<Autodiff<CudaBare, S>>,
 {
     burn_gdn2::reset_fused_calls();
-    let (y, s) = f.m.forward_train_state::<Autodiff<CudaBare, S>>(x.clone(), None);
-    let grads = y.powf_scalar(2.0).sum().add(s.powf_scalar(2.0).sum()).backward();
+    let (y, s) =
+        f.m.forward_train_state::<Autodiff<CudaBare, S>>(x.clone(), None);
+    let grads = y
+        .powf_scalar(2.0)
+        .sum()
+        .add(s.powf_scalar(2.0).sum())
+        .backward();
     let counts = burn_gdn2::seam_counts();
     let loss = cuda_loss::<S>(&f.m, x);
     println!("\n=== {label} ===");
@@ -725,8 +789,19 @@ where
     );
     let mut out = vec![];
     for (prm, g) in params(&f.m, Some(&grads)) {
-        let c = cpu.iter().find(|(n, _)| *n == prm.name).map(|(_, v)| v.as_slice());
-        out.push(check_group::<S>(&f.m, x, &prm, g, c, loss, &f.cuda.clone().autodiff()));
+        let c = cpu
+            .iter()
+            .find(|(n, _)| *n == prm.name)
+            .map(|(_, v)| v.as_slice());
+        out.push(check_group::<S>(
+            &f.m,
+            x,
+            &prm,
+            g,
+            c,
+            loss,
+            &f.cuda.clone().autodiff(),
+        ));
     }
     print_table(&out, label);
     out
@@ -801,9 +876,10 @@ fn assert_matches(v: &[Verdict]) {
     let mut fd_carried = vec![];
     for x in v {
         match &x.fd {
-            Ok((h, r)) if *r >= FD_BAR => {
-                fd_bad.push(format!("{} (rel {r:.2e} >= {FD_BAR:.0e} at h={h:.1e})", x.name))
-            }
+            Ok((h, r)) if *r >= FD_BAR => fd_bad.push(format!(
+                "{} (rel {r:.2e} >= {FD_BAR:.0e} at h={h:.1e})",
+                x.name
+            )),
             Ok(_) => {}
             Err(_) if x.cpu_rel >= CPU_BAR_UNRESOLVED_FD => fd_carried.push(format!(
                 "{} (cpu_rel {:.2e} >= {CPU_BAR_UNRESOLVED_FD:.0e})",
@@ -884,7 +960,10 @@ fn every_group_gets_a_gradient_on_the_fused_arm() {
     // message made.
     burn_gdn2::reset_fused_calls();
     let (y, s) = f.m.forward_train_state::<AdNo>(x.clone(), None);
-    y.powf_scalar(2.0).sum().add(s.powf_scalar(2.0).sum()).backward();
+    y.powf_scalar(2.0)
+        .sum()
+        .add(s.powf_scalar(2.0).sum())
+        .backward();
     let c = burn_gdn2::seam_counts();
     assert!(
         c.1 > 0 && c.2 > 0,
@@ -898,7 +977,8 @@ fn every_group_gets_a_gradient_on_the_fused_arm() {
         show(c)
     );
     assert_eq!(
-        c.4, 0,
+        c.4,
+        0,
         "the ops path also ran ({}); the seam declined, so this was not the fused arm",
         show(c)
     );
@@ -920,7 +1000,11 @@ fn every_group_gets_a_gradient_on_the_fused_arm() {
          disagreement, recomputed: {}\n    {} of {} groups are outside {CPU_BAR:.0e}. FLOW is \
          asserted above; the numbers are here so this arm can never be reported as \
          numerically verified. docs/reviews/kda-gradflow-2026-09-30.md",
-        if bad.is_empty() { "NONE — the fused adjoint now agrees".into() } else { bad.join("\n    ") },
+        if bad.is_empty() {
+            "NONE — the fused adjoint now agrees".into()
+        } else {
+            bad.join("\n    ")
+        },
         bad.len(),
         v.len()
     );
@@ -958,8 +1042,15 @@ fn every_group_is_present_for_the_config() {
     let f = fixture(cfg_trainer());
     let (x, _) = input(&f);
     let (y, s) = f.m.forward_train_state::<AdBal>(x, None);
-    let grads = y.powf_scalar(2.0).sum().add(s.powf_scalar(2.0).sum()).backward();
-    let names: Vec<&str> = params(&f.m, Some(&grads)).iter().map(|(p, _)| p.name).collect();
+    let grads = y
+        .powf_scalar(2.0)
+        .sum()
+        .add(s.powf_scalar(2.0).sum())
+        .backward();
+    let names: Vec<&str> = params(&f.m, Some(&grads))
+        .iter()
+        .map(|(p, _)| p.name)
+        .collect();
     assert_eq!(
         names,
         [
@@ -987,10 +1078,20 @@ fn every_group_is_present_for_the_config() {
     let f = fixture(cfg_short_conv());
     let (x, _) = input(&f);
     let (y, s) = f.m.forward_train_state::<AdBal>(x, None);
-    let grads = y.powf_scalar(2.0).sum().add(s.powf_scalar(2.0).sum()).backward();
-    let names: Vec<&str> = params(&f.m, Some(&grads)).iter().map(|(p, _)| p.name).collect();
+    let grads = y
+        .powf_scalar(2.0)
+        .sum()
+        .add(s.powf_scalar(2.0).sum())
+        .backward();
+    let names: Vec<&str> = params(&f.m, Some(&grads))
+        .iter()
+        .map(|(p, _)| p.name)
+        .collect();
     for want in ["q_conv_w", "k_conv_w", "v_conv_w"] {
-        assert!(names.contains(&want), "{want} missing with use_short_conv=true");
+        assert!(
+            names.contains(&want),
+            "{want} missing with use_short_conv=true"
+        );
     }
     assert_eq!(names.len(), 14, "the conv-on group list is {names:?}");
 }

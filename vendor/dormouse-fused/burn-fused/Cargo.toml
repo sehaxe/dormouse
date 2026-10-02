@@ -25,7 +25,6 @@ autodiff = [
     "burn-kda/autodiff",
     "burn-mhc/autodiff",
     "burn-rope/autodiff",
-    "burn-sct/autodiff",
     "burn-situ/autodiff",
     "dep:burn-autodiff",
 ]
@@ -39,15 +38,10 @@ cuda = [
     "burn-muon-plus/cuda",
     "burn-rmsnorm/cuda",
     "burn-rope/cuda",
-    "burn-sct/cuda",
     "burn-situ/cuda",
     "burn-spectral/cuda",
     "burn-swiglu/cuda",
     "dep:burn-cuda",
-]
-
-serde = [
-    "burn-sct/serde",
 ]
 
 # every member ships `std`; the facade default is exactly this
@@ -57,7 +51,6 @@ std = [
     "burn-dspark/std",
     "burn-eggroll/std",
     "burn-engram/std",
-    "burn-es/std",
     "burn-gdn2/std",
     "burn-jepa/std",
     "burn-kda/std",
@@ -68,7 +61,6 @@ std = [
     "burn-ptrn/std",
     "burn-rmsnorm/std",
     "burn-rope/std",
-    "burn-sct/std",
     "burn-situ/std",
     "burn-spectral/std",
     "burn-swiglu/std",
@@ -84,7 +76,6 @@ burn-bitnet = { path = "../crates/burn-bitnet", default-features = false }
 burn-dspark = { path = "../crates/burn-dspark", default-features = false }
 burn-eggroll = { path = "../crates/burn-eggroll", default-features = false }
 burn-engram = { path = "../crates/burn-engram", default-features = false }
-burn-es = { path = "../crates/burn-es", default-features = false }
 burn-gdn2 = { path = "../crates/burn-gdn2", default-features = false }
 burn-jepa = { path = "../crates/burn-jepa", default-features = false }
 burn-kda = { path = "../crates/burn-kda", default-features = false }
@@ -95,7 +86,6 @@ burn-parcae = { path = "../crates/burn-parcae", default-features = false }
 burn-ptrn = { path = "../crates/burn-ptrn", default-features = false }
 burn-rmsnorm = { path = "../crates/burn-rmsnorm", default-features = false }
 burn-rope = { path = "../crates/burn-rope", default-features = false }
-burn-sct = { path = "../crates/burn-sct", default-features = false }
 burn-situ = { path = "../crates/burn-situ", default-features = false }
 burn-spectral = { path = "../crates/burn-spectral", default-features = false }
 burn-swiglu = { path = "../crates/burn-swiglu", default-features = false }

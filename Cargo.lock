@@ -735,7 +735,6 @@ dependencies = [
  "burn-cuda",
  "burn-mor",
  "burn-ndarray",
- "burn-tensor",
  "log",
 ]
 
@@ -2869,15 +2868,12 @@ name = "dormouse-cli"
 version = "0.1.0"
 dependencies = [
  "axum",
- "burn",
  "clap",
  "dormouse-core",
- "dormouse-data",
  "dormouse-train",
  "libc",
  "rand 0.8.8",
  "serde",
- "serde_json",
  "tokio",
 ]
 
@@ -2896,12 +2892,10 @@ dependencies = [
  "burn-kda",
  "burn-mhc",
  "burn-mor",
- "burn-nn",
  "burn-rmsnorm",
  "burn-situ",
  "burn-spectral",
  "burn-tensor",
- "rand 0.8.8",
  "serde",
  "toml 0.8.23",
 ]
@@ -2924,7 +2918,6 @@ dependencies = [
  "burn-dispatch",
  "burn-muon-plus",
  "burn-spectral",
- "burn-tensor",
  "clap",
  "crc32fast",
  "cubecl-cuda",
@@ -2934,7 +2927,6 @@ dependencies = [
  "dormouse-core",
  "dormouse-data",
  "half",
- "rand 0.8.8",
  "serde",
  "toml 0.8.23",
 ]

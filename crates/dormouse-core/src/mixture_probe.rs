@@ -118,7 +118,10 @@ pub struct MixtureStats {
 /// Reduce a capture to [`MixtureStats`]. Host arithmetic over the capture's
 /// own numbers; the only device read is the one `take` already made.
 pub fn stats(cap: &[Tensor<2>]) -> MixtureStats {
-    assert!(!cap.is_empty(), "mixture_probe::stats: empty capture (arm() before the forward?)");
+    assert!(
+        !cap.is_empty(),
+        "mixture_probe::stats: empty capture (arm() before the forward?)"
+    );
     let rows: Vec<Vec<Vec<f64>>> = cap
         .iter()
         .map(|t| {
@@ -128,8 +131,17 @@ pub fn stats(cap: &[Tensor<2>]) -> MixtureStats {
                 .try_to_vec()
                 .expect("mixture_probe::stats: reading the captured mixture back");
             let [b, e] = t.dims();
-            assert_eq!(v.len(), b * e, "mixture_probe::stats: {} values for a [{}, {}] tensor", v.len(), b, e);
-            v.chunks(e).map(|r| r.iter().map(|x| *x as f64).collect()).collect()
+            assert_eq!(
+                v.len(),
+                b * e,
+                "mixture_probe::stats: {} values for a [{}, {}] tensor",
+                v.len(),
+                b,
+                e
+            );
+            v.chunks(e)
+                .map(|r| r.iter().map(|x| *x as f64).collect())
+                .collect()
         })
         .collect();
     let e = rows[0][0].len();
@@ -137,12 +149,22 @@ pub fn stats(cap: &[Tensor<2>]) -> MixtureStats {
         let dot: f64 = a.iter().zip(b).map(|(x, y)| x * y).sum();
         let na: f64 = a.iter().map(|x| x * x).sum::<f64>().sqrt();
         let nb: f64 = b.iter().map(|x| x * x).sum::<f64>().sqrt();
-        if na == 0.0 || nb == 0.0 { 0.0 } else { dot / (na * nb) }
+        if na == 0.0 || nb == 0.0 {
+            0.0
+        } else {
+            dot / (na * nb)
+        }
     };
     let top1 = |r: &[f64]| {
         r.iter()
             .enumerate()
-            .fold((0usize, f64::NEG_INFINITY), |(bi, bv), (i, &v)| if v > bv { (i, v) } else { (bi, bv) })
+            .fold((0usize, f64::NEG_INFINITY), |(bi, bv), (i, &v)| {
+                if v > bv {
+                    (i, v)
+                } else {
+                    (bi, bv)
+                }
+            })
             .0
     };
     let mean: Vec<Vec<f64>> = rows
@@ -178,9 +200,7 @@ pub fn stats(cap: &[Tensor<2>]) -> MixtureStats {
     // arm it is exactly the top-k. Both statistics below are over that set,
     // which is what the Sparse-Layers anchors are about - "which experts did
     // this token use", not "how did it weight all of them".
-    let support = |r: &[f64]| -> Vec<usize> {
-        (0..r.len()).filter(|&j| r[j] > 0.0).collect()
-    };
+    let support = |r: &[f64]| -> Vec<usize> { (0..r.len()).filter(|&j| r[j] > 0.0).collect() };
     let cross_iter_identical: Vec<f64> = (1..rows.len())
         .map(|i| {
             rows[i]
@@ -207,11 +227,25 @@ pub fn stats(cap: &[Tensor<2>]) -> MixtureStats {
         .map(|r| support(r).len() as f64)
         .sum::<f64>()
         / (rows.iter().map(|it| it.len()).sum::<usize>()) as f64;
-    let total: f64 = rows.iter().flat_map(|it| it.iter()).map(|r| r.iter().sum::<f64>()).sum();
+    let total: f64 = rows
+        .iter()
+        .flat_map(|it| it.iter())
+        .map(|r| r.iter().sum::<f64>())
+        .sum();
     let load: Vec<f64> = (0..e)
-        .map(|j| rows.iter().flat_map(|it| it.iter()).map(|r| r[j]).sum::<f64>() / total)
+        .map(|j| {
+            rows.iter()
+                .flat_map(|it| it.iter())
+                .map(|r| r[j])
+                .sum::<f64>()
+                / total
+        })
         .collect();
-    let entropy: f64 = load.iter().filter(|p| **p > 0.0).map(|p| -(p * p.ln())).sum();
+    let entropy: f64 = load
+        .iter()
+        .filter(|p| **p > 0.0)
+        .map(|p| -(p * p.ln()))
+        .sum();
     MixtureStats {
         mean,
         cross_iter_cosine,
@@ -231,7 +265,11 @@ pub fn stats(cap: &[Tensor<2>]) -> MixtureStats {
 /// the selection at all"). A number near 0 means the mixture is a function of
 /// the iteration alone - a learned per-pass bias wearing a mixture's clothes.
 pub fn top1_disagreement(a: &[Tensor<2>], b: &[Tensor<2>]) -> Vec<f64> {
-    assert_eq!(a.len(), b.len(), "top1_disagreement: captures have different depths");
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "top1_disagreement: captures have different depths"
+    );
     let top1 = |t: &Tensor<2>| -> Vec<usize> {
         let v: Vec<f32> = t
             .clone()
@@ -244,7 +282,11 @@ pub fn top1_disagreement(a: &[Tensor<2>], b: &[Tensor<2>]) -> Vec<f64> {
                 r.iter()
                     .enumerate()
                     .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &x)| {
-                        if x > bv { (i, x) } else { (bi, bv) }
+                        if x > bv {
+                            (i, x)
+                        } else {
+                            (bi, bv)
+                        }
                     })
                     .0
             })
@@ -254,7 +296,11 @@ pub fn top1_disagreement(a: &[Tensor<2>], b: &[Tensor<2>]) -> Vec<f64> {
         .zip(b)
         .map(|(x, y)| {
             let (tx, ty) = (top1(x), top1(y));
-            assert_eq!(tx.len(), ty.len(), "top1_disagreement: captures have different batch shapes");
+            assert_eq!(
+                tx.len(),
+                ty.len(),
+                "top1_disagreement: captures have different batch shapes"
+            );
             tx.iter().zip(&ty).filter(|(p, q)| p != q).count() as f64 / tx.len() as f64
         })
         .collect()
@@ -288,25 +334,47 @@ mod tests {
     /// comment is here rather than the assertion alone.
     #[test]
     fn stats_separates_a_permutation_from_a_copy() {
-        let a = t(vec![vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 0.0], vec![0.0, 0.0, 1.0]]);
-        let permuted = t(vec![vec![0.0, 1.0, 0.0], vec![0.0, 0.0, 1.0], vec![1.0, 0.0, 0.0]]);
-        let copy = t(vec![vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 0.0], vec![0.0, 0.0, 1.0]]);
+        let a = t(vec![
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+        ]);
+        let permuted = t(vec![
+            vec![0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+            vec![1.0, 0.0, 0.0],
+        ]);
+        let copy = t(vec![
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+        ]);
         let perm = stats(&[a.clone(), permuted]);
         assert!(
             perm.cross_iter_cosine[0].abs() < 1e-9,
             "a permutation of the weights is ORTHOGONAL (cosine 0), got {}",
             perm.cross_iter_cosine[0]
         );
-        assert_eq!(perm.cross_iter_top1_agree[0], 0.0, "a permutation agrees on no position");
+        assert_eq!(
+            perm.cross_iter_top1_agree[0], 0.0,
+            "a permutation agrees on no position"
+        );
         let same = stats(&[a, copy]);
         assert!(
             (same.cross_iter_cosine[0] - 1.0).abs() < 1e-9,
             "an identical iteration has cosine 1, got {}",
             same.cross_iter_cosine[0]
         );
-        assert_eq!(same.cross_iter_top1_agree[0], 1.0, "an identical iteration agrees everywhere");
+        assert_eq!(
+            same.cross_iter_top1_agree[0], 1.0,
+            "an identical iteration agrees everywhere"
+        );
         for s in [&perm, &same] {
-            assert!((s.effective_experts - 3.0).abs() < 1e-9, "uniform load over 3 experts is 3, got {}", s.effective_experts);
+            assert!(
+                (s.effective_experts - 3.0).abs() < 1e-9,
+                "uniform load over 3 experts is 3, got {}",
+                s.effective_experts
+            );
             for (l, p) in s.load.iter().zip([1.0 / 3.0; 3]) {
                 assert!((l - p).abs() < 1e-9, "load must be uniform: {l} vs {p}");
             }
@@ -330,10 +398,17 @@ mod tests {
     fn top1_disagreement_is_the_input_dependence_read() {
         let a = t(vec![vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 0.0]]);
         let b = t(vec![vec![0.0, 0.0, 1.0], vec![0.0, 1.0, 0.0]]);
-        let d = top1_disagreement(&[a.clone()], &[b.clone()]);
+        let d = top1_disagreement(std::slice::from_ref(&a), std::slice::from_ref(&b));
         assert_eq!(d.len(), 1);
-        assert!((d[0] - 0.5).abs() < 1e-9, "one of two positions flipped: {}", d[0]);
-        assert_eq!(top1_disagreement(&[a.clone()], &[a.clone()])[0], 0.0);
+        assert!(
+            (d[0] - 0.5).abs() < 1e-9,
+            "one of two positions flipped: {}",
+            d[0]
+        );
+        assert_eq!(
+            top1_disagreement(std::slice::from_ref(&a), std::slice::from_ref(&a))[0],
+            0.0
+        );
     }
 
     /// ZERO DEFAULT. An ordinary forward records nothing, and the sink stays
@@ -341,7 +416,10 @@ mod tests {
     #[test]
     fn disarmed_is_the_default() {
         assert!(!armed(), "a fresh thread must be disarmed");
-        assert!(take().is_none(), "take() on a disarmed sink is None, not an empty capture");
+        assert!(
+            take().is_none(),
+            "take() on a disarmed sink is None, not an empty capture"
+        );
         let _ = t(vec![vec![1.0, 0.0], vec![0.0, 1.0]]);
         record(&t(vec![vec![1.0, 0.0], vec![0.0, 1.0]]));
         assert!(take().is_none(), "record() while disarmed must be a no-op");
@@ -375,13 +453,28 @@ mod tests {
             vec![0.25, 0.25, 0.25, 0.25],
         ]);
         let s = stats(&[dense.clone(), dense.clone()]);
-        assert_eq!(s.cross_iter_identical[0], 1.0, "an all-experts set is identical");
+        assert_eq!(
+            s.cross_iter_identical[0], 1.0,
+            "an all-experts set is identical"
+        );
         assert_eq!(s.cross_iter_disjoint[0], 0.0, "and never disjoint");
-        assert!((s.mean_support - 4.0).abs() < 1e-9, "dense support is every expert, got {}", s.mean_support);
+        assert!(
+            (s.mean_support - 4.0).abs() < 1e-9,
+            "dense support is every expert, got {}",
+            s.mean_support
+        );
 
         // A ROUTED k=1 capture: one live expert per row, and the winner moves.
-        let routed = t(vec![vec![1.0, 0.0, 0.0, 0.0], vec![0.0, 1.0, 0.0, 0.0], vec![0.0, 0.0, 0.0, 1.0]]);
-        let moved = t(vec![vec![0.0, 0.0, 1.0, 0.0], vec![0.0, 1.0, 0.0, 0.0], vec![1.0, 0.0, 0.0, 0.0]]);
+        let routed = t(vec![
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0, 0.0],
+            vec![0.0, 0.0, 0.0, 1.0],
+        ]);
+        let moved = t(vec![
+            vec![0.0, 0.0, 1.0, 0.0],
+            vec![0.0, 1.0, 0.0, 0.0],
+            vec![1.0, 0.0, 0.0, 0.0],
+        ]);
         let s = stats(&[routed.clone(), moved]);
         assert!(
             (s.mean_support - 1.0).abs() < 1e-9,

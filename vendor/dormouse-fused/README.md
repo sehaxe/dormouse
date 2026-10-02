@@ -42,7 +42,6 @@ tools/            gen_facade.py, gpu-gate.sh, test-feature-matrix.sh
 | `burn-dspark` | — | yes | speculative decoding (DeepSeek AI, arXiv 2607.05147) |
 | `burn-eggroll` | — | no | EGGROLL — low-rank evolutionary strategies (arXiv:2511.16652) |
 | `burn-engram` | — | yes | conditional memory — n-gram hash embeddings, multi-head gated fusion |
-| `burn-es` | — | no | Evolution Strategies |
 | `burn-gdn2` | fwd+bwd | yes | Gated DeltaNet 2 — channel-wise erase/write gates |
 | `burn-jepa` | — | yes | data2vec 2.0-style EMA teacher + masked latent prediction |
 | `burn-kda` | fwd+bwd | yes | Kimi Delta Attention — data-dependent write strength, channel-wise decay |
@@ -53,7 +52,6 @@ tools/            gen_facade.py, gpu-gate.sh, test-feature-matrix.sh
 | `burn-ptrn` | — | no | Probabilistic Tiny Recursive Model — test-time scaling |
 | `burn-rmsnorm` | fwd | yes | RMS normalization |
 | `burn-rope` | fwd+bwd | no | RoPE with YaRN extrapolation |
-| `burn-sct` | fwd+bwd | no | permanent truncated SVD with Stiefel QR retraction |
 | `burn-situ` | fwd+bwd | yes | SiTU-GLU (Kimi K3) |
 | `burn-spectral` | fwd | yes | ternary SVD weights with rank-1 ternary MoE routing |
 | `burn-swiglu` | fwd | no | SiLU-gated linear unit |

@@ -223,17 +223,26 @@ fn gdn2_f32_agrees_with_the_f64_reference() {
     println!(
         "fixture: d={} h={} hk={} hv={} expand_v={} -> value head {v_head}, VD={}, \
          {} cases, {} tensors",
-        t.d, t.h, t.hk, t.hv, t.expand_v, t.hv * v_head, t.cases.len(), t.tensors.len()
+        t.d,
+        t.h,
+        t.hk,
+        t.hv,
+        t.expand_v,
+        t.hv * v_head,
+        t.cases.len(),
+        t.tensors.len()
     );
     for (label, module) in [
-        ("FusedRecurrent", build(&t, Gdn2Mode::FusedRecurrent, 64, &device)),
+        (
+            "FusedRecurrent",
+            build(&t, Gdn2Mode::FusedRecurrent, 64, &device),
+        ),
         ("Chunk", build(&t, Gdn2Mode::Chunk, 64, &device)),
     ] {
         let mut worst = 0.0f64;
         let mut worst_t = 0usize;
         for (i, (seq, x, ref_y)) in t.cases.iter().enumerate() {
-            let input =
-                Tensor::<3>::from_data(TensorData::new(x.clone(), [1, *seq, t.d]), &device);
+            let input = Tensor::<3>::from_data(TensorData::new(x.clone(), [1, *seq, t.d]), &device);
             let mut state: Option<burn_gdn2::Gdn2State> = None;
             let out = module.forward::<NdArray>(input, &mut state, true);
             let got = to_f32_vec(&out);
@@ -274,7 +283,10 @@ fn the_bar_bites_a_wrong_formula() {
     let mut c = Cursor::new(data.as_slice());
     let mut magic = [0u8; 8];
     c.read_exact(&mut magic).unwrap();
-    assert_eq!(&magic, b"GDN2FLT\0", "ref_f64_faults.bin is not this format");
+    assert_eq!(
+        &magic, b"GDN2FLT\0",
+        "ref_f64_faults.bin is not this format"
+    );
     let case_idx = rd_u32_pub(&mut c) as usize;
     let n_faults = rd_u32_pub(&mut c) as usize;
     let seq = rd_u32_pub(&mut c) as usize;
@@ -391,8 +403,7 @@ fn rd_name_pub(c: &mut Cursor<&[u8]>) -> String {
 }
 fn rd_f64_pub(c: &mut Cursor<&[u8]>, n: usize) -> Vec<f64> {
     let mut v = vec![0f64; n];
-    let bytes =
-        unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, n * 8) };
+    let bytes = unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, n * 8) };
     c.read_exact(bytes).unwrap();
     v
 }

@@ -79,7 +79,9 @@ fn gain_at(i: usize) -> f32 {
 
 fn build_row(d: usize, mean_sq: f32) -> Vec<f32> {
     // Exact mean-square: x_i = sqrt(mean_sq) * u_i with mean(u^2) == 1.
-    let us: Vec<f32> = (0..d).map(|i| ((i * 2 + 1) as f32 * std::f32::consts::PI / d as f32).sin()).collect();
+    let us: Vec<f32> = (0..d)
+        .map(|i| ((i * 2 + 1) as f32 * std::f32::consts::PI / d as f32).sin())
+        .collect();
     let m = us.iter().map(|u| u * u).sum::<f32>() / us.len() as f32;
     us.iter().map(|u| (mean_sq * u * u / m).sqrt()).collect()
 }
@@ -137,7 +139,13 @@ fn the_fused_kernel_is_taken_on_cuda_and_matches_the_scalar_definition() {
         skipped - skipped0,
         takes
     );
-    assert_eq!(takes, ROWS.len() as u64, "the fused arm ran {} times, not {}", takes, ROWS.len());
+    assert_eq!(
+        takes,
+        ROWS.len() as u64,
+        "the fused arm ran {} times, not {}",
+        takes,
+        ROWS.len()
+    );
     assert!(checked > 20, "only {checked} outputs compared");
     assert!(
         worst < 1e-5,
@@ -176,7 +184,10 @@ fn the_fused_kernel_is_taken_on_cuda_and_matches_the_scalar_definition() {
     for (i, &x) in row.iter().take(d).enumerate() {
         let want = scalar_ref(x, f64::from(mean_sq), gain_at(i), 1e-5);
         let rel = (f64::from(ctl[i]) - want).abs() / want.abs().max(1.0);
-        assert!(rel < 1e-5, "the CONTROL is wrong, not the kernel: i={i} rel={rel:e}");
+        assert!(
+            rel < 1e-5,
+            "the CONTROL is wrong, not the kernel: i={i} rel={rel:e}"
+        );
     }
 }
 
@@ -200,7 +211,11 @@ fn the_fused_kernel_declines_on_an_autodiff_device() {
          the result carries no graph and the arm would receive NO GRADIENT while \\
          the loss curve still looked healthy."
     );
-    assert_eq!(out.dims(), [1, 4, 64], "the fallback must still produce the right shape");
+    assert_eq!(
+        out.dims(),
+        [1, 4, 64],
+        "the fallback must still produce the right shape"
+    );
 }
 
 /// The `d < 4` refusal in `fused.rs`, as a gate rather than a hope.
@@ -266,10 +281,13 @@ fn the_fused_arm_declines_the_narrow_shapes_and_the_fallback_is_correct() {
             let row = &x[r * d..(r + 1) * d];
             let ss: f64 = row.iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
             for i in 0..d {
-                let want = f64::from(row[i]) / (ss / d as f64 + 1e-5).sqrt() * f64::from(gain_at(i));
-                let rel =
-                    (f64::from(got[r * d + i]) - want).abs() / want.abs().max(1.0);
-                assert!(rel < 1e-5, "d={d} r={r} i={i}: rel {rel:e} from the FALLBACK");
+                let want =
+                    f64::from(row[i]) / (ss / d as f64 + 1e-5).sqrt() * f64::from(gain_at(i));
+                let rel = (f64::from(got[r * d + i]) - want).abs() / want.abs().max(1.0);
+                assert!(
+                    rel < 1e-5,
+                    "d={d} r={r} i={i}: rel {rel:e} from the FALLBACK"
+                );
             }
         }
     }

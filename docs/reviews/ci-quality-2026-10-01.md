@@ -11,6 +11,23 @@ exists because two of them are RED ON LANDING and a red gate with no number
 attached is the failure mode AGENTS.md §1.1 calls a defect — so the numbers are
 here, and the fixes are named.
 
+**CLOSED IN PART, 2026-10-02 (wt/ci-final, rebased onto `1717ac3` — the
+baseline numbers below were measured before 26 commits of landed lanes, so the
+fresh counts were smaller):**
+
+- `unused-deps`: **closed** (machete 10 → 0: eight deletions, two reasoned
+  facade entries; `continue-on-error` dropped). §4.
+- `lint` (clippy): **closed** (green under `-D warnings`; the three
+  named exceptions carry `#[allow]` + reason). §2.
+- `lint` (fmt): **closed except two files** — `cargo fmt` applied to all 52
+  files of the four crates except `train/src/lib.rs` (129 hunks) and
+  `core/src/routing.rs` (8), both held out because lanes hold uncommitted
+  edits in them; `continue-on-error` stays until those land. §1.
+- `fused-library / ndarray`: **closed** — the three burn-spectral fixtures
+  moved to `Autodiff<NdArray>` and now assert instead of panicking in setup
+  (TEST-AUDIT.md finding 2, CLOSED line); vendor formatted (280 hunks) and
+  green under clippy `-D warnings`; the job's KNOWN RED note removed.
+
 ---
 
 ## The scoreboard
