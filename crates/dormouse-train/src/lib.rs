@@ -31,10 +31,25 @@ pub use stress::{grad_norm, StressMonitor};
 /// bits per byte from mean cross-entropy (nats).
 pub fn bpb(ce: f32) -> f32 { ce / std::f32::consts::LN_2 }
 
+/// The trainer's backend type MUST name the strategy its device actually
+/// builds: `Device::cuda(0).autodiff()` runs `Enabled(Disabled)` — i.e.
+/// `NoCheckpointing::STRATEGY` (burn-dispatch tensor.rs:449-460). Until
+/// 2026-10-02 this type said `BalancedCheckpointing` while the device said
+/// `Disabled`; burn's type-erased ops never noticed (the strategy lives in
+/// the runtime context they carry), but every seam that names the concrete
+/// type in a conversion refused the trainer's own tensors: `chunk_dispatch`'s
+/// final cast failed on ALL 412 training KDA calls of the 2026-10-02 probe
+/// run, so the fused forward launched and its result was DISCARDED into the
+/// ops path every step (`fused kda=412/0 ops=492 node_bwd=0`,
+/// logs/dg2_ab_f1.log) — the ADR-0019 silent-fallback shape, in the type
+/// system. The Balanced TYPE never had an effect on any run in this
+/// project's history; if Balanced is ever WANTED, the device must be built
+/// with `.gradient_checkpointing()` AND the type changed back together, and
+/// that is a numerical-path change requiring its own A/B (owner's call).
 #[cfg(feature = "cuda")]
 pub type Backend = burn::backend::autodiff::Autodiff<
     burn_cuda::Cuda,
-    burn::backend::autodiff::checkpoint::strategy::BalancedCheckpointing,
+    burn::backend::autodiff::checkpoint::strategy::NoCheckpointing,
 >;
 #[cfg(all(feature = "cpu", not(feature = "cuda")))]
 pub type Backend = burn::backend::autodiff::Autodiff<
