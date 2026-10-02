@@ -354,10 +354,12 @@ pub struct DormouseConfig {
     pub use_mhc: bool,
     /// How many streams the residual is split into. Must divide `d_model` or
     /// the first forward's reshape fails, which is why
-    /// [`super::validate`] checks it with the divisor in the message. `2` is
-    /// the K the phi study ran; the base paper's own `n = 4` is
-    /// `--set mhc_streams=4` - except that this field is not in the `--set`
-    /// match, so today it is a preset edit.
+    /// [`super::validate`] checks it with the divisor in the message.
+    /// **Default 4 since 2026-10-02** (fidelity F-F3): the base paper's Tab. 1
+    /// and mHC's Tab. 5 both run n = 4, and n = 2 was measured as the rung
+    /// where most of the family's gain has not arrived yet (2.802 of the
+    /// best 2.778; `mhc-2026-09-30.md` §1.3). The tuning knob
+    /// `--set mhc_streams=…` still reaches the trainer through `override.rs`.
     #[serde(default = "d_mhc_streams")]
     pub mhc_streams: usize,
     /// SiTU-GLU in the expert FFN (arXiv:2607.24653v2 Eq 12, Kimi K3):
@@ -597,7 +599,7 @@ impl Default for DormouseConfig {
 }
 
 fn d_mhc_streams() -> usize {
-    2
+    4
 }
 fn d_moe_topk() -> usize {
     0

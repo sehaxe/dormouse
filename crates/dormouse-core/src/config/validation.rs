@@ -265,9 +265,9 @@ pub fn validate(c: &DormouseConfig) -> Result<(), String> {
             return Err(format!(
                 "mhc_streams {} must divide d_model {}: the residual stream is read as \
                  n streams of width d_model/n, so a non-divisor fails the reshape in the \
-                 first forward. Default 2 is the K the phi study (2604.21106v3 5.2) ran \
-                 and the base paper's own n=4 (2409.19606 App. Tab. 1) is --set \
-                 mhc_streams=4.",
+                 first forward. Default 4 is HC's Tab. 1 and mHC's Tab. 5 operating point \
+                 (2409.19606 / 2512.24880, fidelity F-F3 2026-10-02); the phi study's \
+                 n = 2 is --set mhc_streams=2.",
                 c.mhc_streams, c.d_model
             ));
         }

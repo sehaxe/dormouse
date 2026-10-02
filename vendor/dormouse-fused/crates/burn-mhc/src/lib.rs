@@ -17,9 +17,12 @@
 //! Hyper-parameters follow App. A.1: gating factors alpha init = 0.01,
 //! Sinkhorn-Knopp t_max = 20, expansion rate n = 4, Layer Norm eps = 1e-20
 //! (Table 5). Those four are the paper's. The static-bias initialisation
-//! (`b_pre = b_res = 10`, `b_post = 0`, `block.rs:7-8`) is OURS: the paper
-//! states no bias init, and 10 is chosen so `sigma(10) ~ 1` and
-//! `Sinkhorn(exp(diag 10)) ~ I`.
+//! (`b_pre = 10`, `b_res = 0`, `b_post = 0`, `block.rs`) is OURS: the paper
+//! states no bias init; `b_pre = 10` is `sigma(10) ~ 1`, and **`b_res = 0` is
+//! the fidelity fix of 2026-10-02** — the 10I init froze `α_res`'s gradient at
+//! 7.3e-9 on the exponential's flat top (`fidelity-audit-2026-10-02.md` F-F4),
+//! so the arm's first steps were a ReZero with a Sinkhorn in front of it and
+//! never a trainable projection.
 //!
 //! Two readings of the paper matter, both decided in favour of the PRINTED
 //! equation:
@@ -95,6 +98,30 @@ mod tests {
         for (k, &v) in vals.iter().enumerate() {
             assert!(v >= 0.0, "entry {k} negative: {v}");
         }
+    }
+
+    /// THE FIDELITY FIX'S OWN PIN (2026-10-02, F-F4): `b_res` starts at ALL
+    /// ZEROES - off the exponential's flat top, alpha_res's gradient alive.
+    /// The previous init was `10·I`, under which the off-diagonal Jacobian is
+    /// `e^-10` and the measured `|grad alpha_res|` was 7.288e-9
+    /// (`mhc-2026-09-30.md` §5.3b): an arm frozen at its init, with a healthy
+    /// loss curve.
+    #[test]
+    fn b_res_starts_at_zero_not_the_10i_stiffness() {
+        let m = MhcBlock::new(4, 32, &dev());
+        let vals = to_vec(m.b_res.val().reshape([1, 1, 4, 4]));
+        assert!(
+            vals.iter().all(|v| *v == 0.0),
+            "b_res no longer starts at 0: {vals:?} - if the init moved again, the \
+             fidelity audit's F-F4 reasoning must be revisited, not silently retuned"
+        );
+        // And the block at THAT init still produces a doubly stochastic H_res
+        // (uniform at init, the fixed point) - the projection sanity, not the
+        // freeze, is what the old init could not provide.
+        let h = Tensor::<3>::ones([1, 1, 32], &dev());
+        let branch = Tensor::<3>::ones([1, 1, 32], &dev());
+        let out = m.forward(h, std::slice::from_ref(&branch));
+        assert!(out.dims() == [1, 1, 32], "shape {out:?}");
     }
 
     #[test]
