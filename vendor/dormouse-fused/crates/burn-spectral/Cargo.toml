@@ -30,7 +30,6 @@ burn-autodiff = { workspace = true, features = ["std"] }
 burn-optim = { workspace = true, features = ["std"] }
 burn-nn = { workspace = true, features = ["std"] }
 burn-bitnet = { path = "../burn-bitnet" }
-burn-sct = { path = "../burn-sct" }
 burn-muon-plus = { path = "../burn-muon-plus" }
 burn-rope = { path = "../burn-rope" }
 burn-situ = { path = "../burn-situ" }

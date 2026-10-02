@@ -1,4 +1,4 @@
-//! param - TSCT linear via burn-sct SpectralLinear, pad to multiple of 4,
+//! param - TSCT linear via burn-spectral SpectralLinear, pad to multiple of 4,
 //! NM knob, BF16 env (mirrors aria semantics; fresh mini composition)
 //!
 //! # What [`LinearLike`] is for

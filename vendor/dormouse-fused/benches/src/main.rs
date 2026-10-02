@@ -198,19 +198,5 @@ fn main() {
         );
     }
 
-    // --- sct: QR from_dense (fused retraction) ---
-    {
-        let (n, m, rank) = (512usize, 256, 32);
-        let w = Tensor::<2>::random([n, m], Distribution::Normal(0.0, 1.0), &dev);
-        out.insert(
-            "sct_qr.fused_ms".into(),
-            time(2, || {
-                // sweeps=15: the crate's own benchmark convention (bench_ops.rs)
-                let _ = burn_sct::qr_cuda::from_dense_cuda::<B>(w.clone(), rank, 15);
-            })
-            .into(),
-        );
-    }
-
     println!("{}", serde_json::to_string_pretty(&out).unwrap());
 }

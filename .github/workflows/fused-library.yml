@@ -99,7 +99,6 @@ jobs:
           cargo check -p burn-gdn2 --features binary-tests
           cargo check -p burn-kda --no-default-features
           cargo check -p burn-kda --features autodiff
-          cargo check -p burn-sct --features autodiff
 
   # 3. the flagship claim: the reference fixture is regenerable and unchanged
   #

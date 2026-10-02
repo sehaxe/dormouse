@@ -8,7 +8,6 @@ members = [
     "crates/burn-mhc",
     "crates/burn-muon-plus",
     "crates/burn-rope",
-    "crates/burn-sct",
     "crates/burn-situ",
     "crates/burn-spectral",
     "crates/burn-rmsnorm",
