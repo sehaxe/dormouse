@@ -12,6 +12,10 @@ readme = "README.md"
 default = ["std"]
 std = ["burn/std", "burn-tensor/std"]
 cuda = ["dep:burn-cuda", "dep:burn-cubecl", "dep:cubecl", "burn/std", "burn/cuda", "burn-tensor/cuda", "burn/extension", "burn/autodiff"]
+# The same fused kernel through cubecl-wgpu's WGSL pipeline (AMD/Intel/lavapipe).
+# The launch is runtime-agnostic — CubeTensor erases the runtime and the DEVICE
+# picks it — so this feature changes only which runtime the graph carries.
+wgpu = ["dep:burn-cubecl", "dep:cubecl", "burn/std", "burn/wgpu", "burn-tensor/wgpu", "burn/extension"]
 
 [dependencies]
 burn = { workspace = true }
@@ -51,3 +55,11 @@ required-features = ["cuda"]
 [[test]]
 name = "d2_isolate"
 required-features = ["cuda"]
+
+# The cross-vendor gate: the SAME kernel lowered to WGSL by cubecl-wgpu and run
+# on a CPU-adapter Vulkan device (lavapipe). Needs a software/CPU Vulkan ICD
+# (Arch: `pacman -S vulkan-swrast`); absent, the adapter request fails loudly —
+# the test never skips.
+[[test]]
+name = "rmsnorm_kernel_wgpu"
+required-features = ["wgpu"]
