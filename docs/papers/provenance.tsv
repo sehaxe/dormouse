@@ -11,6 +11,7 @@
 #
 # columns  file | kind | source | version | source_date | bytes | sha256 | fetched
 file	kind	source	version	source_date	bytes	sha256	fetched
+2603.03583-byteflow.pdf	paper	https://arxiv.org/abs/2603.03583	v1	2026-03-16	998111	a6ece1897a9682ec856003e3125604a43e3c3d4981bee4e348d39feb550e7dcb	2026-10-02
 2212.07525-data2vec-2.0.pdf	paper	https://arxiv.org/abs/2212.07525	v2	2023-06-15	876692	d180ad5a84c606c1b09e008a8d0a1c753c7d9cfe081c451ef0146cdbdfa0571b	2026-10-01
 2505.16932-polar-express.pdf	paper	https://arxiv.org/abs/2505.16932	v5	2026-05-04	1543444	9e7badb9f4fd51cb87ba1fe1e49e6b8c3278f55496d014d5969743351e82eb3e	2026-10-01
 2601.16531-engram.pdf	paper	https://arxiv.org/abs/2601.16531	v2	2026-01-26	550949	2921ec8d82ec2901df5f1fc210b6adfde3380a40bc937da672c19ae37138127a	2026-10-01

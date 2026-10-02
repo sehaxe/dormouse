@@ -652,6 +652,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "burn-byteflow"
+version = "0.1.0"
+dependencies = [
+ "burn",
+ "burn-ndarray",
+ "burn-swiglu",
+ "burn-tensor",
+]
+
+[[package]]
 name = "burn-core"
 version = "0.22.0-pre.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -830,6 +840,7 @@ dependencies = [
  "burn-attnres",
  "burn-autodiff",
  "burn-bitnet",
+ "burn-byteflow",
  "burn-cuda",
  "burn-dspark",
  "burn-eggroll",
