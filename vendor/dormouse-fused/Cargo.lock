@@ -805,15 +805,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "burn-es"
-version = "0.1.0"
-dependencies = [
- "burn",
- "burn-ndarray",
- "burn-tensor",
-]
-
-[[package]]
 name = "burn-flex"
 version = "0.22.0-pre.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -843,7 +834,6 @@ dependencies = [
  "burn-dspark",
  "burn-eggroll",
  "burn-engram",
- "burn-es",
  "burn-gdn2",
  "burn-jepa",
  "burn-kda",
@@ -855,7 +845,6 @@ dependencies = [
  "burn-ptrn",
  "burn-rmsnorm",
  "burn-rope",
- "burn-sct",
  "burn-situ",
  "burn-spectral",
  "burn-swiglu",
@@ -874,7 +863,6 @@ dependencies = [
  "burn-mhc",
  "burn-muon-plus",
  "burn-rope",
- "burn-sct",
  "burn-situ",
  "burn-tensor",
  "cubecl",
@@ -1121,23 +1109,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "burn-sct"
-version = "0.1.4"
-dependencies = [
- "burn",
- "burn-cubecl",
- "burn-cuda",
- "burn-ndarray",
- "burn-nn",
- "burn-tensor",
- "cubecl",
- "cubecl-common",
- "futures-lite",
- "num-traits",
- "serde",
-]
-
-[[package]]
 name = "burn-signal"
 version = "0.22.0-pre.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1178,7 +1149,6 @@ dependencies = [
  "burn-nn",
  "burn-optim",
  "burn-rope",
- "burn-sct",
  "burn-situ",
  "burn-tensor",
  "cubecl",
