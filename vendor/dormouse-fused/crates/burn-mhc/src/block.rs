@@ -4,8 +4,25 @@
 
 /// Gating factor init (App. A.1: 0.01).
 pub const ALPHA_INIT: f64 = 0.01;
-/// Static-mapping init magnitude: sigmoid(10) ~ 1, Sinkhorn(exp(diag 10)) ~ I.
+/// Static-mapping init magnitude for `b_pre`: sigmoid(10) ~ 1, the full
+/// read-in gate (H_pre is unwired — allocated, never read; kept at 10).
 pub(crate) const STATIC_INIT: f32 = 10.0;
+///
+/// # FIDELITY FIX 2026-10-02 (`docs/reviews/fidelity-audit-2026-10-02.md` F-F4)
+///
+/// `b_res` is NO LONGER `10·I`. The 10 puts the exp'd diagonal at e^10 ≈ 2.2e4
+/// against off-diagonals at e^-10 ≈ 4.5e-5: the Sinkhorn output is the identity
+/// to within 2.1e-4 per off-diagonal unit, `α_res`'s gradient at init measured
+/// **7.288e-9** (`mhc-2026-09-30.md` §5.3b), and the arm's whole reachable
+/// contribution in its first steps was `H_post ≈ 1` — a ReZero wearing a
+/// Sinkhorn. 0 = σ⁻¹(0.5), off the exponential's flat top: at init
+/// `H_res = Sinkhorn(exp(E·x_norm·φ + 0))` starts at ≈ uniform mixing and the
+/// projection can actually leave it. The cost is named: the arm's residual
+/// operator no longer STARTS as the identity it is meant to tend to; the
+/// identity is what training must find it stable AROUND, and the eval line's
+/// telemetry (`bres=` on the trainer's eval forward) watches `|b_res|` leave
+/// this init.
+pub(crate) const B_RES_INIT: f32 = 10.0; // FALSIFY
 
 use burn::module::{Module, Param};
 use burn::nn::Initializer;
@@ -22,9 +39,14 @@ use crate::sinkhorn::{sinkhorn_knopp, SINKHORN_ITERS};
 /// polytope via Sinkhorn-Knopp (Eq 8-9). Branches are layer outputs `[B, T, D]`
 /// (viewed as n per-stream outputs) scattered onto the stream with `H_post`.
 ///
-/// At init (alpha = 0.01, b_pre = 10, b_post = 0, b_res = 10*I):
-/// `H_pre ~ 1`, `H_post ~ 1`, `H_res ~ I` - the block starts as the standard
-/// residual connection `h + sum(branches)`, restoring the identity mapping.
+/// At init (alpha = 0.01, b_pre = 10, b_post = 0, b_res = 0 — THE FIDELITY
+/// FIX, see [`B_RES_INIT`]):
+/// `H_pre ~ 1`, `H_post ~ 1`, `H_res ~ uniform` (Sinkhorn of exp(≈0)) — the
+/// block starts NEAR the standard residual `h + sum(branches)` and the
+/// identity is what training steers the projection around, NOT what it
+/// initialises at. The previous `b_res = 10·I` init made `H_res ~ I` exactly,
+/// froze `α_res`'s gradient at 7.3e-9, and measured a tie that was really a
+/// frozen arm (`fidelity-audit-2026-10-02.md` §2.3).
 #[derive(Module, Debug)]
 pub struct MhcBlock {
     /// Dynamic-mapping projections (Eq 7): `[D, n]` for pre/post, `[D, n^2]` for res.
@@ -61,7 +83,9 @@ impl MhcBlock {
             mean: 0.0,
             std: 0.01,
         };
-        let b_res = Tensor::<2>::eye(n, device).mul_scalar(STATIC_INIT);
+        // THE FIDELITY FIX: b_res starts at 0 (σ⁻¹(0.5)), not at the 10I that
+        // froze α_res's gradient on the exponential's flat top.
+        let b_res = Tensor::<2>::zeros([n, n], device).mul_scalar(B_RES_INIT);
         let b_pre = Tensor::<1>::ones([n], device).mul_scalar(STATIC_INIT);
         let b_post = Tensor::<1>::zeros([n], device);
         Self {

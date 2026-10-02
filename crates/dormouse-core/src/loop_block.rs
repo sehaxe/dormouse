@@ -262,11 +262,13 @@ pub struct LoopBlock {
     /// -0.027 total, so the two terms we do wire are ~89% of the measured
     /// effect (docs/reviews/mhc-2026-09-30.md §3).
     ///
-    /// `n = mhc_streams` defaults to **2** (the base paper 2409.19606 calls the
-    /// same quantity the "expansion rate" and Tab. 1 ablates it; 2604.21106v3
-    /// §5.2 ran K = 2). At our launch-bound profile the `n x n` Sinkhorn is a
-    /// launch-count cost, not a parameter cost, which is why the small rung
-    /// comes first - see [`crate::config::DormouseConfig::mhc_streams`].
+    /// `n = mhc_streams` defaults to **4** since the fidelity fix F-F3
+    /// (2026-10-02; the base paper 2409.19606 calls the same quantity the
+    /// "expansion rate" and its Tab. 1 ablates it: n=4 is its best rung; mHC
+    /// 2512.24880 runs n=4 on every model in Tab. 5). At our launch-bound
+    /// profile the `n x n` Sinkhorn is a launch-count cost, not a parameter
+    /// cost, and the phi study's n = 2 rung is `--set mhc_streams=2` - see
+    /// [`crate::config::DormouseConfig::mhc_streams`].
     pub mhc: Option<MhcBlock>,
     /// `e_k`, the per-iteration-slot embedding added at the readout:
     /// `[max_iter, d_model]`. Its presence is what makes the `T` iterations
@@ -1505,10 +1507,21 @@ mod tests {
     // ---- mHC (arXiv:2512.24880) ------------------------------------------------
 
     /// The one fixture every mHC gate below is built on: a narrow, fast block
-    /// with the attention and memory arms off, so what differs between the arms
-    /// is the residual statement and nothing else.
+    /// with the attention and memory arms off, so what differs between the
+    /// arms is the residual statement and nothing else.
+    ///
+    /// `mhc_streams: 2` is set EXPLICITLY with the rule the 2026-09-30 DSpark
+    /// incident taught (`memory.md`: a test that takes a config value from the
+    /// preset verifies nothing about that value - when a default moves, such a
+    /// test reddens or passes vacuously). This fixture's literals (`2(J-I)`
+    /// perturbation, the `n = 2` eigenvalues) are for n = 2; the DEFAULT is
+    /// the paper's n = 4 since the fidelity fix F-F3, and n = 4's own gates
+    /// are the ones that read the configured `n` instead of a literal.
     fn mhc_cfg(depth: usize) -> DormouseConfig {
-        small_cfg(depth)
+        DormouseConfig {
+            mhc_streams: 2,
+            ..small_cfg(depth)
+        }
     }
 
     // SITU (arXiv:2607.24653v2 Eq 12). The FORM is gated in the mechanism
@@ -1546,13 +1559,6 @@ mod tests {
     fn mhc_head(cfg: &DormouseConfig) -> LinearLike {
         LinearLike::with_tsct(cfg.d_model, 16, 8, cfg.use_tsct, &adev())
     }
-
-    /// `MhcBlock::STATIC_INIT`, named here so the identity bound in
-    /// `mhc_res_leaves_the_identity...` can be PREDICTED (`(n-1) e^-10`) rather
-    /// than fitted. The crate keeps it private; the number is its own and is
-    /// asserted to still be 10, so a change upstream cannot silently retune
-    /// this gate's meaning.
-    const STATIC_INIT_REF: f64 = 10.0;
 
     /// A `[1]` tensor from one number, for the `Param::from_tensor` knobs. Not
     /// `from_floats([[x]])`: that is rank 2 and burns says so at runtime.
@@ -1632,10 +1638,15 @@ mod tests {
     /// question - "does `H_res` actually mix the streams?" - asked at both ends
     /// of the trajectory, and the middle is the only place it can fail:
     ///
-    /// 1. **At the paper's init it is the identity.** `b_res = 10 I` makes
-    ///    `Sinkhorn(exp(10 I)) ~ I`, and that is the POINT of the constraint
-    ///    (2512.24880 §4.1: it "restores the identity mapping property"), not
-    ///    a defect. So identity-at-init is asserted, and asserted to be close.
+    /// 1. **At the fidelity-fixed init it is (approximately) the uniform mix.**
+    ///    `b_res = 0` (the F-F4 fix) makes `Sinkhorn(exp(E·x_norm·φ + 0))` -
+    ///    exp(≈0) ≈ 1 everywhere, so the projection starts AT the uniform mix
+    ///    `J/n` - the doubly stochastic fixed point, alpha's gradient ALIVE
+    ///    (the 10I init read 7.3e-9 on it, `mhc-2026-09-30.md` §5.3b). An init
+    ///    at the fixed point has a zero LINEAR drift toward it - the expensive
+    ///    claim the old init made (start at identity, drift to the identity's
+    ///    neighbourhood) is replaced by start at the fixed point and learn
+    ///    which direction the A/B wants.
     /// 2. **Off that init it leaves the identity while staying on the
     ///    manifold.** This is the assertion that matters, and it is the
     ///    published failure mode: 2603.20896 (s²HC, NeurIPS 2026) reports that
@@ -1669,11 +1680,14 @@ mod tests {
         assert_eq!(n, N, "this gate's predicted literals are for n = 2");
         const NN: usize = N * N;
 
-        // (1) at init: the identity. The bound is not a guess - `STATIC_INIT =
-        // 10` puts the off-diagonal ratio at `e^-10 = 4.54e-5`, and a row of
-        // `n` has `n - 1` of them, so the largest entry error is
-        // `(n-1) e^-10 = 4.54e-5` at n = 2 before the dynamic term contributes
-        // anything.
+        // (1) at init: LOWER BOUND, refined - H_res must have LEFT the Birkhoff
+        // polytope's only accidentally-attractive point the OLD init sat on:
+        // every entry ~1/n (exp(0) -> doubly stochastic -> uniform) and
+        // OFF-DIAGONAL MASS O(1), which is what alpha can actually move. The
+        // OLD assert here was `max |entry - I| < 1e-3` - the 10I stiffness
+        // scored 4.5e-5 and the gate blessed a frozen arm; inverted, it reads
+        // whether the init off-diagonal mass (at n = 2, uniform J/2) is O(1):
+        // the map distance from I is |J/n - I| ~ 0.5 per identity entry.
         let h_res = |blk: &LoopBlock| -> Vec<f32> {
             blk.mhc
                 .as_ref()
@@ -1697,17 +1711,16 @@ mod tests {
             worst
         };
         let at_init = ident(&h_res(&blk));
+        // uniform J/2: off-diagonals 0.5, diagonal 0.5 -> distance to I = 0.5.
+        let b = 0.5f64;
         println!(
-            "mhc H_res at init: max |entry - I| = {at_init:.3e} (predicted (n-1) \
-             e^-STATIC_INIT = {:.3e})",
-            (n - 1) as f64 * (-(STATIC_INIT_REF)).exp()
+            "mhc H_res at init: max |entry - I| = {at_init:.3e} (predicted |J/n - I| entry = {b})"
         );
         assert!(
-            at_init < 1e-3,
-            "H_res at the paper's init is not the identity (max entry error {at_init:.3e}, \
-             predicted (n-1) e^-STATIC_INIT = {:.3e}): the arm would start as a mixing \
-             operator it cannot undo",
-            (n - 1) as f64 * (-(STATIC_INIT_REF)).exp()
+            at_init > 0.3,
+            "H_res at init is (near) the identity again (max entry error {at_init:.3e}, \
+             predicted |J/n - I| = {b}): the b_res init drifted back toward the 10I \
+             stiffness, whose gradient is dead on the flat top"
         );
 
         // (2) perturbed: the manifold holds and the streams MIX.
@@ -1873,22 +1886,28 @@ mod tests {
 
         let scale = o_rz.clone().abs().max().into_scalar::<f32>();
         let rel = (o_rz.clone() - o_mh).abs().max().into_scalar::<f32>() / scale;
+        // FIDELITY FIX F-F4 (2026-10-02): the OLD assertion here was
+        // `rel < 1e-2` - "mHC at init is ReZero at scale 1" - which was the
+        // 10I identity init SPEAKING, not the mechanism: it froze alpha_res's
+        // gradient at 7.3e-9 and measured a tie between the arm and its own
+        // starting point. The fix moves b_res to 0, so mHC-at-init is UNIFORM
+        // stream mixing - O(1) apart from ReZero, and trainable.
         println!(
             "mhc@init vs ReZero@scale1 on identical weights: relative {rel:.3e} \
-             (bounds: > 1e-6 so an inert arm fails, < 1e-2)"
+             (the fidelity fix made this O(1); it was < 1e-2 under the 10I init)"
         );
         assert!(
-            rel < 1e-2,
-            "mHC at init is not ReZero at residual_scale = 1: relative {rel:.3e}"
+            rel > 0.05,
+            "mHC at init is ReZero at residual_scale = 1 (relative {rel:.3e}): \
+             the b_res init has drifted back onto the identity - \
+             the arm is frozen exactly as the fidelity audit describes"
         );
-        // Named, because a bound nobody printed is a guess: the init's own
-        // error is set by `H_post = 2 sigma(b_post + alpha x' phi_post)`, and
-        // `b_post = 0` with `alpha = 0.01` puts it within ~0.5% of 1, and by
-        // `H_res` being the identity to `(n-1) e^-10 = 1.4e-4`.
+        // ...and still a BOUNDED operator, not garbage: the Sinkhorn of
+        // exp(≈0) is doubly stochastic, so the init mixing is a convex map.
         assert!(
-            rel > 1e-6,
-            "mHC at init is BITWISE ReZero ({rel:.3e}): the Sinkhorn and the \
-             hyper-network are not in the write at all, so the arm is inert"
+            rel < 5.0,
+            "mHC at init diverged (relative {rel:.3e}): the projection left the \
+             Birkhoff polytope or the fixture is broken"
         );
     }
 
@@ -2094,9 +2113,18 @@ mod tests {
             gap(&mh, &ar) / scale,
             gap(&ar, &rz) / scale,
         );
+        // FIDELITY FIX F-F4 (2026-10-02): `b_res` starts at 0, NOT at the 10I
+        // that froze alpha_res's gradient. The old init made mHC-at-init
+        // ReZero at scale 1 (`mh_rz ~ 4e-3`, the old assertion) - and never a
+        // trainable projection. The new init is UNIFORM mixing: exp(≈0) at
+        // every entry -> Sinkhorn -> 1/n, off-diagonal mass O(1), so the arm
+        // starts a DIFFERENT residual operator from ReZero (that separation is
+        // the A/B's subject, not a defect) and it must still be no function of
+        // AttnRes's.
         assert!(
-            mh_rz < 1e-2,
-            "mHC at init is not ReZero at scale 1: relative {mh_rz:.3e}"
+            mh_rz > 0.05,
+            "mHC at init has become ReZero again (relative {mh_rz:.3e}): the b_res init drifted \
+             back onto the identity - the arm's gradient would be dead on arrival"
         );
         assert!(
             mh_ar > 0.1,
