@@ -27,6 +27,7 @@ mod re_exports {
     #[cfg(feature = "autodiff")]
     use burn_fused::burn_autodiff;
     use burn_fused::burn_bitnet;
+    use burn_fused::burn_byteflow;
     #[cfg(feature = "cuda")]
     use burn_fused::burn_cuda;
     use burn_fused::burn_dspark;
