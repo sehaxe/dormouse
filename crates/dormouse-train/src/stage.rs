@@ -171,7 +171,7 @@ impl StageSeam {
             if !ungraphed && self.stats.capture_allowed() {
                 if let Some(client) = &self.client {
                     if let Err(e) = client.graph_prepare() {
-                        let out = body(xin);
+                        let out = body(xin.clone());
                         self.stats.refused(format!("graph_prepare: {e:?}"));
                         return Ok(out);
                     }
@@ -181,12 +181,12 @@ impl StageSeam {
                     // memory node, and a memory node refuses the capture).
                     let _ = body(xin.clone());
                     if let Err(e) = client.start_capture() {
-                        let out = body(xin);
+                        let out = body(xin.clone());
                         self.stats.refused(format!("start_capture: {e:?}"));
                         return Ok(out);
                     }
                     // The recorded pass does not execute; the replay below does.
-                    let out = body(xin);
+                    let out = body(xin.clone());
                     return match client.stop_capture() {
                         Ok(g) => {
                             let g: std::sync::Arc<dyn crate::graph::GraphReplay> =
@@ -204,7 +204,7 @@ impl StageSeam {
                             Ok(out)
                         }
                         Err(e) => {
-                            let out = body(xin);
+                            let out = body(xin.clone());
                             self.stats.refused(format!("stop_capture: {e:?}"));
                             Ok(out)
                         }

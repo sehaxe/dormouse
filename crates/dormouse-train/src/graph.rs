@@ -798,10 +798,6 @@ impl Seam {
     }
 }
 
-fn map(module: DormouseModel, pins: &mut Pins, action: PinAction) -> DormouseModel {
-    module.map(&mut PinMapper { action, pins, failed: false, why: None })
-}
-
 /// Pin one module's float parameters to master buffers. `pub(crate)` so the
 /// stage seam can arm the teacher alone (the whole-step seam pins both models).
 pub(crate) fn arm_pins<M: Module>(module: M, pins: &mut Pins) -> M {
