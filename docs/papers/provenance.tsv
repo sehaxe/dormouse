@@ -5,10 +5,8 @@
 # original. A row is added when a document is fetched and never edited to
 # "refresh" a hash - a new version of a paper is a NEW row, because the old
 # transcription was made against the old text.
-#
 # Read a transcription's own header for what was read (full text, abstract only,
 # the authors' code). Tier language lives in docs/protocols/ORACLE.md.
-#
 # columns  file | kind | source | version | source_date | bytes | sha256 | fetched
 file	kind	source	version	source_date	bytes	sha256	fetched
 2212.07525-data2vec-2.0.pdf	paper	https://arxiv.org/abs/2212.07525	v2	2023-06-15	876692	d180ad5a84c606c1b09e008a8d0a1c753c7d9cfe081c451ef0146cdbdfa0571b	2026-10-01
@@ -24,3 +22,6 @@ file	kind	source	version	source_date	bytes	sha256	fetched
 tech_report-qwen3.8-flash-next.pdf	report	~/Downloads/tech_report.pdf (Qwen3.8-Flash-Next technical report)	-	-	2366146	04f263446d74a35cb7cea368574e0c561f3b05c133be2c777ac884404063655d	2026-10-01context-lms-2609.37725.pdf	https://arxiv.org/abs/2609.37725	v1	ac5c926814434d8ad2f499183cd2a81e53b4c14f327587f99980ade9157db01b
 looped-dit-2609.40305.pdf	https://arxiv.org/abs/2609.40305	v1	bc97f24d5703911433e04b1dfdedbc8f11f931de8a4158cc3592f5335563eaef
 loopcd-2610.02185.pdf	https://arxiv.org/abs/2610.02185	v1	ea3f4126a96cfe11b752c7ccfc6aa6b14c844952488ccfeac5ebd939517cd334
+2412.09871-blt.pdf	paper	https://arxiv.org/abs/2412.09871	v1	2024-12-13	2388447	23e0cc90e9e2ef0c11291043ca7ad4d48d5384328f31007b8b40230f370756ff	2026-10-02
+2305.07185-megabyte.pdf	paper	https://arxiv.org/abs/2305.07185	v1	2023-05-11	917445	94e38949305f642ea0f008850869c8902138bb44d44b3abf8da1c5113fb329c0	2026-10-02
+2404.14408-spacebyte.pdf	paper	https://arxiv.org/abs/2404.14408	v3	2024-10-06	585500	19914f0da857986df3c3c0e7e23bd8a0e4c268425a9645b444e9febd4589605c	2026-10-02
