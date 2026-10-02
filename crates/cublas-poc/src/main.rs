@@ -35,9 +35,9 @@
 mod poc {
     use burn::tensor::{Device, Distribution, FloatDType, Tensor, TensorData};
     use cudarc::driver::sys::{
-        CUdevice, CUdeviceptr, CUstream, cuCtxSetCurrent, cuDeviceGet, cuDevicePrimaryCtxRetain,
-        cuInit, cuMemAlloc_v2, cuMemFree_v2, cuMemcpyDtoD_v2, cuMemcpyDtoH_v2, cuMemcpyHtoD_v2,
-        cuStreamCreate, cuStreamDestroy_v2, cuStreamSynchronize,
+        cuCtxSetCurrent, cuDeviceGet, cuDevicePrimaryCtxRetain, cuInit, cuMemAlloc_v2,
+        cuMemFree_v2, cuMemcpyDtoD_v2, cuMemcpyDtoH_v2, cuMemcpyHtoD_v2, cuStreamCreate,
+        cuStreamDestroy_v2, cuStreamSynchronize, CUdevice, CUdeviceptr, CUstream,
     };
     use half::f16;
     use std::ffi::{c_char, c_int, c_void};
@@ -145,10 +145,7 @@ mod poc {
 
                 Self {
                     gemm_ex: std::mem::transmute(pick("cublasGemmEx", "cublasGemmEx_v2")),
-                    set_stream: std::mem::transmute(pick(
-                        "cublasSetStream",
-                        "cublasSetStream_v2",
-                    )),
+                    set_stream: std::mem::transmute(pick("cublasSetStream", "cublasSetStream_v2")),
                     destroy: std::mem::transmute(pick("cublasDestroy", "cublasDestroy_v2")),
                     handle,
                     stream: ptr::null_mut(),
@@ -321,15 +318,10 @@ mod poc {
     }
 
     fn upload_f32(ptr: CUdeviceptr, host: &[f32]) {
-        let raw: Vec<u8> = host
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
-        unsafe {
-            cuMemcpyHtoD_v2(ptr, raw.as_ptr() as *const c_void, raw.len())
-        }
-        .result()
-        .expect("H2D f32");
+        let raw: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
+        unsafe { cuMemcpyHtoD_v2(ptr, raw.as_ptr() as *const c_void, raw.len()) }
+            .result()
+            .expect("H2D f32");
     }
 
     fn upload_f16(ptr: CUdeviceptr, host: &[f32]) {
@@ -337,11 +329,9 @@ mod poc {
             .iter()
             .flat_map(|v| f16::from_f32(*v).to_bits().to_le_bytes())
             .collect();
-        unsafe {
-            cuMemcpyHtoD_v2(ptr, raw.as_ptr() as *const c_void, raw.len())
-        }
-        .result()
-        .expect("H2D f16");
+        unsafe { cuMemcpyHtoD_v2(ptr, raw.as_ptr() as *const c_void, raw.len()) }
+            .result()
+            .expect("H2D f16");
     }
 
     /// Deterministic host data, so two runs are comparable.
@@ -451,8 +441,18 @@ mod poc {
                     for lda in [k, n] {
                         for ldb in [k, m] {
                             let r = blas.gemm_ex_raw(
-                                m, k, n, da.0, db.0, dc.0, R_32F, COMPUTE_32F, transa,
-                                transb, lda, ldb,
+                                m,
+                                k,
+                                n,
+                                da.0,
+                                db.0,
+                                dc.0,
+                                R_32F,
+                                COMPUTE_32F,
+                                transa,
+                                transb,
+                                lda,
+                                ldb,
                             );
                             let msg = match r {
                                 Err(status) => format!("rejected, status {status}"),
@@ -462,7 +462,9 @@ mod poc {
                                     if rel < 1e-4 {
                                         format!("MATCH  maxabs {maxabs:.2e} rel {rel:.1e}")
                                     } else {
-                                        format!("accepted but WRONG: maxabs {maxabs:.2e} rel {rel:.1e}")
+                                        format!(
+                                            "accepted but WRONG: maxabs {maxabs:.2e} rel {rel:.1e}"
+                                        )
                                     }
                                 }
                             };
@@ -488,8 +490,7 @@ mod poc {
             let b = lcg(k * n, 0.05);
             // Host f32 reference, small shape only: 5120x2048x8192 on one core
             // is 30 s, which is not a probe.
-            let want: Option<Vec<f32>> = (m * n <= 1 << 22)
-                .then(|| host_gemm(&a, &b, m, k, n));
+            let want: Option<Vec<f32>> = (m * n <= 1 << 22).then(|| host_gemm(&a, &b, m, k, n));
 
             for (ab_type, compute, ab_name) in [
                 (R_32F, COMPUTE_32F, "f32"),
@@ -511,7 +512,8 @@ mod poc {
                     upload_f32(da.0, &a);
                     upload_f32(db.0, &b);
                 }
-                let (maxabs, rel) = match blas.gemm_ex(m, k, n, da.0, db.0, dc.0, ab_type, compute) {
+                let (maxabs, rel) = match blas.gemm_ex(m, k, n, da.0, db.0, dc.0, ab_type, compute)
+                {
                     Err(status) => {
                         println!(
                             "{:<20} {:>5} {:>8} rejected (status {status})",
@@ -554,7 +556,11 @@ mod poc {
             "{:<20} {:>10} {:>10} {:>9} {:>9} {:>9}",
             "shape", "burn ms", "staged ms", "TFLOP/s", "maxabs", "rel"
         );
-        for (m, k, n) in [(256usize, 128usize, 128usize), (5120, 768, 2048), (5120, 2048, 8192)] {
+        for (m, k, n) in [
+            (256usize, 128usize, 128usize),
+            (5120, 768, 2048),
+            (5120, 2048, 8192),
+        ] {
             let a = Tensor::<2>::random([m, k], Distribution::Normal(0.0, 1.0), &device);
             let b = Tensor::<2>::random([k, n], Distribution::Normal(0.0, 0.05), &device);
             let want: Vec<f32> = a
@@ -588,8 +594,7 @@ mod poc {
                 let out = dc.download_f32(m * n);
                 // The last step any real caller needs: the result AS a burn
                 // tensor, so the rest of the graph can consume it.
-                let back =
-                    Tensor::<2>::from_data(TensorData::new(out.clone(), [m, n]), &device);
+                let back = Tensor::<2>::from_data(TensorData::new(out.clone(), [m, n]), &device);
                 std::hint::black_box(back.into_data());
                 out
             };
@@ -636,7 +641,11 @@ mod poc {
             let db = Buf::new(k * n * 2);
             let dc = Buf::new(m * n * 4);
             // Same byte volume, from a different buffer, so the copy is real.
-            let (sa, sb, sc) = (Buf::new(m * k * 2), Buf::new(k * n * 2), Buf::new(m * n * 4));
+            let (sa, sb, sc) = (
+                Buf::new(m * k * 2),
+                Buf::new(k * n * 2),
+                Buf::new(m * n * 4),
+            );
             let d2d_ms = ms_of(20, || {
                 for (dst, src, bytes) in [
                     (da.0, sa.0, m * k * 2),
@@ -702,7 +711,8 @@ mod poc {
             );
             let (ptrs, stream) = a
                 .clone()
-                .try_into_primitive().unwrap()
+                .try_into_primitive()
+                .unwrap()
                 .client
                 .native_handles::<CudaServer>(vec![a_p.clone(), b_p, c_p])
                 .expect("native_handles");
@@ -769,7 +779,8 @@ mod poc {
             );
             let (p16, _) = a16
                 .clone()
-                .try_into_primitive().unwrap()
+                .try_into_primitive()
+                .unwrap()
                 .client
                 .native_handles::<CudaServer>(vec![a16_p, b16_p, out16_p])
                 .expect("native_handles");

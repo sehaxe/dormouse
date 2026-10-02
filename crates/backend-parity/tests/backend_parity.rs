@@ -63,14 +63,13 @@ fn bool_to_float_parity(device: &Device) {
     );
     let mask = lhs.greater_elem(0.0);
     let got: Vec<f32> = mask.clone().float().into_data().try_to_vec_as().unwrap();
-    assert_eq!(got, vec![0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0, 0.0], "comparison mask .float()");
+    assert_eq!(
+        got,
+        vec![0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0, 0.0],
+        "comparison mask .float()"
+    );
     // and the negation of one, the shape the firewall's `bool_not` used
-    let notted: Vec<f32> = mask
-        .bool_not()
-        .float()
-        .into_data()
-        .try_to_vec_as()
-        .unwrap();
+    let notted: Vec<f32> = mask.bool_not().float().into_data().try_to_vec_as().unwrap();
     assert_eq!(
         notted,
         vec![1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0],
@@ -150,7 +149,13 @@ fn device_side_bool_indicator(device: &Device) {
         // back [7]. Build it the way the trainer did, same shape.
         let indicator = Tensor::<1>::zeros([n], device).mask_fill(mask, 1.0);
         let v: Vec<f32> = indicator.clone().into_data().try_to_vec_as().unwrap();
-        assert_eq!(v, flags.iter().map(|&b| if b { 1.0 } else { 0.0 }).collect::<Vec<_>>());
+        assert_eq!(
+            v,
+            flags
+                .iter()
+                .map(|&b| if b { 1.0 } else { 0.0 })
+                .collect::<Vec<_>>()
+        );
         // ... and the accumulation, which is how it was read.
         assert_eq!(
             indicator.sum().into_scalar::<f32>(),
@@ -216,7 +221,11 @@ fn narrow_matmul_matches_fp32(device: &Device, cast: FloatDType, eps: f32) {
         .into_scalar();
 
     let an = a.cast(cast);
-    assert_eq!(an.dtype(), DType::from(cast), "cast produced the wrong dtype");
+    assert_eq!(
+        an.dtype(),
+        DType::from(cast),
+        "cast produced the wrong dtype"
+    );
     let got: f32 = an.matmul(b.cast(cast)).cast(FloatDType::F32).into_scalar();
     assert!(
         (got - reference).abs() <= eps * reference.abs().max(1.0),
