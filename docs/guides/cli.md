@@ -171,7 +171,7 @@ line instead.
 | `--detach` | off | daemonize: ignore SIGHUP, fork to background |
 
 There is no process-level auto-restart: a failure exits non-zero and the
-operator resumes with the same `--ckpt-name`. The `--guard` wrapper that
+operator resumes with the same `--ckpt-name`. The guard wrapper that
 re-exec'd from a pinned image was removed 2026-10-02 — its detached parent
 exited 0, so orchestrators read a crashed run as a finished one
 (`docs/reviews/unguard-2026-10-02.md`). The in-loop NaN firewall (loss masked,

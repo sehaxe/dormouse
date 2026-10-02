@@ -152,3 +152,24 @@ OpenBLAS, собранный `DYNAMIC_ARCH` ( measured: `OpenBLAS 0.3.34.106.0 .
 **Config-seams lane (2026-10-01, wt/config-seams):** the four doc-coverage §3.1-§3.3 + dead-pub §2 fixes landed as 179bdf3..ad3147f; loader warn is COUNTED not LOUD (the dangerous case is when another candidate loads — a terminal Err never fires there). red→green trick that needs no throwaway code: run the OLD test binary from a scratch cwd holding a broken configs/small.toml (cwd candidates come first in `candidates()`); before = silence, after = the warn.
 
 2026-10-01 (f16 TC, ИЗМЕРЕНО, wt/f16tc): SizedType-патч РАБОТАЕТ — f16 через burn = 40.05 TFLOP/s @ 5120×768×2048 (0.40 ms; cuBLAS 41.4) и 39.75 @ 5120×2048×8192 (4.32 ms; потолок 43.7, 91%); fp32-сиблинги 8.24/8.89; корректность 1e-2 зелёная. Гейт: f16_gemm_perf --ignored --exact, по dtype на процесс. Два грабли: (1) фикс виден ТОЛЬКО в корневом графе — у vendor/dormouse-fused свой воркспейс без [patch.crates-io], registry cubecl-ir фикса не содержит, тест оттуда меряет непатченный стек; (2) мой же guard `ms > 1.0` (писался до патча, когда f16 был медленным) паникнул на настоящих 0.474 ms — «гейт, который падает на успехе», переписан на потолок TFLOP/s (60/25). COUNTED-warn в Candidate::fail (cubecl-runtime schedule.rs) теперь показывает ~20 skip'ов кандидатов на прогон (No tile size / TMA unavailable) — раньше всё это было немым.
+
+2026-10-02 (unguard, дефект-инцидент): `--guard` + guard-image re-exec УДАЛЕНЫ (1949c39) — родитель при `--detach` выходил 0, оркестраторы читали краш как успех → 15 прогонов на одном GPU. Главная находка: NaN-файрвол ВСЕГДА был безусловен — флаг не доходил до TrainCfg, весь механизм жил в cli/train.rs (−109 строк), lib.rs не тронут (дифф не нужен). `--guard` теперь громко отказывает в clap. docs/reviews/unguard-2026-10-02.md.
+
+2026-10-02 (checks-sh, финишировано, wt/checks-sh): агрегатор `tools/checks.sh` готов и запушен (`f875564`). Три находки: (1) `oracle_gate.py` собирал путь `"vendor"/"burn-fused"/"crates"` из ЧАСТЕЙ — grep по токену `vendor/burn-fused` (клейм C1 «→ 0») и PREFIXES в check_doc_refs его не видят; гейт лежал с переименования, после фикса `05c91e1` жив и красный по существу (3×R1: файлы burn-kda без строк ORACLE-TIERS.tsv — владельцам). (2) doc-refs сканирует tracked-файлы, а существование путей проверяет по ФС — любой untracked-каталог маскирует красный в зелёный (механизм дефекта a0a1dce). (3) doc-warnings (-D warnings cargo doc) компилирует ЗАМЫКАНИЕ зависимостей: 8 rustc-warnings в dormouse-train (optim.rs:63, lib.rs:1118-1328, offload.rs:171, jepa_targets.rs:144) краснят гейт на main; не чинил — владельцу крейта.
+
+## CI-final lane (2026-10-02, wt/ci-final)
+
+**Cargo.toml gotcha of the day:** `[package.metadata.cargo-machete]` inserted
+mid-`[dependencies]` silently turns every following dep into inert metadata —
+the lock "consistently" drops them and `cargo metadata --locked` still passes;
+the crate just stops linking the dep. Metadata tables go AFTER the deps
+section. **clippy `-D warnings` stops enumerating at the first failing crate**
+(`could not compile X` then the run ends) — enumerate per-crate or
+fix-and-recurse; the 114-count shrank to ~46 on the rebased tree because
+landed lanes had quietly fixed their share. **Parallel release test-binary
+links (lto=thin, units=1) kernel-OOM** — `-j 1` links them one at a time.
+machete/clippy/fmt of crates/ closed (f47419a, f315275, de222ea); fmt stays
+red on train/src/lib.rs (129 hunks, wt/graph holds it) + core/src/routing.rs
+(8) — closing command is one `cargo fmt -p dormouse-core -p dormouse-data
+-p dormouse-train -p dormouse-cli` when the graph lane lands, then drop the
+lint job's continue-on-error.

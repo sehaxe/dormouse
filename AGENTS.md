@@ -105,7 +105,7 @@ run is correct but a year slower. Data that does not exist stops the run and is
 never synthesized (pretrain v21 trained on constant `b'x'`); shape mismatches
 assert; assertions average ≥2 per non-trivial function (NASA P10 Rule 5). The
 NaN firewall is unconditional — a masked step is skipped on device, and a
-failure that survives it stops the run for a human: the `--guard` auto-restart
+failure that survives it stops the run for a human: the guard auto-restart
 wrapper was removed 2026-10-02 (its detached parent exited 0, orchestrators
 read failure as success, fifteen runs stacked on one GPU —
 `docs/reviews/unguard-2026-10-02.md`).
