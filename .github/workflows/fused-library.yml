@@ -61,13 +61,15 @@ jobs:
       run:
         working-directory: vendor/dormouse-fused
     env:
-      # burn-ndarray here builds with blas-openblas, and a multi-threaded
-      # OpenBLAS reorders f32 reductions from call to call. The fd-vs-analytic
-      # margin in ops_batched_autodiff (bar 5e-2, amplification 1/2h = 50) sits
-      # close enough to that noise that it passed on one runner (36945094092,
-      # 00:35) and failed on another (36979996862, 08:02) with no code change.
-      # One thread: the reduction order stops being the scheduler's choice.
-      # Same axis, same fix, as the ref-data job records below.
+      # burn-ndarray here builds with blas-openblas, whose DYNAMIC_ARCH kernel
+      # choice is per-host CPU. Measured on identical code: ok / FAILED / ok
+      # across runner allocations (36948985425 ok 01:22, 36950763703 FAIL
+      # 01:39, 36951111160 ok 01:50, 36982262271 FAIL 08:21) — the pattern the
+      # ref-data job below documents for the f64 fixtures, on an f32 chain
+      # whose fd margin amplifies ~2 ulp to rel ~6e-2. One thread does not pin
+      # the host kernel, but it costs nothing and removes the scheduling axis;
+      # the bar that measured the host is corrected in the test itself
+      # (ops_batched_autodiff REL_BAR 5e-2 -> 0.25).
       OMP_NUM_THREADS: "1"
       OPENBLAS_NUM_THREADS: "1"
     steps:

@@ -29,8 +29,20 @@ use burn_gdn2::{chunk_path, chunk_wy_forward, chunk_wy_forward_autodiff, ChunkPa
 /// Central-difference step, from `burn-kda/tests/ops_grad_cuda.rs`: truncation
 /// O(h^2) against f32 round-off O(eps/h).
 const H: f32 = 1e-2;
-/// The bar from the same file.
-const REL_BAR: f32 = 5e-2;
+/// Was 5e-2 ("the bar from the same file"), and it measured the HOST more than
+/// the adjoint. burn-ndarray here runs OpenBLAS with DYNAMIC_ARCH — the kernel
+/// set is picked per host CPU — and this f32 chain (loss ~77, fd amplification
+/// 1/2h = 50) turns ~2 ulp of reduction-order difference into rel ~6e-2. On
+/// IDENTICAL code the test flipped with the runner allocation:
+/// 36948985425 ok (01:22) · 36950763703 FAIL (01:39) · 36951111160 ok (01:50) ·
+/// 36972953116 ok (06:39) · 36979996862 FAIL (08:02) · 36982262271 FAIL (08:21,
+/// with OPENBLAS_NUM_THREADS=1, byte-identical 6.15e-2) — the same
+/// host-not-formula axis `fused-library.yml`'s ref-data job documents for the
+/// f64 fixtures. 0.25 sits 4x above the worst measured host noise and still
+/// fails every real break of the contract this test exists for: a backward
+/// that cannot read the padded scratch produces O(1)-wrong gradients (or
+/// panics on the shape), which is decades outside it.
+const REL_BAR: f32 = 0.25;
 const N_COORDS: usize = 6;
 
 // 40 = 2 full chunks of 16 + one of 8. The ragged tail is the point.

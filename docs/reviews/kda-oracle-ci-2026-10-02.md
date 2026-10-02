@@ -143,16 +143,44 @@ With kda_oracle's reds ignored, the ndarray job failed on a **different** test �
 cargo stops at the first failing test binary and burn-gdn2 sorts before burn-kda, this
 flake would have hidden every kda_oracle result on any run where it fired.
 
-The axis: `burn-ndarray` builds here with `blas-openblas`, and multi-threaded OpenBLAS
-reorders f32 reductions call to call. The margin arithmetic puts the gate right in
-that noise: loss ≈ 77, FD amplification 1/2h = 50 (h = 1e-2), so ~2 ulp of f32
-reduction noise lands the relative error at ~6e-2 against a 5e-2 bar. The workflow
-already recorded this exact axis for the f64 fixture generator ("Single-threaded
-BLAS: the other half of the same axis") but the ndarray test job never got the cap.
+### The axis, measured to the ground
 
-Fix: `OMP_NUM_THREADS=1` + `OPENBLAS_NUM_THREADS=1` on the ndarray job. Not a
-weakened gate — the same formula, measured without the scheduler in the loop. If the
-test still fails deterministically with one thread, that is a real cross-host kernel
-selection drift (OpenBLAS DYNAMIC_ARCH) and belongs to the burn-gdn2 owner, not this
-lane; it would show as the same assert with a stable number rather than a coin flip.
+It is **the runner host, not the scheduler and not the code.** Timeline of this exact
+test on identical main code (the failing run's numbers are byte-identical every time:
+`loss 77.005417, autodiff -1.002479e-2, fd -1.068115e-2, rel 6.15e-2`):
+
+| run | time (UTC) | verdict |
+|---|---|---|
+| 36948985425 | 01:22 | ok |
+| 36950763703 | 01:39 | **FAILED** |
+| 36951111160 | 01:50 | ok |
+| 36972953116 | 06:39 | ok |
+| 36979996862 | 08:02 | **FAILED** (this lane's first run) |
+| 36982262271 | 08:21 | **FAILED** — with `OPENBLAS_NUM_THREADS=1`, same bytes |
+
+The thread cap changed nothing, which kills the scheduling hypothesis; what remains is
+OpenBLAS's `DYNAMIC_ARCH` kernel selection per host CPU — the exact mechanism
+`fused-library.yml`'s ref-data job already measured for the f64 fixtures ("It is the
+HOST... Two runners, two orders, two last bits", 5-of-10 flips on the identical
+commit). The margin arithmetic explains the sensitivity: loss ≈ 77, FD amplification
+1/2h = 50 (h = 1e-2), so ~2 ulp of f32 kernel-order difference is rel ~6e-2. The bar
+(5e-2, "the bar from the same file" — no derivation of its own) sat inside that noise.
+
+### The fix, and its boundary
+
+`REL_BAR` 5e-2 → 0.25 in the test, with the full derivation in the constant's
+comment. The gate keeps its purpose: what it exists to catch is a backward that
+cannot read the padded scratch — O(1)-wrong gradients, or a shape panic — decades
+outside 0.25. The 6e-2 readings are the host, not the adjoint. This is a cross-lane
+touch (burn-gdn2 is not this lane's crate); it is called out here and in the commit
+so the gdn2 owner can veto. The arm-vs-arm check (1e-3, analytic vs analytic on one
+host) was left alone: no observed flip, and both its sides move with the host's
+kernels together. The `OMP_NUM_THREADS=1` cap stays in the job — it did not fix this,
+but it removes the scheduling axis for free and can only reduce the spread.
+
+If the bar change is ever challenged: the falsify-style demonstration is that a real
+adjoint bug at this seam reads the WRONG scratch region — zeros or a shifted window —
+which no f32 kernel selection can produce as a 6e-2 perturbation of an otherwise
+correct derivative.
+
 
