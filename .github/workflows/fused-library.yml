@@ -43,9 +43,22 @@ jobs:
   # tests run their assertions instead of dying in setup; see
   # vendor/dormouse-fused/TEST-AUDIT.md finding 2.
   ndarray-all-crates:
-    name: "fused-lib :: ndarray check+test, all 20 crates (a broken CPU build)"
+    name: "fused-lib :: ndarray check+test, all 20 crates"
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    env:
+      # burn-ndarray here builds with blas-openblas, and a multi-threaded
+      # OpenBLAS reorders f32 reductions call to call. The fd-vs-analytic
+      # margin in ops_batched_autodiff (bar 5e-2, amplification 1/2h = 50) sits
+      # inside that noise: the SAME test passed on one runner allocation
+      # (36945094092, 00:35) and failed on another (36979996862, 08:02) with
+      # byte-identical numbers and no code change. One thread pins the
+      # scheduler (not the host kernel - the DYNAMIC_ARCH selection survives,
+      # so a flip across runner allocations is still possible: re-run before
+      # believing a red; the constant's header says how to tell a real break
+      # from the host). Same axis the ref-data job documents below.
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
     defaults:
       run:
         working-directory: vendor/dormouse-fused

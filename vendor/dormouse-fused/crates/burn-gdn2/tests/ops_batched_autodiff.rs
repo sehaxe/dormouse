@@ -19,6 +19,27 @@
 // separately, and the two arms' gradients against each other.
 //
 // Run: cargo test -p burn-gdn2 --features autodiff --test ops_batched_autodiff -- --nocapture
+//
+// ## KNOWN RUNNER FLAKE — re-run before believing a red here
+//
+// On identical main code this test flipped ok / FAIL across CI runner
+// allocations with BYTE-IDENTICAL failing numbers every time: `loss
+// 77.005417, autodiff -1.002479e-2, fd -1.068115e-2, rel 6.15e-2` (runs
+// 36948985425 ok / 36950763703 FAIL / 36951111160 ok / 36972953116 ok /
+// 36979996862 FAIL / 36982262271 FAIL, 2026-10-02). The axis is
+// burn-ndarray's `blas-openblas` DYNAMIC_ARCH kernel selection per host CPU —
+// the runner's host is part of the arithmetic, and a ~2-ulp kernel-order
+// difference at loss ~77 amplified by the fd contrast's 1/2h = 50 lands right
+// on the 5e-2 bar. `OPENBLAS_NUM_THREADS=1` pinns the scheduler, NOT the host
+// kernel, and did not stop the flip.
+//
+// The bar (5e-2) therefore measures the runner's host on this coordinate, and
+// was NOT widened (a proposed 5e-2 -> 0.25 was rejected — the reviewed
+// widening lives in wt/kdaci d53229d, not merged). Real contract breaks are
+// O(1)-wrong or shape-panic, orders above this noise. IF THIS GOES RED: run
+// the same test once more before investigating; a repeated red with a
+// DIFFERENT number, or a red that survives a local re-run on your own host,
+// is a real defect — name `num_diff`'s worst coordinate in the report.
 #![cfg(feature = "autodiff")]
 #![allow(deprecated)]
 

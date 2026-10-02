@@ -11,17 +11,15 @@
 #   A. MUTANTS THAT BREAK A GREEN. Perturb our source and show the corresponding
 #      green arm goes red. This is the ordinary "can it fail" demonstration.
 #
-#   B. MUTANTS THAT "FIX" A RED. The two red tests are red because our code
-#      disagrees with FLA. A mutant that moves our code TOWARD FLA's formula
-#      turns a red green. That is the strongest statement available: it proves
-#      the red is pinned to the reference's actual rule and not merely to "not
-#      what we happen to have written". The e2m1 lane's M6 is the precedent.
-#      Two of these are shipped here, since they are the fixes the owner may
-#      choose:
-#        - moving `exp(A)` outside the softplus in DecayFn::Softplus;
-#        - passing `head_k_dim**-0.5` instead of 1.0 as the chunk `scale`.
-#      Run the full oracle after each to see the red go green AND check that no
-#      OTHER test changed state.
+#   B. MUTANTS THAT REVERT A FIX. Until 2026-10-02 the two softplus/scale
+#      divergences were RED-ON-PURPOSE gates and this section shipped mutants
+#      that "fixed" them. Both divergences are now FIXED (owner-approved
+#      class B; `docs/reviews/kdafix-2026-10-02.md`), so the same mutations
+#      run in the REVERSE direction: re-invert the fix, expect the formerly
+#      red gate to go red again, and check that no OTHER test changed state.
+#      That is the same strongest statement read the other way: each green is
+#      pinned to the reference's actual rule and not merely to "not what we
+#      happen to have written".
 #
 # It mutates SOURCE files, so it snapshots first and restores on any exit path:
 #   * ORIG is a copy taken at start-up, not a `git checkout`, so this works in a
@@ -32,8 +30,7 @@
 #   * the final `cmp` reports whether the tree is back.
 #
 # Usage:  bash tests/oracle/falsify.sh
-# Expected: baseline 5 green / 2 red; every A-mutant >= 1 red; every B-mutant
-#           turns its target red green; tree restored.
+# Expected: baseline 7 green; every A-mutant >= 1 red; tree restored.
 set -u
 
 here="$(dirname "$(readlink -f "$0")")"   # .../burn-kda/tests/oracle
@@ -113,7 +110,7 @@ perturb_rope() { # as `perturb`, but the gate it must break is tests/kda_rope.rs
 }
 
 echo "== 0. BASELINE (unperturbed) =="
-echo "-- burn-kda oracle: 5 green, 2 red ON PURPOSE (the softplus placement and the read scale)"
+echo "-- burn-kda oracle: 7 green (0 designed reds since 2026-10-02)"
 run
 echo "-- the RoPE arm's own gate (tests/kda_rope.rs), expected all green"
 run_rope
@@ -161,25 +158,24 @@ perturb "A5 Eq 1: decay moved to the value axis" "$LIB" \
   'let state = state.mul(decay.clone().reshape([1, h, dk, 1]));' \
   'let state = state.mul(decay.clone().reshape([1, h, 1, dv]));'
 
-# ── A6. WHY THERE IS NO "TURN THE SCALE RED GREEN" MUTANT ─────────────────
-# The obvious mutant here -- change the `1.0` at src/lib.rs:646/:653 to
-# K**-0.5 -- provably does NOT turn `chunked_wy_applies_no_read_scale` green,
-# and the reason is worth stating rather than hiding behind a mutant that looks
-# like it worked:
-#
-#   the scale reds drive `chunk_wy_forward` with an EXPLICIT scale, on purpose,
-#   so that they compare the MECHANISM against FLA and not the wiring. The
-#   evidence that the mechanism is right and only the argument is wrong is the
-#   other test, `chunked_wy_honours_the_read_scale_when_asked`, which is GREEN:
-#   asked for K**-0.5, `chunk_wy_forward` reproduces FLA's own `oK` row.
-#
-# So the fix is at the call site and the fixture already contains the row that
-# call site must produce. There is nothing a source mutant can demonstrate that
-# the green does not already demonstrate, and a mutant that appeared to "fix" the
-# red would be a mutant measuring the test rather than the code.
-#
-# The one thing that IS worth a mutant, because it is our code and not the
-# reference's, is the decay axis -- A5 above -- and it is there.
+# ── A6. THE READ SCALE ─────────────────────────────────────────────────────
+# Until 2026-10-02 burn-kda passed `scale = 1.0` at src/lib.rs:646/:653 (and
+# hard-coded it in `fused.rs`'s dispatch arms); FLA's official KDA layer runs
+# at `head_k_dim**-0.5` (`fla/ops/kda/chunk.py:474-475`,
+# `fla/ops/kda/fused_recurrent.py:261-262`, `fla/layers/kda.py:262` passing
+# none). The module now passes the reference constant, and the constant lives
+# in ONE function — `KdaModule::k_scale` — so a mutant on that function breaks
+# every scale gate at once. Before the fix the reds compared the EXPLICIT
+# mechanism (they drove `chunk_wy_forward`/`kda_step` with the scale as an
+# argument, on purpose), which is why no source mutant could demonstrate
+# anything back then.
+perturb "A6 scale: k_scale loses the -0.5 exponent" "$LIB" \
+  'pub fn k_scale(&self) -> f64 {
+        (self.head_dim as f64).powf(-0.5)
+    }' \
+  'pub fn k_scale(&self) -> f64 {
+        (self.head_dim as f64).powf(-0.25)
+    }'
 
 # ── A-rope. mutants that must break the RoPE gate ─────────────────────────
 # The RoPE arm is a CROSS-FAMILY TRANSPLANT: FLA's official KDA layer has no
@@ -218,40 +214,24 @@ perturb_rope "A8 rope: theta 10000 -> 1000" \
   'pub const ROPE_THETA: f64 = 1000.0;'
 
 # ── B. mutants that "fix" a RED ─────────────────────────────────────────────
-# B1: the softplus form, corrected to FLA's. This one CAN be turned green,
-# because the softplus red drives `KdaDecay::forward`, i.e. our code. Expect
-# `kimi_linear_softplus_decay_matches_fla_reference` to go GREEN and nothing
-# else to move. If it stays red, the diagnosis in S3.1 is wrong about the
-# formula even though it is right that the two differ.
-#
-# The patch spans three lines because `a` AND `z_h` are both MOVED by
-# `z_h.mul(a.exp())`, so the corrected arm must clone both to read them. Three
-# earlier versions did not compile or did not match, and each failure is worth
-# the line it cost:
+# B1 → A9: the softplus form RE-INVERTED (exp(A) moved back INSIDE the
+# softplus). Until 2026-10-02 this was shipped as a B-mutant demonstrating the
+# fix; the fix now IS the production code, so the same mutation must turn
+# `kimi_linear_softplus_decay_matches_fla_reference` RED again. Previous
+# attempts' lessons survive the move:
 #   1. `mul_scalar(exp(A)*...)` -- `mul_scalar` on a rank-4 `Tensor` wants an
 #      `ElementConversion` bound a generic `B: Backend` does not supply;
 #   2. clone `a` but not `z_h` -- E0382, `z_h` moved;
-#   3. broadcast `mul(a)` instead of `mul(a.exp())` -- **compiles, and is wrong**:
-#      `a` is the clamped `A_h` itself (`lib.rs:259-264`), not `exp(A_h)`, so
-#      with `A = -3` the sign flips and every case reads positive where FLA
-#      reads negative. A mutant that compiles and is silently wrong is the worst
-#      kind, and it is the same shape as the bug this whole lane is about: a
-#      decision that looks fine and is not the reference's.
-perturb "B1 softplus: exp(A) moved OUTSIDE (expect the softplus red to GO GREEN)" "$LIB" \
-  'let scaled = z_h.mul(a.exp());
-        let g = match self.decay_fn {
-            // Kimi Linear: g = -exp(A_h) * Softplus(z), alpha in (0, 1)
-            DecayFn::Softplus => activation::softplus(scaled, 1.0).neg(),' \
-  'let scaled = z_h.clone().mul(a.clone().exp());
-        let g = match self.decay_fn {
-            // Kimi Linear: g = -exp(A_h) * Softplus(z), alpha in (0, 1)
-            DecayFn::Softplus => activation::softplus(z_h, 1.0).neg().mul(a.exp()),'
+#   3. broadcast `mul(a)` instead of `mul(a.exp())` -- **compiles, and is wrong**.
+perturb "A9 softplus re-inverted: exp(A) back INSIDE (expect the softplus green to GO RED)" "$LIB" \
+  'DecayFn::Softplus => activation::softplus(z_h, 1.0).mul(exp_a.neg()),' \
+  'DecayFn::Softplus => activation::softplus(z_h.mul(exp_a), 1.0).neg(),'
 
-# B2: G_MIN changed from K3'"'"'s -5. Both gate greens must react, and the module
+# A8: G_MIN changed from K3'"'"'s -5. Both gate greens must react, and the module
 #     doc's published 0.0771 stops being the init'"'"'s alpha. The generator
 #     '"'"'s vacuity guard 3 is the other half of this: it re-derives 0.0771 from
 #     FLA'"'"'s executed reference and refuses to write the fixture if it moves.
-perturb "B2 g_min: -5 (K3) -> -2" "$LIB" \
+perturb "A8 g_min: -5 (K3) -> -2" "$LIB" \
   'pub const G_MIN: f64 = -5.0;' \
   'pub const G_MIN: f64 = -2.0;'
 
@@ -262,7 +242,7 @@ if cmp -s "$LIB" "$ORIG_L" && cmp -s "$FUSED" "$ORIG_F"; then
 else
   echo "    !! a source file DOES NOT MATCH the snapshot" >&2
 fi
-echo "-- burn-kda oracle back to 5 green / 2 red:"
+echo "-- burn-kda oracle back to 7 green:"
 run
 echo "-- the RoPE gate back to all green:"
 run_rope
