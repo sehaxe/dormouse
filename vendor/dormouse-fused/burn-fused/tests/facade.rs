@@ -32,7 +32,6 @@ mod re_exports {
     use burn_fused::burn_dspark;
     use burn_fused::burn_eggroll;
     use burn_fused::burn_engram;
-    use burn_fused::burn_es;
     use burn_fused::burn_gdn2;
     use burn_fused::burn_jepa;
     use burn_fused::burn_kda;
@@ -43,7 +42,6 @@ mod re_exports {
     use burn_fused::burn_ptrn;
     use burn_fused::burn_rmsnorm;
     use burn_fused::burn_rope;
-    use burn_fused::burn_sct;
     use burn_fused::burn_situ;
     use burn_fused::burn_spectral;
     use burn_fused::burn_swiglu;

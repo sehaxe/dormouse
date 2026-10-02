@@ -47,7 +47,7 @@ fn tsct_fused_env_enabled() -> bool {
 }
 
 /// Absmean ternary projection (BitNet b1.58 STE): `sign(w) * mean(|w|)`
-/// with a dead zone at `0.7·mean` (burn-es convention).
+/// with a dead zone at `0.7·mean` (no external reference exists for this threshold).
 pub fn ternarize(w: Tensor<2>) -> Tensor<2> {
     let mag = w.clone().abs();
     let mean = mag.clone().mean().unsqueeze_dims(&[0, 0]);

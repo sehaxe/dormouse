@@ -18,7 +18,6 @@ members = [
     "crates/burn-jepa",
     "crates/burn-ptrn",
     "crates/burn-eggroll",
-    "crates/burn-es",
     "crates/burn-engram",
     "burn-fused",
     "benches",
