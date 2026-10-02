@@ -1353,7 +1353,13 @@ pub fn train_loop(
         //
         // `step % 500` is in the list for the two 500-step instruments
         // (`max_ortho`, `memory_cleanup`), both of which sync.
-        let ungraphed = !graph_on
+        //
+        // A graphed run is EITHER the whole-step window (`--graph-capture`) OR
+        // the stage (`--graph-stage`): the cadence below applies to both. With
+        // neither flag on, every step is ungraphed by definition. (The stage
+        // arm's first run fed 500 steps and captured none because this used to
+        // read `!graph_on` alone — the stage was armed and never asked.)
+        let ungraphed = !(graph_on || stage_on)
             || step % cfg.log_every as u64 == 0
             || host_adam_step
             || (cfg.timers && timer_step)
