@@ -327,7 +327,7 @@ mod tests {
         // it is paid ONCE: a new TrainCfg field must be added here, which is
         // exactly the moment the author has to ask "does this belong in the
         // snapshot?" - the question the skip hid.
-        const FIELDS: [&str; 42] = [
+        const FIELDS: [&str; 43] = [
             "steps", "ckpt_every", "log_every", "seq_len", "batch", "lr", "wd",
             "grad_clip", "ckpt_name", "eval_every", "opt", "quant",
             "factors_fallback", "rand_depth", "eval_batches", "eval_depths",
