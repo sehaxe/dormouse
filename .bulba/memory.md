@@ -173,3 +173,5 @@ red on train/src/lib.rs (129 hunks, wt/graph holds it) + core/src/routing.rs
 (8) — closing command is one `cargo fmt -p dormouse-core -p dormouse-data
 -p dormouse-train -p dormouse-cli` when the graph lane lands, then drop the
 lint job's continue-on-error.
+
+2026-10-02 (ночная волна→утро): **`--quant fp16` — режим BATCH 8**: при b8 −5% ms/step (441 vs 465, fwd 185→162), при b16 выигрыш инвертируется (bwd 504→534), b32 с aux не влезает вообще (OOM step 0, JEPA-учитель — второй форвард). Парное сравнение с 100k-бейзлайном (один сид, одно окно) на согласованных шагах: fp16 ≈ fp8 внутри шума ±0.1-0.2 — качество не просело. **Граф v1 упёрся в стену, предсказанную его же §1**: окно, исключающее out-of-place оптимизатор, НЕ ТРЕНИРУЕТ — 6 реплеев оставляют параметры bit-identical к capture-шагу (гейты 1/4, `wt/graph-trainer` не смержен, блокер в continuation-разделе дока). **attnres: s1 6.191 был разбросом сида, не сигналом** — fresh 3 сида дали range 0.262 (3.6× контроля 0.0730), mean 6.3300 → TIE → удалена; вся волна-3: все руки TIE, в сборку не вошла ни одна. Ночной прогон 44k шагов (b8+fp16) сам дошёл до финиша за 4.97ч, 0 NaN, BEST 5.908@36500.
