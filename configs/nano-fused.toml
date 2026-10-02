@@ -7,6 +7,7 @@ n_heads = 8
 head_dim = 64
 d_ffn = 2048
 vocab = 256
+use_byteflow = false
 max_seq_len = 512
 max_iter = 4
 rank = 96

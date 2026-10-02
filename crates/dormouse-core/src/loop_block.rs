@@ -1214,6 +1214,9 @@ mod tests {
             engram_rows: 256,
             use_kda: false,
             use_engram: false,
+            // These are dormouse-loop fixtures; the schema default is the
+            // byteflow net as of 2026-10-02, so the net is pinned off.
+            use_byteflow: false,
             ..Default::default()
         }
     }
@@ -1430,6 +1433,8 @@ mod tests {
             n_experts: 1,
             rank: 8,
             engram_rows: 256,
+            // dormouse-loop fixture; the schema default is the byteflow net
+            use_byteflow: false,
             ..Default::default()
         };
         let both = DormouseConfig {

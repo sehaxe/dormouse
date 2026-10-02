@@ -1,4 +1,6 @@
-# dormouse preset: small (flat schema, ADR-0005; these are also the schema defaults)
+# dormouse preset: small (flat schema; the schema default is now the BYTEFLOW
+# net for use_byteflow — this preset carries `false` explicitly, see
+# docs/reviews/byteflow-ab-2026-10-02.md for the 2026-10-02 A/B that flipped it)
 bf16 = false
 act_group = 0
 d_model = 768
@@ -6,6 +8,7 @@ n_heads = 12
 head_dim = 64
 d_ffn = 2048
 vocab = 256
+use_byteflow = false
 max_seq_len = 512
 max_iter = 4
 rank = 64
