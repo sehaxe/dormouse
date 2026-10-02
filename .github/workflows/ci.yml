@@ -57,6 +57,13 @@ jobs:
   # -p dormouse-train -p dormouse-cli` runs over them — then drop it and this
   # job is closed like unused-deps.
   #
+  # The mold step is NOT decoration, it is the reason the clippy step could
+  # report at all: `.cargo/config.toml` links through mold, this job never
+  # installed it, and every clippy step before 2026-10-02 died at the first
+  # build-script link ("collect2: fatal error: cannot find 'ld'") — the step
+  # has never run the lints on a runner. The 114-count was measured locally
+  # (findings file §2), which is the only place it could be measured.
+  #
   # `continue-on-error` is on the JOB, not on the steps, and that placement is
   # load-bearing. Measured on run 36866436388 (2026-10-01): with it on the
   # steps, GitHub reported BOTH failing steps as `conclusion: success` — a
@@ -74,6 +81,8 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: install mold (repo config links through it)
+        run: sudo apt-get update && sudo apt-get install -y mold
       - name: rustfmt
         # `-p` on the four crates, NOT `--all`: `cargo fmt --all` also walks
         # local path-based dependencies, so it reaches the 279 unformatted
