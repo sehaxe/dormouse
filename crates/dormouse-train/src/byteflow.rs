@@ -163,8 +163,7 @@ pub fn train_loop(
 
     let mut optim: Optim = burn::optim::AdamWConfig::new()
         .with_weight_decay(cfg.wd as f32)
-        .init()
-        .into();
+        .init();
     let mut step = load_ckpt(&dir, &cfg.ckpt_name, &dorm, &mut net, &mut optim);
     if step > 0 {
         println!("resumed {} at step {step}", cfg.ckpt_name);
@@ -224,7 +223,7 @@ pub fn train_loop(
         let lr = crate::wsd_factor(step, cfg.steps as u64, cfg.lr);
         net = optim.step(lr, net, grads);
         step += 1;
-        if step % cfg.log_every as u64 == 0 || step == 1 {
+        if step == 1 || step.is_multiple_of(cfg.log_every as u64) {
             let ms = t_iter.elapsed().as_secs_f64() * 1000.0;
             if ce.is_finite() {
                 best = best.min(ce);
@@ -236,7 +235,7 @@ pub fn train_loop(
                 best,
             );
         }
-        if cfg.eval_every > 0 && step % cfg.eval_every as u64 == 0 {
+        if cfg.eval_every > 0 && step.is_multiple_of(cfg.eval_every as u64) {
             let Some(ev) = eval_stream.as_mut() else {
                 continue;
             };
