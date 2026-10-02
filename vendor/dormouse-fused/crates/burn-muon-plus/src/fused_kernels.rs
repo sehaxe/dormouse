@@ -371,13 +371,13 @@ mod tests {
         let dev = cuda_dev();
         let src: Tensor<2> = Tensor::random([37, 11], Distribution::Normal(0.0, 1.0), &dev);
         let dst: Tensor<2> = Tensor::zeros([37, 11], &dev);
-        let before = src.clone().into_data().to_vec::<f32>();
+        let before = src.clone().into_data().try_to_vec::<f32>().expect("src readback");
         copy_into_cuda(&src, &dst).expect("the copy kernel must run on a bare cubecl tensor");
         // Bit-exact, not close: a copy is a copy. A kernel that launched and
         // wrote nothing fails here, which is the whole reason the test exists.
-        assert_eq!(dst.clone().into_data().to_vec::<f32>(), before);
+        assert_eq!(dst.clone().into_data().try_to_vec::<f32>().expect("dst readback"), before);
         assert_eq!(
-            src.clone().into_data().to_vec::<f32>(),
+            src.clone().into_data().try_to_vec::<f32>().expect("src readback 2"),
             before,
             "the source must be left alone"
         );
@@ -396,7 +396,7 @@ mod tests {
         let dst: Tensor<2, burn::tensor::Int> = Tensor::zeros([7, 5], &dev);
         copy_into_i32_cuda(&src, &dst).expect("the Int copy kernel must run");
         assert_eq!(
-            dst.into_data().to_vec::<i32>(),
+            dst.into_data().try_to_vec::<i32>().expect("dst readback"),
             (0..(7 * 5)).collect::<Vec<i32>>()
         );
     }

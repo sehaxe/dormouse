@@ -390,6 +390,16 @@ fn as_constant_int<const D: usize>(t: &Tensor<D, burn::tensor::Int>) -> Tensor<D
     Tensor::from_dispatch(d)
 }
 
+/// The seam's own unit: one float-pin copy, exactly what [`Master::put`]
+/// executes every step — both sides through [`as_constant_float`], then
+/// `copy_into`. Public for the integration gate that pins this path
+/// (`float_pin_roundtrips_through_as_constant`); a copy that launches and
+/// writes elsewhere would otherwise surface only as silently-frozen masters.
+#[doc(hidden)]
+pub fn float_pin_copy<const D: usize>(src: &Tensor<D>, dst: &Tensor<D>) -> Result<(), String> {
+    copy_into(&as_constant_float(src), &as_constant_float(dst))
+}
+
 /// Copy `src` into `dst`'s existing buffer: one launch, no allocation.
 ///
 /// A CUDA-graph pin is exactly this operation and nothing else — the graph has
@@ -661,14 +671,33 @@ impl Seam {
                         self.grads = Some(body());
                         return self.refused(format!("start_capture: {e:?}"));
                     }
-                    // The body runs either way: a capture refused at
-                    // `stop_capture` has already done the step's work, and
-                    // running it again would apply the update twice.
+                    // The body always runs (the closure is Fn): its grads are
+                    // the buffers' pre-capture contents until the replay below
+                    // executes the recording, and a capture refused at
+                    // `stop_capture` must still hand the caller SOMETHING for
+                    // the step it just consumed.
                     self.grads = Some(body());
                     return match client.stop_capture() {
                         Ok(graph) => {
                             self.graph = Some(Arc::new(graph));
                             self.stats.captures += 1;
+                            // CUDA stream capture RECORDS work; it does not
+                            // execute it. The gradients `body()` handed back
+                            // are the buffers' PRE-capture contents — measured
+                            // 2026-10-02 (`probe_replay_matches_fresh_window`):
+                            // iter_embed's grad read exactly 0.0 (a
+                            // never-written page) and embedding's 190x a real
+                            // gradient, while the SAME graph's first replay
+                            // wrote gradients equal to a fresh window's to six
+                            // decimals. Execute the recorded step now: one
+                            // replay launches the recorded kernels and writes
+                            // the real results into the buffers this seam
+                            // already handed to the caller.
+                            if let Some(g) = &self.graph {
+                                g.replay()
+                                    .map_err(|e| format!("graph replay after capture failed: {e}"))?;
+                                self.stats.replays += 1;
+                            }
                             Ok(())
                         }
                         Err(e) => self.refused(format!("stop_capture: {e:?}")),
