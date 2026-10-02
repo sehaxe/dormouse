@@ -182,3 +182,29 @@ depth 4.
   latent mismatch, пример-only;
 - решение владельца: Balanced-режим (память) как отдельный A/B, если
   нужен.
+
+## 8. Два дефекта прибора, найденных при закрытии lane (2026-10-02, вечер)
+
+1. **`tools/lib_gate.sh:95` глотает красный главной ячейки.**
+   `[ "$rc" -eq 0 ] || rc=$rc2` ПЕРЕЗАПИСЫВАЕТ ненулевой rc ячейки
+   `cargo test --workspace` значением rc2 (burn-gdn2 binary-tests). Красная
+   ячейка 2 + зелёная ячейка 3 = зелёный гейт. Измерено: мой локальный
+   прогон напечатал `PASS lib_gate` при 6 FAILED прямо в логе (kda_oracle
+   3 designed-red + burn-spectral 3 known-red), а solo-прогон
+   `cargo test -p burn-kda --test kda_oracle` в том же дереве честно
+   выходит 101. Фикс — удалить строку 95 (строка 96 уже покрывает rc2).
+   **Не правил** (общий инструмент; переплетено с designed-red решением
+   владельца) — сообщено с file:line. Следствие: локальный «зелёный» гейт
+   этой lane был ложно-зелёным; честное состояние дерева = CI
+   fused-library, красный по designed-red тестам.
+
+2. **fused-library CI красный на MAIN** (3/3 последних прогона main
+   failure, те же тесты): burn-kda kda_oracle `read_scale_matches_fla_reference`
+   / `chunked_wy_applies_no_read_scale` /
+   `kimi_linear_softplus_decay_matches_fla_reference` — designed-red
+   (владельческое решение по scale=1.0, docs/reviews/2026-09-30-kda-formula-audit.md
+   §3.2); фикс `#[ignore = "<причина>"]` лежит в `wt/kdaci` (`23f4b5f`) и
+   НЕ смержен в main; burn-spectral `polar_retracts` + два inference —
+   known-red из шапки gpu-gate.sh. Моя ветка не добавила ни одного нового
+   красного: workflow `ci` (корневой) — зелёный; fused-library падает
+   идентично main.
