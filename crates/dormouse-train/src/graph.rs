@@ -516,36 +516,27 @@ impl InputPins {
                 self.x.dims()[1] * self.x.dims()[0]
             ));
         }
+        if !self.keys_consumed {
+            return Ok((self.x.clone(), self.y.clone(), None));
+        }
+        let Some(h) = h else {
+            return Err(
+                "graph capture: the window consumes hashed keys but this step supplies \
+                 none — replaying it would train a memory-less model on a keyed run"
+                    .into(),
+            );
+        };
         if let Err(e) = copy_into_int(&as_constant_int(x), &as_constant_int(&self.x)) {
             return Err(format!("graph capture: could not pin x: {e}"));
         }
         if let Err(e) = copy_into_int(&as_constant_int(y), &as_constant_int(&self.y)) {
             return Err(format!("graph capture: could not pin y: {e}"));
         }
-        if !self.keys_consumed {
-            // The model reads no keys this run (no Engram arm, or the arm fed
-            // from host rows): the supplied keys are dead weight and the
-            // memory-less forward is the CORRECT program, so drop them. The
-            // armed line already printed `key window none` — the reader can
-            // tell which arm every step took.
-            return Ok((self.x.clone(), self.y.clone(), None));
-        }
-        match h {
-            Some(src) => {
-                if let Err(e) = copy_into_int(
-                    &as_constant_int(src),
-                    &as_constant_int(self.h.as_ref().expect("keyed arm built the buffer")),
-                ) {
-                    return Err(format!("graph capture: could not pin hashed_ids: {e}"));
-                }
-            }
-            None => {
-                return Err(
-                    "graph capture: the window consumes hashed keys but this step supplies \
-                     none — replaying it would train a memory-less model on a keyed run"
-                        .into(),
-                );
-            }
+        if let Err(e) = copy_into_int(
+            &as_constant_int(h),
+            &as_constant_int(self.h.as_ref().expect("keyed arm built the buffer")),
+        ) {
+            return Err(format!("graph capture: could not pin hashed_ids: {e}"));
         }
         Ok((
             self.x.clone(),
