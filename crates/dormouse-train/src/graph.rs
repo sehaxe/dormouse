@@ -867,4 +867,43 @@ mod tests {
         #[cfg(feature = "cuda")]
         m.put(&t).expect("on CUDA the pin copy must succeed");
     }
+    /// The keys gate, quiet half (2026-10-02, the `gbench_graph2` refusal): a
+    /// window that consumes no keys (`--no-engram`) takes a step that still
+    /// SUPPLIES the stream's unconditional FNV keys — passes, drops.
+    ///
+    /// The `feed` copy arms are not touched on this path, so the test is honest
+    /// on any backend. Before the fix this shape returned the loud
+    /// "this step has hashed keys and the pinned window has none" at every
+    /// step, which is exactly the lane that found the defect.
+    #[test]
+    fn a_keyless_window_takes_a_step_that_supplies_keys() {
+        let dev = burn::tensor::Device::default();
+        let x = Tensor::<2, burn::tensor::Int>::zeros([2, 4], &dev);
+        let y = Tensor::<2, burn::tensor::Int>::zeros([2, 4], &dev);
+        let h = Tensor::<3, burn::tensor::Int>::zeros([2, 4, 3], &dev);
+        let mut p = InputPins::new(&x, &y, &h, false);
+        let (_x, _y, hp) = p.feed(&x, &y, Some(&h)).expect("a keyless window must not refuse");
+        assert!(hp.is_none(), "a keyless window hands no keys, whatever the stream supplies");
+    }
+
+    /// The keys gate, loud half: a window that CONSUMES keys (the Engram arm
+    /// on) handed a step with none would replay a memory-less program on a
+    /// keyed run — refused by name, never papered over. THE real mismatch of
+    /// the pair (its inverse cannot be constructed: `new` allocates the key
+    /// buffer iff it claims consumption).
+    #[test]
+    fn a_consuming_window_refuses_a_step_that_supplies_none() {
+        let dev = burn::tensor::Device::default();
+        let x = Tensor::<2, burn::tensor::Int>::zeros([2, 4], &dev);
+        let y = Tensor::<2, burn::tensor::Int>::zeros([2, 4], &dev);
+        let h = Tensor::<3, burn::tensor::Int>::zeros([2, 4, 3], &dev);
+        let mut p = InputPins::new(&x, &y, &h, true);
+        let e = p
+            .feed(&x, &y, None)
+            .expect_err("a consuming window must refuse a key-less step");
+        assert!(
+            e.contains("consumes hashed keys"),
+            "the refusal must name the consumption mismatch: {e}"
+        );
+    }
 }

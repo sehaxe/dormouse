@@ -919,3 +919,54 @@ fn probe_replay_matches_fresh_window() {
         "the window itself is nondeterministic: two FRESH runs on the same batch differ by {w1:.3e} at {k1} - the differential gates are measuring the window, not the graphs"
     );
 }
+
+/// Gate 5, the `gbench_graph2` refusal keyed (2026-10-02): a `--no-engram` run
+/// whose byte stream still SUPPLIES FNV keys every step (dormouse-data computes
+/// them unconditionally). The window is key-less; `feed` receives the supplied
+/// keys; the capture must run and the replays must follow — before the fix,
+/// this exact shape refused every capture with "this step has hashed keys and
+/// the pinned window has none" (~/logs/gbench_graph.log).
+///
+/// The inverse mismatch (a consuming window on a step with no keys) is the
+/// built CPU-side: `a_consuming_window_refuses_a_step_that_supplies_none`.
+#[test]
+fn the_noengram_key_contract_captures_and_replays() {
+    let dev = device();
+    let (mut model, _t) = build();
+    let mut optim = AdamWConfig::new().init();
+    let mut seam = Seam::new(dormouse_train::cubecl_client_opt(&dev));
+    let (m, _t2) = seam.arm(model, None);
+    model = m;
+    assert!(seam.armed(), "the pin did not arm");
+    let mut pins: Option<InputPins> = None;
+    for step in 0..3 {
+        let (x, y, h) = batch(step, &dev);
+        let (x, y, window_keys) = {
+            let p = pins.get_or_insert_with(|| InputPins::new(&x, &y, &h, false));
+            p.feed(&x, &y, Some(&h))
+                .expect("a key-less window takes the keys the stream always supplies")
+        };
+        assert!(
+            window_keys.is_none(),
+            "the no-engram window must hand the forward None keys"
+        );
+        // The window here IS the trainer's no-engram shape: `h_for_fwd` is
+        // None, so the forward reads no keys no matter what loop_block's
+        // consumption branch would do.
+        seam.step(step == 0, || {
+            window(&model, None, x.clone(), y.clone(), window_keys.clone())
+        })
+        .expect("seam step");
+        let grads = seam.grads().expect("the window ran");
+        model = opt_borrowing(&mut optim, 1e-6, model, grads);
+        let (m, r) = seam.refresh(model, false);
+        model = m;
+        r.expect("pin holds");
+    }
+    println!("key-less window with supplied keys: {}", seam.report());
+    assert!(
+        seam.stats.captures > 0 && seam.stats.replays >= 1,
+        "the no-engram shape must capture and replay, not refuse: {}",
+        seam.report()
+    );
+}
