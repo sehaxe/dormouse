@@ -128,11 +128,7 @@ fn check(name: &str, device: &Device, rows: Vec<Vec<f32>>, k: usize) {
     // The index dtype is backend-defined — ndarray hands back I64, cubecl I32 —
     // which is itself a reason this comparison cannot be a shared device: read
     // through a conversion and let the check be about the VALUES.
-    let idx_flat: Vec<i64> = idx
-        .reshape([r, k])
-        .into_data()
-        .try_to_vec_as()
-        .unwrap();
+    let idx_flat: Vec<i64> = idx.reshape([r, k]).into_data().try_to_vec_as().unwrap();
     let picks: Vec<Vec<i64>> = idx_flat.chunks(k).map(<[i64]>::to_vec).collect();
 
     let out = topk_gather(scores, values, k);
@@ -159,10 +155,7 @@ fn check(name: &str, device: &Device, rows: Vec<Vec<f32>>, k: usize) {
         dup += v.3;
         if v.1 + v.2 + v.3 > 0 {
             // which columns, so a failure is diagnosable from the log alone
-            let mine: Vec<f32> = picks[row]
-                .iter()
-                .map(|&p| rows[row][p as usize])
-                .collect();
+            let mine: Vec<f32> = picks[row].iter().map(|&p| rows[row][p as usize]).collect();
             eprintln!(
                 "{name}: row {row} off — picks {:?} scores {mine:?}\n  \
                  row scores {:?}\n  gathered head {:?} want head {:?}",

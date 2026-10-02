@@ -105,7 +105,12 @@ fn rope_blocks() -> BTreeMap<String, Block> {
             continue;
         }
         if let Some(k) = key.take() {
-            out.insert(k, Block { fields: std::mem::take(&mut fields) });
+            out.insert(
+                k,
+                Block {
+                    fields: std::mem::take(&mut fields),
+                },
+            );
         }
         let mut it = t.split_whitespace();
         let kind = it.next().expect("empty block header");
@@ -156,7 +161,13 @@ fn bthd_to_bhtd(t: Tensor<4>, b: usize, h: usize, tt: usize, d: usize) -> Tensor
 /// assertion reads `<= 1.0`. Copied from `kda_oracle.rs` (same definition, same
 /// reason for the absolute term) rather than re-derived.
 fn num_diff(got: &[f32], want: &[f32], atol: f32, rtol: f32) -> (f32, usize) {
-    assert_eq!(got.len(), want.len(), "length {} vs {}", got.len(), want.len());
+    assert_eq!(
+        got.len(),
+        want.len(),
+        "length {} vs {}",
+        got.len(),
+        want.len()
+    );
     let mut worst = 0.0f32;
     let mut at = 0usize;
     for (i, (g, w)) in got.iter().zip(want).enumerate() {
@@ -208,12 +219,11 @@ fn rope_rotation_matches_fla_reference() {
         let d = blk.dims();
         assert_eq!(d[2], d[3], "the rope cases carry no GVA, so H == HV");
         for (ours, theirs) in [("q", "qrot"), ("k", "krot")] {
-            let got: Vec<f32> = our_rope(&blk, ours)
-                .into_data()
-                .to_vec::<f32>()
-                .unwrap();
+            let got: Vec<f32> = our_rope(&blk, ours).into_data().to_vec::<f32>().unwrap();
             let (r, at) = num_diff(&got, &blk.nums(theirs), ATOL_ROPE, TOL_ROPE);
-            report.push_str(&format!("  {name} {ours}: worst normalised {r:.3e} at {at}\n"));
+            report.push_str(&format!(
+                "  {name} {ours}: worst normalised {r:.3e} at {at}\n"
+            ));
             assert!(
                 r <= 1.0,
                 "apply_rope disagrees with FLA's rotary_embedding_ref\n  \
@@ -289,10 +299,7 @@ fn chunked_wy_with_rope_matches_fla_chunk() {
         for name in ["rope_short", "rope_t38", "rope_t64"] {
             let blk = get(&rope, name);
             let (got, got_s) = run_chunk(&blk, true);
-            for (what, mine, theirs) in [
-                ("o", &got, blk.nums("o")),
-                ("S", &got_s, blk.nums("S")),
-            ] {
+            for (what, mine, theirs) in [("o", &got, blk.nums("o")), ("S", &got_s, blk.nums("S"))] {
                 let (r, at) = num_diff(mine, &theirs, ATOL_CHUNK, TOL_CHUNK);
                 report.push_str(&format!(
                     "  arm {path:?} case {name} {what}: worst normalised {r:.3e} at {at}\n"
@@ -363,7 +370,8 @@ fn module_projects_both_q_and_k_rotated() {
     // interchangeable and the weights are made equal the honest way: build
     // one, hand its record to the other.
     let off = KdaModule::new(&cfg(false), 0.0, &dev);
-    let on = match KdaModule::new(&cfg(true), 0.0, &dev).try_load_record(off.clone().into_record()) {
+    let on = match KdaModule::new(&cfg(true), 0.0, &dev).try_load_record(off.clone().into_record())
+    {
         Ok(m) => m,
         Err(e) => panic!("the two configs must have interchangeable records: {e}"),
     };
@@ -465,7 +473,12 @@ fn rope_commutes_with_l2norm() {
     let to4 = |z: Tensor<3>| z.reshape([b, t, h, k]).permute([0, 2, 1, 3]);
     let from4 = |z: Tensor<4>| z.permute([0, 2, 1, 3]).reshape([b, t, h * k]);
     let per_head = |z: Tensor<4>| {
-        let s = z.clone().powf_scalar(2.0).sum_dim(3).add_scalar(1e-6).sqrt();
+        let s = z
+            .clone()
+            .powf_scalar(2.0)
+            .sum_dim(3)
+            .add_scalar(1e-6)
+            .sqrt();
         z / s
     };
     // `to4` takes the flat `[B,T,H*HD]` form, which is what `apply_rope`
@@ -498,7 +511,10 @@ fn rope_commutes_with_l2norm() {
         ATOL_ROPE,
         TOL_ROPE,
     );
-    assert!(r <= 1.0, "the rotation changed a head's L2 norm: {r:.3e} at {at}");
+    assert!(
+        r <= 1.0,
+        "the rotation changed a head's L2 norm: {r:.3e} at {at}"
+    );
 }
 
 // ── 4. the zero default ───────────────────────────────────────────────────

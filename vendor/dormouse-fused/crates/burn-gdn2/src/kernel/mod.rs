@@ -45,7 +45,10 @@ where
         Some(cube.clone())
     };
     let cube = read(t)?;
-    if row_major(&cube.meta.shape().dims::<D>(), &cube.meta.strides().to_vec()) {
+    if row_major(
+        &cube.meta.shape().dims::<D>(),
+        &cube.meta.strides().to_vec(),
+    ) {
         return Some(cube);
     }
     let shape = t.dims();

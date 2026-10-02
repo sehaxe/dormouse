@@ -52,7 +52,10 @@ impl MhcBlock {
     /// here rather than clamped.
     /// `d_model`: hidden dim `D = n*C`.
     pub fn new(n_branches: usize, d_model: usize, device: &Device) -> Self {
-        assert!(n_branches >= 1, "n_branches (the expansion rate n) must be >= 1");
+        assert!(
+            n_branches >= 1,
+            "n_branches (the expansion rate n) must be >= 1"
+        );
         let n = n_branches;
         let normal = Initializer::Normal {
             mean: 0.0,

@@ -46,7 +46,11 @@ fn cfg() -> DormouseConfig {
 }
 
 fn train_cfg(factors_fallback: bool, qk_heads: Option<usize>) -> TrainCfg {
-    TrainCfg { factors_fallback, qk_heads, ..TrainCfg::default() }
+    TrainCfg {
+        factors_fallback,
+        qk_heads,
+        ..TrainCfg::default()
+    }
 }
 
 /// THE gate. For every parameter of the live model, the group it is
@@ -59,8 +63,9 @@ fn installed_groups_are_the_declared_groups() {
                 let c = DormouseConfig { use_tsct, ..cfg() };
                 let model = DormouseModel::new(&c, &device());
                 let tcfg = train_cfg(factors_fallback, qk_heads);
-                let g = optimizer_groups(&model, &tcfg)
-                    .unwrap_or_else(|e| panic!("use_tsct={use_tsct} ff={factors_fallback} qk={qk_heads:?}: {e}"));
+                let g = optimizer_groups(&model, &tcfg).unwrap_or_else(|e| {
+                    panic!("use_tsct={use_tsct} ff={factors_fallback} qk={qk_heads:?}: {e}")
+                });
                 let r = routing(&model, factors_fallback);
                 let what = format!("use_tsct={use_tsct} ff={factors_fallback} qk={qk_heads:?}");
 
@@ -98,7 +103,10 @@ fn installed_groups_are_the_declared_groups() {
                     }
                     checked += 1;
                 }
-                assert!(checked > 10, "{what}: only {checked} params - the fixture is not the model this test thinks");
+                assert!(
+                    checked > 10,
+                    "{what}: only {checked} params - the fixture is not the model this test thinks"
+                );
             }
         }
     }
@@ -110,7 +118,10 @@ fn installed_groups_are_the_declared_groups() {
 /// assertion rather than riding inside the loop above.
 #[test]
 fn a_dense_expert_weight_never_reaches_muon() {
-    let c = DormouseConfig { use_tsct: false, ..cfg() };
+    let c = DormouseConfig {
+        use_tsct: false,
+        ..cfg()
+    };
     let model = DormouseModel::new(&c, &device());
     let tcfg = train_cfg(false, Some(2));
     let g = optimizer_groups(&model, &tcfg).expect("declared");
@@ -128,7 +139,11 @@ fn a_dense_expert_weight_never_reaches_muon() {
             "{path}: a [d,d] weight reached the Muon+ group - fp32 Newton-Schulz on it is the \
              ~40 s/step case; escape is to fix the group, not to raise --no-tsct's speed budget"
         );
-        assert_eq!(r.group_of_id(&id), Some(Group::Rest), "{path}: declared on the base optimizer");
+        assert_eq!(
+            r.group_of_id(&id),
+            Some(Group::Rest),
+            "{path}: declared on the base optimizer"
+        );
     }
     assert_eq!(dense_weights, 2 * c.n_experts, "gate_up + down, per expert");
     // And the spectral arm DOES put its factors there, or the test above is
@@ -137,9 +152,14 @@ fn a_dense_expert_weight_never_reaches_muon() {
     let sg = optimizer_groups(&spectral, &train_cfg(false, Some(2))).expect("declared");
     let factors = param_paths(&spectral)
         .into_iter()
-        .filter(|(p, id, _)| p.contains("expert_ffns") && p.ends_with("Tsct.u") && sg.muon.matches(id, Some(p)))
+        .filter(|(p, id, _)| {
+            p.contains("expert_ffns") && p.ends_with("Tsct.u") && sg.muon.matches(id, Some(p))
+        })
         .count();
-    assert!(factors > 0, "the spectral expert factors must be on Muon+ - otherwise the dense gate is vacuous");
+    assert!(
+        factors > 0,
+        "the spectral expert factors must be on Muon+ - otherwise the dense gate is vacuous"
+    );
 }
 
 /// Loudness: the install is verified against the live tree, and the
@@ -150,7 +170,8 @@ fn a_dense_expert_weight_never_reaches_muon() {
 #[test]
 fn the_group_build_is_loud_and_reachable() {
     let model = DormouseModel::new(&cfg(), &device());
-    let g = optimizer_groups(&model, &train_cfg(false, Some(2))).expect("the declared install is valid");
+    let g = optimizer_groups(&model, &train_cfg(false, Some(2)))
+        .expect("the declared install is valid");
     let r = routing(&model, false);
     // Every parameter the declaration does NOT call `Rest` is claimed by
     // exactly one installed group, and no `Rest` parameter is claimed at all.
@@ -164,7 +185,10 @@ fn the_group_build_is_loud_and_reachable() {
             || g.table.matches(&id, Some(&path));
         match r.group_of_id(&id) {
             Some(Group::Rest) => {
-                assert!(!claimed, "{path}: a base-optimizer parameter is claimed by an installed group");
+                assert!(
+                    !claimed,
+                    "{path}: a base-optimizer parameter is claimed by an installed group"
+                );
                 rest += 1;
             }
             Some(_) => {
@@ -205,11 +229,19 @@ fn the_declaration_is_declared_once() {
         "two module walkers disagree on how many parameters the model has"
     );
     for ((p1, i1, r1), (p2, i2, r2)) in from_train.iter().zip(&from_core) {
-        assert_eq!((p1, i1, r1), (p2, i2, r2), "two module walkers disagree on a parameter");
+        assert_eq!(
+            (p1, i1, r1),
+            (p2, i2, r2),
+            "two module walkers disagree on a parameter"
+        );
     }
     // And the walk still finds the arms, so an empty result cannot make the
     // equality above vacuously true.
-    assert!(from_core.len() > 10, "the walk returned {} params", from_core.len());
+    assert!(
+        from_core.len() > 10,
+        "the walk returned {} params",
+        from_core.len()
+    );
     assert!(
         from_core.iter().any(|(_, _, r)| *r == 2) && from_core.iter().any(|(_, _, r)| *r == 1),
         "no rank-1 parameter: the fixture is not the model this test thinks"

@@ -243,23 +243,36 @@ impl ModuleVisitor for Collector {
         // LOUD, never `unwrap_or_default()`: a readback that failed as an
         // empty vec would export a model with a missing tensor (ADR-0019).
         let flat = data.try_to_vec::<f32>().unwrap_or_else(|e| {
-            panic!("export: reading {} back from the device failed: {e}", self.path.join("."))
+            panic!(
+                "export: reading {} back from the device failed: {e}",
+                self.path.join(".")
+            )
         });
-        self.out.push((self.path.join("."), param.val().dims().to_vec(), flat));
+        self.out
+            .push((self.path.join("."), param.val().dims().to_vec(), flat));
     }
 
     fn visit_int<const D: usize>(&mut self, _param: &Param<Tensor<D, burn::tensor::Int>>) {
-        panic!("export: {} is an integer parameter and the format has no dtype for it", self.path.join("."));
+        panic!(
+            "export: {} is an integer parameter and the format has no dtype for it",
+            self.path.join(".")
+        );
     }
 
     fn visit_bool<const D: usize>(&mut self, _param: &Param<Tensor<D, burn::tensor::Bool>>) {
-        panic!("export: {} is a bool parameter and the format has no dtype for it", self.path.join("."));
+        panic!(
+            "export: {} is a bool parameter and the format has no dtype for it",
+            self.path.join(".")
+        );
     }
 }
 
 /// Every float parameter of `model`, by module path.
 pub fn tensors_of(model: &DormouseModel) -> Vec<(String, Vec<usize>, Vec<f32>)> {
-    let mut c = Collector { path: Vec::new(), out: Vec::new() };
+    let mut c = Collector {
+        path: Vec::new(),
+        out: Vec::new(),
+    };
     model.visit(&mut c);
     c.out
 }
@@ -276,7 +289,8 @@ pub fn encode(
     let tensors = tensors_of(model);
     let mut payload: Vec<u8> = Vec::new();
     let mut entries = Vec::with_capacity(tensors.len());
-    let (mut num_params, mut flushed, mut max_abs, mut min_nz) = (0u64, 0u64, 0.0f32, f32::INFINITY);
+    let (mut num_params, mut flushed, mut max_abs, mut min_nz) =
+        (0u64, 0u64, 0.0f32, f32::INFINITY);
     for (name, dims, flat) in &tensors {
         // A per-tensor count of values that stopped being numbers. The loop
         // below refuses the file if any is non-zero, so this is always 0 in a
@@ -307,7 +321,11 @@ pub fn encode(
             dtype.pack(y, &mut payload);
             num_params += 1;
         }
-        entries.push(TensorEntry { name: name.clone(), dims: dims.clone(), overflowed });
+        entries.push(TensorEntry {
+            name: name.clone(),
+            dims: dims.clone(),
+            overflowed,
+        });
     }
     assert!(
         entries.iter().all(|e| e.overflowed == 0),
@@ -344,7 +362,10 @@ pub fn encode(
 /// builds.
 pub fn decode(raw: &[u8]) -> Result<(DormouseModel, DormouseConfig, Header), String> {
     if raw.len() < FIXED {
-        return Err(format!("{} bytes: too short to be a dormouse export", raw.len()));
+        return Err(format!(
+            "{} bytes: too short to be a dormouse export",
+            raw.len()
+        ));
     }
     if raw[..8] != MAGIC {
         let path = Path::new("<export>");
@@ -359,7 +380,9 @@ pub fn decode(raw: &[u8]) -> Result<(DormouseModel, DormouseConfig, Header), Str
     let end = FIXED
         .checked_add(hlen)
         .and_then(|h| h.checked_add(plen))
-        .ok_or_else(|| "header + payload length overflows usize - the file is not what it claims".to_string())?;
+        .ok_or_else(|| {
+            "header + payload length overflows usize - the file is not what it claims".to_string()
+        })?;
     if end != raw.len() {
         return Err(format!(
             "truncated or padded: header says {hlen} + {plen} payload bytes, the file has {}",
@@ -374,8 +397,8 @@ pub fn decode(raw: &[u8]) -> Result<(DormouseModel, DormouseConfig, Header), Str
              the file did not arrive intact (re-download it; do not load it anyway)"
         ));
     }
-    let header: Header = toml::from_str(header_str(raw, FIXED, hlen)?)
-        .map_err(|e| format!("header parse: {e}"))?;
+    let header: Header =
+        toml::from_str(header_str(raw, FIXED, hlen)?).map_err(|e| format!("header parse: {e}"))?;
     if header.format != MAGIC[7] {
         return Err(format!(
             "export format version {} is not the {} this build reads",
@@ -412,7 +435,10 @@ fn apply(
                 payload.len()
             ));
         }
-        let flat: Vec<f32> = (off..end).step_by(w).map(|i| dtype.unpack(payload, i)).collect();
+        let flat: Vec<f32> = (off..end)
+            .step_by(w)
+            .map(|i| dtype.unpack(payload, i))
+            .collect();
         left.insert(t.name.clone(), TensorData::new(flat, t.dims.clone()));
         off = end;
     }
@@ -495,7 +521,9 @@ impl ModuleMapper for Loader {
         let want = param.val().dims();
         let got: Vec<usize> = data.shape.to_vec();
         if want.to_vec() != got {
-            self.mismatched.push(format!("{name}: model wants {want:?}, file carries {got:?}"));
+            self.mismatched.push(format!(
+                "{name}: model wants {want:?}, file carries {got:?}"
+            ));
             return param;
         }
         Param::from_data(data, &self.dev)
@@ -523,7 +551,11 @@ pub fn read(path: &Path) -> Result<(DormouseModel, DormouseConfig, Header), Stri
     let raw = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     decode(&raw).map_err(|e| {
         // The wrong-file sentence already names the path; do not say it twice.
-        if e.starts_with(&path.display().to_string()) { e } else { format!("{}: {e}", path.display()) }
+        if e.starts_with(&path.display().to_string()) {
+            e
+        } else {
+            format!("{}: {e}", path.display())
+        }
     })
 }
 
@@ -544,7 +576,8 @@ pub fn write(
     }
     let f = std::fs::File::create(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
     let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
-    w.write_all(&raw).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    w.write_all(&raw)
+        .map_err(|e| format!("{}: {e}", tmp.display()))?;
     std::io::Write::flush(&mut w).map_err(|e| format!("{}: {e}", tmp.display()))?;
     drop(w);
     std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", tmp.display()))?;
@@ -585,7 +618,10 @@ pub fn export_ckpt(
     let h = crate::parse_header(&raw)
         .ok_or_else(|| format!("{} is not a dormouse training checkpoint", ckpt.display()))?;
     if h.body + h.model > raw.len() {
-        return Err(format!("{}: the model section runs past the end of the file", ckpt.display()));
+        return Err(format!(
+            "{}: the model section runs past the end of the file",
+            ckpt.display()
+        ));
     }
     let cfg = config_for(ckpt, preset, set)?;
     let rec = burn::store::ModuleRecord::from_bytes(burn::tensor::Bytes::from_bytes_vec(
@@ -626,15 +662,18 @@ fn config_for(ckpt: &Path, preset: Option<&str>, set: &[String]) -> Result<Dormo
         .unwrap_or("");
     let snap = dir.join(format!("{name}.config.toml"));
     if snap.exists() {
-        let text = std::fs::read_to_string(&snap).map_err(|e| format!("{}: {e}", snap.display()))?;
+        let text =
+            std::fs::read_to_string(&snap).map_err(|e| format!("{}: {e}", snap.display()))?;
         let run = crate::RunCfg::from_snapshot(&text)?;
         return Ok(run.model);
     }
-    let preset = preset.ok_or_else(|| format!(
-        "no config for this checkpoint: {} does not exist, so there is no record of the shape \
+    let preset = preset.ok_or_else(|| {
+        format!(
+            "no config for this checkpoint: {} does not exist, so there is no record of the shape \
          its weights were trained under. Pass --preset <name> (or --config <path>) if you know it.",
-        snap.display()
-    ))?;
+            snap.display()
+        )
+    })?;
     Ok(crate::resolve(preset, set, Default::default())?.model)
 }
 
@@ -646,7 +685,11 @@ fn config_for(ckpt: &Path, preset: Option<&str>, set: &[String]) -> Result<Dormo
 pub fn inspect(path: &Path) -> Result<(Header, usize), String> {
     let raw = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     if raw.len() < FIXED {
-        return Err(format!("{}: {} bytes, too short to be a dormouse export", path.display(), raw.len()));
+        return Err(format!(
+            "{}: {} bytes, too short to be a dormouse export",
+            path.display(),
+            raw.len()
+        ));
     }
     if raw[..8] != MAGIC {
         return Err(wrong_file(path, &raw));
@@ -657,7 +700,12 @@ pub fn inspect(path: &Path) -> Result<(Header, usize), String> {
     let end = FIXED
         .checked_add(hlen)
         .and_then(|h| h.checked_add(plen))
-        .ok_or_else(|| format!("{}: header + payload length overflows usize", path.display()))?;
+        .ok_or_else(|| {
+            format!(
+                "{}: header + payload length overflows usize",
+                path.display()
+            )
+        })?;
     if end != raw.len() {
         return Err(format!(
             "{}: truncated or padded - the header says {hlen} + {plen} payload bytes, the file \

@@ -122,7 +122,10 @@ fn export_roundtrip_reproduces_the_model() {
     // --- f32: no narrowing, so this is the container's own claim ---
     let raw32 = export::encode(&src, &cfg, "test", 7, DType::F32).expect("f32 encodes");
     let (m32, cfg32, h32) = export::decode(&raw32).expect("f32 decodes");
-    assert_eq!(cfg32, cfg, "the header must carry the config the model was built with");
+    assert_eq!(
+        cfg32, cfg,
+        "the header must carry the config the model was built with"
+    );
     assert_eq!(h32.num_params, num_params as u64);
     assert_eq!(h32.num_tensors, tensors.len());
     assert!(
@@ -159,18 +162,32 @@ fn export_roundtrip_reproduces_the_model() {
         // One readback for the whole check: `tensors_of` pulls every parameter
         // to the host, so calling it per tensor would re-read the model once
         // per tensor and turn this gate into a timeout.
-        let loaded: std::collections::HashMap<String, (Vec<usize>, usize)> =
-            export::tensors_of(&m).into_iter().map(|(n, d, f)| (n, (d, f.len()))).collect();
-        assert_eq!(loaded.len(), h.tensors.len(), "a tensor went missing across the roundtrip");
+        let loaded: std::collections::HashMap<String, (Vec<usize>, usize)> = export::tensors_of(&m)
+            .into_iter()
+            .map(|(n, d, f)| (n, (d, f.len())))
+            .collect();
+        assert_eq!(
+            loaded.len(),
+            h.tensors.len(),
+            "a tensor went missing across the roundtrip"
+        );
         for t in &h.tensors {
             assert!(
                 !t.name.is_empty() && !t.dims.is_empty() && t.overflowed == 0,
                 "a malformed tensor entry: {t:?}"
             );
-            let (dims, len) = loaded
-                .get(&t.name)
-                .unwrap_or_else(|| panic!("{name}: in the header but not in the loaded model", name = t.name));
-            assert_eq!(*dims, t.dims, "{name}: dims changed across the roundtrip", name = t.name);
+            let (dims, len) = loaded.get(&t.name).unwrap_or_else(|| {
+                panic!(
+                    "{name}: in the header but not in the loaded model",
+                    name = t.name
+                )
+            });
+            assert_eq!(
+                *dims,
+                t.dims,
+                "{name}: dims changed across the roundtrip",
+                name = t.name
+            );
             assert_eq!(
                 t.dims.iter().product::<usize>(),
                 *len,
@@ -180,7 +197,10 @@ fn export_roundtrip_reproduces_the_model() {
         }
         let d = max_delta(&ref_logits, &logits(&m));
         println!("{dtype:?}: max |logit delta| {d:.3e} (tolerance {tol:.1e})");
-        assert!(d <= tol, "{dtype:?}: max |logit delta| {d:.3e} exceeds the measured {tol:.1e}");
+        assert!(
+            d <= tol,
+            "{dtype:?}: max |logit delta| {d:.3e} exceeds the measured {tol:.1e}"
+        );
     }
 
     // --- a corrupted payload is REFUSED, not loaded ---
@@ -223,14 +243,19 @@ fn export_roundtrip_reproduces_the_model() {
     let src_raw = export::encode(&src, &cfg, "test", 7, DType::Bf16).expect("encodes");
     let hlen = header_len(&src_raw);
     let plen = u64::from_le_bytes(src_raw[12..20].try_into().expect("8-byte window")) as usize;
-    let header = String::from_utf8(src_raw[export::FIXED..export::FIXED + hlen].to_vec()).expect("the header is utf-8");
+    let header = String::from_utf8(src_raw[export::FIXED..export::FIXED + hlen].to_vec())
+        .expect("the header is utf-8");
     let patched = header
         .replace(
             &format!("d_model = {}", cfg.d_model),
             &format!("d_model = {}", cfg.d_model / 2),
         )
         .into_bytes();
-    assert_ne!(patched, header.as_bytes(), "the header must contain d_model for this to test anything");
+    assert_ne!(
+        patched,
+        header.as_bytes(),
+        "the header must contain d_model for this to test anything"
+    );
     let mut tampered = Vec::with_capacity(export::FIXED + patched.len() + plen);
     tampered.extend_from_slice(&src_raw[..export::FIXED]);
     tampered[8..12].copy_from_slice(&(patched.len() as u32).to_le_bytes());
@@ -254,7 +279,10 @@ fn export_roundtrip_reproduces_the_model() {
     ));
     let err = export::encode(&big, &cfg, "test", 0, DType::F16)
         .expect_err("f16 must refuse a weight above 65504");
-    assert!(err.contains("bf16"), "the refusal must name the format that works, got: {err}");
+    assert!(
+        err.contains("bf16"),
+        "the refusal must name the format that works, got: {err}"
+    );
     assert!(
         export::encode(&big, &cfg, "test", 0, DType::Bf16).is_ok(),
         "bf16 has f32's exponent range and must accept the same model"
@@ -273,6 +301,10 @@ fn write_mini_ckpt(path: &std::path::Path) {
     let optim = build_optim(&model, &TrainCfg::default());
     save_ckpt(dir, "rt", &model, &optim, None, false, 3, 2.5).expect("saves");
     assert!(path.exists(), "save_ckpt wrote {path:?}");
-    let run = RunCfg { source: "test".into(), model: cfg, train: TrainCfg::default() };
+    let run = RunCfg {
+        source: "test".into(),
+        model: cfg,
+        train: TrainCfg::default(),
+    };
     std::fs::write(dir.join("rt.config.toml"), run.snapshot_toml()).expect("snapshot");
 }

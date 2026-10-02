@@ -114,7 +114,10 @@ impl GatedResidual {
     /// concatenated, so without it the gate pre-activation is nr times too
     /// large and a fresh init lands the gate saturated at 0 or 1 instead of
     /// near 0.5.
-    pub fn read<B: burn::backend::AutodiffBackend>(&self, branches: &[Tensor<3>]) -> (Tensor<3>, GrState)
+    pub fn read<B: burn::backend::AutodiffBackend>(
+        &self,
+        branches: &[Tensor<3>],
+    ) -> (Tensor<3>, GrState)
     where
         DispatchTensor: DispatchKindConversion<B>
             + DispatchKindConversion<B::InnerBackend>
@@ -133,12 +136,12 @@ impl GatedResidual {
             self.wd.forward::<B>(stacked).mul_scalar(1.0 / nr),
         ))); // [b*t, nr*d]
         let mut x = Tensor::zeros([b, t, d], &branches[0].device());
-        for i in 0..GR_BRANCHES {
+        for (i, nrm) in normed.iter().enumerate() {
             let gi = g_flat
                 .clone()
                 .slice([0..b * t, i * d..(i + 1) * d])
                 .reshape([b, t, d]);
-            x = x + gi.mul(normed[i].clone());
+            x = x + gi.mul(nrm.clone());
         }
         (x.div_scalar(nr), GrState { normed })
     }
@@ -169,13 +172,11 @@ impl GatedResidual {
         .mul_scalar(2.0)
         .reshape([b, t, GR_BRANCHES]);
         let mut out = Vec::with_capacity(GR_BRANCHES);
-        for i in 0..GR_BRANCHES {
-            let si = s_flat
-                .clone()
-                .slice([0..b, 0..t, i..i + 1]);
+        for (i, br) in branches.iter().enumerate() {
+            let si = s_flat.clone().slice([0..b, 0..t, i..i + 1]);
             // Store back in the branch dtype (bf16 under --bf16): the sum
             // itself is computed in fp32 (mixed-dtype ops NaN on sm_120).
-            out.push(branches[i].clone() + si.mul(y.clone()).cast(branches[i].dtype()));
+            out.push(br.clone() + si.mul(y.clone()).cast(br.dtype()));
         }
         out
     }
@@ -184,8 +185,8 @@ impl GatedResidual {
 mod tests {
     use super::*;
     use crate::param::LinearLikeInner;
-    use burn::backend::Autodiff;
     use burn::backend::autodiff::checkpoint::strategy::BalancedCheckpointing;
+    use burn::backend::Autodiff;
     use burn::tensor::TensorData;
 
     // The CPU backend (burn-flex). Either backend works: the arithmetic here is
@@ -229,7 +230,12 @@ mod tests {
         let bv = m
             .bias
             .as_ref()
-            .map(|b| b.val().into_data().try_to_vec::<f32>().expect("bias to host"))
+            .map(|b| {
+                b.val()
+                    .into_data()
+                    .try_to_vec::<f32>()
+                    .expect("bias to host")
+            })
             .unwrap_or_default();
         assert_eq!(wv.len(), out * inp, "weight shape");
         (wv, bv, inp, out)
@@ -340,16 +346,14 @@ mod tests {
         let br = branches(&dev);
         let (_, state) = gr.read::<B>(&br);
         let normed: Vec<Vec<f32>> = state.normed.iter().map(host3).collect();
-        let y: Vec<f32> = (0..B_ * T * D).map(|n| ((n * 3) % 7) as f32 * 0.5 - 0.9).collect();
+        let y: Vec<f32> = (0..B_ * T * D)
+            .map(|n| ((n * 3) % 7) as f32 * 0.5 - 0.9)
+            .collect();
         let y = Tensor::from_data(TensorData::new(y, [B_, T, D]), &dev);
         let out = gr.write::<B>(&br, &state, y.clone());
 
         let (ww, bw, ww_in, ww_out) = dense_params(&gr.ww);
-        assert_eq!(
-            (ww_in, ww_out),
-            (ND, GR_BRANCHES),
-            "W_w in R^(nr x nr*d)"
-        );
+        assert_eq!((ww_in, ww_out), (ND, GR_BRANCHES), "W_w in R^(nr x nr*d)");
         let nr = GR_BRANCHES as f64;
 
         let yv = host3(&y);

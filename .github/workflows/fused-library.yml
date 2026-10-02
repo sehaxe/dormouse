@@ -35,14 +35,13 @@ env:
 
 jobs:
   # 1. every crate, on the ndarray backend, in one command
-  # KNOWN RED on its first run: burn-spectral's `polar_retracts`,
-  # `to_inference_matches_trained_layer` and
-  # `to_inference_matches_per_column_layer` panic in `retract` before they
-  # assert, because `Tensor::set_require_grad(true)` on a non-autodiff device
-  # is an assert on burn 0.22. Precise cause and line numbers:
-  # vendor/dormouse-fused/TEST-AUDIT.md, finding 2. Left red on purpose — the fix
-  # belongs to whoever owns that crate, and a job that hides it is the failure
-  # mode this rewrite exists to end.
+  # GREEN as of 2026-10-02. The first-run red named below is closed: the three
+  # burn-spectral tests built their fixtures on the plain ndarray device, and
+  # `retract`'s `set_require_grad(true)` is an assert on a non-autodiff device
+  # (burn 0.22) — they panicked before they asserted. The fixtures now build on
+  # `Autodiff<NdArray>` (the device the retraction actually targets), so the
+  # tests run their assertions instead of dying in setup; see
+  # vendor/dormouse-fused/TEST-AUDIT.md finding 2.
   ndarray-all-crates:
     name: "fused-lib :: ndarray check+test, all 20 crates (a broken CPU build)"
     runs-on: ubuntu-latest

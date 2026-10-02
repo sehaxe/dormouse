@@ -12,21 +12,32 @@ use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 struct Args {
-    #[arg(long, help = "inference export written by `dormouse export` (<name>.dmexp)")] export: PathBuf,
-    #[arg(long, default_value = "hello")] prompt: String,
-    #[arg(long, default_value = "32")] steps: usize,
-    #[arg(long, default_value = "0.8")] temp: f32,
+    #[arg(
+        long,
+        help = "inference export written by `dormouse export` (<name>.dmexp)"
+    )]
+    export: PathBuf,
+    #[arg(long, default_value = "hello")]
+    prompt: String,
+    #[arg(long, default_value = "32")]
+    steps: usize,
+    #[arg(long, default_value = "0.8")]
+    temp: f32,
 }
 
 fn main() {
     let a = Args::parse();
-    let (model, cfg, h) = dormouse_train::export::read(&a.export)
-        .unwrap_or_else(|e| { eprintln!("generate: {e}"); std::process::exit(1); });
+    let (model, cfg, h) = dormouse_train::export::read(&a.export).unwrap_or_else(|e| {
+        eprintln!("generate: {e}");
+        std::process::exit(1);
+    });
     // LOUD before a single byte is sampled: a --engram-ram model has its
     // memory in a .ngram sidecar this export does not ship, so decoding it
     // here would answer from a memory arm that never ran.
-    dormouse_train::decode::refuse_unservable_memory(&cfg)
-        .unwrap_or_else(|e| { eprintln!("generate: {e}"); std::process::exit(1); });
+    dormouse_train::decode::refuse_unservable_memory(&cfg).unwrap_or_else(|e| {
+        eprintln!("generate: {e}");
+        std::process::exit(1);
+    });
     println!(
         "loaded {} ({:?} weights, {} params, step {})",
         a.export.display(),
@@ -38,19 +49,27 @@ fn main() {
     println!("prompt: {}", a.prompt);
     let mut rng = rand::thread_rng();
     for _ in 0..a.steps {
-        let logits = dormouse_train::decode::next_byte_logits::<dormouse_train::Backend>(&model, &bytes);
+        let logits =
+            dormouse_train::decode::next_byte_logits::<dormouse_train::Backend>(&model, &bytes);
         let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let exp: Vec<f32> = logits.iter().map(|x| ((x - max)/a.temp).exp()).collect();
+        let exp: Vec<f32> = logits.iter().map(|x| ((x - max) / a.temp).exp()).collect();
         let sum: f32 = exp.iter().sum();
         let mut r = rng.gen_range(0.0..sum);
         let mut next = 0u8;
         for (i, e) in exp.iter().enumerate() {
             r -= e;
-            if r <= 0.0 { next = i as u8; break; }
+            if r <= 0.0 {
+                next = i as u8;
+                break;
+            }
         }
-        if next < 32 || next > 126 { next = 32 + (next % 95); }
+        if !(32..=126).contains(&next) {
+            next = 32 + (next % 95);
+        }
         bytes.push(next);
-        if bytes.len() > model.max_seq_len() { break; }
+        if bytes.len() > model.max_seq_len() {
+            break;
+        }
     }
     println!("gen: {}", String::from_utf8_lossy(&bytes));
 }

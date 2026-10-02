@@ -102,7 +102,9 @@ struct Io {
 
 fn io() -> Io {
     let dev = Device::cuda(0);
-    let xvals: Vec<f32> = (0..ROWS * D).map(|i| (i as f32 * 0.37).sin() * 3.0).collect();
+    let xvals: Vec<f32> = (0..ROWS * D)
+        .map(|i| (i as f32 * 0.37).sin() * 3.0)
+        .collect();
     let wvals: Vec<f32> = (0..D).map(|i| 0.5 + 0.25 * i as f32).collect();
     let xt = Tensor::<2>::from_data(TensorData::new(xvals.clone(), [ROWS, D]), &dev);
     let wt = Tensor::<1>::from_data(TensorData::new(wvals.clone(), [D]), &dev);
@@ -111,7 +113,15 @@ fn io() -> Io {
     let client = xc.client.clone();
     let wc = down1(wt);
     let outc = down2(outt.clone());
-    Io { out: outt, outc, client, x: xc, w: wc, xvals, wvals }
+    Io {
+        out: outt,
+        outc,
+        client,
+        x: xc,
+        w: wc,
+        xvals,
+        wvals,
+    }
 }
 
 impl Io {
@@ -137,7 +147,13 @@ impl Io {
     /// rung is judged on the shape of its own answer and not on its scale.
     fn worst(&self, want: &dyn Fn(usize, usize) -> f32) -> f64 {
         let got = self.read();
-        assert_eq!(got.len(), ROWS * D, "the output has {} elements, not {}", got.len(), ROWS * D);
+        assert_eq!(
+            got.len(),
+            ROWS * D,
+            "the output has {} elements, not {}",
+            got.len(),
+            ROWS * D
+        );
         let mut worst = 0.0f64;
         for r in 0..ROWS {
             for i in 0..D {
@@ -166,7 +182,10 @@ impl Io {
     fn check(&self, rung: &str, want: &dyn Fn(usize, usize) -> f32) {
         let worst = self.worst(want);
         eprintln!("{rung}: LOWERED, worst rel {worst:e} against this rung's own expected value");
-        assert!(worst < 1e-4, "{rung} lowered but computed the wrong value: worst {worst:e}");
+        assert!(
+            worst < 1e-4,
+            "{rung} lowered but computed the wrong value: worst {worst:e}"
+        );
     }
 }
 
@@ -235,7 +254,9 @@ fn p1_runtime_scalar() {
             D as u32,
         );
     }
-    io.check("p1_runtime_scalar", &|r, i| io.x_at(r, i) * io.w_at(i) * (eps + 1.0));
+    io.check("p1_runtime_scalar", &|r, i| {
+        io.x_at(r, i) * io.w_at(i) * (eps + 1.0)
+    });
 }
 
 // ── p2: + Shared::new_slice at a #[comptime] size, one write, ONE barrier ──
@@ -275,13 +296,22 @@ fn p2_shared_write_sync_read() {
             THREADS,
         );
     }
-    io.check("p2_shared_write_sync_read", &|r, i| io.x_at(r, i) * io.w_at(i) * io.x_at(r, 0));
+    io.check("p2_shared_write_sync_read", &|r, i| {
+        io.x_at(r, i) * io.w_at(i) * io.x_at(r, 0)
+    });
 }
 
 // ── p3: + a CONDITIONAL write to shared, a SECOND barrier, a read by ALL ──
 
 #[cube(launch_unchecked)]
-fn p3<F: Float>(x: &[F], w: &[F], out: &mut [F], eps: f32, #[comptime] d: u32, #[comptime] threads: u32) {
+fn p3<F: Float>(
+    x: &[F],
+    w: &[F],
+    out: &mut [F],
+    eps: f32,
+    #[comptime] d: u32,
+    #[comptime] threads: u32,
+) {
     let row = CUBE_POS_X as usize;
     let tid = UNIT_POS_X as usize;
     let d = d as usize;
@@ -369,7 +399,14 @@ fn p4_barrier_in_while() {
 // ── p5: the real kernel's WHOLE reduction, tree and all ───────────────────
 
 #[cube(launch_unchecked)]
-fn p5<F: Float>(x: &[F], w: &[F], out: &mut [F], eps: f32, #[comptime] d: u32, #[comptime] threads: u32) {
+fn p5<F: Float>(
+    x: &[F],
+    w: &[F],
+    out: &mut [F],
+    eps: f32,
+    #[comptime] d: u32,
+    #[comptime] threads: u32,
+) {
     let row = CUBE_POS_X as usize;
     let tid = UNIT_POS_X as usize;
     let d = d as usize;
@@ -440,7 +477,14 @@ fn p5_tree_reduction() {
 // which is what makes the pair a bisect rather than two anecdotes.
 
 #[cube(launch_unchecked)]
-fn p6<F: Float>(x: &[F], w: &[F], out: &mut [F], eps: f32, #[comptime] d: u32, #[comptime] threads: u32) {
+fn p6<F: Float>(
+    x: &[F],
+    w: &[F],
+    out: &mut [F],
+    eps: f32,
+    #[comptime] d: u32,
+    #[comptime] threads: u32,
+) {
     let row = CUBE_POS_X as usize;
     let tid = UNIT_POS_X as usize;
     let d = d as usize;
@@ -592,7 +636,14 @@ fn p7_full_kernel() {
 // necessary to the failure or merely a bystander.
 
 #[cube(launch_unchecked)]
-fn p9<F: Float>(x: &[F], w: &[F], out: &mut [F], eps: f32, #[comptime] d: u32, #[comptime] threads: u32) {
+fn p9<F: Float>(
+    x: &[F],
+    w: &[F],
+    out: &mut [F],
+    eps: f32,
+    #[comptime] d: u32,
+    #[comptime] threads: u32,
+) {
     let row = CUBE_POS_X as usize;
     let tid = UNIT_POS_X as usize;
     let d = d as usize;
@@ -787,7 +838,11 @@ fn p11_run(x: &[f32], d: usize, w: &[f32], eps: f32, cuda: &Device) -> Option<Ve
         Tensor::<1>::from_data(TensorData::new(w.to_vec(), [d]), cuda),
         eps,
     )
-    .map(|o| o.into_data().try_to_vec().expect("the fused arm read back nothing"))
+    .map(|o| {
+        o.into_data()
+            .try_to_vec()
+            .expect("the fused arm read back nothing")
+    })
 }
 
 fn p11_worst(x: &[f32], d: usize, w: &[f32], eps: f32, got: &[f32]) -> f64 {
@@ -797,8 +852,8 @@ fn p11_worst(x: &[f32], d: usize, w: &[f32], eps: f32, got: &[f32]) -> f64 {
         let row = &x[r * d..(r + 1) * d];
         let ss: f64 = row.iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
         for i in 0..d {
-            let want = f64::from(row[i]) / (ss / d as f64 + f64::from(eps)).sqrt()
-                * f64::from(w[i]);
+            let want =
+                f64::from(row[i]) / (ss / d as f64 + f64::from(eps)).sqrt() * f64::from(w[i]);
             worst = worst.max((f64::from(got[r * d + i]) - want).abs() / want.abs().max(1.0));
         }
     }
@@ -814,13 +869,27 @@ fn p11_the_claimed_envelope() {
         // mean-square where eps is decisive (1e-7 against eps=1e-5, so any error
         // in the sum is multiplied up).
         (1, vec![2.5e-5, -7.0e-5], vec![3.0]),
-        (2, vec![0.0, 1.08484633e-3, 5.41788817e-4, -5.61883964e-4], vec![-2.5, 3.0]),
-        (3, (0..9).map(|i| (i as f32 * 0.9).sin() * 2.0).collect(), vec![0.5, 0.75, 1.0]),
+        (
+            2,
+            vec![0.0, 1.08484633e-3, 5.41788817e-4, -5.61883964e-4],
+            vec![-2.5, 3.0],
+        ),
+        (
+            3,
+            (0..9).map(|i| (i as f32 * 0.9).sin() * 2.0).collect(),
+            vec![0.5, 0.75, 1.0],
+        ),
         // And two widths INSIDE the envelope, which must run and be right.
-        (4, (0..12).map(|i| (i as f32 * 0.9).sin() * 2.0).collect(),
-            (0..4).map(|i| 0.5 + 0.25 * i as f32).collect()),
-        (13, (0..13).map(|i| (i as f32 * 0.9).sin() * 2.0).collect(),
-            (0..13).map(|i| 0.5 + 0.25 * i as f32).collect()),
+        (
+            4,
+            (0..12).map(|i| (i as f32 * 0.9).sin() * 2.0).collect(),
+            (0..4).map(|i| 0.5 + 0.25 * i as f32).collect(),
+        ),
+        (
+            13,
+            (0..13).map(|i| (i as f32 * 0.9).sin() * 2.0).collect(),
+            (0..13).map(|i| 0.5 + 0.25 * i as f32).collect(),
+        ),
     ];
     for (d, x, w) in &cases {
         match p11_run(x, *d, w, eps, &cuda) {

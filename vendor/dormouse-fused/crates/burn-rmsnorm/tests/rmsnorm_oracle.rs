@@ -186,7 +186,12 @@ const DISCRIM_FACTOR: f64 = 2.0;
 /// is 1962x TOL and is stated in the generator rather than discovered here.
 const EPS_DECISIVE: [&str; 5] = ["tiny", "micro", "zero_row", "d1", "d2"];
 /// The wrong columns, and the case that must separate from each of them.
-const WRONG_COLUMNS: [&str; 4] = ["out_eps_outside", "out_no_eps", "out_layernorm", "out_axis1"];
+const WRONG_COLUMNS: [&str; 4] = [
+    "out_eps_outside",
+    "out_no_eps",
+    "out_layernorm",
+    "out_axis1",
+];
 
 fn dev() -> Device {
     Device::ndarray()
@@ -209,10 +214,12 @@ fn fixture() -> HashMap<String, Vec<f64>> {
         if key.starts_with("meta.") {
             continue;
         }
-        out.entry(key.to_string()).or_default().extend(
-            body.split_whitespace()
-                .map(|v| v.parse::<f64>().unwrap_or_else(|_| panic!("bad number {v:?} in {key:?}"))),
-        );
+        out.entry(key.to_string())
+            .or_default()
+            .extend(body.split_whitespace().map(|v| {
+                v.parse::<f64>()
+                    .unwrap_or_else(|_| panic!("bad number {v:?} in {key:?}"))
+            }));
     }
     out
 }
@@ -285,7 +292,13 @@ impl Fx {
     /// not be silently skipped by an `is_finite()` guard.
     fn rel_diff(&self, case: &str, ours: &[f32], col: &str) -> f64 {
         let want = self.get(&format!("case.{case}.{col}"));
-        assert_eq!(ours.len(), want.len(), "{case}/{col}: {} vs {}", ours.len(), want.len());
+        assert_eq!(
+            ours.len(),
+            want.len(),
+            "{case}/{col}: {} vs {}",
+            ours.len(),
+            want.len()
+        );
         ours.iter()
             .zip(want)
             .map(|(a, b)| {
@@ -513,7 +526,8 @@ fn the_claim() {
         worst_pair.0 <= 1e-6,
         "torch and fla disagree on case {} by {}e relative; the fixture is \
          recording a conflict, not an answer",
-        worst_pair.1, worst_pair.0
+        worst_pair.1,
+        worst_pair.0
     );
 
     // (2) The cases that must decide the eps question, do — by a wide margin.

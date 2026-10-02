@@ -290,7 +290,10 @@ pub fn dspark_loss(
             let c_star = accept_rate_target(draft_logits, target_logits).detach(); // [B, L]
             let cl = cl.reshape([b, l]);
             let one_minus_c = c_star.neg().add_scalar(1.0);
-            let bce_per = cl.clone().mul(one_minus_c).add(activation::softplus(cl.neg(), 1.0));
+            let bce_per = cl
+                .clone()
+                .mul(one_minus_c)
+                .add(activation::softplus(cl.neg(), 1.0));
             (bce_per * wm).sum().div(den)
         }
     };
@@ -422,7 +425,10 @@ mod tests {
         let p = AcceptRatePredictor::with_markov(D, R, &dev());
         let h = Tensor::<3>::zeros([1, 3, D], &dev());
         let token = |i: i64| -> Tensor<2, Int> {
-            Tensor::from_data(burn::tensor::TensorData::new(vec![i, 1 + i, 2 + i], [1, 3]), &dev())
+            Tensor::from_data(
+                burn::tensor::TensorData::new(vec![i, 1 + i, 2 + i], [1, 3]),
+                &dev(),
+            )
         };
         let logit = |t: i64| -> Vec<f32> {
             p.logit(h.clone(), Some(markov.get_prev_embeddings(token(t))))
@@ -431,8 +437,13 @@ mod tests {
                 .unwrap()
         };
         let (a, b) = (logit(1), logit(9));
-        let moved: f32 = (0..a.len()).map(|i| (a[i] - b[i]).abs()).fold(0.0, f32::max);
-        assert!(moved > 1e-4, "the markov head ignores W1[x]: {a:?} vs {b:?}");
+        let moved: f32 = (0..a.len())
+            .map(|i| (a[i] - b[i]).abs())
+            .fold(0.0, f32::max);
+        assert!(
+            moved > 1e-4,
+            "the markov head ignores W1[x]: {a:?} vs {b:?}"
+        );
 
         let hidden_only: Vec<f32> = AcceptRatePredictor::new(D, &dev())
             .prob(h, None)

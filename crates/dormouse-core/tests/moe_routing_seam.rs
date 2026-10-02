@@ -87,7 +87,11 @@ fn capture(block: &LoopBlock, x: Tensor<3>, head: &LinearLike) -> Vec<Tensor<2>>
 
 fn rows(cap: &[Tensor<2>]) -> Vec<Vec<f32>> {
     let t = &cap[0];
-    let v: Vec<f32> = t.clone().into_data().try_to_vec().expect("mixture readable");
+    let v: Vec<f32> = t
+        .clone()
+        .into_data()
+        .try_to_vec()
+        .expect("mixture readable");
     let [n, e] = t.dims();
     assert_eq!(v.len(), n * e);
     v.chunks(e).map(|r| r.to_vec()).collect()
@@ -118,7 +122,8 @@ fn off_is_the_dense_mixture_and_allocates_nothing() {
     let n0 = Module::num_params(&LoopBlock::new(&c0, &adev()));
     let n1 = Module::num_params(&LoopBlock::new(&c1, &adev()));
     assert_eq!(
-        n0, n1,
+        n0,
+        n1,
         "the routing arm added {} parameters: an off-arm checkpoint would stop \
          loading, and every measured preset parameter count would move",
         n1 - n0
@@ -127,12 +132,19 @@ fn off_is_the_dense_mixture_and_allocates_nothing() {
     let block = LoopBlock::new(&c0, &adev());
     probe::reset();
     let cap = capture(&block, x(), &head);
-    assert_eq!(cap.len(), block.max_iter, "one capture per executed iteration");
+    assert_eq!(
+        cap.len(),
+        block.max_iter,
+        "one capture per executed iteration"
+    );
     let r = rows(&cap);
     for (i, row) in r.iter().enumerate() {
         assert_eq!(row.len(), EXPERTS);
         let s: f32 = row.iter().sum();
-        assert!((s - 1.0).abs() < 1e-5, "iteration {i}: the blend must sum to 1, got {s}");
+        assert!(
+            (s - 1.0).abs() < 1e-5,
+            "iteration {i}: the blend must sum to 1, got {s}"
+        );
         assert!(
             row.iter().all(|v| *v > 0.0),
             "iteration {i}: the DENSE blend gives every expert a positive weight, got {row:?} - \
@@ -176,7 +188,10 @@ fn routed_support_is_exactly_one_and_the_counter_follows() {
         );
         for (j, v) in row.iter().enumerate() {
             if j != live[0] {
-                assert_eq!(*v, 0.0, "iteration {i}: a non-selected expert carries nothing");
+                assert_eq!(
+                    *v, 0.0,
+                    "iteration {i}: a non-selected expert carries nothing"
+                );
             }
         }
     }
@@ -198,7 +213,10 @@ fn routed_support_is_exactly_one_and_the_counter_follows() {
 #[test]
 fn the_router_receives_the_pass_index() {
     let head = head();
-    let c = DormouseConfig { max_iter: 1, ..cfg(0) };
+    let c = DormouseConfig {
+        max_iter: 1,
+        ..cfg(0)
+    };
     let mut block = LoopBlock::new(&c, &adev());
     let x = x();
     let before = rows(&capture(&block, x.clone(), &head));
@@ -212,7 +230,11 @@ fn the_router_receives_the_pass_index() {
         .into_data()
         .try_to_vec::<f32>()
         .expect("iter_embed readable");
-    let moved: Vec<f32> = e.iter().enumerate().map(|(i, v)| if i < 32 { -*v - 1.0 } else { *v }).collect();
+    let moved: Vec<f32> = e
+        .iter()
+        .enumerate()
+        .map(|(i, v)| if i < 32 { -*v - 1.0 } else { *v })
+        .collect();
     block.iter_embed = Param::from_tensor(Tensor::<2>::from_data(
         burn::tensor::TensorData::new(moved, [1, 32]),
         &adev(),
@@ -244,14 +266,18 @@ fn the_balancer_reaches_the_loss_only_with_a_selection() {
     // The model must be small enough for a CPU forward; `cfg` already is.
     let ids = Tensor::<2, burn::tensor::Int>::from_data(
         burn::tensor::TensorData::new(
-            (0..(BATCH * SEQ)).map(|i| (i % 251) as i64).collect::<Vec<_>>(),
+            (0..(BATCH * SEQ))
+                .map(|i| (i % 251) as i64)
+                .collect::<Vec<_>>(),
             [BATCH, SEQ],
         ),
         &adev(),
     );
     let targets = Tensor::<2, burn::tensor::Int>::from_data(
         burn::tensor::TensorData::new(
-            (0..(BATCH * SEQ)).map(|i| (i % 251 + 1) as i64).collect::<Vec<_>>(),
+            (0..(BATCH * SEQ))
+                .map(|i| (i % 251 + 1) as i64)
+                .collect::<Vec<_>>(),
             [BATCH, SEQ],
         ),
         &adev(),
@@ -278,9 +304,10 @@ fn the_balancer_reaches_the_loss_only_with_a_selection() {
     let mut on = c.clone();
     on.moe_lb_coef = 0.01;
     let m_on = DormouseModel::new(&on, &adev());
-    let (_l, _r, _k, aux_on) =
-        m_on.forward_with_hidden::<B>(ids, None, None, Some(targets), None);
-    let t = aux_on.expect("a balancer with a selection must produce a term").into_scalar::<f32>();
+    let (_l, _r, _k, aux_on) = m_on.forward_with_hidden::<B>(ids, None, None, Some(targets), None);
+    let t = aux_on
+        .expect("a balancer with a selection must produce a term")
+        .into_scalar::<f32>();
     assert!(
         t.is_finite() && t > 0.0,
         "the balancer must be a finite positive addition, got {t}"

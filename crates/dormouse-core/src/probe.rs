@@ -145,7 +145,7 @@ pub const NAMES: [&str; N_ARMS] = [
 ];
 
 thread_local! {
-    static COUNTS: [Cell<u64>; N_ARMS] = [const { Cell::new(0) }; N_ARMS];
+    static COUNTS: [Cell<u64>; N_ARMS] = const { [const { Cell::new(0) }; N_ARMS] };
 }
 
 /// Count one entry into `arm`. Host-side, branch-local, never on device.
@@ -167,5 +167,11 @@ pub fn reset() {
 /// `(name, count)` for every arm, zeroed ones included - a printout that shows
 /// the arms that did NOT run is the point.
 pub fn counts() -> Vec<(&'static str, u64)> {
-    COUNTS.with(|c| NAMES.iter().zip(c.iter()).map(|(n, x)| (*n, x.get())).collect())
+    COUNTS.with(|c| {
+        NAMES
+            .iter()
+            .zip(c.iter())
+            .map(|(n, x)| (*n, x.get()))
+            .collect()
+    })
 }

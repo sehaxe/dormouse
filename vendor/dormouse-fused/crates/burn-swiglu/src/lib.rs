@@ -21,10 +21,10 @@ pub fn swiglu_gate(gu: Tensor<3>) -> Tensor<3> {
     let hidden = d2 / 2;
     #[cfg(feature = "cuda")]
     {
-        if let Some(out) = crate::fused::swiglu_cuda::<
-            burn_cubecl::CubeBackend,
-        >(gu.clone().reshape([b * t, d2]), hidden)
-        {
+        if let Some(out) = crate::fused::swiglu_cuda::<burn_cubecl::CubeBackend>(
+            gu.clone().reshape([b * t, d2]),
+            hidden,
+        ) {
             return out.reshape([b, t, hidden]);
         }
     }

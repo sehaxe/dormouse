@@ -31,8 +31,8 @@
 #![cfg(all(feature = "cuda", feature = "autodiff"))]
 
 use burn::tensor::{Device, Distribution, Tensor};
-use burn_autodiff::Autodiff;
 use burn_autodiff::checkpoint::strategy::BalancedCheckpointing;
+use burn_autodiff::Autodiff;
 use burn_gdn2::CudaBare;
 use burn_kda::{DecayFn, KdaConfig, KdaModule};
 
@@ -88,7 +88,11 @@ fn kda_forward_train_state_produces_a_gradient_on_the_trainers_backend() {
     // finite differences in `tests/ops_grad_cuda.rs`; what this file adds is
     // the trainer's own wiring - the real module, the real backend, a real
     // state carried out of the op.
-    let loss = y.clone().powf_scalar(2.0).sum().add(s.powf_scalar(2.0).sum());
+    let loss = y
+        .clone()
+        .powf_scalar(2.0)
+        .sum()
+        .add(s.powf_scalar(2.0).sum());
     let grads = loss.backward();
     let counts = burn_gdn2::seam_counts();
     println!(

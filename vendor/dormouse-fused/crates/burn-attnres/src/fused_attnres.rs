@@ -396,14 +396,16 @@ fn depth_attend_backward_kernel<F: Float>(
     // scores + softmax over l
     let mut max_s = F::new(-3.0e38_f32);
     for li in 0..l {
-        let s = qh[li] * F::cast_from(scale) / (sq[li] * F::cast_from(norm_m) + F::new(1e-5_f32)).sqrt();
+        let s = qh[li] * F::cast_from(scale)
+            / (sq[li] * F::cast_from(norm_m) + F::new(1e-5_f32)).sqrt();
         if s > max_s {
             max_s = s;
         }
     }
     let mut sum_e = F::new(0.0_f32);
     for li in 0..l {
-        let s = qh[li] * F::cast_from(scale) / (sq[li] * F::cast_from(norm_m) + F::new(1e-5_f32)).sqrt();
+        let s = qh[li] * F::cast_from(scale)
+            / (sq[li] * F::cast_from(norm_m) + F::new(1e-5_f32)).sqrt();
         let e = (s - max_s).exp();
         w[li] = e;
         sum_e += e;
@@ -461,8 +463,7 @@ fn depth_attend_backward_kernel<F: Float>(
                 // `m = 1/d`, and the finite-difference gate
                 // (`depth_attend_grad_matches_finite_difference`) went red at
                 // rel 1.47 the moment `ScoreForm::Paper` was wired in.
-                let norm =
-                    dsc * F::cast_from(scale) * (q[col] * inv - m * hl * qh[li] * inv3);
+                let norm = dsc * F::cast_from(scale) * (q[col] * inv - m * hl * qh[li] * inv3);
                 dh[li * hbt + base + col] = w[li] * dout[base + col] + norm;
                 dq[tid * per + j] += dsc * F::cast_from(scale) * hl * inv;
             }
@@ -488,27 +489,23 @@ pub fn depth_attend_backward_cuda(
     type CudaBare = burn_cubecl::CubeBackend;
     let cube = |t: &Tensor<3>| -> Option<CubeTensor> {
         let prim = t.clone().try_into_primitive::<CudaBare>().ok()?;
-        let c = (&prim as &dyn std::any::Any)
-            .downcast_ref::<CubeTensor>()?;
+        let c = (&prim as &dyn std::any::Any).downcast_ref::<CubeTensor>()?;
         Some(c.clone())
     };
     let cube_any = |t: &burn::tensor::Tensor<3, burn::tensor::Float>| -> Option<CubeTensor> {
         let prim = t.clone().try_into_primitive::<CudaBare>().ok()?;
-        let c = (&prim as &dyn std::any::Any)
-            .downcast_ref::<CubeTensor>()?;
+        let c = (&prim as &dyn std::any::Any).downcast_ref::<CubeTensor>()?;
         Some(c.clone())
     };
     let cube1 = |t: &Tensor<1>| -> Option<CubeTensor> {
         let prim = t.clone().try_into_primitive::<CudaBare>().ok()?;
-        let c = (&prim as &dyn std::any::Any)
-            .downcast_ref::<CubeTensor>()?;
+        let c = (&prim as &dyn std::any::Any).downcast_ref::<CubeTensor>()?;
         Some(c.clone())
     };
     let l = history.len();
     let [b, t, d] = history[0].dims();
     let bt = b * t;
-    let hc: Vec<CubeTensor> =
-        history.iter().map(cube).collect::<Option<_>>()?;
+    let hc: Vec<CubeTensor> = history.iter().map(cube).collect::<Option<_>>()?;
     let qc = cube1(query)?;
     let dc = cube(d_out)?;
     let dev = &history[0].device();
@@ -712,8 +709,7 @@ pub fn depth_attend_cuda(
         return None;
     }
     let qc = cube_of(query)?;
-    let hc: Vec<CubeTensor> =
-        history.iter().map(cube_of).collect::<Option<_>>()?;
+    let hc: Vec<CubeTensor> = history.iter().map(cube_of).collect::<Option<_>>()?;
     // chunked: peak memory (G+2)*B*T*D instead of (L+1)*B*T*D; the chunk
     // stack is cached (never escapes), out is written once by the last chunk
     let dev = &history[0].device();
@@ -783,11 +779,7 @@ pub fn depth_attend_cuda(
     Some(out)
 }
 
-pub fn source_score_cuda(
-    query: &Tensor<1>,
-    src: &Tensor<3>,
-    form: ScoreForm,
-) -> Option<Tensor<3>> {
+pub fn source_score_cuda(query: &Tensor<1>, src: &Tensor<3>, form: ScoreForm) -> Option<Tensor<3>> {
     let [b, t, d] = src.dims();
     if d == 0 {
         return None;
@@ -898,11 +890,7 @@ mod tests {
     /// formula, so they agreed. It now takes the form as an argument, and the
     /// tests run BOTH forms, so a kernel that ignored `norm_m` or `scale`
     /// would be red rather than consistently wrong.
-    fn ref_depth_attend(
-        history: &[Tensor<3>],
-        query: &Tensor<1>,
-        form: ScoreForm,
-    ) -> Tensor<3> {
+    fn ref_depth_attend(history: &[Tensor<3>], query: &Tensor<1>, form: ScoreForm) -> Tensor<3> {
         let n = history.len();
         let [b, t, d] = history[0].dims();
         let scale = form.scale(d);
@@ -1033,8 +1021,14 @@ mod tests {
             let out_cuda = cuda.step(hc, &mut st_cuda);
             let md = maxdiff(&to_host(out_cuda.clone()), &to_host(out_cpu));
             let md_acc = maxdiff(&to_host(st_cuda.acc.clone()), &to_host(st_cpu.acc.clone()));
-            let md_ms = maxdiff(&to_host(st_cuda.max_score.clone()), &to_host(st_cpu.max_score.clone()));
-            let md_se = maxdiff(&to_host(st_cuda.sum_exp.clone()), &to_host(st_cpu.sum_exp.clone()));
+            let md_ms = maxdiff(
+                &to_host(st_cuda.max_score.clone()),
+                &to_host(st_cpu.max_score.clone()),
+            );
+            let md_se = maxdiff(
+                &to_host(st_cuda.sum_exp.clone()),
+                &to_host(st_cpu.sum_exp.clone()),
+            );
             assert!(
                 md < 1e-4 && md_acc < 1e-4 && md_ms < 1e-4 && md_se < 1e-4,
                 "step {step}: out {md} acc {md_acc} max_score {md_ms} sum_exp {md_se} \
@@ -1188,8 +1182,12 @@ mod tests {
         let tf = t0.elapsed() / 10;
         let t0 = std::time::Instant::now();
         for _ in 0..3 {
-            let (dhs, dq) =
-                crate::fused_attnres::ad::depth_attend_backward_tensor(&hist, &q, &dout, ScoreForm::Paper);
+            let (dhs, dq) = crate::fused_attnres::ad::depth_attend_backward_tensor(
+                &hist,
+                &q,
+                &dout,
+                ScoreForm::Paper,
+            );
             let _: f32 = (dhs[0].clone().sum() + dq.clone().sum()).into_scalar();
         }
         let tt = t0.elapsed() / 3;
@@ -1361,6 +1359,11 @@ fn note_fused_backward() {
 #[cfg(any(feature = "autodiff", test))]
 #[allow(dead_code)] // items are wired by the autodiff dispatch / ad tests
 mod ad {
+    #[cfg(any(feature = "autodiff", test))]
+    use crate::fused_attnres::note_entry_reached;
+    #[cfg(feature = "cuda")]
+    use crate::fused_attnres::{note_fused_backward, note_fused_forward};
+    use crate::ScoreForm;
     use burn::backend::{Backend, DispatchKindConversion};
     use burn::tensor::{DispatchTensor, Tensor};
     use burn_autodiff::checkpoint::base::Checkpointer;
@@ -1368,11 +1371,6 @@ mod ad {
     use burn_autodiff::grads::Gradients;
     use burn_autodiff::ops::{Backward, Ops, OpsKind};
     use burn_autodiff::Autodiff;
-    use crate::ScoreForm;
-    #[cfg(any(feature = "autodiff", test))]
-    use crate::fused_attnres::note_entry_reached;
-    #[cfg(feature = "cuda")]
-    use crate::fused_attnres::{note_fused_backward, note_fused_forward};
 
     #[derive(Debug)]
     struct AttnResOp;
@@ -1413,7 +1411,9 @@ mod ad {
                 // gate asks the right question. The entry below was the one
                 // pinned to `NoCheckpointing`.
                 if std::any::TypeId::of::<B>() == std::any::TypeId::of::<CudaBare>() {
-                    if let Some((dhs, dq)) = super::depth_attend_backward_cuda(&hs, &q, &d_out, form) {
+                    if let Some((dhs, dq)) =
+                        super::depth_attend_backward_cuda(&hs, &q, &d_out, form)
+                    {
                         note_fused_backward();
                         for (i, dh) in dhs.into_iter().enumerate() {
                             grads.register::<B>(
@@ -1646,10 +1646,10 @@ mod seam_tests {
     use super::*;
     use burn::backend::DispatchKindConversion;
     use burn::tensor::{Device, DispatchTensor};
-    use burn_autodiff::Autodiff as Ad;
     use burn_autodiff::checkpoint::strategy::{
         BalancedCheckpointing, CheckpointStrategy, NoCheckpointing,
     };
+    use burn_autodiff::Autodiff as Ad;
 
     type Nd = burn_ndarray::NdArray;
 
@@ -1667,7 +1667,9 @@ mod seam_tests {
         let q = Tensor::<1>::ones([8], &dev);
 
         reset_seam_counts();
-        let base = seam_counts().expect("autodiff feature is on in this test").0;
+        let base = seam_counts()
+            .expect("autodiff feature is on in this test")
+            .0;
 
         assert!(reach::<BalancedCheckpointing>(&h, &q).is_some());
         assert_eq!(
@@ -1730,9 +1732,12 @@ mod ad_tests {
         // fused op graph
         let hf: Vec<Tensor<3>> = hist.iter().map(|h| h.clone().require_grad()).collect();
         let qf = q.clone().require_grad();
-        let outf =
-            crate::fused_attnres::depth_attend_autodiff::<CudaBare, 64>(&hf, qf.clone(), ScoreForm::Paper)
-                .unwrap();
+        let outf = crate::fused_attnres::depth_attend_autodiff::<CudaBare, 64>(
+            &hf,
+            qf.clone(),
+            ScoreForm::Paper,
+        )
+        .unwrap();
         let loss_f = outf.powf_scalar(2.0).sum();
         let grads_f = loss_f.backward();
         let dhf: Vec<Tensor<3>> = hf.iter().map(|h| h.grad(&grads_f).unwrap()).collect();

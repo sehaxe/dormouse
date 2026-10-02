@@ -572,10 +572,10 @@ mod seam_tests {
     use super::*;
     use burn::backend::DispatchKindConversion;
     use burn::tensor::Device;
-    use burn_autodiff::Autodiff as Ad;
     use burn_autodiff::checkpoint::strategy::{
         BalancedCheckpointing, CheckpointStrategy, NoCheckpointing,
     };
+    use burn_autodiff::Autodiff as Ad;
 
     type Nd = burn_ndarray::NdArray;
 
@@ -594,7 +594,9 @@ mod seam_tests {
         let x = Tensor::<2>::ones([4, 12], &dev);
 
         reset_seam_counts();
-        let base = seam_counts().expect("autodiff feature is on in this test").0;
+        let base = seam_counts()
+            .expect("autodiff feature is on in this test")
+            .0;
 
         // 1. the strategy-generic entry reaches the seam on Balanced.
         assert!(reach::<BalancedCheckpointing>(&x).is_some());

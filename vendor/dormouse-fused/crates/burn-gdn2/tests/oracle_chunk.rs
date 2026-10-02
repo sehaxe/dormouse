@@ -97,8 +97,7 @@ fn chunk_sizes_match_the_f64_oracle() {
         let mut case_worst = 0.0f64;
         let mut case_worst_t = 0usize;
         for (i, (seq, x, ref_y)) in t.cases.iter().enumerate() {
-            let input =
-                Tensor::<3>::from_data(TensorData::new(x.clone(), [1, *seq, t.d]), &device);
+            let input = Tensor::<3>::from_data(TensorData::new(x.clone(), [1, *seq, t.d]), &device);
             let mut state: Option<burn_gdn2::Gdn2State> = None;
             let out = module.forward::<NdArray>(input, &mut state, true);
             let got = to_f32_vec(&out);
@@ -131,7 +130,10 @@ fn chunk_sizes_match_the_f64_oracle() {
         );
     }
 
-    assert_eq!(n_fail, 0, "{n_fail} case/chunk-size pairs at or above the bar");
+    assert_eq!(
+        n_fail, 0,
+        "{n_fail} case/chunk-size pairs at or above the bar"
+    );
     println!(
         "Chunk, all 5 chunk sizes x {} cases: worst {global_worst:.3e} rel (BAR {BAR:.0e})",
         t.cases.len()

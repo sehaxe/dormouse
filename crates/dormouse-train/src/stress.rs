@@ -75,7 +75,7 @@ impl StressMonitor {
 
     /// Report line at cadence.
     pub fn report(&self, step: u64) -> Option<String> {
-        if step as usize % self.log_every != 0 {
+        if !(step as usize).is_multiple_of(self.log_every) {
             return None;
         }
         let p999 = if self.grad_norms.len() >= 1000 {
@@ -125,9 +125,7 @@ pub fn grad_norm<M: burn::module::Module>(model: &M, grads: &burn::tensor::Gradi
     }
     let mut v = NormVisitor { grads, acc: None };
     model.visit(&mut v);
-    v.acc
-        .map(|t| t.sqrt().into_scalar())
-        .unwrap_or(f32::NAN) // no gradient at all: NaN, not a fake clean 0.0
+    v.acc.map(|t| t.sqrt().into_scalar()).unwrap_or(f32::NAN) // no gradient at all: NaN, not a fake clean 0.0
 }
 
 #[cfg(test)]
@@ -138,7 +136,7 @@ mod tests {
     /// gradient norm means "every gradient on this step was non-finite and
     /// got zeroed". `grad_norm` used to return 0.0 when it found no gradient
     /// at all, so "no gradient / readback failed" said "the firewall fired"
-    /// - and a masked step then looked like a healthy one in the same log
+    /// — and a masked step then looked like a healthy one in the same log
     /// line. ADR-0019's class: a value that means two things, both of them
     /// about health.
     #[test]
@@ -160,7 +158,10 @@ mod tests {
         // did not turn the monitor off.
         let real = lin.weight.val().clone().require_grad().sum().backward();
         let gn2 = grad_norm(&lin, &real);
-        assert!(gn2 > 0.0 && gn2.is_finite(), "a real gradient must report its norm, got {gn2}");
+        assert!(
+            gn2 > 0.0 && gn2.is_finite(),
+            "a real gradient must report its norm, got {gn2}"
+        );
         // The stress monitor refuses a non-finite observation and COUNTS it,
         // instead of sorting NaN as Equal and reporting a fiction.
         let mut m = StressMonitor::new(2.0, 1);

@@ -26,7 +26,11 @@ fn main() {
     let mut it = std::env::args().skip(1);
     let inp = it.next().unwrap_or_else(|| usage());
     let out_dir = it.next().unwrap_or_else(|| usage());
-    let n: usize = it.next().unwrap_or_else(|| usage()).parse().unwrap_or_else(|_| usage());
+    let n: usize = it
+        .next()
+        .unwrap_or_else(|| usage())
+        .parse()
+        .unwrap_or_else(|_| usage());
     if n == 0 {
         usage();
     }
@@ -48,11 +52,11 @@ fn main() {
     let mut bytes: u64 = 0;
     let mut chunk = vec![0u8; 1 << 23];
 
-    let mut push = |b: u8, doc: &mut Vec<u8>, run: &mut Vec<u8>| {
+    let push = |b: u8, doc: &mut Vec<u8>, run: &mut Vec<u8>| {
         if b == b'\n' {
             run.push(b);
         } else {
-            doc.extend_from_slice(&run);
+            doc.extend_from_slice(run);
             run.clear();
             doc.push(b);
         }
@@ -82,8 +86,11 @@ fn main() {
                 push(b, &mut doc, &mut run);
             }
         }
-        if docs > 0 && docs % 2_000_000 == 0 {
-            eprintln!("[shard] docs={docs} bytes={bytes} elapsed={:?}", t0.elapsed());
+        if docs > 0 && docs.is_multiple_of(2_000_000) {
+            eprintln!(
+                "[shard] docs={docs} bytes={bytes} elapsed={:?}",
+                t0.elapsed()
+            );
         }
     }
     if !doc.is_empty() {
@@ -94,7 +101,10 @@ fn main() {
     for w in &mut writers {
         w.flush().expect("flush shard");
     }
-    eprintln!("[shard] done: docs={docs} bytes={bytes} elapsed={:?}", t0.elapsed());
+    eprintln!(
+        "[shard] done: docs={docs} bytes={bytes} elapsed={:?}",
+        t0.elapsed()
+    );
 }
 
 fn usage() -> ! {

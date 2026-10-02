@@ -142,10 +142,12 @@ impl Fx {
                 meta.insert(key.to_string(), body.trim().to_string());
                 continue;
             }
-            map.entry(key.to_string()).or_default().extend(
-                body.split_whitespace()
-                    .map(|v| v.parse::<f64>().unwrap_or_else(|_| panic!("bad number {v:?}"))),
-            );
+            map.entry(key.to_string())
+                .or_default()
+                .extend(body.split_whitespace().map(|v| {
+                    v.parse::<f64>()
+                        .unwrap_or_else(|_| panic!("bad number {v:?}"))
+                }));
         }
         assert!(
             map.keys().any(|k| k.ends_with("out_torch")),
@@ -162,10 +164,15 @@ impl Fx {
             .collect()
     }
     fn text(&self, key: &str) -> &str {
-        self.meta.get(key).map(String::as_str).unwrap_or_else(|| panic!("no {key:?}"))
+        self.meta
+            .get(key)
+            .map(String::as_str)
+            .unwrap_or_else(|| panic!("no {key:?}"))
     }
     fn get(&self, key: &str) -> &[f64] {
-        self.map.get(key).unwrap_or_else(|| panic!("fixture key {key:?} missing"))
+        self.map
+            .get(key)
+            .unwrap_or_else(|| panic!("fixture key {key:?} missing"))
     }
     fn one(&self, key: &str) -> f64 {
         let v = self.get(key);
@@ -182,7 +189,13 @@ impl Fx {
     /// non-finite on EITHER side is maximally separated rather than skipped.
     fn rel_diff(&self, case: &str, ours: &[f32], col: &str) -> f64 {
         let want = self.get(&format!("case.{case}.{col}"));
-        assert_eq!(ours.len(), want.len(), "{case}/{col}: {} vs {}", ours.len(), want.len());
+        assert_eq!(
+            ours.len(),
+            want.len(),
+            "{case}/{col}: {} vs {}",
+            ours.len(),
+            want.len()
+        );
         ours.iter()
             .zip(want)
             .map(|(a, b)| {

@@ -64,7 +64,6 @@ pub const LOG_THREADS: u32 = THREADS.trailing_zeros();
 #[cfg(feature = "cuda")]
 pub const MIN_FUSED_D: usize = 4;
 
-
 #[cfg(feature = "cuda")]
 #[cube(launch_unchecked)]
 fn rmsnorm_kernel<F: Float>(

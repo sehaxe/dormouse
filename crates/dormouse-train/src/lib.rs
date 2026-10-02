@@ -13,7 +13,6 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use burn::{
-    backend::Backend as BurnBackend,
     module::{Module, ModuleVisitor, Param},
     optim::{GradientsParams, OptimizerRecord},
     store::ModuleRecord,
@@ -475,7 +474,7 @@ fn sm_of(_device: &Device) -> u32 {
     (major * 10 + minor) as u32
 }
 
-fn bytes_to_tensors<B: BurnBackend>(
+fn bytes_to_tensors(
     bytes: &[u8], hashes: &[i64], seq_len: usize, batch: usize, device: &Device,
 ) -> (Tensor<2, Int>, Tensor<3, Int>) {
     let ids: Vec<i64> = bytes.iter().map(|&b| b as i64).collect();
@@ -562,6 +561,10 @@ fn parse_header(raw: &[u8]) -> Option<CkptHeader> {
     }
 }
 
+// The checkpoint signature is the trainer's persistence seam: each argument is
+// a distinct part of the artefact (weights, optimizer, EMA teacher, the best
+// bookkeeping), and a config struct would only relocate the same eight names.
+#[allow(clippy::too_many_arguments)]
 pub fn save_ckpt(
     dir: &Path,
     name: &str,
@@ -803,7 +806,7 @@ pub fn precompute_jepa_targets(
     );
     for i in 0..n_steps {
         let (bytes, hashes) = stream.next_batch();
-        let (x, h) = bytes_to_tensors::<Backend>(&bytes, &hashes, cfg.seq_len, cfg.batch, &device);
+        let (x, h) = bytes_to_tensors(&bytes, &hashes, cfg.seq_len, cfg.batch, &device);
         let latent = model.forward_latent::<Backend>(x, Some(h), None).detach();
         let [b, t, d] = latent.dims();
         let vals: Vec<f32> = latent.into_data().try_to_vec().map_err(|e| e.to_string())?;
@@ -881,7 +884,7 @@ pub fn train_loop(
     // `cfg.seed` is the one knob already in the snapshot, and it is what the
     // protocol says the seed IS, so a different value in the config is now a
     // different run in the strongest sense: a different model.
-    device.seed(cfg.seed as u64);
+    device.seed(cfg.seed);
     let (mut model, qfmt) = build_model(&dorm_cfg, &cfg, &device);
     let mut optim = build_optim(&model, &cfg);
     // Fail fast if the routing policy no longer matches the model (stale
@@ -1042,7 +1045,7 @@ pub fn train_loop(
     // loop (then cleanup returns the pages - later steps reuse cached blocks).
     if cfg.warmup && step == 0 {
         let (bytes, hashes) = stream.next_batch();
-        let (x, h) = bytes_to_tensors::<Backend>(&bytes, &hashes, cfg.seq_len, cfg.batch, &device);
+        let (x, h) = bytes_to_tensors(&bytes, &hashes, cfg.seq_len, cfg.batch, &device);
         let shifted: Vec<i64> = bytes.iter().skip(1).chain(std::iter::once(&bytes[0])).map(|&b| b as i64).collect();
         let y: Tensor<2, Int> = Tensor::from_data(TensorData::new(shifted, [cfg.batch, cfg.seq_len]), &device);
         for _ in 0..2 {
@@ -1058,7 +1061,7 @@ pub fn train_loop(
     // viability is measured, not assumed.
     if cfg.quant_check && qfmt != burn_spectral::QuantFormat::Fp32 && step == 0 {
         let (bytes, hashes) = stream.next_batch();
-        let (x, h) = bytes_to_tensors::<Backend>(&bytes, &hashes, cfg.seq_len, cfg.batch, &device);
+        let (x, h) = bytes_to_tensors(&bytes, &hashes, cfg.seq_len, cfg.batch, &device);
         let shifted: Vec<i64> = bytes.iter().skip(1).chain(std::iter::once(&bytes[0])).map(|&b| b as i64).collect();
         let y: Tensor<2, Int> = Tensor::from_data(TensorData::new(shifted, [cfg.batch, cfg.seq_len]), &device);
         let (lq, rec_q, _kq, _aq) = model.forward_with_hidden::<Backend>(x.clone(), Some(h.clone()), None, Some(y.clone()), None);
@@ -1115,7 +1118,13 @@ pub fn train_loop(
     // `None` on every step that is not an eval step, and on an eval step
     // where `retract_every` did not fire — the field then reads `-` rather
     // than printing two identical numbers that look like a measurement.
+    // The initial Nones are never read (the loop resets them before any
+    // read) — the assignment lint is allowed, not obeyed, because removing
+    // the declarations moves them inside the loop and into the graph lane's
+    // in-flight region.
+    #[allow(unused_assignments)]
     let mut tsct_bef: Option<f32> = None;
+    #[allow(unused_assignments)]
     let mut tsct_aft: Option<f32> = None;
     if saved_ortho && cfg.quant.as_deref() != Some("fp32") {
         println!("fp32 factor fallback restored from the checkpoint (one-way, still latched)");
@@ -1133,6 +1142,10 @@ pub fn train_loop(
     // fired on at least one step in that window), `nan_reads` counts the
     // non-finite loss VALUES we actually read, which is a lower bound.
     let mut masked_since_read = 0u32;
+    // Counted, and read on no cadence today (`let _ =` at both write sites):
+    // the StressMonitor report is the consumer that never landed (ADR-0021
+    // item 4). Deleting the counter would delete the only record of firewall
+    // firings.
     let mut nan_reads = 0u32;
     // The JEPA span mask is the only stochastic input to a step, and it is a
     // pure function of `(cfg.seed, step)` — so a resume redraws the same mask
@@ -1146,7 +1159,7 @@ pub fn train_loop(
         // must agree on which steps those are. `step > 0` is the eval's own
         // guard (a step-0 eval would score an untrained model on the same
         // window and look like a result).
-        let on_eval_step = cfg.eval_every > 0 && step > 0 && step % cfg.eval_every as u64 == 0;
+        let on_eval_step = cfg.eval_every > 0 && step > 0 && step.is_multiple_of(cfg.eval_every as u64);
         // Reset per step: the retraction block only writes them on a step
         // where it fires, so without this a step whose retraction is skipped
         // would inherit the PREVIOUS step's pair and print it against this
@@ -1155,9 +1168,9 @@ pub fn train_loop(
         tsct_bef = None;
         tsct_aft = None;
         let t_iter = std::time::Instant::now();
-        let (bytes, hashes) = (std::mem::replace(&mut pbytes, Vec::new()), std::mem::replace(&mut phashes, Vec::new()));
+        let (bytes, hashes) = (std::mem::take(&mut pbytes), std::mem::take(&mut phashes));
         let t_io = std::time::Instant::now();
-        let (x, h) = bytes_to_tensors::<Backend>(&bytes, &hashes, cfg.seq_len, cfg.batch, &device);
+        let (x, h) = bytes_to_tensors(&bytes, &hashes, cfg.seq_len, cfg.batch, &device);
         let data_ms = t_io.elapsed().as_secs_f64() * 1000.0;
         // targets = next byte (shifted by one position)
         let shifted = std::mem::take(&mut pshift);
@@ -1234,11 +1247,11 @@ pub fn train_loop(
         // the RAM tables every step), not piggybacked on the log cadence -
         // at log_every=100 they got 1/100 of their updates.
         let host_adam_step = cfg.host_adam_every > 0
-            && step % cfg.host_adam_every as u64 == 0
+            && step.is_multiple_of(cfg.host_adam_every as u64)
             && rows_param.is_some();
         // Aux is read only on log steps; skip the clone (an extra autodiff
         // node) elsewhere.
-        let aux_log = if step % cfg.log_every as u64 == 0 {
+        let aux_log = if step.is_multiple_of(cfg.log_every as u64) {
             aux.clone()
         } else {
             None
@@ -1253,8 +1266,8 @@ pub fn train_loop(
         // One cadence for the timer and for the loss copy that feeds it, or the
         // timer reports a step whose loss was never read back. Both used to say
         // `step % 50` independently, and they now say the same thing.
-        let timer_step = step == 0 || (cfg.log_every > 0 && step % cfg.log_every as u64 == 0);
-        let loss_log = if step % cfg.log_every as u64 == 0
+        let timer_step = step == 0 || (cfg.log_every > 0 && step.is_multiple_of(cfg.log_every as u64));
+        let loss_log = if step.is_multiple_of(cfg.log_every as u64)
             || host_adam_step
             || (cfg.timers && timer_step)
         {
@@ -1306,7 +1319,10 @@ pub fn train_loop(
             };
             ce = ce_now;
             if !ce_now.is_finite() {
+                // Counted, not read on any cadence today — see the counter's
+                // declaration: the consumer is ADR-0021 item 4's report.
                 nan_reads += 1;
+                let _ = nan_reads;
             }
             if ce.is_finite() && ce < best { best = ce; }
             // A step whose gradients were ALL non-finite (or whose loss was)
@@ -1326,6 +1342,7 @@ pub fn train_loop(
             }
             masked_since_read = 0;
             nan_reads = 0;
+            let _ = nan_reads;
             if host_adam_step {
                 if let (Some(h), Some(p), Some(uniq)) =
                     (host.as_mut(), &rows_param, uniq_rows.as_ref())
@@ -1352,7 +1369,7 @@ pub fn train_loop(
                     }
                 }
             }
-            if step % cfg.log_every as u64 == 0 {
+            if step.is_multiple_of(cfg.log_every as u64) {
                 let gn = grad_norm(&model, &raw_grads);
                 if gn == 0.0 {
                     masked_since_read += 1;
@@ -1372,7 +1389,7 @@ pub fn train_loop(
         // every step so the quantized forward stays faithful; monitor the
         // drift at cadence and fall back to fp32 factors when it exceeds the
         // plan's 1e-3 threshold. --retract-every / --retract-iters override.
-        if step % cfg.retract_every.max(1) as u64 == 0 {
+        if step.is_multiple_of(cfg.retract_every.max(1) as u64) {
             // TSCT retraction diagnostic, BEFORE side (pre-100k checklist 2a).
             // `max_ortho` IS the per-entry masters metric, so this costs no
             // new metric - it is the same read the latch below makes, taken
@@ -1405,7 +1422,7 @@ pub fn train_loop(
         // retract's convergence floor and below real drift; before the
         // normalization (2026-09-04) the fallback fired at step 0 on every
         // fresh run, silently disabling the factor-quant forward.
-        if step % 500 == 0 && !ortho_fp32 {
+        if step.is_multiple_of(500) && !ortho_fp32 {
             let ortho = model.max_ortho();
             if ortho > 1e-3 {
                 println!("max_ortho {ortho:.2e} > 1e-3 - fallback fp32 factors");
@@ -1449,7 +1466,7 @@ pub fn train_loop(
                 total_ms - data_ms
             );
         }
-        if step % cfg.log_every as u64 == 0 {
+        if step.is_multiple_of(cfg.log_every as u64) {
             let bpb = bpb(ce);
             // pool_stats syncs the device; only with --memlog
             let mem = if cfg.memlog { pool_stats(&device) } else { String::new() };
@@ -1471,7 +1488,7 @@ pub fn train_loop(
         }
         if cfg.eval_every > 0 {
             if let Some(ev) = eval_stream.as_mut() {
-                if step % cfg.eval_every as u64 == 0 && step > 0 {
+                if step.is_multiple_of(cfg.eval_every as u64) && step > 0 {
                     // Rewind FIRST: every eval must score the SAME bytes, or
                     // eval N of run A and eval N of run B read different
                     // windows and no A/B is comparable (measured 2026-09-27:
@@ -1511,7 +1528,7 @@ pub fn train_loop(
                             None => ev.next_batch(),
                         };
                         let (ex, eh_t) =
-                            bytes_to_tensors::<Backend>(&eb, &eh, cfg.seq_len, cfg.batch, &device);
+                            bytes_to_tensors(&eb, &eh, cfg.seq_len, cfg.batch, &device);
                         let eshift: Vec<i64> = eb
                             .iter()
                             .skip(1)
@@ -1695,7 +1712,7 @@ pub fn train_loop(
                                     None => ev.next_batch(),
                                 };
                                 let (dx, dh_t) =
-                                    bytes_to_tensors::<Backend>(&db, &dh, cfg.seq_len, cfg.batch, &device);
+                                    bytes_to_tensors(&db, &dh, cfg.seq_len, cfg.batch, &device);
                                 let dshift: Vec<i64> = db
                                     .iter()
                                     .skip(1)
@@ -1743,7 +1760,7 @@ pub fn train_loop(
                 }
             }
         }
-        if cfg.ckpt_every > 0 && step % cfg.ckpt_every as u64 == 0 {
+        if cfg.ckpt_every > 0 && step.is_multiple_of(cfg.ckpt_every as u64) {
             // LOUD, not `let _ =` + an unconditional "saved" line: a failed
             // save used to print "ckpt saved", keep training for hours and
             // lose the run (ADR-0019). A run that cannot checkpoint must say
@@ -1756,7 +1773,7 @@ pub fn train_loop(
         // Returning pool pages forces the next steps to re-acquire them from
         // the driver; at a near-full high-water this stalls the GPU. 500
         // steps keeps the OOM guard while amortizing the reacquisition.
-        if step % 500 == 0 {
+        if step.is_multiple_of(500) {
             memory_cleanup(&device);
         }
         step += 1;
@@ -1948,6 +1965,7 @@ mod tests {
     ///   - 6.5: below its held-out, above its train CE -> held-out rule says
     ///     DO NOT save; a train-CE rule would save.
     ///   - 8.5: above its held-out -> held-out rule says save.
+    ///
     /// Together the two runs BRACKET this run's held-out bpb into [6.5, 8.5)
     /// and the test asserts the train CE it really produced is below that
     /// whole bracket, so run 1's "did not save" is only reachable by having
@@ -2245,7 +2263,7 @@ mod tests {
     /// Test-only: the trainer has no alpha schedule today, so this is how a
     /// test reaches the annealing regime the diagnostic exists to measure.
     fn set_tsct_alpha(model: &mut DormouseModel, a: f32) {
-        let mut set = |l: &mut LinearLike| {
+        let set = |l: &mut LinearLike| {
             if let LinearLikeInner::Tsct(t) = &mut l.inner {
                 t.set_alpha(a);
             }
@@ -2267,7 +2285,7 @@ mod tests {
         let mut ll = LinearLike::new(64, 64, 16, &dev);
         if let LinearLikeInner::Tsct(l) = &mut ll.inner {
             let u = l.u.val().mul_scalar(3.0).detach();
-            l.u = burn::module::Param::from_tensor(u.into());
+            l.u = burn::module::Param::from_tensor(u);
         } else {
             panic!("LinearLike must be TSCT on the CPU backend");
         }
@@ -2309,7 +2327,7 @@ mod tests {
             hashes.push((fnv(&bytes[e.saturating_sub(5)..e]) % 4096) as i64);
             hashes.push((fnv(&bytes[e.saturating_sub(8)..e]) % 4096) as i64);
         }
-        let (x, h) = bytes_to_tensors::<Backend>(&bytes, &hashes, 64, 2, &device());
+        let (x, h) = bytes_to_tensors(&bytes, &hashes, 64, 2, &device());
         let (l1, ..) = model.forward_with_hidden::<Backend>(x.clone(), Some(h.clone()), None, None, None);
         let (l2, ..) = model2.forward_with_hidden::<Backend>(x, Some(h), None, None, None);
         let d = (l1 - l2).abs().max().into_scalar::<f32>();
@@ -2664,7 +2682,7 @@ mod tests {
             hashes.push((fnv(&bytes[e.saturating_sub(5)..e]) % 4096) as i64);
             hashes.push((fnv(&bytes[e.saturating_sub(8)..e]) % 4096) as i64);
         }
-        let (x, h) = bytes_to_tensors::<Backend>(&bytes, &hashes, 64, 2, &device());
+        let (x, h) = bytes_to_tensors(&bytes, &hashes, 64, 2, &device());
         let shifted: Vec<i64> = bytes.iter().skip(1).chain(std::iter::once(&bytes[0])).map(|&b| b as i64).collect();
         let y: Tensor<2, Int> = Tensor::from_data(TensorData::new(shifted, [2, 64]), &device());
         let mut losses: Vec<f32> = Vec::with_capacity(STEPS);
@@ -2713,7 +2731,7 @@ mod tests {
             hashes.push((fnv(&bytes[e.saturating_sub(5)..e]) % 4096) as i64);
             hashes.push((fnv(&bytes[e.saturating_sub(8)..e]) % 4096) as i64);
         }
-        let (x, h) = bytes_to_tensors::<Backend>(&bytes, &hashes, 64, 2, &device());
+        let (x, h) = bytes_to_tensors(&bytes, &hashes, 64, 2, &device());
         let shifted: Vec<i64> = bytes.iter().skip(1).chain(std::iter::once(&bytes[0])).map(|&b| b as i64).collect();
         let y: Tensor<2, Int> = Tensor::from_data(TensorData::new(shifted, [2, 64]), &device());
         let mut losses: Vec<f32> = Vec::with_capacity(50);
@@ -2756,7 +2774,7 @@ mod tests {
         for _ in 0..3 {
             let bytes: Vec<u8> = (0..128).map(|_| next_u8(&mut rng_state)).collect();
             let hashes: Vec<i64> = (0..384).map(|p| (p as i64) % 4096).collect();
-            let (x, h) = bytes_to_tensors::<Backend>(&bytes, &hashes, 64, 2, &device());
+            let (x, h) = bytes_to_tensors(&bytes, &hashes, 64, 2, &device());
             let shifted: Vec<i64> = bytes.iter().skip(1).chain(std::iter::once(&bytes[0])).map(|&b| b as i64).collect();
             let y: Tensor<2, Int> = Tensor::from_data(TensorData::new(shifted, [2, 64]), &device());
             let (_logits, rec, _k, aux) = model.forward_with_hidden::<Backend>(
@@ -2794,7 +2812,7 @@ mod tests {
         };
         let bytes: Vec<u8> = (0..128).map(|_| next_u8(&mut rng_state)).collect();
         let hashes: Vec<i64> = (0..384).map(|p| (p as i64) % 4096).collect();
-        let (x, h) = bytes_to_tensors::<Backend>(&bytes, &hashes, 64, 2, &device());
+        let (x, h) = bytes_to_tensors(&bytes, &hashes, 64, 2, &device());
         let shifted: Vec<i64> = bytes.iter().skip(1).chain(std::iter::once(&bytes[0])).map(|&b| b as i64).collect();
         let y: Tensor<2, Int> = Tensor::from_data(TensorData::new(shifted, [2, 64]), &device());
         // (1) The target the offline pass would store == the online teacher's
@@ -2902,7 +2920,7 @@ mod tests {
         let mut optim = crate::optim::build_optim_mode(&model, &optim_cfg, "adamw");
         let bytes: Vec<u8> = (0..128).map(|i| (i * 7) as u8).collect();
         let hashes: Vec<i64> = (0..384).map(|p| (p as i64) % 4096).collect();
-        let (x, h) = bytes_to_tensors::<Backend>(&bytes, &hashes, 64, 2, &device());
+        let (x, h) = bytes_to_tensors(&bytes, &hashes, 64, 2, &device());
         let shifted: Vec<i64> = bytes.iter().skip(1).chain(std::iter::once(&bytes[0])).map(|&b| b as i64).collect();
         let y: Tensor<2, Int> = Tensor::from_data(TensorData::new(shifted, [2, 64]), &device());
         let (_l, rec, _k, _a) = model.forward_with_hidden::<Backend>(x, Some(h), None, Some(y), None);
@@ -2951,7 +2969,7 @@ mod tests {
         assert_eq!(model.loop_block.max_iter, 4, "test config must have 4 iterations");
         let bytes: Vec<u8> = (0..128).map(|i| (i * 7) as u8).collect();
         let hashes: Vec<i64> = (0..384).map(|p| (p as i64) % 4096).collect();
-        let (x, h) = bytes_to_tensors::<Backend>(&bytes, &hashes, 64, 2, &device());
+        let (x, h) = bytes_to_tensors(&bytes, &hashes, 64, 2, &device());
         let shifted: Vec<i64> = bytes.iter().skip(1).chain(std::iter::once(&bytes[0])).map(|&b| b as i64).collect();
         let y: Tensor<2, Int> = Tensor::from_data(TensorData::new(shifted, [2, 64]), &device());
 
@@ -3020,7 +3038,7 @@ mod tests {
             let mut optim = crate::optim::build_optim_mode(&model, &optim_cfg, mode);
             let bytes: Vec<u8> = (0..128).map(|i| (i * 7) as u8).collect();
             let hashes: Vec<i64> = (0..384).map(|p| (p as i64) % 4096).collect();
-            let (x, h) = bytes_to_tensors::<Backend>(&bytes, &hashes, 64, 2, &device());
+            let (x, h) = bytes_to_tensors(&bytes, &hashes, 64, 2, &device());
             let shifted: Vec<i64> = bytes.iter().skip(1).chain(std::iter::once(&bytes[0])).map(|&b| b as i64).collect();
             let y: Tensor<2, Int> = Tensor::from_data(TensorData::new(shifted, [2, 64]), &device());
             let (_logits, rec, _k, _aux) = model.forward_with_hidden::<Backend>(x, Some(h), None, Some(y), None);
@@ -3040,7 +3058,7 @@ mod tests {
         let mut optim = crate::optim::build_optim_mode(&model, &optim_cfg, "mix");
         let bytes: Vec<u8> = (0..128).map(|i| (i * 7) as u8).collect();
         let hashes: Vec<i64> = (0..384).map(|p| (p as i64) % 4096).collect();
-        let (x, h) = bytes_to_tensors::<Backend>(&bytes, &hashes, 64, 2, &device());
+        let (x, h) = bytes_to_tensors(&bytes, &hashes, 64, 2, &device());
         let shifted: Vec<i64> = bytes.iter().skip(1).chain(std::iter::once(&bytes[0])).map(|&b| b as i64).collect();
         let y: Tensor<2, Int> = Tensor::from_data(TensorData::new(shifted, [2, 64]), &device());
         let (_logits, rec, _k, _aux) = model.forward_with_hidden::<Backend>(x, Some(h), None, Some(y), None);

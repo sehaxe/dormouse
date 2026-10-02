@@ -21,11 +21,8 @@
 const DECODERS: [&str; 2] = ["generate.rs", "serve.rs"];
 
 fn src(bin: &str) -> String {
-    std::fs::read_to_string(format!(
-        "{}/src/bin/{bin}",
-        env!("CARGO_MANIFEST_DIR")
-    ))
-    .unwrap_or_else(|e| panic!("src/bin/{bin} must be readable: {e}"))
+    std::fs::read_to_string(format!("{}/src/bin/{bin}", env!("CARGO_MANIFEST_DIR")))
+        .unwrap_or_else(|e| panic!("src/bin/{bin} must be readable: {e}"))
 }
 
 #[test]

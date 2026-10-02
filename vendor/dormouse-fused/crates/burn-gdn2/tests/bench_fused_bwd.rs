@@ -112,7 +112,12 @@ fn bench_fused_bwd() {
             tf * 1e3,
             tt * 1e3,
             (tt - tf) * 1e3,
-            counts.0, counts.1, counts.2, counts.3, counts.4, counts.5
+            counts.0,
+            counts.1,
+            counts.2,
+            counts.3,
+            counts.4,
+            counts.5
         );
         // raw kernels: fused_chunk_forward_scratch + fused_chunk_backward
         {

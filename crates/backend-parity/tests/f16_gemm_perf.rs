@@ -199,9 +199,7 @@ fn run_arm(shape: (usize, usize, usize), dtype: &str) -> f64 {
             .sum()
             .into_scalar();
         assert!(
-            got.is_finite()
-                && want.is_finite()
-                && (got - want).abs() <= 1e-2 * want.abs().max(1.0),
+            got.is_finite() && want.is_finite() && (got - want).abs() <= 1e-2 * want.abs().max(1.0),
             "f16 GEMM is not within 1e-2 of the fp32 result: {got} vs {want}"
         );
     }
@@ -210,12 +208,7 @@ fn run_arm(shape: (usize, usize, usize), dtype: &str) -> f64 {
 
     // Warmup outside the clock: JIT + autotune land here. This is also where a
     // dying candidate prints its warn/panic - read stderr, not just the number.
-    std::hint::black_box(
-        lhs.clone()
-            .matmul(rhs.clone())
-            .sum()
-            .into_scalar::<f32>(),
-    );
+    std::hint::black_box(lhs.clone().matmul(rhs.clone()).sum().into_scalar::<f32>());
 
     let ms = (0..3)
         .map(|_| ms_of(|| lhs.clone().matmul(rhs.clone())))

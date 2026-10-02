@@ -782,9 +782,7 @@ pub mod cuda {
     /// view (the `project()` [B,T,H,K] -> [B,H,T,K] permute) is materialized
     /// once, never recursed into — see
     /// [`crate::kernel::contiguous_cube_of`].
-    fn cube_of<B: Backend, const D: usize>(
-        t: &Tensor<D>,
-    ) -> Option<CubeTensor>
+    fn cube_of<B: Backend, const D: usize>(t: &Tensor<D>) -> Option<CubeTensor>
     where
         DispatchTensor: DispatchKindConversion<B>,
     {
@@ -810,10 +808,13 @@ pub mod cuda {
     where
         DispatchTensor: DispatchKindConversion<B>,
     {
-        let (out, state, io) = fused_chunk_forward_impl::<B>(
-            q, k, v, g, b, w, state, scale, chunk_size, true,
-        )?;
-        Some((out, state, io.expect("want_scratch = true always exports IntraOut")))
+        let (out, state, io) =
+            fused_chunk_forward_impl::<B>(q, k, v, g, b, w, state, scale, chunk_size, true)?;
+        Some((
+            out,
+            state,
+            io.expect("want_scratch = true always exports IntraOut"),
+        ))
     }
 
     /// The body of both fused entries. `want_scratch` selects whether the
@@ -888,7 +889,11 @@ pub mod cuda {
         let state = state.clone() * 1.0;
         // Only the export kernel reads the pre-update state, so the forward-only
         // path must not pay for this second full-size copy.
-        let state_initial = if want_scratch { Some(state.clone() * 1.0) } else { None };
+        let state_initial = if want_scratch {
+            Some(state.clone() * 1.0)
+        } else {
+            None
+        };
         let state_cube = cube_of::<B, 4>(&state).expect("backend mismatch");
 
         let nblk = bh * nt;
@@ -909,7 +914,10 @@ pub mod cuda {
         let glast = Tensor::<2>::empty([nblk, k_dim], &device);
         let out = Tensor::<4>::empty([batch, heads, time, v_dim], &device);
         for (l, b) in [
-            ("fwd:state private copy", crate::alloc_trace::bytes_of(&state)),
+            (
+                "fwd:state private copy",
+                crate::alloc_trace::bytes_of(&state),
+            ),
             (
                 "fwd:state initial copy",
                 state_initial

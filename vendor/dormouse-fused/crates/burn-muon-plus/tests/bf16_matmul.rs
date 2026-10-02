@@ -129,9 +129,7 @@ fn bf16_matmul_is_refused() {
 /// visible instead of silent.
 #[test]
 fn every_bf16_matmul_shape_is_the_same_refusal() {
-    let rnd = |dev: &Device| {
-        Tensor::<2>::random([256, 256], Distribution::Normal(0.0, 1.0), dev)
-    };
+    let rnd = |dev: &Device| Tensor::<2>::random([256, 256], Distribution::Normal(0.0, 1.0), dev);
 
     // bf16 activation x f32 parameter, under autodiff (dormouse's own shape).
     let da = Device::default().autodiff();
@@ -148,7 +146,12 @@ fn every_bf16_matmul_shape_is_the_same_refusal() {
     let leaf = panic_message(|| {
         let a = rnd(&da).cast(FloatDType::BF16).require_grad();
         let b = rnd(&da).cast(FloatDType::BF16).require_grad();
-        let grads = a.clone().matmul(b.clone()).cast(FloatDType::F32).sum().backward();
+        let grads = a
+            .clone()
+            .matmul(b.clone())
+            .cast(FloatDType::F32)
+            .sum()
+            .backward();
         let _ = (a.grad(&grads), b.grad(&grads));
     });
     assert_refused(
@@ -173,12 +176,15 @@ fn every_bf16_matmul_shape_is_the_same_refusal() {
 #[test]
 fn bf16_cast_works_and_the_f32_readback_is_refused() {
     let d = Device::default();
-    let a = Tensor::<2>::random([64, 64], Distribution::Normal(0.0, 1.0), &d)
-        .cast(FloatDType::BF16);
+    let a =
+        Tensor::<2>::random([64, 64], Distribution::Normal(0.0, 1.0), &d).cast(FloatDType::BF16);
     let back = a.into_data().try_to_vec::<f32>();
     assert!(
         back.is_err(),
         "burn must REFUSE to read a bf16 buffer back as f32; got {back:?}"
     );
-    println!("bf16 cast ok; f32 readback refused: {:?}", back.err().unwrap());
+    println!(
+        "bf16 cast ok; f32 readback refused: {:?}",
+        back.err().unwrap()
+    );
 }

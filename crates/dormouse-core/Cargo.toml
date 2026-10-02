@@ -10,7 +10,6 @@ workspace = true
 [dependencies]
 burn = { workspace = true, features = ["std", "extension"] }
 burn-tensor = { workspace = true }
-burn-nn = { version = "0.22.0-pre.4", default-features = false }
 burn-cuda = { workspace = true, features = ["std", "autotune"] }
 burn-kda = { path = "../../vendor/dormouse-fused/crates/burn-kda" }
 # The fused-kernel seam counters (ADR-0019): burn-kda's fused dispatch hands
@@ -38,9 +37,23 @@ burn-attnres = { path = "../../vendor/dormouse-fused/crates/burn-attnres" }
 # CUDA gate that compares the fused output to the tensor path first; see
 # docs/reviews/situ-2026-09-30.md §7.
 burn-situ = { path = "../../vendor/dormouse-fused/crates/burn-situ" }
-rand = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 toml = { workspace = true }
+
+# cargo-machete cannot see through the `burn` facade: this crate's sources say
+# `use burn::tensor::Tensor`, and the string `burn_tensor` appears ZERO times in
+# them, so a literal grep reads the direct `burn-tensor` declaration as unused.
+# It is not, and deleting it is a LOUD failure rather than a silent one - the
+# `std` feature below names `burn-tensor/std`, so cargo refuses the manifest:
+#     error: feature `std` includes `burn-tensor/std`, but `burn-tensor`
+#            is not a dependency
+# (`burn::std` does not forward it; the feature list has to name it.)
+# `burn-nn` was in this list until 2026-10-01 and is now DELETED instead: with
+# the declaration removed, `cargo tree -e features` for this crate was
+# byte-identical (884 package+feature edges either way), so it was a no-op and
+# an `ignored` entry would have been a lie about a dependency that does nothing.
+[package.metadata.cargo-machete]
+ignored = ["burn-tensor"]
 
 [features]
 default = ["std"]

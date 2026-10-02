@@ -38,9 +38,9 @@
 // `Backend` is the only one of these an UNGATED item needs - `backend_matches`
 // is callable from every build - so it stays ungated, and the rest follow the
 // `burn_autodiff`-typed helpers they belong to.
+use burn::backend::Backend;
 #[cfg(feature = "autodiff")]
 use burn::backend::{AutodiffBackend, BackendTypes, DispatchKindConversion};
-use burn::backend::Backend;
 #[cfg(feature = "autodiff")]
 use burn::tensor::{DispatchTensor, Tensor};
 #[cfg(feature = "autodiff")]

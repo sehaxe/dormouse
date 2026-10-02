@@ -92,16 +92,16 @@ mod tests {
     use super::*;
     use burn::tensor::Distribution;
 
-    type AD = burn::backend::autodiff::Autodiff<
-        burn_cubecl::CubeBackend,
-    >;
+    type AD = burn::backend::autodiff::Autodiff<burn_cubecl::CubeBackend>;
     type Bare = burn_cubecl::CubeBackend;
 
     #[test]
     fn bf16_matmul_matches_fp32_with_grads() {
         let d = burn::tensor::Device::default().autodiff();
-        let a: Tensor<2> = Tensor::random([256, 512], Distribution::Normal(0.0, 1.0), &d).require_grad();
-        let w: Tensor<2> = Tensor::random([512, 256], Distribution::Normal(0.0, 1.0), &d).require_grad();
+        let a: Tensor<2> =
+            Tensor::random([256, 512], Distribution::Normal(0.0, 1.0), &d).require_grad();
+        let w: Tensor<2> =
+            Tensor::random([512, 256], Distribution::Normal(0.0, 1.0), &d).require_grad();
         let y = bf16_matmul::<Bare>(a.clone(), w.clone());
         // fp32 reference on the same backend (cast path is identity here).
         let y_ref = a.clone().matmul(w.clone());
@@ -110,10 +110,14 @@ mod tests {
         let rel = diff / scale.max(1e-6);
         assert!(rel < 0.01, "bf16 forward too far from fp32: rel {rel:.4}");
         let grads = y.sum().backward();
-        let ga: Vec<f32> = a.clone().grad(&grads)
+        let ga: Vec<f32> = a
+            .clone()
+            .grad(&grads)
             .map(|t| t.into_data().try_to_vec().unwrap_or_default())
             .unwrap_or_default();
-        let gw: Vec<f32> = w.clone().grad(&grads)
+        let gw: Vec<f32> = w
+            .clone()
+            .grad(&grads)
             .map(|t| t.into_data().try_to_vec().unwrap_or_default())
             .unwrap_or_default();
         assert_eq!(ga.len(), 256 * 512, "grad a must arrive");
@@ -129,12 +133,12 @@ mod tests {
         // Real FFN shapes: [768, 2048] x [2048, 768], two chained matmuls
         // with an elementwise scale in between (the spectral y=(x@U)*s@Vt).
         let d = burn::tensor::Device::default().autodiff();
-        let x: Tensor<2> = Tensor::random([512, 768], Distribution::Normal(0.0, 1.0), &d)
-            .require_grad();
-        let u: Tensor<2> = Tensor::random([768, 64], Distribution::Normal(0.0, 1.0), &d)
-            .require_grad();
-        let v: Tensor<2> = Tensor::random([2048, 64], Distribution::Normal(0.0, 1.0), &d)
-            .require_grad();
+        let x: Tensor<2> =
+            Tensor::random([512, 768], Distribution::Normal(0.0, 1.0), &d).require_grad();
+        let u: Tensor<2> =
+            Tensor::random([768, 64], Distribution::Normal(0.0, 1.0), &d).require_grad();
+        let v: Tensor<2> =
+            Tensor::random([2048, 64], Distribution::Normal(0.0, 1.0), &d).require_grad();
         let s: Tensor<1> = Tensor::ones([64], &d);
         let mid = bf16_matmul::<Bare>(x.clone(), u.clone());
         let y = bf16_matmul::<Bare>(mid.mul(s.unsqueeze_dim::<2>(0)), v.clone().transpose());

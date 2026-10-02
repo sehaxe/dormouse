@@ -60,8 +60,8 @@
 
 use burn::{
     grad_clipping::GradientClippingConfig,
-    module::{Module, ParamGroup},
-    optim::{AdanConfig, AdamConfig, AdamWConfig, LearningRate, Optimizer},
+    module::ParamGroup,
+    optim::{AdamConfig, AdamWConfig, AdanConfig, LearningRate, Optimizer},
     tensor::{Device, ElementConversion, Tensor},
 };
 use burn_muon_plus::{MuonPlus, MuonPlusConfig, MuonPlusState, NormDir};
@@ -400,7 +400,9 @@ pub fn check_installed(
         let table = g.table.matches(id, Some(path));
         let hits = [muon, qk, table].iter().filter(|hit| **hit).count();
         if hits > 1 {
-            return Err(format!("{path}: matches multiple installed optimizer groups ({hits})"));
+            return Err(format!(
+                "{path}: matches multiple installed optimizer groups ({hits})"
+            ));
         }
         // A 1D leaf has no shared linear structure to orthogonalize; the TSCT
         // scale leaf's being 1D is the whole reason the factors are in the
@@ -538,7 +540,10 @@ pub fn validate_routing(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn::optim::Optimizer as _;
+    // `model.visit` below comes from the Module trait; the trait has no
+    // non-test caller in this crate, so a top-level import reads unused on
+    // the lib build (newer rustc flags it, CI clippy runs one).
+    use burn::module::Module as _;
     use burn::tensor::{Distribution, TensorData};
 
     /// The weight the trainer installs Q/K into is `[n_heads*head_dim, d]`.

@@ -51,8 +51,6 @@
 //! and it is paid once per run.
 
 use super::schema::DormouseConfig;
-#[cfg(test)]
-use super::schema::ActQuant;
 
 /// Check every cross-field rule the model cannot enforce for itself. `Ok(())`
 /// means the config is coherent, not that it is GOOD - validation has no
@@ -65,15 +63,30 @@ use super::schema::ActQuant;
 /// cannot be used to reproduce a run that predates a new rule.
 pub fn validate(c: &DormouseConfig) -> Result<(), String> {
     macro_rules! gt0 {
-        ($v:expr, $name:expr) => { if $v == 0 { return Err(format!("{} must be >0", $name)); } };
+        ($v:expr, $name:expr) => {
+            if $v == 0 {
+                return Err(format!("{} must be >0", $name));
+            }
+        };
     }
-    gt0!(c.d_model, "d_model"); gt0!(c.n_heads, "n_heads"); gt0!(c.head_dim, "head_dim");
-    gt0!(c.d_ffn, "d_ffn"); gt0!(c.vocab, "vocab"); gt0!(c.max_seq_len, "max_seq_len");
-    gt0!(c.max_iter, "max_iter"); gt0!(c.rank, "rank");
+    gt0!(c.d_model, "d_model");
+    gt0!(c.n_heads, "n_heads");
+    gt0!(c.head_dim, "head_dim");
+    gt0!(c.d_ffn, "d_ffn");
+    gt0!(c.vocab, "vocab");
+    gt0!(c.max_seq_len, "max_seq_len");
+    gt0!(c.max_iter, "max_iter");
+    gt0!(c.rank, "rank");
     gt0!(c.n_experts, "n_experts");
-    if c.norm_eps <= 0.0 { return Err("norm_eps must be >0".into()); }
-    if c.jepa_weight < 0.0 || c.dspark_weight < 0.0 { return Err("jepa/dspark_weight >=0".into()); }
-    if c.jepa_mask_frac < 0.0 || c.jepa_mask_frac > 1.0 { return Err("jepa_mask_frac 0..1".into()); }
+    if c.norm_eps <= 0.0 {
+        return Err("norm_eps must be >0".into());
+    }
+    if c.jepa_weight < 0.0 || c.dspark_weight < 0.0 {
+        return Err("jepa/dspark_weight >=0".into());
+    }
+    if c.jepa_mask_frac < 0.0 || c.jepa_mask_frac > 1.0 {
+        return Err("jepa_mask_frac 0..1".into());
+    }
     // DSpark anchors. `dspark_aux_loss` sizes the anchor COUNT with
     // `stride.max(1)` but multiplies the anchor POSITIONS by the raw stride,
     // so stride = 0 puts every one of the n = t-k-1 anchors on position 0 and
@@ -88,7 +101,9 @@ pub fn validate(c: &DormouseConfig) -> Result<(), String> {
                 .into(),
         );
     }
-    if c.mor_bce_weight < 0.0 { return Err("mor_bce_weight >=0".into()); }
+    if c.mor_bce_weight < 0.0 {
+        return Err("mor_bce_weight >=0".into());
+    }
     // The future-byte head (queue v2 item 5). Both checks are LOUD because both
     // wrong values compute a DIFFERENT objective without saying so, which is
     // the ADR-0019 class: a negative weight is a sign flip on the aux term, and
@@ -96,7 +111,9 @@ pub fn validate(c: &DormouseConfig) -> Result<(), String> {
     // be `targets[q]`, the byte the MAIN CE already predicts, so the term is a
     // second CE on the next byte through an independent head. It trains, it
     // descends, it costs a step, and it is not multi-token prediction at all.
-    if c.aux_fb_weight < 0.0 { return Err("aux_fb_weight >= 0".into()); }
+    if c.aux_fb_weight < 0.0 {
+        return Err("aux_fb_weight >= 0".into());
+    }
     if c.aux_fb_horizon < 1 {
         return Err(format!(
             "aux_fb_horizon {} must be >= 1: the label for position q is targets[q + k], so k = 0 \
@@ -108,9 +125,14 @@ pub fn validate(c: &DormouseConfig) -> Result<(), String> {
     }
     // The floor of one recursion is structural, so mor_k=0 is a config error
     // (loud, not clamped), and mor_k > max_iter is a set that cannot fill.
-    if c.mor_k < 1 { return Err("mor_k must be >= 1 (floor of one recursion)".into()); }
+    if c.mor_k < 1 {
+        return Err("mor_k must be >= 1 (floor of one recursion)".into());
+    }
     if c.use_mor && c.mor_k > c.max_iter {
-        return Err(format!("mor_k {} > max_iter {}: the top-k set cannot fill", c.mor_k, c.max_iter));
+        return Err(format!(
+            "mor_k {} > max_iter {}: the top-k set cannot fill",
+            c.mor_k, c.max_iter
+        ));
     }
     // Sparse expert routing over the FFN branch. Two LOUD checks, both the
     // class where a wrong value computes a DIFFERENT objective without saying
@@ -166,13 +188,15 @@ pub fn validate(c: &DormouseConfig) -> Result<(), String> {
     //    routed run with no balancer behind it. That is the repo's own
     //    COUNTED mark for "a fallback happened and a reader can tell", which
     //    is the correct instrument here - not a loud refusal of a legal run.
-    if c.d_model % c.n_heads != 0 { return Err("d_model must be divisible by n_heads".into()); }
+    if !c.d_model.is_multiple_of(c.n_heads) {
+        return Err("d_model must be divisible by n_heads".into());
+    }
     // The act-quant group size. `quant_act` takes `g = min(act_group, d)` and
     // reshapes the [b*t, d] activations to [b, d/g, g], so a `g` that does not
     // divide `d` makes d/g*g != d and the reshape fails on the FIRST forward
     // (act_quant.rs:82) - a shape error a long way from the flag that caused
     // it. `act_group` is a free-form `--set` value, so it is checked here.
-    if c.act_quant.is_some() && c.act_group != 0 && c.d_model % c.act_group != 0 {
+    if c.act_quant.is_some() && c.act_group != 0 && !c.d_model.is_multiple_of(c.act_group) {
         return Err(format!(
             "act_group {} must divide d_model {} (or be 0 for one scale per token): the \
              quantizer groups the activations in blocks of act_group, so a non-divisor fails \
@@ -192,10 +216,15 @@ pub fn validate(c: &DormouseConfig) -> Result<(), String> {
         ));
     }
     if c.engram_orders.iter().any(|&n| n == 0 || n > 32) {
-        return Err(format!("engram_orders entries must be 1..=32, got {:?}", c.engram_orders));
+        return Err(format!(
+            "engram_orders entries must be 1..=32, got {:?}",
+            c.engram_orders
+        ));
     }
     if !(c.engram_lam_max > 0.0 && c.engram_lam_max <= 1.0) {
-        return Err("engram_lam_max must be in (0, 1]: 0 would delete the arm, >1 is not a floor".into());
+        return Err(
+            "engram_lam_max must be in (0, 1]: 0 would delete the arm, >1 is not a floor".into(),
+        );
     }
     // AttnRes, Gated Residual and mHC all REPLACE the residual accumulation, in
     // the same statement of the loop (the `else` chain in `forward_full_state`).
@@ -232,7 +261,7 @@ pub fn validate(c: &DormouseConfig) -> Result<(), String> {
         if c.mhc_streams == 0 {
             return Err("mhc_streams must be >= 1".into());
         }
-        if c.d_model % c.mhc_streams != 0 {
+        if !c.d_model.is_multiple_of(c.mhc_streams) {
             return Err(format!(
                 "mhc_streams {} must divide d_model {}: the residual stream is read as \
                  n streams of width d_model/n, so a non-divisor fails the reshape in the \
