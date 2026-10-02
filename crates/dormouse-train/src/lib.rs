@@ -189,7 +189,7 @@ impl Default for TrainCfg {
             rand_depth: false,
             eval_batches: 20,
             eval_depths: false,
-            retract_every: 1, retract_iters: 3, retract_batched: false,
+            retract_every: 1, retract_iters: 3, retract_batched: true,
             stress: false, stress_lr: 1.0, stress_every: 50,
             engram_ram: false, engram_slots: 1_000_000, host_adam_every: 1,
             warmup: true, quant_check: false, timers: false, memlog: false,
