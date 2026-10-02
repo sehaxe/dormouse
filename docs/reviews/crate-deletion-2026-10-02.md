@@ -126,7 +126,7 @@ Both are run per batch, plus `gen_facade.py --check` and
 
 ## Execution (2026-10-02, branch wt/cut2)
 
-Landed as three code commits plus the docs/manifest commit:
+Landed as three code commits plus the docs/README.md commit:
 
 - `f13ec4e` delete(vendor): burn-sct — 3439 lines, 16 files.
 - `24834c6` refactor(burn-spectral): drop the sct8/sct16 arms from tsct_diag —

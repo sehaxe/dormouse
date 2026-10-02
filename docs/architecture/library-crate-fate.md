@@ -59,10 +59,10 @@ dependency on the other crates does not make them reachable.
 | `burn-spectral` | 6329 | 2122 | **W** | keep | TSCT linears + MoE router; every `LinearLike` in the model |
 | `burn-gdn2` | 4871 | 4085 | **W** | keep | the gated-delta kernel `burn-kda` is built on |
 | `burn-sct` | 2739 | 458 | d, b | **DELETED 2026-10-02** | non-ternary original of what `burn-spectral` does in the product |
-| `burn-attnres` | 2268 | 64 | b | REFERENCE | residual A/B arm named at `PLAN-minimal-core.md` §M2 |
+| `burn-attnres` | 2268 | 64 | w | WIRED | product dependency of `dormouse-core` (Cargo.toml:32); the A/B arm ran in wave-3 |
 | `burn-bitnet` | 2088 | 0 | **W** | keep | ternary weight quant called from `burn-spectral` |
 | `burn-kda` | 1232 | 845 | **W** | keep | the attention arm |
-| `burn-mhc` | 1171 | 0 | b | REFERENCE | residual A/B arm named at `PLAN-minimal-core.md` §M2 |
+| `burn-mhc` | 1171 | 0 | w | WIRED | product dependency of `dormouse-core` (Cargo.toml:27); A/B wave-3 tie, owner keeps for FLOP economics |
 | `burn-rope` | 1131 | 0 | d, b | **WIRE** | the attention arm has **no positional encoding at all** today |
 | `burn-muon-plus` | 1055 | 336 | **W** | keep | the default optimizer |
 | `burn-dspark` | 867 | 0 | **W** | keep | the draft head (replaced MTP) |
