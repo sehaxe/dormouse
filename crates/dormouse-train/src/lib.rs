@@ -1554,8 +1554,13 @@ pub fn train_loop(
             // cadence only, keeps the hot path sync-free.
             let ce_now: f32 = match loss_log.clone().try_into_scalar() {
                 Ok(v) => v,
-                Err(_) => {
-                    return Err(format!("step {step}: device error (loss is not a scalar)"));
+                Err(e) => {
+                    // The underlying error is the evidence (often a CUDA
+                    // execution/alloc failure whose real cause is OOM): print
+                    // it. The old message named only the symptom, and every
+                    // night2b/c/d failure on b16 read as "loss is not a scalar"
+                    // while the log held OOM panics (defect #2, 2026-10-03).
+                    return Err(format!("step {step}: loss read failed: {e}"));
                 }
             };
             ce = ce_now;
