@@ -86,3 +86,77 @@ Sum of the "must have" for a 1M byteflow run: ~20–30 LOC (raise the window
 ceiling in the flat config + the COUNTED stress skip) + the recurrent-window
 path (~300–400 crate LOC) IF quadratic local attention is not acceptable at
 1M. NOT implemented here, per the lane brief.
+
+## CONFIRMATION — lane bfconfirm, 2026-10-03 (params-matched, 2k × 3 seeds)
+
+Date: 2026-10-03. Tree: `wt/bfab` (rebased to main `3b117a4`). Logs:
+`~/logs/bfconfirm_bf9m_s{1,2,3}.log`, `~/logs/bfconfirm_ctl_s{1,2,3}.log`,
+`~/logs/bftiming_ctl.log`. GPU: RTX 5060 Ti, fp32, six runs sequential,
+starts waited on `pgrep -x train` empty (the maxopt ×3 queue drained first).
+
+**The params-matching, measured before any GPU turn** (CPU probe
+`vendor/dormouse-fused/crates/burn-byteflow/examples/param_probe.rs`,
+`ByteFlowNet::init().num_params()` on NdArray — the same count the step-0 arm
+line prints on device):
+
+- the preset `byteflow.toml` ("the byteflow_9m build", d_global 768) measures
+  **15 923 968** — the name is **15.9 M, not ~9 M**. It is the 200-step A/B arm
+  config; the +73% confound was THIS config, and the doc's suggested
+  `--set byteflow_d_global=640` gives 12 697 344 (+38%), still not a match.
+- the match is `--set byteflow_d_global=496` → **9 380 736**, i.e. **+2.0 %**
+  against the control's 9 197 454 — inside the brief's 5 % cap, the closest
+  the discrete knob (d_global, multiples of heads_global=8) comes (480 gives
+  −1.8 %, which was not run). Not byte-exact; LOUDLY stated here.
+
+Instrument: batch 8, seq 512, 2000 steps, both arms consume the same
+`next_batch` seam (`ByteStream::train_and_eval`) → equal bytes (8.19 MB);
+held-out window **identical on both arms, printed on every eval line:
+81920 B** = eval_batches 20 × batch 8 × seq 512. Control = preset `small`,
+`--no-engram --jepa-weight 0 --dspark-weight 0` (pure CE, Muon+, 9 197 454
+params — the same control as the 200-step table). Byteflow arm = AdamW
+(sd 1e-2), the arm's own recipe; both lr 1e-4.
+
+| arm | seed 1 | seed 2 | seed 3 | params | ms/step |
+|---|---|---|---|---|---|
+| control best held-out BPB (steps 500–1500) | 6.509 | 6.499 | 6.421 | 9 197 454 | 337–356 (timer lines, steps 50/100, `bftiming_ctl.log`); ≥454 ms in every other 2000-step shape run today (maxopt re5/re10) |
+| byteflow_9m-496 @1500 | 3.551 | 3.575 | 3.583 | 9 380 736 | 46 (ms/step field, log steps, steady through step 2000) |
+| byteflow_9m-496 @2000 | **3.453** | **3.458** | **3.482** | 9 380 736 | 46 |
+
+(Note on the control's step time: the dormouse loop prints `ms/step` only
+under `--timers`, and the 3 confirm controls ran without it, so the honest
+indexed reading is the 150-step `--timers` probe at the SAME shape:
+warm steps 50..150 = 326 ms/step, timer lines 337/356 ms at steps 50/100 —
+a warm-step reading with a step index. The byteflow arm prints its own
+indexed `ms/step`: 46, stable.)
+
+### Verdict (§1.2)
+
+**WIN — canon holds.** The worst byteflow seed (3.482 @2k, 3.583 @1500) beats
+the best control seed (6.421) by **~2.94 BPB**, more than **30×** the
+control's own seed spread (0.088 over its three best readings; the byteflow
+triad spreads 0.029). At the matched comparison step (1500, the last control
+eval): 3.570 mean vs 6.485 best-control — same verdict. Triangle check: the
+win survives every pairing, not just best-vs-worst.
+
+**Default action: none. The schema default `use_byteflow = true` stays.**
+No rollback, nothing was proxied by the flip, the 8 preset `false` explicity
+lines stay as they are (they keep each preset's meaning pinned, independent
+of the verdict). Params caveat from the 200-step section is now closed by
+this table: the claim "better net at equal budget" stands at +2.0 % params.
+
+Residual confounds, named honestly:
+
+1. **Optimizer differs by arm design**: byteflow asks AdamW (the mix router
+   does not walk its tree), the control runs Muon+. The 200-step A/B had the
+   same asymmetry. An AdamW-trained 9.2 M dormouse control is a different
+   experiment and was not required by the brief.
+2. **The byteflow_9m-496 config has no committed preset** — it exists as
+   `--set` overrides on `byteflow.toml` in the logged commands. If this build
+   becomes official it owes a `configs/byteflow_9m.toml`.
+3. Both arms at lr 1e-4 default, WSD warmup unexamined — a tuned byteflow
+   recipe can only move it further from the control, not toward.
+
+bf9m filenames note: `bfbf9m_s{N}` checkpoints, `bfctl9m_s{N}` for the
+control; the s3 control log contains two "warmup done" headers because a
+killed attempt (tool timeout mid-queue, step ~1800) was rerun from scratch —
+the table's s3 numbers come from the complete second pass only.
