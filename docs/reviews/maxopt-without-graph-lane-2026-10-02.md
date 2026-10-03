@@ -64,7 +64,10 @@ every BPB quotes the scored-byte window it was scored over)
 - Wall check on the fresh 500-step control replica (after-binary, quiet window):
   **419/420/420/419 ms at the step 100..400 timers = 387.0 ms/step** vs the
   gbench2_control's 457.3-485.8 — the ms reading pairs with the atlas Δ within
-  noise; the raw row is in history.tsv.
+  noise; the raw row is in history.tsv. The fresh replica's CE replays the
+  gbench2 per-head run within ±0.04-0.07 CE at the matched schedule (steps=500;
+  the 2k arms' curve differs from it BY SCHEDULE DESIGN — the warmup length
+  scales with `cfg.steps` — do not read the ce curves across schedules).
 
 ### Lever 1 — TSCT retraction cadence (MEASURED, no code change)
 All four arms at 2k steps, 2 seeds, the SAME window (eval-batches 20 × 8 × 512
