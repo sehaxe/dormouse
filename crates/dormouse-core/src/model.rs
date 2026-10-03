@@ -243,6 +243,7 @@ impl DormouseModel {
             host_rows,
             None,
             None,
+            None,
             &self.lm_head,
         );
         out_acc
@@ -298,7 +299,14 @@ impl DormouseModel {
                 host_rows.clone().map(|r| r.detach()),
             )
         });
-        self.forward_with_latent::<B>(input_ids, hashed_ids, host_rows, targets, teacher_latent)
+        self.forward_with_latent::<B>(
+            input_ids,
+            hashed_ids,
+            host_rows,
+            targets,
+            teacher_latent,
+            None,
+        )
     }
 
     /// Same as [`Self::forward_with_hidden`], but the JEPA target latent is
@@ -318,7 +326,40 @@ impl DormouseModel {
             + DispatchKindConversion<B::InnerBackend>
             + DispatchKindConversion<burn::backend::Autodiff<B::InnerBackend>>,
     {
-        self.forward_with_latent::<B>(input_ids, hashed_ids, host_rows, targets, jepa_target)
+        self.forward_with_latent::<B>(input_ids, hashed_ids, host_rows, targets, jepa_target, None)
+    }
+
+    /// The supervised-fine-tuning forward: [`Self::forward_with_hidden`] plus a
+    /// per-position **loss mask**, and no EMA teacher (an SFT step is one
+    /// forward; the teacher exists to make a second forward worth running, and
+    /// pure-CE SFT has no such term).
+    ///
+    /// `loss_mask` is `[b, t]` f32 and is **label-aligned**: `loss_mask[q]`
+    /// weights `targets[q]`. The mask out of the data crate is byte-indexed, so
+    /// shift it first — `dormouse_data::sft::SftBatch::target_mask` is the
+    /// function that does that, and `tests/sft_smoke.rs` pins the difference
+    /// between the two (pass the unshifted mask and the loss trains one byte
+    /// early, which looks like a slightly worse model, not like a bug).
+    ///
+    /// This is its own entry point rather than a sixth argument to
+    /// `forward_with_hidden` for one reason: the mask is the SFT path's only
+    /// extra input, and 60+ pretraining and eval call sites would all grow a
+    /// `None` for something they have no meaning for. Same private funnel
+    /// underneath — not a second implementation of the forward.
+    pub fn forward_sft<B: burn::backend::AutodiffBackend>(
+        &self,
+        input_ids: Tensor<2, Int>,
+        hashed_ids: Option<Tensor<3, Int>>,
+        host_rows: Option<Tensor<3>>,
+        targets: Option<Tensor<2, Int>>,
+        loss_mask: Option<Tensor<2>>,
+    ) -> (Tensor<3>, Tensor<1>, Tensor<4>, Option<Tensor<1>>)
+    where
+        DispatchTensor: DispatchKindConversion<B>
+            + DispatchKindConversion<B::InnerBackend>
+            + DispatchKindConversion<burn::backend::Autodiff<B::InnerBackend>>,
+    {
+        self.forward_with_latent::<B>(input_ids, hashed_ids, host_rows, targets, None, loss_mask)
     }
 
     fn forward_with_latent<B: burn::backend::AutodiffBackend>(
@@ -328,6 +369,7 @@ impl DormouseModel {
         host_rows: Option<Tensor<3>>,
         targets: Option<Tensor<2, Int>>,
         teacher_latent: Option<Tensor<3>>,
+        loss_mask: Option<Tensor<2>>,
     ) -> (Tensor<3>, Tensor<1>, Tensor<4>, Option<Tensor<1>>)
     where
         DispatchTensor: DispatchKindConversion<B>
@@ -368,6 +410,7 @@ impl DormouseModel {
             host_rows,
             None,
             tgt,
+            loss_mask,
             &self.lm_head,
         );
         // loop activations may be bf16; the final norm+head compute in fp32

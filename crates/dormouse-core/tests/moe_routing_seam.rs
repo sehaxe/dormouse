@@ -76,7 +76,7 @@ fn head() -> LinearLike {
 /// One capture of the mixture the FFN branch really used.
 fn capture(block: &LoopBlock, x: Tensor<3>, head: &LinearLike) -> Vec<Tensor<2>> {
     mixture_probe::arm();
-    let _ = block.forward_full_state::<B>(x, None, None, None, None, head);
+    let _ = block.forward_full_state::<B>(x, None, None, None, None, None, head);
     let cap = mixture_probe::take().expect("armed before the forward");
     assert!(
         !mixture_probe::armed(),

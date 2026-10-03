@@ -108,7 +108,7 @@ fn backward_report(topk: usize) -> (f64, f64, Vec<f64>) {
     // a shape error about the head, reported from inside the loss.
     let head = dormouse_core::param::LinearLike::with_tsct(32, 256, 8, false, &adev());
     let (_logits, rec, _kda, _route) =
-        block.forward_full_state::<B>(x, None, None, None, Some(y), &head);
+        block.forward_full_state::<B>(x, None, None, None, Some(y), None, &head);
     let grads = rec.backward();
 
     // The controller weight is `[2d, ctrl_pad]`; columns `0..3` are the arm

@@ -52,6 +52,11 @@
 //! Everything else in the hot path is a memcpy: `next_batch` hands back
 //! `batch * seq_len` bytes and one FNV pass over them.
 //!
+//! [`sft`] is the supervised half: JSONL conversations rendered to the same
+//! byte stream, plus the mask that says which of those bytes the loss may
+//! score. It is a separate module, not a flag on [`ByteStream`], because the
+//! mask is a per-position quantity the pretraining path has no meaning for.
+//!
 //! # Gate
 //!
 //! `#![warn(missing_docs)]` and `#![warn(rustdoc::broken_intra_doc_links)]` are
@@ -59,6 +64,8 @@
 //! dormouse-data` is green.
 #![warn(missing_docs)]
 #![warn(rustdoc::broken_intra_doc_links)]
+
+pub mod sft;
 
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
