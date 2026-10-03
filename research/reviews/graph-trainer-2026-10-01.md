@@ -310,3 +310,8 @@ insist on the divergence.
 Decision recorded per the brief: gates not green → `wt/graph-trainer`
 stays unmerged, `--graph-capture` ships in nothing, this file is the
 blocker report.
+
+---
+
+## Continuation 3 — 2026-10-02, gates green after the pin-through-optimizer rewrite (afterno) operator
+
