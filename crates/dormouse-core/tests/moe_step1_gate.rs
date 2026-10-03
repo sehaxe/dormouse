@@ -76,7 +76,7 @@ fn x() -> Tensor<3> {
 /// else in this file can contaminate the capture.
 fn stats_of(block: &LoopBlock, x: Tensor<3>, head: &LinearLike) -> MixtureStats {
     mixture_probe::arm();
-    let _ = block.forward_full_state::<B>(x, None, None, None, None, head);
+    let _ = block.forward_full_state::<B>(x, None, None, None, None, None, head);
     let cap = mixture_probe::take().expect("armed before the forward");
     assert_eq!(
         cap.len(),
@@ -274,12 +274,12 @@ fn input_dependence_is_measured_on_both_arms() {
             let b = Tensor::<3>::random([BATCH, SEQ, 32], Distribution::Normal(0.0, 1.0), &adev());
             let cap_a = {
                 mixture_probe::arm();
-                let _ = block.forward_full_state::<B>(a, None, None, None, None, &head);
+                let _ = block.forward_full_state::<B>(a, None, None, None, None, None, &head);
                 mixture_probe::take().expect("armed")
             };
             let cap_b = {
                 mixture_probe::arm();
-                let _ = block.forward_full_state::<B>(b, None, None, None, None, &head);
+                let _ = block.forward_full_state::<B>(b, None, None, None, None, None, &head);
                 mixture_probe::take().expect("armed")
             };
             let d = mixture_probe::top1_disagreement(&cap_a, &cap_b);

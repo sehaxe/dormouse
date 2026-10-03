@@ -597,6 +597,23 @@ impl LoopBlock {
     ///   `L_Rec`. `None` (an eval/decode forward) returns a **zero** `L_Rec`
     ///   rather than the previous iteration's value, so an eval cannot
     ///   accidentally train on a stale loss.
+    /// * `loss_mask` `[b, t]` f32, **label-aligned** — a per-position weight
+    ///   on `targets`: 0 hides that position from the loss entirely (no CE
+    ///   term, no gradient), 1 scores it normally. This is the SFT arm, and
+    ///   `None` is the pretraining path bit for bit.
+    ///
+    ///   **The alignment is the whole contract.** `loss_mask[q]` weights
+    ///   `targets[q]`, i.e. the label, not the byte read at position `q`. A
+    ///   caller holding a byte-indexed mask must shift it first
+    ///   (`dormouse_data::sft::SftBatch::target_mask`); passing the unshifted
+    ///   mask trains on the byte before the turn and off the last byte of it,
+    ///   which looks like a slightly worse model rather than like a bug.
+    ///
+    ///   The divisor is the mask's own count, not `b * t`, so the loss keeps
+    ///   the scale of a fully-masked-in batch and a 5 %-supervised SFT batch is
+    ///   not silently 20× smaller. `clamp_min(1.0)` covers an all-zero mask,
+    ///   which yields 0.0 rather than NaN (a NaN here would stop the run at the
+    ///   first padded SFT batch).
     ///
     /// # Cost (this is where a step goes)
     ///
@@ -624,6 +641,9 @@ impl LoopBlock {
         kda_state: Option<Tensor<4>>,
         // Target byte indices [b*t, 1]: L_Rec gathers their log-probs.
         targets: Option<Tensor<2, Int>>,
+        // Per-position weight on `targets`, [b, t], LABEL-aligned. None = every
+        // position scored (the pretraining path, unchanged).
+        loss_mask: Option<Tensor<2>>,
         lm_head: &LinearLike,
     ) -> (Tensor<3>, Tensor<1>, Tensor<4>, RouteAux)
     where
@@ -1162,14 +1182,21 @@ impl LoopBlock {
             let g = g.cast(s_out.dtype());
             out_acc = out_acc + s_out.clone().mul(g.clone()).mul_scalar(w);
             if let Some(ce) = ce_terms.get(n) {
-                rec = rec
-                    + ce.clone()
-                        .mul(g.reshape([b, t]))
+                let cm = ce.clone().mul(g.reshape([b, t]));
+                // The SFT arm: weight each position by the mask and divide by
+                // the mask's own count, so the loss keeps the scale of a
+                // fully-scored batch instead of shrinking with the supervised
+                // fraction. The count lives on the DEVICE (it is data), so this
+                // is a tensor divide - no host read, no sync (ADR-0018 rule 2).
+                // clamp_min(1) is the all-zero-mask row: 0/1 = 0, not 0/0 NaN.
+                let row = match &loss_mask {
+                    Some(m) => cm
+                        .mul(m.clone())
                         .sum_dim(1)
-                        .div_scalar(t as f32)
-                        .sum_dim(0)
-                        .reshape([1])
-                        .mul_scalar(w);
+                        .div(m.clone().sum_dim(1).clamp_min(1.0)),
+                    None => cm.sum_dim(1).div_scalar(t as f32),
+                };
+                rec = rec + row.sum_dim(0).reshape([1]).mul_scalar(w);
             }
         }
         let rec = rec.div_scalar(b as f32); // mean over batch
@@ -1356,8 +1383,9 @@ mod tests {
             let x = Tensor::<3>::random([b, t, d], Distribution::Normal(0.0, 1.0), &adev());
             let head = LinearLike::with_tsct(d, 16, 8, cfg.use_tsct, &adev());
             let (o_rezero, _, _, _) =
-                plain.forward_full_state::<B>(x.clone(), None, None, None, None, &head);
-            let (o_attnres, _, _, _) = ar.forward_full_state::<B>(x, None, None, None, None, &head);
+                plain.forward_full_state::<B>(x.clone(), None, None, None, None, None, &head);
+            let (o_attnres, _, _, _) =
+                ar.forward_full_state::<B>(x, None, None, None, None, None, &head);
             let diff = (o_rezero - o_attnres).abs().max().into_scalar::<f32>();
             assert!(
                 diff > 1e-6,
@@ -1540,7 +1568,7 @@ mod tests {
             },
             &adev(),
         );
-        let _ = ar.forward_full_state::<B>(x.clone(), None, None, None, None, &head);
+        let _ = ar.forward_full_state::<B>(x.clone(), None, None, None, None, None, &head);
         assert_eq!(
             crate::probe::count(crate::probe::ATTNRES),
             4,
@@ -1551,7 +1579,7 @@ mod tests {
         // on the eval line would read non-zero for a run that never aggregated.
         crate::probe::reset();
         let rz = LoopBlock::new(&cfg, &adev());
-        let _ = rz.forward_full_state::<B>(x, None, None, None, None, &head);
+        let _ = rz.forward_full_state::<B>(x, None, None, None, None, None, &head);
         assert_eq!(
             crate::probe::count(crate::probe::ATTNRES),
             0,
@@ -1571,6 +1599,7 @@ mod tests {
         ar.set_depth(Some(2));
         let _ = ar.forward_full_state::<B>(
             Tensor::zeros([2, 5, 32], &adev()),
+            None,
             None,
             None,
             None,
@@ -1949,7 +1978,8 @@ mod tests {
         );
         let head = mhc_head(&cfg);
         let x = Tensor::<3>::random([2, 5, 32], Distribution::Normal(0.0, 1.0), &adev());
-        let (o_mh, _, _, _) = blk.forward_full_state::<B>(x.clone(), None, None, None, None, &head);
+        let (o_mh, _, _, _) =
+            blk.forward_full_state::<B>(x.clone(), None, None, None, None, None, &head);
         // The scalar ReZero is about to be compared against must BE 1.
         assert_eq!(blk.residual_scale.val().clone().into_scalar::<f32>(), 1.0);
         // Same object, ReZero's statement. `mhc` stays allocated (so the
@@ -1957,7 +1987,7 @@ mod tests {
         // counter says which branch ran.
         blk.use_mhc = false;
         crate::probe::reset();
-        let (o_rz, _, _, _) = blk.forward_full_state::<B>(x, None, None, None, None, &head);
+        let (o_rz, _, _, _) = blk.forward_full_state::<B>(x, None, None, None, None, None, &head);
         assert_eq!(
             crate::probe::count(crate::probe::MHC),
             0,
@@ -2010,7 +2040,7 @@ mod tests {
         let head = mhc_head(&cfg);
         let x = Tensor::<3>::random([2, 5, 32], Distribution::Normal(0.0, 1.0), &adev());
         let run = |blk: &mut LoopBlock| -> Tensor<3> {
-            blk.forward_full_state::<B>(x.clone(), None, None, None, None, &head)
+            blk.forward_full_state::<B>(x.clone(), None, None, None, None, None, &head)
                 .0
         };
         let far = |a: &Tensor<3>, b: &Tensor<3>| -> f32 {
@@ -2087,7 +2117,8 @@ mod tests {
         // returned `rec` is the zero it started as - a leaf, and `backward()`
         // refuses it. The gate would then be measuring burn's error message.
         let tgt = Tensor::<2, Int>::zeros([2 * 5, 1], &adev());
-        let (_, rec, _, _) = blk.forward_full_state::<B>(x, None, None, None, Some(tgt), &head);
+        let (_, rec, _, _) =
+            blk.forward_full_state::<B>(x, None, None, None, Some(tgt), None, &head);
         let grads = rec.backward();
         let mhc = blk.mhc.as_ref().expect("arm on");
         // `b_res` is the one that matters: it is the whole mechanism, and
@@ -2271,14 +2302,15 @@ mod tests {
             // differ by their initialisation, not by their residual operator.
             crate::probe::reset();
             let (on, _, _, _) =
-                blk.forward_full_state::<B>(x.clone(), None, None, None, None, &head);
+                blk.forward_full_state::<B>(x.clone(), None, None, None, None, None, &head);
             assert_eq!(crate::probe::count(crate::probe::MHC), depth as u64);
             blk.use_mhc = false;
             let (off, _, _, _) =
-                blk.forward_full_state::<B>(x.clone(), None, None, None, None, &head);
+                blk.forward_full_state::<B>(x.clone(), None, None, None, None, None, &head);
             crate::probe::reset();
             blk.forward_full_state::<B>(
                 Tensor::zeros([2, 5, 32], &adev()),
+                None,
                 None,
                 None,
                 None,
@@ -2315,7 +2347,7 @@ mod tests {
             },
             &adev(),
         );
-        let _ = mh.forward_full_state::<B>(x.clone(), None, None, None, None, &head);
+        let _ = mh.forward_full_state::<B>(x.clone(), None, None, None, None, None, &head);
         assert_eq!(
             crate::probe::count(crate::probe::MHC),
             4,
@@ -2330,7 +2362,7 @@ mod tests {
             &adev(),
         );
         mh.set_depth(Some(2));
-        let _ = mh.forward_full_state::<B>(x.clone(), None, None, None, None, &head);
+        let _ = mh.forward_full_state::<B>(x.clone(), None, None, None, None, None, &head);
         assert_eq!(
             crate::probe::count(crate::probe::MHC),
             2,
@@ -2338,7 +2370,7 @@ mod tests {
         );
         crate::probe::reset();
         let rz = LoopBlock::new(&cfg, &adev());
-        let _ = rz.forward_full_state::<B>(x, None, None, None, None, &head);
+        let _ = rz.forward_full_state::<B>(x, None, None, None, None, None, &head);
         assert_eq!(
             crate::probe::count(crate::probe::MHC),
             0,
@@ -2566,7 +2598,7 @@ mod tests {
         blk.use_situ = true;
         let head = LinearLike::with_tsct(cfg.d_model, 16, cfg.rank, cfg.use_tsct, &adev());
         let x = Tensor::<3>::zeros([2, 5, cfg.d_model], &adev());
-        let _ = blk.forward_full_state::<B>(x, None, None, None, None, &head);
+        let _ = blk.forward_full_state::<B>(x, None, None, None, None, None, &head);
     }
 
     /// THE ARM IS OBSERVABLE, and its counter is exact. `use_situ = true` with a
@@ -2586,7 +2618,7 @@ mod tests {
             },
             &adev(),
         );
-        let _ = on.forward_full_state::<B>(x.clone(), None, None, None, None, &head);
+        let _ = on.forward_full_state::<B>(x.clone(), None, None, None, None, None, &head);
         assert_eq!(
             crate::probe::count(crate::probe::SITU),
             (cfg.n_experts * cfg.max_iter) as u64,
@@ -2597,7 +2629,7 @@ mod tests {
         // would read non-zero for a run that never activated the arm.
         crate::probe::reset();
         let off = LoopBlock::new(&cfg, &adev());
-        let _ = off.forward_full_state::<B>(x.clone(), None, None, None, None, &head);
+        let _ = off.forward_full_state::<B>(x.clone(), None, None, None, None, None, &head);
         assert_eq!(
             crate::probe::count(crate::probe::SITU),
             0,
@@ -2607,7 +2639,7 @@ mod tests {
         // Truncated depth counts what RAN, like every other counter here.
         crate::probe::reset();
         on.set_depth(Some(1));
-        let _ = on.forward_full_state::<B>(x, None, None, None, None, &head);
+        let _ = on.forward_full_state::<B>(x, None, None, None, None, None, &head);
         assert_eq!(
             crate::probe::count(crate::probe::SITU),
             cfg.n_experts as u64,
