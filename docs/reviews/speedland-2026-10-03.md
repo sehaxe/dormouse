@@ -12,7 +12,7 @@ Newton-Schulz`. Один stacked NS над `[n_heads, dh, cols]` вместо 12
 `crates/dormouse-train/src/optim.rs`.
 
 Gate: `cargo test -p dormouse-train --lib optim` — 7/7 зелёный, включая
-`headwise_batched_ns_matches_per_head` (13.14s).
+`headwise_batched_ns_matches_per_head`.
 
 Ожидаемый эффект: −15 ms/step по atlas-оценке wt/maxopt2
 (opt-стадия, launch-bound). Точного quiet-card замера ms/step в этой
@@ -39,8 +39,8 @@ quiet-card repeat не сделан, re10_s2 не добежал (lane отме�
   отдельным коммитом. Evidence lane: `~/logs/dg2_ab_f{3,4}.log`,
   `fused kda=412/412 node_bwd=412 ops=80 declined=240` (первый живой
   backward фьюжн-пути в истории проекта), adjoint equivalence ≤4.7e-7,
-  net wall +2.6% = шум. CUDA-гейт kda_param_grads зелёный по логам lane;
-  в этой lane — CPU compile-check, GPU занят.
+  net wall +2.6% = шум. `cargo check -p dormouse-train --features cuda`
+  зелёный (CPU compile, без GPU-прогона).
 - `ec438ec` (rmsnorm fused kernel как один autodiff node) — НЕ сел:
   vendor-изменения burn-rmsnorm/burn-gdn2, требует собственного
   CUDA-гейта rmsnorm node arm; follow-up (в докладе dispatch-guard
