@@ -109,9 +109,16 @@ use burn_autodiff::Autodiff;
 use burn_gdn2::CudaBare;
 use burn_kda::{DecayFn, KdaConfig, KdaModule};
 
-/// The trainer's backend: `Autodiff<CudaBare, BalancedCheckpointing>`, which is
-/// exactly what `Device::cuda(0).autodiff()` builds — the strategy `8fa5d4c`
-/// was about.
+/// The trainer's backend: `Autodiff<CudaBare, NoCheckpointing>` — which is
+/// what `Device::cuda(0).autodiff()` builds (`Enabled(Disabled)` and
+/// `NoCheckpointing::STRATEGY == Disabled`, burn-dispatch
+/// `src/tensor.rs:449-460`). The trainer's TYPE said `BalancedCheckpointing`
+/// until 2026-10-02 while its device ran `Disabled`; the type governed
+/// nothing (burn's ops are type-erased) except the seams that name it in a
+/// conversion, where it silently discarded every fused result
+/// (`fused kda=412/0 ops=492` on the probe run). See the Backend comment in
+/// `dormouse-train/src/lib.rs`. This file keeps BOTH strategies pinned: AdBal
+/// exercises the Balanced conversions, AdNo the trainer's actual pair.
 type AdBal = Autodiff<CudaBare, BalancedCheckpointing>;
 /// The same module on the same strategy with every intermediate a real graph
 /// node, which is what makes the fused op reachable.
