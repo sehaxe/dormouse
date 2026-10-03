@@ -157,3 +157,5 @@ date	commit	mode	step	throughput	mem	final-ce
 # byteflow CONFIRMATION 2026-10-03 (bfconfirm, matched params, CANON): 2k steps x 3 seeds x 2 arms, real corpus + real_eval, window 81920B
 # byteflow_9m (d_global=640, ~9.2M): 3.458/3.465/3.478 @49ms/step (2.7min/run) | control small pureCE ~9.2M: 6.465/6.447/6.495 @~450-500ms/step
 # verdict: gap ~3.0 BPB = 60x control seed spread (0.048) at EQUAL params -> CANON (file:byteflow.toml is the winning net; default flip stands)
+# anchors at the byteflow-confirm budget (2026-10-03): score=eval_tail.bin, --fit real_filtered/corpus.bin --bytes 8388608 (equal-bytes bar for 2k-step runs)
+# uniform 8.000 | unigram 5.009 | 5-gram+backoff 2.580 (10.3% unseen) -> byteflow_9m 3.458@2k: beats unigram by 1.55, 0.878 ABOVE the 5-gram line
