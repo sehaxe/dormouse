@@ -116,11 +116,21 @@ pub const MOE_LB: usize = 17;
 /// it while the elementwise `silu` actually ran would look entirely healthy.
 /// A ZERO here with `use_situ = true` means the arm did not run.
 pub const SITU: usize = 18;
+/// The Qwen Sparse Attention stage's sparse forward RAN (one entry per
+/// executed iteration; stage (b)). COUNTED: `use_msa` names the arm, and a
+/// run that printed the name while never reaching it would lose only this
+/// counter.
+pub const MSA: usize = 19;
+/// The MSA distillation KL term was COMPUTED AND ADDED (one per step, stage
+/// (a)). The pair with [`MSA`]: a stage-(a) run reports `msa=0/<iters>` on the
+/// eval line (the sparse core contributes nothing there) and `msa_distill`
+/// non-zero; a stage-(b) run the reverse.
+pub const MSA_DISTILL: usize = 20;
 /// How many arms [`NAMES`] and the counter array hold. **Adding an arm means
 /// bumping this**, and the array is `[Cell<u64>; N_ARMS]`, so the compiler
 /// refuses a `NAMES` entry that does not fit — an arm cannot be named without
 /// being countable.
-pub const N_ARMS: usize = 19;
+pub const N_ARMS: usize = 21;
 /// Arm name per index, for assertion messages that name the thing.
 pub const NAMES: [&str; N_ARMS] = [
     "iterations",
@@ -142,6 +152,8 @@ pub const NAMES: [&str; N_ARMS] = [
     "moe_select",
     "moe_lb",
     "situ",
+    "msa",
+    "msa_distill",
 ];
 
 thread_local! {

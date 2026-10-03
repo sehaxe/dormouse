@@ -587,6 +587,50 @@ pub struct DormouseConfig {
     #[serde(default = "d_mor_bce_weight")]
     pub mor_bce_weight: f32,
 
+    // --- Qwen Sparse Attention (tech report §QSA): the full-attention arm ---
+    /// **Qwen Sparse Attention as an EXTRA per-iteration stage** — the arm
+    /// ADR-0014 cut (its indexer emitted garbage indices and every gather
+    /// went out of bounds) and §3.5 item 4 re-adds. A compressed MQA indexer
+    /// (4 query heads, 1 shared key head) scores the sequence in blocks of
+    /// `msa_block_r` tokens and picks the top `msa_kb`; the core attention
+    /// (a plain multi-head softmax over the model's OWN Q/K/V projections,
+    /// a NEW mechanism — not a sparse version of KDA) then runs over the
+    /// selected blocks plus the ALWAYS-INCLUDED final incomplete block
+    /// (report Eq. 19). OFF by default; the crate's dense-contract gate
+    /// (`sparse(all) == dense` bit-near) is `burn-msa/tests/gate1_dense_contract.rs`.
+    ///
+    /// Stage (a) of the two-stage training (distill the dense attention into
+    /// the indexer) is `msa_distill_weight > 0`: the stage computes the dense
+    /// TEACHER distribution in the same forward, max-pools it into blocks,
+    /// and adds an unscaled KL term to the aux loss (Eq. 17-18); the sparse
+    /// core attention contributes nothing on that stage.
+    #[serde(default = "d_false")]
+    pub use_msa: bool,
+    /// Complete blocks the indexer picks per query (the report's `KB`).
+    /// `>= the complete blocks of a sequence` is REFUSED loudly by
+    /// [`super::validate`] - a sparse arm over every block is the dense
+    /// arm at a top-k's price, the control wearing the arm's label.
+    #[serde(default = "d_msa_kb")]
+    pub msa_kb: usize,
+    /// MQA query heads of the indexer (report: 4).
+    #[serde(default = "d_msa_q_heads")]
+    pub msa_q_heads: usize,
+    /// Compression ratio `r`, tokens per block (report: 4).
+    #[serde(default = "d_msa_block_r")]
+    pub msa_block_r: usize,
+    /// Indexer head width (report: 128 at 256K context; the model's own
+    /// attention geometry stays in `n_heads`/`head_dim`). Partial RoPE
+    /// covers the first HALF of these dims (the report's 64-of-128 ratio).
+    #[serde(default = "d_msa_head_dim")]
+    pub msa_head_dim: usize,
+    /// Stage (a)'s distillation KL weight (unscaled term in the aux loss).
+    /// `0.0` is stage (b), the sparse stage - the default, since the distill
+    /// stage needs its own runs at a high indexer LR (paper 1e-3, indexer
+    /// only) and a trainer-side indexer-only optimizer cell that is QUEUED
+    /// (docs/reviews/msa-reentry-2026-10-02.md).
+    #[serde(default = "d_msa_distill_weight")]
+    pub msa_distill_weight: f32,
+
     // --- ByteFlow (arXiv 2603.03583): the byte-compression architecture arm ---
     /// **Replace the DormouseModel with ByteFlow Net** — the paper's
     /// five-stage hierarchy (local SWA+Canon encoder → coding-rate Top-K
@@ -670,6 +714,21 @@ impl Default for DormouseConfig {
 
 fn d_mhc_streams() -> usize {
     4
+}
+fn d_msa_kb() -> usize {
+    16
+}
+fn d_msa_q_heads() -> usize {
+    4
+}
+fn d_msa_block_r() -> usize {
+    4
+}
+fn d_msa_head_dim() -> usize {
+    32
+}
+fn d_msa_distill_weight() -> f32 {
+    0.0
 }
 fn d_moe_topk() -> usize {
     0

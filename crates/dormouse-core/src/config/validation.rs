@@ -167,6 +167,32 @@ pub fn validate(c: &DormouseConfig) -> Result<(), String> {
             c.moe_lb_coef
         ));
     }
+    // Qwen Sparse Attention (msa): one loud check is the whole point - KB
+    // >= the complete block count of a sequence runs the DENSE arm at a top-k's
+    // price (and burn's argtopk cannot even express k == n, ADR-0015), so it
+    // would be the control wearing the arm's label. Escape: msa_kb below the
+    // block count, or use_msa = false.
+    if c.use_msa {
+        let complete = c.max_seq_len / c.msa_block_r;
+        if c.msa_kb >= complete {
+            return Err(format!(
+                "msa_kb {} >= the {} complete blocks of a {}-token sequence at r = {}: a sparse arm                  over every block IS the dense arm at a top-k's price (and argtopk cannot express                  k == n, ADR-0015). Lower msa_kb below {}, or set use_msa = false.",
+                c.msa_kb, complete, c.max_seq_len, c.msa_block_r, complete
+            ));
+        }
+        if c.msa_kb < 1 {
+            return Err("msa_kb must be >= 1 (an empty selection is a lost arm)".into());
+        }
+        if c.msa_q_heads < 1 || c.msa_head_dim.is_multiple_of(2) == false || c.msa_head_dim < 4 {
+            return Err(format!(
+                "msa_q_heads {} and msa_head_dim {} must be >= 1 / even and >= 4 (the indexer's                  partial RoPE rotates half of an even head width)",
+                c.msa_q_heads, c.msa_head_dim
+            ));
+        }
+        if c.msa_distill_weight < 0.0 {
+            return Err("msa_distill_weight >= 0".into());
+        }
+    }
     // DELIBERATELY NOT a refusal: `moe_topk > 0` with `moe_lb_coef == 0`.
     //
     // The risk is real - Switch §3.3 is the whole reason the term exists, and a

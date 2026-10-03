@@ -984,6 +984,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "burn-msa"
+version = "0.1.0"
+dependencies = [
+ "burn",
+ "burn-autodiff",
+ "burn-cubecl",
+ "burn-cuda",
+ "burn-ndarray",
+ "burn-rope",
+ "burn-tensor",
+ "cubecl",
+]
+
+[[package]]
 name = "burn-muon-plus"
 version = "0.1.0"
 dependencies = [
