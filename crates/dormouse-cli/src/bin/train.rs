@@ -98,6 +98,10 @@ struct Args {
     /// DSpark draft depth K (default: preset, 4).
     #[arg(long)]
     dspark_k: Option<usize>,
+    /// JEPA mask span (default: preset, 8). Each mask start covers `span`
+    /// positions; wider spans give fewer, longer masked runs.
+    #[arg(long)]
+    jepa_span: Option<usize>,
     /// Offline JEPA targets: precomputed teacher-latent sidecar (from
     /// --jepa-precompute). Set = no per-step EMA teacher forward, no EMA
     /// advance.
@@ -246,6 +250,7 @@ fn build_run(a: &Args) -> Result<dormouse_train::RunCfg, String> {
     train.jepa_weight = a.jepa_weight.or(train.jepa_weight);
     train.dspark_weight = a.dspark_weight.or(train.dspark_weight);
     train.dspark_k = a.dspark_k.or(train.dspark_k);
+    train.jepa_mask_span = a.jepa_span.or(train.jepa_mask_span);
     train.jepa_targets = a.jepa_targets.clone().or(train.jepa_targets);
     train.seed = a.seed.unwrap_or(train.seed);
     train.rand_depth |= a.rand_depth;

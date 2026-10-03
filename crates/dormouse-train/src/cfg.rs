@@ -70,6 +70,9 @@ pub fn resolve(preset: &str, set: &[String], mut train: TrainCfg) -> Result<RunC
     if let Some(k) = train.dspark_k {
         model.dspark_k = k;
     }
+    if let Some(s) = train.jepa_mask_span {
+        model.jepa_mask_span = s;
+    }
     // Host-RAM n-gram tables: the in-model table is never READ on that path
     // (the rows arrive pre-gathered, `hashed_ids` is None in both the train
     // and the eval forward), so it must not cost VRAM and per-checkpoint
@@ -327,7 +330,7 @@ mod tests {
         // it is paid ONCE: a new TrainCfg field must be added here, which is
         // exactly the moment the author has to ask "does this belong in the
         // snapshot?" - the question the skip hid.
-        const FIELDS: [&str; 43] = [
+        const FIELDS: [&str; 44] = [
             "steps", "ckpt_every", "log_every", "seq_len", "batch", "lr", "wd",
             "grad_clip", "ckpt_name", "eval_every", "opt", "quant",
             "factors_fallback", "rand_depth", "eval_batches", "eval_depths",
@@ -336,6 +339,7 @@ mod tests {
             "warmup", "quant_check", "timers", "memlog", "bf16", "act_quant",
             "act_group", "max_iter", "no_kda", "no_engram", "byteflow", "jepa_weight",
             "dspark_weight", "dspark_k", "jepa_targets", "seed", "graph_capture", "graph_stage",
+            "jepa_mask_span",
         ];
         // An Option field that is None is omitted by the TOML serializer, so
         // a skipped Option is invisible to the round trip too. Set them.
@@ -351,6 +355,7 @@ mod tests {
                 jepa_weight: Some(0.1),
                 dspark_weight: Some(0.2),
                 dspark_k: Some(3),
+                jepa_mask_span: Some(8),
                 jepa_targets: Some(std::path::PathBuf::from("t.bin")),
                 ..Default::default()
             },

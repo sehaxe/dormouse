@@ -151,6 +151,8 @@ pub struct TrainCfg {
     pub jepa_weight: Option<f32>,
     pub dspark_weight: Option<f32>,
     pub dspark_k: Option<usize>,
+    /// JEPA mask span override; None keeps the preset value (8).
+    pub jepa_mask_span: Option<usize>,
     /// Head-wise Muon for the attention Q/K projections: `Some(n_heads)`
     /// enables the per-head groups (derived from the model config in
     /// `resolve`, ADR-0005).
@@ -204,6 +206,7 @@ impl Default for TrainCfg {
             bf16: None, act_quant: None, act_group: None, max_iter: None,
             no_kda: false, no_engram: false, byteflow: false,
             jepa_weight: None, dspark_weight: None, dspark_k: None,
+            jepa_mask_span: None,
             qk_heads: None, jepa_targets: None,
             seed: 1,
             graph_capture: false,
