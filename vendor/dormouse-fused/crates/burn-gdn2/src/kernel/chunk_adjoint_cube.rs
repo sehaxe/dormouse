@@ -34,15 +34,15 @@ fn gdn2_chunk_intra_adjoint_kernel<F: Float>(
     wg_buf: &[F],   // [nblk, C, V]
     s_before: &[F], // [nblk, K, V]
     d_v_new: &[F],  // [nblk, C, V]  BK2 output (incl. BPTT part)
-    d_k_bptt: &[F], // [nblk, C, K]  BK2 output
-    d_e_bptt: &[F], // [nblk, C, K]  BK2 output (d_e_decay)
-    d_e_last: &[F], // [nblk, K]     BK2 output
     d_q: &mut [F],  // [nblk, C, K]
     d_k: &mut [F],  // [nblk, C, K]
     d_b: &mut [F],  // [nblk, C, K]
     d_g: &mut [F],  // [nblk, C, K]
     d_v: &mut [F],  // [nblk, C, V]
     d_w: &mut [F],  // [nblk, C, V]
+    glast: &[F],    // [nblk, K]     forward export
+    d_s: &[F],      // [nblk, K, V]  BK2 state adjoint per chunk
+    nt: u32,        // chunks per (batch,head); locates the next chunk
     scale: f32,
     #[comptime] chunk_c: u32,
     #[comptime] k_dim: u32,
@@ -67,6 +67,9 @@ fn gdn2_chunk_intra_adjoint_kernel<F: Float>(
     let mut d_rhs_v_sh = Shared::<[F]>::new_slice(c * vd);
     let mut d_akk_sh = Shared::<[F]>::new_slice(c * c);
     let mut d_e_sh = Shared::<[F]>::new_slice(c * kd);
+    // d_hat[r][k]·k[r][k]/E[r][k] staged so the reverse-cumsum d_g can add the
+    // d_e_last term (see 5) without a second pass over global memory.
+    let mut d_elpart_sh = Shared::<[F]>::new_slice(c * kd);
 
     if r < c {
         // 1) d_qk row: d_aqk[r][s]·scale·causal, stage the full d_qk.
@@ -175,8 +178,25 @@ fn gdn2_chunk_intra_adjoint_kernel<F: Float>(
             let d_k_g = d_kg_sh[r * kd + k] + kg2;
             let d_bk = (d_rhs_k + bk_e) * e;
 
+            // BPTT terms, folded in here (they were tensor-op glue in the
+            // wrapper). d_hat[r][k] = Σ_v v_new[r][v]·dS_acc_next[k][v];
+            // the next chunk's state adjoint is zero past the last chunk.
+            let has_next = (block as u32) % nt + 1 < nt;
+            let mut dh = F::new(0.0_f32);
+            if has_next {
+                let nb = (block + 1) * kd * vd;
+                for vv in 0..vd {
+                    dh += v_new[vb + r * vd + vv]
+                        * d_s[nb + k * vd + vv];
+                }
+            }
+            let decay = glast[block * kd + k] / e;
+            let d_k_bptt_val = dh * decay;
+            let d_e_bptt_val = -(dh * kk * decay) / e;
+            d_elpart_sh[r * kd + k] = dh * kk / e;
+
             d_q[kb + r * kd + k] = d_qe_k * e;
-            d_k[kb + r * kd + k] = d_bk * bb + d_k_g / e + d_k_bptt[kb + r * kd + k];
+            d_k[kb + r * kd + k] = d_bk * bb + d_k_g / e + d_k_bptt_val;
             d_b[kb + r * kd + k] = d_bk * kk;
 
             let e_rhsk = d_rhs_k * bk;
@@ -185,13 +205,8 @@ fn gdn2_chunk_intra_adjoint_kernel<F: Float>(
             let q_val = qgt[(block * kd + k) * c + r] / e;
             let e_qe = d_qe_k * q_val;
             let e_bke = bk_e * bk;
-            d_e_sh[r * kd + k] = e_rhsk + e_kg + e_qe + e_bke + d_e_bptt[kb + r * kd + k];
+            d_e_sh[r * kd + k] = e_rhsk + e_kg + e_qe + e_bke + d_e_bptt_val;
             d_kg_sh[r * kd + k] = d_k_g;
-        }
-        if r == c - 1 {
-            for k in 0..kd {
-                d_e_sh[r * kd + k] += d_e_last[block * kd + k];
-            }
         }
         for vv in 0..vd {
             let d_rhs_v = d_rhs_v_sh[r * vd + vv];
@@ -201,7 +216,11 @@ fn gdn2_chunk_intra_adjoint_kernel<F: Float>(
         sync_cube();
 
         // 5) d_g row: reverse cumsum over t of d_e[t][k]·E[t][k], t = r..c.
+        // The d_e value at row c-1 carries d_e_last[k] (folded in here from
+        // the staged partials and the state-adjoint·s_before term); it enters
+        // the cumsum through the same E-weighted product.
         if r < c {
+            let has_next = (block as u32) % nt + 1 < nt;
             for k in 0..kd {
                 let mut acc = F::new(0.0_f32);
                 let mut t = r;
@@ -209,6 +228,19 @@ fn gdn2_chunk_intra_adjoint_kernel<F: Float>(
                     acc += d_e_sh[t * kd + k] * gexp[kb + t * kd + k];
                     t += 1;
                 }
+                let mut d_el = F::new(0.0_f32);
+                let mut rp = 0;
+                while rp < c {
+                    d_el += d_elpart_sh[rp * kd + k];
+                    rp += 1;
+                }
+                if has_next {
+                    let nb = (block + 1) * kd * vd;
+                    for vv in 0..vd {
+                        d_el += d_s[nb + k * vd + vv] * s_before[sb + k * vd + vv];
+                    }
+                }
+                acc += d_el * gexp[kb + (c - 1) * kd + k];
                 d_g[kb + r * kd + k] = acc;
             }
         }
@@ -494,15 +526,13 @@ pub mod cuda {
         let u_c = cube_of::<B, 3>(&fwd.u)?;
         let client = m_inv_c.client.clone();
 
-        // output buffers
-        let mk3 = |shape: [usize; 3]| -> Tensor<3> { Tensor::<3>::zeros(shape, &device) };
-        let mk4 = |shape: [usize; 4]| -> Tensor<4> { Tensor::<4>::zeros(shape, &device) };
+        // output buffers: every one is fully overwritten by the BK2/BK1
+        // kernels, so `empty` — the `zeros` fill was pure dead work per call.
+        let mk3 = |shape: [usize; 3]| -> Tensor<3> { Tensor::<3>::empty(shape, &device) };
+        let mk4 = |shape: [usize; 4]| -> Tensor<4> { Tensor::<4>::empty(shape, &device) };
         let d_v_new = mk3([nblk, c, v_dim]);
         let d_s_flat = mk3([nblk, k_dim, v_dim]);
 
-        let d_k_bptt = mk3([nblk, c, k_dim]);
-        let d_e_bptt = mk3([nblk, c, k_dim]);
-        let d_e_last = Tensor::<2>::empty([nblk, k_dim], &device);
         let d_q = mk4([batch, heads, time, k_dim]);
         let d_k = mk4([batch, heads, time, k_dim]);
         let d_b = mk4([batch, heads, time, k_dim]);
@@ -513,9 +543,6 @@ pub mod cuda {
 
         let d_v_new_c = cube_of::<B, 3>(&d_v_new).expect("backend mismatch");
         let d_s_c = cube_of::<B, 3>(&d_s_flat).expect("backend mismatch");
-        let d_k_bptt_c = cube_of::<B, 3>(&d_k_bptt).expect("backend mismatch");
-        let d_e_bptt_c = cube_of::<B, 3>(&d_e_bptt).expect("backend mismatch");
-        let d_e_last_c = cube_of::<B, 2>(&d_e_last).expect("backend mismatch");
         let d_q_c = cube_of::<B, 4>(&d_q).expect("backend mismatch");
         let d_k_c = cube_of::<B, 4>(&d_k).expect("backend mismatch");
         let d_b_c = cube_of::<B, 4>(&d_b).expect("backend mismatch");
@@ -536,22 +563,6 @@ pub mod cuda {
             ("bwd:d_v", crate::alloc_trace::bytes_of(&d_v)),
             ("bwd:d_w", crate::alloc_trace::bytes_of(&d_w)),
             ("bwd:d_s", crate::alloc_trace::bytes_of(&d_s)),
-        ] {
-            crate::alloc_trace::note(l, b);
-        }
-        for (l, b) in [
-            (
-                "bwd:d_k_bptt (discarded)",
-                crate::alloc_trace::bytes_of(&d_k_bptt),
-            ),
-            (
-                "bwd:d_e_bptt (discarded)",
-                crate::alloc_trace::bytes_of(&d_e_bptt),
-            ),
-            (
-                "bwd:d_e_last (discarded)",
-                crate::alloc_trace::bytes_of(&d_e_last),
-            ),
         ] {
             crate::alloc_trace::note(l, b);
         }
@@ -604,87 +615,9 @@ pub mod cuda {
             );
         }
 
-        // E = exp(cumsum(g)) exported by the forward kernel (no 0/0).
-        let k_r = k.clone().reshape([batch, heads, nt, c, k_dim]);
-        let e_full = fwd.gexp.clone().reshape([batch, heads, nt, c, k_dim]);
-        let v_new_r = fwd.v_new.clone().reshape([batch, heads, nt, c, v_dim]);
-        let d_s_r = d_s_flat.clone().reshape([batch, heads, nt, k_dim, v_dim]);
-        // d_K̂[i] = v_new[i]·dSacc(i+1)^T — the state adjoint AFTER chunk i
-        // (the shifted chain); the last chunk's dSacc is zero.
-        let d_s_shift = Tensor::cat(
-            vec![
-                d_s_r
-                    .clone()
-                    .slice([0..batch, 0..heads, 1..nt, 0..k_dim, 0..v_dim]),
-                Tensor::<5>::zeros([batch, heads, 1, k_dim, v_dim], &device),
-            ],
-            2,
-        );
-        // batched [c,v]@[v,k] over b1 = B·H·nt (explicit 3D: the 5D matmul
-        // path reshapes internally in a way that breaks non-contiguous RHS).
-        let b1 = batch * heads * nt;
-        //
-        // The contraction is over V, and `d_s` is stored [k][v], so the last
-        // two dims must be SWAPPED. `reshape` does not move elements — it
-        // reinterprets the buffer — so the old `reshape([b1, v_dim, k_dim])`
-        // contracted over K instead: d_k was off by rel 3.3e-1 and d_g by
-        // 6.2e-1 on a 4-chunk sequence, while every single-chunk case passed
-        // (d_s_shift is all zeros when there is no chunk to carry, so the bad
-        // contraction evaluated to nothing). Measured 2026-09-28 on CUDA
-        // against burn's autograd over the ops path; see
-        // `tests/fused_adjoint_vs_ops.rs`. `* 1.0` materializes the transposed
-        // view once, the same trick `forward.rs` uses on the permuted module
-        // inputs.
-        let v_new_3 = v_new_r.clone().reshape([b1, c, v_dim]);
-        let d_s_3 = d_s_shift
-            .clone()
-            .reshape([b1, k_dim, v_dim])
-            .swap_dims(1, 2)
-            * 1.0;
-        let d_hat = v_new_3.matmul(d_s_3).reshape([batch, heads, nt, c, k_dim]); // [B,H,nt,c,k]
-        let decay = fwd
-            .glast
-            .clone()
-            .reshape([batch, heads, nt, 1, k_dim])
-            .repeat(&[1, 1, 1, c, 1])
-            .div(e_full.clone());
-        let d_k_bptt_r = d_hat.clone() * decay.clone();
-        let d_decay = d_hat * k_r.clone();
-        let d_e_bptt_r = -(d_decay.clone() * decay.clone()) / e_full.clone();
-        let d_e_last_3 = (d_decay.clone() / e_full.clone()).reshape([b1, c, k_dim]);
-        let d_e_last_2 = d_e_last_3.sum_dim(1);
-        let d_e_last_r = d_e_last_2.reshape([batch, heads, nt, k_dim])
-            + d_s_shift
-                .clone()
-                .mul(fwd.states.clone().reshape([batch, heads, nt, k_dim, v_dim]))
-                .reshape([b1, k_dim, v_dim])
-                .sum_dim(2)
-                .reshape([batch, heads, nt, k_dim]);
-
-        // push the glue results into the flat buffers
-        let d_k_bptt_flat = d_k_bptt_r.reshape([nblk, c, k_dim]);
-        let d_e_bptt_flat = d_e_bptt_r.reshape([nblk, c, k_dim]);
-        let d_e_last_flat = d_e_last_r.reshape([nblk, k_dim]);
-        let _ = d_k_bptt;
-        let _ = d_e_bptt;
-        let _ = d_e_last;
-        let d_k_bptt = d_k_bptt_flat;
-        let d_e_bptt = d_e_bptt_flat;
-        let d_e_last = d_e_last_flat;
-        let d_k_bptt_c2 = cube_of::<B, 3>(&d_k_bptt).expect("backend mismatch");
-        let d_e_bptt_c2 = cube_of::<B, 3>(&d_e_bptt).expect("backend mismatch");
-        let d_e_last_c2 = cube_of::<B, 2>(&d_e_last).expect("backend mismatch");
-        let _ = d_k_bptt_c;
-        let _ = d_e_bptt_c;
-        let _ = d_e_last_c;
-
-        let e_flat = e_full.clone().reshape([nblk, c, k_dim]);
-        let e_flat_c = cube_of::<B, 3>(&e_flat).expect("backend mismatch");
-        // BK1: the token-parallel intra-chunk adjoint.
-        // Materialize d_v_new: the output buffers share the allocator's
-        // address space and can alias the BK2 scratch buffer otherwise.
-        let d_v_new_fresh = d_v_new.clone().mul_scalar(1.0);
-        let d_v_new_fresh_c = cube_of::<B, 3>(&d_v_new_fresh).expect("backend mismatch");
+        // BK1: the token-parallel intra-chunk adjoint, including the BPTT
+        // k/e terms (folded in: they used to be ~14 tensor-op launches of
+        // glue, plus a full-trajectory cat, per call).
         let cube_dim1 = CubeDim::new_3d(c as u32, 8, 1);
         let cube_count1 = CubeCount::Static(nblk as u32, 1, 1);
         unsafe {
@@ -704,16 +637,16 @@ pub mod cuda {
                 BufferArg::from_raw_parts(v_c.handle, nblk * c * v_dim),
                 BufferArg::from_raw_parts(wg_c.handle, nblk * c * v_dim),
                 BufferArg::from_raw_parts(states_c.handle, nblk * k_dim * v_dim),
-                BufferArg::from_raw_parts(d_v_new_fresh_c.handle, nblk * c * v_dim),
-                BufferArg::from_raw_parts(d_k_bptt_c2.handle, nblk * c * k_dim),
-                BufferArg::from_raw_parts(d_e_bptt_c2.handle, nblk * c * k_dim),
-                BufferArg::from_raw_parts(d_e_last_c2.handle, nblk * k_dim),
+                BufferArg::from_raw_parts(d_v_new_c.handle, nblk * c * v_dim),
                 BufferArg::from_raw_parts(d_q_c.handle, nblk * c * k_dim),
                 BufferArg::from_raw_parts(d_k_c.handle, nblk * c * k_dim),
                 BufferArg::from_raw_parts(d_b_c.handle, nblk * c * k_dim),
                 BufferArg::from_raw_parts(d_g_c.handle, nblk * c * k_dim),
                 BufferArg::from_raw_parts(d_v_c.handle, nblk * c * v_dim),
                 BufferArg::from_raw_parts(d_w_c.handle, nblk * c * v_dim),
+                BufferArg::from_raw_parts(glast_c.handle.clone(), nblk * k_dim),
+                BufferArg::from_raw_parts(d_s_c.handle.clone(), nblk * k_dim * v_dim),
+                nt as u32,
                 scale as f32,
                 c as u32,
                 k_dim as u32,
