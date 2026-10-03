@@ -526,9 +526,23 @@ impl DormouseModel {
         // `z` and the boundaries stay fixed by the coding rate.
         let (h, z, sel) = bf.net.encode_chunks(input_ids, bf.k);
         let x = bf.in_proj.forward(z); // [b, k, d_model]
+        // `loss_mask` is `None`, and this line is where a merge dropped one.
+        // Two lanes landed on `forward_full_state` at once: the SFT lane added
+        // the `loss_mask` parameter (`0953a79`) and the byteflow lane added
+        // this call site (`48ef9ae`); the merge took the new signature and the
+        // old arity, so `cargo check -p dormouse-core` was RED on `main` at
+        // `146df4c`. The argument is honestly `None` rather than a plumbed
+        // value because THIS FUNCTION has no mask to pass - `forward_channel`
+        // takes only `(input_ids, targets)`.
+        //
+        // That is a real, still-open gap and it is NOT fixed here: an SFT run
+        // with `use_byteflow` would score every position, ignoring the mask.
+        // Closing it means a parameter through `forward_channel` and its three
+        // callers, which is the SFT lane's file. Owed, and named in
+        // docs/reviews/moe-dev-2026-10-03.md.
         let (out_acc, _loop_rec, kda, _route) =
             self.loop_block
-                .forward_full_state::<B>(x, None, None, None, None, &self.lm_head);
+                .forward_full_state::<B>(x, None, None, None, None, None, &self.lm_head);
         // Back stage: K latents → T byte positions, then the decoder blocks
         // and the byte head.
         let g = bf.out_proj.forward(out_acc); // [b, k, d_global]
