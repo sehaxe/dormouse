@@ -61,17 +61,20 @@ fn one_step_trains_and_saves_through_the_real_entry() {
 
 #[test]
 fn a_preset_arm_conflict_is_refused_loudly() {
-    // `--byteflow` on a preset that turns a dormouse arm on: validate must
-    // refuse with the flag named, not train a model the config does not
-    // describe (this is WHY the preset keeps every dormouse arm off).
+    // `use_byteflow` with a dormouse arm on that the channel does not read:
+    // validate must refuse with the flags named, not train a model the config
+    // does not describe (this is WHY the byteflow presets keep every dormouse
+    // arm off). `small` turns Engram on, and Engram is the first arm in the
+    // refusal list — `use_kda` is NOT in it any more, it is the one pair the
+    // compat channel admits (lane bf-compat, crates/dormouse-core/src/bf.rs).
     let err = resolve(
         "small",
         &["use_byteflow=true".to_string()],
         TrainCfg::default(),
     )
-    .expect_err("use_byteflow with use_kda/use_engram must be refused");
+    .expect_err("use_byteflow with use_engram must be refused");
     assert!(
-        err.contains("use_byteflow") && err.contains("use_kda"),
+        err.contains("use_byteflow") && err.contains("use_engram"),
         "unexpected error: {err}"
     );
 }

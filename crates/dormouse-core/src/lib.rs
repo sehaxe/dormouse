@@ -54,6 +54,7 @@
 pub mod act_quant;
 pub mod attention;
 pub mod aux;
+pub mod bf;
 pub mod config;
 #[cfg(test)]
 mod dspark_oracle;

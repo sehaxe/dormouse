@@ -1,5 +1,10 @@
 # dormouse preset: p150 - the 150M-program flagship (see docs/architecture/PLAN.md).
 # Overrides only; missing keys = schema defaults (== small). Flat per ADR-0005.
+# The one exception is use_byteflow: the schema default flipped to the winning
+# byteflow net on 2026-10-02, so a dormouse preset must carry `false`
+# explicitly (every other one does; small.toml:2-11). Without it this preset
+# validated against the byteflow refusal block and `preset_exec` went red.
+use_byteflow = false
 d_model = 4096
 n_heads = 64
 head_dim = 64

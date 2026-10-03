@@ -126,11 +126,17 @@ pub const MSA: usize = 19;
 /// eval line (the sparse core contributes nothing there) and `msa_distill`
 /// non-zero; a stage-(b) run the reverse.
 pub const MSA_DISTILL: usize = 20;
+/// The ByteFlow compat channel (`use_byteflow` + `use_kda`, `bf.rs`) ran its
+/// front/back stages around the loop. COUNTED, and the delta over the eval's
+/// own forwards is what the eval line prints: `bf=0` on a run whose config
+/// says `use_byteflow` is exactly the §3.2 shape — an eval that scored a
+/// different network than the one being trained.
+pub const BF_CHANNEL: usize = 21;
 /// How many arms [`NAMES`] and the counter array hold. **Adding an arm means
 /// bumping this**, and the array is `[Cell<u64>; N_ARMS]`, so the compiler
 /// refuses a `NAMES` entry that does not fit — an arm cannot be named without
 /// being countable.
-pub const N_ARMS: usize = 21;
+pub const N_ARMS: usize = 22;
 /// Arm name per index, for assertion messages that name the thing.
 pub const NAMES: [&str; N_ARMS] = [
     "iterations",
@@ -154,6 +160,7 @@ pub const NAMES: [&str; N_ARMS] = [
     "situ",
     "msa",
     "msa_distill",
+    "byteflow_channel",
 ];
 
 thread_local! {

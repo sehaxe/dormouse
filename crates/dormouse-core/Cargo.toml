@@ -43,6 +43,11 @@ burn-situ = { path = "../../vendor/dormouse-fused/crates/burn-situ" }
 # the fused gather kernel of stage (b) is QUEUED and must reproduce gate 1
 # (`burn-msa/tests/gate1_dense_contract.rs`) bit-near before it is believed.
 burn-msa = { path = "../../vendor/dormouse-fused/crates/burn-msa" }
+# The ByteFlow × dormouse compat channel (`use_byteflow` + `use_kda`): the
+# crate's front/back stages wrap the dormouse loop (crates/dormouse-core/src/
+# bf.rs). The net's own forward is not called on that path; the split seam
+# (`encode_chunks`/`decode_chunks`) is, and its own gates pin it.
+burn-byteflow = { path = "../../vendor/dormouse-fused/crates/burn-byteflow" }
 serde = { workspace = true, features = ["derive"] }
 toml = { workspace = true }
 

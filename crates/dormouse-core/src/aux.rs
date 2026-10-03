@@ -448,6 +448,13 @@ mod tests {
             max_seq_len: 64,
             use_kda: false,
             use_tsct: false,
+            // The byte-level path, not the patch channel: the schema default
+            // flipped to `use_byteflow = true` on 2026-10-02 and the channel
+            // arms whenever `bf::compat_armed` says so — with `use_engram`
+            // defaulting on, this config would arm it and `forward_channel`
+            // would refuse the DSpark weight below (it carries no aux heads).
+            // Same one-liner `loop_block.rs`'s test configs carry.
+            use_byteflow: false,
             engram_rows: 1024,
             dspark_stride: 8,
             // DSpark is OFF in every shipped preset as of 2026-09-29 (DeepSeek's
