@@ -1305,6 +1305,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "burn-msa"
+version = "0.1.0"
+dependencies = [
+ "burn",
+ "burn-rope",
+ "burn-tensor",
+]
+
+[[package]]
 name = "burn-muon-plus"
 version = "0.1.0"
 dependencies = [
@@ -1403,6 +1412,14 @@ dependencies = [
  "burn-backend",
  "burn-cubecl",
  "cubecl",
+]
+
+[[package]]
+name = "burn-rope"
+version = "0.2.0"
+dependencies = [
+ "burn",
+ "burn-tensor",
 ]
 
 [[package]]
@@ -2913,6 +2930,7 @@ dependencies = [
  "burn-kda",
  "burn-mhc",
  "burn-mor",
+ "burn-msa",
  "burn-rmsnorm",
  "burn-situ",
  "burn-spectral",

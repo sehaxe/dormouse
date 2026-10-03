@@ -135,6 +135,9 @@ pub struct RouteAux {
     /// The sparse-routing load-balancing term (`moe::lb_aux`), UNSCALED and
     /// averaged over the iterations that ran. `None` unless `moe_topk > 0`.
     pub moe_lb: Option<Tensor<1>>,
+    /// The MSA distillation KL (tech report Eq. 18), UNSCALED, averaged over
+    /// the iterations that ran. `None` unless the MSA stage ran stage (a).
+    pub msa_distill: Option<Tensor<1>>,
 }
 
 impl ExpertFFN {
@@ -293,6 +296,10 @@ pub struct LoopBlock {
     /// AdamW by the optimizer policy - routers are not Muon+ candidates);
     /// `use_mor` decides whether it is read.
     pub mor_router: MoRRouter,
+    /// Qwen Sparse Attention stage (tech report §QSA): an EXTRA full-softmax
+    /// attention per iteration, off by default (`use_msa`). See
+    /// [`crate::msa_stage`] for the placement decision and the two stages.
+    pub msa: Option<crate::msa_stage::MsaStage>,
     /// Loop depth, copied from the config so the forward does not have to be
     /// handed the config. Changing it after construction does NOT resize
     /// `iter_embed` or the `attnres` slot vector, so it is a config-time
@@ -352,6 +359,11 @@ pub struct LoopBlock {
     /// mean readout is the default path.
     #[module(skip)]
     pub use_mor: bool,
+    /// MSA stage switch: `false` = the loop never reaches the arm (and the
+    /// parameters do not exist - `Option`-shaped, unlike the Engram's
+    /// always-built tables).
+    #[module(skip)]
+    pub use_msa: bool,
     /// Selected iteration slots per position under MoR (>= 1, see
     /// `mor::route`). Ignored when `use_mor` is off.
     #[module(skip)]
@@ -521,6 +533,23 @@ impl LoopBlock {
             residual_scale: burn::module::Param::from_tensor(Tensor::ones([1], device)),
             out_proj: LinearLike::with_tsct(d, d, cfg.rank, cfg.use_tsct, device),
             mor_router: MoRRouter::new(d, device),
+            msa: match cfg.use_msa {
+                true => {
+                    let indexer = burn_msa::IndexerModule::new(
+                        burn_msa::IndexerConfig {
+                            d_model: d,
+                            q_heads: cfg.msa_q_heads,
+                            head_dim: cfg.msa_head_dim,
+                            block_r: cfg.msa_block_r,
+                            rope_frac: cfg.msa_head_dim / 2,
+                            max_seq_len: cfg.max_seq_len,
+                        },
+                        device,
+                    );
+                    Some(crate::msa_stage::MsaStage::new(cfg, indexer, device))
+                }
+                false => None,
+            },
             max_iter: cfg.max_iter,
             d_model: d,
             ffn_hidden: f,
@@ -532,6 +561,7 @@ impl LoopBlock {
             use_mhc: cfg.use_mhc,
             use_situ: cfg.use_situ,
             use_mor: cfg.use_mor,
+            use_msa: cfg.use_msa,
             mor_k: cfg.mor_k,
             moe_topk: cfg.moe_topk,
             engram_slot_mask: mask,
@@ -701,9 +731,14 @@ impl LoopBlock {
         // score, output and CE are collected here and combined after the loop
         // (the top-k cannot be known before the last score exists).
         let use_mor = self.use_mor;
-        let mut slot_scores: Vec<Tensor<3>> = Vec::with_capacity(iters);
+        let use_msa = self.use_msa;
+        // The MSA stage's distillation KL, one per EXECUTED iteration,
+        // averaged below like every other per-iteration quantity.
+        let mut msa_terms: Vec<Tensor<1>> = Vec::with_capacity(iters);
         let mut step_outs: Vec<Tensor<3>> = Vec::with_capacity(iters);
         let mut ce_terms: Vec<Tensor<2>> = Vec::with_capacity(iters);
+        // MoR's per-slot scores (arXiv 2507.10524's router).
+        let mut slot_scores: Vec<Tensor<3>> = Vec::with_capacity(iters);
         // One load-balancing term per executed iteration, averaged below. Empty
         // when `moe_topk == 0`, which is how the off-arm gets `None` rather
         // than a zero that a caller would have to guess the meaning of.
@@ -928,6 +963,22 @@ impl LoopBlock {
                 Tensor::zeros([b * t, d], &h.device())
             };
 
+            // Qwen Sparse Attention (tech report §QSA): the stage's OWN
+            // multi-head softmax attention over the same block-body input,
+            // dense (teacher) in stage (a), micro-block masked in stage (b);
+            // the distill KL rides out unscaled on the aux seam. Zero on the
+            // off arm, so the residual assembly below is untouched.
+            let (msa_out, _msa_dl) = match (use_msa, &self.msa) {
+                (true, Some(msa)) => {
+                    let m = msa.forward::<B>(normed_attn.clone());
+                    if let Some(dl) = m.distill {
+                        msa_terms.push(dl);
+                    }
+                    (m.output, ())
+                }
+                _ => (Tensor::zeros([b, t, d], &h.device()), ()),
+            };
+
             // Expert FFN: softmax blend of n_experts TSCT gate_up/silu/down.
             // `use_situ` swaps the elementwise SiLU for SiTU-GLU
             // (arXiv:2607.24653v2 Eq 12), which is why `gate_up` is `d -> 2f`
@@ -961,7 +1012,10 @@ impl LoopBlock {
             // These are four spellings of ONE statement - how iteration n's
             // block-body output joins the residual stream - and
             // `config::validate` refuses the pairs that cannot both run.
-            let y = attn.reshape([b, t, d]) + engram_a.reshape([b, t, d]) + ffn;
+            let y = attn.reshape([b, t, d])
+                + engram_a.reshape([b, t, d])
+                + ffn
+                + msa_out.reshape([b, t, d]);
             if use_attnres {
                 crate::probe::note(crate::probe::ATTNRES);
                 // Eq. 1/3/4: sources are the token embedding `b_0 = h_1` plus
@@ -1141,6 +1195,15 @@ impl LoopBlock {
             RouteAux {
                 mor: mor_aux,
                 moe_lb,
+                msa_distill: if msa_terms.is_empty() {
+                    None
+                } else {
+                    let mut acc = msa_terms[0].clone();
+                    for t in &msa_terms[1..] {
+                        acc = acc + t.clone();
+                    }
+                    Some(acc.div_scalar(msa_terms.len() as f32))
+                },
             },
         )
     }

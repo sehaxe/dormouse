@@ -14,6 +14,7 @@ members = [
     "crates/burn-swiglu",
     "crates/burn-byteflow",
     "crates/burn-mor",
+    "crates/burn-msa",
     "crates/burn-dspark",
     "crates/burn-parcae",
     "crates/burn-jepa",

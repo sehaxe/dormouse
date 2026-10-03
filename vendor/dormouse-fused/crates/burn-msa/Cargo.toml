@@ -1,0 +1,34 @@
+[package]
+name = "burn-msa"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Qwen Sparse Attention (QSA) re-entry for dormouse: compressed block indexer + gathered-block sparse core attention"
+keywords = ["burn", "sparse-attention", "indexer", "topk", "block"]
+readme = "README.md"
+repository = "https://github.com/sehaxe/dormouse"
+
+[features]
+default = ["std"]
+std = ["burn/std", "burn-tensor/std", "burn/cpu"]
+cuda = ["dep:burn-cuda", "dep:burn-cubecl", "dep:cubecl", "burn/cuda", "burn-tensor/cuda"]
+autodiff = ["burn/autodiff", "burn-tensor/std", "dep:burn-autodiff"]
+
+[dependencies]
+burn = { workspace = true, features = ["std", "extension"] }
+burn-tensor = { workspace = true }
+burn-rope = { path = "../burn-rope" }
+burn-autodiff = { workspace = true, optional = true, features = ["std"] }
+burn-cuda = { workspace = true, optional = true }
+burn-cubecl = { workspace = true, optional = true }
+cubecl = { workspace = true, optional = true, features = ["std"] }
+
+[dev-dependencies]
+burn-ndarray = { workspace = true, features = ["blas-openblas"] }
+burn-autodiff = { workspace = true, features = ["std"] }
+burn-cuda = { workspace = true }
+burn = { workspace = true, features = ["ndarray", "autodiff", "cuda", "extension", "optim"] }
+
+[[test]]
+name = "gate1_cuda"
+required-features = ["cuda"]

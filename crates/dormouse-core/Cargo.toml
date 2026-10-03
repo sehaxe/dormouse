@@ -37,6 +37,12 @@ burn-attnres = { path = "../../vendor/dormouse-fused/crates/burn-attnres" }
 # CUDA gate that compares the fused output to the tensor path first; see
 # docs/reviews/situ-2026-09-30.md §7.
 burn-situ = { path = "../../vendor/dormouse-fused/crates/burn-situ" }
+# Qwen Sparse Attention (tech report §QSA): the compressed MQA block indexer +
+# the micro-block masked sparse softmax attention arm, off by default
+# (`use_msa`). DEFAULT FEATURES ONLY - the tensor path is the reference form;
+# the fused gather kernel of stage (b) is QUEUED and must reproduce gate 1
+# (`burn-msa/tests/gate1_dense_contract.rs`) bit-near before it is believed.
+burn-msa = { path = "../../vendor/dormouse-fused/crates/burn-msa" }
 serde = { workspace = true, features = ["derive"] }
 toml = { workspace = true }
 
