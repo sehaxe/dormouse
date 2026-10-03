@@ -1,0 +1,75 @@
+# COMPAT CHANNEL preset (lane bf-compat, docs/reviews/bf-compat-2026-10-03.md).
+#
+# `use_byteflow = true` + `use_kda = true` does NOT replace the model: the
+# trainer dispatches to the channel (crates/dormouse-core/src/bf.rs), where
+# ByteFlow's front stage packs the 512-byte window into 128 patch latents,
+# the dormouse loop runs KDA over those 128 positions, and ByteFlow's
+# back stage lifts the K outputs to 512 byte positions. Every OTHER dormouse
+# arm stays refused (config::validate), every aux weight must be 0, and
+# byteflow::check's train-side flags (`--bf16`, `--engram-ram`, `--rand-depth`,
+# `--eval-depths`, `--stress`, `--graph-capture`, `--opt` outside
+# {adamw, mix}) stay refused too. This file is `byteflow.toml` with the one
+# lifted pair flipped; the byteflow_* numbers are the byteflow_9m shape
+# (docs/reviews/byteflow-rate-2026-10-02.md §5), UNCHANGED.
+#
+# `byteflow_g_layers` is a STANDALONE-net knob: the channel builds that stage
+# empty by construction (`BfChannel::new`), because the dormouse loop IS the
+# global stage. It is carried here at the byteflow_9m value so a `--set
+# use_kda=false` runs the real standalone arm; the step-0 arm line prints
+# `byteflow_g_layers replaced by the loop` for the path that actually ran.
+bf16 = false
+act_group = 0
+d_model = 768
+n_heads = 12
+head_dim = 64
+d_ffn = 2048
+vocab = 256
+max_seq_len = 512
+max_iter = 4
+rank = 64
+norm_eps = 0.001
+# THE LIFTED PAIR: the patch channel runs the loop with KDA as its only
+# attention arm.
+use_kda = true
+# ... and everything else, still refused by validate with use_byteflow:
+use_engram = false
+use_gr = false
+use_attnres = false
+use_mhc = false
+use_situ = false
+use_mor = false
+use_msa = false
+n_experts = 3
+moe_topk = 0
+# ... every aux weight 0 (the channel carries no aux heads):
+jepa_weight = 0.0
+jepa_mask_frac = 0.15
+jepa_mask_span = 8
+dspark_weight = 0.0
+dspark_k = 4
+dspark_stride = 16
+aux_fb_weight = 0.0
+aux_fb_horizon = 2
+mor_bce_weight = 0.0
+# Dormouse memory knobs the channel does not read (use_engram is off):
+engram_rows = 25000
+engram_orders = [2, 3, 4]
+engram_dim = 32
+engram_lam_max = 0.5
+mor_k = 2
+# --- the byteflow side (byteflow_9m, unchanged) ---
+use_byteflow = true
+byteflow_d_local = 96
+byteflow_d_global = 768
+byteflow_k_tokens = 128
+byteflow_e_layers = 2
+byteflow_g_layers = 2
+byteflow_heads_local = 4
+byteflow_heads_global = 8
+byteflow_w_local = 256
+byteflow_d_ff_local = 256
+byteflow_d_ff_global = 2048
+byteflow_bins = 16
+byteflow_eps2 = 0.5
+byteflow_logdet = false
+byteflow_max_bytes = 512

@@ -74,11 +74,16 @@ fn preset(name: &str) -> DormouseConfig {
 /// The preset with its WIDTHS shrunk. Everything that decides what executes
 /// (arms, depth, expert count, aux weights, quant format, MoR, GR) is the
 /// preset's own value; only `d_model`/`n_heads`/`head_dim`/`d_ffn`/`rank`/
-/// `max_seq_len` and the n-gram table capacity shrink - the last two because
-/// a real table is megabytes per row and a 2048-token sequence is minutes of
-/// ndarray. The shrunk fields are asserted equal in
-/// `the_fixture_only_shrinks_widths` below; do not add a new shrunk field
-/// without adding it there.
+/// `max_seq_len`, the n-gram table capacity and — for a byteflow preset —
+/// `byteflow_k_tokens` shrink.
+///
+/// The first group is what [`execution_fields`] forbids touching, and it is
+/// deliberately a list of ARM switches. `byteflow_k_tokens` is not on it: it
+/// is a capacity, in the same class as `max_seq_len` (the chunker asserts
+/// `K <= T` in `encode_chunks`, the fixture's window is `SEQ` = 32 bytes, and
+/// the preset ships K = 128 for a 512-byte window), and shrinking it does not
+/// decide which mechanism runs. Do not add an arm switch here — add it to
+/// `execution_fields`, or the fixture stops being the preset.
 fn fixture(c: &DormouseConfig) -> DormouseConfig {
     DormouseConfig {
         d_model: 64,
@@ -88,6 +93,11 @@ fn fixture(c: &DormouseConfig) -> DormouseConfig {
         rank: 16,
         max_seq_len: 64,
         engram_rows: 512,
+        byteflow_k_tokens: if c.use_byteflow {
+            8
+        } else {
+            c.byteflow_k_tokens
+        },
         ..c.clone()
     }
 }
@@ -215,6 +225,24 @@ fn executes(name: &str) {
     // per executed iteration: a top-k that could not fill computes the dense
     // blend, so the arm trains the control while its config says otherwise.
     arm(fx.moe_topk > 0, probe::MOE_ROUTE);
+    // THE COMPAT CHANNEL: entered iff the model BUILT one. The condition is
+    // `compat_armed` and not `use_byteflow`, because the standalone byteflow
+    // preset has the flag with `model.bf = None` (the trainer sends it down
+    // another dispatch before a model exists) — counting on the flag would
+    // demand a channel that model never had. ONE entry per step, not
+    // `iters_per_step`: the JEPA teacher's `forward_latent` is the byte-level
+    // latent path and goes through the plain loop, not the channel, and there
+    // is nothing for it to run through — every aux weight is refused with the
+    // arm, so its latent is discarded before it can matter.
+    let bf_on = dormouse_core::bf::compat_armed(&cfg);
+    let bf_want = if bf_on { STEPS as u64 } else { 0 };
+    assert_eq!(
+        probe::count(probe::BF_CHANNEL),
+        bf_want,
+        "{name}: the compat channel ran {} times, {bf_want} expected (armed = {bf_on})\n  counters: {:?}",
+        probe::count(probe::BF_CHANNEL),
+        probe::counts()
+    );
     // The KDA state: with the arm on it is a real [b, heads, k, v] state; with
     // it off the loop substitutes a [b,1,1,1] placeholder. Shape, not a
     // counter, because it is the returned value the trainer persists.
@@ -420,12 +448,36 @@ fn mor_executes() {
 fn nano_fused_executes() {
     executes("nano-fused");
 }
+/// The standalone ByteFlow arm: `use_byteflow` with NO dormouse arm on, so
+/// `model.bf` is `None` and this forward is the plain dormouse loop. That is
+/// NOT the path the trainer runs for this preset — `train_loop` dispatches it
+/// to `byteflow::train_loop` (ByteFlowNet itself) before a `DormouseModel`
+/// exists — so what this test holds is the preset's own promises: it parses,
+/// it validates, and it declares no arm. The channel below is the other
+/// dispatch.
+#[test]
+fn byteflow_executes() {
+    executes("byteflow");
+}
+/// THE COMPAT CHANNEL (lane bf-compat, `crates/dormouse-core/src/bf.rs`):
+/// `use_byteflow` + `use_kda` keeps the model. ByteFlow's front stage packs
+/// the window into K patch latents, the loop runs KDA over those K positions,
+/// the back stage lifts them to byte logits, and the objective is the
+/// decoder's byte CE. `executes` proves the pair resolves and validates, the
+/// KDA arm entered on PATCH input, the channel counter moved, and the byte CE
+/// came back finite.
+#[test]
+fn byteflow_kda_executes() {
+    executes("byteflow_kda");
+}
 
 /// The presets that have an execution test above. A preset added to
 /// `configs/` without one is the exact hole this file exists to close, so the
 /// list is checked against the directory, not trusted.
 const COVERED: &[&str] = &[
     "base",
+    "byteflow",
+    "byteflow_kda",
     "mor",
     "nano",
     "nano-fused",
@@ -493,6 +545,10 @@ fn a_preset_that_declares_an_arm_it_never_enters_fails_here() {
             (cfg.jepa_weight > 0.0, probe::JEPA),
             (cfg.dspark_weight > 0.0 && cfg.dspark_k > 0, probe::DSPARK),
             (cfg.use_mor, probe::MOR_BCE),
+            // The compat channel (lane bf-compat): the model built one iff
+            // `compat_armed`, and it must have been ENTERED — a channel that
+            // exists and never runs is the same defect as any other dead arm.
+            (dormouse_core::bf::compat_armed(&cfg), probe::BF_CHANNEL),
         ];
         let never_entered: Vec<&str> = declared
             .iter()
@@ -647,7 +703,15 @@ fn cost_of_preset(name: &str) -> CostSplit {
 /// The rest are in the slow test: a full-width build on the pure-Rust CPU
 /// backend costs MINUTES (measured: 4-11 min for the presets here), and a
 /// suite nobody runs is a suite nobody reads.
-const CHEAP_PRESETS: &[&str] = &["base", "mor", "nano", "nano-fused", "small"];
+const CHEAP_PRESETS: &[&str] = &[
+    "base",
+    "byteflow",
+    "byteflow_kda",
+    "mor",
+    "nano",
+    "nano-fused",
+    "small",
+];
 
 #[test]
 fn every_preset_states_its_cost_and_no_preset_is_a_lookup_table() {

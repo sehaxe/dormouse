@@ -943,21 +943,52 @@ pub fn train_loop(
     // protocol says the seed IS, so a different value in the config is now a
     // different run in the strongest sense: a different model.
     device.seed(cfg.seed);
-    // THE BYTEFLOW DISPATCH. `use_byteflow` replaces the model, so the
-    // dormouse loop does not build one: the arm's own loop takes over HERE,
-    // after the snapshot and after the seed (seed-before-any-parameter is the
-    // 2026-09-28 rule), and the config snapshot above covers its resume
-    // discipline. `check` inside refuses every dormouse-only knob loudly.
+    // THE BYTEFLOW DISPATCH, two ways: the COMPAT CHANNEL (crates/dormouse-
+    // core/src/bf.rs — ByteFlow's front/back stages around the dormouse loop)
+    // when a dormouse arm is on, the standalone ByteFlow net otherwise. The
+    // snapshot above covers both (a flipped `use_byteflow` between the two is
+    // a drift key like any other), and `bf::compat_armed` is the single list
+    // `config::validate` refuses against, so the two can never disagree.
+    //
+    // `byteflow::check` runs for BOTH modes: it holds the train-side
+    // refusals `config::validate` cannot see (`--bf16`, `--graph-capture`,
+    // `--jepa-targets`, `--engram-ram`, `--rand-depth`, `--eval-depths`,
+    // `--stress`, `--opt` outside {adamw, mix}) — those were the standalone
+    // arm's refusals and this lane lifts NONE of them.
     if dorm_cfg.use_byteflow {
-        return byteflow::train_loop(
-            RunCfg {
-                source: preset,
-                model: dorm_cfg,
-                train: cfg,
-            },
-            data,
-            Some(dir.clone()),
-            eval_data,
+        byteflow::check(&cfg)?;
+        if !dormouse_core::bf::compat_armed(&dorm_cfg) {
+            return byteflow::train_loop(
+                RunCfg {
+                    source: preset,
+                    model: dorm_cfg,
+                    train: cfg,
+                },
+                data,
+                Some(dir.clone()),
+                eval_data,
+            );
+        }
+        // THE ARM LINE (ADR-0011): what this path runs, and the fields it
+        // does not read. Printed once, before the model exists — the runtime
+        // counterpart is `probe::BF_CHANNEL`, printed as `bf=<n>` on every
+        // eval line (a zero there means the EVAL did not go through the
+        // channel, which is the §3.2 defect shape).
+        // The optimizer line is `build_optim`'s, i.e. the SAME router as the
+        // dormouse path: with `--opt mix` (the default, and one of the two
+        // values `byteflow::check` allows) the stages' 2-D `Linear`s land in
+        // Muon+ ColRow and `upsample_w` in the fallback AdamW group. The
+        // standalone arm's "opt=AdamW" line does not apply here, and a line
+        // that said it would be the ADR-0011 class (a mark that names the
+        // wrong thing is worse than no mark).
+        println!(
+            "byteflow compat arm: front/back stages + dormouse loop (byteflow_g_layers replaced by \
+             the loop) over k={} patches of t={} bytes (patcher={}, opt={}) aux=none \
+             host-tables=none",
+            dorm_cfg.byteflow_k_tokens,
+            dorm_cfg.max_seq_len,
+            if dorm_cfg.byteflow_logdet { "logdet" } else { "l2" },
+            cfg.opt,
         );
     }
     let (mut model, qfmt) = build_model(&dorm_cfg, &cfg, &device);
@@ -1808,6 +1839,12 @@ pub fn train_loop(
                         probe::count(probe::ENGRAM),
                         probe::count(probe::ENGRAM_KEYS),
                     );
+                    // The compat channel, counted over the eval's own
+                    // forwards for the same reason: `bf=0` on a run whose
+                    // config says `use_byteflow` is an eval that scored a
+                    // channel-less network — the same defect shape at a new
+                    // seam (§3.2).
+                    let bf0 = probe::count(probe::BF_CHANNEL);
                     for _ in 0..cfg.eval_batches.max(1) {
                         let (eb, eh) = match &host {
                             Some(h) => ev.next_batch_with_tables(h.slots),
@@ -1912,6 +1949,7 @@ pub fn train_loop(
                         probe::count(probe::ENGRAM) - eg_arms0,
                         probe::count(probe::ENGRAM_KEYS) - eg_rows0,
                     );
+                    let bf_runs = probe::count(probe::BF_CHANNEL) - bf0;
                     // `fb=<ran>/<asked>`: the future-byte arm, over the TRAINING
                     // forwards, not the eval's own. The eval forward passes no
                     // labels (`targets = None`, which is what keeps the held-out
@@ -1935,7 +1973,8 @@ pub fn train_loop(
                         "step {step:6} EVAL ce={ece:.3} bpb={ebpb:.3}{} over {bytes} B (fixed window) \
                          fused kda={kda_f}/{kda_b} asked={kda_asked} bwd={kda_bwd} \
                          declined={kda_decl} ops={kda_ops} node_bwd={kda_node_bwd} \
-                         norm={}/{} muon_skipped={}/{} engram={eg_rows}/{eg_arms} fb={fb_ran}/{fb_asked} \
+                         norm={}/{} muon_skipped={}/{} engram={eg_rows}/{eg_arms} bf={bf_runs} \
+                         fb={fb_ran}/{fb_asked} \
                          {tsct_field}",
                         if is_best_eval { " BEST" } else { "" },
                         norm_asked.saturating_sub(norm_skipped),

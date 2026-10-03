@@ -2923,6 +2923,7 @@ dependencies = [
  "burn",
  "burn-attnres",
  "burn-bitnet",
+ "burn-byteflow",
  "burn-cuda",
  "burn-dspark",
  "burn-engram",

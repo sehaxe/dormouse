@@ -82,6 +82,14 @@ pub struct DormouseModel {
     /// unclamped `rank` above either dimension is not a compression at all but
     /// a wider matrix wearing a rank's name.
     pub lm_head: LinearLike,
+    /// THE COMPAT CHANNEL (lane bf-compat; `use_byteflow` + `use_kda` +
+    /// `--opt mix`). `Some` iff [`crate::bf::compat_armed`] — the one list
+    /// `config::validate` refuses against and the trainer's dispatch reads —
+    /// so the model, the validator and the dispatch cannot disagree; the
+    /// checkpoint then carries the byteflow front/back record plus the two
+    /// pairing Linears. `None` = the pure-byteflow net (byte identical to its
+    /// pre-compat build) or the plain dormouse model.
+    pub bf: Option<crate::bf::BfChannel>,
     /// The auxiliary heads (JEPA predictor, DSpark draft + acceptance,
     /// future-byte). ON by default; the weights live in the `#[module(skip)]`
     /// fields below.
@@ -180,6 +188,7 @@ impl DormouseModel {
             loop_block: LoopBlock::new(cfg, device),
             norm: RMSNorm::new(d, cfg.norm_eps, device),
             lm_head: LinearLike::with_tsct(d, v, cfg.rank.min(d).min(v), cfg.use_tsct, device),
+            bf: crate::bf::bf_for_model(cfg, device),
             aux,
             vocab_size: v,
             d_model: d,
@@ -376,6 +385,20 @@ impl DormouseModel {
             + DispatchKindConversion<B::InnerBackend>
             + DispatchKindConversion<burn::backend::Autodiff<B::InnerBackend>>,
     {
+        // THE COMPAT CHANNEL (bf.rs). Everything below this line is the
+        // byte-level path: dormouse embedding, in-loop L_Rec, aux heads. The
+        // channel replaces all three, so it branches BEFORE them rather than
+        // after — a `Some` channel that fell through to the embedding would be
+        // two different networks in one function (ADR-0019).
+        //
+        // `hashed_ids` / `host_rows` / `teacher_latent` are dropped here, not
+        // silently read: `validate` refuses `use_engram` and every aux weight
+        // with `use_byteflow`, so on a validated run the keys belong to a loop
+        // whose memory arm is off (as dead as on any `use_engram = false`
+        // run) and there is no teacher to build a target from.
+        if self.bf.is_some() {
+            return self.forward_channel::<B>(input_ids, targets);
+        }
         // DSpark's window tokens are the sequence the model CONSUMED, not the
         // label sequence. They used to be `targets`, which put the draft
         // head's step s one position ahead of its own base logits: it was fed
@@ -434,6 +457,98 @@ impl DormouseModel {
             &route,
         );
         (logits, rec, kda, aux)
+    }
+
+    /// THE COMPAT CHANNEL'S FORWARD (`crate::bf`): ByteFlow's front stage
+    /// (embedding → local encoder → coding-rate Top-K chunker → proj) packs
+    /// the T-byte window into K patch latents, `in_proj` pairs the width, the
+    /// dormouse loop runs over those K positions, `out_proj` pairs it back,
+    /// and `decode_chunks` lifts the K outputs to `[b, t, 256]` byte logits.
+    ///
+    /// THE OBJECTIVE IS THE BYTE CE FROM THE DECODER, not the loop's in-loop
+    /// `L_Rec`: the loop is called with `targets = None` (its `lm_head`
+    /// gather never builds) and `rec` is the mean CE of the decoder's logits
+    /// against all T labels. Two reasons, both load-bearing:
+    ///
+    /// 1. `decode_chunks` is the model's only exit, so a loss taken at K
+    ///    patch starts would leave `upsample_w`, `decoder` and `out` with no
+    ///    gradient — a dead back stage behind a perfectly healthy loss curve
+    ///    (the `8fa5d4c` shape: the arm looks alive because nothing that
+    ///    would reveal it is measured).
+    /// 2. The held-out eval scores `[b, t, 256]` logits against all T bytes
+    ///    (`train/src/lib.rs`, the `ece` block), so a train CE averaged over
+    ///    K patch starts would be a DIFFERENT quantity from the one the eval
+    ///    line prints, and best-checkpoint-by-held-out would compare them.
+    ///
+    /// The dormant `norm` / `lm_head` / byte `embedding` take no gradient on
+    /// this path and stay in the module tree for the reason `crate::bf`
+    /// gives: the module tree is the checkpoint format. A missing gradient is
+    /// not an error on the dormouse path (the pure-CE baseline's aux heads
+    /// have none either).
+    ///
+    /// The channel computes fp32 end to end and does not read `self.bf16`:
+    /// `byteflow::check` refuses `--bf16` for both byteflow modes, because
+    /// ByteFlowNet has no bf16 handling (§2.1 — bf16 would be slower than
+    /// fp32 here anyway).
+    fn forward_channel<B: burn::backend::AutodiffBackend>(
+        &self,
+        input_ids: Tensor<2, Int>,
+        targets: Option<Tensor<2, Int>>,
+    ) -> (Tensor<3>, Tensor<1>, Tensor<4>, Option<Tensor<1>>)
+    where
+        DispatchTensor: DispatchKindConversion<B>
+            + DispatchKindConversion<B::InnerBackend>
+            + DispatchKindConversion<burn::backend::Autodiff<B::InnerBackend>>,
+    {
+        let bf = self.bf.as_ref().expect("forward_channel without model.bf");
+        // The aux weights are refused with `use_byteflow` by `validate`, and
+        // the model constructors deliberately do NOT call `validate` — so the
+        // same refusal is held here, at the runtime seam. Without it a
+        // hand-built config with `jepa_weight > 0` and a channel armed would
+        // have every aux weight silently ignored: this function returns
+        // `aux = None` unconditionally, so the term would cost a config field
+        // and produce nothing (the ADR-0019 class validate's doc names as
+        // "a term with nothing to act on").
+        assert!(
+            self.jepa_weight == 0.0
+                && self.dspark_weight == 0.0
+                && self.aux_fb_weight == 0.0
+                && self.mor_bce_weight == 0.0,
+            "the byteflow compat channel carries no aux heads: validate refuses jepa_weight, \
+             dspark_weight, aux_fb_weight and mor_bce_weight > 0 together with use_byteflow - \
+             set them to 0"
+        );
+        crate::probe::note(crate::probe::BF_CHANNEL);
+        let [b, t] = input_ids.dims();
+        // Front stage. `sel` is a discrete argtopk product: the SELECTION has
+        // no gradient path (the paper's own treatment of its chunker), the
+        // gathered rows behind it do, so the encoder and `proj` train through
+        // `z` and the boundaries stay fixed by the coding rate.
+        let (h, z, sel) = bf.net.encode_chunks(input_ids, bf.k);
+        let x = bf.in_proj.forward(z); // [b, k, d_model]
+        let (out_acc, _loop_rec, kda, _route) =
+            self.loop_block
+                .forward_full_state::<B>(x, None, None, None, None, &self.lm_head);
+        // Back stage: K latents → T byte positions, then the decoder blocks
+        // and the byte head.
+        let g = bf.out_proj.forward(out_acc); // [b, k, d_global]
+        let logits = bf.net.decode_chunks(g, h, &sel); // [b, t, 256]
+        let dev = logits.device();
+        let rec = match targets {
+            Some(tg) => {
+                let [_, _, v] = logits.dims();
+                burn::tensor::activation::log_softmax(logits.clone().reshape([b * t, v]), 1)
+                    .gather(1, tg.reshape([b * t, 1]))
+                    .neg()
+                    .mean()
+                    .reshape([1])
+            }
+            // An eval/decode forward: the same zero `L_Rec` the loop returns
+            // with `targets = None` (loop_block.rs), a constant leaf. Nothing
+            // reads it — the eval scores `logits` itself.
+            None => Tensor::zeros([1], &dev),
+        };
+        (logits, rec, kda, None)
     }
 
     /// Weight-combined auxiliary loss (JEPA + DSpark + MoR BCE + the
