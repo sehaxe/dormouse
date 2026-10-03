@@ -7,7 +7,9 @@ s512, Fp8 factors, Muon+ ns=8, aux JEPA 0.05 + KoLeo, dspark 0, no-engram,
 re-measure, **457.3** on the quiet-card repeat (same flags; the spread is
 GPU contention, and both numbers are in `~/logs/gbench2_control.log`).
 
-STATUS: RUNNING (conserved at last commit if session dies).
+STATUS: CONSERVED 2026-10-03 — levers 1 and 3 done (measured + gated), lever 2
+measured (launch pair) but BLOCKED by the cubecl server reserve OOM at
+precompute-record 3; the ceiling and the follow-ups are §"Results" + §"Follow-ups".
 
 ## Levers, in the brief's order
 
