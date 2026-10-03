@@ -471,3 +471,5 @@ night2 b16/Fp16/--graph-stage умер на шаге 100: "train failed: step 10
 night2c: b16 s512 Fp16 aux-off no-engram no-stage — умер на шаге 100 (первый log-шаг) c "device error (loss is not a scalar)". Не стадия (была off), не aux (0). b8+Fp16 стабилен (44k + 3×2k сегодня). Лестница b16 мерилась на fp32. Чинить: loss-read путь при b16 в Fp16-режиме, гейт = 200-шаговый прогон b16 Fp16.
 ## b16 OOM — координация (2026-10-03)
 Корень: b16 транзиенты (2× от b8) в Fp16/Fp8 > 16 GB до первого memory_cleanup (step%500); OOM утопал в "loss is not a scalar" (lib.rs:1540 — теперь печатает underlying). СЛЕДУЮЩИЙ ФИКС = adjoint-tune-дорожки item 3 (переиспользование 17 тензоров fwd — та же работа: меньше транзиентов = b16 влезает). Гейт финала: 200 шагов b16 Fp16+Fp8 green на тихой карте. night2e (b8) жив, step 12200+.
+## Очередь дорожек (2026-10-03 ~16:00): free-тир rate-limited, сериал-политика
+Все 3 lane (bf-giant, bf-compat, posttrain) умерли в rate limit. Порядок перезапуска ПО ОДНОЙ: (1) bf-compat (1M-блокер) → (2) bf-giant (конфиги гигантов) → (3) posttrain (SFT-скелет). Триггер: сброс квоты ИЛИ отчёт night2e. jepa-цепочка своя (ждёт карту). Ночь night2e жива.
