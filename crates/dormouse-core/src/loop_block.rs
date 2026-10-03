@@ -763,6 +763,10 @@ impl LoopBlock {
         // when `moe_topk == 0`, which is how the off-arm gets `None` rather
         // than a zero that a caller would have to guess the meaning of.
         let mut lb_terms: Vec<Tensor<1>> = Vec::with_capacity(iters);
+        // The utilization statistic, one per executed iteration, averaged the
+        // same way and handed to `moe`'s seam. Empty exactly when `lb_terms`
+        // is empty, so the routed arm is what records it.
+        let mut util_terms: Vec<Tensor<1>> = Vec::with_capacity(iters);
 
         for iter in 0..iters {
             crate::probe::note(crate::probe::ITER);
@@ -877,6 +881,14 @@ impl LoopBlock {
                 crate::probe::note(crate::probe::MOE_ROUTE);
                 let (g, m, probs) = crate::moe::topk_blend(expert_logits, self.moe_topk);
                 lb_terms.push(crate::moe::lb_aux(&probs, &m, self.n_experts));
+                // The utilization STATISTIC (`moe::util_stats`), on the same
+                // mask `lb_aux` counts. It is not a loss term and carries no
+                // gradient; it exists because a collapsed router is invisible
+                // in the loss curve (every expert is computed regardless -
+                // tsct-spec §12) and because `lb_aux` is weighted at nothing
+                // in the shipped default, so it cannot report the
+                // distribution it was written to keep balanced.
+                util_terms.push(crate::moe::util_stats(&m, self.moe_topk));
                 g
             } else {
                 activation::softmax(expert_logits, 1)
@@ -1215,6 +1227,20 @@ impl LoopBlock {
             }
             Some(acc.div_scalar(lb_terms.len() as f32))
         };
+        // The utilization statistic, averaged over the same iterations and
+        // handed to `moe`'s seam. Recorded HERE rather than returned on
+        // `RouteAux` because nothing inside the model consumes it: it is a
+        // read-out, and a thread-local seam (the shape `mixture_probe` already
+        // uses for the per-iteration blend) keeps it off the autodiff tape and
+        // out of the loss without threading a tensor through the forward's
+        // signature. The trainer reads it at log cadence and nowhere else.
+        if let Some(first) = util_terms.first() {
+            let mut acc = first.clone();
+            for t in &util_terms[1..] {
+                acc = acc + t.clone();
+            }
+            crate::moe::record_util(acc.div_scalar(util_terms.len() as f32));
+        }
         (
             out_acc,
             rec,
