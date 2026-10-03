@@ -304,6 +304,52 @@ impl MuonPlus {
         }
     }
 
+    /// Batched Newton-Schulz for a rank-D tensor (D >= 3) whose SLICES are the
+    /// matrices to orthogonalize: the same NS loop as [`Self::orthogonalize`]
+    /// run once per step over `[B, r, c]`, with the Frobenius normalization
+    /// per slice instead of per tensor. Matmul over the batch dims is math
+    /// per slice - no singular directions mix across slices - which is what
+    /// makes a per-head (`[n_heads, head_dim, d]`) NS the same object the
+    /// per-head loop computes, in one launch set.
+    ///
+    /// LOUD on a taller-than-wide slice: the per-slice transpose arm of
+    /// [`Self::orthogonalize`] has no batched counterpart, and silently
+    /// skipping it would compute a different polynomial. Callers slice flat
+    /// (`[64, 768]` blocks are never taller) - assert, don't guess.
+    pub fn orthogonalize_batched<const D: usize>(&self, g: Tensor<D>) -> Tensor<D> {
+        assert!(D >= 3, "orthogonalize_batched is for batched slices (D >= 3); use orthogonalize");
+        let dims = g.dims();
+        assert!(
+            dims[D - 2] <= dims[D - 1],
+            "batched NS: slice [{}, {}] is taller than wide - no per-slice transpose arm \
+             exists; reshuffle the batch so slices are wide",
+            dims[D - 2],
+            dims[D - 1]
+        );
+        // orient_and_normalize's scale, per slice: Frobenius over BOTH trailing
+        // dims, keep the batch. Two sum_dims, not a global sum, is the whole
+        // point of the batched form.
+        let mut x = g;
+        let fro = x
+            .clone()
+            .mul(x.clone())
+            .sum_dim(D - 1)
+            .sum_dim(D - 2)
+            .sqrt()
+            .clamp_min(1e-7);
+        x = x.div(fro);
+
+        let (a, b, c) = self.ns_coeffs;
+        for _ in 0..self.ns_steps {
+            let xt = x.clone().swap_dims(D - 2, D - 1);
+            let xx = x.clone().matmul(xt); // X X^T, per slice
+            let xx2 = xx.clone().matmul(xx.clone()); // (X X^T)^2
+            let poly = xx.mul_scalar(b).add(xx2.mul_scalar(c));
+            x = x.clone().mul_scalar(a).add(poly.matmul(x.clone()));
+        }
+        x
+    }
+
     /// Muon+ post-polar normalization (2602.21545 §2.3, Eqs. (3)-(8)).
     ///
     /// `Norm_col(X) = X·D_col⁻¹`, `Norm_row(X) = D_row⁻¹·X`; compositions are
@@ -325,8 +371,17 @@ impl MuonPlus {
                 let mut xm = x;
                 #[cfg(feature = "cuda")]
                 {
-                    if !crate::fused_kernels::norm_colrow_cuda(&mut xm, 1e-7) {
-                        count_skip(Skip::Norm);
+                    let fused = D == 2 && crate::fused_kernels::norm_colrow_cuda(&mut xm, 1e-7);
+                    if !fused {
+                        if D != 2 {
+                            // A batched (rank >= 3) tensor on the ColRow fused kernel
+                            // would stride-walk the BATCH dim as row pitch - silent
+                            // corruption, not a fallback. The tensor composite below
+                            // is the defined batched arm, so it is counted as a skip
+                            // only where the fused kernel was actually asked (D == 2).
+                        } else {
+                            count_skip(Skip::Norm);
+                        }
                         xm = Self::norm_row(Self::norm_col(xm));
                     }
                 }

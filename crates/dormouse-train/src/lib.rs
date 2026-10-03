@@ -844,6 +844,12 @@ pub fn precompute_jepa_targets(
         let [b, t, d] = latent.dims();
         let vals: Vec<f32> = latent.into_data().try_to_vec().map_err(|e| e.to_string())?;
         w.push(&bytes, &vals, b, t, d).map_err(|e| e.to_string())?;
+        // The train loop's pool discipline, at the same cadence: the pool is
+        // high-water and never frees on its own (AGENTS.md 2.2), so a run
+        // without the 500-step cleanup died at step 3 OOMing a 12 MB latent.
+        if (i + 1).is_multiple_of(500) {
+            memory_cleanup(&device);
+        }
         if (i + 1) % 100 == 0 {
             println!("jepa precompute: {}/{}", i + 1, n_steps);
         }

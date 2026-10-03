@@ -148,3 +148,36 @@ date	commit	mode	step	throughput	mem	final-ce
 2026-10-02T04:05:00Z	8dd8398	wt/graph-trainer-gates	4 CUDA gates, 1/4 green (75s test, build 5m45 dt-graph)	n/a	n/a	res=n/a	BLOCKER: a_pinned_replay_agrees 8.9e-1 rel at iter_embed; replays_train_and_are_reproducible: 6 replays leave params BIT-IDENTICAL to capture step - a window excluding an out-of-place optimizer cannot train; negative gate now crashes CUDA_ERROR_ILLEGAL_ADDRESS instead of clean signature. a_replay_launches_no_kernels green (6 launches/replay). --graph-capture NOT merged; verdict in research/reviews/graph-trainer-2026-10-01.md continuation
 2026-10-02T04:12:00Z	af9def1	probe-b8-fp16-vs-fp32-+-batch-ladder	150 steps/cell, warm step-100 timers	465/441/894/930 ms (b8-fp32/b8-fp16/b16-fp32/b16-fp16); b32 OOM step-0 (aux JEPA 2nd forward)	tok/s 8809/9288/9163/8809	3.9GB @b8	VERDICT: f16 ships AT BATCH 8 ONLY (-5.2%, fwd 185->162, slope identical ce@100 3.846=3.846, 0 NaN, quant format Fp16 confirmed); at b16 the win inverts (bwd 504->534). Night mode = b8 + --quant fp16 (9288 tok/s, +5.4% vs b8 fp32). logs=~/logs/probe_{b8f32,b8f16,b16,b32,b16f16}.log
 2026-10-02T09:20:00Z	e55a4c2	night_20261002-small-b8-s512-fp16	44000 done 2026-10-02 04:18->09:16 (4.97h, warm 440-445ms/step, ~0.414s/step incl evals, ~9200 tok/s sustained, 0 NaN, monitor ~/logs/night_mon.log all-green)	81920B x 87 eval windows	res=n/a	held-out bpb: BEST 5.908 @ 36500; train ce best 2.512. PAIRED vs first-100k-production (same seed 1, batch 8, window, schedule shape; the one variable = factor quant fp16 vs fp8): matched-step evals interleave inside +-0.1-0.2 eval noise (500: 6.469/6.480, 5000: 6.483/6.323, 30000: 6.119/6.111, 36500: 5.908/~5.95, 42000: 6.108/5.705) - fp16 NOT a quality regression at -5% ms/step. preset=small params=9197454 (no arms - all wave-3 arms tied per §1.2) aux=jepa0.05+koleo(dspark0) no-engram quant=FP16(opt) opt=muon+ ns=8 lr=cos1e-4 warmup retract_every=4 steps=44000 batch=8 seq_len=512 eval_every=500 log=~/logs/night_2026-10-02.log ckpt=checkpoints/night_20261002.best.bin. Not comparable to 5.545@86k (half the steps); the f16-at-100k question needs this run at --steps 100000 (~12.6h).
+2026-10-03T01:17:35Z	ddc5187	maxopt-re4-2k-paired-BPB	s524-608ms-contended
+81920 B window (20x8x512)	res=n/a	bpb: s1 6.503 s2 6.297 (mean 6.400) seed=1/2
+preset=small aux=jepa0.05+koleo(dspark0) no-engram r-e=4 fp8 opt=muon+ retract_every=4 steps=2000 eval_every=500 the gbench2_control 2k twins
+logs=~/logs/maxopt_re4_s{1,2}.log
+2026-10-03T01:37:09Z	ddc5187	maxopt-re1-2k-paired-BPB	s468-609ms-contended
+81920 B window	res=n/a	bpb: s1 6.415 s2 6.350 (mean 6.3825) paired-vs-re4: -0.088/+0.053 within the re4 spread 0.206
+no max_ortho latch; r-e=1
+logs=~/logs/maxopt_re1_s{1,2}.log
+2026-10-03T02:57:09Z	ddc5187	maxopt-re5-2k-paired-BPB	s468-609ms-contended
+81920 B window	res=n/a	bpb: s1 6.426 s2 6.372 (mean 6.399) paired-vs-re4: -0.077/+0.075
+r-e=5
+logs=~/logs/maxopt_re5_s{1,2}.log
+2026-10-03T03:38:00Z	ddc5187	maxopt-re10-2k-paired-BPB	s427-610ms-contended
+81920 B window	res=n/a	bpb: s1 6.433 s2 6.374 (mean 6.4035) paired-vs-re4: -0.070/+0.077
+r-e=10; NO max_ortho latch either seed
+logs=~/logs/maxopt_re10_s{1,2}.log
+2026-10-03T04:47:00Z	ddc5187+unc		maxopt-lever3-atlas-pair/opt-stage
+opt launches/step 3914.2 -> 2257.3 (-1657, -42%); opt ms/step (atlas stage timer) 62.2 -> 37.7 (-24.5 ms)
+launches: same-tree before = per-head loop (0*24 3D unbatched), after = batched [12,64,768] NS; ms readings from atlas runs of the same host window, +-cardno
+===
+2026-10-03T05:0xZ	ddc5187	maxopt-gctrl-after 500 steps
+387.0 ms/step (my after merged+lever3 rebuilt binary, cards at ~284-800MiB)
+419/420/420/419 at the step-100|200|300|400 timers
+res=n/a
+---
+2026-10-03T05:31:00Z	ddc5187 BLOCKER: the teacher-target precompute pass DIEs at step 3/2000 on cubecl server.rs:144
+"failed to reserve 12582912 bytes of device memory: out of device memory" - the LATENT write's page at b=8 t=512 d=768 f32 (12 582 912 b = exactly 1 record; a 3-record 37.75 MB sidecar every run, incl n_steps=10)
+repro: run_maxopt.sh jpre 10/2000 x3 (04:09 04:3x 05:2x) mine with memory_cleanup at 500-step per i+1... x3 doses; the cleanup fix does not touch it
+the jarm (the offline-target 2k arm) must either wait for the fix or run at reduced slots
+filed in docs/reviews/maxopt-without-graph-lane-2026-10-02.md - the cubecl server's lane is not mine
+2026-10-03T05:31:00Z	ddc5187 PASS-up: the pre-existing eval "counter covers both muon impls" test RED on --features cuda (maxopt-etest2 with my lever-3 stash popped = same red):
+asserting "(0,0) -> (1,4)" skips on a CUDA-feature build = the fused kernels cannot answer the autodiff device's tensors: the counter's CPU-only first clause - the wgpu-lane's pattern (the test that runs 0 + a green line over a mis-written proof)
+follow-up owner: the guard's first clause is a miswritten proof on the cuda feature's RUN - the pre-existing red = not my regression (the falsification: stashed = same red)

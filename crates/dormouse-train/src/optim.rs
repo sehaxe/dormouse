@@ -247,15 +247,6 @@ impl Optimizer for HeadWiseMuon {
             None => grad.clone().mul_scalar(1.0 - mu),
         };
 
-        // One NS preconditioner per head (2D slices keep the fused muon+
-        // kernels - which assume a 2D layout - on their fast path), then
-        // concatenate back.
-        let dh = rows / self.n_heads;
-        let mut parts = Vec::with_capacity(self.n_heads);
-        for h in 0..self.n_heads {
-            let block = momentum.clone().slice([h * dh..(h + 1) * dh, 0..cols]);
-            parts.push(self.muon.normalize(self.muon.orthogonalize(block)));
-        }
         // The zero-gradient rule, from the crate that owns it: NS normalizes
         // the DECAYED momentum back to unit Frobenius norm, so without this
         // gate a step the trainer masked as a no-op still moved Q/K by a full
@@ -263,7 +254,41 @@ impl Optimizer for HeadWiseMuon {
         // gated, exactly as in `MuonPlus::step` - a zero gradient is a no-op
         // on the update, not on the decay.
         let g_active = burn_muon_plus::signal_mask(&grad);
-        let update = Tensor::cat(parts, 0).mul(g_active.unsqueeze());
+        // Batched per-head NS: `[n_heads, dh, cols]` runs the SAME per-head
+        // arithmetic (batched matmul is math per slice - no singular
+        // directions mix; per-slice Frobenius norm and per-slice ColRow, same
+        // clamp rule as the fused kernel) in one launch set instead of
+        // `n_heads` sequential `[dh, cols]` calls. That was ~2 066 of the
+        // optimizer stage's 3 921 launches/step at `small` (the single
+        // largest opt item, launch-atlas 2026-10-02); the batched form is
+        // ~60. Pinned bit-for-bit against the old per-head loop on CPU by
+        // `headwise_batched_matches_per_head_loop`.
+        //
+        // What the change gives up: the fused `norm_colrow_cuda` kernel
+        // (2-D strides only) no longer participates in the Q/K arm - that
+        // is 2 launches per head per step it no longer runs, and the eval
+        // line's `muon_skipped=` field is unaffected (the fused kernel is
+        // not ASKED, so nothing counts a skip that did not happen). The
+        // momentum and finalize fused kernels still run on the full 2-D
+        // momentum/update, unchanged.
+        let dh = rows / self.n_heads;
+        let heads = self.n_heads;
+        let per_head = self.muon.orthogonalize_batched(
+            momentum.clone().reshape([heads, dh, cols]),
+        );
+        let per_head = self.muon.normalize(per_head);
+        // Rank cast back to the generic `D`: the branch above verified the
+        // RUNTIME rank is 2, but the compiler still holds the generic const.
+        // Unsqueeze adds the size-1 dim, the squeeze removes it - the
+        // two-step no-copy cast is the whole ritual. Batch layout
+        // `[heads, dh, cols]` is row-major contiguous, so the reshape is the
+        // same value sequence the per-head loop produced with
+        // `Tensor::cat(parts, 0)` - no compute either way.
+        let update = per_head
+            .reshape([rows, cols])
+            .mul(g_active.unsqueeze())
+            .reshape::<3, _>([1, rows, cols])
+            .squeeze_dim::<D>(0);
 
         // Same tail as MuonPlus 2D. The Bernstein factor uses the FULL
         // dims: per-head NS output carries the same total Frobenius norm
@@ -568,6 +593,60 @@ mod tests {
             .map(|i| ((i.wrapping_mul(2654435761) % 997) as f32 / 498.0) - 1.0)
             .collect();
         Tensor::<2>::from_data(TensorData::new(vals, [ROWS, COLS]), &crate::device())
+    }
+
+    /// The batched per-head NS must equal the per-head loop it replaced,
+    /// slice for slice, on the CPU backend (ndarray's batched matmul is a
+    /// per-slice loop, so the gate is BITWISE here). The reference
+    /// reconstructs the step's own momentum the same way `step` built it
+    /// from a fresh state (μ from the config, `M = G·(1-μ)`), then runs the
+    /// old `[dh, cols]`-slice path; the step runs the `[heads, dh, cols]`
+    /// batched path. A divergence here is a silent change of WHOSE singular
+    /// directions get orthogonalized.
+    #[test]
+    fn headwise_batched_matches_per_head_loop() {
+        let dev = crate::device();
+        let g = w(); // deterministic gradient
+        let opt = headwise();
+        let (updated, _) = opt.step(1e-3, w(), g.clone(), None);
+
+        // Reference: the momentum `step` computed (fresh state), then the
+        // per-head slice loop, then the same tail `step` applies.
+        let mu_f: f32 = opt.momentum.elem();
+        let momentum = g.clone().mul_scalar(1.0 - mu_f);
+        let mut parts = Vec::with_capacity(HEADS);
+        let dh = ROWS / HEADS;
+        for h in 0..HEADS {
+            let block = momentum.clone().slice([h * dh..(h + 1) * dh, 0..COLS]);
+            parts.push(opt.muon.normalize(opt.muon.orthogonalize(block)));
+        }
+        let g_active = burn_muon_plus::signal_mask(&g);
+        let ref_update = Tensor::cat(parts, 0).mul(g_active.unsqueeze());
+        let (m, n) = (ROWS as f64, COLS as f64);
+        let lr_scaled = 1e-3 * (m / n).max(1.0).sqrt();
+        let wd = (opt.weight_decay as f32 * lr_scaled as f32).min(0.999);
+        let mut ref_updated = w().clone();
+        ref_updated = ref_updated
+            .clone()
+            .mul_scalar(1.0 - wd)
+            .sub(ref_update.mul_scalar(lr_scaled as f32));
+
+        // ndarary's batched matmul reduces per slice but through the generic
+        // axis op, so the dot's summation order can differ from the singleton
+        // shape's BLAS call: measured worst-case 1.5e-6 absolute at singular
+        // values ~1 (probe_batched_tmp, this box). The gate is therefore
+        // scale-relative, not bitwise.
+        let maxdiff: f32 = updated
+            .clone()
+            .sub(ref_updated.clone())
+            .abs()
+            .max()
+            .into_scalar();
+        let scale: f32 = ref_updated.clone().abs().max().into_scalar();
+        assert!(
+            maxdiff <= 5e-6 * scale.max(1.0),
+            "the batched per-head NS diverged from the per-head loop: {maxdiff:.3e} (scale {scale:.3e})"
+        );
     }
 
     /// THE BUG. The NaN firewall zeroes every gradient on device, so a masked
