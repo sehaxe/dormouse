@@ -465,3 +465,5 @@ burn-spectral) + решения владельца по arm 5 и read_scale.
 
 ## MODE: AWAY (2026-10-03 ночь) — владелец спит
 Ночная программа: (1) посадить maxopt2 + dispatch-guard (bwd-приз, пол-форвард) по их отчётам; (2) msa стадии 1–3 (r=4 блоки, MQA 4q/1k — НЕ забыть: «msa 1:4»); (3) byteflow ПОДТВЕРЖДЕНИЕ 2k×3 сида на МАТЧНЫХ параметрах (byteflow_9m vs контроль 9.2M) — гейт канона; (4) ночная большая тренировка на реальном корпусе с лучшим стеком на момент старта (Fp16, граф-стадия, retract batched) — Chinchilla-прогресс, BEST-чекпойнты, resume; (5) STATUS: DONE + полный отчёт к пробуждению.
+## ДЕФЕКТ для graphstage-владельца (2026-10-03 ~03:00)
+night2 b16/Fp16/--graph-stage умер на шаге 100: "train failed: step 100: device error (loss is not a scalar)" (~/logs/night2_driver.log). Гейты дорожки были b8/Fp8 — на b16/Fp16 stage-захват ломает loss-путь. Ночь перезапущена без --graph-stage (460ms). Чинить с гейтом на b16+Fp16.
