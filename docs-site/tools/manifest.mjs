@@ -253,6 +253,7 @@ export const pages = [
 	{ src: 'README.md', out: 'architecture/vendored-library', slice: { from: /^## The vendored kernel library/, to: /^## Documentation$/ }, title: 'The vendored kernel library', nav: 'The kernel library' },
 	{ src: 'docs/architecture/design-minimal.md', out: 'architecture/design-minimal' },
 	{ src: 'docs/architecture/mixture-arms.md', out: 'architecture/mixture-arms' },
+	{ src: 'docs/architecture/tk-design-on-cubecl-2026-10-04.md', out: 'architecture/tk-design-on-cubecl', title: 'ThunderKittens design on cubecl', nav: 'TK design on cubecl' },
 	{ src: 'docs/architecture/library-crate-fate.md', out: 'architecture/library-crate-fate' },
 	{ src: 'docs/architecture/post-training.md', out: 'architecture/post-training' },
 	{ src: 'docs/architecture/bf16-plan.md', out: 'architecture/bf16-plan' },
