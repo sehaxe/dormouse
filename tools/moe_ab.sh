@@ -106,7 +106,10 @@ clean_control() { # log label expect_routed
   [ -f "$log" ] || { echo "=== $label: no log at $log"; return 1; }
 
   # --- 1. the routing arm actually ran (or deliberately did not) -------------
-  local routed; routed=$(grep -c 'moe=\[' "$log" 2>/dev/null || echo 0)
+  # `grep -c` PRINTS 0 and EXITS 1 on no match, so `|| echo 0` appends a second
+  # 0 and the test below gets "0\n0". The count is always printed; only the
+  # exit code is conditional.
+  local routed; routed=$(grep -c 'moe=\[' "$log" 2>/dev/null); routed=${routed:-0}
   local step; step=$(grep -oE 'moe=\[[^]]*\] H=[0-9.]+ dead=[0-9]+' "$log" | tail -1)
   echo "=== $label utilization (last): ${step:-ABSENT}"
   if [ "$expect_routed" = yes ]; then
@@ -152,18 +155,32 @@ is still 1.0 at step $STEPS the arm specialized in NO dimension and that is the 
     *engram=*)  ;;
     *)          echo "=== DIRTY [$label]: the eval line carries no engram= field"; return 1;;
   esac
-  local kb; kb=$(grep -o 'fused kda=[0-9]*/[0-9]*' "$log" | tail -1)
-  echo "=== $label kda counter: ${kb:-absent}"
+  # The attention backward, read from `bwd=` and NOT from `fused kda=F/B`.
+  # `mor_ab.sh` checks `fused kda=.../0`, which was right when the fused backward
+  # was the only backward there was (§3.2's retraction). It is now the WRONG
+  # field: `kda_seam_counts` orders the tuple (asked, fused_fwd, fused_bwd,
+  # declined, ops_path, custom_node_bwd), so `fused kda=4/0` reads
+  # "4 fused forwards, 0 fused backwards" - and per §3.3 the fused forward
+  # launches and is DISCARDED while the real backward is `bwd=`. Checking the
+  # fused pair would refuse EVERY arm, including a perfectly clean one. Caught
+  # by the synthetic-log gate in this lane's commit message.
+  # Anchored on the LEADING SPACE, not on `bwd=` alone: the same line carries
+  # `node_bwd=0` (the custom-node backward), and a bare `bwd=[0-9]*` matches
+  # inside it, so `tail -1` returns the wrong counter and reads a clean arm as
+  # one with no attention backward. Second bug the synthetic gate caught here.
+  local kb; kb=$(grep -oE ' bwd=[0-9]+' "$log" | tail -1 | tr -dc '0-9')
+  local ff; ff=$(grep -o 'fused kda=[0-9]*/[0-9]*' "$log" | tail -1)
+  echo "=== $label attention counter: ${kb:-absent} backwards (${ff:-no fused counter})"
   case "${kb:-}" in
-    *"/0") echo "=== DIRTY [$label]: the attention arm ran 0 backwards"; return 1;;
-    "")    echo "=== DIRTY [$label]: no fused kda= counter in the log"; return 1;;
+    "")  echo "=== DIRTY [$label]: no bwd= counter in the log"; return 1;;
+    0)   echo "=== DIRTY [$label]: the attention arm ran 0 backwards"; return 1;;
   esac
 
   # --- 4. the window is the one this script budgeted for (§2.6) --------------
   assert_window "$log" "$label" || return 1
 
   # --- 5. no NaN survived the firewall --------------------------------------
-  local nan; nan=$(grep -c 'NaN' "$log" 2>/dev/null || echo 0)
+  local nan; nan=$(grep -c 'NaN' "$log" 2>/dev/null); nan=${nan:-0}
   echo "=== $label NaN lines: $nan"
   [ "$nan" -eq 0 ] || { echo "=== DIRTY [$label]: $nan NaN lines"; return 1; }
   return $(( 1 - ok ))
@@ -230,15 +247,92 @@ run() { # label preset seed expect_routed
 # §1.2: the verdict is a comparison against the SPREAD of the control's own
 # seeds, not against one control number. `jq` is not assumed; this is awk.
 verdict() {
-  local ctrl=("$@")
-  local w
+  local w moe
   w=$(grep EVAL "$LOGDIR"/ctrl_s*.log | grep -o 'bpb=[0-9.]*' | cut -d= -f2)
-  local moe
   moe=$(grep EVAL "$LOGDIR"/routed_s*.log | grep -o 'bpb=[0-9.]*' | cut -d= -f2)
-  echo "=== control BPBs: $(echo $w | tr '\n' ' ')"
-  echo "=== routed  BPBs: $(echo $moe | tr '\n' ' ')"
+  echo "=== control BPBs: $(echo $w)"
+  echo "=== routed  BPBs: $(echo $moe)"
   [ -z "$w" ] && { echo "=== no control BPBs on record"; return 1; }
-  echo "$w $moe" | awk '
+  [ -z "$moe" ] && { echo "=== no routed BPBs on record"; return 1; }
+  # `verdict_awk` rather than inlined here, so the arithmetic `selftest`
+  # exercises is the arithmetic that decides. Two copies of a §1.2 verdict is
+  # one too many.
+  echo "$w $moe" | verdict_awk
+}
+
+# `selftest` is defined BEFORE the dispatch so it can reuse `clean_control`
+# directly, with fixtures written fresh on every run (a stale fixture is how the
+# first version of this gate reported a false failure).
+selftest() {
+  local L; L=$(mktemp -d)
+  trap 'rm -rf "$L"' RETURN
+  cat > "$L/good_routed.log" <<'LOG'
+step     0 ce=5.500 bpb=8.000 best=8.000 lr=1.00e-04 moe=[0.250,0.250,0.250,0.250] H=1.000 dead=0 retr_arm=batched:0/factor:14
+step  1000 ce=4.900 bpb=7.100 best=7.100 lr=1.00e-04 moe=[0.480,0.520,0.000,0.000] H=0.510 dead=2 retr_arm=batched:0/factor:14
+step  2000 EVAL ce=4.231 bpb=6.104 over 40960 B (fixed window) fused kda=4/0 asked=88 bwd=4 declined=260 ops=88 node_bwd=0 norm=0/109 muon_skipped=0/0 engram=88/88 bf=0 fb=0/0
+LOG
+  # The dense control: same run with the utilization field removed, which is
+  # exactly what it looks like when `moe_topk = 0` (the field only prints when
+  # the routed branch ran).
+  sed 's/ moe=\[[^]]*\] H=[0-9.]* dead=[0-9]*//' "$L/good_routed.log" > "$L/good_dense.log"
+  sed 's/engram=88\/88/engram=0\/88/'       "$L/good_routed.log" > "$L/dirty_engram.log"
+  sed 's/bwd=4 /bwd=0 /'                    "$L/good_routed.log" > "$L/dirty_kda.log"
+  sed 's/over 40960 B/over 20480 B/'        "$L/good_routed.log" > "$L/dirty_window.log"
+  sed 's/ moe=\[[^]]*\] H=[0-9.]* dead=[0-9]*//' "$L/good_routed.log" > "$L/no_moe.log"
+  cp "$L/good_routed.log" "$L/nan.log"; echo 'step 1 ce=NaN bpb=NaN' >> "$L/nan.log"
+
+  local pass=0 fail=0
+  local name want log label routed got
+  check() { # name expect_pass log label expect_routed
+    name=$1; want=$2; log=$3; label=$4; routed=$5
+    if clean_control "$log" "$label" "$routed" >/dev/null 2>&1; then got=pass; else got=fail; fi
+    if [ "$got" = "$want" ]; then
+      pass=$((pass+1)); echo "  ok   $name"
+    else
+      fail=$((fail+1)); echo "  FAIL $name: expected $want, got $got"
+      clean_control "$log" "$label" "$routed" 2>&1 | sed 's/^/       /' | tail -3
+    fi
+  }
+  echo "=== the checks must ACCEPT a clean run of either arm"
+  check "routed arm, clean" pass "$L/good_routed.log" t yes
+  check "dense  arm, clean" pass "$L/good_dense.log"  t no
+  echo "=== and REJECT each defect they claim to catch"
+  check "the eval ran a memory-disabled forward" fail "$L/dirty_engram.log" t yes
+  check "the attention arm ran 0 backwards"       fail "$L/dirty_kda.log"     t yes
+  check "the eval window is not the budgeted one" fail "$L/dirty_window.log"  t yes
+  check "routed arm, no utilization field"        fail "$L/no_moe.log"        t yes
+  check "dense arm printed a utilization field"   fail "$L/good_routed.log"   t no
+  check "a NaN line"                              fail "$L/nan.log"           t yes
+  echo "=== $pass passed, $fail failed"
+
+  # The VERDICT half, because a protocol that cannot say "tie" will be read as
+  # a win. §1.2: a tie deletes the mechanism, so the interesting case is the one
+  # where the delta is INSIDE the control's own seed spread, and that case has to
+  # be demonstrably reached rather than assumed. Two synthetic triples:
+  #   5.10 5.30 5.05 | 4.70 4.72 4.68  -> delta -0.45 beats spread 0.09 -> KEEP
+  #   5.10 5.30 5.05 | 5.12 4.95 5.18  -> delta +0.00 inside spread 0.16 -> TIE
+  local got_want got_got
+  got_got=$(printf '5.10 5.30 5.05 4.70 4.72 4.68' | verdict_awk)
+  case "$got_got" in *KEEP*) got_want=KEEP ;; *) got_want=other ;; esac
+  local t_want t_got
+  t_got=$(printf '5.10 5.30 5.05 5.12 4.95 5.18' | verdict_awk)
+  case "$t_got" in *TIE*) t_want=TIE ;; *) t_want=other ;; esac
+  if [ "$got_want" = KEEP ] && [ "$t_want" = TIE ]; then
+    pass=$((pass+1)); echo "  ok   verdict: a delta outside the spread is a KEEP"
+    pass=$((pass+1)); echo "  ok   verdict: a delta inside it is a TIE (which deletes)"
+  else
+    fail=$((fail+1)); echo "  FAIL verdict: expected KEEP and TIE, got $got_want / $t_want"
+  fi
+  echo "=== $pass passed, $fail failed"
+  [ "$fail" -eq 0 ]
+}
+
+# The verdict arithmetic on stdin: six numbers, three control then three routed.
+# Split out from `verdict` so `selftest` can drive it with a synthetic triple -
+# a verdict function that has never been run is the one that decides whether a
+# mechanism survives §1.2.
+verdict_awk() {
+  awk '
     { for (i = 1; i <= NF; i++) v[++n] = $i }
     END {
       ns = int(n / 2)
@@ -248,17 +342,14 @@ verdict() {
       for (i = 1; i <= ns; i++) { d = c[i] - sc; vc += d * d; d = m[i] - sm; vm += d * d }
       vc = sqrt(vc / (ns - 1)); vm = sqrt(vm / (ns - 1))
       dm = sm - sc
-      printf "=== control mean %.4f sd %.4f | routed mean %.4f sd %.4f | delta %+.4f\n", sc, vc, sm, vm, dm
-      # A tie deletes the mechanism (§1.2), but only a tie the control SPREAD
-      # cannot resolve. The band is the pooled spread: a delta inside it is a
-      # tie, and the honest verdict is "delete", not "run more seeds".
+      printf "control %.4f sd %.4f | routed %.4f sd %.4f | delta %+.4f\n", sc, vc, sm, vm, dm
       pooled = sqrt((vc * vc + vm * vm) / 2)
       if (pooled > 0 && (dm < -pooled || dm > pooled)) {
-        printf "=== VERDICT: routed %s by %.4f, which beats the control spread %.4f -> KEEP\n", \
+        printf "VERDICT KEEP: routed %s by %.4f, beating the control spread %.4f\n", \
                (dm < 0 ? "wins" : "loses"), (dm < 0 ? -dm : dm), pooled
       } else {
-        printf "=== VERDICT: |delta| %.4f is inside the control spread %.4f -> TIE, and a tie \
-DELETES the mechanism (docs/protocols/AB-PROTOCOL.md)\n", (dm < 0 ? -dm : dm), pooled
+        printf "VERDICT TIE: |delta| %.4f is inside the spread %.4f, and a tie DELETES the\n\
+               mechanism (docs/protocols/AB-PROTOCOL.md)\n", (dm < 0 ? -dm : dm), pooled
       }
     }'
 }
@@ -277,5 +368,25 @@ case "${1:-all}" in
     echo "ALL DONE $(date +%H:%M)" ;;
   verdict)
     verdict $(ls "$LOGDIR"/ctrl_s*.log) $(ls "$LOGDIR"/routed_s*.log) ;;
-  *) echo "usage: $0 [preflight|all|verdict]"; exit 2 ;;
+  selftest)
+    # THE CHECKS, EXERCISED. This lane had no GPU, so `clean_control` and
+    # `assert_window` were written and never run - and a gate that cannot fail is
+    # the defect class this repo keeps finding (AGENTS.md §3.2: the eval read a
+    # memory-disabled forward, the attention arm ran 3126 forwards and 0
+    # backwards, and every loss curve looked fine). A protocol whose checks have
+    # never executed is exactly that shape.
+    #
+    # Eight cases against SYNTHETIC logs: the two clean arms must be ACCEPTED,
+    # and each defect the checks claim to catch must be REJECTED. Three real
+    # bugs were found this way the day it was written, all of which would have
+    # refused or mis-read a good run:
+    #   * the attention counter read `fused kda=F/B`, whose second field is the
+    #     FUSED backward - which §3.3 says never ran - so it read every clean arm
+    #     as having no backward at all. The real counter is `bwd=`.
+    #   * `grep -o 'bwd=[0-9]*'` also matches inside `node_bwd=0`, so `tail -1`
+    #     returned the custom-node counter. Anchored on the leading space.
+    #   * `grep -c ... || echo 0` printed "0\n0" (grep -c prints 0 AND exits 1)
+    #     and the integer test choked on it.
+    selftest ;;
+  *) echo "usage: $0 [preflight|all|verdict|selftest]"; exit 2 ;;
 esac
