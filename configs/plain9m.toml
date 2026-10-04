@@ -1,6 +1,6 @@
 # plain9m — the PLAIN BYTE TRANSFORMER, i.e. the CONTROL of the controlled trio
 # (plain byte Transformer vs byteflow vs dormouse, one recipe, equal bytes;
-# docs/reviews/trio-prep-2026-10-04.md).
+# the regular 9M byte Transformer control (no loop, no byteflow).
 #
 # WHAT THIS IS: every dormouse mechanism off, and the loop's one attention
 # statement filled by `use_plain_attn` — textbook dense causal multi-head
@@ -83,7 +83,7 @@ mor_bce_weight = 0.0
 # calls `EngramModule::new`, so an off-arm checkpoint keeps its rows), and they
 # are PARAMETERS: `engram_rows = 25000` is 3 145 728 of the parameter count of
 # a run that never reads a row. Every `--no-engram` number in this repo's logs
-# therefore over-counts by 3.1M (docs/reviews/trio-prep-2026-10-04.md §3), and
+# therefore over-counts by 3.1M, and
 # the control zeroes the tables instead of accepting a count that is 34% dead
 # weight. 1 row is the smallest legal value (`validate` refuses 0).
 engram_rows = 1
