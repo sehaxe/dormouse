@@ -2934,6 +2934,7 @@ dependencies = [
  "burn-mor",
  "burn-msa",
  "burn-rmsnorm",
+ "burn-rope",
  "burn-situ",
  "burn-spectral",
  "burn-tensor",

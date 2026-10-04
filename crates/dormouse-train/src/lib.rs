@@ -1863,6 +1863,11 @@ pub fn train_loop(
                     // channel-less network — the same defect shape at a new
                     // seam (§3.2).
                     let bf0 = probe::count(probe::BF_CHANNEL);
+                    // The dense-attention control arm, over the eval's own
+                    // forwards, for the same reason: `plain=0` on a run whose
+                    // config says `use_plain_attn` is an eval that scored a
+                    // network whose attention branch never ran.
+                    let plain0 = probe::count(probe::PLAIN_ATTN);
                     for _ in 0..cfg.eval_batches.max(1) {
                         let (eb, eh) = match &host {
                             Some(h) => ev.next_batch_with_tables(h.slots),
@@ -1968,6 +1973,7 @@ pub fn train_loop(
                         probe::count(probe::ENGRAM_KEYS) - eg_rows0,
                     );
                     let bf_runs = probe::count(probe::BF_CHANNEL) - bf0;
+                    let plain_runs = probe::count(probe::PLAIN_ATTN) - plain0;
                     // `fb=<ran>/<asked>`: the future-byte arm, over the TRAINING
                     // forwards, not the eval's own. The eval forward passes no
                     // labels (`targets = None`, which is what keeps the held-out
@@ -1992,6 +1998,7 @@ pub fn train_loop(
                          fused kda={kda_f}/{kda_b} asked={kda_asked} bwd={kda_bwd} \
                          declined={kda_decl} ops={kda_ops} node_bwd={kda_node_bwd} \
                          norm={}/{} muon_skipped={}/{} engram={eg_rows}/{eg_arms} bf={bf_runs} \
+                         plain={plain_runs} \
                          fb={fb_ran}/{fb_asked} \
                          {tsct_field}",
                         if is_best_eval { " BEST" } else { "" },

@@ -300,6 +300,14 @@ pub struct LoopBlock {
     /// attention per iteration, off by default (`use_msa`). See
     /// [`crate::msa_stage`] for the placement decision and the two stages.
     pub msa: Option<crate::msa_stage::MsaStage>,
+    /// The dense causal softmax arm (`use_plain_attn`): the plain byte
+    /// Transformer CONTROL of the controlled trio. It occupies the same
+    /// attention slot as KDA — one of the two runs, chosen by config, and
+    /// `config::validate` refuses both at once — so it is weight-shared across
+    /// iterations exactly like [`Self::shared_attn`]. `None` unless the flag is
+    /// on (`Option`-shaped like `msa`, so an off-arm checkpoint is unaffected).
+    /// See [`crate::plain_attn`] for what this arm is and is not.
+    pub plain_attn: Option<crate::plain_attn::PlainAttention>,
     /// Loop depth, copied from the config so the forward does not have to be
     /// handed the config. Changing it after construction does NOT resize
     /// `iter_embed` or the `attnres` slot vector, so it is a config-time
@@ -364,6 +372,13 @@ pub struct LoopBlock {
     /// always-built tables).
     #[module(skip)]
     pub use_msa: bool,
+    /// Dense-attention arm switch (`use_plain_attn`), read next to
+    /// [`Self::use_kda`] because the two share ONE attention statement: this is
+    /// the branch order (plain wins, KDA second, neither = zeros), and the
+    /// forward asserts the pair is not both on so a hand-built block cannot
+    /// disagree with what `config::validate` refuses.
+    #[module(skip)]
+    pub use_plain_attn: bool,
     /// Selected iteration slots per position under MoR (>= 1, see
     /// `mor::route`). Ignored when `use_mor` is off.
     #[module(skip)]
@@ -550,6 +565,9 @@ impl LoopBlock {
                 }
                 false => None,
             },
+            plain_attn: cfg
+                .use_plain_attn
+                .then(|| crate::plain_attn::PlainAttention::new(cfg, device)),
             max_iter: cfg.max_iter,
             d_model: d,
             ffn_hidden: f,
@@ -562,6 +580,7 @@ impl LoopBlock {
             use_situ: cfg.use_situ,
             use_mor: cfg.use_mor,
             use_msa: cfg.use_msa,
+            use_plain_attn: cfg.use_plain_attn,
             mor_k: cfg.mor_k,
             moe_topk: cfg.moe_topk,
             engram_slot_mask: mask,
@@ -688,6 +707,11 @@ impl LoopBlock {
             !(use_attnres && use_gr) && !(use_attnres && use_mhc) && !(use_gr && use_mhc),
             "use_attnres, use_gr and use_mhc each replace the residual accumulation; \
              config::validate refuses any two of them together"
+        );
+        assert!(
+            !(self.use_plain_attn && self.use_kda),
+            "use_plain_attn and use_kda share ONE attention statement in the block body, and the \
+             branch order would run one of them silently; config::validate refuses the pair"
         );
         let mut branches: Vec<Tensor<3>> = if use_gr {
             vec![h0.clone(); GR_BRANCHES]
@@ -906,21 +930,37 @@ impl LoopBlock {
             // Shared attention. `normed` above is the block-body input:
             // RMSNorm of h_ctx, identity under GR (the read already
             // normalized).
-            let (gdn2_out, s_new) = if use_kda {
-                crate::probe::note(crate::probe::KDA);
-                self.shared_attn
-                    .gdn2
-                    .forward_train_state::<B>(normed_attn.clone(), kda_s.take())
+            //
+            // ONE attention slot, three arms in a fixed order: the dense causal
+            // softmax (`use_plain_attn`, the plain-transformer control), KDA
+            // (default), or neither (zeros - the `--no-kda` bisect). The pair
+            // plain+KDA is REFUSED by `config::validate` and re-asserted at the
+            // top of this function, because an if/else that silently picked one
+            // of two configured arms is the ADR-0019 defect.
+            let attn_out = if self.use_plain_attn {
+                crate::probe::note(crate::probe::PLAIN_ATTN);
+                self.plain_attn
+                    .as_ref()
+                    .expect("use_plain_attn => plain_attn is built")
+                    .forward::<B>(normed_attn.clone())
             } else {
-                (
-                    Tensor::zeros([b, t, d], &h.device()),
-                    kda_s
-                        .take()
-                        .unwrap_or_else(|| Tensor::zeros([b, 1, 1, 1], &h.device())),
-                )
+                let (out, state) = if use_kda {
+                    crate::probe::note(crate::probe::KDA);
+                    self.shared_attn
+                        .gdn2
+                        .forward_train_state::<B>(normed_attn.clone(), kda_s.take())
+                } else {
+                    (
+                        Tensor::zeros([b, t, d], &h.device()),
+                        kda_s
+                            .take()
+                            .unwrap_or_else(|| Tensor::zeros([b, 1, 1, 1], &h.device())),
+                    )
+                };
+                kda_s = Some(state);
+                out
             };
-            kda_s = Some(s_new);
-            let attn = gdn2_out.reshape([b * t, d]).mul(w_attn);
+            let attn = attn_out.reshape([b * t, d]).mul(w_attn);
 
             // Engram (hashed n-gram lookup) as a convex mixture with a hard
             // floor: `min(w_mem, lam_max) * memory + (1 - that) * dense`.

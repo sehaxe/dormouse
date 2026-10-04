@@ -163,6 +163,7 @@ pub fn apply_overrides(cfg: &mut DormouseConfig, ov: &[Override]) -> Result<(), 
             "bf16" => cfg.bf16 = parse_bool(v)?,
             "use_tsct" => cfg.use_tsct = parse_bool(v)?,
             "use_kda" => cfg.use_kda = parse_bool(v)?,
+            "use_plain_attn" => cfg.use_plain_attn = parse_bool(v)?,
             "use_engram" => cfg.use_engram = parse_bool(v)?,
             "use_gr" => cfg.use_gr = parse_bool(v)?,
             "use_mor" => cfg.use_mor = parse_bool(v)?,
@@ -248,6 +249,7 @@ mod tests {
     #[test]
     fn arm_flags_resolve_from_set() {
         assert!(one("use_situ=true").unwrap().use_situ);
+        assert!(one("use_plain_attn=true").unwrap().use_plain_attn);
         assert!(one("use_attnres=true").unwrap().use_attnres);
         assert!(one("use_mhc=true").unwrap().use_mhc);
         assert_eq!(one("mhc_streams=4").unwrap().mhc_streams, 4);

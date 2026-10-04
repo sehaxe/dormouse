@@ -90,6 +90,7 @@ pub fn byteflow_config(c: &DormouseConfig) -> ByteFlowConfig {
 pub fn compat_armed(c: &DormouseConfig) -> bool {
     c.use_byteflow
         && (c.use_kda
+            || c.use_plain_attn
             || c.use_engram
             || c.use_mor
             || c.use_msa

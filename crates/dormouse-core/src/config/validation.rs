@@ -167,6 +167,22 @@ pub fn validate(c: &DormouseConfig) -> Result<(), String> {
             c.moe_lb_coef
         ));
     }
+    // THE ATTENTION SLOT IS SINGLE-OCCUPANCY (`use_plain_attn` + `use_kda`).
+    // The loop's body has ONE attention statement and an if/else over the two
+    // arms, so a config with both on is a config whose attention runs one of
+    // them SILENTLY — the control wearing the other arm's label, which is the
+    // ADR-0019 defect and, for the controlled trio, a comparison between two
+    // different networks. `use_msa` is deliberately NOT in this list: it is an
+    // EXTRA stage (its own module, added to the block body alongside), not a
+    // second claimant of the attention slot.
+    if c.use_plain_attn && c.use_kda {
+        return Err(
+            "use_plain_attn with use_kda: the loop's body has one attention statement and an \
+             if/else over the two arms, so one of them would run SILENTLY. Set use_kda = false \
+             for the plain-transformer control (or use_plain_attn = false for the KDA arm)."
+                .into(),
+        );
+    }
     // Qwen Sparse Attention (msa): one loud check is the whole point - KB
     // >= the complete block count of a sequence runs the DENSE arm at a top-k's
     // price (and burn's argtopk cannot even express k == n, ADR-0015), so it
@@ -315,10 +331,11 @@ pub fn validate(c: &DormouseConfig) -> Result<(), String> {
         // standalone dispatch never BUILT a DormouseModel, so every loop arm
         // was dead under `use_byteflow`; the channel builds one, and an arm
         // this lane never lifted must not start running.
-        let arms: [(&str, bool); 7] = [
+        let arms: [(&str, bool); 8] = [
             ("use_engram", c.use_engram),
             ("use_mor", c.use_mor),
             ("use_msa", c.use_msa),
+            ("use_plain_attn", c.use_plain_attn),
             ("use_gr", c.use_gr),
             ("use_attnres", c.use_attnres),
             ("use_mhc", c.use_mhc),

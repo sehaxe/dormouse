@@ -67,6 +67,7 @@ pub mod msa_stage;
 pub mod moe;
 pub mod mor;
 pub mod param;
+pub mod plain_attn;
 pub mod probe;
 pub mod routing;
 

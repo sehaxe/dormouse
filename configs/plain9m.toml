@@ -1,0 +1,92 @@
+# plain9m — the PLAIN BYTE TRANSFORMER, i.e. the CONTROL of the controlled trio
+# (plain byte Transformer vs byteflow vs dormouse, one recipe, equal bytes;
+# docs/reviews/trio-prep-2026-10-04.md).
+#
+# WHAT THIS IS: every dormouse mechanism off, and the loop's one attention
+# statement filled by `use_plain_attn` — textbook dense causal multi-head
+# softmax attention (RoPE on q/k, no state, no top-k). It is a config and not a
+# new net BECAUSE the trio's whole claim is one recipe: the control has to
+# train through the same `train_loop`, the same optimizer routing, the same NaN
+# firewall and the same eval as the two arms it is compared against.
+#
+# WHY IT IS A NEW ARM AND NOT AN OLD FLAG (2026-10-04): this repository had no
+# plain-attention forward to point a control at. `use_kda = false` is a network
+# with NO attention arm, and `config::validate` REFUSES the sparse arm at
+# `msa_kb >= the block count` with the words "a sparse arm over every block IS
+# the dense arm at a top-k's price" — the repo's own doctrine saying the dense
+# control cannot be spelled as a sparse config.
+#
+# max_iter = 1 IS PART OF THE CONTROL, not a shortcut: depth > 1 in this model
+# IS the weight-shared loop under test, so a multi-layer plain control is not
+# reachable without a second UNSHARED stack. Read this preset as a ONE-LAYER
+# dense transformer and quote it as one. What survives with every mechanism off
+# is the loop's fixed scaffolding — the controller's sigmoid `w_attn`, ReZero's
+# scalar (init 1), `out_proj`, `iter_embed` (zeros at init) — all identity or
+# near-identity at step 0, all named in crates/dormouse-core/src/plain_attn.rs.
+bf16 = false
+act_group = 0
+d_model = 768
+n_heads = 12
+head_dim = 64
+d_ffn = 3520
+# THE WIDTH FOLLOWS THE MATCHING RULE, AND THE RULE IS "LIVE", NOT "COUNTED".
+# Measured 2026-10-04 on the instantiated models at these widths
+# (`cargo test -p dormouse-core --test plain9m_control -- --ignored
+# --nocapture`, which prints the whole split):
+#     plain9m   counted 12_669_934   trains  8_076_545   (at d_ffn = 3072)
+#     small     counted  9_197_454   trains ~8_770_000   (--no-engram, pure CE)
+# The two nets carry DIFFERENT dead weight - plain9m the always-built KDA arm
+# and the always-built aux heads, small the always-built Engram subtree and the
+# same aux heads - so equal COUNTED totals would mean shrinking this FFN to
+# ~813 to pay for weight neither net trains: distorting the architecture to
+# match a number that is not about learning. `d_ffn = 3520` puts the two nets
+# within 1% of each other in parameters that actually receive a gradient, which
+# is the comparison a trio needs. The `counted` number is what a run header
+# prints, so every table this preset appears in carries BOTH columns.vocab = 256
+max_seq_len = 512
+# One pass. See above.
+max_iter = 1
+# TSCT rank is not read on this path (`use_tsct = false`): the control's
+# projections are dense `burn::nn::Linear`s, which is the whole point.
+rank = 64
+use_tsct = false
+norm_eps = 0.001
+# THE attention slot: dense causal softmax, KDA off. Both on is REFUSED
+# (config::validate) because the loop's body would run one of them silently.
+use_plain_attn = true
+use_kda = false
+# Every other mechanism off.
+use_engram = false
+use_gr = false
+use_attnres = false
+use_mhc = false
+use_situ = false
+use_msa = false
+use_mor = false
+use_byteflow = false
+# One expert = a dense FFN. The controller's softmax blend over a single expert
+# is exactly 1.0, so the FFN branch is the dense SwiGLU an ordinary transformer
+# has, and `moe_topk = 0` keeps the blend dense.
+n_experts = 1
+moe_topk = 0
+jepa_weight = 0.0
+jepa_mask_frac = 0.15
+jepa_mask_span = 8
+dspark_weight = 0.0
+dspark_k = 4
+dspark_stride = 16
+aux_fb_weight = 0.0
+aux_fb_horizon = 2
+mor_k = 2
+mor_bce_weight = 0.0
+# THE MEMORY TABLES ARE BUILT WHATEVER THE ARM SAYS (`LoopBlock::new` always
+# calls `EngramModule::new`, so an off-arm checkpoint keeps its rows), and they
+# are PARAMETERS: `engram_rows = 25000` is 3 145 728 of the parameter count of
+# a run that never reads a row. Every `--no-engram` number in this repo's logs
+# therefore over-counts by 3.1M (docs/reviews/trio-prep-2026-10-04.md §3), and
+# the control zeroes the tables instead of accepting a count that is 34% dead
+# weight. 1 row is the smallest legal value (`validate` refuses 0).
+engram_rows = 1
+engram_orders = [2, 3, 4]
+engram_dim = 32
+engram_lam_max = 0.5

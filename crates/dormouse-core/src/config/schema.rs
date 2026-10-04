@@ -307,6 +307,30 @@ pub struct DormouseConfig {
     /// arm is slow.
     #[serde(default = "d_true")]
     pub use_kda: bool,
+    /// THE PLAIN-BYTE-TRANSFORMER CONTROL (`use_plain_attn`): textbook dense
+    /// causal multi-head softmax attention — `softmax(q·kᵀ/√d_head + mask)·v`,
+    /// four dense projections, RoPE on q/k, no state and no top-k. It exists
+    /// because the controlled trio (plain byte Transformer vs byteflow vs
+    /// dormouse, one recipe, equal bytes) needs a control that trains through
+    /// the SAME `train_loop`, and this repository had none: `use_kda = false` is
+    /// a network with no attention arm, and `config::validate` refuses the
+    /// sparse arm at `msa_kb >= the block count` precisely because "a sparse arm
+    /// over every block IS the dense arm at a top-k's price".
+    ///
+    /// It is an ATTENTION SLOT, not an extra stage: `use_plain_attn` with
+    /// `use_kda = true` is refused, because the forward's branch would pick one
+    /// of them silently (ADR-0019). `use_msa` is still allowed alongside it —
+    /// that arm is an extra stage by construction — but the control preset
+    /// (`configs/plain9m.toml`) has everything else off.
+    ///
+    /// **NOT a GPT-2, and the difference is fixed, not tuned**: the loop's
+    /// scaffolding (the controller's sigmoid `w_attn`, ReZero's scalar,
+    /// `out_proj`, `iter_embed`) survives with every mechanism switched off,
+    /// and depth > 1 IS the weight-shared loop under test, so this arm at
+    /// `max_iter = 1` is a ONE-LAYER dense transformer. See
+    /// [`crate::plain_attn`]'s module docs for the full list.
+    #[serde(default = "d_false")]
+    pub use_plain_attn: bool,
     /// Spectral (low-rank TSCT) linears vs plain dense ones. The spectral
     /// path is what makes the FFN 2048-wide on `small` (9 197 390 params,
     /// MEASURED on the instantiated model - the 7.5M in older comments here

@@ -111,6 +111,10 @@ fn execution_fields(c: &DormouseConfig) -> Vec<(&'static str, String)> {
         ("bf16", c.bf16.to_string()),
         ("act_quant", format!("{:?}", c.act_quant)),
         ("use_kda", c.use_kda.to_string()),
+        // The dense-attention control arm: which arm fills the loop's ONE
+        // attention statement decides what network this is, so it belongs here
+        // with `use_kda` rather than with the widths.
+        ("use_plain_attn", c.use_plain_attn.to_string()),
         ("use_tsct", c.use_tsct.to_string()),
         ("use_engram", c.use_engram.to_string()),
         ("use_gr", c.use_gr.to_string()),
@@ -212,6 +216,7 @@ fn executes(name: &str) {
         );
     };
     arm(cfg.use_kda, probe::KDA);
+    arm(cfg.use_plain_attn, probe::PLAIN_ATTN);
     arm(cfg.use_engram, probe::ENGRAM);
     // The memory branch: entered AND read. An arm that is entered with no
     // keys is inert - the difference between a memory and a table nobody
@@ -387,15 +392,21 @@ fn executes(name: &str) {
         fx.max_iter as u64,
         "{name}: one teacher-free forward must be max_iter iterations"
     );
-    let mut shallow = model.clone();
-    shallow.set_loop_depth(Some(2));
-    probe::reset();
-    let _ = shallow.forward::<B>(x, Some(h));
-    assert_eq!(
-        probe::count(probe::ITER),
-        2,
-        "{name}: set_loop_depth(2) did not truncate the loop"
-    );
+    // Skipped at depth 1, and the reason is not laziness: `set_depth` refuses
+    // n > max_iter LOUDLY, and the plain-transformer control runs ONE pass by
+    // construction (depth > 1 is the weight-shared loop under test). There is
+    // no shallower model to truncate to, so the check has nothing to check.
+    if fx.max_iter >= 2 {
+        let mut shallow = model.clone();
+        shallow.set_loop_depth(Some(2));
+        probe::reset();
+        let _ = shallow.forward::<B>(x, Some(h));
+        assert_eq!(
+            probe::count(probe::ITER),
+            2,
+            "{name}: set_loop_depth(2) did not truncate the loop"
+        );
+    }
     probe::reset();
     println!("{name}: ok, max_iter={} experts={} arms=kda:{} engram:{} gr:{} mor:{} jepa:{} dspark:{} ({} ms)",
         fx.max_iter, fx.n_experts, cfg.use_kda, cfg.use_engram, cfg.use_gr, cfg.use_mor,
@@ -466,6 +477,11 @@ fn byteflow_executes() {
 /// decoder's byte CE. `executes` proves the pair resolves and validates, the
 /// KDA arm entered on PATCH input, the channel counter moved, and the byte CE
 /// came back finite.
+#[test]
+fn plain9m_executes() {
+    executes("plain9m");
+}
+
 #[test]
 fn byteflow_kda_executes() {
     executes("byteflow_kda");
@@ -748,15 +764,41 @@ fn cost_of_preset(name: &str) -> CostSplit {
     let g = r
         .check(&model)
         .unwrap_or_else(|e| panic!("{name}: routing: {e}"));
-    assert_eq!(
-        g.muon,
-        4 * cfg.n_experts + 3,
-        "{name}: Muon+ group must follow n_experts"
-    );
-    assert_eq!(
-        g.qk, 2,
-        "{name}: the head-wise Q/K group is the KDA q and k"
-    );
+    // The Muon+ group's count is a claim about the model's TOPOLOGY, so it is
+    // asserted against the topology it describes. A dense model
+    // (`use_tsct = false` - the plain-transformer control) has no TSCT factor
+    // anywhere, and its only remaining Muon+ candidate is the Engram's key
+    // projection, which `LoopBlock::new` builds whether or not the memory arm
+    // is on. `0` there would mean that projection stopped being built, which is
+    // the defect the check exists for, so the assertion is NOT dropped for a
+    // dense preset - it changes shape.
+    if cfg.use_tsct {
+        assert_eq!(
+            g.muon,
+            4 * cfg.n_experts + 3,
+            "{name}: Muon+ group must follow n_experts"
+        );
+    } else {
+        assert_eq!(
+            g.muon, 1,
+            "{name}: a dense model's only Muon+ candidate is the Engram key projection"
+        );
+    }
+    // The head-wise Q/K group is the KDA q and k, so it follows the KDA arm and
+    // is empty without it. A dense attention arm has no head-wise policy (its
+    // projections are `Role`-less and land in Rest), which is the trio's
+    // "one optimizer for all three arms" requirement made structural.
+    if cfg.use_kda {
+        assert_eq!(
+            g.qk, 2,
+            "{name}: the head-wise Q/K group is the KDA q and k"
+        );
+    } else {
+        assert_eq!(
+            g.qk, 0,
+            "{name}: no KDA arm means no Q/K pair, so the head-wise group must be empty"
+        );
+    }
     assert_eq!(g.tables, 1, "{name}: the n-gram table is one parameter");
     assert_eq!(
         g.muon + g.qk + g.tables + g.rest,
@@ -781,6 +823,12 @@ const CHEAP_PRESETS: &[&str] = &[
     "mor",
     "nano",
     "nano-fused",
+    // The plain-byte-Transformer CONTROL of the controlled trio (2026-10-04).
+    // It is `small`'s parameter budget on a dense one-layer arm, so it costs
+    // what `small` costs; its cost line is where the trio's control price is
+    // read (crates/dormouse-core/tests/plain9m_control.rs holds the
+    // params-matched assertion and the never-read-memory-subtree measurement).
+    "plain9m",
     "small",
 ];
 

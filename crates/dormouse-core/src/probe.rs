@@ -132,11 +132,18 @@ pub const MSA_DISTILL: usize = 20;
 /// says `use_byteflow` is exactly the §3.2 shape — an eval that scored a
 /// different network than the one being trained.
 pub const BF_CHANNEL: usize = 21;
+/// The dense causal softmax arm (`use_plain_attn`) ran: one entry per executed
+/// iteration. COUNTED for the reason every arm here is counted — the plain
+/// byte Transformer is the CONTROL of the controlled trio, and a control whose
+/// attention silently fell through to the KDA branch (or to zeros) is a
+/// comparison between two different networks. The `plain=<n>` field on the eval
+/// line is over the EVAL's own forwards, like `engram=` and `bf=`.
+pub const PLAIN_ATTN: usize = 22;
 /// How many arms [`NAMES`] and the counter array hold. **Adding an arm means
 /// bumping this**, and the array is `[Cell<u64>; N_ARMS]`, so the compiler
 /// refuses a `NAMES` entry that does not fit — an arm cannot be named without
 /// being countable.
-pub const N_ARMS: usize = 22;
+pub const N_ARMS: usize = 23;
 /// Arm name per index, for assertion messages that name the thing.
 pub const NAMES: [&str; N_ARMS] = [
     "iterations",
@@ -161,6 +168,7 @@ pub const NAMES: [&str; N_ARMS] = [
     "msa",
     "msa_distill",
     "byteflow_channel",
+    "plain_attn",
 ];
 
 thread_local! {
