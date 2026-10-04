@@ -1571,6 +1571,18 @@ pub fn train_loop(
         })?;
         let loss_log = loss_log.into_inner();
         let aux_log = aux_log.into_inner();
+        // The router's utilization, taken OUT of the forward's seam closure and
+        // at the SAME log cadence as `aux_log` - one host read per log step,
+        // nothing else (§1.3). Taken here rather than inside the closure
+        // because the closure may be a CUDA-graph capture, and a thread-local
+        // write is a host side effect a capture must not depend on; taking it
+        // out on the far side of the step is also the only place the value is
+        // guaranteed to be THIS step's rather than the previous one's.
+        let util_log = if step % cfg.log_every as u64 == 0 {
+            dormouse_core::moe::take_util().map(dormouse_core::moe::util_note)
+        } else {
+            None
+        };
         let fwd_ms = t_fwd.elapsed().as_secs_f64() * 1000.0;
         let t_bwd = std::time::Instant::now();
         let lr = match stress.as_ref() {
@@ -1791,8 +1803,14 @@ pub fn train_loop(
                 Some(Some(v)) => format!(" aux={v:.4}"),
                 _ => String::new(),
             };
+            // `moe=[shares] H=.. dead=..`, present ONLY when the routed arm ran.
+            // The absence IS the signal (ADR-0019 COUNTED): a collapsed router
+            // prints `H=0.000 dead=4`, which is a number, while an arm that
+            // never ran prints nothing at all. There is no third state in
+            // which the field exists and means nothing.
+            let moe_note = util_log.clone().map(|s| format!(" {s}")).unwrap_or_default();
             println!(
-                "step {step:6} ce={ce:.3} bpb={bpb:.3} best={best:.3} lr={lr:.2e}{aux_note} \
+                "step {step:6} ce={ce:.3} bpb={bpb:.3} best={best:.3} lr={lr:.2e}{aux_note}{moe_note} \
                  retr_arm=batched:{}/factor:{} {mem}",
                 probe::count(probe::RETRACT_BATCHED),
                 probe::count(probe::RETRACT_FACTOR),

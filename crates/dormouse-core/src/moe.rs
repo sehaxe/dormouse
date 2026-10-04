@@ -28,6 +28,8 @@
 //! `mask_fill`-on-a-float idiom: no bool->float cast, no gather, no scatter, no
 //! host round-trip. Both are used verbatim.
 
+use std::cell::RefCell;
+
 use burn::tensor::activation::softmax;
 use burn::tensor::{Int, Tensor};
 
@@ -143,6 +145,129 @@ pub fn lb_aux(probs: &Tensor<2>, mask: &Tensor<2>, n_experts: usize) -> Tensor<1
     let f = mask.clone().mean_dim(0).reshape([e]); // [E] fraction of tokens selecting e
     let p = probs.clone().mean_dim(0).reshape([e]); // [E] mean router probability
     f.mul(p).sum().mul_scalar(n_experts as f32).reshape([1])
+}
+
+/// Where the entropy's `ln(0)` is replaced. Only ever reached by a DEAD
+/// expert, whose `p` is exactly `0.0`, and `0 * ln(anything) = 0` - which is
+/// the correct `0 ln 0` term. The floor exists so the log is finite rather
+/// than `NaN`, because a `NaN` in this field would be indistinguishable from
+/// a dead metric.
+const ENTROPY_FLOOR: f32 = 1e-12;
+
+/// Router UTILIZATION, as ONE `[n_experts + 2]` device tensor:
+///
+/// ```text
+/// [0..e]   share  - fraction of tokens whose top-k included expert i
+/// [e]      H      - Shannon entropy of that share, NORMALIZED by ln(e), in [0,1]
+/// [e + 1]  dead   - how many experts received ZERO tokens
+/// ```
+///
+/// # Why this exists: the router is unobservable from the loss
+///
+/// A top-k router that collapses - every token on expert 0 - produces a
+/// perfectly healthy loss curve, because the arm still computes every expert
+/// and the blend is still a valid convex combination (`docs/reviews/
+/// tsct-spec-2026-10-03.md` §12: top-k does NOT dispatch, so a collapsed
+/// router is not even slower). Nothing else on the line would say so. The
+/// balancer `lb_aux` is a *counter-measure*, not a measurement: with
+/// `moe_lb_coef = 0` - the shipped default, and the arm's own removal under
+/// §1.2 - it is computed and weighted at nothing, so it tells a reader
+/// nothing about the distribution it was written to keep balanced.
+///
+/// # WHY THE ENTROPY OF THE HARD SHARE, AND WHY IT IS NORMALIZED
+///
+/// Two candidates: the entropy of the mean router probability `P`, or of the
+/// hard token share `f`. The HARD share is the one reported because it is the
+/// quantity that decides the bill - every expert is computed regardless, but
+/// the share is what a future dispatch (§12's priority 1) would bill, and what
+/// "dead expert" is defined against (`f_e == 0`, i.e. a row nobody ever
+/// selected). `P` is reported by `lb_aux` and is a different number.
+///
+/// Normalizing by `ln(e)` is not cosmetic: it is what makes the number
+/// COMPARABLE across the capacity ladder, where the same run has `e = 2` and
+/// `e = 16`. Raw entropy is `ln(e)` at uniform, so a raw `H` would read
+/// `0.69` on a healthy 2-expert router and `2.77` on a healthy 16-expert one,
+/// and the only thing a reader wants is "1.0 = uniform, 0.0 = collapsed".
+///
+/// `k` is passed rather than recovered from `mask`, because the shares sum to
+/// `k`, not to 1: `f / k` is the probability distribution the entropy is taken
+/// over, and inferring `k` from the tensor would cost a reduce to compute a
+/// constant the caller already has.
+pub fn util_stats(mask: &Tensor<2>, k: usize) -> Tensor<1> {
+    assert!(k >= 1, "util_stats: k must be >= 1 (topk_blend's own floor), got {k}");
+    let e = mask.dims()[1];
+    // The same reduce `lb_aux` does, and for the same reason `mean_dim(0)` and
+    // not `mean()`: this is per-EXPERT over the TOKEN axis, so an expert's
+    // share must survive the reduction as a vector of length `e`.
+    let f = mask.clone().mean_dim(0).reshape([e]);
+    // `p = f / k` is the distribution; `H = -sum p ln p`; normalized by ln(e).
+    // Uniform routing scores exactly 1.0 and a one-hot distribution exactly
+    // 0.0, both by symmetry of the sum rather than by construction of a clamp.
+    let p = f.clone().div_scalar(k as f32);
+    let h = p
+        .clone()
+        .clamp_min(ENTROPY_FLOOR)
+        .log()
+        .mul(p)
+        .sum()
+        .neg()
+        .div_scalar((e as f32).ln());
+    // `dead` without a bool tensor: `MAX` over the TOKEN axis of a 0/1 mask is
+    // 1.0 exactly where SOME row selected the expert, so `1 - max` is its own
+    // dead indicator and the count is a float sum. Deliberately not
+    // `mask.eq(0).float()` - AGENTS.md §1.3 forbids building a numeric
+    // indicator from a bool tensor on device, and this needs no cast at all.
+    //
+    // MAX, and this was `min_dim` first, which is a real trap worth recording:
+    // `min` over the token axis is 1.0 only where EVERY row selected the
+    // expert, so with 8 tokens on 4 experts it reads 0.0 everywhere and every
+    // expert looks dead - a uniform router reporting `dead=4`. The uniform
+    // endpoint test caught it in one run.
+    let dead = mask.clone().max_dim(0).neg().add_scalar(1.0).sum();
+    Tensor::cat(vec![f, h.reshape([1]), dead.reshape([1])], 0)
+}
+
+thread_local! {
+    /// The most recent [`util_stats`], DETACHED. Same seam shape as
+    /// `mixture_probe`: a thread-local, written at the branch and read at a
+    /// declared cadence, so nothing about the hot path changes.
+    static LAST_UTIL: RefCell<Option<Tensor<1>>> = const { RefCell::new(None) };
+}
+
+/// Record one routed iteration's utilization. Called at the branch.
+///
+/// The tensor is **detached**, and that is load-bearing rather than tidiness.
+/// It is a statistic, it is never added to the loss, and an un-detached one
+/// would sit in this thread-local holding a reference into the autodiff tape
+/// of the step that produced it - so the tape of the PREVIOUS step would stay
+/// alive until the next forward overwrites it. At `max_iter = 4` that is
+/// activations nobody will ever backward through.
+pub(crate) fn record_util(stats: Tensor<1>) {
+    LAST_UTIL.with(|s| *s.borrow_mut() = Some(stats.detach()));
+}
+
+/// Take the last recorded utilization and clear it. `None` means the routed
+/// branch has not run on this thread since the last take - which is the whole
+/// ADR-0019 point: an absent field is an honest "the arm did not run", and it
+/// is distinguishable from "the metric is zero" because a dead router reports
+/// `H=0.000 dead=4`, not an empty field.
+pub fn take_util() -> Option<Tensor<1>> {
+    LAST_UTIL.with(|s| s.borrow_mut().take())
+}
+
+/// Format a [`util_stats`] tensor for a log line: `moe=[0.42,0.31,0.27] H=0.98 dead=0`.
+///
+/// This is the ONE place the layout of `util_stats` is interpreted, so the
+/// field widths and the slice arithmetic live next to the definition rather
+/// than being re-derived in a log statement.
+pub fn util_note(stats: Tensor<1>) -> String {
+    let v: Vec<f32> = stats
+        .into_data()
+        .try_to_vec()
+        .unwrap_or_else(|e| panic!("moe: utilization stat is not readable: {e}"));
+    let e = v.len() - 2;
+    let shares: Vec<String> = v[..e].iter().map(|x| format!("{x:.3}")).collect();
+    format!("moe=[{}] H={:.3} dead={:.0}", shares.join(","), v[e], v[e + 1])
 }
 
 #[cfg(test)]
@@ -627,5 +752,326 @@ mod tests {
         println!("  ~4096-token batch would need is ~64x larger again. NO coefficient is shipped:");
         println!("  moe_lb_coef stays 0.0 and the arm is off, because no value transfers and an");
         println!("  unswept default would be a number copied from a regime we are not in.");
+    }
+
+    /// Read a [`util_stats`] tensor back as `(shares, H, dead)`. The only
+    /// place in the crate that interprets the layout, together with
+    /// [`util_note`].
+    fn util(mask: &Tensor<2>, k: usize) -> (Vec<f32>, f32, f32) {
+        let v: Vec<f32> = util_stats(mask, k)
+            .into_data()
+            .try_to_vec()
+            .expect("util stats readable");
+        let e = v.len() - 2;
+        (v[..e].to_vec(), v[e], v[e + 1])
+    }
+
+    /// A REAL top-1 mask over `rows` rows in which exactly `counts[i]` rows
+    /// select expert `i`.
+    ///
+    /// Built through [`topk_blend`] rather than handed in as a literal tensor,
+    /// because the metric's input is a selection mask and a hand-built 0/1
+    /// tensor would be testing a different object than the one the loop feeds
+    /// it. The logits are `MASK_SCALE` on the chosen expert and 0 elsewhere -
+    /// a WIDE margin, so no row's argmax is ever near a tie (`topk_indices`' own
+    /// doc: a tied score makes the selected SET backend-defined, which would
+    /// make these tests measure the tie-break).
+    fn top1_mask(counts: &[usize], rows: usize) -> Tensor<2> {
+        const MASK_SCALE: f32 = 8.0;
+        let e = counts.len();
+        let mut left = counts.to_vec();
+        assert_eq!(
+            left.iter().sum::<usize>(),
+            rows,
+            "the counts must cover every row exactly once"
+        );
+        let mut flat = vec![0.0f32; rows * e];
+        for r in 0..rows {
+            let j = left.iter().position(|c| *c > 0).expect("a row is left to place");
+            flat[r * e + j] = MASK_SCALE;
+            left[j] -= 1;
+        }
+        let logits = Tensor::<2>::from_data(TensorData::new(flat, [rows, e]), &dev());
+        let (_gates, mask, _probs) = topk_blend(logits, 1);
+        mask
+    }
+
+    /// The two ENDPOINTS of a distribution's entropy: uniform scores exactly
+    /// 1.0, a one-hot exactly 0.0, on the normalized scale.
+    ///
+    /// The normalization is what earns its keep here, not the entropy. Raw
+    /// entropy is `ln(e)` at uniform, so an un-normalized reading is a
+    /// function of `n_experts` - which is the very axis the capacity ladder
+    /// moves - and comparing `e = 2` against `e = 16` on raw entropy would say
+    /// nothing about either. `1.0` at uniform is not a clamp: it falls out of
+    /// `-sum (1/e) ln(1/e) / ln(e)`.
+    #[test]
+    fn util_entropy_is_one_at_uniform_and_zero_at_collapse() {
+        let mask = top1_mask(&[2, 2, 2, 2], 8);
+        let (shares, h, dead) = util(&mask, 1);
+        for (i, s) in shares.iter().enumerate() {
+            assert!(
+                (s - 0.25).abs() < 1e-5,
+                "expert {i} share {s} != 2/8 - the reduction is over TOKENS, not over experts"
+            );
+        }
+        assert!(
+            (h - 1.0).abs() < 1e-4,
+            "uniform routing must score H = 1.0 normalized, got {h}"
+        );
+        assert_eq!(dead, 0.0, "uniform routing has no dead expert");
+
+        let mask = top1_mask(&[8, 0, 0, 0], 8);
+        let (shares, h, dead) = util(&mask, 1);
+        assert!(
+            h < 1e-4,
+            "a one-hot distribution has zero entropy, got {h}"
+        );
+        assert_eq!(
+            dead, 3.0,
+            "three of four experts received zero tokens; the dead count must say so"
+        );
+        assert_eq!(shares[0], 1.0, "the one live expert holds every token");
+    }
+
+    /// A PARTIAL collapse - the shape that actually happens, and the one a
+    /// dead-count alone under-reports: the survivors are unevenly loaded too.
+    ///
+    /// `p = (4/6, 2/6, 0, 0)`, so the host entropy is
+    /// `-(2/3 ln 2/3 + 1/3 ln 1/3) / ln 4 = 0.6887`, and it is checked against
+    /// that rather than against a range: a fixture with dead experts and a
+    /// uniform surviving split would score 1.0 here and pass a `< 1.0` gate
+    /// without the metric knowing anything.
+    #[test]
+    fn util_counts_a_partially_dead_router() {
+        let mask = top1_mask(&[4, 2, 0, 0], 6);
+        let (shares, h, dead) = util(&mask, 1);
+        assert_eq!(
+            dead, 2.0,
+            "experts 2 and 3 received zero tokens: the count is the number of DEAD EXPERTS, \
+             not the share of dead load (which would be 4/6)"
+        );
+        let p = [4.0f64 / 6.0, 2.0 / 6.0];
+        let host: f64 = -p.iter().map(|x| x * x.ln()).sum::<f64>() / 4.0f64.ln();
+        assert!(
+            (h as f64 - host).abs() < 1e-4,
+            "H = {h}, but the host entropy of p = (4/6, 2/6, 0, 0) is {host}"
+        );
+        assert!(
+            (shares[0] - 4.0 / 6.0).abs() < 1e-5,
+            "share[0] = {}, want 4/6",
+            shares[0]
+        );
+    }
+
+    /// THE GATE: **the router learns to specialize, and the entropy falls.**
+    ///
+    /// The other tests here pin the arithmetic. This one pins the SIGN - that
+    /// the number MOVES in the direction specialization goes - and it moves it
+    /// by TRAINING a router on a synthetic separable task, not by asserting
+    /// that one hand-built vector is smaller than another. A metric that ROSE
+    /// with specialization would pass every other test in this file and be
+    /// useless, which is why this is the test the instrument rests on.
+    ///
+    /// The task, and why it is the right one: the goal is to drive experts 2
+    /// and 3 to zero load while loading 0 and 1 heavily and roughly equally.
+    /// The objective that produces exactly that is the mean mask-share of the
+    /// two POISON experts, and it is the one the fixture optimizes - so the
+    /// entropy fall is a CONSEQUENCE of the objective rather than a property of
+    /// the metric. A uniform start (checked, not assumed) is what makes
+    /// "falls" a claim about learning rather than about the initial state.
+    #[test]
+    fn util_entropy_falls_when_the_router_learns_to_specialize() {
+        const ROWS: usize = 32;
+        const E: usize = 4;
+        const STEPS: usize = 60;
+        // Large, and for a measured reason rather than taste: the objective is
+        // a MEAN over 32 rows, so its gradient is diluted ~32x - the same `E /
+        // tokens` dilution `lb_aux`'s doc section names. With a small step the
+        // poison logits fall by ~0.1 over the whole run, which is far short of
+        // the margin needed to flip an argmax, and the gate then measures a
+        // metric that correctly did not move. The dilution is real and it is
+        // exactly why no published `moe_lb_coef` transfers to this box.
+        const LR: f32 = 20.0;
+        // The starting margin is 0.5 and not larger, for the same reason: the
+        // poison columns only have to fall by 0.5 to stop winning their rows,
+        // and a 4.0 margin would need ~8x the steps to get there.
+        const MARGIN: f32 = 0.5;
+
+        // Seeded UNIFORM BY CONSTRUCTION - expert `r % E` leads its row by 4.0 - and
+        // with a small deterministic row-varying jitter on top. Both halves are
+        // load-bearing and the first version had only the second, which is why
+        // it started at H = 0.94 rather than 1.0:
+        //
+        // * the 4.0 margin is what makes the start exactly uniform (asserted
+        //   below, not assumed) and keeps every row's argmax away from a tie,
+        //   which would make the selected SET backend-defined (`topk_indices`'
+        //   own doc);
+        // * the jitter is row-varying, because a batch of IDENTICAL rows could
+        //   only ever all pick the same expert and there would be no
+        //   distribution to concentrate - the same degeneracy the `lb_aux`
+        //   sweep test documents.
+        //
+        // DETERMINISTIC, not RNG: burn's global RNG is never seeded (AGENTS.md
+        // §3.7), so an RNG here would make the gate irreproducible.
+        let mut v: Vec<f32> = (0..ROWS * E)
+            .map(|i| {
+                let (r, j) = (i / E, i % E);
+                let jitter = 0.01 * ((i * 7) % 11) as f32;
+                if j == r % E {
+                    MARGIN + jitter
+                } else {
+                    jitter
+                }
+            })
+            .collect();
+
+        // Read the metric THROUGH the real path (topk_blend -> util_stats) on
+        // the initial state, and require it to be uniform. If it is not, the
+        // fixture is not the balanced router this gate needs and the fall below
+        // would be measuring something else.
+        let measure = |v: &[f32]| -> (Vec<f32>, f32, f32) {
+            let logits =
+                Tensor::<2>::from_data(TensorData::new(v.to_vec(), [ROWS, E]), &dev());
+            let (_gates, mask, _probs) = topk_blend(logits, 1);
+            util(&mask, 1)
+        };
+        let (shares0, h0, dead0) = measure(&v);
+        assert!(
+            (h0 - 1.0).abs() < 1e-3 && dead0 == 0.0,
+            "the gate must start from a uniform router: H = {h0}, dead = {dead0}, shares {shares0:?}"
+        );
+
+        for step in 0..STEPS {
+            let leaf = Tensor::<2>::from_data(TensorData::new(v.clone(), [ROWS, E]), &adev())
+                .require_grad();
+            let (_gates, _mask, probs) = topk_blend(leaf.clone(), 1);
+            // The mean PRE-top-k probability of the two POISON experts, as a
+            // `[1]` loss: `P_e` in Switch's notation, and the same shape as
+            // `lb_aux` minus the `f` factor.
+            //
+            // On `probs` and NOT on the mask or the gates, and that is the whole
+            // design constraint rather than a preference:
+            //
+            // * `mask` is built by `mask_fill` on an argsort index, so it has NO
+            //   gradient path to the logits at all. Differentiating it raises
+            //   "backward requires a tracked tensor" - it is not a weak signal,
+            //   it is structurally constant.
+            // * `gates` ARE tracked, and at top-1 they are piecewise constant
+            //   in the logits (a winner's renormalized gate is exactly 1.0), so
+            //   the gradient is identically zero wherever the selection does not
+            //   change. `lb_aux`'s own doc measures exactly this for the
+            //   renormalized variant, and it is why that term takes `probs`.
+            //
+            // So the objective reads `probs` for the same reason `lb_aux` does,
+            // and the METRIC still reads the hard `mask` - which is the whole
+            // point of the gate: the thing being optimized is soft, the thing
+            // being measured is the selection the model actually made.
+            let poison = Tensor::<1>::from_data(
+                TensorData::new(
+                    (0..E).map(|j| if j >= 2 { 1.0f32 } else { 0.0 }).collect(),
+                    [E],
+                ),
+                &leaf.device(),
+            );
+            let loss = probs
+                .mean_dim(0)
+                .reshape([E])
+                .mul(poison)
+                .sum()
+                .reshape([1]);
+            let g: Vec<f32> = leaf
+                .grad(&loss.backward())
+                .expect("the task loss must reach the router logits")
+                .into_data()
+                .try_to_vec()
+                .expect("grad readable");
+            // Ascend: the poison share is to be MINIMIZED.
+            for i in 0..ROWS * E {
+                v[i] -= LR * g[i];
+            }
+            if step == 0 {
+                let norm = g.iter().map(|x| x * x).sum::<f32>().sqrt();
+                assert!(
+                    norm > 0.0,
+                    "the task gradient is exactly zero: the fixture cannot teach the router \
+                     anything, so the entropy gate below would be asserting a property of the \
+                     metric rather than of learning"
+                );
+            }
+        }
+
+        let (shares, h, dead) = measure(&v);
+        println!(
+            "utilization gate: H {h0:.4} -> {h:.4}, dead {dead0:.0} -> {dead:.0}, learned shares \
+             {shares:?}"
+        );
+        assert!(
+            h < h0 - 0.05,
+            "a router that drove two experts to zero load must LOWER the entropy: {h0} -> {h} \
+             is not a fall. If it does not fall, this metric is not measuring specialization."
+        );
+        assert!(
+            h > 0.0,
+            "the learned router put EVERY token on one expert (H = 0). The fixture only \
+             penalizes experts 2 and 3, so a one-hot on 0 or 1 IS a minimum of it - which \
+             means the fixture cannot distinguish the fall it wants from a collapse, and the \
+             share assertion below is the one that rules collapse out."
+        );
+        assert_eq!(
+            dead, 2.0,
+            "experts 2 and 3 are the objective's target, so exactly TWO must end dead: \
+             shares {shares:?}"
+        );
+        // The anti-collapse half, and the reason the previous assertion is not
+        // redundant: the fall must be a SPECIALIZED distribution over the two
+        // survivors, not one expert taking everything. 4/32 = 0.125 per expert
+        // is the fixture's floor at this step count.
+        assert!(
+            shares[0] > 0.15 && shares[1] > 0.15,
+            "the survivors must both hold real load, or the router collapsed instead of \
+             specializing: shares {shares:?}"
+        );
+        assert!(
+            shares.iter().sum::<f32>() > 0.99 && shares.iter().sum::<f32>() < 1.01,
+            "top-1 shares must sum to 1 over the experts - got {}, which would mean the \
+             reduction is not over tokens",
+            shares.iter().sum::<f32>()
+        );
+    }
+
+    /// The seam, not the arithmetic: the routed loop RECORDS a utilization and
+    /// the dense control records NONE, and taking it clears it.
+    ///
+    /// This is the ADR-0019 shape turned on its own instrument. Every test
+    /// above pins what `util_stats` computes; nothing would fail if
+    /// `forward_full_state` stopped calling it, and the log field would then
+    /// be permanently empty on a run whose config says `moe_topk > 0` - a
+    /// reader concluding the arm was off. Absent-after-take is the other half:
+    /// a `take` that did not clear would report a STALE step's utilization
+    /// forever, which is worse than silence because it looks alive.
+    #[test]
+    fn the_seam_records_on_the_routed_arm_and_clears_on_take() {
+        assert!(take_util().is_none(), "a fresh thread holds no utilization");
+        let (_, mask, _) = topk_blend(t(&fixture()), 1);
+        let stats = util_stats(&mask, 1);
+        record_util(stats);
+        let taken = take_util().expect("the routed branch recorded a utilization");
+        assert!(
+            take_util().is_none(),
+            "take must CLEAR: a seam that keeps its value reports the previous step's numbers"
+        );
+        let note = util_note(taken);
+        assert!(
+            note.starts_with("moe=[") && note.contains("H=") && note.contains("dead="),
+            "the note must be the log field a reader greps for, got {note:?}"
+        );
+        // The note's shape is the contract with the log line, so pin the exact
+        // number of shares it prints: `n_experts - 1` of them for this fixture.
+        assert_eq!(
+            note.matches(',').count(),
+            3,
+            "four experts must print four shares and nothing else, got {note:?}"
+        );
     }
 }

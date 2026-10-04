@@ -57,6 +57,12 @@ fn cfg(topk: usize) -> DormouseConfig {
         use_kda: false,
         use_engram: false,
         use_tsct: false,
+        // The byteflow channel is OFF here for the same reason the three
+        // above are: it is not what this file is about, and it carries no aux
+        // heads, so `validate` refuses the `Default::default()` it used to
+        // inherit once `fdcd030` flipped the schema default to `true`. These
+        // fixtures pin every arm they depend on; this is the fourth.
+        use_byteflow: false,
         jepa_weight: 0.0,
         dspark_weight: 0.0,
         moe_topk: topk,

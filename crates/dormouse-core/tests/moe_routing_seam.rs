@@ -51,6 +51,12 @@ fn cfg(topk: usize) -> DormouseConfig {
         use_kda: false,
         use_engram: false,
         use_tsct: false,
+        // The byteflow channel is OFF here for the same reason the three
+        // above are: it is not what this file is about, and it carries no aux
+        // heads, so `validate` refuses the `Default::default()` it used to
+        // inherit once `fdcd030` flipped the schema default to `true`. These
+        // fixtures pin every arm they depend on; this is the fourth.
+        use_byteflow: false,
         jepa_weight: 0.0,
         dspark_weight: 0.0,
         moe_topk: topk,
@@ -316,5 +322,91 @@ fn the_balancer_reaches_the_loss_only_with_a_selection() {
         t <= 0.01 * EXPERTS as f32 * (1.0 + 1e-5),
         "the balancer is bounded by coef * E = {}, got {t}",
         0.01 * EXPERTS as f32
+    );
+}
+
+/// THE UTILIZATION SEAM: a routed forward RECORDS a reading, a dense forward
+/// records none, and the recorded reading describes THIS forward.
+///
+/// `moe.rs`'s unit tests pin what `util_stats` computes from a mask. Nothing
+/// there would fail if `forward_full_state` stopped calling it - and then the
+/// trainer's log field would be permanently empty on a run whose config says
+/// `moe_topk = 1`, which a reader reads as "the arm was off". That is the
+/// `probe::JEPA` class (a counter bumped nowhere) pointed at a metric instead
+/// of a counter, so the seam gets its own gate here.
+///
+/// The third assertion is the one that stops this from being a tautology: the
+/// note must carry `EXPERTS` shares, a normalized entropy inside `[0, 1]` and
+/// a dead count inside `[0, EXPERTS]`. A seam that recorded a zero tensor, or
+/// one built from the dense blend (which has full support, so every expert
+/// looks alive and H would read 1.0 on a run that routed nothing), would fail
+/// on the ranges and the counts.
+#[test]
+fn the_routed_arm_records_a_utilization_and_the_dense_control_does_not() {
+    use dormouse_core::moe;
+    let head = head();
+
+    // Off: no record. Taken BEFORE the routed forward so a leak from an
+    // earlier test on this thread cannot be mistaken for this arm's.
+    let block_off = LoopBlock::new(&cfg(0), &adev());
+    let _ = block_off.forward_full_state::<B>(x(), None, None, None, None, None, &head);
+    assert!(
+        moe::take_util().is_none(),
+        "the dense blend must record NO utilization: every expert has positive weight there, \
+         so any number derived from it would describe a distribution the model never chose"
+    );
+
+    // On: a record, with a well-formed reading.
+    let block_on = LoopBlock::new(&cfg(1), &adev());
+    let _ = block_on.forward_full_state::<B>(x(), None, None, None, None, None, &head);
+    let stats = moe::take_util().expect("the routed arm must record a utilization");
+    let v: Vec<f32> = stats
+        .into_data()
+        .try_to_vec()
+        .expect("the utilization stat is readable");
+    assert_eq!(
+        v.len(),
+        EXPERTS + 2,
+        "util_stats returns [shares, H, dead] - {} experts must give {} values, got {}",
+        EXPERTS,
+        EXPERTS + 2,
+        v.len()
+    );
+    let (h, dead) = (v[EXPERTS], v[EXPERTS + 1]);
+    assert!(
+        (0.0..=1.0).contains(&h),
+        "the normalized entropy must lie in [0, 1], got {h}"
+    );
+    assert!(
+        (0.0..=EXPERTS as f32).contains(&dead),
+        "the dead count must lie in [0, {EXPERTS}], got {dead}"
+    );
+    assert!(
+        (v[..EXPERTS].iter().sum::<f32>() - 1.0).abs() < 1e-4,
+        "top-1 shares must sum to 1 over the experts - got {}, which means the reduction is \
+         not over tokens",
+        v[..EXPERTS].iter().sum::<f32>()
+    );
+    // And the note the trainer prints carries all three, so the format the log
+    // line depends on is pinned here rather than discovered by grepping a log.
+    let note = moe::util_note(
+        burn::tensor::Tensor::<1>::from_data(
+            burn::tensor::TensorData::new(v.clone(), [EXPERTS + 2]),
+            &adev(),
+        ),
+    );
+    assert_eq!(
+        note.matches(',').count(),
+        EXPERTS - 1,
+        "the note must print {EXPERTS} shares separated by commas: {note:?}"
+    );
+    assert!(note.contains("H=") && note.contains("dead="), "note = {note:?}");
+
+    // Consumed: a second take is empty, so the next step's reading cannot be
+    // the previous step's.
+    assert!(
+        moe::take_util().is_none(),
+        "take must CLEAR - a seam that keeps its value would report the previous forward's \
+         distribution forever"
     );
 }

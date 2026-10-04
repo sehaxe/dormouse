@@ -1,0 +1,54 @@
+# dormouse preset: moe-cap-2 (the capacity ladder, rung 2)
+#
+# `small` field for field, with ONE difference: `n_experts = 2`. That is the
+# whole point of this file - a ladder rung is the control config with a single
+# number changed, so that an A/B against `small` differs in capacity and in
+# nothing else. `small` itself is rung 3 (`n_experts = 3`), so the ladder is
+# 2 / 3 / 4 / 8 / 16 with `small` doubling as the third rung rather than
+# being duplicated.
+#
+# WHY 2 IS THE BOTTOM: `small`'s controller already allocates
+# `3 + n_experts` columns out of its padded width, and `routing.rs` asserts
+# the Muon+ group follows `4 * n_experts + 3`, so 1 is a legal but degenerate
+# arm (it is the fixed mixture wearing a router's clothes). 2 is the smallest
+# rung at which the router can actually CHOOSE.
+#
+# The ladder is a CAPACITY measurement, not a shipped recipe: the measured
+# params and the FLOP accounting for all four rungs are in
+# docs/reviews/moe-dev-2026-10-03.md §3, measured on the instantiated model by
+# `cargo test -p dormouse-core --test preset_exec -- --ignored`.
+#
+# NOT AN A/B WINNER. These rungs exist to price capacity. Whether more experts
+# help is a separate question with its own protocol (tools/moe_ab.sh, 3 seeds
+# per arm, 2k steps) and NO rung here has run it.
+bf16 = false
+act_group = 0
+d_model = 768
+n_heads = 12
+head_dim = 64
+d_ffn = 2048
+vocab = 256
+use_byteflow = false
+max_seq_len = 512
+max_iter = 4
+rank = 64
+norm_eps = 0.001
+use_kda = true
+use_engram = true
+use_gr = false
+n_experts = 2
+jepa_weight = 0.05
+jepa_mask_frac = 0.15
+jepa_mask_span = 8
+dspark_weight = 0.0
+dspark_k = 4
+dspark_stride = 16
+aux_fb_weight = 0.0
+aux_fb_horizon = 2
+engram_rows = 25000
+engram_orders = [2, 3, 4]
+engram_dim = 32
+engram_lam_max = 0.5
+use_mor = false
+mor_k = 2
+mor_bce_weight = 0.05
