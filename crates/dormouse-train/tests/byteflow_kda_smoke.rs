@@ -247,20 +247,13 @@ fn the_untouched_refusals_still_refuse() {
     //    everything refuses these too.
     byteflow::check(&TrainCfg::default())
         .expect("the default train cfg must not be one of the refused ones");
-    let cases: [(TrainCfg, &str); 8] = [
+    let cases: [(TrainCfg, &str); 7] = [
         (
             TrainCfg {
                 bf16: Some(true),
                 ..Default::default()
             },
             "--bf16",
-        ),
-        (
-            TrainCfg {
-                graph_capture: true,
-                ..Default::default()
-            },
-            "--graph-capture",
         ),
         (
             TrainCfg {

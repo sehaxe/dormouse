@@ -88,13 +88,6 @@ pub fn check(cfg: &TrainCfg) -> Result<(), String> {
              flag would silently do nothing. Run the byteflow arm fp32 (the paper's recipe).",
         );
     }
-    if cfg.graph_capture {
-        return refuse(
-            "--graph-capture",
-            "v1 of the arm does not implement capture; the dormouse loop's graph seam is \
-             untouched by this module and off here",
-        );
-    }
     if cfg.jepa_targets.is_some() {
         return refuse("--jepa-targets", "ByteFlowNet carries no JEPA teacher");
     }

@@ -7,7 +7,7 @@
 # back stage lifts the K outputs to 512 byte positions. Every OTHER dormouse
 # arm stays refused (config::validate), every aux weight must be 0, and
 # byteflow::check's train-side flags (`--bf16`, `--engram-ram`, `--rand-depth`,
-# `--eval-depths`, `--stress`, `--graph-capture`, `--opt` outside
+# `--eval-depths`, `--stress`, `--opt` outside
 # {adamw, mix}) stay refused too. This file is `byteflow.toml` with the one
 # lifted pair flipped; the byteflow_* numbers are the byteflow_9m shape
 # (docs/reviews/byteflow-rate-2026-10-02.md §5), UNCHANGED.

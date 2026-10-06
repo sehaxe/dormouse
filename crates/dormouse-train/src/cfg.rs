@@ -7,7 +7,6 @@ use dormouse_core::DormouseConfig;
 use serde::{Deserialize, Serialize};
 
 use crate::TrainCfg;
-
 /// A fully resolved run: where the config came from, the model config, and
 /// the train-layer config. Literal-constructible for tests.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -102,14 +101,7 @@ pub fn resolve(preset: &str, set: &[String], mut train: TrainCfg) -> Result<RunC
     }
     // 4. Validate the merged config (the train path previously never did).
     dormouse_core::config::validate(&model)?;
-    // 4b. `--graph-capture` / `--graph-stage` against the arms that would make
-    // the captured region a different computation than the run claims to be
-    // doing: one named error each, before any GPU work (`graph::check` /
-    // `stage::check`).
-    let run = RunCfg { source: preset.to_string(), model, train };
-    crate::graph::check(&run)?;
-    crate::stage::check(&run)?;
-    Ok(run)
+    Ok(RunCfg { source: preset.to_string(), model, train })
 }
 
 impl RunCfg {
@@ -120,9 +112,35 @@ impl RunCfg {
         toml::to_string_pretty(self).expect("RunCfg serializes to toml")
     }
 
-    /// Inverse of [`RunCfg::snapshot_toml`].
+    /// Inverse of [`RunCfg::snapshot_toml`]. Keys the 0.22 port cut from
+    /// `TrainCfg` — the hand-written CUDA-graph seam and stage — refuse here
+    /// with their replacement named, rather than silently dropping out of the
+    /// struct: a resume whose snapshot still carries them is a different
+    /// execution wanting to continue under one step count (ADR-0011 loud).
     pub fn from_snapshot(s: &str) -> Result<RunCfg, String> {
-        toml::from_str(s).map_err(|e| format!("config snapshot parse: {e}"))
+        // Parsed as a value first: serde (container `#[serde(default)]`, no
+        // `deny_unknown_fields`) would swallow an unknown key without a word.
+        let v: toml::Value = toml::from_str(s).map_err(|e| format!("config snapshot parse: {e}"))?;
+        let record: RunCfg = toml::from_str(s).map_err(|e| format!("config snapshot parse: {e}"))?;
+        let gone = [
+            ("graph_capture", "burn's native graph capture follow-up"),
+            ("graph_stage", "burn's native graph capture follow-up"),
+        ];
+        let train = v.get("train").and_then(toml::Value::as_table);
+        let killed: Vec<&str> = gone
+            .iter()
+            .filter(|(k, _)| train.is_some_and(|t| t.contains_key(*k)))
+            .map(|(k, _)| *k)
+            .collect();
+        if !killed.is_empty() {
+            return Err(format!(
+                "config snapshot carries train key(s) deleted by the 0.22 port: {}. The \
+                 hand-written CUDA-graph seam is gone; replacement: native burn capture - \
+                 a follow-up. Drop the key(s) from the snapshot or pick a new --ckpt-name.",
+                killed.join(", ")
+            ));
+        }
+        Ok(record)
     }
 
     /// `model.*` / `train.*` keys where `self` and `other` differ. `source`
@@ -281,56 +299,13 @@ mod tests {
     /// every field the struct has. A skipped field shows up as a deficit
     /// here, whatever its name and whatever it does; adding a field without
     /// adding it to the snapshot (or vice versa) fails the count.
-    /// `--graph-capture` is a LOUD refusal beside every arm that would make the
-    /// captured window a different computation than the run claims to be
-    /// doing. Three gates, one per arm, each naming the arm (ADR-0011: a
-    /// fallback is excused by the caller being able to say which arm ran).
-    #[test]
-    fn graph_capture_refuses_the_arms_it_cannot_capture() {
-        let named = |t: TrainCfg| {
-            resolve("small", &[], t).expect_err("--graph-capture must refuse this arm")
-        };
-        let e = named(TrainCfg { graph_capture: true, rand_depth: true, ..Default::default() });
-        assert!(e.contains("rand-depth"), "{e}");
-        let e = named(TrainCfg { graph_capture: true, engram_ram: true, ..Default::default() });
-        assert!(e.contains("engram-ram"), "{e}");
-        // Offline JEPA targets are a per-chunk upload v1 does not pin.
-        let e = named(TrainCfg {
-            graph_capture: true,
-            jepa_targets: Some(std::path::PathBuf::from("t.bin")),
-            ..Default::default()
-        });
-        assert!(e.contains("jepa-targets"), "{e}");
-    }
-
-    /// The flag alone resolves ON CUDA: the refusals above are about the other
-    /// arm, not about the flag. Off CUDA the flag alone is the refusal the
-    /// other test owns.
-    #[cfg(feature = "cuda")]
-    #[test]
-    fn graph_capture_alone_resolves_on_cuda() {
-        resolve("small", &[], TrainCfg { graph_capture: true, ..Default::default() })
-            .expect("--graph-capture on its own is legal on CUDA");
-    }
-
-    /// Off CUDA there is no graph, and a flag that cannot do what it says is
-    /// not a flag. On a CUDA build this cell is compiled away (the refusal is
-    /// then unreachable, which is the point).
-    #[cfg(not(feature = "cuda"))]
-    #[test]
-    fn graph_capture_is_refused_off_cuda() {
-        let e = resolve("small", &[], TrainCfg { graph_capture: true, ..Default::default() })
-            .expect_err("there is no graph off CUDA");
-        assert!(e.contains("cuda"), "{e}");
-    }
-
     #[test]
     fn snapshot_carries_every_train_field() {
         // The field list, written out. This is the price of the guarantee and
         // it is paid ONCE: a new TrainCfg field must be added here, which is
         // exactly the moment the author has to ask "does this belong in the
         // snapshot?" - the question the skip hid.
-        const FIELDS: [&str; 44] = [
+        const FIELDS: [&str; 42] = [
             "steps", "ckpt_every", "log_every", "seq_len", "batch", "lr", "wd",
             "grad_clip", "ckpt_name", "eval_every", "opt", "quant",
             "factors_fallback", "rand_depth", "eval_batches", "eval_depths",
@@ -338,8 +313,7 @@ mod tests {
             "stress_every", "engram_ram", "engram_slots", "host_adam_every",
             "warmup", "quant_check", "timers", "memlog", "bf16", "act_quant",
             "act_group", "max_iter", "no_kda", "no_engram", "byteflow", "jepa_weight",
-            "dspark_weight", "dspark_k", "jepa_targets", "seed", "graph_capture", "graph_stage",
-            "jepa_mask_span",
+            "dspark_weight", "dspark_k", "jepa_targets", "seed", "jepa_mask_span",
         ];
         // An Option field that is None is omitted by the TOML serializer, so
         // a skipped Option is invisible to the round trip too. Set them.
@@ -426,8 +400,7 @@ mod tests {
     /// Drift check: a re-resolved config that differs from the stored
     /// snapshot names the changed key (model AND derived train keys).
     #[test]
-    fn drift_names_changed_keys() {
-        let run = resolve("small", &set("max_iter=6"), TrainCfg::default()).unwrap();
+    fn drift_names_changed_keys() {        let run = resolve("small", &set("max_iter=6"), TrainCfg::default()).unwrap();
         let stored = RunCfg::from_snapshot(&run.snapshot_toml()).unwrap();
         let changed = resolve("small", &set("max_iter=10"), TrainCfg::default()).unwrap();
         let keys = changed.diff_keys(&stored);
@@ -463,6 +436,23 @@ mod tests {
             "{:?}",
             longer.diff_keys(&stored)
         );
+    }
+
+    /// A snapshot that still carries a key the 0.22 port cut from `TrainCfg`
+    /// is refused with the key named and the replacement named (the owner's
+    /// rule for flags the deleted seam left behind) - NOT silently dropped by
+    /// serde's tolerant unknown-key handling.
+    #[test]
+    fn snapshot_refuses_graph_keys_left_by_the_port() {
+        let run = resolve("small", &[], TrainCfg::default()).unwrap();
+        let stale = run.snapshot_toml().replace("[train]", "[train]\ngraph_capture = false");
+        let e = RunCfg::from_snapshot(&stale).expect_err("the deleted key must refuse");
+        assert!(
+            e.contains("graph_capture") && e.contains("native burn capture"),
+            "{e}"
+        );
+        // And the sectionless shape drifts nothing: a live snapshot parses.
+        RunCfg::from_snapshot(&run.snapshot_toml()).expect("clean snapshot still parses");
     }
 
     #[test]
