@@ -15,9 +15,10 @@ workspace = true
 [dependencies]
 burn = { workspace = true, features = ["std", "extension", "cuda"] }
 burn-cuda = { workspace = true, features = ["std", "autotune"] }
-# `cubecl` only for the two patched types the zero-copy section names
+# `cubecl` only for the two types the zero-copy section names
 # (`cubecl::cuda::CudaServer`); every other crate is reachable through burn.
-cubecl = { version = "0.11.0-pre.4", default-features = false, features = ["std", "cuda"] }
+# Stock 0.11.0: the [patch.crates-io] layers died with the 0.22 port.
+cubecl = { version = "0.11.0", default-features = false, features = ["std", "cuda"] }
 # Raw CUDA driver + a dlopen'd cuBLAS. Pinned to the cudarc the lock already
 # resolved, so the probe cannot pull a second copy into the graph; note the
 # `cublas` cargo feature is deliberately NOT enabled (it would recompile every

@@ -9,7 +9,7 @@ members = [
 ]
 # vendored fork workspaces: they are their own workspace roots; without this
 # cargo resolves their crates' `workspace = true` inheritance against OUR root.
-exclude = ["vendor/dormouse-fused", "vendor/cubecl-fix", "vendor/cubek-fix"]
+exclude = ["vendor/dormouse-fused"]
 resolver = "2"
 [workspace.package]
 version = "0.1.0"
@@ -34,9 +34,9 @@ license = "MIT"
 # version at all; and the `cubecl-*` crates, one caller each. Both are single
 # readers, and a table entry with a single reader cannot catch anything.
 [workspace.dependencies]
-burn = { version = "0.22.0-pre.4", default-features = false }
-burn-tensor = { version = "0.22.0-pre.4", default-features = false }
-burn-cuda = { version = "0.22.0-pre.4", default-features = false }
+burn = { version = "0.22.0", default-features = false }
+burn-tensor = { version = "0.22.0", default-features = false }
+burn-cuda = { version = "0.22.0", default-features = false }
 serde = { version = "1", features = ["derive"] }
 rand = "0.8"
 toml = "0.8"
@@ -96,29 +96,3 @@ opt-level = 0
 opt-level = 0
 [profile.dev.package.dormouse-cli]
 opt-level = 0
-
-# Same patches as aria: stale-page-safe cubecl (#1401 root fix, ported onto
-# 0.11.0-pre.4 where the pools moved into the new cubecl-server crate).
-# cubek comes from crates.io (local /tmp/cubek with matmul tail fixes was
-# lost to the tmpfs wipe; registry cubek 0.3.0-pre.4 has the fp4 helpers).
-[patch.crates-io]
-cubecl-runtime = { path = "vendor/cubecl-fix/cubecl-runtime" }
-cubecl-server = { path = "vendor/cubecl-fix/cubecl-server" }
-cubecl-cuda = { path = "vendor/cubecl-fix/cubecl-cuda" }
-# cubecl-ir carries pliron's f16 size interfaces (ADR-0016 bug 3, ~40 lines in
-# src/types/scalar.rs). pliron's `builtin.fp16` - the type `cube.f16` lowers to -
-# implemented `FloatTypeInterface` and no `SizedType`, and the shared-memory
-# sizing query (`cubecl-opt/src/lib.rs:36-40`) unwraps that cast. An f16 matmul
-# is the one matmul that stages f16 tiles, so f16 is the one element type that
-# reaches it: the candidate kernel panicked at compile, and the autotuner
-# caught it and fell back to a non-accelerated routine, so f16 matmul was
-# CORRECT and silently un-accelerated. SizedType is LOCAL to this crate, which
-# is why the impl is legal here and not in a downstream crate. This is the only
-# cubecl-ir change; the f64 and bf16 equivalents are deliberately not touched.
-cubecl-ir = { path = "vendor/cubecl-fix/cubecl-ir" }
-# cubek-reduce carries the top-k index kernel (ADR-0015). Vendored, not forked
-# from a working copy: 0.3.0-pre.4's `reaches` fast-path guard cannot tell an
-# empty top-k slot from one holding -inf, so a masked score row emits the
-# `u32::MAX` seed coordinate as an index and the caller's gather reads out of
-# bounds. Two hunks in src/components/instructions/{topk,base}.rs.
-cubek-reduce = { path = "vendor/cubek-fix/cubek-reduce" }

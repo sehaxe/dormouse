@@ -31,11 +31,11 @@ cubecl = { workspace = true, optional = true, features = ["std"] }
 burn-ndarray = { workspace = true, features = ["blas-openblas"] }
 burn-cuda = { workspace = true }
 burn-autodiff = { workspace = true }
-# The probe must install the same pool the trainer installs, and
-# `MemoryPoolsConfig` is not re-exported by the `cubecl` meta-crate. Pinned to
-# the same `0.11.0-pre.*` line `cubecl` resolves to, not `workspace = true`:
-# the fork's root manifest is shared and must not be edited from a leaf crate.
-cubecl-runtime = { version = "0.11.0-pre.3", default-features = false, features = [
+# The probe must see the same allocator API the trainer sees; pinned to the
+# stock `0.11.0` line burn resolves to (the fork's `MemoryPoolsConfig` and the
+# pre.4 pin are gone with the patches), not `workspace = true`: the fused
+# workspace's root manifest is shared and must not be edited from a leaf crate.
+cubecl-runtime = { version = "0.11.0", default-features = false, features = [
     "std",
 ] }
 burn = { workspace = true, features = ["ndarray", "autodiff", "cuda", "extension"] }
