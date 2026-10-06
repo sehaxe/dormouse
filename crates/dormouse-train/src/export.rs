@@ -519,7 +519,7 @@ impl ModuleMapper for Loader {
         // the cardinal sin (ADR-0011), and it is reachable by editing one
         // number in a header.
         let want = param.val().dims();
-        let got: Vec<usize> = data.shape.to_vec();
+        let got: Vec<usize> = data.shape().to_vec();
         if want.to_vec() != got {
             self.mismatched.push(format!(
                 "{name}: model wants {want:?}, file carries {got:?}"

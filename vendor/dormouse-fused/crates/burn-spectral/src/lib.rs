@@ -391,10 +391,11 @@ pub fn ortho_error(u: &Tensor<2>) -> f32 {
     }
     let eye_t = Tensor::<2>::from_data(burn::tensor::TensorData::new(eye, [k, k]), &device);
     let diff = u.clone().transpose().matmul(u.clone()) - eye_t;
-    diff.powf_scalar(2.0)
-        .into_data()
-        .bytes
-        .chunks_exact(4)
+    // `.bytes()` returns an owned buffer, so it must be bound before the
+    // borrow — the field access never had this problem.
+    let data = diff.powf_scalar(2.0).into_data();
+    let raw = data.bytes();
+    raw.chunks_exact(4)
         .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
         .sum::<f32>()
         .sqrt()
@@ -444,7 +445,8 @@ pub fn ortho_error_forward(u: &Tensor<2>, alpha: f32) -> f32 {
 /// 3.6e-2), so this function has no policy in it — a metric that hardcoded
 /// its own threshold would be a second place to change the answer.
 pub fn spectrum_stats(s: &Tensor<1>, near_off: f32) -> (f32, f32, usize) {
-    let bytes = s.clone().abs().into_data().bytes;
+    let data = s.clone().abs().into_data();
+    let bytes = data.bytes();
     let vals: Vec<f32> = bytes
         .chunks_exact(4)
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))

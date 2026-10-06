@@ -19,17 +19,17 @@ workspace = true
 # this workspace (dormouse-core enables it), so this crate adds no new feature
 # to the shared `burn` build. Enabling `flex` here re-fingerprints the whole
 # burn stack for every crate in the workspace - measured, do not.
-burn = { version = "0.22.0-pre.4", default-features = false, features = [
+burn = { version = "0.22.0", default-features = false, features = [
     "std",
     "ndarray",
 ] }
 
 [dev-dependencies]
-burn-ndarray = { version = "0.22.0-pre.4", features = ["blas-openblas"] }
+burn-ndarray = { version = "0.22.0", features = ["blas-openblas"] }
 # the subject of the ADR-0015 gate: the top-k -> gather primitive, whose
 # `argtopk` is the kernel the gate is about.
 burn-mor = { path = "../../vendor/dormouse-fused/crates/burn-mor" }
-burn-cuda = { version = "0.22.0-pre.4", default-features = false, features = [
+burn-cuda = { version = "0.22.0", default-features = false, features = [
     "std",
     "autotune",
 ] }
