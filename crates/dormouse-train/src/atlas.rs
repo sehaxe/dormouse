@@ -1,35 +1,28 @@
-//! Per-stage kernel-launch atlas (`DM_LAUNCH_ATLAS=1`).
+//! Per-stage timing atlas (`DM_LAUNCH_ATLAS=1`).
 //!
-//! The launch-bound attack needs to know WHERE the 21 434 launches/step
-//! come from before any fusion work is ranked. This wraps the stage timers
-//! that already exist in `train_loop` (fwd / bwd / opt / retr / ema) and
-//! reads `cubecl_launches()` at the same five boundaries, so each stage's
-//! population is the counter delta across it. Per-ARM attribution comes
-//! from differential runs (`--no-kda`, `--jepa-weight 0`, `--set
-//! n_experts=1`, `--set max_iter=2`): arm off = its launches gone, same
-//! stage marks in both runs.
+//! The launch-bound attack needs to know WHERE a step's time goes before any
+//! fusion work is ranked. This wraps the stage timers that already exist in
+//! `train_loop` (fwd / bwd / opt / retr / ema) and flushes them as TSV.
 //!
-//! Counting only, §1.3-clean: the counter is a host-side atomic incremented
-//! on the device thread, so a mark is one atomic load and one push - no
+//! The LAUNCH COLUMNS are gone: the pre-0.22 fork counted at the single choke
+//! point every launch passed through, stock cubecl 0.11 exposes no such hook,
+//! and burn 0.22's native graph capture (#5146) shifts the question from
+//! counting launches to capturing them. Per-arm attribution still comes from
+//! differential runs (`--no-kda`, `--jepa-weight 0`, `--set n_experts=1`,
+//! `--set max_iter=2`): arm off = its time gone, same stage marks in both
+//! runs.
+//!
+//! Counting only, §1.3-clean: a mark is one timer read and one push — no
 //! sync, no host branch on a device value. Disabled (no env var) it costs
-//! one env read per process and nothing per step. Known bound: the device
-//! thread may lag the enqueue, so a stage boundary can smear into its
-//! neighbour by a fraction of a step at startup; steady-state per-step
-//! totals are exact and per-stage deltas settle once the host runs ahead.
-
-/// The 24 us/launch host-enqueue estimate the atlas' ms column is quoted at
-/// (launch-bound host cost, release-measured on this box). Not a constant
-/// in code because it is arithmetic for the report, not a knob.
-pub const US_PER_LAUNCH: f64 = 24.0;
+//! one env read per process and nothing per step.
 
 pub struct LaunchAtlas {
     on: bool,
     step: u64,
-    last: u64,
-    /// This step's (stage, launches, ms), in mark order.
-    rows: Vec<(&'static str, u64, f32)>,
-    /// Every (step, stage, launches, ms) of the run, for the warm summary.
-    all: Vec<(u64, &'static str, u64, f32)>,
+    /// This step's (stage, ms), in mark order.
+    rows: Vec<(&'static str, f32)>,
+    /// Every (step, stage, ms) of the run, for the warm summary.
+    all: Vec<(u64, &'static str, f32)>,
 }
 
 impl LaunchAtlas {
@@ -38,21 +31,18 @@ impl LaunchAtlas {
     }
 
     pub fn new(on: bool) -> Self {
-        Self { on, step: 0, last: 0, rows: Vec::new(), all: Vec::new() }
+        Self { on, step: 0, rows: Vec::new(), all: Vec::new() }
     }
 
     /// Record one stage boundary. `ms` is the stage timer that already
-    /// exists; the launch delta comes from the global counter.
+    /// exists in `train_loop`.
     pub fn mark(&mut self, step: u64, stage: &'static str, ms: f32) {
         if !self.on {
             return;
         }
-        let now = crate::cubecl_launches();
-        let d = now - self.last;
-        self.last = now;
         self.step = step;
-        self.rows.push((stage, d, ms));
-        self.all.push((step, stage, d, ms));
+        self.rows.push((stage, ms));
+        self.all.push((step, stage, ms));
     }
 
     /// Flush the step's rows as TSV. Call once per step, after the last
@@ -61,45 +51,37 @@ impl LaunchAtlas {
         if !self.on {
             return;
         }
-        for (stage, l, ms) in self.rows.drain(..) {
-            println!("ATLAS\t{}\t{stage}\t{l}\t{ms:.1}", self.step);
+        for (stage, ms) in self.rows.drain(..) {
+            println!("ATLAS\t{}\t{stage}\t{ms:.1}", self.step);
         }
     }
 
-    /// Warm-window summary: mean launches/step and ms/step per stage over
-    /// the last third of the requested steps (steps 20+ of a 30-step run),
-    /// descending by launches. Cold steps are autotune garbage; the warm
-    /// window is the reading (AGENTS.md 2.2).
+    /// Warm-window summary: mean ms/step per stage over the last third of
+    /// the requested steps (steps 20+ of a 30-step run), descending by time.
+    /// Cold steps are autotune garbage; the warm window is the reading
+    /// (AGENTS.md 2.2).
     pub fn finish(&self, steps: u64) {
         if !self.on {
             return;
         }
         let warm = steps * 2 / 3;
-        let mut stages: Vec<(&'static str, u64, u32, f32)> = Vec::new();
-        for &(step, stage, l, ms) in &self.all {
+        let mut stages: Vec<(&'static str, u32, f32)> = Vec::new();
+        for &(step, stage, ms) in &self.all {
             if step < warm {
                 continue;
             }
             match stages.iter_mut().find(|(s, ..)| *s == stage) {
-                Some((_, sl, n, sm)) => {
-                    *sl += l;
+                Some((_, n, sm)) => {
                     *n += 1;
                     *sm += ms;
                 }
-                None => stages.push((stage, l, 1, ms)),
+                None => stages.push((stage, 1, ms)),
             }
         }
-        stages.sort_by(|a, b| (b.1 / u64::from(b.2)).cmp(&(a.1 / u64::from(a.2))));
-        println!(
-            "ATLAS-WARM\tfrom_step={warm}\tstage\tlaunches_per_step\tms_per_step\tms_at_24us"
-        );
-        for (stage, sl, n, sm) in stages {
-            let lps = sl as f64 / f64::from(n);
-            println!(
-                "ATLAS-WARM\t{stage}\t{lps:.1}\t{:.1}\t{:.1}",
-                sm / n as f32,
-                lps * US_PER_LAUNCH / 1000.0
-            );
+        stages.sort_by(|a, b| (b.2 / b.1 as f32).total_cmp(&(a.2 / a.1 as f32)));
+        println!("ATLAS-WARM\tfrom_step={warm}\tstage\tms_per_step");
+        for (stage, n, sm) in stages {
+            println!("ATLAS-WARM\t{stage}\t{:.1}", sm / n as f32);
         }
     }
 }
@@ -119,10 +101,6 @@ mod tests {
 
     #[test]
     fn marks_accumulate_and_flush_in_order() {
-        // Off CUDA the counter reads 0, so every delta is 0 - the test pins
-        // the plumbing (rows accumulate, flush clears, summary runs), not
-        // the counter. The counter itself is gated on CUDA hardware
-        // (cubecl-cuda/tests/graph_step.rs).
         let mut a = LaunchAtlas::new(true);
         a.mark(7, "fwd", 10.0);
         a.mark(7, "bwd", 20.0);

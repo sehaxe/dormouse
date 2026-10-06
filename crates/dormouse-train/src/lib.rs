@@ -248,27 +248,6 @@ pub fn memory_cleanup(device: &Device) {
 #[cfg(not(feature = "cuda"))]
 pub fn memory_cleanup(_device: &Device) {}
 
-/// How many kernel launches the CUDA backend has executed since process start.
-///
-/// The pre-0.22 fork counted at the single choke point every launch passes
-/// through; stock cubecl 0.11 exposes no such hook - so on stock this says
-/// so, once, loudly (ADR-0011 COUNTED).
-///
-/// Off CUDA there genuinely are no launches; zero stays the honest answer.
-pub fn cubecl_launches() -> u64 {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static SAID: AtomicBool = AtomicBool::new(false);
-    if SAID.swap(true, Ordering::Relaxed) {
-        return 0;
-    }
-    #[cfg(feature = "cuda")]
-    eprintln!(
-        "[train] launch counter unavailable on stock cubecl 0.11 (fork hook \
-         cut in the 0.22 migration; once)."
-    );
-    0
-}
-
 /// The `cubecl.toml` honesty check (ADR-0011): cubecl 0.11 reads the file
 /// from the process CWD itself (`config/base.rs`) and falls back to its
 /// defaults (persistent = Enabled, allocator = Sync) when it is absent —
@@ -1506,21 +1485,10 @@ pub fn train_loop(
                 let _: f32 = ll.clone().try_into_scalar().unwrap_or(0.0);
             }
             let total_ms = t_iter.elapsed().as_secs_f64() * 1000.0;
-            // The launch count, on the same line as the time it buys. This is
-            // the number that decides whether a CUDA graph is worth anything:
-            // a replay is ONE dispatch however many launches it contains, so
-            // the benefit is `launches - 1` and the cost is one copy per
-            // parameter per step (the pin a captured optimizer needs, because
-            // burn's is out-of-place and the parameter's address moves).
-            // Counted on the device thread, so it is a LOWER BOUND on what
-            // the host enqueued, and cumulative since process start: the
-            // per-step figure is the difference between two timer lines, which
-            // is why this is a count and not a rate.
-            let launches = cubecl_launches();
             println!(
                 "timer step {step}: total={total_ms:.0}ms data={data_ms:.1}ms fwd={fwd_ms:.0}ms \
                  bwd={bwd_ms:.0}ms (incl. loss sync + host-adam D2H) opt={opt_ms:.0}ms \
-                 retr={retr_ms:.1}ms ema={ema_ms:.1}ms gpu_step={:.0}ms launches={launches}",
+                 retr={retr_ms:.1}ms ema={ema_ms:.1}ms gpu_step={:.0}ms",
                 total_ms - data_ms,
             );
         }
