@@ -224,27 +224,10 @@ pub fn device() -> Device {
 /// Pool introspection (debug): bytes reserved/used/live allocs on the CUDA client.
 #[cfg(feature = "cuda")]
 pub fn pool_stats(device: &Device) -> String {
-    use burn_dispatch::devices::CubeDevice;
-    use burn_dispatch::DispatchDevice;
-    use cubecl_cuda::CudaRuntime;
-    use cubecl_runtime::runtime::Runtime as _;
-    fn unwrap(d: &DispatchDevice) -> &burn_cuda::CudaDevice {
-        // pre.4 unifies every cubecl runtime under DispatchDevice::Cube
-        // (CubeDevice = cubecl::Device); pick the CUDA entry.
-        match d {
-            DispatchDevice::Cube(CubeDevice::Cuda(dev)) => dev,
-            DispatchDevice::Autodiff(a) => match &**a {
-                DispatchDevice::Cube(CubeDevice::Cuda(dev)) => dev,
-                other => panic!("expected CUDA device, got {other:?}"),
-            },
-            other => panic!("expected CUDA device, got {other:?}"),
-        }
-    }
-    let client = CudaRuntime::client(unwrap(device.as_dispatch()));
-    {
-        let u = client.memory_usage();
-        format!("res={:.1}MB used={:.1}MB allocs={}", u.bytes_reserved as f64 / 1e6, u.bytes_in_use as f64 / 1e6, u.number_allocs)
-    }
+    let u = cubecl_client(device)
+        .memory_report(cubecl_runtime::memory_management::MemoryScope::Device)
+        .usage();
+    format!("res={:.1}MB used={:.1}MB allocs={}", u.bytes_reserved as f64 / 1e6, u.bytes_in_use as f64 / 1e6, u.number_allocs)
 }
 #[cfg(not(feature = "cuda"))]
 pub fn pool_stats(_device: &Device) -> String { "cpu".into() }
@@ -252,74 +235,26 @@ pub fn pool_stats(_device: &Device) -> String { "cpu".into() }
 /// Return pooled VRAM pages to the driver. cubecl's pool is high-water: it
 /// reserves pages for every allocation size ever seen and never frees them
 /// on its own, so a long run eventually OOMs despite a low live footprint
-/// (aria hit the same wall; periodic cleanup is the cheap fix).
+/// (aria hit the same wall; periodic cleanup is the cheap fix). cubecl 0.11
+/// returns a `Result` (a cleanup waits on the device, so a recording stream
+/// refuses it) — LOUD on the error (ADR-0011): a memory failure that
+/// vanishes is how runs arrive at "NaN evals for 500 more steps".
 #[cfg(feature = "cuda")]
 pub fn memory_cleanup(device: &Device) {
-    use burn_dispatch::devices::CubeDevice;
-    use burn_dispatch::DispatchDevice;
-    use cubecl_cuda::CudaRuntime;
-    use cubecl_runtime::runtime::Runtime as _;
-    fn unwrap(d: &DispatchDevice) -> &burn_cuda::CudaDevice {
-        // pre.4 unifies every cubecl runtime under DispatchDevice::Cube
-        // (CubeDevice = cubecl::Device); pick the CUDA entry.
-        match d {
-            DispatchDevice::Cube(CubeDevice::Cuda(dev)) => dev,
-            DispatchDevice::Autodiff(a) => match &**a {
-                DispatchDevice::Cube(CubeDevice::Cuda(dev)) => dev,
-                other => panic!("expected CUDA device, got {other:?}"),
-            },
-            other => panic!("expected CUDA device, got {other:?}"),
-        }
-    }
-    let client = CudaRuntime::client(unwrap(device.as_dispatch()));
-    client.memory_cleanup();
+    cubecl_client(device)
+        .memory_cleanup()
+        .expect("cubecl memory_cleanup failed on the CUDA client");
 }
 #[cfg(not(feature = "cuda"))]
 pub fn memory_cleanup(_device: &Device) {}
 
-/// Must run BEFORE the first allocation on the device (model init).
-/// ExclusivePages: one page per allocation, so `memory_cleanup` returns
-/// freed pages to the driver; SubSlices keeps size buckets forever and a
-/// graph-heavy autodiff loop (new shapes every step) OOMs at the high-water
-/// mark.
-#[cfg(feature = "cuda")]
-pub fn init_pools(device: &Device) {
-    // 0.22 carries the old pool setup natively: `cubecl.toml` (resolved from
-    // the process cwd, base.rs) selects the layout through
-    // `MemoryConfig.persistent_memory` - `Enabled` / `SizeMatch` (documented
-    // as the training heuristic) / `Enforced`. The fork's programmatic
-    // `install_memory_pools(Preset::ExclusivePages)` is gone with the fork.
-    // The only check that keeps this honest: the shipped config must exist
-    // where the run starts, LOUD at init, not at step 500.
-    use std::path::Path;
-    const TOML: &str = "cubecl.toml";
-    assert!(
-        Path::new(TOML).exists(),
-        "cubecl.toml not in the run directory - CUDA memory pools are \
-         configured by file since cubecl 0.11, and 'precision/managed' \
-         behavior is chosen by [memory] there. Ship a cubecl.toml next \
-         to ./train or set CWD accordingly (ADR-0011 loud)."
-    );
-    let _ = device; // pools now attach at runtime init; kept for signature compat
-}
-#[cfg(not(feature = "cuda"))]
-pub fn init_pools(_device: &Device) {}
-
 /// How many kernel launches the CUDA backend has executed since process start.
 ///
-/// The instrument behind every "this workload is launch-bound" claim in this
-/// repo: counted at the single choke point every launch passes through
-/// (`cubecl-cuda/src/compute/context.rs`), and self-validated against the number
-/// of launches a test makes
-/// (`cubecl-cuda/tests/graph_step.rs::launch_counter_counts_every_launch`).
+/// The pre-0.22 fork counted at the single choke point every launch passes
+/// through; stock cubecl 0.11 exposes no such hook - so on stock this says
+/// so, once, loudly (ADR-0011 COUNTED).
 ///
-/// **It is counted on the device thread**, so a value read from the host is a
-/// LOWER BOUND on what the host has enqueued — the device thread may still be
-/// behind. In a launch-bound loop the host runs ahead and the two nearly
-/// coincide, but the claim is the bound.
-///
-/// Zero off CUDA: the counter lives in the CUDA backend, and a run on another
-/// backend has no launches to count. That is the honest answer, not a stand-in.
+/// Off CUDA there genuinely are no launches; zero stays the honest answer.
 pub fn cubecl_launches() -> u64 {
     use std::sync::atomic::{AtomicBool, Ordering};
     static SAID: AtomicBool = AtomicBool::new(false);
@@ -334,19 +269,30 @@ pub fn cubecl_launches() -> u64 {
     0
 }
 
-/// The cubecl client behind a `Device`, or `None` off CUDA. The same
-/// unwrap `init_pools` does, factored out because the graph seam needs it too
-/// and two copies of a backend downcast is how they drift.
+/// The `cubecl.toml` honesty check (ADR-0011): cubecl 0.11 reads the file
+/// from the process CWD itself (`config/base.rs`) and falls back to its
+/// defaults (persistent = Enabled, allocator = Sync) when it is absent —
+/// a silently different pool layout than the `size-match` + async one this
+/// repo ships. A missing file is refused at startup, not discovered at step
+/// 500. One check, three train entry points.
+pub fn cubecl_toml_or_loud() {
+    #[cfg(feature = "cuda")]
+    assert!(
+        std::path::Path::new("cubecl.toml").is_file(),
+        "cubecl.toml not found in the run directory: CUDA memory pools are \
+         configured by that file since cubecl 0.11 ([memory] layout, [memory.cuda] \
+         allocator), and its absence would silently run the stock defaults instead \
+         of the shipped size-match/async layout. Run ./train from the repo root, \
+         or copy the file next to your binary (ADR-0011 loud)."
+    );
+    #[cfg(not(feature = "cuda"))]
+    {} // no device pools to configure on the CPU backends
+}
+/// Unwrap the backend indirection to the bare cubecl client for
+/// runtime-indirection sites (pool stats, cleanup), CUDA only: two copies of
+/// a dispatch downcast is how they drift.
 #[cfg(feature = "cuda")]
 pub fn cubecl_client(device: &Device) -> cubecl_runtime::client::Client {
-    cubecl_client_opt(device).expect("a CUDA device has a cubecl client")
-}
-
-/// [`cubecl_client`] as an `Option`, for the seam's one field that is `None`
-/// off CUDA. Panics on a CUDA device that has no client, which is the same
-/// panic `cubecl_client` has always had.
-#[cfg(feature = "cuda")]
-pub fn cubecl_client_opt(device: &Device) -> Option<cubecl_runtime::client::Client> {
     use burn_dispatch::devices::CubeDevice;
     use burn_dispatch::DispatchDevice;
     use cubecl_cuda::CudaRuntime;
@@ -361,11 +307,7 @@ pub fn cubecl_client_opt(device: &Device) -> Option<cubecl_runtime::client::Clie
             other => panic!("expected CUDA device, got {other:?}"),
         }
     }
-    Some(CudaRuntime::client(unwrap(device.as_dispatch())))
-}
-#[cfg(not(feature = "cuda"))]
-pub fn cubecl_client_opt(_device: &Device) -> Option<cubecl_runtime::client::Client> {
-    None
+    CudaRuntime::client(unwrap(device.as_dispatch()))
 }
 
 /// The NaN firewall (2026-09-27). A non-finite loss must never reach the
@@ -818,7 +760,7 @@ pub fn precompute_jepa_targets(
     let dorm_cfg = &run.model;
     let cfg = &run.train;
     let device = device();
-    init_pools(&device);
+    cubecl_toml_or_loud();
     let (model, qfmt) = build_model(dorm_cfg, cfg, &device);
     let mut stream = dormouse_data::ByteStream::new(cfg.seq_len, cfg.batch, data);
     // Mirror the train loop's pre-loop stream consumption (the warmup
@@ -897,7 +839,7 @@ pub fn train_loop(
     }
     let RunCfg { source: preset, model: dorm_cfg, train: cfg } = run;
     let device = device();
-    init_pools(&device);
+    cubecl_toml_or_loud();
     // SEED THE BACKEND BEFORE ANY PARAMETER IS CREATED, or nothing downstream
     // is reproducible.
     //

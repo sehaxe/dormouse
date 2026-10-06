@@ -42,7 +42,7 @@ use burn::tensor::{activation::log_softmax, Bool, Bytes, Int, Tensor, TensorData
 use burn_byteflow::{ByteFlowConfig, ByteFlowNet, RateMode};
 
 use crate::cfg::RunCfg;
-use crate::{device, init_pools, mask_nonfinite, Optim, TrainCfg};
+use crate::{device, mask_nonfinite, Optim, TrainCfg};
 use dormouse_core::DormouseConfig;
 
 const BF_MAGIC: [u8; 8] = *b"DMBF\x00\x01\x00\x00";
@@ -137,7 +137,7 @@ pub fn train_loop(
     let dorm = run.model;
     let cfg = run.train;
     let device = device();
-    init_pools(&device);
+    super::cubecl_toml_or_loud();
 
     let net_cfg = net_config(&dorm);
     let mut net = ByteFlowNet::init(net_cfg, &device);

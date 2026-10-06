@@ -107,15 +107,17 @@ fn main() {
     // every boundary. Returns the reserved bytes after the forward and after
     // the backward, and the pair's wall time.
     let mut call = |label: &str| -> (u64, u64, f32, f32) {
+        use cubecl_runtime::memory_management::MemoryScope;
+        let usage = || client.memory_report(MemoryScope::CurrentStream).usage();
         let xi = x();
-        let u0 = client.memory_usage();
+        let u0 = usage();
 
         let t0 = Instant::now();
         let y = attn.gdn2.forward_train::<Ad>(xi.clone());
         let t1 = Instant::now(); // host: allocations + launches
         cubecl_environment::future::block_on(client.sync()).expect("device barrier");
         let t2 = Instant::now(); // GPU drained
-        let u1 = client.memory_usage();
+        let u1 = usage();
 
         let loss = y.clone().sum();
         let t3 = Instant::now();
@@ -125,12 +127,12 @@ fn main() {
             .q_proj
             .weight
             .grad(&grads)
-            .map(|t| t.into_data().bytes.len())
+            .map(|t| t.into_data().bytes().len())
             .unwrap_or(0);
         let t4 = Instant::now(); // host: backward allocations + launches
         cubecl_environment::future::block_on(client.sync()).expect("device barrier");
         let t5 = Instant::now(); // GPU drained
-        let u2 = client.memory_usage();
+        let u2 = usage();
         drop(grads);
         assert!(bytes > 0, "probe: no param gradient - untracked graph");
 
@@ -187,7 +189,7 @@ fn main() {
             .q_proj
             .weight
             .grad(&grads)
-            .map(|t| t.into_data().bytes.len())
+            .map(|t| t.into_data().bytes().len())
             .unwrap_or(0);
         let t4 = Instant::now();
         cubecl_environment::future::block_on(client.sync()).expect("device barrier");
@@ -211,10 +213,10 @@ fn main() {
     // identical call. If it returns to the cold time, the cost is the
     // allocator; if it stays warm, the pool was serving it and the cost is
     // the kernel.
-    let before = client.memory_usage();
-    client.memory_cleanup();
+    let before = client.memory_report(cubecl_runtime::memory_management::MemoryScope::CurrentStream).usage();
+    client.memory_cleanup().expect("cubecl memory_cleanup failed on the CUDA client");
     cubecl_environment::future::block_on(client.sync()).expect("device barrier");
-    let drained = client.memory_usage();
+    let drained = client.memory_report(cubecl_runtime::memory_management::MemoryScope::CurrentStream).usage();
     println!(
         "\n  memory_cleanup(): reserved {:.1} -> {:.1} MB ({} allocs dropped)\n",
         mb(before.bytes_reserved),
@@ -226,14 +228,14 @@ fn main() {
 
     // Forward-only, steady state: the cheapest possible KDA call, to price
     // the pass a no-grad teacher forward would pay.
-    let u_before = client.memory_usage();
+    let u_before = client.memory_report(cubecl_runtime::memory_management::MemoryScope::CurrentStream).usage();
     let t0 = Instant::now();
     for _ in 0..2 {
         let y = attn.gdn2.forward_train::<Ad>(x());
         let _ = y.into_data();
     }
     let warm = t0.elapsed().as_secs_f32() * 1e3 / 2.0;
-    let u_after = client.memory_usage();
+    let u_after = client.memory_report(cubecl_runtime::memory_management::MemoryScope::CurrentStream).usage();
     println!("\n  2 warm forward-only calls: {warm:.1} ms/call");
     println!(
         "  forward-only allocs {} -> {} (+{}), reserved {:.1} -> {:.1} MB (+{:.1})",
