@@ -108,7 +108,7 @@ fn gamma_matches_the_official_config_and_so_does_its_shape() {
     let dev = burn::tensor::Device::flex();
     let w = {
         let raw = burn_dspark::position_weights(block, DSPARK_GAMMA, &dev).into_data();
-        le_f32s(&raw.bytes).collect::<Vec<_>>()
+        le_f32s(&raw.bytes()).collect::<Vec<_>>()
     };
     assert_eq!(w.len(), block, "position_weights returned the wrong length");
     for (k, got) in w.iter().enumerate() {
@@ -188,7 +188,7 @@ fn accept_rate_target_matches_the_official_formula() {
     };
     let scalar = |t: burn::tensor::Tensor<2>| {
         let d = t.into_data();
-        let first = le_f32s(&d.bytes).next().unwrap();
+        let first = le_f32s(&d.bytes()).next().unwrap();
         first
     };
     let base: Vec<f32> = (0..8).map(|i| i as f32 * 0.7 - 2.0).collect();
@@ -549,7 +549,7 @@ fn probe_loss() -> (f32, f32, f32, f32) {
     );
     let g = |x: burn::tensor::Tensor<1>| {
         let d = x.into_data();
-        let first = le_f32s(&d.bytes).next().unwrap();
+        let first = le_f32s(&d.bytes()).next().unwrap();
         first
     };
     (g(t), g(ce), g(tv), g(conf))
