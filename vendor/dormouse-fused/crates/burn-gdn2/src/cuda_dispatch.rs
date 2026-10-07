@@ -226,6 +226,35 @@ mod fused {
     use burn_autodiff::checkpoint::strategy::{BalancedCheckpointing, NoCheckpointing};
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
+    /// The fused KDA arm is OFF by default and requires an explicit opt-in.
+///
+/// Why: the correctness record is not clean on this runner. The 2026-10-01
+/// adjoint gate was green on the pre-0.22 backend; under the 0.22 forest
+/// (native pools, #5645's no-reuse graph leaves) a 200-step run with the arm
+/// live explodes (ce 5.396@50 -> 396.8@100) while the same shape on the plain
+/// ops path descends cleanly for 150 steps. Until the adjoint gate green
+/// ON 0.22, running the fused arm silently is the 8fa5d4c/`fused kda=N/0`
+/// failure in its newest costume: a wrong-but-finite gradient class that
+/// only a count can see, and our count does.
+///
+/// `DM_GDN2_FUSED=1` opts in (loud, once). Nothing else may.
+#[inline]
+pub fn fused_arm_enabled() -> bool {
+    std::env::var("DM_GDN2_FUSED").is_ok_and(|v| v != "0")
+}
+
+#[inline]
+pub fn note_fused_arm_default_off() {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if !SAID.swap(true, Relaxed) {
+        eprintln!(
+            "[gdn2] fused KDA arm OFF by default: adjoint gate not proven on \
+             cubecl 0.11 (0.22 run exploded with it live; ops path clean). \
+             DM_GDN2_FUSED=1 opts in, naming the gate it skips."
+        );
+    }
+}
     static FUSED_FWD: AtomicU64 = AtomicU64::new(0);
     static FUSED_BWD: AtomicU64 = AtomicU64::new(0);
     static FUSED_DECLINED: AtomicU64 = AtomicU64::new(0);
@@ -423,6 +452,15 @@ mod fused {
         DispatchTensor: FusedCudaAutodiff + DispatchKindConversion<B>,
     {
         note_dispatch_asked();
+        if !fused_arm_enabled() {
+            note_fused_arm_default_off();
+            note_fused_declined();
+            note_ops_path();
+            let (o, s, _scratch) = crate::forward::chunk_wy_forward_impl(
+                q, k, v, g, b, w, state, scale, chunk_size, None,
+            );
+            return Fused::Fused((o, s));
+        }
         if !backend_matches::<B>() {
             return Fused::Fallback(Fallback::NotCuda);
         }
