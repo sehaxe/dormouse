@@ -96,7 +96,7 @@ fn rel_diff(a: Tensor<4>, b: Tensor<4>) -> f32 {
     let a = a.into_data();
     let b = b.into_data();
     let (mut max_abs, mut scale) = (0.0f32, 0.0f32);
-    for (x, y) in a.bytes.chunks_exact(4).zip(b.bytes.chunks_exact(4)) {
+    for (x, y) in a.bytes().chunks_exact(4).zip(b.bytes().chunks_exact(4)) {
         let x = f32::from_le_bytes(x.try_into().unwrap());
         let y = f32::from_le_bytes(y.try_into().unwrap());
         max_abs = max_abs.max((x - y).abs());
@@ -108,7 +108,7 @@ fn rel_diff(a: Tensor<4>, b: Tensor<4>) -> f32 {
 fn finite(t: &Tensor<4>) -> bool {
     t.clone()
         .into_data()
-        .bytes
+        .bytes()
         .chunks_exact(4)
         .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
         .all(|x| x.is_finite())

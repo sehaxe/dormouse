@@ -69,11 +69,11 @@ mod tests {
         Device::ndarray()
     }
     fn as_scalar(t: Tensor<1>) -> f32 {
-        f32::from_le_bytes(t.into_data().bytes[..4].try_into().unwrap())
+        f32::from_le_bytes(t.into_data().bytes()[..4].try_into().unwrap())
     }
     fn as_vec(t: Tensor<1>) -> Vec<f32> {
         t.into_data()
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect()

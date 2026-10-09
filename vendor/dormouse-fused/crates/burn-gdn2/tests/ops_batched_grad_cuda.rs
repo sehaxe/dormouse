@@ -74,7 +74,7 @@ fn draw(dev: &Device) -> Arms {
     let [nb, nh, _nt, nk] = SHAPE;
     let f = |t: Tensor<4>| -> Vec<f32> {
         t.into_data()
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
             .collect()
@@ -142,7 +142,7 @@ fn loss(a: &Arms, dev: &Device, q_override: Option<Tensor<4>>) -> T1 {
 fn host(t: &T4) -> Vec<f32> {
     t.clone()
         .into_data()
-        .bytes
+        .bytes()
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
         .collect()

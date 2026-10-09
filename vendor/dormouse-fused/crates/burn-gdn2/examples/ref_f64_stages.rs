@@ -47,17 +47,17 @@ fn main() {
         dump(
             &mut out,
             &format!("c{ci}/raw_q_proj"),
-            &qr.clone().into_data().bytes,
+            &qr.clone().into_data().bytes(),
         );
         dump(
             &mut out,
             &format!("c{ci}/raw_k_proj"),
-            &kr.clone().into_data().bytes,
+            &kr.clone().into_data().bytes(),
         );
         dump(
             &mut out,
             &format!("c{ci}/raw_v_proj"),
-            &vr.clone().into_data().bytes,
+            &vr.clone().into_data().bytes(),
         );
 
         // the conv, straight out of the crate's own short_conv_1d
@@ -70,7 +70,7 @@ fn main() {
             dump(
                 &mut out,
                 &format!("c{ci}/{n}"),
-                &y.clone().into_data().bytes,
+                &y.clone().into_data().bytes(),
             );
         }
 
@@ -100,7 +100,7 @@ fn main() {
             dump(
                 &mut out,
                 &format!("c{ci}/{n}"),
-                &o.clone().into_data().bytes,
+                &o.clone().into_data().bytes(),
             );
         }
         // the same two-layer chain on the OUTPUT gate, which is known to agree.
@@ -111,7 +111,7 @@ fn main() {
             dump(
                 &mut out,
                 &format!("c{ci}/{n}"),
-                &o.clone().into_data().bytes,
+                &o.clone().into_data().bytes(),
             );
         }
         let g_recomputed =
@@ -119,22 +119,22 @@ fn main() {
         dump(
             &mut out,
             &format!("c{ci}/g_recomputed"),
-            &g_recomputed.clone().into_data().bytes,
+            &g_recomputed.clone().into_data().bytes(),
         );
         dump(
             &mut out,
             &format!("c{ci}/a_exp"),
-            &a_exp.clone().into_data().bytes,
+            &a_exp.clone().into_data().bytes(),
         );
         dump(
             &mut out,
             &format!("c{ci}/dt_bias"),
-            &m.dt_bias.val().into_data().bytes,
+            &m.dt_bias.val().into_data().bytes(),
         );
         dump(
             &mut out,
             &format!("c{ci}/A_log"),
-            &m.a_log.val().into_data().bytes,
+            &m.a_log.val().into_data().bytes(),
         );
 
         // THE 4-D PER-HEAD STAGES. These were previously not dumped because
@@ -168,7 +168,7 @@ fn main() {
             dump(
                 &mut out,
                 &format!("c{ci}/{n}"),
-                &o.clone().powf_scalar(2.0).into_data().bytes,
+                &o.clone().powf_scalar(2.0).into_data().bytes(),
             );
         }
     }

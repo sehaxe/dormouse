@@ -469,7 +469,7 @@ mod cuda_tests {
 
     fn to_host(t: Tensor<2>) -> Vec<f32> {
         t.into_data()
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect()
@@ -552,7 +552,7 @@ mod ad_tests {
 
     fn to_host(t: Tensor<2>) -> Vec<f32> {
         t.into_data()
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect()
@@ -612,7 +612,7 @@ mod fd_tests {
 
     fn to_host(t: Tensor<2>) -> Vec<f32> {
         t.into_data()
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect()
@@ -644,8 +644,8 @@ mod fd_tests {
         let mut fd = vec![0.0f32; 12];
         for i in 0..12 {
             let mut plus = data.clone();
-            plus.bytes[i * 4..i * 4 + 4].copy_from_slice(
-                &(data.bytes[i * 4..i * 4 + 4]
+            plus.bytes()[i * 4..i * 4 + 4].copy_from_slice(
+                &(data.bytes()[i * 4..i * 4 + 4]
                     .try_into()
                     .map(f32::from_le_bytes)
                     .unwrap()
@@ -653,8 +653,8 @@ mod fd_tests {
                     .to_le_bytes(),
             );
             let mut minus = data.clone();
-            let mv = f32::from_le_bytes(minus.bytes[i * 4..i * 4 + 4].try_into().unwrap()) - eps;
-            minus.bytes[i * 4..i * 4 + 4].copy_from_slice(&mv.to_le_bytes());
+            let mv = f32::from_le_bytes(minus.bytes()[i * 4..i * 4 + 4].try_into().unwrap()) - eps;
+            minus.bytes()[i * 4..i * 4 + 4].copy_from_slice(&mv.to_le_bytes());
             let xp = Tensor::<2>::from_data(plus, &dev);
             let xm = Tensor::<2>::from_data(minus, &dev);
             fd[i] = (situ_sum(&xp) - situ_sum(&xm)) / (2.0 * eps);

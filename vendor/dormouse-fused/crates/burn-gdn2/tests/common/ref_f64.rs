@@ -236,7 +236,7 @@ pub fn build(t: &Fixture, mode: Gdn2Mode, chunk_size: usize, device: &Device) ->
 pub fn to_f32_vec(x: &Tensor<3>) -> Vec<f32> {
     x.clone()
         .into_data()
-        .bytes
+        .bytes()
         .chunks_exact(4)
         .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
         .collect()

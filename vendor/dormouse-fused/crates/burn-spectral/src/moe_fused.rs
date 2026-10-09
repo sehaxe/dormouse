@@ -1772,7 +1772,7 @@ mod moe_tests {
 
     fn to_host<const D: usize>(t: Tensor<D>) -> Vec<f32> {
         t.into_data()
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect()
@@ -1780,7 +1780,7 @@ mod moe_tests {
 
     fn to_host_int<const D: usize>(t: Tensor<D, Int>) -> Vec<i32> {
         t.into_data()
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|b| i32::from_le_bytes(b.try_into().unwrap()))
             .collect()
@@ -2558,7 +2558,7 @@ mod moe_tests {
             )
             .expect("fwd");
             let d = g.into_data();
-            assert!(!d.bytes.is_empty(), "kernel produced no output");
+            assert!(!d.bytes().is_empty(), "kernel produced no output");
         }
         let tf = t0.elapsed().as_secs_f32() / iters as f32;
         let t1 = std::time::Instant::now();
@@ -2918,7 +2918,7 @@ mod moe_tests {
                 k as u32,
                 r as u32,
             );
-            let _ = ya.clone().slice([0..1, 0..32]).into_data().bytes;
+            let _ = ya.clone().slice([0..1, 0..32]).into_data().bytes();
         }
         let ts = t0.elapsed().as_secs_f32() / iters as f32;
         let t1 = std::time::Instant::now();
@@ -2941,7 +2941,7 @@ mod moe_tests {
                 k as u32,
                 r as u32,
             );
-            let _ = yb.clone().slice([0..1, 0..32]).into_data().bytes;
+            let _ = yb.clone().slice([0..1, 0..32]).into_data().bytes();
         }
         let tt = t1.elapsed().as_secs_f32() / iters as f32;
         println!("fwd kernel scalar {ts:.3} ms vs tiled {tt:.3} ms @B={b} in={dim_in} out={dim_out} k={k} r={r} (host-enqueue only; use CUBECL_DEBUG_OPTION=profile for GPU times)");
@@ -3162,7 +3162,7 @@ mod moe_tests {
                 k as u32,
                 r as u32,
             );
-            let _ = dga.clone().slice([0..1, 0..k]).into_data().bytes;
+            let _ = dga.clone().slice([0..1, 0..k]).into_data().bytes();
         }
         let ts = t0.elapsed().as_secs_f32() / iters as f32;
         let t1 = std::time::Instant::now();
@@ -3190,7 +3190,7 @@ mod moe_tests {
                 k as u32,
                 r as u32,
             );
-            let _ = dgb.clone().slice([0..1, 0..k]).into_data().bytes;
+            let _ = dgb.clone().slice([0..1, 0..k]).into_data().bytes();
         }
         let tb = t1.elapsed().as_secs_f32() / iters as f32;
         println!("bwd kernel scalar {ts:.3} ms vs tiled {tb:.3} ms @B={b} in={dim_in} out={dim_out} k={k} r={r} (host-enqueue only; use CUBECL_DEBUG_OPTION=profile for GPU times)");

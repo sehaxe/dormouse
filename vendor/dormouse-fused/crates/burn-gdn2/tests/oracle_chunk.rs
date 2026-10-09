@@ -188,7 +188,7 @@ fn test_chunk_matches_fused_with_real_decay() {
     let diff = (chunk_out - fused_out).abs().max().into_data();
     let state_diff = (chunk_state - fused_state).abs().max().into_data();
     let to_f32 = |d: burn::tensor::TensorData| {
-        d.bytes
+        d.bytes()
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .fold(0.0f32, f32::max)

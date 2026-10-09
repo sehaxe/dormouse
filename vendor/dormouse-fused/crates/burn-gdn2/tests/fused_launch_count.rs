@@ -162,7 +162,7 @@ fn the_two_entry_points_agree_on_the_forward() {
         .abs()
         .max()
         .into_data()
-        .bytes
+        .bytes()
         .chunks_exact(4)
         .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
         .fold(0.0f32, f32::max);
@@ -170,7 +170,7 @@ fn the_two_entry_points_agree_on_the_forward() {
         .abs()
         .max()
         .into_data()
-        .bytes
+        .bytes()
         .chunks_exact(4)
         .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
         .fold(0.0f32, f32::max);

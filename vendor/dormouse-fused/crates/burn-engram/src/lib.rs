@@ -282,7 +282,7 @@ mod tests {
         let out = m.forward(ids, h).reshape([1, 4, 64]);
         let v: Vec<f32> = out
             .into_data()
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect();
@@ -316,7 +316,7 @@ mod gate_tests {
         let g = compute_gate(key, q, 4);
         let v: Vec<f32> = g
             .into_data()
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
             .collect();

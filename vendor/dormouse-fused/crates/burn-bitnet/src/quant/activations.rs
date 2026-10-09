@@ -178,7 +178,7 @@ mod tests {
         let q = bitnet_v2_quantize(x.clone(), 16);
         let d: Vec<f32> = (x - q)
             .into_data()
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect();

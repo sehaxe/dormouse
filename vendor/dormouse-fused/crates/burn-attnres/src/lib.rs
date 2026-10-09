@@ -613,7 +613,7 @@ mod tests {
         let out = depth_attend(std::slice::from_ref(&h), q);
         let d: Vec<f32> = (out - h)
             .into_data()
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect();

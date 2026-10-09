@@ -60,7 +60,7 @@ mod tests {
     }
 
     fn as_scalar(t: Tensor<1>) -> f32 {
-        f32::from_le_bytes(t.into_data().bytes[..4].try_into().unwrap())
+        f32::from_le_bytes(t.into_data().bytes()[..4].try_into().unwrap())
     }
 
     #[test]
@@ -80,7 +80,7 @@ mod tests {
         let v: Vec<f32> = q
             .prob(h)
             .into_data()
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect();
@@ -147,8 +147,8 @@ mod tests {
             Tensor::from_data(TensorData::new(vec![1i32, 9, 3, 9], [2, 2]), &dev());
         let flags = correctness_target(pred, truth).into_data();
         assert_eq!(
-            flags.bytes,
-            burn::tensor::Bytes::from_elems(vec![1i64, 0, 1, 0])
+            flags.bytes(),
+            &burn::tensor::Bytes::from_elems(vec![1i64, 0, 1, 0])
         );
     }
 
@@ -178,12 +178,12 @@ mod tests {
         let (best, idx) = best_of_k(q_logits, rollouts);
         assert_eq!(best.dims(), [b, t, d]);
         assert_eq!(
-            idx.into_data().bytes,
-            burn::tensor::Bytes::from_elems(vec![2i64, 2])
+            idx.into_data().bytes(),
+            &burn::tensor::Bytes::from_elems(vec![2i64, 2])
         );
         let best_data = best.into_data();
         assert!(best_data
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .all(|b| f32::from_le_bytes(b.try_into().unwrap()) == 2.0));
     }
@@ -218,7 +218,7 @@ mod tests {
         let rollouts = Tensor::<4>::from_data(TensorData::new(rs, [k, b, t, d]), &dev());
         let (best, idx) = best_of_k_sampled(q_logits.clone(), rollouts.clone(), 0.0);
         let (best_ref, idx_ref) = best_of_k(q_logits, rollouts);
-        assert_eq!(idx.into_data().bytes, idx_ref.into_data().bytes);
+        assert_eq!(idx.into_data().bytes(), idx_ref.into_data().bytes());
         let diff: f32 = (best - best_ref).abs().max().into_scalar();
         assert!(diff == 0.0);
     }

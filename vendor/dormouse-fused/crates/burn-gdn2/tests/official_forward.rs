@@ -519,7 +519,7 @@ fn build(
 fn max_abs_diff(a: &Tensor<3>, b: &[f64], t: usize, d: usize) -> f32 {
     let data = a.clone().into_data();
     let got: Vec<f32> = data
-        .bytes
+        .bytes()
         .chunks_exact(4)
         .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
         .collect();
@@ -536,7 +536,7 @@ fn max_abs_diff(a: &Tensor<3>, b: &[f64], t: usize, d: usize) -> f32 {
 fn pos_diffs(a: &Tensor<3>, b: &[f64], t: usize, d: usize) -> Vec<f32> {
     let data = a.clone().into_data();
     let got: Vec<f32> = data
-        .bytes
+        .bytes()
         .chunks_exact(4)
         .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
         .collect();
@@ -734,7 +734,7 @@ fn gva_head_repeat_preserves_values_on_this_backend() {
     let device = Device::ndarray();
     let grab = |t: Tensor<4>| -> Vec<f64> {
         t.into_data()
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|x| f64::from(f32::from_le_bytes(x.try_into().unwrap())))
             .collect()
@@ -762,7 +762,7 @@ fn gva_head_repeat_preserves_values_on_this_backend() {
             .unsqueeze_dim::<5>(3)
             .repeat(&[1, 1, 1, rep, 1])
             .into_data()
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|x| f64::from(f32::from_le_bytes(x.try_into().unwrap())))
             .collect();
@@ -883,7 +883,7 @@ fn gva_head_repeat_preserves_values_on_this_backend() {
 fn max_abs_diff4(got: &Tensor<4>, want: &[f64], hv: usize, t: usize, n: usize) -> f32 {
     let data = got.clone().into_data();
     let v: Vec<f32> = data
-        .bytes
+        .bytes()
         .chunks_exact(4)
         .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
         .collect();
@@ -1066,7 +1066,7 @@ fn chunk_size_is_a_schedule_choice_not_a_mathematical_one() {
             let out = build(&p, &device, true, false, c).forward_train::<NdArray>(input.clone());
             let diff = (out - base.clone()).abs().max().into_data();
             let v: f32 = diff
-                .bytes
+                .bytes()
                 .chunks_exact(4)
                 .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
                 .fold(0.0, f32::max);
@@ -1184,7 +1184,7 @@ fn max4(a: &Tensor<4>, b: &Tensor<4>) -> f32 {
     let f = |t: &Tensor<4>| -> Vec<f32> {
         t.clone()
             .into_data()
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
             .collect()
@@ -1252,7 +1252,7 @@ fn decode_matches_prefill_including_a_fresh_state() {
             let stepwise = Tensor::cat(decoded, 1);
             let diff = (prefill - stepwise).abs().max().into_data();
             let v: f32 = diff
-                .bytes
+                .bytes()
                 .chunks_exact(4)
                 .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
                 .fold(0.0, f32::max);
@@ -1272,7 +1272,7 @@ fn decode_matches_prefill_including_a_fresh_state() {
 
 /// max abs value of an f32 `TensorData` buffer.
 fn abs_max(a: &burn::tensor::TensorData) -> f32 {
-    a.bytes
+    a.bytes()
         .chunks_exact(4)
         .map(|x| f32::from_le_bytes(x.try_into().unwrap()).abs())
         .fold(0.0, f32::max)
@@ -1281,7 +1281,7 @@ fn abs_max(a: &burn::tensor::TensorData) -> f32 {
 /// max abs difference of two `TensorData` buffers of f32, in f32.
 fn max_abs_diff_data(a: &burn::tensor::TensorData, b: &burn::tensor::TensorData, n: usize) -> f32 {
     let g = |d: &burn::tensor::TensorData| -> Vec<f32> {
-        d.bytes
+        d.bytes()
             .chunks_exact(4)
             .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
             .collect()

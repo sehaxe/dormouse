@@ -128,7 +128,7 @@ mod tests {
         let capped = softcap(x, 1.0);
         let vals: Vec<f32> = capped
             .into_data()
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect();
@@ -146,7 +146,7 @@ mod tests {
         let out = situ_glu(gu, 128, 1.0, 1.0);
         let vals: Vec<f32> = out
             .into_data()
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect();
@@ -163,7 +163,7 @@ mod tests {
         let out = situ_glu(gu, 1, 1.0, 1.0);
         let vals: Vec<f32> = out
             .into_data()
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect();
@@ -226,7 +226,7 @@ mod tests {
 
     fn f32s(t: Tensor<2>) -> Vec<f32> {
         t.into_data()
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .collect()

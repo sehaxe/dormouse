@@ -124,7 +124,7 @@ fn step(inp: &[Tensor<4>; 7]) -> f32 {
     let mut acc = 0.0f32;
     for t in inp.iter() {
         if let Some(gr) = t.grad(&g) {
-            acc += gr.clone().into_data().bytes.len() as f32;
+            acc += gr.clone().into_data().bytes().len() as f32;
         }
     }
     acc

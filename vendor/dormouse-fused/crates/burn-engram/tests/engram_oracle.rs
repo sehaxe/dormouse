@@ -177,7 +177,7 @@ impl Fx {
 fn flat<const D: usize>(t: Tensor<D>) -> Vec<f32> {
     // The in-repo readback pattern (lib.rs:275-278).
     t.into_data()
-        .bytes
+        .bytes()
         .chunks_exact(4)
         .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
         .collect()

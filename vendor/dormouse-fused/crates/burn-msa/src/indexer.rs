@@ -305,13 +305,13 @@ mod tests {
     }
 
     fn to_f32(x: Tensor<3>) -> Vec<f32> {
-        x.into_data().bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()
+        x.into_data().bytes().chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()
     }
 
     fn to_i64(x: Tensor<3, Int>) -> Vec<i64> {
         x.into_data()
             .convert::<i64>()
-            .bytes
+            .bytes()
             .chunks_exact(8)
             .map(|b| i64::from_le_bytes(b.try_into().unwrap()))
             .collect()

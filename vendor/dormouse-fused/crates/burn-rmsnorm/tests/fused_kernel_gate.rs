@@ -237,7 +237,7 @@ fn the_fused_kernel_takes_the_node_on_an_autodiff_device() {
         .expect("no gradient through the fused node - the result is a leaf, the 8fa5d4c defect");
     let finite = gx
         .into_data()
-        .bytes
+        .bytes()
         .chunks_exact(4)
         .all(|c| f32::from_le_bytes(c.try_into().unwrap()).is_finite());
     assert!(finite, "non-finite gradient through the fused node");

@@ -42,7 +42,7 @@ fn trainer_dev() -> Device {
 
 fn host(d: TensorData) -> Vec<f32> {
     let mut v = Vec::new();
-    for c in d.bytes.chunks_exact(4) {
+    for c in d.bytes().chunks_exact(4) {
         v.push(f32::from_le_bytes(c.try_into().unwrap()));
     }
     v

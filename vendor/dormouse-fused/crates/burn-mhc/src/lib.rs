@@ -71,7 +71,7 @@ mod tests {
 
     fn to_vec(t: Tensor<4>) -> Vec<f32> {
         t.into_data()
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect()
@@ -218,7 +218,7 @@ mod tests {
         // H_pre, H_post in [0, 2], H_res doubly stochastic
         let pv: Vec<f32> = pre
             .into_data()
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect();

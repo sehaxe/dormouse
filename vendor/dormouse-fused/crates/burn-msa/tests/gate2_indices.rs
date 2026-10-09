@@ -22,14 +22,14 @@ fn pick_data(t: &Tensor<3, burn::tensor::Int>) -> Vec<i64> {
     t.clone()
         .into_data()
         .convert::<i64>()
-        .bytes
+        .bytes()
         .chunks_exact(8)
         .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
         .collect()
 }
 
 fn bool_data(t: &Tensor<4, burn::tensor::Bool>) -> Vec<bool> {
-    t.clone().into_data().bytes.iter().map(|&b| b != 0).collect()
+    t.clone().into_data().bytes().iter().map(|&b| b != 0).collect()
 }
 
 #[test]

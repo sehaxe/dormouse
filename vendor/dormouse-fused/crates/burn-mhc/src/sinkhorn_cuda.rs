@@ -606,7 +606,7 @@ mod seam_tests {
             let grads = out.powf_scalar(2.0).sum().backward();
             let g = x.grad(&grads).expect("a leaf input must carry a gradient");
             g.into_data()
-                .bytes
+                .bytes()
                 .chunks_exact(4)
                 .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
                 .collect()
@@ -676,7 +676,7 @@ fn fused_node_carries_a_gradient() {
         .expect("a fused-node leaf would arrive here with no gradient at all");
     let v: Vec<f32> = g
         .into_data()
-        .bytes
+        .bytes()
         .chunks_exact(4)
         .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
         .collect();
@@ -695,7 +695,7 @@ mod ad_tests {
 
     fn to_host(t: Tensor<4>) -> Vec<f32> {
         t.into_data()
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect()
@@ -775,7 +775,7 @@ mod fd_tests {
 
     fn to_host(t: Tensor<4>) -> Vec<f32> {
         t.into_data()
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect()
@@ -803,11 +803,11 @@ mod fd_tests {
         let mut fd = vec![0.0f32; total];
         for i in 0..total {
             let mut plus = data.clone();
-            let pv = f32::from_le_bytes(plus.bytes[i * 4..i * 4 + 4].try_into().unwrap()) + eps;
-            plus.bytes[i * 4..i * 4 + 4].copy_from_slice(&pv.to_le_bytes());
+            let pv = f32::from_le_bytes(plus.bytes()[i * 4..i * 4 + 4].try_into().unwrap()) + eps;
+            plus.bytes()[i * 4..i * 4 + 4].copy_from_slice(&pv.to_le_bytes());
             let mut minus = data.clone();
-            let mv = f32::from_le_bytes(minus.bytes[i * 4..i * 4 + 4].try_into().unwrap()) - eps;
-            minus.bytes[i * 4..i * 4 + 4].copy_from_slice(&mv.to_le_bytes());
+            let mv = f32::from_le_bytes(minus.bytes()[i * 4..i * 4 + 4].try_into().unwrap()) - eps;
+            minus.bytes()[i * 4..i * 4 + 4].copy_from_slice(&mv.to_le_bytes());
             let xp = Tensor::<4>::from_data(plus, &dev);
             let xm = Tensor::<4>::from_data(minus, &dev);
             let sp = crate::sinkhorn_knopp(xp, iters)

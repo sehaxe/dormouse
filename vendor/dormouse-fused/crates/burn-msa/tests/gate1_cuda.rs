@@ -45,8 +45,8 @@ fn body(dev: burn::tensor::Device) {
     let picks = burn_msa::select_blocks(Tensor::<3>::full([b, t, 32], 0.0, &dev), 32);
     let sparse = burn_msa::sparse_attention(q.clone(), k.clone(), v.clone(), 4, &picks);
     let dense = dense_reference(q, k, v);
-    let da = dense.into_data().bytes;
-    let sa = sparse.into_data().bytes;
+    let da = dense.into_data().bytes();
+    let sa = sparse.into_data().bytes();
     let mut worst = 0f32;
     for (a, c) in da.chunks_exact(4).zip(sa.chunks_exact(4)) {
         let af = f32::from_le_bytes(a.try_into().unwrap());

@@ -604,7 +604,7 @@ mod ad_tests {
 
     fn to_host(t: Tensor<4>) -> Vec<f32> {
         t.into_data()
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect()
@@ -657,7 +657,7 @@ mod fd_tests {
 
     fn to_host<const D: usize>(t: Tensor<D>) -> Vec<f32> {
         t.into_data()
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect()
@@ -692,11 +692,11 @@ mod fd_tests {
         let mut fd = vec![0.0f32; total];
         for i in 0..total {
             let mut plus = data.clone();
-            let pv = f32::from_le_bytes(plus.bytes[i * 4..i * 4 + 4].try_into().unwrap()) + eps;
-            plus.bytes[i * 4..i * 4 + 4].copy_from_slice(&pv.to_le_bytes());
+            let pv = f32::from_le_bytes(plus.bytes()[i * 4..i * 4 + 4].try_into().unwrap()) + eps;
+            plus.bytes()[i * 4..i * 4 + 4].copy_from_slice(&pv.to_le_bytes());
             let mut minus = data.clone();
-            let mv = f32::from_le_bytes(minus.bytes[i * 4..i * 4 + 4].try_into().unwrap()) - eps;
-            minus.bytes[i * 4..i * 4 + 4].copy_from_slice(&mv.to_le_bytes());
+            let mv = f32::from_le_bytes(minus.bytes()[i * 4..i * 4 + 4].try_into().unwrap()) - eps;
+            minus.bytes()[i * 4..i * 4 + 4].copy_from_slice(&mv.to_le_bytes());
             let xp = Tensor::<4>::from_data(plus, &dev);
             let xm = Tensor::<4>::from_data(minus, &dev);
             fd[i] = (rope_loss(&xp, &cos, &sin) - rope_loss(&xm, &cos, &sin)) / (2.0 * eps);

@@ -132,7 +132,7 @@ impl Io {
         self.out
             .clone()
             .into_data()
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect()

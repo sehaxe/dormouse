@@ -24,7 +24,7 @@ fn rel_diff(a: Tensor<4>, b: Tensor<4>) -> f32 {
     let b = b.into_data();
     let mut max_abs = 0.0f32;
     let mut scale = 0.0f32;
-    for (x, y) in a.bytes.chunks_exact(4).zip(b.bytes.chunks_exact(4)) {
+    for (x, y) in a.bytes().chunks_exact(4).zip(b.bytes().chunks_exact(4)) {
         let x = f32::from_le_bytes(x.try_into().unwrap());
         let y = f32::from_le_bytes(y.try_into().unwrap());
         max_abs = max_abs.max((x - y).abs());
@@ -242,7 +242,7 @@ fn fused_grads_match_finite_difference() {
         let shape = inp_i.shape().dims::<4>();
         let grad_flat = fused_grads[i].clone().into_data();
         let grad_vals: Vec<f32> = grad_flat
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
             .collect();
@@ -258,7 +258,7 @@ fn fused_grads_match_finite_difference() {
             max_idx % shape[3],
         );
         let probe = |delta: f32| -> f32 {
-            let mut buf = inp_i.clone().into_data().bytes;
+            let mut buf = inp_i.clone().into_data().bytes();
             let idx = (((b * shape[1] + h) * shape[2] + t) * shape[3] + d) * 4;
             let mut val = f32::from_le_bytes(buf[idx..idx + 4].try_into().unwrap());
             val += delta;
@@ -393,7 +393,7 @@ fn rel_diff_2d<const D: usize>(a: Tensor<D>, b: Tensor<D>) -> f32 {
     let b = b.into_data();
     let mut max_abs = 0.0f32;
     let mut scale = 0.0f32;
-    for (x, y) in a.bytes.chunks_exact(4).zip(b.bytes.chunks_exact(4)) {
+    for (x, y) in a.bytes().chunks_exact(4).zip(b.bytes().chunks_exact(4)) {
         let x = f32::from_le_bytes(x.try_into().unwrap());
         let y = f32::from_le_bytes(y.try_into().unwrap());
         max_abs = max_abs.max((x - y).abs());
@@ -437,7 +437,7 @@ fn chunk64_strong_decay_stays_finite() {
         (out.clone().into_data(), "out"),
         (new_state.into_data(), "state"),
     ] {
-        for x in t.bytes.chunks_exact(4) {
+        for x in t.bytes().chunks_exact(4) {
             let v = f32::from_le_bytes(x.try_into().unwrap());
             assert!(v.is_finite(), "{name} not finite: {v}");
             max_abs = max_abs.max(v.abs());
@@ -460,7 +460,7 @@ fn chunk64_strong_decay_stays_finite() {
     let bb = ref_out.into_data();
     let mut max_abs = 0.0f32;
     let mut scale_v = 0.0f32;
-    for (x, y) in a.bytes.chunks_exact(4).zip(bb.bytes.chunks_exact(4)) {
+    for (x, y) in a.bytes().chunks_exact(4).zip(bb.bytes().chunks_exact(4)) {
         let x = f32::from_le_bytes(x.try_into().unwrap());
         let y = f32::from_le_bytes(y.try_into().unwrap());
         max_abs = max_abs.max((x - y).abs());

@@ -216,7 +216,7 @@ fn tensors(f: &Fixture, dev: &Device) -> [Tensor<4>; 7] {
 fn host(t: &Tensor<4>) -> Vec<f64> {
     t.clone()
         .into_data()
-        .bytes
+        .bytes()
         .chunks_exact(4)
         .map(|b| f64::from(f32::from_le_bytes(b.try_into().unwrap())))
         .collect()

@@ -78,7 +78,7 @@ fn draw(dev: &Device) -> Arms {
     dev.seed(5);
     let f = |t: Tensor<4>| -> Vec<f32> {
         t.into_data()
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
             .collect()
@@ -170,7 +170,7 @@ fn loss_of(a: &Arms, dev: &Device, node: bool) -> Tensor<1> {
 fn host(t: &Tensor<4>) -> Vec<f32> {
     t.clone()
         .into_data()
-        .bytes
+        .bytes()
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
         .collect()

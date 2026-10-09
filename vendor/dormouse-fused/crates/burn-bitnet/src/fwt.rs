@@ -155,7 +155,7 @@ mod tests {
         let h2x = fast_walsh_hadamard(fast_walsh_hadamard(x));
         let v: Vec<f32> = h2x
             .into_data()
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect();

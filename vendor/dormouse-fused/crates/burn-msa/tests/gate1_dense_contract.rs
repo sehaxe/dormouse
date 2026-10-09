@@ -81,8 +81,10 @@ fn sparse_kb_all_with_tail_equals_dense() {
 /// Max |a - b| over two equal-shape f32 tensors. THE comparison of the
 /// dense contract.
 fn worst_abs(a: &Tensor<3>, b: &Tensor<3>) -> f32 {
-    let da = a.clone().into_data().bytes;
-    let db = b.clone().into_data().bytes;
+    let ad = a.clone().into_data();
+    let bd = b.clone().into_data();
+    let da = ad.bytes();
+    let db = bd.bytes();
     assert_eq!(da.len(), db.len(), "shape mismatch");
     da.chunks_exact(4)
         .zip(db.chunks_exact(4))
@@ -124,7 +126,7 @@ fn sparse_small_kb_is_mathematically_consistent_but_restrictive() {
     );
     let picks = burn_msa::select_blocks(inert, 2);
     let out = burn_msa::sparse_attention(q, k, v, 4, &picks);
-    let ov: Vec<f32> = out.into_data().bytes.chunks_exact(4)
+    let ov: Vec<f32> = out.into_data().bytes().chunks_exact(4)
         .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
         .collect();
     assert!(

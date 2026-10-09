@@ -143,7 +143,7 @@ mod tests {
         let got: Vec<f32> = norm
             .forward(x)
             .into_data()
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|v| f32::from_le_bytes(v.try_into().unwrap()))
             .collect();

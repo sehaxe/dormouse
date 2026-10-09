@@ -76,7 +76,7 @@ mod tests {
     use super::*;
 
     fn f32s(x: Tensor<3>) -> Vec<f32> {
-        x.into_data().bytes.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()
+        x.into_data().bytes().chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()
     }
 
     #[test]
@@ -104,7 +104,7 @@ mod tests {
             Tensor::<3>::from_data(burn::tensor::TensorData::new(din, [1, t, t]), &dev),
             r,
         );
-        let av: Vec<f32> = teacher.clone().into_data().bytes.chunks_exact(4)
+        let av: Vec<f32> = teacher.clone().into_data().bytes().chunks_exact(4)
             .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
             .collect();
         // scores: log(a-hat) where the block is visible, -1e30 where not.
@@ -120,7 +120,7 @@ mod tests {
         let scores =
             Tensor::<3>::from_data(burn::tensor::TensorData::new(s, [1, t, b_n]), &dev);
         let l = distill_loss(scores, teacher, r);
-        let v = l.into_data().bytes.chunks_exact(4)
+        let v = l.into_data().bytes().chunks_exact(4)
             .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
             .collect::<Vec<_>>();
         assert!(

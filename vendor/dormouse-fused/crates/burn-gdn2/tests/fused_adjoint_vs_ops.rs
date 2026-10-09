@@ -61,7 +61,7 @@ fn rel(a: &Tensor<4>, b: &Tensor<4>) -> (f32, f32) {
 fn vals(t: &Tensor<4>) -> Vec<f32> {
     t.clone()
         .into_data()
-        .bytes
+        .bytes()
         .chunks_exact(4)
         .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
         .collect()

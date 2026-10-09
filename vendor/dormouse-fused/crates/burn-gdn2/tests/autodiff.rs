@@ -23,7 +23,7 @@ fn cfg(hidden: usize, heads: usize, head_dim: usize, mode: Gdn2Mode) -> Gdn2Conf
 
 fn max_diff(a: Tensor<3>, b: Tensor<3>) -> f32 {
     let d = (a - b).abs().max().into_data();
-    d.bytes
+    d.bytes()
         .chunks_exact(4)
         .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
         .fold(0.0f32, f32::max)

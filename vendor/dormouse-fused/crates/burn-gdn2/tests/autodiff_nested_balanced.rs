@@ -46,7 +46,7 @@ fn rel_diff<const D: usize>(a: &Tensor<D>, b: &Tensor<D>) -> f32 {
     let b = b.clone().into_data();
     let mut max_abs = 0.0f32;
     let mut scale = 0.0f32;
-    for (x, y) in a.bytes.chunks_exact(4).zip(b.bytes.chunks_exact(4)) {
+    for (x, y) in a.bytes().chunks_exact(4).zip(b.bytes().chunks_exact(4)) {
         let x = f32::from_le_bytes(x.try_into().unwrap());
         let y = f32::from_le_bytes(y.try_into().unwrap());
         max_abs = max_abs.max((x - y).abs());
@@ -249,8 +249,8 @@ fn the_trainers_view_is_a_real_transposition() {
     let trainer_view = project_to_4d(src.clone(), h, d);
     assert_eq!(trainer_view.shape().dims::<4>(), [b, h, t, d]);
     assert_ne!(
-        trainer_view.clone().into_data().bytes,
-        src.clone().into_data().bytes,
+        trainer_view.clone().into_data().bytes(),
+        src.clone().into_data().bytes(),
         "the trainer's [B,T,H,D]->[B,H,T,D] permute was a no-op: the fixture \
          would be contiguous and no strided path would be exercised"
     );
@@ -260,8 +260,8 @@ fn the_trainers_view_is_a_real_transposition() {
     let round_trip = src.clone().swap_dims(1, 2).permute([0, 2, 1, 3]);
     assert_eq!(round_trip.shape().dims::<4>(), [b, t, h, d]);
     assert_eq!(
-        round_trip.into_data().bytes,
-        src.into_data().bytes,
+        round_trip.into_data().bytes(),
+        src.into_data().bytes(),
         "swap_dims followed by its inverse permute stopped being the identity; \
          if this ever fails the strided-fixture argument above needs rechecking"
     );

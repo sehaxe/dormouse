@@ -79,7 +79,7 @@ fn distillation_moves_the_picks_onto_the_teacher() {
     let picked: Vec<i64> = picks
         .into_data()
         .convert::<i64>()
-        .bytes
+        .bytes()
         .chunks_exact(8)
         .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
         .collect();

@@ -639,7 +639,7 @@ mod ad_tests {
 
     fn to_host(t: Tensor<2>) -> Vec<f32> {
         t.into_data()
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect()

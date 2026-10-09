@@ -30,7 +30,7 @@ mod tests {
 
     fn to_vec(x: Tensor<2>) -> Vec<f32> {
         x.into_data()
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect()
@@ -76,7 +76,7 @@ mod tests {
         let y = apply_rope_3d::<NdArray>(x.clone(), cos, sin, 4);
         let d: Vec<f32> = (x.slice([0..1, 0..1]) - y.slice([0..1, 0..1]))
             .into_data()
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect();
@@ -91,7 +91,7 @@ mod tests {
         let (cy, sy) = precompute_freqs_yarn(16, 64, 10000.0, 1.0, 4096, 32.0, 1.0, &dev());
         let d: Vec<f32> = (c1.clone() - cy.clone())
             .into_data()
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect();
@@ -101,7 +101,7 @@ mod tests {
         );
         let d2: Vec<f32> = (s1 - sy)
             .into_data()
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect();
@@ -182,7 +182,7 @@ mod tests {
         let y4 = apply_rope_4d::<NdArray>(x4, cos, sin).reshape([2, 8, 32]);
         let d: Vec<f32> = (y3 - y4)
             .into_data()
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect();

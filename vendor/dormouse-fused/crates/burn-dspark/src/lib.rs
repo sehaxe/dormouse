@@ -390,7 +390,7 @@ mod tests {
         assert_eq!(out.dims(), [2, 4, 1]);
         let v: Vec<f32> = out
             .into_data()
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect();

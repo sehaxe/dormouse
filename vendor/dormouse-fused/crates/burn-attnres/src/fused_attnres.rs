@@ -862,7 +862,7 @@ mod tests {
 
     fn to_host<const D: usize>(t: Tensor<D>) -> Vec<f32> {
         t.into_data()
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect()
@@ -1707,7 +1707,7 @@ mod ad_tests {
 
     fn to_host<const D: usize>(t: Tensor<D>) -> Vec<f32> {
         t.into_data()
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect()
@@ -1770,7 +1770,7 @@ mod fd_tests {
 
     fn to_host<const D: usize>(t: Tensor<D>) -> Vec<f32> {
         t.into_data()
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect()
@@ -1827,7 +1827,7 @@ mod fd_tests {
             .grad(&grads)
             .unwrap()
             .into_data()
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect();
@@ -1843,7 +1843,7 @@ mod fd_tests {
             .grad(&grads)
             .unwrap()
             .into_data()
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect();
@@ -1913,12 +1913,12 @@ mod fd_tests {
             let mut fd = vec![0.0f32; total];
             for i in 0..total {
                 let mut plus = data_h[li].clone();
-                let pv = f32::from_le_bytes(plus.bytes[i * 4..i * 4 + 4].try_into().unwrap()) + eps;
-                plus.bytes[i * 4..i * 4 + 4].copy_from_slice(&pv.to_le_bytes());
+                let pv = f32::from_le_bytes(plus.bytes()[i * 4..i * 4 + 4].try_into().unwrap()) + eps;
+                plus.bytes()[i * 4..i * 4 + 4].copy_from_slice(&pv.to_le_bytes());
                 let mut minus = data_h[li].clone();
                 let mv =
-                    f32::from_le_bytes(minus.bytes[i * 4..i * 4 + 4].try_into().unwrap()) - eps;
-                minus.bytes[i * 4..i * 4 + 4].copy_from_slice(&mv.to_le_bytes());
+                    f32::from_le_bytes(minus.bytes()[i * 4..i * 4 + 4].try_into().unwrap()) - eps;
+                minus.bytes()[i * 4..i * 4 + 4].copy_from_slice(&mv.to_le_bytes());
                 let mut hs_p: Vec<Tensor<3>> = data_h
                     .iter()
                     .map(|x| Tensor::<3>::from_data(x.clone(), &dev))
@@ -1968,11 +1968,11 @@ mod fd_tests {
         let mut fd = vec![0.0f32; d];
         for i in 0..d {
             let mut plus = data_q.clone();
-            let pv = f32::from_le_bytes(plus.bytes[i * 4..i * 4 + 4].try_into().unwrap()) + eps;
-            plus.bytes[i * 4..i * 4 + 4].copy_from_slice(&pv.to_le_bytes());
+            let pv = f32::from_le_bytes(plus.bytes()[i * 4..i * 4 + 4].try_into().unwrap()) + eps;
+            plus.bytes()[i * 4..i * 4 + 4].copy_from_slice(&pv.to_le_bytes());
             let mut minus = data_q.clone();
-            let mv = f32::from_le_bytes(minus.bytes[i * 4..i * 4 + 4].try_into().unwrap()) - eps;
-            minus.bytes[i * 4..i * 4 + 4].copy_from_slice(&mv.to_le_bytes());
+            let mv = f32::from_le_bytes(minus.bytes()[i * 4..i * 4 + 4].try_into().unwrap()) - eps;
+            minus.bytes()[i * 4..i * 4 + 4].copy_from_slice(&mv.to_le_bytes());
             let hs: Vec<Tensor<3>> = data_h
                 .iter()
                 .map(|x| Tensor::<3>::from_data(x.clone(), &dev))

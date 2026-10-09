@@ -33,7 +33,7 @@ fn max_rel(a: &Tensor<4>, b: &Tensor<4>) -> f32 {
     let b = b.clone().into_data();
     let mut max_abs = 0.0f32;
     let mut scale = 0.0f32;
-    for (x, y) in a.bytes.chunks_exact(4).zip(b.bytes.chunks_exact(4)) {
+    for (x, y) in a.bytes().chunks_exact(4).zip(b.bytes().chunks_exact(4)) {
         let x = f32::from_le_bytes(x.try_into().unwrap());
         let y = f32::from_le_bytes(y.try_into().unwrap());
         max_abs = max_abs.max((x - y).abs());
@@ -125,14 +125,14 @@ fn fused_chunk_matches_tensor_path() {
             let fo: Vec<f32> = f_out
                 .clone()
                 .into_data()
-                .bytes
+                .bytes()
                 .chunks_exact(4)
                 .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
                 .collect();
             let ro: Vec<f32> = ref_out
                 .clone()
                 .into_data()
-                .bytes
+                .bytes()
                 .chunks_exact(4)
                 .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
                 .collect();
@@ -238,7 +238,7 @@ fn fused_op_grads_match_tensor_path_cuda() {
         let b = gf.clone().into_data();
         let mut max_abs = 0.0f32;
         let mut scale_v = 0.0f32;
-        for (x, y) in a.bytes.chunks_exact(4).zip(b.bytes.chunks_exact(4)) {
+        for (x, y) in a.bytes().chunks_exact(4).zip(b.bytes().chunks_exact(4)) {
             let x = f32::from_le_bytes(x.try_into().unwrap());
             let y = f32::from_le_bytes(y.try_into().unwrap());
             max_abs = max_abs.max((x - y).abs());
@@ -326,7 +326,7 @@ fn fused_zero_key_row_grads_finite() {
         let gr = t.grad(&grads).unwrap().clone();
         let d = gr.into_data();
         let (mut n_nan, mut n_inf) = (0usize, 0usize);
-        for bytes in d.bytes.chunks_exact(4) {
+        for bytes in d.bytes().chunks_exact(4) {
             let x = f32::from_le_bytes(bytes.try_into().unwrap());
             if x.is_nan() {
                 n_nan += 1;

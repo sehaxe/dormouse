@@ -25,7 +25,7 @@ use burn::tensor::{Device, Tensor, TensorData};
 fn host(t: &Tensor<5>) -> Vec<f32> {
     t.clone()
         .into_data()
-        .bytes
+        .bytes()
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
         .collect()

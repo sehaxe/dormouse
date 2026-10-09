@@ -232,7 +232,7 @@ fn run_case(fx: &Fx, case: &str, norm: &RMSNorm, dev: &Device) -> Vec<f32> {
     );
     norm.forward(x)
         .into_data()
-        .bytes
+        .bytes()
         .chunks_exact(4)
         .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
         .collect()

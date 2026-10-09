@@ -86,7 +86,7 @@ fn rel_diff<const D: usize>(a: Tensor<D>, b: Tensor<D>) -> f32 {
     let b = b.clone().into_data();
     let mut max_abs = 0.0f32;
     let mut scale = 0.0f32;
-    for (x, y) in a.bytes.chunks_exact(4).zip(b.bytes.chunks_exact(4)) {
+    for (x, y) in a.bytes().chunks_exact(4).zip(b.bytes().chunks_exact(4)) {
         let x = f32::from_le_bytes(x.try_into().unwrap());
         let y = f32::from_le_bytes(y.try_into().unwrap());
         max_abs = max_abs.max((x - y).abs());
@@ -263,7 +263,7 @@ fn a_strided_input_reaches_the_fused_kernels_and_completes_a_backward() {
     // Keep the values: a materialization that wrote in memory order instead of
     // logical order would leave the inputs alone and corrupt what the kernel
     // reads, so the numbers below are the check.
-    let before: Vec<Bytes> = inp.iter().map(|t| t.clone().into_data().bytes).collect();
+    let before: Vec<Bytes> = inp.iter().map(|t| t.clone().into_data().bytes()).collect();
 
     reset_fused_calls();
     reset_contiguous();
@@ -316,7 +316,7 @@ fn a_strided_input_reaches_the_fused_kernels_and_completes_a_backward() {
     // The materialization must not have disturbed the caller's tensors.
     for (i, t) in inp.iter().enumerate() {
         assert_eq!(
-            t.clone().into_data().bytes,
+            t.clone().into_data().bytes(),
             before[i],
             "input {i} was mutated by the contiguity materialization"
         );
