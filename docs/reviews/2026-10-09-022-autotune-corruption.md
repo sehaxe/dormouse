@@ -1,5 +1,15 @@
 # 0.22: the corruption is the autotuner's coin flip, and it is measured
 
+> **Update, later the same night.** The corruption now has a NAME: two
+> identical processes (one clean, one corrupted) leave 4 of 54 parameters
+> different, and the biggest by five orders of magnitude is
+> `loop_block.engram.memory.embedding.weight` — 10 063 of 32 768 rows, worst
+> entry 4.2e18 absolute, every KDA parameter bit-identical. Three suspects
+> were refuted on the way (the gather's backward zeroes untouched rows
+> exactly; the seeded RNG is sound; `--engram-ram` also explodes). The full
+> list — upstream vs ours, workarounds measured, what burn must fix first —
+> is `docs/reviews/2026-10-09-bug-list-022.md`.
+
 **2026-10-09, review of the 0.22 port (`4b2ff21`..`6e53a4f`), on this box.** The
 question the port left open: `fp32 b10 s512` on `preset small` intermittently
 destroys its own run — `ce` 5.57 → 1e8..1e16 → NaN, roughly 2 runs in 3. This
