@@ -55,11 +55,15 @@
 //!     <= 16: the fused kernels' numerical range (K3 design)"). The default and
 //!     the kernel design disagree; `bench_train_cuda.rs` is the only thing that
 //!     ever ran chunk 64 and it discards its result.
-//!   * the test is RED, and the panic is in the TENSOR-OPS REFERENCE, not the
-//!     fused path: `chunk_wy_forward` dies on a matmul of [10,12,16,64] against
-//!     [10,12,512,64] ("inner dimension ... 64 and 512"). Handed to burn-gdn2's
-//!     owner; the fix is in that crate, not in this file. Note which arm is
-//!     broken: the fallback that was supposed to be the safe harbour.
+//!   * RETRACTION of the 2026-09-29 verdict that used to stand here: the panic
+//!     ("inner dimension ... got 64 and 512") was NOT the tensor-ops reference
+//!     being broken. This test built S0 as a seventh `[B, H, T, K]` tensor, so
+//!     the op's first WY-against-state matmul compared a chunk-sized axis
+//!     against the sequence. S0 is `[B, HV, K, V]` (module.rs's
+//!     `State::recurrent`). The kernel never got that far, and "the fallback
+//!     that was supposed to be the safe harbour" was never the broken arm -
+//!     the fixture was. Fixed 2026-10-09; the header below the fold is the
+//!     evidence the fix was measured with.
 
 use burn::backend::{AutodiffBackend, BackendTypes};
 use burn::tensor::{Device, Distribution, Tensor};
@@ -169,8 +173,17 @@ fn gated_delta_chunk_path_runs_at_the_production_shape() {
             Distribution::Normal(0.0, 0.3),
             &device
         )),
+        // The incoming state S0, and its shape is the CONTRACT, not a detail:
+        // `GatedDeltaNet2::State::recurrent` is `S [B, HV, K, V]` (module.rs),
+        // so the state is [batch, heads, k_dim, v_dim] and NOT one more
+        // [B, H, T, *] tensor like the six attention inputs above. Building it
+        // the sequence's shape is what kept this gate red: the op's first
+        // matmul of the WY basis against S0 then reads inner dimensions
+        // chunk_size against time ("got 64 and 512" at chunk=16, T=512), which
+        // the header blamed on the tensor-ops reference. The kernel never got
+        // that far; the fixture was wrong.
         lift!(Tensor::<4>::random(
-            [batch, heads, time, k_dim],
+            [batch, heads, k_dim, v_dim],
             Distribution::Normal(0.0, 0.3),
             &device
         )),
@@ -198,10 +211,22 @@ fn gated_delta_chunk_path_runs_at_the_production_shape() {
     };
     let (fwd, _) = fused_calls();
     println!("fused forward kernel launches: {fwd}");
-    assert!(
-        fwd > 0,
-        "the fused forward kernel never launched: the gate is closed again"
-    );
+    // The fused arm is OFF by default on 0.22 (79edb95: its adjoint is not
+    // proven on cubecl 0.11), so a launch count is only a claim when the arm
+    // is opted in. What this gate MUST hold either way is the arm that ships,
+    // and that is asserted below against the loop reference - not against
+    // itself.
+    if std::env::var("DM_GDN2_FUSED").is_ok() {
+        assert!(
+            fwd > 0,
+            "DM_GDN2_FUSED is set and the fused forward kernel still never launched"
+        );
+    } else {
+        println!(
+            "fused arm OFF (DM_GDN2_FUSED unset): the ops path is the shipping arm; \
+             its launch counters are 0 by design"
+        );
+    }
 
     // Backward through the checkpointed graph: the fused ADJOINT kernel, not
     // the tensor-ops adjoint. Without this the backward half of the claim is
@@ -210,16 +235,21 @@ fn gated_delta_chunk_path_runs_at_the_production_shape() {
     let grads = loss.backward();
     let (_, bwd) = fused_calls();
     println!("fused adjoint kernel launches: {bwd}");
-    assert!(
-        bwd > 0,
-        "the fused adjoint kernel never launched: the gate is closed again"
-    );
+    if std::env::var("DM_GDN2_FUSED").is_ok() {
+        assert!(
+            bwd > 0,
+            "DM_GDN2_FUSED is set and the fused adjoint kernel still never launched"
+        );
+    }
 
     // The numbers are the chunked WY form, and this comes FIRST because it
-    // settles what the incoming state is: the fused kernels against the
-    // tensor-ops chunk path, which is what the trainer ran while the gate was
-    // closed. Different algorithm (f32 reassociation over chunks), same
-    // function.
+    // settles what the incoming state is. The reference is the OTHER ops arm -
+    // the sequential per-chunk loop - so this is a cross-check of two
+    // algorithms (batched Neumann inverse against the loop's per-chunk
+    // inverse), not a tensor compared to itself. `set_chunk_path` is the same
+    // switch `DM_GDN2_OPS` sets for a whole process; doing it here keeps the
+    // default arm for the op under test and the reference arm in one process.
+    burn_gdn2::forward::set_chunk_path(burn_gdn2::forward::ChunkPath::Loop);
     let (plain_out, plain_st) = chunk_wy_forward(
         inputs[0].clone(),
         inputs[1].clone(),
@@ -233,9 +263,9 @@ fn gated_delta_chunk_path_runs_at_the_production_shape() {
     );
     let d_out = rel_diff(out.clone(), plain_out.clone());
     let d_state = rel_diff(st.clone(), plain_st.clone());
-    println!("fused vs tensor-ops chunk path: out {d_out:.3e}, state {d_state:.3e}");
-    assert!(d_out < 1e-3, "forward drift vs tensor path: {d_out:.3e}");
-    assert!(d_state < 1e-3, "state drift vs tensor path: {d_state:.3e}");
+    println!("shipping arm vs the loop reference: out {d_out:.3e}, state {d_state:.3e}");
+    assert!(d_out < 1e-3, "forward drift vs loop reference: {d_out:.3e}");
+    assert!(d_state < 1e-3, "state drift vs loop reference: {d_state:.3e}");
 
     for (i, t) in inputs.iter().enumerate() {
         let g = t
