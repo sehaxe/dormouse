@@ -732,6 +732,29 @@ The defenses are installed, not optional.
 
 ## 3.3 Broken, open, or undocumented
 
+- **0.22.0 is NOT trainable: the corruption is the autotuner's coin flip
+  (2026-10-09, measured).** `fp32 b10 s512` on `preset small` destroys its own
+  run 2 runs in 3 on burn 0.22.0 + cubecl 0.11.0: `ce` 5.57 → 1e8..1e16 → NaN
+  at step 1. It is **not** the weights (at `--lr 0`, a no-op update, every
+  parameter is bit-identical step 0 → step 1 while the step-1 forward reads
+  1.76e9, and the held-out eval on those same weights reads NaN), **not** the
+  KDA chunk math (the production-shape gate is green: batched vs loop 3.3e-4,
+  gradients ≤ 3.3e-4), and not a race or an out-of-bounds write (memcheck and
+  racecheck both report 0). It is per-process: **50 of 125 autotune keys get a
+  different winning candidate between two runs of one program**, and two keys
+  separate the outcomes 4/2 with winners whose medians are 1.6 % apart — a
+  benchmark coin flip picks between kernels that disagree numerically.
+  Everything that "fixes" a run (`--opt adamw`, `--no-kda`, `--no-engram`,
+  `n_experts=1`, the `persistent_memory` setting: size-match 10/10, enabled
+  1/1, disabled 1/3-3/3, enforced 0/1) only moves the coin, and all cost the
+  same 198-207 ms/step, so **no config change is shipped**. Until upstream
+  answers (issue drafted, evidence in
+  `docs/reviews/2026-10-09-022-autotune-corruption.md`), **burn 0.22.0 is not
+  fit for an A/B or a production run** — a corrupted run looks like a slow
+  arm — and `dormouse-pre4` remains the stack that produces trustworthy
+  numbers. The cheapest loud detector that exists today: replay a step in
+  two processes and compare the bitwise `ce`.
+
 - **The eval's memory arm has no test.** `b3d6914` says it in its own message:
   the eval call site is inside a 1400-line function and is not callable from a
   test, so the half of the fix that mattered — passing the keys the training
