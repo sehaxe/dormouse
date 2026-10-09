@@ -188,3 +188,34 @@ fn bf16_cast_works_and_the_f32_readback_is_refused() {
         back.err().unwrap()
     );
 }
+
+/// 2026-10-09: `bf16_matmul_is_refused` above is RED on burn 0.22 - the matmul
+/// no longer panics. What does it do instead? Compute it and compare against
+/// the same product in fp32: a silent cast lands within casting error
+/// (~1e-2), and anything worse is garbage nobody asked for.
+#[test]
+fn bf16_matmul_on_0_22_is_a_silent_cast_or_garbage() {
+    let d = Device::cuda(0);
+    d.seed(3);
+    let a32 = Tensor::<2>::random([128, 128], Distribution::Normal(0.0, 1.0), &d);
+    let b32 = Tensor::<2>::random([128, 128], Distribution::Normal(0.0, 1.0), &d);
+    let a = a32.clone().cast(FloatDType::BF16);
+    let b = b32.clone().cast(FloatDType::BF16);
+    let c = a.matmul(b);
+    let v: Vec<f32> = c.cast(FloatDType::F32).into_data().try_to_vec().unwrap();
+    let r: Vec<f32> = a32.matmul(b32).into_data().try_to_vec().unwrap();
+    let worst = v
+        .iter()
+        .zip(r.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max);
+    let scale = r.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    println!(
+        "bf16 x bf16 matmul on 0.22: {} elems, finite={}, worst |bf16-fp32|={worst:.3e} \
+         (scale {scale:.3e}, rel {:.3e})",
+        v.len(),
+        v.iter().all(|x| x.is_finite()),
+        worst / scale
+    );
+    assert!(v.iter().all(|x| x.is_finite()), "bf16 matmul produced non-finite values");
+}

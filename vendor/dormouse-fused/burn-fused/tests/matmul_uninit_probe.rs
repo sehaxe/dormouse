@@ -329,3 +329,152 @@ fn module_forward_is_deterministic_within_one_process() {
     let first: Vec<f32> = ya.into_data().try_to_vec().unwrap();
     assert_eq!(first, pa, "a forward after a backward differs from the forward before it");
 }
+
+// ── level 9: is one candidate WRONG, not just different? ─────────────────
+//
+// The shape the autotuner re-picks between runs: m=64, n=2048, k=64 (the
+// TSCT expert's second factor matmul, [*, rank] x [rank, d_ffn]). This prints
+// a checksum so a driver can correlate it with the candidate the autotuner
+// chose (the decisions sink names it). A checksum that differs from the
+// others by more than f32 reassociation (~1e-6) is a kernel computing the
+// wrong product, and that is the defect.
+#[test]
+fn fixed_shape_checksum() {
+    let d = dev();
+    d.seed(42); // same inputs in every process, so a different checksum is the kernel's
+    let a = Tensor::<2>::random([64, 64], Distribution::Normal(0.0, 1.0), &d);
+    let b = Tensor::<2>::random([64, 2048], Distribution::Normal(0.0, 1.0), &d);
+    let c = a.matmul(b);
+    let v: Vec<f32> = c.into_data().try_to_vec().unwrap();
+    let sum: f64 = v.iter().map(|&x| x as f64).sum();
+    let abs: f64 = v.iter().map(|&x| (x as f64).abs()).sum();
+    let bits: u64 = v
+        .iter()
+        .fold(0u64, |h, x| h.wrapping_mul(31).wrapping_add(x.to_bits() as u64));
+    println!(
+        "CHECKSUM m64_n2048_k64: n={} sum={sum:.9e} abs={abs:.9e} bits={bits:016x}",
+        v.len()
+    );
+}
+
+// ── level 10: the value-level proof, on the trainer's device ─────────────
+//
+// Everything above is a correlation (4 exploding runs vs 2 clean). This is
+// the direct form: the same two shapes the trainer tunes, on the AUTOdiff
+// device the trainer uses, seeded, so every process computes the same
+// product. A different checksum between processes is a candidate computing a
+// different answer, and the decisions sink names which candidate won.
+#[test]
+fn checksum_on_the_trainers_device() {
+    use burn::backend::Autodiff;
+    use burn_cuda::Cuda;
+    let d = Device::cuda(0).autodiff();
+    d.seed(42);
+    for (m, k, n) in [(512usize, 128usize, 1024usize), (64usize, 64usize, 2048usize)] {
+        let a = Tensor::<2>::random([m, k], Distribution::Normal(0.0, 1.0), &d).require_grad();
+        let b = Tensor::<2>::random([k, n], Distribution::Normal(0.0, 1.0), &d).require_grad();
+        // The tuner has nothing to compare on a single call: repeat the same
+        // shape, the way a training loop does.
+        let mut c = a.clone().matmul(b.clone());
+        for _ in 0..6 {
+            c = a.clone().matmul(b.clone());
+        }
+        let _ = c.clone().backward();
+        let v: Vec<f32> = c.into_data().try_to_vec().unwrap();
+        let bits: u64 = v
+            .iter()
+            .fold(0u64, |h, x| h.wrapping_mul(31).wrapping_add(x.to_bits() as u64));
+        let sum: f64 = v.iter().map(|&x| x as f64).sum();
+        println!(
+            "TRAINERDEV m{m}_n{n}_k{k}: n={} sum={sum:.9e} bits={bits:016x}",
+            v.len()
+        );
+    }
+    let _ = std::marker::PhantomData::<Autodiff<Cuda>>;
+}
+
+// ── level 11: does a gather's backward ZERO the untouched rows? ──────────
+//
+// The named fingerprint of the corruption is `loop_block.engram.memory`.
+// Its forward is `table.gather(0, idx)` where idx touches only the rows the
+// batch hashed to. The Adam step then reads the WHOLE gradient tensor, so
+// every row the batch did not touch must arrive as exactly 0. If the backward
+// allocates that buffer uninitialised and only scatter-adds the touched rows,
+// the untouched ones are allocator garbage - and Adam turns a 1e18 into a
+// 1e18 * lr write. Two processes, two allocator states, one corrupted table.
+//
+// This is the whole claim in one assertion: the untouched rows of a gather's
+// gradient are zero.
+#[test]
+fn gather_backward_zeroes_the_untouched_rows() {
+    let d = Device::cuda(0).autodiff();
+    d.seed(7);
+    let rows = 4096usize;
+    let width = 96usize;
+    let table = Tensor::<2>::random([rows, width], Distribution::Normal(0.0, 1.0), &d).require_grad();
+    // touch 512 of the 4096 rows, the way a batch's hashes touch a table
+    let hits: Vec<i64> = (0..512).map(|i| (i * 7 % rows as i64) as i64).collect();
+    let idx = Tensor::<2, burn::tensor::Int>::from_data(
+        burn::tensor::TensorData::new(hits.clone(), [512, 1]),
+        &d,
+    )
+    .expand([512, width]);
+    let out = table.clone().gather(0, idx);
+    let loss = out.powf_scalar(2.0).sum();
+    let grads = loss.backward();
+    let g = table.grad(&grads).expect("the table gets a gradient");
+    let v: Vec<f32> = g.into_data().try_to_vec().unwrap();
+    let untouched: Vec<usize> = (0..rows).filter(|r| !hits.contains(&(*r as i64))).collect();
+    let mut worst = 0.0f32;
+    let mut worst_row = usize::MAX;
+    for &r in &untouched {
+        let s = &v[r * width..r * width + width];
+        let m = s.iter().fold(0.0f32, |a, x| a.max(x.abs()));
+        if m > worst {
+            worst = m;
+            worst_row = r;
+        }
+    }
+    println!(
+        "gather backward: {} untouched rows, worst |grad| on row {worst_row} = {worst:.6e}",
+        untouched.len()
+    );
+    assert_eq!(
+        worst, 0.0,
+        "row {worst_row} was never gathered, yet its gradient is {worst:.6e}: the gradient \\
+         buffer is not zeroed, so every untouched entry is allocator garbage"
+    );
+}
+
+// ── level 12: is the seeded device RNG sound on a large tensor? ──────────
+//
+// The engram memory table is `engram_rows` rounded up to a power of two
+// (32 768) times 96, initialised from the seeded device RNG. Two identical
+// processes get different tables, and the difference is not rounding: rows
+// differ by 1e18 absolute, which a Normal(0, 1) draw cannot produce. This is
+// the smallest possible form of that claim: one seeded draw, one assertion
+// about what a Normal draw can contain.
+#[test]
+fn a_seeded_normal_draw_stays_in_the_distribution() {
+    // The model builds its parameters on the autodiff device (the trainer's
+    // log says `checkpointing: Disabled`), so the init ops are dispatched
+    // through the autodiff bridge - a different path from the bare device.
+    let d = Device::cuda(0).autodiff();
+    d.seed(1);
+    for (rows, width) in [(32768usize, 96usize), (98304usize, 96usize), (1000usize, 96usize)] {
+        let t = Tensor::<2>::random([rows, width], Distribution::Normal(0.0, 1.0), &d);
+        let v: Vec<f32> = t.into_data().try_to_vec().unwrap();
+        let max = v.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        let nonfinite = v.iter().filter(|x| !x.is_finite()).count();
+        println!(
+            "seeded Normal draw [{rows},{width}]: max |x| = {max:.4e}, non-finite = {nonfinite} \
+             (a 3.1M-draw from N(0,1) should top out near 5.5)"
+        );
+        assert!(
+            max < 20.0,
+            "[{rows},{width}]: a Normal(0,1) draw contains {max:.4e} - the RNG kernel produced \\
+             values no distribution can"
+        );
+        assert_eq!(nonfinite, 0, "[{rows},{width}]: {nonfinite} non-finite draws");
+    }
+}
