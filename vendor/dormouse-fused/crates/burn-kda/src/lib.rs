@@ -1091,7 +1091,7 @@ mod tests {
         let alpha = dec.forward(x.clone());
         let vals: Vec<f32> = alpha
             .into_data()
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect();
@@ -1106,7 +1106,7 @@ mod tests {
         let alpha2 = dec2.forward(x.clone());
         let vals2: Vec<f32> = alpha2
             .into_data()
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect();
@@ -1130,7 +1130,7 @@ mod tests {
         let d: Vec<f32> = (a1 - a2)
             .abs()
             .into_data()
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect();
@@ -1220,7 +1220,7 @@ mod tests {
         let beta = activation::sigmoid(km.beta_proj.forward(x));
         let vals: Vec<f32> = beta
             .into_data()
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect();
@@ -1284,7 +1284,7 @@ mod tests {
         let d: Vec<f32> = (b1 - b2)
             .abs()
             .into_data()
-            .bytes
+            .bytes()
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect();

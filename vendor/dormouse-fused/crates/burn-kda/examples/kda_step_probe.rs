@@ -99,7 +99,7 @@ fn main() {
         let grads = loss.backward();
         let bytes = xi
             .grad(&grads)
-            .map(|t| t.into_data().bytes.len())
+            .map(|t| t.into_data().bytes().len())
             .unwrap_or(0);
         let t4 = std::time::Instant::now(); // host: backward allocations + launches
         let _ = bytes;

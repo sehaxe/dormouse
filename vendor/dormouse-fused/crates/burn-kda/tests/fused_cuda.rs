@@ -27,8 +27,7 @@ fn fused_matches_decode() {
     let decode = km.forward_recurrent(x, &mut state, true);
     let dmax: f32 = (fused - decode)
         .abs()
-        .into_data()
-        .bytes
+        .into_data() .bytes()
         .chunks_exact(4)
         .map(|bb| f32::from_le_bytes(bb.try_into().unwrap()))
         .fold(0.0f32, f32::max);
@@ -51,8 +50,7 @@ fn fused_matches_decode_softplus() {
     let decode = km.forward_recurrent(x, &mut state, true);
     let dmax: f32 = (fused - decode)
         .abs()
-        .into_data()
-        .bytes
+        .into_data() .bytes()
         .chunks_exact(4)
         .map(|bb| f32::from_le_bytes(bb.try_into().unwrap()))
         .fold(0.0f32, f32::max);
@@ -106,8 +104,7 @@ fn fused_matches_tensor_chunk() {
 
     let dmax: f32 = (fused_out - tensor_out)
         .abs()
-        .into_data()
-        .bytes
+        .into_data() .bytes()
         .chunks_exact(4)
         .map(|bb| f32::from_le_bytes(bb.try_into().unwrap()))
         .fold(0.0f32, f32::max);

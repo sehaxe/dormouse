@@ -39,11 +39,11 @@ use burn_kda::{DecayFn, KdaConfig, KdaModule};
 type AdBal = Autodiff<CudaBare, BalancedCheckpointing>;
 
 fn rel_diff<const D: usize>(a: Tensor<D>, b: Tensor<D>) -> f32 {
-    let a = a.into_data();
-    let b = b.into_data();
+    let da = a.into_data();
+    let db = b.into_data();
     let mut max_abs = 0.0f32;
     let mut scale = 0.0f32;
-    for (x, y) in a.bytes.chunks_exact(4).zip(b.bytes.chunks_exact(4)) {
+    for (x, y) in da.bytes().chunks_exact(4).zip(db.bytes().chunks_exact(4)) {
         let x = f32::from_le_bytes(x.try_into().unwrap());
         let y = f32::from_le_bytes(y.try_into().unwrap());
         max_abs = max_abs.max((x - y).abs());

@@ -224,9 +224,9 @@ const N_SPREAD: usize = 2;
 // ── host helpers ───────────────────────────────────────────────────────
 
 fn host<const D: usize>(t: &Tensor<D>) -> Vec<f32> {
-    t.clone()
-        .into_data()
-        .bytes
+    let data = t.clone().into_data();
+    data
+        .bytes()
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
         .collect()

@@ -93,8 +93,7 @@ fn cfg() -> KdaConfig {
 /// Host f32s of a tensor.
 fn host<const D: usize>(t: &Tensor<D>) -> Vec<f32> {
     t.clone()
-        .into_data()
-        .bytes
+        .into_data() .bytes()
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
         .collect()
