@@ -205,3 +205,20 @@ lint job's continue-on-error.
 2026-10-06 (v22-port): **burn 0.22.0 + cubecl 0.11.0 stock; −79 237 строк** — graph.rs(985)/stage.rs(349)/inplace.rs/graph_seam_cuda(972)/stage_capture(150) удалены, init_pools+launch counter+atlas deltas вырезаны, патч-таблица пуста, vendor/cubecl-fix+vendor/cubek-fix удалены (52k). Оптимизм: (1) f16 SizedType апстрим-импл (float_type! macro); (2) cleanup-renumber hazard #1401 у апстрима ТЕПЕРЬ своё (`held_binding_survives_explicit_cleanup_renumber` в их же тестах); (3) topk OOB (ADR-0015) недостижим нашим плотным роутером без масок. Smoke CUDA: warm step 532-655ms при b8 s512 (против 441ms pre.4 fp16 при b8 — на 20-40% медленнее, но 200 шагов 0 NaN, ce 5.573, clean). Ложный тревога дня: release-билд БЕЗ `--features dormouse-cli/cuda` дал CPU-тренировку 26s/step (qr_householder в DormouseModel::new на flex-CPU стеке — gdb показал) — CUDA-фича у cli default = "cpu", билдить всегда с фичей.
 
 2026-10-07 (bisect022 open): fp32 b8 НЕ детерминировано взрывается на 0.22 (3/4 прогонов к шагу 25-100: 1e10→NaN; один до 150 чист; пул disabled и fused-off не спасают). Двойная улика «руки отвалились»: bwd 14-21ms и retr 5ms на 0.22 (pre.4: 205/52-61) — бэквард/ретракция в 10× быстрее = почти пустые. KDA param-grads на 0.22: q/k/v/b_alpha autodiff vs центральная разница ОДНОГО форварда rel 4e-3..9.6e-1 с расходящимся fd(h) vs fd(h/10) — несглаженность; pre.4 тот же тест 11/11. Лейн wt/bisect022 (ses_eebb3570effekqclkCpG1UQntt) бисектит: CPU-flex 2-layer первым — если врёт CPU-0.22-автодифф, это апстрим-дефект.
+
+2026-10-09 (0.22 bisect, ЗАКРЫТ с доказательством): корень порчи НЕ в весах и НЕ в kernels' math — в ВЫБОРЕ КАНДИДАТА АВТОТЮНОМ.
+При `--lr 0` (no-op апдейт) ВСЕ параметры бит-идентичны шаг0→шаг1, а форвард шага 1 читает ce=1.76e9, и eval на тех же
+весах читает NaN ("held-out eval is NaN … the model or the allocator is broken"). Ретракция, запись оптимизатора, гонки
+(racecheck 0), OOB (memcheck 0) и внутрипроцессная недетерминированность (два форварда бит-равны) — исключены каждым
+своим замером. Математика KDA ops-пути ЗДОРОВА (гейт продакшн-формы зелёный: batched vs loop 3.3e-4, градиенты ≤3.3e-4).
+Что осталось per-process: 50 из 125 ключей тюнинга получают РАЗНОГО победителя между двумя прогонами ОДНОЙ программы;
+два ключа (m=512 n=1024 k=128 и m=64 n=2048 k=64-transposed) расходятся 4-взрыв/2-чисто по выбранному кандидату
+(`matmul_simple_cyclic_mma_multi_rows` против `matmul_ordered_double_mma_..._row_count8`, медианы различаются на 1.6%).
+Всё, что «чинит» один прогон (--opt adamw, --no-kda, --no-engram, n_experts=1, конфиг пула), просто двигает монету:
+size-match 10/10 взрывов, enabled 1/1, disabled 1/3…3/3, enforced 0/1 — и все варианты стоят ОДНО И ТО ЖЕ по ms/step
+(198-207). Поэтому конфиг НЕ меняется: band-aid без причины = ADR-0011. ИТОГ: 0.22.0 пока не тренируем для A/B, pre.4
+остаётся стеком с доверенными числами; доказательная записка docs/reviews/2026-10-09-022-autotune-corruption.md,
+лестница пробников vendor/dormouse-fused/burn-fused/tests/matmul_uninit_probe.rs (9 уровней, включая ОПРОВЕРГНУТУЮ
+гипотезу: uninit-read в узком матмуле реален, но значение маскируется — 0.000e0 против материализованного rhs).
+Побочно, тоже реально: постоянный кэш автотюна (`target/environment`) не создаётся ВООБЩЕ (3 прогона из одного cwd =
+125 свежих решений каждый, 0 файлов) — при том что в бинарнике 2692 символа persistence. Это в тот же issue апстриму.
