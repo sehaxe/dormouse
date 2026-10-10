@@ -55,6 +55,7 @@ fn gr_cfg() -> DormouseConfig {
         n_experts: 2,
         use_gr: true,
         use_tsct: false,
+        use_byteflow: false,
         // The aux heads are a separate objective and a second forward.
         jepa_weight: 0.0,
         dspark_weight: 0.0,
@@ -153,6 +154,7 @@ fn the_rezero_readout_also_contains_the_body_at_every_depth() {
     for depth in 1..=3 {
         let cfg = DormouseConfig {
             use_gr: false,
+            use_byteflow: false,
             ..gr_cfg()
         };
         let mut model = DormouseModel::new(&cfg, &dev);

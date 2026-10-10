@@ -1618,6 +1618,7 @@ mod tests {
         let mut ar = LoopBlock::new(
             &DormouseConfig {
                 use_attnres: true,
+                max_iter: cfg.max_iter.max(2),
                 ..cfg
             },
             &adev(),

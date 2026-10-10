@@ -30,8 +30,10 @@ fn dense_reference(q: Tensor<4>, k: Tensor<4>, v: Tensor<4>) -> Tensor<3> {
 }
 
 fn worst_abs(a: &Tensor<3>, b: &Tensor<3>) -> f32 {
-    let da = a.clone().into_data().bytes;
-    let db = b.clone().into_data().bytes;
+    let ad = a.clone().into_data();
+    let bd = b.clone().into_data();
+    let da = ad.bytes();
+    let db = bd.bytes();
     da.chunks_exact(4)
         .zip(db.chunks_exact(4))
         .map(|(a, c)| f32::from_le_bytes(a.try_into().unwrap()) - f32::from_le_bytes(c.try_into().unwrap()))

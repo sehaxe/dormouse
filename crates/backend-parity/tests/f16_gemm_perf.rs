@@ -147,11 +147,23 @@ fn lcg(n: usize, scale: f32) -> Vec<f32> {
 fn operands(
     device: &Device,
     (m, k, n): (usize, usize, usize),
+    dtype: &str,
 ) -> (Tensor<2>, Tensor<2>, Tensor<2>, Tensor<2>) {
     let a = Tensor::<2>::from_data(TensorData::new(lcg(m * k, 1.0), [m, k]), device);
     let b = Tensor::<2>::from_data(TensorData::new(lcg(k * n, 0.05), [k, n]), device);
-    let a16 = a.clone().cast(FloatDType::F16);
-    let b16 = b.clone().cast(FloatDType::F16);
+    let (a16, b16) = match dtype {
+        "f16" => (a.clone().cast(FloatDType::F16), b.clone().cast(FloatDType::F16)),
+        // bf16 joined the shipped set on 0.22: ADR-0016 bug 2 ("the LLVM
+        // dialect has no bf16 type") is no longer true of this stack, and both
+        // parity tests for it now pass, so it needs a rate and not an ignore.
+        "bf16" => (
+            a.clone().cast(FloatDType::BF16),
+            b.clone().cast(FloatDType::BF16),
+        ),
+        // fp32 is its own reference operand set, not a cast of anything.
+        "fp32" => (a.clone(), b.clone()),
+        other => panic!("unknown dtype {other}"),
+    };
     (a, b, a16, b16)
 }
 
@@ -187,10 +199,10 @@ fn tflops((m, k, n): (usize, usize, usize), ms: f64) -> f64 {
 fn run_arm(shape: (usize, usize, usize), dtype: &str) -> f64 {
     install_warn_logger();
     let device = Device::cuda(0);
-    let (a, b, a16, b16) = operands(&device, shape);
+    let (a, b, a16, b16) = operands(&device, shape, dtype);
     let (m, k, n) = shape;
 
-    if dtype == "f16" {
+    if dtype == "f16" || dtype == "bf16" {
         let want: f32 = a.clone().matmul(b.clone()).sum().into_scalar();
         let got: f32 = a16
             .clone()
@@ -198,13 +210,20 @@ fn run_arm(shape: (usize, usize, usize), dtype: &str) -> f64 {
             .cast(FloatDType::F32)
             .sum()
             .into_scalar();
+        // bf16 keeps 8 mantissa bits and the sum runs over the whole shape, so
+        // its bar is a decade looser than f16's; both are the same claim.
+        let (bar, name) = if dtype == "f16" {
+            (1e-2, "f16")
+        } else {
+            (1e-1, "bf16")
+        };
         assert!(
-            got.is_finite() && want.is_finite() && (got - want).abs() <= 1e-2 * want.abs().max(1.0),
-            "f16 GEMM is not within 1e-2 of the fp32 result: {got} vs {want}"
+            got.is_finite() && want.is_finite() && (got - want).abs() <= bar * want.abs().max(1.0),
+            "{name} GEMM is not within {bar} of the fp32 result: {got} vs {want}"
         );
     }
 
-    let (lhs, rhs) = if dtype == "f16" { (a16, b16) } else { (a, b) };
+    let (lhs, rhs) = if dtype == "fp32" { (a, b) } else { (a16, b16) };
 
     // Warmup outside the clock: JIT + autotune land here. This is also where a
     // dying candidate prints its warn/panic - read stderr, not just the number.
@@ -227,7 +246,14 @@ fn run_arm(shape: (usize, usize, usize), dtype: &str) -> f64 {
     // has never beaten cuBLAS, so anything above 60/25 is a broken runner
     // reporting without executing (the f16 correctness assert above is the
     // other half: a poisoned runner returns a wrong answer and dies there).
-    let ceiling = if dtype == "f16" { 60.0 } else { 25.0 };
+    let ceiling = match dtype {
+        "f16" => 60.0,
+        // bf16 reaches the card through the same cubek path as f16; if it
+        // turns out to be a cast-and-compute route it will land near fp32's
+        // ceiling and this arm says so instead of passing.
+        "bf16" => 60.0,
+        _ => 25.0,
+    };
     let rate = tflops(shape, ms);
     assert!(ms.is_finite() && ms > 0.0, "no {dtype} time was measured");
     assert!(
@@ -260,6 +286,25 @@ fn f16_gemm_speed() {
 #[ignore = "GPU measurement; run with --ignored --exact on a free card"]
 fn fp32_model_shape_baseline() {
     run_arm(MODEL, "fp32");
+}
+
+/// The big-shape bf16 arm. ADR-0016 bug 2 blocked every bf16 plan on this box
+/// ("the LLVM dialect has no bf16 type"); on 0.22 both bf16 parity tests in this
+/// crate PASS and this arm measures the rate the plan is argued from. First
+/// reading 2026-10-10: 3.90 ms / 44.06 TFLOP/s - the cuBLAS ceiling, and 5.2x
+/// the sibling fp32 arm, on a stack where f16 measures 2.3x SLOWER than fp32.
+#[test]
+#[ignore = "GPU measurement; run with --ignored --exact on a free card"]
+fn bf16_gemm_speed() {
+    run_arm(PROD, "bf16");
+}
+
+/// The model-shaped bf16 arm: the same claim at the shape the model's lm_head
+/// and FFN matmuls actually see.
+#[test]
+#[ignore = "GPU measurement; run with --ignored --exact on a free card"]
+fn bf16_gemm_speed_model_shape() {
+    run_arm(MODEL, "bf16");
 }
 
 /// The model-shaped f16 arm. Unpatched this shape measured 5.6 TFLOP/s - the

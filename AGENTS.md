@@ -226,7 +226,33 @@ the file that says so is that one function.
   If a new op misbehaves on one backend only, run
   `cargo test -p backend-parity --features cuda --test backend_parity` — that
   gate turns "the cast is broken" into a command instead of a paragraph.
+- **0.22 FLIPS THE LOW-PRECISION PICTURE: bf16 computes and it is the
+  FASTEST arm; f16 does not — measured 2026-10-10, one dtype per process,
+  release, quiet card (`cargo test --release -p backend-parity --features cuda
+  --test f16_gemm_perf -- --ignored --exact <arm>`).** Same two shapes, same
+  harness, median of the arm's own `min of 3`:
+  | shape | fp32 | f16 | bf16 |
+  |---|---|---|---|
+  | 5120x768x2048 | 0.94 ms / **17.19** | 2.06 ms / 7.83 | 0.44 ms / **36.84** |
+  | 5120x2048x8192 | 8.58 ms / **20.03** | 20.14 ms / 8.53 | 3.90 ms / **44.06** |
+  The two bullets below are pre.4 history; on 0.22 they are both FALSE. (a)
+  **ADR-0016 bug 2 ("bf16 matmul cannot work on this backend, and every bf16
+  run is SLOWER than fp32") is dead**: both bf16 parity tests in
+  `backend-parity` — `bf16_matmul_cuda`, `bf16_gemm_cuda`, `#[ignore]`d by
+  ADR-0016 — now PASS, and bf16 matmul is 44.06 TFLOP/s at the cuBLAS ceiling.
+  (b) **The f16 tensor-core path is NOT alive on 0.22**: 4.7x below the
+  39.75 TFLOP/s the cubecl-ir patch bought on pre.4, and 2.4x below 0.22's own
+  fp32 — a non-tensor-core route, and STABLE across 4 runs (8.47-8.50), so it
+  is not the autotuner's coin flip (§3.3) picking a slow candidate. The cause
+  is `ae80b53`: the 0.22 port cut every `[patch.crates-io]` on the stated
+  premise "stock 0.11.0 covers f16 sizing", and that premise is now measured
+  false. The asymmetry (bf16 fast, f16 slow, same stack, same harness) is a
+  cubecl 0.11 question for the upstream issue. **Any bf16 plan must be argued
+  from the 0.22 numbers above, and the `--bf16` flag's §3.7 note ("slower than
+  fp32 on this box") is stale** — the fp32-vs-bf16 comparison has to be
+  re-measured per shape before a config is picked.
 - **NO WORKAROUND: bf16 matmul cannot work on this backend** (ADR-0016 bug 2).
+  **Pre.4 history; on 0.22 this bullet is FALSE — see the 2026-10-10 table above.**
   Not a burn bug: the LLVM dialect has no bf16 type, so `restrict_to_llvm_backend`
   deletes it from the advertised element types on purpose and strips the bf16
   tensor-core families, and even reading a bf16 buffer back as f32 dies at
@@ -239,7 +265,9 @@ the file that says so is that one function.
   mode). The one primitive that works is bf16 *storage* as `u16` bit patterns
   (integer ops + bitcast, pinned against f64 in
   `vendor/dormouse-fused/crates/burn-gdn2/tests/lowp_bf16_cuda.rs`).
-- **f16 tensor-core through burn: ALIVE and fast — measured 2026-10-01**
+- **f16 tensor-core through burn: ALIVE and fast — measured 2026-10-01.**
+  **Pre.4 history; on 0.22 f16 measures 7.83/8.53 TFLOP/s, 4.7x below this, and
+  2.4x below 0.22's own fp32 — see the 2026-10-10 table above.**
   (ADR-0016 bug 3). History: the candidate died at compile time with
   `Expected type builtin.fp16 to implement dyn SizedType`, the autotuner fell
   back silently, and f16 was CORRECT but slower than fp32. The `SizedType` fix
@@ -1101,8 +1129,11 @@ Ranked applicability:
 ## 3.7 The interface, as it stands (every knob is a typed CLI flag; `--help`)
 
 - `--bf16` — bf16 activations/weights (weights fp32→bf16 cast per forward).
-  Off by default; CPU runs stay fp32 (burn-ndarray has no bf16). §2.1 is why
-  this is slower than fp32 on this box.
+  Off by default; CPU runs stay fp32. **The old note here ("§2.1 is why this is
+  slower than fp32") is stale**: on 0.22 bf16 matmul measured 44.06 TFLOP/s
+  against fp32's 20.03, and the flag still casts per forward — the cast is the
+  question, not the matmul (§2.1's 2026-10-10 table).
+
 - `--no-kda` / `--no-engram` — disable an attention/memory arm (bisect/A-B;
   presets set `kda`/`engram` true). There is no `--no-gr` or `--no-mor` flag:
   those are `--set use_gr=false` / `--set use_mor=true` (config, not A-B flags).

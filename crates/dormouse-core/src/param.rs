@@ -65,7 +65,7 @@ fn quant_debug_on() -> bool {
 /// op does not exist there, the fp32 path returns, the answer is correct — and
 /// this line is the only evidence that it happened. Once per process: the
 /// call site runs on every forward.
-#[cfg(not(feature = "cuda"))]
+
 fn bf16_compute_dropped_once() {
     static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -196,13 +196,34 @@ impl LinearLike {
                 if l.bf16_compute {
                     // bf16 matmuls (tensor cores) with the fp32 autodiff
                     // graph; the factor quant follows the configured format.
-                    // The custom op is CUDA-only; elsewhere fall back.
-                    #[cfg(feature = "cuda")]
-                    {
-                        l.forward_quant_bf16::<B>(x)
-                    }
-                    #[cfg(not(feature = "cuda"))]
-                    {
+                    // The custom op is CUDA-only. The guard is the DEVICE, not
+                    // the build feature: a cuda build run on the Flex test
+                    // device used to take this arm anyway and the composed
+                    // path moved by 1.898 there, so the drop that ADR-0019 row
+                    // 29 promises has to be computed, not compiled in.
+                    // ponytail: `Cube` covers every cubecl runtime (Metal,
+                    // WebGPU, CPU) and the op is only sound on the CUDA one;
+                    // nobody runs those here, and if they do the kernel's own
+                    // refusal names it.
+                    let on_cuda = {
+                        #[cfg(feature = "cuda")]
+                        {
+                            use burn::backend::DispatchDevice;
+                            matches!(x.device().as_dispatch(), DispatchDevice::Cube(_))
+                        }
+                        #[cfg(not(feature = "cuda"))]
+                        {
+                            false
+                        }
+                    };
+                    if on_cuda {
+                        #[cfg(feature = "cuda")]
+                        {
+                            l.forward_quant_bf16::<B>(x)
+                        }
+                        #[cfg(not(feature = "cuda"))]
+                        unreachable!("on_cuda is false without the cuda feature")
+                    } else {
                         bf16_compute_dropped_once();
                         if l.quant != burn_spectral::QuantFormat::Fp32 {
                             l.forward_quant::<B>(x)
@@ -434,7 +455,7 @@ fn opt_f32(v: Option<f32>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn::tensor::TensorData;
+    use burn::tensor::{Distribution, FloatDType, TensorData};
 
     /// The non-CUDA bf16-compute arm: the request is dropped (COUNTED, one
     /// stderr line per process — rerun with `--nocapture` to read it) and the
@@ -459,5 +480,46 @@ mod tests {
         assert_eq!(bf16.dims(), [1, 4]);
         let err: f32 = (bf16 - fp32).abs().max().into_scalar();
         assert!(err < 1e-5, "cpu bf16-compute arm diverged from fp32: {err}");
+    }
+
+    /// The raw op behind the arm above, isolated: fp32 -> bf16, matmul, back.
+    /// The gate above says a cuda build must drop this request on a Flex
+    /// device, and it does not (it takes `forward_quant_bf16`), so the answer
+    /// moves by 1.898 - which is 180x bf16's own rounding. Before our guard is
+    /// blamed for that, this pins where the number comes from: bf16 rounding
+    /// on this magnitude is ~4e-3 relative, so a different order means the
+    /// cast or the matmul is a different program on burn 0.22, and the guard
+    /// was hiding a defect, not causing one.
+    ///
+    /// Both devices are measured, because the composed arm runs on the
+    /// AUTOdiff one (the test's device is `Device::flex().autodiff()`) and a
+    /// hand-rolled op that is correct bare can be wrong through the bridge.
+    fn rel_err_on(d: &Device) -> f32 {
+        d.seed(3);
+        let a = Tensor::<2>::random([32, 64], Distribution::Normal(0.0, 1.0), d);
+        let w = Tensor::<2>::random([64, 16], Distribution::Normal(0.0, 1.0), d);
+        let r: Tensor<2> = a.clone().matmul(w.clone());
+        let b: Tensor<2> = a
+            .cast(FloatDType::BF16)
+            .matmul(w.cast(FloatDType::BF16))
+            .cast(FloatDType::F32);
+        let err: f32 = (r - b.clone()).abs().max().into_scalar();
+        let scale: f32 = b.abs().max().into_scalar();
+        err / scale.max(1e-30)
+    }
+
+    #[test]
+    fn bf16_matmul_on_flex_is_the_fp32_answer() {
+        let bare = rel_err_on(&Device::flex());
+        let ad = rel_err_on(&Device::flex().autodiff());
+        assert!(
+            bare < 1e-2,
+            "bf16 matmul on a bare Flex device is not bf16 rounding: rel {bare:.3e}"
+        );
+        assert!(
+            ad < 1e-2,
+            "bf16 matmul through the AUTOdiff Flex bridge is not bf16 rounding \
+             (rel {ad:.3e}) - the composed arm is correct bare and wrong tracked"
+        );
     }
 }

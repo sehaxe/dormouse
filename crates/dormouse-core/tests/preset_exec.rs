@@ -387,13 +387,17 @@ fn executes(name: &str) {
         fx.max_iter as u64,
         "{name}: one teacher-free forward must be max_iter iterations"
     );
+    // A depth-1 preset (plain9m: `max_iter = 1` is the control, not a
+    // shortcut) cannot be truncated to 2 and the setter refuses that loudly,
+    // so the override goes to whatever it can actually reach.
+    let want = fx.max_iter.min(2);
     let mut shallow = model.clone();
-    shallow.set_loop_depth(Some(2));
+    shallow.set_loop_depth(Some(want));
     probe::reset();
     let _ = shallow.forward::<B>(x, Some(h));
     assert_eq!(
         probe::count(probe::ITER),
-        2,
+        want as u64,
         "{name}: set_loop_depth(2) did not truncate the loop"
     );
     probe::reset();
@@ -411,6 +415,10 @@ fn nano_executes() {
 #[test]
 fn small_executes() {
     executes("small");
+}
+#[test]
+fn plain9m_executes() {
+    executes("plain9m");
 }
 #[test]
 fn base_executes() {
@@ -554,6 +562,7 @@ const COVERED: &[&str] = &[
     "nano-fused",
     "one_b",
     "p150",
+    "plain9m",
     "small",
     "swift50",
 ];
@@ -748,10 +757,22 @@ fn cost_of_preset(name: &str) -> CostSplit {
     let g = r
         .check(&model)
         .unwrap_or_else(|e| panic!("{name}: routing: {e}"));
+    // Muon+ takes only the low-rank TSCT FACTORS (routing.rs:104-127), so the
+    // count is arithmetic on the preset's topology: four factors per expert
+    // (gate_up u/v, down u/v) plus the readout's two when the model is
+    // factorized at all - and the engram key projection, which is Muon-routed
+    // in BOTH topologies. A dense control (plain9m: use_tsct = false) therefore
+    // contributes exactly 1, and the old `4*n_experts + 3` formula called that
+    // a failure.
+    let factors = if cfg.use_tsct {
+        4 * cfg.n_experts + 2
+    } else {
+        0
+    };
     assert_eq!(
         g.muon,
-        4 * cfg.n_experts + 3,
-        "{name}: Muon+ group must follow n_experts"
+        factors + 1,
+        "{name}: Muon+ group must follow n_experts and use_tsct"
     );
     assert_eq!(
         g.qk, 2,
@@ -781,6 +802,7 @@ const CHEAP_PRESETS: &[&str] = &[
     "mor",
     "nano",
     "nano-fused",
+    "plain9m",
     "small",
 ];
 
@@ -1110,3 +1132,4 @@ fn hashed_ids(bytes: &[u8], dev: &Device) -> Tensor<3, Int> {
     }
     Tensor::from_data(TensorData::new(v, [BATCH, SEQ, 3]), dev)
 }
+

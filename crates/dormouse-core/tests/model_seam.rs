@@ -301,7 +301,7 @@ fn seeded_init_is_a_pure_function_of_the_seed_on_a_clean_stream() {
             }
             fn visit_float<const D: usize>(&mut self, p: &Param<Tensor<D>>) {
                 self.out
-                    .push((self.stack.join("."), p.val().into_data().bytes.to_vec()));
+                    .push((self.stack.join("."), p.val().into_data().bytes().to_vec()));
             }
         }
         let mut c = C::default();
@@ -359,7 +359,7 @@ fn seeded_init_is_a_pure_function_of_the_seed_on_a_clean_stream() {
             }
             fn visit_float<const D: usize>(&mut self, p: &Param<Tensor<D>>) {
                 self.out
-                    .push((self.stack.join("."), p.val().into_data().bytes.to_vec()));
+                    .push((self.stack.join("."), p.val().into_data().bytes().to_vec()));
             }
         }
         let mut c = C::default();
