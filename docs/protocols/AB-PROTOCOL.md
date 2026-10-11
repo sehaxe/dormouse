@@ -328,6 +328,20 @@ Two independent lines of evidence now point the same way, and both are measured:
   depth 54.71@2 degrading to 47.54@16, and Huginn tokens that "settle" at depth
   8 carry 0.00 at >=32. Extra depth is not free capacity on a shared-weight loop.
 
+> **The verdict metric for a depth arm is NOT BPB alone (added 2026-10-11).**
+> `docs/research/2026-10-11-recurrence-equivalence.md`: an iso-depth sweep over
+> r ∈ {1,2,4,8} and ~50x compute fits L = E + A(Nonce + r^φ N_rec)^−α + B D^−β
+> and measures **φ = 0.46** - one recurrence buys 0.46 of a unique parameter, so
+> at r = 4 a 410M looped model matches a 580M non-looped model's loss while
+> costing a 1B non-looped model's compute. A depth arm can therefore WIN on BPB
+> and still be the worse model, because the loss conflates a capacity gain with a
+> training-side gain. Two of the paper's case studies are about our own knobs:
+> **truncated backprop** through the loop drops φ to 0.38 while the loss still
+> falls (we run NoCheckpointing, so we are on the baseline side - anything that
+> truncates the backward must be re-judged), and **hyperconnections** raise it to
+> 0.65. A depth arm's verdict is "BPB and the recurrence-equivalence estimate",
+> and the report that names the exponent, not just the curve.
+
 So `--max-iter 2` halves the dominant cost AND tests the quality claim. Run it
 with `--eval-depths`, which prints the held-out BPB at depths 1..=max_iter at
 every eval for free (no extra training) - that curve is the deliverable, because
