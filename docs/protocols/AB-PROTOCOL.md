@@ -342,6 +342,20 @@ Two independent lines of evidence now point the same way, and both are measured:
 > 0.65. A depth arm's verdict is "BPB and the recurrence-equivalence estimate",
 > and the report that names the exponent, not just the curve.
 
+> **And the depth family now has a published reference it did not have
+> yesterday** (2026-10-11): `docs/research/2026-10-11-alodlm-fang-et-al.md` —
+> arXiv:2610.04198, Amazon's ALoDLM, a Qwen3 backbone whose middle 16 layers are
+> a shared recurrent core run up to 4 times with a LEARNED halting policy trained
+> under a conditional NELBO with sequence-level outcome credit. At both scales it
+> beats its own unlooped backbone (8B: 80.3 vs Qwen3's 78.5, eleven-benchmark
+> average), and numerical tokens learn a lower first-pass halting probability with
+> no difficulty labels. So "adaptive depth" is no longer an arm with no working
+> reference - and it is still not a verdict here: their setting is token-parallel
+> diffusion at 1.7-8B, ours is byte-level AR at 9M, and ADR-0013's fixed-depth
+> result was measured here. The lane is costed in that document; the arm goes in
+> the queue only with 3 seeds, one batch size, a fixed-depth control, and the
+> depth curve from `--eval-depths`.
+
 So `--max-iter 2` halves the dominant cost AND tests the quality claim. Run it
 with `--eval-depths`, which prints the held-out BPB at depths 1..=max_iter at
 every eval for free (no extra training) - that curve is the deliverable, because
