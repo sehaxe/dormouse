@@ -233,21 +233,29 @@ the file that says so is that one function.
   harness, median of the arm's own `min of 3`:
   | shape | fp32 | f16 | bf16 |
   |---|---|---|---|
-  | 5120x768x2048 | 0.94 ms / **17.19** | 2.06 ms / 7.83 | 0.44 ms / **36.84** |
-  | 5120x2048x8192 | 8.58 ms / **20.03** | 20.14 ms / 8.53 | 3.90 ms / **44.06** |
+  | 5120x768x2048 | 0.94 ms / **17.08** | 0.43 ms / **37.41** | 0.43 ms / **37.47** |
+  | 5120x2048x8192 | 8.59 ms / **20.00** | 3.90 ms / **44.04** | 3.89 ms / **44.17** |
+  The f16 column is measured WITH the re-landed `cubecl-ir` patch (now the only
+  `[patch.crates-io]` entry, `vendor/cubecl-ir`, landed 2026-10-11). Before it,
+  f16 measured 7.83 / 8.53 TFLOP/s - the tensor-core candidate panicked on the
+  device runner thread with `Expected type builtin.fp16 to implement dyn
+  SizedType` and the autotuner fell back to the slow path, which is also what
+  refuted `ae80b53`'s "stock 0.11.0 covers f16 sizing". The patch costs fp32 and
+  bf16 nothing (both unchanged to 0.1 TFLOP/s).
   The two bullets below are pre.4 history; on 0.22 they are both FALSE. (a)
   **ADR-0016 bug 2 ("bf16 matmul cannot work on this backend, and every bf16
   run is SLOWER than fp32") is dead**: both bf16 parity tests in
   `backend-parity` — `bf16_matmul_cuda`, `bf16_gemm_cuda`, `#[ignore]`d by
   ADR-0016 — now PASS, and bf16 matmul is 44.06 TFLOP/s at the cuBLAS ceiling.
-  (b) **The f16 tensor-core path is NOT alive on 0.22**: 4.7x below the
-  39.75 TFLOP/s the cubecl-ir patch bought on pre.4, and 2.4x below 0.22's own
-  fp32 — a non-tensor-core route, and STABLE across 4 runs (8.47-8.50), so it
-  is not the autotuner's coin flip (§3.3) picking a slow candidate. The cause
-  is `ae80b53`: the 0.22 port cut every `[patch.crates-io]` on the stated
-  premise "stock 0.11.0 covers f16 sizing", and that premise is now measured
-  false. The asymmetry (bf16 fast, f16 slow, same stack, same harness) is a
-  cubecl 0.11 question for the upstream issue. **Any bf16 plan must be argued
+  (b) **The f16 tensor-core path WAS dead on 0.22, and the cause was ours**: the
+  port had cut every `[patch.crates-io]` (`ae80b53`) on the premise "stock 0.11.0
+  covers f16 sizing", and the premise was false — the f16 tensor-core candidate
+  panicked with `Expected type builtin.fp16 to implement dyn SizedType` and the
+  autotuner fell back (8.53 TFLOP/s, 2.4x below 0.22's own fp32). Re-landing the
+  `cubecl-ir` patch in `vendor/cubecl-ir` restored it to 44.04 TFLOP/s, a 5.2x
+  recovery, and cost fp32/bf16 nothing. **So the precision plan is back on**, and
+  the bf16-fast/f16-slow asymmetry that looked like a cubecl 0.11 question was
+  just the missing patch. **Any bf16 plan must be argued
   from the 0.22 numbers above, and the `--bf16` flag's §3.7 note ("slower than
   fp32 on this box") is stale** — the fp32-vs-bf16 comparison has to be
   re-measured per shape before a config is picked.

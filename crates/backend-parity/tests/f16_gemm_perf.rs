@@ -271,9 +271,14 @@ fn fp32_gemm_baseline() {
 }
 
 /// The big-shape f16 arm - the test that decides whether the patch is real.
-/// Pre-patch: 20.02 ms / 8.58 TFLOP/s, i.e. LOST to fp32, with the SizedType
-/// panic in the log (module docs). Accelerated would be a clear win over the
-/// sibling baseline, toward the cuBLAS ceiling of ~3.9 ms / 43.7 TFLOP/s.
+/// WITH the vendored `cubecl-ir` patch (2026-10-11): 3.90 ms / 44.04 TFLOP/s,
+/// i.e. the cuBLAS ceiling of ~3.9 ms / 43.7, a 5.2x recovery. Pre-patch, and
+/// the reason the patch exists: 20.02 ms / 8.58 TFLOP/s - LOST to fp32 - with
+/// `[cubecl WARN] ... Expected type builtin.fp16 to implement dyn SizedType`
+/// in the log: the tensor-core candidate panicked on the device runner thread
+/// and the autotuner's fallback left f16 on the slow path. The patch adds the
+/// two impls that answer the size query (`vendor/cubecl-ir`,
+/// [patch.crates-io]).
 #[test]
 #[ignore = "GPU measurement; run with --ignored --exact on a free card"]
 fn f16_gemm_speed() {

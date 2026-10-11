@@ -9,7 +9,7 @@ members = [
 ]
 # vendored fork workspaces: they are their own workspace roots; without this
 # cargo resolves their crates' `workspace = true` inheritance against OUR root.
-exclude = ["vendor/dormouse-fused"]
+exclude = ["vendor/dormouse-fused", "vendor/cubecl-ir"]
 resolver = "2"
 [workspace.package]
 version = "0.1.0"
@@ -33,6 +33,16 @@ license = "MIT"
 # NOT here: the vendored `burn-*` crates, which are path deps and carry no
 # version at all; and the `cubecl-*` crates, one caller each. Both are single
 # readers, and a table entry with a single reader cannot catch anything.
+# The ONE patched upstream crate, and the only `[patch.crates-io]` entry on
+# this tree. `ae80b53` cut all five on the stated premise "stock 0.11.0 covers
+# f16 sizing"; measured 2026-10-11 that premise is FALSE - a f16 matmul's
+# tensor-core candidate panics on the device runner thread with "Expected type
+# builtin.fp16 to implement dyn SizedType", and the autotuner's fallback leaves
+# f16 at 8.53 TFLOP/s against 39.75 on the patched pre.4 stack. The impls
+# below are the fork's, unchanged. See docs/research/2026-10-11-022-reads-unwritten-memory.md.
+[patch.crates-io]
+cubecl-ir = { path = "vendor/cubecl-ir" }
+
 [workspace.dependencies]
 burn = { version = "0.22.0", default-features = false }
 burn-tensor = { version = "0.22.0", default-features = false }
