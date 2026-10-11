@@ -289,6 +289,21 @@ pub fn cubecl_client(device: &Device) -> cubecl_runtime::client::Client {
     CudaRuntime::client(unwrap(device.as_dispatch()))
 }
 
+/// The sanity ceiling (2026-10-11). The NaN firewall catches non-finite; this
+/// catches the FINITE garbage a read of unwritten memory produces on 0.22, which
+/// the firewall by definition cannot see. Uniform over 256 bytes is ln(256) =
+/// 5.545 nats, a healthy run starts at ~5.57, and every garbage reading measured
+/// on this box was >= 1e3 - so 100 is 18x uniform and still six orders of
+/// magnitude below the thing it is guarding against.
+pub const CE_CEILING: f32 = 100.0;
+
+/// Whether a step's CE is the corruption's FINITE-garbage signature. Non-finite
+/// values are deliberately NOT this class - the NaN firewall owns them, and a
+/// guard that claimed both would double-count one failure and misname the other.
+pub fn is_corrupt_ce(ce: f32) -> bool {
+    ce.is_finite() && ce > CE_CEILING
+}
+
 /// The NaN firewall (2026-09-27). A non-finite loss must never reach the
 /// optimizer: backward turns it into NaN grads for every parameter, the step
 /// writes them into the weights, and from then on the model is dead - the
@@ -1349,6 +1364,28 @@ pub fn train_loop(
                 }
             };
             ce = ce_now;
+            // ADR-0011, the fourth mark made concrete: a FINITE but absurd loss
+            // is the 0.22 corruption's fingerprint, and it passes the NaN
+            // firewall untouched because 1e38 is not non-finite. Measured
+            // (docs/research/2026-10-11-022-reads-unwritten-memory.md): a
+            // kernel reads memory nobody wrote, and the memory pool decides
+            // what is in that page - which is why `persistent_memory =
+            // "disabled"` + `allocator = "sync"` cuts the rate and does not
+            // remove it. Uniform is ln(256) = 5.545 nats and a healthy run
+            // starts at ~5.57, so 100 is 18x uniform and six orders of
+            // magnitude below any garbage this box actually produces.
+            // LOUD, not counted: a corrupted run that continues looks like a
+            // slow arm, and every A/B verdict downstream of it is then void.
+            if is_corrupt_ce(ce_now) {
+                return Err(format!(
+                    "step {step}: ce {ce_now:.3e} is above the sanity ceiling {CE_CEILING}                      (uniform is {:.3} nats) - a FINITE garbage value, so the NaN firewall                      cannot see it. Cause on 0.22: a kernel reads memory nobody wrote and the                      memory pool supplies the value \
+                     (docs/research/2026-10-11-022-reads-unwritten-memory.md). Escape: set \
+                     persistent_memory=\"disabled\" and allocator=\"sync\" in cubecl.toml \
+                     (measured 0/3 corrupt vs 9/9), or run the experiment on the pre.4 stack; \
+                     then report the run - a number taken on a corrupted run is not a number.",
+                    f64::from(CE_CEILING) * 0.0 + 256f64.ln()
+                ));
+            }
             if !ce_now.is_finite() {
                 // Counted, not read on any cadence today — see the counter's
                 // declaration: the consumer is ADR-0021 item 4's report.
