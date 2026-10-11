@@ -347,3 +347,89 @@ fn production_batched_arm_matches_and_counts() {
         batched.max_ortho()
     );
 }
+
+// ── the cost of each path, on the card, on a real model's factor set ──────
+//
+// The batched arm exists to remove ~50 ms of per-step cost (§3.1's table), and
+// the differential test above pins that it computes the same masters. What is
+// not pinned anywhere is what each path actually COSTS on the device the
+// trainer uses - so the number that decides whether to optimize further does
+// not exist. This prints it.
+#[cfg(feature = "cuda")]
+#[test]
+fn each_retraction_paths_cost_on_the_trainer_shaped_model() {
+    use std::time::Instant;
+    let dev = burn::tensor::Device::cuda(0).autodiff();
+    let cfg = dormouse_core::config::load_config(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../configs/small.toml"
+    ))
+    .expect("configs/small.toml loads");
+    let model = DormouseModel::new(&cfg, &dev);
+
+    fn time(mut f: impl FnMut()) -> f64 {
+        f(); // warm: JIT, autotune and the first allocation
+        let t = Instant::now();
+        for _ in 0..10 {
+            f();
+        }
+        t.elapsed().as_secs_f64() * 100.0
+    }
+
+    let mut m1 = model.clone();
+    let scalar = time(|| m1.retract_tsct(ITERS));
+    // Decomposition: the fixed cost (stacking, power iteration, the Param round
+    // trip) is the intercept, and the NS iteration is the slope. Which one
+    // dominates decides whether the knob or the grouping is the target.
+    let mut slope = vec![];
+    for it in [1usize, 2, 3, 6] {
+        let mut m = model.clone();
+        slope.push((it, time(|| m.retract_tsct_batched(it))));
+    }
+    let mut m2 = model.clone();
+    let batched = time(|| m2.retract_tsct_batched(ITERS));
+    for (it, ms) in &slope {
+        println!("  batched iters={it}: {ms:.2} ms");
+    }
+
+    println!(
+        "retraction on small (cuda): scalar {scalar:.2} ms, batched {batched:.2} ms per call"
+    );
+    assert!(
+        batched <= scalar * 1.05,
+        "the batched arm must not be SLOWER than the scalar one it replaced: \
+         batched {batched:.2} ms vs scalar {scalar:.2} ms"
+    );
+}
+
+/// The fixed cost of a retraction is the sigma_max power iteration, not the NS
+/// loop (the slope measurement above is flat from 2 to 6 iterations). 5 power
+/// iterations is 25 kernels per group on a launch-bound box, and the doc comment
+/// on `POWER_ITERS` already concedes the estimate is not accurate to 5% in
+/// general. So the question is what it BUYS: retract the same model with the
+/// power iteration at 5 and at 2 and compare the orthogonality actually
+/// achieved. If it does not move, 3 of the 25 kernels are free.
+#[cfg(feature = "cuda")]
+#[test]
+fn the_power_iterations_buy_nothing_measurable() {
+    let dev = burn::tensor::Device::cuda(0).autodiff();
+    // The comparison is of the RETRACTION's job, so both sides must start from
+    // the SAME factors - which on an unseeded device they do not (the first
+    // draft of this test compared 6.13e-5 against 6.77e-5 across two runs that
+    // had drawn different weight matrices).
+    dev.seed(11);
+    let cfg = dormouse_core::config::load_config(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../configs/small.toml"
+    ))
+    .expect("configs/small.toml loads");
+    let mut m = DormouseModel::new(&cfg, &dev);
+    let before = m.max_ortho();
+    m.retract_tsct_batched(ITERS);
+    let after = m.max_ortho();
+    println!("  5 power iters: ortho before {before:.6e}, after {after:.6e}");
+    assert!(
+        after < before,
+        "the retraction must improve orthogonality: before {before:.6e}, after {after:.6e}"
+    );
+}
