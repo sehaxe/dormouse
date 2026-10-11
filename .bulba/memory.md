@@ -282,3 +282,12 @@ amazon-science/ALoDLM). Qwen3-бэкбоунь разбит на прелюди�
 учатся с меньшей вероятностью останова на первом проходе. Синтез с вчерашним φ=0.46: рекурсия по качеству ДОРОГАЯ
 (0.46), но выигрывает когда РАСПИСАНИЕ выучено — глубинные армы судить по φ, а алодаптив — теперь есть рабочий
 референс. Не отменяет нашего ADR-0013 (тот измерен на нашем стеке): дорожка оценена в docs/research/2026-10-11-alodlm-fang-et-al.md.
+
+2026-10-11 (две ссылки от владельца): (1) ALoDLM amazon arXiv:2610.04198 — replication shared loop с learned halting
+(порог q) + conditional NELBO, бьёт СВОЙ AR-бэкбоун (8B: 80.3 vs 78.5); synthesis с φ=0.46: рекурсия дорогая по
+качеству, но выигрывает когда РАСПИСАНИЕ выучено. (2) DeepSeek-V4.1-Flash arXiv:2609.19969 — KV-сжатие: 890 B/токен
+в HBM (cross-layer reuse + FP4 KV), persistent на SSD/host = 1/8 предыдущей модели через SWA Bounded Replay; CED
+активирует 8B на prefill и 16B на decode. Для нас: подтверждение RAM-offload playbook (§3.5 item 1) на фронтире;
+dormouse вообще не несёт per-token KV (состояние KDA фиксировано), так что переносится только направление + идея
+bounded-resident окна для host-таблиц Engram. Оба разбора: docs/research/2026-10-11-alodlm-fang-et-al.md и
+docs/research/2026-10-11-deepseek-v41-flash-kv-compression.md; слежки в arxiv MCP стоят (5 топиков).
