@@ -291,3 +291,12 @@ amazon-science/ALoDLM). Qwen3-бэкбоунь разбит на прелюди�
 dormouse вообще не несёт per-token KV (состояние KDA фиксировано), так что переносится только направление + идея
 bounded-resident окна для host-таблиц Engram. Оба разбора: docs/research/2026-10-11-alodlm-fang-et-al.md и
 docs/research/2026-10-11-deepseek-v41-flash-kv-compression.md; слежки в arxiv MCP стоят (5 топиков).
+
+2026-10-11 (РЕТРАКЦИЯ + исправление): моё «порча перестала воспроизводиться (0/16)» было артефактом —
+`cargo build --release -p dormouse-cli` без `--features cuda` даёт CPU-бинарь (default = ["cpu"] у CLI!),
+а 16 «чистых» прогонов шли на Flex-CPU, где нет ни автотюна, ни пула, ни чтения неинициализации. Пересобрал с
+--features cuda и перемерил: size-match 3/3 остановлены гейтом CE_CEILING на шаге 1; disabled 2/3 чисто (1 умер
+на шаге 2). То есть прежняя таблица 9/9 vs 1/3 в силе, pool-корреляция в силе, ПАТЧ cubecl-ir порчу НЕ вылечил
+(«контроль» был тоже на CPU), и гейт CE_CEILING впервые проверен end-to-end — поймал 3 из 3. Замер стоимости пула
+(sizematch vs disabled) тоже был на CPU и недействителен — перемерить на CUDA. Урок на будущее: проверять строку
+backend=Device<Cube(Cuda)> в логе прежде чемtrustить any 0.22 measurement.

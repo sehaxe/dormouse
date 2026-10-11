@@ -45,6 +45,27 @@ zeroed and the same read is harmless — which is why `persistent_memory =
 
    Earlier in the port: size-match 10/10, disabled 1/3, enforced 0/1 (§3.3).
 
+## RETRACTION, 2026-10-11 (later the same day): the "it stopped reproducing" reading was a CPU-backend artifact
+
+Mid-session I built `target/release/train` with plain `cargo build --release -p
+dormouse-cli` - and the CLI's default feature is `cpu` (`crates/dormouse-cli/Cargo.toml`:
+`default = ["cpu"]`), so those 16 clean runs were measured on the Flex CPU backend, which
+has neither the autotuner nor the pool nor the uninit read. The corruption was never
+gone. Rebuilt with `--features cuda` and re-measured the same recipe (12 steps,
+b10 s512, lr 1e-4, seed 1, `--log-every 1`):
+
+| config | outcome |
+|---|---|
+| size-match + async (shipped) | **3 of 3 stopped by the new CE ceiling, at step 1** |
+| disabled + sync | 2 of 3 clean, 1 stopped at step 2 |
+
+So the earlier table (9/9 vs 0/3) stands, the pool correlation stands, and the
+**`CE_CEILING` guard is now validated end to end** - it caught every one of the
+three corruptions loudly at the first log step, which is the thing it was built
+for and could not be tested while the runs were on the CPU. Also corrected: the
+`cubecl-ir` f16 patch did **not** fix this (the "control" that suggested it might
+was one of the CPU-backend runs).
+
 ## What this refutes, on the record
 
 - **The autotuner's coin flip as the cause.** The decisions sink does show

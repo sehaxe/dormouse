@@ -130,12 +130,15 @@ hot path stays sync-free. Not exercised end to end — see the caveat below.
 
 ### 6. What is NOT closed
 
-- **The corruption stopped reproducing mid-session and that is unexplained.**
-  12/12 corrupted at step 1 before (~04:00), 0/16 clean after (~08:00-09:00)
-  across three batches, both pool configs, patched and unpatched binaries. The
-  rebuild is the only difference I can name; a machine-state confound (thermal,
-  clock, memory left by earlier processes) cannot be excluded. **Re-measure
-  before trusting either rate.**
+- ~~**The corruption stopped reproducing mid-session and that is unexplained.**~~
+  **RETRACTED the same day**: that reading was a CPU-backend artifact. The build
+  had been made without `--features cuda`, and the CLI's default is `cpu`, so
+  those 16 clean runs never touched the GPU (no autotuner, no pool, no uninit
+  read). Rebuilt with cuda and re-measured: size-match 3/3 stopped at step 1
+  (caught by the new `CE_CEILING` guard - its first end-to-end validation),
+  disabled 2/3 clean. The pool correlation stands; the `cubecl-ir` patch did NOT
+  fix the corruption; the pool cost measurement is still owed, on CUDA.
+  The lesson: read the `backend=` line before trusting any 0.22 number.
 - **A new finding of the same class**: `dormouse-train`'s headwise-Muon gates
   (`headwise_batched_ns_matches_per_head`, `the_eval_counter_covers_both_muon_implementations`,
   `headwise_muon_matches_per_slice_muon`) fail by 2.27e-3 ONLY in a full run and
