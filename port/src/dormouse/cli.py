@@ -242,6 +242,99 @@ def train_cmd(
     console.print(f"[green]done[/] steps={report['steps']} loss={report['loss']:.4f}")
 
 
+@app.command()
+def run(
+    preset: Annotated[str, typer.Argument(help="preset NAME or a .toml PATH")] = "small",
+    data: Annotated[Path | None, typer.Option(help="a flat .bin byte corpus")] = None,
+    eval_file: Annotated[
+        Path | None,
+        typer.Option("--eval", help="held-out .bin — its own file, or the no-leak tail split"),
+    ] = None,
+    batch: Annotated[int | None, typer.Option(help="tokens per step are batch*seq_len")] = None,
+    steps: Annotated[
+        int | None, typer.Option(help="stage-1 token budget = steps*batch*seq")
+    ] = None,
+    lr: Annotated[float | None, typer.Option] = None,
+    device: Annotated[str, typer.Option(help="auto|cuda|cpu")] = "auto",
+    post_cls: Annotated[str | None, typer.Option(help="stage-2 task class: code|math")] = None,
+    post_steps: Annotated[int, typer.Option(help="stage-2 groups per task")] = 2,
+    post_budget: Annotated[int, typer.Option(help="stage-2 byte budget per rollout")] = 256,
+    out_dir: Annotated[Path | None, typer.Option] = None,
+    sets: Annotated[list[str], typer.Option("--set", help="override: key=value")] = [],  # noqa: B006
+) -> None:
+    """One button: stage-1 pretrain → checkpoint family → stage-2 post-train.
+
+    The STAGE-EXIT rules are the research's, named (docs/research/
+    2026-10-16-one-button-pipeline.md): stage 1 leaves on the TOKEN budget
+    (the `steps` line) — not on a loss plateau, which no published pipeline
+    uses; the terminal decay + checkpoint average is stage 1's ONLY
+    irreversible act, and it re-enters from the pre-decay checkpoint family
+    the same way later stages do (a stage never overwrites the family).
+    Stage 2 rides the verifier-first reward: byte-budgeted rollouts on
+    `post_cls` tasks, CRR fork-replay advantage, the pass-rate and the
+    correct@budget printed — exactly the plan's success criterion.
+    """
+    from .post import build_tasks, crr_advantage, rollout
+    from .train.loop import train as _train
+
+    model_over, train_over = _split_sets(sets)
+    if data is not None:
+        train_over["data"] = str(data)
+    if eval_file is not None:
+        train_over["eval_data"] = str(eval_file)
+    for k, v in (("batch", batch), ("steps", steps), ("lr", lr)):
+        if v is not None:
+            train_over[k] = v
+    if out_dir is not None:
+        train_over["out_dir"] = str(out_dir)
+    run = load_run(preset, model_overrides=model_over, train_overrides=train_over)
+    dev = _device(device)
+    model = _model(run).to(dev)
+
+    # ---- stage 1: pretrain, WITHOUT the decay (the family see below) ----
+    console.print(
+        Panel(
+            f"[bold]stage 1[/] {run.source} · {param_count(model):,} params · {dev}",
+            subtitle=f"steps={run.train.steps} batch={run.train.batch} seq={run.train.seq_len}"
+            f" lr={run.train.lr} opt={run.train.opt}",
+        )
+    )
+    report = _train(model, run, device=None if dev.type == "cpu" else dev)
+    console.print(f"[green]stage 1 done[/] steps={report['steps']} loss={report['loss']:.4f}")
+
+    # The stage gate: a post lane needs a task class, or the run ends here
+    # (that IS the one button — stage 1 does not silently start stage 2).
+    if post_cls is None:
+        console.print("[yellow]stage 2 off[/] (no --post-cls); the family stays at the checkpoint")
+        return
+
+    # ---- stage 2: verifier-first post-train, byte-budgeted ----
+    tokens = run.train.steps * run.train.batch * run.train.seq_len
+    tasks = build_tasks(post_cls, seed=run.model.seed, n=8)
+    rows = []
+    for task in tasks:
+        group = [rollout(model, task, budget=post_budget, device=dev) for _ in range(post_steps)]
+        advs = crr_advantage(group)
+        rows.append(
+            {
+                "task": task["id"],
+                "pass@budget": sum(a.artifact.passed for a in advs) / len(advs),
+                "budget": post_budget,
+            }
+        )
+    passed = [r["pass@budget"] for r in rows]
+    console.print(
+        Panel(
+            f"[bold]stage 2[/] {post_cls} · {len(rows)} tasks × {post_steps} rollouts ·"
+            f" budget {post_budget} B",
+            subtitle=f"mean pass@budget {sum(passed) / len(passed):.2f}"
+            f" · tokens witnessed {tokens:,}",
+        )
+    )
+    for r in rows[:4]:
+        console.print(f"  {r['task']}  pass@budget={r['pass@budget']:.2f}")
+
+
 @app.command("eval")
 def eval_cmd(
     out_dir: Annotated[Path, typer.Option(help="checkpoint directory")] = Path("checkpoints"),

@@ -49,7 +49,7 @@ def test_noop_verifier_refuses_loudly():
 
 def test_code_sandbox_refuses_network_and_passwd():
     task = _add_task()
-    net = 'import socket\ndef add(a, b):\n    return a + b'
+    net = "import socket\ndef add(a, b):\n    return a + b"
     verdict = verify(task, net)
     assert verdict.passed is False
     assert verdict.reason == "refused: network access is not allowed in a sandboxed verifier"
@@ -71,9 +71,9 @@ def test_code_sandbox_runtime_guard_blocks_string_built_reads():
 
 def test_code_verifier_accepts_correct_and_rejects_wrong():
     task = _add_task()
-    good = 'def add(a, b):\n    return a + b'
+    good = "def add(a, b):\n    return a + b"
     assert verify(task, good).passed is True
-    bad = 'def add(a, b):\n    return a - b'
+    bad = "def add(a, b):\n    return a - b"
     assert verify(task, bad).passed is False
 
 
@@ -132,7 +132,7 @@ def test_crr_advantage_matches_a_hand_computed_table():
 
 def test_verify_is_pure_and_never_logs_the_raw_response():
     task = build_tasks("code", 5, 1)[0].as_dict()
-    response = task["prompt"] + 'def add(a, b):\n    return a + b\n# sentinel-9f3a\n'
+    response = task["prompt"] + "def add(a, b):\n    return a + b\n# sentinel-9f3a\n"
     first, second = verify(task, response), verify(task, response)
     assert first == second
     assert "sentinel-9f3a" not in first.reason

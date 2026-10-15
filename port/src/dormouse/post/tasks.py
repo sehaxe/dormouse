@@ -133,9 +133,7 @@ def _math_task(seed: int, i: int) -> Task:
         expr, answer = f"{p}/{q} + {r}/{s}", Fraction(p, q) + Fraction(r, s)
 
     expected = str(answer)
-    prompt = (
-        "Solve. Put the final value on its own last line as 'answer: <value>'.\n\n" + expr
-    )
+    prompt = "Solve. Put the final value on its own last line as 'answer: <value>'.\n\n" + expr
     return Task(
         cls="math",
         tid=f"math-{seed}-{i}",
