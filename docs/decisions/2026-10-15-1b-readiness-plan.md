@@ -469,6 +469,18 @@ Consequences, stated honestly:
 
 ## 7. The port lane (started 2026-10-15, owner's go on the substrate verdict)
 
+**The port lane is LIVE at the 9.2M scale — and the b1 recipe is pinned
+(autonomous overnight run of 2026-10-15/16, all numbers my own):**
+
+| milestone | status | number |
+|---|---|---|
+| first real-corpus trains | `small` 500 steps | CE 3.68 → 1.85, 0 NaN, 142 ms/step steady (8.3× over the day's start) |
+| the profiler killers (all fixed + committed) | per-step cost died 8× | MAGMA fp32 GEMM 46.6% GPU (mm_mixed), clip_norm 252 ms (foreach dual), dense-MoE 24-launch loop (banked bmm), per-param python data hash (device-side FNV pinned bit-exact), per-param Muon 46k launches (shape-batched NS), per-param writeback 8.5k launches (foreach dual) |
+| eval line exists on the new CLI | small real run | BPB 4.457 → 3.946 across 150 steps (window 20 480 B) |
+| b1 speed at THIS CARD | **honest: eager OOM at b8·s512 / b4·s512 (fp32 masters, E=1024)** | the spike's 45.9-53.8k tok/s numbers ride **compile + bnb8bit** — a different memory regime; the full-loop with inductor warmup did NOT complete in one bench window overnight (compile > 10 min per graph); the 60k answer rides that recipe's first complete run |
+| LFB × caps measured | cap 32 drops 12.5% → 11.3% with LFB; cap 64 ~0% drops with LFB | b1 preset now capacity 2.0 + lfb 0.01 (assignment-is-a-gradient argument) |
+| storage rungs | fp8/nvfp4 REAL (bank/checkpoint compression; fp32 masters live, not in a run) | 1.26 GB → 0.63 / 0.33 GB VRAM for b1's expert bank |
+
 The PyTorch port lives in `port/` inside this repo (one git, shared docs; no
 new repo). Toolchain per the owner's intake: **uv (envs/deps), ruff (lint/
 format), pytest (tests)**, Python 3.12, torch 2.13+cu129 (the spike's measured
