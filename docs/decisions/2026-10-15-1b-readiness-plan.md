@@ -358,6 +358,22 @@ re-measure the loop-block step with the ecosystem's best available on sm_120
 stand-in if installable) — the verdict table then carries torch-vanilla AND
 torch-max rows before the substrate decision is taken.
 
+**Standing principle (owner, 2026-10-15): use the best existing kernel; do not
+roll our own where a proven optimized one exists — the ecosystem is there
+precisely so we don't take that risk. "Maximal optimization and modernity."**
+Consequences, stated honestly:
+- On the **torch path**, the hand-rolled layer shrinks to the three mechanisms
+  nothing exists for — TSCT (STE-quantized low-rank experts), Engram (host
+  hash-table memory), ByteFlow (coding-rate patching); attention/optimizer/
+  quant/data become dependencies (FLA/TK, Muon, torchao/Liger, HF-class).
+- On the **burn path**, that layer stays OURS to write and own — including the
+  KDA fused-backward repair (Phase 3.3), the quant ladder rungs, the graph
+  capture and the MoE dispatch. The same "use the ecosystem" principle is
+  exactly why several Phase-3 items are torch-side dependencies and burn-side
+  engineering; the phase-2 spike must therefore produce, per path, a
+  **replaced-by-ecosystem vs stays-custom LOC table** as part of the code-
+  volume criterion, not just a tok/s number.
+
 ## 5. What I would NOT do (the traps)
 
 - **1M context before the first model.** KDA is O(n) and the arm exists, but
