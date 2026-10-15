@@ -474,7 +474,8 @@ Consequences, stated honestly:
 
 | milestone | status | number |
 |---|---|---|
-| first real-corpus trains | `small` 500 steps | CE 3.68 → 1.85, 0 NaN, 142 ms/step steady (8.3× over the day's start) |
+| first real-corpus trains | `small` 500 steps; **1500-step WSD rerun (lr 1e-3, eval every 250)** | CE 3.68 → 1.85 (500), 1.70 (1500); **eval BPB 3.342 → 2.981** over 250→1500 (window 81 920 B, w≈5× the old 20 480 B rows), 0 NaN; the 5-gram bar (2.57-2.91 measured on the same file) is now REACHED (2.981 ≈ the bar's high end) — first time any dormouse model has touched it |
+| honest degradation admission | the 1500-step run DEGRADED 1919 → 1410 tok/s over its own length (~30%) | suspect set (named, not bisected yet): the per-step Engram host-adam D2H row-grad sync, a growing allocator regime, LFB's cumulative bincount — the 1400-1500 steps look unproven; the BEFORE-1500 numbers read fine |
 | the profiler killers (all fixed + committed) | per-step cost died 8× | MAGMA fp32 GEMM 46.6% GPU (mm_mixed), clip_norm 252 ms (foreach dual), dense-MoE 24-launch loop (banked bmm), per-param python data hash (device-side FNV pinned bit-exact), per-param Muon 46k launches (shape-batched NS), per-param writeback 8.5k launches (foreach dual) |
 | eval line exists on the new CLI | small real run | BPB 4.457 → 3.946 across 150 steps (window 20 480 B) |
 | b1 speed at THIS CARD | **honest: eager OOM at b8·s512 / b4·s512 (fp32 masters, E=1024)** | the spike's 45.9-53.8k tok/s numbers ride **compile + bnb8bit** — a different memory regime; the full-loop with inductor warmup did NOT complete in one bench window overnight (compile > 10 min per graph); the 60k answer rides that recipe's first complete run |
