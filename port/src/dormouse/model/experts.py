@@ -103,6 +103,14 @@ class SparseMoE(nn.Module):
         # The router: ONE 2-D linear on the raw hidden state (not on the
         # latent), softmax over the bank, then top-k + a capacity-bound permute.
         self.router = nn.Linear(d, cfg.n_experts, bias=False, device=device)
+        # The LFB routing bias (arXiv:2408.15664): a per-expert `b_e` added to
+        # the softmax probs before the top-k, moved after each routed forward
+        # by `-coef·sign(load_e − mean)` WITHOUT gradients. A buffer, never a
+        # parameter: the optimizer must not move it, LFB does.
+        self.lfb_coef = cfg.moe_lb_coef
+        self.register_buffer(
+            "lfb_bias", torch.zeros(cfg.n_experts, device=device), persistent=False
+        )
         # The shared write back to the residual width.
         self.down = nn.Linear(f, d, bias=False, device=device)
 
@@ -117,7 +125,13 @@ class SparseMoE(nn.Module):
             for e, expert in enumerate(self.experts):
                 weighted = weighted + expert(x) * probs[:, e : e + 1]
         else:
-            weight, index = probs.topk(self.topk, dim=-1)
+            # LFB (arXiv:2408.15664): the top-k reads the RAISED score
+            # `probs + b_e`; the gate weight stays the honest prob at the
+            # chosen expert (the bias steers selection, never magnitude).
+            raised = probs + self.lfb_bias
+            index = raised.topk(self.topk, dim=-1).indices
+            weight = torch.gather(probs, 1, index)
+            self._lfb_step(index, counters)
             # Renormalized (burn's `topk_blend`): a top-1 token's gate is
             # exactly 1.0, so the sparse arm and the dense control run at the
             # same output magnitude — the A/B compares specialization, not scale.
@@ -127,6 +141,21 @@ class SparseMoE(nn.Module):
         weighted = weighted + self.shared(x)
         counters.count("moe_shared_forwards", n)
         return self.down(weighted)
+
+    def _lfb_step(self, index: torch.Tensor, counters: Counters) -> None:
+        """The LFB bias move: on-device, gradient-free, trains-mode only.
+
+        `b_e -= coef · sign(load_e − mean load)` leaves the graph entirely —
+        a aux-loss-free rebalancer, which is exactly the field's converged
+        pick (`docs/research/2026-10-15-1b-tech-verification.md` §1). A zero
+        config coefficient costs one dead branch and nothing else.
+        """
+        if self.lfb_coef == 0.0 or not self.training:
+            return
+        with torch.no_grad():
+            counts = torch.bincount(index.reshape(-1), minlength=self.n_experts).float()
+            self.lfb_bias.sub_(self.lfb_coef * torch.sign(counts - counts.mean()))
+        counters.count("moe_lfb_updates")
 
     def _capacity(self, n: int, k: int) -> int:
         """The routing capacity rule, in ONE place: `max(k, ceil(capacity·n·k/E))`.

@@ -102,7 +102,12 @@ class ModelConfig:
     #: Tokens per expert in the capacity-bound permute:
     #: `ceil(capacity * tokens * topk / n_experts)`, never below `topk`.
     moe_capacity: float = 1.0
-    moe_lb_coef: float = _unsupported(0.0, "MoE load-balancing loss (Switch §3.3)")
+    #: Loss-Free Balancing step (arXiv:2408.15664): before the top-k decision
+    #: the scores read `probs + b_e`, and after the forward `b_e` moves by
+    #: `-coef · sign(load_e − mean load)` — a bias, NOT an aux loss (no
+    #: interference gradients; the field converged here away from Switch-style
+    #: losses). 0.0 = off. The update is on-device per routed forward.
+    moe_lb_coef: float = 0.0
     #: Rank of the always-on shared expert (TSCT2 §14's `R_act` ≥ 192 zone).
     shared_rank: int = 192
 

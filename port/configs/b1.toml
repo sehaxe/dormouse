@@ -44,6 +44,8 @@ use_mhc = false
 use_mor = false
 use_situ = false
 use_byteflow = false
+# Load-Free Balancing step (arXiv:2408.15664): bias, not an aux loss.
+# 0.0 = off; 1e-2 is the paper's example scale at our router (tune with WSD).
 moe_lb_coef = 0.0
 jepa_weight = 0.0
 dspark_weight = 0.0

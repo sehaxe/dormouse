@@ -115,6 +115,55 @@ def test_no_engram_and_no_kda_arms_are_off_not_faked(byte_tensor):
     assert kda_field(c) == "kda=off,n=0"
 
 
+def test_lfb_moves_the_bias_and_never_carries_grad(byte_tensor):
+    """LFB (arXiv:2408.15664), pinned to the rule itself.
+
+    The bias after n routed forwards must equal `−coef · Σ sign(load − mean)`
+    over the forwards — not just "nonzero": two forwards can carry exactly
+    mirrored loads (measured: counts [59,60,60,77] then [66,69,70,51] at
+    seed 0, which sums to exactly zero and would flake any weaker check).
+    """
+    torch.manual_seed(0)
+    cfg = tiny_cfg(moe_lb_coef=0.05)
+    model = DormouseModel(cfg)
+    moe = next(m for m in model.modules() if hasattr(m, "lfb_bias"))
+    coef = moe.lfb_coef
+    counts_seen: list[torch.Tensor] = []
+    real_step = moe._lfb_step
+
+    def spy(index, counters):
+        counts_seen.append(torch.bincount(index.reshape(-1), minlength=moe.n_experts).float())
+        return real_step(index, counters)
+
+    moe._lfb_step = spy  # observe the counts the real path sees
+
+    ids = torch.randint(0, 256, (2, 64))
+    targets = (ids + 1) % 256
+    # Different bytes per call: one fixed input through two weight-shared
+    # iterations can carry exactly MIRRORED loads (measured: counts
+    # [59,60,60,77] then [66,69,70,51] at seed 0 — the bias sums to exactly
+    # zero by symmetry). The rule must be checked per call instead.
+    expected = torch.zeros_like(moe.lfb_bias)
+    for step in range(3):
+        generator = torch.Generator().manual_seed(7 + step)
+        ids = torch.randint(0, 256, (2, 64), generator=generator)
+        targets = (ids + 1) % 256
+        _, _, counters = model(ids, targets)
+        assert counters["moe_lfb_updates"] == 2  # this call's own dict
+        expected -= coef * torch.sign(counts_seen[-1] - counts_seen[-1].mean())
+        expected -= coef * torch.sign(counts_seen[-2] - counts_seen[-2].mean())
+        assert torch.allclose(moe.lfb_bias, expected, atol=1e-7), (
+            f"bias {moe.lfb_bias.tolist()} != the sign rule after step {step}"
+        )
+    model.eval()
+    with torch.no_grad():
+        _, _, eval_counters = model(ids, targets)  # eval: no update, no counter
+    assert "moe_lfb_updates" not in eval_counters
+    assert torch.allclose(moe.lfb_bias, expected), "eval moved the bias"
+    # The optimizer must never see it: a buffer by name, not a Parameter.
+    assert "lfb_bias" not in dict(model.named_parameters())
+
+
 def test_topk_dispatch_touches_only_selected_experts(byte_tensor):
     cfg = tiny_cfg(n_experts=8, moe_topk=2)
     m = DormouseModel(cfg)

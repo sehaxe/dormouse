@@ -50,7 +50,6 @@ def test_unknown_key_refuses_and_names_the_escape():
         ("jepa_weight", "0.05", "JEPA"),
         ("dspark_weight", "0.1", "DSpark"),
         ("aux_fb_weight", "0.1", "future-byte"),
-        ("moe_lb_coef", "0.01", "load-balancing"),
         ("act_quant", '"int8"', "activation quantization"),
     ],
 )
