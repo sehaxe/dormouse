@@ -76,8 +76,10 @@ the tech-verification doc §4):
 | KDA (q,k,v,g per-channel + beta) | ~16.9M |
 | Engram dense half + router + out_proj | ~10.5M |
 | Engram tables (4M rows/order) | 402M |
-| TSCT experts: 1024 × (2048·64 + 64·5461 + s) | ~492M |
-| **total** | **~0.92B ≈ 1B** |
+| TSCT experts: 1024 × (dual gate/up latent 2·(2048·64+64) + down 64·5461) + shared (rank 192 + its write) | ~639.5M (MEASURED on the instantiated port model, 2026-10-15: the §2.2 draft missed the down-projection and the second latent — the spike found it; `configs/b1.toml` comments carry the arithmetic) |
+| Engram tables: 4M rows/order × 3 orders × dim 32 | 402.65M |
+| **total** | **1,066,354,113 ≈ 1.07B (MEASURED, `tests/test_param_count.py`)** |
+| active per token | ~57M (unchanged in shape) |
 | **active per token (train, both iters)** | **~57M** |
 | FLOPs/token (train, derived) | ~0.40 GFLOP |
 
@@ -242,7 +244,7 @@ carry:
    A/B at iso-effective-bits vs ternary and NVFP4, 9M first, 100M to enter the
    recipe — the same discipline as TSCT2's own G-gates.
 2. **The capacity/compute frame the design implies but does not price.** TSCT's
-   job at 1B is capacity at near-zero active compute (§2.2: 492M expert params,
+   job at 1B is capacity at near-zero active compute (§2.2: 639M expert params,
    0.96 MFLOP/token). TSCT2 §10's arithmetic-intensity ridge (τ ≈ 28 →
    E ≲ T·k/28 at its assumed FP8-class rates) couples the expert count to the
    tokens-per-step lever (Phase 3.4): E=1024 pays only from ~16K tokens/step
@@ -429,10 +431,10 @@ Consequences, stated honestly:
    committing Phase 3 engineering (recommended), or stay burn-only.
 2. **First-model scope**: 9.2M control → 100M rung → 1B flagship (recommended
    ladder), or straight to 1B, or prep-only and you launch it yourself.
-3. **"1B total" reading**: ~0.92B on-card (the §2.2 shape), or 1B counted WITH
-   host-RAM Engram tables — which stretches to ~2-3B effective capacity at the
-   same compute. DeepSeek's own ratio argues the on-card reading; the playbook
-   argues the stretched one.
+3. **"1B total" reading**: 1.066B on-card (the §2.2 shape, MEASURED — the
+   dual-latent + down-projection correction pushed the draft 0.92B up 15.6%),
+   or 1B counted WITH host-RAM Engram tables — a knob the loader already has.
+   The owner left this to me; the on-card reading is the flag-first one.
 4. **Upstream issue**: provide a repo-scope GitHub token (the drafted text is
    ready), or file it yourself from
    `docs/reviews/upstream-issue-autotune-candidate-coin-flip.md`.
@@ -481,10 +483,12 @@ grouped MoE, fp8 experts).
   carries a LOUD/COUNTED/SILENT mark, device counters are read at declared
   cadences, and resume refuses a config whose resolved values differ
   (progress keys exempt).
-- Model shape constants come from §2.2/§2.3 of the plan (b1 ≈ 0.92B total,
-  57M active; `small` at 9.2M remains the A/B polygon with a port preset of
-  the same name and the same param count) so arm verdicts transfer across the
-  substrate.
+- Model shape constants come from §2.2/§2.3 of the plan (b1 ≈ 1.066B total
+  MEASURED by the port's instantiated count, 57M active; the port's `small`
+  preset is 9,476,993 vs burn's 9,197,390 — the +3.0% is structural: the
+  shared expert + its write per TSCT2 §14, minus burn's ~1.2M aux heads; the
+  delta is pinned in `port/configs/small.toml` and its test, so cross-
+  substrate arm verdicts read it and never silently compare counts).
 
 Burn lanes pause while the port lane is active (one lane at a time; the burn
 stack stays green and untouched as the fallback).
