@@ -37,15 +37,19 @@ aux_fb_horizon = 2
 # 25_000 rows/order x 3 orders x 32 dim; each table rounds UP to a power of two,
 # so what is built is 3 x 32 768 x 32 = 3 145 728 memory params. Measured
 # 2026-10-01 on the instantiated model: 3 145 728 of 9 197 454 = 34.2%. The
-# budget was picked as DeepSeek's own shipped operating point (V4.1-Flash 196B
-# Engram vs a 552B backbone = 26% of total; its stated law is 20-25% of the
-# sparse budget) - so the measured 34.2% sits ABOVE that band, because the ratio
-# was set against a retracted 7.5M-backbone count rather than a measurement.
-# The measured slot-count curve (arXiv 2601.16531, iso-parameter at a 125M
-# backbone) peaks at 500K/order, but that backbone is 16x ours: the same 500K
-# here is 48M params = 5.2x the measured total, i.e. the monopoly shape again.
-# The curve is flat 300K-500K and silent below, so the ratio anchors the default
-# and the 500K point stays a ladder rung.
+# Budget provenance, corrected 2026-10-15 by
+# docs/research/2026-10-15-1b-tech-verification.md: the DeepSeek-Flash operating
+# point we anchored on (V4.1-Flash 196B Engram vs a 552B backbone = 26% of
+# total) is a real shipped ratio, but no published "20-25% law" survived
+# verification; the published Qwen3.8-Next numbers are 51B n-gram tables =
+# 40.8% of the base model, or 29% counting on top (arXiv:2608.30320). So the
+# allocation is derived by sweeping engram_rows against BPB (AB-PROTOCOL row
+# 6b), not by an allocation law. The adjacent slot-count study (arXiv
+# 2601.16531, ~185M backbone + 128M memory) is flat WITHIN ITS NOISE across
+# 300K/500K/800K (peak 500K, delta 0.0016 vs the one reported std 0.0082; its
+# own best config is NOT significant) and reads collisions as implicit
+# regularization - so 500K/order stays a ladder rung, never the default, and
+# collision-free hot tiers are NOT the 1B direction.
 # Orders 2/3/4 replace the dead 3/5/8 (only n=3 had per-key support; n=5/n=8
 # were ~5775-way averages). engram_lam_max is the HARD floor on the memory's
 # share of its branch (`lam = min(w_mem, 0.5)`, the other half a dense

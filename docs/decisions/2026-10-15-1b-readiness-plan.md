@@ -23,6 +23,7 @@ action plan; §6 is the owner's decision list.
 | JEPA aux beats pure CE 3/3 seeds | `d8062d1`; the one arm with a positive verdict |
 | Muon+ default optimizer, routing validated at startup; host-RAM Engram works (`--engram-ram`) | AGENTS §3.5, §3.7 |
 | φ = 0.46: one recurrence buys 0.46 of a parameter (iso-depth law) → weight-shared depth is worth keeping | `docs/research/2026-10-11-recurrence-equivalence.md` (arXiv:2604.21106) |
+| Every major bet against the published record: Muon hybrid confirmed (8-bit state at our scale 2509.23106; 4-bit Muon measured on an RTX 5090, 2607.04422); host-Engram confirmed twice (2608.30320, 2610.20456); **"20-25%" and the slot-count law REFUTED — allocation is swept, not cited**; the ByteFlow criterion is unpublished → judge against boundary dependence, not entropy (2610.11790; BLT = 2412.09871); fp32 KDA state; WSD + wind-tunnel for overtraining | `docs/research/2026-10-15-1b-tech-verification.md` (69 arXiv IDs, verdict table first) |
 | Instrument layer: NaN firewall, CE ceiling, `engram=`/`fused kda=` counters, eval window printed, `--fit` anchors, determinism harness | AGENTS §2.6, §3.7; `tools/determinism.py` |
 
 ### 1.2 Open debts this plan pays
@@ -64,8 +65,10 @@ The three parts of that headroom, measured:
 ### 2.2 The candidate 1B shape ("b1", derived)
 
 d 2048 · H 32×64 · d_ffn 5461 · rank 64 · max_iter 2 · E 1024 experts, topk 2 ·
-Engram 4M rows/order × 3 orders × dim 32 (the DeepSeek 20-25% allocation ratio;
-`configs/small.toml` carries the provenance):
+Engram 4M rows/order × 3 orders × dim 32 (the DeepSeek-Flash operating point,
+26% by our attribute table; no published "20-25% law" survives verification and
+the allocation is swept, not cited — `configs/small.toml`, AB-PROTOCOL row 6b,
+the tech-verification doc §4):
 
 | component | params |
 |---|---|

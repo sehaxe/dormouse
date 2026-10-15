@@ -24,9 +24,11 @@ dspark_stride = 16
 
 # Hashed n-gram memory (Engram), the 2026-09-27 re-enable. 25_000 rows/order x
 # 3 orders x 32 dim; each table rounds UP to a power of two, so what is built is
-# 3 x 32 768 x 32 = 3 145 728 memory params. See configs/small.toml for why the
-# budget is the DeepSeek allocation ratio (20-25% of the model) and not the
-# 500K/order that the iso-parameter curve peaks at on a 16x larger backbone.
+# 3 x 32 768 x 32 = 3 145 728 memory params. Budget provenance lives in
+# configs/small.toml (corrected 2026-10-15): the DeepSeek-Flash operating point
+# 26% is real, no published "20-25%" law survived verification (arXiv:2608.30320
+# reads 29-41%), and the allocation is swept, not fixed - 500K/order is a ladder
+# rung, not this default ("the monopoly shape").
 # Measured 2026-10-01 on the instantiated model (`preset_exec`): 3 145 728 of
 # 13 065 874 = 24.1%.
 engram_rows = 25000
