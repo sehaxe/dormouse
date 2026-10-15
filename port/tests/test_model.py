@@ -59,6 +59,19 @@ def test_every_arm_counts(model, tiny, byte_tensor):
     assert kda_field(c) == f"kda=sdpa,n={tiny.max_iter}"
 
 
+def test_a_cuda_box_does_not_make_a_cpu_tensor_run_on_the_fused_arm():
+    """The FLA verdict is per device TYPE, not per machine.
+
+    Installing FLA on a CUDA box must not switch the CPU path onto a CUDA kernel:
+    the tests below run on CPU tensors, and a fused arm selected by "is there a
+    GPU here" would either crash or (worse) get a fallback nobody counted.
+    """
+    from dormouse.model.kda import fla_status
+
+    ok, why = fla_status("cpu")
+    assert not ok and "cpu" in why, why
+
+
 def test_attnres_mode_runs_and_replaces_rezero(byte_tensor):
     cfg = tiny_cfg(use_attnres=True)
     m = DormouseModel(cfg)

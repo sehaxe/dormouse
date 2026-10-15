@@ -102,6 +102,7 @@ def evaluate(
     model: torch.nn.Module,
     stream: ByteStream,
     batches: int,
+    device: torch.device | str | None = None,
 ) -> tuple[float, int]:
     """Mean held-out CE over `batches` windows + the BYTES those windows scored.
 
@@ -117,6 +118,8 @@ def evaluate(
     with torch.no_grad():
         for _ in range(batches):
             x, y = stream.next_batch()
+            if device is not None:
+                x, y = x.to(device), y.to(device)
             _, loss, _ = model(x, y)
             assert loss is not None, "an eval batch must carry targets"
             total += float(loss)
@@ -133,9 +136,17 @@ def train(
     eval_stream: ByteStream | None = None,
     resume: bool = False,
     log=print,
+    device: torch.device | str | None = None,
 ) -> dict:
-    """Run the training loop. Returns a report dict (final loss, counters, step)."""
+    """Run the training loop. Returns a report dict (final loss, counters, step).
+
+    `device` is the batch seam: the stream hands out CPU tensors (its bytes come
+    from an mmap, and it is the caller who knows where the model lives), so a
+    GPU run names the device here and gets its windows transferred. `None` is
+    the CPU path, unchanged.
+    """
     cfg = run.train
+    device = None if device is None else torch.device(device)
     if stream is None:
         stream, eval_stream = open_streams(run)
     model.train()
@@ -173,6 +184,8 @@ def train(
                 group["lr"] = lr
 
         x, y = stream.next_batch()
+        if device is not None:
+            x, y = x.to(device), y.to(device)
         logits, loss, step_counters = model(x, y)
         assert logits.shape[-1] == run.model.vocab, "logits width != vocab"
         total.merge(step_counters)
@@ -227,7 +240,7 @@ def train(
                 )
 
         if cfg.eval and eval_stream is not None and (step + 1) % cfg.eval_every == 0:
-            ev, scored = evaluate(model, eval_stream, cfg.eval_batches)
+            ev, scored = evaluate(model, eval_stream, cfg.eval_batches, device=device)
             log(
                 f"eval step={step + 1} loss={ev:.4f} bpb={bpb(ev):.3f} over {scored} B "
                 f"({cfg.eval_batches} x {cfg.batch} x {cfg.seq_len})"
@@ -238,7 +251,7 @@ def train(
             log(f"ckpt step={step + 1} -> {weights} ({snapshot})")
 
     if cfg.eval and eval_stream is not None and cfg.steps % cfg.eval_every != 0:
-        ev, scored = evaluate(model, eval_stream, cfg.eval_batches)
+        ev, scored = evaluate(model, eval_stream, cfg.eval_batches, device=device)
         log(
             f"eval step={cfg.steps} loss={ev:.4f} bpb={bpb(ev):.3f} over {scored} B "
             f"({cfg.eval_batches} x {cfg.batch} x {cfg.seq_len})"

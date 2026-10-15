@@ -5,6 +5,25 @@ description = "dormouse PyTorch port — day-one skeleton (config, model, traine
 requires-python = ">=3.12,<3.13"
 dependencies = ["torch>=2.13"]
 
+[project.optional-dependencies]
+# The stack the 2026-10-15 torch spike MEASURED on this card (RTX 5060 Ti,
+# sm_120): FLA 0.5.2 on torch 2.13.0+cu129 — the version pair the chunked
+# per-channel KDA kernel (`fla.ops.kda.chunk_kda`) was verified to run on.
+#   install: uv sync --extra gpu     run: uv run --extra gpu pytest
+# The extra is what makes FLA reachable at all; the `torch` pin is in the
+# shared lock, so a CPU-only environment installs this wheel and runs it as
+# CPU-only (`torch.cuda.is_available()` False → the CUDA gates skip, `fla` is
+# absent, and both fused arms fall back COUNTED).
+gpu = ["torch==2.13.0+cu129", "flash-linear-attention==0.5.2", "fla-core==0.5.2"]
+
+[[tool.uv.index]]
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu129", extra = "gpu" }]
+
 [dependency-groups]
 dev = ["pytest>=8.0", "ruff>=0.6"]
 
