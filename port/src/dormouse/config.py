@@ -344,8 +344,15 @@ def load_run(
     *,
     train: TrainConfig | None = None,
     train_overrides: dict[str, Any] | None = None,
+    model_overrides: dict[str, Any] | None = None,
 ) -> RunConfig:
-    """Resolve a run: preset (name or path) + the train half + loud overrides."""
+    """Resolve a run: preset (name or path) + both config halves + loud overrides.
+
+    Model overrides get the same two refusals the preset file itself gets
+    (`_refuse_unsupported` for a missing mechanism, `validate` for a
+    self-inconsistent set), because an override that bypasses them is the
+    silent-collapse shape the preset layer exists to prevent.
+    """
     model = load_preset(preset)
     tcfg = train if train is not None else TrainConfig()
     if train_overrides:
@@ -360,6 +367,12 @@ def load_run(
         tcfg = dataclasses.replace(tcfg, **train_overrides)
     if tcfg.opt not in ("mix", "adamw"):
         loud(f"opt={tcfg.opt!r}: known optimizers are 'mix' (default) and 'adamw'")
+    if model_overrides:
+        _refuse_unsupported(ModelConfig, model_overrides, "model")
+        import dataclasses as _dc
+
+        model = _dc.replace(model, **model_overrides)
+        validate(model)
     if tcfg.batch < 1 or tcfg.seq_len < 1 or tcfg.steps < 1:
         loud(f"batch={tcfg.batch} seq_len={tcfg.seq_len} steps={tcfg.steps}: all must be >= 1")
     if tcfg.seq_len > model.max_seq_len:

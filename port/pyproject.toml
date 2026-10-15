@@ -3,7 +3,10 @@ name = "dormouse"
 version = "0.0.1"
 description = "dormouse PyTorch port — day-one skeleton (config, model, trainer)"
 requires-python = ">=3.12,<3.13"
-dependencies = ["torch>=2.13"]
+dependencies = [
+    "torch>=2.13",
+    "typer>=0.27.3",
+]
 
 [project.optional-dependencies]
 # The stack the 2026-10-15 torch spike MEASURED on this card (RTX 5060 Ti,
@@ -44,3 +47,6 @@ select = ["E", "F", "I", "W", "UP", "B"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+
+[project.scripts]
+dormouse = "dormouse.cli:main"
