@@ -26,7 +26,7 @@ Nothing else is cited without an ID.
 | KDA decay form `A_h=-3 / b_alpha=+1.0` (K3 sigmoid) | **refuted as a literature default; keep as a measured local choice** | 2510.26692, 2607.24653 | not Moonshot's and not FLA's; label it "ours, measured" and re-test against FLA's init |
 | `g_min=-5` | **confirmed** | 2510.26692 + `[web]` FLA `lower_bound` | matches FLA's documented `-5` gate floor; keep |
 | KDA recurrent state dtype | **fp32 confirmed for inference state; bf16 training open** | 2608.27513 | keep §2.1's fp32-state trajectory; do not bf16 the state on a loss match |
-| 1B trained on ~10B tokens (10× overtraining) | **open** | 2608.07222, 2502.02737, 2404.06395 | treat as a distinct regime; fit our own law rather than assuming Chinchilla |
+| 1B trained on ~10B bytes/params total (see the corrected label below) | **open** | 2608.07222, 2502.02737, 2404.06395 | treat as a distinct regime; fit our own law rather than assuming Chinchilla |
 | bf16 GEMM on sm_120 | **confirmed fine here (refutes the old fear)** | §2.1 2026-10-10 table + 2607.04422 | bf16 compute is not the risk on 0.22; the fp32-GEMM-fallback premise is dead |
 | fp8/FP4 + bf16 optimizer state on sm_120 | **open** | 2607.04422, 2608.27513 | the real open risk; overfit degradation and state dtype need our own measurement |
 | CUDA-graph capture of the launch-bound stage | **confirmed direction, failure modes known** | 2609.23536, 2501.09398 | already 5/5 green on this GPU; capture one stage, not the whole step |
@@ -220,6 +220,14 @@ judged on more than BPB. Related: 2604.21100 (Preconditioned DeltaNet), 2607.118
 Fourier Delta Attention), 2610.02816 (Gated Slot Attention-2).
 
 ## 6. An over-trained ~1B
+
+LABEL CORRECTED 2026-10-15 (flagged by the data-strategy doc): this section's
+"10B tokens per 1B params" reads 9.3 bytes/param against Chinchilla's
+~20 — BELOW the optimum on the COUNTED 1.07B, not over-trained; only against
+the 57M ACTIVE params does it read 176× (the byte level makes the two
+claims look alike). The over-training question is therefore "do we run 1-4
+epochs of what we have, and does that buy", not "10× like frontier labs".
+The regime remains distinct; fit our own law on our own lattice.
 
 **No Chinchilla head-to-head at 1B / 10B tokens exists in what I found.** What exists is
 agreement that Chinchilla fits badly at the overtraining extreme. 2608.07222 (Skaling) states
