@@ -32,8 +32,9 @@ def preflight() -> None:
     print(f"[preflight] ok: no train procs, {free >> 20} MiB free of {total >> 20}")
 
 
-def build(e: int = 1024, d: int = 2048, r: int = 64, f: int = 5461,
-          tokens: int = 16384, cap: int = 32):
+def build(
+    e: int = 1024, d: int = 2048, r: int = 64, f: int = 5461, tokens: int = 16384, cap: int = 32
+):
     from dormouse.config import ModelConfig
     from dormouse.model.experts import SparseMoE
 

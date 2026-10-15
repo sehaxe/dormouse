@@ -287,8 +287,15 @@ def _bench_arms(e: int, d: int, r: int, f: int, tokens: int, cap: float, reps: i
     """
     torch.manual_seed(11)
     cfg = ModelConfig(
-        d_model=d, n_heads=4, head_dim=d // 4, d_ffn=f, rank=r, n_experts=e,
-        moe_topk=2, moe_capacity=cap, bf16=True,
+        d_model=d,
+        n_heads=4,
+        head_dim=d // 4,
+        d_ffn=f,
+        rank=r,
+        n_experts=e,
+        moe_topk=2,
+        moe_capacity=cap,
+        bf16=True,
     )
     moe = SparseMoE(cfg, device=DEV)
     x = torch.randn(tokens, d, device=DEV)

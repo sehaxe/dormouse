@@ -314,7 +314,7 @@ def run(
     rows = []
     for task in tasks:
         group = [rollout(model, task, budget=post_budget, device=dev) for _ in range(post_steps)]
-        advs = crr_advantage(group)
+        crr_advantage(group)
         rows.append(
             {
                 "task": task.tid,

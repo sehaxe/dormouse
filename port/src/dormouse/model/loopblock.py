@@ -147,11 +147,15 @@ class LoopBlock(nn.Module):
             if self.engram is not None and input_ids is not None:
                 mem = self.engram(normed, input_ids, counters).reshape(b * t, d)
                 dense = (
-                    mm_mixed(
-                        normed.reshape(b * t, d), self.mem_dense.weight, self.compute_dtype
+                    (
+                        mm_mixed(
+                            normed.reshape(b * t, d), self.mem_dense.weight, self.compute_dtype
+                        )
+                        + self.mem_dense.bias.to(self.compute_dtype)
                     )
-                    + self.mem_dense.bias.to(self.compute_dtype)
-                ).to(torch.float32).reshape(b * t, d)
+                    .to(torch.float32)
+                    .reshape(b * t, d)
+                )
                 branch = memory_floor_mix(mem, dense, w_mem, self.lam_max)
             else:
                 branch = torch.zeros(b * t, d, dtype=torch.float32, device=h0.device)
