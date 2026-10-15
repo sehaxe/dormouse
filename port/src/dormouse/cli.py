@@ -310,15 +310,19 @@ def run(
 
     # ---- stage 2: verifier-first post-train, byte-budgeted ----
     tokens = run.train.steps * run.train.batch * run.train.seq_len
-    tasks = build_tasks(post_cls, seed=run.model.seed, n=8)
+    tasks = build_tasks(post_cls, seed=run.train.seed, n=8)
     rows = []
     for task in tasks:
         group = [rollout(model, task, budget=post_budget, device=dev) for _ in range(post_steps)]
         advs = crr_advantage(group)
         rows.append(
             {
-                "task": task["id"],
-                "pass@budget": sum(a.artifact.passed for a in advs) / len(advs),
+                "task": task.tid,
+                # The METRIC is a well-defined fraction: rollouts that PASSED
+                # verification at the byte budget. CRR's advantage mean is
+                # negative when the whole group fails (the shape's design)
+                # — the pass@budget fraction is what the report knows.
+                "pass@budget": sum(r.passed for r in group) / max(1, len(group)),
                 "budget": post_budget,
             }
         )
