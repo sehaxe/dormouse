@@ -31,9 +31,7 @@ REPS, WARM = 5, 2
 
 
 def preflight() -> None:
-    busy = subprocess.run(
-        ["pgrep", "-ax", "train"], capture_output=True, text=True
-    ).stdout.strip()
+    busy = subprocess.run(["pgrep", "-ax", "train"], capture_output=True, text=True).stdout.strip()
     if busy:
         loud(f"a train process is alive:\n{busy}\nONE GPU process at a time (AGENTS §1.5)")
     free, total = torch.cuda.mem_get_info()
@@ -64,8 +62,15 @@ def main() -> int:
     preflight()
     torch.manual_seed(11)
     cfg = ModelConfig(
-        d_model=D, n_heads=16, head_dim=128, d_ffn=F_, rank=R,
-        n_experts=E, moe_topk=2, moe_capacity=2.0, bf16=True,
+        d_model=D,
+        n_heads=16,
+        head_dim=128,
+        d_ffn=F_,
+        rank=R,
+        n_experts=E,
+        moe_topk=2,
+        moe_capacity=2.0,
+        bf16=True,
     )
     moe = SparseMoE(cfg, device=DEV)
     x = torch.randn(N_TOK, D, device=DEV)

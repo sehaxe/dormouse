@@ -9,6 +9,7 @@ library rules, and the CLI adds none of its own. The log line stays plain
 from __future__ import annotations
 
 import dataclasses
+import math
 from pathlib import Path
 from typing import Annotated
 
@@ -180,7 +181,9 @@ def _snapshot_run(
 @app.command()
 def info(
     preset: Annotated[str, typer.Argument(help="preset NAME or a .toml PATH")] = "small",
-    sets: Annotated[list[str], typer.Option("--set", help="override: key=value")] = [],  # noqa: B006 - typer's contract: the runner constructs a fresh list per call
+    # typer constructs a fresh list per call (its contract) — B006 is a
+    # plain-function footgun, and the option annotation IS the fixture.
+    sets: Annotated[list[str], typer.Option("--set", help="override: key=value")] = [],  # noqa: B006
 ) -> None:
     """The resolved config and the parameter budget. Prints, trains nothing."""
     run = _run(preset, sets)
@@ -205,7 +208,12 @@ def train_cmd(
     resume: Annotated[
         bool, typer.Option(help="continue `ckpt_name`; a drifted config refuses")
     ] = False,
-    sets: Annotated[list[str], typer.Option("--set", help="override: key=value")] = [],  # noqa: B006 - typer's contract: the runner constructs a fresh list per call
+    json_log: Annotated[
+        Path | None, typer.Option("--json-log", help="telemetry sink for `dormouse plot`")
+    ] = None,
+    # typer constructs a fresh list per call (its contract) — B006 is a
+    # plain-function footgun, and the option annotation IS the fixture.
+    sets: Annotated[list[str], typer.Option("--set", help="override: key=value")] = [],  # noqa: B006
 ) -> None:
     """Train. The log lines (loss / arms / counters) go to stdout as-is."""
     model_over, train_over = _split_sets(sets)
@@ -216,6 +224,8 @@ def train_cmd(
     for k, v in (("batch", batch), ("steps", steps), ("lr", lr)):
         if v is not None:
             train_over[k] = v
+    if json_log is not None:
+        train_over["json_log"] = str(json_log)
     run = load_run(preset, model_overrides=model_over, train_overrides=train_over)
     dev = _device(device)
     model = _model(run).to(dev)
@@ -297,6 +307,73 @@ def decode(
     out = decode_bytes(model, encode(prompt), n, temp=temp, device=dev, generator=gen)
     text = out[len(encode(prompt)) :].decode("utf-8", "replace")
     console.print(Panel(f"[bold]{prompt}[/]{text}", title=f"decode · temp {temp} · {n} bytes"))
+
+
+@app.command()
+def plot(
+    json_log: Annotated[
+        Path, typer.Argument(help="a run's telemetry .jsonl (train --json-log)")
+    ] = ...,
+    out: Annotated[
+        Path | None, typer.Option(help="png path; default = the jsonl with .png")
+    ] = None,
+) -> None:
+    """A training report from telemetry: loss panel, eval panel, throughput panel."""
+    import json
+
+    runs = [json.loads(line) for line in json_log.read_text().splitlines() if line.strip()]
+    assert runs, f"{json_log}: empty telemetry (nothing was ever logged)"
+    head = runs[0] if runs[0].get("event") == "run" else {}
+    logs = [r for r in runs if r.get("event") == "log"]
+    evals = [r for r in runs if r.get("event") == "eval"]
+    assert logs, f"{json_log}: no log rows (train without --json-log?)"
+
+    steps = [r["step"] for r in logs]
+    losses = [float(r["loss"]) for r in logs if r["loss"] is not None and math.isfinite(r["loss"])]
+    loss_steps = [r["step"] for r in logs if r["loss"] is not None and math.isfinite(r["loss"])]
+    rates = [float(r["tokens_per_s"]) for r in logs if "tokens_per_s" in r]
+    rate_steps = [r["step"] for r in logs if "tokens_per_s" in r]
+    best = min((r for r in evals if r.get("bpb") is not None), key=lambda r: r["bpb"], default=None)
+    out = out or json_log.with_suffix(".png")
+    console.print(
+        Panel(
+            f"{json_log.name}: {head.get('source', '?')} · {len(steps)} log rows, steps {steps[0]}..{steps[-1]}",
+            subtitle=(
+                f"loss {min(losses):.4f}→{losses[-1]:.4f}"
+                + (
+                    f" · eval best {best['bpb']:.3f} BPB at step {best['step']}"
+                    if best
+                    else " · no eval rows"
+                )
+                + (f" · {max(rates):,.0f} tok/s peak" if rates else "")
+            ),
+        )
+    )
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    panels = [("train CE", (loss_steps, losses), "log")]
+    if evals:
+        panels.append(
+            ("held-out", ([r["step"] for r in evals], [float(r["bpb"]) for r in evals]), "linear")
+        )
+    panels.append(("tok/s", (rate_steps, rates), "linear"))
+    fig, axes = plt.subplots(len(panels), 1, figsize=(8, 2.2 * len(panels)), sharex=True)
+    axes = [axes] if len(panels) == 1 else list(axes)
+    for ax, (title, (xs, ys), scale) in zip(axes, panels):
+        ax.plot(xs, ys, lw=0.9)
+        ax.set_title(title, fontsize=10, loc="left")
+        ax.set_ylabel(title)
+        if scale == "log":
+            ax.set_yscale("log")
+        ax.grid(alpha=0.25)
+    axes[-1].set_xlabel("step")
+    fig.tight_layout()
+    fig.savefig(out, dpi=130)
+    console.print(f"[green]saved[/] {out}")
 
 
 if __name__ == "__main__":

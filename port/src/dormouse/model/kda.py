@@ -62,9 +62,7 @@ from ..instrument import Counters
 _FLA: dict[str, tuple[bool, str]] = {}
 
 
-def fla_status(
-    device: torch.device | str = "cuda", recheck: bool = False
-) -> tuple[bool, str]:
+def fla_status(device: torch.device | str = "cuda", recheck: bool = False) -> tuple[bool, str]:
     """Is FLA usable on THIS device type? Validated by a tiny call, once per process."""
     key = torch.device(device).type
     if key in _FLA and not recheck:

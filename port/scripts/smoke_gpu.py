@@ -43,9 +43,7 @@ DEV = "cuda"
 
 
 def preflight() -> None:
-    busy = subprocess.run(
-        ["pgrep", "-ax", "train"], capture_output=True, text=True
-    ).stdout.strip()
+    busy = subprocess.run(["pgrep", "-ax", "train"], capture_output=True, text=True).stdout.strip()
     if busy:
         loud(f"a train process is alive:\n{busy}\nONE GPU process at a time (AGENTS §1.5)")
     free, total = torch.cuda.mem_get_info()

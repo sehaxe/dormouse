@@ -88,3 +88,7 @@ class StepTimer:
         self.mark = now
         self.steps = 0
         return f"{ms:.1f} ms/step {rate:.0f} tok/s"
+
+    def window_s(self) -> float:
+        """The seconds this window of steps took, WITHOUT resetting the mark."""
+        return max(time.perf_counter() - self.mark, 1e-9)

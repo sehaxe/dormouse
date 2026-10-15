@@ -46,7 +46,6 @@ def test_unknown_key_refuses_and_names_the_escape():
         ("use_mhc", "true", "Hyper-Connections"),
         ("use_mor", "true", "Mixture-of-Recursions"),
         ("use_situ", "true", "SiTU-GLU"),
-        ("use_byteflow", "true", "ByteFlow"),
         ("jepa_weight", "0.05", "JEPA"),
         ("dspark_weight", "0.1", "DSpark"),
         ("aux_fb_weight", "0.1", "future-byte"),
@@ -54,12 +53,92 @@ def test_unknown_key_refuses_and_names_the_escape():
     ],
 )
 def test_missing_mechanisms_refuse_when_non_default(key, value, mechanism):
-    """(a) A key whose mechanism is missing REFUSES when set non-default."""
+    """(a) A key whose mechanism is missing REFUSES when set non-default.
+
+    `use_byteflow` used to be in this list; it left it the day the port landed
+    the crate's five stages (`byteflow.py`), and its own coherence rules are
+    pinned in `test_byteflow_*` below.
+    """
     with pytest.raises(LoudError) as e:
         parse_preset(f"d_model = 64\nn_heads = 4\nhead_dim = 16\n{key} = {value}\n")
     msg = str(e.value)
     assert key in msg and mechanism in msg
     assert "not ported" in msg and "remove the key or port the mechanism" in msg
+
+
+def _byteflow_preset(**over) -> str:
+    """A minimal valid byteflow model table, with named overrides."""
+    keys: dict[str, object] = {
+        "d_model": 64,
+        "n_heads": 4,
+        "head_dim": 16,
+        "use_byteflow": "true",
+        "byteflow_k_tokens": 8,
+        "bf16": "false",
+        "use_engram": "false",
+    }
+    keys.update(over)
+    return "\n".join(f"{k} = {v}" for k, v in keys.items()) + "\n"
+
+
+def test_use_byteflow_is_a_real_field_with_the_crates_defaults():
+    """The flag loads and refuses nothing; its numbers are `ByteFlowConfig`'s own.
+
+    (`vendor/dormouse-fused/crates/burn-byteflow/src/net.rs:290-310` — copied,
+    not guessed. The presets all carry `use_byteflow = false`, so a preset
+    cannot change nets by omission.)
+    """
+    cfg = parse_preset(_byteflow_preset())
+    assert cfg.use_byteflow is True
+    defaults = ModelConfig()
+    assert defaults.use_byteflow is False
+    assert (
+        defaults.byteflow_d_local,
+        defaults.byteflow_d_global,
+        defaults.byteflow_k_tokens,
+        defaults.byteflow_e_layers,
+        defaults.byteflow_g_layers,
+        defaults.byteflow_heads_local,
+        defaults.byteflow_heads_global,
+        defaults.byteflow_w_local,
+        defaults.byteflow_d_ff_local,
+        defaults.byteflow_d_ff_global,
+        defaults.byteflow_bins,
+        defaults.byteflow_eps2,
+        defaults.byteflow_logdet,
+        defaults.byteflow_max_bytes,
+    ) == (512, 1536, 3200, 6, 20, 8, 12, 512, 1408, 4096, 16, 0.5, False, 8192)
+    # The shipped presets keep their meaning: not one of them turns it on.
+    assert load_preset("small").use_byteflow is False
+    assert load_preset("b1").use_byteflow is False
+
+
+@pytest.mark.parametrize(
+    ("over", "match"),
+    [
+        ({"max_seq_len": 4096, "byteflow_max_bytes": 512}, "byteflow_max_bytes"),
+        ({"byteflow_k_tokens": 0}, "must be >= 1"),
+        ({"byteflow_k_tokens": 1024}, "byteflow_k_tokens"),
+        ({"byteflow_eps2": 0.0}, "byteflow_eps2"),
+        ({"byteflow_bins": 0}, "byteflow_bins"),
+        ({"byteflow_d_local": 17}, "does not divide"),
+        ({"byteflow_d_global": 17}, "does not divide"),
+        ({"bf16": "true"}, "bf16"),
+        ({"use_engram": "true"}, "use_engram"),
+    ],
+)
+def test_byteflow_coherence_is_loud_at_load(over, match):
+    """(d) The byteflow arm's own fields are checked where a preset can be wrong."""
+    with pytest.raises(LoudError, match=match):
+        parse_preset(_byteflow_preset(**over))
+
+
+def test_a_seq_len_below_the_patch_count_refuses(tmp_path):
+    """K boundaries live inside the T-byte window: K > T has nothing to select."""
+    path = tmp_path / "bf.toml"
+    path.write_text(_byteflow_preset(byteflow_k_tokens=32))
+    with pytest.raises(LoudError, match="seq_len"):
+        load_run(str(path), train_overrides={"seq_len": 16})
 
 
 @pytest.mark.parametrize("rung", ["fp8", "fp16", "fp4", "nvfp4", "lbit", "ternary", "int4"])

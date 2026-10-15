@@ -173,6 +173,30 @@ def train(
     window_finite: list[bool] = []
     timer = StepTimer()
     last_loss = float("nan")
+    #: The telemetry sink: every event (log cadence, evals, checkpoints) gets
+    #: a JSON row. A dict writer that never raises on non-JSON values.
+    sink = None
+    if cfg.json_log:
+        sink = open(cfg.json_log, "a", encoding="utf-8")
+
+        def _row(**kw) -> None:
+            import json
+
+            sink.write(
+                json.dumps({k: v for k, v in kw.items() if v is not None}, default=str) + "\n"
+            )
+            sink.flush()
+
+        _row(
+            event="run",
+            source=run.source,
+            steps=cfg.steps,
+            batch=cfg.batch,
+            seq_len=cfg.seq_len,
+            lr=cfg.lr,
+            opt=cfg.opt,
+            resumed=start,
+        )
     for step in range(start, cfg.steps):
         lr = wsd_lr(
             step, total_steps=cfg.steps, peak_lr=cfg.lr, warmup_steps=warm, decay_steps=decay
@@ -226,7 +250,21 @@ def train(
             ]
             if cfg.timers:
                 parts.append(timer.report(cfg.log_every * tokens_per_step))
+            # Telemetry reads the interval BEFORE any opt-in timer report
+            # (report() resets the mark; the json row must not depend on a flag).
+            interval_s = timer.window_s()
+            rate = (cfg.log_every * tokens_per_step) / interval_s if interval_s > 0 else None
             log(" ".join(p for p in parts if p))
+            if sink is not None:
+                _row(
+                    event="log",
+                    step=step + 1,
+                    loss=last_loss,
+                    lr=lr,
+                    tokens_per_s=rate,
+                    counters=dict(window),
+                    nan_skipped=nan_skipped,
+                )
             window = Counters()
             if drowning >= 2:
                 raise LoudError(
@@ -245,6 +283,8 @@ def train(
                 f"eval step={step + 1} loss={ev:.4f} bpb={bpb(ev):.3f} over {scored} B "
                 f"({cfg.eval_batches} x {cfg.batch} x {cfg.seq_len})"
             )
+            if sink is not None:
+                _row(event="eval", step=step + 1, loss=ev, bpb=bpb(ev), scored=scored)
 
         if (step + 1) % cfg.ckpt_every == 0:
             weights, snapshot = save_ckpt(run, model, opt, step)

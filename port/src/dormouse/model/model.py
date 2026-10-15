@@ -22,6 +22,14 @@ from torch import nn
 
 from ..config import ModelConfig
 from ..instrument import Counters
+from .byteflow import (
+    BfChannel,
+    ByteFlowNet,
+    bf_for_model,
+    byteflow_config,
+    compat_armed,
+    count_channel,
+)
 from .loopblock import LoopBlock
 from .tsct import make_projection
 
@@ -30,6 +38,16 @@ class DormouseModel(nn.Module):
     def __init__(self, cfg: ModelConfig, *, device: torch.device | str = "cpu") -> None:
         super().__init__()
         self.cfg = cfg
+        #: The byteflow arm, under ONE flag with two shapes (`byteflow.py`'s
+        #: Option A/B): `bf_net` is the standalone net (no loop arm is on, so
+        #: the loop is not built at all — no dormant parameter tree), `bf` is
+        #: the channel that runs THIS model's loop over K patch latents. Exactly
+        #: one of them is ever non-None, and which one is COUNTED per forward.
+        self.bf_net: ByteFlowNet | None = None
+        self.bf: BfChannel | None = None
+        if cfg.use_byteflow and not compat_armed(cfg):
+            self.bf_net = ByteFlowNet(byteflow_config(cfg), device=device)
+            return
         d = cfg.d_model
         self.embed = nn.Embedding(cfg.vocab, d, device=device)
         self.loop = LoopBlock(cfg, device=device)
@@ -39,6 +57,7 @@ class DormouseModel(nn.Module):
         # does the same, here, and nowhere else.
         head_rank = min(cfg.rank, d, cfg.vocab)
         self.lm_head = make_projection(d, cfg.vocab, cfg, rank=head_rank, device=device)
+        self.bf = bf_for_model(cfg, device=device)
 
     def forward(
         self,
@@ -50,6 +69,76 @@ class DormouseModel(nn.Module):
         counters = Counters() if counters is None else counters
         assert input_ids.dtype in (torch.long, torch.int64), "input_ids must be integer ids"
         assert input_ids.ndim == 2, f"input_ids must be [b, t], got {tuple(input_ids.shape)}"
+        if self.bf_net is not None:
+            logits, loss = self._forward_net(input_ids, targets, counters)
+        elif self.bf is not None:
+            logits, loss = self._forward_channel(input_ids, targets, counters)
+        else:
+            logits, loss = self._forward_byte_lm(input_ids, targets, counters)
+        counters.count("forward")
+        return logits, loss, counters
+
+    def _forward_net(
+        self,
+        input_ids: torch.Tensor,
+        targets: torch.Tensor | None,
+        counters: Counters,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Option A: the byteflow net alone — its byte logits ARE the model's."""
+        counters.count("bf_net")
+        assert self.bf_net is not None
+        b, t = input_ids.shape
+        flat = self.bf_net(input_ids).reshape(b * t, self.cfg.vocab)
+        return flat, _byte_ce(flat, targets)
+
+    def _forward_channel(
+        self,
+        input_ids: torch.Tensor,
+        targets: torch.Tensor | None,
+        counters: Counters,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Option B: front stage → this model's loop on K latents → back stage.
+
+        The objective is the byte CE from the DECODER, over all T positions —
+        not the loop's in-loop `L_Rec`. Two reasons, both load-bearing: the
+        decoder is the model's only exit, so a loss taken at the K patch starts
+        would leave `decode_chunks`' blocks and the byte head with no gradient;
+        and the held-out eval scores `[b,t,256]` logits against all T bytes, so
+        anything else would be a train CE that is not the quantity on the eval
+        line. `sel` is a discrete argtopk product: the SELECTION has no
+        gradient, the gathered rows and everything after `z` train normally.
+        """
+        assert self.bf is not None
+        # The aux heads are refused with `use_byteflow` by `validate`, and the
+        # model constructors deliberately do NOT call `validate` — so the same
+        # refusal is held here, at the runtime seam (ADR-0019's "a term with
+        # nothing to act on").
+        assert (
+            self.cfg.jepa_weight == 0.0
+            and self.cfg.dspark_weight == 0.0
+            and self.cfg.aux_fb_weight == 0.0
+        ), (
+            "the byteflow channel carries no aux heads: validate refuses the aux weights "
+            "with use_byteflow - set them to 0"
+        )
+        count_channel(counters)
+        bf = self.bf
+        h, z, sel = bf.net.encode_chunks(input_ids, bf.k)
+        x = bf.in_proj(z)  # [b, k, d_model]
+        # The loop, unchanged, on K patch latents. No byte ids: the memory arm
+        # is refused with use_byteflow (validate), so nothing here needs them.
+        out_acc, _, _ = self.loop(x, None, None, None, counters=counters)
+        logits = bf.net.decode_chunks(bf.out_proj(out_acc), h, sel)  # [b, t, vocab]
+        flat = logits.reshape(-1, self.cfg.vocab)
+        return flat, _byte_ce(flat, targets)
+
+    def _forward_byte_lm(
+        self,
+        input_ids: torch.Tensor,
+        targets: torch.Tensor | None,
+        counters: Counters,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """The plain byte-level stack: embedding → loop → RMSNorm → lm_head."""
         h0 = self.embed(input_ids)
         out, rec_sum, counters = self.loop(h0, input_ids, targets, self.lm_head, counters=counters)
         # fp32 logits — the burn rule that fixes `bf16 logits NaN`: the final
@@ -73,8 +162,21 @@ class DormouseModel(nn.Module):
             ce_final = -F.log_softmax(logits, dim=-1).gather(1, flat).mean()
             loss = (rec_sum + ce_final) / (self.cfg.max_iter + 1)
             assert torch.isfinite(loss), "L_Rec + final CE must be finite"
-        counters.count("forward", 1)
-        return logits, loss, counters
+        return logits, loss
+
+
+def _byte_ce(flat_logits: torch.Tensor, targets: torch.Tensor | None) -> torch.Tensor | None:
+    """The byte-lm CE: mean over positions and batch of the target log-prob.
+
+    Shared by both byteflow shapes (A and B) so the two cannot disagree about
+    what the objective is; `None` on a decode forward ("no labels" is not
+    "loss 0").
+    """
+    if targets is None:
+        return None
+    loss = -F.log_softmax(flat_logits, dim=-1).gather(1, targets.reshape(-1, 1)).mean()
+    assert torch.isfinite(loss), "the byte CE must be finite"
+    return loss
 
 
 def param_count(model: nn.Module) -> int:

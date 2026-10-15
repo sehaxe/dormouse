@@ -92,7 +92,41 @@ class ModelConfig:
     use_mhc: bool = _unsupported(False, "Manifold-Constrained Hyper-Connections")
     use_mor: bool = _unsupported(False, "Mixture-of-Recursions router")
     use_situ: bool = _unsupported(False, "SiTU-GLU expert activation")
-    use_byteflow: bool = _unsupported(False, "ByteFlow patcher")
+    use_byteflow: bool = False
+
+    # --- ByteFlow (arXiv 2603.03583): the byte-compression architecture -----
+    # A REAL arm, not an `_unsupported` stub: `byteflow.py` ports the crate's
+    # five stages and `DormouseModel` wires them (see that module's docstring
+    # for the Option A/B/C design decision). Every default below is
+    # `ByteFlowConfig::default()` from `vendor/dormouse-fused/crates/
+    # burn-byteflow/src/net.rs:290-310` — the crate's BFlowNet-600M numbers,
+    # copied, not guessed. burn's own `schema.rs` ships a reduced
+    # `byteflow_9m` build (d_local 96 / d_global 768 / K 128) for its presets;
+    # that is a preset choice, and the port's presets all carry
+    # `use_byteflow = false`, so the schema is the crate's.
+    byteflow_d_local: int = 512
+    byteflow_d_global: int = 1536
+    #: Global sequence length K after chunking — the compression knob.
+    byteflow_k_tokens: int = 3200
+    #: Encoder depth E; reused by the decoder (paper §3.5).
+    byteflow_e_layers: int = 6
+    #: Global depth G (paper Table 5: `[6, 20]` layers at 600M).
+    byteflow_g_layers: int = 20
+    byteflow_heads_local: int = 8
+    byteflow_heads_global: int = 12
+    #: Sliding window `w_local` of the local encoder/decoder.
+    byteflow_w_local: int = 512
+    byteflow_d_ff_local: int = 1408
+    byteflow_d_ff_global: int = 4096
+    #: Shared upsampling bins B (paper §3.4).
+    byteflow_bins: int = 16
+    #: Noise variance ε² of the coding rate, eq. (11).
+    byteflow_eps2: float = 0.5
+    #: Score the chunker with the EXACT log-det rate instead of Appendix B's
+    #: L2 fast path (the default: pure tensor ops, no host sync).
+    byteflow_logdet: bool = False
+    #: Byte-sequence length the RoPE tables are built for.
+    byteflow_max_bytes: int = 8192
 
     # --- MoE ------------------------------------------------------------
     n_experts: int = 3
@@ -159,6 +193,11 @@ class TrainConfig:
     warmup_tokens: int = 0
     #: Fraction of the token budget spent on the WSD decay.
     decay_frac: float = 0.1
+    #: JSONL telemetry sink: one row per event (log line, eval, checkpoint),
+    #: consumed by `dormouse plot`. Empty = off. NOT a progress key — it is
+    #: where measurements go, never what the run computes; re-pointing it on
+    #: a resume is legal and expected for a moved run.
+    json_log: str = ""
     data: str = ""
     eval_data: str = ""
     out_dir: str = "checkpoints"
@@ -275,8 +314,69 @@ def validate(model: ModelConfig) -> None:
         )
     if model.moe_capacity <= 0.0:
         loud(f"moe_capacity={model.moe_capacity} must be > 0")
+    if model.use_byteflow:
+        _validate_byteflow(model)
     if model.quant != "none":
         _refuse_ladder_rung(model.quant)
+
+
+def _validate_byteflow(model: ModelConfig) -> None:
+    """Coherence of the ByteFlow arm's own fields and of what it is wired to.
+
+    The chunker's RoPE table covers `byteflow_max_bytes`, so a longer window
+    must fail here with the field named, not at the first forward; `K ≤ T`
+    because every boundary is a position inside the window; and the local /
+    global widths must tile their head splits (`byteflow.py`, `ByteFlowNet`).
+    """
+    if model.max_seq_len > model.byteflow_max_bytes:
+        loud(
+            f"max_seq_len={model.max_seq_len} > byteflow_max_bytes="
+            f"{model.byteflow_max_bytes}: the chunker's RoPE table covers "
+            f"byteflow_max_bytes positions, so a longer sequence is a loud forward "
+            f"assert. Escape: raise byteflow_max_bytes with the model."
+        )
+    if model.byteflow_k_tokens < 1:
+        loud("byteflow_k_tokens must be >= 1 (at least the BOS boundary)")
+    if model.byteflow_k_tokens > model.max_seq_len:
+        loud(
+            f"byteflow_k_tokens={model.byteflow_k_tokens} > max_seq_len="
+            f"{model.max_seq_len}: the chunker's Top-K needs K <= T, every boundary a "
+            f"position inside the window. Escape: raise max_seq_len or lower K."
+        )
+    if model.byteflow_eps2 <= 0.0:
+        loud("byteflow_eps2 must be > 0 (it divides d inside the logdet)")
+    if model.byteflow_bins < 1:
+        loud("byteflow_bins must be >= 1")
+    for d, h, side in (
+        (model.byteflow_d_local, model.byteflow_heads_local, "local"),
+        (model.byteflow_d_global, model.byteflow_heads_global, "global"),
+    ):
+        if h < 1 or d % h != 0:
+            loud(
+                f"byteflow_{side} width {d} does not divide by its head count {h}: "
+                f"the head split must tile the width. Escape: fix the byteflow_* widths."
+            )
+    # fp32 only, and there is no second reading of that: the ported net has no
+    # bf16 path (the crate refuses --bf16 for the same reason — a cast copy
+    # dressed as a dtype).
+    if model.bf16:
+        loud(
+            "use_byteflow with bf16=true: the ByteFlow net has no bf16 handling, so the "
+            "flag would either be a cast copy around every projection or a silent fp32 "
+            "run wearing a bf16 label. Escape: `bf16 = false` (the paper's recipe), or "
+            "drop use_byteflow."
+        )
+    # The channel runs OUR loop on K patch latents, and the memory arm needs a
+    # byte position to hash an n-gram from — it has none on that path. Refused
+    # rather than silently inert (an arm that runs and trains nothing is the
+    # defect class the counters exist for).
+    if model.use_engram:
+        loud(
+            "use_byteflow with use_engram=true: the channel runs the loop over K patch "
+            "latents, so the n-gram memory has no byte position to read and would be "
+            "built, counted and trained by nothing. Escape: `use_engram = false` (the "
+            "byteflow arm alone carries the compression), or drop use_byteflow."
+        )
 
 
 def _refuse_ladder_rung(rung: str) -> None:
@@ -379,6 +479,13 @@ def load_run(
         loud(
             f"seq_len={tcfg.seq_len} exceeds max_seq_len={model.max_seq_len}: "
             f"the run would train on sequences the model refuses to serve"
+        )
+    if model.use_byteflow and model.byteflow_k_tokens > tcfg.seq_len:
+        loud(
+            f"byteflow_k_tokens={model.byteflow_k_tokens} > seq_len={tcfg.seq_len}: the "
+            f"chunker promotes K boundaries inside the T-byte window, so K > T has no "
+            f"positions to select. Escape: raise `seq_len`/`--batch`'s window or lower "
+            f"byteflow_k_tokens."
         )
     return RunConfig(source=preset, model=model, train=tcfg)
 

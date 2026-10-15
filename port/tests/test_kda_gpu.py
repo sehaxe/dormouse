@@ -181,9 +181,7 @@ def test_the_in_kernel_l2norm_is_what_keeps_the_recurrence_finite():
     g = -0.5 * torch.rand(b, t, h, hd, device=DEV)
     beta = torch.sigmoid(torch.randn(b, t, h, device=DEV))
     raw, _ = chunk_kda(q, k, v, g=g, beta=beta, scale=hd**-0.5)
-    normed, _ = chunk_kda(
-        q, k, v, g=g, beta=beta, scale=hd**-0.5, use_qk_l2norm_in_kernel=True
-    )
+    normed, _ = chunk_kda(q, k, v, g=g, beta=beta, scale=hd**-0.5, use_qk_l2norm_in_kernel=True)
     print(
         f"[kda l2] raw |o|max={float(raw.abs().max()):.3e} "
         f"normed |o|max={float(normed.abs().max()):.3e}"
@@ -216,13 +214,15 @@ def test_the_sdpa_fallback_normalizes_qk_like_the_kernel():
             F.normalize(qr, dim=-1) * attn.scale, F.normalize(kr, dim=-1), v, is_causal=True
         )
         ref = ref.transpose(1, 2).reshape(1, t, d) * gate
-        raw = F.scaled_dot_product_attention(
-            qr * attn.scale, kr, v, is_causal=True
-        ).transpose(1, 2).reshape(1, t, d) * gate
+        raw = (
+            F.scaled_dot_product_attention(qr * attn.scale, kr, v, is_causal=True)
+            .transpose(1, 2)
+            .reshape(1, t, d)
+            * gate
+        )
     gap = float((got - raw).abs().max())
     print(
-        f"[kda sdpa norm] |got-ref|max={float((got - ref).abs().max()):.2e} "
-        f"|norm-raw|max={gap:.3e}"
+        f"[kda sdpa norm] |got-ref|max={float((got - ref).abs().max()):.2e} |norm-raw|max={gap:.3e}"
     )
     assert torch.allclose(got, ref, atol=1e-6), "the fallback must normalize q and k"
     assert gap > 1e-3, "the norm must MOVE the output, not be decorative"

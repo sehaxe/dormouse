@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 from conftest import tiny_cfg, tiny_run
 
+from dormouse.config import ModelConfig
 from dormouse.model import DormouseModel
+from dormouse.model.byteflow import compat_armed
 from dormouse.train import kda_field, train
 
 
@@ -204,3 +207,104 @@ def _first_loss(model, run) -> float:
     _, loss, _ = model(ids, targets)
     stream.rewind()
     return float(loss.detach())
+
+
+# ---------------------------------------------------------------------------
+# the byteflow arm's two shapes (`byteflow.py`'s Option A/B), counted
+# ---------------------------------------------------------------------------
+
+#: A byteflow-sized tiny model: the crate's `tiny_config` shape
+#: (`net.rs:540-558`) at the port's tiny width.
+BYTEFLOW = dict(
+    d_model=16,
+    n_heads=2,
+    head_dim=8,
+    d_ffn=32,
+    max_seq_len=32,
+    max_iter=2,
+    rank=4,
+    n_experts=2,
+    moe_topk=0,
+    engram_rows=8,
+    engram_dim=4,
+    bf16=False,
+    shared_rank=4,
+    use_byteflow=True,
+    use_engram=False,
+    byteflow_d_local=16,
+    byteflow_d_global=16,
+    byteflow_k_tokens=8,
+    byteflow_e_layers=2,
+    byteflow_g_layers=2,
+    byteflow_heads_local=2,
+    byteflow_heads_global=2,
+    byteflow_w_local=8,
+    byteflow_d_ff_local=32,
+    byteflow_d_ff_global=32,
+    byteflow_bins=8,
+    byteflow_max_bytes=64,
+)
+
+
+def _bf_cfg(**over) -> ModelConfig:
+    return tiny_cfg(**{**BYTEFLOW, **over})
+
+
+def test_byteflow_channel_runs_the_loop_on_patch_latents(byte_tensor):
+    """Option B: front stage → OUR loop on K latents → back stage, COUNTED.
+
+    The evidence a reader needs is in the counters: `bf_channel=1` says the
+    channel ran, `iter`/`kda_sdpa` say the loop and its own attention arm ran
+    over K patches, and the byte head's gradient says the back stage trains
+    (the burn defect class is an arm that runs and trains nothing).
+    """
+    torch.manual_seed(0)
+    cfg = _bf_cfg()
+    assert compat_armed(cfg)
+    model = DormouseModel(cfg)
+    assert model.bf is not None and model.bf_net is None
+    ids, targets = byte_tensor(2, 64)
+    logits, loss, c = model(ids, targets)
+    assert logits.shape == (ids.numel(), cfg.vocab), "the decoder's byte logits are flat"
+    assert loss is not None and torch.isfinite(loss) and loss.item() > 0
+    assert c["bf_channel"] == 1 and c["forward"] == 1
+    assert c["iter"] == cfg.max_iter, "the loop ran"
+    assert c["kda_sdpa"] == cfg.max_iter, "with its own attention arm"
+    assert "engram_rows" not in c, "the memory arm has no byte position here"
+    loss.backward()
+    grads = {n for n, p in model.named_parameters() if p.grad is not None}
+    assert {
+        "bf.net.encoder.0.attn.qkv.weight",
+        "bf.net.proj.weight",
+        "bf.net.upsample_w",
+        "bf.net.decoder.0.attn.qkv.weight",
+        "bf.net.out.weight",
+        "bf.in_proj.weight",
+        "bf.out_proj.weight",
+        "loop.out_proj.u",
+    } <= grads, sorted(grads)
+
+
+def test_byteflow_standalone_is_the_net_and_nothing_else():
+    """Option A: no loop arm on ⇒ the net alone, no dormant parameter tree."""
+    torch.manual_seed(0)
+    cfg = _bf_cfg(use_kda=False)
+    assert not compat_armed(cfg)
+    model = DormouseModel(cfg)
+    assert model.bf is None and model.bf_net is not None
+    assert not hasattr(model, "loop"), "the loop must not be built beside the net"
+    ids = torch.randint(0, 256, (2, 32))
+    logits, loss, c = model(ids, (ids + 1) % 256)
+    assert logits.shape == (64, 256) and torch.isfinite(loss)
+    assert c["bf_net"] == 1 and c["forward"] == 1 and "bf_channel" not in c
+    loss.backward()
+    assert model.bf_net.out.weight.grad is not None
+
+
+def test_byteflow_channel_refuses_aux_weights_at_the_runtime_seam(byte_tensor):
+    """`validate` refuses the aux weights with `use_byteflow`; a hand-built
+    config bypasses it, so the forward holds the same line (ADR-0019)."""
+    model = DormouseModel(_bf_cfg(jepa_weight=0.1))
+    ids, targets = byte_tensor()
+    with pytest.raises(AssertionError, match="aux"):
+        model(ids, targets)
