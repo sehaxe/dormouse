@@ -324,6 +324,12 @@ not blocked on it. If the spike shows ≥2x at the b1 shape, the multi-day
 flagship runs on PyTorch and the Rust stack keeps serving experiments/decode.
 This is the owner's call (§6, Q1) — nothing moves before it is answered.
 
+**Decision criterion refined by the owner (2026-10-15): speed is welcome but
+decides LAST — the order is (1) less code, (2) easier to maintain, (3) memory,
+(4) only then tok/s. And any Python-side work (the spike, any port) uses
+`uv` for envs/deps, `ruff` for lint/format, `pytest` for tests; a torch-port
+decision starts with a `pyproject.toml` + ruff + pytest skeleton on day one.**
+
 ## 5. What I would NOT do (the traps)
 
 - **1M context before the first model.** KDA is O(n) and the arm exists, but
