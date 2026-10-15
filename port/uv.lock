@@ -160,6 +160,7 @@ source = { editable = "." }
 dependencies = [
     { name = "bitsandbytes" },
     { name = "matplotlib" },
+    { name = "sympy" },
     { name = "torch" },
     { name = "typer" },
 ]
@@ -185,6 +186,7 @@ requires-dist = [
     { name = "fla-core", marker = "extra == 'gpu'", specifier = "==0.5.2" },
     { name = "flash-linear-attention", marker = "extra == 'gpu'", specifier = "==0.5.2" },
     { name = "matplotlib", specifier = ">=3.11.2" },
+    { name = "sympy", specifier = ">=1.12" },
     { name = "torch", specifier = ">=2.13" },
     { name = "torch", marker = "extra == 'gpu'", specifier = "==2.13.0+cu129", index = "https://download.pytorch.org/whl/cu129", conflict = { package = "dormouse", extra = "gpu" } },
     { name = "typer", specifier = ">=0.27.3" },
