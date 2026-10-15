@@ -65,7 +65,7 @@ use_attnres = false
 # dispatch is the A/B this arm's control is measured against.
 n_experts = 3
 moe_topk = 0
-moe_capacity = 1.0
+moe_capacity = 2.0
 shared_rank = 192
 
 # Hashed n-gram memory. 25 000 rows/order x 3 orders x 32 dim, each table
@@ -88,7 +88,9 @@ use_situ = false
 use_byteflow = false
 # Load-Free Balancing step (arXiv:2408.15664): bias, not an aux loss.
 # 0.0 = off; 1e-2 is the paper's example scale at our router (tune with WSD).
-moe_lb_coef = 0.0
+# Load-Free Balancing ON (same measured pattern as b1.toml 2026-10-15).
+moe_lb_coef = 0.01
+
 jepa_weight = 0.0
 dspark_weight = 0.0
 aux_fb_weight = 0.0

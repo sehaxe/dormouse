@@ -119,12 +119,14 @@ def test_no_engram_and_no_kda_arms_are_off_not_faked(byte_tensor):
 
 
 def test_lfb_moves_the_bias_and_never_carries_grad(byte_tensor):
-    """LFB (arXiv:2408.15664), pinned to the rule itself.
+    """LFB (arXiv:2408.15664), pinned to the integrator rule itself.
 
-    The bias after n routed forwards must equal `−coef · Σ sign(load − mean)`
-    over the forwards — not just "nonzero": two forwards can carry exactly
-    mirrored loads (measured: counts [59,60,60,77] then [66,69,70,51] at
-    seed 0, which sums to exactly zero and would flake any weaker check).
+    The bias after each routed forward must equal `-coef·sign(L_cum − mean L)`
+    over ALL routed rows so far — cumulative, per the paper. The A/B of
+    2026-10-15 caught the per-forward variant making drops WORSE (bang-bang
+    control at one-step lag oscillates the whole bank). Consecutive forwards
+    can also carry exactly mirrored loads (measured: [59,60,60,77] then
+    [66,69,70,51] at seed 0) — per-call checking is the only honest pin.
     """
     torch.manual_seed(0)
     cfg = tiny_cfg(moe_lb_coef=0.05)
@@ -140,30 +142,28 @@ def test_lfb_moves_the_bias_and_never_carries_grad(byte_tensor):
 
     moe._lfb_step = spy  # observe the counts the real path sees
 
-    ids = torch.randint(0, 256, (2, 64))
-    targets = (ids + 1) % 256
-    # Different bytes per call: one fixed input through two weight-shared
-    # iterations can carry exactly MIRRORED loads (measured: counts
-    # [59,60,60,77] then [66,69,70,51] at seed 0 — the bias sums to exactly
-    # zero by symmetry). The rule must be checked per call instead.
-    expected = torch.zeros_like(moe.lfb_bias)
+    expected = torch.zeros(moe.n_experts)
+    cum = torch.zeros(moe.n_experts)
     for step in range(3):
         generator = torch.Generator().manual_seed(7 + step)
         ids = torch.randint(0, 256, (2, 64), generator=generator)
         targets = (ids + 1) % 256
         _, _, counters = model(ids, targets)
         assert counters["moe_lfb_updates"] == 2  # this call's own dict
-        expected -= coef * torch.sign(counts_seen[-1] - counts_seen[-1].mean())
-        expected -= coef * torch.sign(counts_seen[-2] - counts_seen[-2].mean())
-        assert torch.allclose(moe.lfb_bias, expected, atol=1e-7), (
-            f"bias {moe.lfb_bias.tolist()} != the sign rule after step {step}"
+        for c in (counts_seen[-2], counts_seen[-1]):
+            cum = cum + c
+            expected -= coef * torch.sign(cum - cum.mean())
+        assert torch.allclose(moe.lfb_bias.cpu(), expected, atol=1e-6), (
+            f"bias {moe.lfb_bias.tolist()} != the integrator rule after step {step}"
         )
     model.eval()
     with torch.no_grad():
+        ids = torch.randint(0, 256, (2, 64))
+        targets = (ids + 1) % 256
         _, _, eval_counters = model(ids, targets)  # eval: no update, no counter
     assert "moe_lfb_updates" not in eval_counters
-    assert torch.allclose(moe.lfb_bias, expected), "eval moved the bias"
-    # The optimizer must never see it: a buffer by name, not a Parameter.
+    assert torch.allclose(moe.lfb_bias.cpu(), expected), "eval moved the bias"
+    # The optimizer must never see it: buffers by name, not a Parameter.
     assert "lfb_bias" not in dict(model.named_parameters())
 
 

@@ -25,7 +25,11 @@ use_attnres = false
 
 n_experts = 1024
 moe_topk = 2
-moe_capacity = 1.0
+# capacity 2.0 = cap 64 (ceil(2·16K·2/1024)): the 2026-10-15 A/B measured
+# capacity 1.0 (cap 32) dropping 12.5% of assignments and LFB shaving only
+# to 11.3%, while cap 64 costs +4.5% step time for 0-3.8% drops. Capacity
+# wins: an assignment dropped is a gradient never seen.
+moe_capacity = 2.0
 # TSCT2 §13.4: writing only into a 64-dim subspace gives too small an R_act;
 # §14 answers with a shared expert of rank ~192-256 next to the routed r=64.
 shared_rank = 192
@@ -46,7 +50,11 @@ use_situ = false
 use_byteflow = false
 # Load-Free Balancing step (arXiv:2408.15664): bias, not an aux loss.
 # 0.0 = off; 1e-2 is the paper's example scale at our router (tune with WSD).
-moe_lb_coef = 0.0
+# Load-Free Balancing ON (arXiv:2408.15664): the bias reads cumulative
+# routed counts against their mean (the A/B caught both the per-forward
+# variant — bang-bang oscillation, drops WORSE — and biases-on-probs
+# flooding hot experts; logit-space bias with the integrator is what works).
+moe_lb_coef = 0.01
 jepa_weight = 0.0
 dspark_weight = 0.0
 aux_fb_weight = 0.0

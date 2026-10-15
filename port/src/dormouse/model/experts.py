@@ -128,6 +128,12 @@ class SparseMoE(nn.Module):
         self.register_buffer(
             "lfb_bias", torch.zeros(cfg.n_experts, device=device), persistent=False
         )
+        # The cumulative routed-count integrator the bias reads (persistent:
+        # a resume must keep its controller state or the rebalancer restarts
+        # its memory of where the load went).
+        self.register_buffer(
+            "lfb_counts", torch.zeros(cfg.n_experts, device=device), persistent=True
+        )
         # The shared write back to the residual width.
         self.down = nn.Linear(f, d, bias=False, device=device)
 
@@ -136,16 +142,22 @@ class SparseMoE(nn.Module):
         n = x.shape[0]
         assert x.ndim == 2 and x.shape[1] == self.d, f"MoE input {tuple(x.shape)} != [n, {self.d}]"
         probs = F.softmax(self.router(x), dim=-1)  # [n, E]
+        logits = self.router(x)  # the bias lives in LOGITS, not on probs
         weighted = torch.zeros(n, self.f, dtype=torch.float32, device=x.device)
         if self.topk == 0:
             counters.count("moe_dense_forwards", n * self.n_experts)
             for e, expert in enumerate(self.experts):
                 weighted = weighted + expert(x) * probs[:, e : e + 1]
         else:
-            # LFB (arXiv:2408.15664): the top-k reads the RAISED score
-            # `probs + b_e`; the gate weight stays the honest prob at the
-            # chosen expert (the bias steers selection, never magnitude).
-            raised = probs + self.lfb_bias
+            # LFB (arXiv:2408.15664): the top-k reads the RAISED logits
+            # `logits + b_e` (the paper's bias is on the pre-softmax score).
+            # The A/B caught BIASES ON PROBS flooding the bank: a ±0.4
+            # cumulative bias swamps a 1/E = 0.015-range prob and every token
+            # runs to the same two experts (67,459 drops vs 42,065). In logit
+            # space the bias competes with logits' own scale; the gate weight
+            # stays the honest prob from the UNbiased softmax (the bias
+            # steers selection, never magnitude).
+            raised = logits + self.lfb_bias
             index = raised.topk(self.topk, dim=-1).indices
             weight = torch.gather(probs, 1, index)
             self._lfb_step(index, counters)
@@ -162,16 +174,19 @@ class SparseMoE(nn.Module):
     def _lfb_step(self, index: torch.Tensor, counters: Counters) -> None:
         """The LFB bias move: on-device, gradient-free, trains-mode only.
 
-        `b_e -= coef · sign(load_e − mean load)` leaves the graph entirely —
-        a aux-loss-free rebalancer, which is exactly the field's converged
-        pick (`docs/research/2026-10-15-1b-tech-verification.md` §1). A zero
-        config coefficient costs one dead branch and nothing else.
+        `b_e -= coef · sign(L_e − mean L)` over the CUMULATIVE routed counts
+        `L_e` — the integrator the paper specifies. The A/B of 2026-10-15
+        caught the per-forward variant making drops WORSE (42,258→45,325 at
+        cap 32): bang-bang control at one-step lag oscillates the whole
+        bank; the cumulative mean is what converges. A MEASURED correction
+        to the first implementation, not an opinion.
         """
         if self.lfb_coef == 0.0 or not self.training:
             return
         with torch.no_grad():
             counts = torch.bincount(index.reshape(-1), minlength=self.n_experts).float()
-            self.lfb_bias.sub_(self.lfb_coef * torch.sign(counts - counts.mean()))
+            self.lfb_counts.add_(counts)
+            self.lfb_bias.sub_(self.lfb_coef * torch.sign(self.lfb_counts - self.lfb_counts.mean()))
         counters.count("moe_lfb_updates")
 
     def _capacity(self, n: int, k: int) -> int:
