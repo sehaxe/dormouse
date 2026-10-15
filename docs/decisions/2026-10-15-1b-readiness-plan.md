@@ -521,14 +521,18 @@ grouped MoE, fp8 experts).
   What remains is a 9.2M smoke (hours): correctness, arms engaged, speed vs
   burn's 245 ms/step — a gate, not a rung. b1 is the first real run.
 - **Parity discipline (owner, 2026-10-15, applies to EVERY ported
-  mechanism): a golden-parity test against the burn crate, or a documented
-  numeric anchor, or the difference is named in the module doc.** The burn
-  crates' own oracle tests are the goldens (`vendor/dormouse-fused/crates/
-  burn-byteflow/tests/*_oracle.rs` carried values — the port replicates them
-  as pytest, same inputs, same expected values, named tolerance); where no
-  oracle exists the rule is the KDA one (a 10-line recurrent reference as
-  the anchor, the difference explained). "A lot of code, check it all" —
-  the port is held to the burn stack's numbers, not to vibes.
+  mechanism): burn is the INSPIRATION and the formula source, not the
+  integration spec — the port is written from scratch, clean ("burn crates
+  are junk; write it perfectly and verify").** The verification is therefore
+  math-level, not line-level: every ported mechanism carries (a) a
+  golden/property test that pins its formulas — the burn crates' host
+  fixtures (`vendor/dormouse-fused/crates/burn-byteflow/tests/*_oracle.rs`)
+  remain excellent sources of expected VALUES — or (b) a documented numeric
+  anchor (the KDA rule: a 10-line recurrent reference), and additionally
+  (c) named properties asserted as invariants (rate ordering, forced BOS,
+  chronological patch order, window arithmetic, resume/progress keys).
+  Integration design is decided by the port's own architecture and the
+  readiness plan, with burn's A/B results as history, not spec.
 - **Kernel interfaces stay pure** (torch in / torch out, no global state, no
   custom allocators): reusable-good, not reusable-goal — performance and few
   owned lines first (owner directive).
