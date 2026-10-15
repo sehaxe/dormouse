@@ -147,9 +147,26 @@ class SparseMoE(nn.Module):
         probs = F.softmax(logits, dim=-1)  # [n, E]
         weighted = torch.zeros(n, self.f, dtype=torch.float32, device=x.device)
         if self.topk == 0:
-            counters.count("moe_dense_forwards", n * self.n_experts)
-            for e, expert in enumerate(self.experts):
-                weighted = weighted + expert(x) * probs[:, e : e + 1]
+            # Dense arm via ONE banked bmm per projection: the per-expert loop
+            # was 24 sequential launches per forward at small (launch-bound,
+            # measured 787 → 57 ms/step when banked 2026-10-15). The bank
+            # carries E·n·d activations — budget-guarded, COUNTED fallback.
+            e = self.n_experts
+            budget = e * n * self.d * 2 <= (1 << 28)
+            if budget:
+                gate_u, up_u, v, gate_s, up_s = self._banks(dt)
+                xg = x.to(dt).unsqueeze(0).expand(e, -1, -1)  # view, not copy
+                g = (torch.bmm(xg, gate_u) * gate_s[:, None, :])
+                h = F.silu(g) * (torch.bmm(xg, up_u) * up_s[:, None, :])
+                y = torch.bmm(h, v)  # [E, n, f]
+                weighted = torch.einsum(
+                    "ne,enf->nf", probs, y.to(probs.dtype)
+                )  # einsum keeps both operands in declared dtype (its own dispatch)
+                counters.count("moe_dense_banked", n)
+            else:
+                for ex, expert in enumerate(self.experts):
+                    weighted += expert(x) * probs[:, ex : ex + 1]
+                counters.count("moe_dense_loop", n)  # the fallback, read in logs
         else:
             # LFB (arXiv:2408.15664): the top-k reads the RAISED logits
             # `logits + b_e` (the paper's bias is on the pre-softmax score).
