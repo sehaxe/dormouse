@@ -25,14 +25,22 @@ Dispatch has TWO arms over ONE permute, and the log line says which ran:
   and the ragged grouped op was REJECTED for the combined pass (its cost is
   ~19 µs PER GROUP, flat — 2× the whole padded bmm at that E; see
   `/tmp/opencode/dormouse-torch-spike/SPIKE_REPORT.md`, phase-2 probe table).
+* **triton (research step 3/3, `model/moe_kernels.py`)**: the padding is gone —
+  the caller gathers the same ragged rows expert-major and the unpadded grouped
+  GEMM takes them with `offs [E+1]`, one program per (expert, row-block), the
+  GLU fused into the second GEMM's input. `ModelConfig.moe_kernel` picks it and
+  is the A/B kill-switch (`docs/research/2026-10-15-tsct-super-kernel.md` §5.5:
+  expert-kernel verdicts come from isolated-pass benches, then the full step);
+  when the kernel cannot run (no triton, not CUDA) the padded arm runs instead
+  and `moe_triton_fallback` + the reason say so.
 * **naive (the CPU path and the correctness reference)**: gather → per-expert
   matmul → scatter over a capacity-bound permute. The day-one implementation,
   kept because it is what the padded arm is compared against — the same rows,
   the same capacity rule, the same drop counter.
 
-Both count: `moe_padded_bmm` or `moe_naive_dispatch` (with the reason attached
-to the counter object) on the step's counter line, so a reader never has to
-guess which one produced the loss.
+All three count: `moe_padded_bmm`, `moe_triton_gemm` or `moe_naive_dispatch`
+(with the reason attached to the counter object) on the step's counter line, so
+a reader never has to guess which one produced the loss.
 """
 
 from __future__ import annotations
@@ -44,6 +52,14 @@ import torch.nn.functional as F
 from torch import nn
 
 from ..instrument import Counters
+
+try:  # the Triton arm is an ABILITY, not a dependency
+    from . import moe_kernels
+except Exception as exc:  # noqa: BLE001 — the reason is COUNTED by `_dispatch`
+    moe_kernels = None
+    _TRITON_WHY: str | None = f"the triton kernels are not importable here: {exc}"
+else:
+    _TRITON_WHY = None
 
 
 class DualLatentGLU(nn.Module):
@@ -96,6 +112,7 @@ class SparseMoE(nn.Module):
         self.n_experts = cfg.n_experts
         self.topk = cfg.moe_topk
         self.capacity = cfg.moe_capacity
+        self.moe_kernel = cfg.moe_kernel
         self.experts = nn.ModuleList(
             DualLatentGLU(d, f, cfg.rank, dtype=dtype, device=device) for _ in range(cfg.n_experts)
         )
@@ -312,19 +329,83 @@ class SparseMoE(nn.Module):
         index: torch.Tensor,
         counters: Counters,
     ) -> torch.Tensor:
-        """Capacity-bound permute, then the padded arm if it can run here, else naive.
+        """Capacity-bound permute, then `moe_kernel`'s arm (fallbacks COUNTED).
 
-        The fallback is COUNTED (`moe_naive_dispatch` + the reason on the counter
-        object) because the naive path is 3·E launches and a different GEMM
-        layout — a degradation, not another name for the same function.
+        ONE permute feeds every arm, so all three see the same rows and drop the
+        same ones; which one ran is on the counter, and a fallback carries the
+        reason on the counter object (ADR-0019 — a degradation a reader of the
+        log cannot see is a defect).
         """
         order, keep, dropped = self._permute(index)
         if dropped:
             counters.count("moe_dropped_assignments", dropped)
+        notes = []
+        if self.moe_kernel == "triton":
+            why = self._triton_reason(x)
+            if why is None:
+                counters.count("moe_triton_gemm")
+                return self._triton_dispatch(x, weight, index, order, keep)
+            counters.count("moe_triton_fallback")
+            notes.append(f"triton: {why}")
         why = self._padded_reason(x)
+        if self.moe_kernel == "naive":
+            why = "moe_kernel=naive: the config picked the reference loop"
         if why is None:
+            if notes:
+                counters.why = "; ".join(notes)  # type: ignore[attr-defined]
             counters.count("moe_padded_bmm")
             return self._padded_dispatch(x, weight, index, order, keep)
         counters.count("moe_naive_dispatch")
-        counters.why = why  # type: ignore[attr-defined]
+        counters.why = "; ".join([*notes, why])  # type: ignore[attr-defined]
         return self._naive_dispatch(x, weight, index, order, keep, counters)
+
+    def _triton_reason(self, x: torch.Tensor) -> str | None:
+        """`None` if the unpadded grouped GEMM can run THIS call, else why not.
+
+        The arm is unpadded by construction (`offs` carries the ragged bounds),
+        so the only things that can stop it are the ability itself (no triton,
+        no CUDA) — both COUNTED, never silent. The shapes need no gate: every
+        dimension is masked in-kernel, and the op asserts what it cannot do.
+        """
+        if _TRITON_WHY is not None:
+            return _TRITON_WHY
+        if not x.is_cuda:
+            return f"input is on {x.device.type}: the grouped GEMM is the CUDA path"
+        return None
+
+    def _triton_dispatch(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        index: torch.Tensor,
+        order: torch.Tensor,
+        keep: torch.Tensor,
+    ) -> torch.Tensor:
+        """Gather → ONE unpadded grouped-GEMM pass (GLU fused) → weighted scatter.
+
+        The arithmetic of `_padded_dispatch` with the padding removed: the kept
+        rows are gathered expert-major (they already are — the permute sorts by
+        expert id), `offs` carries the ragged group bounds, and no `[E, cap, f]`
+        intermediate is ever materialized. Rows past capacity never enter, so the
+        drop set is byte-for-byte the padded arm's.
+        """
+        assert moe_kernels is not None, "the triton arm cannot be dispatched without it"
+        n, k = index.shape
+        dt = self._bank_dtype()
+        rows = order[keep]
+        owner = rows // k
+        kept = index.reshape(-1)[rows]
+        counts = torch.bincount(kept, minlength=self.n_experts).to(torch.int32)
+        offs = torch.zeros(self.n_experts + 1, dtype=torch.int32, device=x.device)
+        offs[1:] = torch.cumsum(counts, 0)
+        gate_u, up_u, v, gate_s, up_s = self._banks(dt)
+        y = moe_kernels.expert_gemm_glu(
+            x[owner].to(dt), gate_u, up_u, gate_s, up_s, v, offs, cap=self._capacity(n, k)
+        )
+        # fp32 weight applied where the padded arm applies it (see the note
+        # there): a bf16 multiply would be a 2^-8 step the parity gate could not
+        # tell from a wiring error.
+        y = y.to(torch.float32) * weight.reshape(-1)[rows].unsqueeze(-1)
+        out = torch.zeros(n, self.f, dtype=torch.float32, device=x.device)
+        out.index_add_(0, owner, y)
+        return out

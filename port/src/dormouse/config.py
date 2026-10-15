@@ -44,6 +44,10 @@ UNSUPPORTED = "unsupported_mechanism"
 #: what the model computes. Exactly the burn list (cfg.rs `PROGRESS_KEYS`).
 PROGRESS_KEYS = ("steps", "log_every", "ckpt_every", "eval", "eval_every")
 
+#: The `moe_kernel` literals — the expert-pass arms `experts._dispatch` routes
+#: between. One list, read by `validate`: a name that is not here is LOUD.
+MOE_KERNELS = ("padded", "triton", "naive")
+
 
 def _unsupported(default: Any, mechanism: str) -> Any:
     """A field whose mechanism has not been ported: refuses when non-default."""
@@ -142,6 +146,15 @@ class ModelConfig:
     #: interference gradients; the field converged here away from Switch-style
     #: losses). 0.0 = off. The update is on-device per routed forward.
     moe_lb_coef: float = 0.0
+    #: Which expert-pass arm the routed forward runs, and the A/B switch
+    #: (`docs/research/2026-10-15-tsct-super-kernel.md` step 2):
+    #: `padded` = the cap-padded `[E, cap, ·]` bank of bmms — the reference and
+    #: the fallback every other arm is compared against; `triton` = the unpadded
+    #: grouped GEMM (`model/moe_kernels.py`, one program per ragged row-block,
+    #: GLU fused); `naive` = the per-expert loop (the CPU path). An unknown name
+    #: is LOUD at config load. `triton` falls back COUNTED to `padded` when the
+    #: kernel cannot run (no triton import, input not on CUDA) — never silently.
+    moe_kernel: str = "padded"
     #: Rank of the always-on shared expert (TSCT2 §14's `R_act` ≥ 192 zone).
     shared_rank: int = 192
 
@@ -314,6 +327,14 @@ def validate(model: ModelConfig) -> None:
         )
     if model.moe_capacity <= 0.0:
         loud(f"moe_capacity={model.moe_capacity} must be > 0")
+    if model.moe_kernel not in MOE_KERNELS:
+        loud(
+            f"moe_kernel={model.moe_kernel!r} is not an arm. Known: "
+            f"{list(MOE_KERNELS)} — `padded` the cap-padded bmm bank (reference "
+            f"and fallback), `triton` the unpadded grouped GEMM "
+            f"(model/moe_kernels.py), `naive` the per-expert loop. Escape: name "
+            f"one of those, or add the arm before the config can lie about it."
+        )
     if model.use_byteflow:
         _validate_byteflow(model)
     if model.quant != "none":
