@@ -348,13 +348,15 @@ the spike dir's SPIKE_REPORT.md, phase-2 section):
   from the exact gated-delta recurrence, so FLA-backed KDA is NOT tensor-
   comparable to burn-kda — a recurrent reference stays the anchor, and no
   cross-substrate "bitwise" claim is ever made.
-- **Gate 2 — torch-max, measured.** Real KDA + `_grouped_mm` MoE + AdamW +
-  compile: **304.67 ms/step, 53,776 tok/s** (7.93 GiB); the eager variant
-  with bnb 8-bit optimizers: 389 ms, 42,110 tok/s (6.38 GiB). compile and
-  bnb8bit are mutually exclusive ("cannot mutate tensors with frozen
-  storage") — a recorded trade, not a bug. The same-model substrate gain vs
-  vanilla is 1.22× (73,137 tok/s with the SDPA stand-in); the real KDA arm
-  costs 80 ms/step over it (1.36×) — that is the honest price of attention.
+- **Gate 2 — torch-max, measured.** Real KDA + the cap-padded bmm MoE
+  (`moe_fast` — `torch._grouped_mm` was measured 2× SLOWER at E=1024/b1: 44.2
+  vs 21.4 ms fwd — and REJECTED by the spike's own probe) + AdamW + compile:
+  **304.67 ms/step, 53,776 tok/s** (7.93 GiB); the eager variant with bnb
+  8-bit optimizers: 389 ms, 42,110 tok/s (6.38 GiB). compile and bnb8bit are
+  mutually exclusive ("cannot mutate tensors with frozen storage") — a
+  recorded trade, not a bug. The same-model substrate gain vs vanilla is
+  1.22× (73,137 tok/s with the SDPA stand-in); the real KDA arm costs
+  80 ms/step over it (1.36×) — that is the honest price of attention.
 
 **Loud negatives, carried:** `LigerFusedLinearCrossEntropyLoss` returns a
 ~40×-wrong loss and then illegal-memory-accesses at other shapes — excluded
