@@ -4,6 +4,7 @@ version = "0.0.1"
 description = "dormouse PyTorch port — day-one skeleton (config, model, trainer)"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "bitsandbytes[gpu]>=0.50.2",
     "matplotlib>=3.11.2",
     "torch>=2.13",
     "typer>=0.27.3",
@@ -18,7 +19,12 @@ dependencies = [
 # shared lock, so a CPU-only environment installs this wheel and runs it as
 # CPU-only (`torch.cuda.is_available()` False → the CUDA gates skip, `fla` is
 # absent, and both fused arms fall back COUNTED).
-gpu = ["torch==2.13.0+cu129", "flash-linear-attention==0.5.2", "fla-core==0.5.2"]
+gpu = [
+    "torch==2.13.0+cu129",
+    "flash-linear-attention==0.5.2",
+    "fla-core==0.5.2",
+    "bitsandbytes>=0.50.2",
+]
 
 [[tool.uv.index]]
 name = "pytorch-cu129"

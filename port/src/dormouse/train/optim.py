@@ -157,18 +157,29 @@ class Muon(Optimizer):
                         p.add_(update.to(p.dtype), alpha=-lr * scale)
                 continue
             n = len(params)
-            bufs = torch.stack([self.state[p]["momentum"] for p in params])
-            grads = torch.stack([p.grad for p in params])
-            bufs.mul_(mu).add_(grads.detach(), alpha=1.0 - mu)
-            update = colrow_normalize(zeropower_via_ns(bufs, ns))
-            scale = max(1.0, shape[0] / shape[1]) ** 0.5
-            updates = update.mul(-lr * scale).detach()
-            for i, p in enumerate(params):
+            # Chunk the shape stack: [1024, 64, 5461] fp32 batched NS needs
+            # ~1.33 GiB per intermediate and the 5-iteration chain keeps ~4
+            # GiB live — the 16-GB card OOMs WITH the model resident
+            # (2026-10-15 b1 bench). Chunks cap the batch's fp32 footprint;
+            # NS still runs on 512-slice groups.
+            n_chunk = max(1, min(n, (1 << 27) // (shape[0] * shape[1] * 4)))
+            for start in range(0, n, n_chunk):
+                params_c = params[start : start + n_chunk]
+                bufs = torch.stack([self.state[p]["momentum"] for p in params_c])
+                grads = torch.stack([p.grad for p in params_c])
+                bufs.mul_(mu).add_(grads.detach(), alpha=1.0 - mu)
+                update = colrow_normalize(zeropower_via_ns(bufs, ns)).detach()
+                scale = max(1.0, shape[0] / shape[1]) ** 0.5
+                updates = update.mul(-lr * scale)
+                # The write-back is FOREACH too: per-param copies are what kept
+                # 5221 add_ + 3267 copy_ launches on the post-batched profile
+                # (55 + 57 ms/step); the size check guarantees identical shapes
+                # so the sockets align 1:1.
                 with torch.no_grad():
-                    p.add_(updates[i].to(p.dtype))
-            for i, p in enumerate(params):
-                with torch.no_grad():
-                    self.state[p]["momentum"].copy_(bufs[i])
+                    torch._foreach_add_([p.detach() for p in params_c], torch.unbind(updates))
+                    torch._foreach_copy_(
+                        [self.state[p]["momentum"] for p in params_c], torch.unbind(bufs)
+                    )
             n_batches += 1
         return n_batches
 
