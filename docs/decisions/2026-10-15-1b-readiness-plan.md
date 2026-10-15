@@ -319,13 +319,42 @@ risk), and the compiled-kernel library's correctness work would restart from
 zero. The technology — not the framework — is the moat; but the moat ports,
 the framework does not follow.
 
-**Recommendation: spike, then decide.** A 48-72 h PyTorch spike at the b1 shape
-(one LoopBlock block + a grouped-GEMM topk dispatch + bf16, tok/s and step-time
-measured against Option A's measured constants) is cheap and decides with
-data. The default while the spike runs is Option A (stay) — the first model is
-not blocked on it. If the spike shows ≥2x at the b1 shape, the multi-day
-flagship runs on PyTorch and the Rust stack keeps serving experiments/decode.
-This is the owner's call (§6, Q1) — nothing moves before it is answered.
+### 4.1 The spike's measured answer (2026-10-15)
+
+Full report: `docs/research/2026-10-15-torch-spike.md` (torch 2.13.0+cu129,
+CPython 3.12.15 via uv, this card, pre-flight before each of 13 GPU runs).
+The verdict table against the owner's ordered criteria:
+
+| criterion | burn (Option A) | torch (Option B) | winner |
+|---|---|---|---|
+| code / maintainability | 24k LOC owned + 55k vendored + **1.5-3.9k LOC still owed** (Phase 3) | 2.75-6.4k new LOC; **~39k of hand-written kernels deleted, not translated** | **B, 10-20x less owned code**; the instrument layer (LOUD/COUNTED, resume refusals) is a rewrite, not a freebie |
+| memory | 9-10 GB (bf16-plan, derived) | **6.93 GiB allocated / 8.88 reserved measured** at b16 s1024, 518.5M params (no Engram/KDA yet) | tie — B lands inside A's own budget; the [E,cap,f] MoE materialization needs a Triton kernel on either path |
+| tok/s at b1 | **no measurement exists**; nearest measured point: 9.2M, 245 ms/step, 87% GPU idle, dense MoE | **45,861 tok/s eager → 59,901 compiled** = 15.7-20.5 effective train TFLOP/s, **99.9% GPU util**; 10B tokens ≈ 1.9 days; at 46% of the 44 TFLOP/s silicon ceiling | B by default — nothing measured says burn wins; a finished burn shares the same ceiling |
+
+And the plan's load-bearing wall is now MEASURED, not derived: **grouped topk-2
+MoE is 339× the dense loop at iso-total-params** (52.6 ms vs 17.8 s, fwd+bwd).
+
+**Provisional verdict: Option B (port), by the owner's own priority order.**
+Two gates before the port starts, both cheap:
+1. **FLA gated-delta on sm_120** — the port's KDA arm would ride the FLA
+   dependency; the spike substituted SDPA, so the dependency is asserted
+   untested. ~1 h: pip-install FLA, run its gated-delta kernel bf16 at our
+   shape, correctness + tok/s vs the KDA constants. If it fails sm_120, the
+   LOC advantage shrinks by 1.5-3k and the decision reopens.
+2. **Spike phase 2 (torch-max)**: same loop-block measured with the ecosystem's
+   best — fp8 expert weights (`torch._scaled_mm`/torchao), a fused grouped MoE
+   kernel replacing the [E,cap,f] materialization, bnb paged 8-bit optimizers,
+   Liger fused RMSNorm/CE — Sirius the torch-max row the verdict table needs.
+
+Carried caveats (the spike's own): AdamW not Muon+ (burn's 52-61 ms retraction
+is NOT inside the 357 ms comparison), SDPA not KDA, no Engram, no data
+pipeline/resume/instrumentation; and the plan §2.2's expert pricing has no
+down-projection — the spike folded one shared [5461→2048] (+11.2M) to keep the
+specified shape; the TSCT2 GLU-at-latent pricing replaces this before b1.toml.
+
+Burn stays the fallback that produced every trustworthy number to date and can
+ship the first model if either gate fails; nothing on the burn path is deleted
+by the port decision.
 
 **Decision criterion refined by the owner (2026-10-15): speed is welcome but
 decides LAST — the order is (1) less code, (2) easier to maintain, (3) memory,
