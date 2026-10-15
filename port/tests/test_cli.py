@@ -38,7 +38,7 @@ def test_unknown_set_key_refuses():
 
 
 def test_unported_mechanism_refuses_through_the_cli():
-    r = runner.invoke(app, ["info", "small", "--set", 'quant="fp8"'])
+    r = runner.invoke(app, ["info", "small", "--set", 'quant="lbit"'])  # a training-time rung
     assert r.exit_code != 0 and "Escape" in str(
         r.exception
     )  # the exact message belongs to `quant`'s own rule

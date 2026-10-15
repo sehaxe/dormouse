@@ -217,36 +217,35 @@ class SparseMoE(nn.Module):
         return self.experts[0].compute_dtype
 
     def _banks(self, dt: torch.dtype) -> tuple[torch.Tensor, ...]:
-        """The expert bank as `[E, ·]` tensors for the batched matmuls — CACHED.
+        """The expert bank as `[E, ·]` tensors for the batched matmuls — CACHED IN `dt`.
 
-        The old form stacked per forward: at b1 that is a 1.25 GB bf16 copy
-        (gate/up `[E,2048,64]` + v `[E,64,5461]`) paid `max_iter` times per
-        step — docs/research/2026-10-15-tsct-super-kernel.md op 1 ("delete,
-        not write"). The cache key is the parameters' in-place `_version`: an
-        optimizer step bumps it, so a bank never survives a stale update; one
-        bf16 conversion per step is still paid. Identity across forwards is
-        asserted by test.
+        Two caches' lessons paid here. (1) The naive form stacked per forward
+        (1.25 GB at b1). (2) The first cache stored the fp32 stack and called
+        `.to(dt)` EVERY forward — measured ~15 ms host + ~4 ms copies per
+        call at b1 (1.79 GB re-converted twice per step at max_iter 2; the
+        TSCT-super-kernel bench flagged it as larger than the Triton kernel
+        win). So this cache stores the CONVERTED tensors, keyed by the
+        parameters' in-place `_version`: an optimizer step bumps it, nothing
+        stale survives; one conversion per step is the honest floor, zero
+        conversions inside the step.
         """
         key = (dt, tuple(p._version for e in self.experts for p in e.parameters()))
         cached = getattr(self, "_bank_cache", None)
         if cached is None or cached[0] != key:
-            stacked = tuple(
-                torch.stack([getattr(e, name) for e in self.experts])
-                for name in ("gate_u", "up_u", "v")
+            cached = (
+                key,
+                tuple(
+                    torch.stack([getattr(e, name) for e in self.experts]).to(dt)
+                    for name in ("gate_u", "up_u", "v")
+                ),
+                tuple(
+                    torch.stack([getattr(e, name) for e in self.experts]).to(dt)
+                    for name in ("gate_s", "up_s")
+                ),
             )
-            cached = (key, stacked)
             self._bank_cache = cached
-
-        def bank(name: str) -> torch.Tensor:
-            return cached[1][("gate_u", "up_u", "v").index(name)].to(dt)
-
-        return (
-            bank("gate_u"),
-            bank("up_u"),
-            bank("v"),
-            torch.stack([e.gate_s for e in self.experts]).to(dt),
-            torch.stack([e.up_s for e in self.experts]).to(dt),
-        )
+        mats, scales = cached[1], cached[2]
+        return (mats[0], mats[1], mats[2], scales[0], scales[1])
 
     def _padded_dispatch(
         self,

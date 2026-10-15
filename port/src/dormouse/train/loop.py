@@ -53,21 +53,52 @@ def ckpt_paths(cfg: TrainConfig) -> tuple[Path, Path]:
 def save_ckpt(
     run: RunConfig, model: torch.nn.Module, opt: MixOptimizer, step: int
 ) -> tuple[Path, Path]:
-    """Weights + optimizer state, plus the config snapshot beside them."""
+    """Weights + optimizer state, plus the config snapshot beside them.
+
+    A storage rung (`model.quant` ∈ fp8/nvfp4) packs the factor matrices on
+    the way out: masters stay fp32 in memory, the FILE carries the compressed
+    record (`model_quant_rung` names it), and `load_ckpt` unpacks back to
+    fp32. The bank/checkpoint is the rung's whole contract — the forward path
+    within a run never changes numerics.
+    """
+    from ..model.tsct import is_factor_key, pack_tsct
+
     weights, snapshot = ckpt_paths(run.train)
     weights.parent.mkdir(parents=True, exist_ok=True)
+    sd = model.state_dict()
+    rung = run.model.quant if run.model.quant != "none" else ""
+    if rung and (rung == "fp8" or rung == "nvfp4"):
+        sd = {k: (pack_tsct(v, rung) if is_factor_key(k) else v) for k, v in sd.items()}
     tmp = weights.with_suffix(".pt.tmp")
     torch.save(
         {
-            "model": model.state_dict(),
+            "model": sd,
             "opt": opt.state_dict(),
             "step": step,
+            "model_quant_rung": rung or None,
         },
         tmp,
     )
     tmp.replace(weights)  # atomic: a crash never leaves a half-written ckpt
     snapshot.write_text(run.snapshot_toml())
     return weights, snapshot
+
+
+def unpack_state_dict(sd: dict, rung: str | None) -> dict:
+    """Model half of a checkpoint → fp32 masters. Packed records unpacked;
+    a rung that does not name a storage level is a loud refusal."""
+    from ..model.tsct import is_factor_key, unpack_tsct
+
+    if rung is None:
+        return sd
+    out = {}
+    for k, v in sd.items():
+        if isinstance(v, dict) and v.get("rung"):
+            assert is_factor_key(k), f"packed record at a non-factor key {k}"
+            out[k] = unpack_tsct(v)
+        else:
+            out[k] = v
+    return out
 
 
 def load_ckpt(run: RunConfig) -> tuple[dict, RunConfig]:
@@ -95,6 +126,14 @@ def load_ckpt(run: RunConfig) -> tuple[dict, RunConfig]:
             f"Escape: resolve the run with the stored values, or use a new ckpt_name."
         )
     ck = torch.load(weights, map_location="cpu", weights_only=False)
+    # Storage rungs: the model half unpacks to fp32 masters (eval/decode/
+    # resume all ride the same path). `quant` on the LOAD side is allowed to
+    # differ from the save side — the file's rung is what describes the
+    # values, and a checkpoint is legal evidence for a bf16 run starting
+    # from fp8-rounded init; the snapshot gate above already handles intent.
+    stored_rung = ck.get("model_quant_rung")
+    ck = dict(ck)
+    ck["model"] = unpack_state_dict(ck["model"], stored_rung)
     return ck, stored
 
 

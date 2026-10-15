@@ -400,27 +400,31 @@ def _validate_byteflow(model: ModelConfig) -> None:
         )
 
 
-def _refuse_ladder_rung(rung: str) -> None:
-    """The quant ladder is config-only on day one (plan §7): every rung refuses.
+def _refuse_ladder_rung(rung: str) -> str:
+    """The quant ladder: `fp8`/`nvfp4` are Storage rungs since 2026-10-15 (they
+    compress the factor bank and the checkpoint, the fp32 masters stay the
+    optimizer's object — see `tsct.py` module doc); everything else refuses.
 
-    GROUPED, not a fallback. `docs/architecture/bf16-plan.md` and the readiness
-    plan §7 wire `fp8 → NVFP4 → LittleBit` as a config field the day the
-    kernels land; today the factors are bf16 and a rung that silently ran bf16
-    while the config read `fp8` is the ADR-0019 defect in its purest form — a
-    *correct* number from a different program.
+    GROUPED, not a fallback. What remains refused (`fp16/lbit/ternary/act
+    quant`) is a TRAINING-time change — LittleBit's gates G-A..G-D
+    (`docs/reviews/littlebit-design-2026-10-15.md`) must close first.
     """
-    known = {"fp8", "fp16", "fp4", "nvfp4", "int4", "int8", "lbit", "ternary"}
+    storage = ("fp8", "nvfp4")
+    if rung in storage:
+        return rung
+    known = {"fp16", "fp4", "int4", "int8", "lbit", "ternary"}
     hint = (
-        " (a ladder rung: docs/reviews/littlebit-design-2026-10-15.md carries "
-        "the gates that must close first)"
+        " (a training-time rung: docs/reviews/littlebit-design-2026-10-15.md "
+        "carries the gates that must close first)"
         if rung in known
         else ""
     )
     loud(
-        f"quant={rung!r} is not supported{hint}: none of the ladder rungs are "
-        f"ported — the day-one port computes bf16 factors with fp32 masters "
-        f'(docs/architecture/bf16-plan.md). Escape: `quant = "none"`, or port '
-        f"the mechanism."
+        f"quant={rung!r} is not supported{hint}: the implemented rungs are the "
+        f"STORE levels fp8/nvfp4 (checkpoint/bank compression; compute stays "
+        f"bf16 factors with fp32 masters — docs/architecture/bf16-plan.md). "
+        f'Escape: `quant = "none"` (bf16), `quant = "fp8"`, `quant = "nvfp4"`, '
+        f"or close the LittleBit gates."
     )
 
 
