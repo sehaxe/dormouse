@@ -17,16 +17,20 @@ The expert is TSCT2 §14's shape (`docs/reviews/tsct2-design-2026-10-04.md`):
 
 Dispatch has TWO arms over ONE permute, and the log line says which ran:
 
-* **fused (CUDA, `torch._grouped_mm`)**: a ragged grouped GEMM, no `[E, cap, f]`
-  materialization and no zero-filled padded rows. Taken when the op exists in
-  this torch and the layer's own shapes satisfy its 16-byte stride rule; the
-  arithmetic is the same, the layout is not.
+* **padded (CUDA, the fast arm)**: gather the kept rows into ONE zero-filled
+  `[E, cap, d]` bank and run the whole expert bank as three batched matmuls
+  (`bmm`) — one launch per GEMM instead of `3·E` small ones. This is the
+  spike's phase-2 winner and the arm that survived the probe: at E=1024/b1 the
+  padded bmm measured **21.4 ms fwd against `torch._grouped_mm`'s 44.2 ms**,
+  and the ragged grouped op was REJECTED for the combined pass (its cost is
+  ~19 µs PER GROUP, flat — 2× the whole padded bmm at that E; see
+  `/tmp/opencode/dormouse-torch-spike/SPIKE_REPORT.md`, phase-2 probe table).
 * **naive (the CPU path and the correctness reference)**: gather → per-expert
   matmul → scatter over a capacity-bound permute. The day-one implementation,
-  kept because it is what the fused arm is compared against — the same rows, the
-  same capacity rule, the same drop counter.
+  kept because it is what the padded arm is compared against — the same rows,
+  the same capacity rule, the same drop counter.
 
-Both count: `moe_grouped_mm` or `moe_naive_dispatch` (with the reason attached
+Both count: `moe_padded_bmm` or `moe_naive_dispatch` (with the reason attached
 to the counter object) on the step's counter line, so a reader never has to
 guess which one produced the loss.
 """
@@ -124,14 +128,20 @@ class SparseMoE(nn.Module):
         counters.count("moe_shared_forwards", n)
         return self.down(weighted)
 
+    def _capacity(self, n: int, k: int) -> int:
+        """The routing capacity rule, in ONE place: `max(k, ceil(capacity·n·k/E))`.
+
+        Burn's `[E, cap, f]` rule, kept exact, and floored at `k` so a token is
+        never dropped by the floor itself.
+        """
+        return max(k, math.ceil(self.capacity * n * k / self.n_experts))
+
     def _permute(self, index: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
         """The routing permute: `(order, keep, dropped)` — one place, both arms.
 
         Both arms are permuted by the SAME rows and drop the SAME ones, which is
         what makes a parity run comparable and the drop count one number rather
-        than two opinions. The capacity rule is burn's `[E, cap, f]` rule, kept
-        exact: `cap = max(k, ceil(capacity·n·k/E))`, floored at `k` so a token is
-        never dropped by the floor itself.
+        than two opinions.
         """
         n, k = index.shape
         flat_ids = index.reshape(-1)
@@ -140,45 +150,33 @@ class SparseMoE(nn.Module):
         counts = torch.bincount(sorted_ids, minlength=self.n_experts)
         offsets = torch.cumsum(counts, 0) - counts
         pos = torch.arange(n * k, device=index.device) - offsets[sorted_ids]
-        cap = max(k, math.ceil(self.capacity * n * k / self.n_experts))
+        cap = self._capacity(n, k)
         keep = pos < cap
         return order, keep, int((~keep).sum())
 
-    def _grouped_reason(self, x: torch.Tensor) -> str | None:
-        """`None` if `torch._grouped_mm` can run THIS call, else the reason why not.
+    def _padded_reason(self, x: torch.Tensor) -> str | None:
+        """`None` if the padded bank can run THIS call, else the reason why not.
 
-        Checked from the ABI rather than by catching an exception at runtime:
-        the op must exist in this torch (2.13+), the tensor must be on CUDA, and
-        every output width must be a whole number of 16-byte elements — bf16
-        wants `rank % 8 == 0`, fp32 `rank % 4 == 0`, on `rank` and on `f`. The
-        three cases that fail are the three the spike's probe recorded
-        ("strides should be multiple of 16 bytes"); catching them per step would
-        hide a real shape bug behind a fallback.
+        The padded arm needs no ABI: it is plain `bmm` over a bank the forward
+        builds, so the only reason left is the device (`bmm` on fp32-CPU is the
+        slow reference path, which is what the naive arm is for). The fallback
+        is COUNTED, not silent (ADR-0019) — a reader of the log line sees it.
         """
-        if not hasattr(torch, "_grouped_mm"):
-            return "this torch has no torch._grouped_mm"
         if not x.is_cuda:
-            return f"input is on {x.device.type}: torch._grouped_mm is CUDA-only"
-        es = self._bank_dtype().itemsize
-        rank = self.experts[0].rank
-        if (rank * es) % 16 or (self.f * es) % 16:
-            return (
-                f"torch._grouped_mm needs every output width a multiple of 16 bytes; "
-                f"rank={rank}, f={self.f} at {es} bytes/element are not"
-            )
+            return f"input is on {x.device.type}: the padded bank is the CUDA path"
         return None
 
     def _bank_dtype(self) -> torch.dtype:
         """The dtype the experts compute in (their own `bf16` switch, not the device's)."""
         return self.experts[0].compute_dtype
 
-    def _stacked(self, dt: torch.dtype) -> tuple[torch.Tensor, ...]:
-        """The expert bank as `[E, ·]` tensors for the grouped op.
+    def _banks(self, dt: torch.dtype) -> tuple[torch.Tensor, ...]:
+        """The expert bank as `[E, ·]` tensors for the batched matmuls.
 
-        One small copy per forward — `E` is 3-to-8 here, so it is KB, not MB —
-        and `torch.stack` keeps the graph, so the gradients land back on each
-        expert's own parameters. Not a cached buffer: a cache would silently
-        outlive an optimizer step.
+        One small copy per forward — `E` is 3-to-8 in the presets, so it is KB,
+        not MB — and `torch.stack` keeps the graph, so the gradients land back
+        on each expert's own parameters. Not a cached buffer: a cache would
+        silently outlive an optimizer step.
         """
 
         def bank(name: str) -> torch.Tensor:
@@ -186,7 +184,7 @@ class SparseMoE(nn.Module):
 
         return bank("gate_u"), bank("up_u"), bank("v"), bank("gate_s"), bank("up_s")
 
-    def _grouped_dispatch(
+    def _padded_dispatch(
         self,
         x: torch.Tensor,
         weight: torch.Tensor,
@@ -194,30 +192,37 @@ class SparseMoE(nn.Module):
         order: torch.Tensor,
         keep: torch.Tensor,
     ) -> torch.Tensor:
-        """Ragged grouped GEMM: `torch._grouped_mm(a [R, K], w [G, K, N], offs)`.
+        """Gather → ONE capacity-padded `[E, cap, ·]` bank pass → weighted scatter.
 
-        `a[g] @ w[g]` for the rows `offs` slices into groups — the layout the
-        spike's probe established (`mat_b` is `(G, K, N)`, and the docstring in
-        `torch/nn/functional.py` is wrong about the 2-D-`mat_a` case). Rows past
-        capacity are gone by the same `keep` mask the naive path drops them with,
-        so the fused arm changes how the arithmetic is laid out, never which
-        tokens get an expert.
+        The spike's `moe_grouped`, adapted to the dual-latent GLU expert: the
+        same math the naive path runs per expert, batched over the bank. Rows
+        past capacity never enter the bank, and the ones that do are scattered
+        back by the same `keep` mask, so this arm changes how the arithmetic is
+        laid out, never which tokens get an expert.
         """
         n, k = index.shape
+        e, cap = self.n_experts, self._capacity(n, k)
         dt = self._bank_dtype()
         flat_w = weight.reshape(-1)
-        gid_all = index.reshape(-1)[order]
+        flat_e = index.reshape(-1)
         rows = order[keep]  # flat (token, slot) pairs that survive the cap
-        owner = rows // k  # the token each ragged row belongs to
-        gid = gid_all[keep]  # the expert each ragged row belongs to
-        offs = torch.bincount(gid, minlength=self.n_experts).cumsum(0).to(torch.int32)
+        owner = rows // k  # the token each kept row belongs to
+        # The padded-bank slot of each sorted row: expert-major, capacity-padded.
+        counts = torch.bincount(flat_e, minlength=e)
+        starts = torch.cumsum(counts, 0) - counts
+        pos = torch.arange(n * k, device=index.device) - starts[flat_e[order]]
+        kept_slots = (flat_e[order] * cap + pos)[keep]
+        # Zero-filled, not `empty`: a row past capacity is never read, but a
+        # zero row keeps the bank finite, and inf-garbage × 0 is NaN in the
+        # backward (the spike measured exactly that — `probe_moe_variants.py`).
+        xg = torch.zeros(e * cap, self.d, dtype=dt, device=x.device)
+        xg = xg.index_put((kept_slots,), x[owner].to(dt)).view(e, cap, self.d)
 
-        xg = x[owner].to(dt)
-        gate_u, up_u, v, gate_s, up_s = self._stacked(dt)
-        g = torch._grouped_mm(xg, gate_u, offs) * gate_s[gid]
-        u = torch._grouped_mm(xg, up_u, offs) * up_s[gid]
+        gate_u, up_u, v, gate_s, up_s = self._banks(dt)
+        g = torch.bmm(xg, gate_u) * gate_s[:, None, :]
+        u = torch.bmm(xg, up_u) * up_s[:, None, :]
         h = F.silu(g) * u
-        y = torch._grouped_mm(h, v, offs)  # [R, f]
+        y = torch.bmm(h, v).reshape(e * cap, self.f)[kept_slots]  # [R, f]
         # The router weight is applied in fp32, exactly where the naive path
         # applies it: a bf16 multiply would put a 2^-8 relative step between the
         # two arms that the parity gate could not tell from a wiring error.
@@ -260,19 +265,19 @@ class SparseMoE(nn.Module):
         index: torch.Tensor,
         counters: Counters,
     ) -> torch.Tensor:
-        """Capacity-bound permute, then the fused arm if it can run here, else naive.
+        """Capacity-bound permute, then the padded arm if it can run here, else naive.
 
         The fallback is COUNTED (`moe_naive_dispatch` + the reason on the counter
-        object) because the naive path is 3× the launches and a different GEMM
+        object) because the naive path is 3·E launches and a different GEMM
         layout — a degradation, not another name for the same function.
         """
         order, keep, dropped = self._permute(index)
         if dropped:
             counters.count("moe_dropped_assignments", dropped)
-        why = self._grouped_reason(x)
+        why = self._padded_reason(x)
         if why is None:
-            counters.count("moe_grouped_mm")
-            return self._grouped_dispatch(x, weight, index, order, keep)
+            counters.count("moe_padded_bmm")
+            return self._padded_dispatch(x, weight, index, order, keep)
         counters.count("moe_naive_dispatch")
         counters.why = why  # type: ignore[attr-defined]
         return self._naive_dispatch(x, weight, index, order, keep, counters)

@@ -15,6 +15,12 @@ Three claims, in the order the plan needs them:
    cross-substrate bitwise claim exists. The bounds are WIRING gates — a
    transposed head axis or a swapped gate is O(1) off — not a certificate;
 3. **the arm the log line names is the arm that ran** (`kda=fla,n=…`).
+
+One more, added when the fallback stopped being a different model: **the SDPA
+arm L2-normalizes q/k before the attention** (`_sdpa_normalizes`), the same
+norm the fused arm gets in-kernel (`use_qk_l2norm_in_kernel=True`, burn-kda
+K3). Without it the two arms ran different q/k; `beta_proj` stays dead on the
+fallback either way, so the counters below are unchanged.
 """
 
 from __future__ import annotations
@@ -184,3 +190,39 @@ def test_the_in_kernel_l2norm_is_what_keeps_the_recurrence_finite():
     )
     assert float(raw.abs().max()) > 1e3, "the raw-q/k blow-up this gate exists for"
     assert float(normed.abs().max()) < 1e2 and bool(torch.isfinite(normed).all())
+
+
+def test_the_sdpa_fallback_normalizes_qk_like_the_kernel():
+    """Arm symmetry: the fallback applies the SAME q/k L2 norm the kernel does.
+
+    `_sdpa_path` must reproduce `F.normalize(q,k)` by hand — an un-normalized
+    fallback is a different model from the FLA arm (and 1e17-explosive, see the
+    test above), which is the defect this pins. No FLA call here; it runs on any
+    CUDA box, and the `_FLA_INSTALLED` mark keeps it with the rest of the arm's
+    gates.
+    """
+    torch.manual_seed(0)
+    cfg = tiny_cfg(bf16=False, **ANCHOR)
+    attn = KDAAttention(cfg, device=DEV).eval()
+    t, d = 64, cfg.d_model
+    x = torch.randn(1, t, d, device=DEV)
+    with torch.no_grad():
+        qr = attn._heads(attn.q_proj(x), 1, t)
+        kr = attn._heads(attn.k_proj(x), 1, t)
+        v = attn._heads(attn.v_proj(x), 1, t)
+        gate = torch.sigmoid(attn.g_proj(x))
+        got = attn._sdpa_path(x, 1, t, d)
+        ref = F.scaled_dot_product_attention(
+            F.normalize(qr, dim=-1) * attn.scale, F.normalize(kr, dim=-1), v, is_causal=True
+        )
+        ref = ref.transpose(1, 2).reshape(1, t, d) * gate
+        raw = F.scaled_dot_product_attention(
+            qr * attn.scale, kr, v, is_causal=True
+        ).transpose(1, 2).reshape(1, t, d) * gate
+    gap = float((got - raw).abs().max())
+    print(
+        f"[kda sdpa norm] |got-ref|max={float((got - ref).abs().max()):.2e} "
+        f"|norm-raw|max={gap:.3e}"
+    )
+    assert torch.allclose(got, ref, atol=1e-6), "the fallback must normalize q and k"
+    assert gap > 1e-3, "the norm must MOVE the output, not be decorative"

@@ -29,7 +29,10 @@ WHAT RUNS OUTSIDE THE FUSED ARM, and why (COUNTED, not hidden):
 * The q/k L2 norm IS inside the kernel (`use_qk_l2norm_in_kernel=True`), which is
   where burn-kda has it too (K3: `q,k = L2Norm(ShortConv(Linear(x)))`). The port's
   projections are raw, and without that norm the gated-delta recurrence is
-  numerically explosive (measured: 1e17 by t=64 at unit-variance q/k).
+  numerically explosive (measured: 1e17 by t=64 at unit-variance q/k). **The
+  SDPA fallback applies the same `F.normalize` explicitly**, so both arms
+  implement K3's normalization and neither is anchored on inputs the other
+  never saw.
 * NOT in this model at all, so in neither arm: burn-kda's short convolutions, its
   output `Sigmoid(W_g x) ⊙ RMSNorm(o)` gate and its `o_proj`. Those are
   parameters the port does not have (the loop block norms BEFORE the layer and
@@ -189,14 +192,19 @@ class KDAAttention(nn.Module):
         return out.reshape(b, t, d)
 
     def _sdpa_path(self, x: torch.Tensor, b: int, t: int, d: int) -> torch.Tensor:
-        """COUNTED fallback: causal SDPA over q/k/v, g as a sigmoid output gate.
+        """COUNTED fallback: causal SDPA over L2-normalized q/k, g as an output gate.
 
         Counted because it is a DEGRADATION, not a different name for the same
         function: the delta-rule recurrence and `beta` do not run here. The
         counter on the log line is how a reader tells which arm produced a loss.
+
+        q/k are L2-normalized BEFORE the attention, mirroring the fused arm's
+        `use_qk_l2norm_in_kernel=True`: burn-kda K3 normalizes q/k, and an
+        un-normalized fallback would make the two arms two different models
+        (raw q/k are 1e17-explosive, see the module docs).
         """
-        q = self._heads(self.q_proj(x), b, t)
-        k = self._heads(self.k_proj(x), b, t)
+        q = F.normalize(self._heads(self.q_proj(x), b, t), dim=-1)
+        k = F.normalize(self._heads(self.k_proj(x), b, t), dim=-1)
         v = self._heads(self.v_proj(x), b, t)
         y = F.scaled_dot_product_attention(q * self.scale, k, v, is_causal=True)
         gate = torch.sigmoid(self.g_proj(x))  # [b, t, d]

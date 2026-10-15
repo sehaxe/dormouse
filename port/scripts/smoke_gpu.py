@@ -8,9 +8,9 @@ TWO arms because they prove different things:
 * `small` as shipped — it sets `moe_topk = 0` (burn's DENSE blend), so it proves
   the FLA KDA arm and nothing about the dispatch;
 * `small` + `moe_topk = 2` — the sparse dispatch, the only path that enters
-  `SparseMoE._grouped_dispatch`.
+  `SparseMoE._padded_dispatch`.
 
-Each prints the window counters (`kda=fla,n=…`, `moe_grouped_mm=…`), the held-out
+Each prints the window counters (`kda=fla,n=…`, `moe_padded_bmm=…`), the held-out
 BPB over its own window, ms/step, tok/s and peak allocated VRAM. The numbers go
 in the commit message.
 
@@ -56,8 +56,8 @@ def preflight() -> None:
 
 
 def moe_mode(counters) -> str:
-    if counters.get("moe_grouped_mm"):
-        return "grouped"
+    if counters.get("moe_padded_bmm"):
+        return "padded"
     if counters.get("moe_naive_dispatch"):
         return "naive"
     return "dense"
