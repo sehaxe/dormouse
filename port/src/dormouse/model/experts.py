@@ -52,6 +52,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from ..instrument import Counters
+from .tsct import mm_mixed
 
 try:  # the Triton arm is an ABILITY, not a dependency
     from . import moe_kernels
@@ -141,8 +142,9 @@ class SparseMoE(nn.Module):
         counters = Counters() if counters is None else counters
         n = x.shape[0]
         assert x.ndim == 2 and x.shape[1] == self.d, f"MoE input {tuple(x.shape)} != [n, {self.d}]"
-        probs = F.softmax(self.router(x), dim=-1)  # [n, E]
-        logits = self.router(x)  # the bias lives in LOGITS, not on probs
+        dt = self.experts[0].compute_dtype  # the shared compute dtype
+        logits = mm_mixed(x, self.router.weight, dt)  # bf16 tensor-core, fp32 out
+        probs = F.softmax(logits, dim=-1)  # [n, E]
         weighted = torch.zeros(n, self.f, dtype=torch.float32, device=x.device)
         if self.topk == 0:
             counters.count("moe_dense_forwards", n * self.n_experts)
@@ -169,7 +171,8 @@ class SparseMoE(nn.Module):
         # The shared expert is ALWAYS on: it is the write path, not a routed arm.
         weighted = weighted + self.shared(x)
         counters.count("moe_shared_forwards", n)
-        return self.down(weighted)
+        # down: an fp32-master Linear; bf16 matmul + fp32 out (MAGMA fix).
+        return mm_mixed(weighted.to(dt), self.down.weight, dt).to(torch.float32)
 
     def _lfb_step(self, index: torch.Tensor, counters: Counters) -> None:
         """The LFB bias move: on-device, gradient-free, trains-mode only.

@@ -33,7 +33,7 @@ from ..instrument import Counters
 from .engram import Engram, memory_floor_mix
 from .experts import SparseMoE
 from .kda import KDAAttention
-from .tsct import make_projection
+from .tsct import make_projection, mm_mixed
 
 __all__ = ["AttnResSlot", "LoopBlock", "depth_attend", "memory_floor_mix"]
 
@@ -82,6 +82,9 @@ class LoopBlock(nn.Module):
         self.lam_max = cfg.engram_lam_max
         self.use_engram = cfg.use_engram
         self.use_attnres = cfg.use_attnres
+        #: The compute dtype the bf16 plan names for the block's small mixed
+        #: projections (controller, mem_dense) — the experts' own choice.
+        self.compute_dtype = torch.bfloat16 if cfg.bf16 else torch.float32
         self.norm = nn.RMSNorm(d, eps=cfg.norm_eps, device=device)
         # The three gates only. burn's controller ALSO emits the expert-blend
         # logits and its MoE "adds NO parameters"; the port's MoE owns a
@@ -130,7 +133,7 @@ class LoopBlock(nn.Module):
             ctx = h + self.iter_embed[i].view(1, 1, d)
             normed = self.norm(ctx)
             ctrl = torch.cat([ctx.reshape(b * t, d), h0_flat], dim=-1)
-            raw = self.controller(ctrl)
+            raw = mm_mixed(ctrl, self.controller.weight, self.compute_dtype)  # MAGMA fix
             w_attn = torch.sigmoid(raw[:, 0:1])
             w_mem = torch.sigmoid(raw[:, 1:2])
             w_ffn = torch.sigmoid(raw[:, 2:3])
@@ -143,7 +146,12 @@ class LoopBlock(nn.Module):
 
             if self.engram is not None and input_ids is not None:
                 mem = self.engram(normed, input_ids, counters).reshape(b * t, d)
-                dense = self.mem_dense(normed).reshape(b * t, d)
+                dense = (
+                    mm_mixed(
+                        normed.reshape(b * t, d), self.mem_dense.weight, self.compute_dtype
+                    )
+                    + self.mem_dense.bias.to(self.compute_dtype)
+                ).to(torch.float32).reshape(b * t, d)
                 branch = memory_floor_mix(mem, dense, w_mem, self.lam_max)
             else:
                 branch = torch.zeros(b * t, d, dtype=torch.float32, device=h0.device)

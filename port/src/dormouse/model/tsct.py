@@ -51,6 +51,20 @@ from torch import nn
 from ..instrument import loud
 
 
+def mm_mixed(x: torch.Tensor, weight: torch.Tensor, dt: torch.dtype) -> torch.Tensor:
+    """`x @ Wᵀ` in `dt` with fp32-out — the port's mixed-dtype rule (F.linear).
+
+    torch's `Linear` dispatched on the INPUT's dtype: fp32 masters with fp32
+    activation inputs run fp32 GEMM, which on sm_120 means the MAGMA lane —
+    measured 46.6% of small's forward CUDA time in the 2026-10-15 profiler
+    probe (280 × ~240 µs fp32 gemms against TSCT's 13-38 µs bf16 cutlass).
+    Casting per forward (masters stay fp32, exactly TSCTLinear's contract)
+    routes every projection through the bf16 cuBLAS tensor-core path.
+    """
+    w = weight if weight.dtype == dt else weight.to(dt)
+    return (x if x.dtype == dt else x.to(dt)) @ w.t()
+
+
 class TSCTLinear(nn.Module):
     """A factorized linear: `x → ((x·U) ⊙ s)·V`, masters fp32, forward in `dtype`."""
 
