@@ -156,7 +156,7 @@ class SparseMoE(nn.Module):
             if budget:
                 gate_u, up_u, v, gate_s, up_s = self._banks(dt)
                 xg = x.to(dt).unsqueeze(0).expand(e, -1, -1)  # view, not copy
-                g = (torch.bmm(xg, gate_u) * gate_s[:, None, :])
+                g = torch.bmm(xg, gate_u) * gate_s[:, None, :]
                 h = F.silu(g) * (torch.bmm(xg, up_u) * up_s[:, None, :])
                 y = torch.bmm(h, v)  # [E, n, f]
                 weighted = torch.einsum(

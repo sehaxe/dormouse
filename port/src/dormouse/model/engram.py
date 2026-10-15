@@ -33,6 +33,7 @@ import math
 from collections.abc import Sequence
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from ..instrument import Counters, loud
@@ -41,6 +42,10 @@ FNV_OFFSET_BASIS = 1469598103934665603  # burn's constant, verbatim (NOT 2^40·s
 FNV_PRIME = 1099511628211
 FNV_MASK64 = (1 << 64) - 1
 KEY_MASK = 0x7FFF_FFFF  # 31 bits: burn's i32-safe truncation
+
+#: The pad value `slots_for` uses for the byte slot a window does NOT reach —
+#: impossible for real bytes (0..255), so a fold on it is always a no-op.
+_PAD_BYTE = 256
 
 
 def fnv(data: bytes | Sequence[int]) -> int:
@@ -62,6 +67,33 @@ def raw_keys(byte_ids: Sequence[int], orders: Sequence[int]) -> list[list[int]]:
             s = max(0, e - order)
             row.append(fnv(byte_ids[s:e]) & KEY_MASK)
         out.append(row)
+    return out
+
+
+def slot_keys_gpu(input_ids: torch.Tensor, orders: Sequence[int]) -> torch.Tensor:
+    """The burn-identical keys, computed ON THE DEVICE — all torch ops.
+
+    The host form (`raw_keys`) walked a python list per position — a
+    GPU→CPU sync every forward, 15.6 ms/fwd in the profiler probe, and the
+    single thing that graph-broke torch.compiled(dynamo) (an int64-overflow
+    python literal inside the traced region). This version walks the LAGS
+    (o-1..0): a window fold is `h = (h ^ byte) · prime & mask64`, bytes
+    folded oldest→newest; a byte a window does not reach (position < lag)
+    folds as a no-op via the impossible pad byte — the EXACT window
+    semantics of `raw_keys` (`s = max(0, e - order)`), vectorized. int64
+    multiply wrapping is what this hash REQUIRES (`& FNV_MASK64` restates
+    the wrap); GPU/CPU agreement is pinned by test.
+    """
+    b, t = input_ids.shape
+    dev = input_ids.device
+    out = torch.empty(b, t, len(orders), dtype=torch.int64, device=dev)
+    for oi, order in enumerate(orders):
+        h = torch.full((b, t), FNV_OFFSET_BASIS, dtype=torch.int64, device=dev)
+        for lag in range(order - 1, -1, -1):
+            byte = F.pad(input_ids, (lag, 0), value=_PAD_BYTE)[:, :t]
+            folded = ((h ^ byte) * FNV_PRIME) & FNV_MASK64
+            h = torch.where(byte < _PAD_BYTE, folded, h)
+        out[:, :, oi] = h & KEY_MASK
     return out
 
 
@@ -91,10 +123,14 @@ class Engram(nn.Module):
         self.value_proj = nn.Linear(self.dim, self.d, bias=False, device=device)
 
     def slots_for(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """`[b, t, n_orders]` slot indices — the model masks, per burn."""
-        ids = input_ids.detach().to("cpu").tolist()
-        keys = [raw_keys(row, self.orders) for row in ids]
-        t = torch.tensor(keys, dtype=torch.long, device=input_ids.device)
+        """`[b, t, n_orders]` slot indices — the model masks, per burn.
+
+        The keys are now computed on the device (`slot_keys_gpu`): the same
+        FNV-64 digest, no `.tolist()` sync, and nothing for dynamo to choke
+        on. The burn-identical contract is now pinned by the pinned-value
+        test rather than by the sharing of a python function.
+        """
+        t = slot_keys_gpu(input_ids, self.orders)
         assert t.shape == (*input_ids.shape, len(self.orders)), f"key shape {tuple(t.shape)}"
         return t & (self.slots - 1)
 
