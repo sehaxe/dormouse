@@ -43,25 +43,45 @@ JORDAN_NS_COEFFS = (3.4445, -4.7750, 2.0315)
 
 
 def zeropower_via_ns(g: torch.Tensor, steps: int = 5) -> torch.Tensor:
-    """The polar factor's polynomial approximation, matrix-only, fp32."""
-    assert g.ndim == 2, f"NS is matrix-only, got shape {tuple(g.shape)}"
+    """The polar factor's polynomial approximation, matrix-only, fp32.
+
+    The batched form accepts `[N, d0, d1]`: the polynomial is ELEMENTWISE in
+    the leading batch dim (a Gram per slice), and `x @ x.T` broadcasts
+    unchanged, so the same math runs for N slices at once — that is the
+    whole point of the batched Muon pass (version-branched off the same
+    body, no second implementation exists here).
+    """
+    if g.ndim == 2:
+        a, b, c = JORDAN_NS_COEFFS
+        x = g.to(torch.float32)
+        x = x / (x.norm() + 1e-7)
+        transposed = x.shape[0] > x.shape[1]
+        if transposed:
+            x = x.T.contiguous()
+        for _ in range(steps):
+            gram = x @ x.T
+            poly = b * gram + c * (gram @ gram)
+            x = a * x + poly @ x
+        return x.T.contiguous() if transposed else x
+    assert g.ndim == 3, f"NS is matrix-only or [N,d0,d1] batched, got shape {tuple(g.shape)}"
     a, b, c = JORDAN_NS_COEFFS
     x = g.to(torch.float32)
-    x = x / (x.norm() + 1e-7)
-    transposed = x.shape[0] > x.shape[1]
+    x = x / (x.norm(dim=(1, 2), keepdim=True) + 1e-7)
+    transposed = x.shape[1] > x.shape[2]
     if transposed:
-        x = x.T.contiguous()
+        x = x.transpose(1, 2).contiguous()
     for _ in range(steps):
-        gram = x @ x.T
+        gram = x @ x.transpose(1, 2)
         poly = b * gram + c * (gram @ gram)
         x = a * x + poly @ x
-    return x.T.contiguous() if transposed else x
+    return x.transpose(1, 2).contiguous() if transposed else x
 
 
 def colrow_normalize(x: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
     """`Norm_d` for `NormDir::ColRow` (the trainer's choice): columns, then rows."""
-    x = x / (x.norm(dim=0, keepdim=True) + eps)
-    return x / (x.norm(dim=1, keepdim=True) + eps)
+    dim = (1, 2) if x.ndim == 3 else 0
+    x = x / (x.norm(dim=dim, keepdim=True) + eps)
+    return x / (x.norm(dim=(1, 2) if x.ndim == 3 else 1, keepdim=True) + eps)
 
 
 class Muon(Optimizer):
@@ -97,6 +117,60 @@ class Muon(Optimizer):
                 scale = max(1.0, p.shape[0] / p.shape[1]) ** 0.5
                 p.add_(update.to(p.dtype), alpha=-lr * scale)
         return loss
+
+    def batched_step_from_model(self, model) -> int:
+        """The shape-batched Muon pass (a no-op when the batches are trivially small).
+
+        The per-param loop above re-derives identical-shape Newton-Schulz
+        computations for EACH expert separately — 46,341 `aten::mm` launches
+        for ONE step of b1 (the 2026-10-15 profiler probe at b8·s512: 6.9 s
+        of a 7.2 s step, 84% of the CPU on per-tensor dispatches). The fix,
+        one regex that mirrors the padded-MoE banked-bmm lesson: per UNIQUE
+        parameter shape, stack the momentum buffers (and the grads) via view
+        [N, d0, d1]; the SAME NS math inside runs unchanged; then scatter
+        back. The scaled `max(1, d0/d1)^0.5` case is the SAME for the whole
+        shape, so it stays a scalar.
+        """
+        by_shape: dict[tuple[int, int], list] = {}
+        for group in self.param_groups:
+            lr, mu, ns = group["lr"], group["momentum"], group["ns_steps"]
+            for p in group["params"]:
+                if p.grad is None or p.grad.ndim != 2:
+                    continue
+                by_shape.setdefault((p.shape[0], p.shape[1]), []).append(p)
+        n_batches = 0
+        for shape, params in by_shape.items():
+            for p in params:
+                state = self.state[p]
+                if "momentum" not in state:
+                    state["momentum"] = torch.zeros_like(p)
+            if len(params) < 2:
+                # Match the per-param math exactly: one computation per tensor.
+                for p in params:
+                    g = p.grad
+                    state = self.state[p]
+                    buf = state["momentum"]
+                    buf.mul_(mu).add_(g, alpha=1.0 - mu)
+                    update = colrow_normalize(zeropower_via_ns(buf, ns))
+                    scale = max(1.0, shape[0] / shape[1]) ** 0.5
+                    with torch.no_grad():
+                        p.add_(update.to(p.dtype), alpha=-lr * scale)
+                continue
+            n = len(params)
+            bufs = torch.stack([self.state[p]["momentum"] for p in params])
+            grads = torch.stack([p.grad for p in params])
+            bufs.mul_(mu).add_(grads.detach(), alpha=1.0 - mu)
+            update = colrow_normalize(zeropower_via_ns(bufs, ns))
+            scale = max(1.0, shape[0] / shape[1]) ** 0.5
+            updates = update.mul(-lr * scale).detach()
+            for i, p in enumerate(params):
+                with torch.no_grad():
+                    p.add_(updates[i].to(p.dtype))
+            for i, p in enumerate(params):
+                with torch.no_grad():
+                    self.state[p]["momentum"].copy_(bufs[i])
+            n_batches += 1
+        return n_batches
 
 
 def is_muon_param(name: str, p: torch.Tensor) -> bool:
@@ -148,6 +222,11 @@ class MixOptimizer:
         #: Let a caller (the trainer, the smoke test) keep looking at the groups.
         self.n_muon, self.n_adamw = len(muon_params), len(adamw_params)
         self.steps = 0
+        #: The SHAPE answer: identical-shape parameters update as ONE stack.
+        #: The per-param loop cost 84% of b1's step in per-tensor dispatches.
+        self.muon_params = muon_params
+        self.model = model
+        self.steps_batched = 0
 
     def zero_grad(self, set_to_none: bool = True) -> None:
         if self.muon is not None:
@@ -155,8 +234,10 @@ class MixOptimizer:
         self.adamw.zero_grad(set_to_none=set_to_none)
 
     def step(self) -> None:
+        """The mixed step: the batched Muon per shape ( Platzhalter-kill), AdamW per group."""
         if self.muon is not None:
-            self.muon.step()
+            n_batched = self.muon.batched_step_from_model(self.model)
+            self.steps_batched = n_batched
         self.adamw.step()
         self.steps += 1
 
