@@ -438,3 +438,40 @@ Consequences, stated honestly:
    `docs/reviews/upstream-issue-autotune-candidate-coin-flip.md`.
 5. **LittleBit lane**: design note + 9M A/B now (GPU-light, parallel), or after
    the first model ships.
+
+## 7. The port lane (started 2026-10-15, owner's go on the substrate verdict)
+
+The PyTorch port lives in `port/` inside this repo (one git, shared docs; no
+new repo). Toolchain per the owner's intake: **uv (envs/deps), ruff (lint/
+format), pytest (tests)**, Python 3.12, torch 2.13+cu129 (the spike's measured
+stack). Day-one skeleton = config schema (strict, loud unknown keys), the model
+stack, a byte-data cell, the trainer loop with the instrument layer, WSD
+schedule, checkpoints with config-snapshot refusal, and CPU tests. GPU pieces
+land only after spike phase 2's gates close (FLA-on-sm120 verdict, fused
+grouped MoE, fp8 experts).
+
+**Architecture decisions baked in from the record (not renegotiated per file):**
+- Custom code stays at the minimum the ecosystem lacks: TSCT (STE-quantized
+  low-rank experts — the dual-latent GLU variant per TSCT2 §14, rank
+  configurable), Engram host tables (FNV byte n-grams, host optimizer), and
+  the ByteFlow patcher hook (interface only until its criterion is validated).
+  Everything else is a dependency: FLA for KDA (optional, LOUD when absent;
+  SDPA is the COUNTED fallback and the CPU test path), Liger/RMSNorm+CE
+  fusions, torchao/fp8 for the quant ladder, bitsandbytes paged optimizers
+  where VRAM calls for it.
+- Precision plan at init: bf16 activations/weights, fp32 KDA state + softmax +
+  loss; the quant ladder (fp8 → NVFP4 → LittleBit sign+scales) exists as
+  config exactly as the burn side spelled it
+  (`docs/reviews/littlebit-design-2026-10-15.md` gates carry over verbatim).
+- Continuing invariants from the burn lessons (ADR-0011/0016/0018/0021): the
+  instrument layer is day-one code, not an addition — every degradation
+  carries a LOUD/COUNTED/SILENT mark, device counters are read at declared
+  cadences, and resume refuses a config whose resolved values differ
+  (progress keys exempt).
+- Model shape constants come from §2.2/§2.3 of the plan (b1 ≈ 0.92B total,
+  57M active; `small` at 9.2M remains the A/B polygon with a port preset of
+  the same name and the same param count) so arm verdicts transfer across the
+  substrate.
+
+Burn lanes pause while the port lane is active (one lane at a time; the burn
+stack stays green and untouched as the fallback).
