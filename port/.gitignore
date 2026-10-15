@@ -1,0 +1,6 @@
+# The uv environment, tool caches and run artifacts are not source.
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+checkpoints/

@@ -1,0 +1,124 @@
+"""Config seam: strict keys, loud refusals, and the ported presets."""
+
+from __future__ import annotations
+
+import pytest
+
+from dormouse.config import (
+    PROGRESS_KEYS,
+    ModelConfig,
+    RunConfig,
+    TrainConfig,
+    load_preset,
+    load_run,
+    parse_preset,
+)
+from dormouse.instrument import LoudError
+
+
+def test_presets_load_and_validate():
+    small = load_preset("small")
+    assert (small.d_model, small.n_heads, small.head_dim) == (768, 12, 64)
+    assert small.n_experts == 3 and small.moe_topk == 0
+    assert small.engram_rows == 25000 and small.engram_orders == [2, 3, 4]
+    b1 = load_preset("b1")
+    assert (b1.d_model, b1.n_heads, b1.head_dim, b1.d_ffn) == (2048, 32, 64, 5461)
+    assert b1.n_experts == 1024 and b1.moe_topk == 2 and b1.max_iter == 2
+    assert b1.engram_rows == 4_000_000 and b1.shared_rank == 192
+
+
+def test_unknown_key_refuses_and_names_the_escape():
+    """(a) An unknown key is a LOUD error naming the key and the escape."""
+    with pytest.raises(LoudError) as e:
+        parse_preset("d_model = 64\nn_heads = 4\nhead_dim = 16\nnot_a_key = 3\n")
+    msg = str(e.value)
+    assert "not_a_key" in msg
+    assert "remove the key" in msg and "port the mechanism" in msg
+    # A typo in a real key is the same class, and it must not silently default.
+    with pytest.raises(LoudError):
+        parse_preset("d_models = 64\n")
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "mechanism"),
+    [
+        ("use_gr", "true", "Gated Residual"),
+        ("use_mhc", "true", "Hyper-Connections"),
+        ("use_mor", "true", "Mixture-of-Recursions"),
+        ("use_situ", "true", "SiTU-GLU"),
+        ("use_byteflow", "true", "ByteFlow"),
+        ("jepa_weight", "0.05", "JEPA"),
+        ("dspark_weight", "0.1", "DSpark"),
+        ("aux_fb_weight", "0.1", "future-byte"),
+        ("moe_lb_coef", "0.01", "load-balancing"),
+        ("act_quant", '"int8"', "activation quantization"),
+    ],
+)
+def test_missing_mechanisms_refuse_when_non_default(key, value, mechanism):
+    """(a) A key whose mechanism is missing REFUSES when set non-default."""
+    with pytest.raises(LoudError) as e:
+        parse_preset(f"d_model = 64\nn_heads = 4\nhead_dim = 16\n{key} = {value}\n")
+    msg = str(e.value)
+    assert key in msg and mechanism in msg
+    assert "not ported" in msg and "remove the key or port the mechanism" in msg
+
+
+@pytest.mark.parametrize("rung", ["fp8", "fp16", "fp4", "nvfp4", "lbit", "ternary", "int4"])
+def test_quant_ladder_rungs_refuse_at_load(rung):
+    """(e) The STE/ladder stub refuses per rung, by name, at LOAD."""
+    with pytest.raises(LoudError) as e:
+        parse_preset(f'd_model = 64\nn_heads = 4\nhead_dim = 16\nquant = "{rung}"\n')
+    msg = str(e.value)
+    assert rung in msg
+    assert 'quant = "none"' in msg
+    # And the shipped presets use only the ported rung.
+    assert ModelConfig().quant == "none"
+
+
+def test_train_key_refusals():
+    """The train half has the same two rules."""
+    with pytest.raises(LoudError) as e:
+        load_run("small", train_overrides={"engram_ram": True})
+    assert "engram_ram" in str(e.value) and "not ported" in str(e.value)
+    with pytest.raises(LoudError) as e:
+        load_run("small", train_overrides={"nope": 1})
+    assert "nope" in str(e.value) and "remove the" in str(e.value)
+    with pytest.raises(LoudError) as e:
+        load_run("small", train_overrides={"opt": "adan"})
+    assert "adan" in str(e.value)
+
+
+def test_missing_key_takes_the_class_default():
+    cfg = parse_preset("d_model = 128\nn_heads = 2\nhead_dim = 64\n")
+    assert cfg.d_ffn == 2048  # the schema default
+    assert cfg.engram_lam_max == 0.5
+    assert cfg.bf16 is True
+
+
+def test_validation_is_loud_not_clamping():
+    with pytest.raises(LoudError, match="tile the residual width"):
+        parse_preset("d_model = 100\nn_heads = 3\nhead_dim = 64\n")
+    with pytest.raises(LoudError, match="refused, not clamped"):
+        parse_preset("d_model = 64\nn_heads = 4\nhead_dim = 16\nn_experts = 2\nmoe_topk = 3\n")
+    with pytest.raises(LoudError, match="outside"):
+        parse_preset("d_model = 64\nn_heads = 4\nhead_dim = 16\nengram_lam_max = 1.5\n")
+
+
+def test_seq_len_cannot_exceed_max_seq_len():
+    with pytest.raises(LoudError, match="max_seq_len"):
+        load_run("small", train_overrides={"seq_len": 4096})
+
+
+def test_snapshot_round_trip_and_progress_exemption():
+    run = load_run("small", train_overrides={"steps": 5, "ckpt_name": "x"})
+    back = RunConfig.from_snapshot(run.snapshot_toml())
+    assert back.diff_keys(run) == []
+    # Progress keys are exempt: extending a run is a legal resume.
+    from dataclasses import replace
+
+    longer = replace(run, train=replace(run.train, steps=999, log_every=1, eval=True))
+    assert longer.diff_keys(run) == []
+    assert set(PROGRESS_KEYS) <= set(TrainConfig().__dataclass_fields__)
+    # Anything else is not.
+    hotter = replace(run, train=replace(run.train, lr=run.train.lr * 2))
+    assert hotter.diff_keys(run) == ["train.lr"]

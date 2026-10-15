@@ -1,0 +1,121 @@
+# port preset: b1 — the 1B shape of the readiness plan §2.2, with the expert
+# price CORRECTED (see below). No GPU run has ever been made with this config;
+# it is a pre-registered shape, not a measured recipe.
+#
+# d 2048 · H 32x64 · d_ffn 5461 · rank 64 · max_iter 2 · E 1024 experts, topk 2 ·
+# Engram 4M rows/order x 3 orders x dim 32.
+
+d_model = 2048
+n_heads = 32
+head_dim = 64
+d_ffn = 5461
+vocab = 256
+max_seq_len = 2048
+max_iter = 2
+rank = 64
+norm_eps = 0.001
+
+bf16 = true
+quant = "none"
+
+use_kda = true
+use_tsct = true
+use_engram = true
+use_attnres = false
+
+n_experts = 1024
+moe_topk = 2
+moe_capacity = 1.0
+# TSCT2 §13.4: writing only into a 64-dim subspace gives too small an R_act;
+# §14 answers with a shared expert of rank ~192-256 next to the routed r=64.
+shared_rank = 192
+
+# Engram: 4M rows/order, each table rounded UP to a power of two -> 4 194 304
+# rows/order x 3 x 32 = 402 653 184 rows. (The plan §2.2 table's "402M" is the
+# rounded value; the nominal 4M/order would be 384M.)
+engram_rows = 4000000
+engram_orders = [2, 3, 4]
+engram_dim = 32
+engram_lam_max = 0.5
+
+# Keys whose mechanisms are NOT ported — off, and a non-default value refuses.
+use_gr = false
+use_mhc = false
+use_mor = false
+use_situ = false
+use_byteflow = false
+moe_lb_coef = 0.0
+jepa_weight = 0.0
+dspark_weight = 0.0
+aux_fb_weight = 0.0
+act_group = 0
+
+# ===========================================================================
+# THE EXPERT PRICE, CORRECTED — this is the one count that CHANGES vs plan §2.2
+# ===========================================================================
+#
+# Plan §2.2 prices the expert bank as `1024 x (2048*64 + 64*5461 + s) ~ 492M`:
+# a single `d -> r` latent (`U [2048, 64]`), the scale vector, and one
+# `r -> f` write. The plan's own carried caveat says the term "has no
+# down-projection" (readiness plan §4.1).
+#
+# The port implements TSCT2 §14's expert (docs/reviews/tsct2-design-2026-10-04.md),
+# which changes the price in three ways, all of them the design's own:
+#
+#  1. TWO latents, one for gate and one for up, with the GLU at the LATENT.
+#     §13.3 names the shared-latent version as a defect: with one latent the
+#     GLU is a rescaling of a single subspace. +`d*r` per expert.
+#  2. the write goes through ONE shared `[5461 -> 2048]` projection, shared by
+#     every routed expert and by the shared expert (`models/experts.py`'s
+#     `down`). That is the missing down-projection, folded once (+11.2M).
+#  3. an always-on shared expert at rank 192 (TSCT2 §14's R_act >= 192).
+#
+# Per routed expert: 2*(d*r + r) + r*f = 2*(2048*64 + 64) + 64*5461 = 611 776
+#
+# PARAM COUNT, computed by hand and pinned by tests/test_param_count.py against
+# the model instantiated on the `meta` device (port: 1 066 354 113):
+#
+#   embed (256x2048)                                      524 288
+#   lm_head TSCT(2048->256, r=64)                         147 520
+#   RMSNorm x2 (loop, final)                                4 096
+#   controller (2*2048 -> 3 gates, no bias)                12 288
+#   KDA q,k,v,g (4x2048^2) + beta (2048*32)            16 842 752
+#   1024 routed experts, 1024 x 611 776               626 458 624
+#   shared expert (rank 192)                            1 835 328
+#   shared write [5461 -> 2048]                        11 184 128
+#   router (2048 -> 1024, no bias)                      2 097 152
+#   Engram tables (3 x 4 194 304 x 32)                402 653 184
+#   Engram query/key/value projs                          132 096
+#   mem_dense (2048 -> 2048 + bias)                     4 196 352
+#   out_proj TSCT(2048 -> 2048, r=64)                     262 208
+#   iter_embed (2 x 2048) + residual_scale                  4 097
+#   ------------------------------------------------- ---------
+#   total                                           1 066 354 113
+#
+# AGAINST PLAN §2.2's TABLE (component by component, so a reader can check):
+#
+#   | component                       | plan §2.2 | port      | delta   |
+#   |---------------------------------|-----------|-----------|---------|
+#   | embedding + lm_head (vocab)     |    1.0M   |  0.67M    | -0.33M  |
+#   | KDA (q,k,v,g + beta)            |   16.9M   | 16.84M    | -0.06M  |
+#   | Engram dense+router+out_proj    |   10.5M   |  6.71M    | -3.79M  |
+#   | Engram tables (4M rows/order)   |    402M   | 402.65M   | +0.65M  |
+#   | TSCT experts (routed+shared+down)|  492.2M  | 639.48M   | +147.3M |
+#   | total                           |  922.6M   | 1066.35M  | +143.8M |
+#
+# (`922.6M` is the §2.2 table's own component sum, which the plan rounds to
+# "~0.92B ≈ 1B".)
+#
+# The single dominant mismatch is the expert bank: +147.3M = the second
+# gate/up latent (+134.3M), the shared down projection (+11.2M) and the shared
+# expert (+1.8M) — the three corrections TSCT2 §14 makes to the §2.2 price.
+# The other rows are within a few M, and the "Engram dense+router+out_proj"
+# row is smaller in the port because the port carries no aux heads and its
+# controller is three gate columns (the router is a separate linear here).
+#
+# ACTIVE COMPUTE per token is NOT the plan's 57M figure either: the port runs
+# the shared expert and the shared write at every pass, so the touched
+# parameter set is ~37.9M per iteration (~75.9M over both) vs the plan's ~57M
+# for both. The two numbers may not be the same quantity (the plan does not say
+# whether "active per token (train, both iters)" counts the loop's passes
+# separately or the unique parameters); treat this line as derived, not measured.

@@ -1,0 +1,93 @@
+# port preset: small — the A/B polygon, same geometry as burn's configs/small.toml.
+#
+# Ported from the burn side (docs/decisions/2026-10-15-1b-readiness-plan.md §7:
+# "`small` at 9.2M remains the A/B polygon with a port preset of the same name"),
+# with three deliberate deviations, each named where it bites:
+#
+#  1. `bf16 = true` (burn ships false). The port's init path IS the bf16 plan
+#     (docs/architecture/bf16-plan.md): bf16 matmuls with fp32 masters, fp32
+#     state between arms. burn's `small.toml` predates its own 0.22 bf16
+#     measurements; on the port there is no "storage bf16, compute fp32" mode
+#     to preserve.
+#  2. `jepa_weight = 0.0` (burn ships 0.05). The aux heads (JEPA+KoLeo/DSpark/
+#     future-byte) are NOT in the day-one port, and a non-zero weight REFUSES
+#     at load rather than being silently dropped — the key is kept in the
+#     schema for exactly that refusal.
+#  3. the expert is TSCT2 §14's dual-latent GLU with a shared write and an
+#     always-on shared expert (see configs/b1.toml for the full arithmetic).
+#
+# PARAM COUNT, computed by hand and pinned by tests/test_param_count.py against
+# the instantiated model (port: 9 476 993; burn's `small`, measured
+# 2026-10-01 on its own instantiated model: 9 197 390 — delta +279 603, +3.0%):
+#
+#   embed (256x768)                                196 608
+#   lm_head TSCT(768->256, r=64)                    65 600
+#   RMSNorm x2 (loop, final)                         1 536
+#   controller (2*768 -> 3 gates, no bias)           4 608
+#   KDA q,k,v,g (4x768^2) + beta (768*12)        2 368 512
+#   3 routed experts, 3 x 229 504                  688 512
+#   shared expert (rank 192)                       688 512
+#   shared write [2048 -> 768]                   1 572 864
+#   router (768 -> 3)                                2 304
+#   Engram tables (3 x 32 768 x 32)              3 145 728
+#   Engram query/key/value projs                    50 176
+#   mem_dense (768 -> 768 + bias)                  590 592
+#   out_proj TSCT(768 -> 768, r=64)                 98 368
+#   iter_embed (4 x 768) + residual_scale            3 073
+#   --------------------------------------------- ---------
+#   total                                        9 476 993
+#
+# The delta is structural, not a typo: the port pays a shared write and a
+# shared expert the burn small does not have, and does not pay the aux heads
+# (~1.2M) or the per-expert down factor burn's TSCT experts each carry.
+
+d_model = 768
+n_heads = 12
+head_dim = 64
+d_ffn = 2048
+vocab = 256
+max_seq_len = 512
+max_iter = 4
+rank = 64
+norm_eps = 0.001
+
+bf16 = true
+# The quant ladder is config-only on day one: `fp8`/`nvfp4`/`lbit`/`ternary`
+# refuse at load (per rung, naming the escape). `none` = bf16 factors.
+quant = "none"
+
+use_kda = true
+use_tsct = true
+use_engram = true
+use_attnres = false
+
+# burn's small runs the DENSE blend (moe_topk = 0) over 3 experts; the sparse
+# dispatch is the A/B this arm's control is measured against.
+n_experts = 3
+moe_topk = 0
+moe_capacity = 1.0
+shared_rank = 192
+
+# Hashed n-gram memory. 25 000 rows/order x 3 orders x 32 dim, each table
+# rounded UP to a power of two by the in-VRAM masking read (`engram_tables`),
+# so what is built is 3 x 32 768 x 32 = 3 145 728 rows = 33.2% of the port's
+# small (burn measured 34.2% of its 9 197 390). Orders 2/3/4 are
+# `dormouse_data::ORDERS`, the set that replaced the dead 3/5/8.
+engram_rows = 25000
+engram_orders = [2, 3, 4]
+engram_dim = 32
+engram_lam_max = 0.5
+
+# Keys whose mechanisms are NOT ported, at their off values so the preset
+# loads. Setting any of them non-default refuses loudly at load, naming the
+# mechanism and the escape ("remove the key or port the mechanism").
+use_gr = false
+use_mhc = false
+use_mor = false
+use_situ = false
+use_byteflow = false
+moe_lb_coef = 0.0
+jepa_weight = 0.0
+dspark_weight = 0.0
+aux_fb_weight = 0.0
+act_group = 0
