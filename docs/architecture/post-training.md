@@ -15,6 +15,19 @@ I → J[Holdout] →|beats| K[Promote] →|no| L[Strategy review] → G
 
 ## RLVR — PPO + value head (not GRPO)
 
+### Reward shape for token thrift (MiMo-V2.6, 2610.11959 + 2609.32577)
+
+- **Multiplicative**: R = R_test · S_sol · S_beh (test pass × solution score × behavior score) — a zero in ANY factor cannot be bought back by the others.
+- **Group-relative length penalty** (2609.32577's shape, gated): `LP = 1 + α·(⌈quantile(passing_lengths, β) − len⌉ / q)` — only on PASSING group members, only when the group pass rate ≥ γ; the α/β/γ args are OURS to fit. MiMo's own live page shows length grew 1.9–2.1× in 30 steps even WITH the penalty — expect a slowdown, not a stop.
+- **Prompt-mean loss aggregation** (not token-mean): a terse correct answer counts as much as a verbose one; byte-thrift enters the loss, not just the reward.
+- **Grader economics**: MiMo buys credit via grader compute (12.7% pass = 1 in 8 needs judge reuse). At our scale the default is the deterministic verifier (code exec, exact match) + the heuristic quality proxy S_beh — a learned/LLM judge is a later, measured node.
+- Router FREEZE is their measured zero-cost fix (CV 0.78→2.0, cold experts 0.5%→22%); our LFB integrator covers the same failure mode at ≤1B — freeze only if A/B says so.
+
+### Byte-thrift contract (owner directive)
+`correct@budget(bytes)` — accuracy FOR a byte budget — is a first-class metric on every RL/eval report; "solved it, cheaply" is part of the success criterion of the self-evolve loop.
+
+
+
 - Value head V(s) bf16, GAE λ0.95, PPO clip 0.2, KL 0.01
 - reward = verifier_pass − λ_tokens·T − λ_cost·tools
 - Token-level advantage, not group-relative (GRPO is DPO, encourages verbosity)
