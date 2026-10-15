@@ -565,7 +565,33 @@ Reserved CLI surface (matches `docs/architecture/post-training.md`):
 `dormouse post-train --base … --env code,math --verifier hard` — wired after
 step 2 learns anything.
 
+### 7.2 The intelligence target (owner directive, 2026-10-15 late)
 
+**"Maximally smart, honest, critical-thinking — and byte-thrifty."** The
+owner's observation (smarter models spend FEWER tokens) becomes a design
+axis with instruments, not a vibe:
+
+1. **Bytes-to-solution is a first-class metric.** Every eval and RL report
+   carries `correct@budget(bytes)` — accuracy FOR a byte budget — alongside
+   the loss; the success criterion of the post-train loop includes
+   "solved it, cheaply" (the plan's own reward shape
+   `verifier_pass − λ_tokens·T` was already built for this; the research
+   found group-advantage methods push verbosity — a second reason for the
+   fork-replay-first order).
+2. **Data: terse-and-correct beats verbose-and-correct.** The mixture ranks
+   data where concise high-quality solutions live (code, worked math
+   without filler, tight prose); verbose churn is filtered by the same
+   quality gates already in the data queue.
+3. **Honesty mechanisms**: verifier-first rewards (anti-hack screens —
+   already in the research), self-verification traces in SFT data
+   (checkable steps), and byte-level BPB as the anti-hallucination anchor:
+   a model that asserts more than its memory supports pays in BPB.
+4. **Engram is the memory-boundedness ally**: hashed memory means facts
+   live outside weights; "known in memory vs fabricated in weights" is a
+   measurable gap (the `engram=` counter family).
+
+This rides the model, not a flag: the byte level + sparse active params +
+host memory is the architecture of thrift.
 
 Burn lanes pause while the port lane is active (one lane at a time; the burn
 stack stays green and untouched as the fallback).
