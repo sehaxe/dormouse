@@ -100,9 +100,18 @@ class Muon(Optimizer):
 
 
 def is_muon_param(name: str, p: torch.Tensor) -> bool:
-    """The membership rule, in one place, checked by a test."""
+    """The membership rule, in one place, checked by a test.
+
+    burn's policy (AGENTS §3.5 item 3, `core/src/routing.rs`): 2-D linear maps
+    go to Muon; **embeddings, the output head, the controller, the MoE router
+    and the Engram tables go to AdamW** — orthogonalization hurts or ignores
+    them. The literal "everything-2-D" rule is the defect the router agent
+    flagged; this is the honest mirror.
+    """
     if name.endswith("tables"):
         return False  # the hashed-memory table: Adam, orthogonalization is meaningless
+    if any(t in name for t in ("embed", "lm_head", "controller", "router")):
+        return False  # orthogonalization hurts them (burn's measured policy)
     return p.ndim == 2 and p.shape[0] > 1 and p.shape[1] > 1
 
 

@@ -31,13 +31,18 @@ def test_wsd_warmup_peak_and_decay():
 
 
 def test_optimizer_routing(tiny):
-    """2-D (both dims > 1) goes to Muon; 1-D, the s-scales and the tables do not."""
+    """burn's routing policy, mirrored: linear maps to Muon, the excluded names to AdamW."""
     model = DormouseModel(tiny)
     assert is_muon_param("loop.attn.q_proj.weight", torch.zeros(64, 64))
     assert is_muon_param("loop.out_proj.u", torch.zeros(64, 8))
     assert not is_muon_param("loop.engram.tables", torch.zeros(3, 64, 8))
     assert not is_muon_param("loop.out_proj.s", torch.zeros(8))
     assert not is_muon_param("loop.residual_scale", torch.zeros(1))
+    # orthogonalization hurts them (burn's measured routing policy, ADR-listed)
+    assert not is_muon_param("embed.weight", torch.zeros(256, 8))
+    assert not is_muon_param("lm_head.weight", torch.zeros(256, 8))
+    assert not is_muon_param("loop.controller.gates", torch.zeros(3, 8))
+    assert not is_muon_param("loop.experts.router.weight", torch.zeros(8, 8))
     mix = MixOptimizer(model, lr=1e-3, wd=0.0)
     assert mix.routing["loop.engram.tables"] == "adamw"
     assert mix.routing["loop.out_proj.s"] == "adamw"
