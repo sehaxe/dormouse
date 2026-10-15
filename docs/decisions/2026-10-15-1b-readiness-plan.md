@@ -459,6 +459,19 @@ grouped MoE, fp8 experts).
   SDPA is the COUNTED fallback and the CPU test path), Liger/RMSNorm+CE
   fusions, torchao/fp8 for the quant ladder, bitsandbytes paged optimizers
   where VRAM calls for it.
+- **Where Rust stays (owner go, 2026-10-15): the three custom CPU mechanisms —
+  the data pipeline (`crates/dormouse-data`: byte streaming, FNV n-gram
+  hashing, ring, split), the Engram host tables and their per-step update
+  (`train/src/offload.rs`), and eventually the ByteFlow patcher — are KEPT IN
+  RUST as a small PyO3 extension (`port/ffi/`, own crate outside the root
+  workspace, built by maturin through uv), not rewritten in Python.** They
+  are pure CPU, already written and battle-tested for years, and two of them
+  run per step at millions of rows (the host-table update); Python glue calls
+  the minimal ABI. The skeleton's Python `data.py` stays as the interface
+  definition and fallback — the Rust binding must match it on a parity test,
+  so nothing is hidden. GPU-side Rust buys nothing (torch owns the accelerators
+  there) — a whole-trainer-in-Rust/tch-rs rewrite is rejected: glue wins in
+  Python, hot loops on GPU, hot loops on CPU stay Rust.
 - Precision plan at init: bf16 activations/weights, fp32 KDA state + softmax +
   loss; the quant ladder (fp8 → NVFP4 → LittleBit sign+scales) exists as
   config exactly as the burn side spelled it
