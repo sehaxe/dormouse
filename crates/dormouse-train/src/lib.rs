@@ -1171,6 +1171,11 @@ pub fn train_loop(
     // item 4). Deleting the counter would delete the only record of firewall
     // firings.
     let mut nan_reads = 0u32;
+    // Consecutive log windows with a non-finite loss. The per-window masked
+    // counter saturates at 1 (measured 2026-10-11: a NaN-poisoned 600-step run
+    // printed "firewall: 1 non-finite loss read(s)" every window and exited 0),
+    // so persistence across windows is the signal that has to be counted.
+    let mut nan_windows = 0u32;
     // The JEPA span mask is the only stochastic input to a step, and it is a
     // pure function of `(cfg.seed, step)` — so a resume redraws the same mask
     // the interrupted run used and two A/B arms differ only in the arm
@@ -1391,6 +1396,24 @@ pub fn train_loop(
                 // declaration: the consumer is ADR-0021 item 4's report.
                 nan_reads += 1;
                 let _ = nan_reads;
+                // The gap the 2026-10-11 diagnostic found: a run that drowns in
+                // NaN reports "1 non-finite loss read per log window" forever,
+                // because the mask fires once and the masked counter behind
+                // `masked >= 8` never accumulates - so a poisoned 600-step run
+                // exited rc=0 with a meaningless `best`. Two consecutive windows
+                // of non-finite loss is enough: the loss is not spiking, the run
+                // is dead, and a number taken from it is not a number.
+                nan_windows += 1;
+                if nan_windows >= 2 {
+                    return Err(format!(
+                        "step {step}: the loss has been non-finite for {nan_windows} log windows \
+                         - the model is broken, not spiking, and this run's numbers are void. \
+                         Reported best ce was {best:.3}. Cause on 0.22: \
+                         docs/research/2026-10-11-022-reads-unwritten-memory.md."
+                    ));
+                }
+            } else {
+                nan_windows = 0;
             }
             if ce.is_finite() && ce < best { best = ce; }
             // A step whose gradients were ALL non-finite (or whose loss was)
