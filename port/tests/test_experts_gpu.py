@@ -87,6 +87,9 @@ def test_both_arms_drop_the_same_rows_and_count_them_twice_the_same(monkeypatch)
     padded = moe._dispatch(x, weight, index, padded_c)
     monkeypatch.setattr(moe, "_padded_reason", lambda _x: "forced: naive for the counter parity")
     naive = moe._dispatch(x, weight, index, naive_c)
+    # The drop counter is DEVICE-side now (no per-pass sync): drain once, then
+    # treat the numbers exactly like int counters again.
+    assert padded_c.drain() and naive_c.drain()
     print(
         f"[moe drops] padded={padded_c['moe_dropped_assignments']} "
         f"naive={naive_c['moe_dropped_assignments']} rows={index.numel()}"

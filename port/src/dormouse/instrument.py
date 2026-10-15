@@ -22,6 +22,8 @@ from __future__ import annotations
 import time
 from typing import NoReturn
 
+import torch
+
 
 class LoudError(RuntimeError):
     """A degradation that stops the run, naming cause and escape.
@@ -46,13 +48,53 @@ class Counters(dict):
     (`engram_rows`), or that the loop ran (`iter`). A zero entry is a
     statement of its own — `kda_fla=0` means the fast path is not on this
     machine, not that it was slow.
+
+    Device-side counters (`count_device`) stay on their device until the
+    trainer drains the whole window once per log cadence — no per-pass
+    GPU→CPU read survives, which is what blocked torch.compile's graphs in
+    the arm-level probe (the `int((~keep).sum())` sync, now a device counter).
     """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._device: dict[str, torch.Tensor] = {}
 
     def count(self, name: str, n: int = 1) -> None:
         if n == 0:
             return
+        if isinstance(n, torch.Tensor):
+            self.count_device(name, n)
+            return
         assert isinstance(n, int) and n > 0, f"counter {name}: n must be > 0, got {n!r}"
         self[name] = self.get(name, 0) + n
+
+    def count_device(self, name: str, n: torch.Tensor) -> None:
+        """A DEVICE-side counter: `n` stays on its device; no host read.
+
+        This is the 0-sync rule (the port's rule 1.3): a counter built from a
+        device value must never call `.item()`. The drain happens ONCE per
+        window — `drain()` is called by the trainer on the log cadence only.
+        """
+        self._device[name] = self._device.get(name, 0) + n
+
+    def drain(self) -> dict[str, int]:
+        """Read every pending device counter ONE time, as a batch.
+
+        One GPU→CPU transfer for the whole window, at the log cadence's
+        declared cost. The pending state empties; counters stay honest.
+        """
+        out: dict[str, int] = {}
+        for name, t in list(self._device.items()):
+            out[name] = int(t.item()) if t.numel() == 1 else [int(x) for x in t.tolist()]
+            del self._device[name]
+        for name, value in out.items():
+            if isinstance(value, list):
+                for i, v in enumerate(value):
+                    if v:
+                        self.count(f"{name}[{i}]", v)
+            else:
+                self.count(name, value)
+        return out
 
     def line(self) -> str:
         """The one-line form, deterministic (sorted) so two runs' lines diff."""
@@ -61,6 +103,8 @@ class Counters(dict):
     def merge(self, other: Counters) -> None:
         for k, v in other.items():
             self.count(k, v)
+        for k, v in other._device.items():
+            self._device[k] = self._device.get(k, 0) + v
 
 
 class StepTimer:

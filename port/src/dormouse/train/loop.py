@@ -275,6 +275,11 @@ def train(
             opt.zero_grad(set_to_none=True)
 
         if (step + 1) % cfg.log_every == 0:
+            # The 0-sync rule: every DEVICE-side counter this window gathered
+            # is read NOW, in one batched GPU→CPU transfer, at the declared
+            # cadence — never per pass.
+            window.drain()
+            total.drain()
             if window_finite and not any(window_finite):
                 drowning += 1
             elif window_finite:

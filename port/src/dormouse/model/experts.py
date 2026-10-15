@@ -217,12 +217,16 @@ class SparseMoE(nn.Module):
         """
         return max(k, math.ceil(self.capacity * n * k / self.n_experts))
 
-    def _permute(self, index: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
+    def _permute(self, index: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """The routing permute: `(order, keep, dropped)` — one place, both arms.
 
         Both arms are permuted by the SAME rows and drop the SAME ones, which is
         what makes a parity run comparable and the drop count one number rather
-        than two opinions.
+        than two opinions. `dropped` STAYS A DEVICE TENSOR (a 0-dim int64
+        counter the caller's `Counters.count_device` accumulates): the early
+        form returned `int((~keep).sum())`, a per-forward GPU→CPU sync — one
+        of exactly two places that blocked torch.compile(dynamic) in the
+        arm-level probe (the other is the drain cadence itself, instrument.py).
         """
         n, k = index.shape
         flat_ids = index.reshape(-1)
@@ -231,9 +235,9 @@ class SparseMoE(nn.Module):
         counts = torch.bincount(sorted_ids, minlength=self.n_experts)
         offsets = torch.cumsum(counts, 0) - counts
         pos = torch.arange(n * k, device=index.device) - offsets[sorted_ids]
-        cap = self._capacity(n, k)
-        keep = pos < cap
-        return order, keep, int((~keep).sum())
+        keep = pos < self._capacity(n, k)
+        dropped = (~keep).sum().view(())
+        return order, keep, dropped
 
     def _padded_reason(self, x: torch.Tensor) -> str | None:
         """`None` if the padded bank can run THIS call, else the reason why not.
@@ -371,8 +375,11 @@ class SparseMoE(nn.Module):
         log cannot see is a defect).
         """
         order, keep, dropped = self._permute(index)
-        if dropped:
-            counters.count("moe_dropped_assignments", dropped)
+        # Count EVERY call: a python `if dropped:` on the device tensor is
+        # exactly the sync this counter exists to prevent (caught by the
+        # drop-parity test when the tensor stopped being an int). A zero add
+        # costs nothing once the drain batches it.
+        counters.count("moe_dropped_assignments", dropped)
         notes = []
         if self.moe_kernel == "triton":
             why = self._triton_reason(x)
