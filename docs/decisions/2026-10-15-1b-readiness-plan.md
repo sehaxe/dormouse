@@ -330,6 +330,34 @@ decides LAST — the order is (1) less code, (2) easier to maintain, (3) memory,
 `uv` for envs/deps, `ruff` for lint/format, `pytest` for tests; a torch-port
 decision starts with a `pyproject.toml` + ruff + pytest skeleton on day one.**
 
+**The torch ecosystem inventory (2026-10-15, owner: "максимально выжимаем
+память fp4/bf16/fp8 + открытые ядра") — a vanilla-torch spike number is NOT
+the torch verdict; the decision compares burn-at-its-best vs torch-at-its-best.**
+"Kitty" = **ThunderKittens** (HazyResearch), verified: a CUDA tile DSL whose
+kernels are callable from PyTorch, on Blackwell since 2025-03 (BF16 and FP8
+GEMM/attention), Vera Rubin support 2026-09; consumer sm_120 support is what
+the spike must PROBE, not assume. Relevant inventory:
+- **Attention/KDA kernels that already exist outside our hand-rolled stack**:
+  FLA (`flash-linear-attention` — the lineage burn-kda was transcribed from),
+  TK's linear-attention/DeltaNet kernels, triton scan kernels — on the torch
+  path the fused KDA backward is a DEPENDENCY, not a repair item (our §1.2
+  fused-adjoint debt dissolves).
+- **Precision/memory**: torch native fp8 `scaled_mm`, `torchao` (fp8/fp4/int4
+  + QAT), `bitsandbytes` paged optimizers, DeepSpeed ZeRO-offload, Liger
+  Kernel fused RMSNorm/SwiGLU/CE, gradient checkpointing.
+- **Launch overhead**: `torch.compile` reduce-overhead (CUDA graphs); at the
+  far end the TK Megakernel direction (a whole model in one kernel — the
+  maximal answer to the GPU-idle-87% measurement, "Low-Latency Llama-1B",
+  Megakernels repo). `train-tk` is the training-with-TK-kernels template.
+- **MoE**: TK fused token-dispatch + expert-GEMM ("Loads and Loads of Fluffy
+  Kittens", 2025-11), vLLM-class triton grouped GEMM.
+
+**Spike phase 2 (after the vanilla numbers land, same spike session)**:
+re-measure the loop-block step with the ecosystem's best available on sm_120
+(fp8 scaled_mm, compile+cudagraphs, Liger-class fusions, FLA/TK attention
+stand-in if installable) — the verdict table then carries torch-vanilla AND
+torch-max rows before the substrate decision is taken.
+
 ## 5. What I would NOT do (the traps)
 
 - **1M context before the first model.** KDA is O(n) and the arm exists, but
