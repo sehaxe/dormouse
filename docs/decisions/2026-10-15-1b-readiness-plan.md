@@ -537,5 +537,35 @@ grouped MoE, fp8 experts).
   custom allocators): reusable-good, not reusable-goal — performance and few
   owned lines first (owner directive).
 
+### 7.1 The post-training lane (SFT → RLVR → self-evolve; owner: RL in the framework, first-class)
+
+Grounded by `docs/research/2026-10-15-agentic-post-training.md` (SOTA read;
+the owner's `docs/architecture/post-training.md` was the start, confirmed OR
+corrected there). The research's own headline: **no paper does agentic RL at
+≤1B total / ≤100M active** — smallest published points are 0.5-3B — so every
+mechanism below is a transfer, and the queue starts cheapest-provable:
+
+1. **Verifier protocol + rollout runner on `code` only** (~300-500 LOC):
+   exec sandbox step, exact-match, per-decision logging; gate = a 20-task
+   smoke where every verifier decision is attributable.
+2. **Fork-replay advantage (CRR 2609.33875) + SFT spans**, A/B against a
+   GRPO-shaped group baseline at fixed wall-clock. CRR beat GRPO 41.7 vs
+   36.7 SWE-V at 14B with NO learned reward model — the owner's "PPO not
+   GRPO" instinct reads as: group-advantage methods collapse on all-fail
+   groups (2610.14000, at 1.5B); the PPO-vs-fork question gets measured.
+3. **Only if it learns**: control-plane EGGROLL (2511.16652; the owner's
+   bet: rank-r ES ~100× cheaper, routers/harness only) + the SEED-shaped
+   skill loop (2607.14777) with adaptive retirement (2609.20784) + anchored
+   self-play (2607.03523 anti-drift).
+4. Data side rides `docs/research/2026-10-15-data-strategy.md`: verifier
+   tasks synthesis → solvability screen → anti-hack; agent traces as SFT
+   spans (SWE-Gym/Open-SWE/ToolACE, Apache-2.0).
+
+Reserved CLI surface (matches `docs/architecture/post-training.md`):
+`dormouse post-train --base … --env code,math --verifier hard` — wired after
+step 2 learns anything.
+
+
+
 Burn lanes pause while the port lane is active (one lane at a time; the burn
 stack stays green and untouched as the fallback).
