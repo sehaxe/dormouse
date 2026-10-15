@@ -515,6 +515,23 @@ grouped MoE, fp8 experts).
   shared expert + its write per TSCT2 §14, minus burn's ~1.2M aux heads; the
   delta is pinned in `port/configs/small.toml` and its test, so cross-
   substrate arm verdicts read it and never silently compare counts).
+- **The ladder is DROPPED (owner, 2026-10-15): b1 directly.** The 100M rung's
+  promised transfers (LR transfer, capacity debugging) were derived, never
+  measured, and the owner called it: "no bonuses were given, go straight".
+  What remains is a 9.2M smoke (hours): correctness, arms engaged, speed vs
+  burn's 245 ms/step — a gate, not a rung. b1 is the first real run.
+- **Parity discipline (owner, 2026-10-15, applies to EVERY ported
+  mechanism): a golden-parity test against the burn crate, or a documented
+  numeric anchor, or the difference is named in the module doc.** The burn
+  crates' own oracle tests are the goldens (`vendor/dormouse-fused/crates/
+  burn-byteflow/tests/*_oracle.rs` carried values — the port replicates them
+  as pytest, same inputs, same expected values, named tolerance); where no
+  oracle exists the rule is the KDA one (a 10-line recurrent reference as
+  the anchor, the difference explained). "A lot of code, check it all" —
+  the port is held to the burn stack's numbers, not to vibes.
+- **Kernel interfaces stay pure** (torch in / torch out, no global state, no
+  custom allocators): reusable-good, not reusable-goal — performance and few
+  owned lines first (owner directive).
 
 Burn lanes pause while the port lane is active (one lane at a time; the burn
 stack stays green and untouched as the fallback).
