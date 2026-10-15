@@ -178,6 +178,7 @@ def test_topk_dispatch_touches_only_selected_experts(byte_tensor):
 
 
 def test_loss_decreases_on_fixed_bytes(tmp_path):
+    """Fixed synthetic bytes, 30 steps, determinant: loss descends."""
     """(b) 30 steps on fixed synthetic bytes at a fast lr: final < initial.
 
     Seeded, because an unseeded draw makes the gate itself a coin flip: at
@@ -197,6 +198,25 @@ def test_loss_decreases_on_fixed_bytes(tmp_path):
     assert report["loss"] < first, f"loss did not drop: {first} -> {report['loss']}"
     assert report["nan_skipped"] == 0
     assert report["opt_steps"] == run.train.steps
+
+
+def test_expert_bank_cache_serves_one_step_and_rejects_after_an_update():
+    """The research op-1: the stack is identity-stable within a step, rebuilt on update.
+
+    The naive per-forward stack copies 1.25 GB at b1 per iteration (the
+    tsct-super-kernel doc named it "delete, not write"); `_version` is what
+    makes a one-step cache honest.
+    """
+    cfg = tiny_cfg(n_experts=4, moe_topk=2)
+    model = DormouseModel(cfg)
+    moe = next(m for m in model.modules() if hasattr(m, "experts"))
+    b1 = moe._banks(torch.float32)  # the cache populates on first use
+    b2 = moe._banks(torch.float32)
+    assert b1[0] is b2[0] and b1[2] is b2[2]  # identity, not a second copy
+    with torch.no_grad():
+        moe.experts[0].gate_u.add_(1.0)  # what an optimizer step does in place
+    b3 = moe._banks(torch.float32)
+    assert b3[0] is not b1[0] and float(b3[0][0].max()) > float(b1[0][0].max())
 
 
 def _first_loss(model, run) -> float:

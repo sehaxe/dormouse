@@ -200,18 +200,36 @@ class SparseMoE(nn.Module):
         return self.experts[0].compute_dtype
 
     def _banks(self, dt: torch.dtype) -> tuple[torch.Tensor, ...]:
-        """The expert bank as `[E, ·]` tensors for the batched matmuls.
+        """The expert bank as `[E, ·]` tensors for the batched matmuls — CACHED.
 
-        One small copy per forward — `E` is 3-to-8 in the presets, so it is KB,
-        not MB — and `torch.stack` keeps the graph, so the gradients land back
-        on each expert's own parameters. Not a cached buffer: a cache would
-        silently outlive an optimizer step.
+        The old form stacked per forward: at b1 that is a 1.25 GB bf16 copy
+        (gate/up `[E,2048,64]` + v `[E,64,5461]`) paid `max_iter` times per
+        step — docs/research/2026-10-15-tsct-super-kernel.md op 1 ("delete,
+        not write"). The cache key is the parameters' in-place `_version`: an
+        optimizer step bumps it, so a bank never survives a stale update; one
+        bf16 conversion per step is still paid. Identity across forwards is
+        asserted by test.
         """
+        key = (dt, tuple(p._version for e in self.experts for p in e.parameters()))
+        cached = getattr(self, "_bank_cache", None)
+        if cached is None or cached[0] != key:
+            stacked = tuple(
+                torch.stack([getattr(e, name) for e in self.experts])
+                for name in ("gate_u", "up_u", "v")
+            )
+            cached = (key, stacked)
+            self._bank_cache = cached
 
         def bank(name: str) -> torch.Tensor:
-            return torch.stack([getattr(e, name) for e in self.experts]).to(dt)
+            return cached[1][("gate_u", "up_u", "v").index(name)].to(dt)
 
-        return bank("gate_u"), bank("up_u"), bank("v"), bank("gate_s"), bank("up_s")
+        return (
+            bank("gate_u"),
+            bank("up_u"),
+            bank("v"),
+            torch.stack([e.gate_s for e in self.experts]).to(dt),
+            torch.stack([e.up_s for e in self.experts]).to(dt),
+        )
 
     def _padded_dispatch(
         self,

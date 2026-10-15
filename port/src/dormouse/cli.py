@@ -337,7 +337,8 @@ def plot(
     out = out or json_log.with_suffix(".png")
     console.print(
         Panel(
-            f"{json_log.name}: {head.get('source', '?')} · {len(steps)} log rows, steps {steps[0]}..{steps[-1]}",
+            f"{json_log.name}: {head.get('source', '?')} · {len(steps)} rows, "
+            f"steps {steps[0]}..{steps[-1]}",
             subtitle=(
                 f"loss {min(losses):.4f}→{losses[-1]:.4f}"
                 + (
@@ -363,7 +364,7 @@ def plot(
     panels.append(("tok/s", (rate_steps, rates), "linear"))
     fig, axes = plt.subplots(len(panels), 1, figsize=(8, 2.2 * len(panels)), sharex=True)
     axes = [axes] if len(panels) == 1 else list(axes)
-    for ax, (title, (xs, ys), scale) in zip(axes, panels):
+    for ax, (title, (xs, ys), scale) in zip(axes, panels, strict=True):
         ax.plot(xs, ys, lw=0.9)
         ax.set_title(title, fontsize=10, loc="left")
         ax.set_ylabel(title)
