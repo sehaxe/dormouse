@@ -337,16 +337,40 @@ And the plan's load-bearing wall is now MEASURED, not derived: **grouped topk-2
 MoE is 339× the dense loop at iso-total-params** (52.6 ms vs 17.8 s, fwd+bwd).
 
 **Provisional verdict: Option B (port), by the owner's own priority order.**
-Two gates before the port starts, both cheap:
-1. **FLA gated-delta on sm_120** — the port's KDA arm would ride the FLA
-   dependency; the spike substituted SDPA, so the dependency is asserted
-   untested. ~1 h: pip-install FLA, run its gated-delta kernel bf16 at our
-   shape, correctness + tok/s vs the KDA constants. If it fails sm_120, the
-   LOC advantage shrinks by 1.5-3k and the decision reopens.
-2. **Spike phase 2 (torch-max)**: same loop-block measured with the ecosystem's
-   best — fp8 expert weights (`torch._scaled_mm`/torchao), a fused grouped MoE
-   kernel replacing the [E,cap,f] materialization, bnb paged 8-bit optimizers,
-   Liger fused RMSNorm/CE — Sirius the torch-max row the verdict table needs.
+Phase 2 closed the two gates on the torch side (`/tmp/opencode/dormouse-
+torch-spike/` commit `7920ad2`, the working notes below — the report file is
+the spike dir's SPIKE_REPORT.md, phase-2 section):
+
+- **Gate 1 — FLA on sm_120: YES.** `flash-linear-attention` 0.5.2 runs
+  `chunk_kda`/`chunk_gated_delta_rule`/`KimiDeltaAttention` on this card with
+  torch 2.13+cu129: fwd+bwd 27.9 ms at the model shape (= 587k tok/s arm-
+  only). Caveat pinned: the chunked kernel sits ~0.3% (fp32) / ~1.8% (bf16)
+  from the exact gated-delta recurrence, so FLA-backed KDA is NOT tensor-
+  comparable to burn-kda — a recurrent reference stays the anchor, and no
+  cross-substrate "bitwise" claim is ever made.
+- **Gate 2 — torch-max, measured.** Real KDA + `_grouped_mm` MoE + AdamW +
+  compile: **304.67 ms/step, 53,776 tok/s** (7.93 GiB); the eager variant
+  with bnb 8-bit optimizers: 389 ms, 42,110 tok/s (6.38 GiB). compile and
+  bnb8bit are mutually exclusive ("cannot mutate tensors with frozen
+  storage") — a recorded trade, not a bug. The same-model substrate gain vs
+  vanilla is 1.22× (73,137 tok/s with the SDPA stand-in); the real KDA arm
+  costs 80 ms/step over it (1.36×) — that is the honest price of attention.
+
+**Loud negatives, carried:** `LigerFusedLinearCrossEntropyLoss` returns a
+~40×-wrong loss and then illegal-memory-accesses at other shapes — excluded
+everywhere; and `_scaled_grouped_mm` is sm_90/sm_100-only, so **fp8/expert
+COMPUTE has no off-the-shelf path on sm_120** — the quant ladder's fp8/NVFP4/
+LittleBit rungs remain STORAGE-side (factors stored low-bit, computed in fp32
+masters → bf16 matmul, exactly `--quant`'s burn semantics), which the compute
+gap does not touch. The vLLM fused kernel stays unclaimed; 7.9 ms of
+permutation traffic + ~2.9 ms of fp8 are named headroom.
+
+**Port LOC bands after the FLA check: best 2,850 · expected 3,300-3,900 ·
+worst 4,300** (was 2,750-6,400 — the KDA-as-dependency fact cut the fat tail).
+
+Option B stands on every one of the owner's ordered criteria; the burn stack
+stays untouched as the fallback and the measuring instrument of record for
+0.22 math questions.
 
 Carried caveats (the spike's own): AdamW not Muon+ (burn's 52-61 ms retraction
 is NOT inside the 357 ms comparison), SDPA not KDA, no Engram, no data
