@@ -179,6 +179,17 @@ class ModelConfig:
     #: `validate` refuses it together with `jepa_weight`/`dspark_weight` — the
     #: A/B attributes its verdict to ONE signal per run.
     aux_fb_weight: float = 0.0
+    #: SIGReg / LeJEPA (arXiv:2511.08544, `model/sigreg.py`): a REGULARISER, not
+    #: a head. `loss = CE + sigreg_weight · sigreg_loss(z)`, `z` the strided
+    #: sample of the state `lm_head` reads — no teacher, no predictor, no mask,
+    #: no second forward, no parameters, no detach. 0.0 = off. The research
+    #: doc's ONE arm to run first (`docs/research/2026-10-16-jepa-into-dormouse.md`
+    #: §3; the burn `l1 + 0.1·koleo` bundle cannot attribute its own 0.082 BPB).
+    #: The suggested grid is 0.005 / 0.05 / 0.1 — publish which.
+    #: COEXISTS with `aux_fb_weight` by design: a regulariser and a head are
+    #: different classes, so the one-signal-per-run rule (which is about two
+    #: HEADS in one run) does not apply to this pair.
+    sigreg_weight: float = 0.0
     #: ---- the second attention arm (MSA re-entry, ADR-0014; owner 2026-10-16) ----
     #: 1M-context sparse attention BESIDE KDA (which stays the default arm).
     #: `msa_capacity_ratio` = the arm's share of the attention demand (owner:
@@ -372,6 +383,13 @@ def validate(model: ModelConfig) -> None:
             f"multiplier on the future-byte CE term, not a sign to flip. "
             f"Escape: 0.0 (off) or a positive weight (AB-PROTOCOL row 1b: 0.1)."
         )
+    if model.sigreg_weight < 0.0:
+        loud(
+            f"sigreg_weight={model.sigreg_weight} is negative: it is the "
+            f"multiplier on the SIGReg term, not a sign to flip. Escape: 0.0 "
+            f"(off) or a positive weight (the research doc's grid: 0.005, 0.05, "
+            f"0.1 — docs/research/2026-10-16-jepa-into-dormouse.md §3)."
+        )
     if model.aux_fb_weight > 0.0 and (model.jepa_weight > 0.0 or model.dspark_weight > 0.0):
         which = "jepa_weight" if model.jepa_weight > 0.0 else "dspark_weight"
         loud(
@@ -442,6 +460,16 @@ def _validate_byteflow(model: ModelConfig) -> None:
             "latents, so the n-gram memory has no byte position to read and would be "
             "built, counted and trained by nothing. Escape: `use_engram = false` (the "
             "byteflow arm alone carries the compression), or drop use_byteflow."
+        )
+    # SIGReg reads the state `lm_head` reads, and this channel's readout is
+    # `bf.out_proj(out_acc)` — not that state. A weight with nothing to attach
+    # to is refused, never silently dropped (ADR-0019).
+    if model.sigreg_weight > 0.0:
+        loud(
+            "use_byteflow with sigreg_weight>0: the channel's readout is "
+            "`bf.out_proj(out_acc)`, not the `norm(out)` state SIGReg reads, so the "
+            "term would be built and attached to nothing. Escape: sigreg_weight = 0.0, "
+            "or drop use_byteflow."
         )
 
 

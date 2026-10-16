@@ -20,6 +20,14 @@ rolled by -1. It is AB-PROTOCOL row 1b's pre-registered competitor to JEPA at
 **our 2.1% weighting claim, verified in the research doc**
 (`docs/research/2026-10-16-jepa-dspark-alternatives.md` §1.3/§4.1: 196 864
 params at our d768 = 2.14% of the burn `small`, no extra forward).
+
+The port also carries one REGULARISER, SIGReg (`sigreg.py`, default weight 0.0):
+`CE + sigreg_weight · sigreg_loss(z)` over the strided sample of the same
+`norm(out)` state — teacher-free, predictor-free, mask-free, 0 parameters, no
+second forward (`docs/research/2026-10-16-jepa-into-dormouse.md` §2/§3, the ONE
+arm to run first). A regulariser and a head are different classes, so `validate`
+allows it beside `aux_fb_weight`; the one-signal-per-run rule is about two HEADS
+in one run.
 """
 
 from __future__ import annotations
@@ -40,6 +48,7 @@ from .byteflow import (
 )
 from .fb import FutureByteHead, future_byte_loss
 from .loopblock import LoopBlock
+from .sigreg import sigreg_loss, stride_sample
 from .tsct import make_projection
 
 
@@ -133,9 +142,10 @@ class DormouseModel(nn.Module):
             self.cfg.jepa_weight == 0.0
             and self.cfg.dspark_weight == 0.0
             and self.cfg.aux_fb_weight == 0.0
+            and self.cfg.sigreg_weight == 0.0
         ), (
-            "the byteflow channel carries no aux heads: validate refuses the aux weights "
-            "with use_byteflow - set them to 0"
+            "the byteflow channel carries no aux term: validate refuses the aux weights "
+            "and sigreg_weight with use_byteflow - set them to 0"
         )
         count_channel(counters)
         bf = self.bf
@@ -184,6 +194,18 @@ class DormouseModel(nn.Module):
                 # the A/B arm is this term and nothing else.
                 loss = loss + self.cfg.aux_fb_weight * future_byte_loss(
                     self.fb, hn.to(torch.float32), targets, counters
+                )
+            if self.cfg.sigreg_weight > 0.0:
+                # SIGReg (arXiv:2511.08544, `sigreg.py`): ONE term on the state
+                # `lm_head` already reads, no teacher, no predictor, no mask, no
+                # second forward, no parameters, and NO detach — the gradient
+                # reaches the loop (LeJEPA's "no stop-gradient"). The counter is
+                # bumped exactly here, where the term is added: the research
+                # doc's metric 2 is a term that was never added looking alive
+                # (`docs/research/2026-10-16-jepa-into-dormouse.md` §3).
+                counters.count("sigreg")
+                loss = loss + self.cfg.sigreg_weight * sigreg_loss(
+                    stride_sample(hn.reshape(-1, self.cfg.d_model).to(torch.float32))
                 )
             assert torch.isfinite(loss), "L_Rec + final CE must be finite"
         return logits, loss
