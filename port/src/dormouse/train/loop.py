@@ -441,7 +441,9 @@ def train(
         # carries them (`Engram.to_host` deletes the parameter).
         n = host_tables(model)
         log(f"engram_ram: {n} table set(s) in host RAM, VRAM holds the batch's unique rows")
-    opt = MixOptimizer(model, lr=cfg.lr, wd=cfg.wd, opt=cfg.opt)
+    opt = MixOptimizer(
+        model, lr=cfg.lr, wd=cfg.wd, opt=cfg.opt, ns_steps=cfg.ns_steps, ns_kind=cfg.ns_kind
+    )
     if cfg.optim_8bit:
         opt.enable_bnb8bit()
     tokens_per_step = cfg.batch * cfg.seq_len

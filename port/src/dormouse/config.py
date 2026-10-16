@@ -382,6 +382,15 @@ class TrainConfig:
     #: `mix` = Muon on 2-D params + AdamW elsewhere (the default); `adamw` =
     #: the fallback arm, which is the same code with the routing disabled.
     opt: str = "mix"
+    #: Newton-Schulz iterations for the Muon polar retraction. 5 = Muon's own
+    #: default (the Jordan triple's original setting). 3 = the arm the
+    #: 2026-10-16 cost note prices at ~-130 ms/step at b1: the step-count
+    #: quality literature (arXiv:2606.00371 §3.2, 3 seeds, exact-SVD control)
+    #: is NON-MONOTONE with a <0.003 BPB spread -> a tie prediction, and this
+    #: port's own 3-iteration NS sits 1.17e-15 from the manifold at a 10:1
+    #: spectral spread (docs/reviews/..., 2026-10-15). A change of this
+    #: default goes through the standing 3-seed A/B, not a sentence.
+    ns_steps: int = 5
     #: The ANNEALED factor_qat ramp (burn-spectral's measured soft-to-hard
     #: recipe, `ste_ternary_annealed`: "converges better than hard STE from
     #: step one"): the trainer sets `model.set_factor_qat_alpha(min(1, step/N))`
