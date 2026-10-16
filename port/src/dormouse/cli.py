@@ -1,4 +1,4 @@
-"""The dormouse CLI: `dormouse info|train|eval|decode`.
+"""The dormouse CLI: `dormouse info|train|eval|decode|serve`.
 
 A thin, pretty front over `config.load_run`, `train.loop`, and `model.decode`
 — config strictness, resume refusal and counter discipline are already
@@ -23,6 +23,7 @@ from .config import PROGRESS_KEYS, UNSUPPORTED, ModelConfig, RunConfig, TrainCon
 from .instrument import LoudError, loud
 from .model import DormouseModel, param_count
 from .model.decode import decode_bytes, encode
+from .serve import DEFAULT_MAX_TOKENS, build_server, serve_forever
 
 app = typer.Typer(
     add_completion=False,
@@ -494,6 +495,63 @@ def plot(
     fig.tight_layout()
     fig.savefig(out, dpi=130)
     console.print(f"[green]saved[/] {out}")
+
+
+@app.command("serve")
+def serve_cmd(
+    preset: Annotated[
+        str,
+        typer.Argument(
+            help="optional CHECK: given, it must resolve to the checkpoint's own numbers"
+        ),
+    ] = "",
+    out_dir: Annotated[Path, typer.Option(help="checkpoint directory")] = Path("checkpoints"),
+    ckpt_name: Annotated[str, typer.Option("--ckpt-name")] = "",
+    port: Annotated[int, typer.Option(help="TCP port (0 = an ephemeral one)")] = 8765,
+    host: Annotated[str, typer.Option(help="bind address")] = "127.0.0.1",
+    max_tokens_cap: Annotated[
+        int, typer.Option("--max-tokens-cap", help="hard ceiling on one reply, in bytes")
+    ] = DEFAULT_MAX_TOKENS,
+    temp: Annotated[float, typer.Option(help="sampling temperature")] = 0.8,
+    device: Annotated[str, typer.Option(help="auto|cuda|cpu")] = "auto",
+) -> None:
+    """Serve a checkpoint on the OpenAI HTTP schema (`/v1/models`, chat completions).
+
+    The model loads ONCE and is reused for every request, and resolution is the
+    checkpoint's own snapshot (the `eval`/`decode` mechanics — the snapshot is
+    authority, there is no `--set` here). `preset` is therefore a CHECK, not a
+    source: given, its MODEL half must equal the snapshot's, or you are serving
+    an architecture other than the one you named. Train-half keys are exempt —
+    the cadence, optimizer and data path do not reach the served bytes, and
+    every checkpoint on disk was trained with `--set` overrides.
+    """
+    if preset:
+        claimed, snap = _run(preset, []), _snapshot_run(out_dir, ckpt_name)
+        drift = [k for k in claimed.diff_keys(snap) if k.startswith("model.")]
+        if drift:
+            loud(
+                f"serve {preset}: its model half differs from the checkpoint's own "
+                f"snapshot in {drift}. Escape: drop the argument (the checkpoint IS "
+                f"what is served), or point --ckpt-name at that run's checkpoint."
+            )
+    httpd = build_server(
+        out_dir,
+        ckpt_name,
+        host=host,
+        port=port,
+        device=device,
+        max_tokens_cap=max_tokens_cap,
+        temp=temp,
+    )
+    state = httpd.state
+    console.print(
+        Panel(
+            f"[bold]{ckpt_name}[/] · {param_count(state.model):,} params · {state.device}",
+            subtitle=f"http://{host}:{httpd.server_address[1]}/v1 · cap {max_tokens_cap} B"
+            f" · temp {temp}",
+        )
+    )
+    serve_forever(httpd)
 
 
 if __name__ == "__main__":
