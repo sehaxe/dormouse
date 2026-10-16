@@ -1,4 +1,4 @@
-"""The dormouse CLI: `dormouse info|train|eval|decode|serve`.
+"""The dormouse CLI: `dormouse info|train|sft|eval|decode|serve`.
 
 A thin, pretty front over `config.load_run`, `train.loop`, and `model.decode`
 — config strictness, resume refusal and counter discipline are already
@@ -357,6 +357,101 @@ def run(
     )
     for r in rows[:4]:
         console.print(f"  {r['task']}  pass@budget={r['pass@budget']:.2f}")
+
+
+@app.command("sft")
+def sft_cmd(
+    preset: Annotated[str, typer.Argument(help="preset NAME or a .toml PATH")] = "small",
+    data: Annotated[
+        Path | None, typer.Option(help="the SFT corpus .bin (records of seq_len+1 B)")
+    ] = None,
+    ckpt_name: Annotated[str, typer.Option("--ckpt-name", help="checkpoint name to write")] = "",
+    out_dir: Annotated[Path | None, typer.Option(help="checkpoint directory")] = None,
+    build_sft: Annotated[
+        bool,
+        typer.Option("--build-sft", help="(re)build the seeded instruction corpus at --data first"),
+    ] = False,
+    n_tasks: Annotated[
+        int, typer.Option(help="code and math tasks per class in the built corpus")
+    ] = 32,
+    steps: Annotated[int | None, typer.Option] = None,
+    batch: Annotated[
+        int | None, typer.Option(help="windows per step are batch*seq_len bytes")
+    ] = None,
+    lr: Annotated[float | None, typer.Option] = None,
+    resume: Annotated[
+        bool, typer.Option(help="continue `ckpt_name`; a drifted config refuses")
+    ] = False,
+    device: Annotated[str, typer.Option(help="auto|cuda|cpu")] = "auto",
+    json_log: Annotated[
+        Path | None, typer.Option("--json-log", help="telemetry sink for `dormouse plot`")
+    ] = None,
+    # typer constructs a fresh list per call (its contract) — B006 is a
+    # plain-function footgun, and the option annotation IS the fixture.
+    sets: Annotated[list[str], typer.Option("--set", help="override: key=value")] = [],  # noqa: B006
+) -> None:
+    """SFT: the prompt-masked byte CE on a seeded instruction corpus.
+
+    The base model is a FRESH init unless `--resume` names an existing
+    checkpoint pair (which refuses loudly when either half is missing), so the
+    bare command is the concept test — the format is learned, the knowledge is
+    not there yet. `--build-sft` writes the corpus deterministically from
+    `(seed, seq_len, n_tasks)`; a `--data` that does not exist without it is a
+    loud refusal, because a pretrain corpus has no markers and the masked CE
+    would refuse it one step later anyway.
+    """
+    from .train.sft import build_sft_corpus, sft_train
+
+    model_over, train_over = _split_sets(sets)
+    if data is not None:
+        train_over["data"] = str(data)
+    if ckpt_name:
+        train_over["ckpt_name"] = ckpt_name
+    if out_dir is not None:
+        train_over["out_dir"] = str(out_dir)
+    for k, v in (("steps", steps), ("batch", batch), ("lr", lr)):
+        if v is not None:
+            train_over[k] = v
+    if json_log is not None:
+        train_over["json_log"] = str(json_log)
+    run = load_run(preset, model_overrides=model_over, train_overrides=train_over)
+    if not run.train.data:
+        raise LoudError(
+            "sft needs --data (the SFT corpus .bin) or `--set data=/path`. Escape: "
+            "--build-sft writes the seeded instruction corpus there first."
+        )
+    path = Path(run.train.data)
+    if build_sft:
+        built = build_sft_corpus(path, run.train.seed, seq_len=run.train.seq_len, n_tasks=n_tasks)
+        dropped = (
+            f" · {built['dropped']} dropped (longer than one window)" if built["dropped"] else ""
+        )
+        console.print(
+            f"[green]sft corpus[/] {built['records']} records x {built['record_bytes']} B "
+            f"= {built['bytes']:,} B -> {built['path']} (seed {built['seed']}){dropped}"
+        )
+    elif not path.is_file():
+        raise LoudError(
+            f"sft: the corpus {path} does not exist and --build-sft was not given. "
+            f"Escape: --build-sft (the seeded instruction corpus), or point --data "
+            f"at an existing SFT corpus."
+        )
+    dev = _device(device)
+    model = _model(run).to(dev)
+    _freeze_gc()
+    console.print(
+        Panel(
+            f"[bold]sft[/] {run.source} · {param_count(model):,} params · {dev}"
+            + ("" if resume else " · base = fresh init"),
+            subtitle=f"steps={run.train.steps} batch={run.train.batch} "
+            f"seq={run.train.seq_len} lr={run.train.lr} opt={run.train.opt}",
+        )
+    )
+    report = sft_train(model, run, resume=resume, device=None if dev.type == "cpu" else dev)
+    console.print(
+        f"[green]sft done[/] steps={report['steps']} loss={report['loss']:.4f} "
+        f"masked_bytes={report['supervised_bytes']:,} nan_skipped={report['nan_skipped']}"
+    )
 
 
 @app.command("eval")

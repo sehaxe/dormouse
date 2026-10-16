@@ -1,0 +1,388 @@
+"""The SFT minimum: the corpus, the markers, the mask, the masked CE, the loop, the CLI.
+
+Every gate here is CPU and tiny: what has to be true of SFT is the SEMANTICS
+(which bytes the loss counts, that a window is one example, that a NaN step
+touches no weight), and none of it needs a GPU.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import math
+from pathlib import Path
+
+import pytest
+import torch
+from torch import nn
+from typer.testing import CliRunner
+
+from dormouse.cli import app
+from dormouse.config import ModelConfig, RunConfig, TrainConfig
+from dormouse.instrument import Counters, LoudError
+from dormouse.model import DormouseModel
+from dormouse.train.data import ByteStream
+from dormouse.train.sft import (
+    ASSIST,
+    END,
+    GENERIC_QA,
+    PAD,
+    USER,
+    build_sft_corpus,
+    render,
+    sft_loss,
+    sft_mask,
+    sft_train,
+)
+
+runner = CliRunner()
+SEQ, BATCH = 64, 2
+
+
+def tiny_model_cfg(**over) -> ModelConfig:
+    base = dict(
+        d_model=64,
+        n_heads=4,
+        head_dim=16,
+        d_ffn=128,
+        vocab=256,
+        max_seq_len=SEQ,
+        max_iter=2,
+        rank=8,
+        n_experts=4,
+        moe_topk=2,
+        engram_rows=64,
+        engram_dim=8,
+        bf16=False,
+        shared_rank=16,
+    )
+    base.update(over)
+    return ModelConfig(**base)
+
+
+def sft_run(tmp_path: Path, *, corpus: Path | None = None, **train_over) -> RunConfig:
+    data = corpus if corpus is not None else tmp_path / "sft.bin"
+    if corpus is None:
+        build_sft_corpus(data, seed=1, seq_len=SEQ, n_tasks=32)
+    cfg = TrainConfig(
+        steps=30,
+        batch=BATCH,
+        seq_len=SEQ,
+        lr=0.02,
+        log_every=1,
+        ckpt_every=1000,
+        ckpt_name="s",
+        out_dir=str(tmp_path / "ck"),
+        data=str(data),
+    )
+    return RunConfig(
+        source="sft-tiny", model=tiny_model_cfg(), train=dataclasses.replace(cfg, **train_over)
+    )
+
+
+def window(instr: str = "Hi", ans: str = "Hello", t: int = SEQ) -> tuple[bytes, torch.Tensor]:
+    """A hand-built single-example window: the record and the model's `x` input."""
+    raw = render(instr, ans)
+    assert len(raw) <= t
+    rec = raw + bytes([PAD]) * (t + 1 - len(raw))
+    return rec, torch.tensor(list(rec[:-1]), dtype=torch.long).view(1, t)
+
+
+def _losses(lines: list[str]) -> list[float]:
+    return [float(ln.split("loss=")[1].split()[0]) for ln in lines if ln.startswith("sft step=")]
+
+
+# --------------------------------------------------------------------------- corpus
+
+
+def test_corpus_is_deterministic_and_seed_dependent(tmp_path: Path):
+    """Same seed = same bytes, in any process; a different seed is a different corpus."""
+    a, b, c = tmp_path / "a.bin", tmp_path / "b.bin", tmp_path / "c.bin"
+    ra = build_sft_corpus(a, 7, seq_len=SEQ, n_tasks=4)
+    rb = build_sft_corpus(b, 7, seq_len=SEQ, n_tasks=4)
+    build_sft_corpus(c, 8, seq_len=SEQ, n_tasks=4)
+    assert a.read_bytes() == b.read_bytes()
+    assert (ra["records"], ra["dropped"]) == (rb["records"], rb["dropped"])
+    assert a.read_bytes() != c.read_bytes()
+
+
+def test_markers_never_collide_with_the_content(tmp_path: Path):
+    """Every record: one user marker at 0, one assistant marker, one end marker, pad tail."""
+    path = tmp_path / "s.bin"
+    rep = build_sft_corpus(path, 3, seq_len=128, n_tasks=8)
+    raw = path.read_bytes()
+    assert len(raw) == rep["bytes"] and len(raw) % rep["record_bytes"] == 0
+    for i in range(rep["records"]):
+        rec = raw[i * rep["record_bytes"] : (i + 1) * rep["record_bytes"]]
+        assert rec.count(bytes([USER])) == 1 and rec.count(bytes([ASSIST])) == 1
+        assert rec.count(bytes([END])) == 1
+        assert rec.index(USER) == 0 < rec.index(ASSIST) < rec.index(END)
+        assert set(rec[rec.index(END) + 1 :]) <= {PAD}, "only padding may follow the end marker"
+    # The assert that licenses all of the above: a marker in the text is refused.
+    with pytest.raises(AssertionError):
+        render("boom\x02", "no")
+    with pytest.raises(AssertionError):
+        render("ok", "no\x00")
+
+
+def test_the_corpus_carries_the_seeded_tasks_and_the_generic_pairs(tmp_path: Path):
+    """The sources are REUSED (post/tasks.py), not re-invented: both classes show up."""
+    path = tmp_path / "s.bin"
+    rep = build_sft_corpus(path, 1, seq_len=256, n_tasks=4)
+    text = path.read_bytes()
+    assert rep["records"] >= len(GENERIC_QA)
+    assert b"def add(" in text or b"def square_sum(" in text  # a code task's reference
+    assert b"answer: " in text  # the math prompt's own format, taught in the answer
+    assert "Привет!".encode() in text  # the RU half of the generic set
+
+
+def test_every_window_is_a_single_example(tmp_path: Path):
+    """The stream's own windows pass the single-example gate, and never leak forward."""
+    run = sft_run(tmp_path)
+    stream = ByteStream(run.train.data, BATCH, SEQ)
+    for _ in range(10):
+        x, _y = stream.next_batch()
+        mask = sft_mask(x)  # LOUD on a window with 0 or 2 assistant markers
+        assert bool(mask.any())
+        # The last target predicts the NEXT record's first byte: never supervised.
+        assert not bool(mask[:, -1].any())
+
+
+# --------------------------------------------------------------------------- the mask
+
+
+def test_mask_matches_the_known_marker_positions():
+    rec, x = window("Hi", "Hello")
+    a, e = rec.index(ASSIST), rec.index(END)
+    expected = torch.tensor([[a - 1 <= j <= e - 1 for j in range(SEQ)]])
+    mask = sft_mask(x)
+    assert torch.equal(mask, expected)
+    # The `0x02` and `0x03` bytes themselves ARE supervised (the model must learn
+    # to emit them); the count is the whole answer region.
+    assert int(mask.sum()) == e - a + 1
+    assert not bool(mask[0, : a - 1].any()), "no prompt byte may be supervised"
+
+
+class _PosWise(nn.Module):
+    """`logits[j]` depends on `x[j]` ALONE — no context mixing.
+
+    Under a causal attention stack a prompt-byte flip DOES move the answer
+    positions' logits, so this fixture is what isolates the mask itself; the
+    real model's causal analogue is the pad-byte test below.
+    """
+
+    def __init__(self, vocab: int = 256) -> None:
+        super().__init__()
+        g = torch.Generator().manual_seed(0)
+        self.table = nn.Parameter(torch.randn(vocab, vocab, generator=g) * 0.5)
+
+    def forward(self, x, targets=None, counters=None):
+        return self.table[x.reshape(-1)], None, Counters()
+
+
+def test_masked_loss_ignores_a_prompt_byte():
+    rec, x = window("Hi", "Hello")
+    model = _PosWise()
+    l0 = sft_loss(model(x)[0], x.roll(-1, dims=1), sft_mask(x))
+    flipped = x.clone()
+    flipped[0, 2] = ord("X")  # inside "Hi", before the assistant marker
+    assert 2 < rec.index(ASSIST)
+    assert torch.equal(l0, sft_loss(model(flipped)[0], flipped.roll(-1, dims=1), sft_mask(flipped)))
+
+
+def test_masked_loss_moves_when_an_answer_byte_changes():
+    rec, x = window("Hi", "Hello")
+    model = _PosWise()
+    l0 = sft_loss(model(x)[0], x.roll(-1, dims=1), sft_mask(x))
+    flipped = x.clone()
+    flipped[0, rec.index(ASSIST) + 2] = ord("Z")  # inside the answer
+    assert not torch.equal(
+        l0, sft_loss(model(flipped)[0], flipped.roll(-1, dims=1), sft_mask(flipped))
+    )
+
+
+def test_a_pad_byte_outside_the_mask_cannot_move_the_loss():
+    """The real model: causal attention means a later byte cannot move an earlier CE."""
+    rec, x = window("Hi", "Hello")
+    y = x.roll(-1, dims=1)
+    mask = sft_mask(x)
+    model = DormouseModel(tiny_model_cfg())
+    l0 = sft_loss(model(x)[0], y, mask)
+    corrupted = x.clone()
+    corrupted[0, rec.index(END) + 1] = ord("A")  # padding, outside the mask
+    assert torch.equal(l0, sft_loss(model(corrupted)[0], y, mask))
+
+
+# --------------------------------------------------------------------------- the loop
+
+
+def test_sft_train_runs_thirty_steps_and_the_loss_falls(tmp_path: Path):
+    run = sft_run(tmp_path)
+    lines: list[str] = []
+    report = sft_train(DormouseModel(run.model), run, log=lines.append)
+    losses = _losses(lines)
+    assert len(losses) == 30 and all(math.isfinite(v) for v in losses)
+    assert sum(losses[-5:]) / 5 < sum(losses[:5]) / 5, losses
+    assert report["nan_skipped"] == 0
+    assert report["loss"] == pytest.approx(losses[-1], abs=1e-4)
+    # The counter line is the run's own count of SUPERVISED bytes, per window.
+    assert report["supervised_bytes"] == sum(
+        int(ln.split("sft_bytes=")[1]) for ln in lines if ln.startswith("sft step=")
+    )
+    assert report["counters"]["iter"] == 30 * run.model.max_iter
+
+
+class _NaNSftModel(nn.Module):
+    """The SFT firewall's fixture: the logits are never finite, so the CE is NaN."""
+
+    def __init__(self, inner: nn.Module) -> None:
+        super().__init__()
+        self.inner = inner
+
+    def forward(self, x, targets=None, counters=None):
+        logits, _loss, counters = self.inner(x, targets, counters)
+        return logits * float("nan"), None, counters
+
+
+def test_sft_nan_step_is_skipped_and_counted_not_learned(tmp_path: Path):
+    run = sft_run(tmp_path, steps=1)
+    model = _NaNSftModel(DormouseModel(run.model))
+    before = [p.detach().clone() for p in model.parameters()]
+    report = sft_train(model, run, log=lambda *_: None)
+    assert report["nan_skipped"] == 1 and report["counters"]["nan_skipped"] == 1
+    for p, b in zip(model.parameters(), before, strict=True):
+        assert torch.equal(p, b), "a non-finite SFT step must not touch a weight"
+
+
+def test_sft_two_all_nan_windows_stop_the_run(tmp_path: Path):
+    run = sft_run(tmp_path, steps=4, log_every=1)
+    with pytest.raises(LoudError) as e:
+        sft_train(_NaNSftModel(DormouseModel(run.model)), run, log=lambda *_: None)
+    assert "entirely non-finite" in str(e.value)
+
+
+def test_sft_refuses_a_window_that_spans_two_examples(tmp_path: Path):
+    """The single-example guarantee, checked per window: 10-byte records, seq_len 32."""
+    path = tmp_path / "packed.bin"
+    path.write_bytes((render("a", "b") + bytes([PAD]) * 4) * 40)
+    run = sft_run(tmp_path, corpus=path, seq_len=32, steps=1)
+    with pytest.raises(LoudError) as e:
+        sft_train(DormouseModel(tiny_model_cfg(max_seq_len=32)), run, log=lambda *_: None)
+    assert "spans two examples" in str(e.value) and "build-sft" in str(e.value)
+
+
+def test_sft_refuses_engram_ram(tmp_path: Path):
+    run = sft_run(tmp_path, steps=1, engram_ram=True)
+    with pytest.raises(LoudError) as e:
+        sft_train(DormouseModel(run.model), run, log=lambda *_: None)
+    assert "engram_ram" in str(e.value) and "Escape" in str(e.value)
+
+
+# --------------------------------------------------------------------------- the CLI
+
+_TINY_PRESET = "\n".join(
+    [
+        "d_model = 64",
+        "n_heads = 4",
+        "head_dim = 16",
+        "d_ffn = 128",
+        "max_seq_len = 64",
+        "max_iter = 2",
+        "rank = 8",
+        "shared_rank = 16",
+        "moe_topk = 2",
+        "moe_capacity = 1.0",
+        "engram_orders = [2, 3]",
+        "engram_rows = 64",
+        "engram_dim = 8",
+        "bf16 = false",
+    ]
+)
+
+
+def _preset(tmp_path: Path) -> Path:
+    p = tmp_path / "tiny.toml"
+    p.write_text(_TINY_PRESET)
+    return p
+
+
+def test_cli_sft_builds_the_corpus_and_trains(tmp_path: Path):
+    corpus = tmp_path / "sft.bin"
+    r = runner.invoke(
+        app,
+        [
+            "sft",
+            str(_preset(tmp_path)),
+            "--data",
+            str(corpus),
+            "--build-sft",
+            "--n-tasks",
+            "8",
+            "--ckpt-name",
+            "s",
+            "--set",
+            f"out_dir={tmp_path / 'ck'}",
+            "--set",
+            "batch=2",
+            "--set",
+            "seq_len=64",
+            "--set",
+            "steps=5",
+            "--set",
+            "log_every=1",
+            "--set",
+            "ckpt_every=5",
+            "--device",
+            "cpu",
+        ],
+    )
+    assert r.exit_code == 0, r.output
+    assert corpus.is_file() and "sft corpus" in r.output
+    assert (tmp_path / "ck" / "s.pt").is_file()
+    assert (tmp_path / "ck" / "s.config.toml").is_file()
+    assert "sft done" in r.output and "masked_bytes=" in r.output
+
+
+def test_cli_sft_refuses_a_missing_corpus(tmp_path: Path):
+    r = runner.invoke(
+        app,
+        [
+            "sft",
+            str(_preset(tmp_path)),
+            "--data",
+            str(tmp_path / "nope.bin"),
+            "--set",
+            "seq_len=64",
+            "--device",
+            "cpu",
+        ],
+    )
+    assert r.exit_code != 0
+    assert "build-sft" in str(r.exception)
+
+
+def test_cli_sft_refuses_a_resume_without_a_checkpoint(tmp_path: Path):
+    r = runner.invoke(
+        app,
+        [
+            "sft",
+            str(_preset(tmp_path)),
+            "--data",
+            str(tmp_path / "sft.bin"),
+            "--build-sft",
+            "--n-tasks",
+            "4",
+            "--ckpt-name",
+            "absent",
+            "--set",
+            f"out_dir={tmp_path / 'ck2'}",
+            "--set",
+            "seq_len=64",
+            "--set",
+            "steps=2",
+            "--resume",
+            "--device",
+            "cpu",
+        ],
+    )
+    assert r.exit_code != 0
+    assert "resume" in str(r.exception)
