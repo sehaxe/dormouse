@@ -99,6 +99,18 @@ ACT_QUANTS = ("none", "int8", "int4", "fp4", "mxfp8", "v2_int4", "v2_int8")
 #: to `classic` up to fp32 round-off order (`tests/test_muon_gram.py`), which
 #: is why the arm needs no training A/B. A name that is not here is LOUD.
 NS_KINDS = ("classic", "gram")
+#: The `muon_colrow_3d` literals — the arms of `colrow_normalize`'s 3-D branch
+#: (`optim.COLROW_3D`, which is where they execute; the list is duplicated here
+#: the way `NS_KINDS` is, so the config layer does not import the trainer).
+#: `frobenius` = the per-slice Frobenius normalisation the batched Muon step has
+#: always run: it is NOT `NormDir::ColRow`, it is a pre-existing defect found
+#: 2026-10-16 by the equivalence gate, and it makes the batched update exactly
+#: `1/sqrt(d0)` of the per-param one (8x at `[64, 5461]`, 45x at `[2048, 2048]`).
+#: It is the DEFAULT because every number on record ran it. `colrow` = the 2-D
+#: definition applied per slice, bit-identical to the per-param path — the fix,
+#: and an A/B-gated change (AGENTS §1.2: it moves the update scale for every
+#: shape group with >= 2 members). A name that is not here is LOUD.
+MUON_COLROW_3D = ("frobenius", "colrow")
 
 
 def _unsupported(default: Any, mechanism: str) -> Any:
@@ -419,13 +431,26 @@ class TrainConfig:
     #: regrouped — the equivalence gate in `tests/test_muon_gram.py` is what
     #: licenses the swap without a training A/B
     #: (`docs/research/2026-10-16-muon-orthogonalization-cost.md` row 1).
-    #: NOT yet forwarded by the trainer: the call site is `train/loop.py:378`
-    #: (`MixOptimizer(model, lr=cfg.lr, wd=cfg.wd, opt=cfg.opt)`), and that file
-    #: belongs to another lane, so this field is honoured by `MixOptimizer` —
-    #: and by the gate + `scripts/bench_muon_ns.py`, which build it directly —
-    #: while the trainer keeps running `classic` until the one argument
-    #: `ns_kind=cfg.ns_kind` lands there.
+    #: Forwarded by the trainer: `train/loop.py` builds
+    #: `MixOptimizer(..., ns_kind=cfg.ns_kind)` (the same call site now also
+    #: forwards `muon_colrow_3d`), so this field is what the run executes — not
+    #: only what the gates and `scripts/bench_muon_ns.py` build directly.
     ns_kind: str = "classic"
+
+    #: The 3-D `colrow_normalize` arm the batched Muon step runs
+    #: (`MUON_COLROW_3D` above, `optim.COLROW_3D` where it executes).
+    #: `frobenius` = the per-slice Frobenius normalisation the batched step has
+    #: always run. It is **NOT `NormDir::ColRow`** — the 3-D branch collapses
+    #: dims `(1, 2)` twice instead of columns then rows — so the batched update
+    #: is exactly `1/sqrt(d0)` of the per-param definition (8x at `[64, 5461]`,
+    #: 45x at `[2048, 2048]`). Found 2026-10-16 by
+    #: `tests/test_muon_fast.py`'s equivalence gate; it stays the DEFAULT
+    #: because every number on record ran it. `colrow` = the 2-D definition
+    #: applied per slice — bit-identical to the per-param path, and a numerics
+    #: change for every shape group with >= 2 members, so it is an ARM awaiting
+    #: the standing 3-seed A/B (AGENTS §1.2), not a new default. The 2-D path
+    #: (and a shape group with one member) is the same in both arms.
+    muon_colrow_3d: str = "frobenius"
     seed: int = 1
     #: WSD warmup, in TOKENS (not steps): the schedule is a function of how
     #: much data the run has seen, so a batch-size change does not change it.
@@ -914,6 +939,18 @@ def load_run(
             f"iterated in the `[r, r]` Gram space. Escape: name one of those, or "
             f"land the arm in `optim.NS_KINDS` and its equivalence gate BEFORE the "
             f"config can lie about it."
+        )
+    if tcfg.muon_colrow_3d not in MUON_COLROW_3D:
+        loud(
+            f"muon_colrow_3d={tcfg.muon_colrow_3d!r} is not an arm. Known: "
+            f"{list(MUON_COLROW_3D)} — `frobenius` is the per-slice Frobenius "
+            f"normalisation the batched Muon step has always run (it is NOT "
+            f"ColRow: the batched update comes out `1/sqrt(d0)` of the per-param "
+            f"definition — a defect, kept as the A/B control), `colrow` is the "
+            f"2-D definition applied per slice (the fix, bit-identical to the "
+            f"per-param path). Escape: name one of those, or land the arm in "
+            f"`optim.COLROW_3D` and its parity gate BEFORE the config can lie "
+            f"about it."
         )
     if model_overrides:
         _refuse_unsupported(ModelConfig, model_overrides, "model")

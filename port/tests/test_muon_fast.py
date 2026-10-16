@@ -36,11 +36,12 @@ import math
 
 import pytest
 import torch
-from conftest import tiny_cfg
+from conftest import tiny_cfg, tiny_run
 from torch import nn
 
+from dormouse.config import load_run
 from dormouse.model import DormouseModel
-from dormouse.train import optim
+from dormouse.train import optim, train
 from dormouse.train.optim import (
     MixOptimizer,
     Muon,
@@ -138,9 +139,12 @@ def _twin(shapes: dict[tuple[int, int], int], seed: int = 1) -> tuple[nn.Module,
     return a, b
 
 
-def _pair(shapes: dict[tuple[int, int], int]) -> tuple[nn.Module, Muon, nn.Module, Muon]:
+def _pair(
+    shapes: dict[tuple[int, int], int], colrow_3d: str = "frobenius"
+) -> tuple[nn.Module, Muon, nn.Module, Muon]:
     a, b = _twin(shapes)
-    return a, Muon(a.parameters(), lr=1e-3), b, Muon(b.parameters(), lr=1e-3)
+    kw = {"colrow_3d": colrow_3d}
+    return a, Muon(a.parameters(), lr=1e-3, **kw), b, Muon(b.parameters(), lr=1e-3, **kw)
 
 
 def _same_params(a: nn.Module, b: nn.Module) -> bool:
@@ -369,7 +373,10 @@ def test_the_batched_colrow_is_not_the_per_param_colrow(shape):
     NOT landed by a speed commit.
 
     When the fix lands, THIS test goes red — which is the point: it is the
-    marker that the A/B was owed.
+    marker that the A/B was owed. The fix is now LANDED as an arm
+    (`train.muon_colrow_3d`, default `frobenius`), so this test still passes
+    and becomes the gate on the DEFAULT: flipping `muon_colrow_3d` to `colrow`
+    for everyone means updating this test with the A/B's verdict.
     """
     torch.manual_seed(0)
     u = zeropower_via_ns(torch.randn(1, *shape), 5, "classic")
@@ -378,6 +385,110 @@ def test_the_batched_colrow_is_not_the_per_param_colrow(shape):
     ratio = float(batched.norm() / per_param.norm())
     assert ratio == pytest.approx(1.0 / math.sqrt(shape[0]), rel=1e-5), ratio
     assert not torch.allclose(batched[0], per_param)
+
+
+# --- the arm that fixes it (`muon_colrow_3d`) --------------------------------
+
+
+@pytest.mark.parametrize("shape", [(4, 64, 5461), (3, 64, 8), (2, 2048, 64), (3, 8, 128)])
+def test_the_colrow_arm_is_the_per_param_definition_on_a_stack(shape):
+    """`colrow_3d="colrow"` on `[N, d0, d1]` == `colrow_normalize` per slice.
+
+    Bit-exact, not merely close: dims 1 and 2 are the same reductions the 2-D
+    form takes over dims 0 and 1, so the batched arm is the definition itself.
+    """
+    torch.manual_seed(0)
+    x = torch.randn(*shape)
+    got = colrow_normalize(x, colrow_3d="colrow")
+    ref = torch.stack([colrow_normalize(x[i]) for i in range(shape[0])])
+    assert torch.equal(got, ref)
+    assert torch.equal(colrow_normalize_(x.clone(), colrow_3d="colrow"), ref)
+    # the defining property of the arm: every row of every slice is unit L2
+    assert float((got.norm(dim=-1) - 1.0).abs().max()) < 1e-6
+
+
+def test_the_colrow_arm_makes_the_batched_step_the_per_param_definition():
+    """With the arm on, the batched step IS `_step_one` for EVERY parameter.
+
+    The `frobenius` default diverges by `1/sqrt(d0)` on any group with >= 2
+    members (the characterisation above); this is the same comparison with the
+    fix in. Tolerance: **rel <= 1e-6** on each parameter (observed 2.5e-8), and
+    the residual is the NS chain's batched-vs-2-D GEMM rounding, NOT ColRow —
+    the ColRow step itself is bit-exact against the per-slice definition
+    (`test_the_colrow_arm_is_the_per_param_definition_on_a_stack`).
+    """
+    shapes = {(64, 5461): 4, (2048, 64): 4, (256, 256): 3, (64, 64): 3}
+    a, oa, b, ob = _pair(shapes, colrow_3d="colrow")
+    lr, mu, ns = (oa.param_groups[0][k] for k in ("lr", "momentum", "ns_steps"))
+    ob.batched_step_from_model(b)
+    oa._build_groups()
+    for grp in oa._groups:
+        for p in grp.params:
+            oa._step_one(p, lr, mu, ns, max(1.0, grp.shape[0] / grp.shape[1]) ** 0.5)
+    worst = max(
+        float((pa - pb).detach().norm() / (pa.detach().norm() + 1e-30))
+        for pa, pb in zip(a.parameters(), b.parameters(), strict=True)
+    )
+    assert worst <= 1e-6, f"the colrow arm is not the per-param definition: {worst:.3e}"
+    assert _same_momentum(oa, ob)
+    # ... and it is NOT the frobenius default's step, on the same fixture
+    c, oc, _, _ = _pair(shapes, colrow_3d="colrow")
+    oc.batched_step_from_model(c)
+    e, oe, _, _ = _pair(shapes)
+    oe.batched_step_from_model(e)
+    assert not _same_params(c, e), "the arm changed nothing — it is inert"
+
+
+def test_the_frobenius_arm_is_still_the_default():
+    """The arm is opt-in: the default reproduces the pre-change step exactly."""
+    shapes = {(64, 5461): 3, (64, 64): 2}
+    a, oa, b, ob = _pair(shapes)
+    assert ob.colrow_3d == "frobenius"
+    old_batched_step(oa)
+    ob.batched_step_from_model(b)
+    assert _same_params(a, b) and _same_momentum(oa, ob)
+
+
+def test_a_bad_colrow_arm_is_loud_everywhere_it_can_be_set():
+    from dormouse.instrument import LoudError
+
+    model = DormouseModel(tiny_cfg())
+    for build in (
+        lambda: colrow_normalize(torch.randn(2, 4, 4), colrow_3d="ColRow"),
+        lambda: Muon([nn.Parameter(torch.zeros(8, 8))], colrow_3d="frobenius_"),
+        lambda: MixOptimizer(model, lr=1e-3, wd=0.0, colrow_3d="col_row"),
+        lambda: load_run("small", train_overrides={"muon_colrow_3d": "colrow3d"}),
+    ):
+        with pytest.raises(LoudError) as e:
+            build()
+        assert "muon_colrow_3d=" in str(e.value) and "frobenius" in str(e.value)
+
+
+def test_the_colrow_knob_round_trips_through_the_config():
+    """A real config key: it loads, it snapshots, it pins the arm on a resume."""
+    run = load_run("small", train_overrides={"muon_colrow_3d": "colrow"})
+    assert run.train.muon_colrow_3d == "colrow"
+    assert 'muon_colrow_3d = "colrow"' in run.snapshot_toml()
+    other = load_run("small", train_overrides={"muon_colrow_3d": "frobenius"})
+    assert run.diff_keys(other) == ["train.muon_colrow_3d"]
+
+
+def test_the_trainer_forwards_the_colrow_arm(monkeypatch, tmp_path):
+    """The wiring gate: `train/loop.py` must hand the config value to the
+    optimizer, or the flag is inert and every A/B on it is a no-op."""
+    from dormouse.train import loop as train_loop
+
+    seen: list[str] = []
+    real = train_loop.MixOptimizer
+
+    def spy(model, **kw):
+        seen.append(kw.get("colrow_3d"))
+        return real(model, **kw)
+
+    monkeypatch.setattr(train_loop, "MixOptimizer", spy)
+    run = tiny_run(tmp_path, steps=2, log_every=2, muon_colrow_3d="colrow")
+    train(DormouseModel(run.model), run, log=lambda *_: None)
+    assert seen == ["colrow"], seen
 
 
 # --- the bench (`scripts/bench_muon_ns.py step` runs this) -------------------

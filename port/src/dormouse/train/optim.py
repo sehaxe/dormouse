@@ -52,6 +52,14 @@ JORDAN_NS_COEFFS = (3.4445, -4.7750, 2.0315)
 #: something (`config.NS_KINDS` mirrors this list for the config layer).
 NS_KINDS = ("classic", "gram")
 
+#: The 3-D `colrow_normalize` arms (`config.MUON_COLROW_3D` mirrors this list):
+#: `frobenius` is the per-slice Frobenius normalisation the batched Muon step
+#: has always run — NOT the ColRow the port documents — and `colrow` is the
+#: 2-D definition applied per slice, i.e. the fix. The defect, its exact size
+#: and the A/B it owes are in `colrow_normalize`'s docstring and
+#: `tests/test_muon_fast.py`.
+COLROW_3D = ("frobenius", "colrow")
+
 #: Where Gram-NS restarts: 0-based iteration indices, exactly the reference's
 #: `gram_newton_schulz_reset_iterations` default (`[2]`, i.e. a restart before
 #: the third step) — "for 5 steps of Newton-Schulz, we recommend num-restarts =
@@ -86,6 +94,19 @@ def _check_ns_kind(kind: str) -> None:
             f"this port's history), `gram` is Gram Newton–Schulz (arXiv 2608.11612 "
             f"§4): the same polynomial iterated in the `[r, r]` Gram space. Escape: "
             f"name one of those, or land the arm in `optim.NS_KINDS` first."
+        )
+
+
+def _check_colrow_3d(arm: str) -> None:
+    """A name that is not an arm is LOUD, naming both arms and the escape."""
+    if arm not in COLROW_3D:
+        loud(
+            f"muon_colrow_3d={arm!r} is not an arm. Known: {list(COLROW_3D)} — "
+            f"`frobenius` is the per-slice Frobenius normalisation the batched "
+            f"Muon step has always run (the 1/sqrt(d0)-of-ColRow defect, kept as "
+            f"the A/B control), `colrow` is the 2-D definition applied per slice "
+            f"(the fix, bit-identical to the per-param path). Escape: name one of "
+            f"those, or land the arm in `optim.COLROW_3D` first."
         )
 
 
@@ -213,41 +234,53 @@ def _gram_via_ns(
     return out.transpose(-1, -2).contiguous() if transposed else out
 
 
-def colrow_normalize(x: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
+def colrow_normalize(x: torch.Tensor, eps: float = 1e-7, *, colrow_3d: str = "frobenius"):
     """`Norm_d` for `NormDir::ColRow` (the trainer's choice): columns, then rows.
 
-    **The 2-D form is the definition; the 3-D branch is NOT ColRow and is a
-    PRE-EXISTING defect, found 2026-10-16 by the equivalence gate in
-    `tests/test_muon_fast.py`** (it arrived with the batched step, `d55fd1d`,
-    whose message claims "the same math"). It collapses dims `(1, 2)` twice,
-    i.e. normalises each slice by its Frobenius norm — so the batched Muon
-    step applies exactly `1/sqrt(d0)` of the per-param update (`[64, 5461]`
-    and `[64, 2048]` at b1: 8x too small; `[2048, 2048]`: 45x). The fix is
-    one line here (dims 1 then 2) and it MOVES THE TRAINER'S UPDATE SCALE for
-    every shape group with >= 2 members, so it is an A/B-gated numerics change
-    (AGENTS §1.2) and is deliberately NOT landed by a speed commit. The
-    divergence and its exact factor are pinned by
-    `test_the_batched_colrow_is_not_the_per_param_colrow`.
+    **The 2-D form is the definition and is untouched by `colrow_3d`.** The 3-D
+    form has two arms (`COLROW_3D`), because the batched step's original 3-D
+    branch was NOT ColRow — found 2026-10-16 by the equivalence gate in
+    `tests/test_muon_fast.py`:
+
+    * `"frobenius"` (**the default, and what every number on record ran**):
+      collapses dims `(1, 2)` twice, i.e. normalises each slice by its Frobenius
+      norm. The batched Muon step therefore applies exactly `1/sqrt(d0)` of the
+      per-param update (8x at `[64, 5461]`/`[64, 2048]`, 45x at `[2048, 2048]`).
+      This is the DEFECT, kept as the control so the A/B is apples-to-apples.
+    * `"colrow"` (**the fix**): dims 1 then 2 per slice — the 2-D definition
+      applied to each matrix, which `tests/test_muon_fast.py` shows is
+      bit-identical to running `colrow_normalize` on the slices one at a time.
+
+    The arm is a config key (`train.muon_colrow_3d`) and an optimizer attribute,
+    never a param-group key: the group is what `load_state_dict` REPLACES with
+    the checkpoint's copy, so a key added today would KeyError on every
+    checkpoint written before it (the same rule `ns_kind` follows). A switch
+    whose `"colrow"` arm moves the update scale 8-45x needs the standing 3-seed
+    A/B (AGENTS §1.2) before it can become the default.
     """
-    dim = (1, 2) if x.ndim == 3 else 0
-    x = x / (x.norm(dim=dim, keepdim=True) + eps)
-    return x / (x.norm(dim=(1, 2) if x.ndim == 3 else 1, keepdim=True) + eps)
+    if x.ndim == 2:
+        x = x / (x.norm(dim=0, keepdim=True) + eps)
+        return x / (x.norm(dim=1, keepdim=True) + eps)
+    _check_colrow_3d(colrow_3d)
+    x = x / (x.norm(dim=(1, 2) if colrow_3d == "frobenius" else 1, keepdim=True) + eps)
+    return x / (x.norm(dim=(1, 2) if colrow_3d == "frobenius" else 2, keepdim=True) + eps)
 
 
-def colrow_normalize_(x: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
+def colrow_normalize_(x: torch.Tensor, eps: float = 1e-7, *, colrow_3d: str = "frobenius"):
     """`colrow_normalize` in place — the SAME arithmetic, no new tensor.
 
     `x.div_(n + eps)` and `x / (n + eps)` are the same operation on the same
     operands, so this is bit-identical to the out-of-place form; it exists
     because the batched step's `x` is a fresh tensor the optimizer owns (at b1
     the two temporaries are 2 x 1.33 GiB of the expert-write group per step).
-    Same 3-D caveat as `colrow_normalize` — it is the same arithmetic, defect
-    included.
+    Takes the same `colrow_3d` arm, with the same semantics.
     """
-    dim = (1, 2) if x.ndim == 3 else 0
-    x.div_(x.norm(dim=dim, keepdim=True) + eps)
-    x.div_(x.norm(dim=(1, 2) if x.ndim == 3 else 1, keepdim=True) + eps)
-    return x
+    if x.ndim == 2:
+        x.div_(x.norm(dim=0, keepdim=True) + eps)
+        return x.div_(x.norm(dim=1, keepdim=True) + eps)
+    _check_colrow_3d(colrow_3d)
+    x.div_(x.norm(dim=(1, 2) if colrow_3d == "frobenius" else 1, keepdim=True) + eps)
+    return x.div_(x.norm(dim=(1, 2) if colrow_3d == "frobenius" else 2, keepdim=True) + eps)
 
 
 class _MomGroup:
@@ -283,16 +316,20 @@ class Muon(Optimizer):
         ns_steps: int = 5,
         ns_kind: str = "classic",
         gram_restarts: tuple[int, ...] = GRAM_NS_RESTARTS,
+        colrow_3d: str = "frobenius",
     ) -> None:
         _check_ns_kind(ns_kind)
+        _check_colrow_3d(colrow_3d)
         #: The arm and its restart positions live on the OPTIMIZER, not in the
         #: param group: the group is what `Optimizer.load_state_dict` REPLACES
         #: with the checkpoint's copy, so a key added today would KeyError on
         #: every checkpoint written before it. The arm is already pinned across
         #: a resume by the config snapshot (`train.ns_kind` is not a progress
         #: key, so `RunConfig::diff_keys` refuses a flip) — one place, not two.
+        #: `colrow_3d` follows the same rule (`train.muon_colrow_3d`).
         self.ns_kind = ns_kind
         self.gram_restarts = gram_restarts
+        self.colrow_3d = colrow_3d
         super().__init__(params, dict(lr=lr, momentum=momentum, ns_steps=ns_steps))
         #: One stacked momentum buffer per (param group, shape) — the canonical
         #: state, built lazily by `_build_groups` and rebuilt after a load.
@@ -429,7 +466,7 @@ class Muon(Optimizer):
                 # add_ + 3267 copy_ launches on the post-batched profile
                 # (55 + 57 ms/step). The size check guarantees identical
                 # shapes so the sockets align 1:1.
-                colrow_normalize_(update).mul_(-lr * scale)
+                colrow_normalize_(update, colrow_3d=self.colrow_3d).mul_(-lr * scale)
                 with torch.no_grad():
                     torch._foreach_add_([p.detach() for p in params_c], torch.unbind(update))
             n_batches += 1
@@ -471,12 +508,14 @@ class MixOptimizer:
         ns_steps: int = 5,
         ns_kind: str = "classic",
         gram_restarts: tuple[int, ...] = GRAM_NS_RESTARTS,
+        colrow_3d: str = "frobenius",
         betas: tuple[float, float] = (0.9, 0.95),
         eps: float = 1e-8,
     ) -> None:
         if opt not in ("mix", "adamw"):
             loud(f"opt={opt!r}: known optimizers are 'mix' (default) and 'adamw'")
         _check_ns_kind(ns_kind)
+        _check_colrow_3d(colrow_3d)
         muon_params: list[nn.Parameter] = []
         adamw_params: list[nn.Parameter] = []
         self.routing: dict[str, str] = {}
@@ -494,6 +533,7 @@ class MixOptimizer:
                 ns_steps=ns_steps,
                 ns_kind=ns_kind,
                 gram_restarts=gram_restarts,
+                colrow_3d=colrow_3d,
             )
             if muon_params
             else None

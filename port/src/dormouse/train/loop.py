@@ -442,7 +442,13 @@ def train(
         n = host_tables(model)
         log(f"engram_ram: {n} table set(s) in host RAM, VRAM holds the batch's unique rows")
     opt = MixOptimizer(
-        model, lr=cfg.lr, wd=cfg.wd, opt=cfg.opt, ns_steps=cfg.ns_steps, ns_kind=cfg.ns_kind
+        model,
+        lr=cfg.lr,
+        wd=cfg.wd,
+        opt=cfg.opt,
+        ns_steps=cfg.ns_steps,
+        ns_kind=cfg.ns_kind,
+        colrow_3d=cfg.muon_colrow_3d,
     )
     if cfg.optim_8bit:
         opt.enable_bnb8bit()
