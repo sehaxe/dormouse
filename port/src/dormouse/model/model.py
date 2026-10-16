@@ -97,6 +97,7 @@ class DormouseModel(nn.Module):
         counters: Counters | None = None,
         depth: int | None = None,
         pure: bool = False,
+        breakdown: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None, Counters]:
         """`input_ids [b,t]` (+ `targets [b,t]`) → (logits `[b*t,vocab]`, loss, counters).
 
@@ -113,7 +114,9 @@ class DormouseModel(nn.Module):
         elif self.bf is not None:
             logits, loss = self._forward_channel(input_ids, targets, counters, depth)
         else:
-            logits, loss = self._forward_byte_lm(input_ids, targets, counters, depth, pure)
+            logits, loss = self._forward_byte_lm(
+                input_ids, targets, counters, depth, pure, breakdown
+            )
         counters.count("forward")
         return logits, loss, counters
 
@@ -180,6 +183,7 @@ class DormouseModel(nn.Module):
         counters: Counters,
         depth: int | None = None,
         pure: bool = False,
+        breakdown: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """The plain byte-level stack: embedding → loop → RMSNorm → lm_head."""
         h0 = self.embed(input_ids)
@@ -206,6 +210,16 @@ class DormouseModel(nn.Module):
             # term that makes the logits it RETURNS the logits it TRAINS.
             flat = targets.reshape(-1, 1)
             ce_final = -F.log_softmax(logits, dim=-1).gather(1, flat).mean()
+            if breakdown:
+                # Eval-only host reads (called under `torch.no_grad()` by
+                # `evaluate(..., breakdown=True)`; NEVER in the training path —
+                # the 0-sync rule). `fin` is the depth-comparable number: the CE
+                # of the mean readout at the depth actually run.
+                per = getattr(self.loop, "_per_iter_ce", None) or []
+                self.last_breakdown = {
+                    "fin": float(ce_final.detach()),
+                    "per_iter": [float(t.detach()) for t in per],
+                }
             # (Σ_i CE_i + CE_final) / (T + 1), unweighted, with T the depth this
             # forward ACTUALLY ran. burn's code divided by `max_iter + 1`
             # unconditionally; under the ADAPTIVE DEPTH arm that divisor is a

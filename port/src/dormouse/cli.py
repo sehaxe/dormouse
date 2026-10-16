@@ -389,13 +389,14 @@ def eval_cmd(
     _train_stream, eval_stream = open_streams(run)
     if eval_stream is None:
         raise LoudError("no eval stream (the snapshot carries eval_data or eval=true)")
-    loss, scored = _evaluate(
+    loss, scored, fin, _per_iter = _evaluate(
         model, eval_stream, run.train.eval_batches, device=None if dev.type == "cpu" else dev
     )
     console.print(
         Panel(
-            f"[bold]{ckpt_name}[/] · [bold]{loss / _LN2:.3f}[/] BPB",
-            subtitle=f"loss {loss:.4f} over {scored:,} B = {run.train.eval_batches}"
+            f"[bold]{ckpt_name}[/] · [bold]{fin / _LN2:.3f}[/] BPB (fin) · "
+            f"{loss / _LN2:.3f} headline",
+            subtitle=f"loss {loss:.4f} fin {fin:.4f} over {scored:,} B = {run.train.eval_batches}"
             f" x {run.train.batch} x {run.train.seq_len}",
         )
     )

@@ -140,6 +140,8 @@ def test_depth_curve_is_wired_with_loom_on(tmp_path):
     assert eval_stream is not None
     curve = evaluate(model, eval_stream, 3, depths=True)
     assert sorted(curve) == [1, 2, 3, 4], sorted(curve)
-    for ce, scored in curve.values():
-        assert math.isfinite(ce)
+    for d, (loss_d, bytes_d, fin_d, per_d) in curve.items():
+        assert loss_d > 0 and bytes_d > 0 and fin_d > 0 and len(per_d) == d, (d, per_d)
+    for loss_d, scored, _fin_d, _per_d in curve.values():
+        assert math.isfinite(loss_d)
         assert scored == 3 * BATCH * SEQ

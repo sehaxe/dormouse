@@ -176,11 +176,20 @@ def _eval_loss(
     batches: int,
     device: torch.device | str | None,
     depth: int | None,
-) -> tuple[float, int]:
-    """One held-out pass at ONE loop depth — the body both eval shapes share."""
+) -> tuple[float, int, float, list[float]]:
+    """One held-out pass at ONE loop depth: (loss, bytes, fin, per_iter_mean).
+
+    `loss` is the headline (Σ CE_i + CE_final)/(T+1) — kept for continuity but
+    DEPTH-CONFOUNDED (its term count changes with T; found 2026-10-16).
+    `fin` is the CE of the mean readout alone — the number comparable across
+    depths and the one generation reads. `per_iter_mean` averages the
+    per-iteration CEs over the batch — the deep-supervision shape.
+    """
     stream.rewind()
     total = 0.0
     scored = 0
+    fin_total = 0.0
+    per_iter_acc: list[float] = []
     was_training = model.training
     model.eval()
     kw = {} if depth is None else {"depth": depth}
@@ -196,12 +205,26 @@ def _eval_loss(
             # first aux A/B run: control 3.045 vs fb 3.469 while the arm was
             # fine). Counters are not bumped on this path — fb=0/0 is the
             # eval's honest reading of "no aux ran HERE".
-            _, loss, _ = model(x, y, pure=True, **kw)
+            _, loss, _ = model(x, y, pure=True, breakdown=True, **kw)
             assert loss is not None, "an eval batch must carry targets"
             total += float(loss)
             scored += int(x.numel())
+            bd = getattr(model, "last_breakdown", None)
+            if bd is not None:
+                fin_total += bd["fin"]
+                per = bd["per_iter"]
+                if not per_iter_acc:
+                    per_iter_acc = [0.0] * len(per)
+                for i, v in enumerate(per):
+                    per_iter_acc[i] += v
+    n = max(batches, 1)
     model.train(was_training)
-    return total / max(batches, 1), scored
+    return (
+        total / n,
+        scored,
+        fin_total / n,
+        [v / n for v in per_iter_acc],
+    )
 
 
 def evaluate(
@@ -251,15 +274,20 @@ def _eval_line(
     curve = None
     if cfg.rand_depth or cfg.eval_depths:
         curve = evaluate(model, stream, cfg.eval_batches, device=device, depths=True)
-        ev, scored = curve[max_iter]
+        ev, scored, fin, per_iter = curve[max_iter]
     else:
-        ev, scored = evaluate(model, stream, cfg.eval_batches, device=device)
+        ev, scored, fin, per_iter = evaluate(model, stream, cfg.eval_batches, device=device)
+    # `fin` = the CE of the final mean readout — the DEPTH-COMPARABLE number
+    # (the headline `loss` averages T+1 terms and is not, see `_eval_loss`).
     line = (
-        f"eval step={step} loss={ev:.4f} bpb={bpb(ev):.3f} over {scored} B "
+        f"eval step={step} loss={ev:.4f} bpb={bpb(ev):.3f} fin={fin:.4f} "
+        f"bpb_fin={bpb(fin):.3f} over {scored} B "
         f"({cfg.eval_batches} x {cfg.batch} x {cfg.seq_len}) {fb}"
     )
+    if per_iter:
+        line += " periter=" + ",".join(f"{v:.4f}" for v in per_iter)
     if curve is not None:
-        line += " depths=" + ",".join(f"{d}:{curve[d][0]:.4f}" for d in sorted(curve))
+        line += " depths=" + ",".join(f"{d}:{curve[d][2]:.4f}(fin)" for d in sorted(curve))
     return line, ev, scored
 
 

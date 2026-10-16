@@ -179,6 +179,7 @@ class LoopBlock(nn.Module):
         h0_flat = h0.reshape(b * t, d)
         out_acc = torch.zeros_like(h0)
         rec = torch.zeros((), dtype=torch.float32, device=h0.device)
+        per_iter: list[torch.Tensor] = []
         sources: list[torch.Tensor] = [h0] if self.use_attnres else []
         for i in range(T):
             counters.count("iter")
@@ -260,5 +261,14 @@ class LoopBlock(nn.Module):
                 logits = lm_head(step_out.reshape(b * t, d).to(torch.float32))
                 ce = -F.log_softmax(logits, dim=-1).gather(1, targets.reshape(-1, 1))
                 rec = rec + ce.mean()
+                per_iter.append(ce.mean())
         rec = None if targets is None else rec
+        # The per-iteration CEs as a LIST on the module (host floats ONLY on an
+        # eval-style read; see `model.DormouseModel.forward(breakdown=True)`) —
+        # the depth-confounded headline metric (ΣCE + CE_final)/(T+1) averages
+        # a DIFFERENT number of terms per depth, so cross-depth comparisons from
+        # the headline alone are arithmetic artifacts (found 2026-10-16: every
+        # trained arm read "deeper is worse" because the average gains another
+        # mid-quality term with each iteration).  No sync here: tensors stay.
+        self._per_iter_ce: list[torch.Tensor] | None = per_iter
         return out_acc / T, rec, counters
