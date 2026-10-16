@@ -531,7 +531,7 @@ def decode(
     _freeze_gc()
     ck = torch.load(Path(out_dir) / f"{ckpt_name}.pt", map_location="cpu", weights_only=False)
     model.load_state_dict(ck["model"])
-    gen = torch.Generator().manual_seed(run.train.seed)
+    gen = torch.Generator(device=dev).manual_seed(run.train.seed)
     out = decode_bytes(model, encode(prompt), n, temp=temp, device=dev, generator=gen)
     text = out[len(encode(prompt)) :].decode("utf-8", "replace")
     console.print(Panel(f"[bold]{prompt}[/]{text}", title=f"decode · temp {temp} · {n} bytes"))

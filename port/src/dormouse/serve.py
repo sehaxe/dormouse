@@ -128,7 +128,7 @@ def _generate(state: ServeState, prompt: bytes, n: int, chunk: int = STREAM_BYTE
         loud("empty prompt: the first window IS the prompt (model.decode's rule)")
     if n < 1:
         loud(f"max_tokens={n}: must be >= 1")
-    gen = torch.Generator().manual_seed(state.seed)
+    gen = torch.Generator(device=state.device).manual_seed(state.seed)
     dec = codecs.getincrementaldecoder("utf-8")("replace")
     ctx, done = prompt, 0
     while done < n:
