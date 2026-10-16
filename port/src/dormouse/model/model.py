@@ -239,8 +239,16 @@ class DormouseModel(nn.Module):
                 # sequence and the byte ids the lm_head just scored (D1), and
                 # `dspark=<windows>/<calls>` on the log line is the void check
                 # (0/<n> = the length budget allowed no window, counted).
+                # `logits` is [b*t, vocab] here; the head's contract is
+                # [b, t, vocab] (its own assert caught exactly this on the
+                # first A/B run — counted as a FAIL in the driver, fixed here).
+                b_tok, t_tok = input_ids.shape
                 loss = loss + self.cfg.dspark_weight * dspark_aux_loss(
-                    self.dspark, hn.to(torch.float32), input_ids, logits, counters=counters
+                    self.dspark,
+                    hn.to(torch.float32),
+                    input_ids,
+                    logits.reshape(b_tok, t_tok, -1),
+                    counters=counters,
                 )
             assert torch.isfinite(loss), "L_Rec + final CE must be finite"
         return logits, loss
