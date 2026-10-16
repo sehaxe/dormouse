@@ -23,7 +23,8 @@ def test_presets_load_and_validate():
     assert small.engram_rows == 25000 and small.engram_orders == [2, 3, 4]
     b1 = load_preset("b1")
     assert (b1.d_model, b1.n_heads, b1.head_dim, b1.d_ffn) == (2048, 32, 64, 5461)
-    assert b1.n_experts == 1024 and b1.moe_topk == 2 and b1.max_iter == 2
+    # max_iter 4 = the owner's 2026-10-16 directive (the depth arm rides on top).
+    assert b1.n_experts == 1024 and b1.moe_topk == 2 and b1.max_iter == 4
     assert b1.engram_rows == 4_000_000 and b1.shared_rank == 192
 
 

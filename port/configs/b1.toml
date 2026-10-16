@@ -2,7 +2,7 @@
 # price CORRECTED (see below). No GPU run has ever been made with this config;
 # it is a pre-registered shape, not a measured recipe.
 #
-# d 2048 · H 32x64 · d_ffn 5461 · rank 64 · max_iter 2 · E 1024 experts, topk 2 ·
+# d 2048 · H 32x64 · d_ffn 5461 · rank 64 · max_iter 4 (owner 2026-10-16) · E 1024 experts, topk 2 ·
 # Engram 4M rows/order x 3 orders x dim 32.
 
 d_model = 2048
@@ -11,7 +11,7 @@ head_dim = 64
 d_ffn = 5461
 vocab = 256
 max_seq_len = 2048
-max_iter = 2
+max_iter = 4
 rank = 64
 norm_eps = 0.001
 
