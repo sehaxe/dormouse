@@ -146,3 +146,32 @@ def test_loss_is_finite_and_the_loop_runs_the_configured_depth(tmp_path):
     report = train(DormouseModel(run.model), run, log=lines.append)
     assert math.isfinite(report["loss"])
     assert report["counters"]["iter"] == 3 * run.model.max_iter
+
+
+def test_torch_compile_flag_wraps_the_model_after_resume(tmp_path, monkeypatch):
+    """The wiring gate: with `torch_compile=true` the trainer hands the model
+    to `torch.compile(dynamic=True)` — once, after any resume load (the
+    `_orig_mod.` prefix rule). `torch.compile` itself is patched out: this is
+    a wiring test, not a compiler test."""
+    calls: list[dict] = []
+    real = torch.compile
+
+    def spy(mod, **kw):
+        calls.append(kw)
+        return real(mod, **kw)
+
+    monkeypatch.setattr(torch, "compile", spy)
+    run = tiny_run(tmp_path, steps=2, log_every=2, torch_compile=True)
+    lines: list[str] = []
+    report = train(DormouseModel(run.model), run, log=lines.append)
+    assert len(calls) == 1 and calls[0].get("dynamic") is True
+    assert any("torch_compile" in s for s in lines)
+    assert math.isfinite(report["loss"])
+
+
+def test_torch_compile_off_by_default(tmp_path, monkeypatch):
+    calls: list[int] = []
+    monkeypatch.setattr(torch, "compile", lambda *a, **k: calls.append(1))
+    run = tiny_run(tmp_path, steps=1, log_every=1)
+    train(DormouseModel(run.model), run, log=lambda *_: None)
+    assert calls == []

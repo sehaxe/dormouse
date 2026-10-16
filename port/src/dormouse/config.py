@@ -391,6 +391,14 @@ class TrainConfig:
     #: spectral spread (docs/reviews/..., 2026-10-15). A change of this
     #: default goes through the standing 3-seed A/B, not a sentence.
     ns_steps: int = 5
+    #: torch.compile(dynamic=True) around the model's forward — the one large
+    #: speed lever left (the spike measured 273.5 vs 357.3 ms/step at the b1
+    #: shape, 1.20x; dynamic=True because eval/resume lengths vary). The first
+    #: warmup costs minutes and lands in ~/.cache/torch, so it is paid once
+    #: per machine, not per run. OFF by default until a b1-shape run confirms
+    #: the win end to end; the wrapper goes on AFTER resume (an
+    #: OptimizedModule's state_dict carries a `_orig_mod.` prefix).
+    torch_compile: bool = False
     #: The ANNEALED factor_qat ramp (burn-spectral's measured soft-to-hard
     #: recipe, `ste_ternary_annealed`: "converges better than hard STE from
     #: step one"): the trainer sets `model.set_factor_qat_alpha(min(1, step/N))`

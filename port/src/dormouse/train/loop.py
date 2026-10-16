@@ -468,6 +468,15 @@ def train(
 
     warm = warmup_steps(cfg.warmup_tokens, cfg.batch, cfg.seq_len)
     decay = int(round(cfg.decay_frac * cfg.steps))
+    if cfg.torch_compile:
+        # torch.compile(dynamic=True) — the spike's measured winner at the b1
+        # shape (273.5 vs 357.3 ms/step, 1.20x). Wrapped AFTER the resume
+        # load: an OptimizedModule's state_dict carries a `_orig_mod.` prefix,
+        # so loading into the wrapped model would rename every key. The
+        # inductor cache persists in ~/.cache/torch — the warmup is once per
+        # machine, not per run.
+        model = torch.compile(model, dynamic=True)
+        log("torch_compile: model wrapped (first steps pay the warmup)")
     anneal_steps = cfg.factor_qat_anneal_steps
     if anneal_steps > 0 and run.model.factor_qat == "none":
         loud(
