@@ -45,19 +45,30 @@ DEFAULT_MAX_TOKENS = 512
 #: stream; the sampling sequence is independent of it.
 STREAM_BYTES = 8
 
-#: The model speaks no chat template — the prompt IS this plain dialogue.
+#: The SFT template's markers (`train/sft.py`: `0x01` opens the user turn,
+#: `0x02` the assistant turn, `0x03` closes the answer, `0x00` pads). The
+#: server renders prompts in THAT template: the model was trained on it, and
+#: the first chat smoke showed a `User:/Assistant:` prompt answers with noise.
+TURN_OPEN, TURN_ANSWER = 0x01, 0x02
+#: The model speaks no chat template beyond that: the prompt IS the dialogue.
 ROLES = {"system": "System", "user": "User", "assistant": "Assistant"}
 
 
 def assemble(messages: Any) -> bytes:
-    """`[{role, content}]` → the plain-text dialogue, UTF-8 bytes.
+    """`[{role, content}]` → the SFT-template prompt, UTF-8 bytes.
 
     Unknown role or non-string content is loud: a prompt the model half
     understood would produce a confident reply to a different question.
+
+    The model is SINGLE-TURN (the SFT corpus is instruction→answer pairs), so
+    the prompt is the LAST user message — with any system text and earlier
+    user turns prepended as context — wrapped in the markers the model trained
+    on: `\\x01 {instruction} \\n\\x02 `.
     """
     if not isinstance(messages, list) or not messages:
         loud('messages: need a non-empty list of {"role", "content"} objects')
-    lines: list[str] = []
+    system: list[str] = []
+    users: list[str] = []
     for m in messages:
         if not isinstance(m, dict):
             loud(f"message {m!r}: expected an object with role and content")
@@ -66,8 +77,17 @@ def assemble(messages: Any) -> bytes:
             loud(f"message role {role!r}: this model renders {sorted(ROLES)} only")
         if not isinstance(content, str):
             loud(f"message {role}: content must be a string, got {type(content).__name__}")
-        lines.append(f"{ROLES[role]}: {content}")
-    return encode("\n".join(lines) + "\nAssistant:")
+        if role == "system":
+            system.append(content)
+        elif role == "user":
+            users.append(content)
+        # an assistant turn is history; the corpus has no multi-turn dialogue
+        # to learn from, so it is not re-fed (the last user message is the
+        # instruction the model answers).
+    if not users:
+        loud("messages: no user turn — the model answers an instruction, and there is none")
+    instruction = "\n".join([*system, *users[:-1], users[-1]])
+    return bytes([TURN_OPEN]) + b" " + encode(instruction) + b" \n" + bytes([TURN_ANSWER]) + b" "
 
 
 def load_checkpoint(
