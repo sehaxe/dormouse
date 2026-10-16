@@ -274,9 +274,45 @@ def _e2m1_dequant(packed: torch.Tensor, scale: torch.Tensor, global_scale: float
     return (vals.float() * scale.float().unsqueeze(-1)).reshape(-1) * (1.0 / global_scale)
 
 
+def _ternary_quant(t: torch.Tensor) -> tuple[torch.Tensor, float]:
+    """b1.58 ternary projection → 2-bit codes + the α scalar (16× vs fp32).
+
+    Stores the TERNARY PROJECTION of the master (`ternary.ternarize`, the same
+    formula `factor_qat` trains against): codes 0/1/2 for {0, +α, −α}, four to
+    a byte, α in fp32 beside them. Round-trip is bit-exact to `ternarize(t)`
+    for finite t — a storage rung may lose precision by its FORMAT'S OWN grid
+    (nvfp4 stores 4-bit values), never by an extra rounding.
+    """
+    from .ternary import ternarize
+
+    t = t.detach()
+    q = ternarize(t)
+    alpha = float(t.abs().mean())
+    code = torch.zeros_like(t, dtype=torch.uint8)
+    code[q > 0] = 1
+    code[q < 0] = 2
+    flat = code.reshape(-1)
+    pad = (-flat.numel()) % 4
+    if pad:
+        flat = torch.cat([flat, torch.zeros(pad, dtype=torch.uint8)])
+    packed = flat[0::4] | (flat[1::4] << 2) | (flat[2::4] << 4) | (flat[3::4] << 6)
+    return packed.to(torch.uint8), alpha
+
+
+def _ternary_dequant(packed: torch.Tensor, alpha: float, n: int) -> torch.Tensor:
+    """Inverse of [`_ternary_quant`]: codes → `{0, ±α}`, tail padding cut."""
+    c = torch.stack(
+        [packed & 3, (packed >> 2) & 3, (packed >> 4) & 3, (packed >> 6) & 3],
+        dim=-1,
+    ).reshape(-1)[:n]
+    v = torch.zeros(n, dtype=torch.float32, device=packed.device)
+    return v.masked_fill(c == 1, alpha).masked_fill(c == 2, -alpha)
+
+
 FACTORS_QUANT = {
     "fp8": None,  # native dtype; no packer needed
     "nvfp4": (_e2m1_quant, _e2m1_dequant),
+    "ternary": (_ternary_quant, _ternary_dequant),
 }
 
 
@@ -301,7 +337,16 @@ def pack_tsct(t: torch.Tensor, rung: str) -> dict[str, object]:
             "shape": t.shape,
             "n": t.numel(),
         }
-    loud(f"pack_tsct: rung {rung!r} is not a storage rung (fp8|nvfp4)")
+    if rung == "ternary":
+        packed, alpha = _ternary_quant(t)
+        return {
+            "rung": rung,
+            "codes": packed,
+            "alpha": alpha,
+            "shape": t.shape,
+            "n": t.numel(),
+        }
+    loud(f"pack_tsct: rung {rung!r} is not a storage rung (fp8|nvfp4|ternary)")
 
 
 def unpack_tsct(rec: dict[str, object]) -> torch.Tensor:
@@ -314,6 +359,8 @@ def unpack_tsct(rec: dict[str, object]) -> torch.Tensor:
         packed, scale = rec["codes"], rec["scale"]
         t = _e2m1_dequant(packed, scale, rec.get("global_scale", 1.0))
         return t.reshape(rec["shape"])
+    if rung == "ternary":
+        return _ternary_dequant(rec["codes"], rec["alpha"], rec["n"]).reshape(rec["shape"])
     loud(f"unpack_tsct: rung {rung!r} is not a storage rung (fp8|nvfp4)")
 
 

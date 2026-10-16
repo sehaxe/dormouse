@@ -677,18 +677,18 @@ def _validate_byteflow(model: ModelConfig) -> None:
 
 
 def _refuse_ladder_rung(rung: str) -> str:
-    """The quant ladder: `fp8`/`nvfp4` are Storage rungs since 2026-10-15 (they
+    """The quant ladder: `fp8`/`nvfp4`/`ternary` are Storage rungs (they
     compress the factor bank and the checkpoint, the fp32 masters stay the
     optimizer's object — see `tsct.py` module doc); everything else refuses.
 
-    GROUPED, not a fallback. What remains refused (`fp16/lbit/ternary/act
-    quant`) is a TRAINING-time change — LittleBit's gates G-A..G-D
+    GROUPED, not a fallback. What remains refused (`fp16/lbit`) is a
+    TRAINING-time change — LittleBit's gates G-A..G-D
     (`docs/reviews/littlebit-design-2026-10-15.md`) must close first.
     """
-    storage = ("fp8", "nvfp4")
+    storage = ("fp8", "nvfp4", "ternary")
     if rung in storage:
         return rung
-    known = {"fp16", "fp4", "int4", "int8", "lbit", "ternary"}
+    known = {"fp16", "fp4", "int4", "int8", "lbit"}
     hint = (
         " (a training-time rung: docs/reviews/littlebit-design-2026-10-15.md "
         "carries the gates that must close first)"

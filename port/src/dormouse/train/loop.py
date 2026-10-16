@@ -150,7 +150,7 @@ def save_ckpt(
     weights.parent.mkdir(parents=True, exist_ok=True)
     sd = model.state_dict()
     rung = run.model.quant if run.model.quant != "none" else ""
-    if rung and (rung == "fp8" or rung == "nvfp4"):
+    if rung and rung in ("fp8", "nvfp4", "ternary"):
         sd = {k: (pack_tsct(v, rung) if is_factor_key(k) else v) for k, v in sd.items()}
     tmp = weights.with_suffix(".pt.tmp")
     torch.save(
