@@ -67,6 +67,14 @@ dspark_weight = 0.0
 aux_fb_weight = 0.0
 act_group = 0
 
+# The ADAPTIVE DEPTH arm (owner 2026-10-16). TRAIN keys, so they are CLI-only
+# (`--set rand_depth=true`), never model keys in this preset:
+#   rand_depth = false  — ADR-0013 fixed depth is the default; the arm samples
+#                         T in 1..=max_iter per step, pure in (seed, step),
+#                         and normalizes the loss by the ACTUAL T.
+#   eval_depths = false — the eval line prints the depth-efficiency curve
+#                         (loss at 1..=max_iter); it trains nothing.
+
 # ===========================================================================
 # THE EXPERT PRICE, CORRECTED — this is the one count that CHANGES vs plan §2.2
 # ===========================================================================

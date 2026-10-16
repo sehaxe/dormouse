@@ -116,3 +116,11 @@ aux_fb_weight = 0.0
 # it coexists with aux_fb_weight by design (regulariser vs head).
 sigreg_weight = 0.0
 act_group = 0
+
+# The ADAPTIVE DEPTH arm (owner 2026-10-16). These are TRAIN keys, not model
+# keys, so they live on the CLI (`--set rand_depth=true`), not in this file:
+#   rand_depth = false  — off, because ADR-0013 fixed depth is the default; the
+#                         arm samples T in 1..=max_iter per step as a pure
+#                         function of (seed, step) and normalizes by ACTUAL T.
+#   eval_depths = false — on: the eval line carries the loss at 1..=max_iter,
+#                         the depth-efficiency curve; it trains nothing.

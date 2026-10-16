@@ -256,7 +256,22 @@ class TrainConfig:
     out_dir: str = "checkpoints"
     timers: bool = False
     engram_ram: bool = _unsupported(False, "host-RAM Engram tables (--engram-ram)")
-    rand_depth: bool = _unsupported(False, "random loop depth per step")
+    #: The ADAPTIVE DEPTH arm (owner 2026-10-16): run the loop `T` iterations
+    #: per TRAIN step, `T` sampled in `1..=max_iter` as a PURE function of
+    #: `(seed, step)` (`train.loop._sample_depth`), with the loss normalized by
+    #: the depth ACTUALLY run so depths are scale-comparable. `false` is
+    #: ADR-0013's fixed depth — the DEFAULT; this field is the arm. It is a
+    #: function of `(seed, step)` and not a global draw because burn's RNG is
+    #: never seeded: two runs of one config would draw different depth
+    #: schedules and a resume would continue a different objective (ADR-0021,
+    #: the defect that fixed DSpark's stride).
+    rand_depth: bool = False
+    #: Print the held-out loss at depths 1..=max_iter on every eval line — the
+    #: depth-efficiency curve a depth claim is measured by (the plan's
+    #: `--eval-depths`). MEASUREMENT only, it trains nothing. It is on whenever
+    #: `rand_depth` is (the arm must show its own curve), and can be asked for
+    #: explicitly on a fixed-depth run.
+    eval_depths: bool = False
     stress: bool = _unsupported(False, "stress protocol (--stress)")
 
 

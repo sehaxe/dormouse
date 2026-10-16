@@ -155,34 +155,105 @@ def load_ckpt(run: RunConfig) -> tuple[dict, RunConfig]:
     return ck, stored
 
 
-def evaluate(
+def _sample_depth(seed: int, step: int, max_iter: int) -> int:
+    """The ADAPTIVE DEPTH arm's depth for one step: `1 + ((step·2654435761 + seed) % max_iter)`.
+
+    A PURE function of `(seed, step)`: same arguments, same `T`, in any process
+    and before or after a resume. Not a draw from a global RNG, because burn's
+    RNG is never seeded — a sampled depth would differ between two runs of one
+    config and a resume would continue a different objective (ADR-0021, the
+    defect that fixed DSpark's stride). `2654435761` is the 32-bit golden-ratio
+    odd constant (Knuth's multiplicative hash), so consecutive steps land on
+    different residues in `1..=max_iter`.
+    """
+    assert max_iter >= 1, f"max_iter must be >= 1, got {max_iter}"
+    return 1 + ((step * 2654435761 + seed) % max_iter)
+
+
+def _eval_loss(
     model: torch.nn.Module,
     stream: ByteStream,
     batches: int,
-    device: torch.device | str | None = None,
+    device: torch.device | str | None,
+    depth: int | None,
 ) -> tuple[float, int]:
-    """Mean held-out CE over `batches` windows + the BYTES those windows scored.
-
-    `rewind()` first, always: an eval that inherits the stream position is not
-    comparable with the previous one (AGENTS §2.6). No autodiff — burn's eval
-    runs never-backwarded graphs to OOM on the card.
-    """
+    """One held-out pass at ONE loop depth — the body both eval shapes share."""
     stream.rewind()
     total = 0.0
     scored = 0
     was_training = model.training
     model.eval()
+    kw = {} if depth is None else {"depth": depth}
     with torch.no_grad():
         for _ in range(batches):
             x, y = stream.next_batch()
             if device is not None:
                 x, y = x.to(device), y.to(device)
-            _, loss, _ = model(x, y)
+            _, loss, _ = model(x, y, **kw)
             assert loss is not None, "an eval batch must carry targets"
             total += float(loss)
             scored += int(x.numel())
     model.train(was_training)
     return total / max(batches, 1), scored
+
+
+def evaluate(
+    model: torch.nn.Module,
+    stream: ByteStream,
+    batches: int,
+    device: torch.device | str | None = None,
+    *,
+    depths: bool = False,
+) -> tuple[float, int] | dict[int, tuple[float, int]]:
+    """Mean held-out CE over `batches` windows + the BYTES those windows scored.
+
+    `rewind()` first, always: an eval that inherits the stream position is not
+    comparable with the previous one (AGENTS §2.6). No autodiff — burn's eval
+    runs never-backwarded graphs to OOM on the card.
+
+    `depths=True` is the ADAPTIVE DEPTH arm's measurement, the plan's
+    `--eval-depths`: one pass per depth `1..=max_iter` and a dict
+    `{T: (ce, bytes)}` back — the depth-efficiency curve. It trains nothing
+    (no optimizer, no `no_grad` gap) and needs a model that carries its own
+    `cfg.max_iter`.
+    """
+    if depths:
+        return {
+            d: _eval_loss(model, stream, batches, device, d)
+            for d in range(1, model.cfg.max_iter + 1)
+        }
+    return _eval_loss(model, stream, batches, device, None)
+
+
+def _eval_line(
+    model: torch.nn.Module,
+    stream: ByteStream,
+    cfg: TrainConfig,
+    max_iter: int,
+    device: torch.device | str | None,
+    fb: str,
+    step: int,
+) -> tuple[str, float, int]:
+    """The eval line, carrying the depth curve when the config asks for it.
+
+    `cfg.rand_depth` turns the curve on (the arm must show its own curve);
+    `cfg.eval_depths` requests it on a fixed-depth run. The line reports the
+    held-out loss at `max_iter` as its headline number, so the arm's curve and
+    the fixed-depth control are read off the same line.
+    """
+    curve = None
+    if cfg.rand_depth or cfg.eval_depths:
+        curve = evaluate(model, stream, cfg.eval_batches, device=device, depths=True)
+        ev, scored = curve[max_iter]
+    else:
+        ev, scored = evaluate(model, stream, cfg.eval_batches, device=device)
+    line = (
+        f"eval step={step} loss={ev:.4f} bpb={bpb(ev):.3f} over {scored} B "
+        f"({cfg.eval_batches} x {cfg.batch} x {cfg.seq_len}) {fb}"
+    )
+    if curve is not None:
+        line += " depths=" + ",".join(f"{d}:{curve[d][0]:.4f}" for d in sorted(curve))
+    return line, ev, scored
 
 
 def train(
@@ -267,7 +338,12 @@ def train(
         x, y = stream.next_batch()
         if device is not None:
             x, y = x.to(device), y.to(device)
-        logits, loss, step_counters = model(x, y)
+        # The ADAPTIVE DEPTH arm: T is the pure `(seed, step)` sample, and the
+        # loss divides by the depth actually run (`model.forward`/`loopblock`).
+        # `None` (the default and every other config) keeps the call unchanged.
+        depth = _sample_depth(cfg.seed, step, run.model.max_iter) if cfg.rand_depth else None
+        kw = {} if depth is None else {"depth": depth}
+        logits, loss, step_counters = model(x, y, **kw)
         assert logits.shape[-1] == run.model.vocab, "logits width != vocab"
         total.merge(step_counters)
         window.merge(step_counters)
@@ -349,11 +425,10 @@ def train(
                 )
 
         if cfg.eval and eval_stream is not None and (step + 1) % cfg.eval_every == 0:
-            ev, scored = evaluate(model, eval_stream, cfg.eval_batches, device=device)
-            log(
-                f"eval step={step + 1} loss={ev:.4f} bpb={bpb(ev):.3f} over {scored} B "
-                f"({cfg.eval_batches} x {cfg.batch} x {cfg.seq_len}) {fb_field(total)}"
+            line, ev, scored = _eval_line(
+                model, eval_stream, cfg, run.model.max_iter, device, fb_field(total), step + 1
             )
+            log(line)
             if sink is not None:
                 _row(event="eval", step=step + 1, loss=ev, bpb=bpb(ev), scored=scored)
 
@@ -362,11 +437,10 @@ def train(
             log(f"ckpt step={step + 1} -> {weights} ({snapshot})")
 
     if cfg.eval and eval_stream is not None and cfg.steps % cfg.eval_every != 0:
-        ev, scored = evaluate(model, eval_stream, cfg.eval_batches, device=device)
-        log(
-            f"eval step={cfg.steps} loss={ev:.4f} bpb={bpb(ev):.3f} over {scored} B "
-            f"({cfg.eval_batches} x {cfg.batch} x {cfg.seq_len}) {fb_field(total)}"
+        line, _ev, _scored = _eval_line(
+            model, eval_stream, cfg, run.model.max_iter, device, fb_field(total), cfg.steps
         )
+        log(line)
     return {
         "steps": cfg.steps,
         "loss": last_loss,

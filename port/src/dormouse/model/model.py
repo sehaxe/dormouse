@@ -89,17 +89,24 @@ class DormouseModel(nn.Module):
         input_ids: torch.Tensor,
         targets: torch.Tensor | None = None,
         counters: Counters | None = None,
+        depth: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, Counters]:
-        """`input_ids [b,t]` (+ `targets [b,t]`) → (logits `[b*t,vocab]`, loss, counters)."""
+        """`input_ids [b,t]` (+ `targets [b,t]`) → (logits `[b*t,vocab]`, loss, counters).
+
+        `depth` is the ADAPTIVE DEPTH arm's per-step loop depth (`None` =
+        `max_iter`, ADR-0013's fixed depth). It reaches the loop and the loss
+        divides by the depth ACTUALLY run, so steps of different `T` are
+        scale-comparable.
+        """
         counters = Counters() if counters is None else counters
         assert input_ids.dtype in (torch.long, torch.int64), "input_ids must be integer ids"
         assert input_ids.ndim == 2, f"input_ids must be [b, t], got {tuple(input_ids.shape)}"
         if self.bf_net is not None:
             logits, loss = self._forward_net(input_ids, targets, counters)
         elif self.bf is not None:
-            logits, loss = self._forward_channel(input_ids, targets, counters)
+            logits, loss = self._forward_channel(input_ids, targets, counters, depth)
         else:
-            logits, loss = self._forward_byte_lm(input_ids, targets, counters)
+            logits, loss = self._forward_byte_lm(input_ids, targets, counters, depth)
         counters.count("forward")
         return logits, loss, counters
 
@@ -121,6 +128,7 @@ class DormouseModel(nn.Module):
         input_ids: torch.Tensor,
         targets: torch.Tensor | None,
         counters: Counters,
+        depth: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Option B: front stage → this model's loop on K latents → back stage.
 
@@ -153,7 +161,7 @@ class DormouseModel(nn.Module):
         x = bf.in_proj(z)  # [b, k, d_model]
         # The loop, unchanged, on K patch latents. No byte ids: the memory arm
         # is refused with use_byteflow (validate), so nothing here needs them.
-        out_acc, _, _ = self.loop(x, None, None, None, counters=counters)
+        out_acc, _, _ = self.loop(x, None, None, None, counters=counters, depth=depth)
         logits = bf.net.decode_chunks(bf.out_proj(out_acc), h, sel)  # [b, t, vocab]
         flat = logits.reshape(-1, self.cfg.vocab)
         return flat, _byte_ce(flat, targets)
@@ -163,10 +171,13 @@ class DormouseModel(nn.Module):
         input_ids: torch.Tensor,
         targets: torch.Tensor | None,
         counters: Counters,
+        depth: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """The plain byte-level stack: embedding → loop → RMSNorm → lm_head."""
         h0 = self.embed(input_ids)
-        out, rec_sum, counters = self.loop(h0, input_ids, targets, self.lm_head, counters=counters)
+        out, rec_sum, counters = self.loop(
+            h0, input_ids, targets, self.lm_head, counters=counters, depth=depth
+        )
         # fp32 logits — the burn rule that fixes `bf16 logits NaN`: the final
         # norm and the head run in fp32 whatever the body computed in.
         hn = self.norm(out)
@@ -187,7 +198,15 @@ class DormouseModel(nn.Module):
             # term that makes the logits it RETURNS the logits it TRAINS.
             flat = targets.reshape(-1, 1)
             ce_final = -F.log_softmax(logits, dim=-1).gather(1, flat).mean()
-            loss = (rec_sum + ce_final) / (self.cfg.max_iter + 1)
+            # (Σ_i CE_i + CE_final) / (T + 1), unweighted, with T the depth this
+            # forward ACTUALLY ran. burn's code divided by `max_iter + 1`
+            # unconditionally; under the ADAPTIVE DEPTH arm that divisor is a
+            # constant that no longer counts the terms summed, so a T=1 step
+            # would read as the loss of a max_iter-deep model (and the arm's
+            # whole point — scale-comparable depths — would be invisible in
+            # the curve). One divisor, the count of terms it divides.
+            T = self.cfg.max_iter if depth is None else depth
+            loss = (rec_sum + ce_final) / (T + 1)
             if self.fb is not None:
                 # The same readout `lm_head` reads, the same graph (`fb.py`):
                 # no teacher forward, no detach, no second pass over the loop —

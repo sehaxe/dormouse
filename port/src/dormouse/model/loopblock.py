@@ -19,8 +19,10 @@ Mirrors `crates/dormouse-core/src/loop_block.rs`. One iteration, in order:
    accumulated inside the loop (deep supervision, burn's own shape), which is
    also why it is never materialized as `[T, b, t, d]`.
 
-There is no halt head and no PonderNet: depth is fixed and the per-iteration CE
-is an unweighted mean (ADR-0013).
+There is no halt head and no PonderNet: depth is fixed by default and the
+per-iteration CE is an unweighted mean (ADR-0013). The ADAPTIVE DEPTH arm
+passes `depth=T` to run `T` iterations instead, and the readout divides by the
+`T` actually run so different depths are scale-comparable.
 """
 
 from __future__ import annotations
@@ -127,22 +129,31 @@ class LoopBlock(nn.Module):
         targets: torch.Tensor | None = None,
         lm_head: nn.Module | None = None,
         counters: Counters | None = None,
+        depth: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, Counters]:
         """`h0 [b,t,d]` → (`mean readout [b,t,d]`, SUM of per-iteration mean CEs, counters).
 
         The CE is a SUM over iterations, not a mean: the model divides by the
         number of terms once it has added the final readout's own CE (see
         `model.DormouseModel.forward` for why that term exists).
+
+        `depth=None` runs `max_iter` iterations (ADR-0013's fixed depth,
+        unchanged); `depth=T` runs exactly `T` and the readout mean divides by
+        that `T`, never by `max_iter` — the ADAPTIVE DEPTH arm's contract.
+        `counters["depth"]` accumulates the depth each forward actually ran.
         """
         counters = Counters() if counters is None else counters
         b, t, d = h0.shape
         assert d == self.d, f"loop block width {self.d} != input {d}"
+        T = self.max_iter if depth is None else depth
+        assert 1 <= T <= self.max_iter, f"depth {T} outside 1..={self.max_iter}"
+        counters.count("depth", T)
         h = h0
         h0_flat = h0.reshape(b * t, d)
         out_acc = torch.zeros_like(h0)
         rec = torch.zeros((), dtype=torch.float32, device=h0.device)
         sources: list[torch.Tensor] = [h0] if self.use_attnres else []
-        for i in range(self.max_iter):
+        for i in range(T):
             counters.count("iter")
             ctx = h + self.iter_embed[i].view(1, 1, d)
             normed = self.norm(ctx)
@@ -213,4 +224,4 @@ class LoopBlock(nn.Module):
                 ce = -F.log_softmax(logits, dim=-1).gather(1, targets.reshape(-1, 1))
                 rec = rec + ce.mean()
         rec = None if targets is None else rec
-        return out_acc / self.max_iter, rec, counters
+        return out_acc / T, rec, counters
