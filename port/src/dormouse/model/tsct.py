@@ -12,9 +12,13 @@ the forward casts to bf16, matmuls, and returns fp32 — softmax/loss/KDA state
 stay fp32 at the arm boundary. `quant = "none"` is the day-one format and it
 resolves to bf16 factors; the STORAGE rungs (`fp8`, `nvfp4`) exist since
 2026-10-15 and dequantize inside the forward (see below); every other rung
-(LittleBit semantics, act quant) is still refused at CONFIG load (see
+(LittleBit semantics) is still refused at CONFIG load (see
 `config._refuse_ladder_rung`), so a rung can never silently compute bf16
-while the config reads a name it did not implement.
+while the config reads a name it did not implement. The activation side is a
+separate field (`config.act_quant`, `model/act_quant.py`), not a rung of this
+ladder: the factors stay bf16, only the activations the factor matmuls read are
+fake-quantized (with an STE), and the a4.8 attention rule is
+`act_quant.attn_format`.
 
 STORAGE rungs vs bf16, the exact mechanics (validated by test):
 * master fp32 factors are quantized elementwise to the storage format with
@@ -129,6 +133,9 @@ class TSCTLinear(nn.Module):
         bias: bool = False,
         factor_qat: str = "none",
         factor_qat_alpha: float = 1.0,
+        act_quant: str = "none",
+        act_group: int = 0,
+        attn_path: bool = False,
         device: torch.device | str = "cpu",
     ) -> None:
         super().__init__()
@@ -158,6 +165,31 @@ class TSCTLinear(nn.Module):
         #: fp32. `s` is never quantized — it IS the scale.
         self.factor_qat = factor_qat
         self.factor_qat_alpha = factor_qat_alpha
+        #: The a4.8 ACTIVATION switch (`act_quant.fake_quant_act`): the `x` that
+        #: feeds the factor matmuls is fake-quantized with an STE.
+        #: `attn_path` marks a projection that sits INSIDE the attention arm, and
+        #: then the format is upgraded to >= 8 bits (`act_quant.attn_format`) —
+        #: the a4.8 recipe's rule, unconditional. No call site in the port's graph
+        #: sets it yet: the KDA arm's q/k/v/g projections are dense `nn.Linear`
+        #: (`kda.py:131-133`) and `LoopBlock`'s one TSCT projection (`out_proj`) is
+        #: the readout AFTER attention+FFN, not inside attention.
+        self.act_quant = act_quant
+        self.act_group = act_group
+        self.attn_path = attn_path
+
+    def _act(self, x: torch.Tensor) -> torch.Tensor:
+        """The activation the factor matmuls see under `act_quant` (STE).
+
+        Lazily imported: `model/act_quant.py` imports the e2m1 grid FROM this
+        module (`_NVFP4_MAGNITUDES`), so a module-level import here would be a
+        cycle — the same lazy form `factor_qat_project` uses for `ternary`.
+        """
+        if self.act_quant == "none":
+            return x
+        from .act_quant import attn_format, fake_quant_act
+
+        fmt = attn_format(self.act_quant) if self.attn_path else self.act_quant
+        return fake_quant_act(x, fmt, self.act_group)
 
     def _factors(self) -> tuple[torch.Tensor, torch.Tensor]:
         """The forward's `(u, v)`: masters under `factor_qat`, else untouched."""
@@ -179,6 +211,7 @@ class TSCTLinear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         dt = self.compute_dtype
         u, v = self._factors()
+        x = self._act(x)  # a4.8: the activation feeding the factor matmuls
         if dt == torch.float32:
             y = ((x @ u) * self.s) @ v
         else:
@@ -422,10 +455,17 @@ def make_projection(
     *,
     rank: int | None = None,
     bias: bool = False,
+    attn_path: bool = False,
     device: torch.device | str = "cpu",
 ) -> nn.Module:
     """Spectral or dense, chosen once from `use_tsct` (a construction-time
-    decision, so the shape of the model cannot drift afterwards)."""
+    decision, so the shape of the model cannot drift afterwards).
+
+    `attn_path` is forwarded to `TSCTLinear` and means "this projection sits
+    inside the attention arm": the a4.8 activation upgrade (`act_quant.attn_format`)
+    then applies to it. It is inert on the dense rung (a dense factor-less
+    projection has no activation-format seam) and on `act_quant = "none"`.
+    """
     dtype = torch.bfloat16 if cfg.bf16 else torch.float32
     rank = cfg.rank if rank is None else rank
     if cfg.use_tsct:
@@ -437,6 +477,9 @@ def make_projection(
             bias=bias,
             factor_qat=cfg.factor_qat,
             factor_qat_alpha=cfg.factor_qat_alpha,
+            act_quant=cfg.act_quant,
+            act_group=cfg.act_group,
+            attn_path=attn_path,
             device=device,
         )
     return DenseLinear(in_features, out_features, dtype=dtype, bias=bias, device=device)

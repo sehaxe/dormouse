@@ -93,6 +93,7 @@ from torch.autograd.graph import saved_tensors_hooks
 from torch.utils.checkpoint import checkpoint
 
 from ..instrument import Counters
+from .act_quant import fake_quant_act
 from .tsct import factor_qat_project, mm_mixed
 
 try:  # the Triton arm is an ABILITY, not a dependency
@@ -198,6 +199,8 @@ class DualLatentGLU(nn.Module):
         dtype: torch.dtype,
         factor_qat: str = "none",
         factor_qat_alpha: float = 1.0,
+        act_quant: str = "none",
+        act_group: int = 0,
         device: torch.device | str = "cpu",
     ) -> None:
         super().__init__()
@@ -205,6 +208,13 @@ class DualLatentGLU(nn.Module):
         self.compute_dtype = dtype
         self.factor_qat = factor_qat
         self.factor_qat_alpha = factor_qat_alpha
+        #: The a4.8 ACTIVATION switch (`act_quant.fake_quant_act`): the `x` fed
+        #: to this expert's factor matmuls is fake-quantized with an STE. Same
+        #: switch the banked path in `SparseMoE` applies to its `x`, so one
+        #: expert through the bank and the same expert alone quantize their
+        #: activation identically (per-row/group scale, expert-independent).
+        self.act_quant = act_quant
+        self.act_group = act_group
         for name in ("gate", "up"):
             # `U [d, r]` and `s [r]`: the latent half of TSCT's factorization.
             setattr(
@@ -216,6 +226,10 @@ class DualLatentGLU(nn.Module):
 
     def forward(self, x: torch.Tensor, glu=None) -> torch.Tensor:
         dt = self.compute_dtype
+        if self.act_quant != "none":
+            # a4.8: the activation feeding the factor matmuls, quantized in the
+            # dtype it arrives in (fp32 masters, cast to `dt` after) with an STE.
+            x = fake_quant_act(x, self.act_quant, self.act_group)
         xu = x if dt == torch.float32 else x.to(dt)
         gate_u, up_u, v = self.gate_u, self.up_u, self.v
         if self.factor_qat != "none":
@@ -257,6 +271,14 @@ class SparseMoE(nn.Module):
         #: factor == dim=(1,2) slice) on the naive/shared path.
         self.factor_qat = cfg.factor_qat
         self.factor_qat_alpha = cfg.factor_qat_alpha
+        #: The a4.8 ACTIVATION quantization (`act_quant.fake_quant_act`): the
+        #: expert activations are fake-quantized with an STE — in the banked
+        #: branches here (the factors are reached through `bmm`, not through
+        #: `DualLatentGLU.forward`) and inside `DualLatentGLU` on the naive /
+        #: dense-loop paths. Both quantize the same `x` per row/group, so a
+        #: banked expert and the same expert alone agree.
+        self.act_quant = cfg.act_quant
+        self.act_group = cfg.act_group
         self.expert_act = cfg.expert_act
         self._glu = (
             None
@@ -280,6 +302,8 @@ class SparseMoE(nn.Module):
                 dtype=dtype,
                 factor_qat=cfg.factor_qat,
                 factor_qat_alpha=cfg.factor_qat_alpha,
+                act_quant=cfg.act_quant,
+                act_group=cfg.act_group,
                 device=device,
             )
             for _ in range(cfg.n_experts)
@@ -291,6 +315,8 @@ class SparseMoE(nn.Module):
             dtype=dtype,
             factor_qat=cfg.factor_qat,
             factor_qat_alpha=cfg.factor_qat_alpha,
+            act_quant=cfg.act_quant,
+            act_group=cfg.act_group,
             device=device,
         )
         # The router: ONE 2-D linear on the raw hidden state (not on the
@@ -320,6 +346,13 @@ class SparseMoE(nn.Module):
         dt = self.experts[0].compute_dtype  # the shared compute dtype
         logits = mm_mixed(x, self.router.weight, dt)  # bf16 tensor-core, fp32 out
         probs = F.softmax(logits, dim=-1)  # [n, E]
+        # a4.8: the activation quantization arm (COUNTED — a reader of the log
+        # line sees it) applies to the EXPERTS' activations only. The router
+        # above reads the raw state on purpose (`router` is a dense `nn.Linear`,
+        # no factor matmul, and routing must not be steered by a quantizer).
+        if self.act_quant != "none":
+            x = fake_quant_act(x, self.act_quant, self.act_group)
+            counters.count("act_quant_arms", n)
         weighted = torch.zeros(n, self.f, dtype=torch.float32, device=x.device)
         if self.moe_offload and self.topk == 0:
             # The offload switch is the ROUTED pass's (the capacity-padded bank

@@ -48,7 +48,6 @@ def test_unknown_key_refuses_and_names_the_escape():
         ("use_mor", "true", "Mixture-of-Recursions"),
         ("use_situ", "true", "SiTU-GLU"),
         ("jepa_weight", "0.05", "JEPA"),
-        ("act_quant", '"int8"', "activation quantization"),
     ],
 )
 def test_missing_mechanisms_refuse_when_non_default(key, value, mechanism):
@@ -57,7 +56,8 @@ def test_missing_mechanisms_refuse_when_non_default(key, value, mechanism):
     `use_byteflow` used to be in this list; it left it the day the port landed
     the crate's five stages (`byteflow.py`), and its own coherence rules are
     pinned in `test_byteflow_*` below. `aux_fb_weight` left it the same way
-    when the future-byte head landed (`model/fb.py`, `tests/test_fb.py`).
+    when the future-byte head landed (`model/fb.py`, `tests/test_fb.py`), and
+    `act_quant` left it with `model/act_quant.py` (`tests/test_act_quant.py`).
     """
     with pytest.raises(LoudError) as e:
         parse_preset(f"d_model = 64\nn_heads = 4\nhead_dim = 16\n{key} = {value}\n")

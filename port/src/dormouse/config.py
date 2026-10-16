@@ -64,6 +64,17 @@ EXPERT_ACTS = ("silu", "situ", "memglu")
 #: sprint's arms; a new rung lands WITH its gold test
 #: (`tests/test_factor_qat.py`) before this tuple grows.
 FACTOR_QATS = ("none", "ternary", "binary")
+#: The `act_quant` literals — the a4.8 ACTIVATION formats (`model/act_quant.py`,
+#: transcribed from `crates/dormouse-core/src/act_quant.rs`): `none` = no
+#: activation quantization (every number on record); `int8`/`int4` = symmetric
+#: integer levels `2^(bits-1)-1` (127/7); `fp4` = e2m1, the OCP MX FP4 grid
+#: (8 magnitudes, `tsct._NVFP4_MAGNITUDES`) scaled onto the format's MAX, which
+#: is what makes all 8 reachable (the old 3-level bug: AGENTS §3.7 act-quant).
+#: The attention path is upgraded to >= 8 bits unconditionally
+#: (`act_quant.attn_format`), so `fp4`/`int4` never run 4-bit attention. A new
+#: format lands WITH its gold test (`tests/test_act_quant.py`) before this tuple
+#: grows.
+ACT_QUANTS = ("none", "int8", "int4", "fp4")
 #: The `ns_kind` literals — the Newton–Schulz arms the Muon group runs
 #: (`optim.NS_KINDS`, which is where they are executed; the list is duplicated
 #: here the way `MOE_KERNELS` is, so the config layer does not import the
@@ -284,7 +295,21 @@ class ModelConfig:
     msa_capacity_ratio: float = 0.25
     adaptive_msa: bool = False
     jepa_weight: float = _unsupported(0.0, "JEPA + KoLeo aux heads")
-    act_quant: str | None = _unsupported(None, "BitNet-style activation quantization (STE)")
+    #: BitNet a4.8 ACTIVATION quantization (`ACT_QUANTS`, formulas in
+    #: `model/act_quant.py`, transcribed from `crates/dormouse-core/src/act_quant.rs`):
+    #: the activations that feed the factor matmuls are fake-quantized with an STE
+    #: while the fp32 masters — and the activation graph — stay fp32. `none` is
+    #: every number on record. Wired at three seams: `TSCTLinear.forward` (the
+    #: readout and `lm_head`; any TSCT factor projection ON the attention path
+    #: takes the a4.8 upgrade via `attn_path=True`), `DualLatentGLU.forward` (the
+    #: experts) and the expert bank in `SparseMoE`. The ROUTER input and the KDA
+    #: internals are out of scope by design.
+    act_quant: str = "none"
+    #: Activation columns per scale: 0 = one scale per token (row), else one per
+    #: group of `act_group` columns (the a4.8 FFN recipe). Must divide `d_model`,
+    #: because the quantizer reshapes the activations to `[..., d/group, group]`
+    #: and a non-divisor fails on the first forward, far from the flag (`validate`
+    #: refuses it, mirroring `config/validation.rs:220-231`).
     act_group: int = 0
 
     # --- hashed n-gram memory (Engram) ---------------------------------
@@ -553,6 +578,37 @@ def validate(model: ModelConfig) -> None:
             f"factor_qat_alpha={model.factor_qat_alpha} with factor_qat='none' "
             f"is inert — the quantizer is off, so the blend has nothing to "
             f"blend toward. Escape: set factor_qat, or leave alpha at 1.0."
+        )
+    if model.act_quant not in ACT_QUANTS:
+        loud(
+            f"act_quant={model.act_quant!r} is not an activation format. Known: "
+            f"{list(ACT_QUANTS)} — `none` off, `int8`/`int4` symmetric integer "
+            f"levels (arXiv 2504.12285 §2.2; 127/7, formulas in "
+            f"model/act_quant.py), `fp4` e2m1 (the OCP MX FP4 grid). Escape: name "
+            f"one of those, or land the format and its gold test "
+            f"(tests/test_act_quant.py) BEFORE the config can lie about it."
+        )
+    if model.act_group < 0:
+        loud(
+            f"act_group={model.act_group} is negative: it is a block width in "
+            f"activation columns (0 = one scale per token). Escape: 0, or a "
+            f"positive divisor of d_model={model.d_model}."
+        )
+    if model.act_quant != "none" and model.act_group != 0 and model.d_model % model.act_group != 0:
+        loud(
+            f"act_group={model.act_group} must divide d_model={model.d_model} (or "
+            f"be 0 for one scale per token): the quantizer groups the activations "
+            f"in blocks of act_group and reshapes to [..., d_model/act_group, "
+            f"act_group], so a non-divisor fails the reshape on the first "
+            f"forward, a long way from the flag that set it "
+            f"(config/validation.rs:220-231). Escape: pick a divisor of "
+            f"d_model, or 0."
+        )
+    if model.act_group != 0 and model.act_quant == "none":
+        loud(
+            f"act_group={model.act_group} with act_quant='none' is inert — the "
+            f"quantizer is off, so there is no block to group. Escape: set "
+            f"act_quant, or leave act_group at 0."
         )
     if model.use_byteflow:
         _validate_byteflow(model)
