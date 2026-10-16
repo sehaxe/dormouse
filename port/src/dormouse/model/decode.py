@@ -30,8 +30,15 @@ def decode_bytes(
     temp: float = DEFAULT_TEMP,
     device: torch.device | str | None = None,
     generator: torch.Generator | None = None,
+    stop: frozenset[int] | None = None,
 ) -> bytes:
-    """Return `prompt + n_new` sampled bytes, temperature-scaled logits."""
+    """Return `prompt + n_new` sampled bytes, temperature-scaled logits.
+
+    `stop` names bytes that END the reply (the SFT template's `0x03`): a
+    generated stop byte is appended and generation returns early, so the
+    caller never has to trim the model's padding habits out of a reply. The
+    default (`None`) keeps the historical contract — exactly `n_new` bytes.
+    """
     if not prompt:
         loud("decode needs a non-empty prompt (the first window is the prompt)")
     if temp <= 0:
@@ -48,5 +55,7 @@ def decode_bytes(
             probs = torch.softmax(logits / temp, dim=-1)
             nxt = int(torch.multinomial(probs, 1, generator=generator))
             ctx.append(nxt)
+            if stop is not None and nxt in stop:
+                break
     model.train(was_training)
     return bytes(ctx)

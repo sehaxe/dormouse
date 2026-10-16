@@ -122,6 +122,10 @@ class ServeState:
         self.lock = threading.Lock()
 
 
+#: Bytes that end a reply: the SFT template's end-of-answer, plus its pad.
+_STOP = frozenset({0x03, 0x00})
+
+
 def _generate(state: ServeState, prompt: bytes, n: int, chunk: int = STREAM_BYTES) -> Iterator[str]:
     """`n` bytes past `prompt`, decoded incrementally, as text pieces."""
     if not prompt:
@@ -135,7 +139,16 @@ def _generate(state: ServeState, prompt: bytes, n: int, chunk: int = STREAM_BYTE
         k = min(chunk, n - done)
         with state.lock:
             ctx = decode_bytes(
-                state.model, ctx, k, temp=state.temp, device=state.device, generator=gen
+                state.model,
+                ctx,
+                k,
+                temp=state.temp,
+                device=state.device,
+                generator=gen,
+                # The SFT template's end-of-answer byte (0x03) ENDS a reply:
+                # without it the model pads a finished answer with its
+                # neighbours' tails, which is what the first chat smoke showed.
+                stop=_STOP,
             )
         done += k
         text = dec.decode(ctx[-k:])

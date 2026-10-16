@@ -166,3 +166,18 @@ def test_assemble_renders_the_plain_dialogue():
     assert assemble([{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]) == (
         b"System: s\nUser: u\nAssistant:"
     )
+
+
+def test_a_stop_byte_ends_the_reply(tmp_path):
+    """The SFT template's 0x03 ends a reply: the streamed and non-streamed
+    content both stop at it instead of running to max_tokens."""
+    from dormouse.model.decode import decode_bytes
+
+    model = tiny_model()
+    gen = torch.Generator().manual_seed(0)
+    out = decode_bytes(
+        model, b"\x01 hi \n\x02 ", 64, temp=1.0, generator=gen, stop=frozenset({0x03})
+    )
+    assert len(out) <= 64 + 8  # bounded by n_new; the early exit only shortens
+    out2 = decode_bytes(model, b"\x01 hi \n\x02 ", 64, temp=1.0, generator=gen)
+    assert len(out2) == 64 + len(b"\x01 hi \n\x02 ")  # default: no early exit
