@@ -167,3 +167,17 @@ def test_small_arithmetic_matches_the_model_and_the_preset():
     # The Engram share, the number the memory budget is argued from.
     rows = want["engram_tables"]
     assert round(100 * rows / SMALL_PORT_TOTAL, 1) == 33.2  # burn measured 34.2%
+
+
+MEDIUM_PORT_TOTAL = 141_910_405  # the recipe-validation preset (2026-10-16)
+
+
+def test_medium_arithmetic_matches_the_model_and_the_preset():
+    cfg = load_preset("medium")
+    model = DormouseModel(cfg, device="meta")
+    want = arithmetic(cfg)
+    assert built(model) == want
+    assert sum(want.values()) == MEDIUM_PORT_TOTAL == param_count(model)
+    assert want["engram_tables"] == 3 * 524288 * 32 == 50_331_648
+    # The b1-bet shapes survive the halving: rank-64 experts, topk-2, depth 4.
+    assert cfg.rank == 64 and cfg.moe_topk == 2 and cfg.max_iter == 4

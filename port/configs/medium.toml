@@ -1,0 +1,58 @@
+# port preset: medium — the fast recipe-validation run (owner 2026-10-16:
+# "поскорее перейти к обучению... можно меньше чем миллиард").
+#
+# NOT a ladder step and NOT an A/B polygon (small is that): one short series
+# on the REAL corpus, to validate the whole b1 recipe (MoE+LFB, KDA, Engram,
+# MSA+adaptive, loop depth 4, Muon/ColRow, engram_ram) at a scale where the
+# b1-class effects are visible and a run costs hours, not days. ~142M params:
+# big enough that the 9.2M artifacts (overfit at ~step 50, degenerate router)
+# cannot hide a broken mechanism; small enough for a same-day curve.
+#
+# Geometry = b1's, halved where it scales: d 2048->1024, d_ffn 5461->2730,
+# E 1024->256; rank-64 and topk-2 kept (they are the TSCT bet), engram rows
+# 4M->512K (tables 100.7M -> 50.3M params).
+#
+# The param arithmetic is pinned by tests/test_param_count.py (independent
+# hand sum vs the instantiated model), like small and b1.
+
+d_model = 1024
+n_heads = 16
+head_dim = 64
+d_ffn = 2730
+vocab = 256
+max_seq_len = 1024
+max_iter = 4
+rank = 64
+norm_eps = 0.001
+bf16 = true
+quant = "none"
+use_kda = true
+use_tsct = true
+use_engram = true
+use_attnres = false
+loom = false
+n_experts = 256
+moe_topk = 2
+moe_capacity = 2.0
+moe_offload = false
+shared_rank = 192
+engram_rows = 524288
+engram_orders = [2, 3, 4]
+engram_dim = 32
+engram_lam_max = 0.5
+use_gr = false
+use_mhc = false
+use_mor = false
+use_situ = false
+use_byteflow = false
+moe_lb_coef = 0.01
+jepa_weight = 0.0
+dspark_weight = 0.0
+aux_fb_weight = 0.0
+sigreg_weight = 0.0
+act_group = 0
+use_msa = true
+msa_topk = 32
+msa_block = 4
+msa_capacity_ratio = 0.25
+adaptive_msa = true
