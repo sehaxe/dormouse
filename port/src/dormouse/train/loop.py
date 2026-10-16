@@ -423,6 +423,18 @@ def train(
     if stream is None:
         stream, eval_stream = open_streams(run)
     model.train()
+    if run.model.factor_qat == "ternary_s3t":
+        # The ADR-0021 caveat, said where a reader of the log meets it. The
+        # projector has no step index, so the S3T mask is a process-local
+        # generator's stream (seeded from `factor_qat_seed`): reproducible
+        # within a run, NOT continued by a resume. A degradation a reader
+        # cannot see is a defect (`tsct.factor_qat_project`).
+        log(
+            f"factor_qat=ternary_s3t: the S3T Bernoulli mask is a process-local "
+            f"stream seeded {run.model.factor_qat_seed} — a resumed run restarts "
+            f"it, so its masks differ from an unbroken run's. Reproducible within "
+            f"one run only."
+        )
     if cfg.engram_ram:
         # BEFORE the optimizer exists: on the host path the tables are not
         # parameters, so no group, no grad clip and no checkpoint half ever

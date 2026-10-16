@@ -56,11 +56,6 @@ certificate; the analytic bound asserted by the gold test is
 WHAT IS **NOT** HERE (each has a home, none is wired — YAGNI until a lane needs
 it):
 
-* the Hadamard rotation of BitNet v2 (`model/hadamard.py`'s `v2_quantize`) — the
-  ROTATED arm, a different format family; this module is the plain a4.8 one.
-* MXFP4/MXFP8 steel formats (`model/mxfp.py`) — power-of-two block scales and
-  4-bit PACKED storage, not a linear scale + group, and a codec rather than an
-  activation fake-quant.
 * `ternary.activation_quant_8bit` — the same object for `int8` + `group=0`: its
   scale is `block_max` and it multiplies by 127 explicitly, which is this
   module's `block_max / 127` (the values agree to within the order of the two
@@ -70,6 +65,27 @@ it):
   quantizer drifting apart is the defect that shape produced on the burn side
   (`tsct.factor_qat_project`'s docstring); the equivalence to
   `activation_quant_8bit` is pinned by test so a drift fails loudly.
+
+THE THREE IMPORTED FORMATS (they are rungs HERE since 2026-10-16, and each
+keeps its own estimator — this module does not re-implement any of them):
+
+* `mxfp8` → `mxfp.fake_quant_mx(x, "mxfp8")`: the OCP MX codec's per-32 e8m0
+  power-of-two block scales and the e4m3 element grid (spec §5.2 Table 1). It
+  carries its own block grid, so `act_group` is refused (LOUD) rather than
+  silently ignored, and a last dim that is not a multiple of 32 is PADDED
+  per row, quantized and sliced back — one padding rule for both MX consumers
+  (`mxfp.fake_quant_mx`'s docstring carries the exactness argument).
+* `v2_int4` / `v2_int8` → `hadamard.v2_quantize(x, 4|8)`: BitNet v2's
+  Hadamard rotation → per-token int quant → rotate back (arXiv:2504.18415,
+  `burn-bitnet/src/quant/activations.rs`). The FWHT needs a **2^k** last dim and
+  that is a LOUD refusal, NOT a pad — zero-padding to 2^k changes the rotation
+  basis (`fwt.rs:105-112`), where padding an MX block only changes which tail
+  columns share a scale.
+
+Both of those modules return an **STE'd** tensor (`x + (dq − x).detach()` is
+their own last line), so [`fake_quant_act`] hands their result straight through
+instead of wrapping it a second time: the value is identical, and one estimator
+in one place is what makes a divergence visible.
 
 Verified by `tests/test_act_quant.py` (CPU, fp32); no external oracle exists for
 the exact error bounds, so the bound asserted is the format's own analytic one
@@ -81,10 +97,22 @@ from __future__ import annotations
 import torch
 
 from ..instrument import loud
+from .hadamard import v2_quantize
+from .mxfp import E4M3_MAX, fake_quant_mx
 from .tsct import _NVFP4_MAGNITUDES as _E2M1
 
-#: The activation formats: `none` (off), the symmetric integers and e2m1 fp4.
-ACT_FORMATS = ("none", "int8", "int4", "fp4")
+#: The activation formats: `none` (off), the a4.8 symmetric integers and e2m1
+#: fp4, then the two families that bring their own scale rule — the OCP MX
+#: codec (`mxfp8`, per-32 e8m0 blocks) and BitNet v2's rotated integer arms
+#: (`v2_int4`/`v2_int8`, per-token absmax after the FWHT).
+ACT_FORMATS = ("none", "int8", "int4", "fp4", "mxfp8", "v2_int4", "v2_int8")
+
+#: The formats whose scale is NOT `block_max / max_value(...)`: they carry
+#: their own grid (`mxfp8`: 32-wide e8m0 blocks, `mxfp.fake_quant_mx`) or their
+#: own rotation + per-token absmax (`v2_*`, `hadamard.v2_quantize`). `act_group`
+#: has nothing to group on them, so it is refused rather than silently ignored,
+#: and `fake_quant_act` does not re-wrap their (already STE'd) result.
+_OWN_GRID_FORMATS = ("mxfp8", "v2_int4", "v2_int8")
 
 #: The scale guard: an all-zero block must quantize to zeros, not to NaN.
 _EPS = 1e-8
@@ -94,8 +122,17 @@ def max_value(fmt: str) -> float:
     """The format's largest magnitude, and therefore what a block max maps ONTO.
 
     fp4 → 6.0 (`_E2M1`'s top), int8 → 127, int4 → 7 — `2^(b-1) − 1`
-    (`act_quant.rs:54-59`). `none` is the identity format: it has no max and is
-    refused here rather than answered with a number that would silently scale.
+    (`act_quant.rs:54-59`); the imported families keep their own maxima (e4m3 →
+    448, the MX spec's element max; `v2_*` → 7/127, the a4.8 levels after the
+    rotation). `none` is the identity format: it has no max and is refused here
+    rather than answered with a number that would silently scale.
+
+    The three `_OWN_GRID_FORMATS` never CALL this — their scale is the codec's
+    (`ceil(log2(amax/448))`) or the rotated token absmax — but their maxima are
+    still what their block/token max is scaled against (`v2_*`: exactly, the
+    token max lands on 7/127; `mxfp8`: the ceiling keeps it inside [224, 448]),
+    so the table stays complete and a reader asking "how big can this format
+    get" gets one answer.
     """
     if fmt == "fp4":
         return _E2M1[-1]
@@ -103,10 +140,17 @@ def max_value(fmt: str) -> float:
         return 127.0
     if fmt == "int4":
         return 7.0
+    if fmt == "mxfp8":
+        return E4M3_MAX
+    if fmt == "v2_int8":
+        return 127.0
+    if fmt == "v2_int4":
+        return 7.0
     loud(
         f"act_quant max_value({fmt!r}): no format max — known: "
         f"{[f for f in ACT_FORMATS if f != 'none']} (fp4 = e2m1's 6.0, int8 = 127, "
-        f"int4 = 7). Escape: pass a real format, or ask `none` for nothing."
+        f"int4 = 7, mxfp8 = e4m3's {E4M3_MAX}, v2_int8 = 127, v2_int4 = 7). "
+        f"Escape: pass a real format, or ask `none` for nothing."
     )
 
 
@@ -117,15 +161,27 @@ def attn_format(fmt: str) -> str:
     — `fp4` and `int4` run 8-bit attention, never 4-bit, and a reading that
     claims otherwise measured the FFN path alone. `none` stays `none` (the whole
     arm off).
+
+    The two imported families are OURS, not a line in `act_quant.rs`, and each
+    is read the way its own source reads it: `mxfp8` is already 8 bits (e4m3),
+    so it stays `mxfp8`; `v2_int4` becomes `v2_int8`, because the rotated 8-bit
+    arm IS BitNet v2's published activation format (arXiv:2504.18415) — dropping
+    to the unrelated plain `int8` would measure a different arm on the attention
+    path than the one the rung names.
     """
     if fmt == "none":
         return "none"
-    if fmt in ("fp4", "int4", "int8"):
+    if fmt in ("int8", "mxfp8", "v2_int8"):
+        return fmt
+    if fmt in ("fp4", "int4"):
         return "int8"
+    if fmt == "v2_int4":
+        return "v2_int8"
     loud(
         f"act_quant attn_format({fmt!r}) is not a format: known {list(ACT_FORMATS)}. "
-        f"The attention path is upgraded to int8 for every 4-bit format "
-        f"(act_quant.rs:38-46). Escape: name one of those."
+        f"The attention path is upgraded to >= 8 bits for every 4-bit format "
+        f"(act_quant.rs:38-46; `v2_int4` upgrades inside its own family). Escape: "
+        f"name one of those."
     )
 
 
@@ -142,8 +198,18 @@ def _check(x: torch.Tensor, fmt: str, group: int) -> None:
             f"act_quant: {fmt!r} is not an activation format. Known: "
             f"{list(ACT_FORMATS)} — `none` off, `int8`/`int4` symmetric integer "
             f"levels (127/7, act_quant.rs:54-59), `fp4` e2m1 (8 magnitudes, "
-            f"tsct.py:216). Escape: name one of those, or land the format and its "
+            f"tsct.py:216), `mxfp8` the OCP MX e4m3 codec (per-32 e8m0 blocks, "
+            f"mxfp.py), `v2_int4`/`v2_int8` BitNet v2's rotated integer arms "
+            f"(hadamard.py). Escape: name one of those, or land the format and its "
             f"gold test (tests/test_act_quant.py) before the config can lie about it."
+        )
+    if fmt in _OWN_GRID_FORMATS and group != 0:
+        loud(
+            f"act_quant {fmt} carries its own scale grid (mxfp8: 32-wide e8m0 "
+            f"blocks; v2_*: per-token absmax after the FWHT), so act_group={group} "
+            f"is INERT here — the quantizer would silently ignore it. Escape: "
+            f"act_group=0, or a format whose scale is `block_max / max_value` "
+            f"(int8/int4/fp4)."
         )
     if not x.is_floating_point():
         loud(
@@ -215,10 +281,23 @@ def quantize_act(x: torch.Tensor, fmt: str, group: int = 0) -> torch.Tensor:
     tile the last dim (LOUD otherwise). The scale is `block_max / max_value(fmt)`,
     so the block max lands on the format's top level — see the module docstring
     for why `block_max` alone is the 3-level bug.
+
+    The three `_OWN_GRID_FORMATS` do not take that path: they hand the tensor to
+    the module that owns their estimator — `mxfp.fake_quant_mx(x, "mxfp8")`
+    (per-row pad, per-32 e8m0 scales, e4m3 elements) or
+    `hadamard.v2_quantize(x, 4|8)` (FWHT rotate → per-token int → rotate back) —
+    and `group != 0` is refused for them (their grid is not the caller's to
+    choose). Their returned VALUE is the dequantized activation, and because
+    those modules end in `x + (dq − x).detach()` their gradient through this
+    function is the identity too: same contract, one estimator per family.
     """
     if fmt == "none":
         return x
     _check(x, fmt, group)
+    if fmt == "mxfp8":
+        return fake_quant_mx(x, "mxfp8")
+    if fmt in ("v2_int4", "v2_int8"):
+        return v2_quantize(x, 4 if fmt == "v2_int4" else 8)
     xf = x.float()
     d = xf.shape[-1]
     fmax = max_value(fmt)
@@ -246,8 +325,15 @@ def fake_quant_act(x: torch.Tensor, fmt: str, group: int = 0) -> torch.Tensor:
 
     Forward sees the quantized value; backward is the identity, so the fp32
     masters keep a gradient (`round` has none, `act_quant.rs:103-104`).
+
+    The `_OWN_GRID_FORMATS` are handed through WITHOUT this wrap: their module
+    already returns its own STE'd tensor (its last line is exactly this
+    expression), and wrapping it twice would compute the same value while
+    hiding which layer owns the estimator. One STE, one place.
     """
     if fmt == "none":
         return x
+    if fmt in _OWN_GRID_FORMATS:
+        return quantize_act(x, fmt, group)
     xq = quantize_act(x, fmt, group)
     return x + (xq - x).detach()

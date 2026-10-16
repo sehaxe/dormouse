@@ -50,13 +50,19 @@ from .dspark import DSparkHead, dspark_aux_loss
 from .fb import FutureByteHead, future_byte_loss
 from .loopblock import LoopBlock
 from .sigreg import sigreg_loss, stride_sample
-from .tsct import make_projection
+from .tsct import make_projection, set_factor_qat_seed
 
 
 class DormouseModel(nn.Module):
     def __init__(self, cfg: ModelConfig, *, device: torch.device | str = "cpu") -> None:
         super().__init__()
         self.cfg = cfg
+        # `factor_qat_seed`'s ONE consumer (`tsct.set_factor_qat_seed`): the S3T
+        # mask stream is a process-local generator, and a model build is its
+        # boundary — the trainer builds one model per process, so the config
+        # field reaches the arm here and nowhere else (a seed with no build
+        # behind it would be the config-field-that-lies defect).
+        set_factor_qat_seed(cfg.factor_qat_seed)
         #: The byteflow arm, under ONE flag with two shapes (`byteflow.py`'s
         #: Option A/B): `bf_net` is the standalone net (no loop arm is on, so
         #: the loop is not built at all — no dormant parameter tree), `bf` is

@@ -320,6 +320,58 @@ def fake_quant_mxfp8(w: torch.Tensor) -> torch.Tensor:
     return w + (dq - w).detach()
 
 
+def fake_quant_mx(w: torch.Tensor, fmt: str) -> torch.Tensor:
+    """`fake_quant_mxfp4`/`fake_quant_mxfp8` for ANY last dim — pad, quantize, slice back.
+
+    THE PADDING RULE, in one place for both consumers (the factor projector and
+    the activation seam, so the two can never disagree): the last dim is
+    zero-padded UP to a multiple of `BLOCK` (≤ 31 columns), the PADDED view is
+    fake-quantized, and the result is sliced back to the original width. MX has
+    no partial block (§5.2 Table 1 fixes k=32) and [`_blocks`] refuses one, so
+    the caller decides — this is that decision, taken once.
+
+    WHY PADDING IS EXACT HERE, not an approximation (`fake_quant_mxfp4`'s own
+    contract is unchanged and still refuses a bad width):
+    * the block scale is `ceil(log2(amax / elem_max))` and a zero never raises an
+      `amax`, so every block holding a real element keeps the scale it would
+      have had alone;
+    * the pad is PER ROW — torch pads the last dim of every `[..., n]` row — so
+      no block ever mixes two rows. Therefore the `[E, d, r]` expert bank
+      quantizes to exactly the values E separate `[d, r]` slices get, for an
+      ALIGNED `r` (`r % 32 == 0`, blocks already inside one row's last dim) and
+      for a padded one alike. That is the equality that makes a banked expert
+      identical to the same expert run alone, and it is pinned by test;
+    * the STE residual is subtracted on the PADDED tensor and sliced AFTER, so
+      every real element's gradient is exactly 1 (`fake_quant_mxfp4`'s
+      straight-through) and the pad's is discarded.
+
+    COST: ≤ 31 extra columns per row, i.e. one extra block per row of scale
+    bytes — `bytes_per_elements_mxfp4` / `bytes_per_elements_mxfp8` already
+    count a partial tail block whole, so the accounting above the codec is
+    unchanged. A caller that would rather refuse calls
+    `fake_quant_mxfp4`/`fake_quant_mxfp8` directly: `_blocks` names the shape
+    and the escape.
+    """
+    fns = {"mxfp4": fake_quant_mxfp4, "mxfp8": fake_quant_mxfp8}
+    if fmt not in fns:
+        loud(
+            f"fake_quant_mx: {fmt!r} is not an MX format. Known: {list(fns)} — "
+            f"`mxfp4` e2m1 and `mxfp8` e4m3, the two concrete rows of §5.2 Table 1. "
+            f"Escape: name one of those."
+        )
+    if w.dim() == 0 or w.shape[-1] == 0:
+        loud(
+            f"fake_quant_mx({fmt}): MX blocks run along the LAST dim and this "
+            f"tensor is {tuple(w.shape)}. Escape: pass [..., features] with "
+            f"features >= 1."
+        )
+    n = w.shape[-1]
+    pad = (-n) % BLOCK
+    if pad:
+        w = torch.nn.functional.pad(w, (0, pad))
+    return fns[fmt](w)[..., :n]
+
+
 def bytes_per_elements_mxfp4(n: int) -> int:
     """Packed MXFP4 bytes for `n` elements INCLUDING the e8m0 scale bytes.
 

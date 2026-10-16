@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from dormouse.config import ModelConfig, load_preset, load_run, parse_preset
 from dormouse.instrument import LoudError
@@ -28,6 +29,9 @@ from dormouse.model.act_quant import (
     quantize_act,
 )
 from dormouse.model.experts import DualLatentGLU, SparseMoE
+from dormouse.model.hadamard import v2_quantize
+from dormouse.model.mxfp import BLOCK as MX_BLOCK
+from dormouse.model.mxfp import fake_quant_mxfp8
 from dormouse.model.ternary import activation_quant_8bit
 from dormouse.model.tsct import TSCTLinear
 
@@ -272,10 +276,19 @@ def test_none_is_the_identity_and_all_zero_blocks_are_safe():
 
 
 def test_attn_format_upgrades_every_4_bit_format():
-    """`act_quant.rs:38-46`, unconditional: fp4/int4 → int8, int8 → int8."""
+    """`act_quant.rs:38-46`, unconditional: fp4/int4 → int8, int8 → int8.
+
+    The two imported families are read the way their own source reads them:
+    `mxfp8` is already 8 bits (e4m3) and stays itself, and `v2_int4` upgrades
+    INSIDE BitNet v2 (arXiv 2504.18415's activation format is the rotated
+    integer arm at 8 bits) rather than dropping to the unrelated plain `int8`.
+    """
     assert attn_format("fp4") == "int8"
     assert attn_format("int4") == "int8"
     assert attn_format("int8") == "int8"
+    assert attn_format("mxfp8") == "mxfp8"
+    assert attn_format("v2_int4") == "v2_int8"
+    assert attn_format("v2_int8") == "v2_int8"
     assert attn_format("none") == "none"
     with pytest.raises(LoudError, match="not a format"):
         attn_format("int3")
@@ -469,3 +482,174 @@ def test_banked_dense_bmm_quantizes_the_same_activation_as_the_module():
     off.load_state_dict(moe.state_dict())
     with torch.no_grad():
         assert not torch.equal(off(x), got), "the banked branch ignored the arm"
+
+
+# --------------------------------------------------------------------------
+# the imported families: mxfp8 (OCP MX) and v2_int4/v2_int8 (BitNet v2 FWHT)
+# --------------------------------------------------------------------------
+
+
+def _mxfp8_ref(x: torch.Tensor) -> torch.Tensor:
+    """The pad rule spelled out: zero-pad the last dim per row to a 32-multiple."""
+    n = x.shape[-1]
+    pad = (-n) % MX_BLOCK
+    if pad:
+        x = torch.nn.functional.pad(x, (0, pad))
+    return fake_quant_mxfp8(x)[..., :n]
+
+
+def test_mxfp8_on_a_768_activation_is_exactly_the_mx_module():
+    """The wiring claim: the seam hands `x` to `mxfp`, it does not reimplement it.
+
+    `d_model = 768 = 24·32` is the real preset width, so this is the no-pad
+    path; the assertion is bit-equality with the module's own fake-quant, i.e.
+    the seam adds NOTHING (no second STE, no re-scale).
+    """
+    x = _randn(6, 768, seed=31)
+    got = fake_quant_act(x, "mxfp8")
+    assert torch.equal(got, fake_quant_mxfp8(x))
+    assert torch.equal(quantize_act(x, "mxfp8"), fake_quant_mxfp8(x))
+    assert not torch.equal(got, x), "the arm must quantize"
+
+
+def test_mxfp8_pads_a_non_multiple_of_32_last_dim_and_the_module_still_refuses():
+    """1000 = 31·32 + 8: padded per row here, LOUD in `mxfp` itself."""
+    x = _randn(4, 1000, seed=5)
+    got = fake_quant_act(x, "mxfp8")
+    assert got.shape == x.shape and bool(torch.isfinite(got).all())
+    assert torch.equal(got, _mxfp8_ref(x))
+    per_row = torch.cat([_mxfp8_ref(x[i : i + 1]) for i in range(4)])
+    assert torch.equal(got, per_row), "the pad must be per row, not one flat tail"
+    with pytest.raises(LoudError, match="divisible by 32"):
+        fake_quant_mxfp8(x)
+
+
+def test_mxfp8_model_forward_runs_and_moves_the_logits():
+    from conftest import tiny_model
+
+    a, b = tiny_model(), tiny_model(act_quant="mxfp8")
+    b.load_state_dict(a.state_dict())
+    x = torch.randint(0, 256, (2, 16))
+    with torch.no_grad():
+        la, _, _ = a(x, x)
+        lb, _, cnt = b(x, x)
+    assert bool(torch.isfinite(lb).all())
+    assert not torch.equal(la, lb)
+    assert cnt.get("act_quant_arms", 0) > 0, "the arm must reach the MoE, not idle"
+
+
+def test_v2_int4_forward_equals_v2_quantize_through_the_same_weights():
+    """Wiring, not reimplementation: the expert seam feeds `v2_quantize(x, 4)`.
+
+    The expected value is computed from the module directly, so this pins the
+    FORMAT and the rotation reaching the factor matmuls — a seam that quantized
+    a different width or skipped the rotation would fail here.
+    """
+    torch.manual_seed(0)
+    d, f, r = 64, 32, 8
+    m = DualLatentGLU(d, f, r, dtype=torch.float32, act_quant="v2_int4")
+    x = _randn(4, d, seed=17)
+    with torch.no_grad():
+        got = m(x)
+        xq = v2_quantize(x, 4)
+        g = (xq @ m.gate_u) * m.gate_s
+        u = (xq @ m.up_u) * m.up_s
+        want = (F.silu(g) * u) @ m.v
+    assert torch.equal(got, want)
+    # `v2_int8` is a different arm on the same weights (a 4x finer grid).
+    m8 = DualLatentGLU(d, f, r, dtype=torch.float32, act_quant="v2_int8")
+    m8.load_state_dict(m.state_dict())
+    x8 = v2_quantize(x, 8)
+    want8 = (F.silu((x8 @ m.gate_u) * m.gate_s) * ((x8 @ m.up_u) * m.up_s)) @ m.v
+    with torch.no_grad():
+        got8 = m8(x)
+    assert torch.equal(got8, want8)
+    assert not torch.equal(got, got8)
+
+
+def test_v2_formats_refuse_a_non_power_of_two_last_dim():
+    """96 = 3·32: the FWHT has no basis there, and padding would change it.
+
+    LOUD with the escape named (hadamard._check), unlike MX's tail pad — the
+    MX pad only decides which tail columns share a scale, the FWHT pad decides
+    the rotation itself.
+    """
+    x = _randn(2, 96, seed=3)
+    for fmt in ("v2_int4", "v2_int8"):
+        with pytest.raises(LoudError, match=r"2\^k"):
+            fake_quant_act(x, fmt)
+        # The escape is named (pad to 128 or pick a 2^k width) — the assertion
+        # is on the PAD path being the escape, since this rung refuses it.
+        with pytest.raises(LoudError, match="power-of-two width"):
+            quantize_act(x, fmt)
+
+
+def test_own_grid_formats_ste_gradient_is_one_and_there_is_only_one_ste():
+    """`mxfp8`/`v2_*` return their module's own STE — the seam must not re-wrap.
+
+    `fake_quant_act` hands those three through unchanged (`act_quant.py`), so the
+    gradient is the identity exactly ONCE: `d/dx = 1`, and the forward value
+    equals the module's fake-quant (no second `x + (dq − x).detach()` hiding
+    which layer owns the estimator).
+    """
+    for fmt in ("mxfp8", "v2_int4", "v2_int8"):
+        x = _randn(4, 64, seed=41).requires_grad_(True)
+        y = fake_quant_act(x, fmt)
+        y.sum().backward()
+        assert x.grad is not None and torch.equal(x.grad, torch.ones_like(x)), fmt
+        assert torch.equal(y.detach(), quantize_act(x.detach(), fmt)), fmt
+
+
+def test_own_grid_formats_refuse_a_group_instead_of_ignoring_it():
+    """Their grid is not the caller's to choose: `act_group` is LOUD-inert."""
+    x = _randn(4, 64, seed=7)
+    for fmt in ("mxfp8", "v2_int4", "v2_int8"):
+        with pytest.raises(LoudError, match="INERT"):
+            fake_quant_act(x, fmt, 32)
+    # ... and the a4.8 formats still take a group (the control for that rule).
+    assert not torch.equal(fake_quant_act(x, "int4", 32), fake_quant_act(x, "int4", 0))
+
+
+@pytest.mark.parametrize("fmt", ["mxfp8", "v2_int4", "v2_int8"])
+def test_each_new_act_rung_runs_is_finite_and_moves_the_logits(fmt):
+    from conftest import tiny_model
+
+    a, b = tiny_model(), tiny_model(act_quant=fmt)
+    b.load_state_dict(a.state_dict())
+    x = torch.randint(0, 256, (2, 16))
+    with torch.no_grad():
+        la, _, _ = a(x, x)
+        lb, _, cnt = b(x, x)
+    assert bool(torch.isfinite(lb).all())
+    assert not torch.equal(la, lb), f"{fmt} left the logits untouched"
+    assert cnt.get("act_quant_arms", 0) > 0, f"{fmt} did not reach the MoE bank"
+
+
+def test_config_new_act_rungs_their_inert_combinations_and_the_2k_rule():
+    load_run("small", model_overrides={"act_quant": "mxfp8"})
+    # `small` is d_model=768 = 3·2^8: the rotated arms refuse at load, not on
+    # the first forward, and the escape is a power-of-two width.
+    with pytest.raises(LoudError, match=r"2\^k"):
+        load_run("small", model_overrides={"act_quant": "v2_int4"})
+    with pytest.raises(LoudError, match=r"2\^k"):
+        load_run("small", model_overrides={"act_quant": "v2_int8"})
+    ok = load_run(
+        "small",
+        model_overrides={"act_quant": "v2_int8", "d_model": 512, "n_heads": 8},
+    )
+    assert ok.model.act_quant == "v2_int8"
+    for fmt in ("mxfp8", "v2_int4", "v2_int8"):
+        with pytest.raises(LoudError, match="inert"):
+            load_run("small", model_overrides={"act_quant": fmt, "act_group": 32})
+    with pytest.raises(LoudError, match="not an activation format"):
+        load_run("small", model_overrides={"act_quant": "mxfp4"})
+    assert set(ACT_FORMATS) == {
+        "none",
+        "int8",
+        "int4",
+        "fp4",
+        "mxfp8",
+        "v2_int4",
+        "v2_int8",
+    }
+    assert max_value("mxfp8") == 448.0 and max_value("v2_int4") == 7.0

@@ -60,10 +60,17 @@ EXPERT_ACTS = ("silu", "situ", "memglu")
 #: axis burn-bitnet uses) with the soft-to-hard annealing burn-spectral
 #: measured ("converges better than hard STE from step one", lib.rs:75-77);
 #: `binary` = LittleBit's sign factors (arXiv:2506.13771: `sign(W)·mean(|W|)`,
-#: `ternary.sign_binary`) under the same annealing. The compressed-forward
-#: sprint's arms; a new rung lands WITH its gold test
+#: `ternary.sign_binary`) under the same annealing; `mxfp4` = the OCP MX e2m1
+#: codec (MX spec §5.2 Table 1, `mxfp.fake_quant_mx` — per-32 e8m0 scales,
+#: RNE) under the same annealing, with the last dim zero-padded per row to a
+#: 32-multiple when it is not one; `ternary_s3t` = S3T stochastic rounding
+#: (arXiv:2412.04787, `ternary.stochastic_ternary`) under the same annealing,
+#: its Bernoulli mask drawn from a process-local generator seeded by
+#: `factor_qat_seed` (reproducible within a run, NOT across a resume —
+#: `tsct.factor_qat_project`'s docstring and the line `train/loop.py` prints).
+#: The compressed-forward sprint's arms; a new rung lands WITH its gold test
 #: (`tests/test_factor_qat.py`) before this tuple grows.
-FACTOR_QATS = ("none", "ternary", "binary")
+FACTOR_QATS = ("none", "ternary", "binary", "mxfp4", "ternary_s3t")
 #: The `act_quant` literals — the a4.8 ACTIVATION formats (`model/act_quant.py`,
 #: transcribed from `crates/dormouse-core/src/act_quant.rs`): `none` = no
 #: activation quantization (every number on record); `int8`/`int4` = symmetric
@@ -71,10 +78,16 @@ FACTOR_QATS = ("none", "ternary", "binary")
 #: (8 magnitudes, `tsct._NVFP4_MAGNITUDES`) scaled onto the format's MAX, which
 #: is what makes all 8 reachable (the old 3-level bug: AGENTS §3.7 act-quant).
 #: The attention path is upgraded to >= 8 bits unconditionally
-#: (`act_quant.attn_format`), so `fp4`/`int4` never run 4-bit attention. A new
-#: format lands WITH its gold test (`tests/test_act_quant.py`) before this tuple
-#: grows.
-ACT_QUANTS = ("none", "int8", "int4", "fp4")
+#: (`act_quant.attn_format`), so `fp4`/`int4` never run 4-bit attention. Two
+#: imported families dodge that scale rule: `mxfp8` = the OCP MX e4m3 codec
+#: (spec §5.2, `mxfp.fake_quant_mx`; last dim padded per row to a 32-multiple
+#: when needed), `v2_int4`/`v2_int8` = BitNet v2's Hadamard-rotated integer arms
+#: (arXiv:2504.18415, `hadamard.v2_quantize`; needs a 2^k last dim, LOUD
+#: otherwise — the rotation of a padded row is a different basis). All three
+#: refuse a non-zero `act_group`: their grid is not the caller's to choose.
+#: A new format lands WITH its gold test (`tests/test_act_quant.py`) before
+#: this tuple grows.
+ACT_QUANTS = ("none", "int8", "int4", "fp4", "mxfp8", "v2_int4", "v2_int8")
 #: The `ns_kind` literals — the Newton–Schulz arms the Muon group runs
 #: (`optim.NS_KINDS`, which is where they are executed; the list is duplicated
 #: here the way `MOE_KERNELS` is, so the config layer does not import the
@@ -236,6 +249,13 @@ class ModelConfig:
     #: burn-measured better-than-hard-STE recipe; until the schedule lands, a
     #: constant is the honest form (a 2k-step A/B can hold it fixed).
     factor_qat_alpha: float = 1.0
+    #: The `ternary_s3t` Bernoulli mask's seed (`tsct.set_factor_qat_seed`,
+    #: called once per model build). The mask is a process-local generator's
+    #: stream, not a pure function of `(seed, step)` — the projector has no step
+    #: — so this makes a run reproducible and a RESUME not (it restarts the
+    #: stream): `tsct.factor_qat_project`'s docstring owns the statement and
+    #: `train/loop.py` prints it at start. Inert (LOUD) without that arm.
+    factor_qat_seed: int = 0
     #: MemGLU's RMS-calibration constant — the authors' 9M-scale value
     #: (`2608.07323` appendix table: 0.6039096539628113).
     memglu_c0: float = 0.6039096539628113
@@ -304,6 +324,9 @@ class ModelConfig:
     #: takes the a4.8 upgrade via `attn_path=True`), `DualLatentGLU.forward` (the
     #: experts) and the expert bank in `SparseMoE`. The ROUTER input and the KDA
     #: internals are out of scope by design.
+    #: Two of `ACT_QUANTS`' formats are imported rather than a4.8: `mxfp8`
+    #: (`mxfp.fake_quant_mx`) and `v2_int4`/`v2_int8` (`hadamard.v2_quantize`,
+    #: which needs a 2^k `d_model` — refused at load, not silently padded).
     act_quant: str = "none"
     #: Activation columns per scale: 0 = one scale per token (row), else one per
     #: group of `act_group` columns (the a4.8 FFN recipe). Must divide `d_model`,
@@ -563,9 +586,11 @@ def validate(model: ModelConfig) -> None:
         loud(
             f"factor_qat={model.factor_qat!r} is not an arm. Known: "
             f"{list(FACTOR_QATS)} — `none` bf16 masters, `ternary` b1.58 STE "
-            f"(arXiv 2402.17764), `binary` LittleBit signs (arXiv 2506.13771). "
-            f"Escape: name one of those, or land the arm and its gold test "
-            f"(tests/test_factor_qat.py) BEFORE the config can lie about it."
+            f"(arXiv 2402.17764), `binary` LittleBit signs (arXiv 2506.13771), "
+            f"`mxfp4` the OCP MX e2m1 codec (spec §5.2, mxfp.py), `ternary_s3t` "
+            f"S3T stochastic rounding (arXiv 2412.04787). Escape: name one of "
+            f"those, or land the arm and its gold test (tests/test_factor_qat.py) "
+            f"BEFORE the config can lie about it."
         )
     if not 0.0 <= model.factor_qat_alpha <= 1.0:
         loud(
@@ -579,13 +604,22 @@ def validate(model: ModelConfig) -> None:
             f"is inert — the quantizer is off, so the blend has nothing to "
             f"blend toward. Escape: set factor_qat, or leave alpha at 1.0."
         )
+    if model.factor_qat_seed != 0 and model.factor_qat != "ternary_s3t":
+        loud(
+            f"factor_qat_seed={model.factor_qat_seed} with "
+            f"factor_qat={model.factor_qat!r} is inert — only `ternary_s3t` draws "
+            f"from a generator (the other rungs are deterministic projections). "
+            f"Escape: factor_qat='ternary_s3t', or leave the seed at 0."
+        )
     if model.act_quant not in ACT_QUANTS:
         loud(
             f"act_quant={model.act_quant!r} is not an activation format. Known: "
             f"{list(ACT_QUANTS)} — `none` off, `int8`/`int4` symmetric integer "
             f"levels (arXiv 2504.12285 §2.2; 127/7, formulas in "
-            f"model/act_quant.py), `fp4` e2m1 (the OCP MX FP4 grid). Escape: name "
-            f"one of those, or land the format and its gold test "
+            f"model/act_quant.py), `fp4` e2m1 (the OCP MX FP4 grid), `mxfp8` the "
+            f"OCP MX e4m3 codec (spec §5.2), `v2_int4`/`v2_int8` BitNet v2's "
+            f"Hadamard-rotated integer arms (arXiv 2504.18415). Escape: name one "
+            f"of those, or land the format and its gold test "
             f"(tests/test_act_quant.py) BEFORE the config can lie about it."
         )
     if model.act_group < 0:
@@ -594,6 +628,28 @@ def validate(model: ModelConfig) -> None:
             f"activation columns (0 = one scale per token). Escape: 0, or a "
             f"positive divisor of d_model={model.d_model}."
         )
+    if model.act_group != 0 and model.act_quant in ("mxfp8", "v2_int4", "v2_int8"):
+        loud(
+            f"act_group={model.act_group} with act_quant={model.act_quant!r} is "
+            f"inert — that format carries its own scale grid (mxfp8: 32-wide e8m0 "
+            f"blocks; v2_*: per-token absmax after the FWHT), so the group would "
+            f"be silently ignored. Escape: act_group=0, or int8/int4/fp4, whose "
+            f"scale IS the group's block max."
+        )
+    if model.act_quant in ("v2_int4", "v2_int8"):
+        d = model.d_model
+        if d < 1 or (d & (d - 1)) != 0:
+            loud(
+                f"act_quant={model.act_quant} rotates the activation with the "
+                f"FWHT (BitNet v2, arXiv 2504.18415), which needs a LAST dim of "
+                f"2^k — d_model={d} is not one. Zero-padding to 2^k is NOT the "
+                f"MX tail pad: it changes the rotation's basis, so the port "
+                f"refuses instead of quantizing a row it did not rotate. The same "
+                f"rule is enforced per projection at the first forward "
+                f"(hadamard._check names the width); this is the early refusal "
+                f"for the width every TSCT projection in the loop block reads. "
+                f"Escape: a power-of-two d_model, or another activation format."
+            )
     if model.act_quant != "none" and model.act_group != 0 and model.d_model % model.act_group != 0:
         loud(
             f"act_group={model.act_group} must divide d_model={model.d_model} (or "
