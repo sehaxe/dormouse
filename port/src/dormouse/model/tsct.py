@@ -40,9 +40,15 @@ Deviations from burn, both deliberate and listed in the port report:
   and slices back because cubek's matmul vectorizes on `N % 4 == 0`
   (AGENTS §2.2). torch has no such constraint, so the port drops the pad — the
   parameter count is the honest `r·(in + out + 1)` either way.
-* **no STE quantizer in the forward.** burn's factor quant is a
-  straight-through estimator (`act_quant.rs`); the day-one port has no rung to
-  run, so the only format is bf16 and no fake-quant path exists to be wrong.
+* **the STE quantizer IS in the forward** (since 2026-10-16, `factor_qat`):
+  the b1.58 ternary / LittleBit-binary / MXFP4 quantizers with burn-spectral's
+  annealed STE, applied to every TSCT factor through `factor_qat_project`.
+  What the compression tournament MEASURED at 9.2M (3 seeds x 2k steps):
+  hard STE from step 0 loses +0.050 BPB (ternary) / +0.087 (binary) to bf16;
+  the annealed ramp (alpha 0->1 over 1000 steps) recovers only 0.010 of it
+  (+0.040) with a tighter spread — so at THIS scale the arm is CLOSED for
+  training (the controls' spread is 0.006). The storage rungs (fp8/nvfp4/
+  ternary, checkpoint compression) are untouched by that verdict.
 """
 
 from __future__ import annotations
