@@ -235,14 +235,44 @@ class MixOptimizer:
             Muon(muon_params, lr=lr, momentum=momentum, ns_steps=ns_steps) if muon_params else None
         )
         self.adamw = AdamW(adamw_params, lr=lr, weight_decay=wd, betas=betas, eps=eps)
+        #: `bnb8 = True` swaps AdamW for bitsandbytes' 8-bit AdamW on the SAME
+        #: params — the b1 enabler (the spike's 6.4-7.9 GiB regime rode it;
+        #: eager fp32 state at 1.07B params OOMs a 16-GB card). Import is
+        #: LOCAL and loud-when-missing, so CPU tests never touch bnb.
+        self.bnb8bit = False
         #: Let a caller (the trainer, the smoke test) keep looking at the groups.
         self.n_muon, self.n_adamw = len(muon_params), len(adamw_params)
-        self.steps = 0
         #: The SHAPE answer: identical-shape parameters update as ONE stack.
         #: The per-param loop cost 84% of b1's step in per-tensor dispatches.
         self.muon_params = muon_params
         self.model = model
+        self.steps = 0
         self.steps_batched = 0
+
+    def enable_bnb8bit(self) -> None:
+        """Swap the plain AdamW for bitsandbytes' 8-bit state, LOUD on absence.
+
+        The swap is pairwise per group: same lr/wd/betas/eps, same params,
+        only the state dtype drops to int8-quantized — so checkpoint stats
+        ride the same optimizer API and a resume reloads it at the same
+        shapes. Adequate for the b1 recipe; NOT the default (a 9.2M run
+        saves nothing at 16 GB and loses the plain AdamW's exactness).
+        """
+        if self.bnb8bit:
+            return
+        try:
+            import bitsandbytes as bnb
+        except ImportError as e:  # pragma: no cover - the gpu extra pins bnb
+            loud(f"bnb8bit: bitsandbytes is not installed ({e}); add the gpu extra")
+        new = bnb.optim.AdamW8bit(
+            self.adamw.param_groups[0]["params"],
+            lr=self.adamw.param_groups[0]["lr"],
+            weight_decay=self.adamw.param_groups[0].get("weight_decay", 0.01),
+            betas=self.adamw.param_groups[0].get("betas", (0.9, 0.95)),
+            eps=self.adamw.param_groups[0].get("eps", 1e-8),
+        )
+        self.adamw = new
+        self.bnb8bit = True
 
     def zero_grad(self, set_to_none: bool = True) -> None:
         if self.muon is not None:
