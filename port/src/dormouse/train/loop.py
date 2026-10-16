@@ -309,6 +309,11 @@ def train(
     the CPU path, unchanged.
     """
     cfg = run.train
+    if cfg.tf32:
+        # The knob the b1 opt bench measured (2026-10-16): 1399 -> 1201 ms/step.
+        torch.set_float32_matmul_precision("high")
+    else:
+        torch.set_float32_matmul_precision("highest")
     device = None if device is None else torch.device(device)
     if stream is None:
         stream, eval_stream = open_streams(run)

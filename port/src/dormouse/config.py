@@ -254,6 +254,13 @@ class TrainConfig:
     lr: float = 3e-4
     wd: float = 0.01
     grad_clip: float = 1.0
+    #: TF32 for the remaining fp32 matmuls (the Muon Newton-Schulz iterations,
+    #: the KDA internals, the fp32 lm_head path): measured 2026-10-16 at b1
+    #: b8x1024 as 1399 -> 1201 ms/step (+16%, mostly the optimizer's NS bmm).
+    #: OFF by default until a loss-parity check names its cost; NS is already
+    #: an approximate iteration, so the expected cost is small — that is a
+    #: prediction, not a substitute for the check.
+    tf32: bool = False
     log_every: int = 10
     ckpt_every: int = 100
     ckpt_name: str = "port"
