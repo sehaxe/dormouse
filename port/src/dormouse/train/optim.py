@@ -66,6 +66,16 @@ NS_KINDS = ("classic", "gram")
 #: leaving it out costs accuracy (`tests/test_muon_gram.py`).
 GRAM_NS_RESTARTS = (2,)
 
+#: The batched Muon step's chunk cap, in fp32 ELEMENTS per stacked buffer
+#: (`1 << 25` = 33.5M elements = 134 MiB): `[1024, 64, 5461]` fp32 batched NS
+#: needs ~1.33 GiB per intermediate and the 5-iteration chain keeps ~4 GiB
+#: live — the 16-GB card OOMs WITH the model resident (2026-10-15 b1 bench).
+#: Chunks cap the batch's fp32 footprint; NS still runs on whole chunks. A
+#: named constant so a test can shrink it to exercise the chunk boundary and
+#: the b1 bench can sweep it against VRAM. The value is the one the step has
+#: always used (`(1 << 27) // (d0 * d1 * 4)` params).
+MUON_CHUNK_ELEMS = 1 << 25
+
 
 def _check_ns_kind(kind: str) -> None:
     """A name that is not an arm is LOUD, naming both arms and the escape."""
@@ -204,10 +214,61 @@ def _gram_via_ns(
 
 
 def colrow_normalize(x: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
-    """`Norm_d` for `NormDir::ColRow` (the trainer's choice): columns, then rows."""
+    """`Norm_d` for `NormDir::ColRow` (the trainer's choice): columns, then rows.
+
+    **The 2-D form is the definition; the 3-D branch is NOT ColRow and is a
+    PRE-EXISTING defect, found 2026-10-16 by the equivalence gate in
+    `tests/test_muon_fast.py`** (it arrived with the batched step, `d55fd1d`,
+    whose message claims "the same math"). It collapses dims `(1, 2)` twice,
+    i.e. normalises each slice by its Frobenius norm — so the batched Muon
+    step applies exactly `1/sqrt(d0)` of the per-param update (`[64, 5461]`
+    and `[64, 2048]` at b1: 8x too small; `[2048, 2048]`: 45x). The fix is
+    one line here (dims 1 then 2) and it MOVES THE TRAINER'S UPDATE SCALE for
+    every shape group with >= 2 members, so it is an A/B-gated numerics change
+    (AGENTS §1.2) and is deliberately NOT landed by a speed commit. The
+    divergence and its exact factor are pinned by
+    `test_the_batched_colrow_is_not_the_per_param_colrow`.
+    """
     dim = (1, 2) if x.ndim == 3 else 0
     x = x / (x.norm(dim=dim, keepdim=True) + eps)
     return x / (x.norm(dim=(1, 2) if x.ndim == 3 else 1, keepdim=True) + eps)
+
+
+def colrow_normalize_(x: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
+    """`colrow_normalize` in place — the SAME arithmetic, no new tensor.
+
+    `x.div_(n + eps)` and `x / (n + eps)` are the same operation on the same
+    operands, so this is bit-identical to the out-of-place form; it exists
+    because the batched step's `x` is a fresh tensor the optimizer owns (at b1
+    the two temporaries are 2 x 1.33 GiB of the expert-write group per step).
+    Same 3-D caveat as `colrow_normalize` — it is the same arithmetic, defect
+    included.
+    """
+    dim = (1, 2) if x.ndim == 3 else 0
+    x.div_(x.norm(dim=dim, keepdim=True) + eps)
+    x.div_(x.norm(dim=(1, 2) if x.ndim == 3 else 1, keepdim=True) + eps)
+    return x
+
+
+class _MomGroup:
+    """One shape group's canonical STACKED momentum buffer.
+
+    `mom` is `[N, d0, d1]` fp32 and it IS the state: `state[p]["momentum"]` is
+    a view of row `i`, so the step never stacks the group in and copies it back
+    (at b1 that was 3 x 1.33 GiB of fp32 traffic per step for the `[64, 5461]`
+    expert writes alone, plus the allocator churn of a fresh 1.33 GiB block
+    every step). The checkpoint format is unchanged — `Optimizer.state_dict`
+    still emits one `momentum` tensor per parameter, and `load_state_dict`
+    rebuilds the stack from them once.
+    """
+
+    __slots__ = ("gi", "shape", "params", "mom")
+
+    def __init__(self, gi: int, shape: tuple[int, int], params: list, mom: torch.Tensor) -> None:
+        self.gi = gi
+        self.shape = shape
+        self.params = params
+        self.mom = mom
 
 
 class Muon(Optimizer):
@@ -233,6 +294,40 @@ class Muon(Optimizer):
         self.ns_kind = ns_kind
         self.gram_restarts = gram_restarts
         super().__init__(params, dict(lr=lr, momentum=momentum, ns_steps=ns_steps))
+        #: One stacked momentum buffer per (param group, shape) — the canonical
+        #: state, built lazily by `_build_groups` and rebuilt after a load.
+        self._groups: list[_MomGroup] = []
+
+    def _build_groups(self) -> None:
+        """One stacked momentum buffer per unique shape; per-param state views it.
+
+        Idempotent and cheap, but it STACKS whatever is in
+        `state[p]["momentum"]`, so it is called (a) lazily by the batched step
+        and (b) after `load_state_dict` — where the loader has replaced the
+        views with the checkpoint's own per-param tensors, which is exactly the
+        historical format and stays readable.
+        """
+        self._groups = []
+        for gi, group in enumerate(self.param_groups):
+            by_shape: dict[tuple[int, int], list] = {}
+            for p in group["params"]:
+                if p.ndim == 2:
+                    by_shape.setdefault((p.shape[0], p.shape[1]), []).append(p)
+            for shape, params in by_shape.items():
+                mom = torch.zeros(len(params), *shape, dtype=torch.float32, device=params[0].device)
+                for i, p in enumerate(params):
+                    prev = self.state[p].get("momentum")
+                    if prev is not None:
+                        mom[i].copy_(prev)
+                    self.state[p]["momentum"] = mom[i]
+                self._groups.append(_MomGroup(gi, shape, params, mom))
+
+    def load_state_dict(self, state_dict) -> None:  # noqa: D102 - torch's contract
+        super().load_state_dict(state_dict)
+        # The loader installed the checkpoint's per-param `momentum` tensors;
+        # stacking them once here is what makes an old checkpoint (per-param)
+        # and a new one (views of one storage) both load correctly.
+        self._build_groups()
 
     @torch.no_grad()
     def step(self, closure=None):  # noqa: D102 - torch's Optimizer contract
@@ -257,6 +352,24 @@ class Muon(Optimizer):
                 p.add_(update.to(p.dtype), alpha=-lr * scale)
         return loss
 
+    def _step_one(self, p: torch.Tensor, lr: float, mu: float, ns: int, scale: float) -> None:
+        """The per-param update — the reference the batched path must match.
+
+        Kept because it is the definition, and used by the batched step for the
+        rare group where a 2-D parameter carries no gradient (a shape with one
+        live member is not worth a batch). It reads and writes
+        `state[p]["momentum"]`, which on a built group is a VIEW of the stacked
+        buffer, so both paths share one state.
+        """
+        state = self.state[p]
+        if "momentum" not in state:
+            state["momentum"] = torch.zeros_like(p.grad)
+        buf = state["momentum"]
+        buf.mul_(mu).add_(p.grad, alpha=1.0 - mu)
+        update = colrow_normalize(zeropower_via_ns(buf, ns, self.ns_kind, self.gram_restarts))
+        with torch.no_grad():
+            p.add_(update.to(p.dtype), alpha=-lr * scale)
+
     def batched_step_from_model(self, model) -> int:
         """The shape-batched Muon pass (a no-op when the batches are trivially small).
 
@@ -269,60 +382,56 @@ class Muon(Optimizer):
         [N, d0, d1]; the SAME NS math inside runs unchanged; then scatter
         back. The scaled `max(1, d0/d1)^0.5` case is the SAME for the whole
         shape, so it stays a scalar.
+
+        Since 2026-10-16 the stack is not per-step work at all: the stacked
+        buffer is the STATE (`_build_groups`), the momentum update is
+        `mom.mul_(mu)` + ONE fused `_foreach_add_` over its own rows (the
+        gradient stack is gone with it), and the writes are in place. What
+        remains per step is the NS chain and the final `_foreach_add_`.
         """
-        by_shape: dict[tuple[int, int], list] = {}
-        for group in self.param_groups:
-            lr, mu, ns = group["lr"], group["momentum"], group["ns_steps"]
-            for p in group["params"]:
-                if p.grad is None or p.grad.ndim != 2:
-                    continue
-                by_shape.setdefault((p.shape[0], p.shape[1]), []).append(p)
+        if not self._groups:
+            self._build_groups()
         n_batches = 0
-        for shape, params in by_shape.items():
-            for p in params:
-                state = self.state[p]
-                if "momentum" not in state:
-                    state["momentum"] = torch.zeros_like(p)
-            if len(params) < 2:
-                # Match the per-param math exactly: one computation per tensor.
+        for grp in self._groups:
+            group = self.param_groups[grp.gi]
+            lr, mu, ns = group["lr"], group["momentum"], group["ns_steps"]
+            scale = max(1.0, grp.shape[0] / grp.shape[1]) ** 0.5
+            params = grp.params
+            if len(params) < 2 or any(p.grad is None for p in params):
+                # A shape with one member, or a 2-D parameter with no gradient:
+                # fall back to the definition rather than inventing a "zero
+                # gradient" row. This is not just caution — the 3-D branch of
+                # `colrow_normalize` is a KNOWN divergence from the per-param
+                # ColRow (see its docstring), so routing a singleton through the
+                # batch would MOVE that parameter's update scale by 1/sqrt(d0).
                 for p in params:
-                    g = p.grad
-                    state = self.state[p]
-                    buf = state["momentum"]
-                    buf.mul_(mu).add_(g, alpha=1.0 - mu)
-                    update = colrow_normalize(
-                        zeropower_via_ns(buf, ns, self.ns_kind, self.gram_restarts)
-                    )
-                    scale = max(1.0, shape[0] / shape[1]) ** 0.5
-                    with torch.no_grad():
-                        p.add_(update.to(p.dtype), alpha=-lr * scale)
+                    if p.grad is not None:
+                        self._step_one(p, lr, mu, ns, scale)
                 continue
+            mom = grp.mom
+            # The momentum update, in place, without a stack: `mom` is the
+            # buffer and `torch.unbind` hands out its rows as views.
+            mom.mul_(mu)
+            torch._foreach_add_(torch.unbind(mom, 0), [p.grad for p in params], alpha=1.0 - mu)
             n = len(params)
-            # Chunk the shape stack: [1024, 64, 5461] fp32 batched NS needs
-            # ~1.33 GiB per intermediate and the 5-iteration chain keeps ~4
-            # GiB live — the 16-GB card OOMs WITH the model resident
-            # (2026-10-15 b1 bench). Chunks cap the batch's fp32 footprint;
-            # NS still runs on 512-slice groups.
-            n_chunk = max(1, min(n, (1 << 27) // (shape[0] * shape[1] * 4)))
+            # Chunk the shape stack: the cap is fp32 ELEMENTS per stacked
+            # buffer (`MUON_CHUNK_ELEMS`), so NS never materializes the whole
+            # shape group's chain at once.
+            n_chunk = max(1, min(n, MUON_CHUNK_ELEMS // (grp.shape[0] * grp.shape[1])))
             for start in range(0, n, n_chunk):
                 params_c = params[start : start + n_chunk]
-                bufs = torch.stack([self.state[p]["momentum"] for p in params_c])
-                grads = torch.stack([p.grad for p in params_c])
-                bufs.mul_(mu).add_(grads.detach(), alpha=1.0 - mu)
-                update = colrow_normalize(
-                    zeropower_via_ns(bufs, ns, self.ns_kind, self.gram_restarts)
-                ).detach()
-                scale = max(1.0, shape[0] / shape[1]) ** 0.5
-                updates = update.mul(-lr * scale)
-                # The write-back is FOREACH too: per-param copies are what kept
-                # 5221 add_ + 3267 copy_ launches on the post-batched profile
-                # (55 + 57 ms/step); the size check guarantees identical shapes
-                # so the sockets align 1:1.
+                update = zeropower_via_ns(
+                    mom[start : start + n_chunk], ns, self.ns_kind, self.gram_restarts
+                )
+                # In place: `update` is a fresh tensor the optimizer owns (NS
+                # always allocates on its first `x / (norm + eps)`), and the
+                # write-back is FOREACH — per-param copies are what kept 5221
+                # add_ + 3267 copy_ launches on the post-batched profile
+                # (55 + 57 ms/step). The size check guarantees identical
+                # shapes so the sockets align 1:1.
+                colrow_normalize_(update).mul_(-lr * scale)
                 with torch.no_grad():
-                    torch._foreach_add_([p.detach() for p in params_c], torch.unbind(updates))
-                    torch._foreach_copy_(
-                        [self.state[p]["momentum"] for p in params_c], torch.unbind(bufs)
-                    )
+                    torch._foreach_add_([p.detach() for p in params_c], torch.unbind(update))
             n_batches += 1
         return n_batches
 
