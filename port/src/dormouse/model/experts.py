@@ -93,7 +93,7 @@ from torch.autograd.graph import saved_tensors_hooks
 from torch.utils.checkpoint import checkpoint
 
 from ..instrument import Counters
-from .tsct import mm_mixed
+from .tsct import factor_qat_project, mm_mixed
 
 try:  # the Triton arm is an ABILITY, not a dependency
     from . import moe_kernels
@@ -196,11 +196,15 @@ class DualLatentGLU(nn.Module):
         rank: int,
         *,
         dtype: torch.dtype,
+        factor_qat: str = "none",
+        factor_qat_alpha: float = 1.0,
         device: torch.device | str = "cpu",
     ) -> None:
         super().__init__()
         self.d, self.f, self.rank = d, f, rank
         self.compute_dtype = dtype
+        self.factor_qat = factor_qat
+        self.factor_qat_alpha = factor_qat_alpha
         for name in ("gate", "up"):
             # `U [d, r]` and `s [r]`: the latent half of TSCT's factorization.
             setattr(
@@ -213,10 +217,19 @@ class DualLatentGLU(nn.Module):
     def forward(self, x: torch.Tensor, glu=None) -> torch.Tensor:
         dt = self.compute_dtype
         xu = x if dt == torch.float32 else x.to(dt)
-        g = (xu @ self.gate_u.to(dt)) * self.gate_s.to(dt)
-        u = (xu @ self.up_u.to(dt)) * self.up_s.to(dt)
+        gate_u, up_u, v = self.gate_u, self.up_u, self.v
+        if self.factor_qat != "none":
+            # Per-tensor α on a 2-D factor == per-expert α on that expert's
+            # slice of the bank (`_banks`'s `dim=(1,2)`), so the naive/shared
+            # path and the banked path quantize an expert IDENTICALLY.
+            q = factor_qat_project
+            gate_u = q(gate_u, self.factor_qat, self.factor_qat_alpha)
+            up_u = q(up_u, self.factor_qat, self.factor_qat_alpha)
+            v = q(v, self.factor_qat, self.factor_qat_alpha)
+        g = (xu @ gate_u.to(dt)) * self.gate_s.to(dt)
+        u = (xu @ up_u.to(dt)) * self.up_s.to(dt)
         h = F.silu(g) * u if glu is None else glu(g, u)
-        y = h @ self.v.to(dt)
+        y = h @ v.to(dt)
         return y if dt == torch.float32 else y.to(torch.float32)
 
 
@@ -238,6 +251,12 @@ class SparseMoE(nn.Module):
         self.capacity = cfg.moe_capacity
         self.moe_kernel = cfg.moe_kernel
         self.moe_offload = cfg.moe_offload
+        #: The compressed-forward sprint's factor quantization (`factor_qat`):
+        #: `_banks` applies it to the fp32 stacks before the dt-conversion, and
+        #: `DualLatentGLU` applies the SAME projection (dim=None on a 2-D
+        #: factor == dim=(1,2) slice) on the naive/shared path.
+        self.factor_qat = cfg.factor_qat
+        self.factor_qat_alpha = cfg.factor_qat_alpha
         self.expert_act = cfg.expert_act
         self._glu = (
             None
@@ -254,9 +273,26 @@ class SparseMoE(nn.Module):
             )
         )
         self.experts = nn.ModuleList(
-            DualLatentGLU(d, f, cfg.rank, dtype=dtype, device=device) for _ in range(cfg.n_experts)
+            DualLatentGLU(
+                d,
+                f,
+                cfg.rank,
+                dtype=dtype,
+                factor_qat=cfg.factor_qat,
+                factor_qat_alpha=cfg.factor_qat_alpha,
+                device=device,
+            )
+            for _ in range(cfg.n_experts)
         )
-        self.shared = DualLatentGLU(d, f, cfg.shared_rank, dtype=dtype, device=device)
+        self.shared = DualLatentGLU(
+            d,
+            f,
+            cfg.shared_rank,
+            dtype=dtype,
+            factor_qat=cfg.factor_qat,
+            factor_qat_alpha=cfg.factor_qat_alpha,
+            device=device,
+        )
         # The router: ONE 2-D linear on the raw hidden state (not on the
         # latent), softmax over the bank, then top-k + a capacity-bound permute.
         self.router = nn.Linear(d, cfg.n_experts, bias=False, device=device)
@@ -417,12 +453,23 @@ class SparseMoE(nn.Module):
         key = (dt, tuple(p._version for e in self.experts for p in e.parameters()))
         cached = getattr(self, "_bank_cache", None)
         if cached is None or cached[0] != key:
+            # The stack builds in fp32 (the masters' dtype), the qat arm — if
+            # on — quantizes THERE (per-expert α via `dim=(1,2)`, so a banked
+            # expert is identical to the same expert run through
+            # `DualLatentGLU.forward` — the parity the A/B needs), and only
+            # then does the cache convert to `dt`. Scales (`gate_s`/`up_s`)
+            # are never quantized: they ARE the diag(s) of the factorization.
+            mats = []
+            for name in ("gate_u", "up_u", "v"):
+                stack = torch.stack([getattr(e, name) for e in self.experts])
+                if self.factor_qat != "none":
+                    stack = factor_qat_project(
+                        stack, self.factor_qat, self.factor_qat_alpha, dim=(1, 2)
+                    )
+                mats.append(stack.to(dt))
             cached = (
                 key,
-                tuple(
-                    torch.stack([getattr(e, name) for e in self.experts]).to(dt)
-                    for name in ("gate_u", "up_u", "v")
-                ),
+                tuple(mats),
                 tuple(
                     torch.stack([getattr(e, name) for e in self.experts]).to(dt)
                     for name in ("gate_s", "up_s")

@@ -53,6 +53,17 @@ MOE_KERNELS = ("padded", "triton", "naive")
 #: `memglu` (closed-tail gate, arXiv 2608.07323). A new arm lands WITH its
 #: gold test (`tests/test_expert_act.py`) before this tuple grows.
 EXPERT_ACTS = ("silu", "situ", "memglu")
+#: The `factor_qat` literals — what the FORWARD does to the TSCT factor
+#: masters (`U`, `V`; the diagonal `s` rides as the scale, never quantized).
+#: `none` = bf16 masters (every number on record); `ternary` = b1.58 STE
+#: (arXiv:2402.17764 Eq. 1, `ternary.ternarize`, per-TENSOR absmean — the
+#: axis burn-bitnet uses) with the soft-to-hard annealing burn-spectral
+#: measured ("converges better than hard STE from step one", lib.rs:75-77);
+#: `binary` = LittleBit's sign factors (arXiv:2506.13771: `sign(W)·mean(|W|)`,
+#: `ternary.sign_binary`) under the same annealing. The compressed-forward
+#: sprint's arms; a new rung lands WITH its gold test
+#: (`tests/test_factor_qat.py`) before this tuple grows.
+FACTOR_QATS = ("none", "ternary", "binary")
 #: The `ns_kind` literals — the Newton–Schulz arms the Muon group runs
 #: (`optim.NS_KINDS`, which is where they are executed; the list is duplicated
 #: here the way `MOE_KERNELS` is, so the config layer does not import the
@@ -200,6 +211,20 @@ class ModelConfig:
     #: β2 = 25 up). ‖SiTU-GLU(x)‖∞ ≤ β1·β2 = 100 at these.
     expert_beta1: float = 4.0
     expert_beta2: float = 25.0
+    #: What the FORWARD does to the TSCT factor masters — the compressed-model
+    #: sprint's central knob (`FACTOR_QATS`, formulas in `tsct.factor_qat_project`):
+    #: `none` = bf16 masters, every number on record; `ternary` = b1.58 STE with
+    #: burn-spectral's soft-to-hard annealing; `binary` = LittleBit sign factors +
+    #: the same annealing. Applies to EVERY TSCT pair the model owns: the loop
+    #: block's projections and the MoE experts' dual-latent factors alike (the
+    #: same `factor_qat_project` on both paths — one place, one test). `s` stays
+    #: fp32 in all arms: it IS the scale the annealing needs.
+    factor_qat: str = "none"
+    #: Annealing strength, 0..=1: 0 = masters untouched (bit-identical `none`),
+    #: 1 = pure quantized forward with STE. A schedule ramping this 0→1 is the
+    #: burn-measured better-than-hard-STE recipe; until the schedule lands, a
+    #: constant is the honest form (a 2k-step A/B can hold it fixed).
+    factor_qat_alpha: float = 1.0
     #: MemGLU's RMS-calibration constant — the authors' 9M-scale value
     #: (`2608.07323` appendix table: 0.6039096539628113).
     memglu_c0: float = 0.6039096539628113
@@ -509,6 +534,26 @@ def validate(model: ModelConfig) -> None:
         )
     if model.memglu_c0 <= 0.0:
         loud(f"memglu_c0={model.memglu_c0} must be > 0 (an RMS scale, not a sign)")
+    if model.factor_qat not in FACTOR_QATS:
+        loud(
+            f"factor_qat={model.factor_qat!r} is not an arm. Known: "
+            f"{list(FACTOR_QATS)} — `none` bf16 masters, `ternary` b1.58 STE "
+            f"(arXiv 2402.17764), `binary` LittleBit signs (arXiv 2506.13771). "
+            f"Escape: name one of those, or land the arm and its gold test "
+            f"(tests/test_factor_qat.py) BEFORE the config can lie about it."
+        )
+    if not 0.0 <= model.factor_qat_alpha <= 1.0:
+        loud(
+            f"factor_qat_alpha={model.factor_qat_alpha} is outside 0..=1: it "
+            f"blends master (0) with pure quantized forward (1). Escape: clamp "
+            f"your schedule to that range."
+        )
+    if model.factor_qat == "none" and model.factor_qat_alpha != 1.0:
+        loud(
+            f"factor_qat_alpha={model.factor_qat_alpha} with factor_qat='none' "
+            f"is inert — the quantizer is off, so the blend has nothing to "
+            f"blend toward. Escape: set factor_qat, or leave alpha at 1.0."
+        )
     if model.use_byteflow:
         _validate_byteflow(model)
     if model.aux_fb_weight < 0.0:

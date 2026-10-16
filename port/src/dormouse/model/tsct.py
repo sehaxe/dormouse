@@ -65,6 +65,57 @@ def mm_mixed(x: torch.Tensor, weight: torch.Tensor, dt: torch.dtype) -> torch.Te
     return (x if x.dtype == dt else x.to(dt)) @ w.t()
 
 
+def factor_qat_project(
+    w: torch.Tensor, mode: str, alpha: float, *, dim: tuple | None = None
+) -> torch.Tensor:
+    """The forward's view of a TSCT factor master under `factor_qat`.
+
+    ONE place both consumers (the loop block's `TSCTLinear` and the experts'
+    `DualLatentGLU`) route through — the burn-era defect this avoids is two
+    copies of one quantizer drifting apart (the tool for that is a grep).
+
+    - `none` → the master untouched (bit-identical to every number on record);
+    - `ternary` → b1.58 STE (`ternary.ste_ternary_annealed`, burn-spectral's
+      measured "converges better than hard STE" annealing);
+    - `binary` → LittleBit sign factors under the SAME annealing:
+      `w → w + alpha·(sign_binary(w) − w).detach()` (the annealed STE is the
+      one mechanism here; sign vs roundclip is the entire difference).
+
+    `dim` picks the absmean's aggregation axis: `None` = the whole tensor (the
+    factor-per-layer reading, `ternary.ternarize`'s per-TENSOR axis); `(1, 2)`
+    = per first-index slice for an `[E, ·, ·]` bank, i.e. **per-EXPERT α** —
+    the reading that makes a banked expert identical to the same expert run
+    through `DualLatentGLU.forward` (a 2-D factor's per-tensor mean IS that
+    expert's mean). The rung's gold test pins both axes.
+
+    STE algebra: forward sees the quantized value, backward flows through the
+    master (`w_eff = w + alpha·(q(w) − w).detach()`; `alpha = 0` is exactly the
+    master). The masters stay fp32 — quantization lives on the compute copy
+    only, exactly the storage-rung contract (`pack_tsct`'s docstring).
+    """
+    if mode == "none":
+        return w
+    if mode not in ("ternary", "binary"):
+        raise AssertionError(f"factor_qat={mode!r} reached the projector with no mode")
+    if dim is None:
+        from .ternary import sign_binary, ste_ternary_annealed
+
+        if mode == "ternary":
+            return ste_ternary_annealed(w, alpha)
+        return w + alpha * (sign_binary(w) - w).detach()
+    # The per-slice axis (banks): the same formula as `ternary.ternarize` /
+    # `ternary.sign_binary`, transposed onto `dim` — the grid is ±mean(|W|),
+    # ε only guards the division (exactly `ternarize`'s convention: divide by
+    # `α+ε`, scale back by `α`), so a banked expert and the same expert run
+    # alone land on the SAME values.
+    a = w.abs().mean(dim=dim, keepdim=True)
+    if mode == "ternary":
+        q = (w.float() / (a + 1e-5)).round().clamp(-1.0, 1.0) * a
+    else:
+        q = torch.sign(w) * a
+    return (w + alpha * (q.to(w.dtype) - w).detach()).to(w.dtype)
+
+
 class TSCTLinear(nn.Module):
     """A factorized linear: `x → ((x·U) ⊙ s)·V`, masters fp32, forward in `dtype`."""
 
@@ -76,6 +127,8 @@ class TSCTLinear(nn.Module):
         *,
         dtype: torch.dtype = torch.bfloat16,
         bias: bool = False,
+        factor_qat: str = "none",
+        factor_qat_alpha: float = 1.0,
         device: torch.device | str = "cpu",
     ) -> None:
         super().__init__()
@@ -100,21 +153,39 @@ class TSCTLinear(nn.Module):
         self.s = nn.Parameter(torch.ones(rank, device=device))
         self.v = nn.Parameter(torch.randn(rank, out_features, device=device) / math.sqrt(rank))
         self.bias = nn.Parameter(torch.zeros(out_features, device=device)) if bias else None
+        #: The compressed-forward sprint's switch (`factor_qat_project`): the
+        #: forward reads quantized factors with STE while the masters stay
+        #: fp32. `s` is never quantized — it IS the scale.
+        self.factor_qat = factor_qat
+        self.factor_qat_alpha = factor_qat_alpha
+
+    def _factors(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """The forward's `(u, v)`: masters under `factor_qat`, else untouched."""
+        if self.factor_qat == "none":
+            return self.u, self.v
+        f = factor_qat_project
+        return f(self.u, self.factor_qat, self.factor_qat_alpha), f(
+            self.v, self.factor_qat, self.factor_qat_alpha
+        )
 
     def effective_weight(self) -> torch.Tensor:
         """`U diag(s) Vᵀ` in fp32 — the weight the optimizer and the report
-        talk about. Never used in a forward (it would materialize `d·f`)."""
-        return (self.u * self.s) @ self.v
+        talk about. Never used in a forward (it would materialize `d·f`).
+        Reads the QUANTIZED factors when the qat arm is on: the report must
+        describe the network that ran, not the masters next to it."""
+        u, v = self._factors()
+        return (u * self.s) @ v
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         dt = self.compute_dtype
+        u, v = self._factors()
         if dt == torch.float32:
-            y = ((x @ self.u) * self.s) @ self.v
+            y = ((x @ u) * self.s) @ v
         else:
             # Matmuls in the factor dtype with fp32 accumulate (torch's own
             # reduction), the master params untouched.
             xu = x.to(dt)
-            y = ((xu @ self.u.to(dt)) * self.s.to(dt)) @ self.v.to(dt)
+            y = ((xu @ u.to(dt)) * self.s.to(dt)) @ v.to(dt)
             y = y.to(torch.float32)
         if self.bias is not None:
             y = y + self.bias
@@ -311,5 +382,14 @@ def make_projection(
     dtype = torch.bfloat16 if cfg.bf16 else torch.float32
     rank = cfg.rank if rank is None else rank
     if cfg.use_tsct:
-        return TSCTLinear(in_features, out_features, rank, dtype=dtype, bias=bias, device=device)
+        return TSCTLinear(
+            in_features,
+            out_features,
+            rank,
+            dtype=dtype,
+            bias=bias,
+            factor_qat=cfg.factor_qat,
+            factor_qat_alpha=cfg.factor_qat_alpha,
+            device=device,
+        )
     return DenseLinear(in_features, out_features, dtype=dtype, bias=bias, device=device)
