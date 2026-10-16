@@ -313,7 +313,21 @@ class TrainConfig:
     eval_data: str = ""
     out_dir: str = "checkpoints"
     timers: bool = False
-    engram_ram: bool = _unsupported(False, "host-RAM Engram tables (--engram-ram)")
+    #: Host-RAM Engram tables — burn's `--engram-ram` (Qwen3.8-Flash-Next §2.3
+    #: via `crates/dormouse-train/src/offload.rs`): the n-gram tables and their
+    #: ONE momentum buffer live in plain CPU fp32 memory (`Engram.to_host`) and
+    #: only the batch's unique rows cross the bus, so the memory's VRAM is
+    #: `batch × unique rows` rather than `orders × slots × dim × 4`. In-VRAM is
+    #: the DEFAULT (the day-one table; the optimizer policy routes it to AdamW),
+    #: and this flag is what a run switches on to buy memory capacity.
+    #:
+    #: Three things about it are refusals rather than fallbacks: a CPU run
+    #: (host tables ARE CPU memory — the in-VRAM path is all the playbook is for,
+    #: and the run would pay the row transfers for no VRAM), the byteflow channel
+    #: (`use_byteflow`: no byte positions to hash), and `use_engram = false`
+    #: (there is no table to host). Flipping the flag on a resume is refused by
+    #: the snapshot drift check — it changes the parameter set AND the optimizer.
+    engram_ram: bool = False
     #: The ADAPTIVE DEPTH arm (owner 2026-10-16): run the loop `T` iterations
     #: per TRAIN step, `T` sampled in `1..=max_iter` as a PURE function of
     #: `(seed, step)` (`train.loop._sample_depth`), with the loss normalized by
@@ -699,6 +713,24 @@ def load_run(
             f"positions to select. Escape: raise `seq_len`/`--batch`'s window or lower "
             f"byteflow_k_tokens."
         )
+    if tcfg.engram_ram:
+        # The host path is a MODEL-shape decision that spans both halves of the
+        # config, so its refusals live here, where both are resolved. They are
+        # refusals and not fallbacks: a run that asked for host tables and
+        # silently got the in-VRAM ones would report the VRAM it did not save.
+        if model.use_byteflow:
+            loud(
+                "engram_ram with use_byteflow=true: the channel runs the loop over K "
+                "patch latents, so the n-gram memory has no byte position to hash and "
+                "there are no rows to host. Escape: use_byteflow=false, or "
+                "engram_ram=false."
+            )
+        if not model.use_engram:
+            loud(
+                "engram_ram with use_engram=false: the model builds no table, so "
+                "`engram_ram` would host nothing while the optimizer silently keeps its "
+                "in-VRAM shape. Escape: use_engram=true, or engram_ram=false."
+            )
     return RunConfig(source=preset, model=model, train=tcfg)
 
 

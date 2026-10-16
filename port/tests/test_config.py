@@ -160,9 +160,10 @@ def test_quant_ladder_rungs_refuse_at_load(rung):
 
 def test_train_key_refusals():
     """The train half has the same two rules."""
-    with pytest.raises(LoudError) as e:
-        load_run("small", train_overrides={"engram_ram": True})
-    assert "engram_ram" in str(e.value) and "not ported" in str(e.value)
+    # `engram_ram` is a REAL field since the host path landed; the arms-off test
+    # (`test_model`) uses `use_engram` for that reason. An unknown key still
+    # refuses, naming the key and the escape.
+    assert load_run("small", train_overrides={"engram_ram": True}).train.engram_ram is True
     with pytest.raises(LoudError) as e:
         load_run("small", train_overrides={"nope": 1})
     assert "nope" in str(e.value) and "remove the" in str(e.value)

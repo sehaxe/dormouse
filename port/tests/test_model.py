@@ -108,7 +108,8 @@ def test_bf16_forward_runs_and_stays_finite(byte_tensor):
 
 
 def test_no_engram_and_no_kda_arms_are_off_not_faked(byte_tensor):
-    # `engram_ram=True` refuses in the config; the OFF switch is `use_engram`.
+    # The OFF switch for an arm is `use_*` (`engram_ram` moves the tables to
+    # host RAM, it does not remove the arm).
     cfg = tiny_cfg(use_engram=False, use_kda=False)
     m = DormouseModel(cfg)
     ids, targets = byte_tensor()

@@ -24,6 +24,7 @@ import torch
 
 from ..config import PROGRESS_KEYS, RunConfig, TrainConfig
 from ..instrument import Counters, LoudError, StepTimer, loud
+from ..model.engram import enable_host_tables, host_state, host_step_all, load_host_state
 from .data import ByteStream, eval_window_bytes, open_streams, warmup_steps
 from .lr import wsd_lr
 from .optim import MixOptimizer
@@ -68,6 +69,70 @@ def ckpt_paths(cfg: TrainConfig) -> tuple[Path, Path]:
     return base / f"{cfg.ckpt_name}.pt", base / f"{cfg.ckpt_name}.config.toml"
 
 
+def ngram_path(cfg: TrainConfig) -> Path:
+    """The host tables' sibling of a checkpoint: `<ckpt_name>.ngram`.
+
+    A sibling file, not a key inside the checkpoint, for the reason the burn side
+    learned (`7adda92`, AGENTS §3.3): the `.ngram` sidecar did not travel with
+    the weights and a `.best` checkpoint turned out to be a different model. Here
+    the pairing is checkable — the load refuses a missing sibling, the snapshot
+    drift check refuses an `engram_ram` flip, and `load_host_state` refuses a
+    shape mismatch — which is what that entry's "no test, no stamp" complaint
+    asked for, minus the `train_step` stamp.
+    """
+    weights, _ = ckpt_paths(cfg)
+    return weights.with_suffix(".ngram")
+
+
+def host_device_type(model: torch.nn.Module) -> str:
+    """The device the MODEL lives on — the one input to the host-path refusal.
+
+    Its own function because it is the seam the CPU suite drives (`engram_ram`
+    is a CUDA-budget rule; the host path's NUMERICS are device-agnostic and CPU-
+    observable, since the tables ARE CPU memory). Nothing else reads it.
+    """
+    return next(model.parameters()).device.type
+
+
+def host_tables(model: torch.nn.Module) -> int:
+    """Switch every Engram to host tables; LOUD on a run that cannot have them.
+
+    Called BEFORE the optimizer is built (`train`), which is what keeps the
+    tables out of a parameter group: on this path they are plain CPU tensors,
+    not parameters at all.
+
+    Two refusals, no fallback — both cases would show the flag on while the
+    thing the flag buys (VRAM) was never saved:
+
+    * a non-CUDA model has no VRAM to save: the per-forward row transfers are
+      pure cost against the in-VRAM table, and burn's `--engram-ram` is a
+      VRAM-budget decision (`cfg.rs:50`);
+    * a model with no Engram to host (`use_engram=false`) — `load_run` refuses
+      that pair too, but a hand-built model reaches here without passing it.
+    """
+    dev = host_device_type(model)
+    if dev != "cuda":
+        loud(
+            f"engram_ram on a {dev} model: host tables buy VRAM by keeping the n-gram "
+            f"rows and their momentum in host RAM, and a {dev} run has no VRAM to buy — "
+            f"the per-forward row transfers would be pure cost against the in-VRAM "
+            f"table. Escape: engram_ram=false, or run on cuda."
+        )
+    n = enable_host_tables(model)
+    if n == 0:
+        loud(
+            "engram_ram=true but the model has no Engram to host (use_engram=false?): "
+            "the flag would host nothing while the run reported it on. Escape: "
+            "use_engram=true, or engram_ram=false."
+        )
+    return n
+
+
+def load_ngram(cfg: TrainConfig) -> dict:
+    """The `<ckpt_name>.ngram` sibling, read as CPU state (tensors + ints only)."""
+    return torch.load(ngram_path(cfg), map_location="cpu", weights_only=True)
+
+
 def save_ckpt(
     run: RunConfig, model: torch.nn.Module, opt: MixOptimizer, step: int
 ) -> tuple[Path, Path]:
@@ -98,6 +163,15 @@ def save_ckpt(
         tmp,
     )
     tmp.replace(weights)  # atomic: a crash never leaves a half-written ckpt
+    if run.train.engram_ram:
+        # The host tables are not parameters, so they are not in `sd`: they are
+        # the sibling file, written atomically like the weights. A checkpoint
+        # that restored the model without its memory would be a different
+        # network at the same step count (AGENTS §3.3).
+        ng = ngram_path(run.train)
+        tmp_ng = ng.with_suffix(".ngram.tmp")
+        torch.save(host_state(model), tmp_ng)
+        tmp_ng.replace(ng)
     snapshot.write_text(run.snapshot_toml())
     return weights, snapshot
 
@@ -132,6 +206,16 @@ def load_ckpt(run: RunConfig) -> tuple[dict, RunConfig]:
             f"resume: {weights} and {snapshot} must both exist (the snapshot is "
             f"what makes a resume checkable). Escape: start without --resume, or "
             f"fix ckpt_name/out_dir."
+        )
+    if run.train.engram_ram and not ngram_path(run.train).is_file():
+        loud(
+            f"resume: {weights} is a host-table run (train.engram_ram=true) and its "
+            f"sibling {ngram_path(run.train)} is missing. On that path the tables and "
+            f"their momentum ARE the memory's state — the model half carries no "
+            f"`engram.tables` parameter — so continuing without them would restart the "
+            f"memory from scratch and train a different network under this step count. "
+            f"Escape: restore the .ngram, start fresh under a new ckpt_name, or set "
+            f"engram_ram=false."
         )
     stored = RunConfig.from_snapshot(snapshot.read_text())
     drift = run.diff_keys(stored)
@@ -176,6 +260,7 @@ def _eval_loss(
     batches: int,
     device: torch.device | str | None,
     depth: int | None,
+    counters: Counters | None = None,
 ) -> tuple[float, int, float, list[float]]:
     """One held-out pass at ONE loop depth: (loss, bytes, fin, per_iter_mean).
 
@@ -184,6 +269,12 @@ def _eval_loss(
     `fin` is the CE of the mean readout alone — the number comparable across
     depths and the one generation reads. `per_iter_mean` averages the
     per-iteration CEs over the batch — the deep-supervision shape.
+
+    `counters`, when given, receives THIS eval's own arm counters (the eval
+    forward's `engram_rows`/`engram_arms` — the `engram=` field the eval line
+    prints). They are the eval's, not the run's: a training counter would say
+    the memory ran during an eval that ran without it, which is exactly the
+    blind spot of AGENTS §3.2's retracted arm.
     """
     stream.rewind()
     total = 0.0
@@ -193,6 +284,7 @@ def _eval_loss(
     was_training = model.training
     model.eval()
     kw = {} if depth is None else {"depth": depth}
+    ev_counters = Counters()
     with torch.no_grad():
         for _ in range(batches):
             x, y = stream.next_batch()
@@ -205,7 +297,7 @@ def _eval_loss(
             # first aux A/B run: control 3.045 vs fb 3.469 while the arm was
             # fine). Counters are not bumped on this path — fb=0/0 is the
             # eval's honest reading of "no aux ran HERE".
-            _, loss, _ = model(x, y, pure=True, breakdown=True, **kw)
+            _, loss, _ = model(x, y, pure=True, breakdown=True, counters=ev_counters, **kw)
             assert loss is not None, "an eval batch must carry targets"
             total += float(loss)
             scored += int(x.numel())
@@ -219,6 +311,8 @@ def _eval_loss(
                     per_iter_acc[i] += v
     n = max(batches, 1)
     model.train(was_training)
+    if counters is not None:
+        counters.merge(ev_counters)
     return (
         total / n,
         scored,
@@ -234,6 +328,7 @@ def evaluate(
     device: torch.device | str | None = None,
     *,
     depths: bool = False,
+    counters: Counters | None = None,
 ) -> tuple[float, int] | dict[int, tuple[float, int]]:
     """Mean held-out CE over `batches` windows + the BYTES those windows scored.
 
@@ -249,10 +344,10 @@ def evaluate(
     """
     if depths:
         return {
-            d: _eval_loss(model, stream, batches, device, d)
+            d: _eval_loss(model, stream, batches, device, d, counters)
             for d in range(1, model.cfg.max_iter + 1)
         }
-    return _eval_loss(model, stream, batches, device, None)
+    return _eval_loss(model, stream, batches, device, None, counters)
 
 
 def _eval_line(
@@ -272,18 +367,28 @@ def _eval_line(
     the fixed-depth control are read off the same line.
     """
     curve = None
+    eng = Counters()
     if cfg.rand_depth or cfg.eval_depths:
-        curve = evaluate(model, stream, cfg.eval_batches, device=device, depths=True)
+        curve = evaluate(model, stream, cfg.eval_batches, device=device, depths=True, counters=eng)
         ev, scored, fin, per_iter = curve[max_iter]
     else:
-        ev, scored, fin, per_iter = evaluate(model, stream, cfg.eval_batches, device=device)
+        ev, scored, fin, per_iter = evaluate(
+            model, stream, cfg.eval_batches, device=device, counters=eng
+        )
     # `fin` = the CE of the final mean readout — the DEPTH-COMPARABLE number
     # (the headline `loss` averages T+1 terms and is not, see `_eval_loss`).
+    # `engram=<rows>/<arms>` is burn's field (`lib.rs:1751`, the `ENGRAM_KEYS` /
+    # `ENGRAM` probe deltas) over THIS eval's own forwards: `engram=0/<n>` is how
+    # a reader learns the eval ran a memory-disabled forward, which is the defect
+    # that retracted the Engram arm's numbers (AGENTS §3.2). It is printed on
+    # both substrates — the host path counts the same rows in `Engram._read`.
     line = (
         f"eval step={step} loss={ev:.4f} bpb={bpb(ev):.3f} fin={fin:.4f} "
         f"bpb_fin={bpb(fin):.3f} over {scored} B "
-        f"({cfg.eval_batches} x {cfg.batch} x {cfg.seq_len}) {fb}"
+        f"({cfg.eval_batches} x {cfg.batch} x {cfg.seq_len}) "
+        f"engram={eng.get('engram_rows', 0)}/{eng.get('engram_arms', 0)} {fb}"
     )
+
     if per_iter:
         line += " periter=" + ",".join(f"{v:.4f}" for v in per_iter)
     if curve is not None:
@@ -318,6 +423,12 @@ def train(
     if stream is None:
         stream, eval_stream = open_streams(run)
     model.train()
+    if cfg.engram_ram:
+        # BEFORE the optimizer exists: on the host path the tables are not
+        # parameters, so no group, no grad clip and no checkpoint half ever
+        # carries them (`Engram.to_host` deletes the parameter).
+        n = host_tables(model)
+        log(f"engram_ram: {n} table set(s) in host RAM, VRAM holds the batch's unique rows")
     opt = MixOptimizer(model, lr=cfg.lr, wd=cfg.wd, opt=cfg.opt)
     if cfg.optim_8bit:
         opt.enable_bnb8bit()
@@ -327,6 +438,13 @@ def train(
         ck, _stored = load_ckpt(run)
         model.load_state_dict(ck["model"])
         opt.load_state_dict(ck["opt"])
+        if cfg.engram_ram:
+            # The model half carries no `engram.tables` on this path, so the
+            # sibling file IS the memory's state — restoring the model without
+            # it would train a different network under this step count (the
+            # `7adda92` class, AGENTS §3.3). `load_ckpt` refused a missing file
+            # already; this is where its values land.
+            load_host_state(model, load_ngram(cfg))
         start = int(ck["step"]) + 1
         if start:
             # A resumed run must continue on UNSEEN bytes: the burn failure
@@ -399,6 +517,18 @@ def train(
             if cfg.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
             opt.step()
+            if cfg.engram_ram:
+                # The host update runs ONCE per TRAINING step, after the
+                # optimizer — never per forward (the loop calls the memory once
+                # per iteration, and `host_step` sums those), and never on a
+                # NaN-skipped step (that branch does not call `opt.step`
+                # either). `rows` counts the rows this step touched; it is a
+                # CPU count already, so the 0-sync rule holds.
+                updates, rows = host_step_all(model, lr)
+                total.count("engram_host_updates", updates)
+                window.count("engram_host_updates", updates)
+                total.count("engram_host_update_rows", rows)
+                window.count("engram_host_update_rows", rows)
             last_loss = float(loss.detach())
         else:
             # Skip the step entirely (a masked loss scalar does not stop NaN
