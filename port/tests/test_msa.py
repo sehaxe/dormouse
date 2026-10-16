@@ -25,7 +25,12 @@ from conftest import tiny_cfg
 from dormouse.instrument import Counters
 from dormouse.model import DormouseModel, param_count
 from dormouse.model.sparse import BlockSparseAttention, FlexSparseSelector
-from dormouse.model.sparse.attention import MSA_SLOT_CHUNK, attend_selected_blocks
+from dormouse.model.sparse import attention as msa_attention
+from dormouse.model.sparse.attention import (
+    MSA_SLOT_CHUNK,
+    _ckpt_needed,
+    attend_selected_blocks,
+)
 
 R, K = 4, 4  # small block/top-K so the top-k is exercised at tiny shapes
 
@@ -223,10 +228,12 @@ def test_f_gather_is_chunk_bounded_and_runs_at_the_b1_shape(monkeypatch):
 
     Every 5-D tensor `attend_selected_blocks` hands to `einsum` is the gathered
     chunk, so its column count IS the arm's peak tensor. Asserted to be
-    `MSA_SLOT_CHUNK * r` and never the whole `m * r` — with the gradient ON too,
-    where a checkpoint region recomputes the gather in the backward instead of
-    retaining all `m` copies (the 12.9 GB that OOMed b8 s512 on 2026-10-16 is
-    exactly those retained copies; the forward shape bound holds either way).
+    `MSA_SLOT_CHUNK * r` and never the whole `m * r` — in every policy state:
+    with the gradient ON the chunk region may recompute the gather in the
+    backward (that is what keeps the 12.9 GB that OOMed b8 s512 on 2026-10-16
+    from being retained) or, when `MSA_CKPT_BYTES` says the whole-m gather is
+    small enough to retain, the backward reuses the chunk it was handed. Both
+    are chunk-bounded; which one ran is COUNTED (`msa_ckpt`).
     """
     r, topk = 4, 32
     assert isinstance(MSA_SLOT_CHUNK, int) and 1 <= MSA_SLOT_CHUNK < topk
@@ -241,20 +248,37 @@ def test_f_gather_is_chunk_bounded_and_runs_at_the_b1_shape(monkeypatch):
         return real(*args)
 
     monkeypatch.setattr(torch, "einsum", spy)
+    chunks = -(-topk // MSA_SLOT_CHUNK)
     with torch.no_grad():
         attend_selected_blocks(q, k, v, blocks, keep, r, scale)
-    chunks = -(-topk // MSA_SLOT_CHUNK)
     assert len(widths) == 2 * chunks, f"kk+vv per chunk: {widths}"
     assert max(widths) == min(MSA_SLOT_CHUNK, topk) * r < topk * r
 
+    # This shape's whole-m gather is 4 MiB — 64x under the budget — so the
+    # policy leaves the region OFF and the backward does not re-gather. The peak
+    # is the chunk either way: that is the claim.
+    assert not _ckpt_needed(1, 128, topk, r, 4, 16, 4)
+    c_off = Counters()
     widths.clear()
     qg = q.clone().requires_grad_(True)
-    attend_selected_blocks(qg, k, v, blocks, keep, r, scale).sum().backward()
-    # 4x and not 2x: the backward RECOMPUTED every chunk instead of retaining
-    # the gathers, which is exactly the 12.9 GB the old form kept alive. Were
-    # the checkpoint region dropped, this count would stay at 2x.
+    attend_selected_blocks(qg, k, v, blocks, keep, r, scale, c_off).sum().backward()
+    assert len(widths) == 2 * chunks, f"the un-regioned backward re-gathered: {len(widths)}"
+    assert max(widths) <= MSA_SLOT_CHUNK * r, f"backward re-gathered {max(widths)} positions"
+    assert "msa_ckpt" not in c_off, "the policy fired on a shape it should skip"
+
+    # Over budget (the measured b8 s512 shape) the region fires and the backward
+    # RECOMPUTES every chunk instead of retaining the gathers, which is exactly
+    # the 12.9 GB the old form kept alive. 4x and not 2x: the recompute is the
+    # evidence the region ran.
+    assert _ckpt_needed(8, 512, 32, r, 12, 64, 4), "b8 s512 is the measured OOM shape"
+    monkeypatch.setattr(msa_attention, "MSA_CKPT_BYTES", 0)
+    c_on = Counters()
+    widths.clear()
+    qg = q.clone().requires_grad_(True)
+    attend_selected_blocks(qg, k, v, blocks, keep, r, scale, c_on).sum().backward()
     assert len(widths) == 4 * chunks, f"the chunk regions did not recompute: {len(widths)}"
     assert max(widths) <= MSA_SLOT_CHUNK * r, f"backward re-gathered {max(widths)} positions"
+    assert c_on["msa_ckpt"] == 1, "the checkpoint policy must be COUNTED when it fires"
     monkeypatch.undo()
 
     # The b1 attention SHAPE on CPU (b=2,t=512,K=32,r=4,h=32,hd=64 = d 2048):
