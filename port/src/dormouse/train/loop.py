@@ -27,7 +27,7 @@ from ..instrument import Counters, LoudError, StepTimer, loud
 from ..model.engram import enable_host_tables, host_state, host_step_all, load_host_state
 from .data import ByteStream, eval_window_bytes, open_streams, warmup_steps
 from .lr import wsd_lr
-from .optim import MixOptimizer
+from .optim import MixOptimizer, clip_grads
 
 
 def bpb(loss: float) -> float:
@@ -542,7 +542,10 @@ def train(
             opt.zero_grad(set_to_none=True)
             loss.backward()
             if cfg.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+                # `clip_grads` (optim.py): ONE `_foreach_norm` + ONE fused
+                # `_foreach_mul_` — the stock per-tensor walk measured 252 ms
+                # of a small-form step (2920 norm calls, profile 2026-10-16).
+                clip_grads(model.parameters(), cfg.grad_clip)
             opt.step()
             if cfg.engram_ram:
                 # The host update runs ONCE per TRAINING step, after the
