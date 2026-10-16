@@ -100,6 +100,23 @@ def _device(name: str) -> torch.device:
     return torch.device("cuda")
 
 
+def _freeze_gc() -> None:
+    """The GC-storm fix for long runs (gdb-found, 2026-10-16).
+
+    A Python GC cycle scans every tracked object; a live model tree plus the
+    optimizer's state runs that scan on a huge graph — a b1-shape compile
+    spent 20+ minutes inside `gc_collect_main` at 100% CPU before this froze
+    the world (the `deduce_unreachable` stack). `freeze()` moves everything
+    alive at this point — modules, the model, the config — into the permanent
+    generation, which is never scanned again; later short-lived rows (log
+    dicts) still collect. Safe for a long run, wrong for nothing.
+    """
+    import gc
+
+    gc.freeze()
+    gc.set_threshold(1_000_000, 50, 50)
+
+
 def _model(run) -> DormouseModel:
     return DormouseModel(run.model)
 
@@ -229,6 +246,7 @@ def train_cmd(
     run = load_run(preset, model_overrides=model_over, train_overrides=train_over)
     dev = _device(device)
     model = _model(run).to(dev)
+    _freeze_gc()
     from .train.loop import train as _train
 
     console.print(
@@ -290,6 +308,7 @@ def run(
     run = load_run(preset, model_overrides=model_over, train_overrides=train_over)
     dev = _device(device)
     model = _model(run).to(dev)
+    _freeze_gc()
 
     # ---- stage 1: pretrain, WITHOUT the decay (the family see below) ----
     console.print(
@@ -364,6 +383,7 @@ def eval_cmd(
     run.train = dataclasses.replace(run.train, eval=True)
     dev = _device(device)
     model = _model(run).to(dev)
+    _freeze_gc()
     ck = torch.load(Path(out_dir) / f"{ckpt_name}.pt", map_location="cpu", weights_only=False)
     model.load_state_dict(ck["model"])
     _train_stream, eval_stream = open_streams(run)
@@ -398,6 +418,7 @@ def decode(
     run = _snapshot_run(out_dir, ckpt_name)
     dev = _device(device)
     model = _model(run).to(dev)
+    _freeze_gc()
     ck = torch.load(Path(out_dir) / f"{ckpt_name}.pt", map_location="cpu", weights_only=False)
     model.load_state_dict(ck["model"])
     gen = torch.Generator().manual_seed(run.train.seed)
