@@ -47,6 +47,12 @@ PROGRESS_KEYS = ("steps", "log_every", "ckpt_every", "eval", "eval_every")
 #: The `moe_kernel` literals — the expert-pass arms `experts._dispatch` routes
 #: between. One list, read by `validate`: a name that is not here is LOUD.
 MOE_KERNELS = ("padded", "triton", "naive")
+#: The `expert_act` literals — the 2026-10-16 activation tournament arms, each
+#: with its formula source in `experts.expert_glu`:
+#: `silu` (control, SwiGLU), `situ` (Kimi K3, arXiv 2607.24653 Eq. 12),
+#: `memglu` (closed-tail gate, arXiv 2608.07323). A new arm lands WITH its
+#: gold test (`tests/test_expert_act.py`) before this tuple grows.
+EXPERT_ACTS = ("silu", "situ", "memglu")
 
 
 def _unsupported(default: Any, mechanism: str) -> Any:
@@ -169,6 +175,23 @@ class ModelConfig:
     #: is LOUD at config load. `triton` falls back COUNTED to `padded` when the
     #: kernel cannot run (no triton import, input not on CUDA) — never silently.
     moe_kernel: str = "padded"
+    #: The expert GLU's activation, the 2026-10-16 activation tournament arm
+    #: (`docs/research` scan; formula sources named in `experts.expert_glu`):
+    #: `silu` = SwiGLU's gate, the control and every number on record;
+    #: `situ` = Kimi K3's Sigmoid-Tanh-Unit GLU (arXiv 2607.24653 Eq. 12) —
+    #: both factors soft-capped, ‖·‖∞ ≤ β1·β2, matches SwiGLU to first order at
+    #: the origin; `memglu` = closed-tail gate (arXiv 2608.07323 Eq. —, c0
+    #: RMS-calibrated by the authors). Unknown name is LOUD at config load; a
+    #: non-`silu` arm keeps the padded torch path (the fused triton kernel has
+    #: silu in registers and is skipped COUNTED, `moe_triton_fallback`).
+    expert_act: str = "silu"
+    #: SiTU's soft-cap scales, Kimi K3's own values (§2.3.2: β1 = 4 gate,
+    #: β2 = 25 up). ‖SiTU-GLU(x)‖∞ ≤ β1·β2 = 100 at these.
+    expert_beta1: float = 4.0
+    expert_beta2: float = 25.0
+    #: MemGLU's RMS-calibration constant — the authors' 9M-scale value
+    #: (`2608.07323` appendix table: 0.6039096539628113).
+    memglu_c0: float = 0.6039096539628113
     #: SL1 of `docs/research/2026-10-16-budget-savers.md` §5: park the routed
     #: expert pass's saved activations in HOST RAM instead of VRAM
     #: (`experts._expert_pass`: `checkpoint(use_reentrant=False)` with
@@ -425,6 +448,23 @@ def validate(model: ModelConfig) -> None:
             f"(model/moe_kernels.py), `naive` the per-expert loop. Escape: name "
             f"one of those, or add the arm before the config can lie about it."
         )
+    if model.expert_act not in EXPERT_ACTS:
+        loud(
+            f"expert_act={model.expert_act!r} is not an arm. Known: "
+            f"{list(EXPERT_ACTS)} — `silu` the SwiGLU control, `situ` Kimi K3's "
+            f"capped GLU (arXiv 2607.24653 Eq. 12, β1={model.expert_beta1}, "
+            f"β2={model.expert_beta2}), `memglu` the closed-tail gate "
+            f"(arXiv 2608.07323). Escape: name one of those, or land the arm and "
+            f"its gold test BEFORE the config can lie about it."
+        )
+    if model.expert_beta1 <= 0.0 or model.expert_beta2 <= 0.0:
+        loud(
+            f"SiTU βs must be > 0 (gate β1={model.expert_beta1}, up "
+            f"β2={model.expert_beta2}) — they are soft-cap scales, and a "
+            f"non-positive one divides by zero or flips the cap."
+        )
+    if model.memglu_c0 <= 0.0:
+        loud(f"memglu_c0={model.memglu_c0} must be > 0 (an RMS scale, not a sign)")
     if model.use_byteflow:
         _validate_byteflow(model)
     if model.aux_fb_weight < 0.0:

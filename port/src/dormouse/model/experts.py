@@ -104,6 +104,43 @@ else:
     _TRITON_WHY = None
 
 
+def expert_glu(
+    act: str,
+    g: torch.Tensor,
+    u: torch.Tensor,
+    *,
+    beta1: float = 4.0,
+    beta2: float = 25.0,
+    c0: float = 0.6039096539628113,
+) -> torch.Tensor:
+    """The expert GLU's activation — ONE place, every torch path routes here.
+
+    Formulas, each transcribed from its paper (never from another impl):
+
+    - `silu` (the control, SwiGLU's gate): `silu(g) ⊙ u` — both factors
+      unbounded, the overflow risk the K3 report names at scale.
+    - `situ` — Kimi K3, arXiv:2607.24653 §2.3.2 Eq. 12:
+      `[β1·tanh(g/β1) ⊙ σ(g)] ⊙ [β2·tanh(u/β2)]`, their β1 = 4 / β2 = 25.
+      Matches silu to first order at the origin (β·tanh(z/β) = z + O(z³/β²))
+      and is bounded: ‖·‖∞ ≤ β1·β2 = 100 (their Eq. 19). The smooth caps keep
+      gradients alive away from saturation (their ablation vs hard clamping).
+    - `memglu` — arXiv:2608.07323 Eq. 1: `ϕ(g) ⊙ u`, `ϕ(g) = c0·tanh(g)·sech(g)`,
+      computed as `c0·t·sqrt(1−t²)` (t = tanh g) — identical in fp32 and it
+      cannot overflow where `cosh` would at large |g|. `c0` is the authors'
+      RMS-matched 9M-scale calibration (their appendix table): without it the
+      closed-tail gate under-scales the gate by ~1.66x against silu's RMS.
+    """
+    if act == "silu":
+        return F.silu(g) * u
+    if act == "situ":
+        gate = beta1 * torch.tanh(g / beta1) * torch.sigmoid(g)
+        return gate * (beta2 * torch.tanh(u / beta2))
+    if act == "memglu":
+        t = torch.tanh(g)
+        return (c0 * t * torch.sqrt((1.0 - t * t).clamp_min(0.0))) * u
+    raise AssertionError(f"expert_act={act!r} reached the GLU with no formula")
+
+
 class _OnHost:
     """A saved activation parked in host RAM by the offload pack hook.
 
@@ -173,12 +210,12 @@ class DualLatentGLU(nn.Module):
         # The write `V [r, f]` — one, at the latent, after the GLU.
         self.v = nn.Parameter(torch.randn(rank, f, device=device) / math.sqrt(rank))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, glu=None) -> torch.Tensor:
         dt = self.compute_dtype
         xu = x if dt == torch.float32 else x.to(dt)
         g = (xu @ self.gate_u.to(dt)) * self.gate_s.to(dt)
         u = (xu @ self.up_u.to(dt)) * self.up_s.to(dt)
-        h = F.silu(g) * u
+        h = F.silu(g) * u if glu is None else glu(g, u)
         y = h @ self.v.to(dt)
         return y if dt == torch.float32 else y.to(torch.float32)
 
@@ -201,6 +238,21 @@ class SparseMoE(nn.Module):
         self.capacity = cfg.moe_capacity
         self.moe_kernel = cfg.moe_kernel
         self.moe_offload = cfg.moe_offload
+        self.expert_act = cfg.expert_act
+        self._glu = (
+            None
+            if cfg.expert_act == "silu"
+            else (
+                lambda g, u: expert_glu(
+                    cfg.expert_act,
+                    g,
+                    u,
+                    beta1=cfg.expert_beta1,
+                    beta2=cfg.expert_beta2,
+                    c0=cfg.memglu_c0,
+                )
+            )
+        )
         self.experts = nn.ModuleList(
             DualLatentGLU(d, f, cfg.rank, dtype=dtype, device=device) for _ in range(cfg.n_experts)
         )
@@ -250,7 +302,8 @@ class SparseMoE(nn.Module):
                 gate_u, up_u, v, gate_s, up_s = self._banks(dt)
                 xg = x.to(dt).unsqueeze(0).expand(e, -1, -1)  # view, not copy
                 g = torch.bmm(xg, gate_u) * gate_s[:, None, :]
-                h = F.silu(g) * (torch.bmm(xg, up_u) * up_s[:, None, :])
+                u = torch.bmm(xg, up_u) * up_s[:, None, :]
+                h = F.silu(g) * u if self._glu is None else self._glu(g, u)
                 y = torch.bmm(h, v)  # [E, n, f]
                 weighted = torch.einsum(
                     "ne,enf->nf", probs, y.to(probs.dtype)
@@ -258,7 +311,7 @@ class SparseMoE(nn.Module):
                 counters.count("moe_dense_banked", n)
             else:
                 for ex, expert in enumerate(self.experts):
-                    weighted += expert(x) * probs[:, ex : ex + 1]
+                    weighted += expert(x, glu=self._glu) * probs[:, ex : ex + 1]
                 counters.count("moe_dense_loop", n)  # the fallback, read in logs
         else:
             # LFB (arXiv:2408.15664): the top-k reads the RAISED logits
@@ -279,7 +332,7 @@ class SparseMoE(nn.Module):
             weight = weight / weight.sum(dim=-1, keepdim=True).clamp_min(1e-9)
             weighted = self._dispatch(x, weight, index, counters)
         # The shared expert is ALWAYS on: it is the write path, not a routed arm.
-        weighted = weighted + self.shared(x)
+        weighted = weighted + self.shared(x, glu=self._glu)
         counters.count("moe_shared_forwards", n)
         # down: an fp32-master Linear; bf16 matmul + fp32 out (MAGMA fix).
         return mm_mixed(weighted.to(dt), self.down.weight, dt).to(torch.float32)
@@ -416,7 +469,7 @@ class SparseMoE(nn.Module):
         gate_u, up_u, v, gate_s, up_s = self._banks(dt)
         g = torch.bmm(xg, gate_u) * gate_s[:, None, :]
         u = torch.bmm(xg, up_u) * up_s[:, None, :]
-        h = F.silu(g) * u
+        h = F.silu(g) * u if self._glu is None else self._glu(g, u)
         y = torch.bmm(h, v).reshape(e * cap, self.f)[kept_slots]  # [R, f]
         # The router weight is applied in fp32, exactly where the naive path
         # applies it: a bf16 multiply would put a 2^-8 relative step between the
@@ -447,7 +500,7 @@ class SparseMoE(nn.Module):
         for e in torch.unique(sorted_ids[keep]).tolist():
             sel = keep & (sorted_ids == e)
             rows = owner[sel]
-            y = self.experts[e](x[rows]) * flat_w[order[sel]].unsqueeze(-1)
+            y = self.experts[e](x[rows], glu=self._glu) * flat_w[order[sel]].unsqueeze(-1)
             out.index_add_(0, rows, y)
             counters.count("moe_expert_calls")
         counters.count("moe_tokens", n)
@@ -509,7 +562,16 @@ class SparseMoE(nn.Module):
         counters.count("moe_dropped_assignments", dropped)
         notes = []
         if self.moe_kernel == "triton":
-            why = self._triton_reason(x)
+            why = (
+                None
+                if self.expert_act == "silu"
+                else (
+                    f"expert_act={self.expert_act} has no fused kernel "
+                    f"(the triton GLU hardcodes silu) — padded torch arm runs"
+                )
+            )
+            if why is None:
+                why = self._triton_reason(x)
             if why is None:
                 counters.count("moe_triton_gemm")
                 return self._expert_pass(
