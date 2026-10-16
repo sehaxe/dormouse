@@ -41,15 +41,56 @@ Dispatch has TWO arms over ONE permute, and the log line says which ran:
 All three count: `moe_padded_bmm`, `moe_triton_gemm` or `moe_naive_dispatch`
 (with the reason attached to the counter object) on the step's counter line, so
 a reader never has to guess which one produced the loss.
+
+One more thing the routed pass can do, OFF by default: `moe_offload` (SL1,
+`docs/research/2026-10-16-budget-savers.md` §5). The MoE block owns the
+activation peak, and the tensors that own it are the `[E, cap, d]` /
+`[E, cap, f]` bank materializations plus the saved GLU gates; with the switch on,
+the arm `_dispatch` picked runs inside `checkpoint(use_reentrant=False)` with
+`torch.autograd.graph.saved_tensors_hooks` INSIDE it, so every activation the
+pass saves is parked in PLAIN HOST RAM (pageable cpu tensors, pinned=False) and
+handed back on the backward edge. Values are COPIED, never approximated, so loss
+and gradients are bit-identical to the switch-off run — that parity is the gate
+(`tests/test_offload_experts.py`), and `moe_offloaded` on the counter line is
+what proves the arm ran (a zero means it did not).
+
+THE TORCH CAVEATS this combination carries, all measured here on 2.13.0 (CPU
+and CUDA) and pinned by `tests/test_offload_experts.py`:
+
+1. **The hooks go INSIDE the checkpointed function.** Non-reentrant `checkpoint`
+   is ITSELF a `saved_tensors_hooks` context, and only the INNERMOST pair is
+   applied. A `with saved_tensors_hooks(...)` wrapped AROUND the `checkpoint()`
+   call is SILENTLY INERT — checkpoint's hook is innermost, the pack hook fires
+   zero times, nothing reaches host, and only the counter would claim otherwise.
+   With the hooks inside and covering the whole pass, every save is captured by
+   us, so the checkpoint's frame registers no holders and it does NOT recompute:
+   the pass runs once and the saving is the host offload alone. With a partial
+   scope the checkpoint recomputes and stays exact. Both are correct; the
+   non-inert one ships, and the pack-hook spy in the test file keeps it that way.
+2. **Unpack must return the tensor ON ITS ORIGINAL DEVICE** (the hook contract:
+   equal in value, size, dtype *and device*). The copy back happens at the
+   backward edge — a device temporary for exactly the node that needs it, which
+   is what makes the peak fall.
+3. **The parameter banks are packed too, and that buys nothing.** The pass's
+   `bmm` operands are `_banks`' cached `[E, ·, ·]` stacks; they are saved by
+   autograd like any other operand, so they ride the copy out and back — but
+   their storage is the cache, which stays in VRAM either way. On a b1-shaped
+   dispatch that is ~1.25 GB of traffic per pass for zero reclaimed bytes.
+   `ponytail:` the hook copies whatever autograd saves; if the SL1 measurement
+   says that traffic is the bill, the upgrade is to skip the tensors the cache
+   already holds (the pack hook can identity-check them against `_bank_cache`).
 """
 
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.autograd.graph import saved_tensors_hooks
+from torch.utils.checkpoint import checkpoint
 
 from ..instrument import Counters
 from .tsct import mm_mixed
@@ -61,6 +102,51 @@ except Exception as exc:  # noqa: BLE001 — the reason is COUNTED by `_dispatch
     _TRITON_WHY: str | None = f"the triton kernels are not importable here: {exc}"
 else:
     _TRITON_WHY = None
+
+
+class _OnHost:
+    """A saved activation parked in host RAM by the offload pack hook.
+
+    A CLASS, not the bare cpu tensor: the pack hook also sees values it must
+    pass through untouched (a non-tensor), the unpack hook has to tell its own
+    cargo from those, and the contract `saved_tensors_hooks` documents requires
+    the unpacked tensor to come back on the ORIGINAL device — so the packed
+    object carries it.
+    """
+
+    __slots__ = ("t", "device")
+
+    def __init__(self, t: torch.Tensor, device: torch.device) -> None:
+        self.t = t
+        self.device = device
+
+
+def _pack_activation(t: object) -> object:
+    """`saved_tensors_hooks` pack: copy a saved activation to plain host RAM.
+
+    `detach()` so the copy carries no graph of its own (the documented
+    reference-cycle rule), `.to("cpu")` so it is a pageable host tensor — the
+    copy is exact (same dtype, same bits), which is what makes the parity gate a
+    bit-equality and not a bound. The original device travels with it.
+    """
+    if not isinstance(t, torch.Tensor):
+        return t
+    return _OnHost(t.detach().to("cpu"), t.device)
+
+
+def _unpack_activation(h: object) -> object:
+    """`saved_tensors_hooks` unpack: give the copy back ON ITS ORIGINAL DEVICE.
+
+    The device leg is not optional and it is not decoration: the hook contract
+    is "equal in value, size, dtype AND device", and a backward kernel handed a
+    cpu tensor where the forward saved a cuda one dies on the device check
+    (`index_select` refuses a cpu index, measured on 2.13.0). The copy back
+    happens at the backward edge, so the tensor is a device temporary for
+    exactly the node that needs it — which is the whole offload.
+    """
+    if not isinstance(h, _OnHost):
+        return h
+    return h.t if h.device.type == "cpu" else h.t.to(h.device)
 
 
 class DualLatentGLU(nn.Module):
@@ -114,6 +200,7 @@ class SparseMoE(nn.Module):
         self.topk = cfg.moe_topk
         self.capacity = cfg.moe_capacity
         self.moe_kernel = cfg.moe_kernel
+        self.moe_offload = cfg.moe_offload
         self.experts = nn.ModuleList(
             DualLatentGLU(d, f, cfg.rank, dtype=dtype, device=device) for _ in range(cfg.n_experts)
         )
@@ -146,6 +233,12 @@ class SparseMoE(nn.Module):
         logits = mm_mixed(x, self.router.weight, dt)  # bf16 tensor-core, fp32 out
         probs = F.softmax(logits, dim=-1)  # [n, E]
         weighted = torch.zeros(n, self.f, dtype=torch.float32, device=x.device)
+        if self.moe_offload and self.topk == 0:
+            # The offload switch is the ROUTED pass's (the capacity-padded bank
+            # it materializes is what it exists for); a dense blend has no such
+            # bank. Counted, never silent: an arm asked for and not run is the
+            # thing the counters exist to make visible (ADR-0019).
+            counters.count("moe_offload_inert_dense")
         if self.topk == 0:
             # Dense arm via ONE banked bmm per projection: the per-expert loop
             # was 24 sequential launches per forward at small (launch-bound,
@@ -360,6 +453,40 @@ class SparseMoE(nn.Module):
         counters.count("moe_tokens", n)
         return out
 
+    def _expert_pass(self, run: Callable[[], torch.Tensor], counters: Counters) -> torch.Tensor:
+        """Run ONE routed expert pass, host-offloading its saved activations (SL1).
+
+        `moe_offload` off: `run()` and nothing else — byte-for-byte today's path,
+        and no counter, so a reader can tell the two apart on the log line.
+
+        `moe_offload` on: the pass runs inside `checkpoint(use_reentrant=False)`
+        with the host pack/unpack hooks INSIDE it, so every activation the pass
+        saves (the `[E, cap, ·]` banks, the GLU gates, the gathered rows) lives in
+        host RAM between the forward and the backward instead of on the device.
+        The hooks go inside the checkpointed FUNCTION, not around the
+        `checkpoint()` call — the module docstring carries that measured caveat,
+        and `tests/test_offload_experts.py` pins it with a spy on the pack hook
+        (a scope wrapped around the call leaves it firing zero times, which is
+        the silent no-op this ordering exists to avoid).
+        The correctness claim is bit-parity, gated in the same test file.
+
+        Non-reentrant is required, not preferred: the routed pass reads router
+        outputs (`index`, `weight`) that are detached from the expert graph.
+        The pack copy is SYNCHRONOUS `device→host` (pageable, no pin) — that is
+        what the mechanism costs; pinned buffers plus a side-stream copy are the
+        upgrade if the b1 step-time measurement says the sync is the bill
+        (`docs/research/2026-10-16-budget-savers.md` §5: predicted +5-15% step).
+        """
+        if not self.moe_offload:
+            return run()
+        counters.count("moe_offloaded")
+
+        def offloaded() -> torch.Tensor:
+            with saved_tensors_hooks(_pack_activation, _unpack_activation):
+                return run()
+
+        return checkpoint(offloaded, use_reentrant=False)
+
     def _dispatch(
         self,
         x: torch.Tensor,
@@ -385,7 +512,9 @@ class SparseMoE(nn.Module):
             why = self._triton_reason(x)
             if why is None:
                 counters.count("moe_triton_gemm")
-                return self._triton_dispatch(x, weight, index, order, keep)
+                return self._expert_pass(
+                    lambda: self._triton_dispatch(x, weight, index, order, keep), counters
+                )
             counters.count("moe_triton_fallback")
             notes.append(f"triton: {why}")
         why = self._padded_reason(x)
@@ -395,10 +524,14 @@ class SparseMoE(nn.Module):
             if notes:
                 counters.why = "; ".join(notes)  # type: ignore[attr-defined]
             counters.count("moe_padded_bmm")
-            return self._padded_dispatch(x, weight, index, order, keep)
+            return self._expert_pass(
+                lambda: self._padded_dispatch(x, weight, index, order, keep), counters
+            )
         counters.count("moe_naive_dispatch")
         counters.why = "; ".join([*notes, why])  # type: ignore[attr-defined]
-        return self._naive_dispatch(x, weight, index, order, keep, counters)
+        return self._expert_pass(
+            lambda: self._naive_dispatch(x, weight, index, order, keep, counters), counters
+        )
 
     def _triton_reason(self, x: torch.Tensor) -> str | None:
         """`None` if the unpadded grouped GEMM can run THIS call, else why not.

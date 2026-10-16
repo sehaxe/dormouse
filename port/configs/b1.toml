@@ -30,6 +30,13 @@ moe_topk = 2
 # to 11.3%, while cap 64 costs +4.5% step time for 0-3.8% drops. Capacity
 # wins: an assignment dropped is a gradient never seen.
 moe_capacity = 2.0
+# SL1 host-offload of the routed expert pass (docs/research/
+# 2026-10-16-budget-savers.md §5): the MoE block owns the activation peak, and
+# this pass's `[E, cap, d]` / `[E, cap, f]` banks own it. `moe_offload` parks
+# those saves in host RAM, loss and gradients exact (they are copied). It is
+# OFF (the schema default) while the switch lands with its parity gate;
+# the b1 recipe is the one that turns it ON once it is a default.
+moe_offload = false
 # TSCT2 §13.4: writing only into a 64-dim subspace gives too small an R_act;
 # §14 answers with a shared expert of rank ~192-256 next to the routed r=64.
 shared_rank = 192

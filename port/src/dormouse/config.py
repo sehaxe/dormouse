@@ -155,6 +155,17 @@ class ModelConfig:
     #: is LOUD at config load. `triton` falls back COUNTED to `padded` when the
     #: kernel cannot run (no triton import, input not on CUDA) — never silently.
     moe_kernel: str = "padded"
+    #: SL1 of `docs/research/2026-10-16-budget-savers.md` §5: park the routed
+    #: expert pass's saved activations in HOST RAM instead of VRAM
+    #: (`experts._expert_pass`: `checkpoint(use_reentrant=False)` with
+    #: `saved_tensors_hooks` inside). Loss and gradients are EXACT — the values
+    #: are copied, never approximated (`tests/test_offload_experts.py`) — and
+    #: `moe_offloaded` on the counter line is what proves the arm ran. Off by
+    #: default: this round ships the switch and its parity gate, and the b1
+    #: recipe turns it ON when it lands as a default. The ROUTED pass only:
+    #: with `moe_topk = 0` there is no capacity-padded bank to offload and the
+    #: switch is COUNTED inert (`moe_offload_inert_dense`).
+    moe_offload: bool = False
     #: Rank of the always-on shared expert (TSCT2 §14's `R_act` ≥ 192 zone).
     shared_rank: int = 192
 

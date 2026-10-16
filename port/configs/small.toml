@@ -68,6 +68,13 @@ use_attnres = false
 n_experts = 3
 moe_topk = 0
 moe_capacity = 2.0
+# SL1 host-offload of the routed expert pass (budget-savers doc §5): with the
+# switch ON the `[E, cap, ·]` bank and the GLU gates it saves live in host RAM
+# between the forward and its backward, loss and gradients bit-identical.
+# OFF here because this preset runs the DENSE blend (`moe_topk = 0`), which has
+# no capacity-padded bank to offload — a dense blend counts
+# `moe_offload_inert_dense` rather than pretending the arm ran.
+moe_offload = false
 shared_rank = 192
 
 # Hashed n-gram memory. 25 000 rows/order x 3 orders x 32 dim, each table
