@@ -20,7 +20,7 @@ from dormouse.model import DormouseModel, param_count, table_slots
 
 #: The totals the two presets' comments carry.
 SMALL_PORT_TOTAL = 9_476_993
-B1_PORT_TOTAL = 1_066_358_209  # max_iter 4 (owner 2026-10-16): +2 slots x d 2048
+B1_PORT_TOTAL = 1_066_356_161  # max_iter 3 (depth A/B 2026-10-16): iter-embed slots
 
 
 def arithmetic(cfg) -> dict[str, int]:
