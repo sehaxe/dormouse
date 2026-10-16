@@ -48,7 +48,6 @@ def test_unknown_key_refuses_and_names_the_escape():
         ("use_mor", "true", "Mixture-of-Recursions"),
         ("use_situ", "true", "SiTU-GLU"),
         ("jepa_weight", "0.05", "JEPA"),
-        ("dspark_weight", "0.1", "DSpark"),
         ("act_quant", '"int8"', "activation quantization"),
     ],
 )

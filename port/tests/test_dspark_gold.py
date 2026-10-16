@@ -27,7 +27,6 @@ from __future__ import annotations
 import pytest
 
 from dormouse.config import parse_preset
-from dormouse.instrument import LoudError
 
 #: Paper Eq 5's default Markov rank `r` for `W_1` / `W_2` (`dspark.md` §1).
 MARKOV_RANK = 256
@@ -124,10 +123,11 @@ def test_the_confidence_head_is_markov_conditioned_and_the_port_refuses_the_arm(
     Eq 7's acceptance head reads `[h_k ; W1[x_{k-1}]]`, so its width is
     `d_model + markov_rank` — NOT `d_model`. The operand comes from the same
     window step the draft head is fed (`make_window`'s `token`, which is why the
-    two defects share a file). The port has no head and refuses to pretend it
-    does: `dspark_weight` non-default is LOUD, so a future landing has to bring
-    the window, the Markov conditioning and the arm's own A/B together.
+    two defects share a file). The port now HAS the head (`dspark.py`,
+    integrated 2026-10-16); this test used to pin the refusal and now pins the
+    positive: the width contract stands, and the arm is reachable through the
+    config with its defaults.
     """
     assert acceptance_width(768, MARKOV_RANK) == 768 + MARKOV_RANK != 768
-    with pytest.raises(LoudError, match="DSpark"):
-        parse_preset("d_model = 64\nn_heads = 4\nhead_dim = 16\ndspark_weight = 0.1\n")
+    cfg = parse_preset("d_model = 64\nn_heads = 4\nhead_dim = 16\ndspark_weight = 0.1\n")
+    assert cfg.dspark_weight == 0.1 and cfg.dspark_k == 4 and cfg.dspark_stride == 16

@@ -46,6 +46,7 @@ from .byteflow import (
     compat_armed,
     count_channel,
 )
+from .dspark import DSparkHead, dspark_aux_loss
 from .fb import FutureByteHead, future_byte_loss
 from .loopblock import LoopBlock
 from .sigreg import sigreg_loss, stride_sample
@@ -82,6 +83,11 @@ class DormouseModel(nn.Module):
         # makes pure CE a valid control without a re-baseline.
         self.fb: FutureByteHead | None = (
             FutureByteHead(d, cfg.vocab, device=device) if cfg.aux_fb_weight > 0.0 else None
+        )
+        # The DSpark draft head (2607.05147): built only when the weight is on
+        # — at 0.0 the parameter set and every preset count match today's.
+        self.dspark: DSparkHead | None = (
+            DSparkHead(cfg, device=device) if cfg.dspark_weight > 0.0 else None
         )
 
     def forward(
@@ -225,6 +231,16 @@ class DormouseModel(nn.Module):
                 counters.count("sigreg")
                 loss = loss + self.cfg.sigreg_weight * sigreg_loss(
                     stride_sample(hn.reshape(-1, self.cfg.d_model).to(torch.float32))
+                )
+            if self.dspark is not None:
+                # The DSpark draft head (`dspark.py`, standalone module; this
+                # hook is its integration commit): γ is the config weight (D2 —
+                # the loss returns γ-free), the window reads the CONSUMED
+                # sequence and the byte ids the lm_head just scored (D1), and
+                # `dspark=<windows>/<calls>` on the log line is the void check
+                # (0/<n> = the length budget allowed no window, counted).
+                loss = loss + self.cfg.dspark_weight * dspark_aux_loss(
+                    self.dspark, hn.to(torch.float32), input_ids, logits, counters=counters
                 )
             assert torch.isfinite(loss), "L_Rec + final CE must be finite"
         return logits, loss

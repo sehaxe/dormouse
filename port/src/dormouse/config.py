@@ -179,6 +179,16 @@ class ModelConfig:
     #: `validate` refuses it together with `jepa_weight`/`dspark_weight` — the
     #: A/B attributes its verdict to ONE signal per run.
     aux_fb_weight: float = 0.0
+    #: ---- the DSpark draft head (2607.05147; port wiring 2026-10-16) ----
+    #: The DSpark term adds next-K-byte draft supervision + the acceptance
+    #: head. `dspark_weight` = γ (D2: the loss is γ-free, the CALLER scales);
+    #: `dspark_k` = the draft reach in bytes; `dspark_stride` = the anchor
+    #: spacing in byte positions (0 refused). `dspark_markov_rank` sizes the
+    #: D9 markov feature. Refused with use_byteflow (the channel has no aux).
+    dspark_weight: float = 0.0
+    dspark_k: int = 4
+    dspark_stride: int = 16
+    dspark_markov_rank: int = 256
     #: SIGReg / LeJEPA (arXiv:2511.08544, `model/sigreg.py`): a REGULARISER, not
     #: a head. `loss = CE + sigreg_weight · sigreg_loss(z)`, `z` the strided
     #: sample of the state `lm_head` reads — no teacher, no predictor, no mask,
@@ -201,7 +211,6 @@ class ModelConfig:
     msa_capacity_ratio: float = 0.25
     adaptive_msa: bool = False
     jepa_weight: float = _unsupported(0.0, "JEPA + KoLeo aux heads")
-    dspark_weight: float = _unsupported(0.0, "DSpark draft head")
     act_quant: str | None = _unsupported(None, "BitNet-style activation quantization (STE)")
     act_group: int = 0
 
@@ -415,6 +424,7 @@ def validate(model: ModelConfig) -> None:
             f"attributes the result to neither. Escape: set {which} = 0.0, or "
             f"aux_fb_weight = 0.0."
         )
+
     if model.quant != "none":
         _refuse_ladder_rung(model.quant)
 
@@ -485,6 +495,29 @@ def _validate_byteflow(model: ModelConfig) -> None:
             "`bf.out_proj(out_acc)`, not the `norm(out)` state SIGReg reads, so the "
             "term would be built and attached to nothing. Escape: sigreg_weight = 0.0, "
             "or drop use_byteflow."
+        )
+    if model.dspark_weight > 0.0:
+        loud(
+            "use_byteflow with dspark_weight>0: the channel's forward carries no "
+            "byte ids for the draft window to read. Escape: dspark_weight = 0.0, "
+            "or drop use_byteflow."
+        )
+    if model.dspark_weight < 0.0:
+        loud(
+            f"dspark_weight={model.dspark_weight} is negative: it is γ, the "
+            f"multiplier on the γ-free DSpark loss (D2). Escape: 0.0 (off) or a "
+            f"positive weight."
+        )
+    if model.dspark_k < 1 or model.dspark_stride < 1:
+        loud(
+            f"dspark_k={model.dspark_k} / dspark_stride={model.dspark_stride}: "
+            f"both are positive counts (the draft reach and the anchor spacing, "
+            f"in bytes). Escape: k >= 1, stride >= 1."
+        )
+    if model.dspark_weight > 0.0 and model.aux_fb_weight > 0.0:
+        loud(
+            "dspark_weight with aux_fb_weight>0: two heads on one run breaks the "
+            "one-signal-per-run A/B rule. Escape: pick one."
         )
 
 

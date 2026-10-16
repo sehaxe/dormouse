@@ -101,7 +101,7 @@ use_byteflow = false
 moe_lb_coef = 0.01
 
 jepa_weight = 0.0
-dspark_weight = 0.0
+dspark_weight = 0.0  # gamma; >0 builds the DSpark draft head (dspark_k/stride/markov_rank follow)
 # The future-byte head (arXiv 2404.19737, `model/fb.py`): a dense untied
 # `d_model -> vocab` readout over the state lm_head already reads, one plain CE
 # on the label rolled by -1. 196 864 params at this preset's d768/v256 = 2.14%
