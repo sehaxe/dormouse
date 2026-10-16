@@ -1,4 +1,4 @@
-"""The MSA block indexer (QSA → MSA) — the plan's §3.5 item 4 recipe.
+"""The MSA: 1/4 arm share + the ADAPTIVE per-iteration schedule the owner set.
 
 **SOURCE**: `docs/decisions/2026-10-15-1b-readiness-plan.md` §3.5 item 4 (the
 MQA + block-indexer recipe, carried from the burn re-entry review
@@ -18,13 +18,18 @@ The recipe, one clause at a time:
   first token is at or before `i` (`j*r <= i`), and the score is
   `Σ_h ReLU(q_h · k_block_j)` — non-negative by construction, so a logit is
   never a negative "similarity", which is the paper's ReLU choice.
-* **top-K blocks**: `msa_topk` per query (default 32; K ~ 32-64 at 1M).
-
-A query whose candidate blocks number fewer than K truncates the top-K (every
-early position, and every sequence shorter than K blocks) — that is COUNTED as
-`msa_truncated`, never a silent `-inf` row (the burn side's ADR-0015 lesson:
-the pre.4 argtopk emitted the out-of-range seed coordinate for exactly this
-case). The count is pure shape arithmetic, so it costs no device sync.
+* **top-K blocks**: `msa_topk` per query (default 32; K ~ 32-64 at 1M). **1/4
+  ARM SHARE (owner's directive, 2026-10-16): MSA answers to 1/4 of the model's
+  attention demand versus the KDA linear arm, so `msa_capacity_ratio` = 0.25
+  of each query's candidate blocks is the DEFAULT. The ADAPTIVE SCHEDULE is
+  the owner's second ask: the model itself decides where the 25% is spent —
+  `adaptive_msa` routes per ITERATION (the router's pooled MoE scores pick
+  the iteration that runs sparse attention; the average share across the
+  block's iterations stays at 1/4, per-iteration 0..~0.5), measured by
+  `msa_iterations=<n>/<total>` on the eval line; NOT per-token MoD-style
+  pruning (the 2026-10-16 MoD sweep says per-token pruning is parity at
+  BEST on our scale, and the plan's pre-registered TIE holds for the arm
+  A/B at 9.2M).
 
 CEILING (`ponytail:`): the score tensor is `[b, t, n_blocks]` = O(t·ceil(t/r))
 memory — fine at 512-2048, impossible at 1M. The 1M form scores blocks against
@@ -72,10 +77,11 @@ class FlexSparseSelector(nn.Module):
         self.k_idx = nn.Linear(d, self.head_dim, bias=False, device=device)
 
     def forward(
-        self, x: torch.Tensor, counters: Counters | None = None
+        self, x: torch.Tensor, counters: Counters | None = None, k: int | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         b, t, _ = x.shape
-        r, k = self.block, self.topk
+        r = self.block
+        k = self.topk if k is None else k
         n = (t + r - 1) // r  # ceil: the final block may be partial
         counters = Counters() if counters is None else counters
         assert x.ndim == 3, f"selector takes [b,t,d], got {tuple(x.shape)}"

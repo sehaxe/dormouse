@@ -168,6 +168,16 @@ class ModelConfig:
     #: `validate` refuses it together with `jepa_weight`/`dspark_weight` — the
     #: A/B attributes its verdict to ONE signal per run.
     aux_fb_weight: float = 0.0
+    #: ---- the second attention arm (MSA re-entry, ADR-0014; owner 2026-10-16) ----
+    #: 1M-context sparse attention BESIDE KDA (which stays the default arm).
+    #: `msa_capacity_ratio` = the arm's share of the attention demand (owner:
+    #: 1/4 of KDA's); `adaptive_msa` = the model decides WHERE that 1/4 goes
+    #: (per-iteration learned share, mean = the ratio; the `msa_gate` blend).
+    use_msa: bool = False
+    msa_topk: int = 32
+    msa_block: int = 4
+    msa_capacity_ratio: float = 0.25
+    adaptive_msa: bool = False
     jepa_weight: float = _unsupported(0.0, "JEPA + KoLeo aux heads")
     dspark_weight: float = _unsupported(0.0, "DSpark draft head")
     act_quant: str | None = _unsupported(None, "BitNet-style activation quantization (STE)")

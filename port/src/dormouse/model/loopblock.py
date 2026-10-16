@@ -33,6 +33,7 @@ from ..instrument import Counters
 from .engram import Engram, memory_floor_mix
 from .experts import SparseMoE
 from .kda import KDAAttention
+from .sparse import BlockSparseAttention
 from .tsct import make_projection, mm_mixed
 
 __all__ = ["AttnResSlot", "LoopBlock", "depth_attend", "memory_floor_mix"]
@@ -93,6 +94,19 @@ class LoopBlock(nn.Module):
         # no gradient is the defect class this project's counters exist for.
         self.controller = nn.Linear(2 * d, 3, bias=False, device=device)
         self.attn = KDAAttention(cfg, device=device) if cfg.use_kda else None
+        # The second attention arm (owner's 1M-context directive, 2026-10-16):
+        # MSA rides an ADDITIVE branch beside KDA, off by default; the ADAPTIVE
+        # schedule (`adaptive_msa`) gives it a per-ITERATION share whose mean
+        # is `msa_capacity_ratio` (the owner's 1/4), decided BY the model: one
+        # learnable logit per iteration slot, softmax-normalized across the
+        # slots and scaled to the mean — so the model picks WHERE the sparse
+        # attention's compute is spent, the total budget is fixed.
+        self.adaptive_msa = bool(getattr(cfg, "adaptive_msa", False))
+        self.msa = BlockSparseAttention(cfg, device=device) if cfg.use_msa else None
+        self.msa_capacity_ratio = float(getattr(cfg, "msa_capacity_ratio", 0.25))
+        if self.msa is not None:
+            assert 0.0 < self.msa_capacity_ratio <= 1.0, "msa_capacity_ratio in (0, 1]"
+            self.msa_gate = nn.Parameter(torch.zeros(cfg.max_iter, device=device))
         self.moe = SparseMoE(cfg, device=device)
         self.engram = Engram(cfg, device=device) if cfg.use_engram else None
         # The dense half of the memory branch's mixture — the `(1-g)·v_t` term.
@@ -143,6 +157,26 @@ class LoopBlock(nn.Module):
                 if self.attn is not None
                 else torch.zeros(b * t, d, dtype=torch.float32, device=h0.device)
             )
+            if self.msa is not None:
+                # The ADAPTIVE share: softmax over the iteration gates × max_iter
+                # = a per-slot share whose MEAN over slots is 1; × the arm's
+                # capacity ratio (the owner's 1/4) it becomes the slot's budget.
+                # The ROUNDED share picks the block count (compute follows), and
+                # the SOFT share multiplies the branch's output below, so the
+                # gates receive gradient — the model learns WHERE to spend the
+                # 25%, and a zero share can switch a slot off entirely.
+                if self.adaptive_msa and self.max_iter > 1:
+                    share = torch.softmax(self.msa_gate, dim=0) * self.max_iter
+                    counters.count("msa_iter_gate")
+                    msa_out = self.msa.forward_k(
+                        normed, counters, float(share[i].detach()) * self.msa_capacity_ratio
+                    )
+                    if msa_out is not None:
+                        attn = attn + msa_out.reshape(b * t, d) * w_attn * share[i]
+                else:
+                    msa_out = self.msa(normed, counters=counters)
+                    if msa_out is not None:
+                        attn = attn + msa_out.reshape(b * t, d) * w_attn
 
             if self.engram is not None and input_ids is not None:
                 mem = self.engram(normed, input_ids, counters).reshape(b * t, d)

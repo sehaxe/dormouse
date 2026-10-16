@@ -143,11 +143,14 @@ def test_d_arm_off_is_free_and_the_model_is_unchanged():
     assert c["msa_off"] == 1 and "msa_blocks" not in c
     assert sum(p.numel() for p in BlockSparseAttention(_cfg()).parameters()) > 0
 
-    # The whole model's bytes do not move with the flag: the tree is untouched.
-    a, b = tiny_cfg(), tiny_cfg()
+    # The flag is a REAL ModelConfig field since 2026-10-16 (the owner's 1M
+    # directive made the arm configurable): OFF builds no arm parameters, ON
+    # adds the arm's own projections, and both trees forward end to end.
+    m_off = DormouseModel(tiny_cfg())
+    b = tiny_cfg()
     b.use_msa = True
-    m_off, m_on = DormouseModel(a), DormouseModel(b)
-    assert param_count(m_off) == param_count(m_on) > 0
+    m_on = DormouseModel(b)
+    assert param_count(m_on) > param_count(m_off) > 0
 
     # And the default 512-seq forward still runs (the KDA-only path).
     model = DormouseModel(tiny_cfg(max_seq_len=512))

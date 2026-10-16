@@ -88,7 +88,29 @@ class BlockSparseAttention(nn.Module):
             return None
         assert self.selector is not None and self.q_proj is not None
         b, t, d = x.shape
-        blocks, keep = self.selector(x, counters)
+        return self._forward(x, counters, k_override=None)
+
+    def forward_k(self, x: torch.Tensor, counters: Counters, k_share: float) -> torch.Tensor | None:
+        """The ADAPTIVE entry: K per query from `k_share` × candidate blocks.
+
+        `k_share` is the per-ITERATION share (the adaptive schedule's ratio for
+        this slot); 0 → MSA runs with no blocks this iteration (COUNTED
+        `msa_iter_skip`, returns None so the caller adds nothing), the model
+        spends its budget elsewhere. The share's mean over iterations is the
+        arm's `msa_capacity_ratio` (owner's 1/4), the placement is learned.
+        """
+        assert self.use_msa and self.selector is not None
+        b, t, _ = x.shape
+        n_blocks = (t + self.block - 1) // self.block
+        k = int(round(k_share * n_blocks))
+        if k <= 0:
+            counters.count("msa_iter_skip")
+            return None
+        return self._forward(x, counters, k_override=k)
+
+    def _forward(self, x, counters, k_override) -> torch.Tensor:
+        b, t, d = x.shape
+        blocks, keep = self.selector(x, counters, k=k_override)
         counters.count("msa_blocks", b * t * blocks.shape[-1])
         q = self.q_proj(x).reshape(b, t, self.n_heads, self.head_dim)
         k = self.k_proj(x).reshape(b, t, self.n_heads, self.head_dim)
