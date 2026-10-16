@@ -234,7 +234,7 @@ def _gram_via_ns(
     return out.transpose(-1, -2).contiguous() if transposed else out
 
 
-def colrow_normalize(x: torch.Tensor, eps: float = 1e-7, *, colrow_3d: str = "frobenius"):
+def colrow_normalize(x: torch.Tensor, eps: float = 1e-7, *, colrow_3d: str = "colrow"):
     """`Norm_d` for `NormDir::ColRow` (the trainer's choice): columns, then rows.
 
     **The 2-D form is the definition and is untouched by `colrow_3d`.** The 3-D
@@ -266,7 +266,7 @@ def colrow_normalize(x: torch.Tensor, eps: float = 1e-7, *, colrow_3d: str = "fr
     return x / (x.norm(dim=(1, 2) if colrow_3d == "frobenius" else 2, keepdim=True) + eps)
 
 
-def colrow_normalize_(x: torch.Tensor, eps: float = 1e-7, *, colrow_3d: str = "frobenius"):
+def colrow_normalize_(x: torch.Tensor, eps: float = 1e-7, *, colrow_3d: str = "colrow"):
     """`colrow_normalize` in place — the SAME arithmetic, no new tensor.
 
     `x.div_(n + eps)` and `x / (n + eps)` are the same operation on the same
@@ -316,7 +316,7 @@ class Muon(Optimizer):
         ns_steps: int = 5,
         ns_kind: str = "classic",
         gram_restarts: tuple[int, ...] = GRAM_NS_RESTARTS,
-        colrow_3d: str = "frobenius",
+        colrow_3d: str = "colrow",
     ) -> None:
         _check_ns_kind(ns_kind)
         _check_colrow_3d(colrow_3d)
@@ -508,7 +508,7 @@ class MixOptimizer:
         ns_steps: int = 5,
         ns_kind: str = "classic",
         gram_restarts: tuple[int, ...] = GRAM_NS_RESTARTS,
-        colrow_3d: str = "frobenius",
+        colrow_3d: str = "colrow",
         betas: tuple[float, float] = (0.9, 0.95),
         eps: float = 1e-8,
     ) -> None:

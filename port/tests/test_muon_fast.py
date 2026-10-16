@@ -81,7 +81,8 @@ def old_batched_step(muon: Muon, chunk_elems: int | None = None) -> int:
                 buf = state["momentum"]
                 buf.mul_(mu).add_(p.grad, alpha=1.0 - mu)
                 update = colrow_normalize(
-                    zeropower_via_ns(buf, ns, muon.ns_kind, muon.gram_restarts)
+                    zeropower_via_ns(buf, ns, muon.ns_kind, muon.gram_restarts),
+                    colrow_3d="frobenius",  # the historical arm, pinned
                 )
                 scale = max(1.0, shape[0] / shape[1]) ** 0.5
                 with torch.no_grad():
@@ -99,7 +100,8 @@ def old_batched_step(muon: Muon, chunk_elems: int | None = None) -> int:
             grads = torch.stack([p.grad for p in params_c])
             bufs.mul_(mu).add_(grads.detach(), alpha=1.0 - mu)
             update = colrow_normalize(
-                zeropower_via_ns(bufs, ns, muon.ns_kind, muon.gram_restarts)
+                zeropower_via_ns(bufs, ns, muon.ns_kind, muon.gram_restarts),
+                colrow_3d="frobenius",  # the historical arm, pinned
             ).detach()
             scale = max(1.0, shape[0] / shape[1]) ** 0.5
             updates = update.mul(-lr * scale)
@@ -308,7 +310,7 @@ def test_state_dict_round_trip_continues_identically():
     assert sd["state"][0]["momentum"].shape == (64, 5461)
 
     fresh = shape_model(shapes)
-    resumed = Muon(fresh.parameters(), lr=1e-3)
+    resumed = Muon(fresh.parameters(), lr=1e-3, colrow_3d="frobenius")
     resumed.load_state_dict(sd)
     assert len(resumed._groups) == 3, "the loader must restack per shape"
     for i, p in enumerate(resumed.param_groups[0]["params"]):
@@ -321,7 +323,7 @@ def test_state_dict_round_trip_continues_identically():
     d.load_state_dict(a.state_dict())  # d starts where `a` is after step 1
     for p, q in zip(a.parameters(), c.parameters(), strict=True):
         p.grad = q.grad.clone()
-    resumed = Muon(d.parameters(), lr=1e-3)
+    resumed = Muon(d.parameters(), lr=1e-3, colrow_3d="frobenius")
     resumed.load_state_dict(sd)
     old_batched_step(oa)
     resumed.batched_step_from_model(d)
@@ -346,8 +348,8 @@ def test_an_old_per_param_checkpoint_still_loads_and_steps():
             {"lr": 1e-3, "momentum": 0.95, "ns_steps": 5, "params": list(range(len(params)))}
         ],
     }
-    oa = Muon(a.parameters(), lr=1e-3)
-    ob = Muon(b.parameters(), lr=1e-3)
+    oa = Muon(a.parameters(), lr=1e-3, colrow_3d="frobenius")
+    ob = Muon(b.parameters(), lr=1e-3, colrow_3d="frobenius")
     oa.load_state_dict(sd)
     ob.load_state_dict(sd)
     assert len(ob._groups) == 2 and torch.equal(ob._groups[0].mom, torch.stack(rows[:3]))
@@ -361,30 +363,29 @@ def test_an_old_per_param_checkpoint_still_loads_and_steps():
 
 @pytest.mark.parametrize("shape", [(64, 64), (8, 128), (16, 128), (64, 2048)])
 def test_the_batched_colrow_is_not_the_per_param_colrow(shape):
-    """CHARACTERISATION of a pre-existing defect — `colrow_normalize`'s 3-D branch.
+    """The DEFECT, pinned on its own arm — `colrow_normalize`'s 3-D branch.
 
-    The batched step normalises each slice by its Frobenius norm TWICE
-    (dims `(1, 2)`) instead of columns (dim 1) then rows (dim 2), so its update
-    is exactly `1/sqrt(d0)` of the per-param ColRow the port documents and the
-    papers specify. Found 2026-10-16 by the equivalence gate above; the fix is
-    one line in `colrow_normalize` and it MOVES the trainer's Muon update scale
-    for every shape group with >= 2 members (8x at `[64, 5461]`, 45x at
-    `[2048, 2048]`), so it is an A/B-gated numerics change (AGENTS §1.2) and is
-    NOT landed by a speed commit.
-
-    When the fix lands, THIS test goes red — which is the point: it is the
-    marker that the A/B was owed. The fix is now LANDED as an arm
-    (`train.muon_colrow_3d`, default `frobenius`), so this test still passes
-    and becomes the gate on the DEFAULT: flipping `muon_colrow_3d` to `colrow`
-    for everyone means updating this test with the A/B's verdict.
+    With `colrow_3d="frobenius"` (the historical arm) the batched step
+    normalises each slice by its Frobenius norm TWICE (dims `(1, 2)`) instead
+    of columns (dim 1) then rows (dim 2), so its update is exactly
+    `1/sqrt(d0)` of the per-param ColRow the port documents and the papers
+    specify. Found 2026-10-16 by the equivalence gate above; the A/B (6 runs,
+    small, 2k) measured the fix at **-0.0428 BPB vs this arm (8.7x the
+    control's spread, zero overlap)**, so the DEFAULT flipped to `colrow` the
+    same day. This test keeps the defect arm CHARACTERISED: the day someone
+    "cleans up" `frobenius` into `colrow`, this goes red and the history of
+    why the two arms exist is one docstring away.
     """
     torch.manual_seed(0)
     u = zeropower_via_ns(torch.randn(1, *shape), 5, "classic")
-    batched = colrow_normalize(u)
+    batched = colrow_normalize(u, colrow_3d="frobenius")
     per_param = colrow_normalize(u[0])
     ratio = float(batched.norm() / per_param.norm())
     assert ratio == pytest.approx(1.0 / math.sqrt(shape[0]), rel=1e-5), ratio
     assert not torch.allclose(batched[0], per_param)
+    # And the default IS the fix now: the same call without the kwarg matches
+    # the per-param definition exactly.
+    assert torch.equal(colrow_normalize(u), colrow_normalize(u, colrow_3d="colrow"))
 
 
 # --- the arm that fixes it (`muon_colrow_3d`) --------------------------------
@@ -439,14 +440,35 @@ def test_the_colrow_arm_makes_the_batched_step_the_per_param_definition():
     assert not _same_params(c, e), "the arm changed nothing — it is inert"
 
 
-def test_the_frobenius_arm_is_still_the_default():
-    """The arm is opt-in: the default reproduces the pre-change step exactly."""
+def test_the_frobenius_arm_reproduces_the_pre_fix_step():
+    """The historical arm still exists and reproduces the pre-change step.
+
+    The DEFAULT moved to `colrow` on 2026-10-17 (the A/B: -0.0428 BPB, 8.7x
+    the control spread), so this test pins the OLD arm explicitly — the
+    characterisation test above needs it, and a reader needs it to
+    reproduce every number taken before the flip.
+    """
     shapes = {(64, 5461): 3, (64, 64): 2}
-    a, oa, b, ob = _pair(shapes)
+    a, oa, b, ob = _pair(shapes, colrow_3d="frobenius")
     assert ob.colrow_3d == "frobenius"
     old_batched_step(oa)
     ob.batched_step_from_model(b)
     assert _same_params(a, b) and _same_momentum(oa, ob)
+
+
+def test_the_default_colrow_arm_is_the_fix():
+    """The flip: `Muon()` with no arm IS `colrow_3d="colrow"`, and the step
+    it takes differs from the historical arm (the flip is not inert)."""
+    shapes = {(64, 5461): 3, (64, 64): 2}
+    b_old, o_old, b, ob = _pair(shapes, colrow_3d="frobenius")
+    old_batched_step(o_old)
+    ob.batched_step_from_model(b)
+
+    c, oc, d, _ = _pair(shapes, colrow_3d="colrow")
+    oc.batched_step_from_model(c)
+    assert Muon(d.parameters(), lr=1e-3).colrow_3d == "colrow", "the default is the fix"
+    assert not _same_params(b, c), "the two arms must not take the same step"
+    del b_old
 
 
 def test_a_bad_colrow_arm_is_loud_everywhere_it_can_be_set():

@@ -439,18 +439,20 @@ class TrainConfig:
 
     #: The 3-D `colrow_normalize` arm the batched Muon step runs
     #: (`MUON_COLROW_3D` above, `optim.COLROW_3D` where it executes).
-    #: `frobenius` = the per-slice Frobenius normalisation the batched step has
-    #: always run. It is **NOT `NormDir::ColRow`** — the 3-D branch collapses
-    #: dims `(1, 2)` twice instead of columns then rows — so the batched update
-    #: is exactly `1/sqrt(d0)` of the per-param definition (8x at `[64, 5461]`,
-    #: 45x at `[2048, 2048]`). Found 2026-10-16 by
-    #: `tests/test_muon_fast.py`'s equivalence gate; it stays the DEFAULT
-    #: because every number on record ran it. `colrow` = the 2-D definition
-    #: applied per slice — bit-identical to the per-param path, and a numerics
-    #: change for every shape group with >= 2 members, so it is an ARM awaiting
-    #: the standing 3-seed A/B (AGENTS §1.2), not a new default. The 2-D path
-    #: (and a shape group with one member) is the same in both arms.
-    muon_colrow_3d: str = "frobenius"
+    #: **`colrow` (the default since 2026-10-16) = the 2-D definition applied
+    #: per slice** — bit-identical to the per-param path. The A/B verdict
+    #: (6 runs x 2k steps, small, 81 920 B window): control 3.0542 vs fix
+    #: 3.0113 = **-0.0428 BPB, 8.7x the control's seed spread, zero seed
+    #: overlap** — the largest measured A/B win in the port's history, so the
+    #: default flipped (AGENTS 1.2). Carry-forward caveats: the arm's curve
+    #: CROSSES (worse at step 1000, better at 2000), its own spread is 3.7x
+    #: the control's, and it is one preset/one budget — re-confirm on `medium`
+    #: and `b1`. `frobenius` = the per-slice Frobenius normalisation the
+    #: batched step ran before that (dims `(1, 2)` twice, so the update was
+    #: exactly `1/sqrt(d0)` of the definition — 8x weak at `[64, 5461]`,
+    #: 45x at `[2048, 2048]`); kept as the historical control arm. The 2-D
+    #: path (and a shape group with one member) is the same in both arms.
+    muon_colrow_3d: str = "colrow"
     seed: int = 1
     #: WSD warmup, in TOKENS (not steps): the schedule is a function of how
     #: much data the run has seen, so a batch-size change does not change it.
