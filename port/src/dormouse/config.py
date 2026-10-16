@@ -158,10 +158,18 @@ class ModelConfig:
     #: Rank of the always-on shared expert (TSCT2 §14's `R_act` ≥ 192 zone).
     shared_rank: int = 192
 
-    # --- aux objectives (not in the day-one skeleton) -------------------
+    # --- aux objectives -------------------------------------------------
+    #: The FUTURE-BYTE head (arXiv 2404.19737, `model/fb.py`): a REAL arm, not
+    #: an `_unsupported` stub. It is the pre-registered competitor to JEPA
+    #: (AB-PROTOCOL row 1b) — a dense untied `d_model -> vocab` readout over the
+    #: state `lm_head` already reads, one plain CE on the label rolled by -1,
+    #: 196 864 params at `small` (2.14%), no extra forward. 0.0 = off, and the
+    #: default is off: a preset nobody edited must not carry an untrained head.
+    #: `validate` refuses it together with `jepa_weight`/`dspark_weight` — the
+    #: A/B attributes its verdict to ONE signal per run.
+    aux_fb_weight: float = 0.0
     jepa_weight: float = _unsupported(0.0, "JEPA + KoLeo aux heads")
     dspark_weight: float = _unsupported(0.0, "DSpark draft head")
-    aux_fb_weight: float = _unsupported(0.0, "future-byte aux head")
     act_quant: str | None = _unsupported(None, "BitNet-style activation quantization (STE)")
     act_group: int = 0
 
@@ -337,6 +345,22 @@ def validate(model: ModelConfig) -> None:
         )
     if model.use_byteflow:
         _validate_byteflow(model)
+    if model.aux_fb_weight < 0.0:
+        loud(
+            f"aux_fb_weight={model.aux_fb_weight} is negative: it is the "
+            f"multiplier on the future-byte CE term, not a sign to flip. "
+            f"Escape: 0.0 (off) or a positive weight (AB-PROTOCOL row 1b: 0.1)."
+        )
+    if model.aux_fb_weight > 0.0 and (model.jepa_weight > 0.0 or model.dspark_weight > 0.0):
+        which = "jepa_weight" if model.jepa_weight > 0.0 else "dspark_weight"
+        loud(
+            f"aux_fb_weight={model.aux_fb_weight} with {which}>0: the two aux "
+            f"signals cannot share a run. The A/B (AB-PROTOCOL row 1b) puts the "
+            f"future-byte head against pure CE so its verdict is attributed to "
+            f"ONE signal; a run carrying both moves two things at once and "
+            f"attributes the result to neither. Escape: set {which} = 0.0, or "
+            f"aux_fb_weight = 0.0."
+        )
     if model.quant != "none":
         _refuse_ladder_rung(model.quant)
 

@@ -195,6 +195,11 @@ def is_muon_param(name: str, p: torch.Tensor) -> bool:
     """
     if name.endswith("tables"):
         return False  # the hashed-memory table: Adam, orthogonalization is meaningless
+    if name.startswith("fb."):
+        # The future-byte head is a readout like `lm_head` (`fb.py`): burn
+        # routes it to `Group::Rest`, and a polar update is wrong for a
+        # classifier's last layer at the same lr as the body.
+        return False
     if any(t in name for t in ("embed", "lm_head", "controller", "router")):
         return False  # orthogonalization hurts them (burn's measured policy)
     return p.ndim == 2 and p.shape[0] > 1 and p.shape[1] > 1

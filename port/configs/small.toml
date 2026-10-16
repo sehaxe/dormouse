@@ -9,10 +9,12 @@
 #     state between arms. burn's `small.toml` predates its own 0.22 bf16
 #     measurements; on the port there is no "storage bf16, compute fp32" mode
 #     to preserve.
-#  2. `jepa_weight = 0.0` (burn ships 0.05). The aux heads (JEPA+KoLeo/DSpark/
-#     future-byte) are NOT in the day-one port, and a non-zero weight REFUSES
-#     at load rather than being silently dropped — the key is kept in the
-#     schema for exactly that refusal.
+#  2. `jepa_weight = 0.0` (burn ships 0.05). JEPA+KoLeo and DSpark are NOT
+#     ported: a non-zero weight REFUSES at load rather than being silently
+#     dropped — the key is kept in the schema for exactly that refusal. The
+#     FUTURE-BYTE head IS ported (`model/fb.py`) and still ships at 0.0: it is
+#     AB-PROTOCOL row 1b's A/B arm (`--set aux_fb_weight=0.1`), and it refuses
+#     only when a second aux signal is on in the same run — one signal per A/B.
 #  3. the expert is TSCT2 §14's dual-latent GLU with a shared write and an
 #     always-on shared expert (see configs/b1.toml for the full arithmetic).
 #
@@ -93,5 +95,10 @@ moe_lb_coef = 0.01
 
 jepa_weight = 0.0
 dspark_weight = 0.0
+# The future-byte head (arXiv 2404.19737, `model/fb.py`): a dense untied
+# `d_model -> vocab` readout over the state lm_head already reads, one plain CE
+# on the label rolled by -1. 196 864 params at this preset's d768/v256 = 2.14%
+# of the burn `small`, no extra forward. This line is the A/B's pure-CE control
+# (AB-PROTOCOL row 1b); the arm is `--set aux_fb_weight=0.1`.
 aux_fb_weight = 0.0
 act_group = 0

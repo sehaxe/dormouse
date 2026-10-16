@@ -12,6 +12,14 @@ of the final `norm`+`lm_head` logits the forward returns — one unweighted mean
 over `max_iter + 1` terms. See `DormouseModel.forward` for why the final term
 is not optional. There is no KL term and no `p_dist`: they were deleted with
 PonderNet (ADR-0013).
+
+The one aux term the port carries is the FUTURE-BYTE head (arXiv:2404.19737,
+`fb.py`), off at its default weight 0.0: a dense untied `d_model -> vocab`
+readout over the same `norm(out)` `lm_head` reads, one plain CE on the label
+rolled by -1. It is AB-PROTOCOL row 1b's pre-registered competitor to JEPA at
+**our 2.1% weighting claim, verified in the research doc**
+(`docs/research/2026-10-16-jepa-dspark-alternatives.md` §1.3/§4.1: 196 864
+params at our d768 = 2.14% of the burn `small`, no extra forward).
 """
 
 from __future__ import annotations
@@ -30,6 +38,7 @@ from .byteflow import (
     compat_armed,
     count_channel,
 )
+from .fb import FutureByteHead, future_byte_loss
 from .loopblock import LoopBlock
 from .tsct import make_projection
 
@@ -58,6 +67,13 @@ class DormouseModel(nn.Module):
         head_rank = min(cfg.rank, d, cfg.vocab)
         self.lm_head = make_projection(d, cfg.vocab, cfg, rank=head_rank, device=device)
         self.bf = bf_for_model(cfg, device=device)
+        # The future-byte head exists IFF its weight is non-zero (`fb.py`,
+        # burn's `future_byte.rs:182`): at 0.0 the parameter set, the checkpoint
+        # and every measured preset count are exactly today's, which is what
+        # makes pure CE a valid control without a re-baseline.
+        self.fb: FutureByteHead | None = (
+            FutureByteHead(d, cfg.vocab, device=device) if cfg.aux_fb_weight > 0.0 else None
+        )
 
     def forward(
         self,
@@ -143,7 +159,8 @@ class DormouseModel(nn.Module):
         out, rec_sum, counters = self.loop(h0, input_ids, targets, self.lm_head, counters=counters)
         # fp32 logits — the burn rule that fixes `bf16 logits NaN`: the final
         # norm and the head run in fp32 whatever the body computed in.
-        logits = self.lm_head(self.norm(out).reshape(-1, self.cfg.d_model).to(torch.float32))
+        hn = self.norm(out)
+        logits = self.lm_head(hn.reshape(-1, self.cfg.d_model).to(torch.float32))
         loss = None
         if targets is not None:
             assert rec_sum is not None, "targets given but the loop accumulated no L_Rec"
@@ -161,6 +178,13 @@ class DormouseModel(nn.Module):
             flat = targets.reshape(-1, 1)
             ce_final = -F.log_softmax(logits, dim=-1).gather(1, flat).mean()
             loss = (rec_sum + ce_final) / (self.cfg.max_iter + 1)
+            if self.fb is not None:
+                # The same readout `lm_head` reads, the same graph (`fb.py`):
+                # no teacher forward, no detach, no second pass over the loop —
+                # the A/B arm is this term and nothing else.
+                loss = loss + self.cfg.aux_fb_weight * future_byte_loss(
+                    self.fb, hn.to(torch.float32), targets, counters
+                )
             assert torch.isfinite(loss), "L_Rec + final CE must be finite"
         return logits, loss
 

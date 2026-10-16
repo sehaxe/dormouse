@@ -45,6 +45,23 @@ def kda_field(counters: Counters) -> str:
     return f"kda={arm},n={n}"
 
 
+def fb_field(counters: Counters) -> str:
+    """`fb=<ran>/<asked>` — the future-byte arm, over the TRAINING forwards.
+
+    Read it before believing any future-byte number
+    (`docs/research/2026-10-16-jepa-dspark-alternatives.md` §4.1 item 1, metric
+    2): `0/<n>` means the head was asked at every step and produced no term —
+    a horizon past the sequence length, so the whole arm trained nothing and a
+    2 000-step A/B of it is a 2 000-step A/B of nothing.
+
+    The port's eval forward carries labels (burn's passes `targets = None`, so
+    burn prints the training count). An eval-local count here would be an
+    instrument of the eval, not of the arm, so these are the run's own training
+    counters (`train` passes `total`).
+    """
+    return f"fb={counters.get('fb_ran', 0)}/{counters.get('fb_asked', 0)}"
+
+
 def ckpt_paths(cfg: TrainConfig) -> tuple[Path, Path]:
     base = Path(cfg.out_dir)
     return base / f"{cfg.ckpt_name}.pt", base / f"{cfg.ckpt_name}.config.toml"
@@ -325,7 +342,7 @@ def train(
             ev, scored = evaluate(model, eval_stream, cfg.eval_batches, device=device)
             log(
                 f"eval step={step + 1} loss={ev:.4f} bpb={bpb(ev):.3f} over {scored} B "
-                f"({cfg.eval_batches} x {cfg.batch} x {cfg.seq_len})"
+                f"({cfg.eval_batches} x {cfg.batch} x {cfg.seq_len}) {fb_field(total)}"
             )
             if sink is not None:
                 _row(event="eval", step=step + 1, loss=ev, bpb=bpb(ev), scored=scored)
@@ -338,7 +355,7 @@ def train(
         ev, scored = evaluate(model, eval_stream, cfg.eval_batches, device=device)
         log(
             f"eval step={cfg.steps} loss={ev:.4f} bpb={bpb(ev):.3f} over {scored} B "
-            f"({cfg.eval_batches} x {cfg.batch} x {cfg.seq_len})"
+            f"({cfg.eval_batches} x {cfg.batch} x {cfg.seq_len}) {fb_field(total)}"
         )
     return {
         "steps": cfg.steps,
