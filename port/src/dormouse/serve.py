@@ -137,6 +137,7 @@ def _generate(state: ServeState, prompt: bytes, n: int, chunk: int = STREAM_BYTE
     ctx, done = prompt, 0
     while done < n:
         k = min(chunk, n - done)
+        before = len(ctx)
         with state.lock:
             ctx = decode_bytes(
                 state.model,
@@ -150,8 +151,20 @@ def _generate(state: ServeState, prompt: bytes, n: int, chunk: int = STREAM_BYTE
                 # neighbours' tails, which is what the first chat smoke showed.
                 stop=_STOP,
             )
+        delta = ctx[before:]
+        hit = next((i for i, b in enumerate(delta) if b in _STOP), None)
+        if hit is not None:
+            # The reply ENDED: emit the bytes up to the marker, then stop —
+            # the caller must not read a finished answer's padding as text.
+            text = dec.decode(bytes(delta[:hit]))
+            if text:
+                yield text
+            tail = dec.decode(b"", True)
+            if tail:
+                yield tail
+            return
         done += k
-        text = dec.decode(ctx[-k:])
+        text = dec.decode(bytes(delta))
         if text:
             yield text
     tail = dec.decode(b"", True)
