@@ -29,10 +29,14 @@ apply token-level causality, and take one softmax over the gathered keys — the
 attention restricted to the selected blocks (the union of the blocks IS the
 mask), which is the equivalence `tests/test_msa.py` replays.
 
-CEILING (`ponytail:`): the gather materializes `[b,t,r*K,h,hd]` — O(t·r·K)
-memory, and at 1M with K=32, r=4 that is already 16 GB in bf16. The 1M form
-computes a per-block logsumexp and combines blocks in a streaming loop; upgrade
-when a 1M run exists (the plan's verdict says the k/r sweep has not been run).
+MEMORY (2026-10-16, measured): the gather runs in SLOT CHUNKS of
+`MSA_SLOT_CHUNK` selected-block columns and each chunk is a checkpoint region
+(`attend_selected_blocks`), so the largest tensor this arm builds is
+`[b,t,chunk*r,h,hd]` and not `[b,t,K*r,h,hd]` — and the backward recomputes it
+instead of retaining all `K` of them. Measured on the `small` preset (fp32 at
+this seam, d 768) at b8 s512: 13.59 GiB peak and an OOM before, 3.15 GiB after;
+the whole-m gather alone was 1.61 GB ×2 (k and v) ×4 loop iterations = 12.9 GB
+of autograd-retained copies.
 """
 
 from __future__ import annotations
@@ -41,11 +45,24 @@ import math
 
 import torch
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 from ...instrument import Counters
 from .sparse import MSA_BLOCK, MSA_TOPK, FlexSparseSelector
 
-__all__ = ["MSA_BLOCK", "MSA_TOPK", "BlockSparseAttention"]
+__all__ = ["MSA_BLOCK", "MSA_TOPK", "MSA_SLOT_CHUNK", "BlockSparseAttention"]
+
+#: Selected-block columns gathered per chunk in `attend_selected_blocks`, i.e.
+#: `MSA_SLOT_CHUNK * block` key positions per gather. A module constant and not
+#: a config field: nothing sweeps it, and the value that matters is the ONE
+#: measured bound it sets (the chunk gather is the largest tensor the arm
+#: builds). MEASURED 2026-10-16, `small` preset b8 s512, 6 steps each, peak is
+#: `torch.cuda.max_memory_allocated` (`/tmp/opencode/chunk_sweep.py`):
+#: 1 slot 882 ms / 5.06 GiB · 2 slots 850 ms / 3.56 GiB · **4 slots 661 ms /
+#: 3.15 GiB** · 8 slots 633 ms / 3.51 GiB · all 32 slots in one region
+#: 632 ms / 7.73 GiB. 4 is the lowest peak of the five and within 4.6% of the
+#: fastest — smaller chunks pay more launches, bigger ones pay more memory.
+MSA_SLOT_CHUNK = 4
 
 
 class BlockSparseAttention(nn.Module):
@@ -138,7 +155,27 @@ def attend_selected_blocks(
     (token-level causality). With no valid key the query would divide by a
     clamped denominator and read 0.0 — impossible here: every kept block's first
     token sits at or before the query (the selector's block-causal rule), so a
-    query with any kept block always has at least one valid key.
+    query with any kept block always has at least one valid key. That invariant
+    is what guards the online-softmax denominator below, and the assert is the
+    gate on it.
+
+    ROUTE (2026-10-16): **slot chunks**, not a per-slot loop. The `m` selected
+    columns are walked in groups of `MSA_SLOT_CHUNK`, each group gathered,
+    scored and folded into a running `(max, den, num)` softmax accumulator with
+    the standard rescale — mathematically the one softmax over all kept keys,
+    bit-for-bit close to it (`tests/test_msa.py` case e pins the parity).
+
+    Each chunk is a `torch.utils.checkpoint` region (only outside `no_grad`),
+    and that half is load-bearing rather than hygiene: the chunk's gathered
+    `[b,t,chunk*r,h,hd]` is what the *backward* needs, so a plain loop would
+    leave one retained copy per chunk — all `m` of them, the full tensor again.
+    Checkpointing recomputes the gather in the backward instead, which is what
+    makes the peak O(b·chunk·r·h·hd) rather than O(b·m·r·h·hd). Measured on the
+    `small` preset at b8 s512 (2026-10-16, `/tmp/opencode/chunk_sweep.py`, 6
+    steps, `torch.cuda.max_memory_allocated`): 13.59 GiB and an OOM with no
+    chunk and no region, 7.73 GiB with the region but one whole-`m` chunk,
+    3.15 GiB at `MSA_SLOT_CHUNK` 4. The same gather at b1's shape
+    (b16 s1024, d 2048, fp32) is 2.1 GB per chunk instead of 17 GB whole.
     """
     b, t, h, hd = q.shape
     r = block
@@ -150,18 +187,67 @@ def attend_selected_blocks(
     valid = (pos < t) & (pos <= qpos) & keep.repeat_interleave(r, dim=-1)  # [b,t,M]
     assert valid.shape == (b, t, m * r)
 
-    b_idx = torch.arange(b, device=q.device).view(b, 1, 1).expand(b, t, m * r)
-    kf = k.reshape(b, t, h * hd)
-    vf = v.reshape(b, t, h * hd)
-    kk = kf[b_idx, safe].reshape(b, t, m * r, h, hd)
-    vv = vf[b_idx, safe].reshape(b, t, m * r, h, hd)
+    mx = torch.full((b, t, h), float("-inf"), dtype=q.dtype, device=q.device)
+    den = torch.zeros((b, t, h), dtype=q.dtype, device=q.device)
+    num = torch.zeros((b, t, h, hd), dtype=q.dtype, device=q.device)
+    for s0 in range(0, m, MSA_SLOT_CHUNK):
+        sl = slice(s0 * r, min(s0 + MSA_SLOT_CHUNK, m) * r)
+        mxc, denc, numc = _maybe_checkpoint(_chunk, q, k, v, safe[:, :, sl], valid[:, :, sl], scale)
+        mx_new = torch.maximum(mx, mxc)
+        # Nothing valid anywhere yet (impossible for a query with a kept block,
+        # but reachable while the first chunks are all empty): 0 keeps the
+        # rescale finite and leaves den at 0, so the assert below fires.
+        mx_new = torch.where(torch.isfinite(mx_new), mx_new, torch.zeros_like(mx_new))
+        alpha = torch.exp(mx - mx_new)
+        beta = torch.exp(mxc - mx_new)
+        mx = mx_new
+        den = den * alpha + denc * beta
+        num = num * alpha.unsqueeze(-1) + numc * beta.unsqueeze(-1)
 
-    scores = torch.einsum("bthd,btmhd->bthm", q, kk) * scale
-    scores = scores.masked_fill(~valid[:, :, None, :], float("-inf"))
-    mx = scores.amax(-1, keepdim=True)
-    mx = torch.where(torch.isfinite(mx), mx, torch.zeros_like(mx))
-    p = torch.exp(scores - mx)  # exp(-inf) = 0 for the masked slots
-    den = p.sum(-1, keepdim=True).clamp_min(torch.finfo(p.dtype).tiny)
+    den = den.clamp_min(torch.finfo(den.dtype).tiny)
     assert torch.isfinite(den).all(), "every query must have a valid key"
-    out = torch.einsum("bthm,btmhd->bthd", p, vv) / den
-    return out
+    return num / den.unsqueeze(-1)
+
+
+def _chunk(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    safe: torch.Tensor,
+    valid: torch.Tensor,
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """One slot chunk → `(chunk max, chunk denominator, chunk numerator)`.
+
+    `safe/valid [b,t,c]` is a column slice of the gather plan; the returned
+    tensors are chunk-normalized (`p = exp(scores - chunk max)`) and the caller
+    rescales them into its running accumulator. The chunk max may be `-inf`
+    (every slot in this chunk masked) — the caller's rescale zeroes that
+    contribution, and the `finite or zero` rule is applied HERE so `p` is a
+    clean 0 row rather than a NaN.
+    """
+    b, t, h, hd = q.shape
+    c = safe.shape[-1]
+    b_idx = torch.arange(b, device=q.device).view(b, 1, 1).expand(b, t, c)
+    kk = k.reshape(b, t, h * hd)[b_idx, safe].reshape(b, t, c, h, hd)
+    vv = v.reshape(b, t, h * hd)[b_idx, safe].reshape(b, t, c, h, hd)
+    scores = torch.einsum("bthd,btchd->bthc", q, kk) * scale
+    scores = scores.masked_fill(~valid[:, :, None, :], float("-inf"))
+    mxc = scores.amax(-1)  # [b,t,h]
+    mx_used = torch.where(torch.isfinite(mxc), mxc, torch.zeros_like(mxc))
+    p = torch.exp(scores - mx_used[..., None])  # exp(-inf) = 0 for masked slots
+    return mxc, p.sum(-1), torch.einsum("bthc,btchd->bthd", p, vv)
+
+
+def _maybe_checkpoint(fn, *args):
+    """`fn(*args)` — inside a checkpoint region when a gradient is being built.
+
+    The region is what keeps the gather from being retained for the backward
+    (see the route note above); outside `no_grad` it would only buy the
+    recompute cost, so inference runs the plain call.
+    """
+    if torch.is_grad_enabled() and any(
+        isinstance(a, torch.Tensor) and a.requires_grad for a in args
+    ):
+        return checkpoint(fn, *args, use_reentrant=False)
+    return fn(*args)
