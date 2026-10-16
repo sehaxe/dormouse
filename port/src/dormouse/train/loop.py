@@ -319,6 +319,8 @@ def train(
         stream, eval_stream = open_streams(run)
     model.train()
     opt = MixOptimizer(model, lr=cfg.lr, wd=cfg.wd, opt=cfg.opt)
+    if cfg.optim_8bit:
+        opt.enable_bnb8bit()
     tokens_per_step = cfg.batch * cfg.seq_len
     start = 0
     if resume:

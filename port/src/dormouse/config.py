@@ -261,6 +261,11 @@ class TrainConfig:
     #: an approximate iteration, so the expected cost is small — that is a
     #: prediction, not a substitute for the check.
     tf32: bool = False
+    #: bitsandbytes 8-bit state for the AdamW group. The group at the FULL b1
+    #: preset includes the Engram tables (402M params => 3.2 GB of fp32 m+v),
+    #: which is exactly what this saves; measured cost +~180 ms/step with the
+    #: tables OFF (2026-10-16), so it is the VRAM-fit lever, not a speed knob.
+    optim_8bit: bool = False
     log_every: int = 10
     ckpt_every: int = 100
     ckpt_name: str = "port"
