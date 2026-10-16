@@ -189,7 +189,14 @@ def _eval_loss(
             x, y = stream.next_batch()
             if device is not None:
                 x, y = x.to(device), y.to(device)
-            _, loss, _ = model(x, y, **kw)
+            # `pure=True`: the held-out number is the PREDICTIVE CE alone.
+            # The aux terms (fb/DSpark/SIGReg) are training signals; without
+            # this the fb/dspark arms read ~w*aux_term worse by construction
+            # and the A/B compares two different quantities (measured on the
+            # first aux A/B run: control 3.045 vs fb 3.469 while the arm was
+            # fine). Counters are not bumped on this path — fb=0/0 is the
+            # eval's honest reading of "no aux ran HERE".
+            _, loss, _ = model(x, y, pure=True, **kw)
             assert loss is not None, "an eval batch must carry targets"
             total += float(loss)
             scored += int(x.numel())

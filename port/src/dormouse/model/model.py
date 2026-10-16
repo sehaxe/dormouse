@@ -96,6 +96,7 @@ class DormouseModel(nn.Module):
         targets: torch.Tensor | None = None,
         counters: Counters | None = None,
         depth: int | None = None,
+        pure: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None, Counters]:
         """`input_ids [b,t]` (+ `targets [b,t]`) → (logits `[b*t,vocab]`, loss, counters).
 
@@ -112,7 +113,7 @@ class DormouseModel(nn.Module):
         elif self.bf is not None:
             logits, loss = self._forward_channel(input_ids, targets, counters, depth)
         else:
-            logits, loss = self._forward_byte_lm(input_ids, targets, counters, depth)
+            logits, loss = self._forward_byte_lm(input_ids, targets, counters, depth, pure)
         counters.count("forward")
         return logits, loss, counters
 
@@ -178,6 +179,7 @@ class DormouseModel(nn.Module):
         targets: torch.Tensor | None,
         counters: Counters,
         depth: int | None = None,
+        pure: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """The plain byte-level stack: embedding → loop → RMSNorm → lm_head."""
         h0 = self.embed(input_ids)
@@ -213,14 +215,23 @@ class DormouseModel(nn.Module):
             # the curve). One divisor, the count of terms it divides.
             T = self.cfg.max_iter if depth is None else depth
             loss = (rec_sum + ce_final) / (T + 1)
-            if self.fb is not None:
+            if pure:
+                # `pure=True` reads the PREDICTIVE CE alone (the aux terms are
+                # training signals, not part of the model's held-out quality).
+                # Without this the A/B compares two DIFFERENT quantities: the
+                # fb/dspark arms' eval loss carries +w*aux_term and reads ~0.3
+                # BPB worse by construction (measured on the first A/B run,
+                # 2026-10-16 — control 3.045 vs fb 3.469 while the fb ARM's
+                # own counters showed the head was fine).
+                pass
+            elif self.fb is not None:
                 # The same readout `lm_head` reads, the same graph (`fb.py`):
                 # no teacher forward, no detach, no second pass over the loop —
                 # the A/B arm is this term and nothing else.
                 loss = loss + self.cfg.aux_fb_weight * future_byte_loss(
                     self.fb, hn.to(torch.float32), targets, counters
                 )
-            if self.cfg.sigreg_weight > 0.0:
+            if not pure and self.cfg.sigreg_weight > 0.0:
                 # SIGReg (arXiv:2511.08544, `sigreg.py`): ONE term on the state
                 # `lm_head` already reads, no teacher, no predictor, no mask, no
                 # second forward, no parameters, and NO detach — the gradient
@@ -232,7 +243,7 @@ class DormouseModel(nn.Module):
                 loss = loss + self.cfg.sigreg_weight * sigreg_loss(
                     stride_sample(hn.reshape(-1, self.cfg.d_model).to(torch.float32))
                 )
-            if self.dspark is not None:
+            if not pure and self.dspark is not None:
                 # The DSpark draft head (`dspark.py`, standalone module; this
                 # hook is its integration commit): γ is the config weight (D2 —
                 # the loss returns γ-free), the window reads the CONSUMED
