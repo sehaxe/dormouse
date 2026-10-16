@@ -20,7 +20,7 @@ from dormouse.model import DormouseModel, param_count, table_slots
 
 #: The totals the two presets' comments carry.
 SMALL_PORT_TOTAL = 9_476_993
-B1_PORT_TOTAL = 1_079_596_485  # max_iter 4 + the MSA arm (use_msa, +13,238,276)
+B1_PORT_TOTAL = 1_066_358_209  # max_iter 4; MSA off (tie verdict 2026-10-17)
 
 
 def arithmetic(cfg) -> dict[str, int]:
