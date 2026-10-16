@@ -17,6 +17,7 @@ carries the BYTE COUNT it scored (`eval_batches × batch × seq_len`, AGENTS
 from __future__ import annotations
 
 import math
+import time
 from pathlib import Path
 
 import torch
@@ -314,6 +315,15 @@ def train(
             # Telemetry reads the interval BEFORE any opt-in timer report
             # (report() resets the mark; the json row must not depend on a flag).
             interval_s = timer.window_s()
+            # The rate's denominator must be THIS WINDOW's seconds, not the
+            # run's whole wall time: `window_s()` does not reset, and until
+            # today nothing reset it when `--timers` was off — so
+            # `interval_s` was the CUMULATIVE elapsed and `tokens_per_s` was
+            # the monotone-decaying illusion (the trainer's 22k→0.9k that
+            # three real runs and the noeval bisect all showed, while every
+            # in-process probe stayed flat at 89-134 ms/step). One mark reset
+            # is the whole fix; the NVTX-suspect stack dissolves with it.
+            timer.mark = time.perf_counter()
             rate = (cfg.log_every * tokens_per_step) / interval_s if interval_s > 0 else None
             log(" ".join(p for p in parts if p))
             if sink is not None:
