@@ -19,6 +19,18 @@ bf16 = true
 quant = "none"
 
 use_kda = true
+# The second attention arm (ADR-0014 re-entry, owner 2026-10-16: "включай"):
+# block-sparse MSA BESIDE KDA at a learned 1/4 share (adaptive_msa: the
+# per-iteration gate decides WHERE that quarter goes; KDA stays the default
+# arm and every number on record is KDA-only). WARNING carried in the file:
+# the MSA path has unit gates (tests/test_msa.py) but NO GPU smoke and NO A/B
+# yet — it entered this preset on the owner's call; the A/B is queued and a
+# loss closes the arm again. Cost at b1: +3·d² (q/k/v) + indexer + gates.
+use_msa = true
+msa_topk = 32
+msa_block = 4
+msa_capacity_ratio = 0.25
+adaptive_msa = true
 use_tsct = true
 use_engram = true
 use_attnres = false
@@ -100,7 +112,7 @@ act_group = 0
 # Per routed expert: 2*(d*r + r) + r*f = 2*(2048*64 + 64) + 64*5461 = 611 776
 #
 # PARAM COUNT, computed by hand and pinned by tests/test_param_count.py against
-# the model instantiated on the `meta` device (port: 1 066 354 113):
+# the model instantiated on the `meta` device (port: 1 079 596 485):
 #
 #   embed (256x2048)                                      524 288
 #   lm_head TSCT(2048->256, r=64)                         147 520
@@ -115,9 +127,10 @@ act_group = 0
 #   Engram query/key/value projs                          132 096
 #   mem_dense (2048 -> 2048 + bias)                     4 196 352
 #   out_proj TSCT(2048 -> 2048, r=64)                     262 208
-#   iter_embed (2 x 2048) + residual_scale                  4 097
+#   iter_embed (4 x 2048) + residual_scale                  8 193
+#   MSA arm (3x2048^2 + indexer 2048*256 + 2048*64 + 4)  13 238 276
 #   ------------------------------------------------- ---------
-#   total                                           1 066 354 113
+#   total                                           1 079 596 485
 #
 # AGAINST PLAN §2.2's TABLE (component by component, so a reader can check):
 #
@@ -128,7 +141,8 @@ act_group = 0
 #   | Engram dense+router+out_proj    |   10.5M   |  6.71M    | -3.79M  |
 #   | Engram tables (4M rows/order)   |    402M   | 402.65M   | +0.65M  |
 #   | TSCT experts (routed+shared+down)|  492.2M  | 639.48M   | +147.3M |
-#   | total                           |  922.6M   | 1066.35M  | +143.8M |
+#   | MSA arm (owner call 2026-10-16) |    —      | 13.24M    | +13.24M |
+#   | total                           |  922.6M   | 1079.60M  | +157.0M |
 #
 # (`922.6M` is the §2.2 table's own component sum, which the plan rounds to
 # "~0.92B ≈ 1B".)

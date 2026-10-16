@@ -20,7 +20,7 @@ from dormouse.model import DormouseModel, param_count, table_slots
 
 #: The totals the two presets' comments carry.
 SMALL_PORT_TOTAL = 9_476_993
-B1_PORT_TOTAL = 1_066_358_209  # max_iter 4 (fin-metric depth verdict 2026-10-16): iter-embed slots
+B1_PORT_TOTAL = 1_079_596_485  # max_iter 4 + the MSA arm (use_msa, +13,238,276)
 
 
 def arithmetic(cfg) -> dict[str, int]:
@@ -51,7 +51,29 @@ def arithmetic(cfg) -> dict[str, int]:
         "out_proj": tsct(d, d, r),
         "iter_embed": cfg.max_iter * d,
         "residual_scale": 1,
+        "msa": _msa_params(cfg),
     }
+
+
+def _msa_params(cfg) -> int:
+    """The MSA arm's parameters when `use_msa` (else 0 — the arm's absence is
+    byte-for-byte the KDA-only model, `tests/test_msa.py` case d).
+
+    Three `d x d` projections (q, k, v — the g/beta of gated-delta are
+    KDA-specific and not carried), the indexer's MQA pair
+    (`q_idx [d, q_heads*head_dim]`, `k_idx [d, head_dim]`, q_heads =
+    `sparse.sparse.MSA_Q_HEADS`) and the per-slot adaptive gate `[max_iter]`.
+    """
+    if not getattr(cfg, "use_msa", False):
+        return 0
+    from dormouse.model.sparse.sparse import MSA_Q_HEADS
+
+    return (
+        3 * cfg.d_model * cfg.d_model
+        + cfg.d_model * MSA_Q_HEADS * cfg.head_dim
+        + cfg.d_model * cfg.head_dim
+        + cfg.max_iter
+    )
 
 
 def built(model) -> dict[str, int]:
@@ -72,6 +94,8 @@ def built(model) -> dict[str, int]:
             key = "engram_projs"
         elif name.startswith("loop.attn"):
             key = "kda"
+        elif name.startswith("loop.msa"):
+            key = "msa"  # covers loop.msa.* and the loop.msa_gate parameter
         elif name.startswith("loop.mem_dense"):
             key = "mem_dense"
         elif name.startswith("loop.out_proj"):
@@ -91,6 +115,10 @@ def built(model) -> dict[str, int]:
         else:  # pragma: no cover - a new parameter must land in a bucket
             raise AssertionError(f"unbucketed parameter {name}")
         out[key] = out.get(key, 0) + p.numel()
+    if "msa" not in out:
+        # The arm is off: `built` must carry the key so the dict compare holds
+        # (arithmetic always emits it, 0 when off).
+        out["msa"] = 0
     return out
 
 
