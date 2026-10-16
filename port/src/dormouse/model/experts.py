@@ -483,7 +483,12 @@ class SparseMoE(nn.Module):
         stale survives; one conversion per step is the honest floor, zero
         conversions inside the step.
         """
-        key = (dt, tuple(p._version for e in self.experts for p in e.parameters()))
+        key = (
+            dt,
+            self.factor_qat,
+            self.factor_qat_alpha,  # the anneal ramp moves this every step
+            tuple(p._version for e in self.experts for p in e.parameters()),
+        )
         cached = getattr(self, "_bank_cache", None)
         if cached is None or cached[0] != key:
             # The stack builds in fp32 (the masters' dtype), the qat arm — if

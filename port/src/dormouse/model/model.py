@@ -96,6 +96,22 @@ class DormouseModel(nn.Module):
             DSparkHead(cfg, device=device) if cfg.dspark_weight > 0.0 else None
         )
 
+    def set_factor_qat_alpha(self, alpha: float) -> None:
+        """Set the annealing alpha on EVERY factor_qat consumer (one call per step).
+
+        The consumers are the `TSCTLinear`s (loop block + head),
+        `DualLatentGLU`s (routed + shared experts) and `SparseMoE._banks`'
+        cached stacks — the bank module reads its SAME-named attributes, so
+        walking `modules()` and setting the attribute is the complete set.
+        The bank cache keys on `factor_qat_alpha` (see `_banks`), so a changed
+        alpha rebuilds the quantized stacks on the next forward; a constant
+        alpha (the default) rebuilds nothing extra.
+        """
+        assert 0.0 <= alpha <= 1.0, f"anneal alpha {alpha} outside 0..=1"
+        for m in self.modules():
+            if hasattr(m, "factor_qat_alpha"):
+                m.factor_qat_alpha = alpha
+
     def forward(
         self,
         input_ids: torch.Tensor,

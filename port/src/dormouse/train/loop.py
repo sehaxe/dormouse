@@ -466,6 +466,13 @@ def train(
 
     warm = warmup_steps(cfg.warmup_tokens, cfg.batch, cfg.seq_len)
     decay = int(round(cfg.decay_frac * cfg.steps))
+    anneal_steps = cfg.factor_qat_anneal_steps
+    if anneal_steps > 0 and run.model.factor_qat == "none":
+        loud(
+            f"factor_qat_anneal_steps={anneal_steps} with factor_qat='none': "
+            f"there is no quantizer to anneal toward. Escape: set factor_qat "
+            f"(ternary|binary|mxfp4|ternary_s3t) or leave the ramp at 0."
+        )
     total = Counters()
     window = Counters()
     nan_skipped = 0
@@ -506,6 +513,14 @@ def train(
         if opt.muon is not None:
             for group in opt.muon.param_groups:
                 group["lr"] = lr
+
+        # The ANNEALED factor_qat arm: burn-spectral's measured soft-to-hard
+        # ramp (`ste_ternary_annealed`, "converges better than hard STE from
+        # step one"). alpha = min(1, step/anneal) is a PURE function of the
+        # step, so a resume lands on the same alpha. `anneal = 0` (default)
+        # leaves every module's constant alpha untouched.
+        if anneal_steps > 0:
+            model.set_factor_qat_alpha(min(1.0, step / anneal_steps))
 
         x, y = stream.next_batch()
         if device is not None:

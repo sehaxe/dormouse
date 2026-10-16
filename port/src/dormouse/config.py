@@ -382,6 +382,14 @@ class TrainConfig:
     #: `mix` = Muon on 2-D params + AdamW elsewhere (the default); `adamw` =
     #: the fallback arm, which is the same code with the routing disabled.
     opt: str = "mix"
+    #: The ANNEALED factor_qat ramp (burn-spectral's measured soft-to-hard
+    #: recipe, `ste_ternary_annealed`: "converges better than hard STE from
+    #: step one"): the trainer sets `model.set_factor_qat_alpha(min(1, step/N))`
+    #: BEFORE each forward. `0` (default) = the module's constant
+    #: `factor_qat_alpha` — the hard-STE arm the compression tournament
+    #: measured LOSING to bf16 (+0.05/+0.09 BPB at 9.2M, 2026-10-16); this
+    #: ramp is the one untested variant of that recipe.
+    factor_qat_anneal_steps: int = 0
     #: The Newton–Schulz arm the Muon group runs (`NS_KINDS` above,
     #: `optim.zeropower_via_ns(kind=...)`). `classic` = the per-iteration
     #: `X @ X.T` recurrence: the default, byte-identical to this port's history.
