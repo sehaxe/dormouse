@@ -23,6 +23,23 @@ There is no halt head and no PonderNet: depth is fixed by default and the
 per-iteration CE is an unweighted mean (ADR-0013). The ADAPTIVE DEPTH arm
 passes `depth=T` to run `T` iterations instead, and the readout divides by the
 `T` actually run so different depths are scale-comparable.
+
+**LOOM** (`2610.01153`, 2026-10-01; scanned in
+`docs/research/2026-10-16-new-tech-scan.md` §2.1) is the arm behind
+`cfg.loom`. The paper measures a looped MoE stalling at **two** iterations —
+hidden-state variance growth plus expert-selection collapse — and reports 9-12
+stable loops at 100M-1.7B, i.e. exactly the band our `max_iter 4` / depth 2
+sits in. Its fix is a bundle (bounded residual updates, input re-injection per
+loop, **per-loop routers**, a looping residual); what is transcribed here is the
+MINIMAL faithful half of that summary and nothing more: **one learned per-slot
+gate on the RMS-normalized write** — per-loop router conditioning, the only
+thing that can distinguish the `T` passes of a weight-shared body, plus the
+variance control the normalized write carries (it cannot grow with depth). The
+gate is zero-initialised, so `loom = true` at init IS the `loom = false`
+forward; the arm must earn its depth by training, and the A/B against a
+fixed-depth control is the arbiter of the 8-12-loop claim. **CAVEAT, and it is
+the scan's own convention: the arm is a transcription of the scan's summary;
+the paper's full recipe may differ — re-derive before any multi-loop default.**
 """
 
 from __future__ import annotations
@@ -121,6 +138,16 @@ class LoopBlock(nn.Module):
             if cfg.use_attnres
             else None
         )
+        # LOOM (`2610.01153`): one learned scalar per iteration slot on the
+        # RMS-normalized write, ZERO-INIT — at init the arm is the identity and
+        # adds an exact zero, so pure-CE parity holds and the gate has to be
+        # MOVED by gradient before the arm is anything (module docstring). Built
+        # only when the flag is on, so a `loom = false` model's parameter tree —
+        # and every preset count pinned off it — is exactly today's.
+        self.loom = bool(getattr(cfg, "loom", False))
+        self.loom_gate = (
+            nn.Parameter(torch.zeros(cfg.max_iter, device=device)) if self.loom else None
+        )
 
     def forward(
         self,
@@ -207,6 +234,16 @@ class LoopBlock(nn.Module):
 
             ffn = self.moe(normed.reshape(b * t, d), counters=counters) * w_ffn
             y = (attn + branch + ffn).reshape(b, t, d)
+
+            if self.loom:
+                # LOOM (2610.01153): per-loop router conditioning + variance
+                # control in ONE place — the RMS-normalized write is the arm's
+                # own signal (unit scale, so it cannot grow with depth) and the
+                # per-slot gate decides how much of it this iteration writes.
+                # `gate[i] == 0` adds an exact zero: the at-init forward IS the
+                # `loom = false` forward, bit for bit.
+                counters.count("loom")
+                y = y + _rms_no_gain(y, self.eps) * self.loom_gate[i].view(1, 1, 1)
 
             if self.use_attnres:
                 counters.count("attnres_write")

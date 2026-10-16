@@ -22,6 +22,8 @@ use_kda = true
 use_tsct = true
 use_engram = true
 use_attnres = false
+# LOOM (`2610.01153`, docs/research/2026-10-16-new-tech-scan.md §2.1): per-iteration gate on the RMS-normalized write; OFF = today's write, and the arm's A/B against a fixed-depth control is what decides the 8-12-loop claim.
+loom = false
 
 n_experts = 1024
 moe_topk = 2

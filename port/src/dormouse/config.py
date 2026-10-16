@@ -92,6 +92,20 @@ class ModelConfig:
     use_tsct: bool = True
     use_engram: bool = True
     use_attnres: bool = False
+    #: LOOM (`2610.01153`, 2026-10-01; scanned in
+    #: `docs/research/2026-10-16-new-tech-scan.md` §2.1, whose row names our
+    #: own `max_iter 4` / operating depth 2 as exactly the regime that paper
+    #: measures as stuck at two loops). A REAL arm, not an `_unsupported` stub:
+    #: `LoopBlock` applies one learned per-iteration gate to the RMS-normalized
+    #: write — per-loop router conditioning (the `T` passes of a weight-shared
+    #: body are otherwise indistinguishable) plus the variance control the
+    #: normalized write carries. Zero-init, so `loom = true` at init IS
+    #: `loom = false` and pure-CE parity holds; the arm enables the scan's
+    #: 8-12-loop claim ONLY if its A/B beats a fixed-depth control. It is a
+    #: transcription of the SCAN's summary of the paper — the paper's full
+    #: recipe (bounded residual updates, input re-injection) may differ, so
+    #: re-derive before any multi-loop default.
+    loom: bool = False
     use_gr: bool = _unsupported(False, "Gated Residual (GR)")
     use_mhc: bool = _unsupported(False, "Manifold-Constrained Hyper-Connections")
     use_mor: bool = _unsupported(False, "Mixture-of-Recursions router")
