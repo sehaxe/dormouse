@@ -293,6 +293,7 @@ def sft_train(
     *,
     stream: ByteStream | None = None,
     resume: bool = False,
+    init_from: str | None = None,
     log=print,
     device: torch.device | str | None = None,
 ) -> dict:
@@ -339,6 +340,38 @@ def sft_train(
     if cfg.optim_8bit:
         opt.enable_bnb8bit()
     start = 0
+    if init_from is not None:
+        # Fine-tune init: WEIGHTS from a foreign checkpoint (e.g. the pretrain
+        # run), no config gate and no optimizer state. That is the deliberate
+        # difference from `resume`: a resume continues THIS run and must prove
+        # the config did not move (ADR-0021); an init knowingly changes the
+        # objective (pretrain -> instruction) and starts a fresh snapshot, a
+        # fresh optimizer and a fresh byte stream. LOUD because the weights
+        # leave their recorded context.
+        if resume:
+            loud(
+                "sft: --init-from and --resume together name two different "
+                "sources of weights. Escape: --init-from to start a new SFT run "
+                "from a pretrain checkpoint, or --resume to continue an SFT run."
+            )
+        path = Path(init_from)
+        if not path.is_file():
+            loud(f"sft --init-from: {path} does not exist. Escape: the pretrain run's .pt path.")
+        foreign = torch.load(path, map_location="cpu", weights_only=False)
+        state = foreign.get("model", foreign)
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        if unexpected:
+            loud(
+                f"sft --init-from: {len(unexpected)} tensors in {path} do not exist "
+                f"in this model ({list(unexpected)[:4]}...). Escape: the checkpoint "
+                f"and the preset must be the same architecture."
+            )
+        if missing:
+            loud(
+                f"sft --init-from: {len(missing)} model tensors are absent from "
+                f"{path} ({list(missing)[:4]}...). Escape: same-architecture preset."
+            )
+        log(f"sft init: weights from {path} (step {foreign.get('step', '?')}), fresh optimizer")
     if resume:
         ck, _stored = load_ckpt(run)
         model.load_state_dict(ck["model"])

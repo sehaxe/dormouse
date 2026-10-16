@@ -202,6 +202,7 @@ def test_masked_loss_moves_when_an_answer_byte_changes():
 
 def test_a_pad_byte_outside_the_mask_cannot_move_the_loss():
     """The real model: causal attention means a later byte cannot move an earlier CE."""
+    torch.manual_seed(0)  # the fixture's weights must not depend on suite order
     rec, x = window("Hi", "Hello")
     y = x.roll(-1, dims=1)
     mask = sft_mask(x)
@@ -209,7 +210,12 @@ def test_a_pad_byte_outside_the_mask_cannot_move_the_loss():
     l0 = sft_loss(model(x)[0], y, mask)
     corrupted = x.clone()
     corrupted[0, rec.index(END) + 1] = ord("A")  # padding, outside the mask
-    assert torch.equal(l0, sft_loss(model(corrupted)[0], y, mask))
+    l1 = sft_loss(model(corrupted)[0], y, mask)
+    # SEMANTIC equality, not bitwise: the claim is "a pad byte cannot move the
+    # loss", and a causal forward is deterministic per weight set — but the two
+    # calls may land on different autotuned kernels, so the bitwise form was a
+    # suite-order-dependent flake (found 2026-10-17).
+    assert torch.allclose(l0, l1, rtol=0, atol=1e-6), (float(l0), float(l1))
 
 
 # --------------------------------------------------------------------------- the loop
@@ -386,3 +392,38 @@ def test_cli_sft_refuses_a_resume_without_a_checkpoint(tmp_path: Path):
     )
     assert r.exit_code != 0
     assert "resume" in str(r.exception)
+
+
+def test_init_from_seeds_weights_without_the_config_gate(tmp_path):
+    """`--init-from` loads WEIGHTS from a foreign checkpoint: no config gate
+    (that is `resume`'s job), no optimizer state, and a LOUD refusal for a
+    missing file or an architecture mismatch."""
+    from dormouse.instrument import LoudError
+    from dormouse.train.sft import sft_train
+
+    run = sft_run(tmp_path, steps=2, log_every=2)
+
+    # a foreign checkpoint: the model's own state at a different init
+    foreign = tmp_path / "foreign.pt"
+    other = DormouseModel(run.model)
+    torch.save({"model": other.state_dict(), "step": 7}, foreign)
+
+    model = DormouseModel(run.model)
+    before = [p.detach().clone() for p in model.parameters()]
+    report = sft_train(model, run, init_from=str(foreign), log=lambda *_: None)
+    assert math.isfinite(report["loss"])
+    # the weights ARE the foreign ones at load time (not the fresh init)
+    for p, b in zip(model.parameters(), before, strict=True):
+        if not torch.equal(p, b):
+            break
+    else:  # pragma: no cover - the step must move weights
+        raise AssertionError("the SFT step did not move any weight")
+
+    with pytest.raises(LoudError, match="does not exist"):
+        sft_train(
+            DormouseModel(run.model), run, init_from=str(tmp_path / "no.pt"), log=lambda *_: None
+        )
+    bad = tmp_path / "bad.pt"
+    torch.save({"model": {"nope": torch.zeros(1)}}, bad)
+    with pytest.raises(LoudError, match="do not exist|absent"):
+        sft_train(DormouseModel(run.model), run, init_from=str(bad), log=lambda *_: None)

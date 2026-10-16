@@ -382,6 +382,13 @@ def sft_cmd(
     resume: Annotated[
         bool, typer.Option(help="continue `ckpt_name`; a drifted config refuses")
     ] = False,
+    init_from: Annotated[
+        str,
+        typer.Option(
+            "--init-from",
+            help="a .pt whose WEIGHTS seed this SFT run (fresh optimizer/snapshot)",
+        ),
+    ] = "",
     device: Annotated[str, typer.Option(help="auto|cuda|cpu")] = "auto",
     json_log: Annotated[
         Path | None, typer.Option("--json-log", help="telemetry sink for `dormouse plot`")
@@ -442,12 +449,18 @@ def sft_cmd(
     console.print(
         Panel(
             f"[bold]sft[/] {run.source} · {param_count(model):,} params · {dev}"
-            + ("" if resume else " · base = fresh init"),
+            + ("" if resume else (" · base = " + (init_from or "fresh init"))),
             subtitle=f"steps={run.train.steps} batch={run.train.batch} "
             f"seq={run.train.seq_len} lr={run.train.lr} opt={run.train.opt}",
         )
     )
-    report = sft_train(model, run, resume=resume, device=None if dev.type == "cpu" else dev)
+    report = sft_train(
+        model,
+        run,
+        resume=resume,
+        init_from=init_from or None,
+        device=None if dev.type == "cpu" else dev,
+    )
     console.print(
         f"[green]sft done[/] steps={report['steps']} loss={report['loss']:.4f} "
         f"masked_bytes={report['supervised_bytes']:,} nan_skipped={report['nan_skipped']}"
