@@ -53,6 +53,17 @@ MOE_KERNELS = ("padded", "triton", "naive")
 #: `memglu` (closed-tail gate, arXiv 2608.07323). A new arm lands WITH its
 #: gold test (`tests/test_expert_act.py`) before this tuple grows.
 EXPERT_ACTS = ("silu", "situ", "memglu")
+#: The `ns_kind` literals — the Newton–Schulz arms the Muon group runs
+#: (`optim.NS_KINDS`, which is where they are executed; the list is duplicated
+#: here the way `MOE_KERNELS` is, so the config layer does not import the
+#: trainer). `classic` = the per-iteration `X @ X.T` recurrence: the default,
+#: and every number on record. `gram` = Gram Newton–Schulz (arXiv 2608.11612
+#: §4 + `github.com/Dao-AILab/gram-newton-schulz`): the SAME polynomial
+#: iterated on the `[r, r]` Gram and applied once at the end, so the two
+#: rectangular matmuls per iteration collapse to four `[r, r]` ones. Equivalent
+#: to `classic` up to fp32 round-off order (`tests/test_muon_gram.py`), which
+#: is why the arm needs no training A/B. A name that is not here is LOUD.
+NS_KINDS = ("classic", "gram")
 
 
 def _unsupported(default: Any, mechanism: str) -> Any:
@@ -298,6 +309,25 @@ class TrainConfig:
     #: `mix` = Muon on 2-D params + AdamW elsewhere (the default); `adamw` =
     #: the fallback arm, which is the same code with the routing disabled.
     opt: str = "mix"
+    #: The Newton–Schulz arm the Muon group runs (`NS_KINDS` above,
+    #: `optim.zeropower_via_ns(kind=...)`). `classic` = the per-iteration
+    #: `X @ X.T` recurrence: the default, byte-identical to this port's history.
+    #: `gram` = **Gram Newton–Schulz** (arXiv:2608.11612 §4, transcribed from
+    #: `Dao-AILab/gram-newton-schulz` on 2026-10-16): the SAME polynomial
+    #: iterated on the `[r, r]` Gram instead of on `X`, so the two rectangular
+    #: matmuls per iteration (the `[64, 64]` Gram of a `[64, 5461]` factor and
+    #: the `P @ X` product) are replaced by four `[r, r]` ones and exactly two
+    #: rectangular matmuls in total. Mathematically the same polynomial,
+    #: regrouped — the equivalence gate in `tests/test_muon_gram.py` is what
+    #: licenses the swap without a training A/B
+    #: (`docs/research/2026-10-16-muon-orthogonalization-cost.md` row 1).
+    #: NOT yet forwarded by the trainer: the call site is `train/loop.py:378`
+    #: (`MixOptimizer(model, lr=cfg.lr, wd=cfg.wd, opt=cfg.opt)`), and that file
+    #: belongs to another lane, so this field is honoured by `MixOptimizer` —
+    #: and by the gate + `scripts/bench_muon_ns.py`, which build it directly —
+    #: while the trainer keeps running `classic` until the one argument
+    #: `ns_kind=cfg.ns_kind` lands there.
+    ns_kind: str = "classic"
     seed: int = 1
     #: WSD warmup, in TOKENS (not steps): the schedule is a function of how
     #: much data the run has seen, so a batch-size change does not change it.
@@ -693,6 +723,16 @@ def load_run(
         tcfg = dataclasses.replace(tcfg, **train_overrides)
     if tcfg.opt not in ("mix", "adamw"):
         loud(f"opt={tcfg.opt!r}: known optimizers are 'mix' (default) and 'adamw'")
+    if tcfg.ns_kind not in NS_KINDS:
+        loud(
+            f"ns_kind={tcfg.ns_kind!r} is not an arm. Known: {list(NS_KINDS)} — "
+            f"`classic` forms `X @ X.T` at every Newton–Schulz iteration (the "
+            f"default), `gram` is Gram Newton–Schulz (arXiv 2608.11612 §4 + "
+            f"github.com/Dao-AILab/gram-newton-schulz): the same polynomial "
+            f"iterated in the `[r, r]` Gram space. Escape: name one of those, or "
+            f"land the arm in `optim.NS_KINDS` and its equivalence gate BEFORE the "
+            f"config can lie about it."
+        )
     if model_overrides:
         _refuse_unsupported(ModelConfig, model_overrides, "model")
         import dataclasses as _dc
