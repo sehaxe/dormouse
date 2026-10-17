@@ -204,6 +204,33 @@ def test_snapshot_round_trip_and_progress_exemption():
     longer = replace(run, train=replace(run.train, steps=999, log_every=1, eval=True))
     assert longer.diff_keys(run) == []
     assert set(PROGRESS_KEYS) <= set(TrainConfig().__dataclass_fields__)
+    # ... and so is the telemetry sink: it decides WHERE the measurement goes,
+    # never what the model computes (audit MINOR 23, 2026-10-17).
+    assert "json_log" in PROGRESS_KEYS
+    moved = replace(run, train=replace(run.train, json_log="/tmp/other.jsonl"))
+    assert moved.diff_keys(run) == []
     # Anything else is not.
     hotter = replace(run, train=replace(run.train, lr=run.train.lr * 2))
     assert hotter.diff_keys(run) == ["train.lr"]
+
+
+def test_dspark_guards_run_outside_byteflow():
+    """Audit MINOR 12: the dspark coherence checks lived in `_validate_byteflow`,
+    so the default path accepted a negative γ and a zero k/stride."""
+    from dormouse.config import validate
+
+    validate(ModelConfig())  # the legal default still passes
+    for bad in ({"dspark_weight": -1.0}, {"dspark_k": 0}, {"dspark_stride": 0}):
+        with pytest.raises(LoudError, match="dspark"):
+            validate(ModelConfig(**bad))
+    # The byteflow-only interaction is still refused where it belongs.
+    with pytest.raises(LoudError, match="use_byteflow"):
+        validate(
+            ModelConfig(
+                use_byteflow=True,
+                bf16=False,
+                use_engram=False,
+                byteflow_k_tokens=8,
+                dspark_weight=0.1,
+            )
+        )

@@ -344,6 +344,17 @@ class Engram(nn.Module):
         self.host = HostTables(rows)
         del self.tables
 
+    def drop_pending(self) -> None:
+        """Discard this step's pending leaves without updating anything.
+
+        The NaN firewall's skip branch calls this (audit MINOR 13, 2026-10-17):
+        a skipped step never reaches `host_step`, so the leaves it built would
+        stay in `_pending` until the next REAL step — memory proportional to the
+        NaN count, and their `uniq` rows re-deduped there. `host_step` clears the
+        same list; this is the same clear with the update left out.
+        """
+        self._pending = []
+
     def host_step(self, lr: float) -> tuple[int, int]:
         """The ONE host update a TRAINING step gets: `(updates, rows)`.
 

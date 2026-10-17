@@ -41,8 +41,11 @@ PRESET_DIR = Path(__file__).resolve().parents[2] / "configs"
 UNSUPPORTED = "unsupported_mechanism"
 
 #: Train keys a resume is allowed to change: they decide WHEN we look, never
-#: what the model computes. Exactly the burn list (cfg.rs `PROGRESS_KEYS`).
-PROGRESS_KEYS = ("steps", "log_every", "ckpt_every", "eval", "eval_every")
+#: what the model computes. The burn list (cfg.rs `PROGRESS_KEYS`) plus
+#: `json_log` — the telemetry sink is WHERE the measurement goes and it reaches
+#: no forward (audit MINOR 23, 2026-10-17: the field's own docstring promised
+#: this exemption while `diff_keys` refused the flip).
+PROGRESS_KEYS = ("steps", "log_every", "ckpt_every", "eval", "eval_every", "json_log")
 
 #: The `moe_kernel` literals — the expert-pass arms `experts._dispatch` routes
 #: between. One list, read by `validate`: a name that is not here is LOUD.
@@ -102,14 +105,16 @@ NS_KINDS = ("classic", "gram")
 #: The `muon_colrow_3d` literals — the arms of `colrow_normalize`'s 3-D branch
 #: (`optim.COLROW_3D`, which is where they execute; the list is duplicated here
 #: the way `NS_KINDS` is, so the config layer does not import the trainer).
-#: `frobenius` = the per-slice Frobenius normalisation the batched Muon step has
-#: always run: it is NOT `NormDir::ColRow`, it is a pre-existing defect found
-#: 2026-10-16 by the equivalence gate, and it makes the batched update exactly
-#: `1/sqrt(d0)` of the per-param one (8x at `[64, 5461]`, 45x at `[2048, 2048]`).
-#: It is the DEFAULT because every number on record ran it. `colrow` = the 2-D
-#: definition applied per slice, bit-identical to the per-param path — the fix,
-#: and an A/B-gated change (AGENTS §1.2: it moves the update scale for every
-#: shape group with >= 2 members). A name that is not here is LOUD.
+#: `frobenius` = the per-slice Frobenius normalisation the batched Muon step ran
+#: until the 2026-10-17 flip (`9ee82c5`): it is NOT `NormDir::ColRow`, it is a
+#: pre-existing defect found 2026-10-16 by the equivalence gate, and it makes the
+#: batched update exactly `1/sqrt(d0)` of the per-param one (8x at `[64, 5461]`,
+#: 45x at `[2048, 2048]`). Every number on record BEFORE the flip ran it; it is
+#: kept as the A/B control. `colrow` = the 2-D definition applied per slice,
+#: bit-identical to the per-param path — the fix, and the DEFAULT since that
+#: A/B verdict (AGENTS §1.2: it moves the update scale for every shape group
+#: with >= 2 members, and the verdict cleared the bar). A name that is not here
+#: is LOUD.
 MUON_COLROW_3D = ("frobenius", "colrow")
 
 
@@ -450,8 +455,9 @@ class TrainConfig:
 
     #: The 3-D `colrow_normalize` arm the batched Muon step runs
     #: (`MUON_COLROW_3D` above, `optim.COLROW_3D` where it executes).
-    #: **`colrow` (the default since 2026-10-16) = the 2-D definition applied
-    #: per slice** — bit-identical to the per-param path. The A/B verdict
+    #: **`colrow` (the default since the flip landed — `9ee82c5`, 2026-10-17)
+    #: = the 2-D definition applied per slice** — bit-identical to the per-param
+    #: path. The A/B verdict
     #: (6 runs x 2k steps, small, 81 920 B window): control 3.0542 vs fix
     #: 3.0113 = **-0.0428 BPB, 8.7x the control's seed spread, zero seed
     #: overlap** — the largest measured A/B win in the port's history, so the
@@ -471,9 +477,9 @@ class TrainConfig:
     #: Fraction of the token budget spent on the WSD decay.
     decay_frac: float = 0.1
     #: JSONL telemetry sink: one row per event (log line, eval, checkpoint),
-    #: consumed by `dormouse plot`. Empty = off. NOT a progress key — it is
-    #: where measurements go, never what the run computes; re-pointing it on
-    #: a resume is legal and expected for a moved run.
+    #: consumed by `dormouse plot`. Empty = off. A PROGRESS key: it is where
+    #: measurements go, never what the run computes, so re-pointing it on a
+    #: resume is legal and expected for a moved run (audit MINOR 23, 2026-10-17).
     json_log: str = ""
     data: str = ""
     eval_data: str = ""
@@ -793,6 +799,25 @@ def validate(model: ModelConfig) -> None:
             f"aux_fb_weight = 0.0."
         )
 
+    # The dspark arm's OWN coherence (audit MINOR 12, 2026-10-17): these used to
+    # live inside `_validate_byteflow`, which only runs under `use_byteflow`, so
+    # the default path accepted `dspark_weight=-1.0` / `dspark_k=0` /
+    # `dspark_stride=0` — a field that lies about being refused (§1.7). The
+    # byteflow-only interaction (`dspark_weight>0` with the channel's forward)
+    # stays in `_validate_byteflow`; the two-head rule is the aux_fb guard above.
+    if model.dspark_weight < 0.0:
+        loud(
+            f"dspark_weight={model.dspark_weight} is negative: it is γ, the "
+            f"multiplier on the γ-free DSpark loss (D2). Escape: 0.0 (off) or a "
+            f"positive weight."
+        )
+    if model.dspark_k < 1 or model.dspark_stride < 1:
+        loud(
+            f"dspark_k={model.dspark_k} / dspark_stride={model.dspark_stride}: "
+            f"both are positive counts (the draft reach and the anchor spacing, "
+            f"in bytes). Escape: k >= 1, stride >= 1."
+        )
+
     if model.quant != "none":
         _refuse_ladder_rung(model.quant)
 
@@ -869,23 +894,6 @@ def _validate_byteflow(model: ModelConfig) -> None:
             "use_byteflow with dspark_weight>0: the channel's forward carries no "
             "byte ids for the draft window to read. Escape: dspark_weight = 0.0, "
             "or drop use_byteflow."
-        )
-    if model.dspark_weight < 0.0:
-        loud(
-            f"dspark_weight={model.dspark_weight} is negative: it is γ, the "
-            f"multiplier on the γ-free DSpark loss (D2). Escape: 0.0 (off) or a "
-            f"positive weight."
-        )
-    if model.dspark_k < 1 or model.dspark_stride < 1:
-        loud(
-            f"dspark_k={model.dspark_k} / dspark_stride={model.dspark_stride}: "
-            f"both are positive counts (the draft reach and the anchor spacing, "
-            f"in bytes). Escape: k >= 1, stride >= 1."
-        )
-    if model.dspark_weight > 0.0 and model.aux_fb_weight > 0.0:
-        loud(
-            "dspark_weight with aux_fb_weight>0: two heads on one run breaks the "
-            "one-signal-per-run A/B rule. Escape: pick one."
         )
 
 

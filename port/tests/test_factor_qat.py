@@ -119,39 +119,40 @@ def test_expert_bank_quantizes_per_expert_alpha():
 
 
 def test_banked_and_standalone_experts_agree_under_qat():
-    """The A/B's parity: one expert through `_banks` == the same expert alone.
+    """The A/B's parity, run END-TO-END: one expert through `_banks` == alone.
 
     Both routes must quantize with the SAME α_e (`dim=(1,2)` over the bank
-    slice vs per-tensor over the 2-D factor — algebraically the same mean).
+    slice vs per-tensor over the 2-D factor — algebraically the same mean), so
+    the bank slice IS the expert's own quantized tensors and an expert built
+    from them must reproduce the qat expert's forward. The banked arm feeds
+    those same tensors to `bmm`, so this is the arithmetic the banked path
+    runs, per expert — not a projection compared with itself.
     """
     cfg = _moe_cfg(factor_qat="ternary")
     model = DormouseModel(cfg)
     moe = next(m for m in model.modules() if isinstance(m, SparseMoE))
     expert = moe.experts[2]
     x = torch.randn(6, cfg.d_model)
-    _ = expert(x)  # the standalone path must run end-to-end under qat
+    with torch.no_grad():
+        alone = expert(x)  # the standalone path, quantizing with its own α_e
     # The banked path for one expert: quantized stack sliced back to [d, r]/[r, f].
     gate_u_b, up_u_b, v_b, gate_s_b, up_s_b = moe._banks(torch.float32)
-    q_alone = DualLatentGLU(
-        expert.d,
-        expert.f,
-        expert.rank,
-        dtype=torch.float32,
-        factor_qat="ternary",
-    )
+    # `factor_qat="none"`: the slice is ALREADY quantized, and re-quantizing it
+    # would take the absmean of a quantized tensor — a second α the bank never
+    # applies.
+    q_alone = DualLatentGLU(expert.d, expert.f, expert.rank, dtype=torch.float32, factor_qat="none")
     with torch.no_grad():
         q_alone.gate_u.copy_(gate_u_b[2])
         q_alone.up_u.copy_(up_u_b[2])
         q_alone.v.copy_(v_b[2])
         q_alone.gate_s.copy_(gate_s_b[2])
         q_alone.up_s.copy_(up_s_b[2])
-    # q_alone re-quantizes its (already quantized) inputs — idempotent on the
-    # grid up to the α of an already-quantized tensor, so compare the
-    # effective forward of the BANK tensors without re-quantizing: the parity
-    # claim is that expert-alone == bank-slice, checked on the effective weights.
-    u_direct = factor_qat_project(expert.gate_u, "ternary", 1.0)
-    assert torch.allclose(u_direct, gate_u_b[2], atol=1e-6)
-    assert torch.allclose(factor_qat_project(expert.v, "ternary", 1.0), v_b[2], atol=1e-6)
+        banked = q_alone(x)
+    assert banked.shape == alone.shape
+    assert torch.equal(banked, alone), (
+        "the bank slice must BE the expert's own quantized forward: "
+        f"max |Δ| = {(banked - alone).abs().max().item():.3e}"
+    )
 
 
 def test_moe_forward_runs_and_differs_from_unquantized():

@@ -129,6 +129,26 @@ def test_nan_step_is_skipped_and_counted_not_learned(tmp_path):
         assert torch.equal(p, b), "a non-finite step must not touch a weight"
 
 
+def test_a_nan_skipped_step_drops_the_pending_host_rows(tmp_path):
+    """Audit MINOR 13: the skip branch never calls `host_step`, so the leaves a
+    NaN step built would sit in `Engram._pending` until the next REAL step (and
+    their rows be re-deduped there) — growth proportional to the NaN count."""
+    from dormouse.model.engram import Engram
+
+    run = tiny_run(tmp_path, steps=1, log_every=1)
+    model = _NaNModel(DormouseModel(run.model))
+    engrams = [m for m in model.modules() if isinstance(m, Engram)]
+    assert engrams, "the fixture needs an Engram to leak through"
+    for m in engrams:
+        # The host substrate is where `_pending` is written at all: the in-VRAM
+        # read appends nothing. `to_host` directly, because the trainer's
+        # `host_tables` is a CUDA-budget refusal and this gate is CPU-only.
+        m.to_host()
+    report = train(model, run, log=lambda *_: None)
+    assert report["nan_skipped"] == 1
+    assert all(m._pending == [] for m in engrams), "a skipped step must drop its pending rows"
+
+
 def test_two_all_nan_windows_stop_the_run(tmp_path):
     """The plan's `nan_windows >= 2` hard error: a drowning run must not exit 0."""
     run = tiny_run(tmp_path, steps=5, log_every=1)

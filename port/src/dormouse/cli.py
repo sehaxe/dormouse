@@ -521,6 +521,7 @@ def eval_cmd(
     """Held-out BPB of a checkpoint. It resolves from the checkpoint's own snapshot."""
     from .train.data import open_streams
     from .train.loop import evaluate as _evaluate
+    from .train.loop import load_model_half
 
     if not ckpt_name:
         raise LoudError("eval needs --ckpt-name")
@@ -534,8 +535,10 @@ def eval_cmd(
     dev = _device(device)
     model = _model(run).to(dev)
     _freeze_gc()
-    ck = torch.load(Path(out_dir) / f"{ckpt_name}.pt", map_location="cpu", weights_only=False)
-    model.load_state_dict(ck["model"])
+    # The model half through the ONE loader (audit MAJOR 6): a raw
+    # `load_state_dict` on a storage-rung file (quant=fp8/nvfp4/ternary) dies on
+    # the packed records.
+    model.load_state_dict(load_model_half(Path(out_dir) / f"{ckpt_name}.pt"))
     _train_stream, eval_stream = open_streams(run)
     if eval_stream is None:
         raise LoudError("no eval stream (the snapshot carries eval_data or eval=true)")
@@ -562,6 +565,8 @@ def decode(
     device: Annotated[str, typer.Option(help="auto|cuda|cpu")] = "auto",
 ) -> None:
     """Sample bytes from a checkpoint (sliding-window next-byte decode)."""
+    from .train.loop import load_model_half
+
     if not ckpt_name:
         raise LoudError("decode needs --ckpt-name")
     if not prompt:
@@ -570,8 +575,9 @@ def decode(
     dev = _device(device)
     model = _model(run).to(dev)
     _freeze_gc()
-    ck = torch.load(Path(out_dir) / f"{ckpt_name}.pt", map_location="cpu", weights_only=False)
-    model.load_state_dict(ck["model"])
+    # Same loader as `eval` and `load_ckpt` (audit MAJOR 6): a rung checkpoint's
+    # factor records are packed, and `load_state_dict` cannot read them raw.
+    model.load_state_dict(load_model_half(Path(out_dir) / f"{ckpt_name}.pt"))
     gen = torch.Generator(device=dev).manual_seed(run.train.seed)
     out = decode_bytes(model, encode(prompt), n, temp=temp, device=dev, generator=gen)
     text = out[len(encode(prompt)) :].decode("utf-8", "replace")

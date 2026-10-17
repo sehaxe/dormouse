@@ -53,10 +53,11 @@ JORDAN_NS_COEFFS = (3.4445, -4.7750, 2.0315)
 NS_KINDS = ("classic", "gram")
 
 #: The 3-D `colrow_normalize` arms (`config.MUON_COLROW_3D` mirrors this list):
-#: `frobenius` is the per-slice Frobenius normalisation the batched Muon step
-#: has always run — NOT the ColRow the port documents — and `colrow` is the
-#: 2-D definition applied per slice, i.e. the fix. The defect, its exact size
-#: and the A/B it owes are in `colrow_normalize`'s docstring and
+#: `frobenius` is the per-slice Frobenius normalisation the batched Muon step ran
+#: before the 2026-10-17 flip (`9ee82c5`) — NOT the ColRow the port documents —
+#: and `colrow` is the 2-D definition applied per slice, i.e. the fix and the
+#: default since that flip. The defect, its exact size
+#: and the A/B it owed are in `colrow_normalize`'s docstring and
 #: `tests/test_muon_fast.py`.
 COLROW_3D = ("frobenius", "colrow")
 
@@ -103,9 +104,10 @@ def _check_colrow_3d(arm: str) -> None:
         loud(
             f"muon_colrow_3d={arm!r} is not an arm. Known: {list(COLROW_3D)} — "
             f"`frobenius` is the per-slice Frobenius normalisation the batched "
-            f"Muon step has always run (the 1/sqrt(d0)-of-ColRow defect, kept as "
-            f"the A/B control), `colrow` is the 2-D definition applied per slice "
-            f"(the fix, bit-identical to the per-param path). Escape: name one of "
+            f"Muon step ran before the flip (the 1/sqrt(d0)-of-ColRow defect, "
+            f"kept as the A/B control), `colrow` is the 2-D definition applied per "
+            f"slice (the fix, bit-identical to the per-param path, the default "
+            f"since `9ee82c5`). Escape: name one of "
             f"those, or land the arm in `optim.COLROW_3D` first."
         )
 
@@ -242,21 +244,26 @@ def colrow_normalize(x: torch.Tensor, eps: float = 1e-7, *, colrow_3d: str = "co
     branch was NOT ColRow — found 2026-10-16 by the equivalence gate in
     `tests/test_muon_fast.py`:
 
-    * `"frobenius"` (**the default, and what every number on record ran**):
+    * `"frobenius"` (**the historical default until the 2026-10-17 flip, and what
+      every number on record ran**):
       collapses dims `(1, 2)` twice, i.e. normalises each slice by its Frobenius
       norm. The batched Muon step therefore applies exactly `1/sqrt(d0)` of the
       per-param update (8x at `[64, 5461]`/`[64, 2048]`, 45x at `[2048, 2048]`).
       This is the DEFECT, kept as the control so the A/B is apples-to-apples.
-    * `"colrow"` (**the fix**): dims 1 then 2 per slice — the 2-D definition
+    * `"colrow"` (**the fix, and the default since that flip — `9ee82c5`**):
+      dims 1 then 2 per slice — the 2-D definition
       applied to each matrix, which `tests/test_muon_fast.py` shows is
       bit-identical to running `colrow_normalize` on the slices one at a time.
 
     The arm is a config key (`train.muon_colrow_3d`) and an optimizer attribute,
     never a param-group key: the group is what `load_state_dict` REPLACES with
     the checkpoint's copy, so a key added today would KeyError on every
-    checkpoint written before it (the same rule `ns_kind` follows). A switch
-    whose `"colrow"` arm moves the update scale 8-45x needs the standing 3-seed
-    A/B (AGENTS §1.2) before it can become the default.
+    checkpoint written before it (the same rule `ns_kind` follows). The switch
+    moves the update scale 8-45x, so it owed the standing 3-seed A/B (AGENTS
+    §1.2) and that A/B ran: **-0.0428 BPB against `"frobenius"`, 8.7x the
+    control's own seed spread, zero seed overlap** — which is why `"colrow"` is
+    the default and `"frobenius"` is kept as the control, not the other way
+    round.
     """
     if x.ndim == 2:
         x = x / (x.norm(dim=0, keepdim=True) + eps)

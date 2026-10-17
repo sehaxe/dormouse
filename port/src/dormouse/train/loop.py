@@ -24,7 +24,13 @@ import torch
 
 from ..config import PROGRESS_KEYS, RunConfig, TrainConfig
 from ..instrument import Counters, LoudError, StepTimer, loud
-from ..model.engram import enable_host_tables, host_state, host_step_all, load_host_state
+from ..model.engram import (
+    enable_host_tables,
+    host_engrams,
+    host_state,
+    host_step_all,
+    load_host_state,
+)
 from .data import ByteStream, eval_window_bytes, open_streams, warmup_steps
 from .lr import wsd_lr
 from .optim import MixOptimizer, clip_grads
@@ -185,9 +191,16 @@ def save_ckpt(
 
 def unpack_state_dict(sd: dict, rung: str | None) -> dict:
     """Model half of a checkpoint → fp32 masters. Packed records unpacked;
-    a rung that does not name a storage level is a loud refusal."""
+    a rung that does not name a storage level is a loud refusal.
+
+    The ONE normalization every reader shares: the `_orig_mod.` prefix a
+    torch.compile'd run wrote before the strip landed (audit CRITICAL 2) is
+    dropped here, so `load_ckpt`, `eval`, `decode` and `serve` all load into the
+    UNWRAPPED model.
+    """
     from ..model.tsct import is_factor_key, unpack_tsct
 
+    sd = {k.removeprefix("_orig_mod."): v for k, v in sd.items()}
     if rung is None:
         return sd
     out = {}
@@ -200,12 +213,26 @@ def unpack_state_dict(sd: dict, rung: str | None) -> dict:
     return out
 
 
+def load_model_half(weights: Path) -> dict:
+    """A checkpoint FILE's model half → fp32 masters, storage rung unpacked.
+
+    The loader `eval`, `decode` and `serve` share with `load_ckpt` (audit MAJOR
+    6, 2026-10-17): those three read the file with a raw `torch.load` +
+    `load_state_dict`, so a checkpoint written with `quant = fp8|nvfp4|ternary`
+    — a config `validate` accepts and `save_ckpt` packs — died in the load with
+    a `RuntimeError` naming neither the rung nor the escape.
+    """
+    ck = torch.load(weights, map_location="cpu", weights_only=False)
+    return unpack_state_dict(ck["model"], ck.get("model_quant_rung"))
+
+
 def load_ckpt(run: RunConfig) -> tuple[dict, RunConfig]:
     """Load a checkpoint, refusing a config that differs from the snapshot.
 
     The exemption list is the progress keys, and nothing else: they decide WHEN
-    we look (how many steps, how often to log/save/evaluate), never what the
-    model computes. `lr` is NOT exempt — a different lr is a different run.
+    we look (how many steps, how often to log/save/evaluate) and WHERE the
+    telemetry goes, never what the model computes. `lr` is NOT exempt — a
+    different lr is a different run.
     """
     weights, snapshot = ckpt_paths(run.train)
     if not weights.is_file() or not snapshot.is_file():
@@ -234,20 +261,15 @@ def load_ckpt(run: RunConfig) -> tuple[dict, RunConfig]:
             f"so continuing under one step count would be a different experiment. "
             f"Escape: resolve the run with the stored values, or use a new ckpt_name."
         )
-    ck = torch.load(weights, map_location="cpu", weights_only=False)
-    # Tolerate a file written by a torch.compile'd run BEFORE the strip landed
-    # (audit CRITICAL 2): the prefix is a wrapper artifact; a reader that
-    # refuses it would strand a legal checkpoint. New saves carry no prefix.
-    if isinstance(ck.get("model"), dict):
-        ck["model"] = {k.removeprefix("_orig_mod."): v for k, v in ck["model"].items()}
+    ck = dict(torch.load(weights, map_location="cpu", weights_only=False))
     # Storage rungs: the model half unpacks to fp32 masters (eval/decode/
-    # resume all ride the same path). `quant` on the LOAD side is allowed to
-    # differ from the save side — the file's rung is what describes the
-    # values, and a checkpoint is legal evidence for a bf16 run starting
-    # from fp8-rounded init; the snapshot gate above already handles intent.
-    stored_rung = ck.get("model_quant_rung")
-    ck = dict(ck)
-    ck["model"] = unpack_state_dict(ck["model"], stored_rung)
+    # resume all ride the same path) — and the `_orig_mod.` prefix of a
+    # pre-strip torch.compile file is dropped there too, so ONE function is the
+    # whole reader contract (audit CRITICAL 2 + MAJOR 6). `quant` on the LOAD
+    # side is allowed to differ from the save side — the file's rung is what
+    # describes the values, and a checkpoint is legal evidence for a bf16 run
+    # starting from fp8-rounded init; the snapshot gate above handles intent.
+    ck["model"] = unpack_state_dict(ck["model"], ck.get("model_quant_rung"))
     return ck, stored
 
 
@@ -614,6 +636,14 @@ def train(
             total.count("nan_skipped")
             window.count("nan_skipped")
             opt.zero_grad(set_to_none=True)
+            # A skipped step never reaches `host_step_all`, so the host-path
+            # leaves it built would sit in `Engram._pending` until the next REAL
+            # step (and their rows be re-deduped there) — growth proportional to
+            # the NaN count, and the burn record has NaN FLOODS (AGENTS §2.3).
+            # Dropped here, once, in the one place that knows the step did not
+            # train. The in-VRAM path never appends, so this is a no-op there.
+            for m in host_engrams(model):
+                m.drop_pending()
 
         if (step + 1) % cfg.log_every == 0:
             # The 0-sync rule: every DEVICE-side counter this window gathered

@@ -57,6 +57,19 @@ def test_resume_without_a_checkpoint_is_loud(tmp_path):
         load_ckpt(run)
 
 
+def test_json_log_may_move_on_a_resume(tmp_path):
+    """Audit MINOR 23: the telemetry sink is a progress key, so a resume that
+    only moves it continues (the field's own docstring, now true)."""
+    first = tiny_run(tmp_path, steps=2, ckpt_every=2, log_every=10)
+    train(DormouseModel(first.model), first, log=lambda *_: None)
+    moved = tiny_run(
+        tmp_path, steps=4, ckpt_every=2, log_every=10, json_log=str(tmp_path / "moved.jsonl")
+    )
+    assert moved.diff_keys(first) == []
+    report = train(DormouseModel(moved.model), moved, resume=True, log=lambda *_: None)
+    assert report["opt_steps"] == 4, "the moved sink must not restart the run"
+
+
 def test_optimizer_state_round_trips(tiny, byte_tensor):
     model = DormouseModel(tiny)
     opt = MixOptimizer(model, lr=1e-3, wd=0.01)

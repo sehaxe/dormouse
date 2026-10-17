@@ -11,14 +11,19 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import torch
-from conftest import tiny_cfg
+from conftest import tiny_cfg, write_corpus
+from typer.testing import CliRunner
 
+from dormouse.cli import app
 from dormouse.config import load_run
 from dormouse.model import DormouseModel
 from dormouse.model.tsct import is_factor_key, pack_tsct, unpack_tsct
 from dormouse.train.loop import load_ckpt, save_ckpt, unpack_state_dict
 from dormouse.train.optim import MixOptimizer
+
+runner = CliRunner()
 
 
 def test_fp8_round_trip_within_the_e4m3_bound():
@@ -212,3 +217,52 @@ def test_ternary_refusal_update():
     with pytest.raises(LoudError):
         load_run("small", model_overrides={"quant": "lbit"})
     assert load_run("small", model_overrides={"quant": "ternary"}).model.quant == "ternary"
+
+
+# ---------------------------------------------------------------------------
+# the audit's MAJOR 6 gate: `eval`/`decode`/`serve` load a rung checkpoint
+# ---------------------------------------------------------------------------
+
+
+def _save_rung_checkpoint(tmp_path: Path, quant: str) -> Path:
+    """A 1-step tiny run saved with a storage rung; returns the corpus path."""
+    from dormouse.config import RunConfig, TrainConfig
+    from dormouse.train.optim import MixOptimizer
+
+    corpus = write_corpus(tmp_path / "corpus.bin", n_bytes=4096)
+    run = RunConfig(
+        source="t",
+        model=tiny_cfg(quant=quant),
+        train=TrainConfig(
+            steps=1,
+            batch=2,
+            seq_len=8,
+            ckpt_name="rung",
+            out_dir=str(tmp_path / "ck"),
+            data=str(corpus),
+        ),
+    )
+    model = DormouseModel(run.model)
+    opt = MixOptimizer(model, lr=0.001, wd=0.0, opt="mix")
+    save_ckpt(run, model, opt, step=1)
+    return corpus
+
+
+@pytest.mark.parametrize("quant", ["fp8", "none"])
+def test_cli_eval_and_decode_load_a_rung_checkpoint(tmp_path: Path, quant: str):
+    """`dormouse eval`/`decode` on a checkpoint whose factors are PACKED.
+
+    `cli.py`'s eval and decode read the model half with a raw `torch.load` +
+    `load_state_dict`, so a checkpoint written with `quant=fp8` — a config the
+    validator accepts and `save_ckpt` packs — died there with a RuntimeError
+    naming neither the rung nor the escape (audit MAJOR 6, 2026-10-17). Both now
+    ride `load_model_half`; `quant="none"` is the unpaced control that must keep
+    loading as before.
+    """
+    corpus = _save_rung_checkpoint(tmp_path, quant)
+    ck = ["--out-dir", str(tmp_path / "ck"), "--ckpt-name", "rung", "--device", "cpu"]
+    ev = runner.invoke(app, ["eval", *ck, "--eval", str(corpus)])
+    assert ev.exit_code == 0, ev.output
+    assert "BPB" in ev.output
+    dec = runner.invoke(app, ["decode", *ck, "--prompt", "abcdefgh", "--n", "4"])
+    assert dec.exit_code == 0, dec.output
