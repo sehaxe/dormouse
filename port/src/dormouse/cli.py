@@ -375,15 +375,17 @@ def sft_cmd(
         int, typer.Option(help="code and math tasks per class in the built corpus")
     ] = 32,
     chat_data: Annotated[
-        Path | None,
+        list[Path],
         typer.Option(
             "--chat-data",
-            help="JSONL of {instruction, response} rows mixed into the built corpus",
+            help="chat files mixed into the built corpus (repeatable): .jsonl or Q/A text",
         ),
-    ] = None,
+    ] = [],  # noqa: B006 — typer constructs a fresh list per call (its contract)
     chat_cap: Annotated[
         int | None,
-        typer.Option("--chat-cap", help="max chat rows used (a deterministic sample)"),
+        typer.Option(
+            "--chat-cap", help="max chat rows used across all files (a deterministic sample)"
+        ),
     ] = None,
     steps: Annotated[int | None, typer.Option] = None,
     batch: Annotated[
@@ -445,7 +447,7 @@ def sft_cmd(
             run.train.seed,
             seq_len=run.train.seq_len,
             n_tasks=n_tasks,
-            chat_jsonl=chat_data,
+            chat_data=chat_data or None,
             chat_cap=chat_cap,
         )
         dropped = (
@@ -453,9 +455,10 @@ def sft_cmd(
         )
         chat_line = ""
         if built["chat_loaded"]:
+            per_file = ", ".join(f"{Path(p).name}:{n}" for p, n in built["chat_files"].items())
             chat_line = (
-                f" · chat {built['chat_used']}/{built['chat_loaded']} used"
-                f" ({built['chat_dropped_long']} long, {built['chat_dropped_dirty']} dirty dropped)"
+                f" · chat {built['chat_used']}/{built['chat_loaded']} used ({per_file};"
+                f" {built['chat_dropped_long']} long, {built['chat_dropped_dirty']} dirty dropped)"
             )
         console.print(
             f"[green]sft corpus[/] {built['records']} records x {built['record_bytes']} B "

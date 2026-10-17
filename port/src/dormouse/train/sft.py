@@ -236,46 +236,133 @@ def _ru_pairs() -> list[tuple[str, str]]:
 # ---------------------------------------------------------------------------
 
 
-def _chat_pairs(path: str | Path, seq_len: int) -> tuple[list[tuple[str, str]], dict[str, int]]:
-    """Load `{"instruction", "response"}` JSONL rows that can fit ONE window.
+def _read_chat_file(path: Path) -> list[tuple[str, str]]:
+    """Parse ONE chat file into raw pairs, refusing malformed input loudly.
+
+    Two formats, dispatched by suffix:
+
+    * `.jsonl` — one `{"instruction": ..., "response": ...}` object per line
+      (the distill exports use that pair).
+    * anything else (`.qa`, `.txt`) — the hand-editable Q/A text format:
+
+          # comments and blank lines are skipped
+          Q: What is your name?
+          A: dormouse.
+
+          Q: Привет!
+          A: Привет! Чем помочь?
+
+      The Q/A form exists because personal examples are hand-written: one line
+      per half, `#` to comment, blank lines free. Every malformed line is a
+      LOUD error naming `file:line`, never a silent skip.
+    """
+    import json
+
+    text = path.read_text(encoding="utf-8")
+    if path.suffix == ".jsonl":
+        pairs: list[tuple[str, str]] = []
+        for lineno, line in enumerate(text.splitlines(), 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                loud(
+                    f"sft --chat-data {path}:{lineno}: not valid JSON ({exc.msg}). "
+                    f'Escape: one {{"instruction", "response"}} object per line.'
+                )
+            pairs.append(
+                (str(row.get("instruction", "")).strip(), str(row.get("response", "")).strip())
+            )
+        return pairs
+    pairs = []
+    question: str | None = None
+    q_line = 0
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("Q:"):
+            if question is not None:
+                loud(
+                    f"sft --chat-data {path}:{lineno}: a new `Q:` before the question "
+                    f"at line {q_line} got its `A:`. Escape: give every question an "
+                    f"answer, or separate pairs with a blank line."
+                )
+            question = line[2:].strip()
+            q_line = lineno
+            if not question:
+                loud(f"sft --chat-data {path}:{lineno}: empty question after `Q:`.")
+        elif line.startswith("A:"):
+            if question is None:
+                loud(
+                    f"sft --chat-data {path}:{lineno}: an `A:` without a preceding "
+                    f"`Q:`. Escape: write the question first, one line per half."
+                )
+            answer = line[2:].strip()
+            if not answer:
+                loud(f"sft --chat-data {path}:{lineno}: empty answer after `A:`.")
+            pairs.append((question, answer))
+            question = None
+        else:
+            loud(
+                f"sft --chat-data {path}:{lineno}: neither `Q: ...`, `A: ...` nor a "
+                f"`#` comment: {line[:48]!r}. Escape: the Q/A text format is one "
+                f"line per half (or use a .jsonl file)."
+            )
+    if question is not None:
+        loud(
+            f"sft --chat-data {path}:{q_line}: the question never got an `A:` line. "
+            f"Escape: add one."
+        )
+    return pairs
+
+
+def _chat_pairs(
+    paths: str | Path | list[str | Path], seq_len: int
+) -> tuple[list[tuple[str, str]], dict]:
+    """Load chat files (one path or a list) and keep the one-window fits.
 
     The build's own rule is applied here, early: an example longer than
     `seq_len` B of content can never be rendered into a record, so it is dropped
     with a count rather than in the build loop (where a `cap` would otherwise
     spend slots on rows that cannot land). Sentinel-carrying rows are dropped
     the same way — the marker license requires it, and real web text can carry
-    a stray 0x00. The rows are returned in file order; the caller shuffles
-    deterministically before applying its cap.
+    a stray 0x00. Rows keep file order; the caller shuffles deterministically
+    before applying its cap.
     """
-    import json
-
-    p = Path(path)
-    if not p.is_file():
-        loud(
-            f"sft --chat-data: {p} does not exist. Escape: a JSONL file with "
-            f"{{instruction, response}} rows (the distill exports use that pair)."
-        )
+    if isinstance(paths, (str, Path)):
+        paths = [paths]
     pairs: list[tuple[str, str]] = []
+    files: dict[str, int] = {}
     dropped_long = dropped_dirty = 0
-    for line in p.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        row = json.loads(line)
-        instruction = str(row.get("instruction", "")).strip()
-        answer = str(row.get("response", "")).strip()
-        if not instruction or not answer:
-            dropped_dirty += 1
-            continue
-        raw_i, raw_a = instruction.encode(), answer.encode()
-        if len(raw_i) + len(raw_a) + 4 > seq_len:
-            dropped_long += 1
-            continue
-        if any(b in raw_i for b in SENTINELS) or any(b in raw_a for b in SENTINELS):
-            dropped_dirty += 1
-            continue
-        pairs.append((instruction, answer))
-    return pairs, {"chat_dropped_long": dropped_long, "chat_dropped_dirty": dropped_dirty}
+    for path in paths:
+        p = Path(path)
+        if not p.is_file():
+            loud(
+                f"sft --chat-data: {p} does not exist. Escape: a .jsonl export or "
+                f"a hand-written Q/A text file (see sft_pairs/mine.qa)."
+            )
+        raw_pairs = _read_chat_file(p)
+        files[str(p)] = len(raw_pairs)
+        for instruction, answer in raw_pairs:
+            if not instruction or not answer:
+                dropped_dirty += 1
+                continue
+            raw_i, raw_a = instruction.encode(), answer.encode()
+            if len(raw_i) + len(raw_a) + 4 > seq_len:
+                dropped_long += 1
+                continue
+            if any(b in raw_i for b in SENTINELS) or any(b in raw_a for b in SENTINELS):
+                dropped_dirty += 1
+                continue
+            pairs.append((instruction, answer))
+    return pairs, {
+        "chat_files": files,
+        "chat_dropped_long": dropped_long,
+        "chat_dropped_dirty": dropped_dirty,
+    }
 
 
 def _assert_clean(text: str) -> None:
@@ -331,20 +418,21 @@ def build_sft_corpus(
     *,
     seq_len: int,
     n_tasks: int = 32,
-    chat_jsonl: str | Path | None = None,
+    chat_data: str | Path | list[str | Path] | None = None,
     chat_cap: int | None = None,
 ) -> dict:
     """Write the instruction corpus: fixed `seq_len + 1`-byte records, deterministic.
 
-    A pure function of `(seed, seq_len, n_tasks, chat_jsonl, chat_cap)`: the same
+    A pure function of `(seed, seq_len, n_tasks, chat_data, chat_cap)`: the same
     arguments produce the same bytes in any process (the shuffles are
     `random.Random(seed)` / `Random(seed + 1)`), which is what makes an SFT run
     replayable (ADR-0021's determinism discipline).
 
-    `chat_jsonl` mixes external `{instruction, response}` rows (the distill
-    exports) into the corpus: they are pre-filtered to one-window fits, shuffled
-    deterministically and cut to `chat_cap`. Without it the corpus is the small
-    seeded set, which is enough to learn the FORMAT and nothing else.
+    `chat_data` mixes external rows (the distill `.jsonl` exports, hand-written
+    Q/A text files — see [`_read_chat_file`]) into the corpus: they are
+    pre-filtered to one-window fits, shuffled deterministically and cut to
+    `chat_cap` across ALL files. Without it the corpus is the small seeded set,
+    which is enough to learn the FORMAT and nothing else.
 
     An example that does not fit in ONE window is DROPPED, not truncated (a
     truncated answer teaches the model to stop mid-function) and not wrapped (a
@@ -359,9 +447,15 @@ def build_sft_corpus(
     if chat_cap is not None and chat_cap < 0:
         loud(f"build_sft_corpus chat_cap={chat_cap}: a cap cannot be negative")
     chat: list[tuple[str, str]] = []
-    chat_stats = {"chat_loaded": 0, "chat_used": 0, "chat_dropped_long": 0, "chat_dropped_dirty": 0}
-    if chat_jsonl is not None:
-        chat, dropped = _chat_pairs(chat_jsonl, seq_len)
+    chat_stats: dict = {
+        "chat_files": {},
+        "chat_loaded": 0,
+        "chat_used": 0,
+        "chat_dropped_long": 0,
+        "chat_dropped_dirty": 0,
+    }
+    if chat_data is not None:
+        chat, dropped = _chat_pairs(chat_data, seq_len)
         chat_stats.update(dropped)
         chat_stats["chat_loaded"] = len(chat)
         random.Random(seed + 1).shuffle(chat)

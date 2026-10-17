@@ -445,16 +445,63 @@ def test_chat_jsonl_rows_are_filtered_capped_and_deterministic(tmp_path):
     src = tmp_path / "chat.jsonl"
     src.write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
 
-    a = build_sft_corpus(tmp_path / "a.bin", 7, seq_len=64, n_tasks=0, chat_jsonl=src, chat_cap=1)
-    build_sft_corpus(tmp_path / "b.bin", 7, seq_len=64, n_tasks=0, chat_jsonl=src, chat_cap=1)
+    a = build_sft_corpus(tmp_path / "a.bin", 7, seq_len=64, n_tasks=0, chat_data=src, chat_cap=1)
+    build_sft_corpus(tmp_path / "b.bin", 7, seq_len=64, n_tasks=0, chat_data=src, chat_cap=1)
     assert (tmp_path / "a.bin").read_bytes() == (tmp_path / "b.bin").read_bytes()
     assert a["chat_loaded"] == 2 and a["chat_used"] == 1
     assert a["chat_dropped_long"] == 1 and a["chat_dropped_dirty"] == 2
+    assert a["chat_files"] == {str(src): 5}
 
     with pytest.raises(LoudError, match="does not exist"):
         build_sft_corpus(
-            tmp_path / "c.bin", 1, seq_len=64, n_tasks=0, chat_jsonl=tmp_path / "no.jsonl"
+            tmp_path / "c.bin", 1, seq_len=64, n_tasks=0, chat_data=tmp_path / "no.jsonl"
         )
+
+
+def test_qa_text_format_parses_and_refuses_malformed_lines(tmp_path):
+    """The hand-editable Q/A format: `#` comments and blank lines are free,
+    pairs are positional, and every malformed line is a LOUD error naming
+    file:line — a personal file deserves a message, not a silent skip."""
+    src = tmp_path / "mine.qa"
+    src.write_text(
+        "# my own examples\n"
+        "\n"
+        "Q: What is your name?\n"
+        "A: dormouse.\n"
+        "\n"
+        "Q: Привет!\n"
+        "A: Привет! Чем помочь?\n",
+        encoding="utf-8",
+    )
+    built = build_sft_corpus(tmp_path / "a.bin", 3, seq_len=128, n_tasks=0, chat_data=src)
+    assert built["chat_files"] == {str(src): 2}
+    assert built["chat_loaded"] == 2 and built["chat_used"] == 2
+
+    bad = tmp_path / "bad.qa"
+    bad.write_text("A: answer first?\n", encoding="utf-8")
+    with pytest.raises(LoudError, match=r"bad\.qa:1"):
+        build_sft_corpus(tmp_path / "b.bin", 3, seq_len=128, n_tasks=0, chat_data=bad)
+    bad.write_text("Q: q1\nQ: q2\nA: a\n", encoding="utf-8")
+    with pytest.raises(LoudError, match="before the question"):
+        build_sft_corpus(tmp_path / "b.bin", 3, seq_len=128, n_tasks=0, chat_data=bad)
+    bad.write_text("Q: unfinished question\n", encoding="utf-8")
+    with pytest.raises(LoudError, match="never got"):
+        build_sft_corpus(tmp_path / "b.bin", 3, seq_len=128, n_tasks=0, chat_data=bad)
+
+
+def test_chat_files_merge_before_the_cap(tmp_path):
+    """Several --chat-data files are merged into ONE pool before the cap, so a
+    small personal file is not starved by a large export (and the sample stays
+    a pure function of the seed)."""
+    f1 = tmp_path / "one.qa"
+    f1.write_text("Q: q1\nA: a1\nQ: q2\nA: a2\nQ: q3\nA: a3\n", encoding="utf-8")
+    f2 = tmp_path / "two.qa"
+    f2.write_text("Q: q4\nA: a4\n", encoding="utf-8")
+    built = build_sft_corpus(
+        tmp_path / "a.bin", 11, seq_len=64, n_tasks=0, chat_data=[f1, f2], chat_cap=4
+    )
+    assert built["chat_loaded"] == 4 and built["chat_used"] == 4
+    assert built["chat_files"] == {str(f1): 3, str(f2): 1}
 
 
 def test_ru_bank_is_broad_and_fits_one_window():
