@@ -42,6 +42,33 @@ All three count: `moe_padded_bmm`, `moe_triton_gemm` or `moe_naive_dispatch`
 (with the reason attached to the counter object) on the step's counter line, so
 a reader never has to guess which one produced the loss.
 
+**`moe_capacity = 0` is DROPLESS** (2026-10-17, the segmented-training lane).
+The capacity rule makes the DROP SET a function of the window's composition —
+`keep = pos < max(k, ceil(capacity·tokens·k/E))` is a per-forward rank, so which
+tokens get an expert depends on how many other tokens share their forward
+(measured: 0.39 on the tiny readout at `capacity = 1.0` between a one-shot window
+and the same window cut in four). A training forward that segments a long window
+therefore changed the model, not just the memory, and `segment_len` refused the
+pair. With `moe_capacity = 0` every assignment goes to its expert, the routing is
+per position, and the segmented forward is the one-shot forward
+(`tests/test_longctx.py`). Three consequences, each of them LOUD or COUNTED:
+
+* the padded arm **refuses** (`_padded_dispatch`): a capacity-padded `[E, cap, ·]`
+  bank has no shape without a cap, and sizing it to the largest expert would be
+  an input-dependent bank — a different arm, not a flag;
+* the arm that runs is the RAGGED one. `_naive_dispatch` is dropless by
+  construction (it loops the experts over the kept rows); the Triton kernel is
+  ragged too but its row-block GRID needs a bound the caller computes on the
+  host, and dropless has none (`cap = R` is a bound, but the kernel does not
+  early-exit, so the grid would do `E`-times the masked GEMM work). The one
+  host read that would fix it (`moe_kernels._cap_from_offs`) is exactly the sync
+  ADR-0018 rule 2 bans in a step, so the dropless pass falls back to the
+  reference loop **COUNTED**: `moe_dropless` + `moe_naive_dispatch` on the
+  counter line, plus `moe_triton_fallback` when the config asked for the grouped
+  GEMM. A sync-free bound for that grid is a `moe_kernels.py` follow-up;
+* `_capacity` asserts, so no other arm can quietly read a capacity of 0 as "the
+  floor k" and drop everything (the defect that would look like a working run).
+
 One more thing the routed pass can do, OFF by default: `moe_offload` (SL1,
 `docs/research/2026-10-16-budget-savers.md` §5). The MoE block owns the
 activation peak, and the tensors that own it are the `[E, cap, d]` /
@@ -92,7 +119,7 @@ from torch import nn
 from torch.autograd.graph import saved_tensors_hooks
 from torch.utils.checkpoint import checkpoint
 
-from ..instrument import Counters
+from ..instrument import Counters, loud
 from .act_quant import fake_quant_act
 from .tsct import factor_qat_project, mm_mixed
 
@@ -429,7 +456,17 @@ class SparseMoE(nn.Module):
 
         Burn's `[E, cap, f]` rule, kept exact, and floored at `k` so a token is
         never dropped by the floor itself.
+
+        `capacity = 0` is DROPLESS and has NO cap: the floor would return `k`,
+        i.e. "keep the first k rows of every expert and drop the rest" — the
+        silent-collapse shape this assert exists for. The dropless path does not
+        call this at all (`_permute` keeps every row).
         """
+        assert self.capacity > 0, (
+            f"capacity={self.capacity} is the DROPLESS mode and has no cap: the rule "
+            f"would return the floor k and drop every row past it. Escape: "
+            f"moe_capacity > 0, or the dropless path (which keeps every assignment)."
+        )
         return max(k, math.ceil(self.capacity * n * k / self.n_experts))
 
     def _permute(self, index: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -442,6 +479,11 @@ class SparseMoE(nn.Module):
         form returned `int((~keep).sum())`, a per-forward GPU→CPU sync — one
         of exactly two places that blocked torch.compile(dynamic) in the
         arm-level probe (the other is the drain cadence itself, instrument.py).
+
+        `moe_capacity = 0` (dropless) keeps EVERY row: `keep` is all-True and
+        `dropped` is 0, so the ragged arms see the full assignment set. That is
+        what makes the drop set independent of the window's composition, and it
+        is the whole reason this mode exists (module docstring).
         """
         n, k = index.shape
         flat_ids = index.reshape(-1)
@@ -450,7 +492,10 @@ class SparseMoE(nn.Module):
         counts = torch.bincount(sorted_ids, minlength=self.n_experts)
         offsets = torch.cumsum(counts, 0) - counts
         pos = torch.arange(n * k, device=index.device) - offsets[sorted_ids]
-        keep = pos < self._capacity(n, k)
+        if self.capacity == 0:
+            keep = torch.ones_like(pos, dtype=torch.bool)
+        else:
+            keep = pos < self._capacity(n, k)
         dropped = (~keep).sum().view(())
         return order, keep, dropped
 
@@ -532,7 +577,23 @@ class SparseMoE(nn.Module):
         past capacity never enter the bank, and the ones that do are scattered
         back by the same `keep` mask, so this arm changes how the arithmetic is
         laid out, never which tokens get an expert.
+
+        `moe_capacity = 0` (dropless) is REFUSED here: this arm IS a
+        `[E, cap, ·]` bank and dropless has no cap to size it. A bank sized to
+        the largest expert would be an input-dependent arm (a new mechanism, not
+        a flag), and the rule's floor `k` would silently drop every row past it.
+        `_dispatch` routes the dropless mode to the ragged arm instead; this
+        guard is the seam for a direct call.
         """
+        if self.capacity == 0:
+            loud(
+                "the padded MoE arm with moe_capacity=0: this arm materializes a "
+                "[E, cap, ·] bank and dropless has no cap (the rule's floor would be "
+                "k, which drops every row past it — a silently wrong forward). "
+                "Escape: moe_capacity > 0 for the padded kernel, or the dropless "
+                "route, which is moe_kernel=naive (the ragged arms keep every "
+                "assignment)."
+            )
         n, k = index.shape
         e, cap = self.n_experts, self._capacity(n, k)
         dt = self._bank_dtype()
@@ -638,6 +699,15 @@ class SparseMoE(nn.Module):
         same ones; which one ran is on the counter, and a fallback carries the
         reason on the counter object (ADR-0019 — a degradation a reader of the
         log cannot see is a defect).
+
+        `moe_capacity = 0` (dropless) short-circuits to the RAGGED reference
+        loop: the permute keeps every assignment, the padded arm has no cap to
+        size its bank with (`_padded_dispatch` refuses), and the grouped GEMM's
+        row-block grid needs a bound the caller computes on the host — a sync is
+        banned in a step (ADR-0018 rule 2), and `cap = rows` is not a substitute
+        (the kernel does not early-exit, so the grid would run `E`-times the
+        masked GEMM work). COUNTED as `moe_dropless` + `moe_naive_dispatch`, plus
+        `moe_triton_fallback` when the config asked for the grouped GEMM.
         """
         order, keep, dropped = self._permute(index)
         # Count EVERY call: a python `if dropped:` on the device tensor is
@@ -645,6 +715,21 @@ class SparseMoE(nn.Module):
         # drop-parity test when the tensor stopped being an int). A zero add
         # costs nothing once the drain batches it.
         counters.count("moe_dropped_assignments", dropped)
+        if self.capacity == 0:
+            counters.count("moe_dropless")
+            why = (
+                "capacity=0: dropless - the padded bank has no cap and the grouped "
+                "GEMM's grid needs a host-computable row-block bound (a sync is banned "
+                "in a step, ADR-0018 rule 2), so the ragged reference loop runs"
+            )
+            if self.moe_kernel == "triton":
+                counters.count("moe_triton_fallback")
+                why = f"triton: {why}"
+            counters.why = why  # type: ignore[attr-defined]
+            counters.count("moe_naive_dispatch")
+            return self._expert_pass(
+                lambda: self._naive_dispatch(x, weight, index, order, keep, counters), counters
+            )
         notes = []
         if self.moe_kernel == "triton":
             why = (

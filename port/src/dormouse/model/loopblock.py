@@ -456,13 +456,15 @@ class LoopBlock(nn.Module):
             "a model change wearing a memory flag. Escape: use_msa=false, or "
             "segment_len=0."
         )
-        assert self.moe.topk == 0, (
-            "segment_len with moe_topk>0: the capacity-padded sparse dispatch drops "
-            "the rows past `ceil(moe_capacity · tokens · k / E)` per expert, so which "
-            "tokens get an expert depends on the OTHER tokens in the same forward - "
-            "cutting the window changes that set (measured 0.39 on the readout at "
-            "moe_capacity=1.0, 2026-10-17) and the forward stops being the one-shot "
-            "forward. Escape: moe_topk=0 (the dense blend), or segment_len=0."
+        assert self.moe.topk == 0 or self.moe.capacity == 0, (
+            "segment_len with moe_topk>0 at moe_capacity>0: the capacity-padded sparse "
+            "dispatch drops the rows past `ceil(moe_capacity · tokens · k / E)` per "
+            "expert, so which tokens get an expert depends on the OTHER tokens in the "
+            "same forward - cutting the window changes that set (measured 0.39 on the "
+            "readout at moe_capacity=1.0, 2026-10-17) and the forward stops being the "
+            "one-shot forward. Escape: moe_capacity=0 (DROPLESS: every assignment "
+            "reaches its expert and the routing is per position), moe_topk=0 (the "
+            "dense blend), or segment_len=0."
         )
         b, t, d = h0.shape
         assert t % segment_len == 0, f"segment_len={segment_len} does not divide {t}"

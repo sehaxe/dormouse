@@ -217,6 +217,17 @@ class ModelConfig:
     moe_topk: int = 0
     #: Tokens per expert in the capacity-bound permute:
     #: `ceil(capacity * tokens * topk / n_experts)`, never below `topk`.
+    #: **`0` = DROPLESS** (2026-10-17): every assignment reaches its expert, so
+    #: the ROUTING IS PER POSITION and does not depend on the window's
+    #: composition. The default and the presets' `2.0` keep the capacity rule —
+    #: do not change them here. The dropless mode is what makes `segment_len`
+    #: legal with `moe_topk > 0` (a capacity'd window changes WHICH tokens get an
+    #: expert when it is cut — `experts.py` module docstring, and
+    #: `config._validate_segment` refuses the pair), and it runs the ragged
+    #: reference arm COUNTED (`moe_dropless` + `moe_naive_dispatch`): the padded
+    #: bank has no cap to size itself with and the grouped GEMM's grid needs a
+    #: host-computable row-block bound a sync is banned from providing
+    #: (ADR-0018 rule 2).
     moe_capacity: float = 1.0
     #: Loss-Free Balancing step (arXiv:2408.15664): before the top-k decision
     #: the scores read `probs + b_e`, and after the forward `b_e` moves by
@@ -523,12 +534,13 @@ class TrainConfig:
     #: arm selects blocks INSIDE a window, so cutting the window would change the
     #: attention pattern itself), `rand_depth` (two unvalidated axes in one
     #: run: the depth arm is un-A/B'd, and attributing a result to either would
-    #: be a guess), and `moe_topk > 0` (the capacity-padded dispatch DROPS the
-    #: rows past its per-expert capacity, so which tokens get an expert is a
-    #: function of the other tokens in the same forward — measured 0.39 on the
-    #: tiny readout at `moe_capacity=1.0`, 2026-10-17; `small`'s dense blend is
-    #: exact). The last three are the finding this feature came with: each one
-    #: would have been a SILENT model change wearing a memory flag.
+    #: be a guess), and `moe_topk > 0` AT `moe_capacity > 0` (the capacity-padded
+    #: dispatch DROPS the rows past its per-expert capacity, so which tokens get
+    #: an expert is a function of the other tokens in the same forward — measured
+    #: 0.39 on the tiny readout at `moe_capacity=1.0`, 2026-10-17; `moe_capacity=0`
+    #: is the DROPLESS mode and IS allowed, `small`'s dense blend is exact). The
+    #: last three are the finding this feature came with: each one would have been
+    #: a SILENT model change wearing a memory flag.
     segment_len: int = 0
     stress: bool = _unsupported(False, "stress protocol (--stress)")
 
@@ -638,8 +650,14 @@ def validate(model: ModelConfig) -> None:
             f"moe_topk={model.moe_topk} > n_experts={model.n_experts}: a top-k "
             f"above the bank is refused, not clamped (clamping is the silent collapse)"
         )
-    if model.moe_capacity <= 0.0:
-        loud(f"moe_capacity={model.moe_capacity} must be > 0")
+    if model.moe_capacity < 0.0:
+        loud(
+            f"moe_capacity={model.moe_capacity} is negative: it is a multiple of the "
+            f"average expert load (`ceil(capacity·tokens·k/E)` rows per expert), and 0 "
+            f"is the DROPLESS mode (every assignment reaches its expert, the padded "
+            f"bank refuses, the ragged arm runs COUNTED). Escape: 0, or a positive "
+            f"capacity (2.0 is the presets')."
+        )
     if model.moe_kernel not in MOE_KERNELS:
         loud(
             f"moe_kernel={model.moe_kernel!r} is not an arm. Known: "
@@ -957,18 +975,21 @@ def _validate_segment(model: ModelConfig, tcfg: TrainConfig) -> None:
             f"would be attributable to neither. Escape: rand_depth=false, or "
             f"segment_len=0."
         )
-    if model.moe_topk > 0:
+    if model.moe_topk > 0 and model.moe_capacity > 0:
         loud(
-            f"segment_len={n} with moe_topk={model.moe_topk} (the sparse dispatch): the "
-            f"capacity-padded top-k DROPS the rows past `ceil(moe_capacity · tokens · "
-            f"k / E)` per expert, so WHICH tokens get an expert is a function of how "
-            f"many other tokens share their forward — cutting the window changes that "
-            f"set and the segmented forward stops being the one-shot forward "
-            f"(measured on the tiny shape at moe_capacity=1.0: 0.39 on the readout, "
-            f"2026-10-17; at moe_capacity=2.0 no drop happened on that shape, which is "
-            f"not a promise a collapsing router keeps). Escape: moe_topk=0, the dense "
-            f"blend `small` ships — there the experts blend per position and the "
-            f"segmented forward is the one-shot forward to fp32 round-off — or "
+            f"segment_len={n} with moe_topk={model.moe_topk} at moe_capacity="
+            f"{model.moe_capacity}: the capacity-padded top-k DROPS the rows past "
+            f"`ceil(moe_capacity · tokens · k / E)` per expert, so WHICH tokens get "
+            f"an expert is a function of how many other tokens share their forward — "
+            f"cutting the window changes that set and the segmented forward stops "
+            f"being the one-shot forward (measured on the tiny shape at "
+            f"moe_capacity=1.0: 0.39 on the readout, 2026-10-17; at 2.0 no drop "
+            f"happened on that shape, which is not a promise a collapsing router "
+            f"keeps). Escape: moe_capacity=0 — the DROPLESS mode, where every "
+            f"assignment reaches its expert and the routing is per position (it runs "
+            f"the ragged reference arm, COUNTED as `moe_dropless`; the padded bank "
+            f"has no cap and the grouped GEMM's grid needs a bound a step may not "
+            f"sync for) — or moe_topk=0 (the dense blend `small` ships), or "
             f"segment_len=0."
         )
 

@@ -30,9 +30,10 @@ import pytest
 import torch
 from conftest import SEQ, tiny_cfg, tiny_model, tiny_run
 
-from dormouse.config import load_run
+from dormouse.config import load_preset, load_run
 from dormouse.instrument import Counters, LoudError
 from dormouse.model import DormouseModel
+from dormouse.model.experts import SparseMoE
 from dormouse.model.kda import KDAAttention
 from dormouse.train import train
 
@@ -278,14 +279,186 @@ def test_the_trainer_passes_the_flag_and_counts_exactly_once(tmp_path):
     print(f"[longctx train] {logged[-1]}")
 
 
+# --------------------------------------------------- the dropless routing mode
+
+
+def _router_spy(monkeypatch) -> list[torch.Tensor]:
+    """Record every routed `index` the MoE dispatches, in call order.
+
+    The routing is read at `_dispatch` — the router's OWN output, not something
+    inferred from the logits — so the gate is about the selection, which is the
+    thing a capacity makes window-dependent.
+    """
+    seen: list[torch.Tensor] = []
+    real = SparseMoE._dispatch
+
+    def spy(self, x, weight, index, counters):
+        seen.append(index.detach().clone())
+        return real(self, x, weight, index, counters)
+
+    monkeypatch.setattr(SparseMoE, "_dispatch", spy)
+    return seen
+
+
+def _routes_per_iteration(seen: list[torch.Tensor], b: int, t: int, T: int, S: int):
+    """`[(i, [b, t, k])]` — the segmented calls arrive segment-major (`s·T + i`)."""
+    out = []
+    for i in range(T):
+        if S == 1:
+            out.append((i, seen[i].reshape(b, t, -1)))
+            continue
+        segs = [seen[s * T + i].reshape(b, t // S, -1) for s in range(S)]
+        out.append((i, torch.cat(segs, dim=1)))
+    return out
+
+
+def test_dropless_sparse_routing_is_identical_and_the_logits_match(byte_tensor, monkeypatch):
+    """`moe_topk=2` + `moe_capacity=0`: segmented == one-shot, ROUTING INCLUDED.
+
+    This is the gate the capacity could not pass. With a capacity the drop set is
+    a per-forward rank, so the same window cut in four routes different tokens to
+    different experts — a silent model change (0.39 on the readout). Dropless
+    makes the selection per position, so the segmented forward must route
+    EXACTLY the one-shot indices; that equality is asserted on the router's own
+    output, and the logits parity is the second half (the experts and their gates
+    agree too).
+    """
+    torch.manual_seed(0)
+    model = tiny_model(moe_topk=2, moe_capacity=0)
+    ids, targets = byte_tensor()
+    b, t = ids.shape
+    T, S = model.cfg.max_iter, t // SEG
+    seen = _router_spy(monkeypatch)
+    # `no_grad`: the checkpointed segments must not recompute into the spy.
+    with torch.no_grad():
+        ref_logits, _, ref_c = model(ids, targets)
+        ref = list(seen)
+        seen.clear()
+        logits, _, c = model(ids, targets, segment_len=SEG)
+        seg = list(seen)
+    monkeypatch.undo()
+    assert len(ref) == T and len(seg) == T * S, f"{len(ref)} / {len(seg)} dispatches"
+    d = float((logits - ref_logits).abs().max())
+    same = []
+    for (i, one), (_, many) in zip(
+        _routes_per_iteration(ref, b, t, T, 1), _routes_per_iteration(seg, b, t, T, S), strict=True
+    ):
+        same.append(bool(torch.equal(one, many)))
+        if not same[-1]:
+            bad = int((one != many).sum())
+            n = one.numel()
+            print(f"[longctx dropless] iteration {i}: {bad} of {n} routing entries differ")
+    dropped_seg = c.drain().get("moe_dropped_assignments", 0)
+    dropped_ref = ref_c.drain().get("moe_dropped_assignments", 0)
+    print(
+        f"[longctx dropless] max|dlogits|={d:.3e} routing identical per iteration={same} "
+        f"dropped={dropped_seg} dropless={c['moe_dropless']} naive={c['moe_naive_dispatch']}"
+    )
+    assert all(same), f"the routing must be identical: {same}"
+    assert d <= 1e-4, f"segmented logits differ by {d}"
+    # The mechanism's own evidence, not just the outcome: nothing was dropped in
+    # either run, and the ragged arm is the one that ran (COUNTED).
+    assert dropped_seg == 0 and dropped_ref == 0
+    assert c["moe_dropless"] == T * S and c["moe_naive_dispatch"] == T * S
+
+
+def test_dropless_keeps_every_assignment_and_the_capacity_control_drops():
+    """`_permute` at capacity 0 vs 0.25: the drop count is the mechanism.
+
+    The control half is what makes this gate able to fail — a capacity of 0.25
+    really does drop rows on this shape, so "dropless keeps everything" is a
+    statement about the new mode and not about the fixture.
+    """
+    torch.manual_seed(0)
+    index = torch.randint(0, 4, (8, 2))
+    dropless = SparseMoE(tiny_cfg(moe_topk=2, moe_capacity=0))
+    order, keep, dropped = dropless._permute(index)
+    capped = SparseMoE(tiny_cfg(moe_topk=2, moe_capacity=0.25))
+    _, keep2, dropped2 = capped._permute(index)
+    print(
+        f"[longctx dropless] rows={keep.numel()} keep={int(keep.sum())} dropped={int(dropped)}; "
+        f"control(cap 0.25) keep={int(keep2.sum())} dropped={int(dropped2)}"
+    )
+    assert keep.numel() == index.numel() and bool(keep.all()) and int(dropped) == 0
+    assert order.numel() == index.numel()
+    assert int(dropped2) > 0 and not bool(keep2.all()), "the control must really drop"
+
+
+def test_the_padded_arm_refuses_a_dropless_capacity():
+    """The bank has no cap to size itself with: LOUD, with the escape named."""
+    torch.manual_seed(0)
+    moe = SparseMoE(tiny_cfg(moe_topk=2, moe_capacity=0, moe_kernel="padded"))
+    index = torch.zeros(16, 2, dtype=torch.long)
+    order, keep, _ = moe._permute(index)
+    with pytest.raises(LoudError) as e:
+        moe._padded_dispatch(torch.randn(16, moe.d), torch.ones(16, 2), index, order, keep)
+    msg = str(e.value)
+    assert "moe_capacity=0" in msg and "Escape" in msg and "moe_kernel=naive" in msg
+
+
+def test_the_dropless_route_is_counted_not_silent(byte_tensor):
+    """`moe_kernel=triton` + dropless: the grouped GEMM is out, and the log says why.
+
+    The Triton kernel is ragged but its row-block GRID needs a bound the caller
+    computes on the host, and dropless has none — the read that would provide it
+    (`moe_kernels._cap_from_offs`) is the sync ADR-0018 rule 2 bans in a step. A
+    COUNTED fallback, never a silent one.
+    """
+    torch.manual_seed(0)
+    model = tiny_model(moe_topk=2, moe_capacity=0, moe_kernel="triton")
+    ids, targets = byte_tensor()
+    _, loss, c = model(ids, targets)
+    assert loss is not None and torch.isfinite(loss)
+    print(f"[longctx dropless] {c.line()} why={c.why}")
+    assert c["moe_dropless"] == model.cfg.max_iter
+    assert c["moe_naive_dispatch"] == model.cfg.max_iter
+    assert c["moe_triton_fallback"] == model.cfg.max_iter
+    assert "dropless" in c.why and "sync is banned" in c.why
+
+
+def test_dropless_makes_segment_len_legal_with_the_sparse_dispatch():
+    """The point of the mode: `b1`'s topk=2 at a long window is now legal.
+
+    Same run without the dropless override is still refused — the refusal is
+    about the capacity, not about the sparse dispatch.
+    """
+    run = load_run(
+        "b1",
+        model_overrides={"moe_capacity": 0},
+        train_overrides={"seq_len": 2048, "segment_len": 1024},
+    )
+    assert run.model.moe_topk == 2 and run.model.moe_capacity == 0
+    assert run.train.segment_len == 1024
+    msg = _refused("b1", seq_len=2048, segment_len=1024)
+    assert "moe_capacity=0" in msg and "DROPLESS" in msg
+
+
+def test_the_presets_capacity_defaults_are_untouched():
+    """`moe_capacity = 0` is opt-in: no preset and no dataclass default moved."""
+    from dormouse.config import ModelConfig
+
+    assert ModelConfig().moe_capacity == 1.0
+    assert load_preset("small").moe_capacity == 2.0
+    assert load_preset("b1").moe_capacity == 2.0
+    assert load_preset("medium").moe_capacity == 2.0
+    assert load_preset("small").moe_topk == 0 and load_preset("b1").moe_topk == 2
+
+
+def test_a_negative_capacity_is_refused_and_zero_is_legal():
+    """0 is a MODE, a negative is a typo — and the refusal says which."""
+    msg = _refused(seq_len=512, model_overrides={"moe_capacity": -1.0})
+    assert "moe_capacity=-1.0" in msg and "DROPLESS" in msg and "Escape" in msg
+    assert load_run("small", model_overrides={"moe_capacity": 0}).model.moe_capacity == 0
+
+
 # ----------------------------------------------------------------- (d) refusals
 
 
-def _refused(**over) -> str:
+def _refused(preset: str = "small", **over) -> str:
     """`load_run` with the overrides, returning the refusal's message."""
     model_over = over.pop("model_overrides", None)
     with pytest.raises(LoudError) as e:
-        load_run("small", train_overrides=over, model_overrides=model_over)
+        load_run(preset, train_overrides=over, model_overrides=model_over)
     return str(e.value)
 
 
