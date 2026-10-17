@@ -60,10 +60,14 @@ class Counters(dict):
         self._device: dict[str, torch.Tensor] = {}
 
     def count(self, name: str, n: int = 1) -> None:
-        if n == 0:
-            return
+        # THE ORDER IS LOAD-BEARING (audit 2026-10-17, CRITICAL 1): a device
+        # tensor must reach `count_device` BEFORE any comparison. `if n == 0`
+        # first builds a device bool and `if <bool tensor>` is a D2H read —
+        # every MoE forward syncs, and torch.compile's graphs break.
         if isinstance(n, torch.Tensor):
             self.count_device(name, n)
+            return
+        if n == 0:
             return
         assert isinstance(n, int) and n > 0, f"counter {name}: n must be > 0, got {n!r}"
         self[name] = self.get(name, 0) + n

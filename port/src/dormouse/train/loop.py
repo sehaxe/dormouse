@@ -149,6 +149,13 @@ def save_ckpt(
     weights, snapshot = ckpt_paths(run.train)
     weights.parent.mkdir(parents=True, exist_ok=True)
     sd = model.state_dict()
+    # A torch.compile'd model is an OptimizedModule whose keys carry a
+    # `_orig_mod.` prefix. Strip it on the way out (audit 2026-10-17,
+    # CRITICAL 2): every reader — load_ckpt, eval, decode, serve — loads into
+    # the UNWRAPPED model, so a prefixed checkpoint is unresumable and
+    # un-evaluable. The prefix is a wrapper artifact, never part of the file
+    # format.
+    sd = {k.removeprefix("_orig_mod."): v for k, v in sd.items()}
     rung = run.model.quant if run.model.quant != "none" else ""
     if rung and rung in ("fp8", "nvfp4", "ternary"):
         sd = {k: (pack_tsct(v, rung) if is_factor_key(k) else v) for k, v in sd.items()}
@@ -228,6 +235,11 @@ def load_ckpt(run: RunConfig) -> tuple[dict, RunConfig]:
             f"Escape: resolve the run with the stored values, or use a new ckpt_name."
         )
     ck = torch.load(weights, map_location="cpu", weights_only=False)
+    # Tolerate a file written by a torch.compile'd run BEFORE the strip landed
+    # (audit CRITICAL 2): the prefix is a wrapper artifact; a reader that
+    # refuses it would strand a legal checkpoint. New saves carry no prefix.
+    if isinstance(ck.get("model"), dict):
+        ck["model"] = {k.removeprefix("_orig_mod."): v for k, v in ck["model"].items()}
     # Storage rungs: the model half unpacks to fp32 masters (eval/decode/
     # resume all ride the same path). `quant` on the LOAD side is allowed to
     # differ from the save side — the file's rung is what describes the
