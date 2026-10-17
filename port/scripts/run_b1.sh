@@ -19,10 +19,15 @@
 #   it; the same form without it died on a 128 MB alloc (b1drop.log).
 # - --tf32 true: +16% at b1 (1399->1201 ms/step, profile 2026-10-16).
 # - engram_ram: 402M tables -> host RAM; VRAM frees ~1.5 GB (fits the form).
-# - torch_compile: warm2 completed at b8 s768 with the cache persisting in
-#   ~/.cache/torch; at b8 s512 the FIRST steps of this run pay a fresh compile
-#   (~20-40 min, once) — watch the log; if it dies in compile, relaunch with
-#   --set torch_compile=false (eager is the proven fallback).
+# - torch_compile=false, DECIDED by measurement (2026-10-17): the b8 s512
+#   compile spun at 99.8% CPU for 65 min with NO inductor-cache write for the
+#   last 28 (the dynamic=True graph of this model stalls inductor; the b8 s768
+#   warm did complete in ~28 min, so it is graph-shape-specific). Eager is the
+#   proven path (the VRAM ladder ran 3 steps in seconds). The compile question
+#   stays open with a probe plan: TORCHINDUCTOR_CACHE_DIR is now persistent,
+#   and `torch.compile(dynamic=False)` (never measured; shapes are FIXED in a
+#   run, so it is the better candidate) is the next probe — on a free card,
+#   never inside a production run.
 # - no --optim_8bit: bnb8bit measured +180 ms/step for crumbs of state at this
 #   shape (a VRAM lever, not speed); the ladder forms fit without it.
 # - factor_qat stays "none": the compression tournament closed the arm for
@@ -37,6 +42,7 @@ NAME="b1first"
 
 cd "$(dirname "$0")/.."
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export TORCHINDUCTOR_CACHE_DIR=/home/sehaxe/.cache/torchinductor  # NOT /tmp: tmpfs dies on reboot (AGENTS 2.4.5)
 systemd-run --user --scope -p MemoryMax=40G -- \
   uv run --extra gpu dormouse train b1 \
   --data /home/sehaxe/dormouse/data_local/corpus_bin_filtered.bin \
@@ -51,7 +57,7 @@ systemd-run --user --scope -p MemoryMax=40G -- \
   --set eval_batches=8 \
   --set lr=3e-4 \
   --set tf32=true \
-  --set torch_compile=true \
+  --set torch_compile=false \
   --set engram_ram=true \
   --set ckpt_every=5000 \
   --set out_dir=checkpoints/b1run \
