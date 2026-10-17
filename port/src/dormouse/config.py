@@ -11,12 +11,6 @@ Three rules, all of them the burn side's, and all of them load-time:
    that reaches no code is a config that lies about what it runs.
 2. **A missing key takes the class default.** Every field has one, so a sparse
    preset is legal — the defaults are the schema, not a second file.
-3. **A key whose mechanism is not ported refuses when set NON-DEFAULT.** The
-   field carries `supported = False` in its metadata and its off/default value;
-   a preset that turns it on is refused with the mechanism named. This is the
-   port's honest answer to the burn schema's 40-odd arms: the day-one skeleton
-   ships the three mechanisms nothing in the ecosystem provides plus the
-   instrument layer, and everything else is a dependency that has not landed.
 
 `RunConfig` is the snapshot: the resolved model + train config plus provenance,
 written next to a checkpoint as `<ckpt_name>.config.toml`. A resume refuses a
@@ -36,9 +30,6 @@ from .instrument import LoudError, loud
 
 #: `port/configs/`, reached from this file (`port/src/dormouse/config.py`).
 PRESET_DIR = Path(__file__).resolve().parents[2] / "configs"
-
-#: Metadata key marking a field whose mechanism is not ported yet.
-UNSUPPORTED = "unsupported_mechanism"
 
 #: Train keys a resume is allowed to change: they decide WHEN we look, never
 #: what the model computes. The burn list (cfg.rs `PROGRESS_KEYS`) plus
@@ -147,20 +138,14 @@ OPT_DTYPES = ("fp32", "bf16")
 MUON_VARIANTS = ("muon", "normuon")
 
 
-def _unsupported(default: Any, mechanism: str) -> Any:
-    """A field whose mechanism has not been ported: refuses when non-default."""
-    return field(default=default, metadata={UNSUPPORTED: mechanism})
-
-
 @dataclass
 class ModelConfig:
     """The model half of a preset — flat, every key a field, defaults == small.
 
-    Keys that exist on the burn side whose mechanism is NOT in this port carry
-    `_unsupported(...)`: they load at their default and refuse loudly when a
-    preset sets them. The refusal is the ADR-0019 answer to a config field with
-    no code behind it — the burn history's `use_mhc` reached a trainer that
-    never read it, and no test could see that.
+    A key the burn side has and this port does not is NOT a field: setting it is
+    an unknown key, refused loudly with the key named and the escape. A field
+    that reaches no code is the defect that refusal exists to prevent (the burn
+    history's `use_mhc` reached a trainer that never read it).
     """
 
     # --- geometry -------------------------------------------------------
@@ -193,7 +178,7 @@ class ModelConfig:
     #: LOOM (`2610.01153`, 2026-10-01; scanned in
     #: `docs/research/2026-10-16-new-tech-scan.md` §2.1, whose row names our
     #: own `max_iter 4` / operating depth 2 as exactly the regime that paper
-    #: measures as stuck at two loops). A REAL arm, not an `_unsupported` stub:
+    #: measures as stuck at two loops). A REAL arm, not a stub:
     #: `LoopBlock` applies one learned per-iteration gate to the RMS-normalized
     #: write — per-loop router conditioning (the `T` passes of a weight-shared
     #: body are otherwise indistinguishable) plus the variance control the
@@ -204,14 +189,10 @@ class ModelConfig:
     #: recipe (bounded residual updates, input re-injection) may differ, so
     #: re-derive before any multi-loop default.
     loom: bool = False
-    use_gr: bool = _unsupported(False, "Gated Residual (GR)")
-    use_mhc: bool = _unsupported(False, "Manifold-Constrained Hyper-Connections")
-    use_mor: bool = _unsupported(False, "Mixture-of-Recursions router")
-    use_situ: bool = _unsupported(False, "SiTU-GLU expert activation")
     use_byteflow: bool = False
 
     # --- ByteFlow (arXiv 2603.03583): the byte-compression architecture -----
-    # A REAL arm, not an `_unsupported` stub: `byteflow.py` ports the crate's
+    # A REAL arm, not a stub: `byteflow.py` ports the crate's
     # five stages and `DormouseModel` wires them (see that module's docstring
     # for the Option A/B/C design decision). Every default below is
     # `ByteFlowConfig::default()` from `vendor/dormouse-fused/crates/
@@ -332,13 +313,13 @@ class ModelConfig:
 
     # --- aux objectives -------------------------------------------------
     #: The FUTURE-BYTE head (arXiv 2404.19737, `model/fb.py`): a REAL arm, not
-    #: an `_unsupported` stub. It is the pre-registered competitor to JEPA
+    #: a stub. It is the pre-registered competitor to JEPA
     #: (AB-PROTOCOL row 1b) — a dense untied `d_model -> vocab` readout over the
     #: state `lm_head` already reads, one plain CE on the label rolled by -1,
     #: 196 864 params at `small` (2.14%), no extra forward. 0.0 = off, and the
     #: default is off: a preset nobody edited must not carry an untrained head.
-    #: `validate` refuses it together with `jepa_weight`/`dspark_weight` — the
-    #: A/B attributes its verdict to ONE signal per run.
+    #: `validate` refuses it together with `dspark_weight` — the A/B attributes
+    #: its verdict to ONE signal per run.
     aux_fb_weight: float = 0.0
     #: ---- the DSpark draft head (2607.05147; port wiring 2026-10-16) ----
     #: The DSpark term adds next-K-byte draft supervision + the acceptance
@@ -371,7 +352,6 @@ class ModelConfig:
     msa_block: int = 4
     msa_capacity_ratio: float = 0.25
     adaptive_msa: bool = False
-    jepa_weight: float = _unsupported(0.0, "JEPA + KoLeo aux heads")
     #: BitNet a4.8 ACTIVATION quantization (`ACT_QUANTS`, formulas in
     #: `model/act_quant.py`, transcribed from `crates/dormouse-core/src/act_quant.rs`):
     #: the activations that feed the factor matmuls are fake-quantized with an STE
@@ -685,7 +665,6 @@ class TrainConfig:
     #: last three are the finding this feature came with: each one would have been
     #: a SILENT model change wearing a memory flag.
     segment_len: int = 0
-    stress: bool = _unsupported(False, "stress protocol (--stress)")
 
 
 @dataclass
@@ -739,21 +718,6 @@ class RunConfig:
 # --------------------------------------------------------------------------
 
 
-def _refuse_unsupported(cls: type, table: dict[str, Any], where: str) -> None:
-    """A field whose mechanism is missing refuses when it is set NON-DEFAULT."""
-    fields = {f.name: f for f in dataclasses.fields(cls)}
-    for name, value in table.items():
-        mechanism = fields[name].metadata.get(UNSUPPORTED)
-        if mechanism is not None and value != fields[name].default:
-            loud(
-                f"{where}.{name}={value!r} is not supported by this port: the "
-                f"{mechanism} mechanism is not ported yet "
-                f"(docs/decisions/2026-10-15-1b-readiness-plan.md §7 ships the "
-                f"minimum the ecosystem lacks: TSCT, Engram, the byte stream). "
-                f"Escape: remove the key or port the mechanism."
-            )
-
-
 def _known(cls: type, table: dict[str, Any], where: str) -> dict[str, Any]:
     """Strict key check: a table is a config only if every key is a field."""
     fields = {f.name: f for f in dataclasses.fields(cls)}
@@ -764,7 +728,6 @@ def _known(cls: type, table: dict[str, Any], where: str) -> dict[str, Any]:
             f"{len(fields)}. Escape: remove the key, or port the mechanism it "
             f"was meant to drive and add the field to {cls.__name__}."
         )
-    _refuse_unsupported(cls, table, where)
     return dict(table)
 
 
@@ -925,14 +888,13 @@ def validate(model: ModelConfig) -> None:
             f"(off) or a positive weight (the research doc's grid: 0.005, 0.05, "
             f"0.1 — docs/research/2026-10-16-jepa-into-dormouse.md §3)."
         )
-    if model.aux_fb_weight > 0.0 and (model.jepa_weight > 0.0 or model.dspark_weight > 0.0):
-        which = "jepa_weight" if model.jepa_weight > 0.0 else "dspark_weight"
+    if model.aux_fb_weight > 0.0 and model.dspark_weight > 0.0:
         loud(
-            f"aux_fb_weight={model.aux_fb_weight} with {which}>0: the two aux "
+            f"aux_fb_weight={model.aux_fb_weight} with dspark_weight>0: the two aux "
             f"signals cannot share a run. The A/B (AB-PROTOCOL row 1b) puts the "
             f"future-byte head against pure CE so its verdict is attributed to "
             f"ONE signal; a run carrying both moves two things at once and "
-            f"attributes the result to neither. Escape: set {which} = 0.0, or "
+            f"attributes the result to neither. Escape: set dspark_weight = 0.0, or "
             f"aux_fb_weight = 0.0."
         )
 
@@ -1184,9 +1146,9 @@ def load_run(
 ) -> RunConfig:
     """Resolve a run: preset (name or path) + both config halves + loud overrides.
 
-    Model overrides get the same two refusals the preset file itself gets
-    (`_refuse_unsupported` for a missing mechanism, `validate` for a
-    self-inconsistent set), because an override that bypasses them is the
+    Model overrides get the same refusals the preset file itself gets
+    (`validate` for a self-inconsistent set, and the unknown-key check the
+    preset layer runs), because an override that bypasses them is the
     silent-collapse shape the preset layer exists to prevent.
     """
     model = load_preset(preset)
@@ -1199,7 +1161,6 @@ def load_run(
                 f"unknown train key(s) {sorted(unknown)}. Escape: remove the "
                 f"key, or add the field to TrainConfig and wire it."
             )
-        _refuse_unsupported(TrainConfig, train_overrides, "train")
         tcfg = dataclasses.replace(tcfg, **train_overrides)
     if tcfg.opt not in ("mix", "adamw"):
         loud(f"opt={tcfg.opt!r}: known optimizers are 'mix' (default) and 'adamw'")
@@ -1257,7 +1218,6 @@ def load_run(
             f"AdamW is the named follow-up, not this arm.)"
         )
     if model_overrides:
-        _refuse_unsupported(ModelConfig, model_overrides, "model")
         import dataclasses as _dc
 
         model = _dc.replace(model, **model_overrides)

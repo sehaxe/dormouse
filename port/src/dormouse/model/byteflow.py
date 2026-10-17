@@ -657,14 +657,7 @@ def compat_armed(cfg: ModelConfig) -> bool:
     must not start running because a byteflow flag moved.
     """
     return cfg.use_byteflow and (
-        cfg.use_kda
-        or cfg.use_engram
-        or cfg.use_mor
-        or cfg.use_gr
-        or cfg.use_attnres
-        or cfg.use_mhc
-        or cfg.use_situ
-        or cfg.moe_topk > 0
+        cfg.use_kda or cfg.use_engram or cfg.use_attnres or cfg.moe_topk > 0
     )
 
 

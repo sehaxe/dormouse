@@ -19,7 +19,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from .config import PROGRESS_KEYS, UNSUPPORTED, ModelConfig, RunConfig, TrainConfig, load_run
+from .config import PROGRESS_KEYS, ModelConfig, RunConfig, TrainConfig, load_run
 from .instrument import LoudError, loud
 from .model import DormouseModel, param_count
 from .model.decode import decode_bytes, encode
@@ -137,17 +137,8 @@ def _train_table(run) -> Table:
     t = Table(title="train", title_style="bold", show_header=False)
     for f in dataclasses.fields(TrainConfig):
         v = getattr(run.train, f.name)
-        if f.metadata.get(UNSUPPORTED) and v != f.default:
-            loud(
-                f"resolved run carries {f.name}={v!r}: an unported mechanism "
-                f"cannot sit inside a resolved run"
-            )
         default = v == f.default
-        t.add_row(
-            f.name + (" (not ported)" if f.metadata.get(UNSUPPORTED) else ""),
-            repr(v),
-            style="dim" if default else None,
-        )
+        t.add_row(f.name, repr(v), style="dim" if default else None)
     return t
 
 

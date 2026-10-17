@@ -210,8 +210,7 @@ class DormouseModel(nn.Module):
         # refusal is held here, at the runtime seam (ADR-0019's "a term with
         # nothing to act on").
         assert (
-            self.cfg.jepa_weight == 0.0
-            and self.cfg.dspark_weight == 0.0
+            self.cfg.dspark_weight == 0.0
             and self.cfg.aux_fb_weight == 0.0
             and self.cfg.sigreg_weight == 0.0
         ), (

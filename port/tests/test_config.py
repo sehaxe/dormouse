@@ -38,32 +38,12 @@ def test_unknown_key_refuses_and_names_the_escape():
     # A typo in a real key is the same class, and it must not silently default.
     with pytest.raises(LoudError):
         parse_preset("d_models = 64\n")
-
-
-@pytest.mark.parametrize(
-    ("key", "value", "mechanism"),
-    [
-        ("use_gr", "true", "Gated Residual"),
-        ("use_mhc", "true", "Hyper-Connections"),
-        ("use_mor", "true", "Mixture-of-Recursions"),
-        ("use_situ", "true", "SiTU-GLU"),
-        ("jepa_weight", "0.05", "JEPA"),
-    ],
-)
-def test_missing_mechanisms_refuse_when_non_default(key, value, mechanism):
-    """(a) A key whose mechanism is missing REFUSES when set non-default.
-
-    `use_byteflow` used to be in this list; it left it the day the port landed
-    the crate's five stages (`byteflow.py`), and its own coherence rules are
-    pinned in `test_byteflow_*` below. `aux_fb_weight` left it the same way
-    when the future-byte head landed (`model/fb.py`, `tests/test_fb.py`), and
-    `act_quant` left it with `model/act_quant.py` (`tests/test_act_quant.py`).
-    """
+    # A deleted stub field is refused the same way — the pin that `use_gr`,
+    # `use_mhc`, `use_mor`, `use_situ`, `jepa_weight` and `stress` are GONE and
+    # not merely unwired (a re-added field would accept the key again).
     with pytest.raises(LoudError) as e:
-        parse_preset(f"d_model = 64\nn_heads = 4\nhead_dim = 16\n{key} = {value}\n")
-    msg = str(e.value)
-    assert key in msg and mechanism in msg
-    assert "not ported" in msg and "remove the key or port the mechanism" in msg
+        parse_preset("d_model = 64\nn_heads = 4\nhead_dim = 16\nuse_gr = true\n")
+    assert "use_gr" in str(e.value)
 
 
 def _byteflow_preset(**over) -> str:

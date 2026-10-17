@@ -171,22 +171,20 @@ def test_the_aux_signals_cannot_coexist_and_the_weight_cannot_be_negative():
     """(c) LOUD: two aux signals in one run, and a negative weight.
 
     The A/B attributes its verdict to ONE signal (research §4.1: "the A/B has
-    one signal per run"), so `aux_fb_weight` with JEPA or DSpark on is refused
-    at `validate` — the seam a hand-built config also passes through.
+    one signal per run"), so `aux_fb_weight` with DSpark on is refused at
+    `validate` — the seam a hand-built config also passes through.
     """
-    with pytest.raises(LoudError, match="jepa_weight"):
-        validate(ModelConfig(aux_fb_weight=0.05, jepa_weight=0.05))
     with pytest.raises(LoudError, match="dspark_weight"):
         validate(ModelConfig(aux_fb_weight=0.05, dspark_weight=0.1))
     with pytest.raises(LoudError, match="cannot share a run"):
-        validate(ModelConfig(aux_fb_weight=0.1, jepa_weight=0.05))
+        validate(ModelConfig(aux_fb_weight=0.1, dspark_weight=0.05))
     with pytest.raises(LoudError, match="negative"):
         validate(ModelConfig(aux_fb_weight=-0.1))
-    # The ported signal is a REAL field now: it loads (it left `_unsupported`),
-    # and each unported one still refuses at its own key.
+    # The ported signal is a REAL field: it loads, and the JEPA key the port
+    # never carried is refused as unknown rather than silently dropped.
     cfg = parse_preset("d_model = 64\nn_heads = 4\nhead_dim = 16\naux_fb_weight = 0.1\n")
     assert cfg.aux_fb_weight == 0.1
-    with pytest.raises(LoudError, match="not ported"):
+    with pytest.raises(LoudError, match="unknown key"):
         parse_preset("d_model = 64\nn_heads = 4\nhead_dim = 16\njepa_weight = 0.05\n")
 
 

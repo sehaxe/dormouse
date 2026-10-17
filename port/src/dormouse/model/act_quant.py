@@ -1,7 +1,7 @@
 r"""BitNet a4.8 ACTIVATION quantization — the FFN side of the quant track.
 
 RECOVERY, not new design: the burn tree had `crates/dormouse-core/src/act_quant.rs`
-and the torch port suppressed it as an `_unsupported` config stub. Every
+and the torch port suppressed it as an unsupported config stub. Every
 formula below is transcribed from that file, named line by line.
 
 | what | burn source | paper |

@@ -325,7 +325,7 @@ def test_byteflow_standalone_is_the_net_and_nothing_else():
 def test_byteflow_channel_refuses_aux_weights_at_the_runtime_seam(byte_tensor):
     """`validate` refuses the aux weights with `use_byteflow`; a hand-built
     config bypasses it, so the forward holds the same line (ADR-0019)."""
-    model = DormouseModel(_bf_cfg(jepa_weight=0.1))
+    model = DormouseModel(_bf_cfg(dspark_weight=0.1))
     ids, targets = byte_tensor()
     with pytest.raises(AssertionError, match="aux"):
         model(ids, targets)

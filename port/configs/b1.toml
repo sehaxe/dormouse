@@ -64,11 +64,7 @@ engram_orders = [2, 3, 4]
 engram_dim = 32
 engram_lam_max = 0.5
 
-# Keys whose mechanisms are NOT ported — off, and a non-default value refuses.
-use_gr = false
-use_mhc = false
-use_mor = false
-use_situ = false
+# The ByteFlow arm (Option A/B): OFF — the loop stack is the model.
 use_byteflow = false
 # Load-Free Balancing step (arXiv:2408.15664): bias, not an aux loss.
 # 0.0 = off; 1e-2 is the paper's example scale at our router (tune with WSD).
@@ -77,7 +73,6 @@ use_byteflow = false
 # variant — bang-bang oscillation, drops WORSE — and biases-on-probs
 # flooding hot experts; logit-space bias with the integrator is what works).
 moe_lb_coef = 0.01
-jepa_weight = 0.0
 dspark_weight = 0.0
 aux_fb_weight = 0.0
 act_group = 0
