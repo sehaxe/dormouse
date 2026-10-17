@@ -4,8 +4,12 @@
 #
 #   bash port/scripts/run_b1.sh [steps] [batch] [seq_len]
 #
-# Defaults: 20000 steps b8 s768 (~2.3B bytes) — the first-run budget, chosen
-# so WSD's stable phase can be cut short without waste.
+# Defaults: 20000 steps b8 s768 = 122.9 MB of bytes (~3.3 h eager at 10.5k
+# tok/s) — a FIRST-LIGHT budget: long enough to see the curve and the health
+# counters, short enough to stop cheaply. The real budget is chosen after it:
+# 1B bytes ~= 27 h eager / ~13.5 h compiled; 10B bytes ~= 11 d eager / 5.5 d
+# compiled. WSD's stable phase means the run can be extended from any
+# checkpoint, so the first launch should be the CHEAP one.
 #
 # Evidence for the flags (all in .bulba/memory.md + docs/reviews/):
 # - --tf32 true: +16% at b1 (1399->1201 ms/step, profile 2026-10-16).
@@ -18,6 +22,14 @@
 #   TRAINING at 9.2M (+0.040 BPB annealed); QAT belongs to the post-base
 #   finetune, not the base run.
 # - MemoryMax=40G: AGENTS 1.5 — every launch goes under the cgroup.
+# - Form: b8 s768 measured at 13.5 GiB with tf32 (profile 2026-10-16) — the
+#   SAFE form under a live desktop; b8 s1024 was UNSTABLE (CLI OOM at ~step 16)
+#   and b16 s512 needs the desktop closed. One form per run, never mixed: the
+#   eval window is batch*seq_len bytes (AGENTS 2.6).
+# - torch_compile: keep TRUE only once the warmup has actually completed on
+#   this box (the first compile is 20-45 min of CPU; the cache in ~/.cache/torch
+#   survives). If the compile is not warm, set it false — an unwarmed compile
+#   spends the whole first run compiling.
 set -euo pipefail
 STEPS="${1:-20000}"
 BATCH="${2:-8}"
