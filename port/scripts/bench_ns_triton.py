@@ -41,7 +41,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tests"))
 
-from test_muon_gram import gauss  # noqa: E402
+from conftest import gauss  # noqa: E402
 from test_ns_triton import B1_SHAPES, _fake_kernel  # noqa: E402
 
 from dormouse.instrument import Counters  # noqa: E402

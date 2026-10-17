@@ -95,12 +95,7 @@ ACT_QUANTS = ("none", "int8", "int4", "fp4", "mxfp8", "v2_int4", "v2_int8")
 #: (`optim.NS_KINDS`, which is where they are executed; the list is duplicated
 #: here the way `MOE_KERNELS` is, so the config layer does not import the
 #: trainer). `classic` = the per-iteration `X @ X.T` recurrence: the default,
-#: and every number on record. `gram` = Gram Newton–Schulz (arXiv 2608.11612
-#: §4 + `github.com/Dao-AILab/gram-newton-schulz`): the SAME polynomial
-#: iterated on the `[r, r]` Gram and applied once at the end, so the two
-#: rectangular matmuls per iteration collapse to four `[r, r]` ones. Equivalent
-#: to `classic` up to fp32 round-off order (`tests/test_muon_gram.py`), which
-#: is why the arm needs no training A/B. `triton` = the SAME chain FUSED into
+#: and every number on record. `triton` = the SAME chain FUSED into
 #: ONE kernel launch (`optim/ns_kernels.py`): the whole Jordan chain runs inside
 #: one program per slice with the `[r, r]` Gram in registers, against ~52 aten
 #: dispatches for a `[2048, 64]` factor (measured, `scripts/bench_ns_triton.py`).
@@ -109,7 +104,7 @@ ACT_QUANTS = ("none", "int8", "int4", "fp4", "mxfp8", "v2_int4", "v2_int8")
 #: when it could not (rank > 64, no triton, not CUDA, non-contiguous, or
 #: `ns_dtype="bf16"`, which it subsumes rather than composes with). A name that
 #: is not here is LOUD.
-NS_KINDS = ("classic", "gram", "triton")
+NS_KINDS = ("classic", "triton")
 #: The `muon_colrow_3d` literals — the arms of `colrow_normalize`'s 3-D branch
 #: (`optim.COLROW_3D`, which is where they execute; the list is duplicated here
 #: the way `NS_KINDS` is, so the config layer does not import the trainer).
@@ -472,15 +467,6 @@ class TrainConfig:
     #: The Newton–Schulz arm the Muon group runs (`NS_KINDS` above,
     #: `optim.zeropower_via_ns(kind=...)`). `classic` = the per-iteration
     #: `X @ X.T` recurrence: the default, byte-identical to this port's history.
-    #: `gram` = **Gram Newton–Schulz** (arXiv:2608.11612 §4, transcribed from
-    #: `Dao-AILab/gram-newton-schulz` on 2026-10-16): the SAME polynomial
-    #: iterated on the `[r, r]` Gram instead of on `X`, so the two rectangular
-    #: matmuls per iteration (the `[64, 64]` Gram of a `[64, 5461]` factor and
-    #: the `P @ X` product) are replaced by four `[r, r]` ones and exactly two
-    #: rectangular matmuls in total. Mathematically the same polynomial,
-    #: regrouped — the equivalence gate in `tests/test_muon_gram.py` is what
-    #: licenses the swap without a training A/B
-    #: (`docs/research/2026-10-16-muon-orthogonalization-cost.md` row 1).
     #: Forwarded by the trainer: `train/loop.py` builds
     #: `MixOptimizer(..., ns_kind=cfg.ns_kind)` (the same call site now also
     #: forwards `muon_colrow_3d`), so this field is what the run executes — not
@@ -1221,12 +1207,10 @@ def load_run(
         loud(
             f"ns_kind={tcfg.ns_kind!r} is not an arm. Known: {list(NS_KINDS)} — "
             f"`classic` forms `X @ X.T` at every Newton–Schulz iteration (the "
-            f"default), `gram` is Gram Newton–Schulz (arXiv 2608.11612 §4 + "
-            f"github.com/Dao-AILab/gram-newton-schulz): the same polynomial "
-            f"iterated in the `[r, r]` Gram space, `triton` is the same chain "
-            f"fused into ONE kernel launch (`ns_kernels.py`, COUNTED fallback to "
-            f"`classic`). Escape: name one of those, or land the arm in "
-            f"`optim.NS_KINDS` and its gate BEFORE the config can lie about it."
+            f"default), `triton` is the same chain fused into ONE kernel launch "
+            f"(`ns_kernels.py`, COUNTED fallback to `classic`). Escape: name one "
+            f"of those, or land the arm in `optim.NS_KINDS` and its gate BEFORE "
+            f"the config can lie about it."
         )
     if tcfg.muon_colrow_3d not in MUON_COLROW_3D:
         loud(

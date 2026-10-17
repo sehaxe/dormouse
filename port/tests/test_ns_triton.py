@@ -1,12 +1,12 @@
 """The fused Triton Newton–Schulz arm (`train/ns_kernels.py`, `ns_kind="triton"`).
 
 The claim this arm rests on is **speed at equal quality**, not equivalence, so the
-gates are different from `test_muon_gram.py`'s:
+gates are:
 
 1. **the recursion is the classic polynomial** — a faithful fp64 transcription of
    the kernel's own three phases (prescale → `R = X Xᵀ` → `X ← aX + P(R)X`, in the
-   logical `[r, d]` orientation) against `fp64_classic` (imported from
-   `test_muon_gram`, one transcription of the classic chain, not two), at ≤1e-9.
+   logical `[r, d]` orientation) against `fp64_classic` (shared from
+   `conftest.py`, one transcription of the classic chain, not two), at ≤1e-9.
    No fp32 in the way, so this is the tier the 1e-9 belongs to.
 2. **fp32 parity at the b1 shapes** (GPU): the kernel vs the classic chain at
    rel ≤ 1e-5, the research note's Stage-0 gate
@@ -34,9 +34,9 @@ gates are different from `test_muon_gram.py`'s:
 cannot hold for this kernel and the split above is why. The kernel is fp32 by
 construction (`ns_kernels.zeropower_triton`: "fp32 in / fp32 out"), ~50 sequential
 roundings at `u = 2^-24 = 5.96e-8`, and the Jordan quintic amplifies by up to
-`a = 3.4445` per step — the same arithmetic `test_muon_gram.py` prices in its
-tolerance paragraph (worst case ~1.4e-3, observed 1.4e-6 at the b1 shapes). So
-tier 1 carries the 1e-9 and tier 3 carries the honest fp32 envelope against fp64.
+`a = 3.4445` per step — the honest fp32 envelope is ~1.4e-3 (observed 1.4e-6 at
+the b1 shapes). So tier 1 carries the 1e-9 and tier 3 carries that envelope
+against fp64.
 
 The GPU tiers are `skipif`'d on `torch.cuda.is_available()`; the CPU tiers are
 NOT (a gate that is skipped everywhere it could fire is the defect ADR-0019
@@ -51,7 +51,7 @@ import subprocess
 
 import pytest
 import torch
-from test_muon_gram import fp64_classic, gauss, ramp, rel
+from conftest import fp64_classic, gauss, ramp, rel
 from torch import nn
 
 from dormouse.instrument import Counters, LoudError
@@ -566,9 +566,9 @@ def test_a_shape_that_cannot_fit_falls_back_counted(monkeypatch):
 def _dispatches(fn) -> tuple[int, int]:
     """(matmul dispatches, all dispatches) for one call — the classic side's cost.
 
-    A `TorchDispatchMode` rather than `torch.profiler` (the idiom
-    `test_muon_gram.py::_matmul_launches` uses): the same count of the ops this
-    code issues, without kineto's USDT chatter, and it works on CPU.
+    A `TorchDispatchMode` rather than `torch.profiler` (the idiom used
+    elsewhere in this port): the same count of the ops this code issues, without
+    kineto's USDT chatter, and it works on CPU.
     """
 
     counted: list[str] = []

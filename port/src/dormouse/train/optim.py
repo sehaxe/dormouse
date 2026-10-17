@@ -20,11 +20,8 @@ The update is `burn-muon-plus`'s, not a re-derivation:
   retraction uses. Two different quantities with two correct citations
   (AGENTS §3.7).
 * Two Newton-Schulz **arms**, `NS_KINDS`: `classic` (the recurrence above, the
-  default) and `gram` — Gram Newton-Schulz, the SAME polynomial iterated on the
-  `[r, r]` Gram matrix instead of on `X`, which removes the two rectangular
-  matmuls per iteration (arXiv:2608.11612 §4 + `Dao-AILab/gram-newton-schulz`,
-  transcribed in `_gram_via_ns`). Equivalent to `classic` up to fp32 round-off
-  order, and gated as such in `tests/test_muon_gram.py`.
+  default) and `triton` — the SAME chain fused into ONE kernel launch
+  (`train/ns_kernels.py`), the only arm whose mechanism is a dispatch count.
 * `M_t = μ·M_{t-1} + (1-μ)·G_t` with **no Nesterov lerp** (the paper's Eq. 4;
   the crate's manifest was the defect, not the code).
 * `O_t = Norm_d(Ortho(M_t))` with ColRow normalisation, and the step
@@ -92,7 +89,7 @@ JORDAN_NS_COEFFS = (3.4445, -4.7750, 2.0315)
 #: arm whose mechanism is *fewer launches* on a launch-bound step
 #: (`docs/research/2026-10-17-muon-variants.md` §2 #1). It is COUNTED and falls
 #: back to `classic` with its reason when it cannot serve a call.
-NS_KINDS = ("classic", "gram", "triton")
+NS_KINDS = ("classic", "triton")
 
 #: The 3-D `colrow_normalize` arms (`config.MUON_COLROW_3D` mirrors this list):
 #: `frobenius` is the per-slice Frobenius normalisation the batched Muon step ran
@@ -148,20 +145,6 @@ NOR_ETA_SCALE = 0.2
 #: `betas=(0.9, 0.95)` in the reference, so `β1 = betas[0] = 0.9` (Appendix F:23).
 SF_BETA1 = 0.9
 
-#: Where Gram-NS restarts: 0-based iteration indices, exactly the reference's
-#: `gram_newton_schulz_reset_iterations` default (`[2]`, i.e. a restart before
-#: the third step) — "for 5 steps of Newton-Schulz, we recommend num-restarts =
-#: 1 for maximum speed while maintaining numerical stability". Source: the
-#: pinned upstream README,
-#: `vendor/dormouse-fused/crates/burn-spectral/tests/oracle/upstream/
-#: gram_newton_schulz_README.md` (tag v0.1.6 = `e45d0aca7083cb275c9a303220c05c4
-#: abecd9187`, sha256 `c8701727…bf99f`, both recorded in
-#: `docs/papers/spectral-reference.md`). A restart cannot move the math: it
-#: materializes `Q X` and rebuilds the Gram from it, which is exactly what the
-#: classic arm does at every step — but it does change the fp32 error, and
-#: leaving it out costs accuracy (`tests/test_muon_gram.py`).
-GRAM_NS_RESTARTS = (2,)
-
 #: The batched Muon step's chunk cap, in fp32 ELEMENTS per stacked buffer
 #: (`1 << 25` = 33.5M elements = 134 MiB): `[1024, 64, 5461]` fp32 batched NS
 #: needs ~1.33 GiB per intermediate and the 5-iteration chain keeps ~4 GiB
@@ -179,11 +162,9 @@ def _check_ns_kind(kind: str) -> None:
         loud(
             f"ns_kind={kind!r} is not an arm. Known: {list(NS_KINDS)} — `classic` "
             f"forms `X @ X.T` at every iteration (the default, byte-identical to "
-            f"this port's history), `gram` is Gram Newton–Schulz (arXiv 2608.11612 "
-            f"§4): the same polynomial iterated in the `[r, r]` Gram space, "
-            f"`triton` is the same chain FUSED into one kernel launch "
-            f"(`train/ns_kernels.py`, COUNTED fallback to `classic`). Escape: "
-            f"name one of those, or land the arm in `optim.NS_KINDS` first."
+            f"this port's history), `triton` is the same chain FUSED into one "
+            f"kernel launch (`train/ns_kernels.py`, COUNTED fallback to `classic`). "
+            f"Escape: name one of those, or land the arm in `optim.NS_KINDS` first."
         )
 
 
@@ -239,7 +220,6 @@ def zeropower_via_ns(
     g: torch.Tensor,
     steps: int = 5,
     kind: str = "classic",
-    gram_restarts: tuple[int, ...] = GRAM_NS_RESTARTS,
     ns_dtype: str = "fp32",
     *,
     counters=None,
@@ -247,13 +227,11 @@ def zeropower_via_ns(
     """The polar factor's polynomial approximation, matrix-only, fp32 by default.
 
     `kind` selects the arm (`NS_KINDS`): `classic` is the recurrence this port
-    has always run; `gram` is Gram Newton–Schulz — the same polynomial,
-    iterated on the `[r, r]` Gram and applied once at the end, so the two
-    rectangular matmuls per iteration are gone (`_gram_via_ns`); `triton` is the
-    SAME chain fused into ONE kernel launch (`train/ns_kernels.py`), which is the
-    only arm here whose mechanism is a dispatch count — it is COUNTED and falls
-    back to `classic` with its reason when it cannot serve the call, so `counters`
-    is what a caller passes to see which chain ran.
+    has always run; `triton` is the SAME chain fused into ONE kernel launch
+    (`train/ns_kernels.py`), the only arm here whose mechanism is a dispatch
+    count — it is COUNTED and falls back to `classic` with its reason when it
+    cannot serve the call, so `counters` is what a caller passes to see which
+    chain ran.
 
     `ns_dtype` (`OPT_DTYPES`) is the chain's own dtype: `fp32` is the default
     and every number on record; `bf16` runs the polynomial in bf16 with
@@ -282,8 +260,6 @@ def zeropower_via_ns(
         from .ns_kernels import zeropower_triton_or_classic
 
         return zeropower_triton_or_classic(g, steps, counters=counters, ns_dtype=ns_dtype)
-    if kind == "gram":
-        return _gram_via_ns(g, steps=steps, restarts=gram_restarts, ns_dtype=ns_dtype)
     if g.ndim == 2:
         a, b, c = JORDAN_NS_COEFFS
         x = g.to(torch.float32)
@@ -311,92 +287,6 @@ def zeropower_via_ns(
         poly = b * gram + c * (gram @ gram)
         x = a * x + poly @ x
     out = x.transpose(1, 2).contiguous() if transposed else x
-    return out.to(torch.float32)
-
-
-def _gram_via_ns(
-    g: torch.Tensor,
-    *,
-    steps: int,
-    restarts: tuple[int, ...] = GRAM_NS_RESTARTS,
-    ns_dtype: str = "fp32",
-) -> torch.Tensor:
-    """Gram Newton–Schulz: the classic recurrence, regrouped on the Gram.
-
-    Transcribed from the authors' code — `Dao-AILab/gram-newton-schulz`,
-    `gram_newton_schulz/gram_newton_schulz.py::_gram_newton_schulz`, tag
-    **v0.1.6 = `e45d0aca7083cb275c9a303220c05c4abecd9187`** (fetched 2026-10-16;
-    byte-identical to `main` that day) — and from the pseudo-code in the same
-    tag's README, pinned in-tree at
-    `vendor/dormouse-fused/crates/burn-spectral/tests/oracle/upstream/
-    gram_newton_schulz_README.md` (arXiv:2608.11612 §4 is the paper behind it).
-    The port's orientation is kept — the small side first, `[r, d]` with
-    `r <= d`, so the Gram is `[r, r]`, which is the space this port's classic
-    arm already works in (`zeropower_via_ns` transposes when `rows > cols`).
-    `restarts` are 0-based iteration indices at which to re-materialize `X` (the
-    reference's `gram_newton_schulz_reset_iterations`, default `(2,)`).
-
-    `ns_dtype` is the chain's own dtype (see `zeropower_via_ns`): the Gram, `Q`
-    and the eye all follow it, and the fp32 in/out casts are explicit.
-
-    The recurrence, with `P(R) = a·I + b·R + c·R²`:
-
-        X0 = X / (‖X‖_F + 1e-7)
-        R  = X0 @ X0ᵀ                 # the [r, r] Gram, formed ONCE
-        Q  = I                        # the invariant is X_t == Q_t @ X0
-        for t in 0..steps-1:
-            if t in restarts and t != 0:      # restart, then rebuild both
-                X = Q @ X;  R = X @ Xᵀ;  Q = I
-            Z  = b·R + c·R²                   # 1 small matmul
-            Q  = Z + a·I   (or  Q @ Z + a·Q when Q is live)     # 1 small matmul
-            R  = Z·RZ + a·RZ,  RZ = R·Z + a·R # 2 small matmuls, skipped on the
-                                              # last step / before a restart
-        return Q @ X
-
-    **Why it is the same polynomial**, which is the whole claim: the classic
-    step is `X ← (a·I + b·R + c·R²)·X = P(R)·X`, so after `steps` of them
-    `X = P(R_{steps-1}) … P(R_0)·X0`. Every `P(R_t)` is itself a polynomial in
-    `R_0` (because `R_t = P(R_{t-1})²·R_{t-1}`), and polynomials of one matrix
-    commute — so the whole product collapses to ONE `[r, r]` factor `Q` with
-    `X = Q·X0`, and `R` can be carried alongside it in `[r, r]`:
-    `R_t = P(R_{t-1})²·R_{t-1}`. What the classic arm spends per iteration is
-    two RECTANGULAR matmuls (`X @ Xᵀ` and `P @ X`, both `O(r·d·r)`, `d` =
-    2048/5461 at the b1 shapes); this arm spends four `[r, r]` ones and pays
-    exactly TWO rectangular matmuls in total (`X0 @ X0ᵀ`, `Q @ X`). Same
-    polynomial, different fp32 round-off order — no training A/B is licensed by
-    the speed, only by the equivalence gate (`tests/test_muon_gram.py`).
-
-    NOT transcribed, deliberately: the reference's step 2, `X → float16(X)`.
-    This port runs `ns_dtype` (`fp32` by default; `bf16` is the same cast with
-    the port's own dtype rung — row 4 of the cost note). Its CuTeDSL
-    symmetric-GEMM kernels are Hopper/Blackwell-only and are not
-    ported either — this is the ALGORITHM, in torch.
-    """
-    a, b, c = JORDAN_NS_COEFFS
-    _check_dtype("ns_dtype", ns_dtype)
-    assert g.ndim in (2, 3), f"NS is matrix-only or [N,d0,d1] batched, got shape {tuple(g.shape)}"
-    x = g.to(torch.float32)
-    x = x / (x.norm(dim=(-1, -2), keepdim=True) + 1e-7)
-    transposed = x.shape[-2] > x.shape[-1]
-    if transposed:
-        x = x.transpose(-1, -2).contiguous()
-    x = x.to(_torch_dtype(ns_dtype))
-    eye = torch.eye(x.shape[-2], dtype=x.dtype, device=x.device)
-    restart = set(restarts)
-    q: torch.Tensor | None = None
-    gram = x @ x.transpose(-1, -2)
-    for t in range(steps):
-        if t in restart and t != 0:
-            x = q @ x
-            gram = x @ x.transpose(-1, -2)
-            q = None
-        z = b * gram + c * (gram @ gram)
-        q = (z + a * eye) if q is None else (q @ z + a * q)
-        if t + 1 < steps and (t + 1) not in restart:
-            rz = gram @ z + a * gram
-            gram = z @ rz + a * rz
-    out = x if q is None else q @ x  # `q is None` only at steps == 0
-    out = out.transpose(-1, -2).contiguous() if transposed else out
     return out.to(torch.float32)
 
 
@@ -690,7 +580,6 @@ class Muon(Optimizer):
         momentum: float = 0.95,
         ns_steps: int = 5,
         ns_kind: str = "classic",
-        gram_restarts: tuple[int, ...] = GRAM_NS_RESTARTS,
         colrow_3d: str = "colrow",
         state_dtype: str = "fp32",
         ns_dtype: str = "fp32",
@@ -715,7 +604,6 @@ class Muon(Optimizer):
         #: the two dtype rungs (`train.muon_state_dtype` / `train.ns_dtype`),
         #: `variant` (`train.muon_variant`) and `sf`/`sf_beta` (`train.muon_sf`).
         self.ns_kind = ns_kind
-        self.gram_restarts = gram_restarts
         self.colrow_3d = colrow_3d
         self.state_dtype = state_dtype
         self.ns_dtype = ns_dtype
@@ -820,21 +708,17 @@ class Muon(Optimizer):
     def _orthogonalize(self, x: torch.Tensor, steps: int) -> torch.Tensor:
         """The NS call, with the rung forwarded only when it is NOT the default.
 
-        The `fp32` rung therefore passes the four arguments every gate, spy and
-        pin in this tree was written against (`tests/test_muon_gram.py`'s
-        `test_the_requested_arm_is_the_arm_that_runs` transcribes exactly that
-        signature), and the default path's call shape does not move. The `triton`
-        arm is the same rule one step further: its counters are forwarded (the
-        arm must be able to show which chain ran) and nothing else about the call
-        changes for `classic`/`gram`.
+        The `fp32` rung therefore passes the three arguments every gate, spy and
+        pin in this tree was written against, and the default path's call shape
+        does not move. The `triton` arm is the same rule one step further: its
+        counters are forwarded (the arm must be able to show which chain ran) and
+        nothing else about the call changes for `classic`.
         """
         if self.ns_kind == "triton":
-            return zeropower_via_ns(
-                x, steps, self.ns_kind, self.gram_restarts, self.ns_dtype, counters=self.counters
-            )
+            return zeropower_via_ns(x, steps, self.ns_kind, self.ns_dtype, counters=self.counters)
         if self.ns_dtype == "fp32":
-            return zeropower_via_ns(x, steps, self.ns_kind, self.gram_restarts)
-        return zeropower_via_ns(x, steps, self.ns_kind, self.gram_restarts, self.ns_dtype)
+            return zeropower_via_ns(x, steps, self.ns_kind)
+        return zeropower_via_ns(x, steps, self.ns_kind, self.ns_dtype)
 
     def _step_one(self, p: torch.Tensor, lr: float, mu: float, ns: int, scale: float) -> None:
         """The per-param update — the reference the batched path must match.
@@ -1162,7 +1046,6 @@ class MixOptimizer:
         momentum: float = 0.95,
         ns_steps: int = 5,
         ns_kind: str = "classic",
-        gram_restarts: tuple[int, ...] = GRAM_NS_RESTARTS,
         colrow_3d: str = "colrow",
         muon_state_dtype: str = "fp32",
         ns_dtype: str = "fp32",
@@ -1203,7 +1086,6 @@ class MixOptimizer:
                 momentum=momentum,
                 ns_steps=ns_steps,
                 ns_kind=ns_kind,
-                gram_restarts=gram_restarts,
                 colrow_3d=colrow_3d,
                 state_dtype=muon_state_dtype,
                 ns_dtype=ns_dtype,

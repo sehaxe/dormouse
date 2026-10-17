@@ -82,7 +82,7 @@ def old_batched_step(muon: Muon, chunk_elems: int | None = None) -> int:
                 buf = state["momentum"]
                 buf.mul_(mu).add_(p.grad, alpha=1.0 - mu)
                 update = colrow_normalize(
-                    zeropower_via_ns(buf, ns, muon.ns_kind, muon.gram_restarts),
+                    zeropower_via_ns(buf, ns, muon.ns_kind),
                     colrow_3d="frobenius",  # the historical arm, pinned
                 )
                 scale = max(1.0, shape[0] / shape[1]) ** 0.5
@@ -101,7 +101,7 @@ def old_batched_step(muon: Muon, chunk_elems: int | None = None) -> int:
             grads = torch.stack([p.grad for p in params_c])
             bufs.mul_(mu).add_(grads.detach(), alpha=1.0 - mu)
             update = colrow_normalize(
-                zeropower_via_ns(bufs, ns, muon.ns_kind, muon.gram_restarts),
+                zeropower_via_ns(bufs, ns, muon.ns_kind),
                 colrow_3d="frobenius",  # the historical arm, pinned
             ).detach()
             scale = max(1.0, shape[0] / shape[1]) ** 0.5
@@ -514,7 +514,7 @@ def test_the_trainer_forwards_the_colrow_arm(monkeypatch, tmp_path):
     assert seen == ["colrow"], seen
 
 
-# --- the bench (`scripts/bench_muon_ns.py step` runs this) -------------------
+# --- the bench (`python tests/test_muon_fast.py` runs this) ------------------
 
 
 def b1_muon_shapes() -> dict[tuple[int, int], int]:
@@ -560,9 +560,9 @@ def bench_muon_b1_step(device=None, reps: int = 5, warm: int = 2) -> None:
 
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     if device == "cuda":
-        from test_muon_gram import _gpu_free
+        from conftest import gpu_free
 
-        free, why = _gpu_free()
+        free, why = gpu_free()
         print(f"card: {why}")
         if not free:
             print("  REFUSING: one GPU thing at a time (AGENTS §1.5). Re-run when idle.")
