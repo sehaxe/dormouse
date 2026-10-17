@@ -617,5 +617,41 @@ axis with instruments, not a vibe:
 This rides the model, not a flag: the byte level + sparse active params +
 host memory is the architecture of thrift.
 
+### 7.3 Status — 2026-10-17 (the port's third day, measured)
+
+**The b1 run is LAUNCHED** (`b1first`, `~/logs/b1first.log`): 1,066,358,209
+params, b8 s512, 50 000 steps = 204.8 MB of bytes, `engram_ram` + `tf32` +
+dropless MoE + `torch.compile`, ~8-9 h, checkpoints every 5000, eval every
+1000 (16 384 B window). The form is the VRAM ladder's verdict: b8 s768 OOMs,
+b4 s768 and b8 s512 fit, and b8 s512 carries more bytes per step.
+
+**Long context, measured** (`smoke_long`): the segmented path holds VRAM
+nearly flat — 8k: 1.06 GiB / 791 ms, 16k: 1.23 / 1605, 32k: 1.56 / 3214 —
+while one-shot grows 5.65 → 11.17 GiB and **OOMs at 32k**. 128-256k training
+is reachable at ~2.6× the step time. The enabler is FLA's own `initial_state`
+on `chunk_kda` (StateFlow pattern, not truncated BPTT), plus the dropless
+Triton grouped GEMM (empty-block exit in-kernel; 37.9× the naive loop).
+
+**The audit** (`docs/reviews/2026-10-17-port-audit.md`, 3 CRITICAL / 15 MAJOR
+/ 14 MINOR) found and the same day fixed: a per-forward device sync in the
+counter fast path, `torch.compile` checkpoints no loader could read, the b1
+recipe's capacity claim falsified by its own counter (77% of assignments
+dropped → dropless), the fp32 bank-stack transient that OOM'd every b1 warm
+(rebuilt per expert in the compute dtype), the half-wired storage rungs, the
+`_pending` leak on NaN steps. Verdict in the doc: *"a well-built project —
+the defects are the seams of a fast build, not rot."*
+
+**A/B verdicts on the clean base** (all 3 seeds, 2k steps, 81 920 B window):
+ColRow −0.0428 BPB (flipped to default), depth 3 beats 2 and 4, MSA tie (off
+in b1), LOOM tie (off), aux (future-byte, DSpark) tie, annealed ternary
++0.040 (off for training; QAT belongs to the post-base finetune).
+
+**Open, ranked**: `torch.compile` first-warm per shape (the b8 s512 graph is
+fresh this run); Muon momentum in bf16 (−1.25 GB, literature-backed) if a
+bigger form is wanted; the remaining per-step syncs the audit named (SFT
+mask, adaptive-MSA share, naive dispatch); the eval-tail 1 MiB cap for long
+windows; 1M needs PISA-class selector + length-upsampled data (the research
+doc's make-or-break).
+
 Burn lanes pause while the port lane is active (one lane at a time; the burn
 stack stays green and untouched as the fallback).
