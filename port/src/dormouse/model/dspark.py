@@ -226,6 +226,28 @@ class DSparkHead(nn.Module):
         self.joint = nn.Linear(2 * r + d, 3 * r, bias=False, device=device)  # Eq 6
         self.conf = nn.Linear(d + r, 1, bias=False, device=device)  # Eq 7, D9
 
+    def step(
+        self,
+        state: torch.Tensor,
+        prev: torch.Tensor,
+        hidden: torch.Tensor,
+        base: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """One Eq 6 step: `(s, W1[x], h, base) -> (s', base + W2·tanh(out))`.
+
+        The recurrence `terms()` runs over a window, as ONE call — so the
+        training path and the inference path (`specdecode.draft_block`, one
+        step per proposed byte) share one implementation of Eq 6 and cannot
+        drift. Flat shapes: `state [N,r]`, `prev [N,r]`, `hidden [N,d]`,
+        `base [N,v]`; the returned logits are `[N,v]`.
+        """
+        gate, cand, out = self.joint(torch.cat([state, prev, hidden], dim=-1)).split(
+            self.markov_rank, dim=-1
+        )
+        gate = torch.sigmoid(gate)
+        new_state = gate * state + (1.0 - gate) * torch.tanh(cand)
+        return new_state, base + self.w2(torch.tanh(out))
+
     def window(
         self, input_ids: torch.Tensor, k: int | None = None, stride: int | None = None
     ) -> Window:
@@ -289,12 +311,10 @@ class DSparkHead(nn.Module):
             h = hidden[:, pos[:, s]]  # [b,n,d]
             prev = self.w1(win.token_ids[:, :, s])  # [b,n,r] — Eq 7's W1[x_{k-1}]
             base = frozen[:, pos[:, s]]  # [b,n,v]
-            gate, cand, out = self.joint(
-                torch.cat([state, prev.reshape(b * n, r), h.reshape(b * n, d)], dim=-1)
-            ).split(r, dim=-1)
-            gate = torch.sigmoid(gate)
-            state = gate * state + (1.0 - gate) * torch.tanh(cand)
-            drafts.append(base + self.w2(torch.tanh(out)).reshape(b, n, v))
+            state, step_logits = self.step(
+                state, prev.reshape(b * n, r), h.reshape(b * n, d), base.reshape(b * n, v)
+            )
+            drafts.append(step_logits.reshape(b, n, v))
             confs.append(self.conf(torch.cat([h, prev], dim=-1)))  # [b,n,1]
             targets.append(base)
         draft = torch.stack(drafts, dim=2)  # [b,n,k,v]

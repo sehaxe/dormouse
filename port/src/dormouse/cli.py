@@ -562,9 +562,25 @@ def decode(
     prompt: Annotated[str, typer.Option(help="prompt text; UTF-8 bytes are the tokens")] = "",
     n: Annotated[int, typer.Option(help="new bytes to sample")] = 100,
     temp: Annotated[float, typer.Option(help="sampling temperature")] = 0.8,
+    spec_k: Annotated[
+        int,
+        typer.Option(
+            "--spec-k",
+            help="speculative decode: bytes the draft proposes per round (0 = off, "
+            "plain decode); needs a checkpoint trained with dspark_weight > 0",
+        ),
+    ] = 0,
     device: Annotated[str, typer.Option(help="auto|cuda|cpu")] = "auto",
 ) -> None:
-    """Sample bytes from a checkpoint (sliding-window next-byte decode)."""
+    """Sample bytes from a checkpoint (sliding-window next-byte decode).
+
+    `--spec-k N` is the speculative path (`model/specdecode.py`): the DSpark
+    draft proposes N bytes, ONE target forward verifies them, and the accepted
+    prefix is emitted — the same bytes the plain decoder emits at the same temp,
+    for ~1 forward per N when the draft is right. The default 0 is exactly
+    today's `decode_bytes`.
+    """
+    from .model.specdecode import spec_decode_bytes
     from .train.loop import load_model_half
 
     if not ckpt_name:
@@ -579,9 +595,27 @@ def decode(
     # factor records are packed, and `load_state_dict` cannot read them raw.
     model.load_state_dict(load_model_half(Path(out_dir) / f"{ckpt_name}.pt"))
     gen = torch.Generator(device=dev).manual_seed(run.train.seed)
-    out = decode_bytes(model, encode(prompt), n, temp=temp, device=dev, generator=gen)
-    text = out[len(encode(prompt)) :].decode("utf-8", "replace")
-    console.print(Panel(f"[bold]{prompt}[/]{text}", title=f"decode · temp {temp} · {n} bytes"))
+    body = encode(prompt)
+    if spec_k:
+        out, stats = spec_decode_bytes(
+            model, body, n, spec_k=spec_k, temp=temp, device=dev, generator=gen
+        )
+        subtitle = (
+            f"spec k={spec_k} · accepted {stats.accepted}/{stats.drafted} "
+            f"({stats.acceptance_rate:.0%}) · {stats.per_byte_forwards:.2f} forwards/byte"
+            f" · {stats.counters.line()}"
+        )
+    else:
+        out = decode_bytes(model, body, n, temp=temp, device=dev, generator=gen)
+        subtitle = f"{n} bytes"
+    text = out[len(body) :].decode("utf-8", "replace")
+    console.print(
+        Panel(
+            f"[bold]{prompt}[/]{text}",
+            title=f"decode · temp {temp}" + (f" · spec k={spec_k}" if spec_k else ""),
+            subtitle=subtitle,
+        )
+    )
 
 
 @app.command()
