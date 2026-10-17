@@ -387,6 +387,17 @@ def sft_cmd(
             "--chat-cap", help="max rows sampled from EACH chat file (a deterministic sample)"
         ),
     ] = None,
+    holdout: Annotated[
+        int,
+        typer.Option("--holdout", help="records moved to a .holdout sibling for the in-loop eval"),
+    ] = 0,
+    eval_data: Annotated[
+        Path | None,
+        typer.Option(
+            "--eval-data",
+            help="holdout corpus for the in-loop SFT eval (masked CE + first-byte agreement)",
+        ),
+    ] = None,
     steps: Annotated[int | None, typer.Option] = None,
     batch: Annotated[
         int | None, typer.Option(help="windows per step are batch*seq_len bytes")
@@ -432,6 +443,8 @@ def sft_cmd(
     for k, v in (("steps", steps), ("batch", batch), ("lr", lr)):
         if v is not None:
             train_over[k] = v
+    if eval_data is not None:
+        train_over["eval_data"] = str(eval_data)
     if json_log is not None:
         train_over["json_log"] = str(json_log)
     run = load_run(preset, model_overrides=model_over, train_overrides=train_over)
@@ -449,6 +462,7 @@ def sft_cmd(
             n_tasks=n_tasks,
             chat_data=chat_data or None,
             chat_cap=chat_cap,
+            holdout=holdout,
         )
         dropped = (
             f" · {built['dropped']} dropped (longer than one window)" if built["dropped"] else ""

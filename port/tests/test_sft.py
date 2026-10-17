@@ -512,6 +512,46 @@ def test_chat_cap_is_per_file_so_small_files_stay_whole(tmp_path):
     assert a["chat_files"] == {str(big): 5, str(small): 1}
 
 
+def test_holdout_moves_the_tail_to_a_sibling(tmp_path):
+    """`holdout=N` splits the LAST N records into `<name>.holdout` (the same
+    fixed record size), so the training stream never reads them and the eval
+    stream reads nothing else. Deterministic like the rest of the build."""
+    a = build_sft_corpus(tmp_path / "a.bin", 5, seq_len=64, n_tasks=0, holdout=7)
+    build_sft_corpus(tmp_path / "b.bin", 5, seq_len=64, n_tasks=0, holdout=7)
+    hold = tmp_path / "a.bin.holdout"
+    assert hold.is_file()
+    assert hold.read_bytes() == (tmp_path / "b.bin.holdout").read_bytes()
+    assert a["holdout"] == 7 and a["records"] > 7
+    assert len(hold.read_bytes()) == 7 * a["record_bytes"]
+    with pytest.raises(LoudError, match="holdout"):
+        build_sft_corpus(tmp_path / "c.bin", 5, seq_len=64, n_tasks=0, holdout=10_000)
+
+
+def test_sft_eval_reports_first_byte_agreement(tmp_path):
+    """The in-loop eval (masked CE + first-answer-byte agreement) runs on the
+    holdout file and lands in the log — the metric that catches a model which
+    only predicts answer marginals (the sft5 failure)."""
+    corpus = tmp_path / "sft.bin"
+    built = build_sft_corpus(corpus, seed=1, seq_len=SEQ, n_tasks=32, holdout=4)
+    hold = tmp_path / "sft.bin.holdout"
+    run = sft_run(
+        tmp_path,
+        corpus=corpus,
+        steps=4,
+        log_every=2,
+        eval=True,
+        eval_every=2,
+        eval_batches=2,
+        eval_data=str(hold),
+    )
+    lines: list[str] = []
+    sft_train(DormouseModel(run.model), run, log=lines.append)
+    evals = [ln for ln in lines if ln.startswith("sft eval")]
+    assert evals, lines
+    assert "first=" in evals[-1] and "over " in evals[-1]
+    assert built["holdout"] == 4
+
+
 def test_ru_bank_is_broad_and_fits_one_window():
     """The RU bank must stay deterministic, wide (>= 200 pairs) and every pair
     must render into a 512-byte window — it is the fix for an English-drift

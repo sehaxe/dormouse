@@ -47,6 +47,7 @@ eval line's `fin` scores, so SFT trains exactly the readout generation reads.
 
 from __future__ import annotations
 
+import math
 import random
 import time
 from pathlib import Path
@@ -435,6 +436,7 @@ def build_sft_corpus(
     n_tasks: int = 32,
     chat_data: str | Path | list[str | Path] | None = None,
     chat_cap: int | None = None,
+    holdout: int = 0,
 ) -> dict:
     """Write the instruction corpus: fixed `seq_len + 1`-byte records, deterministic.
 
@@ -497,6 +499,17 @@ def build_sft_corpus(
         )
     path = Path(out_path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    held = 0
+    if holdout:
+        if holdout >= len(records):
+            loud(
+                f"build_sft_corpus holdout={holdout}: the corpus has only "
+                f"{len(records)} records. Escape: a holdout smaller than the corpus."
+            )
+        held = holdout
+        hold_path = path.with_name(path.name + ".holdout")
+        hold_path.write_bytes(b"".join(records[-held:]))
+        records = records[:-held]
     path.write_bytes(b"".join(records))
     return {
         "path": str(path),
@@ -507,6 +520,7 @@ def build_sft_corpus(
         "seq_len": seq_len,
         "seed": seed,
         "n_tasks": n_tasks,
+        "holdout": held,
         **chat_stats,
     }
 
@@ -632,6 +646,14 @@ def sft_train(
     device = None if device is None else torch.device(device)
     if stream is None:
         stream = ByteStream(cfg.data, cfg.batch, cfg.seq_len)
+    eval_stream = None
+    if cfg.eval and cfg.eval_data:
+        # The holdout: the same record format, never read by the training
+        # stream (the build writes it to a sibling file). The metric that
+        # matters is `first` — the top-1 agreement on the FIRST answer byte,
+        # which is the byte that requires READING the instruction; the CE can
+        # look healthy while the model only predicts answer marginals.
+        eval_stream = ByteStream(cfg.eval_data, cfg.batch, cfg.seq_len)
     model.train()
     opt = MixOptimizer(
         model,
@@ -806,6 +828,43 @@ def sft_train(
                     f"drowning run must stop for a human, not exit 0. Escape: "
                     f"lower lr, check the corpus, or bisect the arms."
                 )
+
+        if eval_stream is not None and (step + 1) % cfg.eval_every == 0:
+            model.eval()
+            ce_total = 0.0
+            batches = 0
+            first_ok = 0
+            first_n = 0
+            with torch.no_grad():
+                for _ in range(cfg.eval_batches):
+                    ex, ey = eval_stream.next_batch()
+                    if device is not None:
+                        ex, ey = ex.to(device), ey.to(device)
+                    emask = sft_mask(ex)
+                    elogits, _en, _ec = model(ex)
+                    flat = emask.reshape(-1)
+                    ce_total += float(F.cross_entropy(elogits[flat], ey.reshape(-1)[flat]))
+                    batches += 1
+                    # The conditioning metric: at the assistant marker's
+                    # position the model predicts the FIRST answer byte — the
+                    # one byte that cannot be guessed from the answer alone.
+                    is_a = ex == ASSIST
+                    assist = is_a.to(torch.int8).argmax(dim=1)
+                    rows = torch.arange(ex.shape[0], device=ex.device)
+                    per_row = elogits.reshape(ex.shape[0], ex.shape[1], -1)
+                    pred = per_row[rows, assist].argmax(dim=-1)
+                    true = ey[rows, assist]
+                    first_ok += int((pred == true).sum())
+                    first_n += int(ex.shape[0])
+            model.train()
+            ce = ce_total / max(batches, 1)
+            frac = first_ok / max(first_n, 1)
+            log(
+                f"sft eval step={step + 1} ce={ce:.4f} bpb={ce / math.log(2):.4f} "
+                f"first={100 * frac:.1f}% over {first_n} records"
+            )
+            if sink is not None:
+                _row(event="sft_eval", step=step + 1, ce=ce, first=frac, records=first_n)
 
         if (step + 1) % cfg.ckpt_every == 0:
             weights, snapshot = save_ckpt(run, model, opt, step)
