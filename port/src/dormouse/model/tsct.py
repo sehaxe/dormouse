@@ -62,7 +62,7 @@ from ..instrument import loud
 
 
 def mm_mixed(x: torch.Tensor, weight: torch.Tensor, dt: torch.dtype) -> torch.Tensor:
-    """`x @ Wᵀ` in `dt` with fp32-out — the port's mixed-dtype rule (F.linear).
+    """`x @ Wᵀ` in `dt` — the port's mixed-dtype rule (F.linear). The OUT is `dt`.
 
     torch's `Linear` dispatched on the INPUT's dtype: fp32 masters with fp32
     activation inputs run fp32 GEMM, which on sm_120 means the MAGMA lane —
@@ -70,6 +70,12 @@ def mm_mixed(x: torch.Tensor, weight: torch.Tensor, dt: torch.dtype) -> torch.Te
     probe (280 × ~240 µs fp32 gemms against TSCT's 13-38 µs bf16 cutlass).
     Casting per forward (masters stay fp32, exactly TSCTLinear's contract)
     routes every projection through the bf16 cuBLAS tensor-core path.
+
+    The result dtype is the COMPUTE dtype, not fp32: with `bf16 = true` this
+    returns bf16 (an fp32 `x @ Wᵀ` under bf16 would have been the fp32 GEMM the
+    rule exists to avoid), so a caller that needs fp32 widens it explicitly —
+    `SparseMoE`'s `down` does, and so does the MoE combine boundary, which is
+    why the router's bf16 softmax weight is cast there rather than here.
     """
     w = weight if weight.dtype == dt else weight.to(dt)
     return (x if x.dtype == dt else x.to(dt)) @ w.t()

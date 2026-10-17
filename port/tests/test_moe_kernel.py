@@ -139,6 +139,113 @@ def test_triton_backward_matches_the_padded_autograd(bf16, bound):
     assert dx_rel <= bound, f"dx disagrees: {dx_rel:.3e}"
 
 
+def test_mm_mixed_returns_the_compute_dtype_not_fp32():
+    """The premise of the combine crash, pinned on ANY device: `mm_mixed` OUT is `dt`.
+
+    Its docstring used to claim "fp32 out" and the MoE call site repeated the
+    claim, which is why a bf16 weight reached `combine` unnoticed. With
+    `bf16 = true` the router's logits are bf16, so the softmax and the routed
+    weight are bf16 too. This is the half of the bug a CPU can see; the CUDA
+    gate below is the consequence.
+    """
+    from dormouse.model.tsct import mm_mixed
+
+    x, w = torch.randn(4, 8), torch.randn(3, 8)
+    assert mm_mixed(x, w, torch.float32).dtype == torch.float32
+    assert mm_mixed(x, w, torch.bfloat16).dtype == torch.bfloat16
+
+
+@CUDA
+@pytest.mark.parametrize("capacity", [0.0, 1.0])
+def test_the_bf16_module_forward_trains_through_the_fused_combine(capacity, monkeypatch):
+    """The REAL path: a bf16 `SparseMoE.forward` through `combine`, fwd + bwd.
+
+    Every other gate on this arm hand-builds its fp32 router weight by calling
+    `moe.router(x)` directly (`_routing` above) — an fp32 `nn.Linear` — so the
+    dtype the SHIPPING forward produces was never exercised. With `bf16 = true`
+    the logits come out of `mm_mixed` in bf16, the softmax and the routed
+    `weight` follow, and `combine` asserts `w.dtype == torch.float32`: `9876ab8`
+    dropped the explicit widening the pre-fusion adjoint did (`y.to(fp32) * w`),
+    so this crashed on b1's FIRST forward, with every arm off, because the bug is
+    the dtype and not the arm.
+
+    Both routes are covered (`capacity = 0` is b1's dropless one, `1.0` the
+    capped one — both funnel into the same `combine`). The gate spies on
+    `_triton_dispatch` to get the EXACT weight/index the module's forward built,
+    asserts that weight is bf16 (so the gate cannot silently become the fp32
+    gate next door), and compares the real path to the reference loop with the
+    SAME bf16-valued weight — the bounds are the file's own bf16 ones.
+    """
+    torch.manual_seed(0)
+    moe = _moe(bf16=True, moe_capacity=capacity, moe_kernel="triton")
+    x = torch.randn(64, moe.d, device=DEV)
+    dropless = capacity == 0.0
+
+    seen: dict = {}
+    real = SparseMoE._triton_dispatch
+
+    def spy(self, xi, weight, index, order, keep, *, dropless=False, fused_bwd=True):
+        seen.update(weight=weight, index=index, order=order, keep=keep, dropless=dropless)
+        seen["out"] = real(
+            self, xi, weight, index, order, keep, dropless=dropless, fused_bwd=fused_bwd
+        )
+        return seen["out"]
+
+    monkeypatch.setattr(SparseMoE, "_triton_dispatch", spy)
+    counters = Counters()
+    out = moe(x, counters)  # the module's own forward: router → bf16 probs → combine
+    monkeypatch.undo()
+
+    weight, index, order, keep = (seen[k] for k in ("weight", "index", "order", "keep"))
+    assert weight.dtype == torch.bfloat16, (
+        f"the gate must feed combine the bf16 weight the forward builds, got {weight.dtype}"
+    )
+    assert seen["dropless"] == dropless
+    assert counters["moe_triton_gemm"] == 1 and "moe_triton_fallback" not in counters, counters
+    assert torch.isfinite(out).all()
+
+    # forward: the widened-weight path (the cast is the ONLY difference — same
+    # rows, same kernels) and the reference loop on the same bf16-valued weight.
+    w = weight.detach()
+    with torch.no_grad():
+        same = moe._triton_dispatch(x, w.float(), index, order, keep, dropless=dropless)
+        loop = moe._naive_dispatch(x, w, index, order, keep, Counters())
+    routed = seen["out"].detach()
+    rel_cast, rel_loop = _rel(routed, same), _rel(routed, loop)
+
+    # fwd + bwd on the real graph: the router's own gradient rides `dw` through
+    # the gather, so a `combine` that dropped it would leave the router dead.
+    moe.zero_grad(set_to_none=True)
+    xg = x.detach().clone().requires_grad_(True)
+    moe(xg, Counters()).float().pow(2).mean().backward()
+    dead = [n for n, p in moe.named_parameters() if p.grad is None]
+    assert not dead, f"the bf16 forward left {dead} without a gradient"
+    assert float(moe.router.weight.grad.abs().sum()) > 0, "the router gradient is zero"
+    assert xg.grad is not None and torch.isfinite(xg.grad).all()
+
+    def run(arm):
+        moe.zero_grad(set_to_none=True)
+        xi = x.detach().clone().requires_grad_(True)
+        arm(xi).float().pow(2).mean().backward()
+        grads = {n: p.grad.detach().clone() for n, p in moe.experts.named_parameters()}
+        assert all(p.grad is not None for p in moe.experts.parameters())
+        return grads, xi.grad.detach().clone()
+
+    got, dx = run(lambda xi: moe._triton_dispatch(xi, w, index, order, keep, dropless=dropless))
+    ref, dx_ref = run(lambda xi: moe._naive_dispatch(xi, w, index, order, keep, Counters()))
+    per = {n: _rel(got[n], ref[n]) for n in ref}
+    worst, dx_rel = max(per.values()), _rel(dx, dx_ref)
+    print(
+        f"[bf16 combine] capacity={capacity} w.dtype={weight.dtype} "
+        f"fwd rel(cast)={rel_cast:.3e} rel(loop)={rel_loop:.3e} "
+        f"grad worst={worst:.3e} dx={dx_rel:.3e} worst={max(per, key=per.get)}"
+    )
+    assert rel_cast <= 1e-5, f"the cast changed the forward: {rel_cast:.3e}"
+    assert rel_loop <= 2e-3, f"the bf16 forward differs from the loop: {rel_loop:.3e}"
+    assert worst <= 2e-2, f"the bf16 grads differ from the loop: {per}"
+    assert dx_rel <= 2e-2, f"dx differs from the loop: {dx_rel:.3e}"
+
+
 @CUDA
 @pytest.mark.parametrize("arm", ["fused", "split"])
 def test_both_glu_forward_arms_are_the_same_function_and_trainable(arm, monkeypatch):

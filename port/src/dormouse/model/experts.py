@@ -386,7 +386,10 @@ class SparseMoE(nn.Module):
         n = x.shape[0]
         assert x.ndim == 2 and x.shape[1] == self.d, f"MoE input {tuple(x.shape)} != [n, {self.d}]"
         dt = self.experts[0].compute_dtype  # the shared compute dtype
-        logits = mm_mixed(x, self.router.weight, dt)  # bf16 tensor-core, fp32 out
+        # `mm_mixed` returns `dt`, NOT fp32: with bf16 on, `logits` — and so the
+        # softmax `probs` and the routed `weight` — are bf16. The combine
+        # boundary widens the weight back to fp32 (`_triton_dispatch`).
+        logits = mm_mixed(x, self.router.weight, dt)
         probs = F.softmax(logits, dim=-1)  # [n, E]
         # a4.8: the activation quantization arm (COUNTED — a reader of the log
         # line sees it) applies to the EXPERTS' activations only. The router
@@ -1021,4 +1024,15 @@ class SparseMoE(nn.Module):
             seg=seg,
             ws=ws,
         )
-        return moe_kernels.combine(y, weight.reshape(-1)[rows], owner, rowmap.view(n, k), n, ws=ws)
+        # `combine`'s contract is fp32 `w` (and its fused backward's `dy` is
+        # built from it), so the weight is widened HERE, at the boundary. The
+        # weight arrives in the COMPUTE dtype — under `bf16 = true` it is the
+        # softmax of `mm_mixed`'s bf16 logits — and the pre-fusion adjoint
+        # (`y.to(fp32) * w`) ran the scatter and its `mul`/`index_add` backward
+        # in fp32 for exactly this reason. Casting at the call site rather than
+        # inside `combine` keeps the kernel's own `w.dtype == torch.float32`
+        # assert LOUD: a future caller that hands it a non-fp32 weight still
+        # fails instead of being silently coerced.
+        return moe_kernels.combine(
+            y, weight.reshape(-1)[rows].float(), owner, rowmap.view(n, k), n, ws=ws
+        )

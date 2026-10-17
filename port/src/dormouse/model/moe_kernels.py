@@ -1112,6 +1112,14 @@ def combine(y, w, owner, rowmap, n, *, ws=None, tiles=None):
     gathered router weight, `owner [R]` the token each gathered row belongs to.
     `ws` is the caller's grow-only `BwdWorkspace` (a throwaway one is made if
     omitted, which is correct and simply re-allocates every call).
+
+    `w` is fp32 BY CONTRACT, asserted below rather than coerced: the kernel's
+    `dy` is `grad_out · w` and its `dw` is the fp32 reduction, so a bf16 weight
+    would put the whole combine path — forward and backward — a 2^-8 step off
+    the adjoint it replaced. Under `bf16 = true` the routed weight really is
+    bf16 (the softmax of `mm_mixed`'s bf16 logits), so the model widens it at
+    this boundary (`experts.SparseMoE._triton_dispatch`); the assert is what
+    keeps that a deliberate, single, visible cast instead of a silent one.
     """
     assert y.ndim == 2 and y.is_cuda and y.is_contiguous(), "y must be a dense CUDA [R, f]"
     assert w.shape == (y.shape[0],) and w.dtype == torch.float32 and w.is_contiguous()
