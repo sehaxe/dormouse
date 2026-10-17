@@ -561,6 +561,15 @@ def decode(
             "plain decode); needs a checkpoint trained with dspark_weight > 0",
         ),
     ] = 0,
+    recurrent: Annotated[
+        bool,
+        typer.Option(
+            "--recurrent",
+            help="state-carry decode: carry the per-iteration KDA state across bytes "
+            "(O(1)/byte, unbounded context) instead of re-forwarding the window "
+            "(O(window)/byte). Off by default until the GPU gate has run.",
+        ),
+    ] = False,
     device: Annotated[str, typer.Option(help="auto|cuda|cpu")] = "auto",
 ) -> None:
     """Sample bytes from a checkpoint (sliding-window next-byte decode).
@@ -570,6 +579,13 @@ def decode(
     prefix is emitted — the same bytes the plain decoder emits at the same temp,
     for ~1 forward per N when the draft is right. The default 0 is exactly
     today's `decode_bytes`.
+
+    `--recurrent` is the state-carry path (`model/decode.py`): one byte per step
+    with the KDA state carried, `O(1)` per byte. Its bytes are NOT guaranteed to
+    be the plain decoder's at the same seed — the step kernel and the chunked
+    pass are the same recurrence with different summation orders (the `kda.py`
+    numerics contract), which is why it is off by default and why the subtitle
+    prints the counters of the arm that ran.
     """
     from .model.specdecode import spec_decode_bytes
     from .train.loop import load_model_half
@@ -578,6 +594,12 @@ def decode(
         raise LoudError("decode needs --ckpt-name")
     if not prompt:
         raise LoudError("decode needs --prompt (the first window is the prompt)")
+    if spec_k and recurrent:
+        raise LoudError(
+            "decode --spec-k and --recurrent are two different decoders (a verified "
+            "draft block vs a carried state), and neither is the other's control. "
+            "Escape: pass one of them."
+        )
     run = _snapshot_run(out_dir, ckpt_name)
     dev = _device(device)
     model = _model(run).to(dev)
@@ -587,7 +609,16 @@ def decode(
     model.load_state_dict(load_model_half(Path(out_dir) / f"{ckpt_name}.pt"))
     gen = torch.Generator(device=dev).manual_seed(run.train.seed)
     body = encode(prompt)
-    if spec_k:
+    if recurrent:
+        from .instrument import Counters
+        from .model.decode import recurrent_decode
+
+        arm = Counters()
+        out = recurrent_decode(
+            model, body, n, temp=temp, device=dev, generator=gen, counters=arm
+        )
+        subtitle = f"recurrent · {arm.line()}"
+    elif spec_k:
         out, stats = spec_decode_bytes(
             model, body, n, spec_k=spec_k, temp=temp, device=dev, generator=gen
         )

@@ -133,6 +133,41 @@ def _warmup() -> None:
         raise RuntimeError("warmup produced non-finite output")
 
 
+def _recurrent_step(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    state: torch.Tensor | None,
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """ONE token of KDA Eq 1 in torch, fp32 — the CPU decode step and the kernel's anchor.
+
+    `S = Diag(exp(g))·S + beta·k·(v − kᵀ·Diag(exp(g))·S)`, `o = scale·qᵀ·S` — the
+    same recurrence `tests/test_kda_gpu.py::_recurrent` walks a whole sequence
+    with, one position at a time. The q/k L2 norm is applied here the way the
+    fused arm applies it IN the kernel (`q / √(Σq² + 1e-6)`,
+    `use_qk_l2norm_in_kernel=True`): K3 normalizes q/k and raw q/k explode (module
+    docstring), so the two arms must not be anchored on different inputs.
+
+    `q,k,v,g [b, 1, h, hd]`, `beta [b, 1, h]`, `state [b, h, hd, hd] | None` (None
+    = position 0) → (`o [b, 1, h, hd]`, the state leaving this token).
+    """
+    b, _, h, hd = q.shape
+    qf, kf, vf = q.float(), k.float(), v.float()
+    qf = qf * torch.rsqrt(qf.pow(2).sum(-1, keepdim=True) + 1e-6)
+    kf = kf * torch.rsqrt(kf.pow(2).sum(-1, keepdim=True) + 1e-6)
+    s = torch.zeros(b, h, hd, vf.shape[-1], dtype=torch.float32, device=q.device)
+    if state is not None:
+        s = s + state.float()
+    s = s * g[:, 0].float().exp()[..., None]
+    ks = torch.einsum("bhk,bhkv->bhv", kf[:, 0], s)
+    s = s + kf[:, 0].unsqueeze(-1) * (beta[:, 0].float()[..., None] * (vf[:, 0] - ks)).unsqueeze(-2)
+    o = torch.einsum("bhk,bhkv->bhv", qf[:, 0], s) * scale
+    return o.unsqueeze(1), s
+
+
 class KDAAttention(nn.Module):
     """`d → d` gated-delta attention: `q,k,v,g` projections plus per-head `beta`.
 
@@ -224,6 +259,70 @@ class KDAAttention(nn.Module):
         if not carry:
             return self._sdpa_path(x, b, t, d), None
         return self._sdpa_path_carry(x, b, t, d, state)
+
+    def step_state(
+        self,
+        x: torch.Tensor,
+        state: torch.Tensor | None = None,
+        counters: Counters | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """`x [b, 1, d]` + the state entering this token → (`[b, 1, d]`, the state leaving it).
+
+        The single-token DECODE step: the same gated-delta recurrence
+        `forward_state` computes over a window, one position at a time, with the
+        state CARRIED instead of recomputed — `O(1)` per byte instead of
+        `O(window)`.
+
+        * FLA live on this device (a CUDA box whose warmup passed): the vLLM-derived
+          decode kernel `fused_recurrent_kda` (FLA 0.5.2, `fused_recurrent.py:336`)
+          — `initial_state` in, `final_state` out, `[b, H, head_dim, head_dim]`
+          fp32 on both sides, i.e. the same state `chunk_kda` returns from
+          `forward_state`. **It ships no backward**, so it is taken only where
+          none is needed (the decode path runs under `no_grad`); a carried step
+          WITH a graph stays on `chunk_kda` and the torch arm below.
+        * No FLA (CPU, or a card whose warmup fails): the exact torch recurrence
+          (`_recurrent_step`), fp32, COUNTED `kda_step_torch` — a python loop over
+          head_dim² is a real degradation and the counter is how the log says so.
+          It is the same recurrence the fused kernel computes, so the decode arm
+          does not change between the two; only its speed does.
+
+        The SDPA fallback is deliberately NOT this path: its carried state is a
+        `(k, v)` context that grows with the sequence (`_sdpa_path_carry`), which
+        is `O(n)` per byte and would defeat the point of a recurrent decoder.
+        `state=None` means position 0, exactly as `forward_state`.
+        """
+        b, t, d = x.shape
+        assert t == 1, f"step_state is the single-token decode step, got t={t}"
+        counters = Counters() if counters is None else counters
+        q, k, v, g, beta = self.projections(x)
+        ok, why = fla_status(x.device)
+        if ok and not torch.is_grad_enabled():
+            from fla.ops.kda import fused_recurrent_kda
+
+            dt = self.compute_dtype
+            if dt != torch.float32:
+                q, k, v, beta = q.to(dt), k.to(dt), v.to(dt), beta.to(dt)
+            out, ht = fused_recurrent_kda(
+                q,
+                k,
+                v,
+                g=g,
+                beta=beta,
+                scale=self.scale,
+                initial_state=state,
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
+            )
+            counters.count("kda_step")
+            assert out.shape == (b, t, self.n_heads, self.head_dim), f"step {tuple(out.shape)}"
+            assert ht is not None and ht.dtype == torch.float32, "the step state is fp32"
+            want = (b, self.n_heads, self.head_dim, self.head_dim)
+            assert ht.shape == want, f"step state {tuple(ht.shape)} != {want}"
+            return out.reshape(b, t, d), ht
+        counters.count("kda_step_torch")
+        counters.why = why  # type: ignore[attr-defined]
+        o, ht = _recurrent_step(q, k, v, g, beta, state, self.scale)
+        return o.reshape(b, t, d), ht
 
     def _fla_path(
         self,

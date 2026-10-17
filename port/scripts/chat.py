@@ -27,9 +27,9 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from dormouse.cli import _snapshot_run  # noqa: E402
-from dormouse.instrument import loud  # noqa: E402
+from dormouse.instrument import Counters, loud  # noqa: E402
 from dormouse.model import DormouseModel  # noqa: E402
-from dormouse.model.decode import decode_bytes  # noqa: E402
+from dormouse.model.decode import decode_bytes, recurrent_decode  # noqa: E402
 from dormouse.model.specdecode import spec_decode_bytes  # noqa: E402
 
 USER, ASSIST, END = 0x01, 0x02, 0x03
@@ -47,6 +47,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="speculative decode: draft bytes per round (0 = off); needs a draft head",
+    )
+    p.add_argument(
+        "--recurrent",
+        action="store_true",
+        help="state-carry decode: carry the KDA state across bytes (O(1)/byte); off "
+        "by default, and its bytes are not guaranteed to be the plain decoder's",
     )
     p.add_argument("--ask", default="", help="one question, print the answer, exit")
     return p
@@ -69,12 +75,25 @@ def main() -> None:
     model = model.to(device).eval()
     step = ck.get("step", "?")
     temp, n_new, spec_k = args.temp, args.n, args.spec_k
+    recurrent = args.recurrent
 
     def answer(question: str) -> bytes:
         prompt = bytes([USER]) + question.encode("utf-8") + b"\n" + bytes([ASSIST])
         t0 = time.perf_counter()
         with torch.no_grad():
-            if spec_k:
+            if recurrent:
+                arm = Counters()
+                raw = recurrent_decode(
+                    model,
+                    prompt,
+                    n_new,
+                    temp=temp,
+                    device=device,
+                    stop=frozenset({END}),
+                    counters=arm,
+                )
+                rate = f"recurrent · {arm.line()}"
+            elif spec_k:
                 raw, stats = spec_decode_bytes(
                     model,
                     prompt,
@@ -107,7 +126,8 @@ def main() -> None:
 
     print(
         f"dormouse chat · {args.ckpt_name} (step {step}) · temp {temp} · "
-        f"spec k={spec_k or 'off'} · /quit to exit"
+        f"spec k={spec_k or 'off'} · recurrent {'on' if recurrent else 'off'} · "
+        f"/quit to exit"
     )
     while True:
         try:
@@ -130,6 +150,10 @@ def main() -> None:
         if line.startswith("/spec "):
             spec_k = int(line.split()[1])
             print(f"spec k = {spec_k or 'off'}")
+            continue
+        if line.startswith("/recurrent"):
+            recurrent = not recurrent
+            print(f"recurrent = {'on' if recurrent else 'off'}")
             continue
         print(answer(line).decode("utf-8", "replace"))
 

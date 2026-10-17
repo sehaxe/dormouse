@@ -55,6 +55,12 @@ decision only: the segmented logits are the one-shot logits to fp32 round-off
 every number on record keep their meaning. `segment_len=0` does not enter the
 branch at all — the one-shot path is `_window(carry=False)`, the same code with
 the same calls it has always made.
+
+RECURRENT DECODE (`recurrent_step`, the inference twin of the segmented path) —
+`decode.recurrent_decode`'s per-byte step: the same body, over ONE position,
+with the same per-iteration KDA state carried across BYTES. It is what makes
+generation `O(1)` per byte instead of `O(window)`, and it is a reordering of the
+one-shot forward rather than a second implementation of it (see the method).
 """
 
 from __future__ import annotations
@@ -243,6 +249,7 @@ class LoopBlock(nn.Module):
         carry: bool,
         states: list | None = None,
         drop: int = 0,
+        recurrent: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor], list]:
         """`T` iterations over ONE window — a segment, or the whole sequence.
 
@@ -277,7 +284,11 @@ class LoopBlock(nn.Module):
 
             if self.attn is not None:
                 attn_out, st = self._attn(
-                    normed, counters, carry, None if states is None else states[i]
+                    normed,
+                    counters,
+                    carry,
+                    None if states is None else states[i],
+                    recurrent=recurrent,
                 )
                 new_states.append(st)
                 attn = attn_out.reshape(b * t, d) * w_attn
@@ -351,19 +362,64 @@ class LoopBlock(nn.Module):
                 per_iter.append(ce.mean())
         return out_acc / T, rec, per_iter, new_states
 
+    def recurrent_step(
+        self,
+        h0: torch.Tensor,
+        input_ids: torch.Tensor,
+        states: list,
+        *,
+        drop: int = 0,
+        counters: Counters | None = None,
+    ) -> tuple[torch.Tensor, list]:
+        """ONE position through the `T` iterations, KDA state carried — the decode step.
+
+        `h0 [b, 1, d]` is this position's embedding, `input_ids [b, drop+1]` the
+        byte window its causal n-grams read (`_memory`'s left context), `states`
+        the per-iteration state leaving the PREVIOUS position. Returns
+        `(readout [b, 1, d], the per-iteration state leaving this one)`.
+
+        The same body as `_window` — one call site per arm, `self._attn` — with
+        the attention arm's single-token step (`KDAAttention.step_state`) in place
+        of the chunked pass. Only the ITERATION ORDER differs (position-major here,
+        iteration-major in `_window`), and that is not a model change: iteration
+        `i` at position `p` reads `h` from iteration `i-1` at the SAME position
+        and the state from iteration `i` at `p-1`, both already produced in the
+        position-major order; every other arm in the body is per position. The
+        one place it can differ is a capacity-dropping MoE, whose drop set is a
+        function of the window's composition (`decode.recurrent_decode` counts it).
+        """
+        counters = Counters() if counters is None else counters
+        out, _, _, new_states = self._window(
+            h0,
+            input_ids,
+            None,
+            None,
+            counters,
+            self.max_iter,
+            carry=True,
+            recurrent=True,
+            states=states,
+            drop=drop,
+        )
+        return out, new_states
+
     def _attn(
         self,
         normed: torch.Tensor,
         counters: Counters,
         carry: bool,
         state: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None,
+        *,
+        recurrent: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None]:
         """One iteration's attention call → (`[b,t,d]`, the state leaving it).
 
         One call site for both paths, so the segmented arm cannot drift from the
         one-shot one: `carry=False` is the arm's `forward` (the call every
         number on record made) and returns no state; `carry=True` is
-        `forward_state`, whose state is the edge into the next segment.
+        `forward_state`, whose state is the edge into the next segment;
+        `recurrent=True` (the decode step, `recurrent_step`) is the arm's
+        `step_state`, which carries the state across BYTES rather than segments.
 
         The state is PER ITERATION SLOT: the loop body is shared, but each of its
         `T` passes is a separate pass over the sequence, so each needs its own
@@ -371,6 +427,9 @@ class LoopBlock(nn.Module):
         which is the same defect as sharing one hidden state across them.
         """
         assert self.attn is not None
+        if recurrent:
+            assert carry, "the recurrent step carries the state by construction"
+            return self.attn.step_state(normed, state, counters=counters)
         if not carry:
             return self.attn(normed, counters=counters), None
         return self.attn.forward_state(normed, state, counters=counters, carry=True)
