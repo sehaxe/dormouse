@@ -483,6 +483,13 @@ def train(
         ns_steps=cfg.ns_steps,
         ns_kind=cfg.ns_kind,
         colrow_3d=cfg.muon_colrow_3d,
+        # The two optimizer rungs the bench named (2026-10-17). Without these
+        # kwargs a `--set muon_state_dtype=bf16` would be INERT in a train run
+        # — the SILENT class the repo's rules forbid (the wiring gap the
+        # optimizer lane's own report flagged). Both default fp32 = the
+        # pre-rung behaviour, so a resume of an older snapshot is unaffected.
+        muon_state_dtype=cfg.muon_state_dtype,
+        ns_dtype=cfg.ns_dtype,
     )
     if cfg.optim_8bit:
         opt.enable_bnb8bit()
@@ -663,19 +670,21 @@ def train(
                 kda_field(window),
                 window.line(),
             ]
+            # Telemetry reads the interval BEFORE any opt-in timer report —
+            # and the ORDER is load-bearing: `report()` resets the mark, so a
+            # read AFTER it measures ~0 s and the JSONL's `tokens_per_s` reads
+            # 1e7-1e8 (the optimizer lane measured exactly that on 2026-10-17).
+            # This comment said "before" while the code did "after"; fixed.
+            interval_s = timer.window_s()
             if cfg.timers:
                 parts.append(timer.report(cfg.log_every * tokens_per_step))
-            # Telemetry reads the interval BEFORE any opt-in timer report
-            # (report() resets the mark; the json row must not depend on a flag).
-            interval_s = timer.window_s()
             # The rate's denominator must be THIS WINDOW's seconds, not the
-            # run's whole wall time: `window_s()` does not reset, and until
-            # today nothing reset it when `--timers` was off — so
-            # `interval_s` was the CUMULATIVE elapsed and `tokens_per_s` was
-            # the monotone-decaying illusion (the trainer's 22k→0.9k that
-            # three real runs and the noeval bisect all showed, while every
-            # in-process probe stayed flat at 89-134 ms/step). One mark reset
-            # is the whole fix; the NVTX-suspect stack dissolves with it.
+            # run's whole wall time: until the 2026-10-17 fix nothing reset the
+            # mark when `--timers` was off, so `interval_s` was the CUMULATIVE
+            # elapsed and `tokens_per_s` was the monotone-decaying illusion (the
+            # trainer's 22k→0.9k that three real runs and the noeval bisect all
+            # showed, while every in-process probe stayed flat). One mark reset
+            # is the whole fix.
             timer.mark = time.perf_counter()
             rate = (cfg.log_every * tokens_per_step) / interval_s if interval_s > 0 else None
             log(" ".join(p for p in parts if p))

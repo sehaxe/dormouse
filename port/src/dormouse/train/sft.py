@@ -804,9 +804,11 @@ def sft_train(
                 kda_field(window),
                 window.line(),
             ]
+            # The interval read must precede any `report()` (it resets the
+            # mark) — same order fix as `train/loop.py` (2026-10-17).
+            interval_s = timer.window_s()
             if cfg.timers:
                 parts.append(timer.report(cfg.log_every * tokens_per_step))
-            interval_s = timer.window_s()
             timer.mark = time.perf_counter()
             rate = (cfg.log_every * tokens_per_step) / interval_s if interval_s > 0 else None
             log(" ".join(p for p in parts if p))
