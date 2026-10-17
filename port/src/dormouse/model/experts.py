@@ -539,20 +539,29 @@ class SparseMoE(nn.Module):
         )
         cached = getattr(self, "_bank_cache", None)
         if cached is None or cached[0] != key:
-            # The stack builds in fp32 (the masters' dtype), the qat arm — if
-            # on — quantizes THERE (per-expert α via `dim=(1,2)`, so a banked
-            # expert is identical to the same expert run through
-            # `DualLatentGLU.forward` — the parity the A/B needs), and only
-            # then does the cache convert to `dt`. Scales (`gate_s`/`up_s`)
-            # are never quantized: they ARE the diag(s) of the factorization.
-            mats = []
-            for name in ("gate_u", "up_u", "v"):
-                stack = torch.stack([getattr(e, name) for e in self.experts])
-                if self.factor_qat != "none":
-                    stack = factor_qat_project(
-                        stack, self.factor_qat, self.factor_qat_alpha, dim=(1, 2)
-                    )
-                mats.append(stack.to(dt))
+            # The stack is built PER EXPERT, converted to `dt` BEFORE the stack
+            # (audit 2026-10-17, MAJOR 7): stacking in fp32 first costs a
+            # 1.43 GB transient per name at b1 (`[1024, 5461, 64]`) and that
+            # allocation is what OOM'd both b1 warm attempts and the compile
+            # warm-up. Per-expert, the fp32 footprint is one expert (5.6 MB),
+            # and the qat arm — if on — quantizes the same way the stacked
+            # form did: `dim=(1, 2)` over a `[1, r, d]` view is the identical
+            # per-expert α, so a banked expert stays identical to the same
+            # expert run through `DualLatentGLU.forward` (the parity the A/B
+            # needs). Scales (`gate_s`/`up_s`) are never quantized: they ARE
+            # the diag(s) of the factorization.
+            def _one(name: str) -> torch.Tensor:
+                parts = []
+                for e in self.experts:
+                    t = getattr(e, name)
+                    if self.factor_qat != "none":
+                        t = factor_qat_project(
+                            t.unsqueeze(0), self.factor_qat, self.factor_qat_alpha, dim=(1, 2)
+                        )[0]
+                    parts.append(t.to(dt))
+                return torch.stack(parts)
+
+            mats = [_one(name) for name in ("gate_u", "up_u", "v")]
             cached = (
                 key,
                 tuple(mats),

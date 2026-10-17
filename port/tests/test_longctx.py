@@ -399,27 +399,27 @@ def test_the_padded_arm_refuses_a_dropless_capacity():
 def test_dropless_makes_segment_len_legal_with_the_sparse_dispatch():
     """The point of the mode: `b1`'s topk=2 at a long window is now legal.
 
-    Same run without the dropless override is still refused — the refusal is
-    about the capacity, not about the sparse dispatch.
+    `b1` ships DROPLESS (capacity 0 — the 2026-10-17 audit's CRITICAL 3), so
+    the legal case needs no override; the CONTROL (a capped sparse preset,
+    `medium`) is still refused, because the refusal is about the capacity, not
+    about the sparse dispatch.
     """
-    run = load_run(
-        "b1",
-        model_overrides={"moe_capacity": 0},
-        train_overrides={"seq_len": 2048, "segment_len": 1024},
-    )
+    run = load_run("b1", train_overrides={"seq_len": 2048, "segment_len": 1024})
     assert run.model.moe_topk == 2 and run.model.moe_capacity == 0
     assert run.train.segment_len == 1024
-    msg = _refused("b1", seq_len=2048, segment_len=1024)
+    msg = _refused("medium", model_overrides={"use_msa": False}, seq_len=1024, segment_len=512)
     assert "moe_capacity=0" in msg and "DROPLESS" in msg
 
 
 def test_the_presets_capacity_defaults_are_untouched():
-    """`moe_capacity = 0` is opt-in: no preset and no dataclass default moved."""
+    """The dataclass default and the dense preset stay capped; `b1` is dropless
+    BY DECISION (audit CRITICAL 3: cap 2.0 measured 77% of assignments dropped
+    at step 1 at E=1024), and that decision is the only preset that moved."""
     from dormouse.config import ModelConfig
 
     assert ModelConfig().moe_capacity == 1.0
     assert load_preset("small").moe_capacity == 2.0
-    assert load_preset("b1").moe_capacity == 2.0
+    assert load_preset("b1").moe_capacity == 0.0  # dropless, pinned by the audit fix
     assert load_preset("medium").moe_capacity == 2.0
     assert load_preset("small").moe_topk == 0 and load_preset("b1").moe_topk == 2
 
