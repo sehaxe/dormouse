@@ -574,7 +574,14 @@ def train(
         window.merge(step_counters)
         timer.tick()
 
-        finite = loss is not None and bool(torch.isfinite(loss))
+        # ONE host read per step, not two (audit MAJOR 4): `float(loss)` and the
+        # finiteness test share a single D2H transfer. The full device-side
+        # firewall (mask on the device, count at log cadence) needs an optimizer
+        # that accepts a device `scale` — the follow-up the audit names — and is
+        # not smuggled in here: the skip semantics below are the burn-proven
+        # ones and must not drift silently.
+        lf = float(loss.detach()) if loss is not None else float("nan")
+        finite = math.isfinite(lf)
         window_finite.append(finite)
         if finite:
             opt.zero_grad(set_to_none=True)
@@ -597,7 +604,7 @@ def train(
                 window.count("engram_host_updates", updates)
                 total.count("engram_host_update_rows", rows)
                 window.count("engram_host_update_rows", rows)
-            last_loss = float(loss.detach())
+            last_loss = lf
         else:
             # Skip the step entirely (a masked loss scalar does not stop NaN
             # gradients from reaching the weights - the burn bug of

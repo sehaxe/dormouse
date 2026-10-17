@@ -772,7 +772,9 @@ def sft_train(
         window.merge(step_counters)
         timer.tick()
 
-        finite = bool(torch.isfinite(loss))
+        # ONE host read per step (audit MAJOR 4), same as the train loop.
+        lf = float(loss.detach())
+        finite = math.isfinite(lf)
         window_finite.append(finite)
         if finite:
             opt.zero_grad(set_to_none=True)
@@ -780,7 +782,7 @@ def sft_train(
             if cfg.grad_clip > 0:
                 clip_grads(model.parameters(), cfg.grad_clip)
             opt.step()
-            last_loss = float(loss.detach())
+            last_loss = lf
         else:
             nan_skipped += 1
             total.count("nan_skipped")
