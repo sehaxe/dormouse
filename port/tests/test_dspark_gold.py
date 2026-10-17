@@ -12,14 +12,11 @@ arm exists and fails loudly on a targets-based window.
 
 ## The one design decision this file records
 
-The port's own aux head (`model/fb.py`) **consumes `targets` directly, read-only,
-and is still position-ordered** — because its read is SHIFTED: at trial `q` it
-reads `targets[q + 1]` (rolled by -1), a label strictly in `q`'s own future.
-Consuming the label sequence is not the defect; consuming it **unshifted** is.
-That is exactly D1 here: the slave's step `s` was fed `y[p + s] = x[p + s + 1]`,
-the very byte its own logits at `p + s` had just produced, and supervised on the
-one after. So both pieces obey one rule, stated once: a head at trial `q` may
-read the label at `q + 1` and nothing nearer.
+D1: the slave's step `s` was fed `y[p + s] = x[p + s + 1]`, the very byte its own
+logits at `p + s` had just produced, and supervised on the one after. The rule
+this file pins: a head at trial `q` may read the label at `q + 1` and nothing
+nearer — consuming the label sequence is not the defect; consuming it
+**unshifted** is.
 """
 
 from __future__ import annotations

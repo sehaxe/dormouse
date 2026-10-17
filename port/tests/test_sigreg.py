@@ -130,10 +130,11 @@ def test_the_weight_is_a_real_config_key():
     assert run.model.sigreg_weight == 0.1
     cfg = parse_preset("d_model = 64\nn_heads = 4\nhead_dim = 16\nsigreg_weight = 0.005\n")
     assert cfg.sigreg_weight == 0.005
-    # A regulariser beside a HEAD is allowed: different classes (`validate`'s
-    # one-signal-per-run rule is about two heads).
-    both = load_run("small", model_overrides={"sigreg_weight": 0.1, "aux_fb_weight": 0.1})
-    assert (both.model.sigreg_weight, both.model.aux_fb_weight) == (0.1, 0.1)
+    # A regulariser beside anything else is allowed: it is not a head, so the
+    # one-signal-per-run rule (which is about two HEADS in one run) does not
+    # apply to it.
+    both = load_run("small", model_overrides={"sigreg_weight": 0.1, "dspark_weight": 0.1})
+    assert (both.model.sigreg_weight, both.model.dspark_weight) == (0.1, 0.1)
 
 
 def test_a_negative_weight_is_loud():

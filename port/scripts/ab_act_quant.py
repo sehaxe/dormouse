@@ -49,7 +49,7 @@ once per forward over the expert activation). A non-`none` arm whose run reports
 the mean, never averaged in. Two things a reader must know about the instrument:
 (1) the EVAL JSONL row carries no counters (`train/loop.py:849` writes
 `step`/`loss`/`bpb`/`scored` only), so the count is read from the `log` rows'
-`counters` dict — and the eval line prints `engram=`/`fb=`, not this field; (2)
+`counters` dict — and the eval line prints `engram=`, not this field; (2)
 the counter is the EXPERT-BANK seam. `TSCTLinear`'s readout / `lm_head` seam and
 the attention upgrade do not count, so `act_quant_arms > 0` proves the experts
 were quantized, not that every seam was.

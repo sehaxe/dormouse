@@ -312,15 +312,6 @@ class ModelConfig:
     shared_rank: int = 192
 
     # --- aux objectives -------------------------------------------------
-    #: The FUTURE-BYTE head (arXiv 2404.19737, `model/fb.py`): a REAL arm, not
-    #: a stub. It is the pre-registered competitor to JEPA
-    #: (AB-PROTOCOL row 1b) — a dense untied `d_model -> vocab` readout over the
-    #: state `lm_head` already reads, one plain CE on the label rolled by -1,
-    #: 196 864 params at `small` (2.14%), no extra forward. 0.0 = off, and the
-    #: default is off: a preset nobody edited must not carry an untrained head.
-    #: `validate` refuses it together with `dspark_weight` — the A/B attributes
-    #: its verdict to ONE signal per run.
-    aux_fb_weight: float = 0.0
     #: ---- the DSpark draft head (2607.05147; port wiring 2026-10-16) ----
     #: The DSpark term adds next-K-byte draft supervision + the acceptance
     #: head. `dspark_weight` = γ (D2: the loss is γ-free, the CALLER scales);
@@ -338,9 +329,6 @@ class ModelConfig:
     #: doc's ONE arm to run first (`docs/research/2026-10-16-jepa-into-dormouse.md`
     #: §3; the burn `l1 + 0.1·koleo` bundle cannot attribute its own 0.082 BPB).
     #: The suggested grid is 0.005 / 0.05 / 0.1 — publish which.
-    #: COEXISTS with `aux_fb_weight` by design: a regulariser and a head are
-    #: different classes, so the one-signal-per-run rule (which is about two
-    #: HEADS in one run) does not apply to this pair.
     sigreg_weight: float = 0.0
     #: ---- the second attention arm (MSA re-entry, ADR-0014; owner 2026-10-16) ----
     #: 1M-context sparse attention BESIDE KDA (which stays the default arm).
@@ -875,12 +863,6 @@ def validate(model: ModelConfig) -> None:
         )
     if model.use_byteflow:
         _validate_byteflow(model)
-    if model.aux_fb_weight < 0.0:
-        loud(
-            f"aux_fb_weight={model.aux_fb_weight} is negative: it is the "
-            f"multiplier on the future-byte CE term, not a sign to flip. "
-            f"Escape: 0.0 (off) or a positive weight (AB-PROTOCOL row 1b: 0.1)."
-        )
     if model.sigreg_weight < 0.0:
         loud(
             f"sigreg_weight={model.sigreg_weight} is negative: it is the "
@@ -888,22 +870,12 @@ def validate(model: ModelConfig) -> None:
             f"(off) or a positive weight (the research doc's grid: 0.005, 0.05, "
             f"0.1 — docs/research/2026-10-16-jepa-into-dormouse.md §3)."
         )
-    if model.aux_fb_weight > 0.0 and model.dspark_weight > 0.0:
-        loud(
-            f"aux_fb_weight={model.aux_fb_weight} with dspark_weight>0: the two aux "
-            f"signals cannot share a run. The A/B (AB-PROTOCOL row 1b) puts the "
-            f"future-byte head against pure CE so its verdict is attributed to "
-            f"ONE signal; a run carrying both moves two things at once and "
-            f"attributes the result to neither. Escape: set dspark_weight = 0.0, or "
-            f"aux_fb_weight = 0.0."
-        )
-
     # The dspark arm's OWN coherence (audit MINOR 12, 2026-10-17): these used to
     # live inside `_validate_byteflow`, which only runs under `use_byteflow`, so
     # the default path accepted `dspark_weight=-1.0` / `dspark_k=0` /
     # `dspark_stride=0` — a field that lies about being refused (§1.7). The
     # byteflow-only interaction (`dspark_weight>0` with the channel's forward)
-    # stays in `_validate_byteflow`; the two-head rule is the aux_fb guard above.
+    # stays in `_validate_byteflow`.
     if model.dspark_weight < 0.0:
         loud(
             f"dspark_weight={model.dspark_weight} is negative: it is γ, the "

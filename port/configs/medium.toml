@@ -43,7 +43,6 @@ engram_lam_max = 0.5
 use_byteflow = false
 moe_lb_coef = 0.01
 dspark_weight = 0.0
-aux_fb_weight = 0.0
 sigreg_weight = 0.0
 act_group = 0
 use_msa = true

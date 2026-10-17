@@ -54,23 +54,6 @@ def kda_field(counters: Counters) -> str:
     return f"kda={arm},n={n}"
 
 
-def fb_field(counters: Counters) -> str:
-    """`fb=<ran>/<asked>` — the future-byte arm, over the TRAINING forwards.
-
-    Read it before believing any future-byte number
-    (`docs/research/2026-10-16-jepa-dspark-alternatives.md` §4.1 item 1, metric
-    2): `0/<n>` means the head was asked at every step and produced no term —
-    a horizon past the sequence length, so the whole arm trained nothing and a
-    2 000-step A/B of it is a 2 000-step A/B of nothing.
-
-    The port's eval forward carries labels (burn's passes `targets = None`, so
-    burn prints the training count). An eval-local count here would be an
-    instrument of the eval, not of the arm, so these are the run's own training
-    counters (`train` passes `total`).
-    """
-    return f"fb={counters.get('fb_ran', 0)}/{counters.get('fb_asked', 0)}"
-
-
 def ckpt_paths(cfg: TrainConfig) -> tuple[Path, Path]:
     base = Path(cfg.out_dir)
     return base / f"{cfg.ckpt_name}.pt", base / f"{cfg.ckpt_name}.config.toml"
@@ -326,12 +309,11 @@ def _eval_loss(
             if device is not None:
                 x, y = x.to(device), y.to(device)
             # `pure=True`: the held-out number is the PREDICTIVE CE alone.
-            # The aux terms (fb/DSpark/SIGReg) are training signals; without
-            # this the fb/dspark arms read ~w*aux_term worse by construction
-            # and the A/B compares two different quantities (measured on the
-            # first aux A/B run: control 3.045 vs fb 3.469 while the arm was
-            # fine). Counters are not bumped on this path — fb=0/0 is the
-            # eval's honest reading of "no aux ran HERE".
+            # The aux terms (DSpark/SIGReg) are training signals; without this
+            # an aux arm reads ~w*aux_term worse by construction and the A/B
+            # compares two different quantities (measured on the first aux A/B
+            # run: control 3.045 vs fb 3.469 while the arm was fine). Counters
+            # are not bumped on this path.
             _, loss, _ = model(x, y, pure=True, breakdown=True, counters=ev_counters, **kw)
             assert loss is not None, "an eval batch must carry targets"
             total += float(loss)
@@ -391,7 +373,6 @@ def _eval_line(
     cfg: TrainConfig,
     max_iter: int,
     device: torch.device | str | None,
-    fb: str,
     step: int,
 ) -> tuple[str, float, int]:
     """The eval line, carrying the depth curve when the config asks for it.
@@ -421,7 +402,7 @@ def _eval_line(
         f"eval step={step} loss={ev:.4f} bpb={bpb(ev):.3f} fin={fin:.4f} "
         f"bpb_fin={bpb(fin):.3f} over {scored} B "
         f"({cfg.eval_batches} x {cfg.batch} x {cfg.seq_len}) "
-        f"engram={eng.get('engram_rows', 0)}/{eng.get('engram_arms', 0)} {fb}"
+        f"engram={eng.get('engram_rows', 0)}/{eng.get('engram_arms', 0)}"
     )
 
     if per_iter:
@@ -841,7 +822,7 @@ def train(
             # reference's `eval()`); the params go back to Y for the next step.
             sf("eval")
             line, ev, scored = _eval_line(
-                model, eval_stream, cfg, run.model.max_iter, device, fb_field(total), step + 1
+                model, eval_stream, cfg, run.model.max_iter, device, step + 1
             )
             sf("train")
             log(line)
@@ -861,7 +842,7 @@ def train(
     if cfg.eval and eval_stream is not None and cfg.steps % cfg.eval_every != 0:
         sf("eval")
         line, _ev, _scored = _eval_line(
-            model, eval_stream, cfg, run.model.max_iter, device, fb_field(total), cfg.steps
+            model, eval_stream, cfg, run.model.max_iter, device, cfg.steps
         )
         sf("train")
         log(line)

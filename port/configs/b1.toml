@@ -74,7 +74,6 @@ use_byteflow = false
 # flooding hot experts; logit-space bias with the integrator is what works).
 moe_lb_coef = 0.01
 dspark_weight = 0.0
-aux_fb_weight = 0.0
 act_group = 0
 
 # The ADAPTIVE DEPTH arm (owner 2026-10-16). TRAIN keys, so they are CLI-only

@@ -20,7 +20,6 @@ from .byteflow import (
 )
 from .engram import Engram, fnv, raw_keys, table_slots
 from .experts import DualLatentGLU, SparseMoE
-from .fb import FB_PARAMS_AT_SMALL, FutureByteHead, future_byte_loss
 from .kda import KDAAttention, fla_status
 from .loopblock import LoopBlock, memory_floor_mix
 from .model import DormouseModel, param_count
@@ -36,8 +35,6 @@ __all__ = [
     "DormouseModel",
     "DualLatentGLU",
     "Engram",
-    "FB_PARAMS_AT_SMALL",
-    "FutureByteHead",
     "KDAAttention",
     "LoopBlock",
     "RateMode",
@@ -51,7 +48,6 @@ __all__ = [
     "effective_bins",
     "fla_status",
     "fnv",
-    "future_byte_loss",
     "make_projection",
     "marginal_gains_exact",
     "marginal_gains_l2",

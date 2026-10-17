@@ -11,10 +11,7 @@
 #     to preserve.
 #  2. `dspark_weight = 0.0` (burn ships 0.05 JEPA+KoLeo plus a DSpark term).
 #     JEPA+KoLeo is NOT ported and is not a key at all; a JEPA key is refused
-#     as unknown rather than silently dropped. The FUTURE-BYTE head IS ported
-#     (`model/fb.py`) and still ships at 0.0: it is AB-PROTOCOL row 1b's A/B
-#     arm (`--set aux_fb_weight=0.1`), and it refuses only when a second aux
-#     signal is on in the same run — one signal per A/B.
+#     as unknown rather than silently dropped.
 #  3. the expert is TSCT2 §14's dual-latent GLU with a shared write and an
 #     always-on shared expert (see configs/b1.toml for the full arithmetic).
 #
@@ -97,18 +94,11 @@ use_byteflow = false
 moe_lb_coef = 0.01
 
 dspark_weight = 0.0  # gamma; >0 builds the DSpark draft head (dspark_k/stride/markov_rank follow)
-# The future-byte head (arXiv 2404.19737, `model/fb.py`): a dense untied
-# `d_model -> vocab` readout over the state lm_head already reads, one plain CE
-# on the label rolled by -1. 196 864 params at this preset's d768/v256 = 2.14%
-# of the burn `small`, no extra forward. This line is the A/B's pure-CE control
-# (AB-PROTOCOL row 1b); the arm is `--set aux_fb_weight=0.1`.
-aux_fb_weight = 0.0
 # SIGReg / LeJEPA (arXiv:2511.08544, model/sigreg.py): a REGULARISER, not a
 # head — `CE + sigreg_weight * sigreg_loss(z)` on the strided sample of the
 # state lm_head reads, no teacher / no predictor / no second forward / 0 params.
 # 0.0 = the pure-CE control. The grid is 0.005 / 0.05 / 0.1 (the research doc
-# docs/research/2026-10-16-jepa-into-dormouse.md §3, the ONE arm to run first);
-# it coexists with aux_fb_weight by design (regulariser vs head).
+# docs/research/2026-10-16-jepa-into-dormouse.md §3, the ONE arm to run first).
 sigreg_weight = 0.0
 act_group = 0
 

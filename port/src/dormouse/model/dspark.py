@@ -49,16 +49,15 @@ algebra as `binary_cross_entropy_with_logits`, smooth, and its derivative is
 
 ## The integration hook this module expects (a LATER commit, not this one)
 
-`model.py`'s byte-LM forward, beside the `fb` term (`model.py:210-216`), and
-nowhere else:
+`model.py`'s byte-LM forward, and nowhere else:
 
     if cfg.dspark_weight > 0.0:
         loss = loss + cfg.dspark_weight * dspark_aux_loss(
             self.dspark, hn.to(torch.float32), input_ids, logits, counters=counters
         )
 
-with the head built IFF `cfg.dspark_weight > 0.0` (the `fb` rule, `model.py:83-85`,
-so a preset that never arms it keeps today's parameter set and checkpoint), and
+with the head built IFF `cfg.dspark_weight > 0.0` (so a preset that never arms
+it keeps today's parameter set and checkpoint), and
 NOT in any decode forward: a decode pass has no labels and no window, and the
 burn side gates the aux graph on `targets.is_some()` for exactly that reason.
 

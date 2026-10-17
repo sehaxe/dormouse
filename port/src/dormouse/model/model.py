@@ -13,21 +13,11 @@ over `max_iter + 1` terms. See `DormouseModel.forward` for why the final term
 is not optional. There is no KL term and no `p_dist`: they were deleted with
 PonderNet (ADR-0013).
 
-The one aux term the port carries is the FUTURE-BYTE head (arXiv:2404.19737,
-`fb.py`), off at its default weight 0.0: a dense untied `d_model -> vocab`
-readout over the same `norm(out)` `lm_head` reads, one plain CE on the label
-rolled by -1. It is AB-PROTOCOL row 1b's pre-registered competitor to JEPA at
-**our 2.1% weighting claim, verified in the research doc**
-(`docs/research/2026-10-16-jepa-dspark-alternatives.md` §1.3/§4.1: 196 864
-params at our d768 = 2.14% of the burn `small`, no extra forward).
-
 The port also carries one REGULARISER, SIGReg (`sigreg.py`, default weight 0.0):
 `CE + sigreg_weight · sigreg_loss(z)` over the strided sample of the same
 `norm(out)` state — teacher-free, predictor-free, mask-free, 0 parameters, no
 second forward (`docs/research/2026-10-16-jepa-into-dormouse.md` §2/§3, the ONE
-arm to run first). A regulariser and a head are different classes, so `validate`
-allows it beside `aux_fb_weight`; the one-signal-per-run rule is about two HEADS
-in one run.
+arm to run first).
 """
 
 from __future__ import annotations
@@ -47,7 +37,6 @@ from .byteflow import (
     count_channel,
 )
 from .dspark import DSparkHead, dspark_aux_loss
-from .fb import FutureByteHead, future_byte_loss
 from .loopblock import LoopBlock
 from .sigreg import sigreg_loss, stride_sample
 from .tsct import make_projection, set_factor_qat_seed
@@ -83,13 +72,6 @@ class DormouseModel(nn.Module):
         head_rank = min(cfg.rank, d, cfg.vocab)
         self.lm_head = make_projection(d, cfg.vocab, cfg, rank=head_rank, device=device)
         self.bf = bf_for_model(cfg, device=device)
-        # The future-byte head exists IFF its weight is non-zero (`fb.py`,
-        # burn's `future_byte.rs:182`): at 0.0 the parameter set, the checkpoint
-        # and every measured preset count are exactly today's, which is what
-        # makes pure CE a valid control without a re-baseline.
-        self.fb: FutureByteHead | None = (
-            FutureByteHead(d, cfg.vocab, device=device) if cfg.aux_fb_weight > 0.0 else None
-        )
         # The DSpark draft head (2607.05147): built only when the weight is on
         # — at 0.0 the parameter set and every preset count match today's.
         self.dspark: DSparkHead | None = (
@@ -209,11 +191,7 @@ class DormouseModel(nn.Module):
         # model constructors deliberately do NOT call `validate` — so the same
         # refusal is held here, at the runtime seam (ADR-0019's "a term with
         # nothing to act on").
-        assert (
-            self.cfg.dspark_weight == 0.0
-            and self.cfg.aux_fb_weight == 0.0
-            and self.cfg.sigreg_weight == 0.0
-        ), (
+        assert self.cfg.dspark_weight == 0.0 and self.cfg.sigreg_weight == 0.0, (
             "the byteflow channel carries no aux term: validate refuses the aux weights "
             "and sigreg_weight with use_byteflow - set them to 0"
         )
@@ -288,22 +266,13 @@ class DormouseModel(nn.Module):
             # the curve). One divisor, the count of terms it divides.
             T = self.cfg.max_iter if depth is None else depth
             loss = (rec_sum + ce_final) / (T + 1)
-            if pure:
-                # `pure=True` reads the PREDICTIVE CE alone (the aux terms are
-                # training signals, not part of the model's held-out quality).
-                # Without this the A/B compares two DIFFERENT quantities: the
-                # fb/dspark arms' eval loss carries +w*aux_term and reads ~0.3
-                # BPB worse by construction (measured on the first A/B run,
-                # 2026-10-16 — control 3.045 vs fb 3.469 while the fb ARM's
-                # own counters showed the head was fine).
-                pass
-            elif self.fb is not None:
-                # The same readout `lm_head` reads, the same graph (`fb.py`):
-                # no teacher forward, no detach, no second pass over the loop —
-                # the A/B arm is this term and nothing else.
-                loss = loss + self.cfg.aux_fb_weight * future_byte_loss(
-                    self.fb, hn.to(torch.float32), targets, counters
-                )
+            # `pure=True` reads the PREDICTIVE CE alone (the aux terms are
+            # training signals, not part of the model's held-out quality).
+            # Without it the A/B compares two DIFFERENT quantities: an aux
+            # arm's eval loss carries +w*aux_term and reads ~0.3 BPB worse by
+            # construction (measured on the first A/B run, 2026-10-16 —
+            # control 3.045 vs fb 3.469 while the arm's own counters showed
+            # the head was fine).
             if not pure and self.cfg.sigreg_weight > 0.0:
                 # SIGReg (arXiv:2511.08544, `sigreg.py`): ONE term on the state
                 # `lm_head` already reads, no teacher, no predictor, no mask, no
