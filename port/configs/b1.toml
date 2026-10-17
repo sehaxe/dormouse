@@ -43,7 +43,8 @@ moe_topk = 2
 # capacity 1.0 (cap 32) dropping 12.5% of assignments and LFB shaving only
 # to 11.3%, while cap 64 costs +4.5% step time for 0-3.8% drops. Capacity
 # wins: an assignment dropped is a gradient never seen.
-moe_capacity = 2.0
+moe_capacity = 0.0  # DROPLESS (audit CRITICAL 3, 2026-10-17): cap 2.0 measured 38026/49152 = 77% of assignments DROPPED at step 1 (the init router is skewed; the small-model sweep that justified 2.0 does not transfer to E=1024). Dropless keeps every assignment; the Triton grouped GEMM's empty-block exit makes it affordable (16.5 ms fwd at this shape, bench_moe_dropless).
+moe_kernel = "triton"  # the dropless route's fast arm (measured: 37.9x the naive ragged loop); a device/dtype the kernel cannot serve falls back COUNTED to naive.
 # SL1 host-offload of the routed expert pass (docs/research/
 # 2026-10-16-budget-savers.md §5): the MoE block owns the activation peak, and
 # this pass's `[E, cap, d]` / `[E, cap, f]` banks own it. `moe_offload` parks
