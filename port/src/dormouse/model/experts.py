@@ -542,15 +542,42 @@ class SparseMoE(nn.Module):
         parameters' in-place `_version`: an optimizer step bumps it, nothing
         stale survives; one conversion per step is the honest floor, zero
         conversions inside the step.
+
+        **`_version` alone was a one-step zero-gradient bug** (battery
+        2026-10-17, measured 20/20 dead on both adjoints). The eval forward runs
+        on the SAME model under `torch.no_grad()` (`train/loop.py`), and an
+        optimizer step has just bumped `_version`, so the eval is exactly the
+        call that REBUILDS the entry — with `requires_grad=False` stacks. The
+        next training step's key then matches, the bank is read as a constant,
+        and every expert parameter comes back with `.grad is None` until some
+        other `_version` bump happens to rebuild it. So the grad state is part
+        of the key, a no-grad build is never STORED, and a stored entry that
+        cannot serve a tracked call is stale whatever the key says.
         """
+        grad = torch.is_grad_enabled()
+        # `want` is what the cached bank must carry a graph FOR: a frozen expert
+        # bank cannot, and keying on `is_grad_enabled()` alone would rebuild the
+        # same untracked stack on every forward of a frozen model.
+        want = grad and self.experts[0].gate_u.requires_grad
         key = (
             dt,
             self.factor_qat,
             self.factor_qat_alpha,  # the anneal ramp moves this every step
             tuple(p._version for e in self.experts for p in e.parameters()),
+            want,
         )
         cached = getattr(self, "_bank_cache", None)
-        if cached is None or cached[0] != key:
+        if cached is not None:
+            # A TRACKED entry serves a no-grad forward as it stands — same
+            # tensors, no gradient wanted — so the eval keeps the cache hit. The
+            # reverse (an untracked entry serving a tracked forward) is the
+            # defect above, and it is what the key and the second clause forbid.
+            reusable = cached[0] == key or (
+                not grad and cached[0][:-1] == key[:-1] and cached[0][-1]
+            )
+            if not reusable or (want and not cached[1][0].requires_grad):
+                cached = None
+        if cached is None:
             # The stack is built PER EXPERT, converted to `dt` BEFORE the stack
             # (audit 2026-10-17, MAJOR 7): stacking in fp32 first costs a
             # 1.43 GB transient per name at b1 (`[1024, 5461, 64]`) and that
@@ -582,7 +609,8 @@ class SparseMoE(nn.Module):
                     for name in ("gate_s", "up_s")
                 ),
             )
-            self._bank_cache = cached
+            if want:
+                self._bank_cache = cached
         mats, scales = cached[1], cached[2]
         return (mats[0], mats[1], mats[2], scales[0], scales[1])
 
