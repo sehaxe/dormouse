@@ -374,6 +374,17 @@ def sft_cmd(
     n_tasks: Annotated[
         int, typer.Option(help="code and math tasks per class in the built corpus")
     ] = 32,
+    chat_data: Annotated[
+        Path | None,
+        typer.Option(
+            "--chat-data",
+            help="JSONL of {instruction, response} rows mixed into the built corpus",
+        ),
+    ] = None,
+    chat_cap: Annotated[
+        int | None,
+        typer.Option("--chat-cap", help="max chat rows used (a deterministic sample)"),
+    ] = None,
     steps: Annotated[int | None, typer.Option] = None,
     batch: Annotated[
         int | None, typer.Option(help="windows per step are batch*seq_len bytes")
@@ -429,13 +440,26 @@ def sft_cmd(
         )
     path = Path(run.train.data)
     if build_sft:
-        built = build_sft_corpus(path, run.train.seed, seq_len=run.train.seq_len, n_tasks=n_tasks)
+        built = build_sft_corpus(
+            path,
+            run.train.seed,
+            seq_len=run.train.seq_len,
+            n_tasks=n_tasks,
+            chat_jsonl=chat_data,
+            chat_cap=chat_cap,
+        )
         dropped = (
             f" · {built['dropped']} dropped (longer than one window)" if built["dropped"] else ""
         )
+        chat_line = ""
+        if built["chat_loaded"]:
+            chat_line = (
+                f" · chat {built['chat_used']}/{built['chat_loaded']} used"
+                f" ({built['chat_dropped_long']} long, {built['chat_dropped_dirty']} dirty dropped)"
+            )
         console.print(
             f"[green]sft corpus[/] {built['records']} records x {built['record_bytes']} B "
-            f"= {built['bytes']:,} B -> {built['path']} (seed {built['seed']}){dropped}"
+            f"= {built['bytes']:,} B -> {built['path']} (seed {built['seed']}){dropped}{chat_line}"
         )
     elif not path.is_file():
         raise LoudError(

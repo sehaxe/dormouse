@@ -13,8 +13,10 @@ template, and a loop whose cross-entropy counts only the answer's bytes.
 `0x01` opens the user turn, `0x02` the assistant turn, `0x03` closes the answer,
 `0x00` pads the record to the window. Every byte of every instruction and answer
 is asserted marker-free at render time ([`render`]) — and the assert can only
-pass because the sources are generated text (the seeded tasks of `post/tasks.py`
-and the hand-written `GENERIC_QA`), never arbitrary user bytes. `0x03` and
+pass because the sources are generated text (the seeded tasks of `post/tasks.py`,
+the hand-written `GENERIC_QA`, the generated `_ru_pairs` bank, and the distill
+JSONL rows, which are pre-filtered for sentinels and for one-window fits before
+they enter the build), never arbitrary user bytes. `0x03` and
 `0x00` exist because a fixed-size window needs an answer END: without them the
 only way to keep a window single-example is to train on padding.
 
@@ -141,9 +143,139 @@ GENERIC_QA: tuple[tuple[str, str], ...] = (
 )
 
 
+def _ru_pairs() -> list[tuple[str, str]]:
+    """The Russian half: generated small talk, arithmetic drills and simple facts.
+
+    `GENERIC_QA` carries ~35 RU pairs; a chat that only ever hears English plus
+    a handful of Russian sentences drifts to English on a Russian prompt. This
+    bank is a pure function (no RNG) so the corpus stays deterministic, and
+    every answer stays short — the template renders both halves into one
+    `seq_len` window.
+    """
+    out: list[tuple[str, str]] = []
+    hello_q = [
+        "Привет",
+        "Привет!",
+        "Здравствуй",
+        "Здравствуйте",
+        "Добрый день",
+        "Добрый вечер",
+        "Доброе утро",
+        "Хай",
+    ]
+    hello_a = ["Привет!", "Здравствуй!", "Привет, чем помочь?", "Добрый день!"]
+    for i, q in enumerate(hello_q):
+        out.append((q, hello_a[i % len(hello_a)]))
+    out += [
+        ("Как дела?", "Хорошо, спасибо! А у тебя?"),
+        ("Как у тебя дела?", "Нормально, спасибо."),
+        ("Как тебя зовут?", "Меня зовут dormouse."),
+        ("Как твоё имя?", "answer: dormouse"),
+        ("Ты человек?", "answer: нет"),
+        ("Ты робот?", "answer: да, я программа."),
+        ("Ты живой?", "answer: нет, я языковая модель."),
+        ("Что ты такое?", "Я маленькая байтовая языковая модель."),
+        ("Кто ты?", "Я dormouse — маленькая языковая модель."),
+        ("Что ты умеешь?", "answer: короткие ответы, арифметика, простые функции."),
+        ("Что ты не умеешь?", "answer: длинные рассуждения и открытый чат — слабые."),
+        ("Ты умный?", "Я маленькая модель: на простом отвечаю, на сложном ошибаюсь."),
+        ("Ты уверен?", "answer: настолько, насколько позволяют мои данные."),
+        ("Скажи что-нибудь честное.", "Я могу ошибаться — проверяй мои ответы."),
+        ("Извинись.", "Извини, пожалуйста."),
+        ("Скажи спасибо.", "Спасибо!"),
+        ("Как сказать 'hello' по-русски?", "answer: привет"),
+        ("Переведи 'cat' на русский.", "answer: кошка"),
+        ("Переведи 'dog' на русский.", "answer: собака"),
+        ("Переведи 'house' на русский.", "answer: дом"),
+        ("Переведи 'water' на русский.", "answer: вода"),
+        ("Сколько дней в неделе?", "answer: 7"),
+        ("Сколько дней в году?", "answer: 365"),
+        ("Сколько месяцев в году?", "answer: 12"),
+        ("Сколько часов в сутках?", "answer: 24"),
+        ("Сколько сторон у квадрата?", "answer: 4"),
+        ("Сколько сторон у треугольника?", "answer: 3"),
+        ("Какого цвета небо днём?", "answer: голубое"),
+        ("Какого цвета трава?", "answer: зелёная"),
+        ("Какого цвета снег?", "answer: белый"),
+        ("Какого цвета солнце?", "answer: жёлтое"),
+        ("Какого цвета море?", "answer: синее"),
+        ("Столица России?", "answer: Москва"),
+        ("Столица Франции?", "answer: Париж"),
+        ("Столица Германии?", "answer: Берлин"),
+        ("Столица Японии?", "answer: Токио"),
+        ("Столица Италии?", "answer: Рим"),
+        ("Как называется наша планета?", "answer: Земля"),
+        ("Назови первый день недели.", "answer: понедельник"),
+        ("Что больше: 5 или 8?", "answer: 8"),
+        ("Что больше: 3 или 10?", "answer: 10"),
+        ("Число 4 чётное?", "answer: да"),
+        ("Число 7 чётное?", "answer: нет"),
+        ("Посчитай от 1 до 5.", "answer: 1, 2, 3, 4, 5"),
+        ("Продолжи: 2, 4, 6, ...", "answer: 8"),
+        ("Продолжи: 1, 2, 3, ...", "answer: 4"),
+        ("Что идёт после 9?", "answer: 10"),
+        ("Что идёт перед 5?", "answer: 4"),
+        ("Скажи 'до свидания' вежливо.", "До свидания, хорошего дня!"),
+        ("Пока!", "Пока! Хорошего дня."),
+    ]
+    # The drills: every table a small model should hold without thinking.
+    for a in range(1, 13):
+        for b in range(1, 13):
+            out.append((f"Сколько будет {a} + {b}?", f"answer: {a + b}"))
+    for a in range(2, 13):
+        for b in range(1, a):
+            out.append((f"Сколько будет {a} - {b}?", f"answer: {a - b}"))
+    for a in range(2, 10):
+        for b in range(2, 10):
+            out.append((f"Сколько будет {a} * {b}?", f"answer: {a * b}"))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # the corpus
 # ---------------------------------------------------------------------------
+
+
+def _chat_pairs(path: str | Path, seq_len: int) -> tuple[list[tuple[str, str]], dict[str, int]]:
+    """Load `{"instruction", "response"}` JSONL rows that can fit ONE window.
+
+    The build's own rule is applied here, early: an example longer than
+    `seq_len` B of content can never be rendered into a record, so it is dropped
+    with a count rather than in the build loop (where a `cap` would otherwise
+    spend slots on rows that cannot land). Sentinel-carrying rows are dropped
+    the same way — the marker license requires it, and real web text can carry
+    a stray 0x00. The rows are returned in file order; the caller shuffles
+    deterministically before applying its cap.
+    """
+    import json
+
+    p = Path(path)
+    if not p.is_file():
+        loud(
+            f"sft --chat-data: {p} does not exist. Escape: a JSONL file with "
+            f"{{instruction, response}} rows (the distill exports use that pair)."
+        )
+    pairs: list[tuple[str, str]] = []
+    dropped_long = dropped_dirty = 0
+    for line in p.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        row = json.loads(line)
+        instruction = str(row.get("instruction", "")).strip()
+        answer = str(row.get("response", "")).strip()
+        if not instruction or not answer:
+            dropped_dirty += 1
+            continue
+        raw_i, raw_a = instruction.encode(), answer.encode()
+        if len(raw_i) + len(raw_a) + 4 > seq_len:
+            dropped_long += 1
+            continue
+        if any(b in raw_i for b in SENTINELS) or any(b in raw_a for b in SENTINELS):
+            dropped_dirty += 1
+            continue
+        pairs.append((instruction, answer))
+    return pairs, {"chat_dropped_long": dropped_long, "chat_dropped_dirty": dropped_dirty}
 
 
 def _assert_clean(text: str) -> None:
@@ -175,9 +307,11 @@ def render(instruction: str, answer: str) -> bytes:
     )
 
 
-def _examples(seed: int, n_tasks: int) -> list[tuple[str, str]]:
-    """The pairs: seeded code + math tasks (REUSED, not re-invented) + generic QA."""
-    out = list(GENERIC_QA)
+def _examples(
+    seed: int, n_tasks: int, chat: list[tuple[str, str]] | None = None
+) -> list[tuple[str, str]]:
+    """The pairs: generic QA + the RU bank + seeded tasks (REUSED) + chat rows."""
+    out = list(GENERIC_QA) + _ru_pairs()
     for task in build_tasks("code", seed, n=n_tasks):
         # The task's prompt is the instruction (signature + docstring); the
         # hidden reference implementation is the answer.
@@ -186,15 +320,31 @@ def _examples(seed: int, n_tasks: int) -> list[tuple[str, str]]:
         # The math prompt asks for a final `answer: <value>` line, so the answer
         # teaches that format too (it is what `verifiers._final_answer` reads).
         out.append((task.prompt, f"answer: {task.solution}"))
+    if chat:
+        out.extend(chat)
     return out
 
 
-def build_sft_corpus(out_path: str | Path, seed: int, *, seq_len: int, n_tasks: int = 32) -> dict:
+def build_sft_corpus(
+    out_path: str | Path,
+    seed: int,
+    *,
+    seq_len: int,
+    n_tasks: int = 32,
+    chat_jsonl: str | Path | None = None,
+    chat_cap: int | None = None,
+) -> dict:
     """Write the instruction corpus: fixed `seq_len + 1`-byte records, deterministic.
 
-    A pure function of `(seed, seq_len, n_tasks)`: the same arguments produce the
-    same bytes in any process (the shuffle is a `random.Random(seed)`), which is
-    what makes an SFT run replayable (ADR-0021's determinism discipline).
+    A pure function of `(seed, seq_len, n_tasks, chat_jsonl, chat_cap)`: the same
+    arguments produce the same bytes in any process (the shuffles are
+    `random.Random(seed)` / `Random(seed + 1)`), which is what makes an SFT run
+    replayable (ADR-0021's determinism discipline).
+
+    `chat_jsonl` mixes external `{instruction, response}` rows (the distill
+    exports) into the corpus: they are pre-filtered to one-window fits, shuffled
+    deterministically and cut to `chat_cap`. Without it the corpus is the small
+    seeded set, which is enough to learn the FORMAT and nothing else.
 
     An example that does not fit in ONE window is DROPPED, not truncated (a
     truncated answer teaches the model to stop mid-function) and not wrapped (a
@@ -206,7 +356,19 @@ def build_sft_corpus(out_path: str | Path, seed: int, *, seq_len: int, n_tasks: 
         loud(f"build_sft_corpus seq_len={seq_len}: a window must hold a marker pair")
     if n_tasks < 0:
         loud(f"build_sft_corpus n_tasks={n_tasks}: a task count cannot be negative")
-    examples = _examples(seed, n_tasks)
+    if chat_cap is not None and chat_cap < 0:
+        loud(f"build_sft_corpus chat_cap={chat_cap}: a cap cannot be negative")
+    chat: list[tuple[str, str]] = []
+    chat_stats = {"chat_loaded": 0, "chat_used": 0, "chat_dropped_long": 0, "chat_dropped_dirty": 0}
+    if chat_jsonl is not None:
+        chat, dropped = _chat_pairs(chat_jsonl, seq_len)
+        chat_stats.update(dropped)
+        chat_stats["chat_loaded"] = len(chat)
+        random.Random(seed + 1).shuffle(chat)
+        if chat_cap is not None:
+            chat = chat[:chat_cap]
+        chat_stats["chat_used"] = len(chat)
+    examples = _examples(seed, n_tasks, chat)
     random.Random(seed).shuffle(examples)
     record = seq_len + 1
     records: list[bytes] = []
@@ -238,6 +400,7 @@ def build_sft_corpus(out_path: str | Path, seed: int, *, seq_len: int, n_tasks: 
         "seq_len": seq_len,
         "seed": seed,
         "n_tasks": n_tasks,
+        **chat_stats,
     }
 
 

@@ -427,3 +427,44 @@ def test_init_from_seeds_weights_without_the_config_gate(tmp_path):
     torch.save({"model": {"nope": torch.zeros(1)}}, bad)
     with pytest.raises(LoudError, match="do not exist|absent"):
         sft_train(DormouseModel(run.model), run, init_from=str(bad), log=lambda *_: None)
+
+
+def test_chat_jsonl_rows_are_filtered_capped_and_deterministic(tmp_path):
+    """The chat rows go through the build's own window rule: long rows and
+    sentinel-carrying rows are dropped with counts, the cap keeps a
+    deterministic sample, and two builds of one (seed, args) are bit-equal."""
+    import json
+
+    rows = [
+        {"instruction": "Hi there", "response": "Hello!"},
+        {"instruction": "How are you?", "response": "Fine, thanks."},
+        {"instruction": "Too long?", "response": "x" * 600},
+        {"instruction": "Bad\x00byte", "response": "no"},
+        {"instruction": "", "response": "empty instruction"},
+    ]
+    src = tmp_path / "chat.jsonl"
+    src.write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+
+    a = build_sft_corpus(tmp_path / "a.bin", 7, seq_len=64, n_tasks=0, chat_jsonl=src, chat_cap=1)
+    build_sft_corpus(tmp_path / "b.bin", 7, seq_len=64, n_tasks=0, chat_jsonl=src, chat_cap=1)
+    assert (tmp_path / "a.bin").read_bytes() == (tmp_path / "b.bin").read_bytes()
+    assert a["chat_loaded"] == 2 and a["chat_used"] == 1
+    assert a["chat_dropped_long"] == 1 and a["chat_dropped_dirty"] == 2
+
+    with pytest.raises(LoudError, match="does not exist"):
+        build_sft_corpus(
+            tmp_path / "c.bin", 1, seq_len=64, n_tasks=0, chat_jsonl=tmp_path / "no.jsonl"
+        )
+
+
+def test_ru_bank_is_broad_and_fits_one_window():
+    """The RU bank must stay deterministic, wide (>= 200 pairs) and every pair
+    must render into a 512-byte window — it is the fix for an English-drift
+    chat, and it is generated, not sampled."""
+    from dormouse.train.sft import _ru_pairs
+
+    ru = _ru_pairs()
+    assert len(ru) >= 200
+    assert len({q for q, _ in ru}) == len(ru)  # no duplicate prompts
+    assert all(len(render(q, a)) <= 512 for q, a in ru)
+    assert any("Сколько будет" in q for q, _ in ru)  # the drills are there
