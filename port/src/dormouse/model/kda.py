@@ -46,6 +46,33 @@ the spike measured 0.3 % / 1.8 % mean-relative at its own shape. The anchor is a
 naive recurrent reference (`tests/test_kda_gpu.py`), which FLA's own
 `naive_recurrent_kda` agrees with to 1.5e-8 in fp32. The bound asserted on it is
 a WIRING gate (a transposed head axis is O(1) off), not a numerics certificate.
+
+THE CARRIED STATE (`forward_state`) — read from the INSTALLED FLA source, not
+from a doc page (2026-10-17, `.venv/.../fla/ops/kda/`):
+
+* **`chunk_kda` itself takes `initial_state` and returns `final_state`** —
+  `chunk.py:185` / `chunk.py:186`, `[N, HV, K, V]` (`K, V` = head_dim) and
+  **fp32 on both sides**: the forward allocates it fp32
+  (`common/chunk_delta_h.py:707`) and the entry point asserts fp32 on the way
+  back in (`chunk.py:383`). The `fused_recurrent` variant has `h0`/`ht` too, but
+  the chunked one — the arm this model runs — is not the poorer relation here,
+  so the port uses the op it already calls.
+* **The gradient rides the same two arguments**: `ChunkKDAFunction.backward`
+  takes `dht` (`chunk.py:127`) and returns `dh0` (`chunk.py:135`, `:172`), and
+  the boundary state is `save_for_backward`ed (`chunk.py:106`). So a segment's
+  entering state is a real graph edge in BOTH directions — StateFlow's
+  boundary state + gradient propagation (arXiv:2608.06838) — and nothing is
+  detached or truncated.
+* The state is `O(1)` in the sequence length (2·b·H·head_dim² fp32 = 393 KB at
+  the shipped `small`), which is the point of carrying it rather than a KV cache.
+* **The SDPA fallback has no recurrent state to carry** — it is not a
+  recurrence (its own docstring says the delta rule and `beta` do not run
+  there). Its carry is the EXACT causal-attention context (the K/V of the
+  preceding segments, `_sdpa_path`), so a segmented forward on the fallback is
+  still the same function as the one-shot one — which is what makes the CPU
+  gates in `tests/test_longctx.py` mean something. It is linear in the
+  sequence length, and the arm is already COUNTED (`kda=sdpa`) as a
+  degradation, so nothing here pretends to be the fast path.
 """
 
 from __future__ import annotations
@@ -155,21 +182,63 @@ class KDAAttention(nn.Module):
         return x.reshape(b, t, self.n_heads, self.head_dim).transpose(1, 2)
 
     def forward(self, x: torch.Tensor, counters: Counters | None = None) -> torch.Tensor:
-        """`x [b, t, d]` (block-body input) → `[b, t, d]`."""
+        """`x [b, t, d]` (block-body input) → `[b, t, d]`.
+
+        The ONE-SHOT contract: no state in, none out. Every number on record ran
+        through this call; the segmented path uses `forward_state` instead.
+        """
+        return self.forward_state(x, None, counters=counters)[0]
+
+    def forward_state(
+        self,
+        x: torch.Tensor,
+        state: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None = None,
+        counters: Counters | None = None,
+        *,
+        carry: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None]:
+        """`x [b,t,d]` + the state entering this window → (`[b,t,d]`, the state leaving it).
+
+        `carry=False` (the default) is `forward`'s call and returns `None` for
+        the state; `carry=True` is the segmented training path's call and
+        returns the state the NEXT window starts from. `state=None` means "this
+        window starts at position 0" — segment 0 of a segmented run, and the
+        one-shot call, take the same branch, which is why a single full-length
+        segment reproduces the one-shot numbers bit for bit
+        (`tests/test_longctx.py`).
+
+        The state's SHAPE is per arm and both are documented at `_fla_path` /
+        `_sdpa_path`: the fused arm carries the `[b, H, head_dim, head_dim]`
+        fp32 gated-delta state, the SDPA fallback carries its K/V context.
+        """
         b, t, d = x.shape
         counters = Counters() if counters is None else counters
         ok, why = fla_status(x.device)
         if ok:
             counters.count("kda_fla")
-            return self._fla_path(x)
+            return self._fla_path(x, state, carry=carry)
         counters.count("kda_sdpa")
         # The reason is attached to the counter object, not printed per forward:
         # `log line` prints one `kda=` field, and the reason belongs there.
         counters.why = why  # type: ignore[attr-defined]
-        return self._sdpa_path(x, b, t, d)
+        if not carry:
+            return self._sdpa_path(x, b, t, d), None
+        return self._sdpa_path_carry(x, b, t, d, state)
 
-    def _fla_path(self, x: torch.Tensor) -> torch.Tensor:
-        """The real arm: FLA 0.5.2's chunked per-channel gated-delta kernel."""
+    def _fla_path(
+        self,
+        x: torch.Tensor,
+        state: torch.Tensor | None = None,
+        carry: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """The real arm: FLA 0.5.2's chunked per-channel gated-delta kernel.
+
+        `carry=False` is the call that produced every number on record — not one
+        argument of it differs. `carry=True` adds `initial_state` /
+        `output_final_state` (both real arguments of `chunk_kda`, `chunk.py:185-186`;
+        see the module docstring for the gradient side), so segment s's state is
+        the graph edge into segment s+1.
+        """
         from fla.ops.kda import chunk_kda
 
         b, t, d = x.shape
@@ -177,20 +246,54 @@ class KDAAttention(nn.Module):
         q, k, v, g, beta = self.projections(x)
         if dt != torch.float32:
             q, k, v, beta = q.to(dt), k.to(dt), v.to(dt), beta.to(dt)
-        out, _ = chunk_kda(
+        if not carry:
+            out, _ = chunk_kda(
+                q,
+                k,
+                v,
+                g=g,
+                beta=beta,
+                scale=self.scale,
+                use_qk_l2norm_in_kernel=True,  # burn-kda K3: L2Norm on q/k, in kernel
+            )
+            assert out.shape == (b, t, self.n_heads, self.head_dim), f"chunk_kda {tuple(out.shape)}"
+            return out.reshape(b, t, d), None
+        out, ht = chunk_kda(
             q,
             k,
             v,
             g=g,
             beta=beta,
             scale=self.scale,
-            use_qk_l2norm_in_kernel=True,  # burn-kda K3: L2Norm on q/k, in kernel
+            initial_state=state,  # None = position 0 (segment 0)
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
         )
         assert out.shape == (b, t, self.n_heads, self.head_dim), f"chunk_kda {tuple(out.shape)}"
-        return out.reshape(b, t, d)
+        assert ht is not None and ht.dtype == torch.float32, "the boundary state is fp32"
+        want = (b, self.n_heads, self.head_dim, self.head_dim)
+        assert ht.shape == want, f"boundary state {tuple(ht.shape)} != {want}"
+        return out.reshape(b, t, d), ht
 
     def _sdpa_path(self, x: torch.Tensor, b: int, t: int, d: int) -> torch.Tensor:
         """COUNTED fallback: causal SDPA over L2-normalized q/k, g as an output gate.
+
+        The ONE-SHOT call — signature and return value exactly as they were, so
+        the arm's own gates and every recorded number keep their call. The
+        segmented path's call is `_sdpa_path_carry`, which is the same function
+        with the context of the preceding windows (see there).
+        """
+        return self._sdpa_path_carry(x, b, t, d, None)[0]
+
+    def _sdpa_path_carry(
+        self,
+        x: torch.Tensor,
+        b: int,
+        t: int,
+        d: int,
+        state: tuple[torch.Tensor, torch.Tensor] | None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """`_sdpa_path` + the state: (`[b,t,d]`, the `(k, v)` context leaving this window).
 
         Counted because it is a DEGRADATION, not a different name for the same
         function: the delta-rule recurrence and `beta` do not run here. The
@@ -200,11 +303,38 @@ class KDAAttention(nn.Module):
         `use_qk_l2norm_in_kernel=True`: burn-kda K3 normalizes q/k, and an
         un-normalized fallback would make the two arms two different models
         (raw q/k are 1e17-explosive, see the module docs).
+
+        The CARRIED state is the exact causal-attention context `(k, v)` of the
+        windows before this one, in the `[b, h, t, hd]` head layout — this arm
+        has no recurrent state to carry (it is not a recurrence), and the
+        context is what makes the segmented forward the SAME function as the
+        one-shot one. It is linear in the sequence length, unlike the fused
+        arm's `O(1)` state, and the arm is already COUNTED as the degradation it
+        is. `state=None` (position 0) takes the `is_causal` branch, so segment 0
+        is bit-identical to the one-shot call's own kernel.
         """
         q = F.normalize(self._heads(self.q_proj(x), b, t), dim=-1)
         k = F.normalize(self._heads(self.k_proj(x), b, t), dim=-1)
         v = self._heads(self.v_proj(x), b, t)
-        y = F.scaled_dot_product_attention(q * self.scale, k, v, is_causal=True)
+        if state is None:
+            kk, vv = k, v
+            y = F.scaled_dot_product_attention(q * self.scale, kk, vv, is_causal=True)
+        else:
+            kp, vp = state
+            tp = int(kp.shape[2])
+            assert tp > 0, "an empty context is `state=None`, not a zero-width cache"
+            kk, vv = torch.cat([kp, k], dim=2), torch.cat([vp, v], dim=2)
+            # Query i of this window is global position tp+i, so it reads keys
+            # 0..tp+i. `is_causal=True` cannot express that: with L_q != L_k torch
+            # aligns the mask to the top-left, which would read keys 0..i.
+            cols = torch.arange(tp + t, device=x.device).view(1, -1)
+            rows = torch.arange(t, device=x.device).view(-1, 1) + tp
+            y = F.scaled_dot_product_attention(q * self.scale, kk, vv, attn_mask=cols <= rows)
         gate = torch.sigmoid(self.g_proj(x))  # [b, t, d]
         y = y.transpose(1, 2).reshape(b, t, d) * gate
-        return y
+        # The state returned is the ACCUMULATED context, not this window's own
+        # keys: a third segment would otherwise read only the second one's keys
+        # and lose the first (the gate in `test_segment_zero_moves_segment_one`
+        # runs two segments and cannot see that, `test_segmented_logits…[16]`
+        # runs four and does).
+        return y, (kk, vv)

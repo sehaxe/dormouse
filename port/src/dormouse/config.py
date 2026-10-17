@@ -499,6 +499,37 @@ class TrainConfig:
     #: `rand_depth` is (the arm must show its own curve), and can be asked for
     #: explicitly on a fixed-depth run.
     eval_depths: bool = False
+    #: SEGMENTED TRAINING: cut the training window into segments of this many
+    #: bytes and carry the KDA state across the cuts (`loopblock._forward_segmented`,
+    #: the StateFlow pattern — arXiv:2608.06838 — instead of truncated BPTT), so
+    #: a sequence longer than one forward fits in VRAM can be trained. It is a
+    #: MEMORY decision and not a model change: the logits agree with the
+    #: one-shot forward to fp32 round-off (`tests/test_longctx.py`), the returned
+    #: logits keep the `[b*seq_len, vocab]` shape, and the loss is the same
+    #: `(Σ CE_i + CE_final)/(T+1)`, so nothing downstream changes.
+    #:
+    #: **`0` = OFF, and that is the default**: the field must be set explicitly
+    #: to enter the branch. The state carried is PER ITERATION SLOT (the loop
+    #: calls the attention arm once per iteration), the gradient rides it (the
+    #: fused op takes `dht` and returns `dh0` — `fla/ops/kda/chunk.py:127`, `:172`),
+    #: and each segment runs inside `checkpoint(use_reentrant=False)` so its
+    #: activations are recomputed in the backward rather than stored.
+    #:
+    #: Refused loudly (see `_validate_segment`): `>= seq_len` (the window is one
+    #: segment — pointless), `< 0` (0 is the off value), a non-divisor of
+    #: `seq_len` (a short last segment would weight its bytes more than the
+    #: others, so the loss would stop being the one-shot loss), `use_byteflow`
+    #: (the loop runs over patch latents, not bytes), `use_msa` (the block-sparse
+    #: arm selects blocks INSIDE a window, so cutting the window would change the
+    #: attention pattern itself), `rand_depth` (two unvalidated axes in one
+    #: run: the depth arm is un-A/B'd, and attributing a result to either would
+    #: be a guess), and `moe_topk > 0` (the capacity-padded dispatch DROPS the
+    #: rows past its per-expert capacity, so which tokens get an expert is a
+    #: function of the other tokens in the same forward — measured 0.39 on the
+    #: tiny readout at `moe_capacity=1.0`, 2026-10-17; `small`'s dense blend is
+    #: exact). The last three are the finding this feature came with: each one
+    #: would have been a SILENT model change wearing a memory flag.
+    segment_len: int = 0
     stress: bool = _unsupported(False, "stress protocol (--stress)")
 
 
@@ -868,6 +899,80 @@ def _refuse_ladder_rung(rung: str) -> str:
     )
 
 
+def _validate_segment(model: ModelConfig, tcfg: TrainConfig) -> None:
+    """The segmented-training flag against the window and the arms it cannot ride.
+
+    All of these are refusals rather than fallbacks, for the reason the whole
+    config layer exists: a `segment_len` that quietly did nothing (or that cut
+    the window in a way that changed the objective or the model) would show the
+    flag on while the run reported it, which is the class of defect ADR-0019 is
+    about. `0` is the OFF value and the only value any number on record ran.
+    """
+    n = tcfg.segment_len
+    if n < 0:
+        loud(
+            f"segment_len={n} is negative: it is a count of bytes per segment, and "
+            f"0 is the OFF value (the one-shot forward). Escape: 0, or a positive "
+            f"divisor of seq_len={tcfg.seq_len}."
+        )
+    if n == 0:
+        return
+    if n >= tcfg.seq_len:
+        loud(
+            f"segment_len={n} >= seq_len={tcfg.seq_len}: the window is one segment, so "
+            f"the segmented path would run the same forward through a checkpoint "
+            f"wrapper and buy nothing while the log line reported it on. Escape: a "
+            f"segment_len < seq_len (the recipe's 1024 at seq 8192 is 8 segments), or "
+            f"segment_len=0 for the one-shot path."
+        )
+    if tcfg.seq_len % n != 0:
+        loud(
+            f"segment_len={n} does not divide seq_len={tcfg.seq_len}: a shorter last "
+            f"segment is REFUSED rather than allowed, because the per-iteration CE is "
+            f"a MEAN per segment — an uneven cut would weight the short segment's "
+            f"bytes more, so the loss would stop being the one-shot loss and the "
+            f"segmented run would be a different objective wearing a memory flag. "
+            f"Escape: a divisor of {tcfg.seq_len}."
+        )
+    if model.use_byteflow:
+        loud(
+            f"segment_len={n} with use_byteflow=true: the byteflow shapes run the loop "
+            f"over K patch latents (or not at all), not over the byte window, so there "
+            f"is no byte sequence to cut into segments. Escape: use_byteflow=false, or "
+            f"segment_len=0."
+        )
+    if model.use_msa:
+        loud(
+            f"segment_len={n} with use_msa=true: the block-sparse arm selects its "
+            f"blocks INSIDE one window, so cutting the window changes the attention "
+            f"pattern itself (a block spanning a cut can no longer be selected) — that "
+            f"is a model change, and this flag is allowed to change only the memory. "
+            f"Escape: use_msa=false, or segment_len=0."
+        )
+    if tcfg.rand_depth:
+        loud(
+            f"segment_len={n} with rand_depth=true: the adaptive-depth arm is "
+            f"un-A/B'd, and segmenting adds a second axis (the carried state at depth "
+            f"T vs the one-shot forward at depth T) — a result from a run carrying both "
+            f"would be attributable to neither. Escape: rand_depth=false, or "
+            f"segment_len=0."
+        )
+    if model.moe_topk > 0:
+        loud(
+            f"segment_len={n} with moe_topk={model.moe_topk} (the sparse dispatch): the "
+            f"capacity-padded top-k DROPS the rows past `ceil(moe_capacity · tokens · "
+            f"k / E)` per expert, so WHICH tokens get an expert is a function of how "
+            f"many other tokens share their forward — cutting the window changes that "
+            f"set and the segmented forward stops being the one-shot forward "
+            f"(measured on the tiny shape at moe_capacity=1.0: 0.39 on the readout, "
+            f"2026-10-17; at moe_capacity=2.0 no drop happened on that shape, which is "
+            f"not a promise a collapsing router keeps). Escape: moe_topk=0, the dense "
+            f"blend `small` ships — there the experts blend per position and the "
+            f"segmented forward is the one-shot forward to fp32 round-off — or "
+            f"segment_len=0."
+        )
+
+
 def _candidates(name: str) -> list[Path]:
     """Search order, burn's: cwd `configs/`, then the port's own `configs/`."""
     return [Path(f"configs/{name}.toml"), PRESET_DIR / f"{name}.toml"]
@@ -992,6 +1097,10 @@ def load_run(
                 "`engram_ram` would host nothing while the optimizer silently keeps its "
                 "in-VRAM shape. Escape: use_engram=true, or engram_ram=false."
             )
+    # The segmented-training flag is a MODEL-shape decision too: it meets the
+    # window AND the arms, so its refusals live here, where both halves are
+    # resolved — the same shape as the `engram_ram` block above.
+    _validate_segment(model, tcfg)
     return RunConfig(source=preset, model=model, train=tcfg)
 
 

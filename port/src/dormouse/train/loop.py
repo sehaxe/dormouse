@@ -547,6 +547,15 @@ def train(
         # `None` (the default and every other config) keeps the call unchanged.
         depth = _sample_depth(cfg.seed, step, run.model.max_iter) if cfg.rand_depth else None
         kw = {} if depth is None else {"depth": depth}
+        if cfg.segment_len:
+            # The SEGMENTED training forward: the window is cut into
+            # `segment_len`-position segments and the KDA state is carried across
+            # them as a graph edge (`loopblock._forward_segmented`), so a window
+            # longer than one forward fits in VRAM can be trained. Same logits
+            # shape, same loss. The EVAL path does not pass it: an eval saves no
+            # activations, so it needs no segmentation, and leaving it one-shot
+            # keeps the held-out number comparable with the record.
+            kw["segment_len"] = cfg.segment_len
         logits, loss, step_counters = model(x, y, **kw)
         assert logits.shape[-1] == run.model.vocab, "logits width != vocab"
         total.merge(step_counters)

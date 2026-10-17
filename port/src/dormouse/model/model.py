@@ -37,7 +37,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from ..config import ModelConfig
-from ..instrument import Counters
+from ..instrument import Counters, loud
 from .byteflow import (
     BfChannel,
     ByteFlowNet,
@@ -120,6 +120,7 @@ class DormouseModel(nn.Module):
         depth: int | None = None,
         pure: bool = False,
         breakdown: bool = False,
+        segment_len: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor | None, Counters]:
         """`input_ids [b,t]` (+ `targets [b,t]`) → (logits `[b*t,vocab]`, loss, counters).
 
@@ -127,20 +128,50 @@ class DormouseModel(nn.Module):
         `max_iter`, ADR-0013's fixed depth). It reaches the loop and the loss
         divides by the depth ACTUALLY run, so steps of different `T` are
         scale-comparable.
+
+        `segment_len` is the SEGMENTED TRAINING path (`loopblock`, off at 0):
+        the trainer passes `train.segment_len`, which cuts the window into
+        segments and carries the KDA state across them so a window longer than
+        one forward fits in VRAM can be trained. It is a memory decision, not a
+        model change (the logits agree with the one-shot forward to fp32
+        round-off), and the returned logits keep the `[b*t, vocab]` shape, so
+        the trainer's loss code is untouched. The EVAL path deliberately does
+        not pass it: an eval saves no activations (`no_grad`), and leaving it
+        one-shot keeps the held-out number comparable with the record.
         """
         counters = Counters() if counters is None else counters
         assert input_ids.dtype in (torch.long, torch.int64), "input_ids must be integer ids"
         assert input_ids.ndim == 2, f"input_ids must be [b, t], got {tuple(input_ids.shape)}"
         if self.bf_net is not None:
+            self._refuse_segmented(segment_len)
             logits, loss = self._forward_net(input_ids, targets, counters)
         elif self.bf is not None:
+            self._refuse_segmented(segment_len)
             logits, loss = self._forward_channel(input_ids, targets, counters, depth)
         else:
             logits, loss = self._forward_byte_lm(
-                input_ids, targets, counters, depth, pure, breakdown
+                input_ids, targets, counters, depth, pure, breakdown, segment_len
             )
         counters.count("forward")
         return logits, loss, counters
+
+    @staticmethod
+    def _refuse_segmented(segment_len: int) -> None:
+        """`segment_len` on a path that has no byte window to cut — LOUD.
+
+        The byteflow shapes run the loop over K patch latents (Option B) or not
+        at all (Option A), so a segment_len would either be silently inert or
+        cut a sequence that is not the byte stream the carry was designed for.
+        `validate` refuses the pair for a resolved run; this is the same
+        refusal at the runtime seam, where a hand-built model arrives.
+        """
+        if segment_len:
+            loud(
+                f"segment_len={segment_len} with use_byteflow: the byteflow shapes run "
+                f"the loop over K patch latents, not over the byte window, so there is "
+                f"no byte sequence to cut into segments. Escape: use_byteflow=false, or "
+                f"segment_len=0."
+            )
 
     def _forward_net(
         self,
@@ -206,11 +237,18 @@ class DormouseModel(nn.Module):
         depth: int | None = None,
         pure: bool = False,
         breakdown: bool = False,
+        segment_len: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """The plain byte-level stack: embedding → loop → RMSNorm → lm_head."""
         h0 = self.embed(input_ids)
         out, rec_sum, counters = self.loop(
-            h0, input_ids, targets, self.lm_head, counters=counters, depth=depth
+            h0,
+            input_ids,
+            targets,
+            self.lm_head,
+            counters=counters,
+            depth=depth,
+            segment_len=segment_len,
         )
         # fp32 logits — the burn rule that fixes `bf16 logits NaN`: the final
         # norm and the head run in fp32 whatever the body computed in.

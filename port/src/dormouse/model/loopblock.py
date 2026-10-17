@@ -40,6 +40,21 @@ forward; the arm must earn its depth by training, and the A/B against a
 fixed-depth control is the arbiter of the 8-12-loop claim. **CAVEAT, and it is
 the scan's own convention: the arm is a transcription of the scan's summary;
 the paper's full recipe may differ — re-derive before any multi-loop default.**
+
+SEGMENTED TRAINING (`segment_len`, off at 0) — the enabler for training on
+windows longer than one forward fits in VRAM. `_forward_segmented` cuts the
+window into `t // segment_len` segments and runs the SAME `_window` body on
+each, carrying the KDA state across the cuts **per iteration slot** (the loop
+calls the attention arm once per iteration, so the state is per iteration, not
+one state for the whole block) as a real graph edge, each segment inside
+`torch.utils.checkpoint(..., use_reentrant=False)`. That is StateFlow's
+boundary state AND gradient propagation (arXiv:2608.06838) rather than the
+truncated BPTT the burn side runs (`forward_train_state`), and it is a MEMORY
+decision only: the segmented logits are the one-shot logits to fp32 round-off
+(`tests/test_longctx.py`), so the trainer's loss code, the eval window and
+every number on record keep their meaning. `segment_len=0` does not enter the
+branch at all — the one-shot path is `_window(carry=False)`, the same code with
+the same calls it has always made.
 """
 
 from __future__ import annotations
@@ -47,8 +62,9 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
-from ..instrument import Counters
+from ..instrument import Counters, loud
 from .engram import Engram, memory_floor_mix
 from .experts import SparseMoE
 from .kda import KDAAttention
@@ -157,6 +173,7 @@ class LoopBlock(nn.Module):
         lm_head: nn.Module | None = None,
         counters: Counters | None = None,
         depth: int | None = None,
+        segment_len: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor | None, Counters]:
         """`h0 [b,t,d]` → (`mean readout [b,t,d]`, SUM of per-iteration mean CEs, counters).
 
@@ -168,6 +185,13 @@ class LoopBlock(nn.Module):
         unchanged); `depth=T` runs exactly `T` and the readout mean divides by
         that `T`, never by `max_iter` — the ADAPTIVE DEPTH arm's contract.
         `counters["depth"]` accumulates the depth each forward actually ran.
+
+        `segment_len=0` (the default; the only value any number on record ran)
+        is the ONE-SHOT path. `0 < segment_len <= t` is the SEGMENTED path
+        (`_forward_segmented`), which is a MEMORY decision and not a model
+        change: the two agree to fp32 round-off (`tests/test_longctx.py`), and
+        `segment_len = t` — one segment — is bit-identical to the one-shot path
+        (that is the pin the default rests on).
         """
         counters = Counters() if counters is None else counters
         b, t, d = h0.shape
@@ -175,12 +199,72 @@ class LoopBlock(nn.Module):
         T = self.max_iter if depth is None else depth
         assert 1 <= T <= self.max_iter, f"depth {T} outside 1..={self.max_iter}"
         counters.count("depth", T)
+        if segment_len > t:
+            loud(
+                f"segment_len={segment_len} > the window {t}: a segment longer than "
+                f"the sequence is the sequence, so the flag would buy nothing while "
+                f"the log line reported it on. Escape: a segment_len <= {t} (and "
+                f"< seq_len, or the config layer refuses it as pointless)."
+            )
+        if segment_len > 0 and t % segment_len != 0:
+            loud(
+                f"segment_len={segment_len} does not divide the window {t}: a shorter "
+                f"last segment would weight its positions more than the others (the "
+                f"per-iteration CE is a MEAN per segment), so the loss would stop "
+                f"being the one-shot loss — and segmentation is allowed to change the "
+                f"memory, never the objective. Escape: a divisor of {t}."
+            )
+        if segment_len > 0:
+            return self._forward_segmented(
+                h0, input_ids, targets, lm_head, counters, T, segment_len
+            )
+        out, rec, per_iter, _ = self._window(
+            h0, input_ids, targets, lm_head, counters, T, carry=False
+        )
+        # The per-iteration CEs as a LIST on the module (host floats ONLY on an
+        # eval-style read; see `model.DormouseModel.forward(breakdown=True)`) —
+        # the depth-confounded headline metric (ΣCE + CE_final)/(T+1) averages
+        # a DIFFERENT number of terms per depth, so cross-depth comparisons from
+        # the headline alone are arithmetic artifacts (found 2026-10-16: every
+        # trained arm read "deeper is worse" because the average gains another
+        # mid-quality term with each iteration).  No sync here: tensors stay.
+        self._per_iter_ce = per_iter
+        return out, (None if targets is None else rec), counters
+
+    def _window(
+        self,
+        h0: torch.Tensor,
+        input_ids: torch.Tensor | None,
+        targets: torch.Tensor | None,
+        lm_head: nn.Module | None,
+        counters: Counters,
+        T: int,
+        *,
+        carry: bool,
+        states: list | None = None,
+        drop: int = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor], list]:
+        """`T` iterations over ONE window — a segment, or the whole sequence.
+
+        The body of the loop, in one place, called by both paths: `carry=False`
+        is the one-shot call (`states=None`, `drop=0`, the attention arm called
+        through its one-shot `forward`), `carry=True` is the segmented one
+        (`states` = the per-iteration state entering this window, `drop` = the
+        positions of `input_ids` that belong to the window BEFORE this one).
+
+        `h0`/`input_ids`/`targets` are this window's slice; `input_ids` carries
+        `drop` extra LEADING positions when `drop > 0` (see `_memory`).
+        Returns `(mean readout, Σ per-iteration mean CE, per-iteration CEs, the
+        per-iteration states leaving this window)`.
+        """
+        b, t, d = h0.shape
         h = h0
         h0_flat = h0.reshape(b * t, d)
         out_acc = torch.zeros_like(h0)
         rec = torch.zeros((), dtype=torch.float32, device=h0.device)
         per_iter: list[torch.Tensor] = []
         sources: list[torch.Tensor] = [h0] if self.use_attnres else []
+        new_states: list = []
         for i in range(T):
             counters.count("iter")
             ctx = h + self.iter_embed[i].view(1, 1, d)
@@ -191,11 +275,14 @@ class LoopBlock(nn.Module):
             w_mem = torch.sigmoid(raw[:, 1:2])
             w_ffn = torch.sigmoid(raw[:, 2:3])
 
-            attn = (
-                self.attn(normed, counters=counters).reshape(b * t, d) * w_attn
-                if self.attn is not None
-                else torch.zeros(b * t, d, dtype=torch.float32, device=h0.device)
-            )
+            if self.attn is not None:
+                attn_out, st = self._attn(
+                    normed, counters, carry, None if states is None else states[i]
+                )
+                new_states.append(st)
+                attn = attn_out.reshape(b * t, d) * w_attn
+            else:
+                attn = torch.zeros(b * t, d, dtype=torch.float32, device=h0.device)
             if self.msa is not None:
                 # The ADAPTIVE share: softmax over the iteration gates × max_iter
                 # = a per-slot share whose MEAN over slots is 1; × the arm's
@@ -218,7 +305,7 @@ class LoopBlock(nn.Module):
                         attn = attn + msa_out.reshape(b * t, d) * w_attn
 
             if self.engram is not None and input_ids is not None:
-                mem = self.engram(normed, input_ids, counters).reshape(b * t, d)
+                mem = self._memory(normed, input_ids, drop, counters).reshape(b * t, d)
                 dense = (
                     (
                         mm_mixed(
@@ -262,13 +349,173 @@ class LoopBlock(nn.Module):
                 ce = -F.log_softmax(logits, dim=-1).gather(1, targets.reshape(-1, 1))
                 rec = rec + ce.mean()
                 per_iter.append(ce.mean())
-        rec = None if targets is None else rec
-        # The per-iteration CEs as a LIST on the module (host floats ONLY on an
-        # eval-style read; see `model.DormouseModel.forward(breakdown=True)`) —
-        # the depth-confounded headline metric (ΣCE + CE_final)/(T+1) averages
-        # a DIFFERENT number of terms per depth, so cross-depth comparisons from
-        # the headline alone are arithmetic artifacts (found 2026-10-16: every
-        # trained arm read "deeper is worse" because the average gains another
-        # mid-quality term with each iteration).  No sync here: tensors stay.
-        self._per_iter_ce: list[torch.Tensor] | None = per_iter
-        return out_acc / T, rec, counters
+        return out_acc / T, rec, per_iter, new_states
+
+    def _attn(
+        self,
+        normed: torch.Tensor,
+        counters: Counters,
+        carry: bool,
+        state: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None]:
+        """One iteration's attention call → (`[b,t,d]`, the state leaving it).
+
+        One call site for both paths, so the segmented arm cannot drift from the
+        one-shot one: `carry=False` is the arm's `forward` (the call every
+        number on record made) and returns no state; `carry=True` is
+        `forward_state`, whose state is the edge into the next segment.
+
+        The state is PER ITERATION SLOT: the loop body is shared, but each of its
+        `T` passes is a separate pass over the sequence, so each needs its own
+        boundary state — one state for the whole block would mix the passes,
+        which is the same defect as sharing one hidden state across them.
+        """
+        assert self.attn is not None
+        if not carry:
+            return self.attn(normed, counters=counters), None
+        return self.attn.forward_state(normed, state, counters=counters, carry=True)
+
+    def _memory(
+        self, normed: torch.Tensor, input_ids: torch.Tensor, drop: int, counters: Counters
+    ) -> torch.Tensor:
+        """The Engram read for one window, with the left context its n-grams need.
+
+        `drop=0` (the one-shot path) is the call the arm has always made.
+        `drop>0` is the segmented path: the memory's keys are CAUSAL n-grams
+        (`engram.raw_keys`: position `e` reads bytes `max(0, e-order)..e`), so a
+        segment that starts at byte `p` needs the `drop = min(max_order-1, p)`
+        bytes BEFORE it or the first positions of every segment would read a
+        different key than the one-shot forward — a silent model change, which
+        is exactly what the parity gate exists to catch.
+
+        The extra positions' OUTPUTS are discarded, and that is sound because
+        the arm's gate math is elementwise per position (`engram._read`: the
+        only axis it mixes is the n-gram order). Their `hidden` rows are
+        therefore padding and never read — `F.pad` puts zeros there, and
+        `_read` reads them only to produce values this function slices off.
+
+        `engram_rows` on the counter line counts those context keys too (they
+        ARE read from the table): at orders [2,3,4] that is ≤ 3 extra keys per
+        segment per order, i.e. ≤ 3/segment_len of the rows.
+        """
+        if drop == 0:
+            return self.engram(normed, input_ids, counters)  # type: ignore[misc]
+        assert input_ids.shape[1] == normed.shape[1] + drop, "the window slice is misaligned"
+        hidden = F.pad(normed, (0, 0, drop, 0))
+        return self.engram(hidden, input_ids, counters)[:, drop:]  # type: ignore[misc]
+
+    def _forward_segmented(
+        self,
+        h0: torch.Tensor,
+        input_ids: torch.Tensor | None,
+        targets: torch.Tensor | None,
+        lm_head: nn.Module | None,
+        counters: Counters,
+        T: int,
+        segment_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, Counters]:
+        """The segmented training forward: `t // segment_len` checkpointed windows.
+
+        What is carried and what is not:
+
+        * **The KDA state is carried, per iteration slot** (`_attn`), as a real
+          graph edge — segment `s`'s state is an output of segment `s-1`'s
+          checkpointed body, so the backward recomputes segment `s-1` and the
+          gradient reaches its parameters. That is StateFlow's boundary state +
+          gradient propagation (arXiv:2608.06838), and it is the reason this is
+          not truncated BPTT: nothing is detached and no window is a fresh
+          sequence.
+        * **`h` is NOT carried and must not be**: it is a per-position residual
+          stream, and iteration `i` of segment `s` reads iteration `i-1` of the
+          SAME positions, which this window produced itself. Only the
+          cross-position state (attention) crosses the cut.
+        * **The objective is unchanged.** Each segment returns its own
+          `out_acc / T` (concatenated) and its own per-iteration MEAN CE; with
+          equal segments the mean of those segment means is the window's own
+          mean, so the driver divides their sum by the segment count and
+          `(Σ CE_i + CE_final)/(T+1)` is the one-shot loss — the trainer's loss
+          code is untouched. (Equal segments are not an assumption: a
+          `segment_len` that does not divide the window is refused, which is
+          exactly what the divisor rests on.)
+
+        `checkpoint(use_reentrant=False)` per segment is the memory win: the
+        segment's activations are recomputed in the backward instead of stored,
+        and the boundary state is what stays alive. Two consequences that are
+        not optional here:
+
+        * the body's counters are gathered in a per-segment `Counters` that is
+          merged once, because the recomputation runs the body a second time
+          (`checkpoint` calls the function again in the backward) — counting
+          into the run's own object would report `2·S·T` iterations on the log
+          line. The recomputation's copy is discarded by checkpoint.
+        """
+        assert self.msa is None, (
+            "segment_len with use_msa: the block-sparse arm selects its blocks "
+            "INSIDE one window, so segmenting it would change the attention "
+            "pattern itself (a boundary block can no longer be selected) - that is "
+            "a model change wearing a memory flag. Escape: use_msa=false, or "
+            "segment_len=0."
+        )
+        assert self.moe.topk == 0, (
+            "segment_len with moe_topk>0: the capacity-padded sparse dispatch drops "
+            "the rows past `ceil(moe_capacity · tokens · k / E)` per expert, so which "
+            "tokens get an expert depends on the OTHER tokens in the same forward - "
+            "cutting the window changes that set (measured 0.39 on the readout at "
+            "moe_capacity=1.0, 2026-10-17) and the forward stops being the one-shot "
+            "forward. Escape: moe_topk=0 (the dense blend), or segment_len=0."
+        )
+        b, t, d = h0.shape
+        assert t % segment_len == 0, f"segment_len={segment_len} does not divide {t}"
+        segments = t // segment_len
+        counters.count("loop_segments", segments)
+        #: The left context the Engram's causal n-grams need (orders [2,3,4] -> 3).
+        ctx = 0 if self.engram is None else max(self.engram.orders) - 1
+        states: list = [None] * T
+        outs: list[torch.Tensor] = []
+        rec_sum = torch.zeros((), dtype=torch.float32, device=h0.device)
+        per_iter_sum: list[torch.Tensor] | None = None
+        for s in range(segments):
+            lo, hi = s * segment_len, (s + 1) * segment_len
+            drop = min(ctx, lo)
+            ids = None if input_ids is None else input_ids[:, lo - drop : hi]
+            tgts = None if targets is None else targets[:, lo:hi]
+            h_seg = h0[:, lo:hi]
+
+            def body(h_seg, ids, tgts, *states, _drop=drop):
+                """The checkpointed unit. Its counters are its own (see above)."""
+                seg_counters = Counters()
+                out, rec, per_iter, states_out = self._window(
+                    h_seg,
+                    ids,
+                    tgts,
+                    lm_head,
+                    seg_counters,
+                    T,
+                    carry=True,
+                    states=list(states),
+                    drop=_drop,
+                )
+                return out, rec, per_iter, seg_counters, *states_out
+
+            out_seg, rec_seg, per_iter, seg_counters, *states = checkpoint(
+                body, h_seg, ids, tgts, *states, use_reentrant=False
+            )
+            counters.merge(seg_counters)
+            if hasattr(seg_counters, "why"):
+                counters.why = seg_counters.why  # type: ignore[attr-defined]
+            outs.append(out_seg)
+            rec_sum = rec_sum + rec_seg
+            if per_iter:
+                if per_iter_sum is None:
+                    per_iter_sum = list(per_iter)
+                else:
+                    per_iter_sum = [a + c for a, c in zip(per_iter_sum, per_iter, strict=True)]
+        assert len(outs) == segments, f"{len(outs)} segments != {segments}"
+        out = torch.cat(outs, dim=1) if segments > 1 else outs[0]
+        # The per-segment CEs are MEANS over each segment, so their sum is
+        # `segments` × the window's mean — the divisor the parity gate caught
+        # (the logits matched at 2 segments while the loss was exactly 2×; a
+        # segment-local mean is not a share of the window's mean).
+        rec = None if targets is None else rec_sum / segments
+        self._per_iter_ce = [] if per_iter_sum is None else [v / segments for v in per_iter_sum]
+        return out, rec, counters
