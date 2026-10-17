@@ -590,6 +590,37 @@ class TrainConfig:
     #: verdict must read the `X`↔`Y` gap and the LR-schedule-free claim, not the
     #: endpoint alone. `scripts/ab_muon_variants.py` is the driver.
     muon_sf: bool = False
+    #: CUDA-graph capture of the optimizer STAGE (`train/graph.py`): the grad
+    #: clip + the mixed step are recorded once after `GRAPH_WARMUP_STEPS` eager
+    #: steps and replayed with ONE launch per step afterwards. This is the
+    #: direct attack on the measured bottleneck — the optimizer is 44-53% of a
+    #: b1 step and the step is HOST-DISPATCH-BOUND (the card is idle 87% of a
+    #: warm step; 46 341 `aten::mm` launches per step at b8·s512) — and it is
+    #: the P0 idea of `docs/research/2026-10-17-olmo-core-ideas.md` §2.1,
+    #: reimplemented from `microsoft/dion` `dion/cuda_graph.py`.
+    #:
+    #: **`false` by default, and the default path is byte-identical to its
+    #: history** (gated: sha256 of a fixed-seed 10-step run, `tests/test_opt_graph.py`).
+    #: The arm changes three things a reader must know before reading a number
+    #: off it, all named in `graph.py`: the LR becomes a DEVICE tensor the
+    #: trainer fills in place (a host float would be baked at capture and
+    #: silently freeze the WSD schedule), `zero_grad` runs
+    #: `set_to_none=False` (a fresh `.grad` every step breaks the pinned
+    #: buffers), and the AdamW half rides torch's `capturable=True` — which is
+    #: what makes a device-tensor LR readable there, and which MOVES the AdamW
+    #: arithmetic (the bias correction is folded in on device), so the arm is
+    #: bit-identical to its own eager path and not to the pre-arm path.
+    #:
+    #: Refused combinations, all LOUD at capture and COUNTED (`opt_graph_fallback`
+    #: + the reason) rather than fatal: `muon_sf` (its `_sf_ckp` recursion is host
+    #: arithmetic), `muon_variant="normuon"` (`_foreach_add_`'s `alpha` cannot take
+    #: a device tensor without a host sync), `optim_8bit` (bitsandbytes' AdamW8bit
+    #: has no capturable path), any `requires_grad` param with `.grad is None`
+    #: (the participating set freezes at capture), and a non-CUDA device. The
+    #: trainer also refuses `opt_graph` + `torch_compile` (a recompile under an
+    #: active capture aborts it). A resume with a different value is refused by
+    #: the snapshot drift check — it changes what the optimizer computes.
+    opt_graph: bool = False
     seed: int = 1
     #: WSD warmup, in TOKENS (not steps): the schedule is a function of how
     #: much data the run has seen, so a batch-size change does not change it.

@@ -868,7 +868,19 @@ class Muon(Optimizer):
             return
         update = colrow_normalize(update)
         with torch.no_grad():
-            p.add_(update.to(p.dtype), alpha=-lr * scale)
+            if torch.is_tensor(lr):
+                # The CUDA-graph arm (`train/graph.py`): `lr` is a 0-dim DEVICE
+                # tensor the captured ops re-read on every replay, and `add_`'s
+                # `alpha` cannot take one without a host read (the dispatcher
+                # converts a 0-dim tensor to a Scalar, which is a D2H sync — and a
+                # sync inside a capture window aborts it). Fold it into the update
+                # on device and keep `alpha` a host float; `-scale` is the same
+                # factor, one elementwise op earlier. The batched path
+                # (`batched_step_from_model`) needs nothing: `-lr * scale` is a
+                # device scalar op when `lr` is a tensor.
+                p.add_(update.to(p.dtype).mul_(lr), alpha=-scale)
+            else:
+                p.add_(update.to(p.dtype), alpha=-lr * scale)
 
     def _nor_apply(self, p: torch.Tensor, o: torch.Tensor, lr: float) -> None:
         """The `normuon` tail for ONE parameter: `W -= η·λ·W + η·update`.
@@ -998,6 +1010,13 @@ class Muon(Optimizer):
         remains per step is the NS chain and the final `_foreach_add_`. On the
         `bf16` state rung the same update runs with an fp32 accumulate and a
         bf16 store, one chunk temporary at a time (`_momentum_update_`).
+
+        The group's `lr` may be a 0-dim DEVICE tensor instead of a host float
+        (`train/graph.py`): `-lr * scale` is then a device scalar op the captured
+        ops re-read on every replay, which is what lets a CUDA-graph replay track
+        the WSD schedule. Nothing in this method branches on it — the singleton /
+        missing-grad path it delegates to (`_step_one`) is where the difference
+        has to be handled.
         """
         if not self._groups:
             self._build_groups()

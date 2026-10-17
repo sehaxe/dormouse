@@ -32,6 +32,7 @@ from ..model.engram import (
     load_host_state,
 )
 from .data import ByteStream, eval_window_bytes, open_streams, warmup_steps
+from .graph import OptimizerGraph
 from .lr import wsd_lr
 from .optim import MixOptimizer, clip_grads
 
@@ -548,6 +549,13 @@ def train(
     warm = warmup_steps(cfg.warmup_tokens, cfg.batch, cfg.seq_len)
     decay = int(round(cfg.decay_frac * cfg.steps))
     if cfg.torch_compile:
+        if cfg.opt_graph:
+            loud(
+                "torch_compile=true with opt_graph=true: a recompile attempted while "
+                "a CUDA graph capture is active aborts the capture, and torch.compile "
+                "is neither needed nor wanted under a graph (the graph already removes "
+                "the host dispatch). Escape: torch_compile=false, or opt_graph=false."
+            )
         # torch.compile(dynamic=True) — the spike's measured winner at the b1
         # shape (273.5 vs 357.3 ms/step, 1.20x). Wrapped AFTER the resume
         # load: an OptimizedModule's state_dict carries a `_orig_mod.` prefix,
@@ -594,12 +602,49 @@ def train(
             opt=cfg.opt,
             resumed=start,
         )
+
+    def opt_stage() -> None:
+        """ONE optimizer stage: the grad clip, then the mixed step.
+
+        Defined as one callable so the CUDA-graph arm captures EXACTLY this and
+        nothing about the loop (`train/graph.py`), and so the eager and captured
+        paths cannot drift into two definitions of "the stage".
+
+        The clip is `clip_grads` (optim.py): ONE `_foreach_norm` + ONE fused
+        `_foreach_mul_` — the stock per-tensor walk measured 252 ms of a
+        small-form step (2920 norm calls, profile 2026-10-16).
+        """
+        if cfg.grad_clip > 0:
+            clip_grads(model.parameters(), cfg.grad_clip)
+        opt.step()
+
+    #: The CUDA-graph arm (`train/graph.py`, `train.opt_graph`). `None` is the
+    #: default path and it is untouched: the LR stays a host float in the group
+    #: dict, `opt_stage()` is called directly, and `zero_grad` keeps
+    #: `set_to_none=True`. A refusal or a capture failure falls back to EAGER for
+    #: the rest of the run, COUNTED as `opt_graph_fallback` + the reason
+    #: (ADR-0019) — this arm must never kill a run.
+    #:
+    #: Built HERE, after the resume load, on purpose: `Optimizer.load_state_dict`
+    #: REPLACES `param_groups` with the checkpoint's copies (`torch/optim/
+    #: optimizer.py`), which carry a plain float `lr` and the checkpoint's own
+    #: `capturable`. A wrapper built before the load would hold LR tensors no
+    #: group points at any more — every replay would read a stale value.
+    graph = None
+    if cfg.opt_graph:
+        graph = OptimizerGraph(opt, opt_stage, counters=total, log=log)
+        log(
+            f"opt_graph: the optimizer stage is captured after {graph.warmup_steps} "
+            f"eager steps and replayed with ONE launch per step; the LR lives in a "
+            f"device tensor this loop fills IN PLACE (a host float would be baked at "
+            f"capture and freeze the WSD schedule), and zero_grad runs "
+            f"set_to_none=False so the captured ops keep their pinned .grad buffers."
+        )
     for step in range(start, cfg.steps):
         lr = wsd_lr(
             step, total_steps=cfg.steps, peak_lr=cfg.lr, warmup_steps=warm, decay_steps=decay
         )
-        for group in opt.adamw.param_groups:
-            group["lr"] = lr
+        muon_lr = lr
         if opt.muon is not None:
             # The SF arm's whole point: the Muon group's LR is CONSTANT after
             # warmup, so the arm is horizon-free where the AdamW half is not —
@@ -618,8 +663,20 @@ def train(
                 if cfg.muon_sf
                 else lr
             )
-            for group in opt.muon.param_groups:
-                group["lr"] = muon_lr
+
+        if graph is not None:
+            # The graph arm: `group["lr"]` IS a 0-dim device tensor the captured
+            # ops read, so it is filled IN PLACE. `group["lr"] = lr` would replace
+            # that tensor with a float no replay ever reads again — the silent
+            # freeze `dion/cuda_graph.py:70-78` documents. `muon_sf` is refused at
+            # capture (`train/graph.py`), so the Muon group's LR is this value.
+            graph.set_lr(lr)
+        else:
+            for group in opt.adamw.param_groups:
+                group["lr"] = lr
+            if opt.muon is not None:
+                for group in opt.muon.param_groups:
+                    group["lr"] = muon_lr
 
         # The ANNEALED factor_qat arm: burn-spectral's measured soft-to-hard
         # ramp (`ste_ternary_annealed`, "converges better than hard STE from
@@ -662,14 +719,20 @@ def train(
         finite = math.isfinite(lf)
         window_finite.append(finite)
         if finite:
-            opt.zero_grad(set_to_none=True)
+            # The graph arm needs STABLE `.grad` buffers: `set_to_none=True` swaps
+            # each `.grad` for a fresh tensor every step, which breaks the buffers
+            # capture pinned (`dion/cuda_graph.py:170-181`). `False` is a no-op for
+            # a param whose grad is still None, so the FIRST backward allocates it
+            # — which is why the wrapper demands at least one eager step.
+            opt.zero_grad(set_to_none=graph is None)
             loss.backward()
-            if cfg.grad_clip > 0:
-                # `clip_grads` (optim.py): ONE `_foreach_norm` + ONE fused
-                # `_foreach_mul_` — the stock per-tensor walk measured 252 ms
-                # of a small-form step (2920 norm calls, profile 2026-10-16).
-                clip_grads(model.parameters(), cfg.grad_clip)
-            opt.step()
+            if graph is not None:
+                # ONE launch: the captured stage IS `opt_stage()` (the grad clip
+                # plus the mixed step), and the wrapper redoes the host-side step
+                # counters that a recording cannot carry.
+                graph.step()
+            else:
+                opt_stage()
             if opt.counters:
                 # The Muon arms' own counters (ADR-0019): `ns_triton` when the
                 # fused Newton–Schulz chain ran, `ns_triton_fallback` + the reason
@@ -701,7 +764,10 @@ def train(
             nan_skipped += 1
             total.count("nan_skipped")
             window.count("nan_skipped")
-            opt.zero_grad(set_to_none=True)
+            # A skipped step calls NEITHER the stage nor `graph.step()`: the graph
+            # replay advances only on a real optimizer step, exactly as the
+            # optimizer's own step count does (`train/graph.py`).
+            opt.zero_grad(set_to_none=graph is None)
             # A skipped step never reaches `host_step_all`, so the host-path
             # leaves it built would sit in `Engram._pending` until the next REAL
             # step (and their rows be re-deduped there) — growth proportional to
