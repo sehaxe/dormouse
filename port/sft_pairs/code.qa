@@ -1,0 +1,131 @@
+# code.qa — маленькие функции. Ответы обязаны влезать в окно (~500 байт на пару),
+# поэтому код короткий: одна-две строки.
+
+Q: Write a function that adds two numbers.
+A: def add(a, b): return a + b
+
+Q: Write a function that returns the larger of two numbers.
+A: def larger(a, b): return a if a > b else b
+
+Q: Write a function that squares a number.
+A: def square(x): return x * x
+
+Q: Write a function that returns the sum of a list.
+A: def total(xs): return sum(xs)
+
+Q: Write a function that reverses a string.
+A: def reverse(s): return s[::-1]
+
+Q: Write a function that counts the letters in a word.
+A: def letters(word): return len(word)
+
+Q: Write a function that checks if a number is even.
+A: def is_even(n): return n % 2 == 0
+
+Q: Write a function that checks if a string is empty.
+A: def is_empty(s): return len(s) == 0
+
+Q: Write a function that returns the first element of a list.
+A: def first(xs): return xs[0]
+
+Q: Write a function that returns the last element of a list.
+A: def last(xs): return xs[-1]
+
+Q: Write a function that uppercases a string.
+A: def shout(s): return s.upper()
+
+Q: Write a function that lowercases a string.
+A: def whisper(s): return s.lower()
+
+Q: Write a function that doubles every number in a list.
+A: def doubled(xs): return [x * 2 for x in xs]
+
+Q: Write a function that keeps only even numbers.
+A: def evens(xs): return [x for x in xs if x % 2 == 0]
+
+Q: Write a function that counts vowels in a string.
+A: def vowels(s): return sum(c in "aeiou" for c in s.lower())
+
+Q: Write a function that replaces spaces with underscores.
+A: def snake(s): return s.replace(" ", "_")
+
+Q: Write a function that joins a list with commas.
+A: def commas(xs): return ", ".join(str(x) for x in xs)
+
+Q: Write a function that returns the max of a list.
+A: def biggest(xs): return max(xs)
+
+Q: Write a function that returns the min of a list.
+A: def smallest(xs): return min(xs)
+
+Q: Write a function that repeats a string n times.
+A: def repeat(s, n): return s * n
+
+Q: Write a function that checks if a word is a palindrome.
+A: def is_palindrome(s): return s == s[::-1]
+
+Q: Write a function that returns the absolute value.
+A: def absolute(x): return abs(x)
+
+Q: Write a function that converts Celsius to Fahrenheit.
+A: def to_f(c): return c * 9 / 5 + 32
+
+Q: Write a function that converts Fahrenheit to Celsius.
+A: def to_c(f): return (f - 32) * 5 / 9
+
+Q: Write a function that returns n factorial.
+A: def fact(n): return 1 if n <= 1 else n * fact(n - 1)
+
+Q: Write a function that sums numbers from 1 to n.
+A: def upto(n): return n * (n + 1) // 2
+
+Q: Write a function that checks if n is prime.
+A: def is_prime(n): return n > 1 and all(n % d for d in range(2, int(n ** 0.5) + 1))
+
+Q: Write a function that finds the longest word in a sentence.
+A: def longest(s): return max(s.split(), key=len)
+
+Q: Write a function that counts words in a sentence.
+A: def words(s): return len(s.split())
+
+Q: Write a function that capitalizes the first letter.
+A: def capitalize(s): return s[:1].upper() + s[1:]
+
+Q: Write a function that removes duplicates from a list, keeping order.
+A: def dedup(xs): return list(dict.fromkeys(xs))
+
+Q: Write a function that returns the average of a list.
+A: def mean(xs): return sum(xs) / len(xs)
+
+Q: Write a function that flattens a list of lists.
+A: def flatten(xss): return [x for xs in xss for x in xs]
+
+Q: Write a function that returns True if two strings are anagrams.
+A: def anagrams(a, b): return sorted(a) == sorted(b)
+
+Q: Write a function that turns a number into its binary string.
+A: def to_binary(n): return bin(n)[2:]
+
+Q: What does this print: print(2 ** 10)?
+A: answer: 1024
+
+Q: What does this print: print(len("hello"))?
+A: answer: 5
+
+Q: What does this print: print("a" + "b")?
+A: answer: ab
+
+Q: What does this print: print([1, 2] * 2)?
+A: answer: [1, 2, 1, 2]
+
+Q: What does this print: print(7 // 2)?
+A: answer: 3
+
+Q: What does this print: print(7 % 2)?
+A: answer: 1
+
+Q: Что выведет print(3 * 4)?
+A: answer: 12
+
+Q: Что выведет print(len("кот"))?
+A: answer: 3

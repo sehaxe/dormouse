@@ -489,19 +489,27 @@ def test_qa_text_format_parses_and_refuses_malformed_lines(tmp_path):
         build_sft_corpus(tmp_path / "b.bin", 3, seq_len=128, n_tasks=0, chat_data=bad)
 
 
-def test_chat_files_merge_before_the_cap(tmp_path):
-    """Several --chat-data files are merged into ONE pool before the cap, so a
-    small personal file is not starved by a large export (and the sample stays
-    a pure function of the seed)."""
-    f1 = tmp_path / "one.qa"
-    f1.write_text("Q: q1\nA: a1\nQ: q2\nA: a2\nQ: q3\nA: a3\n", encoding="utf-8")
-    f2 = tmp_path / "two.qa"
-    f2.write_text("Q: q4\nA: a4\n", encoding="utf-8")
-    built = build_sft_corpus(
-        tmp_path / "a.bin", 11, seq_len=64, n_tasks=0, chat_data=[f1, f2], chat_cap=4
+def test_chat_cap_is_per_file_so_small_files_stay_whole(tmp_path):
+    """The cap applies to EACH file: a small hand-written file is fully kept
+    even when a large export is sampled, and the sample is a pure function of
+    the seed."""
+    big = tmp_path / "big.qa"
+    big.write_text(
+        "Q: q1\nA: a1\nQ: q2\nA: a2\nQ: q3\nA: a3\nQ: q4\nA: a4\nQ: q5\nA: a5\n",
+        encoding="utf-8",
     )
-    assert built["chat_loaded"] == 4 and built["chat_used"] == 4
-    assert built["chat_files"] == {str(f1): 3, str(f2): 1}
+    small = tmp_path / "small.qa"
+    small.write_text("Q: mine\nA: kept\n", encoding="utf-8")
+
+    a = build_sft_corpus(
+        tmp_path / "a.bin", 11, seq_len=64, n_tasks=0, chat_data=[big, small], chat_cap=2
+    )
+    build_sft_corpus(
+        tmp_path / "b.bin", 11, seq_len=64, n_tasks=0, chat_data=[big, small], chat_cap=2
+    )
+    assert (tmp_path / "a.bin").read_bytes() == (tmp_path / "b.bin").read_bytes()
+    assert a["chat_fit"] == 6 and a["chat_used"] == 3  # 2 sampled from big + the whole small
+    assert a["chat_files"] == {str(big): 5, str(small): 1}
 
 
 def test_ru_bank_is_broad_and_fits_one_window():

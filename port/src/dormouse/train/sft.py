@@ -320,7 +320,10 @@ def _read_chat_file(path: Path) -> list[tuple[str, str]]:
 
 
 def _chat_pairs(
-    paths: str | Path | list[str | Path], seq_len: int
+    paths: str | Path | list[str | Path],
+    seq_len: int,
+    cap_per_file: int | None = None,
+    seed: int = 0,
 ) -> tuple[list[tuple[str, str]], dict]:
     """Load chat files (one path or a list) and keep the one-window fits.
 
@@ -329,14 +332,19 @@ def _chat_pairs(
     with a count rather than in the build loop (where a `cap` would otherwise
     spend slots on rows that cannot land). Sentinel-carrying rows are dropped
     the same way — the marker license requires it, and real web text can carry
-    a stray 0x00. Rows keep file order; the caller shuffles deterministically
-    before applying its cap.
+    a stray 0x00.
+
+    The cap is PER FILE (`cap_per_file`), not on the merged pool: a 500-row
+    hand-written file and a 100k-row export are both fully useful, and a global
+    cap would dilute the small curated file to a rounding error. Each file's
+    sample is `random.Random(seed + 1)`, so it is a pure function of the seed.
     """
     if isinstance(paths, (str, Path)):
         paths = [paths]
     pairs: list[tuple[str, str]] = []
     files: dict[str, int] = {}
     dropped_long = dropped_dirty = 0
+    fit_total = 0
     for path in paths:
         p = Path(path)
         if not p.is_file():
@@ -346,6 +354,7 @@ def _chat_pairs(
             )
         raw_pairs = _read_chat_file(p)
         files[str(p)] = len(raw_pairs)
+        kept: list[tuple[str, str]] = []
         for instruction, answer in raw_pairs:
             if not instruction or not answer:
                 dropped_dirty += 1
@@ -357,9 +366,15 @@ def _chat_pairs(
             if any(b in raw_i for b in SENTINELS) or any(b in raw_a for b in SENTINELS):
                 dropped_dirty += 1
                 continue
-            pairs.append((instruction, answer))
+            kept.append((instruction, answer))
+        fit_total += len(kept)
+        if cap_per_file is not None and len(kept) > cap_per_file:
+            random.Random(seed + 1).shuffle(kept)
+            kept = kept[:cap_per_file]
+        pairs.extend(kept)
     return pairs, {
         "chat_files": files,
+        "chat_fit": fit_total,
         "chat_dropped_long": dropped_long,
         "chat_dropped_dirty": dropped_dirty,
     }
@@ -430,9 +445,10 @@ def build_sft_corpus(
 
     `chat_data` mixes external rows (the distill `.jsonl` exports, hand-written
     Q/A text files — see [`_read_chat_file`]) into the corpus: they are
-    pre-filtered to one-window fits, shuffled deterministically and cut to
-    `chat_cap` across ALL files. Without it the corpus is the small seeded set,
-    which is enough to learn the FORMAT and nothing else.
+    pre-filtered to one-window fits and the sample from EACH file is cut to
+    `chat_cap` rows (per file, not on the merged pool: a 500-row hand-written
+    file must not be diluted by a 100k-row export). Without it the corpus is
+    the small seeded set, which is enough to learn the FORMAT and nothing else.
 
     An example that does not fit in ONE window is DROPPED, not truncated (a
     truncated answer teaches the model to stop mid-function) and not wrapped (a
@@ -455,12 +471,9 @@ def build_sft_corpus(
         "chat_dropped_dirty": 0,
     }
     if chat_data is not None:
-        chat, dropped = _chat_pairs(chat_data, seq_len)
+        chat, dropped = _chat_pairs(chat_data, seq_len, cap_per_file=chat_cap, seed=seed)
         chat_stats.update(dropped)
-        chat_stats["chat_loaded"] = len(chat)
-        random.Random(seed + 1).shuffle(chat)
-        if chat_cap is not None:
-            chat = chat[:chat_cap]
+        chat_stats["chat_loaded"] = dropped.get("chat_fit", len(chat))
         chat_stats["chat_used"] = len(chat)
     examples = _examples(seed, n_tasks, chat)
     random.Random(seed).shuffle(examples)

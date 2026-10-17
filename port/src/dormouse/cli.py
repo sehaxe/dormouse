@@ -384,7 +384,7 @@ def sft_cmd(
     chat_cap: Annotated[
         int | None,
         typer.Option(
-            "--chat-cap", help="max chat rows used across all files (a deterministic sample)"
+            "--chat-cap", help="max rows sampled from EACH chat file (a deterministic sample)"
         ),
     ] = None,
     steps: Annotated[int | None, typer.Option] = None,

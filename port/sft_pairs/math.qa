@@ -1,0 +1,182 @@
+# math.qa — арифметика руками: разнообразие вместо таблиц. Формат "answer: N" сохранён
+# (его читает верификатор), но сами примеры разные.
+
+Q: What is 2 + 2?
+A: answer: 4
+
+Q: What is 17 + 25?
+A: answer: 42
+
+Q: What is 99 + 1?
+A: answer: 100
+
+Q: What is 40 + 60?
+A: answer: 100
+
+Q: What is 123 + 77?
+A: answer: 200
+
+Q: What is 58 + 7?
+A: answer: 65
+
+Q: What is 100 - 37?
+A: answer: 63
+
+Q: What is 81 - 9?
+A: answer: 72
+
+Q: What is 7 - 12?
+A: answer: -5
+
+Q: What is 500 - 499?
+A: answer: 1
+
+Q: What is 6 * 7?
+A: answer: 42
+
+Q: What is 12 * 12?
+A: answer: 144
+
+Q: What is 15 * 3?
+A: answer: 45
+
+Q: What is 25 * 4?
+A: answer: 100
+
+Q: What is 144 / 12?
+A: answer: 12
+
+Q: What is 100 / 4?
+A: answer: 25
+
+Q: What is half of 90?
+A: answer: 45
+
+Q: What is double 35?
+A: answer: 70
+
+Q: Which is bigger: 58 or 85?
+A: answer: 85
+
+Q: Which is smaller: 12 or 21?
+A: answer: 12
+
+Q: Is 49 odd or even?
+A: answer: odd
+
+Q: Is 128 even?
+A: answer: yes
+
+Q: Is 101 a prime number?
+A: answer: yes
+
+Q: Is 1 prime?
+A: answer: no
+
+Q: Count from 7 to 11.
+A: answer: 7, 8, 9, 10, 11
+
+Q: What comes after 19?
+A: answer: 20
+
+Q: What comes before 30?
+A: answer: 29
+
+Q: I have 3 apples and buy 4 more. How many now?
+A: answer: 7
+
+Q: There are 10 eggs and 3 break. How many are left?
+A: answer: 7
+
+Q: A pizza has 8 slices. Two pizzas have how many?
+A: answer: 16
+
+Q: You read 20 pages a day. How many in 5 days?
+A: answer: 100
+
+Q: A box holds 6 bottles. How many boxes for 18 bottles?
+A: answer: 3
+
+Q: What is 3 + 4 + 5?
+A: answer: 12
+
+Q: What is 10 + 20 + 30?
+A: answer: 60
+
+Q: What is 100 - 25 - 25?
+A: answer: 50
+
+Q: What is 2 * 3 * 4?
+A: answer: 24
+
+Q: What is 1000 - 1?
+A: answer: 999
+
+Q: What is 7 * 8?
+A: answer: 56
+
+Q: What is 9 * 9?
+A: answer: 81
+
+Q: What is 11 * 11?
+A: answer: 121
+
+Q: What is the square of 5?
+A: answer: 25
+
+Q: What is the square of 10?
+A: answer: 100
+
+Q: What is 2 to the power of 8?
+A: answer: 256
+
+Q: What is 2 to the power of 10?
+A: answer: 1024
+
+Q: Сколько будет 8 + 9?
+A: answer: 17
+
+Q: Сколько будет 45 + 55?
+A: answer: 100
+
+Q: Сколько будет 100 - 64?
+A: answer: 36
+
+Q: Сколько будет 7 * 9?
+A: answer: 63
+
+Q: Сколько будет 64 / 8?
+A: answer: 8
+
+Q: Половина от 50?
+A: answer: 25
+
+Q: Удвой 45.
+A: answer: 90
+
+Q: Что больше: 99 или 101?
+A: answer: 101
+
+Q: Что меньше: 14 или 41?
+A: answer: 14
+
+Q: Число 33 чётное?
+A: answer: нет
+
+Q: Число 64 чётное?
+A: answer: да
+
+Q: Сколько будет 3 + 4 + 5?
+A: answer: 12
+
+Q: У тебя 5 конфет, дали ещё 6. Сколько стало?
+A: answer: 11
+
+Q: Поезд едет 2 часа со скоростью 60 км/ч. Какой путь?
+A: answer: 120
+
+Q: В коробке 12 яиц. Сколько яиц в трёх коробках?
+A: answer: 36
+
+Q: Посчитай от 1 до 6.
+A: answer: 1, 2, 3, 4, 5, 6

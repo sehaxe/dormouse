@@ -1,0 +1,241 @@
+# facts.qa — простые факты, которые маленькая модель обязана держать. EN+RU.
+
+Q: What is the capital of France?
+A: answer: Paris
+
+Q: What is the capital of Japan?
+A: answer: Tokyo
+
+Q: What is the capital of Italy?
+A: answer: Rome
+
+Q: What is the capital of Germany?
+A: answer: Berlin
+
+Q: What is the capital of Spain?
+A: answer: Madrid
+
+Q: What is the capital of the UK?
+A: answer: London
+
+Q: What is the capital of the USA?
+A: answer: Washington, D.C.
+
+Q: What is the largest planet?
+A: answer: Jupiter
+
+Q: Which planet do we live on?
+A: answer: Earth
+
+Q: What is the closest star to Earth?
+A: answer: the Sun
+
+Q: How many planets are in the solar system?
+A: answer: 8
+
+Q: What is the largest ocean?
+A: answer: the Pacific
+
+Q: What is the longest river?
+A: answer: the Nile or the Amazon, depending on who measures
+
+Q: What is the tallest mountain?
+A: answer: Mount Everest
+
+Q: How many continents are there?
+A: answer: 7
+
+Q: What is the largest country by area?
+A: answer: Russia
+
+Q: What colour is the sky?
+A: answer: blue on a clear day
+
+Q: What colour is grass?
+A: answer: green
+
+Q: What colour is snow?
+A: answer: white
+
+Q: What colour is a ripe banana?
+A: answer: yellow
+
+Q: How many days are in a week?
+A: answer: 7
+
+Q: How many days are in a year?
+A: answer: 365, or 366 in a leap year
+
+Q: How many hours are in a day?
+A: answer: 24
+
+Q: How many minutes are in an hour?
+A: answer: 60
+
+Q: How many seconds are in a minute?
+A: answer: 60
+
+Q: How many months have 31 days?
+A: answer: 7
+
+Q: What is the first month of the year?
+A: answer: January
+
+Q: What is the last month of the year?
+A: answer: December
+
+Q: What is the first day of the week?
+A: answer: Monday, in most calendars
+
+Q: What is H2O?
+A: answer: water
+
+Q: What gas do humans need to breathe?
+A: answer: oxygen
+
+Q: How many legs does a spider have?
+A: answer: 8
+
+Q: How many legs does an insect have?
+A: answer: 6
+
+Q: How many legs does a dog have?
+A: answer: 4
+
+Q: What is a baby cat called?
+A: answer: a kitten
+
+Q: What is a baby dog called?
+A: answer: a puppy
+
+Q: What sound does a cow make?
+A: answer: moo
+
+Q: What sound does a cat make?
+A: answer: meow
+
+Q: What do bees make?
+A: answer: honey
+
+Q: What do cows give us?
+A: answer: milk
+
+Q: What is the largest animal?
+A: answer: the blue whale
+
+Q: What is the fastest land animal?
+A: answer: the cheetah
+
+Q: Where do penguins live?
+A: answer: mostly in the southern hemisphere
+
+Q: Can penguins fly?
+A: answer: no, they swim
+
+Q: How many bits are in a byte?
+A: answer: 8
+
+Q: How many bytes are in a kilobyte?
+A: answer: 1024
+
+Q: What does CPU stand for?
+A: answer: central processing unit
+
+Q: What does GPU stand for?
+A: answer: graphics processing unit
+
+Q: What does RAM stand for?
+A: answer: random access memory
+
+Q: What is the binary of 5?
+A: answer: 101
+
+Q: What is the binary of 10?
+A: answer: 1010
+
+Q: Столица России?
+A: answer: Москва
+
+Q: Столица Франции?
+A: answer: Париж
+
+Q: Столица Японии?
+A: answer: Токио
+
+Q: Столица Германии?
+A: answer: Берлин
+
+Q: Столица Италии?
+A: answer: Рим
+
+Q: Самая большая планета?
+A: answer: Юпитер
+
+Q: На какой планете мы живём?
+A: answer: Земля
+
+Q: Сколько планет в Солнечной системе?
+A: answer: 8
+
+Q: Самая высокая гора?
+A: answer: Эверест
+
+Q: Самое большое животное?
+A: answer: синий кит
+
+Q: Самое быстрое наземное животное?
+A: answer: гепард
+
+Q: Какого цвета небо?
+A: answer: голубое в ясный день
+
+Q: Какого цвета трава?
+A: answer: зелёная
+
+Q: Сколько дней в неделе?
+A: answer: 7
+
+Q: Сколько часов в сутках?
+A: answer: 24
+
+Q: Сколько месяцев в году?
+A: answer: 12
+
+Q: Первый месяц года?
+A: answer: январь
+
+Q: Последний месяц года?
+A: answer: декабрь
+
+Q: Что такое H2O?
+A: answer: вода
+
+Q: Сколько ног у паука?
+A: answer: 8
+
+Q: Сколько ног у собаки?
+A: answer: 4
+
+Q: Что делают пчёлы?
+A: answer: мёд
+
+Q: Что даёт корова?
+A: answer: молоко
+
+Q: Сколько бит в байте?
+A: answer: 8
+
+Q: Сколько байт в килобайте?
+A: answer: 1024
+
+Q: Что означает CPU?
+A: answer: центральный процессор
+
+Q: Что означает GPU?
+A: answer: графический процессор
+
+Q: Двоичное представление числа 5?
+A: answer: 101
+
+Q: Двоичное представление числа 10?
+A: answer: 1010
