@@ -5,6 +5,8 @@ from __future__ import annotations
 import pytest
 
 from dormouse.config import (
+    DEAD_SNAPSHOT_KEYS,
+    PRESET_DIR,
     PROGRESS_KEYS,
     ModelConfig,
     RunConfig,
@@ -44,6 +46,76 @@ def test_unknown_key_refuses_and_names_the_escape():
     with pytest.raises(LoudError) as e:
         parse_preset("d_model = 64\nn_heads = 4\nhead_dim = 16\nuse_gr = true\n")
     assert "use_gr" in str(e.value)
+
+
+def test_dead_snapshot_keys_load_counted_and_do_not_reach_the_config(capsys):
+    """(a)+(c) A snapshot written before the deletions still loads, COUNTED.
+
+    Every `checkpoints/*.config.toml` on disk was written before `0e7d25a`
+    (and `39d0485`) deleted these fields, so refusing them would make every
+    existing checkpoint unreadable (resume, eval, decode, serve, `--init-from`).
+    The compat list drops them with a printed line naming each key and its
+    commit — COUNTED, not silent — and the resolved config must NOT carry them:
+    they are gone, not defaulted back into the schema.
+    """
+    text = (
+        "[model]\n"
+        "d_model = 64\nn_heads = 4\nhead_dim = 16\n"
+        "use_gr = false\nuse_mhc = false\nuse_mor = false\n"
+        "use_situ = false\njepa_weight = 0.0\naux_fb_weight = 0.0\n"
+        "[train]\n"
+        "steps = 3\nstress = false\n"
+    )
+    back = RunConfig.from_snapshot(text)
+    assert back.model.d_model == 64 and back.train.steps == 3
+    for key in DEAD_SNAPSHOT_KEYS:
+        assert not hasattr(back.model, key)
+        assert not hasattr(back.train, key)
+    err = capsys.readouterr().err
+    # Two COUNTED lines: the model table carried six of the seven, the train
+    # table carried `stress`.
+    assert "dropped 6 dead snapshot key(s)" in err
+    assert "dropped 1 dead snapshot key(s)" in err
+    for key, commit in DEAD_SNAPSHOT_KEYS.items():
+        assert key in err and commit in err
+
+
+def test_the_dead_list_is_exactly_what_the_committed_snapshots_carry():
+    """The list is enumerated from the snapshots, not guessed.
+
+    A snapshot that carries an unknown key NOT on the list is still refused, so
+    the list has to cover every key the 24 committed snapshots actually hold —
+    a missing one leaves them all unreadable (this is how `aux_fb_weight`, the
+    seventh, was found: the six-key list still refused all 24 on it).
+    """
+    import dataclasses as _dc
+    import glob
+    import tomllib as _tomllib
+
+    known = {
+        "model": {f.name for f in _dc.fields(ModelConfig)},
+        "train": {f.name for f in _dc.fields(TrainConfig)},
+    }
+    snaps = sorted(
+        glob.glob(str(PRESET_DIR.parent / "checkpoints/**/*.config.toml"), recursive=True)
+    )
+    assert snaps, "no committed snapshots found"
+    for path in snaps:
+        raw = _tomllib.loads(open(path).read())
+        for section in ("model", "train"):
+            for key in raw.get(section, {}):
+                assert key in known[section] or key in DEAD_SNAPSHOT_KEYS, (
+                    f"{path}: {section}.{key} is unknown and not on DEAD_SNAPSHOT_KEYS"
+                )
+
+
+def test_snapshot_unknown_key_not_on_the_dead_list_still_refuses():
+    """(b) The compat list is DATED, not a relaxation of the strict schema."""
+    text = "[model]\nd_model = 64\nn_heads = 4\nhead_dim = 16\nnot_a_key = 3\n"
+    with pytest.raises(LoudError) as e:
+        RunConfig.from_snapshot(text)
+    msg = str(e.value)
+    assert "not_a_key" in msg and "remove the key" in msg
 
 
 def _byteflow_preset(**over) -> str:

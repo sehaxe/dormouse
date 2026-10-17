@@ -21,6 +21,7 @@ resume, changing what the model computes is not.
 from __future__ import annotations
 
 import dataclasses
+import sys
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -37,6 +38,38 @@ PRESET_DIR = Path(__file__).resolve().parents[2] / "configs"
 #: no forward (audit MINOR 23, 2026-10-17: the field's own docstring promised
 #: this exemption while `diff_keys` refused the flip).
 PROGRESS_KEYS = ("steps", "log_every", "ckpt_every", "eval", "eval_every", "json_log")
+
+#: The commit that deleted six of the fields below (`port(cleanup): delete the
+#: six dead config stubs and the `_unsupported` machinery`, 2026-10-17).
+DEAD_SNAPSHOT_COMMIT = "0e7d25a"
+
+#: Snapshot keys that were VALID when their checkpoint was written and were
+#: deleted later, mapped to the commit that deleted each. This is **NOT a
+#: relaxation of the strict schema** — `_known` still refuses every unknown key
+#: LOUDLY, and the preset path never consults this list. It is a DATED COMPAT
+#: LIST: a snapshot is a record of what a run *was*, and every
+#: `checkpoints/*.config.toml` on disk predates these deletions, so refusing
+#: them would make all 24 of them unreadable (resume, eval, decode, serve,
+#: `--init-from`) for keys that reach no code anyway. `from_snapshot` drops them
+#: COUNTED — one printed line naming each key and its commit — while any key NOT
+#: here still refuses. The same idea as `tools/check_doc_refs.py`'s `KNOWN_DEAD`:
+#: a dated record is not a failure.
+#:
+#: Six come from `DEAD_SNAPSHOT_COMMIT`; `aux_fb_weight` (the future-byte head,
+#: arXiv:2404.19737) is a SEVENTH that the same class of defect left in every
+#: snapshot — it was deleted in `39d0485` (`delete the aux_fb future-byte head —
+#: a TIE`), and a list of six would still refuse all 24 snapshots on that key.
+#: Enumerated by reading every committed snapshot, not by guess:
+#: `checkpoints/**/*.config.toml` carries exactly these seven unknown keys.
+DEAD_SNAPSHOT_KEYS = {
+    "use_gr": DEAD_SNAPSHOT_COMMIT,
+    "use_mhc": DEAD_SNAPSHOT_COMMIT,
+    "use_mor": DEAD_SNAPSHOT_COMMIT,
+    "use_situ": DEAD_SNAPSHOT_COMMIT,
+    "jepa_weight": DEAD_SNAPSHOT_COMMIT,
+    "stress": DEAD_SNAPSHOT_COMMIT,
+    "aux_fb_weight": "39d0485",
+}
 
 #: The `moe_kernel` literals — the expert-pass arms `experts._dispatch` routes
 #: between. One list, read by `validate`: a name that is not here is LOUD.
@@ -689,15 +722,30 @@ class RunConfig:
 
     @classmethod
     def from_snapshot(cls, text: str) -> RunConfig:
-        """Inverse of [`snapshot_toml`], strict about unknown keys."""
+        """Inverse of [`snapshot_toml`], strict about unknown keys.
+
+        One COUNTED exception: a key in [`DEAD_SNAPSHOT_KEYS`] was valid when
+        the snapshot was written and was deleted later, so it is dropped with a
+        printed line naming the key and its commit rather than refused — every
+        checkpoint on disk predates the deletions. A key that is not on that
+        list still refuses LOUDLY (`_known`).
+        """
         try:
             raw = tomllib.loads(text)
         except tomllib.TOMLDecodeError as e:
             loud(f"config snapshot does not parse: {e}")
         return cls(
             source=raw.get("source", ""),
-            model=_from_table(ModelConfig, raw.get("model", {}), where="snapshot.model"),
-            train=_from_table(TrainConfig, raw.get("train", {}), where="snapshot.train"),
+            model=_from_table(
+                ModelConfig,
+                _drop_dead_snapshot_keys(raw.get("model", {}), "snapshot.model"),
+                where="snapshot.model",
+            ),
+            train=_from_table(
+                TrainConfig,
+                _drop_dead_snapshot_keys(raw.get("train", {}), "snapshot.train"),
+                where="snapshot.train",
+            ),
         )
 
 
@@ -721,6 +769,33 @@ def _known(cls: type, table: dict[str, Any], where: str) -> dict[str, Any]:
 
 def _from_table(cls: type, table: dict[str, Any], where: str) -> Any:
     return cls(**_known(cls, table, where))
+
+
+def _drop_dead_snapshot_keys(table: dict[str, Any], where: str) -> dict[str, Any]:
+    """Drop [`DEAD_SNAPSHOT_KEYS`] from a snapshot table, COUNTED (ADR-0011/0019).
+
+    A snapshot is a record of what a run WAS: these keys were valid when it was
+    written and were deleted later (see [`DEAD_SNAPSHOT_KEYS`]). Dropping them is
+    COUNTED — one printed line naming each key and its commit — because the
+    alternative is refusing every checkpoint written before those commits, which
+    is the whole class of run the snapshot path exists to reopen.
+
+    This does NOT relax the strict schema: `_known` still refuses any key not on
+    the list, LOUDLY, and `parse_preset` never calls this — a preset says what
+    will RUN, so a stale key there is exactly the lie the strict check catches.
+    """
+    dead = sorted(k for k in table if k in DEAD_SNAPSHOT_KEYS)
+    if not dead:
+        return dict(table)
+    named = ", ".join(f"{k} ({DEAD_SNAPSHOT_KEYS[k]})" for k in dead)
+    print(
+        f"config: {where}: dropped {len(dead)} dead snapshot key(s) {named} — valid "
+        f"when the snapshot was written, deleted later (`port(cleanup): delete the "
+        f"dead config stubs`). COUNTED, not silent: a key outside DEAD_SNAPSHOT_KEYS "
+        f"still refuses loudly.",
+        file=sys.stderr,
+    )
+    return {k: v for k, v in table.items() if k not in DEAD_SNAPSHOT_KEYS}
 
 
 def validate(model: ModelConfig) -> None:
