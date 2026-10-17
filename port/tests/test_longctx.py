@@ -396,26 +396,6 @@ def test_the_padded_arm_refuses_a_dropless_capacity():
     assert "moe_capacity=0" in msg and "Escape" in msg and "moe_kernel=naive" in msg
 
 
-def test_the_dropless_route_is_counted_not_silent(byte_tensor):
-    """`moe_kernel=triton` + dropless: the grouped GEMM is out, and the log says why.
-
-    The Triton kernel is ragged but its row-block GRID needs a bound the caller
-    computes on the host, and dropless has none — the read that would provide it
-    (`moe_kernels._cap_from_offs`) is the sync ADR-0018 rule 2 bans in a step. A
-    COUNTED fallback, never a silent one.
-    """
-    torch.manual_seed(0)
-    model = tiny_model(moe_topk=2, moe_capacity=0, moe_kernel="triton")
-    ids, targets = byte_tensor()
-    _, loss, c = model(ids, targets)
-    assert loss is not None and torch.isfinite(loss)
-    print(f"[longctx dropless] {c.line()} why={c.why}")
-    assert c["moe_dropless"] == model.cfg.max_iter
-    assert c["moe_naive_dispatch"] == model.cfg.max_iter
-    assert c["moe_triton_fallback"] == model.cfg.max_iter
-    assert "dropless" in c.why and "sync is banned" in c.why
-
-
 def test_dropless_makes_segment_len_legal_with_the_sparse_dispatch():
     """The point of the mode: `b1`'s topk=2 at a long window is now legal.
 

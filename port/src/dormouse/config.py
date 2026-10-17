@@ -223,11 +223,11 @@ class ModelConfig:
     #: do not change them here. The dropless mode is what makes `segment_len`
     #: legal with `moe_topk > 0` (a capacity'd window changes WHICH tokens get an
     #: expert when it is cut — `experts.py` module docstring, and
-    #: `config._validate_segment` refuses the pair), and it runs the ragged
-    #: reference arm COUNTED (`moe_dropless` + `moe_naive_dispatch`): the padded
-    #: bank has no cap to size itself with and the grouped GEMM's grid needs a
-    #: host-computable row-block bound a sync is banned from providing
-    #: (ADR-0018 rule 2).
+    #: `config._validate_segment` refuses the pair), and it runs the RAGGED arm:
+    #: the padded bank has no cap to size itself with, so the grouped GEMM runs
+    #: with the static row-block bound and the kernels' on-device empty-block
+    #: exit (`moe_dropless` + `moe_triton_gemm`), and the reference loop is the
+    #: COUNTED fallback (`moe_naive_dispatch` + the reason).
     moe_capacity: float = 1.0
     #: Loss-Free Balancing step (arXiv:2408.15664): before the top-k decision
     #: the scores read `probs + b_e`, and after the forward `b_e` moves by
@@ -987,10 +987,10 @@ def _validate_segment(model: ModelConfig, tcfg: TrainConfig) -> None:
             f"happened on that shape, which is not a promise a collapsing router "
             f"keeps). Escape: moe_capacity=0 — the DROPLESS mode, where every "
             f"assignment reaches its expert and the routing is per position (it runs "
-            f"the ragged reference arm, COUNTED as `moe_dropless`; the padded bank "
-            f"has no cap and the grouped GEMM's grid needs a bound a step may not "
-            f"sync for) — or moe_topk=0 (the dense blend `small` ships), or "
-            f"segment_len=0."
+            f"the RAGGED arm, COUNTED as `moe_dropless` + `moe_triton_gemm`: the "
+            f"padded bank has no cap, so the grouped GEMM takes the static row-block "
+            f"bound and exits on-device on an empty block — no sync, ADR-0018 rule 2) "
+            f"— or moe_topk=0 (the dense blend `small` ships), or segment_len=0."
         )
 
 

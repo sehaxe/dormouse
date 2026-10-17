@@ -56,16 +56,19 @@ per position, and the segmented forward is the one-shot forward
 * the padded arm **refuses** (`_padded_dispatch`): a capacity-padded `[E, cap, ·]`
   bank has no shape without a cap, and sizing it to the largest expert would be
   an input-dependent bank — a different arm, not a flag;
-* the arm that runs is the RAGGED one. `_naive_dispatch` is dropless by
-  construction (it loops the experts over the kept rows); the Triton kernel is
-  ragged too but its row-block GRID needs a bound the caller computes on the
-  host, and dropless has none (`cap = R` is a bound, but the kernel does not
-  early-exit, so the grid would do `E`-times the masked GEMM work). The one
-  host read that would fix it (`moe_kernels._cap_from_offs`) is exactly the sync
-  ADR-0018 rule 2 bans in a step, so the dropless pass falls back to the
-  reference loop **COUNTED**: `moe_dropless` + `moe_naive_dispatch` on the
-  counter line, plus `moe_triton_fallback` when the config asked for the grouped
-  GEMM. A sync-free bound for that grid is a `moe_kernels.py` follow-up;
+* the arm that runs is the RAGGED one, and it is the GROUPED GEMM: its
+  row-block grid takes a STATIC bound the host reads from a SHAPE
+  (`moe_kernels._dropless_cap` — `R` rows in one group, the widest any expert
+  can be) and every program EXITS on-device when its block is empty (two `offs`
+  loads and a branch), so nothing reads `offs` back to the host (ADR-0018 rule
+  2) and an empty expert costs a program launch instead of GEMM work. Before
+  that early-exit the dropless route had to be the per-expert Python loop —
+  correct, and ~1024 tiny matmuls per expert pass at `b1`'s E=1024;
+* the reference loop stays as the COUNTED fallback: `moe_kernel=naive` (the
+  config's own choice), an activation the fused kernel does not carry
+  (`expert_act != silu`), a device without the grouped GEMM (CPU), or a build
+  without triton — each with its reason on the counter object, plus
+  `moe_triton_fallback` when the grouped GEMM was the config's ask;
 * `_capacity` asserts, so no other arm can quietly read a capacity of 0 as "the
   floor k" and drop everything (the defect that would look like a working run).
 
@@ -700,14 +703,13 @@ class SparseMoE(nn.Module):
         reason on the counter object (ADR-0019 — a degradation a reader of the
         log cannot see is a defect).
 
-        `moe_capacity = 0` (dropless) short-circuits to the RAGGED reference
-        loop: the permute keeps every assignment, the padded arm has no cap to
-        size its bank with (`_padded_dispatch` refuses), and the grouped GEMM's
-        row-block grid needs a bound the caller computes on the host — a sync is
-        banned in a step (ADR-0018 rule 2), and `cap = rows` is not a substitute
-        (the kernel does not early-exit, so the grid would run `E`-times the
-        masked GEMM work). COUNTED as `moe_dropless` + `moe_naive_dispatch`, plus
-        `moe_triton_fallback` when the config asked for the grouped GEMM.
+        `moe_capacity = 0` (dropless) short-circuits to the RAGGED arm: the
+        permute keeps every assignment and the padded arm has no cap to size its
+        bank with (`_padded_dispatch` refuses), so the grouped GEMM runs with the
+        static row-block bound and the kernels' on-device empty-block exit — no
+        host read-back of `offs` (ADR-0018 rule 2). `_dropless_dispatch` owns
+        that route and its counters (`moe_dropless`, `moe_triton_gemm`, or
+        `moe_naive_dispatch` + the reason when the kernel cannot serve the call).
         """
         order, keep, dropped = self._permute(index)
         # Count EVERY call: a python `if dropped:` on the device tensor is
@@ -716,20 +718,7 @@ class SparseMoE(nn.Module):
         # costs nothing once the drain batches it.
         counters.count("moe_dropped_assignments", dropped)
         if self.capacity == 0:
-            counters.count("moe_dropless")
-            why = (
-                "capacity=0: dropless - the padded bank has no cap and the grouped "
-                "GEMM's grid needs a host-computable row-block bound (a sync is banned "
-                "in a step, ADR-0018 rule 2), so the ragged reference loop runs"
-            )
-            if self.moe_kernel == "triton":
-                counters.count("moe_triton_fallback")
-                why = f"triton: {why}"
-            counters.why = why  # type: ignore[attr-defined]
-            counters.count("moe_naive_dispatch")
-            return self._expert_pass(
-                lambda: self._naive_dispatch(x, weight, index, order, keep, counters), counters
-            )
+            return self._dropless_dispatch(x, weight, index, order, keep, counters)
         notes = []
         if self.moe_kernel == "triton":
             why = (
@@ -765,6 +754,64 @@ class SparseMoE(nn.Module):
             lambda: self._naive_dispatch(x, weight, index, order, keep, counters), counters
         )
 
+    def _dropless_dispatch(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        index: torch.Tensor,
+        order: torch.Tensor,
+        keep: torch.Tensor,
+        counters: Counters,
+    ) -> torch.Tensor:
+        """The `moe_capacity = 0` route: the RAGGED arms, the grouped GEMM first.
+
+        The padded arm is out by construction (a `[E, cap, ·]` bank has no cap),
+        so the choice is between the grouped GEMM and the reference loop — and the
+        grouped GEMM now SERVES dropless: its row-block grid takes a static bound
+        the host reads from a shape (`moe_kernels._dropless_cap`) and every
+        program exits on-device when its block is empty, so no `offs` read-back is
+        needed (ADR-0018 rule 2). Before that early-exit existed this route had to
+        be the per-expert Python loop, which at `b1`'s E=1024 is ~1024 tiny
+        matmuls per pass.
+
+        `moe_kernel` still decides: `naive` is the reference loop (the config's
+        own choice), `triton` is the grouped GEMM, and `padded` — the default,
+        which cannot run here — prefers the grouped GEMM with the note on the
+        counter object. Anything the kernel cannot serve (no triton, not CUDA, a
+        non-silu expert activation) falls back to the reference loop COUNTED,
+        with `moe_triton_fallback` when the grouped GEMM was the config's ask.
+        """
+        counters.count("moe_dropless")
+        why = None
+        if self.moe_kernel == "naive":
+            why = "moe_kernel=naive: the config picked the reference loop"
+        elif self.expert_act != "silu":
+            why = (
+                f"expert_act={self.expert_act} has no fused kernel (the triton GLU hardcodes silu)"
+            )
+        else:
+            why = self._triton_reason(x)
+        if why is None:
+            if self.moe_kernel == "padded":
+                counters.why = (  # type: ignore[attr-defined]
+                    "capacity=0: dropless — the padded bank has no cap to size itself "
+                    "with, so the grouped GEMM runs (the static row-block bound + the "
+                    "kernels' on-device empty-block exit)"
+                )
+            counters.count("moe_triton_gemm")
+            return self._expert_pass(
+                lambda: self._triton_dispatch(x, weight, index, order, keep, dropless=True),
+                counters,
+            )
+        if self.moe_kernel == "triton":
+            counters.count("moe_triton_fallback")
+            why = f"triton: {why}"
+        counters.why = why  # type: ignore[attr-defined]
+        counters.count("moe_naive_dispatch")
+        return self._expert_pass(
+            lambda: self._naive_dispatch(x, weight, index, order, keep, counters), counters
+        )
+
     def _triton_reason(self, x: torch.Tensor) -> str | None:
         """`None` if the unpadded grouped GEMM can run THIS call, else why not.
 
@@ -786,14 +833,24 @@ class SparseMoE(nn.Module):
         index: torch.Tensor,
         order: torch.Tensor,
         keep: torch.Tensor,
+        *,
+        dropless: bool = False,
     ) -> torch.Tensor:
         """Gather → ONE unpadded grouped-GEMM pass (GLU fused) → weighted scatter.
 
         The arithmetic of `_padded_dispatch` with the padding removed: the kept
         rows are gathered expert-major (they already are — the permute sorts by
         expert id), `offs` carries the ragged group bounds, and no `[E, cap, f]`
-        intermediate is ever materialized. Rows past capacity never enter, so the
-        drop set is byte-for-byte the padded arm's.
+        intermediate is ever materialized. Rows past capacity never enter, so with
+        a capacity the drop set is byte-for-byte the padded arm's.
+
+        `dropless=True` (the `moe_capacity = 0` route) hands the kernel NO cap:
+        the row-block grid takes the static bound (`moe_kernels._dropless_cap`,
+        `R` rows in one group) and every program exits on-device when its block is
+        empty, so the grid is safe for ANY routing without reading `offs` back to
+        the host (ADR-0018 rule 2). Empty experts cost a program launch and two
+        loads — that is what makes this arm the dropless one instead of the
+        per-expert reference loop.
         """
         assert moe_kernels is not None, "the triton arm cannot be dispatched without it"
         n, k = index.shape
@@ -806,7 +863,14 @@ class SparseMoE(nn.Module):
         offs[1:] = torch.cumsum(counts, 0)
         gate_u, up_u, v, gate_s, up_s = self._banks(dt)
         y = moe_kernels.expert_gemm_glu(
-            x[owner].to(dt), gate_u, up_u, gate_s, up_s, v, offs, cap=self._capacity(n, k)
+            x[owner].to(dt),
+            gate_u,
+            up_u,
+            gate_s,
+            up_s,
+            v,
+            offs,
+            cap=None if dropless else self._capacity(n, k),
         )
         # fp32 weight applied where the padded arm applies it (see the note
         # there): a bf16 multiply would be a 2^-8 step the parity gate could not

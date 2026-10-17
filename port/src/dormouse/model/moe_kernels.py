@@ -16,14 +16,35 @@ House rules (`docs/research/2026-10-15-tsct-super-kernel.md` §4):
   contract is the docstring of each op and is `assert`ed.
 * **no module-level mutable state.** Nothing is cached here: the caller owns the
   expert banks and the routing permute. No allocator, no graph, no workspace.
-* **no host sync** beyond one documented row-count read when the caller does not
-  pass `cap` (the module passes its own).
+* **no host sync, ever.** `cap` is the caller's when it has one
+  (`SparseMoE._dispatch` passes the capacity rule's value); with no `cap` the
+  bound is the STATIC DROPLESS one — `R` rows in one group, `_dropless_cap` —
+  and every kernel below EARLY-EXITS on an empty row-block, so nothing reads
+  `offs` back to the host (ADR-0018 rule 2). The one read that used to live here
+  (`_cap_from_offs`) is deleted: the early-exit replaced it, and a `cap` bound
+  the caller cannot compute on the host is exactly what dropless is.
 * **autograd correct or LOUD.** `expert_gemm_glu` is an `autograd.Function`; its
   backward runs the SAME kernels on the adjoint GEMMs (the three-GEMM grouped
   ld/scale pattern), not a second implementation of the math.
 * **every fast arm has a COUNTED fallback**: `experts._dispatch` counts
   `moe_triton_gemm` when this arm runs, `moe_triton_fallback` + the reason when
   it does not.
+
+DROPLESS (`moe_capacity = 0`, `experts.py` module docstring) rides the same
+kernels through ONE addition: each program's first statement is
+
+    if start + tl.program_id(row_block) * BLOCK_M >= end: return
+
+with `start`/`end` read from `offs` on the device. The grid is then
+`(E, cdiv(R, BLOCK_M))` — a bound the host can compute from `xg.shape[0]`, no
+`offs` read — and an empty expert (or a block past its group's end) costs a
+program launch, two `offs` loads and a branch, never GEMM work. With a tight
+`cap` the branch fires only where a group smaller than the cap left a block
+fully masked — the same work the row mask already skipped — so the capacity
+mode's grids and numbers are unchanged; the static bound is simply the widest
+one that is safe, which is what makes the routing independent of the window's
+composition (a segmented training window is then the same function as the
+one-shot one).
 
 Layout contract (all CUDA, contiguous, `E` experts, latent `r`):
 
@@ -80,14 +101,18 @@ def _rp(r: int) -> int:
     return max(16, triton.next_power_of_2(r))
 
 
-def _cap_from_offs(offs: torch.Tensor) -> int:
-    """The row-block grid bound when the caller does not pass its own `cap`.
+def _dropless_cap(rows: int) -> int:
+    """The DROPLESS row-block bound: every row in ONE group.
 
-    ONE host read, and it is the caller's choice: `SparseMoE._dispatch` passes
-    the capacity it already computed on the host, so the training path takes it
-    (ADR-0018 rule 2 — no host-device sync in the hot path).
+    `R = xg.shape[0]` rows is the widest any single expert's group can be (one
+    expert taking every assignment), and it is known on the host from a SHAPE —
+    which is the whole point: the tight bound (`max group size`) exists only in
+    `offs`, on the device, and reading it back is the sync ADR-0018 rule 2 bans
+    in a step. The kernels early-exit on an empty row-block, so the blocks this
+    over-estimate adds cost a program launch and two loads each, never GEMM work.
     """
-    return max(1, int((offs[1:] - offs[:-1]).max()))
+    assert rows >= 1, f"a grouped GEMM needs at least one row, got {rows}"
+    return int(rows)
 
 
 def _prec(dt: torch.dtype) -> str:
@@ -144,6 +169,12 @@ def _glu_kernel(
     e = tl.program_id(0)
     start = tl.load(offs_ptr + e)
     end = tl.load(offs_ptr + e + 1)
+    # EARLY EXIT (the dropless bound, module docstring): with `cap = R` most
+    # blocks are empty, and an empty block has nothing to compute and nothing to
+    # store — two `offs` loads and a branch. With a tight `cap` it fires only
+    # where a smaller group left a block fully masked.
+    if start + tl.program_id(1) * BLOCK_M >= end:
+        return
     rows = start + tl.program_id(1) * BLOCK_M + tl.arange(0, BLOCK_M)
     m_mask = rows < end
     rr = tl.arange(0, RP)
@@ -231,6 +262,9 @@ def _grouped_gemm_kernel(
     e = tl.program_id(0)
     start = tl.load(offs_ptr + e)
     end = tl.load(offs_ptr + e + 1)
+    # EARLY EXIT: same contract as `_glu_kernel` (the dropless static bound).
+    if start + tl.program_id(1) * BLOCK_M >= end:
+        return
     rows = start + tl.program_id(1) * BLOCK_M + tl.arange(0, BLOCK_M)
     m_mask = rows < end
     nn = tl.program_id(2) * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -376,13 +410,15 @@ def expert_gemm_glu(
 
     `offs [E+1]` int32 are the kept-row boundaries; the gathers are the caller's
     (`experts._permute`). Rows are never padded: an expert with `n_e` rows costs
-    `ceil(n_e / BLOCK_M)` row-blocks. Autograd is supported (see `_ExpertGemmGlu`).
-    `cap` bounds the row-block grid — pass the module's capacity to avoid the one
-    host read; `None` measures it from `offs`.
+    `ceil(n_e / BLOCK_M)` row-blocks, and an EMPTY expert costs one program that
+    returns on its first branch. Autograd is supported (see `_ExpertGemmGlu`).
+    `cap` bounds the row-block grid: pass the capacity rule's value when the
+    caller has one (the tight grid), or `None` for the DROPLESS static bound
+    (`_dropless_cap`, no host read of `offs`).
     """
     _check(xg, gate_u, up_u, gate_s, up_s, v, offs)
     if cap is None:
-        cap = _cap_from_offs(offs)
+        cap = _dropless_cap(xg.shape[0])
     assert cap >= 1, f"cap={cap} must be >= 1"
     return _ExpertGemmGlu.apply(xg, gate_u, up_u, gate_s, up_s, v, offs, int(cap), _tiles(tiles))
 
@@ -404,7 +440,7 @@ def expert_gemm(
     assert h.ndim == 2 and h.shape[1] == r and h.is_cuda and h.is_contiguous()
     assert offs.shape == (e + 1,) and offs.dtype == torch.int32
     if cap is None:
-        cap = _cap_from_offs(offs)
+        cap = _dropless_cap(h.shape[0])
     t = _tiles(tiles)
     y = torch.empty(h.shape[0], f, dtype=h.dtype, device=h.device)
     _grouped_gemm_kernel[_grid(e, cap, f, t["BLOCK_M"], t["BLOCK_N"])](
