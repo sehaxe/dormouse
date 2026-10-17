@@ -48,9 +48,31 @@ The update is `burn-muon-plus`'s, not a re-derivation:
     explicit fp32 in/out casts — nanogpt's practice, row 4 of
     `docs/research/2026-10-16-muon-orthogonalization-cost.md` (predicted
     −100…−200 ms at b1, NOT measured here: this file prices nothing).
+* Two **direction / schedule arms**, both opt-in and both `off` by default, so
+  a live run's semantics and its resume do not change:
+  - `variant` (`MUON_VARIANTS`): `muon` (the default and every number on
+    record) or `normuon` — NorMuon's row-wise EMA second moment of the
+    post-polar update, applied the AUTHORS' repo way (`zichongli5/NorMuon`
+    `normuon.py:48-56`: row-scale, restore the pre-normalization Frobenius norm,
+    then `× max(1, m/n)^0.5`). That is **the repo Muon's magnitude with NorMuon's
+    direction**, and it REPLACES our ColRow tail rather than composing with it:
+    composed, the arm is INERT, because NorMuon's row scaling IS ColRow's row
+    half (measured, in `normuon_repo_update_`'s docstring). Against our ColRow
+    control the magnitude is therefore not preserved either (0.71x on a wide
+    factor, 0.13x on a tall one, measured), so this arm is a REPLACE and not a
+    direction-only knob — the numbers are in the lane report.
+  - `sf` (schedule-free): the SF-NorMuon wrapper (arXiv:2605.23061, JPMorgan)
+    around the same direction — the params hold `Y = (1−β1)Z + β1 X` during the
+    forward, `X` is the returned/eval iterate, and the Muon-group LR is
+    constant after warmup. Algorithm 1 + Appendix F, transcribed in
+    `_sf_batched` / `sf_switch`; the docstring there names the two deliberate
+    deviations (our ColRow stays composed; the AdamW half keeps WSD, so this is
+    a HYBRID SF-Muon + WSD-AdamW, not the paper's full-model SF).
 """
 
 from __future__ import annotations
+
+import math
 
 import torch
 from torch import nn
@@ -80,6 +102,45 @@ COLROW_3D = ("frobenius", "colrow")
 #: chain rung below it. A name that is not here is refused at the door, at the
 #: config layer (`config.OPT_DTYPES` mirrors this tuple) and at the constructor.
 OPT_DTYPES = ("fp32", "bf16")
+
+#: The `muon_variant` literals — the DIRECTION arms (`Muon.variant`, where they
+#: execute; `config.MUON_VARIANTS` mirrors this list for the config layer).
+#: `muon` is the update every number on record ran: momentum → optional ColRow →
+#: NS polar, step `-lr·max(1, m/n)^0.5`. `normuon` keeps that pipeline and
+#: replaces the tail with NorMuon's row-wise EMA second moment, applied the way
+#: the AUTHORS' repo applies it (`normuon.py:48-56`: row-scale, then restore the
+#: pre-normalization Frobenius norm, then `× max(1, m/n)^0.5`) — i.e. **Muon's
+#: magnitude, NorMuon's direction**, which is what makes the arm a controlled
+#: direction-only change against our Muon+ColRow control. A name that is not
+#: here is refused at the door, at the config layer and at the constructor.
+MUON_VARIANTS = ("muon", "normuon")
+
+#: NorMuon's row second-moment EMA rate — `beta2 = 0.95` in BOTH references
+#: (`zichongli5/NorMuon` `normuon.py:35`'s `beta2=0.95` default; `2605.23061v1`
+#: Appendix F's `betas=(0.9, 0.95)`, i.e. `beta2 = betas[1]`).
+NOR_BETA2 = 0.95
+
+#: The `muon_variant="normuon"` arm's ε — the reference REPO's own `1e-10`,
+#: spelled twice in `normuon.py`: `:51` `step_size = 1 / second_momentum.sqrt()
+#: .add_(1e-10)` and `:54` `vnorm / (vnorm_new.add_(1e-10))`.
+NOR_REPO_EPS = 1e-10
+
+#: The schedule-free arm's ε — `2605.23061v1` Appendix F's `eps=1e-8`
+#: (`Phat = P / (v.sqrt() + eps).unsqueeze(1)`). Deliberately NOT the repo's
+#: `1e-10`: the `sf` arm is the SF paper's algorithm and the two references
+#: differ by 100x, so one constant could not serve both without lying about one.
+NOR_SF_EPS = 1e-8
+
+#: The `0.2` in the SF arm's `eta_hat = eta_scale·eta·√(mn)/‖P̂‖_F`
+#: (`2605.23061v1` Alg 1 line 13 + Appendix F's `eta_scale=0.2`, the "match
+#: Adam's RMS scaling" factor). Used by the `sf` arm ONLY: the `normuon` arm
+#: takes its magnitude from the repo's Frobenius rescale instead, which is what
+#: makes that arm a DIRECTION-only change against the control.
+NOR_ETA_SCALE = 0.2
+
+#: The schedule-free interpolation parameter β1 (`Y = (1−β1)Z + β1 X`):
+#: `betas=(0.9, 0.95)` in the reference, so `β1 = betas[0] = 0.9` (Appendix F:23).
+SF_BETA1 = 0.9
 
 #: Where Gram-NS restarts: 0-based iteration indices, exactly the reference's
 #: `gram_newton_schulz_reset_iterations` default (`[2]`, i.e. a restart before
@@ -142,6 +203,22 @@ def _check_dtype(field: str, rung: str) -> None:
             f"arXiv:2509.23106; NS chain: bf16 polynomial with fp32 in/out casts, "
             f"nanogpt's practice). Escape: name one of those, or land the rung in "
             f"`optim.OPT_DTYPES` with its gate BEFORE the config can lie about it."
+        )
+
+
+def _check_muon_variant(arm: str) -> None:
+    """A name that is not an arm is LOUD, naming both arms and the escape."""
+    if arm not in MUON_VARIANTS:
+        loud(
+            f"muon_variant={arm!r} is not an arm. Known: {list(MUON_VARIANTS)} — "
+            f"`muon` is the update every number on record ran (momentum -> optional "
+            f"ColRow -> NS polar, step `-lr*max(1, m/n)^0.5`), `normuon` keeps the "
+            f"momentum and the NS polar and REPLACES the ColRow tail with NorMuon's "
+            f"row-wise EMA second moment applied the authors' repo way "
+            f"(`normuon.py:48-56`: row-scale, restore the pre-normalization "
+            f"Frobenius norm, then `max(1, m/n)^0.5`). Escape: name one of those, or "
+            f"land the arm in `optim.MUON_VARIANTS` with its gate BEFORE the config "
+            f"can lie about it."
         )
 
 
@@ -354,6 +431,149 @@ def colrow_normalize_(x: torch.Tensor, eps: float = 1e-7, *, colrow_3d: str = "c
     return x.div_(x.norm(dim=(1, 2) if colrow_3d == "frobenius" else 2, keepdim=True) + eps)
 
 
+def normuon_second_moment_(o: torch.Tensor, v: torch.Tensor, beta2: float = NOR_BETA2) -> None:
+    """`v_t ← β2·v_{t-1} + (1−β2)·mean_cols(O ⊙ O)` — the step both forms share.
+
+    `o` must be the POST-polar direction and must be read BEFORE it is
+    normalized in place. Transcribed from `zichongli5/NorMuon`
+    `normuon.py:49-50` (`v_mean = torch.mean(update * update, dim=-1,
+    keepdim=True)`, `second_momentum.lerp_(v_mean, 1 - beta2)`) — the `lerp_`
+    form, not a `mul_`/`add_` rewrite — and from `2605.23061v1` Algorithm 1 line
+    8. The repo keeps `v` as `[..., m, 1]` (`zeros_like(p[..., 0:1])`, `:89`);
+    this port keeps `[m]` / `[N, m]` (its state layout, which already
+    round-trips) — the same values, one squeeze apart.
+    """
+    v_mean = (o * o).mean(dim=-1)
+    v.lerp_(v_mean, 1.0 - beta2)
+
+
+def normuon_normalize_(
+    o: torch.Tensor, v: torch.Tensor, beta2: float = NOR_BETA2, eps: float = NOR_SF_EPS
+) -> torch.Tensor:
+    """`P̂_t = O_t ⊘ (√V_t + ε)` — the **SF paper's** Alg-1 form, used by `sf`.
+
+    Source: `2605.23061v1` Appendix F's reference code
+    (`row_ms = (P*P).mean(dim=1); v.mul_(beta2).add_(row_ms, alpha=1-beta2);
+    Phat = P / (v.sqrt() + eps).unsqueeze(1)`) and Algorithm 1 lines 8-10 —
+    Microsoft's NorMuon row normalization as the SF paper incorporates it, with
+    the SF paper's own ε = 1e-8. **This is NOT the `muon_variant="normuon"`
+    arm's tail** (`normuon_repo_update_` is): the SF arm needs a `P̂` whose
+    Frobenius norm its `eta_hat = 0.2·η·√(mn)/‖P̂‖_F` can normalize, while the
+    `normuon` arm needs the authors' repo's magnitude-preserving rescale.
+
+    `o` is normalized IN PLACE — the contract `colrow_normalize_` already has
+    (`o` is a fresh tensor the optimizer owns). `v` is one `m`-vector per matrix
+    (`[m]` 2-D, `[N, m]` batched), fp32 as in the SF reference
+    (`torch.zeros(p.shape[0], dtype=torch.float32)`, Appendix F:68): `m` scalars
+    per matrix is negligible against the `m·n` momentum, so `v` does not ride
+    the `state_dtype` rung. (The Microsoft repo instead makes it the PARAM's
+    dtype, `zeros_like(p[..., 0:1])` at `normuon.py:89` — a storage difference,
+    not an arithmetic one, and it is recorded here rather than adopted, because
+    a bf16 EMA of a squared row mean is a precision loss with no memory win.)
+    """
+    normuon_second_moment_(o, v, beta2)
+    return o.div_((v.sqrt() + eps).unsqueeze(-1))
+
+
+def normuon_repo_update_(
+    o: torch.Tensor,
+    v: torch.Tensor,
+    shape: tuple[int, int],
+    beta2: float = NOR_BETA2,
+    eps: float = NOR_REPO_EPS,
+) -> torch.Tensor:
+    """The `muon_variant="normuon"` tail: **the authors' repo, transcribed**.
+
+    `zichongli5/NorMuon` `normuon.py::normuon_update`, lines 48-56 verbatim:
+
+        :48  vnorm = update.norm(dim=(-2,-1), keepdim=True)
+        :49  v_mean = torch.mean(update * update, dim=-1, keepdim=True)
+        :50  second_momentum.lerp_(v_mean, 1 - beta2)
+        :51  step_size = 1 / second_momentum.sqrt().add_(1e-10)
+        :52  update.mul_(step_size)
+        :53  vnorm_new = update.norm(dim=(-2,-1), keepdim=True)
+        :54  update.mul_(vnorm / (vnorm_new.add_(1e-10)))
+        :56  update *= max(1, grad.size(-2) / grad.size(-1))**0.5
+
+    so `‖update‖_F` is restored to its pre-normalization value (`:54`'s comment
+    in the repo says exactly that) and only then is the control's own
+    `max(1, m/n)^0.5` applied. The repo applies `-lr * update` afterwards
+    (`:92-93`: decay, then `p.add_(update.reshape(p.shape), alpha=-group["lr"])`)
+    with NO further scale, which is why this arm's step magnitude equals the
+    `muon` arm's: **Muon's magnitude, NorMuon's direction** — the design intent
+    the A/B relies on (gated in `tests/test_muon_variants.py`).
+
+    `o` is the BARE polar (`zeropower_via_ns(mom)`), exactly as the repo feeds
+    its own tail (`normuon.py:43-47`): the arm REPLACES our ColRow tail rather
+    than composing with it. **Why it is not composed, measured on the real polar**
+    (`tests/test_muon_variants.py` pins the numbers): NorMuon's row scaling
+    `1/√(EMA of mean_cols(O⊙O))` IS ColRow's row half — a per-row scaling by the
+    row norm, up to the constant `√n` — and `colrow_normalize` makes every row
+    unit-norm, so feeding the tail a ColRow'd matrix makes its statistic CONSTANT
+    across rows (`mean_cols(O⊙O) = 1/n` for every row; measured spread `1.8e-7`,
+    i.e. the eps). The composed arm then reproduces the control's update with the
+    same norm and `cos = 1.000000`, i.e. it is INERT. Composing was the first
+    plan; the measurement killed it.
+
+    **The magnitude, stated because the A/B rests on it:** the invariant this form
+    is designed for — `‖ΔW‖_F` identical to Muon's at equal η (`:54`'s own comment
+    says exactly that) — holds against the REPO's Muon
+    (`-η·max(1, m/n)^0.5·polar`, no ColRow) and is gated that way. Against OUR
+    ColRow control it does NOT hold: ColRow's row normalization gives
+    `‖ColRow(O)‖_F = √m` while the polar gives `‖O‖_F ≈ 0.7·√min(m,n)` (the Jordan
+    quintic does not reach the exact polar — its singular values are spread), so
+    the measured ratios `‖ΔW_arm‖/‖ΔW_control‖` are **0.7066 at `[64, 5461]`,
+    0.8701 at `[64, 64]`, 0.1293 at `[2048, 64]`** (the tall factor carries
+    `√(n/m)` on top). The arm is therefore a REPLACE of our ColRow tail — the row
+    half is NorMuon's EMA instead of instantaneous — not a direction-only change
+    against that control, and the tall-factor gap is reported, not papered over.
+
+    **The rejected alternative, named here so nobody re-derives it:** the SF
+    paper's Alg-1 form (`normuon_normalize_` + `nor_eta_hat`,
+    `eta_hat = 0.2·η·√(mn)/‖P̂‖_F`) FIXES the step's Frobenius norm at
+    `0.2·η·√(mn)` whatever the matrix is, so it moves the magnitude as well as
+    the direction, and it also disagrees with itself on the factor (`√(mn)` in
+    Alg 1 line 13 and the code, `√max(m,n)` in the prose and Lemma 3.1 — 41%
+    apart at `[2, 3]`). The repo form is what produced the published +11.31% at
+    1.1B, so the repo form is the arm.
+    """
+    m, n = shape
+    vnorm = o.norm(dim=(-1, -2), keepdim=True)
+    normuon_second_moment_(o, v, beta2)
+    o.mul_(1.0 / (v.sqrt() + eps).unsqueeze(-1))
+    vnorm_new = o.norm(dim=(-1, -2), keepdim=True)
+    o.mul_(vnorm / (vnorm_new + eps))
+    o.mul_(max(1.0, m / n) ** 0.5)
+    return o
+
+
+def nor_eta_hat(lr: float, shape: tuple[int, int], p_hat: torch.Tensor) -> torch.Tensor:
+    """`η̂ = 0.2·η·√(mn)/‖P̂‖_F` — the **`sf` arm's** RMS-matching step scale.
+
+    Source: arXiv:2605.23061v1 **Appendix F** line 77, verbatim —
+    `eta_hat = eta_scale * lr * math.sqrt(m * n) / max(1e-12, Phat.float().norm())`
+    — and Algorithm 1 line 13 (`η̂_t ← 0.2 η_t √(mn)/‖P̂_t‖_F`). The `sf` arm's
+    step magnitude is set HERE on both variants (`_sf_direction`), which is what
+    makes `sf` and `normuon` composable; the non-SF `normuon` arm does not use
+    this function at all (`normuon_repo_update_`'s rescale is its magnitude).
+
+    **The paper disagrees with itself and the CODE wins here:** §2.2's "learning
+    rate scaling" paragraph and Lemma 3.1 both write `√max(m,n)`, while
+    Algorithm 1 line 13 and Appendix F's code write `√(mn)` (41% apart at a
+    `[2, 3]` factor). `√(mn)` is what this port runs, so a run is the algorithm
+    the authors implemented, and the disagreement is recorded in this docstring
+    instead of being silently picked.
+
+    Per SLICE for the batched step: each `[m, n]` slice is its own matrix, so
+    the norm is taken over the last two dims with `keepdim` — the reference's
+    `norm()` over a whole stacked buffer would tie every slice's step to the
+    batch's largest. `1e-12` floor as in the reference.
+    """
+    m, n = shape
+    norm = p_hat.norm() if p_hat.ndim == 2 else p_hat.norm(dim=(-1, -2), keepdim=True)
+    return NOR_ETA_SCALE * lr * math.sqrt(m * n) / norm.clamp_min(1e-12)
+
+
 class _MomGroup:
     """One shape group's canonical STACKED momentum buffer.
 
@@ -365,15 +585,36 @@ class _MomGroup:
     still emits one `momentum` tensor per parameter, and `load_state_dict`
     rebuilds the stack from them once. `mom.dtype` is the group's
     `state_dtype` rung (`fp32` by default).
+
+    The two opt-in arms add stacked buffers the same way, each present only when
+    its arm is on (`None` otherwise), so a `muon` run's memory and dispatches do
+    not move:
+
+    * `v` — NorMuon's row second moment, `[N, m]` fp32 (`variant="normuon"`);
+    * `x`, `z` — the schedule-free iterates, `[N, d0, d1]` in the state dtype
+      (`sf=True`). `x` is the returned/eval iterate and `z` the fast one; the
+      PARAMS are `Y = (1-β1)Z + β1 X` (`sf_switch`).
     """
 
-    __slots__ = ("gi", "shape", "params", "mom")
+    __slots__ = ("gi", "shape", "params", "mom", "v", "x", "z")
 
-    def __init__(self, gi: int, shape: tuple[int, int], params: list, mom: torch.Tensor) -> None:
+    def __init__(
+        self,
+        gi: int,
+        shape: tuple[int, int],
+        params: list,
+        mom: torch.Tensor,
+        v: torch.Tensor | None = None,
+        x: torch.Tensor | None = None,
+        z: torch.Tensor | None = None,
+    ) -> None:
         self.gi = gi
         self.shape = shape
         self.params = params
         self.mom = mom
+        self.v = v
+        self.x = x
+        self.z = z
 
 
 def _momentum_update_(mom: torch.Tensor, params: list, mu: float) -> None:
@@ -410,6 +651,12 @@ class Muon(Optimizer):
     Both precision knobs (`OPT_DTYPES`) default to `fp32`, which is the
     behaviour every number on record ran; `state_dtype="bf16"` halves the
     momentum state, `ns_dtype="bf16"` runs the polynomial in bf16.
+
+    `variant` (`MUON_VARIANTS`) picks the direction arm and `sf` wraps it in the
+    schedule-free averaging — both `off`/`muon` by default. `wd` is the Muon
+    group's OWN weight decay (the papers' `-η·λ·W`), which this port carries at
+    `0.0` on every run: the trainer's `wd` reaches the AdamW half only, so the
+    default path is byte-identical to its history (the SF research doc's S2 gap).
     """
 
     def __init__(
@@ -424,11 +671,17 @@ class Muon(Optimizer):
         colrow_3d: str = "colrow",
         state_dtype: str = "fp32",
         ns_dtype: str = "fp32",
+        variant: str = "muon",
+        beta2: float = NOR_BETA2,
+        wd: float = 0.0,
+        sf: bool = False,
+        sf_beta: float = SF_BETA1,
     ) -> None:
         _check_ns_kind(ns_kind)
         _check_colrow_3d(colrow_3d)
         _check_dtype("state_dtype", state_dtype)
         _check_dtype("ns_dtype", ns_dtype)
+        _check_muon_variant(variant)
         #: The arm and its restart positions live on the OPTIMIZER, not in the
         #: param group: the group is what `Optimizer.load_state_dict` REPLACES
         #: with the checkpoint's copy, so a key added today would KeyError on
@@ -436,12 +689,18 @@ class Muon(Optimizer):
         #: a resume by the config snapshot (`train.ns_kind` is not a progress
         #: key, so `RunConfig::diff_keys` refuses a flip) — one place, not two.
         #: `colrow_3d` follows the same rule (`train.muon_colrow_3d`), and so do
-        #: the two dtype rungs (`train.muon_state_dtype` / `train.ns_dtype`).
+        #: the two dtype rungs (`train.muon_state_dtype` / `train.ns_dtype`),
+        #: `variant` (`train.muon_variant`) and `sf`/`sf_beta` (`train.muon_sf`).
         self.ns_kind = ns_kind
         self.gram_restarts = gram_restarts
         self.colrow_3d = colrow_3d
         self.state_dtype = state_dtype
         self.ns_dtype = ns_dtype
+        self.variant = variant
+        self.beta2 = beta2
+        self.wd = wd
+        self.sf = sf
+        self.sf_beta = sf_beta
         super().__init__(params, dict(lr=lr, momentum=momentum, ns_steps=ns_steps))
         #: One stacked momentum buffer per (param group, shape) — the canonical
         #: state, built lazily by `_build_groups` and rebuilt after a load.
@@ -455,6 +714,13 @@ class Muon(Optimizer):
         and (b) after `load_state_dict` — where the loader has replaced the
         views with the checkpoint's own per-param tensors, which is exactly the
         historical format and stays readable.
+
+        The two arms' buffers (`v`, `x`, `z`) are stacked and viewed the same
+        way, and are `None` when their arm is off — so the default path's state
+        and memory are exactly what they were. `x`/`z` default to the PARAM's
+        value when the checkpoint carries none, which is Algorithm 1's own
+        initialization (`X_1 = Z_1`, and the params hold `Y_1 = X_1` at build
+        time: `sf_switch` cannot have run, there is no state yet).
         """
         self._groups = []
         for gi, group in enumerate(self.param_groups):
@@ -463,18 +729,35 @@ class Muon(Optimizer):
                 if p.ndim == 2:
                     by_shape.setdefault((p.shape[0], p.shape[1]), []).append(p)
             for shape, params in by_shape.items():
-                mom = torch.zeros(
-                    len(params),
-                    *shape,
-                    dtype=_torch_dtype(self.state_dtype),
-                    device=params[0].device,
+                n = len(params)
+                dtype = _torch_dtype(self.state_dtype)
+                mom = torch.zeros(n, *shape, dtype=dtype, device=params[0].device)
+                v = (
+                    torch.zeros(n, shape[0], dtype=torch.float32, device=params[0].device)
+                    if self.variant == "normuon"
+                    else None
                 )
+                x = z = None
+                if self.sf:
+                    x = torch.zeros(n, *shape, dtype=dtype, device=params[0].device)
+                    z = torch.zeros(n, *shape, dtype=dtype, device=params[0].device)
                 for i, p in enumerate(params):
                     prev = self.state[p].get("momentum")
                     if prev is not None:
                         mom[i].copy_(prev)
                     self.state[p]["momentum"] = mom[i]
-                self._groups.append(_MomGroup(gi, shape, params, mom))
+                    if v is not None:
+                        pv = self.state[p].get("v")
+                        if pv is not None:
+                            v[i].copy_(pv)
+                        self.state[p]["v"] = v[i]
+                    for key, buf in (("x", x), ("z", z)):
+                        if buf is None:
+                            continue
+                        pv = self.state[p].get(key)
+                        buf[i].copy_(pv if pv is not None else p.detach())
+                        self.state[p][key] = buf[i]
+                self._groups.append(_MomGroup(gi, shape, params, mom, v, x, z))
 
     def load_state_dict(self, state_dict) -> None:  # noqa: D102 - torch's contract
         super().load_state_dict(state_dict)
@@ -526,6 +809,10 @@ class Muon(Optimizer):
         buffer, so both paths share one state. On the `bf16` rung the view is
         bf16 and the update goes through an fp32 temporary (`_momentum_update_`'s
         arithmetic, one parameter at a time).
+
+        The two arms branch here too, with the SAME helpers the batched path
+        calls (`_nor_apply` / `_sf_one`), so the per-param and batched arms
+        cannot drift — the file's own rule for the dtype rungs.
         """
         state = self.state[p]
         if "momentum" not in state:
@@ -535,9 +822,124 @@ class Muon(Optimizer):
             buf.copy_(buf.float().mul_(mu).add_(p.grad, alpha=1.0 - mu))
         else:
             buf.mul_(mu).add_(p.grad, alpha=1.0 - mu)
-        update = colrow_normalize(self._orthogonalize(buf, ns))
+        update = self._orthogonalize(buf, ns)
+        if self.sf:
+            self._sf_one(p, update, lr)
+            return
+        if self.variant == "normuon":
+            self._nor_apply(p, update, lr)
+            return
+        update = colrow_normalize(update)
         with torch.no_grad():
             p.add_(update.to(p.dtype), alpha=-lr * scale)
+
+    def _nor_apply(self, p: torch.Tensor, o: torch.Tensor, lr: float) -> None:
+        """The `normuon` tail for ONE parameter: `W -= η·λ·W + η·update`.
+
+        `update` is the repo's tail (`normuon_repo_update_`) applied to the BARE
+        polar, and the apply is the repo's own (`normuon.py:92-93`: decay first,
+        then `p.add_(update, alpha=-lr)`) — no extra scale here, because
+        `max(1, m/n)^0.5` is already inside `update`. `λ` is this optimizer's own
+        `wd` (`0.0` on every run: the trainer's `wd` reaches the AdamW half
+        only), so the decay term is skipped entirely there.
+        """
+        state = self.state[p]
+        v = state.setdefault("v", torch.zeros(p.shape[0], dtype=torch.float32, device=p.device))
+        update = normuon_repo_update_(o, v, p.shape, self.beta2)
+        with torch.no_grad():
+            if self.wd:
+                p.mul_(1.0 - lr * self.wd)
+            p.add_(update.to(p.dtype), alpha=-lr)
+
+    def _sf_one(self, p: torch.Tensor, o: torch.Tensor, lr: float) -> None:
+        """The schedule-free tail for ONE parameter (the batched twin is
+        `_sf_batched`; both use `_sf_direction` and `_sf_ckp`)."""
+        state = self.state[p]
+        if "z" not in state:
+            dtype = _torch_dtype(self.state_dtype)
+            state["z"] = p.detach().to(dtype).clone()
+            state["x"] = p.detach().to(dtype).clone()
+        z, x = state["z"], state["x"]
+        v = state.get("v")
+        if self.variant == "normuon" and v is None:
+            v = state["v"] = torch.zeros(p.shape[0], dtype=torch.float32, device=p.device)
+        p_hat, eta = self._sf_direction(o, lr, p.shape, v)
+        s_new, c = self._sf_ckp(lr, float(state.get("sf_s", 0.0)))
+        state["sf_s"] = s_new
+        with torch.no_grad():
+            if self.wd:
+                z.mul_(1.0 - lr * self.wd)
+            z.add_(p_hat, alpha=-eta)
+            x.mul_(1.0 - c).add_(z, alpha=c)
+            p.copy_(z).lerp_(x.to(p.dtype), self.sf_beta)
+
+    def _sf_direction(
+        self, o: torch.Tensor, lr: float, shape: tuple[int, int], v: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """`(P̂, η̂)` for one slice: the arm's normalization, then `nor_eta_hat`.
+
+        Algorithm 1 line 13 applies the `0.2·η·√(mn)/‖P̂‖_F` scale whichever
+        normalization produced `P̂`, so the SF arm's step magnitude does not
+        depend on `variant` — that is what makes `sf` and `normuon` composable
+        instead of two different step sizes wearing one name. `v` is the
+        NorMuon row statistic (the group's slice, or the parameter's own) and is
+        `None` on the `muon` variant.
+        """
+        if self.variant == "normuon":
+            assert v is not None, "variant=normuon needs its row second moment"
+            p_hat = normuon_normalize_(o, v, self.beta2)
+        else:
+            p_hat = colrow_normalize(o, colrow_3d=self.colrow_3d)
+        return p_hat, nor_eta_hat(lr, shape, p_hat)
+
+    @staticmethod
+    def _sf_ckp(lr: float, s_prev: float) -> tuple[float, float]:
+        """`s_t = s_{t-1} + η_t²`, `c_{t+1} = η_t²/s_t` (Alg 1 lines 14-15).
+
+        A HOST float on purpose: `lr` is a host float the trainer sets, so the
+        whole recursion is host arithmetic — no device read, no sync (the port's
+        rule 1.3). Stored per parameter as `sf_s`, so torch's own `state_dict`
+        carries it (a float, not a tensor: nothing to sync and nothing to cast).
+        """
+        s = s_prev + lr * lr
+        return s, lr * lr / s
+
+    @torch.no_grad()
+    def sf_switch(self, mode: str) -> None:
+        """Move the params between the `Y` (train) and `X` (eval) iterates.
+
+        `Y_t = (1-β1)·Z_t + β1·X_t` is where the gradient is evaluated
+        (arXiv:2605.23061v1 Alg 1 line 3; Appendix F's `train()`), `X_t` is the
+        returned/eval iterate (line 18; `eval()`). BOTH writes are ABSOLUTE
+        functions of the optimizer's own `x`/`z` state, so they are idempotent —
+        the reference needs a `train_mode` flag to make its lerps safe
+        (Appendix F:34/43), this port does not.
+
+        A parameter with no `z` yet has never stepped, so it IS `X = Z`
+        (Alg 1's `X_1 = Z_1`) and both switches are no-ops for it — which is why
+        the trainer's post-construction `sf_switch("train")` is harmless.
+        """
+        if not self.sf:
+            loud(
+                f"sf_switch({mode!r}) on an optimizer with sf=false: the "
+                f"schedule-free iterate state does not exist, so there is nothing "
+                f"to switch. Escape: construct with sf=true (train.muon_sf=true)."
+            )
+        if mode not in ("train", "eval"):
+            loud(
+                f"sf_switch({mode!r}): known modes are 'train' (params <- Y = "
+                f"(1-β1)Z + β1 X, where the gradient is evaluated) and 'eval' "
+                f"(params <- X, the returned iterate). Escape: name one of those."
+            )
+        for group in self.param_groups:
+            for p in group["params"]:
+                st = self.state[p]
+                if "z" not in st:
+                    continue
+                if mode == "eval":
+                    p.copy_(st["x"])
+                else:
+                    p.copy_(st["z"]).lerp_(st["x"].to(p.dtype), self.sf_beta)
 
     def batched_step_from_model(self, model) -> int:
         """The shape-batched Muon pass (a no-op when the batches are trivially small).
@@ -585,6 +987,13 @@ class Muon(Optimizer):
             # (`_momentum_update_` carries the two dtype rungs' arithmetic).
             _momentum_update_(mom, params, mu)
             n = len(params)
+            if self.sf:
+                # `s`/`c` are ONE scalar per group (Alg 1 lines 14-15): read the
+                # group's accumulator once and write it back once, rather than
+                # per chunk, so a chunk boundary cannot move the average.
+                s_new, c = self._sf_ckp(lr, float(self.state[params[0]].get("sf_s", 0.0)))
+                for p in params:
+                    self.state[p]["sf_s"] = s_new
             # Chunk the shape stack: the cap is fp32 ELEMENTS per stacked
             # buffer (`MUON_CHUNK_ELEMS`), so NS never materializes the whole
             # shape group's chain at once.
@@ -592,6 +1001,12 @@ class Muon(Optimizer):
             for start in range(0, n, n_chunk):
                 params_c = params[start : start + n_chunk]
                 update = self._orthogonalize(mom[start : start + n_chunk], ns)
+                if self.sf:
+                    self._sf_batched(grp, start, len(params_c), params_c, update, lr, c)
+                    continue
+                if self.variant == "normuon":
+                    self._nor_batched(grp, start, len(params_c), params_c, update, lr)
+                    continue
                 # In place: `update` is a fresh tensor the optimizer owns (NS
                 # always allocates on its first `x / (norm + eps)`), and the
                 # write-back is FOREACH — per-param copies are what kept 5221
@@ -603,6 +1018,58 @@ class Muon(Optimizer):
                     torch._foreach_add_([p.detach() for p in params_c], torch.unbind(update))
             n_batches += 1
         return n_batches
+
+    def _nor_batched(
+        self, grp: _MomGroup, start: int, k: int, params_c: list, o: torch.Tensor, lr: float
+    ) -> None:
+        """The `normuon` tail for one CHUNK: `W -= η·λ·W + η·update`.
+
+        The batched twin of `_nor_apply` — same helpers, so the two paths cannot
+        drift. `λ` is this optimizer's own `wd` (0.0 on every run).
+        """
+        update = normuon_repo_update_(
+            o,
+            grp.v[start : start + k],
+            grp.shape,
+            self.beta2,
+        )
+        with torch.no_grad():
+            if self.wd:
+                torch._foreach_mul_([p.detach() for p in params_c], 1.0 - lr * self.wd)
+            torch._foreach_add_([p.detach() for p in params_c], torch.unbind(update), alpha=-lr)
+
+    def _sf_batched(
+        self,
+        grp: _MomGroup,
+        start: int,
+        k: int,
+        params_c: list,
+        o: torch.Tensor,
+        lr: float,
+        c: float,
+    ) -> None:
+        """The schedule-free tail for one CHUNK (the batched twin of `_sf_one`).
+
+        Alg 1 lines 17-18 and the `Y` write of Appendix F:81-82, with the two
+        deliberate deviations the module docstring names: our ColRow stays
+        composed (`_sf_direction` applies it on the `muon` variant and NorMuon's
+        row statistic on the `normuon` one), and the LR the trainer hands this
+        group is constant after warmup.
+        """
+        z = grp.z[start : start + k]
+        x = grp.x[start : start + k]
+        v = None if grp.v is None else grp.v[start : start + k]
+        p_hat, eta = self._sf_direction(o, lr, grp.shape, v)
+        p_hat.mul_(-eta)
+        with torch.no_grad():
+            if self.wd:
+                z.mul_(1.0 - lr * self.wd)
+            z.add_(p_hat)  # Z_{t+1} = Z_t - ηλZ_t - η̂P̂
+            x.mul_(1.0 - c).add_(z, alpha=c)  # X_{t+1} = (1-c)X_t + c Z_{t+1}
+            heads = [p.detach() for p in params_c]
+            torch._foreach_copy_(heads, torch.unbind(z))
+            torch._foreach_mul_(heads, 1.0 - self.sf_beta)  # params <- Y
+            torch._foreach_add_(heads, torch.unbind(x), alpha=self.sf_beta)
 
 
 def is_muon_param(name: str, p: torch.Tensor) -> bool:
@@ -645,6 +1112,8 @@ class MixOptimizer:
         ns_dtype: str = "fp32",
         betas: tuple[float, float] = (0.9, 0.95),
         eps: float = 1e-8,
+        muon_variant: str = "muon",
+        muon_sf: bool = False,
     ) -> None:
         if opt not in ("mix", "adamw"):
             loud(f"opt={opt!r}: known optimizers are 'mix' (default) and 'adamw'")
@@ -652,6 +1121,7 @@ class MixOptimizer:
         _check_colrow_3d(colrow_3d)
         _check_dtype("muon_state_dtype", muon_state_dtype)
         _check_dtype("ns_dtype", ns_dtype)
+        _check_muon_variant(muon_variant)
         muon_params: list[nn.Parameter] = []
         adamw_params: list[nn.Parameter] = []
         self.routing: dict[str, str] = {}
@@ -661,6 +1131,15 @@ class MixOptimizer:
             group = "muon" if (opt == "mix" and is_muon_param(name, p)) else "adamw"
             self.routing[name] = group
             (muon_params if group == "muon" else adamw_params).append(p)
+        if muon_sf and not muon_params:
+            loud(
+                f"muon_sf=true with no Muon parameter: `opt={opt!r}` routes every "
+                f"2-D parameter to AdamW (or the model has none), so the "
+                f"schedule-free wrapper has no group to wrap and the flag would be "
+                f"inert while the run reported it on. Escape: opt='mix', or "
+                f"muon_sf=false. (Full schedule-free AdamW is the named follow-up, "
+                f"not this arm.)"
+            )
         self.muon = (
             Muon(
                 muon_params,
@@ -672,6 +1151,15 @@ class MixOptimizer:
                 colrow_3d=colrow_3d,
                 state_dtype=muon_state_dtype,
                 ns_dtype=ns_dtype,
+                variant=muon_variant,
+                # The Muon group's OWN weight decay (the papers' `-ηλW`): the
+                # `muon` control carries none (today's behaviour, byte-identical),
+                # the SF arm carries the trainer's `wd` because arXiv:2605.23061's
+                # Lemma 3.1 makes decay at Z necessary for long-horizon stability
+                # (the `normuon` arm runs λ=0, the Microsoft repo's own default,
+                # so it stays a one-factor arm against the control).
+                wd=wd if muon_sf else 0.0,
+                sf=muon_sf,
             )
             if muon_params
             else None
@@ -720,6 +1208,21 @@ class MixOptimizer:
         if self.muon is not None:
             self.muon.zero_grad(set_to_none=set_to_none)
         self.adamw.zero_grad(set_to_none=set_to_none)
+
+    def sf_switch(self, mode: str) -> None:
+        """`Muon.sf_switch` for the Muon group; LOUD when the arm is not on.
+
+        The trainer's seam (`train/loop.py`): the params hold `Y` while a step
+        runs and `X` at every eval / checkpoint site. Delegated rather than
+        duplicated so the two iterates have one definition.
+        """
+        if self.muon is None or not self.muon.sf:
+            loud(
+                f"sf_switch({mode!r}) on an optimizer whose muon_sf is off: there is "
+                f"no schedule-free iterate state to switch between. Escape: "
+                f"muon_sf=true (train.muon_sf=true), or drop the call."
+            )
+        self.muon.sf_switch(mode)
 
     def step(self) -> None:
         """The mixed step: the batched Muon per shape ( Platzhalter-kill), AdamW per group."""

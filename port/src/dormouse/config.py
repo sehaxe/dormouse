@@ -127,6 +127,21 @@ MUON_COLROW_3D = ("frobenius", "colrow")
 #: `docs/research/2026-10-16-muon-orthogonalization-cost.md`). Both are opt-in
 #: and approximate by design; a name that is not here is LOUD.
 OPT_DTYPES = ("fp32", "bf16")
+#: The `muon_variant` literals — the DIRECTION arms (`optim.MUON_VARIANTS`, which
+#: is where they execute; the list is duplicated here the way `NS_KINDS` is, so
+#: the config layer does not import the trainer). `muon` is the update every
+#: number on record ran; `normuon` keeps the momentum and the NS polar and
+#: REPLACES the ColRow tail with NorMuon's row-wise EMA second moment applied the
+#: AUTHORS' repo way (`zichongli5/NorMuon` `normuon.py:48-56`: row-scale by
+#: `1/√(v+ε)`, restore the pre-normalization Frobenius norm, then
+#: `× max(1, m/n)^0.5`) — the repo Muon's magnitude with NorMuon's direction.
+#: Composing ColRow instead of replacing it makes the arm INERT (NorMuon's row
+#: scaling IS ColRow's row half; measured in `optim.normuon_repo_update_`), so
+#: this arm is a REPLACE, and against our ColRow control its magnitude is not
+#: preserved either. The SF paper's `eta_hat = 0.2·η·√(mn)/‖P̂‖_F` form is the
+#: rejected alternative (it fixes the step norm regardless of the matrix); it is
+#: what the `sf` arm uses. A name that is not here is LOUD.
+MUON_VARIANTS = ("muon", "normuon")
 
 
 def _unsupported(default: Any, mechanism: str) -> Any:
@@ -502,6 +517,68 @@ class TrainConfig:
     #: predicted −100…−200 ms/step at b1, NOT measured on this card yet). The
     #: orthogonality bound it must keep is gated in `tests/test_muon_fast.py`.
     ns_dtype: str = "fp32"
+
+    #: The Muon group's DIRECTION arm (`MUON_VARIANTS`, `optim.Muon(variant=...)`).
+    #: `muon` (the default) is the update every number on record ran: momentum →
+    #: optional ColRow → NS polar, step `-lr·max(1, m/n)^0.5`. `normuon` keeps the
+    #: momentum and the NS polar and **replaces the ColRow tail** with the
+    #: AUTHORS' repo form (`zichongli5/NorMuon` `normuon.py:48-56`, transcribed in
+    #: `optim.normuon_repo_update_`): the row second moment
+    #: `v_t = β2·v_{t-1} + (1−β2)·mean_cols(O_t ⊙ O_t)` of the post-polar update, a
+    #: row scale by `1/√(v_t + 1e-10)`, a rescale by `‖O‖_F/‖Ô‖_F` that restores
+    #: the pre-normalization Frobenius norm, then the repo's own
+    #: `max(1, m/n)^0.5`.
+    #:
+    #: **Two measured facts a reader must know before reading an A/B on it**
+    #: (`tests/test_muon_variants.py` pins both): (1) COMPOSING ColRow instead of
+    #: replacing it makes the arm inert — NorMuon's row scaling IS ColRow's row
+    #: half, so the statistic is constant across rows and the arm reproduces the
+    #: control to `cos = 1.000000`; (2) the repo form's magnitude-preserving
+    #: invariant holds against the REPO's Muon (no ColRow) and NOT against our
+    #: ColRow control, whose `‖ColRow(O)‖_F = √m` exceeds the polar's
+    #: `≈0.7·√min(m,n)` — measured `‖ΔW_arm‖/‖ΔW_control‖` = 0.7066 at
+    #: `[64, 5461]`, 0.8701 at `[64, 64]`, 0.1293 at `[2048, 64]`. So this arm is
+    #: a REPLACE (NorMuon's row half instead of ColRow's), not a direction-only
+    #: knob, and the tall-factor magnitude gap is reported with it.
+    #: Memory: `+m` fp32 scalars per matrix (negligible against `m·n`).
+    #: `scripts/ab_muon_variants.py` is the driver. A name that is not in
+    #: `MUON_VARIANTS` is LOUD at load and at the constructor.
+    muon_variant: str = "muon"
+
+    #: The SCHEDULE-FREE wrapper (`optim.Muon(sf=...)`), `false` by default.
+    #: SF-NorMuon (arXiv:2605.23061, JPMorgan) around the `muon_variant`
+    #: direction: the params hold `Y_t = (1−β1)Z_t + β1 X_t` during the
+    #: forward/backward, `X_t` is the returned/eval iterate, `Z_t` the fast one,
+    #: `s_t = Σ η²` drives the averaging coefficient `c = η_t²/s_t` (β1 = 0.9,
+    #: `optim.SF_BETA1`). The
+    #: trainer's seams: `sf_switch("train")` after the optimizer is built and
+    #: after every eval/checkpoint, `sf_switch("eval")` before them
+    #: (`train/loop.py`), and a NaN-skipped step advances none of it.
+    #:
+    #: **Two deliberate deviations from the paper, both named in `optim.py`:**
+    #: (1) the Muon group's LR is CONSTANT after warmup (no WSD decay) while the
+    #: AdamW half keeps the WSD schedule — a HYBRID SF-Muon + WSD-AdamW, not the
+    #: paper's full-model SF (full SF-AdamW is the named follow-up); (2) our
+    #: ColRow normalization stays composed (the paper's `P̂` is NorMuon's row
+    #: statistic alone). **Two numeric deviations from Appendix F, both checked
+    #: and named rather than silently adopted:** the reference's own momentum
+    #: default is `momentum=0.8` while this port reuses the Muon group's existing
+    #: `momentum` knob (`0.95`) so there is ONE momentum, and the reference warms
+    #: up INSIDE the optimizer (`warmup_steps=2000` steps, `lr*(k+1)/warmup`)
+    #: while this port keeps the trainer's token-based WSD warmup. Refused loudly
+    #: with `opt="adamw"` (no Muon group to wrap). **`engram_ram` is OUTSIDE the
+    #: wrapper** and stays on the WSD schedule: on that path the n-gram tables
+    #: are not parameters at all (`Engram.to_host` deletes them before the
+    #: (`Engram.to_host` deletes them before the optimizer exists) and they are
+    #: updated by their own Nesterov/Sinkhorn step, so a b1-style run with
+    #: `muon_sf` is SF on the Muon group + WSD on AdamW + WSD on the host
+    #: tables — a partial SF, said here rather than discovered from a curve.
+    #: A 2k-step A/B is predicted to TIE — the published gains are stated
+    #: at ≥1000 tokens/param, far past a 2 000-step arm, and a tie is the
+    #: designed outcome (`docs/research/2026-10-16-sf-muon.md` §4), so the
+    #: verdict must read the `X`↔`Y` gap and the LR-schedule-free claim, not the
+    #: endpoint alone. `scripts/ab_muon_variants.py` is the driver.
+    muon_sf: bool = False
     seed: int = 1
     #: WSD warmup, in TOKENS (not steps): the schedule is a function of how
     #: much data the run has seen, so a batch-size change does not change it.
@@ -1132,6 +1209,26 @@ def load_run(
                 f"of those, or land the rung in `optim.OPT_DTYPES` and its gate "
                 f"BEFORE the config can lie about it."
             )
+    if tcfg.muon_variant not in MUON_VARIANTS:
+        loud(
+            f"muon_variant={tcfg.muon_variant!r} is not an arm. Known: "
+            f"{list(MUON_VARIANTS)} — `muon` is the update every number on record "
+            f"ran (momentum -> optional ColRow -> NS polar, step "
+            f"`-lr*max(1, m/n)^0.5`), `normuon` keeps that pipeline and replaces the "
+            f"tail with NorMuon's row-wise EMA second moment plus the "
+            f"`eta_hat = 0.2*eta*sqrt(m*n)/|Phat|_F` step scale (arXiv:2510.05491 "
+            f"Alg 1 lines 5-11, transcribed by arXiv:2605.23061v1 App F). Escape: "
+            f"name one of those, or land the arm in `optim.MUON_VARIANTS` and its "
+            f"gate BEFORE the config can lie about it."
+        )
+    if tcfg.muon_sf and tcfg.opt != "mix":
+        loud(
+            f"muon_sf=true with opt={tcfg.opt!r}: the schedule-free wrapper rides the "
+            f"Muon group, and `opt={tcfg.opt!r}` routes every parameter to AdamW — "
+            f"there is no Muon group to wrap, so the flag would be inert while the run "
+            f"reported it on. Escape: opt='mix', or muon_sf=false. (Full schedule-free "
+            f"AdamW is the named follow-up, not this arm.)"
+        )
     if model_overrides:
         _refuse_unsupported(ModelConfig, model_overrides, "model")
         import dataclasses as _dc

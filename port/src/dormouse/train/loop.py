@@ -490,9 +490,35 @@ def train(
         # pre-rung behaviour, so a resume of an older snapshot is unaffected.
         muon_state_dtype=cfg.muon_state_dtype,
         ns_dtype=cfg.ns_dtype,
+        # The two opt-in direction / schedule arms (2026-10-17). Both default
+        # off (`muon` / false), so a resume of an older snapshot and every
+        # number on record are unaffected; the snapshot pins them, so a flip on
+        # a resume is refused by `diff_keys`.
+        muon_variant=cfg.muon_variant,
+        muon_sf=cfg.muon_sf,
     )
     if cfg.optim_8bit:
         opt.enable_bnb8bit()
+
+    def sf(mode: str) -> None:
+        """The schedule-free switch, a no-op when the arm is off.
+
+        `sf_switch` is LOUD on an optimizer whose arm is off (a silent no-op is
+        the ADR-0019 failure class), so the trainer asks the CONFIG, not the
+        optimizer, and one helper keeps every call site identical.
+        """
+        if cfg.muon_sf:
+            opt.sf_switch(mode)
+
+    sf("train")
+    if cfg.muon_sf:
+        log(
+            "muon_sf: the params hold Y=(1-beta1)Z+beta1 X during every step, X is "
+            "what each eval and checkpoint sees, and the Muon-group LR is CONSTANT "
+            "after warmup (the AdamW half keeps WSD - the hybrid deviation "
+            "`optim.Muon.sf_switch` documents). A NaN-skipped step advances none of "
+            "Z/X/s."
+        )
     tokens_per_step = cfg.batch * cfg.seq_len
     start = 0
     if resume:
@@ -511,6 +537,12 @@ def train(
             # A resumed run must continue on UNSEEN bytes: the burn failure
             # this prevents is re-reading (and memorizing) the corpus head.
             stream.skip_bytes(start * (cfg.seq_len + 1) * cfg.batch)
+        # The checkpoint's model half is the X iterate (a checkpoint is written
+        # with the eval switch on, below), and so is the optimizer's own `x`, so
+        # the params must go back to Y before the next forward. The switch is an
+        # ABSOLUTE write from the optimizer's state, which is why this is the
+        # same call as the post-construction one and cannot double-lerp.
+        sf("train")
         log(f"resume: step={start} opt_steps={opt.steps}")
 
     warm = warmup_steps(cfg.warmup_tokens, cfg.batch, cfg.seq_len)
@@ -569,8 +601,25 @@ def train(
         for group in opt.adamw.param_groups:
             group["lr"] = lr
         if opt.muon is not None:
+            # The SF arm's whole point: the Muon group's LR is CONSTANT after
+            # warmup, so the arm is horizon-free where the AdamW half is not —
+            # `decay_steps=0` gives exactly the warmup ramp and then the peak,
+            # from the same schedule function. The hybrid (SF-Muon + WSD-AdamW)
+            # is a deliberate deviation from the paper's full-model SF, named in
+            # `optim.Muon`'s docstring with full SF-AdamW as the follow-up.
+            muon_lr = (
+                wsd_lr(
+                    step,
+                    total_steps=cfg.steps,
+                    peak_lr=cfg.lr,
+                    warmup_steps=warm,
+                    decay_steps=0,
+                )
+                if cfg.muon_sf
+                else lr
+            )
             for group in opt.muon.param_groups:
-                group["lr"] = lr
+                group["lr"] = muon_lr
 
         # The ANNEALED factor_qat arm: burn-spectral's measured soft-to-hard
         # ramp (`ste_ternary_annealed`, "converges better than hard STE from
@@ -711,21 +760,34 @@ def train(
                 )
 
         if cfg.eval and eval_stream is not None and (step + 1) % cfg.eval_every == 0:
+            # SF: the held-out number must be scored on the RETURNED iterate X,
+            # not on the gradient-evaluation point Y (Alg 1 line 18 / the
+            # reference's `eval()`); the params go back to Y for the next step.
+            sf("eval")
             line, ev, scored = _eval_line(
                 model, eval_stream, cfg, run.model.max_iter, device, fb_field(total), step + 1
             )
+            sf("train")
             log(line)
             if sink is not None:
                 _row(event="eval", step=step + 1, loss=ev, bpb=bpb(ev), scored=scored)
 
         if (step + 1) % cfg.ckpt_every == 0:
+            # A checkpoint is the model a reader would serve, so it is written
+            # at X too — and on a resume the model half plus the optimizer's own
+            # `x` are the same iterate, which is what makes the switch back to Y
+            # an absolute, double-lerp-free write.
+            sf("eval")
             weights, snapshot = save_ckpt(run, model, opt, step)
+            sf("train")
             log(f"ckpt step={step + 1} -> {weights} ({snapshot})")
 
     if cfg.eval and eval_stream is not None and cfg.steps % cfg.eval_every != 0:
+        sf("eval")
         line, _ev, _scored = _eval_line(
             model, eval_stream, cfg, run.model.max_iter, device, fb_field(total), cfg.steps
         )
+        sf("train")
         log(line)
     return {
         "steps": cfg.steps,
