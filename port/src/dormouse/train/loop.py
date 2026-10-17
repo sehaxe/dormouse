@@ -670,6 +670,16 @@ def train(
                 # of a small-form step (2920 norm calls, profile 2026-10-16).
                 clip_grads(model.parameters(), cfg.grad_clip)
             opt.step()
+            if opt.counters:
+                # The Muon arms' own counters (ADR-0019): `ns_triton` when the
+                # fused Newton–Schulz chain ran, `ns_triton_fallback` + the reason
+                # when it could not. Merged and CLEARED here, once per step that
+                # runs the optimizer, so the log line's counter field is where a
+                # reader learns which chain ran — and so a NaN-skipped step (which
+                # never reaches this branch) cannot leave a stale count behind.
+                total.merge(opt.counters)
+                window.merge(opt.counters)
+                opt.counters.clear()
             if cfg.engram_ram:
                 # The host update runs ONCE per TRAINING step, after the
                 # optimizer — never per forward (the loop calls the memory once

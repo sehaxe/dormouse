@@ -78,7 +78,7 @@ import torch
 from torch import nn
 from torch.optim import AdamW, Optimizer
 
-from ..instrument import loud
+from ..instrument import Counters, loud
 
 #: The paper's Jordan triple, `burn-muon-plus::NS_COEFFS`, verbatim.
 JORDAN_NS_COEFFS = (3.4445, -4.7750, 2.0315)
@@ -86,7 +86,13 @@ JORDAN_NS_COEFFS = (3.4445, -4.7750, 2.0315)
 #: The Newton–Schulz arms `zeropower_via_ns(kind=...)` runs. One tuple, so a
 #: name that is not an arm is refused at the door instead of silently meaning
 #: something (`config.NS_KINDS` mirrors this list for the config layer).
-NS_KINDS = ("classic", "gram")
+#: `triton` is the fused chain in `train/ns_kernels.py`: ONE kernel launch runs
+#: the whole Jordan chain (the Gram lives in registers), against ~52 dispatches
+#: for a `[2048, 64]` factor (measured, `scripts/bench_ns_triton.py`) — the one
+#: arm whose mechanism is *fewer launches* on a launch-bound step
+#: (`docs/research/2026-10-17-muon-variants.md` §2 #1). It is COUNTED and falls
+#: back to `classic` with its reason when it cannot serve a call.
+NS_KINDS = ("classic", "gram", "triton")
 
 #: The 3-D `colrow_normalize` arms (`config.MUON_COLROW_3D` mirrors this list):
 #: `frobenius` is the per-slice Frobenius normalisation the batched Muon step ran
@@ -168,13 +174,15 @@ MUON_CHUNK_ELEMS = 1 << 25
 
 
 def _check_ns_kind(kind: str) -> None:
-    """A name that is not an arm is LOUD, naming both arms and the escape."""
+    """A name that is not an arm is LOUD, naming every arm and the escape."""
     if kind not in NS_KINDS:
         loud(
             f"ns_kind={kind!r} is not an arm. Known: {list(NS_KINDS)} — `classic` "
             f"forms `X @ X.T` at every iteration (the default, byte-identical to "
             f"this port's history), `gram` is Gram Newton–Schulz (arXiv 2608.11612 "
-            f"§4): the same polynomial iterated in the `[r, r]` Gram space. Escape: "
+            f"§4): the same polynomial iterated in the `[r, r]` Gram space, "
+            f"`triton` is the same chain FUSED into one kernel launch "
+            f"(`train/ns_kernels.py`, COUNTED fallback to `classic`). Escape: "
             f"name one of those, or land the arm in `optim.NS_KINDS` first."
         )
 
@@ -233,13 +241,19 @@ def zeropower_via_ns(
     kind: str = "classic",
     gram_restarts: tuple[int, ...] = GRAM_NS_RESTARTS,
     ns_dtype: str = "fp32",
+    *,
+    counters=None,
 ) -> torch.Tensor:
     """The polar factor's polynomial approximation, matrix-only, fp32 by default.
 
     `kind` selects the arm (`NS_KINDS`): `classic` is the recurrence this port
     has always run; `gram` is Gram Newton–Schulz — the same polynomial,
     iterated on the `[r, r]` Gram and applied once at the end, so the two
-    rectangular matmuls per iteration are gone (`_gram_via_ns`).
+    rectangular matmuls per iteration are gone (`_gram_via_ns`); `triton` is the
+    SAME chain fused into ONE kernel launch (`train/ns_kernels.py`), which is the
+    only arm here whose mechanism is a dispatch count — it is COUNTED and falls
+    back to `classic` with its reason when it cannot serve the call, so `counters`
+    is what a caller passes to see which chain ran.
 
     `ns_dtype` (`OPT_DTYPES`) is the chain's own dtype: `fp32` is the default
     and every number on record; `bf16` runs the polynomial in bf16 with
@@ -259,6 +273,15 @@ def zeropower_via_ns(
     """
     _check_ns_kind(kind)
     _check_dtype("ns_dtype", ns_dtype)
+    if kind == "triton":
+        # The fused chain, with its COUNTED fallback to `classic` — the whole arm
+        # (including the reason it could not run) lives in `ns_kernels.py`, so the
+        # fallback logic is testable without a GPU. `counters` is what makes the
+        # degradation visible in the training log (ADR-0019); the trainer drains
+        # it (`Muon.counters` -> `train/loop.py`).
+        from .ns_kernels import zeropower_triton_or_classic
+
+        return zeropower_triton_or_classic(g, steps, counters=counters, ns_dtype=ns_dtype)
     if kind == "gram":
         return _gram_via_ns(g, steps=steps, restarts=gram_restarts, ns_dtype=ns_dtype)
     if g.ndim == 2:
@@ -705,6 +728,13 @@ class Muon(Optimizer):
         #: One stacked momentum buffer per (param group, shape) — the canonical
         #: state, built lazily by `_build_groups` and rebuilt after a load.
         self._groups: list[_MomGroup] = []
+        #: The arm counters (ADR-0019). Only the `triton` arm writes here —
+        #: `ns_triton` when the fused chain ran, `ns_triton_fallback` + the
+        #: reason when it could not — and `train/loop.py` merges + clears it on
+        #: every step that runs the optimizer, so the training log's counter line
+        #: is where a reader learns which chain ran. Empty for every other arm,
+        #: so the default path's log line does not move.
+        self.counters = Counters()
 
     def _build_groups(self) -> None:
         """One stacked momentum buffer per unique shape; per-param state views it.
@@ -793,8 +823,15 @@ class Muon(Optimizer):
         The `fp32` rung therefore passes the four arguments every gate, spy and
         pin in this tree was written against (`tests/test_muon_gram.py`'s
         `test_the_requested_arm_is_the_arm_that_runs` transcribes exactly that
-        signature), and the default path's call shape does not move.
+        signature), and the default path's call shape does not move. The `triton`
+        arm is the same rule one step further: its counters are forwarded (the
+        arm must be able to show which chain ran) and nothing else about the call
+        changes for `classic`/`gram`.
         """
+        if self.ns_kind == "triton":
+            return zeropower_via_ns(
+                x, steps, self.ns_kind, self.gram_restarts, self.ns_dtype, counters=self.counters
+            )
         if self.ns_dtype == "fp32":
             return zeropower_via_ns(x, steps, self.ns_kind, self.gram_restarts)
         return zeropower_via_ns(x, steps, self.ns_kind, self.gram_restarts, self.ns_dtype)
@@ -1172,6 +1209,11 @@ class MixOptimizer:
         self.bnb8bit = False
         #: Let a caller (the trainer, the smoke test) keep looking at the groups.
         self.n_muon, self.n_adamw = len(muon_params), len(adamw_params)
+        #: The Muon arms' counters, re-exported so the trainer has ONE place to
+        #: drain (`train/loop.py` merges + clears this after `opt.step()`): the
+        #: `triton` NS arm's `ns_triton` / `ns_triton_fallback` + reason reach the
+        #: log line through here (ADR-0019). Empty on every other arm.
+        self.counters = self.muon.counters if self.muon is not None else Counters()
         #: The SHAPE answer: identical-shape parameters update as ONE stack.
         #: The per-param loop cost 84% of b1's step in per-tensor dispatches.
         self.muon_params = muon_params

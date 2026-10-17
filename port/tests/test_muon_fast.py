@@ -40,6 +40,7 @@ from conftest import tiny_cfg, tiny_run
 from torch import nn
 
 from dormouse.config import load_run
+from dormouse.instrument import Counters
 from dormouse.model import DormouseModel
 from dormouse.train import optim, train
 from dormouse.train.optim import (
@@ -913,8 +914,13 @@ def test_the_bf16_ns_chain_keeps_the_polar_property(shape, kind):
     worst ratio across the four arms: 1.02. Gate: 1.1x and <= 6e-2 absolute.
     """
     g = _b1_like_fixture(shape)
-    ref = zeropower_via_ns(g, 5, kind)
-    got = zeropower_via_ns(g, 5, kind, ns_dtype="bf16")
+    # `Counters()` is what `ns_kind="triton"` needs to record its COUNTED
+    # fallback (ADR-0019); every other arm ignores it. On a CPU box the triton
+    # parameter therefore gates the FALLBACK's rung — which is the point: a
+    # fallback that dropped `ns_dtype` would fail here, and did while this arm
+    # was being written.
+    ref = zeropower_via_ns(g, 5, kind, counters=Counters())
+    got = zeropower_via_ns(g, 5, kind, counters=Counters(), ns_dtype="bf16")
     o32, o16 = _ortho_per_entry(ref), _ortho_per_entry(got)
     assert bool(torch.isfinite(got).all())
     assert o16 <= 1.1 * o32, f"ortho {o16:.3e} vs fp32 {o32:.3e} at {shape}/{kind}"
@@ -933,7 +939,7 @@ def test_the_bf16_ns_chain_keeps_the_spectrum_bounds_the_fp32_gate_states(kind):
     heavy = torch.randn(64, 8, generator=torch.Generator().manual_seed(0)) @ torch.diag(
         torch.logspace(0, -2, 8)
     )
-    o = zeropower_via_ns(heavy, 5, kind, ns_dtype="bf16")
+    o = zeropower_via_ns(heavy, 5, kind, counters=Counters(), ns_dtype="bf16")
     s_out = torch.linalg.svdvals(o)
     assert float(s_out[0] / s_out[-1]) < 2.0, "the spectrum must be compressed"
     assert 0.5 < float(s_out[-1]) and float(s_out[0]) < 1.2, "the update scale must be ~1"

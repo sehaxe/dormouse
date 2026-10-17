@@ -100,8 +100,16 @@ ACT_QUANTS = ("none", "int8", "int4", "fp4", "mxfp8", "v2_int4", "v2_int8")
 #: iterated on the `[r, r]` Gram and applied once at the end, so the two
 #: rectangular matmuls per iteration collapse to four `[r, r]` ones. Equivalent
 #: to `classic` up to fp32 round-off order (`tests/test_muon_gram.py`), which
-#: is why the arm needs no training A/B. A name that is not here is LOUD.
-NS_KINDS = ("classic", "gram")
+#: is why the arm needs no training A/B. `triton` = the SAME chain FUSED into
+#: ONE kernel launch (`optim/ns_kernels.py`): the whole Jordan chain runs inside
+#: one program per slice with the `[r, r]` Gram in registers, against ~52 aten
+#: dispatches for a `[2048, 64]` factor (measured, `scripts/bench_ns_triton.py`).
+#: Its claim is a launch count, not a number, so its verdict is the speed rule —
+#: and it is COUNTED: `ns_triton` when it ran, `ns_triton_fallback` + the reason
+#: when it could not (rank > 64, no triton, not CUDA, non-contiguous, or
+#: `ns_dtype="bf16"`, which it subsumes rather than composes with). A name that
+#: is not here is LOUD.
+NS_KINDS = ("classic", "gram", "triton")
 #: The `muon_colrow_3d` literals — the arms of `colrow_normalize`'s 3-D branch
 #: (`optim.COLROW_3D`, which is where they execute; the list is duplicated here
 #: the way `NS_KINDS` is, so the config layer does not import the trainer).
@@ -476,7 +484,10 @@ class TrainConfig:
     #: Forwarded by the trainer: `train/loop.py` builds
     #: `MixOptimizer(..., ns_kind=cfg.ns_kind)` (the same call site now also
     #: forwards `muon_colrow_3d`), so this field is what the run executes — not
-    #: only what the gates and `scripts/bench_muon_ns.py` build directly.
+    #: only what the gates and `scripts/bench_ns_triton.py` build directly.
+    #: `triton` (the fused chain, `optim/ns_kernels.py`) rides the same field: it
+    #: is COUNTED, and its `ns_triton` / `ns_triton_fallback` counters reach the
+    #: log line through `opt.counters` (`train/loop.py`).
     ns_kind: str = "classic"
 
     #: The 3-D `colrow_normalize` arm the batched Muon step runs
@@ -1181,9 +1192,10 @@ def load_run(
             f"`classic` forms `X @ X.T` at every Newton–Schulz iteration (the "
             f"default), `gram` is Gram Newton–Schulz (arXiv 2608.11612 §4 + "
             f"github.com/Dao-AILab/gram-newton-schulz): the same polynomial "
-            f"iterated in the `[r, r]` Gram space. Escape: name one of those, or "
-            f"land the arm in `optim.NS_KINDS` and its equivalence gate BEFORE the "
-            f"config can lie about it."
+            f"iterated in the `[r, r]` Gram space, `triton` is the same chain "
+            f"fused into ONE kernel launch (`ns_kernels.py`, COUNTED fallback to "
+            f"`classic`). Escape: name one of those, or land the arm in "
+            f"`optim.NS_KINDS` and its gate BEFORE the config can lie about it."
         )
     if tcfg.muon_colrow_3d not in MUON_COLROW_3D:
         loud(
