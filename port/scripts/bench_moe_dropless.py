@@ -9,7 +9,12 @@ exit on-device when a block is empty. Before that early-exit the dropless route
 had to be the per-expert Python loop — and at `b1`'s E=1024 that is ~1024 tiny
 matmuls per expert pass. Three arms, same rows, same weights, interleaved:
 
-* **dropless triton** — `_triton_dispatch(dropless=True)`, the static bound;
+* **dropless triton** — `_triton_dispatch(dropless=True)`, the static bound, in
+  its two backward flavours: `NEW` is the default fused adjoint (one combine
+  kernel, one `dx` GEMM with two accumulators, the permute's own int32 row map,
+  a grow-only workspace) and `CURRENT` is `fused_bwd=False` (the previous
+  adjoint: two `dx` GEMMs plus `add_`, `repeat_interleave`, autograd's combine
+  backward). The forward is the same code on both;
 * **naive ragged** — `_naive_dispatch`, the reference loop (the arm dropless
   used to be forced onto);
 * **padded cap** — `_padded_dispatch` with the capacity rule's own cap, as the
@@ -131,22 +136,29 @@ def main() -> int:
 
     with torch.no_grad():
         dropless = moe._triton_dispatch(x, weight, index, order, keep, dropless=True)
+        dropless_cur = moe._triton_dispatch(
+            x, weight, index, order, keep, dropless=True, fused_bwd=False
+        )
         naive = moe._naive_dispatch(x, weight, index, order, keep, Counters())
         padded = moe._padded_dispatch(x, weight, index, order, keep)
     rel_n = float((dropless.float() - naive.float()).abs().max()) / float(naive.float().abs().max())
     rel_p = float((dropless.float() - padded.float()).abs().max()) / float(
         padded.float().abs().max()
     )
+    rel_b = float((dropless.float() - dropless_cur.float()).abs().max()) / float(
+        dropless_cur.float().abs().max()
+    )
     print(
         f"[parity] dropless-triton vs naive max_rel={rel_n:.3e}; vs padded(cap {cap}) "
-        f"max_rel={rel_p:.3e}",
+        f"max_rel={rel_p:.3e}; NEW-vs-CURRENT backward fwd max_rel={rel_b:.3e}",
         flush=True,
     )
-    del dropless, naive, padded
+    del dropless, dropless_cur, naive, padded
     torch.cuda.empty_cache()
 
     xp = x.clone().requires_grad_(True)
     xt = x.clone().requires_grad_(True)
+    xtc = x.clone().requires_grad_(True)
     xn = x.clone().requires_grad_(True)
 
     def fwd_t():
@@ -167,6 +179,11 @@ def main() -> int:
             2
         ).sum().backward()
 
+    def both_tc():
+        moe.zero_grad(set_to_none=True)
+        out = moe._triton_dispatch(xtc, weight, index, order, keep, dropless=True, fused_bwd=False)
+        out.float().pow(2).sum().backward()
+
     def both_n():
         moe.zero_grad(set_to_none=True)
         out = moe._naive_dispatch(xn, weight, index, order, keep, Counters())
@@ -180,7 +197,8 @@ def main() -> int:
         "dropless triton fwd": fwd_t,
         "naive ragged fwd": fwd_n,
         "padded cap fwd": fwd_p,
-        "dropless triton fwd+bwd": both_t,
+        "dropless triton NEW fwd+bwd": both_t,
+        "dropless triton CURRENT fwd+bwd": both_tc,
         "naive ragged fwd+bwd": both_n,
         "padded cap fwd+bwd": both_p,
     }
@@ -198,10 +216,17 @@ def main() -> int:
         print(f"{name:>24} {med:>10.3f} {lo:>9.3f} {peak:>9.2f}")
     base = statistics.median(r[0] for r in acc["dropless triton fwd"])
     loop = statistics.median(r[0] for r in acc["naive ragged fwd"])
+    new_b = statistics.median(r[0] for r in acc["dropless triton NEW fwd+bwd"])
+    cur_b = statistics.median(r[0] for r in acc["dropless triton CURRENT fwd+bwd"])
     print(
         f"\nthe loop is {loop / base:.1f}x the dropless grouped GEMM's forward at this "
         f"shape; the static bound launches {(-(-rows // BM)) * E} programs of which "
         f"{sum(-(-int(c) // BM) for c in counts)} have work",
+        flush=True,
+    )
+    print(
+        f"the fused backward's fwd+bwd is {new_b:.1f} ms against the previous adjoint's "
+        f"{cur_b:.1f} ms ({cur_b / new_b:.2f}x) at the same forward",
         flush=True,
     )
     return 0

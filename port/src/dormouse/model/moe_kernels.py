@@ -46,6 +46,31 @@ one that is safe, which is what makes the routing independent of the window's
 composition (a segmented training window is then the same function as the
 one-shot one).
 
+BACKWARD (`_glu_backward_fused`, the default; `_glu_backward` stays as the
+reference beside it). Three changes, each reimplementing an idea of OLMo-core's
+`kernels/cuda/moe_unpermute_bwd_kernel.cu` in this module's own idiom:
+
+* the COMBINE backward is ONE kernel (`_combine_bwd_kernel`, `_Combine`): per
+  token it reads `grad_out` once, loops the k selected rows, writes the scaled
+  contribution and accumulates `⟨grad_out, y_row⟩` in registers — one store of
+  `[R]` where autograd ran an `index_add` backward, a `mul` backward and a
+  `[R, f]` re-read plus reduction (their `:127-226`, the register `accum[k]` and
+  the `__shfl_xor_sync` reduction; ours is a `tl.sum` over the tile, the Triton
+  equivalent of the warp butterfly);
+* `dx` is ONE grouped GEMM with two accumulators (`_grouped_gemm_pair_kernel`),
+  the forward's own two-`tl.dot` pattern (`:193-194`) applied to the adjoint —
+  not two GEMMs plus `add_`;
+* the row→expert map is `int32` and arrives from the caller (`seg`, built once in
+  `experts._triton_dispatch` from the routing the permute already produced)
+  instead of a `torch.repeat_interleave` rebuild in every backward; the combine
+  kernel's token→row map is the same idea's `-1` sentinel (their `:177-179`).
+
+The scratch is a `BwdWorkspace` the CALLER owns (`experts.SparseMoE`), not this
+module: the "no module-level mutable state" rule stands — there is no global
+instance and this file keeps no state of its own. Every call the fused backward
+cannot serve falls back to `_glu_backward` COUNTED (`moe_triton_fallback` + the
+reason on the counter object).
+
 Layout contract (all CUDA, contiguous, `E` experts, latent `r`):
 
     xg      [R, d]      gathered rows, expert-major: group e owns offs[e]:offs[e+1]
@@ -82,9 +107,23 @@ import triton.language as tl
 #:   BLOCK_N 256 — the wide adjoint N tile (`dv`, `dx`, `expert_gemm`); 512 is
 #:                  out of shared memory, 256 measured 22.0 ms against 27.1 for
 #:                  64 on the b1 backward (15.9 with 8 warps)
-TILES = {"BLOCK_M": 64, "BLOCK_K": 64, "BLOCK_F": 128, "BLOCK_N": 256}
+#:   BLOCK_T  16 — the combine backward's TOKEN tile (one program owns
+#:                  BLOCK_T tokens and their whole row of `f`); 16 keeps the
+#:                  per-token row map load amortised without spilling the
+#:                  `[BLOCK_T, TOP_K]` register accumulator
+#: `BLOCK_T` is the one tile here NOT picked by a sweep — the combine kernel was
+#: written while the card was held by the live b1 run, so 16 is the starting
+#: value `scripts/bench_moe_kernel.py` is set up to replace (same rule as the
+#: rest: re-measure and edit the constant, never add an autotune).
+TILES = {"BLOCK_M": 64, "BLOCK_K": 64, "BLOCK_F": 128, "BLOCK_N": 256, "BLOCK_T": 16}
 
-assert set(TILES) == {"BLOCK_M", "BLOCK_K", "BLOCK_F", "BLOCK_N"}
+assert set(TILES) == {"BLOCK_M", "BLOCK_K", "BLOCK_F", "BLOCK_N", "BLOCK_T"}
+
+#: The widest top-k the fused combine backward carries: the kernel unrolls the
+#: top-k loop (`tl.static_range`), so a top-k past this is code it does not have.
+#: `experts.SparseMoE._fused_bwd_reason` is what counts the fallback to the
+#: current backward when a config asks for more (our own top-k is 2).
+FUSED_TOPK_MAX = 32
 
 
 def _tiles(tiles: dict | None) -> dict:
@@ -99,6 +138,54 @@ def _tiles(tiles: dict | None) -> dict:
 def _rp(r: int) -> int:
     """The power-of-two rank tile: `tl.dot` needs >= 16 on every axis."""
     return max(16, triton.next_power_of_2(r))
+
+
+def _topk_tile(k: int) -> int:
+    """The top-k tile for the combine backward: `tl.arange` wants a power of two.
+
+    Floored at 2 (never `tl.arange(0, 1)`), and the kernel's `if k < K` static
+    branch is what skips a padded slot, so a top-k of 3 is served by a tile of 4
+    rather than refused.
+    """
+    return max(2, triton.next_power_of_2(k))
+
+
+class BwdWorkspace:
+    """Grow-only scratch for the fused backward — OWNED BY THE CALLER.
+
+    OLMo-core's `_PermuteDropWorkspace` (`kernels/moe_permute_drop.py:11-70`,
+    grow-only: `if ws.max_expanded_rows >= expanded_rows: return ws`) in this
+    module's own idiom. The rule it respects is the module docstring's: nothing
+    is cached HERE and there is no global instance — the owner is the module
+    object that calls in (`experts.SparseMoE`, one workspace per `SparseMoE`), so
+    two models, two devices or two callers never share a buffer.
+
+    A slot is reallocated only when it must GROW (a bigger `R`), or when the
+    dtype/device moves; a smaller call reuses the bigger buffer through a view,
+    so the steady-state backward allocates no `[R, ·]` scratch at all.
+
+    `ponytail:` one slot set per workspace, not per stream — a second CUDA stream
+    running a backward concurrently with this one would race on the buffers.
+    Nothing in this port runs multi-stream; key on the stream if it ever does.
+    """
+
+    __slots__ = ("_flat",)
+
+    def __init__(self) -> None:
+        self._flat: dict[str, torch.Tensor] = {}
+
+    def slot(
+        self, name: str, shape: tuple[int, ...], dtype: torch.dtype, device: torch.device
+    ) -> torch.Tensor:
+        """The `[shape]` `dtype` buffer named `name`, grown in place when needed."""
+        n = 1
+        for s in shape:
+            n *= int(s)
+        t = self._flat.get(name)
+        if t is None or t.numel() < n or t.dtype != dtype or t.device != device:
+            t = torch.empty(n, dtype=dtype, device=device)
+            self._flat[name] = t
+        return t[:n].view(shape)
 
 
 def _dropless_cap(rows: int) -> int:
@@ -343,6 +430,159 @@ def _wgrad_kernel(
     )
 
 
+@triton.jit
+def _combine_bwd_kernel(
+    dout_ptr,
+    y_ptr,
+    w_ptr,
+    rowmap_ptr,
+    dy_ptr,
+    dw_ptr,
+    N,
+    F_,
+    K: tl.constexpr,
+    TOP_K: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_F: tl.constexpr,
+):
+    """The combine's backward in ONE pass: `dy` scatter + `dw` reduction.
+
+    `out[t] = Σ_k y[row(t, k)]·w[row(t, k)]`, so its backward is
+
+        dy[row(t,k)] = grad_out[t] · w[row(t,k)]          (the expert's adjoint)
+        dw[row(t,k)] = ⟨grad_out[t], y[row(t,k)]⟩         (the router-weight grad)
+
+    and both fall out of the SAME read of `grad_out`: the k rows of a token are
+    one gather each, so reading `grad_out` once per token and looping k costs
+    `n·f` reads instead of `n·k·f`. `dw` is accumulated in registers (`acc`, one
+    column per top-k slot) and stored once at the end — the `[R, f]` re-read and
+    the f-reduction autograd ran between the `index_add` backward and the `mul`
+    backward do not exist here.
+
+    Inspiration, not a transcription: OLMo-core's
+    `kernels/cuda/moe_unpermute_bwd_kernel.cu:127-226` (one block per token, the
+    `float accum[topk_tile]` register array `:195-201`, the `__shfl_xor_sync`
+    butterfly `:206-215`, `prob_grad` written by `tid == 0` `:217-224`). Triton
+    has no warp shuffle in this position — `tl.sum(go · y_row, axis=1)` IS the
+    reduction, one store per row, no separate writer thread.
+
+    `rowmap [N, K]` int32 is the token→gathered-row map; `-1` marks a row the
+    capacity dropped (their `dest_row < 0`, `:177-179`), and such a lane stores
+    nothing and contributes nothing.
+    """
+    t = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
+    tmask = t < N
+    kk = tl.arange(0, TOP_K)
+    acc = tl.zeros((BLOCK_T, TOP_K), tl.float32)
+    for f0 in range(0, tl.cdiv(F_, BLOCK_F)):
+        ff = f0 * BLOCK_F + tl.arange(0, BLOCK_F)
+        fmask = ff < F_
+        go = tl.load(
+            dout_ptr + t[:, None] * F_ + ff[None, :],
+            mask=tmask[:, None] & fmask[None, :],
+            other=0.0,
+        )
+        for k in tl.static_range(TOP_K):
+            if k < K:  # static: a padded top-k slot costs no instruction
+                row = tl.load(rowmap_ptr + t * K + k, mask=tmask, other=-1)
+                valid = row >= 0
+                wv = tl.load(w_ptr + row, mask=valid, other=0.0)
+                ymask = valid[:, None] & fmask[None, :]
+                tl.store(
+                    dy_ptr + row[:, None] * F_ + ff[None, :],
+                    (go * wv[:, None]).to(dy_ptr.dtype.element_ty),
+                    mask=ymask,
+                )
+                yv = tl.load(y_ptr + row[:, None] * F_ + ff[None, :], mask=ymask, other=0.0)
+                contrib = tl.sum(go * yv.to(tl.float32), axis=1)
+                acc += tl.where(kk[None, :] == k, contrib[:, None], 0.0)
+    for k in tl.static_range(TOP_K):
+        if k < K:
+            row = tl.load(rowmap_ptr + t * K + k, mask=tmask, other=-1)
+            dwv = tl.sum(tl.where(kk[None, :] == k, acc, 0.0), axis=1)
+            tl.store(dw_ptr + row, dwv, mask=(row >= 0) & tmask)
+
+
+@triton.jit
+def _grouped_gemm_pair_kernel(
+    a1_ptr,
+    w1_ptr,
+    a2_ptr,
+    w2_ptr,
+    o_ptr,
+    offs_ptr,
+    N,
+    K,
+    sam,
+    sak,
+    swe,
+    swk,
+    swn,
+    som,
+    son,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    PREC: tl.constexpr,
+):
+    """`a1 @ w1[e]ᵀ + a2 @ w2[e]ᵀ` into ONE accumulator, ONE store — the fused `dx`.
+
+    `_grouped_gemm_kernel`'s adjoint with a second (a, w) pair folded in, which is
+    the pattern the FORWARD already runs: `_glu_kernel` accumulates both `tl.dot`s
+    of the dual latent in registers (`:193-194`) and combines them at the latent.
+    The backward of that pass had been two grouped GEMMs plus `add_`, i.e. the
+    same tiles computed twice and one extra `[R, d]` round trip.
+
+    Both `a`s share shape and strides, both `w`s too (contiguous `[R, K]` and
+    `[E, N, K]`), so the launcher passes one stride set for the two pairs.
+    Accumulating the second dot INTO the first's fp32 accumulator is what makes
+    this equal to `dot1 + dot2` rather than an approximation of it: the products
+    are summed in the same order, only the accumulator's starting value differs.
+    """
+    e = tl.program_id(0)
+    start = tl.load(offs_ptr + e)
+    end = tl.load(offs_ptr + e + 1)
+    # EARLY EXIT: the dropless static bound, same contract as every kernel here.
+    if start + tl.program_id(1) * BLOCK_M >= end:
+        return
+    rows = start + tl.program_id(1) * BLOCK_M + tl.arange(0, BLOCK_M)
+    m_mask = rows < end
+    nn = tl.program_id(2) * BLOCK_N + tl.arange(0, BLOCK_N)
+    n_mask = nn < N
+    kk = tl.arange(0, BLOCK_K)
+    a1p = a1_ptr + rows[:, None] * sam + kk[None, :] * sak
+    a2p = a2_ptr + rows[:, None] * sam + kk[None, :] * sak
+    w1p = w1_ptr + e * swe + kk[:, None] * swk + nn[None, :] * swn
+    w2p = w2_ptr + e * swe + kk[:, None] * swk + nn[None, :] * swn
+    acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
+        rem = K - k * BLOCK_K
+        k_mask = kk < rem
+        am = m_mask[:, None] & k_mask[None, :]
+        wm = k_mask[:, None] & n_mask[None, :]
+        acc = tl.dot(
+            tl.load(a1p, mask=am, other=0.0),
+            tl.load(w1p, mask=wm, other=0.0),
+            acc,
+            input_precision=PREC,
+        )
+        acc = tl.dot(
+            tl.load(a2p, mask=am, other=0.0),
+            tl.load(w2p, mask=wm, other=0.0),
+            acc,
+            input_precision=PREC,
+        )
+        a1p += BLOCK_K * sak
+        a2p += BLOCK_K * sak
+        w1p += BLOCK_K * swk
+        w2p += BLOCK_K * swk
+    tl.store(
+        o_ptr + rows[:, None] * som + nn[None, :] * son,
+        acc.to(o_ptr.dtype.element_ty),
+        mask=m_mask[:, None] & n_mask[None, :],
+    )
+
+
 # --------------------------------------------------------------------------
 # forward
 # --------------------------------------------------------------------------
@@ -405,6 +645,9 @@ def expert_gemm_glu(
     *,
     cap: int | None = None,
     tiles: dict | None = None,
+    fused_bwd: bool = True,
+    seg: torch.Tensor | None = None,
+    ws: BwdWorkspace | None = None,
 ) -> torch.Tensor:
     """`y [R, f]` = `(silu((xg@gate_u)·gate_s) ⊙ ((xg@up_u)·up_s)) @ v`, grouped.
 
@@ -415,12 +658,39 @@ def expert_gemm_glu(
     `cap` bounds the row-block grid: pass the capacity rule's value when the
     caller has one (the tight grid), or `None` for the DROPLESS static bound
     (`_dropless_cap`, no host read of `offs`).
+
+    `fused_bwd=True` (the default) runs `_glu_backward_fused`: pass the caller's
+    `seg` (`[R]` int32 row→expert map — the routing the permute already had) and
+    `ws` (the caller's `BwdWorkspace`) and the backward neither rebuilds the
+    segments nor allocates its `[R, ·]` scratch. `seg=None` falls back to
+    `_segments(offs)` and `ws=None` to a throwaway workspace: correct, and the
+    reason a standalone call is still one line. `fused_bwd=False` is the
+    reference adjoint, kept as the parity gate and the bench's control.
     """
     _check(xg, gate_u, up_u, gate_s, up_s, v, offs)
     if cap is None:
         cap = _dropless_cap(xg.shape[0])
     assert cap >= 1, f"cap={cap} must be >= 1"
-    return _ExpertGemmGlu.apply(xg, gate_u, up_u, gate_s, up_s, v, offs, int(cap), _tiles(tiles))
+    if seg is not None:
+        assert seg.shape == (xg.shape[0],) and seg.dtype == torch.int32, (
+            "seg must be the [R] int32 row→expert map"
+        )
+    if fused_bwd and ws is None:
+        ws = BwdWorkspace()
+    return _ExpertGemmGlu.apply(
+        xg,
+        gate_u,
+        up_u,
+        gate_s,
+        up_s,
+        v,
+        offs,
+        int(cap),
+        _tiles(tiles),
+        bool(fused_bwd),
+        seg,
+        ws,
+    )
 
 
 def expert_gemm(
@@ -490,10 +760,19 @@ def _grid(e: int, cap: int, n: int, block_m: int, block_n: int) -> tuple[int, in
     return (e, max(1, triton.cdiv(cap, block_m)), triton.cdiv(n, block_n))
 
 
-def _grouped_nt(a, w, offs, cap, n, k, tiles, out_dtype):
-    """`a [R, K] @ w[e]ᵀ` with `w` stored `[E, N, K]` — the adjoint GEMM."""
+def _grouped_nt(a, w, offs, cap, n, k, tiles, out_dtype, out=None):
+    """`a [R, K] @ w[e]ᵀ` with `w` stored `[E, N, K]` — the adjoint GEMM.
+
+    `out` is the caller-owned grow-only destination (`BwdWorkspace.slot`), the
+    `out=` idiom of `moe_unpermute_bwd_kernel.cu:16-46`; omitted, the tensor is
+    allocated here as it always was.
+    """
     e = w.shape[0]
-    out = torch.empty(a.shape[0], n, dtype=out_dtype, device=a.device)
+    if out is None:
+        out = torch.empty(a.shape[0], n, dtype=out_dtype, device=a.device)
+    else:
+        assert out.shape == (a.shape[0], n), f"out {tuple(out.shape)} != [{a.shape[0]}, {n}]"
+        assert out.dtype == out_dtype and out.is_contiguous(), "out must be the caller's buffer"
     _grouped_gemm_kernel[_grid(e, cap, n, tiles["BLOCK_M"], tiles["BLOCK_N"])](
         a,
         w,
@@ -513,6 +792,45 @@ def _grouped_nt(a, w, offs, cap, n, k, tiles, out_dtype):
         BLOCK_K=tiles["BLOCK_K"],
         TRANS_W=True,
         PREC=_prec(a.dtype),
+        num_warps=8,
+    )
+    return out
+
+
+def _grouped_nt_pair(a1, w1, a2, w2, offs, cap, n, k, tiles, out_dtype):
+    """`a1 @ w1[e]ᵀ + a2 @ w2[e]ᵀ` — `_grouped_nt` twice, in ONE kernel.
+
+    The fused `dx` (module docstring). The two pairs must agree on shape AND
+    strides — the kernel carries one stride set — which is the caller's
+    invariant here: both are the `[R, r]` post-scale adjoints and the `[E, d, r]`
+    banks the forward used.
+    """
+    e = w1.shape[0]
+    assert a1.shape == a2.shape, "the fused dx pairs must share a shape"
+    assert w1.shape == w2.shape, "the fused dx weight pairs must share a shape"
+    assert a1.stride() == a2.stride() and w1.stride() == w2.stride(), "shared strides"
+    assert a1.is_contiguous() and a2.is_contiguous() and w1.is_contiguous() and w2.is_contiguous()
+    out = torch.empty(a1.shape[0], n, dtype=out_dtype, device=a1.device)
+    _grouped_gemm_pair_kernel[_grid(e, cap, n, tiles["BLOCK_M"], tiles["BLOCK_N"])](
+        a1,
+        w1,
+        a2,
+        w2,
+        out,
+        offs,
+        n,
+        k,
+        a1.stride(0),
+        a1.stride(1),
+        w1.stride(0),
+        w1.stride(2),
+        w1.stride(1),
+        out.stride(0),
+        1,
+        BLOCK_M=tiles["BLOCK_M"],
+        BLOCK_N=tiles["BLOCK_N"],
+        BLOCK_K=tiles["BLOCK_K"],
+        PREC=_prec(a1.dtype),
         num_warps=8,
     )
     return out
@@ -552,7 +870,13 @@ def _wgrad(a, b, offs, e, cap, k, n, tiles, out_dtype):
 
 
 def _glu_backward(xg, gate_u, up_u, gate_s, up_s, v, offs, cap, gpre, upre, h, dy, tiles):
-    """The three-GEMM grouped adjoint, all of it on this module's own kernels."""
+    """The three-GEMM grouped adjoint, all of it on this module's own kernels.
+
+    The REFERENCE backward (`fused_bwd=False`): two `dx` GEMMs plus `add_`, a
+    `repeat_interleave` segment rebuild, and one allocation per temporary. Kept
+    because it is what the fused adjoint is compared against — and because it is
+    the arm an unsupported call falls back to.
+    """
     e, d, r = gate_u.shape
     f = v.shape[2]
     rp = _rp(r)
@@ -595,26 +919,203 @@ def _glu_backward(xg, gate_u, up_u, gate_s, up_s, v, offs, cap, gpre, upre, h, d
     return dx, dgate_u, dup_u, dgate_s, dup_s, dv
 
 
-class _ExpertGemmGlu(torch.autograd.Function):
-    """The fused pass with its own backward: `fwd` Triton, `bwd` Triton (adjoint GEMMs)."""
+def _glu_backward_fused(
+    xg, gate_u, up_u, gate_s, up_s, v, offs, cap, gpre, upre, h, dy, tiles, seg, ws
+):
+    """The SAME adjoint with the three OLMo-core ideas (module docstring) in it.
+
+    The arithmetic and the OP ORDER are `_glu_backward`'s, op for op — only the
+    buffers and two kernels differ. That is deliberate: the parity gate compares
+    this against the padded arm's autograd at 1e-4 (fp32), and a reordered
+    elementwise chain would show up there as a wiring error.
+
+    What is different:
+
+    * `dx` is `_grouped_nt_pair` — ONE kernel, one accumulator, one `[R, d]`
+      store, instead of two `_grouped_nt` calls plus `add_`;
+    * `seg` is the caller's `int32` row→expert map (built from the routing the
+      permute already had) instead of a `repeat_interleave` rebuild;
+    * every `[R, r]` temporary is a slot of the caller-owned grow-only `ws`.
+
+    The OUTPUTS (`dx`, `dgate_u`, `dup_u`, `dv`, `dgate_s`, `dup_s`) are fresh
+    allocations: autograd owns them, so they cannot be reused. `dy` and `dw` —
+    the combine backward's own outputs — are the one pair of GRADS that live in
+    the workspace; the engine hands `dy` straight to this function and drops it
+    after, so nothing outlives the single backward that owns the workspace.
+    """
+    e, d, r = gate_u.shape
+    f = v.shape[2]
+    R = xg.shape[0]
+    rp = _rp(r)
+    assert gpre is not None and upre is not None and h is not None, "no saved activations"
+    assert ws is not None, "the fused backward needs a workspace (BwdWorkspace)"
+    dt, dev = xg.dtype, xg.device
+    if seg is None:
+        seg = _segments(offs).to(torch.int32)
+    assert seg.shape == (R,) and seg.dtype == torch.int32, "seg must be the [R] int32 row map"
+    dyc = dy.to(dt).contiguous()
+    t_rank_n = dict(tiles, BLOCK_N=rp)
+    t_wide = dict(tiles, BLOCK_K=rp)
+
+    dh = _grouped_nt(
+        dyc,
+        v,
+        offs,
+        cap,
+        r,
+        f,
+        dict(t_rank_n, BLOCK_K=tiles["BLOCK_K"]),
+        torch.float32,
+        out=ws.slot("dh", (R, r), torch.float32, dev),
+    )
+    # The re-rounding chain, `_glu_backward`'s order verbatim (round to the
+    # compute dtype, multiply the scale, widen). Each step writes into a slot
+    # rather than a fresh tensor, so a `torch.mul(..., out=)` with an operand
+    # that is already the right dtype costs no allocation at all.
+    gs_row = torch.index_select(gate_s, 0, seg)
+    us_row = torch.index_select(up_s, 0, seg)
+    gb = ws.slot("gb", (R, r), dt, dev)
+    torch.mul(gpre.to(dt), gs_row, out=gb)
+    ub = ws.slot("ub", (R, r), dt, dev)
+    torch.mul(upre.to(dt), us_row, out=ub)
+    g = ws.slot("g", (R, r), torch.float32, dev)
+    g.copy_(gb)
+    u = ws.slot("u", (R, r), torch.float32, dev)
+    u.copy_(ub)
+    sig = ws.slot("sig", (R, r), torch.float32, dev)
+    torch.sigmoid(g, out=sig)
+    tmp = ws.slot("tmp", (R, r), torch.float32, dev)
+    dsilu = ws.slot("dsilu", (R, r), torch.float32, dev)
+    torch.sub(1.0, sig, out=dsilu)  # 1 - sig
+    torch.mul(g, dsilu, out=tmp)  # g·(1 - sig)
+    torch.add(tmp, 1.0, out=tmp)  # 1 + g·(1 - sig)
+    torch.mul(sig, tmp, out=dsilu)  # dsilu = sig·(1 + g·(1 - sig))
+    dg = ws.slot("dg", (R, r), torch.float32, dev)
+    torch.mul(dh, u, out=dg)
+    torch.mul(dg, dsilu, out=dg)  # dg = dh·u·dsilu, left-to-right like the reference
+    du = ws.slot("du", (R, r), torch.float32, dev)
+    torch.mul(sig, g, out=du)
+    torch.mul(dh, du, out=du)  # du = dh·(sig·g)
+    dg_l = ws.slot("dg_l", (R, r), dt, dev)
+    torch.mul(dg, gs_row, out=tmp)
+    dg_l.copy_(tmp)
+    du_l = ws.slot("du_l", (R, r), dt, dev)
+    torch.mul(du, us_row, out=tmp)
+    du_l.copy_(tmp)
+
+    dgate_u = _wgrad(xg, dg_l, offs, e, cap, d, r, t_rank_n, xg.dtype)
+    dup_u = _wgrad(xg, du_l, offs, e, cap, d, r, t_rank_n, xg.dtype)
+    dv = _wgrad(h, dyc, offs, e, cap, r, f, t_wide, xg.dtype)
+    dx = _grouped_nt_pair(dg_l, gate_u, du_l, up_u, offs, cap, d, r, t_wide, xg.dtype)
+
+    torch.mul(dg, gpre, out=tmp)
+    dgate_s = _seg_sum(tmp, seg, e)
+    torch.mul(du, upre, out=tmp)
+    dup_s = _seg_sum(tmp, seg, e)
+    return dx, dgate_u, dup_u, dgate_s, dup_s, dv
+
+
+class _Combine(torch.autograd.Function):
+    """`out = index_add(owner, y·w)` with the FUSED backward — one kernel, one read.
+
+    The forward is the same three lines the caller used to run inline (`y` widened
+    to fp32, scaled by the gathered router weight, scattered by token), so the
+    forward's numbers are unchanged. What changes is the graph: the `[R, f]`
+    scaled tensor is no longer an autograd node, so it is not saved and no `mul`
+    backward or `index_add` backward exists — `_combine_bwd_kernel` produces both
+    gradients in one pass.
+    """
 
     @staticmethod
-    def forward(ctx, xg, gate_u, up_u, gate_s, up_s, v, offs, cap, tiles):
+    def forward(ctx, y, w, owner, rowmap, n, ws, tiles):
+        out = torch.zeros(n, y.shape[1], dtype=torch.float32, device=y.device)
+        out.index_add_(0, owner, y.to(torch.float32) * w.unsqueeze(-1))
+        ctx.save_for_backward(y, w, rowmap)
+        ctx.ws, ctx.tiles = ws, tiles
+        return out
+
+    @staticmethod
+    def backward(ctx, dout):
+        y, w, rowmap = ctx.saved_tensors
+        ws, tiles = ctx.ws, ctx.tiles
+        R, f = y.shape
+        n, k = rowmap.shape
+        assert dout.dtype == torch.float32, "the combine's grad_out is fp32 by contract"
+        dout = dout.contiguous()  # a no-op when autograd hands over a dense tensor
+        dy = ws.slot("dy", (R, f), y.dtype, y.device)
+        # `dw` is NOT a workspace slot: it becomes `weight.grad` when the router
+        # weight is a leaf, and autograd would then alias the buffer into a leaf's
+        # `.grad` — a second backward would silently rewrite the first's gradient.
+        # It is `[R]` floats, so there is nothing to save by caching it.
+        dw = torch.empty(R, dtype=torch.float32, device=y.device)
+        _combine_bwd_kernel[(triton.cdiv(n, tiles["BLOCK_T"]),)](
+            dout,
+            y,
+            w,
+            rowmap,
+            dy,
+            dw,
+            n,
+            f,
+            K=k,
+            TOP_K=_topk_tile(k),
+            BLOCK_T=tiles["BLOCK_T"],
+            BLOCK_F=tiles["BLOCK_F"],
+            num_warps=4,
+        )
+        return dy, dw, None, None, None, None, None
+
+
+def combine(y, w, owner, rowmap, n, *, ws=None, tiles=None):
+    """`out [n, f] = Σ_rows y[row]·w[row]`, the rows gathered by `owner` — fused bwd.
+
+    The scatter half of the MoE pass (`experts.SparseMoE._triton_dispatch`), with
+    `_Combine`'s fused backward. `rowmap [n, k]` int32 is the token→gathered-row
+    map with `-1` where the capacity dropped the assignment; `w [R]` fp32 is the
+    gathered router weight, `owner [R]` the token each gathered row belongs to.
+    `ws` is the caller's grow-only `BwdWorkspace` (a throwaway one is made if
+    omitted, which is correct and simply re-allocates every call).
+    """
+    assert y.ndim == 2 and y.is_cuda and y.is_contiguous(), "y must be a dense CUDA [R, f]"
+    assert w.shape == (y.shape[0],) and w.dtype == torch.float32 and w.is_contiguous()
+    assert owner.shape == (y.shape[0],) and owner.is_contiguous()
+    assert rowmap.ndim == 2 and rowmap.dtype == torch.int32 and rowmap.shape[0] == n
+    assert rowmap.is_contiguous(), "rowmap must be dense"
+    k = rowmap.shape[1]
+    assert 1 <= k <= FUSED_TOPK_MAX, (
+        f"topk={k} is outside the fused combine's unrolled tile [1, {FUSED_TOPK_MAX}]: "
+        f"escape is a smaller moe_topk, or the current backward (`fused_bwd=False`)"
+    )
+    return _Combine.apply(
+        y, w, owner, rowmap, n, ws if ws is not None else BwdWorkspace(), _tiles(tiles)
+    )
+
+
+class _ExpertGemmGlu(torch.autograd.Function):
+    """The fused pass with its own backward: `fwd` Triton, `bwd` Triton (adjoint GEMMs).
+
+    `fused_bwd` picks WHICH adjoint: `_glu_backward_fused` (default, the fused
+    `dx` + the caller's row map + the caller's workspace) or `_glu_backward` (the
+    reference). `seg`/`ws` are the caller's; the function neither builds nor owns
+    them.
+    """
+
+    @staticmethod
+    def forward(ctx, xg, gate_u, up_u, gate_s, up_s, v, offs, cap, tiles, fused_bwd, seg, ws):
         y, (gpre, upre, h) = _glu_fused_or_head(
             xg, gate_u, up_u, gate_s, up_s, v, offs, cap, tiles, split=False, save=True
         )
         ctx.save_for_backward(xg, gate_u, up_u, gate_s, up_s, v, offs, gpre, upre, h)
         ctx.cap, ctx.tiles = cap, tiles
+        ctx.fused_bwd, ctx.seg, ctx.ws = fused_bwd, seg, ws
         return y
 
     @staticmethod
     def backward(ctx, dy):
         xg, gate_u, up_u, gate_s, up_s, v, offs, gpre, upre, h = ctx.saved_tensors
-        return (
-            *_glu_backward(
-                xg, gate_u, up_u, gate_s, up_s, v, offs, ctx.cap, gpre, upre, h, dy, ctx.tiles
-            ),
-            None,
-            None,
-            None,
-        )
+        args = (xg, gate_u, up_u, gate_s, up_s, v, offs, ctx.cap, gpre, upre, h, dy, ctx.tiles)
+        if ctx.fused_bwd:
+            grads = _glu_backward_fused(*args, ctx.seg, ctx.ws)
+        else:
+            grads = _glu_backward(*args)
+        return (*grads, None, None, None, None, None, None)

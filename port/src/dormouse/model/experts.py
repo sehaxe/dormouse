@@ -33,6 +33,18 @@ Dispatch has TWO arms over ONE permute, and the log line says which ran:
   expert-kernel verdicts come from isolated-pass benches, then the full step);
   when the kernel cannot run (no triton, not CUDA) the padded arm runs instead
   and `moe_triton_fallback` + the reason say so.
+  Its BACKWARD is FUSED by default (`fused_bwd=True`, `_triton_dispatch`): the
+  scatter is `moe_kernels.combine` (one Triton kernel for both the `[R]`
+  router-weight gradient and the expert adjoint — the OLMo-core combine-backward
+  idea, reimplemented in `moe_kernels`), `dx` is one grouped GEMM with two
+  accumulators instead of two plus `add_`, the row→expert map is an `int32`
+  tensor the permute already had instead of a `repeat_interleave` rebuild, and
+  the `[R, ·]` scratch is a grow-only workspace THIS module owns (one per
+  `SparseMoE`) instead of ~12 allocations per backward. `fused_bwd=False` is the
+  previous adjoint, kept as the parity gate and the bench's control; a top-k past
+  `moe_kernels.FUSED_TOPK_MAX` is the one call the fused path refuses, and it
+  says so on the counter line (`moe_triton_fallback`, reason `fused backward:
+  …`) while `moe_triton_gemm` still counts — the grouped GEMM did run.
 * **naive (the CPU path and the correctness reference)**: gather → per-expert
   matmul → scatter over a capacity-bound permute. The day-one implementation,
   kept because it is what the padded arm is compared against — the same rows,
@@ -741,9 +753,18 @@ class SparseMoE(nn.Module):
             if why is None:
                 why = self._triton_reason(x)
             if why is None:
+                # The fused backward's own gate (top-k): COUNTED, and it leaves
+                # `moe_triton_gemm` counting because the grouped GEMM does run.
+                fwhy = self._fused_bwd_reason(index.shape[1])
+                if fwhy is not None:
+                    counters.count("moe_triton_fallback")
+                    counters.why = f"fused backward: {fwhy}"  # type: ignore[attr-defined]
                 counters.count("moe_triton_gemm")
                 return self._expert_pass(
-                    lambda: self._triton_dispatch(x, weight, index, order, keep), counters
+                    lambda: self._triton_dispatch(
+                        x, weight, index, order, keep, fused_bwd=fwhy is None
+                    ),
+                    counters,
                 )
             counters.count("moe_triton_fallback")
             notes.append(f"triton: {why}")
@@ -789,6 +810,8 @@ class SparseMoE(nn.Module):
         counter object. Anything the kernel cannot serve (no triton, not CUDA, a
         non-silu expert activation) falls back to the reference loop COUNTED,
         with `moe_triton_fallback` when the grouped GEMM was the config's ask.
+        The grouped GEMM itself runs the FUSED backward (`_fused_bwd_reason` is
+        the only thing that can send it back to the previous adjoint, COUNTED).
         """
         counters.count("moe_dropless")
         why = None
@@ -807,9 +830,20 @@ class SparseMoE(nn.Module):
                     "with, so the grouped GEMM runs (the static row-block bound + the "
                     "kernels' on-device empty-block exit)"
                 )
+            # The fused backward's own gate (top-k): COUNTED, and `moe_triton_gemm`
+            # still counts because the grouped GEMM does run (its previous adjoint
+            # is what the fallback selects).
+            fwhy = self._fused_bwd_reason(index.shape[1])
+            if fwhy is not None:
+                counters.count("moe_triton_fallback")
+                note = f"fused backward: {fwhy}"
+                prev = getattr(counters, "why", None)
+                counters.why = f"{prev}; {note}" if prev else note  # type: ignore[attr-defined]
             counters.count("moe_triton_gemm")
             return self._expert_pass(
-                lambda: self._triton_dispatch(x, weight, index, order, keep, dropless=True),
+                lambda: self._triton_dispatch(
+                    x, weight, index, order, keep, dropless=True, fused_bwd=fwhy is None
+                ),
                 counters,
             )
         if self.moe_kernel == "triton":
@@ -835,6 +869,44 @@ class SparseMoE(nn.Module):
             return f"input is on {x.device.type}: the grouped GEMM is the CUDA path"
         return None
 
+    def _fused_bwd_reason(self, k: int) -> str | None:
+        """`None` if the FUSED backward can serve a top-k of `k`, else why not.
+
+        The only thing it refuses is the top-k: the combine kernel UNROLLS the
+        top-k loop (`tl.static_range`) up to `moe_kernels.FUSED_TOPK_MAX`, and
+        everything else the fused path needs — CUDA, triton, a dense `[R, ·]`
+        `dy` — is `_triton_reason`'s gate already. Our own top-k is 2, so this
+        fires only for a config that asks for more.
+
+        COUNTED, never silent, and the counter is `moe_triton_fallback` with
+        `fused backward: …` on `counters.why` while `moe_triton_gemm` still
+        counts: the grouped GEMM DID run, it just ran its previous adjoint
+        (`fused_bwd=False`) — the reference is the fallback here, not the loop.
+        """
+        if moe_kernels is None:
+            return _TRITON_WHY
+        if k < 1 or k > moe_kernels.FUSED_TOPK_MAX:
+            return (
+                f"topk={k} is outside the fused backward's unrolled tile "
+                f"[1, {moe_kernels.FUSED_TOPK_MAX}]"
+            )
+        return None
+
+    def _bwd_workspace(self):
+        """The grow-only backward scratch — ONE per `SparseMoE`, owned HERE.
+
+        `moe_kernels.BwdWorkspace` holds no module-level state (its docstring:
+        the caller owns the buffers); this is the caller. Created on first use
+        so a model that never runs the triton arm never allocates it, and kept
+        across steps so the steady-state backward allocates no `[R, ·]` scratch.
+        `_banks`'s cache is the same shape of object for the same reason.
+        """
+        ws = getattr(self, "_moe_bwd_ws", None)
+        if ws is None:
+            assert moe_kernels is not None, "no workspace without the triton arm"
+            ws = self._moe_bwd_ws = moe_kernels.BwdWorkspace()
+        return ws
+
     def _triton_dispatch(
         self,
         x: torch.Tensor,
@@ -844,6 +916,7 @@ class SparseMoE(nn.Module):
         keep: torch.Tensor,
         *,
         dropless: bool = False,
+        fused_bwd: bool = True,
     ) -> torch.Tensor:
         """Gather → ONE unpadded grouped-GEMM pass (GLU fused) → weighted scatter.
 
@@ -860,6 +933,17 @@ class SparseMoE(nn.Module):
         the host (ADR-0018 rule 2). Empty experts cost a program launch and two
         loads — that is what makes this arm the dropless one instead of the
         per-expert reference loop.
+
+        `fused_bwd=True` (the default) is the fused adjoint: the scatter is
+        `moe_kernels.combine` (a custom Function whose backward is ONE kernel —
+        `grad_out` read once per token, the `[R]` router-weight gradient summed
+        in registers) and the expert pass gets the permute's own `int32`
+        row→expert map plus this module's grow-only workspace, so the backward
+        neither rebuilds the segments with `repeat_interleave` nor allocates its
+        `[R, ·]` scratch per call. The forward's numbers are unchanged either
+        way — only the graph the backward walks. `fused_bwd=False` is the
+        previous path (a plain torch scatter and `_glu_backward`), kept as the
+        parity gate and the bench's control.
         """
         assert moe_kernels is not None, "the triton arm cannot be dispatched without it"
         n, k = index.shape
@@ -871,20 +955,42 @@ class SparseMoE(nn.Module):
         offs = torch.zeros(self.n_experts + 1, dtype=torch.int32, device=x.device)
         offs[1:] = torch.cumsum(counts, 0)
         gate_u, up_u, v, gate_s, up_s = self._banks(dt)
+        cap = None if dropless else self._capacity(n, k)
+        xg = x[owner].to(dt)
+        if not fused_bwd:
+            y = moe_kernels.expert_gemm_glu(
+                xg, gate_u, up_u, gate_s, up_s, v, offs, cap=cap, fused_bwd=False
+            )
+            # fp32 weight applied where the padded arm applies it (see the note
+            # there): a bf16 multiply would be a 2^-8 step the parity gate could
+            # not tell from a wiring error.
+            y = y.to(torch.float32) * weight.reshape(-1)[rows].unsqueeze(-1)
+            out = torch.zeros(n, self.f, dtype=torch.float32, device=x.device)
+            out.index_add_(0, owner, y)
+            return out
+        # The row→expert map the fused backward needs IS the routing the permute
+        # already produced — `kept` is the expert of every gathered row — so the
+        # backward's `repeat_interleave` rebuild costs one cast instead. Built
+        # once per forward here and carried through autograd (`_ExpertGemmGlu`
+        # keeps it on `ctx`), which is the "built once, cached" the study asks for.
+        seg = kept.to(torch.int32)
+        # `rowmap[flat (token, slot)] = gathered row`, `-1` where the capacity
+        # dropped it: the int32 row map OLMo-core's combine backward is built
+        # around (`moe_unpermute_bwd_kernel.cu:177-179`), one per forward.
+        rowmap = torch.full((n * k,), -1, dtype=torch.int32, device=x.device)
+        rowmap[rows] = torch.arange(rows.numel(), dtype=torch.int32, device=x.device)
+        ws = self._bwd_workspace()
         y = moe_kernels.expert_gemm_glu(
-            x[owner].to(dt),
+            xg,
             gate_u,
             up_u,
             gate_s,
             up_s,
             v,
             offs,
-            cap=None if dropless else self._capacity(n, k),
+            cap=cap,
+            fused_bwd=True,
+            seg=seg,
+            ws=ws,
         )
-        # fp32 weight applied where the padded arm applies it (see the note
-        # there): a bf16 multiply would be a 2^-8 step the parity gate could not
-        # tell from a wiring error.
-        y = y.to(torch.float32) * weight.reshape(-1)[rows].unsqueeze(-1)
-        out = torch.zeros(n, self.f, dtype=torch.float32, device=x.device)
-        out.index_add_(0, owner, y)
-        return out
+        return moe_kernels.combine(y, weight.reshape(-1)[rows], owner, rowmap.view(n, k), n, ws=ws)

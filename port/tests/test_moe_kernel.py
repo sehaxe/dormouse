@@ -241,6 +241,378 @@ def test_dispatch_counts_the_triton_fallback_on_cpu():
 
 
 # --------------------------------------------------------------------------
+# the FUSED backward — parity against the previous adjoint, per parameter group
+# --------------------------------------------------------------------------
+
+
+def _relz(a: torch.Tensor, b: torch.Tensor) -> float:
+    """`_rel` with the degenerate case DEFINED: 0 against 0 is 0, not NaN.
+
+    A capacity'd routing leaves experts with no rows, and their gradients are
+    legitimately all-zero on both arms — `0/0` would read as a failure.
+    """
+    scale = float(b.float().abs().max())
+    d = float((a.float() - b.float()).abs().max())
+    return d / scale if scale > 0 else d
+
+
+def _run_arm(moe, x, weight, index, order, keep, *, fused: bool, dropless: bool):
+    """`(expert grads, dx, dprobs)` for one arm — the five groups the gate names.
+
+    `dprobs` is the gradient of the ROUTER WEIGHT (`weight.grad`), which is what
+    the fused combine backward produces in registers; `dv`/`dgate_u`/`dup_u` are
+    the expert banks' (`v`, `gate_u`, `up_u`) and `dx` is the input's.
+    """
+    moe.zero_grad(set_to_none=True)
+    xi = x.detach().clone().requires_grad_(True)
+    wi = weight.detach().clone().requires_grad_(True)
+    out = moe._triton_dispatch(xi, wi, index, order, keep, dropless=dropless, fused_bwd=fused)
+    out.float().pow(2).mean().backward()
+    grads = {n: p.grad.detach().clone() for n, p in moe.experts.named_parameters()}
+    assert all(p.grad is not None for p in moe.experts.parameters()), "a dead expert param"
+    assert xi.grad is not None and wi.grad is not None
+    return grads, xi.grad.detach().clone(), wi.grad.detach().clone()
+
+
+#: `(capacity, dropless)` — the three routings the fused backward has to serve:
+#: the tight cap (the b1 default), a cap that really DROPS rows (so the combine
+#: kernel's `-1` sentinel is on the tested path), and the dropless static bound.
+ROUTINGS = [("cap1.0", 1.0, False), ("cap0.25", 0.25, False), ("dropless", 0.0, True)]
+
+
+@CUDA
+@pytest.mark.parametrize("bf16,bound", [(False, 1e-6), (True, 2e-2)])
+@pytest.mark.parametrize("label,cap,dropless", ROUTINGS, ids=[r[0] for r in ROUTINGS])
+def test_the_fused_backward_matches_the_current_one(bf16, bound, label, cap, dropless):
+    """The fused adjoint == the previous one, forward and on all five groups.
+
+    The bounds are the study's: **1e-6 at fp32** (the differences are summation
+    ORDER only — `dv`/`dgate_u`/`dup_u` run the same `_wgrad` on bit-identical
+    inputs, `dx` accumulates both dots into one fp32 accumulator instead of
+    adding two rounded results, and `dprobs` is a tree sum in the kernel against
+    torch's `sum(-1)`), and **2e-2 at bf16**, the bound every other gradient gate
+    in this file uses. At bf16 `dx` also differs by ONE rounding instead of two
+    (the fused accumulator rounds once), which is 2^-8 of the value and is why
+    the bf16 bound is the loose one.
+    """
+    moe = _moe(bf16=bf16, moe_capacity=cap)
+    x = torch.randn(64, moe.d, device=DEV)
+    index, weight = _routing(moe, x)
+    order, keep, dropped = moe._permute(index)
+    with torch.no_grad():
+        fwd_new = moe._triton_dispatch(
+            x, weight, index, order, keep, dropless=dropless, fused_bwd=True
+        )
+        fwd_cur = moe._triton_dispatch(
+            x, weight, index, order, keep, dropless=dropless, fused_bwd=False
+        )
+    fwd_rel = _relz(fwd_new, fwd_cur)
+    new, dx_new, dp_new = _run_arm(
+        moe, x, weight, index, order, keep, fused=True, dropless=dropless
+    )
+    cur, dx_cur, dp_cur = _run_arm(
+        moe, x, weight, index, order, keep, fused=False, dropless=dropless
+    )
+    per = {n: _relz(new[n], cur[n]) for n in cur}
+    worst = max(per.values())
+    dx_rel, dp_rel = _relz(dx_new, dx_cur), _relz(dp_new, dp_cur)
+    print(
+        f"[fused bwd] {label} bf16={bf16} dropped={int(dropped)}/{index.numel()} "
+        f"fwd={fwd_rel:.3e} dv/dgate_u/dup_u={worst:.3e} ({max(per, key=per.get)}) "
+        f"dx={dx_rel:.3e} dprobs={dp_rel:.3e} bound={bound}"
+    )
+    assert fwd_rel <= bound, f"the forward moved: {fwd_rel:.3e} > {bound}"
+    assert worst <= bound, f"expert parameter grads disagree: {per}"
+    assert dx_rel <= bound, f"dx disagrees: {dx_rel:.3e}"
+    assert dp_rel <= bound, f"dprobs disagrees: {dp_rel:.3e}"
+
+
+@CUDA
+def test_the_fused_backward_is_the_one_the_module_runs_by_default():
+    """`_triton_dispatch`'s default IS the fused arm — the counter says so.
+
+    The whole point of the lane is that the shipped path changes; a default that
+    silently kept the old adjoint would make every number below a measurement of
+    the wrong program (and the module's own docstring names `fused_bwd=False` as
+    the bench's control, not the default).
+    """
+    moe = _moe(moe_kernel="triton", moe_capacity=0)
+    x = torch.randn(64, moe.d, device=DEV)
+    index, weight = _routing(moe, x)
+    counters = Counters()
+    out = moe._dispatch(x, weight, index, counters)
+    print(f"[fused default] {counters.line()} why={getattr(counters, 'why', None)}")
+    assert counters["moe_triton_gemm"] == 1 and "moe_triton_fallback" not in counters
+    assert torch.isfinite(out).all()
+    # ... and the workspace it uses is the module's own, created on first use.
+    assert isinstance(moe._bwd_workspace(), mk.BwdWorkspace)
+    assert moe._bwd_workspace() is moe._bwd_workspace(), "one workspace per module object"
+
+
+def test_the_combine_forward_is_the_scatter_it_replaced():
+    """The fused combine's FORWARD is the three lines it replaced, bit for bit.
+
+    `_Combine.forward` is pure torch, so this gate needs no card — and it is the
+    one that says the new graph did not change the forward's numbers (the
+    backward is a kernel and is gated on CUDA; a forward that moved would make
+    every CUDA parity number a measurement of a different function).
+    """
+    if mk is None:
+        pytest.skip("no triton in this build")
+    torch.manual_seed(5)
+    n, k, f = 7, 2, 6
+    owner = torch.tensor([0, 0, 1, 2, 3, 4, 5, 6, 6, 2, 1, 3, 4, 5])  # 14 kept rows
+    rows = owner.numel()
+    y = torch.randn(rows, f, dtype=torch.bfloat16)
+    w = torch.rand(rows, dtype=torch.float32)
+    rowmap = torch.full((n, k), -1, dtype=torch.int32)
+    rowmap[0, 0], rowmap[0, 1] = 0, 1
+    rowmap[1, 0], rowmap[1, 1] = 2, 10
+    rowmap[2, 0], rowmap[2, 1] = 3, 9
+    rowmap[3, 0], rowmap[3, 1] = 4, 11
+    rowmap[4, 0], rowmap[4, 1] = 5, 12
+    rowmap[5, 0], rowmap[5, 1] = 6, 13
+    rowmap[6, 0], rowmap[6, 1] = 7, 8
+
+    with torch.no_grad():
+        got = mk._Combine.apply(y, w, owner, rowmap, n, mk.BwdWorkspace(), mk.TILES)
+    ref = torch.zeros(n, f, dtype=torch.float32)
+    ref.index_add_(0, owner, y.to(torch.float32) * w.unsqueeze(-1))
+    print(f"[combine fwd] rows={rows} n={n} equal={torch.equal(got, ref)}")
+    assert torch.equal(got, ref), "the combine's forward must not have moved"
+
+
+def test_the_row_map_is_the_inverse_of_the_gather():
+    """The `-1` int32 map the combine kernel reads is the permute's own inverse.
+
+    Built exactly as `_triton_dispatch` builds it — index arithmetic, so no card
+    is needed — and checked against the gather it must invert: every KEPT
+    (token, slot) pair points at its gathered row, every DROPPED one is `-1`.
+    The kernel's per-token loop reads `rowmap[token*K + k]`, so a transposed map
+    (`k*N + token`, OLMo-core's own layout) would read the wrong row for every
+    token but the first; this is the gate that fails if that convention drifts.
+    """
+    torch.manual_seed(7)
+    moe = SparseMoE(tiny_cfg(n_experts=4, moe_topk=2, rank=8, moe_capacity=0.25), device="cpu")
+    x = torch.randn(32, moe.d)
+    index, _weight = _routing(moe, x)
+    n, k = index.shape
+    order, keep, dropped = moe._permute(index)
+    rows = order[keep]
+    rowmap = torch.full((n * k,), -1, dtype=torch.int32)
+    rowmap[rows] = torch.arange(rows.numel(), dtype=torch.int32)
+    assert int(dropped) > 0, "the fixture must DROP rows — that is the `-1` path"
+    for j in range(rows.numel()):
+        flat = int(rows[j])
+        assert int(rowmap[flat]) == j and int(rowmap.view(n, k)[flat // k, flat % k]) == j
+    for p in order[~keep].tolist():  # `keep` masks SORTED positions, rowmap is by flat id
+        assert int(rowmap[p]) == -1, f"a dropped assignment ({p}) must be -1"
+    print(f"[row map] n={n} k={k} kept={rows.numel()} dropped={int(dropped)} -1s checked")
+
+
+def test_the_fused_backward_refuses_only_an_out_of_range_topk():
+    """The fused path's ONE refusal, and it is a name, not a crash (CPU gate).
+
+    Everything else the fused path needs is `_triton_reason`'s gate (CUDA, triton);
+    what is left is the combine kernel's UNROLLED top-k loop. The literal is
+    pinned because `experts._fused_bwd_reason` and the kernel's `tl.static_range`
+    must agree on it — a drift is a config that silently loses its fast backward.
+    """
+    if mk is None:
+        pytest.skip("no triton in this build: the ability gate is the reason itself")
+    moe = SparseMoE(tiny_cfg(n_experts=4, moe_topk=2, rank=8), device="cpu")
+    assert moe._fused_bwd_reason(1) is None and moe._fused_bwd_reason(2) is None
+    why = moe._fused_bwd_reason(mk.FUSED_TOPK_MAX + 1)
+    print(f"[fused gate] {why}")
+    assert f"topk={mk.FUSED_TOPK_MAX + 1}" in why and str(mk.FUSED_TOPK_MAX) in why
+    assert mk.FUSED_TOPK_MAX == 32, "the unrolled top-k tile is a module literal"
+    assert mk._topk_tile(1) == 2 and mk._topk_tile(3) == 4 and mk._topk_tile(2) == 2
+
+
+def test_the_bwd_workspace_is_grow_only_and_reuses_its_buffers():
+    """The caller-owned scratch is pure torch, so this gate needs no card.
+
+    Grow-only is the whole contract: a smaller call must hand back the SAME
+    storage (that is what "no per-call allocation" means), a bigger one must
+    grow, a dtype/device move must reallocate, and two names must never alias.
+    """
+    if mk is None:
+        pytest.skip("no triton in this build")
+    ws = mk.BwdWorkspace()
+    dev = torch.device("cpu")
+    a = ws.slot("s", (4, 8), torch.float32, dev)
+    a.fill_(1.0)
+    b = ws.slot("s", (2, 3), torch.float32, dev)
+    assert b.data_ptr() == a.data_ptr(), "a smaller call must reuse the buffer"
+    assert b.shape == (2, 3) and float(b.abs().sum()) == 6.0, "the same storage, a view"
+    c = ws.slot("s", (5, 9), torch.float32, dev)
+    assert c.data_ptr() != a.data_ptr() and c.numel() == 45, "a bigger call must grow"
+    d = ws.slot("s", (5, 9), torch.float16, dev)
+    assert d.dtype == torch.float16 and d.data_ptr() != c.data_ptr(), "a dtype move grows"
+    e = ws.slot("t", (4, 8), torch.float32, dev)
+    assert e.data_ptr() != c.data_ptr() and e.data_ptr() != a.data_ptr(), "one buffer per name"
+
+
+def _fake_grouped_nt(a, w, offs, cap, n, k, tiles, out_dtype, out=None):
+    """CPU stand-in for `_grouped_nt`: the same product per group, in fp64.
+
+    fp64 so that the two adjoints are handed BIT-IDENTICAL tensors and the
+    comparison below can be `torch.equal` instead of a bound — a fake that
+    rounded would hide exactly the class of defect this gate is for.
+    """
+    res = torch.zeros(a.shape[0], n, dtype=out_dtype)
+    for i in range(w.shape[0]):
+        s, t = int(offs[i]), int(offs[i + 1])
+        if t > s:
+            res[s:t] = (a[s:t].double() @ w[i].double().T).to(out_dtype)
+    if out is not None:
+        out.copy_(res)
+        return out
+    return res
+
+
+def _fake_wgrad(a, b, offs, e, cap, k, n, tiles, out_dtype):
+    res = torch.zeros(e, k, n, dtype=out_dtype)
+    for i in range(e):
+        s, t = int(offs[i]), int(offs[i + 1])
+        if t > s:
+            res[i] = (a[s:t].double().T @ b[s:t].double()).to(out_dtype)
+    return res
+
+
+def _fake_pair(a1, w1, a2, w2, offs, cap, n, k, tiles, out_dtype):
+    """`_grouped_nt_pair` on CPU = the reference's two GEMMs plus `add_`."""
+    return _fake_grouped_nt(a1, w1, offs, cap, n, k, tiles, out_dtype) + _fake_grouped_nt(
+        a2, w2, offs, cap, n, k, tiles, out_dtype
+    )
+
+
+@pytest.mark.parametrize("dt", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+@pytest.mark.parametrize("give_seg", [True, False], ids=["seg-int32", "seg-rebuilt"])
+def test_the_fused_adjoint_is_the_reference_op_for_op_on_cpu(monkeypatch, dt, give_seg):
+    """The elementwise chain and the workspace discipline, WITHOUT a card.
+
+    The three Triton GEMMs are replaced by fp64 stand-ins, which is what makes
+    this gate sharp rather than merely available: both adjoints are then handed
+    the same tensors and the comparison is BITWISE, so a reordered multiply, a
+    lost `.to(dtype)`, a workspace slot read after it was overwritten, a swapped
+    return, or an int32 row map that disagrees with `_segments` all fail HERE.
+
+    What it does not verify is the two new KERNELS' arithmetic — the AOT gate
+    says they build and the CUDA parity gate says they compute the same function
+    — and this docstring says so on purpose.
+    """
+    if mk is None:
+        pytest.skip("no triton in this build")
+    monkeypatch.setattr(mk, "_grouped_nt", _fake_grouped_nt)
+    monkeypatch.setattr(mk, "_wgrad", _fake_wgrad)
+    monkeypatch.setattr(mk, "_grouped_nt_pair", _fake_pair)
+
+    torch.manual_seed(3)
+    e, d, r, f = 5, 24, 8, 32
+    counts = torch.tensor([0, 3, 7, 2, 6], dtype=torch.int32)  # group 0 is EMPTY
+    rows = int(counts.sum())
+    offs = torch.zeros(e + 1, dtype=torch.int32)
+    offs[1:] = torch.cumsum(counts, 0)
+    seg = torch.repeat_interleave(torch.arange(e, dtype=torch.int32), counts.to(torch.int64))
+
+    def cast(t):
+        return t.to(dt)
+
+    xg = cast(torch.randn(rows, d))
+    gu = cast(torch.randn(e, d, r) / d**0.5)
+    uu = cast(torch.randn(e, d, r) / d**0.5)
+    gs = cast(torch.randn(e, r) * 0.1 + 1.0)
+    us = cast(torch.randn(e, r) * 0.1 + 1.0)
+    v = cast(torch.randn(e, r, f) / r**0.5)
+    gpre, upre = torch.randn(rows, r), torch.randn(rows, r)
+    h = cast(torch.randn(rows, r))
+    dy = cast(torch.randn(rows, f))
+    cap = int(counts.max())
+    args = (xg, gu, uu, gs, us, v, offs, cap, gpre, upre, h, dy, mk.TILES)
+
+    ref = mk._glu_backward(*args)
+    got = mk._glu_backward_fused(*args, seg if give_seg else None, mk.BwdWorkspace())
+    names = ("dx", "dgate_u", "dup_u", "dgate_s", "dup_s", "dv")
+    # `strict=True`: the adjoint's six outputs, in the order `_ExpertGemmGlu`
+    # returns them — a swapped pair must fail here, not pass as a tolerance.
+    bad = [n for n, a, b in zip(names, got, ref, strict=True) if not torch.equal(a, b)]
+    worst = max(float((a.float() - b.float()).abs().max()) for a, b in zip(got, ref, strict=True))
+    print(
+        f"[fused bwd op-for-op] dt={dt} seg={'caller int32' if give_seg else 'rebuilt'} "
+        f"rows={rows} counts={counts.tolist()} mismatched={bad} max|d|={worst:.3e}"
+    )
+    assert not bad, f"the fused adjoint differs from the reference on {bad}"
+    assert worst == 0.0, "the fused adjoint must be bit-identical on the same GEMMs"
+    # The reference really did visit every expert: an empty group is a legal call,
+    # and a fused path that silently dropped it would still pass a bitwise test.
+    assert int(counts[0]) == 0 and int(offs[-1]) == rows
+
+
+def _sig(pairs: str) -> dict[str, str]:
+    """`"x:*fp32 n:i32"` -> an `ASTSource` signature — one line instead of twelve."""
+    out: dict[str, str] = {}
+    for item in pairs.split():
+        name, _, ty = item.partition(":")
+        out[name] = ty
+    return out
+
+
+def test_the_fused_kernels_compile_for_this_arch():
+    """A COMPILE gate that needs no card — the only way to fail a kernel here.
+
+    The card is held by a live run for most of this project's hours, so a gate
+    that needs a device is a gate that never runs. `triton.compile` with an
+    explicit `GPUTarget` lowers a kernel to PTX/cubin on the HOST (ptxas; no
+    device memory, no launch), which catches every frontend failure a new kernel
+    can have: an unknown op, a bad broadcast, a `tl.arange` that is not a power
+    of two, a mask of the wrong rank. It is NOT a parity gate — the numeric gates
+    above are — and it does not replace one; it is what makes a kernel that
+    cannot even be built fail HERE instead of on the first training step.
+    """
+    if mk is None:
+        pytest.skip("no triton in this build")
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler import ASTSource
+    from triton.compiler import compile as tcompile
+
+    if torch.cuda.is_available():
+        major, minor = torch.cuda.get_device_capability()
+        arch = major * 10 + minor
+    else:
+        arch = 120  # this box's card; a compile-only gate does not need the device
+    target = GPUTarget("cuda", arch, 32)
+
+    sig_combine = _sig(
+        "dout_ptr:*fp32 y_ptr:*bf16 w_ptr:*fp32 rowmap_ptr:*i32 dy_ptr:*bf16 dw_ptr:*fp32 "
+        "N:i32 F_:i32 K:constexpr TOP_K:constexpr BLOCK_T:constexpr BLOCK_F:constexpr"
+    )
+    sig_pair = _sig(
+        "a1_ptr:*bf16 w1_ptr:*bf16 a2_ptr:*bf16 w2_ptr:*bf16 o_ptr:*bf16 offs_ptr:*i32 "
+        "N:i32 K:i32 sam:i32 sak:i32 swe:i32 swk:i32 swn:i32 som:i32 son:i32 "
+        "BLOCK_M:constexpr BLOCK_N:constexpr BLOCK_K:constexpr PREC:constexpr"
+    )
+    t = mk.TILES
+    comb = {"BLOCK_T": t["BLOCK_T"], "BLOCK_F": t["BLOCK_F"]}
+    pair = {"BLOCK_M": t["BLOCK_M"], "BLOCK_N": t["BLOCK_N"], "BLOCK_K": t["BLOCK_K"]}
+    cases = [
+        # our top-k, and the two padded tiles the `if k < K` static branch skips
+        ("combine K=2", mk._combine_bwd_kernel, sig_combine, dict(comb, K=2, TOP_K=2), 4),
+        ("combine K=1", mk._combine_bwd_kernel, sig_combine, dict(comb, K=1, TOP_K=2), 4),
+        ("combine K=3", mk._combine_bwd_kernel, sig_combine, dict(comb, K=3, TOP_K=4), 4),
+        ("fused dx bf16", mk._grouped_gemm_pair_kernel, sig_pair, dict(pair, PREC="tf32"), 8),
+        ("fused dx fp32", mk._grouped_gemm_pair_kernel, sig_pair, dict(pair, PREC="ieee"), 8),
+    ]
+    built = []
+    for label, fn, sig, consts, warps in cases:
+        src = ASTSource(fn, signature=sig, constexprs=consts)
+        k = tcompile(src, target=target, options={"num_warps": warps})
+        assert "cubin" in k.asm, f"{label}: no cubin"
+        built.append(f"{label}={len(k.asm['cubin'])}B")
+    print(f"[kernel compile] arch=sm_{arch} " + " ".join(built))
+
+
+# --------------------------------------------------------------------------
 # benches — NOT tests: the perf gate, run by scripts/bench_moe_kernel.py
 # --------------------------------------------------------------------------
 
@@ -278,7 +650,14 @@ def _timed(fn, reps: int, warm: int = 2, x=None) -> tuple[float, float, float]:
 
 
 def _bench_arms(e: int, d: int, r: int, f: int, tokens: int, cap: float, reps: int = 8) -> None:
-    """Interleaved padded-vs-triton at one shape — both arms see the same rows.
+    """Interleaved padded vs current-triton vs new-triton at one shape.
+
+    All three arms see the same rows, the same weights and the same gate, so the
+    table is a comparison of the passes and not of two routings. `current-triton`
+    is `fused_bwd=False` (two `dx` GEMMs, a `repeat_interleave` segment rebuild,
+    autograd's combine backward), `new-triton` is the default fused adjoint —
+    the forward is the SAME code on both, which is why their fwd rows should tie
+    and their fwd+bwd rows should not.
 
     Interleaved on purpose: this card's dispatch timings drift a few ms between
     runs of one binary, so measuring one arm to completion and then the other
@@ -312,32 +691,48 @@ def _bench_arms(e: int, d: int, r: int, f: int, tokens: int, cap: float, reps: i
     )
     with torch.no_grad():
         padded = moe._padded_dispatch(x, weight, index, order, keep)
-        triton = moe._triton_dispatch(x, weight, index, order, keep)
-    print(f"[parity] padded-vs-triton max_rel {_rel(triton, padded):.3e}", flush=True)
-    del padded, triton
+        cur = moe._triton_dispatch(x, weight, index, order, keep, fused_bwd=False)
+        new = moe._triton_dispatch(x, weight, index, order, keep, fused_bwd=True)
+    print(
+        f"[parity] padded-vs-new-triton max_rel {_rel(new, padded):.3e}; "
+        f"current-vs-new triton max_rel {_rel(new, cur):.3e}",
+        flush=True,
+    )
+    del padded, cur, new
     torch.cuda.empty_cache()
 
-    xp, xt = x.clone().requires_grad_(True), x.clone().requires_grad_(True)
+    xp, xct, xnt = (x.clone().requires_grad_(True) for _ in range(3))
 
     def fwd_p():
         with torch.no_grad():
             moe._padded_dispatch(x, weight, index, order, keep)
 
-    def fwd_t():
+    def fwd_ct():
         with torch.no_grad():
-            moe._triton_dispatch(x, weight, index, order, keep)
+            moe._triton_dispatch(x, weight, index, order, keep, fused_bwd=False)
+
+    def fwd_nt():
+        with torch.no_grad():
+            moe._triton_dispatch(x, weight, index, order, keep, fused_bwd=True)
 
     def both_p():
         moe._padded_dispatch(xp, weight, index, order, keep).float().pow(2).sum().backward()
 
-    def both_t():
-        moe._triton_dispatch(xt, weight, index, order, keep).float().pow(2).sum().backward()
+    def both_ct():
+        out = moe._triton_dispatch(xct, weight, index, order, keep, fused_bwd=False)
+        out.float().pow(2).sum().backward()
+
+    def both_nt():
+        out = moe._triton_dispatch(xnt, weight, index, order, keep, fused_bwd=True)
+        out.float().pow(2).sum().backward()
 
     runs = {
         "padded fwd": (fwd_p, None),
-        "triton fwd": (fwd_t, None),
+        "current-triton fwd": (fwd_ct, None),
+        "new-triton fwd": (fwd_nt, None),
         "padded fwd+bwd": (both_p, xp),
-        "triton fwd+bwd": (both_t, xt),
+        "current-triton fwd+bwd": (both_ct, xct),
+        "new-triton fwd+bwd": (both_nt, xnt),
     }
     acc: dict[str, list] = {k: [] for k in runs}
     for _ in range(reps):
