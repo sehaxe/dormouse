@@ -116,6 +116,17 @@ NS_KINDS = ("classic", "gram")
 #: with >= 2 members, and the verdict cleared the bar). A name that is not here
 #: is LOUD.
 MUON_COLROW_3D = ("frobenius", "colrow")
+#: The `muon_state_dtype` / `ns_dtype` literals — the rungs of the two precision
+#: knobs (`optim.OPT_DTYPES`, which is where they execute; the list is
+#: duplicated here the way `NS_KINDS` is, so the config layer does not import
+#: the trainer). `fp32` is the default and every number on record. `bf16` =
+#: Muon's momentum STATE stored in bf16 with the accumulation in fp32
+#: (arXiv:2509.23106's compute-high/store-low rung; stochastic rounding is the
+#: NEXT rung and is not implemented) / the Newton–Schulz CHAIN run in bf16 with
+#: explicit fp32 in/out casts (nanogpt's practice, row 4 of
+#: `docs/research/2026-10-16-muon-orthogonalization-cost.md`). Both are opt-in
+#: and approximate by design; a name that is not here is LOUD.
+OPT_DTYPES = ("fp32", "bf16")
 
 
 def _unsupported(default: Any, mechanism: str) -> Any:
@@ -470,6 +481,27 @@ class TrainConfig:
     #: 45x at `[2048, 2048]`); kept as the historical control arm. The 2-D
     #: path (and a shape group with one member) is the same in both arms.
     muon_colrow_3d: str = "colrow"
+
+    #: Muon's momentum STATE dtype (`OPT_DTYPES`, `optim.Muon(state_dtype=...)`).
+    #: `fp32` (the default) is every number on record. `bf16` halves the
+    #: optimizer state — at b1 2.46 GiB -> 1.23 GiB, measured on the instantiated
+    #: model's Muon groups, of which `[64, 5461] x 1024` (the expert bank
+    #: factors) is 1.333 GiB fp32 alone — while the ACCUMULATION stays fp32 and
+    #: only the store rounds (arXiv:2509.23106; the rung's provenance and the
+    #: **not implemented** stochastic-rounding follow-up are in `optim`'s module
+    #: docs, and the gate in `tests/test_muon_fast.py` holds the update to 1e-2
+    #: relative against the fp32 arm). Resume-safe by construction: a snapshot
+    #: that lacks the key fills this default, and a flip on a resume is refused
+    #: by the snapshot drift check (`diff_keys`), so a live run's semantics and
+    #: its resume do not move.
+    muon_state_dtype: str = "fp32"
+    #: The Newton–Schulz CHAIN's dtype (`OPT_DTYPES`): `fp32` (the default) is
+    #: every number on record; `bf16` runs the polynomial — BOTH arms, `classic`
+    #: and `gram` — in bf16 with explicit fp32 in/out casts (nanogpt's practice;
+    #: row 4 of `docs/research/2026-10-16-muon-orthogonalization-cost.md`,
+    #: predicted −100…−200 ms/step at b1, NOT measured on this card yet). The
+    #: orthogonality bound it must keep is gated in `tests/test_muon_fast.py`.
+    ns_dtype: str = "fp32"
     seed: int = 1
     #: WSD warmup, in TOKENS (not steps): the schedule is a function of how
     #: much data the run has seen, so a batch-size change does not change it.
@@ -1088,6 +1120,18 @@ def load_run(
             f"`optim.COLROW_3D` and its parity gate BEFORE the config can lie "
             f"about it."
         )
+    for name in ("muon_state_dtype", "ns_dtype"):
+        rung = getattr(tcfg, name)
+        if rung not in OPT_DTYPES:
+            loud(
+                f"{name}={rung!r} is not a rung. Known: {list(OPT_DTYPES)} — "
+                f"`fp32` is the default and every number on record, `bf16` is the "
+                f"low-precision rung (Muon state: bf16 storage with fp32 "
+                f"accumulation, arXiv:2509.23106; NS chain: bf16 polynomial with "
+                f"explicit fp32 in/out casts, nanogpt's practice). Escape: name one "
+                f"of those, or land the rung in `optim.OPT_DTYPES` and its gate "
+                f"BEFORE the config can lie about it."
+            )
     if model_overrides:
         _refuse_unsupported(ModelConfig, model_overrides, "model")
         import dataclasses as _dc

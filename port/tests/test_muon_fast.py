@@ -142,10 +142,10 @@ def _twin(shapes: dict[tuple[int, int], int], seed: int = 1) -> tuple[nn.Module,
 
 
 def _pair(
-    shapes: dict[tuple[int, int], int], colrow_3d: str = "frobenius"
+    shapes: dict[tuple[int, int], int], colrow_3d: str = "frobenius", **kw
 ) -> tuple[nn.Module, Muon, nn.Module, Muon]:
     a, b = _twin(shapes)
-    kw = {"colrow_3d": colrow_3d}
+    kw = {"colrow_3d": colrow_3d, **kw}
     return a, Muon(a.parameters(), lr=1e-3, **kw), b, Muon(b.parameters(), lr=1e-3, **kw)
 
 
@@ -701,3 +701,323 @@ def test_mix_optimizer_uses_the_fast_path(byte_tensor):
         1 for n, p in model.named_parameters() if p.ndim == 2 and optim.is_muon_param(n, p)
     )
     assert stacked == routed > 0
+
+
+# --- the two dtype rungs (`muon_state_dtype`, `ns_dtype`) --------------------
+#
+# Both are OPT-IN and default to `fp32`, which is every number on record, so the
+# gates below come in three shapes: the default must be the SAME PROGRAM it has
+# always been (bit-exactly), the low-precision rung must be the rung it claims
+# to be (transcribed, not merely "close"), and its deviation from `fp32` must be
+# inside a bound that is DERIVED, not chosen to pass.
+#
+# The state rung's bound, from the arithmetic: the bf16 STORE rounds each element
+# to 8 mantissa bits, i.e. rel `2^-9 = 1.95e-3`; the momentum is an EMA with
+# `mu = 0.95`, so the store's error does not accumulate (it contracts by `mu`
+# each step) and the relative deviation of the buffer stays at the store's own
+# resolution. A Lipschitz constant of the polar factor near 1 then carries it to
+# the update. Measured on the b1-like fixture below: **3.6e-3** worst per-param
+# relative update difference (2.1M elements, 3 steps), 0.9998 elementwise sign
+# agreement, per-param cosine >= 0.999993. The gate is 1e-2 — 2.8x the measured
+# worst — and it is stated as `by design approximate`, not as an equality.
+#
+# Stochastic rounding (arXiv:2509.23106's 8-bit rung) is the NEXT rung and is
+# NOT implemented: this is round-to-nearest storage only.
+
+
+def _bf16_chain_ref(g: torch.Tensor, steps: int = 5) -> torch.Tensor:
+    """The bf16 NS chain, TRANSCRIBED: fp32 in -> bf16 polynomial -> fp32 out.
+
+    Independent of the implementation under test (written from
+    `zeropower_via_ns`'s fp32 body with the two casts), so the gate below is a
+    comparison of two programs. A silent fallback to the fp32 chain fails it.
+    """
+    a, b, c = optim.JORDAN_NS_COEFFS
+    x = g.to(torch.float32)
+    x = x / (x.norm() + 1e-7)
+    transposed = x.shape[0] > x.shape[1]
+    if transposed:
+        x = x.T.contiguous()
+    x = x.to(torch.bfloat16)
+    for _ in range(steps):
+        gram = x @ x.T
+        x = a * x + (b * gram + c * (gram @ gram)) @ x
+    out = x.T.contiguous() if transposed else x
+    return out.to(torch.float32)
+
+
+def _ortho_per_entry(o: torch.Tensor) -> float:
+    """`‖O Oᵀ − I‖_F / rank` on the SMALL side — the AGENTS §2.3 metric."""
+    m, n = o.shape[-2], o.shape[-1]
+    prod = o @ o.transpose(-1, -2) if m <= n else o.transpose(-1, -2) @ o
+    rank = min(m, n)
+    return float((prod - torch.eye(rank)).norm()) / rank
+
+
+def _b1_like_fixture(shape: tuple[int, int], seed: int = 0) -> torch.Tensor:
+    """A momentum-shaped buffer: a decaying spectrum, the real factors' regime.
+
+    A raw Gaussian is NOT the right fixture for an orthogonality bound: the
+    Frobenius prescale leaves its `sigma_max` at ~0.125, so the fp32 chain
+    itself is 5.9e-2 per-entry off the manifold there. The TSCT factors'
+    momentum is a sum of gradients of a low-rank factor, i.e. heavy-spectrum.
+    """
+    gen = torch.Generator().manual_seed(seed)
+    r = min(shape)
+    s = torch.logspace(0, -2, r)
+    return (
+        torch.randn(*shape, generator=gen) @ torch.diag(s)
+        if shape[0] >= shape[1]
+        else torch.diag(s) @ torch.randn(*shape, generator=gen)
+    )
+
+
+def test_the_dtype_rungs_default_to_todays_behaviour_bit_exactly():
+    """The flags are opt-in: the default IS the fp32 program, and so is `fp32`.
+
+    Three statements, all bit-exact: the defaults are `fp32`; the default
+    `Muon` takes the step the pre-change reference takes (the pin above is
+    untouched, this is the same comparison with the dtype knobs in scope); and
+    naming `fp32` EXPLICITLY is the same program as leaving it out, so the
+    default is not a special path.
+    """
+    assert optim.OPT_DTYPES == ("fp32", "bf16")
+    run = load_run("small")
+    assert run.train.muon_state_dtype == "fp32" and run.train.ns_dtype == "fp32"
+    shapes = {(64, 5461): 3, (2048, 64): 3, (256, 256): 2}
+    a, oa, b, ob = _pair(shapes)
+    assert oa.state_dtype == "fp32" and oa.ns_dtype == "fp32"
+    old_batched_step(oa)
+    ob.batched_step_from_model(b)
+    assert _same_params(a, b) and _same_momentum(oa, ob)
+    assert all(g.mom.dtype == torch.float32 for g in ob._groups)
+    assert all(ob.state[p]["momentum"].dtype == torch.float32 for p in ob.param_groups[0]["params"])
+    assert ob.state_dict()["state"][0]["momentum"].dtype == torch.float32
+
+    e, f = _twin(shapes)
+    oe = Muon(e.parameters(), lr=1e-3, colrow_3d="frobenius", state_dtype="fp32", ns_dtype="fp32")
+    of = Muon(f.parameters(), lr=1e-3, colrow_3d="frobenius")
+    oe.batched_step_from_model(e)
+    of.batched_step_from_model(f)
+    assert _same_params(e, f), "the explicit fp32 rung is not the default"
+    assert _same_momentum(oe, of)
+
+
+def test_the_bf16_state_rung_halves_the_state_and_is_finite():
+    """The buffers are bf16, the arithmetic is fp32, the state is exactly half."""
+    shapes = {(64, 5461): 4, (2048, 64): 4, (256, 256): 2}
+    a, oa, b, ob = _pair(shapes, state_dtype="bf16")
+    oa.batched_step_from_model(a)
+    ob.batched_step_from_model(b)
+    assert ob._groups and all(g.mom.dtype == torch.bfloat16 for g in ob._groups)
+    assert all(
+        ob.state[p]["momentum"].dtype == torch.bfloat16 for p in ob.param_groups[0]["params"]
+    )
+    assert all(bool(torch.isfinite(g.mom).all()) for g in ob._groups)
+    assert all(bool(torch.isfinite(p).all()) for p in b.parameters())
+    # the state is EXACTLY half — the memory claim, not an estimate
+    assert sum(g.mom.numel() * g.mom.element_size() for g in ob._groups) * 2 == sum(
+        g.mom.numel() * 4 for g in oa._groups
+    )
+    # ... and the b1 preset's own groups, read off the meta model: 2.46 -> 1.23 GiB
+    b1 = b1_muon_shapes()
+    fp32_bytes = sum(c * s[0] * s[1] * 4 for s, c in b1.items())
+    assert fp32_bytes / 2**30 == pytest.approx(2.4616, abs=1e-3)
+    assert fp32_bytes // 2 / 2**30 == pytest.approx(1.2308, abs=1e-3)
+
+
+def test_the_bf16_state_rung_moves_the_params_the_same_way():
+    """Sign pattern, direction and the 1e-2 bound, on the b1-like fixture.
+
+    The tolerance is DERIVED in the section comment: bf16's store resolution is
+    `2^-9 = 1.95e-3` relative and the EMA does not accumulate it, so a 1e-2 gate
+    is 2.8x the measured worst (3.6e-3) and still fails a rung that lost the
+    fp32 accumulation (which would be ~4e-2 out, `2^-9/(1-mu)`).
+    """
+    shapes = {(64, 5461): 4, (2048, 64): 4, (256, 256): 3, (64, 64): 3}
+    a, b = _twin(shapes)
+    before = [p.detach().clone() for p in a.parameters()]
+    oa = Muon(a.parameters(), lr=1e-3, state_dtype="fp32")
+    ob = Muon(b.parameters(), lr=1e-3, state_dtype="bf16")
+    for _ in range(3):
+        for p, q in zip(a.parameters(), b.parameters(), strict=True):
+            p.grad = q.grad.clone()
+        oa.batched_step_from_model(a)
+        ob.batched_step_from_model(b)
+    n_same = n_el = 0
+    for p, q, p0 in zip(a.parameters(), b.parameters(), before, strict=True):
+        d32 = p.detach() - p0
+        d16 = q.detach() - p0
+        assert bool(torch.isfinite(d16).all())
+        n_same += int((d16.sign() == d32.sign()).sum())
+        n_el += d16.numel()
+        rel = float((d16 - d32).norm() / (d32.norm() + 1e-30))
+        cos = float((d16.flatten() @ d32.flatten()) / (d16.norm() * d32.norm() + 1e-30))
+        assert rel <= 1e-2, f"rel {rel:.3e} at {tuple(d32.shape)}"
+        assert cos >= 0.9999, f"cos {cos:.6f} at {tuple(d32.shape)}"
+    assert n_el > 2_000_000, "the fixture must be b1-sized"
+    assert n_same / n_el >= 0.999, f"sign agreement {n_same}/{n_el}"
+    assert not _same_params(a, b), "the rung moved nothing — it is inert"
+
+
+def test_the_bf16_state_rung_accumulates_in_fp32_then_stores_bf16():
+    """Step 1 of the bf16 rung is the fp32 rung's momentum ROUNDED to bf16.
+
+    That is the whole claim of the rung, and it is checkable exactly at step 1
+    (both rungs start from a zero buffer, so the fp32 accumulation is the same
+    program): a bf16 ACCUMULATION would round `(1-mu)·g` in bf16 and the two
+    would differ. From step 2 the buffers are different inputs to the same
+    recurrence, which is why the deviation gate above is a tolerance.
+    """
+    shapes = {(64, 5461): 2, (2048, 64): 2}
+    a, b = _twin(shapes)
+    oa = Muon(a.parameters(), lr=1e-3, state_dtype="fp32")
+    ob = Muon(b.parameters(), lr=1e-3, state_dtype="bf16")
+    oa.batched_step_from_model(a)
+    ob.batched_step_from_model(b)
+    for g32, g16 in zip(oa._groups, ob._groups, strict=True):
+        assert g16.mom.dtype == torch.bfloat16
+        assert torch.equal(g16.mom, g32.mom.to(torch.bfloat16)), (
+            f"the bf16 rung is not round_bf16(fp32 accumulate) at {tuple(g32.mom.shape)}"
+        )
+
+
+def test_the_bf16_ns_chain_is_the_transcribed_program():
+    """`ns_dtype="bf16"` runs the transcribed bf16 chain — bit-exactly.
+
+    And it is a DIFFERENT program from the fp32 chain on the same input, which
+    is the "the arm must show it ran" half: a silent fallback passes nothing
+    here.
+    """
+    g = torch.randn(64, 5461, generator=torch.Generator().manual_seed(0)) * 0.05
+    got = zeropower_via_ns(g, 5, "classic", ns_dtype="bf16")
+    assert got.dtype == torch.float32, "the output cast must be explicit fp32"
+    assert torch.equal(got, _bf16_chain_ref(g)), "the bf16 rung is not the transcribed chain"
+    assert not torch.equal(got, zeropower_via_ns(g, 5, "classic")), "the bf16 rung is inert"
+    # the batched (3-D) branch runs the same chain, per slice
+    x = torch.randn(3, 64, 5461, generator=torch.Generator().manual_seed(1)) * 0.05
+    b3 = zeropower_via_ns(x, 5, "classic", ns_dtype="bf16")
+    per = torch.stack([zeropower_via_ns(x[i], 5, "classic", ns_dtype="bf16") for i in range(3)])
+    assert float((b3 - per).norm() / per.norm()) <= 1e-2  # measured 0.0 on this fixture
+
+
+@pytest.mark.parametrize("kind", optim.NS_KINDS)
+@pytest.mark.parametrize("shape", [(2048, 64), (64, 5461)])
+def test_the_bf16_ns_chain_keeps_the_polar_property(shape, kind):
+    """The bf16 chain stays on the manifold as well as the fp32 chain does.
+
+    The bound is stated RELATIVE to the fp32 arm, because the absolute number is
+    a property of the input, not of the rung: on this heavy-spectrum fixture the
+    fp32 chain itself sits 4.3e-2 per-entry off `O Oᵀ = I` (5 NS iterations at
+    `sigma_max ~= 1.2`), and bf16 must not make that materially worse. Measured
+    worst ratio across the four arms: 1.02. Gate: 1.1x and <= 6e-2 absolute.
+    """
+    g = _b1_like_fixture(shape)
+    ref = zeropower_via_ns(g, 5, kind)
+    got = zeropower_via_ns(g, 5, kind, ns_dtype="bf16")
+    o32, o16 = _ortho_per_entry(ref), _ortho_per_entry(got)
+    assert bool(torch.isfinite(got).all())
+    assert o16 <= 1.1 * o32, f"ortho {o16:.3e} vs fp32 {o32:.3e} at {shape}/{kind}"
+    assert o16 <= 6e-2, o16
+
+
+@pytest.mark.parametrize("kind", optim.NS_KINDS)
+def test_the_bf16_ns_chain_keeps_the_spectrum_bounds_the_fp32_gate_states(kind):
+    """The existing polar assertion's shape, with the bf16 rung in.
+
+    `test_train.py::test_muon_update_compresses_the_spectrum_and_is_not_a_copy`
+    states the property Muon's lr is calibrated against (a ~1-scale update with
+    the spread squeezed out); the same fixture and the same bounds must hold
+    when the polynomial runs in bf16.
+    """
+    heavy = torch.randn(64, 8, generator=torch.Generator().manual_seed(0)) @ torch.diag(
+        torch.logspace(0, -2, 8)
+    )
+    o = zeropower_via_ns(heavy, 5, kind, ns_dtype="bf16")
+    s_out = torch.linalg.svdvals(o)
+    assert float(s_out[0] / s_out[-1]) < 2.0, "the spectrum must be compressed"
+    assert 0.5 < float(s_out[-1]) and float(s_out[0]) < 1.2, "the update scale must be ~1"
+
+
+@pytest.mark.parametrize("state_dtype", optim.OPT_DTYPES)
+def test_the_state_dict_round_trips_on_both_state_rungs(state_dtype):
+    """Save -> load -> the SAME next step, on `fp32` and on `bf16`.
+
+    The historical format (one `momentum` tensor per parameter) is what
+    `state_dict` emits either way; on the bf16 rung torch's loader upcasts the
+    stored tensor to the param's fp32 dtype and `_build_groups` casts it back
+    down, which is value-preserving because bf16 -> fp32 -> bf16 is exact.
+    """
+    shapes = {(64, 5461): 4, (2048, 64): 4, (256, 256): 2}
+    a, oa, b, ob = _pair(shapes, state_dtype=state_dtype)
+    oa.batched_step_from_model(a)
+    ob.batched_step_from_model(b)
+    assert _same_params(a, b) and _same_momentum(oa, ob)  # one program, two runs
+
+    sd = oa.state_dict()
+    want = torch.bfloat16 if state_dtype == "bf16" else torch.float32
+    assert sd["state"][0]["momentum"].dtype == want
+    fresh = shape_model(shapes)
+    resumed = Muon(fresh.parameters(), lr=1e-3, colrow_3d="frobenius", state_dtype=state_dtype)
+    resumed.load_state_dict(sd)
+    assert len(resumed._groups) == 3, "the loader must restack per shape"
+    for i, p in enumerate(resumed.param_groups[0]["params"]):
+        assert torch.equal(resumed.state[p]["momentum"], sd["state"][i]["momentum"])
+        assert resumed.state[p]["momentum"].dtype == want
+
+    c, d = _twin(shapes)
+    d.load_state_dict(a.state_dict())
+    for p, q in zip(a.parameters(), c.parameters(), strict=True):
+        p.grad = q.grad.clone()
+    resumed = Muon(d.parameters(), lr=1e-3, colrow_3d="frobenius", state_dtype=state_dtype)
+    resumed.load_state_dict(sd)
+    oa.batched_step_from_model(a)
+    resumed.batched_step_from_model(d)
+    assert _same_params(a, d), "the resumed optimizer's next step diverged"
+    assert _same_momentum(oa, resumed)
+
+
+def test_the_mix_optimizer_carries_both_rungs_and_the_config_round_trips():
+    """The knobs are real config keys, they reach `Muon`, and a flip is refused
+    on a resume (`diff_keys`) — the two reasons a live run cannot drift."""
+    model = DormouseModel(tiny_cfg())
+    opt = MixOptimizer(model, lr=1e-3, wd=0.0, muon_state_dtype="bf16", ns_dtype="bf16")
+    assert opt.muon.state_dtype == "bf16" and opt.muon.ns_dtype == "bf16"
+    assert MixOptimizer(model, lr=1e-3, wd=0.0).muon.state_dtype == "fp32"
+    run = load_run("small", train_overrides={"muon_state_dtype": "bf16", "ns_dtype": "bf16"})
+    assert 'muon_state_dtype = "bf16"' in run.snapshot_toml()
+    assert 'ns_dtype = "bf16"' in run.snapshot_toml()
+    assert run.diff_keys(load_run("small")) == ["train.muon_state_dtype", "train.ns_dtype"]
+    # a snapshot that LACKS the keys fills the default (resume-safe by construction)
+    older = (
+        run.snapshot_toml()
+        .replace('muon_state_dtype = "bf16"\n', "")
+        .replace('ns_dtype = "bf16"\n', "")
+    )
+    from dormouse.config import RunConfig
+
+    assert RunConfig.from_snapshot(older).train.muon_state_dtype == "fp32"
+
+
+def test_a_bad_dtype_rung_is_loud_everywhere_it_can_be_set():
+    from dormouse.instrument import LoudError
+
+    model = DormouseModel(tiny_cfg())
+    for field, build in (
+        ("state_dtype", lambda: Muon([nn.Parameter(torch.zeros(8, 8))], state_dtype="fp16")),
+        (
+            "muon_state_dtype",
+            lambda: MixOptimizer(model, lr=1e-3, wd=0.0, muon_state_dtype="float32"),
+        ),
+        (
+            "muon_state_dtype",
+            lambda: load_run("small", train_overrides={"muon_state_dtype": "fp16"}),
+        ),
+        ("ns_dtype", lambda: zeropower_via_ns(torch.randn(4, 4), 5, ns_dtype="float16")),
+        ("ns_dtype", lambda: Muon([nn.Parameter(torch.zeros(8, 8))], ns_dtype="Bf16")),
+        ("ns_dtype", lambda: MixOptimizer(model, lr=1e-3, wd=0.0, ns_dtype="fp16")),
+        ("ns_dtype", lambda: load_run("small", train_overrides={"ns_dtype": "bf16x"})),
+    ):
+        with pytest.raises(LoudError) as e:
+            build()
+        assert f"{field}=" in str(e.value) and "bf16" in str(e.value), str(e.value)

@@ -34,6 +34,20 @@ The update is `burn-muon-plus`'s, not a re-derivation:
   TRANSPOSED orientation when the matrix is tall, i.e. in the `[r, r]` Gram
   space of the smaller side — the burn economics that keeps `[768, 768]` out
   of fp32 NS entirely.
+* Two precision **rungs**, both `fp32` by default so a live run's semantics and
+  its resume do not change:
+  - `muon_state_dtype` (`fp32` | `bf16`) stores the momentum buffers in bf16
+    while the ACCUMULATION stays fp32. Source: arXiv:2509.23106 — a Muon variant
+    with a low-precision state (bf16/8-bit storage with stochastic rounding,
+    confirmed at the 8-bit rung); the citation comes from the task that
+    specified this rung, **the paper itself was not read here**. This port
+    implements the bf16 rung with a round-to-nearest store; **stochastic
+    rounding is the NEXT rung and is not implemented here**, so the rung is
+    approximate by design (gate: `tests/test_muon_fast.py`).
+  - `ns_dtype` (`fp32` | `bf16`) runs the Newton–Schulz chain in bf16 with
+    explicit fp32 in/out casts — nanogpt's practice, row 4 of
+    `docs/research/2026-10-16-muon-orthogonalization-cost.md` (predicted
+    −100…−200 ms at b1, NOT measured here: this file prices nothing).
 """
 
 from __future__ import annotations
@@ -60,6 +74,12 @@ NS_KINDS = ("classic", "gram")
 #: and the A/B it owed are in `colrow_normalize`'s docstring and
 #: `tests/test_muon_fast.py`.
 COLROW_3D = ("frobenius", "colrow")
+
+#: The rungs of BOTH precision knobs (`muon_state_dtype`, `ns_dtype`):
+#: `fp32` is the default and every number on record; `bf16` is the storage /
+#: chain rung below it. A name that is not here is refused at the door, at the
+#: config layer (`config.OPT_DTYPES` mirrors this tuple) and at the constructor.
+OPT_DTYPES = ("fp32", "bf16")
 
 #: Where Gram-NS restarts: 0-based iteration indices, exactly the reference's
 #: `gram_newton_schulz_reset_iterations` default (`[2]`, i.e. a restart before
@@ -112,18 +132,47 @@ def _check_colrow_3d(arm: str) -> None:
         )
 
 
+def _check_dtype(field: str, rung: str) -> None:
+    """A rung that is not implemented is LOUD, naming both rungs and the escape."""
+    if rung not in OPT_DTYPES:
+        loud(
+            f"{field}={rung!r} is not a rung. Known: {list(OPT_DTYPES)} — `fp32` "
+            f"is the default and every number on record, `bf16` is the low-precision "
+            f"rung (Muon state: bf16 storage with fp32 accumulation, "
+            f"arXiv:2509.23106; NS chain: bf16 polynomial with fp32 in/out casts, "
+            f"nanogpt's practice). Escape: name one of those, or land the rung in "
+            f"`optim.OPT_DTYPES` with its gate BEFORE the config can lie about it."
+        )
+
+
+def _torch_dtype(rung: str) -> torch.dtype:
+    """The torch dtype a checked rung stores in (`fp32` maps to `torch.float32`)."""
+    return torch.bfloat16 if rung == "bf16" else torch.float32
+
+
 def zeropower_via_ns(
     g: torch.Tensor,
     steps: int = 5,
     kind: str = "classic",
     gram_restarts: tuple[int, ...] = GRAM_NS_RESTARTS,
+    ns_dtype: str = "fp32",
 ) -> torch.Tensor:
-    """The polar factor's polynomial approximation, matrix-only, fp32.
+    """The polar factor's polynomial approximation, matrix-only, fp32 by default.
 
     `kind` selects the arm (`NS_KINDS`): `classic` is the recurrence this port
     has always run; `gram` is Gram Newton–Schulz — the same polynomial,
     iterated on the `[r, r]` Gram and applied once at the end, so the two
     rectangular matmuls per iteration are gone (`_gram_via_ns`).
+
+    `ns_dtype` (`OPT_DTYPES`) is the chain's own dtype: `fp32` is the default
+    and every number on record; `bf16` runs the polynomial in bf16 with
+    **explicit fp32 casts at the door and at the exit** — the input is upcast
+    and the Frobenius prescale runs in fp32 (it is one pass and it is what the
+    polynomial's conditioning rests on), then the chain runs in bf16 and the
+    result is returned in fp32. nanogpt's practice (row 4 of
+    `docs/research/2026-10-16-muon-orthogonalization-cost.md`); the rung is
+    approximate by design and the orthogonality gate is in
+    `tests/test_muon_fast.py`.
 
     The batched form accepts `[N, d0, d1]`: the polynomial is ELEMENTWISE in
     the leading batch dim (a Gram per slice), and `x @ x.T` broadcasts
@@ -132,8 +181,9 @@ def zeropower_via_ns(
     body, no second implementation exists here).
     """
     _check_ns_kind(kind)
+    _check_dtype("ns_dtype", ns_dtype)
     if kind == "gram":
-        return _gram_via_ns(g, steps=steps, restarts=gram_restarts)
+        return _gram_via_ns(g, steps=steps, restarts=gram_restarts, ns_dtype=ns_dtype)
     if g.ndim == 2:
         a, b, c = JORDAN_NS_COEFFS
         x = g.to(torch.float32)
@@ -141,11 +191,13 @@ def zeropower_via_ns(
         transposed = x.shape[0] > x.shape[1]
         if transposed:
             x = x.T.contiguous()
+        x = x.to(_torch_dtype(ns_dtype))
         for _ in range(steps):
             gram = x @ x.T
             poly = b * gram + c * (gram @ gram)
             x = a * x + poly @ x
-        return x.T.contiguous() if transposed else x
+        out = x.T.contiguous() if transposed else x
+        return out.to(torch.float32)
     assert g.ndim == 3, f"NS is matrix-only or [N,d0,d1] batched, got shape {tuple(g.shape)}"
     a, b, c = JORDAN_NS_COEFFS
     x = g.to(torch.float32)
@@ -153,15 +205,21 @@ def zeropower_via_ns(
     transposed = x.shape[1] > x.shape[2]
     if transposed:
         x = x.transpose(1, 2).contiguous()
+    x = x.to(_torch_dtype(ns_dtype))
     for _ in range(steps):
         gram = x @ x.transpose(1, 2)
         poly = b * gram + c * (gram @ gram)
         x = a * x + poly @ x
-    return x.transpose(1, 2).contiguous() if transposed else x
+    out = x.transpose(1, 2).contiguous() if transposed else x
+    return out.to(torch.float32)
 
 
 def _gram_via_ns(
-    g: torch.Tensor, *, steps: int, restarts: tuple[int, ...] = GRAM_NS_RESTARTS
+    g: torch.Tensor,
+    *,
+    steps: int,
+    restarts: tuple[int, ...] = GRAM_NS_RESTARTS,
+    ns_dtype: str = "fp32",
 ) -> torch.Tensor:
     """Gram Newton–Schulz: the classic recurrence, regrouped on the Gram.
 
@@ -177,6 +235,9 @@ def _gram_via_ns(
     arm already works in (`zeropower_via_ns` transposes when `rows > cols`).
     `restarts` are 0-based iteration indices at which to re-materialize `X` (the
     reference's `gram_newton_schulz_reset_iterations`, default `(2,)`).
+
+    `ns_dtype` is the chain's own dtype (see `zeropower_via_ns`): the Gram, `Q`
+    and the eye all follow it, and the fp32 in/out casts are explicit.
 
     The recurrence, with `P(R) = a·I + b·R + c·R²`:
 
@@ -206,18 +267,20 @@ def _gram_via_ns(
     the speed, only by the equivalence gate (`tests/test_muon_gram.py`).
 
     NOT transcribed, deliberately: the reference's step 2, `X → float16(X)`.
-    This port's NS is fp32; a bf16 NS chain is a separate, unmeasured arm
-    (row 4 of `docs/research/2026-10-16-muon-orthogonalization-cost.md`). Its
-    CuTeDSL symmetric-GEMM kernels are Hopper/Blackwell-only and are not
+    This port runs `ns_dtype` (`fp32` by default; `bf16` is the same cast with
+    the port's own dtype rung — row 4 of the cost note). Its CuTeDSL
+    symmetric-GEMM kernels are Hopper/Blackwell-only and are not
     ported either — this is the ALGORITHM, in torch.
     """
     a, b, c = JORDAN_NS_COEFFS
+    _check_dtype("ns_dtype", ns_dtype)
     assert g.ndim in (2, 3), f"NS is matrix-only or [N,d0,d1] batched, got shape {tuple(g.shape)}"
     x = g.to(torch.float32)
     x = x / (x.norm(dim=(-1, -2), keepdim=True) + 1e-7)
     transposed = x.shape[-2] > x.shape[-1]
     if transposed:
         x = x.transpose(-1, -2).contiguous()
+    x = x.to(_torch_dtype(ns_dtype))
     eye = torch.eye(x.shape[-2], dtype=x.dtype, device=x.device)
     restart = set(restarts)
     q: torch.Tensor | None = None
@@ -233,7 +296,8 @@ def _gram_via_ns(
             rz = gram @ z + a * gram
             gram = z @ rz + a * rz
     out = x if q is None else q @ x  # `q is None` only at steps == 0
-    return out.transpose(-1, -2).contiguous() if transposed else out
+    out = out.transpose(-1, -2).contiguous() if transposed else out
+    return out.to(torch.float32)
 
 
 def colrow_normalize(x: torch.Tensor, eps: float = 1e-7, *, colrow_3d: str = "colrow"):
@@ -293,13 +357,14 @@ def colrow_normalize_(x: torch.Tensor, eps: float = 1e-7, *, colrow_3d: str = "c
 class _MomGroup:
     """One shape group's canonical STACKED momentum buffer.
 
-    `mom` is `[N, d0, d1]` fp32 and it IS the state: `state[p]["momentum"]` is
+    `mom` is `[N, d0, d1]` and it IS the state: `state[p]["momentum"]` is
     a view of row `i`, so the step never stacks the group in and copies it back
     (at b1 that was 3 x 1.33 GiB of fp32 traffic per step for the `[64, 5461]`
     expert writes alone, plus the allocator churn of a fresh 1.33 GiB block
     every step). The checkpoint format is unchanged — `Optimizer.state_dict`
     still emits one `momentum` tensor per parameter, and `load_state_dict`
-    rebuilds the stack from them once.
+    rebuilds the stack from them once. `mom.dtype` is the group's
+    `state_dtype` rung (`fp32` by default).
     """
 
     __slots__ = ("gi", "shape", "params", "mom")
@@ -311,8 +376,41 @@ class _MomGroup:
         self.mom = mom
 
 
+def _momentum_update_(mom: torch.Tensor, params: list, mu: float) -> None:
+    """`m ← mu·m + (1-mu)·g`, in place over a stacked buffer, one fused pass.
+
+    `fp32` (the default): `mom.mul_(mu)` + ONE `_foreach_add_` over the rows —
+    the path this port has always run, untouched.
+
+    `bf16`: the ACCUMULATION is fp32 and only the STORE rounds to bf16
+    (arXiv:2509.23106's rung, cited in the module docstring). One fp32 temporary
+    per CHUNK carries the arithmetic (`MUON_CHUNK_ELEMS` caps it at 134 MiB) and
+    the store is one cast-copy per chunk: an unchunked fp32 temporary of the b1
+    `[1024, 64, 5461]` group alone is 1.33 GiB, which is the size that OOM'd the
+    warm attempts (audit MAJOR 7, `~/logs/b1warm.log`), so the chunking is what
+    makes the bf16 rung a memory win instead of a memory-neutral one.
+    """
+    if mom.dtype != torch.bfloat16:
+        mom.mul_(mu)
+        torch._foreach_add_(torch.unbind(mom, 0), [p.grad for p in params], alpha=1.0 - mu)
+        return
+    n = len(params)
+    n_chunk = max(1, min(n, MUON_CHUNK_ELEMS // mom[0].numel()))
+    for start in range(0, n, n_chunk):
+        chunk = params[start : start + n_chunk]
+        acc = mom[start : start + n_chunk].to(torch.float32)
+        acc.mul_(mu)
+        torch._foreach_add_(torch.unbind(acc, 0), [p.grad for p in chunk], alpha=1.0 - mu)
+        mom[start : start + n_chunk].copy_(acc)
+
+
 class Muon(Optimizer):
-    """Momentum + polar orthogonalization on 2-D parameters, fp32."""
+    """Momentum + polar orthogonalization on 2-D parameters.
+
+    Both precision knobs (`OPT_DTYPES`) default to `fp32`, which is the
+    behaviour every number on record ran; `state_dtype="bf16"` halves the
+    momentum state, `ns_dtype="bf16"` runs the polynomial in bf16.
+    """
 
     def __init__(
         self,
@@ -324,19 +422,26 @@ class Muon(Optimizer):
         ns_kind: str = "classic",
         gram_restarts: tuple[int, ...] = GRAM_NS_RESTARTS,
         colrow_3d: str = "colrow",
+        state_dtype: str = "fp32",
+        ns_dtype: str = "fp32",
     ) -> None:
         _check_ns_kind(ns_kind)
         _check_colrow_3d(colrow_3d)
+        _check_dtype("state_dtype", state_dtype)
+        _check_dtype("ns_dtype", ns_dtype)
         #: The arm and its restart positions live on the OPTIMIZER, not in the
         #: param group: the group is what `Optimizer.load_state_dict` REPLACES
         #: with the checkpoint's copy, so a key added today would KeyError on
         #: every checkpoint written before it. The arm is already pinned across
         #: a resume by the config snapshot (`train.ns_kind` is not a progress
         #: key, so `RunConfig::diff_keys` refuses a flip) — one place, not two.
-        #: `colrow_3d` follows the same rule (`train.muon_colrow_3d`).
+        #: `colrow_3d` follows the same rule (`train.muon_colrow_3d`), and so do
+        #: the two dtype rungs (`train.muon_state_dtype` / `train.ns_dtype`).
         self.ns_kind = ns_kind
         self.gram_restarts = gram_restarts
         self.colrow_3d = colrow_3d
+        self.state_dtype = state_dtype
+        self.ns_dtype = ns_dtype
         super().__init__(params, dict(lr=lr, momentum=momentum, ns_steps=ns_steps))
         #: One stacked momentum buffer per (param group, shape) — the canonical
         #: state, built lazily by `_build_groups` and rebuilt after a load.
@@ -358,7 +463,12 @@ class Muon(Optimizer):
                 if p.ndim == 2:
                     by_shape.setdefault((p.shape[0], p.shape[1]), []).append(p)
             for shape, params in by_shape.items():
-                mom = torch.zeros(len(params), *shape, dtype=torch.float32, device=params[0].device)
+                mom = torch.zeros(
+                    len(params),
+                    *shape,
+                    dtype=_torch_dtype(self.state_dtype),
+                    device=params[0].device,
+                )
                 for i, p in enumerate(params):
                     prev = self.state[p].get("momentum")
                     if prev is not None:
@@ -375,6 +485,12 @@ class Muon(Optimizer):
 
     @torch.no_grad()
     def step(self, closure=None):  # noqa: D102 - torch's Optimizer contract
+        """The per-param step: `_step_one` per parameter, nothing else.
+
+        `MixOptimizer` runs the batched path; this is the Optimizer contract
+        and the definition, in one place so the two dtype rungs cannot drift
+        between a batched and a per-param implementation.
+        """
         loss = None if closure is None else closure()
         for group in self.param_groups:
             lr, mu, ns = group["lr"], group["momentum"], group["ns_steps"]
@@ -384,17 +500,21 @@ class Muon(Optimizer):
                 g = p.grad
                 if g.ndim != 2:
                     loud(f"Muon got a rank-{g.ndim} gradient: the router must not send it here")
-                state = self.state[p]
-                if "momentum" not in state:
-                    state["momentum"] = torch.zeros_like(g)
-                buf = state["momentum"]
-                buf.mul_(mu).add_(g, alpha=1.0 - mu)
-                update = colrow_normalize(
-                    zeropower_via_ns(buf, ns, self.ns_kind, self.gram_restarts)
-                )
                 scale = max(1.0, p.shape[0] / p.shape[1]) ** 0.5
-                p.add_(update.to(p.dtype), alpha=-lr * scale)
+                self._step_one(p, lr, mu, ns, scale)
         return loss
+
+    def _orthogonalize(self, x: torch.Tensor, steps: int) -> torch.Tensor:
+        """The NS call, with the rung forwarded only when it is NOT the default.
+
+        The `fp32` rung therefore passes the four arguments every gate, spy and
+        pin in this tree was written against (`tests/test_muon_gram.py`'s
+        `test_the_requested_arm_is_the_arm_that_runs` transcribes exactly that
+        signature), and the default path's call shape does not move.
+        """
+        if self.ns_dtype == "fp32":
+            return zeropower_via_ns(x, steps, self.ns_kind, self.gram_restarts)
+        return zeropower_via_ns(x, steps, self.ns_kind, self.gram_restarts, self.ns_dtype)
 
     def _step_one(self, p: torch.Tensor, lr: float, mu: float, ns: int, scale: float) -> None:
         """The per-param update — the reference the batched path must match.
@@ -403,14 +523,19 @@ class Muon(Optimizer):
         rare group where a 2-D parameter carries no gradient (a shape with one
         live member is not worth a batch). It reads and writes
         `state[p]["momentum"]`, which on a built group is a VIEW of the stacked
-        buffer, so both paths share one state.
+        buffer, so both paths share one state. On the `bf16` rung the view is
+        bf16 and the update goes through an fp32 temporary (`_momentum_update_`'s
+        arithmetic, one parameter at a time).
         """
         state = self.state[p]
         if "momentum" not in state:
-            state["momentum"] = torch.zeros_like(p.grad)
+            state["momentum"] = torch.zeros_like(p.grad, dtype=_torch_dtype(self.state_dtype))
         buf = state["momentum"]
-        buf.mul_(mu).add_(p.grad, alpha=1.0 - mu)
-        update = colrow_normalize(zeropower_via_ns(buf, ns, self.ns_kind, self.gram_restarts))
+        if buf.dtype == torch.bfloat16:
+            buf.copy_(buf.float().mul_(mu).add_(p.grad, alpha=1.0 - mu))
+        else:
+            buf.mul_(mu).add_(p.grad, alpha=1.0 - mu)
+        update = colrow_normalize(self._orthogonalize(buf, ns))
         with torch.no_grad():
             p.add_(update.to(p.dtype), alpha=-lr * scale)
 
@@ -431,7 +556,9 @@ class Muon(Optimizer):
         buffer is the STATE (`_build_groups`), the momentum update is
         `mom.mul_(mu)` + ONE fused `_foreach_add_` over its own rows (the
         gradient stack is gone with it), and the writes are in place. What
-        remains per step is the NS chain and the final `_foreach_add_`.
+        remains per step is the NS chain and the final `_foreach_add_`. On the
+        `bf16` state rung the same update runs with an fp32 accumulate and a
+        bf16 store, one chunk temporary at a time (`_momentum_update_`).
         """
         if not self._groups:
             self._build_groups()
@@ -454,9 +581,9 @@ class Muon(Optimizer):
                 continue
             mom = grp.mom
             # The momentum update, in place, without a stack: `mom` is the
-            # buffer and `torch.unbind` hands out its rows as views.
-            mom.mul_(mu)
-            torch._foreach_add_(torch.unbind(mom, 0), [p.grad for p in params], alpha=1.0 - mu)
+            # buffer and `torch.unbind` hands out its rows as views
+            # (`_momentum_update_` carries the two dtype rungs' arithmetic).
+            _momentum_update_(mom, params, mu)
             n = len(params)
             # Chunk the shape stack: the cap is fp32 ELEMENTS per stacked
             # buffer (`MUON_CHUNK_ELEMS`), so NS never materializes the whole
@@ -464,9 +591,7 @@ class Muon(Optimizer):
             n_chunk = max(1, min(n, MUON_CHUNK_ELEMS // (grp.shape[0] * grp.shape[1])))
             for start in range(0, n, n_chunk):
                 params_c = params[start : start + n_chunk]
-                update = zeropower_via_ns(
-                    mom[start : start + n_chunk], ns, self.ns_kind, self.gram_restarts
-                )
+                update = self._orthogonalize(mom[start : start + n_chunk], ns)
                 # In place: `update` is a fresh tensor the optimizer owns (NS
                 # always allocates on its first `x / (norm + eps)`), and the
                 # write-back is FOREACH — per-param copies are what kept 5221
@@ -516,6 +641,8 @@ class MixOptimizer:
         ns_kind: str = "classic",
         gram_restarts: tuple[int, ...] = GRAM_NS_RESTARTS,
         colrow_3d: str = "colrow",
+        muon_state_dtype: str = "fp32",
+        ns_dtype: str = "fp32",
         betas: tuple[float, float] = (0.9, 0.95),
         eps: float = 1e-8,
     ) -> None:
@@ -523,6 +650,8 @@ class MixOptimizer:
             loud(f"opt={opt!r}: known optimizers are 'mix' (default) and 'adamw'")
         _check_ns_kind(ns_kind)
         _check_colrow_3d(colrow_3d)
+        _check_dtype("muon_state_dtype", muon_state_dtype)
+        _check_dtype("ns_dtype", ns_dtype)
         muon_params: list[nn.Parameter] = []
         adamw_params: list[nn.Parameter] = []
         self.routing: dict[str, str] = {}
@@ -541,6 +670,8 @@ class MixOptimizer:
                 ns_kind=ns_kind,
                 gram_restarts=gram_restarts,
                 colrow_3d=colrow_3d,
+                state_dtype=muon_state_dtype,
+                ns_dtype=ns_dtype,
             )
             if muon_params
             else None
