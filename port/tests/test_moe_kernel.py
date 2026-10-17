@@ -140,6 +140,41 @@ def test_triton_backward_matches_the_padded_autograd(bf16, bound):
 
 
 @CUDA
+@pytest.mark.parametrize("arm", ["fused", "split"])
+def test_both_glu_forward_arms_are_the_same_function_and_trainable(arm, monkeypatch):
+    """`glu_arm`'s two forwards: the padded bank's numbers, and live gradients.
+
+    The shipped forward is E-dependent (`mk.glu_arm` / `mk.FUSED_GLU_MIN_E`), so
+    at the tiny E=4 fixture only ONE arm would ever run and the other would go
+    unmeasured. Patching the boundary is what forces each — and the SPLIT arm is
+    the one that needs saying: its `y` comes from `expert_gemm`, a plain grouped
+    GEMM with no autograd of its own, so "the backward still reaches every expert
+    parameter" is the thing to check rather than assume (the adjoint is
+    `_ExpertGemmGlu`'s in either case and never walks a graph through `v`).
+    """
+    monkeypatch.setattr(mk, "FUSED_GLU_MIN_E", 1 if arm == "fused" else 1 << 30)
+    assert mk.glu_arm(4) == arm
+    moe = _moe()
+    x = torch.randn(64, moe.d, device=DEV)
+    index, weight = _routing(moe, x)
+    order, keep, _ = moe._permute(index)
+    with torch.no_grad():
+        padded = moe._padded_dispatch(x, weight, index, order, keep)
+        got = moe._triton_dispatch(x, weight, index, order, keep)
+    rel = _rel(got, padded)
+
+    moe.zero_grad(set_to_none=True)
+    xi = x.detach().clone().requires_grad_(True)
+    out = moe._triton_dispatch(xi, weight, index, order, keep)
+    out.float().pow(2).mean().backward()
+    dead = [n for n, p in moe.experts.named_parameters() if p.grad is None]
+    print(f"[glu arm] {arm} E={moe.n_experts} parity-vs-padded={rel:.3e} dead={dead}")
+    assert rel <= 1e-5, f"{arm}: {rel:.3e} vs the padded bank"
+    assert not dead, f"{arm}: the forward left {dead} without a gradient"
+    assert xi.grad is not None and torch.isfinite(xi.grad).all()
+
+
+@CUDA
 def test_ragged_offsets_hold_for_empty_and_short_groups():
     """`offs` is the whole contract: an empty group is legal, a short one too."""
     torch.manual_seed(0)
@@ -218,6 +253,25 @@ def test_unknown_moe_kernel_is_loud_and_the_literals_are_declared():
     assert MOE_KERNELS == ("padded", "triton", "naive")
     for name in MOE_KERNELS:
         validate(ModelConfig(moe_kernel=name))
+
+
+def test_the_glu_arm_is_e_dependent():
+    """`glu_arm` is a pure function of E, and its boundary is a pinned literal.
+
+    Both arms compute the same `y` and share the backward, so the choice is pure
+    speed — and its boundary is a SWEPT CONSTANT: the bench measured E=8 and
+    E=1024 and nothing in between. Pinning it here is what makes the bench's
+    assertion ("the shipped arm is not beaten by >10%") a statement about a
+    choice rather than about whatever the constant happens to be.
+    """
+    if mk is None:
+        pytest.skip("no triton in this build")
+    assert mk.FUSED_GLU_MIN_E == 64, "the swept boundary is a module literal"
+    assert mk.glu_arm(8) == "split" and mk.glu_arm(1024) == "fused"
+    assert mk.glu_arm(mk.FUSED_GLU_MIN_E) == "fused"
+    assert mk.glu_arm(mk.FUSED_GLU_MIN_E - 1) == "split"
+    with pytest.raises(AssertionError):
+        mk.glu_arm(0)
 
 
 def test_dispatch_counts_the_triton_fallback_on_cpu():
@@ -752,8 +806,11 @@ def _bench_variants(moe, x, index, order, keep, cap, reps=6) -> None:
     """The op's own kernels, chrome removed: fused (h in registers) vs split.
 
     The study's step-2 note asks for both and says ship the faster; this is the
-    measurement that picks. `mk.TILES` is what ships, so both variants carry the
-    same tile choices and the difference is only where `h` lives.
+    measurement that picks, and the pick is E-DEPENDENT (`mk.glu_arm` /
+    `mk.FUSED_GLU_MIN_E`): measured 2026-10-17, the split pair is 2x faster at
+    E=8 (0.184 vs 0.375 ms) and the fused kernel 1.35x faster at b1's E=1024
+    (4.699 vs 6.335). So the gate asserts on the arm that SHIPS at this E — a
+    reading that wins on the arm the trainer does not run is not a gate.
     """
     n, k = index.shape
     dt = moe._bank_dtype()
@@ -771,20 +828,24 @@ def _bench_variants(moe, x, index, order, keep, cap, reps=6) -> None:
         )
         return mk.expert_gemm(h, v, offs, cap=cap)
 
+    chosen = mk.glu_arm(moe.n_experts)
     with torch.no_grad():
         fused = _timed(
             lambda: mk.expert_gemm_glu(xg, gate_u, up_u, gate_s, up_s, v, offs, cap=cap), reps, 1
         )[0]
         sp = _timed(split, reps, 1)[0]
+    mine, theirs = (fused, sp) if chosen == "fused" else (sp, fused)
     print(
-        f"[kernel] fused {fused:.3f} ms | split (head + @v) {sp:.3f} ms | "
-        f"shipped: fused (TILES) — at small shapes the two tie, `h` is 1/128th of "
-        f"the work and both are launch-bound"
+        f"[kernel] fused {fused:.3f} ms | split (head + @v) {sp:.3f} ms | shipped for "
+        f"E={moe.n_experts}: {chosen} (FUSED_GLU_MIN_E={mk.FUSED_GLU_MIN_E})"
     )
-    # The split arm may only win the SHIPPED choice back with a real margin: a
-    # 2 % reading at a small shape is launch noise, and `h` in registers is the
-    # whole point of the fused kernel.
-    assert sp >= 0.9 * fused, f"split ({sp:.3f}) beats the shipped fused ({fused:.3f}) by >10%"
+    # The arm that ships may only be beaten by the other one with a real margin:
+    # a 2 % reading at a small shape is launch noise, and this card's dispatch
+    # timings drift a few ms between runs of one binary.
+    assert mine <= 1.1 * theirs, (
+        f"the shipped {chosen} arm ({mine:.3f} ms) loses to the other one ({theirs:.3f} ms) "
+        f"by >10% at E={moe.n_experts}: move mk.FUSED_GLU_MIN_E"
+    )
 
 
 def bench_small() -> None:

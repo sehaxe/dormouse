@@ -104,18 +104,32 @@ import triton.language as tl
 #:   BLOCK_F 128 — the f = 5461 write side, 43 steps; 128 measured fastest of
 #:                  {64, 128, 256} in the sweep (4.58 vs 4.83 ms), and 256
 #:                  blows the shared-memory budget at BLOCK_K 128+
-#:   BLOCK_N 256 — the wide adjoint N tile (`dv`, `dx`, `expert_gemm`); 512 is
-#:                  out of shared memory, 256 measured 22.0 ms against 27.1 for
-#:                  64 on the b1 backward (15.9 with 8 warps)
+#:   BLOCK_N 128 — the wide adjoint N tile (`dv`, `dx`, `expert_gemm`,
+#:                  `_grouped_nt_pair`); 512 is out of shared memory, and 256 is
+#:                  TOO (battery 2026-10-17: `_grouped_nt_pair` at the b1 shape
+#:                  needs 163840 B against this card's 101376 B, so the fused
+#:                  backward crashed at launch on `(2048, 64)`), so 128 is the
+#:                  shipped N. **The battery's b1 fwd+bwd row for 128 (58.15
+#:                  fused / 67.22 previous adjoint / 67.41 padded) was measured
+#:                  with a POISONED bank cache** — `experts._banks` handed the
+#:                  backward constant banks, so that backward never computed an
+#:                  expert bank gradient (the defect `tests/test_expert_banks.py`
+#:                  now gates). Re-measured on the same bench after that fix:
+#:                  fused 202-240 ms, previous adjoint 211-256, padded 215-253 —
+#:                  the fused adjoint wins by ~4-6%, not 13%, and reverting
+#:                  `_banks` alone reproduces the battery's row exactly
+#:                  (55.96/65.89/65.19). Quote the fwd rows (25.6/26.5/28.8 ms),
+#:                  which the cache defect does not touch.
 #:   BLOCK_T  16 — the combine backward's TOKEN tile (one program owns
 #:                  BLOCK_T tokens and their whole row of `f`); 16 keeps the
 #:                  per-token row map load amortised without spilling the
-#:                  `[BLOCK_T, TOP_K]` register accumulator
+#:                  `[BLOCK_T, TOP_K]` register accumulator; an 8/16/32 sweep was
+#:                  flat (1.4% spread), so 16 stands
 #: `BLOCK_T` is the one tile here NOT picked by a sweep — the combine kernel was
 #: written while the card was held by the live b1 run, so 16 is the starting
 #: value `scripts/bench_moe_kernel.py` is set up to replace (same rule as the
 #: rest: re-measure and edit the constant, never add an autotune).
-TILES = {"BLOCK_M": 64, "BLOCK_K": 64, "BLOCK_F": 128, "BLOCK_N": 256, "BLOCK_T": 16}
+TILES = {"BLOCK_M": 64, "BLOCK_K": 64, "BLOCK_F": 128, "BLOCK_N": 128, "BLOCK_T": 16}
 
 assert set(TILES) == {"BLOCK_M", "BLOCK_K", "BLOCK_F", "BLOCK_N", "BLOCK_T"}
 
@@ -124,6 +138,27 @@ assert set(TILES) == {"BLOCK_M", "BLOCK_K", "BLOCK_F", "BLOCK_N", "BLOCK_T"}
 #: `experts.SparseMoE._fused_bwd_reason` is what counts the fallback to the
 #: current backward when a config asks for more (our own top-k is 2).
 FUSED_TOPK_MAX = 32
+
+#: The expert count at/above which the GLU forward runs the FUSED kernel (`h` kept
+#: in registers, `[R, f]` written in one launch) rather than the SPLIT pair (the
+#: GLU head writing `[R, r]`, then `expert_gemm`). Both are the same function —
+#: the backward is identical and takes `h` from the save buffer either way — so
+#: the choice is pure speed, and the b1 bench measured the two ENDPOINTS
+#: (2026-10-17): at **E=8** the split arm is **0.184 ms against the fused 0.375**
+#: (2x — `h` is 1/128th of the work there and both are launch-bound, so the second
+#: kernel costs less than the fused kernel's wider tile), at **E=1024/b1** the
+#: fused arm is **4.699 against 6.335** (1.35x — the `[R, r]` round trip through
+#: global memory is the bill). Nothing between them was swept, so this is a SWEPT
+#: CONSTANT and not an interpolated crossing: re-measure with
+#: `scripts/bench_moe_kernel.py` before moving it, and see `glu_arm` for the
+#: caller (`_ExpertGemmGlu.forward`, i.e. the shipped forward).
+FUSED_GLU_MIN_E = 64
+
+
+def glu_arm(e: int) -> str:
+    """`"fused"` or `"split"` — the GLU forward arm for an `e`-expert bank."""
+    assert e >= 1, f"an expert bank needs at least one expert, got {e}"
+    return "fused" if e >= FUSED_GLU_MIN_E else "split"
 
 
 def _tiles(tiles: dict | None) -> dict:
@@ -842,7 +877,9 @@ def _wgrad(a, b, offs, e, cap, k, n, tiles, out_dtype):
     `num_stages=2` is load-bearing, not taste: the row-loop body stages a
     `[BLOCK_M, BLOCK_K]` and a `[BLOCK_M, BLOCK_N]` tile, and at `BLOCK_N=256`
     three stages want 120 KB of the 99 KB of shared memory this card has
-    (`sm_120`). Two stages fit at every rank from 16 to 128.
+    (`sm_120`) — which is also the tile size that made `_grouped_nt_pair` fail to
+    launch at the b1 shape, so 128 is the shipped N and two stages fit at every
+    rank from 16 to 128.
     """
     out = torch.empty(e, k, n, dtype=out_dtype, device=a.device)
     _wgrad_kernel[(e, triton.cdiv(k, tiles["BLOCK_K"]), triton.cdiv(n, tiles["BLOCK_N"]))](
@@ -1098,13 +1135,26 @@ class _ExpertGemmGlu(torch.autograd.Function):
     `dx` + the caller's row map + the caller's workspace) or `_glu_backward` (the
     reference). `seg`/`ws` are the caller's; the function neither builds nor owns
     them.
+
+    The FORWARD is picked by `glu_arm(E)`: the fused kernel for a bank at/above
+    `FUSED_GLU_MIN_E`, the GLU head plus `expert_gemm` below it (measured faster
+    there — the constant's comment has both endpoints). The two compute the same
+    `y`, and the backward is the same code in either case: it takes `h`, the
+    saved gates and `dy` explicitly and recomputes `dh` from them, so it never
+    needs a graph through `v` and the split forward is trainable, not bench-only.
     """
 
     @staticmethod
     def forward(ctx, xg, gate_u, up_u, gate_s, up_s, v, offs, cap, tiles, fused_bwd, seg, ws):
-        y, (gpre, upre, h) = _glu_fused_or_head(
-            xg, gate_u, up_u, gate_s, up_s, v, offs, cap, tiles, split=False, save=True
-        )
+        if glu_arm(gate_u.shape[0]) == "split":
+            _, (gpre, upre, h) = _glu_fused_or_head(
+                xg, gate_u, up_u, gate_s, up_s, v, offs, cap, tiles, split=True, save=True
+            )
+            y = expert_gemm(h, v, offs, cap=cap, tiles=tiles)
+        else:
+            y, (gpre, upre, h) = _glu_fused_or_head(
+                xg, gate_u, up_u, gate_s, up_s, v, offs, cap, tiles, split=False, save=True
+            )
         ctx.save_for_backward(xg, gate_u, up_u, gate_s, up_s, v, offs, gpre, upre, h)
         ctx.cap, ctx.tiles = cap, tiles
         ctx.fused_bwd, ctx.seg, ctx.ws = fused_bwd, seg, ws
