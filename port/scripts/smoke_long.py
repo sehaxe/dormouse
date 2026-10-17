@@ -10,11 +10,11 @@ backward — that is the trade, so the measurement is fwd+bwd and not the forwar
 alone), and (2) how much VRAM does it save at the shapes where the one-shot
 forward does not fit at all.
 
-Shape: `small` as shipped (the dense blend — `moe_topk > 0` is refused with
-segmentation, `config._validate_segment`), batch 2, seq 2048 / 4096 / 8192, the
-SAME window for both arms at each shape, `segment_len = 1024` (the recipe's own
-cut). The one-shot arm is attempted where it fits and COUNTED as OOM where it
-does not — never silently skipped.
+Shape: `small` as shipped (the dense blend; with `moe_topk > 0` segmentation needs
+`moe_capacity = 0` — the dropless arm — see `config._validate_segment`), batch 2,
+seq 2048 / 4096 / 8192, the SAME window for both arms at each shape,
+`segment_len = 1024` (the recipe's own cut). The one-shot arm is attempted where
+it fits and COUNTED as OOM where it does not — never silently skipped.
 
 The counters are printed per arm (`loop_segments`, `kda=…`) because the number a
 reader needs is "which path produced this step time", not just the time.
@@ -41,8 +41,9 @@ from dormouse.config import load_run
 from dormouse.model import DormouseModel
 from dormouse.train import kda_field, open_streams
 
-#: The port's data on this box (AGENTS §2.6).
-DATA = "/mnt/e43497ab-0ff2-45b4-b45f-28de3339a53e/aria_data/pretrain/real/corpus.bin"
+#: The port's data on this box (AGENTS §2.6) — the LOCAL copy (the /mnt drive
+#: may not be mounted; the 19.9 GB filtered corpus was copied here).
+DATA = "/home/sehaxe/dormouse/data_local/corpus_bin_filtered.bin"
 
 DEV = "cuda"
 BATCH = 2
@@ -88,6 +89,9 @@ def arm(seq_len: int, segment_len: int) -> dict:
         model_overrides={"max_seq_len": max(SEQ_LENS)},
         train_overrides={"batch": BATCH, "seq_len": seq_len, "segment_len": segment_len},
     )
+    # A preset carries no data path (the CLI always passes --data); the smoke
+    # names the corpus itself. Without this `open_streams` refuses loudly.
+    run.train.data = DATA
     model = DormouseModel(run.model, device=DEV)
     stream, _ = open_streams(run)
     x, y = stream.next_batch()
