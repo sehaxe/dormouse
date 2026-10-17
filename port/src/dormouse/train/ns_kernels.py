@@ -57,7 +57,10 @@ module-level mutable state, no host sync (every bound is a SHAPE the host alread
 has), and **every fast arm has a COUNTED fallback with its reason** — `ns_triton`
 when the fused chain ran, `ns_triton_fallback` + the reason when it could not
 (`docs/research/2026-10-17-muon-variants.md` §2 #1's void check: "the Triton path
-must be COUNTED, never a silent fallback to classic").
+must be COUNTED, never a silent fallback to classic"). That includes a tile set
+the DEVICE cannot fit: the b1 `(2048, 64)` shape at `BLOCK_D=128` needed 114688 B
+of shared memory against this card's 101376 B and crashed at launch (measured
+2026-10-17), which is a refusal to count, not a traceback to read.
 """
 
 from __future__ import annotations
@@ -73,8 +76,15 @@ import torch
 try:
     import triton
     import triton.language as tl
+    from triton.runtime.errors import OutOfResources
 
     TRITON_AVAILABLE = True
+    #: What a launch can REFUSE on (as opposed to get wrong): a tile set whose
+    #: shared-memory need is past the device's limit. Triton raises this from
+    #: `_init_handles`, i.e. on the HOST, before any driver call — so catching it
+    #: is a COUNTED fallback, not a poisoned CUDA context (measured: the battery
+    #: ran the crash and the same process kept launching the next shape).
+    LAUNCH_REFUSALS: tuple[type[BaseException], ...] = (OutOfResources,)
 except ImportError:  # pragma: no cover - the CPU-only wheel (no `gpu` extra)
     triton = types.ModuleType("triton")  # type: ignore[assignment]
     triton.jit = lambda fn: fn  # type: ignore[attr-defined]
@@ -83,15 +93,17 @@ except ImportError:  # pragma: no cover - the CPU-only wheel (no `gpu` extra)
     tl = types.ModuleType("triton.language")  # type: ignore[assignment]
     tl.constexpr = int  # type: ignore[attr-defined]
     TRITON_AVAILABLE = False
+    LAUNCH_REFUSALS = ()
 
 from .optim import JORDAN_NS_COEFFS
 
 #: The register cap on the small side. The `[r, r]` Gram is held in registers for
 #: the whole chain, so `r²` is the binding number: 64² = 4096 fp32 values is
-#: 16 registers per thread at 8 warps, which leaves room for the `[r, BLOCK_D]`
-#: iterate tile. 128 would be 4× that and spill. The port's Muon factors are
-#: rank 64 by construction (`model/tsct.py`), so this cap is not a compromise on
-#: anything the router sends here — see the module docstring.
+#: 16 registers per thread at 8 warps (32 at the shipped 4), either of which
+#: leaves room for the `[r, BLOCK_D]` iterate tile. 128 would be 4× that and
+#: spill. The port's Muon factors are rank 64 by construction (`model/tsct.py`),
+#: so this cap is not a compromise on anything the router sends here — see the
+#: module docstring.
 MAX_RANK = 64
 
 #: The streaming tile on the long side, and the warp count. Module constants on
@@ -100,8 +112,25 @@ MAX_RANK = 64
 #: own `_get_autotune_configs` sweeps 36 configs — "may take several minutes" on
 #: first call, per its README). Re-measure with `scripts/bench_ns_triton.py` and
 #: edit these, do not add a decorator.
-BLOCK_D = 128
-NUM_WARPS = 8
+#:
+#: **64, not 128, and the reason is shared memory** (battery 2026-10-17). The
+#: `[RT=64, BLOCK_D=128]` operands of `tl.dot(x, trans(x))` need **114688 B**
+#: against this card's **101376 B** limit, so at 128 the b1 Muon group's
+#: `(2048, 64)` shapes died at launch with `OutOfResources` — a CRASH, not a
+#: counted fallback. At 64 every b1 shape launches with parity **1.7e-6 … 2.3e-6**
+#: against the classic chain (fp32/ieee), and the b1 Muon group measures
+#: **677.1 → 162.6 ms/step in the bench's `_median_ms` idiom** (which syncs only
+#: after the loop, so the tail reps carry queue backpressure; a per-rep-synced
+#: harness reads ~31 ms of true enqueue on BOTH arms) and **675.6 → 607.9 ms
+#: synced** — the arm's whole claim. A tile set that still cannot fit is refused
+#: COUNTED now (`zeropower_triton_or_classic`), never crashed.
+BLOCK_D = 64
+#: 4, not 8, and it is the same sweep: every b1 chain shape measured faster at 4
+#: warps (`(2048, 64)` 1.210 vs 1.523 ms, `(64, 5461)` 5.780 vs 7.193,
+#: `(513, 1024, 64)` 7.967 vs 13.005), and on the b1 Muon group the synced step
+#: is 683.5 vs 768.7 ms (interleaved, 6 reps each) with the enqueue a tie. At
+#: `r ≤ 64` the `[r, r]` Gram is 4096 values, so 8 warps leave most threads idle.
+NUM_WARPS = 4
 
 #: The prescale's ε, `zeropower_via_ns`'s own `x / (x.norm() + 1e-7)`.
 NS_EPS = 1e-7
@@ -299,6 +328,10 @@ def zeropower_triton_or_classic(
 
     `ns_dtype != "fp32"` is a COUNTED fallback, not a compose: the kernels run
     fp32 (see `zeropower_triton`), so the two arms cannot ride in one A/B.
+
+    The third COUNTED reason is the LAUNCH's own refusal (a tile set whose shared
+    memory is past the device's limit): it is caught here rather than allowed to
+    crash, and it carries triton's own required-vs-limit numbers.
     """
     from ..instrument import loud
 
@@ -320,8 +353,21 @@ def zeropower_triton_or_classic(
     if why is None:
         why = triton_reason(g)
     if why is None:
-        counters.count("ns_triton")
-        return zeropower_triton(g, steps)
+        try:
+            out = zeropower_triton(g, steps)
+        except LAUNCH_REFUSALS as e:  # pragma: no cover - needs a device to fire
+            # A tile set the device cannot fit is a REFUSAL, and a refusal is a
+            # degradation like any other: COUNTED, with the number the reader
+            # needs (required vs limit), never a crash at launch. Reachable on
+            # this card only by editing `BLOCK_D` — which is the point: the
+            # constants above are the thing a sweep moves, and the sweep must
+            # not be able to turn a measurement into a traceback.
+            # `tests/test_ns_triton.py::test_a_shape_that_cannot_fit_falls_back_counted`
+            # drives this branch by patching `BLOCK_D` to 128.
+            why = f"the launch was refused by the device ({type(e).__name__}: {e})"
+        else:
+            counters.count("ns_triton")
+            return out
     from .optim import zeropower_via_ns  # lazy: `optim` imports this module only inside its arm
 
     counters.count("ns_triton_fallback")

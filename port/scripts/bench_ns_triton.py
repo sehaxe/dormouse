@@ -71,7 +71,11 @@ def preflight() -> str | None:
         return f"cannot check the card ({e})"
     if busy:
         return f"a training run is live (pids {busy.replace(chr(10), ' ')})"
-    mib = int(used.split(",")[0]) if used else -1
+    # `nvidia-smi --format=csv,noheader` prints `694 MiB, 3 %`: the NUMBER is the
+    # first whitespace token. Splitting on the comma leaves `694 MiB` and `int()`
+    # dies on it (the battery's `ValueError: invalid literal for int()`), which
+    # turned a free card into a refused bench.
+    mib = int(used.split()[0]) if used else -1
     if mib >= 1024:
         return f"the card already holds {mib} MiB ({used})"
     return None

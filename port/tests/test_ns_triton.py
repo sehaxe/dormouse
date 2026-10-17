@@ -25,7 +25,10 @@ gates are different from `test_muon_gram.py`'s:
    edit moved the DEFAULT path** — which is the finding, not a broken test.
 6. **the fallback is COUNTED, with its reason** (never silent, ADR-0019), and the
    fallback's VALUE is the classic chain bit-for-bit — a fallback that computed
-   something else would be a second bug wearing a degradation's clothes.
+   something else would be a second bug wearing a degradation's clothes. That
+   includes the LAUNCH's own refusal (a tile set the device cannot fit): at the
+   shipped `BLOCK_D` no shape reaches it, so the gate patches the constant back
+   to the 128 that crashed the b1 Muon group and asserts the COUNT.
 
 `≤1e-9` against an fp64 reference on a small matrix was the ask for tier 2; it
 cannot hold for this kernel and the split above is why. The kernel is fp32 by
@@ -488,6 +491,8 @@ def test_triton_matches_classic_at_the_b1_shapes(shape):
     out = nk.zeropower_triton_or_classic(g, 5, counters=c)
     assert out.shape == g.shape
     d = rel(out, classic)
+    ran = "fallback" if c.get("ns_triton_fallback") else "triton"
+    print(f"[ns parity] {str(shape):16s} ran={ran:8s} rel={d:.3e}")
     if min(shape[-2:]) > nk.MAX_RANK:
         assert c.get("ns_triton_fallback") == 1 and c.get("ns_triton", 0) == 0, dict(c)
         assert "MAX_RANK" in c.why
@@ -528,6 +533,30 @@ def test_a_non_contiguous_input_is_a_counted_fallback():
     c = Counters()
     out = nk.zeropower_triton_or_classic(g, 5, counters=c)
     assert c.get("ns_triton_fallback") == 1 and "non-contiguous" in c.why
+    assert torch.equal(out, zeropower_via_ns(g, 5, "classic"))
+
+
+@CUDA
+def test_a_shape_that_cannot_fit_falls_back_counted(monkeypatch):
+    """The b1 crash, as a COUNTED refusal: 112 KiB of tiles on a 99 KiB card.
+
+    `BLOCK_D=128` is what this arm SHIPPED until the battery ran it. The
+    `[RT=64, BLOCK_D=128]` operands of `tl.dot(x, trans(x))` need **114688 B** of
+    shared memory against this card's **101376 B**, so the b1 Muon group's
+    `(2048, 64)` shapes died at launch with `OutOfResources` — a crash on the
+    exact shape the arm exists to accelerate, and not one of the counted
+    refusals `triton_reason` could express. Patching the constant back is the
+    falsification this gate needs: the same call must now COUNT the refusal,
+    carry triton's own numbers in the reason, and return the classic chain.
+    """
+    monkeypatch.setattr(nk, "BLOCK_D", 128)
+    g = gauss((2048, 64)).cuda()
+    c = Counters()
+    out = nk.zeropower_triton_or_classic(g, 5, counters=c)
+    print(f"[launch refusal] {c.line()} why={c.why}")
+    assert c.get("ns_triton_fallback") == 1, dict(c)
+    assert c.get("ns_triton", 0) == 0, dict(c)
+    assert "OutOfResources" in c.why and "shared memory" in c.why, c.why
     assert torch.equal(out, zeropower_via_ns(g, 5, "classic"))
 
 
