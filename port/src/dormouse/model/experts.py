@@ -553,6 +553,24 @@ class SparseMoE(nn.Module):
         """The dtype the experts compute in (their own `bf16` switch, not the device's)."""
         return self.experts[0].compute_dtype
 
+    def invalidate_banks(self) -> None:
+        """Drop the bank cache so the NEXT forward rebuilds it — the opt_graph fix.
+
+        The cache key carries the parameters' `_version` tuple, and that assumed
+        "an optimizer step bumps `_version`". **A CUDA-graph replay does not**
+        (measured 2026-10-19: an eager step moves 0->1; the same step replayed
+        from a captured graph leaves `_version` FROZEN while the value moves).
+        With `opt_graph = true` the key therefore stopped moving at capture, the
+        bank served the step-5 build for the whole run — the experts' FORWARD was
+        frozen while the optimizer kept stepping them with stale gradients (they
+        drifted ~44x; the saved checkpoint then exploded in any fresh process,
+        and the live evals could not show it because they reused the same stale
+        bank). The trainer now calls this once per TRAINING step, right after the
+        parameters move: the cache keeps its real job (one build per step, reused
+        by the loop's iterations) and can no longer outlive a step.
+        """
+        self._bank_cache = None
+
     @torch.compiler.disable
     def _banks(self, dt: torch.dtype) -> tuple[torch.Tensor, ...]:
         """The expert bank as `[E, ·]` tensors for the batched matmuls — CACHED IN `dt`.
@@ -1070,3 +1088,19 @@ class SparseMoE(nn.Module):
         return moe_kernels.combine(
             y, weight.reshape(-1)[rows].float(), owner, rowmap.view(n, k), n, ws=ws
         )
+
+
+def invalidate_banks_all(model: nn.Module) -> int:
+    """Drop every SparseMoE's bank cache; returns how many were cleared.
+
+    The trainer's ONE per-step call (`train/loop.py`, `train/sft.py`): see
+    `SparseMoE.invalidate_banks` for the measured reason (a CUDA-graph replay
+    moves a parameter's VALUE without bumping `_version`, so a `_version`-keyed
+    cache cannot outlive a step in which the optimizer ran).
+    """
+    n = 0
+    for m in model.modules():
+        if isinstance(m, SparseMoE):
+            m.invalidate_banks()
+            n += 1
+    return n

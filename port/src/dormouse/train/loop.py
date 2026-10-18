@@ -32,6 +32,7 @@ from ..model.engram import (
     host_step_all,
     load_host_state,
 )
+from ..model.experts import invalidate_banks_all
 from ..model.tsct import set_mm_dtype
 from .data import ByteStream, eval_window_bytes, open_streams, warmup_steps
 from .graph import OptimizerGraph
@@ -796,6 +797,15 @@ def train(
                 graph.step()
             else:
                 opt_stage()
+            # The parameters just moved — and a CUDA-graph replay moves them
+            # WITHOUT bumping `_version` (measured 2026-10-19). `_banks` keys its
+            # cache on `_version`, so with `opt_graph = true` the key froze at
+            # capture and the bank served the step-5 build for a whole run
+            # (experts frozen in the forward, drifting in memory, checkpoint
+            # unreproducible — the medbig2/b1night defect). One call per
+            # TRAINING step keeps the cache's real job (one build per step,
+            # reused by the loop's iterations) and nothing more.
+            invalidate_banks_all(model)
             if opt.counters:
                 # The Muon arms' own counters (ADR-0019): `ns_triton` when the
                 # fused Newton–Schulz chain ran, `ns_triton_fallback` + the reason

@@ -73,6 +73,7 @@ import torch.nn.functional as F
 from ..config import RunConfig, TrainConfig
 from ..instrument import Counters, LoudError, StepTimer, loud
 from ..model.engram import Engram, enable_host_tables, host_engrams, host_step_all
+from ..model.experts import invalidate_banks_all
 from ..post.tasks import build_tasks
 from .data import ByteStream, warmup_steps
 from .loop import kda_field, load_ckpt, load_model_state, save_ckpt, unpack_state_dict
@@ -861,6 +862,12 @@ def sft_train(
             if cfg.grad_clip > 0:
                 clip_grads(model.parameters(), cfg.grad_clip)
             opt.step()
+            # The same per-step bank invalidation `train()` runs (`loop.py`): a
+            # parameter's VALUE can move without `_version` moving (a CUDA-graph
+            # replay does exactly that), and `_banks` keys on `_version`. This
+            # loop has no graph arm today; the call keeps the invariant true for
+            # any arm that ever adds one.
+            invalidate_banks_all(model)
             if cfg.engram_ram:
                 # The host update runs ONCE per TRAINING step, after the
                 # optimizer — the same rule and the same counters as `train()`
