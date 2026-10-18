@@ -1,4 +1,4 @@
-"""The dormouse CLI: `dormouse info|train|sft|eval|bench|decode|serve`.
+"""The dormouse CLI: `dormouse info|train|sft|rl|eval|bench|decode|serve`.
 
 A thin, pretty front over `config.load_run`, `train.loop`, and `model.decode`
 — config strictness, resume refusal and counter discipline are already
@@ -514,6 +514,79 @@ def sft_cmd(
     console.print(
         f"[green]sft done[/] steps={report['steps']} loss={report['loss']:.4f} "
         f"masked_bytes={report['supervised_bytes']:,} nan_skipped={report['nan_skipped']}"
+    )
+
+
+@app.command("rl")
+def rl_cmd(
+    preset: Annotated[str, typer.Argument(help="preset NAME or a .toml PATH")] = "small",
+    ckpt_name: Annotated[str, typer.Option("--ckpt-name", help="checkpoint name to write")] = "",
+    out_dir: Annotated[Path | None, typer.Option(help="checkpoint directory")] = None,
+    steps: Annotated[int | None, typer.Option] = None,
+    lr: Annotated[float | None, typer.Option] = None,
+    resume: Annotated[
+        bool, typer.Option(help="continue `ckpt_name`; a drifted config refuses")
+    ] = False,
+    init_from: Annotated[
+        str,
+        typer.Option(
+            "--init-from",
+            help="a .pt whose WEIGHTS seed this RL run (fresh optimizer/snapshot)",
+        ),
+    ] = "",
+    device: Annotated[str, typer.Option(help="auto|cuda|cpu")] = "auto",
+    json_log: Annotated[
+        Path | None, typer.Option("--json-log", help="telemetry sink for `dormouse plot`")
+    ] = None,
+    # typer constructs a fresh list per call (its contract) — B006 is a
+    # plain-function footgun, and the option annotation IS the fixture.
+    sets: Annotated[list[str], typer.Option("--set", help="override: key=value")] = [],  # noqa: B006
+) -> None:
+    """RL: the MiMo-style reward and a policy-gradient step on GENERATED tasks.
+
+    There is no corpus to point at — a step draws its task from
+    `build_tasks(cfg.rl_task_cls, seed, n=cfg.rl_tasks)` — so `--data`/`--eval`
+    do not exist here. The lane's own knobs go through `--set`: `rl_task_cls`,
+    `rl_tasks`, `rl_group`, `rl_budget`, `rl_adv`, and the reward's X/B/A/δ/s/γ.
+    """
+    from .post.rl_train import rl_train
+
+    model_over, train_over = _split_sets(sets)
+    if ckpt_name:
+        train_over["ckpt_name"] = ckpt_name
+    if out_dir is not None:
+        train_over["out_dir"] = str(out_dir)
+    for k, v in (("steps", steps), ("lr", lr)):
+        if v is not None:
+            train_over[k] = v
+    if json_log is not None:
+        train_over["json_log"] = str(json_log)
+    run = load_run(preset, model_overrides=model_over, train_overrides=train_over)
+    dev = _device(device)
+    _freeze_gc()
+    console.print(
+        Panel(
+            f"[bold]rl[/] {run.source} · {run.train.rl_task_cls} · {run.train.rl_tasks} "
+            f"generated tasks · group {run.train.rl_group} · budget "
+            f"{run.train.rl_budget} B · {dev}"
+            + ("" if resume else (" · base = " + (init_from or "fresh init"))),
+            subtitle=f"steps={run.train.steps} lr={run.train.lr} opt={run.train.opt} "
+            f"adv={run.train.rl_adv}",
+        )
+    )
+    report = rl_train(
+        run,
+        resume=resume,
+        init_from=init_from or None,
+        device=None if dev.type == "cpu" else dev,
+    )
+    per_solved = (
+        f"{report['bytes_per_solved']:.1f}" if report["bytes_per_solved"] is not None else "-"
+    )
+    console.print(
+        f"[green]rl done[/] steps={report['steps']} loss={report['loss']:.4f} "
+        f"pass={report['pass_rate']:.2f} bytes/solved={per_solved} "
+        f"rl_samples={report['rl_samples']:,} nan_skipped={report['nan_skipped']}"
     )
 
 

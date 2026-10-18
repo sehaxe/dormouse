@@ -25,9 +25,12 @@ import sys
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .instrument import LoudError, loud
+
+if TYPE_CHECKING:  # the RL config lives in the post lane; importing it here
+    from .post.rl import RLConfig  # would be a cycle at module load
 
 #: `port/configs/`, reached from this file (`port/src/dormouse/config.py`).
 PRESET_DIR = Path(__file__).resolve().parents[2] / "configs"
@@ -753,6 +756,52 @@ class TrainConfig:
     #: a SILENT model change wearing a memory flag.
     segment_len: int = 0
 
+    # --- the RL lane (`post/rl.py` + `post/rl_train.py`) ----------------
+    # The reward/advantage knobs are `RLConfig`'s fields, spelled here so the CLI
+    # and a snapshot carry them; the mapping back is [`rl_config`], the ONE
+    # construction site (so `RLConfig.__post_init__`'s refusals are the only
+    # rules and cannot drift into a second copy).
+    #: `S_sol`'s proxy: `thrift` (bytes against the hidden reference) or `none`.
+    rl_quality: str = "thrift"
+    #: X — the group-relative length penalty's ceiling; 0.0 = OFF (the shipped
+    #: default: nobody has measured X/B/A/δ/s/γ at this scale).
+    rl_len_penalty: float = 0.0
+    #: B — the percentile of the SUCCESSFUL lengths that sets ℓ*_q (0.5-0.75).
+    rl_len_quantile: float = 0.5
+    #: A — the group pass rate the length term needs (0.3-0.5).
+    rl_len_gate: float = 0.4
+    #: δ — the free band above ℓ*_q (0.0-0.1); s must stay above it.
+    rl_len_delta: float = 0.0
+    #: s — where the ramp saturates, as a multiple of ℓ*_q.
+    rl_len_s: float = 0.5
+    #: γ — the ramp's exponent (1-2).
+    rl_len_gamma: float = 1.0
+    #: The advantage arm (`RL_ADVANTAGES`): `crr` = the fork-replay shape
+    #: (`post/train_steps.crr_advantage`), `group` = GRPO's group-normalised
+    #: rewards. `crr` is the default because it is the arm with a gate behind it.
+    rl_adv: str = "crr"
+    #: The loss normaliser: `prompt-mean` (this lane's rule) or `token-mean` (the
+    #: notes' §4.2 control arm).
+    rl_agg: str = "prompt-mean"
+    #: The task class `build_tasks` generates (`code` | `math` | `noop`); the
+    #: tasks are GENERATED, so the RL lane reads no corpus at all.
+    rl_task_cls: str = "code"
+    #: How many tasks a seed produces (`build_tasks(cls, seed, n=...)`); a step
+    #: draws ONE of them as a pure function of `(seed, step)`.
+    rl_tasks: int = 16
+    #: G — rollouts per prompt: the group the reward, the advantage and the
+    #: length penalty are all relative to. GRPO's group of 4-8 is the sourced band.
+    rl_group: int = 4
+    #: The rollout's byte budget (`correct@budget(bytes)`): prompt + response +
+    #: 2 B per generation stroke. 256 B is the `code` class's own budget.
+    rl_budget: int = 256
+
+
+#: The `rl_adv` literals — the two advantage arms `rl.rl_advantages` implements.
+#: The list is duplicated here the way `MOE_KERNELS` is, so the config layer does
+#: not import the post lane. A name that is not here is LOUD at load.
+RL_ADVANTAGES = ("crr", "group")
+
 
 @dataclass
 class RunConfig:
@@ -1251,6 +1300,29 @@ def parse_preset(text: str, where: str = "<preset>") -> ModelConfig:
     return model
 
 
+def rl_config(tcfg: TrainConfig) -> RLConfig:
+    """The [`RLConfig`] the RL keys describe — the ONE construction site.
+
+    `load_run` builds one for its refusals and `post.rl_train` builds one to run
+    with, both through here: a second mapping would be a second set of rules, and
+    `RLConfig.__post_init__` is the only place the X/B/A/δ/s/γ relations are
+    checked (ADR-0011: one rule, one place). The import is function-local because
+    the post lane imports this module.
+    """
+    from .post.rl import RLConfig
+
+    return RLConfig(
+        quality=tcfg.rl_quality,
+        length_penalty=tcfg.rl_len_penalty,
+        quantile=tcfg.rl_len_quantile,
+        gate=tcfg.rl_len_gate,
+        delta=tcfg.rl_len_delta,
+        s=tcfg.rl_len_s,
+        gamma=tcfg.rl_len_gamma,
+        agg=tcfg.rl_agg,
+    )
+
+
 def load_run(
     preset: str = "small",
     *,
@@ -1397,6 +1469,27 @@ def load_run(
     # window AND the arms, so its refusals live here, where both halves are
     # resolved — the same shape as the `engram_ram` block above.
     _validate_segment(model, tcfg)
+    # The RL lane's keys. The advantage arm is a literal list (checked here, the
+    # way `opt` and `mm_dtype` are); the reward and penalty knobs are checked by
+    # BUILDING the `RLConfig` they describe, whose `__post_init__` is LOUD — one
+    # construction, so its rules cannot drift into a second copy here.
+    if tcfg.rl_adv not in RL_ADVANTAGES:
+        loud(
+            f"rl_adv={tcfg.rl_adv!r} is not an arm. Known: {list(RL_ADVANTAGES)} — "
+            f"`crr` is the fork-replay advantage (`post/train_steps.crr_advantage`, "
+            f"read off each group's Rollout) and `group` is GRPO's "
+            f"group-normalised reward. Escape: name one of those, or land the arm "
+            f"in `post/rl.rl_advantages` and its gate BEFORE the config can lie "
+            f"about it."
+        )
+    if tcfg.rl_tasks < 1 or tcfg.rl_group < 1 or tcfg.rl_budget < 1:
+        loud(
+            f"rl_tasks={tcfg.rl_tasks} rl_group={tcfg.rl_group} "
+            f"rl_budget={tcfg.rl_budget}: a step needs at least one task to draw, "
+            f"one rollout in the group and one byte of budget. Escape: positive "
+            f"counts (the defaults are 16 / 4 / 256)."
+        )
+    rl_config(tcfg)
     return RunConfig(source=preset, model=model, train=tcfg)
 
 
