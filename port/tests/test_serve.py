@@ -32,18 +32,23 @@ MSG = [{"role": "user", "content": "Hello"}]
 def served(tmp_path_factory: pytest.TempPathFactory):
     """The module's one server: a checkpoint on disk, port 0, loaded once."""
     d = tmp_path_factory.mktemp("ck")
-    run = RunConfig(
-        source="tiny", model=tiny_cfg(), train=TrainConfig(ckpt_name=CKPT, out_dir=str(d))
-    )
-    (d / f"{CKPT}.config.toml").write_text(run.snapshot_toml())
-    torch.save({"model": tiny_model().state_dict(), "opt": {}, "step": 0}, d / f"{CKPT}.pt")
-    httpd = build_server(d, CKPT, port=0, device="cpu", max_tokens_cap=CAP)
+    _write_ckpt(d, tiny_cfg(), tiny_model())
+    lines: list[str] = []
+    httpd = build_server(d, CKPT, port=0, device="cpu", max_tokens_cap=CAP, log=lines.append)
+    httpd.startup_log = lines  # the arm line the decision printed, for the tests
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     yield f"http://127.0.0.1:{httpd.server_address[1]}", httpd
     httpd.shutdown()
     httpd.server_close()
     thread.join(timeout=10)
+
+
+def _write_ckpt(d: Path, cfg, model) -> None:
+    """The snapshot + weights pair a server loads (written directly, not trained)."""
+    run = RunConfig(source="tiny", model=cfg, train=TrainConfig(ckpt_name=CKPT, out_dir=str(d)))
+    (d / f"{CKPT}.config.toml").write_text(run.snapshot_toml())
+    torch.save({"model": model.state_dict(), "opt": {}, "step": 0}, d / f"{CKPT}.pt")
 
 
 def _req(url: str, payload=None) -> urllib.request.Request:
@@ -102,6 +107,96 @@ def test_stream_is_sse_and_ends_with_done(served):
     # one seeded generator over a growing context == one call: same sampling path
     assert streamed == _chat(served, max_tokens=CAP)["choices"][0]["message"]["content"]
     assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+
+
+def test_recurrent_is_the_default_arm_and_the_line_says_so(served):
+    """The default arm is the state-carry decoder, named BEFORE the socket binds."""
+    _, httpd = served
+    assert httpd.state.recurrent is True
+    assert any("decode arm = recurrent" in line for line in httpd.startup_log)
+    # The arm is not decoration: a served request runs the torch recurrence
+    # (FLA is CUDA-only, so on this CPU server every step counts `kda_step_torch`).
+    before = httpd.state.counters.get("kda_step_torch", 0)
+    _chat(served, max_tokens=CAP)
+    assert httpd.state.counters.get("kda_step_torch", 0) > before
+
+
+def test_a_model_that_cannot_run_recurrent_falls_back_counted(tmp_path: Path):
+    """MSA on → the recurrent arm is refused; plain decode is COUNTED + named.
+
+    The decision happens in `build_server`, before the socket binds, so the
+    startup line a reader sees already names the arm every request will use.
+    """
+    d = tmp_path / "ck_msa"
+    d.mkdir()
+    _write_ckpt(d, tiny_cfg(use_msa=True), tiny_model(use_msa=True))
+    lines: list[str] = []
+    httpd = build_server(d, CKPT, port=0, device="cpu", log=lines.append)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        assert httpd.state.recurrent is False
+        assert httpd.state.counters.get("recurrent_fallback") == 1
+        (line,) = [line for line in lines if "recurrent_fallback" in line]
+        assert "use_msa" in line and "Escape" in line
+        # The fallback is usable, not just declared: the request is served.
+        body = _chat((f"http://127.0.0.1:{httpd.server_address[1]}", httpd), max_tokens=CAP)
+        assert body["choices"][0]["message"]["role"] == "assistant"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=10)
+
+
+def test_no_recurrent_serves_plain_without_a_fallback(tmp_path: Path):
+    """`--no-recurrent` is a choice, not a degradation: no fallback counter."""
+    d = tmp_path / "ck_plain"
+    d.mkdir()
+    _write_ckpt(d, tiny_cfg(), tiny_model())
+    lines: list[str] = []
+    httpd = build_server(d, CKPT, port=0, device="cpu", recurrent=False, log=lines.append)
+    try:
+        assert httpd.state.recurrent is False
+        assert "recurrent_fallback" not in httpd.state.counters
+        assert any("--no-recurrent" in line for line in lines)
+    finally:
+        httpd.server_close()
+
+
+def test_serve_cli_wires_the_recurrent_flag(tmp_path: Path, monkeypatch):
+    """`dormouse serve --no-recurrent` reaches `build_server` (the typer seam)."""
+    from typer.testing import CliRunner
+
+    import dormouse.cli as cli
+
+    d = tmp_path / "ck_cli"
+    d.mkdir()
+    _write_ckpt(d, tiny_cfg(), tiny_model())
+    seen: dict[str, object] = {}
+
+    def fake_serve(httpd):
+        seen["arm"] = httpd.state.recurrent
+        httpd.server_close()
+
+    monkeypatch.setattr(cli, "serve_forever", fake_serve)
+    r = CliRunner().invoke(
+        cli.app,
+        [
+            "serve",
+            "--out-dir",
+            str(d),
+            "--ckpt-name",
+            CKPT,
+            "--port",
+            "0",
+            "--no-recurrent",
+            "--device",
+            "cpu",
+        ],
+    )
+    assert r.exit_code == 0, r.output
+    assert seen["arm"] is False
+    assert "decode arm = plain" in r.output
 
 
 def test_max_tokens_above_the_cap_is_clamped_and_counted(served):
@@ -217,3 +312,37 @@ def test_a_stop_byte_ends_the_reply(tmp_path):
     assert len(out) <= 64 + 8  # bounded by n_new; the early exit only shortens
     out2 = decode_bytes(model, b"\x01 hi \n\x02 ", 64, temp=1.0, generator=gen)
     assert len(out2) == 64 + len(b"\x01 hi \n\x02 ")  # default: no early exit
+
+
+def test_recurrent_streaming_is_one_seeded_call():
+    """The SSE re-call trick under the recurrent arm: chunked `_generate` == one call.
+
+    `_generate` re-calls the decoder on a growing context under ONE seeded
+    generator (the serve contract). On CPU the prefill is byte-by-byte, so the
+    state after re-prefilling the grown context is identical to the carried
+    state a single call would have — the emitted bytes must match exactly, stop
+    byte included.
+    """
+    from types import SimpleNamespace
+
+    from dormouse.model.decode import recurrent_decode
+    from dormouse.serve import _STOP, ServeState, _generate
+
+    model = tiny_model(moe_topk=0)
+    state = ServeState(
+        model=model,
+        run=SimpleNamespace(train=SimpleNamespace(seed=7)),
+        device=torch.device("cpu"),
+        ckpt_name=CKPT,
+        max_tokens_cap=64,
+        temp=0.8,
+        recurrent=True,
+    )
+    prompt, n = b"\x01 hi \n\x02 ", 24
+    text = "".join(_generate(state, prompt, n))
+    gen = torch.Generator().manual_seed(7)
+    raw = recurrent_decode(model, prompt, n, temp=0.8, generator=gen, stop=_STOP)
+    body = raw[len(prompt) :]
+    if body and body[-1] in _STOP:
+        body = body[:-1]  # the stop byte ends the reply and is never emitted as text
+    assert text == body.decode("utf-8", "replace")

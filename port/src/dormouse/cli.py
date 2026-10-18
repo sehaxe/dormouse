@@ -655,9 +655,9 @@ def bench_cmd(
             "with --download: every task)",
         ),
     ] = "",
-    data_dir: Annotated[
-        Path, typer.Option("--data-dir", help="where the task files live")
-    ] = Path("data_local/bench"),
+    data_dir: Annotated[Path, typer.Option("--data-dir", help="where the task files live")] = Path(
+        "data_local/bench"
+    ),
     limit: Annotated[int, typer.Option(help="items per task (0 = all)")] = 0,
     download: Annotated[
         bool, typer.Option("--download", help="fetch the named tasks into --data-dir and exit")
@@ -844,9 +844,7 @@ def decode(
         from .model.decode import recurrent_decode
 
         arm = Counters()
-        out = recurrent_decode(
-            model, body, n, temp=temp, device=dev, generator=gen, counters=arm
-        )
+        out = recurrent_decode(model, body, n, temp=temp, device=dev, generator=gen, counters=arm)
         subtitle = f"recurrent · {arm.line()}"
     elif spec_k:
         out, stats = spec_decode_bytes(
@@ -954,6 +952,15 @@ def serve_cmd(
         int, typer.Option("--max-tokens-cap", help="hard ceiling on one reply, in bytes")
     ] = DEFAULT_MAX_TOKENS,
     temp: Annotated[float, typer.Option(help="sampling temperature")] = 0.8,
+    recurrent: Annotated[
+        bool,
+        typer.Option(
+            "--recurrent/--no-recurrent",
+            help="state-carry decode (O(1)/byte) when the model supports it — the "
+            "default; --no-recurrent forces decode_bytes (O(window)/byte). A model "
+            "that cannot run it falls back COUNTED (recurrent_fallback).",
+        ),
+    ] = True,
     device: Annotated[str, typer.Option(help="auto|cuda|cpu")] = "auto",
 ) -> None:
     """Serve a checkpoint on the OpenAI HTTP schema (`/v1/models`, chat completions).
@@ -965,6 +972,11 @@ def serve_cmd(
     an architecture other than the one you named. Train-half keys are exempt —
     the cadence, optimizer and data path do not reach the served bytes, and
     every checkpoint on disk was trained with `--set` overrides.
+
+    Decode is the state-carry arm by default (`recurrent_decode`, `O(1)`/byte);
+    `--no-recurrent` forces the window re-forward, and a model that cannot run
+    recurrent (byteflow, MSA) falls back COUNTED with the reason on the startup
+    line.
     """
     if preset:
         _preset_check(preset, _snapshot_run(out_dir, ckpt_name), what="served")
@@ -976,13 +988,14 @@ def serve_cmd(
         device=device,
         max_tokens_cap=max_tokens_cap,
         temp=temp,
+        recurrent=recurrent,
     )
     state = httpd.state
     console.print(
         Panel(
             f"[bold]{ckpt_name}[/] · {param_count(state.model):,} params · {state.device}",
             subtitle=f"http://{host}:{httpd.server_address[1]}/v1 · cap {max_tokens_cap} B"
-            f" · temp {temp}",
+            f" · temp {temp} · {'recurrent' if state.recurrent else 'plain'} arm",
         )
     )
     serve_forever(httpd)

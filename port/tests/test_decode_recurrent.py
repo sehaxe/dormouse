@@ -38,6 +38,7 @@ from dormouse.cli import app
 from dormouse.instrument import Counters, LoudError
 from dormouse.model import DormouseModel
 from dormouse.model.decode import (
+    _chunked_prefill,
     _step_logits,
     decode_bytes,
     recurrent_decode,
@@ -87,6 +88,7 @@ _cuda_step = pytest.mark.skipif(
     reason=f"needs a free CUDA device with FLA ({_BUSY or 'no CUDA device or no fla'})",
 )
 
+
 def _drop(model) -> int:
     """The left context the Engram's causal n-grams reach — `max(orders) - 1`."""
     return 0 if model.loop.engram is None else max(model.loop.engram.orders) - 1
@@ -101,9 +103,7 @@ def _prefill(model, prompt: list[int], dev: torch.device) -> tuple[torch.Tensor,
     states: list = [None] * model.cfg.max_iter
     logits = None
     for i in range(len(prompt)):
-        logits, states = _step_logits(
-            model, prompt[: i + 1], states, dev, _drop(model), Counters()
-        )
+        logits, states = _step_logits(model, prompt[: i + 1], states, dev, _drop(model), Counters())
     return logits, states
 
 
@@ -353,9 +353,7 @@ def test_per_byte_cost_does_not_grow_with_context():
                 model, prompt, 2 * n, temp=0.8, generator=torch.Generator().manual_seed(1)
             )
             t1 = time.process_time()
-            recurrent_decode(
-                model, prompt, n, temp=0.8, generator=torch.Generator().manual_seed(1)
-            )
+            recurrent_decode(model, prompt, n, temp=0.8, generator=torch.Generator().manual_seed(1))
             t2 = time.process_time()
             best = min(best, (t1 - t0) - (t2 - t1))
         return best / n
@@ -365,6 +363,113 @@ def test_per_byte_cost_does_not_grow_with_context():
     lo, hi = min(got.values()), max(got.values())
     assert lo > 0.0, f"the marginal cost measured nothing: {got}"
     assert hi / lo < 2.0, f"the per-byte cost grows with context: {got}"
+
+
+# --------------------------------------------------------- the chunked prefill
+
+
+def test_chunked_prefill_falls_back_counted_on_cpu():
+    """`prefill="chunked"` on CPU: byte prefill, COUNTED, and byte-identical.
+
+    The chunk kernel is CUDA-only, so the explicit request degrades to the byte
+    prefill — the same recurrence — and says so (`prefill_fallback` + the
+    reason), exactly like every other counted fallback in this project.
+    """
+    from dormouse.model.decode import _prefill_refusal
+
+    model = tiny_model(moe_topk=0)
+    prompt = b"\x01 hi \n\x02 "
+    c = Counters()
+    out = recurrent_decode(
+        model,
+        prompt,
+        8,
+        temp=0.8,
+        generator=torch.Generator().manual_seed(0),
+        counters=c,
+        prefill="chunked",
+    )
+    assert c["prefill_fallback"] == 1, c.line()
+    assert c["prefill_byte"] == 1 and "prefill_chunked" not in c, c.line()
+    why = _prefill_refusal(torch.device("cpu"))
+    assert why is not None and "cpu" in why, why
+    same = recurrent_decode(
+        model, prompt, 8, temp=0.8, generator=torch.Generator().manual_seed(0), prefill="byte"
+    )
+    assert out == same, "the counted fallback must BE the byte prefill"
+
+
+def test_the_chunked_prefill_glue_feeds_the_steps(monkeypatch):
+    """The chunked-prefill GLUE on CPU, with the recurrence substituted for the kernel.
+
+    `fla_status` is forced True and `forward_state` is the exact torch
+    recurrence, one position at a time (the substitution style of
+    `test_the_position_major_order_is_the_iteration_major_order`). The chunked
+    path then runs its real code — the dispatch, `_window(carry=True)`, the
+    per-iteration `[b, H, head_dim, head_dim]` fp32 state — and `step_state`
+    consumes that state through the torch arm. With one recurrence on both
+    sides the state must agree with the byte prefill to fp round-off (the
+    batched-vs-per-position forward), which is the wiring this gate exists for;
+    the GPU gate bounds the real kernel's summation order.
+    """
+    import dormouse.model.decode as decode_mod
+
+    model = tiny_model(moe_topk=0)
+    prompt = b"\x01 hi \n\x02 "
+    dev = torch.device("cpu")
+
+    def torch_window_state(attn, x, state=None, counters=None, *, carry=False):
+        """`forward_state`, one position at a time on the exact recurrence."""
+        outs, s = [], state
+        for i in range(x.shape[1]):
+            q, k, v, g, beta = attn.projections(x[:, i : i + 1])
+            o, s = _recurrent_step(q, k, v, g, beta, s, attn.scale)
+            outs.append(o)
+        return torch.cat(outs, dim=1).reshape(x.shape[0], x.shape[1], -1), (s if carry else None)
+
+    monkeypatch.setattr(decode_mod, "fla_status", lambda *a, **k: (True, "patched: CPU glue gate"))
+    monkeypatch.setattr(KDAAttention, "forward_state", torch_window_state)
+    with torch.no_grad():
+        ref_logits, ref_states = _prefill(model, list(prompt), dev)
+        c = Counters()
+        got_logits, got_states = _chunked_prefill(model, list(prompt), dev, c)
+    dl = float((got_logits - ref_logits).abs().max())
+    ds = max(float((a - b).abs().max()) for a, b in zip(got_states, ref_states, strict=True))
+    print(f"[chunked glue] max|dlogits|={dl:.3e} max|dstate|={ds:.3e}")
+    assert dl <= 1e-4, f"the chunked prefill's logits drifted: {dl}"
+    assert ds <= 1e-4, f"the chunked prefill's state drifted: {ds}"
+    # The dispatch itself: `auto` with the kernel "live" must choose chunked,
+    # and the bytes must be the byte prefill's (one recurrence on both sides).
+    gen = lambda: torch.Generator().manual_seed(0)  # noqa: E731 - a seed, not a function
+    c2 = Counters()
+    chunked = recurrent_decode(
+        model, prompt, 8, temp=1e-6, generator=gen(), counters=c2, prefill="auto"
+    )
+    assert c2["prefill_chunked"] == 1 and "prefill_byte" not in c2, c2.line()
+    byte = recurrent_decode(model, prompt, 8, temp=1e-6, generator=gen(), prefill="byte")
+    assert chunked == byte, "the chunked-prefill glue did not decode the byte prefill's stream"
+
+
+def test_auto_prefill_counts_the_arm_that_ran():
+    """`auto` on CPU is the byte prefill — COUNTED, and not a fallback."""
+    model = tiny_model(moe_topk=0)
+    c = Counters()
+    recurrent_decode(
+        model,
+        b"abcdefgh",
+        4,
+        temp=0.8,
+        generator=torch.Generator().manual_seed(0),
+        counters=c,
+    )
+    assert c["prefill_byte"] == 1 and "prefill_fallback" not in c, c.line()
+
+
+def test_a_bad_prefill_literal_is_loud():
+    model = tiny_model(moe_topk=0)
+    with pytest.raises(LoudError) as e:
+        recurrent_decode(model, b"abc", 2, prefill="fast")
+    assert "prefill" in str(e.value) and "Escape" in str(e.value)
 
 
 # ------------------------------------------------------------------------- the CLI
@@ -536,3 +641,61 @@ def test_the_fused_step_tracks_the_chunked_decode():
     )
     assert rel <= 5e-2, f"the step path's logits drifted from the window forward: {rel}"
     assert chunked == rec, "the greedy argmax did not survive the documented divergence"
+
+
+@_cuda_step
+def test_the_chunked_prefill_is_the_byte_prefill():
+    """The card's gate: ONE `chunk_kda` prefill == the byte steps, within contract.
+
+    The chunked prefill and the byte prefill are the same recurrence with
+    different summation orders (the module docstring's class: 1.3e-2 fp32 /
+    4.9e-2 bf16 of the output RMS at the port's shape). Bounded here: (1) the
+    last-position logits and the carried state stay inside that class, (2) at
+    `temp -> 0` both prefills decode the same bytes — a wiring error (a state
+    that is not the one `step_state` consumes) flips the argmax immediately. If
+    this goes red, report the measured gap; do not loosen the bound silently.
+    """
+    from dormouse.model.kda import fla_status
+
+    ok, why = fla_status("cuda", recheck=True)
+    assert ok, f"the chunked kernel must be live on THIS card: {why}"
+    torch.manual_seed(0)
+    cfg = tiny_cfg(bf16=False, moe_topk=0)
+    model = DormouseModel(cfg, device="cuda").eval()
+    prompt = b"The quick brown fox jumps over the lazy dog. "
+    dev = torch.device("cuda")
+    with torch.no_grad():
+        ref_logits, ref_states = _prefill(model, list(prompt), dev)
+        c = Counters()
+        got_logits, got_states = _chunked_prefill(model, list(prompt), dev, c)
+        chunked = recurrent_decode(
+            model,
+            prompt,
+            8,
+            temp=1e-6,
+            device=dev,
+            generator=torch.Generator(device=dev).manual_seed(0),
+            prefill="chunked",
+        )
+        byte = recurrent_decode(
+            model,
+            prompt,
+            8,
+            temp=1e-6,
+            device=dev,
+            generator=torch.Generator(device=dev).manual_seed(0),
+            prefill="byte",
+        )
+    assert c["prefill_chunked"] == 1, c.line()
+    rel = float((got_logits - ref_logits).abs().max()) / float(ref_logits.abs().max())
+    dmax = max(
+        float((a - b).abs().max()) / (float(b.abs().max()) + 1e-30)
+        for a, b in zip(got_states, ref_states, strict=True)
+    )
+    print(
+        f"[chunked prefill cuda] logits max/refmax={rel:.3e} state={dmax:.3e} "
+        f"greedy bytes equal={chunked == byte} {c.line()}"
+    )
+    assert rel <= 5e-2, f"the chunked prefill's logits drifted: {rel}"
+    assert dmax <= 5e-2, f"the chunked prefill's state drifted: {dmax}"
+    assert chunked == byte, "the greedy argmax did not survive the prefill divergence"

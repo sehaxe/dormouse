@@ -4,11 +4,18 @@ Two decisions keep this small, and both are calls into code that already
 exists rather than copies of it:
 
 * **Generation is `dormouse.model.decode`, called, not re-implemented.** The
-  server renders messages into a byte prompt and asks `decode_bytes` for bytes.
-  A `stream=true` response calls the SAME function on a growing context with
-  one seeded `torch.Generator`, so a streamed reply and one `max_tokens`-long
-  call draw the identical sample sequence — there is no second sampler that
-  could drift from the CLI's.
+  server renders messages into a byte prompt and asks the decoder for bytes.
+  The arm is decided ONCE, before the socket binds: `recurrent_decode` (the
+  state-carry, `O(1)`/byte path) when the model supports it and the caller did
+  not pass `--no-recurrent`, else `decode_bytes` — a requested recurrent decode
+  on a model that cannot run it falls back COUNTED (`recurrent_fallback`) with
+  the reason printed at startup. A `stream=true` response calls the SAME
+  function on a growing context with one seeded `torch.Generator`, so a
+  streamed reply and one `max_tokens`-long call draw the identical sample
+  sequence — there is no second sampler that could drift from the CLI's. (The
+  recurrent arm's chunked prefill on CUDA is the one summation-order deviation:
+  streamed and non-streamed stay equal within the documented class, not
+  bit-for-bit; on CPU the byte prefill keeps them bit-identical.)
 * **Loading is the CLI's own path, called, not copied** (`cli._snapshot_run`
   for resolution — the checkpoint's snapshot is authority, as in `eval`/
   `decode` — plus `cli._device`, the GPU preflight, so a card held by another
@@ -36,7 +43,13 @@ from urllib.parse import urlsplit
 import torch
 
 from .instrument import Counters, LoudError, loud
-from .model.decode import DEFAULT_TEMP, decode_bytes, encode
+from .model.decode import (
+    DEFAULT_TEMP,
+    decode_bytes,
+    encode,
+    recurrent_decode,
+    recurrent_refusal,
+)
 
 #: The hard ceiling on one reply, in bytes (this model's tokens ARE bytes).
 DEFAULT_MAX_TOKENS = 512
@@ -117,11 +130,13 @@ def load_checkpoint(
 
 
 class ServeState:
-    """What every request shares: the ONE model, its device, the counters.
+    """What every request shares: the ONE model, its device, its decode arm.
 
     One lock covers the forwards (`torch` modules and the seeded generator are
-    not concurrent), and it is held per `decode_bytes` call — never across a
-    socket write, or one slow reader would stall every other request.
+    not concurrent), and it is held per decode call — never across a socket
+    write, or one slow reader would stall every other request. `recurrent` is
+    the arm `build_server` decided BEFORE the socket bound: `True` runs
+    `recurrent_decode` (state-carry, `O(1)`/byte), `False` runs `decode_bytes`.
     """
 
     def __init__(
@@ -133,6 +148,7 @@ class ServeState:
         max_tokens_cap: int,
         temp: float,
         log: Any = print,
+        recurrent: bool = False,
     ) -> None:
         self.model = model
         self.run = run
@@ -142,8 +158,23 @@ class ServeState:
         self.temp = temp
         self.seed = run.train.seed
         self.log = log
+        self.recurrent = recurrent
         self.counters = Counters()
         self.lock = threading.Lock()
+
+
+def resolve_arm(model: Any, recurrent: bool) -> tuple[bool, str | None]:
+    """The serve arm decision, made BEFORE the socket binds: `(use_recurrent, why_not)`.
+
+    `recurrent=False` is the caller's choice and carries no reason; a requested
+    recurrent decode on a model that cannot run it (`recurrent_refusal`)
+    returns the reason, and the caller COUNTS `recurrent_fallback` and serves
+    `decode_bytes` instead of failing on the first request.
+    """
+    if not recurrent:
+        return False, None
+    why = recurrent_refusal(model)
+    return (True, None) if why is None else (False, why)
 
 
 #: Bytes that end a reply: the SFT template's end-of-answer, plus its pad.
@@ -151,7 +182,15 @@ _STOP = frozenset({0x03, 0x00})
 
 
 def _generate(state: ServeState, prompt: bytes, n: int, chunk: int = STREAM_BYTES) -> Iterator[str]:
-    """`n` bytes past `prompt`, decoded incrementally, as text pieces."""
+    """`n` bytes past `prompt`, decoded incrementally, as text pieces.
+
+    The arm is `state.recurrent`, decided once in `build_server` before the
+    socket bound. Either way the SAME call is re-made on a growing context
+    under ONE seeded generator: on the recurrent arm each re-call re-prefills
+    the context and carries on from the state a single call would have (byte
+    prefill on CPU, so byte-identical; chunked prefill on CUDA, equal within
+    the documented summation-order class).
+    """
     if not prompt:
         loud("empty prompt: the first window IS the prompt (model.decode's rule)")
     if n < 1:
@@ -163,18 +202,30 @@ def _generate(state: ServeState, prompt: bytes, n: int, chunk: int = STREAM_BYTE
         k = min(chunk, n - done)
         before = len(ctx)
         with state.lock:
-            ctx = decode_bytes(
-                state.model,
-                ctx,
-                k,
-                temp=state.temp,
-                device=state.device,
-                generator=gen,
-                # The SFT template's end-of-answer byte (0x03) ENDS a reply:
-                # without it the model pads a finished answer with its
-                # neighbours' tails, which is what the first chat smoke showed.
-                stop=_STOP,
-            )
+            if state.recurrent:
+                ctx = recurrent_decode(
+                    state.model,
+                    ctx,
+                    k,
+                    temp=state.temp,
+                    device=state.device,
+                    generator=gen,
+                    # The SFT template's end-of-answer byte (0x03) ENDS a reply:
+                    # without it the model pads a finished answer with its
+                    # neighbours' tails, which is what the first chat smoke showed.
+                    stop=_STOP,
+                    counters=state.counters,
+                )
+            else:
+                ctx = decode_bytes(
+                    state.model,
+                    ctx,
+                    k,
+                    temp=state.temp,
+                    device=state.device,
+                    generator=gen,
+                    stop=_STOP,
+                )
         delta = ctx[before:]
         hit = next((i for i, b in enumerate(delta) if b in _STOP), None)
         if hit is not None:
@@ -359,18 +410,37 @@ def build_server(
     device: str = "auto",
     max_tokens_cap: int = DEFAULT_MAX_TOKENS,
     temp: float = DEFAULT_TEMP,
+    recurrent: bool = True,
     log: Any = print,
 ) -> ServeServer:
-    """Load the checkpoint ONCE, bind, and return the ready server.
+    """Load the checkpoint ONCE, pick the decode arm, bind, and return the ready server.
 
-    `port=0` takes an ephemeral one, so a test can run the real socket path.
+    The arm decision happens HERE, before the socket binds, so the startup
+    lines name the arm that will serve every request — and a requested
+    recurrent decode on a model that cannot run it is COUNTED
+    (`recurrent_fallback`) with the reason, instead of failing on the first
+    request. `port=0` takes an ephemeral one, so a test can run the real
+    socket path.
     """
     if max_tokens_cap < 1:
         loud(f"--max-tokens-cap {max_tokens_cap}: must be >= 1")
     if temp <= 0:
         loud(f"--temp {temp}: use a positive temperature (decode's rule)")
     model, run, dev = load_checkpoint(out_dir, ckpt_name, device)
-    state = ServeState(model, run, dev, ckpt_name, max_tokens_cap, temp, log)
+    use_recurrent, why = resolve_arm(model, recurrent)
+    state = ServeState(
+        model, run, dev, ckpt_name, max_tokens_cap, temp, log, recurrent=use_recurrent
+    )
+    if why is not None:
+        state.counters.count("recurrent_fallback")
+        log(
+            f"serve: decode arm = plain (decode_bytes) — recurrent unavailable "
+            f"({why}); {state.counters.line()}"
+        )
+    elif use_recurrent:
+        log("serve: decode arm = recurrent (state-carry, O(1)/byte)")
+    else:
+        log("serve: decode arm = plain (decode_bytes; --no-recurrent)")
     httpd = ServeServer((host, port), make_handler(state))
     httpd.state = state
     return httpd

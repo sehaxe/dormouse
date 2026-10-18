@@ -35,7 +35,7 @@ same seed and temperature — the per-byte logits track, and the argmax usually
 survives, but a near-tie can flip. That is a documented deviation, not a bug,
 and the GPU gate (`tests/test_decode_recurrent.py`) is what keeps it bounded.
 
-Two more deviations, both COUNTED rather than hidden:
+Three more deviations, all COUNTED rather than hidden:
 
 * On a CPU box (no FLA) the step is the torch recurrence (`kda_step_torch`), not
   the SDPA fallback the training forward degrades to — SDPA has no `O(1)` state
@@ -47,6 +47,15 @@ Two more deviations, both COUNTED rather than hidden:
   one-byte step sees a one-token window. The bytes still come out, counted
   `recurrent_non_causal` once per call — `specdecode.py`'s rule for the same
   defect. `moe_topk = 0` (what `small` ships) is per position and immune.
+* The PREFILL is chunked when it can be: `prefill="auto"` (the default) runs
+  ONE `chunk_kda` pass over the prompt on a CUDA box with FLA live (COUNTED
+  `prefill_chunked`) instead of one step per prompt byte (COUNTED
+  `prefill_byte`), and an explicit `prefill="chunked"` that cannot run falls
+  back COUNTED as `prefill_fallback` + the reason. Chunked prefill and byte
+  prefill are the same recurrence with different summation orders — the
+  divergence class of the paragraph above — so the state the prefill leaves is
+  equivalent, not bit-equal, to the byte prefill's. `"byte"` is the arm that
+  keeps the streaming re-call trick byte-identical to a single call.
 """
 
 from __future__ import annotations
@@ -54,6 +63,7 @@ from __future__ import annotations
 import torch
 
 from ..instrument import Counters, loud
+from .kda import fla_status
 
 #: The pseudo-count temperature keeps sampling near-greedy but never zerolock.
 DEFAULT_TEMP = 0.8
@@ -185,6 +195,83 @@ def _step_logits(
     return logits[-1], states
 
 
+#: The prefill arms: `auto` picks chunked on a CUDA box with FLA live, else byte.
+PREFILL_ARMS = ("auto", "byte", "chunked")
+
+
+def recurrent_refusal(model) -> str | None:
+    """Why `recurrent_decode` cannot run on `model`, or `None` when it can.
+
+    The two refusals are `recurrent_decode`'s own (the byteflow shapes have no
+    byte `model.loop`; the block-sparse arm selects its blocks inside a window),
+    exposed so a server or a REPL can decide its arm BEFORE it binds a socket
+    and COUNT the fallback instead of failing on the first request.
+    """
+    loop = getattr(model, "loop", None)
+    if loop is None or getattr(model, "bf", None) is not None:
+        return (
+            "recurrent decode needs the byte-lm path (`model.loop`): the byteflow "
+            "shapes run the loop over K patch latents, not over the byte window. "
+            "Escape: use_byteflow=false, or plain decode."
+        )
+    if loop.msa is not None:
+        return (
+            "recurrent decode with use_msa: the block-sparse arm selects its blocks "
+            "INSIDE one window, and a one-byte step has no window to select in — that "
+            "is a model change wearing an inference flag. Escape: use_msa=false."
+        )
+    return None
+
+
+def _prefill_refusal(dev: torch.device) -> str | None:
+    """Why a CHUNKED prefill cannot run on `dev`, or `None` when it can.
+
+    The chunked prefill is ONE `chunk_kda` call (`LoopBlock._window` with
+    `carry=True`), so it needs the kernel the segmented training forward uses:
+    FLA live on a CUDA device. Everywhere else the byte prefill runs — the same
+    recurrence, one step per prompt byte.
+    """
+    ok, why = fla_status(dev)
+    return (
+        None if ok else f"the chunked prefill kernel (fla chunk_kda) is not live on {dev} ({why})"
+    )
+
+
+def _chunked_prefill(
+    model, ctx: list[int], dev: torch.device, counters: Counters
+) -> tuple[torch.Tensor, list]:
+    """ONE chunked forward over the prompt: (its last logits row, the state it leaves).
+
+    `LoopBlock._window` is the shared body of the one-shot forward, the
+    segmented training path and `recurrent_step`; with `carry=True` its
+    attention call is `KDAAttention.forward_state` — `chunk_kda` with
+    `initial_state=None` and `output_final_state=True` — so the state returned
+    is the `[b, H, head_dim, head_dim]` fp32 state `step_state` consumes, the
+    same layout `_forward_segmented` carries between segments.
+
+    HOOK POINT: the public entry point this deserves is a
+    `LoopBlock.prefill_state(h0, input_ids, counters) -> (out, states)` wrapper
+    around exactly this `_window` call; until it exists, decode reaches the
+    shared body directly rather than growing a second forward.
+    """
+    loop = model.loop
+    ids = torch.tensor([ctx], dtype=torch.long, device=dev)
+    h0 = model.embed(ids)
+    out, _, _, states = loop._window(
+        h0,
+        ids,
+        None,
+        None,
+        counters,
+        model.cfg.max_iter,
+        carry=True,
+        states=[None] * model.cfg.max_iter,
+    )
+    assert len(states) in (0, model.cfg.max_iter), f"{len(states)} states for {model.cfg.max_iter}"
+    logits = model.lm_head(model.norm(out.reshape(-1, model.cfg.d_model).to(torch.float32)))
+    return logits[-1], states
+
+
 def recurrent_decode(
     model,
     prompt: bytes,
@@ -195,40 +282,45 @@ def recurrent_decode(
     generator: torch.Generator | None = None,
     stop: frozenset[int] | None = None,
     counters: Counters | None = None,
+    prefill: str = "auto",
 ) -> bytes:
     """`decode_bytes`' contract, `O(1)` per byte — the state-carry decoder.
 
     Returns `prompt + n_new` sampled bytes (or fewer if a `stop` byte ends the
-    reply early), exactly as `decode_bytes`; `counters` is the only added
-    argument, and it is how a caller reads which arm ran (`kda_step` = the fused
-    decode kernel, `kda_step_torch` = the CPU recurrence, `recurrent_non_causal`
-    = a capacity-dropping MoE). The module docstring has the state-carry
-    mechanism, the numerics contract and the two COUNTED deviations.
+    reply early), exactly as `decode_bytes`; `counters` and `prefill` are the
+    added arguments, and `counters` is how a caller reads which arm ran
+    (`kda_step` = the fused decode kernel, `kda_step_torch` = the CPU
+    recurrence, `recurrent_non_causal` = a capacity-dropping MoE,
+    `prefill_chunked`/`prefill_byte` = the prefill arm). The module docstring
+    has the state-carry mechanism, the numerics contract and the three COUNTED
+    deviations.
 
-    Cost: the prompt is PREFILLED one byte at a time (position-major — the same
-    function the full-window forward computes, see `LoopBlock.recurrent_step`),
-    so a call is `O(len(prompt) + n_new)` steps of `O(1)` each. There is no
-    chunked prefill: on CPU there is no chunk kernel, and keeping the prefill on
-    the same arm as the steps means the state never changes representation.
+    Cost: the prefill is `prefill="auto"` (the default) — ONE chunked forward
+    over the prompt when the chunk kernel is live (CUDA + FLA, COUNTED
+    `prefill_chunked`), one step per prompt byte otherwise (COUNTED
+    `prefill_byte`; an explicit `"chunked"` that cannot run is COUNTED
+    `prefill_fallback` + the reason). Then `n_new` steps of `O(1)` each. The
+    two prefill arms are the same recurrence with different summation orders
+    (the numerics contract above), so the state they leave is equivalent, not
+    bit-equal — `"byte"` is the arm that keeps the serve streaming re-call
+    byte-identical to a single call, `"auto"` is the latency default.
     """
     if not prompt:
         loud("decode needs a non-empty prompt (the first window is the prompt)")
     if temp <= 0:
         loud(f"temp={temp}: use a positive temperature (0 means greedy, not this flag)")
-    loop = getattr(model, "loop", None)
-    if loop is None or getattr(model, "bf", None) is not None:
+    if prefill not in PREFILL_ARMS:
         loud(
-            "recurrent decode needs the byte-lm path (`model.loop`): the byteflow "
-            "shapes run the loop over K patch latents, not over the byte window. "
-            "Escape: use_byteflow=false, or plain decode."
+            f"prefill={prefill!r}: use one of {PREFILL_ARMS}. Escape: 'auto' picks the "
+            f"chunked kernel on a CUDA box with FLA, 'byte' is one step per prompt byte, "
+            f"'chunked' demands the chunked kernel (COUNTED fallback to byte when it "
+            f"cannot run)."
         )
-    if loop.msa is not None:
-        loud(
-            "recurrent decode with use_msa: the block-sparse arm selects its blocks "
-            "INSIDE one window, and a one-byte step has no window to select in — that "
-            "is a model change wearing an inference flag. Escape: use_msa=false."
-        )
+    why = recurrent_refusal(model)
+    if why is not None:
+        loud(why)
     counters = Counters() if counters is None else counters
+    loop = model.loop
     if loop.moe.topk > 0 and loop.moe.capacity > 0.0:
         counters.count("recurrent_non_causal")
     dev = torch.device(device) if device is not None else torch.device("cpu")
@@ -239,9 +331,23 @@ def recurrent_decode(
     drop = 0 if loop.engram is None else max(loop.engram.orders) - 1
     states: list = [None] * model.cfg.max_iter
     with torch.no_grad():
-        logits = None
-        for _ in range(len(ctx)):  # prefill: one step per prompt byte
-            logits, states = _step_logits(model, ctx, states, dev, drop, counters)
+        chunked = prefill == "chunked"
+        if prefill == "auto":
+            chunked = _prefill_refusal(dev) is None
+        elif chunked:
+            why = _prefill_refusal(dev)
+            if why is not None:
+                counters.count("prefill_fallback")
+                counters.why = why  # type: ignore[attr-defined]
+                chunked = False
+        if chunked:
+            counters.count("prefill_chunked")
+            logits, states = _chunked_prefill(model, ctx, dev, counters)
+        else:
+            counters.count("prefill_byte")
+            logits = None
+            for _ in range(len(ctx)):  # prefill: one step per prompt byte
+                logits, states = _step_logits(model, ctx, states, dev, drop, counters)
         while True:
             probs = torch.softmax(logits / temp, dim=-1)
             nxt = int(torch.multinomial(probs, 1, generator=generator))

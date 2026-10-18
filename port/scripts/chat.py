@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from dormouse.cli import _snapshot_run  # noqa: E402
 from dormouse.instrument import Counters, loud  # noqa: E402
 from dormouse.model import DormouseModel  # noqa: E402
-from dormouse.model.decode import decode_bytes, recurrent_decode  # noqa: E402
+from dormouse.model.decode import decode_bytes, recurrent_decode, recurrent_refusal  # noqa: E402
 from dormouse.model.specdecode import spec_decode_bytes  # noqa: E402
 from dormouse.train.loop import load_model_state, unpack_state_dict  # noqa: E402
 
@@ -51,9 +51,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--recurrent",
-        action="store_true",
-        help="state-carry decode: carry the KDA state across bytes (O(1)/byte); off "
-        "by default, and its bytes are not guaranteed to be the plain decoder's",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="state-carry decode (O(1)/byte) when the model supports it — the "
+        "default; --no-recurrent forces the plain window re-forward. A model that "
+        "cannot run it falls back COUNTED (recurrent_fallback) with the reason.",
     )
     p.add_argument("--ask", default="", help="one question, print the answer, exit")
     return p
@@ -85,7 +87,13 @@ def main() -> None:
     model = model.to(device).eval()
     step = ck.get("step", "?")
     temp, n_new, spec_k = args.temp, args.n, args.spec_k
-    recurrent = args.recurrent
+    # The same arm decision `serve` makes, once at startup: a requested recurrent
+    # decode on a model that cannot run it falls back COUNTED with the reason,
+    # not on the first question.
+    why = recurrent_refusal(model) if args.recurrent else None
+    recurrent = args.recurrent and why is None
+    if why is not None:
+        print(f"chat: recurrent unavailable ({why}) -> plain decode; recurrent_fallback=1")
 
     def answer(question: str) -> bytes:
         prompt = bytes([USER]) + question.encode("utf-8") + b"\n" + bytes([ASSIST])
@@ -162,6 +170,9 @@ def main() -> None:
             print(f"spec k = {spec_k or 'off'}")
             continue
         if line.startswith("/recurrent"):
+            if why is not None:
+                print(f"recurrent unavailable: {why}")
+                continue
             recurrent = not recurrent
             print(f"recurrent = {'on' if recurrent else 'off'}")
             continue
