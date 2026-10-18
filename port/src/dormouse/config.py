@@ -387,7 +387,9 @@ class ModelConfig:
     #: which needs a 2^k `d_model` — refused at load, not silently padded).
     act_quant: str = "none"
     #: Activation columns per scale: 0 = one scale per token (row), else one per
-    #: group of `act_group` columns (the a4.8 FFN recipe). Must divide `d_model`,
+    #: group of `act_group` columns — OUR convention (the a4.8 paper has no
+    #: groups; see `model/act_quant.py`'s table and
+    #: `docs/research/2026-10-18-act4.md` §3.1). Must divide `d_model`,
     #: because the quantizer reshapes the activations to `[..., d/group, group]`
     #: and a non-divisor fails on the first forward, far from the flag (`validate`
     #: refuses it, mirroring `config/validation.rs:220-231`).
@@ -885,7 +887,8 @@ def validate(model: ModelConfig) -> None:
         loud(
             f"act_quant={model.act_quant!r} is not an activation format. Known: "
             f"{list(ACT_QUANTS)} — `none` off, `int8`/`int4` symmetric integer "
-            f"levels (arXiv 2504.12285 §2.2; 127/7, formulas in "
+            f"levels (int8 per-token absmax: 2B4T arXiv 2504.12285; int4 127/7 "
+            f"and the group rule are our convention — formulas in "
             f"model/act_quant.py), `fp4` e2m1 (the OCP MX FP4 grid), `mxfp8` the "
             f"OCP MX e4m3 codec (spec §5.2), `v2_int4`/`v2_int8` BitNet v2's "
             f"Hadamard-rotated integer arms (arXiv 2504.18415). Escape: name one "

@@ -27,10 +27,14 @@ also REFUSE a non-zero `act_group` (`config.py:889`), so a driver that mixed the
 in could not hold one `act_group` across arms.
 
 **The companion key** (`config.py:398`): `act_group` — columns per scale,
-`0` = one scale per token, else the a4.8 FFN group recipe. `0` is the default and
-is held across every arm here, so the arms differ in the FORMAT alone. The
-published a4.8 FFN recipe is group scales (a divisor of `d_model` 768, e.g. 128);
-that is a SECOND axis and its own A/B, not a free variable in this one. A
+`0` = one scale per token, else a per-group scale. `0` is the default and
+is held across every arm here, so the arms differ in the FORMAT alone. NOTE
+(2026-10-18 research, `docs/research/2026-10-18-act4.md` §3.1): the "a4.8 FFN
+group recipe" was OUR mis-attribution — the a4.8 paper (`2411.04965`) has no
+groups ("group" appears zero times); its scales are γ=max|X| (8-bit) and
+β=2·mean|X| (INT4 FFN-down). The training literature's granularity is block
+16/32 (NVFP4/MXFP4), never 128. Group scales remain a runnable axis, but it
+tests our convention, not a published recipe. A
 non-divisor is refused at load (`config.py:911`), not at the first forward.
 
 **Protocol** (`docs/protocols/AB-PROTOCOL.md`): 3 seeds per arm, 2 000 steps,

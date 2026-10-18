@@ -6,10 +6,10 @@ formula below is transcribed from that file, named line by line.
 
 | what | burn source | paper |
 |---|---|---|
-| e2m1 grid, tie rule | `act_quant.rs:150-170` (`fp4_round`) | OCP MX FP4 spec; `2504.12285` §2.2 |
+| e2m1 grid, tie rule | `act_quant.rs:150-170` (`fp4_round`) | OCP MX FP4 spec §5.3.3 |
 | `max_value` (block max → FORMAT max) | `act_quant.rs:54-59` | — (the fix for the 3-level bug) |
-| `attn()` — attention never below 8 bits | `act_quant.rs:38-46` | a4.8 `2504.12285` |
-| per-token / per-group scale, STE | `act_quant.rs:70-104` | a4.8 group scales |
+| `attn()` — attention never below 8 bits | `act_quant.rs:38-46` | a4.8 `2411.04965` |
+| per-token / per-group scale, STE | `act_quant.rs:70-104` | OUR convention (a4.8 has no groups) |
 
 THE FORMULA (one line, both formats):
 
