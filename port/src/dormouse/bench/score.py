@@ -89,7 +89,7 @@ def score_choices(
         start = len(ctx) - 1
         rows = logits[start : start + len(choice)].float()
         logp = torch.log_softmax(rows, dim=-1)
-        target = torch.tensor(list(choice), dtype=torch.long)
+        target = torch.tensor(list(choice), dtype=torch.long, device=logp.device)
         out.append(
             ChoiceScore(
                 logp=float(logp.gather(1, target[:, None]).sum()),
