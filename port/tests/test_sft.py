@@ -20,6 +20,7 @@ from dormouse.cli import app
 from dormouse.config import ModelConfig, RunConfig, TrainConfig
 from dormouse.instrument import Counters, LoudError
 from dormouse.model import DormouseModel
+from dormouse.model.engram import enable_host_tables, host_engrams
 from dormouse.train.data import ByteStream
 from dormouse.train.sft import (
     ASSIST,
@@ -276,11 +277,54 @@ def test_sft_refuses_a_window_that_spans_two_examples(tmp_path: Path):
     assert "spans two examples" in str(e.value) and "build-sft" in str(e.value)
 
 
-def test_sft_refuses_engram_ram(tmp_path: Path):
-    run = sft_run(tmp_path, steps=1, engram_ram=True)
-    with pytest.raises(LoudError) as e:
-        sft_train(DormouseModel(run.model), run, log=lambda *_: None)
-    assert "engram_ram" in str(e.value) and "Escape" in str(e.value)
+def test_sft_engram_ram_trains_the_host_tables_and_saves_their_sidecar(tmp_path: Path):
+    """`engram_ram=true` is the host path, not a refusal (it was a LOUD refusal
+    until the `--init-from` loader landed: tonight's pretrain writes such a
+    checkpoint, and a handoff from it is impossible while the loop cannot step
+    host tables). The tables leave VRAM, the loop STEPS them once per training
+    step (COUNTED `engram_host_updates`/`..._rows`), and `save_ckpt` writes the
+    `.ngram` sibling this run's own resume needs."""
+    run = sft_run(tmp_path, steps=3, log_every=1, ckpt_every=3, engram_ram=True)
+    model = DormouseModel(run.model)
+    before = [
+        p.detach().clone() for k, p in model.state_dict().items() if k.endswith("engram.tables")
+    ]
+    assert before, "the fixture must start with an in-VRAM table to host"
+    lines: list[str] = []
+    report = sft_train(model, run, log=lines.append)
+    hosts = host_engrams(model)
+    assert len(hosts) == 1
+    assert not any(k.endswith("engram.tables") for k in model.state_dict())
+    assert report["counters"]["engram_host_updates"] == 3
+    assert report["counters"]["engram_host_update_rows"] > 0
+    assert not torch.equal(hosts[0].host.rows, before[0]), "the host tables must train"
+    assert (Path(run.train.out_dir) / "s.ngram").is_file()
+    step3 = [ln for ln in lines if ln.startswith("sft step=3")]
+    assert step3 and "engram_host_updates=1" in step3[0]  # the WINDOW's count: one per step
+    assert "table set(s) in host RAM" in lines[0]
+
+
+def test_sft_engram_ram_resume_restores_the_sidecar(tmp_path: Path):
+    """A host-table SFT run resumes through the same loader: `load_ckpt` refuses
+    a missing `.ngram`, and the tables continue from the checkpoint's rows
+    (`lr=1e-6`, so the resumed step leaves them where the load put them)."""
+    run = sft_run(tmp_path, steps=2, log_every=1, ckpt_every=2, lr=1e-6, engram_ram=True)
+    sft_train(DormouseModel(run.model), run, log=lambda *_: None)
+    ng = Path(run.train.out_dir) / "s.ngram"
+    assert (Path(run.train.out_dir) / "s.pt").is_file() and ng.is_file()
+    saved = torch.load(ng, map_location="cpu", weights_only=True)["engrams"][0]["rows"]
+
+    model = DormouseModel(run.model)
+    longer = dataclasses.replace(run, train=dataclasses.replace(run.train, steps=4))
+    report = sft_train(model, longer, resume=True, log=lambda *_: None)
+    hosts = host_engrams(model)
+    assert hosts, "the resumed run must be on host tables"
+    assert float((hosts[0].host.rows - saved).abs().max()) < 1e-3, (
+        "the resume must restore the sidecar"
+    )
+    # `save_ckpt` stamps the 0-BASED index of the completed step, so the resume
+    # starts at step 2 and runs 2..3 = two steps.
+    assert report["counters"]["engram_host_updates"] == 2
 
 
 # --------------------------------------------------------------------------- the CLI
@@ -394,6 +438,76 @@ def test_cli_sft_refuses_a_resume_without_a_checkpoint(tmp_path: Path):
     assert "resume" in str(r.exception)
 
 
+def test_cli_sft_init_from_an_engram_ram_checkpoint(tmp_path: Path):
+    """The CLI shape of the pretrain handoff: `sft --init-from <engram_ram
+    checkpoint>` with `--set engram_ram=true` (the substrate the checkpoint
+    records — a mismatch is a LOUD refusal, see the library gates).
+
+    The checkpoint is built from the CLI's OWN resolved run, so the strict load
+    has nothing to forgive; the run writes its own `.ngram` at the checkpoint
+    cadence, which is what makes the SFT run resumable."""
+    from dormouse.config import load_run
+    from dormouse.train.loop import save_ckpt
+    from dormouse.train.optim import MixOptimizer
+
+    preset = _preset(tmp_path)
+    pre = load_run(
+        str(preset),
+        train_overrides={
+            "engram_ram": True,
+            "out_dir": str(tmp_path / "pre"),
+            "ckpt_name": "pre",
+            "seq_len": 64,
+            "batch": 2,
+        },
+    )
+    model = DormouseModel(pre.model)
+    assert enable_host_tables(model) == 1
+    ids = torch.arange(2 * 64, dtype=torch.long).view(2, 64) % 251
+    model(ids)[0].sum().backward()
+    opt = MixOptimizer(model, lr=pre.train.lr, wd=pre.train.wd, opt=pre.train.opt)
+    save_ckpt(pre, model, opt, 0)
+    ckpt = tmp_path / "pre" / "pre.pt"
+    assert ckpt.is_file() and ckpt.with_suffix(".ngram").is_file()
+
+    r = runner.invoke(
+        app,
+        [
+            "sft",
+            str(preset),
+            "--data",
+            str(tmp_path / "sft.bin"),
+            "--build-sft",
+            "--n-tasks",
+            "4",
+            "--init-from",
+            str(ckpt),
+            "--ckpt-name",
+            "s",
+            "--set",
+            f"out_dir={tmp_path / 'ck'}",
+            "--set",
+            "engram_ram=true",
+            "--set",
+            "batch=2",
+            "--set",
+            "seq_len=64",
+            "--set",
+            "steps=2",
+            "--set",
+            "log_every=1",
+            "--set",
+            "ckpt_every=2",
+            "--device",
+            "cpu",
+        ],
+    )
+    assert r.exit_code == 0, r.output
+    assert "table set(s) in host RAM" in r.output
+    assert "sft init: weights from" in r.output
+    assert (tmp_path / "ck" / "s.ngram").is_file(), "the SFT run saves its own sidecar"
+
+
 def test_init_from_seeds_weights_without_the_config_gate(tmp_path):
     """`--init-from` loads WEIGHTS from a foreign checkpoint: no config gate
     (that is `resume`'s job), no optimizer state, and a LOUD refusal for a
@@ -425,8 +539,121 @@ def test_init_from_seeds_weights_without_the_config_gate(tmp_path):
         )
     bad = tmp_path / "bad.pt"
     torch.save({"model": {"nope": torch.zeros(1)}}, bad)
-    with pytest.raises(LoudError, match="do not exist|absent"):
+    # A model half with no `engram.tables` is EITHER a host-table checkpoint or
+    # the wrong architecture; this run is in-VRAM, so both are refused with the
+    # substrate message (the keys torch would name are the same mismatch, caught
+    # one step earlier — see `_init_cfg`).
+    with pytest.raises(LoudError, match="carries no `engram.tables`"):
         sft_train(DormouseModel(run.model), run, init_from=str(bad), log=lambda *_: None)
+
+
+# --- the engram_ram handoff: one loader, and the substrate it leaves behind ---
+
+
+def _host_ckpt(run: RunConfig, fill: float = 0.5) -> Path:
+    """A host-table checkpoint pair (model half + `.ngram` sibling), CPU-only.
+
+    Built the way a `--engram-ram` pretrain run saves: `enable_host_tables`
+    (the tables leave the parameter list) then `save_ckpt`, which writes the
+    sibling from `host_state`. The rows are FILLED so the transfer is checkable
+    — a fresh init's rows are ~N(0, 0.02), never 0.5.
+    """
+    from dormouse.train.loop import save_ckpt
+    from dormouse.train.optim import MixOptimizer
+
+    model = DormouseModel(run.model)
+    assert enable_host_tables(model) == 1
+    for m in host_engrams(model):
+        m.host.rows.fill_(fill)
+    ids = torch.arange(BATCH * SEQ, dtype=torch.long).view(BATCH, SEQ) % 251
+    model(ids)[0].sum().backward()
+    opt = MixOptimizer(model, lr=run.train.lr, wd=run.train.wd, opt=run.train.opt)
+    save_ckpt(run, model, opt, 0)
+    return Path(run.train.out_dir) / f"{run.train.ckpt_name}.pt"
+
+
+def test_init_from_an_engram_ram_checkpoint_loads_and_sft_trains(tmp_path: Path):
+    """Gate (a): `--init-from` a host-table checkpoint (tonight's pretrain shape)
+    loads through `load_model_state` and SFT trains on it.
+
+    The rows ARE the checkpoint's — `lr=1e-6` keeps them where the load put them
+    (0.5) while the model half still takes a step — and the memory is STEPPED
+    (the host counters fire). A raw `load_state_dict` refused this checkpoint
+    outright (`Missing key(s): "loop.engram.tables"`).
+    """
+    pre = sft_run(
+        tmp_path, steps=1, ckpt_name="pretrain", out_dir=str(tmp_path / "pre"), engram_ram=True
+    )
+    ckpt = _host_ckpt(pre)
+    run = sft_run(tmp_path, steps=1, log_every=1, lr=1e-6, engram_ram=True)
+    model = DormouseModel(run.model)
+    lines: list[str] = []
+    report = sft_train(model, run, init_from=str(ckpt), log=lines.append)
+    assert math.isfinite(report["loss"])
+    hosts = host_engrams(model)
+    assert len(hosts) == 1
+    assert float((hosts[0].host.rows - 0.5).abs().max()) < 1e-3, "the checkpoint's rows must arrive"
+    assert report["counters"]["engram_host_updates"] == 1
+    assert report["counters"]["engram_host_update_rows"] > 0
+    assert any(ln.startswith("sft init: weights from") for ln in lines)
+
+
+def test_init_from_a_host_checkpoint_without_its_sidecar_is_loud(tmp_path: Path):
+    """Gate (b): on the host path the sibling `.ngram` IS the memory's state, so
+    a missing one is the loader's LOUD refusal — never freshly seeded rows."""
+    pre = sft_run(
+        tmp_path, steps=1, ckpt_name="pretrain", out_dir=str(tmp_path / "pre"), engram_ram=True
+    )
+    ckpt = _host_ckpt(pre)
+    assert ckpt.with_suffix(".ngram").is_file()
+    ckpt.with_suffix(".ngram").unlink()
+    run = sft_run(tmp_path, steps=1, engram_ram=True)
+    with pytest.raises(LoudError, match=r"Escape: restore the \.ngram"):
+        sft_train(DormouseModel(run.model), run, init_from=str(ckpt), log=lambda *_: None)
+
+
+def test_init_from_an_in_vram_checkpoint_still_loads(tmp_path: Path):
+    """Gate (c): the old path is unbroken — a checkpoint whose tables ARE in the
+    model half loads into an in-VRAM run, with no host switch and no `.ngram`."""
+    run = sft_run(tmp_path, steps=1, log_every=1, lr=1e-6)
+    src = DormouseModel(run.model)
+    with torch.no_grad():
+        for key, p in src.state_dict().items():
+            if key.endswith("engram.tables"):
+                p.fill_(0.25)
+    foreign = tmp_path / "vram.pt"
+    torch.save({"model": src.state_dict(), "step": 3}, foreign)
+
+    model = DormouseModel(run.model)
+    report = sft_train(model, run, init_from=str(foreign), log=lambda *_: None)
+    assert math.isfinite(report["loss"])
+    assert not host_engrams(model)
+    tables = [p for k, p in model.state_dict().items() if k.endswith("engram.tables")]
+    assert len(tables) == 1
+    assert float((tables[0] - 0.25).abs().max()) < 1e-3
+    assert not foreign.with_suffix(".ngram").exists()
+
+
+def test_init_from_refuses_a_substrate_mismatch(tmp_path: Path):
+    """The flag decides the host switch (BEFORE the optimizer), the loop's host
+    step and the `.ngram` write — so a run whose `engram_ram` disagrees with the
+    init checkpoint's substrate is refused, not silently degraded."""
+    host_ckpt = _host_ckpt(
+        sft_run(tmp_path, steps=1, ckpt_name="pre", out_dir=str(tmp_path / "pre"), engram_ram=True)
+    )
+    vram = tmp_path / "vram.pt"
+    torch.save({"model": DormouseModel(sft_run(tmp_path, steps=1).model).state_dict()}, vram)
+
+    # a host-table init into an in-VRAM run: the tables would be read, never
+    # stepped, never saved
+    run = sft_run(tmp_path, steps=1)
+    with pytest.raises(LoudError, match="--set engram_ram=true"):
+        sft_train(DormouseModel(run.model), run, init_from=str(host_ckpt), log=lambda *_: None)
+
+    # an in-VRAM init into a host-table run: the switch would drop its memory
+    host_run = sft_run(tmp_path, steps=1, engram_ram=True)
+    with pytest.raises(LoudError, match="--set engram_ram=false"):
+        sft_train(DormouseModel(host_run.model), host_run, init_from=str(vram), log=lambda *_: None)
 
 
 def test_chat_jsonl_rows_are_filtered_capped_and_deterministic(tmp_path):

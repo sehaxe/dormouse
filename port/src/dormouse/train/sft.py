@@ -32,12 +32,26 @@ mismatch looks like.
 **What is reused vs copied.** Reused by import: `ByteStream` (the byte stream
 contract), `wsd_lr` (the schedule — WSD, the same one `train()` runs, rather than
 a second schedule to keep honest), `warmup_steps`, `MixOptimizer` + `clip_grads`,
-`save_ckpt`/`load_ckpt`, `kda_field` and `Counters`. **Copied verbatim from
-`train()` (`loop.py`):** the NaN firewall (finite check → skip → count →
-`nan_skipped`, and the two-consecutive-all-non-finite-windows `LoudError`) and the
-log/JSON cadence. It is copied, not shared, because `loop.py` belongs to another
-lane this round; a `firewall()` helper both loops call is the follow-up, and the
-two copies must not drift before it lands.
+`save_ckpt`/`load_ckpt`/`load_model_state`, `kda_field` and `Counters`. **Copied
+verbatim from `train()` (`loop.py`):** the NaN firewall (finite check → skip →
+count → `nan_skipped`, and the two-consecutive-all-non-finite-windows `LoudError`)
+and the log/JSON cadence. It is copied, not shared, because `loop.py` belongs to
+another lane this round; a `firewall()` helper both loops call is the follow-up,
+and the two copies must not drift before it lands.
+
+**The host-table path (`engram_ram`), and why SFT drives it.** A pretrain
+checkpoint from a `--engram-ram` run stores its memory OUTSIDE the model half
+(the sibling `<ckpt>.ngram`; `Engram.to_host` deletes the `engram.tables`
+parameter), so `--init-from` such a checkpoint has to go through
+`load_model_state` — and that loader leaves the model ON host tables. This loop
+therefore owns that substrate the way `train()` does: enable before the
+optimizer exists, one `host_step_all` per training step, the same counters, and
+`drop_pending` on a NaN-skipped step. Without it the memory would be read every
+forward and never trained — a SILENT degradation, and a `_pending` list that
+grows one step at a time. `cfg.engram_ram` must AGREE with the init
+checkpoint's substrate (`_init_cfg` refuses a mismatch loudly): the flag is what
+`save_ckpt` keys the `.ngram` write off, so a host model under an `engram_ram=false`
+run would lose its memory at the first checkpoint.
 
 **The objective.** The model is called with `targets=None` (the decode forward:
 no in-loop `L_Rec`), and the CE is taken on the logits it returns, masked. That
@@ -47,6 +61,7 @@ eval line's `fin` scores, so SFT trains exactly the readout generation reads.
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import random
 import time
@@ -55,11 +70,12 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-from ..config import RunConfig
+from ..config import RunConfig, TrainConfig
 from ..instrument import Counters, LoudError, StepTimer, loud
+from ..model.engram import Engram, enable_host_tables, host_engrams, host_step_all
 from ..post.tasks import build_tasks
 from .data import ByteStream, warmup_steps
-from .loop import kda_field, load_ckpt, save_ckpt
+from .loop import kda_field, load_ckpt, load_model_state, save_ckpt, unpack_state_dict
 from .lr import wsd_lr
 from .optim import MixOptimizer, clip_grads
 
@@ -606,6 +622,50 @@ def sft_loss(logits: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor) ->
 # ---------------------------------------------------------------------------
 
 
+def _init_cfg(cfg: TrainConfig, path: Path, sd: dict, model: torch.nn.Module) -> TrainConfig:
+    """The cfg that describes the INIT FILE: its substrate and its sidecar path.
+
+    `load_model_state` reads the substrate from `cfg.engram_ram` and finds the
+    `.ngram` sibling through `cfg.out_dir`/`cfg.ckpt_name`, so an init load
+    cannot use the SFT run's own cfg — that names the sidecar THIS run will
+    write, not the init file's. The substrate is read from the FILE, not from a
+    flag: a host-table checkpoint's model half carries no `engram.tables`
+    (`Engram.to_host` deletes the parameter), which is the file's own statement
+    of where its memory lives.
+
+    The run's `engram_ram` must AGREE with the file's, and a disagreement is
+    LOUD, because the flag decides three things a mismatch would corrupt: the
+    host switch happens BEFORE the optimizer exists (a switch after it leaves
+    the tables in a parameter group that then steps a deleted tensor), the loop
+    steps the tables only when the flag is on, and `save_ckpt` writes the
+    `.ngram` only when it is on.
+    """
+    tables_in_file = any(k.endswith("engram.tables") for k in sd)
+    has_engram = any(isinstance(m, Engram) for m in model.modules())
+    host = has_engram and not tables_in_file
+    if host and not cfg.engram_ram:
+        loud(
+            f"sft --init-from: {path}'s model half carries no `engram.tables`: it "
+            f"is a host-table run (its rows are the sibling `{path.stem}.ngram`), "
+            f"or it is not this model's checkpoint at all. This run is configured "
+            f"engram_ram=false, so the memory could not be loaded: a host-table "
+            f"load switches the model to host tables after the optimizer exists, "
+            f"and the run would read a memory it never steps and never saves. "
+            f"Escape: --set engram_ram=true (the pretrain's substrate), or an init "
+            f"checkpoint whose model half carries the tables."
+        )
+    if tables_in_file and cfg.engram_ram:
+        loud(
+            f"sft --init-from: {path} carries its Engram in the model half "
+            f"(`engram.tables`) but this run is configured engram_ram=true. "
+            f"Switching to host tables would DROP the checkpoint's memory — the "
+            f"host path starts from the model's own rows and this run's `.ngram` "
+            f"sibling does not exist yet. Escape: --set engram_ram=false, or "
+            f"re-save the init as a host-table run (with its `.ngram` sibling)."
+        )
+    return dataclasses.replace(cfg, engram_ram=host, out_dir=str(path.parent), ckpt_name=path.stem)
+
+
 def sft_train(
     model: torch.nn.Module,
     run: RunConfig,
@@ -630,18 +690,15 @@ def sft_train(
 
     `device` is the batch seam, as in `train()`: the stream hands out CPU
     tensors and the caller names where the model lives.
+
+    `init_from` loads WEIGHTS through `load_model_state` (the ONE checkpoint
+    loader), so an `engram_ram` pretrain checkpoint — whose model half carries
+    no `engram.tables` — loads too: the helper switches the model to host tables
+    and restores the sibling `.ngram`, and this loop then owns that substrate
+    (see the module docstring). The run's `engram_ram` must match the
+    checkpoint's; `_init_cfg` refuses a mismatch loudly.
     """
     cfg = run.train
-    if cfg.engram_ram:
-        # LOUD, not a fallback: the host path's state is a `.ngram` sidecar that
-        # `train()` writes and steps and this loop does neither, so the run would
-        # report host tables while the memory trained in VRAM.
-        loud(
-            "sft with engram_ram=true: the host-table path's state is a `.ngram` "
-            "sidecar that this loop does not enable, step or save (`train()` does "
-            "all three). Escape: engram_ram=false, or port the host step into "
-            "sft_train."
-        )
     torch.set_float32_matmul_precision("high" if cfg.tf32 else "highest")
     device = None if device is None else torch.device(device)
     if stream is None:
@@ -655,6 +712,26 @@ def sft_train(
         # look healthy while the model only predicts answer marginals.
         eval_stream = ByteStream(cfg.eval_data, cfg.batch, cfg.seq_len)
     model.train()
+    if cfg.engram_ram:
+        # The host path's substrate, switched BEFORE the optimizer exists — the
+        # rule `train()` carries (`loop.py:495-500`): `Engram.to_host` DELETES
+        # the table parameter, so a group built first would hold a dead tensor
+        # and step it every step for nothing (402M params at b1).
+        # `enable_host_tables`, not `host_tables`: the CUDA-only refusal is a
+        # training VRAM-budget rule, and on a CPU model the host path's NUMERICS
+        # are device-agnostic (the tables ARE CPU memory) — the same call
+        # `load_model_state` makes, for the same reason.
+        enable_host_tables(model)
+        if not host_engrams(model):
+            loud(
+                "sft engram_ram=true but the model has no Engram to host "
+                "(use_engram=false?): the flag would host nothing while the run "
+                "reported it on. Escape: use_engram=true, or engram_ram=false."
+            )
+        log(
+            f"engram_ram: {len(host_engrams(model))} table set(s) in host RAM, VRAM "
+            f"holds the batch's unique rows"
+        )
     opt = MixOptimizer(
         model,
         lr=cfg.lr,
@@ -685,23 +762,25 @@ def sft_train(
         if not path.is_file():
             loud(f"sft --init-from: {path} does not exist. Escape: the pretrain run's .pt path.")
         foreign = torch.load(path, map_location="cpu", weights_only=False)
-        state = foreign.get("model", foreign)
-        missing, unexpected = model.load_state_dict(state, strict=False)
-        if unexpected:
-            loud(
-                f"sft --init-from: {len(unexpected)} tensors in {path} do not exist "
-                f"in this model ({list(unexpected)[:4]}...). Escape: the checkpoint "
-                f"and the preset must be the same architecture."
-            )
-        if missing:
-            loud(
-                f"sft --init-from: {len(missing)} model tensors are absent from "
-                f"{path} ({list(missing)[:4]}...). Escape: same-architecture preset."
-            )
+        sd = unpack_state_dict(foreign.get("model", foreign), foreign.get("model_quant_rung"))
+        # The ONE loader (`load_model_state`), which is what makes a host-table
+        # init possible at all: such a checkpoint's model half carries no
+        # `engram.tables`, so the raw `load_state_dict` this replaced refused
+        # every b1/medium checkpoint with `Missing key(s)`. The helper switches
+        # the model to host tables BEFORE the load and restores the
+        # `<ckpt>.ngram` sibling; a missing sibling is its LOUD refusal, never
+        # freshly seeded rows. STRICT: a pretrain -> SFT transfer is the same
+        # architecture by construction, so the substrate is the only legal
+        # difference — and `_init_cfg` refuses a substrate mismatch before the
+        # load, which is why strict can stay strict.
+        load_model_state(model, _init_cfg(cfg, path, sd, model), sd, strict=True)
         log(f"sft init: weights from {path} (step {foreign.get('step', '?')}), fresh optimizer")
     if resume:
         ck, _stored = load_ckpt(run)
-        model.load_state_dict(ck["model"])
+        # The same ONE loader as the init path (and as `train()`'s resume): a
+        # host-table run's model half has no `engram.tables`, and `load_ckpt`
+        # already refused a missing `.ngram` (`require_ngram`).
+        load_model_state(model, cfg, ck["model"])
         opt.load_state_dict(ck["opt"])
         start = int(ck["step"]) + 1
         if start:
@@ -782,12 +861,29 @@ def sft_train(
             if cfg.grad_clip > 0:
                 clip_grads(model.parameters(), cfg.grad_clip)
             opt.step()
+            if cfg.engram_ram:
+                # The host update runs ONCE per TRAINING step, after the
+                # optimizer — the same rule and the same counters as `train()`
+                # (`loop.py:761-772`): the loop reads the memory once per
+                # ITERATION and `host_step` sums those into one update per row,
+                # and a NaN-skipped step (below) updates nothing.
+                updates, rows = host_step_all(model, lr)
+                total.count("engram_host_updates", updates)
+                window.count("engram_host_updates", updates)
+                total.count("engram_host_update_rows", rows)
+                window.count("engram_host_update_rows", rows)
             last_loss = lf
         else:
             nan_skipped += 1
             total.count("nan_skipped")
             window.count("nan_skipped")
             opt.zero_grad(set_to_none=True)
+            # A skipped step never reaches `host_step_all`, so the host-path
+            # leaves it built would sit in `Engram._pending` until the next REAL
+            # step (`loop.py:786-793`); the in-VRAM path never appends, so this
+            # is a no-op there.
+            for m in host_engrams(model):
+                m.drop_pending()
 
         if (step + 1) % cfg.log_every == 0:
             window.drain()
