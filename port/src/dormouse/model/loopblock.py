@@ -75,7 +75,7 @@ from .engram import Engram, memory_floor_mix
 from .experts import SparseMoE
 from .kda import KDAAttention
 from .sparse import BlockSparseAttention
-from .tsct import make_projection, mm_mixed
+from .tsct import dense_qat_project, make_projection, mm_mixed
 
 __all__ = ["AttnResSlot", "LoopBlock", "depth_attend", "memory_floor_mix"]
 
@@ -127,6 +127,13 @@ class LoopBlock(nn.Module):
         #: The compute dtype the bf16 plan names for the block's small mixed
         #: projections (controller, mem_dense) — the experts' own choice.
         self.compute_dtype = torch.bfloat16 if cfg.bf16 else torch.float32
+        #: The DENSE path's switch (`tsct.dense_qat_project`, the SAME projector
+        #: as the factor rung): every plain `nn.Linear` weight the block owns —
+        #: the controller, `mem_dense`, and `out_proj` when it is a
+        #: `DenseLinear` — is read through the annealed STE. `dense_qat_alpha`
+        #: is the SAME alpha the factor ramp sets (`set_factor_qat_alpha`).
+        self.dense_qat = cfg.dense_qat
+        self.dense_qat_alpha = cfg.factor_qat_alpha
         self.norm = nn.RMSNorm(d, eps=cfg.norm_eps, device=device)
         # The three gates only. burn's controller ALSO emits the expert-blend
         # logits and its MoE "adds NO parameters"; the port's MoE owns a
@@ -279,7 +286,14 @@ class LoopBlock(nn.Module):
             ctrl = torch.cat([ctx.reshape(b * t, d), h0_flat], dim=-1)
             # MAGMA fix: fp32 masters with fp32 activations would run the slow
             # fp32 lane; `mm_mixed` casts to the compute dtype per forward.
-            raw = mm_mixed(ctrl, self.controller.weight, self.compute_dtype, counters)
+            # `dense_qat_project` is the identity when the arm is off (same
+            # parameter object), so the default path is byte-for-byte today's.
+            raw = mm_mixed(
+                ctrl,
+                dense_qat_project(self.controller.weight, self.dense_qat, self.dense_qat_alpha),
+                self.compute_dtype,
+                counters,
+            )
             w_attn = torch.sigmoid(raw[:, 0:1])
             w_mem = torch.sigmoid(raw[:, 1:2])
             w_ffn = torch.sigmoid(raw[:, 2:3])
@@ -323,7 +337,9 @@ class LoopBlock(nn.Module):
                     (
                         mm_mixed(
                             normed.reshape(b * t, d),
-                            self.mem_dense.weight,
+                            dense_qat_project(
+                                self.mem_dense.weight, self.dense_qat, self.dense_qat_alpha
+                            ),
                             self.compute_dtype,
                             counters,
                         )

@@ -56,6 +56,7 @@ from __future__ import annotations
 import math
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from ..instrument import Counters, loud
@@ -397,7 +398,7 @@ def factor_qat_project(
     if mode == "none":
         return w
     if mode not in ("ternary", "binary", "mxfp4", "ternary_s3t"):
-        raise AssertionError(f"factor_qat={mode!r} reached the projector with no mode")
+        raise AssertionError(f"factor_qat/dense_qat={mode!r} reached the projector with no mode")
     if mode == "mxfp4":
         from .mxfp import fake_quant_mx
 
@@ -442,6 +443,42 @@ def factor_qat_project(
     else:
         q = torch.sign(w) * a
     return (w + alpha * (q.to(w.dtype) - w).detach()).to(w.dtype)
+
+
+# ---------------------------------------------------------------------------
+# The DENSE path: the same projector, applied to plain `[out, in]` weights
+# ---------------------------------------------------------------------------
+
+#: The dense path's projector — the SAME function object as
+#: [`factor_qat_project`], deliberately. What the owner's final-quantized
+#: recipe needs on a plain linear weight IS the factor rung's semantics
+#: (per-tensor absmean `ternarize` / LittleBit `sign_binary` / the MX e2m1
+#: codec, all under the annealed STE `w + alpha·(q(w) − w).detach()`, with
+#: `alpha = 0` the master bit for bit), and one object means the two paths
+#: cannot drift apart. `dim=None` is the per-TENSOR axis — the BitNet
+#: convention for a weight matrix (b1.58 arXiv:2402.17764 Eq. 1).
+#:
+#: NOT routed through it, on purpose (the BitNet convention: these are not
+#: weight matrices): `nn.Embedding` tables (`embed`, DSpark's `w1`), the Engram
+#: n-gram tables, every norm, every bias, and the TSCT diagonals (`s`,
+#: `gate_s`, `up_s` — they ARE the scale). The TSCT FACTORS stay on
+#: `factor_qat`; this name is what every `nn.Linear`/`DenseLinear` weight in
+#: the forward goes through when `dense_qat != "none"`.
+dense_qat_project = factor_qat_project
+
+
+def qat_linear(linear: nn.Linear, x: torch.Tensor, kind: str, alpha: float) -> torch.Tensor:
+    """`linear(x)` with `dense_qat` applied to its weight — the master when off.
+
+    The ONE call shape for every plain `nn.Linear` site (KDA's q/k/v/g/beta,
+    the Engram's three projections, MSA's, DSpark's). `F.linear` IS
+    `nn.Linear.forward`'s whole body, so `kind = "none"` returns `linear(x)`
+    itself — bit-identical to the call it replaces, no copy.
+    """
+    if kind == "none":
+        return linear(x)
+    w = dense_qat_project(linear.weight, kind, alpha)
+    return F.linear(x, w, linear.bias)
 
 
 class TSCTLinear(nn.Module):
@@ -748,19 +785,27 @@ class DenseLinear(nn.Module):
         *,
         dtype: torch.dtype = torch.bfloat16,
         bias: bool = False,
+        dense_qat: str = "none",
+        dense_qat_alpha: float = 1.0,
         device: torch.device | str = "cpu",
     ) -> None:
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.compute_dtype = dtype
+        #: The DENSE path's switch (`dense_qat_project`, the same projector as
+        #: the factor rung): the forward reads the projected weight with an STE
+        #: while the fp32 master stays the optimizer's object. `none` = the
+        #: master untouched, every number on record.
+        self.dense_qat = dense_qat
+        self.dense_qat_alpha = dense_qat_alpha
         self.weight = nn.Parameter(
             torch.randn(out_features, in_features, device=device) / math.sqrt(in_features)
         )
         self.bias = nn.Parameter(torch.zeros(out_features, device=device)) if bias else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        w = self.weight
+        w = dense_qat_project(self.weight, self.dense_qat, self.dense_qat_alpha)
         if self.compute_dtype != torch.float32:
             x = x.to(self.compute_dtype)
             w = w.to(self.compute_dtype)
@@ -789,6 +834,9 @@ def make_projection(
     inside the attention arm": the a4.8 activation upgrade (`act_quant.attn_format`)
     then applies to it. It is inert on the dense rung (a dense factor-less
     projection has no activation-format seam) and on `act_quant = "none"`.
+    `dense_qat` is forwarded to `DenseLinear` (a TSCT projection's weights ARE
+    its factors, covered by `factor_qat`; the dense path has no factors to
+    quantize).
     """
     dtype = torch.bfloat16 if cfg.bf16 else torch.float32
     rank = cfg.rank if rank is None else rank
@@ -806,4 +854,12 @@ def make_projection(
             attn_path=attn_path,
             device=device,
         )
-    return DenseLinear(in_features, out_features, dtype=dtype, bias=bias, device=device)
+    return DenseLinear(
+        in_features,
+        out_features,
+        dtype=dtype,
+        bias=bias,
+        dense_qat=cfg.dense_qat,
+        dense_qat_alpha=cfg.factor_qat_alpha,
+        device=device,
+    )

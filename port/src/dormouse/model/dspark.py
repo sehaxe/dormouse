@@ -82,6 +82,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from ..instrument import Counters, loud
+from .tsct import qat_linear
 
 #: Paper Eq 5's default Markov rank `r`, the same constant
 #: `tests/test_dspark_gold.py::MARKOV_RANK` pins (768 + 256 for `small`).
@@ -224,6 +225,12 @@ class DSparkHead(nn.Module):
         self.w2 = nn.Linear(r, vocab, bias=False, device=device)  # W2, Eq 5
         self.joint = nn.Linear(2 * r + d, 3 * r, bias=False, device=device)  # Eq 6
         self.conf = nn.Linear(d + r, 1, bias=False, device=device)  # Eq 7, D9
+        #: The DENSE path's switch (`tsct.dense_qat_project`, the SAME projector
+        #: as the factor rung): the draft head's three projections are plain
+        #: `nn.Linear`s, so their weights are read through the annealed STE.
+        #: `w1` is an `nn.Embedding` (a table) and stays unquantized.
+        self.dense_qat = cfg.dense_qat
+        self.dense_qat_alpha = cfg.factor_qat_alpha
 
     def step(
         self,
@@ -240,12 +247,17 @@ class DSparkHead(nn.Module):
         drift. Flat shapes: `state [N,r]`, `prev [N,r]`, `hidden [N,d]`,
         `base [N,v]`; the returned logits are `[N,v]`.
         """
-        gate, cand, out = self.joint(torch.cat([state, prev, hidden], dim=-1)).split(
-            self.markov_rank, dim=-1
-        )
+        gate, cand, out = qat_linear(
+            self.joint,
+            torch.cat([state, prev, hidden], dim=-1),
+            self.dense_qat,
+            self.dense_qat_alpha,
+        ).split(self.markov_rank, dim=-1)
         gate = torch.sigmoid(gate)
         new_state = gate * state + (1.0 - gate) * torch.tanh(cand)
-        return new_state, base + self.w2(torch.tanh(out))
+        return new_state, base + qat_linear(
+            self.w2, torch.tanh(out), self.dense_qat, self.dense_qat_alpha
+        )
 
     def window(
         self, input_ids: torch.Tensor, k: int | None = None, stride: int | None = None
@@ -314,7 +326,14 @@ class DSparkHead(nn.Module):
                 state, prev.reshape(b * n, r), h.reshape(b * n, d), base.reshape(b * n, v)
             )
             drafts.append(step_logits.reshape(b, n, v))
-            confs.append(self.conf(torch.cat([h, prev], dim=-1)))  # [b,n,1]
+            confs.append(
+                qat_linear(
+                    self.conf,
+                    torch.cat([h, prev], dim=-1),
+                    self.dense_qat,
+                    self.dense_qat_alpha,
+                )
+            )  # [b,n,1]
             targets.append(base)
         draft = torch.stack(drafts, dim=2)  # [b,n,k,v]
         target = torch.stack(targets, dim=2)  # [b,n,k,v]

@@ -79,20 +79,24 @@ class DormouseModel(nn.Module):
         )
 
     def set_factor_qat_alpha(self, alpha: float) -> None:
-        """Set the annealing alpha on EVERY factor_qat consumer (one call per step).
+        """Set the annealing alpha on EVERY QAT consumer (one call per step).
 
-        The consumers are the `TSCTLinear`s (loop block + head),
+        The consumers are the `TSCTLinear`s (loop block + head), the
         `DualLatentGLU`s (routed + shared experts) and `SparseMoE._banks`'
-        cached stacks — the bank module reads its SAME-named attributes, so
-        walking `modules()` and setting the attribute is the complete set.
-        The bank cache keys on `factor_qat_alpha` (see `_banks`), so a changed
-        alpha rebuilds the quantized stacks on the next forward; a constant
-        alpha (the default) rebuilds nothing extra.
+        cached stacks — every module carrying `factor_qat_alpha` — PLUS every
+        dense path module carrying `dense_qat_alpha` (`LoopBlock`, `SparseMoE`,
+        `KDAAttention`, `Engram`, the MSA pair, `DSparkHead`, `DenseLinear`):
+        ONE alpha drives both paths, so a run cannot anneal them on two
+        schedules. The bank cache keys on `factor_qat_alpha` (see `_banks`), so
+        a changed alpha rebuilds the quantized stacks on the next forward; a
+        constant alpha (the default) rebuilds nothing extra.
         """
         assert 0.0 <= alpha <= 1.0, f"anneal alpha {alpha} outside 0..=1"
         for m in self.modules():
             if hasattr(m, "factor_qat_alpha"):
                 m.factor_qat_alpha = alpha
+            if hasattr(m, "dense_qat_alpha"):
+                m.dense_qat_alpha = alpha
 
     def forward(
         self,
@@ -124,6 +128,12 @@ class DormouseModel(nn.Module):
         counters = Counters() if counters is None else counters
         assert input_ids.dtype in (torch.long, torch.int64), "input_ids must be integer ids"
         assert input_ids.ndim == 2, f"input_ids must be [b, t], got {tuple(input_ids.shape)}"
+        if self.cfg.dense_qat != "none":
+            # The dense path ran (the per-site proof is the coverage gate,
+            # tests/test_dense_qat.py: every nn.Linear/DenseLinear weight in the
+            # forward must be seen by `dense_qat_project`). One per forward, on
+            # the existing counter line — a reader of the log sees the arm.
+            counters.count("dense_qat_arms")
         if self.bf_net is not None:
             self._refuse_segmented(segment_len)
             logits, loss = self._forward_net(input_ids, targets, counters)

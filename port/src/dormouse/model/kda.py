@@ -84,9 +84,29 @@ import torch.nn.functional as F
 from torch import nn
 
 from ..instrument import Counters
+from .tsct import qat_linear
 
 #: Cached warmup verdict per device TYPE: `{"cuda": (ok, why), "cpu": (ok, why)}`.
 _FLA: dict[str, tuple[bool, str]] = {}
+
+#: FLA's `disable_recompute` (chunk.py:50, documented at :258): when True the
+#: kernel SAVES the backward intermediates instead of recomputing them —
+#: "beneficial for training small models at the cost of increased memory
+#: usage" (their docstring). One process-wide flag, set from
+#: `TrainConfig.kda_disable_recompute` beside the tf32 knob; a fresh process is
+#: False = FLA's own default = the behaviour every number on record ran with.
+_DISABLE_RECOMPUTE = False
+
+
+def set_disable_recompute(flag: bool) -> None:
+    """`TrainConfig.kda_disable_recompute`'s ONE entry point (`train/loop.py`)."""
+    global _DISABLE_RECOMPUTE
+    _DISABLE_RECOMPUTE = bool(flag)
+
+
+def disable_recompute() -> bool:
+    """The live flag (for a gate or a bench)."""
+    return _DISABLE_RECOMPUTE
 
 
 def fla_status(device: torch.device | str = "cuda", recheck: bool = False) -> tuple[bool, str]:
@@ -190,6 +210,12 @@ class KDAAttention(nn.Module):
         self.head_dim = cfg.head_dim
         self.scale = 1.0 / math.sqrt(cfg.head_dim)
         self.compute_dtype = torch.bfloat16 if cfg.bf16 else torch.float32
+        #: The DENSE path's switch (`tsct.dense_qat_project`, the SAME projector
+        #: as the factor rung): `q/k/v/g/beta` are plain `nn.Linear`s, so their
+        #: weights are read through the annealed STE. `dense_qat_alpha` is the
+        #: SAME alpha the factor ramp sets (`set_factor_qat_alpha`).
+        self.dense_qat = cfg.dense_qat
+        self.dense_qat_alpha = cfg.factor_qat_alpha
         for name in ("q_proj", "k_proj", "v_proj", "g_proj"):
             setattr(self, name, nn.Linear(d, d, bias=False, device=device))
         self.beta_proj = nn.Linear(d, h, bias=False, device=device)
@@ -206,11 +232,12 @@ class KDAAttention(nn.Module):
         """
         b, t, _ = x.shape
         h, hd = self.n_heads, self.head_dim
-        q = self.q_proj(x).reshape(b, t, h, hd)
-        k = self.k_proj(x).reshape(b, t, h, hd)
-        v = self.v_proj(x).reshape(b, t, h, hd)
-        g = F.logsigmoid(self.g_proj(x).float()).reshape(b, t, h, hd)
-        beta = torch.sigmoid(self.beta_proj(x).float())  # [b, t, h]
+        dq = (self.dense_qat, self.dense_qat_alpha)
+        q = qat_linear(self.q_proj, x, *dq).reshape(b, t, h, hd)
+        k = qat_linear(self.k_proj, x, *dq).reshape(b, t, h, hd)
+        v = qat_linear(self.v_proj, x, *dq).reshape(b, t, h, hd)
+        g = F.logsigmoid(qat_linear(self.g_proj, x, *dq).float()).reshape(b, t, h, hd)
+        beta = torch.sigmoid(qat_linear(self.beta_proj, x, *dq).float())  # [b, t, h]
         return q, k, v, g, beta
 
     def _heads(self, x: torch.Tensor, b: int, t: int) -> torch.Tensor:
@@ -354,6 +381,7 @@ class KDAAttention(nn.Module):
                 beta=beta,
                 scale=self.scale,
                 use_qk_l2norm_in_kernel=True,  # burn-kda K3: L2Norm on q/k, in kernel
+                disable_recompute=_DISABLE_RECOMPUTE,
             )
             assert out.shape == (b, t, self.n_heads, self.head_dim), f"chunk_kda {tuple(out.shape)}"
             return out.reshape(b, t, d), None
@@ -367,6 +395,7 @@ class KDAAttention(nn.Module):
             initial_state=state,  # None = position 0 (segment 0)
             output_final_state=True,
             use_qk_l2norm_in_kernel=True,
+            disable_recompute=_DISABLE_RECOMPUTE,
         )
         assert out.shape == (b, t, self.n_heads, self.head_dim), f"chunk_kda {tuple(out.shape)}"
         assert ht is not None and ht.dtype == torch.float32, "the boundary state is fp32"
@@ -412,9 +441,10 @@ class KDAAttention(nn.Module):
         is. `state=None` (position 0) takes the `is_causal` branch, so segment 0
         is bit-identical to the one-shot call's own kernel.
         """
-        q = F.normalize(self._heads(self.q_proj(x), b, t), dim=-1)
-        k = F.normalize(self._heads(self.k_proj(x), b, t), dim=-1)
-        v = self._heads(self.v_proj(x), b, t)
+        dq = (self.dense_qat, self.dense_qat_alpha)
+        q = F.normalize(self._heads(qat_linear(self.q_proj, x, *dq), b, t), dim=-1)
+        k = F.normalize(self._heads(qat_linear(self.k_proj, x, *dq), b, t), dim=-1)
+        v = self._heads(qat_linear(self.v_proj, x, *dq), b, t)
         if state is None:
             kk, vv = k, v
             y = F.scaled_dot_product_attention(q * self.scale, kk, vv, is_causal=True)
@@ -429,7 +459,7 @@ class KDAAttention(nn.Module):
             cols = torch.arange(tp + t, device=x.device).view(1, -1)
             rows = torch.arange(t, device=x.device).view(-1, 1) + tp
             y = F.scaled_dot_product_attention(q * self.scale, kk, vv, attn_mask=cols <= rows)
-        gate = torch.sigmoid(self.g_proj(x))  # [b, t, d]
+        gate = torch.sigmoid(qat_linear(self.g_proj, x, *dq))  # [b, t, d]
         y = y.transpose(1, 2).reshape(b, t, d) * gate
         # The state returned is the ACCUMULATED context, not this window's own
         # keys: a third segment would otherwise read only the second one's keys

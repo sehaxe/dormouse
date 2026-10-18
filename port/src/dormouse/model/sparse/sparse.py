@@ -43,6 +43,7 @@ import torch
 from torch import nn
 
 from ...instrument import Counters
+from ..tsct import qat_linear
 
 #: Indexer query heads — the recipe's MQA shape ("4 q-heads, 1 shared k-head").
 MSA_Q_HEADS = 4
@@ -75,6 +76,11 @@ class FlexSparseSelector(nn.Module):
         assert self.topk >= 1, f"msa_topk={self.topk} must be >= 1"
         self.q_idx = nn.Linear(d, self.q_heads * self.head_dim, bias=False, device=device)
         self.k_idx = nn.Linear(d, self.head_dim, bias=False, device=device)
+        #: The DENSE path's switch (`tsct.dense_qat_project`, the SAME projector
+        #: as the factor rung): the indexer's two projections are plain
+        #: `nn.Linear`s, so their weights are read through the annealed STE.
+        self.dense_qat = cfg.dense_qat
+        self.dense_qat_alpha = cfg.factor_qat_alpha
 
     def forward(
         self, x: torch.Tensor, counters: Counters | None = None, k: int | None = None
@@ -89,13 +95,15 @@ class FlexSparseSelector(nn.Module):
         # avg-pool keys into blocks: zero-pad the tail, then the mean over the
         # block's r slots. A partial final block's padding drags its mean toward
         # 0 — acceptable for a SCORER (the aggregator masks the pad tokens out).
-        kk = self.k_idx(x)
+        kk = qat_linear(self.k_idx, x, self.dense_qat, self.dense_qat_alpha)
         pad = n * r - t
         if pad:
             kk = torch.cat([kk, kk.new_zeros(b, pad, self.head_dim)], dim=1)
         k_blk = kk.reshape(b, n, r, self.head_dim).mean(dim=2)  # [b,n,hd]
 
-        q = self.q_idx(x).reshape(b, t, self.q_heads, self.head_dim)
+        q = qat_linear(self.q_idx, x, self.dense_qat, self.dense_qat_alpha).reshape(
+            b, t, self.q_heads, self.head_dim
+        )
         proj = torch.einsum("bihd,bjd->bijh", q, k_blk)  # [b,t,n,H]
         score = torch.relu(proj).sum(-1)  # [b,t,n], non-negative
 

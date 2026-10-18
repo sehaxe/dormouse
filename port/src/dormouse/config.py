@@ -101,6 +101,18 @@ EXPERT_ACTS = ("silu", "situ", "memglu")
 #: The compressed-forward sprint's arms; a new rung lands WITH its gold test
 #: (`tests/test_factor_qat.py`) before this tuple grows.
 FACTOR_QATS = ("none", "ternary", "binary", "mxfp4", "ternary_s3t")
+#: The `dense_qat` literals — the DENSE path's switch. It is `FACTOR_QATS`
+#: exactly, and deliberately: `tsct.dense_qat_project` IS `factor_qat_project`
+#: (one function object), so every rung the factor path implements is the same
+#: projection on a plain `[out, in]` weight, with the same annealed STE and the
+#: same per-tensor axis. `none` = the master untouched (every number on
+#: record); the others quantize every `nn.Linear`/`DenseLinear` weight in the
+#: forward (KDA's q/k/v/g/beta, the controller, `mem_dense`, the MoE router and
+#: `down`, MSA's, the Engram's three, DSpark's three, and the dense readouts
+#: `out_proj`/`lm_head` when `use_tsct = false`). Embeddings, norms, biases and
+#: the Engram/TSCT tables stay unquantized (BitNet convention — see
+#: `tsct.dense_qat_project`'s comment).
+DENSE_QATS = FACTOR_QATS
 #: The `act_quant` literals — the a4.8 ACTIVATION formats (`model/act_quant.py`,
 #: transcribed from `crates/dormouse-core/src/act_quant.rs`): `none` = no
 #: activation quantization (every number on record); `int8`/`int4` = symmetric
@@ -344,8 +356,22 @@ class ModelConfig:
     #: stream, not a pure function of `(seed, step)` — the projector has no step
     #: — so this makes a run reproducible and a RESUME not (it restarts the
     #: stream): `tsct.factor_qat_project`'s docstring owns the statement and
-    #: `train/loop.py` prints it at start. Inert (LOUD) without that arm.
+    #: `train/loop.py` prints it at start. Inert (LOUD) without that arm — on
+    #: EITHER path (`factor_qat` or `dense_qat`).
     factor_qat_seed: int = 0
+    #: What the forward does to every DENSE weight master — the plain
+    #: `nn.Linear`/`DenseLinear` path the factor rung does not reach (owner
+    #: decision, 2026-10-18: the next training run trains in the FINAL
+    #: QUANTIZED FORM, so `factor_qat = "ternary"` and `dense_qat = "ternary"`
+    #: TOGETHER describe a model whose whole weight set is ternary in the
+    #: forward). `tsct.dense_qat_project` IS `factor_qat_project` — the same
+    #: rungs, the same annealed STE (`w + alpha·(q(w) − w).detach()`), the same
+    #: per-tensor axis — so the two switches cannot drift. `none` (the default)
+    #: is the master untouched, every number on record. Covered sites and the
+    #: two deliberate exclusions (embeddings/norms/tables/biases — the BitNet
+    #: convention) are listed at `DENSE_QATS`; `use_byteflow` is refused with a
+    #: non-`none` value (its net's projections are not on this seam).
+    dense_qat: str = "none"
     #: MemGLU's RMS-calibration constant — the authors' 9M-scale value
     #: (`2608.07323` appendix table: 0.6039096539628113).
     memglu_c0: float = 0.6039096539628113
@@ -983,18 +1009,41 @@ def validate(model: ModelConfig) -> None:
             f"blends master (0) with pure quantized forward (1). Escape: clamp "
             f"your schedule to that range."
         )
-    if model.factor_qat == "none" and model.factor_qat_alpha != 1.0:
+    if model.dense_qat not in DENSE_QATS:
+        loud(
+            f"dense_qat={model.dense_qat!r} is not an arm. Known: "
+            f"{list(DENSE_QATS)} — the SAME projector as `factor_qat` "
+            f"(`tsct.dense_qat_project` IS `factor_qat_project`), applied to "
+            f"every plain nn.Linear/DenseLinear weight in the forward: `none` "
+            f"the master untouched, `ternary` b1.58 STE (arXiv 2402.17764), "
+            f"`binary` LittleBit signs (arXiv 2506.13771), `mxfp4` the OCP MX "
+            f"e2m1 codec (spec §5.2, mxfp.py), `ternary_s3t` S3T stochastic "
+            f"rounding (arXiv 2412.04787). Escape: name one of those, or land "
+            f"the arm and its gold test (tests/test_dense_qat.py) BEFORE the "
+            f"config can lie about it."
+        )
+    if (
+        model.factor_qat == "none"
+        and model.dense_qat == "none"
+        and model.factor_qat_alpha != 1.0
+    ):
         loud(
             f"factor_qat_alpha={model.factor_qat_alpha} with factor_qat='none' "
-            f"is inert — the quantizer is off, so the blend has nothing to "
-            f"blend toward. Escape: set factor_qat, or leave alpha at 1.0."
+            f"and dense_qat='none' is inert — both quantizers are off, so the "
+            f"blend has nothing to blend toward. Escape: set factor_qat or "
+            f"dense_qat, or leave alpha at 1.0."
         )
-    if model.factor_qat_seed != 0 and model.factor_qat != "ternary_s3t":
+    if model.factor_qat_seed != 0 and "ternary_s3t" not in (
+        model.factor_qat,
+        model.dense_qat,
+    ):
         loud(
             f"factor_qat_seed={model.factor_qat_seed} with "
-            f"factor_qat={model.factor_qat!r} is inert — only `ternary_s3t` draws "
-            f"from a generator (the other rungs are deterministic projections). "
-            f"Escape: factor_qat='ternary_s3t', or leave the seed at 0."
+            f"factor_qat={model.factor_qat!r} / dense_qat={model.dense_qat!r} "
+            f"is inert — only `ternary_s3t` draws from a generator (the other "
+            f"rungs are deterministic projections), on either path. Escape: "
+            f"factor_qat='ternary_s3t' or dense_qat='ternary_s3t', or leave the "
+            f"seed at 0."
         )
     if model.act_quant not in ACT_QUANTS:
         loud(
@@ -1140,6 +1189,21 @@ def _validate_byteflow(model: ModelConfig) -> None:
             "latents, so the n-gram memory has no byte position to read and would be "
             "built, counted and trained by nothing. Escape: `use_engram = false` (the "
             "byteflow arm alone carries the compression), or drop use_byteflow."
+        )
+    # `dense_qat`'s seam is the MODEL's dense weights; the ByteFlow net is a
+    # separate module tree (`byteflow.py`: qkv/out, the SwiGLU pair, the chunk
+    # projections, and the channel's in_proj/out_proj) that does NOT route
+    # through `dense_qat_project`. Refused rather than silently half-quantized:
+    # a reader of the config would otherwise believe the forward ran ternary
+    # weights everywhere while the net's own projections stayed in their dtype.
+    if model.dense_qat != "none":
+        loud(
+            f"dense_qat={model.dense_qat!r} with use_byteflow=true: the ByteFlow net's "
+            f"own dense projections (`byteflow.py`: qkv/out, the SwiGLU pair, the "
+            f"chunker's proj, the channel's in_proj/out_proj) are not on the "
+            f"dense_qat seam, so the flag would report a quantized forward while those "
+            f"weights stay in their own dtype. Escape: use_byteflow=false, or "
+            f"dense_qat='none'."
         )
     # SIGReg reads the state `lm_head` reads, and this channel's readout is
     # `bf.out_proj(out_acc)` — not that state. A weight with nothing to attach

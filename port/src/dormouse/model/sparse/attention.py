@@ -63,6 +63,7 @@ from torch import nn
 from torch.utils.checkpoint import checkpoint
 
 from ...instrument import Counters, loud
+from ..tsct import qat_linear
 from .sparse import MSA_BLOCK, MSA_TOPK, FlexSparseSelector
 
 try:  # the fused gather is an ABILITY: without triton the module is not importable
@@ -157,6 +158,11 @@ class BlockSparseAttention(nn.Module):
         self.q_proj: nn.Linear | None = None
         self.k_proj: nn.Linear | None = None
         self.v_proj: nn.Linear | None = None
+        #: The DENSE path's switch (`tsct.dense_qat_project`, the SAME projector
+        #: as the factor rung): the arm's three projections are plain
+        #: `nn.Linear`s, so their weights are read through the annealed STE.
+        self.dense_qat = cfg.dense_qat
+        self.dense_qat_alpha = cfg.factor_qat_alpha
         if self.use_msa:
             # Built only when the arm runs: `use_msa=False` must leave the whole
             # model's parameter count untouched (test_msa.py, case d).
@@ -197,9 +203,10 @@ class BlockSparseAttention(nn.Module):
         b, t, d = x.shape
         blocks, keep = self.selector(x, counters, k=k_override)
         counters.count("msa_blocks", b * t * blocks.shape[-1])
-        q = self.q_proj(x).reshape(b, t, self.n_heads, self.head_dim)
-        k = self.k_proj(x).reshape(b, t, self.n_heads, self.head_dim)
-        v = self.v_proj(x).reshape(b, t, self.n_heads, self.head_dim)
+        dq = (self.dense_qat, self.dense_qat_alpha)
+        q = qat_linear(self.q_proj, x, *dq).reshape(b, t, self.n_heads, self.head_dim)
+        k = qat_linear(self.k_proj, x, *dq).reshape(b, t, self.n_heads, self.head_dim)
+        v = qat_linear(self.v_proj, x, *dq).reshape(b, t, self.n_heads, self.head_dim)
         out = attend_selected_blocks(q, k, v, blocks, keep, self.block, self.scale, counters)
         assert out.shape == (b, t, self.n_heads, self.head_dim)
         return out.reshape(b, t, d)

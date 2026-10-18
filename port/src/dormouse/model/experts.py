@@ -136,7 +136,7 @@ from torch.utils.checkpoint import checkpoint
 
 from ..instrument import Counters, loud
 from .act_quant import fake_quant_act
-from .tsct import factor_qat_project, mm_mixed
+from .tsct import dense_qat_project, factor_qat_project, mm_mixed
 
 try:  # the Triton arm is an ABILITY, not a dependency
     from . import moe_kernels
@@ -313,6 +313,12 @@ class SparseMoE(nn.Module):
         #: factor == dim=(1,2) slice) on the naive/shared path.
         self.factor_qat = cfg.factor_qat
         self.factor_qat_alpha = cfg.factor_qat_alpha
+        #: The DENSE path's switch (`tsct.dense_qat_project`, the SAME projector
+        #: as the factor rung): the router and the shared `down` write are plain
+        #: `nn.Linear`s, so they are read through the annealed STE. The
+        #: experts' FACTORS stay on `factor_qat` (they are not weight matrices).
+        self.dense_qat = cfg.dense_qat
+        self.dense_qat_alpha = cfg.factor_qat_alpha
         #: The a4.8 ACTIVATION quantization (`act_quant.fake_quant_act`): the
         #: expert activations are fake-quantized with an STE — in the banked
         #: branches here (the factors are reached through `bmm`, not through
@@ -389,12 +395,21 @@ class SparseMoE(nn.Module):
         # `mm_mixed` returns `dt`, NOT fp32: with bf16 on, `logits` — and so the
         # softmax `probs` and the routed `weight` — are bf16. The combine
         # boundary widens the weight back to fp32 (`_triton_dispatch`).
-        logits = mm_mixed(x, self.router.weight, dt, counters)
+        # `dense_qat_project` is the identity when the arm is off.
+        logits = mm_mixed(
+            x,
+            dense_qat_project(self.router.weight, self.dense_qat, self.dense_qat_alpha),
+            dt,
+            counters,
+        )
         probs = F.softmax(logits, dim=-1)  # [n, E]
         # a4.8: the activation quantization arm (COUNTED — a reader of the log
         # line sees it) applies to the EXPERTS' activations only. The router
         # above reads the raw state on purpose (`router` is a dense `nn.Linear`,
-        # no factor matmul, and routing must not be steered by a quantizer).
+        # no factor matmul, and the activation quantizer must not steer
+        # routing); its WEIGHT is a `dense_qat` target like every other dense
+        # weight, which is the owner's ternary-everywhere rule, not a second
+        # activation quantizer.
         if self.act_quant != "none":
             x = fake_quant_act(x, self.act_quant, self.act_group)
             counters.count("act_quant_arms", n)
@@ -449,7 +464,12 @@ class SparseMoE(nn.Module):
         weighted = weighted + self.shared(x, glu=self._glu)
         counters.count("moe_shared_forwards", n)
         # down: an fp32-master Linear; bf16 matmul + fp32 out (MAGMA fix).
-        return mm_mixed(weighted.to(dt), self.down.weight, dt, counters).to(torch.float32)
+        return mm_mixed(
+            weighted.to(dt),
+            dense_qat_project(self.down.weight, self.dense_qat, self.dense_qat_alpha),
+            dt,
+            counters,
+        ).to(torch.float32)
 
     def _lfb_step(self, index: torch.Tensor, counters: Counters) -> None:
         """The LFB bias move: on-device, gradient-free, trains-mode only.

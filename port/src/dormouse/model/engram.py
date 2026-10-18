@@ -57,6 +57,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from ..instrument import Counters, loud
+from .tsct import qat_linear
 
 FNV_OFFSET_BASIS = 1469598103934665603  # burn's constant, verbatim (NOT 2^40·sqrt(5))
 FNV_PRIME = 1099511628211
@@ -229,6 +230,13 @@ class Engram(nn.Module):
         self.query_proj = nn.Linear(self.d, self.dim, bias=False, device=device)
         self.key_proj = nn.Linear(self.dim, self.dim, bias=False, device=device)
         self.value_proj = nn.Linear(self.dim, self.d, bias=False, device=device)
+        #: The DENSE path's switch (`tsct.dense_qat_project`, the SAME projector
+        #: as the factor rung): the three projections are plain `nn.Linear`s,
+        #: so their weights are read through the annealed STE. The TABLES
+        #: (`self.tables` / the host rows) are memory, not a weight matrix —
+        #: they stay fp32 (BitNet convention; also the burn Engram is fp32).
+        self.dense_qat = cfg.dense_qat
+        self.dense_qat_alpha = cfg.factor_qat_alpha
         #: Non-None = this Engram is on host tables (`to_host`): the tables are
         #: plain CPU fp32 (`HostTables`) and `self.tables` no longer exists, so
         #: the optimizer can never see them.
@@ -290,13 +298,14 @@ class Engram(nn.Module):
         b, t, _ = hidden.shape
         counters.count("engram_rows", int(b * t * len(self.orders)))
         counters.count("engram_arms")
-        query = self.query_proj(hidden)  # [b, t, dim]
-        key = self.key_proj(emb)  # [b, t, n_orders, dim]
+        dq = (self.dense_qat, self.dense_qat_alpha)
+        query = qat_linear(self.query_proj, hidden, *dq)  # [b, t, dim]
+        key = qat_linear(self.key_proj, emb, *dq)  # [b, t, n_orders, dim]
         s = (key * query.unsqueeze(2)).sum(-1) / math.sqrt(self.dim)
         # sign(s)·sqrt(clamp_min(|s|, 1e-6)) — the reference's CLAMP, not `+1e-6`
         # (the burn oracle test that separated the two).
         gate = torch.sigmoid(s.sign() * s.abs().clamp_min(1e-6).sqrt())
-        value = self.value_proj(emb)  # [b, t, n_orders, d]
+        value = qat_linear(self.value_proj, emb, *dq)  # [b, t, n_orders, d]
         return (value * gate.unsqueeze(-1)).sum(2)  # [b, t, d]
 
     def _forward_host(
