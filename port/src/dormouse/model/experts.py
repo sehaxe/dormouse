@@ -553,6 +553,7 @@ class SparseMoE(nn.Module):
         """The dtype the experts compute in (their own `bf16` switch, not the device's)."""
         return self.experts[0].compute_dtype
 
+    @torch.compiler.disable
     def _banks(self, dt: torch.dtype) -> tuple[torch.Tensor, ...]:
         """The expert bank as `[E, ·]` tensors for the batched matmuls — CACHED IN `dt`.
 
@@ -576,6 +577,19 @@ class SparseMoE(nn.Module):
         other `_version` bump happens to rebuild it. So the grad state is part
         of the key, a no-grad build is never STORED, and a stored entry that
         cannot serve a tracked call is stale whatever the key says.
+
+        **`torch.compiler.disable` keeps this method — and only the cache
+        DECISION — out of dynamo's compiled regions.** The key reads per-step
+        Python values (`factor_qat_alpha` moves on every annealed step,
+        `_version` on every optimizer step) and dynamo guards a compiled region
+        on every Python value it reads, so without the decorator the frame spent
+        one recompile per step until it hit `config.recompile_limit` and fell
+        back to eager (measured 2026-10-18, `docs/research/2026-10-18-compile-moe.md`;
+        the trainer wraps the model with `torch.compile(dynamic=True)`,
+        `train/loop.py:626`). The three call sites consume the bank tensors as
+        ordinary inputs, so the compiled region is unchanged; the DECISION is
+        unchanged too — the bank still rebuilds whenever the key moves
+        (`tests/test_compile_moe.py` pins both halves, CPU and GPU).
         """
         grad = torch.is_grad_enabled()
         # `want` is what the cached bank must carry a graph FOR: a frozen expert
