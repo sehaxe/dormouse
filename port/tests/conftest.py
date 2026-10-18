@@ -127,7 +127,7 @@ def gpu_free() -> tuple[bool, str]:
             check=True,
         ).stdout.strip()
         busy = subprocess.run(
-            ["pgrep", "-af", "dormouse trai[n]|[/]target/release/train "],
+            ["pgrep", "-af", "[d]ormouse (train|rl|sft|bench|serve)|[/]target/release/train "],
             capture_output=True,
             text=True,
             timeout=15,
