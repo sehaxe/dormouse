@@ -31,6 +31,7 @@ from dormouse.instrument import Counters, loud  # noqa: E402
 from dormouse.model import DormouseModel  # noqa: E402
 from dormouse.model.decode import decode_bytes, recurrent_decode  # noqa: E402
 from dormouse.model.specdecode import spec_decode_bytes  # noqa: E402
+from dormouse.train.loop import load_model_state, unpack_state_dict  # noqa: E402
 
 USER, ASSIST, END = 0x01, 0x02, 0x03
 
@@ -65,7 +66,16 @@ def main() -> None:
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     model = DormouseModel(run.model)
     ck = torch.load(out / f"{args.ckpt_name}.pt", map_location="cpu", weights_only=False)
-    missing, unexpected = model.load_state_dict(ck["model"], strict=False)
+    # The shared loader (`train.loop.load_model_state`): a storage rung is
+    # unpacked, and an `engram_ram` checkpoint switches the model to host tables
+    # and restores its `.ngram` sibling. `strict=False` keeps the drift
+    # diagnostic below instead of a raw RuntimeError.
+    missing, unexpected = load_model_state(
+        model,
+        run.train,
+        unpack_state_dict(ck["model"], ck.get("model_quant_rung")),
+        strict=False,
+    )
     if missing or unexpected:
         loud(
             f"chat: the checkpoint and the preset disagree "

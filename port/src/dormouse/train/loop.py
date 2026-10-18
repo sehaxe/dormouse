@@ -210,6 +210,55 @@ def load_model_half(weights: Path) -> dict:
     return unpack_state_dict(ck["model"], ck.get("model_quant_rung"))
 
 
+def require_ngram(cfg: TrainConfig) -> None:
+    """LOUD unless the host tables' `<ckpt_name>.ngram` sibling exists.
+
+    ONE definition of the refusal: `load_ckpt` (a resume) and every CLI loader
+    (`load_model_state`) call it, so an `engram_ram` checkpoint that lost its
+    sidecar fails the same way everywhere. On that path the tables ARE this file
+    — the model half carries no `engram.tables` parameter (`Engram.to_host`
+    deletes it) — so loading without it would silently seed fresh rows and use a
+    different network under the same step count (`7adda92`, AGENTS §3.3).
+    """
+    if ngram_path(cfg).is_file():
+        return
+    weights, _ = ckpt_paths(cfg)
+    loud(
+        f"{weights} is a host-table run (train.engram_ram=true) and its sibling "
+        f"{ngram_path(cfg)} is missing. On that path the tables and their momentum "
+        f"ARE the memory's state — the model half carries no `engram.tables` "
+        f"parameter — so loading without them would restart the memory from scratch "
+        f"and use a different network under this step count. Escape: restore the "
+        f".ngram, start fresh under a new ckpt_name, or set engram_ram=false."
+    )
+
+
+def load_model_state(model: torch.nn.Module, cfg: TrainConfig, sd: dict, *, strict: bool = True):
+    """The ONE way a checkpoint's model half reaches a model.
+
+    `train`'s resume, `eval`, `decode`, `serve`, `scripts/chat.py` and the two
+    decode benches all call this, so "how an `engram_ram` checkpoint is loaded"
+    is defined once. `sd` is the already-unpacked model half (`load_model_half`
+    or `unpack_state_dict`), so a storage rung is the caller's read.
+
+    The host-table rule, and why it is not a plain `load_state_dict`: on that
+    path the tables are not a parameter (`Engram.to_host` deletes
+    `engram.tables`), so the model must be switched to host tables BEFORE the
+    load — otherwise a fresh in-VRAM model refuses `Missing key(s):
+    "loop.engram.tables"` — and the sibling `<ckpt>.ngram` is restored after.
+    `enable_host_tables` (not `host_tables`) is the call: the CUDA-only refusal
+    is a training VRAM-budget rule, and a load must work on `--device cpu`.
+    A missing sibling is LOUD (`require_ngram`), never freshly seeded rows.
+    """
+    if cfg.engram_ram:
+        require_ngram(cfg)
+        enable_host_tables(model)  # idempotent: 0 when the model is already host
+    result = model.load_state_dict(sd, strict=strict)
+    if cfg.engram_ram:
+        load_host_state(model, load_ngram(cfg))
+    return result
+
+
 def load_ckpt(run: RunConfig) -> tuple[dict, RunConfig]:
     """Load a checkpoint, refusing a config that differs from the snapshot.
 
@@ -225,16 +274,8 @@ def load_ckpt(run: RunConfig) -> tuple[dict, RunConfig]:
             f"what makes a resume checkable). Escape: start without --resume, or "
             f"fix ckpt_name/out_dir."
         )
-    if run.train.engram_ram and not ngram_path(run.train).is_file():
-        loud(
-            f"resume: {weights} is a host-table run (train.engram_ram=true) and its "
-            f"sibling {ngram_path(run.train)} is missing. On that path the tables and "
-            f"their momentum ARE the memory's state — the model half carries no "
-            f"`engram.tables` parameter — so continuing without them would restart the "
-            f"memory from scratch and train a different network under this step count. "
-            f"Escape: restore the .ngram, start fresh under a new ckpt_name, or set "
-            f"engram_ram=false."
-        )
+    if run.train.engram_ram:
+        require_ngram(run.train)
     stored = RunConfig.from_snapshot(snapshot.read_text())
     drift = run.diff_keys(stored)
     if drift:
@@ -505,15 +546,8 @@ def train(
     start = 0
     if resume:
         ck, _stored = load_ckpt(run)
-        model.load_state_dict(ck["model"])
+        load_model_state(model, cfg, ck["model"])
         opt.load_state_dict(ck["opt"])
-        if cfg.engram_ram:
-            # The model half carries no `engram.tables` on this path, so the
-            # sibling file IS the memory's state — restoring the model without
-            # it would train a different network under this step count (the
-            # `7adda92` class, AGENTS §3.3). `load_ckpt` refused a missing file
-            # already; this is where its values land.
-            load_host_state(model, load_ngram(cfg))
         start = int(ck["step"]) + 1
         if start:
             # A resumed run must continue on UNSEEN bytes: the burn failure

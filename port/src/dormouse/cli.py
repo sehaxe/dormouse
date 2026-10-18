@@ -512,7 +512,7 @@ def eval_cmd(
     """Held-out BPB of a checkpoint. It resolves from the checkpoint's own snapshot."""
     from .train.data import open_streams
     from .train.loop import evaluate as _evaluate
-    from .train.loop import load_model_half
+    from .train.loop import load_model_half, load_model_state
 
     if not ckpt_name:
         raise LoudError("eval needs --ckpt-name")
@@ -526,10 +526,11 @@ def eval_cmd(
     dev = _device(device)
     model = _model(run).to(dev)
     _freeze_gc()
-    # The model half through the ONE loader (audit MAJOR 6): a raw
-    # `load_state_dict` on a storage-rung file (quant=fp8/nvfp4/ternary) dies on
-    # the packed records.
-    model.load_state_dict(load_model_half(Path(out_dir) / f"{ckpt_name}.pt"))
+    # The ONE loader (audit MAJOR 6 + the host-table path): the model half is
+    # unpacked from its storage rung, and an `engram_ram` checkpoint switches
+    # the model to host tables and restores its `.ngram` sibling — a raw
+    # `load_state_dict` died on both (`Missing key(s): "loop.engram.tables"`).
+    load_model_state(model, run.train, load_model_half(Path(out_dir) / f"{ckpt_name}.pt"))
     _train_stream, eval_stream = open_streams(run)
     if eval_stream is None:
         raise LoudError("no eval stream (the snapshot carries eval_data or eval=true)")
@@ -588,7 +589,7 @@ def decode(
     prints the counters of the arm that ran.
     """
     from .model.specdecode import spec_decode_bytes
-    from .train.loop import load_model_half
+    from .train.loop import load_model_half, load_model_state
 
     if not ckpt_name:
         raise LoudError("decode needs --ckpt-name")
@@ -604,9 +605,10 @@ def decode(
     dev = _device(device)
     model = _model(run).to(dev)
     _freeze_gc()
-    # Same loader as `eval` and `load_ckpt` (audit MAJOR 6): a rung checkpoint's
-    # factor records are packed, and `load_state_dict` cannot read them raw.
-    model.load_state_dict(load_model_half(Path(out_dir) / f"{ckpt_name}.pt"))
+    # Same ONE loader as `eval`, `serve` and `load_ckpt`: the storage rung's
+    # packed records are unpacked, and an `engram_ram` checkpoint switches the
+    # model to host tables and restores its `.ngram` sibling.
+    load_model_state(model, run.train, load_model_half(Path(out_dir) / f"{ckpt_name}.pt"))
     gen = torch.Generator(device=dev).manual_seed(run.train.seed)
     body = encode(prompt)
     if recurrent:

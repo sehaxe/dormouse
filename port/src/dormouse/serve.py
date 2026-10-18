@@ -99,7 +99,7 @@ def load_checkpoint(
     the typer/rich front, and the CLI's front imports it.
     """
     from .cli import _device, _freeze_gc, _model, _snapshot_run
-    from .train.loop import load_model_half
+    from .train.loop import load_model_half, load_model_state
 
     if not ckpt_name:
         loud("serve needs --ckpt-name")
@@ -108,11 +108,11 @@ def load_checkpoint(
     dev = _device(device)
     model = _model(run).to(dev)
     _freeze_gc()
-    # The same loader `eval`, `decode` and `load_ckpt` use (audit MAJOR 6): a
-    # storage-rung checkpoint's factor records are packed, so serving one used
-    # to die in `load_state_dict` with a RuntimeError naming neither the rung
-    # nor the escape.
-    model.load_state_dict(load_model_half(base / f"{ckpt_name}.pt"))
+    # The ONE loader `eval`, `decode` and `load_ckpt` share: a storage-rung
+    # checkpoint's factor records are unpacked, and an `engram_ram` checkpoint
+    # switches the model to host tables and restores its `.ngram` sibling — a
+    # raw `load_state_dict` died on both.
+    load_model_state(model, run.train, load_model_half(base / f"{ckpt_name}.pt"))
     return model, run, dev
 
 

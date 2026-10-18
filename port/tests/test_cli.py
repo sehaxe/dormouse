@@ -10,6 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import torch
 from conftest import write_corpus
 from typer.testing import CliRunner
 
@@ -142,3 +143,93 @@ def test_decode_samples_from_the_checkpoint(ckpt_dir: Path, tmp_path: Path):
         ],
     )
     assert r.exit_code == 0, r.output
+
+
+# --- the engram_ram loader gates: one rule, every CLI loader ----------------
+#
+# A host-table run stores its Engram OUTSIDE the model (`Engram.to_host` deletes
+# the `engram.tables` parameter) in the sibling `<ckpt>.ngram`. `eval`, `decode`
+# and `serve` called `model.load_state_dict(...)` directly, so ANY such
+# checkpoint died with `Missing key(s): "loop.engram.tables"` — the loaders
+# could not read a single b1/medium/sft checkpoint. `train.loop.load_model_state`
+# is now the ONE definition; these gates pin it from the CLI.
+
+
+def _host_table_ckpt(tmp_path: Path):
+    """A tiny `engram_ram` checkpoint pair + its `.ngram` sibling (CPU-only)."""
+    from conftest import tiny_run
+
+    from dormouse.model import DormouseModel
+    from dormouse.model.engram import enable_host_tables
+    from dormouse.train.loop import save_ckpt
+    from dormouse.train.optim import MixOptimizer
+
+    run = tiny_run(tmp_path, steps=1, engram_ram=True)
+    model = DormouseModel(run.model)
+    assert enable_host_tables(model) == 1, "what train()'s host_tables does"
+    ids = torch.arange(2 * 64, dtype=torch.long).view(2, 64) % 251
+    model(ids, (ids + 1) % 251)[1].backward()
+    opt = MixOptimizer(model, lr=run.train.lr, wd=run.train.wd, opt=run.train.opt)
+    save_ckpt(run, model, opt, 0)
+    return run
+
+
+def test_eval_loads_an_engram_ram_checkpoint(tmp_path: Path):
+    """(a) The CLI eval loader round-trips a host-table checkpoint."""
+    run = _host_table_ckpt(tmp_path)
+    r = runner.invoke(
+        app,
+        [
+            "eval",
+            "--out-dir",
+            run.train.out_dir,
+            "--ckpt-name",
+            run.train.ckpt_name,
+            "--eval",
+            run.train.data,
+            "--device",
+            "cpu",
+        ],
+    )
+    assert r.exit_code == 0, r.output
+    assert "BPB" in r.output
+
+
+def test_eval_refuses_an_engram_ram_checkpoint_without_its_sidecar(tmp_path: Path):
+    """(b) A host-table checkpoint with no `.ngram` is a LOUD refusal."""
+    run = _host_table_ckpt(tmp_path)
+    ngram = Path(run.train.out_dir) / f"{run.train.ckpt_name}.ngram"
+    assert ngram.is_file()
+    ngram.unlink()
+    r = runner.invoke(
+        app,
+        [
+            "eval",
+            "--out-dir",
+            run.train.out_dir,
+            "--ckpt-name",
+            run.train.ckpt_name,
+            "--eval",
+            run.train.data,
+            "--device",
+            "cpu",
+        ],
+    )
+    assert r.exit_code != 0, r.output
+    msg = r.output + str(r.exception)
+    assert ".ngram" in msg and "sibling" in msg, msg
+
+
+def test_in_vram_checkpoint_still_loads_unchanged(ckpt_dir: Path, tmp_path: Path):
+    """(c) The old path is untouched: `engram_ram=false` stays a parameter."""
+    from dormouse.cli import _model, _snapshot_run
+    from dormouse.train.loop import load_model_half, load_model_state
+
+    run = _snapshot_run(tmp_path / "ck", "smoke")
+    assert not run.train.engram_ram
+    model = _model(run)
+    sd = load_model_half(tmp_path / "ck" / "smoke.pt")
+    load_model_state(model, run.train, sd)
+    assert model.loop.engram.host is None, "an in-VRAM run must not switch to host"
+    assert "loop.engram.tables" in model.state_dict()
+    assert torch.equal(model.loop.engram.tables, sd["loop.engram.tables"])

@@ -50,7 +50,7 @@ from dormouse.cli import _snapshot_run
 from dormouse.instrument import Counters
 from dormouse.model import DormouseModel
 from dormouse.model.decode import decode_bytes, recurrent_decode
-from dormouse.train.loop import load_model_half
+from dormouse.train.loop import load_model_half, load_model_state
 
 #: The context ladder the headline is quoted at (prompt bytes).
 CONTEXTS = (512, 1024, 2048, 4096)
@@ -123,7 +123,8 @@ def main() -> int:
     out_dir = Path(args.out_dir)
     run = _snapshot_run(out_dir, args.ckpt_name)
     model = DormouseModel(run.model).to(dev)
-    model.load_state_dict(load_model_half(out_dir / f"{args.ckpt_name}.pt"))
+    # The ONE loader: an engram_ram checkpoint is host tables + `.ngram`.
+    load_model_state(model, run.train, load_model_half(out_dir / f"{args.ckpt_name}.pt"))
     model.eval()
     params = sum(p.numel() for p in model.parameters())
     contexts = [int(c) for c in args.contexts.split(",")]

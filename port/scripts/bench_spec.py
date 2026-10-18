@@ -38,7 +38,7 @@ from dormouse.instrument import loud
 from dormouse.model import DormouseModel
 from dormouse.model.decode import decode_bytes
 from dormouse.model.specdecode import spec_decode_bytes
-from dormouse.train.loop import load_model_half
+from dormouse.train.loop import load_model_half, load_model_state
 
 SPEC_KS = (1, 2, 4, 8)
 
@@ -80,7 +80,8 @@ def main() -> int:
     out_dir, ckpt = Path(args.out_dir), args.ckpt_name
     run = _snapshot_run(out_dir, ckpt)
     model = DormouseModel(run.model).to("cuda")
-    model.load_state_dict(load_model_half(out_dir / f"{ckpt}.pt"))
+    # The ONE loader: an engram_ram checkpoint is host tables + `.ngram`.
+    load_model_state(model, run.train, load_model_half(out_dir / f"{ckpt}.pt"))
     model.eval()
     if model.dspark is None:
         loud(
