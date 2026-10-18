@@ -24,6 +24,7 @@ import torch
 
 from ..config import PROGRESS_KEYS, RunConfig, TrainConfig
 from ..instrument import Counters, LoudError, StepTimer, loud
+from ..model import kda
 from ..model.engram import (
     enable_host_tables,
     host_engrams,
@@ -35,6 +36,7 @@ from ..model.tsct import set_mm_dtype
 from .data import ByteStream, eval_window_bytes, open_streams, warmup_steps
 from .graph import OptimizerGraph
 from .lr import wsd_lr
+from .mixture import open_mixture
 from .optim import MixOptimizer, clip_grads
 
 
@@ -484,6 +486,14 @@ def train(
     # training forward takes the COUNTED bf16 fallback and a reader has to know
     # that before reading the loss curve.
     set_mm_dtype(cfg.mm_dtype)
+    kda.set_disable_recompute(cfg.kda_disable_recompute)
+    if cfg.kda_disable_recompute:
+        log(
+            "kda_disable_recompute=true: FLA's chunk_kda SAVES its backward "
+            "intermediates instead of recomputing them (their docstring: for small "
+            "training at the cost of memory). Same math, more VRAM, less recompute; "
+            "default false = every number on record."
+        )
     if cfg.mm_dtype == "fp8":
         log(
             "mm_dtype=fp8: the 2-D GEMMs run e4m3 `torch._scaled_mm` where autograd "
@@ -495,7 +505,25 @@ def train(
         )
     device = None if device is None else torch.device(device)
     if stream is None:
-        stream, eval_stream = open_streams(run)
+        if run.train.mix_plan:
+            # The staged mixture (train/mixture.py): N sources interleaved by
+            # per-stage weights, epoch-capped LOUD. The eval side is unchanged
+            # (the same held-out file and window), so BPB stays comparable.
+            stream = open_mixture(
+                run.train.mix_plan,
+                steps=run.train.steps,
+                batch=run.train.batch,
+                seq_len=run.train.seq_len,
+                seed=run.train.seed,
+                max_epochs=run.train.max_epochs,
+            )
+            _, eval_stream = open_streams(run)
+            log(
+                f"mix_plan={run.train.mix_plan}: {len(stream.plan.sources)} sources, "
+                f"{len(stream.plan.stages)} stage(s), max_epochs={run.train.max_epochs}"
+            )
+        else:
+            stream, eval_stream = open_streams(run)
     model.train()
     if run.model.factor_qat == "ternary_s3t":
         # The ADR-0021 caveat, said where a reader of the log meets it. The

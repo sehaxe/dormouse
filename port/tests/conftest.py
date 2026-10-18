@@ -127,13 +127,16 @@ def gpu_free() -> tuple[bool, str]:
             check=True,
         ).stdout.strip()
         busy = subprocess.run(
-            ["pgrep", "-x", "train"], capture_output=True, text=True, timeout=15
+            ["pgrep", "-af", "dormouse trai[n]|[/]target/release/train "],
+            capture_output=True,
+            text=True,
+            timeout=15,
         ).stdout.strip()
     except Exception as e:  # noqa: BLE001 - a bench's precondition, not a run's
         return False, f"cannot check the card ({e})"
     mib = int(used.split()[0]) if used else -1
     if busy:
-        return False, f"a `train` process is live (pids {busy})"
+        return False, f"a train process is live (pids {busy.splitlines()[0].split()[0]})"
     if mib >= 1024:
         return False, f"the card holds {mib} MiB"
     return True, f"card {mib} MiB, no train process"

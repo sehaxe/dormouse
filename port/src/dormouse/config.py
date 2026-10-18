@@ -444,6 +444,13 @@ class TrainConfig:
     #: an approximate iteration, so the expected cost is small — that is a
     #: prediction, not a substitute for the check.
     tf32: bool = False
+    #: FLA chunk_kda's `disable_recompute` (`model/kda.py`'s setter, called once
+    #: by `train/loop.py` beside `tf32`/`mm_dtype`). `False` (the default and
+    #: every number on record) = the kernel recomputes its backward
+    #: intermediates; `True` SAVES them instead — FLA's docstring: "beneficial
+    #: for training small models at the cost of increased memory usage". A
+    #: speed/VRAM trade decided by a bench, never by hope.
+    kda_disable_recompute: bool = False
     #: The 2-D GEMM COMPUTE precision (`MM_DTYPES`, `model/tsct.py` where it
     #: executes — `tsct.set_mm_dtype` is called once by `train/loop.py`, the same
     #: shape as the `tf32` knob above). `bf16` (the default) is every number on
@@ -670,6 +677,16 @@ class TrainConfig:
     json_log: str = ""
     data: str = ""
     eval_data: str = ""
+    #: The staged-mixture plan (`train/mixture.py`, TOML): when set, the train
+    #: side reads N sources interleaved by per-stage weights instead of the one
+    #: `data` file (the eval side is unchanged). Empty = off = every number on
+    #: record. Non-progress: flipping it changes what the run reads, so the
+    #: ADR-0021 drift check refuses a flip on a resume.
+    mix_plan: str = ""
+    #: The repetition guard (`train/mixture.py`): a source whose planned bytes
+    #: exceed `max_epochs × its file size` is a LOUD refusal naming it (the
+    #: research onset: MoE degrades at 4× repetition, dense at 8×). 0 = off.
+    max_epochs: float = 4.0
     out_dir: str = "checkpoints"
     timers: bool = False
     #: Host-RAM Engram tables — burn's `--engram-ram` (Qwen3.8-Flash-Next §2.3
@@ -1273,6 +1290,18 @@ def load_run(
             f"backward, so a training forward falls back to bf16 COUNTED). "
             f"Escape: name one of those, or land the mode in `tsct.MM_DTYPES` and "
             f"its gate BEFORE the config can lie about it."
+        )
+    if tcfg.max_epochs < 0:
+        loud(
+            f"max_epochs={tcfg.max_epochs} is negative: it is the repetition cap "
+            f"in `train/mixture.py` (0 = off). Escape: a non-negative number, or "
+            f"leave the default 4.0 (the measured MoE onset)."
+        )
+    if tcfg.mix_plan and not Path(tcfg.mix_plan).is_file():
+        loud(
+            f"mix_plan={tcfg.mix_plan!r} is not a file. Escape: a path to an "
+            f"existing plan TOML (the shape is documented in `train/mixture.py`), "
+            f"or leave it empty to read the single `data` file."
         )
     if tcfg.ns_kind not in NS_KINDS:
         loud(
