@@ -31,6 +31,19 @@ the burn history paid for:
   realized proportions converge to the weights over a run (the bound is the
   binomial one, `sqrt(q/(n·p))` at `n` steps — ±2% needs ~10k steps for a 50%
   source and ~100k for a 5% one).
+* **A source is a FILE or a DIRECTORY.** A `.bin` file opens `ByteStream`; a
+  directory of `*.txt` shards opens
+  [`ShardStream`][dormouse.train.data.ShardStream] (`open_source`), which reads
+  the mount's 6.3 MB shards directly — 227 GB is not worth duplicating into a
+  concatenated `.bin` when the drive sustains 146 MB/s against a ~40 KB/s
+  training read. The shard order is a SEEDED permutation
+  (`_stream_seed(seed, name)`, so two sources do not draw the same order), which
+  is the shuffle the burn side was missing: the shards are packed in download
+  order, so reading them in order puts one crawl/period in a block and the loss
+  spikes at the boundary (`plan_txt_streamer.md`: 1.46 → 8.69 at ~step 25k of a
+  joint run). Resume is unaffected — a shard stream is periodic in
+  `sum(shard sizes)`, so `skip_bytes` lands on the exact byte an unbroken run
+  would have read.
 
 **The plan file** (`mix_plan.toml`, every key shown; `[sources]` paths are
 resolved against the plan file's own directory):
@@ -88,7 +101,7 @@ from pathlib import Path
 import torch
 
 from ..instrument import loud
-from .data import DEFAULT_RING, ByteStream
+from .data import DEFAULT_RING, ByteStream, ShardStream, open_source, shard_files, shard_sizes
 
 #: The 4-epoch rule (2305.16264) — a source repeated more than this is refused
 #: unless the plan (or `--set max_epochs=N`) says otherwise. `0` = off.
@@ -281,6 +294,29 @@ def _mix64(x: int) -> int:
     return x ^ (x >> 31)
 
 
+def _fnv1a(data: bytes) -> int:
+    """FNV-1a 64 — the repo's stable string hash (the Engram keys' own).
+
+    A source NAME has to be a seed input without Python's `hash()`, which is
+    randomized per process (PYTHONHASHSEED): the shard order must be the same
+    bytes in every process, or a resume reads a different order than the run.
+    """
+    h = 0xCBF29CE484222325
+    for b in data:
+        h = ((h ^ b) * 0x100000001B3) & _MASK64
+    return h
+
+
+def _stream_seed(seed: int, name: str) -> int:
+    """The shard-order seed of ONE source: the run seed mixed with the source name.
+
+    Two sources in one plan must not draw the same permutation by construction
+    (their shards are different crawls of different corpora, and a shared order
+    would re-correlate them per epoch).
+    """
+    return _mix64(seed ^ _fnv1a(name.encode("utf-8")))
+
+
 def _unit(seed: int, step: int) -> float:
     """A `[0, 1)` draw that is a PURE function of `(seed, step)` — no RNG stream.
 
@@ -343,7 +379,15 @@ def source_for_step(plan: MixPlan, step: int, steps: int, seed: int | None = Non
 
 
 def source_size(name: str, path: Path) -> int:
-    """Bytes on disk, LOUD when the source is missing or empty."""
+    """Bytes on disk, LOUD when the source is missing or empty.
+
+    A DIRECTORY source is a shard directory (`ShardStream`): its size is the sum
+    of its `*.txt` shards, read through the same `shard_files`/`shard_sizes`
+    calls the stream makes — so the epoch cap and the stream cannot disagree
+    about what a source IS.
+    """
+    if path.is_dir():
+        return sum(shard_sizes(shard_files(path)))
     if not path.is_file():
         loud(
             f"mix source {name!r} -> {path} does not exist. Escape: fetch the slices "
@@ -432,9 +476,16 @@ def check_epoch_cap(
 class MixtureStream:
     """`ByteStream`'s interface over N sources: one whole batch per step, staged.
 
+    A source is a `.bin` FILE or a shard DIRECTORY (`open_source`): the
+    directory mode reads the mount's `*.txt` shards in a seeded shuffled order
+    and is the reason this class exists at 227 GB, where a concatenated corpus
+    would be a 227 GB copy of data already on disk.
+
     The stage and the source of a step are pure functions of `(seed, step, steps)`
     (see the module docstring), so two instances with one seed read the same bytes
-    and `skip_bytes()` reproduces exactly what an unbroken run would have read.
+    and `skip_bytes()` reproduces exactly what an unbroken run would have read —
+    for a shard source too, because `ShardStream`'s byte sequence is periodic in
+    `sum(shard sizes)` and the seed pins the file order.
     """
 
     def __init__(
@@ -455,8 +506,14 @@ class MixtureStream:
         self.seed = plan.seed if seed is None else seed
         self.window = batch * (seq_len + 1)
         stage_bounds(plan, steps)  # refuse a plan whose stages do not cover the budget
-        self._streams = {
-            name: ByteStream(path, batch, seq_len, ring_bytes=ring_bytes)
+        self._streams: dict[str, ByteStream | ShardStream] = {
+            name: open_source(
+                path,
+                batch,
+                seq_len,
+                seed=_stream_seed(self.seed, name),
+                ring_bytes=ring_bytes,
+            )
             for name, path in plan.sources.items()
         }
         self._step = 0

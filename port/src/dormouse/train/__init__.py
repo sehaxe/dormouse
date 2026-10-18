@@ -1,6 +1,15 @@
 """The trainer: the byte stream, the WSD schedule, the optimizer router, the loop."""
 
-from .data import ByteStream, eval_window_bytes, open_streams, split_points, warmup_steps
+from .data import (
+    ByteStream,
+    ShardStream,
+    eval_window_bytes,
+    open_source,
+    open_streams,
+    shard_files,
+    split_points,
+    warmup_steps,
+)
 from .graph import GRAPH_WARMUP_STEPS, OptimizerGraph
 from .loop import bpb, evaluate, kda_field, load_ckpt, save_ckpt, train
 from .lr import wsd_lr
@@ -13,14 +22,17 @@ __all__ = [
     "MixOptimizer",
     "Muon",
     "OptimizerGraph",
+    "ShardStream",
     "bpb",
     "eval_window_bytes",
     "evaluate",
     "is_muon_param",
     "kda_field",
     "load_ckpt",
+    "open_source",
     "open_streams",
     "save_ckpt",
+    "shard_files",
     "split_points",
     "train",
     "warmup_steps",
