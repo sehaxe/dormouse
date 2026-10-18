@@ -1,0 +1,21 @@
+# port preset: tiny — the CPU/CI shape the model tests use (`tests/conftest.py`
+# TINY: d=64, E=4, rank=8, engram 64 rows, bf16 off). NOT a training preset: it
+# is the shape every CPU gate instantiates, and `scripts/qat_export_demo.py
+# --preset tiny --fresh` is the export product's end-to-end CI path.
+# `tests/test_export.py::test_tiny_preset_matches_the_test_fixture` pins this
+# file against `conftest.TINY`, so the two cannot drift silently.
+
+d_model = 64
+n_heads = 4
+head_dim = 16
+d_ffn = 128
+vocab = 256
+max_seq_len = 64
+max_iter = 2
+rank = 8
+n_experts = 4
+moe_topk = 2
+engram_rows = 64
+engram_dim = 8
+bf16 = false
+shared_rank = 16
