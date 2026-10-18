@@ -1,4 +1,4 @@
-"""The dormouse CLI: `dormouse info|train|sft|eval|decode|serve`.
+"""The dormouse CLI: `dormouse info|train|sft|eval|bench|decode|serve`.
 
 A thin, pretty front over `config.load_run`, `train.loop`, and `model.decode`
 — config strictness, resume refusal and counter discipline are already
@@ -20,7 +20,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from .config import PROGRESS_KEYS, ModelConfig, RunConfig, TrainConfig, load_run
-from .instrument import LoudError, loud
+from .instrument import LoudError
 from .model import DormouseModel, param_count
 from .model.decode import decode_bytes, encode
 from .serve import DEFAULT_MAX_TOKENS, build_server, serve_forever
@@ -180,6 +180,24 @@ def _snapshot_run(
     if over:
         run.train = _dc.replace(run.train, **over)
     return run
+
+
+def _preset_check(preset: str, snap, *, what: str) -> None:
+    """`preset` is a CHECK, not a source: given, its MODEL half must match the snapshot's.
+
+    Train-half keys are exempt — the cadence, optimizer and data path do not
+    reach the bytes a checkpoint produces, and every checkpoint on disk was
+    trained with `--set` overrides. The shared rule for `serve` and `bench`
+    (one definition, so the two cannot drift).
+    """
+    claimed = _run(preset, [])
+    drift = [k for k in claimed.diff_keys(snap) if k.startswith("model.")]
+    if drift:
+        raise LoudError(
+            f"{what} {preset}: its model half differs from the checkpoint's own "
+            f"snapshot in {drift}. Escape: drop the argument (the checkpoint IS "
+            f"what is {what}), or point --ckpt-name at that run's checkpoint."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -547,6 +565,143 @@ def eval_cmd(
     )
 
 
+@app.command("bench")
+def bench_cmd(
+    preset: Annotated[
+        str,
+        typer.Argument(
+            help="optional CHECK: given, it must resolve to the checkpoint's own numbers"
+        ),
+    ] = "",
+    out_dir: Annotated[Path, typer.Option(help="checkpoint directory")] = Path("checkpoints"),
+    ckpt_name: Annotated[str, typer.Option("--ckpt-name", help="the checkpoint to score")] = "",
+    tasks: Annotated[
+        str,
+        typer.Option(
+            help="comma list: synth_math|arc_easy|hellaswag (default: synth_math,arc_easy; "
+            "with --download: every task)",
+        ),
+    ] = "",
+    data_dir: Annotated[
+        Path, typer.Option("--data-dir", help="where the task files live")
+    ] = Path("data_local/bench"),
+    limit: Annotated[int, typer.Option(help="items per task (0 = all)")] = 0,
+    download: Annotated[
+        bool, typer.Option("--download", help="fetch the named tasks into --data-dir and exit")
+    ] = False,
+    json_log: Annotated[
+        Path | None, typer.Option("--json-log", help="one JSONL row per task (appended)")
+    ] = None,
+    device: Annotated[str, typer.Option(help="auto|cuda|cpu")] = "auto",
+) -> None:
+    """Downstream MC eval: ARC-Easy / HellaSwag / a synthetic arithmetic task.
+
+    The score is the byte-level protocol (`bench/score.py`): every choice is
+    teacher-forced in ONE forward over `context + choice` and scored by the sum
+    of its bytes' log-probs. The printed headline is the per-byte MEAN and the
+    raw sum rides next to it, because the two disagree when choices differ in
+    length — a 1-byte choice and a 2-byte choice are not comparable as sums.
+
+    The window is the model's own `max_seq_len`; an item that does not fit is
+    DROPPED and counted (`bench_dropped`), never truncated. `preset` is a CHECK,
+    not a source (the `serve` rule): the snapshot is authority, and a preset
+    whose model half differs refuses. `--download` fetches the real tasks from
+    HuggingFace's public JSON-rows endpoint into `--data-dir` and exits; a task
+    that cannot be fetched refuses LOUDLY with its URL while the others land.
+    """
+    from .bench import TASKS, run_bench
+    from .bench.score import model_logits
+    from .bench.tasks import download as download_task
+    from .instrument import Counters
+    from .train.loop import load_model_half, load_model_state
+
+    names = [t.strip() for t in tasks.split(",") if t.strip()]
+    if not names:
+        names = list(TASKS) if download else ["synth_math", "arc_easy"]
+    if download:
+        failed: list[str] = []
+        for name in names:
+            try:
+                download_task(name, data_dir)
+            except LoudError as e:
+                failed.append(name)
+                console.print(f"[bold red]loud:[/] {e}")
+        if failed:
+            raise LoudError(
+                f"bench --download: {failed} did not land (the URLs above). The other tasks "
+                f"are on disk; the harness refuses a missing task by name rather than "
+                f"scoring one it did not read."
+            )
+        return
+
+    if not ckpt_name:
+        raise LoudError("bench needs --ckpt-name")
+    run = _snapshot_run(out_dir, ckpt_name)
+    if preset:
+        _preset_check(preset, run, what="scored")
+    dev = _device(device)
+    if dev.type == "cuda" and run.model.use_kda:
+        # The arm is checked BEFORE the run: `fla_status` is a tiny warmup call,
+        # and a bench that discovers an hour later that it measured the SDPA
+        # fallback has already spent the hour.
+        from .model.kda import fla_status
+
+        ok, why = fla_status(dev, recheck=True)
+        if not ok:
+            raise LoudError(
+                f"bench: the FLA KDA kernel is not live on {dev} ({why}). The SDPA "
+                f"fallback is a different algorithm, so its accuracy is not this "
+                f"checkpoint's number. Escape: `uv sync --extra gpu`, or run --device cpu "
+                f"and read the number as the COUNTED fallback's."
+            )
+    model = _model(run).to(dev)
+    _freeze_gc()
+    load_model_state(model, run.train, load_model_half(Path(out_dir) / f"{ckpt_name}.pt"))
+    model.eval()
+    # One counter set for the whole bench: the model's own arm counters (`kda_fla`
+    # vs `kda_sdpa`, `engram_rows`), which each JSONL row carries.
+    arm = Counters()
+
+    def logits_fn(ids):
+        return model_logits(model, ids.to(dev), arm)
+
+    reports = run_bench(
+        logits_fn,
+        names,
+        data_dir=data_dir,
+        max_seq_len=run.model.max_seq_len,
+        limit=limit,
+        json_log=json_log,
+        arm=arm,
+    )
+    macro = sum(r.acc_mean for r in reports) / len(reports)
+    console.print(
+        Panel(
+            f"[bold]{ckpt_name}[/] · {len(reports)} tasks · {sum(r.n for r in reports):,} items ·"
+            f" macro acc_mean {macro:.4f}",
+            subtitle=f"device {dev} · max_seq_len {run.model.max_seq_len}",
+        )
+    )
+    # The arm line goes OUTSIDE the panel: a Panel clips its subtitle at the
+    # console width, and a clipped counter line is a counter nobody can read
+    # (`kda_sdpa` was the field that got cut).
+    console.print(f"bench arm: {arm.line()}")
+    if dev.type == "cuda" and run.model.use_kda and not arm.get("kda_fla", 0):
+        raise LoudError(
+            "bench: on CUDA the KDA arm never ran the FLA kernel (kda_fla=0) although the "
+            "pre-run check found FLA live — the model did not route through it, and the "
+            "SDPA fallback is a different algorithm, so these accuracies are not this "
+            "checkpoint's numbers. Escape: check the config's `use_kda`/dispatch seam, or "
+            "run --device cpu and read the number as the COUNTED fallback's."
+        )
+    if dev.type == "cpu":
+        console.print(
+            f"[yellow]counted[/] CPU: the attention arm is the SDPA fallback "
+            f"({arm.get('kda_sdpa', 0)} calls), not the FLA KDA kernel — the same counted "
+            f"degradation the training forward takes on a CPU box."
+        )
+
+
 @app.command()
 def decode(
     out_dir: Annotated[Path, typer.Option(help="checkpoint directory")] = Path("checkpoints"),
@@ -739,14 +894,7 @@ def serve_cmd(
     every checkpoint on disk was trained with `--set` overrides.
     """
     if preset:
-        claimed, snap = _run(preset, []), _snapshot_run(out_dir, ckpt_name)
-        drift = [k for k in claimed.diff_keys(snap) if k.startswith("model.")]
-        if drift:
-            loud(
-                f"serve {preset}: its model half differs from the checkpoint's own "
-                f"snapshot in {drift}. Escape: drop the argument (the checkpoint IS "
-                f"what is served), or point --ckpt-name at that run's checkpoint."
-            )
+        _preset_check(preset, _snapshot_run(out_dir, ckpt_name), what="served")
     httpd = build_server(
         out_dir,
         ckpt_name,
