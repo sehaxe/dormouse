@@ -389,7 +389,7 @@ class SparseMoE(nn.Module):
         # `mm_mixed` returns `dt`, NOT fp32: with bf16 on, `logits` — and so the
         # softmax `probs` and the routed `weight` — are bf16. The combine
         # boundary widens the weight back to fp32 (`_triton_dispatch`).
-        logits = mm_mixed(x, self.router.weight, dt)
+        logits = mm_mixed(x, self.router.weight, dt, counters)
         probs = F.softmax(logits, dim=-1)  # [n, E]
         # a4.8: the activation quantization arm (COUNTED — a reader of the log
         # line sees it) applies to the EXPERTS' activations only. The router
@@ -449,7 +449,7 @@ class SparseMoE(nn.Module):
         weighted = weighted + self.shared(x, glu=self._glu)
         counters.count("moe_shared_forwards", n)
         # down: an fp32-master Linear; bf16 matmul + fp32 out (MAGMA fix).
-        return mm_mixed(weighted.to(dt), self.down.weight, dt).to(torch.float32)
+        return mm_mixed(weighted.to(dt), self.down.weight, dt, counters).to(torch.float32)
 
     def _lfb_step(self, index: torch.Tensor, counters: Counters) -> None:
         """The LFB bias move: on-device, gradient-free, trains-mode only.

@@ -277,7 +277,9 @@ class LoopBlock(nn.Module):
             ctx = h + self.iter_embed[i].view(1, 1, d)
             normed = self.norm(ctx)
             ctrl = torch.cat([ctx.reshape(b * t, d), h0_flat], dim=-1)
-            raw = mm_mixed(ctrl, self.controller.weight, self.compute_dtype)  # MAGMA fix
+            # MAGMA fix: fp32 masters with fp32 activations would run the slow
+            # fp32 lane; `mm_mixed` casts to the compute dtype per forward.
+            raw = mm_mixed(ctrl, self.controller.weight, self.compute_dtype, counters)
             w_attn = torch.sigmoid(raw[:, 0:1])
             w_mem = torch.sigmoid(raw[:, 1:2])
             w_ffn = torch.sigmoid(raw[:, 2:3])
@@ -320,7 +322,10 @@ class LoopBlock(nn.Module):
                 dense = (
                     (
                         mm_mixed(
-                            normed.reshape(b * t, d), self.mem_dense.weight, self.compute_dtype
+                            normed.reshape(b * t, d),
+                            self.mem_dense.weight,
+                            self.compute_dtype,
+                            counters,
                         )
                         + self.mem_dense.bias.to(self.compute_dtype)
                     )

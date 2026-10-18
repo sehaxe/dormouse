@@ -31,6 +31,7 @@ from ..model.engram import (
     host_step_all,
     load_host_state,
 )
+from ..model.tsct import set_mm_dtype
 from .data import ByteStream, eval_window_bytes, open_streams, warmup_steps
 from .graph import OptimizerGraph
 from .lr import wsd_lr
@@ -476,6 +477,22 @@ def train(
         torch.set_float32_matmul_precision("high")
     else:
         torch.set_float32_matmul_precision("highest")
+    # The 2-D GEMM COMPUTE mode (`tsct.set_mm_dtype`), the `tf32` knob's twin: a
+    # process-wide torch setting, applied once at the top of a run. LOUD when it
+    # is `fp8`, because on torch 2.13 that lane is FORWARD-ONLY: the training
+    # forward's operands require grad and `_scaled_mm` has no backward, so every
+    # training forward takes the COUNTED bf16 fallback and a reader has to know
+    # that before reading the loss curve.
+    set_mm_dtype(cfg.mm_dtype)
+    if cfg.mm_dtype == "fp8":
+        log(
+            "mm_dtype=fp8: the 2-D GEMMs run e4m3 `torch._scaled_mm` where autograd "
+            "is off. torch 2.13's `_scaled_mm` has NO backward (measured: "
+            "`RuntimeError: derivative for aten::_scaled_mm is not implemented`), so "
+            "this run's TRAINING forward falls back to bf16 COUNTED (`mm_fp8_fallback` "
+            "on the log line, the reason on `counters.why`) while its no-grad eval "
+            "forwards run fp8. Escape: mm_dtype=bf16 (the default)."
+        )
     device = None if device is None else torch.device(device)
     if stream is None:
         stream, eval_stream = open_streams(run)

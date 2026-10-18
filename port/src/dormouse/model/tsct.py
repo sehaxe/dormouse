@@ -58,10 +58,210 @@ import math
 import torch
 from torch import nn
 
-from ..instrument import loud
+from ..instrument import Counters, loud
+
+# ---------------------------------------------------------------------------
+# COMPUTE rungs: the fp8 2-D GEMM lane (`mm_dtype`)
+# ---------------------------------------------------------------------------
+
+#: The `mm_dtype` literals — the COMPUTE precision of `mm_mixed`'s 2-D GEMMs.
+#: `bf16` is the default and every number on record: cast the fp32 masters to
+#: the compute dtype, let cuBLAS run the bf16 tensor-core GEMM. `fp8` runs the
+#: same product through `torch._scaled_mm` (e4m3 × e4m3 → `dt` out) with
+#: per-tensor amax scales computed from the bf16 operand. It is a COMPUTE lane,
+#: not a storage rung: the fp32 masters and the checkpoint are untouched.
+#: Measured by the spike on this card (RTX 5060 Ti, 2026-10-15; the spike dir's
+#: `bench_f_fp8.py` = `docs/research/2026-10-15-torch-spike.md` phase 2, bf16
+#: in/out, per-tensor scales): [32768,2048]×[2048→64] 23.8 → 39.3 TFLOP/s,
+#: [32768,64]×[64→5461] 14.2 → 22.3 — **1.6-1.8×** — and `_scaled_grouped_mm`
+#: refuses sm_120 outright ("only supported on CUDA devices with compute
+#: capability = [9.0, 10.0]"), so the grouped/batched expert pass has no fp8
+#: path and is not attempted. `config.MM_DTYPES` is the same list at the schema
+#: layer (duplicated the way `NS_KINDS` is, so the config layer does not import
+#: the model).
+MM_DTYPES = ("bf16", "fp8")
+
+#: The process-wide compute mode (`set_mm_dtype`). `bf16` until a trainer says
+#: otherwise: a fresh process, an eval, a decode and every test run the default.
+_MM_DTYPE = "bf16"
+
+#: E4M3's own signed max (`RUNG_MAX["fp8"]`) — the per-tensor scale's divisor.
+_FP8_MAX = 448.0
+
+#: COUNTED fallbacks, reason → count, process-local. The `Counters` half is what
+#: the log line reads; this tally is what makes the guarantee unconditional — a
+#: call site that passes no `counters` still cannot fall back silently (ADR-0019).
+_FP8_FALLBACKS: dict[str, int] = {}
 
 
-def mm_mixed(x: torch.Tensor, weight: torch.Tensor, dt: torch.dtype) -> torch.Tensor:
+def set_mm_dtype(mode: str) -> None:
+    """`TrainConfig.mm_dtype`'s ONE entry point (`train/loop.py`, beside the
+    `tf32` knob): the compute mode is process-wide, like
+    `torch.set_float32_matmul_precision`, and a fresh process is `bf16`.
+
+    A value outside [`MM_DTYPES`] is LOUD here too — the setter is reachable
+    from a script or a test that never went through `load_run`, and the config
+    layer's refusal is not a substitute for the seam's.
+    """
+    if mode not in MM_DTYPES:
+        loud(
+            f"mm_dtype={mode!r} is not a compute mode. Known: {list(MM_DTYPES)} — "
+            f"`bf16` the bf16 tensor-core GEMM (the default and every number on "
+            f"record), `fp8` the e4m3 `torch._scaled_mm` lane (2-D only, forward "
+            f"only). Escape: name one of those."
+        )
+    global _MM_DTYPE
+    _MM_DTYPE = mode
+
+
+def mm_dtype() -> str:
+    """The live compute mode (`set_mm_dtype`'s state, for a gate or a bench)."""
+    return _MM_DTYPE
+
+
+def mm_fp8_fallbacks() -> dict[str, int]:
+    """The process-local reason tally of the fp8 lane's COUNTED fallbacks."""
+    return dict(_FP8_FALLBACKS)
+
+
+def fp8_quantize_2d(x: torch.Tensor, dt: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-tensor amax e4m3 quantize: `(q, scale)` with `x ≈ q.float() * scale`.
+
+    The scale is `amax(|x|) / 448` — E4M3's own signed max — computed from the
+    operand in `dt`, i.e. from the same bf16 tensor the bf16 lane would have
+    multiplied, and the cast is RNE onto the e4m3 grid (the spike's
+    `quant_per_tensor`). `clamp_min(1e-12)` is the all-zero operand: `0/1e-12`
+    quantizes to zero and the product comes back zero, where an unclamped `0/0`
+    would be NaN. The reduction is `detach()`ed — the scale is a constant of the
+    forward, and the lane is forward-only anyway (see [`mm_fp8`]).
+    """
+    amax = x.detach().abs().amax().to(torch.float32).clamp_min(1e-12)
+    scale = (amax / _FP8_MAX).reshape(1)
+    q = (x.float() / scale).to(torch.float8_e4m3fn).contiguous()
+    return q, scale
+
+
+def mm_fp8_shape_ok(k: int, n: int) -> bool:
+    """The e4m3 `_scaled_mm` shape rule: `K % 16 == 0 and N % 16 == 0`.
+
+    The one precondition that is a property of the SHAPE rather than of a live
+    tensor — so a bench, or a coverage table for the model's GEMM inventory, can
+    ask it without a device. [`_fp8_reason`] reads it; a shape that fails it is
+    a COUNTED fallback, never a padded call (padding a K or an N would change
+    the product).
+    """
+    return k % 16 == 0 and n % 16 == 0
+
+
+def _fp8_reason(
+    x: torch.Tensor, weight: torch.Tensor, dt: torch.dtype
+) -> tuple[str, str] | None:
+    """`None` if the fp8 lane can run THIS call, else `(reason, detail)`.
+
+    The ORDER is the operands' own properties first (dtype, rank, the
+    16-divisibility the e4m3 kernel needs, the contraction), the environment
+    after (device, autograd): a CPU test can reach the shape reasons, and a CUDA
+    call with a bad shape is told the shape reason rather than "not CUDA".
+
+    The autograd entry is a MEASUREMENT, not a guess: torch 2.13.0+cu129
+    registers no derivative for the op (`RuntimeError: derivative for
+    aten::_scaled_mm is not implemented`, reproduced on CPU for both
+    `_scaled_mm` and `_scaled_mm_v2`), so a training forward — where the
+    operands require grad — cannot use the lane. It falls back COUNTED, and the
+    lane serves the no-grad forwards (eval, decode, the bench).
+    """
+    if not hasattr(torch, "_scaled_mm"):
+        return ("this torch has no `torch._scaled_mm`", torch.__version__)
+    if dt not in (torch.bfloat16, torch.float16):
+        return ("the compute dtype is fp32 (the lane's out_dtype is bf16/fp16)", str(dt))
+    if x.dim() != 2 or weight.dim() != 2:
+        return (
+            "non-2-D operand (`_scaled_mm` is the 2-D GEMM)",
+            f"x{tuple(x.shape)} W{tuple(weight.shape)}",
+        )
+    if weight.shape[-1] != x.shape[-1]:
+        return (
+            "the operands do not contract",
+            f"x{tuple(x.shape)} @ W{tuple(weight.shape)}.T",
+        )
+    k, n = x.shape[-1], weight.shape[0]
+    if not mm_fp8_shape_ok(k, n):
+        return (
+            "K or N is not a multiple of 16 (the e4m3 `_scaled_mm` rule)",
+            f"K={k} N={n}",
+        )
+    if not x.is_cuda or not weight.is_cuda:
+        return ("not CUDA (the lane is the e4m3 kernel path)", str(x.device))
+    if torch.is_grad_enabled() and (x.requires_grad or weight.requires_grad):
+        return (
+            "autograd is on (torch's `_scaled_mm` has no backward)",
+            "the lane is forward-only",
+        )
+    return None
+
+
+def _fp8_fallback(reason: str, detail: str, counters: Counters | None) -> None:
+    """The COUNTED mark of a fallback: the tally always, the log line if given."""
+    _FP8_FALLBACKS[reason] = _FP8_FALLBACKS.get(reason, 0) + 1
+    if counters is not None:
+        counters.count("mm_fp8_fallback")
+        note = f"mm_fp8: {reason} [{detail}]"
+        prev = getattr(counters, "why", None)
+        counters.why = f"{prev}; {note}" if prev else note  # type: ignore[attr-defined]
+
+
+def mm_fp8(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    dt: torch.dtype,
+    counters: Counters | None = None,
+) -> torch.Tensor | None:
+    """`x @ Wᵀ` through `torch._scaled_mm`, or `None` = "run the bf16 lane".
+
+    Both operands are quantized per-tensor (e4m3) from their bf16 form and the
+    GEMM runs fp8 in / `dt` out; the fp32 masters are not read here at all, so
+    the storage and the optimizer's object cannot move (this is a COMPUTE rung).
+
+    `None` is returned only after a COUNTED fallback — `mm_fp8_fallback` on the
+    `Counters` (the log line) + the reason on `counters.why`, and the
+    process-local [`mm_fp8_fallbacks`] tally so a call with no counters is still
+    not silent (ADR-0019). Every precondition is in [`_fp8_reason`]; the one a
+    training run meets is autograd, because torch 2.13's `_scaled_mm` has no
+    backward.
+    """
+    why = _fp8_reason(x, weight, dt)
+    if why is not None:
+        _fp8_fallback(why[0], why[1], counters)
+        return None
+    a = x if x.dtype == dt else x.to(dt)
+    w = weight if weight.dtype == dt else weight.to(dt)
+    aq, sa = fp8_quantize_2d(a, dt)
+    wq, sw = fp8_quantize_2d(w, dt)
+    # `_scaled_mm` wants mat2 column-major: `wq` is [N, K] row-major, so its
+    # transpose is [K, N] with strides (1, K) — the layout the fp8 kernel asks
+    # for, as a VIEW (no copy; the spike's `col_major` materializes the same).
+    try:
+        out = torch._scaled_mm(aq, wq.t(), sa, sw, out_dtype=dt)
+    except RuntimeError as e:
+        # A kernel refusal for a call the preconditions accepted (an unlisted
+        # stride/dtype combination on some future shape) is COUNTED and the run
+        # stays on the bf16 lane — the `moe_triton_fallback` /
+        # `opt_graph_fallback` rule: a failed accelerated arm degrades, it does
+        # not kill the run. The quantize above is plain torch and stays OUTSIDE
+        # this handler: a failure there is a bug in the lane, and bugs are LOUD.
+        _fp8_fallback("`_scaled_mm` refused the call", str(e)[:160], counters)
+        return None
+    if counters is not None:
+        counters.count("mm_fp8_gemm")
+    return out
+
+
+def mm_mixed(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    dt: torch.dtype,
+    counters: Counters | None = None,
+) -> torch.Tensor:
     """`x @ Wᵀ` in `dt` — the port's mixed-dtype rule (F.linear). The OUT is `dt`.
 
     torch's `Linear` dispatched on the INPUT's dtype: fp32 masters with fp32
@@ -76,7 +276,18 @@ def mm_mixed(x: torch.Tensor, weight: torch.Tensor, dt: torch.dtype) -> torch.Te
     rule exists to avoid), so a caller that needs fp32 widens it explicitly —
     `SparseMoE`'s `down` does, and so does the MoE combine boundary, which is
     why the router's bf16 softmax weight is cast there rather than here.
+
+    Under `mm_dtype = "fp8"` this is the ONE seam the lane enters: the product
+    is attempted through [`mm_fp8`] first and the bf16 line below is the COUNTED
+    fallback, never a silent one. Every call site passes `counters`, so the log
+    line's `mm_fp8_gemm` / `mm_fp8_fallback` counters say which lane ran; the
+    reason rides `counters.why` (the port's seam channel, the same one
+    `moe_triton_fallback` uses) and [`mm_fp8_fallbacks`].
     """
+    if _MM_DTYPE == "fp8":
+        y = mm_fp8(x, weight, dt, counters)
+        if y is not None:
+            return y
     w = weight if weight.dtype == dt else weight.to(dt)
     return (x if x.dtype == dt else x.to(dt)) @ w.t()
 

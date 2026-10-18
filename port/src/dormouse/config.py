@@ -154,6 +154,22 @@ MUON_COLROW_3D = ("frobenius", "colrow")
 #: `docs/research/2026-10-16-muon-orthogonalization-cost.md`). Both are opt-in
 #: and approximate by design; a name that is not here is LOUD.
 OPT_DTYPES = ("fp32", "bf16")
+#: The `mm_dtype` literals — the COMPUTE precision of the 2-D GEMMs
+#: (`model/tsct.py`, which is where they execute; the list is duplicated here
+#: the way `NS_KINDS` is, so the config layer does not import the model).
+#: `bf16` is the default and every number on record: fp32 masters cast to the
+#: compute dtype, cuBLAS bf16 tensor cores. `fp8` routes `mm_mixed`'s 2-D
+#: products through `torch._scaled_mm` (e4m3 × e4m3 → bf16 out) with per-tensor
+#: amax scales computed from the bf16 operand — the spike's measured 1.6-1.8×
+#: on 2-D GEMMs (`docs/research/2026-10-15-torch-spike.md` phase 2; grouped fp8
+#: is ABSENT on sm_120 and is not attempted). A COMPUTE rung: the fp32 masters,
+#: the checkpoint and the optimizer are untouched. **On torch 2.13 the lane is
+#: FORWARD-ONLY** — `_scaled_mm` registers no derivative (`RuntimeError:
+#: derivative for aten::_scaled_mm is not implemented`, measured), so a training
+#: forward falls back to bf16 COUNTED (`mm_fp8_fallback` on the log line, the
+#: reason on `counters.why`) and the no-grad forwards (eval, decode, the bench)
+#: run it. A name that is not here is LOUD.
+MM_DTYPES = ("bf16", "fp8")
 #: The `muon_variant` literals — the DIRECTION arms (`optim.MUON_VARIANTS`, which
 #: is where they execute; the list is duplicated here the way `NS_KINDS` is, so
 #: the config layer does not import the trainer). `muon` is the update every
@@ -428,6 +444,37 @@ class TrainConfig:
     #: an approximate iteration, so the expected cost is small — that is a
     #: prediction, not a substitute for the check.
     tf32: bool = False
+    #: The 2-D GEMM COMPUTE precision (`MM_DTYPES`, `model/tsct.py` where it
+    #: executes — `tsct.set_mm_dtype` is called once by `train/loop.py`, the same
+    #: shape as the `tf32` knob above). `bf16` (the default) is every number on
+    #: record: fp32 masters, bf16 tensor-core GEMM. `fp8` runs `mm_mixed`'s
+    #: products through `torch._scaled_mm` (e4m3 × e4m3 → bf16 out, per-tensor
+    #: amax scales off the bf16 operand): the spike's 1.6-1.8× on 2-D GEMMs,
+    #: measured on this card (`bench_f_fp8.py`: [32768,2048]×[2048→64] 23.8 →
+    #: 39.3 TFLOP/s, [32768,64]×[64→5461] 14.2 → 22.3). It is a COMPUTE rung:
+    #: masters, checkpoint and optimizer state do not move.
+    #:
+    #: **Two facts a reader must know before reading a number off it**, both
+    #: measured on torch 2.13.0+cu129 (2026-10-18, CPU + the spike's GPU runs):
+    #: (1) the lane is FORWARD-ONLY — `_scaled_mm` has no autograd formula
+    #: (`RuntimeError: derivative for aten::_scaled_mm is not implemented`), so
+    #: every forward whose operands require grad falls back to bf16 COUNTED
+    #: (`mm_fp8_fallback` on the log line, the reason on `counters.why`); the
+    #: trainer prints the same fact at start. A TRAINING run is therefore bf16
+    #: compute, while its own no-grad eval forwards are fp8 — the flag's meaning
+    #: until a custom backward lands. The mode is PROCESS-wide, set by `train()`
+    #: (the `tf32` shape), so a standalone `dormouse eval`/`generate` process
+    #: starts at the default `bf16`: that default IS the precision this run's
+    #: training step ran, so the standalone eval is the training-precision
+    #: measurement rather than a mismatch.
+    #: (2) `_scaled_mm` is a 2-D op and e4m3 needs K and N divisible by 16, so a
+    #: shape outside that (the medium router's N=3, its 2730-wide down
+    #: projection) falls back COUNTED with its reason. Grouped/batched fp8 does
+    #: not exist on sm_120.
+    #: In the snapshot: a flip is refused on a resume by `diff_keys` (it changes
+    #: what the forward computes), and an older snapshot that lacks the key
+    #: fills this default and stays a legal resume.
+    mm_dtype: str = "bf16"
     #: bitsandbytes 8-bit state for the AdamW group. The group at the FULL b1
     #: preset includes the Engram tables (402M params => 3.2 GB of fp32 m+v),
     #: which is exactly what this saves; measured cost +~180 ms/step with the
@@ -1214,6 +1261,19 @@ def load_run(
         tcfg = dataclasses.replace(tcfg, **train_overrides)
     if tcfg.opt not in ("mix", "adamw"):
         loud(f"opt={tcfg.opt!r}: known optimizers are 'mix' (default) and 'adamw'")
+    if tcfg.mm_dtype not in MM_DTYPES:
+        loud(
+            f"mm_dtype={tcfg.mm_dtype!r} is not a compute mode. Known: "
+            f"{list(MM_DTYPES)} — `bf16` casts the fp32 masters to the compute "
+            f"dtype and runs the bf16 tensor-core GEMM (the default and every "
+            f"number on record), `fp8` runs the 2-D products through "
+            f"`torch._scaled_mm` (e4m3 × e4m3 → bf16 out, per-tensor amax scales "
+            f"off the bf16 operand; the spike measured 1.6-1.8× on 2-D GEMMs, and "
+            f"the lane is FORWARD-ONLY on torch 2.13 — `_scaled_mm` has no "
+            f"backward, so a training forward falls back to bf16 COUNTED). "
+            f"Escape: name one of those, or land the mode in `tsct.MM_DTYPES` and "
+            f"its gate BEFORE the config can lie about it."
+        )
     if tcfg.ns_kind not in NS_KINDS:
         loud(
             f"ns_kind={tcfg.ns_kind!r} is not an arm. Known: {list(NS_KINDS)} — "
