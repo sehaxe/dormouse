@@ -89,6 +89,15 @@ END = 0x03
 PAD = 0x00
 SENTINELS = (USER, ASSIST, END, PAD)
 
+#: The generator's index range the RL/bench lane owns: `build_tasks(cls, seed,
+#: n=...)` returns indices `0..n-1` (`post/rl_train.py` uses the run's
+#: `rl_tasks`; `cli.run`'s stage 2 uses 8). The SFT corpus draws from
+#: `[SFT_TASK_OFFSET, SFT_TASK_OFFSET + n_tasks)` instead, and `cli.rl_cmd`
+#: refuses an `rl_tasks` that reaches this offset — so under one seed the two
+#: sets cannot share a task instance (audit C2). The range check is code, not
+#: convention; `tests/test_sft.py` pins the disjointness.
+SFT_TASK_OFFSET = 10_000
+
 #: The generic half of the corpus: the model has to learn the FORMAT, not just
 #: code. Hand-written, both languages the corpus speaks, answers kept short so
 #: the pair fits a 64-byte window (the tests' tiny preset).
@@ -427,16 +436,45 @@ def render(instruction: str, answer: str) -> bytes:
     )
 
 
+def _sft_tasks(cls: str, seed: int, n_tasks: int) -> list:
+    """The SFT slice of the generator's index space: `[OFFSET, OFFSET+n)`.
+
+    The RL/bench lane draws `0..n-1` from the same `(cls, seed)`, so an index
+    offset is the disjointness proof (audit C2). `n_tasks == 0` short-circuits
+    the generator: a chat-only corpus must not build 10 000 unused tasks.
+    """
+    if n_tasks < 0:
+        loud(f"SFT corpus n_tasks={n_tasks}: a task count cannot be negative")
+    if n_tasks == 0:
+        return []
+    return build_tasks(cls, seed, n=SFT_TASK_OFFSET + n_tasks)[SFT_TASK_OFFSET:]
+
+
+def _code_instruction(task) -> str:
+    """The task's prompt PLUS its own verifier calls.
+
+    `post/tasks.py` emits ONE signature+docstring prompt per `i % 3` kind — the
+    text does not vary with the index — so an index-disjoint SFT slice would
+    still contain the exact prompt string the RL lane scores. The verifier's
+    calls are the task's own random draw, so printing them makes the SFT
+    instruction an instance of the kind rather than a copy of the prompt
+    template (the answer is still the reference implementation, which is what
+    SFT is for).
+    """
+    examples = "; ".join(f"{call} == {value}" for call, value in task.tests)
+    return f"{task.prompt.rstrip()}\n# examples: {examples}"
+
+
 def _examples(
     seed: int, n_tasks: int, chat: list[tuple[str, str]] | None = None
 ) -> list[tuple[str, str]]:
     """The pairs: generic QA + the RU bank + seeded tasks (REUSED) + chat rows."""
     out = list(GENERIC_QA) + _ru_pairs()
-    for task in build_tasks("code", seed, n=n_tasks):
-        # The task's prompt is the instruction (signature + docstring); the
-        # hidden reference implementation is the answer.
-        out.append((task.prompt.rstrip("\n"), task.solution.rstrip("\n")))
-    for task in build_tasks("math", seed, n=n_tasks):
+    for task in _sft_tasks("code", seed, n_tasks):
+        # The code prompt is the instruction (signature + docstring) plus the
+        # task's examples; the hidden reference implementation is the answer.
+        out.append((_code_instruction(task), task.solution.rstrip("\n")))
+    for task in _sft_tasks("math", seed, n_tasks):
         # The math prompt asks for a final `answer: <value>` line, so the answer
         # teaches that format too (it is what `verifiers._final_answer` reads).
         out.append((task.prompt, f"answer: {task.solution}"))

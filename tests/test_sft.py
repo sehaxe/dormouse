@@ -21,6 +21,7 @@ from dormouse.config import ModelConfig, RunConfig, TrainConfig
 from dormouse.instrument import Counters, LoudError
 from dormouse.model import DormouseModel
 from dormouse.model.engram import enable_host_tables, host_engrams
+from dormouse.post.tasks import build_tasks
 from dormouse.train.data import ByteStream
 from dormouse.train.sft import (
     ASSIST,
@@ -28,6 +29,7 @@ from dormouse.train.sft import (
     GENERIC_QA,
     PAD,
     USER,
+    _sft_tasks,
     build_sft_corpus,
     render,
     sft_loss,
@@ -752,6 +754,45 @@ def test_holdout_moves_the_tail_to_a_sibling(tmp_path):
     assert len(hold.read_bytes()) == 7 * a["record_bytes"]
     with pytest.raises(LoudError, match="holdout"):
         build_sft_corpus(tmp_path / "c.bin", 5, seq_len=64, n_tasks=0, holdout=10_000)
+
+
+def _corpus_instructions(path: Path, record_bytes: int) -> set[bytes]:
+    """The instruction text of every record (markers and the render newline out)."""
+    out = set()
+    raw = path.read_bytes()
+    for off in range(0, len(raw), record_bytes):
+        rec = raw[off : off + record_bytes]
+        assert rec[0] == USER, rec[:8]
+        a = rec.index(ASSIST)
+        out.add(rec[1 : a - 1])  # render: USER + instruction + b"\n" + ASSIST
+    return out
+
+
+def test_the_sft_corpus_and_the_rl_task_set_are_disjoint(tmp_path: Path):
+    """C2 gate: one seed, two disjoint ranges of the generator's index space.
+
+    The RL/bench lane draws `build_tasks` indices `0..n-1`; the SFT corpus
+    draws `[SFT_TASK_OFFSET, ...)`. `post/tasks.py` repeats its code
+    signature+docstring prompt by `i % 3` kind, so the corpus instruction also
+    carries the task's own verifier calls — an index offset alone would leave
+    the RL prompt string in the corpus. This is the observable property;
+    `cli.rl_cmd`'s `rl_tasks <= SFT_TASK_OFFSET` refusal is the code guarantee.
+    """
+    seed = 1
+    path = tmp_path / "sft.bin"
+    report = build_sft_corpus(path, seed, seq_len=512, n_tasks=32)
+    instructions = _corpus_instructions(path, report["record_bytes"])
+
+    sft_code = _sft_tasks("code", seed, 32)
+    sft_math = _sft_tasks("math", seed, 32)
+    assert sft_code[0].tid == "code-1-10000"  # the offset is the range, not a promise
+    for cls, sft_tasks in (("code", sft_code), ("math", sft_math)):
+        rl_tasks = build_tasks(cls, seed, n=8)
+        # The same (seed, n) is a stable task set across calls.
+        assert rl_tasks == build_tasks(cls, seed, n=8)
+        assert {t.tid for t in rl_tasks}.isdisjoint({t.tid for t in sft_tasks})
+        for task in rl_tasks:
+            assert task.prompt.rstrip("\n").encode() not in instructions, task.tid
 
 
 def test_sft_eval_reports_first_byte_agreement(tmp_path):
