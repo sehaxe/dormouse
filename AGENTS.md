@@ -24,6 +24,39 @@ the code is worse than none. The list of places where a document and the code
 disagree about a name or a default is at the end of the glossary; several of
 them are still open.
 
+## Retracted — the Python lane (2026-10-19)
+
+The Rust lane's retractions are §3.2 below. These are the Python lane's, and they
+are the ones a reader of this tree needs first, because they invalidate artifacts
+that are still on disk:
+
+- **`checkpoints/b1night`, `checkpoints/medium_big2` and `checkpoints/sft/sft9`
+  are NOT reproducible and must not be used as bases.** The expert-bank cache in
+  `SparseMoE._banks` was keyed on the parameters' `_version`, and a CUDA-graph
+  replay moves a parameter's VALUE without bumping `_version` (measured
+  2026-10-19: eager step `0 → 1`, the same step replayed `5 → 5`). With
+  `opt_graph=true` the key therefore froze at capture, and the forward served the
+  bank built at ~step 5 for the whole run: the experts stopped training, drifted
+  ~44× from a fresh build, and a fresh process could not rebuild the bank the run
+  used (loading the file gives loss 2.7e6). The live evals could not see it —
+  they reused the same stale bank. Fixed by `invalidate_banks_all(model)` per
+  trained step (`train/loop.py`, `train/sft.py`), pinned by
+  `tests/test_bank_invalidation.py`, whose CPU stand-in for a graph replay is
+  `p.data.add_(...)`. Runs that did not set `opt_graph` (`b1first`, the speed
+  sweeps) are unaffected. The cost of the fix is ~4% of step time (a bank rebuild
+  per step) — the correct trade.
+- **The depth claim in README is a small-protocol result, not a settled
+  optimum.** The A/B (small, 2k steps, 81 920 B) put depth 3 ahead by 0.0042 BPB
+  against a control spread of 0.0016; the mixture runs' own eval curve is still
+  improving at the preset's `max_iter=4` (`small_wide` step 7500:
+  `depths=1:1.8934, 2:1.6637, 3:1.6221, 4:1.6129`). Presets run 4; the question is
+  open, and `--eval-depths` is the instrument.
+- **A BPB is only comparable inside one window.** The window is
+  `eval_batches × batch × seq_len` and it is printed on every eval line
+  (`over 196608 B (8 x 24 x 1024)`). `mix1` (196 608 B) and `small_wide`
+  (131 072 B) are therefore not on one curve, and neither is comparable to the
+  Rust lane's 20 480 B readings.
+
 ## Repo layout
 
 - `crates/dormouse-core` — the model: `DormouseModel` = Embedding → `LoopBlock`

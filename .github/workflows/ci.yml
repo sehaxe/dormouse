@@ -7,7 +7,7 @@ on:
 jobs:
   # The Python tree: lint, then the full CPU suite. The CUDA gates self-skip on
   # a runner without a GPU (they check for the device, not for CI), so the same
-  # 861 tests that run locally run here minus the hardware-bound ones.
+  # tests that run locally run here minus the hardware-bound ones.
   python:
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -16,6 +16,14 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
+      # The browser-engine parity gate (`tests/test_demo_engine.py`) drives
+      # `node --test` and SKIPS itself when node is absent — which meant the
+      # one gate that proves the shipped JS engine computes this model's
+      # arithmetic never ran here. Node is pinned to the same major the
+      # docs-site workflow uses; the gate reads either reporter's spelling.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
       - name: install (CPU torch from PyPI; the gpu extra is the local stack)
         run: uv sync
       - name: lint
