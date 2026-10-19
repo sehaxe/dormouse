@@ -57,22 +57,22 @@ Status values: `fixed` (with the proof named) · `open` · `queued` (a task exis
 | M4 | `mm_dtype` / `kda_disable_recompute` were inert on SFT and RL | **fixed for the CLI, verified** (R1 i) | the setters moved into `load_run` (`7f8b906`); `load_run` leaked them to non-training callers (R1-M6), now opt-in (`a1bb3eb`). Direct library callers of `sft_train`/`rl_train` still bypass the setters |
 | M5 | the no-`--eval` tail path overstates the scored bytes when the window exceeds 1 MB | **fixed for the printed count, residual wrap open** (R1-M5) | `loop.py` prints the bytes it read; `_eval_batches` still divides by `batch*seq_len` while a window reads `batch*(seq_len+1)`, so the last window wraps (`loop.py:403-417`, other lane) |
 | M6 | the CPU gate cannot run while a training job holds the card | **queued** (infra I12) | a `conftest` guard that turns "card busy" into a skip; not landed |
-| M7 | device syncs in the forward: quantizers, the SFT step, the naive MoE arm | **partly fixed** | act_quant/mxfp cadence verified (R1 g) and the SFT step's mask/count is host-side with a CUDA sync-debug gate (`ea2dc53`); the mxfp cadence silently zeroes a block (R1-M4), the SFT eval mask is still built on device (R1-M8), and the naive MoE arm still calls `torch.unique(...).tolist()` (`experts.py:753`) |
+| M7 | device syncs in the forward: quantizers, the SFT step, the naive MoE arm | **partly fixed** | act_quant/mxfp cadence verified (R1 g), the off-cadence MX zero is now COUNTED (`98642e6`), and the SFT step's mask/count is host-side with a CUDA sync-debug gate (`ea2dc53`); the SFT eval mask is still built on device (R1-M8), and the naive MoE arm still calls `torch.unique(...).tolist()` (`experts.py:753`) |
 | M8 | `lfb_bias` is not persisted while `lfb_counts` is | **fixed, verified** (R1 j) | `tests/test_lfb.py` round-trip; the sidecar write is not atomic with the weights and a pre-fix checkpoint resumes with a zero bias (R1-M7) |
 
 ## Review round 1 — N1-N5 and M1-M9
 
 | # | finding | status | proof / plan |
 |---|---|---|---|
-| R1-N1 | `Counters.why` crashes `OptimizerGraph._replay` (`graph.py:284`, `:322`) | **open** | reproduced in the round-1 review; the gate is a `_replay` on a counters dict containing `why` (no GPU needed); `instrument.py`/`graph.py` are another lane's |
-| R1-N2 | `serve.py` reports `completion_tokens = n` and `finish_reason = "stop"` even when the early stop byte or the budget ended the reply | **open** | `serve.py:372-376`; the fix is `len(content)` and `length` on a budget exit; `tests/test_serve.py:93` currently pins the wrong contract |
+| R1-N1 | `Counters.why` crashes `OptimizerGraph._replay` (`graph.py:284`, `:322`) | **fixed** | `9f76650`; `tests/test_opt_graph.py` replays a captured counters dict that carries `why` (no GPU needed) |
+| R1-N2 | `serve.py` reports `completion_tokens = n` and `finish_reason = "stop"` even when the early stop byte or the budget ended the reply | **fixed** | `f964190`; `tests/test_serve.py` pins `len(content)` and `length` on a budget exit |
 | R1-N3 | a non-numeric `Content-Length` raises in the handler thread, resetting the connection instead of a JSON 400 | **open** | `serve.py:306-311`; no body-size cap either |
 | R1-N4 | the findings ledger omitted the code audit's C1/C2/M1-M8 and the round-1 findings | **fixed** | this file; the rows above are the missing sets |
 | R1-N5 | `_verify_math`'s sympy call has no timeout and the sandbox patches only `builtins.open` | **open** | `post/verifiers.py:52-56`, `:136-142`; one generated expression can hang the reward loop |
 | R1-M1 | the SFT corpus still contained the verifier's exact answers | **fixed** | `4f61858`; gate `test_the_sft_corpus_shares_no_solution_with_the_verifier` |
 | R1-M2 | the SFT eval prints and scores more records than its holdout holds | **open** | `_sft_eval` loops `cfg.eval_batches` without capping to the stream (`sft.py:708-717`), and `sft_train` prints the requested window (`sft.py:1013-1018`) |
 | R1-M3 | the `nvfp4` zero-block counter never reaches a log | **open** | `pack_tsct(t, rung, counters=None)` (`tsct.py:735`) is called with two arguments by `save_ckpt` (`loop.py:222`); other lane |
-| R1-M4 | the mxfp cadence turns the e8m0 range refusal into a silent zeroed block | **open** | `mxfp.py:150`, `:200`; reproduced in round 1; other lane |
+| R1-M4 | the mxfp cadence turns the e8m0 range refusal into a silent zeroed block | **fixed** | `98642e6`; `tests/test_mxfp.py` asserts the off-cadence range refusal is zeroed and COUNTED, never silent |
 | R1-M5 | `_eval_batches` is off by one target byte per window | **open** | `loop.py:403-417`; capacity divides by `batch*seq_len`, `next_batch` reads `batch*(seq_len+1)`; other lane |
 | R1-M6 | `load_run` mutates process-wide compute state for non-training callers | **fixed** | `a1bb3eb`; gate asserts `info` and the serve/bench preset check stay at bf16/False while `train`/`run`/`sft`/`rl` apply fp8/True |
 | R1-M7 | the LFB sidecar is a second atomic write and a pre-fix checkpoint resumes with a zero bias | **open** | `loop.py:111-120`, `:233`; other lane; the missing-sidecar line is not COUNTED |
