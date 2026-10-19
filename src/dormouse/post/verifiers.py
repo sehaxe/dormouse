@@ -10,32 +10,41 @@ default grader at our scale is the deterministic verifier.
 | class | signal | shape |
 |---|---|---|
 | `code` | subprocess exec, 5 s, rlimits, tempdir cwd, no-network preamble | per-test I/O |
-| `math` | sympy equivalence of the extracted FINAL answer | algebra, not string match |
+| `math` | whitelisted parse; sympy equivalence of the FINAL answer | algebra, not a string |
 | `noop` | **LOUD refusal of every task** (the do-not-run class) | raises [`LoudError`] |
+
+**The model's text is hostile input in both classes.** The math answer used to go
+through `sympy.sympify`, which *evaluates* the string in this process: an answer
+like `__import__('os').system('...')` was arbitrary code execution in the
+trainer, and `9**9**9` was a hang. [`_safe_expr`] now parses with a whitelist —
+numbers, `+ - * / ** ( )`, a fixed function set, `pi`/`E` — and bounds the work
+([`MAX_EXPR_CHARS`], [`MAX_EXPR_NODES`], [`MAX_EXPONENT`], [`MAX_MAGNITUDE`]);
+everything else is a refusal whose reason names the offending token. The code
+class is screened statically by an AST **allowlist** (imports limited to `math`,
+calls limited to the standard names an algorithmic solution needs, no dunder
+attributes, no `open`/`eval`/`exec`/`compile`/`__import__`/`getattr` and no
+`os`/`posix`/`pathlib`/`io`/`subprocess`/`shutil`/`socket`/`ctypes`/`importlib`/
+`sys`), and the child process keeps a second line: the forbidden modules are
+removed from `sys.modules` and refused by an import hook, `open` refuses all
+file I/O, and the submission executes with an allowlist of builtins.
 
 [`verify`] is pure and deterministic: the same `(task, response)` always yields
 the same `Verdict`, and the `reason` never carries the raw response — a byte
 budget and a log line read both, and an unlogged verifier is the ADR-0019
-failure mode.
+failure mode. A refusal names the token, never the response text.
 """
 
 from __future__ import annotations
 
 import ast
 import math
-import os
 import re
-import subprocess
-import sys
-import tempfile
 from dataclasses import dataclass
 
 import sympy
 
 from ..instrument import loud
-
-#: The exec jail's wall clock and CPU limit, in seconds (2602.11210's shape).
-TIMEOUT_S = 5.0
+from .sandbox import TIMEOUT_S, run_code
 
 #: The math parser's work bounds. These are refusals, not truncations: an answer
 #: over a limit is REJECTED and the reason says which limit it crossed.
@@ -46,7 +55,16 @@ MAX_EXPR_NODES = 64
 MAX_EXPONENT = 1000
 MAX_MAGNITUDE = 1e100
 
-__all__ = ["TIMEOUT_S", "Verdict", "sympy_equivalent", "verify"]
+__all__ = [
+    "MAX_EXPR_CHARS",
+    "MAX_EXPR_NODES",
+    "MAX_EXPONENT",
+    "MAX_MAGNITUDE",
+    "TIMEOUT_S",
+    "Verdict",
+    "sympy_equivalent",
+    "verify",
+]
 
 
 @dataclass(frozen=True)
@@ -269,128 +287,13 @@ def _verify_math(task: dict, response: str, used: float) -> Verdict:
 
 # --------------------------------------------------------------------------- code
 
-#: The static anti-reward-hack screen (2601.20103's class). A response that names
-#: any of these is refused BEFORE it runs — the sandbox below is the second layer,
-#: not the first.
-_FORBIDDEN: tuple[tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"\bsocket\b"), "network access"),
-    (
-        re.compile(r"\b(?:urllib|requests|httpx|ftplib|smtplib|telnetlib|asyncio)\b"),
-        "network access",
-    ),
-    (re.compile(r"\bsubprocess\b|\bos\.(?:system|popen|spawn\w*|exec\w*|fork)\b"), "process spawn"),
-    (re.compile(r"\bctypes\b"), "native code"),
-    (re.compile(r"__import__|\bimportlib\b"), "dynamic import"),
-    (re.compile(r"/etc/passwd"), "sensitive path"),
-    (re.compile(r"open\s*\(\s*[\"']/(?!tmp)"), "absolute-path read"),
-)
-
-#: Child-side jail: a new session, no CPU/address-space blowups, no forks, and a
-#: preamble that unimports the network and refuses absolute-path reads. The
-#: static screen catches the plain cases; this catches a string-built ones.
-_SANDBOX_PREAMBLE = """\
-import sys as _sys
-for _m in ("socket", "ssl", "http", "urllib", "ftplib", "smtplib", "asyncio",
-           "ctypes", "subprocess"):
-    _sys.modules[_m] = None
-import builtins as _builtins
-_open = _builtins.open
-def _sandbox_open(file, *args, **kwargs):
-    path = str(file)
-    if path.startswith("/") and not path.startswith("/tmp/"):
-        raise PermissionError("sandbox: absolute-path reads outside the workdir are refused")
-    return _open(file, *args, **kwargs)
-_builtins.open = _sandbox_open
-"""
-
-
-class _Timeout(Exception):
-    """The jailed program exceeded [`TIMEOUT_S`]."""
-
-
-class _SandboxError(Exception):
-    """The jailed program exited non-zero; carries the code, never the stderr."""
-
-    def __init__(self, code: int) -> None:
-        super().__init__(code)
-        self.code = code
-
-
-def _sandbox_limits() -> None:  # runs in the child, before exec
-    os.setsid()
-    import resource
-
-    resource.setrlimit(resource.RLIMIT_CPU, (int(TIMEOUT_S), int(TIMEOUT_S)))
-    resource.setrlimit(resource.RLIMIT_AS, (512 << 20, 512 << 20))
-    resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
-    resource.setrlimit(resource.RLIMIT_NPROC, (0, 0))
-
-
-def _extract_code(response: str) -> str:
-    fence = re.search(r"```(?:python)?\s*\n(.*?)```", response, re.DOTALL)
-    return fence.group(1) if fence else response
-
-
-def _harness(tests) -> str:
-    lines = ["_results = []"]
-    for call, _ in tests:
-        lines.append(f"_results.append(repr({call}))")
-    lines.append("print('\\n'.join(_results))")
-    return "\n".join(lines) + "\n"
-
-
-def _run_sandbox(program: str, *, timeout: float) -> str:
-    with tempfile.TemporaryDirectory() as workdir:
-        try:
-            proc = subprocess.run(
-                [sys.executable, "-I", "-B", "-"],
-                input=program,
-                cwd=workdir,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                env={"PATH": "/usr/bin:/bin", "HOME": workdir},
-                preexec_fn=_sandbox_limits,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise _Timeout from exc
-    if proc.returncode != 0:
-        raise _SandboxError(proc.returncode)
-    return proc.stdout
-
-
-def _screen_code(response: str) -> str | None:
-    for pat, label in _FORBIDDEN:
-        if pat.search(response):
-            return label
-    return None
-
 
 def _verify_code(task: dict, response: str, used: float) -> Verdict:
-    bad = _screen_code(response)
-    if bad is not None:
-        return Verdict(False, f"refused: {bad} is not allowed in a sandboxed verifier", used)
+    """The jail lives in `post/sandbox.py` (static allowlist + runtime guard)."""
     tests = tuple(task.get("tests") or ())
     if not tests:
         return Verdict(False, "refused: the task carries no tests to run", used)
-    program = _SANDBOX_PREAMBLE + "\n" + _extract_code(response) + "\n" + _harness(tests)
-    try:
-        out = _run_sandbox(program, timeout=TIMEOUT_S)
-    except _Timeout:
-        return Verdict(False, f"timed out after {TIMEOUT_S:g}s in the sandbox", used)
-    except _SandboxError as exc:
-        return Verdict(False, f"program exited with code {exc.code} under the sandbox", used)
-    lines = out.strip().splitlines() if out.strip() else []
-    if len(lines) != len(tests):
-        return Verdict(False, f"expected {len(tests)} result lines, got {len(lines)}", used)
-    match = str(task.get("match", "exact"))
-    for (call, expected), got in zip(tests, lines, strict=True):
-        if not _answer_matches(str(expected), got, match):
-            return Verdict(False, f"test {call!r} failed (expected {expected!r})", used)
-    return Verdict(True, f"all {len(tests)} tests passed", used)
-
-
-def _answer_matches(expected: str, got: str, match: str) -> bool:
-    if match == "regex":
-        return re.search(expected, got) is not None
-    return got.strip() == expected.strip()
+    reason = run_code(response, tests, str(task.get("match", "exact")))
+    if reason is None:
+        return Verdict(True, f"all {len(tests)} tests passed", used)
+    return Verdict(False, reason, used)

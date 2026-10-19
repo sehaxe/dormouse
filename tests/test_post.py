@@ -52,21 +52,20 @@ def test_code_sandbox_refuses_network_and_passwd():
     net = "import socket\ndef add(a, b):\n    return a + b"
     verdict = verify(task, net)
     assert verdict.passed is False
-    assert verdict.reason == "refused: network access is not allowed in a sandboxed verifier"
+    assert verdict.reason.startswith("refused:") and "socket" in verdict.reason
     leak = 'def add(a, b):\n    return open("/etc/passwd").read()'
     verdict = verify(task, leak)
     assert verdict.passed is False
-    assert verdict.reason.startswith("refused:")
+    assert verdict.reason.startswith("refused:") and "open" in verdict.reason
 
 
-def test_code_sandbox_runtime_guard_blocks_string_built_reads():
-    # A path the static screen cannot see: the guard, not the regex, must refuse it.
+def test_code_sandbox_blocks_string_built_reads_by_name():
+    # The path is built at runtime, but the CALL is a name: the allowlist sees it.
     task = _add_task()
     sneaky = 'def add(a, b):\n    open(chr(47) + "etc/passwd", "rb").read()\n    return a + b'
     verdict = verify(task, sneaky)
     assert verdict.passed is False
-    assert not verdict.reason.startswith("refused:")
-    assert "sandbox" in verdict.reason
+    assert verdict.reason.startswith("refused:") and "open" in verdict.reason
 
 
 def test_code_verifier_accepts_correct_and_rejects_wrong():
