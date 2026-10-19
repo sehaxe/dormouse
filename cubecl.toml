@@ -1,14 +1,4 @@
-# cubecl 0.11 reads this from the process CWD (config/base.rs); the missing
-# file silently falls back to the stock defaults (persistent = Enabled,
-# allocator = Sync), which is NOT the layout this repo trains under - hence
-# the loud exists-check at trainer startup.
-#
-# persistent pools ON, size-match: the training heuristic per the cubecl 0.11
-# docs (recurring allocations are weight-shaped and updated within the same
-# pool); the fork's ExclusivePages preset died with the fork.
-# allocator async: CUDA's stream-ordered allocator, so pool growth does not
-# force-sync the GPU.
 [memory]
-persistent_memory = "size-match"
+persistent_memory = "disabled"
 [memory.cuda]
-allocator = "async"
+allocator = "sync"

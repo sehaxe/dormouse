@@ -163,6 +163,9 @@ pub struct TrainCfg {
     /// Auxiliary-loss weight overrides; None keeps the preset value.
     pub jepa_weight: Option<f32>,
     pub dspark_weight: Option<f32>,
+    /// Z-loss regularization weight (Chowdhery et al. 2022, OLMo-2): stabilizes
+    /// logit growth; None = off (0.0).
+    pub z_loss_weight: Option<f32>,
     pub dspark_k: Option<usize>,
     /// JEPA mask span override; None keeps the preset value (8).
     pub jepa_mask_span: Option<usize>,
@@ -201,6 +204,7 @@ impl Default for TrainCfg {
             bf16: None, act_quant: None, act_group: None, max_iter: None,
             no_kda: false, no_engram: false, byteflow: false,
             jepa_weight: None, dspark_weight: None, dspark_k: None,
+            z_loss_weight: None,
             jepa_mask_span: None,
             qk_heads: None, jepa_targets: None,
             seed: 1,
@@ -1311,6 +1315,7 @@ pub fn train_loop(
         } else {
             None
         };
+<<<<<<< Updated upstream
         // ── In-software NaN firewall ────────────────────────────────────────
         // A non-finite loss used to be INVISIBLE between log steps: the
         // scalar is only read every log_every steps, so backward produced
@@ -1337,6 +1342,102 @@ pub fn train_loop(
         // host read per log step, nothing else (§1.3). Here rather than beside
         // the forward because the thread-local's value is THIS step's, and the
         // forward has just run it.
+=======
+        seam.step(ungraphed, || {
+            let (logits, rec_ce, _kda, aux) = if let Some(tg) = jepa_target.clone() {
+                model.forward_with_jepa_targets::<Backend>(
+                    x.clone(),
+                    // RAM-offload path drives the Engram from host_rows; uploading
+                    // hashed_ids too would be a dead per-step H2D copy.
+                    if host_rows.is_some() { None } else { h_for_fwd.clone() },
+                    host_rows.clone(),
+                    Some(y.clone()),
+                    Some(tg),
+                )
+            } else if let Some(tg) = stage_latents.clone() {
+                // The stage's latents: the same stop-grad target the EMA
+                // teacher's in-window forward would have produced (gate (b)
+                // pins the replay bit-exact against it), so the JEPA term is
+                // the same objective computed with one replay dispatch.
+                model.forward_with_jepa_targets::<Backend>(
+                    x.clone(),
+                    if host_rows.is_some() { None } else { h_for_fwd.clone() },
+                    host_rows.clone(),
+                    Some(y.clone()),
+                    Some(tg),
+                )
+            } else {
+                model.forward_with_hidden::<Backend>(
+                    x.clone(),
+                    if host_rows.is_some() { None } else { h_for_fwd.clone() },
+                    host_rows.clone(),
+                    Some(y.clone()),
+                    teacher.as_ref(),
+                )
+            };
+            let mut loss = model.loss::<Backend>(rec_ce);
+            // Aux is read only on log steps; skip the clone (an extra autodiff
+            // node) elsewhere.
+            *aux_log.borrow_mut() = if step % cfg.log_every as u64 == 0 { aux.clone() } else { None };
+            if let Some(a) = aux {
+                loss = loss + a;
+            }
+            // Z-Loss (Chowdhery et al. 2022, OLMo-2): mean(logsumexp(logits)^2),
+            // stabilizes logit growth. Off by default (None = 0.0); logged separately.
+            if let Some(zw) = cfg.z_loss_weight {
+                if zw > 0.0 {
+                    let m = logits.clone().max_dim(2);
+                    let lse = (logits - m.clone()).exp().sum_dim(2).log() + m;
+                    let z = (lse.clone() * lse).mean();
+                    loss = loss + z * zw;
+                }
+            }
+            // The device syncs only on steps that read something back (loss
+            // scalar at log cadence, host-table grads at the host-Adam cadence,
+            // timers) so forward/backward/step of adjacent steps overlap on the
+            // GPU. The scalar read rides along free inside the grads D2H.
+            *loss_log.borrow_mut() = if step % cfg.log_every as u64 == 0
+                || host_adam_step
+                || (cfg.timers && timer_step)
+            {
+                Some(loss.clone())
+            } else {
+                None
+            };
+            // ── In-software NaN firewall ────────────────────────────────────
+            // A non-finite loss used to be INVISIBLE between log steps: the
+            // scalar is only read every log_every steps, so backward produced
+            // NaN grads, the optimizer wrote them into the weights, and the
+            // guard then replayed the poisoned region from a stale ckpt forever
+            // (measured 2026-09-26 on official_v4: NaN at step 1550, then 1700,
+            // ckpt stuck at 1000, zero progress across three restarts). The
+            // recovery now lives inside the process and stays honest: see
+            // `mask_nonfinite`. The log copy above is the RAW loss, so a spike
+            // still prints as NaN/inf.
+            // The firewall, with ZERO host-device synchronization (owner rule
+            // 2026-09-27). Masking the loss scalar is not enough: a NaN from an
+            // intermediate activation back-propagates anyway, because the chain
+            // rule multiplies the masked zero seed by the Jacobian and NaN*0 =
+            // NaN. So the loss is masked on device AND the gradients are
+            // sanitized on device. The host learns a step was masked from the
+            // gradient norm it already reads at log cadence (an exactly-zero
+            // grad norm means every gradient was non-finite), so the accounting
+            // costs no sync either.
+            let loss = mask_nonfinite(loss);
+            let mut raw_grads = loss.backward();
+            sanitize_grads(&mut raw_grads, &model);
+            raw_grads
+        })?;
+        let loss_log = loss_log.into_inner();
+        let aux_log = aux_log.into_inner();
+        // The router's utilization, taken OUT of the forward's seam closure and
+        // at the SAME log cadence as `aux_log` - one host read per log step,
+        // nothing else (§1.3). Taken here rather than inside the closure
+        // because the closure may be a CUDA-graph capture, and a thread-local
+        // write is a host side effect a capture must not depend on; taking it
+        // out on the far side of the step is also the only place the value is
+        // guaranteed to be THIS step's rather than the previous one's.
+>>>>>>> Stashed changes
         let util_log = if step % cfg.log_every as u64 == 0 {
             dormouse_core::moe::take_util().map(dormouse_core::moe::util_note)
         } else {

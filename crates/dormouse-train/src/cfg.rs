@@ -305,7 +305,11 @@ mod tests {
         // it is paid ONCE: a new TrainCfg field must be added here, which is
         // exactly the moment the author has to ask "does this belong in the
         // snapshot?" - the question the skip hid.
+<<<<<<< Updated upstream
         const FIELDS: [&str; 42] = [
+=======
+        const FIELDS: [&str; 45] = [
+>>>>>>> Stashed changes
             "steps", "ckpt_every", "log_every", "seq_len", "batch", "lr", "wd",
             "grad_clip", "ckpt_name", "eval_every", "opt", "quant",
             "factors_fallback", "rand_depth", "eval_batches", "eval_depths",
@@ -313,7 +317,12 @@ mod tests {
             "stress_every", "engram_ram", "engram_slots", "host_adam_every",
             "warmup", "quant_check", "timers", "memlog", "bf16", "act_quant",
             "act_group", "max_iter", "no_kda", "no_engram", "byteflow", "jepa_weight",
+<<<<<<< Updated upstream
             "dspark_weight", "dspark_k", "jepa_targets", "seed", "jepa_mask_span",
+=======
+            "dspark_weight", "dspark_k", "jepa_targets", "seed", "graph_capture", "graph_stage", "z_loss_weight",
+            "jepa_mask_span",
+>>>>>>> Stashed changes
         ];
         // An Option field that is None is omitted by the TOML serializer, so
         // a skipped Option is invisible to the round trip too. Set them.

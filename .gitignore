@@ -12,3 +12,11 @@ __pycache__/
 # .gitignore, so the rule below only bites after `git rm --cached`.
 .playwright-mcp/
 graphify-out/
+
+# Local data + tooling state (never source).
+data_local/
+.cortexkit/
+wt/
+vendor/cubecl-cuda/
+vendor/cubecl-runtime/
+vendor/cubecl-server/
