@@ -638,16 +638,29 @@ def sft_mask(windows: torch.Tensor) -> torch.Tensor:
     return (pos[None, :] + 1 >= assist[:, None]) & (pos[None, :] + 1 <= end[:, None])
 
 
-def sft_loss(logits: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+def sft_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    n_supervised: int | None = None,
+) -> torch.Tensor:
     """Masked next-byte CE: the mean over the SUPERVISED positions only.
 
     `logits` is `[b*t, vocab]` (the model's own shape), `targets` `[b, t]`, `mask`
     `[b, t]` bool. Every prompt byte and every pad byte is dropped from BOTH the
     numerator and the denominator — an unmasked prompt byte is not "cheap", it is
     a byte the model was asked to predict that the task never wanted.
+
+    `n_supervised`, when the caller already counted the mask on the host (the
+    SFT loop builds the mask before the device seam), keeps the empty-mask
+    refusal off the per-step D2H path: the check is the caller's host count,
+    not a `mask.any()` on the device tensor (§1.3).
     """
     flat = mask.reshape(-1)
-    if not bool(flat.any()):
+    if n_supervised is None:
+        n_supervised = int(flat.sum())
+    if not n_supervised:
         loud(
             "sft_loss: the mask supervises no byte in this window. Escape: the "
             "window's markers are wrong (see sft_mask)."
@@ -927,16 +940,21 @@ def sft_train(
                 group["lr"] = lr
 
         x, y = stream.next_batch()
-        if device is not None:
-            x, y = x.to(device), y.to(device)
+        # The mask is built from BYTE POSITIONS, so it is host work: build it on
+        # the stream's CPU window BEFORE the device seam, count it there, and
+        # send the finished mask across. That keeps `int(mask.sum())` and
+        # `sft_mask`'s per-row padding checks off the per-step D2H path (audit
+        # MAJOR 4 / §1.3) — the only host read left in the step is the loss.
         mask = sft_mask(x)
+        n_mask = int(mask.sum())
+        if device is not None:
+            x, y, mask = x.to(device), y.to(device), mask.to(device)
         # `targets=None`: the decode forward. Its logits are the ones generation
         # samples and the eval's `fin` scores, so SFT trains that readout — the
         # in-loop `L_Rec` is a pretraining signal and is not built here.
         logits, _none, step_counters = model(x)
         assert logits.shape[-1] == run.model.vocab, "logits width != vocab"
-        loss = sft_loss(logits, y, mask)
-        n_mask = int(mask.sum())
+        loss = sft_loss(logits, y, mask, n_supervised=n_mask)
         total.count("sft_bytes", n_mask)
         window.count("sft_bytes", n_mask)
         supervised += n_mask

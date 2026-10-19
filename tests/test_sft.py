@@ -236,7 +236,7 @@ def test_sft_train_runs_thirty_steps_and_the_loss_falls(tmp_path: Path):
     assert report["loss"] == pytest.approx(losses[-1], abs=1e-4)
     # The counter line is the run's own count of SUPERVISED bytes, per window.
     assert report["supervised_bytes"] == sum(
-        int(ln.split("sft_bytes=")[1]) for ln in lines if ln.startswith("sft step=")
+        int(ln.split("sft_bytes=")[1].split()[0]) for ln in lines if ln.startswith("sft step=")
     )
     assert report["counters"]["iter"] == 30 * run.model.max_iter
 
@@ -840,6 +840,30 @@ def test_two_sft_evals_on_one_checkpoint_score_the_same_window(tmp_path: Path):
     assert ce1 == pytest.approx(ce2, abs=1e-12), (ce1, ce2)
     assert first1 == first2
     assert (records1, scored1) == (records2, scored2) == (2 * BATCH, 2 * BATCH * SEQ)
+
+
+def test_the_logged_sft_byte_count_is_the_host_mask_count(tmp_path: Path):
+    """M4 gate: `sft_bytes` is the host mask's sum for a fixed batch.
+
+    The mask is built and counted on the stream's CPU window before the device
+    seam, so the printed value must equal a host `int(sft_mask(x).sum())` and
+    must not move between two identical runs.
+    """
+    corpus = tmp_path / "sft.bin"
+    build_sft_corpus(corpus, seed=3, seq_len=SEQ, n_tasks=0)
+    stream = ByteStream(corpus, BATCH, SEQ)
+    x, _y = stream.next_batch()
+    expected = int(sft_mask(x).sum())
+    run = sft_run(tmp_path, corpus=corpus, steps=1, log_every=1)
+    counts = []
+    for _ in range(2):
+        lines: list[str] = []
+        report = sft_train(DormouseModel(run.model), run, log=lines.append)
+        step_line = next(ln for ln in lines if ln.startswith("sft step="))
+        assert f"sft_bytes={expected}" in step_line
+        assert report["supervised_bytes"] == expected
+        counts.append(step_line.split("sft_bytes=")[1].split()[0])
+    assert counts[0] == counts[1] == str(expected)
 
 
 def test_ru_bank_is_broad_and_fits_one_window():
