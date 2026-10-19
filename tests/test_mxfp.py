@@ -488,6 +488,11 @@ def test_guard_is_cadenced_and_the_forward_takes_no_host_read(monkeypatch) -> No
         out8 = mxfp.fake_quant_mxfp8(w)
         dq = mxfp.dequantize_mxfp4(*mxfp.quantize_mxfp4(w), tuple(w.shape))
     assert out4.shape == w.shape and out8.shape == w.shape and dq.shape == w.shape
+    # The gap is covered by the step's NaN firewall: the STE keeps a non-finite
+    # input non-finite (it never masks it into a zero block).
+    bad = torch.full((1, 32), float("nan"))
+    assert bool(torch.isnan(mxfp.fake_quant_mxfp8(bad)).all())
+    assert bool(torch.isnan(mxfp.fake_quant_mxfp4(bad)).all())
 
 
 # --------------------------------------------------------------------------

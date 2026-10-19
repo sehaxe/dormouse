@@ -291,6 +291,11 @@ def test_finite_guard_is_cadenced_and_the_forward_takes_no_host_read(monkeypatch
         y = fake_quant_act(x, "fp4", 32)
         y8 = fake_quant_act(x, "int8")
     assert bool(torch.isfinite(y).all()) and bool(torch.isfinite(y8).all())
+    # The gap is covered by the step's NaN firewall: a non-finite input still
+    # comes out non-finite, so the loss is masked instead of a block being
+    # silently zeroed (the cadence defers the refusal, it does not hide it).
+    bad = torch.full((1, 8), float("nan"))
+    assert bool(torch.isnan(fake_quant_act(bad, "fp4")).all())
 
 
 def test_none_is_the_identity_and_all_zero_blocks_are_safe():
