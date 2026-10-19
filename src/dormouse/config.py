@@ -1389,6 +1389,7 @@ def load_run(
     train: TrainConfig | None = None,
     train_overrides: dict[str, Any] | None = None,
     model_overrides: dict[str, Any] | None = None,
+    apply_compute: bool = False,
 ) -> RunConfig:
     """Resolve a run: preset (name or path) + both config halves + loud overrides.
 
@@ -1396,6 +1397,13 @@ def load_run(
     (`validate` for a self-inconsistent set, and the unknown-key check the
     preset layer runs), because an override that bypasses them is the
     silent-collapse shape the preset layer exists to prevent.
+
+    `apply_compute` is the opt-in for the two process-wide COMPUTE knobs
+    (`mm_dtype`, `kda_disable_recompute`), which live in module state read at
+    forward time. ONLY a command that trains passes True: `info` is a dry-run
+    print, and `serve`/`bench` load a snapshot and are not training, so letting
+    a preset's training global leak into them would make the process compute a
+    format its own snapshot does not name (the review's M6).
     """
     model = load_preset(preset)
     tcfg = train if train is not None else TrainConfig()
@@ -1554,16 +1562,19 @@ def load_run(
     # read at forward time, not on the model object. `train()` sets them, but
     # `sft` and `rl` never call it — a snapshot could say `mm_dtype=fp8` /
     # `kda_disable_recompute=true` while the step ran the process defaults
-    # (audit 2026-10-19 M4, the SILENT class). Both training commands resolve
-    # their config HERE, so the seam applies them once, before any forward
-    # exists; `train()` keeps its own calls for direct API callers. `eval` and
-    # `decode` resolve from the snapshot (`from_snapshot`), not this function,
-    # so their documented "fresh process = bf16" default is unchanged.
-    from .model import kda as _kda
-    from .model.tsct import set_mm_dtype as _set_mm_dtype
+    # (audit 2026-10-19 M4, the SILENT class). The four TRAINING commands pass
+    # `apply_compute=True`, so the seam applies them once, before any forward
+    # exists; `train()` keeps its own calls for direct API callers. `info`,
+    # `serve` and `bench` resolve through here too and must not inherit a
+    # training global (review M6), which is why the default is False. `eval`
+    # and `decode` resolve from the snapshot (`from_snapshot`), not this
+    # function, so their documented "fresh process = bf16" default is unchanged.
+    if apply_compute:
+        from .model import kda as _kda
+        from .model.tsct import set_mm_dtype as _set_mm_dtype
 
-    _set_mm_dtype(tcfg.mm_dtype)
-    _kda.set_disable_recompute(tcfg.kda_disable_recompute)
+        _set_mm_dtype(tcfg.mm_dtype)
+        _kda.set_disable_recompute(tcfg.kda_disable_recompute)
     return RunConfig(source=preset, model=model, train=tcfg)
 
 

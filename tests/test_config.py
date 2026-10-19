@@ -353,13 +353,63 @@ def test_mm_dtype_and_kda_recompute_are_live_on_sft_and_rl(tmp_path, monkeypatch
             "nan_skipped": 0,
         }
 
+    def fake_train(model, run, **kw):
+        capture(run)
+        return {"steps": 0, "loss": 0.0}
+
     monkeypatch.setattr(sft_mod, "sft_train", fake_sft)
     monkeypatch.setattr(rl_mod, "rl_train", fake_rl)
+    monkeypatch.setattr(importlib.import_module("dormouse.train.loop"), "train", fake_train)
+    from dormouse.cli import _preset_check
+    from dormouse.config import load_run
+
     runner = CliRunner()
+
+    def live():
+        return (tsct.mm_dtype(), kda.disable_recompute())
+
     tsct.set_mm_dtype("bf16")
     kda.set_disable_recompute(False)
     try:
+        # M6: `info` prints, and `serve`/`bench` resolve through `_preset_check`
+        # against a snapshot they do not train. Neither may inherit the
+        # process-wide compute state a training command would apply.
+        result = runner.invoke(
+            app,
+            [
+                "info",
+                str(preset),
+                "--set",
+                "mm_dtype=fp8",
+                "--set",
+                "kda_disable_recompute=true",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert live() == ("bf16", False), "info inherited a training global"
+        snap = load_run(str(preset))
+        for what in ("served", "scored"):
+            _preset_check(str(preset), snap, what=what)
+            assert live() == ("bf16", False), f"{what} inherited a training global"
+        # The default is the non-training one; the flag is the one seam.
+        non_training = load_run(
+            str(preset), train_overrides={"mm_dtype": "fp8", "kda_disable_recompute": True}
+        )
+        assert (non_training.train.mm_dtype, non_training.train.kda_disable_recompute) == (
+            "fp8",
+            True,
+        )
+        assert live() == ("bf16", False)
+        load_run(
+            str(preset),
+            train_overrides={"mm_dtype": "fp8", "kda_disable_recompute": True},
+            apply_compute=True,
+        )
+        assert live() == ("fp8", True)
+
         for args in (
+            ["train", str(preset), "--data", str(data)],
+            ["run", str(preset), "--data", str(data)],
             ["sft", str(preset), "--data", str(data)],
             ["rl", str(preset)],
         ):

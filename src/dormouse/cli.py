@@ -265,7 +265,9 @@ def train_cmd(
             train_over[k] = v
     if json_log is not None:
         train_over["json_log"] = str(json_log)
-    run = load_run(preset, model_overrides=model_over, train_overrides=train_over)
+    run = load_run(
+        preset, model_overrides=model_over, train_overrides=train_over, apply_compute=True
+    )
     dev = _device(device)
     model = _model(run).to(dev)
     _freeze_gc()
@@ -327,7 +329,9 @@ def run(
             train_over[k] = v
     if out_dir is not None:
         train_over["out_dir"] = str(out_dir)
-    run = load_run(preset, model_overrides=model_over, train_overrides=train_over)
+    run = load_run(
+        preset, model_overrides=model_over, train_overrides=train_over, apply_compute=True
+    )
     dev = _device(device)
     model = _model(run).to(dev)
     _freeze_gc()
@@ -465,7 +469,9 @@ def sft_cmd(
         train_over["eval_data"] = str(eval_data)
     if json_log is not None:
         train_over["json_log"] = str(json_log)
-    run = load_run(preset, model_overrides=model_over, train_overrides=train_over)
+    run = load_run(
+        preset, model_overrides=model_over, train_overrides=train_over, apply_compute=True
+    )
     if not run.train.data:
         raise LoudError(
             "sft needs --data (the SFT corpus .bin) or `--set data=/path`. Escape: "
@@ -569,7 +575,9 @@ def rl_cmd(
             train_over[k] = v
     if json_log is not None:
         train_over["json_log"] = str(json_log)
-    run = load_run(preset, model_overrides=model_over, train_overrides=train_over)
+    run = load_run(
+        preset, model_overrides=model_over, train_overrides=train_over, apply_compute=True
+    )
     dev = _device(device)
     _freeze_gc()
     console.print(
