@@ -373,7 +373,14 @@ class SparseMoE(nn.Module):
         # The LFB routing bias (arXiv:2408.15664): a per-expert `b_e` added to
         # the softmax probs before the top-k, moved after each routed forward
         # by `-coef·sign(load_e − mean)` WITHOUT gradients. A buffer, never a
-        # parameter: the optimizer must not move it, LFB does.
+        # parameter: the optimizer must not move it, LFB does. It is MODEL
+        # state — the next resume continues from it — but NOT a persistent
+        # state-dict buffer: the export artifact's key set is pinned by the
+        # demo engine and `tests/test_export.py`, which have no LFB. The
+        # checkpoint carries it in the `<ckpt_name>.lfb` sibling and
+        # `train.loop.load_model_state` restores it, so a resume does not
+        # restart a controller the counts say it already integrated (audit
+        # 2026-10-19 M8).
         self.lfb_coef = cfg.moe_lb_coef
         self.register_buffer(
             "lfb_bias", torch.zeros(cfg.n_experts, device=device), persistent=False

@@ -78,6 +78,68 @@ def ngram_path(cfg: TrainConfig) -> Path:
     return weights.with_suffix(".ngram")
 
 
+def lfb_path(cfg: TrainConfig) -> Path:
+    """The LFB controller's sibling of a checkpoint: `<ckpt_name>.lfb`.
+
+    `lfb_bias` is model state — the next resume continues the integrator from it
+    — but it is deliberately NOT a persistent `state_dict` buffer: the export
+    artifact's key set is pinned by the demo engine (`docs-site/public/demo/
+    engine.js` refuses an unknown key) and by `tests/test_export.py`, which have
+    no LFB. The checkpoint still carries it, in this sibling, and
+    `load_model_state` restores it for every reader (resume, eval, decode,
+    serve) — the same sidecar contract as `<ckpt_name>.ngram` (audit 2026-10-19
+    M8: the counts persisted while the bias they integrate did not).
+    """
+    weights, _ = ckpt_paths(cfg)
+    return weights.with_suffix(".lfb")
+
+
+def _lfb_state(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """`{buffer name: cpu copy}` for every LFB bias in `model`.
+
+    The `_orig_mod.` prefix of a `torch.compile` wrapper is stripped, like the
+    rest of the checkpoint (`save_ckpt`): every reader loads the unwrapped
+    model.
+    """
+    return {
+        name.removeprefix("_orig_mod."): buf.detach().to("cpu").clone()
+        for name, buf in model.named_buffers()
+        if name.rpartition(".")[2] == "lfb_bias"
+    }
+
+
+def _restore_lfb(model: torch.nn.Module, cfg: TrainConfig) -> None:
+    """Restore the LFB bias from `<ckpt_name>.lfb` when the checkpoint has one.
+
+    A checkpoint written before the sidecar existed cannot supply it; the bias
+    then stays at its fresh zero, which is the only state that file recorded.
+    A sidecar naming a buffer this model does not have, or a shape mismatch, is
+    LOUD: silently dropping controller state is the class this sidecar fixes.
+    """
+    path = lfb_path(cfg)
+    if not path.is_file():
+        return
+    state = torch.load(path, map_location="cpu", weights_only=True)
+    buffers = dict(model.named_buffers())
+    missing = sorted(k for k in state if k not in buffers)
+    if missing:
+        loud(
+            f"LFB sidecar {path} names buffer(s) {missing} this model does not "
+            f"have. Escape: load the matching checkpoint, or delete the stale "
+            f"`{path.name}` if it belongs to a different run."
+        )
+    with torch.no_grad():
+        for name, value in state.items():
+            target = buffers[name]
+            if tuple(target.shape) != tuple(value.shape):
+                loud(
+                    f"LFB sidecar {path}: {name} has shape {tuple(value.shape)} "
+                    f"but the model's buffer is {tuple(target.shape)}. Escape: "
+                    f"the sidecar does not belong to this model."
+                )
+            target.copy_(value.to(target.device))
+
+
 def host_device_type(model: torch.nn.Module) -> str:
     """The device the MODEL lives on — the one input to the host-path refusal.
 
@@ -137,6 +199,11 @@ def save_ckpt(
     record (`model_quant_rung` names it), and `load_ckpt` unpacks back to
     fp32. The bank/checkpoint is the rung's whole contract — the forward path
     within a run never changes numerics.
+
+    The LFB routing bias is written to the `<ckpt_name>.lfb` sibling, not into
+    the model half: it is model state (the next resume continues from it) but
+    a non-persistent buffer (`lfb_path` says why). `load_model_state` restores
+    it for every reader.
     """
     from ..model.tsct import is_factor_key, pack_tsct
 
@@ -164,6 +231,16 @@ def save_ckpt(
         tmp,
     )
     tmp.replace(weights)  # atomic: a crash never leaves a half-written ckpt
+    lfb = _lfb_state(model)
+    if lfb:
+        # LFB's bias is model state but not a persistent state-dict buffer —
+        # `lfb_path` says why (the export artifact's pinned key set). Written
+        # for EVERY checkpoint, zeros included, so a reused `ckpt_name` can
+        # never inherit a stale controller from an older run.
+        lp = lfb_path(run.train)
+        tmp_lfb = lp.with_suffix(".lfb.tmp")
+        torch.save(lfb, tmp_lfb)
+        tmp_lfb.replace(lp)
     if run.train.engram_ram:
         # The host tables are not parameters, so they are not in `sd`: they are
         # the sibling file, written atomically like the weights. A checkpoint
@@ -253,6 +330,11 @@ def load_model_state(model: torch.nn.Module, cfg: TrainConfig, sd: dict, *, stri
     `enable_host_tables` (not `host_tables`) is the call: the CUDA-only refusal
     is a training VRAM-budget rule, and a load must work on `--device cpu`.
     A missing sibling is LOUD (`require_ngram`), never freshly seeded rows.
+
+    The LFB bias is restored from the `<ckpt>.lfb` sibling after the load when
+    that file exists (`_restore_lfb`): it is a non-persistent buffer (see
+    `lfb_path`), so a plain `load_state_dict` would reset the routing
+    controller a resume is supposed to continue.
     """
     if cfg.engram_ram:
         require_ngram(cfg)
@@ -260,6 +342,7 @@ def load_model_state(model: torch.nn.Module, cfg: TrainConfig, sd: dict, *, stri
     result = model.load_state_dict(sd, strict=strict)
     if cfg.engram_ram:
         load_host_state(model, load_ngram(cfg))
+    _restore_lfb(model, cfg)
     return result
 
 
@@ -317,6 +400,22 @@ def _sample_depth(seed: int, step: int, max_iter: int) -> int:
     return 1 + ((step * 2654435761 + seed) % max_iter)
 
 
+def _eval_batches(stream: ByteStream, requested: int) -> int:
+    """How many eval windows the stream's byte range holds, capped at `requested`.
+
+    The window's reportable size is `batch × seq_len` bytes, so that is the
+    denominator a range is worth: `span // (batch × seq_len)`. `open_streams`
+    caps the no-`--eval` tail at 1 MiB, so a large
+    `eval_batches × batch × seq_len` asks for more than the tail holds; the eval
+    scores the windows that fit and the line names the shortfall (COUNTED —
+    audit 2026-10-19 M5). Never 0: `ByteStream` refuses a range smaller than one
+    batch before this is called.
+    """
+    per_window = stream.batch * stream.seq_len
+    assert per_window > 0, "an eval window has no bytes"
+    return max(1, min(requested, (stream.hi - stream.lo) // per_window))
+
+
 def _eval_loss(
     model: torch.nn.Module,
     stream: ByteStream,
@@ -333,6 +432,12 @@ def _eval_loss(
     depths and the one generation reads. `per_iter_mean` averages the
     per-iteration CEs over the batch — the deep-supervision shape.
 
+    The byte count is what the pass SCORED, not the window the config asked
+    for: when the eval range is shorter than the requested window (the
+    no-`--eval` tail is capped at 1 MiB), the loop runs only the windows the
+    range holds, so the `over N B` field cannot claim more text than the tail
+    contains (audit 2026-10-19 M5). `_eval_line` names the shortfall.
+
     `counters`, when given, receives THIS eval's own arm counters (the eval
     forward's `engram_rows`/`engram_arms` — the `engram=` field the eval line
     prints). They are the eval's, not the run's: a training counter would say
@@ -340,6 +445,7 @@ def _eval_loss(
     blind spot of AGENTS §3.2's retracted arm.
     """
     stream.rewind()
+    batches = _eval_batches(stream, batches)
     total = 0.0
     scored = 0
     fin_total = 0.0
@@ -369,8 +475,8 @@ def _eval_loss(
                 per = bd["per_iter"]
                 if not per_iter_acc:
                     per_iter_acc = [0.0] * len(per)
-                for i, v in enumerate(per):
-                    per_iter_acc[i] += v
+                for j, v in enumerate(per):
+                    per_iter_acc[j] += v
     n = max(batches, 1)
     model.train(was_training)
     if counters is not None:
@@ -443,12 +549,29 @@ def _eval_line(
     # a reader learns the eval ran a memory-disabled forward, which is the defect
     # that retracted the Engram arm's numbers (AGENTS §3.2). It is printed on
     # both substrates — the host path counts the same rows in `Engram._read`.
+    #
+    # The byte field is what the pass SCORED, and it names the shortfall when
+    # the range could not hold the window the config asked for (the no-`--eval`
+    # tail is capped at 1 MiB; audit 2026-10-19 M5). A line that printed
+    # `eval_batches × batch × seq_len` here overstated the evidence by the
+    # wrapped bytes.
+    ran = _eval_batches(stream, cfg.eval_batches)
+    window = cfg.eval_batches * cfg.batch * cfg.seq_len
+    batches_field = f"{ran} x {cfg.batch} x {cfg.seq_len}"
+    if ran != cfg.eval_batches:
+        batches_field += f", requested {cfg.eval_batches}"
     line = (
         f"eval step={step} loss={ev:.4f} bpb={bpb(ev):.3f} fin={fin:.4f} "
-        f"bpb_fin={bpb(fin):.3f} over {scored} B "
-        f"({cfg.eval_batches} x {cfg.batch} x {cfg.seq_len}) "
+        f"bpb_fin={bpb(fin):.3f} over {scored} B ({batches_field}) "
         f"engram={eng.get('engram_rows', 0)}/{eng.get('engram_arms', 0)}"
     )
+    if scored < window:
+        held = stream.hi - stream.lo
+        line += (
+            f" shortfall: requested {window} B over {cfg.eval_batches} batch(es), "
+            f"the eval stream holds {held} B; scored {scored} B"
+            + (f" over {ran} batch(es)" if ran != cfg.eval_batches else "")
+        )
 
     if per_iter:
         line += " periter=" + ",".join(f"{v:.4f}" for v in per_iter)

@@ -1550,6 +1550,20 @@ def load_run(
             f"counts (the defaults are 16 / 4 / 256)."
         )
     rl_config(tcfg)
+    # The two process-wide COMPUTE knobs (`tf32`'s twins) live in module state
+    # read at forward time, not on the model object. `train()` sets them, but
+    # `sft` and `rl` never call it — a snapshot could say `mm_dtype=fp8` /
+    # `kda_disable_recompute=true` while the step ran the process defaults
+    # (audit 2026-10-19 M4, the SILENT class). Both training commands resolve
+    # their config HERE, so the seam applies them once, before any forward
+    # exists; `train()` keeps its own calls for direct API callers. `eval` and
+    # `decode` resolve from the snapshot (`from_snapshot`), not this function,
+    # so their documented "fresh process = bf16" default is unchanged.
+    from .model import kda as _kda
+    from .model.tsct import set_mm_dtype as _set_mm_dtype
+
+    _set_mm_dtype(tcfg.mm_dtype)
+    _kda.set_disable_recompute(tcfg.kda_disable_recompute)
     return RunConfig(source=preset, model=model, train=tcfg)
 
 

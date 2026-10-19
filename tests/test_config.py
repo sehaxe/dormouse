@@ -293,3 +293,92 @@ def test_dspark_guards_run_outside_byteflow():
                 dspark_weight=0.1,
             )
         )
+
+
+def test_mm_dtype_and_kda_recompute_are_live_on_sft_and_rl(tmp_path, monkeypatch):
+    """M4: the two process-wide setters were called only by `train()`, so an
+    SFT/RL run could carry `mm_dtype=fp8`/`kda_disable_recompute=true` in its
+    snapshot while the step ran the process defaults (the SILENT class).
+
+    The gate runs each COMMAND through the CLI with a fake loop that records
+    the live module state at entry: the setters must have applied before the
+    forward is built. On the pre-fix tree both commands read bf16/False.
+    """
+    from typer.testing import CliRunner
+
+    from dormouse.cli import app
+    from dormouse.model import kda, tsct
+
+    preset = tmp_path / "tiny.toml"
+    preset.write_text(
+        "d_model = 64\n"
+        "n_heads = 4\n"
+        "head_dim = 16\n"
+        "d_ffn = 128\n"
+        "max_seq_len = 512\n"
+        "max_iter = 1\n"
+        "rank = 8\n"
+        "shared_rank = 16\n"
+        "moe_topk = 1\n"
+        "engram_orders = [2, 3]\n"
+        "engram_rows = 64\n"
+        "engram_dim = 8\n"
+        "bf16 = false\n"
+    )
+    data = tmp_path / "sft.bin"
+    data.write_bytes(b"x" * 4096)
+    seen: dict[str, object] = {}
+
+    def capture(run):
+        seen["config"] = (run.train.mm_dtype, run.train.kda_disable_recompute)
+        seen["live"] = (tsct.mm_dtype(), kda.disable_recompute())
+
+    import importlib
+
+    rl_mod = importlib.import_module("dormouse.post.rl_train")
+    sft_mod = importlib.import_module("dormouse.train.sft")
+
+    def fake_sft(model, run, **kw):
+        capture(run)
+        return {"steps": 0, "loss": 0.0, "supervised_bytes": 0, "nan_skipped": 0}
+
+    def fake_rl(run, **kw):
+        capture(run)
+        return {
+            "steps": 0,
+            "loss": 0.0,
+            "pass_rate": 0.0,
+            "bytes_per_solved": None,
+            "rl_samples": 0,
+            "nan_skipped": 0,
+        }
+
+    monkeypatch.setattr(sft_mod, "sft_train", fake_sft)
+    monkeypatch.setattr(rl_mod, "rl_train", fake_rl)
+    runner = CliRunner()
+    tsct.set_mm_dtype("bf16")
+    kda.set_disable_recompute(False)
+    try:
+        for args in (
+            ["sft", str(preset), "--data", str(data)],
+            ["rl", str(preset)],
+        ):
+            seen.clear()
+            result = runner.invoke(
+                app,
+                [
+                    *args,
+                    "--set",
+                    "mm_dtype=fp8",
+                    "--set",
+                    "kda_disable_recompute=true",
+                    "--device",
+                    "cpu",
+                ],
+            )
+            assert result.exit_code == 0, result.output
+            assert seen["config"] == ("fp8", True)
+            assert seen["live"] == ("fp8", True), f"{args[0]}: the knob stayed inert"
+    finally:
+        tsct.set_mm_dtype("bf16")
+        kda.set_disable_recompute(False)

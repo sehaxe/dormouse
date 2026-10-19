@@ -6,7 +6,7 @@ import math
 
 import pytest
 import torch
-from conftest import BATCH, SEQ, tiny_run
+from conftest import BATCH, SEQ, tiny_run, write_corpus
 from torch import nn
 
 from dormouse.instrument import LoudError
@@ -93,6 +93,58 @@ def test_eval_line_prints_the_byte_window(tmp_path):
     assert report["eval_window_bytes"] == window
     evals = [ln for ln in lines if ln.startswith("eval ")]
     assert evals and f"over {window} B (3 x {BATCH} x {SEQ})" in evals[0]
+
+
+def test_the_tail_eval_prints_only_the_bytes_it_scored(tmp_path):
+    """M5: the no-`--eval` tail is capped at 1 MiB, so a window larger than the
+    tail used to wrap. The eval line used to print the REQUESTED window; it must
+    print the bytes the pass actually scored and name the shortfall (COUNTED)."""
+    import dataclasses
+
+    from conftest import tiny_cfg
+
+    from dormouse.train.data import open_streams
+    from dormouse.train.loop import _eval_line
+
+    # The audit's own shape: 2048 x 10 x 512 = 10 MiB requested against the
+    # 1 MiB tail. 204 windows fit exactly (204 x 5130 B read <= 2^20), so the
+    # pass scores 204 x 5120 B with no wrapped re-read.
+    run = dataclasses.replace(
+        tiny_run(
+            tmp_path,
+            steps=1,
+            eval=True,
+            eval_every=1,
+            eval_batches=2048,
+            batch=10,
+            seq_len=512,
+        ),
+        model=tiny_cfg(max_seq_len=512),
+    )
+    write_corpus(tmp_path / "corpus.bin", 3 << 20)  # > the 1 MiB carve
+    _train, ev = open_streams(run)
+    assert ev is not None
+    requested = eval_window_bytes(run.train)
+    assert requested == 10 * (1 << 20), "the fixture must exceed the tail by 10x"
+
+    class _Counting(nn.Module):
+        """The bytes scored are the tokens this model is handed."""
+
+        def __init__(self):
+            super().__init__()
+            self.seen = 0
+
+        def forward(self, x, targets=None, counters=None, **kw):
+            self.seen += x.numel()
+            return None, torch.tensor(1.0), counters
+
+    model = _Counting()
+    line, _loss, scored = _eval_line(model, ev, run.train, run.model.max_iter, None, 1)
+    assert scored == model.seen == 204 * 10 * 512
+    assert scored <= 1 << 20, "the count must not claim more bytes than the tail holds"
+    assert f"over {scored} B" in line
+    assert "shortfall" in line and f"requested {requested} B" in line
+    assert f"the eval stream holds {1 << 20} B" in line
 
 
 def test_log_line_carries_the_kda_arm_and_counters(tmp_path):
