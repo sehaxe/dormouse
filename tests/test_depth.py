@@ -120,6 +120,10 @@ def test_eval_depths_returns_the_curve(tmp_path):
     assert sorted(curve) == list(range(1, run.model.max_iter + 1))
     ces = [curve[d][0] for d in sorted(curve)]
     assert all(math.isfinite(c) for c in ces)
+    # The fixture's eval tail is now SIZED IN READS (3 x BATCH x (SEQ+1) =
+    # 390 B), so all 3 requested windows fit; each scores BATCH x SEQ.
+    # (The 2 here between the M5 fix and the tail-sizing fix was the tail
+    # being carved in scored bytes: 384 B held only two reads.)
     assert all(curve[d][1] == 3 * BATCH * SEQ for d in curve)
     # Monotone-ish, NOT strictly: the deepest run is the smallest CE within a
     # loose bound. That is an empirical claim about an untrained loop, and the

@@ -10,8 +10,11 @@
 # burn side hit (1.46 -> 8.69 at ~step 25k of a joint run,
 # aria_data/plan_txt_streamer.md).
 #
-# Paths are absolute because this file lives in the repo and the mount is not
-# under it; `[sources]` paths that are relative resolve beside this file.
+# Paths are absolute because the corpora live on an external drive, not in the
+# repo; `[sources]` paths that are relative resolve beside this file. The UUID
+# below is THAT drive's: on another machine, point the four paths at wherever the
+# shard directories are (`dormouse train … --set mix_plan=configs/mix_big.toml`
+# plus an edit here, or your own plan — see docs/guides/data.md).
 #
 # --- what is in, what is out -------------------------------------------------
 #

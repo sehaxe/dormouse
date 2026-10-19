@@ -21,6 +21,7 @@ import torch.nn.functional as F
 
 from dormouse.config import ModelConfig, load_preset, load_run, parse_preset
 from dormouse.instrument import LoudError
+from dormouse.model import act_quant as aq
 from dormouse.model.act_quant import (
     ACT_FORMATS,
     attn_format,
@@ -248,16 +249,53 @@ def test_group_must_divide_the_last_dim_and_be_non_negative():
 def test_non_finite_and_non_float_inputs_are_loud():
     bad = _randn(2, 8)
     bad[0, 3] = float("nan")
+    aq._GUARD.reset()
     with pytest.raises(LoudError, match="non-finite"):
         quantize_act(bad, "int8")
     inf = _randn(2, 8)
     inf[1, 0] = float("inf")
+    aq._GUARD.reset()
     with pytest.raises(LoudError, match="non-finite"):
         fake_quant_act(inf, "fp4")
     with pytest.raises(LoudError, match="float tensors"):
         quantize_act(torch.tensor([[1, 2], [3, 4]]), "int8")
     with pytest.raises(LoudError, match="LAST dim"):
         quantize_act(torch.tensor(3.0), "int8")
+
+
+def test_finite_guard_is_cadenced_and_the_forward_takes_no_host_read(monkeypatch):
+    """The 2026-10-19 audit M7: one D2H per MoE forward became a cadence.
+
+    The guard still refuses (it runs on the first calls), and a forward after
+    that window performs no `.item()` / `bool(any())` — every such read goes
+    through `Tensor.item`, so raising from it is the gate.
+    """
+    x = _randn(4, 64)
+    aq._GUARD.reset()
+    with pytest.raises(LoudError, match="non-finite"):
+        fake_quant_act(torch.full((1, 8), float("nan")), "fp4")
+    aq._GUARD.calls = aq._GUARD.first  # the next call is NOT the cadence
+    assert not aq._GUARD.due()
+
+    def _no_item(self, *args, **kwargs):
+        raise AssertionError("the per-forward path took a host read (.item())")
+
+    def _no_bool(self):
+        raise AssertionError("the per-forward path branched on a device value (bool)")
+
+    with monkeypatch.context() as m:
+        m.setattr(torch.Tensor, "item", _no_item)
+        # `if bool(tensor)` goes through `__bool__` in C, NOT through the Python
+        # `item` attribute — both must raise or the gate cannot see the guard.
+        m.setattr(torch.Tensor, "__bool__", _no_bool)
+        y = fake_quant_act(x, "fp4", 32)
+        y8 = fake_quant_act(x, "int8")
+    assert bool(torch.isfinite(y).all()) and bool(torch.isfinite(y8).all())
+    # The gap is covered by the step's NaN firewall: a non-finite input still
+    # comes out non-finite, so the loss is masked instead of a block being
+    # silently zeroed (the cadence defers the refusal, it does not hide it).
+    bad = torch.full((1, 8), float("nan"))
+    assert bool(torch.isnan(fake_quant_act(bad, "fp4")).all())
 
 
 def test_none_is_the_identity_and_all_zero_blocks_are_safe():

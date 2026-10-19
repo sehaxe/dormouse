@@ -416,6 +416,19 @@ def eval_window_bytes(cfg: TrainConfig) -> int:
     return cfg.eval_batches * cfg.batch * cfg.seq_len
 
 
+def eval_read_bytes(cfg: TrainConfig) -> int:
+    """`eval_batches × batch × (seq_len + 1)` — the bytes the eval READS.
+
+    One window READS one byte more than it SCORES (the next-byte shift), so a
+    tail sized as scored bytes holds one window fewer than the config asks for
+    (review round 2 R2-1: 20 x 8 x 512 on a 81 920 B tail scored 19 windows).
+    `open_streams` carves the no-`--eval` tail with THIS number; the 1 MiB cap
+    is then the only reason the eval can still fall short, and `_eval_line`
+    names it.
+    """
+    return cfg.eval_batches * cfg.batch * (cfg.seq_len + 1)
+
+
 def split_points(size: int, eval_bytes: int) -> tuple[int, int]:
     """`(hi_train, hi_total)`: the eval tail is the LAST `eval_bytes` bytes."""
     if eval_bytes < 0:
@@ -437,7 +450,9 @@ def open_streams(
     `batch`/`seq_len` default to the config's; a distributed rank passes its
     OWN micro-batch (stage 3's capacity profile), and then the eval carve and
     the eval window are that rank's — which is why the caller prints the shape
-    it used.
+    it used. The tail is sized in READS (`eval_read_bytes`), not scored bytes,
+    so `eval_batches` whole windows fit (capped at 1 MiB; a shortfall above the
+    cap is named on the eval line).
     """
     tr = run.train
     b = tr.batch if batch is None else batch
@@ -461,7 +476,7 @@ def open_streams(
         )
         train = ByteStream(tr.data, b, t, ring_bytes=ring_bytes)
         return train, ev
-    ev_bytes = min(max(window, 1), 1 << 20) if tr.eval else 0
+    ev_bytes = min(max(eval_read_bytes(tr), 1), 1 << 20) if tr.eval else 0
     hi_train, _ = split_points(Path(tr.data).stat().st_size, ev_bytes)
     train = ByteStream(tr.data, b, t, lo=0, hi=hi_train, ring_bytes=ring_bytes)
     ev = ByteStream(tr.data, b, t, lo=hi_train, ring_bytes=1 << 20) if tr.eval else None

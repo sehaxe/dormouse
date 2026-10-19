@@ -303,6 +303,13 @@ export const pages = [
 	// assembled from the protocols, the rulebook and the reviews - no new
 	// numbers, every figure carried with its source.
 	{ src: 'docs/guides/train-your-first.md', out: 'tooling/train-your-first', title: 'Train your first model', nav: 'First run' },
+	{ src: 'docs/guides/data.md', out: 'tooling/data', title: 'Data: what the corpora are and how to get one', nav: 'Data' },
+	{ src: 'docs/reviews/2026-10-19-findings-ledger.md', out: 'reviews/2026-10-19-findings-ledger', title: 'Findings ledger: the 2026-10-19 audits', nav: 'Findings' },
+	{ src: 'docs/reviews/2026-10-19-code-audit.md', out: 'reviews/2026-10-19-code-audit', title: 'Code audit: 6/10, and the two holes that matter' },
+	{ src: 'docs/reviews/2026-10-19-review-loop.md', out: 'reviews/2026-10-19-review-loop', title: 'The review loop: rounds and scores' },
+	{ src: 'docs/reviews/2026-10-19-review-round-1.md', out: 'reviews/2026-10-19-review-round-1', title: 'Review round 1: 7/10, the fixes verified and what they broke' },
+	{ src: 'docs/reviews/2026-10-19-review-round-2.md', out: 'reviews/2026-10-19-review-round-2', title: 'Review round 2: 6/10, the regressions the fixes introduced' },
+	{ src: 'docs/reviews/2026-10-19-review-round-3.md', out: 'reviews/2026-10-19-review-round-3', title: 'Review round 3: 7/10, the final score of the cycle' },
 	{ src: 'docs/guides/determinism.md', out: 'tooling/determinism', title: 'Determinism: why --seed was the easy part', nav: 'Determinism' },
 	{ src: 'docs/guides/ab-testing.md', out: 'tooling/ab-testing', title: 'A/B testing: how an arm is judged here', nav: 'A/B testing' },
 	{ src: 'docs/guides/precision.md', out: 'tooling/precision', title: 'Precision on this backend: why bf16 is slower than fp32', nav: 'Precision' },

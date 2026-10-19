@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ..instrument import loud
+from ..instrument import Counters, LoudError, loud
 from ..model.decode import DEFAULT_TEMP, decode_bytes
 from .tasks import Task
 from .verifiers import Verdict, verify
@@ -33,7 +33,13 @@ GREEDY_TEMP = 1e-6
 #: means here).
 STROKE_BYTES = 2
 
-__all__ = ["GREEDY_TEMP", "STROKE_BYTES", "Rollout", "rollout"]
+#: COUNTED verifier failures at the rollout boundary. `verify` is total (R3-1),
+#: so this key must stay at 0 in a healthy run; a non-zero reading is a verifier
+#: bug that failed one sample instead of killing the batch — and the reader can
+#: see it without a traceback (ADR-0019).
+COUNTERS = Counters()
+
+__all__ = ["COUNTERS", "GREEDY_TEMP", "STROKE_BYTES", "Rollout", "rollout"]
 
 
 @dataclass(frozen=True)
@@ -84,6 +90,23 @@ def rollout(
         )[-1:]
         response += new
         trace.append(f"{new[0]:02x}")
-    verdict = verify(task.as_dict(), response.decode("utf-8", "replace"))
+    verdict = _verify_response(task.as_dict(), response, budget)
     n_bytes = len(prompt) + len(response) + STROKE_BYTES * len(trace)
     return Rollout(trace=trace, n_bytes=n_bytes, verdict=verdict)
+
+
+def _verify_response(task: dict, response: bytes, budget: int) -> Verdict:
+    """The verifier boundary: one hostile answer (or one verifier bug) fails a
+    sample, never the rollout batch. The counter is the evidence it happened."""
+    try:
+        return verify(task, response.decode("utf-8", "replace"))
+    except LoudError:
+        raise  # the do-not-run class and a bad task reference stay LOUD
+    except Exception as exc:  # a boundary guard: the batch survives a verifier bug
+        COUNTERS.count("rollout_verify_error")
+        used = min(len(response) / budget, 1.0) if budget > 0 else 0.0
+        return Verdict(
+            False,
+            f"verify raised {type(exc).__name__}: the sample is failed, not the batch",
+            used,
+        )

@@ -96,10 +96,17 @@ from __future__ import annotations
 
 import torch
 
-from ..instrument import loud
+from ..instrument import GuardCadence, loud
 from .hadamard import v2_quantize
 from .mxfp import E4M3_MAX, fake_quant_mx
 from .tsct import _NVFP4_MAGNITUDES as _E2M1
+
+#: The finite guard's cadence (§1.3): `isfinite(x).all()` is a device→host
+#: read, so it runs on the first `first` quantize calls and every `every`-th
+#: after — never once per forward. In the gap a NaN/inf still reaches the
+#: step's NaN firewall (a NaN block max makes the whole block NaN, which the
+#: loss shows), so the guard is deferred, not dropped. `reset()` is the test seam.
+_GUARD = GuardCadence(first=8, every=1000)
 
 #: The activation formats: `none` (off), the a4.8 symmetric integers and e2m1
 #: fp4, then the two families that bring their own scale rule — the OCP MX
@@ -192,6 +199,11 @@ def _check(x: torch.Tensor, fmt: str, group: int) -> None:
     finite test is the load-bearing one: `max|x|` over a block holding one NaN
     is NaN, so the scale would be NaN and EVERY element of the tensor would come
     back NaN with nothing said — a silent corruption with an obvious cause.
+
+    Structural checks are metadata and run every call. The finite test is a
+    device→host read, so it runs on [`_GUARD`]'s cadence (§1.3): a NaN/inf
+    between checks still produces a NaN block and the step's NaN firewall stops
+    it. The 2026-10-19 audit found this as a per-forward sync (M7).
     """
     if fmt not in ACT_FORMATS:
         loud(
@@ -237,7 +249,7 @@ def _check(x: torch.Tensor, fmt: str, group: int) -> None:
             f"the flag that set it (act_quant.rs's caller rule). Escape: group=0 "
             f"for one scale per token, or a divisor of {d}."
         )
-    if not bool(torch.isfinite(x).all()):
+    if _GUARD.due() and not bool(torch.isfinite(x).all()):
         n_bad = int((~torch.isfinite(x)).sum())
         loud(
             f"act_quant {fmt}: {n_bad} non-finite element(s) (inf/NaN). Cause: a "

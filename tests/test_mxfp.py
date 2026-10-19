@@ -423,8 +423,10 @@ def test_loud_on_nan_and_inf_input() -> None:
         w = torch.ones(1, 32)
         w[0, 5] = bad
         for quant in (mxfp.quantize_mxfp4, mxfp.quantize_mxfp8):
+            mxfp._GUARD.reset()
             with pytest.raises(LoudError, match="non-finite"):
                 quant(w)
+        mxfp._GUARD.reset()
         with pytest.raises(LoudError, match="non-finite"):
             mxfp.fake_quant_mxfp4(w)
 
@@ -433,13 +435,16 @@ def test_loud_on_denormal_amax_block() -> None:
     """A block whose scale needs e8m0 < 2^-126 refuses (its code 0x00 is zero)."""
     w = torch.full((1, 32), 1e-40)
     for quant in (mxfp.quantize_mxfp4, mxfp.quantize_mxfp8):
+        mxfp._GUARD.reset()
         with pytest.raises(LoudError, match="exponent range"):
             quant(w)
+    mxfp._GUARD.reset()
     with pytest.raises(LoudError, match="prescale"):
         mxfp.quantize_mxfp4(w)  # the message names the escape
 
 
 def test_loud_on_e8m0_nan_byte_and_bad_shapes() -> None:
+    mxfp._GUARD.reset()
     with pytest.raises(LoudError, match="NaN"):
         mxfp.e8m0_decode(torch.tensor([0xFF], dtype=torch.uint8))
     packed = torch.zeros(16, dtype=torch.uint8)
@@ -452,6 +457,72 @@ def test_loud_on_e8m0_nan_byte_and_bad_shapes() -> None:
         mxfp.dequantize_mxfp4(packed.float(), scales, (1, 32))  # storage must be uint8
     with pytest.raises(AssertionError):
         mxfp.dequantize_mxfp8(torch.zeros(32, dtype=torch.float8_e4m3fn), scales.float(), (1, 32))
+
+
+def test_the_range_guard_off_cadence_zeroes_and_COUNTS_the_block() -> None:
+    """M4: the cadence may skip the HOST READ, never the consequence.
+
+    A block the checked call refuses (e8m0 exponent < -126) used to encode a
+    wrapped uint8 code and decode to zeros with no record — the SILENT class.
+    Off-cadence it must still be the codec's declared zero AND land in the
+    per-cadence tally; on-cadence it must still refuse loudly.
+    """
+    mxfp._GUARD.reset()
+    mxfp._RANGE_REJECTED.clear()
+    tiny = torch.full((1, 32), 1e-40)
+    good = torch.randn(2, 32)
+    # 3 packed tensors consume 9 due() calls (finite, e8m0-encode, e8m0-decode),
+    # so the 4th is the first off-cadence call.
+    for _ in range(3):
+        mxfp.quantize_mxfp4(good)
+    packed, scales = mxfp.quantize_mxfp4(tiny)
+    assert scales.flatten().tolist() == [0x00], "an unscalable block is the declared zero"
+    assert mxfp.dequantize_mxfp4(packed, scales, (1, 32)).abs().max().item() == 0.0
+    assert mxfp.range_rejected_blocks() == 1, "the off-cadence zero must be counted"
+
+    # On-cadence the same block is the LOUD refusal it always was.
+    mxfp._GUARD.reset()
+    with pytest.raises(LoudError, match="exponent range"):
+        mxfp.quantize_mxfp4(tiny)
+    mxfp._GUARD.reset()
+    with pytest.raises(LoudError, match="exponent range"):
+        mxfp.quantize_mxfp8(tiny)
+
+
+def test_guard_is_cadenced_and_the_forward_takes_no_host_read(monkeypatch) -> None:
+    """Audit M7: 2-3 `bool(any())` syncs per packed tensor became a cadence.
+
+    The guard still refuses an inf/NaN input (it runs on the first calls), and
+    the per-forward path after that window performs no `.item()` — every D2H
+    read funnels through `Tensor.item`, so raising from it is the gate.
+    """
+    w = torch.randn(8, 64)
+    mxfp._GUARD.reset()
+    with pytest.raises(LoudError, match="non-finite"):
+        mxfp.quantize_mxfp4(torch.full((1, 32), float("nan")))
+    mxfp._GUARD.calls = mxfp._GUARD.first
+    assert not mxfp._GUARD.due()
+
+    def _no_item(self, *args, **kwargs):
+        raise AssertionError("the per-forward path took a host read (.item())")
+
+    def _no_bool(self):
+        raise AssertionError("the per-forward path branched on a device value (bool)")
+
+    with monkeypatch.context() as m:
+        m.setattr(torch.Tensor, "item", _no_item)
+        # `if bool(tensor)` goes through `__bool__` in C, not the Python `item`
+        # attribute — both must raise or the gate cannot see the guard.
+        m.setattr(torch.Tensor, "__bool__", _no_bool)
+        out4 = mxfp.fake_quant_mxfp4(w)
+        out8 = mxfp.fake_quant_mxfp8(w)
+        dq = mxfp.dequantize_mxfp4(*mxfp.quantize_mxfp4(w), tuple(w.shape))
+    assert out4.shape == w.shape and out8.shape == w.shape and dq.shape == w.shape
+    # The gap is covered by the step's NaN firewall: the STE keeps a non-finite
+    # input non-finite (it never masks it into a zero block).
+    bad = torch.full((1, 32), float("nan"))
+    assert bool(torch.isnan(mxfp.fake_quant_mxfp8(bad)).all())
+    assert bool(torch.isnan(mxfp.fake_quant_mxfp4(bad)).all())
 
 
 # --------------------------------------------------------------------------

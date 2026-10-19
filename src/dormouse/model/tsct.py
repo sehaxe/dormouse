@@ -607,44 +607,26 @@ _FACTOR_SUFFIXES = ("u", "v", "gate_u", "up_u")
 #: sign per code; two codes per byte, low nibble first.
 _NVFP4_MAGNITUDES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
+#: COUNTED tally of NVFP4 blocks whose stored e4m3 scale rounded to zero —
+#: process-local so a `pack_tsct` call with no counters is still not silent.
+_NVFP4_ZEROED_BLOCKS = {"blocks": 0}
 
-def _e2m1_quant(t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, float]:
-    """Per-16-block NVFP4 quantize: codes u8 + e4m3 scales [n/16] + a global
-    fp32 correction.
 
-    NVIDIA's NVFP4 is TWO-LEVEL for exactly the underflow this would hit:
-    a block amax smaller than e4m3's min normal rounds the block scale to
-    zero and the block is lost entirely. So the tensor is first prescaled by
-    a global power of two that pushes block scales into e4m3's normal range,
-    and the global comes back on decode.
+def nvfp4_zeroed_blocks() -> int:
+    """Blocks whose NVFP4 scale rounded to zero (the COUNTED tally, no counters)."""
+    return _NVFP4_ZEROED_BLOCKS["blocks"]
 
-    Encode = quotient by the block scale then nearest grid magnitude (the
-    grid is LittleBit's, so a later sign rung re-uses the same codes).
-    """
-    n = t.numel()
-    assert n % 16 == 0, f"nvfp4 quantizes blocks of 16, got numel={n}"
-    # Global prescale: aim the SMALLEST nonzero block scale at e4m3's min
-    # normal (the largest block scale then lands wherever it lands — e4m3
-    # covers [tiny, 448] = ~16 decades, ample). A power of two moves nothing.
-    float(torch.finfo(torch.float8_e4m3fn).tiny)  # smallest positive
-    min_normal = float(2.0 ** torch.finfo(torch.float8_e4m3fn).min)  # 2^-6
-    amaxs = t.float().abs().reshape(-1, 16).amax(dim=1)
-    amaxs = amaxs[amaxs > 0]
-    if amaxs.numel() == 0:
-        global_scale = 1.0
-    else:
-        scale_min = float(amaxs.min()) / 6.0
-        exponent = torch.ceil(torch.log2(torch.tensor(min_normal / scale_min)))
-        global_scale = float(2.0**exponent) if scale_min < min_normal else 1.0
-    t = t * global_scale
 
-    blocks = t.float().reshape(-1, 16)
+def _e2m1_encode(t: torch.Tensor, global_scale: float) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """One NVFP4 encoding pass at `global_scale`: (codes, e4m3 scales, zeroed blocks)."""
+    blocks = (t * global_scale).float().reshape(-1, 16)
     amax = blocks.absolute().amax(dim=1)
     scale = amax / 6.0
     # A block of exact zeros scales to 0 → decode has to multiply by 1, not 0.
     scale = torch.where(scale == 0, torch.ones_like(scale), scale)
     # The scale itself is stored e4m3 (NVIDIA's NVFP4 layout): quantize it too.
     s_fp8 = scale.to(torch.float8_e4m3fn)
+    zero_blocks = int((s_fp8.float() == 0).sum())
     q = blocks / s_fp8.float().unsqueeze(-1)
     # Nearest-magnitude rounding: searchsorted over the MIDPOINTS of adjacent
     # grid entries (bucketize alone rounds "≤ boundary", not nearest).
@@ -653,7 +635,49 @@ def _e2m1_quant(t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, float]:
     sign = (q < 0) & (mag_idx > 0)  # zero codes carry no sign
     codes = (sign.to(torch.int32) * 8 + mag_idx).reshape(-1)  # sign<<3 | mag, flat
     packed = (codes[0::2] | (codes[1::2] << 4)).to(torch.uint8)
-    return packed, s_fp8, global_scale
+    return packed, s_fp8, zero_blocks
+
+
+def _e2m1_quant(t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, float, int]:
+    """Per-16-block NVFP4 quantize: codes u8 + e4m3 scales [n/16] + a global
+    fp32 correction + the number of blocks whose stored scale rounded to zero.
+
+    NVIDIA's NVFP4 is TWO-LEVEL for exactly the underflow this would hit:
+    a block whose e4m3 scale rounds to zero is lost entirely. The e4m3 scale
+    grid is OCP *Microscaling Formats (MX) Specification* v1.0 §5.3.1 Table 2
+    (bias 7: max normal ±448, min normal ±2⁻⁶, min subnormal ±2⁻⁹) — RNE of a
+    scale at or below `2^-10` (half the min subnormal) is the zero code, and
+    `torch.finfo(...).min` is NOT an exponent: it is −448.0, so `2 ** min` =
+    `2^-448` made the old prescale inert (2026-10-19 audit M1). `finfo.tiny`
+    (2⁻⁶) is the min NORMAL, not the zeroing boundary — a 2⁻⁶ scale is
+    representable — so the retry below is driven by the encode's actual zero
+    count, and the target is the MAX (448): keeping the large blocks
+    representable is the choice, and blocks left below the grid are counted.
+
+    Prescale: encode once, and if any nonzero block's scale rounded to zero,
+    encode again with a power-of-two global that puts the LARGEST block scale
+    at e4m3's max (448; floored, so it can never round up to NaN). The global
+    comes back on decode. Aiming the LARGEST at the top — not the smallest at
+    the min normal — is what one global multiplier can do: a tensor spanning
+    more than e4m3's ~18 octaves cannot carry both ends, the large blocks are
+    its mass, and the blocks still below the grid are returned in the fourth
+    slot for `pack_tsct` to COUNT. The global is 1.0 whenever no block would
+    zero, so the common path's record is byte-identical.
+
+    Encode = quotient by the block scale then nearest grid magnitude (the
+    grid is LittleBit's, so a later sign rung re-uses the same codes).
+    """
+    n = t.numel()
+    assert n % 16 == 0, f"nvfp4 quantizes blocks of 16, got numel={n}"
+    packed, s_fp8, zero_blocks = _e2m1_encode(t, 1.0)
+    if not zero_blocks:
+        return packed, s_fp8, 1.0, 0
+    amaxs = t.float().abs().reshape(-1, 16).amax(dim=1)
+    scale_max = float(amaxs.max()) / 6.0
+    exponent = torch.floor(torch.log2(torch.tensor(RUNG_MAX["fp8"] / scale_max)))
+    global_scale = float(2.0**exponent)
+    packed, s_fp8, zero_blocks = _e2m1_encode(t, global_scale)
+    return packed, s_fp8, global_scale, zero_blocks
 
 
 def _e2m1_dequant(packed: torch.Tensor, scale: torch.Tensor, global_scale: float) -> torch.Tensor:
@@ -708,8 +732,15 @@ FACTORS_QUANT = {
 }
 
 
-def pack_tsct(t: torch.Tensor, rung: str) -> dict[str, object]:
-    """One factor matrix → its storage record. Scales travel COMPUTED."""
+def pack_tsct(t: torch.Tensor, rung: str, counters: Counters | None = None) -> dict[str, object]:
+    """One factor matrix → its storage record. Scales travel COMPUTED.
+
+    `counters` is where the NVFP4 rung reports blocks whose stored e4m3 scale
+    rounded to zero (`nvfp4_zero_scale_blocks`, COUNTED — such a block decodes
+    to zeros and a reader must see it). The process-local
+    [`nvfp4_zeroed_blocks`] tally makes the report unconditional for a caller
+    that passes none.
+    """
     if t.dtype != torch.float32:
         loud(f"storage rungs quantize the fp32 masters, got dtype {t.dtype}")
     if not torch.isfinite(t).all():
@@ -720,7 +751,11 @@ def pack_tsct(t: torch.Tensor, rung: str) -> dict[str, object]:
         packed = (t / scale).to(torch.float8_e4m3fn)
         return {"rung": rung, "packed": packed.reshape(t.shape), "scale": scale, "shape": t.shape}
     if rung == "nvfp4":
-        packed, scale, correction = _e2m1_quant(t)
+        packed, scale, correction, zero_blocks = _e2m1_quant(t)
+        if zero_blocks:
+            _NVFP4_ZEROED_BLOCKS["blocks"] += zero_blocks
+            if counters is not None:
+                counters.count("nvfp4_zero_scale_blocks", zero_blocks)
         return {
             "rung": rung,
             "codes": packed,

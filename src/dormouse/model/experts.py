@@ -373,14 +373,25 @@ class SparseMoE(nn.Module):
         # The LFB routing bias (arXiv:2408.15664): a per-expert `b_e` added to
         # the softmax probs before the top-k, moved after each routed forward
         # by `-coef·sign(load_e − mean)` WITHOUT gradients. A buffer, never a
-        # parameter: the optimizer must not move it, LFB does.
+        # parameter: the optimizer must not move it, LFB does. It is MODEL
+        # state — the next resume continues from it — but NOT a persistent
+        # state-dict buffer: the export artifact's key set is pinned by the
+        # demo engine and `tests/test_export.py`, which have no LFB. The
+        # checkpoint carries it in the `<ckpt_name>.lfb` sibling and
+        # `train.loop.load_model_state` restores it, so a resume does not
+        # restart a controller the counts say it already integrated (audit
+        # 2026-10-19 M8).
         self.lfb_coef = cfg.moe_lb_coef
         self.register_buffer(
             "lfb_bias", torch.zeros(cfg.n_experts, device=device), persistent=False
         )
-        # The cumulative routed-count integrator the bias reads (persistent:
-        # a resume must keep its controller state or the rebalancer restarts
-        # its memory of where the load went).
+        # The cumulative routed-count working set the bias reads: the sign
+        # rule integrates it over the steps since the last load. Persistent so
+        # a checkpoint still carries the counter, but `train.loop._restore_lfb`
+        # ZEROES it on every load — the bias, restored from the sidecar, is the
+        # controller state a resume continues; the counts are not. Keeping a
+        # whole-run history here (mix1: 11.8e9 at step 80k) would make the next
+        # update diff against the run's entire past and freeze the controller.
         self.register_buffer(
             "lfb_counts", torch.zeros(cfg.n_experts, device=device), persistent=True
         )

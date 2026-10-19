@@ -171,6 +171,18 @@ def _freeze_gc() -> None:
 
 
 def _model(run) -> DormouseModel:
+    """Construct the model from `run` — seeded by the run, never by the caller.
+
+    `train.seed` is recorded in every snapshot and every `.dormouse` header, so
+    it must own the weights: `DormouseModel.__init__` draws from the global
+    torch RNG, and before this call nothing in the train path seeded it (audit
+    C1: two `seed=1` processes built `39cb6df0…` vs `c70cb36b…`). Set the seed
+    HERE, immediately before the constructor, because this is the one place
+    `train`/`run`/`sft`/`eval`/`bench`/`export`/`decode`/`serve` build a model
+    (`serve.py` imports this helper). The RL lane builds its own
+    (`post/rl_train.py`), so `rl_cmd` seeds immediately before that call.
+    """
+    torch.manual_seed(run.train.seed)
     return DormouseModel(run.model)
 
 
@@ -330,7 +342,9 @@ def train_cmd(
         train_over["dist"] = True
     if capacity:
         train_over["dist_capacity"] = capacity
-    run = load_run(preset, model_overrides=model_over, train_overrides=train_over)
+    run = load_run(
+        preset, model_overrides=model_over, train_overrides=train_over, apply_compute=True
+    )
     run = _apply_fit(run, fit, log=print)
     dev = _device(device)
     world = int(os.environ.get("WORLD_SIZE", "1"))
@@ -424,7 +438,9 @@ def run(
             train_over[k] = v
     if out_dir is not None:
         train_over["out_dir"] = str(out_dir)
-    run = load_run(preset, model_overrides=model_over, train_overrides=train_over)
+    run = load_run(
+        preset, model_overrides=model_over, train_overrides=train_over, apply_compute=True
+    )
     dev = _device(device)
     run = _apply_dtype(run, dev, log=print)
     model = _model(run).to(dev)
@@ -490,9 +506,6 @@ def sft_cmd(
         bool,
         typer.Option("--build-sft", help="(re)build the seeded instruction corpus at --data first"),
     ] = False,
-    n_tasks: Annotated[
-        int, typer.Option(help="code and math tasks per class in the built corpus")
-    ] = 32,
     chat_data: Annotated[
         list[Path],
         typer.Option(
@@ -546,7 +559,7 @@ def sft_cmd(
     checkpoint pair (which refuses loudly when either half is missing), so the
     bare command is the concept test — the format is learned, the knowledge is
     not there yet. `--build-sft` writes the corpus deterministically from
-    `(seed, seq_len, n_tasks)`; a `--data` that does not exist without it is a
+    `(seed, seq_len)`; a `--data` that does not exist without it is a
     loud refusal, because a pretrain corpus has no markers and the masked CE
     would refuse it one step later anyway.
     """
@@ -566,7 +579,9 @@ def sft_cmd(
         train_over["eval_data"] = str(eval_data)
     if json_log is not None:
         train_over["json_log"] = str(json_log)
-    run = load_run(preset, model_overrides=model_over, train_overrides=train_over)
+    run = load_run(
+        preset, model_overrides=model_over, train_overrides=train_over, apply_compute=True
+    )
     if not run.train.data:
         raise LoudError(
             "sft needs --data (the SFT corpus .bin) or `--set data=/path`. Escape: "
@@ -578,7 +593,6 @@ def sft_cmd(
             path,
             run.train.seed,
             seq_len=run.train.seq_len,
-            n_tasks=n_tasks,
             chat_data=chat_data or None,
             chat_cap=chat_cap,
             holdout=holdout,
@@ -671,7 +685,9 @@ def rl_cmd(
             train_over[k] = v
     if json_log is not None:
         train_over["json_log"] = str(json_log)
-    run = load_run(preset, model_overrides=model_over, train_overrides=train_over)
+    run = load_run(
+        preset, model_overrides=model_over, train_overrides=train_over, apply_compute=True
+    )
     dev = _device(device)
     _freeze_gc()
     console.print(
@@ -684,6 +700,11 @@ def rl_cmd(
             f"adv={run.train.rl_adv}",
         )
     )
+    # C1: `rl_train` constructs its own DormouseModel (`post/rl_train.py`), so
+    # this is the seed call immediately before that construction. A direct
+    # library caller of `rl_train` still bypasses it; the durable fix is the
+    # same line inside `rl_train` (not this lane's file).
+    torch.manual_seed(run.train.seed)
     report = rl_train(
         run,
         resume=resume,

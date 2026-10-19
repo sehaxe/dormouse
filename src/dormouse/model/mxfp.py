@@ -95,8 +95,35 @@ import math
 
 import torch
 
-from ..instrument import loud
+from ..instrument import GuardCadence, loud
 from .tsct import _NVFP4_MAGNITUDES as E2M1_MAGNITUDES
+
+#: The guard cadence (§1.3): the finite / e8m0-range / NaN-byte checks each
+#: cost a device→host read (`bool(any())`), which is forbidden on the hot path.
+#: They run on the first `first` calls and every `every`-th after that; in the
+#: gap a non-finite value reaches the step's NaN firewall, and an out-of-range
+#: e8m0 scale is handled WITHOUT a host read: the block is zeroed (the codec's
+#: declared 0x00) and its count accumulates on device in `_RANGE_REJECTED`, so
+#: the degradation is still COUNTED, never silent. `_GUARD.reset()` is the test
+#: seam.
+_GUARD = GuardCadence(first=8, every=1000)
+
+#: COUNTED tally of blocks whose e8m0 exponent is out of range on an
+#: off-cadence call. A DEVICE tensor, so the hot path adds `bad.sum()` with no
+#: host read; [`range_rejected_blocks`] is the declared drain (a log/test
+#: cadence), like `Counters.drain`.
+_RANGE_REJECTED: dict[str, torch.Tensor] = {}
+
+
+def range_rejected_blocks() -> int:
+    """Blocks the e8m0 range guard would have refused, zeroed COUNTED.
+
+    An off-cadence call cannot afford the `bool((off & ~zero).any())` host read,
+    so it zeroes those blocks and tallies them here instead. Read this on a log
+    or test cadence (it takes the one `.item()`), not per packed tensor.
+    """
+    return sum(int(t.item()) for t in _RANGE_REJECTED.values())
+
 
 #: §5.2 Table 1: the scaling block size k for every concrete MX format.
 BLOCK = 32
@@ -138,17 +165,32 @@ def _e8m0_encode(amax: torch.Tensor, elem_max: float) -> torch.Tensor:
     ratio = torch.where(zero, torch.ones_like(amax), amax / elem_max)
     exp = torch.ceil(torch.log2(ratio))
     off = (exp < _E8M0_EXP_MIN) | (exp > _E8M0_EXP_MAX)
-    if bool((off & ~zero).any()):
-        bad = exp[off & ~zero][0]
-        loud(
-            f"MX block scale {float(bad):.0f} is outside e8m0's exponent range "
-            f"[{_E8M0_EXP_MIN}, {_E8M0_EXP_MAX}] (spec §5.4.1 Table 7; -127 is "
-            "reserved as this codec's zero): the block amax is denormal/tiny. "
-            "Escape: prescale the tensor by a power of two (a power of two moves "
-            "no element — see tsct.py:163-176's NVFP4 global prescale)"
-        )
-    exp = torch.where(zero, torch.zeros_like(exp), exp)
-    codes = torch.where(zero, torch.zeros_like(exp), exp + _E8M0_BIAS)
+    bad = off & ~zero
+    # LOUD on the guard cadence; COUNTED (zero + device tally) in the gap. The
+    # cadence may skip the HOST READ, never the consequence: a block a checked
+    # call would refuse is zeroed here and counted in `_RANGE_REJECTED`, so it
+    # cannot decode as plausible text and cannot vanish from the record (review
+    # round 1 M4).
+    if _GUARD.due():
+        if bool(bad.any()):
+            bad_exp = exp[bad][0]
+            loud(
+                f"MX block scale {float(bad_exp):.0f} is outside e8m0's exponent range "
+                f"[{_E8M0_EXP_MIN}, {_E8M0_EXP_MAX}] (spec §5.4.1 Table 7; -127 is "
+                "reserved as this codec's zero): the block amax is denormal/tiny. "
+                "Escape: prescale the tensor by a power of two (a power of two moves "
+                "no element — see tsct.py:163-176's NVFP4 global prescale)"
+            )
+    else:
+        key = str(amax.device)
+        prev = _RANGE_REJECTED.get(key)
+        n = bad.sum()
+        _RANGE_REJECTED[key] = n if prev is None else prev + n
+    # `zero | bad` carries code 0x00 (the declared zero): the value this codec
+    # writes for a block it cannot scale. No wrap through `exp + bias`.
+    drop = zero | bad
+    exp = torch.where(drop, torch.zeros_like(exp), exp)
+    codes = torch.where(drop, torch.zeros_like(exp), exp + _E8M0_BIAS)
     return codes.to(torch.uint8)
 
 
@@ -162,13 +204,14 @@ def e8m0_decode(codes: torch.Tensor) -> torch.Tensor:
     of our numbers is a silent corruption with an obvious cause we can name).
     """
     codes = codes.to(torch.int32)
-    if bool((codes == _E8M0_NAN).any()):
+    # Guard cadence (module _GUARD): one host read per 1000 decodes, not per
+    # packed tensor; a 0xFF scale makes the block NaN either way.
+    if _GUARD.due() and bool((codes == _E8M0_NAN).any()):
         loud(
             "e8m0 0xFF is the spec's NaN scale (§5.4.1 Table 7) and this codec "
             "never emits it: refusing to decode a NaN block. Cause: the scale "
             "bytes are not from this codec (or are uninitialized memory)"
         )
-    assert bool((codes >= 0).all()), "e8m0 codes are unsigned bytes"
     assert codes.dtype == torch.int32
     # 2^(c-127) in fp32 is exact for every c in [0, 254] (integer exponent).
     values = torch.pow(2.0, (codes - _E8M0_BIAS).to(torch.float32))
@@ -181,8 +224,13 @@ def _check_finite(w: torch.Tensor, what: str) -> None:
     §5.3.3 Table 5 (e2m1) and §5.3.1 Table 2 (e4m3) both list Infinities N/A,
     so an inf input would silently become the grid's max (SAT) or NaN, and a
     NaN input would poison the block amax and therefore the scale.
+
+    The finite test is a device→host read, so it runs on [`_GUARD`]'s cadence
+    (§1.3): a NaN that slips between checks still reaches the step's NaN
+    firewall. `what` is kept for the message.
     """
-    if not bool(torch.isfinite(w).all()):
+    assert w.is_floating_point(), f"MX quantize: {what} must be a float tensor, got {w.dtype}"
+    if _GUARD.due() and not bool(torch.isfinite(w).all()):
         n_bad = int((~torch.isfinite(w)).sum())
         loud(
             f"MX quantize: {what} has {n_bad} non-finite element(s). MX e2m1/e4m3 "
@@ -190,7 +238,6 @@ def _check_finite(w: torch.Tensor, what: str) -> None:
             "would corrupt the block amax. Escape: sanitize the tensor (a NaN "
             "firewall belongs upstream — AGENTS §1.1), or mask the bad elements"
         )
-    assert w.is_floating_point(), f"MX quantize: {what} must be a float tensor, got {w.dtype}"
 
 
 def quantize_mxfp4(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -219,7 +266,6 @@ def quantize_mxfp4(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     sign = (q < 0) & (mag_idx > 0)
     codes = (sign.to(torch.int32) * 8 + mag_idx).reshape(-1)
     assert codes.numel() == blocks.numel(), "one 4-bit code per element"
-    assert bool((codes < 16).all()), "e2m1 codes are 4 bits (S E1M2)"
     packed = (codes[0::2] | (codes[1::2] << 4)).to(torch.uint8)
     tail = w.shape[:-1]
     return packed.reshape(*tail, -1), scale_codes.reshape(*tail, -1)
@@ -272,7 +318,6 @@ def quantize_mxfp8(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     scale = e8m0_decode(scale_codes).unsqueeze(-1)
     q = torch.where(scale == 0, torch.zeros_like(blocks), blocks / scale).to(torch.float8_e4m3fn)
     assert q.numel() == blocks.numel(), "one 8-bit element per value"
-    assert bool((q.to(torch.float32).abs() <= E4M3_MAX).all()), "e4m3 |value| ≤ 448"
     tail = w.shape[:-1]
     return q.reshape(*tail, -1), scale_codes.reshape(*tail, -1)
 

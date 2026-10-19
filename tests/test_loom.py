@@ -144,4 +144,6 @@ def test_depth_curve_is_wired_with_loom_on(tmp_path):
         assert loss_d > 0 and bytes_d > 0 and fin_d > 0 and len(per_d) == d, (d, per_d)
     for loss_d, scored, _fin_d, _per_d in curve.values():
         assert math.isfinite(loss_d)
+        # The eval tail is sized in reads now (3 x BATCH x (SEQ+1)), so all
+        # 3 windows fit and each scores BATCH x SEQ (no wrapped read: M5).
         assert scored == 3 * BATCH * SEQ

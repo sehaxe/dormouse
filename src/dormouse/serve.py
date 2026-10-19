@@ -199,7 +199,13 @@ def resolve_arm(model: Any, recurrent: bool) -> tuple[bool, str | None]:
 _STOP = frozenset({0x03, 0x00})
 
 
-def _generate(state: ServeState, prompt: bytes, n: int, chunk: int = STREAM_BYTES) -> Iterator[str]:
+def _generate(
+    state: ServeState,
+    prompt: bytes,
+    n: int,
+    chunk: int = STREAM_BYTES,
+    stats: dict[str, Any] | None = None,
+) -> Iterator[str]:
     """`n` bytes past `prompt`, decoded incrementally, as text pieces.
 
     The arm is `state.recurrent`, decided once in `build_server` before the
@@ -208,6 +214,11 @@ def _generate(state: ServeState, prompt: bytes, n: int, chunk: int = STREAM_BYTE
     the context and carries on from the state a single call would have (byte
     prefill on CPU, so byte-identical; chunked prefill on CUDA, equal within
     the documented summation-order class).
+
+    `stats`, when given, receives `bytes` (the ANSWER bytes actually emitted,
+    stop marker excluded) and `stopped` (the reply ended on a stop byte rather
+    than the budget). The usage block reports THIS, not `n`: the requested cap
+    is not a completion (review round 1 N2).
     """
     if not prompt:
         loud("empty prompt: the first window IS the prompt (model.decode's rule)")
@@ -215,7 +226,7 @@ def _generate(state: ServeState, prompt: bytes, n: int, chunk: int = STREAM_BYTE
         loud(f"max_tokens={n}: must be >= 1")
     gen = torch.Generator(device=state.device).manual_seed(state.seed)
     dec = codecs.getincrementaldecoder("utf-8")("replace")
-    ctx, done = prompt, 0
+    ctx, done, emitted = prompt, 0, 0
     while done < n:
         k = min(chunk, n - done)
         before = len(ctx)
@@ -249,20 +260,26 @@ def _generate(state: ServeState, prompt: bytes, n: int, chunk: int = STREAM_BYTE
         if hit is not None:
             # The reply ENDED: emit the bytes up to the marker, then stop —
             # the caller must not read a finished answer's padding as text.
+            emitted += hit
             text = dec.decode(bytes(delta[:hit]))
             if text:
                 yield text
             tail = dec.decode(b"", True)
             if tail:
                 yield tail
+            if stats is not None:
+                stats.update(bytes=emitted, stopped=True)
             return
         done += k
+        emitted += len(delta)
         text = dec.decode(bytes(delta))
         if text:
             yield text
     tail = dec.decode(b"", True)
     if tail:
         yield tail
+    if stats is not None:
+        stats.update(bytes=emitted, stopped=False)
 
 
 def _max_tokens(body: dict, state: ServeState) -> int:
@@ -350,8 +367,9 @@ def make_handler(state: ServeState) -> type[BaseHTTPRequestHandler]:
             cid, created = f"chatcmpl-{uuid.uuid4().hex[:24]}", int(time.time())
             if body.get("stream"):
                 return self._stream(prompt, n, cid, created)
+            stats: dict[str, Any] = {}
             try:
-                content = "".join(_generate(state, prompt, n))
+                content = "".join(_generate(state, prompt, n, stats=stats))
             except LoudError as e:
                 return self._error(400, str(e))
             self._json(
@@ -365,14 +383,16 @@ def make_handler(state: ServeState) -> type[BaseHTTPRequestHandler]:
                         {
                             "index": 0,
                             "message": {"role": "assistant", "content": content},
-                            "finish_reason": "stop",
+                            # `stop` = the model's end-of-answer byte; `length` =
+                            # the n-byte budget ran out mid-reply (N2).
+                            "finish_reason": "stop" if stats["stopped"] else "length",
                         }
                     ],
                     # bytes ARE this model's tokens; nothing is estimated here.
                     "usage": {
                         "prompt_tokens": len(prompt),
-                        "completion_tokens": n,
-                        "total_tokens": len(prompt) + n,
+                        "completion_tokens": stats["bytes"],
+                        "total_tokens": len(prompt) + stats["bytes"],
                     },
                 },
             )

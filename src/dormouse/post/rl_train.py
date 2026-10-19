@@ -191,7 +191,11 @@ def rl_train(
         log(f"rl init: weights from {path} (step {foreign.get('step', '?')}), fresh optimizer")
     if resume:
         ck, _stored = load_ckpt(run)
-        load_model_state(model, cfg, ck["model"])
+        # `resume=True`: an RL training resume is the same case as `train()`'s
+        # and SFT's — a pre-sidecar checkpoint with the LFB controller on is
+        # LOUD, never COUNTED (review round 3 R3-3). `log` carries the
+        # controller-off escape's COUNTED line into the run's log.
+        load_model_state(model, cfg, ck["model"], log=log, resume=True)
         opt.load_state_dict(ck["opt"])
         start = int(ck["step"]) + 1
         log(f"rl resume: step={start} opt_steps={opt.steps}")
@@ -377,8 +381,17 @@ def rl_train(
                 )
 
         if (step + 1) % cfg.ckpt_every == 0:
-            weights, snapshot = save_ckpt(run, model, opt, step)
-            log(f"ckpt step={step + 1} -> {weights} ({snapshot})")
+            # A fresh tally per save, exactly as `train/loop.py` and `sft_train`
+            # do: the storage rung's COUNTED degradations belong to the FILE just
+            # written, and the checkpoint line is where a reader sees them
+            # (review round 1 M3).
+            ck_counts = Counters()
+            weights, snapshot = save_ckpt(run, model, opt, step, counters=ck_counts)
+            ck_line = f"ckpt step={step + 1} -> {weights} ({snapshot})"
+            if ck_counts:
+                total.merge(ck_counts)
+                ck_line += " " + ck_counts.line()
+            log(ck_line)
             if sink is not None:
                 _row(event="rl_ckpt", step=step + 1, path=str(weights))
 

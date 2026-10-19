@@ -87,11 +87,13 @@ def test_chat_completion_has_the_openai_shape(served):
     body = _chat(served, max_tokens=CAP)
     assert body["model"] == CKPT and body["object"] == "chat.completion"
     (choice,) = body["choices"]
-    assert choice["finish_reason"] == "stop"
+    produced = body["usage"]["completion_tokens"]
+    # The usage reports what was PRODUCED, not the requested cap (round 1 N2).
+    assert 1 <= produced <= CAP
+    assert choice["finish_reason"] == ("length" if produced == CAP else "stop")
     assert choice["message"]["role"] == "assistant"
     assert isinstance(choice["message"]["content"], str) and choice["message"]["content"]
-    assert body["usage"]["completion_tokens"] == CAP
-    assert body["usage"]["total_tokens"] == body["usage"]["prompt_tokens"] + CAP
+    assert body["usage"]["total_tokens"] == body["usage"]["prompt_tokens"] + produced
 
 
 def test_stream_is_sse_and_ends_with_done(served):
@@ -203,9 +205,39 @@ def test_max_tokens_above_the_cap_is_clamped_and_counted(served):
     _, httpd = served
     before = httpd.state.counters.get("max_tokens_clamped", 0)
     body = _chat(served, max_tokens=10_000)
-    assert body["usage"]["completion_tokens"] == CAP
+    # The cap bounds the budget; usage still reports what was produced (N2).
+    assert 1 <= body["usage"]["completion_tokens"] <= CAP
     assert body["choices"][0]["message"]["content"]
     assert httpd.state.counters.get("max_tokens_clamped", 0) == before + 1
+
+
+def test_usage_reports_the_bytes_produced_and_stops_at_nine(served, monkeypatch):
+    """N2's gate: `max_tokens=64`, a reply that ends at 9 B, usage says 9."""
+    import dormouse.serve as serve_mod
+
+    def nine_then_stop(model, ctx, k, **kw):
+        return ctx + b"123456789\x03"  # answer + the SFT end-of-answer byte
+
+    monkeypatch.setattr(serve_mod, "recurrent_decode", nine_then_stop)
+    body = _chat(served, max_tokens=64)
+    choice = body["choices"][0]
+    assert choice["message"]["content"] == "123456789"
+    assert choice["finish_reason"] == "stop"
+    assert body["usage"]["completion_tokens"] == 9
+    assert body["usage"]["total_tokens"] == body["usage"]["prompt_tokens"] + 9
+
+
+def test_finish_reason_is_length_when_the_budget_runs_out(served, monkeypatch):
+    """The other half of N2: `n` bytes and no stop byte is not `stop`."""
+    import dormouse.serve as serve_mod
+
+    def always_more(model, ctx, k, **kw):
+        return ctx + b"x" * k
+
+    monkeypatch.setattr(serve_mod, "recurrent_decode", always_more)
+    body = _chat(served, max_tokens=CAP)
+    assert body["usage"]["completion_tokens"] == CAP
+    assert body["choices"][0]["finish_reason"] == "length"
 
 
 def test_unknown_model_is_a_404_json_error(served):

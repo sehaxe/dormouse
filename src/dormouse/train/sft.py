@@ -13,10 +13,12 @@ template, and a loop whose cross-entropy counts only the answer's bytes.
 `0x01` opens the user turn, `0x02` the assistant turn, `0x03` closes the answer,
 `0x00` pads the record to the window. Every byte of every instruction and answer
 is asserted marker-free at render time ([`render`]) — and the assert can only
-pass because the sources are generated text (the seeded tasks of `post/tasks.py`,
-the hand-written `GENERIC_QA`, the generated `_ru_pairs` bank, and the distill
-JSONL rows, which are pre-filtered for sentinels and for one-window fits before
-they enter the build), never arbitrary user bytes. `0x03` and
+pass because the sources are selected text (the hand-written `GENERIC_QA`, the
+generated `_ru_pairs` bank, and the distill JSONL rows, which are pre-filtered
+for sentinels and for one-window fits before
+they enter the build), never arbitrary user bytes. `post/tasks.py` is NOT a
+source: its answers are the verifier's reward set (see the comment above
+`GENERIC_QA`). `0x03` and
 `0x00` exist because a fixed-size window needs an answer END: without them the
 only way to keep a window single-example is to train on padding.
 
@@ -74,7 +76,6 @@ from ..config import RunConfig, TrainConfig
 from ..instrument import Counters, LoudError, StepTimer, loud
 from ..model.engram import Engram, enable_host_tables, host_engrams, host_step_all
 from ..model.experts import invalidate_banks_all
-from ..post.tasks import build_tasks
 from .data import ByteStream, warmup_steps
 from .loop import kda_field, load_ckpt, load_model_state, save_ckpt, unpack_state_dict
 from .lr import wsd_lr
@@ -88,6 +89,14 @@ ASSIST = 0x02
 END = 0x03
 PAD = 0x00
 SENTINELS = (USER, ASSIST, END, PAD)
+
+#: The corpus has NO `post.tasks` pairs. That generator is the RL/bench reward
+#: set, and its code variant derives ONE solution per `i % 3` kind: any slice of
+#: its index range therefore teaches answer strings the verifier scores (the
+#: review's M1, the round-0 CRITICAL's other half). An offset makes the ids and
+#: prompts disjoint and leaves the answers identical; the only root fix is not
+#: to put them in the corpus. Code/math instruction data must come from a source
+#: the verifier never scores (a hand-written corpus, `--chat-data`).
 
 #: The generic half of the corpus: the model has to learn the FORMAT, not just
 #: code. Hand-written, both languages the corpus speaks, answers kept short so
@@ -427,19 +436,15 @@ def render(instruction: str, answer: str) -> bytes:
     )
 
 
-def _examples(
-    seed: int, n_tasks: int, chat: list[tuple[str, str]] | None = None
-) -> list[tuple[str, str]]:
-    """The pairs: generic QA + the RU bank + seeded tasks (REUSED) + chat rows."""
+def _examples(chat: list[tuple[str, str]] | None = None) -> list[tuple[str, str]]:
+    """The pairs: generic QA + the RU bank + chat rows, and nothing scored.
+
+    `post.tasks.build_tasks` is the RL/bench reward set; its answer strings are
+    the solutions the verifier scores, so no pair from it may enter the corpus
+    (see the module comment above `GENERIC_QA`). The seed still orders the
+    corpus below; it no longer selects generated tasks.
+    """
     out = list(GENERIC_QA) + _ru_pairs()
-    for task in build_tasks("code", seed, n=n_tasks):
-        # The task's prompt is the instruction (signature + docstring); the
-        # hidden reference implementation is the answer.
-        out.append((task.prompt.rstrip("\n"), task.solution.rstrip("\n")))
-    for task in build_tasks("math", seed, n=n_tasks):
-        # The math prompt asks for a final `answer: <value>` line, so the answer
-        # teaches that format too (it is what `verifiers._final_answer` reads).
-        out.append((task.prompt, f"answer: {task.solution}"))
     if chat:
         out.extend(chat)
     return out
@@ -450,14 +455,13 @@ def build_sft_corpus(
     seed: int,
     *,
     seq_len: int,
-    n_tasks: int = 32,
     chat_data: str | Path | list[str | Path] | None = None,
     chat_cap: int | None = None,
     holdout: int = 0,
 ) -> dict:
     """Write the instruction corpus: fixed `seq_len + 1`-byte records, deterministic.
 
-    A pure function of `(seed, seq_len, n_tasks, chat_data, chat_cap)`: the same
+    A pure function of `(seed, seq_len, chat_data, chat_cap)`: the same
     arguments produce the same bytes in any process (the shuffles are
     `random.Random(seed)` / `Random(seed + 1)`), which is what makes an SFT run
     replayable (ADR-0021's determinism discipline).
@@ -477,8 +481,6 @@ def build_sft_corpus(
     """
     if seq_len < 8:
         loud(f"build_sft_corpus seq_len={seq_len}: a window must hold a marker pair")
-    if n_tasks < 0:
-        loud(f"build_sft_corpus n_tasks={n_tasks}: a task count cannot be negative")
     if chat_cap is not None and chat_cap < 0:
         loud(f"build_sft_corpus chat_cap={chat_cap}: a cap cannot be negative")
     chat: list[tuple[str, str]] = []
@@ -494,7 +496,7 @@ def build_sft_corpus(
         chat_stats.update(dropped)
         chat_stats["chat_loaded"] = dropped.get("chat_fit", len(chat))
         chat_stats["chat_used"] = len(chat)
-    examples = _examples(seed, n_tasks, chat)
+    examples = _examples(chat)
     random.Random(seed).shuffle(examples)
     record = seq_len + 1
     records: list[bytes] = []
@@ -536,7 +538,6 @@ def build_sft_corpus(
         "bytes": record * len(records),
         "seq_len": seq_len,
         "seed": seed,
-        "n_tasks": n_tasks,
         "holdout": held,
         **chat_stats,
     }
@@ -600,16 +601,29 @@ def sft_mask(windows: torch.Tensor) -> torch.Tensor:
     return (pos[None, :] + 1 >= assist[:, None]) & (pos[None, :] + 1 <= end[:, None])
 
 
-def sft_loss(logits: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+def sft_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    n_supervised: int | None = None,
+) -> torch.Tensor:
     """Masked next-byte CE: the mean over the SUPERVISED positions only.
 
     `logits` is `[b*t, vocab]` (the model's own shape), `targets` `[b, t]`, `mask`
     `[b, t]` bool. Every prompt byte and every pad byte is dropped from BOTH the
     numerator and the denominator — an unmasked prompt byte is not "cheap", it is
     a byte the model was asked to predict that the task never wanted.
+
+    `n_supervised`, when the caller already counted the mask on the host (the
+    SFT loop builds the mask before the device seam), keeps the empty-mask
+    refusal off the per-step D2H path: the check is the caller's host count,
+    not a `mask.any()` on the device tensor (§1.3).
     """
     flat = mask.reshape(-1)
-    if not bool(flat.any()):
+    if n_supervised is None:
+        n_supervised = int(flat.sum())
+    if not n_supervised:
         loud(
             "sft_loss: the mask supervises no byte in this window. Escape: the "
             "window's markers are wrong (see sft_mask)."
@@ -665,6 +679,60 @@ def _init_cfg(cfg: TrainConfig, path: Path, sd: dict, model: torch.nn.Module) ->
             f"re-save the init as a host-table run (with its `.ngram` sibling)."
         )
     return dataclasses.replace(cfg, engram_ram=host, out_dir=str(path.parent), ckpt_name=path.stem)
+
+
+def _sft_eval(
+    model: torch.nn.Module,
+    eval_stream: ByteStream,
+    cfg: TrainConfig,
+    device: torch.device | str | None,
+) -> tuple[float, float, int, int]:
+    """One held-out pass: `(ce, first_frac, records, scored_bytes)`.
+
+    `rewind()` first, ALWAYS (audit MAJOR 3, the defect `train/loop.py`'s
+    `_eval_loss` fixed on 2026-09-27): the stream is a ring, so an eval that
+    inherits the previous eval's position scores different bytes and its
+    `ce=`/`first=` are not a statement about the weights alone. `scored_bytes`
+    is the eval window the line prints (`batches × batch × seq_len`), the same
+    unit as the pretrain line.
+    """
+    eval_stream.rewind()
+    ce_total = 0.0
+    batches = 0
+    first_ok = 0
+    first_n = 0
+    scored = 0
+    was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        for _ in range(cfg.eval_batches):
+            ex, ey = eval_stream.next_batch()
+            if device is not None:
+                ex, ey = ex.to(device), ey.to(device)
+            emask = sft_mask(ex)
+            elogits, _en, _ec = model(ex)
+            flat = emask.reshape(-1)
+            ce_total += float(F.cross_entropy(elogits[flat], ey.reshape(-1)[flat]))
+            batches += 1
+            scored += int(ex.numel())
+            # The conditioning metric: at the assistant marker's position the
+            # model predicts the FIRST answer byte — the one byte that cannot
+            # be guessed from the answer alone.
+            is_a = ex == ASSIST
+            assist = is_a.to(torch.int8).argmax(dim=1)
+            rows = torch.arange(ex.shape[0], device=ex.device)
+            per_row = elogits.reshape(ex.shape[0], ex.shape[1], -1)
+            pred = per_row[rows, assist].argmax(dim=-1)
+            true = ey[rows, assist]
+            first_ok += int((pred == true).sum())
+            first_n += int(ex.shape[0])
+    model.train(was_training)
+    return (
+        ce_total / max(batches, 1),
+        first_ok / max(first_n, 1),
+        first_n,
+        scored,
+    )
 
 
 def sft_train(
@@ -780,8 +848,11 @@ def sft_train(
         ck, _stored = load_ckpt(run)
         # The same ONE loader as the init path (and as `train()`'s resume): a
         # host-table run's model half has no `engram.tables`, and `load_ckpt`
-        # already refused a missing `.ngram` (`require_ngram`).
-        load_model_state(model, cfg, ck["model"])
+        # already refused a missing `.ngram` (`require_ngram`). `resume=True`
+        # is load-bearing: a pre-sidecar checkpoint with `moe_lb_coef > 0` must
+        # be LOUD here too, not only in `train()` (review round 3 R3-3). The
+        # lane's `log` carries the COUNTED line on the controller-off escape.
+        load_model_state(model, cfg, ck["model"], log=log, resume=True)
         opt.load_state_dict(ck["opt"])
         start = int(ck["step"]) + 1
         if start:
@@ -835,16 +906,21 @@ def sft_train(
                 group["lr"] = lr
 
         x, y = stream.next_batch()
-        if device is not None:
-            x, y = x.to(device), y.to(device)
+        # The mask is built from BYTE POSITIONS, so it is host work: build it on
+        # the stream's CPU window BEFORE the device seam, count it there, and
+        # send the finished mask across. That keeps `int(mask.sum())` and
+        # `sft_mask`'s per-row padding checks off the per-step D2H path (audit
+        # MAJOR 4 / §1.3) — the only host read left in the step is the loss.
         mask = sft_mask(x)
+        n_mask = int(mask.sum())
+        if device is not None:
+            x, y, mask = x.to(device), y.to(device), mask.to(device)
         # `targets=None`: the decode forward. Its logits are the ones generation
         # samples and the eval's `fin` scores, so SFT trains that readout — the
         # in-loop `L_Rec` is a pretraining signal and is not built here.
         logits, _none, step_counters = model(x)
         assert logits.shape[-1] == run.model.vocab, "logits width != vocab"
-        loss = sft_loss(logits, y, mask)
-        n_mask = int(mask.sum())
+        loss = sft_loss(logits, y, mask, n_supervised=n_mask)
         total.count("sft_bytes", n_mask)
         window.count("sft_bytes", n_mask)
         supervised += n_mask
@@ -937,45 +1013,35 @@ def sft_train(
                 )
 
         if eval_stream is not None and (step + 1) % cfg.eval_every == 0:
-            model.eval()
-            ce_total = 0.0
-            batches = 0
-            first_ok = 0
-            first_n = 0
-            with torch.no_grad():
-                for _ in range(cfg.eval_batches):
-                    ex, ey = eval_stream.next_batch()
-                    if device is not None:
-                        ex, ey = ex.to(device), ey.to(device)
-                    emask = sft_mask(ex)
-                    elogits, _en, _ec = model(ex)
-                    flat = emask.reshape(-1)
-                    ce_total += float(F.cross_entropy(elogits[flat], ey.reshape(-1)[flat]))
-                    batches += 1
-                    # The conditioning metric: at the assistant marker's
-                    # position the model predicts the FIRST answer byte — the
-                    # one byte that cannot be guessed from the answer alone.
-                    is_a = ex == ASSIST
-                    assist = is_a.to(torch.int8).argmax(dim=1)
-                    rows = torch.arange(ex.shape[0], device=ex.device)
-                    per_row = elogits.reshape(ex.shape[0], ex.shape[1], -1)
-                    pred = per_row[rows, assist].argmax(dim=-1)
-                    true = ey[rows, assist]
-                    first_ok += int((pred == true).sum())
-                    first_n += int(ex.shape[0])
-            model.train()
-            ce = ce_total / max(batches, 1)
-            frac = first_ok / max(first_n, 1)
+            ce, frac, first_n, eval_scored = _sft_eval(model, eval_stream, cfg, device)
             log(
                 f"sft eval step={step + 1} ce={ce:.4f} bpb={ce / math.log(2):.4f} "
-                f"first={100 * frac:.1f}% over {first_n} records"
+                f"first={100 * frac:.1f}% over {eval_scored} B "
+                f"({cfg.eval_batches} x {cfg.batch} x {cfg.seq_len}) "
+                f"= {first_n} records"
             )
             if sink is not None:
-                _row(event="sft_eval", step=step + 1, ce=ce, first=frac, records=first_n)
+                _row(
+                    event="sft_eval",
+                    step=step + 1,
+                    ce=ce,
+                    first=frac,
+                    records=first_n,
+                    scored=eval_scored,
+                )
 
         if (step + 1) % cfg.ckpt_every == 0:
-            weights, snapshot = save_ckpt(run, model, opt, step)
-            log(f"ckpt step={step + 1} -> {weights} ({snapshot})")
+            # A fresh tally per save, exactly as `train/loop.py` does: a storage
+            # rung's COUNTED degradations (`nvfp4_zero_scale_blocks`) belong to
+            # the FILE just written, and the checkpoint line is where a reader
+            # sees them (review round 1 M3).
+            ck_counts = Counters()
+            weights, snapshot = save_ckpt(run, model, opt, step, counters=ck_counts)
+            ck_line = f"ckpt step={step + 1} -> {weights} ({snapshot})"
+            if ck_counts:
+                total.merge(ck_counts)
+                ck_line += " " + ck_counts.line()
+            log(ck_line)
 
     if sink is not None:
         sink.close()

@@ -12,6 +12,7 @@ import pytest
 from conftest import tiny_model
 
 from dormouse.instrument import LoudError
+from dormouse.post.rollouts import COUNTERS as ROLLOUT_COUNTERS
 from dormouse.post.rollouts import Rollout, rollout
 from dormouse.post.tasks import TASKS_PER_CLASS, build_tasks
 from dormouse.post.train_steps import crr_advantage
@@ -52,21 +53,20 @@ def test_code_sandbox_refuses_network_and_passwd():
     net = "import socket\ndef add(a, b):\n    return a + b"
     verdict = verify(task, net)
     assert verdict.passed is False
-    assert verdict.reason == "refused: network access is not allowed in a sandboxed verifier"
+    assert verdict.reason.startswith("refused:") and "socket" in verdict.reason
     leak = 'def add(a, b):\n    return open("/etc/passwd").read()'
     verdict = verify(task, leak)
     assert verdict.passed is False
-    assert verdict.reason.startswith("refused:")
+    assert verdict.reason.startswith("refused:") and "open" in verdict.reason
 
 
-def test_code_sandbox_runtime_guard_blocks_string_built_reads():
-    # A path the static screen cannot see: the guard, not the regex, must refuse it.
+def test_code_sandbox_blocks_string_built_reads_by_name():
+    # The path is built at runtime, but the CALL is a name: the allowlist sees it.
     task = _add_task()
     sneaky = 'def add(a, b):\n    open(chr(47) + "etc/passwd", "rb").read()\n    return a + b'
     verdict = verify(task, sneaky)
     assert verdict.passed is False
-    assert not verdict.reason.startswith("refused:")
-    assert "sandbox" in verdict.reason
+    assert verdict.reason.startswith("refused:") and "open" in verdict.reason
 
 
 def test_code_verifier_accepts_correct_and_rejects_wrong():
@@ -136,3 +136,95 @@ def test_verify_is_pure_and_never_logs_the_raw_response():
     first, second = verify(task, response), verify(task, response)
     assert first == second
     assert "sentinel-9f3a" not in first.reason
+
+
+def test_a_hostile_answer_fails_the_sample_not_the_rollout(monkeypatch):
+    """R3-1 boundary: `(2**1000)**1000` is a failed sample, never a dead batch.
+
+    The model can generate `.` for any byte, so the gate feeds the hostile bytes
+    through the SAME decode seam the rollouts use, then runs the real verifier.
+    The budget is sized for exactly the payload, so the verdict is the numeric
+    refusal and not a truncation.
+    """
+    task = build_tasks("math", 1, 1)[0]
+    answer = b"(2**1000)**1000"
+    fed = {"i": 0}
+
+    def fake_decode(_model, _window, _n, **_kwargs):
+        i = fed["i"]
+        fed["i"] += 1
+        return answer[i : i + 1]
+
+    monkeypatch.setattr("dormouse.post.rollouts.decode_bytes", fake_decode)
+    prompt = len(task.prompt.encode("utf-8"))
+    roll = rollout(tiny_model(), task, prompt + 3 * len(answer), greedy=True)
+    assert roll.passed is False
+    assert roll.verdict.reason.startswith("refused:"), roll.verdict.reason
+    assert "power" in roll.verdict.reason, roll.verdict.reason
+
+
+def test_a_verifier_bug_fails_the_sample_not_the_batch(monkeypatch):
+    """The rollout boundary: even a verifier that RAISES fails one sample."""
+    task = build_tasks("math", 1, 1)[0]
+    before = ROLLOUT_COUNTERS.get("rollout_verify_error", 0)
+
+    def boom(_task, _response):
+        raise RuntimeError("verifier bug")
+
+    monkeypatch.setattr("dormouse.post.rollouts.verify", boom)
+    roll = rollout(tiny_model(), task, len(task.prompt.encode("utf-8")) + 20, greedy=True)
+    assert roll.passed is False
+    assert "RuntimeError" in roll.verdict.reason
+    assert ROLLOUT_COUNTERS.get("rollout_verify_error", 0) == before + 1
+
+
+def test_a_loud_verifier_refusal_is_not_a_failed_sample(monkeypatch):
+    """The boundary is for bugs, not for the do-not-run class: LOUD stays LOUD."""
+    task = build_tasks("math", 1, 1)[0]
+    before = ROLLOUT_COUNTERS.get("rollout_verify_error", 0)
+
+    def refuse(_task, _response):
+        raise LoudError("noop verifier refuses this class")
+
+    monkeypatch.setattr("dormouse.post.rollouts.verify", refuse)
+    with pytest.raises(LoudError, match="noop verifier"):
+        rollout(tiny_model(), task, len(task.prompt.encode("utf-8")) + 20, greedy=True)
+    assert ROLLOUT_COUNTERS.get("rollout_verify_error", 0) == before
+
+
+def test_the_corpus_reader_decodes_before_the_solution_comparison(tmp_path):
+    """R3-2 gate: reverting `_corpus_pairs`'s `.decode` turns this test RED.
+
+    Round 3 reverted the decode and the SFT gate stayed green because its only
+    injection appended a `str` pair by hand (`tests/test_sft.py:830`), never
+    going through the reader. Here the pair is a real RECORD that goes through
+    `_corpus_pairs`: the answer is a verifier solution containing a non-ASCII
+    character, so as `str` it IS the solution while the raw UTF-8 `bytes` will
+    never match a `set[str]` (`b'...' in {...}` is always False — the round-2
+    vacuity). That is the case the correct decode must catch and the reverted
+    one cannot.
+    """
+    from test_sft import _corpus_pairs, _solution_collisions
+
+    from dormouse.train.sft import PAD, render
+
+    solution = "def greet():\n    return 'Grüße, Welt'"
+    instruction = "Greet in German"
+    record = render(instruction, solution)
+    slot = len(record) + 4
+    path = tmp_path / "one.bin"
+    path.write_bytes(record + bytes([PAD]) * (slot - len(record)))
+
+    pairs = _corpus_pairs(path, slot)
+    assert len(pairs) == 1
+    read_instruction, answer = pairs[0]
+    assert read_instruction == instruction
+    # The property under test: the reader produces `str`, not the record's bytes.
+    assert isinstance(answer, str), type(answer)
+    assert answer == solution
+    # The helper catches the decoded pair...
+    assert _solution_collisions(pairs, {solution}) == [(instruction, solution)]
+    # ...and the same text as raw bytes is invisible to it, which is why the
+    # decode (not the comparison alone) needs this gate.
+    raw = answer if isinstance(answer, bytes) else answer.encode("utf-8")
+    assert _solution_collisions([(instruction, raw)], {solution}) == []

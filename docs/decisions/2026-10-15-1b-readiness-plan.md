@@ -78,7 +78,7 @@ the tech-verification doc §4):
 | Engram tables (4M rows/order) | 402M |
 | TSCT experts: 1024 × (dual gate/up latent 2·(2048·64+64) + down 64·5461) + shared (rank 192 + its write) | ~639.5M (MEASURED on the instantiated port model, 2026-10-15: the §2.2 draft missed the down-projection and the second latent — the spike found it; `configs/b1.toml` comments carry the arithmetic) |
 | Engram tables: 4M rows/order × 3 orders × dim 32 | 402.65M |
-| **total** | **1,066,354,113 ≈ 1.07B (MEASURED, `tests/test_param_count.py`)** |
+| **total** | **1,066,354,113 ≈ 1.07B (MEASURED, `tests/test_param_count.py`)** — 2026-10-15, at `max_iter=2`; the preset moved to `max_iter=4` and the count moved with it to **1,066,358,209** (the number the pinned test asserts today and the one `b1first` ran) |
 | active per token | ~57M (unchanged in shape) |
 | **active per token (train, both iters)** | **~57M** |
 | FLOPs/token (train, derived) | ~0.40 GFLOP |

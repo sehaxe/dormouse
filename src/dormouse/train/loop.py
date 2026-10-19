@@ -78,6 +78,116 @@ def ngram_path(cfg: TrainConfig) -> Path:
     return weights.with_suffix(".ngram")
 
 
+def lfb_path(cfg: TrainConfig) -> Path:
+    """The LFB controller's sibling of a checkpoint: `<ckpt_name>.lfb`.
+
+    `lfb_bias` is model state — the next resume continues the integrator from it
+    — but it is deliberately NOT a persistent `state_dict` buffer: the export
+    artifact's key set is pinned by the demo engine (`docs-site/public/demo/
+    engine.js` refuses an unknown key) and by `tests/test_export.py`, which have
+    no LFB. The checkpoint still carries it, in this sibling, and
+    `load_model_state` restores it for every reader (resume, eval, decode,
+    serve) — the same sidecar contract as `<ckpt_name>.ngram` (audit 2026-10-19
+    M8: the counts persisted while the bias they integrate did not).
+    """
+    weights, _ = ckpt_paths(cfg)
+    return weights.with_suffix(".lfb")
+
+
+def _lfb_state(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """`{buffer name: cpu copy}` for every LFB bias in `model`.
+
+    The `_orig_mod.` prefix of a `torch.compile` wrapper is stripped, like the
+    rest of the checkpoint (`save_ckpt`): every reader loads the unwrapped
+    model.
+    """
+    return {
+        name.removeprefix("_orig_mod."): buf.detach().to("cpu").clone()
+        for name, buf in model.named_buffers()
+        if name.rpartition(".")[2] == "lfb_bias"
+    }
+
+
+def _restore_lfb(
+    model: torch.nn.Module, cfg: TrainConfig, *, log=print, resume: bool = False
+) -> None:
+    """Restore the LFB bias from `<ckpt_name>.lfb` when the checkpoint has one.
+
+    A checkpoint written before the sidecar existed cannot supply it, and the
+    mark depends on WHO is loading (review round 2 R2-2):
+
+    * a TRAINING RESUME (`resume=True`) with the controller live
+      (`moe_lb_coef > 0`) is LOUD: the next optimizer step would integrate from
+      a zero bias under the checkpoint's own step count — a different network.
+      The escape is the sidecar, or an explicit `moe_lb_coef=0` (the controller
+      never MOVES the bias again);
+    * every reader — eval/decode/serve/export/bench, an SFT/RL `--init-from`,
+      and a resume with `moe_lb_coef == 0` — loads with the controller zeroed
+      and a COUNTED `lfb: no sidecar, controller zeroed` line. There is no
+      objective to continue, and a LOUD here would brick every pre-sidecar
+      artifact for every reader (the failure this scoping fixes).
+
+    `moe_lb_coef=0` is a break-glass, not a no-op: `SparseMoE.forward` adds
+    `lfb_bias` to the logits UNCONDITIONALLY (`model/experts.py`), so a
+    pre-sidecar checkpoint whose stored run had moved the bias resumes with a
+    different routing than the one it was saved in. The COUNTED line says so.
+
+    `lfb_counts` is reset here for every load. It is the sign rule's working
+    set, not controller state: the bias is the integral a resume continues.
+    `load_state_dict` restores the persistent counts too, and keeping them
+    would make the first post-load update diff against the WHOLE run (mix1
+    carries 11.8e9 accumulated counts at step 80k) instead of the steps since
+    the load — the controller's time constant would grow with the run and
+    freeze. Resetting is consistent with the restored bias: the bias survives,
+    the counts restart at zero.
+
+    A sidecar naming a buffer this model does not have, or a shape mismatch,
+    is LOUD: silently dropping controller state is the class this sidecar fixes.
+    """
+    path = lfb_path(cfg)
+    buffers = dict(model.named_buffers())
+    if not any(name.rpartition(".")[2] == "lfb_bias" for name in buffers):
+        return  # no LFB in this model: nothing to restore, nothing to report
+    for name, buf in buffers.items():
+        if name.rpartition(".")[2] == "lfb_counts":
+            buf.zero_()
+    if not path.is_file():
+        coef = float(getattr(getattr(model, "cfg", None), "moe_lb_coef", 0.0))
+        if coef > 0 and resume:
+            loud(
+                f"LFB sidecar {path} is missing but this model runs "
+                f"moe_lb_coef={coef}: a training resume would continue the routing "
+                f"controller from a zero bias under the checkpoint's step count — a "
+                f"different network. "
+                f"Escape: restore the `{path.name}` sibling, or resume with "
+                f"moe_lb_coef=0 if the controller is meant to be off."
+            )
+        log(
+            f"lfb: no sidecar, controller zeroed — routing differs from the stored "
+            f"step ({path}, moe_lb_coef={coef})"
+        )
+        return
+
+    state = torch.load(path, map_location="cpu", weights_only=True)
+    missing = sorted(k for k in state if k not in buffers)
+    if missing:
+        loud(
+            f"LFB sidecar {path} names buffer(s) {missing} this model does not "
+            f"have. Escape: load the matching checkpoint, or delete the stale "
+            f"`{path.name}` if it belongs to a different run."
+        )
+    with torch.no_grad():
+        for name, value in state.items():
+            target = buffers[name]
+            if tuple(target.shape) != tuple(value.shape):
+                loud(
+                    f"LFB sidecar {path}: {name} has shape {tuple(value.shape)} "
+                    f"but the model's buffer is {tuple(target.shape)}. Escape: "
+                    f"the sidecar does not belong to this model."
+                )
+            target.copy_(value.to(target.device))
+
+
 def host_device_type(model: torch.nn.Module) -> str:
     """The device the MODEL lives on — the one input to the host-path refusal.
 
@@ -128,7 +238,12 @@ def load_ngram(cfg: TrainConfig) -> dict:
 
 
 def save_ckpt(
-    run: RunConfig, model: torch.nn.Module, opt: MixOptimizer, step: int
+    run: RunConfig,
+    model: torch.nn.Module,
+    opt: MixOptimizer,
+    step: int,
+    *,
+    counters: Counters | None = None,
 ) -> tuple[Path, Path]:
     """Weights + optimizer state, plus the config snapshot beside them.
 
@@ -137,6 +252,18 @@ def save_ckpt(
     record (`model_quant_rung` names it), and `load_ckpt` unpacks back to
     fp32. The bank/checkpoint is the rung's whole contract — the forward path
     within a run never changes numerics.
+
+    The LFB routing bias is written to the `<ckpt_name>.lfb` sibling, not into
+    the model half: it is model state (the next resume continues from it) but
+    a non-persistent buffer (`lfb_path` says why). `load_model_state` restores
+    it for every reader.
+
+    `counters` receives the storage rung's COUNTED degradations: NVFP4 blocks
+    whose stored e4m3 scale rounded to zero (`nvfp4_zero_scale_blocks`) decode
+    to zeros, and a save that did not surface the count left the audit's
+    "COUNTED, never SILENT" half of the prescale as a test-only tally (review
+    round 1 M3). The trainer passes a fresh `Counters` per checkpoint and
+    prints it on the checkpoint line.
     """
     from ..model.tsct import is_factor_key, pack_tsct
 
@@ -152,7 +279,10 @@ def save_ckpt(
     sd = {k.removeprefix("_orig_mod."): v for k, v in sd.items()}
     rung = run.model.quant if run.model.quant != "none" else ""
     if rung and rung in ("fp8", "nvfp4", "ternary"):
-        sd = {k: (pack_tsct(v, rung) if is_factor_key(k) else v) for k, v in sd.items()}
+        sd = {
+            k: (pack_tsct(v, rung, counters=counters) if is_factor_key(k) else v)
+            for k, v in sd.items()
+        }
     tmp = weights.with_suffix(".pt.tmp")
     torch.save(
         {
@@ -164,6 +294,16 @@ def save_ckpt(
         tmp,
     )
     tmp.replace(weights)  # atomic: a crash never leaves a half-written ckpt
+    lfb = _lfb_state(model)
+    if lfb:
+        # LFB's bias is model state but not a persistent state-dict buffer —
+        # `lfb_path` says why (the export artifact's pinned key set). Written
+        # for EVERY checkpoint, zeros included, so a reused `ckpt_name` can
+        # never inherit a stale controller from an older run.
+        lp = lfb_path(run.train)
+        tmp_lfb = lp.with_suffix(".lfb.tmp")
+        torch.save(lfb, tmp_lfb)
+        tmp_lfb.replace(lp)
     if run.train.engram_ram:
         # The host tables are not parameters, so they are not in `sd`: they are
         # the sibling file, written atomically like the weights. A checkpoint
@@ -237,7 +377,15 @@ def require_ngram(cfg: TrainConfig) -> None:
     )
 
 
-def load_model_state(model: torch.nn.Module, cfg: TrainConfig, sd: dict, *, strict: bool = True):
+def load_model_state(
+    model: torch.nn.Module,
+    cfg: TrainConfig,
+    sd: dict,
+    *,
+    strict: bool = True,
+    log=print,
+    resume: bool = False,
+):
     """The ONE way a checkpoint's model half reaches a model.
 
     `train`'s resume, `eval`, `decode`, `serve`, `scripts/chat.py` and the two
@@ -253,6 +401,14 @@ def load_model_state(model: torch.nn.Module, cfg: TrainConfig, sd: dict, *, stri
     `enable_host_tables` (not `host_tables`) is the call: the CUDA-only refusal
     is a training VRAM-budget rule, and a load must work on `--device cpu`.
     A missing sibling is LOUD (`require_ngram`), never freshly seeded rows.
+
+    The LFB bias is restored from the `<ckpt>.lfb` sibling after the load when
+    that file exists (`_restore_lfb`): it is a non-persistent buffer (see
+    `lfb_path`), so a plain `load_state_dict` would reset the routing
+    controller a resume is supposed to continue. `resume=True` is the
+    TRAINER's resume only: a missing sidecar with the controller live is LOUD
+    there, and every reader (or a resume with `moe_lb_coef=0`) gets the COUNTED
+    zeroed line instead of a refusal.
     """
     if cfg.engram_ram:
         require_ngram(cfg)
@@ -260,6 +416,7 @@ def load_model_state(model: torch.nn.Module, cfg: TrainConfig, sd: dict, *, stri
     result = model.load_state_dict(sd, strict=strict)
     if cfg.engram_ram:
         load_host_state(model, load_ngram(cfg))
+    _restore_lfb(model, cfg, log=log, resume=resume)
     return result
 
 
@@ -282,6 +439,15 @@ def load_ckpt(run: RunConfig) -> tuple[dict, RunConfig]:
         require_ngram(run.train)
     stored = RunConfig.from_snapshot(snapshot.read_text())
     drift = run.diff_keys(stored)
+    # The controller-off escape (`_restore_lfb`): a pre-sidecar checkpoint has
+    # no bias to restore, and `moe_lb_coef=0` is the documented break-glass —
+    # the controller never moves the bias again. It is NOT "the same function":
+    # `SparseMoE.forward` adds a stored nonzero bias unconditionally, but a
+    # missing sidecar loads a zero one, so routing differs from the stored step
+    # (the COUNTED line says so). Only that one key, only to 0, and only when
+    # the sidecar really is absent; every other model/train change is refused.
+    if run.model.moe_lb_coef == 0 and not lfb_path(run.train).is_file():
+        drift = [k for k in drift if k != "model.moe_lb_coef"]
     if drift:
         loud(
             f"resume refused: {snapshot} was written by a config that differs in "
@@ -317,6 +483,27 @@ def _sample_depth(seed: int, step: int, max_iter: int) -> int:
     return 1 + ((step * 2654435761 + seed) % max_iter)
 
 
+def _eval_batches(stream: ByteStream, requested: int) -> int:
+    """How many WHOLE eval windows the stream's byte range holds, capped at `requested`.
+
+    One `next_batch` reads `batch × (seq_len + 1)` bytes (the next-byte shift)
+    and scores `batch × seq_len` of them, so that read is the denominator a
+    range is worth: `span // (batch × (seq_len + 1))`. The old denominator
+    (`batch × seq_len`) let the last window overrun the range and wrap into its
+    head — the 160 B / 640 B wrap review round 1 measured (M5). A range can
+    still be large enough for `ByteStream` (which requires `batch × seq_len + 1`
+    bytes) yet hold no whole window: then this returns 0 and the line says so.
+    `open_streams` sizes the no-`--eval` tail in READS
+    (`eval_batches × batch × (seq_len + 1)`, capped at 1 MiB), so the cap is
+    the only reason a shortfall remains; the eval scores the windows that fit
+    and the line names what is missing (COUNTED — audit 2026-10-19 M5, review
+    round 2 R2-1).
+    """
+    per_window = stream.batch * (stream.seq_len + 1)
+    assert per_window > 0, "an eval window has no bytes"
+    return max(0, min(requested, (stream.hi - stream.lo) // per_window))
+
+
 def _eval_loss(
     model: torch.nn.Module,
     stream: ByteStream,
@@ -333,13 +520,26 @@ def _eval_loss(
     depths and the one generation reads. `per_iter_mean` averages the
     per-iteration CEs over the batch — the deep-supervision shape.
 
+    The byte count is what the pass SCORED, not the window the config asked
+    for: when the eval range is shorter than the requested window (the
+    no-`--eval` tail is capped at 1 MiB), the loop runs only the windows the
+    range holds, so the `over N B` field cannot claim more text than the tail
+    contains (audit 2026-10-19 M5). `_eval_line` names the shortfall.
+
     `counters`, when given, receives THIS eval's own arm counters (the eval
     forward's `engram_rows`/`engram_arms` — the `engram=` field the eval line
     prints). They are the eval's, not the run's: a training counter would say
     the memory ran during an eval that ran without it, which is exactly the
     blind spot of AGENTS §3.2's retracted arm.
+
+    With no WHOLE window in the range the pass scores 0 B and returns NaN loss:
+    there is no measurement to report, and a fabricated 0.0 would read as a
+    perfect score (`_eval_line` names the bytes left unscored).
     """
     stream.rewind()
+    batches = _eval_batches(stream, batches)
+    if batches == 0:
+        return float("nan"), 0, float("nan"), []
     total = 0.0
     scored = 0
     fin_total = 0.0
@@ -369,9 +569,9 @@ def _eval_loss(
                 per = bd["per_iter"]
                 if not per_iter_acc:
                     per_iter_acc = [0.0] * len(per)
-                for i, v in enumerate(per):
-                    per_iter_acc[i] += v
-    n = max(batches, 1)
+                for j, v in enumerate(per):
+                    per_iter_acc[j] += v
+    n = batches
     model.train(was_training)
     if counters is not None:
         counters.merge(ev_counters)
@@ -455,12 +655,38 @@ def _eval_line(
     # a reader learns the eval ran a memory-disabled forward, which is the defect
     # that retracted the Engram arm's numbers (AGENTS §3.2). It is printed on
     # both substrates — the host path counts the same rows in `Engram._read`.
+    #
+    # The byte field is what the pass SCORED, and it names the shortfall when
+    # the range could not hold the window the config asked for (the no-`--eval`
+    # tail is capped at 1 MiB; audit 2026-10-19 M5). A line that printed
+    # `eval_batches × batch × seq_len` here overstated the evidence by the
+    # wrapped bytes.
+    ran = _eval_batches(stream, cfg.eval_batches)
+    # The WINDOW is the shape the rank actually scored (`b`/`t`), not the
+    # config's: on a fleet a rank runs its own micro-batch, and a window that
+    # quoted the config would describe another rank's measurement.
+    window = cfg.eval_batches * b * t
+    batches_field = f"{ran} x {b} x {t}"
+    if ran != cfg.eval_batches:
+        batches_field += f", requested {cfg.eval_batches}"
     line = (
         f"eval step={step} loss={ev:.4f} bpb={bpb(ev):.3f} fin={fin:.4f} "
-        f"bpb_fin={bpb(fin):.3f} over {scored} B "
-        f"({cfg.eval_batches} x {b} x {t}) "
+        f"bpb_fin={bpb(fin):.3f} over {scored} B ({batches_field}) "
         f"engram={eng.get('engram_rows', 0)}/{eng.get('engram_arms', 0)}"
     )
+    if scored < window:
+        held = stream.hi - stream.lo
+        line += (
+            f" shortfall: requested {window} B over {cfg.eval_batches} batch(es), "
+            f"the eval stream holds {held} B; scored {scored} B"
+            + (f" over {ran} batch(es)" if ran != cfg.eval_batches else "")
+            + f", left over {held - scored} B"
+        )
+        if ran == 0:
+            line += (
+                f" (no whole window fits: one read is {b} x "
+                f"({t} + 1) = {b * (t + 1)} B)"
+            )
     if parallel is not None:
         line += f" dist={parallel.rank}/{parallel.world_size}"
 
@@ -641,17 +867,26 @@ def train(
     tokens_per_step = cfg.batch * cfg.seq_len if parallel is None else parallel.global_tokens
     start = 0
     if resume:
-        ck, _stored = load_ckpt(run)
-        load_model_state(model, cfg, ck["model"])
+        ck, stored = load_ckpt(run)
+        load_model_state(model, cfg, ck["model"], log=log, resume=True)
         opt.load_state_dict(ck["opt"])
         start = int(ck["step"]) + 1
         if start:
             # A resumed run must continue on UNSEEN bytes: the burn failure
             # this prevents is re-reading (and memorizing) the corpus head.
-            # The rank's own byte offset persists (it is part of where its
-            # stream lives), hence the addition rather than rank·span.
-            span = (seq_len + 1) * batch
-            stream.skip_bytes(start * span + (0 if parallel is None else parallel.byte_offset()))
+            # A mixture's position is a STEP-INDEX question, not a byte-count
+            # one: its stage schedule is a function of the run's budget, and
+            # `steps` is an exempt progress key, so an extended run must
+            # replay the prefix under the checkpoint's stored budget or it
+            # assigns already-taken steps to different sources and moves every
+            # cursor by the wrong amount (review round 3 R3-4). A fleet's rank
+            # adds its own byte offset on the byte path (stage 3).
+            skip_to_step = getattr(stream, "skip_to_step", None)
+            if skip_to_step is not None:
+                skip_to_step(start, budget=stored.train.steps)
+            else:
+                rank_off = 0 if parallel is None else parallel.byte_offset()
+                stream.skip_bytes(start * (cfg.seq_len + 1) * cfg.batch + rank_off)
         # The checkpoint's model half is the X iterate (a checkpoint is written
         # with the eval switch on, below), and so is the optimizer's own `x`, so
         # the params must go back to Y before the next forward. The switch is an
@@ -1032,11 +1267,23 @@ def train(
             # an absolute, double-lerp-free write. ONE writer (rank 0) and the
             # UNWRAPPED module: DDP prefixes every state-dict key with `module.`.
             sf("eval")
+            # A fresh tally per save: the checkpoint line names a file's own
+            # zeroed blocks, not a run-cumulative number a reader cannot tie to
+            # the file (`save_ckpt`'s `counters`).
+            ck_counts = Counters()
             weights, snapshot = save_ckpt(
-                run, parallel.raw(model) if parallel is not None else model, opt, step
+                run,
+                parallel.raw(model) if parallel is not None else model,
+                opt,
+                step,
+                counters=ck_counts,
             )
             sf("train")
-            log(f"ckpt step={step + 1} -> {weights} ({snapshot})")
+            ck_line = f"ckpt step={step + 1} -> {weights} ({snapshot})"
+            if ck_counts:
+                total.merge(ck_counts)
+                ck_line += " " + ck_counts.line()
+            log(ck_line)
 
     if (
         cfg.eval
