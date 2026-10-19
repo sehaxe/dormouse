@@ -392,9 +392,6 @@ def sft_cmd(
         bool,
         typer.Option("--build-sft", help="(re)build the seeded instruction corpus at --data first"),
     ] = False,
-    n_tasks: Annotated[
-        int, typer.Option(help="code and math tasks per class in the built corpus")
-    ] = 32,
     chat_data: Annotated[
         list[Path],
         typer.Option(
@@ -448,7 +445,7 @@ def sft_cmd(
     checkpoint pair (which refuses loudly when either half is missing), so the
     bare command is the concept test — the format is learned, the knowledge is
     not there yet. `--build-sft` writes the corpus deterministically from
-    `(seed, seq_len, n_tasks)`; a `--data` that does not exist without it is a
+    `(seed, seq_len)`; a `--data` that does not exist without it is a
     loud refusal, because a pretrain corpus has no markers and the masked CE
     would refuse it one step later anyway.
     """
@@ -480,7 +477,6 @@ def sft_cmd(
             path,
             run.train.seed,
             seq_len=run.train.seq_len,
-            n_tasks=n_tasks,
             chat_data=chat_data or None,
             chat_cap=chat_cap,
             holdout=holdout,
@@ -574,19 +570,6 @@ def rl_cmd(
     if json_log is not None:
         train_over["json_log"] = str(json_log)
     run = load_run(preset, model_overrides=model_over, train_overrides=train_over)
-    # The SFT corpus draws `build_tasks` indices from [SFT_TASK_OFFSET, ...);
-    # the RL lane draws 0..rl_tasks-1. At or past the offset the two sets share
-    # a task under the same seed (audit C2), so the bound is a refusal, not a
-    # comment. `cli.run`'s stage 2 draws a fixed 8, well below it.
-    from .train.sft import SFT_TASK_OFFSET
-
-    if run.train.rl_tasks > SFT_TASK_OFFSET:
-        raise LoudError(
-            f"rl: rl_tasks={run.train.rl_tasks} reaches index {SFT_TASK_OFFSET}, "
-            f"the start of the SFT corpus's task range (train/sft.py). Under the "
-            f"same seed the reward set and the corpus would share a task. Escape: "
-            f"rl_tasks <= {SFT_TASK_OFFSET}."
-        )
     dev = _device(device)
     _freeze_gc()
     console.print(

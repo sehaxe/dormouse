@@ -30,7 +30,6 @@ from dormouse.train.sft import (
     PAD,
     USER,
     _sft_eval,
-    _sft_tasks,
     build_sft_corpus,
     render,
     sft_loss,
@@ -66,7 +65,7 @@ def tiny_model_cfg(**over) -> ModelConfig:
 def sft_run(tmp_path: Path, *, corpus: Path | None = None, **train_over) -> RunConfig:
     data = corpus if corpus is not None else tmp_path / "sft.bin"
     if corpus is None:
-        build_sft_corpus(data, seed=1, seq_len=SEQ, n_tasks=32)
+        build_sft_corpus(data, seed=1, seq_len=SEQ)
     cfg = TrainConfig(
         steps=30,
         batch=BATCH,
@@ -101,9 +100,9 @@ def _losses(lines: list[str]) -> list[float]:
 def test_corpus_is_deterministic_and_seed_dependent(tmp_path: Path):
     """Same seed = same bytes, in any process; a different seed is a different corpus."""
     a, b, c = tmp_path / "a.bin", tmp_path / "b.bin", tmp_path / "c.bin"
-    ra = build_sft_corpus(a, 7, seq_len=SEQ, n_tasks=4)
-    rb = build_sft_corpus(b, 7, seq_len=SEQ, n_tasks=4)
-    build_sft_corpus(c, 8, seq_len=SEQ, n_tasks=4)
+    ra = build_sft_corpus(a, 7, seq_len=SEQ)
+    rb = build_sft_corpus(b, 7, seq_len=SEQ)
+    build_sft_corpus(c, 8, seq_len=SEQ)
     assert a.read_bytes() == b.read_bytes()
     assert (ra["records"], ra["dropped"]) == (rb["records"], rb["dropped"])
     assert a.read_bytes() != c.read_bytes()
@@ -112,7 +111,7 @@ def test_corpus_is_deterministic_and_seed_dependent(tmp_path: Path):
 def test_markers_never_collide_with_the_content(tmp_path: Path):
     """Every record: one user marker at 0, one assistant marker, one end marker, pad tail."""
     path = tmp_path / "s.bin"
-    rep = build_sft_corpus(path, 3, seq_len=128, n_tasks=8)
+    rep = build_sft_corpus(path, 3, seq_len=128)
     raw = path.read_bytes()
     assert len(raw) == rep["bytes"] and len(raw) % rep["record_bytes"] == 0
     for i in range(rep["records"]):
@@ -128,14 +127,21 @@ def test_markers_never_collide_with_the_content(tmp_path: Path):
         render("ok", "no\x00")
 
 
-def test_the_corpus_carries_the_seeded_tasks_and_the_generic_pairs(tmp_path: Path):
-    """The sources are REUSED (post/tasks.py), not re-invented: both classes show up."""
+def test_the_corpus_is_the_unscored_bank_and_not_the_verifier_tasks(tmp_path: Path):
+    """M1: the corpus carries the generic/RU bank and NO `post/tasks` pair.
+
+    `post/tasks.py`'s code generator repeats one solution per `i % 3` kind, so
+    any slice of its index range would teach the RL/bench verifier's exact
+    answers. The corpus must keep the hand-written bank and must not carry a
+    single generated reference implementation.
+    """
     path = tmp_path / "s.bin"
-    rep = build_sft_corpus(path, 1, seq_len=256, n_tasks=4)
+    rep = build_sft_corpus(path, 1, seq_len=256)
     text = path.read_bytes()
     assert rep["records"] >= len(GENERIC_QA)
-    assert b"def add(" in text or b"def square_sum(" in text  # a code task's reference
-    assert b"answer: " in text  # the math prompt's own format, taught in the answer
+    assert b"def add(" not in text and b"def square_sum(" not in text
+    assert b"Complete this Python function" not in text
+    assert b"answer: " in text  # the generic bank's own format
     assert "Привет!".encode() in text  # the RU half of the generic set
 
 
@@ -368,8 +374,6 @@ def test_cli_sft_builds_the_corpus_and_trains(tmp_path: Path):
             "--data",
             str(corpus),
             "--build-sft",
-            "--n-tasks",
-            "8",
             "--ckpt-name",
             "s",
             "--set",
@@ -422,8 +426,6 @@ def test_cli_sft_refuses_a_resume_without_a_checkpoint(tmp_path: Path):
             "--data",
             str(tmp_path / "sft.bin"),
             "--build-sft",
-            "--n-tasks",
-            "4",
             "--ckpt-name",
             "absent",
             "--set",
@@ -481,8 +483,6 @@ def test_cli_sft_init_from_an_engram_ram_checkpoint(tmp_path: Path):
             "--data",
             str(tmp_path / "sft.bin"),
             "--build-sft",
-            "--n-tasks",
-            "4",
             "--init-from",
             str(ckpt),
             "--ckpt-name",
@@ -675,17 +675,15 @@ def test_chat_jsonl_rows_are_filtered_capped_and_deterministic(tmp_path):
     src = tmp_path / "chat.jsonl"
     src.write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
 
-    a = build_sft_corpus(tmp_path / "a.bin", 7, seq_len=64, n_tasks=0, chat_data=src, chat_cap=1)
-    build_sft_corpus(tmp_path / "b.bin", 7, seq_len=64, n_tasks=0, chat_data=src, chat_cap=1)
+    a = build_sft_corpus(tmp_path / "a.bin", 7, seq_len=64, chat_data=src, chat_cap=1)
+    build_sft_corpus(tmp_path / "b.bin", 7, seq_len=64, chat_data=src, chat_cap=1)
     assert (tmp_path / "a.bin").read_bytes() == (tmp_path / "b.bin").read_bytes()
     assert a["chat_loaded"] == 2 and a["chat_used"] == 1
     assert a["chat_dropped_long"] == 1 and a["chat_dropped_dirty"] == 2
     assert a["chat_files"] == {str(src): 5}
 
     with pytest.raises(LoudError, match="does not exist"):
-        build_sft_corpus(
-            tmp_path / "c.bin", 1, seq_len=64, n_tasks=0, chat_data=tmp_path / "no.jsonl"
-        )
+        build_sft_corpus(tmp_path / "c.bin", 1, seq_len=64, chat_data=tmp_path / "no.jsonl")
 
 
 def test_qa_text_format_parses_and_refuses_malformed_lines(tmp_path):
@@ -703,20 +701,20 @@ def test_qa_text_format_parses_and_refuses_malformed_lines(tmp_path):
         "A: Привет! Чем помочь?\n",
         encoding="utf-8",
     )
-    built = build_sft_corpus(tmp_path / "a.bin", 3, seq_len=128, n_tasks=0, chat_data=src)
+    built = build_sft_corpus(tmp_path / "a.bin", 3, seq_len=128, chat_data=src)
     assert built["chat_files"] == {str(src): 2}
     assert built["chat_loaded"] == 2 and built["chat_used"] == 2
 
     bad = tmp_path / "bad.qa"
     bad.write_text("A: answer first?\n", encoding="utf-8")
     with pytest.raises(LoudError, match=r"bad\.qa:1"):
-        build_sft_corpus(tmp_path / "b.bin", 3, seq_len=128, n_tasks=0, chat_data=bad)
+        build_sft_corpus(tmp_path / "b.bin", 3, seq_len=128, chat_data=bad)
     bad.write_text("Q: q1\nQ: q2\nA: a\n", encoding="utf-8")
     with pytest.raises(LoudError, match="before the question"):
-        build_sft_corpus(tmp_path / "b.bin", 3, seq_len=128, n_tasks=0, chat_data=bad)
+        build_sft_corpus(tmp_path / "b.bin", 3, seq_len=128, chat_data=bad)
     bad.write_text("Q: unfinished question\n", encoding="utf-8")
     with pytest.raises(LoudError, match="never got"):
-        build_sft_corpus(tmp_path / "b.bin", 3, seq_len=128, n_tasks=0, chat_data=bad)
+        build_sft_corpus(tmp_path / "b.bin", 3, seq_len=128, chat_data=bad)
 
 
 def test_chat_cap_is_per_file_so_small_files_stay_whole(tmp_path):
@@ -731,12 +729,8 @@ def test_chat_cap_is_per_file_so_small_files_stay_whole(tmp_path):
     small = tmp_path / "small.qa"
     small.write_text("Q: mine\nA: kept\n", encoding="utf-8")
 
-    a = build_sft_corpus(
-        tmp_path / "a.bin", 11, seq_len=64, n_tasks=0, chat_data=[big, small], chat_cap=2
-    )
-    build_sft_corpus(
-        tmp_path / "b.bin", 11, seq_len=64, n_tasks=0, chat_data=[big, small], chat_cap=2
-    )
+    a = build_sft_corpus(tmp_path / "a.bin", 11, seq_len=64, chat_data=[big, small], chat_cap=2)
+    build_sft_corpus(tmp_path / "b.bin", 11, seq_len=64, chat_data=[big, small], chat_cap=2)
     assert (tmp_path / "a.bin").read_bytes() == (tmp_path / "b.bin").read_bytes()
     assert a["chat_fit"] == 6 and a["chat_used"] == 3  # 2 sampled from big + the whole small
     assert a["chat_files"] == {str(big): 5, str(small): 1}
@@ -746,54 +740,52 @@ def test_holdout_moves_the_tail_to_a_sibling(tmp_path):
     """`holdout=N` splits the LAST N records into `<name>.holdout` (the same
     fixed record size), so the training stream never reads them and the eval
     stream reads nothing else. Deterministic like the rest of the build."""
-    a = build_sft_corpus(tmp_path / "a.bin", 5, seq_len=64, n_tasks=0, holdout=7)
-    build_sft_corpus(tmp_path / "b.bin", 5, seq_len=64, n_tasks=0, holdout=7)
+    a = build_sft_corpus(tmp_path / "a.bin", 5, seq_len=64, holdout=7)
+    build_sft_corpus(tmp_path / "b.bin", 5, seq_len=64, holdout=7)
     hold = tmp_path / "a.bin.holdout"
     assert hold.is_file()
     assert hold.read_bytes() == (tmp_path / "b.bin.holdout").read_bytes()
     assert a["holdout"] == 7 and a["records"] > 7
     assert len(hold.read_bytes()) == 7 * a["record_bytes"]
     with pytest.raises(LoudError, match="holdout"):
-        build_sft_corpus(tmp_path / "c.bin", 5, seq_len=64, n_tasks=0, holdout=10_000)
+        build_sft_corpus(tmp_path / "c.bin", 5, seq_len=64, holdout=10_000)
 
 
-def _corpus_instructions(path: Path, record_bytes: int) -> set[bytes]:
-    """The instruction text of every record (markers and the render newline out)."""
-    out = set()
+def _corpus_pairs(path: Path, record_bytes: int) -> list[tuple[bytes, bytes]]:
+    """Every record as `(instruction, answer)`, markers and the render newline out."""
+    out = []
     raw = path.read_bytes()
     for off in range(0, len(raw), record_bytes):
         rec = raw[off : off + record_bytes]
         assert rec[0] == USER, rec[:8]
         a = rec.index(ASSIST)
-        out.add(rec[1 : a - 1])  # render: USER + instruction + b"\n" + ASSIST
+        e = rec.index(END)
+        assert a < e
+        out.append((rec[1 : a - 1], rec[a + 1 : e]))  # render: USER + instr + \n + ASSIST
     return out
 
 
-def test_the_sft_corpus_and_the_rl_task_set_are_disjoint(tmp_path: Path):
-    """C2 gate: one seed, two disjoint ranges of the generator's index space.
+def test_the_sft_corpus_shares_no_solution_with_the_verifier(tmp_path: Path):
+    """M1 gate: the ANSWER strings, not just the ids, are disjoint.
 
-    The RL/bench lane draws `build_tasks` indices `0..n-1`; the SFT corpus
-    draws `[SFT_TASK_OFFSET, ...)`. `post/tasks.py` repeats its code
-    signature+docstring prompt by `i % 3` kind, so the corpus instruction also
-    carries the task's own verifier calls — an index offset alone would leave
-    the RL prompt string in the corpus. This is the observable property;
-    `cli.rl_cmd`'s `rl_tasks <= SFT_TASK_OFFSET` refusal is the code guarantee.
+    Round 1 measured that the index offset made the task ids and instructions
+    disjoint and left the code solutions identical, because `post/tasks.py`
+    derives one solution per `i % 3` kind. This gate reads the answers out of
+    every corpus record and compares them with every solution the RL/bench
+    verifier can draw at the same seed; the corpus must also be non-empty, so
+    "drop everything" cannot pass it.
     """
     seed = 1
     path = tmp_path / "sft.bin"
-    report = build_sft_corpus(path, seed, seq_len=512, n_tasks=32)
-    instructions = _corpus_instructions(path, report["record_bytes"])
-
-    sft_code = _sft_tasks("code", seed, 32)
-    sft_math = _sft_tasks("math", seed, 32)
-    assert sft_code[0].tid == "code-1-10000"  # the offset is the range, not a promise
-    for cls, sft_tasks in (("code", sft_code), ("math", sft_math)):
-        rl_tasks = build_tasks(cls, seed, n=8)
-        # The same (seed, n) is a stable task set across calls.
-        assert rl_tasks == build_tasks(cls, seed, n=8)
-        assert {t.tid for t in rl_tasks}.isdisjoint({t.tid for t in sft_tasks})
-        for task in rl_tasks:
-            assert task.prompt.rstrip("\n").encode() not in instructions, task.tid
+    report = build_sft_corpus(path, seed, seq_len=512)
+    pairs = _corpus_pairs(path, report["record_bytes"])
+    answers = {answer.strip() for _instruction, answer in pairs}
+    assert answers, "the SFT corpus is empty"
+    scored: set[str] = set()
+    for cls in ("code", "math"):
+        scored |= {task.solution.strip() for task in build_tasks(cls, seed, n=64)}
+    assert scored, "the verifier's solution set is empty"
+    assert answers.isdisjoint(scored), sorted(answers & scored)
 
 
 def test_sft_eval_reports_first_byte_agreement(tmp_path):
@@ -801,7 +793,7 @@ def test_sft_eval_reports_first_byte_agreement(tmp_path):
     holdout file and lands in the log — the metric that catches a model which
     only predicts answer marginals (the sft5 failure)."""
     corpus = tmp_path / "sft.bin"
-    built = build_sft_corpus(corpus, seed=1, seq_len=SEQ, n_tasks=32, holdout=4)
+    built = build_sft_corpus(corpus, seed=1, seq_len=SEQ, holdout=4)
     hold = tmp_path / "sft.bin.holdout"
     run = sft_run(
         tmp_path,
@@ -831,7 +823,7 @@ def test_two_sft_evals_on_one_checkpoint_score_the_same_window(tmp_path: Path):
     the weights (the defect `train/loop.py` fixed on 2026-09-27).
     """
     corpus = tmp_path / "sft.bin"
-    build_sft_corpus(corpus, seed=1, seq_len=SEQ, n_tasks=0, holdout=4)
+    build_sft_corpus(corpus, seed=1, seq_len=SEQ, holdout=4)
     run = sft_run(tmp_path, corpus=corpus, eval_batches=2)
     eval_stream = ByteStream(tmp_path / "sft.bin.holdout", BATCH, SEQ)
     model = DormouseModel(run.model)
@@ -850,7 +842,7 @@ def test_the_logged_sft_byte_count_is_the_host_mask_count(tmp_path: Path):
     must not move between two identical runs.
     """
     corpus = tmp_path / "sft.bin"
-    build_sft_corpus(corpus, seed=3, seq_len=SEQ, n_tasks=0)
+    build_sft_corpus(corpus, seed=3, seq_len=SEQ)
     stream = ByteStream(corpus, BATCH, SEQ)
     x, _y = stream.next_batch()
     expected = int(sft_mask(x).sum())

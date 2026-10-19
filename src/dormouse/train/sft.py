@@ -13,10 +13,12 @@ template, and a loop whose cross-entropy counts only the answer's bytes.
 `0x01` opens the user turn, `0x02` the assistant turn, `0x03` closes the answer,
 `0x00` pads the record to the window. Every byte of every instruction and answer
 is asserted marker-free at render time ([`render`]) — and the assert can only
-pass because the sources are generated text (the seeded tasks of `post/tasks.py`,
-the hand-written `GENERIC_QA`, the generated `_ru_pairs` bank, and the distill
-JSONL rows, which are pre-filtered for sentinels and for one-window fits before
-they enter the build), never arbitrary user bytes. `0x03` and
+pass because the sources are selected text (the hand-written `GENERIC_QA`, the
+generated `_ru_pairs` bank, and the distill JSONL rows, which are pre-filtered
+for sentinels and for one-window fits before
+they enter the build), never arbitrary user bytes. `post/tasks.py` is NOT a
+source: its answers are the verifier's reward set (see the comment above
+`GENERIC_QA`). `0x03` and
 `0x00` exist because a fixed-size window needs an answer END: without them the
 only way to keep a window single-example is to train on padding.
 
@@ -74,7 +76,6 @@ from ..config import RunConfig, TrainConfig
 from ..instrument import Counters, LoudError, StepTimer, loud
 from ..model.engram import Engram, enable_host_tables, host_engrams, host_step_all
 from ..model.experts import invalidate_banks_all
-from ..post.tasks import build_tasks
 from .data import ByteStream, warmup_steps
 from .loop import kda_field, load_ckpt, load_model_state, save_ckpt, unpack_state_dict
 from .lr import wsd_lr
@@ -89,14 +90,13 @@ END = 0x03
 PAD = 0x00
 SENTINELS = (USER, ASSIST, END, PAD)
 
-#: The generator's index range the RL/bench lane owns: `build_tasks(cls, seed,
-#: n=...)` returns indices `0..n-1` (`post/rl_train.py` uses the run's
-#: `rl_tasks`; `cli.run`'s stage 2 uses 8). The SFT corpus draws from
-#: `[SFT_TASK_OFFSET, SFT_TASK_OFFSET + n_tasks)` instead, and `cli.rl_cmd`
-#: refuses an `rl_tasks` that reaches this offset — so under one seed the two
-#: sets cannot share a task instance (audit C2). The range check is code, not
-#: convention; `tests/test_sft.py` pins the disjointness.
-SFT_TASK_OFFSET = 10_000
+#: The corpus has NO `post.tasks` pairs. That generator is the RL/bench reward
+#: set, and its code variant derives ONE solution per `i % 3` kind: any slice of
+#: its index range therefore teaches answer strings the verifier scores (the
+#: review's M1, the round-0 CRITICAL's other half). An offset makes the ids and
+#: prompts disjoint and leaves the answers identical; the only root fix is not
+#: to put them in the corpus. Code/math instruction data must come from a source
+#: the verifier never scores (a hand-written corpus, `--chat-data`).
 
 #: The generic half of the corpus: the model has to learn the FORMAT, not just
 #: code. Hand-written, both languages the corpus speaks, answers kept short so
@@ -436,48 +436,15 @@ def render(instruction: str, answer: str) -> bytes:
     )
 
 
-def _sft_tasks(cls: str, seed: int, n_tasks: int) -> list:
-    """The SFT slice of the generator's index space: `[OFFSET, OFFSET+n)`.
+def _examples(chat: list[tuple[str, str]] | None = None) -> list[tuple[str, str]]:
+    """The pairs: generic QA + the RU bank + chat rows, and nothing scored.
 
-    The RL/bench lane draws `0..n-1` from the same `(cls, seed)`, so an index
-    offset is the disjointness proof (audit C2). `n_tasks == 0` short-circuits
-    the generator: a chat-only corpus must not build 10 000 unused tasks.
+    `post.tasks.build_tasks` is the RL/bench reward set; its answer strings are
+    the solutions the verifier scores, so no pair from it may enter the corpus
+    (see the module comment above `GENERIC_QA`). The seed still orders the
+    corpus below; it no longer selects generated tasks.
     """
-    if n_tasks < 0:
-        loud(f"SFT corpus n_tasks={n_tasks}: a task count cannot be negative")
-    if n_tasks == 0:
-        return []
-    return build_tasks(cls, seed, n=SFT_TASK_OFFSET + n_tasks)[SFT_TASK_OFFSET:]
-
-
-def _code_instruction(task) -> str:
-    """The task's prompt PLUS its own verifier calls.
-
-    `post/tasks.py` emits ONE signature+docstring prompt per `i % 3` kind — the
-    text does not vary with the index — so an index-disjoint SFT slice would
-    still contain the exact prompt string the RL lane scores. The verifier's
-    calls are the task's own random draw, so printing them makes the SFT
-    instruction an instance of the kind rather than a copy of the prompt
-    template (the answer is still the reference implementation, which is what
-    SFT is for).
-    """
-    examples = "; ".join(f"{call} == {value}" for call, value in task.tests)
-    return f"{task.prompt.rstrip()}\n# examples: {examples}"
-
-
-def _examples(
-    seed: int, n_tasks: int, chat: list[tuple[str, str]] | None = None
-) -> list[tuple[str, str]]:
-    """The pairs: generic QA + the RU bank + seeded tasks (REUSED) + chat rows."""
     out = list(GENERIC_QA) + _ru_pairs()
-    for task in _sft_tasks("code", seed, n_tasks):
-        # The code prompt is the instruction (signature + docstring) plus the
-        # task's examples; the hidden reference implementation is the answer.
-        out.append((_code_instruction(task), task.solution.rstrip("\n")))
-    for task in _sft_tasks("math", seed, n_tasks):
-        # The math prompt asks for a final `answer: <value>` line, so the answer
-        # teaches that format too (it is what `verifiers._final_answer` reads).
-        out.append((task.prompt, f"answer: {task.solution}"))
     if chat:
         out.extend(chat)
     return out
@@ -488,14 +455,13 @@ def build_sft_corpus(
     seed: int,
     *,
     seq_len: int,
-    n_tasks: int = 32,
     chat_data: str | Path | list[str | Path] | None = None,
     chat_cap: int | None = None,
     holdout: int = 0,
 ) -> dict:
     """Write the instruction corpus: fixed `seq_len + 1`-byte records, deterministic.
 
-    A pure function of `(seed, seq_len, n_tasks, chat_data, chat_cap)`: the same
+    A pure function of `(seed, seq_len, chat_data, chat_cap)`: the same
     arguments produce the same bytes in any process (the shuffles are
     `random.Random(seed)` / `Random(seed + 1)`), which is what makes an SFT run
     replayable (ADR-0021's determinism discipline).
@@ -515,8 +481,6 @@ def build_sft_corpus(
     """
     if seq_len < 8:
         loud(f"build_sft_corpus seq_len={seq_len}: a window must hold a marker pair")
-    if n_tasks < 0:
-        loud(f"build_sft_corpus n_tasks={n_tasks}: a task count cannot be negative")
     if chat_cap is not None and chat_cap < 0:
         loud(f"build_sft_corpus chat_cap={chat_cap}: a cap cannot be negative")
     chat: list[tuple[str, str]] = []
@@ -532,7 +496,7 @@ def build_sft_corpus(
         chat_stats.update(dropped)
         chat_stats["chat_loaded"] = dropped.get("chat_fit", len(chat))
         chat_stats["chat_used"] = len(chat)
-    examples = _examples(seed, n_tasks, chat)
+    examples = _examples(chat)
     random.Random(seed).shuffle(examples)
     record = seq_len + 1
     records: list[bytes] = []
@@ -574,7 +538,6 @@ def build_sft_corpus(
         "bytes": record * len(records),
         "seq_len": seq_len,
         "seed": seed,
-        "n_tasks": n_tasks,
         "holdout": held,
         **chat_stats,
     }
