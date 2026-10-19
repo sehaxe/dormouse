@@ -1,0 +1,439 @@
+---
+// The demo page: the `small` polygon running in the reader's browser.
+//
+// Hand-written, like the landing page, and in the same design language: the
+// tokens come from `src/styles/landing.css` (imported, not copied) — cream
+// canvas, ink, hairlines, `[+]` bullets, one dark surface (the status card),
+// no shadows, no rounded corners. The engine is loaded as a plain ES module
+// (`/demo/engine.js`, no bundler), and the model is a `.dormouse` artifact the
+// page FETCHES — it is not committed (16.3 MB, over the 8 MB rule), so the page
+// has to degrade with a message that names the command that makes it.
+import Topbar from './Topbar.astro';
+import { COPY, type Lang } from '../i18n/demo';
+import '../styles/landing.css';
+
+interface Props {
+	lang?: Lang;
+}
+const { lang = 'en' } = Astro.props;
+const c = COPY[lang];
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+const at = (path) => `${base}${path}`;
+const repo = 'https://github.com/sehaxe/dormouse';
+---
+
+<!doctype html>
+<html lang={lang}>
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<meta name="color-scheme" content="light dark" />
+		<title>{c.title}</title>
+		<meta name="description" content={c.description} />
+		{/* The social card, the same one the landing carries: the demo page had no
+		    og tags at all, so a shared link previewed as a bare title. */}
+		<link rel="alternate" hreflang={lang === 'en' ? 'ru' : 'en'} href={lang === 'en' ? at('/ru/demo/') : at('/demo/')} />
+		<meta property="og:type" content="website" />
+		<meta property="og:site_name" content="dormouse" />
+		<meta property="og:title" content={c.title} />
+		<meta property="og:description" content={c.description} />
+		<meta property="og:image" content="https://sehaxe.github.io/dormouse/og.png" />
+		<meta property="og:image:width" content="1200" />
+		<meta property="og:image:height" content="630" />
+		<meta property="og:url" content={lang === 'en' ? 'https://sehaxe.github.io/dormouse/demo/' : 'https://sehaxe.github.io/dormouse/ru/demo/'} />
+		<meta property="og:locale" content={lang === 'en' ? 'en_US' : 'ru_RU'} />
+		<meta name="twitter:card" content="summary_large_image" />
+		<meta name="twitter:image" content="https://sehaxe.github.io/dormouse/og.png" />		<link rel="icon" href={at('/favicon.svg')} type="image/svg+xml" />
+	</head>
+	<body>
+		<Topbar current="demo" lang={lang} page="demo" />
+
+		<main>
+			<header class="wrap hero">
+				<h1>{c.h1}</h1>
+				<p class="tagline" set:html={c.tagline} />
+			</header>
+
+			<section class="wrap section">
+				<h2>{c.engineHeading}</h2>
+				<dl class="tech">
+					{c.engineRows.map((r) => (
+						<div class="tech-row">
+							<dt>{r.dt}</dt>
+							<dd set:html={r.dd} />
+						</div>
+					))}
+				</dl>
+				<p class="section-note" set:html={c.verified} />
+			</section>
+
+			<section class="wrap section">
+				<h2>{c.runHeading}</h2>
+				<div id="demo-root" data-engine={at('/demo/engine.js')} data-model={at('/demo/model.dormouse')}>
+					<div class="terminal">
+						<div class="term-bar">
+							<span>{c.termBarLeft}</span>
+							<span id="status-right">model.dormouse</span>
+						</div>
+						<pre class="term-body" id="status" aria-live="polite">{c.statusLoading}</pre>
+						<div class="progress" id="progress" hidden>
+							<div class="progress-fill" id="progress-fill"></div>
+						</div>
+					</div>
+
+					<div class="controls">
+						<label class="field">
+							<span>{c.promptLabel}</span>
+							<textarea id="prompt" rows="4" spellcheck="false">{c.promptDefault}</textarea>
+						</label>
+						<div class="knobs">
+							<label class="field knob">
+								<span>{c.bytesLabel}</span>
+								<input id="n" type="number" min="1" max="512" value="48" />
+							</label>
+							<label class="field knob">
+								<span>{c.tempLabel}</span>
+								<input id="temp" type="number" min="0" max="2" step="0.05" value="0.8" />
+							</label>
+							<button id="go" type="button" disabled>{c.generate}</button>
+							<button id="stop" type="button" disabled>{c.stop}</button>
+						</div>
+						<p class="section-note" id="speed" set:html={c.greedyNote} />
+					</div>
+
+					<div class="out">
+						<div class="out-bar">
+							<span>{c.outLabel}</span>
+							<span id="out-stat">—</span>
+						</div>
+						<pre id="out" aria-live="polite"></pre>
+					</div>
+				</div>
+			</section>
+
+			<section class="wrap section">
+				<h2>{c.notHeading}</h2>
+				<ul class="register" id="honest">
+					{c.notRows.map((r, i) => (
+						<li class={i === 0 ? 'admitted' : undefined}>
+							<span class="name">{r.name}</span>
+							<span class="delta">{r.delta}</span>
+						</li>
+					))}
+				</ul>
+				<p class="prose" set:html={c.notProse} />
+				<p class="section-note" set:html={c.notNote.replace('{status}', at('/start-here/status/'))} />
+			</section>
+		</main>
+
+		<footer class="footer wrap">
+			<span>{c.footerNote}</span>
+			<span class="footer-links">
+				<a href={at('/start-here/what-is-this/')}>{c.docs}</a>
+				<a href={at('/start-here/status/')}>{c.status}</a>
+				<a href={repo}>GitHub</a>
+			</span>
+		</footer>
+
+		<script is:inline>
+			(() => {
+				const root = document.getElementById('demo-root');
+				const engineUrl = root.dataset.engine;
+				const modelUrl = root.dataset.model;
+				const $ = (id) => document.getElementById(id);
+				const status = $('status');
+				const out = $('out');
+				const outStat = $('out-stat');
+				const progress = $('progress');
+				const progressFill = $('progress-fill');
+				const go = $('go');
+				const stop = $('stop');
+				let engine = null;
+				let running = false;
+				let stopped = false;
+
+				const say = (text) => {
+					status.textContent = text;
+				};
+
+				// A byte-exact view of the output: printable ASCII passes through,
+				// everything else is named as \xNN rather than silently dropped.
+				const render = (bytes) =>
+					bytes
+						.map((b) => {
+							if (b === 10) return '\n';
+							if (b >= 32 && b < 127) return String.fromCharCode(b);
+							return '\\x' + b.toString(16).padStart(2, '0');
+						})
+						.join('');
+
+				// 1024-based, and labelled as such: the README quotes the same
+				// artifact in decimal MB (16.3), and a page that says "15.5 MB" of a
+				// 16.3 MB file is a unit disagreement, not a measurement.
+				const fmtBytes = (n) => {
+					if (!n) return '0 B';
+					if (n < 1024) return n + ' B';
+					if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KiB';
+					return (n / (1024 * 1024)).toFixed(2) + ' MiB';
+				};
+
+				import(engineUrl)
+					.then((mod) => {
+						say(`fetching ${modelUrl} …`);
+						progress.hidden = false;
+						return mod.Engine.load(modelUrl, {
+							onProgress: (got, total) => {
+								const pct = total ? Math.round((100 * got) / total) : null;
+								progressFill.style.width = pct === null ? '100%' : pct + '%';
+								say(
+									`fetching ${modelUrl} — ${fmtBytes(got)}` +
+										(pct === null ? '' : ` of ${fmtBytes(total)} (${pct}%)`),
+								);
+							},
+						});
+					})
+					.then((eng) => {
+						engine = eng;
+						const W = eng.W;
+						progress.hidden = true;
+						const st = eng.stats;
+						say(
+							`ready — ${W.cfg.d_model}-wide, ${W.H} heads, ${W.T} iterations, ` +
+								`${W.E} experts + 1 shared (rank ${W.cfg.shared_rank}), ` +
+								`Engram ${W.orders.join('/')} × ${W.slots} rows\n` +
+								`artifact ${fmtBytes(st.bytes)} · dense ${st.denseDtype} · table ${st.engramDtype} · ` +
+								`${st.ternaryFactors} ternary factor matrices${st.commit ? ' · commit ' + st.commit : ''}\n` +
+								`${st.preset ? st.preset + ' preset · ' : ''}fp32 engine · ${(W.H * W.hd * W.hd * 4) / 1024} KB of KDA state per iteration slot`,
+						);
+						$('status-right').textContent = `${fmtBytes(st.bytes)} · fp32`;
+						go.disabled = false;
+						if (st.engramDtype === 'fp32' && st.bytes > 20 * 1024 * 1024) {
+							// COUNTED, not silent: the table's rung is the page's largest knob.
+							say(
+								status.textContent +
+									'\nnote: this artifact stores the Engram table at fp32 — ' +
+									'`--engram-dtype fp16` is 6.3 MB smaller and is what the demo ships with.',
+							);
+						}
+					})
+					.catch((err) => {
+						progress.hidden = true;
+						say(
+							`the model is not there: ${err.message}\n\n` +
+								'This page fetches a generated artifact and it is not committed ' +
+								'(16.3 MB, over the 8 MB rule). Build one from a trained checkpoint:\n\n' +
+								'  uv run dormouse export small --ckpt-name <name> --out-dir checkpoints \\\n' +
+								'    --engram-dtype fp16 --out docs-site/public/demo/model.dormouse --verify\n\n' +
+								'See docs-site/public/demo/README.md.',
+						);
+						out.textContent = '';
+						outStat.textContent = 'no model';
+					});
+
+				go.addEventListener('click', async () => {
+					if (!engine || running) return;
+					running = true;
+					stopped = false;
+					go.disabled = true;
+					stop.disabled = false;
+					engine.reset();
+					const prompt = new TextEncoder().encode($('prompt').value);
+					if (prompt.length === 0) {
+						say('the prompt is empty: the first window IS the prompt (model.decode\'s rule)');
+						running = false;
+						go.disabled = false;
+						stop.disabled = true;
+						return;
+					}
+					const n = Math.max(1, Math.min(512, Number($('n').value) || 1));
+					const temp = Number($('temp').value);
+					const produced = [];
+					out.textContent = '';
+					let t0 = null;
+					let last = null;
+					try {
+						await engine.generate(prompt, n, {
+							temp,
+							shouldStop: () => stopped,
+							onPrefill: (i, total) => {
+								outStat.textContent = `prefill ${i}/${total} bytes`;
+							},
+							onByte: (byte, i) => {
+								produced.push(byte);
+								out.textContent = render(produced);
+								const now = performance.now();
+								if (t0 === null) {
+									t0 = now;
+									last = now;
+								}
+								if (i % 4 === 0) {
+									const per = (now - last) / Math.min(4, i + 1);
+									last = now;
+									outStat.textContent =
+										`${produced.length}/${n} bytes · ${(1000 / per).toFixed(1)} B/s · ` +
+										`${per.toFixed(0)} ms/byte`;
+								}
+							},
+						});
+						const dt = (performance.now() - t0) / 1000;
+						outStat.textContent =
+							`${produced.length} bytes in ${dt.toFixed(1)} s · ` +
+							`${(produced.length / dt).toFixed(1)} B/s · ${((1000 * dt) / produced.length).toFixed(0)} ms/byte`;
+					} catch (err) {
+						say(status.textContent + `\ngeneration stopped: ${err.message}`);
+					} finally {
+						running = false;
+						go.disabled = false;
+						stop.disabled = true;
+					}
+				});
+
+				stop.addEventListener('click', () => {
+					// The loop yields between bytes and checks this flag, so there is
+					// no worker to kill: the current byte finishes, then it stops.
+					stopped = true;
+					stop.disabled = true;
+				});
+			})();
+		</script>
+	</body>
+</html>
+
+<style>
+	/* Only what the landing page's language does not already define: the
+	   controls, the progress bar and the output pane. Every token is
+	   landing.css's (`--ink`, `--hairline`, `--surface-dark`, `--mono`). */
+
+	code {
+		font-family: var(--mono);
+		color: var(--ink);
+	}
+
+	.controls {
+		margin-top: 24px;
+	}
+
+	.field {
+		display: block;
+		margin: 0 0 12px;
+	}
+
+	.field > span {
+		display: block;
+		margin-bottom: 4px;
+		color: var(--mute);
+		font-size: 13px;
+	}
+
+	textarea,
+	input[type='number'] {
+		width: 100%;
+		padding: 10px 12px;
+		border: 1px solid var(--hairline);
+		border-radius: 0;
+		background: var(--canvas);
+		color: var(--ink);
+		font-family: var(--mono);
+		font-size: 14px;
+		line-height: 1.6;
+		resize: vertical;
+	}
+
+	textarea:focus-visible,
+	input[type='number']:focus-visible,
+	button:focus-visible {
+		outline: 1px solid var(--ink);
+		outline-offset: 2px;
+	}
+
+	.knobs {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: flex-end;
+		gap: 16px;
+	}
+
+	.knob {
+		margin: 0;
+		width: 120px;
+	}
+
+	button {
+		padding: 10px 20px;
+		border: 1px solid var(--ink);
+		border-radius: 0;
+		background: var(--canvas);
+		color: var(--ink);
+		font-family: var(--mono);
+		font-size: 14px;
+		cursor: pointer;
+		transition: background 120ms linear, color 120ms linear;
+	}
+
+	button:hover:not(:disabled) {
+		background: var(--ink);
+		color: var(--canvas);
+	}
+
+	button:disabled {
+		border-color: var(--hairline);
+		color: var(--ash);
+		cursor: default;
+	}
+
+	.progress {
+		height: 3px;
+		background: var(--surface-dark-elevated);
+	}
+
+	.progress-fill {
+		height: 100%;
+		width: 0;
+		background: var(--on-dark);
+		transition: width 120ms linear;
+	}
+
+	.out {
+		margin-top: 24px;
+		border: 1px solid var(--hairline);
+	}
+
+	.out-bar {
+		display: flex;
+		justify-content: space-between;
+		gap: 16px;
+		padding: 8px 16px;
+		border-bottom: 1px solid var(--hairline);
+		color: var(--mute);
+		font-size: 13px;
+	}
+
+	.out pre {
+		margin: 0;
+		padding: 16px;
+		min-height: 96px;
+		max-height: 360px;
+		overflow: auto;
+		color: var(--ink);
+		font-family: var(--mono);
+		font-size: 14px;
+		line-height: 1.7;
+		white-space: pre-wrap;
+		overflow-wrap: anywhere;
+	}
+
+	#honest .name::before {
+		content: '[-] ';
+	}
+
+	#honest .admitted .name::before {
+		content: '[+] ';
+	}
+
+	@media (prefers-reduced-motion: reduce) {
+		button,
+		.progress-fill {
+			transition: none;
+		}
+	}
+</style>

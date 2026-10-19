@@ -16,14 +16,25 @@ const { repo } = manifest;
 interface Props {
 	current?: 'docs' | 'status' | 'demo';
 	lang?: 'en' | 'ru';
+	/** Which page kind the language switch mirrors: the landing, or the demo. */
+	page?: 'landing' | 'demo';
 }
 
-const { current, lang = 'en' } = Astro.props;
+const { current, lang = 'en', page = 'landing' } = Astro.props;
 const base = import.meta.env.BASE_URL.replace(/\/$/, '');
 const at = (path: string) => `${base}${path}`;
-// The docs are English-only; a Russian reader gets the Russian LANDING back, not
-// a Russian page that does not exist. The demo page is English-only too.
-const other = lang === 'en' ? at('/ru/') : at('/');
+// The switch mirrors the PAGE the reader is on, not just the language: the
+// landing's [ru] goes to the Russian landing, the demo's [ru] to the Russian
+// demo. The docs are English-only, so a docs page (which uses Starlight's own
+// header, not this one) has no switch to mirror.
+const other =
+	page === 'demo'
+		? lang === 'en'
+			? at('/ru/demo/')
+			: at('/demo/')
+		: lang === 'en'
+			? at('/ru/')
+			: at('/');
 const langLabel = lang === 'en' ? 'ru' : 'en';
 const langTitle = lang === 'en' ? 'Русская версия' : 'English version';
 
