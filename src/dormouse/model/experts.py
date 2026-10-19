@@ -385,9 +385,13 @@ class SparseMoE(nn.Module):
         self.register_buffer(
             "lfb_bias", torch.zeros(cfg.n_experts, device=device), persistent=False
         )
-        # The cumulative routed-count integrator the bias reads (persistent:
-        # a resume must keep its controller state or the rebalancer restarts
-        # its memory of where the load went).
+        # The cumulative routed-count working set the bias reads: the sign
+        # rule integrates it over the steps since the last load. Persistent so
+        # a checkpoint still carries the counter, but `train.loop._restore_lfb`
+        # ZEROES it on every load — the bias, restored from the sidecar, is the
+        # controller state a resume continues; the counts are not. Keeping a
+        # whole-run history here (mix1: 11.8e9 at step 80k) would make the next
+        # update diff against the run's entire past and freeze the controller.
         self.register_buffer(
             "lfb_counts", torch.zeros(cfg.n_experts, device=device), persistent=True
         )

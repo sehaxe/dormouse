@@ -119,13 +119,27 @@ def _restore_lfb(
     * a TRAINING RESUME (`resume=True`) with the controller live
       (`moe_lb_coef > 0`) is LOUD: the next optimizer step would integrate from
       a zero bias under the checkpoint's own step count — a different network.
-      The escape is the sidecar, or an explicit `moe_lb_coef=0` (the
-      controller is off, so the bias steers nothing);
+      The escape is the sidecar, or an explicit `moe_lb_coef=0` (the controller
+      never MOVES the bias again);
     * every reader — eval/decode/serve/export/bench, an SFT/RL `--init-from`,
       and a resume with `moe_lb_coef == 0` — loads with the controller zeroed
       and a COUNTED `lfb: no sidecar, controller zeroed` line. There is no
       objective to continue, and a LOUD here would brick every pre-sidecar
       artifact for every reader (the failure this scoping fixes).
+
+    `moe_lb_coef=0` is a break-glass, not a no-op: `SparseMoE.forward` adds
+    `lfb_bias` to the logits UNCONDITIONALLY (`model/experts.py`), so a
+    pre-sidecar checkpoint whose stored run had moved the bias resumes with a
+    different routing than the one it was saved in. The COUNTED line says so.
+
+    `lfb_counts` is reset here for every load. It is the sign rule's working
+    set, not controller state: the bias is the integral a resume continues.
+    `load_state_dict` restores the persistent counts too, and keeping them
+    would make the first post-load update diff against the WHOLE run (mix1
+    carries 11.8e9 accumulated counts at step 80k) instead of the steps since
+    the load — the controller's time constant would grow with the run and
+    freeze. Resetting is consistent with the restored bias: the bias survives,
+    the counts restart at zero.
 
     A sidecar naming a buffer this model does not have, or a shape mismatch,
     is LOUD: silently dropping controller state is the class this sidecar fixes.
@@ -134,6 +148,9 @@ def _restore_lfb(
     buffers = dict(model.named_buffers())
     if not any(name.rpartition(".")[2] == "lfb_bias" for name in buffers):
         return  # no LFB in this model: nothing to restore, nothing to report
+    for name, buf in buffers.items():
+        if name.rpartition(".")[2] == "lfb_counts":
+            buf.zero_()
     if not path.is_file():
         coef = float(getattr(getattr(model, "cfg", None), "moe_lb_coef", 0.0))
         if coef > 0 and resume:
@@ -145,7 +162,10 @@ def _restore_lfb(
                 f"Escape: restore the `{path.name}` sibling, or resume with "
                 f"moe_lb_coef=0 if the controller is meant to be off."
             )
-        log(f"lfb: no sidecar, controller zeroed ({path}, moe_lb_coef={coef})")
+        log(
+            f"lfb: no sidecar, controller zeroed — routing differs from the stored "
+            f"step ({path}, moe_lb_coef={coef})"
+        )
         return
 
     state = torch.load(path, map_location="cpu", weights_only=True)
@@ -420,10 +440,12 @@ def load_ckpt(run: RunConfig) -> tuple[dict, RunConfig]:
     stored = RunConfig.from_snapshot(snapshot.read_text())
     drift = run.diff_keys(stored)
     # The controller-off escape (`_restore_lfb`): a pre-sidecar checkpoint has
-    # no bias to restore, and `moe_lb_coef=0` is the documented way to continue
-    # it — the controller steers nothing, so a zero bias is the same function.
-    # Only that one key, only to 0, and only when the sidecar really is absent;
-    # every other model/train change is still refused.
+    # no bias to restore, and `moe_lb_coef=0` is the documented break-glass —
+    # the controller never moves the bias again. It is NOT "the same function":
+    # `SparseMoE.forward` adds a stored nonzero bias unconditionally, but a
+    # missing sidecar loads a zero one, so routing differs from the stored step
+    # (the COUNTED line says so). Only that one key, only to 0, and only when
+    # the sidecar really is absent; every other model/train change is refused.
     if run.model.moe_lb_coef == 0 and not lfb_path(run.train).is_file():
         drift = [k for k in drift if k != "model.moe_lb_coef"]
     if drift:

@@ -848,8 +848,11 @@ def sft_train(
         ck, _stored = load_ckpt(run)
         # The same ONE loader as the init path (and as `train()`'s resume): a
         # host-table run's model half has no `engram.tables`, and `load_ckpt`
-        # already refused a missing `.ngram` (`require_ngram`).
-        load_model_state(model, cfg, ck["model"])
+        # already refused a missing `.ngram` (`require_ngram`). `resume=True`
+        # is load-bearing: a pre-sidecar checkpoint with `moe_lb_coef > 0` must
+        # be LOUD here too, not only in `train()` (review round 3 R3-3). The
+        # lane's `log` carries the COUNTED line on the controller-off escape.
+        load_model_state(model, cfg, ck["model"], log=log, resume=True)
         opt.load_state_dict(ck["opt"])
         start = int(ck["step"]) + 1
         if start:

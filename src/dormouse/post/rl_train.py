@@ -191,7 +191,11 @@ def rl_train(
         log(f"rl init: weights from {path} (step {foreign.get('step', '?')}), fresh optimizer")
     if resume:
         ck, _stored = load_ckpt(run)
-        load_model_state(model, cfg, ck["model"])
+        # `resume=True`: an RL training resume is the same case as `train()`'s
+        # and SFT's — a pre-sidecar checkpoint with the LFB controller on is
+        # LOUD, never COUNTED (review round 3 R3-3). `log` carries the
+        # controller-off escape's COUNTED line into the run's log.
+        load_model_state(model, cfg, ck["model"], log=log, resume=True)
         opt.load_state_dict(ck["opt"])
         start = int(ck["step"]) + 1
         log(f"rl resume: step={start} opt_steps={opt.steps}")
