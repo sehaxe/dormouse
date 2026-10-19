@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import os
 from pathlib import Path
 from typing import Annotated
 
@@ -251,6 +252,20 @@ def train_cmd(
     steps: Annotated[int | None, typer.Option] = None,
     lr: Annotated[float | None, typer.Option] = None,
     device: Annotated[str, typer.Option(help="auto|cuda|cpu")] = "auto",
+    dist: Annotated[
+        bool,
+        typer.Option(
+            "--dist",
+            help="single-node multi-process (launch under torchrun; rank 0's log is the run's)",
+        ),
+    ] = False,
+    capacity: Annotated[
+        str,
+        typer.Option(
+            "--capacity",
+            help="per-rank micro-batches for --dist: '4,2', '4x512,2x256', or auto",
+        ),
+    ] = "",
     resume: Annotated[
         bool, typer.Option(help="continue `ckpt_name`; a drifted config refuses")
     ] = False,
@@ -272,8 +287,42 @@ def train_cmd(
             train_over[k] = v
     if json_log is not None:
         train_over["json_log"] = str(json_log)
+    if dist:
+        train_over["dist"] = True
+    if capacity:
+        train_over["dist_capacity"] = capacity
     run = load_run(preset, model_overrides=model_over, train_overrides=train_over)
     dev = _device(device)
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    if dist and world <= 1:
+        raise LoudError(
+            f"--dist without torchrun (WORLD_SIZE={world}): there is no fleet to join, "
+            f"and a silent single-process run under a --dist flag is the fallback this "
+            f"repo refuses. Escape: `torchrun --standalone --nproc_per_node=2 -m "
+            f"dormouse train --dist ...`, or drop --dist."
+        )
+    if not dist and world > 1:
+        raise LoudError(
+            f"launched under torchrun (WORLD_SIZE={world}) without --dist: every rank "
+            f"would train the same data independently and overwrite the same "
+            f"checkpoint. Escape: pass --dist, or run without torchrun."
+        )
+    if dist:
+        from .train.distributed import train_dist as _train_dist
+
+        console.print(
+            Panel(
+                f"[bold]{run.source}[/] · distributed · {world} rank(s) · device {dev.type}",
+                subtitle=f"steps={run.train.steps} capacity={capacity or 'cfg.batch'}"
+                f" lr={run.train.lr} opt={run.train.opt}",
+            )
+        )
+        report = _train_dist(run, resume=resume, device_type=dev.type, log=print)
+        console.print(
+            f"[green]done[/] steps={report['steps']} loss={report['loss']:.4f} "
+            f"rank={report['rank']}/{report['world_size']}"
+        )
+        return
     run = _apply_dtype(run, dev, log=print)
     model = _model(run).to(dev)
     _freeze_gc()

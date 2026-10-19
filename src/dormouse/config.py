@@ -86,6 +86,12 @@ MOE_KERNELS = ("padded", "triton", "naive")
 #: an explicit rung is LOUD when the device cannot run it. On the CPU arm the
 #: ladder is fp32-only by the port's own rule, so `auto` resolves fp32.
 DTYPES = ("none", "auto", "bf16", "fp16", "fp32")
+#: The distributed knobs' literals — mirrors of `train/distributed.py`'s
+#: `BACKENDS` / `SHARDS` / `REDUCE_DTYPES`, so the config layer does not import
+#: the distributed layer (which imports torch.distributed at call time).
+DIST_BACKENDS = ("auto", "gloo", "nccl")
+DIST_SHARDS = ("none", "fsdp")
+DIST_REDUCE_DTYPES = ("auto", "bf16", "fp16", "fp32")
 #: The `expert_act` literals — the 2026-10-16 activation tournament arms, each
 #: with its formula source in `experts.expert_glu`:
 #: `silu` (control, SwiGLU), `situ` (Kimi K3, arXiv 2607.24653 Eq. 12),
@@ -802,6 +808,40 @@ class TrainConfig:
     #: a SILENT model change wearing a memory flag.
     segment_len: int = 0
 
+    # --- the distributed lane (`train/distributed.py`) -------------------
+    #: Join a single-node multi-process data-parallel run. Set by the CLI's
+    #: `--dist`; the process must have been launched under torchrun (WORLD_SIZE
+    #: > 1 is refused otherwise, and WORLD_SIZE > 1 with dist=false is refused
+    #: too — N ranks each training the same data is not a fallback).
+    dist: bool = False
+    #: The process-group backend (`distributed.BACKENDS`): `auto` is nccl on a
+    #: CUDA fleet and gloo on the CPU arm. `nccl` on a box without it is LOUD,
+    #: never a silent gloo fallback (host-staged gradients compute the right
+    #: answer at a fraction of the speed).
+    dist_backend: str = "auto"
+    #: The sharding arm (`distributed.SHARDS`): `none` = DDP (the path the
+    #: gates prove, and the only one the custom Muon optimizer can ride today),
+    #: `fsdp` = FSDP2 `fully_shard` — available for the `opt=adamw` control arm,
+    #: refused LOUDLY for Muon (the stacked momentum buffer vs DTensor
+    #: gradients, measured) and for resume/checkpoint (the DTensor state dict
+    #: is not the port's single-file format).
+    dist_shard: str = "none"
+    #: The gradient-reduce rung (`distributed.REDUCE_DTYPES`): `auto` = the
+    #: fleet's compute dtype (bf16 on this card), `fp32` = the exact reference
+    #: the gates compare against. A compressed reduce is a POSITIVE claim about
+    #: precision, not a default.
+    dist_reduce: str = "auto"
+    #: DDP's bucket cap in MiB; `0` = derive it from the gradient payload
+    #: (`distributed.bucket_mb_for`: payload/8, clamped) — a PCIe-sized
+    #: starting point, not a measured optimum.
+    dist_bucket_mb: int = 0
+    #: The capacity profile: one entry per rank, `B` or `BxT` (`"4,2"`), or
+    #: `"auto"` (a fixed matmul's measured rate per rank, the global batch
+    #: `batch × world_size` split in proportion). Empty = `batch`/`seq_len` on
+    #: every rank, and the global batch is `batch × world_size` — which is the
+    #: key the whole run is read against.
+    dist_capacity: str = ""
+
     # --- the RL lane (`post/rl.py` + `post/rl_train.py`) ----------------
     # The reward/advantage knobs are `RLConfig`'s fields, spelled here so the CLI
     # and a snapshot carry them; the mapping back is [`rl_config`], the ONE
@@ -1456,6 +1496,38 @@ def load_run(
             f"max_epochs={tcfg.max_epochs} is negative: it is the repetition cap "
             f"in `train/mixture.py` (0 = off). Escape: a non-negative number, or "
             f"leave the default 4.0 (the measured MoE onset)."
+        )
+    if tcfg.dist_backend not in DIST_BACKENDS:
+        loud(
+            f"dist_backend={tcfg.dist_backend!r} is not a backend. Known: "
+            f"{list(DIST_BACKENDS)} — `auto` is nccl on a CUDA fleet and gloo on "
+            f"the CPU arm (train/distributed.py). Escape: name one of those."
+        )
+    if tcfg.dist_shard not in DIST_SHARDS:
+        loud(
+            f"dist_shard={tcfg.dist_shard!r} is not a sharding arm. Known: "
+            f"{list(DIST_SHARDS)} — `none` is DDP (the verified path), `fsdp` is "
+            f"FSDP2 (AdamW control arm only, see distributed.refuse_incompatible)."
+        )
+    if tcfg.dist_reduce not in DIST_REDUCE_DTYPES:
+        loud(
+            f"dist_reduce={tcfg.dist_reduce!r} is not a rung. Known: "
+            f"{list(DIST_REDUCE_DTYPES)} — `auto` follows the compute policy, "
+            f"`fp32` is the exact reference, `bf16`/`fp16` compress the link."
+        )
+    if tcfg.dist_bucket_mb < 0:
+        loud(f"dist_bucket_mb={tcfg.dist_bucket_mb}: 0 means auto, a negative cap is nonsense")
+    if not tcfg.dist and (
+        tcfg.dist_shard != "none"
+        or tcfg.dist_reduce != "auto"
+        or tcfg.dist_bucket_mb
+        or tcfg.dist_capacity
+    ):
+        loud(
+            f"dist=false with a distributed knob set (dist_shard={tcfg.dist_shard!r}, "
+            f"dist_reduce={tcfg.dist_reduce!r}, dist_bucket_mb={tcfg.dist_bucket_mb}, "
+            f"dist_capacity={tcfg.dist_capacity!r}): the knobs would be inert while "
+            f"the config carried them. Escape: dist=true, or drop them."
         )
     if tcfg.mix_plan and not Path(tcfg.mix_plan).is_file():
         loud(

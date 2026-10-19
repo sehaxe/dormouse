@@ -34,7 +34,7 @@ from ..model.engram import (
 )
 from ..model.experts import invalidate_banks_all
 from ..model.tsct import set_mm_dtype
-from .data import ByteStream, eval_window_bytes, open_streams, warmup_steps
+from .data import ByteStream, open_streams, warmup_steps
 from .graph import OptimizerGraph
 from .lr import wsd_lr
 from .mixture import open_mixture
@@ -419,6 +419,10 @@ def _eval_line(
     max_iter: int,
     device: torch.device | str | None,
     step: int,
+    *,
+    batch: int | None = None,
+    seq_len: int | None = None,
+    parallel=None,
 ) -> tuple[str, float, int]:
     """The eval line, carrying the depth curve when the config asks for it.
 
@@ -426,7 +430,15 @@ def _eval_line(
     `cfg.eval_depths` requests it on a fixed-depth run. The line reports the
     held-out loss at `max_iter` as its headline number, so the arm's curve and
     the fixed-depth control are read off the same line.
+
+    `batch`/`seq_len` are the shape the eval ACTUALLY scored (a distributed
+    rank's micro-batch), and they are printed for the same reason the config's
+    are: a BPB without its window is not a number. `parallel` adds the
+    `dist=r/P` field — in a fleet only rank 0 evaluates, and the line must say
+    so rather than look like a fleet-wide measurement.
     """
+    b = cfg.batch if batch is None else batch
+    t = cfg.seq_len if seq_len is None else seq_len
     curve = None
     eng = Counters()
     if cfg.rand_depth or cfg.eval_depths:
@@ -446,9 +458,11 @@ def _eval_line(
     line = (
         f"eval step={step} loss={ev:.4f} bpb={bpb(ev):.3f} fin={fin:.4f} "
         f"bpb_fin={bpb(fin):.3f} over {scored} B "
-        f"({cfg.eval_batches} x {cfg.batch} x {cfg.seq_len}) "
+        f"({cfg.eval_batches} x {b} x {t}) "
         f"engram={eng.get('engram_rows', 0)}/{eng.get('engram_arms', 0)}"
     )
+    if parallel is not None:
+        line += f" dist={parallel.rank}/{parallel.world_size}"
 
     if per_iter:
         line += " periter=" + ",".join(f"{v:.4f}" for v in per_iter)
@@ -466,6 +480,7 @@ def train(
     resume: bool = False,
     log=print,
     device: torch.device | str | None = None,
+    parallel=None,
 ) -> dict:
     """Run the training loop. Returns a report dict (final loss, counters, step).
 
@@ -473,8 +488,28 @@ def train(
     from an mmap, and it is the caller who knows where the model lives), so a
     GPU run names the device here and gets its windows transferred. `None` is
     the CPU path, unchanged.
+
+    `parallel` is the distributed seam (`train/distributed.py`). `None` is the
+    single-process path and every line below is byte-identical to its history:
+    the rank's shape is the config's, the loss is untouched, the NaN decision
+    is local. With a `Parallel`, four things change and nothing else — the
+    stream is the rank's own byte range and micro-batch, the loss is scaled by
+    `world_size · t_rank / Σt` before backward (so DDP's mean-of-means lands on
+    the global token mean), the NaN decision is one collective (a rank that
+    skips backward would hang the reducer), and only rank 0 evaluates,
+    checkpoints and logs.
     """
     cfg = run.train
+    #: The model shape's effective batch. `parallel=None` keeps the config's
+    #: exactly; a rank runs its own capacity-profile entry (stage 3).
+    batch, seq_len = (
+        (cfg.batch, cfg.seq_len)
+        if parallel is None
+        else (
+            parallel.shape.batch,
+            parallel.shape.seq_len,
+        )
+    )
     if cfg.tf32:
         # The knob the b1 opt bench measured (2026-10-16): 1399 -> 1201 ms/step.
         torch.set_float32_matmul_precision("high")
@@ -513,19 +548,29 @@ def train(
             stream = open_mixture(
                 run.train.mix_plan,
                 steps=run.train.steps,
-                batch=run.train.batch,
-                seq_len=run.train.seq_len,
+                batch=batch,
+                seq_len=seq_len,
                 seed=run.train.seed,
                 max_epochs=run.train.max_epochs,
             )
-            _, eval_stream = open_streams(run)
+            _, eval_stream = open_streams(run, batch=batch, seq_len=seq_len)
             log(
                 f"mix_plan={run.train.mix_plan}: {len(stream.plan.sources)} sources, "
                 f"{len(stream.plan.stages)} stage(s), max_epochs={run.train.max_epochs}"
             )
         else:
-            stream, eval_stream = open_streams(run)
+            stream, eval_stream = open_streams(run, batch=batch, seq_len=seq_len)
+        if parallel is not None:
+            # The rank's own byte range: disjoint per rank, and with equal shapes
+            # the fleet's union at step s is the contiguous block one process at
+            # Σbatch reads at step s — the equal-batch gate's whole basis.
+            stream.skip_bytes(parallel.byte_offset())
     model.train()
+    if parallel is not None:
+        # Refusals BEFORE any state is built, then FSDP2's shard (it must come
+        # before the optimizer so the optimizer state is sharded with it).
+        parallel.refuse_incompatible(run, resume=resume)
+        model = parallel.shard(model)
     if "ternary_s3t" in (run.model.factor_qat, run.model.dense_qat):
         # The ADR-0021 caveat, said where a reader of the log meets it. The
         # projector has no step index, so the S3T mask is a process-local
@@ -589,7 +634,11 @@ def train(
             "`optim.Muon.sf_switch` documents). A NaN-skipped step advances none of "
             "Z/X/s."
         )
-    tokens_per_step = cfg.batch * cfg.seq_len
+    #: The GLOBAL tokens one step consumes. A fleet property: the loss scale,
+    #: the LR warmup and the logged tok/s are all defined on it, so every rank
+    #: must agree — a per-rank warmup count would put the ranks on different
+    #: schedules and silently train N different runs.
+    tokens_per_step = cfg.batch * cfg.seq_len if parallel is None else parallel.global_tokens
     start = 0
     if resume:
         ck, _stored = load_ckpt(run)
@@ -599,7 +648,10 @@ def train(
         if start:
             # A resumed run must continue on UNSEEN bytes: the burn failure
             # this prevents is re-reading (and memorizing) the corpus head.
-            stream.skip_bytes(start * (cfg.seq_len + 1) * cfg.batch)
+            # The rank's own byte offset persists (it is part of where its
+            # stream lives), hence the addition rather than rank·span.
+            span = (seq_len + 1) * batch
+            stream.skip_bytes(start * span + (0 if parallel is None else parallel.byte_offset()))
         # The checkpoint's model half is the X iterate (a checkpoint is written
         # with the eval switch on, below), and so is the optimizer's own `x`, so
         # the params must go back to Y before the next forward. The switch is an
@@ -608,7 +660,19 @@ def train(
         sf("train")
         log(f"resume: step={start} opt_steps={opt.steps}")
 
-    warm = warmup_steps(cfg.warmup_tokens, cfg.batch, cfg.seq_len)
+    if parallel is not None:
+        # DDP AFTER the optimizer and after the resume load: the wrapper
+        # broadcasts rank 0's parameters, and the optimizer already holds those
+        # parameter objects — wrapping earlier would load a `module.`-prefixed
+        # state dict into the raw module's keys.
+        model = parallel.replicate(model)
+        log(parallel.line())
+
+    warm = (
+        warmup_steps(cfg.warmup_tokens, cfg.batch, cfg.seq_len)
+        if parallel is None
+        else warmup_steps(cfg.warmup_tokens, 1, tokens_per_step)
+    )
     decay = int(round(cfg.decay_frac * cfg.steps))
     if cfg.torch_compile:
         if cfg.opt_graph:
@@ -645,7 +709,9 @@ def train(
     #: The telemetry sink: every event (log cadence, evals, checkpoints) gets
     #: a JSON row. A dict writer that never raises on non-JSON values.
     sink = None
-    if cfg.json_log:
+    if cfg.json_log and (parallel is None or parallel.is_main):
+        # ONE writer: N ranks appending to one JSONL would interleave partial
+        # lines. Rank 0's file is the run's telemetry, like its log.
         sink = open(cfg.json_log, "a", encoding="utf-8")
 
         def _row(**kw) -> None:
@@ -781,6 +847,18 @@ def train(
         # ones and must not drift silently.
         lf = float(loss.detach()) if loss is not None else float("nan")
         finite = math.isfinite(lf)
+        if parallel is not None:
+            # The NaN decision is the FLEET's, not this rank's: a rank that
+            # skipped backward would never enter the reducer and the peers
+            # would block on a collective that never comes. MIN over the flag;
+            # a rank whose own loss was finite but whose peer's was not has its
+            # lost step COUNTED (`nan_forced_skip`), because that is a real
+            # cost of a peer's divergence and a reader should see it.
+            agreed = parallel.all_finite(finite)
+            if finite and not agreed:
+                total.count("nan_forced_skip")
+                window.count("nan_forced_skip")
+            finite = agreed
         window_finite.append(finite)
         if finite:
             # The graph arm needs STABLE `.grad` buffers: `set_to_none=True` swaps
@@ -789,7 +867,14 @@ def train(
             # a param whose grad is still None, so the FIRST backward allocates it
             # — which is why the wrapper demands at least one eager step.
             opt.zero_grad(set_to_none=graph is None)
-            loss.backward()
+            if parallel is None:
+                loss.backward()
+            else:
+                # DDP averages the ranks' gradients; the objective is the mean
+                # over the GLOBAL batch's tokens. Scaling this rank's loss by
+                # `world_size · t_rank / Σt` makes the reducer's division land
+                # on `Σ (t_r/Σt)·g_r` exactly (stage 3's normalization).
+                (loss * parallel.loss_scale).backward()
             if graph is not None:
                 # ONE launch: the captured stage IS `opt_stage()` (the grad clip
                 # plus the mixed step), and the wrapper redoes the host-side step
@@ -861,6 +946,12 @@ def train(
             elif window_finite:
                 drowning = 0
             window_finite = []
+            if parallel is not None:
+                # The line's loss is the FLEET's (token-weighted mean of the
+                # ranks' local means), reduced at the log cadence on every rank
+                # — a fleet line that printed rank 0's micro-batch loss would be
+                # the eval-window defect in another costume.
+                last_loss = parallel.fleet_loss(last_loss)
             parts = [
                 f"step={step + 1}",
                 f"loss={last_loss:.4f}",
@@ -885,17 +976,18 @@ def train(
             # is the whole fix.
             timer.mark = time.perf_counter()
             rate = (cfg.log_every * tokens_per_step) / interval_s if interval_s > 0 else None
-            log(" ".join(p for p in parts if p))
-            if sink is not None:
-                _row(
-                    event="log",
-                    step=step + 1,
-                    loss=last_loss,
-                    lr=lr,
-                    tokens_per_s=rate,
-                    counters=dict(window),
-                    nan_skipped=nan_skipped,
-                )
+            if parallel is None or parallel.is_main:
+                log(" ".join(p for p in parts if p))
+                if sink is not None:
+                    _row(
+                        event="log",
+                        step=step + 1,
+                        loss=last_loss,
+                        lr=lr,
+                        tokens_per_s=rate,
+                        counters=dict(window),
+                        nan_skipped=nan_skipped,
+                    )
             window = Counters()
             if drowning >= 2:
                 raise LoudError(
@@ -912,29 +1004,57 @@ def train(
             # SF: the held-out number must be scored on the RETURNED iterate X,
             # not on the gradient-evaluation point Y (Alg 1 line 18 / the
             # reference's `eval()`); the params go back to Y for the next step.
-            sf("eval")
-            line, ev, scored = _eval_line(
-                model, eval_stream, cfg, run.model.max_iter, device, step + 1
-            )
-            sf("train")
-            log(line)
-            if sink is not None:
-                _row(event="eval", step=step + 1, loss=ev, bpb=bpb(ev), scored=scored)
+            # A fleet evaluates on rank 0 only (`dist=r/P` on the line): its
+            # window is the rank's micro-batch, printed, and the other ranks
+            # wait at the next step's collective.
+            if parallel is None or parallel.is_main:
+                sf("eval")
+                line, ev, scored = _eval_line(
+                    model,
+                    eval_stream,
+                    cfg,
+                    run.model.max_iter,
+                    device,
+                    step + 1,
+                    batch=batch,
+                    seq_len=seq_len,
+                    parallel=parallel,
+                )
+                sf("train")
+                log(line)
+                if sink is not None:
+                    _row(event="eval", step=step + 1, loss=ev, bpb=bpb(ev), scored=scored)
 
-        if (step + 1) % cfg.ckpt_every == 0:
+        if (step + 1) % cfg.ckpt_every == 0 and (parallel is None or parallel.is_main):
             # A checkpoint is the model a reader would serve, so it is written
             # at X too — and on a resume the model half plus the optimizer's own
             # `x` are the same iterate, which is what makes the switch back to Y
-            # an absolute, double-lerp-free write.
+            # an absolute, double-lerp-free write. ONE writer (rank 0) and the
+            # UNWRAPPED module: DDP prefixes every state-dict key with `module.`.
             sf("eval")
-            weights, snapshot = save_ckpt(run, model, opt, step)
+            weights, snapshot = save_ckpt(
+                run, parallel.raw(model) if parallel is not None else model, opt, step
+            )
             sf("train")
             log(f"ckpt step={step + 1} -> {weights} ({snapshot})")
 
-    if cfg.eval and eval_stream is not None and cfg.steps % cfg.eval_every != 0:
+    if (
+        cfg.eval
+        and eval_stream is not None
+        and cfg.steps % cfg.eval_every != 0
+        and (parallel is None or parallel.is_main)
+    ):
         sf("eval")
         line, _ev, _scored = _eval_line(
-            model, eval_stream, cfg, run.model.max_iter, device, cfg.steps
+            model,
+            eval_stream,
+            cfg,
+            run.model.max_iter,
+            device,
+            cfg.steps,
+            batch=batch,
+            seq_len=seq_len,
+            parallel=parallel,
         )
         sf("train")
         log(line)
@@ -944,5 +1064,7 @@ def train(
         "nan_skipped": nan_skipped,
         "counters": total,
         "opt_steps": opt.steps,
-        "eval_window_bytes": eval_window_bytes(cfg),
+        "eval_window_bytes": cfg.eval_batches * batch * seq_len,
+        "rank": parallel.rank if parallel is not None else 0,
+        "world_size": parallel.world_size if parallel is not None else 1,
     }

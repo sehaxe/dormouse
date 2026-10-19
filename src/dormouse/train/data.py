@@ -425,14 +425,24 @@ def split_points(size: int, eval_bytes: int) -> tuple[int, int]:
     return size - eval_bytes, size
 
 
-def open_streams(run, *, ring_bytes: int = DEFAULT_RING) -> tuple[ByteStream, ByteStream | None]:
+def open_streams(
+    run, *, ring_bytes: int = DEFAULT_RING, batch: int | None = None, seq_len: int | None = None
+) -> tuple[ByteStream, ByteStream | None]:
     """The train stream and (when an eval file is set) the eval stream.
 
     `eval_data` names a DIFFERENT file (the burn recipe's held-out tail carve).
     When it is empty the eval tail of the train file is used, and the train
     stream's high bound stops one window short of it — the no-leak split.
+
+    `batch`/`seq_len` default to the config's; a distributed rank passes its
+    OWN micro-batch (stage 3's capacity profile), and then the eval carve and
+    the eval window are that rank's — which is why the caller prints the shape
+    it used.
     """
     tr = run.train
+    b = tr.batch if batch is None else batch
+    t = tr.seq_len if seq_len is None else seq_len
+    window = tr.eval_batches * b * t
     if not tr.data:
         loud(
             "no data file: `data` is empty in the train config. Escape: set "
@@ -445,20 +455,16 @@ def open_streams(run, *, ring_bytes: int = DEFAULT_RING) -> tuple[ByteStream, By
     if tr.eval_data:
         ev = ByteStream(
             tr.eval_data,
-            tr.batch,
-            tr.seq_len,
-            ring_bytes=min(ring_bytes, max(1 << 20, eval_window_bytes(tr))),
+            b,
+            t,
+            ring_bytes=min(ring_bytes, max(1 << 20, window)),
         )
-        train = ByteStream(tr.data, tr.batch, tr.seq_len, ring_bytes=ring_bytes)
+        train = ByteStream(tr.data, b, t, ring_bytes=ring_bytes)
         return train, ev
-    ev_bytes = min(max(eval_window_bytes(tr), 1), 1 << 20) if tr.eval else 0
+    ev_bytes = min(max(window, 1), 1 << 20) if tr.eval else 0
     hi_train, _ = split_points(Path(tr.data).stat().st_size, ev_bytes)
-    train = ByteStream(tr.data, tr.batch, tr.seq_len, lo=0, hi=hi_train, ring_bytes=ring_bytes)
-    ev = (
-        ByteStream(tr.data, tr.batch, tr.seq_len, lo=hi_train, ring_bytes=1 << 20)
-        if tr.eval
-        else None
-    )
+    train = ByteStream(tr.data, b, t, lo=0, hi=hi_train, ring_bytes=ring_bytes)
+    ev = ByteStream(tr.data, b, t, lo=hi_train, ring_bytes=1 << 20) if tr.eval else None
     return train, ev
 
 
