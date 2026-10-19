@@ -303,6 +303,7 @@ export const pages = [
 	// numbers, every figure carried with its source.
 	{ src: 'docs/guides/train-your-first.md', out: 'tooling/train-your-first', title: 'Train your first model', nav: 'First run' },
 	{ src: 'docs/guides/data.md', out: 'tooling/data', title: 'Data: what the corpora are and how to get one', nav: 'Data' },
+	{ src: 'docs/reviews/2026-10-19-findings-ledger.md', out: 'reviews/2026-10-19-findings-ledger', title: 'Findings ledger: the 2026-10-19 audits', nav: 'Findings' },
 	{ src: 'docs/guides/determinism.md', out: 'tooling/determinism', title: 'Determinism: why --seed was the easy part', nav: 'Determinism' },
 	{ src: 'docs/guides/ab-testing.md', out: 'tooling/ab-testing', title: 'A/B testing: how an arm is judged here', nav: 'A/B testing' },
 	{ src: 'docs/guides/precision.md', out: 'tooling/precision', title: 'Precision on this backend: why bf16 is slower than fp32', nav: 'Precision' },
