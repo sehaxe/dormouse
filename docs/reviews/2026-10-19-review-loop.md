@@ -43,12 +43,46 @@ SFT eval's un-rewound stream, the red-while-busy CPU gate, the tail-path window
 that overstates what it scores, two inert knobs, three per-forward device syncs
 and the LFB bias that does not survive a resume.
 
-### Round 1 — pending
+### Round 1 — 7/10 (`2026-10-19-review-round-1.md`)
 
-Started after the ledger's CRITICAL rows are fixed. Reviewer: same scope as the
-code audit, plus a read of the two other reports, told to verify each fix and to
-look specifically at what changed.
+Eight verdicts on the fixes; two gates could not fail; one regression caused by
+the wave (the new counter reason crashed `opt_graph`). Regressions and the
+vacuous gates were fixed before round 2.
 
-### Round 2 — pending, only if round 1 scores below 9.
+### Round 2 — 6/10 (`2026-10-19-review-round-2.md`)
 
-### Round 3 — pending, only if round 2 scores below 9. Last round.
+Lower, honestly: two regressions the previous wave introduced (the no-`--eval`
+tail carved in scored bytes; the LFB refusal reaching readers), one gate that
+compared `bytes` with `str`, and — new, and the most serious finding of the
+whole loop — **a sympy RCE in the math verifier** (the model's answer text
+executed in the trainer process; `__import__('os').system(...)` ran) plus a code
+jail bypassed through `os.open`/`pathlib`. Both were fixed before round 3.
+
+### Round 3 — 7/10 (`2026-10-19-review-round-3.md`) — the loop's result
+
+Six of seven fixes verified as falsifiable (the seventh, the M1 corpus decode,
+was made falsifiable afterwards). Four new findings: the reward path died on a
+23-byte answer (`(2**1000)**1000`), the M1 decode half was still vacuous, LFB
+scoping stopped at the pretrain trainer and `lfb_counts` accumulated across
+resumes (11.8e9 on `mix1`), and a mixture run extended with more `steps`
+resumed from the wrong position. All four fixed with revert-checked gates.
+
+## The loop's outcome: 7/10, accepted by the owner (2026-10-20)
+
+The owner's call: 7 is a defensible first ceiling; 8-9 comes later. What keeps
+it from 8, named rather than implied:
+
+1. **Gates that cannot fail** are a class, not an incident — one was found in
+   every round. The fix is a habit (every gate gets a revert check in the
+   commit), not a patch.
+2. **Each wave of fixes produced a regression** in the next round. The counter
+   to this is fewer, slower waves with the whole suite and the reviewers'
+   own tests run between them.
+3. **The GPU gates were written but never executed** — the card was held by a
+   live run through all three rounds, so the reviewer read `skipif`s. A round
+   with a free card is the single cheapest way to move the number.
+
+Reaching 8-9, concretely: free the card and re-run this protocol once (all
+three audits' findings are already fixed); make the revert check part of the
+commit template; and let the reviewer run the distributed lane
+(`tools/dist_gate.py`, two ranks) which no round has executed.
