@@ -119,6 +119,18 @@ def _freeze_gc() -> None:
 
 
 def _model(run) -> DormouseModel:
+    """Construct the model from `run` — seeded by the run, never by the caller.
+
+    `train.seed` is recorded in every snapshot and every `.dormouse` header, so
+    it must own the weights: `DormouseModel.__init__` draws from the global
+    torch RNG, and before this call nothing in the train path seeded it (audit
+    C1: two `seed=1` processes built `39cb6df0…` vs `c70cb36b…`). Set the seed
+    HERE, immediately before the constructor, because this is the one place
+    `train`/`run`/`sft`/`eval`/`bench`/`export`/`decode`/`serve` build a model
+    (`serve.py` imports this helper). The RL lane builds its own
+    (`post/rl_train.py`), so `rl_cmd` seeds immediately before that call.
+    """
+    torch.manual_seed(run.train.seed)
     return DormouseModel(run.model)
 
 
@@ -574,6 +586,11 @@ def rl_cmd(
             f"adv={run.train.rl_adv}",
         )
     )
+    # C1: `rl_train` constructs its own DormouseModel (`post/rl_train.py`), so
+    # this is the seed call immediately before that construction. A direct
+    # library caller of `rl_train` still bypasses it; the durable fix is the
+    # same line inside `rl_train` (not this lane's file).
+    torch.manual_seed(run.train.seed)
     report = rl_train(
         run,
         resume=resume,
