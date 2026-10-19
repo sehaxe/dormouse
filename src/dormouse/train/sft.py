@@ -705,6 +705,60 @@ def _init_cfg(cfg: TrainConfig, path: Path, sd: dict, model: torch.nn.Module) ->
     return dataclasses.replace(cfg, engram_ram=host, out_dir=str(path.parent), ckpt_name=path.stem)
 
 
+def _sft_eval(
+    model: torch.nn.Module,
+    eval_stream: ByteStream,
+    cfg: TrainConfig,
+    device: torch.device | str | None,
+) -> tuple[float, float, int, int]:
+    """One held-out pass: `(ce, first_frac, records, scored_bytes)`.
+
+    `rewind()` first, ALWAYS (audit MAJOR 3, the defect `train/loop.py`'s
+    `_eval_loss` fixed on 2026-09-27): the stream is a ring, so an eval that
+    inherits the previous eval's position scores different bytes and its
+    `ce=`/`first=` are not a statement about the weights alone. `scored_bytes`
+    is the eval window the line prints (`batches × batch × seq_len`), the same
+    unit as the pretrain line.
+    """
+    eval_stream.rewind()
+    ce_total = 0.0
+    batches = 0
+    first_ok = 0
+    first_n = 0
+    scored = 0
+    was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        for _ in range(cfg.eval_batches):
+            ex, ey = eval_stream.next_batch()
+            if device is not None:
+                ex, ey = ex.to(device), ey.to(device)
+            emask = sft_mask(ex)
+            elogits, _en, _ec = model(ex)
+            flat = emask.reshape(-1)
+            ce_total += float(F.cross_entropy(elogits[flat], ey.reshape(-1)[flat]))
+            batches += 1
+            scored += int(ex.numel())
+            # The conditioning metric: at the assistant marker's position the
+            # model predicts the FIRST answer byte — the one byte that cannot
+            # be guessed from the answer alone.
+            is_a = ex == ASSIST
+            assist = is_a.to(torch.int8).argmax(dim=1)
+            rows = torch.arange(ex.shape[0], device=ex.device)
+            per_row = elogits.reshape(ex.shape[0], ex.shape[1], -1)
+            pred = per_row[rows, assist].argmax(dim=-1)
+            true = ey[rows, assist]
+            first_ok += int((pred == true).sum())
+            first_n += int(ex.shape[0])
+    model.train(was_training)
+    return (
+        ce_total / max(batches, 1),
+        first_ok / max(first_n, 1),
+        first_n,
+        scored,
+    )
+
+
 def sft_train(
     model: torch.nn.Module,
     run: RunConfig,
@@ -975,41 +1029,22 @@ def sft_train(
                 )
 
         if eval_stream is not None and (step + 1) % cfg.eval_every == 0:
-            model.eval()
-            ce_total = 0.0
-            batches = 0
-            first_ok = 0
-            first_n = 0
-            with torch.no_grad():
-                for _ in range(cfg.eval_batches):
-                    ex, ey = eval_stream.next_batch()
-                    if device is not None:
-                        ex, ey = ex.to(device), ey.to(device)
-                    emask = sft_mask(ex)
-                    elogits, _en, _ec = model(ex)
-                    flat = emask.reshape(-1)
-                    ce_total += float(F.cross_entropy(elogits[flat], ey.reshape(-1)[flat]))
-                    batches += 1
-                    # The conditioning metric: at the assistant marker's
-                    # position the model predicts the FIRST answer byte — the
-                    # one byte that cannot be guessed from the answer alone.
-                    is_a = ex == ASSIST
-                    assist = is_a.to(torch.int8).argmax(dim=1)
-                    rows = torch.arange(ex.shape[0], device=ex.device)
-                    per_row = elogits.reshape(ex.shape[0], ex.shape[1], -1)
-                    pred = per_row[rows, assist].argmax(dim=-1)
-                    true = ey[rows, assist]
-                    first_ok += int((pred == true).sum())
-                    first_n += int(ex.shape[0])
-            model.train()
-            ce = ce_total / max(batches, 1)
-            frac = first_ok / max(first_n, 1)
+            ce, frac, first_n, eval_scored = _sft_eval(model, eval_stream, cfg, device)
             log(
                 f"sft eval step={step + 1} ce={ce:.4f} bpb={ce / math.log(2):.4f} "
-                f"first={100 * frac:.1f}% over {first_n} records"
+                f"first={100 * frac:.1f}% over {eval_scored} B "
+                f"({cfg.eval_batches} x {cfg.batch} x {cfg.seq_len}) "
+                f"= {first_n} records"
             )
             if sink is not None:
-                _row(event="sft_eval", step=step + 1, ce=ce, first=frac, records=first_n)
+                _row(
+                    event="sft_eval",
+                    step=step + 1,
+                    ce=ce,
+                    first=frac,
+                    records=first_n,
+                    scored=eval_scored,
+                )
 
         if (step + 1) % cfg.ckpt_every == 0:
             weights, snapshot = save_ckpt(run, model, opt, step)

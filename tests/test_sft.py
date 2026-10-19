@@ -29,6 +29,7 @@ from dormouse.train.sft import (
     GENERIC_QA,
     PAD,
     USER,
+    _sft_eval,
     _sft_tasks,
     build_sft_corpus,
     render,
@@ -817,7 +818,28 @@ def test_sft_eval_reports_first_byte_agreement(tmp_path):
     evals = [ln for ln in lines if ln.startswith("sft eval")]
     assert evals, lines
     assert "first=" in evals[-1] and "over " in evals[-1]
+    # The window is on the line, like the pretrain eval (audit M3).
+    assert f"over {2 * BATCH * SEQ} B (2 x {BATCH} x {SEQ})" in evals[-1], evals[-1]
     assert built["holdout"] == 4
+
+
+def test_two_sft_evals_on_one_checkpoint_score_the_same_window(tmp_path: Path):
+    """M3 gate: `_sft_eval` rewinds, so pass two scores the same bytes.
+
+    Before the fix the stream inherited pass one's position; the two `ce=`/
+    `first=` numbers were a moving-window measurement, not a statement about
+    the weights (the defect `train/loop.py` fixed on 2026-09-27).
+    """
+    corpus = tmp_path / "sft.bin"
+    build_sft_corpus(corpus, seed=1, seq_len=SEQ, n_tasks=0, holdout=4)
+    run = sft_run(tmp_path, corpus=corpus, eval_batches=2)
+    eval_stream = ByteStream(tmp_path / "sft.bin.holdout", BATCH, SEQ)
+    model = DormouseModel(run.model)
+    ce1, first1, records1, scored1 = _sft_eval(model, eval_stream, run.train, None)
+    ce2, first2, records2, scored2 = _sft_eval(model, eval_stream, run.train, None)
+    assert ce1 == pytest.approx(ce2, abs=1e-12), (ce1, ce2)
+    assert first1 == first2
+    assert (records1, scored1) == (records2, scored2) == (2 * BATCH, 2 * BATCH * SEQ)
 
 
 def test_ru_bank_is_broad_and_fits_one_window():
