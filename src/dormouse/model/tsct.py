@@ -648,7 +648,11 @@ def _e2m1_quant(t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, float, int
     (bias 7: max normal ±448, min normal ±2⁻⁶, min subnormal ±2⁻⁹) — RNE of a
     scale at or below `2^-10` (half the min subnormal) is the zero code, and
     `torch.finfo(...).min` is NOT an exponent: it is −448.0, so `2 ** min` =
-    `2^-448` made the old prescale inert (2026-10-19 audit M1).
+    `2^-448` made the old prescale inert (2026-10-19 audit M1). `finfo.tiny`
+    (2⁻⁶) is the min NORMAL, not the zeroing boundary — a 2⁻⁶ scale is
+    representable — so the retry below is driven by the encode's actual zero
+    count, and the target is the MAX (448): keeping the large blocks
+    representable is the choice, and blocks left below the grid are counted.
 
     Prescale: encode once, and if any nonzero block's scale rounded to zero,
     encode again with a power-of-two global that puts the LARGEST block scale
