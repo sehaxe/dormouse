@@ -12,9 +12,10 @@ forward does not fit at all.
 
 Shape: `small` as shipped (the dense blend; with `moe_topk > 0` segmentation needs
 `moe_capacity = 0` — the dropless arm — see `config._validate_segment`), batch 2,
-seq 2048 / 4096 / 8192, the SAME window for both arms at each shape,
-`segment_len = 1024` (the recipe's own cut). The one-shot arm is attempted where
-it fits and COUNTED as OOM where it does not — never silently skipped.
+seq 2048 / 8192 / 16384 / 32768, the SAME window for both arms at each shape,
+`segment_len = 4096` (16k in 4 segments; the 8k cut was the first measurement).
+The one-shot arm is attempted where it fits and COUNTED as OOM where it does
+not — never silently skipped.
 
 The counters are printed per arm (`loop_segments`, `kda=…`) because the number a
 reader needs is "which path produced this step time", not just the time.
@@ -47,8 +48,8 @@ DATA = "/home/sehaxe/dormouse/data_local/corpus_bin_filtered.bin"
 
 DEV = "cuda"
 BATCH = 2
-SEQ_LENS = (2048, 4096, 8192)
-SEGMENT = 1024
+SEQ_LENS = (8192, 16384, 32768)
+SEGMENT = 4096
 WARM, MEASURE = 2, 3
 
 
