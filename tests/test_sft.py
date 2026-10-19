@@ -757,8 +757,12 @@ def test_holdout_moves_the_tail_to_a_sibling(tmp_path):
         build_sft_corpus(tmp_path / "c.bin", 5, seq_len=64, holdout=10_000)
 
 
-def _corpus_pairs(path: Path, record_bytes: int) -> list[tuple[bytes, bytes]]:
-    """Every record as `(instruction, answer)`, markers and the render newline out."""
+def _corpus_pairs(path: Path, record_bytes: int) -> list[tuple[str, str]]:
+    """Every record as `(instruction, answer)`, markers and the render newline out.
+
+    Decoded to `str` on purpose: the verifier's solutions are `str`, and a
+    `bytes.isdisjoint(str)` call is always True (review round 2 R2-3).
+    """
     out = []
     raw = path.read_bytes()
     for off in range(0, len(raw), record_bytes):
@@ -767,8 +771,26 @@ def _corpus_pairs(path: Path, record_bytes: int) -> list[tuple[bytes, bytes]]:
         a = rec.index(ASSIST)
         e = rec.index(END)
         assert a < e
-        out.append((rec[1 : a - 1], rec[a + 1 : e]))  # render: USER + instr + \n + ASSIST
+        # render: USER + instr + \n + ASSIST
+        out.append((rec[1 : a - 1].decode("utf-8"), rec[a + 1 : e].decode("utf-8")))
     return out
+
+
+def _verifier_solutions(seed: int, n: int = 64) -> set[str]:
+    """Every solution the RL/bench verifier can draw at `seed`, all THREE kinds.
+
+    `build_tasks` cycles `i % 3`, so `n=64` covers `add`, `square_sum` AND
+    `count_vowels`; the old substring gate named only the first two.
+    """
+    scored: set[str] = set()
+    for cls in ("code", "math"):
+        scored |= {task.solution.strip() for task in build_tasks(cls, seed, n=n)}
+    return scored
+
+
+def _solution_collisions(pairs: list[tuple[str, str]], scored: set[str]) -> list[tuple[str, str]]:
+    """The `(instruction, answer)` pairs whose answer IS a verifier solution."""
+    return [(instruction, answer) for instruction, answer in pairs if answer.strip() in scored]
 
 
 def test_the_sft_corpus_shares_no_solution_with_the_verifier(tmp_path: Path):
@@ -786,6 +808,11 @@ def test_the_sft_corpus_shares_no_solution_with_the_verifier(tmp_path: Path):
     drills (`answer: 4`) share VALUES with generated math answers by design —
     option (a) keeps the generic bank — so the gate is on the generated
     solution strings, not on the numeric value space.
+
+    The gate must be able to FAIL (review round 2 R2-3): the equality
+    comparison above ran `bytes` against `str` and was vacuous. The last block
+    injects a real verifier pair — the third generator kind, which the old
+    substring check never named — and requires the same helper to name it.
     """
     seed = 1
     path = tmp_path / "sft.bin"
@@ -793,11 +820,18 @@ def test_the_sft_corpus_shares_no_solution_with_the_verifier(tmp_path: Path):
     pairs = _corpus_pairs(path, report["record_bytes"])
     answers = {answer.strip() for _instruction, answer in pairs}
     assert answers, "the SFT corpus is empty"
-    scored: set[str] = set()
-    for cls in ("code", "math"):
-        scored |= {task.solution.strip() for task in build_tasks(cls, seed, n=64)}
+    scored = _verifier_solutions(seed)
     assert scored, "the verifier's solution set is empty"
-    assert answers.isdisjoint(scored), sorted(answers & scored)
+    assert any("def count_vowels(" in s for s in scored), (
+        "the comparison must include the third generator kind"
+    )
+    assert _solution_collisions(pairs, scored) == []
+
+    # Injection: a REAL task the verifier would score must turn the gate red.
+    injected = build_tasks("code", seed, n=3)[2]
+    assert injected.solution.strip() in scored
+    collisions = _solution_collisions([*pairs, (injected.prompt, injected.solution)], scored)
+    assert [answer.strip() for _instruction, answer in collisions] == [injected.solution.strip()]
 
 
 def test_sft_eval_reports_first_byte_agreement(tmp_path):
