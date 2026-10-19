@@ -1028,8 +1028,17 @@ def sft_train(
                 )
 
         if (step + 1) % cfg.ckpt_every == 0:
-            weights, snapshot = save_ckpt(run, model, opt, step)
-            log(f"ckpt step={step + 1} -> {weights} ({snapshot})")
+            # A fresh tally per save, exactly as `train/loop.py` does: a storage
+            # rung's COUNTED degradations (`nvfp4_zero_scale_blocks`) belong to
+            # the FILE just written, and the checkpoint line is where a reader
+            # sees them (review round 1 M3).
+            ck_counts = Counters()
+            weights, snapshot = save_ckpt(run, model, opt, step, counters=ck_counts)
+            ck_line = f"ckpt step={step + 1} -> {weights} ({snapshot})"
+            if ck_counts:
+                total.merge(ck_counts)
+                ck_line += " " + ck_counts.line()
+            log(ck_line)
 
     if sink is not None:
         sink.close()
