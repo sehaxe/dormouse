@@ -12,6 +12,7 @@ import pytest
 from conftest import tiny_model
 
 from dormouse.instrument import LoudError
+from dormouse.post.rollouts import COUNTERS as ROLLOUT_COUNTERS
 from dormouse.post.rollouts import Rollout, rollout
 from dormouse.post.tasks import TASKS_PER_CLASS, build_tasks
 from dormouse.post.train_steps import crr_advantage
@@ -135,3 +136,43 @@ def test_verify_is_pure_and_never_logs_the_raw_response():
     first, second = verify(task, response), verify(task, response)
     assert first == second
     assert "sentinel-9f3a" not in first.reason
+
+
+def test_a_hostile_answer_fails_the_sample_not_the_rollout(monkeypatch):
+    """R3-1 boundary: `(2**1000)**1000` is a failed sample, never a dead batch.
+
+    The model can generate `.` for any byte, so the gate feeds the hostile bytes
+    through the SAME decode seam the rollouts use, then runs the real verifier.
+    The budget is sized for exactly the payload, so the verdict is the numeric
+    refusal and not a truncation.
+    """
+    task = build_tasks("math", 1, 1)[0]
+    answer = b"(2**1000)**1000"
+    fed = {"i": 0}
+
+    def fake_decode(_model, _window, _n, **_kwargs):
+        i = fed["i"]
+        fed["i"] += 1
+        return answer[i : i + 1]
+
+    monkeypatch.setattr("dormouse.post.rollouts.decode_bytes", fake_decode)
+    prompt = len(task.prompt.encode("utf-8"))
+    roll = rollout(tiny_model(), task, prompt + 3 * len(answer), greedy=True)
+    assert roll.passed is False
+    assert roll.verdict.reason.startswith("refused:"), roll.verdict.reason
+    assert "power" in roll.verdict.reason, roll.verdict.reason
+
+
+def test_a_verifier_bug_fails_the_sample_not_the_batch(monkeypatch):
+    """The rollout boundary: even a verifier that RAISES fails one sample."""
+    task = build_tasks("math", 1, 1)[0]
+    before = ROLLOUT_COUNTERS.get("rollout_verify_error", 0)
+
+    def boom(_task, _response):
+        raise RuntimeError("verifier bug")
+
+    monkeypatch.setattr("dormouse.post.rollouts.verify", boom)
+    roll = rollout(tiny_model(), task, len(task.prompt.encode("utf-8")) + 20, greedy=True)
+    assert roll.passed is False
+    assert "RuntimeError" in roll.verdict.reason
+    assert ROLLOUT_COUNTERS.get("rollout_verify_error", 0) == before + 1

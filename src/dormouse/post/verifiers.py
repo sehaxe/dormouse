@@ -32,6 +32,15 @@ file I/O, and the submission executes with an allowlist of builtins.
 the same `Verdict`, and the `reason` never carries the raw response — a byte
 budget and a log line read both, and an unlogged verifier is the ADR-0019
 failure mode. A refusal names the token, never the response text.
+
+It is also **TOTAL**: any byte string is a verdict, never an exception. One
+23-byte answer (`(2**1000)**1000`) used to raise out of the old magnitude check
+— Python 3.12 refuses `str()` above 4 300 digits — and one rollout answer used
+to spend 5.45 s in `simplify`. Every numeric node is now bounded OUTSIDE before
+it is computed ([`MAX_RESULT_BITS`]), every exception in the numeric path is a
+COUNTED refusal ([`COUNTERS`]), and a wall-clock deadline ([`MATH_DEADLINE_S`])
+is the second line. The rollout caller keeps a third one (`rollout_verify_error`
+in `post/rollouts.py`): even a verifier bug fails one sample, not the batch.
 """
 
 from __future__ import annotations
@@ -39,11 +48,12 @@ from __future__ import annotations
 import ast
 import math
 import re
+import time
 from dataclasses import dataclass
 
 import sympy
 
-from ..instrument import loud
+from ..instrument import Counters, LoudError, loud
 from .sandbox import TIMEOUT_S, run_code
 
 #: The math parser's work bounds. These are refusals, not truncations: an answer
@@ -55,11 +65,36 @@ MAX_EXPR_NODES = 64
 MAX_EXPONENT = 1000
 MAX_MAGNITUDE = 1e100
 
+#: The result of every intermediate node, in bits. `333 = ceil(log2(1e100))`:
+#: `10**100` passes, `2**1000` does not. The check runs on the POWER'S OPERANDS
+#: before the power is computed (`_check_pow_size`), so `(2**1000)**1000` is
+#: refused at the inner `2**1000` in microseconds. The old path let the inner
+#: value form, then asked sympy for `2**10^6` (301 030 digits), and a 3-deep
+#: form asked for `2**10^9` — measured 5.45 s, and the 4-deep form is a ~125 GB
+#: integer. With this bound the worst allowed expression measured 0.31 ms on
+#: this box (2026-10-19: `sin(10**99)`, `sin(1)**999`, `pi**100`, `10**100`,
+#: all at the bound). That is the bound stated in the module contract; the
+#: deadline below is a regression alarm, not the bound.
+MAX_RESULT_BITS = 333
+
+#: One answer's wall-clock budget. Checked before and after every node
+#: evaluation and after the numeric difference; a parser/sympy regression that
+#: slips past the operand bounds still returns a refusal promptly.
+MATH_DEADLINE_S = 0.05
+
+#: COUNTED numeric outcomes: `verify_refused` is every hostile/over-bound final
+#: answer (a failed rollout, by design), `verify_error` is an exception the
+#: verifier itself had to absorb (a bug, counted so a log reader sees it).
+COUNTERS = Counters()
+
 __all__ = [
+    "COUNTERS",
+    "MATH_DEADLINE_S",
     "MAX_EXPR_CHARS",
     "MAX_EXPR_NODES",
     "MAX_EXPONENT",
     "MAX_MAGNITUDE",
+    "MAX_RESULT_BITS",
     "TIMEOUT_S",
     "Verdict",
     "sympy_equivalent",
@@ -93,23 +128,34 @@ class _Refused(Exception):
 
 
 def sympy_equivalent(expected: str, got: str) -> bool:
-    """True iff `expected − got` simplifies to 0 (`2/4` == `0.5` == `1/2`).
+    """True iff `expected − got` is exactly 0 (`2/4` == `0.5` == `1/2`).
 
     `got` is model text: it is parsed by the whitelist in [`_safe_expr`] and a
     refusal returns False. `expected` is the task's own reference, so a bad one
     is a task defect and stops the run LOUDLY rather than scoring every rollout
     wrong.
     """
+    deadline = time.monotonic() + MATH_DEADLINE_S
     try:
-        b = _safe_expr(got)
+        b = _safe_expr(got, deadline)
     except _Refused:
+        COUNTERS.count("verify_refused")
         return False
-    a = _expected_expr(expected)
-    return bool(sympy.simplify(a - b) == 0)
+    except Exception:  # model text must never raise out of the reward path
+        COUNTERS.count("verify_error")
+        return False
+    a = _expected_expr(expected, deadline)
+    try:
+        return _equivalent(a, b, deadline)
+    except _Refused:
+        COUNTERS.count("verify_refused")
+        return False
 
 
-def verify(task: dict, response: str) -> Verdict:
+def verify(task: dict, response: str | bytes) -> Verdict:
     """Dispatch on `task["cls"]`; see the module docstring for the three classes."""
+    if isinstance(response, bytes):
+        response = response.decode("utf-8", "replace")
     cls = task.get("cls")
     used = _budget_used(response, int(task.get("budget", 0) or 0))
     if cls == "noop" or task.get("kind") == "noop":
@@ -163,7 +209,19 @@ def _final_answer(response: str) -> str | None:
 
 
 def _short(value: object, n: int = 32) -> str:
-    text = str(value)
+    """A bounded spelling of `value`; TOTAL, because it formats hostile values.
+
+    Python 3.12 raises `ValueError` on `str(int)` above 4 300 digits — that was
+    the R3-1 crash: the magnitude branch formatted the very integer it had just
+    refused. A value too big to spell is named by its size instead.
+    """
+    try:
+        text = str(value)
+    except (ValueError, OverflowError):
+        if isinstance(value, (int, sympy.Integer)):
+            text = f"<{int(value).bit_length()}-bit integer>"
+        else:
+            text = f"<{type(value).__name__}>"
     return text if len(text) <= n else text[: n - 3] + "..."
 
 
@@ -174,26 +232,104 @@ def _token(node: ast.AST) -> str:
         return type(node).__name__
 
 
-def _safe_expr(text: str) -> sympy.Expr:
+def _check_deadline(deadline: float) -> None:
+    if time.monotonic() > deadline:
+        raise _Refused(
+            f">{MATH_DEADLINE_S * 1000:.0f} ms",
+            "the arithmetic exceeded the wall-clock work deadline",
+        )
+
+
+def _bounded(value: sympy.Expr) -> None:
+    """Refuse a node OUTSIDE the cheap numeric band, before it can grow.
+
+    Integer/rational magnitudes are measured in bits (no `float()` on a huge
+    int, no `str()` at all); everything else is evalf'd through `complex()`.
+    Totality is the point: a conversion failure is a refusal naming the size or
+    the type, never an exception out of the verifier.
+    """
+    if isinstance(value, sympy.Integer):
+        if int(value).bit_length() > MAX_RESULT_BITS:
+            raise _Refused(
+                _short(value), f"the integer exceeds the {MAX_RESULT_BITS}-bit work band"
+            )
+        return
+    if isinstance(value, sympy.Rational):
+        if max(int(value.p).bit_length(), int(value.q).bit_length()) > MAX_RESULT_BITS:
+            raise _Refused(
+                _short(value), f"the fraction exceeds the {MAX_RESULT_BITS}-bit work band"
+            )
+        return
+    if isinstance(value, sympy.Float):
+        magnitude = abs(float(value))
+    else:
+        try:
+            magnitude = abs(complex(value))
+        except (TypeError, ValueError, OverflowError):
+            magnitude = math.inf
+    if not math.isfinite(magnitude):
+        raise _Refused(_short(value), "is not a finite number")
+    if magnitude > MAX_MAGNITUDE:
+        raise _Refused(_short(value), f"magnitude exceeds the {MAX_MAGNITUDE:g} work limit")
+
+
+def _check_pow_size(base: sympy.Expr, exponent: sympy.Expr) -> None:
+    """Refuse a power whose RESULT would leave the band, BEFORE computing it.
+
+    The exponent bound is per operation, so it cannot see composition: a 4-deep
+    pow with every exponent = 1000 asks for `2**10^12`. The result's size is the
+    base's log2 times the exponent — arithmetic on floats, no big integer is
+    formed. `|log2|` also covers a base below 1, whose RESULT is tiny but whose
+    exact fraction would grow a huge denominator (`0.5**-1000` = 2**1000).
+    """
+    try:
+        base_f = abs(float(base))
+    except (TypeError, ValueError, OverflowError):
+        return  # a symbolic base is bounded by _bounded's evalf; exponent <= 1000
+    if base_f == 0.0 or not math.isfinite(base_f):
+        return
+    try:
+        bits = abs(math.log2(base_f)) * abs(float(exponent))
+    except (ValueError, OverflowError):
+        bits = math.inf
+    if bits > MAX_RESULT_BITS:
+        raise _Refused(
+            _short(exponent), f"the power would exceed the {MAX_RESULT_BITS}-bit work band"
+        )
+
+
+def _safe_expr(text: str, deadline: float | None = None) -> sympy.Expr:
     """Parse ONE numeric expression under the math whitelist, or raise [`_Refused`]."""
     text = text.strip()
     if not text:
         raise _Refused("''", "the final answer is empty")
     if len(text) > MAX_EXPR_CHARS:
         raise _Refused(f"{len(text)} characters", f"exceeds the {MAX_EXPR_CHARS}-character limit")
+    if deadline is None:
+        deadline = time.monotonic() + MATH_DEADLINE_S
     try:
         tree = ast.parse(text, mode="eval")
-    except SyntaxError as exc:
-        raise _Refused(_short(text), f"is not a valid expression ({exc.msg})") from exc
+    except (SyntaxError, ValueError) as exc:
+        # `ValueError` is the null-byte lexical error: binary garbage is data,
+        # not a crash (`ast.parse` raises it, not `SyntaxError`).
+        msg = getattr(exc, "msg", str(exc))
+        raise _Refused(_short(text), f"is not a valid expression ({msg})") from exc
     nodes = sum(1 for _ in ast.walk(tree))
     if nodes > MAX_EXPR_NODES:
         raise _Refused(f"{nodes} nodes", f"exceeds the {MAX_EXPR_NODES}-node limit")
-    value = _eval_node(tree.body)
-    _check_number(value)
+    return _eval_node(tree.body, deadline)
+
+
+def _eval_node(node: ast.AST, deadline: float) -> sympy.Expr:
+    """Evaluate one node, bounding its value and the clock on the way out."""
+    _check_deadline(deadline)
+    value = _eval_node_raw(node, deadline)
+    _bounded(value)
+    _check_deadline(deadline)
     return value
 
 
-def _eval_node(node: ast.AST) -> sympy.Expr:
+def _eval_node_raw(node: ast.AST, deadline: float) -> sympy.Expr:
     if isinstance(node, ast.Constant):
         value = node.value
         if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -206,24 +342,24 @@ def _eval_node(node: ast.AST) -> sympy.Expr:
             return _CONSTS[node.id]
         raise _Refused(node.id, "is not a name in the math whitelist")
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
-        operand = _eval_node(node.operand)
+        operand = _eval_node(node.operand, deadline)
         return operand if isinstance(node.op, ast.UAdd) else -operand
     if isinstance(node, ast.BinOp):
-        return _eval_binop(node)
+        return _eval_binop(node, deadline)
     if isinstance(node, ast.Call):
         if not isinstance(node.func, ast.Name) or node.func.id not in _FUNCS:
             raise _Refused(_token(node.func), "is not a function in the math whitelist")
         if node.keywords or len(node.args) != 1 or isinstance(node.args[0], ast.Starred):
             raise _Refused(node.func.id, "takes exactly one positional argument")
-        return _FUNCS[node.func.id](_eval_node(node.args[0]))
+        return _FUNCS[node.func.id](_eval_node(node.args[0], deadline))
     raise _Refused(_token(node), f"{type(node).__name__} is not allowed in a final answer")
 
 
-def _eval_binop(node: ast.BinOp) -> sympy.Expr:
+def _eval_binop(node: ast.BinOp, deadline: float) -> sympy.Expr:
     if not isinstance(node.op, _BINOPS):
         raise _Refused(type(node.op).__name__, "is not an operator in the math whitelist")
-    left = _eval_node(node.left)
-    right = _eval_node(node.right)
+    left = _eval_node(node.left, deadline)
+    right = _eval_node(node.right, deadline)
     if isinstance(node.op, ast.Add):
         return left + right
     if isinstance(node.op, ast.Sub):
@@ -234,10 +370,10 @@ def _eval_binop(node: ast.BinOp) -> sympy.Expr:
         if right == 0:
             raise _Refused("/", "division by zero")
         return left / right
-    return _eval_pow(left, right)
+    return _eval_pow(left, right, deadline)
 
 
-def _eval_pow(base: sympy.Expr, exponent: sympy.Expr) -> sympy.Expr:
+def _eval_pow(base: sympy.Expr, exponent: sympy.Expr, deadline: float) -> sympy.Expr:
     if exponent.is_real is False:
         raise _Refused("**", "the exponent must be a real number")
     try:
@@ -246,23 +382,40 @@ def _eval_pow(base: sympy.Expr, exponent: sympy.Expr) -> sympy.Expr:
         raise _Refused(_short(exponent), "the exponent is not a finite number") from None
     if not math.isfinite(magnitude) or magnitude > MAX_EXPONENT:
         raise _Refused(_short(exponent), f"exceeds the {MAX_EXPONENT} exponent limit")
-    return base**exponent
+    _check_pow_size(base, exponent)
+    value = base**exponent
+    _check_deadline(deadline)
+    return value
 
 
-def _check_number(value: sympy.Expr) -> None:
-    if value.is_real is False:
-        raise _Refused(_short(value), "the final answer is not a real number")
+def _equivalent(a: sympy.Expr, b: sympy.Expr, deadline: float) -> bool:
+    """Exact equivalence, with a cheap numeric exit BEFORE `simplify`.
+
+    `simplify` on a symbolic power is the measured 5.45 s path
+    (`sin(1)**999` alone spent > 90 s in it). A numeric difference that is not
+    exactly zero already proves the answers differ, so `simplify` runs only on
+    the numerically-zero case.
+    """
+    diff = a - b
     try:
-        magnitude = abs(complex(value))
+        magnitude = abs(complex(diff))
     except (TypeError, ValueError, OverflowError):
-        raise _Refused(_short(value), "the final answer is not a finite number") from None
-    if not math.isfinite(magnitude) or magnitude > MAX_MAGNITUDE:
-        raise _Refused(_short(value), f"magnitude exceeds the {MAX_MAGNITUDE:g} work limit")
-
-
-def _expected_expr(expected: object) -> sympy.Expr:
+        raise _Refused(_short(diff), "the difference is not a finite number") from None
+    _check_deadline(deadline)
+    if not math.isfinite(magnitude):
+        raise _Refused(_short(diff), "the difference is not finite")
+    if magnitude:
+        return False
     try:
-        return _safe_expr(str(expected))
+        return bool(sympy.simplify(diff) == 0)
+    except Exception:  # a sympy bug is a "not equivalent", never a dead rollout
+        COUNTERS.count("verify_error")
+        return False
+
+
+def _expected_expr(expected: object, deadline: float | None = None) -> sympy.Expr:
+    try:
+        return _safe_expr(str(expected), deadline)
     except _Refused as exc:
         loud(
             f"task reference {_short(expected)!r} is outside the verifier's math "
@@ -275,12 +428,23 @@ def _verify_math(task: dict, response: str, used: float) -> Verdict:
     got = _final_answer(response)
     if got is None or not got:
         return Verdict(False, "no final answer found in the response", used)
+    deadline = time.monotonic() + MATH_DEADLINE_S
     try:
-        b = _safe_expr(got)
+        b = _safe_expr(got, deadline)
+        a = _expected_expr(task["expected"], deadline)
+        ok = _equivalent(a, b, deadline)
     except _Refused as exc:
+        COUNTERS.count("verify_refused")
         return Verdict(False, f"refused: {exc.token!r} {exc.why}", used)
-    a = _expected_expr(task["expected"])
-    ok = bool(sympy.simplify(a - b) == 0)
+    except LoudError:
+        raise  # a bad task reference is task data: LOUD, not a failed rollout
+    except Exception as exc:  # the numeric path's last line: model text never raises
+        COUNTERS.count("verify_error")
+        return Verdict(
+            False,
+            f"refused: {_short(got)!r} raised {type(exc).__name__} in the numeric path",
+            used,
+        )
     reason = "sympy-equivalent" if ok else "not equivalent to the expected answer"
     return Verdict(bool(ok), reason, used)
 
