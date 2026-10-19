@@ -79,6 +79,32 @@ Status values: `fixed` (with the proof named) · `open` · `queued` (a task exis
 | R1-M8 | the eval half of SFT still builds its mask on the device | **open** | `sft.py:711-712`; the training step is host-side and gated (`ea2dc53`), eval is not |
 | R1-M9 | `Counters.merge` drops a distinct reason by substring | **open** | `instrument.py:144-146`; the merge is not a set |
 
+## Round 2's findings (2026-10-19, `2026-10-19-review-round-2.md`)
+
+| # | finding | status | proof |
+|---|---|---|---|
+| R2-1 | the M1 gate compared `bytes` with `str`, so an injected task still passed | **fixed** | `ddc86ba`: str with str, and the test injects a real `count_vowels` task and requires the helper to name it |
+| R2-2 | the SFT corpus still held verifier-scored code/math pairs | **fixed** | `4f61858`: `build_tasks` pairs removed from the corpus, `--n-tasks` gone (an old command line dies loudly), the gate compares SOLUTION TEXT |
+| R2-3 | the no-`--eval` tail was carved in SCORED bytes, so the default 20 windows scored 19 | **fixed** | `4a27ba4`: sized in reads (`eval_batches × batch × (seq_len+1)`); `test_the_no_eval_tail_is_sized_in_reads` |
+| R2-4 | SFT/RL saves passed no counters, so the nvfp4 tally never reached their lines | **fixed** | `d5b028a`; `tests/test_save_counters.py` |
+| R2-5 | a missing `.lfb` refused every reader, and `moe_lb_coef=0` was refused on resume | **fixed** | `952b53a`: LOUD only on a training resume with the controller on; readers and controller-off resumes get the COUNTED line |
+| R2-6 | the 1 MiB-capped eval reports the REQUESTED window, not what the cap allows | **open** | `loop.py` prints `requested` in the shortfall field; the honest number is what the cap permits |
+| R2-7 | `verify` raised `ValueError` on `answer: (2**1000)**1000` and spent 5.45 s on a 3-deep form | **fixed** | `d822ac5`: `MAX_RESULT_BITS=333` checked BEFORE the power is computed, 50 ms deadline, worst allowed expression 0.31 ms |
+| R2-8 | the reward path had no boundary: a verifier bug killed the rollout batch | **fixed** | `7c48b0c`: `rollouts.py` counts `rollout_verify_error` and fails the SAMPLE |
+| R2-9 | the code jail was bypassed through `os.open`/`pathlib` | **fixed** | `ac18f3a`: AST allowlist + child guard; 21 table escapes + 9 more blocked, 768/768 reference solutions pass |
+| R2-10 | the math verifier executed the model's answer text in the trainer (sympy RCE) | **fixed** | `93a81c3`: numeric whitelist, `/tmp/pwn_*` markers absent in the gate |
+
+## Round 3's findings (2026-10-19, `2026-10-19-review-round-3.md`)
+
+| # | finding | status | proof |
+|---|---|---|---|
+| R3-1 | the reward path died on a 23-byte answer; no timeout on the numeric path | **fixed** | `d822ac5` + `7c48b0c` (see R2-7/R2-8) |
+| R3-2 | the M1 decode gate could pass on a revert | **fixed** | `a863aad`: a non-ASCII record makes the raw-bytes comparison visibly different |
+| R3-3 | the LFB scoping stopped at the pretrain trainer; `lfb_counts` accumulated 11.8e9 across a run | **fixed** | `049449b`: SFT/RL pass `resume=True`; counts zeroed on load (`test_a_resume_counts_only_the_steps_since_the_load`) |
+| R3-4 | a mixture run extended with more `steps` resumed from the wrong position | **fixed** | `75b5a1d`: `skip_to_step(step, budget=stored_steps)`; the gate replays the prefix under the checkpoints' budget |
+| R3-5 | the ledger claimed `moe_lb_coef=0` was "the same function" | **fixed** | `049449b`: it is a COUNTED break-glass, and the line says the routing differs from the stored step |
+| R3-6 | the depth/loom gates expected the read-sized tail's window count | **fixed** | `8a8650f`: 3 windows, with the arithmetic in the comment |
+
 ## What the ledger is for
 
 The review loop the owner asked for: fix → an independent reviewer verifies the
