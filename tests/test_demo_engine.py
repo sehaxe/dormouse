@@ -100,6 +100,22 @@ def _run_engine_test(artifact: Path, ref: dict, tmp_path: Path) -> str:
     return proc.stdout
 
 
+def _parity_line(out: str) -> str:
+    """The gate's own number, in whichever reporter the local node defaults to.
+
+    node's spec reporter (the default from v22) prints a test's `console.log` as
+    `# parity ...`; the TAP reporter (the default on v20, and on a CI runner)
+    ESCAPES the leading hash as `# \\# parity ...`. Same line, two spellings — a
+    gate that reads only one of them is a gate that fails on the other machine,
+    which is exactly what happened: green here, red on the runner.
+    """
+    for raw in out.splitlines():
+        line = raw.replace("# \\# ", "# ")
+        if line.startswith("# parity"):
+            return line
+    raise AssertionError(f"no parity line in the engine test's output:\n{out[-2000:]}")
+
+
 def _parity_case(model: DormouseModel, tmp_path: Path, label: str) -> str:
     """Export → Python reference → `node --test`, one case end to end."""
     artifact = tmp_path / f"{label}.dormouse"
@@ -122,7 +138,7 @@ def test_engine_matches_python_on_the_tiny_fixture(tmp_path: Path) -> None:
     torch.manual_seed(0)
     model = tiny_model(moe_topk=0)  # the dense blend the engine implements
     out = _parity_case(model, tmp_path, "tiny")
-    line = next(ln for ln in out.splitlines() if ln.startswith("# parity"))
+    line = _parity_line(out)
     print(line)  # the number, on the test's own output: evidence, not a vibe
     assert "max |Δlogit|" in line
 
@@ -132,7 +148,7 @@ def test_engine_matches_python_on_the_small_polygon(tmp_path: Path) -> None:
     torch.manual_seed(0)
     model = DormouseModel(load_preset("small"))
     out = _parity_case(model, tmp_path, "small")
-    line = next(ln for ln in out.splitlines() if ln.startswith("# parity"))
+    line = _parity_line(out)
     # the measured number, printed so a reader of the log sees it — the gate
     # itself is the JS assertion, not this line
     print(line)
