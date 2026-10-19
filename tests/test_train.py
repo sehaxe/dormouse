@@ -92,7 +92,11 @@ def test_eval_line_prints_the_byte_window(tmp_path):
     assert window == 3 * BATCH * SEQ
     assert report["eval_window_bytes"] == window
     evals = [ln for ln in lines if ln.startswith("eval ")]
-    assert evals and f"over {window} B (3 x {BATCH} x {SEQ})" in evals[0]
+    # The eval tail is exactly `eval_window_bytes` (384 B), but one window READS
+    # `batch × (seq_len + 1)` = 130 B and scores 128, so only TWO whole windows
+    # fit (round 1 M5: the old code read three and wrapped the last one).
+    assert evals and f"over {2 * BATCH * SEQ} B (2 x {BATCH} x {SEQ}, requested 3)" in evals[0]
+    assert "shortfall" in evals[0] and "left over" in evals[0]
 
 
 def test_the_tail_eval_prints_only_the_bytes_it_scored(tmp_path):
@@ -145,6 +149,58 @@ def test_the_tail_eval_prints_only_the_bytes_it_scored(tmp_path):
     assert f"over {scored} B" in line
     assert "shortfall" in line and f"requested {requested} B" in line
     assert f"the eval stream holds {1 << 20} B" in line
+
+
+def test_only_whole_eval_windows_are_scored_and_the_leftover_is_named(tmp_path):
+    """M5: one window reads `batch × (seq_len + 1)` bytes; score only wholes.
+
+    160 B with `batch × seq_len == 512` (batch 1) is below one read (513) and
+    must score 0 B and say why; 672 B with batch 2 / seq_len 256 holds one read
+    (514), scores 512 B, and says the other 160 B were left over.
+    """
+    from dormouse.config import TrainConfig
+    from dormouse.train.data import ByteStream
+    from dormouse.train.loop import _eval_batches, _eval_line
+
+    class _Counting(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.seen = 0
+
+        def forward(self, x, targets=None, counters=None, **kw):
+            self.seen += x.numel()
+            return None, torch.tensor(1.0), counters
+
+    class _Range:
+        """160 B with batch × seq_len == 512 — below even one 513 B read."""
+
+        batch, seq_len, lo, hi = 1, 512, 0, 160
+
+        def rewind(self) -> None:
+            pass
+
+        def next_batch(self):  # pragma: no cover - must never be called
+            raise AssertionError("a range with no whole window must not be read")
+
+    stub = _Range()
+    assert _eval_batches(stub, 4) == 0
+    zero_line, _loss, zero = _eval_line(
+        _Counting(), stub, TrainConfig(batch=1, seq_len=512), 1, None, 1
+    )
+    assert zero == 0, "a range with no whole read must score nothing"
+    assert "over 0 B" in zero_line and "no whole window fits" in zero_line
+    assert "holds 160 B" in zero_line and "left over 160 B" in zero_line
+
+    data = tmp_path / "long.bin"
+    data.write_bytes(bytes(range(256)) * 3 + b"x" * 160)
+    assert data.stat().st_size == 928
+    stream = ByteStream(data, 2, 256, hi=672)
+    cfg = TrainConfig(batch=2, seq_len=256, eval_batches=4)
+    model = _Counting()
+    line, _loss, scored = _eval_line(model, stream, cfg, 1, None, 1)
+    assert scored == model.seen == 512
+    assert "over 512 B (1 x 2 x 256, requested 4)" in line
+    assert "holds 672 B" in line and "left over 160 B" in line
 
 
 def test_log_line_carries_the_kda_arm_and_counters(tmp_path):

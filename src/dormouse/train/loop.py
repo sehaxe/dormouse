@@ -401,19 +401,23 @@ def _sample_depth(seed: int, step: int, max_iter: int) -> int:
 
 
 def _eval_batches(stream: ByteStream, requested: int) -> int:
-    """How many eval windows the stream's byte range holds, capped at `requested`.
+    """How many WHOLE eval windows the stream's byte range holds, capped at `requested`.
 
-    The window's reportable size is `batch × seq_len` bytes, so that is the
-    denominator a range is worth: `span // (batch × seq_len)`. `open_streams`
-    caps the no-`--eval` tail at 1 MiB, so a large
+    One `next_batch` reads `batch × (seq_len + 1)` bytes (the next-byte shift)
+    and scores `batch × seq_len` of them, so that read is the denominator a
+    range is worth: `span // (batch × (seq_len + 1))`. The old denominator
+    (`batch × seq_len`) let the last window overrun the range and wrap into its
+    head — the 160 B / 640 B wrap review round 1 measured (M5). A range can
+    still be large enough for `ByteStream` (which requires `batch × seq_len + 1`
+    bytes) yet hold no whole window: then this returns 0 and the line says so.
+    `open_streams` caps the no-`--eval` tail at 1 MiB, so a large
     `eval_batches × batch × seq_len` asks for more than the tail holds; the eval
     scores the windows that fit and the line names the shortfall (COUNTED —
-    audit 2026-10-19 M5). Never 0: `ByteStream` refuses a range smaller than one
-    batch before this is called.
+    audit 2026-10-19 M5).
     """
-    per_window = stream.batch * stream.seq_len
+    per_window = stream.batch * (stream.seq_len + 1)
     assert per_window > 0, "an eval window has no bytes"
-    return max(1, min(requested, (stream.hi - stream.lo) // per_window))
+    return max(0, min(requested, (stream.hi - stream.lo) // per_window))
 
 
 def _eval_loss(
@@ -443,9 +447,15 @@ def _eval_loss(
     prints). They are the eval's, not the run's: a training counter would say
     the memory ran during an eval that ran without it, which is exactly the
     blind spot of AGENTS §3.2's retracted arm.
+
+    With no WHOLE window in the range the pass scores 0 B and returns NaN loss:
+    there is no measurement to report, and a fabricated 0.0 would read as a
+    perfect score (`_eval_line` names the bytes left unscored).
     """
     stream.rewind()
     batches = _eval_batches(stream, batches)
+    if batches == 0:
+        return float("nan"), 0, float("nan"), []
     total = 0.0
     scored = 0
     fin_total = 0.0
@@ -477,7 +487,7 @@ def _eval_loss(
                     per_iter_acc = [0.0] * len(per)
                 for j, v in enumerate(per):
                     per_iter_acc[j] += v
-    n = max(batches, 1)
+    n = batches
     model.train(was_training)
     if counters is not None:
         counters.merge(ev_counters)
@@ -571,7 +581,13 @@ def _eval_line(
             f" shortfall: requested {window} B over {cfg.eval_batches} batch(es), "
             f"the eval stream holds {held} B; scored {scored} B"
             + (f" over {ran} batch(es)" if ran != cfg.eval_batches else "")
+            + f", left over {held - scored} B"
         )
+        if ran == 0:
+            line += (
+                f" (no whole window fits: one read is {cfg.batch} x "
+                f"({cfg.seq_len} + 1) = {cfg.batch * (cfg.seq_len + 1)} B)"
+            )
 
     if per_iter:
         line += " periter=" + ",".join(f"{v:.4f}" for v in per_iter)
