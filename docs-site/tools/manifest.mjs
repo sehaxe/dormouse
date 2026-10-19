@@ -259,6 +259,7 @@ export const pages = [
 	{ src: 'docs/architecture/library-crate-fate.md', out: 'architecture/library-crate-fate' },
 	{ src: 'docs/architecture/post-training.md', out: 'architecture/post-training' },
 	{ src: 'docs/architecture/bf16-plan.md', out: 'architecture/bf16-plan' },
+	{ src: 'docs/architecture/multi-gpu.md', out: 'architecture/multi-gpu', title: 'Multi-GPU and heterogeneous hardware', nav: 'Multi-GPU' },
 
 	// ── Protocols ────────────────────────────────────────────────────────────
 	{ src: 'docs/protocols/AB-PROTOCOL.md', out: 'protocols/ab-protocol' },
