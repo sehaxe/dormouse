@@ -108,18 +108,27 @@ def _lfb_state(model: torch.nn.Module) -> dict[str, torch.Tensor]:
     }
 
 
-def _restore_lfb(model: torch.nn.Module, cfg: TrainConfig, *, log=print) -> None:
+def _restore_lfb(
+    model: torch.nn.Module, cfg: TrainConfig, *, log=print, resume: bool = False
+) -> None:
     """Restore the LFB bias from `<ckpt_name>.lfb` when the checkpoint has one.
 
-    A checkpoint written before the sidecar existed cannot supply it. That is
-    reported, never silent (review round 1 M7): with `moe_lb_coef > 0` the
-    routing controller is live, and starting it from a zero bias under the
-    checkpoint's own step count is a different network — LOUD, naming the
-    escape. With the controller off (`moe_lb_coef == 0`) the bias steers
-    nothing, so the reset is COUNTED on the load line instead of stopping a
-    legal read. A sidecar naming a buffer this model does not have, or a shape
-    mismatch, is LOUD: silently dropping controller state is the class this
-    sidecar fixes.
+    A checkpoint written before the sidecar existed cannot supply it, and the
+    mark depends on WHO is loading (review round 2 R2-2):
+
+    * a TRAINING RESUME (`resume=True`) with the controller live
+      (`moe_lb_coef > 0`) is LOUD: the next optimizer step would integrate from
+      a zero bias under the checkpoint's own step count — a different network.
+      The escape is the sidecar, or an explicit `moe_lb_coef=0` (the
+      controller is off, so the bias steers nothing);
+    * every reader — eval/decode/serve/export/bench, an SFT/RL `--init-from`,
+      and a resume with `moe_lb_coef == 0` — loads with the controller zeroed
+      and a COUNTED `lfb: no sidecar, controller zeroed` line. There is no
+      objective to continue, and a LOUD here would brick every pre-sidecar
+      artifact for every reader (the failure this scoping fixes).
+
+    A sidecar naming a buffer this model does not have, or a shape mismatch,
+    is LOUD: silently dropping controller state is the class this sidecar fixes.
     """
     path = lfb_path(cfg)
     buffers = dict(model.named_buffers())
@@ -127,18 +136,18 @@ def _restore_lfb(model: torch.nn.Module, cfg: TrainConfig, *, log=print) -> None
         return  # no LFB in this model: nothing to restore, nothing to report
     if not path.is_file():
         coef = float(getattr(getattr(model, "cfg", None), "moe_lb_coef", 0.0))
-        if coef > 0:
+        if coef > 0 and resume:
             loud(
                 f"LFB sidecar {path} is missing but this model runs "
-                f"moe_lb_coef={coef}: the run has a live routing controller and "
-                f"its bias is not in the model half. Loading it would reset the "
-                f"controller to zero under the checkpoint's step count — a "
+                f"moe_lb_coef={coef}: a training resume would continue the routing "
+                f"controller from a zero bias under the checkpoint's step count — a "
                 f"different network. "
-                f"Escape: restore the `{path.name}` sibling, or load with "
+                f"Escape: restore the `{path.name}` sibling, or resume with "
                 f"moe_lb_coef=0 if the controller is meant to be off."
             )
-        log(f"lfb: no sidecar at {path}, controller reset (moe_lb_coef=0)")
+        log(f"lfb: no sidecar, controller zeroed ({path}, moe_lb_coef={coef})")
         return
+
     state = torch.load(path, map_location="cpu", weights_only=True)
     missing = sorted(k for k in state if k not in buffers)
     if missing:
@@ -349,7 +358,13 @@ def require_ngram(cfg: TrainConfig) -> None:
 
 
 def load_model_state(
-    model: torch.nn.Module, cfg: TrainConfig, sd: dict, *, strict: bool = True, log=print
+    model: torch.nn.Module,
+    cfg: TrainConfig,
+    sd: dict,
+    *,
+    strict: bool = True,
+    log=print,
+    resume: bool = False,
 ):
     """The ONE way a checkpoint's model half reaches a model.
 
@@ -370,9 +385,10 @@ def load_model_state(
     The LFB bias is restored from the `<ckpt>.lfb` sibling after the load when
     that file exists (`_restore_lfb`): it is a non-persistent buffer (see
     `lfb_path`), so a plain `load_state_dict` would reset the routing
-    controller a resume is supposed to continue. A missing sidecar on a model
-    with `moe_lb_coef > 0` is LOUD there; with the controller off it is COUNTED
-    on `log`.
+    controller a resume is supposed to continue. `resume=True` is the
+    TRAINER's resume only: a missing sidecar with the controller live is LOUD
+    there, and every reader (or a resume with `moe_lb_coef=0`) gets the COUNTED
+    zeroed line instead of a refusal.
     """
     if cfg.engram_ram:
         require_ngram(cfg)
@@ -380,7 +396,7 @@ def load_model_state(
     result = model.load_state_dict(sd, strict=strict)
     if cfg.engram_ram:
         load_host_state(model, load_ngram(cfg))
-    _restore_lfb(model, cfg, log=log)
+    _restore_lfb(model, cfg, log=log, resume=resume)
     return result
 
 
@@ -403,6 +419,13 @@ def load_ckpt(run: RunConfig) -> tuple[dict, RunConfig]:
         require_ngram(run.train)
     stored = RunConfig.from_snapshot(snapshot.read_text())
     drift = run.diff_keys(stored)
+    # The controller-off escape (`_restore_lfb`): a pre-sidecar checkpoint has
+    # no bias to restore, and `moe_lb_coef=0` is the documented way to continue
+    # it — the controller steers nothing, so a zero bias is the same function.
+    # Only that one key, only to 0, and only when the sidecar really is absent;
+    # every other model/train change is still refused.
+    if run.model.moe_lb_coef == 0 and not lfb_path(run.train).is_file():
+        drift = [k for k in drift if k != "model.moe_lb_coef"]
     if drift:
         loud(
             f"resume refused: {snapshot} was written by a config that differs in "
@@ -771,7 +794,7 @@ def train(
     start = 0
     if resume:
         ck, _stored = load_ckpt(run)
-        load_model_state(model, cfg, ck["model"], log=log)
+        load_model_state(model, cfg, ck["model"], log=log, resume=True)
         opt.load_state_dict(ck["opt"])
         start = int(ck["step"]) + 1
         if start:
