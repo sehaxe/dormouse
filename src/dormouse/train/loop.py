@@ -448,10 +448,11 @@ def _eval_batches(stream: ByteStream, requested: int) -> int:
     head — the 160 B / 640 B wrap review round 1 measured (M5). A range can
     still be large enough for `ByteStream` (which requires `batch × seq_len + 1`
     bytes) yet hold no whole window: then this returns 0 and the line says so.
-    `open_streams` caps the no-`--eval` tail at 1 MiB, so a large
-    `eval_batches × batch × seq_len` asks for more than the tail holds; the eval
-    scores the windows that fit and the line names the shortfall (COUNTED —
-    audit 2026-10-19 M5).
+    `open_streams` sizes the no-`--eval` tail in READS
+    (`eval_batches × batch × (seq_len + 1)`, capped at 1 MiB), so the cap is
+    the only reason a shortfall remains; the eval scores the windows that fit
+    and the line names what is missing (COUNTED — audit 2026-10-19 M5, review
+    round 2 R2-1).
     """
     per_window = stream.batch * (stream.seq_len + 1)
     assert per_window > 0, "an eval window has no bytes"

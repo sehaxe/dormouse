@@ -416,6 +416,19 @@ def eval_window_bytes(cfg: TrainConfig) -> int:
     return cfg.eval_batches * cfg.batch * cfg.seq_len
 
 
+def eval_read_bytes(cfg: TrainConfig) -> int:
+    """`eval_batches × batch × (seq_len + 1)` — the bytes the eval READS.
+
+    One window READS one byte more than it SCORES (the next-byte shift), so a
+    tail sized as scored bytes holds one window fewer than the config asks for
+    (review round 2 R2-1: 20 x 8 x 512 on a 81 920 B tail scored 19 windows).
+    `open_streams` carves the no-`--eval` tail with THIS number; the 1 MiB cap
+    is then the only reason the eval can still fall short, and `_eval_line`
+    names it.
+    """
+    return cfg.eval_batches * cfg.batch * (cfg.seq_len + 1)
+
+
 def split_points(size: int, eval_bytes: int) -> tuple[int, int]:
     """`(hi_train, hi_total)`: the eval tail is the LAST `eval_bytes` bytes."""
     if eval_bytes < 0:
@@ -430,7 +443,10 @@ def open_streams(run, *, ring_bytes: int = DEFAULT_RING) -> tuple[ByteStream, By
 
     `eval_data` names a DIFFERENT file (the burn recipe's held-out tail carve).
     When it is empty the eval tail of the train file is used, and the train
-    stream's high bound stops one window short of it — the no-leak split.
+    stream's high bound stops one window short of it — the no-leak split. The
+    tail is sized in READS (`eval_read_bytes`), not scored bytes, so
+    `eval_batches` whole windows fit (capped at 1 MiB; a shortfall above the
+    cap is named on the eval line).
     """
     tr = run.train
     if not tr.data:
@@ -451,7 +467,7 @@ def open_streams(run, *, ring_bytes: int = DEFAULT_RING) -> tuple[ByteStream, By
         )
         train = ByteStream(tr.data, tr.batch, tr.seq_len, ring_bytes=ring_bytes)
         return train, ev
-    ev_bytes = min(max(eval_window_bytes(tr), 1), 1 << 20) if tr.eval else 0
+    ev_bytes = min(max(eval_read_bytes(tr), 1), 1 << 20) if tr.eval else 0
     hi_train, _ = split_points(Path(tr.data).stat().st_size, ev_bytes)
     train = ByteStream(tr.data, tr.batch, tr.seq_len, lo=0, hi=hi_train, ring_bytes=ring_bytes)
     ev = (

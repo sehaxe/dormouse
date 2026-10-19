@@ -92,11 +92,76 @@ def test_eval_line_prints_the_byte_window(tmp_path):
     assert window == 3 * BATCH * SEQ
     assert report["eval_window_bytes"] == window
     evals = [ln for ln in lines if ln.startswith("eval ")]
-    # The eval tail is exactly `eval_window_bytes` (384 B), but one window READS
-    # `batch × (seq_len + 1)` = 130 B and scores 128, so only TWO whole windows
-    # fit (round 1 M5: the old code read three and wrapped the last one).
-    assert evals and f"over {2 * BATCH * SEQ} B (2 x {BATCH} x {SEQ}, requested 3)" in evals[0]
-    assert "shortfall" in evals[0] and "left over" in evals[0]
+    # The tail is sized in READS (`eval_batches × batch × (seq_len + 1)` = 390 B
+    # here), so ALL THREE windows the config asks for fit; the old fixture
+    # encoded the 384 B scored-byte tail that held only two (review round 2
+    # R2-1).
+    assert evals and f"over {3 * BATCH * SEQ} B (3 x {BATCH} x {SEQ})" in evals[0]
+    assert "shortfall" not in evals[0]
+
+
+def test_the_no_eval_tail_is_sized_in_reads(tmp_path):
+    """R2-1: the default 20-window request scores 20 windows, not 19.
+
+    One window READS `batch × (seq_len + 1)` bytes and scores `batch × seq_len`
+    (the next-byte shift), so a tail carved as scored bytes held one window
+    fewer: the default `20 × 8 × 512` asked for 81 920 B, one read is 4 104 B,
+    only 19 fits, and 77 824 B were scored. The tail is now carved in reads.
+    The 1 MiB cap is still a real shortfall, and the line must name it.
+    """
+    import dataclasses
+
+    from conftest import tiny_cfg
+
+    from dormouse.train.data import eval_read_bytes, open_streams
+    from dormouse.train.loop import _eval_line
+
+    run = dataclasses.replace(
+        tiny_run(
+            tmp_path,
+            steps=1,
+            eval=True,
+            eval_every=1,
+            eval_batches=20,
+            batch=8,
+            seq_len=512,
+            data=str(tmp_path / "corpus.bin"),
+        ),
+        model=tiny_cfg(max_seq_len=512),
+    )
+    write_corpus(tmp_path / "corpus.bin", 2 << 20)
+    _train, ev = open_streams(run)
+    assert ev is not None
+    assert eval_read_bytes(run.train) == 20 * 8 * (512 + 1) == 82_080
+    assert ev.hi - ev.lo >= 20 * 8 * (512 + 1), "the tail must hold every read"
+
+    class _Counting(nn.Module):
+        """The bytes scored are the tokens this model is handed."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.seen = 0
+
+        def forward(self, x, targets=None, counters=None, **kw):
+            self.seen += x.numel()
+            return None, torch.tensor(1.0), counters
+
+    model = _Counting()
+    line, _loss, scored = _eval_line(model, ev, run.train, run.model.max_iter, None, 1)
+    assert eval_window_bytes(run.train) == 20 * 8 * 512 == 81_920
+    assert scored == model.seen == 20 * 8 * 512
+    assert "over 81920 B (20 x 8 x 512)" in line, line
+    assert "shortfall" not in line
+
+    # A deliberately tiny tail: the 1 MiB cap binds, so the honest shortfall
+    # is still reported (COUNTED) rather than claimed away.
+    capped = dataclasses.replace(run.train, eval_batches=4096)
+    _train, ev = open_streams(dataclasses.replace(run, train=capped))
+    assert ev is not None and ev.hi - ev.lo == 1 << 20
+    model = _Counting()
+    line, _loss, scored = _eval_line(model, ev, capped, run.model.max_iter, None, 1)
+    assert scored == model.seen < eval_window_bytes(capped)
+    assert "shortfall" in line and f"requested {eval_window_bytes(capped)} B" in line
 
 
 def test_the_tail_eval_prints_only_the_bytes_it_scored(tmp_path):
@@ -255,11 +320,13 @@ def test_a_tiny_nvfp4_block_is_counted_on_the_checkpoint_line(tmp_path):
     assert clean_ckpts and "nvfp4_zero_scale_blocks" not in clean_ckpts[0]
 
 
-def test_a_missing_lfb_sidecar_is_loud_when_the_controller_is_on(tmp_path):
-    """M7: an OLD checkpoint must not resume with bias=0 silently.
+def test_a_missing_lfb_sidecar_is_loud_on_a_training_resume(tmp_path):
+    """M7/R2-2: a RESUME must not continue with bias=0 silently.
 
     With `moe_lb_coef > 0` the bias steers routing; the sidecar is the only
-    copy of it. Refusing is the reading that cannot mislead.
+    copy of it, and a resume integrates from whatever it loads. Refusing is the
+    reading that cannot mislead — for a training resume only; the readers load
+    with a COUNTED line (`test_lfb.py`).
     """
     import dataclasses
 
@@ -276,7 +343,12 @@ def test_a_missing_lfb_sidecar_is_loud_when_the_controller_is_on(tmp_path):
     lfb_path(run.train).unlink()
     fresh = DormouseModel(run.model)
     with pytest.raises(LoudError, match="LFB sidecar"):
-        load_model_state(fresh, run.train, load_model_half(weights))
+        load_model_state(fresh, run.train, load_model_half(weights), resume=True)
+    # The same checkpoint loads as a READER: no objective to continue, and the
+    # zeroed controller is on the log (R2-2: a LOUD here bricks every reader).
+    lines: list[str] = []
+    load_model_state(fresh, run.train, load_model_half(weights), log=lines.append)
+    assert any("lfb: no sidecar, controller zeroed" in line for line in lines), lines
 
 
 def test_a_missing_lfb_sidecar_is_counted_when_the_controller_is_off(tmp_path):
@@ -298,7 +370,7 @@ def test_a_missing_lfb_sidecar_is_counted_when_the_controller_is_off(tmp_path):
     load_model_state(
         DormouseModel(run.model), run.train, load_model_half(weights), log=lines.append
     )
-    assert any("lfb: no sidecar" in line and "controller reset" in line for line in lines)
+    assert any("lfb: no sidecar, controller zeroed" in line for line in lines)
 
 
 def test_log_line_carries_the_kda_arm_and_counters(tmp_path):
