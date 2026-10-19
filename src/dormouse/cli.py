@@ -121,6 +121,38 @@ def _apply_dtype(run: RunConfig, dev: torch.device, log) -> RunConfig:
     return apply_policy(run, [policy])
 
 
+def _apply_fit(run: RunConfig, fit_gb: float, log) -> RunConfig:
+    """The `--fit` seam: 0 (default) is a no-op; anything else resolves and prints.
+
+    The knob is a RESOLVER, not a config field: the run's config then carries
+    the mechanisms themselves (`engram_ram=true`, `optim_8bit=true`, …), so the
+    snapshot says what ran and a resume refuses a different set. On a fleet the
+    plan uses the largest rank's micro-batch (the one that must fit) and never
+    engages the host tables (they do not reduce across ranks).
+    """
+    if not fit_gb:
+        return run
+    from .train.fit import apply_fit, plan_fit
+
+    batch = run.train.batch
+    if run.train.dist and run.train.dist_capacity not in ("", "auto"):
+        from .train.distributed import parse_capacity
+
+        world = int(os.environ.get("WORLD_SIZE", "1"))
+        batch = max(
+            s.batch
+            for s in parse_capacity(
+                run.train.dist_capacity,
+                world_size=world,
+                cfg=run.train,
+                max_seq_len=run.model.max_seq_len,
+            )
+        )
+    plan = plan_fit(run, fit_gb, batch=batch)
+    log(plan.line())
+    return apply_fit(run, plan)
+
+
 def _freeze_gc() -> None:
     """The GC-storm fix for long runs (gdb-found, 2026-10-16).
 
@@ -266,6 +298,13 @@ def train_cmd(
             help="per-rank micro-batches for --dist: '4,2', '4x512,2x256', or auto",
         ),
     ] = "",
+    fit: Annotated[
+        float,
+        typer.Option(
+            "--fit",
+            help="fit a card of this many GB (0 = off): resolves a memory-mechanism set",
+        ),
+    ] = 0.0,
     resume: Annotated[
         bool, typer.Option(help="continue `ckpt_name`; a drifted config refuses")
     ] = False,
@@ -292,6 +331,7 @@ def train_cmd(
     if capacity:
         train_over["dist_capacity"] = capacity
     run = load_run(preset, model_overrides=model_over, train_overrides=train_over)
+    run = _apply_fit(run, fit, log=print)
     dev = _device(device)
     world = int(os.environ.get("WORLD_SIZE", "1"))
     if dist and world <= 1:
