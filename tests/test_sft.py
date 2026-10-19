@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import warnings
 from pathlib import Path
 
 import pytest
@@ -39,6 +40,11 @@ from dormouse.train.sft import (
 
 runner = CliRunner()
 SEQ, BATCH = 64, 2
+
+CUDA = pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="sync-debug mode only guards CUDA work; without a card this gate cannot fire",
+)
 
 
 def tiny_model_cfg(**over) -> ModelConfig:
@@ -869,6 +875,45 @@ def test_the_logged_sft_byte_count_is_the_host_mask_count(tmp_path: Path):
         assert report["supervised_bytes"] == expected
         counts.append(step_line.split("sft_bytes=")[1].split()[0])
     assert counts[0] == counts[1] == str(expected)
+
+
+@CUDA
+def test_the_sft_step_builds_and_counts_its_mask_on_the_host(tmp_path, monkeypatch):
+    """(d) gate: on CUDA, a D2H read is a warning, so the step's byte seam is visible.
+
+    The CPU test above cannot fail on revert: the pre-fix code produced the same
+    number by counting on the device. This runs one real SFT step on the card
+    and asserts (1) `sft_mask` first sees a CPU window, i.e. the mask is built
+    before the device seam, and (2) the step's only synchronising operation is
+    the ONE declared loss-scalar read (`float(loss.detach())`). `log_every=2`
+    keeps the counters' declared log-cadence drain out of a one-step run.
+    """
+    corpus = tmp_path / "sft.bin"
+    build_sft_corpus(corpus, seed=1, seq_len=SEQ)
+    run = sft_run(tmp_path, corpus=corpus, steps=1, log_every=2)
+    import dormouse.train.sft as sft_mod
+
+    seen: list[str] = []
+    real = sft_mod.sft_mask
+
+    def spy(windows):
+        seen.append(windows.device.type)
+        mask = real(windows)
+        assert mask.device.type == "cpu", "the mask left the host before the count"
+        return mask
+
+    monkeypatch.setattr(sft_mod, "sft_mask", spy)
+    model = DormouseModel(run.model).to("cuda")
+    torch.cuda.set_sync_debug_mode("warn")
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            sft_train(model, run, device=torch.device("cuda"), log=lambda *_: None)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    assert seen and seen[0] == "cpu", seen
+    syncs = [str(w.message) for w in caught if "synchroniz" in str(w.message).lower()]
+    assert len(syncs) <= 1, syncs
 
 
 def test_ru_bank_is_broad_and_fits_one_window():
