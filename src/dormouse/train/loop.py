@@ -108,19 +108,38 @@ def _lfb_state(model: torch.nn.Module) -> dict[str, torch.Tensor]:
     }
 
 
-def _restore_lfb(model: torch.nn.Module, cfg: TrainConfig) -> None:
+def _restore_lfb(model: torch.nn.Module, cfg: TrainConfig, *, log=print) -> None:
     """Restore the LFB bias from `<ckpt_name>.lfb` when the checkpoint has one.
 
-    A checkpoint written before the sidecar existed cannot supply it; the bias
-    then stays at its fresh zero, which is the only state that file recorded.
-    A sidecar naming a buffer this model does not have, or a shape mismatch, is
-    LOUD: silently dropping controller state is the class this sidecar fixes.
+    A checkpoint written before the sidecar existed cannot supply it. That is
+    reported, never silent (review round 1 M7): with `moe_lb_coef > 0` the
+    routing controller is live, and starting it from a zero bias under the
+    checkpoint's own step count is a different network — LOUD, naming the
+    escape. With the controller off (`moe_lb_coef == 0`) the bias steers
+    nothing, so the reset is COUNTED on the load line instead of stopping a
+    legal read. A sidecar naming a buffer this model does not have, or a shape
+    mismatch, is LOUD: silently dropping controller state is the class this
+    sidecar fixes.
     """
     path = lfb_path(cfg)
+    buffers = dict(model.named_buffers())
+    if not any(name.rpartition(".")[2] == "lfb_bias" for name in buffers):
+        return  # no LFB in this model: nothing to restore, nothing to report
     if not path.is_file():
+        coef = float(getattr(getattr(model, "cfg", None), "moe_lb_coef", 0.0))
+        if coef > 0:
+            loud(
+                f"LFB sidecar {path} is missing but this model runs "
+                f"moe_lb_coef={coef}: the run has a live routing controller and "
+                f"its bias is not in the model half. Loading it would reset the "
+                f"controller to zero under the checkpoint's step count — a "
+                f"different network. "
+                f"Escape: restore the `{path.name}` sibling, or load with "
+                f"moe_lb_coef=0 if the controller is meant to be off."
+            )
+        log(f"lfb: no sidecar at {path}, controller reset (moe_lb_coef=0)")
         return
     state = torch.load(path, map_location="cpu", weights_only=True)
-    buffers = dict(model.named_buffers())
     missing = sorted(k for k in state if k not in buffers)
     if missing:
         loud(
@@ -329,7 +348,9 @@ def require_ngram(cfg: TrainConfig) -> None:
     )
 
 
-def load_model_state(model: torch.nn.Module, cfg: TrainConfig, sd: dict, *, strict: bool = True):
+def load_model_state(
+    model: torch.nn.Module, cfg: TrainConfig, sd: dict, *, strict: bool = True, log=print
+):
     """The ONE way a checkpoint's model half reaches a model.
 
     `train`'s resume, `eval`, `decode`, `serve`, `scripts/chat.py` and the two
@@ -349,7 +370,9 @@ def load_model_state(model: torch.nn.Module, cfg: TrainConfig, sd: dict, *, stri
     The LFB bias is restored from the `<ckpt>.lfb` sibling after the load when
     that file exists (`_restore_lfb`): it is a non-persistent buffer (see
     `lfb_path`), so a plain `load_state_dict` would reset the routing
-    controller a resume is supposed to continue.
+    controller a resume is supposed to continue. A missing sidecar on a model
+    with `moe_lb_coef > 0` is LOUD there; with the controller off it is COUNTED
+    on `log`.
     """
     if cfg.engram_ram:
         require_ngram(cfg)
@@ -357,7 +380,7 @@ def load_model_state(model: torch.nn.Module, cfg: TrainConfig, sd: dict, *, stri
     result = model.load_state_dict(sd, strict=strict)
     if cfg.engram_ram:
         load_host_state(model, load_ngram(cfg))
-    _restore_lfb(model, cfg)
+    _restore_lfb(model, cfg, log=log)
     return result
 
 
@@ -747,7 +770,7 @@ def train(
     start = 0
     if resume:
         ck, _stored = load_ckpt(run)
-        load_model_state(model, cfg, ck["model"])
+        load_model_state(model, cfg, ck["model"], log=log)
         opt.load_state_dict(ck["opt"])
         start = int(ck["step"]) + 1
         if start:

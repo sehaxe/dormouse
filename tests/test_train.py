@@ -255,6 +255,52 @@ def test_a_tiny_nvfp4_block_is_counted_on_the_checkpoint_line(tmp_path):
     assert clean_ckpts and "nvfp4_zero_scale_blocks" not in clean_ckpts[0]
 
 
+def test_a_missing_lfb_sidecar_is_loud_when_the_controller_is_on(tmp_path):
+    """M7: an OLD checkpoint must not resume with bias=0 silently.
+
+    With `moe_lb_coef > 0` the bias steers routing; the sidecar is the only
+    copy of it. Refusing is the reading that cannot mislead.
+    """
+    import dataclasses
+
+    from conftest import tiny_cfg
+
+    from dormouse.train.loop import ckpt_paths, lfb_path, load_model_half, load_model_state
+
+    run = dataclasses.replace(
+        tiny_run(tmp_path, steps=2, log_every=10, ckpt_every=2, ckpt_name="lfb"),
+        model=tiny_cfg(moe_lb_coef=0.05),
+    )
+    train(DormouseModel(run.model), run, log=lambda *_: None)
+    weights, _snap = ckpt_paths(run.train)
+    lfb_path(run.train).unlink()
+    fresh = DormouseModel(run.model)
+    with pytest.raises(LoudError, match="LFB sidecar"):
+        load_model_state(fresh, run.train, load_model_half(weights))
+
+
+def test_a_missing_lfb_sidecar_is_counted_when_the_controller_is_off(tmp_path):
+    """The inert case: no sidecar is reported (COUNTED), not a crash."""
+    import dataclasses
+
+    from conftest import tiny_cfg
+
+    from dormouse.train.loop import ckpt_paths, lfb_path, load_model_half, load_model_state
+
+    run = dataclasses.replace(
+        tiny_run(tmp_path, steps=2, log_every=10, ckpt_every=2, ckpt_name="lfb"),
+        model=tiny_cfg(moe_lb_coef=0.0),
+    )
+    train(DormouseModel(run.model), run, log=lambda *_: None)
+    weights, _snap = ckpt_paths(run.train)
+    lfb_path(run.train).unlink()
+    lines: list[str] = []
+    load_model_state(
+        DormouseModel(run.model), run.train, load_model_half(weights), log=lines.append
+    )
+    assert any("lfb: no sidecar" in line and "controller reset" in line for line in lines)
+
+
 def test_log_line_carries_the_kda_arm_and_counters(tmp_path):
     run = tiny_run(tmp_path, steps=1, log_every=1, timers=True)
     lines: list[str] = []
