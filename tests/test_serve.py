@@ -263,14 +263,12 @@ def test_a_rung_checkpoint_serves(tmp_path: Path):
 
 def test_clamp_line_is_counted():
     """The clamp is COUNTED, not just applied: the serve line carries the number."""
-    from types import SimpleNamespace
-
     from dormouse.serve import ServeState, _max_tokens
 
     lines: list[str] = []
     state = ServeState(
         model=None,
-        run=SimpleNamespace(train=SimpleNamespace(seed=1)),
+        seed=1,
         device="cpu",
         ckpt_name=CKPT,
         max_tokens_cap=CAP,
@@ -323,15 +321,13 @@ def test_recurrent_streaming_is_one_seeded_call():
     state a single call would have — the emitted bytes must match exactly, stop
     byte included.
     """
-    from types import SimpleNamespace
-
     from dormouse.model.decode import recurrent_decode
     from dormouse.serve import _STOP, ServeState, _generate
 
     model = tiny_model(moe_topk=0)
     state = ServeState(
         model=model,
-        run=SimpleNamespace(train=SimpleNamespace(seed=7)),
+        seed=7,
         device=torch.device("cpu"),
         ckpt_name=CKPT,
         max_tokens_cap=64,

@@ -129,6 +129,25 @@ def load_checkpoint(
     return model, run, dev
 
 
+def load_artifact(path: Path | str, device: str = "auto") -> tuple[Any, int, Any, str]:
+    """`(model, seed, device, name)` from a `.dormouse` artifact — the other source.
+
+    The browser demo reads the same file, so a served model and a demo model are
+    the same weights by construction rather than by a promise. The seed is the
+    one the header carries (the run's), which is what a served reply's sampling
+    reproducibility rests on.
+    """
+    from .cli import _device, _freeze_gc
+    from .model.export import load_export, read_export
+
+    path = Path(path)
+    f = read_export(path)
+    dev = _device(device)
+    model = load_export(f, device=dev)
+    _freeze_gc()
+    return model, int(f.header.get("seed") or 1), dev, path.name
+
+
 class ServeState:
     """What every request shares: the ONE model, its device, its decode arm.
 
@@ -142,7 +161,7 @@ class ServeState:
     def __init__(
         self,
         model: Any,
-        run: Any,
+        seed: int,
         device: torch.device,
         ckpt_name: str,
         max_tokens_cap: int,
@@ -151,12 +170,11 @@ class ServeState:
         recurrent: bool = False,
     ) -> None:
         self.model = model
-        self.run = run
         self.device = device
         self.ckpt_name = ckpt_name
         self.max_tokens_cap = max_tokens_cap
         self.temp = temp
-        self.seed = run.train.seed
+        self.seed = seed
         self.log = log
         self.recurrent = recurrent
         self.counters = Counters()
@@ -411,9 +429,10 @@ def build_server(
     max_tokens_cap: int = DEFAULT_MAX_TOKENS,
     temp: float = DEFAULT_TEMP,
     recurrent: bool = True,
+    export: str | None = None,
     log: Any = print,
 ) -> ServeServer:
-    """Load the checkpoint ONCE, pick the decode arm, bind, and return the ready server.
+    """Load the model ONCE, pick the decode arm, bind, and return the ready server.
 
     The arm decision happens HERE, before the socket binds, so the startup
     lines name the arm that will serve every request — and a requested
@@ -421,16 +440,23 @@ def build_server(
     (`recurrent_fallback`) with the reason, instead of failing on the first
     request. `port=0` takes an ephemeral one, so a test can run the real
     socket path.
+
+    `export` is the OTHER source: a `.dormouse` artifact, read by the same
+    reader the browser demo uses. It and `ckpt_name` are mutually exclusive at
+    the CLI layer; here an `export` simply wins because the caller has already
+    checked.
     """
     if max_tokens_cap < 1:
         loud(f"--max-tokens-cap {max_tokens_cap}: must be >= 1")
     if temp <= 0:
         loud(f"--temp {temp}: use a positive temperature (decode's rule)")
-    model, run, dev = load_checkpoint(out_dir, ckpt_name, device)
+    if export:
+        model, seed, dev, name = load_artifact(export, device)
+    else:
+        model, run, dev = load_checkpoint(out_dir, ckpt_name, device)
+        seed, name = run.train.seed, ckpt_name
     use_recurrent, why = resolve_arm(model, recurrent)
-    state = ServeState(
-        model, run, dev, ckpt_name, max_tokens_cap, temp, log, recurrent=use_recurrent
-    )
+    state = ServeState(model, seed, dev, name, max_tokens_cap, temp, log, recurrent=use_recurrent)
     if why is not None:
         state.counters.count("recurrent_fallback")
         log(

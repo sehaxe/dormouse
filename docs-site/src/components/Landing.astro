@@ -30,7 +30,7 @@ const COPY = {
 		title: 'dormouse — a byte-level MoE language model on one consumer GPU',
 		description:
 			'A byte-level Mixture-of-Experts language model, trained end to end on one consumer GPU: 1.07B total / 57M active parameters, 40.9k tok/s and BPB 1.936 held-out on one RTX 5060 Ti.',
-		nav: { docs: 'docs', status: 'status', github: 'github', lang: 'ru', langTitle: 'Русская версия' },
+		nav: { docs: 'docs', status: 'status', github: 'github', demo: 'demo', lang: 'ru', langTitle: 'Русская версия' },
 		termBar: { left: 'dormouse(1)', right: 'rtx 5060 ti · 16 gb' },
 		termHints: ['[+] 861 tests', '[+] ruff clean', '[-] cuda gates self-skip'],
 		session: `$ dormouse train medium --set seq_len=1024 --set moe_capacity=0
@@ -110,7 +110,7 @@ ready — one RTX 5060 Ti 16GB, $429`,
 		title: 'dormouse — байтовая MoE-модель на одной потребительской видеокарте',
 		description:
 			'Байтовая Mixture-of-Experts языковая модель, обученная от начала до конца на одной потребительской видеокарте: 1.07B всего / 57M активных, 40.9k ток/с и BPB 1.936 на held-out на одной RTX 5060 Ti.',
-		nav: { docs: 'док', status: 'статус', github: 'github', lang: 'en', langTitle: 'English version' },
+		nav: { docs: 'док', status: 'статус', github: 'github', demo: 'демо', lang: 'en', langTitle: 'English version' },
 		termBar: { left: 'dormouse(1)', right: 'rtx 5060 ti · 16 gb' },
 		termHints: ['[+] 861 тест', '[+] ruff чистый', '[-] cuda-гейты скипаются'],
 		session: `$ dormouse train medium --set seq_len=1024 --set moe_capacity=0
@@ -221,6 +221,7 @@ const repo = 'https://github.com/sehaxe/dormouse';
 				<span class="topbar-links">
 					<a href={at('/start-here/what-is-this/')}>{c.nav.docs}</a>
 					<a href={at('/start-here/status/')}>{c.nav.status}</a>
+					<a href={at('/demo/')}>{c.nav.demo}</a>
 					<a href={repo}>{c.nav.github}</a>
 					<a href={other} title={c.nav.langTitle} class="lang">[{c.nav.lang}]</a>
 				</span>

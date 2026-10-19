@@ -775,10 +775,134 @@ def bench_cmd(
         )
 
 
+@app.command("export")
+def export_cmd(
+    preset: Annotated[
+        str,
+        typer.Argument(help="optional CHECK: given, it must resolve to the checkpoint's numbers"),
+    ] = "",
+    ckpt_name: Annotated[str, typer.Option("--ckpt-name", help="the checkpoint to export")] = "",
+    out_dir: Annotated[Path, typer.Option(help="checkpoint directory")] = Path("checkpoints"),
+    out: Annotated[
+        str,
+        typer.Option("--out", help="artifact path (default <out-dir>/<ckpt-name>.dormouse)"),
+    ] = "",  # str, not Path: `Path()` is `.` and would read as "given"
+    mode: Annotated[str, typer.Option(help="factor rung: ternary|mxfp4")] = "ternary",
+    dense_dtype: Annotated[
+        str, typer.Option("--dense-dtype", help="dense tensors: fp16 (default) | fp32")
+    ] = "fp16",
+    engram_dtype: Annotated[
+        str, typer.Option("--engram-dtype", help="n-gram table: fp32 (default) | fp16")
+    ] = "fp32",
+    verify: Annotated[
+        bool,
+        typer.Option("--verify", help="read the file back and compare a forward to the source"),
+    ] = False,
+) -> None:
+    """Write the one-file `.dormouse` artifact: config + weights for every reader.
+
+    The readers are `dormouse decode/serve --export` (Python), the browser
+    engine (`docs-site/public/demo/engine.js`) and distribution — one format,
+    one writer. The snapshot decides the config (this is `eval`'s resolution
+    rule); `preset` is therefore a CHECK, and a model half that disagrees with
+    it is refused rather than exported under the wrong name.
+
+    `--verify` is the gate that makes the file trustworthy: it reads the
+    artifact back, checks that every record's bytes are where the header says,
+    and forwards one batch through the source model (projection on) and the
+    rebuilt one, printing the max |Δlogits|.
+    """
+    from .model.export import engine_refusal, load_export, read_export, verify_export, write_export
+    from .train.loop import load_model_state, unpack_state_dict
+
+    if not ckpt_name:
+        raise LoudError("export needs --ckpt-name (the checkpoint to export)")
+    run = _snapshot_run(out_dir, ckpt_name)
+    if preset:
+        _preset_check(preset, run, what="exported")
+    weights = Path(out_dir) / f"{ckpt_name}.pt"
+    model = _model(run)
+    # The ONE loader `eval`/`decode`/`serve` share (`load_model_half` is exactly
+    # these two lines): a storage rung's packed records unpack, and an
+    # `engram_ram` checkpoint switches the model to host tables and restores
+    # its `.ngram` sibling — which is what lets this export fold the memory IN
+    # instead of writing a memory-less model under the run's name. The
+    # checkpoint dict is read here rather than through `load_model_half` for the
+    # `step` it also carries: the artifact's provenance, and a second full
+    # `torch.load` (optimizer state included) is not worth a metadata field.
+    ck = torch.load(weights, map_location="cpu", weights_only=False)
+    load_model_state(model, run.train, unpack_state_dict(ck["model"], ck.get("model_quant_rung")))
+    step = ck["step"] if isinstance(ck.get("step"), int) else None
+    commit = _git_commit()
+    path = Path(out) if out else Path(out_dir) / f"{ckpt_name}.dormouse"
+    report = write_export(
+        model,
+        path,
+        mode=mode,
+        preset=preset or run.source,
+        seed=run.train.seed,
+        step=step,
+        commit=commit,
+        dense_dtype=dense_dtype,
+        engram_dtype=engram_dtype,
+    )
+    console.print(report.table())
+    why = engine_refusal(run.model)
+    engine_line = (
+        "[green]runnable[/] (small-byte-lm)"
+        if why is None
+        else f"[yellow]NOT runnable[/] by docs-site/public/demo/engine.js — {why}"
+    )
+    console.print(f"browser engine: {engine_line}")
+    if verify:
+        torch.manual_seed(0)
+        seq = min(64, run.model.max_seq_len)
+        x = torch.randint(0, run.model.vocab, (2, seq))
+        diff = verify_export(model, path, (x,))
+        f = read_export(path)
+        loaded = load_export(f)
+        console.print(
+            f"verify: max |Δlogits| = {diff:.3e} over {tuple(x.shape)} "
+            f"(reference = the projection on the fp32 masters, loaded = the file) · "
+            f"{sum(p.numel() for p in loaded.parameters()):,} params rebuilt"
+        )
+        if not math.isfinite(diff):
+            raise LoudError("verify: non-finite logits — the rebuilt model is not the exported one")
+
+
+def _git_commit() -> str | None:
+    """`HEAD`'s short hash, or None — the artifact's provenance, never a guess.
+
+    A non-git tree (a source tarball) leaves the header's `commit` null, which
+    is the honest value; this is metadata, so it does not stop an export.
+    """
+    import subprocess
+
+    try:
+        got = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).resolve().parents[2],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    return got.stdout.strip() if got.returncode == 0 and got.stdout.strip() else None
+
+
 @app.command()
 def decode(
     out_dir: Annotated[Path, typer.Option(help="checkpoint directory")] = Path("checkpoints"),
     ckpt_name: Annotated[str, typer.Option("--ckpt-name")] = "",
+    export_file: Annotated[
+        str,
+        typer.Option(
+            "--export",
+            help="read the model from a .dormouse artifact instead of a checkpoint "
+            "(the browser demo reads the same bytes)",
+        ),
+    ] = "",  # str, not Path: `Path()` is `.` and would read as "given"
     prompt: Annotated[str, typer.Option(help="prompt text; UTF-8 bytes are the tokens")] = "",
     n: Annotated[int, typer.Option(help="new bytes to sample")] = 100,
     temp: Annotated[float, typer.Option(help="sampling temperature")] = 0.8,
@@ -819,8 +943,14 @@ def decode(
     from .model.specdecode import spec_decode_bytes
     from .train.loop import load_model_half, load_model_state
 
-    if not ckpt_name:
-        raise LoudError("decode needs --ckpt-name")
+    if not ckpt_name and not export_file:
+        raise LoudError("decode needs --ckpt-name or --export")
+    if ckpt_name and export_file:
+        raise LoudError(
+            "decode --ckpt-name and --export are two sources for one model. "
+            "Escape: pass one of them (--export reads the artifact, --ckpt-name "
+            "resolves through the checkpoint's snapshot)."
+        )
     if not prompt:
         raise LoudError("decode needs --prompt (the first window is the prompt)")
     if spec_k and recurrent:
@@ -829,15 +959,25 @@ def decode(
             "draft block vs a carried state), and neither is the other's control. "
             "Escape: pass one of them."
         )
-    run = _snapshot_run(out_dir, ckpt_name)
     dev = _device(device)
-    model = _model(run).to(dev)
+    if export_file:
+        from .model.export import load_export, read_export
+
+        artifact = read_export(export_file)
+        model = load_export(artifact, device=dev)
+        seed = int(artifact.header.get("seed") or 1)
+        source = str(export_file)
+    else:
+        run = _snapshot_run(out_dir, ckpt_name)
+        model = _model(run).to(dev)
+        seed = run.train.seed
+        source = f"{Path(out_dir) / ckpt_name}.pt"
+        # Same ONE loader as `eval`, `serve` and `load_ckpt`: the storage rung's
+        # packed records are unpacked, and an `engram_ram` checkpoint switches
+        # the model to host tables and restores its `.ngram` sibling.
+        load_model_state(model, run.train, load_model_half(Path(out_dir) / f"{ckpt_name}.pt"))
     _freeze_gc()
-    # Same ONE loader as `eval`, `serve` and `load_ckpt`: the storage rung's
-    # packed records are unpacked, and an `engram_ram` checkpoint switches the
-    # model to host tables and restores its `.ngram` sibling.
-    load_model_state(model, run.train, load_model_half(Path(out_dir) / f"{ckpt_name}.pt"))
-    gen = torch.Generator(device=dev).manual_seed(run.train.seed)
+    gen = torch.Generator(device=dev).manual_seed(seed)
     body = encode(prompt)
     if recurrent:
         from .instrument import Counters
@@ -863,7 +1003,7 @@ def decode(
         Panel(
             f"[bold]{prompt}[/]{text}",
             title=f"decode · temp {temp}" + (f" · spec k={spec_k}" if spec_k else ""),
-            subtitle=subtitle,
+            subtitle=f"{subtitle} · {source}",
         )
     )
 
@@ -946,6 +1086,14 @@ def serve_cmd(
     ] = "",
     out_dir: Annotated[Path, typer.Option(help="checkpoint directory")] = Path("checkpoints"),
     ckpt_name: Annotated[str, typer.Option("--ckpt-name")] = "",
+    export_file: Annotated[
+        str,
+        typer.Option(
+            "--export",
+            help="serve a .dormouse artifact instead of a checkpoint (the browser "
+            "demo reads the same bytes)",
+        ),
+    ] = "",  # str, not Path: `Path()` is `.` and would read as "given"
     port: Annotated[int, typer.Option(help="TCP port (0 = an ephemeral one)")] = 8765,
     host: Annotated[str, typer.Option(help="bind address")] = "127.0.0.1",
     max_tokens_cap: Annotated[
@@ -978,6 +1126,20 @@ def serve_cmd(
     recurrent (byteflow, MSA) falls back COUNTED with the reason on the startup
     line.
     """
+    if not ckpt_name and not export_file:
+        raise LoudError("serve needs --ckpt-name or --export")
+    if ckpt_name and export_file:
+        raise LoudError(
+            "serve --ckpt-name and --export are two sources for one model. Escape: "
+            "pass one of them (--export reads the artifact, --ckpt-name resolves "
+            "through the checkpoint's snapshot)."
+        )
+    if preset and export_file:
+        raise LoudError(
+            "serve --preset with --export: the preset check compares against the "
+            "checkpoint's snapshot, and an artifact carries its own config. Escape: "
+            "drop --preset (the file IS what it is)."
+        )
     if preset:
         _preset_check(preset, _snapshot_run(out_dir, ckpt_name), what="served")
     httpd = build_server(
@@ -989,11 +1151,12 @@ def serve_cmd(
         max_tokens_cap=max_tokens_cap,
         temp=temp,
         recurrent=recurrent,
+        export=export_file or None,
     )
     state = httpd.state
     console.print(
         Panel(
-            f"[bold]{ckpt_name}[/] · {param_count(state.model):,} params · {state.device}",
+            f"[bold]{state.ckpt_name}[/] · {param_count(state.model):,} params · {state.device}",
             subtitle=f"http://{host}:{httpd.server_address[1]}/v1 · cap {max_tokens_cap} B"
             f" · temp {temp} · {'recurrent' if state.recurrent else 'plain'} arm",
         )

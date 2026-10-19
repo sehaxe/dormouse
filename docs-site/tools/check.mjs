@@ -111,6 +111,9 @@ for (const file of html) {
 // the measured number itself, and the model walk carries the block's file.
 const CASES = [
 	['landing', 'index.html', 'A knowledge base with a retraction policy'],
+	// The demo page is hand-written, not ingested: its needle is the sentence
+	// that says the vocabulary is bytes, which only the page can carry.
+	['demo', 'demo/index.html', 'bytes are the vocabulary'],
 	['start-here', 'start-here/status/index.html', 'BPB 1.936'],
 	['architecture', 'architecture/model/index.html', 'loopblock.py'],
 	['protocols', 'protocols/ab-protocol/index.html', 'A/B protocol'],
