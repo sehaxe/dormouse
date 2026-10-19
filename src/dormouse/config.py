@@ -1022,11 +1022,7 @@ def validate(model: ModelConfig) -> None:
             f"the arm and its gold test (tests/test_dense_qat.py) BEFORE the "
             f"config can lie about it."
         )
-    if (
-        model.factor_qat == "none"
-        and model.dense_qat == "none"
-        and model.factor_qat_alpha != 1.0
-    ):
+    if model.factor_qat == "none" and model.dense_qat == "none" and model.factor_qat_alpha != 1.0:
         loud(
             f"factor_qat_alpha={model.factor_qat_alpha} with factor_qat='none' "
             f"and dense_qat='none' is inert — both quantizers are off, so the "

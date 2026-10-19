@@ -26,3 +26,7 @@ vendor/cubecl-server/
 .pytest_cache/
 .ruff_cache/
 sft_pairs/aria_*.jsonl
+
+# Node (docs-site) and build artifacts.
+node_modules/
+.astro/

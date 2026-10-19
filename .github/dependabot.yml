@@ -1,0 +1,14 @@
+# Dependabot, scoped to what is safe to bump automatically: the CI actions and
+# the docs site's npm tree. The Python dependency stack (torch 2.13.0+cu129 +
+# FLA 0.5.2) is deliberately pinned to the version pair the sm_120 kernels were
+# MEASURED on - a bot must not move it, a human may, with a bench.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+  - package-ecosystem: npm
+    directory: /docs-site
+    schedule:
+      interval: monthly

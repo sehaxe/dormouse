@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from dormouse.config import (
     DEAD_SNAPSHOT_KEYS,
-    PRESET_DIR,
     PROGRESS_KEYS,
     ModelConfig,
     RunConfig,
@@ -83,8 +84,11 @@ def test_dead_snapshot_keys_load_counted_and_do_not_reach_the_config(capsys):
 def test_the_dead_list_is_exactly_what_the_committed_snapshots_carry():
     """The list is enumerated from the snapshots, not guessed.
 
-    A snapshot that carries an unknown key NOT on the list is still refused, so
-    the list has to cover every key the 24 committed snapshots actually hold —
+    The snapshots are fixtures (tests/fixtures/snapshot_configs/), copied from
+    real runs: the run artifacts themselves live under checkpoints/ and are
+    never committed, so a test that scanned them could not run in a fresh
+    clone. A snapshot that carries an unknown key NOT on the list is still
+    refused, so the list has to cover every key the snapshots actually hold —
     a missing one leaves them all unreadable (this is how `aux_fb_weight`, the
     seventh, was found: the six-key list still refused all 24 on it).
     """
@@ -97,9 +101,12 @@ def test_the_dead_list_is_exactly_what_the_committed_snapshots_carry():
         "train": {f.name for f in _dc.fields(TrainConfig)},
     }
     snaps = sorted(
-        glob.glob(str(PRESET_DIR.parent / "checkpoints/**/*.config.toml"), recursive=True)
+        glob.glob(
+            str(Path(__file__).parent / "fixtures/snapshot_configs/**/*.config.toml"),
+            recursive=True,
+        )
     )
-    assert snaps, "no committed snapshots found"
+    assert snaps, "no fixture snapshots found"
     for path in snaps:
         raw = _tomllib.loads(open(path).read())
         for section in ("model", "train"):

@@ -106,11 +106,13 @@ for (const file of html) {
 // ingest step ran on the right canonical file. Three moved with the docs
 // consolidation (2026-10-01) and two changed source: the status page is now
 // README's "## Results" slice, and the archive registers are slices of AGENTS.md
-// §3.2/§3.3 because the front-page README no longer carries them.
+// §3.2/§3.3 because the front-page README no longer carries them. Two needles
+// re-pointed at the python-first README (2026-10-19): the status page carries
+// the measured number itself, and the model walk carries the block's file.
 const CASES = [
 	['landing', 'index.html', 'A knowledge base with a retraction policy'],
-	['start-here', 'start-here/status/index.html', 'Held-out BPB'],
-	['architecture', 'architecture/model/index.html', 'LoopBlock'],
+	['start-here', 'start-here/status/index.html', 'BPB 1.936'],
+	['architecture', 'architecture/model/index.html', 'loopblock.py'],
 	['protocols', 'protocols/ab-protocol/index.html', 'A/B protocol'],
 	['adr', 'adr/0011-loud-failures/index.html', 'P10 Rule 5'],
 	['research', 'research/notes/index.html', '2026-10-01'],

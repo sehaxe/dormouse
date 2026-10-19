@@ -1,0 +1,23 @@
+# Local hooks only - no remote pins to drift, and the same commands CI runs.
+# Wire them in once per clone:  uv tool install pre-commit && pre-commit install
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff check
+        entry: uv run ruff check
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: ruff-format
+        name: ruff format --check
+        entry: uv run ruff format --check
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: doc-refs
+        name: doc-refs (every repo path a document names must exist)
+        entry: python3 tools/check_doc_refs.py
+        language: system
+        pass_filenames: false
+        always_run: true

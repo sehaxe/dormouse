@@ -154,9 +154,7 @@ def mm_fp8_shape_ok(k: int, n: int) -> bool:
     return k % 16 == 0 and n % 16 == 0
 
 
-def _fp8_reason(
-    x: torch.Tensor, weight: torch.Tensor, dt: torch.dtype
-) -> tuple[str, str] | None:
+def _fp8_reason(x: torch.Tensor, weight: torch.Tensor, dt: torch.dtype) -> tuple[str, str] | None:
     """`None` if the fp8 lane can run THIS call, else `(reason, detail)`.
 
     The ORDER is the operands' own properties first (dtype, rank, the

@@ -125,9 +125,9 @@ def test_dense_projector_is_the_factor_projector(kind):
     torch.manual_seed(0)
     w = torch.randn(16, 32) * 0.2
     for alpha in (0.0, 0.25, 1.0):
-        assert torch.equal(
-            dense_qat_project(w, kind, alpha), factor_qat_project(w, kind, alpha)
-        ), f"{kind} at alpha={alpha} diverged from the factor path"
+        assert torch.equal(dense_qat_project(w, kind, alpha), factor_qat_project(w, kind, alpha)), (
+            f"{kind} at alpha={alpha} diverged from the factor path"
+        )
     assert torch.equal(dense_qat_project(w, kind, 0.0), w), "alpha=0 must be the master"
 
 
@@ -320,9 +320,7 @@ def test_coverage_every_dense_weight_is_projected(monkeypatch):
     # Every dense arm ON, so the walk sees the whole tree: use_tsct=false makes
     # out_proj/lm_head DenseLinears, use_msa builds the MSA pair, dspark_weight
     # builds the draft head.
-    model = _model(
-        use_tsct=False, use_msa=True, dspark_weight=0.05, dense_qat="ternary"
-    )
+    model = _model(use_tsct=False, use_msa=True, dspark_weight=0.05, dense_qat="ternary")
     x = torch.randint(0, 256, (2, 64))
     model(x, x)  # the training forward, aux term included
     # The FLA arm's entry is not reachable on CPU (see the seam test above);
@@ -330,11 +328,7 @@ def test_coverage_every_dense_weight_is_projected(monkeypatch):
     # training forward runs.
     model.loop.attn.projections(torch.randn(2, 4, 64))
 
-    walk = {
-        name: m
-        for name, m in model.named_modules()
-        if isinstance(m, (nn.Linear, DenseLinear))
-    }
+    walk = {name: m for name, m in model.named_modules() if isinstance(m, (nn.Linear, DenseLinear))}
     projected = {wid for wid, _ in seen["dense"]}
     missed = sorted(name for name, m in walk.items() if id(m.weight) not in projected)
     assert not missed, f"dense weights the projector never saw: {missed}"

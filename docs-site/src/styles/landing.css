@@ -1,0 +1,532 @@
+/* landing.css — the dormouse front page.
+ *
+ * The tokens are opencode.ai's DESIGN.md, not invented here: warm cream canvas
+ * (#fdfcfc), near-black ink (#201d1d), 1px hairline rules (rgba(15,0,0,.12)),
+ * 4px radius on the one snippet surface and 0 on every container, no shadows,
+ * no gradients. The dark surface (#201d1d) appears exactly once — the terminal
+ * card — because DESIGN.md allows "at most one dark mockup per page".
+ *
+ * Type is one family at five sizes: 38/700 wordmark, 26/700 stat, 16/400 prose,
+ * 14/400 code and metadata, 13/400 captions. Letter-spacing stays 0 everywhere.
+ * There is no dark theme: the reference has one canvas, and a second palette
+ * would be a second design system nobody asked for.
+ */
+
+:root {
+	--ink: #201d1d;
+	--body: #424245;
+	--mute: #646262;
+	--ash: #9a9898;
+	--canvas: #fdfcfc;
+	--surface-card: #f1eeee;
+	--surface-dark: #201d1d;
+	--surface-dark-elevated: #302c2c;
+	--hairline: rgba(15, 0, 0, 0.12);
+	--hairline-strong: #646262;
+	--on-dark: #fdfcfc;
+	--on-dark-mute: #9a9898;
+	--accent: #007aff;
+	--accent-hover: #0056b3;
+
+	--mono: ui-monospace, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+	--wrap: 960px;
+	--section: 96px;
+}
+
+*,
+*::before,
+*::after {
+	box-sizing: border-box;
+}
+
+html {
+	background: var(--canvas);
+	-webkit-text-size-adjust: 100%;
+}
+
+body {
+	margin: 0;
+	background: var(--canvas);
+	color: var(--body);
+	font-family: var(--mono);
+	font-size: 16px;
+	font-weight: 400;
+	line-height: 1.5;
+	letter-spacing: 0;
+	-webkit-font-smoothing: antialiased;
+}
+
+a {
+	color: var(--accent);
+	text-decoration: underline;
+	text-decoration-thickness: 1px;
+	text-underline-offset: 3px;
+	transition: color 120ms linear;
+}
+
+a:hover {
+	color: var(--accent-hover);
+}
+
+:focus-visible {
+	outline: 1px solid var(--ink);
+	outline-offset: 2px;
+}
+
+.wrap {
+	max-width: var(--wrap);
+	margin: 0 auto;
+	padding: 0 24px;
+}
+
+/* ── the one nav row: DESIGN.md's primary-nav, 1px rule, no elevation ─────── */
+
+.topbar {
+	border-bottom: 1px solid var(--hairline);
+}
+
+.topbar-in {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 24px;
+	min-height: 56px;
+}
+
+.topbar-mark,
+.topbar-links a {
+	color: var(--ink);
+	font-size: 13px;
+	text-decoration: none;
+}
+
+.topbar-mark {
+	font-weight: 700;
+}
+
+.topbar-links {
+	display: flex;
+	gap: 20px;
+}
+
+.topbar-links a:hover {
+	color: var(--accent);
+}
+
+/* ── hero ─────────────────────────────────────────────────────────────────── */
+
+.hero {
+	padding-top: 72px;
+}
+
+.mark {
+	margin: 0 0 24px;
+	color: var(--mute);
+	font-size: 14px;
+	line-height: 1;
+	white-space: pre;
+}
+
+h1 {
+	margin: 0;
+	color: var(--ink);
+	font-size: 38px;
+	font-weight: 700;
+	line-height: 1.2;
+}
+
+.tagline {
+	margin: 12px 0 0;
+	max-width: 62ch;
+	color: var(--body);
+}
+
+/* ── the terminal card: the page's only dark surface ─────────────────────── */
+
+.terminal {
+	margin-top: 40px;
+	background: var(--surface-dark);
+	color: var(--on-dark);
+	overflow: hidden;
+}
+
+.term-bar {
+	display: flex;
+	justify-content: space-between;
+	gap: 16px;
+	padding: 8px 16px;
+	background: var(--surface-dark-elevated);
+	color: var(--on-dark-mute);
+	font-size: 13px;
+}
+
+.term-body {
+	margin: 0;
+	padding: 20px 16px;
+	font-family: var(--mono);
+	font-size: 14px;
+	line-height: 1.8;
+	white-space: pre-wrap;
+	overflow-wrap: break-word;
+}
+
+.term-hints {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 4px 24px;
+	padding: 10px 16px 12px;
+	border-top: 1px solid rgba(253, 252, 252, 0.12);
+	color: var(--ash);
+	font-size: 13px;
+}
+
+.cursor {
+	display: inline-block;
+	width: 1ch;
+	height: 1.05em;
+	margin-left: 2px;
+	background: currentColor;
+	vertical-align: text-bottom;
+	animation: blink 1.06s step-end infinite;
+}
+
+@keyframes blink {
+	50% {
+		opacity: 0;
+	}
+}
+
+/* ── the stat band: one hairline-bordered block, cells split by rules ────── */
+
+.band {
+	display: grid;
+	grid-template-columns: repeat(5, minmax(0, 1fr));
+	margin-top: var(--section);
+	border-top: 1px solid var(--hairline);
+	border-bottom: 1px solid var(--hairline);
+}
+
+.band-cell {
+	padding: 20px 16px 22px;
+	border-left: 1px solid var(--hairline);
+}
+
+.band-cell:first-child {
+	border-left: 0;
+	padding-left: 0;
+}
+
+.band-n {
+	display: block;
+	color: var(--ink);
+	font-size: 26px;
+	font-weight: 700;
+	line-height: 1.2;
+	font-variant-numeric: tabular-nums;
+}
+
+.band-cap {
+	display: block;
+	margin-top: 6px;
+	color: var(--mute);
+	font-size: 13px;
+	line-height: 1.5;
+}
+
+/* ── sections ────────────────────────────────────────────────────────────── */
+
+.section {
+	margin-top: var(--section);
+}
+
+.section > h2 {
+	margin: 0 0 24px;
+	padding-bottom: 8px;
+	border-bottom: 1px solid var(--hairline);
+	color: var(--ink);
+	font-size: 14px;
+	font-weight: 700;
+	line-height: 1.5;
+	text-transform: uppercase;
+}
+
+.prose {
+	max-width: 72ch;
+	margin: 0;
+}
+
+/* the five axes: collapsed 1px borders — each card carries its own, and the
+   negative margin makes the shared edge a single hairline instead of two. */
+
+.cards {
+	display: grid;
+	grid-template-columns: repeat(6, 1fr);
+}
+
+.card {
+	margin: 0 -1px -1px 0;
+	padding: 20px;
+	border: 1px solid var(--hairline);
+}
+
+/* four axes two-up, the fifth closing the block full-width: the rectangle has
+   no ragged edge, which is the whole point of a hairline text block. */
+.card:nth-child(-n + 4) {
+	grid-column: span 3;
+}
+
+.card:nth-child(5) {
+	grid-column: 1 / -1;
+}
+
+.card h3 {
+	margin: 0 0 8px;
+	color: var(--ink);
+	font-size: 15px;
+	font-weight: 700;
+	line-height: 1.5;
+}
+
+.card h3::before {
+	content: '[+] ';
+	color: var(--mute);
+}
+
+.card p {
+	margin: 0;
+	font-size: 14px;
+	line-height: 1.6;
+}
+
+/* the A/B register: admitted on the left, rejected on the right */
+
+.register {
+	margin: 32px 0 0;
+	padding: 0;
+	list-style: none;
+	max-width: 72ch;
+}
+
+.register li {
+	display: flex;
+	align-items: baseline;
+	justify-content: space-between;
+	gap: 16px;
+	padding: 10px 0;
+	border-top: 1px solid var(--hairline);
+}
+
+.register li:first-child {
+	border-top: 1px solid var(--hairline-strong);
+}
+
+.register .name {
+	color: var(--ink);
+	font-size: 14px;
+}
+
+.register .name::before {
+	content: '[-] ';
+	color: var(--mute);
+}
+
+.register .admitted .name::before {
+	content: '[+] ';
+}
+
+.register .delta {
+	color: var(--mute);
+	font-size: 14px;
+	font-variant-numeric: tabular-nums;
+	white-space: nowrap;
+}
+
+.register .admitted .delta {
+	color: var(--ink);
+}
+
+/* ── quick start ─────────────────────────────────────────────────────────── */
+
+.snippet {
+	margin: 0;
+	padding: 12px 16px;
+	border: 1px solid var(--hairline);
+	border-radius: 4px;
+	background: var(--surface-card);
+	color: var(--ink);
+	font-family: var(--mono);
+	font-size: 14px;
+	line-height: 1.8;
+	overflow-x: auto;
+}
+
+.section-note {
+	margin: 12px 0 0;
+	color: var(--mute);
+	font-size: 13px;
+}
+
+/* ── docs peek (htmx) ────────────────────────────────────────────────────── */
+
+.peek {
+	border: 1px solid var(--hairline);
+	margin-top: 24px;
+}
+
+.peek-nav {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0;
+	border-bottom: 1px solid var(--hairline);
+}
+
+.peek-nav a {
+	padding: 8px 16px;
+	border-right: 1px solid var(--hairline);
+	color: var(--accent);
+	text-decoration: none;
+	font-size: 14px;
+	line-height: 2;
+
+	&:hover {
+		background: var(--surface-card);
+	}
+}
+
+.peek-body {
+	padding: 16px 20px;
+	max-height: 420px;
+	overflow-y: auto;
+	font-size: 14px;
+	color: var(--body);
+
+	/* The fetched fragment is a Starlight page's main content: give it the
+	   same mono voice as the page, at the reading size, nothing else. */
+	h1,
+	h2,
+	h3 {
+		color: var(--ink);
+		font-size: 16px;
+		line-height: 1.5;
+		margin: 16px 0 8px;
+	}
+
+	p,
+	li {
+		line-height: 1.7;
+	}
+
+	a {
+		color: var(--accent);
+	}
+
+	table {
+		border-collapse: collapse;
+		font-size: 13px;
+	}
+
+	th,
+	td {
+		border: 1px solid var(--hairline);
+		padding: 4px 8px;
+		text-align: left;
+	}
+
+	pre {
+		border: 1px solid var(--hairline);
+		background: var(--surface-card);
+		padding: 12px;
+		overflow-x: auto;
+	}
+}
+
+.peek-hint {
+	margin: 0;
+	color: var(--mute);
+}
+
+/* htmx marks the element it is fetching into; one hairline tells the reader
+   something is in flight without a spinner. */
+.peek-body.htmx-request {
+	opacity: 0.5;
+}
+
+/* ── footer ──────────────────────────────────────────────────────────────── */
+
+.footer {
+	margin-top: var(--section);
+	border-top: 1px solid var(--hairline);
+	padding: 24px 0 72px;
+	display: flex;
+	flex-wrap: wrap;
+	align-items: baseline;
+	justify-content: space-between;
+	gap: 12px 32px;
+	color: var(--mute);
+	font-size: 14px;
+}
+
+.footer-links {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 12px 28px;
+}
+
+/* ── responsive: 960 → single column, 38px headline → 28px ──────────────── */
+
+@media (max-width: 900px) {
+	.band {
+		grid-template-columns: 1fr;
+	}
+
+	.band-cell {
+		padding: 14px 0;
+		border-left: 0;
+		border-top: 1px solid var(--hairline);
+	}
+
+	.band-cell:first-child {
+		border-top: 0;
+		padding-top: 20px;
+	}
+
+	.band-n {
+		font-size: 22px;
+	}
+}
+
+@media (max-width: 760px) {
+	.cards {
+		grid-template-columns: 1fr;
+	}
+
+	.card:nth-child(n) {
+		grid-column: auto;
+	}
+}
+
+@media (max-width: 640px) {
+	:root {
+		--section: 64px;
+	}
+
+	h1 {
+		font-size: 28px;
+	}
+
+	.hero {
+		padding-top: 48px;
+	}
+}
+
+/* ── motion: the only animation on the page is opt-out by default ────────── */
+
+@media (prefers-reduced-motion: reduce) {
+	.cursor {
+		animation: none;
+	}
+
+	a {
+		transition: none;
+	}
+}

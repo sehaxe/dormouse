@@ -1,8 +1,18 @@
+<p align="center">
+  <img src="assets/banner.svg" alt="dormouse — a byte-level Mixture-of-Experts language model trained end to end on one consumer GPU" width="1200">
+</p>
+
 # 🐹 dormouse
+
+[![ci](https://github.com/sehaxe/dormouse/actions/workflows/ci.yml/badge.svg)](https://github.com/sehaxe/dormouse/actions/workflows/ci.yml)
+
+**English** · [Русский](README.ru.md)
 
 A byte-level Mixture-of-Experts language model, trained end to end on **one consumer GPU** (RTX 5060 Ti, 16 GB, $429). No tokenizer, no cluster, no distillation teacher — the whole recipe runs on the card, and every claim in this repository carries its measurement.
 
 The Rust/burn original this grew out of lives on the [`rust-legacy`](../../tree/rust-legacy) branch. `main` is the Python project.
+
+**Contents** — [What is this](#what-is-this) · [Results](#results) · [Quick start](#quick-start) · [Architecture](#architecture) · [Documentation](#documentation) · [License](#license)
 
 ## What is this
 
