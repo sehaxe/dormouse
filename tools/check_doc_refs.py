@@ -40,18 +40,34 @@ ROOT = Path(__file__).resolve().parent.parent
 PREFIXES = (
 	"docs/",
 	"research/",
-	"crates/",
-	"vendor/dormouse-fused/",
-	"vendor/cubecl-fix/",
 	"tools/",
 	"scripts/",
 	"configs/",
-	"benches/",
+	"sft_pairs/",
+	"src/dormouse/",
+	"pyproject.toml",
+	"uv.lock",
+	"port/",
 	"README.md",
 	"AGENTS.md",
 	"CONTEXT.md",
 	"POST_TRAINING.md",
 )
+
+# Paths that exist only on the rust-legacy branch (2026-10-19: the Python port
+# became main and the Rust tree moved to `rust-legacy`). Dated documents cite
+# them as the truth of their moment; the checker skips them the way it skips
+# `.bulba/` - "fixing" them would rewrite history, not repair a reference.
+LEGACY_PREFIXES = ("crates/", "vendor/", "benches/")
+
+# Run artifacts: real files on a machine that has trained, never in a clone.
+# A document citing one is citing the run, not the tree.
+ARTIFACT_PREFIXES = ("checkpoints/", "data_local/", ".venv")
+
+# The tree was re-rooted when port/ became the repository root (2026-10-19).
+# A dated document citing `port/<path>` means today's `<path>`; the reference
+# keeps being checked instead of going dark.
+ALIASES = {"port/": ""}
 
 SKIP_DIRS = {".bulba", "target", "node_modules", ".git", "graphify-out", ".playwright-mcp"}
 EXTS = (".md", ".rs", ".toml", ".py", ".sh", ".tsv", ".yml")
@@ -77,6 +93,58 @@ KNOWN_DEAD = {
 	"vendor/dormouse-fused/crates/burn-sct/src/qr_cuda.rs": "the crate was deleted 2026-10-02; the audit that names it is a dated record",
 	"vendor/dormouse-fused/crates/burn-sct": "the crate was deleted 2026-10-02; dated reviews and ADRs keep the name on purpose",
 	"vendor/dormouse-fused/crates/burn-es": "the crate was deleted 2026-10-02; dated reviews and ADRs keep the name on purpose",
+}
+
+# The 2026-10-19 rust-legacy restructure moved the Rust tree (crates/, vendor/,
+# benches/ - now skipped wholesale via LEGACY_PREFIXES) and the Rust-era tooling
+# to the `rust-legacy` branch. Dated documents cite these as the truth of their
+# moment; they are registered rather than edited out for the same reason
+# KNOWN_DEAD exists at all: the citation is a record, not a link.
+_LEGACY = "moved to the rust-legacy branch (2026-10-19 restructure)"
+LEGACY_DEAD = {
+	"configs/byteflow.toml": _LEGACY,
+	"configs/moe-cap": _LEGACY,
+	"configs/mor.toml": _LEGACY,
+	"configs/nano-fused.toml": _LEGACY,
+	"configs/p150.toml": _LEGACY,
+	"configs/smoke.toml": _LEGACY,
+	"ffi": "the port/ffi Rust extension is PLANNED, not built (readiness plan §7)",
+	"scripts/bench.sh": _LEGACY,
+	"scripts/chat_rl.py": _LEGACY,
+	"scripts/chat_sft.py": _LEGACY,
+	"scripts/classifier.py": _LEGACY,
+	"scripts/extract_activations.py": _LEGACY,
+	"scripts/extract_answer_tokens.py": _LEGACY,
+	"scripts/intervene_model.py": _LEGACY,
+	"scripts/tsz1024x4k_100B_swa_gdn2.sh": _LEGACY,
+	"tools/atlas_summarize.py": _LEGACY,
+	"tools/build_lock.sh": _LEGACY,
+	"tools/check_f64_fixtures.py": _LEGACY,
+	"tools/checks.sh": _LEGACY,
+	"tools/dead_pub_audit.py": _LEGACY,
+	"tools/determinism": _LEGACY,
+	"tools/determinism.py": _LEGACY,
+	"tools/env": _LEGACY,
+	"tools/falsify_fused_adjoint.sh": _LEGACY,
+	"tools/first_run.sh": _LEGACY,
+	"tools/fused_matrix.sh": _LEGACY,
+	"tools/fused_matrix_static.py": _LEGACY,
+	"tools/fwd_mode.py": _LEGACY,
+	"tools/gen_bwd_f64.py": _LEGACY,
+	"tools/gen_facade.py": _LEGACY,
+	"tools/gen_oracle_tiers.py": _LEGACY,
+	"tools/gen_reference_f64.py": _LEGACY,
+	"tools/gpu-gate.sh": _LEGACY,
+	"tools/lib_gate.sh": _LEGACY,
+	"tools/migrate-dormouse-fused.sh": _LEGACY,
+	"tools/moe_ab.sh": _LEGACY,
+	"tools/mor_ab.sh": _LEGACY,
+	"tools/oracle_gate.py": _LEGACY,
+	"tools/polar_probe.rs": _LEGACY,
+	"tools/test-feature-matrix.sh": _LEGACY,
+	"tools/test_targets.py": _LEGACY,
+	"tools/trainboard.py": _LEGACY,
+	"tools/trio_ab.sh": _LEGACY,
 }
 
 # `path` / `path:line` / `path:12` / `path:12-34`, or a glob, or `a/{b,c}`.
@@ -112,6 +180,8 @@ def candidates(line: str):
 
 
 def plausible(token: str) -> bool:
+	if any(token.startswith(p) for p in LEGACY_PREFIXES):
+		return False
 	if not any(token.startswith(p) for p in PREFIXES):
 		return False
 	if any(c in token for c in "{*") or ".." in token or token.endswith("/"):
@@ -123,6 +193,14 @@ def plausible(token: str) -> bool:
 
 def exists(repo_rel: str) -> bool:
 	return (ROOT / repo_rel).exists()
+
+
+def alias(path: str) -> str:
+	"""Resolve a legacy prefix onto today's tree (the 2026-10-19 re-root)."""
+	for old, new in ALIASES.items():
+		if path.startswith(old):
+			return new + path[len(old):]
+	return path
 
 
 def main() -> int:
@@ -142,12 +220,14 @@ def main() -> int:
 			continue
 		text = strip_fences((ROOT / f).read_text(encoding="utf-8", errors="replace"))
 		for n, line in enumerate(text.split("\n"), 1):
-			if "docs/" not in line and "research/" not in line:
+			if not any(p in line for p in ("docs/", "research/", "port/", "src/dormouse/", "configs/", "scripts/", "tools/", "sft_pairs/")):
 				continue  # cheap reject: nothing to resolve on this line
 			for token in candidates(line):
 				if not plausible(token):
 					continue
-				path = LINE_SUFFIX.sub("", token)
+				path = alias(LINE_SUFFIX.sub("", token))
+				if path.startswith(ARTIFACT_PREFIXES):
+					continue  # a run artifact, not a tree path
 				if exists(path):
 					checked += 1
 					continue
@@ -156,8 +236,9 @@ def main() -> int:
 				if (ROOT / Path(f).parent / path).exists():
 					checked += 1
 					continue
-				if path in KNOWN_DEAD:
-					warned.append(f"{f}:{n} -> {path}  (KNOWN_DEAD: {KNOWN_DEAD[path][:60]}…)")
+				reason = KNOWN_DEAD.get(path) or LEGACY_DEAD.get(path)
+				if reason is not None:
+					warned.append(f"{f}:{n} -> {path}  (known-dead: {reason[:60]}…)")
 					continue
 				bad.append(f"{f}:{n} -> {token}")
 	print(f"doc-refs: {len(files)} files scanned, {checked} path references resolved")

@@ -1,64 +1,111 @@
-# dormouse preset: small (flat schema; the schema default is now the BYTEFLOW
-# net for use_byteflow — this preset carries `false` explicitly, see
-# docs/reviews/byteflow-ab-2026-10-02.md for the 2026-10-02 A/B that flipped it)
-bf16 = false
-act_group = 0
+# port preset: small — the A/B polygon, same geometry as burn's configs/small.toml.
+#
+# Ported from the burn side (docs/decisions/2026-10-15-1b-readiness-plan.md §7:
+# "`small` at 9.2M remains the A/B polygon with a port preset of the same name"),
+# with three deliberate deviations, each named where it bites:
+#
+#  1. `bf16 = true` (burn ships false). The port's init path IS the bf16 plan
+#     (docs/architecture/bf16-plan.md): bf16 matmuls with fp32 masters, fp32
+#     state between arms. burn's `small.toml` predates its own 0.22 bf16
+#     measurements; on the port there is no "storage bf16, compute fp32" mode
+#     to preserve.
+#  2. `dspark_weight = 0.0` (burn ships 0.05 JEPA+KoLeo plus a DSpark term).
+#     JEPA+KoLeo is NOT ported and is not a key at all; a JEPA key is refused
+#     as unknown rather than silently dropped.
+#  3. the expert is TSCT2 §14's dual-latent GLU with a shared write and an
+#     always-on shared expert (see configs/b1.toml for the full arithmetic).
+#
+# PARAM COUNT, computed by hand and pinned by tests/test_param_count.py against
+# the instantiated model (port: 9 476 993; burn's `small`, measured
+# 2026-10-01 on its own instantiated model: 9 197 390 — delta +279 603, +3.0%):
+#
+#   embed (256x768)                                196 608
+#   lm_head TSCT(768->256, r=64)                    65 600
+#   RMSNorm x2 (loop, final)                         1 536
+#   controller (2*768 -> 3 gates, no bias)           4 608
+#   KDA q,k,v,g (4x768^2) + beta (768*12)        2 368 512
+#   3 routed experts, 3 x 229 504                  688 512
+#   shared expert (rank 192)                       688 512
+#   shared write [2048 -> 768]                   1 572 864
+#   router (768 -> 3)                                2 304
+#   Engram tables (3 x 32 768 x 32)              3 145 728
+#   Engram query/key/value projs                    50 176
+#   mem_dense (768 -> 768 + bias)                  590 592
+#   out_proj TSCT(768 -> 768, r=64)                 98 368
+#   iter_embed (4 x 768) + residual_scale            3 073
+#   --------------------------------------------- ---------
+#   total                                        9 476 993
+#
+# The delta is structural, not a typo: the port pays a shared write and a
+# shared expert the burn small does not have, and does not pay the aux heads
+# (~1.2M) or the per-expert down factor burn's TSCT experts each carry.
+
 d_model = 768
 n_heads = 12
 head_dim = 64
 d_ffn = 2048
 vocab = 256
-use_byteflow = false
 max_seq_len = 512
 max_iter = 4
 rank = 64
 norm_eps = 0.001
+
+bf16 = true
+# The quant ladder is config-only on day one: `fp8`/`nvfp4`/`lbit`/`ternary`
+# refuse at load (per rung, naming the escape). `none` = bf16 factors.
+quant = "none"
+
 use_kda = true
+use_tsct = true
 use_engram = true
-use_gr = false
+use_attnres = false
+# LOOM (`2610.01153`, docs/research/2026-10-16-new-tech-scan.md §2.1): per-iteration gate on the RMS-normalized write; OFF = today's write, and the arm's A/B against a fixed-depth control is what decides the 8-12-loop claim.
+loom = false
+
+# burn's small runs the DENSE blend (moe_topk = 0) over 3 experts; the sparse
+# dispatch is the A/B this arm's control is measured against.
 n_experts = 3
-jepa_weight = 0.05
-jepa_mask_frac = 0.15
-jepa_mask_span = 8
-dspark_weight = 0.0
-dspark_k = 4
-dspark_stride = 16
-# Future-byte auxiliary head (our adaptation of arXiv 2404.19737's per-horizon
-# multi-token heads to a byte-level AR model). OFF: the weight is 0, so the
-# head is not even BUILT (AuxHeads.fb is None) and this recipe's parameters and
-# checkpoint are byte-identical to a build from before the arm existed. Turn it
-# on with `--set aux_fb_weight=0.1`; horizon is in BYTE POSITIONS and 0 is
-# refused (targets[q + 0] is the byte the main CE already predicts).
-aux_fb_weight = 0.0
-aux_fb_horizon = 2
-# Hashed n-gram memory (Engram). Capacity budget, not tuning knobs: the arm
-# was off because its row budget broke the 50% memory-share gate (the
-# `share <= 0.5` assert in `preset_exec::cost_of_preset`) and monopolized the loss.
-# 25_000 rows/order x 3 orders x 32 dim; each table rounds UP to a power of two,
-# so what is built is 3 x 32 768 x 32 = 3 145 728 memory params. Measured
-# 2026-10-01 on the instantiated model: 3 145 728 of 9 197 454 = 34.2%. The
-# Budget provenance, corrected 2026-10-15 by
-# docs/research/2026-10-15-1b-tech-verification.md: the DeepSeek-Flash operating
-# point we anchored on (V4.1-Flash 196B Engram vs a 552B backbone = 26% of
-# total) is a real shipped ratio, but no published "20-25% law" survived
-# verification; the published Qwen3.8-Next numbers are 51B n-gram tables =
-# 40.8% of the base model, or 29% counting on top (arXiv:2608.30320). So the
-# allocation is derived by sweeping engram_rows against BPB (AB-PROTOCOL row
-# 6b), not by an allocation law. The adjacent slot-count study (arXiv
-# 2601.16531, ~185M backbone + 128M memory) is flat WITHIN ITS NOISE across
-# 300K/500K/800K (peak 500K, delta 0.0016 vs the one reported std 0.0082; its
-# own best config is NOT significant) and reads collisions as implicit
-# regularization - so 500K/order stays a ladder rung, never the default, and
-# collision-free hot tiers are NOT the 1B direction.
-# Orders 2/3/4 replace the dead 3/5/8 (only n=3 had per-key support; n=5/n=8
-# were ~5775-way averages). engram_lam_max is the HARD floor on the memory's
-# share of its branch (`lam = min(w_mem, 0.5)`, the other half a dense
-# projection of the same hidden state) - kNN-LM eq. 3 / FwPKM eq. 12, a
-# constant, not a learned value.
+moe_topk = 0
+moe_capacity = 2.0
+# SL1 host-offload of the routed expert pass (budget-savers doc §5): with the
+# switch ON the `[E, cap, ·]` bank and the GLU gates it saves live in host RAM
+# between the forward and its backward, loss and gradients bit-identical.
+# OFF here because this preset runs the DENSE blend (`moe_topk = 0`), which has
+# no capacity-padded bank to offload — a dense blend counts
+# `moe_offload_inert_dense` rather than pretending the arm ran.
+moe_offload = false
+shared_rank = 192
+
+# Hashed n-gram memory. 25 000 rows/order x 3 orders x 32 dim, each table
+# rounded UP to a power of two by the in-VRAM masking read (`engram_tables`),
+# so what is built is 3 x 32 768 x 32 = 3 145 728 rows = 33.2% of the port's
+# small (burn measured 34.2% of its 9 197 390). Orders 2/3/4 are
+# `dormouse_data::ORDERS`, the set that replaced the dead 3/5/8.
 engram_rows = 25000
 engram_orders = [2, 3, 4]
 engram_dim = 32
 engram_lam_max = 0.5
-use_mor = false
-mor_k = 2
-mor_bce_weight = 0.05
+
+# The ByteFlow arm (Option A/B): OFF — the loop stack is the model.
+use_byteflow = false
+# Load-Free Balancing step (arXiv:2408.15664): bias, not an aux loss.
+# 0.0 = off; 1e-2 is the paper's example scale at our router (tune with WSD).
+# Load-Free Balancing ON (same measured pattern as b1.toml 2026-10-15).
+moe_lb_coef = 0.01
+
+dspark_weight = 0.0  # gamma; >0 builds the DSpark draft head (dspark_k/stride/markov_rank follow)
+# SIGReg / LeJEPA (arXiv:2511.08544, model/sigreg.py): a REGULARISER, not a
+# head — `CE + sigreg_weight * sigreg_loss(z)` on the strided sample of the
+# state lm_head reads, no teacher / no predictor / no second forward / 0 params.
+# 0.0 = the pure-CE control. The grid is 0.005 / 0.05 / 0.1 (the research doc
+# docs/research/2026-10-16-jepa-into-dormouse.md §3, the ONE arm to run first).
+sigreg_weight = 0.0
+act_group = 0
+
+# The ADAPTIVE DEPTH arm (owner 2026-10-16). These are TRAIN keys, not model
+# keys, so they live on the CLI (`--set rand_depth=true`), not in this file:
+#   rand_depth = false  — off, because ADR-0013 fixed depth is the default; the
+#                         arm samples T in 1..=max_iter per step as a pure
+#                         function of (seed, step) and normalizes by ACTUAL T.
+#   eval_depths = false — on: the eval line carries the loss at 1..=max_iter,
+#                         the depth-efficiency curve; it trains nothing.

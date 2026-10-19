@@ -10,11 +10,13 @@ maintainer's repository, and the workflow below is the one that actually runs.
 
 ## Before you edit
 
+`main` is the Python tree (2026-10-19): `uv sync`, `uv run pytest`, `uv run ruff check .`, `uv run dormouse <cmd>`. The Rust-era commands below (worktree helper, build lock) still describe the workflow the rules were earned in; `tools/wt.sh` works for either lane, `tools/build_lock.sh` belongs to `rust-legacy`.
+
 | you want to | do this |
 |---|---|
 | change code, or fix a bug | `tools/wt.sh new <task>` — one task per worktree, off `HEAD` |
-| test your change | `tools/wt.sh test <task>` — runs our three crates plus the vendored-library gate |
-| run something heavy (a build, a training run) | `tools/build_lock.sh run <label> -- <cmd>` |
+| test your change | `uv run pytest` (CPU; CUDA gates self-skip) + `uv run ruff check .` + `uv run ruff format --check .` |
+| run something heavy (a training run) | `systemd-run --user --scope -p MemoryMax=40G -- <cmd>` — the box's RAM guard, see `.bulba/memory.md` |
 
 `tools/wt.sh` is not ceremony: a worktree off `HEAD` is a **different build** if
 the shared tree is dirty (ADR-0022), and uncommitted vendor patches do not

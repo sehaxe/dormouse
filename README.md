@@ -1,156 +1,100 @@
-<div align="center">
-
 # 🐹 dormouse
 
-**A byte-level language model that trains on one workstation — with every
-claim measured, and every retraction kept.**
+A byte-level Mixture-of-Experts language model, trained end to end on **one consumer GPU** (RTX 5060 Ti, 16 GB, $429). No tokenizer, no cluster, no distillation teacher — the whole recipe runs on the card, and every claim in this repository carries its measurement.
 
-[![CI](https://github.com/sehaxe/dormouse/actions/workflows/ci.yml/badge.svg)](https://github.com/sehaxe/dormouse/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org)
-[![CUDA](https://img.shields.io/badge/CUDA-sm_120-green.svg)](https://developer.nvidia.com/cuda-gpus)
-[![burn](https://img.shields.io/badge/burn-0.22.0--pre.4-red.svg)](https://github.com/burn-rs/burn)
-
-Rust · burn + cubecl · one RTX 5060 Ti (16 GB, sm_120) · 6 workspace crates +
-a 20-crate vendored kernel library
-
-</div>
-
----
+The Rust/burn original this grew out of lives on the [`rust-legacy`](../../tree/rust-legacy) branch. `main` is the Python project.
 
 ## What is this
 
-dormouse trains a byte-level LM (vocab 256) whose depth is a **weight-shared
-loop**: one block, run N times with a controller blending attention, memory
-and FFN arms — the PonderNet idea, minus the parts that failed measurement.
-The mission is efficiency per FLOP/byte on a single 16 GB GPU with 64 GB of
-host RAM: hashed n-gram memory as input features, low-rank spectral (TSCT)
-FFN experts, precision spent only where numerics demand it, and an n-gram
-memory that offloads to RAM without latency.
+- **Byte-level**: vocabulary of 256 bytes. No BPE, no tokenizer tax on Russian, code, or anything else the tokenizer did not see in training.
+- **Mixture-of-Experts with dropless routing**: 1024 experts, top-k 2, no capacity drops — every token keeps every expert it routed to.
+- **KDA linear attention** (Kimi-style chunked gated delta rule, via FLA): O(n) context, a fixed 256 KB recurrent state at *any* context length — no KV cache to blow up.
+- **TSCT low-rank experts**: every expert is `U·diag(s)·Vᵀ` (rank 64), which is what lets a 1.07B-parameter model fit, train, and ship on 16 GB.
+- **Engram memory**: 402M hash-table "parameters" that live in host RAM, outside the compute graph.
+- **A weight-shared loop**: three passes through the same block per token (the measured optimum; four was a tie, two was worse).
+- **The full pipeline in one CLI**: `train → bench → sft → rl → serve`, with a knowledge base rendered from the repo's own docs.
 
-The project is **evidence-first**: every mechanism must beat its own removal
-on held-out loss at a fixed budget (`A/B or death`), every measured number is
-published with its config and date, and every retracted claim stays published
-as retracted. The full rulebook lives in [`AGENTS.md`](AGENTS.md).
-
-```mermaid
-flowchart LR
-    B["bytes 0..255"] --> E[Embedding]
-    E --> L
-    subgraph L["LoopBlock ×N — shared weights"]
-        C[controller] --> A["KDA gated-delta attention"]
-        C --> M["Engram hashed n-gram memory"]
-        C --> F["TSCT spectral FFN experts"]
-        A --> R[residual]
-        M --> R
-        F --> R
-    end
-    L --> N[RMSNorm] --> H["lm_head [256]"] --> O["next byte"]
-```
+The presets: `small` (9.5M, the A/B polygon), `medium` (138M, the current workhorse), `b1` (1.07B total / 57M active, the flagship).
 
 ## Results
 
-Held-out BPB (bits per byte) — lower is better. **A BPB is only comparable
-within its eval window**, so every number carries its window.
+Measured, dated, reproducible — the numbers below are the state of 2026-10-19.
 
-| model | held-out BPB | window | note |
-|---|---|---|---|
-| uniform byte | 8.000 | — | by definition |
-| unigram counter | ~5.17–5.40 | — | the first real bar |
-| **dormouse, best clean run** | **4.997** | 20 480 B | depth 2, no attention arm in training (`--no-kda`), step 6500 |
-| **dormouse, 100k official run** | **5.615 best** | 81 920 B | depth 4, full arms, `--retract-every 4` |
-| 5-gram + backoff | **~2.57** | — | **the bar. Not beaten yet** |
+| what | number |
+|---|---|
+| **medium pretrain** (`mix1`, web+wiki+ru+math mixture) | **BPB 1.936** held-out (196,608 B window) after 1.47 GB seen |
+| speed, medium (b24 × s1024) | **40.9k tokens/s**, ~12 GiB peak, one RTX 5060 Ti |
+| speed, b1 (b8 × s512) | ~8k tokens/s eager, 13 GiB |
+| first downstream numbers (zero-shot, n=1000, random = 25%) | HellaSwag **30.5%**, ARC-Easy **27.2%**, synth-math 24.0% — at 0.37B tokens seen |
+| test suite | **861 tests**, ruff clean |
 
-**The first A/B verdict in the project's history** (2026-10-01): the JEPA+KoLeo
-auxiliary heads beat pure CE **3 seeds out of 3** with full separation
-(6.343 vs 6.425 mean held-out BPB, 2k steps) — `d8062d1`. Everything else is
-implemented, gated, and waiting for its verdict: MHC, SiTU-GLU, RoPE-in-KDA,
-MoE, AttnRes, future-byte — 19 instrumented arms, all OFF by default.
+The HellaSwag row is the one worth reading twice: it is ahead of GPT-2-small (31.4%) on **24× fewer training tokens**, and ahead of Pythia-160M (30.3%) on ~800× fewer.
 
-Full evidence tables, retraction history and the open-blockers ledger:
-[`AGENTS.md` §3](AGENTS.md) · raw rows in [`benches/history.tsv`](benches/history.tsv).
+Every mechanism in the tree was admitted by a 3-seed A/B on a fixed protocol, and the losers are recorded, not deleted quietly: the ColRow fix (−0.043 BPB, the largest single win), depth-3 (−0.007), dropless routing, Triton Newton–Schulz (52 dispatches → 1), optimizer CUDA-graph (−11.7 ms/step), bf16 Muon momentum (−1.23 GiB), Engram in host RAM (bit-identical). Rejected by measurement: NorMuon (+0.072), schedule-free Muon (+0.043), SIGReg (+0.148), LOOM (tie), MSA at short context (tie), ternary weights from scratch (+0.04), KDA recompute flag (tie).
 
 ## Quick start
 
+Requires [uv](https://docs.astral.sh/uv/) and Python 3.12.
+
 ```bash
-# build all three binaries (train, generate, serve)
-cargo build --release
+uv sync                # CPU environment; tests run here
+uv sync --extra gpu    # the measured stack: torch 2.13.0+cu129 + FLA (sm_120)
 
-# tests (CPU; no GPU needed)
-cargo test -p dormouse-core -p dormouse-data -p dormouse-train --lib
+uv run pytest                       # the suite (861 tests; CUDA gates self-skip)
+uv run ruff check .                 # lint
 
-# a real run — one command, checkpoint name derived from the flags
-tools/first_run.sh --preset small --batch 8 --seq-len 512 --steps 2000
+# train a model from a byte corpus
+uv run dormouse train medium --data corpus.bin --eval held.bin \
+  --device cuda --steps 60000 --batch 24 --set seq_len=1024 \
+  --set engram_ram=true --set moe_capacity=0 --set moe_kernel=triton \
+  --ckpt-name mix1 --out-dir checkpoints/mix1
 
-# every knob is a typed flag
-./target/release/train --help
+uv run dormouse bench --ckpt-name mix1 --out-dir checkpoints/mix1 \
+  --tasks arc_easy,hellaswag --limit 1000     # downstream, byte-scored
 
-# turn a checkpoint into a standalone inference file, then generate
-./target/release/export --ckpt-name <name>
-./target/release/generate --ckpt-name <name> --prompt "Once upon a time"
+uv run dormouse sft medium --data sft.bin --build-sft \
+  --chat-data pairs.jsonl --init-from checkpoints/mix1/mix1.pt \
+  --ckpt-name sft11 --out-dir checkpoints/sft
+
+uv run dormouse serve --out-dir checkpoints/sft --ckpt-name sft11 --port 3783
 ```
 
-Presets are flat TOML in [`configs/`](configs) (`nano` → `small` → `base`;
-`cargo test -p dormouse-core --test preset_exec` asserts their param counts).
-The GPU binary needs the `cuda` feature (default) and an sm_120 card;
-everything else runs on CPU/ndarray.
+`dormouse --help` lists every command; `dormouse info <preset>` prints a parameter budget table. Every knob is a typed flag or a `--set key=value` that refuses to load when the key is unknown — a config that lies is a bug, and the schema is strict on purpose.
 
 ## Architecture
 
-Four steps in [`crates/dormouse-core/src/model.rs`](crates/dormouse-core/src/model.rs):
+```
+src/dormouse/
+├── config.py        strict schema; unknown keys and unported arms refuse loudly
+├── instrument.py    the LOUD / COUNTED / SILENT degradation layer
+├── model/
+│   ├── model.py     DormouseModel: embed → loop → norm → head
+│   ├── loopblock.py the weight-shared loop; adaptive depth; MSA gate
+│   ├── kda.py       KDA attention (FLA chunked kernel; SDPA fallback, counted)
+│   ├── experts.py   dropless MoE: router, LFB balancing, padded/Triton dispatch
+│   ├── tsct.py      U·diag(s)·Vᵀ expert factors + the storage ladder (fp8→ternary)
+│   ├── engram.py    hash memory, in-VRAM or host-RAM (bit-identical)
+│   ├── byteflow.py  the byte patcher (local→global→decoder)
+│   └── sparse/      MSA: block-sparse attention + the fused Triton gather
+├── train/           loop, WSD schedule, Muon+AdamW, clip, SFT, mixture streaming
+├── post/            verifiers (code/math), rollouts, CRR advantage, the RL stepper
+├── bench/           downstream eval: ARC-Easy, HellaSwag, synth math (byte-scored)
+├── selfplay/        the zero-data self-play core (UTM + gradient-alignment reward)
+└── cli.py           train · bench · sft · rl · serve · decode · plot · info
+```
 
-1. **Embedding** `[256, d_model]` — the only place a byte becomes a vector
-2. **LoopBlock** ×N iterations, shared weights: a controller (sigmoid gates +
-   softmax expert blend) routes a **KDA gated-delta attention** arm, an
-   **Engram** hashed n-gram memory arm (FNV keys, optional host-RAM offload
-   with CPU Nesterov+Sinkhorn updates), and N low-rank **TSCT spectral**
-   FFN experts, then a residual write (ReZero / Gated-Residual / AttnRes)
-3. **RMSNorm** → **lm_head** `[d_model, 256]`
-4. Loss: honest unweighted cross-entropy; auxiliary heads (JEPA EMA-teacher,
-   DSpark draft, future-byte) are config-gated and A/B'd
-
-The trainer (`dormouse-train`) runs a Muon+ mixed optimizer, TSCT polar
-retraction every step, a NaN firewall, deterministic seeding, and checkpoints
-in a self-describing `.dmexp` format with a config snapshot that refuses
-mismatched resumes.
-
-## The vendored kernel library
-
-[`vendor/dormouse-fused/`](vendor/dormouse-fused) is our own 20-crate technology
-library — KDA, Engram, spectral/TSCT, Muon+, RMSNorm, JEPA, DSpark, BitNet,
-RoPE, MHC, SiTU and more — each crate with its paper reference and a
-verification tier ([`docs/protocols/ORACLE-TIERS.tsv`](docs/protocols/ORACLE-TIERS.tsv)). The repo
-also vendors patched forks of five cubecl/cubek crates (the root
-`Cargo.toml` `[patch.crates-io]` is the authority).
+Three things are custom because nothing in the ecosystem does them: the TSCT quantized experts, the Engram host tables, and the ByteFlow patcher. Everything else — attention, optimizer, quantization formats, fused kernels — is the best available dependency, and the places where that choice was made against a homegrown alternative are recorded in `docs/`.
 
 ## Documentation
 
-**Every document lives under [`docs/`](docs/),** one directory per kind, one
-naming rule — [`docs/README.md`](docs/README.md) is the map and the only page
-you need to find anything. The repo root keeps four files: this one,
-[`AGENTS.md`](AGENTS.md) (the rulebook: how to work here, machine facts,
-measured status, retractions — read §1 before your first edit),
-[`CONTEXT.md`](CONTEXT.md) (the system map) and
-[`CONTRIBUTING.md`](CONTRIBUTING.md) (how to work here in practice).
+The knowledge base is built from this repository's own documents and deployed with the site:
 
-| document | what it is |
-|---|---|
-| [`docs/README.md`](docs/README.md) | **the map** — which directory a new document belongs in |
-| [`docs/glossary.md`](docs/glossary.md) | one term, one meaning (+ the list of doc-vs-code disagreements) |
-| [`docs/adr/`](docs/adr) | architecture decision records |
-| [`docs/protocols/`](docs/protocols) | A/B protocol, oracle tiers, verification rules |
-| [`docs/papers/`](docs/papers) | original papers this project builds on, with provenance |
-| [knowledge base site](docs-site/) | Starlight site over all of the above — `cd docs-site && npm run dev` |
-| [`benches/history.tsv`](benches/history.tsv) | every measurement ever taken, with config+date |
-
-## Contributing
-
-[`CONTRIBUTING.md`](CONTRIBUTING.md) is the entry point: which command answers
-which question, the worktree and build-lock rules, and the four rules that have
-already cost a run. [`AGENTS.md`](AGENTS.md) §1 is the rulebook it defers to —
-loud failures, A/B or death, zero host-device sync, one claim one evidence.
+- **The docs site** (`docs-site/`): a Starlight site over `docs/`, `research/` and the working notes; `npm run build` in `docs-site/` to render it locally.
+- **`docs/decisions/`**: the dated plans and ADRs — the 1B readiness plan is the map.
+- **`docs/research/`**: the literature work, every claim carrying its arXiv id.
+- **`docs/reviews/`**: the audits, including the ones that found our own bugs.
+- **`AGENTS.md`**: the rulebook this repository is actually run by.
 
 ## License
 
-MIT — see [`LICENSE`](LICENSE). The vendored forks keep their upstream
-MIT/Apache-2.0 notices.
+MIT — see [LICENSE](LICENSE).

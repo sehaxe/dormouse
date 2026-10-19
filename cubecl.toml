@@ -1,4 +1,0 @@
-[memory]
-persistent_memory = "disabled"
-[memory.cuda]
-allocator = "sync"

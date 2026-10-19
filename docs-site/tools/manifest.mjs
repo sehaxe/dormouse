@@ -214,19 +214,18 @@ export const dirIndex = {
 };
 
 // Where a LINK to a file that is only ingested as slices should go: the file's
-// primary page. README.md is 845 lines and is cut into eight pages; the reader
-// who clicks "README.md" wants the status, which is where it opens.
+// primary page. README.md is cut into pages; the reader who clicks "README.md"
+// wants the status, which is where it opens.
 export const srcIndex = {
 	'README.md': '/start-here/status/',
 };
 
 export const pages = [
 	// ── Start here ───────────────────────────────────────────────────────────
-	// README.md was rewritten on 2026-10-01 as a front page (93ba203): eight
-	// sections instead of the dev-log's twenty. The slices follow the sections
-	// that exist; five pages whose ONLY source was a deleted section are gone
-	// rather than re-anchored onto text that is not what it says - see the
-	// site's IA.md for which content moved where.
+	// README.md is the front page: rewritten 2026-10-01 (93ba203) for the Rust
+	// tree, rewritten again 2026-10-19 for the Python-first tree. The slices
+	// follow the sections that exist; the Rust-era sections retired with the
+	// tree (see the comment below the model-walk page).
 	{ src: 'README.md', out: 'start-here/what-is-this', slice: { from: /^## What is this$/, to: /^## Results$/ }, title: 'What this is', nav: 'What this is' },
 	{ src: 'README.md', out: 'start-here/status', slice: { from: /^## Results$/, to: /^## Quick start$/ }, title: 'Status: the measured numbers', nav: 'Status' },
 	{ src: 'README.md', out: 'start-here/quick-start', slice: { from: /^## Quick start$/, to: /^## Architecture$/ }, title: 'Quick start' },
@@ -249,8 +248,10 @@ export const pages = [
 	// ── Architecture ─────────────────────────────────────────────────────────
 	{ src: 'CONTEXT.md', out: 'architecture/context', title: 'The system map', nav: 'The system map' },
 	{ src: 'docs/glossary.md', out: 'architecture/glossary' },
-	{ src: 'README.md', out: 'architecture/model', slice: { from: /^## Architecture$/, to: /^## The vendored kernel library/ }, title: 'The model walk', nav: 'The model walk' },
-	{ src: 'README.md', out: 'architecture/vendored-library', slice: { from: /^## The vendored kernel library/, to: /^## Documentation$/ }, title: 'The vendored kernel library', nav: 'The kernel library' },
+	{ src: 'README.md', out: 'architecture/model', slice: { from: /^## Architecture$/, to: /^## Documentation$/ }, title: 'The model walk', nav: 'The model walk' },
+	// The "vendored kernel library" page retired with the Rust tree (2026-10-19
+	// restructure: crates/, vendor/ and benches/ moved to the `rust-legacy`
+	// branch; the archived Rust-era README is docs/archive/rust-era-readme.md).
 	{ src: 'docs/architecture/design-minimal.md', out: 'architecture/design-minimal' },
 	{ src: 'docs/architecture/mixture-arms.md', out: 'architecture/mixture-arms' },
 	{ src: 'docs/architecture/tk-design-on-cubecl-2026-10-04.md', out: 'architecture/tk-design-on-cubecl', title: 'ThunderKittens design on cubecl', nav: 'TK design on cubecl' },

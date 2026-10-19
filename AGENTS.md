@@ -12,13 +12,9 @@ purpose, because a newcomer cannot otherwise tell which one they are reading:
    retracted, what is broken, what is next. This part goes stale; check the date
    on every number.
 
-**Mission.** dormouse = byte-level LM trainer in Rust (burn 0.22.0-pre.4 +
-cubecl CUDA) with max efficiency per FLOP/byte: PonderNet-style adaptive depth
-over a **weight-shared loop block**, hashed n-gram memory as input features,
-low-rank TSCT experts, and precision spent only where numerics demand it.
-Target hardware: 16 GB VRAM (5060 Ti) + 64 GB host RAM. Goal: train the
-biggest possible smart model on that box, optionally offloading to RAM without
-latency.
+**Lane (2026-10-19).** `main` is the Python tree: `uv sync` · `uv run pytest` · `uv run ruff check .` · `uv run dormouse <cmd>`. The Rust/burn original moved to the `rust-legacy` branch; anything below that names `cargo`, `crates/`, `vendor/` or `tools/build_lock.sh` describes that branch and is kept as the record of how the rules were earned. The rules themselves — A/B or death, loud failures, one claim one evidence — apply to both lanes.
+
+**Mission.** dormouse = a byte-level Mixture-of-Experts LM, trained end to end on one consumer GPU (RTX 5060 Ti, 16 GB) with maximal quality per FLOP: a weight-shared loop block (measured depth 3), dropless top-k MoE over low-rank TSCT experts, KDA linear attention, hashed n-gram memory (Engram) in host RAM, and precision spent only where numerics demand it. Goal: the biggest smart model that box can train, and a pipeline that ships it (`train → bench → sft → rl → serve`).
 
 **The vocabulary is in [`docs/glossary.md`](docs/glossary.md); the system map is
 in [`CONTEXT.md`](CONTEXT.md).** If you are about to use a word, check it there

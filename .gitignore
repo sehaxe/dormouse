@@ -20,3 +20,9 @@ wt/
 vendor/cubecl-cuda/
 vendor/cubecl-runtime/
 vendor/cubecl-server/
+
+# Python environment and run artifacts (merged from port/.gitignore, 2026-10-19).
+.venv/
+.pytest_cache/
+.ruff_cache/
+sft_pairs/aria_*.jsonl
