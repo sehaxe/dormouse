@@ -519,6 +519,89 @@ h1 {
 	}
 }
 
+/* ── the stack list: what it is, why it is here ──────────────────────────── */
+
+.sub {
+	margin: 32px 0 8px;
+	font-size: 16px;
+	line-height: 1.5;
+	color: var(--ink);
+}
+
+.tech {
+	margin: 24px 0 0;
+	border-top: 1px solid var(--hairline);
+}
+
+.tech-row {
+	display: grid;
+	grid-template-columns: 280px 1fr;
+	gap: 8px 32px;
+	padding: 14px 0;
+	border-bottom: 1px solid var(--hairline);
+}
+
+.tech-row dt {
+	color: var(--ink);
+	font-weight: 500;
+}
+
+.tech-row dt::before {
+	content: '[+] ';
+	color: var(--mute);
+}
+
+.tech-row dd {
+	margin: 0;
+	color: var(--body);
+	line-height: 1.7;
+}
+
+@media (max-width: 760px) {
+	.tech-row {
+		grid-template-columns: 1fr;
+		gap: 4px;
+	}
+}
+
+/* ── the language switch in the topbar ───────────────────────────────────── */
+
+.topbar-links a.lang {
+	color: var(--mute);
+}
+
+.topbar-links a.lang:hover {
+	color: var(--ink);
+}
+
+/* ── theme: the reader's system preference, in pure CSS ──────────────────────
+ *
+ * Light is the reference canvas (opencode's DESIGN.md). Dark is the same token
+ * set inverted: the cream becomes the ink, the hairlines stay hairlines, and
+ * the page's single dark surface (the terminal card) is elevated to
+ * --surface-dark-elevated so it still reads as a distinct card. No toggle and
+ * no script: `prefers-color-scheme` is the switch, and <meta color-scheme>
+ * tells the browser both are supported.
+ */
+@media (prefers-color-scheme: dark) {
+	:root {
+		--ink: #fdfcfc;
+		--body: #c9c6c6;
+		--mute: #9a9898;
+		--ash: #6e6e73;
+		--canvas: #201d1d;
+		--surface-card: #302c2c;
+		--surface-dark: #302c2c;
+		--surface-dark-elevated: #3a3636;
+		--hairline: rgba(253, 252, 252, 0.14);
+		--hairline-strong: #9a9898;
+		--on-dark: #fdfcfc;
+		--on-dark-mute: #9a9898;
+		--accent: #4da3ff;
+		--accent-hover: #7ab8ff;
+	}
+}
+
 /* ── motion: the only animation on the page is opt-out by default ────────── */
 
 @media (prefers-reduced-motion: reduce) {
