@@ -190,7 +190,12 @@ def load_ngram(cfg: TrainConfig) -> dict:
 
 
 def save_ckpt(
-    run: RunConfig, model: torch.nn.Module, opt: MixOptimizer, step: int
+    run: RunConfig,
+    model: torch.nn.Module,
+    opt: MixOptimizer,
+    step: int,
+    *,
+    counters: Counters | None = None,
 ) -> tuple[Path, Path]:
     """Weights + optimizer state, plus the config snapshot beside them.
 
@@ -204,6 +209,13 @@ def save_ckpt(
     the model half: it is model state (the next resume continues from it) but
     a non-persistent buffer (`lfb_path` says why). `load_model_state` restores
     it for every reader.
+
+    `counters` receives the storage rung's COUNTED degradations: NVFP4 blocks
+    whose stored e4m3 scale rounded to zero (`nvfp4_zero_scale_blocks`) decode
+    to zeros, and a save that did not surface the count left the audit's
+    "COUNTED, never SILENT" half of the prescale as a test-only tally (review
+    round 1 M3). The trainer passes a fresh `Counters` per checkpoint and
+    prints it on the checkpoint line.
     """
     from ..model.tsct import is_factor_key, pack_tsct
 
@@ -219,7 +231,10 @@ def save_ckpt(
     sd = {k.removeprefix("_orig_mod."): v for k, v in sd.items()}
     rung = run.model.quant if run.model.quant != "none" else ""
     if rung and rung in ("fp8", "nvfp4", "ternary"):
-        sd = {k: (pack_tsct(v, rung) if is_factor_key(k) else v) for k, v in sd.items()}
+        sd = {
+            k: (pack_tsct(v, rung, counters=counters) if is_factor_key(k) else v)
+            for k, v in sd.items()
+        }
     tmp = weights.with_suffix(".pt.tmp")
     torch.save(
         {
@@ -1066,9 +1081,17 @@ def train(
             # `x` are the same iterate, which is what makes the switch back to Y
             # an absolute, double-lerp-free write.
             sf("eval")
-            weights, snapshot = save_ckpt(run, model, opt, step)
+            # A fresh tally per save: the checkpoint line names a file's own
+            # zeroed blocks, not a run-cumulative number a reader cannot tie to
+            # the file (`save_ckpt`'s `counters`).
+            ck_counts = Counters()
+            weights, snapshot = save_ckpt(run, model, opt, step, counters=ck_counts)
             sf("train")
-            log(f"ckpt step={step + 1} -> {weights} ({snapshot})")
+            ck_line = f"ckpt step={step + 1} -> {weights} ({snapshot})"
+            if ck_counts:
+                total.merge(ck_counts)
+                ck_line += " " + ck_counts.line()
+            log(ck_line)
 
     if cfg.eval and eval_stream is not None and cfg.steps % cfg.eval_every != 0:
         sf("eval")

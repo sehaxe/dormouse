@@ -203,6 +203,58 @@ def test_only_whole_eval_windows_are_scored_and_the_leftover_is_named(tmp_path):
     assert "holds 672 B" in line and "left over 160 B" in line
 
 
+def test_a_tiny_nvfp4_block_is_counted_on_the_checkpoint_line(tmp_path):
+    """M3: a real save surfaces the zero-scale block count, not just a test tally.
+
+    A factor matrix spanning more than e4m3's ~18 octaves loses its smallest
+    16-block even after the global prescale. `save_ckpt` used to call
+    `pack_tsct(v, rung)` with no counters, so `nvfp4_zero_scale_blocks` reached
+    no log. The checkpoint line must carry it — and the common path must not
+    grow a field it never used.
+    """
+    import dataclasses
+
+    from conftest import tiny_cfg
+
+    from dormouse.model.tsct import is_factor_key
+
+    run = dataclasses.replace(
+        tiny_run(tmp_path, steps=1, log_every=1, ckpt_every=1),
+        model=tiny_cfg(quant="nvfp4"),
+    )
+    model = DormouseModel(run.model)
+    params = dict(model.named_parameters())
+    for key in sorted(params):
+        if is_factor_key(key) and params[key].numel() >= 32:
+            with torch.no_grad():
+                params[key].zero_()
+                flat = params[key].reshape(-1)
+                flat[0] = 1.0  # a block at e4m3's top after the prescale
+                flat[16] = 1e-40  # ...and one ~130 octaves below it, lost
+            # Freeze it: one optimizer step with lr=0.01 would overwrite 1e-40
+            # with an O(lr) update and hide the fixture, not the defect.
+            params[key].requires_grad_(False)
+            break
+    else:  # pragma: no cover - the tiny model always has a factor
+        raise AssertionError("the fixture has no factor matrix")
+    lines: list[str] = []
+    report = train(model, run, log=lines.append)
+    ckpts = [ln for ln in lines if ln.startswith("ckpt ")]
+    assert ckpts and "nvfp4_zero_scale_blocks=1" in ckpts[0], ckpts
+    assert report["counters"]["nvfp4_zero_scale_blocks"] == 1
+
+    clean_dir = tmp_path / "clean"
+    clean_dir.mkdir()
+    clean_run = dataclasses.replace(
+        tiny_run(clean_dir, steps=1, log_every=1, ckpt_every=1),
+        model=tiny_cfg(quant="nvfp4"),
+    )
+    clean_lines: list[str] = []
+    train(DormouseModel(clean_run.model), clean_run, log=clean_lines.append)
+    clean_ckpts = [ln for ln in clean_lines if ln.startswith("ckpt ")]
+    assert clean_ckpts and "nvfp4_zero_scale_blocks" not in clean_ckpts[0]
+
+
 def test_log_line_carries_the_kda_arm_and_counters(tmp_path):
     run = tiny_run(tmp_path, steps=1, log_every=1, timers=True)
     lines: list[str] = []
