@@ -780,6 +780,12 @@ def test_the_sft_corpus_shares_no_solution_with_the_verifier(tmp_path: Path):
     every corpus record and compares them with every solution the RL/bench
     verifier can draw at the same seed; the corpus must also be non-empty, so
     "drop everything" cannot pass it.
+
+    The comparison is the full answer text: for code that is the reference
+    implementation the verifier would score by execution. Generic arithmetic
+    drills (`answer: 4`) share VALUES with generated math answers by design —
+    option (a) keeps the generic bank — so the gate is on the generated
+    solution strings, not on the numeric value space.
     """
     seed = 1
     path = tmp_path / "sft.bin"
