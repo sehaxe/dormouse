@@ -304,6 +304,7 @@ export const pages = [
 	// numbers, every figure carried with its source.
 	{ src: 'docs/guides/train-your-first.md', out: 'tooling/train-your-first', title: 'Train your first model', nav: 'First run' },
 	{ src: 'docs/guides/data.md', out: 'tooling/data', title: 'Data: what the corpora are and how to get one', nav: 'Data' },
+	{ src: 'docs/guides/reproduce.md', out: 'tooling/reproduce', title: 'Reproducing the numbers', nav: 'Reproduce' },
 	{ src: 'docs/reviews/2026-10-19-findings-ledger.md', out: 'reviews/2026-10-19-findings-ledger', title: 'Findings ledger: the 2026-10-19 audits', nav: 'Findings' },
 	{ src: 'docs/reviews/2026-10-19-code-audit.md', out: 'reviews/2026-10-19-code-audit', title: 'Code audit: 6/10, and the two holes that matter' },
 	{ src: 'docs/reviews/2026-10-19-review-loop.md', out: 'reviews/2026-10-19-review-loop', title: 'The review loop: rounds and scores' },

@@ -52,7 +52,8 @@ Every mechanism in the tree was admitted by a 3-seed A/B on a fixed protocol, an
 Requires [uv](https://docs.astral.sh/uv/) and Python 3.12. **You need a corpus** — the
 repositories does not ship one; [docs/guides/data.md](docs/guides/data.md) has the two
 the numbers were taken on, the smallest honest recipe for building your own, and what
-the eval carve must look like.
+the eval carve must look like. Each headline figure's command, log and commit is in
+[docs/guides/reproduce.md](docs/guides/reproduce.md).
 
 ```bash
 uv sync                # CPU environment; tests run here

@@ -14,7 +14,7 @@ reader can check against `~/logs/`.
 
 Every finding is in `docs/reviews/2026-10-19-findings-ledger.md` with its
 status, and the fixes carry revert-checked gates. The three reports are in
-`docs/reviews/2026-10-19-review-round-{1,2,3}.md`, the protocol and the final
+`docs/reviews/2026-10-19-review-round-1.md`, `-round-2.md` and `-round-3.md`, the protocol and the final
 verdict in `docs/reviews/2026-10-19-review-loop.md`.
 
 The fix list from the last round, all landed:
