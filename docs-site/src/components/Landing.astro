@@ -18,12 +18,11 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
 const at = (path) => `${base}${path}`;
 const other = lang === 'en' ? at('/ru/') : at('/');
 
-// The wordmark's only ornament: a block-pixel rodent, four rows of exactly
-// nine cells so the outline cannot drift in any monospace face.
-const mark = ` ▄▄   ▄▄ 
-█▀▀▀▀▀▀▀█
-█  ● ●  █
- ▀▀▀▀▀▀▀ `;
+// The social card: one image for the whole site. Absolute URLs, because a
+// crawler does not resolve a relative og:image (the same requirement that made
+// astro.config.mjs carry the Pages origin instead of the GitHub URL).
+const siteUrl = 'https://sehaxe.github.io/dormouse';
+const ogImage = `${siteUrl}/og.png`;
 
 const COPY = {
 	en: {
@@ -208,6 +207,23 @@ const repo = 'https://github.com/sehaxe/dormouse';
 		<title>{c.title}</title>
 		<meta name="description" content={c.description} />
 		<link rel="alternate" hreflang={lang === 'en' ? 'ru' : 'en'} href={other} />
+		{/* The social card: one image for the whole site (assets/og.svg is its
+		    source, docs-site/public/og.png the rasterisation crawlers read).
+		    Absolute URLs only - crawlers do not resolve relative ones. */}
+		<meta property="og:type" content="website" />
+		<meta property="og:site_name" content="dormouse" />
+		<meta property="og:title" content={c.title} />
+		<meta property="og:description" content={c.description} />
+		<meta property="og:image" content={ogImage} />
+		<meta property="og:image:width" content="1200" />
+		<meta property="og:image:height" content="630" />
+		<meta property="og:url" content={lang === 'en' ? `${siteUrl}/` : `${siteUrl}/ru/`} />
+		<meta property="og:locale" content={lang === 'en' ? 'en_US' : 'ru_RU'} />
+		<meta property="og:locale:alternate" content={lang === 'en' ? 'ru_RU' : 'en_US'} />
+		<meta name="twitter:card" content="summary_large_image" />
+		<meta name="twitter:title" content={c.title} />
+		<meta name="twitter:description" content={c.description} />
+		<meta name="twitter:image" content={ogImage} />
 		<link rel="icon" href={at('/favicon.svg')} type="image/svg+xml" />
 		{/* htmx, vendored (docs-site/public/htmx.min.js, 2.0.4): the docs-peek
 		    section loads Starlight pages in place. The page is complete without
@@ -217,7 +233,20 @@ const repo = 'https://github.com/sehaxe/dormouse';
 	<body>
 		<nav class="topbar">
 			<div class="wrap topbar-in">
-				<a class="topbar-mark" href={at('/')}>dormouse(1)</a>
+				<a class="topbar-mark" href={at('/')}>
+					{/* The mini mark: the wordmark's first cell-glyph, the same one the
+					    favicon carries. Rect-based, and its cells print in sequence
+					    (landing.css). */}
+					<svg class="mark-mini" viewBox="0 0 4 5" width="24" height="30" aria-hidden="true">
+					  <rect x="0" y="0" width="3" height="1"/>
+					  <rect x="0" y="1" width="1" height="1"/>
+					  <rect x="3" y="1" width="1" height="1"/>
+					  <rect x="0" y="2" width="1" height="1"/>
+					  <rect x="3" y="2" width="1" height="1"/>
+					  <rect x="0" y="3" width="1" height="1"/>
+					  <rect x="3" y="3" width="1" height="1"/>
+					  <rect x="0" y="4" width="3" height="1"/>
+					</svg>dormouse(1)</a>
 				<span class="topbar-links">
 					<a href={at('/start-here/what-is-this/')}>{c.nav.docs}</a>
 					<a href={at('/start-here/status/')}>{c.nav.status}</a>
@@ -230,7 +259,6 @@ const repo = 'https://github.com/sehaxe/dormouse';
 
 		<main>
 			<header class="hero wrap">
-				<p class="mark" aria-hidden="true">{mark}</p>
 				<h1>dormouse</h1>
 				<p class="tagline">{c.tagline}</p>
 
@@ -239,6 +267,79 @@ const repo = 'https://github.com/sehaxe/dormouse';
 						<span>{c.termBar.left}</span>
 						<span>{c.termBar.right}</span>
 					</div>
+					{/* The brand mark: the name on a 5-row block grid, from
+					    tools/mk_wordmark.py (the same glyphs the favicon, the banner and
+					    the social card use). Rects, not <text>: a block character's
+					    advance width belongs to whatever font the reader has, and a
+					    wordmark that reflows is not a wordmark. */}
+					<svg class="term-mark" viewBox="0 0 240 30" width="240" height="30" role="img" aria-label="dormouse">
+					<g fill="currentColor" width="240" height="30">
+					  <rect x="0" y="0" width="18" height="6"/>
+					  <rect x="0" y="6" width="6" height="6"/>
+					  <rect x="18" y="6" width="6" height="6"/>
+					  <rect x="0" y="12" width="6" height="6"/>
+					  <rect x="18" y="12" width="6" height="6"/>
+					  <rect x="0" y="18" width="6" height="6"/>
+					  <rect x="18" y="18" width="6" height="6"/>
+					  <rect x="0" y="24" width="18" height="6"/>
+					  <rect x="36" y="0" width="12" height="6"/>
+					  <rect x="30" y="6" width="6" height="6"/>
+					  <rect x="48" y="6" width="6" height="6"/>
+					  <rect x="30" y="12" width="6" height="6"/>
+					  <rect x="48" y="12" width="6" height="6"/>
+					  <rect x="30" y="18" width="6" height="6"/>
+					  <rect x="48" y="18" width="6" height="6"/>
+					  <rect x="36" y="24" width="12" height="6"/>
+					  <rect x="60" y="0" width="6" height="6"/>
+					  <rect x="72" y="0" width="12" height="6"/>
+					  <rect x="60" y="6" width="12" height="6"/>
+					  <rect x="60" y="12" width="6" height="6"/>
+					  <rect x="60" y="18" width="6" height="6"/>
+					  <rect x="60" y="24" width="6" height="6"/>
+					  <rect x="90" y="0" width="12" height="6"/>
+					  <rect x="108" y="0" width="12" height="6"/>
+					  <rect x="90" y="6" width="6" height="6"/>
+					  <rect x="102" y="6" width="6" height="6"/>
+					  <rect x="114" y="6" width="6" height="6"/>
+					  <rect x="90" y="12" width="6" height="6"/>
+					  <rect x="102" y="12" width="6" height="6"/>
+					  <rect x="114" y="12" width="6" height="6"/>
+					  <rect x="90" y="18" width="6" height="6"/>
+					  <rect x="102" y="18" width="6" height="6"/>
+					  <rect x="114" y="18" width="6" height="6"/>
+					  <rect x="90" y="24" width="6" height="6"/>
+					  <rect x="102" y="24" width="6" height="6"/>
+					  <rect x="114" y="24" width="6" height="6"/>
+					  <rect x="132" y="0" width="12" height="6"/>
+					  <rect x="126" y="6" width="6" height="6"/>
+					  <rect x="144" y="6" width="6" height="6"/>
+					  <rect x="126" y="12" width="6" height="6"/>
+					  <rect x="144" y="12" width="6" height="6"/>
+					  <rect x="126" y="18" width="6" height="6"/>
+					  <rect x="144" y="18" width="6" height="6"/>
+					  <rect x="132" y="24" width="12" height="6"/>
+					  <rect x="156" y="0" width="6" height="6"/>
+					  <rect x="174" y="0" width="6" height="6"/>
+					  <rect x="156" y="6" width="6" height="6"/>
+					  <rect x="174" y="6" width="6" height="6"/>
+					  <rect x="156" y="12" width="6" height="6"/>
+					  <rect x="174" y="12" width="6" height="6"/>
+					  <rect x="156" y="18" width="6" height="6"/>
+					  <rect x="174" y="18" width="6" height="6"/>
+					  <rect x="162" y="24" width="18" height="6"/>
+					  <rect x="192" y="0" width="18" height="6"/>
+					  <rect x="186" y="6" width="6" height="6"/>
+					  <rect x="192" y="12" width="12" height="6"/>
+					  <rect x="204" y="18" width="6" height="6"/>
+					  <rect x="186" y="24" width="18" height="6"/>
+					  <rect x="222" y="0" width="12" height="6"/>
+					  <rect x="216" y="6" width="6" height="6"/>
+					  <rect x="234" y="6" width="6" height="6"/>
+					  <rect x="216" y="12" width="24" height="6"/>
+					  <rect x="216" y="18" width="6" height="6"/>
+					  <rect x="222" y="24" width="18" height="6"/>
+					</g>
+					</svg>
 					<pre class="term-body" data-term>{c.session}</pre>
 					<div class="term-hints">
 						{c.termHints.map((h) => (
@@ -271,7 +372,7 @@ const repo = 'https://github.com/sehaxe/dormouse';
 				))}
 			</section>
 
-			<section class="section wrap">
+			<section class="section wrap" data-reveal>
 				<h2>{c.whyTitle}</h2>
 				{c.why.map((p) => (
 					<p class="prose">{p}</p>
@@ -279,7 +380,7 @@ const repo = 'https://github.com/sehaxe/dormouse';
 				<h3 class="sub">{c.registerTitle}</h3>
 				<ul class="register">
 					{c.register.map((r) => (
-						<li class={r.admitted ? 'admitted' : ''}>
+						<li class={r.admitted ? 'admitted' : ''} data-reveal>
 							<span class="name">{r.name}</span>
 							<span class="delta">{r.delta}</span>
 						</li>
@@ -292,11 +393,11 @@ const repo = 'https://github.com/sehaxe/dormouse';
 				</p>
 			</section>
 
-			<section class="section wrap">
+			<section class="section wrap" data-reveal>
 				<h2>{c.axesTitle}</h2>
 				<div class="cards">
 					{c.axes.map((a) => (
-						<article class="card">
+						<article class="card" data-reveal>
 							<h3>{a.name}</h3>
 							<p>{a.body}</p>
 						</article>
@@ -304,11 +405,11 @@ const repo = 'https://github.com/sehaxe/dormouse';
 				</div>
 			</section>
 
-			<section class="section wrap">
+			<section class="section wrap" data-reveal>
 				<h2>{c.stackTitle}</h2>
 				<dl class="tech">
 					{c.stack.map((t) => (
-						<div class="tech-row">
+						<div class="tech-row" data-reveal>
 							<dt>{t.name}</dt>
 							<dd>{t.why}</dd>
 						</div>
@@ -316,7 +417,7 @@ const repo = 'https://github.com/sehaxe/dormouse';
 				</dl>
 			</section>
 
-			<section class="section wrap">
+			<section class="section wrap" data-reveal>
 				<h2>{c.docsTitle}</h2>
 				<p class="prose">{c.docs}</p>
 				<p class="section-note">
@@ -326,7 +427,7 @@ const repo = 'https://github.com/sehaxe/dormouse';
 				</p>
 			</section>
 
-			<section class="section wrap">
+			<section class="section wrap" data-reveal>
 				<h2>{c.peekTitle}</h2>
 				<p class="prose">{c.peek}</p>
 				<div class="peek">
@@ -348,7 +449,7 @@ const repo = 'https://github.com/sehaxe/dormouse';
 				</div>
 			</section>
 
-			<section class="section wrap">
+			<section class="section wrap" data-reveal>
 				<h2>{c.quickTitle}</h2>
 				<pre class="snippet">{quickstart}</pre>
 				<p class="section-note">
@@ -412,6 +513,26 @@ const repo = 'https://github.com/sehaxe/dormouse';
 						};
 						setTimeout(step, 250);
 					}
+				}
+
+				// ── what scrolls into view: add .is-in once, then stop watching.
+				// The CSS owns what that means (a 6px rise and the section's rule
+				// drawing itself); this only says when. Off under reduced motion.
+				const reveals = document.querySelectorAll('[data-reveal]');
+				if (reveals.length && !reduce) {
+					const ro = new IntersectionObserver(
+						(entries) => {
+							for (const e of entries) {
+								if (!e.isIntersecting) continue;
+								ro.unobserve(e.target);
+								e.target.classList.add('is-in');
+							}
+						},
+						{ threshold: 0.15, rootMargin: '0px 0px -40px 0px' },
+					);
+					reveals.forEach((r) => ro.observe(r));
+				} else {
+					reveals.forEach((r) => r.classList.add('is-in'));
 				}
 
 				// ── the stat band: count up once, on the way into view.

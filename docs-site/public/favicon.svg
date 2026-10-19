@@ -1,4 +1,20 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
-  <title>dormouse</title>
-  <text y=".9em" font-size="90">🐹</text>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 4 5" width="32" height="40" role="img" aria-label="dormouse">
+  <!-- The favicon is the block-pixel 'd' — the first cell-glyph of the wordmark
+       (tools/mk_wordmark.py svg d 1), not a drawn logo. The design system's rule
+       is "small monospaced character glyphs, not bitmaps": the mark IS the
+       letter, rendered on the same 5-row grid as the full wordmark, so the tab
+       icon, the nav and the hero card are one identity.
+       Rect-based (not <text>) so no renderer can reflow it; viewBox is the cell
+       grid, so the browser scales it to any favicon slot. -->
+  <rect width="4" height="5" fill="#fdfcfc"/>
+  <g fill="#201d1d">
+    <rect x="0" y="0" width="3" height="1"/>
+    <rect x="0" y="1" width="1" height="1"/>
+    <rect x="3" y="1" width="1" height="1"/>
+    <rect x="0" y="2" width="1" height="1"/>
+    <rect x="3" y="2" width="1" height="1"/>
+    <rect x="0" y="3" width="1" height="1"/>
+    <rect x="3" y="3" width="1" height="1"/>
+    <rect x="0" y="4" width="3" height="1"/>
+  </g>
 </svg>

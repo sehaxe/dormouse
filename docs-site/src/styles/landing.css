@@ -102,6 +102,17 @@ a:hover {
 
 .topbar-mark {
 	font-weight: 700;
+	display: inline-flex;
+	align-items: center;
+	gap: 10px;
+}
+
+/* The mini mark sits on the text baseline, not on its own line: the nav is one
+   line of type, and a 30px box in it would otherwise set the row height. */
+.mark-mini {
+	display: block;
+	flex: none;
+	color: var(--ink);
 }
 
 .topbar-links {
@@ -119,12 +130,17 @@ a:hover {
 	padding-top: 72px;
 }
 
-.mark {
-	margin: 0 0 24px;
-	color: var(--mute);
-	font-size: 14px;
-	line-height: 1;
-	white-space: pre;
+/* The block-pixel wordmark inside the terminal card. The grid must stay SQUARE:
+   a monospace advance is ~0.6em, so line-height 0.6 keeps the 5 rows from
+   stretching, and 40 cells at 10px is a 240x30 mark. white-space: pre is what
+   holds the cell grid; letter-spacing must stay 0 for the same reason. */
+.term-mark {
+	display: block;
+	margin: 22px 16px 4px;
+	padding: 0;
+	color: var(--on-dark);
+	clip-path: inset(0 100% 0 0);
+	animation: print 1100ms steps(40, end) 250ms both;
 }
 
 h1 {
@@ -602,11 +618,82 @@ h1 {
 	}
 }
 
+/* ── the terminal feel: what enters, and how ─────────────────────────────────
+ *
+ * Three motions, each one the page doing what a terminal does: a line prints
+ * (the mark), rows arrive as you scroll to them (the sections), a cursor blinks
+ * (the card, above). Nothing bounces, nothing appears from nowhere, no element
+ * travels more than 6px. All of it is off under prefers-reduced-motion, at the
+ * bottom of this file.
+ */
+
+/* the mini mark in the nav: cells print in reading order */
+.mark-mini rect {
+	opacity: 0;
+	animation: cell-in 140ms ease-out both;
+}
+.mark-mini rect:nth-child(1) { animation-delay: 40ms; }
+.mark-mini rect:nth-child(2) { animation-delay: 90ms; }
+.mark-mini rect:nth-child(3) { animation-delay: 140ms; }
+.mark-mini rect:nth-child(4) { animation-delay: 190ms; }
+.mark-mini rect:nth-child(5) { animation-delay: 240ms; }
+.mark-mini rect:nth-child(6) { animation-delay: 290ms; }
+.mark-mini rect:nth-child(7) { animation-delay: 340ms; }
+.mark-mini rect:nth-child(8) { animation-delay: 390ms; }
+
+@keyframes cell-in {
+	from { opacity: 0; }
+	to { opacity: 1; }
+}
+
+/* the wordmark in the hero card: printed left to right in 40 steps, the way a
+   terminal lays down a line of block characters */
+.term-mark {
+	clip-path: inset(0 100% 0 0);
+	animation: print 1100ms steps(40, end) 250ms both;
+}
+
+@keyframes print {
+	to { clip-path: inset(0 0 0 0); }
+}
+
+/* what scrolls into view */
+[data-reveal] {
+	opacity: 0;
+	transform: translateY(6px);
+}
+
+.is-in {
+	opacity: 1;
+	transform: none;
+	transition:
+		opacity 260ms ease-out,
+		transform 260ms ease-out;
+}
+
+.section.is-in > h2 {
+	animation: rule 420ms ease-out 60ms both;
+}
+
+@keyframes rule {
+	from { border-bottom-color: transparent; }
+	to { border-bottom-color: var(--hairline); }
+}
+
 /* ── motion: the only animation on the page is opt-out by default ────────── */
 
 @media (prefers-reduced-motion: reduce) {
-	.cursor {
+	.cursor,
+	.mark-mini rect,
+	.term-mark,
+	[data-reveal],
+	.is-in,
+	.section.is-in > h2 {
 		animation: none;
+		opacity: 1;
+		transform: none;
+		clip-path: none;
+		transition: none;
 	}
 
 	a {

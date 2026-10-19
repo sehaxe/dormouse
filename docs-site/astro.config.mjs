@@ -11,8 +11,16 @@ import manifest from './tools/manifest.mjs';
 
 const { repo } = manifest;
 
+// The PAGES origin, not the GitHub URL. `site` + `base` compose the absolute
+// URL of every page, so `site: repo` (https://github.com/sehaxe/dormouse) made
+// the sitemap advertise https://github.com/dormouse/... — the origin is taken
+// from `site` and github.com is not where the site lives. Measured 2026-10-19
+// in dist/sitemap-0.xml; og:image has the same requirement.
+const siteUrl = 'https://sehaxe.github.io';
+const ogImage = `${siteUrl}/dormouse/og.png`;
+
 export default defineConfig({
-	site: `${repo}`,
+	site: siteUrl,
 	// GitHub Pages project site: served under /dormouse/ — without this every asset 404s.
 	base: '/dormouse',
 	trailingSlash: 'always',
@@ -46,6 +54,22 @@ export default defineConfig({
 			// public/favicon.svg IS the hamster, so the link resolves instead of
 			// dangling on all 181 pages.
 			favicon: '/favicon.svg',
+			// The social card. Starlight sets title/description per page but no
+			// og:image, so a link to any of the ~180 docs pages previewed as a bare
+			// text card. The image is one file for the whole site (assets/og.svg is
+			// its source, docs-site/public/og.png the rasterisation crawlers read);
+			// og:title/og:description come from Starlight's own per-page tags, which
+			// crawlers also accept, so only the image and the card type are added
+			// here. Absolute URLs: crawlers do not resolve relative ones.
+			head: [
+				{ tag: 'meta', attrs: { property: 'og:image', content: ogImage } },
+				{ tag: 'meta', attrs: { property: 'og:image:width', content: '1200' } },
+				{ tag: 'meta', attrs: { property: 'og:image:height', content: '630' } },
+				{ tag: 'meta', attrs: { property: 'og:site_name', content: 'dormouse' } },
+				{ tag: 'meta', attrs: { property: 'og:type', content: 'website' } },
+				{ tag: 'meta', attrs: { name: 'twitter:card', content: 'summary_large_image' } },
+				{ tag: 'meta', attrs: { name: 'twitter:image', content: ogImage } },
+			],
 			components: {
 				// The site has one author and one repo; a footer credit is noise.
 				Footer: undefined,

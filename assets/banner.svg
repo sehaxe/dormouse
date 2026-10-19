@@ -30,10 +30,76 @@
     <text x="48" y="194" font-size="16" class="body">trained end to end on one consumer GPU.</text>
 
     <!-- the one dark surface: a terminal card -->
-    <rect x="48" y="220" width="640" height="92" rx="4" fill="#201d1d" />
-    <text x="66" y="248" font-size="13" class="on-dark-mute">$ dormouse train medium --set seq_len=1024</text>
-    <text x="66" y="270" font-size="13" class="on-dark">step=60000  loss=1.2130  bpb=1.936  40.9k tok/s</text>
-    <text x="66" y="292" font-size="13" class="on-dark-mute">ready &#8212; one RTX 5060 Ti 16GB, $429</text>
+    <rect x="48" y="204" width="640" height="120" rx="4" fill="#201d1d" />
+    <g fill="#fdfcfc" transform="translate(66 216)">
+      <rect x="0" y="0" width="12" height="4"/>
+      <rect x="0" y="4" width="4" height="4"/>
+      <rect x="12" y="4" width="4" height="4"/>
+      <rect x="0" y="8" width="4" height="4"/>
+      <rect x="12" y="8" width="4" height="4"/>
+      <rect x="0" y="12" width="4" height="4"/>
+      <rect x="12" y="12" width="4" height="4"/>
+      <rect x="0" y="16" width="12" height="4"/>
+      <rect x="24" y="0" width="8" height="4"/>
+      <rect x="20" y="4" width="4" height="4"/>
+      <rect x="32" y="4" width="4" height="4"/>
+      <rect x="20" y="8" width="4" height="4"/>
+      <rect x="32" y="8" width="4" height="4"/>
+      <rect x="20" y="12" width="4" height="4"/>
+      <rect x="32" y="12" width="4" height="4"/>
+      <rect x="24" y="16" width="8" height="4"/>
+      <rect x="40" y="0" width="4" height="4"/>
+      <rect x="48" y="0" width="8" height="4"/>
+      <rect x="40" y="4" width="8" height="4"/>
+      <rect x="40" y="8" width="4" height="4"/>
+      <rect x="40" y="12" width="4" height="4"/>
+      <rect x="40" y="16" width="4" height="4"/>
+      <rect x="60" y="0" width="8" height="4"/>
+      <rect x="72" y="0" width="8" height="4"/>
+      <rect x="60" y="4" width="4" height="4"/>
+      <rect x="68" y="4" width="4" height="4"/>
+      <rect x="76" y="4" width="4" height="4"/>
+      <rect x="60" y="8" width="4" height="4"/>
+      <rect x="68" y="8" width="4" height="4"/>
+      <rect x="76" y="8" width="4" height="4"/>
+      <rect x="60" y="12" width="4" height="4"/>
+      <rect x="68" y="12" width="4" height="4"/>
+      <rect x="76" y="12" width="4" height="4"/>
+      <rect x="60" y="16" width="4" height="4"/>
+      <rect x="68" y="16" width="4" height="4"/>
+      <rect x="76" y="16" width="4" height="4"/>
+      <rect x="88" y="0" width="8" height="4"/>
+      <rect x="84" y="4" width="4" height="4"/>
+      <rect x="96" y="4" width="4" height="4"/>
+      <rect x="84" y="8" width="4" height="4"/>
+      <rect x="96" y="8" width="4" height="4"/>
+      <rect x="84" y="12" width="4" height="4"/>
+      <rect x="96" y="12" width="4" height="4"/>
+      <rect x="88" y="16" width="8" height="4"/>
+      <rect x="104" y="0" width="4" height="4"/>
+      <rect x="116" y="0" width="4" height="4"/>
+      <rect x="104" y="4" width="4" height="4"/>
+      <rect x="116" y="4" width="4" height="4"/>
+      <rect x="104" y="8" width="4" height="4"/>
+      <rect x="116" y="8" width="4" height="4"/>
+      <rect x="104" y="12" width="4" height="4"/>
+      <rect x="116" y="12" width="4" height="4"/>
+      <rect x="108" y="16" width="12" height="4"/>
+      <rect x="128" y="0" width="12" height="4"/>
+      <rect x="124" y="4" width="4" height="4"/>
+      <rect x="128" y="8" width="8" height="4"/>
+      <rect x="136" y="12" width="4" height="4"/>
+      <rect x="124" y="16" width="12" height="4"/>
+      <rect x="148" y="0" width="8" height="4"/>
+      <rect x="144" y="4" width="4" height="4"/>
+      <rect x="156" y="4" width="4" height="4"/>
+      <rect x="144" y="8" width="16" height="4"/>
+      <rect x="144" y="12" width="4" height="4"/>
+      <rect x="148" y="16" width="12" height="4"/>
+    </g>
+    <text x="66" y="266" font-size="13" class="on-dark-mute">$ dormouse train medium --set seq_len=1024</text>
+    <text x="66" y="288" font-size="13" class="on-dark">step=60000  loss=1.2130  bpb=1.936  40.9k tok/s</text>
+    <text x="66" y="310" font-size="13" class="on-dark-mute">ready &#8212; one RTX 5060 Ti 16GB, $429</text>
 
     <!-- stat column -->
     <g font-size="15">
@@ -44,12 +110,19 @@
       <text x="740" y="284" class="ink"><tspan class="mute">[+] </tspan>MIT license</text>
     </g>
 
-    <!-- the block-pixel mouse, four rows of nine cells, exactly as the site draws it -->
-    <g font-size="11" class="ink" aria-hidden="true">
-      <text x="1112" y="128">&#9604;&#9604; &#9604;&#9604;</text>
-      <text x="1112" y="142">&#9608;&#9600;&#9600;&#9600;&#9600;&#9600;&#9600;&#9600;&#9608;</text>
-      <text x="1112" y="156">&#9608; &#9679; &#9679; &#9608;</text>
-      <text x="1112" y="170">&#9600;&#9600;&#9600;&#9600;&#9600;&#9600;&#9600;</text>
+    <!-- The brand mark: the mini 'd' on the wordmark's own 5-row cell grid
+         (tools/mk_wordmark.py), the same glyph the favicon and the nav carry.
+         Rects, not <text>: a block character's advance is the reader's font's,
+         a rect's is not. -->
+    <g fill="#201d1d" transform="translate(1128 104)">
+      <rect x="0" y="0" width="18" height="6"/>
+      <rect x="0" y="6" width="6" height="6"/>
+      <rect x="18" y="6" width="6" height="6"/>
+      <rect x="0" y="12" width="6" height="6"/>
+      <rect x="18" y="12" width="6" height="6"/>
+      <rect x="0" y="18" width="6" height="6"/>
+      <rect x="18" y="18" width="6" height="6"/>
+      <rect x="0" y="24" width="18" height="6"/>
     </g>
   </g>
 </svg>
