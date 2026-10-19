@@ -4,3 +4,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 checkpoints/
+
+# Regenerable SFT corpora (parse_aria_sft.py is deterministic; data lives outside git).
+sft_pairs/aria_*.jsonl
+data_local/
