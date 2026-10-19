@@ -101,10 +101,29 @@ from .tsct import _NVFP4_MAGNITUDES as E2M1_MAGNITUDES
 #: The guard cadence (§1.3): the finite / e8m0-range / NaN-byte checks each
 #: cost a device→host read (`bool(any())`), which is forbidden on the hot path.
 #: They run on the first `first` calls and every `every`-th after that; in the
-#: gap the step's NaN firewall is the detector and this codec has already made
-#: the value NaN (never a plausible-looking number). `_GUARD.reset()` is the
-#: test seam.
+#: gap a non-finite value reaches the step's NaN firewall, and an out-of-range
+#: e8m0 scale is handled WITHOUT a host read: the block is zeroed (the codec's
+#: declared 0x00) and its count accumulates on device in `_RANGE_REJECTED`, so
+#: the degradation is still COUNTED, never silent. `_GUARD.reset()` is the test
+#: seam.
 _GUARD = GuardCadence(first=8, every=1000)
+
+#: COUNTED tally of blocks whose e8m0 exponent is out of range on an
+#: off-cadence call. A DEVICE tensor, so the hot path adds `bad.sum()` with no
+#: host read; [`range_rejected_blocks`] is the declared drain (a log/test
+#: cadence), like `Counters.drain`.
+_RANGE_REJECTED: dict[str, torch.Tensor] = {}
+
+
+def range_rejected_blocks() -> int:
+    """Blocks the e8m0 range guard would have refused, zeroed COUNTED.
+
+    An off-cadence call cannot afford the `bool((off & ~zero).any())` host read,
+    so it zeroes those blocks and tallies them here instead. Read this on a log
+    or test cadence (it takes the one `.item()`), not per packed tensor.
+    """
+    return sum(int(t.item()) for t in _RANGE_REJECTED.values())
+
 
 #: §5.2 Table 1: the scaling block size k for every concrete MX format.
 BLOCK = 32
@@ -146,18 +165,32 @@ def _e8m0_encode(amax: torch.Tensor, elem_max: float) -> torch.Tensor:
     ratio = torch.where(zero, torch.ones_like(amax), amax / elem_max)
     exp = torch.ceil(torch.log2(ratio))
     off = (exp < _E8M0_EXP_MIN) | (exp > _E8M0_EXP_MAX)
-    # COUNTED-or-loud on the guard cadence, never on every pass (module _GUARD).
-    if _GUARD.due() and bool((off & ~zero).any()):
-        bad = exp[off & ~zero][0]
-        loud(
-            f"MX block scale {float(bad):.0f} is outside e8m0's exponent range "
-            f"[{_E8M0_EXP_MIN}, {_E8M0_EXP_MAX}] (spec §5.4.1 Table 7; -127 is "
-            "reserved as this codec's zero): the block amax is denormal/tiny. "
-            "Escape: prescale the tensor by a power of two (a power of two moves "
-            "no element — see tsct.py:163-176's NVFP4 global prescale)"
-        )
-    exp = torch.where(zero, torch.zeros_like(exp), exp)
-    codes = torch.where(zero, torch.zeros_like(exp), exp + _E8M0_BIAS)
+    bad = off & ~zero
+    # LOUD on the guard cadence; COUNTED (zero + device tally) in the gap. The
+    # cadence may skip the HOST READ, never the consequence: a block a checked
+    # call would refuse is zeroed here and counted in `_RANGE_REJECTED`, so it
+    # cannot decode as plausible text and cannot vanish from the record (review
+    # round 1 M4).
+    if _GUARD.due():
+        if bool(bad.any()):
+            bad_exp = exp[bad][0]
+            loud(
+                f"MX block scale {float(bad_exp):.0f} is outside e8m0's exponent range "
+                f"[{_E8M0_EXP_MIN}, {_E8M0_EXP_MAX}] (spec §5.4.1 Table 7; -127 is "
+                "reserved as this codec's zero): the block amax is denormal/tiny. "
+                "Escape: prescale the tensor by a power of two (a power of two moves "
+                "no element — see tsct.py:163-176's NVFP4 global prescale)"
+            )
+    else:
+        key = str(amax.device)
+        prev = _RANGE_REJECTED.get(key)
+        n = bad.sum()
+        _RANGE_REJECTED[key] = n if prev is None else prev + n
+    # `zero | bad` carries code 0x00 (the declared zero): the value this codec
+    # writes for a block it cannot scale. No wrap through `exp + bias`.
+    drop = zero | bad
+    exp = torch.where(drop, torch.zeros_like(exp), exp)
+    codes = torch.where(drop, torch.zeros_like(exp), exp + _E8M0_BIAS)
     return codes.to(torch.uint8)
 
 

@@ -459,6 +459,36 @@ def test_loud_on_e8m0_nan_byte_and_bad_shapes() -> None:
         mxfp.dequantize_mxfp8(torch.zeros(32, dtype=torch.float8_e4m3fn), scales.float(), (1, 32))
 
 
+def test_the_range_guard_off_cadence_zeroes_and_COUNTS_the_block() -> None:
+    """M4: the cadence may skip the HOST READ, never the consequence.
+
+    A block the checked call refuses (e8m0 exponent < -126) used to encode a
+    wrapped uint8 code and decode to zeros with no record — the SILENT class.
+    Off-cadence it must still be the codec's declared zero AND land in the
+    per-cadence tally; on-cadence it must still refuse loudly.
+    """
+    mxfp._GUARD.reset()
+    mxfp._RANGE_REJECTED.clear()
+    tiny = torch.full((1, 32), 1e-40)
+    good = torch.randn(2, 32)
+    # 3 packed tensors consume 9 due() calls (finite, e8m0-encode, e8m0-decode),
+    # so the 4th is the first off-cadence call.
+    for _ in range(3):
+        mxfp.quantize_mxfp4(good)
+    packed, scales = mxfp.quantize_mxfp4(tiny)
+    assert scales.flatten().tolist() == [0x00], "an unscalable block is the declared zero"
+    assert mxfp.dequantize_mxfp4(packed, scales, (1, 32)).abs().max().item() == 0.0
+    assert mxfp.range_rejected_blocks() == 1, "the off-cadence zero must be counted"
+
+    # On-cadence the same block is the LOUD refusal it always was.
+    mxfp._GUARD.reset()
+    with pytest.raises(LoudError, match="exponent range"):
+        mxfp.quantize_mxfp4(tiny)
+    mxfp._GUARD.reset()
+    with pytest.raises(LoudError, match="exponent range"):
+        mxfp.quantize_mxfp8(tiny)
+
+
 def test_guard_is_cadenced_and_the_forward_takes_no_host_read(monkeypatch) -> None:
     """Audit M7: 2-3 `bool(any())` syncs per packed tensor became a cadence.
 
