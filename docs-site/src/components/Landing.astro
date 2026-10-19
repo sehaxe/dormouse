@@ -55,7 +55,7 @@ const COPY = {
 			},
 		],
 		termBar: { left: 'dormouse(1)', right: 'rtx 5060 ti · 16 gb' },
-		termHints: ['[+] 882 tests', '[+] ruff clean', '[-] cuda gates self-skip'],
+		termHints: ['[+] 968 tests', '[+] ruff clean', '[-] cuda gates self-skip'],
 		session: `$ dormouse train medium --set seq_len=1024 --set moe_capacity=0
 step=60000  loss=1.2130  bpb=1.936  40.9k tok/s
 $ dormouse serve --ckpt-name sft11 --port 3783
@@ -66,7 +66,7 @@ ready — one RTX 5060 Ti 16GB, $429`,
 			{ n: '1.07B', cap: 'total params · 57M\u00a0active' },
 			{ n: '40.9k', cap: 'tok/s, medium b24\u00a0×\u00a0s1024' },
 			{ n: '1.936', cap: 'held-out BPB, 196,608\u00a0B window' },
-			{ n: '882', cap: 'tests, ruff clean' },
+			{ n: '968', cap: 'tests, ruff clean' },
 			{ n: '$429', cap: 'one RTX 5060\u00a0Ti 16\u00a0GB' },
 		],
 		whyTitle: 'Why this exists',
@@ -158,7 +158,7 @@ ready — one RTX 5060 Ti 16GB, $429`,
 			},
 		],
 		termBar: { left: 'dormouse(1)', right: 'rtx 5060 ti · 16 gb' },
-		termHints: ['[+] 882 теста', '[+] ruff чистый', '[-] cuda-гейты скипаются'],
+		termHints: ['[+] 968 теста', '[+] ruff чистый', '[-] cuda-гейты скипаются'],
 		session: `$ dormouse train medium --set seq_len=1024 --set moe_capacity=0
 step=60000  loss=1.2130  bpb=1.936  40.9k tok/s
 $ dormouse serve --ckpt-name sft11 --port 3783
@@ -168,7 +168,7 @@ ready — одна RTX 5060 Ti 16GB, $429`,
 			{ n: '1.07B', cap: 'параметров · 57M\u00a0активных' },
 			{ n: '40.9k', cap: 'ток/с, medium b24\u00a0×\u00a0s1024' },
 			{ n: '1.936', cap: 'BPB на held-out, окно 196\u00a0608\u00a0Б' },
-			{ n: '882', cap: 'теста, ruff чистый' },
+			{ n: '968', cap: 'теста, ruff чистый' },
 			{ n: '$429', cap: 'одна RTX 5060\u00a0Ti 16\u00a0ГБ' },
 		],
 		whyTitle: 'Зачем это существует',
@@ -236,7 +236,7 @@ ready — одна RTX 5060 Ti 16GB, $429`,
 const c = COPY[lang];
 
 const quickstart = `uv sync                      # CPU environment; the tests run here
-uv run pytest                # 882 tests, ruff clean
+uv run pytest                # 968 tests, ruff clean
 uv run dormouse train medium --data corpus.bin --eval held.bin --device cuda \\
   --steps 60000 --batch 24 --set seq_len=1024 --set moe_capacity=0
 uv run dormouse serve --out-dir checkpoints/sft --ckpt-name sft11 --port 3783`;

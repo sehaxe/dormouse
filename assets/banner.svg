@@ -26,11 +26,10 @@
     <text x="46" y="132" font-size="68" font-weight="700" class="ink">dormouse</text>
 
     <!-- tagline -->
-    <text x="48" y="172" font-size="16" class="body">A byte-level Mixture-of-Experts language model,</text>
-    <text x="48" y="194" font-size="16" class="body">trained end to end on one consumer GPU.</text>
+    <text x="48" y="176" font-size="16" class="body">A byte-level Mixture-of-Experts language model on one consumer GPU.</text>
 
     <!-- the one dark surface: a terminal card -->
-    <rect x="48" y="204" width="640" height="120" rx="4" fill="#201d1d" />
+    <rect x="48" y="200" width="640" height="124" rx="4" fill="#201d1d" />
     <g fill="#fdfcfc" transform="translate(66 216)">
       <rect x="0" y="0" width="12" height="4"/>
       <rect x="0" y="4" width="4" height="4"/>
@@ -106,7 +105,7 @@
       <text x="740" y="140" class="ink"><tspan class="mute">[+] </tspan>1.07B total &#183; 57M active</text>
       <text x="740" y="176" class="ink"><tspan class="mute">[+] </tspan>40.9k tok/s on one card</text>
       <text x="740" y="212" class="ink"><tspan class="mute">[+] </tspan>BPB 1.936 held-out</text>
-      <text x="740" y="248" class="ink"><tspan class="mute">[+] </tspan>882 tests, ruff clean</text>
+      <text x="740" y="248" class="ink"><tspan class="mute">[+] </tspan>968 tests, ruff clean</text>
       <text x="740" y="284" class="ink"><tspan class="mute">[+] </tspan>MIT license</text>
     </g>
 
