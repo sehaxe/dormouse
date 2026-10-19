@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ..instrument import Counters, loud
+from ..instrument import Counters, LoudError, loud
 from ..model.decode import DEFAULT_TEMP, decode_bytes
 from .tasks import Task
 from .verifiers import Verdict, verify
@@ -100,6 +100,8 @@ def _verify_response(task: dict, response: bytes, budget: int) -> Verdict:
     sample, never the rollout batch. The counter is the evidence it happened."""
     try:
         return verify(task, response.decode("utf-8", "replace"))
+    except LoudError:
+        raise  # the do-not-run class and a bad task reference stay LOUD
     except Exception as exc:  # a boundary guard: the batch survives a verifier bug
         COUNTERS.count("rollout_verify_error")
         used = min(len(response) / budget, 1.0) if budget > 0 else 0.0

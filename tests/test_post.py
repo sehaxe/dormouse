@@ -178,6 +178,20 @@ def test_a_verifier_bug_fails_the_sample_not_the_batch(monkeypatch):
     assert ROLLOUT_COUNTERS.get("rollout_verify_error", 0) == before + 1
 
 
+def test_a_loud_verifier_refusal_is_not_a_failed_sample(monkeypatch):
+    """The boundary is for bugs, not for the do-not-run class: LOUD stays LOUD."""
+    task = build_tasks("math", 1, 1)[0]
+    before = ROLLOUT_COUNTERS.get("rollout_verify_error", 0)
+
+    def refuse(_task, _response):
+        raise LoudError("noop verifier refuses this class")
+
+    monkeypatch.setattr("dormouse.post.rollouts.verify", refuse)
+    with pytest.raises(LoudError, match="noop verifier"):
+        rollout(tiny_model(), task, len(task.prompt.encode("utf-8")) + 20, greedy=True)
+    assert ROLLOUT_COUNTERS.get("rollout_verify_error", 0) == before
+
+
 def test_the_corpus_reader_decodes_before_the_solution_comparison(tmp_path):
     """R3-2 gate: reverting `_corpus_pairs`'s `.decode` turns this test RED.
 
