@@ -32,7 +32,7 @@ const COPY = {
 			'A byte-level Mixture-of-Experts language model, trained end to end on one consumer GPU: 1.07B total / 57M active parameters, 40.9k tok/s and BPB 1.936 held-out on one RTX 5060 Ti.',
 		nav: { docs: 'docs', status: 'status', github: 'github', demo: 'demo', lang: 'ru', langTitle: 'Русская версия' },
 		termBar: { left: 'dormouse(1)', right: 'rtx 5060 ti · 16 gb' },
-		termHints: ['[+] 861 tests', '[+] ruff clean', '[-] cuda gates self-skip'],
+		termHints: ['[+] 882 tests', '[+] ruff clean', '[-] cuda gates self-skip'],
 		session: `$ dormouse train medium --set seq_len=1024 --set moe_capacity=0
 step=60000  loss=1.2130  bpb=1.936  40.9k tok/s
 $ dormouse serve --ckpt-name sft11 --port 3783
@@ -43,7 +43,7 @@ ready — one RTX 5060 Ti 16GB, $429`,
 			{ n: '1.07B', cap: 'total params · 57M\u00a0active' },
 			{ n: '40.9k', cap: 'tok/s, medium b24\u00a0×\u00a0s1024' },
 			{ n: '1.936', cap: 'held-out BPB, 196,608\u00a0B window' },
-			{ n: '861', cap: 'tests, ruff clean' },
+			{ n: '882', cap: 'tests, ruff clean' },
 			{ n: '$429', cap: 'one RTX 5060\u00a0Ti 16\u00a0GB' },
 		],
 		whyTitle: 'Why this exists',
@@ -112,7 +112,7 @@ ready — one RTX 5060 Ti 16GB, $429`,
 			'Байтовая Mixture-of-Experts языковая модель, обученная от начала до конца на одной потребительской видеокарте: 1.07B всего / 57M активных, 40.9k ток/с и BPB 1.936 на held-out на одной RTX 5060 Ti.',
 		nav: { docs: 'док', status: 'статус', github: 'github', demo: 'демо', lang: 'en', langTitle: 'English version' },
 		termBar: { left: 'dormouse(1)', right: 'rtx 5060 ti · 16 gb' },
-		termHints: ['[+] 861 тест', '[+] ruff чистый', '[-] cuda-гейты скипаются'],
+		termHints: ['[+] 882 теста', '[+] ruff чистый', '[-] cuda-гейты скипаются'],
 		session: `$ dormouse train medium --set seq_len=1024 --set moe_capacity=0
 step=60000  loss=1.2130  bpb=1.936  40.9k tok/s
 $ dormouse serve --ckpt-name sft11 --port 3783
@@ -122,7 +122,7 @@ ready — одна RTX 5060 Ti 16GB, $429`,
 			{ n: '1.07B', cap: 'параметров · 57M\u00a0активных' },
 			{ n: '40.9k', cap: 'ток/с, medium b24\u00a0×\u00a0s1024' },
 			{ n: '1.936', cap: 'BPB на held-out, окно 196\u00a0608\u00a0Б' },
-			{ n: '861', cap: 'тест, ruff чистый' },
+			{ n: '882', cap: 'теста, ruff чистый' },
 			{ n: '$429', cap: 'одна RTX 5060\u00a0Ti 16\u00a0ГБ' },
 		],
 		whyTitle: 'Зачем это существует',
@@ -190,7 +190,7 @@ ready — одна RTX 5060 Ti 16GB, $429`,
 const c = COPY[lang];
 
 const quickstart = `uv sync                      # CPU environment; the tests run here
-uv run pytest                # 861 tests, ruff clean
+uv run pytest                # 882 tests, ruff clean
 uv run dormouse train medium --data corpus.bin --eval held.bin --device cuda \\
   --steps 60000 --batch 24 --set seq_len=1024 --set moe_capacity=0
 uv run dormouse serve --out-dir checkpoints/sft --ckpt-name sft11 --port 3783`;

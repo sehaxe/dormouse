@@ -36,7 +36,7 @@ Measured, dated, reproducible — the numbers below are the state of 2026-10-19.
 | speed, medium (b24 × s1024) | **40.9k tokens/s**, ~12 GiB peak, one RTX 5060 Ti |
 | speed, b1 (b8 × s512) | ~8k tokens/s eager, 13 GiB |
 | first downstream numbers (zero-shot, n=1000, random = 25%) | HellaSwag **30.5%**, ARC-Easy **27.2%**, synth-math 24.0% — at 0.37B tokens seen |
-| test suite | **861 tests**, ruff clean |
+| test suite | **882 tests**, ruff clean |
 
 The HellaSwag row is the one worth reading twice: it is ahead of GPT-2-small (31.4%) on **24× fewer training tokens**, and ahead of Pythia-160M (30.3%) on ~800× fewer.
 
@@ -50,7 +50,7 @@ Requires [uv](https://docs.astral.sh/uv/) and Python 3.12.
 uv sync                # CPU environment; tests run here
 uv sync --extra gpu    # the measured stack: torch 2.13.0+cu129 + FLA (sm_120)
 
-uv run pytest                       # the suite (861 tests; CUDA gates self-skip)
+uv run pytest                       # the suite (882 tests; CUDA gates self-skip)
 uv run ruff check .                 # lint
 
 # train a model from a byte corpus

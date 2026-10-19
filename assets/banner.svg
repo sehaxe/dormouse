@@ -40,7 +40,7 @@
       <text x="740" y="140" class="ink"><tspan class="mute">[+] </tspan>1.07B total &#183; 57M active</text>
       <text x="740" y="176" class="ink"><tspan class="mute">[+] </tspan>40.9k tok/s on one card</text>
       <text x="740" y="212" class="ink"><tspan class="mute">[+] </tspan>BPB 1.936 held-out</text>
-      <text x="740" y="248" class="ink"><tspan class="mute">[+] </tspan>861 tests, ruff clean</text>
+      <text x="740" y="248" class="ink"><tspan class="mute">[+] </tspan>882 tests, ruff clean</text>
       <text x="740" y="284" class="ink"><tspan class="mute">[+] </tspan>MIT license</text>
     </g>
 
