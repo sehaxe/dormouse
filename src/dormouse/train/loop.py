@@ -815,14 +815,24 @@ def train(
     tokens_per_step = cfg.batch * cfg.seq_len
     start = 0
     if resume:
-        ck, _stored = load_ckpt(run)
+        ck, stored = load_ckpt(run)
         load_model_state(model, cfg, ck["model"], log=log, resume=True)
         opt.load_state_dict(ck["opt"])
         start = int(ck["step"]) + 1
         if start:
             # A resumed run must continue on UNSEEN bytes: the burn failure
             # this prevents is re-reading (and memorizing) the corpus head.
-            stream.skip_bytes(start * (cfg.seq_len + 1) * cfg.batch)
+            # A mixture's position is a STEP-INDEX question, not a byte-count
+            # one: its stage schedule is a function of the run's budget, and
+            # `steps` is an exempt progress key, so an extended run must
+            # replay the prefix under the checkpoint's stored budget or it
+            # assigns already-taken steps to different sources and moves every
+            # cursor by the wrong amount (review round 3 R3-4).
+            skip_to_step = getattr(stream, "skip_to_step", None)
+            if skip_to_step is not None:
+                skip_to_step(start, budget=stored.train.steps)
+            else:
+                stream.skip_bytes(start * (cfg.seq_len + 1) * cfg.batch)
         # The checkpoint's model half is the X iterate (a checkpoint is written
         # with the eval switch on, below), and so is the optimizer's own `x`, so
         # the params must go back to Y before the next forward. The switch is an

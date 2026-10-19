@@ -428,10 +428,13 @@ def replay_bytes(
 ) -> dict[str, int]:
     """EXACT bytes each source serves in steps `[0, upto)` — the draw, replayed.
 
-    `steps` is the run's budget (it decides the stage schedule), `upto` is how
-    far to replay (default: the whole budget). `per_source_bytes` is the
-    expectation the epoch cap is argued from; this is what a run with THIS seed
-    actually reads, and it is what a resume must reproduce (`skip_bytes`).
+    `steps` is the step budget in force for those steps (on an EXTENDED resume
+    it is the checkpoint's stored `steps`, not the new one: the stage schedule
+    is a function of the budget, so the new one would assign a different source
+    to already-taken steps — review round 3 R3-4), `upto` is how far to replay
+    (default: the whole budget). `per_source_bytes` is the expectation the
+    epoch cap is argued from; this is what a run with THIS seed actually read,
+    and it is what a resume must reproduce (`skip_to_step`).
     """
     window = batch * (seq_len + 1)
     served = dict.fromkeys(plan.sources, 0)
@@ -485,7 +488,11 @@ class MixtureStream:
     (see the module docstring), so two instances with one seed read the same bytes
     and `skip_bytes()` reproduces exactly what an unbroken run would have read —
     for a shard source too, because `ShardStream`'s byte sequence is periodic in
-    `sum(shard sizes)` and the seed pins the file order.
+    `sum(shard sizes)` and the seed pins the file order. An EXTENDED run
+    (`steps` grew, a legal resume) must pass the checkpoint's stored budget to
+    `skip_to_step`: the schedule is a function of the budget, so the prefix has
+    to be replayed under the budget it was actually read with (review round 3
+    R3-4).
     """
 
     def __init__(
@@ -545,13 +552,13 @@ class MixtureStream:
             stream.rewind()
         self._step = 0
 
-    def skip_bytes(self, n: int) -> None:
+    def skip_bytes(self, n: int, *, budget: int | None = None) -> None:
         """Fast-forward the whole mixture `n` bytes (resume), per source exactly.
 
-        The trainer passes `start × (seq_len + 1) × batch` bytes. Because the
-        source of every step is a pure function of the step index, each source is
-        advanced by the bytes IT would have served — so a resumed run continues on
-        unseen bytes and lands on the same mixture as an unbroken one.
+        The trainer passes `start × (seq_len + 1) × batch` bytes. `budget` is the
+        step budget the fast-forwarded steps were taken under (see
+        `skip_to_step`): the checkpoint's stored `steps` on a resume that
+        EXTENDS the run, `None` when the budget did not change.
         """
         if n < 0:
             loud(f"skip_bytes({n}): a negative fast-forward is a rewind")
@@ -561,18 +568,39 @@ class MixtureStream:
                 f"(batch={self.batch}, seq_len={self.seq_len}). Escape: pass "
                 f"steps × (seq_len + 1) × batch."
             )
-        steps = n // self.window
+        self.skip_to_step(n // self.window, budget=budget)
+
+    def skip_to_step(self, step: int, *, budget: int | None = None) -> None:
+        """Fast-forward to the STEP INDEX `step`, replaying the schedule the run used.
+
+        The resume position is a function of the steps already taken, not of the
+        new run's budget. `steps` is an exempt progress key, so extending a
+        mixture run changes the stage boundaries (`stage_bounds(plan, steps)`);
+        replaying the prefix under the NEW budget assigns already-taken steps to
+        different sources and lands every source's cursor on the wrong byte
+        (review round 3 R3-4). `budget` is the budget in force for steps
+        `[0, step)` — the checkpoint snapshot's `steps`, which `load_ckpt`
+        returns. After the fast-forward `next_batch` uses THIS stream's budget,
+        i.e. the extended schedule starts at `step`.
+
+        `budget=None` means "the budget did not change": the current stream's
+        own `steps`, which is exact for a plain resume and for any caller that
+        has no snapshot.
+        """
+        if step < 0:
+            loud(f"skip_to_step({step}): a negative fast-forward is a rewind")
+        schedule = self.steps if budget is None else budget
         served = replay_bytes(
             self.plan,
-            steps=self.steps,
-            upto=steps,
+            steps=schedule,
+            upto=step,
             batch=self.batch,
             seq_len=self.seq_len,
             seed=self.seed,
         )
         for name, stream in self._streams.items():
             stream.skip_bytes(served[name])
-        self._step = steps
+        self._step = step
 
     def close(self) -> None:
         for stream in self._streams.values():
