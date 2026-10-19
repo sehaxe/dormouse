@@ -176,3 +176,41 @@ def test_a_verifier_bug_fails_the_sample_not_the_batch(monkeypatch):
     assert roll.passed is False
     assert "RuntimeError" in roll.verdict.reason
     assert ROLLOUT_COUNTERS.get("rollout_verify_error", 0) == before + 1
+
+
+def test_the_corpus_reader_decodes_before_the_solution_comparison(tmp_path):
+    """R3-2 gate: reverting `_corpus_pairs`'s `.decode` turns this test RED.
+
+    Round 3 reverted the decode and the SFT gate stayed green because its only
+    injection appended a `str` pair by hand (`tests/test_sft.py:830`), never
+    going through the reader. Here the pair is a real RECORD that goes through
+    `_corpus_pairs`: the answer is a verifier solution containing a non-ASCII
+    character, so as `str` it IS the solution while the raw UTF-8 `bytes` will
+    never match a `set[str]` (`b'...' in {...}` is always False — the round-2
+    vacuity). That is the case the correct decode must catch and the reverted
+    one cannot.
+    """
+    from test_sft import _corpus_pairs, _solution_collisions
+
+    from dormouse.train.sft import PAD, render
+
+    solution = "def greet():\n    return 'Grüße, Welt'"
+    instruction = "Greet in German"
+    record = render(instruction, solution)
+    slot = len(record) + 4
+    path = tmp_path / "one.bin"
+    path.write_bytes(record + bytes([PAD]) * (slot - len(record)))
+
+    pairs = _corpus_pairs(path, slot)
+    assert len(pairs) == 1
+    read_instruction, answer = pairs[0]
+    assert read_instruction == instruction
+    # The property under test: the reader produces `str`, not the record's bytes.
+    assert isinstance(answer, str), type(answer)
+    assert answer == solution
+    # The helper catches the decoded pair...
+    assert _solution_collisions(pairs, {solution}) == [(instruction, solution)]
+    # ...and the same text as raw bytes is invisible to it, which is why the
+    # decode (not the comparison alone) needs this gate.
+    raw = answer if isinstance(answer, bytes) else answer.encode("utf-8")
+    assert _solution_collisions([(instruction, raw)], {solution}) == []
