@@ -307,6 +307,7 @@ export const pages = [
 	{ src: 'docs/reviews/2026-10-19-code-audit.md', out: 'reviews/2026-10-19-code-audit', title: 'Code audit: 6/10, and the two holes that matter' },
 	{ src: 'docs/reviews/2026-10-19-review-loop.md', out: 'reviews/2026-10-19-review-loop', title: 'The review loop: rounds and scores' },
 	{ src: 'docs/reviews/2026-10-19-review-round-1.md', out: 'reviews/2026-10-19-review-round-1', title: 'Review round 1: 7/10, the fixes verified and what they broke' },
+	{ src: 'docs/reviews/2026-10-19-review-round-2.md', out: 'reviews/2026-10-19-review-round-2', title: 'Review round 2: 6/10, the regressions the fixes introduced' },
 	{ src: 'docs/guides/determinism.md', out: 'tooling/determinism', title: 'Determinism: why --seed was the easy part', nav: 'Determinism' },
 	{ src: 'docs/guides/ab-testing.md', out: 'tooling/ab-testing', title: 'A/B testing: how an arm is judged here', nav: 'A/B testing' },
 	{ src: 'docs/guides/precision.md', out: 'tooling/precision', title: 'Precision on this backend: why bf16 is slower than fp32', nav: 'Precision' },
