@@ -280,9 +280,27 @@ class OptimizerGraph:
         # and holding it would turn one loud error into every later step replaying
         # garbage (`dion/cuda_graph.py:253-255`).
         self._graph = graph
-        counters = getattr(self.opt, "counters", None)
-        self._captured_counters = dict(counters) if counters else {}
+        self._snapshot_counters()
         graph.replay()
+
+    def _snapshot_counters(self) -> None:
+        """Copy the capture step's INT counters; report the reason at this boundary.
+
+        `Counters` also holds the COUNTED fallback's reason under the string key
+        `why` (`instrument.py`). A replay runs only recorded device ops, so the
+        int counters must be replayed by hand — but the reason is host text: if
+        it enters the captured map, every replay calls `Counters.count("why",
+        <str>)` and asserts (review round 1 N1, a run-killing crash). It is
+        reported ONCE here, through the trainer's cumulative counters, and is
+        left out of the replays.
+        """
+        counters = getattr(self.opt, "counters", None)
+        self._captured_counters = (
+            {k: v for k, v in counters.items() if isinstance(v, int)} if counters else {}
+        )
+        reason = counters.why if counters is not None else None
+        if reason and self.counters is not None and self.counters is not counters:
+            self.counters.why = reason
 
     # -- the step -----------------------------------------------------------
 
@@ -317,9 +335,12 @@ class OptimizerGraph:
         if hasattr(self.opt, "steps"):
             self.opt.steps += 1
         # `steps_batched` is the same value every step (one count per shape group),
-        # so the capture-time value is the live one and is left alone.
+        # so the capture-time value is the live one and is left alone. Only ints
+        # are replayed: `_snapshot_counters` excludes the string `why`, and the
+        # guard here means a hand-built/old captured map cannot resurrect N1.
         for name, n in self._captured_counters.items():
-            self.opt.counters.count(name, n)
+            if isinstance(n, int):
+                self.opt.counters.count(name, n)
 
     def _fall_back(self, reason: str) -> None:
         """COUNTED: record why, print it, and stay eager for the rest of the run.

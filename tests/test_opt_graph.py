@@ -339,6 +339,78 @@ def test_a_replay_redoes_the_host_bookkeeping():
     assert opt.counters["ns_triton"] == 1
 
 
+class _FakeGraph:
+    """A replay counter: enough for the host-bookkeeping tests (no CUDA)."""
+
+    def __init__(self) -> None:
+        self.n = 0
+
+    def replay(self) -> None:
+        self.n += 1
+
+
+def test_a_captured_counter_reason_never_enters_the_replay_map():
+    """N1: the COUNTED fallback's `why` is host text, not a replayable counter.
+
+    `Counters` stores the reason under the string key `why`; the old capture
+    copied the whole dict into `_captured_counters`, so the first replay called
+    `count("why", <str>)` and asserted — a run-killing crash one step after a
+    capture that had seen any triton-NS fallback. The reason is reported once at
+    the capture boundary and must not be re-counted per replay.
+    """
+    model, opt = _mix()
+    opt.counters.count("ns_triton_fallback")
+    opt.counters.why = "triton: input is on cpu"
+    counters = Counters()
+    graph = OptimizerGraph(opt, opt.step, counters=counters)
+    graph._snapshot_counters()
+    assert graph._captured_counters == {"ns_triton_fallback": 1}
+    assert counters.why is not None and "triton: input is on cpu" in counters.why
+
+    graph._graph = _FakeGraph()
+    for _ in range(6):
+        graph._replay()
+    assert graph._graph.n == 6
+    assert opt.counters["ns_triton_fallback"] == 7  # the capture's one + six replays
+    assert counters.why.count("triton: input is on cpu") == 1, "COUNTED once, not per replay"
+
+    # A hand-built/old map carrying the reason must not resurrect the crash.
+    graph._captured_counters = {"ns_triton": 1, "why": "old capture format"}
+    graph._replay()
+    assert opt.counters["ns_triton"] == 1
+
+
+def test_eight_opt_graph_steps_with_a_counter_reason_do_not_crash(tmp_path, monkeypatch):
+    """The task's end-to-end gate: a real `train()` run with capture+replay.
+
+    `capture` is stood in for (no CUDA here) by the same `_snapshot_counters`
+    the real one calls, plus a counter and a reason. With the old capture copy
+    the second graph step dies; with the fix the reason reaches the log exactly
+    once and the int counters keep advancing.
+    """
+    import dormouse.train.loop as loop_mod
+
+    class _Graph(OptimizerGraph):
+        def capture(self) -> None:
+            self.opt.counters.count("ns_triton_fallback")
+            self.opt.counters.why = "triton: input is on cpu"
+            self._snapshot_counters()
+            self._graph = _FakeGraph()
+            self._graph.replay()
+
+    monkeypatch.setattr(loop_mod, "OptimizerGraph", _Graph)
+    run = tiny_run(tmp_path, steps=8, log_every=100, opt_graph=True)
+    lines: list[str] = []
+    report = train(DormouseModel(run.model), run, log=lines.append)
+    counters = report["counters"]
+    assert report["nan_skipped"] == 0
+    assert counters.get("opt_graph_fallback") is None
+    assert counters.why is not None
+    assert counters.why.count("triton: input is on cpu") == 1
+    # Capture step + the two replays after it.
+    assert counters["ns_triton_fallback"] == 3
+
+
 def test_release_restarts_the_warmup():
     """With no graph yet, only the second half of the contract applies — and
     skipping it would let the next step capture on a warmup the caller just
