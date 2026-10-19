@@ -8,11 +8,11 @@
 
 **English** · [Русский](README.ru.md)
 
-A byte-level Mixture-of-Experts language model, trained end to end on **one consumer GPU** (RTX 5060 Ti, 16 GB, $429). No tokenizer, no cluster, no distillation teacher — the whole recipe runs on the card, and every claim in this repository carries its measurement.
+**dormouse** is a from-scratch, byte-level Mixture-of-Experts language model you can train on **one consumer GPU** (RTX 5060 Ti, 16 GB, $429) — no tokenizer, no cluster, no distillation teacher. Its recipe is the 2026 frontier stack squeezed onto one card: KDA linear attention (Kimi-style gated delta rule), dropless top-k MoE over low-rank TSCT experts, a weight-shared loop instead of depth, and 402M rows of n-gram memory in host RAM. The pipeline is complete (`train → bench → sft → rl → serve`), the demo runs the model in your browser, and every claim in this repository carries its measurement — including the ones that were retracted.
 
 The Rust/burn original this grew out of lives on the [`rust-legacy`](../../tree/rust-legacy) branch. `main` is the Python project.
 
-**Contents** — [What is this](#what-is-this) · [Results](#results) · [Quick start](#quick-start) · [Architecture](#architecture) · [Documentation](#documentation) · [License](#license)
+**Contents** — [What is this](#what-is-this) · [Results](#results) · [Quick start](#quick-start) · [Architecture](#architecture) · [FAQ](#faq) · [Documentation](#documentation) · [License](#license)
 
 ## What is this
 
@@ -102,6 +102,35 @@ src/dormouse/
 ```
 
 Three things are custom because nothing in the ecosystem does them: the TSCT quantized experts, the Engram host tables, and the ByteFlow patcher. Everything else — attention, optimizer, quantization formats, fused kernels — is the best available dependency, and the places where that choice was made against a homegrown alternative are recorded in `docs/`.
+
+## FAQ
+
+**Can this really train on one consumer GPU?** Yes. Every run in [Results](#results)
+was taken on one RTX 5060 Ti (16 GB, $429): the expert bank is factorized to rank
+64, the 402M-row n-gram table lives in host RAM, and the loop is weight-shared, so
+1.07B stored parameters cost ~13 GiB at `b8 × s512`.
+
+**What is a byte-level model?** The vocabulary is the 256 byte values. Any
+language, source code or binary file is already in the alphabet, so there is no
+tokenizer to train and no tokenizer mismatch on the languages it did not see. The
+price is fewer characters per forward step than a subword model; this project
+measures that price instead of hiding it.
+
+**How is this different from a small Llama or Qwen?** The recipe, not the size
+class: a weight-shared loop instead of depth, dropless top-k Mixture-of-Experts
+instead of a dense FFN, KDA linear attention with a fixed 256 KB state instead of
+a KV cache, and hash-table memory outside the compute graph. The published
+comparison is in [the scorecard](docs/reviews/2026-10-19-model-scorecard.md), with
+the protocol gap named.
+
+**Is it a chatbot?** Not yet. The pipeline has SFT and a verifier-first RL stepper
+(`train → bench → sft → rl → serve`); the checkpoints are research models, and the
+site publishes which numbers were retracted and why.
+
+**Does this project collect any data about me?** No. The site has no analytics, no
+cookies and no third-party requests: the one script (htmx) is vendored in this
+repository, the fonts are the system's, and the demo model is a file served from
+the site itself. The trainer writes logs to your disk and nothing leaves it.
 
 ## Documentation
 

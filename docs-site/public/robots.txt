@@ -1,0 +1,7 @@
+# dormouse — a static site on GitHub Pages. Everything here is public by design
+# (the model, the docs, the demo). No analytics, no cookies, no third-party
+# requests; the only script is htmx, served from this origin.
+User-agent: *
+Allow: /
+
+Sitemap: https://sehaxe.github.io/dormouse/sitemap-index.xml

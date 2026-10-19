@@ -43,7 +43,22 @@ const repo = 'https://github.com/sehaxe/dormouse';
 		<meta property="og:url" content={lang === 'en' ? 'https://sehaxe.github.io/dormouse/demo/' : 'https://sehaxe.github.io/dormouse/ru/demo/'} />
 		<meta property="og:locale" content={lang === 'en' ? 'en_US' : 'ru_RU'} />
 		<meta name="twitter:card" content="summary_large_image" />
-		<meta name="twitter:image" content="https://sehaxe.github.io/dormouse/og.png" />		<link rel="icon" href={at('/favicon.svg')} type="image/svg+xml" />
+		<meta name="twitter:image" content="https://sehaxe.github.io/dormouse/og.png" />
+		<link rel="canonical" href={lang === 'en' ? 'https://sehaxe.github.io/dormouse/demo/' : 'https://sehaxe.github.io/dormouse/ru/demo/'} />
+		<script
+			type="application/ld+json"
+			set:html={JSON.stringify({
+				'@context': 'https://schema.org',
+				'@type': 'SoftwareApplication',
+				name: 'dormouse browser engine',
+				applicationCategory: 'DeveloperApplication',
+				operatingSystem: 'Any (WebAssembly-free JavaScript, runs in the browser)',
+				url: lang === 'en' ? 'https://sehaxe.github.io/dormouse/demo/' : 'https://sehaxe.github.io/dormouse/ru/demo/',
+				description: c.description,
+				isAccessibleForFree: true,
+				offers: { '@type': 'Offer', price: '0', priceCurrency: 'USD' },
+			})}
+		/>		<link rel="icon" href={at('/favicon.svg')} type="image/svg+xml" />
 	</head>
 	<body>
 		<Topbar current="demo" lang={lang} page="demo" />

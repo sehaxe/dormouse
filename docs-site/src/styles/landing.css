@@ -705,3 +705,35 @@ h1 {
 		transition: none;
 	}
 }
+
+/* The FAQ: a definition list in the same register as the rest of the page —
+   hairline between rows, the question in ink, the answer in body, no cards.
+   It is visible content first (a crawler reads it, a reader skims it) and the
+   FAQPage markup in the head mirrors it exactly. */
+
+.faq {
+	margin: 0;
+	max-width: 78ch;
+}
+
+.faq-row {
+	padding: 14px 0;
+	border-top: 1px solid var(--hairline);
+}
+
+.faq-row:first-child {
+	border-top: 1px solid var(--rule);
+}
+
+.faq dt {
+	color: var(--ink);
+	font-size: 15px;
+	font-weight: 700;
+}
+
+.faq dd {
+	margin: 6px 0 0;
+	color: var(--body);
+	font-size: 15px;
+	line-height: 1.62;
+}

@@ -31,6 +31,29 @@ const COPY = {
 		description:
 			'A byte-level Mixture-of-Experts language model, trained end to end on one consumer GPU: 1.07B total / 57M active parameters, 40.9k tok/s and BPB 1.936 held-out on one RTX 5060 Ti.',
 		nav: { docs: 'docs', status: 'status', github: 'github', demo: 'demo', lang: 'ru', langTitle: 'Русская версия' },
+		faqHeading: 'questions people actually ask',
+		faq: [
+			{
+				q: 'Can this really train on one consumer GPU?',
+				a: 'Yes - the runs in the table above were taken on one RTX 5060 Ti (16 GB). The model that fits is a byte-level Mixture-of-Experts: 1.07B parameters stored, ~57M active per byte, with the 402M-row n-gram table in host RAM and the expert bank factorized to rank 64.',
+			},
+			{
+				q: 'What is a byte-level model, and why no tokenizer?',
+				a: 'The vocabulary is the 256 byte values, so any language, code or binary is already in the alphabet and there is no tokenizer to train or to mismatch. The cost is that a forward pass reads fewer characters per step than a subword model would; the project measures that cost and reports it rather than hiding it.',
+			},
+			{
+				q: 'How is this different from a small Llama or Qwen?',
+				a: 'The recipe is different, not the size class: a weight-shared loop instead of depth, dropless top-k Mixture-of-Experts instead of a dense FFN, KDA linear attention with a fixed 256 KB state instead of a KV cache, and hash-table memory outside the compute graph. The published comparison is in the docs, with the protocol gap named.',
+			},
+			{
+				q: 'Is it a chatbot?',
+				a: 'Not yet. The pipeline has SFT and a verifier-first RL stepper, and the demo shows the architecture running in the browser; the trained models are research checkpoints, and the site says which numbers were retracted and why.',
+			},
+			{
+				q: 'Does the site track me?',
+				a: 'No. No analytics, no cookies, no third-party requests: the one script (htmx) is vendored in this repository, the fonts are the system ones, and the demo model is a file served from this site.',
+			},
+		],
 		termBar: { left: 'dormouse(1)', right: 'rtx 5060 ti · 16 gb' },
 		termHints: ['[+] 882 tests', '[+] ruff clean', '[-] cuda gates self-skip'],
 		session: `$ dormouse train medium --set seq_len=1024 --set moe_capacity=0
@@ -111,6 +134,29 @@ ready — one RTX 5060 Ti 16GB, $429`,
 		description:
 			'Байтовая Mixture-of-Experts языковая модель, обученная от начала до конца на одной потребительской видеокарте: 1.07B всего / 57M активных, 40.9k ток/с и BPB 1.936 на held-out на одной RTX 5060 Ti.',
 		nav: { docs: 'док', status: 'статус', github: 'github', demo: 'демо', lang: 'en', langTitle: 'English version' },
+		faqHeading: 'вопросы, которые действительно задают',
+		faq: [
+			{
+				q: 'Это правда обучается на одной потребительской видеокарте?',
+				a: 'Да — прогоны в таблице выше сделаны на одной RTX 5060 Ti (16 ГБ). Влезает байтовая Mixture-of-Experts модель: 1.07 млрд параметров хранимых, ~57 млн активных на байт, при этом n-граммная таблица на 402 млн строк живёт в оперативной памяти, а банк экспертов факторизован до ранга 64.',
+			},
+			{
+				q: 'Что такое байтовая модель и почему без токенизатора?',
+				a: 'Словарь — это 256 значений байта, поэтому любой язык, код и бинарь уже в алфавите, и токенизатор не нужно ни обучать, ни согласовывать. Цена — за шаг читается меньше символов, чем у подсловной модели; проект эту цену измеряет и публикует, а не прячет.',
+			},
+			{
+				q: 'Чем это отличается от маленькой Llama или Qwen?',
+				a: 'Отличается рецепт, а не класс размера: блок с общими весами вместо глубины, dropless top-k MoE вместо плотного FFN, линейное внимание KDA с фиксированным состоянием 256 КБ вместо KV-кэша и хэш-память вне графа вычислений. Опубликованное сравнение — в документации, с честно названной разницей протоколов.',
+			},
+			{
+				q: 'Это чат-бот?',
+				a: 'Пока нет. В пайплайне есть SFT и verifier-first RL-степпер, а демо показывает архитектуру прямо в браузере; обученные модели — исследовательские чекпоинты, и сайт пишет, какие числа были отозваны и почему.',
+			},
+			{
+				q: 'Сайт меня отслеживает?',
+				a: 'Нет. Ни аналитики, ни cookie, ни сторонних запросов: единственный скрипт (htmx) лежит в этом же репозитории, шрифты системные, модель демо — файл с этого же сайта.',
+			},
+		],
 		termBar: { left: 'dormouse(1)', right: 'rtx 5060 ti · 16 gb' },
 		termHints: ['[+] 882 теста', '[+] ruff чистый', '[-] cuda-гейты скипаются'],
 		session: `$ dormouse train medium --set seq_len=1024 --set moe_capacity=0
@@ -229,6 +275,55 @@ const repo = 'https://github.com/sehaxe/dormouse';
 		{/* htmx, vendored (docs-site/public/htmx.min.js, 2.0.4): the docs-peek
 		    section loads Starlight pages in place. The page is complete without
 		    it - the same links navigate normally. */}
+		<link rel="canonical" href={lang === 'en' ? `${siteUrl}/` : `${siteUrl}/ru/`} />
+		{/* Structured data. Two things a crawler cannot infer from the markup: that
+		    this page is ABOUT a piece of software (so it can be eligible for a
+		    software result), and where its source lives. No analytics, no
+		    third-party scripts, nothing that identifies a reader: the only
+		    structured data here is about the project. */}
+		<script
+			type="application/ld+json"
+			set:html={JSON.stringify({
+				'@context': 'https://schema.org',
+				'@graph': [
+					{
+						'@type': 'SoftwareSourceCode',
+						name: 'dormouse',
+						description:
+							'A byte-level Mixture-of-Experts language model with KDA linear attention, low-rank TSCT experts and hash-table memory in host RAM, trained end to end on one RTX 5060 Ti (16 GB).',
+						codeRepository: repo,
+						license: 'https://opensource.org/licenses/MIT',
+						programmingLanguage: 'Python',
+						runtimePlatform: 'Linux, CUDA 12.9, PyTorch 2.13',
+						keywords: [
+							'byte-level language model',
+							'Mixture-of-Experts',
+							'linear attention',
+							'KDA',
+							'train LLM on one GPU',
+							'RTX 5060 Ti',
+							'low-rank experts',
+							'Engram memory',
+						],
+						author: { '@type': 'Person', name: 'sehaxe', url: 'https://github.com/sehaxe' },
+					},
+					{
+						'@type': 'WebSite',
+						name: 'dormouse',
+						url: `${siteUrl}/`,
+						inLanguage: ['en', 'ru'],
+					},
+					{
+						'@type': 'FAQPage',
+						mainEntity: c.faq.map((f) => ({
+							'@type': 'Question',
+							name: f.q,
+							acceptedAnswer: { '@type': 'Answer', text: f.a },
+						})),
+					},
+				],
+			})}
+		/>
 		<script is:inline src={at('/htmx.min.js')} defer></script>
 	</head>
 	<body>
@@ -434,6 +529,18 @@ const repo = 'https://github.com/sehaxe/dormouse';
 				</p>
 			</section>
 		</main>
+
+		<section class="wrap section" id="faq">
+			<h2>{c.faqHeading}</h2>
+			<dl class="faq">
+				{c.faq.map((f) => (
+					<div class="faq-row">
+						<dt>{f.q}</dt>
+						<dd>{f.a}</dd>
+					</div>
+				))}
+			</dl>
+		</section>
 
 		<footer class="footer wrap">
 			<span>{c.footer}</span>
