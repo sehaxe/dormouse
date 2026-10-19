@@ -141,18 +141,41 @@ def test_apply_policy_maps_the_rung_onto_the_bf16_flag():
     assert apply_policy(run, [resolve_policy(caps(75), "fp32")]).model.bf16 is False
 
 
-def test_apply_policy_refuses_fp16_with_the_f16_plan_named():
-    """A 1650 under `dtype=auto` resolves fp16 — and the PORT has no fp16 forward.
-
-    The refusal is the honest state of the fleet story: until the fp16 forward
-    lands (docs/architecture/f16-plan.md is storage-only so far), the weak card
-    runs fp32 or does not run.
-    """
-    run = a_run(dtype="auto")
+def test_an_explicit_fp16_request_is_loud():
+    """The user asked for a rung the PORT cannot run: stop, naming the plan."""
+    run = a_run(dtype="fp16")
     with pytest.raises(LoudError) as e:
-        apply_policy(run, [resolve_policy(caps(75), "auto")])
+        apply_policy(run, [resolve_policy(caps(75), "fp16")], log=pytest.fail)
     msg = str(e.value)
-    assert "no fp16 path" in msg and "f16-plan.md" in msg and "dtype=fp32" in msg
+    assert "dtype=fp16 requested" in msg and "f16-plan.md" in msg and "dtype=auto" in msg
+
+
+def test_auto_fp16_on_a_1650_is_a_counted_fp32_fallback():
+    """`auto` means "best available": the PORT's best on a 1650 is fp32, said so.
+
+    The device supports fp16; the port has no fp16 forward. Falling back for
+    THIS rank (not the whole fleet) is what lets a 5060 Ti run bf16 beside a
+    1650 running fp32 — and the fallback is COUNTED, never silent.
+    """
+    lines: list[str] = []
+    run = a_run(dtype="auto", bf16=True)
+    fitted = apply_policy(run, [resolve_policy(caps(75), "auto")], log=lines.append)
+    assert fitted.model.bf16 is False
+    assert lines and "COUNTED fallback to fp32" in lines[0]
+    assert "f16-plan.md" in lines[0] and "sm_75" in lines[0]
+    # Without a log the fallback is refused: an unannounced fallback is the defect.
+    with pytest.raises(LoudError):
+        apply_policy(a_run(dtype="auto"), [resolve_policy(caps(75), "auto")])
+
+
+def test_a_mixed_fleet_applies_per_rank():
+    """The heterogeneous story: bf16 on the strong card, fp32 on the weak one."""
+    policies = [resolve_policy(caps(120), "auto"), resolve_policy(caps(75), "auto")]
+    lines: list[str] = []
+    assert apply_policy(a_run(dtype="auto"), policies, rank=0, log=lines.append).model.bf16
+    weak = apply_policy(a_run(dtype="auto"), policies, rank=1, log=lines.append)
+    assert weak.model.bf16 is False
+    assert len(lines) == 1, "only the rank that fell back says so"
 
 
 def test_apply_policy_refuses_triton_moe_without_bf16():

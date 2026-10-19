@@ -69,12 +69,14 @@ Three rules make this honest rather than a table nobody enforces:
   experiment with the requested label on it.
 * **`dtype=auto` is COUNTED**: the log line names the reading (`bf16=0
   fp16=1`), not just the verdict, and the memory budget (`free − 512 MiB`).
-* **the PORT's half of the contract is a refusal too**: the port's forward has
-  no fp16 path (the f16 plan is storage-only so far), so a 1650 under
-  `dtype=auto` resolves fp16 and then **stops**, naming
-  `docs/architecture/f16-plan.md` and `dtype=fp32`. Until that forward lands,
-  the 1650 runs fp32 — correct, and slower than the card can be. That is the
-  honest state, and it is one refusal to delete when the fp16 forward lands.
+* **the PORT's half of the contract**: the port's forward has no fp16 path
+  (the f16 plan is storage-only so far). An **explicit** `dtype=fp16` is LOUD;
+  an `auto` policy that resolved fp16 is a **COUNTED fp32 fallback for that
+  rank**, naming `docs/architecture/f16-plan.md`. That distinction is what
+  makes a mixed fleet work today: `dtype=auto` on a 5060 Ti + 1650 fleet runs
+  **bf16 on the strong card and fp32 on the weak one**, each rank announcing
+  its own rung. Until the fp16 forward lands the 1650 is slower than it can
+  be — correct, counted, and one gate away from better.
 
 `dtype="none"` (the default) means the layer is never called: the `bf16` flag
 decides as it always has and the config round-trips unchanged. The probe also
@@ -277,9 +279,10 @@ byte-identical default.
 
 **Needs two cards (and is NOT claimed):** NCCL's actual all-reduce and its
 timing; the real PCIe rate (the table is theoretical × an assumption); FSDP2's
-all-gather/prefetch on CUDA; a heterogeneous dtype fleet (a 1650 resolving fp16
-would stop at the fp16-forward refusal today); per-rank `throughput_index` on
-two different cards; and the launch-bound question below.
+all-gather/prefetch on CUDA; a heterogeneous dtype fleet on real cards (the
+per-rank policy — bf16 beside a COUNTED fp32 — is gated by unit tests only);
+per-rank `throughput_index` on two different cards; and the launch-bound
+question below.
 
 **The one command that checks a two-card box** (the same gate, on CUDA):
 

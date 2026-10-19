@@ -148,6 +148,11 @@ class DevicePolicy:
     #: Bytes the run may use for weights + optimizer state + activations, or
     #: `None` on a device with no VRAM to budget (the CPU arm).
     memory_budget: int | None
+    #: The REQUEST that produced this policy (`auto` or an explicit rung). The
+    #: difference matters at the port's half of the contract: an explicit
+    #: `fp16` that the port cannot run is LOUD, while `auto` resolving fp16 and
+    #: being unable to run it is a COUNTED fp32 fallback for that rank.
+    requested: str = "auto"
 
     @property
     def moe_triton(self) -> bool:
@@ -288,6 +293,7 @@ def resolve_policy(
             )
         dtype = requested
         reason = f"requested {requested}"
+    policy_request = requested  # the raw request, for apply_policy's contract
     budget = None
     if caps.is_cuda and caps.free_mem >= 0:
         budget = caps.free_mem - reserve
@@ -305,11 +311,21 @@ def resolve_policy(
         # driver's property query still answers). A budget cannot be derived
         # from a number that does not exist, so the reason says so.
         reason = f"{reason}; budget=unknown (free VRAM unreadable: another process holds the card)"
-    return DevicePolicy(caps=caps, compute_dtype=dtype, reason=reason, memory_budget=budget)
+    return DevicePolicy(
+        caps=caps,
+        compute_dtype=dtype,
+        reason=reason,
+        memory_budget=budget,
+        requested=policy_request,
+    )
 
 
 def apply_policy(
-    run: RunConfig, policies: Sequence[DevicePolicy], *, rank: int | None = None
+    run: RunConfig,
+    policies: Sequence[DevicePolicy],
+    *,
+    rank: int | None = None,
+    log=None,
 ) -> RunConfig:
     """Map a resolved policy onto the run's model half — LOUD on what the port cannot honor.
 
@@ -318,10 +334,14 @@ def apply_policy(
 
     * `bf16` -> `bf16 = true` (the plan the port ships);
     * `fp32` -> `bf16 = false` (the CPU arm's and the control's shape);
-    * `fp16` -> **LOUD**: the port's forward has no fp16 path (the f16 plan is
-      landed for storage only), so a card that cannot do bf16 runs fp32 today.
-      That refusal is the honest state of the fleet story, and it is the line
-      to delete when the fp16 forward lands.
+    * `fp16` -> the port's forward has no fp16 path (the f16 plan is storage
+      only). An EXPLICIT `dtype=fp16` is **LOUD** — the request cannot be
+      honored. An `auto` policy that resolved fp16 is a **COUNTED fp32
+      fallback for that rank**: the user asked for the best available, fp32 IS
+      the best the PORT can run on that card, and a mixed fleet therefore runs
+      bf16 on the strong card and fp32 on the weak one — which is the point.
+      `log` is required for the fallback; without it the function refuses,
+      because an unannounced fallback is the failure class this repo bans.
     * `moe_kernel = "triton"` on a policy whose `moe_triton` is false -> LOUD:
       the Triton MoE arm's operands are bf16 today.
 
@@ -344,20 +364,37 @@ def apply_policy(
         policy = policies[0]
     else:
         policy = policies[rank]
-    if policy.compute_dtype == "fp16":
-        loud(
-            f"{policy.caps.line()} resolves to fp16 (auto: bf16={int(policy.caps.bf16)}), "
-            f"but the port's forward has no fp16 path — the f16 plan "
-            f"(docs/architecture/f16-plan.md) is storage-only so far, and a forward "
-            f"cast to fp16 would run unmeasured numerics (the bf16 plan's mixed-dtype "
-            f"rules were derived for bf16). Escape: dtype=fp32 (correct, slower), or "
-            f"land the fp16 forward with its gates and delete this refusal."
+    dtype = policy.compute_dtype
+    if dtype == "fp16":
+        if policy.requested != "auto":
+            loud(
+                f"dtype=fp16 requested, and {policy.caps.line()} supports it — but the "
+                f"port's forward has no fp16 path: the f16 plan "
+                f"(docs/architecture/f16-plan.md) is storage-only so far, and a forward "
+                f"cast to fp16 would run unmeasured numerics (the bf16 plan's "
+                f"mixed-dtype rules were derived for bf16). Escape: dtype=auto (fp32 on "
+                f"this card, COUNTED), dtype=fp32, or land the fp16 forward with its "
+                f"gates and delete this refusal."
+            )
+        if log is None:
+            loud(
+                f"{policy.caps.line()} auto-resolves fp16 and the port has no fp16 "
+                f"forward, so the run must COUNTED-fall back to fp32 — but apply_policy "
+                f"was given no log to announce it with. Escape: pass log=<the run's log>."
+            )
+        log(
+            f"{policy.caps.line()} auto-resolves fp16 (bf16={int(policy.caps.bf16)}), but "
+            f"the port's forward has no fp16 path (docs/architecture/f16-plan.md is "
+            f"storage-only): COUNTED fallback to fp32 for this rank. Escape: land the "
+            f"fp16 forward, or accept fp32 on this card."
         )
-    if run.model.moe_kernel == "triton" and not policy.moe_triton:
+        dtype = "fp32"
+    assert dtype in COMPUTE_DTYPES, dtype
+    if run.model.moe_kernel == "triton" and dtype != "bf16":
         loud(
             f"moe_kernel='triton' with compute={policy.compute_dtype} on "
             f"{policy.caps.line()}: the Triton grouped-GEMM arm takes bf16 operands "
             f"today, so it cannot serve this device. Escape: moe_kernel='padded' "
             f"(the reference arm), or dtype=bf16 on a card that supports it."
         )
-    return replace(run, model=replace(run.model, bf16=policy.compute_dtype == "bf16"))
+    return replace(run, model=replace(run.model, bf16=dtype == "bf16"))

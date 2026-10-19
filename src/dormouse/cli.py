@@ -118,7 +118,7 @@ def _apply_dtype(run: RunConfig, dev: torch.device, log) -> RunConfig:
     caps = probe_device(dev.index or 0) if dev.type == "cuda" else cpu_caps()
     policy = resolve_policy(caps, run.model.dtype)
     log(policy.line())
-    return apply_policy(run, [policy])
+    return apply_policy(run, [policy], log=log)
 
 
 def _apply_fit(run: RunConfig, fit_gb: float, log) -> RunConfig:

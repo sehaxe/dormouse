@@ -329,6 +329,7 @@ class Parallel:
         policies: list[DevicePolicy],
         bucket_mb: int,
         counters: Counters | None = None,
+        log=print,
     ) -> None:
         self.rank = rank
         self.world_size = world_size
@@ -342,6 +343,7 @@ class Parallel:
         self.bucket_mb = bucket_mb
         self.comm_hook = _comm_hook(reduce_dtype)
         self.counters = counters if counters is not None else Counters()
+        self._log = log
         self._flag = torch.zeros(1, dtype=torch.int32, device=device)
         #: The fleet-loss reduction's buffer, float64 so the SUM over ranks does
         #: not lose the low bits of a 5.7-scale CE. Read at the LOG cadence only.
@@ -401,7 +403,7 @@ class Parallel:
         """
         if run.model.dtype == "none":
             run = replace(run, model=replace(run.model, dtype="auto"))
-        return apply_policy(run, self.policies, rank=self.rank)
+        return apply_policy(run, self.policies, rank=self.rank, log=self._log)
 
     # -- the loop's per-step hooks ---------------------------------------
     def all_finite(self, flag: bool) -> bool:
@@ -705,6 +707,7 @@ def init_parallel(
         policies=[policy] * world_size,
         bucket_mb=cfg.dist_bucket_mb,
         counters=counters,
+        log=log,
     )
     return parallel
 
