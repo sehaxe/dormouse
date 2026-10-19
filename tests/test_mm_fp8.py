@@ -34,7 +34,7 @@ from pathlib import Path
 
 import pytest
 import torch
-from conftest import tiny_cfg, tiny_run
+from conftest import local_pin, tiny_cfg, tiny_run
 
 from dormouse.config import RunConfig, load_run
 from dormouse.instrument import Counters, LoudError
@@ -60,6 +60,7 @@ def _bf16_after_each():
 # --- the default path is pinned ---------------------------------------------
 
 
+@local_pin
 def test_the_default_path_is_byte_identical():
     """`mm_dtype="bf16"` must not have moved — the pre-lane hash, re-run."""
     with tempfile.TemporaryDirectory() as td:

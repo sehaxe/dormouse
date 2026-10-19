@@ -39,7 +39,7 @@ import math
 
 import pytest
 import torch
-from conftest import tiny_run
+from conftest import local_pin, tiny_run
 from torch import nn
 
 from dormouse.config import load_run
@@ -372,6 +372,7 @@ def test_the_eta_hat_scale_is_the_sf_arms_and_the_paper_reads_sqrt_mn():
     )
 
 
+@local_pin
 def test_the_default_path_is_bit_identical_to_the_pre_change_tree():
     """`muon` is the default and takes the step the captured tree took.
 

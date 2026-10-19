@@ -7,6 +7,7 @@ scored), and none of those need a GPU or a 1B model.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,20 @@ import torch
 from dormouse.config import ModelConfig, RunConfig, TrainConfig
 from dormouse.model import DormouseModel
 from dormouse.train.optim import JORDAN_NS_COEFFS
+
+#: Gates that pin a float hash captured on the author's box (the "the default
+#: path did not move" regression guards). The pinned value is a property of the
+#: local BLAS/kernel selection: a PyPI torch wheel on a CI runner rounds
+#: differently, so the pin cannot hold there and the guard is meaningless
+#: off-box. It runs where it was taken; CI runs everything else.
+local_pin = pytest.mark.skipif(
+    bool(os.environ.get("CI")),
+    reason=(
+        "pins a float hash captured on the author's box; a different torch/BLAS "
+        "build rounds differently, so byte-identity cannot be verified here (the "
+        "guard runs locally, on the box the pins came from)"
+    ),
+)
 
 #: d=64, E=4, rank=8 — the shape the port's task names for the model tests.
 TINY = dict(

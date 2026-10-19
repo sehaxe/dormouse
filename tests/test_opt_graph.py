@@ -32,7 +32,7 @@ import subprocess
 
 import pytest
 import torch
-from conftest import tiny_cfg, tiny_run
+from conftest import local_pin, tiny_cfg, tiny_run
 from torch import nn
 
 from dormouse.config import RunConfig, load_run
@@ -80,6 +80,7 @@ def _shape_model(seed: int = 0) -> nn.Module:
     return mod
 
 
+@local_pin
 def test_the_default_path_is_byte_identical():
     """`opt_graph=false` (the default) must not have moved — pinned hashes.
 

@@ -51,7 +51,7 @@ import subprocess
 
 import pytest
 import torch
-from conftest import fp64_classic, gauss, ramp, rel
+from conftest import fp64_classic, gauss, local_pin, ramp, rel
 from torch import nn
 
 from dormouse.instrument import Counters, LoudError
@@ -375,6 +375,7 @@ def test_the_caller_s_tensor_is_never_written(monkeypatch):
 # --- the default path cannot move -------------------------------------------
 
 
+@local_pin
 def test_the_default_path_is_byte_identical_to_the_pinned_hashes():
     """10 fixed-seed steps of `Muon` on every default: the hashes captured BEFORE.
 
