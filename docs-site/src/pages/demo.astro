@@ -8,6 +8,7 @@
 // (`/demo/engine.js`, no bundler), and the model is a `.dormouse` artifact the
 // page FETCHES — it is not committed (16.3 MB, over the 8 MB rule), so the page
 // has to degrade with a message that names the command that makes it.
+import Topbar from '../components/Topbar.astro';
 import '../styles/landing.css';
 
 const base = import.meta.env.BASE_URL.replace(/\/$/, '');
@@ -29,18 +30,7 @@ const repo = 'https://github.com/sehaxe/dormouse';
 		<link rel="icon" href={at('/favicon.svg')} type="image/svg+xml" />
 	</head>
 	<body>
-		<nav class="topbar">
-			<div class="wrap topbar-in">
-				<a class="topbar-mark" href={at('/')}>dormouse(1)</a>
-				<span class="topbar-links">
-					<a href={at('/start-here/what-is-this/')}>docs</a>
-					<a href={at('/start-here/status/')}>status</a>
-					<a href={repo}>github</a>
-					<a href={at('/demo/')} aria-current="page">demo</a>
-					<a href={at('/ru/')} title="Русская версия" class="lang">[ru]</a>
-				</span>
-			</div>
-		</nav>
+		<Topbar current="demo" />
 
 		<main>
 			<header class="wrap hero">

@@ -1,0 +1,61 @@
+---
+/**
+ * The one topbar. It used to exist twice — the landing's copy grew the mini mark
+ * and the demo page's copy did not, which is exactly the drift a shared
+ * component prevents (the demo page shipped without the brand while the landing
+ * had it).
+ *
+ * Props are the two things the pages disagree on: `current` (which link is the
+ * reader's own page, marked aria-current) and `lang` (which language variant the
+ * [ru]/[en] switch points at).
+ */
+import manifest from '../../tools/manifest.mjs';
+
+const { repo } = manifest;
+
+interface Props {
+	current?: 'docs' | 'status' | 'demo';
+	lang?: 'en' | 'ru';
+}
+
+const { current, lang = 'en' } = Astro.props;
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+const at = (path: string) => `${base}${path}`;
+// The docs are English-only; a Russian reader gets the Russian LANDING back, not
+// a Russian page that does not exist. The demo page is English-only too.
+const other = lang === 'en' ? at('/ru/') : at('/');
+const langLabel = lang === 'en' ? 'ru' : 'en';
+const langTitle = lang === 'en' ? 'Русская версия' : 'English version';
+
+const links = [
+	{ key: 'docs', href: at('/start-here/what-is-this/'), label: 'docs' },
+	{ key: 'status', href: at('/start-here/status/'), label: 'status' },
+	{ key: 'demo', href: at('/demo/'), label: 'demo' },
+] as const;
+---
+
+<nav class="topbar">
+	<div class="wrap topbar-in">
+		<a class="topbar-mark" href={at('/')}>
+			{/* The mini mark: the wordmark's first cell-glyph, the same one the
+			    favicon carries. Rect-based, and its cells print in sequence
+			    (landing.css). */}
+			<svg class="mark-mini" viewBox="0 0 4 5" width="14" height="18" aria-hidden="true">
+				<rect x="0" y="0" width="3" height="1"/>
+				<rect x="0" y="1" width="1" height="1"/>
+				<rect x="3" y="1" width="1" height="1"/>
+				<rect x="0" y="2" width="1" height="1"/>
+				<rect x="3" y="2" width="1" height="1"/>
+				<rect x="0" y="3" width="1" height="1"/>
+				<rect x="3" y="3" width="1" height="1"/>
+				<rect x="0" y="4" width="3" height="1"/>
+			</svg>dormouse(1)</a>
+		<span class="topbar-links">
+			{links.map((l) => (
+				<a href={l.href} aria-current={current === l.key ? 'page' : undefined}>{l.label}</a>
+			))}
+			<a href={repo}>github</a>
+			<a href={other} title={langTitle} class="lang">[{langLabel}]</a>
+		</span>
+	</div>
+</nav>

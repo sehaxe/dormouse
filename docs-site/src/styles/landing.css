@@ -23,6 +23,10 @@
 	--surface-dark-elevated: #302c2c;
 	--hairline: rgba(15, 0, 0, 0.12);
 	--hairline-strong: #646262;
+	/* The section divider. The 12% hairline is right for row separators inside a
+	   block (it should whisper) and too faint for the rule that announces a
+	   section: at 12% the 'THE STACK' heading read as floating text. */
+	--rule: rgba(15, 0, 0, 0.3);
 	--on-dark: #fdfcfc;
 	--on-dark-mute: #9a9898;
 	--accent: #007aff;
@@ -257,8 +261,8 @@ h1 {
 
 .section > h2 {
 	margin: 0 0 24px;
-	padding-bottom: 8px;
-	border-bottom: 1px solid var(--hairline);
+	padding-top: 14px;
+	border-top: 1px solid var(--rule);
 	color: var(--ink);
 	font-size: 14px;
 	font-weight: 700;
@@ -611,6 +615,7 @@ h1 {
 		--surface-dark-elevated: #3a3636;
 		--hairline: rgba(253, 252, 252, 0.14);
 		--hairline-strong: #9a9898;
+		--rule: rgba(253, 252, 252, 0.32);
 		--on-dark: #fdfcfc;
 		--on-dark-mute: #9a9898;
 		--accent: #4da3ff;
@@ -676,8 +681,8 @@ h1 {
 }
 
 @keyframes rule {
-	from { border-bottom-color: transparent; }
-	to { border-bottom-color: var(--hairline); }
+	from { border-top-color: transparent; }
+	to { border-top-color: var(--rule); }
 }
 
 /* ── motion: the only animation on the page is opt-out by default ────────── */

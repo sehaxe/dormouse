@@ -11,6 +11,7 @@
 // reader's system preference in pure CSS. The one inline script only
 // re-animates what is already in the DOM (typing + count-up) and does nothing
 // under prefers-reduced-motion.
+import Topbar from './Topbar.astro';
 import '../styles/landing.css';
 
 const { lang } = Astro.props;
@@ -231,31 +232,7 @@ const repo = 'https://github.com/sehaxe/dormouse';
 		<script is:inline src={at('/htmx.min.js')} defer></script>
 	</head>
 	<body>
-		<nav class="topbar">
-			<div class="wrap topbar-in">
-				<a class="topbar-mark" href={at('/')}>
-					{/* The mini mark: the wordmark's first cell-glyph, the same one the
-					    favicon carries. Rect-based, and its cells print in sequence
-					    (landing.css). */}
-					<svg class="mark-mini" viewBox="0 0 4 5" width="14" height="18" aria-hidden="true">
-					  <rect x="0" y="0" width="3" height="1"/>
-					  <rect x="0" y="1" width="1" height="1"/>
-					  <rect x="3" y="1" width="1" height="1"/>
-					  <rect x="0" y="2" width="1" height="1"/>
-					  <rect x="3" y="2" width="1" height="1"/>
-					  <rect x="0" y="3" width="1" height="1"/>
-					  <rect x="3" y="3" width="1" height="1"/>
-					  <rect x="0" y="4" width="3" height="1"/>
-					</svg>dormouse(1)</a>
-				<span class="topbar-links">
-					<a href={at('/start-here/what-is-this/')}>{c.nav.docs}</a>
-					<a href={at('/start-here/status/')}>{c.nav.status}</a>
-					<a href={at('/demo/')}>{c.nav.demo}</a>
-					<a href={repo}>{c.nav.github}</a>
-					<a href={other} title={c.nav.langTitle} class="lang">[{c.nav.lang}]</a>
-				</span>
-			</div>
-		</nav>
+		<Topbar lang={lang} />
 
 		<main>
 			<header class="hero wrap">
