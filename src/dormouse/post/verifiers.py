@@ -21,6 +21,8 @@ failure mode.
 
 from __future__ import annotations
 
+import ast
+import math
 import os
 import re
 import subprocess
@@ -34,6 +36,15 @@ from ..instrument import loud
 
 #: The exec jail's wall clock and CPU limit, in seconds (2602.11210's shape).
 TIMEOUT_S = 5.0
+
+#: The math parser's work bounds. These are refusals, not truncations: an answer
+#: over a limit is REJECTED and the reason says which limit it crossed.
+#: `9**9**9` is `9**(9**9)`: its exponent is 387 420 489 and the result would be
+#: a 369-million-digit integer, so the trainer would hang inside sympy.
+MAX_EXPR_CHARS = 256
+MAX_EXPR_NODES = 64
+MAX_EXPONENT = 1000
+MAX_MAGNITUDE = 1e100
 
 __all__ = ["TIMEOUT_S", "Verdict", "sympy_equivalent", "verify"]
 
@@ -49,10 +60,33 @@ class Verdict:
     budget_used: float
 
 
+class _Refused(Exception):
+    """A final answer outside the numeric whitelist, or over a work bound.
+
+    `.token` is the shortest spelling of the cause the reason can carry without
+    echoing the response; `why` names the rule. The exception never escapes
+    [`verify`] — a hostile answer is a failed rollout, not a dead trainer.
+    """
+
+    def __init__(self, token: str, why: str) -> None:
+        super().__init__(f"{token}: {why}")
+        self.token = token
+        self.why = why
+
+
 def sympy_equivalent(expected: str, got: str) -> bool:
-    """True iff `expected − got` simplifies to 0 (`2/4` == `0.5` == `1/2`)."""
-    a = sympy.sympify(expected)
-    b = sympy.sympify(got)
+    """True iff `expected − got` simplifies to 0 (`2/4` == `0.5` == `1/2`).
+
+    `got` is model text: it is parsed by the whitelist in [`_safe_expr`] and a
+    refusal returns False. `expected` is the task's own reference, so a bad one
+    is a task defect and stops the run LOUDLY rather than scoring every rollout
+    wrong.
+    """
+    try:
+        b = _safe_expr(got)
+    except _Refused:
+        return False
+    a = _expected_expr(expected)
     return bool(sympy.simplify(a - b) == 0)
 
 
@@ -80,18 +114,143 @@ def _budget_used(response: str, budget: int) -> float:
 
 # --------------------------------------------------------------------------- math
 
-#: The last `answer: X` / `answer = X` line is the final answer; else the last
-#: non-empty line, so a bare number still scores (2606.30420's exact-match shape).
+#: The last `answer: X` / `answer = X` line or the last `\boxed{X}` is the final
+#: answer; else the last non-empty line, so a bare number still scores
+#: (2606.30420's exact-match shape).
 _ANSWER = re.compile(r"answer\s*[:=]\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
-_PARSE_ERRORS = (sympy.SympifyError, SyntaxError, TypeError, ValueError)
+_BOXED = re.compile(r"\\boxed\{([^{}]*)\}")
+
+#: The whole arithmetic surface a numeric final answer needs. Anything not here
+#: — a name, an attribute, a string, a comprehension, a lambda — is refused.
+_FUNCS = {
+    "sqrt": sympy.sqrt,
+    "abs": sympy.Abs,
+    "sin": sympy.sin,
+    "cos": sympy.cos,
+    "tan": sympy.tan,
+    "log": sympy.log,
+    "exp": sympy.exp,
+}
+_CONSTS = {"pi": sympy.pi, "E": sympy.E}
+_BINOPS = (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow)
 
 
 def _final_answer(response: str) -> str | None:
-    hits = _ANSWER.findall(response)
+    hits = [(m.start(), m.group(1)) for m in _ANSWER.finditer(response)]
+    hits += [(m.start(), m.group(1)) for m in _BOXED.finditer(response)]
     if hits:
-        return hits[-1].strip().rstrip(".")
+        return max(hits)[1].strip().rstrip(".")
     lines = [ln.strip() for ln in response.splitlines() if ln.strip()]
     return lines[-1].rstrip(".") if lines else None
+
+
+def _short(value: object, n: int = 32) -> str:
+    text = str(value)
+    return text if len(text) <= n else text[: n - 3] + "..."
+
+
+def _token(node: ast.AST) -> str:
+    try:
+        return _short(ast.unparse(node))
+    except Exception:  # parser internals on a hostile tree; the class name is enough
+        return type(node).__name__
+
+
+def _safe_expr(text: str) -> sympy.Expr:
+    """Parse ONE numeric expression under the math whitelist, or raise [`_Refused`]."""
+    text = text.strip()
+    if not text:
+        raise _Refused("''", "the final answer is empty")
+    if len(text) > MAX_EXPR_CHARS:
+        raise _Refused(f"{len(text)} characters", f"exceeds the {MAX_EXPR_CHARS}-character limit")
+    try:
+        tree = ast.parse(text, mode="eval")
+    except SyntaxError as exc:
+        raise _Refused(_short(text), f"is not a valid expression ({exc.msg})") from exc
+    nodes = sum(1 for _ in ast.walk(tree))
+    if nodes > MAX_EXPR_NODES:
+        raise _Refused(f"{nodes} nodes", f"exceeds the {MAX_EXPR_NODES}-node limit")
+    value = _eval_node(tree.body)
+    _check_number(value)
+    return value
+
+
+def _eval_node(node: ast.AST) -> sympy.Expr:
+    if isinstance(node, ast.Constant):
+        value = node.value
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise _Refused(_token(node), f"constant {type(value).__name__} is not a number")
+        if isinstance(value, float) and not math.isfinite(value):
+            raise _Refused(_token(node), "a constant must be finite")
+        return sympy.Integer(value) if isinstance(value, int) else sympy.Float(repr(value))
+    if isinstance(node, ast.Name):
+        if node.id in _CONSTS:
+            return _CONSTS[node.id]
+        raise _Refused(node.id, "is not a name in the math whitelist")
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        operand = _eval_node(node.operand)
+        return operand if isinstance(node.op, ast.UAdd) else -operand
+    if isinstance(node, ast.BinOp):
+        return _eval_binop(node)
+    if isinstance(node, ast.Call):
+        if not isinstance(node.func, ast.Name) or node.func.id not in _FUNCS:
+            raise _Refused(_token(node.func), "is not a function in the math whitelist")
+        if node.keywords or len(node.args) != 1 or isinstance(node.args[0], ast.Starred):
+            raise _Refused(node.func.id, "takes exactly one positional argument")
+        return _FUNCS[node.func.id](_eval_node(node.args[0]))
+    raise _Refused(_token(node), f"{type(node).__name__} is not allowed in a final answer")
+
+
+def _eval_binop(node: ast.BinOp) -> sympy.Expr:
+    if not isinstance(node.op, _BINOPS):
+        raise _Refused(type(node.op).__name__, "is not an operator in the math whitelist")
+    left = _eval_node(node.left)
+    right = _eval_node(node.right)
+    if isinstance(node.op, ast.Add):
+        return left + right
+    if isinstance(node.op, ast.Sub):
+        return left - right
+    if isinstance(node.op, ast.Mult):
+        return left * right
+    if isinstance(node.op, ast.Div):
+        if right == 0:
+            raise _Refused("/", "division by zero")
+        return left / right
+    return _eval_pow(left, right)
+
+
+def _eval_pow(base: sympy.Expr, exponent: sympy.Expr) -> sympy.Expr:
+    if exponent.is_real is False:
+        raise _Refused("**", "the exponent must be a real number")
+    try:
+        magnitude = abs(float(exponent))
+    except (TypeError, ValueError, OverflowError):
+        raise _Refused(_short(exponent), "the exponent is not a finite number") from None
+    if not math.isfinite(magnitude) or magnitude > MAX_EXPONENT:
+        raise _Refused(_short(exponent), f"exceeds the {MAX_EXPONENT} exponent limit")
+    return base**exponent
+
+
+def _check_number(value: sympy.Expr) -> None:
+    if value.is_real is False:
+        raise _Refused(_short(value), "the final answer is not a real number")
+    try:
+        magnitude = abs(complex(value))
+    except (TypeError, ValueError, OverflowError):
+        raise _Refused(_short(value), "the final answer is not a finite number") from None
+    if not math.isfinite(magnitude) or magnitude > MAX_MAGNITUDE:
+        raise _Refused(_short(value), f"magnitude exceeds the {MAX_MAGNITUDE:g} work limit")
+
+
+def _expected_expr(expected: object) -> sympy.Expr:
+    try:
+        return _safe_expr(str(expected))
+    except _Refused as exc:
+        loud(
+            f"task reference {_short(expected)!r} is outside the verifier's math "
+            f"whitelist ({exc.token}: {exc.why}). Escape: fix the task's `expected` "
+            "to a numeric expression; the verifier will not guess."
+        )
 
 
 def _verify_math(task: dict, response: str, used: float) -> Verdict:
@@ -99,9 +258,11 @@ def _verify_math(task: dict, response: str, used: float) -> Verdict:
     if got is None or not got:
         return Verdict(False, "no final answer found in the response", used)
     try:
-        ok = sympy_equivalent(str(task["expected"]), got)
-    except _PARSE_ERRORS:
-        return Verdict(False, "final answer is not a parseable expression", used)
+        b = _safe_expr(got)
+    except _Refused as exc:
+        return Verdict(False, f"refused: {exc.token!r} {exc.why}", used)
+    a = _expected_expr(task["expected"])
+    ok = bool(sympy.simplify(a - b) == 0)
     reason = "sympy-equivalent" if ok else "not equivalent to the expected answer"
     return Verdict(bool(ok), reason, used)
 
