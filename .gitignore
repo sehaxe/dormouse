@@ -34,5 +34,5 @@ node_modules/
 # The demo's model artifact is GENERATED (16.3 MB, over the 8 MB commit rule):
 # `dormouse export small --ckpt-name … --engram-dtype fp16 --out
 # docs-site/public/demo/model.dormouse`. See docs-site/public/demo/README.md.
-docs-site/public/demo/model.dormouse
+# docs-site/public/demo/model.dormouse  # committed 2026-10-19: the live demo must work, and 16 MB is a one-time cost
 docs-site/dist/
