@@ -815,23 +815,36 @@ def test_sft_eval_reports_first_byte_agreement(tmp_path):
     assert built["holdout"] == 4
 
 
-def test_two_sft_evals_on_one_checkpoint_score_the_same_window(tmp_path: Path):
-    """M3 gate: `_sft_eval` rewinds, so pass two scores the same bytes.
+def test_two_sft_evals_on_one_checkpoint_score_the_same_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """(c) gate: `_sft_eval` rewinds, and the holdout is THREE eval windows.
 
-    Before the fix the stream inherited pass one's position; the two `ce=`/
-    `first=` numbers were a moving-window measurement, not a statement about
-    the weights (the defect `train/loop.py` fixed on 2026-09-27).
+    The old fixture held exactly one window (`holdout=4`, `2 x 2` records), so
+    the ring was back at `lo` even with the rewind removed and the gate could
+    not fail. Here the holdout is 12 records: pass one stops a third of the way
+    in. The second half patches `rewind` to a no-op and asserts the two passes
+    then score different bytes, so removing the call is observable from here.
     """
     corpus = tmp_path / "sft.bin"
-    build_sft_corpus(corpus, seed=1, seq_len=SEQ, holdout=4)
+    build_sft_corpus(corpus, seed=1, seq_len=SEQ, holdout=12)
     run = sft_run(tmp_path, corpus=corpus, eval_batches=2)
-    eval_stream = ByteStream(tmp_path / "sft.bin.holdout", BATCH, SEQ)
+    hold = tmp_path / "sft.bin.holdout"
     model = DormouseModel(run.model)
+
+    eval_stream = ByteStream(hold, BATCH, SEQ)
     ce1, first1, records1, scored1 = _sft_eval(model, eval_stream, run.train, None)
     ce2, first2, records2, scored2 = _sft_eval(model, eval_stream, run.train, None)
     assert ce1 == pytest.approx(ce2, abs=1e-12), (ce1, ce2)
     assert first1 == first2
     assert (records1, scored1) == (records2, scored2) == (2 * BATCH, 2 * BATCH * SEQ)
+
+    # The revert harness: with no rewind, pass two starts at record 4 of 12.
+    monkeypatch.setattr(ByteStream, "rewind", lambda self: None)
+    stream2 = ByteStream(hold, BATCH, SEQ)
+    a = _sft_eval(model, stream2, run.train, None)
+    b = _sft_eval(model, stream2, run.train, None)
+    assert a[0] != pytest.approx(b[0], abs=1e-12), (a, b)
 
 
 def test_the_logged_sft_byte_count_is_the_host_mask_count(tmp_path: Path):
