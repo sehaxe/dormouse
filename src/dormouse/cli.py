@@ -24,6 +24,7 @@ from .instrument import LoudError
 from .model import DormouseModel, param_count
 from .model.decode import decode_bytes, encode
 from .serve import DEFAULT_MAX_TOKENS, build_server, serve_forever
+from .train.device import apply_policy, cpu_caps, probe_device, resolve_policy
 
 app = typer.Typer(
     add_completion=False,
@@ -99,6 +100,24 @@ def _device(name: str) -> torch.device:
             "the card. One heavy thing at a time (readiness plan §7)."
         )
     return torch.device("cuda")
+
+
+def _apply_dtype(run: RunConfig, dev: torch.device, log) -> RunConfig:
+    """The `dtype` seam: `none` (default) is a no-op, anything else probes once.
+
+    The off switch is checked FIRST and returns the same object — a run with
+    `dtype="none"` never opens a CUDA context, never calls nvidia-smi, and its
+    config is byte-identical to its history (the regression the layer must not
+    cause). With a dtype requested, the device is probed once (metadata only),
+    the policy is resolved (LOUD on an impossible request), the COUNTED line is
+    logged, and the run's `bf16` flag is set to the resolved rung.
+    """
+    if run.model.dtype == "none":
+        return run
+    caps = probe_device(dev.index or 0) if dev.type == "cuda" else cpu_caps()
+    policy = resolve_policy(caps, run.model.dtype)
+    log(policy.line())
+    return apply_policy(run, [policy])
 
 
 def _freeze_gc() -> None:
@@ -255,6 +274,7 @@ def train_cmd(
         train_over["json_log"] = str(json_log)
     run = load_run(preset, model_overrides=model_over, train_overrides=train_over)
     dev = _device(device)
+    run = _apply_dtype(run, dev, log=print)
     model = _model(run).to(dev)
     _freeze_gc()
     from .train.loop import train as _train
@@ -317,6 +337,7 @@ def run(
         train_over["out_dir"] = str(out_dir)
     run = load_run(preset, model_overrides=model_over, train_overrides=train_over)
     dev = _device(device)
+    run = _apply_dtype(run, dev, log=print)
     model = _model(run).to(dev)
     _freeze_gc()
 

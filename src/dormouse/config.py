@@ -77,6 +77,15 @@ DEAD_SNAPSHOT_KEYS = {
 #: The `moe_kernel` literals — the expert-pass arms `experts._dispatch` routes
 #: between. One list, read by `validate`: a name that is not here is LOUD.
 MOE_KERNELS = ("padded", "triton", "naive")
+#: The `dtype` literals — the per-DEVICE compute policy request
+#: (`train/device.py`, which owns the ladder and the refusals; this tuple
+#: mirrors `device.DTYPES` the way `MOE_KERNELS` mirrors `experts`' arms, so
+#: the config layer does not import the device layer).
+#: `none` (the default) = the `bf16` flag decides and the layer is never
+#: called; `auto` = probe this device and take its best legal rung (COUNTED);
+#: an explicit rung is LOUD when the device cannot run it. On the CPU arm the
+#: ladder is fp32-only by the port's own rule, so `auto` resolves fp32.
+DTYPES = ("none", "auto", "bf16", "fp16", "fp32")
 #: The `expert_act` literals — the 2026-10-16 activation tournament arms, each
 #: with its formula source in `experts.expert_glu`:
 #: `silu` (control, SwiGLU), `situ` (Kimi K3, arXiv 2607.24653 Eq. 12),
@@ -230,6 +239,17 @@ class ModelConfig:
     #: unlike burn's `small.toml`, which still ships fp32 (listed in the port
     #: report as a deliberate deviation).
     bf16: bool = True
+    #: The per-DEVICE compute policy request (`DTYPES`, `train/device.py`
+    #: where it is resolved and applied). `none` (the default) is the off
+    #: switch: `bf16` above decides and nothing is probed, so every run and
+    #: snapshot on record is unchanged. `auto` probes the device once and
+    #: takes its best legal rung — COUNTED, the line names the card and why —
+    #: and an explicit rung is refused LOUDLY on a device that cannot run it
+    #: (a 1650 asked for bf16 dies rather than becoming fp16 under the label).
+    #: The applied rung lands in `bf16`, which is what the snapshot and the
+    #: resume gate read; `dtype` itself is pinned too (a flip is a different
+    #: experiment).
+    dtype: str = "none"
     #: TSCT factor format. `none` resolves to bf16 factors at init; every
     #: ladder rung (fp8 → NVFP4 → LittleBit) is a REFUSAL, not a fallback.
     quant: str = "none"
@@ -975,6 +995,14 @@ def validate(model: ModelConfig) -> None:
             f"and fallback), `triton` the unpadded grouped GEMM "
             f"(model/moe_kernels.py), `naive` the per-expert loop. Escape: name "
             f"one of those, or add the arm before the config can lie about it."
+        )
+    if model.dtype not in DTYPES:
+        loud(
+            f"dtype={model.dtype!r} is not a request. Known: {list(DTYPES)} — "
+            f"`none` leaves the `bf16` flag deciding (the default), `auto` picks "
+            f"the best rung the device supports, and an explicit rung is refused "
+            f"when the device cannot run it (train/device.py). Escape: name one "
+            f"of those."
         )
     if model.expert_act not in EXPERT_ACTS:
         loud(
