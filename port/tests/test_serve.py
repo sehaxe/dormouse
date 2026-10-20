@@ -283,11 +283,14 @@ def test_clamp_line_is_counted():
 
 
 def test_assemble_renders_the_sft_template():
-    """The prompt IS the SFT template: `\\x01 instruction \\n\\x02 ` — the
-    model was trained on those markers, and a `User:/Assistant:` prompt was
-    measured answering with noise (the first chat smoke, 2026-10-17)."""
+    """The prompt IS the SFT template: `\\x01instruction\\n\\x02` — the model
+    was trained on those markers flush against the text (`train/sft.py:416`'s
+    `render()`), and a `User:/Assistant:` prompt was measured answering with
+    noise (the first chat smoke, 2026-10-17). The 2026-10-20 fix removed three
+    stray spaces the server had added, which made every reply a different
+    distribution than the one the model learned."""
     got = assemble([{"role": "system", "content": "s"}, {"role": "user", "content": "u"}])
-    assert got == b"\x01 s\nu \n\x02 "
+    assert got == b"\x01s\nu\n\x02"
     # multi-turn: the last user message is the instruction, earlier ones are context
     got2 = assemble(
         [
@@ -296,7 +299,7 @@ def test_assemble_renders_the_sft_template():
             {"role": "user", "content": "second"},
         ]
     )
-    assert got2 == b"\x01 first\nsecond \n\x02 "
+    assert got2 == b"\x01first\nsecond\n\x02"
 
 
 def test_a_stop_byte_ends_the_reply(tmp_path):
