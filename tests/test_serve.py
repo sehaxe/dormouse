@@ -313,11 +313,20 @@ def test_clamp_line_is_counted():
 
 
 def test_assemble_renders_the_sft_template():
-    """The prompt IS the SFT template: `\\x01 instruction \\n\\x02 ` — the
-    model was trained on those markers, and a `User:/Assistant:` prompt was
-    measured answering with noise (the first chat smoke, 2026-10-17)."""
+    """The prompt IS the training template, byte for byte: `\\x01{instruction}\\n\\x02`.
+
+    Pinned against `train.sft.render` — the one authority — so the two cannot
+    drift apart. Two measured failures of a prompt the model did not train on:
+    `User:/Assistant:` answered with noise (2026-10-17), and a template with
+    three extra spaces answered a *different* question (2026-10-20: `"Say
+    hello."` gave a newline and an unrelated sentence where the exact template
+    gave `answer:`-shaped text).
+    """
+    from dormouse.train.sft import render
+
     got = assemble([{"role": "system", "content": "s"}, {"role": "user", "content": "u"}])
-    assert got == b"\x01 s\nu \n\x02 "
+    assert got == b"\x01s\nu\n\x02"
+    assert got == render("s\nu", "")[:-1]  # the template, minus the 0x03 end marker
     # multi-turn: the last user message is the instruction, earlier ones are context
     got2 = assemble(
         [
@@ -326,7 +335,10 @@ def test_assemble_renders_the_sft_template():
             {"role": "user", "content": "second"},
         ]
     )
-    assert got2 == b"\x01 first\nsecond \n\x02 "
+    assert got2 == b"\x01first\nsecond\n\x02"
+    assert got2 == render("first\nsecond", "")[:-1]
+    # no space the training pipeline never wrote
+    assert b" \n" not in got and not got.endswith(b" ")
 
 
 def test_a_stop_byte_ends_the_reply(tmp_path):

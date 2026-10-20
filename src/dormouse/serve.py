@@ -76,7 +76,11 @@ def assemble(messages: Any) -> bytes:
     The model is SINGLE-TURN (the SFT corpus is instruction→answer pairs), so
     the prompt is the LAST user message — with any system text and earlier
     user turns prepended as context — wrapped in the markers the model trained
-    on: `\\x01 {instruction} \\n\\x02 `.
+    on: `\\x01{instruction}\\n\\x02`. The bytes are `train.sft.render`'s own
+    prefix, and `tests/test_serve.py` pins the two together: a prompt that adds
+    spaces the training pipeline never wrote makes the model answer a different
+    question (measured 2026-10-20: `"\\x01 Say hello. \\n\\x02 "` emitted a
+    newline and an unrelated sentence where the exact template gave the answer).
     """
     if not isinstance(messages, list) or not messages:
         loud('messages: need a non-empty list of {"role", "content"} objects')
@@ -100,7 +104,7 @@ def assemble(messages: Any) -> bytes:
     if not users:
         loud("messages: no user turn — the model answers an instruction, and there is none")
     instruction = "\n".join([*system, *users[:-1], users[-1]])
-    return bytes([TURN_OPEN]) + b" " + encode(instruction) + b" \n" + bytes([TURN_ANSWER]) + b" "
+    return bytes([TURN_OPEN]) + encode(instruction) + b"\n" + bytes([TURN_ANSWER])
 
 
 def load_checkpoint(
