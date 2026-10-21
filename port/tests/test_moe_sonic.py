@@ -1,8 +1,8 @@
-"""Gates for the SonicMoE analysis and the gather-fused prototype (`model/moe_sonic.py`).
+"""Gates for the SonicMoE analysis, the prototype, and the arm it is wired as.
 
-The module is ANALYSIS + a prototype, not a shipped arm: nothing in `experts.py`
-imports it, and the card is held by the live pretrain, so the split here is
-deliberate and stated per gate.
+**The module is a shipped, config-gated arm since 2026-10-21**
+(`moe_gather = "kernel"`, `experts.SparseMoE._gather_dispatch`). The split here
+is now by WHAT each half can prove, stated per gate.
 
 **Proven on CPU** (every one of these runs in the plain suite):
 
@@ -25,22 +25,37 @@ deliberate and stated per gate.
    exactly `R` token rows are read, and they are exactly the gathered rows;
 7. **the kernel builds for sm_120** — `triton.compile` with an explicit
    `GPUTarget` lowers to cubin on the HOST (ptxas, no device; the precedent is
-   `tests/test_moe_kernel.py::test_the_fused_kernels_compile_for_this_arch`).
+   `tests/test_moe_kernel.py::test_the_fused_kernels_compile_for_this_arch`);
+8. **the WIRING is the module's own reference loop** — `_gather_dispatch` against
+   `_naive_dispatch` on the same routing, forward AND gradients, at fp32 with
+   both Triton calls swapped for `fused_reference` and `combine` for its own
+   torch forward (`_wired_arm`). The **CPU half can only test the index
+   arithmetic** and the graph: the kernel, the shipped adjoint and `combine`'s
+   fused backward are all Triton launches, and a CPU gate that swapped them for
+   torch is measuring the proxies it swapped in;
+9. **the branch, its counters and its refusals** — `moe_gather_forward` /
+   `moe_gather_rows` are counted when the arm runs, a call it cannot serve is
+   COUNTED with the reason (`moe_gather_fallback`) and falls through to
+   `moe_kernel`, and `config.validate` refuses the four combinations the arm has
+   no evidence for (`bf16=false`, `use_byteflow=true`, `moe_topk_mode != "off"`,
+   `factor_qat != "none"`) while `off` stays the default and draws nothing.
 
 **Needs the card** (written, `skipif`'d on the repo's preflight with its reason
 printed, so a reader of a skip line knows what was not measured): the kernel's
 NUMBERS — the fused kernel against `moe_kernels.expert_gemm_glu` on the same
 rows and the same banks, at fp32 and bf16, on both the tight capacity bound and
-the dropless static one. On 2026-10-18 the preflight found the card IDLE (849
-MiB, no `dormouse train` process) and those gates RAN and PASSED rather than
-skipping — `model/moe_sonic.py`'s docstring records the same. No timing gate: a
-one-shot parity call says nothing about speed, and the honest perf question at
-this shape is the tile-utilisation one the module docstring prices
-(`tile_work`), which needs a bench, not a gate.
+the dropless static one — and the WIRED arm against the shipped triton arm
+(logits and gradients, 1e-5, fp32 and bf16). On 2026-10-18 the preflight found
+the card IDLE (849 MiB, no `dormouse train` process) and the prototype's gates
+RAN and PASSED; the wired arm's gate has been written and NOT run (the card was
+held on 2026-10-21), so no number from it exists yet. No timing gate: a one-shot
+parity call says nothing about speed, and the perf question is
+`scripts/bench_gather.py`'s (written, NOT run).
 """
 
 from __future__ import annotations
 
+import dataclasses
 import subprocess
 import tomllib
 from pathlib import Path
@@ -50,7 +65,8 @@ import torch
 import torch.nn.functional as F
 from conftest import tiny_cfg
 
-from dormouse.instrument import Counters
+from dormouse.config import ModelConfig, validate
+from dormouse.instrument import Counters, LoudError
 from dormouse.model import moe_sonic as ms
 from dormouse.model.experts import SparseMoE
 
@@ -156,6 +172,42 @@ def test_the_traffic_table_is_hand_computable():
             f"({100 * table['forward_gather_saving'] / table['forward_total']:.0f}%) "
             f"backward saving={table['backward_gather_saving'] / 2**20:+.0f} MiB "
             f"cache={table['cached_activation'] / 2**20:.0f} MiB"
+        )
+
+
+def test_the_wired_arms_traffic_is_its_own():
+    """What `moe_gather="kernel"` really moves — asserted, not inferred.
+
+    The forward keeps the kernel's saving (`12·R·d` + the gates), the BACKWARD
+    pays the recompute back, and the CACHE is `x`, `toks`, `y`: at k=2 the saved
+    fp32 `x` is exactly the bf16 `xg` in bytes, so the cache saving is the gates
+    alone — the paper's 4.9x belongs to the FUSED design, which needs an adjoint
+    that reads `dout` through the map and does not exist here.
+
+    `gather_pass > shipped_pass` is asserted ON PURPOSE: as wired, the arm is a
+    forward byte win and a PASS byte loss, and a future gather-fused adjoint
+    must change this test when it changes that fact. `scripts/bench_gather.py`
+    times both; this is only arithmetic.
+    """
+    for shape in ms.SHAPES:
+        w = ms.wired_pass_bytes(shape)
+        b = ms.pass_bytes(shape)
+        rows, d = shape.rows, shape.d
+        assert w["gather_forward"] == (
+            w["shipped_forward"] - 12 * rows * d - b["gates_write"] + 4 * rows
+        )
+        assert w["recompute"] == w["shipped_forward"] - b["y_read"] - b["out_write"]
+        assert w["gather_backward"] == w["shipped_backward"] + w["recompute"]
+        assert w["gather_cache"] == b["xg_dt_write"] + 4 * rows + b["y_write"]
+        assert w["gather_pass"] == w["gather_forward"] + w["gather_backward"]
+        assert w["gather_forward"] < w["shipped_forward"], "the forward IS the win"
+        assert w["gather_cache"] < w["shipped_cache"], "the cache falls by the gates"
+        assert w["gather_pass"] > w["shipped_pass"], "the recompute is a whole forward"
+        print(
+            f"[wired traffic] {shape.name}: fwd {w['shipped_forward'] / 2**20:.0f} -> "
+            f"{w['gather_forward'] / 2**20:.0f} MiB, cache "
+            f"{w['shipped_cache'] / 2**20:.0f} -> {w['gather_cache'] / 2**20:.0f} MiB, "
+            f"pass {w['shipped_pass'] / 2**20:.0f} -> {w['gather_pass'] / 2**20:.0f} MiB"
         )
 
 
@@ -542,3 +594,254 @@ def test_the_fused_kernel_takes_the_dropless_static_bound():
     )
     assert torch.equal(tight, wide), "the bound must not change the answer"
     assert _rel(wide, ref) <= 2e-3
+
+
+# --------------------------------------------------------------------------
+# 8-9. the WIRED arm (`moe_gather = "kernel"`): the branch, counters, refusals
+# --------------------------------------------------------------------------
+
+
+def _torch_combine(y, w, owner, rowmap, n, *, ws=None, tiles=None):
+    """`moe_kernels.combine`'s forward in torch — the CPU proxy for its scatter.
+
+    `combine` is a Triton kernel, so a card-less gate substitutes the FORWARD it
+    performs (the same three lines `_Combine.forward` runs) and lets autograd
+    build the previous adjoint. Its fused backward (the `rowmap` path) stays
+    unmeasured here, and `_wired_arm`'s docstring says so.
+    """
+    out = torch.zeros(n, y.shape[1], dtype=torch.float32)
+    out.index_add_(0, owner, y.to(torch.float32) * w.unsqueeze(-1))
+    return out
+
+
+def _wired_arm(monkeypatch) -> None:
+    """Point the arm's three Triton seams at their torch twins, for a CPU gate.
+
+    `_kernel_forward` IS the kernel's forward, `_shipped_forward` IS the
+    grouped adjoint's forward, and `combine` IS the scatter. Substituting all
+    three means what this gate proves is the INDEX ARITHMETIC and the wiring —
+    which rows `toks` names, that `dx` lands on those token rows, that the
+    weights and `offs` line up — and NOT any of the three kernels. The CUDA
+    gate below is the half that measures those.
+    """
+    monkeypatch.setattr(
+        ms,
+        "_kernel_forward",
+        lambda x, toks, gu, uu, gs, us, v, offs, cap=None: ms.fused_reference(
+            x, toks, gu, uu, gs, us, v, offs
+        ),
+    )
+    monkeypatch.setattr(
+        ms,
+        "_shipped_forward",
+        lambda xg, gu, uu, gs, us, v, offs, *, cap, seg, ws: ms.fused_reference(
+            xg, torch.arange(xg.shape[0], dtype=torch.int32), gu, uu, gs, us, v, offs
+        ),
+    )
+    monkeypatch.setattr(mk, "combine", _torch_combine)
+
+
+def test_the_gather_arm_is_the_naive_pass_on_cpu(monkeypatch):
+    """`_gather_dispatch` == `_naive_dispatch`: forward, `dx`, every expert grad.
+
+    One routing feeds both arms, so the only difference is where the A operand
+    comes from. fp32 has no rounding between them, and 1e-5 is two orders above
+    the measured disagreement (1.5e-7) and far BELOW any wiring error: a
+    permuted `toks` moves `dx` by O(1), so this gate cannot pass on a wrong map.
+    It is also the only gradient evidence for the arm that a CPU can produce —
+    `_GatherGlu`'s backward is the shipped adjoint, so its MATH is not what is
+    under test here; the row map is.
+    """
+    if mk is None:
+        pytest.skip("no triton in this build: the shipped grouped GEMM is the adjoint")
+    _wired_arm(monkeypatch)
+    moe, x, weight, index, order, keep, _d = _cpu_setup(bf16=False)
+
+    xg = x.clone().requires_grad_(True)
+    out = moe._gather_dispatch(xg, weight, index, order, keep, Counters())
+    out.float().pow(2).sum().backward()
+    dx = xg.grad.detach().clone()
+    grads = {n: p.grad.detach().clone() for n, p in moe.named_parameters() if p.grad is not None}
+    moe.zero_grad(set_to_none=True)
+
+    xn = x.clone().requires_grad_(True)
+    ref = moe._naive_dispatch(xn, weight, index, order, keep, Counters())
+    ref.float().pow(2).sum().backward()
+    ref_grads = {
+        n: p.grad.detach().clone() for n, p in moe.named_parameters() if p.grad is not None
+    }
+
+    rel_fwd = _rel(out, ref)
+    rel_dx = _rel(dx, xn.grad)
+    assert set(grads) == set(ref_grads) and len(grads) == 20, sorted(grads)
+    rel_max = max(_rel(g, ref_grads[n]) for n, g in grads.items())
+    print(
+        f"[wired arm] rows={int(keep.sum())} E={moe.n_experts} fwd={rel_fwd:.1e} "
+        f"dx={rel_dx:.1e} grads({len(grads)})={rel_max:.1e} bound=1e-5"
+    )
+    assert rel_fwd <= 1e-5, f"forward {rel_fwd:.3e}"
+    assert rel_dx <= 1e-5, f"dx {rel_dx:.3e}"
+    assert rel_max <= 1e-5, f"parameter gradients {rel_max:.3e}"
+
+
+def test_the_gather_counters_prove_the_path_ran(monkeypatch):
+    """`moe_gather_forward` + `moe_gather_rows` are the arm's evidence line.
+
+    ADR-0019's rule for a new arm: a run labelled with it must show that it
+    ran. `_gather_reason` is forced to `None` because this fixture is a CPU one
+    and that gate is the device's — the object under test here is `_dispatch`'s
+    branch (the counters and the routing), not the device check, which the next
+    test pins from the other side.
+    """
+    if mk is None:
+        pytest.skip("no triton in this build")
+    _wired_arm(monkeypatch)
+    moe, x, weight, index, order, keep, _d = _cpu_setup(bf16=False)
+    assert moe.moe_gather == "off", "the fixture must start from the default"
+    moe.moe_gather = "kernel"
+    monkeypatch.setattr(moe, "_gather_reason", lambda x: None)
+    # The counter must be the branch's OWN evidence: a run that counts the arm
+    # and then returns the shipped arm's value is the defect this pins.
+    calls: list[int] = []
+    real = moe._gather_dispatch
+
+    def spy(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(moe, "_gather_dispatch", spy)
+    counters = Counters()
+    out = moe._dispatch(x, weight, index, counters)
+    rows = int(keep.sum())
+    assert calls, "the branch counted the arm but never called it"
+    assert counters["moe_gather_forward"] == 1, dict(counters)
+    assert counters.drain()["moe_gather_rows"] == rows
+    assert "moe_gather_fallback" not in counters
+    rel = _rel(out, moe._naive_dispatch(x, weight, index, order, keep, Counters()))
+    print(f"[counters] forward=1 rows={rows} (R={index.numel()}) rel={rel:.1e}")
+    assert rel <= 1e-5
+
+
+def test_the_gather_arm_is_counted_when_the_kernel_cannot_run():
+    """A CPU call is the COUNTED fallback, never silence and never the arm.
+
+    `moe_gather="kernel"` on a device without the kernel: `moe_gather_fallback`
+    is counted, `counters.why` names the reason, `moe_gather_forward` stays
+    absent, and the run is the arm `moe_kernel` names — which is what makes the
+    counter a statement about THIS call rather than a config echo.
+    """
+    moe, x, weight, index, order, keep, _d = _cpu_setup(bf16=False)
+    moe.moe_gather = "kernel"
+    counters = Counters()
+    out = moe._dispatch(x, weight, index, counters)
+    why = getattr(counters, "why", "")
+    ref = moe._naive_dispatch(x, weight, index, order, keep, Counters())
+    print(f"[counted fallback] fallback={counters['moe_gather_fallback']} why={why!r}")
+    assert counters["moe_gather_fallback"] == 1
+    assert "moe_gather_forward" not in counters
+    assert "cpu" in why and "gather" in why
+    assert torch.equal(out, ref), "the fallback must be the shipped arm's own numbers"
+
+
+@pytest.mark.parametrize(
+    "over,needle",
+    [
+        ({"bf16": False}, "bf16=false"),
+        ({"use_byteflow": True}, "use_byteflow=true"),
+        ({"moe_topk_mode": "entropy"}, "moe_topk_mode='entropy'"),
+        ({"factor_qat": "ternary"}, "factor_qat='ternary'"),
+    ],
+)
+def test_the_gather_route_is_refused_without_its_evidence(over, needle):
+    """The four combinations the arm has no evidence for are LOUD, with escapes.
+
+    Each is a REFUSAL and not a clamp: the arm's forward is gated on the bf16
+    loop-stack route (its launcher's tiles/stages), on the constant width (the
+    ABI is the permute's own `keep`) and on an unquantized bank (the kernel
+    reads `gate_u`/`up_u`/`v` after `factor_qat_project`). The message must
+    name the escape, or it is a wall rather than a gate.
+    """
+    cfg = {"bf16": True}  # the route the arm is gated on; `over` moves ONE thing off it
+    cfg.update(over)
+    with pytest.raises(LoudError) as e:
+        validate(tiny_cfg(moe_gather="kernel", **cfg))
+    msg = str(e.value)
+    print(f"[refusal] {needle}: {msg[:120]}...")
+    assert needle in msg
+    assert "moe_gather='off'" in msg
+
+
+def test_the_gather_arm_is_off_by_default_and_names_only_known_arms():
+    """`off` draws nothing and validates on every tiny fixture; a typo is LOUD.
+
+    The default matters twice: `off` is every number on record, and a field that
+    is on by default would have to be argued from a measurement that does not
+    exist yet (`scripts/bench_gather.py` has not run).
+    """
+    assert ModelConfig().moe_gather == "off"
+    validate(tiny_cfg())
+    for over in ({"moe_gather": "kernel"}, {"moe_gather": "off"}):
+        validate(tiny_cfg(bf16=True, **over))
+    with pytest.raises(LoudError) as e:
+        validate(tiny_cfg(moe_gather="sonic"))
+    assert "moe_gather='sonic'" in str(e.value)
+    print("[default] moe_gather='off'; 'kernel' validates only on the bf16 route")
+
+
+@CUDA
+@pytest.mark.parametrize("bf16", [False, True])
+def test_the_wired_arm_is_the_shipped_triton_arm(bf16):
+    """The arm vs `moe_kernel="triton"`: logits AND gradients, rel <= 1e-5.
+
+    One seed, two modules, one `state_dict` — so the router draws the same
+    `index` and the only difference is the arm. `moe_gather_forward` on the
+    gather side is the evidence the branch ran; without it the comparison would
+    be triton against itself and would pass no matter what.
+
+    At bf16 the only expected difference is WHERE the cast happens:
+    `x[toks].to(dt)` in torch against `.to(y_ptr.dtype)` on the loaded tile,
+    both round-to-nearest. So 1e-5 is what "the same numbers" means here, and a
+    red bf16 line is that cast disagreeing — a finding, not noise.
+    """
+    base = tiny_cfg(
+        n_experts=8,
+        moe_topk=2,
+        rank=8,
+        d_model=64,
+        d_ffn=128,
+        bf16=bf16,
+        moe_kernel="triton",
+        moe_capacity=0.0,
+    )
+    torch.manual_seed(3)
+    shipped = SparseMoE(base, device=DEV)
+    torch.manual_seed(3)
+    gather = SparseMoE(dataclasses.replace(base, moe_gather="kernel"), device=DEV)
+    gather.load_state_dict(shipped.state_dict())
+    x = torch.randn(64, shipped.d, device=DEV)
+
+    def run(moe):
+        xg = x.clone().requires_grad_(True)
+        counters = Counters()
+        out = moe(xg, counters)
+        out.float().pow(2).sum().backward()
+        grads = {
+            n: p.grad.detach().clone() for n, p in moe.named_parameters() if p.grad is not None
+        }
+        return out.detach(), xg.grad.detach(), grads, counters
+
+    ref_out, ref_dx, ref_grads, ref_c = run(shipped)
+    got_out, got_dx, got_grads, got_c = run(gather)
+    assert "moe_gather_forward" not in ref_c
+    assert got_c["moe_gather_forward"] == 1, dict(got_c)
+    assert set(got_grads) == set(ref_grads)
+    rel_out = _rel(got_out, ref_out)
+    rel_dx = _rel(got_dx, ref_dx)
+    rel_max = max(_rel(got_grads[n], ref_grads[n]) for n in ref_grads)
+    print(
+        f"[wired arm on the card] bf16={bf16} out={rel_out:.1e} dx={rel_dx:.1e} "
+        f"grads={rel_max:.1e} rows={int(got_c.drain()['moe_gather_rows'])} bound=1e-5"
+    )
+    assert rel_out <= 1e-5, f"logits {rel_out:.3e}"
+    assert rel_dx <= 1e-5, f"dx {rel_dx:.3e}"
+    assert rel_max <= 1e-5, f"parameter gradients {rel_max:.3e}"

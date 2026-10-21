@@ -95,6 +95,24 @@ Dispatch has TWO arms over ONE permute, and the log line says which ran:
   kept because it is what the padded arm is compared against — the same rows,
   the same capacity rule, the same drop counter.
 
+ONE more switch on the routed pass, OFF by default: **the gather-fused forward**
+(`moe_gather = "kernel"`, `model/moe_sonic.py`, SonicMoE arXiv:2512.14080
+§5.1.1). It is not a fourth `moe_kernel` — it is a second switch on the SAME
+pass, and `moe_kernel` names the arm that runs when it cannot. With it on, the
+grouped GEMM takes the routing's row map (`gather_abi`'s `toks`/`offs`) and reads
+`x`'s rows itself, so the `xg = x[owner].to(dt)` line — an fp32 `index_select`
+plus a bf16 cast, four `[R, d]` transfers where the fused load is one — does not
+exist. The prototype's own analysis priced that as a FORWARD byte win and a
+BACKWARD byte loss (`grad_out` is fp32 while `dy` is bf16); this wiring fuses the
+forward ONLY and recomputes the shipped grouped adjoint on the same rows
+(`moe_sonic._GatherGlu`), so its fwd→bwd cache is `x`, `toks` and `y`, and it
+pays one extra forward per step. `scripts/bench_gather.py` measures both shapes
+and decides; no speed claim exists until it runs. Counters: `moe_gather_forward`
+(calls) and `moe_gather_rows` (rows read through the map) — a run labelled
+`moe_gather="kernel"` without them did not run the arm. A call the kernel cannot
+serve is COUNTED with its reason (`moe_gather_fallback` + `counters.why`) and
+falls through to `moe_kernel`, exactly like the triton arm's own fallback.
+
 ONE more switch on the routed pass, OFF by default: the **adaptive width**
 (`moe_topk_mode`, `model/adaptive_topk.py`, 2026-10-21). `off` is the constant
 `moe_topk` width every number on record runs and the module never calls the
@@ -109,7 +127,8 @@ what makes the average width the compute that actually happens on the ragged
 arms. Counters: `moe_k1`..`moe_k{max}` (per-token histogram, device
 accumulators) and `moe_k_mean_x100` (the mean width × 100, an INT).
 
-All three count: `moe_padded_bmm`, `moe_triton_gemm` or `moe_naive_dispatch`
+All of them count: `moe_padded_bmm`, `moe_triton_gemm`, `moe_gather_forward` or
+`moe_naive_dispatch`
 (with the reason attached to the counter object) on the step's counter line, so
 a reader never has to guess which one produced the loss.
 
@@ -207,6 +226,8 @@ except Exception as exc:  # noqa: BLE001 — the reason is COUNTED by `_dispatch
     _TRITON_WHY: str | None = f"the triton kernels are not importable here: {exc}"
 else:
     _TRITON_WHY = None
+
+from . import moe_sonic  # the gather-fused forward (`moe_gather = "kernel"`)
 
 
 def expert_glu(
@@ -570,6 +591,14 @@ class SparseMoE(nn.Module):
                 )
         self.capacity = cfg.moe_capacity
         self.moe_kernel = cfg.moe_kernel
+        #: The gather-fused FORWARD (`model/moe_sonic.py`, SonicMoE §5.1.1): a
+        #: second switch on the same pass. `moe_kernel` is what runs when this
+        #: arm cannot (`_gather_reason` → COUNTED `moe_gather_fallback`), and
+        #: `config.validate` refuses the combinations the arm has no evidence
+        #: for. The arm's own counters are `moe_gather_forward` (calls) and
+        #: `moe_gather_rows` (rows read through the map) — a log line without
+        #: them did not run the arm it is labelled with.
+        self.moe_gather = cfg.moe_gather
         self.moe_offload = cfg.moe_offload
         #: The compressed-forward sprint's factor quantization (`factor_qat`):
         #: `_banks` applies it to the fp32 stacks before the dt-conversion, and
@@ -1313,9 +1342,29 @@ class SparseMoE(nn.Module):
         # drop-parity test when the tensor stopped being an int). A zero add
         # costs nothing once the drain batches it.
         counters.count("moe_dropped_assignments", dropped)
+        # The gather-fused forward (`moe_gather = "kernel"`) runs BEFORE the
+        # capacity split: it is one kernel for both routes (the cap bounds its
+        # row-block grid, `None` is the dropless static bound), and its ABI is
+        # the permute above. Everything it cannot serve is COUNTED with the
+        # reason and falls through to the `moe_kernel` arms unchanged.
+        gwhy = None
+        if self.moe_gather == "kernel":
+            gwhy = self._gather_reason(x)
+            if gwhy is None:
+                counters.count("moe_gather_forward")
+                counters.count("moe_gather_rows", keep.sum())
+                if self.moe_offload:
+                    # The arm's graph already recomputes its forward in the
+                    # backward (`moe_sonic._GatherGlu`), so `checkpoint`'s host
+                    # parking would buy a third forward and offload `x` for
+                    # nothing. Asked for and not run must be visible (ADR-0019).
+                    counters.count("moe_offload_inert_gather")
+                return self._gather_dispatch(x, weight, index, order, keep, counters)
+            counters.count("moe_gather_fallback")
+            counters.why = f"gather: {gwhy}"  # type: ignore[attr-defined]
         if self.capacity == 0:
             return self._dropless_dispatch(x, weight, index, order, keep, counters)
-        notes = []
+        notes = [] if gwhy is None else [f"gather: {gwhy}"]
         if self.moe_kernel == "triton":
             why = (
                 None
@@ -1400,11 +1449,13 @@ class SparseMoE(nn.Module):
             why = self._triton_reason(x)
         if why is None:
             if self.moe_kernel == "padded":
-                counters.why = (  # type: ignore[attr-defined]
+                prev = getattr(counters, "why", None)
+                note = (
                     "capacity=0: dropless — the padded bank has no cap to size itself "
                     "with, so the grouped GEMM runs (the static row-block bound + the "
                     "kernels' on-device empty-block exit)"
                 )
+                counters.why = f"{prev}; {note}" if prev else note  # type: ignore[attr-defined]
             # The fused backward's own gate (top-k): COUNTED, and `moe_triton_gemm`
             # still counts because the grouped GEMM does run (its previous adjoint
             # is what the fallback selects).
@@ -1424,7 +1475,8 @@ class SparseMoE(nn.Module):
         if self.moe_kernel == "triton":
             counters.count("moe_triton_fallback")
             why = f"triton: {why}"
-        counters.why = why  # type: ignore[attr-defined]
+        prev = getattr(counters, "why", None)
+        counters.why = f"{prev}; {why}" if prev else why  # type: ignore[attr-defined]
         counters.count("moe_naive_dispatch")
         return self._expert_pass(
             lambda: self._naive_dispatch(x, weight, index, order, keep, counters), counters
@@ -1449,6 +1501,36 @@ class SparseMoE(nn.Module):
             return why
         if not x.is_cuda:
             return f"input is on {x.device.type}: the grouped GEMM is the CUDA path"
+        return None
+
+    def _gather_reason(self, x: torch.Tensor) -> str | None:
+        """`None` if the gather-fused forward can run THIS call, else why not.
+
+        COUNTED (`moe_gather_fallback` + the reason on `counters.why`), like the
+        triton arm's own gate: a config asks for an arm, and an arm that cannot
+        serve a call must not vanish. Three things can stop it, and the dtype
+        route is NOT one of them here — `config.validate` already refused
+        `bf16=false`, `use_byteflow=true`, the adaptive width and `factor_qat`,
+        so a `moe_gather="kernel"` run that reached a forward is on the route
+        the parity gates cover.
+
+        What is left is ability: the kernel must be importable (`moe_sonic`'s
+        own guard), the input must be on a CUDA device (`_gather_glu_kernel` is
+        a Triton launch; `_triton_reason`'s device gate, same words), and the
+        expert activation must be `silu` — the kernel has `tl.sigmoid` in
+        registers and the shipped arm refuses the same three activations for the
+        same reason (`_dispatch`'s `expert_act != "silu"` note).
+        """
+        if moe_sonic._TRITON_WHY is not None:
+            return moe_sonic._TRITON_WHY
+        if self.expert_act != "silu":
+            return (
+                f"expert_act={self.expert_act} has no fused kernel "
+                f"(the gather GLU hardcodes silu) — the grouped GEMM / padded "
+                f"torch arm runs instead"
+            )
+        if not x.is_cuda:
+            return f"input is on {x.device.type}: the gather kernel is the CUDA path"
         return None
 
     def _fused_bwd_reason(self, k: int) -> str | None:
@@ -1584,6 +1666,66 @@ class SparseMoE(nn.Module):
         # inside `combine` keeps the kernel's own `w.dtype == torch.float32`
         # assert LOUD: a future caller that hands it a non-fp32 weight still
         # fails instead of being silently coerced.
+        return moe_kernels.combine(
+            y, weight.reshape(-1)[rows].float(), owner, rowmap.view(n, k), n, ws=ws
+        )
+
+    def _gather_dispatch(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        index: torch.Tensor,
+        order: torch.Tensor,
+        keep: torch.Tensor,
+        counters: Counters,
+    ) -> torch.Tensor:
+        """The gather-fused forward: same rows, same scatter, NO gathered copy.
+
+        `_triton_dispatch` with its `xg = x[owner].to(dt)` line deleted. The
+        routing is the permute's own (`gather_abi` turns `order`/`keep` into the
+        `(toks, offs)` pair the kernel takes), the banks are the same
+        `_banks(dt)` stacks, the output goes through the same
+        `moe_kernels.combine`, so the ONLY thing that changed is where the A
+        operand's rows come from: `x[toks[row]]` read inside the kernel, instead
+        of four `[R, d]` transfers (fp32 gather, its cast-read, the bf16 copy,
+        the kernel's read of that copy).
+
+        Everything after the kernel is `_triton_dispatch`'s, deliberately: the
+        weights are applied as fp32 where the padded arm applies them, the
+        `rowmap` is the combine backward's own int32 map, and the workspace is
+        the same grow-only `BwdWorkspace`. A different scatter here would make
+        the parity gate compare two changes at once.
+
+        The FORWARD is the only fused half (`moe_sonic._GatherGlu` recomputes the
+        grouped pass for its backward), so the fwd→bwd cache is `x`, `toks` and
+        `y` — no `xg`, no GLU gates. That is priced by
+        `scripts/bench_gather.py`, not here.
+        """
+        assert moe_kernels is not None, "the gather arm needs the shipped grouped GEMM"
+        n, k = index.shape
+        dt = self._bank_dtype()
+        rows = order[keep]
+        owner = rows // k
+        toks, offs = moe_sonic.gather_abi(index, order, keep, self.n_experts)
+        gate_u, up_u, v, gate_s, up_s = self._banks(dt)
+        cap = None if self.capacity == 0 else self._capacity(n, k)
+        seg = index.reshape(-1)[rows].to(torch.int32)
+        rowmap = torch.full((n * k,), -1, dtype=torch.int32, device=x.device)
+        rowmap[rows] = torch.arange(rows.numel(), dtype=torch.int32, device=x.device)
+        ws = self._bwd_workspace()
+        y = moe_sonic.gather_glu(
+            x,
+            toks,
+            gate_u,
+            up_u,
+            gate_s,
+            up_s,
+            v,
+            offs,
+            cap=cap,
+            seg=seg,
+            ws=ws,
+        )
         return moe_kernels.combine(
             y, weight.reshape(-1)[rows].float(), owner, rowmap.view(n, k), n, ws=ws
         )

@@ -124,6 +124,30 @@ testable and A/B-able (ADR-0017).
       crates/` now matches core, plus 6 path strings in ONE train test that name
       which parameter each assertion is about (a rename fails it loudly) — no
       group is decided from one.
+- [x] P-GATHER. port (Python): the SonicMoE gather arm, wired and gated.
+      `moe_gather="kernel"` (`config.py`: one more switch on the routed pass, refused
+      LOUDLY with `bf16=false`, `use_byteflow=true`, `moe_topk_mode != "off"` and
+      `factor_qat != "none"`). `experts.SparseMoE._gather_dispatch` is
+      `_triton_dispatch` minus its `xg = x[owner].to(dt)` line:
+      `moe_sonic.gather_abi` + `gather_glu`. The prototype has NO adjoint, so
+      `_GatherGlu.backward` re-runs the shipped `expert_gemm_glu` on the same rows and
+      lets its Triton adjoint produce `dxg`; the fwd->bwd cache is `x`, `toks`, `y`,
+      and the arm pays one extra forward per backward. Counters: `moe_gather_forward`,
+      `moe_gather_rows` (+ `moe_gather_fallback` with the reason).
+      Gates: CPU wiring parity vs `_naive_dispatch` (fwd 1.2e-7, dx 2.2e-7, 20 param
+      grads 2.1e-7 at fp32, bound 1e-5; six scratch reverts turned it red — see the
+      lane report), the counters (including a spy that pins the branch CALLS the arm
+      it counts), the counted CPU fallback, and the four `validate` refusals. GPU
+      parity vs the triton arm (logits AND gradients, 1e-5, fp32+bf16) is written and
+      NOT run (the card was held).
+      Bytes from the code's own layout (`moe_sonic.wired_pass_bytes`, asserted by the
+      CPU suite): medium forward 1715 -> 1109 MiB (-35%), cache 382 -> 352, PASS
+      2739 -> 3336 MiB (+22%); b1 forward 2229 -> 1835 MiB (-18%), cache 245 -> 235,
+      PASS 2911 -> 4405 MiB (+51%). The FORWARD is a byte win (the prototype's own
+      finding) and the PASS is a byte LOSS, for a reason the prototype did not price:
+      the recompute is a whole forward (`grad_out` fp32 vs `dy` bf16 is still the
+      second reason). `scripts/bench_gather.py` (both shapes: bytes, ms fwd,
+      ms fwd+bwd, peak GiB, preflight) is written and NOT run. NO SPEED CLAIM EXISTS.
 - [ ] C12. `feat: smoke preset + --smoke`, `docs/README-model.md` (≤60 lines).
 - [x] P-HALT. port (Python): the halt head + the depth-8 path. `port/src/dormouse/
       model/halt.py` — BCE target read from the model's OWN per-iteration CE

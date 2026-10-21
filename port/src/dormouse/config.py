@@ -100,6 +100,13 @@ DEAD_SNAPSHOT_KEYS = {
 #: The `moe_kernel` literals — the expert-pass arms `experts._dispatch` routes
 #: between. One list, read by `validate`: a name that is not here is LOUD.
 MOE_KERNELS = ("padded", "triton", "naive")
+#: The `moe_gather` literals — the gather-fused FORWARD (`model/moe_sonic.py`,
+#: SonicMoE §5.1.1): `off` is today's pass, `kernel` reads the expert rows
+#: THROUGH the permute's row map instead of a materialised `[R, d]` copy. It is
+#: a second switch on the same pass, not a fourth `moe_kernel`: `moe_kernel` is
+#: what runs when the gather arm does not, and `moe_gather` is refused (LOUD)
+#: off the bf16 loop-stack route, with the adaptive width, and with `factor_qat`.
+MOE_GATHERS = ("off", "kernel")
 #: The `share_u_mode` literals — how the routed experts' INPUT basis is shaped
 #: (`experts.py`'s module docstring): `off` is one `U` per expert, `plane` is
 #: one `U` for the bank, `dict` is one dictionary plus a per-expert column
@@ -463,6 +470,20 @@ class ModelConfig:
     #: is LOUD at config load. `triton` falls back COUNTED to `padded` when the
     #: kernel cannot run (no triton import, input not on CUDA) — never silently.
     moe_kernel: str = "padded"
+    #: The gather-fused FORWARD (`model/moe_sonic.py`, SonicMoE arXiv:2512.14080
+    #: §5.1.1): the grouped GEMM takes the routing's ROW MAP (`toks`/`offs` from
+    #: `gather_abi`) instead of a materialised `[R, d]` copy, so the kernel's A
+    #: load is the only read of `x`'s rows. `off` is every number on record.
+    #: `kernel` is a SECOND switch on the same pass — `moe_kernel` names the arm
+    #: that runs when the gather arm cannot (COUNTED with its reason, the same
+    #: way the triton arm falls back). Refused LOUDLY off the route it is gated
+    #: on: `bf16=false`, `use_byteflow=true`, `moe_topk_mode != "off"` (the
+    #: adaptive width moves unused slots to a sentinel expert past the bank) and
+    #: `factor_qat != "none"` (the kernel reads the dequantized `gate_u`/`up_u`/
+    #: `v`). Its BACKWARD is the shipped grouped adjoint, recomputed on the same
+    #: rows — `moe_sonic.gather_glu` says what that costs and why. No speed claim
+    #: exists until `scripts/bench_gather.py` runs.
+    moe_gather: str = "off"
     #: The expert GLU's activation, the 2026-10-16 activation tournament arm
     #: (`docs/research` scan; formula sources named in `experts.expert_glu`):
     #: `silu` = SwiGLU's gate, the control and every number on record;
@@ -1264,6 +1285,59 @@ def validate(model: ModelConfig) -> None:
             f"(model/moe_kernels.py), `naive` the per-expert loop. Escape: name "
             f"one of those, or add the arm before the config can lie about it."
         )
+    if model.moe_gather not in MOE_GATHERS:
+        loud(
+            f"moe_gather={model.moe_gather!r} is not an arm. Known: "
+            f"{list(MOE_GATHERS)} — `off` is today's pass (the permute materializes "
+            f"`xg [R, d]`), `kernel` reads those rows THROUGH the row map "
+            f"(model/moe_sonic.py, SonicMoE §5.1.1). Escape: name one of those."
+        )
+    if model.moe_gather == "kernel":
+        # The three facts the arm's evidence does not cover, each with the code
+        # that makes it true. A combination this arm refuses is not a numeric
+        # impossibility; it is a route nobody has measured, and ADR-0011 says a
+        # route is named before it runs, not after a run is attributed to it.
+        if not model.bf16:
+            loud(
+                "moe_gather='kernel' with bf16=false: the gather arm is wired on the "
+                "bf16 route only. Its launcher uses the bf16 tile set (`moe_sonic."
+                "TILES`) and passes no `num_stages`, where the shipped 4-byte arm "
+                "halves the wide tiles (`moe_kernels.tiles_for`) and passes "
+                "`num_stages=1` (`_launch_stages`) — the recipe it adopted after the "
+                "default set measured 196608 B against this card's 101376 B CTA "
+                "ceiling. An fp32 gather arm would be a tile/stage choice nobody has "
+                "launched. Escape: bf16=true (the b1 and medium route), or "
+                "moe_gather='off' (the fp32 arm keeps the grouped GEMM, which does "
+                "halve)."
+            )
+        if model.use_byteflow:
+            loud(
+                "moe_gather='kernel' with use_byteflow=true: the gather ABI is the loop "
+                "stack's permute over `[tokens, d]` activations, and the channel runs "
+                "that loop over K patch latents (`byteflow.compat_armed`) — an input "
+                "path the prototype's byte arithmetic and its parity gates do not "
+                "cover. Escape: use_byteflow=false, or moe_gather='off'."
+            )
+        if model.moe_topk_mode != "off":
+            loud(
+                f"moe_gather='kernel' with moe_topk_mode={model.moe_topk_mode!r}: the "
+                f"adaptive width masks the raised logits and moves the unused slots to "
+                f"a sentinel expert PAST the bank (`experts._permute`), so a forward's "
+                f"row set is not the constant-width one this ABI was proven on — "
+                f"`gather_abi`'s `offs` is a cumsum of `bincount(kept)` and the kernel "
+                f"grid is `(n_experts, ...)`, i.e. it never sees that sentinel group. "
+                f"Escape: moe_topk_mode='off', or moe_gather='off'."
+            )
+        if model.factor_qat != "none":
+            loud(
+                f"moe_gather='kernel' with factor_qat={model.factor_qat!r}: the kernel "
+                f"reads the DEQUANTIZED bank — `_banks` applies `factor_qat_project` to "
+                f"`gate_u`, `up_u` and `v` before the dtype cast, and those three "
+                f"tensors are what `_gather_glu_kernel` loads — so the arm would ride "
+                f"the quantization rung, whose alpha anneals every step, and no "
+                f"gather-parity gate covers that pair. Escape: factor_qat='none', or "
+                f"moe_gather='off'."
+            )
     if model.expert_act not in EXPERT_ACTS:
         loud(
             f"expert_act={model.expert_act!r} is not an arm. Known: "
