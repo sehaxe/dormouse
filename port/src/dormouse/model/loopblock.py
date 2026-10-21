@@ -249,6 +249,35 @@ class LoopBlock(nn.Module):
         self._per_iter_ce = per_iter
         return out, (None if targets is None else rec), counters
 
+    def _moe_branch(self, normed: torch.Tensor, counters: Counters) -> torch.Tensor:
+        """The MoE write at the SEAM: cast `normed` to the bank dtype ONCE, cast back to fp32.
+
+        The residual stream is fp32 (the fp32-masters policy) and the MoE's
+        INTERIOR is the bank dtype already (the router, the experts and the
+        kernels all compute in `dt`). Handing the fp32 rows straight to
+        `SparseMoE` charged every routed arm a fused-read chain it did not need:
+        an fp32 `index_select` (4·R·d), the cast's fp32 read (4·R·d), the bf16
+        write (2·R·d) and the kernel's bf16 read (2·R·d) — 12·R·d in total.
+        ONE cast here (2·R·d write) makes the gather `x[owner]` alone (2·R·d
+        write + 2·R·d kernel read): 4·R·d = 201 326 592 B (192 MiB) — 8·R·d
+        saved per routed pass, 402 653 184 B (384 MiB) at
+        `medium-b24·s1024`, where R·d = 49 152·1 024 and the old chain was
+        603 979 776 B (576 MiB). Those three numbers are the delta of the
+        CHAIN, not a fraction of its 16·R·d total (which includes the source
+        read both seams pay).
+
+        `dt` is `SparseMoE._bank_dtype()` — `bf16` when `cfg.bf16`, fp32
+        otherwise — and the SHARED expert is covered by the same call:
+        `SparseMoE.forward` hands this `x` to `self.shared` as well. The cast
+        back is the block's contract (the residual write and `w_ffn` are
+        fp32), so callers above see today's dtype. With `bf16=false` both
+        casts are no-ops on the same tensors: the fp32 seam is byte-for-byte
+        the old forward.
+        """
+        dt = self.moe._bank_dtype()
+        x = normed.reshape(-1, self.d)
+        return self.moe(x.to(dt), counters=counters).to(torch.float32)
+
     def _window(
         self,
         h0: torch.Tensor,
@@ -365,7 +394,7 @@ class LoopBlock(nn.Module):
             else:
                 branch = torch.zeros(b * t, d, dtype=torch.float32, device=h0.device)
 
-            ffn = self.moe(normed.reshape(b * t, d), counters=counters) * w_ffn
+            ffn = self._moe_branch(normed, counters) * w_ffn
             y = (attn + branch + ffn).reshape(b, t, d)
 
             if self.loom:

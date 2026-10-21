@@ -532,7 +532,7 @@ class DualLatentGLU(nn.Module):
             # a4.8: the activation feeding the factor matmuls, quantized in the
             # dtype it arrives in (fp32 masters, cast to `dt` after) with an STE.
             x = fake_quant_act(x, self.act_quant, self.act_group)
-        xu = x if dt == torch.float32 else x.to(dt)
+        xu = x if x.dtype == dt else x.to(dt)
         gate_u, up_u = self._bases()
         v = self.v
         if self.factor_qat != "none":
@@ -1014,6 +1014,29 @@ class SparseMoE(nn.Module):
         """The dtype the experts compute in (their own `bf16` switch, not the device's)."""
         return self.experts[0].compute_dtype
 
+    def _gather_rows(self, x: torch.Tensor, owner: torch.Tensor, dt: torch.dtype) -> torch.Tensor:
+        """`x[owner]` in `dt` — one gather copy, and a cast ONLY when one is needed.
+
+        The loop block casts the MoE input to `dt` at its seam
+        (`loopblock.LoopBlock._moe_branch`), so in the model's forward this is
+        the `index_select` alone: 2·R·d written and 2·R·d read by the kernel,
+        instead of the 12·R·d four-transfer chain an fp32 `x` paid (fp32 copy,
+        cast read, bf16 write, kernel read). The dtype is ASSERTED, not
+        coerced: a third dtype means the seam and the bank disagree, and
+        casting it away would hide exactly that in the same numbers.
+
+        `fp32` is the one other accepted input — a direct API caller
+        (`SparseMoE(x_fp32)` without the loop block: every fixture, bench and
+        test) keeps the old fp32 → `dt` cast, deliberate and counted by the
+        caller's own byte model (`moe_sonic.pass_bytes(x_bytes=4)`).
+        """
+        assert x.dtype in (dt, torch.float32), (
+            f"the routed gather expects the seam's {dt} (or fp32 for a direct "
+            f"caller), got {x.dtype}: a third dtype is a wiring error, not a cast"
+        )
+        xg = x[owner]
+        return xg if xg.dtype == dt else xg.to(dt)
+
     def invalidate_banks(self) -> None:
         """Drop the bank cache so the NEXT forward rebuilds it — the opt_graph fix.
 
@@ -1231,7 +1254,7 @@ class SparseMoE(nn.Module):
         # zero row keeps the bank finite, and inf-garbage × 0 is NaN in the
         # backward (the spike measured exactly that — `probe_moe_variants.py`).
         xg = torch.zeros(e * cap, self.d, dtype=dt, device=x.device)
-        xg = xg.index_put((kept_slots,), x[owner].to(dt)).view(e, cap, self.d)
+        xg = xg.index_put((kept_slots,), self._gather_rows(x, owner, dt)).view(e, cap, self.d)
 
         gate_u, up_u, v, gate_s, up_s = self._banks(dt)
         g = torch.bmm(xg, gate_u) * gate_s[:, None, :]
@@ -1620,7 +1643,7 @@ class SparseMoE(nn.Module):
         offs[1:] = torch.cumsum(counts, 0)
         gate_u, up_u, v, gate_s, up_s = self._banks(dt)
         cap = None if dropless else self._capacity(n, k)
-        xg = x[owner].to(dt)
+        xg = self._gather_rows(x, owner, dt)
         if not fused_bwd:
             y = moe_kernels.expert_gemm_glu(
                 xg, gate_u, up_u, gate_s, up_s, v, offs, cap=cap, fused_bwd=False

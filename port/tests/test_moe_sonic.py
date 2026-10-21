@@ -11,10 +11,17 @@ is now by WHAT each half can prove, stated per gate.
    cannot drift from the geometry it prices;
 2. **the traffic table is hand-computable** — every literal in the module
    docstring's table is asserted, plus the two closed forms the fusion turns on
-   (`forward_gather_saving == 12·R·d`, `backward_gather_saving == −2·R·f`);
-3. **the premise of the two-copies claim is measured** — the MoE input really
-   arrives fp32 while the compute dtype is bf16, through a real `DormouseModel`
-   forward (not through a comment);
+   (`forward_gather_saving == 4·R·d` at the bf16 seam, `12·R·d` for the fp32
+   control, `backward_gather_saving == −2·R·f`);
+3. **the premise of the byte table is measured** — the MoE input arrives in
+   the bank dtype at the loop's seam (bf16 when `bf16=true`, fp32 otherwise),
+   through a real `DormouseModel` forward; the fp32 seam remains the priced
+   control (`pass_bytes(x_bytes=4)`, 12·R·d), and the bf16 seam is 4·R·d. The
+   seam's own gates: the bf16 seam is a parity move (measured `max|Δlogit|`
+   printed against one bf16 `eps` × logit scale, with a dtype spy that fails
+   if the cast is removed), `bf16=false` is `torch.equal` to the old branch,
+   the cast happens ONCE (`Tensor.to` meter), the gather casts ZERO times on
+   a bf16 `x` (and asserts a third dtype), and the branch adds no host sync;
 4. **the ABI is the permute the pass already has** — `gather_abi`'s `toks` is
    bit-identical to the `owner` the shipped path gathers `x` with, and its
    `offs` is the same ragged partition the kernels take;
@@ -64,6 +71,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from conftest import tiny_cfg
+from torch.overrides import TorchFunctionMode
 
 from dormouse.config import ModelConfig, validate
 from dormouse.instrument import Counters, LoudError
@@ -112,26 +120,29 @@ def test_the_shape_table_is_the_configs_own():
 def test_the_traffic_table_is_hand_computable():
     """Every byte the module docstring quotes, asserted as a literal.
 
-    The two closed forms are the point of the table: the forward saving is
-    `12·R·d` (four [R,d] transfers of which the fusion keeps one 4-byte read)
-    and the backward saving is exactly `−2·R·f` — NEGATIVE, because a gathered
-    `grad_out` is fp32 and would be read twice where the shipped pass writes a
-    bf16 `dy` once and reads it twice. A future change that makes the backward
-    a win has to change this test, which is what makes the claim falsifiable.
+    The two closed forms are the point of the table: at the bf16 seam the
+    forward saving is `4·R·d` — the `index_select` copy (2·R·d) plus the
+    kernel's read of it (2·R·d) — and the backward saving is exactly
+    `−2·R·f`, NEGATIVE, because a gathered `grad_out` is fp32 and would be
+    read twice where the shipped pass writes a bf16 `dy` once and reads it
+    twice. The fp32 control (`x_bytes=4`) is asserted in the same test: it
+    still prices `12·R·d`, so a re-introduced seam cast moves the bf16 number
+    and fails the `4 * r * d` line instead of drifting the whole table.
     """
     medium, b1 = ms.SHAPES
     m = ms.pass_bytes(medium)
     assert medium.rows == 49_152
-    assert m["x_read"] == 201_326_592  # one [R,d] fp32 read (the source rows)
-    assert m["xg_write"] == 201_326_592  # the fp32 `index_select` result
-    assert m["xg_cast_read"] == 201_326_592  # `.to(dt)`'s read
-    assert m["xg_dt_write"] == 100_663_296  # the bf16 copy
+    assert m["x_read"] == 100_663_296  # one [R,d] bf16 read (the source rows)
+    assert m["xg_write"] == 100_663_296  # the bf16 `index_select` result
+    assert m["xg_cast_read"] == 0, "no cast at the bf16 seam"
+    assert m["xg_dt_write"] == 0, "no bf16 copy at the bf16 seam"
     assert m["xg_read"] == 100_663_296  # `_glu_kernel`'s A load
-    assert m["forward_gather_saving"] == 603_979_776
-    assert m["forward_total"] == 1_798_438_912
+    assert m["forward_gather_saving"] == 201_326_592
+    assert m["forward_total"] == 1_295_122_432
     assert m["y_write"] == m["y_read"] == 268_369_920
     assert m["out_write"] == 268_369_920  # [T,f] fp32
     assert m["banks_read"] == 156_565_504
+    assert m["xg_copy"] == 100_663_296  # the gathered bf16 copy the pass caches
     assert m["cached_activation"] == 400_490_496
     assert m["backward_adjoint_current"] == 1_073_479_680
     assert m["backward_adjoint_fused"] == 1_341_849_600
@@ -139,17 +150,19 @@ def test_the_traffic_table_is_hand_computable():
 
     b = ms.pass_bytes(b1)
     assert b1.rows == 16_384
-    assert b["x_read"] == 134_217_728
-    assert b["xg_dt_write"] == 67_108_864
-    assert b["forward_gather_saving"] == 402_653_184
-    assert b["forward_total"] == 2_336_849_920
-    assert b["banks_read"] == 1_252_655_104  # 54% of the forward: the fine-grained bill
+    assert b["x_read"] == 67_108_864
+    assert b["xg_cast_read"] == b["xg_dt_write"] == 0
+    assert b["forward_gather_saving"] == 134_217_728
+    assert b["forward_total"] == 2_001_305_600
+    assert b["banks_read"] == 1_252_655_104  # 63% of the forward: the fine-grained bill
     assert b["cached_activation"] == 256_540_672
     assert b["backward_gather_saving"] == -178_946_048
 
     for shape, table in ((medium, m), (b1, b)):
         r, d, f = shape.rows, shape.d, shape.f
-        assert table["forward_gather_saving"] == 12 * r * d, "4 transfers, 3 fp32 + 2 bf16, keep 1"
+        assert table["forward_gather_saving"] == 4 * r * d, (
+            "bf16 seam: the copy + the kernel's read"
+        )
         assert table["backward_gather_saving"] == -2 * r * f, "8Rf gathered vs 6Rf copied+read"
         assert table["forward_total"] == sum(
             table[k]
@@ -174,15 +187,32 @@ def test_the_traffic_table_is_hand_computable():
             f"cache={table['cached_activation'] / 2**20:.0f} MiB"
         )
 
+    # The CONTROL: the fp32 seam still prices the old four-transfer chain.
+    # Reverting the seam cast (`X_BYTES = 4`, or a `.to(dt)` back in the
+    # gather) moves the bf16 assertion above to 12·R·d and turns it red.
+    fp32 = ms.pass_bytes(medium, x_bytes=4)
+    assert fp32["xg_cast_read"] == 201_326_592
+    assert fp32["xg_dt_write"] == 100_663_296
+    assert fp32["forward_gather_saving"] == 12 * medium.rows * medium.d == 603_979_776
+    assert fp32["cached_activation"] == m["cached_activation"], (
+        "the gathered bf16 copy is cached under either seam"
+    )
+    print(
+        f"[seam control] fp32 saving={fp32['forward_gather_saving'] / 2**20:.0f} MiB "
+        f"-> bf16 {m['forward_gather_saving'] / 2**20:.0f} MiB "
+        f"(-{8 * medium.rows * medium.d / 2**20:.0f} MiB = 8·R·d)"
+    )
+
 
 def test_the_wired_arms_traffic_is_its_own():
     """What `moe_gather="kernel"` really moves — asserted, not inferred.
 
-    The forward keeps the kernel's saving (`12·R·d` + the gates), the BACKWARD
-    pays the recompute back, and the CACHE is `x`, `toks`, `y`: at k=2 the saved
-    fp32 `x` is exactly the bf16 `xg` in bytes, so the cache saving is the gates
-    alone — the paper's 4.9x belongs to the FUSED design, which needs an adjoint
-    that reads `dout` through the map and does not exist here.
+    The forward keeps the kernel's saving (`4·R·d` at the bf16 seam + the
+    gates), the BACKWARD pays the recompute back, and the CACHE is `x`, `toks`,
+    `y`: at k=2 the cached bf16 `x` (`T·d·2 = R·d`) is half the shipped arm's
+    gathered `xg` (`R·d·2`), so the cache saving is the gates plus `R·d` — the
+    paper's 4.9x belongs to the FUSED design, which needs an adjoint that reads
+    `dout` through the map and does not exist here.
 
     `gather_pass > shipped_pass` is asserted ON PURPOSE: as wired, the arm is a
     forward byte win and a PASS byte loss, and a future gather-fused adjoint
@@ -194,11 +224,18 @@ def test_the_wired_arms_traffic_is_its_own():
         b = ms.pass_bytes(shape)
         rows, d = shape.rows, shape.d
         assert w["gather_forward"] == (
-            w["shipped_forward"] - 12 * rows * d - b["gates_write"] + 4 * rows
+            w["shipped_forward"] - 4 * rows * d - b["gates_write"] + 4 * rows
         )
         assert w["recompute"] == w["shipped_forward"] - b["y_read"] - b["out_write"]
         assert w["gather_backward"] == w["shipped_backward"] + w["recompute"]
-        assert w["gather_cache"] == b["xg_dt_write"] + 4 * rows + b["y_write"]
+        assert w["gather_cache"] == b["x_read"] // shape.topk + 4 * rows + b["y_write"]
+        assert w["gather_cache"] == (
+            w["shipped_cache"]
+            - b["xg_copy"]
+            - b["gates_write"]
+            + b["x_read"] // shape.topk
+            + 4 * rows
+        )
         assert w["gather_pass"] == w["gather_forward"] + w["gather_backward"]
         assert w["gather_forward"] < w["shipped_forward"], "the forward IS the win"
         assert w["gather_cache"] < w["shipped_cache"], "the cache falls by the gates"
@@ -232,14 +269,16 @@ def test_tile_work_is_the_tile_quantization_b1_pays():
     print(f"[tile work] b1 uniform 4x; medium uniform 1x (BLOCK_M={ms.TILES['BLOCK_M']})")
 
 
-def test_the_moe_input_is_fp32_so_the_gather_is_two_copies():
+def test_the_moe_input_arrives_in_the_bank_dtype_at_the_seam():
     """The premise the whole byte table rests on, MEASURED through a real forward.
 
-    `xg = x[owner].to(dt)` (`experts.py:990`) is two materializations only if
-    `x` is not already `dt`. It is not: the MoE input is `nn.RMSNorm`'s output
-    over the fp32 loop state (`loopblock.py:278,130`), in BOTH precision modes.
-    If that ever changes, `X_BYTES` and every number above it change with it —
-    which is why this is a gate and not a sentence in a docstring.
+    `loopblock.LoopBlock._moe_branch` casts `normed` to `SparseMoE._bank_dtype()`
+    ONCE, so `x[owner]` is the gather alone: bf16 at `bf16=true` (one copy +
+    the kernel read = 4·R·d), fp32 at `bf16=false` (the no-op seam, unchanged
+    `torch.equal` forward). If the seam cast is removed, the bf16 branch sees
+    fp32 here and both this test and the `4·R·d` traffic assertion go red —
+    which is why the dtype is measured at the module that receives it, not
+    inferred from the config.
     """
     from dormouse.model import DormouseModel
 
@@ -260,11 +299,14 @@ def test_the_moe_input_is_fp32_so_the_gather_is_two_copies():
         finally:
             SparseMoE.forward = real
         dt = model.loop.moe._bank_dtype()
-        assert seen["dtype"] == torch.float32, (
-            f"bf16={bf16}: the MoE input moved to {seen['dtype']}"
+        want = torch.bfloat16 if bf16 else torch.float32
+        assert seen["dtype"] == want, (
+            f"bf16={bf16}: the MoE input is {seen['dtype']}, not the bank dtype {want}"
         )
-        assert (dt == torch.bfloat16) == bf16
-        print(f"[input dtype] bf16={bf16}: compute {dt}, input {seen['dtype']} -> X_BYTES=4")
+        print(
+            f"[input dtype] bf16={bf16}: compute {dt}, input {seen['dtype']} "
+            f"-> X_BYTES={2 if bf16 else 4}"
+        )
 
 
 # --------------------------------------------------------------------------
@@ -288,6 +330,209 @@ def _cpu_setup(*, bf16: bool = False, capacity: float = 0.0, tokens: int = 32):
     weight = weight / weight.sum(dim=-1, keepdim=True)
     order, keep, dropped = moe._permute(index)
     return moe, x, weight, index, order, keep, dropped
+
+
+# --------------------------------------------------------------------------
+# 3b. the SEAM: one bf16 cast in, one fp32 cast out, and its byte evidence
+# --------------------------------------------------------------------------
+
+
+class _ToCalls(TorchFunctionMode):
+    """Record every `Tensor.to` call as `(source, dtype)` — the seam's cast meter."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[tuple[torch.Tensor, torch.dtype | None]] = []
+
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        kwargs = {} if kwargs is None else kwargs
+        if func is torch.Tensor.to:
+            self.calls.append((args[0], args[1] if len(args) > 1 else kwargs.get("dtype")))
+        return func(*args, **kwargs)
+
+
+class _SyncCalls(TorchFunctionMode):
+    """Name every host-sync torch function (`item`/`cpu`/`tolist`/`numpy`/`bool`)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.names: list[str] = []
+
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        name = getattr(func, "__name__", "")
+        if name in ("item", "cpu", "tolist", "numpy", "__bool__", "__float__"):
+            self.names.append(name)
+        return func(*args, **(kwargs or {}))
+
+
+def _old_seam(self, normed: torch.Tensor, counters: Counters) -> torch.Tensor:
+    """The pre-2026-10-21 branch: hand the fp32 `normed` straight to the MoE."""
+    return self.moe(normed.reshape(-1, self.d), counters=counters)
+
+
+def test_the_bf16_seam_is_a_parity_move_not_a_rewrite(monkeypatch):
+    """Gate (a): the bf16 seam against the fp32 seam on ONE fixed fixture.
+
+    The measured `max|Δ|` is printed, and the bound is one bf16 `eps` times the
+    logit scale — the largest move ONE round-to-nearest can cause, so this is a
+    parity gate, not a bit-identity one. The reason the number comes out at
+    exactly 0 is worth stating: the fp32 seam's first consumer (`mm_mixed` for
+    the router, `DualLatentGLU`/`_gather_rows` for the experts) cast the SAME
+    rows to the SAME bf16, and `round(round(x)) == round(x)`; the seam moved
+    when the rounding happens, not what it rounds to. A future consumer that
+    reads `x` in fp32 (e.g. an activation quantizer before the cast) would
+    still be bounded by `eps · scale` here.
+
+    The loss is measured the same way: the delta is printed and asserted under
+    a bound first measured at 0.0 and set to 1e-5 (two orders above it). The
+    dtype spy is what makes the test red if the seam cast is removed: the
+    comparison would then be fp32-seam vs fp32-seam and would trivially pass.
+    """
+    from dormouse.model import DormouseModel
+    from dormouse.model.loopblock import LoopBlock
+
+    torch.manual_seed(11)
+    model = DormouseModel(tiny_cfg(bf16=True, n_experts=4, moe_topk=2, moe_kernel="naive"))
+    ids = torch.arange(2 * 64, dtype=torch.long).view(2, 64) % 251
+    targets = (ids + 1) % 256
+
+    seen: dict = {}
+    real = SparseMoE.forward
+
+    def spy(self, x, counters=None, _real=real, _seen=seen):
+        _seen["dtype"] = x.dtype
+        return _real(self, x, counters)
+
+    monkeypatch.setattr(SparseMoE, "forward", spy)
+    with torch.no_grad():
+        logits_seam, loss_seam, _ = model(ids, targets)
+    assert seen["dtype"] == torch.bfloat16, "the seam ran without its bank-dtype cast"
+
+    monkeypatch.setattr(LoopBlock, "_moe_branch", _old_seam)
+    with torch.no_grad():
+        logits_fp32, loss_fp32, _ = model(ids, targets)
+
+    delta = float((logits_seam - logits_fp32).abs().max())
+    scale = float(logits_fp32.abs().max())
+    eps = torch.finfo(torch.bfloat16).eps
+    loss_delta = abs(float(loss_seam) - float(loss_fp32))
+    print(
+        f"[seam parity] max|Δlogit|={delta:.3e} bound={eps * scale:.3e} "
+        f"(eps={eps:.3e} x scale={scale:.3f}), |Δloss|={loss_delta:.3e} bound=1e-5"
+    )
+    assert delta <= eps * scale, f"{delta:.3e} exceeds one bf16 step at this scale"
+    assert loss_delta <= 1e-5, f"the loss moved by {loss_delta:.3e}"
+
+
+def test_the_fp32_seam_is_bit_identical(monkeypatch):
+    """Gate (d): `bf16=false` runs the SAME forward the fp32 seam ran.
+
+    Both `_moe_branch` casts are no-ops on existing tensors when `dt` is fp32,
+    so the new branch and `_old_seam` must be `torch.equal` on logits AND loss.
+    Reverting the change by making the seam cast unconditionally to bf16 turns
+    this red (the logits would move and the dtype spy in gate (a) would fail).
+    """
+    from dormouse.model import DormouseModel
+    from dormouse.model.loopblock import LoopBlock
+
+    torch.manual_seed(5)
+    model = DormouseModel(tiny_cfg(bf16=False, n_experts=4, moe_topk=2, moe_kernel="naive"))
+    ids = torch.arange(2 * 64, dtype=torch.long).view(2, 64) % 251
+    targets = (ids + 1) % 256
+    with torch.no_grad():
+        logits_new, loss_new, _ = model(ids, targets)
+    monkeypatch.setattr(LoopBlock, "_moe_branch", _old_seam)
+    with torch.no_grad():
+        logits_old, loss_old, _ = model(ids, targets)
+    assert torch.equal(logits_new, logits_old), "the fp32 seam moved the logits"
+    assert torch.equal(loss_new, loss_old), "the fp32 seam moved the loss"
+    print("[fp32 seam] torch.equal on logits and loss; bf16=false is unchanged")
+
+
+def test_the_seam_casts_once_and_the_gather_does_not():
+    """Gate (e): ONE cast in at the seam, and the routed gather is cast-free.
+
+    The `Tensor.to` meter sees every call, including a no-op `.to(dt)` — which
+    is exactly what a silently re-introduced cast would be on a bf16 `x`. The
+    direct-API control proves the meter can see a cast at all (fp32 in -> one
+    `.to(dt)`), and a third dtype is an ASSERT, not a coercion.
+    """
+    from dormouse.model.loopblock import LoopBlock
+
+    moe, x, _w, _i, order, keep, _d = _cpu_setup(bf16=True)
+    dt = moe._bank_dtype()
+    owner = order[keep] // 2
+    xb = x.to(dt)
+
+    with _ToCalls() as spy:
+        xg = moe._gather_rows(xb, owner, dt)
+    assert xg.dtype == dt
+    assert spy.calls == [], f"the gather cast a bf16 x: {spy.calls}"
+
+    with _ToCalls() as spy:
+        xg = moe._gather_rows(x, owner, dt)  # direct API caller: fp32 in
+    assert len(spy.calls) == 1 and spy.calls[0][1] == dt, spy.calls
+    with pytest.raises(AssertionError):
+        moe._gather_rows(x.half(), owner, dt)
+
+    block = LoopBlock(tiny_cfg(bf16=True, n_experts=4, moe_topk=2, moe_kernel="naive"))
+    normed = torch.randn(2, 64, block.d)
+    with _ToCalls() as spy:
+        out = block._moe_branch(normed, Counters())
+    seam = [c for c in spy.calls if c[0].shape == (2 * 64, block.d) and c[1] == dt]
+    assert len(seam) == 1, f"the seam cast {len(seam)} times, not once: {seam}"
+    assert out.dtype == torch.float32, "the MoE output must be widened before `* w_ffn`"
+    print(f"[seam cast] 1 x .to({dt}) on the [128, {block.d}] input; gather casts 0; out fp32")
+
+
+def test_the_bf16_seam_adds_no_host_sync():
+    """Gate (c): the new branch and the gather call no host-sync torch function.
+
+    A `TorchFunctionMode` names every `item`/`cpu`/`tolist`/`numpy`/`bool`/
+    `__float__` call made inside them; the counters object is device-side and
+    the seam's only Python is a dtype check. (This is a CPU run, so it cannot
+    catch a CUDA implicit sync — the diff is the evidence for that; this gate
+    pins that no EXPLICIT read was added.)
+    """
+    from dormouse.model.loopblock import LoopBlock
+
+    moe, x, _w, index, order, keep, _d = _cpu_setup(bf16=True, capacity=1.0)
+    dt = moe._bank_dtype()
+    xb = x.to(dt)
+    with _SyncCalls() as spy:
+        moe._gather_rows(xb, order[keep] // 2, dt)
+    assert spy.names == [], f"the gather reads the host: {spy.names}"
+
+    block = LoopBlock(tiny_cfg(bf16=True, n_experts=4, moe_topk=2, moe_kernel="naive"))
+    # The naive reference arm lists its kept expert ids on the host
+    # (`torch.unique(...).tolist()`) — pre-existing and not this seam's. Stub
+    # the dispatch so what this gate measures is the seam + routing + shared
+    # expert, not the reference loop's own known sync.
+    block.moe._dispatch = lambda x, w, i, c: torch.zeros(
+        x.shape[0], block.moe.f, dtype=torch.float32
+    )
+    normed = torch.randn(2, 64, block.d)
+    with _SyncCalls() as spy:
+        block._moe_branch(normed, Counters())
+    assert spy.names == [], f"the seam reads the host: {spy.names}"
+    print("[no sync] 0 host-sync torch calls in the seam and the gather")
+
+
+def test_the_bf16_seam_arms_agree():
+    """Gate (f): padded vs naive on the same bf16 rows and banks.
+
+    `_triton_dispatch` is CUDA-only (the card gate below covers it); on CPU the
+    two arms that can run must agree to the file's bf16 bound (2e-3, two
+    rounding orders: batched `bmm` vs per-expert matmul). The max is printed.
+    """
+    moe, x, weight, index, order, keep, _d = _cpu_setup(bf16=True, capacity=1.0)
+    dt = moe._bank_dtype()
+    xb = x.to(dt)
+    ref = moe._naive_dispatch(xb, weight, index, order, keep, Counters())
+    pad = moe._padded_dispatch(xb, weight, index, order, keep)
+    rel = _rel(pad, ref)
+    print(f"[bf16 arms] padded vs naive rows={int(keep.sum())} max_rel={rel:.3e} bound=2e-3")
+    assert rel <= 2e-3, f"{rel:.3e} exceeds the bf16 bound"
 
 
 def test_the_fused_abi_is_the_gather_the_pass_already_does():
@@ -594,6 +839,30 @@ def test_the_fused_kernel_takes_the_dropless_static_bound():
     )
     assert torch.equal(tight, wide), "the bound must not change the answer"
     assert _rel(wide, ref) <= 2e-3
+
+
+@CUDA
+@pytest.mark.parametrize("bf16", [True])
+def test_the_bf16_seam_arms_agree_on_the_card(bf16):
+    """Gate (f) on the card: triton vs padded vs naive on the same bf16 rows.
+
+    One routing, one bank, one `x.to(dt)` — so the only difference is the arm.
+    `moe_capacity = 0.25` gives all three a capacity to work with (the padded
+    arm refuses dropless by design); the DROPS are the same `keep` for all
+    three, which is what makes the comparison a comparison of the arithmetic.
+    """
+    moe, x, weight, index, order, keep, _d = _cuda_setup(bf16=bf16, capacity=0.25)
+    dt = moe._bank_dtype()
+    xb = x.to(dt)
+    ref = moe._naive_dispatch(xb, weight, index, order, keep, Counters())
+    pad = moe._padded_dispatch(xb, weight, index, order, keep)
+    tri = moe._triton_dispatch(xb, weight, index, order, keep)
+    rel_pad, rel_tri = _rel(pad, ref), _rel(tri, ref)
+    print(
+        f"[bf16 seam on the card] bf16={bf16} rows={int(keep.sum())} "
+        f"padded={rel_pad:.3e} triton={rel_tri:.3e} bound=2e-3"
+    )
+    assert rel_pad <= 2e-3 and rel_tri <= 2e-3
 
 
 # --------------------------------------------------------------------------

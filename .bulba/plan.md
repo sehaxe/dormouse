@@ -148,6 +148,24 @@ testable and A/B-able (ADR-0017).
       the recompute is a whole forward (`grad_out` fp32 vs `dy` bf16 is still the
       second reason). `scripts/bench_gather.py` (both shapes: bytes, ms fwd,
       ms fwd+bwd, peak GiB, preflight) is written and NOT run. NO SPEED CLAIM EXISTS.
+- [x] P-MOE-SEAM. port (Python): cast the MoE input at the LOOP SEAM, not in the
+      gather. `loopblock.LoopBlock._moe_branch` casts `normed` to
+      `SparseMoE._bank_dtype()` once and widens the output before `* w_ffn`;
+      `SparseMoE._gather_rows` is `x[owner]` with the cast only for a direct fp32
+      caller (a third dtype asserts). The shipped gather chain moves 12·R·d ->
+      4·R·d (medium 576 -> 192 MiB, −384 MiB/pass; b1 384 -> 128 MiB, −256
+      MiB); `moe_sonic.X_BYTES` 4 -> 2 and `pass_bytes(x_bytes=4)` keeps the fp32
+      seam as the priced control. Gates: max|Δlogit| = 0.0 against one bf16 eps ×
+      logit scale (3.8e-2) and |Δloss| = 0 on the fixed fixture — the seam is
+      idempotent with the cast the MoE already did, and a dtype spy fails if it is
+      removed; `bf16=false` is `torch.equal`; one `.to(dt)` at the seam and zero in
+      the gather (Tensor.to meter); no host sync added; padded vs naive agree at
+      bf16; triton vs both is a CUDA gate written and NOT run. Six scratch reverts
+      turned the named gate red. `scripts/bench_moe_seam.py` prints both seams at
+      medium and b1 and times fwd / fwd+bwd only on a free card — NOT run, NO
+      TIMING EXISTS. Landed 2026-10-21. Supersedes P-GATHER's byte
+      line: medium shipped forward 1715 -> 1235 MiB, shipped pass 2739 -> 2259;
+      wired forward 1235 -> 1013, cache 382 -> 304, pass 2259 -> 2760 MiB.
 - [ ] C12. `feat: smoke preset + --smoke`, `docs/README-model.md` (≤60 lines).
 - [x] P-HALT. port (Python): the halt head + the depth-8 path. `port/src/dormouse/
       model/halt.py` — BCE target read from the model's OWN per-iteration CE

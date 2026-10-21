@@ -30,13 +30,16 @@ program on sm_120 has, and none of which is a measurement of our pass.
 1. `order = argsort(flat_ids)` -> `rows = order[keep]` -> `owner = rows // k`
    (`experts.py:982-983`). This IS the row->token map the fused kernel needs,
    and the pass already builds it — one `int32` cast is the whole ABI delta.
-2. `xg = x[owner].to(dt)` (`experts.py:990`) — THE GATHER. `x` arrives fp32
-   (`nn.RMSNorm`'s output; MEASURED 2026-10-18, see
-   `tests/test_moe_sonic.py::test_the_moe_input_is_fp32_so_the_gather_is_two_copies`)
-   and `dt` is bf16, so this line is a fp32 `index_select` (one [R,d] copy
-   written) followed by a bf16 cast (a second [R,d] copy written), and
-   `_glu_kernel` then loads the bf16 copy (`moe_kernels.py:306`). Four
-   [R,d]-sized transfers where the fused load has one.
+2. `xg = x[owner].to(dt)` (`experts.py:1621`) — THE GATHER. Since the loop's
+   SEAM cast (`loopblock.LoopBlock._moe_branch`, 2026-10-21) `x` arrives in
+   `dt` (bf16), so `SparseMoE._gather_rows` skips the cast and this line is
+   ONE `index_select` (an [R,d] copy written) that `_glu_kernel` reads back
+   (`moe_kernels.py:306`): 4·R·d, the copy plus the kernel's read. The fp32
+   seam paid 12·R·d (fp32 copy, cast read, bf16 write, bf16 read); four
+   [R,d]-sized transfers became two, and the fused load still has one.
+   `pass_bytes(..., x_bytes=4)` prices the fp32 control, which is what
+   `tests/test_moe_sonic.py` uses to prove the number moved because the seam
+   moved.
 3. `y [R,f]` written by the kernel (`moe_kernels.py:351`) and read back by the
    combine (`moe_kernels.py:531`) — the second [R,f]-sized activation, needed
    by the `dw` reduction.
@@ -51,11 +54,11 @@ with `tomllib` and asserts them, so a geometry change fails the table:
 |---|---|---|
 | geometry (E, d, f, r) | 256, 1024, 2730, 64 | 1024, 2048, 5461, 64 |
 | rows R = T·k | 49 152 | 16 384 |
-| the gather, four transfers | 805 306 368 B (768 MiB) | 536 870 912 B (512 MiB) |
-| the same rows, fused (one read) | 201 326 592 B (192 MiB) | 134 217 728 B (128 MiB) |
-| **forward saving** | **603 979 776 B (576 MiB)** | **402 653 184 B (384 MiB)** |
-| share of the forward's HBM bytes | 34% | 17% |
-| forward traffic, all of it | 1 798 438 912 B | 2 336 849 920 B |
+| the gather, three transfers (bf16 seam) | 301 989 888 B (288 MiB) | 201 326 592 B (192 MiB) |
+| the same rows, fused (one read) | 100 663 296 B (96 MiB) | 67 108 864 B (64 MiB) |
+| **forward saving** | **201 326 592 B (192 MiB)** | **134 217 728 B (128 MiB)** |
+| share of the forward's HBM bytes | 16% | 7% |
+| forward traffic, all of it | 1 295 122 432 B | 2 001 305 600 B |
 | fwd->bwd cache | 382 MiB (xg 96, y 256, gates 30) | 245 MiB (xg 64, y 171, gates 10) |
 | fwd->bwd cache, fused + no `y` cache | 78 MiB | 42 MiB |
 | backward, dy copy + 2 reads | 1024 MiB | 683 MiB |
@@ -63,10 +66,13 @@ with `tomllib` and asserts them, so a geometry change fails the table:
 
 Two results that do NOT follow the paper, both from the same two facts — our
 `grad_out` is **fp32** (`_Combine.backward` asserts it, `moe_kernels.py:1080`)
-while our `dy` is bf16, and our `x` is **fp32** while the compute dtype is bf16:
+while our `dy` is bf16, and the MoE's OUTPUT is **fp32** while the routed
+interior is bf16:
 
-* the **forward** fusion is a real byte win: two of the four transfers are
-  copies that exist only because the ABI materializes the permutation;
+* the **forward** fusion is a real byte win, but a smaller one since the loop
+  casts `normed` to the bank dtype at its seam (2026-10-21): the transfer that
+  exists only because the ABI materializes the permutation is 4·R·d, where the
+  fp32 seam paid 12·R·d;
 * the **backward** fusion is a byte LOSS: gathering `dout` inside the `dH`
   kernel means two [R,f] reads at 4 B/element (8Rf) where the shipped pass
   writes 2Rf and reads 2·2Rf (6Rf). The paper's "-2TKd bytes" assumes a bf16
@@ -86,7 +92,7 @@ weight multiply 6.7 ms, the scatter 5.5 ms against a 6.7 ms bmm chain
 (`.bulba/memory.md:312`, 2026-10-15). The research doc's "up to 15-25% step IF
 the pass is unlanded" (`docs/research/2026-10-18-throughput-leftovers.md` §4.2)
 is therefore NOT met. Honest expectation here: **<=1% of the step, most likely
-<0.5%** — the bytes removed are 17% of a forward whose 2 337 MB of traffic runs
+<0.5%** — the bytes removed are 7% of a forward whose 2 001 MB of traffic runs
 inside a measured 16.5 ms (`configs/b1.toml:47`), i.e. at ~32% of this card's
 ~450 GB/s ceiling (the figure `docs/research/2026-10-15-tsct-super-kernel.md:54`
 uses), and part of the bank re-read is served by L2 — so bytes removed do not
@@ -141,9 +147,9 @@ deciding whether to believe a number:
   therefore tests the row map and the wiring, not a new adjoint;
 * the arm is refused (LOUD) off the bf16 loop-stack route, with the adaptive
   width and with `factor_qat` — `config.validate` names each reason;
-* **the two findings stand**: the forward is a byte WIN (two of the four `[R, d]`
-  transfers exist only because the ABI materialises the permutation, and the
-  kernel's cast-on-load removes them) and the backward is a byte LOSS
+* **the two findings stand**: the forward is a byte WIN (the ABI's gathered copy
+  and the kernel's read of it are 4·R·d since the loop's seam cast, 12·R·d on
+  the fp32 control) and the backward is a byte LOSS
   (`grad_out` is fp32 while `dy` is bf16, so gathering it costs two fp32 `[R, f]`
   reads against a bf16 copy that is written once and read twice). **The
   MEASUREMENT decides what ships** — `scripts/bench_gather.py` prices both
@@ -178,14 +184,15 @@ except Exception as exc:  # noqa: BLE001 — the reason is raised by `gather_glu
 else:
     _SHIPPED_WHY = None
 
-#: The dtype the MoE input ARRIVES in. Not a guess: `normed = self.norm(ctx)` is
-#: an `nn.RMSNorm` over the fp32 loop state (`loopblock.py:278,130`), and
-#: `tests/test_moe_sonic.py` measures it through a real `DormouseModel` forward
-#: in both precision modes. It is 4 bytes because of that, and the whole
-#: two-copies claim of the accounting hangs on it.
-X_BYTES = 4
 #: The compute dtype the banks and the kernels use (`bf16 = true`, b1's setting).
 DT_BYTES = 2
+#: The dtype the routed pass's `x` ARRIVES in. It moved 4 -> 2 on 2026-10-21
+#: with the loop's SEAM cast (`loopblock.LoopBlock._moe_branch`): the residual
+#: stream is still fp32, but the MoE branch is handed `dt` once, so the gather
+#: is one `index_select` instead of an fp32 copy plus a cast copy. The model
+#: tests measure it through a real `DormouseModel` forward in both precision
+#: modes; `pass_bytes(..., x_bytes=4)` still prices the fp32-seam control.
+X_BYTES = DT_BYTES
 #: The MoE output / `grad_out` dtype: `SparseMoE.forward` returns fp32 and
 #: `_Combine.backward` asserts fp32 (`moe_kernels.py:1080`).
 GRAD_BYTES = 4
@@ -247,12 +254,13 @@ def pass_bytes(
     rows = shape.rows
     xg = rows * d  # one [R, d] copy, in elements
     y = rows * f
+    cast = x_bytes != dt_bytes  # the fp32 seam's `.to(dt)`; skipped at the bf16 seam
     out = {
         # --- the forward -------------------------------------------------
         "x_read": xg * x_bytes,  # `x[owner]`'s source rows (kept by the fusion)
-        "xg_write": xg * x_bytes,  # the fp32 `index_select` result
-        "xg_cast_read": xg * x_bytes,  # `.to(dt)`'s read
-        "xg_dt_write": xg * dt_bytes,  # the bf16 copy the kernel gets today
+        "xg_write": xg * x_bytes,  # the `index_select` result, in x's dtype
+        "xg_cast_read": xg * x_bytes if cast else 0,  # `.to(dt)`'s read
+        "xg_dt_write": xg * dt_bytes if cast else 0,  # the bf16 copy a cast writes
         "xg_read": xg * dt_bytes,  # `_glu_kernel`'s A load (moe_kernels.py:306)
         "y_write": y * dt_bytes,  # the pass's [R, f] output
         "y_read": y * dt_bytes,  # `combine`'s read of it (`dw`)
@@ -280,8 +288,11 @@ def pass_bytes(
             "gates_write",
         )
     )
-    # The fusion removes the fp32 copy, its cast-read, the bf16 copy and the
-    # kernel's read of that copy; the source read stays.
+    # What the fusion removes: the copy the ABI materializes and the kernel's
+    # read of it, plus the cast pair WHEN there is one. At the bf16 seam that
+    # is 4·R·d (`xg_write` + `xg_read`); at the fp32 control it is 12·R·d
+    # (fp32 copy + cast read + bf16 write + kernel read). The source read
+    # (`x_read`) stays either way.
     out["forward_gather_saving"] = (
         out["xg_write"] + out["xg_cast_read"] + out["xg_dt_write"] + out["xg_read"]
     )
@@ -290,8 +301,11 @@ def pass_bytes(
     # NEGATIVE at these shapes: the fp32 `grad_out` is twice the bf16 `dy` it
     # would replace, and it would be read twice (docstring).
     out["backward_gather_saving"] = out["backward_adjoint_current"] - out["backward_adjoint_fused"]
+    # The gathered bf16 copy the forward keeps for the backward: the cast's
+    # write at the fp32 seam, the `index_select`'s own result at the bf16 one.
+    out["xg_copy"] = xg * dt_bytes
     # What the forward leaves on the device for the backward.
-    out["cached_activation"] = out["xg_dt_write"] + out["y_write"] + out["gates_write"]
+    out["cached_activation"] = out["xg_copy"] + out["y_write"] + out["gates_write"]
     out["routing_metadata"] = rows * 4  # `toks [R] int32` — the fused ABI's own cost
     return out
 
@@ -305,13 +319,14 @@ def wired_pass_bytes(shape: Shape) -> dict[str, int]:
     recomputes the grouped forward (`_shipped_forward`) and `combine` still caches
     `y`. So the keys are:
 
-    * `gather_forward` = `pass_bytes`' forward, minus the four `[R, d]` transfers
-      of `xg = x[owner].to(dt)`, minus the gates (`gpre`, `upre`, `h` — the
-      kernel saves none), plus the `[R]` int32 row map;
-    * `gather_cache` = what the forward leaves for the backward: `x` (the fp32
-      input), `toks`, and `y` (`combine`'s save). At `k = 2` the fp32 `x` is
-      EXACTLY the bf16 `xg` the shipped arm caches in bytes (`T·d·4 == R·d·2`),
-      so the cache saving is the gates alone — the 4.9x/5.8x figure in the module
+    * `gather_forward` = `pass_bytes`' forward, minus the gather's `[R, d]`
+      transfers (`xg_write` + `xg_read` = 4·R·d at the bf16 seam, 12·R·d in
+      the fp32 control), minus the gates (`gpre`, `upre`, `h` — the kernel
+      saves none), plus the `[R]` int32 row map;
+    * `gather_cache` = what the forward leaves for the backward: `x` (the bf16
+      seam input), `toks`, and `y` (`combine`'s save). At `k = 2` the cached
+      `x` is `T·d·2 = R·d` bytes against the shipped `xg`'s `R·d·2`, so the
+      cache saving is the gates plus `R·d` — the 4.9x/5.8x figure in the module
       docstring is the FUSED design's, which needs an adjoint that reads `dout`
       through the map and does not have one here;
     * `gather_backward` = `combine`'s adjoint (unchanged) + the recompute, which
@@ -348,9 +363,13 @@ def wired_pass_bytes(shape: Shape) -> dict[str, int]:
     }
     out["shipped_pass"] = out["shipped_forward"] + out["shipped_backward"]
     out["gather_pass"] = out["gather_forward"] + out["gather_backward"]
-    # The forward saving is the shipped pass's own closed form, and the kernel
-    # save is exact (`gpre`, `upre` fp32 + `h` bf16, `10·R·r`).
-    assert b["forward_gather_saving"] == 12 * rows * shape.d, "4 transfers, 3 fp32 + 2 bf16, keep 1"
+    # The forward saving is the shipped pass's own closed form under the bf16
+    # seam: the `index_select` copy (2·R·d) + the kernel's read of it (2·R·d),
+    # where the fp32 control still prices 12·R·d. This assertion is what fails
+    # if the seam's cast comes back: `pass_bytes(x_bytes=4)` would move it.
+    assert b["forward_gather_saving"] == 4 * rows * shape.d, (
+        "bf16 seam: the index_select copy + the kernel's read"
+    )
     assert gather_forward == (
         out["shipped_forward"]
         - b["forward_gather_saving"]
@@ -358,10 +377,16 @@ def wired_pass_bytes(shape: Shape) -> dict[str, int]:
         + b["routing_metadata"]
     )
     assert b["gates_write"] == rows * shape.rank * (2 * 4 + DT_BYTES)
-    # k=2: the fp32 input IS the bf16 gathered copy in bytes, so the cache's
-    # saving is the gates and nothing else.
-    assert gather_cache == b["xg_dt_write"] + b["routing_metadata"] + b["y_write"]
-    assert out["gather_cache"] == out["shipped_cache"] - b["gates_write"] + b["routing_metadata"]
+    # k=2: the cached bf16 `x` (`T·d·2 = R·d`) is half the shipped arm's
+    # gathered `xg` (`R·d·2`), so the cache saving is the gates plus `R·d`.
+    assert gather_cache == b["x_read"] // shape.topk + b["routing_metadata"] + b["y_write"]
+    assert out["gather_cache"] == (
+        out["shipped_cache"]
+        - b["xg_copy"]
+        - b["gates_write"]
+        + b["x_read"] // shape.topk
+        + b["routing_metadata"]
+    )
     assert out["gather_backward"] - out["shipped_backward"] == recompute
     return out
 
@@ -509,9 +534,10 @@ if triton is not None:
         u_acc = tl.zeros((BLOCK_M, RP), tl.float32)
         for k in range(0, tl.cdiv(D, BLOCK_K)):
             rem = D - k * BLOCK_K
-            # The cast on load is the fp32 input meeting a bf16 dot: `x` is fp32
-            # (`X_BYTES`), the banks are `dt`, and the fused load is where the
-            # conversion now happens instead of in a separate `to(dt)` copy.
+            # The cast on load meets the banks' dtype (`dt`). At the loop's
+            # bf16 seam `x` is already `dt` and this is a no-op; a direct API
+            # caller passing fp32 gets the conversion here instead of in a
+            # separate `to(dt)` copy.
             a = tl.load(xp, mask=m_mask[:, None] & (kk[None, :] < rem), other=0.0).to(
                 y_ptr.dtype.element_ty
             )
