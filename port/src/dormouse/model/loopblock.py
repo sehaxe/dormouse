@@ -62,13 +62,18 @@ loops*, `docs/reviews/mhc-2026-09-30.md` §3.2): the loop carries `K =
 mhc_streams` FULL-width residual lanes across iterations, `H_res` (doubly
 stochastic, Eq. 9's Sinkhorn-Knopp) mixes them, `H_pre` aggregates them into
 the body's input and `H_post` weights the body's output back onto each lane
-(Eq. 3/7/8 — `mhc.py` transcribes the formulas with the burn line citations).
-The readout is the SUM of the lanes (2409.19606 §2.1; the crate's concat is
-its slicing layout, not ours). It replaces the SAME statement as ReZero /
-AttnRes / LOOM, so `config.validate` refuses the pairs. `streams` are
+(Eq. 3/7/8 — `mhc.py` transcribes them and derives the init from
+2409.19606 Eq. 14). The readout is the SUM of the lanes (2409.19606 §2.1; the
+crate's concat is its slicing layout, not ours), scaled by `1/K` because our
+lanes are full-width copies. `H_pre` is applied HERE, inside the loop's
+forward (the crate left it to its caller and never read it; it is 11 % of the
+measured effect, `mhc-2026-09-30.md` §3.3). mHC replaces the SAME statement as
+ReZero / AttnRes / LOOM, so `config.validate` refuses the pairs. `streams` are
 replicated from `h0` and `h_ctx` = lanes + `iter_embed[i]` is the crate's
 `x_l` (`mhc-2026-09-30.md` §3.4), so the A/B against ReZero differs in the
-residual operator and nothing else.
+residual operator and nothing else. At the derived init the body sees the same
+`h_ctx` and the readout is the same `h + y` bit-for-bit (`mhc.py`'s init
+section), which is the arm's A/B gate.
 
 RECURRENT DECODE (`recurrent_step`, the inference twin of the segmented path) —
 `decode.recurrent_decode`'s per-byte step: the same body, over ONE position,
@@ -346,9 +351,10 @@ class LoopBlock(nn.Module):
             counters.count("iter")
             if streams is not None:
                 # x_l = h_ctx: the iteration embedding joins the LANES, and
-                # H_pre (applied by the caller, `mhc.py`) aggregates them into
-                # the body's input — the crate's `h_ctx` (`mhc-2026-09-30.md`
-                # §3.4), with Eq. 3's H_pre moved out of `forward`.
+                # H_pre (applied here, inside this forward — `mhc.py`) aggregates
+                # them into the body's input — the crate's `h_ctx`
+                # (`mhc-2026-09-30.md` §3.4). The crate left H_pre to its
+                # caller; it is 11 % of the effect (`mhc-2026-09-30.md` §3.3).
                 streams = streams + self.iter_embed[i].view(1, 1, 1, d)
                 ctx = self.mhc.pre_mix(streams)
                 counters.count("mhc")
@@ -453,8 +459,13 @@ class LoopBlock(nn.Module):
                 # Eq. 3's residual: H_res x_l + H_postᵀ F(H_pre x_l). The
                 # readout is the SUM of the lanes (2409.19606 §2.1); the crate's
                 # concat is its D/n-slicing layout, not this one (`mhc.py`).
+                # The paper's n lanes are width C and re-sum to D; ours are
+                # width D, so the same sum is divided by n to hand the block a
+                # D-wide state (see `mhc.py`'s layout note; without the 1/n the
+                # final RMSNorm's ε turns the n× state into a 5.7e-4 logit
+                # shift, and the arm's A/B is no longer a clean mechanism test).
                 streams = self.mhc(streams, y)
-                h = streams.sum(dim=-2)
+                h = streams.sum(dim=-2) / self.mhc.n_streams
             else:
                 counters.count("rezero_write")
                 h = ctx + y * self.residual_scale
