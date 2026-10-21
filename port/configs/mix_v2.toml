@@ -1,0 +1,50 @@
+# port mix plan: v2 — mix_big plus the one REAL code slice the box owns.
+#
+# Why the code source moved in: `mix_big.toml` excluded `code` because the 90 GB
+# directory at `aria_data/pretrain/mix/code` is mislabeled junk (spam, web
+# novels, forum dumps — sampled and verified). The 126 MB
+# `data_local/mix/code.bin` is different: it is `codeparrot/codeparrot-clean`
+# (MIT), fetched by `scripts/fetch_mix_sources.py`, and it is real source code.
+# Its ceiling is arithmetic: 126 MB is 0.055% of the mixture, so it can carry a
+# stage weight only because the stage is short; the epoch cap will name it if a
+# run grows past ~4 passes over it.
+#
+# Weights rebalance so each stage still sums to 1.0; `web` gives up the code
+# share, `math` keeps its decay-stage role.
+#
+# The rest of the design notes (shard directories, seeded shuffle, the epoch
+# arithmetic, why `reasoning` stays out) are `mix_big.toml`'s and apply here.
+
+max_epochs = 4.0
+seed = 1
+
+[[stage]]
+until_frac = 0.70
+[stage.weights]
+web = 0.90
+wiki = 0.10
+
+[[stage]]
+until_frac = 0.90
+[stage.weights]
+web = 0.56
+wiki = 0.10
+ruweb = 0.12
+math = 0.16
+code = 0.06
+
+[[stage]]
+until_frac = 1.00
+[stage.weights]
+web = 0.30
+wiki = 0.05
+ruweb = 0.20
+math = 0.35
+code = 0.10
+
+[sources]
+web = "/mnt/e43497ab-0ff2-45b4-b45f-28de3339a53e/aria_data/pretrain/mix/web"
+wiki = "/mnt/e43497ab-0ff2-45b4-b45f-28de3339a53e/aria_data/pretrain/mix/wiki"
+ruweb = "/mnt/e43497ab-0ff2-45b4-b45f-28de3339a53e/aria_data/pretrain/mix/ruweb"
+math = "/mnt/e43497ab-0ff2-45b4-b45f-28de3339a53e/aria_data/pretrain/mix/math"
+code = "/home/sehaxe/dormouse/data_local/mix/code.bin"
