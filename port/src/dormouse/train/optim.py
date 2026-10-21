@@ -64,7 +64,12 @@ The update is `burn-muon-plus`'s, not a re-derivation:
     constant after warmup. Algorithm 1 + Appendix F, transcribed in
     `_sf_batched` / `sf_switch`; the docstring there names the two deliberate
     deviations (our ColRow stays composed; the AdamW half keeps WSD, so this is
-    a HYBRID SF-Muon + WSD-AdamW, not the paper's full-model SF).
+    a HYBRID SF-Muon + WSD-AdamW, not the paper's full-model SF). Its weight
+    decay is `muon_sf_wd`, applied at `Z` (Alg 1 line 17) and REQUIRED > 0
+    (`lambda=0` leaves Lemma 3.1's bounded-diameter lift unmet); the per-step
+    TSCT retraction is `muon_sf_retract` and `true` is refused (S3: the
+    averaged iterate is a convex combination of retracted factors, and the
+    projection step needs a convex set).
 """
 
 from __future__ import annotations
@@ -567,9 +572,12 @@ class Muon(Optimizer):
 
     `variant` (`MUON_VARIANTS`) picks the direction arm and `sf` wraps it in the
     schedule-free averaging — both `off`/`muon` by default. `wd` is the Muon
-    group's OWN weight decay (the papers' `-η·λ·W`), which this port carries at
-    `0.0` on every run: the trainer's `wd` reaches the AdamW half only, so the
-    default path is byte-identical to its history (the SF research doc's S2 gap).
+    group's OWN weight decay (the papers' `-η·λ·W`). The trainer sets it from
+    `muon_sf_wd` **only under `sf`**, where it is applied at the fast iterate
+    `Z` (Alg 1 line 17) and must be > 0; `MixOptimizer` refuses the arm when it
+    is not (Lemma 3.1). With `sf=false` the optimizer is constructed with
+    `wd=0.0` on every run, so the control is byte-identical to its history (the
+    SF research doc's S2 gap is a property of the arm, not of the control).
     """
 
     def __init__(
@@ -1048,6 +1056,7 @@ class MixOptimizer:
         eps: float = 1e-8,
         muon_variant: str = "muon",
         muon_sf: bool = False,
+        muon_sf_wd: float | None = None,
     ) -> None:
         if opt not in ("mix", "adamw"):
             loud(f"opt={opt!r}: known optimizers are 'mix' (default) and 'adamw'")
@@ -1074,6 +1083,21 @@ class MixOptimizer:
                 f"muon_sf=false. (Full schedule-free AdamW is the named follow-up, "
                 f"not this arm.)"
             )
+        # The SF arm's decay at Z is a DIFFERENT quantity from the AdamW half's
+        # `wd` (the SF paper's Lemma 3.1, `docs/research/2026-10-16-sf-muon.md`:
+        # S2), so it has its own value. `None` keeps the pre-key behaviour
+        # (inherit `wd`) for a caller that predates the key; the trainer passes
+        # the config field explicitly.
+        sf_wd = wd if muon_sf_wd is None else muon_sf_wd
+        if muon_sf and sf_wd <= 0:
+            loud(
+                f"muon_sf=true with muon_sf_wd={sf_wd}: arXiv:2605.23061v1 "
+                f"Lemma 3.1 lifts the SF-Spectral bound's bounded-diameter "
+                f"assumption only when the fast iterate Z carries a POSITIVE "
+                f"decay (Alg 1 line 17: `Z <- (1 - lr*wd)*Z - eta_hat*P_hat`). "
+                f"At zero the arm runs outside the published assumption set. "
+                f"Escape: muon_sf_wd>0 (the arm's 0.01), or muon_sf=false."
+            )
         self.muon = (
             Muon(
                 muon_params,
@@ -1087,11 +1111,12 @@ class MixOptimizer:
                 variant=muon_variant,
                 # The Muon group's OWN weight decay (the papers' `-ηλW`): the
                 # `muon` control carries none (today's behaviour, byte-identical),
-                # the SF arm carries the trainer's `wd` because arXiv:2605.23061's
-                # Lemma 3.1 makes decay at Z necessary for long-horizon stability
-                # (the `normuon` arm runs λ=0, the Microsoft repo's own default,
-                # so it stays a one-factor arm against the control).
-                wd=wd if muon_sf else 0.0,
+                # the SF arm carries `muon_sf_wd` at `Z` because
+                # arXiv:2605.23061's Lemma 3.1 makes decay there necessary for
+                # long-horizon stability (the `normuon` arm outside SF still runs
+                # λ=0, the Microsoft repo's own default, so it stays a one-factor
+                # arm against the control).
+                wd=sf_wd if muon_sf else 0.0,
                 sf=muon_sf,
             )
             if muon_params

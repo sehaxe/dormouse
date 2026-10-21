@@ -581,6 +581,7 @@ def train(
         # a resume is refused by `diff_keys`.
         muon_variant=cfg.muon_variant,
         muon_sf=cfg.muon_sf,
+        muon_sf_wd=cfg.muon_sf_wd,
     )
     if cfg.optim_8bit:
         opt.enable_bnb8bit()
@@ -601,8 +602,11 @@ def train(
             "muon_sf: the params hold Y=(1-beta1)Z+beta1 X during every step, X is "
             "what each eval and checkpoint sees, and the Muon-group LR is CONSTANT "
             "after warmup (the AdamW half keeps WSD - the hybrid deviation "
-            "`optim.Muon.sf_switch` documents). A NaN-skipped step advances none of "
-            "Z/X/s."
+            "`optim.Muon.sf_switch` documents). Weight decay is "
+            f"{cfg.muon_sf_wd:g} AT Z (Lemma 3.1 needs wd>0 there; `config.validate` "
+            "refuses 0); the per-step TSCT retraction is OFF "
+            "(muon_sf_retract=false - the only legal setting, S3). A NaN-skipped step "
+            "advances none of Z/X/s."
         )
     tokens_per_step = cfg.batch * cfg.seq_len
     start = 0
@@ -748,8 +752,16 @@ def train(
             # ops read, so it is filled IN PLACE. `group["lr"] = lr` would replace
             # that tensor with a float no replay ever reads again — the silent
             # freeze `dion/cuda_graph.py:70-78` documents. `muon_sf` is refused at
-            # capture (`train/graph.py`), so the Muon group's LR is this value.
+            # capture (`train/graph.py`) and the run falls back to EAGER, but
+            # `set_lr` writes EVERY group, so the Muon group would follow WSD for
+            # the whole run unless the SF LR is written back after it — a silent
+            # non-arm (the 2026-10-21 SF re-run's config carries the battery's
+            # `opt_graph=true`). No capture can read this host float: the refusal
+            # above is the only path an SF run takes.
             graph.set_lr(lr)
+            if opt.muon is not None and cfg.muon_sf:
+                for group in opt.muon.param_groups:
+                    group["lr"] = muon_lr
         else:
             for group in opt.adamw.param_groups:
                 group["lr"] = lr

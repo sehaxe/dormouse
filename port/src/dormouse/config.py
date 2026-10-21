@@ -844,6 +844,30 @@ class TrainConfig:
     #: verdict must read the `X`↔`Y` gap and the LR-schedule-free claim, not the
     #: endpoint alone. `scripts/ab_muon_variants.py` is the driver.
     muon_sf: bool = False
+
+    #: The SF arm's weight decay at the **fast iterate `Z`**, i.e. the
+    #: `Z_{t+1} = (1−ηλ)Z_t − η̂P̂_t` term of arXiv:2605.23061v1 Algorithm 1
+    #: line 17 — NOT at `Y` and NOT the AdamW group's `wd`. `0.01` is the
+    #: port's standing `wd`; the theorem needs only **λ > 0** (Lemma 3.1 is
+    #: what lifts the bounded-diameter assumption the SF-Spectral bound
+    #: otherwise has to make), so a non-positive value is REFUSED under
+    #: `muon_sf=true` rather than run outside the precondition. Inert when
+    #: `muon_sf=false`: the control's Muon group carries `wd=0.0` and the
+    #: state dict does not move.
+    muon_sf_wd: float = 0.01
+
+    #: Whether the per-step TSCT polar retraction runs while `muon_sf` is on.
+    #: **`true` is REFUSED**: the retraction pulls each iterate onto the
+    #: Stiefel manifold, so the averaged iterate `X` is a convex combination
+    #: of retracted iterates and is NOT on it; the SF-Spectral proof's
+    #: projection/Lyapunov step (arXiv:2605.23061v1 §3.1, Thm 2.1) needs a
+    #: CONVEX set, and the closest-point projection onto Stiefel is not one.
+    #: This port also has no `retract_tsct` call site at all (the Rust loop's
+    #: per-step retraction was not ported), so `true` could only be an inert
+    #: knob here — the S3 gap in `docs/research/2026-10-16-sf-muon.md:82-93`.
+    #: The legal setting is therefore `false`, and it is explicit in the run's
+    #: own snapshot rather than a fact a reader has to recover from the loop.
+    muon_sf_retract: bool = False
     #: CUDA-graph capture of the optimizer STAGE (`train/graph.py`): the grad
     #: clip + the mixed step are recorded once after `GRAPH_WARMUP_STEPS` eager
     #: steps and replayed with ONE launch per step afterwards. This is the
@@ -1898,6 +1922,32 @@ def load_run(
             f"there is no Muon group to wrap, so the flag would be inert while the run "
             f"reported it on. Escape: opt='mix', or muon_sf=false. (Full schedule-free "
             f"AdamW is the named follow-up, not this arm.)"
+        )
+    if tcfg.muon_sf and tcfg.muon_sf_wd <= 0:
+        loud(
+            f"muon_sf_wd={tcfg.muon_sf_wd}: the schedule-free arm needs weight decay "
+            f"at the FAST iterate Z, and a non-positive value leaves the theorem's "
+            f"precondition unmet — arXiv:2605.23061v1 Lemma 3.1 is what lifts the "
+            f"bounded-diameter assumption of the SF-Spectral bound "
+            f"(`docs/research/2026-10-16-sf-muon.md:77-81`, S2). The decay is "
+            f"`Z <- (1 - lr*wd)*Z - eta_hat*P_hat` (Alg 1 line 17), so it is NOT the "
+            f"AdamW group's `wd`. Escape: muon_sf_wd>0 (the arm's 0.01), or "
+            f"muon_sf=false."
+        )
+    if tcfg.muon_sf_retract:
+        loud(
+            "muon_sf_retract=true: the per-step TSCT polar retraction cannot run "
+            "under the schedule-free average. The retraction is a closest-point "
+            "projection onto the (NON-CONVEX) Stiefel manifold, while the "
+            "SF-Spectral proof's projection/Lyapunov step "
+            "(arXiv:2605.23061v1 §3.1, Thm 2.1) needs a convex set, and "
+            "X=(1-c)U1+c*U2 of retracted factors has column norms <= 1 with "
+            "equality only when the two agree — so the averaged iterate is not on "
+            "the manifold the factor contract assumes "
+            "(`docs/research/2026-10-16-sf-muon.md:82-93`, S3). This port's loop "
+            "has no `retract_tsct` call site at all, so with muon_sf=false the flag "
+            "would be inert too. Escape: muon_sf_retract=false (the default, and "
+            "the legal arm)."
         )
     if model_overrides:
         import dataclasses as _dc

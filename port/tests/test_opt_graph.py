@@ -146,6 +146,10 @@ def test_the_trainer_refuses_compile_with_the_graph(tmp_path):
 def _mix(**over) -> tuple[nn.Module, MixOptimizer]:
     torch.manual_seed(0)
     model = DormouseModel(tiny_cfg())
+    if over.get("muon_sf"):
+        # The legal arm: the SF group's decay at Z must be > 0 (Lemma 3.1), and
+        # `wd` here is the AdamW half's 0.0, so the SF value is its own key.
+        over.setdefault("muon_sf_wd", 0.01)
     return model, MixOptimizer(model, lr=0.01, wd=0.0, **over)
 
 

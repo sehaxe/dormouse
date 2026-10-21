@@ -326,11 +326,15 @@ class OptimizerGraph:
 
         The groups also get their HOST floats back: the eager path reads `lr` from
         the group dict, and leaving a device tensor there would make the "fallback"
-        a subtly different program from the one it claims to be.
+        a subtly different program from the one it claims to be. A group that
+        does NOT hold a device tensor is left alone — the trainer writes the SF
+        Muon group's constant LR as a host float after `set_lr`, and clobbering
+        it would put the fallback step on the WSD value for one step.
         """
         self.reason = reason
-        for group, _ in self._lr:
-            group["lr"] = self._lr_value
+        for group, tensor in self._lr:
+            if group.get("lr") is tensor:
+                group["lr"] = self._lr_value
         if self.counters is not None:
             self.counters.count("opt_graph_fallback")
             self.counters.why = f"opt_graph: {reason}"  # type: ignore[attr-defined]
