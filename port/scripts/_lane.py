@@ -39,13 +39,17 @@ EVAL = "/home/sehaxe/dormouse/data_local/eval_mix/eval_mix.bin"
 CARD_CEILING_GIB = 2.0
 
 
-def preflight(device: str) -> str | None:
+def preflight(device: str, ceiling_gib: float = CARD_CEILING_GIB) -> str | None:
     """`None` when the card is ours, else the reason to skip.
 
     NO torch CUDA call here, on purpose: `torch.cuda.is_available()` and
     `mem_get_info()` initialise a CUDA context in the PARENT, and `subprocess`
     then forks a child that inherits a context it cannot use. The card is read
     from `nvidia-smi` instead (measured 2026-10-20).
+
+    `ceiling_gib` is a parameter because twelve benchmark scripts need a tighter
+    budget than a trainer (they measure milliseconds, so a card holding 1.5 GiB
+    of desktop already distorts them). One default, one override, no copies.
     """
     if device == "cpu":
         print("[preflight] device=cpu: the card checks do not apply", flush=True)
@@ -69,8 +73,8 @@ def preflight(device: str) -> str | None:
     except ValueError:
         return f"nvidia-smi's memory row is unreadable: {first!r}"
     used = used_mib / 1024
-    if used >= CARD_CEILING_GIB:
-        return f"the card already holds {used:.2f} GiB (the preflight's ceiling is {CARD_CEILING_GIB})"
+    if used >= ceiling_gib:
+        return f"the card already holds {used:.2f} GiB (the preflight's ceiling is {ceiling_gib})"
     print(f"[preflight] no dormouse process; card holds {used:.2f} GiB", flush=True)
     return None
 
@@ -95,11 +99,17 @@ def skip(why: str) -> int:
 
 
 def guard(device: str, *data: str) -> int | None:
-    """The one call a `main` makes: `rc = guard(device) or ...`.
+    """The one call a `main` makes.
 
-    Returns the exit code to return (0) when the run must not proceed, else
-    `None`. Data is checked after the card so the message names the cheaper of
-    the two blockers first.
+    Returns 0 when the run must not proceed (already printed), else `None`:
+
+        rc = guard(args.device)
+        if rc is not None:
+            return rc
+        ... run ...
+
+    NOT `rc = guard(...) or run()`: `guard` returns 0 on a skip, and `0 or run()`
+    would run the measurement anyway. The same trap this module exists to prevent.
     """
     why = preflight(device) or data_missing(*data)
     if why:
@@ -110,7 +120,9 @@ def guard(device: str, *data: str) -> int | None:
 if __name__ == "__main__":  # the smallest thing that fails if this breaks
     assert preflight("cpu") is None, "cpu must never consult the card"
     assert data_missing(CORPUS) is None, f"the corpus is missing: {CORPUS}"
-    assert "missing data file" in (data_missing("/nonexistent.bin") or ""), "a missing path must be named"
+    assert "missing data file" in (data_missing("/nonexistent.bin") or ""), (
+        "a missing path must be named"
+    )
     assert guard("cpu") is None, "the guard must pass on a box that has the data"
     print("lane guard: ok")
     sys.exit(0)
