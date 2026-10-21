@@ -237,6 +237,27 @@ class ModelConfig:
     # --- arms -----------------------------------------------------------
     use_kda: bool = True
     use_tsct: bool = True
+    #: The expert bank's SHARED input basis (owner directive 2026-10-21):
+    #: every ROUTED expert stops owning its `gate_u`/`up_u [d, rank]` and reads
+    #: ONE tensor per site that `SparseMoE` owns (`experts.py`'s module
+    #: docstring). The per-expert specialization left is `s` and `V [rank, f]`,
+    #: so the bank's capacity lives in a shared dictionary of input directions
+    #: instead of E interchangeable copies — the mechanism that can plausibly
+    #: make a rank-2 bank carry anything (rank 16 with a private `U` measured
+    #: +0.136 BPB, and topk-4 over the same weak bank +0.127; `scripts/ab_rank.py`
+    #: measures the shared ladder).
+    #:
+    #: OFF by default, and off is bit-identical: no parameter is created, no RNG
+    #: is drawn and no counter is emitted, so every snapshot on disk and every
+    #: parameter count on record is unchanged. The always-on shared expert is
+    #: NOT bound (it runs at `shared_rank`, a different shape, and E = 1).
+    #:
+    #: REFUSED loudly with `use_tsct = false` (the shared basis is a TSCT factor,
+    #: so there is no basis to share with the projections dense) and with
+    #: `factor_qat != "none"` (the shared basis is not per-expert, so the factor
+    #: rung's per-expert α has nothing to quantize it against — quantizing it
+    #: would need its own gate, and this arm does not ship one).
+    share_u: bool = False
     use_engram: bool = True
     use_attnres: bool = False
     #: LOOM (`2610.01153`, 2026-10-01; scanned in
@@ -993,6 +1014,22 @@ def validate(model: ModelConfig) -> None:
         )
     if model.memglu_c0 <= 0.0:
         loud(f"memglu_c0={model.memglu_c0} must be > 0 (an RMS scale, not a sign)")
+    if model.share_u and not model.use_tsct:
+        loud(
+            "share_u=true with use_tsct=false: the shared basis is a TSCT input "
+            "factor (`u [d, rank]`), and with the projections dense there is no "
+            "factor basis to share — the flag would name a mechanism the model "
+            "does not have. Escape: use_tsct=true, or share_u=false."
+        )
+    if model.share_u and model.factor_qat != "none":
+        loud(
+            f"share_u=true with factor_qat={model.factor_qat!r}: the shared basis is "
+            f"ONE tensor for the whole bank, so the factor rung's per-expert α has "
+            f"nothing to quantize it against — a quantized shared basis needs its "
+            f"own gate (one α over the dictionary) and a banked-vs-standalone test "
+            f"this arm does not ship. Escape: factor_qat=none with share_u=true, or "
+            f"share_u=false with the rung."
+        )
     if model.factor_qat not in FACTOR_QATS:
         loud(
             f"factor_qat={model.factor_qat!r} is not an arm. Known: "
