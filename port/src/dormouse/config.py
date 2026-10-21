@@ -42,36 +42,59 @@ PRESET_DIR = Path(__file__).resolve().parents[2] / "configs"
 #: this exemption while `diff_keys` refused the flip).
 PROGRESS_KEYS = ("steps", "log_every", "ckpt_every", "eval", "eval_every", "json_log")
 
-#: The commit that deleted six of the fields below (`port(cleanup): delete the
-#: six dead config stubs and the `_unsupported` machinery`, 2026-10-17).
+#: The commit that removed the stubs below (`port(cleanup): delete the six dead
+#: config stubs and the `_unsupported` machinery`, 2026-10-17).
 DEAD_SNAPSHOT_COMMIT = "0e7d25a"
 
-#: Snapshot keys that were VALID when their checkpoint was written and were
-#: deleted later, mapped to the commit that deleted each. This is **NOT a
-#: relaxation of the strict schema** — `_known` still refuses every unknown key
-#: LOUDLY, and the preset path never consults this list. It is a DATED COMPAT
-#: LIST: a snapshot is a record of what a run *was*, and every
-#: `checkpoints/*.config.toml` on disk predates these deletions, so refusing
-#: them would make all 24 of them unreadable (resume, eval, decode, serve,
-#: `--init-from`) for keys that reach no code anyway. `from_snapshot` drops them
-#: COUNTED — one printed line naming each key and its commit — while any key NOT
-#: here still refuses. The same idea as `tools/check_doc_refs.py`'s `KNOWN_DEAD`:
-#: a dated record is not a failure.
+#: Snapshot keys that were VALID when their checkpoint was written and are not
+#: fields of this branch's schema: `key -> (commit, default)`, where `commit` is
+#: the commit that removed the key from this branch's schema, or — for a LANE
+#: key — the commit that carries it on the branch this checkout does not have.
 #:
-#: Six come from `DEAD_SNAPSHOT_COMMIT`; `aux_fb_weight` (the future-byte head,
-#: arXiv:2404.19737) is a SEVENTH that the same class of defect left in every
-#: snapshot — it was deleted in `39d0485` (`delete the aux_fb future-byte head —
-#: a TIE`), and a list of six would still refuse all 24 snapshots on that key.
-#: Enumerated by reading every committed snapshot, not by guess:
-#: `checkpoints/**/*.config.toml` carries exactly these seven unknown keys.
+#: This is **NOT a relaxation of the strict schema**: `_known` still refuses
+#: every unknown key LOUDLY, the preset path never consults this list, and a key
+#: that IS a field of the class is left alone even if it is listed here (a dead
+#: entry can never shadow a live field). It is a DATED COMPAT LIST — a snapshot
+#: is a record of what a run *was*, and every `checkpoints/*.config.toml` on disk
+#: predates these removals, so refusing them would make the snapshots unreadable
+#: (resume, eval, decode, serve, `--init-from`) for keys that reach no code
+#: here. The same idea as `tools/check_doc_refs.py`'s `KNOWN_DEAD`: a dated
+#: record is not a failure.
+#:
+#: The drop is VALUE-CHECKED, and that is the mechanism. A key whose snapshot
+#: value equals its recorded `default` is dropped COUNTED (one printed line per
+#: table, naming each key and its commit). A NON-DEFAULT value is a LOUD refusal
+#: naming the key, its value, the default and the escape: the field is gone from
+#: this code, so resuming would silently run a different forward or optimizer
+#: than the checkpoint was trained with — a different model wearing the same
+#: weights. `sw1` is the standing case: a 300 000-step run trained at
+#: `act_quant = "int4"`, so retiring that field must refuse its resume, never
+#: make the run quietly become `none`.
 DEAD_SNAPSHOT_KEYS = {
-    "use_gr": DEAD_SNAPSHOT_COMMIT,
-    "use_mhc": DEAD_SNAPSHOT_COMMIT,
-    "use_mor": DEAD_SNAPSHOT_COMMIT,
-    "use_situ": DEAD_SNAPSHOT_COMMIT,
-    "jepa_weight": DEAD_SNAPSHOT_COMMIT,
-    "stress": DEAD_SNAPSHOT_COMMIT,
-    "aux_fb_weight": "39d0485",
+    # removed by `port(cleanup): delete the six dead config stubs` (0e7d25a):
+    "use_gr": (DEAD_SNAPSHOT_COMMIT, False),
+    # "use_mhc": removed from this list 2026-10-21 — it is a real field again,
+    # and a listed key that is a field is now skipped, not dropped.
+    "use_mor": (DEAD_SNAPSHOT_COMMIT, False),
+    "use_situ": (DEAD_SNAPSHOT_COMMIT, False),
+    "jepa_weight": (DEAD_SNAPSHOT_COMMIT, 0.0),
+    "stress": (DEAD_SNAPSHOT_COMMIT, False),
+    # removed by `delete the aux_fb future-byte head — a TIE` (39d0485):
+    "aux_fb_weight": ("39d0485", 0.0),
+    # LANE keys: live on branches this checkout does not carry, under these SAME
+    # names — so there is nothing to map them onto here. No field on this branch
+    # means the same thing (`bf16` is a storage flag, not `dtype`'s per-device
+    # policy; no `train` field means "one entry per rank"). Both snapshots that
+    # carry them hold the lane's DEFAULT, so the value check drops them today; a
+    # snapshot from a lane run that MOVED one refuses (below) instead of
+    # resuming as a single-process run wearing a DDP snapshot.
+    "dtype": ("315d3d0", "none"),  # the device-policy lane (`train/device.py`)
+    "dist": ("6f75dfa", False),  # the multigpu lane (`train/distributed.py`)
+    "dist_backend": ("6f75dfa", "auto"),
+    "dist_shard": ("6f75dfa", "none"),
+    "dist_reduce": ("6f75dfa", "auto"),
+    "dist_bucket_mb": ("6f75dfa", 0),
+    "dist_capacity": ("6f75dfa", ""),
 }
 
 #: The `moe_kernel` literals — the expert-pass arms `experts._dispatch` routes
@@ -925,10 +948,11 @@ class RunConfig:
         """Inverse of [`snapshot_toml`], strict about unknown keys.
 
         One COUNTED exception: a key in [`DEAD_SNAPSHOT_KEYS`] was valid when
-        the snapshot was written and was deleted later, so it is dropped with a
-        printed line naming the key and its commit rather than refused — every
-        checkpoint on disk predates the deletions. A key that is not on that
-        list still refuses LOUDLY (`_known`).
+        the snapshot was written and is not a field of this branch. It is
+        dropped only when its value IS the recorded default (a drop that changes
+        nothing the run computes); a non-default value is refused LOUDLY rather
+        than dropped, because dropping it would resume a different model. A key
+        that is not on that list still refuses (`_known`).
         """
         try:
             raw = tomllib.loads(text)
@@ -938,12 +962,12 @@ class RunConfig:
             source=raw.get("source", ""),
             model=_from_table(
                 ModelConfig,
-                _drop_dead_snapshot_keys(raw.get("model", {}), "snapshot.model"),
+                _drop_dead_snapshot_keys(ModelConfig, raw.get("model", {}), "snapshot.model"),
                 where="snapshot.model",
             ),
             train=_from_table(
                 TrainConfig,
-                _drop_dead_snapshot_keys(raw.get("train", {}), "snapshot.train"),
+                _drop_dead_snapshot_keys(TrainConfig, raw.get("train", {}), "snapshot.train"),
                 where="snapshot.train",
             ),
         )
@@ -971,31 +995,55 @@ def _from_table(cls: type, table: dict[str, Any], where: str) -> Any:
     return cls(**_known(cls, table, where))
 
 
-def _drop_dead_snapshot_keys(table: dict[str, Any], where: str) -> dict[str, Any]:
-    """Drop [`DEAD_SNAPSHOT_KEYS`] from a snapshot table, COUNTED (ADR-0011/0019).
+def _same_snapshot_value(value: Any, default: Any) -> bool:
+    """Is `value` the recorded default? Type-guarded: `False == 0` in Python,
+    and a snapshot that wrote `0` where the field was a bool is NOT at default."""
+    if isinstance(value, bool) or isinstance(default, bool):
+        return isinstance(value, bool) and isinstance(default, bool) and value == default
+    return value == default
 
-    A snapshot is a record of what a run WAS: these keys were valid when it was
-    written and were deleted later (see [`DEAD_SNAPSHOT_KEYS`]). Dropping them is
-    COUNTED — one printed line naming each key and its commit — because the
-    alternative is refusing every checkpoint written before those commits, which
-    is the whole class of run the snapshot path exists to reopen.
+
+def _drop_dead_snapshot_keys(cls: type, table: dict[str, Any], where: str) -> dict[str, Any]:
+    """Drop dead snapshot keys that sit at their recorded default, COUNTED.
+
+    A snapshot is a record of what a run WAS: a [`DEAD_SNAPSHOT_KEYS`] key was
+    valid when it was written and is not a field of `cls` on this branch. The
+    drop is VALUE-CHECKED — the default is dropped, because nothing the run
+    computed depends on a key that held its default; a non-default is a LOUD
+    refusal, because dropping it would resume a different model or optimizer
+    than the checkpoint was trained with. A key that IS a field of `cls` is
+    never dropped: this list is dated, the schema is live.
 
     This does NOT relax the strict schema: `_known` still refuses any key not on
     the list, LOUDLY, and `parse_preset` never calls this — a preset says what
     will RUN, so a stale key there is exactly the lie the strict check catches.
     """
-    dead = sorted(k for k in table if k in DEAD_SNAPSHOT_KEYS)
+    live = {f.name for f in dataclasses.fields(cls)}
+    dead = sorted(k for k in table if k in DEAD_SNAPSHOT_KEYS and k not in live)
     if not dead:
         return dict(table)
-    named = ", ".join(f"{k} ({DEAD_SNAPSHOT_KEYS[k]})" for k in dead)
+    for key in dead:
+        commit, default = DEAD_SNAPSHOT_KEYS[key]
+        value = table[key]
+        if not _same_snapshot_value(value, default):
+            loud(
+                f"{where}: {key} = {value!r} is a dead snapshot key whose value is "
+                f"NOT its default ({default!r}); the field is not in this code "
+                f"(commit {commit}). Refusing, not dropping: dropping it would run a "
+                f"different model/optimizer than the checkpoint was trained with. "
+                f"Escape: run this checkpoint on the commit that still reads `{key}` "
+                f"(`git log -S'{key}'` names it), or rewrite the snapshot's `{key}` to "
+                f"{default!r} and accept that the run then computes something else."
+            )
+    named = ", ".join(f"{k} ({DEAD_SNAPSHOT_KEYS[k][0]})" for k in dead)
     print(
-        f"config: {where}: dropped {len(dead)} dead snapshot key(s) {named} — valid "
-        f"when the snapshot was written, deleted later (`port(cleanup): delete the "
-        f"dead config stubs`). COUNTED, not silent: a key outside DEAD_SNAPSHOT_KEYS "
-        f"still refuses loudly.",
+        f"config: {where}: dropped {len(dead)} dead snapshot key(s) {named} — each "
+        f"at its recorded default, so the drop changes nothing this run computes. "
+        f"COUNTED, not silent: a key outside DEAD_SNAPSHOT_KEYS still refuses "
+        f"loudly, and a dead key off its default refuses too.",
         file=sys.stderr,
     )
-    return {k: v for k, v in table.items() if k not in DEAD_SNAPSHOT_KEYS}
+    return {k: v for k, v in table.items() if k not in dead}
 
 
 def validate(model: ModelConfig) -> None:

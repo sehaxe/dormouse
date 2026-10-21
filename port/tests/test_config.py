@@ -48,23 +48,34 @@ def test_unknown_key_refuses_and_names_the_escape():
     assert "use_gr" in str(e.value)
 
 
-def test_dead_snapshot_keys_load_counted_and_do_not_reach_the_config(capsys):
-    """(a)+(c) A snapshot written before the deletions still loads, COUNTED.
+def _toml_literal(value):
+    """A TOML scalar for a recorded default, so the fixture cannot drift."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        return f'"{value}"'
+    return repr(value)
 
-    Every `checkpoints/*.config.toml` on disk was written before `0e7d25a`
-    (and `39d0485`) deleted these fields, so refusing them would make every
-    existing checkpoint unreadable (resume, eval, decode, serve, `--init-from`).
-    The compat list drops them with a printed line naming each key and its
-    commit — COUNTED, not silent — and the resolved config must NOT carry them:
-    they are gone, not defaulted back into the schema.
+
+def test_dead_snapshot_keys_load_counted_and_do_not_reach_the_config(capsys):
+    """(a)+(c) A snapshot written before the removals still loads, COUNTED.
+
+    Every `checkpoints/*.config.toml` on disk predates the removals, so refusing
+    these keys would make every existing checkpoint unreadable (resume, eval,
+    decode, serve, `--init-from`). The compat list drops each one WITH ITS
+    RECORDED DEFAULT, with a printed line naming the key and its commit — COUNTED,
+    not silent — and the resolved config must NOT carry it: it is gone, not
+    defaulted back into the schema. Pinned per key, not as a count: the count was
+    the last thing to rot (it was a global 6 while the message is per table).
     """
+    # The list is FLAT (one name, one entry) and the drop is section-agnostic,
+    # so the model table can carry every key at its recorded default; the train
+    # table carries one, which is the per-section COUNTED line.
     text = (
         "[model]\n"
         "d_model = 64\nn_heads = 4\nhead_dim = 16\n"
-        "use_gr = false\nuse_mhc = false\nuse_mor = false\n"
-        "use_situ = false\njepa_weight = 0.0\naux_fb_weight = 0.0\n"
-        "[train]\n"
-        "steps = 3\nstress = false\n"
+        + "".join(f"{k} = {_toml_literal(v)}\n" for k, (_commit, v) in DEAD_SNAPSHOT_KEYS.items())
+        + "[train]\nsteps = 3\nstress = false\n"
     )
     back = RunConfig.from_snapshot(text)
     assert back.model.d_model == 64 and back.train.steps == 3
@@ -72,11 +83,11 @@ def test_dead_snapshot_keys_load_counted_and_do_not_reach_the_config(capsys):
         assert not hasattr(back.model, key)
         assert not hasattr(back.train, key)
     err = capsys.readouterr().err
-    # Two COUNTED lines: the model table carried six of the seven, the train
-    # table carried `stress`.
-    assert "dropped 6 dead snapshot key(s)" in err
+    # One COUNTED line per table, each naming its keys and their commits; the
+    # model table carried every key, the train table carried `stress`.
+    assert f"dropped {len(DEAD_SNAPSHOT_KEYS)} dead snapshot key(s)" in err
     assert "dropped 1 dead snapshot key(s)" in err
-    for key, commit in DEAD_SNAPSHOT_KEYS.items():
+    for key, (commit, _default) in DEAD_SNAPSHOT_KEYS.items():
         assert key in err and commit in err
 
 
@@ -84,9 +95,9 @@ def test_the_dead_list_is_exactly_what_the_committed_snapshots_carry():
     """The list is enumerated from the snapshots, not guessed.
 
     A snapshot that carries an unknown key NOT on the list is still refused, so
-    the list has to cover every key the 24 committed snapshots actually hold —
-    a missing one leaves them all unreadable (this is how `aux_fb_weight`, the
-    seventh, was found: the six-key list still refused all 24 on it).
+    the list must cover every key the on-disk snapshots actually hold — one
+    missing key leaves its run unreadable (that is how `aux_fb_weight` was
+    found: a list without it still refused every snapshot that carried it).
     """
     import dataclasses as _dc
     import glob
@@ -107,6 +118,63 @@ def test_the_dead_list_is_exactly_what_the_committed_snapshots_carry():
                 assert key in known[section] or key in DEAD_SNAPSHOT_KEYS, (
                     f"{path}: {section}.{key} is unknown and not on DEAD_SNAPSHOT_KEYS"
                 )
+
+
+def test_every_snapshot_on_disk_loads():
+    """The compat list exists for exactly this: every snapshot resolves.
+
+    The enumeration above proves every KEY is either a field or on the list; this
+    proves the COMPAT PATH accepts each one — `from_snapshot` is the single seam
+    resume, eval, decode, serve and `--init-from` all cross, so one refusal here
+    breaks every one of them for that run (`mix1` and `sft12` were both refused
+    on `model.dtype` and the six `train.dist_*` before that key existed).
+    """
+    import glob
+
+    snaps = sorted(
+        glob.glob(str(PRESET_DIR.parent / "checkpoints/**/*.config.toml"), recursive=True)
+    )
+    assert snaps, "no committed snapshots found"
+    for path in snaps:
+        back = RunConfig.from_snapshot(open(path).read())
+        assert isinstance(back, RunConfig)
+
+
+def test_a_live_non_default_value_survives_the_value_check(capsys):
+    """`sw1` was trained 300 000 steps at `act_quant = "int4"` — a LIVE field.
+
+    The value check is about DEAD keys only, so a live key is never compared to a
+    default and its value survives unchanged. This is the artifact the check
+    exists for: if `act_quant` were ever retired, this same snapshot must become
+    the refusal below — never a quiet `none`, which is a different forward on the
+    same weights.
+    """
+    sw1 = PRESET_DIR.parent / "checkpoints/sw1/sw1.config.toml"
+    assert sw1.exists(), f"{sw1} missing — the snapshot suite needs checkpoints/"
+    back = RunConfig.from_snapshot(sw1.read_text())
+    assert back.model.act_quant == "int4"
+    assert back.train.steps == 300_000
+    assert "act_quant" not in capsys.readouterr().err
+
+
+def test_a_dead_key_off_its_default_refuses_loudly():
+    """The value check: a dead key is dropped only AT its recorded default.
+
+    `use_gr = true` means the checkpoint ran a mechanism this code does not have.
+    Dropping the key would resume a DIFFERENT model on the same weights, which is
+    the one thing the resume gate exists to refuse, so the snapshot is refused —
+    naming the key, its value, the default, the commit and the escape.
+    """
+    text = "[model]\nd_model = 64\nn_heads = 4\nhead_dim = 16\nuse_gr = true\n"
+    with pytest.raises(LoudError) as e:
+        RunConfig.from_snapshot(text)
+    msg = str(e.value)
+    for piece in ("use_gr", "True", "False", "0e7d25a", "Escape"):
+        assert piece in msg
+    # `False == 0` in Python, so a bool default and an int snapshot value are NOT
+    # the same thing: a `0` where the field was a bool is off the default.
+    with pytest.raises(LoudError):
+        RunConfig.from_snapshot("[train]\nstress = 0\n")
 
 
 def test_snapshot_unknown_key_not_on_the_dead_list_still_refuses():
