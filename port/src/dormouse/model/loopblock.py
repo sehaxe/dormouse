@@ -56,6 +56,20 @@ every number on record keep their meaning. `segment_len=0` does not enter the
 branch at all — the one-shot path is `_window(carry=False)`, the same code with
 the same calls it has always made.
 
+mHC (`use_mhc`, arXiv:2512.24880) is the fourth residual arm, wired at the
+LOOP BOUNDARY by the φ study's placement (2604.21106 §5.2: K=2 lanes *across
+loops*, `docs/reviews/mhc-2026-09-30.md` §3.2): the loop carries `K =
+mhc_streams` FULL-width residual lanes across iterations, `H_res` (doubly
+stochastic, Eq. 9's Sinkhorn-Knopp) mixes them, `H_pre` aggregates them into
+the body's input and `H_post` weights the body's output back onto each lane
+(Eq. 3/7/8 — `mhc.py` transcribes the formulas with the burn line citations).
+The readout is the SUM of the lanes (2409.19606 §2.1; the crate's concat is
+its slicing layout, not ours). It replaces the SAME statement as ReZero /
+AttnRes / LOOM, so `config.validate` refuses the pairs. `streams` are
+replicated from `h0` and `h_ctx` = lanes + `iter_embed[i]` is the crate's
+`x_l` (`mhc-2026-09-30.md` §3.4), so the A/B against ReZero differs in the
+residual operator and nothing else.
+
 RECURRENT DECODE (`recurrent_step`, the inference twin of the segmented path) —
 `decode.recurrent_decode`'s per-byte step: the same body, over ONE position,
 with the same per-iteration KDA state carried across BYTES. It is what makes
@@ -74,6 +88,7 @@ from ..instrument import Counters, loud
 from .engram import Engram, memory_floor_mix
 from .experts import SparseMoE
 from .kda import KDAAttention
+from .mhc import MHCMix
 from .qat_cache import QuantCache
 from .sparse import BlockSparseAttention
 from .tsct import dense_qat_weight, make_projection, mm_mixed
@@ -181,6 +196,13 @@ class LoopBlock(nn.Module):
         self.loom = bool(getattr(cfg, "loom", False))
         self.loom_gate = (
             nn.Parameter(torch.zeros(cfg.max_iter, device=device)) if self.loom else None
+        )
+        # mHC (`2512.24880`, `mhc.py`): K full-width residual lanes across the
+        # loop, K=2 only (the A/B'd configuration — App. A.1 ships 4, our φ
+        # evidence and 2409.19606 Tab. 1's knee are 2). Built only when the flag
+        # is on, so `use_mhc=false` keeps today's parameter tree exactly.
+        self.mhc = (
+            MHCMix(d, cfg.mhc_streams, device=device) if getattr(cfg, "use_mhc", False) else None
         )
 
     def forward(
@@ -308,6 +330,13 @@ class LoopBlock(nn.Module):
         b, t, d = h0.shape
         h = h0
         h0_flat = h0.reshape(b * t, d)
+        # mHC's K lanes (`mhc.py`): replicated from h0 (2409.19606 §2.1), each
+        # the FULL residual width. `None` is the flag-off path, byte-for-byte.
+        streams = (
+            h0.unsqueeze(-2).expand(b, t, self.mhc.n_streams, d)
+            if self.mhc is not None
+            else None
+        )
         out_acc = torch.zeros_like(h0)
         rec = torch.zeros((), dtype=torch.float32, device=h0.device)
         per_iter: list[torch.Tensor] = []
@@ -315,7 +344,16 @@ class LoopBlock(nn.Module):
         new_states: list = []
         for i in range(T):
             counters.count("iter")
-            ctx = h + self.iter_embed[i].view(1, 1, d)
+            if streams is not None:
+                # x_l = h_ctx: the iteration embedding joins the LANES, and
+                # H_pre (applied by the caller, `mhc.py`) aggregates them into
+                # the body's input — the crate's `h_ctx` (`mhc-2026-09-30.md`
+                # §3.4), with Eq. 3's H_pre moved out of `forward`.
+                streams = streams + self.iter_embed[i].view(1, 1, 1, d)
+                ctx = self.mhc.pre_mix(streams)
+                counters.count("mhc")
+            else:
+                ctx = h + self.iter_embed[i].view(1, 1, d)
             normed = self.norm(ctx)
             ctrl = torch.cat([ctx.reshape(b * t, d), h0_flat], dim=-1)
             # MAGMA fix: fp32 masters with fp32 activations would run the slow
@@ -411,6 +449,12 @@ class LoopBlock(nn.Module):
                 counters.count("attnres_write")
                 sources.append(y)
                 h = depth_attend(sources, self.attnres[i], self.eps)
+            elif self.mhc is not None:
+                # Eq. 3's residual: H_res x_l + H_postᵀ F(H_pre x_l). The
+                # readout is the SUM of the lanes (2409.19606 §2.1); the crate's
+                # concat is its D/n-slicing layout, not this one (`mhc.py`).
+                streams = self.mhc(streams, y)
+                h = streams.sum(dim=-2)
             else:
                 counters.count("rezero_write")
                 h = ctx + y * self.residual_scale
