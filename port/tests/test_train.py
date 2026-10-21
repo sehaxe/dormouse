@@ -6,7 +6,7 @@ import math
 
 import pytest
 import torch
-from conftest import BATCH, SEQ, tiny_run
+from conftest import BATCH, SEQ, tiny_cfg, tiny_run
 from torch import nn
 
 from dormouse.instrument import LoudError
@@ -195,3 +195,86 @@ def test_torch_compile_off_by_default(tmp_path, monkeypatch):
     run = tiny_run(tmp_path, steps=1, log_every=1)
     train(DormouseModel(run.model), run, log=lambda *_: None)
     assert calls == []
+
+
+def test_init_from_carries_the_checkpoints_lfb_controller(tmp_path):
+    """`--init-from` must not silently switch the routing controller on.
+
+    The LFB bias is controller state that is NOT a parameter and NOT in the
+    model half (a non-persistent buffer), so no lr freezes it: a cold integrator
+    started over a converged, skewed router winds up. That is the whole
+    `train --init-from mix1` explosion: `train medium`'s preset has
+    `moe_lb_coef=0.01`, the checkpoint trained with 0, and the bias reached
+    ±4.8 in ~480 forwards — with the weights frozen (lr=1e-12) the loss read
+    1.27 -> 1.50 -> 1.1e7 by step 300 (`logs/diag_lr0.log`). The init file's
+    own snapshot is the authority on what the model is; the seam carries its
+    coefficient, LOUD, instead of the preset's.
+    """
+    import dataclasses
+
+    src_dir = tmp_path / "src"
+    src = tiny_run(tmp_path, steps=1, log_every=1, ckpt_every=1, out_dir=str(src_dir))
+    src = dataclasses.replace(src, model=dataclasses.replace(src.model, moe_lb_coef=0.0))
+    train(DormouseModel(src.model), src, log=lambda *_: None)
+    ckpt = src_dir / "t.pt"
+    assert ckpt.is_file() and ckpt.with_suffix(".config.toml").is_file()
+
+    dst_dir = tmp_path / "dst"
+    dst = tiny_run(tmp_path, steps=1, log_every=1, ckpt_every=1, out_dir=str(dst_dir))
+    dst = dataclasses.replace(dst, model=dataclasses.replace(dst.model, moe_lb_coef=0.01))
+    model = DormouseModel(dst.model)
+    lines: list[str] = []
+    train(model, dst, init_from=str(ckpt), log=lines.append)
+
+    moe = next(m for m in model.modules() if hasattr(m, "lfb_bias"))
+    assert moe.lfb_coef == 0.0, (
+        "init-from kept the preset's moe_lb_coef=0.01 over a checkpoint trained "
+        "with the controller off: the bias integrates from zero on a converged "
+        "router and routing collapses"
+    )
+    assert any("moe_lb_coef" in ln for ln in lines), lines
+    assert "moe_lb_coef = 0.0" in (dst_dir / "t.config.toml").read_text()
+
+
+def test_lfb_integrates_without_bound_when_the_load_cannot_change():
+    """The mechanism: the LFB bias is an open-loop integrator once routing is fixed.
+
+    `_lfb_step` moves every expert by `±moe_lb_coef` per routed forward from the
+    CUMULATIVE counts (`model/experts.py`). When the load cannot answer — a
+    converged router under `--init-from`, whose top-k is pinned by weights the
+    bias does not reach until it is several logits tall — the sign never flips
+    and the bias ramps linearly. It is not a parameter and no lr freezes it:
+    the diag4 run (lr=1e-12, weights frozen) measured ±4.8 after ~520 forwards
+    and the loss went 1.27 -> 5.1e6 by step 173; `moe_lb_coef=0` on the same
+    checkpoint and data stayed 1.2-1.5 for all 400 steps (`logs/diag_lr0.log`,
+    forward-only repro). That is why the init seam must carry the checkpoint's
+    coefficient rather than a preset's.
+    """
+    from dormouse.instrument import Counters
+
+    cfg = tiny_cfg(n_experts=8, moe_topk=2, moe_lb_coef=0.05)
+    moe = next(m for m in DormouseModel(cfg).modules() if hasattr(m, "lfb_bias"))
+    # the frozen load: the same two experts every forward, 64 tokens each
+    index = torch.tensor([[0, 1]] * 64)
+    counters = Counters()
+    for _ in range(100):
+        moe._lfb_step(index, counters)
+    b = moe.lfb_bias
+    assert float(b[0]) < -4.0 and float(b[1]) < -4.0, b
+    assert float(b[2:].min()) > 4.0, b
+    assert counters["moe_lfb_updates"] == 100
+
+
+def test_init_controller_is_not_on_the_fresh_path(tmp_path, monkeypatch):
+    """The fix is the init seam only: a FRESH run never reaches it (bit-identity
+    by construction, and the test fails if the call ever moves out of the
+    `init_from` branch)."""
+    from dormouse.train import loop
+
+    def boom(*a, **k):  # pragma: no cover - the assertion is that it never runs
+        raise AssertionError("init_controller ran on a fresh run")
+
+    monkeypatch.setattr(loop, "init_controller", boom)
+    run = tiny_run(tmp_path, steps=3, log_every=1)
+    report = train(DormouseModel(run.model), run, log=lambda *_: None)
+    assert math.isfinite(report["loss"])

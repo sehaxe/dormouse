@@ -16,6 +16,7 @@ carries the BYTE COUNT it scored (`eval_batches × batch × seq_len`, AGENTS
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import time
 from pathlib import Path
@@ -26,6 +27,7 @@ from ..config import PROGRESS_KEYS, RunConfig, TrainConfig
 from ..instrument import Counters, LoudError, StepTimer, loud
 from ..model import kda
 from ..model.engram import (
+    Engram,
     enable_host_tables,
     host_engrams,
     host_state,
@@ -71,6 +73,19 @@ def mtp_field(model: torch.nn.Module) -> str:
     """
     value = getattr(model, "last_mtp", None)
     return "" if value is None else f"mtp={float(value):.4f}"
+
+
+def halt_field(model: torch.nn.Module) -> str:
+    """`halt=<BCE>` — the halt objective's value, on the log cadence.
+
+    The forward leaves the term DETACHED on the model (`last_halt`) and never
+    reads it; this is the one declared read, once per log window (ADR-0018
+    rule 2 — the same shape as `mtp_field`). Empty when the arm never ran
+    (weight 0, a decode forward, a pure eval): a zero would claim a term that
+    was not added.
+    """
+    value = getattr(model, "last_halt", None)
+    return "" if value is None else f"halt={float(value):.4f}"
 
 
 def ckpt_paths(cfg: TrainConfig) -> tuple[Path, Path]:
@@ -250,6 +265,109 @@ def require_ngram(cfg: TrainConfig) -> None:
         f"and use a different network under this step count. Escape: restore the "
         f".ngram, start fresh under a new ckpt_name, or set engram_ram=false."
     )
+
+
+def init_cfg(cfg: TrainConfig, path: Path, sd: dict, model: torch.nn.Module) -> TrainConfig:
+    """The cfg that describes the INIT FILE: its substrate and its sidecar path.
+
+    `load_model_state` reads the substrate from `cfg.engram_ram` and finds the
+    `.ngram` sibling through `cfg.out_dir`/`cfg.ckpt_name`, so an init load
+    cannot use the SFT run's own cfg — that names the sidecar THIS run will
+    write, not the init file's. The substrate is read from the FILE, not from a
+    flag: a host-table checkpoint's model half carries no `engram.tables`
+    (`Engram.to_host` deletes the parameter), which is the file's own statement
+    of where its memory lives.
+
+    The run's `engram_ram` must AGREE with the file's, and a disagreement is
+    LOUD, because the flag decides three things a mismatch would corrupt: the
+    host switch happens BEFORE the optimizer exists (a switch after it leaves
+    the tables in a parameter group that then steps a deleted tensor), the loop
+    steps the tables only when the flag is on, and `save_ckpt` writes the
+    `.ngram` only when it is on.
+    """
+    tables_in_file = any(k.endswith("engram.tables") for k in sd)
+    has_engram = any(isinstance(m, Engram) for m in model.modules())
+    host = has_engram and not tables_in_file
+    if host and not cfg.engram_ram:
+        loud(
+            f"init-from: {path}'s model half carries no `engram.tables`: it "
+            f"is a host-table run (its rows are the sibling `{path.stem}.ngram`), "
+            f"or it is not this model's checkpoint at all. This run is configured "
+            f"engram_ram=false, so the memory could not be loaded: a host-table "
+            f"load switches the model to host tables after the optimizer exists, "
+            f"and the run would read a memory it never steps and never saves. "
+            f"Escape: --set engram_ram=true (the pretrain's substrate), or an init "
+            f"checkpoint whose model half carries the tables."
+        )
+    if tables_in_file and cfg.engram_ram:
+        loud(
+            f"init-from: {path} carries its Engram in the model half "
+            f"(`engram.tables`) but this run is configured engram_ram=true. "
+            f"Switching to host tables would DROP the checkpoint's memory — the "
+            f"host path starts from the model's own rows and this run's `.ngram` "
+            f"sibling does not exist yet. Escape: --set engram_ram=false, or "
+            f"re-save the init as a host-table run (with its `.ngram` sibling)."
+        )
+    return dataclasses.replace(cfg, engram_ram=host, out_dir=str(path.parent), ckpt_name=path.stem)
+
+
+def init_controller(run: RunConfig, model: torch.nn.Module, path: Path, *, log=print) -> RunConfig:
+    """`--init-from` carries the checkpoint's LFB coefficient, LOUD.
+
+    The LFB bias is routing-CONTROLLER state: `SparseMoE.forward` adds it to the
+    router logits unconditionally and `_lfb_step` moves it by `±moe_lb_coef` per
+    routed forward from the CUMULATIVE counts. It is neither a parameter nor part
+    of the model half (`lfb_bias` is a non-persistent buffer), so **no learning
+    rate freezes it** — the reason an `lr=1e-12` run still degrades. A cold
+    integrator started over a converged router has no feedback: the top-k is
+    pinned by weights the bias does not reach until it is several logits tall,
+    the sign never flips, and the bias ramps linearly. Measured on this seam
+    (mix1 + `train medium`'s `moe_lb_coef=0.01`, weights frozen): ±4.8 after
+    ~480 forwards, routing onto experts the model never selects, loss
+    1.275 → 1.500 → 11 425 785 by step 300 (`logs/diag_lr0.log`). The same
+    stream with `moe_lb_coef=0` reads 1.21-1.49 for all 400 steps.
+
+    `--init-from` deliberately has no config-drift gate (that is `resume`'s job;
+    the QAT seam exists to change the forward), so before this the PRESET's
+    coefficient silently decided the controller — `train medium` says 0.01
+    while mix1 trained at 0. The init file's snapshot is the authority, as it is
+    for the engram substrate: carry its coefficient, LOUD. A checkpoint with no
+    snapshot cannot say what controller it trained with, so a run asking for a
+    live one is refused rather than ramped over a converged router;
+    `moe_lb_coef=0` is the escape (a controller that never moves the bias).
+    """
+    snap = path.with_suffix(".config.toml")
+    if not snap.is_file():
+        if run.model.moe_lb_coef != 0.0:
+            loud(
+                f"init-from: {path} has no {snap.name} snapshot, so the LFB "
+                f"coefficient it trained with is unknown, and this run has "
+                f"moe_lb_coef={run.model.moe_lb_coef:g}. The bias is controller state "
+                f"(not a parameter, not in the model half), so no lr freezes it: a "
+                f"cold integrator over a converged router winds up (measured: loss "
+                f"1.275 -> 11 425 785 by step 300 with the weights frozen). Escape: "
+                f"--set moe_lb_coef=0 leaves the routing exactly the checkpoint's, or "
+                f"use an init checkpoint that carries its snapshot."
+            )
+        return run
+    stored = RunConfig.from_snapshot(snap.read_text())
+    coef = float(stored.model.moe_lb_coef)
+    if coef == float(run.model.moe_lb_coef):
+        return run
+    log(
+        f"init: moe_lb_coef {run.model.moe_lb_coef:g} -> {coef:g} from {snap.name} — "
+        f"the LFB bias is routing-controller state that is not a parameter and not "
+        f"in the model half, so a cold integrator over this checkpoint's router "
+        f"winds up (measured loss 1.275 -> 11 425 785 by step 300 with the weights "
+        f"frozen). The checkpoint's own recipe decides it."
+    )
+    model_cfg = dataclasses.replace(run.model, moe_lb_coef=coef)
+    for m in model.modules():
+        if hasattr(m, "lfb_coef"):
+            m.lfb_coef = coef
+    if hasattr(model, "cfg"):
+        model.cfg = model_cfg
+    return dataclasses.replace(run, model=model_cfg)
 
 
 def load_model_state(model: torch.nn.Module, cfg: TrainConfig, sd: dict, *, strict: bool = True):
@@ -479,6 +597,7 @@ def train(
     stream: ByteStream | None = None,
     eval_stream: ByteStream | None = None,
     resume: bool = False,
+    init_from: str | None = None,
     log=print,
     device: torch.device | str | None = None,
 ) -> dict:
@@ -610,7 +729,36 @@ def train(
         )
     tokens_per_step = cfg.batch * cfg.seq_len
     start = 0
-    if resume:
+    if init_from is not None:
+        # Fine-tune init: WEIGHTS from a foreign checkpoint, no config gate and no
+        # optimizer state. The deliberate difference from `resume`, and the reason
+        # this exists: a resume must prove the config did not move (ADR-0021), so
+        # it cannot express "same weights, different forward" — which is exactly
+        # what a QAT-finish is (`factor_qat=none` bf16 checkpoint -> ternary
+        # forward). Weights leave their recorded context, so it is LOUD.
+        if resume:
+            loud(
+                "train: --init-from and --resume together name two different sources "
+                "of weights. Escape: --init-from to seed a new run from a foreign "
+                "checkpoint (fresh optimizer, fresh snapshot), or --resume to continue "
+                "THIS run."
+            )
+        path = Path(init_from)
+        if not path.is_file():
+            loud(f"train --init-from: {path} does not exist. Escape: the .pt of the run you mean.")
+        foreign = torch.load(path, map_location="cpu", weights_only=False)
+        sd = unpack_state_dict(foreign.get("model", foreign), foreign.get("model_quant_rung"))
+        # The ONE loader: an `engram_ram` checkpoint has no `engram.tables` in the
+        # model half and needs its `.ngram` sibling, which `load_model_state`
+        # restores (a missing sibling is its LOUD refusal, never fresh rows).
+        load_model_state(model, init_cfg(cfg, path, sd, model), sd)
+        run = init_controller(run, model, path, log=log)
+        log(
+            f"init: weights from {path} (step {foreign.get('step', '?')}), "
+            "fresh optimizer and snapshot — the forward may differ from the one "
+            "that trained them (this is the QAT-finish seam)"
+        )
+    elif resume:
         ck, _stored = load_ckpt(run)
         load_model_state(model, cfg, ck["model"])
         opt.load_state_dict(ck["opt"])
@@ -897,6 +1045,7 @@ def train(
                 f"loss={last_loss:.4f}",
                 f"lr={lr:.3e}",
                 kda_field(window),
+                halt_field(model),
                 mtp_field(model),
                 window.line(),
             ]
