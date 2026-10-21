@@ -77,6 +77,14 @@ DEAD_SNAPSHOT_KEYS = {
 #: The `moe_kernel` literals — the expert-pass arms `experts._dispatch` routes
 #: between. One list, read by `validate`: a name that is not here is LOUD.
 MOE_KERNELS = ("padded", "triton", "naive")
+#: The `moe_topk_mode` literals — how many experts each TOKEN runs
+#: (`model/adaptive_topk.py`): `off` is the constant `moe_topk` width every
+#: number on record runs; `entropy`/`margin` are the per-token confidence
+#: policies. A name that is not here is LOUD.
+MOE_TOPK_MODES = ("off", "entropy", "margin")
+#: The widest per-token `k` the instrument can name (`moe_k1`..`moe_k8`). Above
+#: this is LOUD: the fused backward's top-k tile also stops at 8.
+MOE_TOPK_SLOTS_MAX = 8
 #: The `expert_act` literals — the 2026-10-16 activation tournament arms, each
 #: with its formula source in `experts.expert_glu`:
 #: `silu` (control, SwiGLU), `situ` (Kimi K3, arXiv 2607.24653 Eq. 12),
@@ -314,7 +322,25 @@ class ModelConfig:
     n_experts: int = 3
     #: Experts per position. `0` is the DENSE blend (burn's default), `k` is
     #: the sparse top-k dispatch. Above `n_experts` is refused by validate.
+    #: With `moe_topk_mode` != `off` this field is the ARM SWITCH (`> 0` selects
+    #: the routed pass); the per-token width comes from `moe_topk_max` there.
     moe_topk: int = 0
+    #: How many experts each TOKEN runs (`model/adaptive_topk.py`):
+    #: `off` (the default) is the constant `moe_topk` width — every existing run
+    #: and snapshot is bit-identical on it; `entropy` grows the width with the
+    #: router's normalized entropy; `margin` shrinks it with the top-1/top-2
+    #: logit gap. INFERENCE-ONLY: no new parameters and no training path.
+    moe_topk_mode: str = "off"
+    #: The narrow/wide ends of the adaptive width, in experts. `k_min >= 1`,
+    #: `k_min <= k_max <= min(8, n_experts)`; a violation is LOUD at load. Inert
+    #: when `moe_topk_mode = "off"`.
+    moe_topk_min: int = 1
+    moe_topk_max: int = 4
+    #: The confidence window the policy ramps across. `entropy`: normalized
+    #: router entropy in `[0, 1]`; `margin`: the top-1 minus top-2 LOGIT gap in
+    #: logit units. Read only when `moe_topk_mode != "off"`; `lo < hi` is LOUD.
+    moe_entropy_lo: float = 0.2
+    moe_entropy_hi: float = 0.6
     #: Tokens per expert in the capacity-bound permute:
     #: `ceil(capacity * tokens * topk / n_experts)`, never below `topk`.
     #: **`0` = DROPLESS** (2026-10-17): every assignment reaches its expert, so
@@ -981,6 +1007,40 @@ def validate(model: ModelConfig) -> None:
             f"moe_topk={model.moe_topk} > n_experts={model.n_experts}: a top-k "
             f"above the bank is refused, not clamped (clamping is the silent collapse)"
         )
+    if model.moe_topk_mode not in MOE_TOPK_MODES:
+        loud(
+            f"moe_topk_mode={model.moe_topk_mode!r} is not a width policy. Known: "
+            f"{list(MOE_TOPK_MODES)} — `off` the constant `moe_topk` (every number on "
+            f"record), `entropy` the normalized router entropy, `margin` the top-1/"
+            f"top-2 logit gap (model/adaptive_topk.py). Escape: name one of those, or "
+            f"land the policy and its gate BEFORE the config can lie about it."
+        )
+    if not 1 <= model.moe_topk_min <= model.moe_topk_max <= MOE_TOPK_SLOTS_MAX:
+        loud(
+            f"moe_topk_min={model.moe_topk_min} / moe_topk_max={model.moe_topk_max} "
+            f"outside 1 <= min <= max <= {MOE_TOPK_SLOTS_MAX}: the histogram counters "
+            f"and the fused backward's top-k tile stop there, and an inverted window "
+            f"would clamp every token to one end. Escape: the defaults 1/4."
+        )
+    if model.moe_topk_mode != "off":
+        if model.moe_topk <= 0:
+            loud(
+                f"moe_topk_mode={model.moe_topk_mode!r} with moe_topk=0: the adaptive "
+                f"width lives on the ROUTED pass, and 0 is the dense blend (every "
+                f"expert, no router top-k). Escape: moe_topk > 0 — its VALUE selects "
+                f"the arm here, the width comes from moe_topk_max."
+            )
+        if model.moe_topk_max > model.n_experts:
+            loud(
+                f"moe_topk_max={model.moe_topk_max} > n_experts={model.n_experts}: a "
+                f"width above the bank cannot be filled. Escape: k_max <= n_experts."
+            )
+        if not model.moe_entropy_lo < model.moe_entropy_hi:
+            loud(
+                f"moe_entropy_lo={model.moe_entropy_lo} >= moe_entropy_hi="
+                f"{model.moe_entropy_hi} with mode={model.moe_topk_mode!r}: the window "
+                f"would be a step, not a ramp. Escape: lo < hi (defaults 0.2 < 0.6)."
+            )
     if model.moe_capacity < 0.0:
         loud(
             f"moe_capacity={model.moe_capacity} is negative: it is a multiple of the "

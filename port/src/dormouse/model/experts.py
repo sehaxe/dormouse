@@ -66,6 +66,20 @@ Dispatch has TWO arms over ONE permute, and the log line says which ran:
   kept because it is what the padded arm is compared against — the same rows,
   the same capacity rule, the same drop counter.
 
+ONE more switch on the routed pass, OFF by default: the **adaptive width**
+(`moe_topk_mode`, `model/adaptive_topk.py`, 2026-10-21). `off` is the constant
+`moe_topk` width every number on record runs and the module never calls the
+policy at all; `entropy`/`margin` choose a per-token `k` in
+`[moe_topk_min, moe_topk_max]` from the router logits alone (`off` = control).
+The routed branch then masks the raised logits past each row's own `k`, keeps
+`k_max` slots and gives the unused ones weight 0 — the experts, the permute and
+the capacity rule are unchanged. A zero-weight slot is NOT an assignment: the
+permute puts it in a sentinel group past the bank so it consumes no expert's
+capacity and is dropped before any expert runs (`_permute`'s `valid`), which is
+what makes the average width the compute that actually happens on the ragged
+arms. Counters: `moe_k1`..`moe_k{max}` (per-token histogram, device
+accumulators) and `moe_k_mean_x100` (the mean width × 100, an INT).
+
 All three count: `moe_padded_bmm`, `moe_triton_gemm` or `moe_naive_dispatch`
 (with the reason attached to the counter object) on the step's counter line, so
 a reader never has to guess which one produced the loss.
@@ -152,6 +166,7 @@ from torch.utils.checkpoint import checkpoint
 
 from ..instrument import Counters, loud
 from .act_quant import fake_quant_act
+from .adaptive_topk import check_policy, choose_k, select_topk
 from .tsct import dense_qat_project, factor_qat_project, init_u, mm_mixed
 
 try:  # the Triton arm is an ABILITY, not a dependency
@@ -381,6 +396,29 @@ class SparseMoE(nn.Module):
         self.d, self.f = d, f
         self.n_experts = cfg.n_experts
         self.topk = cfg.moe_topk
+        #: The adaptive width (`model/adaptive_topk.py`): `off` is the constant
+        #: `topk` above; a non-off mode runs the routed pass with `topk_max`
+        #: slots of which each token activates its own `k`. The checks run HERE
+        #: too because a hand-built config reaches this module without passing
+        #: the loader — a bad policy is LOUD either way (ADR-0011).
+        self.topk_mode = cfg.moe_topk_mode
+        self.topk_min = cfg.moe_topk_min
+        self.topk_max = cfg.moe_topk_max
+        self.entropy_lo = cfg.moe_entropy_lo
+        self.entropy_hi = cfg.moe_entropy_hi
+        check_policy(self.topk_mode, self.topk_min, self.topk_max)
+        if self.topk_mode != "off":
+            if self.topk <= 0:
+                loud(
+                    f"moe_topk_mode={self.topk_mode!r} with moe_topk=0: the adaptive "
+                    f"width lives on the ROUTED pass, and 0 is the dense blend. "
+                    f"Escape: moe_topk > 0 (the width comes from moe_topk_max)."
+                )
+            if self.topk_max > self.n_experts:
+                loud(
+                    f"moe_topk_max={self.topk_max} > n_experts={self.n_experts}: a "
+                    f"width above the bank cannot be filled. Escape: k_max <= n_experts."
+                )
         self.capacity = cfg.moe_capacity
         self.moe_kernel = cfg.moe_kernel
         self.moe_offload = cfg.moe_offload
@@ -560,9 +598,32 @@ class SparseMoE(nn.Module):
             # stays the honest prob from the UNbiased softmax (the bias
             # steers selection, never magnitude).
             raised = logits + self.lfb_bias
-            index = raised.topk(self.topk, dim=-1).indices
-            weight = torch.gather(probs, 1, index)
-            self._lfb_step(index, counters)
+            if self.topk_mode == "off":
+                # The control, unchanged: ONE global width, no policy call at all
+                # (the off-arm bit-parity gate pins this branch against a digest
+                # measured before the policy existed).
+                index = raised.topk(self.topk, dim=-1).indices
+                weight = torch.gather(probs, 1, index)
+                self._lfb_step(index, counters)
+            else:
+                # The adaptive width: the policy sees the UNbiased logits (the
+                # bias steers selection, never the confidence that picks k), the
+                # mask is applied to the RAISED scores so LFB still selects, and
+                # the weights come from the unbiased softmax, zeroed on the
+                # padding slots.
+                k = choose_k(
+                    logits,
+                    mode=self.topk_mode,
+                    k_min=self.topk_min,
+                    k_max=self.topk_max,
+                    entropy_lo=self.entropy_lo,
+                    entropy_hi=self.entropy_hi,
+                )
+                index, active = select_topk(raised, k, self.topk_max)
+                self._k_counters(k, counters)
+                # LFB reads REAL assignments: a weight-0 padding slot is not a load.
+                self._lfb_step(index[active], counters)
+                weight = torch.gather(probs, 1, index) * active.to(probs.dtype)
             # Renormalized (burn's `topk_blend`): a top-1 token's gate is
             # exactly 1.0, so the sparse arm and the dense control run at the
             # same output magnitude — the A/B compares specialization, not scale.
@@ -597,6 +658,19 @@ class SparseMoE(nn.Module):
             self.lfb_bias.sub_(self.lfb_coef * torch.sign(self.lfb_counts - self.lfb_counts.mean()))
         counters.count("moe_lfb_updates")
 
+    def _k_counters(self, k: torch.Tensor, counters: Counters) -> None:
+        """Per-token width histogram + mean, DEVICE accumulators (no host read).
+
+        `moe_k{i}` is how many tokens ran exactly `i` experts; the histogram
+        sums to the routed token count (the gate). `moe_k_mean_x100` is the
+        mean width × 100 as an INT — the instrument counts integers, and an int
+        counter cannot drift or print `2.0000000001`. Both live on the device
+        lane and are drained once on the log cadence (`Counters.count_device`).
+        """
+        for width in range(self.topk_min, self.topk_max + 1):
+            counters.count_device(f"moe_k{width}", (k == width).sum())
+        counters.count_device("moe_k_mean_x100", (k.sum() * 100) // k.numel())
+
     def _capacity(self, n: int, k: int) -> int:
         """The routing capacity rule, in ONE place: `max(k, ceil(capacity·n·k/E))`.
 
@@ -615,7 +689,9 @@ class SparseMoE(nn.Module):
         )
         return max(k, math.ceil(self.capacity * n * k / self.n_experts))
 
-    def _permute(self, index: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _permute(
+        self, index: torch.Tensor, valid: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """The routing permute: `(order, keep, dropped)` — one place, both arms.
 
         Both arms are permuted by the SAME rows and drop the SAME ones, which is
@@ -626,23 +702,45 @@ class SparseMoE(nn.Module):
         of exactly two places that blocked torch.compile(dynamic) in the
         arm-level probe (the other is the drain cadence itself, instrument.py).
 
-        `moe_capacity = 0` (dropless) keeps EVERY row: `keep` is all-True and
-        `dropped` is 0, so the ragged arms see the full assignment set. That is
-        what makes the drop set independent of the window's composition, and it
-        is the whole reason this mode exists (module docstring).
+        `valid` is the adaptive width's slot mask (`[n, k]`, True = a real
+        assignment). A False slot is PADDING, not a droppable assignment: it is
+        moved to a sentinel expert id PAST the bank (`self.n_experts`), where it
+        sorts last, occupies no expert's capacity and is never kept — so the
+        real assignments of a token see the same `pos` they would if the width
+        had been its own `k`, and `dropped` counts only real rows. `valid=None`
+        is the constant-width path, unchanged (`masked_fill` is not even built).
+
+        `moe_capacity = 0` (dropless) keeps EVERY real row: `keep_cap` is all-True
+        and `dropped` is 0, so the ragged arms see the full assignment set. That
+        is what makes the drop set independent of the window's composition, and
+        it is the whole reason this mode exists (module docstring).
         """
         n, k = index.shape
         flat_ids = index.reshape(-1)
-        order = torch.argsort(flat_ids, stable=True)
-        sorted_ids = flat_ids[order]
-        counts = torch.bincount(sorted_ids, minlength=self.n_experts)
+        if valid is None:
+            active = None
+            safe = flat_ids
+            groups = self.n_experts
+        else:
+            active = valid.reshape(-1).to(torch.bool)
+            safe = flat_ids.masked_fill(~active, self.n_experts)
+            groups = self.n_experts + 1
+        order = torch.argsort(safe, stable=True)
+        sorted_ids = safe[order]
+        counts = torch.bincount(sorted_ids, minlength=groups)
         offsets = torch.cumsum(counts, 0) - counts
         pos = torch.arange(n * k, device=index.device) - offsets[sorted_ids]
         if self.capacity == 0:
-            keep = torch.ones_like(pos, dtype=torch.bool)
+            keep_cap = torch.ones_like(pos, dtype=torch.bool)
         else:
-            keep = pos < self._capacity(n, k)
-        dropped = (~keep).sum().view(())
+            keep_cap = pos < self._capacity(n, k)
+        if active is None:
+            keep = keep_cap
+            dropped = (~keep).sum().view(())
+        else:
+            active_sorted = active[order]
+            keep = keep_cap & active_sorted
+            dropped = (active_sorted & ~keep_cap).sum().view(())
         return order, keep, dropped
 
     def _padded_reason(self, x: torch.Tensor) -> str | None:
@@ -840,10 +938,19 @@ class SparseMoE(nn.Module):
         dt = self._bank_dtype()
         flat_w = weight.reshape(-1)
         flat_e = index.reshape(-1)
+        if self.topk_mode == "off":
+            counts = torch.bincount(flat_e, minlength=e)
+        else:
+            # The adaptive width's padding slots go to the SAME sentinel group
+            # `_permute` used, or `pos` here would count them and disagree with
+            # the permute's `keep` about which padded slot a real row owns
+            # (a mismatch is an out-of-bounds `index_put`). The sentinel rows are
+            # never kept, so their (large) slot numbers are computed, not used.
+            flat_e = flat_e.masked_fill(~(weight > 0).reshape(-1), e)
+            counts = torch.bincount(flat_e, minlength=e + 1)
         rows = order[keep]  # flat (token, slot) pairs that survive the cap
         owner = rows // k  # the token each kept row belongs to
         # The padded-bank slot of each sorted row: expert-major, capacity-padded.
-        counts = torch.bincount(flat_e, minlength=e)
         starts = torch.cumsum(counts, 0) - counts
         pos = torch.arange(n * k, device=index.device) - starts[flat_e[order]]
         kept_slots = (flat_e[order] * cap + pos)[keep]
@@ -948,8 +1055,15 @@ class SparseMoE(nn.Module):
         host read-back of `offs` (ADR-0018 rule 2). `_dropless_dispatch` owns
         that route and its counters (`moe_dropless`, `moe_triton_gemm`, or
         `moe_naive_dispatch` + the reason when the kernel cannot serve the call).
+
+        A zero router weight is an adaptive-width PADDING SLOT, not a dropped
+        assignment: it must not consume capacity (a padding row that keeps a real
+        row out would make the adaptive arm drop more than its own k) and it must
+        not be gathered into an expert bank. The constant-width arm passes `None`
+        — the pre-policy path, bit for bit.
         """
-        order, keep, dropped = self._permute(index)
+        valid = None if self.topk_mode == "off" else weight > 0
+        order, keep, dropped = self._permute(index, valid)
         # Count EVERY call: a python `if dropped:` on the device tensor is
         # exactly the sync this counter exists to prevent (caught by the
         # drop-parity test when the tensor stopped being an int). A zero add
