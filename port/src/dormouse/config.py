@@ -237,7 +237,7 @@ class ModelConfig:
     #: amount of thinking on every input.
     halt_min_iter: int = 1
     #: The INFERENCE cap on loop depth when `halt_mode` is on. LOUDLY refused
-    #: above `max_iter` IFF a halt is requested (the `4`/`8` default pair must
+    #: above `max_iter` IFF `halt_mode` is on (the `4`/`8` default pair must
     #: stay a legal config: `max_iter=4`, `halt_mode=false` runs today's model).
     halt_max_iter: int = 8
     #: Inference-only switch: run the loop up to `halt_max_iter` and stop at
