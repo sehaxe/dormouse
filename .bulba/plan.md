@@ -189,6 +189,23 @@ testable and A/B-able (ADR-0017).
       point at this scale (a cosine loss is scale-blind), and the test says so.
       `port/scripts/ab_jepa.py` (off / h1 / h2, 3 seeds x 2 000, medium) written
       and **NOT run** (card busy). Landed 2026-10-21.
+- [x] P-QAT-STACK. port (Python): the per-step refresh is ONE call per bank
+      site, not one per tensor. `model/qat_cache.py` adds
+      `qat_project_stacked` (`w + alpha·(q(w) − w).detach()` over a whole
+      `[E, ·, ·]` stack in one `qat_values` call, residual folded in place) and
+      `QuantCache.refresh_stacked` (`refresh` is the `N = 1` delegation).
+      `experts.SparseMoE._banks` builds the `[E, ·, ·]` fp32 stack per projection
+      and projects it once; scales and the non-QAT path are untouched.
+      Counters `qat_refresh_calls` / `qat_refresh_tensors` (one stacked call = 1
+      call, E tensors) surface on the forward's counter line. The medium bank
+      site measured **768 calls / 768 tensors -> 3 calls / 768 tensors**
+      (E=256), gated in `tests/test_qat_cache.py` against the pre-fix strategy on
+      the same weights; bit-identity (ternary/binary/mxfp4 x alpha 0/0.5/1,
+      `torch.equal`), the STE gradient contract (1e-6), the `none/none` zero
+      refresh, and the no-host-sync gate are pinned there, each proven by a
+      scratch revert. `port/scripts/bench_qat_cost.py` now prints bf16 /
+      per-tensor / stacked ms/step and the launch counts — written, **NOT run**
+      (card busy): **NO TIMING EXISTS** for the stacked path. Landed 2026-10-21.
 - [x] D1. `docs: retract the false step-time and verification claims` (prose only,
       no Rust). **Landed 2026-09-29.** Withdrawn without replacement, because the
       corrected value is not known: the 25.8 s/step batch-8 figure (no committed

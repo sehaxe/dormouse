@@ -30,6 +30,15 @@ both halves (stale without the call, fresh with it).
 so even a missed invalidation cannot serve a projection blended at last step's
 alpha. `alpha == 0` stores `w` itself and `ste` returns `w` untouched — the
 bf16 path, bit for bit.
+
+THE SECOND SEAM: a bank is ONE projection, not E. `SparseMoE._banks` builds
+`[E, ·, ·]` stacks and used to call the projector once per expert — E launch
+chains per projection per step (768 at medium, E = 256), which is launch-bound
+work for a tensor the same size as one call's. `qat_project_stacked` takes the
+whole stack through `qat_values` once (the STE residual folded in place), and
+`refresh_stacked` is the cached form of the same idea. `qat_refresh_calls` /
+`qat_refresh_tensors` (below) count the two shapes apart, so a regression to
+per-tensor shows up as calls ≈ tensors instead of calls ≪ tensors.
 """
 
 from __future__ import annotations
@@ -37,14 +46,73 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+#: Refresh telemetry, per step. `qat_refresh_calls` is how many times the
+#: quantizer ran (`tsct.qat_values`); `qat_refresh_tensors` is how many weight
+#: tensors those calls covered. ONE stacked call over `[E, ·, ·]` is one call
+#: and E tensors; the pre-stacked bank was E calls of one tensor each. The pair
+#: is what separates "one pass per site" from "one pass per tensor" on the log
+#: line — a call count alone cannot tell a stack from a loop.
+_REFRESH_CALLS = 0
+_REFRESH_TENSORS = 0
+
+
+def note_qat_values(w: torch.Tensor) -> None:
+    """Count ONE quantizer invocation; its leading axis is the stack it covers."""
+    global _REFRESH_CALLS, _REFRESH_TENSORS
+    _REFRESH_CALLS += 1
+    _REFRESH_TENSORS += int(w.shape[0]) if w.ndim >= 3 else 1
+
+
+def take_qat_refresh_counts() -> tuple[int, int]:
+    """`(calls, tensors)` since the last take, then reset — the per-step count."""
+    global _REFRESH_CALLS, _REFRESH_TENSORS
+    out = (_REFRESH_CALLS, _REFRESH_TENSORS)
+    _REFRESH_CALLS = _REFRESH_TENSORS = 0
+    return out
+
+
+def qat_project_stacked(
+    w: torch.Tensor, kind: str, alpha: float, *, dim: tuple | None = None
+) -> torch.Tensor:
+    """`w + alpha·(q(w) − w).detach()` for a whole stack in ONE quantizer call.
+
+    The banked expert seam (`SparseMoE._banks`): the `[E, d, r]` stack is
+    projected as ONE tensor, so the whole bank costs one quantizer chain (one
+    launch per elementwise op) instead of E. `dim` is the per-slice absmean axis
+    (`(1, 2)` for a bank); the expression is `factor_qat_project`'s, evaluated
+    on the stack, so every element is the same arithmetic on the same values —
+    a slice is bit-identical to the same tensor projected alone, `mxfp4`
+    included (`mxfp.fake_quant_mx` pads per ROW, so a block never mixes two
+    slices; pinned by `tests/test_qat_cache.py`).
+
+    NOT a cache: `_banks` already caches the built bank once per step, and
+    storing a second copy of every `q` would double the bank's footprint. The
+    residual is folded IN PLACE on `q` (the projection is a constant for the
+    step), so the peak is `w`, `q` and the result — not four transients.
+    """
+    if kind == "none" or alpha == 0.0:
+        # `alpha = 0` is the master: no projection, the same short-circuit the
+        # cache takes (and the same bits `w + 0·(q − w)` gives for a finite q).
+        return w
+    # Lazy import: `tsct` imports this module at module level.
+    from .tsct import qat_values
+
+    with torch.no_grad():
+        q = qat_values(w, kind, alpha, dim=dim)
+        q.sub_(w).mul_(alpha)  # the detached residual, in place
+    return (w + q).to(w.dtype)
+
 
 class QuantCache:
     """One detached quantized copy per weight, reused until `invalidate()`.
 
-    `refresh(w, kind, alpha)` returns the DETACHED raw projection — a miss runs
-    `tsct.qat_values` once, a hit is a dict lookup that bumps `hits`.
-    `ste(w)` re-composes `w + alpha·(q − w).detach()` from the stored entry, so
-    the forward value equals the uncached path's and the gradient is identity.
+    `refresh_stacked(w, kind, alpha, dim)` returns the DETACHED raw projection
+    for a whole `[N, ·, ·]` stack — ONE quantizer call covering N tensors, the
+    banked expert path's seam. `refresh` is the same call with `N = 1` (a lone
+    tensor: `out_proj`, `lm_head`, a dense weight). A miss runs
+    `tsct.qat_values` once, a hit is a dict lookup that bumps `hits`; `ste(w)`
+    re-composes `w + alpha·(q − w).detach()` from the stored entry, so the
+    forward value equals the uncached path's and the gradient is identity.
     `invalidate()` drops every entry; the trainer calls it once per optimizer
     step, exactly like `SparseMoE.invalidate_banks`.
 
@@ -62,10 +130,15 @@ class QuantCache:
         self.hits = 0
 
     @torch.compiler.disable
-    def refresh(
+    def refresh_stacked(
         self, w: torch.Tensor, kind: str, alpha: float, dim: tuple | None = None
     ) -> torch.Tensor:
-        """The detached projection for `w`; computed on a miss, reused on a hit."""
+        """The detached projection for a whole stack; ONE call, N tensors.
+
+        `w` is `[N, ·, ·]` (a bank) or any tensor `qat_values` accepts; `dim` is
+        the per-slice absmean axis. The entry is keyed on `w`'s identity, so
+        `ste(w)` reads it back exactly as for a lone tensor.
+        """
         ent = self._q.get(id(w))
         if (
             ent is not None
@@ -92,6 +165,12 @@ class QuantCache:
                 q = qat_values(w, kind, alpha, dim=dim).detach()
         self._q[id(w)] = (w, kind, alpha, dim, q)
         return q
+
+    def refresh(
+        self, w: torch.Tensor, kind: str, alpha: float, dim: tuple | None = None
+    ) -> torch.Tensor:
+        """A lone tensor is a stack of one — the SAME code path, `N = 1`."""
+        return self.refresh_stacked(w, kind, alpha, dim)
 
     def ste(self, w: torch.Tensor) -> torch.Tensor:
         """`w + alpha·(q − w).detach()` — the STE the forward reads.

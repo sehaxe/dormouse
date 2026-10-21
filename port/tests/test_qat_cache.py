@@ -26,6 +26,8 @@ from dormouse.model.qat_cache import (
     QuantCache,
     attach_qat_caches,
     invalidate_qat_cache_all,
+    qat_project_stacked,
+    take_qat_refresh_counts,
 )
 from dormouse.model.tsct import DenseLinear, TSCTLinear, factor_qat_project
 
@@ -111,6 +113,21 @@ def test_none_projector_ignores_a_cache():
     assert factor_qat_project(w, "none", 1.0, cache=QuantCache()) is w
 
 
+def test_none_switches_do_no_refresh_and_leave_the_model_bit_identical():
+    """Gate: `factor_qat=none`, `dense_qat=none` — zero refreshes, same bits."""
+    torch.manual_seed(0)
+    a = _model()
+    b = _model()
+    b.load_state_dict(a.state_dict())
+    x = torch.randint(0, 256, (2, 16))
+    take_qat_refresh_counts()
+    c = Counters()
+    la = a(x, x, c)[0]
+    assert take_qat_refresh_counts() == (0, 0), "QAT off must run no quantizer"
+    assert c.get("qat_refresh_calls", 0) == 0
+    assert torch.equal(la, _forward(b, x))
+
+
 # ---------------------------------------------------------------------------
 # gate b: cached forward value == uncached, bit for bit
 # ---------------------------------------------------------------------------
@@ -128,6 +145,38 @@ def test_projector_cache_is_bit_identical_per_rung_and_alpha():
             assert torch.equal(warm, cold), (kind, alpha)
             assert torch.equal(again, cold), (kind, alpha)
             assert cache.hits == 1, (kind, alpha)
+
+
+def test_stacked_refresh_is_bit_identical_to_the_per_tensor_refresh():
+    """Gate: ONE call over `[E, ·, ·]` == E calls, elementwise, all rungs.
+
+    The bank site's whole correctness claim: the stacked projection is the same
+    expression on the same values, so slicing a stacked bank is bit-identical to
+    projecting that expert alone. `alpha = 0` is the master (both paths
+    short-circuit), 0.5 the annealed blend, 1.0 the pure grid.
+    """
+    torch.manual_seed(0)
+    stack = torch.randn(4, 16, 24) * 0.2  # 4 x (16, 24): both dims exercised
+    slices = [stack[e] for e in range(stack.shape[0])]
+    for kind in ("ternary", "binary", "mxfp4"):
+        for alpha in (0.0, 0.5, 1.0):
+            stacked, per = QuantCache(), QuantCache()
+            qs = stacked.refresh_stacked(stack, kind, alpha, dim=(1, 2))
+            qp = torch.stack([per.refresh(s, kind, alpha) for s in slices])
+            assert torch.equal(qs, qp), (kind, alpha, "projection")
+            assert torch.equal(
+                stacked.ste(stack), torch.stack([per.ste(s) for s in slices])
+            ), (kind, alpha, "ste")
+            # The uncached arm is the same expression too (alpha=0 included).
+            assert torch.equal(
+                qat_project_stacked(stack, kind, alpha, dim=(1, 2)),
+                torch.stack([factor_qat_project(s, kind, alpha) for s in slices]),
+            ), (kind, alpha, "uncached")
+    # One stacked call, one entry: a second refresh is a hit, not a second pass.
+    cache = QuantCache()
+    first = cache.refresh_stacked(stack, "ternary", 1.0, dim=(1, 2))
+    assert cache.refresh_stacked(stack, "ternary", 1.0, dim=(1, 2)) is first
+    assert cache.hits == 1
 
 
 def test_cached_model_logits_are_bit_identical_to_the_uncached_model():
@@ -178,6 +227,38 @@ def test_gradients_match_the_uncached_path_on_every_parameter():
         assert rel <= 1e-6, f"{na}: relative gradient difference {rel}"
         checked += 1
     assert checked >= 40, f"only {checked} parameters carried a gradient"
+
+
+def test_stacked_ste_gradient_matches_the_unbatched_path():
+    """Gate: the bank's one-call STE keeps the parameter-grad contract.
+
+    `qat_project_stacked(stack)` vs E `factor_qat_project(parameter)` calls on
+    the SAME weights (medium's widths, E=8 for speed): every parameter's
+    gradient must agree to 1e-6 relative. The mechanism is identity STE in both,
+    so a regression here means the stacked residual leaked into the graph or a
+    slice lost its master.
+    """
+    from dormouse.config import load_preset
+    from dormouse.model.experts import SparseMoE
+
+    torch.manual_seed(0)
+    cfg = dataclasses.replace(
+        load_preset("medium"), n_experts=8, factor_qat="ternary", dense_qat="ternary"
+    )
+    moe = SparseMoE(cfg)
+    for kind in ("ternary", "binary", "mxfp4"):
+        for name in ("gate_u", "up_u", "v"):
+            params = [getattr(ex, name) for ex in moe.experts]
+            for p in params:
+                p.grad = None
+            qat_project_stacked(torch.stack(params), kind, 0.5, dim=(1, 2)).pow(2).sum().backward()
+            got = [p.grad.detach().clone() for p in params]
+            for p in params:
+                p.grad = None
+            sum((factor_qat_project(p, kind, 0.5) ** 2).sum() for p in params).backward()
+            for i, p in enumerate(params):
+                rel = float((got[i] - p.grad).norm() / (p.grad.norm() + 1e-30))
+                assert rel <= 1e-6, f"{kind}/{name}[{i}]: relative {rel}"
 
 
 # ---------------------------------------------------------------------------
@@ -320,3 +401,91 @@ def test_dense_linear_and_qat_linear_take_the_cache():
     assert lin._qat_cache.hits == 1
     cold = torch.nn.functional.linear(x, factor_qat_project(w, "ternary", 1.0))
     assert torch.equal(once, cold)
+
+
+# ---------------------------------------------------------------------------
+# gate g: the medium bank site is ONE call per projection, not E
+# ---------------------------------------------------------------------------
+
+
+def test_medium_bank_site_refreshes_in_one_call_not_E():
+    """Gate: medium's expert bank (E=256) refreshes in 3 calls, not 768.
+
+    The measured problem: the bank was quantized once per expert per factor, so
+    a step issued E quantizer chains per projection. The site must issue ONE
+    call per projection NAME (`gate_u`, `up_u`, `v` — different shapes, so three
+    is the floor) carrying E tensors each. The pre-fix strategy is measured on
+    the SAME weights in this test, so the comparison cannot rot.
+
+    CPU note: the CPU forward routes through the naive reference arm (the padded
+    bank is the CUDA path), which keeps its per-expert `DualLatentGLU` caches by
+    design — materializing an fp32 bank is exactly what that arm exists to
+    avoid. This gate exercises the bank SEAM the CUDA step runs.
+    """
+    from dormouse.config import load_preset
+    from dormouse.model.experts import SparseMoE
+
+    torch.manual_seed(0)
+    cfg = dataclasses.replace(load_preset("medium"), factor_qat="ternary")
+    moe = SparseMoE(cfg)
+    e = cfg.n_experts
+    assert e == 256, "the measured shape's bank"
+
+    take_qat_refresh_counts()
+    with torch.no_grad():
+        mats = moe._banks(torch.bfloat16)
+    calls, tensors = take_qat_refresh_counts()
+    assert [m.shape[0] for m in mats[:3]] == [e, e, e], "the whole bank, one entry per expert"
+    print(
+        f"\nmedium bank (E={e}): stacked = {calls} calls / {tensors} tensors",
+        flush=True,
+    )
+    assert calls == 3, f"one call per projection name, not {calls}"
+    assert tensors == 3 * e, f"one call must carry E tensors, got {tensors}"
+
+    # The pre-fix seam, measured on the same site: `[1, ·, ·]` per expert.
+    take_qat_refresh_counts()
+    with torch.no_grad():
+        for name in ("gate_u", "up_u", "v"):
+            torch.stack(
+                [
+                    factor_qat_project(
+                        getattr(ex, name).unsqueeze(0), "ternary", 1.0, dim=(1, 2)
+                    )[0]
+                    for ex in moe.experts
+                ]
+            )
+    old_calls, old_tensors = take_qat_refresh_counts()
+    print(
+        f"medium bank (E={e}): per-tensor = {old_calls} calls / {old_tensors} tensors",
+        flush=True,
+    )
+    assert (old_calls, old_tensors) == (3 * e, 3 * e)
+    assert calls < old_calls / 100, "the stack must be E-fold fewer launches"
+
+
+# ---------------------------------------------------------------------------
+# gate h: no host sync anywhere in the refresh path
+# ---------------------------------------------------------------------------
+
+
+def test_refresh_path_never_syncs(monkeypatch):
+    """Gate: the quantizer chain reads nothing back to the host.
+
+    Every host-read primitive a torch path can use to turn a device value into
+    a Python number is made to raise; the refresh must not call any of them
+    (`qat_refresh_tensors` counts shapes, which are host metadata, never data).
+    """
+
+    def boom(*_a, **_k):
+        raise AssertionError("host sync in the refresh path")
+
+    for name in ("item", "tolist", "cpu", "numpy", "__float__", "__int__"):
+        monkeypatch.setattr(torch.Tensor, name, boom)
+    torch.manual_seed(0)
+    stack = torch.randn(3, 8, 16) * 0.2
+    for kind in ("ternary", "binary", "mxfp4"):
+        cache = QuantCache()
+        cache.refresh_stacked(stack, kind, 1.0, dim=(1, 2))
+        cache.refresh(stack[0], kind, 1.0)
+        qat_project_stacked(stack, kind, 0.5, dim=(1, 2))

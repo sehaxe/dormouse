@@ -60,7 +60,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from ..instrument import Counters, loud
-from .qat_cache import QuantCache
+from .qat_cache import QuantCache, note_qat_values
 
 # ---------------------------------------------------------------------------
 # COMPUTE rungs: the fp8 2-D GEMM lane (`mm_dtype`)
@@ -350,6 +350,7 @@ def qat_values(
         return w
     if mode not in ("ternary", "binary", "mxfp4", "ternary_s3t"):
         raise AssertionError(f"factor_qat/dense_qat={mode!r} reached the projector with no mode")
+    note_qat_values(w)  # one refresh call; `w.shape[0]` is how many tensors it covers
     if mode == "mxfp4":
         from .mxfp import fake_quant_mx
 
@@ -473,6 +474,11 @@ def factor_qat_project(
     direct API caller that does not opt in) keeps the old per-forward path.
     """
     if mode == "none":
+        return w
+    if alpha == 0.0:
+        # The annealing floor is the master itself: skip the projection (and
+        # its launch chain) rather than compute `w + 0·(q − w)`. The cache
+        # already takes this short-circuit; the uncached arms now agree.
         return w
     if cache is not None:
         # The QAT cost fix: `refresh` is the once-per-step projection (`q` is

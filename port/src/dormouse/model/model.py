@@ -41,7 +41,7 @@ from .energy import EnergyHead, energy_contrastive_loss
 from .jepa import JepaHead
 from .loopblock import LoopBlock
 from .mtp import MTPHead
-from .qat_cache import QuantCache, attach_qat_caches
+from .qat_cache import QuantCache, attach_qat_caches, take_qat_refresh_counts
 from .sigreg import sigreg_loss, stride_sample
 from .tsct import make_projection, set_factor_qat_seed
 
@@ -237,6 +237,14 @@ class DormouseModel(nn.Module):
             reuse = sum(c.take_hits() for c in self._qat_caches)
             if reuse:
                 counters.count("qat_reuse", reuse)
+            # The refresh LAUNCHES of this forward: `calls` is how many quantizer
+            # chains ran, `tensors` how many weight tensors they covered. One
+            # stacked bank call is one call and E tensors, so a regression to
+            # per-expert shows up as calls == tensors instead of calls ≪ tensors.
+            calls, tensors = take_qat_refresh_counts()
+            if calls:
+                counters.count("qat_refresh_calls", calls)
+                counters.count("qat_refresh_tensors", tensors)
         counters.count("forward")
         return logits, loss, counters
 

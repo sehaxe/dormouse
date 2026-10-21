@@ -216,7 +216,7 @@ from ..config import SHARE_U_MODES
 from ..instrument import Counters, loud
 from .act_quant import fake_quant_act
 from .adaptive_topk import check_policy, choose_k, select_topk
-from .qat_cache import QuantCache
+from .qat_cache import QuantCache, qat_project_stacked
 from .tsct import dense_qat_project, factor_qat_project, init_u, mm_mixed
 
 try:  # the Triton arm is an ABILITY, not a dependency
@@ -1145,13 +1145,18 @@ class SparseMoE(nn.Module):
             # (audit 2026-10-17, MAJOR 7): stacking in fp32 first costs a
             # 1.43 GB transient per name at b1 (`[1024, 5461, 64]`) and that
             # allocation is what OOM'd both b1 warm attempts and the compile
-            # warm-up. Per-expert, the fp32 footprint is one expert (5.6 MB),
-            # and the qat arm — if on — quantizes the same way the stacked
-            # form did: `dim=(1, 2)` over a `[1, r, d]` view is the identical
-            # per-expert α, so a banked expert stays identical to the same
-            # expert run through `DualLatentGLU.forward` (the parity the A/B
-            # needs). Scales (`gate_s`/`up_s`) are never quantized: they ARE
-            # the diag(s) of the factorization.
+            # warm-up. Per-expert, the fp32 footprint is one expert (5.6 MB).
+            # Scales (`gate_s`/`up_s`) are never quantized: they ARE the
+            # diag(s) of the factorization.
+            #
+            # THE QAT ARM IS THE ONE EXCEPTION, on purpose: `factor_qat` needs
+            # the whole `[E, ·, ·]` stack in fp32 to project it in ONE call
+            # (`qat_cache.qat_project_stacked`) — the old loop ran the quantizer
+            # E times per name (768 chains per step at medium, E=256), which is
+            # launch-bound work for the same 24.5 M elements. The transient is
+            # paid once per name per step; the non-QAT path every number on
+            # record runs is untouched, and the QAT arm's b1 peak is re-measured
+            # by `scripts/bench_qat_cost.py` before that shape is trusted.
             def _one(name: str) -> torch.Tensor:
                 if self.share_u_mode == "dict" and name in ("gate_u", "up_u"):
                     # The bank's ONE dictionary, gathered into the [E, d, rank]
@@ -1173,15 +1178,12 @@ class SparseMoE(nn.Module):
                     # code. Only the VALUES are E-fold; the parameter is one.
                     u = getattr(self, name).to(dt)
                     return u.unsqueeze(0).expand(len(self.experts), -1, -1).contiguous()
-                parts = []
-                for e in self.experts:
-                    t = getattr(e, name)
-                    if self.factor_qat != "none":
-                        t = factor_qat_project(
-                            t.unsqueeze(0), self.factor_qat, self.factor_qat_alpha, dim=(1, 2)
-                        )[0]
-                    parts.append(t.to(dt))
-                return torch.stack(parts)
+                params = [getattr(e, name) for e in self.experts]
+                if self.factor_qat == "none":
+                    return torch.stack([t.to(dt) for t in params])
+                return qat_project_stacked(
+                    torch.stack(params), self.factor_qat, self.factor_qat_alpha, dim=(1, 2)
+                ).to(dt)
 
             mats = [_one(name) for name in ("gate_u", "up_u", "v")]
             cached = (
