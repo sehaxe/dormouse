@@ -77,7 +77,9 @@ DEAD_SNAPSHOT_KEYS = {
     # and a listed key that is a field is now skipped, not dropped.
     "use_mor": (DEAD_SNAPSHOT_COMMIT, False),
     "use_situ": (DEAD_SNAPSHOT_COMMIT, False),
-    "jepa_weight": (DEAD_SNAPSHOT_COMMIT, 0.0),
+    # "jepa_weight": removed from this list 2026-10-21 — it is a real field
+    # again (JEPA as ONE mechanism, `model/jepa.py`); a listed key that is a
+    # field is skipped, not dropped.
     "stress": (DEAD_SNAPSHOT_COMMIT, False),
     # removed by `delete the aux_fb future-byte head — a TIE` (39d0485):
     "aux_fb_weight": ("39d0485", 0.0),
@@ -581,6 +583,25 @@ class ModelConfig:
     #: §3; the burn `l1 + 0.1·koleo` bundle cannot attribute its own 0.082 BPB).
     #: The suggested grid is 0.005 / 0.05 / 0.1 — publish which.
     sigreg_weight: float = 0.0
+    #: ---- JEPA as ONE mechanism (`model/jepa.py`): a latent predictor + its
+    #: OWN anti-collapse term, never a separate gadget. The arm switch, kept as
+    #: a bool so every arm reads the same way; it MUST agree with the weight
+    #: (`__post_init__`): `jepa` is true iff `jepa_weight > 0`.
+    jepa: bool = False
+    #: λ on the whole JEPA term: `CE + jepa_weight · (cosine + reg)`. `0.0`
+    #: builds no head, adds no parameter and leaves every number bit-identical.
+    jepa_weight: float = 0.0
+    #: The causal horizon `h`: predict `h[p+h]` from `h[p]` in the SAME forward
+    #: (`1` = the next position). Refused below 1 and above `seq_len // 8` (the
+    #: horizon must fit the window with room for a sample; the load path owns
+    #: the `seq_len` half because a preset does not know it).
+    jepa_horizon: int = 1
+    #: The anti-collapse weight INSIDE the JEPA term: SIGReg on the predicted
+    #: latents. It has its own weight so the mechanism is self-contained —
+    #: `jepa_weight` scales the sum, never the two terms differently. `0.1` is
+    #: the value `tests/test_jepa.py`'s collapse gate justifies (the predicted
+    #: latents stay spread at 0.1 and collapse at 0.0).
+    jepa_reg_weight: float = 0.1
     #: ---- energy-based scoring (EBT, arXiv:2507.02092; `model/energy.py`) ----
     #: `energy_weight` = λ on the margin-InfoNCE term: the target byte's energy
     #: must beat `energy_negs` negatives sampled from the `lm_head` softmax by
@@ -661,6 +682,15 @@ class ModelConfig:
         the resolution happens here, the one place every construction passes
         (`parse_preset`, `--set` through `dataclasses.replace`, tests).
         """
+        if self.jepa != (self.jepa_weight > 0.0):
+            loud(
+                f"jepa={self.jepa} with jepa_weight={self.jepa_weight}: the switch "
+                f"and the weight must agree — `jepa` is true iff `jepa_weight > 0`. "
+                f"A switch with a zero weight builds no head (the arm would be "
+                f"inert), and a weight with the switch off is a key that lies about "
+                f"what the run computes (model/jepa.py). Escape: `jepa=true` + a "
+                f"positive `jepa_weight`, or `jepa=false` + `jepa_weight=0.0`."
+            )
         if self.share_u_mode not in SHARE_U_MODES:
             loud(
                 f"share_u_mode={self.share_u_mode!r} is not an arm. Known: "
@@ -1545,6 +1575,27 @@ def validate(model: ModelConfig) -> None:
             f"(off) or a positive weight (the research doc's grid: 0.005, 0.05, "
             f"0.1 — docs/research/2026-10-16-jepa-into-dormouse.md §3)."
         )
+    if model.jepa_weight < 0.0:
+        loud(
+            f"jepa_weight={model.jepa_weight} is negative: it scales the whole "
+            f"JEPA term (`model/jepa.py`), so a negative value flips the sign of "
+            f"both the prediction and its anti-collapse term. Escape: 0.0 (off) "
+            f"or a positive weight."
+        )
+    if model.jepa_reg_weight < 0.0:
+        loud(
+            f"jepa_reg_weight={model.jepa_reg_weight} is negative: it is the "
+            f"anti-collapse weight INSIDE the JEPA term, and a negative value "
+            f"would push the predicted latents toward collapse (the opposite of "
+            f"`sigreg_loss`'s gradient). Escape: 0.0 (no regulariser) or a "
+            f"positive weight (the gate's 0.1)."
+        )
+    if model.jepa_horizon < 1:
+        loud(
+            f"jepa_horizon={model.jepa_horizon}: the horizon is a positive count "
+            f"of positions to look ahead (1 = the next position). Escape: >= 1, "
+            f"and <= seq_len // 8 (the load path checks the window)."
+        )
     # The ENERGY head's own coherence (`model/energy.py`, EBT arXiv:2507.02092):
     # the weight gates the module (0 builds nothing), and every other field is
     # a count/scale the loss would silently misuse. The two INTERACTIONS
@@ -1762,6 +1813,17 @@ def _validate_byteflow(model: ModelConfig) -> None:
             "term would be built and attached to nothing. Escape: sigreg_weight = 0.0, "
             "or drop use_byteflow."
         )
+    # JEPA predicts the loop's byte-position readout `h[p+h]` from `h[p]`; the
+    # channel runs the loop over K patch latents, so there are no byte positions
+    # to shift. Refused, never silently dropped (ADR-0019).
+    if model.jepa_weight > 0.0:
+        loud(
+            f"use_byteflow with jepa_weight={model.jepa_weight}: JEPA predicts the "
+            f"loop's byte-position readout `h[p+h]` from `h[p]`, and the channel "
+            f"runs the loop over K patch latents where there are no byte positions "
+            f"to shift (model/jepa.py). Escape: jepa=false and jepa_weight=0.0, or "
+            f"drop use_byteflow."
+        )
     if model.energy_weight > 0.0:
         loud(
             "use_byteflow with energy_weight>0: the channel runs the loop over K "
@@ -1895,6 +1957,39 @@ def _validate_segment(model: ModelConfig, tcfg: TrainConfig) -> None:
             f"padded bank has no cap, so the grouped GEMM takes the static row-block "
             f"bound and exits on-device on an empty block — no sync, ADR-0018 rule 2) "
             f"— or moe_topk=0 (the dense blend `small` ships), or segment_len=0."
+        )
+
+
+def _validate_jepa(model: ModelConfig, tcfg: TrainConfig) -> None:
+    """The JEPA arm against the window and the segmented path — both halves.
+
+    The horizon crosses SEGMENT boundaries: the segmented forward runs the loop
+    per segment, so `h[p+h]` can come from the next segment's window (a different
+    state) or from the carried-state prefix, which is a second unvalidated
+    objective. The horizon also has to fit the window with room for a sample:
+    `seq_len // 8` is the widest the research plan names, and a horizon at the
+    window's scale leaves almost nothing to predict over. Both are refusals, not
+    fallbacks (ADR-0019: a term with nothing to act on must not look alive).
+    """
+    if model.jepa_weight <= 0.0:
+        return
+    if tcfg.segment_len > 0:
+        loud(
+            f"jepa_weight={model.jepa_weight} with segment_len={tcfg.segment_len}: "
+            f"JEPA predicts `h[p+h]` from `h[p]`, and the segmented forward cuts "
+            f"the window, so the horizon would cross a segment boundary — the "
+            f"target would be a state from a different window (or from the carried "
+            f"prefix), i.e. a different objective from the one-shot forward. "
+            f"Escape: segment_len=0, or jepa_weight=0.0."
+        )
+    cap = tcfg.seq_len // 8
+    if model.jepa_horizon > cap:
+        loud(
+            f"jepa_horizon={model.jepa_horizon} > seq_len // 8 = {cap} "
+            f"(seq_len={tcfg.seq_len}): the horizon must fit the training window "
+            f"with room for a predicted sample, otherwise the term reads a handful "
+            f"of positions (or none) and the A/B cannot tell it apart from off. "
+            f"Escape: a horizon <= {cap}, or jepa_weight=0.0."
         )
 
 
@@ -2129,6 +2224,7 @@ def load_run(
     # window AND the arms, so its refusals live here, where both halves are
     # resolved — the same shape as the `engram_ram` block above.
     _validate_segment(model, tcfg)
+    _validate_jepa(model, tcfg)
     # The RL lane's keys. The advantage arm is a literal list (checked here, the
     # way `opt` and `mm_dtype` are); the reward and penalty knobs are checked by
     # BUILDING the `RLConfig` they describe, whose `__post_init__` is LOUD — one

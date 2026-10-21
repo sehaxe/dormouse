@@ -10,8 +10,9 @@
 #     measurements; on the port there is no "storage bf16, compute fp32" mode
 #     to preserve.
 #  2. `dspark_weight = 0.0` (burn ships 0.05 JEPA+KoLeo plus a DSpark term).
-#     JEPA+KoLeo is NOT ported and is not a key at all; a JEPA key is refused
-#     as unknown rather than silently dropped.
+#     The burn JEPA+KoLeo bundle is NOT ported as-is; JEPA is its own mechanism
+#     (`jepa`, `jepa_weight`, `model/jepa.py`) with an INTERNAL SIGReg
+#     anti-collapse term, off by default and measured by `scripts/ab_jepa.py`.
 #  3. the expert is TSCT2 §14's dual-latent GLU with a shared write and an
 #     always-on shared expert (see configs/b1.toml for the full arithmetic).
 #

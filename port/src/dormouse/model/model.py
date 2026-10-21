@@ -38,6 +38,7 @@ from .byteflow import (
 )
 from .dspark import DSparkHead, dspark_aux_loss
 from .energy import EnergyHead, energy_contrastive_loss
+from .jepa import JepaHead
 from .loopblock import LoopBlock
 from .mtp import MTPHead
 from .qat_cache import QuantCache, attach_qat_caches
@@ -49,6 +50,22 @@ class DormouseModel(nn.Module):
     def __init__(self, cfg: ModelConfig, *, device: torch.device | str = "cpu") -> None:
         super().__init__()
         self.cfg = cfg
+        # JEPA's two runtime refusals (the same shape every aux arm carries):
+        # `validate` owns the CLI path, but a hand-built model skips it, and a
+        # term with nothing to act on must not be silently dropped (ADR-0019).
+        if cfg.jepa_weight > 0.0 and cfg.use_byteflow:
+            loud(
+                f"use_byteflow with jepa_weight={cfg.jepa_weight}: the byteflow "
+                f"shapes run the loop over K patch latents (or not at all), so "
+                f"there are no byte positions for the horizon `h[p+h]` to shift "
+                f"(model/jepa.py). Escape: jepa_weight=0.0, or drop use_byteflow."
+            )
+        if cfg.jepa_weight > 0.0 and cfg.jepa_horizon < 1:
+            loud(
+                f"jepa_horizon={cfg.jepa_horizon} with jepa_weight={cfg.jepa_weight}: "
+                f"the horizon is a positive count of positions to look ahead "
+                f"(1 = the next position). Escape: jepa_horizon >= 1."
+            )
         # `factor_qat_seed`'s ONE consumer (`tsct.set_factor_qat_seed`): the S3T
         # mask stream is a process-local generator, and a model build is its
         # boundary — the trainer builds one model per process, so the config
@@ -72,6 +89,9 @@ class DormouseModel(nn.Module):
         #: `energy_weight > 0`. Declared before the byteflow early return so a
         #: channel model has the attribute (None) rather than no attribute.
         self.energy: EnergyHead | None = None
+        #: JEPA (`jepa.py`): declared before the byteflow early return so a
+        #: channel model has the attribute (None) rather than no attribute.
+        self.jepa: JepaHead | None = None
         #: Every QAT cache in the tree (`qat_cache.QuantCache`), collected after
         #: the build below. `forward` drains their hit counts into `qat_reuse`;
         #: the trainer invalidates them once per optimizer step.
@@ -89,6 +109,20 @@ class DormouseModel(nn.Module):
         head_rank = min(cfg.rank, d, cfg.vocab)
         self.lm_head = make_projection(d, cfg.vocab, cfg, rank=head_rank, device=device)
         self.bf = bf_for_model(cfg, device=device)
+        # The JEPA head (`jepa.py`): ONE mechanism — a causal latent predictor
+        # and its own SIGReg anti-collapse term. Built only when the weight is
+        # on, so `jepa_weight = 0` adds no parameter and no compute (the off
+        # path is bit-identical, pinned in `tests/test_jepa.py`).
+        self.jepa = (
+            JepaHead(
+                d,
+                horizon=cfg.jepa_horizon,
+                reg_weight=cfg.jepa_reg_weight,
+                device=device,
+            )
+            if cfg.jepa_weight > 0.0
+            else None
+        )
         # The DSpark draft head (2607.05147): built only when the weight is on
         # — at 0.0 the parameter set and every preset count match today's.
         self.dspark: DSparkHead | None = (
@@ -292,6 +326,14 @@ class DormouseModel(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """The plain byte-level stack: embedding → loop → RMSNorm → lm_head."""
         h0 = self.embed(input_ids)
+        if self.jepa is not None and segment_len:
+            loud(
+                f"segment_len={segment_len} with jepa_weight={self.cfg.jepa_weight}: "
+                f"JEPA predicts `h[p+h]` from `h[p]`, and the segmented forward "
+                f"cuts the window, so the horizon would cross a segment boundary "
+                f"— a state from a different window is a different objective. "
+                f"Escape: segment_len=0, or jepa_weight=0.0."
+            )
         out, rec_sum, counters = self.loop(
             h0,
             input_ids,
@@ -359,6 +401,15 @@ class DormouseModel(nn.Module):
                 loss = loss + self.cfg.sigreg_weight * sigreg_loss(
                     stride_sample(hn.reshape(-1, self.cfg.d_model).to(torch.float32))
                 )
+            if not pure and self.jepa is not None:
+                # JEPA (`jepa.py`) as ONE term: the causal latent prediction
+                # (`1 - cos(pred(h[p]), sg(h[p+h])))`) PLUS its own SIGReg
+                # anti-collapse term on the predicted latents, scaled by
+                # `jepa_reg_weight` INSIDE the head. `jepa_weight` scales the
+                # sum, so the mechanism cannot be split into two arms by a
+                # config. The counter is the seam's void check, as sigreg's is.
+                counters.count("jepa")
+                loss = loss + self.cfg.jepa_weight * self.jepa(out.to(torch.float32))
             if not pure and self.energy is not None:
                 # The ENERGY term (EBT arXiv:2507.02092, `energy.py`): the target
                 # byte's energy must beat `energy_negs` negatives sampled from

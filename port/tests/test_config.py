@@ -41,8 +41,9 @@ def test_unknown_key_refuses_and_names_the_escape():
     with pytest.raises(LoudError):
         parse_preset("d_models = 64\n")
     # A deleted stub field is refused the same way — the pin that `use_gr`,
-    # `use_mhc`, `use_mor`, `use_situ`, `jepa_weight` and `stress` are GONE and
-    # not merely unwired (a re-added field would accept the key again).
+    # `use_mhc`, `use_mor`, `use_situ` and `stress` are GONE and not merely
+    # unwired (a re-added field would accept the key again). `jepa_weight` left
+    # this list on 2026-10-21: it is a real field again (`model/jepa.py`).
     with pytest.raises(LoudError) as e:
         parse_preset("d_model = 64\nn_heads = 4\nhead_dim = 16\nuse_gr = true\n")
     assert "use_gr" in str(e.value)

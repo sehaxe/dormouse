@@ -158,6 +158,19 @@ testable and A/B-able (ADR-0017).
       loop and counts `halt_skipped`; `max_iter=8` builds/trains/evaluates;
       `port/scripts/ab_depth8.py` (`mi4` vs `mi8`, 3 seeds x 2 000, medium,
       `eval_depths`) written and **NOT run** (card busy). Landed 2026-10-21.
+- [x] P-JEPA. port (Python): JEPA as ONE mechanism. `port/src/dormouse/model/
+      jepa.py` — a causal latent predictor (`d(x) -> d/4 -> d`, `1 - cos(pred(h[p]),
+      sg(h[p+h]))`) with an INTERNAL SIGReg anti-collapse term on the predicted
+      latents (`jepa_reg_weight`, default 0.1), so the mechanism is self-contained
+      rather than a predictor plus a separate regulariser arm. Config `jepa` /
+      `jepa_weight` / `jepa_horizon` / `jepa_reg_weight` with LOUD refusals
+      (`use_byteflow`, `segment_len > 0`, `jepa_horizon < 1` or `> seq_len // 8`);
+      `jepa_weight = 0` builds no head and is bit-identical. The 200-step collapse
+      gate measures per-dim std **0.061 with the reg vs 29 351 without** (a
+      degenerate, scale-diverged latent) — the no-reg arm does NOT collapse to a
+      point at this scale (a cosine loss is scale-blind), and the test says so.
+      `port/scripts/ab_jepa.py` (off / h1 / h2, 3 seeds x 2 000, medium) written
+      and **NOT run** (card busy). Landed 2026-10-21.
 - [x] D1. `docs: retract the false step-time and verification claims` (prose only,
       no Rust). **Landed 2026-09-29.** Withdrawn without replacement, because the
       corrected value is not known: the 25.8 s/step batch-8 figure (no committed
