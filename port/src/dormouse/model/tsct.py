@@ -531,8 +531,10 @@ def init_u(in_features: int, rank: int, device: torch.device | str = "cpu") -> t
     width", which matters because ReZero's `residual_scale` starts at 1.0).
 
     ONE copy of the formula: the expert bank's latents (`DualLatentGLU`) and,
-    under `share_u`, the single basis `SparseMoE` owns draw the same factor.
-    Two transcriptions is how a shared basis and a per-expert one start the A/B
+    under `share_u`, the single basis `SparseMoE` owns (the `plane` mode's
+    `[d, rank]`, and the `dict` mode's `[d, share_u_rank]` DICTIONARY, whose
+    columns each expert reads `rank` of) draw the same factor. Two
+    transcriptions is how a shared basis and a per-expert one start the A/B
     from different scales and the comparison charges that to the mechanism.
     """
     return torch.randn(in_features, rank, device=device) / math.sqrt(in_features)

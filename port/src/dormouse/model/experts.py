@@ -15,21 +15,45 @@ The expert is TSCT2 §14's shape (`docs/reviews/tsct2-design-2026-10-04.md`):
   only into a 64-dim subspace gives too small an `R_act`; §14 answers with a
   shared expert of rank ~192-256 next to routed `r=32-64`).
 
-ONE switch on the routed experts, OFF by default: `share_u` (owner directive
-2026-10-21). The two INPUT bases (`gate_u`, `up_u`, each `[d, rank]`) stop being
-per-expert parameters: `SparseMoE` owns one `[d, rank]` per site and binds it
-into every routed expert, which keeps only its `s` and its write `V`. What the
-bank loses is E interchangeable copies of the same shape; what it keeps is a
-per-expert output direction and scale. That is the shape a rank-2 bank needs —
-with two latent directions per expert, the only thing that can make experts
-differ is a dictionary shared by all of them plus a per-expert write — and it is
-what the `r32s`/`r8s`/`r2s` arms of `scripts/ab_rank.py` measure against a
-per-expert-`U` control (`r64`). `share_u_forward` counts once per forward, so a
-`share_u=true` log with no such field measured a forward that did not run the
-arm. Refused LOUDLY with `factor_qat != "none"` (a shared basis has no
-per-expert α to quantize against — see `_refuse_shared_qat`) and, at the config
-layer, with `use_tsct = false`. Default off is bit-identical: no parameter, no
-draw, no counter.
+ONE switch on the routed experts, OFF by default: `share_u_mode` (owner
+directive 2026-10-21). The two INPUT bases (`gate_u`, `up_u`, each `[d, rank]`)
+stop being per-expert parameters and the bank keeps only each expert's `s` and
+its write `V`. `share_u` is the old boolean spelling of `share_u_mode="plane"`;
+one switch, two spellings, and a conflicting pair is refused (`config`).
+
+* **`plane`** — `SparseMoE` owns ONE `[d, rank]` per site and binds it into
+  every routed expert. What the bank loses is E interchangeable copies of the
+  same shape; what it keeps is a per-expert output direction and scale. That is
+  the shape a rank-2 bank needs — and its weakness is structural: every expert
+  projects the input onto the SAME `rank`-dimensional plane, so at rank 2 the
+  whole bank can only "see" two directions of a `d`-dim state.
+* **`dict`** — the refinement that can plausibly give rank 2 life:
+  `SparseMoE` owns ONE `[d, share_u_rank]` dictionary per site and each expert
+  reads `rank` of its columns, `idx [2, E, rank]` (row 0 the gate latent, row 1
+  the up latent). Two experts then see DIFFERENT `rank`-dimensional subspaces of
+  the same dictionary, and the bank's capacity lives in `d·share_u_rank` instead
+  of in E private copies. At medium (d=1024, f=2730, E=256, R=64, rank 2) the
+  bank is 1 464 320 parameters against the per-expert-`U` control's 78 315 520
+  (53x), the same order as `plane` rank 2 — which is the whole point: the
+  comparison against `plane` isolates *per-expert subspaces*, not the size.
+  The indices are **FIXED and seeded, never learned**: choosing a column is a
+  discrete decision with no gradient signal, so a learned selector is a second
+  mechanism (a straight-through estimator on top of a shared basis), and the
+  cheap falsification asks whether per-expert subspaces help AT ALL before
+  anyone pays for the selector. The dictionary gets its gradient from the
+  gathered columns (the sum over every expert that read them), which is what
+  `tests/test_share_u_dict.py` gate D pins.
+
+`share_u_forward` counts the `plane` forward and `share_u_dict_forward` the
+`dict` one, each once per `SparseMoE.forward` (the site) — the two are
+mutually exclusive, so a log carrying both is two MoEs or a wiring error, and a
+`share_u_mode="dict"` run with no `share_u_dict_forward` measured a forward
+that did not run the arm. Both are refused LOUDLY with `factor_qat != "none"`
+(a shared basis has no per-expert α to quantize against — see
+`_refuse_shared_qat`), with `use_tsct = false`, and `dict` additionally with
+`share_u_rank < 2` or `rank >= share_u_rank` (a width at or past the dictionary
+has no subset to choose, so every expert would read the whole plane). Default
+off is bit-identical: no parameter, no draw, no counter.
 
 Dispatch has TWO arms over ONE permute, and the log line says which ran:
 
@@ -169,6 +193,7 @@ from torch import nn
 from torch.autograd.graph import saved_tensors_hooks
 from torch.utils.checkpoint import checkpoint
 
+from ..config import SHARE_U_MODES
 from ..instrument import Counters, loud
 from .act_quant import fake_quant_act
 from .adaptive_topk import check_policy, choose_k, select_topk
@@ -287,6 +312,99 @@ def _refuse_shared_qat(factor_qat: str, where: str) -> None:
         )
 
 
+#: The seed the `dict` mode's column assignment is drawn from. FIXED on purpose:
+#: the indices are a constant of the model, so two builds of one config see the
+#: same subspaces, a resume reads the same ones, and `share_u_mode="off"` still
+#: draws nothing from the global stream. It is not drawn from the run's `--seed`
+#: because a seed that moves the architecture is a different model, not a
+#: different run of the same one.
+SHARE_U_DICT_SEED = 20_261_021
+
+
+def _check_dict_index(idx: torch.Tensor, dict_rank: int, cols: int, where: str) -> None:
+    """LOUD: a dictionary index that cannot gather `[d, dict_rank]` columns.
+
+    The constructor generates the index, so this fires for a hand-built one (a
+    test, a future resume that stores it) — never for silence. A wrong dtype is
+    refused with the same weight as an out-of-range value: `index_select` would
+    accept a `float` tensor by truncating it, which is a silent wrong subspace.
+    """
+    if idx.ndim != 3 or idx.shape[0] != 2 or idx.shape[2] != cols:
+        loud(
+            f"{where}: the share_u dictionary index must be [2, E, {cols}] "
+            f"(gate row, up row, `rank` columns each), got {tuple(idx.shape)}. "
+            f"Escape: build it with `share_u_dict_index`."
+        )
+    if idx.dtype != torch.long:
+        loud(
+            f"{where}: the share_u dictionary index must be int64, got {idx.dtype} "
+            f"— a float index is silently truncated by `index_select`, i.e. a "
+            f"different subspace than the one written down."
+        )
+    if idx.numel() and (int(idx.min()) < 0 or int(idx.max()) >= dict_rank):
+        loud(
+            f"{where}: the share_u dictionary index is out of range for a "
+            f"[d, {dict_rank}] dictionary: values [{int(idx.min())}, "
+            f"{int(idx.max())}], legal [0, {dict_rank}). Escape: share_u_rank >= "
+            f"rank and indices drawn from [0, share_u_rank)."
+        )
+
+
+def share_u_dict_index(
+    n_experts: int, dict_rank: int, cols: int, *, seed: int = SHARE_U_DICT_SEED
+) -> torch.Tensor:
+    """`[2, E, cols]` column indices into the `dict` mode's `[d, dict_rank]` dictionary.
+
+    Fixed and seeded (module docstring: a learned selector is a second
+    mechanism). Each row names `cols` DISTINCT columns, and a row never repeats
+    a column SET another row already read — the dictionary holds `C(R, cols)`
+    distinct subspaces, so two experts see the same plane only once that pool is
+    smaller than the bank (`2·E`, at E=1024/R=64/cols=2 it is by 32 rows; the
+    repeat is then the arithmetic's, not a choice). An expert's gate row and up
+    row are distinct sets too: with two identical sets the GLU is
+    `silu(xB·s_g) ⊙ (xB·s_u)`, a rescaling of one subspace, exactly the
+    dual-latent defect TSCT2 §13.3 exists to avoid. `cols < dict_rank` is
+    checked by the caller (`config.validate` refuses `rank >= share_u_rank`,
+    where there is no subset left to choose), so both redraws terminate.
+
+    The draw is from a local `torch.Generator`, so it cannot move the global
+    stream the model's init reads: `share_u_mode` changes the architecture, not
+    the other parameters' values.
+    """
+    if dict_rank < 2 or not 1 <= cols < dict_rank:
+        loud(
+            f"share_u_dict_index with dict_rank={dict_rank} cols={cols}: the "
+            f"dictionary needs dict_rank >= 2 and 1 <= cols < dict_rank (cols == "
+            f"dict_rank leaves no subset to choose — that is `share_u_mode="
+            f"'plane'`). Escape: share_u_rank > rank >= 1."
+        )
+    g = torch.Generator().manual_seed(seed)
+    used: set[frozenset[int]] = set()
+
+    def one_row(exclude: frozenset[int] | None) -> torch.Tensor:
+        # 64 tries to land on an UNUSED subspace; at the pool's edge (E·2 close
+        # to C(R, cols) or past it) the second loop accepts the repeat.
+        for _ in range(64):
+            row = torch.randint(0, dict_rank, (cols,), generator=g)
+            cols_ = set(row.tolist())
+            key = frozenset(cols_)
+            if len(cols_) == cols and key not in used and key != exclude:
+                used.add(key)
+                return row
+        while True:
+            row = torch.randint(0, dict_rank, (cols,), generator=g)
+            cols_ = set(row.tolist())
+            if len(cols_) == cols and frozenset(cols_) != exclude:
+                return row
+
+    idx = torch.empty(2, n_experts, cols, dtype=torch.long)
+    for e in range(n_experts):
+        idx[0, e] = one_row(None)
+        idx[1, e] = one_row(frozenset(idx[0, e].tolist()))
+    _check_dict_index(idx, dict_rank, cols, "share_u_dict_index")
+    return idx
+
+
 class DualLatentGLU(nn.Module):
     """`x [n, d] → [n, f]`: two rank-`r` latents, the GLU at the latent."""
 
@@ -323,7 +441,11 @@ class DualLatentGLU(nn.Module):
         #: per expert. Default off = the per-expert basis, and the parameter set
         #: every snapshot on record carries, unchanged.
         self.share_u = share_u
-        self._shared_u: tuple[nn.Parameter, nn.Parameter] | None = None
+        self._shared_u: tuple[torch.Tensor, torch.Tensor] | None = None
+        #: `dict` mode only: `[2, rank]` column indices into the parent's
+        #: dictionary — row 0 the gate latent, row 1 the up latent. `None`
+        #: under `plane`, where the bound pair IS the basis.
+        self._shared_index: torch.Tensor | None = None
         if share_u:
             _refuse_shared_qat(factor_qat, "DualLatentGLU")
         #: The a4.8 ACTIVATION switch (`act_quant.fake_quant_act`): the `x` fed
@@ -341,7 +463,12 @@ class DualLatentGLU(nn.Module):
         # The write `V [r, f]` — one, at the latent, after the GLU.
         self.v = nn.Parameter(torch.randn(rank, f, device=device) / math.sqrt(rank))
 
-    def bind_shared_u(self, gate_u: nn.Parameter, up_u: nn.Parameter) -> None:
+    def bind_shared_u(
+        self,
+        gate_u: torch.Tensor,
+        up_u: torch.Tensor,
+        index: torch.Tensor | None = None,
+    ) -> None:
         """Take the parent's ONE shared basis — the only way `share_u` gets its `U`s.
 
         Not a constructor argument on purpose: the tensor is owned by `SparseMoE`
@@ -350,9 +477,16 @@ class DualLatentGLU(nn.Module):
         expert with no binding refuses at `forward` (`_bases`) rather than
         inventing a basis — a silent private `U` would be a per-expert one
         wearing the shared arm's name.
+
+        `index [2, rank]` is the `dict` mode's column subset: `gate_u`/`up_u` are
+        then the same `[d, share_u_rank]` dictionary and each forward gathers its
+        two rows. Gathered HERE, per forward, not at bind time — a bind-time
+        gather would freeze step 0's columns and every later step would train a
+        constant.
         """
         assert self.share_u, "bind_shared_u on an expert that owns its own U"
         self._shared_u = (gate_u, up_u)
+        self._shared_index = index
 
     def _bases(self) -> tuple[torch.Tensor, torch.Tensor]:
         """The forward's `(gate_u, up_u)` — this expert's, or the bank's shared pair."""
@@ -365,7 +499,11 @@ class DualLatentGLU(nn.Module):
                 "Escape: build it under a SparseMoE with share_u on (it binds one "
                 "`[d, rank]` per site), or share_u=false."
             )
-        return self._shared_u
+        gate_u, up_u = self._shared_u
+        if self._shared_index is not None:
+            gate_u = gate_u.index_select(1, self._shared_index[0])
+            up_u = up_u.index_select(1, self._shared_index[1])
+        return gate_u, up_u
 
     def forward(self, x: torch.Tensor, glu=None) -> torch.Tensor:
         dt = self.compute_dtype
@@ -472,6 +610,19 @@ class SparseMoE(nn.Module):
                 )
             )
         )
+        #: The mode is resolved BEFORE the experts are built: `DualLatentGLU`'s
+        #: own `share_u` flag says "I own no `U`, the parent binds one", which is
+        #: a property of every non-`off` mode — not `cfg.share_u` (the legacy
+        #: alias, which is `false` for a `dict` run that was spelled with
+        #: `share_u_mode` alone).
+        self.share_u_mode = cfg.share_u_mode
+        if self.share_u_mode not in SHARE_U_MODES:
+            loud(
+                f"share_u_mode={self.share_u_mode!r}: known modes are "
+                f"{list(SHARE_U_MODES)} (a hand-built config reaches this module "
+                f"without the loader). Escape: name one of those."
+            )
+        self.share_u = self.share_u_mode != "off"
         self.experts = nn.ModuleList(
             DualLatentGLU(
                 d,
@@ -482,7 +633,7 @@ class SparseMoE(nn.Module):
                 factor_qat_alpha=cfg.factor_qat_alpha,
                 act_quant=cfg.act_quant,
                 act_group=cfg.act_group,
-                share_u=cfg.share_u,
+                share_u=self.share_u,
                 device=device,
             )
             for _ in range(cfg.n_experts)
@@ -498,12 +649,16 @@ class SparseMoE(nn.Module):
             act_group=cfg.act_group,
             device=device,
         )
-        #: `share_u` (owner directive 2026-10-21): ONE input basis per ROUTED
-        #: site, owned HERE and bound into every routed expert. The vocabulary
-        #: is TSCT's (`u [d, r]`, `s [r]`, `v [r, f]`), so this is the same
-        #: factorization with E per-expert copies of `U` replaced by one shared
-        #: dictionary — the direction the bank's capacity can live in when the
-        #: rank is too small for a private basis to carry anything.
+        #: `share_u` (owner directive 2026-10-21): the routed experts' INPUT
+        #: basis is not their own. `plane` = ONE input basis per ROUTED site,
+        #: owned HERE and bound into every routed expert; `dict` = ONE
+        #: dictionary `[d, share_u_rank]` and a per-expert column subset. The
+        #: vocabulary is TSCT's (`u [d, r]`, `s [r]`, `v [r, f]`), so this is the
+        #: same factorization with E per-expert copies of `U` replaced by one
+        #: shared dictionary — the direction the bank's capacity can live in when
+        #: the rank is too small for a private basis to carry anything. Module
+        #: docstring has the two modes, their arithmetic and why the `dict`
+        #: indices are fixed.
         #:
         #: Init is `tsct.init_u` — the same draw a per-expert `u` gets
         #: (`N(0, 1/sqrt(d))`), so the arm changes HOW MANY copies exist, not
@@ -514,13 +669,55 @@ class SparseMoE(nn.Module):
         #: `shared_rank`, so a `[d, rank]` basis is the wrong shape for it, and
         #: it is one expert (E = 1) — there is nothing to share with. Its own
         #: basis is one copy already.
-        self.share_u = cfg.share_u
+        #: The tensors the bank cache must key on beyond `self.experts`' own
+        #: parameters (`_banks`): one basis per site under `plane`, the one
+        #: dictionary under `dict`. Empty when off.
+        self._shared_params: tuple[nn.Parameter, ...] = ()
         if self.share_u:
             _refuse_shared_qat(self.factor_qat, "SparseMoE")
-            self.gate_u = nn.Parameter(init_u(d, cfg.rank, device))
-            self.up_u = nn.Parameter(init_u(d, cfg.rank, device))
-            for e in self.experts:
-                e.bind_shared_u(self.gate_u, self.up_u)
+            if not cfg.use_tsct:
+                loud(
+                    f"share_u_mode={self.share_u_mode!r} with use_tsct=false: the "
+                    f"shared basis is a TSCT input factor, and a dense projection "
+                    f"has no factor basis to share. Escape: use_tsct=true, or "
+                    f"share_u_mode='off'."
+                )
+            if self.share_u_mode == "dict":
+                if cfg.share_u_rank < 2:
+                    loud(
+                        f"share_u_mode='dict' with share_u_rank={cfg.share_u_rank}: "
+                        f"two columns are the minimum for a plane. Escape: "
+                        f"share_u_rank >= 2."
+                    )
+                if cfg.rank >= cfg.share_u_rank:
+                    loud(
+                        f"share_u_mode='dict' with rank={cfg.rank} >= "
+                        f"share_u_rank={cfg.share_u_rank}: each expert reads `rank` "
+                        f"columns of the dictionary; at or past its width there is "
+                        f"no subset to choose and the index could read out of "
+                        f"range. Escape: share_u_rank > rank."
+                    )
+                self.u_dict = nn.Parameter(init_u(d, cfg.share_u_rank, device))
+                #: FIXED, SEEDED, NOT LEARNED (`share_u_dict_index`): a discrete
+                #: column choice has no gradient, so a selector would be a second
+                #: mechanism; this arm asks whether per-expert subspaces help at
+                #: all. A buffer, not a parameter, and derived from (E, R, rank)
+                #: — non-persistent for the same reason `lfb_bias` is: a resume
+                #: rebuilds it identically instead of trusting a stale one.
+                self.register_buffer(
+                    "share_u_idx",
+                    share_u_dict_index(cfg.n_experts, cfg.share_u_rank, cfg.rank),
+                    persistent=False,
+                )
+                for e, row in zip(self.experts, self.share_u_idx.permute(1, 0, 2), strict=True):
+                    e.bind_shared_u(self.u_dict, self.u_dict, row)
+                self._shared_params = (self.u_dict,)
+            else:
+                self.gate_u = nn.Parameter(init_u(d, cfg.rank, device))
+                self.up_u = nn.Parameter(init_u(d, cfg.rank, device))
+                for e in self.experts:
+                    e.bind_shared_u(self.gate_u, self.up_u)
+                self._shared_params = (self.gate_u, self.up_u)
         # The router: ONE 2-D linear on the raw hidden state (not on the
         # latent), softmax over the bank, then top-k + a capacity-bound permute.
         self.router = nn.Linear(d, cfg.n_experts, bias=False, device=device)
@@ -543,13 +740,17 @@ class SparseMoE(nn.Module):
 
     def forward(self, x: torch.Tensor, counters: Counters | None = None) -> torch.Tensor:
         counters = Counters() if counters is None else counters
-        if self.share_u:
+        if self.share_u_mode == "plane":
             # The shared-basis arm's evidence line (ADR-0019): `_banks` owns no
             # counters and the routed / dense arms reach the basis through
             # different code paths, so the ONE place every forward passes is
             # here. A `share_u=true` run whose log has no `share_u_forward` did
-            # not run the arm it is labelled with.
+            # not run the arm it is labelled with. `dict` has its own counter and
+            # the two are mutually exclusive — a log carrying both is two MoEs or
+            # a wiring error.
             counters.count("share_u_forward")
+        elif self.share_u_mode == "dict":
+            counters.count("share_u_dict_forward")
         n = x.shape[0]
         assert x.ndim == 2 and x.shape[1] == self.d, f"MoE input {tuple(x.shape)} != [n, {self.d}]"
         dt = self.experts[0].compute_dtype  # the shared compute dtype
@@ -843,7 +1044,12 @@ class SparseMoE(nn.Module):
         **Under `share_u`** the two input stacks are the SHARED basis
         materialized E-fold (`_one`), so every arm — padded, grouped GEMMs,
         reference loop — takes the same `[E, d, r]` operands as before and only
-        the stored parameter count changes. The shared tensors are not inside
+        the stored parameter count changes. `plane` expands one pair of
+        `[d, rank]` per site; `dict` gathers each expert's `rank` columns out of
+        the one `[d, share_u_rank]` dictionary (`u.t()[idx[row]]`), which is a
+        differentiable gather — the backward sums every expert's contribution
+        into the columns it read, and leaves the rest of the dictionary with no
+        gradient from that expert. The shared tensors are not inside
         `self.experts`, so their `_version`s are part of the key explicitly.
         """
         grad = torch.is_grad_enabled()
@@ -852,7 +1058,12 @@ class SparseMoE(nn.Module):
         # same untracked stack on every forward of a frozen model. Under
         # `share_u` the experts have no `u` of their own, so the shared basis is
         # the tensor whose grad state the cache must be able to serve.
-        want = grad and (self.gate_u if self.share_u else self.experts[0].gate_u).requires_grad
+        want = (
+            grad
+            and (
+                self._shared_params[0] if self._shared_params else self.experts[0].gate_u
+            ).requires_grad
+        )
         key = (
             dt,
             self.factor_qat,
@@ -860,10 +1071,10 @@ class SparseMoE(nn.Module):
             tuple(p._version for e in self.experts for p in e.parameters()),
             # The shared basis is not inside `self.experts`, so its `_version`
             # is not in the tuple above: without this an optimizer step that
-            # moved ONLY `gate_u`/`up_u` would serve a stale bank. (The trainer's
-            # `invalidate_banks` also covers that, but the cache must not depend
-            # on a caller for its own correctness.)
-            tuple(p._version for p in (self.gate_u, self.up_u)) if self.share_u else (),
+            # moved ONLY `u_dict` (or `gate_u`/`up_u`) would serve a stale bank.
+            # (The trainer's `invalidate_banks` also covers that, but the cache
+            # must not depend on a caller for its own correctness.)
+            tuple(p._version for p in self._shared_params),
             want,
         )
         cached = getattr(self, "_bank_cache", None)
@@ -890,7 +1101,18 @@ class SparseMoE(nn.Module):
             # needs). Scales (`gate_s`/`up_s`) are never quantized: they ARE
             # the diag(s) of the factorization.
             def _one(name: str) -> torch.Tensor:
-                if self.share_u and name in ("gate_u", "up_u"):
+                if self.share_u_mode == "dict" and name in ("gate_u", "up_u"):
+                    # The bank's ONE dictionary, gathered into the [E, d, rank]
+                    # stack the arms (and the triton ABI) take. `t()[idx]` picks
+                    # each expert's columns; `.contiguous()` is a differentiable
+                    # copy, so the backward sums every expert's contribution into
+                    # the columns it READ and the rest stay at zero — which is
+                    # what "the dictionary sees every expert that used it" means
+                    # in code. Only the VALUES are E-fold; the parameter is one.
+                    row = 0 if name == "gate_u" else 1
+                    cols = self.u_dict.to(dt).t()[self.share_u_idx[row]]  # [E, r, d]
+                    return cols.permute(0, 2, 1).contiguous()  # [E, d, r]
+                if self.share_u_mode == "plane" and name in ("gate_u", "up_u"):
                     # The bank's ONE basis, materialized as the [E, d, r] stack
                     # the arms (and the triton ABI) take. `.contiguous()` is a
                     # differentiable copy, so the backward sums every expert's
