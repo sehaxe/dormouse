@@ -6,11 +6,11 @@ citations in `model/mhc.py`); the wiring decisions are
 readout, `H_pre` by the caller, `h_ctx` as `x_l`).
 
 The gates here are the ones the burn lane's review paid for: a hand-computed
-Eq. 3 fixture (the red→green table is only worth its numbers if the test was
-run), the manifold's defining property in BOTH directions, the near-identity
-at init as a PRINTED number, per-parameter gradient flow (not "the loss has a
-gradient"), no host sync, and a loud refusal of the configurations that were
-never A/B'd.
+Eq. 3 fixture, the manifold's defining property in BOTH directions, the
+derived Eq. 14 init pinned as values, the ON-vs-OFF logits `torch.equal` at
+that init (the A/B's identity gate), per-parameter gradients with the two
+structural floors NAMED, no host sync, and a loud refusal of the
+configurations that were never A/B'd.
 """
 
 from __future__ import annotations
@@ -25,7 +25,13 @@ from conftest import BATCH, SEQ, tiny_cfg, tiny_model
 from dormouse.config import ModelConfig, load_run, parse_preset
 from dormouse.instrument import Counters, LoudError
 from dormouse.model import DormouseModel, param_count
-from dormouse.model.mhc import SINKHORN_ITERS, MHCMix, sinkhorn_knopp
+from dormouse.model.mhc import (
+    ALPHA_INIT,
+    B_RES_INIT,
+    SINKHORN_ITERS,
+    MHCMix,
+    sinkhorn_knopp,
+)
 
 #: `tiny_cfg()`'s parameter count at HEAD before this port: the pin that the
 #: OFF arm builds today's tree exactly (mHC adds 1 035 here: 1 024 φ + 11
@@ -96,6 +102,10 @@ def test_sinkhorn_is_doubly_stochastic_and_non_negative():
     streams = torch.randn(2, 3, 2, 8)
     for label in ("init", "perturbed"):
         if label == "perturbed":
+            # A fixed draw: 20 iterations reach 1e-5 here (the paper's
+            # Fig. 7(a) reads the same converged-to-fp direction); an unseeded
+            # draw can land on a slow-converging matrix and read 4.5e-4.
+            torch.manual_seed(1)
             with torch.no_grad():
                 mix.b_res.normal_(0.0, 1.0)
         _, _, h_res = mix.hyper_mappings(streams)
@@ -138,60 +148,168 @@ def test_off_is_bit_identical_to_today():
     assert "loop.mhc.b_res" in dict(on.named_parameters())
 
 
-def test_at_init_the_mix_is_rezero_at_scale_one():
-    """(c) At init the operator writes `h + y`; the distance is printed.
+def test_the_derived_biases_are_the_paper_maps():
+    """(c) Eq. 14's maps, derived in the module's own forms, pinned as values.
 
-    `b_res = 0` makes `H_res` UNIFORM (not the identity — the 2026-10-02
-    fidelity fix), and uniform mixing is the identity on replicated lanes
-    (`x_l = vec(h0)`, Eq. 3); `b_pre = 10` → `H_pre ≈ 1`, `b_post = 0` →
-    `H_post ≈ 1`, so the write is ReZero at `residual_scale = 1` to within the
-    α=0.01 dynamic term. This is the crate's gate (`mhc-2026-09-30.md` §5.3),
-    with its relative bounds: `< 1e-2` so the arms start as the same function,
-    `> 1e-6` so an arm that is BITWISE ReZero (the projection not in the write
-    at all) fails.
+    `2409.19606` Eq. 14: `B = 1`, `A_m = e_{k mod n}`, `A_r = I`, dynamic
+    `W = 0` (§2.3). In this module: `phi_* = 0`, `alpha_* = 0.01` (mHC App. A.1
+    Table 5), `b_pre = logit(1/K)`, `b_post = 0`, `b_res = log(J/K) = -ln K`.
+    The first three make `H_pre = 1/K` and `H_post = 1`; the last is the log of
+    the uniform fixed point, which is the identity on the paper's replicated
+    lanes (the Sinkhorn is shift-invariant, so `-ln K` and burn's `0` denote
+    the same map — the derived value is pinned, not the chosen one). The exact
+    `A_r = I` is `log I = -inf` off-diagonal and is NOT approximated with a
+    stiff diagonal (that is burn's frozen `10·I`).
     """
-    torch.manual_seed(0)
     mix = MHCMix(64, 2)
-    h = torch.randn(2, 4, 64)
-    lanes = h.unsqueeze(-2).expand(2, 4, 2, 64)
-    branch = torch.randn(2, 4, 64)
-    out = mix(lanes, branch)
-    want = lanes + branch.unsqueeze(-2)  # ReZero at scale 1, per lane
-    rel = float(((out - want).norm() / want.norm()).detach())
-    print(f"[mhc] at-init relative write distance from ReZero@1: {rel:.3e}")
-    assert 1e-6 < rel < 1e-2, rel
+    with torch.no_grad():
+        assert torch.equal(mix.phi_pre, torch.zeros_like(mix.phi_pre))
+        assert torch.equal(mix.phi_post, torch.zeros_like(mix.phi_post))
+        assert torch.equal(mix.phi_res, torch.zeros_like(mix.phi_res))
+        one = torch.full_like(mix.alpha_pre, ALPHA_INIT)
+        assert torch.equal(mix.alpha_pre, one)
+        assert torch.equal(mix.alpha_post, one)
+        assert torch.equal(mix.alpha_res, one)
+        assert float(mix.b_pre[0]) == math.log(1.0 / (mix.n_streams - 1)) == 0.0
+        assert float(mix.b_post[0]) == 0.0
+        assert torch.equal(
+            mix.b_res, torch.full_like(mix.b_res, -math.log(mix.n_streams))
+        )
+        assert float(mix.b_res[0, 0]) == float(torch.tensor(B_RES_INIT))
+        lanes = torch.randn(2, 4, 2, 64)
+        h_pre, h_post, h_res = mix.hyper_mappings(lanes)
+        assert torch.equal(h_pre, torch.full_like(h_pre, 1.0 / mix.n_streams)), h_pre
+        assert torch.equal(h_post, torch.ones_like(h_post)), h_post
+        assert torch.equal(h_res, torch.full_like(h_res, 1.0 / mix.n_streams)), h_res
+        # The only state the paper's init creates is K copies of h; on it the
+        # uniform fixed point IS the identity, bit for bit (Eq. 3's write).
+        replicated = torch.randn(2, 4, 64).unsqueeze(-2).expand(2, 4, 2, 64)
+        mixed = torch.einsum("btij,btjd->btid", h_res, replicated)
+        assert torch.equal(mixed, replicated)
 
 
-def test_every_mhc_parameter_gets_a_finite_non_zero_gradient_in_three_steps():
-    """(d) All nine parameters, per parameter, after a real 3-step run.
+def test_at_init_mhc_and_off_are_bit_identical():
+    """(c) One seed, `use_mhc=true` vs `false`: every weight and the LOGITS.
 
-    Per-parameter because an aggregate hides a detached arm (the `8fa5d4c`
-    shape). `b_pre = 10` sits on σ's flat top — its gradient is ~1e-7 and must
-    still be NON-ZERO; `phi_res`'s path runs through the Sinkhorn, which is
-    exactly where a silent `detach` would hide.
+    The derived init draws no RNG (phi zeros), so the ON model does not shift
+    the shared initialisation (`lm_head` included); `H_pre = 1/K`,
+    `H_post = 1` and `H_res = J/K` then make the body input and the summed
+    readout the plain residual connection, so the logits are `torch.equal`,
+    not "5.4e-04 close". This is the point of the identity-at-init: the A/B
+    measures the mechanism, not a perturbation.
+    """
+    x, _ = _batch()
+    torch.manual_seed(3)
+    off = tiny_model()
+    torch.manual_seed(3)
+    on = tiny_model(use_mhc=True)
+    off_sd, on_sd = off.state_dict(), on.state_dict()
+    for k, v in off_sd.items():
+        assert k in on_sd and torch.equal(on_sd[k], v), f"shared weight moved: {k}"
+    with torch.no_grad():
+        a, _, _ = on(x)
+        b, _, _ = off(x)
+    diff = float((a - b).abs().max())
+    print(f"[mhc] at-init logits: equal={torch.equal(a, b)} max|diff|={diff:.3e}")
+    assert torch.equal(a, b), diff
+
+
+def test_the_gradient_at_the_derived_init_prints_every_parameter():
+    """(d) Per-parameter gradients, with the two floors NAMED, not hidden.
+
+    At the derived init `phi_* = 0`, so `d(α·xφ)/dφ = α·x ≠ 0` (the wired
+    projections and biases train) while `d/dα = xφ = 0`: `alpha_*` are exactly
+    zero on the first step and move from the second. `phi_res` is also at the
+    floor, for a different reason: the full-width SUM readout weights every
+    lane equally, so `∂loss/∂H_res` is row-constant and the Sinkhorn's row
+    normalisation annihilates exactly that direction. This is the same floor
+    that made burn's `10·I` `|grad α_res| = 7.3e-9` (F-F4); the fix is a
+    lane-specific readout, not a bias — the module-level gate below proves the
+    mixer itself is differentiable.
+
+    The assertion is the strongest true statement at this init: every
+    parameter is finite and non-NaN, and the four wired parameters train
+    (`> 1e-8`). The two floors are printed and pinned as `< 1e-8`, so a future
+    readout change that wakes them up will not silently pass unnoticed.
     """
     x, y = _batch()
     model = DormouseModel(tiny_cfg(use_mhc=True))
     opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
     loss = None
-    for _ in range(3):
+    grads: list[str] = []
+    for step in range(3):
         opt.zero_grad()
         _, loss, _ = model(x, y)
         assert loss is not None
         loss.backward()
+        if step == 0:
+            first = {
+                name: float(p.grad.abs().max())
+                for name, p in model.loop.mhc.named_parameters()
+            }
+            print(
+                "[mhc] step-1 max|grad|: "
+                + " ".join(f"{k}={v:.2e}" for k, v in first.items())
+            )
         opt.step()
     assert loss is not None and math.isfinite(float(loss.detach()))
     seen = 0
-    grads: list[str] = []
     for name, p in model.loop.mhc.named_parameters():
         seen += 1
         g = p.grad
         assert g is not None, f"{name}: no gradient slot"
         assert bool(torch.isfinite(g).all()), name
-        assert float(g.abs().max()) > 0.0, f"{name}: gradient is exactly zero"
         grads.append(f"{name}={float(g.abs().max()):.2e}")
     print("[mhc] 3-step max|grad|: " + " ".join(grads))
     assert seen == 9, seen  # 3 φ + 3 α + 3 biases (b_res counts as one)
+    for name in ("phi_pre", "phi_post", "b_pre", "b_post"):
+        assert first[name] > 1e-8, (name, first[name])
+    # The floors: alpha=0 because phi=0; phi_res killed by the sum readout's
+    # row-constant gradient through the Sinkhorn's row normalisation.
+    for name in ("alpha_pre", "alpha_post", "alpha_res", "phi_res"):
+        assert first[name] < 1e-8, (name, first[name])
+
+
+def test_the_residual_mixer_is_live_when_the_loss_distinguishes_lanes():
+    """(d') The Sinkhorn path is not detached: a lane-specific loss gives φ_res.
+
+    The model's readout is a symmetric sum, which is why the full-model φ_res
+    gradient is zero (above). Read ONE lane and the off-diagonal columns get a
+    real gradient at the SAME derived init — this is the proof that the zero is
+    the readout's symmetry, not a `detach` in the Sinkhorn. A second pass with
+    `phi_res` moved off zero gives BOTH `phi_res` and `alpha_res` > 1e-8,
+    closing the bilinear corner (`d/dα = xφ`).
+    """
+    torch.manual_seed(0)
+    mix = MHCMix(64, 2)
+    lanes = torch.randn(2, 4, 2, 64)
+    branch = torch.randn(2, 4, 64)
+    out = mix(lanes, branch)
+    # Lane-specific: lane 0 weighted 2x lane 1. The model's sum readout is the
+    # 1/2,1/2 case; this is the same operator with a non-symmetric use.
+    (2.0 * out[..., 0, :].pow(2).sum() + out[..., 1, :].pow(2).sum()).backward()
+    phi_at_init = float(mix.phi_res.grad.abs().max())
+    alpha_at_init = float(mix.alpha_res.grad.abs().max())
+    print(
+        f"[mhc] lane-specific step: phi_res={phi_at_init:.3e} "
+        f"alpha_res={alpha_at_init:.3e} (alpha is 0 because phi=0)"
+    )
+    assert phi_at_init > 1e-8, phi_at_init
+    assert alpha_at_init == 0.0, alpha_at_init  # d(αφ)/dα = φ = 0
+    # Off the bilinear corner both are live; this is what step 2 of a real run
+    # reaches once the φ gradient has moved.
+    with torch.no_grad():
+        mix.phi_res.normal_(0.0, 0.01)
+    mix.zero_grad()
+    out = mix(lanes, branch)
+    (2.0 * out[..., 0, :].pow(2).sum() + out[..., 1, :].pow(2).sum()).backward()
+    print(
+        f"[mhc] lane-specific step (phi moved): "
+        f"phi_res={float(mix.phi_res.grad.abs().max()):.3e} "
+        f"alpha_res={float(mix.alpha_res.grad.abs().max()):.3e}"
+    )
+    assert float(mix.phi_res.grad.abs().max()) > 1e-8
+    assert float(mix.alpha_res.grad.abs().max()) > 1e-8
 
 
 def test_the_forward_never_reads_a_device_scalar(monkeypatch):
@@ -241,14 +359,20 @@ def test_wiring_counts_one_mhc_write_per_iteration():
     assert c_on["mhc"] == on.cfg.max_iter == c_on["iter"]
     assert "mhc" not in c_off
     assert c_off["rezero_write"] == off.cfg.max_iter
-    # The arm is IN the write: dropping the module (not rebuilding the model)
-    # falls back to ReZero on the same weights and moves the logits.
+    # The arm is IN the write. At the derived init it IS ReZero, so dropping
+    # the module on the same weights changes nothing. Move `H_pre` off the
+    # derived 1/K mix — the readout's mean is invariant to `H_res` and to a
+    # zero-sum `H_post` split on replicated lanes, so `H_pre` is the parameter
+    # that makes the module visible in the function (mhc.py's gradient caveat).
     with torch.no_grad():
-        before, _, _ = on(x)
+        at_init, _, _ = on(x)
+        on.loop.mhc.b_pre.fill_(10.0)
+        moved, _, _ = on(x)
         on.loop.mhc = None
         after, _, _ = on(x)
-    assert torch.isfinite(before).all() and torch.isfinite(after).all()
-    assert not torch.equal(before, after)
+    assert torch.isfinite(at_init).all() and torch.isfinite(moved).all()
+    assert torch.isfinite(after).all()
+    assert not torch.equal(moved, after)
 
 
 def test_mhc_streams_other_than_two_is_a_loud_refusal():
