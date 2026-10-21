@@ -63,7 +63,7 @@ from torch import nn
 from torch.utils.checkpoint import checkpoint
 
 from ...instrument import Counters, loud
-from ..tsct import qat_linear
+from ..tsct import dense_qat_kind, qat_linear
 from .sparse import MSA_BLOCK, MSA_TOPK, FlexSparseSelector
 
 try:  # the fused gather is an ABILITY: without triton the module is not importable
@@ -161,7 +161,11 @@ class BlockSparseAttention(nn.Module):
         #: The DENSE path's switch (`tsct.dense_qat_project`, the SAME projector
         #: as the factor rung): the arm's three projections are plain
         #: `nn.Linear`s, so their weights are read through the annealed STE.
-        self.dense_qat = cfg.dense_qat
+        #: They are ATTENTION, so the default `dense_qat_skip_attn` keeps them
+        #: bf16 (the BitNet rule; `tsct.DENSE_QAT_ATTN_SITES` owns the list).
+        self.dense_qat = dense_qat_kind(
+            cfg, "loop.msa.q_proj", "loop.msa.k_proj", "loop.msa.v_proj"
+        )
         self.dense_qat_alpha = cfg.factor_qat_alpha
         if self.use_msa:
             # Built only when the arm runs: `use_msa=False` must leave the whole

@@ -76,7 +76,7 @@ from .experts import SparseMoE
 from .kda import KDAAttention
 from .qat_cache import QuantCache
 from .sparse import BlockSparseAttention
-from .tsct import dense_qat_project, make_projection, mm_mixed
+from .tsct import dense_qat_weight, make_projection, mm_mixed
 
 __all__ = ["AttnResSlot", "LoopBlock", "depth_attend", "memory_floor_mix"]
 
@@ -324,7 +324,7 @@ class LoopBlock(nn.Module):
             # parameter object), so the default path is byte-for-byte today's.
             raw = mm_mixed(
                 ctrl,
-                dense_qat_project(
+                dense_qat_weight(
                     self.controller.weight,
                     self.dense_qat,
                     self.dense_qat_alpha,
@@ -376,7 +376,7 @@ class LoopBlock(nn.Module):
                     (
                         mm_mixed(
                             normed.reshape(b * t, d),
-                            dense_qat_project(
+                            dense_qat_weight(
                                 self.mem_dense.weight,
                                 self.dense_qat,
                                 self.dense_qat_alpha,

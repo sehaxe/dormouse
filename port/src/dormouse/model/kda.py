@@ -84,7 +84,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from ..instrument import Counters
-from .tsct import qat_linear
+from .tsct import dense_qat_kind, qat_linear
 
 #: Cached warmup verdict per device TYPE: `{"cuda": (ok, why), "cpu": (ok, why)}`.
 _FLA: dict[str, tuple[bool, str]] = {}
@@ -213,8 +213,17 @@ class KDAAttention(nn.Module):
         #: The DENSE path's switch (`tsct.dense_qat_project`, the SAME projector
         #: as the factor rung): `q/k/v/g/beta` are plain `nn.Linear`s, so their
         #: weights are read through the annealed STE. `dense_qat_alpha` is the
-        #: SAME alpha the factor ramp sets (`set_factor_qat_alpha`).
-        self.dense_qat = cfg.dense_qat
+        #: SAME alpha the factor ramp sets (`set_factor_qat_alpha`). All five
+        #: sites are ATTENTION, so the default `dense_qat_skip_attn` keeps them
+        #: bf16 (the BitNet rule; `tsct.DENSE_QAT_ATTN_SITES` owns the list).
+        self.dense_qat = dense_qat_kind(
+            cfg,
+            "loop.attn.q_proj",
+            "loop.attn.k_proj",
+            "loop.attn.v_proj",
+            "loop.attn.g_proj",
+            "loop.attn.beta_proj",
+        )
         self.dense_qat_alpha = cfg.factor_qat_alpha
         for name in ("q_proj", "k_proj", "v_proj", "g_proj"):
             setattr(self, name, nn.Linear(d, d, bias=False, device=device))

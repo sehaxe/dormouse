@@ -512,6 +512,50 @@ def factor_qat_project(
 #: the forward goes through when `dense_qat != "none"`.
 dense_qat_project = factor_qat_project
 
+#: The attention sites `dense_qat_skip_attn` leaves in bf16 — ONE list, read by
+#: `dense_qat_kind` below AND by `tests/test_dense_qat.py`'s coverage gate, so a
+#: site cannot join the quantized set by accident. KDA's five projections and
+#: the MSA pair + its selector: BitNet b1.58 (arXiv:2402.17764) quantizes the
+#: FFN weight matrices, not attention, and our `act_quant` already upgrades the
+#: attention path to >= 8 bits. Projecting these ten measured +0.198 BPB
+#: (+6.5%) against the bf16 control (2026-10-21, medium b8 s512, 2000 steps,
+#: one 81 920 B eval window, 3 seeds).
+DENSE_QAT_ATTN_SITES = (
+    "loop.attn.q_proj",
+    "loop.attn.k_proj",
+    "loop.attn.v_proj",
+    "loop.attn.g_proj",
+    "loop.attn.beta_proj",
+    "loop.msa.q_proj",
+    "loop.msa.k_proj",
+    "loop.msa.v_proj",
+    "loop.msa.selector.q_idx",
+    "loop.msa.selector.k_idx",
+)
+
+
+def dense_qat_kind(cfg, *sites: str) -> str:
+    """`cfg.dense_qat`, or `"none"` when `dense_qat_skip_attn` and any site is attention.
+
+    Every consumer names ALL the sites it owns, so a module whose sites are in
+    `DENSE_QAT_ATTN_SITES` reads bf16 wholesale and a new `nn.Linear` added to
+    it inherits the rule instead of silently joining the quantized set.
+    """
+    if cfg.dense_qat_skip_attn and any(site in DENSE_QAT_ATTN_SITES for site in sites):
+        return "none"
+    return cfg.dense_qat
+
+
+def dense_qat_weight(weight: torch.Tensor, kind: str, alpha: float, *, cache=None):
+    """`dense_qat_project`, or the master itself when the arm is off.
+
+    The no-op arm must not even CALL the projector: `tests/test_dense_qat.py`'s
+    gate d spies the function and requires zero calls for `dense_qat="none"`.
+    """
+    if kind == "none":
+        return weight
+    return dense_qat_project(weight, kind, alpha, cache=cache)
+
 
 def qat_linear(linear: nn.Linear, x: torch.Tensor, kind: str, alpha: float) -> torch.Tensor:
     """`linear(x)` with `dense_qat` applied to its weight — the master when off.
@@ -876,7 +920,7 @@ class DenseLinear(nn.Module):
         self.bias = nn.Parameter(torch.zeros(out_features, device=device)) if bias else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        w = dense_qat_project(
+        w = dense_qat_weight(
             self.weight, self.dense_qat, self.dense_qat_alpha, cache=self._qat_cache
         )
         if self.compute_dtype != torch.float32:

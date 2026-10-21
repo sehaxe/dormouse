@@ -535,6 +535,17 @@ class ModelConfig:
     #: convention) are listed at `DENSE_QATS`; `use_byteflow` is refused with a
     #: non-`none` value (its net's projections are not on this seam).
     dense_qat: str = "none"
+    #: Keep ATTENTION weights out of `dense_qat` — the BitNet b1.58 rule, and
+    #: the default. `tsct.DENSE_QAT_ATTN_SITES` names the ten sites (KDA's
+    #: q/k/v/g/beta and the MSA pair + its selector): b1.58 (arXiv:2402.17764)
+    #: quantizes the FFN weight matrices, not attention, and our own
+    #: `act_quant` already upgrades the attention path to >= 8 bits. Measured
+    #: 2026-10-21 on medium b8 s512, 2000 steps, one 81 920 B eval window, 3
+    #: seeds: with those ten sites projected, `factor_qat=ternary` +
+    #: `dense_qat=ternary` scored BPB 3.2733 against the bf16 control's 3.0750
+    #: (+0.198, +6.5%). `true` passes `kind="none"` at those sites; `false`
+    #: restores that measured run's behaviour and is what the A/B arm uses.
+    dense_qat_skip_attn: bool = True
     #: MemGLU's RMS-calibration constant — the authors' 9M-scale value
     #: (`2608.07323` appendix table: 0.6039096539628113).
     memglu_c0: float = 0.6039096539628113

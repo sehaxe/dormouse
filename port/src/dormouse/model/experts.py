@@ -217,7 +217,7 @@ from ..instrument import Counters, loud
 from .act_quant import fake_quant_act
 from .adaptive_topk import check_policy, choose_k, select_topk
 from .qat_cache import QuantCache, qat_project_stacked
-from .tsct import dense_qat_project, factor_qat_project, init_u, mm_mixed
+from .tsct import dense_qat_weight, factor_qat_project, init_u, mm_mixed
 
 try:  # the Triton arm is an ABILITY, not a dependency
     from . import moe_kernels
@@ -789,7 +789,7 @@ class SparseMoE(nn.Module):
         # `dense_qat_project` is the identity when the arm is off.
         logits = mm_mixed(
             x,
-            dense_qat_project(
+            dense_qat_weight(
                 self.router.weight,
                 self.dense_qat,
                 self.dense_qat_alpha,
@@ -885,7 +885,7 @@ class SparseMoE(nn.Module):
         # down: an fp32-master Linear; bf16 matmul + fp32 out (MAGMA fix).
         return mm_mixed(
             weighted.to(dt),
-            dense_qat_project(
+            dense_qat_weight(
                 self.down.weight,
                 self.dense_qat,
                 self.dense_qat_alpha,

@@ -206,6 +206,20 @@ testable and A/B-able (ADR-0017).
       scratch revert. `port/scripts/bench_qat_cost.py` now prints bf16 /
       per-tensor / stacked ms/step and the launch counts — written, **NOT run**
       (card busy): **NO TIMING EXISTS** for the stacked path. Landed 2026-10-21.
+- [x] P-QAT-ATTN. port (Python): `dense_qat_skip_attn` (default **true**) keeps
+      attention in bf16 under `dense_qat` — the BitNet b1.58 rule (arXiv
+      2402.17764), which our own `act_quant` already encodes as "attention is
+      never below 8 bits". Measured 2026-10-21 (medium b8 s512, 2000 steps,
+      81 920 B window, 3 seeds): projecting the ten KDA/MSA sites scored BPB
+      **3.2733 vs the bf16 control's 3.0750** (+0.198, +6.5%).
+      `tsct.DENSE_QAT_ATTN_SITES` is the ONE per-site list the implementation
+      and the coverage test read; `false` restores the measured arm bit for bit
+      (golden fixture, `torch.equal`), and gates a-e pin the skip, the restore,
+      the bf16 master, the inert `dense_qat=none` case and the no-host-sync
+      path, each proven by a scratch revert. `scripts/ab_ternary_form.py`
+      (arms f / b / n; `a` dropped — no int8 weight codec, only an activation
+      seam) is written and **NOT run**: the release-form verdict needs its 3
+      arms. Landed 2026-10-21.
 - [x] P-LAUNCH. port (Python): measure the launches behind the b8-s512 3.55x
       per-byte gap, and gate the two legal levers. `scripts/launch_profile.py`
       profiles ONE full medium step (bf16 and ternary): `cudaLaunchKernel`

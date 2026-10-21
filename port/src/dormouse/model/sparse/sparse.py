@@ -43,7 +43,7 @@ import torch
 from torch import nn
 
 from ...instrument import Counters
-from ..tsct import qat_linear
+from ..tsct import dense_qat_kind, qat_linear
 
 #: Indexer query heads — the recipe's MQA shape ("4 q-heads, 1 shared k-head").
 MSA_Q_HEADS = 4
@@ -79,7 +79,10 @@ class FlexSparseSelector(nn.Module):
         #: The DENSE path's switch (`tsct.dense_qat_project`, the SAME projector
         #: as the factor rung): the indexer's two projections are plain
         #: `nn.Linear`s, so their weights are read through the annealed STE.
-        self.dense_qat = cfg.dense_qat
+        #: They too are ATTENTION: `dense_qat_skip_attn` keeps them bf16.
+        self.dense_qat = dense_qat_kind(
+            cfg, "loop.msa.selector.q_idx", "loop.msa.selector.k_idx"
+        )
         self.dense_qat_alpha = cfg.factor_qat_alpha
 
     def forward(
