@@ -37,6 +37,7 @@ from .byteflow import (
     count_channel,
 )
 from .dspark import DSparkHead, dspark_aux_loss
+from .energy import EnergyHead, energy_contrastive_loss
 from .loopblock import LoopBlock
 from .mtp import MTPHead
 from .qat_cache import QuantCache, attach_qat_caches
@@ -66,6 +67,11 @@ class DormouseModel(nn.Module):
         #: (`train/loop.py`'s `mtp_field`) — never per step (ADR-0018 rule 2).
         self.mtp: MTPHead | None = None
         self.last_mtp: torch.Tensor | None = None
+        #: The ENERGY head (`energy.py`, EBT arXiv:2507.02092): inference
+        #: reranker and an OPTIONAL contrastive training term, built IFF
+        #: `energy_weight > 0`. Declared before the byteflow early return so a
+        #: channel model has the attribute (None) rather than no attribute.
+        self.energy: EnergyHead | None = None
         #: Every QAT cache in the tree (`qat_cache.QuantCache`), collected after
         #: the build below. `forward` drains their hit counts into `qat_reuse`;
         #: the trainer invalidates them once per optimizer step.
@@ -97,6 +103,27 @@ class DormouseModel(nn.Module):
             if (cfg.mtp_weight > 0.0)
             else None
         )
+        # The ENERGY head (EBT arXiv:2507.02092, `energy.py`): built IFF the
+        # weight is on, so `energy_weight = 0` adds no parameter and no compute.
+        # The constructor deliberately does not call `validate`, so the two
+        # refusals the config owns are held here too (the same rule the halt
+        # head follows).
+        if cfg.energy_weight > 0.0:
+            if cfg.use_byteflow:
+                loud(
+                    f"energy_weight={cfg.energy_weight} with use_byteflow=true: the "
+                    f"channel runs the loop over K patch latents, so there is no "
+                    f"per-byte state for the contrastive head to score. Escape: "
+                    f"energy_weight=0.0, or use_byteflow=false."
+                )
+            if cfg.dspark_weight > 0.0:
+                loud(
+                    f"energy_weight={cfg.energy_weight} with dspark_weight="
+                    f"{cfg.dspark_weight}: both aux objectives read the same "
+                    f"`norm(out)` state, and their interaction is not measured. "
+                    f"Escape: one weight per run."
+                )
+            self.energy = EnergyHead(d, cfg.energy_rank, device=device)
         # The QAT cost fix's wiring seam: modules whose switch is on built their
         # own `QuantCache`; every plain `nn.Linear` gets one here when
         # `dense_qat` is on (`qat_linear` reads it). A model built with both
@@ -237,9 +264,10 @@ class DormouseModel(nn.Module):
             self.cfg.dspark_weight == 0.0
             and self.cfg.sigreg_weight == 0.0
             and self.cfg.mtp_weight == 0.0
+            and self.cfg.energy_weight == 0.0
         ), (
             "the byteflow channel carries no aux term: validate refuses the aux weights "
-            "(dspark/sigreg/mtp) with use_byteflow - set them to 0"
+            "(dspark/sigreg/mtp/energy) with use_byteflow - set them to 0"
         )
         count_channel(counters)
         bf = self.bf
@@ -330,6 +358,22 @@ class DormouseModel(nn.Module):
                 counters.count("sigreg")
                 loss = loss + self.cfg.sigreg_weight * sigreg_loss(
                     stride_sample(hn.reshape(-1, self.cfg.d_model).to(torch.float32))
+                )
+            if not pure and self.energy is not None:
+                # The ENERGY term (EBT arXiv:2507.02092, `energy.py`): the target
+                # byte's energy must beat `energy_negs` negatives sampled from
+                # the `lm_head` softmax. The scorer reads `(h, candidate)` only;
+                # targets pick the positive and are never an input to the score.
+                # The counter is the A/B's void check (as sigreg's is).
+                counters.count("energy")
+                loss = loss + self.cfg.energy_weight * energy_contrastive_loss(
+                    self.energy,
+                    hn.reshape(-1, self.cfg.d_model).to(torch.float32),
+                    self.embed.weight.to(torch.float32),
+                    targets.reshape(-1),
+                    logits,
+                    n_negs=self.cfg.energy_negs,
+                    temp=self.cfg.energy_temp,
                 )
             if not pure and self.dspark is not None:
                 # The DSpark draft head (`dspark.py`, standalone module; this

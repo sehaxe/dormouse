@@ -560,6 +560,29 @@ class ModelConfig:
     #: §3; the burn `l1 + 0.1·koleo` bundle cannot attribute its own 0.082 BPB).
     #: The suggested grid is 0.005 / 0.05 / 0.1 — publish which.
     sigreg_weight: float = 0.0
+    #: ---- energy-based scoring (EBT, arXiv:2507.02092; `model/energy.py`) ----
+    #: `energy_weight` = λ on the margin-InfoNCE term: the target byte's energy
+    #: must beat `energy_negs` negatives sampled from the `lm_head` softmax by
+    #: `energy.MARGIN`. `0.0` (the default) builds NO head, adds no parameter
+    #: and adds no compute, so every preset and snapshot is bit-identical.
+    #:
+    #: A 256-byte vocabulary is ENUMERABLE, which is why this is a contrastive
+    #: head and not EBT's MCMC: scoring all candidates is one matmul, and the
+    #: same head is the INFERENCE reranker (`scripts/rerank.py`). A quality
+    #: claim needs that table AND `scripts/ab_energy.py`; neither has run.
+    #:
+    #: REFUSED loudly with `use_byteflow` (the channel runs the loop over K
+    #: patch latents and has no byte position for the sampler) and with
+    #: `dspark_weight > 0` (two aux objectives reading the same hidden state is
+    #: not measured here — pick one arm per run).
+    energy_weight: float = 0.0
+    #: Negatives drawn per position from the `lm_head` softmax (target removed).
+    #: `64` covers a quarter of the 256-byte vocabulary per position.
+    energy_negs: int = 64
+    #: InfoNCE temperature τ: lower is sharper (the margin is divided by it too).
+    energy_temp: float = 1.0
+    #: The head's bottleneck `k` in `Linear(d, k) -> SiLU -> Linear(k, 1)`.
+    energy_rank: int = 64
     #: ---- the second attention arm (MSA re-entry, ADR-0014; owner 2026-10-16) ----
     #: 1M-context sparse attention BESIDE KDA (which stays the default arm).
     #: `msa_capacity_ratio` = the arm's share of the attention demand (owner:
@@ -1448,6 +1471,41 @@ def validate(model: ModelConfig) -> None:
             f"(off) or a positive weight (the research doc's grid: 0.005, 0.05, "
             f"0.1 — docs/research/2026-10-16-jepa-into-dormouse.md §3)."
         )
+    # The ENERGY head's own coherence (`model/energy.py`, EBT arXiv:2507.02092):
+    # the weight gates the module (0 builds nothing), and every other field is
+    # a count/scale the loss would silently misuse. The two INTERACTIONS
+    # (byteflow, dspark) are refusals, never a merge: this lane has one aux
+    # objective, and the arm it would have to share a hidden state with is not
+    # measured alongside it.
+    if model.energy_weight < 0.0:
+        loud(
+            f"energy_weight={model.energy_weight} is negative: it is λ, the "
+            f"multiplier on the margin-InfoNCE term. Escape: 0.0 (off) or a "
+            f"positive weight (the A/B's grid is 0.05 / 0.1)."
+        )
+    if model.energy_negs < 1:
+        loud(
+            f"energy_negs={model.energy_negs}: the contrastive term needs at least "
+            f"one sampled negative per position. Escape: >= 1 (the default 64)."
+        )
+    if model.energy_temp <= 0.0:
+        loud(
+            f"energy_temp={model.energy_temp}: it is InfoNCE's temperature, a "
+            f"positive scale (the margin is divided by it too). Escape: > 0."
+        )
+    if model.energy_rank < 1:
+        loud(
+            f"energy_rank={model.energy_rank}: it is the head's bottleneck width "
+            f"in Linear(d, k) -> SiLU -> Linear(k, 1). Escape: >= 1."
+        )
+    if model.energy_weight > 0.0 and model.dspark_weight > 0.0:
+        loud(
+            f"energy_weight={model.energy_weight} with dspark_weight="
+            f"{model.dspark_weight}: both are aux objectives reading the SAME "
+            f"hidden state (`model.norm(out)`), and their interaction is not "
+            f"measured — a run with both armed could not attribute a BPB change "
+            f"to either. Escape: one weight per run, or land the joint A/B first."
+        )
     # The dspark arm's OWN coherence (audit MINOR 12, 2026-10-17): these used to
     # live inside `_validate_byteflow`, which only runs under `use_byteflow`, so
     # the default path accepted `dspark_weight=-1.0` / `dspark_k=0` /
@@ -1629,6 +1687,13 @@ def _validate_byteflow(model: ModelConfig) -> None:
             "`bf.out_proj(out_acc)`, not the `norm(out)` state SIGReg reads, so the "
             "term would be built and attached to nothing. Escape: sigreg_weight = 0.0, "
             "or drop use_byteflow."
+        )
+    if model.energy_weight > 0.0:
+        loud(
+            "use_byteflow with energy_weight>0: the channel runs the loop over K "
+            "patch latents, so there is no per-BYTE position for the contrastive "
+            "head to score and no byte state the sampler could read. Escape: "
+            "energy_weight = 0.0, or drop use_byteflow."
         )
     if model.dspark_weight > 0.0:
         loud(
