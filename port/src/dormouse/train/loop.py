@@ -59,6 +59,20 @@ def kda_field(counters: Counters) -> str:
     return f"kda={arm},n={n}"
 
 
+def mtp_field(model: torch.nn.Module) -> str:
+    """`mtp=<term>` — the MTP objective's weighted value, on the log cadence.
+
+    The forward leaves its scalar DETACHED on the model (`last_mtp`) and never
+    touches the host (ADR-0018 rule 2: no `.item()` in a step). This is the one
+    declared read, once per log window, and it is what makes the arm visible in
+    the log rather than only in the parameter count. Empty when the arm never
+    ran (weight 0, a decode forward, or a step before the first training
+    forward) — a zero would claim a term that was not added.
+    """
+    value = getattr(model, "last_mtp", None)
+    return "" if value is None else f"mtp={float(value):.4f}"
+
+
 def ckpt_paths(cfg: TrainConfig) -> tuple[Path, Path]:
     base = Path(cfg.out_dir)
     return base / f"{cfg.ckpt_name}.pt", base / f"{cfg.ckpt_name}.config.toml"
@@ -871,6 +885,7 @@ def train(
                 f"loss={last_loss:.4f}",
                 f"lr={lr:.3e}",
                 kda_field(window),
+                mtp_field(model),
                 window.line(),
             ]
             # Telemetry reads the interval BEFORE any opt-in timer report —

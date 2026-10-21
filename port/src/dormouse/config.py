@@ -447,6 +447,18 @@ class ModelConfig:
     dspark_k: int = 4
     dspark_stride: int = 16
     dspark_markov_rank: int = 256
+    #: ---- Multi-Token Prediction (DeepSeek-V3 §3.2, `model/mtp.py`) ----
+    #: `mtp_k` = K future-byte modules that share THIS model's embedding and
+    #: `lm_head` (the only new parameters are the K `Linear(2*d, d)` matrices);
+    #: `mtp_weight` = λ on their uniform-mean CE. `0` / `0.0` (the default)
+    #: builds nothing, so every preset's parameter count is unchanged. Refused
+    #: loudly: `mtp_weight > 0` with `mtp_k == 0`, `mtp_k` outside `0..=8`, and
+    #: `use_byteflow` (the channel has no byte ids for the future-byte
+    #: embedding, the same refusal DSpark carries). Prior evidence: the
+    #: `aux_fb` future-byte head Tied at 3 seeds at 9.2M and was deleted in
+    #: `39d0485`; the published wins are large-scale, so the A/B decides here.
+    mtp_k: int = 0
+    mtp_weight: float = 0.0
     #: SIGReg / LeJEPA (arXiv:2511.08544, `model/sigreg.py`): a REGULARISER, not
     #: a head. `loss = CE + sigreg_weight · sigreg_loss(z)`, `z` the strided
     #: sample of the state `lm_head` reads — no teacher, no predictor, no mask,
@@ -1085,11 +1097,7 @@ def validate(model: ModelConfig) -> None:
             f"the arm and its gold test (tests/test_dense_qat.py) BEFORE the "
             f"config can lie about it."
         )
-    if (
-        model.factor_qat == "none"
-        and model.dense_qat == "none"
-        and model.factor_qat_alpha != 1.0
-    ):
+    if model.factor_qat == "none" and model.dense_qat == "none" and model.factor_qat_alpha != 1.0:
         loud(
             f"factor_qat_alpha={model.factor_qat_alpha} with factor_qat='none' "
             f"and dense_qat='none' is inert — both quantizers are off, so the "
@@ -1190,6 +1198,27 @@ def validate(model: ModelConfig) -> None:
             f"dspark_k={model.dspark_k} / dspark_stride={model.dspark_stride}: "
             f"both are positive counts (the draft reach and the anchor spacing, "
             f"in bytes). Escape: k >= 1, stride >= 1."
+        )
+    # The MTP arm's own coherence (`model/mtp.py`): the weight with no depth
+    # asks for a term that has no module to average, and a depth above 8 is
+    # outside the constructor's contract. Both are refusals, never clamps.
+    if model.mtp_k < 0 or model.mtp_k > 8:
+        loud(
+            f"mtp_k={model.mtp_k} outside 0..=8: it is the number of future-byte "
+            f"modules (DeepSeek-V3 §3.2). Escape: 0 (off, nothing is built) or "
+            f"1..=8 (the constructor's ceiling, `mtp.MAX_K`)."
+        )
+    if model.mtp_weight > 0.0 and model.mtp_k == 0:
+        loud(
+            f"mtp_weight={model.mtp_weight} with mtp_k=0: the weight asks for the "
+            f"MTP term but there are no future-byte modules to average (the head "
+            f"is built IFF the weight is on, and K >= 1). Escape: mtp_k >= 1, or "
+            f"mtp_weight=0.0."
+        )
+    if model.mtp_weight < 0.0:
+        loud(
+            f"mtp_weight={model.mtp_weight} is negative: it is λ, the multiplier "
+            f"on the MTP CE. Escape: 0.0 (off) or a positive weight."
         )
 
     # The HALT HEAD's own coherence (`model/halt.py`). The weight gates the
@@ -1336,6 +1365,13 @@ def _validate_byteflow(model: ModelConfig) -> None:
             "use_byteflow with dspark_weight>0: the channel's forward carries no "
             "byte ids for the draft window to read. Escape: dspark_weight = 0.0, "
             "or drop use_byteflow."
+        )
+    if model.mtp_weight > 0.0:
+        loud(
+            "use_byteflow with mtp_weight>0: the MTP modules read the byte ids and "
+            "the loop's byte-position hidden state, and the channel runs the loop "
+            "over K patch latents with no byte ids in that forward. Escape: "
+            "mtp_weight = 0.0, or drop use_byteflow."
         )
 
 

@@ -38,6 +38,7 @@ from .byteflow import (
 )
 from .dspark import DSparkHead, dspark_aux_loss
 from .loopblock import LoopBlock
+from .mtp import MTPHead
 from .qat_cache import QuantCache, attach_qat_caches
 from .sigreg import sigreg_loss, stride_sample
 from .tsct import make_projection, set_factor_qat_seed
@@ -60,6 +61,11 @@ class DormouseModel(nn.Module):
         #: one of them is ever non-None, and which one is COUNTED per forward.
         self.bf_net: ByteFlowNet | None = None
         self.bf: BfChannel | None = None
+        #: The MTP arm (`mtp.py`) and the scalar its own log line reads. The
+        #: tensor is DETACHED by the forward and read only on the log cadence
+        #: (`train/loop.py`'s `mtp_field`) — never per step (ADR-0018 rule 2).
+        self.mtp: MTPHead | None = None
+        self.last_mtp: torch.Tensor | None = None
         #: Every QAT cache in the tree (`qat_cache.QuantCache`), collected after
         #: the build below. `forward` drains their hit counts into `qat_reuse`;
         #: the trainer invalidates them once per optimizer step.
@@ -81,6 +87,15 @@ class DormouseModel(nn.Module):
         # — at 0.0 the parameter set and every preset count match today's.
         self.dspark: DSparkHead | None = (
             DSparkHead(cfg, device=device) if cfg.dspark_weight > 0.0 else None
+        )
+        # The MTP modules (DeepSeek-V3 §3.2, `mtp.py`): built only when the
+        # weight is on, so `mtp_k = mtp_weight = 0` (every preset) leaves the
+        # tree — and the parameter count — exactly as it was. A weight with
+        # `mtp_k == 0` is LOUD in `MTPHead` even without `config.validate`.
+        self.mtp = (
+            MTPHead(cfg.d_model, cfg.mtp_k, eps=cfg.norm_eps, device=device)
+            if (cfg.mtp_weight > 0.0)
+            else None
         )
         # The QAT cost fix's wiring seam: modules whose switch is on built their
         # own `QuantCache`; every plain `nn.Linear` gets one here when
@@ -218,9 +233,13 @@ class DormouseModel(nn.Module):
         # model constructors deliberately do NOT call `validate` — so the same
         # refusal is held here, at the runtime seam (ADR-0019's "a term with
         # nothing to act on").
-        assert self.cfg.dspark_weight == 0.0 and self.cfg.sigreg_weight == 0.0, (
+        assert (
+            self.cfg.dspark_weight == 0.0
+            and self.cfg.sigreg_weight == 0.0
+            and self.cfg.mtp_weight == 0.0
+        ), (
             "the byteflow channel carries no aux term: validate refuses the aux weights "
-            "and sigreg_weight with use_byteflow - set them to 0"
+            "(dspark/sigreg/mtp) with use_byteflow - set them to 0"
         )
         count_channel(counters)
         bf = self.bf
@@ -330,6 +349,27 @@ class DormouseModel(nn.Module):
                     logits.reshape(b_tok, t_tok, -1),
                     counters=counters,
                 )
+            if not pure and self.mtp is not None:
+                # Multi-Token Prediction (DeepSeek-V3 §3.2, `mtp.py`): K
+                # future-byte modules on the loop's own final readout, sharing
+                # THIS model's `embed` and `lm_head`. The term is a training
+                # signal like DSpark's, so `pure` (the held-out number) skips it.
+                mtp_loss, mtp_per_k = self.mtp(
+                    out,
+                    input_ids,
+                    targets,
+                    embed=self.embed,
+                    head=self.lm_head,
+                    weight=self.cfg.mtp_weight,
+                )
+                loss = loss + mtp_loss
+                # The value `train/loop.py`'s `mtp_field` reads on the LOG
+                # cadence: detached, and NOT read here — a `.item()` per step
+                # is the host sync ADR-0018 rule 2 bans.
+                self.last_mtp = mtp_loss.detach()
+                if breakdown:
+                    self.last_breakdown["mtp"] = float(mtp_loss.detach())
+                    self.last_breakdown["mtp_per_k"] = [float(t.detach()) for t in mtp_per_k]
             assert torch.isfinite(loss), "L_Rec + final CE must be finite"
         return logits, loss
 
