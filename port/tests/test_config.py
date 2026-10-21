@@ -41,8 +41,9 @@ def test_unknown_key_refuses_and_names_the_escape():
     with pytest.raises(LoudError):
         parse_preset("d_models = 64\n")
     # A deleted stub field is refused the same way — the pin that `use_gr`,
-    # `use_mhc`, `use_mor`, `use_situ`, `jepa_weight` and `stress` are GONE and
-    # not merely unwired (a re-added field would accept the key again).
+    # `use_mor`, `use_situ`, `jepa_weight` and `stress` are GONE and not merely
+    # unwired (a re-added field would accept the key again). `use_mhc` is a
+    # real field again (the mHC port), so it is NOT in this class.
     with pytest.raises(LoudError) as e:
         parse_preset("d_model = 64\nn_heads = 4\nhead_dim = 16\nuse_gr = true\n")
     assert "use_gr" in str(e.value)
@@ -68,13 +69,16 @@ def test_dead_snapshot_keys_load_counted_and_do_not_reach_the_config(capsys):
     )
     back = RunConfig.from_snapshot(text)
     assert back.model.d_model == 64 and back.train.steps == 3
+    # `use_mhc` is a real field again (the mHC port): the snapshot value is
+    # PARSED, not dropped, and the dead list no longer carries it.
+    assert back.model.use_mhc is False
     for key in DEAD_SNAPSHOT_KEYS:
         assert not hasattr(back.model, key)
         assert not hasattr(back.train, key)
     err = capsys.readouterr().err
-    # Two COUNTED lines: the model table carried six of the seven, the train
-    # table carried `stress`.
-    assert "dropped 6 dead snapshot key(s)" in err
+    # Two COUNTED lines: the model table carried five of the six (use_mhc is
+    # live now), the train table carried `stress`.
+    assert "dropped 5 dead snapshot key(s)" in err
     assert "dropped 1 dead snapshot key(s)" in err
     for key, commit in DEAD_SNAPSHOT_KEYS.items():
         assert key in err and commit in err
@@ -85,8 +89,8 @@ def test_the_dead_list_is_exactly_what_the_committed_snapshots_carry():
 
     A snapshot that carries an unknown key NOT on the list is still refused, so
     the list has to cover every key the 24 committed snapshots actually hold —
-    a missing one leaves them all unreadable (this is how `aux_fb_weight`, the
-    seventh, was found: the six-key list still refused all 24 on it).
+    a missing one leaves them all unreadable (this is how `aux_fb_weight`, then
+    the seventh, was found: the six-key list still refused all 24 on it).
     """
     import dataclasses as _dc
     import glob

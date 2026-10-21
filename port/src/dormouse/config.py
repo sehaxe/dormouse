@@ -58,15 +58,16 @@ DEAD_SNAPSHOT_COMMIT = "0e7d25a"
 #: here still refuses. The same idea as `tools/check_doc_refs.py`'s `KNOWN_DEAD`:
 #: a dated record is not a failure.
 #:
-#: Six come from `DEAD_SNAPSHOT_COMMIT`; `aux_fb_weight` (the future-byte head,
-#: arXiv:2404.19737) is a SEVENTH that the same class of defect left in every
+#: Five come from `DEAD_SNAPSHOT_COMMIT`; `aux_fb_weight` (the future-byte head,
+#: arXiv:2404.19737) is a SIXTH that the same class of defect left in every
 #: snapshot — it was deleted in `39d0485` (`delete the aux_fb future-byte head —
-#: a TIE`), and a list of six would still refuse all 24 snapshots on that key.
+#: a TIE`), and a list of five would still refuse all 24 snapshots on that key.
+#: (`use_mhc` left this list in the mHC port: it is a real `ModelConfig` field
+#: again, so a snapshot carrying it parses rather than drops.)
 #: Enumerated by reading every committed snapshot, not by guess:
-#: `checkpoints/**/*.config.toml` carries exactly these seven unknown keys.
+#: `checkpoints/**/*.config.toml` carries exactly these six unknown keys.
 DEAD_SNAPSHOT_KEYS = {
     "use_gr": DEAD_SNAPSHOT_COMMIT,
-    "use_mhc": DEAD_SNAPSHOT_COMMIT,
     "use_mor": DEAD_SNAPSHOT_COMMIT,
     "use_situ": DEAD_SNAPSHOT_COMMIT,
     "jepa_weight": DEAD_SNAPSHOT_COMMIT,
@@ -209,7 +210,8 @@ class ModelConfig:
     A key the burn side has and this port does not is NOT a field: setting it is
     an unknown key, refused loudly with the key named and the escape. A field
     that reaches no code is the defect that refusal exists to prevent (the burn
-    history's `use_mhc` reached a trainer that never read it).
+    history's `use_mhc` reached a trainer that never read it — it is ported for
+    real in `use_mhc` below, and `use_gr` is the still-dead example).
     """
 
     # --- geometry -------------------------------------------------------
@@ -260,6 +262,27 @@ class ModelConfig:
     share_u: bool = False
     use_engram: bool = True
     use_attnres: bool = False
+    #: Manifold-Constrained Hyper-Connections (arXiv:2512.24880, DeepSeek
+    #: 2025), the fourth residual arm, ported from
+    #: `vendor/dormouse-fused/crates/burn-mhc` (`model/mhc.py` carries the
+    #: Eq. 3/7/8/9 line citations). It replaces the loop's residual write:
+    #: the loop carries `mhc_streams` FULL-width lanes across iterations,
+    #: `H_res` mixes them (Sinkhorn-Knopp, doubly stochastic), `H_pre`
+    #: aggregates them into the body's input and `H_post` weights the body's
+    #: output back onto each lane; the readout is the lanes' SUM
+    #: (`docs/reviews/mhc-2026-09-30.md` §1.2/§3.2, 2409.19606 §2.1).
+    #: **OFF by default and NOT A/B'd**: the burn lane built the mechanism and
+    #: never ran row 7b, and the port's cleanup deleted the flag before it
+    #: could be measured — `scripts/ab_mhc.py` is the driver that decides it.
+    #: Refused together with `use_attnres`, `loom` and `use_byteflow` (the
+    #: same statement, or a second unmeasured write/placement axis).
+    use_mhc: bool = False
+    #: K, mHC's expansion rate: the number of residual lanes at the loop
+    #: boundary. **Only 2 ships** — the φ study's own K=2 (2604.21106 §5.2)
+    #: and 2409.19606 Tab. 1's knee; mHC's App. A.1 default of 4 is the named
+    #: follow-up row, not a shipped rung. Any other value is refused LOUDLY by
+    #: `validate` (a silently different K is a different experiment).
+    mhc_streams: int = 2
     #: LOOM (`2610.01153`, 2026-10-01; scanned in
     #: `docs/research/2026-10-16-new-tech-scan.md` §2.1, whose row names our
     #: own `max_iter 4` / operating depth 2 as exactly the regime that paper
@@ -1137,6 +1160,46 @@ def validate(model: ModelConfig) -> None:
             f"act_group={model.act_group} with act_quant='none' is inert — the "
             f"quantizer is off, so there is no block to group. Escape: set "
             f"act_quant, or leave act_group at 0."
+        )
+    if model.use_mhc:
+        for name, why in (
+            (
+                "use_attnres",
+                "AttnRes replaces the same loop-boundary residual write with a "
+                "softmax mixture over {embedding, body}; two write operators in one "
+                "run would be one experiment with two arms",
+            ),
+            (
+                "loom",
+                "LOOM adds a second, un-A/B'd per-iteration gate to the write "
+                "(2610.01153); an mHC result from that run would be attributable to "
+                "neither mechanism",
+            ),
+            (
+                "use_byteflow",
+                "the channel runs the loop over K patch latents, so the lanes would "
+                "be patch lanes and the placement a different experiment",
+            ),
+        ):
+            if getattr(model, name):
+                loud(
+                    f"use_mhc with {name}=true: {why}. Escape: {name}=false, or "
+                    f"use_mhc=false — mHC's A/B (scripts/ab_mhc.py) runs against "
+                    f"ReZero and nothing else."
+                )
+        if model.mhc_streams != 2:
+            loud(
+                f"mhc_streams={model.mhc_streams}: only K=2 ships. It is the K the "
+                f"φ evidence used (2604.21106 §5.2) and 2409.19606 Tab. 1's knee; "
+                f"mHC's own App. A.1 default of 4 is the named follow-up row, not a "
+                f"shipped rung. Escape: mhc_streams=2, or land the n=4 arm and its "
+                f"gate BEFORE the config can lie about it."
+            )
+    elif model.mhc_streams != 2:
+        loud(
+            f"mhc_streams={model.mhc_streams} with use_mhc=false is inert — the "
+            f"field would name a K no lane carries. Escape: use_mhc=true (K=2), or "
+            f"leave mhc_streams at its default 2."
         )
     if model.use_byteflow:
         _validate_byteflow(model)
