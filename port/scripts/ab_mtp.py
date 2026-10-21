@@ -53,7 +53,21 @@ import argparse
 import json
 import statistics
 import subprocess
+import sys
 from pathlib import Path
+
+# `scripts/` is not a package (a test loads this file by path): the lane guard is
+# a sibling file, so its directory goes on the path, APPENDED not inserted (a
+# script name at the front of `sys.path` would shadow a package of that name).
+sys.path.append(str(Path(__file__).resolve().parent))
+from _lane import preflight as _lane_preflight  # noqa: E402
+
+# `tests/test_mtp.py` pins this 3-arg shape and its "no data file at" wording:
+# the card first, then the cheaper blocker (the missing file, named).
+preflight = lambda device, data, eval_data: (  # noqa: E731
+    _lane_preflight(device)
+    or next((f"no data file at {p}" for p in (data, eval_data) if not Path(p).is_file()), None)
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -121,44 +135,6 @@ def refuse(why: str) -> int:
         flush=True,
     )
     return 1
-
-
-def preflight(device: str, data: str, eval_data: str) -> str | None:
-    """`None` when the card and the data files are ours, else why not.
-
-    Same shape as `ab_byteflow.preflight`: NO torch CUDA call in the parent (a
-    CUDA context initialised before `subprocess` forks makes every child die
-    with "device busy"), so the card is read from `nvidia-smi`. The `[n]`
-    bracket keeps `pgrep` from matching this driver's own command line.
-    """
-    if device == "cpu":
-        print("[preflight] device=cpu: the card checks do not apply", flush=True)
-    else:
-        busy = subprocess.run(
-            ["pgrep", "-af", "dormouse trai[n]"], capture_output=True, text=True
-        ).stdout.strip()
-        if busy:
-            return f"a dormouse process is alive:\n{busy}"
-        smi = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits"],
-            capture_output=True,
-            text=True,
-        )
-        first = smi.stdout.strip().splitlines()[0] if smi.stdout.strip() else ""
-        if not first:
-            return "device=cuda but nvidia-smi reports no device"
-        try:
-            used_mib = float(first.split(",")[0])
-        except ValueError:
-            return f"nvidia-smi's memory row is unreadable: {first!r}"
-        used = used_mib / 1024
-        if used >= 2.0:
-            return f"the card already holds {used:.2f} GiB (the preflight's ceiling is 2.0)"
-        print(f"[preflight] no dormouse process; card holds {used:.2f} GiB", flush=True)
-    for path in (data, eval_data):
-        if not Path(path).is_file():
-            return f"no data file at {path}"
-    return None
 
 
 def read_run(jsonl: Path, log: Path) -> dict:

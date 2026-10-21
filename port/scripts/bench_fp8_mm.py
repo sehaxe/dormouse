@@ -48,6 +48,7 @@ import argparse
 import json
 import statistics
 import subprocess
+import sys
 from pathlib import Path
 
 import torch
@@ -57,6 +58,12 @@ from dormouse.instrument import Counters
 from dormouse.model import tsct
 from dormouse.model.model import DormouseModel
 
+# `scripts/` is not a package (a test loads this file by path): the lane guard is
+# a sibling file, so its directory goes on the path, APPENDED not inserted (a
+# script name at the front of `sys.path` would shadow a package of that name).
+sys.path.append(str(Path(__file__).resolve().parent))
+from _lane import preflight  # noqa: E402
+
 #: The spike's phase-2 fp8 rows (`bench_f_fp8.py`, M=32768, bf16 in/out, per-tensor
 #: scales, L2 flushed) — the PREDICTION this bench checks against.
 SPIKE_ROWS = (
@@ -64,31 +71,6 @@ SPIKE_ROWS = (
     (2048, 64, 0.361, 23.82, 0.219, 39.31),
     (64, 5472, 1.611, 14.21, 1.026, 22.32),
 )
-
-
-def preflight() -> str | None:
-    """`None` when the card may be used, else why not (AGENTS §1.5)."""
-    if not torch.cuda.is_available():
-        return "no CUDA device"
-    try:
-        busy = subprocess.run(
-            ["pgrep", "-f", "dormouse trai[n]"], capture_output=True, text=True, timeout=15
-        ).stdout.strip()
-        used = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        ).stdout.strip()
-    except Exception as e:  # noqa: BLE001 - a bench's precondition, not a run's
-        return f"cannot check the card ({e})"
-    if busy:
-        return f"a training run is live (pids {busy.replace(chr(10), ' ')})"
-    mib = int(used.split()[0]) if used else -1
-    if mib >= 1024:
-        return f"the card already holds {mib} MiB"
-    print(f"[preflight] no dormouse process; card holds {mib} MiB", flush=True)
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -275,7 +257,17 @@ def main() -> int:
         _write_json(args.json, payload)
         return 0
 
-    why = preflight()
+    why = preflight("cuda")
+    if why is None:
+        # This bench's own ceiling is 1 GiB, tighter than the lane guard's 2.0:
+        # a card already holding a second model is contended however idle it looks.
+        smi = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if smi and int(smi.split()[0]) >= 1024:
+            why = f"the card already holds {smi.split()[0]} MiB (this bench's ceiling is 1024)"
     if why is not None:
         print(f"[preflight] REFUSED: {why}. One GPU thing at a time (AGENTS §1.5).")
         _write_json(args.json, payload)

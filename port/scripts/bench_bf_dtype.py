@@ -28,12 +28,19 @@ import statistics
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import torch
 
 from dormouse.config import ModelConfig
 from dormouse.instrument import Counters
 from dormouse.model import DormouseModel
+
+# `scripts/` is not a package (a test loads this file by path): the lane guard is
+# a sibling file, so its directory goes on the path, APPENDED not inserted (a
+# script name at the front of `sys.path` would shadow a package of that name).
+sys.path.append(str(Path(__file__).resolve().parent))
+from _lane import preflight, skip  # noqa: E402
 
 DEV = "cuda"
 #: The channel's profile shape (the ByteFlow recipe's own numbers).
@@ -42,40 +49,6 @@ D, F_DIM, RANK, E, TOPK = 1024, 2730, 64, 256, 2
 MAX_ITER = 2
 REPS = 10
 DTYPES = (("fp32", False), ("bf16", True))
-
-
-def skip(why: str) -> int:
-    print(
-        f"\n=== SKIP: {why}\n"
-        f"=== ONE GPU PROCESS AT A TIME (AGENTS §1.5): nothing was measured, so there\n"
-        f"=== is no number to quote. Re-run when the card is free.\n",
-        flush=True,
-    )
-    return 0
-
-
-def preflight() -> str | None:
-    """No torch CUDA call before this: it would init a context in the parent."""
-    busy = subprocess.run(
-        ["pgrep", "-af", "[d]ormouse (train|rl|sft|bench|serve)|[/]target/release/train "],
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    if busy:
-        return f"a dormouse process is alive:\n{busy}"
-    smi = subprocess.run(
-        ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
-        capture_output=True,
-        text=True,
-    )
-    first = smi.stdout.strip().splitlines()[0] if smi.stdout.strip() else ""
-    if not first:
-        return "no CUDA device is visible to nvidia-smi"
-    used = float(first) / 1024
-    if used >= 1.0:
-        return f"the card already holds {used:.2f} GiB (the preflight's ceiling is 1.0)"
-    print(f"[preflight] no dormouse process; card holds {used:.2f} GiB", flush=True)
-    return None
 
 
 def config(bf16: bool) -> ModelConfig:
@@ -169,7 +142,22 @@ def run_dtype(label: str, bf16: bool, bytes_: torch.Tensor) -> dict[str, float]:
 
 
 def main() -> int:
-    why = preflight()
+    busy = subprocess.run(
+        ["pgrep", "-af", "[d]ormouse (train|rl|sft|bench|serve)|[/]target/release/train"],
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    why = preflight("cuda") or (f"a dormouse process is alive:\n{busy}" if busy else None)
+    if why is None:
+        # This bench's own ceiling is 1 GiB, tighter than the lane guard's 2.0:
+        # a card already holding a second model is contended however idle it looks.
+        smi = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if smi and int(smi.split()[0]) >= 1024:
+            why = f"the card already holds {smi.split()[0]} MiB (this bench's ceiling is 1024)"
     if why is not None:
         return skip(why)
     if not torch.cuda.is_available():

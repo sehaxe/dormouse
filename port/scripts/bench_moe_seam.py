@@ -33,7 +33,7 @@ a busy card is not a measurement.
 from __future__ import annotations
 
 import statistics
-import subprocess
+import sys
 import time
 import tomllib
 from pathlib import Path
@@ -44,6 +44,12 @@ import torch.nn.functional as F
 from dormouse.config import ModelConfig
 from dormouse.model import moe_sonic as ms
 from dormouse.model.experts import SparseMoE
+
+# `scripts/` is not a package (a test loads this file by path): the lane guard is
+# a sibling file, so its directory goes on the path, APPENDED not inserted (a
+# script name at the front of `sys.path` would shadow a package of that name).
+sys.path.append(str(Path(__file__).resolve().parent))
+from _lane import preflight, skip  # noqa: E402
 
 DEV = "cuda"
 ROOT = Path(__file__).resolve().parents[1]
@@ -82,24 +88,6 @@ def bytes_table(shape: ms.Shape) -> None:
         f"{mib(bf16['forward_total'] + bf16['backward_adjoint_current']):>10}  "
         f"(the routed pass, not a step)"
     )
-
-
-def preflight() -> str | None:
-    if not torch.cuda.is_available():
-        return "no CUDA device"
-    busy = subprocess.run(
-        ["pgrep", "-af", "dormouse (trai[n]|bench)|[/]target/release/train"],
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    if busy:
-        return f"a dormouse process is alive:\n{busy}"
-    free, total = torch.cuda.mem_get_info()
-    used = (total - free) / 2**30
-    if used >= 2.0:
-        return f"the card already holds {used:.2f} GiB (the preflight's ceiling is 2.0)"
-    print(f"[preflight] no dormouse process; card holds {used:.2f} GiB", flush=True)
-    return None
 
 
 def _timed(fn, reps: int = REPS) -> tuple[float, float, float]:
@@ -181,29 +169,20 @@ def measure(shape: ms.Shape) -> None:
     )
 
 
-def skip(why: str) -> int:
-    print(
-        f"\n=== SKIP: {why}\n"
-        f"=== ONE GPU PROCESS AT A TIME (AGENTS §1.5): nothing was measured, so there\n"
-        f"=== is no TIME to quote. Re-run when the card is free.\n",
-        flush=True,
-    )
-    print("=== ARITHMETIC ONLY (no GPU call was made) ===")
-    for shape in reversed(ms.SHAPES):
-        bytes_table(shape)
-    print(
-        "\n=== The arithmetic above is a MODEL OF THE CODE, not a timing. The bf16\n"
-        "=== seam removes 8·R·d of the gather chain (12·R·d -> 4·R·d); only a free\n"
-        "=== card says what those bytes cost. No ms/step exists until then.\n",
-        flush=True,
-    )
-    return 0
-
-
 def main() -> int:
-    why = preflight()
+    why = preflight("cuda")
     if why is not None:
-        return skip(why)
+        rc = skip(why)
+        print("=== ARITHMETIC ONLY (no GPU call was made) ===")
+        for shape in reversed(ms.SHAPES):
+            bytes_table(shape)
+        print(
+            "\n=== The arithmetic above is a MODEL OF THE CODE, not a timing. The bf16\n"
+            "=== seam removes 8·R·d of the gather chain (12·R·d -> 4·R·d); only a free\n"
+            "=== card says what those bytes cost. No ms/step exists until then.\n",
+            flush=True,
+        )
+        return rc
     for shape in reversed(ms.SHAPES):
         bytes_table(shape)
         measure(shape)

@@ -48,9 +48,9 @@ import dataclasses
 import math
 import os
 import statistics
-import subprocess
 import sys
 import time
+from pathlib import Path
 
 import torch
 
@@ -62,26 +62,13 @@ from dormouse.model.experts import SparseMoE  # noqa: E402
 from dormouse.model.model import DormouseModel  # noqa: E402
 from dormouse.train.data import open_streams  # noqa: E402
 
+# `scripts/` is not a package (a test loads this file by path): the lane guard is
+# a sibling file, so its directory goes on the path, APPENDED not inserted (a
+# script name at the front of `sys.path` would shadow a package of that name).
+sys.path.append(str(Path(__file__).resolve().parent))
+from _lane import preflight, skip  # noqa: E402
+
 LN2 = math.log(2.0)
-
-
-def preflight(device: str) -> None:
-    """Refuse a busy card LOUDLY; a CPU run is the driver's own smoke."""
-    if device == "cpu":
-        print("[preflight] device=cpu: the card checks do not apply", flush=True)
-        return
-    busy = subprocess.run(
-        ["pgrep", "-af", "dormouse trai[n]"], capture_output=True, text=True
-    ).stdout.strip()
-    if busy:
-        loud(f"a dormouse process is alive:\n{busy}\nONE GPU process at a time (AGENTS §1.5)")
-    if not torch.cuda.is_available():
-        loud("device=cuda but no CUDA device is visible. Escape: --device cpu (host only).")
-    free, total = torch.cuda.mem_get_info()
-    used = (total - free) / 2**30
-    if used >= 2.0:
-        loud(f"the card already holds {used:.2f} GiB (the preflight's ceiling is 2.0)")
-    print(f"[preflight] no dormouse process; card holds {used:.2f} GiB", flush=True)
 
 
 def windows() -> list[tuple[float, float]]:
@@ -159,7 +146,9 @@ def main() -> int:
     ap.add_argument("--ks", default="1,2,4", help="the fixed-width controls")
     args = ap.parse_args()
 
-    preflight(args.device)
+    why = preflight(args.device)
+    if why is not None:
+        return skip(why)
     ks = [int(k) for k in args.ks.split(",")]
     if len(set(ks)) != len(ks) or any(k < 1 for k in ks):
         loud(f"--ks={args.ks!r}: distinct positive widths only. Escape: --ks 1,2,4.")

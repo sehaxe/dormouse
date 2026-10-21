@@ -64,6 +64,12 @@ from pathlib import Path
 
 import torch
 
+# `scripts/` is not a package (a test loads this file by path): the lane guard is
+# a sibling file, so its directory goes on the path, APPENDED not inserted (a
+# script name at the front of `sys.path` would shadow a package of that name).
+sys.path.append(str(Path(__file__).resolve().parent))
+from _lane import preflight, skip  # noqa: E402
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tests"))
 
 #: The port's data on this box (AGENTS §2.6) — the LOCAL copy (the /mnt drive
@@ -81,43 +87,6 @@ EVAL_BATCHES = 20
 EVAL_EVERY = 200
 LOG_EVERY = 50
 COMBOS = (("fp32", "fp32"), ("bf16", "fp32"), ("fp32", "bf16"), ("bf16", "bf16"))
-
-
-def skip(why: str) -> int:
-    """A loud SKIP: the reason, and no table. Exit 0 — the code is not at fault."""
-    print(
-        f"\n=== SKIP: {why}\n"
-        f"=== ONE GPU PROCESS AT A TIME (AGENTS §1.5): nothing was measured, so there\n"
-        f"=== is no number to quote. Re-run when the card is free.\n",
-        flush=True,
-    )
-    return 0
-
-
-def preflight(device: str) -> str | None:
-    """`None` when the card is ours, else the reason to skip.
-
-    A CPU run does not touch the card, so the card checks do not apply to it —
-    and the `pgrep` gate is about the GPU and the RAM (§1.5), so a CPU smoke
-    may proceed (it is the only way to validate the driver without the card).
-    """
-    if device == "cpu":
-        print("[preflight] device=cpu: the card checks do not apply", flush=True)
-        return None
-    # The bracket keeps `pgrep` from matching this script's own command line.
-    busy = subprocess.run(
-        ["pgrep", "-af", "dormouse trai[n]"], capture_output=True, text=True
-    ).stdout.strip()
-    if busy:
-        return f"a dormouse process is alive:\n{busy}"
-    if not torch.cuda.is_available():
-        return "device=cuda but no CUDA device is visible"
-    free, total = torch.cuda.mem_get_info()
-    used = (total - free) / 2**30
-    if used >= 2.0:
-        return f"the card already holds {used:.2f} GiB (the preflight's ceiling is 2.0)"
-    print(f"[preflight] no dormouse process; card holds {used:.2f} GiB", flush=True)
-    return None
 
 
 # --- micro: the 4 combos at the b1 shapes -----------------------------------

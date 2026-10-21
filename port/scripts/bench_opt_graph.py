@@ -39,8 +39,9 @@ from __future__ import annotations
 
 import argparse
 import statistics
-import subprocess
+import sys
 import time
+from pathlib import Path
 
 import torch
 
@@ -49,40 +50,17 @@ from dormouse.model import DormouseModel
 from dormouse.train.graph import OptimizerGraph
 from dormouse.train.optim import MixOptimizer, clip_grads
 
+# `scripts/` is not a package (a test loads this file by path): the lane guard is
+# a sibling file, so its directory goes on the path, APPENDED not inserted (a
+# script name at the front of `sys.path` would shadow a package of that name).
+sys.path.append(str(Path(__file__).resolve().parent))
+from _lane import preflight, skip  # noqa: E402
+
 #: The presets to try, in order. `b1` is the shape the arm exists for; it is
 #: attempted and skipped LOUDLY if the card cannot hold the model + one grad set
 #: + the optimizer state (the VRAM ladder, `scripts/run_b1.sh`).
 PRESETS = ("medium", "b1")
 LR = 3e-4
-
-
-def skip(why: str) -> int:
-    """A loud SKIP: the reason, and no table. Exit 0 — the code is not at fault."""
-    print(
-        f"\n=== SKIP: {why}\n"
-        f"=== ONE GPU PROCESS AT A TIME (AGENTS §1.5): nothing was measured, so there\n"
-        f"=== is no number to quote. Re-run when the card is free.\n",
-        flush=True,
-    )
-    return 0
-
-
-def preflight() -> str | None:
-    """`None` when the card is ours, else the reason to skip."""
-    # The bracket keeps `pgrep` from matching this script's own command line.
-    busy = subprocess.run(
-        ["pgrep", "-af", "dormouse trai[n]"], capture_output=True, text=True
-    ).stdout.strip()
-    if busy:
-        return f"a dormouse process is alive:\n{busy}"
-    if not torch.cuda.is_available():
-        return "no CUDA device is visible"
-    free, total = torch.cuda.mem_get_info()
-    used = (total - free) / 2**30
-    if used >= 2.0:
-        return f"the card already holds {used:.2f} GiB (the preflight's ceiling is 2.0)"
-    print(f"[preflight] no dormouse process; card holds {used:.2f} GiB", flush=True)
-    return None
 
 
 def launches(fn) -> int:
@@ -182,7 +160,7 @@ def main() -> int:
     ap.add_argument("--warmup", type=int, default=5, help="eager steps before the capture")
     args = ap.parse_args()
 
-    why = preflight()
+    why = preflight("cuda")
     if why is not None:
         return skip(why)
     for preset in args.preset or PRESETS:

@@ -70,6 +70,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+# `scripts/` is not a package (a test loads this file by path): the lane guard is
+# a sibling file, so its directory goes on the path, APPENDED not inserted (a
+# script name at the front of `sys.path` would shadow a package of that name).
+sys.path.append(str(Path(__file__).resolve().parent))
+from _lane import data_missing, preflight  # noqa: E402
+
 ROOT = Path(__file__).resolve().parents[1]
 
 #: The port's data on this box (AGENTS §2.6) — the LOCAL copies, so the driver
@@ -150,43 +156,6 @@ def refuse(why: str) -> int:
         flush=True,
     )
     return 1
-
-
-def preflight(device: str) -> str | None:
-    """`None` when the card and the files are ours, else why not.
-
-    No torch CUDA call in the parent (a context initialised before the
-    `subprocess` fork makes every child die with "device busy"); the card is
-    read from `nvidia-smi`. The `[n]` bracket keeps `pgrep` from matching this
-    driver's own command line.
-    """
-    if device == "cpu":
-        print("[preflight] device=cpu: the card checks do not apply", flush=True)
-    else:
-        busy = subprocess.run(
-            ["pgrep", "-af", "dormouse trai[n]"], capture_output=True, text=True
-        ).stdout.strip()
-        if busy:
-            return f"a dormouse process is alive:\n{busy}"
-        smi = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits"],
-            capture_output=True,
-            text=True,
-        )
-        first = smi.stdout.strip().splitlines()[0] if smi.stdout.strip() else ""
-        if not first:
-            return "device=cuda but nvidia-smi reports no device"
-        try:
-            used = float(first.split(",")[0]) / 1024
-        except ValueError:
-            return f"nvidia-smi's memory row is unreadable: {first!r}"
-        if used >= 2.0:
-            return f"the card already holds {used:.2f} GiB (the preflight's ceiling is 2.0)"
-        print(f"[preflight] no dormouse process; card holds {used:.2f} GiB", flush=True)
-    for path in (DATA, EVAL_DATA, str(ROOT / str(COMMON["mix_plan"]))):
-        if not Path(path).is_file():
-            return f"no file at {path}"
-    return None
 
 
 # --- the verdict statistic (pure; gated by tests/test_sf_muon_legal.py) -----
@@ -447,7 +416,9 @@ def main(argv: list[str] | None = None) -> int:
     a.add_argument("--device", default="cuda")
     a.add_argument("--out-dir", default="~/logs/ab_sf_muon")
     args = ap.parse_args(argv)
-    why = preflight(args.device)
+    why = preflight(args.device) or data_missing(
+        DATA, EVAL_DATA, str(ROOT / str(COMMON["mix_plan"]))
+    )
     if why is not None:
         return refuse(why)
     return ab(args)

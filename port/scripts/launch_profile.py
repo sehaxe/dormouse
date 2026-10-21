@@ -51,7 +51,9 @@ import functools
 import re
 import statistics
 import subprocess
+import sys
 import time
+from pathlib import Path
 
 import torch
 
@@ -60,6 +62,16 @@ from dormouse.model import DormouseModel
 from dormouse.model.experts import invalidate_banks_all
 from dormouse.model.qat_cache import invalidate_qat_cache_all
 from dormouse.train.optim import MixOptimizer, clip_grads
+
+# `scripts/` is not a package (a test loads this file by path): the lane guard is
+# a sibling file, so its directory goes on the path, APPENDED not inserted (a
+# script name at the front of `sys.path` would shadow a package of that name).
+sys.path.append(str(Path(__file__).resolve().parent))
+from _lane import preflight as _lane_preflight  # noqa: E402
+from _lane import skip  # noqa: E402
+
+# a test pins a 0-arg `preflight`: this probe only ever measures the card.
+preflight = functools.partial(_lane_preflight, "cuda")
 
 PRESET = "medium"
 BATCH, SEQ = 8, 512
@@ -106,49 +118,6 @@ _NAME_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
         ),
     ),
 )
-
-
-def skip(why: str) -> int:
-    """A loud SKIP: the reason, and no table. Exit 0 — the code is not at fault."""
-    print(
-        f"\n=== SKIP: {why}\n"
-        f"=== ONE GPU PROCESS AT A TIME (AGENTS §1.5): nothing was measured, so there\n"
-        f"=== is no number to quote. Re-run when the card is free.\n",
-        flush=True,
-    )
-    return 0
-
-
-def preflight() -> str | None:
-    """`None` when the card is ours, else the reason to skip.
-
-    `pgrep` + `nvidia-smi`, per the house GPU discipline, so the check itself
-    builds no CUDA context on a card that is in use.
-    """
-    busy = subprocess.run(
-        ["pgrep", "-af", "dormouse trai[n]"], capture_output=True, text=True
-    ).stdout.strip()
-    if busy:
-        return f"a dormouse train process is alive:\n{busy}"
-    smi = subprocess.run(
-        ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
-        capture_output=True,
-        text=True,
-    )
-    if smi.returncode == 0 and smi.stdout.strip():
-        mib = int(smi.stdout.split()[0])
-        if mib >= 1024:
-            return f"the card already holds {mib} MiB (the preflight's ceiling is 1024)"
-        print(f"[preflight] no train process; nvidia-smi reports {mib} MiB used", flush=True)
-        return None
-    if not torch.cuda.is_available():
-        return "no CUDA device is visible"
-    free, total = torch.cuda.mem_get_info()
-    used = (total - free) / 2**30
-    if used >= 1.0:
-        return f"the card already holds {used:.2f} GiB (the preflight's ceiling is 1.0)"
-    print(f"[preflight] no train process; card holds {used:.2f} GiB", flush=True)
-    return None
 
 
 def _overrides(arm: str) -> dict:
@@ -425,6 +394,16 @@ def arm(name: str, run, state: dict) -> None:
 
 def main() -> int:
     why = preflight()
+    if why is None:
+        # This probe's own ceiling is 1 GiB, tighter than the lane guard's 2.0:
+        # a card already holding a second model is contended however idle it looks.
+        smi = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if smi and int(smi.split()[0]) >= 1024:
+            why = f"the card already holds {smi.split()[0]} MiB (this probe's ceiling is 1024)"
     if why is not None:
         return skip(why)
     run = load_run(PRESET)

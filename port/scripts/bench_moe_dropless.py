@@ -36,6 +36,7 @@ import statistics
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -45,36 +46,18 @@ from dormouse.instrument import Counters
 from dormouse.model import moe_kernels as mk
 from dormouse.model.experts import SparseMoE
 
+# `scripts/` is not a package (a test loads this file by path): the lane guard is
+# a sibling file, so its directory goes on the path, APPENDED not inserted (a
+# script name at the front of `sys.path` would shadow a package of that name).
+sys.path.append(str(Path(__file__).resolve().parent))
+from _lane import preflight, skip  # noqa: E402
+
 DEV = "cuda"
 #: b1's expert geometry (`configs/b1.toml`): E 1024, d 2048, r 64, f 5461, topk 2.
 E, D, RANK, F_DIM = 1024, 2048, 64, 5461
 TOKENS = 8192  # x rows -> 16 384 routed rows at topk 2 (the task's shape)
 REPS = 5
 BM = mk.TILES["BLOCK_M"]
-
-
-def skip(why: str) -> int:
-    print(
-        f"\n=== SKIP: {why}\n"
-        f"=== ONE GPU PROCESS AT A TIME (AGENTS §1.5): nothing was measured, so there\n"
-        f"=== is no number to quote. Re-run when the card is free.\n",
-        flush=True,
-    )
-    return 0
-
-
-def preflight() -> str | None:
-    busy = subprocess.run(
-        ["pgrep", "-af", "dormouse sf[t]"], capture_output=True, text=True
-    ).stdout.strip()
-    if busy:
-        return f"a dormouse process is alive:\n{busy}"
-    free, total = torch.cuda.mem_get_info()
-    used = (total - free) / 2**30
-    if used >= 2.0:
-        return f"the card already holds {used:.2f} GiB (the preflight's ceiling is 2.0)"
-    print(f"[preflight] no dormouse process; card holds {used:.2f} GiB", flush=True)
-    return None
 
 
 def _timed(fn, reps: int = REPS) -> tuple[float, float, float]:
@@ -96,7 +79,12 @@ def _timed(fn, reps: int = REPS) -> tuple[float, float, float]:
 
 
 def main() -> int:
-    why = preflight()
+    busy = subprocess.run(
+        ["pgrep", "-af", "dormouse sf[t]"],
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    why = preflight("cuda") or (f"a dormouse process is alive:\n{busy}" if busy else None)
     if why is not None:
         return skip(why)
     torch.manual_seed(11)

@@ -40,23 +40,13 @@ from dormouse.model.decode import decode_bytes
 from dormouse.model.specdecode import spec_decode_bytes
 from dormouse.train.loop import load_model_half, load_model_state
 
+# `scripts/` is not a package (a test loads this file by path): the lane guard is
+# a sibling file, so its directory goes on the path, APPENDED not inserted (a
+# script name at the front of `sys.path` would shadow a package of that name).
+sys.path.append(str(Path(__file__).resolve().parent))
+from _lane import preflight  # noqa: E402
+
 SPEC_KS = (1, 2, 4, 8)
-
-
-def preflight() -> str | None:
-    """`None` when the card is ours; else the reason to SKIP (never an error)."""
-    busy = subprocess.run(
-        ["pgrep", "-ax", "dormouse"], capture_output=True, text=True
-    ).stdout.strip()
-    if busy:
-        return f"a dormouse process is alive:\n{busy}"
-    if not torch.cuda.is_available():
-        return "no CUDA device: this bench measures the card, and a CPU run would measure the host"
-    free, total = torch.cuda.mem_get_info()
-    used = (total - free) / 2**30
-    if used >= 2.0:
-        return f"the card already holds {used:.2f} GiB"
-    return None
 
 
 def main() -> int:
@@ -68,7 +58,10 @@ def main() -> int:
     ap.add_argument("--temp", type=float, default=0.8)
     args = ap.parse_args()
 
-    reason = preflight()
+    busy = subprocess.run(
+        ["pgrep", "-ax", "dormouse"], capture_output=True, text=True
+    ).stdout.strip()
+    reason = preflight("cuda") or (f"a dormouse process is alive:\n{busy}" if busy else None)
     if reason is not None:
         print(f"[SKIP] {reason}")
         print(

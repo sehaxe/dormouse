@@ -51,6 +51,12 @@ from dormouse.instrument import Counters
 from dormouse.model import moe_sonic as ms
 from dormouse.model.experts import SparseMoE
 
+# `scripts/` is not a package (a test loads this file by path): the lane guard is
+# a sibling file, so its directory goes on the path, APPENDED not inserted (a
+# script name at the front of `sys.path` would shadow a package of that name).
+sys.path.append(str(Path(__file__).resolve().parent))
+from _lane import preflight, skip  # noqa: E402
+
 DEV = "cuda"
 ROOT = Path(__file__).resolve().parents[1]
 REPS = 5
@@ -89,43 +95,6 @@ def bytes_table(shape: ms.Shape) -> dict[str, int]:
         f"bytes as the bf16 xg it replaces ({mib(b['xg_dt_write'])})"
     )
     return w
-
-
-def skip(why: str) -> int:
-    print(
-        f"\n=== SKIP: {why}\n"
-        f"=== ONE GPU PROCESS AT A TIME (AGENTS §1.5): nothing was measured, so there\n"
-        f"=== is no TIME to quote. Re-run when the card is free.\n",
-        flush=True,
-    )
-    print("=== ARITHMETIC ONLY (no GPU call was made) ===")
-    for shape in reversed(ms.SHAPES):
-        bytes_table(shape)
-    print(
-        "\n=== The byte arithmetic above is a MODEL OF THE CODE, not a timing. The\n"
-        "=== forward is a byte win; the pass is a byte LOSS because the backward\n"
-        "=== recomputes the grouped forward. Only the run says what those bytes cost.\n",
-        flush=True,
-    )
-    return 0
-
-
-def preflight() -> str | None:
-    if not torch.cuda.is_available():
-        return "no CUDA device"
-    busy = subprocess.run(
-        ["pgrep", "-af", "dormouse (trai[n]|bench)|[/]target/release/train"],
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    if busy:
-        return f"a dormouse process is alive:\n{busy}"
-    free, total = torch.cuda.mem_get_info()
-    used = (total - free) / 2**30
-    if used >= 2.0:
-        return f"the card already holds {used:.2f} GiB (the preflight's ceiling is 2.0)"
-    print(f"[preflight] no dormouse process; card holds {used:.2f} GiB", flush=True)
-    return None
 
 
 def _timed(fn, reps: int = REPS) -> tuple[float, float, float]:
@@ -267,9 +236,24 @@ def measure(shape: ms.Shape) -> None:
 
 
 def main() -> int:
-    why = preflight()
+    busy = subprocess.run(
+        ["pgrep", "-af", "dormouse (trai[n]|bench)|[/]target/release/train"],
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    why = preflight("cuda") or (f"a dormouse process is alive:\n{busy}" if busy else None)
     if why is not None:
-        return skip(why)
+        rc = skip(why)
+        print("=== ARITHMETIC ONLY (no GPU call was made) ===")
+        for shape in reversed(ms.SHAPES):
+            bytes_table(shape)
+        print(
+            "\n=== The byte arithmetic above is a MODEL OF THE CODE, not a timing. The\n"
+            "=== forward is a byte win; the pass is a byte LOSS because the backward\n"
+            "=== recomputes the grouped forward. Only the run says what those bytes cost.\n",
+            flush=True,
+        )
+        return rc
     for shape in reversed(ms.SHAPES):  # b1 first: it is the shape b1 runs
         bytes_table(shape)
         measure(shape)

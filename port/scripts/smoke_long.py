@@ -35,12 +35,19 @@ import statistics
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import torch
 
 from dormouse.config import load_run
 from dormouse.model import DormouseModel
 from dormouse.train import kda_field, open_streams
+
+# `scripts/` is not a package (a test loads this file by path): the lane guard is
+# a sibling file, so its directory goes on the path, APPENDED not inserted (a
+# script name at the front of `sys.path` would shadow a package of that name).
+sys.path.append(str(Path(__file__).resolve().parent))
+from _lane import preflight, skip  # noqa: E402
 
 #: The port's data on this box (AGENTS §2.6) — the LOCAL copy (the /mnt drive
 #: may not be mounted; the 19.9 GB filtered corpus was copied here).
@@ -51,32 +58,6 @@ BATCH = 2
 SEQ_LENS = (8192, 16384, 32768)
 SEGMENT = 4096
 WARM, MEASURE = 2, 3
-
-
-def skip(why: str) -> int:
-    """A loud SKIP: the reason, and no table. Exit 0 — nothing is wrong with the code."""
-    print(
-        f"\n=== SKIP: {why}\n"
-        f"=== ONE GPU PROCESS AT A TIME (AGENTS §1.5): nothing was measured, so there\n"
-        f"=== is no number to quote. Re-run when the card is free.\n",
-        flush=True,
-    )
-    return 0
-
-
-def preflight() -> str | None:
-    """`None` when the card is ours, else the reason to skip."""
-    busy = subprocess.run(
-        ["pgrep", "-af", "dormouse sf[t]"], capture_output=True, text=True
-    ).stdout.strip()
-    if busy:
-        return f"a dormouse process is alive:\n{busy}"
-    free, total = torch.cuda.mem_get_info()
-    used = (total - free) / 2**30
-    if used >= 2.0:
-        return f"the card already holds {used:.2f} GiB (the preflight's ceiling is 2.0)"
-    print(f"[preflight] no dormouse process; card holds {used:.2f} GiB", flush=True)
-    return None
 
 
 def arm(seq_len: int, segment_len: int) -> dict:
@@ -160,7 +141,12 @@ def arm(seq_len: int, segment_len: int) -> dict:
 
 
 def main() -> int:
-    why = preflight()
+    busy = subprocess.run(
+        ["pgrep", "-af", "dormouse sf[t]"],
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    why = preflight("cuda") or (f"a dormouse process is alive:\n{busy}" if busy else None)
     if why is not None:
         return skip(why)
     arms: list[dict] = []

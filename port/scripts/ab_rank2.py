@@ -74,6 +74,12 @@ import sys
 import time
 from pathlib import Path
 
+# `scripts/` is not a package (a test loads this file by path): the lane guard is
+# a sibling file, so its directory goes on the path, APPENDED not inserted (a
+# script name at the front of `sys.path` would shadow a package of that name).
+sys.path.append(str(Path(__file__).resolve().parent))
+from _lane import data_missing, preflight  # noqa: E402
+
 ROOT = Path(__file__).resolve().parent.parent
 LOGDIR = Path.home() / "logs" / "ab_rank2"
 DATA = "/home/sehaxe/dormouse/data_local/corpus_bin_filtered.bin"
@@ -167,27 +173,6 @@ def _literal(value: object) -> str:
     return ("true" if value else "false") if isinstance(value, bool) else str(value)
 
 
-def preflight() -> str | None:
-    """None when the box and the corpus are ready, else the reason (one heavy thing)."""
-    for path in (DATA, EVAL):
-        if not Path(path).is_file():
-            return f"missing corpus file {path}"
-    busy = subprocess.run(["pgrep", "-af", "dormouse trai[n]"], capture_output=True, text=True)
-    if busy.stdout.strip():
-        return f"a train process is live: {busy.stdout.strip().splitlines()[0]}"
-    smi = subprocess.run(
-        ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
-        capture_output=True,
-        text=True,
-    )
-    if smi.returncode != 0:
-        return f"nvidia-smi failed: {smi.stderr.strip() or smi.returncode}"
-    mib = int(smi.stdout.strip().splitlines()[0])
-    if mib >= 2048:
-        return f"the card holds {mib} MiB"
-    return None
-
-
 def read_rows(path: Path) -> tuple[list[dict], list[dict]]:
     evals, logs = [], []
     if not path.exists():
@@ -274,7 +259,7 @@ def main() -> int:
         )
 
     if not args.dry_run:
-        why = preflight()
+        why = preflight("cuda") or data_missing(DATA, EVAL)
         if why:
             print(f"SKIP: {why}")
             return 0
