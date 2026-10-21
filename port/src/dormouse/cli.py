@@ -48,19 +48,74 @@ def main() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _coerce(name: str, value: object, default: object) -> object:
+    """Make `--set` honour the FIELD's type, not the literal's punctuation.
+
+    TOML booleans are lowercase, so `--set use_msa=False` used to stay the
+    string `"False"` — truthy, i.e. the opposite of what was asked. Every bool
+    flag had that hole, and a silently flipped flag is the SILENT class this
+    repo treats as a defect. The rule is now: the field's default names the
+    type, and a literal that does not fit it is refused loudly.
+    """
+    if default is dataclasses.MISSING:
+        return value
+    want = type(default)
+    if want is bool:
+        if isinstance(value, bool):
+            return value
+        text = str(value).strip().lower()
+        if text in ("true", "1", "yes", "on"):
+            return True
+        if text in ("false", "0", "no", "off"):
+            return False
+        raise LoudError(
+            f"--set {name}={value!r}: this is a boolean field. Escape: "
+            f"--set {name}=true or --set {name}=false."
+        )
+    if want is int and not isinstance(value, bool):
+        if isinstance(value, int):
+            return value
+        try:
+            return int(str(value), 0)
+        except ValueError:
+            raise LoudError(
+                f"--set {name}={value!r}: this is an integer field. "
+                f"Escape: a whole number, e.g. --set {name}=512."
+            ) from None
+    if want is float:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+        try:
+            return float(str(value))
+        except ValueError:
+            raise LoudError(
+                f"--set {name}={value!r}: this is a float field. "
+                f"Escape: a number, e.g. --set {name}=1e-3."
+            ) from None
+    return value
+
+
 def _split_sets(sets: list[str]) -> tuple[dict[str, object], dict[str, object]]:
     """`--set k=v` routed by schema: model keys vs train keys, unknown → loud.
 
     A bare value that parses as a TOML literal keeps that type (1, 1e-3,
     true); anything else is a string — the common case is a preset name or an
-    optimizer mode.
+    optimizer mode. Booleans are then re-read against the field's own type
+    (`_coerce`), because TOML spells them lowercase and `--set flag=False`
+    would otherwise be a truthy string.
     """
+
     import tomllib
 
     model_over: dict[str, object] = {}
     train_over: dict[str, object] = {}
     model_keys = {f.name for f in dataclasses.fields(ModelConfig)}
     train_keys = {f.name for f in dataclasses.fields(TrainConfig)}
+    #: name -> declared default, used only to type-check a `--set` literal.
+    _defaults: dict[str, object] = {
+        f.name: f.default
+        for f in (*dataclasses.fields(ModelConfig), *dataclasses.fields(TrainConfig))
+    }
     for s in sets:
         if s.count("=") != 1:
             raise LoudError(f"--set {s!r}: expected exactly one `key=value`")
@@ -75,7 +130,8 @@ def _split_sets(sets: list[str]) -> tuple[dict[str, object], dict[str, object]]:
                 f"--set {k}: neither a model nor a train key. Escape: fix the "
                 f"typo, or add the field to its config class and wire it."
             )
-        where[k] = value
+        default = _defaults[k]
+        where[k] = _coerce(k, value, default)
     return model_over, train_over
 
 

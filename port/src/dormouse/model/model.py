@@ -38,6 +38,7 @@ from .byteflow import (
 )
 from .dspark import DSparkHead, dspark_aux_loss
 from .loopblock import LoopBlock
+from .qat_cache import QuantCache, attach_qat_caches
 from .sigreg import sigreg_loss, stride_sample
 from .tsct import make_projection, set_factor_qat_seed
 
@@ -59,6 +60,10 @@ class DormouseModel(nn.Module):
         #: one of them is ever non-None, and which one is COUNTED per forward.
         self.bf_net: ByteFlowNet | None = None
         self.bf: BfChannel | None = None
+        #: Every QAT cache in the tree (`qat_cache.QuantCache`), collected after
+        #: the build below. `forward` drains their hit counts into `qat_reuse`;
+        #: the trainer invalidates them once per optimizer step.
+        self._qat_caches: list[QuantCache] = []
         if cfg.use_byteflow and not compat_armed(cfg):
             self.bf_net = ByteFlowNet(byteflow_config(cfg), device=device)
             return
@@ -77,6 +82,11 @@ class DormouseModel(nn.Module):
         self.dspark: DSparkHead | None = (
             DSparkHead(cfg, device=device) if cfg.dspark_weight > 0.0 else None
         )
+        # The QAT cost fix's wiring seam: modules whose switch is on built their
+        # own `QuantCache`; every plain `nn.Linear` gets one here when
+        # `dense_qat` is on (`qat_linear` reads it). A model built with both
+        # switches off collects nothing — no cache, every number on record.
+        self._qat_caches = attach_qat_caches(self, dense=cfg.dense_qat != "none")
 
     def set_factor_qat_alpha(self, alpha: float) -> None:
         """Set the annealing alpha on EVERY QAT consumer (one call per step).
@@ -144,6 +154,13 @@ class DormouseModel(nn.Module):
             logits, loss = self._forward_byte_lm(
                 input_ids, targets, counters, depth, pure, breakdown, segment_len
             )
+        if self._qat_caches:
+            # Cache hits in THIS forward, on the existing counter line: the
+            # proof the once-per-step path ran (a cache that silently missed on
+            # every call would leave `qat_reuse=0` while still training).
+            reuse = sum(c.take_hits() for c in self._qat_caches)
+            if reuse:
+                counters.count("qat_reuse", reuse)
         counters.count("forward")
         return logits, loss, counters
 

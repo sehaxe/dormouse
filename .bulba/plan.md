@@ -125,6 +125,15 @@ testable and A/B-able (ADR-0017).
       which parameter each assertion is about (a rename fails it loudly) — no
       group is decided from one.
 - [ ] C12. `feat: smoke preset + --smoke`, `docs/README-model.md` (≤60 lines).
+- [x] P-HALT. port (Python): the halt head + the depth-8 path. `port/src/dormouse/
+      model/halt.py` — BCE target read from the model's OWN per-iteration CE
+      (stop iff `CE_i − CE_{i+1} < halt_eps` or the cap's last iteration), the
+      head built only at `halt_weight > 0` so every preset count is unchanged;
+      config `halt_weight`/`halt_eps`/`halt_min_iter`/`halt_max_iter`/`halt_mode`
+      with loud refusals; the inference stop (`halt_mode`) really shortens the
+      loop and counts `halt_skipped`; `max_iter=8` builds/trains/evaluates;
+      `port/scripts/ab_depth8.py` (`mi4` vs `mi8`, 3 seeds x 2 000, medium,
+      `eval_depths`) written and **NOT run** (card busy). Landed 2026-10-21.
 - [x] D1. `docs: retract the false step-time and verification claims` (prose only,
       no Rust). **Landed 2026-09-29.** Withdrawn without replacement, because the
       corrected value is not known: the 25.8 s/step batch-8 figure (no committed

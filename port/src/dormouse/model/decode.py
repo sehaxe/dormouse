@@ -220,6 +220,15 @@ def recurrent_refusal(model) -> str | None:
             "INSIDE one window, and a one-byte step has no window to select in — that "
             "is a model change wearing an inference flag. Escape: use_msa=false."
         )
+    if getattr(getattr(model, "cfg", None), "halt_mode", False):
+        return (
+            "recurrent decode with halt_mode: the per-iteration KDA state is "
+            "carried across BYTES, so a stop at one byte would leave the deeper "
+            "slots' state un-advanced and the next byte would read a state that "
+            "skipped bytes — a silent model change. Escape: halt_mode=false, or "
+            "decode with the window re-forward (`--no-recurrent`), which halts "
+            "inside one forward."
+        )
     return None
 
 

@@ -33,6 +33,7 @@ from ..model.engram import (
     load_host_state,
 )
 from ..model.experts import invalidate_banks_all
+from ..model.qat_cache import invalidate_qat_cache_all
 from ..model.tsct import set_mm_dtype
 from .data import ByteStream, eval_window_bytes, open_streams, warmup_steps
 from .graph import OptimizerGraph
@@ -804,8 +805,12 @@ def train(
             # (experts frozen in the forward, drifting in memory, checkpoint
             # unreproducible — the medbig2/b1night defect). One call per
             # TRAINING step keeps the cache's real job (one build per step,
-            # reused by the loop's iterations) and nothing more.
+            # reused by the loop's iterations) and nothing more. The QAT
+            # projection cache is keyed on the TENSOR, not `_version` (the same
+            # graph-replay trap), so the trainer invalidates it here beside the
+            # banks: one quantize per trained step, reused by every forward.
             invalidate_banks_all(model)
+            invalidate_qat_cache_all(model)
             if opt.counters:
                 # The Muon arms' own counters (ADR-0019): `ns_triton` when the
                 # fused Newton–Schulz chain ran, `ns_triton_fallback` + the reason

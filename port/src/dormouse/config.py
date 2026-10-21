@@ -77,14 +77,6 @@ DEAD_SNAPSHOT_KEYS = {
 #: The `moe_kernel` literals — the expert-pass arms `experts._dispatch` routes
 #: between. One list, read by `validate`: a name that is not here is LOUD.
 MOE_KERNELS = ("padded", "triton", "naive")
-#: The `moe_topk_mode` literals — how many experts each TOKEN runs
-#: (`model/adaptive_topk.py`): `off` is the constant `moe_topk` width every
-#: number on record runs; `entropy`/`margin` are the per-token confidence
-#: policies. A name that is not here is LOUD.
-MOE_TOPK_MODES = ("off", "entropy", "margin")
-#: The widest per-token `k` the instrument can name (`moe_k1`..`moe_k8`). Above
-#: this is LOUD: the fused backward's top-k tile also stops at 8.
-MOE_TOPK_SLOTS_MAX = 8
 #: The `expert_act` literals — the 2026-10-16 activation tournament arms, each
 #: with its formula source in `experts.expert_glu`:
 #: `silu` (control, SwiGLU), `situ` (Kimi K3, arXiv 2607.24653 Eq. 12),
@@ -228,6 +220,32 @@ class ModelConfig:
     vocab: int = 256
     max_seq_len: int = 512
     max_iter: int = 4
+    #: ---- HALT HEAD (`model/halt.py`): learned inference-time stopping ----
+    #: λ on the halt BCE. `0.0` (the default) builds NO head and adds no
+    #: parameter or compute; a positive weight builds
+    #: `Linear(d, d//4) -> SiLU -> Linear(d//4, 1)` and adds the term to the
+    #: training loss. The target is the model's OWN per-iteration CE: stop at
+    #: iteration `i` iff `CE_i - CE_{i+1} < halt_eps` or `i` is the loop's last
+    #: iteration — never a function of the label sequence (module docstring).
+    halt_weight: float = 0.0
+    #: The CE improvement (nats) below which one more iteration is called
+    #: unhelpful. 0.005 nats = 0.0072 BPB; set by the research scan's reading
+    #: of the depth curves, and a training knob (the A/B keeps it fixed).
+    halt_eps: float = 0.005
+    #: The earliest iteration the INFERENCE stop may fire at (1 = after the
+    #: first). A floor, not a target: `halt_min_iter > 1` guarantees a minimum
+    #: amount of thinking on every input.
+    halt_min_iter: int = 1
+    #: The INFERENCE cap on loop depth when `halt_mode` is on. LOUDLY refused
+    #: above `max_iter` IFF a halt is requested (the `4`/`8` default pair must
+    #: stay a legal config: `max_iter=4`, `halt_mode=false` runs today's model).
+    halt_max_iter: int = 8
+    #: Inference-only switch: run the loop up to `halt_max_iter` and stop at
+    #: the first iteration whose stop probability exceeds 0.5. `false` (the
+    #: default) keeps fixed-depth inference — every existing snapshot's mode.
+    #: Training never halts (the head's BCE needs the full scheduled depth);
+    #: `halt_mode` without a halt head is LOUD.
+    halt_mode: bool = False
     rank: int = 64
     norm_eps: float = 1e-3
 
@@ -322,25 +340,7 @@ class ModelConfig:
     n_experts: int = 3
     #: Experts per position. `0` is the DENSE blend (burn's default), `k` is
     #: the sparse top-k dispatch. Above `n_experts` is refused by validate.
-    #: With `moe_topk_mode` != `off` this field is the ARM SWITCH (`> 0` selects
-    #: the routed pass); the per-token width comes from `moe_topk_max` there.
     moe_topk: int = 0
-    #: How many experts each TOKEN runs (`model/adaptive_topk.py`):
-    #: `off` (the default) is the constant `moe_topk` width — every existing run
-    #: and snapshot is bit-identical on it; `entropy` grows the width with the
-    #: router's normalized entropy; `margin` shrinks it with the top-1/top-2
-    #: logit gap. INFERENCE-ONLY: no new parameters and no training path.
-    moe_topk_mode: str = "off"
-    #: The narrow/wide ends of the adaptive width, in experts. `k_min >= 1`,
-    #: `k_min <= k_max <= min(8, n_experts)`; a violation is LOUD at load. Inert
-    #: when `moe_topk_mode = "off"`.
-    moe_topk_min: int = 1
-    moe_topk_max: int = 4
-    #: The confidence window the policy ramps across. `entropy`: normalized
-    #: router entropy in `[0, 1]`; `margin`: the top-1 minus top-2 LOGIT gap in
-    #: logit units. Read only when `moe_topk_mode != "off"`; `lo < hi` is LOUD.
-    moe_entropy_lo: float = 0.2
-    moe_entropy_hi: float = 0.6
     #: Tokens per expert in the capacity-bound permute:
     #: `ceil(capacity * tokens * topk / n_experts)`, never below `topk`.
     #: **`0` = DROPLESS** (2026-10-17): every assignment reaches its expert, so
@@ -1007,40 +1007,6 @@ def validate(model: ModelConfig) -> None:
             f"moe_topk={model.moe_topk} > n_experts={model.n_experts}: a top-k "
             f"above the bank is refused, not clamped (clamping is the silent collapse)"
         )
-    if model.moe_topk_mode not in MOE_TOPK_MODES:
-        loud(
-            f"moe_topk_mode={model.moe_topk_mode!r} is not a width policy. Known: "
-            f"{list(MOE_TOPK_MODES)} — `off` the constant `moe_topk` (every number on "
-            f"record), `entropy` the normalized router entropy, `margin` the top-1/"
-            f"top-2 logit gap (model/adaptive_topk.py). Escape: name one of those, or "
-            f"land the policy and its gate BEFORE the config can lie about it."
-        )
-    if not 1 <= model.moe_topk_min <= model.moe_topk_max <= MOE_TOPK_SLOTS_MAX:
-        loud(
-            f"moe_topk_min={model.moe_topk_min} / moe_topk_max={model.moe_topk_max} "
-            f"outside 1 <= min <= max <= {MOE_TOPK_SLOTS_MAX}: the histogram counters "
-            f"and the fused backward's top-k tile stop there, and an inverted window "
-            f"would clamp every token to one end. Escape: the defaults 1/4."
-        )
-    if model.moe_topk_mode != "off":
-        if model.moe_topk <= 0:
-            loud(
-                f"moe_topk_mode={model.moe_topk_mode!r} with moe_topk=0: the adaptive "
-                f"width lives on the ROUTED pass, and 0 is the dense blend (every "
-                f"expert, no router top-k). Escape: moe_topk > 0 — its VALUE selects "
-                f"the arm here, the width comes from moe_topk_max."
-            )
-        if model.moe_topk_max > model.n_experts:
-            loud(
-                f"moe_topk_max={model.moe_topk_max} > n_experts={model.n_experts}: a "
-                f"width above the bank cannot be filled. Escape: k_max <= n_experts."
-            )
-        if not model.moe_entropy_lo < model.moe_entropy_hi:
-            loud(
-                f"moe_entropy_lo={model.moe_entropy_lo} >= moe_entropy_hi="
-                f"{model.moe_entropy_hi} with mode={model.moe_topk_mode!r}: the window "
-                f"would be a step, not a ramp. Escape: lo < hi (defaults 0.2 < 0.6)."
-            )
     if model.moe_capacity < 0.0:
         loud(
             f"moe_capacity={model.moe_capacity} is negative: it is a multiple of the "
@@ -1226,6 +1192,52 @@ def validate(model: ModelConfig) -> None:
             f"in bytes). Escape: k >= 1, stride >= 1."
         )
 
+    # The HALT HEAD's own coherence (`model/halt.py`). The weight gates the
+    # module (0 builds nothing), the mode gates INFERENCE, and the cap is only
+    # meaningful on the arm that runs it — so the `halt_max_iter <= max_iter`
+    # refusal applies IFF a halt is requested. The default `max_iter=4` /
+    # `halt_max_iter=8` pair must stay a legal config (every snapshot loads it).
+    if model.halt_weight < 0.0:
+        loud(
+            f"halt_weight={model.halt_weight} is negative: it is λ, the multiplier "
+            f"on the halt BCE. Escape: 0.0 (off) or a positive weight."
+        )
+    if model.halt_eps < 0.0:
+        loud(
+            f"halt_eps={model.halt_eps} is negative: it is a CE improvement in "
+            f"nats, and a negative threshold would ask the head to stop when "
+            f"thinking HURTS by more than |eps|. Escape: 0.0 or a small positive "
+            f"value (the default 0.005)."
+        )
+    if model.halt_min_iter < 1:
+        loud(
+            f"halt_min_iter={model.halt_min_iter}: the first iteration is 1, so a "
+            f"floor below it names a decision the loop cannot make. Escape: >= 1."
+        )
+    if model.halt_mode:
+        if model.halt_weight <= 0.0:
+            loud(
+                f"halt_mode=true with halt_weight={model.halt_weight}: the "
+                f"checkpoint has no halt head (the head is built IFF the weight "
+                f"is on), so there is nothing to decide the stop. Escape: a "
+                f"checkpoint trained with halt_weight>0, or halt_mode=false."
+            )
+        if model.halt_max_iter > model.max_iter:
+            loud(
+                f"halt_max_iter={model.halt_max_iter} > max_iter={model.max_iter}: "
+                f"the inference cap cannot exceed the depth the loop was BUILT "
+                f"for (the `iter_embed`/gate rows stop at max_iter), so the flag "
+                f"would name thinking that has no slot. Escape: max_iter >= "
+                f"{model.halt_max_iter} (the depth-8 arm), or halt_max_iter <= "
+                f"{model.max_iter}."
+            )
+        if model.halt_max_iter < model.halt_min_iter:
+            loud(
+                f"halt_max_iter={model.halt_max_iter} < halt_min_iter="
+                f"{model.halt_min_iter}: the cap must admit the floor. Escape: "
+                f"swap them."
+            )
+
     if model.quant != "none":
         _refuse_ladder_rung(model.quant)
 
@@ -1238,6 +1250,13 @@ def _validate_byteflow(model: ModelConfig) -> None:
     because every boundary is a position inside the window; and the local /
     global widths must tile their head splits (`byteflow.py`, `ByteFlowNet`).
     """
+    if model.halt_weight > 0.0:
+        loud(
+            "use_byteflow with halt_weight>0: the halt head reads the byte loop's "
+            "per-iteration readout, and the channel runs the loop over K patch "
+            "latents with no per-byte CE to build a target from. Escape: "
+            "halt_weight = 0.0, or drop use_byteflow."
+        )
     if model.max_seq_len > model.byteflow_max_bytes:
         loud(
             f"max_seq_len={model.max_seq_len} > byteflow_max_bytes="
@@ -1397,6 +1416,15 @@ def _validate_segment(model: ModelConfig, tcfg: TrainConfig) -> None:
             f"pattern itself (a block spanning a cut can no longer be selected) — that "
             f"is a model change, and this flag is allowed to change only the memory. "
             f"Escape: use_msa=false, or segment_len=0."
+        )
+    if model.halt_weight > 0.0 or model.halt_mode:
+        loud(
+            f"segment_len={n} with halt_weight={model.halt_weight}/halt_mode="
+            f"{model.halt_mode}: the segmented forward runs the loop per segment, "
+            f"so the halt head's per-iteration states would be concatenations of "
+            f"segment windows and its target a per-segment mean — two unvalidated "
+            f"axes in one run. Escape: halt_weight=0 and halt_mode=false, or "
+            f"segment_len=0."
         )
     if tcfg.rand_depth:
         loud(

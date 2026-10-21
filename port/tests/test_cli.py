@@ -38,6 +38,34 @@ def test_unknown_set_key_refuses():
     assert r.exit_code != 0 and "neither a model nor a train key" in str(r.exception)
 
 
+def test_a_bool_set_is_read_as_a_bool_not_as_a_truthy_string():
+    """`--set flag=False` must turn the flag OFF.
+
+    TOML spells booleans lowercase, so the capitalised literal used to survive
+    as the string "False" — truthy, i.e. the opposite of what was typed. This
+    hit every bool flag in the CLI; the field's own type is the fix.
+    """
+    from dormouse.cli import _split_sets
+
+    model, _ = _split_sets(["share_u=False", "use_msa=false", "use_attnres=TRUE"])
+    assert model == {"share_u": False, "use_msa": False, "use_attnres": True}
+
+    # a literal that is not a boolean is refused, not silently truthy
+    import pytest
+
+    from dormouse.instrument import LoudError
+
+    with pytest.raises(LoudError, match="boolean field"):
+        _split_sets(["share_u=maybe"])
+
+
+def test_an_int_set_is_read_as_an_int():
+    from dormouse.cli import _split_sets
+
+    _, train = _split_sets(["steps=1000", "log_every=50"])
+    assert train == {"steps": 1000, "log_every": 50}
+
+
 def test_unported_mechanism_refuses_through_the_cli():
     r = runner.invoke(app, ["info", "small", "--set", 'quant="lbit"'])  # a training-time rung
     assert r.exit_code != 0 and "Escape" in str(

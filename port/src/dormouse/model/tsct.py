@@ -60,6 +60,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from ..instrument import Counters, loud
+from .qat_cache import QuantCache
 
 # ---------------------------------------------------------------------------
 # COMPUTE rungs: the fp8 2-D GEMM lane (`mm_dtype`)
@@ -331,8 +332,73 @@ def _s3t_generator(device: torch.device | str) -> torch.Generator:
     return g
 
 
-def factor_qat_project(
+def qat_values(
     w: torch.Tensor, mode: str, alpha: float, *, dim: tuple | None = None
+) -> torch.Tensor:
+    """The raw projection `q(w)` under `factor_qat` — values only, no STE.
+
+    Split out for `QuantCache`: the cache stores ONE detached `q` per weight per
+    optimizer step, and [`factor_qat_project`] re-composes the SAME expression
+    (`w + alpha·(q − w)`) from it on every forward, so cached and uncached
+    forwards are bit-identical by construction. The cache stores the PROJECTION,
+    never the blended tensor: `w + (w_q − w)` is not bitwise `w_q`.
+
+    `dim` is the absmean axis: `None` = per-tensor (`ternary.ternarize`), a tuple
+    = per first-index slice, which is the per-EXPERT α of an `[E, ·, ·]` bank.
+    """
+    if mode == "none":
+        return w
+    if mode not in ("ternary", "binary", "mxfp4", "ternary_s3t"):
+        raise AssertionError(f"factor_qat/dense_qat={mode!r} reached the projector with no mode")
+    if mode == "mxfp4":
+        from .mxfp import fake_quant_mx
+
+        return fake_quant_mx(w, "mxfp4")
+    if mode == "ternary_s3t":
+        from .ternary import _check_finite, stochastic_ternary
+
+        if dim is None:
+            return stochastic_ternary(w, _s3t_generator(w.device))
+        # The per-slice S3T of `stochastic_ternary`, transposed onto `dim`
+        # (see its docstring: `p = clamp(|w|/scale, 0, 1)`, STRICT `p > u`),
+        # with the one whole-tensor draw the bank's layout gives. The finite
+        # guard is the module's own, so both paths refuse an inf/NaN master
+        # identically instead of one of them zeroing it silently.
+        _check_finite(w, "factor_qat=ternary_s3t (bank slice)")
+        a = w.float().abs().mean(dim=dim, keepdim=True).clamp_min(1e-12)
+        keep_p = (w.float() / a).abs().clamp(0.0, 1.0)
+        u = torch.rand(
+            keep_p.shape,
+            generator=_s3t_generator(w.device),
+            dtype=torch.float32,
+            device=w.device,
+        )
+        return (w.float().sign() * a * (keep_p > u)).to(w.dtype)
+    if dim is None:
+        from .ternary import sign_binary, ternarize
+
+        if mode == "ternary":
+            assert 0.0 <= alpha <= 1.0, (
+                f"annealing alpha={alpha} is a schedule position in [0, 1] "
+                "(1 = pure ternary, 0 = the master); refused, not clamped"
+            )
+            return ternarize(w)
+        return sign_binary(w)
+    # The per-slice axis (banks): the same formula as `ternary.ternarize` /
+    # `ternary.sign_binary`, transposed onto `dim` — the grid is ±mean(|W|),
+    # ε only guards the division (exactly `ternarize`'s convention: divide by
+    # `α+ε`, scale back by `α`), so a banked expert and the same expert run
+    # alone land on the SAME values.
+    a = w.abs().mean(dim=dim, keepdim=True)
+    if mode == "ternary":
+        q = (w.float() / (a + 1e-5)).round().clamp(-1.0, 1.0) * a
+    else:
+        q = torch.sign(w) * a
+    return q.to(w.dtype)
+
+
+def factor_qat_project(
+    w: torch.Tensor, mode: str, alpha: float, *, dim: tuple | None = None, cache=None
 ) -> torch.Tensor:
     """The forward's view of a TSCT factor master under `factor_qat`.
 
@@ -379,9 +445,10 @@ def factor_qat_project(
         prints it at start (`train/loop.py`) and `set_factor_qat_seed` carries
         it too. The fix, if this rung ever needs one, is a step index threaded
         into the projector;
-      * the banked path refreshes the quantized stack once per optimizer step
-        (`SparseMoE._banks`' cache key), so there the mask is drawn per step,
-        not per forward.
+      * every consumer that passes a `QuantCache` (all of them inside the
+        model, wired by `DormouseModel.__init__`) refreshes the mask once per
+        optimizer step, so the mask is drawn per step, not per forward — the
+        `SparseMoE._banks` behaviour, generalized.
 
     `dim` picks the absmean's aggregation axis: `None` = the whole tensor (the
     factor-per-layer reading, `ternary.ternarize`'s per-TENSOR axis); `(1, 2)`
@@ -394,55 +461,28 @@ def factor_qat_project(
     master (`w_eff = w + alpha·(q(w) − w).detach()`; `alpha = 0` is exactly the
     master). The masters stay fp32 — quantization lives on the compute copy
     only, exactly the storage-rung contract (`pack_tsct`'s docstring).
+
+    PASS `cache=` WHEN THE WEIGHTS ONLY MOVE ONCE PER OPTIMIZER STEP. Every
+    forward would otherwise re-run the projection (`absmean`, divide, round,
+    clamp, multiply): measured 17.1 k tok/s against 40.9 k bf16 on the 9.2 M
+    polygon (2026-10-21), and the projection is the whole difference. With a
+    [`qat_cache.QuantCache`], `q` is computed on the first forward after the
+    trainer's per-step invalidation and every later forward pays one sub + one
+    add (`QuantCache.ste`); the logits are bit-identical to the uncached path
+    and dL/dw is unchanged (`tests/test_qat_cache.py`). `cache=None` (every
+    direct API caller that does not opt in) keeps the old per-forward path.
     """
     if mode == "none":
         return w
-    if mode not in ("ternary", "binary", "mxfp4", "ternary_s3t"):
-        raise AssertionError(f"factor_qat/dense_qat={mode!r} reached the projector with no mode")
-    if mode == "mxfp4":
-        from .mxfp import fake_quant_mx
-
-        q = fake_quant_mx(w, "mxfp4")
-        return (w + alpha * (q - w).detach()).to(w.dtype)
-    if mode == "ternary_s3t":
-        from .ternary import _check_finite, stochastic_ternary
-
-        if dim is None:
-            q = stochastic_ternary(w, _s3t_generator(w.device))
-        else:
-            # The per-slice S3T of `stochastic_ternary`, transposed onto `dim`
-            # (see its docstring: `p = clamp(|w|/scale, 0, 1)`, STRICT `p > u`),
-            # with the one whole-tensor draw the bank's layout gives. The finite
-            # guard is the module's own, so both paths refuse an inf/NaN master
-            # identically instead of one of them zeroing it silently.
-            _check_finite(w, "factor_qat=ternary_s3t (bank slice)")
-            a = w.float().abs().mean(dim=dim, keepdim=True).clamp_min(1e-12)
-            keep_p = (w.float() / a).abs().clamp(0.0, 1.0)
-            u = torch.rand(
-                keep_p.shape,
-                generator=_s3t_generator(w.device),
-                dtype=torch.float32,
-                device=w.device,
-            )
-            q = (w.float().sign() * a * (keep_p > u)).to(w.dtype)
-        return (w + alpha * (q.to(w.dtype) - w).detach()).to(w.dtype)
-    if dim is None:
-        from .ternary import sign_binary, ste_ternary_annealed
-
-        if mode == "ternary":
-            return ste_ternary_annealed(w, alpha)
-        return w + alpha * (sign_binary(w) - w).detach()
-    # The per-slice axis (banks): the same formula as `ternary.ternarize` /
-    # `ternary.sign_binary`, transposed onto `dim` — the grid is ±mean(|W|),
-    # ε only guards the division (exactly `ternarize`'s convention: divide by
-    # `α+ε`, scale back by `α`), so a banked expert and the same expert run
-    # alone land on the SAME values.
-    a = w.abs().mean(dim=dim, keepdim=True)
-    if mode == "ternary":
-        q = (w.float() / (a + 1e-5)).round().clamp(-1.0, 1.0) * a
-    else:
-        q = torch.sign(w) * a
-    return (w + alpha * (q.to(w.dtype) - w).detach()).to(w.dtype)
+    if cache is not None:
+        # The QAT cost fix: `refresh` is the once-per-step projection (`q` is
+        # DETACHED); `ste` is the per-forward sub+add. A miss is the uncached
+        # math once; a hit is a dict lookup. The trainer invalidates the cache
+        # after every optimizer step (`qat_cache.invalidate_qat_cache_all`).
+        cache.refresh(w, mode, alpha, dim)
+        return cache.ste(w)
+    q = qat_values(w, mode, alpha, dim=dim)
+    return (w + alpha * (q - w).detach()).to(w.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -477,21 +517,12 @@ def qat_linear(linear: nn.Linear, x: torch.Tensor, kind: str, alpha: float) -> t
     """
     if kind == "none":
         return linear(x)
-    w = dense_qat_project(linear.weight, kind, alpha)
+    # `_qat_cache` is attached by `DormouseModel.__init__` (`attach_qat_caches`);
+    # a bare `nn.Linear` outside a model has none and takes the per-forward path.
+    w = dense_qat_project(
+        linear.weight, kind, alpha, cache=getattr(linear, "_qat_cache", None)
+    )
     return F.linear(x, w, linear.bias)
-
-
-def init_u(in_features: int, rank: int, device: torch.device | str = "cpu") -> torch.Tensor:
-    """The `U [in, rank]` init, `N(0, 1/sqrt(in))` — the distribution the
-    comment below names ("the composed map has unit-ish output scale at any
-    width", which matters because ReZero's `residual_scale` starts at 1.0).
-
-    ONE copy of the formula: the expert bank's latents (`DualLatentGLU`) and,
-    under `share_u`, the single basis `SparseMoE` owns draw the same factor.
-    Two transcriptions is how a shared basis and a per-expert one start the A/B
-    from different scales and the comparison charges that to the mechanism.
-    """
-    return torch.randn(in_features, rank, device=device) / math.sqrt(in_features)
 
 
 class TSCTLinear(nn.Module):
@@ -528,7 +559,9 @@ class TSCTLinear(nn.Module):
         # unit-ish output scale at any width, which matters because ReZero's
         # residual_scale is initialised to 1.0 (not 0 — at 0 the block body
         # gets no gradient at all, the 2026-09-27 burn bug).
-        self.u = nn.Parameter(init_u(in_features, rank, device))
+        self.u = nn.Parameter(
+            torch.randn(in_features, rank, device=device) / math.sqrt(in_features)
+        )
         self.s = nn.Parameter(torch.ones(rank, device=device))
         self.v = nn.Parameter(torch.randn(rank, out_features, device=device) / math.sqrt(rank))
         self.bias = nn.Parameter(torch.zeros(out_features, device=device)) if bias else None
@@ -537,6 +570,10 @@ class TSCTLinear(nn.Module):
         #: fp32. `s` is never quantized — it IS the scale.
         self.factor_qat = factor_qat
         self.factor_qat_alpha = factor_qat_alpha
+        #: The once-per-step projection cache (`qat_cache.QuantCache`): `u` and
+        #: `v` each get one detached `q` per trained step, instead of every
+        #: forward re-running the quantizer (the measured 2.4x cost).
+        self._qat_cache = QuantCache() if factor_qat != "none" else None
         #: The a4.8 ACTIVATION switch (`act_quant.fake_quant_act`): the `x` that
         #: feeds the factor matmuls is fake-quantized with an STE.
         #: `attn_path` marks a projection that sits INSIDE the attention arm, and
@@ -568,8 +605,9 @@ class TSCTLinear(nn.Module):
         if self.factor_qat == "none":
             return self.u, self.v
         f = factor_qat_project
-        return f(self.u, self.factor_qat, self.factor_qat_alpha), f(
-            self.v, self.factor_qat, self.factor_qat_alpha
+        cache = self._qat_cache
+        return f(self.u, self.factor_qat, self.factor_qat_alpha, cache=cache), f(
+            self.v, self.factor_qat, self.factor_qat_alpha, cache=cache
         )
 
     def effective_weight(self) -> torch.Tensor:
@@ -810,13 +848,18 @@ class DenseLinear(nn.Module):
         #: master untouched, every number on record.
         self.dense_qat = dense_qat
         self.dense_qat_alpha = dense_qat_alpha
+        #: The once-per-step projection cache — the same object `TSCTLinear` and
+        #: `qat_linear` read (`qat_cache.QuantCache`).
+        self._qat_cache = QuantCache() if dense_qat != "none" else None
         self.weight = nn.Parameter(
             torch.randn(out_features, in_features, device=device) / math.sqrt(in_features)
         )
         self.bias = nn.Parameter(torch.zeros(out_features, device=device)) if bias else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        w = dense_qat_project(self.weight, self.dense_qat, self.dense_qat_alpha)
+        w = dense_qat_project(
+            self.weight, self.dense_qat, self.dense_qat_alpha, cache=self._qat_cache
+        )
         if self.compute_dtype != torch.float32:
             x = x.to(self.compute_dtype)
             w = w.to(self.compute_dtype)

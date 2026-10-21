@@ -74,6 +74,7 @@ from ..instrument import Counters, loud
 from .engram import Engram, memory_floor_mix
 from .experts import SparseMoE
 from .kda import KDAAttention
+from .qat_cache import QuantCache
 from .sparse import BlockSparseAttention
 from .tsct import dense_qat_project, make_projection, mm_mixed
 
@@ -134,6 +135,10 @@ class LoopBlock(nn.Module):
         #: is the SAME alpha the factor ramp sets (`set_factor_qat_alpha`).
         self.dense_qat = cfg.dense_qat
         self.dense_qat_alpha = cfg.factor_qat_alpha
+        #: The once-per-step projection cache for the two DENSE weights this
+        #: block projects directly (controller, `mem_dense`); the linears go
+        #: through `qat_linear`'s own attached cache.
+        self._qat_cache = QuantCache() if cfg.dense_qat != "none" else None
         self.norm = nn.RMSNorm(d, eps=cfg.norm_eps, device=device)
         # The three gates only. burn's controller ALSO emits the expert-blend
         # logits and its MoE "adds NO parameters"; the port's MoE owns a
@@ -290,7 +295,12 @@ class LoopBlock(nn.Module):
             # parameter object), so the default path is byte-for-byte today's.
             raw = mm_mixed(
                 ctrl,
-                dense_qat_project(self.controller.weight, self.dense_qat, self.dense_qat_alpha),
+                dense_qat_project(
+                    self.controller.weight,
+                    self.dense_qat,
+                    self.dense_qat_alpha,
+                    cache=self._qat_cache,
+                ),
                 self.compute_dtype,
                 counters,
             )
@@ -338,7 +348,10 @@ class LoopBlock(nn.Module):
                         mm_mixed(
                             normed.reshape(b * t, d),
                             dense_qat_project(
-                                self.mem_dense.weight, self.dense_qat, self.dense_qat_alpha
+                                self.mem_dense.weight,
+                                self.dense_qat,
+                                self.dense_qat_alpha,
+                                cache=self._qat_cache,
                             ),
                             self.compute_dtype,
                             counters,
