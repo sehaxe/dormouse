@@ -367,14 +367,26 @@ class ExportReport:
         return "\n".join(lines)
 
 
-def _clean_sd(model: nn.Module) -> dict[str, torch.Tensor]:
+def _is_engram_key(key: str) -> bool:
+    """A key of the Engram module (`loop.engram.*`): the table and its projections."""
+    return ".engram." in key
+
+
+def _clean_sd(model: nn.Module, *, no_engram: bool = False) -> dict[str, torch.Tensor]:
     """`state_dict()` with the `torch.compile` wrapper prefix stripped.
 
     The same normalization `save_ckpt` does: the `_orig_mod.` prefix is a
     wrapper artifact, never part of the file format, and a prefixed export
-    would not load into the unwrapped model `load_export` builds.
+    would not load into the unwrapped model `load_export` builds. `no_engram`
+    drops the whole memory arm, so the file describes a model whose config says
+    `use_engram=false` — the ablation the demo page can load, not a second
+    container format.
     """
-    return {k.removeprefix("_orig_mod."): v for k, v in model.state_dict().items()}
+    return {
+        k.removeprefix("_orig_mod."): v
+        for k, v in model.state_dict().items()
+        if not (no_engram and _is_engram_key(k))
+    }
 
 
 def export_plan(
@@ -383,6 +395,7 @@ def export_plan(
     *,
     dense_dtype: str = "fp16",
     engram_dtype: str = "fp32",
+    no_engram: bool = False,
 ) -> ExportReport:
     """The size arithmetic of an export, WITHOUT writing anything (meta-safe).
 
@@ -401,7 +414,7 @@ def export_plan(
     fp16_groups = dict.fromkeys(_GROUPS, 0)
     fp32_groups = dict.fromkeys(_GROUPS, 0)
     fp16 = fp32 = 0
-    for key, t in _clean_sd(model).items():
+    for key, t in _clean_sd(model, no_engram=no_engram).items():
         kind = _kind(key)
         g = _group(kind, t)
         groups[g] += _packed_bytes(key, t, mode, dense_dtype, engram_dtype)
@@ -529,6 +542,7 @@ def write_export(
     commit: str | None = None,
     dense_dtype: str = "fp16",
     engram_dtype: str = "fp32",
+    no_engram: bool = False,
 ) -> ExportReport:
     """Pack `model` into `path` (one `.dormouse` file) and return its size report.
 
@@ -538,6 +552,13 @@ def write_export(
     [`_host_tables`]) — a LOUD refusal if it is missing while the config says
     `use_engram`. The write is atomic (`<path>.tmp` then replace), like
     `save_ckpt`.
+
+    `no_engram` is the demo's optional-memory arm: the Engram module's records
+    are omitted and the header's `model.use_engram` is set false, so every
+    reader (Python and the browser engine) skips the memory branch exactly as
+    it does for a model trained without one. The parity gate keeps Engram on;
+    this is the smaller artifact for the live page. The remaining fields are
+    untouched — this is a config change, not a second format.
     """
     cfg = getattr(model, "cfg", None)
     if cfg is None:
@@ -546,9 +567,13 @@ def write_export(
             "the writer needs a DormouseModel (a bare nn.Module or a state dict has "
             "no architecture to describe). Escape: pass the model the trainer built."
         )
-    report = export_plan(model, mode, dense_dtype=dense_dtype, engram_dtype=engram_dtype)
-    sd = _clean_sd(model)
-    host = _host_tables(model)
+    if no_engram:
+        cfg = dataclasses.replace(cfg, use_engram=False)
+    report = export_plan(
+        model, mode, dense_dtype=dense_dtype, engram_dtype=engram_dtype, no_engram=no_engram
+    )
+    sd = _clean_sd(model, no_engram=no_engram)
+    host = {} if no_engram else _host_tables(model)
     if host:
         for key, rows in host.items():
             if key in sd:

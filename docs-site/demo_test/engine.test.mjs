@@ -29,6 +29,7 @@ import {
 	initStates,
 	kdaStep,
 	loadWeights,
+	matvec,
 	parseHeader,
 	readTensors,
 	rmsNorm,
@@ -71,6 +72,19 @@ test('unpackTernary pins the 2-bit codebook', () => {
 	assert.deepEqual([...unpackTernary(Uint8Array.from([9]), 0.625, 4)], [0.625, -0.625, 0, 0]);
 	// a code 3 is not a ternary level: refuse rather than decode it to 0
 	assert.throws(() => unpackTernary(Uint8Array.from([0b11]), 1, 4), /not a ternary level/);
+});
+
+test('matvec decodes a packed factor in place (no float copy)', () => {
+	// Artifact layout [in=2, out=4], codes low-first:
+	//   row 0: [+, −, 0, +] → 1|2<<2|0<<4|1<<6 = 73
+	//   row 1: [0, +, +, 0] → 0|1<<2|1<<4|0<<6 = 20
+	const codes = Uint8Array.from([73, 20]);
+	const W = { codes, scale: 0.5, rows: 4, cols: 2 };
+	assert.equal(W.data, undefined, 'the packed view has no float array');
+	assert.equal(W.codes, codes, 'the codes are held as given, not copied');
+	// out[o] = Σ_i x[i]·code(i,o)·scale
+	assert.deepEqual([...matvec(Float32Array.from([2, 4]), W)], [1, 1, 2, 1]);
+	assert.throws(() => matvec(Float32Array.from([1, 1]), { ...W, codes: Uint8Array.from([3, 0]) }), /not a ternary level/);
 });
 
 test('engineRefusal names the arm, and both MoE arms pass', () => {
@@ -193,6 +207,40 @@ test('the engine reproduces the Python decode logits', { skip }, () => {
 			`argmax identical at all ${ref.prompt.length} prefixes, tolerance ${TOL}`,
 	);
 	assert.ok(worst < TOL, `max |Δlogit| ${worst} is over the stated tolerance ${TOL}`);
+});
+
+test('the engine holds factors packed and the table at its rung', { skip }, () => {
+	// The demo's memory contract, asserted on the artifact the gate loads:
+	// ternary records stay 2-bit code VIEWS into the file (never a Float32Array),
+	// and an fp16 Engram table stays a Uint16Array view (never widened).
+	const buf = new Uint8Array(readFileSync(artifact));
+	const { header } = parseHeader(buf);
+	const tensors = readTensors(buf, header);
+	const W = loadWeights(header, tensors);
+	assert.equal(W.stats.factorBytes, W.stats.factorPackedBytes + 8 * W.stats.ternaryFactors);
+	assert.ok(W.stats.factorBytes <= W.stats.factorPackedBytes + 8 * W.stats.ternaryFactors, 'factors are packed');
+	assert.equal(
+		W.stats.factorFloatBytes,
+		16 * W.stats.factorPackedBytes,
+		'a widened copy is exactly 16x the packed codes (4 B vs 2 bits per element)',
+	);
+	for (const rec of header.tensors.filter((r) => r.dtype === 'ternary')) {
+		const t = tensors[rec.name];
+		assert.equal(t.data, undefined, `${rec.name}: no float copy`);
+		assert.ok(t.codes instanceof Uint8Array, `${rec.name}: codes are a Uint8Array`);
+		assert.equal(t.codes.byteLength, rec.length, `${rec.name}: exactly the packed bytes`);
+		assert.equal(t.codes.buffer, buf.buffer, `${rec.name}: a view into the file, not a copy`);
+	}
+	const rec = header.tensors.find((r) => r.name === 'loop.engram.tables');
+	if (rec && rec.dtype === 'fp16') {
+		const t = tensors['loop.engram.tables'];
+		assert.ok(t.data instanceof Uint16Array, 'an fp16 table is kept as Uint16Array');
+		assert.equal(t.data.byteLength, rec.length, 'the table is exactly its stored rung');
+		assert.equal(W.engramFp16, true);
+	}
+	if (rec && rec.dtype === 'fp32') {
+		assert.equal(tensors['loop.engram.tables'].data.byteLength, rec.length);
+	}
 });
 
 test('the engine loads the artifact it was given (architecture + key set)', { skip }, () => {

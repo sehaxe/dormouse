@@ -1,8 +1,11 @@
 ---
 // The demo page: a byte-level LM running in the reader's browser. The page
-// SHIPS the `small` polygon (15.5 MiB); the same engine also runs a
-// `medium`-shaped artifact with the dropless top-k MoE (138 MB, over the page's
-// download budget, so it is generated and measured rather than committed).
+// SHIPS the `small` polygon (15.5 MiB) and, behind `?engram=0`, the
+// medium-shaped export with the Engram table removed (35.5 MiB): the memory
+// arm is most of the download, so a phone loads the smaller file and the page
+// says "engram off" rather than pretending it is the full model. The full
+// 138 MB medium artifact is generated and measured, not committed (GitHub's
+// per-file limit is 100 MB).
 //
 // Hand-written, like the landing page, and in the same design language: the
 // tokens come from `src/styles/landing.css` (imported, not copied) — cream
@@ -87,7 +90,7 @@ const repo = 'https://github.com/sehaxe/dormouse';
 
 			<section class="wrap section">
 				<h2>{c.runHeading}</h2>
-				<div id="demo-root" data-engine={at('/demo/engine.js')} data-model={at('/demo/model.dormouse')}>
+				<div id="demo-root" data-engine={at('/demo/engine.js')} data-model={at('/demo/model.dormouse')} data-model-off={at('/demo/model-engram-off.dormouse')}>
 					<div class="terminal">
 						<div class="term-bar">
 							<span>{c.termBarLeft}</span>
@@ -113,10 +116,15 @@ const repo = 'https://github.com/sehaxe/dormouse';
 								<span>{c.tempLabel}</span>
 								<input id="temp" type="number" min="0" max="2" step="0.05" value="0.8" />
 							</label>
+							<label class="field knob check">
+								<span>{c.engramOffLabel}</span>
+								<input id="engram" type="checkbox" />
+							</label>
 							<button id="go" type="button" disabled>{c.generate}</button>
 							<button id="stop" type="button" disabled>{c.stop}</button>
 						</div>
 						<p class="section-note" id="speed" set:html={c.greedyNote} />
+						<p class="section-note" id="engram-switch" set:html={c.engramSwitch} />
 					</div>
 
 					<div class="out">
@@ -157,7 +165,11 @@ const repo = 'https://github.com/sehaxe/dormouse';
 			(() => {
 				const root = document.getElementById('demo-root');
 				const engineUrl = root.dataset.engine;
-				const modelUrl = root.dataset.model;
+				// `?engram=0` selects the memory-off artifact. The switch is a
+				// property of the FILE, not a runtime flag: the table is not in that
+				// artifact at all, so nothing is downloaded and then skipped.
+				const engramOff = new URLSearchParams(location.search).get('engram') === '0';
+				const modelUrl = engramOff ? root.dataset.modelOff : root.dataset.model;
 				const $ = (id) => document.getElementById(id);
 				const status = $('status');
 				const out = $('out');
@@ -166,6 +178,17 @@ const repo = 'https://github.com/sehaxe/dormouse';
 				const progressFill = $('progress-fill');
 				const go = $('go');
 				const stop = $('stop');
+				const engramBox = $('engram');
+				// The query IS the switch's storage: a reload is what changes the
+				// fetched file, so the checkbox navigates rather than toggling a
+				// runtime flag (the table is not downloaded in the first place).
+				engramBox.checked = engramOff;
+				engramBox.addEventListener('change', () => {
+					const url = new URL(location.href);
+					if (engramBox.checked) url.searchParams.set('engram', '0');
+					else url.searchParams.delete('engram');
+					location.assign(url.toString());
+				});
 				let engine = null;
 				let running = false;
 				let stopped = false;
@@ -220,16 +243,32 @@ const repo = 'https://github.com/sehaxe/dormouse';
 							: `${W.E} experts (dense blend)`;
 						const memory = W.useEngram
 							? `Engram ${W.orders.join('/')} × ${W.slots} rows`
-							: 'no Engram';
+							: 'engram off (memory branch is an exact zero)';
 						say(
 							`ready — ${W.cfg.d_model}-wide, ${W.H} heads, ${W.T} iterations, ` +
 								`${experts} + 1 shared (rank ${W.cfg.shared_rank}), ${memory}` +
 								`${st.lfbBias ? ' · LFB bias ' + st.lfbBias : ''}\n` +
-								`artifact ${fmtBytes(st.bytes)} · dense ${st.denseDtype} · table ${st.engramDtype} · ` +
-								`${st.ternaryFactors} ternary factor matrices${st.commit ? ' · commit ' + st.commit : ''}\n` +
+								`artifact ${fmtBytes(st.bytes)} · tensors ${fmtBytes(st.tensorBytes)} · ` +
+								`factors ${fmtBytes(st.factorBytes)} packed (a float copy would be ${fmtBytes(st.factorFloatBytes)}) · ` +
+								`table ${st.useEngram ? fmtBytes(st.engramBytes) + ' ' + st.engramDtype : 'off'}\n` +
+								`dense ${st.denseDtype} · ${st.ternaryFactors} ternary factor matrices` +
+								`${st.commit ? ' · commit ' + st.commit : ''}\n` +
 								`${st.preset ? st.preset + ' preset · ' : ''}fp32 engine · ${(W.H * W.hd * W.hd * 4) / 1024} KB of KDA state per iteration slot`,
 						);
-						$('status-right').textContent = `${fmtBytes(st.bytes)} · fp32`;
+						$('status-right').textContent = `${fmtBytes(st.bytes)} · ${W.useEngram ? 'engram on' : 'engram off'} · fp32`;
+						if (!W.useEngram) {
+							// COUNTED, not silent: the arm is off, so the page is not
+							// showing the full model and must not imply that it is.
+							say(
+								status.textContent +
+									'\nnote: engram off — this artifact has no Engram table and its config says ' +
+									'use_engram=false. The memory branch is skipped the way the reference skips it ' +
+									'when the module is absent; this is the ablation, not the full model. ' +
+									'The committed memory-off file is a seeded medium-shaped export (no trained ' +
+									'medium checkpoint exists on this box), so it shows the routed geometry, ' +
+									'not language quality.',
+							);
+						}
 						go.disabled = false;
 						if (st.engramDtype === 'fp32' && st.bytes > 20 * 1024 * 1024) {
 							// COUNTED, not silent: the table's rung is the page's largest knob.
@@ -242,8 +281,8 @@ const repo = 'https://github.com/sehaxe/dormouse';
 						if (st.topk > 0 && st.bytes > 64 * 1024 * 1024) {
 							say(
 								status.textContent +
-									`\nnote: a routed artifact is ${fmtBytes(st.bytes)} — the page ships the ` +
-									'15.5 MiB `small` polygon so the download stays small; this engine runs both.',
+									`\nnote: a full routed artifact is ${fmtBytes(st.bytes)} — the page ships the ` +
+									'15.5 MiB `small` polygon and the 35.5 MiB engram-off medium export; this engine runs all three.',
 							);
 						}
 					})
@@ -251,10 +290,14 @@ const repo = 'https://github.com/sehaxe/dormouse';
 						progress.hidden = true;
 						say(
 							`the model is not there: ${err.message}\n\n` +
-								'This page fetches a generated artifact and it is not committed ' +
-								'(16.3 MB, over the 8 MB rule). Build one from a trained checkpoint:\n\n' +
+								'This page fetches generated artifacts. Build the small one from a trained checkpoint:\n\n' +
 								'  uv run dormouse export small --ckpt-name <name> --out-dir checkpoints \\\n' +
-								'    --engram-dtype fp16 --out docs-site/public/demo/model.dormouse --verify\n\n' +
+								'    --engram-dtype fp16 --out docs-site/public/demo/model.dormouse\n\n' +
+								'and the memory-off one with `--no-engram` (it is 35.5 MiB instead of the full ' +
+								'medium artifact\'s 138.1 MB):\n\n' +
+								'  uv run dormouse export medium --ckpt-name <name> --out-dir checkpoints \\\n' +
+								'    --set use_msa=false,moe_capacity=0 --engram-dtype fp16 --no-engram \\\n' +
+								'    --out docs-site/public/demo/model-engram-off.dormouse\n\n' +
 								'See docs-site/public/demo/README.md.',
 						);
 						out.textContent = '';
@@ -387,6 +430,17 @@ const repo = 'https://github.com/sehaxe/dormouse';
 	.knob {
 		margin: 0;
 		width: 120px;
+	}
+
+	.knob.check {
+		width: 168px;
+	}
+
+	.knob.check input {
+		width: 18px;
+		height: 18px;
+		margin: 4px 0 0;
+		accent-color: var(--ink);
 	}
 
 	button {

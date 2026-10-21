@@ -192,6 +192,39 @@ def test_engram_dtype_is_a_rung_and_it_moves_the_bytes(tmp_path: Path) -> None:
         export_plan(model, "ternary", engram_dtype="bf16")
 
 
+def test_no_engram_export_is_the_memory_off_arm(tmp_path: Path) -> None:
+    """`no_engram` drops the module's records and flips the header's config.
+
+    Not a second format: the file is a normal artifact whose `model.use_engram`
+    is false, so every reader skips the memory branch exactly as it does for a
+    model trained without one. The page's `?engram=0` loads this file.
+    """
+    torch.manual_seed(0)
+    model = tiny_model(moe_topk=0)  # a geometry the engine's dense arm runs
+    path = tmp_path / "off.dormouse"
+    rep = write_export(model, path, engram_dtype="fp16", no_engram=True)
+    f = read_export(path)
+    assert f.cfg.use_engram is False
+    assert rep.groups["engram"] == 0
+    assert rep.counts["engram"] == 0
+    assert not [n for n in f.names() if ".engram." in n], "the whole Engram module is gone"
+    assert f.engine_refusal() is None, "the engine runs the memory-off arm"
+    loaded = load_export(f)
+    assert loaded.loop.engram is None
+    assert not [k for k in loaded.state_dict() if ".engram." in k]
+    # same geometry, smaller payload: every `loop.engram.*` record is the delta
+    full = tmp_path / "on.dormouse"
+    rep_on = write_export(model, full, engram_dtype="fp16")
+    dropped = sum(
+        rec["length"] for rec in read_export(full).records if rec["name"].startswith("loop.engram.")
+    )
+    assert dropped > rep_on.groups["engram"], "the table alone is not the whole module"
+    assert rep_on.total_bytes - rep.total_bytes == dropped
+    assert rep.file_bytes < rep_on.file_bytes
+    with pytest.raises(LoudError, match="no tensor named"):
+        f.tensor("loop.engram.tables")
+
+
 def test_export_plan_matches_the_medium_preset_arithmetic() -> None:
     """The E=256 arithmetic on `meta` — no storage, the report function alone."""
     rep = export_plan(

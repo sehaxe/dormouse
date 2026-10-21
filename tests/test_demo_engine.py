@@ -15,13 +15,17 @@ claim is only checkable against the Python reference. So this file:
 5. fails if Node exits non-zero — the JS side asserts max |Δlogit| < 1e-4 and
    an identical argmax at every prefix.
 
-It runs THREE cases: the `tiny` fixture (fast, d=64, dense blend), the routed
-`tiny` fixture (d=64, 4 experts, top-2 dropless, no Engram) and the real
+It runs FIVE cases: the `tiny` fixture (fast, d=64, dense blend), the real
 `small` polygon (d=768, 12 heads, 4 iterations, 3 experts + the rank-192 shared
-one, 32 768-row Engram tables) — the shape the demo page runs. The `small` case
-is the one that makes "the browser runs the small preset" a measurement; the
-routed case is the one that makes "the browser runs a medium-shaped top-k
-export" a measurement.
+one, 32 768-row Engram tables) — the shape the demo page runs, the full
+`medium`-shaped export (d=1024, 256 experts, top-2 dropless, 50.3M-row Engram
+table at fp16) — the 138 MB geometry the size table is about, the routed `tiny`
+fixture (d=64, 4 experts, top-2 dropless, no Engram), and that same routed
+fixture exported through the page's memory-off arm
+(`write_export(no_engram=True)`). The `small` case is the one that makes "the
+browser runs the small preset" a measurement; the medium case is the one that
+makes "the browser runs a medium-shaped top-k export" a measurement at every
+packed factor; the no-Engram case is what `?engram=0` loads.
 
 The engine implements both MoE arms: the dense blend (`moe_topk = 0`, the
 `small` polygon) and the DROPLESS top-k dispatch (`moe_topk = k`,
@@ -124,10 +128,12 @@ def _parity_line(out: str) -> str:
     raise AssertionError(f"no parity line in the engine test's output:\n{out[-2000:]}")
 
 
-def _parity_case(model: DormouseModel, tmp_path: Path, label: str) -> str:
+def _parity_case(
+    model: DormouseModel, tmp_path: Path, label: str, *, no_engram: bool = False
+) -> str:
     """Export → Python reference → `node --test`, one case end to end."""
     artifact = tmp_path / f"{label}.dormouse"
-    write_export(model, artifact, preset=label, seed=1, engram_dtype="fp16")
+    write_export(model, artifact, preset=label, seed=1, engram_dtype="fp16", no_engram=no_engram)
     f = read_export(artifact)
     # the artifact must be one the PAGE can load, not just one this test can
     # read: the refusal is the writer's, and the loader's is the same table.
@@ -166,6 +172,23 @@ def test_engine_matches_python_on_the_small_polygon(tmp_path: Path) -> None:
     assert "max |Δlogit|" in line
 
 
+def test_engine_matches_python_on_the_medium_shaped_export(tmp_path: Path) -> None:
+    """The 138 MB geometry the page's size table is about: d1024, E256, top-2.
+
+    Random init (the gate is arithmetic, not quality) and the engine's own arms
+    (msa off, dropless); the export is 138,058,200 B and the two sides read the
+    same bytes. This is the case that exercises every packed ternary factor and
+    the fp16 Engram table at the scale the demo quotes.
+    """
+    torch.manual_seed(0)
+    cfg = dataclasses.replace(load_preset("medium"), bf16=False, use_msa=False, moe_capacity=0.0)
+    model = DormouseModel(cfg)
+    out = _parity_case(model, tmp_path, "medium-shaped")
+    line = _parity_line(out)
+    print(line)
+    assert "max |Δlogit|" in line
+
+
 def test_engine_matches_python_on_the_routed_dropless_fixture(tmp_path: Path) -> None:
     """The top-k arm: 4 experts, top-2, `moe_capacity=0`, no Engram.
 
@@ -176,6 +199,23 @@ def test_engine_matches_python_on_the_routed_dropless_fixture(tmp_path: Path) ->
     torch.manual_seed(0)
     model = tiny_model(use_engram=False, moe_capacity=0.0)
     out = _parity_case(model, tmp_path, "routed-tiny")
+    line = _parity_line(out)
+    print(line)
+    assert "max |Δlogit|" in line
+
+
+def test_engine_matches_python_with_the_engram_off_export(tmp_path: Path) -> None:
+    """The page's `?engram=0` arm: the exporter drops the table and the cfg says so.
+
+    The model HAS an Engram; `write_export(no_engram=True)` removes its records
+    and writes `use_engram=false`. Both sides then run the reference's
+    "engram is None" branch (the memory arm is an exact zero), so the parity
+    gate covers the same engine path the smaller page artifact loads.
+    """
+    torch.manual_seed(0)
+    model = tiny_model(moe_topk=2, moe_capacity=0.0)
+    assert model.loop.engram is not None, "this case is only meaningful with a table to drop"
+    out = _parity_case(model, tmp_path, "routed-tiny-engram-off", no_engram=True)
     line = _parity_line(out)
     print(line)
     assert "max |Δlogit|" in line

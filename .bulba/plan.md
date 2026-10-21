@@ -156,6 +156,16 @@ testable and A/B-able (ADR-0017).
       reasoning that rests on it is now confirmed by an independent instrument
       (13.3 % mean GPU utilisation, 79 % of samples ≤5 %).
 
+## Demo lane
+
+- [x] Demo engine: keep ternary factors packed and the Engram table at fp16.
+      `engine.js` decodes 2-bit codes inside `matvec` (no float copy) and keeps
+      an fp16 table as a `Uint16Array` view, converting only the 32-wide row a
+      step reads. `dormouse export --no-engram` writes the page's `?engram=0`
+      artifact (same container, `use_engram=false`). Medium tensor heap
+      553,748,996 B → 155,292,700 B; artifacts 138,058,200 B (full Engram) /
+      37,261,384 B (Engram off). **Landed 2026-10-22.**
+
 ## Critical Files
 
 - `crates/dormouse-core/src/loop_block.rs` (617, in flight)

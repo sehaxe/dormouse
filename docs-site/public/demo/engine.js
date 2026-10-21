@@ -25,11 +25,13 @@
  *
  * NUMERICS. fp32 throughout, in `Float32Array`s — the reference path. The
  * artifact stores dense tensors as fp16 and TSCT factors as 2-bit ternary
- * codes + an exact scale; both are unpacked to fp32 AT LOAD, so there is no
- * ternary fast path here and nothing is approximated at run time (a fast path
- * would need an int8/LUT kernel, which this port does not have — the same
- * reason the Python reader dequantizes). `bf16` in the header is a compute
- * setting of the TRAINED run; the engine is its own fp32 arm and says so.
+ * codes + an exact scale. The factors STAY PACKED: each matvec decodes a code
+ * to `{0, ±scale}` as it reads it, so no float copy of the factor is ever held
+ * (79.4M factors are 19.9 MB of codes at `medium`, not 318 MB of floats). The
+ * Engram table likewise stays at its stored rung: an fp16 table is kept as a
+ * `Uint16Array` view into the file and only the 32-wide row a step reads is
+ * converted. `bf16` in the header is a compute setting of the TRAINED run; the
+ * engine is its own fp32 arm and says so.
  *
  * WHAT IT DOES NOT DO, said here rather than on the page's fine print:
  *   - MSA block-sparse attention, AttnRes, LOOM, ByteFlow, DSpark, a
@@ -187,9 +189,45 @@ function halfToF32(h) {
 	return sign * (1 + frac / 1024) * 2 ** (exp - 15);
 }
 
+/** The artifact writes little-endian; a big-endian host swaps its 16-bit words. */
+const LITTLE_ENDIAN = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
+
 /**
- * The artifact's tensors as fp32 arrays, in torch's `[out, in]` row-major order
- * (the record's own shape). Ternary records unpack to their codec's values.
+ * A record's fp16 bytes as a `Uint16Array` VIEW (no widening, no copy).
+ *
+ * The Engram table is the one tensor whose full width is never needed: the
+ * step reads 32 adjacent values per order, so keeping the file's words and
+ * converting only those is 100.7 MB instead of 201 MB at `medium`. A record
+ * whose bytes are not 2-aligned (the writer aligns every blob to 8, so this is
+ * a corrupt file, not a layout this engine writes) falls back to a copy so a
+ * hand-made container still reads.
+ */
+function fp16Words(src) {
+	if (src.byteLength % 2 !== 0) throw new Error(`an fp16 record of ${src.byteLength} B is not a whole number of values`);
+	if ((src.byteOffset & 1) === 0) return new Uint16Array(src.buffer, src.byteOffset, src.byteLength / 2);
+	const out = new Uint16Array(src.byteLength / 2);
+	const view = new DataView(src.buffer, src.byteOffset, src.byteLength);
+	for (let i = 0; i < out.length; i++) out[i] = view.getUint16(i * 2, true);
+	return out;
+}
+
+/** One stored fp16 word → fp32, with the host's endianness handled. */
+function storedHalf(words, i) {
+	const h = words[i];
+	return halfToF32(LITTLE_ENDIAN ? h : ((h >> 8) | ((h & 0xff) << 8)));
+}
+
+/**
+ * The artifact's tensors as the engine holds them — NO widening of factors or
+ * the Engram table:
+ *
+ *   ternary  → `{codes, scale, shape}`: 2-bit codes, decoded inside the matvec
+ *   fp16     → `{data}` fp32, except `loop.engram.tables`, kept as `Uint16Array`
+ *   fp32/u8/i32/i64 → `{data}` at fp32/widened (small tensors, read densely)
+ *
+ * This is the memory contract the demo's size table is about: a ternary record
+ * costs its packed bytes, never 4 B per element, and the table costs its
+ * stored rung, never 2 B more per element. `loadWeights` asserts it.
  */
 export function readTensors(buf, header) {
 	const out = {};
@@ -199,9 +237,13 @@ export function readTensors(buf, header) {
 		if (rec.dtype === 'ternary') {
 			const codes = recordBytes(buf, rec, 'u8');
 			if (codes.length * 4 !== count) throw new Error(`tensor ${rec.name}: codes do not cover its shape`);
-			out[rec.name] = { data: unpackTernary(codes, rec.scale, count), shape: rec.shape, dtype: 'ternary' };
+			// The codes stay as a view into the file. `unpackTernary` is the
+			// reference decoder (and the pure test's); the hot path does not use it.
+			out[rec.name] = { codes, scale: rec.scale, shape: rec.shape, dtype: 'ternary' };
 		} else if (rec.dtype === 'fp16') {
-			out[rec.name] = { data: fp16ToF32(recordBytes(buf, rec)), shape: rec.shape, dtype: 'fp16' };
+			const raw = recordBytes(buf, rec);
+			const data = rec.name.endsWith('engram.tables') ? fp16Words(raw) : fp16ToF32(raw);
+			out[rec.name] = { data, shape: rec.shape, dtype: 'fp16' };
 		} else if (rec.dtype === 'fp32') {
 			const b = recordBytes(buf, rec);
 			out[rec.name] = { data: new Float32Array(b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength)), shape: rec.shape, dtype: 'fp32' };
@@ -230,9 +272,37 @@ export function rmsNorm(x, gain, eps) {
 	return out;
 }
 
-/** `x @ Wᵀ` for a `[out, in]` row-major W — the `nn.Linear` every arm uses. */
+/**
+ * `x @ Wᵀ` for a `[out, in]` row-major W — the `nn.Linear` every arm uses.
+ *
+ * A ternary factor is decoded HERE, one 2-bit code at a time: the artifact
+ * stores it in torch's `[in, out]` order and the engine's view names that
+ * `{rows: out, cols: in}`, so element `(i, o)` is code `i*rows + o`. No float
+ * copy of the factor exists at any point; `W.codes` is a view into the file.
+ */
 export function matvec(x, W, out = new Float32Array(W.rows), bias = null) {
-	const { w, rows, cols } = W;
+	const { rows, cols } = W;
+	if (W.codes !== undefined) {
+		const { codes, scale } = W;
+		if (codes.length * 4 !== rows * cols) {
+			throw new Error(`a packed factor holds ${codes.length * 4} codes for a ${rows}x${cols} matvec — corrupt file?`);
+		}
+		// Output-stationary, like the dense arm: a local fp64 accumulator per
+		// output, rounded once — the accumulation order the widened path used,
+		// so a factor's logits are bit-for-bit the pre-packing engine's.
+		for (let o = 0; o < rows; o++) {
+			let acc = 0;
+			for (let i = 0; i < cols; i++) {
+				const idx = i * rows + o;
+				const code = (codes[idx >> 2] >> ((idx & 3) * 2)) & 3;
+				if (code === 3) throw new Error('a 2-bit code is 3, which is not a ternary level {0, +α, −α} — corrupt file?');
+				if (code !== 0) acc += (code === 1 ? scale : -scale) * x[i];
+			}
+			out[o] = bias ? acc + bias[o] : acc;
+		}
+		return out;
+	}
+	const { w } = W;
 	for (let o = 0; o < rows; o++) {
 		let acc = 0;
 		const base = o * cols;
@@ -429,10 +499,22 @@ export function loadWeights(header, tensors) {
 	const T = cfg.max_iter;
 	const E = cfg.n_experts;
 	const lin = (name, rows, cols) => ({ w: shape(name, [rows, cols]).data, rows, cols });
+	// A TSCT factor arrives in torch's `[in, out]` order. A dense one is
+	// transposed to the engine's `[out, in]` matvec; a ternary one keeps its
+	// packed codes and only names that same shape (the decoder reads
+	// `i*rows + o`), so the load allocates nothing for it.
+	const tr = (t) => {
+		if (t.dtype !== 'ternary') return transpose(t);
+		if (t.shape.length !== 2) throw new Error(`a ternary factor is 2-D, got ${t.shape.join('x')}`);
+		return { codes: t.codes, scale: t.scale, rows: t.shape[1], cols: t.shape[0], dtype: 'ternary' };
+	};
 	// `table_slots(rows)`: the n-gram table is rounded UP to a power of two by
 	// the model's own masking read, so the shape check needs the same rule.
 	let slots = 1;
 	while (slots < cfg.engram_rows) slots <<= 1;
+	const table = useEngram
+		? shape('loop.engram.tables', [cfg.engram_orders.length, slots, cfg.engram_dim])
+		: null;
 	const W = {
 		cfg,
 		header,
@@ -461,7 +543,8 @@ export function loadWeights(header, tensors) {
 		router: lin('loop.moe.router.weight', E, d),
 		down: lin('loop.moe.down.weight', d, cfg.d_ffn),
 		lfbBias: optional.has('loop.moe.lfb_bias') && have.has('loop.moe.lfb_bias') ? shape('loop.moe.lfb_bias', [E]).data : null,
-		engram: useEngram ? shape('loop.engram.tables', [cfg.engram_orders.length, slots, cfg.engram_dim]).data : null,
+		engram: table ? table.data : null,
+		engramFp16: !!(table && table.dtype === 'fp16'),
 		engramQuery: useEngram ? lin('loop.engram.query_proj.weight', cfg.engram_dim, d) : null,
 		engramKey: useEngram ? lin('loop.engram.key_proj.weight', cfg.engram_dim, cfg.engram_dim) : null,
 		engramValue: useEngram ? lin('loop.engram.value_proj.weight', d, cfg.engram_dim) : null,
@@ -471,31 +554,67 @@ export function loadWeights(header, tensors) {
 		residualScale: shape('loop.residual_scale', [1]).data[0],
 		experts: [],
 		shared: null,
-		// TSCT factors arrive as `u [in, r]` / `v [r, out]`; one transpose each
-		// at load turns them into the same `[out, in]` matvec as everything else.
-		outProjU: transpose(shape('loop.out_proj.u', [d, cfg.rank])),
+		// TSCT factors arrive as `u [in, r]` / `v [r, out]`; `tr` turns each into
+		// the same `[out, in]` matvec as everything else — without widening a
+		// ternary factor, which stays 2-bit codes.
+		outProjU: tr(shape('loop.out_proj.u', [d, cfg.rank])),
 		outProjS: shape('loop.out_proj.s', [cfg.rank]).data,
-		outProjV: transpose(shape('loop.out_proj.v', [cfg.rank, d])),
-		headU: transpose(shape('lm_head.u', [d, cfg.rank])),
+		outProjV: tr(shape('loop.out_proj.v', [cfg.rank, d])),
+		headU: tr(shape('lm_head.u', [d, cfg.rank])),
 		headS: shape('lm_head.s', [cfg.rank]).data,
-		headV: transpose(shape('lm_head.v', [cfg.rank, cfg.vocab])),
+		headV: tr(shape('lm_head.v', [cfg.rank, cfg.vocab])),
 	};
 	const glu = (prefix, rank) => ({
-		gateU: transpose(tensors[`${prefix}.gate_u`]),
+		gateU: tr(shape(`${prefix}.gate_u`, [d, rank])),
 		gateS: shape(`${prefix}.gate_s`, [rank]).data,
-		upU: transpose(tensors[`${prefix}.up_u`]),
+		upU: tr(shape(`${prefix}.up_u`, [d, rank])),
 		upS: shape(`${prefix}.up_s`, [rank]).data,
-		v: transpose(tensors[`${prefix}.v`]),
+		v: tr(shape(`${prefix}.v`, [rank, cfg.d_ffn])),
 	});
 	for (let i = 0; i < E; i++) {
 		W.experts.push({ ...glu(`loop.moe.experts.${i}`, cfg.rank), rank: cfg.rank });
 	}
 	W.shared = { ...glu('loop.moe.shared', cfg.shared_rank), rank: cfg.shared_rank };
+	// The memory contract, COUNTED at the boundary: every ternary record must
+	// still be its packed codes (a widened factor would have `.data`, not
+	// `.codes`), and the reported budget is what the engine actually holds —
+	// the gate `tests/test_demo_engine.py` + `engine.test.mjs` assert on it.
+	const factorRecs = header.tensors.filter((r) => r.dtype === 'ternary');
+	let factorPackedBytes = 0;
+	let factorElements = 0;
+	for (const rec of factorRecs) {
+		const t = tensors[rec.name];
+		const count = rec.shape.reduce((a, b) => a * b, 1);
+		if (!t || !(t.codes instanceof Uint8Array) || t.codes.byteLength !== rec.length) {
+			throw new Error(
+				`tensor ${rec.name}: the engine widened a ternary factor to ${t && t.codes ? t.codes.byteLength : 0} B ` +
+					`of codes for ${count} elements. The demo keeps 2-bit codes and decodes in matvec; ` +
+					'a float copy is 4 B/element and is the bug this check exists to catch.',
+			);
+		}
+		factorPackedBytes += rec.length;
+		factorElements += count;
+	}
+	const factorScalesBytes = 8 * factorRecs.length; // one exact fp64 number each
+	const engramRec = header.tensors.find((r) => r.name === 'loop.engram.tables');
+	let tensorBytes = factorPackedBytes + factorScalesBytes;
+	for (const t of Object.values(tensors)) {
+		if (t.dtype !== 'ternary') tensorBytes += t.data.byteLength;
+	}
 	// the artifact's own description, for the page's honest labels
 	W.stats = {
 		engramDtype: header.dtypes ? header.dtypes.engram : '?',
 		denseDtype: header.dtypes ? header.dtypes.dense : '?',
-		ternaryFactors: header.tensors.filter((r) => r.dtype === 'ternary').length,
+		ternaryFactors: factorRecs.length,
+		// The factor HEAP, not the file: packed codes + one scale number each.
+		factorBytes: factorPackedBytes + factorScalesBytes,
+		factorPackedBytes,
+		factorElements,
+		factorFloatBytes: factorElements * 4,
+		// Table bytes as stored; fp16 stays a Uint16Array view at `engramDtype`.
+		engramBytes: useEngram && engramRec ? engramRec.length : 0,
+		// Every tensor the engine holds, at the rung it holds it (views included).
+		tensorBytes,
 		preset: header.preset,
 		commit: header.commit,
 		created: header.created,
@@ -538,7 +657,13 @@ function engramRead(W, normed, window) {
 	const inv = 1 / Math.sqrt(dim);
 	for (let oi = 0; oi < W.orders.length; oi++) {
 		const base = (oi * W.slots + slots[oi]) * dim;
-		for (let i = 0; i < dim; i++) emb[i] = W.engram[base + i];
+		// The ONLY place the table is read: 32 values, at its stored rung.
+		// An fp16 table stays a Uint16Array view; no full-width float copy exists.
+		if (W.engramFp16) {
+			for (let i = 0; i < dim; i++) emb[i] = storedHalf(W.engram, base + i);
+		} else {
+			for (let i = 0; i < dim; i++) emb[i] = W.engram[base + i];
+		}
 		const key = matvec(emb, W.engramKey);
 		let s = 0;
 		for (let i = 0; i < dim; i++) s += key[i] * query[i];

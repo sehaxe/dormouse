@@ -925,6 +925,13 @@ def export_cmd(
     engram_dtype: Annotated[
         str, typer.Option("--engram-dtype", help="n-gram table: fp32 (default) | fp16")
     ] = "fp32",
+    no_engram: Annotated[
+        bool,
+        typer.Option(
+            "--no-engram",
+            help="omit the Engram table and set use_engram=false (the demo's small arm)",
+        ),
+    ] = False,
     verify: Annotated[
         bool,
         typer.Option("--verify", help="read the file back and compare a forward to the source"),
@@ -976,6 +983,7 @@ def export_cmd(
         commit=commit,
         dense_dtype=dense_dtype,
         engram_dtype=engram_dtype,
+        no_engram=no_engram,
     )
     console.print(report.table())
     why = engine_refusal(run.model)
