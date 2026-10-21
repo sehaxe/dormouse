@@ -402,6 +402,126 @@ def test_dispatch_counts_the_triton_fallback_on_cpu():
 
 
 # --------------------------------------------------------------------------
+# the fp32 tile — the ByteFlow arm must not fall back to the naive loop
+# --------------------------------------------------------------------------
+
+#: The ByteFlow channel's loop shape (`/tmp/opencode/profile_bf.py`, 2026-10-21):
+#: `medium`'s d=1024 / f=2730 and rank 64, with the b4 x T512 window compressed
+#: to K=128 patch positions (the loop's 512 rows, topk 2 -> 1024 routed rows).
+BYTEFLOW = dict(d_model=1024, d_ff=2730, rank=64)
+
+
+def test_fp32_tiles_halve_and_fit_under_the_shared_memory_ceiling():
+    """Gate (a): 4-byte elements halve the wide tiles and the estimate fits.
+
+    Shared memory is bytes, so `BLOCK_N`/`BLOCK_F` must halve at fp32 or the
+    pair kernel asks for `2 stages * 2 pairs * (64*64 + 64*128) * 4 B = 196608 B`
+    against the card's 101376 B — the measured refusal that sent the fp32
+    ByteFlow arm to `moe_kernel=naive`. The narrow tiles are unchanged.
+    """
+    if mk is None:
+        pytest.skip("no triton in this build")
+    t = mk.tiles_for(torch.float32, **BYTEFLOW)
+    assert t["BLOCK_N"] == mk.TILES["BLOCK_N"] // 2 == 64
+    assert t["BLOCK_F"] == mk.TILES["BLOCK_F"] // 2 == 64
+    for name in ("BLOCK_M", "BLOCK_K", "BLOCK_T"):
+        assert t[name] == mk.TILES[name], f"{name} must not move at fp32"
+    n = mk.smem_estimate(t, torch.float32, BYTEFLOW["rank"])
+    print(f"[fp32 tile] {t} est={n} B <= {mk.SMEM_CEILING_BYTES} B")
+    assert n == 65536, "the halved pair tile at one stage is 65536 B"
+    assert n <= mk.SMEM_CEILING_BYTES
+    assert mk.tile_reason(torch.float32, **BYTEFLOW) is None, "fp32 must not fall back"
+
+
+def test_bf16_tiles_and_their_estimate_do_not_move():
+    """Gate (d): the two-byte path keeps every number it shipped.
+
+    Same dict, same estimate, and no explicit `num_stages` at the launch (Triton's
+    own default is what the bf16 numbers on record were taken with).
+    """
+    if mk is None:
+        pytest.skip("no triton in this build")
+    for dtype in (torch.bfloat16, torch.float16):
+        assert mk.tiles_for(dtype, **BYTEFLOW) == mk.TILES
+        assert mk._launch_stages(dtype) == {}
+    n = mk.smem_estimate(mk.TILES, torch.bfloat16, BYTEFLOW["rank"])
+    print(f"[bf16 tile] {mk.TILES} est={n} B <= {mk.SMEM_CEILING_BYTES} B")
+    assert n == 98304, "the bf16 pair tile at two stages is 98304 B"
+    assert n <= mk.SMEM_CEILING_BYTES
+    assert mk._launch_stages(torch.float32) == {"num_stages": 1}
+
+
+def test_a_tile_that_cannot_fit_is_refused_before_launch_with_its_numbers():
+    """Gate (3): the refusal names the numbers, and it fires before any launch.
+
+    The 196608 B calibration point is the measured fp32 ByteFlow refusal
+    (`stages=2`, the default that crashed). A tile that still cannot fit — here
+    the `BLOCK_N=512` the tile comment already calls "out of shared memory" — is
+    an `AssertionError` at resolve time, not an `OutOfResources` traceback.
+    """
+    if mk is None:
+        pytest.skip("no triton in this build")
+    old = mk.smem_estimate(mk.TILES, torch.float32, BYTEFLOW["rank"], stages=2)
+    assert old == 196608 and old > mk.SMEM_CEILING_BYTES
+    reason = mk.tile_reason(torch.float32, **BYTEFLOW, tiles=dict(mk.TILES, BLOCK_N=512))
+    print(f"[tile refusal] {reason}")
+    assert reason == "fp32 tile BLOCK_N=512 needs 294912 bytes > 101376"
+    with pytest.raises(AssertionError, match=r"fp32 tile BLOCK_N=512 needs 294912 bytes > 101376"):
+        mk._tiles({"BLOCK_N": 512}, torch.float32, **BYTEFLOW)
+
+
+def test_the_tile_fallback_is_counted_with_the_numbers(monkeypatch):
+    """Gate (c): when the tile does not fit, the dispatch COUNTS it and says so.
+
+    `tile_reason` returning a reason must reach `moe_triton_fallback` and the
+    counter's `why` unchanged — a fallback a reader of the log cannot see is the
+    ADR-0019 defect this gate exists for. The reason is the same string the
+    refusal above prints.
+    """
+    if mk is None:
+        pytest.skip("no triton in this build")
+    reason = "fp32 tile BLOCK_N=512 needs 294912 bytes > 101376"
+    monkeypatch.setattr(mk, "tile_reason", lambda *a, **k: reason)
+    moe = SparseMoE(tiny_cfg(n_experts=4, moe_topk=2, rank=8, moe_kernel="triton"), device="cpu")
+    x = torch.randn(32, 64)
+    index, weight = _routing(moe, x)
+    counters = Counters()
+    with torch.no_grad():
+        out = moe._dispatch(x, weight, index, counters)
+    print(f"[tile fallback] {counters.line()} why={counters.why}")
+    assert counters["moe_triton_fallback"] == 1
+    assert reason in counters.why, counters.why
+    assert counters["moe_naive_dispatch"] == 1  # CPU: the padded bank cannot run either
+    assert torch.isfinite(out).all()
+
+
+@CUDA
+def test_fp32_triton_runs_the_halved_tile_and_matches_the_padded_bank():
+    """Gate (b): fp32 Triton == fp32 padded at the small shape, rel <= 1e-5.
+
+    This is the existing fp32 parity shape with the NEW tile underneath: if the
+    dtype-aware tile or the one-stage launch changed the arithmetic, this is the
+    gate that fails. It also proves the launch is LEGAL at fp32 (the old tile
+    died in `OutOfResources`), which a CPU test cannot.
+    """
+    moe = _moe(bf16=False)
+    t = mk.tiles_for(torch.float32, moe.d, moe.f, moe.experts[0].rank)
+    assert t["BLOCK_N"] == 64 and mk._launch_stages(torch.float32) == {"num_stages": 1}
+    x = torch.randn(64, moe.d, device=DEV)
+    index, weight = _routing(moe, x)
+    order, keep, dropped = moe._permute(index)
+    with torch.no_grad():
+        padded = moe._padded_dispatch(x, weight, index, order, keep)
+        triton = moe._triton_dispatch(x, weight, index, order, keep)
+    rel = _rel(triton, padded)
+    print(
+        f"[fp32 parity] E={moe.n_experts} d={moe.d} f={moe.f} r={moe.experts[0].rank} "
+        f"BLOCK_N={t['BLOCK_N']} stages=1 rel={rel:.3e}"
+    )
+    assert rel <= 1e-5, f"{rel:.3e} exceeds 1e-5"
+
+
+# --------------------------------------------------------------------------
 # the FUSED backward — parity against the previous adjoint, per parameter group
 # --------------------------------------------------------------------------
 

@@ -47,8 +47,13 @@ Dispatch has TWO arms over ONE permute, and the log line says which ran:
   GLU fused into the second GEMM's input. `ModelConfig.moe_kernel` picks it and
   is the A/B kill-switch (`docs/research/2026-10-15-tsct-super-kernel.md` §5.5:
   expert-kernel verdicts come from isolated-pass benches, then the full step);
-  when the kernel cannot run (no triton, not CUDA) the padded arm runs instead
-  and `moe_triton_fallback` + the reason say so.
+  when the kernel cannot run (no triton, not CUDA, a tile set the device cannot
+  hold) the padded arm runs instead and `moe_triton_fallback` + the reason say
+  so. The tile is DTYPE-AWARE (`moe_kernels.tiles_for`): fp32 halves the wide
+  tiles and drops the pipeline to one stage, so the fp32 ByteFlow arm — which
+  used to need 196608 B against a 101376 B ceiling and therefore ran the naive
+  loop — takes the grouped GEMM. A set that still cannot fit is COUNTED with its
+  byte numbers (`fp32 tile BLOCK_N=… needs … bytes > …`), never a silent switch.
   Its BACKWARD is FUSED by default (`fused_bwd=True`, `_triton_dispatch`): the
   scatter is `moe_kernels.combine` (one Triton kernel for both the `[R]`
   router-weight gradient and the expert adjoint — the OLMo-core combine-backward
@@ -1190,12 +1195,19 @@ class SparseMoE(nn.Module):
         """`None` if the unpadded grouped GEMM can run THIS call, else why not.
 
         The arm is unpadded by construction (`offs` carries the ragged bounds),
-        so the only things that can stop it are the ability itself (no triton,
-        no CUDA) — both COUNTED, never silent. The shapes need no gate: every
-        dimension is masked in-kernel, and the op asserts what it cannot do.
+        so the gates are the ability itself (no triton, no CUDA) and the TILE:
+        `moe_kernels.tile_reason` estimates the CTA shared memory of the widest
+        kernel from the tile constants and the compute dtype. A set that does
+        not fit is COUNTED with its numbers instead of dying at launch — that is
+        what `196608 B > 101376` on the fp32 ByteFlow arm used to do, and why
+        that arm ran `moe_kernel=naive`. `moe_kernels.tiles_for` now halves the
+        wide tiles at four bytes, so the fp32 shape fits and no fallback fires.
         """
         if _TRITON_WHY is not None:
             return _TRITON_WHY
+        why = moe_kernels.tile_reason(self._bank_dtype(), self.d, self.f, self.experts[0].rank)
+        if why is not None:
+            return why
         if not x.is_cuda:
             return f"input is on {x.device.type}: the grouped GEMM is the CUDA path"
         return None
