@@ -1,12 +1,15 @@
 /**
- * dormouse browser engine — the `small` polygon, run in JavaScript.
+ * dormouse browser engine — a byte-level LM, run in JavaScript.
  *
  * WHAT THIS IS. A plain ES module with no build step and no dependency that
  * reads the SAME `.dormouse` artifact `dormouse export` writes and that
  * `dormouse decode/serve --export` loads: one file, three readers. It runs the
- * `small` preset's decode path (768-wide, 12 heads, 4 loop iterations, 3 dense
- * experts, Engram n-grams, KDA gated-delta attention) one byte at a time, with
- * the KDA recurrent state carried across bytes.
+ * byte-lm decode path (weight-shared loop, KDA gated-delta attention with the
+ * recurrent state carried across bytes, TSCT low-rank experts, Engram n-grams)
+ * one byte at a time, at any geometry the header describes. Both expert arms
+ * are here: the dense blend (`moe_topk = 0`, the `small` polygon) and the
+ * DROPLESS top-k dispatch (`moe_topk = k`, every routed token to its top-k,
+ * no capacity drop).
  *
  * WHY AN ENGINE AND NOT AN OFF-THE-SHELF RUNTIME. llama.cpp/onnxruntime-web
  * cannot run this model: the chunked gated delta rule, the low-rank TSCT
@@ -29,19 +32,26 @@
  * setting of the TRAINED run; the engine is its own fp32 arm and says so.
  *
  * WHAT IT DOES NOT DO, said here rather than on the page's fine print:
- *   - the top-k DROPLESS MoE path (`moe_topk > 0`) — the `small` preset runs
- *     the dense blend over 3 experts, which is what this implements;
- *   - MSA block-sparse attention, AttnRes, LOOM, ByteFlow, GRes, DSpark and
- *     SIGReg: all refused by name through the header's `engine_refusal`;
+ *   - MSA block-sparse attention, AttnRes, LOOM, ByteFlow, DSpark, a
+ *     non-`silu` expert activation, a dense (non-TSCT) projection and a
+ *     capacity-dropping top-k (`moe_capacity != 0`): all refused BY FIELD
+ *     through `engineRefusal` (the same table `model/export.py` stamps into
+ *     the header), never silently approximated;
+ *   - the LFB selection bias: it is checkpoint state (a `<ckpt>.lfb` sibling),
+ *     not a `.dormouse` record. When the header says `moe_lb_coef != 0` the
+ *     engine routes on the unbiased logits and `W.stats.lfbBias` says
+ *     `absent`; the smallest additive fix is one dense `loop.moe.lfb_bias`
+ *     record beside `loop.moe.lfb_counts`;
  *   - `dense_qat`/`factor_qat` projections at run time (the factors are already
  *     packed);
  *   - any batched or windowed forward: one byte per step, one state per
  *     iteration slot. The prefill is one step per prompt byte, exactly like
  *     Python's CPU `recurrent_decode` — there is no chunked kernel here.
  *
- * The exported surface is deliberately wide: `parseHeader`, `unpackTernary`,
- * `rmsNorm`, `kdaStep`, `fnvKeys`, `stepLogits` and `loadWeights` are pure and
- * callable from Node, which is what makes the parity gate possible.
+ * The exported surface is deliberately wide: `parseHeader`, `engineRefusal`,
+ * `unpackTernary`, `rmsNorm`, `kdaStep`, `fnvKeys`, `stepLogits` and
+ * `loadWeights` are pure and callable from Node, which is what makes the
+ * parity gate possible.
  */
 
 /** The container's magic: `DMSEXP\x01\x00` (see `model/export.py`). */
@@ -49,6 +59,54 @@ export const MAGIC = new Uint8Array([0x44, 0x4d, 0x53, 0x45, 0x58, 0x50, 0x01, 0
 export const ALIGN = 8;
 
 const DTYPE_BYTES = { fp32: 4, fp16: 2, bf16: 2, u8: 1, i32: 4, i64: 8, bool: 1 };
+
+/**
+ * The architecture fields the engine implements, field → value. Geometry is
+ * NOT here: `d_model`, `n_heads`, `head_dim`, `d_ffn`, `max_iter`, `rank`,
+ * `shared_rank`, `n_experts`, `vocab` and the Engram widths are read from the
+ * header, so any validated value runs. This is the JS twin of
+ * `model/export.py`'s `ENGINE_ARMS`; the writer stamps the same refusal into
+ * the header and `Engine.load` re-checks it here so a hand-made file cannot
+ * slip past the header's word alone.
+ *
+ * `moe_topk` is separate because both arms are implemented (`0` = the dense
+ * blend, `k` = dropless top-k); what the engine cannot run is the
+ * CAPACITY-dropping variant, whose drop set depends on the window's
+ * composition and is therefore not a per-byte function.
+ */
+const ENGINE_ARMS = {
+	use_tsct: true,
+	use_kda: true,
+	use_attnres: false,
+	use_byteflow: false,
+	use_msa: false,
+	loom: false,
+	expert_act: 'silu',
+	dspark_weight: 0,
+};
+
+/** Why this header's `model` is not the engine's architecture, or `null`. */
+export function engineRefusal(cfg) {
+	if (!cfg || typeof cfg !== 'object') return 'the header carries no `model` dict';
+	const bad = [];
+	for (const [k, want] of Object.entries(ENGINE_ARMS)) {
+		if (cfg[k] !== want) {
+			bad.push(`${k}=${JSON.stringify(cfg[k])} (engine implements ${JSON.stringify(want)})`);
+		}
+	}
+	const E = cfg.n_experts;
+	const topk = cfg.moe_topk;
+	if (!Number.isInteger(topk) || topk < 0 || (Number.isInteger(E) && topk > E)) {
+		bad.push(`moe_topk=${JSON.stringify(topk)} (engine implements 0..n_experts=${JSON.stringify(E)})`);
+	}
+	if (topk > 0 && cfg.moe_capacity !== 0) {
+		bad.push(
+			`moe_capacity=${JSON.stringify(cfg.moe_capacity)} (engine implements 0 for moe_topk>0: ` +
+				'the DROPLESS path, where every assignment reaches its expert)',
+		);
+	}
+	return bad.length ? bad.join('; ') : null;
+}
 
 // ---------------------------------------------------------------------------
 // the container
@@ -335,17 +393,27 @@ const expertKeys = (i) => [
  */
 export function loadWeights(header, tensors) {
 	const cfg = header.model;
-	const want = new Set(KEYS);
+	const why = engineRefusal(cfg);
+	if (why) {
+		throw new Error(`the artifact's architecture is not the engine's: ${why}. Escape: re-export with these arms.`);
+	}
+	const useEngram = cfg.use_engram !== false;
+	const want = new Set();
+	for (const k of KEYS) if (useEngram || !k.startsWith('loop.engram.')) want.add(k);
 	for (let i = 0; i < cfg.n_experts; i++) for (const k of expertKeys(i)) want.add(k);
 	for (const k of ['gate_u', 'gate_s', 'up_u', 'up_s', 'v']) want.add(`loop.moe.shared.${k}`);
+	// The LFB selection bias is checkpoint state (a `<ckpt>.lfb` sibling), not
+	// a `.dormouse` record today — but if a writer adds the one optional record,
+	// the engine reads it instead of routing on the unbiased logits.
+	const optional = new Set(['loop.moe.lfb_bias']);
 	const have = new Set(Object.keys(tensors));
 	const missing = [...want].filter((k) => !have.has(k));
-	const extra = [...have].filter((k) => !want.has(k));
+	const extra = [...have].filter((k) => !want.has(k) && !optional.has(k));
 	if (missing.length || extra.length) {
 		throw new Error(
 			`the artifact's keys are not this engine's model: ${missing.length} missing ` +
 				`(${missing.slice(0, 3).join(', ')}), ${extra.length} unknown (${extra.slice(0, 3).join(', ')}). ` +
-				'Cause: a different architecture. Escape: export the `small` preset.',
+				'Cause: a different architecture. Escape: export a config the engine runs.',
 		);
 	}
 	const shape = (name, want0) => {
@@ -373,6 +441,8 @@ export function loadWeights(header, tensors) {
 		hd,
 		T,
 		E,
+		topk: cfg.moe_topk || 0,
+		useEngram,
 		eps: cfg.norm_eps,
 		scale: 1 / Math.sqrt(hd),
 		lamMax: cfg.engram_lam_max,
@@ -390,10 +460,11 @@ export function loadWeights(header, tensors) {
 		beta: lin('loop.attn.beta_proj.weight', H, d),
 		router: lin('loop.moe.router.weight', E, d),
 		down: lin('loop.moe.down.weight', d, cfg.d_ffn),
-		engram: shape('loop.engram.tables', [cfg.engram_orders.length, slots, cfg.engram_dim]).data,
-		engramQuery: lin('loop.engram.query_proj.weight', cfg.engram_dim, d),
-		engramKey: lin('loop.engram.key_proj.weight', cfg.engram_dim, cfg.engram_dim),
-		engramValue: lin('loop.engram.value_proj.weight', d, cfg.engram_dim),
+		lfbBias: optional.has('loop.moe.lfb_bias') && have.has('loop.moe.lfb_bias') ? shape('loop.moe.lfb_bias', [E]).data : null,
+		engram: useEngram ? shape('loop.engram.tables', [cfg.engram_orders.length, slots, cfg.engram_dim]).data : null,
+		engramQuery: useEngram ? lin('loop.engram.query_proj.weight', cfg.engram_dim, d) : null,
+		engramKey: useEngram ? lin('loop.engram.key_proj.weight', cfg.engram_dim, cfg.engram_dim) : null,
+		engramValue: useEngram ? lin('loop.engram.value_proj.weight', d, cfg.engram_dim) : null,
 		memDense: lin('loop.mem_dense.weight', d, d),
 		memBias: shape('loop.mem_dense.bias', [d]).data,
 		iterEmbed: shape('loop.iter_embed', [T, d]).data,
@@ -428,6 +499,11 @@ export function loadWeights(header, tensors) {
 		preset: header.preset,
 		commit: header.commit,
 		created: header.created,
+		topk: W.topk,
+		useEngram,
+		// COUNTED, not silent: a routed checkpoint trained with LFB has a
+		// selection bias that this container does not carry (see the header).
+		lfbBias: W.lfbBias ? 'present' : cfg.moe_lb_coef ? `absent (moe_lb_coef=${cfg.moe_lb_coef})` : null,
 	};
 	return W;
 }
@@ -476,7 +552,7 @@ function engramRead(W, normed, window) {
 }
 
 /** `SparseMoE`'s dense blend (`moe_topk = 0`): softmax over the bank, always the shared expert. */
-function moeForward(W, x) {
+function moeDense(W, x) {
 	const logits = matvec(x, W.router);
 	let max = -Infinity;
 	for (let i = 0; i < logits.length; i++) max = Math.max(max, logits[i]);
@@ -498,6 +574,64 @@ function moeForward(W, x) {
 }
 
 /**
+ * `SparseMoE`'s DROPLESS top-k arm (`moe_topk = k`, `moe_capacity = 0`) —
+ * `experts.py`'s `forward` at `topk > 0` + `_naive_dispatch`, one to one:
+ *
+ *   `probs  = softmax(logits)` over the WHOLE bank (not over the k selected);
+ *   `raised = logits + lfb_bias`, `index = topk(raised, k)` (selection only);
+ *   `weight = probs[index] / Σ probs[index]` — the burn `topk_blend`
+ *   renormalisation, so a top-1 token's gate is exactly 1.0 and the sparse
+ *   and dense arms run at the same output magnitude;
+ *   `out = Σ_e expert_e(x)·weight_e + shared(x)`, then ONE shared `down`.
+ *
+ * This is the *renormalised-global-softmax* form, and the distinction is the
+ * whole gate: a softmax over the k logits alone would be a different (sharper)
+ * gate on every token. `torch.topk` returns descending scores; the experts
+ * are then summed in ASCENDING index order, which is the order
+ * `_naive_dispatch`'s `argsort` visits them — the accumulation order the
+ * parity test pins.
+ */
+function moeTopk(W, x) {
+	const topk = W.topk;
+	const raw = matvec(x, W.router);
+	// softmax over all E — the unbiased probabilities the gate reads
+	let max = -Infinity;
+	for (let i = 0; i < W.E; i++) max = Math.max(max, raw[i]);
+	let sum = 0;
+	const probs = new Float32Array(W.E);
+	for (let i = 0; i < W.E; i++) {
+		probs[i] = Math.exp(raw[i] - max);
+		sum += probs[i];
+	}
+	for (let i = 0; i < W.E; i++) probs[i] /= sum;
+	// selection reads the RAISED score (LFB: the raw logit + b_e); the gate
+	// stays the honest probability from the UNBIASED softmax.
+	const score = (e) => raw[e] + (W.lfbBias ? W.lfbBias[e] : 0);
+	const order = [];
+	for (let e = 0; e < W.E; e++) order.push(e);
+	order.sort((a, b) => score(b) - score(a) || a - b); // descending, then lowest index
+	const picked = order.slice(0, topk).sort((a, b) => a - b);
+	let norm = 0;
+	for (const e of picked) norm += probs[e];
+	norm = Math.max(norm, 1e-9);
+	const f = W.cfg.d_ffn;
+	const weighted = new Float32Array(f);
+	for (const e of picked) {
+		const y = expertForward(x, W.experts[e], f);
+		const p = probs[e] / norm;
+		for (let i = 0; i < f; i++) weighted[i] += p * y[i];
+	}
+	const shared = expertForward(x, W.shared, f);
+	for (let i = 0; i < f; i++) weighted[i] += shared[i];
+	return matvec(weighted, W.down);
+}
+
+/** `moe_topk` picks the arm; `moe_topk = 0` is bit-for-bit the arm it always was. */
+function moeForward(W, x) {
+	return W.topk === 0 ? moeDense(W, x) : moeTopk(W, x);
+}
+
+/**
  * ONE byte through the loop block and the head — `decode._step_logits` +
  * `loopblock.recurrent_step`, transcribed.
  *
@@ -511,8 +645,14 @@ export function stepLogits(W, ctx, states) {
 	const d = W.d;
 	const pos = ctx.length - 1;
 	if (pos < 0) throw new Error('stepLogits needs at least one byte of context');
-	const drop = Math.min(W.orders[W.orders.length - 1] - 1, pos);
-	const window = ctx.subarray ? ctx.subarray(pos + 1 - (drop + 1), pos + 1) : ctx.slice(pos - drop, pos + 1);
+	// The Engram's window is the only arm that needs the bytes; without it the
+	// block's memory branch is an exact zero (`loopblock._window`'s
+	// `engram is None` arm), so a no-memory artifact never builds a window.
+	let window = null;
+	if (W.useEngram) {
+		const drop = Math.min(W.orders[W.orders.length - 1] - 1, pos);
+		window = ctx.subarray ? ctx.subarray(pos + 1 - (drop + 1), pos + 1) : ctx.slice(pos - drop, pos + 1);
+	}
 	const byte = ctx[pos];
 	const h0 = W.embed.subarray(byte * d, (byte + 1) * d);
 	let h = new Float32Array(h0);
@@ -544,10 +684,14 @@ export function stepLogits(W, ctx, states) {
 		const y = new Float32Array(d);
 		for (let i = 0; i < d; i++) y[i] = o[i] * wAttn;
 		// 4. the memory branch: lam·Engram + (1−lam)·dense, lam = min(w_mem, lam_max)
-		const mem = engramRead(W, normed, window);
-		const dense = matvec(normed, W.memDense, new Float32Array(d), W.memBias);
-		const lam = Math.min(wMem, W.lamMax);
-		for (let i = 0; i < d; i++) y[i] += mem[i] * lam + dense[i] * (1 - lam);
+		//    (or an exact zero when the model carries no Engram — the reference's
+		//    `engram is None` arm skips BOTH halves, including mem_dense)
+		if (W.useEngram) {
+			const mem = engramRead(W, normed, window);
+			const dense = matvec(normed, W.memDense, new Float32Array(d), W.memBias);
+			const lam = Math.min(wMem, W.lamMax);
+			for (let i = 0; i < d; i++) y[i] += mem[i] * lam + dense[i] * (1 - lam);
+		}
 		// 5. the experts, gated
 		const ffn = moeForward(W, normed);
 		for (let i = 0; i < d; i++) y[i] += ffn[i] * wFfn;
@@ -643,11 +787,16 @@ export class Engine {
 			if (onProgress) onProgress(buf.length, total || buf.length);
 		}
 		const { header } = parseHeader(buf);
-		if (header.architecture !== 'small-byte-lm') {
+		// The writer's `engine_refusal` is the header's own word; re-derive it
+		// from `model` so a hand-made or older file cannot dodge the check, and
+		// so the message names the FIELD rather than "not the small polygon".
+		const why = engineRefusal(header.model);
+		if (why) {
 			throw new Error(
-				`this artifact is not the engine's architecture (${header.architecture}): ` +
-					`${header.engine_refusal}. Escape: export the \`small\` preset ` +
-					'(`dormouse export small --ckpt-name … --out docs-site/public/demo/model.dormouse`).',
+				`this artifact is not the engine's architecture: ${why}` +
+					(header.engine_refusal ? ` (the writer's refusal: ${header.engine_refusal})` : '') +
+					'. Escape: `dormouse export` a config with the engine\'s arms, and for a routed ' +
+					'model a DROPLESS one (`moe_capacity = 0`).',
 			);
 		}
 		const tensors = readTensors(buf, header);

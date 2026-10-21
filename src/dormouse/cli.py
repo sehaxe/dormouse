@@ -980,7 +980,7 @@ def export_cmd(
     console.print(report.table())
     why = engine_refusal(run.model)
     engine_line = (
-        "[green]runnable[/] (small-byte-lm)"
+        "[green]runnable[/] (engine-byte-lm)"
         if why is None
         else f"[yellow]NOT runnable[/] by docs-site/public/demo/engine.js — {why}"
     )

@@ -12,6 +12,7 @@ fixture with room for a different init.
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import json
 import struct
@@ -290,12 +291,19 @@ def test_host_table_export_folds_the_memory_in(tmp_path: Path) -> None:
 
 
 def test_engine_refusal_names_every_field_the_engine_cannot_run(tmp_path: Path) -> None:
-    """`small` is the engine's ONE polygon; anything else is refused by name."""
+    """The engine runs the byte-lm architecture at any geometry, field by field."""
     assert engine_refusal(load_preset("small")) is None
     why = engine_refusal(load_preset("medium"))
     assert why is not None
-    for field in ("d_model=1024", "n_heads=16", "d_ffn=2730"):
+    # the REFUSED arms, not the geometry: medium's width is not itself a refusal
+    for field in ("use_msa=True", "moe_capacity=2.0"):
         assert field in why, why
+    # medium geometry with the unsupported arms off IS the engine's routed arm
+    routed = dataclasses.replace(load_preset("medium"), use_msa=False, moe_capacity=0.0)
+    assert engine_refusal(routed) is None
+    # and the capacity-dropping top-k names its field (tiny ships topk=2, cap 1.0)
+    assert "moe_capacity=1.0" in engine_refusal(tiny_cfg())
+    assert engine_refusal(tiny_cfg(moe_capacity=0.0, use_engram=False)) is None
     # and the refusal is in the FILE, so a reader knows before it loads weights
     torch.manual_seed(0)
     model = tiny_model()
@@ -305,6 +313,12 @@ def test_engine_refusal_names_every_field_the_engine_cannot_run(tmp_path: Path) 
     assert f.header["architecture"] == "byte-lm"
     assert f.header["engine_refusal"] is not None
     assert f.engine_refusal() is not None
+    # a runnable routed config is stamped with the engine's own architecture word
+    routed_path = tmp_path / "routed.dormouse"
+    write_export(DormouseModel(tiny_cfg(moe_capacity=0.0, use_engram=False)), routed_path)
+    rf = read_export(routed_path)
+    assert rf.header["architecture"] == "engine-byte-lm"
+    assert rf.engine_refusal() is None
 
 
 def test_exported_records_are_uint8_codes_and_the_scale_is_a_header_number(

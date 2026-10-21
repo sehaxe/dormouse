@@ -17,10 +17,11 @@ slice without walking the records):
     blobs               each record's bytes, 8-byte aligned
 
 HEADER. `format`, `version`, `preset`, `mode` (the factor rung), `architecture`
-(`small-byte-lm` when `engine_refusal` is None), `engine_refusal` (the named
-field mismatches, or None), `created`, `commit`, `step`, `seed`, `model` (the
-ModelConfig as a dict — the reader rebuilds the model from it), `dtypes`, and
-`tensors`: one record per state-dict key:
+(`engine-byte-lm` when `engine_refusal` is None — the browser engine reads any
+geometry and refuses only the arms it does not implement), `engine_refusal`
+(the named field mismatches, or None), `created`, `commit`, `step`, `seed`,
+`model` (the ModelConfig as a dict — the reader rebuilds the model from it),
+`dtypes`, and `tensors`: one record per state-dict key:
 
     {name, dtype, shape, offset, length}                dense
     {name, dtype: "ternary", shape, offset, length, scale}
@@ -115,37 +116,25 @@ _TORCH_OF = {
 _BYTES_OF = {k: torch.tensor([], dtype=v).element_size() for k, v in _TORCH_OF.items()}
 _NAME_OF = {v: k for k, v in _TORCH_OF.items()}
 
-#: The ONE architecture `docs-site/public/demo/engine.js` implements: the
-#: `small` preset's shape as `configs/small.toml` ships it, field by field.
-#: A mismatch is not a warning — the engine refuses the file and names the
-#: field, because an engine that silently runs a different polygon is a demo
-#: of something else. `engram_lam_max`/`norm_eps`/`bf16`/`seed` are NOT here:
-#: the engine READS them from the header, so any value is a working value.
-ENGINE_SHAPE: dict[str, object] = {
-    "d_model": 768,
-    "n_heads": 12,
-    "head_dim": 64,
-    "d_ffn": 2048,
-    "vocab": 256,
-    "max_seq_len": 512,
-    "max_iter": 4,
-    "rank": 64,
-    "n_experts": 3,
-    "moe_topk": 0,
-    "shared_rank": 192,
-    "engram_rows": 25000,
-    "engram_orders": [2, 3, 4],
-    "engram_dim": 32,
+#: The architecture (not the geometry) `docs-site/public/demo/engine.js`
+#: implements, field → the value it runs. Geometry — `d_model`, `n_heads`,
+#: `head_dim`, `d_ffn`, `vocab`, `max_seq_len`, `max_iter`, `rank`,
+#: `shared_rank`, `n_experts`, the Engram widths — is READ from the header, so
+#: any value the config validates runs. What the engine cannot run is named
+#: here, one FIELD at a time (the refusal in the header lists each mismatch).
+#: `moe_topk` is separate because both arms are implemented: `0` is the dense
+#: blend (the `small` polygon) and `k` is the DROPLESS top-k (`every routed
+#: token to its top-k, no capacity drop`). What cannot run is the CAPACITY
+#: variant (`moe_capacity != 0` with `moe_topk > 0`): its drop set is a
+#: function of the OTHER tokens in the forward, so it is not a per-byte
+#: function and a one-byte decode step would run a different model.
+ENGINE_ARMS: dict[str, object] = {
     "use_tsct": True,
     "use_kda": True,
-    "use_engram": True,
     "use_attnres": False,
     "use_byteflow": False,
     "use_msa": False,
     "loom": False,
-    "quant": "none",
-    "factor_qat": "none",
-    "dense_qat": "none",
     "expert_act": "silu",
     "dspark_weight": 0.0,
 }
@@ -154,10 +143,14 @@ ENGINE_SHAPE: dict[str, object] = {
 #: honest if the ignored set is named too (ADR-0019's "which arm ran").
 ENGINE_IGNORED = {
     "bf16": "a compute-dtype setting: the engine computes fp32 (its reference path)",
-    "moe_capacity": "inert at moe_topk=0: the dense blend has no capacity rule",
-    "moe_lb_coef": "the LFB bias steers the top-k selection, which moe_topk=0 never runs",
-    "moe_kernel": "a dispatch choice for the routed pass, absent at moe_topk=0",
-    "moe_offload": "an activation-offload switch for the routed pass (COUNTED inert at topk=0)",
+    "moe_capacity": "inert at moe_topk=0; at moe_topk>0 the engine requires 0 (DROPLESS)",
+    "moe_lb_coef": (
+        "COUNTED, not reproduced: the LFB selection bias is checkpoint state (a "
+        "`<ckpt>.lfb` sibling), not a `.dormouse` record, so a routed artifact "
+        "routes on the unbiased logits; `W.stats.lfbBias` says `absent`"
+    ),
+    "moe_kernel": "a dispatch choice for the routed pass; the engine has one arm",
+    "moe_offload": "an activation-offload switch for training; inference has no saved activations",
     "factor_qat_alpha": "inert with factor_qat=none (the engine reads the packed values)",
     "sigreg_weight": "a training regulariser: no parameters, no forward term",
     "seed": "the engine's sampler is seeded by the page, not by the run",
@@ -591,7 +584,7 @@ def write_export(
     }
     why = engine_refusal(cfg)
     header["engine_refusal"] = why
-    header["architecture"] = "byte-lm" if why else "small-byte-lm"
+    header["architecture"] = "byte-lm" if why else "engine-byte-lm"
     # The offsets are absolute and the header's own length depends on them
     # (a bigger base can add a digit to every offset), so the layout is a
     # fixpoint: assign, serialize, recompute the base, repeat until stable.
@@ -899,14 +892,30 @@ def verify_export(
 def engine_refusal(cfg) -> str | None:
     """Why the browser engine cannot run `cfg`, or None — the fields, by name.
 
-    The engine implements exactly one architecture (`ENGINE_SHAPE`, the `small`
-    polygon); anything else is refused with the mismatching fields listed, not
-    a warning. This is what the export command prints and what the page shows
-    when it loads a file the engine cannot run.
+    The engine implements the byte-lm ARCHITECTURE (`ENGINE_ARMS`) at any
+    geometry the header describes; anything else is refused with the mismatching
+    fields listed, not a warning. This is what the export command prints and
+    what the page shows when it loads a file the engine cannot run. Both MoE
+    arms run (`moe_topk = 0` dense, `> 0` dropless); the CAPACITY-dropping
+    top-k is the one arm that cannot, because its drop set depends on the
+    window's composition and a decode step is one byte.
     """
     bad = [
         f"{k}={getattr(cfg, k, None)!r} (engine implements {want!r})"
-        for k, want in ENGINE_SHAPE.items()
+        for k, want in ENGINE_ARMS.items()
         if getattr(cfg, k, None) != want
     ]
+    topk = getattr(cfg, "moe_topk", 0)
+    n_experts = getattr(cfg, "n_experts", 0)
+    if not isinstance(topk, int) or topk < 0 or topk > n_experts:
+        bad.append(
+            f"moe_topk={topk!r} (engine implements 0..n_experts={n_experts!r}: "
+            "`0` the dense blend, `k` the dropless top-k)"
+        )
+    if topk > 0 and getattr(cfg, "moe_capacity", 0) != 0:
+        bad.append(
+            f"moe_capacity={getattr(cfg, 'moe_capacity', None)!r} (engine implements 0 "
+            "for moe_topk>0: the DROPLESS path, every assignment to its expert; the "
+            "capacity rule's drop set depends on the window, so it is not per-byte)"
+        )
     return None if not bad else "; ".join(bad)

@@ -9,8 +9,9 @@
  * runs this file — that is the gate that makes this a demonstration of OUR
  * model rather than a plausible-looking toy.
  *
- * The tolerance: max |Δlogit| < 1e-4, measured 3.0e-7 on the tiny fixture and
- * 1.058e-6 on `small` (2026-10-19, this box, fp32 CPU torch vs this engine).
+ * The tolerance: max |Δlogit| < 1e-4, measured 3.0e-7 on the tiny fixture,
+ * 2.384e-7 on the routed tiny fixture (4 experts, top-2, dropless) and
+ * 1.058e-6 on `small` (2026-10-19/22, this box, fp32 CPU torch vs this engine).
  * Both sides read the SAME artifact bytes (fp16 dense, ternary factors), so the
  * only difference left is fp32 accumulation ORDER — the 1e-4 is ~80x headroom
  * for a different BLAS build, not a licence for a different formula.
@@ -23,6 +24,7 @@ import { test } from 'node:test';
 import {
 	Engine,
 	MAGIC,
+	engineRefusal,
 	fnvKeys,
 	initStates,
 	kdaStep,
@@ -69,6 +71,31 @@ test('unpackTernary pins the 2-bit codebook', () => {
 	assert.deepEqual([...unpackTernary(Uint8Array.from([9]), 0.625, 4)], [0.625, -0.625, 0, 0]);
 	// a code 3 is not a ternary level: refuse rather than decode it to 0
 	assert.throws(() => unpackTernary(Uint8Array.from([0b11]), 1, 4), /not a ternary level/);
+});
+
+test('engineRefusal names the arm, and both MoE arms pass', () => {
+	// the byte-lm architecture at ANY geometry: geometry is read, not checked
+	const cfg = {
+		use_tsct: true,
+		use_kda: true,
+		use_attnres: false,
+		use_byteflow: false,
+		use_msa: false,
+		loom: false,
+		expert_act: 'silu',
+		dspark_weight: 0,
+		n_experts: 4,
+		moe_topk: 0,
+		moe_capacity: 1.5,
+	};
+	assert.equal(engineRefusal(cfg), null, 'the dense blend at any geometry runs');
+	assert.equal(engineRefusal({ ...cfg, moe_topk: 2, moe_capacity: 0 }), null, 'the dropless top-k runs');
+	const cap = engineRefusal({ ...cfg, moe_topk: 2 });
+	assert.match(cap, /moe_capacity=1\.5/, cap);
+	const msa = engineRefusal({ ...cfg, use_msa: true, adaptive_msa: true });
+	assert.match(msa, /use_msa=true/, msa);
+	const topk = engineRefusal({ ...cfg, moe_topk: 9 });
+	assert.match(topk, /moe_topk=9/, topk);
 });
 
 test('rmsNorm is x / sqrt(mean(x²) + eps) · gain', () => {

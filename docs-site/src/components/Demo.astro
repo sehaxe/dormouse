@@ -1,5 +1,8 @@
 ---
-// The demo page: the `small` polygon running in the reader's browser.
+// The demo page: a byte-level LM running in the reader's browser. The page
+// SHIPS the `small` polygon (15.5 MiB); the same engine also runs a
+// `medium`-shaped artifact with the dropless top-k MoE (138 MB, over the page's
+// download budget, so it is generated and measured rather than committed).
 //
 // Hand-written, like the landing page, and in the same design language: the
 // tokens come from `src/styles/landing.css` (imported, not copied) — cream
@@ -212,10 +215,16 @@ const repo = 'https://github.com/sehaxe/dormouse';
 						const W = eng.W;
 						progress.hidden = true;
 						const st = eng.stats;
+						const experts = W.topk
+							? `top-${W.topk} of ${W.E} experts (dropless)`
+							: `${W.E} experts (dense blend)`;
+						const memory = W.useEngram
+							? `Engram ${W.orders.join('/')} × ${W.slots} rows`
+							: 'no Engram';
 						say(
 							`ready — ${W.cfg.d_model}-wide, ${W.H} heads, ${W.T} iterations, ` +
-								`${W.E} experts + 1 shared (rank ${W.cfg.shared_rank}), ` +
-								`Engram ${W.orders.join('/')} × ${W.slots} rows\n` +
+								`${experts} + 1 shared (rank ${W.cfg.shared_rank}), ${memory}` +
+								`${st.lfbBias ? ' · LFB bias ' + st.lfbBias : ''}\n` +
 								`artifact ${fmtBytes(st.bytes)} · dense ${st.denseDtype} · table ${st.engramDtype} · ` +
 								`${st.ternaryFactors} ternary factor matrices${st.commit ? ' · commit ' + st.commit : ''}\n` +
 								`${st.preset ? st.preset + ' preset · ' : ''}fp32 engine · ${(W.H * W.hd * W.hd * 4) / 1024} KB of KDA state per iteration slot`,
@@ -228,6 +237,13 @@ const repo = 'https://github.com/sehaxe/dormouse';
 								status.textContent +
 									'\nnote: this artifact stores the Engram table at fp32 — ' +
 									'`--engram-dtype fp16` is 6.3 MB smaller and is what the demo ships with.',
+							);
+						}
+						if (st.topk > 0 && st.bytes > 64 * 1024 * 1024) {
+							say(
+								status.textContent +
+									`\nnote: a routed artifact is ${fmtBytes(st.bytes)} — the page ships the ` +
+									'15.5 MiB `small` polygon so the download stays small; this engine runs both.',
 							);
 						}
 					})

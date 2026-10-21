@@ -15,14 +15,21 @@ claim is only checkable against the Python reference. So this file:
 5. fails if Node exits non-zero — the JS side asserts max |Δlogit| < 1e-4 and
    an identical argmax at every prefix.
 
-It runs TWICE: on the `tiny` fixture (fast, d=64) and on the real `small`
-polygon (d=768, 12 heads, 4 iterations, 3 experts + the rank-192 shared one,
-32 768-row Engram tables) — the shape the demo page runs. The `small` case is
-the one that makes "the browser runs the small preset" a measurement.
+It runs THREE cases: the `tiny` fixture (fast, d=64, dense blend), the routed
+`tiny` fixture (d=64, 4 experts, top-2 dropless, no Engram) and the real
+`small` polygon (d=768, 12 heads, 4 iterations, 3 experts + the rank-192 shared
+one, 32 768-row Engram tables) — the shape the demo page runs. The `small` case
+is the one that makes "the browser runs the small preset" a measurement; the
+routed case is the one that makes "the browser runs a medium-shaped top-k
+export" a measurement.
 
-The engine does NOT implement the top-k dropless MoE path (`moe_topk > 0`), so
-the tiny fixture is built with `moe_topk=0` — the `small` preset's dense blend,
-the arm the demo runs.
+The engine implements both MoE arms: the dense blend (`moe_topk = 0`, the
+`small` polygon) and the DROPLESS top-k dispatch (`moe_topk = k`,
+`moe_capacity = 0`). The tiny dense fixture runs `moe_topk = 0`; the routed
+fixture is `tests/conftest.py`'s TINY geometry (`n_experts = 4`) with
+`moe_topk = 2`, `moe_capacity = 0` and the Engram OFF — the smallest model that
+walks `experts.py`'s routed arm, so the gate measures the top-k normalisation,
+the expert weighting and the shared expert, not the dense control's.
 """
 
 from __future__ import annotations
@@ -64,7 +71,8 @@ def _reference_logits(model: DormouseModel, prompt: bytes) -> list[list[float]]:
     """The decode path's logits at every prefix of `prompt` (the engine's own loop)."""
     model.eval()
     states: list = [None] * model.cfg.max_iter
-    drop = max(model.loop.engram.orders) - 1
+    # `recurrent_decode`'s own rule: no Engram means no left context to carry.
+    drop = 0 if model.loop.engram is None else max(model.loop.engram.orders) - 1
     rows: list[list[float]] = []
     with torch.no_grad():
         for i in range(len(prompt)):
@@ -121,6 +129,9 @@ def _parity_case(model: DormouseModel, tmp_path: Path, label: str) -> str:
     artifact = tmp_path / f"{label}.dormouse"
     write_export(model, artifact, preset=label, seed=1, engram_dtype="fp16")
     f = read_export(artifact)
+    # the artifact must be one the PAGE can load, not just one this test can
+    # read: the refusal is the writer's, and the loader's is the same table.
+    assert f.engine_refusal() is None, f"{label}: {f.engine_refusal()}"
     # The reference is the SAME bytes with fp32 compute: the engine has no bf16
     # arm, and bf16 is a precision setting of the trained run, not architecture.
     ref_model = DormouseModel(dataclasses.replace(f.cfg, bf16=False))
@@ -151,6 +162,21 @@ def test_engine_matches_python_on_the_small_polygon(tmp_path: Path) -> None:
     line = _parity_line(out)
     # the measured number, printed so a reader of the log sees it — the gate
     # itself is the JS assertion, not this line
+    print(line)
+    assert "max |Δlogit|" in line
+
+
+def test_engine_matches_python_on_the_routed_dropless_fixture(tmp_path: Path) -> None:
+    """The top-k arm: 4 experts, top-2, `moe_capacity=0`, no Engram.
+
+    The routing is per position, so the one-byte decode step and Python's
+    `_step_logits` are the same function: softmax over all 4, the top 2
+    renormalised, expert + shared + `down`.
+    """
+    torch.manual_seed(0)
+    model = tiny_model(use_engram=False, moe_capacity=0.0)
+    out = _parity_case(model, tmp_path, "routed-tiny")
+    line = _parity_line(out)
     print(line)
     assert "max |Δlogit|" in line
 
