@@ -19,11 +19,8 @@ Mirrors `crates/dormouse-core/src/loop_block.rs`. One iteration, in order:
    accumulated inside the loop (deep supervision, burn's own shape), which is
    also why it is never materialized as `[T, b, t, d]`.
 
-Depth is fixed by default and the per-iteration CE is an unweighted mean
-(ADR-0013). The learned HALT HEAD (`halt.py`, built IFF `halt_weight > 0`)
-reads the same per-iteration readout at INFERENCE and stops when its stop
-probability passes 0.5; its target is the per-iteration CE's own improvement,
-never the label sequence. The ADAPTIVE DEPTH arm
+There is no halt head and no PonderNet: depth is fixed by default and the
+per-iteration CE is an unweighted mean (ADR-0013). The ADAPTIVE DEPTH arm
 passes `depth=T` to run `T` iterations instead, and the readout divides by the
 `T` actually run so different depths are scale-comparable.
 
@@ -195,9 +192,6 @@ class LoopBlock(nn.Module):
         counters: Counters | None = None,
         depth: int | None = None,
         segment_len: int = 0,
-        halt: nn.Module | None = None,
-        halt_min_iter: int = 1,
-        collect_hidden: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None, Counters]:
         """`h0 [b,t,d]` → (`mean readout [b,t,d]`, SUM of per-iteration mean CEs, counters).
 
@@ -243,16 +237,7 @@ class LoopBlock(nn.Module):
                 h0, input_ids, targets, lm_head, counters, T, segment_len
             )
         out, rec, per_iter, _ = self._window(
-            h0,
-            input_ids,
-            targets,
-            lm_head,
-            counters,
-            T,
-            carry=False,
-            halt=halt,
-            halt_min_iter=halt_min_iter,
-            collect_hidden=collect_hidden,
+            h0, input_ids, targets, lm_head, counters, T, carry=False
         )
         # The per-iteration CEs as a LIST on the module (host floats ONLY on an
         # eval-style read; see `model.DormouseModel.forward(breakdown=True)`) —
@@ -277,9 +262,6 @@ class LoopBlock(nn.Module):
         states: list | None = None,
         drop: int = 0,
         recurrent: bool = False,
-        halt: nn.Module | None = None,
-        halt_min_iter: int = 1,
-        collect_hidden: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor], list]:
         """`T` iterations over ONE window — a segment, or the whole sequence.
 
@@ -300,17 +282,10 @@ class LoopBlock(nn.Module):
         out_acc = torch.zeros_like(h0)
         rec = torch.zeros((), dtype=torch.float32, device=h0.device)
         per_iter: list[torch.Tensor] = []
-        #: The per-iteration states the halt head reads (`model.py`'s loss);
-        #: collected only for a training forward with a head. The references
-        #: are graph nodes `out_acc` already keeps, so no extra storage, and
-        #: the list is replaced on every forward.
-        hidden: list[torch.Tensor] = []
-        ran = 0
         sources: list[torch.Tensor] = [h0] if self.use_attnres else []
         new_states: list = []
         for i in range(T):
             counters.count("iter")
-            ran = i + 1
             ctx = h + self.iter_embed[i].view(1, 1, d)
             normed = self.norm(ctx)
             ctrl = torch.cat([ctx.reshape(b * t, d), h0_flat], dim=-1)
@@ -413,28 +388,13 @@ class LoopBlock(nn.Module):
 
             step_out = self.out_proj(h.reshape(b * t, d)).reshape(b, t, d)
             out_acc = out_acc + step_out
-            if collect_hidden:
-                hidden.append(step_out)
             if targets is not None:
                 assert lm_head is not None, "per-iteration CE needs the lm_head"
                 logits = lm_head(step_out.reshape(b * t, d).to(torch.float32))
                 ce = -F.log_softmax(logits, dim=-1).gather(1, targets.reshape(-1, 1))
                 rec = rec + ce.mean()
                 per_iter.append(ce.mean())
-            if halt is not None and ran >= halt_min_iter:
-                # The HALT DECISION: one scalar from this iteration's readout,
-                # read to the host and compared to 0.5. Inference only — the
-                # trainer never passes `halt`, so a training step adds no host
-                # read (ADR-0018 rule 2). Reading here is what makes the skip
-                # REAL: the iterations below are never launched.
-                if float(torch.sigmoid(halt(step_out))) > 0.5:
-                    counters.count("halt_stop")
-                    break
-        if halt is not None and ran < T:
-            counters.count("halt_skipped", T - ran)
-        self._depth_ran = ran
-        self._per_iter_hidden = hidden
-        return out_acc / ran, rec, per_iter, new_states
+        return out_acc / T, rec, per_iter, new_states
 
     def recurrent_step(
         self,

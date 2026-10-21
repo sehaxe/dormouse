@@ -100,6 +100,19 @@ DEAD_SNAPSHOT_KEYS = {
 #: The `moe_kernel` literals — the expert-pass arms `experts._dispatch` routes
 #: between. One list, read by `validate`: a name that is not here is LOUD.
 MOE_KERNELS = ("padded", "triton", "naive")
+#: The `share_u_mode` literals — how the routed experts' INPUT basis is shaped
+#: (`experts.py`'s module docstring): `off` is one `U` per expert, `plane` is
+#: one `U` for the bank, `dict` is one dictionary plus a per-expert column
+#: subset. A name that is not here is LOUD.
+SHARE_U_MODES = ("off", "plane", "dict")
+#: The `moe_topk_mode` literals — how many experts each TOKEN runs
+#: (`model/adaptive_topk.py`): `off` is the constant `moe_topk` width every
+#: number on record runs; `entropy`/`margin` are the per-token confidence
+#: policies. A name that is not here is LOUD.
+MOE_TOPK_MODES = ("off", "entropy", "margin")
+#: The widest per-token `k` the instrument can name (`moe_k1`..`moe_k8`). Above
+#: this is LOUD: the fused backward's top-k tile also stops at 8.
+MOE_TOPK_SLOTS_MAX = 8
 #: The `expert_act` literals — the 2026-10-16 activation tournament arms, each
 #: with its formula source in `experts.expert_glu`:
 #: `silu` (control, SwiGLU), `situ` (Kimi K3, arXiv 2607.24653 Eq. 12),
@@ -232,7 +245,8 @@ class ModelConfig:
     A key the burn side has and this port does not is NOT a field: setting it is
     an unknown key, refused loudly with the key named and the escape. A field
     that reaches no code is the defect that refusal exists to prevent (the burn
-    history's `use_mhc` reached a trainer that never read it).
+    history's `use_mhc` reached a trainer that never read it — it is ported for
+    real in `use_mhc` below, and `use_gr` is the still-dead example).
     """
 
     # --- geometry -------------------------------------------------------
@@ -286,9 +300,11 @@ class ModelConfig:
     # --- arms -----------------------------------------------------------
     use_kda: bool = True
     use_tsct: bool = True
-    #: The expert bank's SHARED input basis (owner directive 2026-10-21):
-    #: every ROUTED expert stops owning its `gate_u`/`up_u [d, rank]` and reads
-    #: ONE tensor per site that `SparseMoE` owns (`experts.py`'s module
+    #: The expert bank's SHARED input basis (owner directive 2026-10-21) — the
+    #: OLD SPELLING of `share_u_mode = "plane"` below (kept because every
+    #: `--set` and every snapshot names it this way; the two disagreeing is
+    #: LOUD). Every ROUTED expert stops owning its `gate_u`/`up_u [d, rank]` and
+    #: reads ONE tensor per site that `SparseMoE` owns (`experts.py`'s module
     #: docstring). The per-expert specialization left is `s` and `V [rank, f]`,
     #: so the bank's capacity lives in a shared dictionary of input directions
     #: instead of E interchangeable copies — the mechanism that can plausibly
@@ -307,8 +323,43 @@ class ModelConfig:
     #: rung's per-expert α has nothing to quantize it against — quantizing it
     #: would need its own gate, and this arm does not ship one).
     share_u: bool = False
+    #: How the shared basis is shaped — THE switch (`share_u` above is its
+    #: `plane` spelling, kept so every snapshot and `--set share_u=...` still
+    #: means what it meant; the two disagreeing is a LOUD error, not a merge).
+    #:
+    #: * `off` — every expert owns its `gate_u`/`up_u [d, rank]`. Every number
+    #:   on record, and bit-identical to the tree before the flag existed.
+    #: * `plane` — ONE `[d, rank]` per site: all experts project the input onto
+    #:   the SAME `rank`-dimensional plane. At rank 2 the whole bank can only
+    #:   see two directions of a `d`-dim state, which is exactly the weakness
+    #:   this mode's control exists to price.
+    #: * `dict` — ONE `[d, share_u_rank]` DICTIONARY per site, and each expert
+    #:   reads `rank` of its columns (`idx[E, rank]`, fixed and seeded, never
+    #:   learned — see `experts.py`). Two experts then see different
+    #:   `rank`-dimensional subspaces of the same dictionary, which is the one
+    #:   thing a shared plane cannot do at rank 2.
+    #:
+    #: `dict` needs `use_tsct = true` and `factor_qat = "none"` for the same
+    #: reasons `plane` does, plus `share_u_rank > rank` (a width at or past the
+    #: dictionary leaves no subset to choose).
+    share_u_mode: str = "off"
+    #: The `dict` mode's dictionary width `R`. `d*R` parameters per site, shared
+    #: by every routed expert; each expert spends `rank` of its columns. 64 at
+    #: medium (d=1024) is 65 536 parameters against the control's 78.3M bank.
+    share_u_rank: int = 64
     use_engram: bool = True
     use_attnres: bool = False
+    #: mHC (`2512.24880`, DeepSeek 2025): the residual becomes TWO streams
+    #: mixed by a doubly-stochastic (Sinkhorn-projected) matrix, at the LOOP
+    #: BOUNDARY (the paper's K=2 placement, `docs/reviews/mhc-2026-09-30.md`).
+    #: The iso-depth scaling study (`2604.21106`) measures hyperconnections
+    #: raising the recurrence-equivalence exponent φ 0.453 -> 0.646, which is
+    #: exactly the "deeper loops stop paying" wall we hit at iteration 4.
+    #: `false` (the default) leaves the model bit-identical.
+    use_mhc: bool = False
+    #: Lanes. Only K=2 ships: it is the configuration the paper measured and
+    #: the one the review wires; `validate` refuses anything else.
+    mhc_streams: int = 2
     #: LOOM (`2610.01153`, 2026-10-01; scanned in
     #: `docs/research/2026-10-16-new-tech-scan.md` §2.1, whose row names our
     #: own `max_iter 4` / operating depth 2 as exactly the regime that paper
@@ -364,7 +415,25 @@ class ModelConfig:
     n_experts: int = 3
     #: Experts per position. `0` is the DENSE blend (burn's default), `k` is
     #: the sparse top-k dispatch. Above `n_experts` is refused by validate.
+    #: With `moe_topk_mode` != `off` this field is the ARM SWITCH (`> 0` selects
+    #: the routed pass); the per-token width comes from `moe_topk_max` there.
     moe_topk: int = 0
+    #: How many experts each TOKEN runs (`model/adaptive_topk.py`):
+    #: `off` (the default) is the constant `moe_topk` width — every existing run
+    #: and snapshot is bit-identical on it; `entropy` grows the width with the
+    #: router's normalized entropy; `margin` shrinks it with the top-1/top-2
+    #: logit gap. INFERENCE-ONLY: no new parameters and no training path.
+    moe_topk_mode: str = "off"
+    #: The narrow/wide ends of the adaptive width, in experts. `k_min >= 1`,
+    #: `k_min <= k_max <= min(8, n_experts)`; a violation is LOUD at load. Inert
+    #: when `moe_topk_mode = "off"`.
+    moe_topk_min: int = 1
+    moe_topk_max: int = 4
+    #: The confidence window the policy ramps across. `entropy`: normalized
+    #: router entropy in `[0, 1]`; `margin`: the top-1 minus top-2 LOGIT gap in
+    #: logit units. Read only when `moe_topk_mode != "off"`; `lo < hi` is LOUD.
+    moe_entropy_lo: float = 0.2
+    moe_entropy_hi: float = 0.6
     #: Tokens per expert in the capacity-bound permute:
     #: `ceil(capacity * tokens * topk / n_experts)`, never below `topk`.
     #: **`0` = DROPLESS** (2026-10-17): every assignment reaches its expert, so
@@ -536,6 +605,36 @@ class ModelConfig:
     def resolved_quant(self) -> str:
         """The factor format the forward actually runs (`none` → bf16)."""
         return "bf16" if self.quant == "none" else self.quant
+
+    def __post_init__(self) -> None:
+        """Resolve the `share_u` alias — ONE switch, two spellings, never two.
+
+        `share_u = true` IS `share_u_mode = "plane"`: it is the boolean the
+        variable existed as for one day, every `--set share_u=...` and every
+        snapshot on disk spells it that way, and a second mode field must not
+        turn that into a config where two keys disagree about the model. So the
+        alias wins over the default and only a CONFLICTING mode is refused —
+        the resolution happens here, the one place every construction passes
+        (`parse_preset`, `--set` through `dataclasses.replace`, tests).
+        """
+        if self.share_u_mode not in SHARE_U_MODES:
+            loud(
+                f"share_u_mode={self.share_u_mode!r} is not an arm. Known: "
+                f"{list(SHARE_U_MODES)} — `off` is a per-expert `U`, `plane` one "
+                f"basis for the whole bank, `dict` one dictionary plus a "
+                f"per-expert column subset (`experts.py`). Escape: name one of "
+                f"those, or land the mode before the config can lie about it."
+            )
+        if self.share_u:
+            if self.share_u_mode not in ("off", "plane"):
+                loud(
+                    f"share_u=true and share_u_mode={self.share_u_mode!r}: two "
+                    f"switches, two models. `share_u` is the old spelling of "
+                    f"`share_u_mode='plane'`, so it cannot also ask for the shared "
+                    f"dictionary. Escape: drop `share_u` (leave it false) and keep "
+                    f"`share_u_mode`, or set `share_u_mode='plane'`."
+                )
+            self.share_u_mode = "plane"
 
 
 @dataclass
@@ -1068,6 +1167,40 @@ def validate(model: ModelConfig) -> None:
             f"moe_topk={model.moe_topk} > n_experts={model.n_experts}: a top-k "
             f"above the bank is refused, not clamped (clamping is the silent collapse)"
         )
+    if model.moe_topk_mode not in MOE_TOPK_MODES:
+        loud(
+            f"moe_topk_mode={model.moe_topk_mode!r} is not a width policy. Known: "
+            f"{list(MOE_TOPK_MODES)} — `off` the constant `moe_topk` (every number on "
+            f"record), `entropy` the normalized router entropy, `margin` the top-1/"
+            f"top-2 logit gap (model/adaptive_topk.py). Escape: name one of those, or "
+            f"land the policy and its gate BEFORE the config can lie about it."
+        )
+    if not 1 <= model.moe_topk_min <= model.moe_topk_max <= MOE_TOPK_SLOTS_MAX:
+        loud(
+            f"moe_topk_min={model.moe_topk_min} / moe_topk_max={model.moe_topk_max} "
+            f"outside 1 <= min <= max <= {MOE_TOPK_SLOTS_MAX}: the histogram counters "
+            f"and the fused backward's top-k tile stop there, and an inverted window "
+            f"would clamp every token to one end. Escape: the defaults 1/4."
+        )
+    if model.moe_topk_mode != "off":
+        if model.moe_topk <= 0:
+            loud(
+                f"moe_topk_mode={model.moe_topk_mode!r} with moe_topk=0: the adaptive "
+                f"width lives on the ROUTED pass, and 0 is the dense blend (every "
+                f"expert, no router top-k). Escape: moe_topk > 0 — its VALUE selects "
+                f"the arm here, the width comes from moe_topk_max."
+            )
+        if model.moe_topk_max > model.n_experts:
+            loud(
+                f"moe_topk_max={model.moe_topk_max} > n_experts={model.n_experts}: a "
+                f"width above the bank cannot be filled. Escape: k_max <= n_experts."
+            )
+        if not model.moe_entropy_lo < model.moe_entropy_hi:
+            loud(
+                f"moe_entropy_lo={model.moe_entropy_lo} >= moe_entropy_hi="
+                f"{model.moe_entropy_hi} with mode={model.moe_topk_mode!r}: the window "
+                f"would be a step, not a ramp. Escape: lo < hi (defaults 0.2 < 0.6)."
+            )
     if model.moe_capacity < 0.0:
         loud(
             f"moe_capacity={model.moe_capacity} is negative: it is a multiple of the "
@@ -1101,22 +1234,43 @@ def validate(model: ModelConfig) -> None:
         )
     if model.memglu_c0 <= 0.0:
         loud(f"memglu_c0={model.memglu_c0} must be > 0 (an RMS scale, not a sign)")
-    if model.share_u and not model.use_tsct:
+    if model.share_u_mode != "off" and not model.use_tsct:
         loud(
-            "share_u=true with use_tsct=false: the shared basis is a TSCT input "
-            "factor (`u [d, rank]`), and with the projections dense there is no "
-            "factor basis to share — the flag would name a mechanism the model "
-            "does not have. Escape: use_tsct=true, or share_u=false."
+            f"share_u_mode={model.share_u_mode!r} with use_tsct=false: the shared "
+            f"basis is a TSCT input factor (`u [d, rank]`), and with the "
+            f"projections dense there is no factor basis to share — the flag would "
+            f"name a mechanism the model does not have. Escape: use_tsct=true, or "
+            f"share_u_mode='off'."
         )
-    if model.share_u and model.factor_qat != "none":
+    if model.share_u_mode != "off" and model.factor_qat != "none":
         loud(
-            f"share_u=true with factor_qat={model.factor_qat!r}: the shared basis is "
-            f"ONE tensor for the whole bank, so the factor rung's per-expert α has "
-            f"nothing to quantize it against — a quantized shared basis needs its "
-            f"own gate (one α over the dictionary) and a banked-vs-standalone test "
-            f"this arm does not ship. Escape: factor_qat=none with share_u=true, or "
-            f"share_u=false with the rung."
+            f"share_u with factor_qat={model.factor_qat!r} "
+            f"(share_u_mode={model.share_u_mode!r}): the shared basis is ONE tensor "
+            f"for the whole bank, so the factor rung's per-expert α has nothing to "
+            f"quantize it against — a quantized shared basis needs its own gate "
+            f"(one α over the dictionary) and a banked-vs-standalone test this arm "
+            f"does not ship. Escape: factor_qat=none with the shared basis, or "
+            f"share_u_mode='off' with the rung."
         )
+    if model.share_u_mode == "dict":
+        if model.share_u_rank < 2:
+            loud(
+                f"share_u_mode='dict' with share_u_rank={model.share_u_rank}: the "
+                f"dictionary needs at least TWO columns for an expert to read a "
+                f"plane (one column is a single direction, and the two latents "
+                f"would be a rescaling of it). Escape: share_u_rank >= 2, or "
+                f"share_u_mode='plane'."
+            )
+        if model.rank >= model.share_u_rank:
+            loud(
+                f"share_u_mode='dict' with rank={model.rank} >= "
+                f"share_u_rank={model.share_u_rank}: each expert reads `rank` "
+                f"COLUMNS of the dictionary, so a width at (or past) the "
+                f"dictionary leaves no subset to choose and the index could read "
+                f"out of range — every expert would see the whole plane this mode "
+                f"exists to split. Escape: share_u_rank > rank (64 at medium), or "
+                f"share_u_mode='plane'."
+            )
     if model.factor_qat not in FACTOR_QATS:
         loud(
             f"factor_qat={model.factor_qat!r} is not an arm. Known: "
@@ -1220,6 +1374,46 @@ def validate(model: ModelConfig) -> None:
             f"act_group={model.act_group} with act_quant='none' is inert — the "
             f"quantizer is off, so there is no block to group. Escape: set "
             f"act_quant, or leave act_group at 0."
+        )
+    if model.use_mhc:
+        for name, why in (
+            (
+                "use_attnres",
+                "AttnRes replaces the same loop-boundary residual write with a "
+                "softmax mixture over {embedding, body}; two write operators in one "
+                "run would be one experiment with two arms",
+            ),
+            (
+                "loom",
+                "LOOM adds a second, un-A/B'd per-iteration gate to the write "
+                "(2610.01153); an mHC result from that run would be attributable to "
+                "neither mechanism",
+            ),
+            (
+                "use_byteflow",
+                "the channel runs the loop over K patch latents, so the lanes would "
+                "be patch lanes and the placement a different experiment",
+            ),
+        ):
+            if getattr(model, name):
+                loud(
+                    f"use_mhc with {name}=true: {why}. Escape: {name}=false, or "
+                    f"use_mhc=false — mHC's A/B (scripts/ab_mhc.py) runs against "
+                    f"ReZero and nothing else."
+                )
+        if model.mhc_streams != 2:
+            loud(
+                f"mhc_streams={model.mhc_streams}: only K=2 ships. It is the K the "
+                f"φ evidence used (2604.21106 §5.2) and 2409.19606 Tab. 1's knee; "
+                f"mHC's own App. A.1 default of 4 is the named follow-up row, not a "
+                f"shipped rung. Escape: mhc_streams=2, or land the n=4 arm and its "
+                f"gate BEFORE the config can lie about it."
+            )
+    elif model.mhc_streams != 2:
+        loud(
+            f"mhc_streams={model.mhc_streams} with use_mhc=false is inert — the "
+            f"field would name a K no lane carries. Escape: use_mhc=true (K=2), or "
+            f"leave mhc_streams at its default 2."
         )
     if model.use_byteflow:
         _validate_byteflow(model)

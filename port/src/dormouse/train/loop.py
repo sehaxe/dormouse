@@ -73,19 +73,6 @@ def mtp_field(model: torch.nn.Module) -> str:
     return "" if value is None else f"mtp={float(value):.4f}"
 
 
-def halt_field(model: torch.nn.Module) -> str:
-    """`halt=<BCE>` — the halt objective's value, on the log cadence.
-
-    The forward leaves the term DETACHED on the model (`last_halt`) and never
-    reads it; this is the one declared read, once per log window (ADR-0018
-    rule 2 — the same shape as `mtp_field`). Empty when the arm never ran
-    (weight 0, a decode forward, a pure eval): a zero would claim a term that
-    was not added.
-    """
-    value = getattr(model, "last_halt", None)
-    return "" if value is None else f"halt={float(value):.4f}"
-
-
 def ckpt_paths(cfg: TrainConfig) -> tuple[Path, Path]:
     base = Path(cfg.out_dir)
     return base / f"{cfg.ckpt_name}.pt", base / f"{cfg.ckpt_name}.config.toml"
@@ -898,7 +885,6 @@ def train(
                 f"loss={last_loss:.4f}",
                 f"lr={lr:.3e}",
                 kda_field(window),
-                halt_field(model),
                 mtp_field(model),
                 window.line(),
             ]

@@ -12,10 +12,9 @@ move the goalposts. A skipped preflight prints a SKIP banner and no table.
 
 * `control` — the plain byte stack: `use_byteflow=false` at the same geometry,
   so the loop runs over T=512 byte positions. `use_kda=true` (the preset's own
-  arm), `bf16=false`, `use_engram=false` — both arms run fp32 so the A/B
-  compares mechanisms, not dtypes (`bf16` is legal for the net since 2026-10-21,
-  `byteflow.py`'s precision rule; `use_engram=false` is a loud refusal,
-  `config._validate_byteflow`).
+  arm), `bf16=false`, `use_engram=false` — the last two are the loud refusals
+  the byteflow arm carries (`config._validate_byteflow`), and running the control
+  in bf16 against an fp32-only arm would compare dtypes, not mechanisms.
 * `channel` — Option B (`byteflow.py`): `use_byteflow=true` with `use_kda=true`
   arms `BfChannel` (`compat_armed`), the front stage compresses the 512-byte
   window into K=128 patch latents, THIS model's loop runs on the 128 patches,
@@ -25,8 +24,7 @@ move the goalposts. A skipped preflight prints a SKIP banner and no table.
 **The exact legal combinations, and the refusals found** (read off
 `config._validate_byteflow` and `model.DormouseModel`):
 
-* `use_byteflow=true` REFUSES `bf16=true` + `byteflow_logdet=true`,
-  `use_engram=true`, `sigreg_weight>0`,
+* `use_byteflow=true` REFUSES `bf16=true`, `use_engram=true`, `sigreg_weight>0`,
   `dspark_weight>0`, `segment_len>0`, `max_seq_len>byteflow_max_bytes`,
   `byteflow_k_tokens>max_seq_len`, `byteflow_k_tokens<1`, `byteflow_eps2<=0`,
   `byteflow_bins<1`, a width that does not tile its head count, and
