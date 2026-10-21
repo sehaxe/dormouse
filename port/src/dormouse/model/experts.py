@@ -15,6 +15,22 @@ The expert is TSCT2 §14's shape (`docs/reviews/tsct2-design-2026-10-04.md`):
   only into a 64-dim subspace gives too small an `R_act`; §14 answers with a
   shared expert of rank ~192-256 next to routed `r=32-64`).
 
+ONE switch on the routed experts, OFF by default: `share_u` (owner directive
+2026-10-21). The two INPUT bases (`gate_u`, `up_u`, each `[d, rank]`) stop being
+per-expert parameters: `SparseMoE` owns one `[d, rank]` per site and binds it
+into every routed expert, which keeps only its `s` and its write `V`. What the
+bank loses is E interchangeable copies of the same shape; what it keeps is a
+per-expert output direction and scale. That is the shape a rank-2 bank needs —
+with two latent directions per expert, the only thing that can make experts
+differ is a dictionary shared by all of them plus a per-expert write — and it is
+what the `r32s`/`r8s`/`r2s` arms of `scripts/ab_rank.py` measure against a
+per-expert-`U` control (`r64`). `share_u_forward` counts once per forward, so a
+`share_u=true` log with no such field measured a forward that did not run the
+arm. Refused LOUDLY with `factor_qat != "none"` (a shared basis has no
+per-expert α to quantize against — see `_refuse_shared_qat`) and, at the config
+layer, with `use_tsct = false`. Default off is bit-identical: no parameter, no
+draw, no counter.
+
 Dispatch has TWO arms over ONE permute, and the log line says which ran:
 
 * **padded (CUDA, the fast arm)**: gather the kept rows into ONE zero-filled
@@ -136,7 +152,7 @@ from torch.utils.checkpoint import checkpoint
 
 from ..instrument import Counters, loud
 from .act_quant import fake_quant_act
-from .tsct import dense_qat_project, factor_qat_project, mm_mixed
+from .tsct import dense_qat_project, factor_qat_project, init_u, mm_mixed
 
 try:  # the Triton arm is an ABILITY, not a dependency
     from . import moe_kernels
@@ -229,6 +245,27 @@ def _unpack_activation(h: object) -> object:
     return h.t if h.device.type == "cpu" else h.t.to(h.device)
 
 
+def _refuse_shared_qat(factor_qat: str, where: str) -> None:
+    """LOUD: `factor_qat` cannot ride a SHARED `U` — refuse, never silently skip.
+
+    The rung's banked path projects with a per-EXPERT α (`factor_qat_project`'s
+    `dim=(1, 2)` over the `[E, ·, ·]` stack) precisely so a banked expert and the
+    same expert alone quantize identically. A shared `[d, rank]` basis has no
+    per-expert slice: quantizing it would need its OWN gate (one α over the whole
+    dictionary, `dim=None`) and a test that the banked and standalone paths still
+    agree — a mechanism this arm does not ship. So the pair is refused at every
+    construction site (config, `SparseMoE`, `DualLatentGLU`) rather than one of
+    them quietly quantizing the basis the other one reads.
+    """
+    if factor_qat != "none":
+        loud(
+            f"share_u with factor_qat={factor_qat!r} ({where}): the shared basis is "
+            f"ONE tensor for the whole bank, so there is no per-expert scale to "
+            f"quantize it against — quantizing it would need its own gate. Escape: "
+            f"factor_qat=none with share_u=true, or share_u=false with the rung."
+        )
+
+
 class DualLatentGLU(nn.Module):
     """`x [n, d] → [n, f]`: two rank-`r` latents, the GLU at the latent."""
 
@@ -243,6 +280,7 @@ class DualLatentGLU(nn.Module):
         factor_qat_alpha: float = 1.0,
         act_quant: str = "none",
         act_group: int = 0,
+        share_u: bool = False,
         device: torch.device | str = "cpu",
     ) -> None:
         super().__init__()
@@ -250,6 +288,19 @@ class DualLatentGLU(nn.Module):
         self.compute_dtype = dtype
         self.factor_qat = factor_qat
         self.factor_qat_alpha = factor_qat_alpha
+        #: `share_u` (owner directive 2026-10-21): the two INPUT bases are not
+        #: this expert's. The parent `SparseMoE` owns ONE `[d, rank]` per site
+        #: (`gate_u`, `up_u`) and binds it here (`bind_shared_u`); the expert
+        #: keeps `s` (its own latent scale) and `V` (its own write). The bank's
+        #: capacity then lives in a shared dictionary of input directions
+        #: instead of in E interchangeable per-expert copies — the point of the
+        #: arm, since at rank 2 a per-expert basis is just 2 directions of noise
+        #: per expert. Default off = the per-expert basis, and the parameter set
+        #: every snapshot on record carries, unchanged.
+        self.share_u = share_u
+        self._shared_u: tuple[nn.Parameter, nn.Parameter] | None = None
+        if share_u:
+            _refuse_shared_qat(factor_qat, "DualLatentGLU")
         #: The a4.8 ACTIVATION switch (`act_quant.fake_quant_act`): the `x` fed
         #: to this expert's factor matmuls is fake-quantized with an STE. Same
         #: switch the banked path in `SparseMoE` applies to its `x`, so one
@@ -258,13 +309,38 @@ class DualLatentGLU(nn.Module):
         self.act_quant = act_quant
         self.act_group = act_group
         for name in ("gate", "up"):
-            # `U [d, r]` and `s [r]`: the latent half of TSCT's factorization.
-            setattr(
-                self, f"{name}_u", nn.Parameter(torch.randn(d, rank, device=device) / math.sqrt(d))
-            )
+            if not share_u:
+                # `U [d, r]` and `s [r]`: the latent half of TSCT's factorization.
+                setattr(self, f"{name}_u", nn.Parameter(init_u(d, rank, device)))
             setattr(self, f"{name}_s", nn.Parameter(torch.ones(rank, device=device)))
         # The write `V [r, f]` — one, at the latent, after the GLU.
         self.v = nn.Parameter(torch.randn(rank, f, device=device) / math.sqrt(rank))
+
+    def bind_shared_u(self, gate_u: nn.Parameter, up_u: nn.Parameter) -> None:
+        """Take the parent's ONE shared basis — the only way `share_u` gets its `U`s.
+
+        Not a constructor argument on purpose: the tensor is owned by `SparseMoE`
+        (one `nn.Parameter` for the whole bank), so this module must hold a
+        REFERENCE to it, never a copy or a second registration. A `share_u`
+        expert with no binding refuses at `forward` (`_bases`) rather than
+        inventing a basis — a silent private `U` would be a per-expert one
+        wearing the shared arm's name.
+        """
+        assert self.share_u, "bind_shared_u on an expert that owns its own U"
+        self._shared_u = (gate_u, up_u)
+
+    def _bases(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """The forward's `(gate_u, up_u)` — this expert's, or the bank's shared pair."""
+        if not self.share_u:
+            return self.gate_u, self.up_u
+        if self._shared_u is None:
+            loud(
+                "share_u=True and no parent bound the shared basis: an expert that "
+                "owns no `U` and was handed none has nothing to project through. "
+                "Escape: build it under a SparseMoE with share_u on (it binds one "
+                "`[d, rank]` per site), or share_u=false."
+            )
+        return self._shared_u
 
     def forward(self, x: torch.Tensor, glu=None) -> torch.Tensor:
         dt = self.compute_dtype
@@ -273,7 +349,8 @@ class DualLatentGLU(nn.Module):
             # dtype it arrives in (fp32 masters, cast to `dt` after) with an STE.
             x = fake_quant_act(x, self.act_quant, self.act_group)
         xu = x if dt == torch.float32 else x.to(dt)
-        gate_u, up_u, v = self.gate_u, self.up_u, self.v
+        gate_u, up_u = self._bases()
+        v = self.v
         if self.factor_qat != "none":
             # Per-tensor α on a 2-D factor == per-expert α on that expert's
             # slice of the bank (`_banks`'s `dim=(1,2)`), so the naive/shared
@@ -352,6 +429,7 @@ class SparseMoE(nn.Module):
                 factor_qat_alpha=cfg.factor_qat_alpha,
                 act_quant=cfg.act_quant,
                 act_group=cfg.act_group,
+                share_u=cfg.share_u,
                 device=device,
             )
             for _ in range(cfg.n_experts)
@@ -367,6 +445,29 @@ class SparseMoE(nn.Module):
             act_group=cfg.act_group,
             device=device,
         )
+        #: `share_u` (owner directive 2026-10-21): ONE input basis per ROUTED
+        #: site, owned HERE and bound into every routed expert. The vocabulary
+        #: is TSCT's (`u [d, r]`, `s [r]`, `v [r, f]`), so this is the same
+        #: factorization with E per-expert copies of `U` replaced by one shared
+        #: dictionary — the direction the bank's capacity can live in when the
+        #: rank is too small for a private basis to carry anything.
+        #:
+        #: Init is `tsct.init_u` — the same draw a per-expert `u` gets
+        #: (`N(0, 1/sqrt(d))`), so the arm changes HOW MANY copies exist, not
+        #: the scale they start at (a different init would be a second change
+        #: charged to the same A/B).
+        #:
+        #: The ALWAYS-ON shared expert is deliberately NOT bound: it runs at
+        #: `shared_rank`, so a `[d, rank]` basis is the wrong shape for it, and
+        #: it is one expert (E = 1) — there is nothing to share with. Its own
+        #: basis is one copy already.
+        self.share_u = cfg.share_u
+        if self.share_u:
+            _refuse_shared_qat(self.factor_qat, "SparseMoE")
+            self.gate_u = nn.Parameter(init_u(d, cfg.rank, device))
+            self.up_u = nn.Parameter(init_u(d, cfg.rank, device))
+            for e in self.experts:
+                e.bind_shared_u(self.gate_u, self.up_u)
         # The router: ONE 2-D linear on the raw hidden state (not on the
         # latent), softmax over the bank, then top-k + a capacity-bound permute.
         self.router = nn.Linear(d, cfg.n_experts, bias=False, device=device)
@@ -389,6 +490,13 @@ class SparseMoE(nn.Module):
 
     def forward(self, x: torch.Tensor, counters: Counters | None = None) -> torch.Tensor:
         counters = Counters() if counters is None else counters
+        if self.share_u:
+            # The shared-basis arm's evidence line (ADR-0019): `_banks` owns no
+            # counters and the routed / dense arms reach the basis through
+            # different code paths, so the ONE place every forward passes is
+            # here. A `share_u=true` run whose log has no `share_u_forward` did
+            # not run the arm it is labelled with.
+            counters.count("share_u_forward")
         n = x.shape[0]
         assert x.ndim == 2 and x.shape[1] == self.d, f"MoE input {tuple(x.shape)} != [n, {self.d}]"
         dt = self.experts[0].compute_dtype  # the shared compute dtype
@@ -608,17 +716,34 @@ class SparseMoE(nn.Module):
         ordinary inputs, so the compiled region is unchanged; the DECISION is
         unchanged too — the bank still rebuilds whenever the key moves
         (`tests/test_compile_moe.py` pins both halves, CPU and GPU).
+
+        **Under `share_u`** the two input stacks are the SHARED basis
+        materialized E-fold (`_one`), so every arm — padded, grouped GEMMs,
+        reference loop — takes the same `[E, d, r]` operands as before and only
+        the stored parameter count changes. The shared tensors are not inside
+        `self.experts`, so their `_version`s are part of the key explicitly.
         """
         grad = torch.is_grad_enabled()
         # `want` is what the cached bank must carry a graph FOR: a frozen expert
         # bank cannot, and keying on `is_grad_enabled()` alone would rebuild the
         # same untracked stack on every forward of a frozen model.
-        want = grad and self.experts[0].gate_u.requires_grad
+        # `want` is what the cached bank must carry a graph FOR: a frozen expert
+        # bank cannot, and keying on `is_grad_enabled()` alone would rebuild the
+        # same untracked stack on every forward of a frozen model. Under
+        # `share_u` the experts have no `u` of their own, so the shared basis is
+        # the tensor whose grad state the cache must be able to serve.
+        want = grad and (self.gate_u if self.share_u else self.experts[0].gate_u).requires_grad
         key = (
             dt,
             self.factor_qat,
             self.factor_qat_alpha,  # the anneal ramp moves this every step
             tuple(p._version for e in self.experts for p in e.parameters()),
+            # The shared basis is not inside `self.experts`, so its `_version`
+            # is not in the tuple above: without this an optimizer step that
+            # moved ONLY `gate_u`/`up_u` would serve a stale bank. (The trainer's
+            # `invalidate_banks` also covers that, but the cache must not depend
+            # on a caller for its own correctness.)
+            tuple(p._version for p in (self.gate_u, self.up_u)) if self.share_u else (),
             want,
         )
         cached = getattr(self, "_bank_cache", None)
@@ -645,6 +770,15 @@ class SparseMoE(nn.Module):
             # needs). Scales (`gate_s`/`up_s`) are never quantized: they ARE
             # the diag(s) of the factorization.
             def _one(name: str) -> torch.Tensor:
+                if self.share_u and name in ("gate_u", "up_u"):
+                    # The bank's ONE basis, materialized as the [E, d, r] stack
+                    # the arms (and the triton ABI) take. `.contiguous()` is a
+                    # differentiable copy, so the backward sums every expert's
+                    # contribution into the single parameter — which is what
+                    # "the shared U sees every expert that used it" means in
+                    # code. Only the VALUES are E-fold; the parameter is one.
+                    u = getattr(self, name).to(dt)
+                    return u.unsqueeze(0).expand(len(self.experts), -1, -1).contiguous()
                 parts = []
                 for e in self.experts:
                     t = getattr(e, name)
