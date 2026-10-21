@@ -354,7 +354,8 @@ class ModelConfig:
     #: Noise variance ε² of the coding rate, eq. (11).
     byteflow_eps2: float = 0.5
     #: Score the chunker with the EXACT log-det rate instead of Appendix B's
-    #: L2 fast path (the default: pure tensor ops, no host sync).
+    #: L2 fast path (the default: pure tensor ops, no host sync). REFUSED with
+    #: `bf16 = true`: bf16 Cholesky is unstable (`config._validate_byteflow`).
     byteflow_logdet: bool = False
     #: Byte-sequence length the RoPE tables are built for.
     byteflow_max_bytes: int = 8192
@@ -1362,15 +1363,18 @@ def _validate_byteflow(model: ModelConfig) -> None:
                 f"byteflow_{side} width {d} does not divide by its head count {h}: "
                 f"the head split must tile the width. Escape: fix the byteflow_* widths."
             )
-    # fp32 only, and there is no second reading of that: the ported net has no
-    # bf16 path (the crate refuses --bf16 for the same reason — a cast copy
-    # dressed as a dtype).
-    if model.bf16:
+    # bf16 is ALLOWED here: the net runs its matmuls in bf16 with fp32 masters
+    # (`byteflow.py`'s precision rule), the same policy as the loop. The ONE
+    # pair it cannot carry is the exact-rate chunker: a bf16 Cholesky is
+    # unstable, and the default L2 path never enters it.
+    if model.bf16 and model.byteflow_logdet:
         loud(
-            "use_byteflow with bf16=true: the ByteFlow net has no bf16 handling, so the "
-            "flag would either be a cast copy around every projection or a silent fp32 "
-            "run wearing a bf16 label. Escape: `bf16 = false` (the paper's recipe), or "
-            "drop use_byteflow."
+            "bf16 + byteflow_logdet: the exact-rate chunker factorizes "
+            "`I + c·HᵀH` with `torch.linalg.cholesky`, and a bf16 Cholesky is "
+            "unstable — the selection would change on a numerical factorization "
+            "error with no gradient to correct it. Escape: `byteflow_logdet = "
+            "false` (the L2 fast path is the default and is bf16-safe), or "
+            "`bf16 = false`."
         )
     # The channel runs OUR loop on K patch latents, and the memory arm needs a
     # byte position to hash an n-gram from — it has none on that path. Refused

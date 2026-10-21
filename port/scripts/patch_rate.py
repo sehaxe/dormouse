@@ -48,9 +48,10 @@ from dormouse.model.byteflow import bf_for_model
 DATA = "/home/sehaxe/dormouse/data_local/corpus_bin_filtered.bin"
 
 #: The A/B polygon: `small` at d_model 256 / n_heads 4 (4 x 64) with the smoke's
-#: byteflow widths. `bf16=false` and `use_engram=false` are the two loud refusals
-#: the arm carries (`config._validate_byteflow`); `use_kda` stays true so the
-#: channel (Option B) is what gets armed.
+#: byteflow widths. `bf16=false` is the recipe these patch statistics were taken
+#: on (the net runs bf16 since 2026-10-21); `use_engram=false` is a loud refusal
+#: (`config._validate_byteflow`); `use_kda` stays true so the channel (Option B)
+#: is what gets armed.
 GEOM = dict(
     use_byteflow=True,
     use_engram=False,

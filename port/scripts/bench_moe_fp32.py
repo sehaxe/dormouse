@@ -3,7 +3,9 @@
     uv run --extra gpu python scripts/bench_moe_fp32.py
 
 The question is the one `docs/reviews/2026-10-21-battery.md` §5 left open: the
-ByteFlow channel is fp32 (its net refuses bf16), and at fp32 the shipped Triton
+ByteFlow channel ran fp32 when these readings were taken (the net had no bf16
+path then; it has one since 2026-10-21, `byteflow.py`'s precision rule — this
+bench prices the fp32 lane the record was taken on), and at fp32 the shipped Triton
 grouped GEMM asked for **196608 B** of shared memory against this card's
 **101376 B** — so that arm ran `moe_kernel=naive`, 37x slower than the grouped
 GEMM. `moe_kernels.tiles_for` now halves the wide tiles and runs one pipeline
@@ -108,7 +110,7 @@ def main() -> int:
         n_experts=E,
         moe_topk=TOPK,
         moe_capacity=CAPACITY,
-        bf16=False,  # the ByteFlow net's dtype, and the arm this bench is about
+        bf16=False,  # the fp32 lane these readings are about (the net also runs bf16 now)
         use_engram=False,
     )
     moe = SparseMoE(cfg, device=DEV)

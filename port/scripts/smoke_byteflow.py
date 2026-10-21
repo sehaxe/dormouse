@@ -14,9 +14,10 @@ reported separately).
 The resolved config is `small` with the byteflow geometry named explicitly: the
 crate's defaults are BFlowNet-600M (d_local 512, K 3200), so a smoke names its
 own widths and prints every override. Nothing else about the run is hidden —
-`bf16=false` because the byteflow arm is fp32 by construction, `use_engram=false`
-because the memory arm has no byte position to hash on the patch path (both are
-loud refusals in `config.validate`).
+`bf16=false` pins the fp32 recipe this smoke's earlier step times were taken on
+(the net runs bf16 since 2026-10-21, `byteflow.py`'s precision rule), and
+`use_engram=false` because the memory arm has no byte position to hash on the
+patch path (a loud refusal in `config.validate`).
 
 Machine discipline first (AGENTS §1.5): no other `train` process alive, and the
 card holding < 1 GiB before the first kernel.
