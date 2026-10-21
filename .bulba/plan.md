@@ -206,6 +206,22 @@ testable and A/B-able (ADR-0017).
       scratch revert. `port/scripts/bench_qat_cost.py` now prints bf16 /
       per-tensor / stacked ms/step and the launch counts — written, **NOT run**
       (card busy): **NO TIMING EXISTS** for the stacked path. Landed 2026-10-21.
+- [x] P-LAUNCH. port (Python): measure the launches behind the b8-s512 3.55x
+      per-byte gap, and gate the two legal levers. `scripts/launch_profile.py`
+      profiles ONE full medium step (bf16 and ternary): `cudaLaunchKernel`
+      count, executed-kernel phase split (seam annotations for kda/fla, moe,
+      qat refresh, clip, optimizer; name fallback for the rest), GPU-busy union
+      vs wall, top-15 by count and by time. `scripts/compile_retry.py` re-runs
+      `torch.compile(dynamic=False|True)` after the `@torch.compiler.disable`
+      fix, 20 steps, and exits 1 on >20 captured graphs or a `recompile_limit`
+      fallback. `docs/reviews/2026-10-21-launch-bound.md` states why a full-step
+      graph needs the padded arm (dropless `offs` is data-dependent), prices the
+      cap 2.0 77.4% / cap 64 + LFB 3.8% drop trade, proposes padded cap 64 +
+      LFB + graph vs dropless + eager (3 seeds, BPB + ms/step), and lists the
+      prerequisites in landing order. `scripts/bench_shape.py` is the ternary
+      shape x throughput x eval-window table. All three preflight and print
+      SKIP on a busy card; the card was busy, so **NO TIMING EXISTS**. Landed
+      2026-10-21.
 - [x] D1. `docs: retract the false step-time and verification claims` (prose only,
       no Rust). **Landed 2026-09-29.** Withdrawn without replacement, because the
       corrected value is not known: the 25.8 s/step batch-8 figure (no committed
