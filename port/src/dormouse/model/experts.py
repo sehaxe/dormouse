@@ -15,6 +15,22 @@ The expert is TSCT2 §14's shape (`docs/reviews/tsct2-design-2026-10-04.md`):
   only into a 64-dim subspace gives too small an `R_act`; §14 answers with a
   shared expert of rank ~192-256 next to routed `r=32-64`).
 
+ONE switch on the routed experts, OFF by default: `share_u` (owner directive
+2026-10-21). The two INPUT bases (`gate_u`, `up_u`, each `[d, rank]`) stop being
+per-expert parameters: `SparseMoE` owns one `[d, rank]` per site and binds it
+into every routed expert, which keeps only its `s` and its write `V`. What the
+bank loses is E interchangeable copies of the same shape; what it keeps is a
+per-expert output direction and scale. That is the shape a rank-2 bank needs —
+with two latent directions per expert, the only thing that can make experts
+differ is a dictionary shared by all of them plus a per-expert write — and it is
+what the `r32s`/`r8s`/`r2s` arms of `scripts/ab_rank.py` measure against a
+per-expert-`U` control (`r64`). `share_u_forward` counts once per forward, so a
+`share_u=true` log with no such field measured a forward that did not run the
+arm. Refused LOUDLY with `factor_qat != "none"` (a shared basis has no
+per-expert α to quantize against — see `_refuse_shared_qat`) and, at the config
+layer, with `use_tsct = false`. Default off is bit-identical: no parameter, no
+draw, no counter.
+
 Dispatch has TWO arms over ONE permute, and the log line says which ran:
 
 * **padded (CUDA, the fast arm)**: gather the kept rows into ONE zero-filled
@@ -31,8 +47,13 @@ Dispatch has TWO arms over ONE permute, and the log line says which ran:
   GLU fused into the second GEMM's input. `ModelConfig.moe_kernel` picks it and
   is the A/B kill-switch (`docs/research/2026-10-15-tsct-super-kernel.md` §5.5:
   expert-kernel verdicts come from isolated-pass benches, then the full step);
-  when the kernel cannot run (no triton, not CUDA) the padded arm runs instead
-  and `moe_triton_fallback` + the reason say so.
+  when the kernel cannot run (no triton, not CUDA, a tile set the device cannot
+  hold) the padded arm runs instead and `moe_triton_fallback` + the reason say
+  so. The tile is DTYPE-AWARE (`moe_kernels.tiles_for`): fp32 halves the wide
+  tiles and drops the pipeline to one stage, so the fp32 ByteFlow arm — which
+  used to need 196608 B against a 101376 B ceiling and therefore ran the naive
+  loop — takes the grouped GEMM. A set that still cannot fit is COUNTED with its
+  byte numbers (`fp32 tile BLOCK_N=… needs … bytes > …`), never a silent switch.
   Its BACKWARD is FUSED by default (`fused_bwd=True`, `_triton_dispatch`): the
   scatter is `moe_kernels.combine` (one Triton kernel for both the `[R]`
   router-weight gradient and the expert adjoint — the OLMo-core combine-backward
@@ -49,6 +70,20 @@ Dispatch has TWO arms over ONE permute, and the log line says which ran:
   matmul → scatter over a capacity-bound permute. The day-one implementation,
   kept because it is what the padded arm is compared against — the same rows,
   the same capacity rule, the same drop counter.
+
+ONE more switch on the routed pass, OFF by default: the **adaptive width**
+(`moe_topk_mode`, `model/adaptive_topk.py`, 2026-10-21). `off` is the constant
+`moe_topk` width every number on record runs and the module never calls the
+policy at all; `entropy`/`margin` choose a per-token `k` in
+`[moe_topk_min, moe_topk_max]` from the router logits alone (`off` = control).
+The routed branch then masks the raised logits past each row's own `k`, keeps
+`k_max` slots and gives the unused ones weight 0 — the experts, the permute and
+the capacity rule are unchanged. A zero-weight slot is NOT an assignment: the
+permute puts it in a sentinel group past the bank so it consumes no expert's
+capacity and is dropped before any expert runs (`_permute`'s `valid`), which is
+what makes the average width the compute that actually happens on the ragged
+arms. Counters: `moe_k1`..`moe_k{max}` (per-token histogram, device
+accumulators) and `moe_k_mean_x100` (the mean width × 100, an INT).
 
 All three count: `moe_padded_bmm`, `moe_triton_gemm` or `moe_naive_dispatch`
 (with the reason attached to the counter object) on the step's counter line, so
@@ -136,8 +171,9 @@ from torch.utils.checkpoint import checkpoint
 
 from ..instrument import Counters, loud
 from .act_quant import fake_quant_act
+from .adaptive_topk import check_policy, choose_k, select_topk
 from .qat_cache import QuantCache
-from .tsct import dense_qat_project, factor_qat_project, mm_mixed
+from .tsct import dense_qat_project, factor_qat_project, init_u, mm_mixed
 
 try:  # the Triton arm is an ABILITY, not a dependency
     from . import moe_kernels
@@ -230,6 +266,27 @@ def _unpack_activation(h: object) -> object:
     return h.t if h.device.type == "cpu" else h.t.to(h.device)
 
 
+def _refuse_shared_qat(factor_qat: str, where: str) -> None:
+    """LOUD: `factor_qat` cannot ride a SHARED `U` — refuse, never silently skip.
+
+    The rung's banked path projects with a per-EXPERT α (`factor_qat_project`'s
+    `dim=(1, 2)` over the `[E, ·, ·]` stack) precisely so a banked expert and the
+    same expert alone quantize identically. A shared `[d, rank]` basis has no
+    per-expert slice: quantizing it would need its OWN gate (one α over the whole
+    dictionary, `dim=None`) and a test that the banked and standalone paths still
+    agree — a mechanism this arm does not ship. So the pair is refused at every
+    construction site (config, `SparseMoE`, `DualLatentGLU`) rather than one of
+    them quietly quantizing the basis the other one reads.
+    """
+    if factor_qat != "none":
+        loud(
+            f"share_u with factor_qat={factor_qat!r} ({where}): the shared basis is "
+            f"ONE tensor for the whole bank, so there is no per-expert scale to "
+            f"quantize it against — quantizing it would need its own gate. Escape: "
+            f"factor_qat=none with share_u=true, or share_u=false with the rung."
+        )
+
+
 class DualLatentGLU(nn.Module):
     """`x [n, d] → [n, f]`: two rank-`r` latents, the GLU at the latent."""
 
@@ -244,6 +301,7 @@ class DualLatentGLU(nn.Module):
         factor_qat_alpha: float = 1.0,
         act_quant: str = "none",
         act_group: int = 0,
+        share_u: bool = False,
         device: torch.device | str = "cpu",
     ) -> None:
         super().__init__()
@@ -255,6 +313,19 @@ class DualLatentGLU(nn.Module):
         #: expert's three factors on the naive/shared path. The BANKED path
         #: keeps its own per-step cache (`SparseMoE._banks`), so the two agree.
         self._qat_cache = QuantCache() if factor_qat != "none" else None
+        #: `share_u` (owner directive 2026-10-21): the two INPUT bases are not
+        #: this expert's. The parent `SparseMoE` owns ONE `[d, rank]` per site
+        #: (`gate_u`, `up_u`) and binds it here (`bind_shared_u`); the expert
+        #: keeps `s` (its own latent scale) and `V` (its own write). The bank's
+        #: capacity then lives in a shared dictionary of input directions
+        #: instead of in E interchangeable per-expert copies — the point of the
+        #: arm, since at rank 2 a per-expert basis is just 2 directions of noise
+        #: per expert. Default off = the per-expert basis, and the parameter set
+        #: every snapshot on record carries, unchanged.
+        self.share_u = share_u
+        self._shared_u: tuple[nn.Parameter, nn.Parameter] | None = None
+        if share_u:
+            _refuse_shared_qat(factor_qat, "DualLatentGLU")
         #: The a4.8 ACTIVATION switch (`act_quant.fake_quant_act`): the `x` fed
         #: to this expert's factor matmuls is fake-quantized with an STE. Same
         #: switch the banked path in `SparseMoE` applies to its `x`, so one
@@ -263,13 +334,38 @@ class DualLatentGLU(nn.Module):
         self.act_quant = act_quant
         self.act_group = act_group
         for name in ("gate", "up"):
-            # `U [d, r]` and `s [r]`: the latent half of TSCT's factorization.
-            setattr(
-                self, f"{name}_u", nn.Parameter(torch.randn(d, rank, device=device) / math.sqrt(d))
-            )
+            if not share_u:
+                # `U [d, r]` and `s [r]`: the latent half of TSCT's factorization.
+                setattr(self, f"{name}_u", nn.Parameter(init_u(d, rank, device)))
             setattr(self, f"{name}_s", nn.Parameter(torch.ones(rank, device=device)))
         # The write `V [r, f]` — one, at the latent, after the GLU.
         self.v = nn.Parameter(torch.randn(rank, f, device=device) / math.sqrt(rank))
+
+    def bind_shared_u(self, gate_u: nn.Parameter, up_u: nn.Parameter) -> None:
+        """Take the parent's ONE shared basis — the only way `share_u` gets its `U`s.
+
+        Not a constructor argument on purpose: the tensor is owned by `SparseMoE`
+        (one `nn.Parameter` for the whole bank), so this module must hold a
+        REFERENCE to it, never a copy or a second registration. A `share_u`
+        expert with no binding refuses at `forward` (`_bases`) rather than
+        inventing a basis — a silent private `U` would be a per-expert one
+        wearing the shared arm's name.
+        """
+        assert self.share_u, "bind_shared_u on an expert that owns its own U"
+        self._shared_u = (gate_u, up_u)
+
+    def _bases(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """The forward's `(gate_u, up_u)` — this expert's, or the bank's shared pair."""
+        if not self.share_u:
+            return self.gate_u, self.up_u
+        if self._shared_u is None:
+            loud(
+                "share_u=True and no parent bound the shared basis: an expert that "
+                "owns no `U` and was handed none has nothing to project through. "
+                "Escape: build it under a SparseMoE with share_u on (it binds one "
+                "`[d, rank]` per site), or share_u=false."
+            )
+        return self._shared_u
 
     def forward(self, x: torch.Tensor, glu=None) -> torch.Tensor:
         dt = self.compute_dtype
@@ -278,7 +374,8 @@ class DualLatentGLU(nn.Module):
             # dtype it arrives in (fp32 masters, cast to `dt` after) with an STE.
             x = fake_quant_act(x, self.act_quant, self.act_group)
         xu = x if dt == torch.float32 else x.to(dt)
-        gate_u, up_u, v = self.gate_u, self.up_u, self.v
+        gate_u, up_u = self._bases()
+        v = self.v
         if self.factor_qat != "none":
             # Per-tensor α on a 2-D factor == per-expert α on that expert's
             # slice of the bank (`_banks`'s `dim=(1,2)`), so the naive/shared
@@ -310,6 +407,29 @@ class SparseMoE(nn.Module):
         self.d, self.f = d, f
         self.n_experts = cfg.n_experts
         self.topk = cfg.moe_topk
+        #: The adaptive width (`model/adaptive_topk.py`): `off` is the constant
+        #: `topk` above; a non-off mode runs the routed pass with `topk_max`
+        #: slots of which each token activates its own `k`. The checks run HERE
+        #: too because a hand-built config reaches this module without passing
+        #: the loader — a bad policy is LOUD either way (ADR-0011).
+        self.topk_mode = cfg.moe_topk_mode
+        self.topk_min = cfg.moe_topk_min
+        self.topk_max = cfg.moe_topk_max
+        self.entropy_lo = cfg.moe_entropy_lo
+        self.entropy_hi = cfg.moe_entropy_hi
+        check_policy(self.topk_mode, self.topk_min, self.topk_max)
+        if self.topk_mode != "off":
+            if self.topk <= 0:
+                loud(
+                    f"moe_topk_mode={self.topk_mode!r} with moe_topk=0: the adaptive "
+                    f"width lives on the ROUTED pass, and 0 is the dense blend. "
+                    f"Escape: moe_topk > 0 (the width comes from moe_topk_max)."
+                )
+            if self.topk_max > self.n_experts:
+                loud(
+                    f"moe_topk_max={self.topk_max} > n_experts={self.n_experts}: a "
+                    f"width above the bank cannot be filled. Escape: k_max <= n_experts."
+                )
         self.capacity = cfg.moe_capacity
         self.moe_kernel = cfg.moe_kernel
         self.moe_offload = cfg.moe_offload
@@ -362,6 +482,7 @@ class SparseMoE(nn.Module):
                 factor_qat_alpha=cfg.factor_qat_alpha,
                 act_quant=cfg.act_quant,
                 act_group=cfg.act_group,
+                share_u=cfg.share_u,
                 device=device,
             )
             for _ in range(cfg.n_experts)
@@ -377,6 +498,29 @@ class SparseMoE(nn.Module):
             act_group=cfg.act_group,
             device=device,
         )
+        #: `share_u` (owner directive 2026-10-21): ONE input basis per ROUTED
+        #: site, owned HERE and bound into every routed expert. The vocabulary
+        #: is TSCT's (`u [d, r]`, `s [r]`, `v [r, f]`), so this is the same
+        #: factorization with E per-expert copies of `U` replaced by one shared
+        #: dictionary — the direction the bank's capacity can live in when the
+        #: rank is too small for a private basis to carry anything.
+        #:
+        #: Init is `tsct.init_u` — the same draw a per-expert `u` gets
+        #: (`N(0, 1/sqrt(d))`), so the arm changes HOW MANY copies exist, not
+        #: the scale they start at (a different init would be a second change
+        #: charged to the same A/B).
+        #:
+        #: The ALWAYS-ON shared expert is deliberately NOT bound: it runs at
+        #: `shared_rank`, so a `[d, rank]` basis is the wrong shape for it, and
+        #: it is one expert (E = 1) — there is nothing to share with. Its own
+        #: basis is one copy already.
+        self.share_u = cfg.share_u
+        if self.share_u:
+            _refuse_shared_qat(self.factor_qat, "SparseMoE")
+            self.gate_u = nn.Parameter(init_u(d, cfg.rank, device))
+            self.up_u = nn.Parameter(init_u(d, cfg.rank, device))
+            for e in self.experts:
+                e.bind_shared_u(self.gate_u, self.up_u)
         # The router: ONE 2-D linear on the raw hidden state (not on the
         # latent), softmax over the bank, then top-k + a capacity-bound permute.
         self.router = nn.Linear(d, cfg.n_experts, bias=False, device=device)
@@ -399,6 +543,13 @@ class SparseMoE(nn.Module):
 
     def forward(self, x: torch.Tensor, counters: Counters | None = None) -> torch.Tensor:
         counters = Counters() if counters is None else counters
+        if self.share_u:
+            # The shared-basis arm's evidence line (ADR-0019): `_banks` owns no
+            # counters and the routed / dense arms reach the basis through
+            # different code paths, so the ONE place every forward passes is
+            # here. A `share_u=true` run whose log has no `share_u_forward` did
+            # not run the arm it is labelled with.
+            counters.count("share_u_forward")
         n = x.shape[0]
         assert x.ndim == 2 and x.shape[1] == self.d, f"MoE input {tuple(x.shape)} != [n, {self.d}]"
         dt = self.experts[0].compute_dtype  # the shared compute dtype
@@ -467,9 +618,32 @@ class SparseMoE(nn.Module):
             # stays the honest prob from the UNbiased softmax (the bias
             # steers selection, never magnitude).
             raised = logits + self.lfb_bias
-            index = raised.topk(self.topk, dim=-1).indices
-            weight = torch.gather(probs, 1, index)
-            self._lfb_step(index, counters)
+            if self.topk_mode == "off":
+                # The control, unchanged: ONE global width, no policy call at all
+                # (the off-arm bit-parity gate pins this branch against a digest
+                # measured before the policy existed).
+                index = raised.topk(self.topk, dim=-1).indices
+                weight = torch.gather(probs, 1, index)
+                self._lfb_step(index, counters)
+            else:
+                # The adaptive width: the policy sees the UNbiased logits (the
+                # bias steers selection, never the confidence that picks k), the
+                # mask is applied to the RAISED scores so LFB still selects, and
+                # the weights come from the unbiased softmax, zeroed on the
+                # padding slots.
+                k = choose_k(
+                    logits,
+                    mode=self.topk_mode,
+                    k_min=self.topk_min,
+                    k_max=self.topk_max,
+                    entropy_lo=self.entropy_lo,
+                    entropy_hi=self.entropy_hi,
+                )
+                index, active = select_topk(raised, k, self.topk_max)
+                self._k_counters(k, counters)
+                # LFB reads REAL assignments: a weight-0 padding slot is not a load.
+                self._lfb_step(index[active], counters)
+                weight = torch.gather(probs, 1, index) * active.to(probs.dtype)
             # Renormalized (burn's `topk_blend`): a top-1 token's gate is
             # exactly 1.0, so the sparse arm and the dense control run at the
             # same output magnitude — the A/B compares specialization, not scale.
@@ -509,6 +683,19 @@ class SparseMoE(nn.Module):
             self.lfb_bias.sub_(self.lfb_coef * torch.sign(self.lfb_counts - self.lfb_counts.mean()))
         counters.count("moe_lfb_updates")
 
+    def _k_counters(self, k: torch.Tensor, counters: Counters) -> None:
+        """Per-token width histogram + mean, DEVICE accumulators (no host read).
+
+        `moe_k{i}` is how many tokens ran exactly `i` experts; the histogram
+        sums to the routed token count (the gate). `moe_k_mean_x100` is the
+        mean width × 100 as an INT — the instrument counts integers, and an int
+        counter cannot drift or print `2.0000000001`. Both live on the device
+        lane and are drained once on the log cadence (`Counters.count_device`).
+        """
+        for width in range(self.topk_min, self.topk_max + 1):
+            counters.count_device(f"moe_k{width}", (k == width).sum())
+        counters.count_device("moe_k_mean_x100", (k.sum() * 100) // k.numel())
+
     def _capacity(self, n: int, k: int) -> int:
         """The routing capacity rule, in ONE place: `max(k, ceil(capacity·n·k/E))`.
 
@@ -527,7 +714,9 @@ class SparseMoE(nn.Module):
         )
         return max(k, math.ceil(self.capacity * n * k / self.n_experts))
 
-    def _permute(self, index: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _permute(
+        self, index: torch.Tensor, valid: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """The routing permute: `(order, keep, dropped)` — one place, both arms.
 
         Both arms are permuted by the SAME rows and drop the SAME ones, which is
@@ -538,23 +727,45 @@ class SparseMoE(nn.Module):
         of exactly two places that blocked torch.compile(dynamic) in the
         arm-level probe (the other is the drain cadence itself, instrument.py).
 
-        `moe_capacity = 0` (dropless) keeps EVERY row: `keep` is all-True and
-        `dropped` is 0, so the ragged arms see the full assignment set. That is
-        what makes the drop set independent of the window's composition, and it
-        is the whole reason this mode exists (module docstring).
+        `valid` is the adaptive width's slot mask (`[n, k]`, True = a real
+        assignment). A False slot is PADDING, not a droppable assignment: it is
+        moved to a sentinel expert id PAST the bank (`self.n_experts`), where it
+        sorts last, occupies no expert's capacity and is never kept — so the
+        real assignments of a token see the same `pos` they would if the width
+        had been its own `k`, and `dropped` counts only real rows. `valid=None`
+        is the constant-width path, unchanged (`masked_fill` is not even built).
+
+        `moe_capacity = 0` (dropless) keeps EVERY real row: `keep_cap` is all-True
+        and `dropped` is 0, so the ragged arms see the full assignment set. That
+        is what makes the drop set independent of the window's composition, and
+        it is the whole reason this mode exists (module docstring).
         """
         n, k = index.shape
         flat_ids = index.reshape(-1)
-        order = torch.argsort(flat_ids, stable=True)
-        sorted_ids = flat_ids[order]
-        counts = torch.bincount(sorted_ids, minlength=self.n_experts)
+        if valid is None:
+            active = None
+            safe = flat_ids
+            groups = self.n_experts
+        else:
+            active = valid.reshape(-1).to(torch.bool)
+            safe = flat_ids.masked_fill(~active, self.n_experts)
+            groups = self.n_experts + 1
+        order = torch.argsort(safe, stable=True)
+        sorted_ids = safe[order]
+        counts = torch.bincount(sorted_ids, minlength=groups)
         offsets = torch.cumsum(counts, 0) - counts
         pos = torch.arange(n * k, device=index.device) - offsets[sorted_ids]
         if self.capacity == 0:
-            keep = torch.ones_like(pos, dtype=torch.bool)
+            keep_cap = torch.ones_like(pos, dtype=torch.bool)
         else:
-            keep = pos < self._capacity(n, k)
-        dropped = (~keep).sum().view(())
+            keep_cap = pos < self._capacity(n, k)
+        if active is None:
+            keep = keep_cap
+            dropped = (~keep).sum().view(())
+        else:
+            active_sorted = active[order]
+            keep = keep_cap & active_sorted
+            dropped = (active_sorted & ~keep_cap).sum().view(())
         return order, keep, dropped
 
     def _padded_reason(self, x: torch.Tensor) -> str | None:
@@ -628,17 +839,31 @@ class SparseMoE(nn.Module):
         ordinary inputs, so the compiled region is unchanged; the DECISION is
         unchanged too — the bank still rebuilds whenever the key moves
         (`tests/test_compile_moe.py` pins both halves, CPU and GPU).
+
+        **Under `share_u`** the two input stacks are the SHARED basis
+        materialized E-fold (`_one`), so every arm — padded, grouped GEMMs,
+        reference loop — takes the same `[E, d, r]` operands as before and only
+        the stored parameter count changes. The shared tensors are not inside
+        `self.experts`, so their `_version`s are part of the key explicitly.
         """
         grad = torch.is_grad_enabled()
         # `want` is what the cached bank must carry a graph FOR: a frozen expert
         # bank cannot, and keying on `is_grad_enabled()` alone would rebuild the
-        # same untracked stack on every forward of a frozen model.
-        want = grad and self.experts[0].gate_u.requires_grad
+        # same untracked stack on every forward of a frozen model. Under
+        # `share_u` the experts have no `u` of their own, so the shared basis is
+        # the tensor whose grad state the cache must be able to serve.
+        want = grad and (self.gate_u if self.share_u else self.experts[0].gate_u).requires_grad
         key = (
             dt,
             self.factor_qat,
             self.factor_qat_alpha,  # the anneal ramp moves this every step
             tuple(p._version for e in self.experts for p in e.parameters()),
+            # The shared basis is not inside `self.experts`, so its `_version`
+            # is not in the tuple above: without this an optimizer step that
+            # moved ONLY `gate_u`/`up_u` would serve a stale bank. (The trainer's
+            # `invalidate_banks` also covers that, but the cache must not depend
+            # on a caller for its own correctness.)
+            tuple(p._version for p in (self.gate_u, self.up_u)) if self.share_u else (),
             want,
         )
         cached = getattr(self, "_bank_cache", None)
@@ -665,6 +890,15 @@ class SparseMoE(nn.Module):
             # needs). Scales (`gate_s`/`up_s`) are never quantized: they ARE
             # the diag(s) of the factorization.
             def _one(name: str) -> torch.Tensor:
+                if self.share_u and name in ("gate_u", "up_u"):
+                    # The bank's ONE basis, materialized as the [E, d, r] stack
+                    # the arms (and the triton ABI) take. `.contiguous()` is a
+                    # differentiable copy, so the backward sums every expert's
+                    # contribution into the single parameter — which is what
+                    # "the shared U sees every expert that used it" means in
+                    # code. Only the VALUES are E-fold; the parameter is one.
+                    u = getattr(self, name).to(dt)
+                    return u.unsqueeze(0).expand(len(self.experts), -1, -1).contiguous()
                 parts = []
                 for e in self.experts:
                     t = getattr(e, name)
@@ -726,10 +960,19 @@ class SparseMoE(nn.Module):
         dt = self._bank_dtype()
         flat_w = weight.reshape(-1)
         flat_e = index.reshape(-1)
+        if self.topk_mode == "off":
+            counts = torch.bincount(flat_e, minlength=e)
+        else:
+            # The adaptive width's padding slots go to the SAME sentinel group
+            # `_permute` used, or `pos` here would count them and disagree with
+            # the permute's `keep` about which padded slot a real row owns
+            # (a mismatch is an out-of-bounds `index_put`). The sentinel rows are
+            # never kept, so their (large) slot numbers are computed, not used.
+            flat_e = flat_e.masked_fill(~(weight > 0).reshape(-1), e)
+            counts = torch.bincount(flat_e, minlength=e + 1)
         rows = order[keep]  # flat (token, slot) pairs that survive the cap
         owner = rows // k  # the token each kept row belongs to
         # The padded-bank slot of each sorted row: expert-major, capacity-padded.
-        counts = torch.bincount(flat_e, minlength=e)
         starts = torch.cumsum(counts, 0) - counts
         pos = torch.arange(n * k, device=index.device) - starts[flat_e[order]]
         kept_slots = (flat_e[order] * cap + pos)[keep]
@@ -834,8 +1077,15 @@ class SparseMoE(nn.Module):
         host read-back of `offs` (ADR-0018 rule 2). `_dropless_dispatch` owns
         that route and its counters (`moe_dropless`, `moe_triton_gemm`, or
         `moe_naive_dispatch` + the reason when the kernel cannot serve the call).
+
+        A zero router weight is an adaptive-width PADDING SLOT, not a dropped
+        assignment: it must not consume capacity (a padding row that keeps a real
+        row out would make the adaptive arm drop more than its own k) and it must
+        not be gathered into an expert bank. The constant-width arm passes `None`
+        — the pre-policy path, bit for bit.
         """
-        order, keep, dropped = self._permute(index)
+        valid = None if self.topk_mode == "off" else weight > 0
+        order, keep, dropped = self._permute(index, valid)
         # Count EVERY call: a python `if dropped:` on the device tensor is
         # exactly the sync this counter exists to prevent (caught by the
         # drop-parity test when the tensor stopped being an int). A zero add
@@ -962,12 +1212,19 @@ class SparseMoE(nn.Module):
         """`None` if the unpadded grouped GEMM can run THIS call, else why not.
 
         The arm is unpadded by construction (`offs` carries the ragged bounds),
-        so the only things that can stop it are the ability itself (no triton,
-        no CUDA) — both COUNTED, never silent. The shapes need no gate: every
-        dimension is masked in-kernel, and the op asserts what it cannot do.
+        so the gates are the ability itself (no triton, no CUDA) and the TILE:
+        `moe_kernels.tile_reason` estimates the CTA shared memory of the widest
+        kernel from the tile constants and the compute dtype. A set that does
+        not fit is COUNTED with its numbers instead of dying at launch — that is
+        what `196608 B > 101376` on the fp32 ByteFlow arm used to do, and why
+        that arm ran `moe_kernel=naive`. `moe_kernels.tiles_for` now halves the
+        wide tiles at four bytes, so the fp32 shape fits and no fallback fires.
         """
         if _TRITON_WHY is not None:
             return _TRITON_WHY
+        why = moe_kernels.tile_reason(self._bank_dtype(), self.d, self.f, self.experts[0].rank)
+        if why is not None:
+            return why
         if not x.is_cuda:
             return f"input is on {x.device.type}: the grouped GEMM is the CUDA path"
         return None

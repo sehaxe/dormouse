@@ -67,6 +67,7 @@ from ..config import RunConfig, rl_config
 from ..instrument import Counters, LoudError, loud
 from ..model import DormouseModel
 from ..model.engram import enable_host_tables, host_engrams, host_step_all
+from ..model.qat_cache import invalidate_qat_cache_all
 from ..train.loop import kda_field, load_ckpt, load_model_state, save_ckpt, unpack_state_dict
 from ..train.optim import MixOptimizer, clip_grads
 from .rl import RLConfig, Sample, group_rewards, group_stats, reward, rl_advantages, rl_step
@@ -297,6 +298,10 @@ def rl_train(
             if cfg.grad_clip > 0:
                 clip_grads(model.parameters(), cfg.grad_clip)
             opt.step()
+            # The same per-step QAT-cache invalidation `train()`/`sft_train()`
+            # run: a graph replay moves a parameter's value without bumping
+            # `_version`, and the projection cache must not outlive the step.
+            invalidate_qat_cache_all(model)
             if cfg.engram_ram:
                 # Once per TRAINING step, after the optimizer — the same rule and
                 # counters as `train()`/`sft_train()`.

@@ -320,14 +320,36 @@ def quantize_act(x: torch.Tensor, fmt: str, group: int = 0) -> torch.Tensor:
     return xq.to(x.dtype)
 
 
+class _ActQuantSTE(torch.autograd.Function):
+    """Forward = the dequantized value, backward = identity, in ONE pass.
+
+    The plain-tensor spelling `x + (xq - x).detach()` spends two elementwise
+    kernels (a sub and an add over the whole activation) to attach a gradient
+    that is just the incoming one. This Function returns `xq` itself — the exact
+    `quantize_act` value, bit for bit — and hands the gradient straight back, so
+    the two passes disappear and the values do not move (the same STE contract:
+    forward quantized, backward identity, `act_quant.rs:103-104`).
+    """
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, fmt: str, group: int) -> torch.Tensor:
+        return quantize_act(x.detach(), fmt, group)
+
+    @staticmethod
+    def backward(ctx, grad: torch.Tensor) -> tuple[torch.Tensor, None, None]:
+        return grad, None, None
+
+
 def fake_quant_act(x: torch.Tensor, fmt: str, group: int = 0) -> torch.Tensor:
-    """`x + (quantize_act(x) − x).detach()` — the STE the forward runs.
+    """`x + (quantize_act(x) − x).detach()` as ONE pass — the STE the forward runs.
 
     Forward sees the quantized value; backward is the identity, so the fp32
     masters keep a gradient (`round` has none, `act_quant.rs:103-104`).
+    [`_ActQuantSTE`] is the one-pass form: same values as `quantize_act`, same
+    identity gradient, without the sub+add residual materialization.
 
     The `_OWN_GRID_FORMATS` are handed through WITHOUT this wrap: their module
-    already returns its own STE'd tensor (its last line is exactly this
+    already returns its own STE'd tensor (its last line is exactly the residual
     expression), and wrapping it twice would compute the same value while
     hiding which layer owns the estimator. One STE, one place.
     """
@@ -335,5 +357,4 @@ def fake_quant_act(x: torch.Tensor, fmt: str, group: int = 0) -> torch.Tensor:
         return x
     if fmt in _OWN_GRID_FORMATS:
         return quantize_act(x, fmt, group)
-    xq = quantize_act(x, fmt, group)
-    return x + (xq - x).detach()
+    return _ActQuantSTE.apply(x, fmt, group)

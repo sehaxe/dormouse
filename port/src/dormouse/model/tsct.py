@@ -525,6 +525,19 @@ def qat_linear(linear: nn.Linear, x: torch.Tensor, kind: str, alpha: float) -> t
     return F.linear(x, w, linear.bias)
 
 
+def init_u(in_features: int, rank: int, device: torch.device | str = "cpu") -> torch.Tensor:
+    """The `U [in, rank]` init, `N(0, 1/sqrt(in))` — the distribution the
+    comment below names ("the composed map has unit-ish output scale at any
+    width", which matters because ReZero's `residual_scale` starts at 1.0).
+
+    ONE copy of the formula: the expert bank's latents (`DualLatentGLU`) and,
+    under `share_u`, the single basis `SparseMoE` owns draw the same factor.
+    Two transcriptions is how a shared basis and a per-expert one start the A/B
+    from different scales and the comparison charges that to the mechanism.
+    """
+    return torch.randn(in_features, rank, device=device) / math.sqrt(in_features)
+
+
 class TSCTLinear(nn.Module):
     """A factorized linear: `x → ((x·U) ⊙ s)·V`, masters fp32, forward in `dtype`."""
 
@@ -559,9 +572,7 @@ class TSCTLinear(nn.Module):
         # unit-ish output scale at any width, which matters because ReZero's
         # residual_scale is initialised to 1.0 (not 0 — at 0 the block body
         # gets no gradient at all, the 2026-09-27 burn bug).
-        self.u = nn.Parameter(
-            torch.randn(in_features, rank, device=device) / math.sqrt(in_features)
-        )
+        self.u = nn.Parameter(init_u(in_features, rank, device))
         self.s = nn.Parameter(torch.ones(rank, device=device))
         self.v = nn.Parameter(torch.randn(rank, out_features, device=device) / math.sqrt(rank))
         self.bias = nn.Parameter(torch.zeros(out_features, device=device)) if bias else None

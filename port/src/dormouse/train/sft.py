@@ -74,6 +74,7 @@ from ..config import RunConfig, TrainConfig
 from ..instrument import Counters, LoudError, StepTimer, loud
 from ..model.engram import Engram, enable_host_tables, host_engrams, host_step_all
 from ..model.experts import invalidate_banks_all
+from ..model.qat_cache import invalidate_qat_cache_all
 from ..post.tasks import build_tasks
 from .data import ByteStream, warmup_steps
 from .loop import kda_field, load_ckpt, load_model_state, save_ckpt, unpack_state_dict
@@ -866,8 +867,10 @@ def sft_train(
             # parameter's VALUE can move without `_version` moving (a CUDA-graph
             # replay does exactly that), and `_banks` keys on `_version`. This
             # loop has no graph arm today; the call keeps the invariant true for
-            # any arm that ever adds one.
+            # any arm that ever adds one. The QAT projection cache needs the SAME
+            # per-step call (it is tensor-keyed, never `_version`-keyed).
             invalidate_banks_all(model)
+            invalidate_qat_cache_all(model)
             if cfg.engram_ram:
                 # The host update runs ONCE per TRAINING step, after the
                 # optimizer — the same rule and the same counters as `train()`
