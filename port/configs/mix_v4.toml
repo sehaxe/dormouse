@@ -1,0 +1,79 @@
+# port mix plan: v4 — the 5.8 GB mixture built by scripts/build_mix4.py.
+#
+# Unlike v3, every entry below is a `mix4/<domain>.bin` whose size was chosen
+# from the target share, not a raw source directory. One full pass over the
+# plan therefore reads each shard about once (5.77 GB train at 5 130 B/step =
+# 1 124 269 steps); `max_epochs` still guards a longer run.
+#
+# Target shares (bytes of the 5.77 GB train shards; plus 52.9 MB held-out
+# eval), with the measured deviations named in docs/guides/dataset.md:
+#
+#   web          40.8%   (38 +2.8: from `mix/web`; the 19.7 GB
+#                          `corpus_bin_filtered.bin` measured as math/code, not web)
+#   wiki EN       8.0%   } 12% Wikipedia, split 2:1 EN:RU
+#   wiki RU       4.0%
+#   ruweb        15.0%   (13 +2)
+#   code         12.0%
+#   math         11.0%   (10 +1)
+#   books         1.0%   } 2% combined, not 5: the local `books/` parquet is
+#   qa            1.0%   } CommonCrawl text (not books) and NQ is small
+#   reasoning     3.0%
+#   instruct      2.1%   (5 -2.9: only 123.0 MB of unique clean pairs exist)
+#   rudialog      2.0%
+#
+# S1 is the stable English/Russian prose stage; S2 adds code and math; S3 is
+# the decay stage, where math/code rise and instructions are weighted up.
+# The weights are a probability vector per stage (mixer.py refuses otherwise).
+
+max_epochs = 4.0
+seed = 20261022
+
+[[stage]]
+until_frac = 0.42
+[stage.weights]
+web = 0.602
+wiki_en = 0.118
+wiki_ru = 0.059
+ruweb = 0.221
+
+[[stage]]
+until_frac = 0.80
+[stage.weights]
+web = 0.356
+wiki_en = 0.0693
+wiki_ru = 0.0347
+ruweb = 0.124
+code = 0.179
+math = 0.121
+books = 0.021
+qa = 0.021
+reasoning = 0.053
+rudialog = 0.021
+
+[[stage]]
+until_frac = 1.00
+[stage.weights]
+web = 0.10
+wiki_en = 0.02
+wiki_ru = 0.01
+ruweb = 0.05
+code = 0.26
+math = 0.32
+books = 0.01
+qa = 0.01
+reasoning = 0.05
+instruct = 0.11
+rudialog = 0.06
+
+[sources]
+web = "/home/sehaxe/dormouse/data_local/mix4/web.bin"
+wiki_en = "/home/sehaxe/dormouse/data_local/mix4/wiki_en.bin"
+wiki_ru = "/home/sehaxe/dormouse/data_local/mix4/wiki_ru.bin"
+ruweb = "/home/sehaxe/dormouse/data_local/mix4/ruweb.bin"
+code = "/home/sehaxe/dormouse/data_local/mix4/code.bin"
+math = "/home/sehaxe/dormouse/data_local/mix4/math.bin"
+books = "/home/sehaxe/dormouse/data_local/mix4/books.bin"
+qa = "/home/sehaxe/dormouse/data_local/mix4/qa.bin"
+reasoning = "/home/sehaxe/dormouse/data_local/mix4/reasoning.bin"
+instruct = "/home/sehaxe/dormouse/data_local/mix4/instruct.bin"
+rudialog = "/home/sehaxe/dormouse/data_local/mix4/rudialog.bin"
