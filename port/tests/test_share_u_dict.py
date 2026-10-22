@@ -24,8 +24,8 @@ D. The dictionary receives a gradient from EVERY expert that read it: support of
    whole (`g(both) == g(e0) + g(e1)`), on BOTH dispatch arms (reference loop and
    capacity-padded bank, which builds the `[E, d, rank]` stack itself).
 E. The forward touches no host (`.item()` / `.tolist()` raise inside it).
-F. The LOUD refusals: `R < 2`, an out-of-range/float index, `dict` with
-   `factor_qat != "none"`, `dict` with `use_tsct=false`, `rank >= R`, and the
+F. The LOUD refusals: `R < 2`, an out-of-range/float index, `dict` with an
+   unknown `factor_qat`, `dict` with `use_tsct=false`, `rank >= R`, and the
    `share_u` alias disagreeing with `share_u_mode`.
 """
 
@@ -394,7 +394,7 @@ def test_f_refusals() -> None:
     with pytest.raises(LoudError, match="use_tsct=false"):
         _validate(share_u_mode="dict", use_tsct=False)
     with pytest.raises(LoudError, match="share_u with factor_qat"):
-        _validate(share_u_mode="dict", factor_qat="ternary")
+        _validate(share_u_mode="dict", factor_qat="int4")
     with pytest.raises(LoudError, match="share_u_rank"):
         _validate(share_u_mode="dict", share_u_rank=1)
     with pytest.raises(LoudError, match="no subset"):
@@ -406,7 +406,7 @@ def test_f_refusals() -> None:
 
     # The module refuses the same pairs on a hand-built config (no loader).
     with pytest.raises(LoudError, match="share_u with factor_qat"):
-        SparseMoE(tiny_cfg(share_u_mode="dict", factor_qat="binary"), device="cpu")
+        SparseMoE(tiny_cfg(share_u_mode="dict", factor_qat="int4"), device="cpu")
     with pytest.raises(LoudError, match="use_tsct=false"):
         SparseMoE(tiny_cfg(share_u_mode="dict", use_tsct=False), device="cpu")
     with pytest.raises(LoudError, match="share_u_rank"):

@@ -48,12 +48,23 @@ one switch, two spellings, and a conflicting pair is refused (`config`).
 `dict` one, each once per `SparseMoE.forward` (the site) — the two are
 mutually exclusive, so a log carrying both is two MoEs or a wiring error, and a
 `share_u_mode="dict"` run with no `share_u_dict_forward` measured a forward
-that did not run the arm. Both are refused LOUDLY with `factor_qat != "none"`
-(a shared basis has no per-expert α to quantize against — see
-`_refuse_shared_qat`), with `use_tsct = false`, and `dict` additionally with
+that did not run the arm. `share_u_qat_forward` counts the same forward when
+`factor_qat != "none"` (a log without it says the rung did not ride the basis).
+The arm is refused LOUDLY with `use_tsct = false`, and `dict` additionally with
 `share_u_rank < 2` or `rank >= share_u_rank` (a width at or past the dictionary
 has no subset to choose, so every expert would read the whole plane). Default
 off is bit-identical: no parameter, no draw, no counter.
+
+`factor_qat` rides the shared basis with ONE quantized copy per site: the
+`[d, rank]` plane / `[d, share_u_rank]` dictionary gets its own single α
+(`dim=None`, the per-TENSOR absmean) and `qat_values` projection, cached once
+per optimizer step in the owner's `QuantCache` (`SparseMoE._qat_cache`, the
+same per-step invalidation the per-expert factors use). The experts read that
+projection — the plane whole, the dictionary through the seeded column gather
+— so there is no second quantizer per expert and no double STE. The anneal is
+`SparseMoE.factor_qat_alpha`, which `DormouseModel.set_factor_qat_alpha`
+already walks to, so the basis and the per-expert factors move on ONE
+schedule.
 
 Dispatch has TWO arms over ONE permute, and the log line says which ran:
 
@@ -212,7 +223,7 @@ from torch import nn
 from torch.autograd.graph import saved_tensors_hooks
 from torch.utils.checkpoint import checkpoint
 
-from ..config import SHARE_U_MODES
+from ..config import FACTOR_QATS, SHARE_U_MODES
 from ..instrument import Counters, loud
 from .act_quant import fake_quant_act
 from .adaptive_topk import check_policy, choose_k, select_topk
@@ -313,23 +324,20 @@ def _unpack_activation(h: object) -> object:
 
 
 def _refuse_shared_qat(factor_qat: str, where: str) -> None:
-    """LOUD: `factor_qat` cannot ride a SHARED `U` — refuse, never silently skip.
+    """LOUD: a `factor_qat` rung the shared-basis quantizer cannot express.
 
-    The rung's banked path projects with a per-EXPERT α (`factor_qat_project`'s
-    `dim=(1, 2)` over the `[E, ·, ·]` stack) precisely so a banked expert and the
-    same expert alone quantize identically. A shared `[d, rank]` basis has no
-    per-expert slice: quantizing it would need its OWN gate (one α over the whole
-    dictionary, `dim=None`) and a test that the banked and standalone paths still
-    agree — a mechanism this arm does not ship. So the pair is refused at every
-    construction site (config, `SparseMoE`, `DualLatentGLU`) rather than one of
-    them quietly quantizing the basis the other one reads.
+    Kept as the seam for a FUTURE rung: the shared basis is projected with its
+    own single α (`dim=None`), which every current mode supports, so no
+    combination is refused today. A rung that needs a per-expert slice of the
+    shared tensor (the one thing a shared basis cannot provide) belongs here,
+    named, before the config can lie about it.
     """
-    if factor_qat != "none":
+    if factor_qat not in FACTOR_QATS:
         loud(
-            f"share_u with factor_qat={factor_qat!r} ({where}): the shared basis is "
-            f"ONE tensor for the whole bank, so there is no per-expert scale to "
-            f"quantize it against — quantizing it would need its own gate. Escape: "
-            f"factor_qat=none with share_u=true, or share_u=false with the rung."
+            f"share_u with factor_qat={factor_qat!r} ({where}): the shared basis "
+            f"is projected with ONE α over the whole tensor, and this rung is not "
+            f"in {list(FACTOR_QATS)}. Escape: name a known rung, or "
+            f"factor_qat='none'."
         )
 
 
@@ -463,6 +471,13 @@ class DualLatentGLU(nn.Module):
         #: every snapshot on record carries, unchanged.
         self.share_u = share_u
         self._shared_u: tuple[torch.Tensor, torch.Tensor] | None = None
+        #: `share_u` + `factor_qat`: the OWNER's per-step `QuantCache`. The
+        #: shared basis is projected ONCE per site per step (`SparseMoE.
+        #: _qat_cache`), and every expert — the banked arms and this standalone
+        #: path — reads that one projection. `None` (a hand-bound expert) falls
+        #: back to this module's own cache, which is the same arithmetic with
+        #: one entry instead of the bank's one.
+        self._shared_cache: QuantCache | None = None
         #: `dict` mode only: `[2, rank]` column indices into the parent's
         #: dictionary — row 0 the gate latent, row 1 the up latent. `None`
         #: under `plane`, where the bound pair IS the basis.
@@ -489,6 +504,8 @@ class DualLatentGLU(nn.Module):
         gate_u: torch.Tensor,
         up_u: torch.Tensor,
         index: torch.Tensor | None = None,
+        *,
+        cache: QuantCache | None = None,
     ) -> None:
         """Take the parent's ONE shared basis — the only way `share_u` gets its `U`s.
 
@@ -504,10 +521,17 @@ class DualLatentGLU(nn.Module):
         two rows. Gathered HERE, per forward, not at bind time — a bind-time
         gather would freeze step 0's columns and every later step would train a
         constant.
+
+        `cache` is the OWNER's per-step `QuantCache` under `factor_qat`: the
+        shared basis is projected by `SparseMoE` once per site per step (the
+        same object the banked path reads), so binding the owner's cache is
+        what makes "one quantized basis" true across the standalone and banked
+        arms instead of one entry per expert.
         """
         assert self.share_u, "bind_shared_u on an expert that owns its own U"
         self._shared_u = (gate_u, up_u)
         self._shared_index = index
+        self._shared_cache = cache
 
     def _bases(self) -> tuple[torch.Tensor, torch.Tensor]:
         """The forward's `(gate_u, up_u)` — this expert's, or the bank's shared pair."""
@@ -521,6 +545,20 @@ class DualLatentGLU(nn.Module):
                 "`[d, rank]` per site), or share_u=false."
             )
         gate_u, up_u = self._shared_u
+        if self.factor_qat != "none":
+            # ONE quantized basis per site: project the WHOLE shared tensor (the
+            # dictionary under `dict`) with its own single α, BEFORE the
+            # per-expert column gather, through the owner's per-step cache. The
+            # banked path (`SparseMoE._banks`) evaluates the same expression on
+            # the same tensor, so a banked expert and this standalone path read
+            # identical values. Quantizing the gathered slice instead would take
+            # the absmean of `rank` columns of a `share_u_rank`-wide dictionary
+            # — a second α `_banks` never applies (gate C of
+            # `tests/test_share_u_qat.py`).
+            q = factor_qat_project
+            cache = self._shared_cache or self._qat_cache
+            gate_u = q(gate_u, self.factor_qat, self.factor_qat_alpha, cache=cache)
+            up_u = q(up_u, self.factor_qat, self.factor_qat_alpha, cache=cache)
         if self._shared_index is not None:
             gate_u = gate_u.index_select(1, self._shared_index[0])
             up_u = up_u.index_select(1, self._shared_index[1])
@@ -538,11 +576,15 @@ class DualLatentGLU(nn.Module):
         if self.factor_qat != "none":
             # Per-tensor α on a 2-D factor == per-expert α on that expert's
             # slice of the bank (`_banks`'s `dim=(1,2)`), so the naive/shared
-            # path and the banked path quantize an expert IDENTICALLY.
+            # path and the banked path quantize an expert IDENTICALLY. Under
+            # `share_u` the basis was ALREADY projected by `_bases` (once per
+            # site, on the owner's cache) — quantizing it here would be a
+            # second α and a second STE, so only `v` is left.
             q = factor_qat_project
             cache = self._qat_cache
-            gate_u = q(gate_u, self.factor_qat, self.factor_qat_alpha, cache=cache)
-            up_u = q(up_u, self.factor_qat, self.factor_qat_alpha, cache=cache)
+            if not self.share_u:
+                gate_u = q(gate_u, self.factor_qat, self.factor_qat_alpha, cache=cache)
+                up_u = q(up_u, self.factor_qat, self.factor_qat_alpha, cache=cache)
             v = q(v, self.factor_qat, self.factor_qat_alpha, cache=cache)
         g = (xu @ gate_u.to(dt)) * self.gate_s.to(dt)
         u = (xu @ up_u.to(dt)) * self.up_s.to(dt)
@@ -614,8 +656,16 @@ class SparseMoE(nn.Module):
         self.dense_qat_alpha = cfg.factor_qat_alpha
         #: The once-per-step projection cache for the two DENSE weights here
         #: (router, shared `down`) — the same object `qat_linear` reads on the
-        #: plain linears. `_banks` keeps its own cache for the expert stacks.
-        self._qat_cache = QuantCache() if cfg.dense_qat != "none" else None
+        #: plain linears — and, under `share_u` + `factor_qat`, for the ONE
+        #: shared basis per site. `_banks` keeps its own cache for the expert
+        #: stacks. Created whenever either arm needs it, so the trainer's
+        #: per-step `invalidate_qat_cache_all` reaches the shared basis through
+        #: this module's own `_qat_cache` (no second invalidation seam).
+        self._qat_cache = (
+            QuantCache()
+            if (cfg.dense_qat != "none" or (cfg.share_u_mode != "off" and cfg.factor_qat != "none"))
+            else None
+        )
         #: The a4.8 ACTIVATION quantization (`act_quant.fake_quant_act`): the
         #: expert activations are fake-quantized with an STE — in the banked
         #: branches here (the factors are reached through `bmm`, not through
@@ -739,13 +789,13 @@ class SparseMoE(nn.Module):
                     persistent=False,
                 )
                 for e, row in zip(self.experts, self.share_u_idx.permute(1, 0, 2), strict=True):
-                    e.bind_shared_u(self.u_dict, self.u_dict, row)
+                    e.bind_shared_u(self.u_dict, self.u_dict, row, cache=self._qat_cache)
                 self._shared_params = (self.u_dict,)
             else:
                 self.gate_u = nn.Parameter(init_u(d, cfg.rank, device))
                 self.up_u = nn.Parameter(init_u(d, cfg.rank, device))
                 for e in self.experts:
-                    e.bind_shared_u(self.gate_u, self.up_u)
+                    e.bind_shared_u(self.gate_u, self.up_u, cache=self._qat_cache)
                 self._shared_params = (self.gate_u, self.up_u)
         # The router: ONE 2-D linear on the raw hidden state (not on the
         # latent), softmax over the bank, then top-k + a capacity-bound permute.
@@ -780,6 +830,13 @@ class SparseMoE(nn.Module):
             counters.count("share_u_forward")
         elif self.share_u_mode == "dict":
             counters.count("share_u_dict_forward")
+        if self.share_u and self.factor_qat != "none":
+            # Evidence that the quantized shared basis actually ran (ADR-0019):
+            # absent under `factor_qat="none"`, so a log line cannot claim the
+            # pair from a model whose rung was off. Once per forward, not per
+            # site — the per-SITE cost is `qat_refresh_calls` (one per basis),
+            # and that is the counter the once-per-step gate reads.
+            counters.count("share_u_qat_forward")
         n = x.shape[0]
         assert x.ndim == 2 and x.shape[1] == self.d, f"MoE input {tuple(x.shape)} != [n, {self.d}]"
         dt = self.experts[0].compute_dtype  # the shared compute dtype
@@ -1166,8 +1223,21 @@ class SparseMoE(nn.Module):
                     # the columns it READ and the rest stay at zero — which is
                     # what "the dictionary sees every expert that used it" means
                     # in code. Only the VALUES are E-fold; the parameter is one.
+                    #
+                    # Under `factor_qat` the DICTIONARY is projected whole, with
+                    # its own single α, BEFORE the gather; the second `_one` call
+                    # is a cache hit, so the site costs ONE quantizer call per
+                    # step (not one per expert, and not one per expert-row).
                     row = 0 if name == "gate_u" else 1
-                    cols = self.u_dict.to(dt).t()[self.share_u_idx[row]]  # [E, r, d]
+                    d = self.u_dict
+                    if self.factor_qat != "none":
+                        d = factor_qat_project(
+                            d,
+                            self.factor_qat,
+                            self.factor_qat_alpha,
+                            cache=self._qat_cache,
+                        )
+                    cols = d.to(dt).t()[self.share_u_idx[row]]  # [E, r, d]
                     return cols.permute(0, 2, 1).contiguous()  # [E, d, r]
                 if self.share_u_mode == "plane" and name in ("gate_u", "up_u"):
                     # The bank's ONE basis, materialized as the [E, d, r] stack
@@ -1176,7 +1246,21 @@ class SparseMoE(nn.Module):
                     # contribution into the single parameter — which is what
                     # "the shared U sees every expert that used it" means in
                     # code. Only the VALUES are E-fold; the parameter is one.
-                    u = getattr(self, name).to(dt)
+                    #
+                    # Under `factor_qat` this is the SAME per-tensor projection
+                    # `DualLatentGLU._bases` applies on the standalone path
+                    # (one α over the whole `[d, rank]`), cached once per step
+                    # through the owner's `QuantCache`, so the E experts read a
+                    # basis that was quantized ONCE, not E times.
+                    u = getattr(self, name)
+                    if self.factor_qat != "none":
+                        u = factor_qat_project(
+                            u,
+                            self.factor_qat,
+                            self.factor_qat_alpha,
+                            cache=self._qat_cache,
+                        )
+                    u = u.to(dt)
                     return u.unsqueeze(0).expand(len(self.experts), -1, -1).contiguous()
                 params = [getattr(e, name) for e in self.experts]
                 if self.factor_qat == "none":

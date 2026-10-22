@@ -327,10 +327,11 @@ class ModelConfig:
     #: NOT bound (it runs at `shared_rank`, a different shape, and E = 1).
     #:
     #: REFUSED loudly with `use_tsct = false` (the shared basis is a TSCT factor,
-    #: so there is no basis to share with the projections dense) and with
-    #: `factor_qat != "none"` (the shared basis is not per-expert, so the factor
-    #: rung's per-expert α has nothing to quantize it against — quantizing it
-    #: would need its own gate, and this arm does not ship one).
+    #: so there is no basis to share with the projections dense). With
+    #: `factor_qat != "none"` the basis IS quantized: ONE projection per site
+    #: with its own single α (`dim=None`) and the rung's anneal, cached once per
+    #: optimizer step and read by every expert (plane whole, dict through the
+    #: seeded gather) — `experts.SparseMoE._qat_cache` owns the one entry.
     share_u: bool = False
     #: How the shared basis is shaped — THE switch (`share_u` above is its
     #: `plane` spelling, kept so every snapshot and `--set share_u=...` still
@@ -348,9 +349,9 @@ class ModelConfig:
     #:   `rank`-dimensional subspaces of the same dictionary, which is the one
     #:   thing a shared plane cannot do at rank 2.
     #:
-    #: `dict` needs `use_tsct = true` and `factor_qat = "none"` for the same
-    #: reasons `plane` does, plus `share_u_rank > rank` (a width at or past the
-    #: dictionary leaves no subset to choose).
+    #: `dict` needs `use_tsct = true` for the same reason `plane` does, plus
+    #: `share_u_rank > rank` (a width at or past the dictionary leaves no subset
+    #: to choose). `factor_qat` rides either mode (one quantized basis per site).
     share_u_mode: str = "off"
     #: The `dict` mode's dictionary width `R`. `d*R` parameters per site, shared
     #: by every routed expert; each expert spends `rank` of its columns. 64 at
@@ -1404,15 +1405,17 @@ def validate(model: ModelConfig) -> None:
             f"name a mechanism the model does not have. Escape: use_tsct=true, or "
             f"share_u_mode='off'."
         )
-    if model.share_u_mode != "off" and model.factor_qat != "none":
+    if model.share_u_mode != "off" and model.factor_qat not in FACTOR_QATS:
+        # The shared basis is projected with ONE α over the whole tensor
+        # (`dim=None`): every rung in FACTOR_QATS supports that, including the
+        # dictionary gather. A future rung that needs a per-expert slice of a
+        # shared tensor is the combination this seam refuses, named here rather
+        # than silently degraded in the forward.
         loud(
             f"share_u with factor_qat={model.factor_qat!r} "
-            f"(share_u_mode={model.share_u_mode!r}): the shared basis is ONE tensor "
-            f"for the whole bank, so the factor rung's per-expert α has nothing to "
-            f"quantize it against — a quantized shared basis needs its own gate "
-            f"(one α over the dictionary) and a banked-vs-standalone test this arm "
-            f"does not ship. Escape: factor_qat=none with the shared basis, or "
-            f"share_u_mode='off' with the rung."
+            f"(share_u_mode={model.share_u_mode!r}): the shared basis is projected "
+            f"with ONE α over the whole tensor, and this rung is not in "
+            f"{list(FACTOR_QATS)}. Escape: name a known rung, or factor_qat='none'."
         )
     if model.share_u_mode == "dict":
         if model.share_u_rank < 2:

@@ -275,12 +275,12 @@ def test_e_the_shared_forward_touches_no_host(monkeypatch: pytest.MonkeyPatch) -
 def test_refusals() -> None:
     with pytest.raises(LoudError, match="use_tsct=false"):
         validate(ModelConfig(**{**tiny_cfg().__dict__, "share_u": True, "use_tsct": False}))
-    with pytest.raises(LoudError, match="factor_qat"):
-        validate(ModelConfig(**{**tiny_cfg().__dict__, "share_u": True, "factor_qat": "ternary"}))
     with pytest.raises(LoudError, match="share_u with factor_qat"):
-        SparseMoE(tiny_cfg(share_u=True, factor_qat="binary"), device="cpu")
+        validate(ModelConfig(**{**tiny_cfg().__dict__, "share_u": True, "factor_qat": "int4"}))
     with pytest.raises(LoudError, match="share_u with factor_qat"):
-        DualLatentGLU(64, 128, 8, dtype=torch.float32, factor_qat="mxfp4", share_u=True)
+        SparseMoE(tiny_cfg(share_u=True, factor_qat="int4"), device="cpu")
+    with pytest.raises(LoudError, match="share_u with factor_qat"):
+        DualLatentGLU(64, 128, 8, dtype=torch.float32, factor_qat="int4", share_u=True)
     unbound = DualLatentGLU(64, 128, 8, dtype=torch.float32, share_u=True)
     with pytest.raises(LoudError, match="no parent bound the shared basis"):
         unbound(torch.randn(4, 64))
