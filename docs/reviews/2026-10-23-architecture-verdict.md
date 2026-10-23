@@ -137,7 +137,7 @@ Three findings that matter:
 ### Stage A — screening/fast iteration (now proven)
 ```
 medium r64 · d1024 · f2730 · E256 topk2 dropless
-use_mhc=true · share_u=true · moe_topk_mode=entropy
+use_mhc=true · share_u=true · use_attnres=true
 opt=Muon+ColRow · ns_kind=triton · ns_steps=5 · opt_graph=true · bf16 masters
 data=mix4 (5.8 GB, 11 domains) · seq 1024 · batch 24 (≈3.5 GB/day)
 ```
@@ -147,20 +147,24 @@ Measured stack on the new data (600 steps, 3 seeds, window 40 960 B; `scripts/co
 | configuration | n | mean BPB | spread | Δ vs control | verdict |
 |---|---|---|---|---|---|
 | control (bf16, r64) | 3 | 2.6500 | 0.0210 | — | bar = 2.6080 |
-| **mHC + share_u** | 3 | **2.5583** | 0.0170 | **−0.0917** | **WIN** |
+| **mHC + share_u + AttnRes** | 3 | **2.5080** | **0.0090** | **−0.1420** | **WIN — the recipe** |
+| mHC + share_u + AttnRes + prelude/coda (1+1) | 3 | 2.5110 | 0.0050 | −0.1390 | tie with the recipe → prelude is not taken |
+| + mHC + share_u | 3 | 2.5583 | 0.0170 | −0.0917 | WIN |
 | mHC | 3 | 2.5717 | 0.0380 | −0.0783 | WIN |
+| mHC + share_u + prelude/coda (2+2) | 3 | 2.5533 | 0.0260 | −0.0967 | tie with mhc+shu → prelude is not taken |
+| mHC + share_u + prelude/coda (1+1) | 3 | 2.5633 | 0.0220 | −0.0867 | tie / slightly worse |
 | mHC + adaptive topk | 3 | 2.5750 | 0.0170 | −0.0750 | WIN vs control, **tie vs mHC** |
 | AttnRes | 3 | 2.5997 | 0.0150 | −0.0503 | WIN |
 | adaptive topk alone | 3 | 2.6430 | 0.0240 | −0.0070 | tie |
 | mHC + ternary factors | 3 | 2.6550 | 0.0350 | +0.0050 | tie |
-| rank 32 (clean, fixed geometry) | 2 | 2.7450 | 0.0020 | +0.0950 | **LOSS** |
+| rank 32 (clean, fixed geometry) | 3 | 2.7530 | 0.0240 | +0.1030 | **LOSS** |
 | ternary factors + dense | 3 | 2.8997 | 0.0030 | +0.2497 | LOSS |
 
-Two readings that matter for the recipe:
-- **`share_u` on top of mHC is −0.013** (inside mHC's own spread, so a tie on quality) **but it removes 23.5% of the parameters** — take it.
-- **adaptive topk adds nothing on top of mHC** (+0.003, a tie): it is a compute lever on the ragged arms, not a quality one. Keep it only if the ragged path is the one we ship.
+**The win is super-additive, not just additive:** mHC (−0.078) + AttnRes (−0.050) + share_u (−0.013) = −0.141 predicted; measured **−0.142** with a spread of only 0.009 (16× the effect). The two mechanisms attack the same weakness — the loop's later iterations — and do not interfere.
 
-So the recommended **Stage A** is `mHC + share_u`, and **Stage B** adds ternary factors on the bank for the shipped artifact (net +0.005 BPB versus plain bf16, 8× smaller bank).
+**prelude/coda is rejected at our scale.** Two depths (1+1, 2+2), with and without AttnRes, all inside the control's spread, while costing +1.6M and +3.1M parameters respectively. The paper's +12-point MATH500 gain is a reasoning-benchmark effect at 730M/336B tokens; it does not transfer to BPB on prose at 142M with a 600-step budget. Flag stays, verdict dated.
+
+So the recommended **Stage A** is `mHC + share_u + AttnRes`, and **Stage B** adds ternary factors on the bank for the shipped artifact (net +0.005 BPB versus plain bf16, 8× smaller bank).
 
 ### Stage B — shipped form (product)
 ```
