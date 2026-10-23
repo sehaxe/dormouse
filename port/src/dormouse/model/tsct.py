@@ -526,6 +526,7 @@ DENSE_QAT_ATTN_SITES = (
     "loop.attn.v_proj",
     "loop.attn.g_proj",
     "loop.attn.beta_proj",
+    "loop.attn.o_proj",
     "loop.msa.q_proj",
     "loop.msa.k_proj",
     "loop.msa.v_proj",
