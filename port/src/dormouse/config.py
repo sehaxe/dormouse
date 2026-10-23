@@ -1368,9 +1368,13 @@ class TrainConfig:
     # rules and cannot drift into a second copy).
     #: `S_sol`'s proxy: `thrift` (bytes against the hidden reference) or `none`.
     rl_quality: str = "thrift"
-    #: X — the group-relative length penalty's ceiling; 0.0 = OFF (the shipped
-    #: default: nobody has measured X/B/A/δ/s/γ at this scale).
-    rl_len_penalty: float = 0.0
+    #: X — the group-relative length penalty's ceiling; 0.0 = OFF.
+    #: The default is MEASURED, not tasted: `scripts/measure_rl_length.py`
+    #: (2026-10-23, 2 500-task corpus, 200 math tasks) found the longest correct
+    #: answer 1.364x the median correct length (15 B vs 11 B). At s = 0.5 the
+    #: ramp is 0.727, so X = 0.1 costs the longest correct answer 7.3 % of a
+    #: passing reward (the stated 10 % budget; X = 0.2 costs 14.5 %, over it).
+    rl_len_penalty: float = 0.1
     #: B — the percentile of the SUCCESSFUL lengths that sets ℓ*_q (0.5-0.75).
     rl_len_quantile: float = 0.5
     #: A — the group pass rate the length term needs (0.3-0.5).
@@ -1388,18 +1392,38 @@ class TrainConfig:
     #: The loss normaliser: `prompt-mean` (this lane's rule) or `token-mean` (the
     #: notes' §4.2 control arm).
     rl_agg: str = "prompt-mean"
-    #: The task class `build_tasks` generates (`code` | `math` | `noop`); the
-    #: tasks are GENERATED, so the RL lane reads no corpus at all.
+    #: The task class `build_tasks` generates (`code` | `math` | `noop`) when
+    #: `rl_corpus` is empty. `noop` exists only to test the verifier's refusal.
     rl_task_cls: str = "code"
     #: How many tasks a seed produces (`build_tasks(cls, seed, n=...)`); a step
-    #: draws ONE of them as a pure function of `(seed, step)`.
-    rl_tasks: int = 16
+    #: draws ONE of them as a pure function of `(seed, step, attempt)`. The
+    #: generated pool is the smoke path: 128 is `TASKS_PER_CLASS`, and the
+    #: default 32-task holdout leaves 96 to train on. A real run points
+    #: `rl_corpus` at the 2 500-task JSONL instead.
+    rl_tasks: int = 128
     #: G — rollouts per prompt: the group the reward, the advantage and the
     #: length penalty are all relative to. GRPO's group of 4-8 is the sourced band.
     rl_group: int = 4
     #: The rollout's byte budget (`correct@budget(bytes)`): prompt + response +
     #: 2 B per generation stroke. 256 B is the `code` class's own budget.
     rl_budget: int = 256
+    #: A `scripts/build_rl_tasks.py` JSONL corpus. Empty = the generated
+    #: `build_tasks(cls, seed + SFT_TASK_OFFSET)` pool.
+    rl_corpus: str = ""
+    #: Tasks carved out of the corpus as the held-out eval half (never trained).
+    rl_holdout: int = 32
+    #: Held-out eval cadence in steps; 0 = only the before/after readings.
+    rl_eval_every: int = 50
+    #: Sampled attempts per held-out task for `pass@budget` (plus the greedy
+    #: `pass@1` attempt, which is always taken).
+    rl_eval_samples: int = 2
+    #: The difficulty band on the group's pass rate, INCLUSIVE at both ends:
+    #: below `lo` the group is too hard, above `hi` it is consensus.
+    rl_band_lo: float = 0.2
+    rl_band_hi: float = 0.8
+    #: Candidate prompts a step may draw before the counted fallback trains the
+    #: last one (`rl_band_exhausted`). 1 disables the retry, not the band.
+    rl_band_attempts: int = 4
 
 
 #: The `rl_adv` literals — the two advantage arms `rl.rl_advantages` implements.
@@ -2763,7 +2787,24 @@ def load_run(
             f"rl_tasks={tcfg.rl_tasks} rl_group={tcfg.rl_group} "
             f"rl_budget={tcfg.rl_budget}: a step needs at least one task to draw, "
             f"one rollout in the group and one byte of budget. Escape: positive "
-            f"counts (the defaults are 16 / 4 / 256)."
+            f"counts (the defaults are 128 / 4 / 256)."
+        )
+    if tcfg.rl_holdout < 0 or tcfg.rl_eval_every < 0 or tcfg.rl_eval_samples < 1:
+        loud(
+            f"rl_holdout={tcfg.rl_holdout} rl_eval_every={tcfg.rl_eval_every} "
+            f"rl_eval_samples={tcfg.rl_eval_samples}: the holdout is >= 0, the eval "
+            f"cadence is >= 0 (0 = before/after only), and pass@budget needs at "
+            f"least one sampled attempt. Escape: the defaults are 32 / 50 / 2."
+        )
+    if not 0.0 <= tcfg.rl_band_lo <= tcfg.rl_band_hi <= 1.0:
+        loud(
+            f"rl_band=[{tcfg.rl_band_lo}, {tcfg.rl_band_hi}]: a pass rate lies in "
+            f"[0, 1] and lo <= hi. Escape: the default [0.2, 0.8]."
+        )
+    if tcfg.rl_band_attempts < 1:
+        loud(
+            f"rl_band_attempts={tcfg.rl_band_attempts}: a step draws at least one "
+            f"candidate. Escape: 1 (no retry) or more (the default is 4)."
         )
     rl_config(tcfg)
     return RunConfig(source=preset, model=model, train=tcfg)
