@@ -266,12 +266,30 @@ def test_mhc_streams_other_than_two_is_a_loud_refusal():
 
 
 def test_refuses_the_arms_that_share_the_write_or_placement():
-    """The combos that break or confound the contract are refused, not merged."""
-    for key in ("use_attnres", "loom", "use_byteflow"):
+    """The combos that break or confound the contract are refused, not merged.
+
+    `use_attnres` is NOT in this list: it composes with mHC on the same write
+    (mHC owns the lanes, AttnRes the update) and is covered by
+    `test_the_pair_composes_through_preset_override_and_load_run` below.
+    """
+    for key in ("loom", "use_byteflow"):
         with pytest.raises(LoudError) as e:
             parse_preset(f"use_mhc = true\n{key} = true\n")
         assert key in str(e.value), (key, str(e.value))
         assert "use_mhc" in str(e.value)
+        # The legal partner is named, so a reader hitting the refusal has an
+        # escape rather than a dead end.
+        assert "use_attnres" in str(e.value), str(e.value)
+
+
+def test_the_pair_composes_through_preset_override_and_load_run():
+    """`use_mhc` + `use_attnres` is a legal configuration at every seam."""
+    cfg = parse_preset("use_mhc = true\nuse_attnres = true\n")
+    assert cfg.use_mhc is True and cfg.use_attnres is True and cfg.mhc_streams == 2
+    run = load_run("small", model_overrides={"use_mhc": True, "use_attnres": True})
+    assert run.model.use_mhc is True and run.model.use_attnres is True
+    text = run.snapshot_toml()
+    assert "use_mhc = true" in text and "use_attnres = true" in text
 
 
 def test_the_flag_is_a_real_modelconfig_field():

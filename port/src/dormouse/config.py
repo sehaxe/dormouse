@@ -358,6 +358,13 @@ class ModelConfig:
     #: medium (d=1024) is 65 536 parameters against the control's 78.3M bank.
     share_u_rank: int = 64
     use_engram: bool = True
+    #: AttnRes (`2603.15031`): the loop-boundary write becomes a softmax
+    #: mixture over the depth sources with one learned pseudo-query per
+    #: iteration slot (`loopblock.depth_attend`; the paper's score form).
+    #: COMPOSES with `use_mhc`: with both on, mHC owns the K-lane state
+    #: (`H_pre` reads it, `H_post`/`H_res` write it) and AttnRes owns WHICH
+    #: UPDATE the write carries (`loopblock`'s "THE COMPOSITION"). Alone, it
+    #: replaces ReZero exactly as it always did.
     use_attnres: bool = False
     #: mHC (`2512.24880`, DeepSeek 2025): the residual becomes TWO streams
     #: mixed by a doubly-stochastic (Sinkhorn-projected) matrix, at the LOOP
@@ -365,7 +372,9 @@ class ModelConfig:
     #: The iso-depth scaling study (`2604.21106`) measures hyperconnections
     #: raising the recurrence-equivalence exponent φ 0.453 -> 0.646, which is
     #: exactly the "deeper loops stop paying" wall we hit at iteration 4.
-    #: `false` (the default) leaves the model bit-identical.
+    #: `false` (the default) leaves the model bit-identical. Composes with
+    #: `use_attnres` (see the field above); `loom` and `use_byteflow` stay
+    #: refused alongside it.
     use_mhc: bool = False
     #: Lanes. Only K=2 ships: it is the configuration the paper measured and
     #: the one the review wires; `validate` refuses anything else.
@@ -1543,12 +1552,6 @@ def validate(model: ModelConfig) -> None:
     if model.use_mhc:
         for name, why in (
             (
-                "use_attnres",
-                "AttnRes replaces the same loop-boundary residual write with a "
-                "softmax mixture over {embedding, body}; two write operators in one "
-                "run would be one experiment with two arms",
-            ),
-            (
                 "loom",
                 "LOOM adds a second, un-A/B'd per-iteration gate to the write "
                 "(2610.01153); an mHC result from that run would be attributable to "
@@ -1563,8 +1566,9 @@ def validate(model: ModelConfig) -> None:
             if getattr(model, name):
                 loud(
                     f"use_mhc with {name}=true: {why}. Escape: {name}=false, or "
-                    f"use_mhc=false — mHC's A/B (scripts/ab_mhc.py) runs against "
-                    f"ReZero and nothing else."
+                    f"use_mhc=false — mHC's A/B (scripts/ab_mhc.py) moves ONE write "
+                    f"axis at a time, and AttnRes (`use_attnres`) is the only "
+                    f"partner it composes with (scripts/ab_mhc_attnres.py)."
                 )
         if model.mhc_streams != 2:
             loud(
