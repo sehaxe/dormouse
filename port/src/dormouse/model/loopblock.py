@@ -61,6 +61,14 @@ every number on record keep their meaning. `segment_len=0` does not enter the
 branch at all — the one-shot path is `_window(carry=False)`, the same code with
 the same calls it has always made.
 
+CSA (`model/csa.py`) is the **compressed, selectable KV memory**: one shared
+`k`/`v` per `csa_chunk` byte positions and exact attention over the top
+`csa_topk` of the STRICTLY EARLIER chunks. It is ADDITIVE beside KDA — `attn =
+attn_kda + csa_out · w_attn · sigmoid(csa_gate[i])`, the `msa_gate` pattern — and
+built only when `cfg.use_csa`, so the off default is bit-identical. The decode
+step carries a second, per-iteration state (the chunk ring) beside KDA's; the
+`states` list holds `(kda_state, csa_state)` only on that arm.
+
 mHC (`use_mhc`, arXiv:2512.24880) is the fourth residual arm, wired at the
 LOOP BOUNDARY by the φ study's placement (2604.21106 §5.2: K=2 lanes *across
 loops*, `docs/reviews/mhc-2026-09-30.md` §3.2): the loop carries `K =
@@ -127,6 +135,7 @@ from torch import nn
 from torch.utils.checkpoint import checkpoint
 
 from ..instrument import Counters, loud
+from .csa import CompressedSelectiveAttention
 from .engram import Engram, memory_floor_mix
 from .experts import SparseMoE
 from .fullattn import FullAttention
@@ -253,6 +262,17 @@ class LoopBlock(nn.Module):
         if self.msa is not None:
             assert 0.0 < self.msa_capacity_ratio <= 1.0, "msa_capacity_ratio in (0, 1]"
             self.msa_gate = nn.Parameter(torch.zeros(cfg.max_iter, device=device))
+        # CSA (`model/csa.py`): the compressed, SELECTABLE KV memory, also an
+        # ADDITIVE branch beside KDA and off by default. One learned gate per
+        # iteration slot (the `msa_gate` pattern), so the arm's contribution is
+        # per-pass and can be switched off by training. Built only when the flag
+        # is on: `use_csa=false` keeps the parameter tree — and every pinned
+        # `state_dict` hash — exactly as it was.
+        self.csa = (
+            CompressedSelectiveAttention(cfg, device=device) if cfg.use_csa else None
+        )
+        if self.csa is not None:
+            self.csa_gate = nn.Parameter(torch.zeros(cfg.max_iter, device=device))
         self.moe = SparseMoE(cfg, device=device)
         self.engram = Engram(cfg, device=device) if cfg.use_engram else None
         # The dense half of the memory branch's mixture — the `(1-g)·v_t` term.
@@ -504,17 +524,42 @@ class LoopBlock(nn.Module):
             w_ffn = torch.sigmoid(raw[:, 2:3])
 
             if self.attn is not None:
+                # A CSA run carries `(kda_state, csa_state)` per iteration in
+                # `states`; the KDA arm sees only its half.
+                attn_state = None if states is None else states[i]
+                if self.csa is not None and isinstance(attn_state, tuple):
+                    attn_state = attn_state[0]
                 attn_out, st = self._attn(
                     normed,
                     counters,
                     carry,
-                    None if states is None else states[i],
+                    attn_state,
                     recurrent=recurrent,
                 )
-                new_states.append(st)
                 attn = attn_out.reshape(b * t, d) * w_attn
             else:
                 attn = torch.zeros(b * t, d, dtype=torch.float32, device=h0.device)
+            if self.csa is not None:
+                prev = None if states is None else states[i]
+                csa_state = prev[1] if isinstance(prev, tuple) else None
+                if recurrent:
+                    csa_out, csa_st = self.csa.step_state(normed, csa_state, counters=counters)
+                elif carry:
+                    csa_out, csa_st = self.csa.forward_state(
+                        normed, csa_state, counters=counters
+                    )
+                else:
+                    csa_out, csa_st = self.csa(normed, counters=counters), None
+                # The `msa_gate` pattern: one learned scalar per iteration slot,
+                # times the controller's attention gate, on top of KDA's output.
+                attn = attn + csa_out.reshape(b * t, d) * w_attn * torch.sigmoid(
+                    self.csa_gate[i]
+                )
+                if carry or recurrent:
+                    assert self.attn is not None, "CSA is additive beside KDA (config refuses)"
+                    st = (st, csa_st)
+            if self.attn is not None:
+                new_states.append(st)
             if self.msa is not None:
                 # The ADAPTIVE share: softmax over the iteration gates × max_iter
                 # = a per-slot share whose MEAN over slots is 1; × the arm's
@@ -803,6 +848,13 @@ class LoopBlock(nn.Module):
             "pattern itself (a boundary block can no longer be selected) - that is "
             "a model change wearing a memory flag. Escape: use_msa=false, or "
             "segment_len=0."
+        )
+        assert self.csa is None, (
+            "segment_len with use_csa: the CSA state is a chunk ring carried across "
+            "BYTES, and the boundary rule for a half-full chunk at a segment cut is "
+            "undecided (carrying it is a model change, dropping it silently forgets "
+            "the segment). Escape: use_csa=false, or segment_len=0. The config layer "
+            "refuses this pair too."
         )
         assert self.moe.topk == 0 or self.moe.capacity == 0, (
             "segment_len with moe_topk>0 at moe_capacity>0: the capacity-padded sparse "

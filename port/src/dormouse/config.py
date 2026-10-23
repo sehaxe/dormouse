@@ -728,6 +728,22 @@ class ModelConfig:
     energy_temp: float = 1.0
     #: The head's bottleneck `k` in `Linear(d, k) -> SiLU -> Linear(k, 1)`.
     energy_rank: int = 64
+    #: ---- the compressed, selectable KV memory (CSA) beside KDA ----
+    #: `model/csa.py`. Per `csa_chunk` byte positions ONE shared key and value (`csa_kv_dim`
+    #: wide, MQA), and each query attends exactly over the top `csa_topk`
+    #: entries of the STRICTLY EARLIER chunks — the per-token detail KDA's
+    #: O(1) state cannot hold, at `2·csa_kv_dim·2 / csa_chunk` bytes per context
+    #: byte. ADDITIVE beside KDA behind a per-iteration gate and off by default:
+    #: `use_csa=false` builds no module and no parameter. Chunk ∈ {4,8,16,32},
+    #: width ∈ {64,128}. REFUSED loudly with `use_msa` (two sparse branches is
+    #: not measured), `segment_len>0` (the boundary rule for a half-full chunk
+    #: is undecided), `use_byteflow` (its loop runs over patch latents, so a
+    #: byte chunk would silently be a latent chunk), `use_kda=false` and
+    #: `attn_kind='full'` (this arm is specified beside KDA).
+    use_csa: bool = False
+    csa_chunk: int = 8
+    csa_kv_dim: int = 64
+    csa_topk: int = 32
     #: ---- the second attention arm (MSA re-entry, ADR-0014; owner 2026-10-16) ----
     #: 1M-context sparse attention BESIDE KDA (which stays the default arm).
     #: `msa_capacity_ratio` = the arm's share of the attention demand (owner:
@@ -1436,6 +1452,49 @@ def validate(model: ModelConfig) -> None:
             f"readout is not a factorization, and 0 is the OFF sentinel. "
             f"Escape: 0..=d_model."
         )
+    if model.use_csa:
+        if model.csa_chunk not in (4, 8, 16, 32):
+            loud(
+                f"csa_chunk={model.csa_chunk} is not a chunk size: the arm pools "
+                f"{model.csa_chunk} byte positions into one KV entry, and the "
+                f"measured set is (4, 8, 16, 32). Escape: one of those."
+            )
+        if model.csa_kv_dim not in (64, 128):
+            loud(
+                f"csa_kv_dim={model.csa_kv_dim} is not a CSA width: the arm ships "
+                f"64 and 128 (the memory table is asserted at 64). Escape: 64 or 128."
+            )
+        if model.csa_topk < 1:
+            loud(
+                f"csa_topk={model.csa_topk}: a top-k of 0 selects no chunk, which is "
+                f"the branch switched off with its parameters and gate still built. "
+                f"Escape: csa_topk >= 1, or use_csa=false."
+            )
+        if model.use_msa:
+            loud(
+                "use_csa + use_msa: two sparse attention branches have not been "
+                "measured together, so the run could not attribute a result to "
+                "either. Escape: one sparse branch per run."
+            )
+        if model.attn_kind != "kda":
+            loud(
+                f"attn_kind={model.attn_kind!r} with use_csa: CSA is specified as an "
+                f"ADDITIVE branch beside KDA's compressed state, not beside exact "
+                f"attention. Escape: attn_kind='kda', or use_csa=false."
+            )
+        if not model.use_kda:
+            loud(
+                "use_csa with use_kda=false: the hard off switch makes KDA's output "
+                "zeros, and CSA is the branch ADDED to it — the pair is not the "
+                "measured arm. Escape: use_kda=true, or use_csa=false."
+            )
+        if model.use_byteflow:
+            loud(
+                "use_csa with use_byteflow=true: the channel runs the loop over K "
+                "patch latents, so a 'csa_chunk bytes' would silently be a chunk of "
+                "latents (a different unit, and a different window). Refused rather "
+                "than repurposed. Escape: use_byteflow=false, or use_csa=false."
+            )
     if model.rank < 1 or model.shared_rank < 1:
         loud(f"rank and shared_rank must be >= 1, got {model.rank}/{model.shared_rank}")
     if not 0.0 < model.engram_lam_max <= 1.0:
@@ -2083,6 +2142,13 @@ def _validate_segment(model: ModelConfig, tcfg: TrainConfig) -> None:
         )
     if n == 0:
         return
+    if model.use_csa:
+        loud(
+            f"segment_len={n} with use_csa: the CSA state is a chunk ring carried "
+            f"across BYTES, and what a segment cut should do to a half-full chunk is "
+            f"undecided — carrying it at the cut is a model change, and dropping it "
+            f"silently forgets the segment. Escape: use_csa=false, or segment_len=0."
+        )
     if model.attn_kind == "full":
         loud(
             f"segment_len={n} with attn_kind='full': exact attention has no O(1) "
