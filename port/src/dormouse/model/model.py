@@ -84,6 +84,22 @@ class DormouseModel(nn.Module):
                 f"the horizon is a positive count of positions to look ahead "
                 f"(1 = the next position). Escape: jepa_horizon >= 1."
             )
+        # The two SEAM-level regularisers this file owns: both are defined on
+        # this model's `lm_head`, and both byteflow shapes leave that head
+        # behind, so a hand-built config must hear the same refusal `validate`
+        # gives a preset (ADR-0019: a term with nothing to act on).
+        if cfg.tie_embeddings and cfg.use_byteflow:
+            loud(
+                "tie_embeddings=true with use_byteflow=true: both byteflow shapes "
+                "leave this model's `lm_head` behind, so there is no head to tie. "
+                "Escape: tie_embeddings=false, or use_byteflow=false."
+            )
+        if cfg.z_loss > 0.0 and cfg.use_byteflow:
+            loud(
+                f"z_loss={cfg.z_loss} with use_byteflow=true: the z-term is defined "
+                f"on the `norm`+`lm_head` logits and both byteflow shapes return "
+                f"`_byte_ce` instead. Escape: z_loss=0.0, or use_byteflow=false."
+            )
         # `factor_qat_seed`'s ONE consumer (`tsct.set_factor_qat_seed`): the S3T
         # mask stream is a process-local generator, and a model build is its
         # boundary — the trainer builds one model per process, so the config
@@ -134,8 +150,16 @@ class DormouseModel(nn.Module):
         # burn clamps the HEAD's rank to min(rank, d_model, vocab) explicitly
         # ("a rank above either dimension is not a factorization"); the port
         # does the same, here, and nowhere else.
-        head_rank = min(cfg.rank, d, cfg.vocab)
-        self.lm_head = make_projection(d, cfg.vocab, cfg, rank=head_rank, device=device)
+        if cfg.tie_embeddings:
+            # `lm_head` IS `embed.weight`, transposed, with no parameter of its
+            # own (the `d·vocab` the dense head used to cost). On a TSCT body
+            # this REPLACES the low-rank head — a second difference the config
+            # docstring names; on a dense body it is the exact head matrix and
+            # the saving is exactly `d·vocab`.
+            self.lm_head = TiedHead(self.embed)
+        else:
+            head_rank = min(cfg.rank, d, cfg.vocab)
+            self.lm_head = make_projection(d, cfg.vocab, cfg, rank=head_rank, device=device)
         self.bf = bf_for_model(cfg, device=device)
         # The HALT HEAD (`halt.py`): built only when its weight is on, so
         # `halt_weight = 0` (every preset) adds no parameter and no compute.
@@ -509,6 +533,16 @@ class DormouseModel(nn.Module):
                 # the terms it summed, exactly as a scheduled depth does.
                 T = getattr(self.loop, "_depth_ran", T)
             loss = (rec_sum + ce_final) / (T + 1)
+            if not pure and self.cfg.z_loss > 0.0:
+                # z-loss (PaLM §5 / Gemma-2 §9): keep the pre-softmax logits
+                # from drifting tall. It is added AFTER the CE mean that is the
+                # objective, over the FINAL logits only (the same ones the
+                # forward returns), and `pure` skips it for the held-out number
+                # exactly as it skips every other training signal. The counter
+                # is the void check: a term only in the config must not look
+                # alive in a log.
+                counters.count("z_loss")
+                loss = loss + self.cfg.z_loss * torch.logsumexp(logits, dim=-1).pow(2).mean()
             if not pure and self.halt is not None:
                 # The HALT TERM (`halt.py`): BCE over the iterations this step
                 # actually ran, against a target read from the model's OWN
@@ -616,6 +650,32 @@ class DormouseModel(nn.Module):
             # update on the device (ADR-0018 rule 2). The assert used to fire
             # before the firewall could see the value.
         return logits, loss
+
+
+class TiedHead(nn.Module):
+    """`lm_head` as `embed.weight`, transposed — ZERO parameters of its own.
+
+    The embedding is held through a LIST (`self._owner`): assigning the Module
+    as an attribute would register it as a child, and `state_dict()` would then
+    carry a second key (`lm_head.embed.weight`) for the one matrix. The list
+    keeps the reference out of `_modules`, so a tied model's state dict has the
+    single `embed.weight` key the checkpoint format expects.
+
+    The product runs in fp32 (`x @ W.T`), the burn rule that the final norm and
+    head stay fp32 even in bf16 mode (`bf16 logits NaN`). The shared
+    parameter's gradient is the SUM of the embedding-lookup path and every head
+    path — the loop's per-iteration deep-supervision reads (`L_Rec`) and this
+    forward's final logits both accumulate into `embed.weight` — which is the
+    whole of what "tied" means and what `tests/test_train4.py` asserts against
+    a hand-built two-path model.
+    """
+
+    def __init__(self, embed: nn.Embedding) -> None:
+        super().__init__()
+        self._owner = [embed]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.linear(x.to(torch.float32), self._owner[0].weight.to(torch.float32))
 
 
 def _byte_ce(flat_logits: torch.Tensor, targets: torch.Tensor | None) -> torch.Tensor | None:
