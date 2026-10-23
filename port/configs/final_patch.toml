@@ -1,0 +1,19 @@
+# The patched variant (ByteFlow channel). Requires one A/B to promote:
+# ByteFlow measured -0.485 BPB on medium but refuses use_mhc and use_engram,
+# so it composes only with AttnRes + share_u.
+max_seq_len = 512
+max_iter = 3
+d_model = 1024
+n_heads = 16
+n_experts = 256
+moe_topk = 2
+moe_capacity = 2.0
+rank = 64
+share_u = true
+use_mhc = false
+use_attnres = true
+use_msa = false
+use_engram = false
+use_byteflow = true
+byteflow_k_tokens = 512
+byteflow_max_bytes = 2048

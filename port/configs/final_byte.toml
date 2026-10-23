@@ -1,0 +1,19 @@
+# The final byte-level recipe (2026-10-23). Every flag here is measured;
+# the evidence table is docs/architecture/2026-10-23-final-architecture.md.
+# Derived from `medium` with the cross-measured stack: mHC + AttnRes + share_u.
+max_seq_len = 1024
+max_iter = 3
+d_model = 1024
+n_heads = 16
+n_experts = 256
+moe_topk = 2
+moe_capacity = 2.0
+rank = 64
+share_u = true
+use_mhc = true
+mhc_streams = 2
+use_attnres = true
+use_msa = false
+use_engram = true
+engram_rows = 524288
+use_byteflow = false
