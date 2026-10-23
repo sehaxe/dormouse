@@ -1,8 +1,8 @@
 """The CSA A/B: KDA control vs compressed-selectable KV memory, 3 seeds x 600.
 
-    uv run python scripts/ab_csa.py ab            # 3 arms x 3 seeds, 600 steps
+    uv run python scripts/ab_csa.py ab            # 4 arms x 3 seeds, 600 steps
     uv run python scripts/ab_csa.py longctx --control-dir DIR --control off_s1 \\
-        --csa-dir DIR --csa csa8_s1                 # 4096-byte held-out window
+        --csa-dir DIR --csa csa8+coarse256_s1   # 4096 and 16384-byte windows
 
 **THIS DRIVER HAS NOT BEEN RUN.** The card is free, but the brief forbids
 training arms; every number below is unmeasured and the pre-registered rule is
@@ -14,13 +14,16 @@ data file, exactly as `ab_attn.py` does, and `ckpt_every=STEPS` so `longctx`
 has a checkpoint to load):
 
 * `off` — `use_csa=false`, the KDA control;
-* `csa8` — `use_csa=true, csa_chunk=8, csa_kv_dim=64, csa_topk=32`;
+* `csa8` — `use_csa=true, csa_chunk=8, csa_kv_dim=64, csa_topk=32` (FINE only);
+* `csa8+coarse256` — the same fine level plus the COARSE dense level
+  (`csa_coarse_chunk=256, csa_coarse_kv_dim=64`): 4096 dense entries at 1M,
+  1.0 MiB of extra state, 0.52M MAC/byte at 1M;
 * `csa16` — `use_csa=true, csa_chunk=16`, same width/top-k.
 
 `medium`, b8 x s512, 600 steps, 3 seeds, one 81 920 B eval window (20 x 8 x 512)
 on every arm and seed, JSONL to `~/logs/ab_csa/`.
 
-**Pre-registered prediction.** On the 512-byte training window the arm is
+**Pre-registered prediction.** On the 512-byte training window every arm is
 predicted to **TIE** (`off`), for two reasons, both checkable before the run:
 
 1. the branch sees only *strictly earlier* chunks; at `csa_chunk=8` a position
@@ -28,8 +31,8 @@ predicted to **TIE** (`off`), for two reasons, both checkable before the run:
    of a 512-byte window has at most 63 candidates against the top-32 cut — the
    window is already mostly reachable to KDA at this length;
 2. the long-range detail this arm exists for is beyond 512 bytes, so a 512-byte
-   held-out BPB cannot price it. The 4096-byte `longctx` table is the primary
-   read for the mechanism; the 600-step A/B is the cost/slope filter.
+   held-out BPB cannot price it. The 4096/16384-byte `longctx` table is the
+   primary read for the mechanism; the 600-step A/B is the cost/slope filter.
 
 The verdict rule is AGENTS §1.2, applied to every arm vs the control: **WIN**
 iff the arm's mean held-out BPB beats the control's mean by more than the
@@ -37,11 +40,14 @@ iff the arm's mean held-out BPB beats the control's mean by more than the
 win) does NOT land a default — it lands the `--longctx` claim only, and the
 call is reported, not silently rounded.
 
-**`longctx`** evaluates the two checkpoints on held-out 4096-byte windows. It
-prints BPB and the delta; the rule is the same (beat the control's own window
-spread). `segment_len=1024` is used for the control; the CSA arm runs
-`segment_len=0` because `config.validate` refuses the pair loudly (the
-boundary rule for a half-full chunk is undecided) — the driver prints that
+**`longctx`** evaluates each checkpoint on held-out **4096 AND 16384-byte**
+windows, and — for a coarse checkpoint — with the coarse level ON and OFF
+(`coarse_enabled`), so the coarse level's long-context contribution is visible
+at both lengths rather than inferred from one. It prints BPB per (window,
+variant) and the delta against the control; the rule is the same (beat the
+control's own window spread). `segment_len=1024` is used for the control; the
+CSA arm runs `segment_len=0` because `config.validate` refuses the pair loudly
+(the boundary rule for a half-full chunk is undecided) — the driver prints that
 deviation rather than hiding it.
 """
 
@@ -84,14 +90,23 @@ COMMON["ckpt_every"] = STEPS
 ARMS = (
     ("off", {"use_csa": False}),
     ("csa8", {"use_csa": True, "csa_chunk": 8}),
+    (
+        "csa8+coarse256",
+        {"use_csa": True, "csa_chunk": 8, "csa_coarse_chunk": 256},
+    ),
     ("csa16", {"use_csa": True, "csa_chunk": 16}),
 )
 
 #: The counter each arm MUST show (and the control must NOT).
 EXPECT = {
-    "off": {"iter": ">0", "csa_forward": "==0"},
-    "csa8": {"iter": ">0", "csa_forward": ">0"},
-    "csa16": {"iter": ">0", "csa_forward": ">0"},
+    "off": {"iter": ">0", "csa_forward": "==0", "csa_coarse_forward": "==0"},
+    "csa8": {"iter": ">0", "csa_forward": ">0", "csa_coarse_forward": "==0"},
+    "csa8+coarse256": {
+        "iter": ">0",
+        "csa_forward": ">0",
+        "csa_coarse_forward": ">0",
+    },
+    "csa16": {"iter": ">0", "csa_forward": ">0", "csa_coarse_forward": "==0"},
 }
 
 
@@ -176,12 +191,17 @@ def _run_one(args: argparse.Namespace) -> int:
     )
     if is_on:
         assert model.loop.csa.chunk == run.model.csa_chunk, model.loop.csa.chunk
+        assert model.loop.csa.coarse_chunk == run.model.csa_coarse_chunk, (
+            model.loop.csa.coarse_chunk
+        )
     csa_params = sum(p.numel() for p in model.loop.csa.parameters()) if is_on else 0
     total = sum(p.numel() for p in model.parameters())
     window = args.eval_batches * args.batch * args.seq
     print(
         f"[run] arm={args.arm} use_csa={run.model.use_csa} "
-        f"chunk={run.model.csa_chunk} topk={run.model.csa_topk} seed={args.seed} "
+        f"chunk={run.model.csa_chunk} topk={run.model.csa_topk} "
+        f"coarse_chunk={run.model.csa_coarse_chunk} "
+        f"coarse_kv={run.model.csa_coarse_kv_dim} seed={args.seed} "
         f"steps={args.steps} b{args.batch} s{args.seq} lr={LR} window={window} B "
         f"params={total:,} csa_params={csa_params:,} ({csa_params / total:.4%})",
         flush=True,
@@ -323,39 +343,80 @@ def _longctx_bpb(model, eval_path: str, window: int, batches: int, seg: int, dev
     return bpb(total / max(batches, 1)), segment
 
 
+def _score_windows(model, eval_path, windows, batches, seg, device):
+    """BPB per window per active level; a coarse model is scored ON and OFF."""
+    csa = model.loop.csa
+    has_coarse = csa is not None and getattr(csa, "coarse_chunk", 0) > 0
+    variants = [("coarse", True), ("fine", False)] if has_coarse else [("csa", None)]
+    out: dict[tuple[int, str], tuple[float, int]] = {}
+    for window in windows:
+        for label, enabled in variants:
+            if enabled is not None:
+                csa.coarse_enabled = enabled
+            score, segment = _longctx_bpb(model, eval_path, window, batches, seg, device)
+            out[(window, label)] = (score, segment)
+    return out
+
+
 def longctx(args: argparse.Namespace) -> int:
-    """BPB on held-out 4096-byte windows: control vs CSA, same protocol."""
+    """Held-out BPB at 4096 AND 16384 bytes: control vs CSA, coarse ON and OFF."""
     import torch
 
     from dormouse.serve import load_checkpoint
 
+    windows = tuple(int(w) for w in args.windows.split(",") if w.strip())
+    assert windows, "--windows is empty"
     dev = torch.device(f"cuda:{args.device}" if args.device.isdigit() else args.device)
     print(
-        f"longctx: window={args.window} B, {args.batches} held-out windows, "
+        f"longctx: windows={windows} B, {args.batches} held-out windows each, "
         f"segment_len={args.seg} (control) / 0 (CSA, the pair is refused), device={dev}"
     )
-    out: dict[str, tuple[float, int]] = {}
+    rows: dict[str, dict[tuple[int, str], tuple[float, int]]] = {}
+    labels: dict[str, tuple[str, ...]] = {}
     for name, base, ckpt in (
         ("off", args.control_dir, args.control),
         ("csa", args.csa_dir, args.csa),
     ):
         model, run, loaded = load_checkpoint(Path(base).expanduser(), ckpt, str(dev))
-        score, segment = _longctx_bpb(model, args.eval, args.window, args.batches, args.seg, loaded)
-        out[name] = (score, segment)
+        rows[name] = _score_windows(
+            model, args.eval, windows, args.batches, args.seg, loaded
+        )
+        labels[name] = tuple(sorted({label for _w, label in rows[name]}))
         print(
-            f"{name}: bpb={score:.4f} over {args.batches} x {args.window} B, "
-            f"segment_len={segment}, use_csa={run.model.use_csa}, "
-            f"chunk={run.model.csa_chunk}, topk={run.model.csa_topk}"
+            f"{name}: use_csa={run.model.use_csa}, chunk={run.model.csa_chunk}, "
+            f"topk={run.model.csa_topk}, "
+            f"coarse_chunk={run.model.csa_coarse_chunk}, "
+            f"coarse_kv={run.model.csa_coarse_kv_dim}, variants={labels[name]}"
         )
         del model
-    delta = out["csa"][0] - out["off"][0]
     print(
-        f"\nlongctx delta (csa - off): {delta:+.4f} BPB "
-        f"({'CSA better' if delta < 0 else 'control better'})\n"
-        f"pre-registered: CSA is a long-context claim only if it beats the control "
-        f"by more than the control's own window spread; one checkpoint cannot meet a "
-        f"seed-spread rule, so this table is REPORTED, not a verdict — run the A/B's "
-        f"3 seeds to judge it."
+        f"\n{'window':>7s} {'model':>4s} {'variant':>7s} {'bpb':>8s} {'seg':>4s} "
+        f"{'scored B':>9s}"
+    )
+    for window in windows:
+        for name in ("off", "csa"):
+            for (w, label), (score, segment) in sorted(rows[name].items()):
+                if w != window:
+                    continue
+                print(
+                    f"{window:>7d} {name:>4s} {label:>7s} {score:8.4f} "
+                    f"{segment:>4d} {args.batches * window:>9d}"
+                )
+    print()
+    for window in windows:
+        control = rows["off"][(window, "csa")][0]
+        for label in labels["csa"]:
+            delta = rows["csa"][(window, label)][0] - control
+            print(
+                f"window {window:>5d} csa/{label:<6s} - off: {delta:+.4f} BPB "
+                f"({'CSA better' if delta < 0 else 'control better'})"
+            )
+    print(
+        "\npre-registered: the coarse level is a long-context claim only if it "
+        "beats the control by more than the control's own window spread, AND the "
+        "same checkpoint's coarse row beats its fine-only row at the same window; "
+        "one checkpoint cannot meet a seed-spread rule, so this table is REPORTED, "
+        "not a verdict — run the A/B's 3 seeds to judge it."
     )
     return 0
 
@@ -366,7 +427,7 @@ ARMS_DICT = dict(ARMS)
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="mode", required=True)
-    a = sub.add_parser("ab", help="the A/B driver (seeds x 3 arms)")
+    a = sub.add_parser("ab", help="the A/B driver (seeds x arms)")
     a.add_argument("--seeds", default=",".join(str(s) for s in SEEDS))
     a.add_argument("--steps", type=int, default=STEPS)
     a.add_argument("--batch", type=int, default=BATCH)
@@ -378,13 +439,15 @@ def main(argv: list[str] | None = None) -> int:
     a.add_argument("--eval", default=EVAL)
     a.add_argument("--device", default="cuda")
     a.add_argument("--out-dir", default="~/logs/ab_csa")
-    lc = sub.add_parser("longctx", help="4096-byte held-out BPB, control vs CSA")
+    lc = sub.add_parser(
+        "longctx", help="4096 and 16384-byte held-out BPB, control vs CSA"
+    )
     lc.add_argument("--control-dir", required=True)
     lc.add_argument("--control", required=True)
     lc.add_argument("--csa-dir", required=True)
     lc.add_argument("--csa", required=True)
     lc.add_argument("--eval", default=EVAL)
-    lc.add_argument("--window", type=int, default=4096)
+    lc.add_argument("--windows", default="4096,16384")
     lc.add_argument("--batches", type=int, default=4)
     lc.add_argument("--seg", type=int, default=1024)
     lc.add_argument("--device", default="cuda")

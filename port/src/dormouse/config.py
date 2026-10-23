@@ -744,6 +744,23 @@ class ModelConfig:
     csa_chunk: int = 8
     csa_kv_dim: int = 64
     csa_topk: int = 32
+    #: ---- the COARSE, DENSE second level (HCA) of the same arm ----
+    #: `csa_coarse_chunk=0` (OFF) keeps the one-level arm bit-identical. When
+    #: on (64/128/256/512, a multiple of `csa_chunk`), `csa_coarse_kv_dim`
+    #: (64/128) wide keys/values are mean-pooled per coarse chunk and EVERY
+    #: query attends densely over all strictly earlier coarse entries. The two
+    #: outputs are summed and pass through the ONE shared `csa_gate` per
+    #: iteration slot. This is the level that makes 1M decode affordable: at
+    #: 256 bytes an entry, 4096 dense entries per 1M bytes (0.52M MAC/byte at
+    #: kv=64, 1.0 MiB of state) against the fine level's 131 072-entry scan
+    #: (8.4M MAC/byte). REFUSED loudly with `use_msa`, `segment_len>0`, a
+    #: non-multiple of `csa_chunk`, or without `use_csa`.
+    csa_coarse_chunk: int = 0
+    csa_coarse_kv_dim: int = 64
+    #: The fine level's off switch. `false` runs the coarse level ALONE (the
+    #: exact-attention parity gate's configuration); refused without a coarse
+    #: level, because it would build a branch that computes nothing.
+    csa_fine: bool = True
     #: ---- the second attention arm (MSA re-entry, ADR-0014; owner 2026-10-16) ----
     #: 1M-context sparse attention BESIDE KDA (which stays the default arm).
     #: `msa_capacity_ratio` = the arm's share of the attention demand (owner:
@@ -1452,6 +1469,13 @@ def validate(model: ModelConfig) -> None:
             f"readout is not a factorization, and 0 is the OFF sentinel. "
             f"Escape: 0..=d_model."
         )
+    if model.csa_coarse_chunk and not model.use_csa:
+        loud(
+            f"csa_coarse_chunk={model.csa_coarse_chunk} without use_csa: the "
+            f"coarse level is the second level of the CSA arm, so alone it would "
+            f"build no module and the flag would lie. Escape: use_csa=true, or "
+            f"csa_coarse_chunk=0."
+        )
     if model.use_csa:
         if model.csa_chunk not in (4, 8, 16, 32):
             loud(
@@ -1464,12 +1488,45 @@ def validate(model: ModelConfig) -> None:
                 f"csa_kv_dim={model.csa_kv_dim} is not a CSA width: the arm ships "
                 f"64 and 128 (the memory table is asserted at 64). Escape: 64 or 128."
             )
-        if model.csa_topk < 1:
+        if model.csa_topk < (1 if model.csa_fine else 0):
             loud(
                 f"csa_topk={model.csa_topk}: a top-k of 0 selects no chunk, which is "
-                f"the branch switched off with its parameters and gate still built. "
-                f"Escape: csa_topk >= 1, or use_csa=false."
+                f"the branch switched off with its parameters and gate still built; "
+                f"and a negative top-k is not a count. csa_topk=0 is legal only when "
+                f"csa_fine=false. Escape: csa_topk >= 1, or use_csa=false."
             )
+        if not model.csa_fine and model.csa_coarse_chunk == 0:
+            loud(
+                "csa_fine=false without a coarse level: the arm would build no "
+                "level at all while paying its gate. Escape: csa_fine=true, or "
+                "csa_coarse_chunk>0, or use_csa=false."
+            )
+        if model.csa_coarse_chunk:
+            if model.csa_coarse_chunk % model.csa_chunk:
+                loud(
+                    f"csa_coarse_chunk={model.csa_coarse_chunk} is not a multiple of "
+                    f"csa_chunk={model.csa_chunk}: a coarse entry must be a whole "
+                    f"number of fine entries, or the two levels pool different byte "
+                    f"boundaries. Escape: a multiple of csa_chunk."
+                )
+            if model.csa_coarse_chunk not in (64, 128, 256, 512):
+                loud(
+                    f"csa_coarse_chunk={model.csa_coarse_chunk} is not a coarse "
+                    f"chunk: the level means {model.csa_coarse_chunk} bytes into one "
+                    f"dense entry, and the measured set is (64, 128, 256, 512). "
+                    f"Escape: one of those."
+                )
+            if model.csa_coarse_kv_dim not in (64, 128):
+                loud(
+                    f"csa_coarse_kv_dim={model.csa_coarse_kv_dim} is not a coarse "
+                    f"width: the level ships 64 and 128. Escape: 64 or 128."
+                )
+            if model.use_msa:
+                loud(
+                    "use_csa + csa_coarse_chunk with use_msa: two sparse/dense "
+                    "attention levels beside MSA have not been measured. Escape: "
+                    "one extra branch per run, or use_msa=false."
+                )
         if model.use_msa:
             loud(
                 "use_csa + use_msa: two sparse attention branches have not been "
@@ -2142,6 +2199,14 @@ def _validate_segment(model: ModelConfig, tcfg: TrainConfig) -> None:
         )
     if n == 0:
         return
+    if model.csa_coarse_chunk:
+        loud(
+            f"segment_len={n} with csa_coarse_chunk={model.csa_coarse_chunk}: the "
+            f"coarse level is a dense ring carried across BYTES, and what a segment "
+            f"cut does to a half-full coarse chunk is undecided — carrying it is a "
+            f"model change, dropping it silently forgets the segment. Escape: "
+            f"csa_coarse_chunk=0 (fine level only), or segment_len=0."
+        )
     if model.use_csa:
         loud(
             f"segment_len={n} with use_csa: the CSA state is a chunk ring carried "
