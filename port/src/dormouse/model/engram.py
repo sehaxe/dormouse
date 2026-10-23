@@ -418,8 +418,15 @@ class Engram(nn.Module):
         """
         self._pending = []
 
-    def host_step(self, lr: float) -> tuple[int, int]:
+    def host_step(self, lr: float, scale: float = 1.0) -> tuple[int, int]:
         """The ONE host update a TRAINING step gets: `(updates, rows)`.
+
+        `scale` is the trainer's device firewall, already read on this arm
+        (the row gradients come D2H here every step, so the flag rides an
+        existing declared read): `0.0` means the step was non-finite, and the
+        update is the OLD skip branch exactly — the pending leaves are dropped
+        and neither the tables nor their momentum move. `1.0` is the healthy
+        step, unchanged.
 
         Called by the trainer after `loss.backward()` + `opt.step()` — once per
         step, never per forward (the burn bug this rule exists for is the
@@ -439,6 +446,12 @@ class Engram(nn.Module):
         """
         assert self.host is not None, "host_step on an in-VRAM Engram"
         pending, self._pending = self._pending, []
+        if scale <= 0.0:
+            # The device firewall's skip, on the substrate that has to see the
+            # flag on the host: drop the leaves, move nothing (the old skip).
+            for leaf, _ in pending:
+                leaf.grad = None
+            return (0, 0)
         grads = [
             leaf.grad.detach().to("cpu").reshape(-1, self.dim)
             for leaf, _ in pending
@@ -483,11 +496,15 @@ def enable_host_tables(model: nn.Module, *, bias_correction: bool = True) -> int
     return n
 
 
-def host_step_all(model: nn.Module, lr: float) -> tuple[int, int]:
-    """The trainer's one host update per step, over the whole tree."""
+def host_step_all(model: nn.Module, lr: float, scale: float = 1.0) -> tuple[int, int]:
+    """The trainer's one host update per step, over the whole tree.
+
+    `scale` is the device firewall's decision for this step (see
+    `Engram.host_step`); the default keeps the pre-firewall caller unchanged.
+    """
     updates = rows = 0
     for m in host_engrams(model):
-        u, r = m.host_step(lr)
+        u, r = m.host_step(lr, scale)
         updates += u
         rows += r
     return (updates, rows)

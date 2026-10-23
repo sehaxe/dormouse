@@ -201,9 +201,11 @@ def _run_and_record(monkeypatch, **over) -> tuple[dict, list[float]]:
         seen.append({"kw": kw, "opt": opt})
         return opt
 
-    def spy_step(self, model):
+    def spy_step(self, model, flag=None):
+        # `flag` is the trainer's device NaN firewall (0/1 tensor); the spy
+        # records the LR only, so it forwards it unchanged.
         lrs.append(self.param_groups[0]["lr"])
-        return real_step(self, model)
+        return real_step(self, model, flag)
 
     monkeypatch.setattr(train_loop, "MixOptimizer", spy_opt)
     monkeypatch.setattr(Muon, "batched_step_from_model", spy_step)

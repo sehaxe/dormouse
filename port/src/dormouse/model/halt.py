@@ -134,5 +134,7 @@ def halt_loss(
     if not terms:
         return None
     loss = torch.stack(terms).mean()
-    assert torch.isfinite(loss), "the halt BCE must be finite"
+    # No finiteness assert here: `bool(tensor)` is a host read, and the
+    # trainer's DEVICE firewall (`train/loop.py`) already masks a non-finite
+    # loss and gates the update without one (ADR-0018 rule 2).
     return loss

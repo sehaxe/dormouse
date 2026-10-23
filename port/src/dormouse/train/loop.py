@@ -41,12 +41,23 @@ from .data import ByteStream, eval_window_bytes, open_streams, warmup_steps
 from .graph import OptimizerGraph
 from .lr import wsd_lr
 from .mixture import open_mixture
-from .optim import MixOptimizer, clip_grads
+from .optim import MixOptimizer, clip_grads, grad_norm
 
 
 def bpb(loss: float) -> float:
     """Bits per byte from a natural-log CE (burn's `dormouse_train::bpb`)."""
     return loss / math.log(2)
+
+
+def _host_scalar(value: torch.Tensor) -> float:
+    """The ONE declared host read of a device scalar (log / report cadence).
+
+    Everything the step decides is device-resident; this is the seam where the
+    already-decided numbers cross to the host, so the 0-sync rule has a single
+    auditable place to be checked (`tests/test_nan_firewall.py` patches THIS
+    function to allow the cadence and to fail on any other read).
+    """
+    return float(value)
 
 
 def kda_field(counters: Counters) -> str:
@@ -709,7 +720,20 @@ def train(
         muon_sf_wd=cfg.muon_sf_wd,
     )
     if cfg.optim_8bit:
-        opt.enable_bnb8bit()
+        # The device firewall multiplies the FIRST MOMENT and the weight-decay
+        # factor before the step; bitsandbytes' AdamW8bit keeps its state in
+        # 8-bit blocks and its `step` has no seam between that state and the
+        # parameter write, so the flag could only be honoured by a host branch
+        # on the device value — the sync this path exists to remove. LOUD, and
+        # the escape is the plain AdamW this arm was a VRAM lever against
+        # (the follow-up is a snapshot-gated bnb arm, ADR-0019 style).
+        loud(
+            "optim_8bit=true: bitsandbytes' AdamW8bit has no device-flag path "
+            "(its update cannot be multiplied by the NaN firewall's flag), so a "
+            "non-finite step could not be skipped without a host read. Escape: "
+            "optim_8bit=false (plain AdamW keeps the device firewall), or gate "
+            "this arm on its own host-read path first."
+        )
 
     def sf(mode: str) -> None:
         """The schedule-free switch, a no-op when the arm is off.
@@ -812,9 +836,23 @@ def train(
     window = Counters()
     nan_skipped = 0
     drowning = 0
-    window_finite: list[bool] = []
+    window_steps = 0
     timer = StepTimer()
     last_loss = float("nan")
+    #: The DEVICE firewall's state (ADR-0018 rule 2). `flag_dev` is the 1/0
+    #: integer the step's writes are multiplied by; `last_loss_dev` is the last
+    #: FINITE loss, carried on the device so the log cadence is the only host
+    #: read of it. Both are persistent storage filled IN PLACE: a CUDA graph
+    #: captured later reads this tensor's storage on every replay, so
+    #: reassigning the name would freeze the capture-time value (the same
+    #: defect `graph.set_lr` documents for the learning rate).
+    dev = next(model.parameters()).device
+    flag_dev = torch.ones((), dtype=torch.int32, device=dev)
+    last_loss_dev = torch.full((), float("nan"), device=dev)
+    #: Host-substrate Engrams, resolved once: this arm's update needs the flag
+    #: on the HOST and pays an existing per-step D2H for its row gradients, so
+    #: it is the one declared exception to "no per-step device read".
+    hosts = host_engrams(model)
     #: The telemetry sink: every event (log cadence, evals, checkpoints) gets
     #: a JSON row. A dict writer that never raises on non-JSON values.
     sink = None
@@ -850,10 +888,15 @@ def train(
         The clip is `clip_grads` (optim.py): ONE `_foreach_norm` + ONE fused
         `_foreach_mul_` — the stock per-tensor walk measured 252 ms of a
         small-form step (2920 norm calls, profile 2026-10-16).
+
+        `flag_dev` is read INSIDE the captured region only as a device tensor,
+        which is what keeps the stage capture-safe: the loop fills its storage
+        in place before the replay, exactly like `graph.set_lr`'s learning
+        rate. No `.item()`, no `bool(tensor)`, no host branch on it.
         """
         if cfg.grad_clip > 0:
             clip_grads(model.parameters(), cfg.grad_clip)
-        opt.step()
+        opt.step(flag_dev)
 
     #: The CUDA-graph arm (`train/graph.py`, `train.opt_graph`). `None` is the
     #: default path and it is untouched: the LR stays a host float in the group
@@ -954,98 +997,118 @@ def train(
         window.merge(step_counters)
         timer.tick()
 
-        # ONE host read per step, not two (audit MAJOR 4): `float(loss)` and the
-        # finiteness test share a single D2H transfer. The full device-side
-        # firewall (mask on the device, count at log cadence) needs an optimizer
-        # that accepts a device `scale` — the follow-up the audit names — and is
-        # not smuggled in here: the skip semantics below are the burn-proven
-        # ones and must not drift silently.
-        lf = float(loss.detach()) if loss is not None else float("nan")
-        finite = math.isfinite(lf)
-        window_finite.append(finite)
-        if finite:
-            # The graph arm needs STABLE `.grad` buffers: `set_to_none=True` swaps
-            # each `.grad` for a fresh tensor every step, which breaks the buffers
-            # capture pinned (`dion/cuda_graph.py:170-181`). `False` is a no-op for
-            # a param whose grad is still None, so the FIRST backward allocates it
-            # — which is why the wrapper demands at least one eager step.
-            opt.zero_grad(set_to_none=graph is None)
-            loss.backward()
-            if graph is not None:
-                # ONE launch: the captured stage IS `opt_stage()` (the grad clip
-                # plus the mixed step), and the wrapper redoes the host-side step
-                # counters that a recording cannot carry.
-                graph.step()
-            else:
-                opt_stage()
-            # The parameters just moved — and a CUDA-graph replay moves them
-            # WITHOUT bumping `_version` (measured 2026-10-19). `_banks` keys its
-            # cache on `_version`, so with `opt_graph = true` the key froze at
-            # capture and the bank served the step-5 build for a whole run
-            # (experts frozen in the forward, drifting in memory, checkpoint
-            # unreproducible — the medbig2/b1night defect). One call per
-            # TRAINING step keeps the cache's real job (one build per step,
-            # reused by the loop's iterations) and nothing more. The QAT
-            # projection cache is keyed on the TENSOR, not `_version` (the same
-            # graph-replay trap), so the trainer invalidates it here beside the
-            # banks: one quantize per trained step, reused by every forward.
-            invalidate_banks_all(model)
-            invalidate_qat_cache_all(model)
-            if opt.counters:
-                # The Muon arms' own counters (ADR-0019): `ns_triton` when the
-                # fused Newton–Schulz chain ran, `ns_triton_fallback` + the reason
-                # when it could not. Merged and CLEARED here, once per step that
-                # runs the optimizer, so the log line's counter field is where a
-                # reader learns which chain ran — and so a NaN-skipped step (which
-                # never reaches this branch) cannot leave a stale count behind.
-                total.merge(opt.counters)
-                window.merge(opt.counters)
-                opt.counters.clear()
-            if cfg.engram_ram:
-                # The host update runs ONCE per TRAINING step, after the
-                # optimizer — never per forward (the loop calls the memory once
-                # per iteration, and `host_step` sums those), and never on a
-                # NaN-skipped step (that branch does not call `opt.step`
-                # either). `rows` counts the rows this step touched; it is a
-                # CPU count already, so the 0-sync rule holds.
-                updates, rows = host_step_all(model, lr)
-                total.count("engram_host_updates", updates)
-                window.count("engram_host_updates", updates)
-                total.count("engram_host_update_rows", rows)
-                window.count("engram_host_update_rows", rows)
-            last_loss = lf
+        # THE DEVICE FIREWALL (ADR-0018 rule 2). No host read decides this
+        # step: `loss_finite` and the gradient norm stay on the device, the
+        # masked loss makes backward's seed exactly zero, and the resulting
+        # 0-dim 1/0 flag is what every write below is multiplied by. The host
+        # sees the loss and the skip count at the log cadence only.
+        #
+        # `torch.where` on the scalar, not `mask_fill`: on a healthy step the
+        # value AND the gradient are bit-identical to `loss.backward()` (the
+        # where's backward passes the root gradient through unchanged), which
+        # is what keeps a healthy run's sha256 equal to HEAD's.
+        assert loss is not None, "a training step must carry targets"
+        # The graph arm needs STABLE `.grad` buffers: `set_to_none=True` swaps
+        # each `.grad` for a fresh tensor every step, which breaks the buffers
+        # capture pinned (`dion/cuda_graph.py:170-181`). `False` is a no-op for
+        # a param whose grad is still None, so the FIRST backward allocates it
+        # — which is why the wrapper demands at least one eager step.
+        opt.zero_grad(set_to_none=graph is None)
+        loss_d = loss.detach()
+        loss_finite = torch.isfinite(loss_d).all()
+        step_loss = torch.where(loss_finite, loss, loss_d.new_zeros(()))
+        if step_loss.requires_grad:
+            # A real training loss always does. A model that returns a bare
+            # tensor (the firewall's own NaN fixture) has nothing to backprop
+            # through, which is the old code's skip branch by another route.
+            step_loss.backward()
+        grads = [p.grad for p in model.parameters() if p.grad is not None]
+        # A non-finite GRADIENT disables the step too (the burn 2026-09-27
+        # lesson: a masked loss scalar does not stop a NaN that came from an
+        # ACTIVATION — `NaN * 0` is still NaN through the Jacobian). One vector
+        # norm answers "any" without a host read; the flag is the AND of both.
+        raw_norm = grad_norm(model.parameters())
+        if raw_norm.device != loss_d.device:
+            raw_norm = raw_norm.to(loss_d.device)
+        finite = loss_finite & torch.isfinite(raw_norm)
+        flag_dev.copy_(finite.to(torch.int32))
+        # Sanitize on the device AND gate: every non-finite gradient becomes 0
+        # (so a moment cannot be poisoned), then every gradient is multiplied by
+        # the flag — `*1.0` is the identity on a healthy step, `*0` makes the
+        # skipped step's direction exactly zero (a masked loss alone does not:
+        # a NaN that came from an ACTIVATION would still be in the Jacobian).
+        gate = flag_dev.to(torch.float32)
+        for g in grads:
+            g.nan_to_num_(0.0, 0.0, 0.0)
+            g.mul_(gate.to(g.dtype))
+        # The last FINITE loss, carried on the DEVICE: the host reads it when
+        # the cadence fires and never before. Same bits as the old per-step
+        # `float(loss.detach())`, so the printed number does not move.
+        torch.where(loss_finite, loss_d, last_loss_dev, out=last_loss_dev)
+        # COUNTED as a device counter, drained with the window's other counters
+        # at the log cadence (the `Counters.count_device` 0-sync rule).
+        window.count_device("nan_skipped", 1 - flag_dev)
+        total.count_device("nan_skipped", 1 - flag_dev)
+        window_steps += 1
+        if graph is not None:
+            # ONE launch: the captured stage IS `opt_stage()` (the grad clip
+            # plus the mixed step), and the wrapper redoes the host-side step
+            # counters that a recording cannot carry. A skipped step replays
+            # too: the flag multiplies its writes to zero, which is what makes
+            # the same recording serve both outcomes with no host branch.
+            graph.step()
         else:
-            # Skip the step entirely (a masked loss scalar does not stop NaN
-            # gradients from reaching the weights - the burn bug of
-            # 2026-09-27), COUNTED, and never call any cleanup: the pool went
-            # bad after NaN on the burn stack.
-            nan_skipped += 1
-            total.count("nan_skipped")
-            window.count("nan_skipped")
-            # A skipped step calls NEITHER the stage nor `graph.step()`: the graph
-            # replay advances only on a real optimizer step, exactly as the
-            # optimizer's own step count does (`train/graph.py`).
-            opt.zero_grad(set_to_none=graph is None)
-            # A skipped step never reaches `host_step_all`, so the host-path
-            # leaves it built would sit in `Engram._pending` until the next REAL
-            # step (and their rows be re-deduped there) — growth proportional to
-            # the NaN count, and the burn record has NaN FLOODS (AGENTS §2.3).
-            # Dropped here, once, in the one place that knows the step did not
-            # train. The in-VRAM path never appends, so this is a no-op there.
-            for m in host_engrams(model):
-                m.drop_pending()
+            opt_stage()
+        # The parameters just moved — and a CUDA-graph replay moves them
+        # WITHOUT bumping `_version` (measured 2026-10-19). `_banks` keys its
+        # cache on `_version`, so with `opt_graph = true` the key froze at
+        # capture and the bank served the step-5 build for a whole run
+        # (experts frozen in the forward, drifting in memory, checkpoint
+        # unreproducible — the medbig2/b1night defect). One call per
+        # TRAINING step keeps the cache's real job (one build per step,
+        # reused by the loop's iterations) and nothing more. The QAT
+        # projection cache is keyed on the TENSOR, not `_version` (the same
+        # graph-replay trap), so the trainer invalidates it here beside the
+        # banks: one quantize per trained step, reused by every forward.
+        invalidate_banks_all(model)
+        invalidate_qat_cache_all(model)
+        if opt.counters:
+            # The Muon arms' own counters (ADR-0019): `ns_triton` when the
+            # fused Newton–Schulz chain ran, `ns_triton_fallback` + the reason
+            # when it could not. Merged and CLEARED here, once per step that
+            # runs the optimizer, so the log line's counter field is where a
+            # reader learns which chain ran. The clear is what makes the next
+            # step's reading this step's, skipped or not.
+            total.merge(opt.counters)
+            window.merge(opt.counters)
+            opt.counters.clear()
+        if hosts:
+            # The host-table arm, the ONE place the flag reaches the host: this
+            # substrate already copies its row gradients D2H every step, so the
+            # flag rides a read that exists and the table update has to know
+            # `0` (drop the leaves, move nothing) or `1` (the normal update).
+            # `scale=0` is the OLD skip branch exactly.
+            updates, rows = host_step_all(model, lr, _host_scalar(flag_dev))
+            total.count("engram_host_updates", updates)
+            window.count("engram_host_updates", updates)
+            total.count("engram_host_update_rows", rows)
+            window.count("engram_host_update_rows", rows)
 
         if (step + 1) % cfg.log_every == 0:
             # The 0-sync rule: every DEVICE-side counter this window gathered
             # is read NOW, in one batched GPU→CPU transfer, at the declared
-            # cadence — never per pass.
-            window.drain()
+            # cadence — never per pass. The last loss is the one other read,
+            # and it happens here and nowhere else.
+            drained = window.drain()
             total.drain()
-            if window_finite and not any(window_finite):
+            nan_window = int(drained.get("nan_skipped", 0))
+            if window_steps and nan_window >= window_steps:
                 drowning += 1
-            elif window_finite:
+            elif window_steps:
                 drowning = 0
-            window_finite = []
+            window_steps = 0
+            nan_skipped = int(total.get("nan_skipped", 0))
+            last_loss = _host_scalar(last_loss_dev)
             parts = [
                 f"step={step + 1}",
                 f"loss={last_loss:.4f}",
@@ -1118,6 +1181,12 @@ def train(
             sf("train")
             log(f"ckpt step={step + 1} -> {weights} ({snapshot})")
 
+    # The report is a declared cadence: drain whatever the last (partial)
+    # window gathered, and read the last finite loss. Both are host reads, and
+    # both happen HERE — never inside a step.
+    total.drain()
+    nan_skipped = int(total.get("nan_skipped", 0))
+    last_loss = _host_scalar(last_loss_dev)
     if cfg.eval and eval_stream is not None and cfg.steps % cfg.eval_every != 0:
         sf("eval")
         line, _ev, _scored = _eval_line(

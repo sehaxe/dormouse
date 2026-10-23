@@ -728,7 +728,15 @@ class Muon(Optimizer):
             return zeropower_via_ns(x, steps, self.ns_kind)
         return zeropower_via_ns(x, steps, self.ns_kind, self.ns_dtype)
 
-    def _step_one(self, p: torch.Tensor, lr: float, mu: float, ns: int, scale: float) -> None:
+    def _step_one(
+        self,
+        p: torch.Tensor,
+        lr: float,
+        mu: float,
+        ns: int,
+        scale: float,
+        flag: torch.Tensor | None = None,
+    ) -> None:
         """The per-param update — the reference the batched path must match.
 
         Kept because it is the definition, and used by the batched step for the
@@ -756,9 +764,13 @@ class Muon(Optimizer):
             self._sf_one(p, update, lr)
             return
         if self.variant == "normuon":
-            self._nor_apply(p, update, lr)
+            self._nor_apply(p, update, lr, flag)
             return
         update = colrow_normalize(update)
+        if flag is not None:
+            # The device firewall's gate (0/1, on the device): `*1.0` is exact
+            # on a healthy step, so this cannot move a health-run number.
+            update = update.mul(flag.to(update.dtype))
         with torch.no_grad():
             if torch.is_tensor(lr):
                 # The CUDA-graph arm (`train/graph.py`): `lr` is a 0-dim DEVICE
@@ -774,7 +786,9 @@ class Muon(Optimizer):
             else:
                 p.add_(update.to(p.dtype), alpha=-lr * scale)
 
-    def _nor_apply(self, p: torch.Tensor, o: torch.Tensor, lr: float) -> None:
+    def _nor_apply(
+        self, p: torch.Tensor, o: torch.Tensor, lr: float, flag: torch.Tensor | None = None
+    ) -> None:
         """The `normuon` tail for ONE parameter: `W -= η·λ·W + η·update`.
 
         `update` is the repo's tail (`normuon_repo_update_`) applied to the BARE
@@ -787,14 +801,24 @@ class Muon(Optimizer):
         state = self.state[p]
         v = state.setdefault("v", torch.zeros(p.shape[0], dtype=torch.float32, device=p.device))
         update = normuon_repo_update_(o, v, p.shape, self.beta2)
+        if flag is not None:
+            update = update.mul(flag.to(update.dtype))
         with torch.no_grad():
             if self.wd:
-                p.mul_(1.0 - lr * self.wd)
+                p.mul_(_gate_identity(flag, 1.0 - lr * self.wd, p))
             p.add_(update.to(p.dtype), alpha=-lr)
 
     def _sf_one(self, p: torch.Tensor, o: torch.Tensor, lr: float) -> None:
         """The schedule-free tail for ONE parameter (the batched twin is
-        `_sf_batched`; both use `_sf_direction` and `_sf_ckp`)."""
+        `_sf_batched`; both use `_sf_direction` and `_sf_ckp`).
+
+        The SF arm is the ONE host-gated path left, and it is named rather than
+        silent: its `s`/`c` recursion is HOST state (`_sf_ckp`), so the firewall
+        reads the flag on the host for this arm alone and skips the whole Muon
+        step (`MixOptimizer.step`). `opt_graph` already refuses SF, so the
+        capture goal — the reason the rest of the step is device-resident — is
+        not touched by it.
+        """
         state = self.state[p]
         if "z" not in state:
             dtype = _torch_dtype(self.state_dtype)
@@ -841,6 +865,9 @@ class Muon(Optimizer):
         whole recursion is host arithmetic — no device read, no sync (the port's
         rule 1.3). Stored per parameter as `sf_s`, so torch's own `state_dict`
         carries it (a float, not a tensor: nothing to sync and nothing to cast).
+        This is why the SF arm is host-gated in `MixOptimizer.step`: its `s` is
+        host state the device flag cannot reach without a read, and `opt_graph`
+        refuses SF for the same reason.
         """
         s = s_prev + lr * lr
         return s, lr * lr / s
@@ -882,7 +909,7 @@ class Muon(Optimizer):
                 else:
                     p.copy_(st["z"]).lerp_(st["x"].to(p.dtype), self.sf_beta)
 
-    def batched_step_from_model(self, model) -> int:
+    def batched_step_from_model(self, model, flag: torch.Tensor | None = None) -> int:
         """The shape-batched Muon pass (a no-op when the batches are trivially small).
 
         The per-param loop above re-derives identical-shape Newton-Schulz
@@ -927,7 +954,7 @@ class Muon(Optimizer):
                 # batch would MOVE that parameter's update scale by 1/sqrt(d0).
                 for p in params:
                     if p.grad is not None:
-                        self._step_one(p, lr, mu, ns, scale)
+                        self._step_one(p, lr, mu, ns, scale, flag)
                 continue
             mom = grp.mom
             # The momentum update, in place, without a stack: `mom` is the
@@ -953,7 +980,7 @@ class Muon(Optimizer):
                     self._sf_batched(grp, start, len(params_c), params_c, update, lr, c)
                     continue
                 if self.variant == "normuon":
-                    self._nor_batched(grp, start, len(params_c), params_c, update, lr)
+                    self._nor_batched(grp, start, len(params_c), params_c, update, lr, flag)
                     continue
                 # In place: `update` is a fresh tensor the optimizer owns (NS
                 # always allocates on its first `x / (norm + eps)`), and the
@@ -962,13 +989,25 @@ class Muon(Optimizer):
                 # (55 + 57 ms/step). The size check guarantees identical
                 # shapes so the sockets align 1:1.
                 colrow_normalize_(update, colrow_3d=self.colrow_3d).mul_(-lr * scale)
+                if flag is not None:
+                    # The device firewall's gate: `*1.0` on a healthy step is
+                    # bit-exact, `*0` on a skipped one makes the write below a
+                    # zero add. Nothing here branches on the flag.
+                    update.mul_(flag.to(update.dtype))
                 with torch.no_grad():
                     torch._foreach_add_([p.detach() for p in params_c], torch.unbind(update))
             n_batches += 1
         return n_batches
 
     def _nor_batched(
-        self, grp: _MomGroup, start: int, k: int, params_c: list, o: torch.Tensor, lr: float
+        self,
+        grp: _MomGroup,
+        start: int,
+        k: int,
+        params_c: list,
+        o: torch.Tensor,
+        lr: float,
+        flag: torch.Tensor | None = None,
     ) -> None:
         """The `normuon` tail for one CHUNK: `W -= η·λ·W + η·update`.
 
@@ -981,9 +1020,14 @@ class Muon(Optimizer):
             grp.shape,
             self.beta2,
         )
+        if flag is not None:
+            update = update.mul(flag.to(update.dtype))
         with torch.no_grad():
             if self.wd:
-                torch._foreach_mul_([p.detach() for p in params_c], 1.0 - lr * self.wd)
+                torch._foreach_mul_(
+                    [p.detach() for p in params_c],
+                    [_gate_identity(flag, 1.0 - lr * self.wd, p) for p in params_c],
+                )
             torch._foreach_add_([p.detach() for p in params_c], torch.unbind(update), alpha=-lr)
 
     def _sf_batched(
@@ -1187,13 +1231,110 @@ class MixOptimizer:
             )
         self.muon.sf_switch(mode)
 
-    def step(self) -> None:
-        """The mixed step: the batched Muon per shape ( Platzhalter-kill), AdamW per group."""
+    def step(self, flag: torch.Tensor | None = None) -> None:
+        """The mixed step: the batched Muon per shape ( Platzhalter-kill), AdamW per group.
+
+        `flag` is the trainer's DEVICE firewall: a 0-dim 1/0 tensor that says
+        whether this step's loss and gradients were finite. It stays on the
+        device — nothing here reads it on the host — and it multiplies every
+        WRITE the optimizer makes, so a non-finite step becomes a no-op update
+        without a `bool(tensor)` anywhere (ADR-0018 rule 2, `mask_fill` /
+        multiply-by-the-flag). `None` (every other caller) is the old path
+        unchanged.
+
+        Two arms cannot follow a device flag and are refused at setup rather
+        than silently ungated: bitsandbytes' `AdamW8bit` (it has no hook
+        between its state and the parameter write) — `train()` refuses
+        `optim_8bit` with this firewall.
+
+        AdamW's own decoupled weight decay is lifted out of `torch.optim` here
+        for ONE reason: `p.mul_(1 - lr*wd)` moves a parameter even when its
+        gradient is zero, so a gated (zeroed) first moment alone is not enough.
+        The factor is applied by `_gated_adamw_step` instead, from the same
+        `1 - lr*wd` value torch would have used (a 0-dim tensor of the SAME
+        float32 value, which ATen's scalar path also casts to), and is selected
+        to exactly 1.0 on a skipped step. On a healthy step the arithmetic is
+        bit-identical to the stock optimizer — `tests/test_nan_firewall.py`
+        pins that against a HEAD golden, and the conversion was checked on CPU.
+        """
         if self.muon is not None:
-            n_batched = self.muon.batched_step_from_model(self.model)
-            self.steps_batched = n_batched
-        self.adamw.step()
+            if self.muon.sf and flag is not None:
+                # The SF arm's `s`/`c` are HOST state (`_sf_ckp`), so its skip
+                # has to be decided on the host: ONE declared read per step,
+                # exactly the old skip branch (the step is not called at all, so
+                # `z`, `x` and `s` cannot advance). `opt_graph` refuses SF, so
+                # this never sits inside a capture; every other arm is
+                # device-resident.
+                if float(flag) > 0.0:
+                    self.steps_batched = self.muon.batched_step_from_model(self.model)
+            else:
+                n_batched = self.muon.batched_step_from_model(self.model, flag)
+                self.steps_batched = n_batched
+        if flag is None:
+            self.adamw.step()
+        else:
+            self._gated_adamw_step(flag)
         self.steps += 1
+
+    @torch.no_grad()
+    def _gated_adamw_step(self, flag: torch.Tensor) -> None:
+        """AdamW with every parameter WRITE scaled by the device flag.
+
+        Three writes happen in a stock AdamW step, and each is gated:
+
+        * `p.mul_(1 - lr*wd)` — replaced by our own multiply with a factor
+          selected to 1.0 on a skipped step (see `step`'s docstring);
+        * the moment update `exp_avg.lerp_(grad, 1-beta1)` — its `grad` was
+          sanitized to zero by the trainer, so the only thing to stop is the
+          carried first moment reaching the `addcdiv_`; it is multiplied by the
+          flag before the call, so the update term is exactly zero. The cost is
+          a semantic one, named here rather than discovered: a skipped step
+          ZEROES the first moment (`exp_avg`), i.e. the step after a NaN restarts
+          the momentum from the current gradient. The second moment keeps
+          decaying (`grad = 0`), stays finite, and the old skip left both
+          untouched — this is the price of not branching on the device value;
+        * `p.addcdiv_(exp_avg, denom, value=-step_size)` — zero numerator is a
+          zero update, and on the healthy path `exp_avg * 1.0` is bit-exact.
+
+        The weight decay is written back after `adamw.step()` so the optimizer's
+        `param_groups` — and therefore every checkpoint's `opt` half — keep the
+        config's value; only the step's own view is zero.
+        """
+        dtype = next(p for g in self.adamw.param_groups for p in g["params"]).dtype
+        device = flag.device
+        scale = flag.to(dtype)
+        keep = flag.to(torch.bool)
+        one = torch.ones_like(scale)
+        zeroed: list[tuple[dict, float]] = []
+        for group in self.adamw.param_groups:
+            params = [p for p in group["params"] if p.grad is not None]
+            if not params:
+                continue
+            lr = group["lr"]
+            wd = group.get("weight_decay", 0.0)
+            if wd:
+                # The graph arm's LR is a device tensor the capture re-reads; a
+                # host lr is the eager path's float. Both produce the SAME
+                # float32 scalar torch's `p.mul_(1 - lr*wd)` would have used.
+                factor = (
+                    1 - lr * wd
+                    if torch.is_tensor(lr)
+                    else torch.as_tensor(1.0 - lr * wd, dtype=params[0].dtype, device=device)
+                )
+                factor = torch.where(keep, factor, one)
+                torch._foreach_mul_(params, [factor.expand_as(p) for p in params])
+                zeroed.append((group, wd))
+                group["weight_decay"] = 0.0
+            moments = [
+                self.adamw.state[p]["exp_avg"]
+                for p in params
+                if "exp_avg" in self.adamw.state.get(p, {})
+            ]
+            if moments:
+                torch._foreach_mul_(moments, [scale.expand_as(m) for m in moments])
+        self.adamw.step()
+        for group, wd in zeroed:
+            group["weight_decay"] = wd
 
     def state_dict(self) -> dict:
         return {
@@ -1208,6 +1349,39 @@ class MixOptimizer:
             self.muon.load_state_dict(state["muon"])
         self.adamw.load_state_dict(state["adamw"])
         self.steps = int(state["steps"])
+
+
+def _gate_identity(flag: torch.Tensor | None, value: float, like: torch.Tensor):
+    """`value` on a finite step, the multiply identity `1.0` on a skipped one.
+
+    The device firewall's multiply-by-the-flag pattern (ADR-0018): no
+    `bool(tensor)` anywhere, and `* 1.0` is bit-exact, so the healthy path
+    cannot move. Returns a host float when `flag is None` (the old path).
+    """
+    if flag is None:
+        return value
+    one = torch.ones((), dtype=like.dtype, device=like.device)
+    kept = torch.as_tensor(value, dtype=like.dtype, device=like.device)
+    return torch.where(flag.to(torch.bool), kept, one).expand_as(like)
+
+
+def _grad_vector_norm(grads: list[torch.Tensor]) -> torch.Tensor:
+    """`‖g‖₂` over a list of GRADIENT tensors as ONE device scalar."""
+    if not grads:
+        return torch.zeros(())
+    norms = torch._foreach_norm(grads, 2)
+    return torch.linalg.vector_norm(torch.stack([n.float() for n in norms]))
+
+
+def grad_norm(params) -> torch.Tensor:
+    """`‖g‖₂` over every parameter gradient as ONE device scalar.
+
+    The device firewall's gradient test: a vector norm is non-finite iff any
+    element is, so one reduction answers "did any gradient go NaN/inf" without
+    a host read. `clip_grads` uses the same reduction for its coefficient, so
+    both call sites measure the same quantity.
+    """
+    return _grad_vector_norm([p.grad for p in params if p.grad is not None])
 
 
 def clip_grads(params, max_norm: float) -> torch.Tensor:
@@ -1225,10 +1399,7 @@ def clip_grads(params, max_norm: float) -> torch.Tensor:
     grads = [p.grad for p in params if p.grad is not None]
     if not grads:
         return torch.zeros(())
-    norms = torch._foreach_norm(grads, 2)
-    total = torch.linalg.vector_norm(
-        torch.stack([n.float() for n in norms])
-    )  # l2 over l2s = the norm of the concatenation
+    total = _grad_vector_norm(grads)
     coef = (max_norm / (total + 1e-6)).clamp(max=1.0)
     torch._foreach_mul_(grads, [coef] * len(grads))
     return total
