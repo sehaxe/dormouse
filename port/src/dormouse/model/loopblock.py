@@ -653,7 +653,15 @@ class LoopBlock(nn.Module):
                 h = streams.sum(dim=-2)
             else:
                 counters.count("rezero_write")
-                h = ctx + y * self.residual_scale
+                h = ctx + y
+
+            # ONE learnable output gain for every write path. It used to be
+            # applied only in the plain-residual branch, so with mHC or AttnRes
+            # armed the parameter received NO gradient (measured: 815 params
+            # with .grad, `loop.residual_scale` the one missing) — dead weight,
+            # and the reason `opt_graph` refused to capture. Multiplying by 1.0
+            # is exact, so every golden that pins logits at init is unchanged.
+            h = h * self.residual_scale
 
             step_out = self.out_proj(h.reshape(b * t, d)).reshape(b, t, d)
             out_acc = out_acc + step_out
