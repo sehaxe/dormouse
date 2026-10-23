@@ -632,6 +632,17 @@ class Muon(Optimizer):
         #: so the default path's log line does not move.
         self.counters = Counters()
 
+    def drop_groups(self) -> None:
+        """Forget the stacked shape groups; the next step rebuilds them.
+
+        The GROUP is a view over `state[p]` (`_MomGroup`), and a parameter
+        resized by `rank_mode="load"` has a new shape — the old rows cannot be
+        copied into the new stack. `MixOptimizer.reset_state` pops the resized
+        parameters' state first, so the rebuild sees zeros where the shapes
+        moved and the surviving views everywhere else.
+        """
+        self._groups = []
+
     def _build_groups(self) -> None:
         """One stacked momentum buffer per unique shape; per-param state views it.
 
@@ -1194,6 +1205,51 @@ class MixOptimizer:
             self.steps_batched = n_batched
         self.adamw.step()
         self.steps += 1
+
+    def reset_state(self, pairs: list[tuple]) -> int:
+        """Re-point the optimizer at RESIZED parameters, then drop their state.
+
+        `rank_mode="load"` REPLACES a resized expert's `nn.Parameter` objects:
+        a shape change by `p.data = …` is not safe under autograd (a saved
+        variable from the previous graph keeps the pre-resize metadata; measured
+        2026-10-23, the NEXT backward dies on `MmBackward0 ... expected shape
+        compatible with [48, 128]`, see `DualLatentGLU.set_rank`). The new
+        objects are not in any `param_groups` list, so the optimizer is
+        re-pointed HERE — the alternative is an optimizer stepping tensors the
+        model no longer has, a run whose loss moves while its forward does not.
+
+        State is DROPPED rather than reshaped: `state[p]["momentum"]`,
+        AdamW's `exp_avg`/`exp_avg_sq`, SF's `x`/`z` and NorMuon's `v` are all
+        shaped like the parameter, and a `[d, 16]` buffer cannot serve a
+        `[d, 40]` parameter. Restarting one expert's running average is the
+        honest cost of a discrete architecture change; keeping a momentum for
+        columns that did not exist would be the same defect in a bigger tensor.
+
+        `Muon`'s shape GROUPS are stacked views over that state, so they are
+        rebuilt on the next step (`drop_groups`) — for ANY replacement, not
+        only one whose state existed: a group still holding the old object
+        would step it. `bitsandbytes`' AdamW keeps the per-parameter contract,
+        so the same `pop` reaches it.
+        """
+        muon_replaced = False
+        n = 0
+        for old, new in pairs:
+            old.grad = None
+            new.grad = None
+            if self.adamw.state.pop(old, None) is not None:
+                n += 1
+            for group in self.adamw.param_groups:
+                group["params"] = [new if q is old else q for q in group["params"]]
+            if self.muon is not None:
+                if self.muon.state.pop(old, None) is not None:
+                    n += 1
+                muon_replaced = True
+                for group in self.muon.param_groups:
+                    group["params"] = [new if q is old else q for q in group["params"]]
+                self.muon_params = [new if q is old else q for q in self.muon_params]
+        if muon_replaced:
+            self.muon.drop_groups()
+        return n
 
     def state_dict(self) -> dict:
         return {

@@ -114,6 +114,20 @@ MOE_GATHERS = ("off", "kernel")
 #: one `U` for the bank, `dict` is one dictionary plus a per-expert column
 #: subset. A name that is not here is LOUD.
 SHARE_U_MODES = ("off", "plane", "dict")
+#: The `rank_mode` literals — how the FIXED per-site rank budget `rank` is
+#: split across the routed bank (`experts.SparseMoE.reallocate_ranks`):
+#: `uniform` gives every expert `rank` (every number on record); `load` gives a
+#: hot expert a larger rank and a cold one a smaller one from the SAME total,
+#: re-split every `rank_cadence` optimizer steps from the routing integrator
+#: `lfb_counts`. A name that is not here is LOUD.
+RANK_MODES = ("uniform", "load")
+#: The `load` mode's per-expert rank floor and ceiling. MEASURED, not chosen
+#: (`scripts/ab_rank.py`, 2026-10-21): at fixed width, rank 32 costs +0.027 BPB
+#: against 64, rank 16 +0.136, rank 8 crashes the Triton kernel and rank 2 is
+#: NaN — so 16 is the lowest rank that still trains and 64 is the width every
+#: number on record runs (the grouped-GEMM tiles are priced at it).
+RANK_FLOOR = 16
+RANK_CEIL = 64
 #: The `moe_topk_mode` literals — how many experts each TOKEN runs
 #: (`model/adaptive_topk.py`): `off` is the constant `moe_topk` width every
 #: number on record runs; `entropy`/`margin` are the per-token confidence
@@ -293,6 +307,43 @@ class ModelConfig:
     #: `halt_mode` without a halt head is LOUD.
     halt_mode: bool = False
     rank: int = 64
+    #: How the FIXED per-site rank budget `rank` is split across the routed
+    #: bank (`RANK_MODES`, 2026-10-23): `uniform` (the default,
+    #: bit-identical to the tree before the flag existed) gives every expert
+    #: `rank`; `load` gives a HOT expert more rank and a COLD one less from the
+    #: SAME total, re-split on the `rank_cadence` cadence from the MoE's own
+    #: routing integrator (`SparseMoE.lfb_counts`).
+    #:
+    #: `rank` stays the BUDGET in both modes — the MEAN rank, so
+    #: `sum(rank_i) == n_experts·rank` is held exactly (the water-fill in
+    #: `experts.allocate_ranks`), which is why the parameter count is unchanged
+    #: by a reallocation: per expert the bank costs
+    #: `2·d·rank_i + rank_i·f + 2·rank_i`, so the total is `(2d + f + 2)·Σrank_i`.
+    #: What `load` buys is CAPACITY WHERE THE TRAFFIC IS, not fewer parameters or
+    #: FLOPs: the bank stays RECTANGULAR at `rank_max` (a zero-padded
+    #: `[E, d, rank_max]` stack — the padded bmm, the grouped GEMM and the
+    #: gather kernel all require one rectangular shape), so every expert runs at
+    #: `rank_max` FLOPs and a cold expert's padded columns contribute exactly
+    #: zero. The honest scope of the arm is "same parameters, reallocated rank",
+    #: and the A/B is `scripts/ab_pe_rank.py`.
+    #:
+    #: REFUSED loudly in `load` mode: `rank` outside [`RANK_FLOOR`, `RANK_CEIL`]
+    #: (the measured band), `n_experts < 4` (fewer experts than rank buckets
+    #: makes the histogram meaningless), `share_u_mode != "off"` (the shared
+    #: basis is ONE `[d, rank]` tensor for the whole site — a per-expert rank
+    #: would have to grow the SHARED width, i.e. add parameters), and
+    #: `factor_qat != "none"` (`_banks` quantizes ONE rectangular
+    #: `[E, ·, ·]` stack per site with a per-expert α; a ragged stack has no
+    #: rectangular α to project, and padding before the α would fold the zeros
+    #: into it). `opt_graph=true` is refused at the capture site for the same
+    #: class of reason: a capture bakes parameter SHAPES, and this cadence
+    #: changes them.
+    rank_mode: str = "uniform"
+    #: The `load` mode's reallocation cadence, in OPTIMIZER steps (the trainer's
+    #: `step` index). A DECLARED cadence is what makes the one host read legal
+    #: (port rule 1.3): the split is constant between firings, and a step that
+    #: does not fire touches no device tensor. `uniform` never reads it.
+    rank_cadence: int = 1000
     norm_eps: float = 1e-3
 
     # --- precision ------------------------------------------------------
@@ -1268,6 +1319,59 @@ def validate(model: ModelConfig) -> None:
         )
     if model.rank < 1 or model.shared_rank < 1:
         loud(f"rank and shared_rank must be >= 1, got {model.rank}/{model.shared_rank}")
+    if model.rank_mode not in RANK_MODES:
+        loud(
+            f"rank_mode={model.rank_mode!r} is not an arm. Known: {list(RANK_MODES)} — "
+            f"`uniform` every expert at `rank` (every number on record), `load` the "
+            f"same total split by routing load every `rank_cadence` steps "
+            f"(experts.SparseMoE.reallocate_ranks). Escape: name one of those, or "
+            f"land the split and its gate BEFORE the config can lie about it."
+        )
+    if model.rank_mode == "load":
+        if not RANK_FLOOR <= model.rank <= RANK_CEIL:
+            loud(
+                f"rank_mode='load' with rank={model.rank}: `rank` is the MEAN of a "
+                f"per-expert split whose band is [{RANK_FLOOR}, {RANK_CEIL}] — the "
+                f"measured floor (rank 16 costs +0.136 BPB, rank 8 crashes the Triton "
+                f"kernel, rank 2 is NaN) and the ceiling (rank 64 is the width every "
+                f"number on record runs). A mean outside the band cannot be a convex "
+                f"split with a constant total. Escape: {RANK_FLOOR} <= rank <= "
+                f"{RANK_CEIL}, or rank_mode='uniform'."
+            )
+        if model.n_experts < 4:
+            loud(
+                f"rank_mode='load' with n_experts={model.n_experts}: the histogram "
+                f"this arm logs is rank16/32/48/64 over the bank, and fewer than 4 "
+                f"experts means a bucket is empty by construction — the arm would "
+                f"report a split it cannot express. Escape: n_experts >= 4, or "
+                f"rank_mode='uniform'."
+            )
+        if model.rank_cadence < 1:
+            loud(
+                f"rank_mode='load' with rank_cadence={model.rank_cadence}: the "
+                f"cadence is a count of optimizer steps between re-splits, and 0 "
+                f"would re-split (and read the load back to the host) every step. "
+                f"Escape: rank_cadence >= 1 (1000 is the declared default)."
+            )
+        if model.share_u or model.share_u_mode != "off":
+            loud(
+                f"rank_mode='load' with share_u_mode={model.share_u_mode!r} "
+                f"(share_u={model.share_u}): the shared basis is ONE `[d, rank]` "
+                f"tensor per site, so a per-expert rank could only grow the WRITE "
+                f"`V`; the input side would stay at the budget while hot experts "
+                f"write from more columns than the plane has — extra parameters the "
+                f"uniform arm does not pay (the split would stop being budget "
+                f"neutral). Escape: share_u_mode='off', or rank_mode='uniform'."
+            )
+        if model.factor_qat != "none":
+            loud(
+                f"rank_mode='load' with factor_qat={model.factor_qat!r}: `_banks` "
+                f"projects ONE rectangular `[E, ·, ·]` stack with a PER-EXPERT α "
+                f"(`dim=(1, 2)`), and a ragged bank has no rectangular α — padding "
+                f"BEFORE the α would fold the zero columns into each expert's absmean, "
+                f"and padding after it would be a second quantizer path with no gold "
+                f"test. Escape: factor_qat='none', or rank_mode='uniform'."
+            )
     if not 0.0 < model.engram_lam_max <= 1.0:
         loud(f"engram_lam_max={model.engram_lam_max} outside (0, 1]: it is a share")
     if len(model.engram_orders) == 0:

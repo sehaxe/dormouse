@@ -73,7 +73,7 @@ import torch.nn.functional as F
 from ..config import RunConfig, TrainConfig
 from ..instrument import Counters, LoudError, StepTimer, loud
 from ..model.engram import Engram, enable_host_tables, host_engrams, host_step_all
-from ..model.experts import invalidate_banks_all
+from ..model.experts import invalidate_banks_all, reallocate_ranks_all
 from ..model.qat_cache import invalidate_qat_cache_all
 from ..post.tasks import build_tasks
 from .data import ByteStream, warmup_steps
@@ -834,6 +834,19 @@ def sft_train(
         if opt.muon is not None:
             for group in opt.muon.param_groups:
                 group["lr"] = lr
+
+        # The rank cadence, the same call `train()` makes (`loop.py`): a
+        # `rank_mode="load"` arm that never fired here would silently train the
+        # uniform bank wearing the arm's label. Behind the host config check, so
+        # a uniform SFT step allocates nothing.
+        if run.model.rank_mode == "load":
+            rank_counters = Counters()
+            resized = reallocate_ranks_all(model, step, rank_counters)
+            if resized:
+                opt.reset_state(resized)
+            if rank_counters:
+                total.merge(rank_counters)
+                window.merge(rank_counters)
 
         x, y = stream.next_batch()
         if device is not None:

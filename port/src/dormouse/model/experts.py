@@ -55,6 +55,51 @@ The arm is refused LOUDLY with `use_tsct = false`, and `dict` additionally with
 has no subset to choose, so every expert would read the whole plane). Default
 off is bit-identical: no parameter, no draw, no counter.
 
+ONE switch on the routed bank, OFF by default: **`rank_mode`** (`RANK_MODES`).
+`uniform` (the default, and bit-identical to the tree before the flag existed)
+gives every routed expert rank `cfg.rank`. `load` keeps `cfg.rank` as the
+BUDGET — the MEAN per-expert rank — and re-splits it every `rank_cadence`
+optimizer steps by the routing load the LFB integrator already accumulates
+(`lfb_counts`):
+
+    rank_i = clamp(16, 64, round(rank · load_i / mean(load)))
+
+then a water-fill hands/takes ±1 from the hottest/coldest experts until
+`Σ rank_i == E·rank` EXACTLY. Per expert the bank costs
+`2·d·rank_i + rank_i·f + 2·rank_i` (`gate_u`/`up_u`, `v`, the two scales), so
+the total `(2d + f + 2)·Σrank_i` is unchanged by the split: **a reallocation
+moves CAPACITY, not parameter count.**
+
+The bank stays RECTANGULAR at `rank_max = max(rank_i)`: `_banks` zero-pads the
+`U` columns and the `V` rows of a cold expert, because the padded bmm, the
+grouped GEMM and the gather kernel all take ONE `[E, d, r]` / `[E, r, f]`
+shape. Three consequences, stated because each one bounds the claim:
+
+* **Padding saves no FLOP.** Every expert runs at `rank_max`; the pad columns
+  are exactly zero (`x @ 0 == 0`, `silu(0) = 0`, `h ⊙ 0 = 0`) so they cost time
+  and return nothing. A bucket arm (one GEMM per rank bucket) is the only way
+  to turn the split into FLOPs, and it is NOT implemented here.
+* **Growth must be LIVE.** A zero-grown `U` column is a dead direction
+  (`∂L/∂u = silu(g)·∂L/∂h = 0` at zero), so the grown `U` columns are fresh
+  `init_u` draws from a per-`(step, expert)` seed (a resume must reproduce
+  them, ADR-0021) and the grown `V` rows start at EXACTLY zero — the expert's
+  function is continuous across the reallocation and the new capacity learns
+  through the gradient of `V` first.
+* **The shapes are ragged, so the split is not free.** Parameters are
+  resized in place; the optimizer state for a resized parameter is stale by
+  construction (`[d, 16]` momentum cannot serve `[d, 40]`) and the trainer
+  drops it (`optim.MixOptimizer.reset_state`) at the same cadence. The
+  checkpoint carries the split for free — a parameter's shape IS its rank, so
+  `_load_from_state_dict` rebuilds the ragged shapes before loading, and
+  `uniform`'s `state_dict` gains no key.
+
+`load` is refused loudly with `share_u` (the shared basis is one `[d, rank]`
+tensor per site: a per-expert rank would grow the SHARED width, i.e. add
+parameters the uniform arm does not pay) and with `factor_qat` (the banked
+quantizer projects ONE rectangular `[E, ·, ·]` stack with a per-expert α, and
+padding before the α would fold zeros into it). `uniform` emits no counter and
+draws no RNG: the default path is unchanged.
+
 `factor_qat` rides the shared basis with ONE quantized copy per site: the
 `[d, rank]` plane / `[d, share_u_rank]` dictionary gets its own single α
 (`dim=None`, the per-TENSOR absmean) and `qat_values` projection, cached once
@@ -223,7 +268,7 @@ from torch import nn
 from torch.autograd.graph import saved_tensors_hooks
 from torch.utils.checkpoint import checkpoint
 
-from ..config import FACTOR_QATS, SHARE_U_MODES
+from ..config import FACTOR_QATS, RANK_CEIL, RANK_FLOOR, RANK_MODES, SHARE_U_MODES
 from ..instrument import Counters, loud
 from .act_quant import fake_quant_act
 from .adaptive_topk import check_policy, choose_k, select_topk
@@ -348,6 +393,125 @@ def _refuse_shared_qat(factor_qat: str, where: str) -> None:
 #: because a seed that moves the architecture is a different model, not a
 #: different run of the same one.
 SHARE_U_DICT_SEED = 20_261_021
+
+#: The seed the `rank_mode="load"` GROWTH draws from (`_rank_init_seed`). Fixed
+#: and per-`(step, expert)` for the same reason the dictionary index is fixed:
+#: a grown `U` column is a model value a resume must reproduce, and the global
+#: torch stream is not carried by a checkpoint (ADR-0021). Not drawn from the
+#: run's `--seed` for the same reason the dictionary is not: the seed picks a
+#: run, the growth is a constant of `(config, step)`.
+RANK_INIT_SEED = 20_261_022
+
+
+def _rank_init_seed(step: int, expert: int) -> int:
+    """The per-`(step, expert)` seed of a grown rank slice — a PURE function.
+
+    Two runs of one config grow the same columns; a resume at the same step
+    draws the same bits. Collisions across experts are impossible for our
+    ranges (`7919` and `1_000_003` are coprime to any `E < 1e6`), which is all
+    the independence this needs — it is a seed, not a hash.
+    """
+    return RANK_INIT_SEED + 1_000_003 * step + 7919 * expert
+
+
+def allocate_ranks(
+    load,
+    budget: int,
+    *,
+    floor: int = RANK_FLOOR,
+    ceil: int = RANK_CEIL,
+) -> list[int]:
+    """The `rank_mode="load"` split: `clamp(floor, ceil, round(budget·load_i/mean))`.
+
+    The rule the config documents, in ONE place, plus the pass that makes the
+    budget EXACT: rounding a clamped split does not sum to `E·budget` (the
+    clamp absorbs mass at both ends), and a total that drifts is a parameter
+    count that drifts — so the residual is water-filled onto the experts with
+    the most room, hottest-first when the split under-spent and coldest-first
+    when it over-spent. `sum(ranks) == len(load)·budget` is asserted, not
+    hoped for.
+
+    A load vector of all zeros (a bank that never routed — a hand-built fixture,
+    or a cadence that fires before any training step) has no mean to divide by;
+    it returns the uniform split. `SparseMoE.reallocate_ranks` COUNTS that case
+    (`pe_rank_no_load`) instead of pretending it measured a load.
+    """
+    e = len(load)
+    assert e >= 1, "allocate_ranks on an empty bank"
+    assert floor >= 1 and ceil >= floor, f"bad rank band [{floor}, {ceil}]"
+    total = e * budget
+    assert e * floor <= total <= e * ceil, (
+        f"budget={budget} outside the convex band [{floor}, {ceil}] for E={e}: "
+        f"the total {total} cannot be split inside the band"
+    )
+    mean = sum(float(v) for v in load) / e
+    if mean <= 0.0:
+        return [budget] * e
+    ranks = [min(ceil, max(floor, int(round(budget * float(v) / mean)))) for v in load]
+    need = total - sum(ranks)
+    if need:
+        # Water-fill ONE rank per expert per pass, hottest-first when the split
+        # under-spent and coldest-first when it over-spent (ties by expert
+        # index), so a clamped expert's excess is spread over the experts that
+        # share its load instead of piling onto the first one with room. At most
+        # `ceil - floor` passes; the loop terminates because the band holds the
+        # budget (asserted above), so some expert always has room in a pass.
+        order = sorted(range(e), key=lambda i: float(load[i]), reverse=need > 0)
+        while need:
+            moved = 0
+            for i in order:
+                if need == 0:
+                    break
+                if need > 0 and ranks[i] < ceil:
+                    ranks[i] += 1
+                    need -= 1
+                    moved += 1
+                elif need < 0 and ranks[i] > floor:
+                    ranks[i] -= 1
+                    need += 1
+                    moved += 1
+            assert moved, (
+                f"rank band [{floor}, {ceil}] cannot hold {total} over E={e}: the "
+                f"allocation stalled with {need} left to place"
+            )
+    assert sum(ranks) == total, f"rank sum {sum(ranks)} != {total}: the budget moved"
+    return ranks
+
+
+def _rank_bucket(rank: int) -> int:
+    """The histogram bucket of one rank: the smallest of 16/32/48/64 that holds it.
+
+    A shallow split lands on non-16-multiples (37, 41, …), and four named
+    counters cannot be four exact values; bucketing UP keeps the four counts a
+    PARTITION of the bank (`Σ == E`), which is what a reader checks a histogram
+    for. `pe_rank16` therefore means "at the floor".
+    """
+    for edge in (16, 32, 48, 64):
+        if rank <= edge:
+            return edge
+    raise AssertionError(f"rank {rank} above {RANK_CEIL}")
+
+
+def _pad_rank(t: torch.Tensor, rank: int, name: str, *, value: float = 0.0) -> torch.Tensor:
+    """Pad ONE expert factor to `rank` on its RANK axis — exactly `value`.
+
+    `gate_u`/`up_u` are `[d, r]` and pad their COLUMNS; `v` is `[r, f]` and
+    pads its ROWS; the scales are `[r]` and pad their only axis. The pad is a
+    constant, so the bank is finite (`inf × 0` is NaN in the backward) and the
+    contribution is EXACT zero: a zero `U` column makes the latent exactly 0,
+    `silu(0)·0 = 0`, and a zero `V` row writes nothing. The SCALE pad is 1.0
+    on purpose — it multiplies a latent that is already zero, so it never
+    reaches the output, and 1.0 keeps the scale a scale instead of a second
+    mask (`tests/test_pe_rank.py` asserts the zero pad and the zero
+    contribution).
+    """
+    if name == "v":
+        pad = rank - t.shape[0]
+        assert 0 <= pad <= rank, f"pad {pad} for {name} to rank {rank} is not a pad"
+        return t if pad == 0 else F.pad(t, (0, 0, 0, pad), value=value)
+    pad = rank - (t.shape[1] if name in ("gate_u", "up_u") else t.numel())
+    assert 0 <= pad <= rank, f"pad {pad} for {name} to rank {rank} is not a pad"
+    return t if pad == 0 else F.pad(t, (0, pad), value=value)
 
 
 def _check_dict_index(idx: torch.Tensor, dict_rank: int, cols: int, where: str) -> None:
@@ -564,6 +728,83 @@ class DualLatentGLU(nn.Module):
             up_u = up_u.index_select(1, self._shared_index[1])
         return gate_u, up_u
 
+    @torch.no_grad()
+    def set_rank(self, rank: int, *, seed: int) -> list[tuple[nn.Parameter, nn.Parameter]]:
+        """Reallocate this expert's rank — the `rank_mode="load"` resize.
+
+        Preserves the overlap (`[0, min(old, rank))`) on every factor, so a
+        shrink drops the tail and a growth adds columns/rows. What the NEW
+        slices hold is the whole correctness of the arm:
+
+        * `gate_u`/`up_u` columns: fresh `init_u` draws. A ZERO column would be
+          a dead direction — `∂L/∂u = silu(g)·∂L/∂h` is exactly zero at `u = 0`
+          (and `∂L/∂g = silu'(g)·u·∂L/∂h` too at `u = 0`) — so a zero-grown
+          expert would silently never grow. The draw comes from `seed`
+          (`_rank_init_seed`), never the global stream: a resume must grow the
+          same column (ADR-0021).
+        * `v` rows: EXACTLY zero. That is what makes the reallocation
+          CONTINUOUS — the expert's output is unchanged at the firing step, the
+          new capacity writes nothing until `V` learns, and the first gradient
+          it receives is `hᵀ·∂L/∂y` (non-zero because `h` on the new columns
+          is non-zero).
+        * scales: 1.0, the `init` value.
+
+        **The factors are REPLACED, not resized in place.** `p.data = new` on a
+        Parameter whose old shape is still held by an autograd `SavedVariable`
+        corrupts the NEXT graph: measured 2026-10-23, the following backward
+        dies with `MmBackward0 ... got [16, 128] but expected shape compatible
+        with [48, 128]` — the node's input metadata is the pre-resize shape.
+        Replacing the `nn.Parameter` leaves every saved node pointing at a
+        tensor nobody mutates, so it costs the caller ONE obligation: the
+        returned `(old, new)` pairs are what `MixOptimizer.reset_state`
+        re-points the optimizer with. A caller that ignores them has an
+        optimizer stepping dead tensors, which is why the trainer consumes them
+        in the same breath.
+
+        Returns `[]` when the rank did not move (the no-op every caller's cache
+        logic keys on). `share_u` is refused: the input basis is the parent's,
+        so a rank change here could only resize `V` against a plane of a
+        different width (`rank_mode="load"` refuses the pair at the
+        constructor).
+        """
+        assert not self.share_u, (
+            "set_rank on a share_u expert: the input basis is the PARENT's, so a "
+            "per-expert rank could only resize `V` against a plane of another width "
+            "— `rank_mode='load'` refuses that pair in SparseMoE.__init__."
+        )
+        rank = int(rank)
+        assert 1 <= rank <= self.f, f"set_rank({rank}) outside [1, {self.f}]"
+        if rank == self.rank:
+            return []
+        pairs: list[tuple[nn.Parameter, nn.Parameter]] = []
+        old, keep, dev = self.rank, min(self.rank, rank), self.v.device
+        gen = torch.Generator().manual_seed(seed)
+
+        def grown(rows: int, cols: int, ref: torch.Tensor) -> torch.Tensor:
+            fresh = torch.randn(rows, cols, generator=gen) / math.sqrt(self.d)
+            return fresh.to(device=dev, dtype=ref.dtype)
+
+        for name in ("gate_u", "up_u"):
+            p = getattr(self, name)
+            new = torch.empty(self.d, rank, dtype=p.dtype, device=dev)
+            new[:, :keep] = p[:, :keep]
+            if rank > old:
+                new[:, old:] = grown(self.d, rank - old, p)
+            pairs.append((p, nn.Parameter(new)))
+            setattr(self, name, pairs[-1][1])
+        for name in ("gate_s", "up_s"):
+            p = getattr(self, name)
+            new = torch.ones(rank, dtype=p.dtype, device=dev)
+            new[:keep] = p[:keep]
+            pairs.append((p, nn.Parameter(new)))
+            setattr(self, name, pairs[-1][1])
+        new_v = torch.zeros(rank, self.f, dtype=self.v.dtype, device=dev)
+        new_v[:keep] = self.v[:keep]
+        pairs.append((self.v, nn.Parameter(new_v)))
+        self.v = pairs[-1][1]
+        self.rank = rank
+        return pairs
+
     def forward(self, x: torch.Tensor, glu=None) -> torch.Tensor:
         dt = self.compute_dtype
         if self.act_quant != "none":
@@ -702,6 +943,84 @@ class SparseMoE(nn.Module):
                 f"without the loader). Escape: name one of those."
             )
         self.share_u = self.share_u_mode != "off"
+        #: The rank BUDGET's split (`rank_mode`, module docstring). `uniform`
+        #: is every expert at `cfg.rank` and the default path; `load` re-splits
+        #: the same total by routing load every `rank_cadence` steps
+        #: (`reallocate_ranks`). The checks live HERE as well as in
+        #: `config.validate` because a hand-built config reaches this module
+        #: without the loader (ADR-0011).
+        self.rank_mode = cfg.rank_mode
+        self.rank_budget = cfg.rank
+        self.rank_cadence = cfg.rank_cadence
+        if self.rank_mode not in RANK_MODES:
+            loud(
+                f"rank_mode={self.rank_mode!r}: known modes are {list(RANK_MODES)} "
+                f"(a hand-built config reaches this module without the loader). "
+                f"Escape: name one of those."
+            )
+        if self.rank_mode == "load":
+            if not RANK_FLOOR <= self.rank_budget <= RANK_CEIL:
+                loud(
+                    f"rank_mode='load' with rank={self.rank_budget}: the budget is "
+                    f"the MEAN of a split inside [{RANK_FLOOR}, {RANK_CEIL}] (the "
+                    f"measured band: rank 16 costs +0.136 BPB, 8 crashes the Triton "
+                    f"kernel, 2 is NaN; 64 is every number on record). A mean outside "
+                    f"the band cannot be a convex split. Escape: rank in the band, or "
+                    f"rank_mode='uniform'."
+                )
+            if cfg.n_experts < 4:
+                loud(
+                    f"rank_mode='load' with n_experts={cfg.n_experts}: the histogram "
+                    f"is rank16/32/48/64 over the bank, so fewer than 4 experts would "
+                    f"report an empty bucket by construction. Escape: n_experts >= 4, "
+                    f"or rank_mode='uniform'."
+                )
+            if self.rank_cadence < 1:
+                loud(
+                    f"rank_mode='load' with rank_cadence={self.rank_cadence}: a "
+                    f"cadence of 0 re-splits (and reads the load to the host) every "
+                    f"step. Escape: rank_cadence >= 1."
+                )
+            if self.share_u:
+                loud(
+                    f"rank_mode='load' with share_u_mode={self.share_u_mode!r}: the "
+                    f"shared basis is ONE `[d, rank]` tensor per site, so a "
+                    f"per-expert rank could only grow the WRITE `V` against a plane "
+                    f"that stays at the budget — hot experts would hold more "
+                    f"parameters than the uniform arm pays. Escape: "
+                    f"share_u_mode='off', or rank_mode='uniform'."
+                )
+            if cfg.factor_qat != "none":
+                loud(
+                    f"rank_mode='load' with factor_qat={cfg.factor_qat!r}: `_banks` "
+                    f"quantizes ONE rectangular `[E, ·, ·]` stack with a per-expert α "
+                    f"(`dim=(1, 2)`); a ragged stack has no rectangular α, and padding "
+                    f"before the α would fold the zero columns into each expert's "
+                    f"absmean. Escape: factor_qat='none', or rank_mode='uniform'."
+                )
+        #: The WIDEST rank in the bank — the shape `_banks` materialises (the
+        #: padded bmm, the grouped GEMM and the gather kernel all take ONE
+        #: rectangular `[E, d, r]` / `[E, r, f]`). Equal to the budget until a
+        #: reallocation widens someone.
+        self.rank_max = cfg.rank
+        #: Any expert off the budget? `False` is the preamble (and every
+        #: `uniform` run), and it is what makes `_banks` use the exact
+        #: `torch.stack` expression of the uniform tree — the default path is
+        #: bit-identical, not merely equivalent.
+        self._ragged = False
+        #: Bumped by every shape change; part of `_banks`' cache key beside the
+        #: parameters' `_version`s (a `p.data = …` assignment RESETS `_version`
+        #: to 0, so the version tuple alone cannot prove a resize happened).
+        self._bank_epoch = 0
+        #: The current per-expert ranks, NON-persistent: a parameter's shape IS
+        #: its rank, so the checkpoint carries the split for free and
+        #: `_load_from_state_dict` rebuilds it from the shapes. A second stored
+        #: copy would be a number that can drift from the tensors.
+        self.register_buffer(
+            "expert_ranks",
+            torch.full((cfg.n_experts,), cfg.rank, dtype=torch.long, device=device),
+            persistent=False,
+        )
         self.experts = nn.ModuleList(
             DualLatentGLU(
                 d,
@@ -961,13 +1280,24 @@ class SparseMoE(nn.Module):
         cap 32): bang-bang control at one-step lag oscillates the whole
         bank; the cumulative mean is what converges. A MEASURED correction
         to the first implementation, not an opinion.
+
+        `rank_mode="load"` reads the SAME integrator for its budget split, so
+        the counts are accumulated whenever that arm is on even with
+        `moe_lb_coef = 0` (the controller is then inert, the counters are not):
+        a load-split run with the bias switched off would otherwise have no
+        load signal at all. The uniform path's early return is unchanged.
         """
-        if self.lfb_coef == 0.0 or not self.training:
+        if not self.training:
+            return
+        if self.lfb_coef == 0.0 and self.rank_mode != "load":
             return
         with torch.no_grad():
             counts = torch.bincount(index.reshape(-1), minlength=self.n_experts).float()
             self.lfb_counts.add_(counts)
-            self.lfb_bias.sub_(self.lfb_coef * torch.sign(self.lfb_counts - self.lfb_counts.mean()))
+            if self.lfb_coef != 0.0:
+                self.lfb_bias.sub_(
+                    self.lfb_coef * torch.sign(self.lfb_counts - self.lfb_counts.mean())
+                )
         counters.count("moe_lfb_updates")
 
     def _k_counters(self, k: torch.Tensor, counters: Counters) -> None:
@@ -1112,6 +1442,143 @@ class SparseMoE(nn.Module):
         """
         self._bank_cache = None
 
+    def reallocate_ranks(
+        self, step: int, counters: Counters | None = None
+    ) -> list[tuple[nn.Parameter, nn.Parameter]]:
+        """Re-split the rank budget by routing load — ONCE per `rank_cadence`.
+
+        `rank_mode="uniform"` is a no-op returning `[]` (no counter, no read,
+        no draw: the default path is unchanged). `load` re-splits on
+        `step % rank_cadence == 0` from the LFB integrator `lfb_counts`,
+        through `allocate_ranks` (the rule and the exact-sum water-fill), then
+        resizes each expert whose rank moved (`DualLatentGLU.set_rank`).
+
+        HOST TRAFFIC, stated because it is the one place this arm leaves the
+        device: TWO small D2H transfers (`lfb_counts`, `expert_ranks`) and one
+        H2D of the new vector, at the DECLARED cadence — never in `forward`,
+        and a non-cadence step returns before touching either tensor. A
+        parameter's SHAPE cannot be expressed as a device tensor, so the resize
+        needs host integers; that is why this is a cadence call and not a
+        per-step one (port rule 1.3). The four sync TRAPS
+        (`.item()`/`.tolist()`/`bool()`/`float()`) are not used anywhere in the
+        path — the read is one `detach().cpu().numpy()`.
+
+        The counters are the evidence the split ran: `pe_rank_realloc` (how many
+        times), `pe_rank_changed` (how many experts moved) and the
+        `pe_rank16/32/48/64` histogram, whose four counts sum to `n_experts`
+        (`_rank_bucket`) — a bucket with no expert is ABSENT, not zero (the
+        port's counters have no zero entries), so a reader adds the buckets it
+        sees and compares to the bank. `pe_rank_no_load` says the cadence fired with an
+        all-zero integrator (a fixture, or a bank that never routed) and the
+        split stayed uniform — COUNTED, never silently "measured".
+
+        Returns the `(old, new)` PARAMETER PAIRS a resize created: the new
+        objects are not in any optimizer group, and their state is stale by
+        construction (a `[d, 16]` momentum cannot serve a `[d, 40]` parameter),
+        so the trainer's `opt.reset_state` must re-point and drop in the same
+        breath (`DualLatentGLU.set_rank` owns the measured reason a shape change
+        cannot be done in place).
+        """
+        counters = Counters() if counters is None else counters
+        if self.rank_mode != "load" or step % self.rank_cadence:
+            return []
+        load = self.lfb_counts.detach().cpu().numpy()
+        old = self.expert_ranks.cpu().numpy()
+        if float(load.sum()) <= 0.0:
+            counters.count("pe_rank_no_load")
+            return []
+        ranks = allocate_ranks(load.tolist(), self.rank_budget)
+        changed = [e for e in range(self.n_experts) if ranks[e] != int(old[e])]
+        pairs: list[tuple[nn.Parameter, nn.Parameter]] = []
+        for e in changed:
+            pairs.extend(self.experts[e].set_rank(ranks[e], seed=_rank_init_seed(step, e)))
+        self.expert_ranks.copy_(
+            torch.tensor(ranks, dtype=torch.long, device=self.expert_ranks.device)
+        )
+        self.rank_max = max(ranks)
+        self._ragged = any(r != self.rank_budget for r in ranks)
+        self._bank_epoch += 1
+        self.invalidate_banks()
+        counters.count("pe_rank_realloc")
+        counters.count("pe_rank_changed", len(changed))
+        histogram = {edge: 0 for edge in (16, 32, 48, 64)}
+        for r in ranks:
+            histogram[_rank_bucket(r)] += 1
+        for edge, n in histogram.items():
+            counters.count(f"pe_rank{edge}", n)
+        return pairs
+
+    def _apply_ranks(self, ranks) -> None:
+        """Force the bank to `ranks` — the LOAD path's shape rebuild.
+
+        A parameter's shape IS its rank, so a checkpoint carries the split
+        without a second stored copy: `_load_from_state_dict` reads
+        `experts.{e}.gate_u.shape[1]` and calls this BEFORE the strict load,
+        which is the only order that finds matching shapes. The grown slices
+        are drawn but immediately overwritten by the checkpoint's values, so
+        the seed here is a formality (`_rank_init_seed(0, e)`).
+        """
+        assert len(ranks) == self.n_experts, (
+            f"_apply_ranks got {len(ranks)} ranks for {self.n_experts} experts"
+        )
+        for e, r in enumerate(ranks):
+            if not RANK_FLOOR <= r <= RANK_CEIL:
+                loud(
+                    f"checkpoint expert {e} has rank={r}, outside the "
+                    f"rank_mode='load' band [{RANK_FLOOR}, {RANK_CEIL}]: the "
+                    f"checkpoint's bank was written by a different split (a uniform "
+                    f"rank < {RANK_FLOOR}, or a hand-built tensor). Escape: resume "
+                    f"with the config that wrote it (rank_mode='uniform'), or a "
+                    f"checkpoint whose expert ranks sit in the band."
+                )
+            self.experts[e].set_rank(int(r), seed=_rank_init_seed(0, e))
+        self.expert_ranks.copy_(
+            torch.tensor([int(r) for r in ranks], dtype=torch.long, device=self.expert_ranks.device)
+        )
+        self.rank_max = max(int(r) for r in ranks)
+        self._ragged = any(int(r) != self.rank_budget for r in ranks)
+        self._bank_epoch += 1
+        self.invalidate_banks()
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ) -> None:
+        """`rank_mode="load"`: rebuild the RAGGED shapes from the checkpoint.
+
+        Without this a resume into a fresh model (whose experts all start at the
+        budget) would fail the strict load with a shape mismatch the moment the
+        saved split was not uniform — a crash that reads like corruption. The
+        shapes are read from the state dict's own tensors (host metadata, no
+        device sync); `uniform` checkpoints carry uniform shapes, so this is a
+        no-op for every run on record.
+        """
+        if self.rank_mode == "load":
+            ranks = []
+            for e in range(self.n_experts):
+                t = state_dict.get(f"{prefix}experts.{e}.gate_u")
+                if t is None:
+                    ranks = []
+                    break
+                ranks.append(int(t.shape[1]))
+            if ranks:
+                self._apply_ranks(ranks)
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
     @torch.compiler.disable
     def _banks(self, dt: torch.dtype) -> tuple[torch.Tensor, ...]:
         """The expert bank as `[E, ·]` tensors for the batched matmuls — CACHED IN `dt`.
@@ -1184,6 +1651,11 @@ class SparseMoE(nn.Module):
             # (The trainer's `invalidate_banks` also covers that, but the cache
             # must not depend on a caller for its own correctness.)
             tuple(p._version for p in self._shared_params),
+            # A `p.data = …` resize RESETS `_version` to 0, so the tuple above
+            # cannot prove a rank change: the epoch is bumped by the resize
+            # itself (`set_rank`'s callers), one host int, no device read.
+            self._bank_epoch,
+            self.rank_max,
             want,
         )
         cached = getattr(self, "_bank_cache", None)
@@ -1264,19 +1736,43 @@ class SparseMoE(nn.Module):
                     return u.unsqueeze(0).expand(len(self.experts), -1, -1).contiguous()
                 params = [getattr(e, name) for e in self.experts]
                 if self.factor_qat == "none":
-                    return torch.stack([t.to(dt) for t in params])
+                    if not self._ragged:
+                        return torch.stack([t.to(dt) for t in params])
+                    # RAGGED (`rank_mode="load"`): pad every expert to
+                    # `rank_max` on the rank axis. The pad is EXACT zero, so a
+                    # cold expert's extra columns contribute exactly zero; the
+                    # bank is rectangular because the padded bmm, the grouped
+                    # GEMM and the gather kernel all take one shape. This is
+                    # where "the split saves parameters, NOT FLOPs" lives: every
+                    # expert still runs at `rank_max`.
+                    return torch.stack([_pad_rank(t.to(dt), self.rank_max, name) for t in params])
+                assert not self._ragged, (
+                    "a ragged expert bank under factor_qat: `qat_project_stacked` "
+                    "takes ONE rectangular [E, ·, ·] stack and applies a PER-EXPERT "
+                    "α, and `rank_mode='load'` refuses factor_qat at the "
+                    "constructor. A model that reaches here is a wiring error."
+                )
                 return qat_project_stacked(
                     torch.stack(params), self.factor_qat, self.factor_qat_alpha, dim=(1, 2)
                 ).to(dt)
+
+            def _scales(name: str) -> torch.Tensor:
+                if not self._ragged:
+                    # The uniform expression, unchanged (cast AFTER the stack,
+                    # exactly as before the flag existed).
+                    return torch.stack([getattr(e, name) for e in self.experts]).to(dt)
+                return torch.stack(
+                    [
+                        _pad_rank(getattr(e, name), self.rank_max, name, value=1.0).to(dt)
+                        for e in self.experts
+                    ]
+                )
 
             mats = [_one(name) for name in ("gate_u", "up_u", "v")]
             cached = (
                 key,
                 tuple(mats),
-                tuple(
-                    torch.stack([getattr(e, name) for e in self.experts]).to(dt)
-                    for name in ("gate_s", "up_s")
-                ),
+                tuple(_scales(name) for name in ("gate_s", "up_s")),
             )
             if want:
                 self._bank_cache = cached
@@ -1605,7 +2101,7 @@ class SparseMoE(nn.Module):
         """
         if _TRITON_WHY is not None:
             return _TRITON_WHY
-        why = moe_kernels.tile_reason(self._bank_dtype(), self.d, self.f, self.experts[0].rank)
+        why = moe_kernels.tile_reason(self._bank_dtype(), self.d, self.f, self.rank_max)
         if why is not None:
             return why
         if not x.is_cuda:
@@ -1838,6 +2334,26 @@ class SparseMoE(nn.Module):
         return moe_kernels.combine(
             y, weight.reshape(-1)[rows].float(), owner, rowmap.view(n, k), n, ws=ws
         )
+
+
+def reallocate_ranks_all(
+    model: nn.Module, step: int, counters: Counters | None = None
+) -> list[tuple[nn.Parameter, nn.Parameter]]:
+    """The trainer's ONE cadence call: every `SparseMoE` re-splits its budget.
+
+    Returns the `(old, new)` PARAMETER PAIRS across sites — the changed
+    parameters are NEW objects (a shape change cannot be done in place under
+    autograd; `DualLatentGLU.set_rank` carries the measurement), so the caller
+    re-points the optimizer and drops the stale state in the same breath
+    (`optim.MixOptimizer.reset_state`). `uniform` returns `[]` and counts
+    nothing, so a default run's step keeps its exact cost.
+    """
+    counters = Counters() if counters is None else counters
+    moved: list[tuple[nn.Parameter, nn.Parameter]] = []
+    for m in model.modules():
+        if isinstance(m, SparseMoE):
+            moved.extend(m.reallocate_ranks(step, counters))
+    return moved
 
 
 def invalidate_banks_all(model: nn.Module) -> int:

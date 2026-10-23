@@ -34,7 +34,7 @@ from ..model.engram import (
     host_step_all,
     load_host_state,
 )
-from ..model.experts import invalidate_banks_all
+from ..model.experts import invalidate_banks_all, reallocate_ranks_all
 from ..model.qat_cache import invalidate_qat_cache_all
 from ..model.tsct import set_mm_dtype
 from .data import ByteStream, eval_window_bytes, open_streams, warmup_steps
@@ -863,6 +863,15 @@ def train(
     #: group points at any more — every replay would read a stale value.
     graph = None
     if cfg.opt_graph:
+        if run.model.rank_mode == "load":
+            loud(
+                "opt_graph=true with rank_mode='load': the capture bakes the "
+                "optimizer step's parameter SHAPES, and the rank cadence resizes "
+                "them every `rank_cadence` steps — a replay would write the captured "
+                "(old-shaped) buffers into a bank the forward no longer has, the "
+                "silent-staleness class `invalidate_banks` was fixed for. Escape: "
+                "opt_graph=false, or rank_mode='uniform'."
+            )
         graph = OptimizerGraph(opt, opt_stage, counters=total, log=log)
         log(
             f"opt_graph: the optimizer stage is captured after {graph.warmup_steps} "
@@ -924,6 +933,21 @@ def train(
         # leaves every module's constant alpha untouched.
         if anneal_steps > 0:
             model.set_factor_qat_alpha(min(1.0, step / anneal_steps))
+
+        # The rank-budget cadence (`rank_mode="load"`): ONE host-side re-split
+        # every `rank_cadence` optimizer steps (`experts.reallocate_ranks`), and
+        # the resized parameters lose their optimizer state in the SAME breath —
+        # the shape moved, so the momentum cannot be read. The whole block is
+        # behind a HOST config check, so a uniform run's step allocates nothing
+        # and reads nothing (the default path is unchanged, not merely equal).
+        if run.model.rank_mode == "load":
+            rank_counters = Counters()
+            resized = reallocate_ranks_all(model, step, rank_counters)
+            if resized:
+                opt.reset_state(resized)
+            if rank_counters:
+                total.merge(rank_counters)
+                window.merge(rank_counters)
 
         x, y = stream.next_batch()
         if device is not None:
