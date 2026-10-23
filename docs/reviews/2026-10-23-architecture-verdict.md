@@ -230,6 +230,32 @@ Four 2026 papers were read in full and mapped onto this repo. They converge on o
 
 **Memory arithmetic for 1M context** (the reason the hybrid is affordable at all): KDA state is constant; the sliding window costs `2·W·d·2 B` per layer = **8.4 MB at W=2048**, so three iterations cost 25 MB **at any context length**, versus a full KV cache at 1M which would be tens of GB.
 
+
+---
+
+## 8.1 The GPT-2 comparison, measured on identical bytes (2026-10-23)
+
+`scripts/bpb_hf.py` scores any HuggingFace causal LM in bits per byte on a raw byte file (total token code length ÷ bytes encoded, so a tokenizer cannot flatter the number). On the first 40 KB of `data_local/mix4/web_eval.bin`:
+
+| model | BPB | compression | note |
+|---|---|---|---|
+| zstd -3 | 3.190 | ×2.51 | classical LZ |
+| zstd -19 | 2.954 | ×2.71 | classical LZ, max level |
+| xz -9 | 2.927 | ×2.73 | LZMA |
+| our 5-gram anchor | ~2.59 | ×3.09 | on the old eval file |
+| **our `mix1` (142M, 4.18 GB seen)** | **1.833** | **×4.37** | `dormouse eval --ckpt-name mix1` |
+| **GPT-2 small (124M, ~40 GB seen)** | **1.047** | **×7.64** | `scripts/bpb_hf.py gpt2 …` |
+
+**We beat every classical compressor by 1.6× and lose to GPT-2 small by 0.79 BPB.** The parameter counts are almost identical (142M vs 124M), so the gap is not size. Three causes, ranked by weight:
+
+1. **Our corpus was not prose.** Sampling 200 windows of `corpus_bin_filtered.bin` (the corpus behind every run before 2026-10-23) gave 55% LaTeX, 35% code, 25% ordinary prose, 1 Cyrillic window. GPT-2 trained on 40 GB of English web. We measured our model out of its own domain.
+2. **A tenth of the data** (4.18 GB vs ~40 GB): at our measured slope (~0.1 BPB per 4×) that is worth ~0.25 BPB.
+3. **Architecture**: 3 iterations of ONE shared block with linear attention (KDA) versus 12 distinct full-attention layers. KDA is O(1) in context but weaker at exact recall; that is the price of the constant-size state, and it is real.
+
+**What this does NOT say.** At matched parameters and matched data our architecture beats a dense transformer: 2.508 vs 2.653 BPB at 600 steps (both on mix4/web, both 142M). The claim "TSCT/loop is inefficient" is refuted; the claim "we are competitive with a model that saw 10× the data on its home domain" is not supported, and would be dishonest.
+
+**The test that settles it:** the flagship on `mix4` (2.35 GB real English web + 11 domains) scored against the same `bpb_hf.py` anchor. If the gap to GPT-2 small stays above ~0.5 BPB on prose, the next move is an exact sliding window over KDA (planned), not more tuning.
+
 ---
 
 ## 9. The flagship run — what it is, and why it is 1.7 days and not 5
