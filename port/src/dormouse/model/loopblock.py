@@ -264,9 +264,10 @@ class LoopBlock(nn.Module):
             self.msa_gate = nn.Parameter(torch.zeros(cfg.max_iter, device=device))
         # CSA (`model/csa.py`): the compressed, SELECTABLE KV memory, also an
         # ADDITIVE branch beside KDA and off by default. One learned gate per
-        # iteration slot (the `msa_gate` pattern), so the arm's contribution is
-        # per-pass and can be switched off by training. Built only when the flag
-        # is on: `use_csa=false` keeps the parameter tree — and every pinned
+        # iteration slot (the `msa_gate` pattern), shared by the fine top-k and
+        # coarse dense levels, so the arm's contribution is per-pass and can be
+        # switched off by training. Built only when the flag is on:
+        # `use_csa=false` keeps the parameter tree — and every pinned
         # `state_dict` hash — exactly as it was.
         self.csa = (
             CompressedSelectiveAttention(cfg, device=device) if cfg.use_csa else None
