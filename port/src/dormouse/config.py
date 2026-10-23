@@ -385,6 +385,22 @@ class ModelConfig:
     #: re-derive before any multi-loop default.
     loom: bool = False
     use_byteflow: bool = False
+    #: ---- the prelude/coda topology (`arXiv 2610.23036`, `model/prelude.py`) ----
+    #: A few UNIQUE layers that run once BEFORE the shared loop and a few that
+    #: run once AFTER it: `embed → prelude(0..N) → LoopBlock ×T → coda(0..M) →
+    #: RMSNorm → lm_head`. The loop stays weight-shared; only the layers outside
+    #: it are unique. Each is a pre-norm residual SwiGLU FFN at `d_ff = d/2`
+    #: (1 573 888 params at `medium`'s d=1024), deliberately NOT a second KDA:
+    #: a KDA copy is 4.2M there, which would put 1+1 outside the +2-6M envelope
+    #: and add a second attention arm to the model.
+    #: `0`/`0` (the default) builds nothing, draws no RNG and adds no state dict
+    #: key, so every number on record is bit-identical (`c8a2ff9` golden).
+    #: Legal range 0-4 per side; refused outside it, and refused with
+    #: `use_byteflow` (the byteflow shapes run no byte-level loop to wrap).
+    prelude_layers: int = 0
+    #: See `prelude_layers`. The coda runs on the loop's mean readout, before
+    #: the final norm and `lm_head` — those two never move.
+    coda_layers: int = 0
 
     # --- ByteFlow (arXiv 2603.03583): the byte-compression architecture -----
     # A REAL arm, not a stub: `byteflow.py` ports the crate's
@@ -721,6 +737,15 @@ class ModelConfig:
                     f"`share_u_mode`, or set `share_u_mode='plane'`."
                 )
             self.share_u_mode = "plane"
+        for name in ("prelude_layers", "coda_layers"):
+            n = getattr(self, name)
+            if not 0 <= n <= 4:
+                loud(
+                    f"{name}={n} outside 0..=4: the prelude/coda topology ships 0-4 "
+                    f"UNIQUE layers per side (arXiv 2610.23036, model/prelude.py), "
+                    f"and a longer stack is a model nobody priced — each layer is "
+                    f"another 3·d·d/2 parameters. Escape: 0..=4."
+                )
 
 
 @dataclass
@@ -1581,6 +1606,18 @@ def validate(model: ModelConfig) -> None:
             f"leave mhc_streams at its default 2."
         )
     if model.use_byteflow:
+        if model.prelude_layers or model.coda_layers:
+            loud(
+                f"prelude_layers={model.prelude_layers}/coda_layers="
+                f"{model.coda_layers} with use_byteflow=true: the byteflow shapes "
+                f"run no byte-level loop to wrap. Option A is a standalone net "
+                f"with no loop at all (`bf_net` returns before the model tree), "
+                f"and Option B runs this loop over K patch LATENTS "
+                f"(`compat_armed`), so the patcher changes the sequence length "
+                f"mid-model and a prelude/coda would act on patch states, not the "
+                f"bytes they are specified on. Escape: use_byteflow=false, or "
+                f"prelude_layers=0 and coda_layers=0."
+            )
         _validate_byteflow(model)
     if model.sigreg_weight < 0.0:
         loud(
