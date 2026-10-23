@@ -328,6 +328,30 @@ testable and A/B-able (ADR-0017).
       8.4M MAC + 131k comparisons per position/iteration/layer; the arm is a
       4k-32k arm, not an O(1) 1M decoder.
 
+- [x] P-TRAIN4. port (Python): four OFF-by-default frontier train knobs, each
+      with its own gate and a bit-identical off path.
+      `train/loop.py` + `config.py` + `model/model.py`:
+      `grad_accum: int = 1` (loss/`k` before backward, optimizer once per group,
+      `step`/LR/eval/checkpoint cadence per group; dropless gate == `batch·k` at
+      5e-7; LOUD `grad_accum<1` and `grad_accum>1`+`opt_graph`; halt/segment/rand_depth/
+      host-Engram decided ALLOWED with the reasons in the field docstring);
+      `ema_decay: float = 0.0` (shadow of `model.parameters()`, `lerp_` after the
+      optimizer step gated by the device firewall, eval and `load_model_half`
+      read it, checkpoint keeps raw `model` + `model_ema`; `ema_decay` is a
+      PROGRESS key, so changing it on resume is legal — both copies are in the
+      file; refused with `muon_sf` and outside [0,1); `opt_graph` allowed because
+      the update is eager outside the capture); `tie_embeddings: bool = false`
+      (`TiedHead` shares `embed.weight` transposed, zero own params; on `use_tsct`
+      it replaces the low-rank head, on dense it saves exactly `d·vocab`);
+      `z_loss: float = 0.0` (`coef·mean(logsumexp(final logits)²)`, `pure` skips,
+      counter `z_loss`). Gates `tests/test_train4.py` (16; each proven red by a
+      scratch revert: no `/k` -> loss 4.96 vs 9.92; EMA no-op -> 5.7e-3 vs 1e-6;
+      tie off -> missing `lm_head.weight` in the load; z off -> loss/grad equal).
+      `scripts/ab_train4.py`: control/+accum/+ema/+zl/+tie, 3 seeds x 600,
+      `medium`, mix4/web.bin + web_eval.bin, COMMON from `ab_mhc.py` minus
+      `opt_graph` (refused with accum, applied to every arm), JSONL to
+      `~/logs/ab_train4/`, pre-registered TIE on all four. Written, **NOT run**.
+
 ## Critical Files
 
 - `crates/dormouse-core/src/loop_block.rs` (617, in flight)

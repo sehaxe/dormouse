@@ -40,7 +40,20 @@ PRESET_DIR = Path(__file__).resolve().parents[2] / "configs"
 #: `json_log` — the telemetry sink is WHERE the measurement goes and it reaches
 #: no forward (audit MINOR 23, 2026-10-17: the field's own docstring promised
 #: this exemption while `diff_keys` refused the flip).
-PROGRESS_KEYS = ("steps", "log_every", "ckpt_every", "eval", "eval_every", "json_log")
+PROGRESS_KEYS = (
+    "steps",
+    "log_every",
+    "ckpt_every",
+    "eval",
+    "eval_every",
+    "json_log",
+    # `ema_decay` selects WHICH copy of the same trajectory an eval reads: the
+    # checkpoint keeps the raw iterate under `model` (what resume continues)
+    # and the shadow under `model_ema` (what eval/save serve), so changing the
+    # decay on a resume changes a view, never what was trained. It is a
+    # progress key for that reason and is documented on `TrainConfig`.
+    "ema_decay",
+)
 
 #: The commit that removed the stubs below (`port(cleanup): delete the six dead
 #: config stubs and the `_unsupported` machinery`, 2026-10-17).
@@ -337,6 +350,24 @@ class ModelConfig:
     #: KDA already attends over, uncompressed).
     attn_kind: str = "kda"
     use_tsct: bool = True
+    #: TIED EMBEDDINGS: `lm_head` IS `embed.weight`, transposed, and has no
+    #: parameter of its own (`model/model.py::TiedHead`). That is the frontier
+    #: stack's input/output matrix sharing: `d_model·vocab` parameters saved
+    #: against a dense head, and the head's gradient is ADDED to the embedding
+    #: table's (one matrix, two paths — gated).
+    #:
+    #: The tied head is a PLAIN `[vocab, d]` matrix, so on a `use_tsct=true`
+    #: body it REPLACES the low-rank TSCT head (`u·diag(s)·vᵀ`, `rank`
+    #: parameters) — a second difference a reader of that arm must know. On
+    #: `use_tsct=false` the head was exactly `[vocab, d]`, so tying is the
+    #: clean comparison and saves exactly `d_model·vocab`. `factor_qat` no
+    #: longer reaches the head when tied (there is no head factor pair to
+    #: quantize); the embedding is untouched by it either way.
+    #:
+    #: REFUSED with `use_byteflow` (both shapes bypass `lm_head`; the flag
+    #: would be inert while the snapshot reported it on). `false` is every
+    #: number on record, and the off path is bit-identical.
+    tie_embeddings: bool = False
 
     # --- cheap width (2026-10-23): stop `d` from setting the dense bill ----
     #: MLA-style SHARED LATENT for KDA's four `d×d` projections (`q,k,v,g`).
@@ -656,6 +687,21 @@ class ModelConfig:
     shared_rank: int = 192
 
     # --- aux objectives -------------------------------------------------
+    #: ---- z-loss (PaLM §5 / Gemma-2 §9: the softmax's partition function) ----
+    #: `loss = CE + z_loss · mean_i (logsumexp(logits_i))²`. The squared
+    #: log-partition keeps the pre-softmax logits from drifting tall, which is
+    #: the stability term the PaLM/Gemma recipes carry; it is a REGULARISER, so
+    #: `pure=True` (the held-out number) skips it exactly as it skips every
+    #: aux term. `0.0` (the default) adds no op, no parameter and no counter,
+    #: and the off path is bit-identical.
+    #:
+    #: The term reaches the FINAL `lm_head` logits only (the `norm`+head exit),
+    #: not the loop's per-iteration deep-supervision terms: those are a
+    #: training-only readout of the same state, and a second z-term there would
+    #: be a different objective than the paper's. REFUSED with `use_byteflow`
+    #: (both channel shapes return `_byte_ce` and never build this term, so the
+    #: flag would be inert). Negative values are refused.
+    z_loss: float = 0.0
     #: ---- the DSpark draft head (2607.05147; port wiring 2026-10-16) ----
     #: The DSpark term adds next-K-byte draft supervision + the acceptance
     #: head. `dspark_weight` = γ (D2: the loss is γ-free, the CALLER scales);
@@ -837,6 +883,29 @@ class ModelConfig:
                     f"and a longer stack is a model nobody priced — each layer is "
                     f"another 3·d·d/2 parameters. Escape: 0..=4."
                 )
+        if self.z_loss < 0.0:
+            loud(
+                f"z_loss={self.z_loss}: the term is `+ coef · mean(logsumexp²)`, a "
+                f"POSITIVE stability penalty on the logits. A negative value would "
+                f"pay the model to make the partition function tall, which is the "
+                f"opposite of the PaLM/Gemma recipe and has no gate. Escape: "
+                f"z_loss >= 0, or 0.0 to leave the objective alone."
+            )
+        if self.tie_embeddings and self.use_byteflow:
+            loud(
+                "tie_embeddings=true with use_byteflow=true: both byteflow shapes "
+                "leave this model's `lm_head` behind (Option A has its own byte head; "
+                "Option B decodes with `decode_chunks`), so there is no head to tie "
+                "and the flag would be inert while the snapshot reported it on. "
+                "Escape: tie_embeddings=false, or use_byteflow=false."
+            )
+        if self.z_loss > 0.0 and self.use_byteflow:
+            loud(
+                f"z_loss={self.z_loss} with use_byteflow=true: both byteflow shapes "
+                f"compute `_byte_ce` and never reach the `norm`+`lm_head` exit this "
+                f"term is defined on, so the regulariser would be silently absent. "
+                f"Escape: z_loss=0.0, or use_byteflow=false."
+            )
 
 
 @dataclass
@@ -850,6 +919,45 @@ class TrainConfig:
     lr: float = 3e-4
     wd: float = 0.01
     grad_clip: float = 1.0
+    #: GRADIENT ACCUMULATION: micro-batch count per optimizer step. `1` (the
+    #: default and every number on record) runs one forward/backward per step.
+    #: `k > 1` runs `k` micro-batches of `batch` rows, divides EACH micro-loss
+    #: by `k` before backward (so the accumulated gradient is the MEAN over the
+    #: micro-batches, not their sum), and calls the optimizer ONCE per group;
+    #: `step` counts optimizer steps, so the LR schedule and every eval/checkpoint
+    #: cadence tick once per group and never per micro-batch. The data order
+    #: matches a `batch·k` run exactly: `ByteStream.next_batch` returns
+    #: consecutive `batch·(seq_len+1)`-byte windows, so `k` reads concatenate to
+    #: the one wide window, and the gate holds the two to 1e-5 (fp reduction
+    #: order is the only difference; a same-forward `[b·k, t]` batch is
+    #: independent per row, so the math is the same mean). A CAPACITY-PADDED
+    #: MoE (`moe_capacity > 0`) is not row-separable — the dispatch drops rows
+    #: as a function of the forward's OTHER rows — so the equivalence cannot
+    #: exist there for either side; the gate runs dropless (`moe_capacity=0`,
+    #: the A/B battery's own COMMON).
+    #:
+    #: Interactions, each decided here rather than discovered:
+    #: * `opt_graph` is REFUSED with `k > 1` (LOUD in `load_run`): the graph
+    #:   captures ONE optimizer stage, and the arm this field names is the
+    #:   hosting of k backward passes around that stage — a capture of a stage
+    #:   whose gradient buffers are filled by a variable number of standing
+    #:   eager passes is not the stage the graph was verified for;
+    #: * `halt` and `segment_len` are ALLOWED: each micro-batch is a full
+    #:   scheduled-depth training forward, the loss is a mean over positions,
+    #:   and the mean of k micro-means is the wide batch's mean — the halt target
+    #:   is per-forward by construction and segmentation is memory slicing of
+    #:   one window, so neither changes meaning under accumulation;
+    #: * `rand_depth` is ALLOWED and samples ONCE per optimizer step (all
+    #:   micro-batches share the step's depth, matching one wide forward);
+    #: * `engram_ram` is ALLOWED: the host rows accumulate every pending leaf
+    #:   across the group and the host update runs once, after the group, which
+    #:   is exactly the old "once per step" contract (the cost is pending-row
+    #:   memory for `k` forwards).
+    #: The NaN firewall treats a group as skipped if ANY micro-batch is
+    #: non-finite: its contribution is sanitized on arrival, the group's shared
+    #: flag ANDs the per-micro flags, and one multiply at the end zeroes every
+    #: accumulated gradient. `nan_skipped` counts GROUPS, not forwards.
+    grad_accum: int = 1
     #: TF32 for the remaining fp32 matmuls (the Muon Newton-Schulz iterations,
     #: the KDA internals, the fp32 lm_head path): measured 2026-10-16 at b1
     #: b8x1024 as 1399 -> 1201 ms/step (+16%, mostly the optimizer's NS bmm).
@@ -1101,6 +1209,42 @@ class TrainConfig:
     #: active capture aborts it). A resume with a different value is refused by
     #: the snapshot drift check — it changes what the optimizer computes.
     opt_graph: bool = False
+    #: EXPONENTIAL MOVING AVERAGE of the parameters, used at eval/save time.
+    #: `0.0` (the default) keeps no shadow at all: every checkpoint/eval/serve
+    #: path is the pre-arm one, bit-identical. `0 < d < 1` keeps a shadow of the
+    #: PARAMETER TREE and applies `shadow <- d·shadow + (1-d)·param` after each
+    #: optimizer step (once per `grad_accum` group), gated by the NaN firewall's
+    #: device flag so a skipped step leaves the shadow exactly where it was —
+    #: the update is `lerp_` with a 0-dim device weight, so it adds no host
+    #: read. `1.0` is refused (a shadow that never moves is not an average).
+    #:
+    #: WHAT IT COVERS: `model.parameters()` and nothing else — the same tree the
+    #: checkpoint's model half carries. On `engram_ram` the host n-gram tables
+    #: are NOT parameters (they are a sidecar with their own update rule), so
+    #: the shadow is the EMA of the model half while eval reads the live host
+    #: tables. That is stated, not hidden: the alternative is a second 12 GB
+    #: table copy for a substrate that is already its own moving state.
+    #:
+    #: CHECKPOINT CONTRACT: when armed, `save_ckpt` writes the shadow under the
+    #: clearly named `model_ema` key BESIDE the raw training copy under `model`
+    #: (resume continues the raw iterate and its optimizer state, never the
+    #: EMA: the moments belong to the raw weights). `load_model_half` — the
+    #: shared reader of eval/decode/serve/chat — PREFERS `model_ema` when it is
+    #: present, so the checkpoint a reader serves is the averaged model. A
+    #: resume restores the shadow from that key; a checkpoint without it starts
+    #: the shadow from the loaded weights, COUNTED in the log.
+    #:
+    #: RESUME: `ema_decay` is in `PROGRESS_KEYS`, so `--set ema_decay=...` on a
+    #: resume is LEGAL even though it changes what is evaluated. The reason is
+    #: in the paragraph above: the checkpoint carries BOTH copies of the same
+    #: optimizer trajectory, and this knob selects (or re-decays) the shadow,
+    #: never the weights the training step continues from. Refused only with
+    #: `muon_sf` (the params hold the fast iterate Y during a step, so a shadow
+    #: taken there would average a variable that is not the returned iterate X;
+    #: materialising X per step is the named follow-up) and outside [0,1).
+    #: `opt_graph` is ALLOWED: the EMA update runs EAGERLY after the replay,
+    #: outside the captured region, reading the replayed parameters.
+    ema_decay: float = 0.0
     seed: int = 1
     #: WSD warmup, in TOKENS (not steps): the schedule is a function of how
     #: much data the run has seen, so a batch-size change does not change it.
@@ -2317,6 +2461,51 @@ def rl_config(tcfg: TrainConfig) -> RLConfig:
     )
 
 
+def validate_train(tcfg: TrainConfig) -> None:
+    """The train-half refusals the CLI and a hand-built `train()` share.
+
+    ONE definition, two callers (`load_run` and `train/loop.py::train`): a
+    hand-built `TrainConfig` that skips `load_run` must not be able to run a
+    zero-micro-batch step or an EMA outside [0,1) either.
+    """
+    if tcfg.grad_accum < 1:
+        loud(
+            f"grad_accum={tcfg.grad_accum}: the field is a COUNT of micro-batches "
+            f"per optimizer step, so 1 is one forward/backward and 0 or a negative "
+            f"value would mean a step with no gradient at all. Escape: "
+            f"grad_accum >= 1 (the default 1)."
+        )
+    if tcfg.grad_accum > 1 and tcfg.opt_graph:
+        loud(
+            f"grad_accum={tcfg.grad_accum} with opt_graph=true: the CUDA graph "
+            f"captures ONE optimizer stage, and this arm is k EAGER backward "
+            f"passes standing around that stage — a stage whose gradient buffers "
+            f"were filled by a variable number of eager passes is not the stage "
+            f"the graph was verified on, and a capture-time frozen participating "
+            f"set is the `dion/cuda_graph.py:231-255` defect with a second way to "
+            f"starve it. Escape: opt_graph=false (the eager optimizer), or "
+            f"grad_accum=1."
+        )
+    if not 0.0 <= tcfg.ema_decay < 1.0:
+        loud(
+            f"ema_decay={tcfg.ema_decay}: the EMA is "
+            f"`shadow <- d·shadow + (1-d)·param`, so the legal band is [0, 1). 0.0 "
+            f"is OFF; 1.0 freezes the shadow at its initial weights, which is not "
+            f"an average and would make every eval read the init. Escape: "
+            f"0.0 <= ema_decay < 1.0."
+        )
+    if tcfg.ema_decay > 0.0 and tcfg.muon_sf:
+        loud(
+            f"ema_decay={tcfg.ema_decay} with muon_sf=true: during a training step "
+            f"the parameters hold Y = (1-b1)·Z + b1·X, while the iterate this run "
+            f"evaluates and checkpoints is X (materialised by `sf('eval')`). An EMA "
+            f"updated after `opt.step()` would average Y, a different variable, and "
+            f"the checkpoint would pair an X-EMA with an optimizer built for the "
+            f"raw params. Materialising X every step for the shadow is the named "
+            f"follow-up. Escape: muon_sf=false, or ema_decay=0.0."
+        )
+
+
 def load_run(
     preset: str = "small",
     *,
@@ -2448,6 +2637,7 @@ def load_run(
             "would be inert too. Escape: muon_sf_retract=false (the default, and "
             "the legal arm)."
         )
+    validate_train(tcfg)
     if model_overrides:
         import dataclasses as _dc
 

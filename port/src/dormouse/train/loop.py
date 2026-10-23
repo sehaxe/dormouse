@@ -19,11 +19,12 @@ from __future__ import annotations
 import dataclasses
 import math
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import torch
 
-from ..config import PROGRESS_KEYS, RunConfig, TrainConfig
+from ..config import PROGRESS_KEYS, RunConfig, TrainConfig, validate_train
 from ..instrument import Counters, LoudError, StepTimer, loud
 from ..model import kda
 from ..model.engram import (
@@ -173,8 +174,28 @@ def load_ngram(cfg: TrainConfig) -> dict:
     return torch.load(ngram_path(cfg), map_location="cpu", weights_only=True)
 
 
+def _checkpoint_half(sd: dict, rung: str) -> dict:
+    """One model half normalized for the file: prefix stripped, rung packed.
+
+    The ONE normalization `save_ckpt` applies to BOTH copies an EMA run
+    writes (`model` raw, `model_ema` shadow), so the two cannot disagree about
+    a storage rung or a `torch.compile` prefix.
+    """
+    from ..model.tsct import is_factor_key, pack_tsct
+
+    sd = {k.removeprefix("_orig_mod."): v for k, v in sd.items()}
+    if rung and rung in ("fp8", "nvfp4", "ternary"):
+        sd = {k: (pack_tsct(v, rung) if is_factor_key(k) else v) for k, v in sd.items()}
+    return sd
+
+
 def save_ckpt(
-    run: RunConfig, model: torch.nn.Module, opt: MixOptimizer, step: int
+    run: RunConfig,
+    model: torch.nn.Module,
+    opt: MixOptimizer,
+    step: int,
+    *,
+    ema: dict | None = None,
 ) -> tuple[Path, Path]:
     """Weights + optimizer state, plus the config snapshot beside them.
 
@@ -183,32 +204,34 @@ def save_ckpt(
     record (`model_quant_rung` names it), and `load_ckpt` unpacks back to
     fp32. The bank/checkpoint is the rung's whole contract — the forward path
     within a run never changes numerics.
-    """
-    from ..model.tsct import is_factor_key, pack_tsct
 
+    `ema` (the shadow of `TrainConfig.ema_decay`) is written beside the raw
+    training copy under the clearly named `model_ema` key, packed by the SAME
+    rule. It is the checkpoint's SERVED model half — `load_model_half` prefers
+    it — while `model` stays the RAW iterate a resume continues (the optimizer
+    moments belong to those weights). An EMA checkpoint therefore carries two
+    weight copies; that is the cost of a legal resume, stated here rather than
+    discovered from a 2x file size.
+    """
     weights, snapshot = ckpt_paths(run.train)
     weights.parent.mkdir(parents=True, exist_ok=True)
-    sd = model.state_dict()
+    rung = run.model.quant if run.model.quant != "none" else ""
     # A torch.compile'd model is an OptimizedModule whose keys carry a
     # `_orig_mod.` prefix. Strip it on the way out (audit 2026-10-17,
     # CRITICAL 2): every reader — load_ckpt, eval, decode, serve — loads into
     # the UNWRAPPED model, so a prefixed checkpoint is unresumable and
     # un-evaluable. The prefix is a wrapper artifact, never part of the file
     # format.
-    sd = {k.removeprefix("_orig_mod."): v for k, v in sd.items()}
-    rung = run.model.quant if run.model.quant != "none" else ""
-    if rung and rung in ("fp8", "nvfp4", "ternary"):
-        sd = {k: (pack_tsct(v, rung) if is_factor_key(k) else v) for k, v in sd.items()}
+    payload = {
+        "model": _checkpoint_half(model.state_dict(), rung),
+        "opt": opt.state_dict(),
+        "step": step,
+        "model_quant_rung": rung or None,
+    }
+    if ema is not None:
+        payload["model_ema"] = _checkpoint_half(ema, rung)
     tmp = weights.with_suffix(".pt.tmp")
-    torch.save(
-        {
-            "model": sd,
-            "opt": opt.state_dict(),
-            "step": step,
-            "model_quant_rung": rung or None,
-        },
-        tmp,
-    )
+    torch.save(payload, tmp)
     tmp.replace(weights)  # atomic: a crash never leaves a half-written ckpt
     if run.train.engram_ram:
         # The host tables are not parameters, so they are not in `sd`: they are
@@ -255,9 +278,17 @@ def load_model_half(weights: Path) -> dict:
     `load_state_dict`, so a checkpoint written with `quant = fp8|nvfp4|ternary`
     — a config `validate` accepts and `save_ckpt` packs — died in the load with
     a `RuntimeError` naming neither the rung nor the escape.
+
+    An EMA checkpoint keeps its SERVED copy under `model_ema` and its RAW
+    training copy under `model`; this reader PREFERS the former, so eval,
+    decode, serve and chat all score the averaged model while `load_ckpt`'s
+    resume still continues the raw iterate and its optimizer state.
     """
     ck = torch.load(weights, map_location="cpu", weights_only=False)
-    return unpack_state_dict(ck["model"], ck.get("model_quant_rung"))
+    half = ck.get("model_ema")
+    if half is None:
+        half = ck["model"]
+    return unpack_state_dict(half, ck.get("model_quant_rung"))
 
 
 def require_ngram(cfg: TrainConfig) -> None:
@@ -448,6 +479,11 @@ def load_ckpt(run: RunConfig) -> tuple[dict, RunConfig]:
     # describes the values, and a checkpoint is legal evidence for a bf16 run
     # starting from fp8-rounded init; the snapshot gate above handles intent.
     ck["model"] = unpack_state_dict(ck["model"], ck.get("model_quant_rung"))
+    # The EMA copy travels beside the raw one (`save_ckpt`). It is unpacked by
+    # the same rule, and a file without it is a legal resume: the run starts
+    # the shadow from the loaded weights (COUNTED in `train`'s log).
+    if ck.get("model_ema") is not None:
+        ck["model_ema"] = unpack_state_dict(ck["model_ema"], ck.get("model_quant_rung"))
     return ck, stored
 
 
@@ -464,6 +500,91 @@ def _sample_depth(seed: int, step: int, max_iter: int) -> int:
     """
     assert max_iter >= 1, f"max_iter must be >= 1, got {max_iter}"
     return 1 + ((step * 2654435761 + seed) % max_iter)
+
+
+def _shadow_state(model: torch.nn.Module, initial: dict | None = None) -> dict:
+    """The EMA shadow: one tensor per PARAMETER, keyed by the live name.
+
+    `initial` is a checkpoint's `model_ema` half (already unpacked, CPU, keys
+    WITHOUT the `_orig_mod.` prefix `torch.compile` adds). Keys are matched
+    after stripping that prefix on both sides, and a set or shape mismatch is
+    LOUD: a shadow that names a different tree would make every eval score a
+    network the run never trained. `None` starts the shadow AT the current
+    weights (a fresh run, or a resume of a file written with `ema_decay=0`).
+
+    The shadow covers `named_parameters()` and nothing else — buffers and the
+    host Engram tables are not weights of the checkpoint's model half, and
+    `ema_decay`'s docstring names that boundary.
+    """
+    live = list(model.named_parameters())
+    if initial is not None:
+        want = [n.removeprefix("_orig_mod.") for n, _ in live]
+        missing = sorted(set(want) - set(initial))
+        extra = sorted(set(initial) - set(want))
+        if missing or extra:
+            loud(
+                f"ema: the checkpoint's `model_ema` does not name this parameter "
+                f"tree — missing {missing[:5]}{' ...' if len(missing) > 5 else ''}, "
+                f"unexpected {extra[:5]}{' ...' if len(extra) > 5 else ''}. The "
+                f"shadow is a second copy of the SAME model; evaluating a mismatched "
+                f"one would score a network this run never trained. Escape: resume "
+                f"with the checkpoint's own config, or start a fresh ckpt_name."
+            )
+    out: dict[str, torch.Tensor] = {}
+    for name, p in live:
+        src = None if initial is None else initial[name.removeprefix("_orig_mod.")]
+        if src is not None and tuple(src.shape) != tuple(p.shape):
+            loud(
+                f"ema: `model_ema` {name} has shape {tuple(src.shape)}, the model "
+                f"expects {tuple(p.shape)}. Escape: the checkpoint's config, or a "
+                f"fresh ckpt_name."
+            )
+        out[name] = (
+            p.detach().clone()
+            if src is None
+            else src.detach().to(device=p.device, dtype=p.dtype).clone()
+        )
+    return out
+
+
+@contextmanager
+def _shadow_params(model: torch.nn.Module, shadow: dict | None):
+    """Evaluate with the shadow: swap `.data` for the eval, restore after.
+
+    A reference swap, not a copy: an eval is a declared cadence, but copying a
+    1B-parameter shadow in and out of the live tensors twice per eval is the
+    kind of cost that makes an arm look slow for no reason. `.data` assignment
+    does not disturb the optimizer's parameter objects (the objects, their
+    `.grad` and their identity are untouched), which is why the switch back is
+    exact and the next step's graph sees the RAW weights it built.
+    """
+    if shadow is None:
+        yield
+        return
+    live = list(model.named_parameters())
+    saved = {name: p.data for name, p in live}
+    for name, p in live:
+        p.data = shadow[name]
+    try:
+        yield
+    finally:
+        for name, p in live:
+            p.data = saved[name]
+
+
+def _ema_update(model: torch.nn.Module, shadow: dict, decay: float, flag_dev: torch.Tensor) -> None:
+    """`shadow <- d·shadow + (1-d)·param`, ONCE per optimizer step.
+
+    `flag_dev` is the firewall's 0/1 device flag, so a NaN-skipped step leaves
+    the shadow EXACTLY where it was (`lerp` with weight 0) and no host branch on
+    a device value exists. `lerp_` is the in-place form of the recurrence; it
+    reads the parameter AFTER the step (or after the graph replay), which is
+    why `opt_graph` is legal with this arm — the EMA is outside the capture.
+    """
+    weight = flag_dev.to(torch.float32) * (1.0 - decay)
+    for name, p in model.named_parameters():
+        s = shadow[name]
+        s.lerp_(p.detach(), weight.to(s.dtype))
 
 
 def _eval_loss(
@@ -625,6 +746,9 @@ def train(
     the CPU path, unchanged.
     """
     cfg = run.train
+    # The hand-built path skips `load_run`; the train-half refusals are ONE
+    # definition (`config.validate_train`) and this is the second caller.
+    validate_train(cfg)
     if cfg.tf32:
         # The knob the b1 opt bench measured (2026-10-16): 1399 -> 1201 ms/step.
         torch.set_float32_matmul_precision("high")
@@ -759,8 +883,9 @@ def train(
             "(muon_sf_retract=false - the only legal setting, S3). A NaN-skipped step "
             "advances none of Z/X/s."
         )
-    tokens_per_step = cfg.batch * cfg.seq_len
+    tokens_per_step = cfg.batch * cfg.seq_len * cfg.grad_accum
     start = 0
+    resumed_ema: dict | None = None
     if init_from is not None:
         # Fine-tune init: WEIGHTS from a foreign checkpoint, no config gate and no
         # optimizer state. The deliberate difference from `resume`, and the reason
@@ -779,7 +904,13 @@ def train(
         if not path.is_file():
             loud(f"train --init-from: {path} does not exist. Escape: the .pt of the run you mean.")
         foreign = torch.load(path, map_location="cpu", weights_only=False)
-        sd = unpack_state_dict(foreign.get("model", foreign), foreign.get("model_quant_rung"))
+        # An EMA checkpoint's SERVED half is `model_ema` (the same preference
+        # `load_model_half` makes): a fine-tune starts from the averaged model a
+        # reader would serve, not from the raw iterate.
+        half = foreign.get("model_ema")
+        if half is None:
+            half = foreign.get("model", foreign)
+        sd = unpack_state_dict(half, foreign.get("model_quant_rung"))
         # The ONE loader: an `engram_ram` checkpoint has no `engram.tables` in the
         # model half and needs its `.ngram` sibling, which `load_model_state`
         # restores (a missing sibling is its LOUD refusal, never fresh rows).
@@ -795,10 +926,11 @@ def train(
         load_model_state(model, cfg, ck["model"])
         opt.load_state_dict(ck["opt"])
         start = int(ck["step"]) + 1
+        resumed_ema = ck.get("model_ema") if cfg.ema_decay > 0.0 else None
         if start:
             # A resumed run must continue on UNSEEN bytes: the burn failure
             # this prevents is re-reading (and memorizing) the corpus head.
-            stream.skip_bytes(start * (cfg.seq_len + 1) * cfg.batch)
+            stream.skip_bytes(start * (cfg.seq_len + 1) * cfg.batch * cfg.grad_accum)
         # The checkpoint's model half is the X iterate (a checkpoint is written
         # with the eval switch on, below), and so is the optimizer's own `x`, so
         # the params must go back to Y before the next forward. The switch is an
@@ -807,7 +939,7 @@ def train(
         sf("train")
         log(f"resume: step={start} opt_steps={opt.steps}")
 
-    warm = warmup_steps(cfg.warmup_tokens, cfg.batch, cfg.seq_len)
+    warm = warmup_steps(cfg.warmup_tokens, cfg.batch * cfg.grad_accum, cfg.seq_len)
     decay = int(round(cfg.decay_frac * cfg.steps))
     if cfg.torch_compile:
         if cfg.opt_graph:
@@ -825,6 +957,24 @@ def train(
         # machine, not per run.
         model = torch.compile(model, dynamic=True)
         log("torch_compile: model wrapped (first steps pay the warmup)")
+    # The EMA shadow is built AFTER the resume load AND after torch.compile:
+    # it must clone the RESOLVED weights, and its keys must be the live
+    # (possibly `_orig_mod.`-prefixed) names `_shadow_params` swaps. `init_from`
+    # deliberately starts a FRESH shadow (a fine-tune is a new trajectory), so
+    # only a resume restores the stored copy.
+    ema = None
+    if cfg.ema_decay > 0.0:
+        ema = _shadow_state(model, resumed_ema)
+        source = (
+            "restored from model_ema"
+            if resumed_ema is not None
+            else "started at the loaded weights"
+        )
+        log(
+            f"ema_decay={cfg.ema_decay:g}: shadow of {len(ema)} parameter tensors "
+            f"{source}; eval and the served checkpoint use it, the raw iterate stays "
+            f"the training copy (`model_ema` vs `model` in the file)"
+        )
     anneal_steps = cfg.factor_qat_anneal_steps
     if anneal_steps > 0 and run.model.factor_qat == "none" and run.model.dense_qat == "none":
         loud(
@@ -851,6 +1001,12 @@ def train(
     dev = next(model.parameters()).device
     flag_dev = torch.ones((), dtype=torch.int32, device=dev)
     last_loss_dev = torch.full((), float("nan"), device=dev)
+    #: The loss-print decision, separate from the UPDATE flag: the printed
+    #: number is the last FINITE loss (`last_loss_dev`'s contract), and a
+    #: micro-batch can have a finite loss with a non-finite gradient. ON by
+    #: default so a one-micro step hands `torch.where` the same condition the
+    #: pre-arm code did.
+    loss_ok_dev = torch.ones((), dtype=torch.bool, device=dev)
     #: Host-substrate Engrams, resolved once: this arm's update needs the flag
     #: on the HOST and pays an existing per-step D2H for its row gradients, so
     #: it is the one declared exception to "no per-step device read".
@@ -877,6 +1033,8 @@ def train(
             seq_len=cfg.seq_len,
             lr=cfg.lr,
             opt=cfg.opt,
+            grad_accum=cfg.grad_accum,
+            ema_decay=cfg.ema_decay,
             resumed=start,
         )
 
@@ -976,12 +1134,12 @@ def train(
         if anneal_steps > 0:
             model.set_factor_qat_alpha(min(1.0, step / anneal_steps))
 
-        x, y = stream.next_batch()
-        if device is not None:
-            x, y = x.to(device), y.to(device)
         # The ADAPTIVE DEPTH arm: T is the pure `(seed, step)` sample, and the
         # loss divides by the depth actually run (`model.forward`/`loopblock`).
         # `None` (the default and every other config) keeps the call unchanged.
+        # With `grad_accum > 1` the depth is sampled ONCE per optimizer step and
+        # shared by every micro-batch — the same objective one wide forward
+        # would run, and the reason all micro-batches read the same `step`.
         depth = _sample_depth(cfg.seed, step, run.model.max_iter) if cfg.rand_depth else None
         kw = {} if depth is None else {"depth": depth}
         if cfg.segment_len:
@@ -993,62 +1151,103 @@ def train(
             # activations, so it needs no segmentation, and leaving it one-shot
             # keeps the held-out number comparable with the record.
             kw["segment_len"] = cfg.segment_len
-        logits, loss, step_counters = model(x, y, **kw)
-        assert logits.shape[-1] == run.model.vocab, "logits width != vocab"
-        total.merge(step_counters)
-        window.merge(step_counters)
-        timer.tick()
-
-        # THE DEVICE FIREWALL (ADR-0018 rule 2). No host read decides this
-        # step: `loss_finite` and the gradient norm stay on the device, the
-        # masked loss makes backward's seed exactly zero, and the resulting
-        # 0-dim 1/0 flag is what every write below is multiplied by. The host
-        # sees the loss and the skip count at the log cadence only.
-        #
-        # `torch.where` on the scalar, not `mask_fill`: on a healthy step the
-        # value AND the gradient are bit-identical to `loss.backward()` (the
-        # where's backward passes the root gradient through unchanged), which
-        # is what keeps a healthy run's sha256 equal to HEAD's.
-        assert loss is not None, "a training step must carry targets"
         # The graph arm needs STABLE `.grad` buffers: `set_to_none=True` swaps
         # each `.grad` for a fresh tensor every step, which breaks the buffers
         # capture pinned (`dion/cuda_graph.py:170-181`). `False` is a no-op for
         # a param whose grad is still None, so the FIRST backward allocates it
         # — which is why the wrapper demands at least one eager step.
         opt.zero_grad(set_to_none=graph is None)
-        loss_d = loss.detach()
-        loss_finite = torch.isfinite(loss_d).all()
-        step_loss = torch.where(loss_finite, loss, loss_d.new_zeros(()))
-        if step_loss.requires_grad:
-            # A real training loss always does. A model that returns a bare
-            # tensor (the firewall's own NaN fixture) has nothing to backprop
-            # through, which is the old code's skip branch by another route.
-            step_loss.backward()
-        grads = [p.grad for p in model.parameters() if p.grad is not None]
-        # A non-finite GRADIENT disables the step too (the burn 2026-09-27
-        # lesson: a masked loss scalar does not stop a NaN that came from an
-        # ACTIVATION — `NaN * 0` is still NaN through the Jacobian). One vector
-        # norm answers "any" without a host read; the flag is the AND of both.
-        raw_norm = grad_norm(model.parameters())
-        if raw_norm.device != loss_d.device:
-            raw_norm = raw_norm.to(loss_d.device)
-        finite = loss_finite & torch.isfinite(raw_norm)
-        flag_dev.copy_(finite.to(torch.int32))
-        # Sanitize on the device AND gate: every non-finite gradient becomes 0
-        # (so a moment cannot be poisoned), then every gradient is multiplied by
-        # the flag — `*1.0` is the identity on a healthy step, `*0` makes the
-        # skipped step's direction exactly zero (a masked loss alone does not:
-        # a NaN that came from an ACTIVATION would still be in the Jacobian).
-        gate = flag_dev.to(torch.float32)
-        for g in grads:
-            g.nan_to_num_(0.0, 0.0, 0.0)
-            g.mul_(gate.to(g.dtype))
+        # The group's firewall flag starts healthy and is ANDed by every
+        # micro-batch below (`grad_accum > 1`); a one-micro step overwrites it
+        # exactly as the pre-arm code did.
+        flag_dev.fill_(1)
+        loss_ok_dev.fill_(True)
+        loss_sum = last_loss_dev.new_zeros(())
+        n_micro = cfg.grad_accum
+        for _micro in range(n_micro):
+            x, y = stream.next_batch()
+            if device is not None:
+                x, y = x.to(device), y.to(device)
+            logits, loss, step_counters = model(x, y, **kw)
+            assert logits.shape[-1] == run.model.vocab, "logits width != vocab"
+            total.merge(step_counters)
+            window.merge(step_counters)
+
+            # THE DEVICE FIREWALL (ADR-0018 rule 2). No host read decides this
+            # step: `loss_finite` and the gradient norm stay on the device, the
+            # masked loss makes backward's seed exactly zero, and the resulting
+            # 0-dim 1/0 flag is what every write below is multiplied by. The
+            # host sees the loss and the skip count at the log cadence only.
+            #
+            # `torch.where` on the scalar, not `mask_fill`: on a healthy step
+            # the value AND the gradient are bit-identical to `loss.backward()`
+            # (the where's backward passes the root gradient through unchanged),
+            # which is what keeps a healthy run's sha256 equal to HEAD's.
+            assert loss is not None, "a training step must carry targets"
+            loss_d = loss.detach()
+            loss_finite = torch.isfinite(loss_d).all()
+            step_loss = torch.where(loss_finite, loss, loss_d.new_zeros(()))
+            if n_micro > 1:
+                # The MEAN over micro-batches, not their sum: the accumulated
+                # gradient must be the wide batch's MEAN gradient, which is what
+                # makes `grad_accum=k, batch=b` match `batch=b·k`.
+                step_loss = step_loss / n_micro
+            if step_loss.requires_grad:
+                # A real training loss always does. A model that returns a bare
+                # tensor (the firewall's own NaN fixture) has nothing to
+                # backprop through, which is the old code's skip branch by
+                # another route.
+                step_loss.backward()
+            loss_sum = loss_sum + step_loss.detach()
+            grads = [p.grad for p in model.parameters() if p.grad is not None]
+            # A non-finite GRADIENT disables the step too (the burn 2026-09-27
+            # lesson: a masked loss scalar does not stop a NaN that came from an
+            # ACTIVATION — `NaN * 0` is still NaN through the Jacobian). One
+            # vector norm answers "any" without a host read; the flag is the AND
+            # of both.
+            raw_norm = grad_norm(model.parameters())
+            if raw_norm.device != loss_d.device:
+                raw_norm = raw_norm.to(loss_d.device)
+            finite = loss_finite & torch.isfinite(raw_norm)
+            if n_micro > 1:
+                # Sanitize THIS micro-batch's contribution on arrival — a
+                # non-finite activation must not poison the accumulator — and
+                # AND its flag into the group's. If ANY micro fails, the final
+                # multiply below zeroes the earlier contributions too.
+                flag_dev.mul_(finite.to(torch.int32))
+                loss_ok_dev.logical_and_(loss_finite)
+            else:
+                flag_dev.copy_(finite.to(torch.int32))
+                loss_ok_dev.copy_(loss_finite)
+            # Sanitize on the device AND gate: every non-finite gradient becomes
+            # 0 (so a moment cannot be poisoned), then every gradient is
+            # multiplied by the flag — `*1.0` is the identity on a healthy step,
+            # `*0` makes the skipped step's direction exactly zero (a masked loss
+            # alone does not: a NaN that came from an ACTIVATION would still be
+            # in the Jacobian).
+            gate = finite.to(torch.float32)
+            for g in grads:
+                g.nan_to_num_(0.0, 0.0, 0.0)
+                g.mul_(gate.to(g.dtype))
+        timer.tick()
+        if n_micro > 1:
+            # THE GROUP'S DECISION: one multiply, no host branch. Healthy
+            # (`*1`) changes no bit; a single non-finite micro-batch zeroes the
+            # whole accumulated direction, which is the same "skip the step"
+            # the one-micro firewall makes.
+            gate = flag_dev.to(torch.float32)
+            for g in grads:
+                g.mul_(gate.to(g.dtype))
         # The last FINITE loss, carried on the DEVICE: the host reads it when
         # the cadence fires and never before. Same bits as the old per-step
         # `float(loss.detach())`, so the printed number does not move.
-        torch.where(loss_finite, loss_d, last_loss_dev, out=last_loss_dev)
+        # `loss_sum` already holds the MEAN: each micro-contribution was
+        # divided by `n_micro` before backward (one division, not two).
+        torch.where(loss_ok_dev, loss_sum, last_loss_dev, out=last_loss_dev)
         # COUNTED as a device counter, drained with the window's other counters
         # at the log cadence (the `Counters.count_device` 0-sync rule).
+        # `nan_skipped` counts OPTIMIZER STEPS: a group with any non-finite
+        # micro-batch is one skipped step.
         window.count_device("nan_skipped", 1 - flag_dev)
         total.count_device("nan_skipped", 1 - flag_dev)
         window_steps += 1
@@ -1061,6 +1260,11 @@ def train(
             graph.step()
         else:
             opt_stage()
+        if ema is not None:
+            # ONCE per OPTIMIZER STEP (not per micro-batch), after the update
+            # landed. `opt_graph` is legal here because this runs EAGERLY after
+            # the replay, outside the capture.
+            _ema_update(model, ema, cfg.ema_decay, flag_dev)
         # The parameters just moved — and a CUDA-graph replay moves them
         # WITHOUT bumping `_version` (measured 2026-10-19). `_banks` keys its
         # cache on `_version`, so with `opt_graph = true` the key froze at
@@ -1089,7 +1293,11 @@ def train(
             # substrate already copies its row gradients D2H every step, so the
             # flag rides a read that exists and the table update has to know
             # `0` (drop the leaves, move nothing) or `1` (the normal update).
-            # `scale=0` is the OLD skip branch exactly.
+            # `scale=0` is the OLD skip branch exactly. With `grad_accum > 1`
+            # the group's pending leaves are ALL its micro-batches, and this
+            # one call is the old "once per step" contract (the leaves already
+            # carry the 1/k loss scale, so the summed row gradient is the wide
+            # batch's mean).
             updates, rows = host_step_all(model, lr, _host_scalar(flag_dev))
             total.count("engram_host_updates", updates)
             window.count("engram_host_updates", updates)
@@ -1165,9 +1373,10 @@ def train(
             # not on the gradient-evaluation point Y (Alg 1 line 18 / the
             # reference's `eval()`); the params go back to Y for the next step.
             sf("eval")
-            line, ev, scored = _eval_line(
-                model, eval_stream, cfg, run.model.max_iter, device, step + 1
-            )
+            with _shadow_params(model, ema):
+                line, ev, scored = _eval_line(
+                    model, eval_stream, cfg, run.model.max_iter, device, step + 1
+                )
             sf("train")
             log(line)
             if sink is not None:
@@ -1179,7 +1388,7 @@ def train(
             # `x` are the same iterate, which is what makes the switch back to Y
             # an absolute, double-lerp-free write.
             sf("eval")
-            weights, snapshot = save_ckpt(run, model, opt, step)
+            weights, snapshot = save_ckpt(run, model, opt, step, ema=ema)
             sf("train")
             log(f"ckpt step={step + 1} -> {weights} ({snapshot})")
 
@@ -1191,9 +1400,10 @@ def train(
     last_loss = _host_scalar(last_loss_dev)
     if cfg.eval and eval_stream is not None and cfg.steps % cfg.eval_every != 0:
         sf("eval")
-        line, _ev, _scored = _eval_line(
-            model, eval_stream, cfg, run.model.max_iter, device, cfg.steps
-        )
+        with _shadow_params(model, ema):
+            line, _ev, _scored = _eval_line(
+                model, eval_stream, cfg, run.model.max_iter, device, cfg.steps
+            )
         sf("train")
         log(line)
     return {
@@ -1202,5 +1412,9 @@ def train(
         "nan_skipped": nan_skipped,
         "counters": total,
         "opt_steps": opt.steps,
+        # The shadow this run trained (`None` at `ema_decay=0`). A test and a
+        # post-mortem read the same tensor dict the checkpoint writes; it is a
+        # declared report value, not a hot-path export.
+        "ema": ema,
         "eval_window_bytes": eval_window_bytes(cfg),
     }
