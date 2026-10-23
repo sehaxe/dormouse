@@ -20,6 +20,24 @@ they enter the build), never arbitrary user bytes. `0x03` and
 `0x00` exist because a fixed-size window needs an answer END: without them the
 only way to keep a window single-example is to train on padding.
 
+**The tool extension (opt-in; [`render_conversation`]).** A conversation that
+carries tool calls adds four markers to the same record grammar::
+
+    \\x01 <prompt>                    user turn (ends with \\n)
+    \\x02 <assistant text>            assistant turn
+    \\x04 <tool name> \\x05 <json args> \\x06   a tool CALL emitted by the assistant
+    \\x07 <observation>               the tool's RESULT, appended by the harness
+    \\x03                             end of the assistant turn
+
+`0x04`/`0x05`/`0x06` delimit a call, `0x07` opens an observation. [`render`]
+is unchanged — the plain corpus stays byte-identical, pinned by a sha256 gate —
+and [`render_conversation`] is the only writer of the new markers. The mask is
+the point of the extension: the loss supervises the assistant bytes AND the call
+bytes (`0x04` through `0x06`), never the observation. A model trained on tool
+OUTPUT would learn to invent observations instead of calling the tool.
+[`scan_ranges`] is the ONE rule that encodes this, and on a tool-free window it
+reproduces [`sft_mask`] exactly (gated in `tests/test_agent.py`).
+
 **One window, one example, and how that is guaranteed.** Every record is written
 as exactly `seq_len + 1` bytes (the rendered example, then `0x00` padding), and
 the file is a concatenation of records. `ByteStream` reads `batch x (seq_len+1)`
@@ -61,9 +79,12 @@ eval line's `fin` scores, so SFT trains exactly the readout generation reads.
 
 from __future__ import annotations
 
+import json
 import math
 import random
 import time
+from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -95,6 +116,17 @@ ASSIST = 0x02
 END = 0x03
 PAD = 0x00
 SENTINELS = (USER, ASSIST, END, PAD)
+
+#: The tool extension's markers ([`render_conversation`]). They are NOT in
+#: [`SENTINELS`] on purpose: the plain corpus renderer (`render`, `_chat_pairs`)
+#: keeps the exact behaviour it had before they existed, and only the
+#: conversation renderer asserts them absent from the text it writes.
+TOOL_CALL = 0x04  # \x04 <name> — the assistant asks for a tool
+TOOL_ARGS = 0x05  # \x05 <json args>
+TOOL_END = 0x06  # closes the call; also the byte the harness stops generation at
+OBSERVATION = 0x07  # \x07 <observation> — appended by the harness, never supervised
+TOOL_MARKERS = (TOOL_CALL, TOOL_ARGS, TOOL_END, OBSERVATION)
+TOOL_SENTINELS = SENTINELS + TOOL_MARKERS
 
 #: The generic half of the corpus: the model has to learn the FORMAT, not just
 #: code. Hand-written, both languages the corpus speaks, answers kept short so
@@ -432,6 +464,267 @@ def render(instruction: str, answer: str) -> bytes:
         + answer.encode("utf-8")
         + bytes([END])
     )
+
+
+# ---------------------------------------------------------------------------
+# the tool template: segments, the renderer, and the ONE mask rule
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Segment:
+    """One piece of a rendered conversation. `text`/`args` are BYTES or str.
+
+    Bytes, not str, because the agent loop appends the bytes the model actually
+    emitted: re-decoding them through UTF-8 and re-encoding would silently
+    replace an invalid sequence and the trained window would stop being the
+    window that was rolled out.
+    """
+
+    role: str  # "user" | "assistant" | "call" | "observation" | "end"
+    text: bytes | str = b""
+    name: str = ""
+    args: bytes | str = b""
+
+
+def _raw(value: bytes | str) -> bytes:
+    return value if isinstance(value, bytes) else value.encode("utf-8")
+
+
+def _check_clean(raw: bytes, what: str) -> None:
+    """No template marker inside a payload; louder than `_assert_clean`'s assert."""
+    for b in TOOL_SENTINELS:
+        if b in raw:
+            loud(
+                f"render_conversation: marker 0x{b:02x} appears in {what}. The markers "
+                f"must be bytes the text cannot contain, or the mask's boundaries are "
+                f"not the turn's boundaries. Escape: strip the byte, or pick another "
+                f"tool name/argument."
+            )
+
+
+def _check_json(raw: bytes, name: str) -> None:
+    """A call's args must be a JSON object — refused BEFORE the turn is rendered."""
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        loud(
+            f"render_conversation: tool {name!r} call args are not valid JSON "
+            f"({exc}). Escape: the args field must be a JSON object, e.g. "
+            f'{{"expr": "2 + 2"}}.'
+        )
+    if not isinstance(parsed, dict):
+        loud(
+            f"render_conversation: tool {name!r} call args are a JSON "
+            f"{type(parsed).__name__}, not an object. Escape: one JSON object."
+        )
+
+
+def segment_bytes(seg: Segment) -> bytes:
+    """The template bytes of one segment (no padding, no terminator magic)."""
+    text = _raw(seg.text)
+    if seg.role == "user":
+        _check_clean(text, "a user turn")
+        return bytes([USER]) + text + b"\n"
+    if seg.role == "assistant":
+        _check_clean(text, "an assistant turn")
+        return bytes([ASSIST]) + text
+    if seg.role == "call":
+        name = seg.name.encode("utf-8")
+        args = _raw(seg.args)
+        if not name:
+            loud("render_conversation: a call needs a non-empty tool name")
+        _check_clean(name, "a tool name")
+        _check_clean(args, f"tool {seg.name!r}'s args")
+        _check_json(args, seg.name)
+        return bytes([TOOL_CALL]) + name + bytes([TOOL_ARGS]) + args + bytes([TOOL_END])
+    if seg.role == "observation":
+        _check_clean(text, "an observation")
+        return bytes([OBSERVATION]) + text
+    if seg.role == "end":
+        return bytes([END])
+    loud(
+        f"render_conversation: unknown segment role {seg.role!r} (known: user, "
+        f"assistant, call, observation, end)"
+    )
+
+
+def render_conversation(segments: Sequence[Segment]) -> bytes:
+    """Render a turn-aware record: the tool template, structure checked loudly.
+
+    The order rules are the grammar's, not decoration: a call is emitted INSIDE
+    an assistant turn (`\x04` after `\x02`), an observation follows a call
+    (`\x07` after `\x06`), `end` is last, and a user turn cannot follow a call
+    (the harness would be answering itself). A conversation with no tool call
+    renders to exactly [`render`]'s bytes — gated in `tests/test_agent.py`.
+    """
+    out = bytearray()
+    last = None
+    for seg in segments:
+        if last is None and seg.role not in ("user", "assistant"):
+            loud(f"render_conversation: a record opens with {seg.role!r}, not a user turn")
+        if seg.role == "user" and last is not None and last != "end":
+            loud(
+                f"render_conversation: a user turn after {last!r} — turns are separated "
+                f"by the end marker (0x03). Escape: close the assistant turn first."
+            )
+        if seg.role == "call" and last != "assistant":
+            loud(
+                f"render_conversation: a call must follow an assistant segment "
+                f"(got {last!r}): the model emits calls inside its own turn."
+            )
+        if seg.role == "observation" and last != "call":
+            loud(f"render_conversation: an observation follows a call, not {last!r}")
+        if seg.role == "end" and last not in ("assistant", "call", "observation"):
+            loud(f"render_conversation: `end` after {last!r}")
+        if last == "end":
+            loud(f"render_conversation: {seg.role!r} after the end marker")
+        out += segment_bytes(seg)
+        last = seg.role
+    return bytes(out)
+
+
+def scan_ranges(row: Sequence[int]) -> list[tuple[int, int]]:
+    """The ONE mask rule: supervised INCLUSIVE byte spans of a rendered record.
+
+    A target position `j` is supervised iff `j + 1` lies inside a span, because
+    position `j` predicts byte `j + 1` (the `sft_mask` convention). A span is an
+    assistant turn (`0x02` through its text), a call (`0x04` through `0x06`), and
+    the end marker (`0x03`). An observation (`0x07` through the next marker),
+    the user prompt, and the padding are never supervised.
+
+    The refusals are the template's: a call marker without its `0x05`/`0x06`
+    halves, a call name that is empty, an observation outside a call, an
+    assistant turn interrupted by another `0x02`, and content after `0x03` that
+    is not padding. On a tool-free window this returns exactly the spans
+    `sft_mask` masks (same gate).
+    """
+    ranges: list[tuple[int, int]] = []
+    end_at: int | None = None
+    after_call = False
+    i = 0
+    n = len(row)
+    while i < n:
+        b = row[i]
+        if end_at is not None:
+            if b != PAD:
+                loud(
+                    f"scan_ranges: content (0x{b:02x} at byte {i}) after the end marker "
+                    f"at {end_at}. Escape: a record is `seq_len + 1` bytes and only "
+                    f"0x00 may follow 0x03."
+                )
+            i += 1
+            continue
+        if b == PAD:
+            i += 1
+            continue
+        if b == USER:
+            i += 1
+            while i < n and row[i] not in (ASSIST, TOOL_CALL, OBSERVATION, END, PAD):
+                i += 1
+            if i < n and row[i] in (TOOL_CALL, OBSERVATION):
+                loud(
+                    f"scan_ranges: 0x{b:02x} at byte {i} inside a user turn: a call or "
+                    f"an observation needs an assistant turn first."
+                )
+            after_call = False
+            continue
+        if b == ASSIST:
+            start = i
+            i += 1
+            while i < n and row[i] not in (TOOL_CALL, END, OBSERVATION, ASSIST, USER, PAD):
+                i += 1
+            ranges.append((start, max(i - 1, start)))
+            after_call = False
+            if i >= n:
+                break
+            if row[i] == TOOL_CALL:
+                continue
+            if row[i] == END:
+                ranges.append((i, i))
+                end_at = i
+                i += 1
+                continue
+            loud(
+                f"scan_ranges: 0x{row[i]:02x} at byte {i} ends an assistant turn that "
+                f"no call or end marker closed. Escape: a turn ends with 0x04 (a call) "
+                f"or 0x03."
+            )
+        if b == TOOL_CALL:
+            start = i
+            i += 1
+            while i < n and row[i] not in (TOOL_ARGS, END, PAD):
+                i += 1
+            if i >= n or row[i] != TOOL_ARGS:
+                loud(
+                    f"scan_ranges: a call marker 0x04 at byte {start} has no 0x05 args "
+                    f"marker. Escape: a call is `0x04 name 0x05 json 0x06`."
+                )
+            if i - start <= 1:
+                loud(f"scan_ranges: a call at byte {start} carries an empty tool name")
+            i += 1
+            while i < n and row[i] not in (TOOL_END, END, PAD):
+                i += 1
+            if i >= n or row[i] != TOOL_END:
+                loud(
+                    f"scan_ranges: the call at byte {start} is never closed by 0x06 "
+                    f"(the byte budget or the model cut it). Escape: a longer budget, "
+                    f"or refuse the turn."
+                )
+            ranges.append((start, i))
+            after_call = True
+            i += 1
+            continue
+        if b in (TOOL_ARGS, TOOL_END):
+            loud(f"scan_ranges: marker 0x{b:02x} at byte {i} outside a call")
+        if b == OBSERVATION:
+            if not after_call:
+                loud(
+                    f"scan_ranges: an observation at byte {i} without a call before it: "
+                    f"only the harness appends 0x07, and only as a call's result."
+                )
+            i += 1
+            while i < n and row[i] not in (TOOL_CALL, ASSIST, END, PAD, OBSERVATION):
+                i += 1
+            after_call = False
+            continue
+        if b == END:
+            ranges.append((i, i))
+            end_at = i
+            i += 1
+            continue
+        loud(
+            f"scan_ranges: stray byte 0x{b:02x} at byte {i} outside any segment. Escape: "
+            f"render the window with render_conversation."
+        )
+    if not ranges:
+        loud(
+            "scan_ranges: the window carries no assistant/call/end marker, so it is not "
+            "a rendered conversation. Escape: render_conversation, or rebuild the corpus."
+        )
+    return ranges
+
+
+def supervised_ranges(segments: Sequence[Segment]) -> list[tuple[int, int]]:
+    """[`scan_ranges`] over [`render_conversation`]'s bytes — one call, one rule."""
+    return scan_ranges(render_conversation(segments))
+
+
+def conversation_mask(windows: torch.Tensor) -> torch.Tensor:
+    """`[b, t]` bool over TARGET positions for a tool-bearing window.
+
+    The `sft_mask` convention, generalized: True for the assistant bytes and the
+    call bytes, False for the prompt, the observations and the padding. On a
+    tool-free window it equals `sft_mask` (the gate in `tests/test_agent.py`),
+    which is why the extension cannot change what today's SFT run supervises.
+    """
+    assert windows.ndim == 2, f"windows must be [b, t], got {tuple(windows.shape)}"
+    b, t = windows.shape
+    out = torch.zeros((b, t), dtype=torch.bool, device=windows.device)
+    for i in range(b):
+        for start, end in scan_ranges(windows[i].tolist()):
+            out[i, max(start - 1, 0) : end] = True
+    return out
 
 
 def _examples(
