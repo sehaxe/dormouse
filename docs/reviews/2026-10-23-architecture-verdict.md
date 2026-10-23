@@ -115,6 +115,30 @@ Three findings that matter:
 
 **Recommendation for the flagship:** `factor_qat=ternary` (bank only) **plus `use_mhc=true`**, dense layers stay bf16 (`dense_qat=none` — the router is the most damaging place to quantise, and dense layers are only 37 M of b1's 1.07 B). Measured net cost of that combination versus plain bf16: **+0.005 BPB for 8× smaller bank storage**; a 20k-step confirmation is required before the flagship because the 600-step screen may overstate the cost.
 
+
+### 3.1 CRITICAL: `engram_ram=true` costs 0.83 BPB at our budget (measured, isolated)
+
+The diagnostic run (600 steps, 1 seed, everything else identical) isolates three factors that had been confounded:
+
+| config | BPB | per-iteration CE |
+|---|---|---|
+| iter4 + MSA + **engram in VRAM** | **2.649** | 2.024 / 1.812 / 1.767 / 1.807 |
+| iter3 + MSA + engram in VRAM | 2.662 | 1.972 / 1.802 / 1.811 |
+| iter4 + no MSA + engram in VRAM | 2.670 | 2.040 / 1.832 / 1.783 / 1.813 |
+| iter4 + MSA + **engram in host RAM** | **3.476** | 2.488 / 2.414 / 2.381 / 2.376 |
+| iter3 + no MSA + **engram in host RAM** | **3.460** | 2.454 / 2.385 / 2.370 |
+
+**`engram_ram` is the entire 0.8 BPB gap.** `max_iter` 3 vs 4 is +0.013 (a tie) and MSA-off is +0.021 (so MSA earns its keep at this budget).
+
+**Mechanism** (`port/src/dormouse/model/engram.py`, verbatim from burn's `offload.rs:154-160`):
+```python
+m = 0.95*m + 0.05*g
+block = 0.95*m + 0.05*g      # the update actually applied
+```
+At steady state on a *hot* row this converges to `g`, so the formula is right for a table where every row is touched often. For a **cold row touched once**, `m = 0.05g` and `block = 0.0525g` — a **~19× smaller step**, and a hash table at 600 steps is almost entirely cold rows. Burn's production run used 48M rows over 300k steps, where rows converge; our screens do not.
+
+**Consequence:** the engram stays in VRAM for every run at `medium` (3 orders × 524 288 × 32 × 4 B = 201 MB — it fits). `engram_ram` remains mandatory only for `b1` (402M rows), and that path needs bias correction (`m / (1 - 0.95^t)`, Adam-style) before it is trustworthy.
+
 ---
 
 ## 4. What crosses with what (measured)
