@@ -118,7 +118,7 @@ def host_device_type(model: torch.nn.Module) -> str:
     return next(model.parameters()).device.type
 
 
-def host_tables(model: torch.nn.Module) -> int:
+def host_tables(model: torch.nn.Module, bias_correction: bool = True) -> int:
     """Switch every Engram to host tables; LOUD on a run that cannot have them.
 
     Called BEFORE the optimizer is built (`train`), which is what keeps the
@@ -133,6 +133,9 @@ def host_tables(model: torch.nn.Module) -> int:
       VRAM-budget decision (`cfg.rs:50`);
     * a model with no Engram to host (`use_engram=false`) — `load_run` refuses
       that pair too, but a hand-built model reaches here without passing it.
+
+    `bias_correction` is `TrainConfig.engram_bias_correction`: the host update's
+    formula, not a substrate choice (`enable_host_tables` sets it).
     """
     dev = host_device_type(model)
     if dev != "cuda":
@@ -142,7 +145,7 @@ def host_tables(model: torch.nn.Module) -> int:
             f"the per-forward row transfers would be pure cost against the in-VRAM "
             f"table. Escape: engram_ram=false, or run on cuda."
         )
-    n = enable_host_tables(model)
+    n = enable_host_tables(model, bias_correction=bias_correction)
     if n == 0:
         loud(
             "engram_ram=true but the model has no Engram to host (use_engram=false?): "
@@ -389,7 +392,7 @@ def load_model_state(model: torch.nn.Module, cfg: TrainConfig, sd: dict, *, stri
     """
     if cfg.engram_ram:
         require_ngram(cfg)
-        enable_host_tables(model)  # idempotent: 0 when the model is already host
+        enable_host_tables(model, bias_correction=cfg.engram_bias_correction)  # idempotent
     result = model.load_state_dict(sd, strict=strict)
     if cfg.engram_ram:
         load_host_state(model, load_ngram(cfg))
@@ -677,8 +680,11 @@ def train(
         # BEFORE the optimizer exists: on the host path the tables are not
         # parameters, so no group, no grad clip and no checkpoint half ever
         # carries them (`Engram.to_host` deletes the parameter).
-        n = host_tables(model)
-        log(f"engram_ram: {n} table set(s) in host RAM, VRAM holds the batch's unique rows")
+        n = host_tables(model, cfg.engram_bias_correction)
+        log(
+            f"engram_ram: {n} table set(s) in host RAM, VRAM holds the batch's unique "
+            f"rows, bias_correction={'on' if cfg.engram_bias_correction else 'off'}"
+        )
     opt = MixOptimizer(
         model,
         lr=cfg.lr,

@@ -1059,6 +1059,16 @@ class TrainConfig:
     #: (there is no table to host). Flipping the flag on a resume is refused by
     #: the snapshot drift check — it changes the parameter set AND the optimizer.
     engram_ram: bool = False
+    #: The host update's transient (`model/engram.py::HostTables`). `true` (the
+    #: default) divides the Nesterov look-ahead by its total weight per ROW,
+    #: `1 - HOST_MOMENTUM**(t+1)`, `t` = that row's touch count: a cold row's
+    #: first touch is the raw gradient instead of `1-μ² = 0.0975` of it, and a
+    #: row with `t ≥ 337` (measured) divides by exactly `1.0` (bit-unchanged). `false` is
+    #: burn's `offload.rs` formula verbatim — the A/B's `ram_old_formula` arm.
+    #: Host path only (the in-VRAM table is an `nn.Parameter` on AdamW and never
+    #: reads this). In the snapshot, so a flip on a resume is refused by
+    #: `diff_keys` like every other non-progress key.
+    engram_bias_correction: bool = True
     #: The ADAPTIVE DEPTH arm (owner 2026-10-16): run the loop `T` iterations
     #: per TRAIN step, `T` sampled in `1..=max_iter` as a PURE function of
     #: `(seed, step)` (`train.loop._sample_depth`), with the loss normalized by
