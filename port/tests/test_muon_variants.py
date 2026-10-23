@@ -740,9 +740,9 @@ def test_the_sf_muon_lr_is_constant_after_warmup_while_the_control_decays():
     def run_one(**over) -> list[float]:
         recorded: list[float] = []
 
-        def spy(self, model):
+        def spy(self, model, flag=None):
             recorded.append(self.param_groups[0]["lr"])
-            return real(self, model)
+            return real(self, model, flag)
 
         Muon.batched_step_from_model = spy
         try:
@@ -787,9 +787,11 @@ def test_a_nan_skipped_step_advances_none_of_z_x_or_s():
     real_batched = Muon.batched_step_from_model
     seen: list[float] = []
 
-    def spy(self, model):
+    def spy(self, model, flag=None):
+        # `sf_s` is a float64 device scalar now (the firewall can leave it
+        # untouched on a skipped step); reading it here is the gate's own read.
         seen.append(float(self.state[self.param_groups[0]["params"][0]].get("sf_s", 0.0)))
-        return real_batched(self, model)
+        return real_batched(self, model, flag)
 
     DM.forward = forward
     Muon.batched_step_from_model = spy

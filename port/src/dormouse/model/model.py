@@ -610,7 +610,11 @@ class DormouseModel(nn.Module):
                 if breakdown:
                     self.last_breakdown["mtp"] = float(mtp_loss.detach())
                     self.last_breakdown["mtp_per_k"] = [float(t.detach()) for t in mtp_per_k]
-            assert torch.isfinite(loss), "L_Rec + final CE must be finite"
+            # No finiteness assert here: `bool(tensor)` is a host read on the
+            # loss scalar, and the trainer's DEVICE firewall (`train/loop.py`)
+            # owns the decision — it masks a non-finite loss and gates the
+            # update on the device (ADR-0018 rule 2). The assert used to fire
+            # before the firewall could see the value.
         return logits, loss
 
 
@@ -624,7 +628,8 @@ def _byte_ce(flat_logits: torch.Tensor, targets: torch.Tensor | None) -> torch.T
     if targets is None:
         return None
     loss = -F.log_softmax(flat_logits, dim=-1).gather(1, targets.reshape(-1, 1)).mean()
-    assert torch.isfinite(loss), "the byte CE must be finite"
+    # No finiteness assert: see `_forward_byte_lm`'s note — the device
+    # firewall owns the NaN decision and cannot be preempted by a host read.
     return loss
 
 
