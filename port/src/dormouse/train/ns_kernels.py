@@ -310,6 +310,24 @@ def zeropower_triton(x: torch.Tensor, steps: int = 5) -> torch.Tensor:
     return out
 
 
+def path_reason(x: object, ns_dtype: str = "fp32") -> str | None:
+    """`None` if the fused chain can serve THIS call, else why not.
+
+    The one place the ARM's decision lives (the dtype rung first, then the
+    shape/device reasons), so `zeropower_triton_or_classic` and the batched
+    optimizer's per-job partition cannot disagree about which chain a tensor
+    gets. Every branch is COUNTED by the caller, never silent (ADR-0019).
+    """
+    # The CONFIG reason is asked first: it is the one a reader can act on, and a
+    # device reason would otherwise mask it on every CPU box.
+    if ns_dtype != "fp32":
+        return (
+            f"ns_dtype={ns_dtype!r}: the Triton arm runs the chain in fp32 and SUBSUMES "
+            f"the bf16 rung, so the two must not ride in one A/B"
+        )
+    return triton_reason(x)
+
+
 def zeropower_triton_or_classic(
     g: torch.Tensor,
     steps: int = 5,
@@ -344,14 +362,7 @@ def zeropower_triton_or_classic(
         )
     # The CONFIG reason is asked first: it is the one a reader can act on, and a
     # device reason would otherwise mask it on every CPU box.
-    why = None
-    if ns_dtype != "fp32":
-        why = (
-            f"ns_dtype={ns_dtype!r}: the Triton arm runs the chain in fp32 and SUBSUMES "
-            f"the bf16 rung, so the two must not ride in one A/B"
-        )
-    if why is None:
-        why = triton_reason(g)
+    why = path_reason(g, ns_dtype)
     if why is None:
         try:
             out = zeropower_triton(g, steps)
