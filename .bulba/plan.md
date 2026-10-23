@@ -236,6 +236,34 @@ testable and A/B-able (ADR-0017).
       shape x throughput x eval-window table. All three preflight and print
       SKIP on a busy card; the card was busy, so **NO TIMING EXISTS**. Landed
       2026-10-21.
+- [x] P-CHEAPWIDTH. port (Python): make `d_model` stop setting the dense bill
+      with three OFF-by-default flags (all three off = `main` bit for bit,
+      sha256 state_dict + logits pinned from a clean `main` worktree).
+      `attn_latent_rank` (MLA-style `d→r→d` shared latent for KDA's q/k/v/g:
+      `5·d·r` instead of `4·d²`), `n_kv_heads` (GQA on k/v, expanded
+      `repeat_interleave(h/h_kv)` before the kernel so FLA still sees
+      `[b,t,h,hd]`; projection cost `2·d²→2·d·h_kv·hd`), `out_proj_rank`
+      (readout `d→r→d`, `2·d·r` instead of `d²`; TSCT rank override, dense
+      two-linear on `use_tsct=false`). `dormouse.width` prints the arithmetic:
+      at `iters=3`, `d=1024` the dense bill is **24.12M MAC/token**; `latent`
+      (r=256) **15.46M (35.9%)**, `gqa` (2/16) **18.61M (22.8%)**,
+      `latent+gqa` **14.09M (41.6%)**, `all` **12.52M (48.1%)**; at `d=4096`
+      (r=1024) the same three rows cut 35.9/25.3/42.2/48.7% off **385.9M**.
+      The predicted parameter deltas are checked against `dormouse info`'s
+      instantiated totals (latent −2.88M, gqa −1.84M, out_proj −0.52M,
+      all −3.87M at medium, dense rung). Refused LOUDLY: negative flags,
+      `n_kv_heads > n_heads`, non-divisible heads, `out_proj_rank > d_model`,
+      and either attention flag with `use_kda=false`; `attn_latent_rank` is
+      ALLOWED with `factor_qat != none` because the latent and the four
+      projections are dense sites and `factor_qat` reaches only TSCT pairs
+      (checked, stated, gated). Gates a-g pinned in `tests/test_cheapwidth.py`
+      (OFF parity; MAC-vs-info; named gradients; each flag moves the logits;
+      stub-FLA shape contract over all 8 combinations; refusals; no host sync),
+      each proven by a scratch revert. `port/scripts/ab_cheapwidth.py`
+      (dense / latent / gqa / latent+gqa / all, 3 seeds, 600 steps, medium,
+      web.bin + its eval, JSONL in `~/logs/ab_cheapwidth/`, `--profile`) is
+      written and **NOT run**: the card is busy, so no A/B number exists.
+      Landed 2026-10-23.
 - [x] D1. `docs: retract the false step-time and verification claims` (prose only,
       no Rust). **Landed 2026-09-29.** Withdrawn without replacement, because the
       corrected value is not known: the 25.8 s/step batch-8 figure (no committed
