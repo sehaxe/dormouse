@@ -685,7 +685,7 @@ def sft_train(
         # training VRAM-budget rule, and on a CPU model the host path's NUMERICS
         # are device-agnostic (the tables ARE CPU memory) — the same call
         # `load_model_state` makes, for the same reason.
-        enable_host_tables(model)
+        enable_host_tables(model, bias_correction=cfg.engram_bias_correction)
         if not host_engrams(model):
             loud(
                 "sft engram_ram=true but the model has no Engram to host "
@@ -694,7 +694,8 @@ def sft_train(
             )
         log(
             f"engram_ram: {len(host_engrams(model))} table set(s) in host RAM, VRAM "
-            f"holds the batch's unique rows"
+            f"holds the batch's unique rows, "
+            f"bias_correction={'on' if cfg.engram_bias_correction else 'off'}"
         )
     opt = MixOptimizer(
         model,

@@ -147,7 +147,7 @@ def rl_train(
         # The host path's substrate, switched BEFORE the optimizer exists (the
         # rule `sft_train` carries): `Engram.to_host` DELETES the table
         # parameter, so a group built first would hold a dead tensor.
-        enable_host_tables(model)
+        enable_host_tables(model, bias_correction=cfg.engram_bias_correction)
         if not host_engrams(model):
             loud(
                 "rl engram_ram=true but the model has no Engram to host "
@@ -156,7 +156,8 @@ def rl_train(
             )
         log(
             f"engram_ram: {len(host_engrams(model))} table set(s) in host RAM, VRAM "
-            f"holds the batch's unique rows"
+            f"holds the batch's unique rows, "
+            f"bias_correction={'on' if cfg.engram_bias_correction else 'off'}"
         )
     opt = MixOptimizer(
         model,
