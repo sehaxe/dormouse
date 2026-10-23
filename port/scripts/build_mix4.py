@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["pyarrow>=15"]
+# dependencies = ["pyarrow>=15", "numpy>=1.26"]
 # ///
 """Build `data_local/mix4/`: the 5.75 GB pretraining mixture, one byte shard per domain.
 
@@ -16,9 +16,17 @@ shard by source range or document SHA-1. `finish()` does not trust the
 construction: it proves the exclusion and refuses to publish a shard on a
 failed proof.
 
+`--near-dup` and `--quality-band` are OFF by default (the mix4 bytes reproduce
+exactly). With them on, the two crawl domains (`web`, `ruweb`) are cut into
+line-aligned 8 KiB chunks, near-duplicates are removed by MinHash LSH, and a
+cheap heuristic band drops junk. The eval shard is carved first AND indexed
+first, so a near-duplicate of an eval chunk is refused a train write.
+
     uv run port/scripts/build_mix4.py                 # all domains
     uv run port/scripts/build_mix4.py --only web wiki_en
     uv run port/scripts/build_mix4.py --force --only math
+    uv run port/scripts/build_mix4.py --only web ruweb --out-dir data_local/mix5 \\
+        --near-dup --quality-band --max-source-bytes 1200000000
 
 The code domain is `codeparrot/github-code-clean` (Apache-2.0 dataset; the card
 says the files are permissively licensed). `bigcode/starcoderdata` is gated and
@@ -53,6 +61,22 @@ SEED = 20261022
 FILTER_VERSION = 4
 UNIT = 256 << 10
 EVAL_TARGET = 4 << 20
+
+#: Near-duplicate removal and the quality band run on the two crawl domains.
+CRAWL_DOMAINS = ("web", "ruweb")
+#: The chunk is the document unit of both stages (line-aligned, lossless: the
+#: kept chunks concatenated are a byte subsequence of the shard).
+CHUNK_BYTES = 8 << 10
+NEAR_DUP_PERMS = 128
+NEAR_DUP_BANDS = 16
+NEAR_DUP_ROWS = NEAR_DUP_PERMS // NEAR_DUP_BANDS  # 8
+#: Banding target. P(collide at J=0.8) = 1 - (1 - 0.8**8)**16 = 0.946.
+NEAR_DUP_THRESHOLD = 0.8
+#: The 128-perm estimate of a true 0.80 pair has sigma = 0.035, so the
+#: verification accepts a 0.05 margin below the banding target.
+NEAR_DUP_VERIFY = 0.75
+#: Loud ceiling on the index: beyond this the run refuses instead of growing.
+NEAR_DUP_MAX_DOCS = 1_500_000
 
 # Byte targets at a 5.75 GB total. Percentages are in docs/guides/dataset.md.
 TARGETS = {
@@ -174,6 +198,20 @@ def pread(path: Path, offset: int, length: int) -> bytes:
         return f.read(length)
 
 
+def iter_chunks(raw: bytes, size: int = CHUNK_BYTES):
+    """Line-aligned, lossless chunks: `b"".join(kept)` is a subsequence of `raw`."""
+    start = 0
+    n = len(raw)
+    while start < n:
+        end = min(n, start + size)
+        if end < n:
+            nl = raw.rfind(b"\n", start, end)
+            if nl > start:
+                end = nl + 1
+        yield start, raw[start:end]
+        start = end
+
+
 def file_contains(path: Path, needle: bytes) -> bool:
     """True when `needle` occurs anywhere in `path` — the eval-leak proof."""
     if not needle:
@@ -284,12 +322,23 @@ class Domain:
     """One `.bin` domain: a partial train file, a partial eval file, a state file."""
 
     def __init__(
-        self, name: str, target: int, out_dir: Path, *, eval_target: int = EVAL_TARGET
+        self,
+        name: str,
+        target: int,
+        out_dir: Path,
+        *,
+        eval_target: int = EVAL_TARGET,
+        near_dup: bool = False,
+        quality_band: bool = False,
+        max_source_bytes: int = 0,
     ) -> None:
         self.name = name
         self.target = target
         self.eval_target = eval_target
         self.out_dir = out_dir
+        self.near_dup = near_dup
+        self.quality_band = quality_band
+        self.max_source_bytes = max_source_bytes
         self.train_path = out_dir / f"{name}.bin"
         self.eval_path = out_dir / f"{name}_eval.bin"
         self.state_path = out_dir / f".{name}.state.json"
@@ -311,6 +360,15 @@ class Domain:
             "seed": SEED,
             "source": source_fingerprint(self.name),
         }
+        # Only when a stage is on: the mix4 build key of a default run must not
+        # change, or every finished mix4 domain would be rebuilt on a rerun.
+        if self.near_dup or self.quality_band or self.max_source_bytes:
+            spec.update(
+                near_dup=self.near_dup,
+                quality_band=self.quality_band,
+                max_source_bytes=self.max_source_bytes,
+                chunk_bytes=CHUNK_BYTES,
+            )
         return sha1(json.dumps(spec, sort_keys=True).encode())
 
     def _load_state(self) -> dict:
@@ -460,6 +518,25 @@ class Domain:
         if self.state["train_bytes"] == 0:
             raise RuntimeError(f"{self.name}: no training bytes were written")
         proof = self._prove()
+        if self.near_dup:
+            nd = self.state.get("near_dup") or {}
+            if not nd.get("eval_chunks"):
+                raise RuntimeError(
+                    f"{self.name}: --near-dup indexed no eval chunks — the "
+                    "near-duplicate no-leak proof would be vacuous"
+                )
+            collisions = self.state["drops"].get("near_dup_eval", {}).get("units", 0)
+            if nd.get("eval_collisions", 0) != collisions:
+                raise RuntimeError(
+                    f"{self.name}: near-dup eval collisions {nd.get('eval_collisions')} "
+                    f"!= dropped {collisions}"
+                )
+            proof["near_dup"] = {
+                "eval_chunks_indexed": nd["eval_chunks"],
+                "eval_collisions_dropped": collisions,
+                "dropped_before_write": True,
+                "pass": True,
+            }
         train_sha = sha256_file(self.ptrain)
         eval_sha = sha256_file(self.peval)
         entry = {
@@ -478,6 +555,13 @@ class Domain:
             },
             "build_key": self.key,
         }
+        if self.near_dup:
+            entry["near_dup"] = self.state["near_dup"]
+        if self.quality_band:
+            entry["quality_band"] = self.state["quality_band"]
+        if self.max_source_bytes:
+            entry["max_source_bytes"] = self.max_source_bytes
+            entry["source_bytes_read"] = self.state.get("source_bytes", 0)
         os.replace(self.ptrain, self.train_path)
         os.replace(self.peval, self.eval_path)
         self.state["phase"] = "done"
@@ -713,6 +797,441 @@ def render_qa(row: dict) -> tuple[bytes | None, str]:
     return out, ""
 
 
+# --- near-duplicate removal (MinHash LSH) -----------------------------------
+#
+# The corpus does not fit in RAM. A shard is cut into line-aligned chunks (the
+# unit the builder writes), each chunk is shingled at word 5-grams (byte
+# 5-grams when the chunk has no spaces, e.g. CJK), MinHashed with 128
+# permutations, and split into 16 bands x 8 rows. A pair at Jaccard >= 0.8
+# collides in at least one band with P = 1 - (1 - 0.8**8)**16 = 0.946, so a
+# candidate is found without comparing every pair. The candidate is then
+# verified on the 128-value signature (with a 0.05 estimator margin, because
+# the standard error of a 128-perm estimate at J=0.8 is 0.035), and the exact
+# Jaccard of the first five drops is recomputed from the bytes so the number
+# is auditable.
+#
+# Memory is bounded by the index, not the corpus:
+#     n_docs * 128 * 4 B signatures
+#   + 16 band keys and one (path, offset, len) per kept document.
+# The shingles of the chunk being processed are the only text held.
+# `NearDupIndex.signature_nbytes()` is the gate.
+
+_NUMPY = None
+
+
+def _np():
+    """numpy, imported lazily so the mix4 byte-path tests run without it."""
+    global _NUMPY
+    if _NUMPY is None:
+        import numpy
+
+        _NUMPY = numpy
+    return _NUMPY
+
+
+_QPOW = None
+_RPOW = None
+_Q = 0x9E3779B97F4A7C15  # odd: a bijection modulo 2**64
+_R = 0xC2B2AE3D27D4EB4F
+_MIX = 0x9E3779B97F4A7C15
+
+
+def _qpow(n: int):
+    global _QPOW
+    np = _np()
+    if _QPOW is None or len(_QPOW) <= n:
+        size = max(n + 1, 4096)
+        p = np.empty(size, np.uint64)
+        p[0] = 1
+        v = 1
+        for i in range(1, size):
+            v = (v * _Q) & 0xFFFFFFFFFFFFFFFF
+            p[i] = v
+        _QPOW = p
+    return _QPOW
+
+
+def _rpow():
+    global _RPOW
+    np = _np()
+    if _RPOW is None:
+        p = np.empty(5, np.uint64)
+        p[0] = 1
+        v = 1
+        for i in range(1, 5):
+            v = (v * _R) & 0xFFFFFFFFFFFFFFFF
+            p[i] = v
+        _RPOW = p
+    return _RPOW
+
+
+def _perm_ab():
+    """128 (a, b) multiply-shift permutations, a pure function of SEED."""
+    np = _np()
+    rng = np.random.default_rng(SEED)
+    a = rng.integers(1, 1 << 63, size=NEAR_DUP_PERMS, dtype=np.uint64) | np.uint64(1)
+    b = rng.integers(0, 1 << 63, size=NEAR_DUP_PERMS, dtype=np.uint64)
+    return a, b
+
+
+_PERM_A = None
+_PERM_B = None
+
+
+def _perms():
+    global _PERM_A, _PERM_B
+    if _PERM_A is None:
+        _PERM_A, _PERM_B = _perm_ab()
+    return _PERM_A, _PERM_B
+
+
+class ChunkFeatures:
+    """What one chunk contributes: word hashes, 5-gram hashes, char counts.
+
+    `words` are 64-bit hashes of the whitespace tokens (empty in byte mode);
+    `shingles` are 64-bit hashes of consecutive 5-grams. The quality band and
+    the MinHash signature share them, so a chunk is tokenised once.
+    """
+
+    __slots__ = ("nbytes", "n_words", "word_bytes", "words", "shingles", "space_frac", "byte_mode")
+
+    def __init__(self, nbytes, n_words, word_bytes, words, shingles, space_frac, byte_mode):
+        self.nbytes = nbytes
+        self.n_words = n_words
+        self.word_bytes = word_bytes
+        self.words = words
+        self.shingles = shingles
+        self.space_frac = space_frac
+        self.byte_mode = byte_mode
+
+
+def _hash_word(word: bytes):
+    np = _np()
+    b = np.frombuffer(word, np.uint8).astype(np.uint64)
+    if b.size == 0:
+        return np.uint64(0)
+    h = (b * _qpow(b.size)[: b.size]).sum(dtype=np.uint64)
+    return h ^ np.uint64((b.size * _MIX) & 0xFFFFFFFFFFFFFFFF)
+
+
+def chunk_features(raw: bytes) -> ChunkFeatures:
+    """Tokenise one chunk and hash its word 5-grams (byte 5-grams if spaceless)."""
+    np = _np()
+    n = len(raw)
+    b = np.frombuffer(raw, np.uint8)
+    if n == 0:
+        empty = np.empty(0, np.uint64)
+        return ChunkFeatures(0, 0, 0, empty, empty, 0.0, True)
+    space = b <= 32
+    nspace = int(space.sum())
+    prev = np.empty(n, dtype=bool)
+    prev[0] = True
+    prev[1:] = space[:-1]
+    nxt = np.empty(n, dtype=bool)
+    nxt[-1] = True
+    nxt[:-1] = space[1:]
+    starts = np.flatnonzero(~space & prev)
+    ends = np.flatnonzero(~space & nxt) + 1
+    lens = ends - starts
+    total = int(lens.sum())
+    byte_mode = nspace / n < 0.03 or len(starts) < 5
+    if byte_mode:
+        words = np.empty(0, np.uint64)
+        shingles = _byte_shingles(b)
+    else:
+        base = np.cumsum(lens) - lens
+        rel = np.arange(total, dtype=np.int64) - np.repeat(base, lens)
+        idx = np.repeat(starts, lens) + rel
+        q = _qpow(int(lens.max()))
+        vals = b[idx].astype(np.uint64) * q[rel]
+        words = np.add.reduceat(vals, base)
+        words = words ^ (lens.astype(np.uint64) * np.uint64(_MIX))
+        shingles = _word_shingles(words)
+    return ChunkFeatures(n, len(starts), total, words, shingles, nspace / n, byte_mode)
+
+
+def _word_shingles(words):
+    np = _np()
+    if words.size < 5:
+        return np.empty(0, np.uint64)
+    r = _rpow()
+    out = words[:-4] * r[4]
+    for k in range(1, 5):
+        out = out + words[k : words.size - 4 + k] * r[4 - k]
+    return out
+
+
+def _byte_shingles(b):
+    np = _np()
+    if b.size < 5:
+        return np.empty(0, np.uint64)
+    q = _qpow(4)
+    v = b.astype(np.uint64)
+    out = v[:-4] * q[4]
+    for k in range(1, 5):
+        out = out + v[k : v.size - 4 + k] * q[4 - k]
+    return out
+
+
+def minhash_signature(feat: ChunkFeatures):
+    """The 128-permutation MinHash signature, stored as uint32."""
+    np = _np()
+    a, b = _perms()
+    best = np.full(NEAR_DUP_PERMS, np.uint64(0xFFFFFFFFFFFFFFFF), dtype=np.uint64)
+    sh = feat.shingles
+    if sh.size:
+        for i in range(0, sh.size, 4096):
+            block = sh[i : i + 4096]
+            cand = block[:, None] * a[None, :] + b[None, :]  # uint64 wraps
+            np.minimum(best, cand.min(axis=0), out=best)
+    return (best & np.uint64(0xFFFFFFFF)).astype(np.uint32)
+
+
+def shingle_set(raw: bytes) -> set[bytes]:
+    """Exact 5-gram set (word-joined, or raw bytes) for the audited Jaccard."""
+    words = raw.split()
+    if len(words) < 5 or sum(len(w) for w in words) / max(1, len(raw)) < 0.5:
+        return {raw[i : i + 5] for i in range(max(0, len(raw) - 4))}
+    return {b" ".join(words[i : i + 5]) for i in range(len(words) - 4)}
+
+
+def jaccard(a: set, b: set) -> float:
+    if not a and not b:
+        return 1.0
+    return len(a & b) / max(1, len(a | b))
+
+
+class NearDupIndex:
+    """Streaming MinHash-LSH index. Keeps signatures and band keys, never text."""
+
+    def __init__(self, *, threshold: float = NEAR_DUP_VERIFY, max_docs: int = NEAR_DUP_MAX_DOCS):
+        np = _np()
+        self.threshold = threshold
+        self.max_docs = max_docs
+        self.sig = np.empty((1024, NEAR_DUP_PERMS), dtype=np.uint32)
+        self.n = 0
+        self.bands: dict[int, object] = {}
+        self.parent: list[int] = []
+        self.is_eval: list[bool] = []
+        self.ranges: list[tuple[str, int, int]] = []
+        self.eval_docs = 0
+
+    def signature_nbytes(self) -> int:
+        """The stated bound: one 128 x 4 B row per document, nothing per byte."""
+        return self.n * NEAR_DUP_PERMS * 4
+
+    def _grow(self) -> None:
+        np = _np()
+        if self.n < len(self.sig):
+            return
+        self.sig = np.concatenate([self.sig, np.empty_like(self.sig)])
+        assert len(self.sig) <= 2 * max(1024, self.n + 1)
+
+    def _find(self, i: int) -> int:
+        while self.parent[i] != i:
+            self.parent[i] = self.parent[self.parent[i]]
+            i = self.parent[i]
+        return i
+
+    def _union(self, a: int, b: int) -> None:
+        ra, rb = self._find(a), self._find(b)
+        if ra != rb:
+            self.parent[max(ra, rb)] = min(ra, rb)  # the first document stays the root
+
+    def _band_keys(self, sig) -> list[int]:
+        np = _np()
+        rows = sig.reshape(NEAR_DUP_BANDS, NEAR_DUP_ROWS)
+        keys = np.bitwise_xor.reduce(rows, axis=1)
+        return [int(k) for k in keys]
+
+    def _candidates(self, keys: list[int]):
+        for key in keys:
+            entry = self.bands.get(key)
+            if entry is None:
+                continue
+            if isinstance(entry, int):
+                yield entry
+            else:
+                yield from entry
+
+    def _remember(self, keys: list[int], doc_id: int) -> None:
+        for key in keys:
+            entry = self.bands.get(key)
+            if entry is None:
+                self.bands[key] = doc_id
+            elif isinstance(entry, int):
+                self.bands[key] = [entry, doc_id]
+            else:
+                entry.append(doc_id)
+
+    def add(self, feat: ChunkFeatures, source: str, offset: int, *, is_eval: bool = False):
+        """Index one chunk; return (reason, representative, est_jaccard) if dropped.
+
+        `reason` is None for a kept document, `near_dup_eval` when the match is
+        an eval chunk (never written), `near_dup` for a train duplicate.
+        """
+        if self.n >= self.max_docs:
+            raise RuntimeError(
+                f"near-dup index holds {self.n} docs (cap {self.max_docs}); "
+                "raise NEAR_DUP_MAX_DOCS or lower --max-source-bytes"
+            )
+        sig = minhash_signature(feat)
+        keys = self._band_keys(sig)
+        self._grow()
+        doc_id = self.n
+        self.sig[doc_id] = sig
+        self.n += 1
+        self.parent.append(doc_id)
+        self.is_eval.append(is_eval)
+        self.ranges.append((source, offset, feat.nbytes))
+        self._remember(keys, doc_id)
+        if is_eval:
+            self.eval_docs += 1
+            return None, None, 0.0
+
+        best_train: tuple[int | None, float] = (None, 0.0)
+        best_eval: tuple[int | None, float] = (None, 0.0)
+        for cid in self._candidates(keys):
+            if cid == doc_id:
+                continue  # its own band entry
+            j = float((self.sig[cid] == sig).mean())
+            if self.is_eval[cid]:
+                if j > best_eval[1]:
+                    best_eval = (cid, j)
+            else:
+                if j >= self.threshold:
+                    self._union(doc_id, cid)
+                if j > best_train[1]:
+                    best_train = (cid, j)
+        if best_eval[1] >= self.threshold:
+            return "near_dup_eval", best_eval[0], best_eval[1]
+        if best_train[1] >= self.threshold:
+            return "near_dup", best_train[0], best_train[1]
+        return None, None, 0.0
+
+    def cluster_count(self) -> int:
+        """Connected components over the train documents (the first doc is the root)."""
+        return len({self._find(i) for i in range(self.n) if not self.is_eval[i]})
+
+
+# --- the cheap quality band (no model) --------------------------------------
+
+EN_STOP = frozenset(
+    "the a an and or of to in is are was were be been being it its this that these those "
+    "for on with as by at from not but you we they he she i his her their our your "
+    "have has had do does did will would can could should may might must about into over".split()
+)
+RU_STOP = frozenset(
+    "и в не на что я он с как это по но они к у из за от так же бы для мы вы "
+    "то все она его ее они мне мой тебя ты был была было быть есть при о об "
+    "если чем или ни уже только еще".split()
+)
+BOILERPLATE = (b"cookie", b"subscribe", b"sign in", b"privacy policy", b"accept all", b"log in")
+_END_PUNCT = frozenset(b".!?\xe2\x80\xa6:;)]}\"'\xbb")
+_STOP_HASHES: dict[str, object] = {}
+
+
+def stopword_hashes(lang: str):
+    np = _np()
+    cached = _STOP_HASHES.get(lang)
+    if cached is None:
+        words = RU_STOP if lang == "ru" else EN_STOP
+        cached = np.array([_hash_word(w.encode()) for w in sorted(words)], dtype=np.uint64)
+        _STOP_HASHES[lang] = cached
+    return cached
+
+
+def _char_stats(raw: bytes) -> tuple[int, int, int, int, int]:
+    """(alpha, upper, space, digit, chars); Cyrillic is 2 bytes/char, the rest is close."""
+    np = _np()
+    b = np.frombuffer(raw, np.uint8)
+    if b.size == 0:
+        return 0, 0, 0, 0, 0
+    counts = np.bincount(b, minlength=256)
+    ascii_alpha = int(counts[65:91].sum() + counts[97:123].sum())
+    ascii_upper = int(counts[65:91].sum())
+    cyr = int(
+        np.count_nonzero((b[:-1] == 0xD0) & (b[1:] >= 0x80) & (b[1:] <= 0xBF))
+        + np.count_nonzero((b[:-1] == 0xD1) & (b[1:] >= 0x80) & (b[1:] <= 0xBF))
+    )
+    cyr_upper = int(np.count_nonzero((b[:-1] == 0xD0) & (b[1:] >= 0x80) & (b[1:] <= 0xAF)))
+    other = max(0, int(counts[128:].sum()) - 2 * cyr)
+    alpha = ascii_alpha + cyr + other // 2
+    upper = ascii_upper + cyr_upper
+    space = int(counts[32] + counts[9] + counts[10] + counts[13])
+    digit = int(counts[48:58].sum())
+    nchars = int(b.size) - cyr
+    return alpha, upper, space, digit, nchars
+
+
+#: filter name -> (min, max) inclusive. A value outside the band drops the doc.
+QUALITY_BANDS = {
+    "words": (50, 100_000),
+    "mean_word_len": (2.0, 20.0),
+    "stopword_frac": (0.05, 1.0),
+    "line_punct_frac": (0.30, 1.0),
+    "list_line_frac": (0.0, 0.90),
+    "repetition": (0.50, 1.0),
+    "symbol_alpha": (0.0, 0.50),
+    "uppercase_frac": (0.0, 0.40),
+    "boilerplate_hits": (0, 2),
+}
+
+
+def quality_metrics(raw: bytes, feat: ChunkFeatures, lang: str) -> dict:
+    np = _np()
+    words = feat.n_words
+    alpha, upper, space, digit, nchars = _char_stats(raw)
+    lines = [ln for ln in raw.split(b"\n") if ln.strip()]
+    punct = 0
+    listy = 0
+    for ln in lines:
+        stripped = ln.rstrip()
+        if stripped and stripped[-1] in _END_PUNCT:
+            punct += 1
+        head = stripped.lstrip()
+        if head[:1] in (b"-", b"*", b"\xe2", b"\xc2", b"#") or (
+            head[:1].isdigit() and (head[1:2] in (b".", b")"))
+        ):
+            listy += 1
+    nlines = max(1, len(lines))
+    distinct = int(np.unique(feat.shingles).size) if feat.shingles.size else 0
+    sw = 0.0
+    if not feat.byte_mode and words:
+        sw = float(np.isin(feat.words, stopword_hashes(lang)).sum()) / words
+    low = raw.lower()
+    boiler = sum(low.count(m) for m in BOILERPLATE)
+    metrics = {
+        "words": words,
+        "mean_word_len": feat.word_bytes / words if words else 0.0,
+        "stopword_frac": sw,
+        "line_punct_frac": punct / nlines,
+        "list_line_frac": listy / nlines,
+        "repetition": distinct / int(feat.shingles.size) if feat.shingles.size else 0.0,
+        # `_char_stats` returns character counts: bytes minus the two-byte
+        # Cyrillic letters is the character count for these two domains.
+        "symbol_alpha": (nchars - alpha - space - digit) / alpha if alpha else 1.0,
+        "uppercase_frac": upper / alpha if alpha else 1.0,
+        "boilerplate_hits": boiler,
+    }
+    # The per-document score: the fraction of the nine bands it satisfies.
+    metrics["score"] = sum(
+        1 for name, (lo, hi) in QUALITY_BANDS.items() if lo <= metrics[name] <= hi
+    ) / len(QUALITY_BANDS)
+    return metrics
+
+
+def quality_band(raw: bytes, feat: ChunkFeatures, lang: str) -> tuple[bool, str, dict, list[str]]:
+    """First failing band wins. Returns (ok, reason, metrics, filters_checked)."""
+    m = quality_metrics(raw, feat, lang)
+    checked: list[str] = []
+    for name, (lo, hi) in QUALITY_BANDS.items():
+        checked.append(name)
+        if not lo <= m[name] <= hi:
+            return False, name, m, checked
+    return True, "", m, checked
+
+
 # --- generic parquet iteration ----------------------------------------------
 
 
@@ -743,46 +1262,66 @@ def parquet_rows(files: list[Path]) -> int:
 # web share comes from the mount's `web/` shards instead.
 
 
-def build_shards(d: Domain) -> None:
+def _shard_order(d: Domain) -> list[Path]:
     files = sorted(SHARD_DIRS[d.name].glob("*.txt"))
     if not files:
         raise RuntimeError(f"{d.name}: no shards in {SHARD_DIRS[d.name]}")
     rng = random.Random(SEED ^ int(sha1(d.name.encode())[:8], 16))
     order = list(files)
     rng.shuffle(order)
-    filt = {
+    return order
+
+
+def _shard_filter(name: str):
+    return {
         "web": filter_web,
         "wiki_en": filter_wiki_en,
         "ruweb": filter_ruweb,
         "reasoning": filter_reasoning,
         "rudialog": filter_rudialog,
-    }[d.name]
+    }[name]
 
-    if d.state["phase"] == "eval":
-        chosen = None
-        for idx in range(len(order) // 2, len(order)):
-            raw = order[idx].read_bytes()
-            ok, _ = filt(raw)
-            if ok:
-                chosen = order[idx]
-                d.write_eval(raw, sha1(raw))
-                d.state["eval_source"] = chosen.name
-                log(f"  {d.name} eval shard {chosen.name} ({len(raw)} B)")
-                break
-        if chosen is None:
-            raise RuntimeError(f"{d.name}: no shard passed the filter for the eval carve")
-        d.state["phase"] = "train"
-        d.state["cursor"] = 0
-        d.save_state()
+
+def _carve_eval_shard(d: Domain, order: list[Path], filt) -> None:
+    """The eval carve: FIRST, before any train byte, and one whole shard."""
+    if d.state["phase"] != "eval":
+        return
+    chosen = None
+    for idx in range(len(order) // 2, len(order)):
+        raw = order[idx].read_bytes()
+        ok, _ = filt(raw)
+        if ok:
+            chosen = order[idx]
+            d.write_eval(raw, sha1(raw))
+            d.state["eval_source"] = chosen.name
+            log(f"  {d.name} eval shard {chosen.name} ({len(raw)} B)")
+            break
+    if chosen is None:
+        raise RuntimeError(f"{d.name}: no shard passed the filter for the eval carve")
+    d.state["phase"] = "train"
+    d.state["cursor"] = 0
+    d.state["doc_i"] = 0
+    d.save_state()
+
+
+def build_shards(d: Domain) -> None:
+    order = _shard_order(d)
+    filt = _shard_filter(d.name)
+    _carve_eval_shard(d, order, filt)
 
     eval_set = set(d.state.get("eval_sha1", []))
     i = d.state["cursor"]
+    src_read = d.state.get("source_bytes", 0)
     while i < len(order) and d.state["train_bytes"] < d.target:
         path = order[i]
         i += 1
         if path.name == d.state.get("eval_source"):
             continue
+        if d.max_source_bytes and src_read + path.stat().st_size > d.max_source_bytes and src_read:
+            break
         raw = path.read_bytes()
+        src_read += len(raw)
+        d.state["source_bytes"] = src_read
         ok, reason = filt(raw)
         if not ok:
             d.drop(reason, len(raw))
@@ -793,6 +1332,236 @@ def build_shards(d: Domain) -> None:
             continue
         d.write_train(raw, h)
         d.state["cursor"] = i
+
+
+def _near_dup_state(name: str) -> dict:
+    return {
+        "method": "minhash_lsh",
+        "shingle": "word5",
+        "perms": NEAR_DUP_PERMS,
+        "bands": NEAR_DUP_BANDS,
+        "rows": NEAR_DUP_ROWS,
+        "threshold": NEAR_DUP_THRESHOLD,
+        "verify_threshold": NEAR_DUP_VERIFY,
+        "chunk_bytes": CHUNK_BYTES,
+        "chunks_in": 0,
+        "bytes_in": 0,
+        "docs_in": 0,
+        "docs_dropped": 0,
+        "bytes_dropped": 0,
+        "exact_duplicates": 0,
+        "eval_chunks": 0,
+        "eval_collisions": 0,
+        "clusters": 0,
+        "peak_signature_bytes": 0,
+        "memory_bound": "docs * 128 * 4 B signatures + 16 band keys + 1 range per doc",
+        "dropped_ranges": f".{name}.near_dup.jsonl",
+        "spot_check": [],
+    }
+
+
+def _state_with_defaults(state: dict, key: str, defaults: dict) -> dict:
+    """A resumed state may predate a counter; fill it in instead of KeyError."""
+    cur = state.setdefault(key, defaults)
+    for k, v in defaults.items():
+        cur.setdefault(k, v)
+    return cur
+
+
+def _quality_state() -> dict:
+    return {
+        "bands": {k: list(v) for k, v in QUALITY_BANDS.items()},
+        "filters": {
+            k: {"checked": 0, "dropped": 0, "bytes": 0} for k in QUALITY_BANDS
+        },
+        "docs_in": 0,
+        "bytes_in": 0,
+        "docs_dropped": 0,
+        "bytes_dropped": 0,
+        "score_sum": 0.0,
+        "score_n": 0,
+        "mean_score": 0.0,
+    }
+
+
+def build_shards_quality(d: Domain) -> None:
+    """`--near-dup` / `--quality-band` on a crawl domain.
+
+    The eval shard is carved first and its chunks are indexed BEFORE any train
+    chunk is read, so a near-duplicate of an eval chunk is refused a write
+    (`near_dup_eval`). Chunks are line-aligned 8 KiB slices of the shard; the
+    kept slices concatenated are a byte subsequence of the source, so the
+    shard's bytes are never rewritten.
+    """
+    order = _shard_order(d)
+    filt = _shard_filter(d.name)
+    lang = "ru" if d.name == "ruweb" else "en"
+    _carve_eval_shard(d, order, filt)
+
+    index = None
+    nd = None
+    eval_source = d.state.get("eval_source")
+    if d.near_dup:
+        if not eval_source:
+            raise RuntimeError(f"{d.name}: --near-dup needs the eval carve; none recorded")
+        index = NearDupIndex()
+        eval_path = SHARD_DIRS[d.name] / eval_source
+        for off, chunk in iter_chunks(eval_path.read_bytes()):
+            index.add(chunk_features(chunk), str(eval_path), off, is_eval=True)
+        nd = _state_with_defaults(d.state, "near_dup", _near_dup_state(d.name))
+        nd["eval_chunks"] = index.eval_docs
+        log(f"  {d.name}: {index.eval_docs} eval chunks indexed for near-dup no-leak")
+    qs = (
+        _state_with_defaults(d.state, "quality_band", _quality_state())
+        if d.quality_band
+        else None
+    )
+
+    exact: dict[str, int] = {}
+    resumed = bool(d.state["cursor"] or d.state.get("doc_i"))
+    log_fh = None
+    if index is not None:
+        log_fh = (d.out_dir / nd["dropped_ranges"]).open(
+            "a" if resumed else "w", encoding="utf-8"
+        )
+
+    def apply(path: Path, chunk: bytes, off: int, *, write: bool) -> None:
+        if write and nd is not None:
+            nd["chunks_in"] += 1
+            nd["bytes_in"] += len(chunk)
+        feat = chunk_features(chunk)
+        if d.quality_band:
+            ok, reason, metrics, checked = quality_band(chunk, feat, lang)
+            if write:
+                qs["docs_in"] += 1
+                qs["bytes_in"] += len(chunk)
+                qs["score_sum"] += metrics["score"]
+                qs["score_n"] += 1
+                for name in checked:
+                    qs["filters"][name]["checked"] += 1
+            if not ok:
+                if write:
+                    qs["filters"][reason]["dropped"] += 1
+                    qs["filters"][reason]["bytes"] += len(chunk)
+                    qs["docs_dropped"] += 1
+                    qs["bytes_dropped"] += len(chunk)
+                    d.drop(f"quality:{reason}", len(chunk))
+                return
+        if index is None:
+            if write:
+                d.write_train(chunk, sha1(chunk))
+            return
+        h = sha1(chunk)
+        if h in exact:
+            if write:
+                d.drop("duplicate", len(chunk))
+                nd["exact_duplicates"] += 1
+            return
+        if write:
+            nd["docs_in"] += 1
+        reason, rep, est = index.add(feat, str(path), off)
+        if reason is None:
+            exact[h] = index.n - 1
+            if write:
+                d.write_train(chunk, h)
+            return
+        if not write:
+            return
+        d.drop(reason, len(chunk))
+        nd["docs_dropped"] += 1
+        nd["bytes_dropped"] += len(chunk)
+        if reason == "near_dup_eval":
+            nd["eval_collisions"] += 1
+        rep_src, rep_off, rep_len = index.ranges[rep]
+        line = {
+            "reason": reason,
+            "source": str(path),
+            "offset": off,
+            "len": len(chunk),
+            "rep_source": rep_src,
+            "rep_offset": rep_off,
+            "rep_len": rep_len,
+            "est_jaccard": round(est, 4),
+        }
+        if len(nd["spot_check"]) < 5:
+            rep_raw = pread(Path(rep_src), rep_off, rep_len)
+            exact_j = jaccard(shingle_set(chunk), shingle_set(rep_raw))
+            line["exact_jaccard"] = round(exact_j, 4)
+            nd["spot_check"].append(dict(line))
+        log_fh.write(json.dumps(line, sort_keys=True) + "\n")
+
+    i = d.state["cursor"]
+    doc_i = d.state.get("doc_i", 0)
+    src_read = d.state.get("source_bytes", 0)
+    if resumed and index is not None:
+        log(f"  {d.name}: replaying the written prefix to rebuild the near-dup index")
+        for k in range(i):
+            p = order[k]
+            if p.name == eval_source:
+                continue
+            raw = p.read_bytes()
+            for off, chunk in iter_chunks(raw):
+                apply(p, chunk, off, write=False)
+        if doc_i:
+            raw = order[i].read_bytes()
+            for off, chunk in list(iter_chunks(raw))[:doc_i]:
+                apply(order[i], chunk, off, write=False)
+
+    while i < len(order) and d.state["train_bytes"] < d.target:
+        path = order[i]
+        if path.name == eval_source:
+            i += 1
+            doc_i = 0
+            d.state["cursor"] = i
+            d.state["doc_i"] = 0
+            continue
+        size = path.stat().st_size
+        if d.max_source_bytes and src_read and src_read + size > d.max_source_bytes:
+            break
+        raw = path.read_bytes()
+        src_read += len(raw)
+        d.state["source_bytes"] = src_read
+        ok, reason = filt(raw)
+        if not ok:
+            d.drop(reason, len(raw))
+            i += 1
+            doc_i = 0
+            d.state["cursor"] = i
+            d.state["doc_i"] = 0
+            continue
+        chunks = list(iter_chunks(raw))
+        j = doc_i
+        while j < len(chunks):
+            off, chunk = chunks[j]
+            j += 1
+            apply(path, chunk, off, write=True)
+            d.state["cursor"] = i
+            d.state["doc_i"] = j
+            if d.state["train_bytes"] >= d.target:
+                break
+        if d.state["train_bytes"] >= d.target:
+            break
+        i += 1
+        doc_i = 0
+        d.state["cursor"] = i
+        d.state["doc_i"] = 0
+    if log_fh is not None:
+        log_fh.close()
+    if nd is not None:
+        nd["clusters"] = index.cluster_count()
+        nd["peak_signature_bytes"] = index.signature_nbytes()
+        nd["docs_kept"] = nd["docs_in"] - nd["docs_dropped"]
+        nd["duplicate_fraction"] = nd["docs_dropped"] / nd["docs_in"] if nd["docs_in"] else 0.0
+        nd["bytes_fraction"] = nd["bytes_dropped"] / nd["bytes_in"] if nd["bytes_in"] else 0.0
+    if qs is not None:
+        qs["mean_score"] = qs["score_sum"] / qs["score_n"] if qs["score_n"] else 0.0
+        qs["score_docs"] = qs["score_n"]
+        qs["pass_rate"] = 1.0 - qs["docs_dropped"] / qs["docs_in"] if qs["docs_in"] else 0.0
+        # nd.bytes_in counts every chunk; use it when near-dup is on so the
+        # denominator cannot lag a resumed state that predates a counter.
+        denom = nd["bytes_in"] if nd is not None else qs["bytes_in"]
+        qs["bytes_kept"] = denom - qs["bytes_dropped"]
+        qs["byte_pass_rate"] = 1.0 - qs["bytes_dropped"] / denom if denom else 0.0
 
 
 def build_math(d: Domain) -> None:
@@ -1131,7 +1900,22 @@ def ensure_downloads(names: tuple[str, ...]) -> None:
         ensure_ruwiki()
 
 
-def run(names: tuple[str, ...], *, out_dir: Path = MIX, force: bool = False) -> dict:
+def run(
+    names: tuple[str, ...],
+    *,
+    out_dir: Path = MIX,
+    force: bool = False,
+    near_dup: bool = False,
+    quality_band: bool = False,
+    max_source_bytes: int = 0,
+) -> dict:
+    unsupported = sorted(set(names) - set(CRAWL_DOMAINS))
+    if (near_dup or quality_band) and unsupported:
+        raise SystemExit(
+            f"--near-dup/--quality-band are implemented for "
+            f"{', '.join(CRAWL_DOMAINS)} only; refusing to silently ignore them "
+            f"for {unsupported}"
+        )
     out_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = out_dir / "manifest.json"
     manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
@@ -1139,6 +1923,14 @@ def run(names: tuple[str, ...], *, out_dir: Path = MIX, force: bool = False) -> 
     manifest["seed"] = SEED
     manifest["filter_version"] = FILTER_VERSION
     manifest.setdefault("domains", {})
+    if near_dup or quality_band or max_source_bytes:
+        manifest["schema_version"] = 2
+        manifest["pipeline"] = {
+            "near_dup": near_dup,
+            "quality_band": quality_band,
+            "max_source_bytes": max_source_bytes,
+            "chunk_bytes": CHUNK_BYTES,
+        }
     ensure_downloads(names)
 
     for name in names:
@@ -1151,16 +1943,30 @@ def run(names: tuple[str, ...], *, out_dir: Path = MIX, force: bool = False) -> 
                 out_dir / f".{name}.state.json",
                 out_dir / f".{name}.train.part",
                 out_dir / f".{name}.eval.part",
+                out_dir / f".{name}.near_dup.jsonl",
             ):
                 p.unlink(missing_ok=True)
-        d = Domain(name, target, out_dir, eval_target=eval_target)
+        d = Domain(
+            name,
+            target,
+            out_dir,
+            eval_target=eval_target,
+            near_dup=near_dup,
+            quality_band=quality_band,
+            max_source_bytes=max_source_bytes,
+        )
         if not d.start():
             log(f"{name}: done ({d.saved_entry()['train_bytes']} B) — skipped")
             manifest["domains"][name] = d.saved_entry()
             continue
         log(f"{name}: building {target} B")
         t0 = time.time()
-        BUILDERS[name](d)
+        builder = (
+            build_shards_quality
+            if (near_dup or quality_band) and name in CRAWL_DOMAINS
+            else BUILDERS[name]
+        )
+        builder(d)
         entry = d.finish()
         entry["filters"] = FILTER_VERSION
         entry["source"] = source_fingerprint(name)
@@ -1188,9 +1994,33 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--only", nargs="+", choices=DOMAIN_ORDER, default=None)
     ap.add_argument("--out-dir", type=Path, default=MIX)
     ap.add_argument("--force", action="store_true", help="rebuild the named domains")
+    ap.add_argument(
+        "--near-dup",
+        action="store_true",
+        help=f"MinHash-LSH near-duplicate removal ({', '.join(CRAWL_DOMAINS)} only; default off)",
+    )
+    ap.add_argument(
+        "--quality-band",
+        action="store_true",
+        help=f"cheap heuristic quality band ({', '.join(CRAWL_DOMAINS)} only; default off)",
+    )
+    ap.add_argument(
+        "--max-source-bytes",
+        type=int,
+        default=0,
+        help="cap source bytes read per domain (0 = until the byte target); "
+        "the cap is recorded in the manifest",
+    )
     args = ap.parse_args(argv)
     names = tuple(args.only) if args.only else DOMAIN_ORDER
-    run(names, out_dir=args.out_dir, force=args.force)
+    run(
+        names,
+        out_dir=args.out_dir,
+        force=args.force,
+        near_dup=args.near_dup,
+        quality_band=args.quality_band,
+        max_source_bytes=args.max_source_bytes,
+    )
     return 0
 
 
