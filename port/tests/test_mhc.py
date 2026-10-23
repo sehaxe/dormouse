@@ -390,12 +390,32 @@ def test_mhc_streams_other_than_two_is_a_loud_refusal():
 
 
 def test_refuses_the_arms_that_share_the_write_or_placement():
-    """The combos that break or confound the contract are refused, not merged."""
-    for key in ("use_attnres", "loom", "use_byteflow"):
+    """The combos that break or confound the contract are refused, not merged.
+
+    AttnRes is NOT in this list: it composes with mHC (the two act on different
+    axes — `loopblock`'s "THE COMPOSITION"), and the legality is gated by
+    `test_mhc_attnres.py`. What stays refused is a second, un-A/B'd gate on the
+    same write (LOOM) and a different placement (ByteFlow's patch lanes).
+    """
+    for key in ("loom", "use_byteflow"):
         with pytest.raises(LoudError) as e:
             parse_preset(f"use_mhc = true\n{key} = true\n")
         assert key in str(e.value), (key, str(e.value))
         assert "use_mhc" in str(e.value)
+
+
+def test_mhc_and_attnres_together_are_legal():
+    """The pair the refusal used to ban is a real configuration now.
+
+    Preset, override and `load_run` seams all accept it, and the flags survive
+    as `True` on the resolved config (a silently dropped flag is the defect the
+    old refusal existed to prevent — the fix deletes the refusal, it does not
+    keep it as dead code).
+    """
+    cfg = parse_preset("use_mhc = true\nuse_attnres = true\n")
+    assert cfg.use_mhc is True and cfg.use_attnres is True and cfg.mhc_streams == 2
+    run = load_run("small", model_overrides={"use_mhc": True, "use_attnres": True})
+    assert run.model.use_mhc is True and run.model.use_attnres is True
 
 
 def test_the_flag_is_a_real_modelconfig_field():
