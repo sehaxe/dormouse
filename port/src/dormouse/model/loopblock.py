@@ -19,8 +19,11 @@ Mirrors `crates/dormouse-core/src/loop_block.rs`. One iteration, in order:
    accumulated inside the loop (deep supervision, burn's own shape), which is
    also why it is never materialized as `[T, b, t, d]`.
 
-There is no halt head and no PonderNet: depth is fixed by default and the
-per-iteration CE is an unweighted mean (ADR-0013). The ADAPTIVE DEPTH arm
+Depth is fixed by default and the per-iteration CE is an unweighted mean
+(ADR-0013). The learned HALT HEAD (`halt.py`, built IFF `halt_weight > 0`)
+reads the same per-iteration readout at INFERENCE and stops when its stop
+probability passes 0.5; its target is the per-iteration CE's own improvement,
+never the label sequence. The ADAPTIVE DEPTH arm
 passes `depth=T` to run `T` iterations instead, and the readout divides by the
 `T` actually run so different depths are scale-comparable.
 
@@ -56,6 +59,20 @@ every number on record keep their meaning. `segment_len=0` does not enter the
 branch at all — the one-shot path is `_window(carry=False)`, the same code with
 the same calls it has always made.
 
+mHC (`use_mhc`, arXiv:2512.24880) is the fourth residual arm, wired at the
+LOOP BOUNDARY by the φ study's placement (2604.21106 §5.2: K=2 lanes *across
+loops*, `docs/reviews/mhc-2026-09-30.md` §3.2): the loop carries `K =
+mhc_streams` FULL-width residual lanes across iterations, `H_res` (doubly
+stochastic, Eq. 9's Sinkhorn-Knopp) mixes them, `H_pre` aggregates them into
+the body's input and `H_post` weights the body's output back onto each lane
+(Eq. 3/7/8 — `mhc.py` transcribes the formulas with the burn line citations).
+The readout is the SUM of the lanes (2409.19606 §2.1; the crate's concat is
+its slicing layout, not ours). It replaces the SAME statement as ReZero /
+AttnRes / LOOM, so `config.validate` refuses the pairs. `streams` are
+replicated from `h0` and `h_ctx` = lanes + `iter_embed[i]` is the crate's
+`x_l` (`mhc-2026-09-30.md` §3.4), so the A/B against ReZero differs in the
+residual operator and nothing else.
+
 RECURRENT DECODE (`recurrent_step`, the inference twin of the segmented path) —
 `decode.recurrent_decode`'s per-byte step: the same body, over ONE position,
 with the same per-iteration KDA state carried across BYTES. It is what makes
@@ -74,6 +91,7 @@ from ..instrument import Counters, loud
 from .engram import Engram, memory_floor_mix
 from .experts import SparseMoE
 from .kda import KDAAttention
+from .mhc import MHCMix
 from .qat_cache import QuantCache
 from .sparse import BlockSparseAttention
 from .tsct import dense_qat_weight, make_projection, mm_mixed
@@ -182,6 +200,13 @@ class LoopBlock(nn.Module):
         self.loom_gate = (
             nn.Parameter(torch.zeros(cfg.max_iter, device=device)) if self.loom else None
         )
+        # mHC (`2512.24880`, `mhc.py`): K full-width residual lanes across the
+        # loop, K=2 only (the A/B'd configuration — App. A.1 ships 4, our φ
+        # evidence and 2409.19606 Tab. 1's knee are 2). Built only when the flag
+        # is on, so `use_mhc=false` keeps today's parameter tree exactly.
+        self.mhc = (
+            MHCMix(d, cfg.mhc_streams, device=device) if getattr(cfg, "use_mhc", False) else None
+        )
 
     def forward(
         self,
@@ -192,6 +217,9 @@ class LoopBlock(nn.Module):
         counters: Counters | None = None,
         depth: int | None = None,
         segment_len: int = 0,
+        halt: nn.Module | None = None,
+        halt_min_iter: int = 1,
+        collect_hidden: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None, Counters]:
         """`h0 [b,t,d]` → (`mean readout [b,t,d]`, SUM of per-iteration mean CEs, counters).
 
@@ -237,7 +265,16 @@ class LoopBlock(nn.Module):
                 h0, input_ids, targets, lm_head, counters, T, segment_len
             )
         out, rec, per_iter, _ = self._window(
-            h0, input_ids, targets, lm_head, counters, T, carry=False
+            h0,
+            input_ids,
+            targets,
+            lm_head,
+            counters,
+            T,
+            carry=False,
+            halt=halt,
+            halt_min_iter=halt_min_iter,
+            collect_hidden=collect_hidden,
         )
         # The per-iteration CEs as a LIST on the module (host floats ONLY on an
         # eval-style read; see `model.DormouseModel.forward(breakdown=True)`) —
@@ -291,6 +328,9 @@ class LoopBlock(nn.Module):
         states: list | None = None,
         drop: int = 0,
         recurrent: bool = False,
+        halt: nn.Module | None = None,
+        halt_min_iter: int = 1,
+        collect_hidden: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor], list]:
         """`T` iterations over ONE window — a segment, or the whole sequence.
 
@@ -308,14 +348,37 @@ class LoopBlock(nn.Module):
         b, t, d = h0.shape
         h = h0
         h0_flat = h0.reshape(b * t, d)
+        # mHC's K lanes (`mhc.py`): replicated from h0 (2409.19606 §2.1), each
+        # the FULL residual width. `None` is the flag-off path, byte-for-byte.
+        streams = (
+            h0.unsqueeze(-2).expand(b, t, self.mhc.n_streams, d)
+            if self.mhc is not None
+            else None
+        )
         out_acc = torch.zeros_like(h0)
         rec = torch.zeros((), dtype=torch.float32, device=h0.device)
         per_iter: list[torch.Tensor] = []
+        #: The per-iteration states the halt head reads (`model.py`'s loss);
+        #: collected only for a training forward with a head. The references
+        #: are graph nodes `out_acc` already keeps, so no extra storage, and
+        #: the list is replaced on every forward.
+        hidden: list[torch.Tensor] = []
+        ran = 0
         sources: list[torch.Tensor] = [h0] if self.use_attnres else []
         new_states: list = []
         for i in range(T):
             counters.count("iter")
-            ctx = h + self.iter_embed[i].view(1, 1, d)
+            ran = i + 1
+            if streams is not None:
+                # x_l = h_ctx: the iteration embedding joins the LANES, and
+                # H_pre (applied by the caller, `mhc.py`) aggregates them into
+                # the body's input — the crate's `h_ctx` (`mhc-2026-09-30.md`
+                # §3.4), with Eq. 3's H_pre moved out of `forward`.
+                streams = streams + self.iter_embed[i].view(1, 1, 1, d)
+                ctx = self.mhc.pre_mix(streams)
+                counters.count("mhc")
+            else:
+                ctx = h + self.iter_embed[i].view(1, 1, d)
             normed = self.norm(ctx)
             ctrl = torch.cat([ctx.reshape(b * t, d), h0_flat], dim=-1)
             # MAGMA fix: fp32 masters with fp32 activations would run the slow
@@ -411,19 +474,40 @@ class LoopBlock(nn.Module):
                 counters.count("attnres_write")
                 sources.append(y)
                 h = depth_attend(sources, self.attnres[i], self.eps)
+            elif self.mhc is not None:
+                # Eq. 3's residual: H_res x_l + H_postᵀ F(H_pre x_l). The
+                # readout is the SUM of the lanes (2409.19606 §2.1); the crate's
+                # concat is its D/n-slicing layout, not this one (`mhc.py`).
+                streams = self.mhc(streams, y)
+                h = streams.sum(dim=-2)
             else:
                 counters.count("rezero_write")
                 h = ctx + y * self.residual_scale
 
             step_out = self.out_proj(h.reshape(b * t, d)).reshape(b, t, d)
             out_acc = out_acc + step_out
+            if collect_hidden:
+                hidden.append(step_out)
             if targets is not None:
                 assert lm_head is not None, "per-iteration CE needs the lm_head"
                 logits = lm_head(step_out.reshape(b * t, d).to(torch.float32))
                 ce = -F.log_softmax(logits, dim=-1).gather(1, targets.reshape(-1, 1))
                 rec = rec + ce.mean()
                 per_iter.append(ce.mean())
-        return out_acc / T, rec, per_iter, new_states
+            if halt is not None and ran >= halt_min_iter:
+                # The HALT DECISION: one scalar from this iteration's readout,
+                # read to the host and compared to 0.5. Inference only — the
+                # trainer never passes `halt`, so a training step adds no host
+                # read (ADR-0018 rule 2). Reading here is what makes the skip
+                # REAL: the iterations below are never launched.
+                if float(torch.sigmoid(halt(step_out))) > 0.5:
+                    counters.count("halt_stop")
+                    break
+        if halt is not None and ran < T:
+            counters.count("halt_skipped", T - ran)
+        self._depth_ran = ran
+        self._per_iter_hidden = hidden
+        return out_acc / ran, rec, per_iter, new_states
 
     def recurrent_step(
         self,

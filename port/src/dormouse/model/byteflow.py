@@ -52,19 +52,55 @@ COUNTED (`bf_channel` / `bf_net` on the step's counter line), and a
 (`config.validate`) rather than silently ignored — an arm that runs and trains
 nothing is exactly the defect the counters exist to make impossible.
 
-# Precision
+# Precision: bf16 matmuls, fp32 masters, three fp32 islands
 
-**fp32 only.** burn refuses `--bf16` for both byteflow modes (`byteflow.rs:85-89`:
-ByteFlowNet has no bf16 handling) and `config.validate` refuses it here for the
-same reason, so the arm runs the paper's recipe in one dtype end to end.
+**All matmuls run in bf16 with fp32 masters** — the loop's policy, not a second
+one: every projection is a [`_MixedLinear`] over an fp32 `nn.Parameter`, and
+[`mm_mixed`] casts masters and activation per forward so the optimizer and the
+checkpoint never see a bf16 tensor. The residual stream (`h`, `z`, `s`) stays
+fp32, so every add is the same expression at both dtypes and the matmul output
+is the only place a dtype is chosen. No `torch.autocast`: an autocast region
+would be a silent cast copy around every projection, which is the failure mode
+burn's `--bf16` refusal named (`byteflow.rs:85-89`) and the one the explicit
+casts exist to rule out. burn's refusal is a property of that crate, not of this
+math: the port has no burn-side reason to keep the net fp32.
+
+Three islands stay fp32, and each is an explicit cast:
+
+1. **The chunker's selection** (`marginal_gains_l2` → `select_positions`).
+   A bf16 top-k can flip a boundary on a tie, and the selection has NO
+   gradient, so a flip is a discrete change with no learning signal to correct
+   it. The gains and the top-k compute in fp32. Measured on the real corpus
+   (2026-10-21, the first 128 KiB of `real/corpus.bin`): top-1 vs top-2 gains
+   are equal within bf16 epsilon on **0.00 %** of rows, but the k-th vs
+   (k+1)-th — the pair that actually decides the boundary — tie on **100 %**
+   of them. With the island the bf16 net selects the same K positions as the
+   fp32 net on **96.88 %** of 256 rows (smoke geometry) and **100 %** of 64
+   rows (medium); `h` merely stored in bf16 with the widening intact gives
+   **90.62 %**, and scoring the gains in bf16 — what the widening prevents —
+   agrees on **0.00 %** of the 256 rows, i.e. every row a different selection.
+   It is a no-op cast on the already-fp32 `h` today, and it costs one `to`.
+2. **`coding_rate_exact` / the logdet Cholesky.** bf16 Cholesky is unstable, and
+   `marginal_gains_exact` is the only caller. The default path is the L2 fast
+   path, so this only matters with `byteflow_logdet = true`; `config.validate`
+   refuses that pair loudly instead (`bf16 + byteflow_logdet`) rather than
+   pricing a host factorization in bf16.
+3. **Norm and Canon reductions.** The pre-norm LayerNorms and the Canon gate
+   sums read the fp32 stream and stay there — the model's existing pattern
+   (the burned rule "final norm in fp32", `model.rs`), with `CanonLayer` and
+   `FlowBlock` asserting the fp32 stream rather than promoting silently.
+
+Everything else — encoder blocks, decoder blocks, `proj`, `in_proj`/`out_proj`,
+`upsample_w`, the byte head — runs its GEMM in bf16. Parity at `bf16 = false`
+is `torch.equal` against the pre-bf16 expressions
+(`tests/test_byteflow_bf16.py`), not a tolerance.
 
 # What is NOT ported
 
 The paper's unimplemented items stay unimplemented and unclaimed: there is no
 "Multi-level" head split, no θ from Table 5 (the crate's own `TODO(бумага)`
 notes at `net.rs:66-68`, `:265-271`, `:280` carry what the paper does not
-state — RoPE base 500 000 is the hierarchical-family's, not BFlowNet's) and no
-bf16 path.
+state — RoPE base 500 000 is the hierarchical-family's, not BFlowNet's).
 """
 
 from __future__ import annotations
@@ -80,6 +116,7 @@ from torch import nn
 
 from ..config import ModelConfig
 from ..instrument import Counters, loud
+from .tsct import mm_mixed
 
 __all__ = [
     "VOCAB",
@@ -145,13 +182,20 @@ class ByteFlowConfig:
     rate_mode: RateMode = RateMode.L2
     max_bytes: int = 8192
     rope_base: float = 500_000.0
+    #: PORT-ONLY: the COMPUTE dtype of every matmul (`byteflow.py`'s precision
+    #: rule). The crate has no bf16 path, so this field has no counterpart in
+    #: `ByteFlowConfig::default()`; `byteflow_config` sets it from
+    #: `ModelConfig.bf16`, and the fp32 default keeps every direct construction
+    #: (the oracle tests) on the pre-bf16 path.
+    dtype: torch.dtype = torch.float32
 
 
 def byteflow_config(cfg: ModelConfig) -> ByteFlowConfig:
     """The dormouse config's byteflow half → the crate's config (`bf.rs:65-82`).
 
     `rope_base` is not a config field on either side: the crate default stands
-    (`bf.rs:80`'s `..ByteFlowConfig::default()`).
+    (`bf.rs:80`'s `..ByteFlowConfig::default()`). `dtype` is the port's own
+    precision knob (`ModelConfig.bf16`); it moves the compute, never a master.
     """
     return ByteFlowConfig(
         d_local=cfg.byteflow_d_local,
@@ -168,6 +212,7 @@ def byteflow_config(cfg: ModelConfig) -> ByteFlowConfig:
         eps2=cfg.byteflow_eps2,
         rate_mode=RateMode.LOGDET if cfg.byteflow_logdet else RateMode.L2,
         max_bytes=cfg.byteflow_max_bytes,
+        dtype=torch.bfloat16 if cfg.bf16 else torch.float32,
     )
 
 
@@ -176,12 +221,49 @@ def byteflow_config(cfg: ModelConfig) -> ByteFlowConfig:
 # ---------------------------------------------------------------------------
 
 
+class _MixedLinear(nn.Module):
+    """Bias-free `nn.Linear` whose GEMM runs in the net's COMPUTE dtype.
+
+    The `weight` is an fp32 MASTER (the same `torch.empty` + Kaiming-uniform draw
+    `nn.Linear` makes, so the dtype knob does not move a single initial value or
+    an RNG draw), and `mm_mixed` casts it per forward. The output is the compute
+    dtype: a caller that feeds an fp32 residual widens it at the boundary
+    (`fp32_out`), a caller that feeds another bf16 matmul does not.
+
+    `bias` is deliberately absent: the one biased projection is the byte head,
+    which keeps `nn.Linear` so its fp32 op is bit-identical (`addmm` and
+    `matmul + bias` are not — 1.5e-5 at `[512, 1024] → 256`).
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        device: torch.device | str = "cpu",
+        *,
+        dtype: torch.dtype = torch.float32,
+        fp32_out: bool = False,
+    ) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(out_features, in_features, device=device))
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        self.compute_dtype = dtype
+        self.fp32_out = fp32_out
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = mm_mixed(x, self.weight, self.compute_dtype)
+        return y.to(torch.float32) if self.fp32_out else y
+
+
 class CanonLayer(nn.Module):
     """Causal depthwise conv k=4 with learned per-channel gates — `net.rs:20-62`.
 
     `Canon(h_t) = Σ_{k<4} w_k ⊙ h_{t−k}` (paper eq. 10). Identity init
     (w0 = 1, rest 0): the layer starts as a no-op so the pre-norm block trains
     stably from step one (`net.rs:31-34`).
+
+    FP32 ISLAND: the gate sum reads the fp32 residual stream and stays there
+    (`byteflow.py`'s precision rule, reason 3) — asserted, not promoted.
     """
 
     def __init__(self, d: int, device: torch.device | str = "cpu") -> None:
@@ -191,6 +273,7 @@ class CanonLayer(nn.Module):
         self.gates = nn.Parameter(gates)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        assert x.dtype == torch.float32, "Canon is an fp32 island (bf16 streams are a bug)"
         b, t, d = x.shape
         # Left-pad by 3 so the taps read h_{t−3}..h_t without state shifting
         # (`net.rs:44-46`); tap k is the window starting at 3−k (`net.rs:50-53`).
@@ -203,7 +286,13 @@ class CanonLayer(nn.Module):
 
 
 class RopeTable(nn.Module):
-    """Half-split rotary table, applied per head to q/k (`net.rs:69-124`)."""
+    """Half-split rotary table, applied per head to q/k (`net.rs:69-124`).
+
+    The table is DERIVED data (not state, `persistent=False`) built in fp32 and
+    stored in the compute dtype: a bf16 `q` times an fp32 cosine would promote
+    the pair to fp32 — a cast copy of `[b, t, 3·d]` on every forward, the exact
+    thing the precision rule bans. At `dtype = fp32` this is today's table.
+    """
 
     def __init__(
         self,
@@ -212,6 +301,7 @@ class RopeTable(nn.Module):
         max_seq_len: int,
         base: float,
         device: torch.device | str = "cpu",
+        dtype: torch.dtype = torch.float32,
     ) -> None:
         super().__init__()
         hd = d_model // n_heads
@@ -223,8 +313,8 @@ class RopeTable(nn.Module):
                 angles[p, i] = torch.tensor(p * inv, dtype=torch.float32).item()
         self.n_heads = n_heads
         # Non-parameters, derived from the config: they are not state.
-        self.register_buffer("cos", angles.cos(), persistent=False)
-        self.register_buffer("sin", angles.sin(), persistent=False)
+        self.register_buffer("cos", angles.cos().to(dtype), persistent=False)
+        self.register_buffer("sin", angles.sin().to(dtype), persistent=False)
 
     def apply(self, x: torch.Tensor) -> torch.Tensor:
         b, t, d = x.shape
@@ -253,7 +343,12 @@ def causal_mask(t: int, window: int | None, device: torch.device | str) -> torch
 
 
 class FlowAttention(nn.Module):
-    """Causal attention, optional sliding window, RoPE over a fused QKV (`net.rs:143-207`)."""
+    """Causal attention, optional sliding window, RoPE over a fused QKV (`net.rs:143-207`).
+
+    The two projections run at the compute dtype (`qkv`, `out`), so RoPE and
+    SDPA are bf16 too; the fp32 return is the arm boundary the residual add
+    needs.
+    """
 
     def __init__(
         self,
@@ -263,37 +358,58 @@ class FlowAttention(nn.Module):
         max_seq_len: int,
         rope_base: float,
         device: torch.device | str = "cpu",
+        dtype: torch.dtype = torch.float32,
     ) -> None:
         super().__init__()
-        self.qkv = nn.Linear(d_model, 3 * d_model, bias=False, device=device)
-        self.out = nn.Linear(d_model, d_model, bias=False, device=device)
-        self.rope = RopeTable(d_model, n_heads, max_seq_len, rope_base, device)
+        self.qkv = _MixedLinear(d_model, 3 * d_model, device, dtype=dtype)
+        self.out = _MixedLinear(d_model, d_model, device, dtype=dtype, fp32_out=True)
+        self.rope = RopeTable(d_model, n_heads, max_seq_len, rope_base, device, dtype)
         self.n_heads = n_heads
         self.window = window
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        assert x.dtype == torch.float32, "the norm/residual stream feeding attention is fp32"
         b, t, d = x.shape
         hd = d // self.n_heads
         qkv = self.qkv(x)
         q = self.rope.apply(qkv[..., :d]).reshape(b, t, self.n_heads, hd).transpose(1, 2)
         k = self.rope.apply(qkv[..., d : 2 * d]).reshape(b, t, self.n_heads, hd).transpose(1, 2)
         v = qkv[..., 2 * d :].reshape(b, t, self.n_heads, hd).transpose(1, 2)
-        scores = (q @ k.transpose(-1, -2)) * hd**-0.5
-        scores = scores.masked_fill(causal_mask(t, self.window, x.device), -1e9)
-        mixed = (scores.softmax(-1) @ v).transpose(1, 2).reshape(b, t, d)
+        # SDPA, same math as the naive path this replaces (scale is SDPA's own
+        # `1/sqrt(hd)`, causality is the same strictly-lower triangle) but fused:
+        # no `[b, heads, t, t]` scores tensor and no `masked_fill` copy. At the
+        # channel's shape (t=512, 8 heads, b=4) that materialization was 33 MB
+        # per layer per direction; the window is 512 = t in every shipped
+        # preset, so the fast path is the one that runs.
+        if self.window is None or self.window >= t:
+            mixed = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        else:
+            # `causal_mask` returns True = masked OUT; SDPA's bool mask is the
+            # opposite convention (True = may attend).
+            mixed = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=~causal_mask(t, self.window, x.device)
+            )
+        mixed = mixed.transpose(1, 2).reshape(b, t, d)
         return self.out(mixed)
 
 
 class SwiGLU(nn.Module):
     """`x → Linear(d, 2h) → SiLU(left)·right → Linear(h, d)` (`burn-swiglu/src/lib.rs:17-31`)."""
 
-    def __init__(self, d_model: int, hidden: int, device: torch.device | str = "cpu") -> None:
+    def __init__(
+        self,
+        d_model: int,
+        hidden: int,
+        device: torch.device | str = "cpu",
+        dtype: torch.dtype = torch.float32,
+    ) -> None:
         super().__init__()
         self.hidden = hidden
-        self.gate_up = nn.Linear(d_model, 2 * hidden, bias=False, device=device)
-        self.down = nn.Linear(hidden, d_model, bias=False, device=device)
+        self.gate_up = _MixedLinear(d_model, 2 * hidden, device, dtype=dtype)
+        self.down = _MixedLinear(hidden, d_model, device, dtype=dtype, fp32_out=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        assert x.dtype == torch.float32, "the norm feeding the FFN is fp32"
         gu = self.gate_up(x)
         gate, up = gu[..., : self.hidden], gu[..., self.hidden :]
         return self.down(F.silu(gate) * up)
@@ -301,7 +417,12 @@ class SwiGLU(nn.Module):
 
 class FlowBlock(nn.Module):
     """One pre-norm block (`net.rs:209-248`): `ĥ = Canon(h + Attn(LN h))`,
-    `h' = Canon(ĥ + SwiGLU(LN ĥ))`."""
+    `h' = Canon(ĥ + SwiGLU(LN ĥ))`.
+
+    The block's state is fp32 from end to end; only the two projections inside
+    each sublayer run at the compute dtype, and each returns fp32 so the adds
+    are dtype-free.
+    """
 
     def __init__(
         self,
@@ -312,16 +433,18 @@ class FlowBlock(nn.Module):
         max_seq_len: int,
         rope_base: float,
         device: torch.device | str = "cpu",
+        dtype: torch.dtype = torch.float32,
     ) -> None:
         super().__init__()
         self.norm1 = nn.LayerNorm(d_model, device=device)
-        self.attn = FlowAttention(d_model, n_heads, window, max_seq_len, rope_base, device)
+        self.attn = FlowAttention(d_model, n_heads, window, max_seq_len, rope_base, device, dtype)
         self.canon1 = CanonLayer(d_model, device)
         self.norm2 = nn.LayerNorm(d_model, device=device)
-        self.ffn = SwiGLU(d_model, d_ff, device)
+        self.ffn = SwiGLU(d_model, d_ff, device, dtype)
         self.canon2 = CanonLayer(d_model, device)
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
+        assert h.dtype == torch.float32, "the block's residual stream is fp32"
         h_hat = self.canon1(h + self.attn(self.norm1(h)))
         return self.canon2(h_hat + self.ffn(self.norm2(h_hat)))
 
@@ -398,7 +521,13 @@ def coding_rate_exact(h: torch.Tensor, eps2: float) -> torch.Tensor:
 
 
 def marginal_gains_l2(h: torch.Tensor) -> torch.Tensor:
-    """Appendix B's `ΔR_t = √S_t − √S_{t−1}`, `S_t = Σ_{i≤t} ‖h_i‖²` (`chunk.rs:119-131`)."""
+    """Appendix B's `ΔR_t = √S_t − √S_{t−1}`, `S_t = Σ_{i≤t} ‖h_i‖²` (`chunk.rs:119-131`).
+
+    FP32 ISLAND (start): the gains feed the top-k and nothing else, and a bf16
+    `cumsum` can move a boundary on a tie with no gradient to correct it — so a
+    bf16 `h` is widened here rather than scored in place.
+    """
+    h = h.to(torch.float32)
     b, t, _ = h.shape
     cum_rate = h.pow(2).sum(-1).cumsum(1).sqrt()
     zero = cum_rate[:, :1] * 0.0
@@ -409,7 +538,10 @@ def select_positions(gains: torch.Tensor, k: int) -> torch.Tensor:
     """Top-K boundaries: `{position 0 (BOS)} ∪ top-(K−1)` of `1..T`, ascending.
 
     `chunk.rs:137-156`; the index dtype matches burn's `[b, k]` int tensor.
+    FP32 ISLAND (end): `topk` on two gains that are equal within bf16 epsilon
+    picks one of them by a rule the model cannot learn from.
     """
+    gains = gains.to(torch.float32)
     b, t = gains.shape
     if k < 1:
         loud(f"select_positions k={k}: k must be >= 1 (position 0 is the BOS boundary)")
@@ -448,6 +580,16 @@ class ByteFlowNet(nn.Module):
 
     def __init__(self, cfg: ByteFlowConfig, *, device: torch.device | str = "cpu") -> None:
         super().__init__()
+        if cfg.dtype != torch.float32 and cfg.rate_mode is RateMode.LOGDET:
+            # The config layer refuses this pair, but the model constructors do
+            # not call `validate`: the same refusal is held here, at the seam
+            # (ADR-0019 — a hand-built net must not enter a bf16 Cholesky).
+            loud(
+                "bf16 + byteflow_logdet: `marginal_gains_exact` factorizes "
+                "`I + c·HᵀH` with a Cholesky, and a bf16 Cholesky is unstable. "
+                "Escape: `byteflow_logdet = false` (the L2 fast path), or an "
+                "fp32 compute dtype."
+            )
         if cfg.d_global % cfg.n_heads_global or cfg.d_local % cfg.n_heads_local:
             loud(
                 f"byteflow: d_local={cfg.d_local}/heads_local={cfg.n_heads_local} and "
@@ -455,9 +597,20 @@ class ByteFlowNet(nn.Module):
                 f"evenly (net.rs:349-353). Escape: fix the byteflow_* widths in the preset."
             )
         self.cfg = cfg
+        #: The COMPUTE dtype of every matmul (`cfg.dtype`). Masters are fp32.
+        self.dtype = cfg.dtype
 
         def block(d_model: int, n_heads: int, window: int | None, d_ff: int, max_seq: int):
-            return FlowBlock(d_model, n_heads, window, d_ff, max_seq, cfg.rope_base, device=device)
+            return FlowBlock(
+                d_model,
+                n_heads,
+                window,
+                d_ff,
+                max_seq,
+                cfg.rope_base,
+                device=device,
+                dtype=cfg.dtype,
+            )
 
         self.embedding = nn.Embedding(VOCAB, cfg.d_local, device=device)
         self.encoder = nn.ModuleList(
@@ -466,7 +619,7 @@ class ByteFlowNet(nn.Module):
                 for _ in range(cfg.e_layers)
             ]
         )
-        self.proj = nn.Linear(cfg.d_local, cfg.d_global, bias=False, device=device)
+        self.proj = _MixedLinear(cfg.d_local, cfg.d_global, device, dtype=cfg.dtype, fp32_out=True)
         # `net.global` in the crate; `global` is a keyword in Python.
         self.global_blocks = nn.ModuleList(
             [
@@ -528,7 +681,14 @@ class ByteFlowNet(nn.Module):
         s = h + self.upsample(g, sel, t, b, effective_bins(self.bins, t))
         for blk in self.decoder:
             s = blk(s)
-        return self.out(s)
+        if self.dtype == torch.float32:
+            # The pre-bf16 head, verbatim: `F.linear`'s bias rides the same
+            # `addmm` as today, which `matmul + bias` is not (`_MixedLinear`).
+            return self.out(s)
+        logits = mm_mixed(s, self.out.weight, self.dtype) + self.out.bias.to(self.dtype)
+        # fp32 logits for the CE, like the loop's head (`model.py`): the GEMM is
+        # bf16, the arm boundary is not.
+        return logits.to(torch.float32)
 
     def upsample(
         self, g: torch.Tensor, sel: torch.Tensor, t: int, b: int, bins: int
@@ -537,7 +697,9 @@ class ByteFlowNet(nn.Module):
 
         `chunk(t)` counts selected boundaries ≤ t (position 0 always is one);
         `bin(t) = ⌊t·B/T⌋` groups contiguous positions, so the per-position
-        weight gather is B batched GEMMs.
+        weight gather is B batched GEMMs. The GEMM runs at the compute dtype
+        (`upsample_w` is an fp32 master like every other weight); the result is
+        widened for the fp32 residual.
         """
         k, dg = g.shape[1], g.shape[2]
         dl = self.upsample_w.shape[2]
@@ -551,8 +713,13 @@ class ByteFlowNet(nn.Module):
         g_expanded = g.gather(1, chunk_idx.reshape(b, t, 1).expand(-1, -1, dg))
         # [b, bins, per, dg] @ [bins, dg, dl] → [b, t, dl]. Fallback lengths use
         # a PREFIX of the shared bin weights (`net.rs:514-525`).
+        per_pos = g_expanded.reshape(b, bins, per, dg)
         w = self.upsample_w[:bins].reshape(1, bins, dg, dl)
-        return (g_expanded.reshape(b, bins, per, dg) @ w).reshape(b, t, dl)
+        if self.dtype != torch.float32:
+            per_pos = per_pos.to(self.dtype)
+            w = w.to(self.dtype)
+        out = (per_pos @ w).reshape(b, t, dl)
+        return out.to(torch.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -675,8 +842,14 @@ class BfChannel(nn.Module):
         super().__init__()
         bfc = byteflow_config(cfg)
         self.net = ByteFlowNet(dataclasses.replace(bfc, g_layers=0), device=device)
-        self.in_proj = nn.Linear(bfc.d_global, cfg.d_model, bias=False, device=device)
-        self.out_proj = nn.Linear(cfg.d_model, bfc.d_global, bias=False, device=device)
+        # The two pairing Linears are on the SAME compute-dtype rule as the net:
+        # bf16 GEMM, fp32 out (the loop's state and the residual are fp32).
+        self.in_proj = _MixedLinear(
+            bfc.d_global, cfg.d_model, device, dtype=bfc.dtype, fp32_out=True
+        )
+        self.out_proj = _MixedLinear(
+            cfg.d_model, bfc.d_global, device, dtype=bfc.dtype, fp32_out=True
+        )
         self.k = bfc.k_tokens
 
 

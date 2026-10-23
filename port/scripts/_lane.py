@@ -39,6 +39,19 @@ EVAL = "/home/sehaxe/dormouse/data_local/eval_mix/eval_mix.bin"
 CARD_CEILING_GIB = 2.0
 
 
+def _compute_app_gib(line: str) -> float:
+    """MiB held by one `--query-compute-apps` row, 0.0 when unparsable.
+
+    The row is `pid, name, used_memory`; a process name may contain a comma
+    (`/usr/bin/python3, ...` does not, but be strict) so parse from the right.
+    """
+    tail = line.rsplit(",", 1)[-1].strip()
+    try:
+        return float(tail) / 1024.0
+    except ValueError:
+        return 0.0
+
+
 def preflight(device: str, ceiling_gib: float = CARD_CEILING_GIB) -> str | None:
     """`None` when the card is ours, else the reason to skip.
 
@@ -54,12 +67,22 @@ def preflight(device: str, ceiling_gib: float = CARD_CEILING_GIB) -> str | None:
     if device == "cpu":
         print("[preflight] device=cpu: the card checks do not apply", flush=True)
         return None
-    # The bracket keeps `pgrep` from matching this script's own command line.
-    busy = subprocess.run(
-        ["pgrep", "-af", "dormouse trai[n]"], capture_output=True, text=True
+    # No `pgrep`: it matches any shell whose COMMAND LINE contains the pattern,
+    # and a driver launched from a heredoc carries that text (measured twice,
+    # 2026-10-22). The only authoritative answer is the driver's own list of
+    # compute processes: a pid holding VRAM is a training job, a `bash -c` is not.
+    apps = subprocess.run(
+        [
+            "nvidia-smi",
+            "--query-compute-apps=pid,process_name,used_memory",
+            "--format=csv,noheader,nounits",
+        ],
+        capture_output=True,
+        text=True,
     ).stdout.strip()
+    busy = [line for line in apps.splitlines() if line.strip() and _compute_app_gib(line) >= 0.5]
     if busy:
-        return f"a dormouse process is alive:\n{busy}"
+        return "a compute process holds the card:\n" + "\n".join(busy)
     smi = subprocess.run(
         ["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits"],
         capture_output=True,

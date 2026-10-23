@@ -61,7 +61,6 @@ eval line's `fin` scores, so SFT trains exactly the readout generation reads.
 
 from __future__ import annotations
 
-import dataclasses
 import math
 import random
 import time
@@ -70,14 +69,21 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-from ..config import RunConfig, TrainConfig
+from ..config import RunConfig
 from ..instrument import Counters, LoudError, StepTimer, loud
-from ..model.engram import Engram, enable_host_tables, host_engrams, host_step_all
+from ..model.engram import enable_host_tables, host_engrams, host_step_all
 from ..model.experts import invalidate_banks_all
 from ..model.qat_cache import invalidate_qat_cache_all
 from ..post.tasks import build_tasks
 from .data import ByteStream, warmup_steps
-from .loop import kda_field, load_ckpt, load_model_state, save_ckpt, unpack_state_dict
+from .loop import (
+    init_cfg,
+    kda_field,
+    load_ckpt,
+    load_model_state,
+    save_ckpt,
+    unpack_state_dict,
+)
 from .lr import wsd_lr
 from .optim import MixOptimizer, clip_grads
 
@@ -624,50 +630,6 @@ def sft_loss(logits: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor) ->
 # ---------------------------------------------------------------------------
 
 
-def _init_cfg(cfg: TrainConfig, path: Path, sd: dict, model: torch.nn.Module) -> TrainConfig:
-    """The cfg that describes the INIT FILE: its substrate and its sidecar path.
-
-    `load_model_state` reads the substrate from `cfg.engram_ram` and finds the
-    `.ngram` sibling through `cfg.out_dir`/`cfg.ckpt_name`, so an init load
-    cannot use the SFT run's own cfg — that names the sidecar THIS run will
-    write, not the init file's. The substrate is read from the FILE, not from a
-    flag: a host-table checkpoint's model half carries no `engram.tables`
-    (`Engram.to_host` deletes the parameter), which is the file's own statement
-    of where its memory lives.
-
-    The run's `engram_ram` must AGREE with the file's, and a disagreement is
-    LOUD, because the flag decides three things a mismatch would corrupt: the
-    host switch happens BEFORE the optimizer exists (a switch after it leaves
-    the tables in a parameter group that then steps a deleted tensor), the loop
-    steps the tables only when the flag is on, and `save_ckpt` writes the
-    `.ngram` only when it is on.
-    """
-    tables_in_file = any(k.endswith("engram.tables") for k in sd)
-    has_engram = any(isinstance(m, Engram) for m in model.modules())
-    host = has_engram and not tables_in_file
-    if host and not cfg.engram_ram:
-        loud(
-            f"sft --init-from: {path}'s model half carries no `engram.tables`: it "
-            f"is a host-table run (its rows are the sibling `{path.stem}.ngram`), "
-            f"or it is not this model's checkpoint at all. This run is configured "
-            f"engram_ram=false, so the memory could not be loaded: a host-table "
-            f"load switches the model to host tables after the optimizer exists, "
-            f"and the run would read a memory it never steps and never saves. "
-            f"Escape: --set engram_ram=true (the pretrain's substrate), or an init "
-            f"checkpoint whose model half carries the tables."
-        )
-    if tables_in_file and cfg.engram_ram:
-        loud(
-            f"sft --init-from: {path} carries its Engram in the model half "
-            f"(`engram.tables`) but this run is configured engram_ram=true. "
-            f"Switching to host tables would DROP the checkpoint's memory — the "
-            f"host path starts from the model's own rows and this run's `.ngram` "
-            f"sibling does not exist yet. Escape: --set engram_ram=false, or "
-            f"re-save the init as a host-table run (with its `.ngram` sibling)."
-        )
-    return dataclasses.replace(cfg, engram_ram=host, out_dir=str(path.parent), ckpt_name=path.stem)
-
-
 def sft_train(
     model: torch.nn.Module,
     run: RunConfig,
@@ -775,7 +737,7 @@ def sft_train(
         # architecture by construction, so the substrate is the only legal
         # difference — and `_init_cfg` refuses a substrate mismatch before the
         # load, which is why strict can stay strict.
-        load_model_state(model, _init_cfg(cfg, path, sd, model), sd, strict=True)
+        load_model_state(model, init_cfg(cfg, path, sd, model), sd, strict=True)
         log(f"sft init: weights from {path} (step {foreign.get('step', '?')}), fresh optimizer")
     if resume:
         ck, _stored = load_ckpt(run)

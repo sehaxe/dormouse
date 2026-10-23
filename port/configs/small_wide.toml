@@ -1,0 +1,48 @@
+# small_wide — the cheap test of the TSCT bet: capacity without compute.
+#
+# Geometry = `small`'s body (d 768, heads 12x64, max_iter 4, rank 64, engram
+# 25k) with the EXPERT BANK grown to medium's count and the routing turned on:
+# E 3 -> 256, topk 0 -> 2. Every token still runs two rank-64 experts, so the
+# active compute stays in small's class while the stored bank grows ~85x and the
+# dense-equivalent shape of the bank grows ~8x against `small`'s.
+#
+# Why this preset exists: the project's #1 unmeasured bet is whether a low-rank
+# expert bank converts its shape multiplier into quality. medium (d1024, E256)
+# tests it at 138M stored; this one tests it at ~55M stored with small's body,
+# which is the CHEAPEST possible reading of the same question — and it trains at
+# small's throughput (a 5x faster data rate than medium), so a fixed wall-clock
+# budget buys 5x more tokens.
+#
+# It is an experiment, not a default: `dormouse info small_wide` prints the
+# budget, and the A/B that matters is small_wide vs medium at equal WALL-CLOCK
+# (not equal tokens), on the same mix and shape class.
+d_model = 768
+n_heads = 12
+head_dim = 64
+d_ffn = 2048
+vocab = 256
+max_seq_len = 512
+max_iter = 4
+rank = 64
+norm_eps = 0.001
+bf16 = true
+quant = "none"
+use_kda = true
+use_tsct = true
+use_engram = true
+use_attnres = false
+loom = false
+n_experts = 256
+moe_topk = 2
+moe_capacity = 2.0
+moe_offload = false
+shared_rank = 192
+engram_rows = 25000
+engram_orders = [2, 3, 4]
+engram_dim = 32
+engram_lam_max = 0.5
+use_byteflow = false
+moe_lb_coef = 0.01
+dspark_weight = 0.0
+sigreg_weight = 0.0
+act_group = 0

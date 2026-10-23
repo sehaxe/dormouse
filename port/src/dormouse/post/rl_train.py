@@ -7,7 +7,7 @@ shape is `train/sft.py`'s, copied rather than reinvented: the same NaN firewall
 (a non-finite step touches no weight, is COUNTED `nan_skipped`, and two
 consecutive all-non-finite windows stop the run with a `LoudError`), the same
 log/JSON cadence, the same `save_ckpt`/`load_ckpt` pair, and the same
-`--init-from` path (`sft._init_cfg` + `load_model_state`, which is what makes a
+`--init-from` path (`loop.init_cfg` + `load_model_state`, which is what makes a
 host-table pretrain checkpoint a legal init).
 
 **What is different, and why.** SFT reads a corpus; this lane GENERATES its
@@ -186,7 +186,7 @@ def rl_train(
         # not this run — the loader's own contract. Imported here, not at module
         # scope: `train.sft` imports `post.tasks`, so a top-level import of the
         # SFT module from inside the post package is a cycle.
-        from ..train.sft import _init_cfg
+        from ..train.loop import init_cfg as _init_cfg
 
         load_model_state(model, _init_cfg(cfg, path, sd, model), sd, strict=True)
         log(f"rl init: weights from {path} (step {foreign.get('step', '?')}), fresh optimizer")

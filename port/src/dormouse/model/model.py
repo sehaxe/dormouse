@@ -38,6 +38,7 @@ from .byteflow import (
 )
 from .dspark import DSparkHead, dspark_aux_loss
 from .energy import EnergyHead, energy_contrastive_loss
+from .halt import HaltHead, halt_loss
 from .jepa import JepaHead
 from .loopblock import LoopBlock
 from .mtp import MTPHead
@@ -109,6 +110,14 @@ class DormouseModel(nn.Module):
         head_rank = min(cfg.rank, d, cfg.vocab)
         self.lm_head = make_projection(d, cfg.vocab, cfg, rank=head_rank, device=device)
         self.bf = bf_for_model(cfg, device=device)
+        # The HALT HEAD (`halt.py`): built only when its weight is on, so
+        # `halt_weight = 0` (every preset) adds no parameter and no compute.
+        # `halt_mode` without a head is refused here too, because the model
+        # constructor deliberately does not call `validate` (a hand-built model
+        # must not run a mode it has no head for).
+        self.halt: HaltHead | None = HaltHead(d, device=device) if cfg.halt_weight > 0.0 else None
+        #: The detached halt term the log line reads (`train/loop.py:halt_field`).
+        self.last_halt: torch.Tensor | None = None
         # The JEPA head (`jepa.py`): ONE mechanism — a causal latent predictor
         # and its own SIGReg anti-collapse term. Built only when the weight is
         # on, so `jepa_weight = 0` adds no parameter and no compute (the off
@@ -123,6 +132,21 @@ class DormouseModel(nn.Module):
             if cfg.jepa_weight > 0.0
             else None
         )
+        if cfg.halt_mode and self.halt is None:
+            loud(
+                f"halt_mode=true with halt_weight={cfg.halt_weight}: the "
+                f"checkpoint has no halt head (the head is built IFF the weight "
+                f"is on), so there is nothing to decide the stop. Escape: train "
+                f"with halt_weight>0 and resume into halt_mode, or halt_mode=false."
+            )
+        if cfg.halt_mode and self.halt is not None and cfg.halt_max_iter > cfg.max_iter:
+            loud(
+                f"halt_max_iter={cfg.halt_max_iter} > max_iter={cfg.max_iter}: the "
+                f"inference cap exceeds the depth the loop was built for, so the "
+                f"halted forward would ask for an iteration with no slot. Escape: "
+                f"max_iter >= {cfg.halt_max_iter} (the depth-8 arm), or "
+                f"halt_max_iter <= {cfg.max_iter}."
+            )
         # The DSpark draft head (2607.05147): built only when the weight is on
         # — at 0.0 the parameter set and every preset count match today's.
         self.dspark: DSparkHead | None = (
@@ -312,6 +336,11 @@ class DormouseModel(nn.Module):
             "(dspark/sigreg/mtp/energy) with use_byteflow - set them to 0"
         )
         count_channel(counters)
+        assert self.cfg.halt_weight == 0.0, (
+            "the byteflow channel carries no halt head: its loop runs over K patch "
+            "latents with no per-byte readout, and the halt term needs the byte "
+            "loop's per-iteration CE - set halt_weight to 0"
+        )
         bf = self.bf
         h, z, sel = bf.net.encode_chunks(input_ids, bf.k)
         x = bf.in_proj(z)  # [b, k, d_model]
@@ -334,6 +363,36 @@ class DormouseModel(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """The plain byte-level stack: embedding → loop → RMSNorm → lm_head."""
         h0 = self.embed(input_ids)
+        # The HALT HEAD is an INFERENCE mechanism (`halt.py`): a training step
+        # runs the scheduled depth, because the head's BCE needs every iteration
+        # that step ran. At inference (eval/decode, `model.eval()`) it caps the
+        # loop at `halt_max_iter` and stops at the first iteration whose stop
+        # probability exceeds 0.5. The decision costs ONE host read per forward
+        # — never in a training step (ADR-0018 rule 2); the adaptivity research
+        # doc prices a per-iteration read at <=0.1% of an iteration, and making
+        # the skip REAL (the iterations below are never launched) is what buys
+        # the compute back.
+        halt = (
+            self.halt
+            if (self.halt is not None and self.cfg.halt_mode and not self.training)
+            else None
+        )
+        if halt is not None and depth is not None:
+            # An EXPLICIT depth is a fixed-depth call (the eval curve passes one
+            # per depth): the halt policy would make `depths=1..8` mean "the
+            # policy capped at d", a different quantity wearing the same label.
+            # The policy runs where the depth is the model's own choice.
+            halt = None
+        if halt is not None:
+            depth = self.cfg.halt_max_iter
+        if self.halt is not None and segment_len:
+            loud(
+                f"segment_len={segment_len} with halt_weight={self.cfg.halt_weight}: "
+                f"the segmented forward runs the loop per SEGMENT, so the halt "
+                f"head's states would be concatenations of segment windows and "
+                f"its target a per-segment mean — two unvalidated axes in one run. "
+                f"Escape: segment_len=0, or halt_weight=0."
+            )
         if self.jepa is not None and segment_len:
             loud(
                 f"segment_len={segment_len} with jepa_weight={self.cfg.jepa_weight}: "
@@ -350,6 +409,9 @@ class DormouseModel(nn.Module):
             counters=counters,
             depth=depth,
             segment_len=segment_len,
+            halt=halt,
+            halt_min_iter=self.cfg.halt_min_iter,
+            collect_hidden=self.halt is not None and targets is not None and not pure,
         )
         # fp32 logits — the burn rule that fixes `bf16 logits NaN`: the final
         # norm and the head run in fp32 whatever the body computed in.
@@ -376,7 +438,10 @@ class DormouseModel(nn.Module):
                 # `evaluate(..., breakdown=True)`; NEVER in the training path —
                 # the 0-sync rule). `fin` is the depth-comparable number: the CE
                 # of the mean readout at the depth actually run.
-                per = getattr(self.loop, "_per_iter_ce", None) or []
+                # With the halt policy on, the number of iterations varies per
+                # batch, so a fixed-depth `periter=` column would be a misreport;
+                # `fin` (the readout at the depth actually run) is still exact.
+                per = [] if halt is not None else (getattr(self.loop, "_per_iter_ce", None) or [])
                 self.last_breakdown = {
                     "fin": float(ce_final.detach()),
                     "per_iter": [float(t.detach()) for t in per],
@@ -389,7 +454,29 @@ class DormouseModel(nn.Module):
             # whole point — scale-comparable depths — would be invisible in
             # the curve). One divisor, the count of terms it divides.
             T = self.cfg.max_iter if depth is None else depth
+            if halt is not None:
+                # The depth the halted loop ACTUALLY ran: the loss divides by
+                # the terms it summed, exactly as a scheduled depth does.
+                T = getattr(self.loop, "_depth_ran", T)
             loss = (rec_sum + ce_final) / (T + 1)
+            if not pure and self.halt is not None:
+                # The HALT TERM (`halt.py`): BCE over the iterations this step
+                # actually ran, against a target read from the model's OWN
+                # per-iteration CE (the seam `periter` prints) and never from the
+                # label sequence. `halt_loss` detaches its input, so the head
+                # learns from the states without bending them.
+                hidden = getattr(self.loop, "_per_iter_hidden", None)
+                per = getattr(self.loop, "_per_iter_ce", None)
+                assert hidden is not None and per is not None and len(hidden) == len(per), (
+                    "halt_weight>0 but the loop exposed no per-iteration states/CE: "
+                    "the head would train on nothing (collect_hidden was not set)"
+                )
+                term = halt_loss(self.halt, hidden, per, self.cfg.halt_eps, self.cfg.max_iter)
+                if term is not None:
+                    loss = loss + self.cfg.halt_weight * term
+                    self.last_halt = term.detach()
+                    if breakdown:
+                        self.last_breakdown["halt"] = float(term.detach())
             # `pure=True` reads the PREDICTIVE CE alone (the aux terms are
             # training signals, not part of the model's held-out quality).
             # Without it the A/B compares two DIFFERENT quantities: an aux

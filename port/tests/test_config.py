@@ -244,7 +244,7 @@ def test_use_byteflow_is_a_real_field_with_the_crates_defaults():
         ({"byteflow_bins": 0}, "byteflow_bins"),
         ({"byteflow_d_local": 17}, "does not divide"),
         ({"byteflow_d_global": 17}, "does not divide"),
-        ({"bf16": "true"}, "bf16"),
+        ({"bf16": "true", "byteflow_logdet": "true"}, "bf16 \\+ byteflow_logdet"),
         ({"use_engram": "true"}, "use_engram"),
     ],
 )
@@ -252,6 +252,18 @@ def test_byteflow_coherence_is_loud_at_load(over, match):
     """(d) The byteflow arm's own fields are checked where a preset can be wrong."""
     with pytest.raises(LoudError, match=match):
         parse_preset(_byteflow_preset(**over))
+
+
+def test_byteflow_runs_in_bf16_and_keeps_the_exact_chunker_fp32():
+    """The dtype is a COMPUTE knob on the net (`byteflow.py`'s precision rule).
+
+    `bf16` used to be refused here; the net now runs bf16 matmuls with fp32
+    masters, so only the Cholesky pair is left refused. The preset path proves
+    the loaded MODEL carries the flag, not just `ModelConfig`'s default.
+    """
+    assert parse_preset(_byteflow_preset(bf16="true")).bf16 is True
+    logdet = parse_preset(_byteflow_preset(bf16="false", byteflow_logdet="true"))
+    assert logdet.byteflow_logdet is True
 
 
 def test_a_seq_len_below_the_patch_count_refuses(tmp_path):

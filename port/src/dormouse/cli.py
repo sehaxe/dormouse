@@ -291,6 +291,15 @@ def train_cmd(
     resume: Annotated[
         bool, typer.Option(help="continue `ckpt_name`; a drifted config refuses")
     ] = False,
+    init_from: Annotated[
+        str,
+        typer.Option(
+            "--init-from",
+            help="a .pt whose WEIGHTS seed this run (fresh optimizer/snapshot) — the "
+            "way to continue a run under a config it was not snapshotted with, e.g. "
+            "QAT-finish: bf16 weights, ternary forward",
+        ),
+    ] = "",
     json_log: Annotated[
         Path | None, typer.Option("--json-log", help="telemetry sink for `dormouse plot`")
     ] = None,
@@ -322,7 +331,13 @@ def train_cmd(
             f" lr={run.train.lr} opt={run.train.opt}",
         )
     )
-    report = _train(model, run, resume=resume, device=None if dev.type == "cpu" else dev)
+    report = _train(
+        model,
+        run,
+        resume=resume,
+        init_from=init_from or None,
+        device=None if dev.type == "cpu" else dev,
+    )
     console.print(f"[green]done[/] steps={report['steps']} loss={report['loss']:.4f}")
 
 
