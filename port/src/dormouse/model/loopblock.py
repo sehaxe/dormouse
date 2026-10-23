@@ -129,6 +129,7 @@ from torch.utils.checkpoint import checkpoint
 from ..instrument import Counters, loud
 from .engram import Engram, memory_floor_mix
 from .experts import SparseMoE
+from .fullattn import FullAttention
 from .kda import KDAAttention
 from .mhc import MHCMix
 from .qat_cache import QuantCache
@@ -214,7 +215,31 @@ class LoopBlock(nn.Module):
         # controller carries three columns and no dead ones — a parameter with
         # no gradient is the defect class this project's counters exist for.
         self.controller = nn.Linear(2 * d, 3, bias=False, device=device)
-        self.attn = KDAAttention(cfg, device=device) if cfg.use_kda else None
+        #: Which attention arm `use_kda` turns on (`attn_kind`: `kda` the
+        #: compressed-state arm every number on record ran, `full` exact causal
+        #: attention). `use_kda=false` keeps its own meaning — NO attention,
+        #: the zero branch — so the off switch cannot silently become the full
+        #: arm. The `full` arm is built only through this ONE line, and it is
+        #: reached through the same `_attn` seam (`LoopBlock._attn`).
+        self.attn_kind = cfg.attn_kind
+        if cfg.attn_kind not in ("kda", "full"):
+            loud(
+                f"attn_kind={cfg.attn_kind!r} is not an attention arm. Known: 'kda' "
+                f"(compressed state) and 'full' (exact causal attention). Escape: "
+                f"name one of those."
+            )
+        if not cfg.use_kda and cfg.attn_kind != "kda":
+            loud(
+                f"attn_kind={cfg.attn_kind!r} with use_kda=false: the hard off switch "
+                f"makes the attention output zeros, so this arm would never run. "
+                f"Escape: use_kda=true, or attn_kind='kda'."
+            )
+        if not cfg.use_kda:
+            self.attn = None
+        elif cfg.attn_kind == "full":
+            self.attn = FullAttention(cfg, device=device)
+        else:
+            self.attn = KDAAttention(cfg, device=device)
         # The second attention arm (owner's 1M-context directive, 2026-10-16):
         # MSA rides an ADDITIVE branch beside KDA, off by default; the ADAPTIVE
         # schedule (`adaptive_msa`) gives it a per-ITERATION share whose mean
@@ -658,6 +683,17 @@ class LoopBlock(nn.Module):
         which is the same defect as sharing one hidden state across them.
         """
         assert self.attn is not None
+        assert not (
+            self.attn_kind == "full" and (recurrent or carry)
+        ), (
+            "attn_kind='full' with a state-carrying attention call "
+            f"(recurrent={recurrent}, carry={carry}): exact attention has no O(1) "
+            "boundary state — segment_len would have to carry every preceding "
+            "segment's K/V, and the recurrent decode would have to carry a growing "
+            "cache, which is the O(window) memory the compressed arm exists to "
+            "avoid. Escape: attn_kind='kda', or segment_len=0 and the window "
+            "forward (--no-recurrent decode)."
+        )
         if recurrent:
             assert carry, "the recurrent step carries the state by construction"
             return self.attn.step_state(normed, state, counters=counters)
@@ -739,6 +775,12 @@ class LoopBlock(nn.Module):
           into the run's own object would report `2·S·T` iterations on the log
           line. The recomputation's copy is discarded by checkpoint.
         """
+        assert self.attn_kind != "full", (
+            "segment_len with attn_kind='full': exact attention has no O(1) boundary "
+            "state, so a segment would have to carry every preceding segment's K/V "
+            "(O(window) per iteration slot) — the memory this flag exists to save. "
+            "Escape: segment_len=0, or attn_kind='kda'."
+        )
         assert self.msa is None, (
             "segment_len with use_msa: the block-sparse arm selects its blocks "
             "INSIDE one window, so segmenting it would change the attention "

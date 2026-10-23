@@ -220,6 +220,15 @@ def recurrent_refusal(model) -> str | None:
             "INSIDE one window, and a one-byte step has no window to select in — that "
             "is a model change wearing an inference flag. Escape: use_msa=false."
         )
+    if getattr(getattr(model, "cfg", None), "attn_kind", "kda") == "full":
+        return (
+            "recurrent decode with attn_kind='full': exact attention has no O(1) "
+            "per-byte state — a one-byte step would have to carry the whole window's "
+            "K/V (the O(window) cache the compressed arm exists to avoid), and this "
+            "decoder carries one state per iteration slot across BYTES. Escape: "
+            "attn_kind='kda', or decode with the window re-forward (--no-recurrent), "
+            "which attends inside one forward."
+        )
     if getattr(getattr(model, "cfg", None), "halt_mode", False):
         return (
             "recurrent decode with halt_mode: the per-iteration KDA state is "

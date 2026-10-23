@@ -344,8 +344,18 @@ def _walk_forward(model: DormouseModel) -> None:
     model(x, x)  # the training forward, aux term included
     # The FLA arm's entry is not reachable on CPU (see the seam test above);
     # call it so beta_proj is classified on the same code path the GPU training
-    # forward runs.
+    # forward runs. Both arms own `projections` (full attention has q/k/v).
     model.loop.attn.projections(torch.randn(2, 4, 64))
+
+
+def _arm_attn_sites(model: nn.Module) -> tuple[str, ...]:
+    """The attention sites THIS arm owns: `kda` has g/beta, `full` has o_proj.
+
+    The ONE list (`DENSE_QAT_ATTN_SITES`) names both arms' sites because it is
+    the list `dense_qat_kind` reads; a tree can only own one arm's modules.
+    """
+    walk = _walk(model)
+    return tuple(name for name in ATTN_SITES if name in walk)
 
 
 def _projected_names(model: nn.Module, seen: dict[str, list[float]]) -> set[str]:
@@ -353,17 +363,24 @@ def _projected_names(model: nn.Module, seen: dict[str, list[float]]) -> set[str]
     return {name for name, m in _walk(model).items() if id(m.weight) in ids}
 
 
-def test_coverage_every_dense_weight_is_classified(monkeypatch):
+@pytest.mark.parametrize("attn_kind", ["kda", "full"])
+def test_coverage_every_dense_weight_is_classified(monkeypatch, attn_kind):
     """The default arm: every site is walked, exactly the non-attention ones project."""
     seen = _spy_projectors(monkeypatch)
-    model = _coverage_model()
+    model = _coverage_model(attn_kind=attn_kind)
     _walk_forward(model)
 
     walk = _walk(model)
-    assert sorted(walk) == sorted((*COVERED, *ATTN_SITES)), (
+    sites = _arm_attn_sites(model)
+    assert sorted(walk) == sorted((*COVERED, *sites)), (
         "the covered-module list moved: a dense weight was added or removed"
     )
-    assert not set(COVERED) & set(ATTN_SITES), "a site cannot be both classes"
+    assert set(ATTN_SITES) - set(sites) == (
+        {"loop.attn.g_proj", "loop.attn.beta_proj"}
+        if attn_kind == "full"
+        else {"loop.attn.o_proj"}
+    ), "an arm's attention sites moved: kda owns g/beta, full owns o_proj"
+    assert not set(COVERED) & set(sites), "a site cannot be both classes"
     projected = _projected_names(model, seen)
     assert projected == set(COVERED), (
         f"projected under the default: unexpected {sorted(projected - set(COVERED))}, "
@@ -372,10 +389,11 @@ def test_coverage_every_dense_weight_is_classified(monkeypatch):
     assert len(seen["dense"]) >= len(COVERED), "fewer projection calls than sites"
 
 
-def test_coverage_skip_off_projects_every_site(monkeypatch):
+@pytest.mark.parametrize("attn_kind", ["kda", "full"])
+def test_coverage_skip_off_projects_every_site(monkeypatch, attn_kind):
     """Gate b's wiring side: with the default rule off, today's full set projects."""
     seen = _spy_projectors(monkeypatch)
-    model = _coverage_model(dense_qat_skip_attn=False)
+    model = _coverage_model(dense_qat_skip_attn=False, attn_kind=attn_kind)
     _walk_forward(model)
 
     projected = _projected_names(model, seen)
@@ -400,19 +418,21 @@ def test_skip_attn_defaults_on_and_loads():
     assert off.model.dense_qat_skip_attn is False
 
 
-def test_gate_a_skip_attn_projects_no_attention_weight(monkeypatch):
+@pytest.mark.parametrize("attn_kind", ["kda", "full"])
+def test_gate_a_skip_attn_projects_no_attention_weight(monkeypatch, attn_kind):
     """The projector sees ZERO attention weights and EVERY other dense weight."""
     seen = _spy_projectors(monkeypatch)
-    model = _coverage_model()
+    model = _coverage_model(attn_kind=attn_kind)
     _walk_forward(model)
 
     walk = _walk(model)
+    sites = _arm_attn_sites(model)
     hit = {wid for wid, _ in seen["dense"]}
-    attn_ids = {id(walk[name].weight) for name in ATTN_SITES}
-    assert len(attn_ids) == len(ATTN_SITES), "the walk does not resolve the ten sites"
+    attn_ids = {id(walk[name].weight) for name in sites}
+    assert len(attn_ids) == len(sites), "the walk does not resolve the arm's sites"
     assert not hit & attn_ids, (
         f"attention weights reached the projector: "
-        f"{sorted(n for n in ATTN_SITES if id(walk[n].weight) in hit)}"
+        f"{sorted(n for n in sites if id(walk[n].weight) in hit)}"
     )
     missed = [name for name in COVERED if id(walk[name].weight) not in hit]
     assert not missed, f"non-attention sites the projector never saw: {missed}"

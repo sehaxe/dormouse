@@ -62,6 +62,8 @@ def _host_scalar(value: torch.Tensor) -> float:
 
 def kda_field(counters: Counters) -> str:
     """`kda=<arm>,n=<calls>` — which attention arm produced this window."""
+    if counters.get("attn_full_forward"):
+        return f"kda=full,n={counters['attn_full_forward']}"
     n = counters.get("kda_sdpa", 0) + counters.get("kda_fla", 0)
     if counters.get("kda_fla"):
         arm = "fla"

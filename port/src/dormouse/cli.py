@@ -784,7 +784,7 @@ def bench_cmd(
     if preset:
         _preset_check(preset, run, what="scored")
     dev = _device(device)
-    if dev.type == "cuda" and run.model.use_kda:
+    if dev.type == "cuda" and run.model.use_kda and run.model.attn_kind == "kda":
         # The arm is checked BEFORE the run: `fla_status` is a tiny warmup call,
         # and a bench that discovers an hour later that it measured the SDPA
         # fallback has already spent the hour.
@@ -830,7 +830,12 @@ def bench_cmd(
     # console width, and a clipped counter line is a counter nobody can read
     # (`kda_sdpa` was the field that got cut).
     console.print(f"bench arm: {arm.line()}")
-    if dev.type == "cuda" and run.model.use_kda and not arm.get("kda_fla", 0):
+    if (
+        dev.type == "cuda"
+        and run.model.use_kda
+        and run.model.attn_kind == "kda"
+        and not arm.get("kda_fla", 0)
+    ):
         raise LoudError(
             "bench: on CUDA the KDA arm never ran the FLA kernel (kda_fla=0) although the "
             "pre-run check found FLA live — the model did not route through it, and the "
@@ -838,7 +843,7 @@ def bench_cmd(
             "checkpoint's numbers. Escape: check the config's `use_kda`/dispatch seam, or "
             "run --device cpu and read the number as the COUNTED fallback's."
         )
-    if dev.type == "cpu":
+    if dev.type == "cpu" and run.model.attn_kind == "kda":
         console.print(
             f"[yellow]counted[/] CPU: the attention arm is the SDPA fallback "
             f"({arm.get('kda_sdpa', 0)} calls), not the FLA KDA kernel — the same counted "

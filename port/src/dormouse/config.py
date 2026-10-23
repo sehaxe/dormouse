@@ -307,7 +307,35 @@ class ModelConfig:
     quant: str = "none"
 
     # --- arms -----------------------------------------------------------
+    #: The hard ATTENTION ON/OFF switch (every number on record: true). `false`
+    #: is the degenerate zero branch the loop has always had (`LoopBlock._window`
+    #: writes `torch.zeros`), NOT an attention arm — kept bit-for-bit because
+    #: `tests/test_decode_recurrent.py` and `bench_bf_dtype.py` run it.
     use_kda: bool = True
+    #: WHICH attention arm runs when `use_kda` is on:
+    #:
+    #: * `kda` (the default) — the compressed-state gated-delta arm
+    #:   (`model/kda.py`): O(1) state, the arm every number on record ran. The
+    #:   legacy spelling `use_kda=true` means this arm.
+    #: * `full` — exact causal attention (`model/fullattn.py`,
+    #:   `F.scaled_dot_product_attention(is_causal=True)`): query `p` reads keys
+    #:   `0..p`, no compression. `4·t·d_model = 4.2M` MAC/token at t=1024,
+    #:   d=1024 — the same order as the expert FFN, i.e. affordable at our
+    #:   context length. `q,k,v,o` = `4·d²` parameters against KDA's
+    #:   `4·d² + d·n_heads`: at `medium` the delta is **-16 384** (total
+    #:   141 910 405 → 141 894 021, `dormouse info`).
+    #:
+    #: `use_kda=false` does NOT mean `full`: an off switch that changed the arm
+    #: it switches on would move every zeros-arm run. `full` with `use_kda=false`
+    #: is refused (`validate`). REFUSED with it too, each naming the key and the
+    #: escape: `segment_len>0` (`_validate_segment`: no O(1) boundary state) and
+    #: the recurrent decode/prefill (`decode.recurrent_refusal`, `LoopBlock._attn`:
+    #: a one-byte step has no window to attend over). Allowed: `use_mhc` (residual
+    #: lanes, independent of the attention arm — `tests/test_fullattn.py` runs the
+    #: pair) and `use_byteflow` (the channel's loop runs over K patch latents, and
+    #: causal attention over those latents is well-defined — the same sequence
+    #: KDA already attends over, uncompressed).
+    attn_kind: str = "kda"
     use_tsct: bool = True
     #: The expert bank's SHARED input basis (owner directive 2026-10-21) — the
     #: OLD SPELLING of `share_u_mode = "plane"` below (kept because every
@@ -1310,6 +1338,23 @@ def validate(model: ModelConfig) -> None:
             f"n_heads*head_dim={model.n_heads * model.head_dim} != d_model="
             f"{model.d_model}: the head split must tile the residual width"
         )
+    if model.attn_kind not in ("kda", "full"):
+        loud(
+            f"attn_kind={model.attn_kind!r} is not an attention arm. Known: 'kda' "
+            f"(the compressed-state gated-delta arm every number on record ran) and "
+            f"'full' (exact causal attention, model/fullattn.py). Escape: name one "
+            f"of those, or land the arm and its gate BEFORE the config can lie "
+            f"about it."
+        )
+    if not model.use_kda and model.attn_kind != "kda":
+        loud(
+            f"attn_kind={model.attn_kind!r} with use_kda=false: use_kda=false is the "
+            f"HARD OFF switch — the loop's attention output is exactly zeros "
+            f"(loopblock._window), so the arm named here would never run. The two "
+            f"flags are not aliases: use_kda says WHETHER attention runs, attn_kind "
+            f"says WHICH. Escape: use_kda=true (the default) for attn_kind='full', "
+            f"or attn_kind='kda' if the zeros arm is what you meant."
+        )
     if model.rank < 1 or model.shared_rank < 1:
         loud(f"rank and shared_rank must be >= 1, got {model.rank}/{model.shared_rank}")
     if not 0.0 < model.engram_lam_max <= 1.0:
@@ -1957,6 +2002,14 @@ def _validate_segment(model: ModelConfig, tcfg: TrainConfig) -> None:
         )
     if n == 0:
         return
+    if model.attn_kind == "full":
+        loud(
+            f"segment_len={n} with attn_kind='full': exact attention has no O(1) "
+            f"boundary state, so a segment would have to carry every preceding "
+            f"segment's K/V (O(window) per iteration slot) — the memory this flag "
+            f"exists to save, and the reason the compressed arm is the one it was "
+            f"built on. Escape: segment_len=0, or attn_kind='kda'."
+        )
     if n >= tcfg.seq_len:
         loud(
             f"segment_len={n} >= seq_len={tcfg.seq_len}: the window is one segment, so "
