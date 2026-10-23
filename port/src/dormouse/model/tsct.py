@@ -934,6 +934,65 @@ class DenseLinear(nn.Module):
         return y
 
 
+class DenseLowRank(nn.Module):
+    """A dense `d → rank → d` readout: `2·d·rank` MAC instead of `d²`.
+
+    The dense rung's `out_proj_rank` (`use_tsct = false`, so the readout would
+    otherwise be a full `DenseLinear(d, d)`). Two dense linears, no bias and no
+    nonlinearity — the composed map IS a rank-`rank` matrix, which is exactly
+    the cost this flag names. Each half keeps `DenseLinear`'s compute dtype and
+    `dense_qat` policy, so the readout does not become a second numerics path.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        rank: int,
+        out_features: int,
+        *,
+        dtype: torch.dtype = torch.bfloat16,
+        dense_qat: str = "none",
+        dense_qat_alpha: float = 1.0,
+        device: torch.device | str = "cpu",
+    ) -> None:
+        super().__init__()
+        if rank > min(in_features, out_features):
+            loud(
+                f"out_proj_rank {rank} exceeds min({in_features}, {out_features}): "
+                f"a rank above either dimension is not a factorization. Escape: "
+                f"a lower rank."
+            )
+        self.in_features = in_features
+        self.out_features = out_features
+        self.rank = rank
+        self.compute_dtype = dtype
+        self.down = DenseLinear(
+            in_features,
+            rank,
+            dtype=dtype,
+            dense_qat=dense_qat,
+            dense_qat_alpha=dense_qat_alpha,
+            device=device,
+        )
+        self.up = DenseLinear(
+            rank,
+            out_features,
+            dtype=dtype,
+            dense_qat=dense_qat,
+            dense_qat_alpha=dense_qat_alpha,
+            device=device,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.up(self.down(x))
+
+    def extra_repr(self) -> str:
+        return (
+            f"in={self.in_features}, out={self.out_features}, rank={self.rank}, "
+            f"dtype={self.compute_dtype}"
+        )
+
+
 def make_projection(
     in_features: int,
     out_features: int,

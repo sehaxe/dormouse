@@ -133,7 +133,7 @@ from .kda import KDAAttention
 from .mhc import MHCMix
 from .qat_cache import QuantCache
 from .sparse import BlockSparseAttention
-from .tsct import dense_qat_weight, make_projection, mm_mixed
+from .tsct import DenseLowRank, dense_qat_weight, make_projection, mm_mixed
 
 __all__ = ["AttnResSlot", "LoopBlock", "depth_attend", "memory_floor_mix"]
 
@@ -232,7 +232,23 @@ class LoopBlock(nn.Module):
         self.engram = Engram(cfg, device=device) if cfg.use_engram else None
         # The dense half of the memory branch's mixture — the `(1-g)·v_t` term.
         self.mem_dense = nn.Linear(d, d, device=device)
-        self.out_proj = make_projection(d, d, cfg, rank=cfg.rank, device=device)
+        #: The readout (`out_proj_rank`): TSCT at `cfg.rank` by default, or at
+        #: the flag's rank when on; the dense rung's full `d×d` becomes a dense
+        #: two-stage `d → r → d`. `0` is the projection exactly as before.
+        if cfg.out_proj_rank and not cfg.use_tsct:
+            self.out_proj = DenseLowRank(
+                d,
+                cfg.out_proj_rank,
+                d,
+                dtype=torch.bfloat16 if cfg.bf16 else torch.float32,
+                dense_qat=cfg.dense_qat,
+                dense_qat_alpha=cfg.factor_qat_alpha,
+                device=device,
+            )
+        else:
+            self.out_proj = make_projection(
+                d, d, cfg, rank=cfg.out_proj_rank or cfg.rank, device=device
+            )
         self.iter_embed = nn.Parameter(torch.zeros(cfg.max_iter, d, device=device))
         self.residual_scale = nn.Parameter(torch.ones(1, device=device))
         self.attnres = (

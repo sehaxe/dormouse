@@ -309,6 +309,44 @@ class ModelConfig:
     # --- arms -----------------------------------------------------------
     use_kda: bool = True
     use_tsct: bool = True
+
+    # --- cheap width (2026-10-23): stop `d` from setting the dense bill ----
+    #: MLA-style SHARED LATENT for KDA's four `d×d` projections (`q,k,v,g`).
+    #: `0` (off) keeps four `nn.Linear(d, d)`: `4·d²` MAC/token per iteration,
+    #: every number on record. `r > 0` projects the block input ONCE
+    #: (`latent_down`, `d·r`) and reads the four projections off that latent
+    #: (`latent_up`, `r → out` each), so the four cost `d·r + r·Σ out` =
+    #: `5·d·r` while the width stays `d`. `beta_proj` is untouched (`d·h`).
+    #: The reshapes and the FLA call are unchanged.
+    #:
+    #: NOT refused with `factor_qat != "none"`: the four projections — and this
+    #: latent — are plain `nn.Linear` DENSE sites, and `factor_qat` reaches only
+    #: TSCT factor pairs (`u`/`v`). The switches are disjoint, not ambiguous.
+    #: `dense_qat` DOES reach them, through the same `dense_qat_kind` the module
+    #: already reads (`dense_qat_skip_attn` keeps attention bf16, latent
+    #: included). Refused: `r < 0`; `use_kda = false` (no module to reach).
+    attn_latent_rank: int = 0
+    #: GQA on KDA's `k`/`v` projections. `0` (off) is MHA: both project to
+    #: `n_heads·head_dim = d`. `h_kv > 0` projects them to `h_kv·head_dim` and
+    #: EXPANDS with `repeat_interleave(n_heads // h_kv, dim=2)` immediately
+    #: before the kernel, so `q,k,v,g` enter FLA at `[b,t,n_heads,head_dim]`
+    #: exactly as before and only the PROJECTION cost falls
+    #: (`2·d² → 2·d·h_kv·head_dim`). Composes with `attn_latent_rank`: the k/v
+    #: ups then go `r → h_kv·head_dim`.
+    #: Refused LOUDLY: `h_kv < 0`, `h_kv > n_heads`, `n_heads % h_kv != 0`
+    #: (a ragged group has no valid expansion), `use_kda = false`.
+    n_kv_heads: int = 0
+    #: Low-rank `out_proj` (the loop readout): `d → r → d`, cost `2·d·r`
+    #: instead of `d²`. `0` (off) is the readout exactly as before — TSCT at
+    #: `rank` on the default rung, a dense `DenseLinear(d, d)` when
+    #: `use_tsct = false`. `r > 0` sets THIS projection's rank and nothing
+    #: else: on the TSCT rung it builds `TSCTLinear(d, d, r)` (the same
+    #: `U diag(s) Vᵀ` form, one rank knob on one matrix); on the dense rung it
+    #: builds two dense linears (`down [r,d]`, `up [d,r]`), `2·d·r` params.
+    #: NOTE the TSCT default `rank` is already 64, so at `d = 1024` and
+    #: `r = d/4 = 256` the TSCT readout GROWS; the flag is a win where the
+    #: readout was dense or `r < rank`. Refused: `r < 0`, `r > d_model`.
+    out_proj_rank: int = 0
     #: The expert bank's SHARED input basis (owner directive 2026-10-21) — the
     #: OLD SPELLING of `share_u_mode = "plane"` below (kept because every
     #: `--set` and every snapshot names it this way; the two disagreeing is
@@ -1309,6 +1347,49 @@ def validate(model: ModelConfig) -> None:
         loud(
             f"n_heads*head_dim={model.n_heads * model.head_dim} != d_model="
             f"{model.d_model}: the head split must tile the residual width"
+        )
+    if model.attn_latent_rank < 0:
+        loud(
+            f"attn_latent_rank={model.attn_latent_rank} is negative: a shared "
+            f"latent is a WIDTH in (0, d_model], and 0 is the OFF sentinel. "
+            f"Escape: 0, or a positive rank."
+        )
+    if model.attn_latent_rank and not model.use_kda:
+        loud(
+            f"attn_latent_rank={model.attn_latent_rank} with use_kda=false: the "
+            f"KDA module is not built, so the key would reach no code (the "
+            f"config-lies defect). Escape: use_kda=true, or attn_latent_rank=0."
+        )
+    if model.n_kv_heads < 0:
+        loud(
+            f"n_kv_heads={model.n_kv_heads} is negative: 0 is the OFF sentinel "
+            f"(MHA) and a positive value is a head count. Escape: 0, or >= 1."
+        )
+    if model.n_kv_heads and not model.use_kda:
+        loud(
+            f"n_kv_heads={model.n_kv_heads} with use_kda=false: the KDA module "
+            f"is not built, so the key would reach no code. Escape: use_kda=true, "
+            f"or n_kv_heads=0."
+        )
+    if model.n_kv_heads > model.n_heads:
+        loud(
+            f"n_kv_heads={model.n_kv_heads} > n_heads={model.n_heads}: GQA shares "
+            f"key/value heads with the query heads, so there cannot be more KV "
+            f"heads than queries. Escape: n_kv_heads <= n_heads."
+        )
+    if model.n_kv_heads and model.n_heads % model.n_kv_heads:
+        loud(
+            f"n_kv_heads={model.n_kv_heads} does not divide n_heads={model.n_heads}: "
+            f"GQA expands each KV head into a whole group of query heads "
+            f"(`repeat_interleave(n_heads // n_kv_heads)`), and a ragged group has "
+            f"no valid expansion. Escape: a divisor of n_heads, or 0 (MHA)."
+        )
+    if model.out_proj_rank < 0 or model.out_proj_rank > model.d_model:
+        loud(
+            f"out_proj_rank={model.out_proj_rank} outside 0..=d_model="
+            f"{model.d_model}: a rank above either dimension of the square "
+            f"readout is not a factorization, and 0 is the OFF sentinel. "
+            f"Escape: 0..=d_model."
         )
     if model.rank < 1 or model.shared_rank < 1:
         loud(f"rank and shared_rank must be >= 1, got {model.rank}/{model.shared_rank}")
