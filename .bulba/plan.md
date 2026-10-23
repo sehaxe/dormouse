@@ -352,6 +352,62 @@ testable and A/B-able (ADR-0017).
       `opt_graph` (refused with accum, applied to every arm), JSONL to
       `~/logs/ab_train4/`, pre-registered TIE on all four. Written, **NOT run**.
 
+- [x] P-FULLGRAPH. port (Python): ONE CUDA graph for the WHOLE step behind
+      `full_graph` (forward + backward + the device firewall + `zero_grad` +
+      the optimizer stage), plus the 2026-10-23 b24 s1024 capture fault.
+      `train/graph.py::FullGraph` (subclass of `OptimizerGraph`, so the two arms
+      cannot bind the LR or the refusals differently): static `[batch, seq]`
+      device inputs filled with `copy_`, pre-allocated `.grad` zeroed in place
+      (`set_to_none=False`), the LR a device tensor filled in place, the
+      forward's PYTHON counters re-merged on every path (`on_counters`) so a
+      COUNTED arm cannot go silent, and `_check_participants` re-checking the
+      recorded grad set per replay (a host compare, no sync).
+      `train.graph.full_graph_refusal` refuses LOUDLY, one reason + `Escape:`
+      per REAL conflict, each verified against the forward: `opt_graph` both
+      set, `grad_accum>1`, `rand_depth`, `segment_len>0`, `use_byteflow`, halt
+      (`loopblock.py:674`'s host read), `use_msa` (`:576`'s `float(share)`),
+      `ema_decay>0`, `engram_ram` (`_forward_host`'s `.to("cpu")`), JEPA's
+      per-step mask, DSpark's `last_mtp`, `act_quant` (`:240`'s
+      `bool(torch.isfinite(x).all())`), the QAT caches. Data-dependent routing
+      is ALLOWED and stated: the top-k is a kernel on buffer values.
+      **The fault's root cause, measured:** `torch.bincount` is NOT
+      CUDA-graph-capturable on torch 2.13 (`with torch.cuda.graph(g):
+      torch.bincount(a, minlength=9)` raises "Cannot copy between CPU and CUDA
+      tensors during CUDA graph capture unless the CPU tensor is pinned"), and
+      `SparseMoE._padded_dispatch`/`_triton_dispatch`/`_permute` counted experts
+      with it — so NO capture of a training step could complete at ANY MoE
+      shape. `experts._bincount` is the same histogram as one device
+      scatter-add; `tests/test_full_graph.py::test_bincount_aborts_a_capture_and_the_replacement_does_not`
+      is red on revert. A SECOND non-capturable op remains inside
+      `SparseMoE._dispatch` (all three kernels fail; stubbing `_dispatch`
+      captures, stubbing `_permute`/`_banks`/`_gather_rows` does not localize
+      it yet) — `full_graph` therefore COUNTED-falls back to eager and the
+      `opt_graph`/`full_graph` rows of the table are the eager numbers.
+      `opt_graph`'s "+0 at b8 s512" was not a graph result either: the capture
+      was REFUSED for a month because `loop.residual_scale` gets no gradient
+      under `use_mhc` (the reverted `a10f455`), and the trainer now excludes a
+      structurally dead parameter COUNTED (`opt_graph_frozen`) while
+      `_check_participants` catches a real per-step starvation. Captures now
+      `empty_cache()` and refuse COUNTED below `max(384 MiB, 8% of VRAM)` of
+      headroom with the numbers — at b24 s1024 the run leaves 68-250 MiB and the
+      optimizer stage's pool is a measured 88-592 MiB, so that shape REFUSES
+      instead of faulting.
+      Measured (min of 5 for b8, 3 for b24, one process per arm, 20 steps,
+      `final_byte`, bf16, `muon_state_dtype=bf16`, `ns_dtype=bf16`):
+      b8 s512 eager **234.2 ms / 17 490 B/s / 7 611 launches**, opt_graph
+      **239.6 / 17 097 / 8 365**, full_graph **285.0 / 14 373 / 10 392 (COUNTED
+      fallback)**; b24 s1024 eager **909.3 / 27 027 / 7 614**, opt_graph
+      **887.4 / 27 695 / 10 315 (COUNTED: 68 MiB free)**, full_graph refused
+      (`engram_ram`). **The graph removes no launches here and full_graph does
+      NOT beat eager** — it cannot capture yet, and the box's launch count is
+      7.6-7.7k, not the reported 13 886 (different attention arm and substrate).
+      Gates `port/tests/test_full_graph.py` (20; `full_graph=false` sha256 of
+      the 5-step `state_dict` + logits pinned from a clean `main` worktree,
+      `b36ef27`; the bincount capture gate; the 13 refusals; non-CUDA LOUD
+      before the first step; the b24 s1024 optimiser stage captured + 20
+      replays). Bench `port/scripts/bench_full_graph.py`.
+
+
 ## Critical Files
 
 - `crates/dormouse-core/src/loop_block.rs` (617, in flight)

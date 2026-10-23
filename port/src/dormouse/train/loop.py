@@ -39,7 +39,7 @@ from ..model.experts import invalidate_banks_all
 from ..model.qat_cache import invalidate_qat_cache_all
 from ..model.tsct import set_mm_dtype
 from .data import ByteStream, eval_window_bytes, open_streams, warmup_steps
-from .graph import OptimizerGraph
+from .graph import FullGraph, OptimizerGraph, full_graph_refusal
 from .lr import wsd_lr
 from .mixture import open_mixture
 from .optim import MixOptimizer, clip_grads, grad_norm
@@ -1072,13 +1072,157 @@ def train(
     #: group points at any more — every replay would read a stale value.
     graph = None
     if cfg.opt_graph:
-        graph = OptimizerGraph(opt, opt_stage, counters=total, log=log)
+        graph = OptimizerGraph(opt, opt_stage, counters=total, log=log, allow_frozen=True)
         log(
             f"opt_graph: the optimizer stage is captured after {graph.warmup_steps} "
             f"eager steps and replayed with ONE launch per step; the LR lives in a "
             f"device tensor this loop fills IN PLACE (a host float would be baked at "
             f"capture and freeze the WSD schedule), and zero_grad runs "
             f"set_to_none=False so the captured ops keep their pinned .grad buffers."
+        )
+    def micro_step(x, y, kw, n_micro: int, first: bool):
+        """ONE micro-batch: forward + the DEVICE firewall + backward + the gate.
+
+        The ONE definition of the step body, called by the eager accumulation
+        loop AND recorded verbatim by the `full_graph` capture — two copies of
+        this would be two definitions of "a training step" and would drift
+        (`train/graph.py`'s own rule). Returns `(counters, contribution,
+        grads)`: the HOST counter merge and the loss accumulator stay with the
+        caller, because they are the parts a capture cannot carry.
+        """
+        logits, loss, step_counters = model(x, y, **kw)
+        assert logits.shape[-1] == run.model.vocab, "logits width != vocab"
+        # THE DEVICE FIREWALL (ADR-0018 rule 2). No host read decides this
+        # step: `loss_finite` and the gradient norm stay on the device, the
+        # masked loss makes backward's seed exactly zero, and the resulting
+        # 0-dim 1/0 flag is what every write below is multiplied by. The host
+        # sees the loss and the skip count at the log cadence only.
+        #
+        # `torch.where` on the scalar, not `mask_fill`: on a healthy step the
+        # value AND the gradient are bit-identical to `loss.backward()` (the
+        # where's backward passes the root gradient through unchanged), which
+        # is what keeps a healthy run's sha256 equal to HEAD's.
+        assert loss is not None, "a training step must carry targets"
+        loss_d = loss.detach()
+        loss_finite = torch.isfinite(loss_d).all()
+        step_loss = torch.where(loss_finite, loss, loss_d.new_zeros(()))
+        if n_micro > 1:
+            # The MEAN over micro-batches, not their sum: the accumulated
+            # gradient must be the wide batch's MEAN gradient, which is what
+            # makes `grad_accum=k, batch=b` match `batch=b*k`.
+            step_loss = step_loss / n_micro
+        if step_loss.requires_grad:
+            # A real training loss always does. A model that returns a bare
+            # tensor (the firewall's own NaN fixture) has nothing to backprop
+            # through, which is the old code's skip branch by another route.
+            step_loss.backward()
+        grads = [p.grad for p in model.parameters() if p.grad is not None]
+        # A non-finite GRADIENT disables the step too (the burn 2026-09-27
+        # lesson: a masked loss scalar does not stop a NaN that came from an
+        # ACTIVATION — `NaN * 0` is still NaN through the Jacobian). One vector
+        # norm answers "any" without a host read; the flag is the AND of both.
+        raw_norm = grad_norm(model.parameters())
+        if raw_norm.device != loss_d.device:
+            raw_norm = raw_norm.to(loss_d.device)
+        finite = loss_finite & torch.isfinite(raw_norm)
+        if n_micro > 1:
+            # Sanitize THIS micro-batch's contribution on arrival — a
+            # non-finite activation must not poison the accumulator — and AND
+            # its flag into the group's. If ANY micro fails, the final multiply
+            # below zeroes the earlier contributions too.
+            flag_dev.mul_(finite.to(torch.int32))
+            loss_ok_dev.logical_and_(loss_finite)
+        else:
+            flag_dev.copy_(finite.to(torch.int32))
+            loss_ok_dev.copy_(loss_finite)
+        # Sanitize on the device AND gate: every non-finite gradient becomes 0
+        # (so a moment cannot be poisoned), then every gradient is multiplied
+        # by the flag — `*1.0` is the identity on a healthy step, `*0` makes the
+        # skipped step's direction exactly zero (a masked loss alone does not: a
+        # NaN that came from an ACTIVATION would still be in the Jacobian).
+        gate = finite.to(torch.float32)
+        for g in grads:
+            g.nan_to_num_(0.0, 0.0, 0.0)
+            g.mul_(gate.to(g.dtype))
+        return step_counters, step_loss.detach(), grads
+
+    #: ---- `full_graph`: ONE graph for the whole step --------------------
+    #: `cfg.full_graph` (`train/graph.py::FullGraph`): forward + backward +
+    #: firewall + `zero_grad` + the optimizer stage, captured once and replayed
+    #: with ONE launch per step. The refusals are LOUD and come FIRST, before a
+    #: single step runs, so a config that cannot be captured says so instead of
+    #: silently staying eager.
+    full = None
+    if cfg.full_graph:
+        why = full_graph_refusal(cfg, run.model)
+        if why is not None:
+            loud(f"full_graph: {why}")
+        if dev.type != "cuda":
+            # UP FRONT, not at capture: this arm binds the LR as DEVICE tensors
+            # in its constructor, and a run that is refused only when the first
+            # capture fires has already moved the optimizer's LR arithmetic
+            # (fp32 tensor vs Python float) for every warmup step — i.e. it is a
+            # different program from the eager one it claims to fall back to.
+            loud(
+                f"full_graph on a {dev.type} model: a CUDA graph is a CUDA-only "
+                f"mechanism, and this arm binds the LR as device tensors before the "
+                f"first step, so a late fallback would not be the eager run. Escape: "
+                f"--device cuda, or full_graph=false."
+            )
+        _captured: dict = {}
+
+        def full_body() -> None:
+            """The captured region. A capture EXECUTES it, so a host read here
+            would surface at capture time (and `tests/test_full_graph.py` traps
+            `Tensor.item` to prove the region is clean)."""
+            opt.zero_grad(set_to_none=False)
+            flag_dev.fill_(1)
+            loss_ok_dev.fill_(True)
+            loss_sum = last_loss_dev.new_zeros(())
+            step_counters, contribution, _grads = micro_step(full.x, full.y, {}, 1, True)
+            _captured["counters"] = step_counters
+            loss_sum = loss_sum + contribution
+            torch.where(loss_ok_dev, loss_sum, last_loss_dev, out=last_loss_dev)
+            opt_stage()
+
+        def full_counters() -> None:
+            """Re-merge the counters the forward wrote.
+
+            The forward's arm counters are Python (`Counters.count`), so a
+            replay runs only its DEVICE ops and a COUNTED arm would go silent
+            after the capture step (the same rule as `OptimizerGraph._replay`).
+            Called on EVERY path — the eager warmup and a COUNTED fallback need
+            it just as much, or the arm's counters vanish whenever it is on.
+            """
+            captured = _captured.get("counters")
+            if captured:
+                total.merge(captured)
+                window.merge(captured)
+
+        full = FullGraph(
+            opt,
+            full_body,
+            batch=cfg.batch,
+            seq_len=cfg.seq_len,
+            device=dev,
+            counters=total,
+            log=log,
+            # The trainer's setting: one structurally dead gain
+            # (`loop.residual_scale` under `use_mhc`) must not disable the whole
+            # arm — that refusal is why `opt_graph` measured +0 without ever
+            # capturing. `graph._check_participants` catches the real hazard.
+            allow_frozen=True,
+            on_counters=full_counters,
+        )
+        log(
+            f"full_graph: the WHOLE step (forward + backward + firewall + zero_grad + "
+            f"the optimizer stage) is captured after {full.warmup_steps} eager steps and "
+            f"replayed with ONE launch per step. The inputs live in a static "
+            f"{cfg.batch}x{cfg.seq_len} device buffer this loop fills with `copy_`; the "
+            f"LR is a device tensor filled IN PLACE; every `.grad` is pre-allocated and "
+            f"zeroed in place. Refused arms (grad_accum>1, rand_depth, segment_len, "
+            f"use_byteflow, halt, use_msa, engram_ram, jepa, dspark, act_quant, QAT, EMA) "
+            f"are LOUD before the first step."
         )
     for step in range(start, cfg.steps):
         lr = wsd_lr(
@@ -1156,110 +1300,61 @@ def train(
         # capture pinned (`dion/cuda_graph.py:170-181`). `False` is a no-op for
         # a param whose grad is still None, so the FIRST backward allocates it
         # — which is why the wrapper demands at least one eager step.
-        opt.zero_grad(set_to_none=graph is None)
-        # The group's firewall flag starts healthy and is ANDed by every
-        # micro-batch below (`grad_accum > 1`); a one-micro step overwrites it
-        # exactly as the pre-arm code did.
-        flag_dev.fill_(1)
-        loss_ok_dev.fill_(True)
-        loss_sum = last_loss_dev.new_zeros(())
-        n_micro = cfg.grad_accum
-        for _micro in range(n_micro):
+        if full is not None:
+            # ---- the CAPTURED step: one replay does all of it --------------
             x, y = stream.next_batch()
-            if device is not None:
-                x, y = x.to(device), y.to(device)
-            logits, loss, step_counters = model(x, y, **kw)
-            assert logits.shape[-1] == run.model.vocab, "logits width != vocab"
-            total.merge(step_counters)
-            window.merge(step_counters)
-
-            # THE DEVICE FIREWALL (ADR-0018 rule 2). No host read decides this
-            # step: `loss_finite` and the gradient norm stay on the device, the
-            # masked loss makes backward's seed exactly zero, and the resulting
-            # 0-dim 1/0 flag is what every write below is multiplied by. The
-            # host sees the loss and the skip count at the log cadence only.
-            #
-            # `torch.where` on the scalar, not `mask_fill`: on a healthy step
-            # the value AND the gradient are bit-identical to `loss.backward()`
-            # (the where's backward passes the root gradient through unchanged),
-            # which is what keeps a healthy run's sha256 equal to HEAD's.
-            assert loss is not None, "a training step must carry targets"
-            loss_d = loss.detach()
-            loss_finite = torch.isfinite(loss_d).all()
-            step_loss = torch.where(loss_finite, loss, loss_d.new_zeros(()))
+            full.fill(x, y)
+            full.set_lr(lr)
+            full.step()
+        else:
+            # ---- the EAGER step (and `opt_graph`'s stage takeover) ---------
+            opt.zero_grad(set_to_none=graph is None)
+            # The group's firewall flag starts healthy and is ANDed by every
+            # micro-batch below (`grad_accum > 1`); a one-micro step overwrites
+            # it exactly as the pre-arm code did.
+            flag_dev.fill_(1)
+            loss_ok_dev.fill_(True)
+            loss_sum = last_loss_dev.new_zeros(())
+            n_micro = cfg.grad_accum
+            for _micro in range(n_micro):
+                x, y = stream.next_batch()
+                if device is not None:
+                    x, y = x.to(device), y.to(device)
+                step_counters, contribution, grads = micro_step(
+                    x, y, kw, n_micro, _micro == 0
+                )
+                total.merge(step_counters)
+                window.merge(step_counters)
+                loss_sum = loss_sum + contribution
             if n_micro > 1:
-                # The MEAN over micro-batches, not their sum: the accumulated
-                # gradient must be the wide batch's MEAN gradient, which is what
-                # makes `grad_accum=k, batch=b` match `batch=b·k`.
-                step_loss = step_loss / n_micro
-            if step_loss.requires_grad:
-                # A real training loss always does. A model that returns a bare
-                # tensor (the firewall's own NaN fixture) has nothing to
-                # backprop through, which is the old code's skip branch by
-                # another route.
-                step_loss.backward()
-            loss_sum = loss_sum + step_loss.detach()
-            grads = [p.grad for p in model.parameters() if p.grad is not None]
-            # A non-finite GRADIENT disables the step too (the burn 2026-09-27
-            # lesson: a masked loss scalar does not stop a NaN that came from an
-            # ACTIVATION — `NaN * 0` is still NaN through the Jacobian). One
-            # vector norm answers "any" without a host read; the flag is the AND
-            # of both.
-            raw_norm = grad_norm(model.parameters())
-            if raw_norm.device != loss_d.device:
-                raw_norm = raw_norm.to(loss_d.device)
-            finite = loss_finite & torch.isfinite(raw_norm)
-            if n_micro > 1:
-                # Sanitize THIS micro-batch's contribution on arrival — a
-                # non-finite activation must not poison the accumulator — and
-                # AND its flag into the group's. If ANY micro fails, the final
-                # multiply below zeroes the earlier contributions too.
-                flag_dev.mul_(finite.to(torch.int32))
-                loss_ok_dev.logical_and_(loss_finite)
+                # THE GROUP'S DECISION: one multiply, no host branch. Healthy
+                # (`*1`) changes no bit; a single non-finite micro-batch zeroes
+                # the whole accumulated direction, which is the same "skip the
+                # step" the one-micro firewall makes.
+                gate = flag_dev.to(torch.float32)
+                for g in grads:
+                    g.mul_(gate.to(g.dtype))
+            # The last FINITE loss, carried on the DEVICE: the host reads it
+            # when the cadence fires and never before. Same bits as the old
+            # per-step `float(loss.detach())`.
+            torch.where(loss_ok_dev, loss_sum, last_loss_dev, out=last_loss_dev)
+            if graph is not None:
+                # ONE launch: the captured stage IS `opt_stage()` (the grad clip
+                # plus the mixed step), and the wrapper redoes the host-side step
+                # counters a recording cannot carry. A skipped step replays too:
+                # the flag multiplies its writes to zero, which is what makes the
+                # same recording serve both outcomes with no host branch.
+                graph.step()
             else:
-                flag_dev.copy_(finite.to(torch.int32))
-                loss_ok_dev.copy_(loss_finite)
-            # Sanitize on the device AND gate: every non-finite gradient becomes
-            # 0 (so a moment cannot be poisoned), then every gradient is
-            # multiplied by the flag — `*1.0` is the identity on a healthy step,
-            # `*0` makes the skipped step's direction exactly zero (a masked loss
-            # alone does not: a NaN that came from an ACTIVATION would still be
-            # in the Jacobian).
-            gate = finite.to(torch.float32)
-            for g in grads:
-                g.nan_to_num_(0.0, 0.0, 0.0)
-                g.mul_(gate.to(g.dtype))
+                opt_stage()
         timer.tick()
-        if n_micro > 1:
-            # THE GROUP'S DECISION: one multiply, no host branch. Healthy
-            # (`*1`) changes no bit; a single non-finite micro-batch zeroes the
-            # whole accumulated direction, which is the same "skip the step"
-            # the one-micro firewall makes.
-            gate = flag_dev.to(torch.float32)
-            for g in grads:
-                g.mul_(gate.to(g.dtype))
-        # The last FINITE loss, carried on the DEVICE: the host reads it when
-        # the cadence fires and never before. Same bits as the old per-step
-        # `float(loss.detach())`, so the printed number does not move.
-        # `loss_sum` already holds the MEAN: each micro-contribution was
-        # divided by `n_micro` before backward (one division, not two).
-        torch.where(loss_ok_dev, loss_sum, last_loss_dev, out=last_loss_dev)
         # COUNTED as a device counter, drained with the window's other counters
-        # at the log cadence (the `Counters.count_device` 0-sync rule).
-        # `nan_skipped` counts OPTIMIZER STEPS: a group with any non-finite
-        # micro-batch is one skipped step.
+        # at the log cadence (the `Counters.count_device` 0-sync rule). OUTSIDE
+        # any capture: `1 - flag_dev` is a device op on a persistent tensor, and
+        # the flag it reads was written by the replay above.
         window.count_device("nan_skipped", 1 - flag_dev)
         total.count_device("nan_skipped", 1 - flag_dev)
         window_steps += 1
-        if graph is not None:
-            # ONE launch: the captured stage IS `opt_stage()` (the grad clip
-            # plus the mixed step), and the wrapper redoes the host-side step
-            # counters that a recording cannot carry. A skipped step replays
-            # too: the flag multiplies its writes to zero, which is what makes
-            # the same recording serve both outcomes with no host branch.
-            graph.step()
-        else:
-            opt_stage()
         if ema is not None:
             # ONCE per OPTIMIZER STEP (not per micro-batch), after the update
             # landed. `opt_graph` is legal here because this runs EAGERLY after

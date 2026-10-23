@@ -427,7 +427,9 @@ def gather_abi(
     rows = order[keep]
     toks = (rows // k).to(torch.int32).contiguous()
     kept = index.reshape(-1)[rows]
-    counts = torch.bincount(kept, minlength=experts).to(torch.int32)
+    from .experts import _bincount  # lazy: `experts` imports this module
+
+    counts = _bincount(kept, experts).to(torch.int32)
     offs = torch.zeros(experts + 1, dtype=torch.int32, device=index.device)
     offs[1:] = torch.cumsum(counts, 0)
     return toks, offs
