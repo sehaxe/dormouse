@@ -875,6 +875,24 @@ def decode(
             "(O(window)/byte). Off by default until the GPU gate has run.",
         ),
     ] = False,
+    decode_graph: Annotated[
+        bool,
+        typer.Option(
+            "--decode-graph",
+            help="recurrent decode in a CUDA graph: capture the one-byte step once and "
+            "replay it (static buffers, in-place state). Needs --recurrent and CUDA; "
+            "a capture failure falls back COUNTED to eager with the reason.",
+        ),
+    ] = False,
+    decode_multibyte: Annotated[
+        int,
+        typer.Option(
+            "--decode-multibyte",
+            help="recurrent decode, up to N bytes per forward from the model's MTP heads "
+            "(draft -> ONE verify forward -> longest correct prefix). GREEDY ONLY "
+            "(temp <= 1e-6); no MTP head = COUNTED fallback to one byte per forward.",
+        ),
+    ] = 0,
     device: Annotated[str, typer.Option(help="auto|cuda|cpu")] = "auto",
 ) -> None:
     """Sample bytes from a checkpoint (sliding-window next-byte decode).
@@ -891,6 +909,13 @@ def decode(
     pass are the same recurrence with different summation orders (the `kda.py`
     numerics contract), which is why it is off by default and why the subtitle
     prints the counters of the arm that ran.
+
+    `--decode-graph` captures the recurrent step in a CUDA graph and replays it
+    (same bytes as eager, `decode_graph_replay` says how many); a capture
+    failure is COUNTED and prints its reason. `--decode-multibyte N` is the
+    MTP draft-then-verify loop, GREEDY ONLY (`--temp 1e-6`): it emits up to N
+    bytes per forward, and a model without an MTP head falls back COUNTED to one
+    byte per forward. Both are arms OF `--recurrent`.
     """
     from .model.specdecode import spec_decode_bytes
     from .train.loop import load_model_half, load_model_state
@@ -904,6 +929,19 @@ def decode(
             "decode --spec-k and --recurrent are two different decoders (a verified "
             "draft block vs a carried state), and neither is the other's control. "
             "Escape: pass one of them."
+        )
+    if (decode_graph or decode_multibyte) and not recurrent:
+        raise LoudError(
+            "decode --decode-graph / --decode-multibyte are arms OF the recurrent "
+            "decoder (the captured step is `recurrent_step`, and the multibyte verify "
+            "carries its state). Escape: add --recurrent."
+        )
+    if decode_multibyte and temp > 1e-6:
+        raise LoudError(
+            f"decode --decode-multibyte at temp={temp}: multibyte is GREEDY ONLY "
+            f"(temp <= 1e-6), because a block verify's distribution is the one-byte "
+            f"loop's only up to kernel summation order — sampling it would change what "
+            f"the model is. Escape: --temp 1e-6, or drop --decode-multibyte."
         )
     run = _snapshot_run(out_dir, ckpt_name)
     dev = _device(device)
@@ -920,8 +958,21 @@ def decode(
         from .model.decode import recurrent_decode
 
         arm = Counters()
-        out = recurrent_decode(model, body, n, temp=temp, device=dev, generator=gen, counters=arm)
+        out = recurrent_decode(
+            model,
+            body,
+            n,
+            temp=temp,
+            device=dev,
+            generator=gen,
+            counters=arm,
+            decode_graph=decode_graph,
+            decode_multibyte=decode_multibyte,
+        )
         subtitle = f"recurrent · {arm.line()}"
+        why = getattr(arm, "why", None)
+        if why:
+            console.print(f"[yellow]counted[/] {why}")
     elif spec_k:
         out, stats = spec_decode_bytes(
             model, body, n, spec_k=spec_k, temp=temp, device=dev, generator=gen

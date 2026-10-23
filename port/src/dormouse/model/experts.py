@@ -241,6 +241,19 @@ else:
 from . import moe_sonic  # the gather-fused forward (`moe_gather = "kernel"`)
 
 
+def _counts(ids: torch.Tensor, groups: int) -> torch.Tensor:
+    """`bincount(ids, minlength=groups)` that a CUDA graph can capture.
+
+    torch's CUDA `bincount` stages through a CPU tensor, which a CUDA-graph
+    capture refuses ("Cannot copy between CPU and CUDA tensors during CUDA
+    graph capture") — so `decode --decode-graph` would abort on the routed MoE
+    rather than on anything it owns. A scatter-add of ones is the same integer
+    count, exactly, and is a plain kernel launch.
+    """
+    ones = torch.ones_like(ids)
+    return torch.zeros(groups, dtype=torch.long, device=ids.device).scatter_add_(0, ids, ones)
+
+
 def expert_glu(
     act: str,
     g: torch.Tensor,
@@ -965,7 +978,7 @@ class SparseMoE(nn.Module):
         if self.lfb_coef == 0.0 or not self.training:
             return
         with torch.no_grad():
-            counts = torch.bincount(index.reshape(-1), minlength=self.n_experts).float()
+            counts = _counts(index.reshape(-1), self.n_experts).float()
             self.lfb_counts.add_(counts)
             self.lfb_bias.sub_(self.lfb_coef * torch.sign(self.lfb_counts - self.lfb_counts.mean()))
         counters.count("moe_lfb_updates")
@@ -1039,7 +1052,7 @@ class SparseMoE(nn.Module):
             groups = self.n_experts + 1
         order = torch.argsort(safe, stable=True)
         sorted_ids = safe[order]
-        counts = torch.bincount(sorted_ids, minlength=groups)
+        counts = _counts(sorted_ids, groups)
         offsets = torch.cumsum(counts, 0) - counts
         pos = torch.arange(n * k, device=index.device) - offsets[sorted_ids]
         if self.capacity == 0:
@@ -1289,7 +1302,7 @@ class SparseMoE(nn.Module):
         weight: torch.Tensor,
         index: torch.Tensor,
         order: torch.Tensor,
-        keep: torch.Tensor,
+        keep: torch.Tensor | None,
     ) -> torch.Tensor:
         """Gather → ONE capacity-padded `[E, cap, ·]` bank pass → weighted scatter.
 
@@ -1321,7 +1334,7 @@ class SparseMoE(nn.Module):
         flat_w = weight.reshape(-1)
         flat_e = index.reshape(-1)
         if self.topk_mode == "off":
-            counts = torch.bincount(flat_e, minlength=e)
+            counts = _counts(flat_e, e)
         else:
             # The adaptive width's padding slots go to the SAME sentinel group
             # `_permute` used, or `pos` here would count them and disagree with
@@ -1329,13 +1342,15 @@ class SparseMoE(nn.Module):
             # (a mismatch is an out-of-bounds `index_put`). The sentinel rows are
             # never kept, so their (large) slot numbers are computed, not used.
             flat_e = flat_e.masked_fill(~(weight > 0).reshape(-1), e)
-            counts = torch.bincount(flat_e, minlength=e + 1)
-        rows = order[keep]  # flat (token, slot) pairs that survive the cap
+            counts = _counts(flat_e, e + 1)
+        rows = order if keep is None else order[keep]  # flat (token, slot) pairs kept
         owner = rows // k  # the token each kept row belongs to
         # The padded-bank slot of each sorted row: expert-major, capacity-padded.
         starts = torch.cumsum(counts, 0) - counts
         pos = torch.arange(n * k, device=index.device) - starts[flat_e[order]]
-        kept_slots = (flat_e[order] * cap + pos)[keep]
+        kept_slots = flat_e[order] * cap + pos
+        if keep is not None:
+            kept_slots = kept_slots[keep]
         # Zero-filled, not `empty`: a row past capacity is never read, but a
         # zero row keeps the bank finite, and inf-garbage × 0 is NaN in the
         # backward (the spike measured exactly that — `probe_moe_variants.py`).
@@ -1446,6 +1461,18 @@ class SparseMoE(nn.Module):
         """
         valid = None if self.topk_mode == "off" else weight > 0
         order, keep, dropped = self._permute(index, valid)
+        n, k = index.shape
+        # `keep=None` = every permuted row survives, and `order[keep]` is then
+        # `order`. Two cases are provably all-True: dropless (`capacity=0` keeps
+        # every row by construction), and a one-token decode (`topk` returns
+        # DISTINCT experts, so no expert gets more than one of the token's k
+        # rows, and the capacity floor is >= 1). Skipping the mask matters
+        # beyond the op: a boolean mask's output LENGTH is a device value, i.e. a
+        # host sync, which a CUDA-graph capture refuses. `topk_mode != "off"` has
+        # zero-weight PADDING slots and always needs the mask; the drop count is
+        # still computed above either way.
+        static = self.topk_mode == "off" and (self.capacity == 0 or n == 1)
+        keep_rows = None if static else keep
         # Count EVERY call: a python `if dropped:` on the device tensor is
         # exactly the sync this counter exists to prevent (caught by the
         # drop-parity test when the tensor stopped being an int). A zero add
@@ -1472,7 +1499,7 @@ class SparseMoE(nn.Module):
             counters.count("moe_gather_fallback")
             counters.why = f"gather: {gwhy}"  # type: ignore[attr-defined]
         if self.capacity == 0:
-            return self._dropless_dispatch(x, weight, index, order, keep, counters)
+            return self._dropless_dispatch(x, weight, index, order, keep, keep_rows, counters)
         notes = [] if gwhy is None else [f"gather: {gwhy}"]
         if self.moe_kernel == "triton":
             why = (
@@ -1495,7 +1522,7 @@ class SparseMoE(nn.Module):
                 counters.count("moe_triton_gemm")
                 return self._expert_pass(
                     lambda: self._triton_dispatch(
-                        x, weight, index, order, keep, fused_bwd=fwhy is None
+                        x, weight, index, order, keep_rows, fused_bwd=fwhy is None
                     ),
                     counters,
                 )
@@ -1509,7 +1536,7 @@ class SparseMoE(nn.Module):
                 counters.why = "; ".join(notes)  # type: ignore[attr-defined]
             counters.count("moe_padded_bmm")
             return self._expert_pass(
-                lambda: self._padded_dispatch(x, weight, index, order, keep), counters
+                lambda: self._padded_dispatch(x, weight, index, order, keep_rows), counters
             )
         counters.count("moe_naive_dispatch")
         counters.why = "; ".join([*notes, why])  # type: ignore[attr-defined]
@@ -1524,6 +1551,7 @@ class SparseMoE(nn.Module):
         index: torch.Tensor,
         order: torch.Tensor,
         keep: torch.Tensor,
+        keep_rows: torch.Tensor | None,
         counters: Counters,
     ) -> torch.Tensor:
         """The `moe_capacity = 0` route: the RAGGED arms, the grouped GEMM first.
@@ -1577,7 +1605,7 @@ class SparseMoE(nn.Module):
             counters.count("moe_triton_gemm")
             return self._expert_pass(
                 lambda: self._triton_dispatch(
-                    x, weight, index, order, keep, dropless=True, fused_bwd=fwhy is None
+                    x, weight, index, order, keep_rows, dropless=True, fused_bwd=fwhy is None
                 ),
                 counters,
             )
@@ -1686,7 +1714,7 @@ class SparseMoE(nn.Module):
         weight: torch.Tensor,
         index: torch.Tensor,
         order: torch.Tensor,
-        keep: torch.Tensor,
+        keep: torch.Tensor | None,
         *,
         dropless: bool = False,
         fused_bwd: bool = True,
@@ -1721,10 +1749,11 @@ class SparseMoE(nn.Module):
         assert moe_kernels is not None, "the triton arm cannot be dispatched without it"
         n, k = index.shape
         dt = self._bank_dtype()
-        rows = order[keep]
+        # `keep=None` = every permuted row survives (a one-token decode).
+        rows = order if keep is None else order[keep]
         owner = rows // k
         kept = index.reshape(-1)[rows]
-        counts = torch.bincount(kept, minlength=self.n_experts).to(torch.int32)
+        counts = _counts(kept, self.n_experts).to(torch.int32)
         offs = torch.zeros(self.n_experts + 1, dtype=torch.int32, device=x.device)
         offs[1:] = torch.cumsum(counts, 0)
         gate_u, up_u, v, gate_s, up_s = self._banks(dt)
