@@ -667,14 +667,25 @@ def train(
                 seq_len=run.train.seq_len,
                 seed=run.train.seed,
                 max_epochs=run.train.max_epochs,
+                doc_masking=run.train.doc_masking,
             )
-            _, eval_stream = open_streams(run)
+            _, eval_stream = open_streams(run, eval_only=True)
             log(
                 f"mix_plan={run.train.mix_plan}: {len(stream.plan.sources)} sources, "
                 f"{len(stream.plan.stages)} stage(s), max_epochs={run.train.max_epochs}"
             )
         else:
             stream, eval_stream = open_streams(run)
+    if cfg.doc_masking:
+        # The arm's own line: which reader ran and what it does. The row shape
+        # is the whole mechanism, so a reader does not have to infer it from the
+        # flag (a packed row that still glued documents would be the defect).
+        log(
+            "doc_masking=true: one document per training row (whole document, or a "
+            "contiguous chunk of one when it is longer than seq_len), tail-padded; "
+            "padding and cross-document targets are excluded from the loss. The eval "
+            "stream stays flat (the held-out window is the comparable number)."
+        )
     model.train()
     if "ternary_s3t" in (run.model.factor_qat, run.model.dense_qat):
         # The ADR-0021 caveat, said where a reader of the log meets it. The
@@ -976,9 +987,15 @@ def train(
         if anneal_steps > 0:
             model.set_factor_qat_alpha(min(1.0, step / anneal_steps))
 
-        x, y = stream.next_batch()
+        if cfg.doc_masking:
+            x, y, loss_mask = stream.next_batch_masked()
+        else:
+            x, y = stream.next_batch()
+            loss_mask = None
         if device is not None:
             x, y = x.to(device), y.to(device)
+            if loss_mask is not None:
+                loss_mask = loss_mask.to(device)
         # The ADAPTIVE DEPTH arm: T is the pure `(seed, step)` sample, and the
         # loss divides by the depth actually run (`model.forward`/`loopblock`).
         # `None` (the default and every other config) keeps the call unchanged.
@@ -993,6 +1010,11 @@ def train(
             # activations, so it needs no segmentation, and leaving it one-shot
             # keeps the held-out number comparable with the record.
             kw["segment_len"] = cfg.segment_len
+        if loss_mask is not None:
+            # doc_masking: the per-iteration and final CEs are means over the
+            # selected positions only (padding and cross-document targets are
+            # not scored). `None` is the historical `.mean()` path.
+            kw["loss_mask"] = loss_mask
         logits, loss, step_counters = model(x, y, **kw)
         assert logits.shape[-1] == run.model.vocab, "logits width != vocab"
         total.merge(step_counters)
@@ -1189,6 +1211,9 @@ def train(
     total.drain()
     nan_skipped = int(total.get("nan_skipped", 0))
     last_loss = _host_scalar(last_loss_dev)
+    doc_counts = stream.doc_counts() if cfg.doc_masking else {}
+    if cfg.doc_masking:
+        log(f"doc_masking: {doc_counts}")
     if cfg.eval and eval_stream is not None and cfg.steps % cfg.eval_every != 0:
         sf("eval")
         line, _ev, _scored = _eval_line(
@@ -1203,4 +1228,5 @@ def train(
         "counters": total,
         "opt_steps": opt.steps,
         "eval_window_bytes": eval_window_bytes(cfg),
+        "doc_counts": doc_counts,
     }

@@ -101,7 +101,16 @@ from pathlib import Path
 import torch
 
 from ..instrument import loud
-from .data import DEFAULT_RING, ByteStream, ShardStream, open_source, shard_files, shard_sizes
+from .data import (
+    DEFAULT_RING,
+    ByteStream,
+    DocPackedStream,
+    ShardStream,
+    load_doc_starts,
+    open_source,
+    shard_files,
+    shard_sizes,
+)
 
 #: The 4-epoch rule (2305.16264) — a source repeated more than this is refused
 #: unless the plan (or `--set max_epochs=N`) says otherwise. `0` = off.
@@ -440,6 +449,27 @@ def replay_bytes(
     return served
 
 
+def replay_steps(
+    plan: MixPlan,
+    *,
+    steps: int,
+    upto: int | None = None,
+    seed: int | None = None,
+) -> dict[str, int]:
+    """EXACT STEPS each source serves in `[0, upto)` — the `doc_masking` resume.
+
+    A document-packed step consumes a document-dependent number of BYTES, so
+    the flat-byte resume formula cannot name a position. The step index still
+    does: the source of every step is a pure function of `(seed, step, steps)`,
+    so replaying the draw gives each source the number of packed steps it owes,
+    and `DocPackedStream.skip_steps` replays exactly those.
+    """
+    served = dict.fromkeys(plan.sources, 0)
+    for step in range(steps if upto is None else upto):
+        served[source_for_step(plan, step, steps, seed)] += 1
+    return served
+
+
 def check_epoch_cap(
     plan: MixPlan,
     *,
@@ -497,6 +527,7 @@ class MixtureStream:
         *,
         seed: int | None = None,
         ring_bytes: int = DEFAULT_RING,
+        doc_masking: bool = False,
     ) -> None:
         if not plan.stages:
             loud("MixtureStream: the plan has no stages")
@@ -505,17 +536,34 @@ class MixtureStream:
         self.steps = steps
         self.seed = plan.seed if seed is None else seed
         self.window = batch * (seq_len + 1)
+        self.doc_masking = doc_masking
         stage_bounds(plan, steps)  # refuse a plan whose stages do not cover the budget
-        self._streams: dict[str, ByteStream | ShardStream] = {
-            name: open_source(
-                path,
-                batch,
-                seq_len,
-                seed=_stream_seed(self.seed, name),
-                ring_bytes=ring_bytes,
-            )
-            for name, path in plan.sources.items()
-        }
+        self._streams: dict[str, ByteStream | ShardStream | DocPackedStream] = {}
+        for name, path in plan.sources.items():
+            stream: ByteStream | ShardStream
+            if doc_masking:
+                if path.is_dir():
+                    loud(
+                        f"doc_masking with source {name!r} -> {path}: a shard DIRECTORY "
+                        f"has document boundaries (one `*.txt` shard is one document) but "
+                        f"the packed reader is implemented for a `.bin` + its "
+                        f"`.docs.json` sidecar, and the shard stream's ring reads across "
+                        f"shards. Escape: concatenate the domain with "
+                        f"`scripts/build_doc_sidecar.py`'s source map (a `.bin`), or "
+                        f"doc_masking=false."
+                    )
+                # `check_min=False`: a packed row is one document, not a flat batch.
+                stream = ByteStream(path, batch, seq_len, ring_bytes=ring_bytes, check_min=False)
+                stream = DocPackedStream(stream, load_doc_starts(path))
+            else:
+                stream = open_source(
+                    path,
+                    batch,
+                    seq_len,
+                    seed=_stream_seed(self.seed, name),
+                    ring_bytes=ring_bytes,
+                )
+            self._streams[name] = stream
         self._step = 0
 
     @property
@@ -535,9 +583,35 @@ class MixtureStream:
 
     def next_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
         """One `[batch, seq_len]` window of inputs and the byte after each."""
+        if self.doc_masking:
+            loud(
+                "next_batch() on a doc_masking mixture: the window carries a loss "
+                "mask and dropping it would score padding and cross-document "
+                "targets. Escape: read `next_batch_masked()`, or doc_masking=false."
+            )
         name = source_for_step(self.plan, self._step, self.steps, self.seed)
         self._step += 1
-        return self._streams[name].next_batch()
+        stream = self._streams[name]
+        assert isinstance(stream, (ByteStream, ShardStream))
+        return stream.next_batch()
+
+    def next_batch_masked(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """One `doc_masking` window: inputs, targets and the `[batch, seq_len]` mask."""
+        assert self.doc_masking, "next_batch_masked on a flat mixture"
+        name = source_for_step(self.plan, self._step, self.steps, self.seed)
+        self._step += 1
+        stream = self._streams[name]
+        assert isinstance(stream, DocPackedStream)
+        return stream.next_batch_masked()
+
+    def doc_counts(self) -> dict[str, int]:
+        """Boundary counters summed over every packed source (the arm's evidence)."""
+        out: dict[str, int] = {}
+        for stream in self._streams.values():
+            if isinstance(stream, DocPackedStream):
+                for k, v in stream.counts.items():
+                    out[k] = out.get(k, 0) + v
+        return out
 
     def rewind(self) -> None:
         """Back to step 0 and every source's start — what an eval needs."""
@@ -562,6 +636,18 @@ class MixtureStream:
                 f"steps × (seq_len + 1) × batch."
             )
         steps = n // self.window
+        if self.doc_masking:
+            served_steps = replay_steps(
+                self.plan,
+                steps=self.steps,
+                upto=steps,
+                seed=self.seed,
+            )
+            for name, stream in self._streams.items():
+                assert isinstance(stream, DocPackedStream)
+                stream.skip_steps(served_steps[name])
+            self._step = steps
+            return
         served = replay_bytes(
             self.plan,
             steps=self.steps,
@@ -588,6 +674,7 @@ def open_mixture(
     seed: int | None = None,
     max_epochs: float | None = None,
     ring_bytes: int = DEFAULT_RING,
+    doc_masking: bool = False,
 ) -> MixtureStream:
     """Load a plan, run the epoch-cap guard, and build the stream — one call.
 
@@ -597,4 +684,12 @@ def open_mixture(
     """
     plan = load_mix_plan(plan_path)
     check_epoch_cap(plan, steps=steps, batch=batch, seq_len=seq_len, max_epochs=max_epochs)
-    return MixtureStream(plan, batch, seq_len, steps, seed=seed, ring_bytes=ring_bytes)
+    return MixtureStream(
+        plan,
+        batch,
+        seq_len,
+        steps,
+        seed=seed,
+        ring_bytes=ring_bytes,
+        doc_masking=doc_masking,
+    )
