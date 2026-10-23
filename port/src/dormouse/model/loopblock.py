@@ -12,8 +12,10 @@ Mirrors `crates/dormouse-core/src/loop_block.rs`. One iteration, in order:
 5. the **Engram** memory joins as a convex mixture with a hard floor:
    `lam = min(w_mem, lam_max)`;
 6. the body is deposited by **ReZero** (`h = h_ctx + α·y`, α init 1.0 — NOT 0:
-   at 0 the body gets no gradient at all) or by **AttnRes**' pseudo-query
-   mixture (mutually exclusive by construction);
+   at 0 the body gets no gradient at all), by **mHC**'s K-lane Sinkhorn mix,
+   by **AttnRes**' pseudo-query mixture, or by the two TOGETHER (mHC carries
+   the lanes, AttnRes chooses the update `H_post` deposits — "THE
+   COMPOSITION" below);
 7. the readout is `out_proj(h)`, and the final state is the AVERAGE over
    iterations. `L_Rec` — the per-iteration CE through the same `lm_head` — is
    accumulated inside the loop (deep supervision, burn's own shape), which is
@@ -67,11 +69,48 @@ stochastic, Eq. 9's Sinkhorn-Knopp) mixes them, `H_pre` aggregates them into
 the body's input and `H_post` weights the body's output back onto each lane
 (Eq. 3/7/8 — `mhc.py` transcribes the formulas with the burn line citations).
 The readout is the SUM of the lanes (2409.19606 §2.1; the crate's concat is
-its slicing layout, not ours). It replaces the SAME statement as ReZero /
-AttnRes / LOOM, so `config.validate` refuses the pairs. `streams` are
+its slicing layout, not ours). It replaces the SAME statement as ReZero and
+LOOM; it COMPOSES with AttnRes (see "THE COMPOSITION"), so `config.validate`
+refuses only the LOOM/ByteFlow pairs. `streams` are
 replicated from `h0` and `h_ctx` = lanes + `iter_embed[i]` is the crate's
 `x_l` (`mhc-2026-09-30.md` §3.4), so the A/B against ReZero differs in the
 residual operator and nothing else.
+
+THE COMPOSITION (`use_mhc=true, use_attnres=true`, legal since 2026-10-22).
+The two arms act on the SAME statement — the loop-boundary residual write — but
+on different axes: mHC owns the K-lane state (`H_res` mixes it, `H_pre` reads
+it, `H_post` deposits into it), AttnRes owns WHICH UPDATE the write carries.
+The order, one iteration:
+
+1. `x_l = x + e_i` (the crate's `h_ctx`);
+2. `ctx = H_pre x_l` — the K lanes mix down to the body's D-wide input;
+3. the body computes `y = Attn + Engram + MoE` (unchanged);
+4. AttnRes mixes the WRITE UPDATES `u_j` and writes exactly that mixture,
+   `a = Σ_j w_j u_j`, with `w = S·softmax(q_i · RMSNorm(u_j))` (Eq. 1/2/3);
+5. `H_post` deposits it: `x_{l+1} = H_res x_l + H_postᵀ a` (Eq. 3);
+6. the readout is `Σ x_{l+1} / K` (2409.19606 §2.1).
+
+The update set is `S = 2` sources: `u_0 = 0` — the token embedding's update,
+because `H_res x_l` ALREADY carries the embedding (writing it again is the
+double count a residual arm exists to avoid) — and `u_1 = y`, this iteration's
+body. The pseudo-query scores the same tensors that are written (`RMSNorm(u_j)`
+is the key, `u_j` the value), never a pre-mixed state.
+
+**Why `S·softmax` and not Eq. 4's `Σw = 1`.** Eq. 4 is a convex mixture over
+STATES; the composition can only deposit an UPDATE (the state accumulator is
+`H_res`), and over updates the identity member of the family is the SUM. At
+the zero-query init `softmax = 1/S` on every source, so `S·softmax = 1` on
+every source and `a = 0 + y` — exactly the mHC-only write — for ANY number of
+iterations. The departure is only the common scale `S`: the RELATIVE weights
+are the paper's logits, and the softmax still redistributes write mass between
+the two sources as the query trains. The identity is asserted bit-for-bit in
+`tests/test_mhc_attnres.py`, and the two SINGLE-arm paths keep their own
+pinned `state_dict` hashes so the composition cannot perturb them.
+
+The readout above divides by `K` because our lanes are full-width copies of a
+state the paper's `n` lanes re-sum (2409.19606 §2.1; `mhc.py`'s layout note).
+The mHC-ONLY arm keeps its historical unnormalised sum, pinned bit-for-bit by
+`test_mhc.py`; only the composition applies the paper's `1/K`.
 
 RECURRENT DECODE (`recurrent_step`, the inference twin of the segmented path) —
 `decode.recurrent_decode`'s per-byte step: the same body, over ONE position,
@@ -117,19 +156,30 @@ class AttnResSlot(nn.Module):
         self.gain = nn.Parameter(torch.ones(d, device=device))
 
 
-def depth_attend(sources: list[torch.Tensor], slot: AttnResSlot, eps: float) -> torch.Tensor:
-    """The AttnRes mixture: `softmax_i(q_eff · RMSNorm(k_i))` over the sources.
+def depth_attend(
+    sources: list[torch.Tensor], slot: AttnResSlot, eps: float, scale: float = 1.0
+) -> torch.Tensor:
+    """The AttnRes mixture: `scale · softmax_i(q_eff · RMSNorm(k_i))` over the sources.
 
     The score convention is the PAPER's — `q·RMSNorm(k)` with **no `1/√d`**
     (`burn_attnres::ScoreForm::Paper`, the default). The burn side shipped
     `d^-0.5` plus an L2 norm, together a `d`-fold logit compression, both
     silent; the fold `q_eff = γ ⊙ w_l` is fidelity fix F-F7 (the paper's
     affine norm, with its gain).
+
+    `scale` is the composition's identity lever (`loopblock`'s module
+    docstring, "THE COMPOSITION"): the untouched AttnRes arm calls it at its
+    default `1.0`, which is Eq. 4's `Σα = 1` and is SKIPPED so that arm's
+    bits do not move; the mHC+AttnRes write passes `scale = len(sources)`,
+    which at the zero-query init makes every weight exactly `1` and therefore
+    the mixture exactly the residual SUM of the same sources it scored.
     """
     q_eff = slot.gain * slot.query
     keys = torch.stack([_rms_no_gain(s, eps) for s in sources], dim=-2)  # [b,t,S,d]
     scores = (keys * q_eff).sum(-1)  # [b,t,S]
     w = F.softmax(scores, dim=-1)
+    if scale != 1.0:  # not `w * 1.0`: the single-arm path must stay bit-identical
+        w = w * scale
     return (w.unsqueeze(-1) * torch.stack(sources, dim=-2)).sum(-2)
 
 
@@ -348,6 +398,15 @@ class LoopBlock(nn.Module):
         b, t, d = h0.shape
         h = h0
         h0_flat = h0.reshape(b * t, d)
+        #: The COMPOSITION (`use_mhc` + `use_attnres`, module docstring): mHC
+        #: owns the K-lane state, AttnRes owns the update `H_post` deposits.
+        #: A local, not a cached field, so `loop.mhc = None` (the test's way of
+        #: removing one mechanism) cannot leave a stale dispatch behind.
+        compose = self.use_attnres and self.mhc is not None
+        if compose:
+            # Once per window: the spy that says the pair ran at all. The
+            # per-iteration counters below say it ran every iteration.
+            counters.count("mhc_attnres_forward")
         # mHC's K lanes (`mhc.py`): replicated from h0 (2409.19606 §2.1), each
         # the FULL residual width. `None` is the flag-off path, byte-for-byte.
         streams = (
@@ -364,7 +423,10 @@ class LoopBlock(nn.Module):
         #: the list is replaced on every forward.
         hidden: list[torch.Tensor] = []
         ran = 0
-        sources: list[torch.Tensor] = [h0] if self.use_attnres else []
+        # The AttnRes-ONLY history (`[h0]` + every body output). Unused by the
+        # composition, which re-scores two write updates per iteration instead
+        # of the whole depth history: mHC's lanes already hold that history.
+        sources: list[torch.Tensor] = [h0] if self.use_attnres and not compose else []
         new_states: list = []
         for i in range(T):
             counters.count("iter")
@@ -470,7 +532,29 @@ class LoopBlock(nn.Module):
                 counters.count("loom")
                 y = y + _rms_no_gain(y, self.eps) * self.loom_gate[i].view(1, 1, 1)
 
-            if self.use_attnres:
+            if compose:
+                # THE COMPOSITION (module docstring): AttnRes mixes the write
+                # UPDATES — `u_0 = 0` (the embedding's update: H_res already
+                # carries it) and `u_1 = y` (this iteration's body) — and
+                # `H_post` deposits EXACTLY that mixture. The query scores the
+                # same tensors that are written. `scale = 2` is the identity
+                # lever: at the zero-query init every weight is 1, so the
+                # update is `y` and the composition's write is the mHC-only
+                # write bit-for-bit.
+                assert self.mhc is not None, "compose => mhc"
+                counters.count("attnres_write")
+                counters.count("mhc_attnres_write")
+                updates = [torch.zeros_like(y), y]
+                update = depth_attend(
+                    updates, self.attnres[i], self.eps, scale=float(len(updates))
+                )
+                streams = self.mhc(streams, update)
+                # 2409.19606 §2.1: our K full-width lanes re-sum to K times the
+                # state, where the paper's K width-C lanes re-sum to C. The
+                # mHC-ONLY arm keeps its historical unnormalised sum (pinned);
+                # the composition applies the paper's 1/K.
+                h = streams.sum(dim=-2) / self.mhc.n_streams
+            elif self.use_attnres:
                 counters.count("attnres_write")
                 sources.append(y)
                 h = depth_attend(sources, self.attnres[i], self.eps)
