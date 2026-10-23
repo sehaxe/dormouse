@@ -267,6 +267,39 @@ testable and A/B-able (ADR-0017).
       reasoning that rests on it is now confirmed by an independent instrument
       (13.3 % mean GPU utilisation, 79 % of samples ≤5 %).
 
+- [x] P-CSA. port (Python): **compressed, selectable KV memory** as an ADDITIVE
+      branch beside KDA. `model/csa.py` + `use_csa`/`csa_chunk`/`csa_kv_dim`/
+      `csa_topk` on `ModelConfig`. Per `csa_chunk` byte positions ONE shared
+      `k`/`v` (MQA, `csa_kv_dim`), `k = mean_pool(x) @ W_k`, `v = mean_pool(x)
+      @ W_v` on the block's RMS-normed input; each query scores its own `q`
+      against the keys of the STRICTLY EARLIER chunks, keeps top-`csa_topk`,
+      and runs exact softmax attention over them; `W_o` back to `d_model`.
+      Added to KDA's output behind a learned per-iteration `csa_gate` (the
+      `msa_gate` pattern); `use_csa=false` builds nothing (two pinned
+      `state_dict`+logits shas from clean main `d80888d`). Decode appends one
+      entry per finished chunk to a per-iteration ring (`CSAState`, bf16 =
+      2 B/elem, doubling, `DECODE_MAX_CHUNKS=131072`) and refuses LOUDLY past
+      the cap. Memory helper `bytes_per_byte = 2·csa_kv_dim·2 / csa_chunk`:
+      **32 B/byte at kv=64/chunk=8 → 1.0 MiB at 32k, 32 MiB at 1M per layer
+      per iteration slot**, asserted against the actual tensors. Refused
+      LOUDLY: `use_msa` (two sparse branches), `segment_len>0` (half-full chunk
+      at a cut undecided), `use_byteflow` (latent vs byte chunk), `use_kda=false`
+      and `attn_kind='full'`; chunk ∉ {4,8,16,32}, width ∉ {64,128}. Gates
+      `tests/test_csa.py` — 10 gates, each proven by a scratch revert:
+      bit-identical off, both-way causality, strict-causal parity at chunk=1
+      (1.5e-7), W_k/W_v/gate gradients, live top-k, refusals, no host sync,
+      1.0 MiB/32k actual state, ring append/refusal, recurrent state carry.
+      Full CPU suite: 1055 passed / 70 skipped vs main's 1045/70, the only red
+      is the pre-existing wall-clock `test_per_byte_cost_does_not_grow_with_context`
+      under a live training run (green on rerun; `.bulba/memory.md` records it).
+      `scripts/ab_csa.py`: off/csa8/csa16, 3 seeds x 600, `medium`,
+      mix4/web.bin + web_eval.bin, JSONL to `~/logs/ab_csa/`, pre-registered
+      tie on the 512 B window + a `--longctx` 4096-byte held-out BPB table.
+      Written, **NOT run** (the brief forbids training arms). Decode cost,
+      stated: **O(t/chunk) per byte** — at 1M context 131 072 keys × 64 =
+      8.4M MAC + 131k comparisons per position/iteration/layer; the arm is a
+      4k-32k arm, not an O(1) 1M decoder.
+
 ## Critical Files
 
 - `crates/dormouse-core/src/loop_block.rs` (617, in flight)
