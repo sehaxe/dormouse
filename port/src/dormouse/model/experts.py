@@ -241,6 +241,27 @@ else:
 from . import moe_sonic  # the gather-fused forward (`moe_gather = "kernel"`)
 
 
+def _bincount(x: torch.Tensor, minlength: int) -> torch.Tensor:
+    """`torch.bincount` that survives a CUDA-graph capture.
+
+    `torch.bincount` on CUDA is NOT capturable on torch 2.13: its kernel pulls a
+    host-side value and the copy aborts the capture — measured on this box
+    (2026-10-23), a bare `with torch.cuda.graph(g): torch.bincount(a,
+    minlength=9)` raises "Cannot copy between CPU and CUDA tensors during CUDA
+    graph capture unless the CPU tensor is pinned", and the same call inside
+    `_padded_dispatch` is what made a full-step capture (`full_graph`) fail at
+    every MoE shape. This is the same histogram without the host round trip:
+    ONE scatter-add of ones, entirely on device.
+
+    `minlength` must cover the input's whole range — every call site here counts
+    expert ids whose sentinel is already `< minlength` — and an out-of-range id
+    now fails the scatter LOUDLY instead of silently returning a longer array.
+    """
+    out = torch.zeros(minlength, dtype=torch.long, device=x.device)
+    out.scatter_add_(0, x.to(torch.long), torch.ones_like(x, dtype=torch.long))
+    return out
+
+
 def expert_glu(
     act: str,
     g: torch.Tensor,
@@ -965,7 +986,7 @@ class SparseMoE(nn.Module):
         if self.lfb_coef == 0.0 or not self.training:
             return
         with torch.no_grad():
-            counts = torch.bincount(index.reshape(-1), minlength=self.n_experts).float()
+            counts = _bincount(index.reshape(-1), self.n_experts).float()
             self.lfb_counts.add_(counts)
             self.lfb_bias.sub_(self.lfb_coef * torch.sign(self.lfb_counts - self.lfb_counts.mean()))
         counters.count("moe_lfb_updates")
@@ -1039,7 +1060,7 @@ class SparseMoE(nn.Module):
             groups = self.n_experts + 1
         order = torch.argsort(safe, stable=True)
         sorted_ids = safe[order]
-        counts = torch.bincount(sorted_ids, minlength=groups)
+        counts = _bincount(sorted_ids, groups)
         offsets = torch.cumsum(counts, 0) - counts
         pos = torch.arange(n * k, device=index.device) - offsets[sorted_ids]
         if self.capacity == 0:
@@ -1321,7 +1342,7 @@ class SparseMoE(nn.Module):
         flat_w = weight.reshape(-1)
         flat_e = index.reshape(-1)
         if self.topk_mode == "off":
-            counts = torch.bincount(flat_e, minlength=e)
+            counts = _bincount(flat_e, e)
         else:
             # The adaptive width's padding slots go to the SAME sentinel group
             # `_permute` used, or `pos` here would count them and disagree with
@@ -1329,7 +1350,7 @@ class SparseMoE(nn.Module):
             # (a mismatch is an out-of-bounds `index_put`). The sentinel rows are
             # never kept, so their (large) slot numbers are computed, not used.
             flat_e = flat_e.masked_fill(~(weight > 0).reshape(-1), e)
-            counts = torch.bincount(flat_e, minlength=e + 1)
+            counts = _bincount(flat_e, e + 1)
         rows = order[keep]  # flat (token, slot) pairs that survive the cap
         owner = rows // k  # the token each kept row belongs to
         # The padded-bank slot of each sorted row: expert-major, capacity-padded.
@@ -1724,7 +1745,7 @@ class SparseMoE(nn.Module):
         rows = order[keep]
         owner = rows // k
         kept = index.reshape(-1)[rows]
-        counts = torch.bincount(kept, minlength=self.n_experts).to(torch.int32)
+        counts = _bincount(kept, self.n_experts).to(torch.int32)
         offs = torch.zeros(self.n_experts + 1, dtype=torch.int32, device=x.device)
         offs[1:] = torch.cumsum(counts, 0)
         gate_u, up_u, v, gate_s, up_s = self._banks(dt)

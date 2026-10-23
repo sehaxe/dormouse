@@ -1226,6 +1226,42 @@ class TrainConfig:
     #: active capture aborts it). A resume with a different value is refused by
     #: the snapshot drift check — it changes what the optimizer computes.
     opt_graph: bool = False
+    #: CUDA-graph capture of the WHOLE training step (`train/graph.py`'s
+    #: `FullGraph`): forward + backward + the device firewall + `zero_grad` +
+    #: the optimizer stage are recorded once and replayed with ONE launch per
+    #: step. It is the direct attack on the measured 13 886 kernel launches per
+    #: b24 s1024 step (fwd 4 938, bwd 3 843, opt 2 483 + clip), where the CPU
+    #: dispatch time exceeds the GPU time (MFU 2.5%).
+    #:
+    #: **`false` by default and the default path is byte-identical** (gated:
+    #: sha256 of a 5-step `state_dict` + logits from a clean `main` worktree,
+    #: `tests/test_full_graph.py`).
+    #:
+    #: WHAT IT CHANGES, all named here because a reader must know before reading
+    #: a number off it:
+    #:
+    #: * the input batch lives in a STATIC device buffer the loop fills with
+    #:   `copy_` (a rebind would leave the recording pointing at the old rows);
+    #: * every `.grad` is pre-allocated by the eager warmup and zeroed IN PLACE
+    #:   (`set_to_none=False`), so the recording keeps its buffers;
+    #: * the LR is a device tensor filled in place (the `opt_graph` seam);
+    #: * the counters the forward writes are replayed from the capture, so a
+    #:   COUNTED arm does not go silent;
+    #: * the whole step's transients live in a graph-private pool that is
+    #:   PERMANENT for the run — this costs VRAM, and on a card that is full it
+    #:   is refused COUNTED rather than allowed to fault (`graph.py`).
+    #:
+    #: `full_graph` IMPLIES `opt_graph` (the stage is inside it), so setting both
+    #: is refused. Every arm the capture cannot carry is refused LOUDLY before
+    #: the first step, with its reason and its `Escape:` — see
+    #: `train.graph.full_graph_refusal`. The one non-refusal a reader should know
+    #: about: **data-dependent routing is fine** (the MoE top-k is a kernel on
+    #: buffer VALUES, so a replay reads whatever the buffer holds) — what is not
+    #: fine is a PYTHON branch on a routing value, and there is none on the
+    #: training path (`grep` for a host read in `model/` finds `act_quant.py:240`,
+    #: `loopblock.py:576`, `loopblock.py:674` and `engram._forward_host`, each of
+    #: which is a refused arm).
+    full_graph: bool = False
     #: EXPONENTIAL MOVING AVERAGE of the parameters, used at eval/save time.
     #: `0.0` (the default) keeps no shadow at all: every checkpoint/eval/serve
     #: path is the pre-arm one, bit-identical. `0 < d < 1` keeps a shadow of the
@@ -2574,6 +2610,26 @@ def validate_train(tcfg: TrainConfig) -> None:
             f"set is the `dion/cuda_graph.py:231-255` defect with a second way to "
             f"starve it. Escape: opt_graph=false (the eager optimizer), or "
             f"grad_accum=1."
+        )
+    if tcfg.full_graph and tcfg.opt_graph:
+        loud(
+            "full_graph=true with opt_graph=true names TWO captures of one region. "
+            "Escape: full_graph=true alone (it implies the optimizer capture), or "
+            "opt_graph=true alone."
+        )
+    if tcfg.full_graph and tcfg.grad_accum > 1:
+        loud(
+            f"full_graph=true with grad_accum={tcfg.grad_accum}: the accumulation loop "
+            f"is PYTHON (k forwards, a per-micro firewall AND, one group gate), so a "
+            f"capture would record ONE micro-batch and replay it as the group. "
+            f"Escape: grad_accum=1, or full_graph=false."
+        )
+    if tcfg.full_graph and tcfg.torch_compile:
+        loud(
+            "full_graph=true with torch_compile=true: a recompile attempted while a "
+            "CUDA graph capture is active aborts the capture, and `torch.compile` is "
+            "neither needed nor wanted under a graph. Escape: torch_compile=false, or "
+            "full_graph=false."
         )
     if not 0.0 <= tcfg.ema_decay < 1.0:
         loud(
