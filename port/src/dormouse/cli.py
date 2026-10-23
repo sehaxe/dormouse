@@ -613,12 +613,15 @@ def rl_cmd(
     # plain-function footgun, and the option annotation IS the fixture.
     sets: Annotated[list[str], typer.Option("--set", help="override: key=value")] = [],  # noqa: B006
 ) -> None:
-    """RL: the MiMo-style reward and a policy-gradient step on GENERATED tasks.
+    """RL: the MiMo-style reward and a policy-gradient step on verifiable tasks.
 
-    There is no corpus to point at — a step draws its task from
-    `build_tasks(cfg.rl_task_cls, seed, n=cfg.rl_tasks)` — so `--data`/`--eval`
-    do not exist here. The lane's own knobs go through `--set`: `rl_task_cls`,
-    `rl_tasks`, `rl_group`, `rl_budget`, `rl_adv`, and the reward's X/B/A/δ/s/γ.
+    The tasks come from `rl_corpus` (the JSONL `scripts/build_rl_tasks.py`
+    emits) or, when that is empty, from `build_tasks(cfg.rl_task_cls, seed +
+    SFT_TASK_OFFSET, n=cfg.rl_tasks)`. A held-out slice is never trained and is
+    scored `pass@1`/`pass@budget` every `rl_eval_every` steps. `--data`/`--eval`
+    do not exist here. The lane's own knobs go through `--set`: `rl_corpus`,
+    `rl_holdout`, `rl_eval_every`, `rl_band_lo/hi`, `rl_task_cls`, `rl_tasks`,
+    `rl_group`, `rl_budget`, `rl_adv`, and the reward's X/B/A/δ/s/γ.
     """
     from .post.rl_train import rl_train
 
@@ -654,10 +657,17 @@ def rl_cmd(
     per_solved = (
         f"{report['bytes_per_solved']:.1f}" if report["bytes_per_solved"] is not None else "-"
     )
+    held = report.get("eval")
+    held_field = (
+        ""
+        if not held
+        else f" pass@1={held['pass@1']:.3f} pass@budget={held['pass@budget']:.3f}"
+    )
     console.print(
         f"[green]rl done[/] steps={report['steps']} loss={report['loss']:.4f} "
         f"pass={report['pass_rate']:.2f} bytes/solved={per_solved} "
         f"rl_samples={report['rl_samples']:,} nan_skipped={report['nan_skipped']}"
+        f"{held_field}"
     )
 
 
