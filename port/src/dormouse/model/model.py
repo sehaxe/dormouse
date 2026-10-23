@@ -1,4 +1,4 @@
-"""`DormouseModel`: embedding → loop block → RMSNorm → lm_head.
+"""`DormouseModel`: embedding → prelude → loop block → coda → RMSNorm → lm_head.
 
 `crates/dormouse-core/src/model.rs`'s tree, at the port's day-one fidelity:
 the residual stream and the logits are fp32 (the bf16 plan casts at the ARM
@@ -42,6 +42,7 @@ from .halt import HaltHead, halt_loss
 from .jepa import JepaHead
 from .loopblock import LoopBlock
 from .mtp import MTPHead
+from .prelude import UniqueLayer
 from .qat_cache import QuantCache, attach_qat_caches, take_qat_refresh_counts
 from .sigreg import sigreg_loss, stride_sample
 from .tsct import make_projection, set_factor_qat_seed
@@ -51,6 +52,22 @@ class DormouseModel(nn.Module):
     def __init__(self, cfg: ModelConfig, *, device: torch.device | str = "cpu") -> None:
         super().__init__()
         self.cfg = cfg
+        if cfg.use_byteflow and (cfg.prelude_layers or cfg.coda_layers):
+            # The runtime seam's refusal (the same one `config.validate` holds):
+            # Option A builds no loop and returns before the tree below, and
+            # Option B runs the loop over K patch latents — the patcher changes
+            # the sequence mid-model, so a byte-level prelude/coda would either
+            # never run (A) or run on patch states (B). `ModelConfig` is not
+            # validated on the hand-built path, so the check lives here too.
+            loud(
+                f"prelude_layers={cfg.prelude_layers}/coda_layers={cfg.coda_layers} "
+                f"with use_byteflow=true: the byteflow shapes run no byte-level loop "
+                f"to wrap — Option A is a standalone net with no loop at all, and "
+                f"Option B runs this loop over K patch LATENTS, so the sequence "
+                f"length changes mid-model and the unique layers would act on a "
+                f"different sequence than the one they are specified on. Escape: "
+                f"use_byteflow=false, or prelude_layers=0 and coda_layers=0."
+            )
         # JEPA's two runtime refusals (the same shape every aux arm carries):
         # `validate` owns the CLI path, but a hand-built model skips it, and a
         # term with nothing to act on must not be silently dropped (ADR-0019).
@@ -102,7 +119,17 @@ class DormouseModel(nn.Module):
             return
         d = cfg.d_model
         self.embed = nn.Embedding(cfg.vocab, d, device=device)
+        #: The UNIQUE layers outside the shared loop (`prelude.py`, arXiv
+        #: 2610.23036): `N` run once before it, `M` once after it. Empty at the
+        #: defaults (0/0), so no parameter, no RNG draw and no state dict key —
+        #: the off path is the `c8a2ff9` tree bit for bit (`tests/test_prelude.py`).
+        self.prelude = nn.ModuleList(
+            [UniqueLayer(cfg, device=device) for _ in range(cfg.prelude_layers)]
+        )
         self.loop = LoopBlock(cfg, device=device)
+        self.coda = nn.ModuleList(
+            [UniqueLayer(cfg, device=device) for _ in range(cfg.coda_layers)]
+        )
         self.norm = nn.RMSNorm(d, eps=cfg.norm_eps, device=device)
         # burn clamps the HEAD's rank to min(rank, d_model, vocab) explicitly
         # ("a rank above either dimension is not a factorization"); the port
@@ -361,8 +388,25 @@ class DormouseModel(nn.Module):
         breakdown: bool = False,
         segment_len: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """The plain byte-level stack: embedding → loop → RMSNorm → lm_head."""
+        """The plain byte-level stack: embedding → prelude → loop → coda → RMSNorm → lm_head."""
         h0 = self.embed(input_ids)
+        # The prelude: unique layers, once, before the shared loop. The loop's
+        # contract is `[b, t, d_model]` in the embedding's dtype — asserted at
+        # the boundary, not assumed (a prelude that changed the width or the
+        # residual dtype would otherwise fail deep inside the loop's first
+        # projection, far from the flag).
+        for layer in self.prelude:
+            h0 = layer(h0)
+            counters.count("prelude")
+        b_in, t_in = input_ids.shape
+        assert h0.shape == (b_in, t_in, self.cfg.d_model), (
+            f"the loop's input contract is [b, t, d_model] = "
+            f"{(b_in, t_in, self.cfg.d_model)}, got {tuple(h0.shape)}"
+        )
+        assert h0.dtype == self.embed.weight.dtype, (
+            f"the loop's input dtype must be the residual dtype "
+            f"{self.embed.weight.dtype}, got {h0.dtype}"
+        )
         # The HALT HEAD is an INFERENCE mechanism (`halt.py`): a training step
         # runs the scheduled depth, because the head's BCE needs every iteration
         # that step ran. At inference (eval/decode, `model.eval()`) it caps the
@@ -413,6 +457,12 @@ class DormouseModel(nn.Module):
             halt_min_iter=self.cfg.halt_min_iter,
             collect_hidden=self.halt is not None and targets is not None and not pure,
         )
+        # The coda: unique layers, once, after the loop's mean readout. They sit
+        # BEFORE the final norm/head, which stay exactly where they are today
+        # (`embed → prelude → loop ×T → coda → RMSNorm → lm_head`).
+        for layer in self.coda:
+            out = layer(out)
+            counters.count("coda")
         # fp32 logits — the burn rule that fixes `bf16 logits NaN`: the final
         # norm and the head run in fp32 whatever the body computed in.
         hn = self.norm(out)
