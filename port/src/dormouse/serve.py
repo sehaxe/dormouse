@@ -50,6 +50,8 @@ from .model.decode import (
     recurrent_decode,
     recurrent_refusal,
 )
+from .post.agent import ToolCall, parse_turn
+from .train.sft import END, PAD, TOOL_END, Segment, render_conversation
 
 #: The hard ceiling on one reply, in bytes (this model's tokens ARE bytes).
 DEFAULT_MAX_TOKENS = 512
@@ -102,6 +104,115 @@ def assemble(messages: Any) -> bytes:
         loud("messages: no user turn — the model answers an instruction, and there is none")
     instruction = "\n".join([*system, *users[:-1], users[-1]])
     return bytes([TURN_OPEN]) + encode(instruction) + b"\n" + bytes([TURN_ANSWER])
+
+
+# --------------------------------------------------------------------------- tools
+#
+# `tools` is the OpenAI declaration shape; the SERVER does not run anything. It
+# renders the declaration into the prompt, and when the model emits a call it
+# returns it as `tool_calls` — the client executes the tool and sends the result
+# back as a `tool` role message, which `assemble_tools` renders as `0x07`. That
+# is the division of labour the template was extended for: the model must learn
+# to WRITE calls and never to write observations.
+
+
+def tool_schemas(tools: Any) -> dict[str, dict]:
+    """`tools: [...]` (OpenAI) → `name -> parameters schema`, validated loudly."""
+    if not isinstance(tools, list) or not tools:
+        loud("tools: need a non-empty list of {type: function, function: {...}} objects")
+    out: dict[str, dict] = {}
+    for t in tools:
+        if not isinstance(t, dict) or t.get("type") != "function":
+            loud(f"tool {t!r}: expected an object with type 'function'")
+        fn = t.get("function")
+        if not isinstance(fn, dict):
+            loud(f"tool {t!r}: `function` must be an object with a name")
+        name = fn.get("name")
+        if not isinstance(name, str) or not name:
+            loud(f"tool {t!r}: `function.name` must be a non-empty string")
+        params = fn.get("parameters") or {"type": "object", "properties": {}}
+        if not isinstance(params, dict) or params.get("type") != "object":
+            loud(f"tool {name!r}: `parameters` must be a JSON-schema object")
+        if name in out:
+            loud(f"tool {name!r} is declared twice — a call could not be routed")
+        out[name] = params
+    return out
+
+
+def _tools_line(text: str, schemas: dict[str, dict]) -> str:
+    """The tool declarations, in the prompt, in a deterministic order."""
+    lines = ["Tools:"]
+    for name in sorted(schemas):
+        params = schemas[name].get("properties", {})
+        required = set(schemas[name].get("required", ()))
+        args = ", ".join(
+            f"{key}: {params[key].get('type', 'any')}" + ("" if key in required else "?")
+            for key in params
+        )
+        lines.append(f"{name}({args})")
+    return text + "\n" + "\n".join(lines)
+
+
+def assemble_tools(messages: Any, schemas: dict[str, dict]) -> bytes:
+    """`[{role, content, tool_calls}]` → the tool-aware prompt, open assistant turn.
+
+    A `tool` message IS an observation (`0x07`), an assistant message's
+    `tool_calls` are calls (`0x04 name 0x05 args 0x06`), and a plain assistant
+    message closes its turn (`0x03`). The declaration line is appended to the
+    FIRST user turn, so the model is told which names exist.
+    """
+    if not isinstance(messages, list) or not messages:
+        loud('messages: need a non-empty list of {"role", "content"} objects')
+    segments: list[Segment] = []
+    system: list[str] = []
+    declared = False
+    for m in messages:
+        if not isinstance(m, dict):
+            loud(f"message {m!r}: expected an object with role and content")
+        role = m.get("role")
+        content = m.get("content")
+        if role == "system":
+            if not isinstance(content, str):
+                loud("message system: content must be a string")
+            system.append(content)
+            continue
+        if content is not None and not isinstance(content, str):
+            loud(f"message {role}: content must be a string, got {type(content).__name__}")
+        if role == "user":
+            text = "\n".join([*system, content or ""])
+            system = []
+            if not declared:
+                text = _tools_line(text, schemas)
+                declared = True
+            segments.append(Segment("user", text))
+        elif role == "assistant":
+            segments.append(Segment("assistant", content or ""))
+            calls = m.get("tool_calls") or []
+            if not isinstance(calls, list):
+                loud(f"message assistant: tool_calls must be a list, got {type(calls).__name__}")
+            for call in calls:
+                fn = (call or {}).get("function") or {}
+                name, args = fn.get("name"), fn.get("arguments")
+                if not isinstance(name, str) or not name:
+                    loud(f"tool_call {call!r}: `function.name` must be a string")
+                if not isinstance(args, str):
+                    loud(f"tool_call {name!r}: `function.arguments` must be a JSON string")
+                segments.append(Segment("call", name=name, args=args))
+            if not calls:
+                segments.append(Segment("end"))
+        elif role == "tool":
+            segments.append(Segment("observation", content or ""))
+        else:
+            loud(
+                f"message role {role!r}: with `tools` this server accepts system, user, "
+                f"assistant and tool"
+            )
+    if not declared:
+        loud("messages: no user turn — the model answers an instruction, and there is none")
+    # Ending on a `tool` message is the normal continuation case: the prompt opens
+    # a fresh assistant turn (`0x02`) right after the observation, which is the
+    # byte the model wrote next in training.
+    return render_conversation(segments) + bytes([TURN_ANSWER])
 
 
 def load_checkpoint(
@@ -248,6 +359,33 @@ def _generate(state: ServeState, prompt: bytes, n: int, chunk: int = STREAM_BYTE
         yield tail
 
 
+def _tool_turn(
+    state: ServeState, prompt: bytes, n: int, schemas: dict[str, dict]
+) -> tuple[str, ToolCall | None, int]:
+    """ONE tool-aware generation: stop at `0x03`/`0x06`/`0x00`, split out a call.
+
+    A tool turn is generated in one `decode_bytes` call (the same sampler, the
+    same seeded generator as the plain arm) rather than the chunked re-call the
+    stream uses: a call must be parsed as a whole, and one call is already the
+    same byte sequence. `(text, call | None, generated bytes)`.
+    """
+    gen = torch.Generator(device=state.device).manual_seed(state.seed)
+    raw = decode_bytes(
+        state.model,
+        prompt,
+        n,
+        temp=state.temp,
+        device=state.device,
+        generator=gen,
+        stop=frozenset({END, TOOL_END, PAD}),
+    )[len(prompt) :]
+    text, call = parse_turn(raw, schemas, offset=len(prompt))
+    for cutter in (END, PAD):
+        if cutter in text:
+            text = text[: text.index(cutter)]
+    return text.decode("utf-8", "replace"), call, len(raw)
+
+
 def _max_tokens(body: dict, state: ServeState) -> int:
     """`max_tokens`, clamped to the cap with a COUNTED log line."""
     asked = body.get("max_tokens", state.max_tokens_cap)
@@ -325,12 +463,32 @@ def make_handler(state: ServeState) -> type[BaseHTTPRequestHandler]:
                     404,
                     f"unknown model {model_id!r}: this server serves {state.ckpt_name!r}",
                 )
+            schemas = None
+            if body.get("tools"):
+                try:
+                    schemas = tool_schemas(body["tools"])
+                except LoudError as e:
+                    return self._error(400, str(e))
             try:
                 n = _max_tokens(body, state)
-                prompt = assemble(body.get("messages"))
+                prompt = (
+                    assemble_tools(body.get("messages"), schemas)
+                    if schemas is not None
+                    else assemble(body.get("messages"))
+                )
             except LoudError as e:
                 return self._error(400, str(e))
             cid, created = f"chatcmpl-{uuid.uuid4().hex[:24]}", int(time.time())
+            if schemas is not None:
+                # A tool call is one JSON message; an SSE delta has no place for
+                # it, and a silent stop-framed call would be a lie about the shape.
+                if body.get("stream"):
+                    return self._error(
+                        400,
+                        "stream=true with `tools` is not supported yet: a tool "
+                        "call is one message",
+                    )
+                return self._tool_response(prompt, n, schemas, cid, created)
             if body.get("stream"):
                 return self._stream(prompt, n, cid, created)
             try:
@@ -356,6 +514,45 @@ def make_handler(state: ServeState) -> type[BaseHTTPRequestHandler]:
                         "prompt_tokens": len(prompt),
                         "completion_tokens": n,
                         "total_tokens": len(prompt) + n,
+                    },
+                },
+            )
+
+        def _tool_response(
+            self, prompt: bytes, n: int, schemas: dict[str, dict], cid: str, created: int
+        ) -> None:
+            try:
+                text, call, used = _tool_turn(state, prompt, n, schemas)
+            except LoudError as e:
+                return self._error(400, str(e))
+            message: dict[str, Any] = {"role": "assistant", "content": text}
+            if call is not None:
+                message["tool_calls"] = [
+                    {
+                        "id": f"call_{uuid.uuid4().hex[:24]}",
+                        "type": "function",
+                        "function": {"name": call.name, "arguments": call.raw_args},
+                    }
+                ]
+            self._json(
+                200,
+                {
+                    "id": cid,
+                    "object": "chat.completion",
+                    "created": created,
+                    "model": state.ckpt_name,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": message,
+                            "finish_reason": "tool_calls" if call is not None else "stop",
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": len(prompt),
+                        # the bytes this turn actually generated, not the ask
+                        "completion_tokens": used,
+                        "total_tokens": len(prompt) + used,
                     },
                 },
             )

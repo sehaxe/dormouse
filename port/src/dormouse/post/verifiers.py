@@ -35,7 +35,17 @@ from ..instrument import loud
 #: The exec jail's wall clock and CPU limit, in seconds (2602.11210's shape).
 TIMEOUT_S = 5.0
 
-__all__ = ["TIMEOUT_S", "Verdict", "sympy_equivalent", "verify"]
+__all__ = [
+    "SANDBOX_PREAMBLE",
+    "TIMEOUT_S",
+    "SandboxError",
+    "SandboxTimeout",
+    "Verdict",
+    "run_sandbox",
+    "screen_code",
+    "sympy_equivalent",
+    "verify",
+]
 
 
 @dataclass(frozen=True)
@@ -233,3 +243,15 @@ def _answer_matches(expected: str, got: str, match: str) -> bool:
     if match == "regex":
         return re.search(expected, got) is not None
     return got.strip() == expected.strip()
+
+
+# --------------------------------------------------------------------------- the seam
+#
+# `post/agent.py` runs a tool's callable in THIS jail — the same screen, the same
+# child preamble, the same rlimits and cwd — rather than growing a second
+# sandbox that could drift from the verifier's. Public names, one implementation.
+screen_code = _screen_code
+SANDBOX_PREAMBLE = _SANDBOX_PREAMBLE
+run_sandbox = _run_sandbox
+SandboxTimeout = _Timeout
+SandboxError = _SandboxError

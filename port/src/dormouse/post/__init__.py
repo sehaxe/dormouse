@@ -12,6 +12,10 @@ this scale the judge would be the network under training (notes §3.1).
 - [`train_steps`] — the CRR fork-replay advantage over a group.
 - [`rl`] — the MiMo reward, the two advantage arms, the policy-gradient step.
 - [`rl_train`] — the loop: one prompt per step, G rollouts, one step of PG.
+- [`agent`] — the multi-turn rollout: generate, parse a call, run it in the
+  verifier's jail, append the observation, continue (off by default; no import
+  from this `__init__`, so a single-turn lane carries no multi-turn cost).
+- [`agent_rl`] — trajectory-level fork-replay: one weight per supervised span.
 """
 
 from .rl import RLConfig

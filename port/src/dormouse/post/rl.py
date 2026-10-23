@@ -103,6 +103,10 @@ class RLConfig:
     #: The loss normaliser: "prompt-mean" (this lane's rule) or "token-mean" (the
     #: control arm the notes' §4.2 A/B names).
     agg: str = "prompt-mean"
+    #: The counterfactuals a call-bearing turn needs before `agent_rl` believes
+    #: its fork-replay mean. 1 is the floor: with none the "advantage" would be
+    #: the raw pass flag, i.e. the fork estimator silently replaced by another.
+    min_replays: int = 1
 
     def __post_init__(self) -> None:
         if self.quality not in ("thrift", "none"):
@@ -137,6 +141,11 @@ class RLConfig:
             )
         if self.gamma <= 0.0:
             loud(f"RLConfig gamma={self.gamma}: γ is the ramp's exponent, so γ > 0.")
+        if self.min_replays < 1:
+            loud(
+                f"RLConfig min_replays={self.min_replays}: a fork needs at least one "
+                f"replayed continuation (0 would make the advantage the raw pass flag)."
+            )
 
 
 @dataclass(frozen=True)
