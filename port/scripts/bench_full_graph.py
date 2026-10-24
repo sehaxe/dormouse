@@ -28,9 +28,9 @@ busy — nothing measured, so there is no number to quote.
 from __future__ import annotations
 
 import argparse
+import gc
 import sys
 import time
-from functools import partial
 from pathlib import Path
 
 import torch
@@ -50,20 +50,44 @@ SHAPES = {
 }
 LR = 3e-4
 
-#: Set by `--engram-ram` before any arm is built: the production substrate at
-#: b24 s1024, and the arm `full_graph` refuses (its host rows are a D2H in the
-#: forward).
-ENGRAM_RAM = True
+#: `--engram-ram` before any arm is built. OFF by default: it is the one arm
+#: `full_graph` REFUSES (the host table resolves rows with a D2H inside the
+#: forward), so the default substrate is the one both arms can run on. A table
+#: taken with `--engram-ram true` is a different substrate and says so.
+ENGRAM_RAM = False
 
 
-def launches(fn) -> int:
-    """`cudaLaunchKernel` events for one call — the arm's own claim, counted."""
-    from torch.profiler import ProfilerActivity, profile
+class OneStepLaunches:
+    """`cudaLaunchKernel` count for EXACTLY ONE step, not averaged over warmups.
 
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
-        fn()
-        torch.cuda.synchronize()
-    return sum(1 for e in prof.events() if e.name == "cudaLaunchKernel")
+    The trainer logs at the END of a step, so the log callback is a step
+    boundary: entering the profiler on step `k`'s line and leaving on `k+1`'s
+    wraps one whole step and nothing else. `warm`/`steps` are then irrelevant to
+    the count — which the previous `events / (steps + warm)` could not say, and
+    that average is exactly what made a replay invisible (`full_graph` replays
+    ONE launch per step; averaging it over 25 steps reported thousands).
+    """
+
+    def __init__(self, step: int) -> None:
+        self.step = step
+        self.seen = 0
+        self.count: int | None = None
+        self._prof = None
+
+    def __call__(self, line: str) -> None:
+        if not line.startswith("step="):
+            return
+        self.seen += 1
+        from torch.profiler import ProfilerActivity, profile
+
+        if self.seen == self.step:
+            self._prof = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA])
+            self._prof.__enter__()
+        elif self.seen == self.step + 1 and self._prof is not None:
+            self._prof.__exit__(None, None, None)
+            torch.cuda.synchronize()
+            self.count = sum(1 for e in self._prof.events() if e.name == "cudaLaunchKernel")
+            self._prof = None
 
 
 def arm(shape: str, mode: str, *, steps: int, warm: int, reps: int, data: Path):
@@ -93,29 +117,45 @@ def arm(shape: str, mode: str, *, steps: int, warm: int, reps: int, data: Path):
     # switches the Engram to host tables and DELETES `engram.tables`, so a
     # second call on the same object refuses ("no Engram to host") — measured
     # here, and the reason every rep builds its own model.
-    def once(*, timed: bool):
+    def once(*, timed: bool, launches_at: int = 0):
         torch.manual_seed(0)
         model = DormouseModel(run.model, device="cuda")
         stream = ByteStream(data, batch, seq)
+        hook = OneStepLaunches(launches_at) if launches_at else None
+        # The hook rides the trainer's OWN log cadence, so the profiled run logs
+        # every step and the timed runs log none (a log step reads the loss back
+        # to the host — that D2H must not land in a ms/step number).
+        run.train.log_every = 1 if launches_at else 10**9
         t0 = time.perf_counter()
-        rep = train(model, run, stream=stream, device="cuda", log=lambda *a, **k: None)
+        rep = train(
+            model,
+            run,
+            stream=stream,
+            device="cuda",
+            log=(hook if hook is not None else (lambda *a, **k: None)),
+        )
         if timed:
             torch.cuda.synchronize()
         seconds = time.perf_counter() - t0
         del model, stream
+        # The graph's pool is mapped for the GRAPH's life and the graph lives in
+        # `train()`'s frame: a rep that starts before the garbage collector has
+        # dropped it sees the previous pool still reserved and REFUSES the
+        # capture on headroom (measured: rep 1 captures with ~2 GiB free, rep 2
+        # refuses at 140 MiB). Collect FIRST, then release the cached blocks.
+        gc.collect()
         torch.cuda.empty_cache()
-        return seconds, rep
+        return seconds, rep, (hook.count if hook is not None else None)
 
-    # The launch count: one profiled run, divided by its steps (`cudaLaunchKernel`
-    # events are per CALL and one forward is thousands). The first step pays the
-    # autotune, so the column is an upper bound, named as one.
-    profiled = partial(once, timed=False)
-    n = launches(lambda: (profiled(), torch.cuda.synchronize())) // (steps + warm)
+    # ONE step's launch count, profiled in a separate (untimed) run at a step
+    # that is a REPLAY for the graph arms (`warm` = the arm's own warmup, so
+    # step 10 is past the capture at step 6).
+    n = once(timed=False, launches_at=steps // 2 + warm)[2]
     times: list[float] = []
     rep = None
     for _ in range(reps):
         torch.cuda.synchronize()
-        seconds, rep = once(timed=True)
+        seconds, rep, _ = once(timed=True)
         times.append(seconds * 1e3 / (steps + warm))
     ms = min(times)
     return ms, n, rep
@@ -128,7 +168,7 @@ def main() -> int:
     ap.add_argument("--warm", type=int, default=2)
     ap.add_argument("--reps", type=int, default=5)
     ap.add_argument("--modes", default="eager,opt_graph,full_graph")
-    ap.add_argument("--engram-ram", default="true", choices=("true", "false"))
+    ap.add_argument("--engram-ram", default="false", choices=("true", "false"))
     ap.add_argument("--reps-alias", help=argparse.SUPPRESS)
     args = ap.parse_args()
     global ENGRAM_RAM
@@ -140,7 +180,11 @@ def main() -> int:
     data = Path("/tmp/opencode/bench_full_graph_bytes.bin")
     if not data.is_file():
         data.write_bytes(bytes(range(256)) * 240_000)  # 61 MB: 24*1025*20 steps fits
-    print(f"\n--- {args.shape} (steps={args.steps} reps={args.reps}) ---", flush=True)
+    print(
+        f"\n--- {args.shape} (steps={args.steps} reps={args.reps} "
+        f"engram_ram={ENGRAM_RAM}) ---",
+        flush=True,
+    )
     print(f"{'arm':>11s} {'ms/step':>9s} {'bytes/s':>12s} {'launches/step':>14s}  note")
     batch, seq = SHAPES[args.shape]
     bytes_per_step = batch * seq

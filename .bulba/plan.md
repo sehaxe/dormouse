@@ -378,34 +378,69 @@ testable and A/B-able (ADR-0017).
       with it — so NO capture of a training step could complete at ANY MoE
       shape. `experts._bincount` is the same histogram as one device
       scatter-add; `tests/test_full_graph.py::test_bincount_aborts_a_capture_and_the_replacement_does_not`
-      is red on revert. A SECOND non-capturable op remains inside
-      `SparseMoE._dispatch` (all three kernels fail; stubbing `_dispatch`
-      captures, stubbing `_permute`/`_banks`/`_gather_rows` does not localize
-      it yet) — `full_graph` therefore COUNTED-falls back to eager and the
-      `opt_graph`/`full_graph` rows of the table are the eager numbers.
+      is red on revert.
+      **The SECOND blocker, found and fixed 2026-10-24 (`capturable` lane):**
+      `order[keep]` — a BOOLEAN-mask index — inside `SparseMoE._padded_dispatch`
+      (`model/experts.py:1354` and `:1359`) and in the triton/gather/naive arms
+      (`:1745`, `:1837`, `:1397`). A bool mask is `nonzero` underneath: a D2H
+      read AND a kept-row count that changes with the routing, so a graph can
+      neither record it nor replay it correctly. The abort does not name the
+      op — it is `cudaErrorStreamCaptureInvalidated` at the NEXT call — so the
+      diagnosis is a `TorchDispatchMode` log of the last 12 dispatched ops
+      (`port/scripts/probe_capture.py`; per-op table in `probe_ops.py`:
+      bool-mask index, `unique`, `nonzero`, `.tolist()`, `.item()`, `bool(t)`
+      and `repeat_interleave(tensor)` FAIL; `argsort(stable)`, `index_put`,
+      `index_add_`, `bincount`-as-scatter, `bmm`, `cumsum` capture).
+      **The fix is shape-static rows, not an op swap:** the padded arm keeps
+      ALL `n·k` assignments, sends a dropped one to one dump slot
+      (`e·cap`, sliced off before the bmm so the expert pass keeps its exact
+      `[e,cap,d]` shape) and multiplies it by the constant 0 mask — a dropped
+      row adds exactly 0.0 to the scatter and 0 to both gradients, which is the
+      eager semantics, not an approximation. Still bit-identical, measured where
+      it matters: the default path's pinned 5-step sha is unchanged, the padded
+      arm vs the naive reference is 0.0 (bf16) / 1.2e-6 (fp32) max-abs, and the
+      first replay vs the arm's OWN eager program is 1.5e-8 (fp32 ulp).
+      The other three arms are built on the ragged count itself (`offs`, the
+      per-expert `unique().tolist()` loop, the gather ABI's permuted rows), so
+      `full_graph_refusal` REFUSES them LOUDLY with the escape (moe_kernel
+      'padded' + moe_capacity>0 + moe_gather 'off') instead of failing mid
+      capture — one refusal per arm, 4 gates.
+      `FullGraph.capture` also needed torch's stale-stream override: the
+      LAST WARMUP step's `AccumulateGrad` node still refers to the DEFAULT
+      stream, and autograd refuses to `cudaStreamWaitEvent` on stream 0 inside
+      a capture (`RuntimeError ... stale reference to the default stream`).
+      `torch.autograd.graph.set_override_stale_capture_stream(True)` around the
+      one capture redirects it to the capturing stream; reverted to the
+      documented process-initial `False` afterwards.
       `opt_graph`'s "+0 at b8 s512" was not a graph result either: the capture
       was REFUSED for a month because `loop.residual_scale` gets no gradient
       under `use_mhc` (the reverted `a10f455`), and the trainer now excludes a
       structurally dead parameter COUNTED (`opt_graph_frozen`) while
       `_check_participants` catches a real per-step starvation. Captures now
       `empty_cache()` and refuse COUNTED below `max(384 MiB, 8% of VRAM)` of
-      headroom with the numbers — at b24 s1024 the run leaves 68-250 MiB and the
-      optimizer stage's pool is a measured 88-592 MiB, so that shape REFUSES
-      instead of faulting.
-      Measured (min of 5 for b8, 3 for b24, one process per arm, 20 steps,
-      `final_byte`, bf16, `muon_state_dtype=bf16`, `ns_dtype=bf16`):
-      b8 s512 eager **234.2 ms / 17 490 B/s / 7 611 launches**, opt_graph
-      **239.6 / 17 097 / 8 365**, full_graph **285.0 / 14 373 / 10 392 (COUNTED
-      fallback)**; b24 s1024 eager **909.3 / 27 027 / 7 614**, opt_graph
-      **887.4 / 27 695 / 10 315 (COUNTED: 68 MiB free)**, full_graph refused
-      (`engram_ram`). **The graph removes no launches here and full_graph does
-      NOT beat eager** — it cannot capture yet, and the box's launch count is
-      7.6-7.7k, not the reported 13 886 (different attention arm and substrate).
-      Gates `port/tests/test_full_graph.py` (20; `full_graph=false` sha256 of
+      headroom with the numbers.
+      Measured 2026-10-24 (min of 5 for b8, 3 for b24, one process per arm, 20
+      timed steps + 2 warm, `final_byte`, bf16, `muon_state_dtype=bf16`,
+      `ns_dtype=bf16`, `engram_ram=false`, `PYTORCH_CUDA_ALLOC_CONF=
+      expandable_segments:True`; launches counted over ONE step, not averaged):
+      b8 s512 eager **215.5 ms / 19 010 B/s / 7 236 launches**, full_graph
+      **210.6 / 19 450 / 8** — the whole step (fwd+bwd+firewall+zero_grad+
+      optimizer) really is one replay; b24 s1024 eager **819.4 / 29 992 /
+      7 239**, full_graph **COUNTED-refused** (190 MiB free vs 1 275 needed;
+      a FORCED capture OOMs at a 96 MiB allocation with 126 MiB free — the
+      eager step's own peak is 14.8 of 15.6 GiB, so a whole-step pool cannot be
+      mapped on this card). **The graph removes 7 228 of 7 236 launches and buys
+      2.3% of a step**, so on this box CUDA-graph capture is real but is NOT a
+      lever: the port's step is GPU-bound, not host-dispatch-bound.
+      Gates `port/tests/test_full_graph.py` (27; `full_graph=false` sha256 of
       the 5-step `state_dict` + logits pinned from a clean `main` worktree,
-      `b36ef27`; the bincount capture gate; the 13 refusals; non-CUDA LOUD
-      before the first step; the b24 s1024 optimiser stage captured + 20
-      replays). Bench `port/scripts/bench_full_graph.py`.
+      `b36ef27`; the bincount gate; the bool-mask capture gate + a replay of a
+      DIFFERENT routing bit-exactly; the 13 + 4 refusals; non-CUDA LOUD before
+      the first step; b24 s1024's optimizer stage captured + 20 replays;
+      `final_byte` b8 s512 captured + 20 replays with no COUNTED fallback; the
+      first replay vs the arm's own eager program at 1e-6). Bench
+      `port/scripts/bench_full_graph.py` (`--modes eager,full_graph`,
+      launch count for ONE step).
 
 
 ## Critical Files

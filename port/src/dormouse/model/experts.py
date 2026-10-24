@@ -1351,30 +1351,50 @@ class SparseMoE(nn.Module):
             # never kept, so their (large) slot numbers are computed, not used.
             flat_e = flat_e.masked_fill(~(weight > 0).reshape(-1), e)
             counts = _bincount(flat_e, e + 1)
-        rows = order[keep]  # flat (token, slot) pairs that survive the cap
-        owner = rows // k  # the token each kept row belongs to
+        # EVERY assignment keeps its row here; the cap moves into a MASK. A
+        # `rows = order[keep]` compression is `nonzero` on the device, i.e. a
+        # D2H read and a row count that changes with the routing — neither is
+        # legal in a CUDA graph (measured: `t[mask]` aborts a capture, and a
+        # graph replays the FIRST call's shapes). `n · k` assignments is the
+        # static bound, and a dropped row is routed to one dump slot that no
+        # kept row can own (`e·cap`) and multiplied by the constant 0 mask, so
+        # it contributes exactly 0.0 to the scatter and exactly 0 to both
+        # gradients — the eager semantics, not an approximation of them.
+        owner = order // k  # the token each assignment belongs to
         # The padded-bank slot of each sorted row: expert-major, capacity-padded.
         starts = torch.cumsum(counts, 0) - counts
-        pos = torch.arange(n * k, device=index.device) - starts[flat_e[order]]
-        kept_slots = (flat_e[order] * cap + pos)[keep]
+        eid = flat_e[order]
+        pos = torch.arange(n * k, device=index.device) - starts[eid]
+        dump = e * cap
+        slots = torch.where(keep, eid * cap + pos, dump)
         # Zero-filled, not `empty`: a row past capacity is never read, but a
         # zero row keeps the bank finite, and inf-garbage × 0 is NaN in the
         # backward (the spike measured exactly that — `probe_moe_variants.py`).
-        xg = torch.zeros(e * cap, self.d, dtype=dt, device=x.device)
-        xg = xg.index_put((kept_slots,), self._gather_rows(x, owner, dt)).view(e, cap, self.d)
+        xg = torch.zeros(dump + 1, self.d, dtype=dt, device=x.device)
+        xg = xg.index_put((slots,), self._gather_rows(x, owner, dt))
+        # The bank the GEMM sees is EXACTLY the eager `[e, cap, d]` — the dump
+        # row is sliced off, so the expert pass keeps its shape, its kernel and
+        # its bits. Only the lookup needs the extra row, and it gets a constant
+        # zero row (the dumped assignments' output is 0 anyway).
+        bank = xg.narrow(0, 0, dump).view(e, cap, self.d)
 
         gate_u, up_u, v, gate_s, up_s = self._banks(dt)
-        g = torch.bmm(xg, gate_u) * gate_s[:, None, :]
-        u = torch.bmm(xg, up_u) * up_s[:, None, :]
+        g = torch.bmm(bank, gate_u) * gate_s[:, None, :]
+        u = torch.bmm(bank, up_u) * up_s[:, None, :]
         h = F.silu(g) * u if self._glu is None else self._glu(g, u)
-        y = torch.bmm(h, v).reshape(e * cap, self.f)[kept_slots]  # [R, f]
+        y = torch.bmm(h, v).reshape(dump, self.f)
+        y = torch.cat((y, torch.zeros(1, self.f, dtype=dt, device=x.device)))
+        y = y[slots]  # [n·k, f], the dumped rows read the constant zero
         # The router weight is applied in fp32, exactly where the naive path
         # applies it: a bf16 multiply would put a 2^-8 relative step between the
         # two arms that the parity gate could not tell from a wiring error.
+        # `keep` is a bool CONSTANT of the graph, so a dropped row's weight is
+        # exactly 0 and `dL/dw` there is exactly 0 — the eager gradient.
         # ponytail: it may move to rank-space (w ⊙ h before `@ v`, the spike's
         # −8 % on the expert pass) once a b1-shape profile says the [R, f]
         # multiply matters.
-        y = y.to(torch.float32) * flat_w[rows].unsqueeze(-1)
+        w = flat_w[order].unsqueeze(-1) * keep.to(flat_w.dtype).unsqueeze(-1)
+        y = y.to(torch.float32) * w
         out = torch.zeros(n, self.f, dtype=torch.float32, device=x.device)
         out.index_add_(0, owner, y)
         return out

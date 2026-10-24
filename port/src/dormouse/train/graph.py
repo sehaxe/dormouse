@@ -192,6 +192,11 @@ class OptimizerGraph:
     capture policy and nothing about the optimizer's contents.
     """
 
+    #: The arm's name in every message (`_fall_back`, `capture`): the two
+    #: captures share this base class, so a hardcoded prefix made a
+    #: `full_graph` fallback report itself as `opt_graph`.
+    arm = "opt_graph"
+
     def __init__(
         self,
         opt,
@@ -375,10 +380,13 @@ class OptimizerGraph:
                     f"allocator), so the capture would OOM here — and on a card this full "
                     f"an OOM lands either inside the capture or in the next forward, as "
                     f"the fragmentation the 2026-10-23 b24 s1024 run hit. Measured on this "
-                    f"box: the optimizer stage's pool is 88-592 MiB. Escape: run with "
+                    f"box: the optimizer stage's pool is 88-592 MiB, and a whole-step "
+                    f"pool is larger than the step's own activation peak (measured: the "
+                    f"forced b24 s1024 whole-step capture OOMs at a 96 MiB allocation with "
+                    f"125 MiB free). Escape: run with "
                     f"PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True (measured: what lets "
                     f"the b24 s1024 run survive a pool at all), shrink the batch/sequence, "
-                    f"or opt_graph=false."
+                    f"or {self.arm}=false."
                 )
         return None
 
@@ -392,7 +400,7 @@ class OptimizerGraph:
         torch.cuda.empty_cache()  # before the headroom rule: it must see the truth
         why = self._refusals()
         if why is not None:
-            loud(f"opt_graph: capture refused — {why}")
+            loud(f"{self.arm}: capture refused — {why}")
         torch.cuda.synchronize()
         # The capture's allocations come from a graph-private pool that must be
         # MAPPED from free VRAM, and the step that just ran is still holding the
@@ -503,10 +511,16 @@ class OptimizerGraph:
             if group.get("lr") is tensor:
                 group["lr"] = self._lr_value
         if self.counters is not None:
+            # ONE counter for both arms (`opt_graph_fallback` is the documented
+            # name the log/JSONL schema carries), but the REASON names the arm
+            # that fell back: a `full_graph` run whose log says `opt_graph` is a
+            # reader who cannot tell which of the two captures failed (ADR-0019).
             self.counters.count("opt_graph_fallback")
-            self.counters.why = f"opt_graph: {reason}"  # type: ignore[attr-defined]
+            self.counters.why = f"{self.arm}: {reason}"  # type: ignore[attr-defined]
         if self.log is not None:
-            self.log(f"opt_graph: capture failed, staying EAGER for the rest of the run — {reason}")
+            self.log(
+                f"{self.arm}: capture failed, staying EAGER for the rest of the run — {reason}"
+            )
 
     def release(self) -> None:
         """Drop the graph and restart the warmup (the next step re-captures)."""
@@ -633,6 +647,48 @@ def full_graph_refusal(train, model) -> str | None:
             "the same quantized weights. Escape: dense_qat=none and factor_qat=none, or "
             "full_graph=false."
         )
+    # --- the routed MoE: only the capacity-PADDED arm has static rows --------
+    #
+    # Measured 2026-10-24: `order[keep]` (a BOOLEAN-mask index) is `nonzero` on
+    # the device — a D2H read AND a kept-row count that changes with the
+    # routing. Both are illegal in a graph: the capture aborts at the op
+    # (`tests/test_full_graph.py` captures it) and a replay would keep the
+    # first call's shape while the data changed. `_padded_dispatch` now keeps
+    # `n·k` rows and masks the cap, which is why IT can be captured; the other
+    # three arms are built around the ragged kept count itself (`offs`, the
+    # per-expert loop's `unique`, the gather ABI's permuted rows), so they are
+    # refused HERE, loudly, instead of falling back mid-capture.
+    if getattr(model, "moe_topk", 0) > 0:
+        kernel = getattr(model, "moe_kernel", "padded")
+        cap = getattr(model, "moe_capacity", 0.0)
+        gather = getattr(model, "moe_gather", "off")
+        why = None
+        if cap == 0:
+            why = (
+                "moe_capacity=0 (dropless) routes the routed pass to the RAGGED arms, "
+                "whose row count is the capacity's own (there is no cap to pad to)"
+            )
+        elif kernel == "triton":
+            why = (
+                "moe_kernel=triton's grouped GEMM is RAGGED: `offs` and the gathered "
+                "row count come from `order[keep]`, a data-dependent `nonzero`"
+            )
+        elif kernel == "naive":
+            why = (
+                "moe_kernel=naive is a PYTHON loop over `torch.unique(...).tolist()`, "
+                "i.e. a host read and a per-expert row count that changes with routing"
+            )
+        elif gather == "kernel":
+            why = (
+                "moe_gather=kernel's ABI is the PERMUTED (ragged) rows, so its row "
+                "count is `order[keep]`'s"
+            )
+        if why is not None:
+            return (
+                f"the routed MoE arm cannot be captured: {why}. Escape: moe_kernel="
+                f"'padded' with moe_capacity>0 and moe_gather='off' (the only arm whose "
+                f"rows are static), or full_graph=false."
+            )
     return None
 
 
@@ -663,6 +719,8 @@ class FullGraph(OptimizerGraph):
     `invalidate_banks_all`/`invalidate_qat_cache_all` after it (outside the
     region): the expert bank cache and the QAT cache are keyed on it.
     """
+
+    arm = "full_graph"
 
     def __init__(
         self,
@@ -733,8 +791,24 @@ class FullGraph(OptimizerGraph):
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, capture_error_mode=CAPTURE_ERROR_MODE):
-            self.body()
+        # The WARMUP's last backward left an `AccumulateGrad` node referring to
+        # the DEFAULT stream. Capture runs on a side stream, so autograd refuses
+        # to `cudaStreamWaitEvent` on stream 0 — it would pull a non-capturing
+        # stream into the recording — and the capture dies before the first op
+        # (`RuntimeError: ... stale reference to the default stream (stream 0)`).
+        # torch's own switch for exactly this case redirects that node to the
+        # producer's CAPTURING stream, i.e. the accumulation lands inside the
+        # graph, which is where the step's accumulation belongs. Set around this
+        # one capture and restored to its PROCESS-INITIAL value afterwards (the
+        # C++ side exposes no getter; `False` is what torch's own docstring
+        # names as the process initial state, and nothing else in this port sets
+        # it) so a stale stream anywhere else is still the loud error it is today.
+        torch.autograd.graph.set_override_stale_capture_stream(True)
+        try:
+            with torch.cuda.graph(graph, capture_error_mode=CAPTURE_ERROR_MODE):
+                self.body()
+        finally:
+            torch.autograd.graph.set_override_stale_capture_stream(False)
         self._graph = graph
         # The recorded step's own DEVICE counters are recorded too; the HOST ones
         # (`forward`, the arm counters) are Python and stop at capture, so they
