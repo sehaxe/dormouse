@@ -32,19 +32,21 @@ The arm's claims, each with the gate that fails on revert:
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import subprocess
 
 import pytest
 import torch
+from conftest import tiny_cfg
 
 from dormouse.config import TrainConfig, load_run, validate_train
 from dormouse.instrument import LoudError
 from dormouse.model import DormouseModel
-from dormouse.model.experts import _bincount
+from dormouse.model.experts import SparseMoE, _bincount
 from dormouse.train import train
 from dormouse.train.data import ByteStream
-from dormouse.train.graph import OptimizerGraph, full_graph_refusal
+from dormouse.train.graph import FullGraph, OptimizerGraph, full_graph_refusal
 from dormouse.train.optim import MixOptimizer, clip_grads
 
 # --- the pre-arm reference, captured from a CLEAN `main` worktree -----------
@@ -318,3 +320,253 @@ def test_the_b24_s1024_optimizer_stage_replays_20_times(b24_model):
     torch.cuda.synchronize()
     assert graph.reason is None, graph.reason
     torch.cuda.empty_cache()
+
+
+# --- the SECOND blocker: a boolean-mask index is `nonzero` ------------------
+#
+# Measured 2026-10-24: `order[keep]` (a BOOL mask on a device tensor) is
+# `nonzero` underneath — a D2H read, and a kept-row count that changes with the
+# routing, so a graph could neither record it nor replay it. The abort surfaces
+# as `cudaErrorStreamCaptureInvalidated` at the NEXT call (measured: the capture
+# died one op after `aten.index.Tensor @ experts.py:1354`), which is why the
+# `TorchDispatchMode` bisect is `scripts/probe_capture.py`.
+# `_padded_dispatch` now keeps `n·k` rows and moves the cap into a MASK; the
+# three ragged arms are refused by `full_graph_refusal` instead of failing mid
+# capture.
+
+
+def _moe() -> SparseMoE:
+    cfg = tiny_cfg(n_experts=4, moe_topk=2, rank=8, d_model=64, d_ffn=128, bf16=True)
+    return SparseMoE(cfg, device="cuda")
+
+
+def _kept(moe: SparseMoE, x: torch.Tensor) -> torch.Tensor:
+    """The `keep` mask the forward's own router produces for `x`."""
+    probs = torch.softmax(moe.router(x.float()), dim=-1)
+    return moe._permute(probs.topk(moe.topk, dim=-1).indices)[1]
+
+
+@CUDA
+def test_a_boolean_mask_index_aborts_a_capture_and_the_static_rows_do_not():
+    """The op, and the arm that no longer contains it.
+
+    Revert `_padded_dispatch` to `rows = order[keep]` and the capture below
+    raises the same `StreamCaptureInvalidated` the first half pins.
+    """
+    t = torch.arange(4096, device="cuda")
+    mask = torch.rand(4096, device="cuda") > 0.5
+    with pytest.raises(RuntimeError, match="pinned|graph capture|previous error"):
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            t[mask]
+    torch.cuda.synchronize()
+
+    torch.manual_seed(0)
+    moe = _moe()
+    x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
+    x2 = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
+    with torch.no_grad():
+        eager = moe(x)
+        eager2 = moe(x2)
+        keep1, keep2 = _kept(moe, x), _kept(moe, x2)
+    assert not torch.equal(keep1, keep2), "the fixture must route differently"
+
+    g2 = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g2):
+        out = moe(x)
+    g2.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, eager), "the replay must be the eager forward, bit for bit"
+    x.copy_(x2)  # the SAME storage: `fill()`'s contract
+    g2.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, eager2), "the replay must read the LIVE buffer, not the capture's"
+    print(
+        f"[moe capture] dropped rows: pass1={int((~keep1).sum())} "
+        f"pass2={int((~keep2).sum())} -> the replay followed the routing"
+    )
+    torch.cuda.empty_cache()
+
+
+@pytest.mark.parametrize(
+    "model_over, needle",
+    [
+        (dict(moe_capacity=0.0), "dropless"),
+        (dict(moe_kernel="triton"), "RAGGED"),
+        (dict(moe_kernel="naive"), "PYTHON loop"),
+        (dict(moe_gather="kernel"), "PERMUTED"),
+    ],
+)
+def test_full_graph_refuses_the_ragged_moe_arms(model_over, needle):
+    """One refusal per arm, each naming the dynamic row count and its Escape.
+
+    These four are refusals, not fixes, and the reason is the SAME one in all
+    four: the arm is built around the kept-row count (`offs`, the per-expert
+    loop's `unique`, the gather ABI's permuted rows), i.e. a device→host read
+    and a shape that changes with the routing. The padded bank is the arm whose
+    rows are static (`n·k`, cap as a mask).
+    """
+    import dataclasses
+
+    train_cfg, model_cfg = _tiny_pair()
+    model_cfg = dataclasses.replace(model_cfg, moe_topk=2, **model_over)
+    why = full_graph_refusal(train_cfg, model_cfg)
+    assert why is not None, "this arm must be refused"
+    assert needle in why, why
+    assert "Escape:" in why, why
+    assert "moe_kernel='padded'" in why, why
+
+
+# --- the whole step: forward + backward + firewall + optimizer in ONE graph -
+
+_B8S512 = dict(
+    batch=8,
+    seq_len=512,
+    eval=False,
+    log_every=10**9,
+    ckpt_every=10**9,
+    muon_state_dtype="bf16",
+    ns_dtype="bf16",
+    grad_clip=1.0,
+    full_graph=True,
+)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _release_card():
+    """Hand the card back when this module ends.
+
+    The b24 fixture's model and every captured graph are dropped by the garbage
+    collector, and a graph's POOL is mapped for as long as the graph lives — so
+    the next module's `_card_reason` (a 1 GiB threshold in `test_opt_graph`) sees
+    the residue and skips its three GPU gates. Measured: 11 GiB without this,
+    1059 MiB with only the per-test free, under the 1 GiB bar after a collect
+    that runs AFTER the module's fixtures are finalised.
+    """
+    yield
+    _free_gpu()
+
+
+def _free_gpu() -> None:
+    """Release the graph POOL, not just the cache.
+
+    A captured graph's pool is mapped for the GRAPH's life and the graph is
+    dropped by the garbage collector, not by leaving `train()`. Without the
+    collect, the NEXT module on this card sees ~11 GiB still reserved and its
+    GPU gates skip (measured: `test_opt_graph`'s three gates skipped only when
+    these tests ran first).
+
+    The ccBLAS workspaces a capture allocates are HELD for the process's life
+    (`cudaGraphCaptureMode` maps them outside the allocator), +226 MiB measured
+    here — enough to push `test_opt_graph`'s 1 GiB card threshold over and skip
+    three gates that pass on `main`. `_cuda_clearCublasWorkspaces` is torch's
+    own call for exactly this (it runs around its captures); guarded because a
+    CPU-only build need not expose it.
+    """
+    gc.collect()
+    torch.cuda.empty_cache()
+    clear = getattr(torch._C, "_cuda_clearCublasWorkspaces", None)  # noqa: SLF001
+    if clear is not None:
+        clear()
+        torch.cuda.empty_cache()
+
+
+def _final_byte_run(steps: int, **over):
+    ov = dict(_B8S512, steps=steps)
+    ov.update(over)
+    return load_run("final_byte", train_overrides=ov, model_overrides=dict(bf16=True))
+
+
+def _corpus(tmp_path, n: int = 1 << 16):
+    p = tmp_path / "bytes.bin"
+    p.write_bytes(bytes(range(256)) * (n // 256))
+    return p
+
+
+@CUDA
+def test_the_whole_step_captures_and_replays_20_times_at_b8_s512(tmp_path):
+    """`final_byte` b8 s512: 5 eager steps, ONE capture, 20 replays, no fault.
+
+    A COUNTED fallback is the failure this gate exists for: the arm then looks
+    identical from the outside (same loss, same counters) while every step runs
+    eager. Revert either half of the fix — `_padded_dispatch`'s static rows or
+    `FullGraph.capture`'s stale-stream override — and the log carries
+    "full_graph: capture failed, staying EAGER".
+    """
+    run = _final_byte_run(26, log_every=1)
+    torch.manual_seed(0)
+    model = DormouseModel(run.model, device="cuda")
+    logs: list[str] = []
+    report = train(
+        model,
+        run,
+        stream=ByteStream(_corpus(tmp_path), run.train.batch, run.train.seq_len),
+        device="cuda",
+        log=logs.append,
+    )
+    fallback = [ln for ln in logs if "capture failed" in ln]
+    assert not fallback, fallback
+    assert report["steps"] == 26
+    assert torch.isfinite(torch.tensor(report["loss"]))
+    # 20 replays must each read the LIVE batch: identical losses would mean the
+    # graph replayed the capture step's data.
+    losses = [ln for ln in logs if ln.startswith("step=")]
+    tail = {ln.split("loss=")[1].split()[0] for ln in losses[-20:]}
+    print(f"[whole step] {len(losses)} logged steps, {len(tail)} distinct replay losses")
+    assert len(tail) >= 15, f"the replay is not advancing the data: {sorted(tail)}"
+    del model
+    _free_gpu()
+
+
+@CUDA
+def test_the_first_replay_is_the_eager_step(tmp_path, monkeypatch):
+    """Capture vs the arm's OWN eager program, one process, same seed and data.
+
+    `full_graph=false` is not the reference (the arm binds the LR as a device
+    tensor and turns AdamW's `capturable` branch on, so it is a different
+    program by design — measured 2e-7 after ONE step). The reference is the same
+    arm with the capture removed, and the bound is the measured 1.5e-8 fp32 ulp
+    the recording costs: a wrong LR, a stale buffer or a frozen optimizer state
+    would be O(1) here.
+    """
+    data = _corpus(tmp_path)
+
+    def six_steps(capture: bool) -> tuple[dict, str, list[str]]:
+        run = _final_byte_run(6)
+        torch.manual_seed(0)
+        model = DormouseModel(run.model, device="cuda")
+        logs: list[str] = []
+        if not capture:
+            monkeypatch.setattr(
+                FullGraph,
+                "capture",
+                lambda self: (_ for _ in ()).throw(RuntimeError("capture disabled")),
+            )
+        report = train(
+            model,
+            run,
+            stream=ByteStream(data, 8, 512),
+            device="cuda",
+            log=logs.append,
+        )
+        sd = {k: v.detach().float().cpu().clone() for k, v in model.state_dict().items()}
+        loss = f"{report['loss']:.9g}"
+        del model
+        _free_gpu()
+        return sd, loss, logs
+
+    eager_sd, eager_loss, eager_logs = six_steps(capture=True)
+    _free_gpu()
+    graph_sd, graph_loss, graph_logs = six_steps(capture=False)
+    _free_gpu()
+    assert not any("capture failed" in ln for ln in eager_logs), eager_logs
+    assert any("capture failed" in ln for ln in graph_logs), "the reference must be the EAGER arm"
+
+    worst = max(
+        ((a - graph_sd[k]).abs().max().item(), k) for k, a in eager_sd.items()
+    )
+    print(
+        f"[first replay] worst |delta| = {worst[0]:.3e} @ {worst[1]}; "
+        f"loss {eager_loss} vs {graph_loss}"
+    )
+    assert worst[0] <= 1e-6, f"the capture moved the arithmetic: {worst}"
