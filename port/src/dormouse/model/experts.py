@@ -1373,6 +1373,12 @@ class SparseMoE(nn.Module):
         eid = flat_e[order]
         pos = torch.arange(n * k, device=index.device) - starts[eid]
         dump = e * cap
+        if keep is None:
+            # `_permute` always returns a mask; a direct caller may omit it, and
+            # `None` then means "every assignment is kept" (the pre-cap
+            # behaviour), which is the only reading that keeps the two arms'
+            # row sets equal.
+            keep = torch.ones_like(owner, dtype=torch.bool)
         slots = torch.where(keep, eid * cap + pos, dump)
         # Zero-filled, not `empty`: a row past capacity is never read, but a
         # zero row keeps the bank finite, and inf-garbage × 0 is NaN in the
