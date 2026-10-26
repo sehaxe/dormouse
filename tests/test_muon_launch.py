@@ -248,6 +248,7 @@ def test_the_memory_cap_splits_the_batch_without_moving_a_value(monkeypatch):
     assert all(torch.equal(a, b) for a, b in zip(refs, gots, strict=True))
 
 
+@pytest.mark.local_pin
 def test_the_default_step_is_byte_identical_to_clean_main():
     model = shape_model(SHAPES)
     muon = Muon(model.parameters(), lr=1e-3, colrow_3d="colrow")
@@ -279,6 +280,7 @@ def test_the_fallback_step_is_byte_identical_to_clean_main():
     ],
     ids=["default", "fallback"],
 )
+@pytest.mark.local_pin
 def test_the_transcribed_main_step_is_byte_identical_to_the_same_golden(dtype, kwargs, golden):
     """The reference is main, not this branch: if it drifts, the comparison lies."""
     model = shape_model(SHAPES, dtype=dtype)
@@ -295,6 +297,7 @@ def test_the_transcribed_main_step_is_byte_identical_to_the_same_golden(dtype, k
     assert got == golden
 
 
+@pytest.mark.local_pin
 def test_the_mix_arm_is_byte_identical_to_clean_main():
     gen = torch.Generator().manual_seed(0)
     model = nn.Module()

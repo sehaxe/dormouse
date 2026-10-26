@@ -63,6 +63,7 @@ def _mtp_params(model: nn.Module) -> dict[str, nn.Parameter]:
     return {n: p for n, p in model.named_parameters() if n.startswith("mtp.")}
 
 
+@pytest.mark.local_pin
 def test_gate1_mtp_off_reproduces_the_recorded_model_bit_for_bit() -> None:
     model = _build()
     assert model.mtp is None and model.last_mtp is None

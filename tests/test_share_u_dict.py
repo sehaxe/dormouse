@@ -77,6 +77,7 @@ def _forward(model: DormouseModel):
 # --- A. the off path and the alias ------------------------------------------
 
 
+@pytest.mark.local_pin
 def test_a_off_is_bit_identical_and_share_u_is_the_plane_alias() -> None:
     print(f"[gate A] {GOLDEN_PARAMS} params, logits={GOLDEN_LOGITS_SHA[:12]}")
     default = _build()

@@ -430,6 +430,7 @@ def test_gate_a_skip_attn_projects_no_attention_weight(monkeypatch, attn_kind):
     assert not missed, f"non-attention sites the projector never saw: {missed}"
 
 
+@pytest.mark.local_pin
 def test_gate_b_skip_off_is_the_pre_change_forward():
     """`dense_qat_skip_attn=false` IS the measured 3.2733 arm's forward, bit for bit.
 

@@ -58,6 +58,7 @@ def _fixed_batch() -> tuple[torch.Tensor, torch.Tensor]:
     return ids, (ids + 7) % 256
 
 
+@pytest.mark.local_pin
 def test_jepa_off_is_the_pre_change_model_bit_for_bit() -> None:
     """Gate 1: `jepa_weight = 0` builds no head and moves no number."""
     torch.manual_seed(1234)

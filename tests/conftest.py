@@ -166,3 +166,42 @@ def byte_tensor():
         return ids, (ids + 1) % 251
 
     return make
+
+
+# ---------------------------------------------------------------------------
+# Machine pins vs CI
+# ---------------------------------------------------------------------------
+# A "bit-identical to the pre-change tree" gate pins a sha256 of the logits or
+# the state dict. That hash is a property of THIS box's torch build: a
+# different BLAS/kernel selection rounds differently, so the same source prints
+# different bits on another machine. The claim the gate makes is still the one
+# worth making — "the default path did not move" — but it can only be checked
+# where it was captured.
+#
+# `@pytest.mark.local_pin` is that contract: the test runs on the machine that
+# owns the golden and SKIPS in CI, where it would otherwise fail for a reason
+# that has nothing to do with the code. Anything marked here must have a
+# behavioural sibling that does run in CI (parity against a reference computed
+# in-process, a structural assertion, a shape/parameter check) — a marker with
+# no such sibling is hiding a mechanism, not protecting a pin.
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers",
+        "local_pin: golden captured on this box's torch build; skipped in CI",
+    )
+    config.addinivalue_line(
+        "markers",
+        "needs_snapshots: needs the gitignored checkpoints/ snapshots",
+    )
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    import os
+
+    in_ci = os.environ.get("CI", "").lower() in ("1", "true", "yes")
+    if not in_ci:
+        return
+    skip_pin = pytest.mark.skip(reason="local_pin: golden captured on another torch build")
+    for item in items:
+        if item.get_closest_marker("local_pin"):
+            item.add_marker(skip_pin)

@@ -299,6 +299,7 @@ def _logits_sha(logits: torch.Tensor) -> str:
     return hashlib.sha256(logits.detach().cpu().contiguous().numpy().tobytes()).hexdigest()
 
 
+@pytest.mark.local_pin
 def test_the_in_vram_engram_is_bit_identical_to_main():
     """The correction lives on `HostTables`; the VRAM path must not move at all.
 

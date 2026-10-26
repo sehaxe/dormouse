@@ -116,6 +116,7 @@ def _train_steps(model: DormouseModel, steps: int = 3) -> float:
 # --- 1. the OFF arm ---------------------------------------------------------
 
 
+@pytest.mark.local_pin
 def test_off_off_is_bit_identical_to_the_base_commit():
     """(1) Neither flag: the pinned hash of `c8a2ff9`."""
     assert ModelConfig().use_mhc is False and ModelConfig().use_attnres is False
@@ -129,6 +130,7 @@ def test_off_off_is_bit_identical_to_the_base_commit():
 # --- 2. each single arm -----------------------------------------------------
 
 
+@pytest.mark.local_pin
 def test_each_single_arm_keeps_its_pre_composition_hash():
     """(2) mHC-only and AttnRes-only are bit-identical to `c8a2ff9`.
 

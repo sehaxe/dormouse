@@ -15,6 +15,7 @@ version does not.
 
 from __future__ import annotations
 
+import pytest
 import torch
 from conftest import tiny_cfg
 
@@ -74,7 +75,8 @@ def test_invalidation_is_one_build_per_step_not_per_forward():
     assert c is not a, "after invalidation the next call rebuilds exactly once"
 
 
-def test_the_trainer_calls_the_invalidation_every_step(monkeypatch):
+@pytest.mark.local_pin
+def test_the_trainer_calls_the_invalidation_every_step(monkeypatch, tmp_path):
     """The wiring gate: `train()` must clear the cache on every trained step."""
     import dormouse.model.experts as experts
     import dormouse.train.loop as loop_mod
@@ -105,7 +107,7 @@ def test_the_trainer_calls_the_invalidation_every_step(monkeypatch):
         eval=False,
         warmup_tokens=0,
     )
-    run.train.data = "/tmp/opencode/bank_inval_probe.bin"
+    run.train.data = str(tmp_path / "bank_inval_probe.bin")
     torch.manual_seed(0)
     blob = torch.randint(0, 256, (4096,), dtype=torch.uint8).numpy().tobytes()
     with open(run.train.data, "wb") as f:

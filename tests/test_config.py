@@ -92,6 +92,8 @@ def test_dead_snapshot_keys_load_counted_and_do_not_reach_the_config(capsys):
         assert key in err and commit in err
 
 
+@pytest.mark.needs_snapshots
+@pytest.mark.local_pin
 def test_the_dead_list_is_exactly_what_the_committed_snapshots_carry():
     """The list is enumerated from the snapshots, not guessed.
 
@@ -121,6 +123,8 @@ def test_the_dead_list_is_exactly_what_the_committed_snapshots_carry():
                 )
 
 
+@pytest.mark.needs_snapshots
+@pytest.mark.local_pin
 def test_every_snapshot_on_disk_loads():
     """The compat list exists for exactly this: every snapshot resolves.
 
@@ -141,6 +145,8 @@ def test_every_snapshot_on_disk_loads():
         assert isinstance(back, RunConfig)
 
 
+@pytest.mark.needs_snapshots
+@pytest.mark.local_pin
 def test_a_live_non_default_value_survives_the_value_check(capsys):
     """`sw1` was trained 300 000 steps at `act_quant = "int4"` — a LIVE field.
 

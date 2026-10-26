@@ -71,6 +71,7 @@ def _forward(model: DormouseModel):
 # --- A. the off path is today's model ---------------------------------------
 
 
+@pytest.mark.local_pin
 def test_a_share_u_off_is_bit_identical() -> None:
     print(
         f"[gate A] {GOLDEN_PARAMS} params, sd={GOLDEN_SD_SHA[:12]}, logits={GOLDEN_LOGITS_SHA[:12]}"

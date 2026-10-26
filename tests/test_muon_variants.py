@@ -372,6 +372,7 @@ def test_the_eta_hat_scale_is_the_sf_arms_and_the_paper_reads_sqrt_mn():
     )
 
 
+@pytest.mark.local_pin
 def test_the_default_path_is_bit_identical_to_the_pre_change_tree():
     """`muon` is the default and takes the step the captured tree took.
 

@@ -67,6 +67,7 @@ def _logits_sha(logits: torch.Tensor) -> str:
     return hashlib.sha256(logits.detach().cpu().contiguous().numpy().tobytes()).hexdigest()
 
 
+@pytest.mark.local_pin
 def test_off_off_is_bit_identical_to_c8a2ff9():
     """Gate 1: 0/0 adds no parameter, draws no RNG, reads the old bits."""
     threads, precision = torch.get_num_threads(), torch.get_float32_matmul_precision()

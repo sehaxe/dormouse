@@ -699,6 +699,7 @@ def _sha(t: torch.Tensor) -> str:
     return hashlib.sha256(t.detach().contiguous().numpy().tobytes()).hexdigest()
 
 
+@pytest.mark.local_pin
 def test_every_rung_is_bit_identical_to_main_on_the_fixed_fixture():
     """No numerical change on finite inputs: logits AND loss, all seven rungs."""
     from conftest import tiny_cfg

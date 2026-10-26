@@ -115,6 +115,16 @@ LEGACY_DEAD = {
     "src/dormouse/train/device.py": (
         "ships with the `multigpu` lane (device-capability layer); not merged"
     ),
+    "docs/reviews/launch-atlas-2026-10-02": (
+        "the memo is `docs/reviews/launch-atlas-2026-10-02.md`; this reference drops the extension"
+    ),
+    "configs/3b/latentloop.json": (
+        "a config the LatentLoop memo proposes; the 3B lane has no preset in the tree"
+    ),
+    "scripts/engram_ab.sh": (
+        "the Engram A/B driver was never written (the arm lost its A/B on the ratio "
+        "it was meant to test); the memo records it as proposed"
+    ),
     "src/dormouse/train/ns_triton.py": (
         "the Triton NS chain lives in `train/ns_kernels.py`; this name was the "
         "pre-landing placeholder"

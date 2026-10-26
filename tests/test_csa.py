@@ -86,6 +86,7 @@ def _pinned(over: dict) -> str:
 # --- 1. the off switch is bit-identical to main ----------------------------
 
 
+@pytest.mark.local_pin
 def test_gate_1_csa_off_is_bit_identical_to_main():
     got = _pinned({})
     print(f"csa=off sha {got}")

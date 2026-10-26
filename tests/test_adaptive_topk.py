@@ -75,6 +75,7 @@ def _forward(moe: SparseMoE, x: torch.Tensor | None = None) -> tuple[torch.Tenso
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.local_pin
 def test_gate_a_off_arm_is_bit_identical_and_never_calls_the_policy(monkeypatch):
     """The knobs are INERT when the mode is off, and the digest proves it.
 

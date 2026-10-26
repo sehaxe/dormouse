@@ -129,6 +129,7 @@ def _run(tmp_path: Path, corpus: Path | None = None, **over) -> RunConfig:
 # --- gate 1: OFF is main ----------------------------------------------------
 
 
+@pytest.mark.local_pin
 def test_off_is_bit_identical_to_main(tmp_path):
     """`doc_masking=false` moves no tensor: the state, the logits, the batches."""
     assert GOLDEN["fixture"] == {"corpus": "bytes(range(16))*256", "batch": BATCH, "seq": SEQ}

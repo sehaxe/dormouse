@@ -80,6 +80,7 @@ def _shape_model(seed: int = 0) -> nn.Module:
     return mod
 
 
+@pytest.mark.local_pin
 def test_the_default_path_is_byte_identical():
     """`opt_graph=false` (the default) must not have moved — pinned hashes.
 

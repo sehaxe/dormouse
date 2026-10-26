@@ -91,6 +91,7 @@ def _built(label: str, **over):
 
 
 @pytest.mark.parametrize("label,over", [("tiny_tsct", {}), ("tiny_dense", {"use_tsct": False})])
+@pytest.mark.local_pin
 def test_off_path_is_bit_identical_to_main(label, over):
     """Gate 1: the flags are off by default and off is main's tree, byte for byte."""
     want_state, want_logits, want_params = GOLDEN[label]

@@ -114,6 +114,7 @@ def _pre_quantize_factors(model: DormouseModel, kind: str = "ternary") -> int:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.local_pin
 def test_a_none_is_bit_identical_and_owns_no_cache() -> None:
     take_qat_refresh_counts()
     model = _build(share_u_mode="plane")

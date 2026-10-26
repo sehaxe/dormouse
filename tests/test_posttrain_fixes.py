@@ -244,6 +244,7 @@ def test_rl_non_finite_gradient_with_a_finite_loss_is_skipped(monkeypatch, tmp_p
         assert torch.equal(p, b), "a non-finite gradient must not move a weight"
 
 
+@pytest.mark.local_pin
 def test_sft_healthy_three_steps_are_bit_identical_to_main(tmp_path: Path):
     """m3's second gate: the firewall is a `*1.0` / selection identity."""
     run = _sft_run(tmp_path, steps=3, log_every=3)
@@ -256,6 +257,7 @@ def test_sft_healthy_three_steps_are_bit_identical_to_main(tmp_path: Path):
     assert lines[-1].split("loss=")[1].split()[0] == MAIN_SFT_LOSS
 
 
+@pytest.mark.local_pin
 def test_rl_healthy_three_steps_are_bit_identical_to_main(tmp_path: Path):
     """The same identity for the RL loop, through the saved model half."""
     run = _rl_run(tmp_path, steps=3, ckpt_every=3)

@@ -97,6 +97,7 @@ def _info(loop_blocks: int) -> tuple[int, int, int]:
     return total, int(loop.group(1).replace(",", "")), int(extra.group(1).replace(",", ""))
 
 
+@pytest.mark.local_pin
 def test_one_block_is_bit_identical_to_main():
     """Gate 1: `loop_blocks=1` adds no module, no RNG draw, no key."""
     threads, precision = torch.get_num_threads(), torch.get_float32_matmul_precision()
