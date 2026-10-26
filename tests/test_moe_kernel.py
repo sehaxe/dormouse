@@ -1380,3 +1380,26 @@ def bench_b1() -> None:
 if __name__ == "__main__":
     bench_small()
     bench_b1()
+
+
+def test_the_naive_dispatch_keeps_every_row_when_keep_is_none() -> None:
+    """`keep=None` is the dropless route on the CPU reference loop too.
+
+    `_padded_dispatch` was taught this signature; the naive arm still indexed
+    `sorted_ids[keep]` and ANDed the mask, so it raised
+    `TypeError: unsupported operand type(s) for &: 'NoneType' and 'Tensor'` the
+    moment a capacity-0 (dropless) run reached it -- which is the arm
+    `doc_masking` forces. Revert: drop the `keep is None` branch -> this raises.
+    """
+    moe = SparseMoE(tiny_cfg(n_experts=4, moe_topk=2, rank=8, moe_kernel="naive"), device="cpu")
+    x = torch.randn(32, 64)
+    index, weight = _routing(moe, x)
+    order = torch.argsort(index.reshape(-1), stable=True)
+    keep = torch.ones_like(index.reshape(-1), dtype=torch.bool)
+
+    with torch.no_grad():
+        every = moe._naive_dispatch(x, weight, index, order, None, Counters())
+        masked = moe._naive_dispatch(x, weight, index, order, keep, Counters())
+
+    assert every.shape == masked.shape == (32, moe.f)
+    assert torch.equal(every, masked), "keep=None must be the all-rows arm bit for bit"

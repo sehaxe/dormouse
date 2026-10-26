@@ -1427,8 +1427,11 @@ class SparseMoE(nn.Module):
         sorted_ids = index.reshape(-1)[order]
         owner = order // k  # which token each (token, slot) pair belongs to
         out = torch.zeros(n, self.f, dtype=torch.float32, device=x.device)
-        for e in torch.unique(sorted_ids[keep]).tolist():
-            sel = keep & (sorted_ids == e)
+        # `keep=None` is the dropless route: every assignment reaches its expert,
+        # so the selector is the id match alone (the capacity arms pass a mask).
+        ids_in = sorted_ids if keep is None else sorted_ids[keep]
+        for e in torch.unique(ids_in).tolist():
+            sel = (sorted_ids == e) if keep is None else (keep & (sorted_ids == e))
             rows = owner[sel]
             y = self.experts[e](x[rows], glu=self._glu) * flat_w[order[sel]].unsqueeze(-1)
             out.index_add_(0, rows, y)
