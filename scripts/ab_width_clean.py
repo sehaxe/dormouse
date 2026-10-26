@@ -27,7 +27,6 @@ from __future__ import annotations
 import json
 import statistics
 import subprocess
-import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -113,7 +112,12 @@ def main() -> int:
             continue
         m = statistics.mean(v)
         d = m - cm
-        verdict = "ADOPT (tie within bar)" if abs(d) <= bar else ("REJECT (worse)" if d > 0 else "ADOPT (better)")
+        if abs(d) <= bar:
+            verdict = "ADOPT (tie within bar)"
+        elif d > 0:
+            verdict = "REJECT (worse)"
+        else:
+            verdict = "ADOPT (better)"
         print(f"{arm:12s} {len(v):2d} {m:7.4f} {d:+8.4f}  {verdict}")
     (OUT / "verdict.json").write_text(json.dumps(rows, indent=2))
     return 0

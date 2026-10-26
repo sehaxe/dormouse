@@ -33,11 +33,11 @@ import re
 from pathlib import Path
 
 import torch
+from dormouse.train.distributed import parse_capacity, rank_byte_offset
 
 from dormouse.config import ModelConfig, RunConfig, TrainConfig
 from dormouse.model import DormouseModel
 from dormouse.train.data import _windows
-from dormouse.train.distributed import parse_capacity, rank_byte_offset
 from dormouse.train.loop import train
 from dormouse.train.optim import MixOptimizer
 
