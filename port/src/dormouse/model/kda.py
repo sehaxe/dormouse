@@ -349,6 +349,13 @@ class KDAAttention(nn.Module):
         """
         b, t, d = x.shape
         counters = Counters() if counters is None else counters
+        if state is not None and not carry:
+            loud(
+                "kda.forward_state got a non-None `state` with `carry=False`: the "
+                "one-shot call drops the entering state, so the answer would be for a "
+                "different sequence. Escape: carry=True (the segmented path) or "
+                "state=None (this window starts at position 0)."
+            )
         ok, why = fla_status(x.device)
         if ok:
             counters.count("kda_fla")
@@ -421,7 +428,12 @@ class KDAAttention(nn.Module):
             assert ht.shape == want, f"step state {tuple(ht.shape)} != {want}"
             return out.reshape(b, t, d), ht
         counters.count("kda_step_torch")
-        counters.why = why  # type: ignore[attr-defined]
+        counters.why = (  # type: ignore[attr-defined]
+            "grad enabled: fused_recurrent_kda ships no backward, so the torch "
+            "recurrence ran"
+            if ok
+            else why
+        )
         o, ht = _recurrent_step(q, k, v, g, beta, state, self.scale)
         return o.reshape(b, t, d), ht
 
@@ -439,6 +451,13 @@ class KDAAttention(nn.Module):
         see the module docstring for the gradient side), so segment s's state is
         the graph edge into segment s+1.
         """
+        if state is not None and not carry:
+            loud(
+                "kda._fla_path got a non-None `state` with `carry=False`: the "
+                "one-shot arm neither passes `initial_state` nor returns a boundary "
+                "state, so the state would be silently dropped. Escape: carry=True, "
+                "or state=None."
+            )
         from fla.ops.kda import chunk_kda
 
         b, t, d = x.shape

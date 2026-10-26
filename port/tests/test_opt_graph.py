@@ -232,6 +232,73 @@ def test_a_refused_capture_is_counted_and_the_run_stays_eager():
     assert counters["opt_graph_fallback"] == 1 and graph._graph is None
 
 
+def test_a_fallback_restores_the_adamw_capturable_switch():
+    """`_bind_device_lr` flips AdamW onto `capturable=True`; a fallback must undo it.
+
+    On a CUDA box the flip is what makes the captured LR a device read; after a
+    refusal or a failed capture the run is eager again and must be AdamW's
+    NON-capturable branch, or the log's "stayed EAGER" is a different program.
+    The write is simulated here so the gate runs on CPU.
+    """
+    model, opt = _mix()
+    graph = _wrap(opt)
+    group = opt.adamw.param_groups[0]
+    assert not group.get("capturable", False), "the fixture starts on the eager branch"
+    group["capturable"] = True  # what `_bind_device_lr` writes when the params are CUDA
+    graph._fall_back("simulated refusal")
+    assert not group.get("capturable", False), "the capturable branch survived the fallback"
+
+
+def test_frozen_parameters_are_named_not_shape_strings():
+    """`allow_frozen`'s report must name a parameter, not `"0[0] shape (...)"`.
+
+    The old split took the second whitespace field of a `"group {gi}[{i}] shape
+    (...)` message, so the log and the reason named a fragment. The names come
+    from `model.named_parameters()` now; this is the gate on that.
+    """
+    model, opt = _mix()
+    _with_grads(model)
+    name, p = next(iter(model.named_parameters()))
+    p.grad = None
+    graph = _wrap(opt, allow_frozen=True)
+    with pytest.raises(LoudError, match="not on CUDA"):
+        graph.capture()
+    print(f"[frozen] {graph.frozen}")
+    assert graph.frozen == [name], graph.frozen
+
+
+def test_capture_empties_the_cache_once_and_before_the_refusal_decision(monkeypatch):
+    """The headroom rule must read the post-`empty_cache` allocator, once only.
+
+    A second call after `_refusals` (the old code) was both too late for the
+    decision and an extra full-device sweep on every capture attempt. The graph
+    itself is faked: this gate is the CALL ORDER, not a capture.
+    """
+    model, opt = _mix()
+    calls: list[str] = []
+
+    class _FakeGraph:
+        def replay(self) -> None:
+            calls.append("replay")
+
+    class _FakeCtx:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append("empty"))
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: calls.append("sync"))
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", _FakeGraph)
+    monkeypatch.setattr(torch.cuda, "graph", lambda *a, **k: _FakeCtx())
+    graph = _wrap(opt)
+    graph._refusals = lambda: calls.append("decision") or None
+    graph.capture()
+    print(f"[empty_cache] order={calls}")
+    assert calls == ["empty", "decision", "sync", "replay"], calls
+
+
 def test_a_capture_failure_is_counted_with_its_reason():
     """Any exception out of the capture — not just a refusal — is COUNTED."""
     model, opt = _mix()
