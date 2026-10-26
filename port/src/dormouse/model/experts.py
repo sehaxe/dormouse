@@ -802,8 +802,9 @@ class SparseMoE(nn.Module):
                 #: column choice has no gradient, so a selector would be a second
                 #: mechanism; this arm asks whether per-expert subspaces help at
                 #: all. A buffer, not a parameter, and derived from (E, R, rank)
-                #: — non-persistent for the same reason `lfb_bias` is: a resume
-                #: rebuilds it identically instead of trusting a stale one.
+                #: — non-persistent because a resume rebuilds it identically.
+                #: (`lfb_bias` is non-persistent for the opposite reason: it is
+                #: NOT derivable, so it travels in the checkpoint's `moe` section.)
                 self.register_buffer(
                     "share_u_idx",
                     share_u_dict_index(cfg.n_experts, cfg.share_u_rank, cfg.rank),
@@ -825,13 +826,19 @@ class SparseMoE(nn.Module):
         # the softmax probs before the top-k, moved after each routed forward
         # by `-coef·sign(load_e − mean)` WITHOUT gradients. A buffer, never a
         # parameter: the optimizer must not move it, LFB does.
+        # Non-persistent because `state_dict()` is the optimizer/parameter view;
+        # `save_ckpt` writes it per module in the checkpoint's `moe` section and
+        # `load_model_state` restores it. Unlike `lfb_counts` below it is NOT
+        # derivable from anything else, so a resume that lost it would restart
+        # the controller at zero — a different router under the same step count.
         self.lfb_coef = cfg.moe_lb_coef
         self.register_buffer(
             "lfb_bias", torch.zeros(cfg.n_experts, device=device), persistent=False
         )
         # The cumulative routed-count integrator the bias reads (persistent:
         # a resume must keep its controller state or the rebalancer restarts
-        # its memory of where the load went).
+        # its memory of where the load went). This is the input; the bias above
+        # is the output and cannot be reconstructed from it.
         self.register_buffer(
             "lfb_counts", torch.zeros(cfg.n_experts, device=device), persistent=True
         )
