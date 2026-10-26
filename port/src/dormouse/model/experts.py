@@ -1317,7 +1317,7 @@ class SparseMoE(nn.Module):
         weight: torch.Tensor,
         index: torch.Tensor,
         order: torch.Tensor,
-        keep: torch.Tensor,
+        keep: torch.Tensor | None,
     ) -> torch.Tensor:
         """Gather → ONE capacity-padded `[E, cap, ·]` bank pass → weighted scatter.
 
@@ -1494,6 +1494,18 @@ class SparseMoE(nn.Module):
         """
         valid = None if self.topk_mode == "off" else weight > 0
         order, keep, dropped = self._permute(index, valid)
+        n, k = index.shape
+        # `keep=None` = every permuted row survives, and `order[keep]` is then
+        # `order`. Two cases are provably all-True: dropless (`capacity=0` keeps
+        # every row by construction), and a one-token decode (`topk` returns
+        # DISTINCT experts, so no expert gets more than one of the token's k
+        # rows, and the capacity floor is >= 1). Skipping the mask matters
+        # beyond the op: a boolean mask's output LENGTH is a device value, i.e. a
+        # host sync, which a CUDA-graph capture refuses. `topk_mode != "off"` has
+        # zero-weight PADDING slots and always needs the mask; the drop count is
+        # still computed above either way.
+        static = self.topk_mode == "off" and (self.capacity == 0 or n == 1)
+        keep_rows = None if static else keep
         # Count EVERY call: a python `if dropped:` on the device tensor is
         # exactly the sync this counter exists to prevent (caught by the
         # drop-parity test when the tensor stopped being an int). A zero add
@@ -1520,7 +1532,7 @@ class SparseMoE(nn.Module):
             counters.count("moe_gather_fallback")
             counters.why = f"gather: {gwhy}"  # type: ignore[attr-defined]
         if self.capacity == 0:
-            return self._dropless_dispatch(x, weight, index, order, keep, counters)
+            return self._dropless_dispatch(x, weight, index, order, keep, keep_rows, counters)
         notes = [] if gwhy is None else [f"gather: {gwhy}"]
         if self.moe_kernel == "triton":
             why = (
@@ -1543,7 +1555,7 @@ class SparseMoE(nn.Module):
                 counters.count("moe_triton_gemm")
                 return self._expert_pass(
                     lambda: self._triton_dispatch(
-                        x, weight, index, order, keep, fused_bwd=fwhy is None
+                        x, weight, index, order, keep_rows, fused_bwd=fwhy is None
                     ),
                     counters,
                 )
@@ -1557,7 +1569,7 @@ class SparseMoE(nn.Module):
                 counters.why = "; ".join(notes)  # type: ignore[attr-defined]
             counters.count("moe_padded_bmm")
             return self._expert_pass(
-                lambda: self._padded_dispatch(x, weight, index, order, keep), counters
+                lambda: self._padded_dispatch(x, weight, index, order, keep_rows), counters
             )
         counters.count("moe_naive_dispatch")
         counters.why = "; ".join([*notes, why])  # type: ignore[attr-defined]
@@ -1572,6 +1584,7 @@ class SparseMoE(nn.Module):
         index: torch.Tensor,
         order: torch.Tensor,
         keep: torch.Tensor,
+        keep_rows: torch.Tensor | None,
         counters: Counters,
     ) -> torch.Tensor:
         """The `moe_capacity = 0` route: the RAGGED arms, the grouped GEMM first.
@@ -1625,7 +1638,7 @@ class SparseMoE(nn.Module):
             counters.count("moe_triton_gemm")
             return self._expert_pass(
                 lambda: self._triton_dispatch(
-                    x, weight, index, order, keep, dropless=True, fused_bwd=fwhy is None
+                    x, weight, index, order, keep_rows, dropless=True, fused_bwd=fwhy is None
                 ),
                 counters,
             )
@@ -1734,7 +1747,7 @@ class SparseMoE(nn.Module):
         weight: torch.Tensor,
         index: torch.Tensor,
         order: torch.Tensor,
-        keep: torch.Tensor,
+        keep: torch.Tensor | None,
         *,
         dropless: bool = False,
         fused_bwd: bool = True,
@@ -1769,7 +1782,8 @@ class SparseMoE(nn.Module):
         assert moe_kernels is not None, "the triton arm cannot be dispatched without it"
         n, k = index.shape
         dt = self._bank_dtype()
-        rows = order[keep]
+        # `keep=None` = every permuted row survives (a one-token decode).
+        rows = order if keep is None else order[keep]
         owner = rows // k
         kept = index.reshape(-1)[rows]
         counts = _bincount(kept, self.n_experts).to(torch.int32)
