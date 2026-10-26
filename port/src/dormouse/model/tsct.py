@@ -739,10 +739,10 @@ def _e2m1_quant(t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, float]:
     n = t.numel()
     assert n % 16 == 0, f"nvfp4 quantizes blocks of 16, got numel={n}"
     # Global prescale: aim the SMALLEST nonzero block scale at e4m3's min
-    # normal (the largest block scale then lands wherever it lands — e4m3
-    # covers [tiny, 448] = ~16 decades, ample). A power of two moves nothing.
-    float(torch.finfo(torch.float8_e4m3fn).tiny)  # smallest positive
-    min_normal = float(2.0 ** torch.finfo(torch.float8_e4m3fn).min)  # 2^-6
+    # normal. A power of two moves nothing, and e4m3's normal range is
+    # [2^-6, 448] ≈ 4.5 decades, so a block-scale span wider than that still
+    # overflows at the top (the format's limit, not a second level's job).
+    min_normal = float(torch.finfo(torch.float8_e4m3fn).tiny)  # 2^-6
     amaxs = t.float().abs().reshape(-1, 16).amax(dim=1)
     amaxs = amaxs[amaxs > 0]
     if amaxs.numel() == 0:

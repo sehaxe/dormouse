@@ -186,12 +186,16 @@ def attn_format(fmt: str) -> str:
 
 
 def _check(x: torch.Tensor, fmt: str, group: int) -> None:
-    """Float, finite, and a group that tiles the last dim — or LOUD.
+    """Float and a group that tiles the last dim — or LOUD.
 
-    Every message names the cause AND the escape (ADR-0011/ADR-0019). The
-    finite test is the load-bearing one: `max|x|` over a block holding one NaN
-    is NaN, so the scale would be NaN and EVERY element of the tensor would come
-    back NaN with nothing said — a silent corruption with an obvious cause.
+    Every message names the cause AND the escape (ADR-0011/ADR-0019).
+
+    NON-FINITE VALUES ARE NOT CHECKED HERE. An `isfinite(x).all()` is a host
+    read (`bool()` on a device tensor), and this seam runs at every expert
+    activation: ADR-0018 rule 2 bans a per-call sync in the hot path. NaN policy
+    belongs to the training step's NaN firewall (ADR-0019), which owns the loss
+    and gradient gates; a NaN that reaches a quantizer is a firewall bug and
+    shows up on ITS counter, not on a silent D2H read here.
     """
     if fmt not in ACT_FORMATS:
         loud(
@@ -236,14 +240,6 @@ def _check(x: torch.Tensor, fmt: str, group: int) -> None:
             f"non-divisor fails the reshape on the first forward, a long way from "
             f"the flag that set it (act_quant.rs's caller rule). Escape: group=0 "
             f"for one scale per token, or a divisor of {d}."
-        )
-    if not bool(torch.isfinite(x).all()):
-        n_bad = int((~torch.isfinite(x)).sum())
-        loud(
-            f"act_quant {fmt}: {n_bad} non-finite element(s) (inf/NaN). Cause: a "
-            f"block max over a NaN is NaN, so the whole block would quantize to "
-            f"NaN with nothing said. Escape: sanitize the activation upstream "
-            f"(the NaN firewall is the training step's, ADR-0019)."
         )
 
 
