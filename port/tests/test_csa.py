@@ -52,9 +52,12 @@ SEED = 1234
 #: sha256(state_dict keys+bytes | logits bytes), fixture below, seed 1234,
 #: captured from a clean main worktree (`d80888d`) BEFORE this branch existed.
 CSA_OFF_SHA = "beb23f76773c5f63a8b5ed5a549fb3c451174e9f4622c2549246cc63b4d0d318"
-CSA_OFF_ENGRAM_OFF_SHA = "15d1d7df8373ad715f17a95a747d508a530745fa1837224b5bb096a4022ce601"
+CSA_OFF_ENGRAM_OFF_SHA = "ef1c14cc7058d4a9fe10cae1e3efad6822f3fa4aab21cdf564ed23604f90d813"
+#: The Engram-OFF pins moved on 2026-10-26: the dead `mem_dense` (`d²+d`,
+#: 4160 here at d=64) is no longer built with `use_engram=false`. The
+#: Engram-ON pin above did not move.
 #: The causality fixture (engram off, dense MoE) — the same model gate 2 mutates.
-CSA_OFF_CAUSAL_SHA = "e844cc412437cf6637bc3df6478952dbf43c50fdc36d72c66527740a45c5e4ea"
+CSA_OFF_CAUSAL_SHA = "2b3139030d8e46e62ef8ec5dfc5b517cec2ca002abb9db4814d0e19c610f4fb7"
 
 
 def _batch() -> tuple[torch.Tensor, torch.Tensor]:

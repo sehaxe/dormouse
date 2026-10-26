@@ -61,8 +61,11 @@ CSA_ON_FINE_ONLY_SHA = (
     "defb2afec16ed17637447ad5c495fb105e4c382dd7c64e9aacfbaf0d0ec986b6"
 )
 CSA_ON_FINE_ONLY_CAUSAL_SHA = (
-    "9415ca39d4228f42e44b12fe0376953886a2647da8925c4b175723655972f0d1"
+    "5c679b42c30f67d786b66e9d1f4e6f17f25789f60c61e65382dac322d8473e0a"
 )
+#: Moved 2026-10-26: the fixture is `use_engram=false`, which no longer builds
+#: the dead `mem_dense`. `CSA_OFF_SHA`/`CSA_ON_FINE_ONLY_SHA` (Engram on) are
+#: unchanged.
 
 
 def _batch() -> tuple[torch.Tensor, torch.Tensor]:

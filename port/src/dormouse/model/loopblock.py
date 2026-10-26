@@ -277,7 +277,10 @@ class LoopBlock(nn.Module):
         self.moe = SparseMoE(cfg, device=device)
         self.engram = Engram(cfg, device=device) if cfg.use_engram else None
         # The dense half of the memory branch's mixture — the `(1-g)·v_t` term.
-        self.mem_dense = nn.Linear(d, d, device=device)
+        # Built only WITH the branch it feeds: `use_engram=false` never reads
+        # it, so an unconditional build is 1 049 600 dead parameters at d=1024
+        # (no `.grad`, but in `parameters()`, `param_count` and the optimizer).
+        self.mem_dense = nn.Linear(d, d, device=device) if cfg.use_engram else None
         #: The readout (`out_proj_rank`): TSCT at `cfg.rank` by default, or at
         #: the flag's rank when on; the dense rung's full `d×d` becomes a dense
         #: two-stage `d → r → d`. `0` is the projection exactly as before.

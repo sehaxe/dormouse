@@ -56,7 +56,9 @@ SEED = 1234
 #: sha256(state_dict keys+bytes | logits bytes), fixture below, seed 1234,
 #: captured from a clean main checkout (`29510db`) before this arm existed.
 KDA_SHA = "beb23f76773c5f63a8b5ed5a549fb3c451174e9f4622c2549246cc63b4d0d318"
-KDA_ENGRAM_OFF_SHA = "15d1d7df8373ad715f17a95a747d508a530745fa1837224b5bb096a4022ce601"
+KDA_ENGRAM_OFF_SHA = "ef1c14cc7058d4a9fe10cae1e3efad6822f3fa4aab21cdf564ed23604f90d813"
+#: Moved 2026-10-26: `use_engram=false` no longer builds the dead `mem_dense`.
+#: The Engram-ON `KDA_SHA` above is unchanged.
 
 MEDIUM_KDA_PARAMS = 141_910_405
 MEDIUM_FULL_PARAMS = 141_894_021

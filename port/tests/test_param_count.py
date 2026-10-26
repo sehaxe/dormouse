@@ -15,6 +15,9 @@ every module and every shape with no storage behind them.
 
 from __future__ import annotations
 
+import torch
+from conftest import tiny_cfg
+
 from dormouse.config import load_preset
 from dormouse.model import DormouseModel, param_count, table_slots
 
@@ -45,9 +48,9 @@ def arithmetic(cfg) -> dict[str, int]:
         "shared_expert": 2 * (d * sr + sr) + sr * f,
         "down": f * d,  # the single shared write back to the residual width
         "router": d * e,
-        "engram_tables": n_ord * slots * dim,
-        "engram_projs": d * dim + dim * dim + dim * d,  # query, key, value
-        "mem_dense": d * d + d,
+        "engram_tables": n_ord * slots * dim if cfg.use_engram else 0,
+        "engram_projs": (d * dim + dim * dim + dim * d) if cfg.use_engram else 0,
+        "mem_dense": (d * d + d) if cfg.use_engram else 0,
         "out_proj": tsct(d, d, r),
         "iter_embed": cfg.max_iter * d,
         "residual_scale": 1,
@@ -119,6 +122,10 @@ def built(model) -> dict[str, int]:
         # The arm is off: `built` must carry the key so the dict compare holds
         # (arithmetic always emits it, 0 when off).
         out["msa"] = 0
+    # The memory branch's halves exist only WITH the branch (`use_engram`);
+    # arithmetic emits 0 for them, so the dict compare needs the same keys.
+    for key in ("engram_tables", "engram_projs", "mem_dense"):
+        out.setdefault(key, 0)
     return out
 
 
@@ -181,3 +188,48 @@ def test_medium_arithmetic_matches_the_model_and_the_preset():
     assert want["engram_tables"] == 3 * 524288 * 32 == 50_331_648
     # The b1-bet shapes survive the halving: rank-64 experts, topk-2, depth 4.
     assert cfg.rank == 64 and cfg.moe_topk == 2 and cfg.max_iter == 4
+
+
+def test_mem_dense_is_priced_only_with_the_memory_branch():
+    """`use_engram=false` builds no `mem_dense`: the count must follow the tree.
+
+    The 1 049 600 parameters at d=1024 were dead (read only inside the Engram
+    branch) but stayed in `parameters()`, `param_count` and the optimizer's
+    group split. The Engram-ON presets are pinned above and MUST NOT move.
+    """
+    cfg = tiny_cfg(use_engram=False)
+    model = DormouseModel(cfg)
+    want = arithmetic(cfg)
+    assert want["mem_dense"] == 0 and want["engram_tables"] == 0
+    assert built(model) == want
+    assert param_count(model) == sum(want.values())
+    assert not [n for n, _ in model.named_parameters() if "mem_dense" in n]
+
+
+def test_no_engram_leaves_no_parameter_without_a_gradient():
+    """One training step on the shipped no-Engram shape: every remaining
+    parameter is trained. `use_kda=false` isolates the memory branch — the CPU
+    SDPA fallback deliberately does not run `beta_proj` (documented at
+    `kda.py:500`), which is a different, pre-existing arm.
+    """
+    model = DormouseModel(tiny_cfg(use_engram=False, use_kda=False))
+    ids = torch.randint(0, 256, (2, 16))
+    _, loss, _ = model(ids, ids)
+    loss.backward()
+    dead = [n for n, p in model.named_parameters() if p.grad is None]
+    assert dead == [], f"inert parameters with the memory branch off: {dead}"
+
+
+def test_final_patch_ships_without_the_dead_memory_half():
+    """The shipped `use_engram=false` preset: d=1024 used to carry 1 049 600
+    untrained `mem_dense` parameters."""
+    cfg = load_preset("final_patch")
+    assert cfg.use_engram is False
+    model = DormouseModel(cfg, device="meta")
+    assert not [n for n, _ in model.named_parameters() if "mem_dense" in n]
+    assert param_count(model) == FINAL_PATCH_PORT_TOTAL
+
+
+#: `final_patch` after the memory branch stopped building `mem_dense`
+#: (1024² + 1024 = 1 049 600 fewer than the pre-fix tree's 98 003 713).
+FINAL_PATCH_PORT_TOTAL = 96_954_113
