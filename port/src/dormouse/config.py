@@ -279,6 +279,34 @@ class ModelConfig:
     vocab: int = 256
     max_seq_len: int = 512
     max_iter: int = 4
+    #: ---- UNIQUE BLOCKS INSIDE THE LOOP (`model/loopblock.py`) ----
+    #: The number of DISTINCT loop blocks the loop cycles over:
+    #:
+    #:     h = prelude(...)
+    #:     for i in range(max_iter):
+    #:         h = blocks[i % loop_blocks](h, iteration=i)
+    #:     h = coda(...)
+    #:
+    #: `1` (the default) is today's weight-shared loop, bit for bit: no extra
+    #: module is built, no RNG is drawn and no state-dict key appears.
+    #: `loop_blocks=2` at `max_iter=4` runs block 0 on iterations 0/2 and block 1
+    #: on 1/3 — COMPUTE is unchanged, the transformation is not. Each block owns
+    #: its FULL body (controller, KDA, Engram, MoE bank, readout), so the cost is
+    #: ≈ `loop_blocks ×` one block's parameters, which is the depth the loop
+    #: could not buy by iterating one block (`medium`: see
+    #: `tests/test_loop_blocks.py`'s table).
+    #:
+    #: LOOP-LEVEL, deliberately NOT per block (indexed by ITERATION, as today):
+    #: `iter_embed`, the `attnres` pseudo-query slots, and the per-iteration
+    #: gates `msa_gate`/`csa_gate`/`loom_gate`. They describe which pass of the
+    #: loop is running, not which transformation runs it, so block 1 sees the
+    #: same `iter_embed[1]` it would have seen as the only block. mHC's mixing
+    #: matrices ARE per block (each block owns its residual operator); only the
+    #: K-lane STATE is shared across the loop, because it is the loop's state.
+    #: Refused: `< 1`; `> max_iter` (a block that never runs is a config lie);
+    #: `> 1` with `use_byteflow` (Option A builds no loop at all, and Option B
+    #: runs it over K patch latents — an unmeasured state contract).
+    loop_blocks: int = 1
     #: ---- HALT HEAD (`model/halt.py`): learned inference-time stopping ----
     #: λ on the halt BCE. `0.0` (the default) builds NO head and adds no
     #: parameter or compute; a positive weight builds
@@ -922,6 +950,26 @@ class ModelConfig:
                 f"compute `_byte_ce` and never reach the `norm`+`lm_head` exit this "
                 f"term is defined on, so the regulariser would be silently absent. "
                 f"Escape: z_loss=0.0, or use_byteflow=false."
+            )
+        # The loop's DISTINCT-body count. Both bounds are structural, not
+        # measured: the loop selects `i % loop_blocks`, so 1 is the bottom of
+        # the index, and a count above `max_iter` allocates a block that no
+        # iteration can reach (the config-lies defect — parameters with no
+        # forward and no gradient). `max_iter` moves freely, so the pair is
+        # checked here where both are known.
+        if self.loop_blocks < 1:
+            loud(
+                f"loop_blocks={self.loop_blocks}: the loop cycles over "
+                f"`blocks[i % loop_blocks]`, so the count is >= 1 (`1` is today's "
+                f"weight-shared block). Escape: 1..=max_iter={self.max_iter}."
+            )
+        if self.loop_blocks > self.max_iter:
+            loud(
+                f"loop_blocks={self.loop_blocks} > max_iter={self.max_iter}: block "
+                f"{self.max_iter} would never be selected (the loop index is "
+                f"`i % loop_blocks` with i < max_iter), so it would be a parameter "
+                f"tree with no forward and no gradient — a config that lies about "
+                f"the model. Escape: loop_blocks <= max_iter, or raise max_iter."
             )
 
 
@@ -2093,6 +2141,15 @@ def validate(model: ModelConfig) -> None:
             f"leave mhc_streams at its default 2."
         )
     if model.use_byteflow:
+        if model.loop_blocks > 1:
+            loud(
+                f"loop_blocks={model.loop_blocks} with use_byteflow=true: Option A "
+                f"(`compat_armed` false) returns from `DormouseModel` before the "
+                f"model tree is built — there is no loop at all, so blocks 1+ would "
+                f"never run — and Option B runs this loop over K PATCH LATENTS, a "
+                f"different sequence shape whose depth has not been measured with "
+                f"distinct bodies. Escape: use_byteflow=false, or loop_blocks=1."
+            )
         if model.prelude_layers or model.coda_layers:
             loud(
                 f"prelude_layers={model.prelude_layers}/coda_layers="

@@ -1,4 +1,4 @@
-"""`DormouseModel`: embedding → prelude → loop block → coda → RMSNorm → lm_head.
+"""`DormouseModel`: embedding → prelude → loop block(s) → coda → RMSNorm → lm_head.
 
 `crates/dormouse-core/src/model.rs`'s tree, at the port's day-one fidelity:
 the residual stream and the logits are fp32 (the bf16 plan casts at the ARM
@@ -52,6 +52,16 @@ class DormouseModel(nn.Module):
     def __init__(self, cfg: ModelConfig, *, device: torch.device | str = "cpu") -> None:
         super().__init__()
         self.cfg = cfg
+        if cfg.loop_blocks > 1 and cfg.use_byteflow:
+            # The config layer's refusal, held here too because a hand-built
+            # model skips `validate` (the same rule the prelude seam follows).
+            loud(
+                f"loop_blocks={cfg.loop_blocks} with use_byteflow=true: Option A "
+                f"returns before the loop is built (blocks 1+ would never run), "
+                f"and Option B runs this loop over K patch latents — a different "
+                f"sequence shape whose depth has not been measured with distinct "
+                f"bodies. Escape: use_byteflow=false, or loop_blocks=1."
+            )
         if cfg.use_byteflow and (cfg.prelude_layers or cfg.coda_layers):
             # The runtime seam's refusal (the same one `config.validate` holds):
             # Option A builds no loop and returns before the tree below, and
@@ -143,9 +153,21 @@ class DormouseModel(nn.Module):
             [UniqueLayer(cfg, device=device) for _ in range(cfg.prelude_layers)]
         )
         self.loop = LoopBlock(cfg, device=device)
-        self.coda = nn.ModuleList(
-            [UniqueLayer(cfg, device=device) for _ in range(cfg.coda_layers)]
+        #: The DISTINCT bodies inside the loop (`loop_blocks`, `config.py`):
+        #: `self.loop` is body 0 and owns the per-iteration slots; each extra is
+        #: a `body_only` LoopBlock (its own controller/KDA/Engram/MoE bank/
+        #: readout/mHC mixer, no second `iter_embed`/`attnres`/`*_gate` set).
+        #: At `loop_blocks=1` the ModuleList is EMPTY: no parameter, no RNG draw
+        #: and no state-dict key, so the off path is main's tree bit for bit
+        #: (`tests/test_loop_blocks.py` pins the sha256).
+        self.loop_extra = nn.ModuleList(
+            [LoopBlock(cfg, device=device, body_only=True) for _ in range(cfg.loop_blocks - 1)]
         )
+        #: Set on the DRIVER, not passed by every caller: the one-shot forward,
+        #: the segmented path, `recurrent_step` and decode's `_window` all
+        #: resolve `loop._blocks`, so no path can silently run block 0 alone.
+        self.loop._blocks = (self.loop, *self.loop_extra)
+        self.coda = nn.ModuleList([UniqueLayer(cfg, device=device) for _ in range(cfg.coda_layers)])
         self.norm = nn.RMSNorm(d, eps=cfg.norm_eps, device=device)
         # burn clamps the HEAD's rank to min(rank, d_model, vocab) explicitly
         # ("a rank above either dimension is not a factorization"); the port

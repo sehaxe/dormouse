@@ -1,4 +1,16 @@
-"""The weight-shared loop block — one parameter set, `max_iter` iterations.
+"""The loop block — `max_iter` iterations over `loop_blocks` distinct bodies.
+
+`loop_blocks=1` (the default) is the weight-shared loop every number on record
+ran: ONE parameter set, `max_iter` iterations. `loop_blocks=N` (config.py)
+cycles the SAME loop state through `N` DISTINCT bodies — iteration `i` runs
+`blocks[i % N]` — so the loop gains depth from a new transformation, not only
+from more passes of the same one. Each body is a full block (controller, KDA,
+Engram, its own MoE bank, readout, residual operator); the per-ITERATION slots
+(`iter_embed`, `attnres`, `msa_gate`, `csa_gate`, `loom_gate`) belong to the
+driver once, because they name which pass is running, not which body runs it.
+`DormouseModel` builds body 0 as `loop` and the rest as `loop_extra`
+(`body_only`), and points `loop._blocks` at the tuple, so every path —
+one-shot, segmented, recurrent decode — selects the same body per iteration.
 
 Mirrors `crates/dormouse-core/src/loop_block.rs`. One iteration, in order:
 
@@ -207,8 +219,28 @@ def depth_attend(
 
 
 class LoopBlock(nn.Module):
-    def __init__(self, cfg, *, device: torch.device | str = "cpu") -> None:
+    def __init__(
+        self,
+        cfg,
+        *,
+        device: torch.device | str = "cpu",
+        body_only: bool = False,
+    ) -> None:
+        """One loop body. `body_only` drops the LOOP-LEVEL, per-iteration slots.
+
+        `DormouseModel(loop_blocks=N)` builds ONE full block (`loop`, the
+        driver: it owns `iter_embed`/`attnres`/`*_gate` and the loop state) and
+        `N-1` `body_only` blocks (`loop_extra`). A body owns everything its own
+        iteration computes — norm, controller, attention arm, Engram, MoE bank,
+        `mem_dense`, `out_proj`, `residual_scale`, and its own mHC mixer — but
+        not the per-iteration slots: those are indexed by the ITERATION number
+        (`iter_embed[i]`, `attnres[i]`, `msa_gate[i]`, ...), not by the block,
+        so one set on the driver is the whole allocation. Building a second set
+        on every body would allocate `max_iter` slots of which only those with
+        `i % N == block` ever run — the config-lies defect this project refuses.
+        """
         super().__init__()
+        self.body_only = body_only
         d = cfg.d_model
         self.d = d
         self.max_iter = cfg.max_iter
@@ -274,7 +306,8 @@ class LoopBlock(nn.Module):
         self.msa_capacity_ratio = float(getattr(cfg, "msa_capacity_ratio", 0.25))
         if self.msa is not None:
             assert 0.0 < self.msa_capacity_ratio <= 1.0, "msa_capacity_ratio in (0, 1]"
-            self.msa_gate = nn.Parameter(torch.zeros(cfg.max_iter, device=device))
+            if not body_only:
+                self.msa_gate = nn.Parameter(torch.zeros(cfg.max_iter, device=device))
         # CSA (`model/csa.py`): the compressed, SELECTABLE KV memory, also an
         # ADDITIVE branch beside KDA and off by default. One learned gate per
         # iteration slot (the `msa_gate` pattern), shared by the fine top-k and
@@ -282,11 +315,10 @@ class LoopBlock(nn.Module):
         # switched off by training. Built only when the flag is on:
         # `use_csa=false` keeps the parameter tree — and every pinned
         # `state_dict` hash — exactly as it was.
-        self.csa = (
-            CompressedSelectiveAttention(cfg, device=device) if cfg.use_csa else None
-        )
+        self.csa = CompressedSelectiveAttention(cfg, device=device) if cfg.use_csa else None
         if self.csa is not None:
-            self.csa_gate = nn.Parameter(torch.zeros(cfg.max_iter, device=device))
+            if not body_only:
+                self.csa_gate = nn.Parameter(torch.zeros(cfg.max_iter, device=device))
         self.moe = SparseMoE(cfg, device=device)
         self.engram = Engram(cfg, device=device) if cfg.use_engram else None
         # The dense half of the memory branch's mixture — the `(1-g)·v_t` term.
@@ -311,11 +343,13 @@ class LoopBlock(nn.Module):
             self.out_proj = make_projection(
                 d, d, cfg, rank=cfg.out_proj_rank or cfg.rank, device=device
             )
-        self.iter_embed = nn.Parameter(torch.zeros(cfg.max_iter, d, device=device))
+        self.iter_embed = (
+            None if body_only else nn.Parameter(torch.zeros(cfg.max_iter, d, device=device))
+        )
         self.residual_scale = nn.Parameter(torch.ones(1, device=device))
         self.attnres = (
             nn.ModuleList([AttnResSlot(d, device) for _ in range(cfg.max_iter)])
-            if cfg.use_attnres
+            if cfg.use_attnres and not body_only
             else None
         )
         # LOOM (`2610.01153`): one learned scalar per iteration slot on the
@@ -326,15 +360,24 @@ class LoopBlock(nn.Module):
         # and every preset count pinned off it — is exactly today's.
         self.loom = bool(getattr(cfg, "loom", False))
         self.loom_gate = (
-            nn.Parameter(torch.zeros(cfg.max_iter, device=device)) if self.loom else None
+            nn.Parameter(torch.zeros(cfg.max_iter, device=device))
+            if self.loom and not body_only
+            else None
         )
         # mHC (`2512.24880`, `mhc.py`): K full-width residual lanes across the
         # loop, K=2 only (the A/B'd configuration — App. A.1 ships 4, our φ
         # evidence and 2409.19606 Tab. 1's knee are 2). Built only when the flag
-        # is on, so `use_mhc=false` keeps today's parameter tree exactly.
+        # is on, so `use_mhc=false` keeps today's parameter tree exactly. It IS
+        # per block (each body owns the residual operator that deposits its
+        # write); the lane STATE is not — it lives in `_window` across the loop.
         self.mhc = (
             MHCMix(d, cfg.mhc_streams, device=device) if getattr(cfg, "use_mhc", False) else None
         )
+        #: The DISTINCT bodies this driver cycles over (`DormouseModel` sets it
+        #: to `(loop, *loop_extra)`); `None` means this block is the whole loop.
+        #: Read by `_window`, so EVERY caller — one-shot, segmented, recurrent
+        #: decode and prefill — resolves the same body per iteration.
+        self._blocks = None
 
     def forward(
         self,
@@ -469,6 +512,7 @@ class LoopBlock(nn.Module):
         halt_min_iter: int = 1,
         collect_hidden: bool = False,
         loss_mask: torch.Tensor | None = None,
+        blocks: tuple[LoopBlock, ...] | list[LoopBlock] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor], list]:
         """`T` iterations over ONE window — a segment, or the whole sequence.
 
@@ -478,11 +522,21 @@ class LoopBlock(nn.Module):
         (`states` = the per-iteration state entering this window, `drop` = the
         positions of `input_ids` that belong to the window BEFORE this one).
 
+        `blocks` is the DISTINCT body per iteration (`loop_blocks`): iteration
+        `i` runs `blocks[i % len(blocks)]`. `None` resolves `self._blocks` (set
+        by `DormouseModel`), then `(self,)` — so a lone `LoopBlock` keeps
+        today's one-body loop byte for byte. The loop STATE (`h`, the mHC
+        lanes, the AttnRes history) is shared across bodies; only the body's
+        weights change.
+
         `h0`/`input_ids`/`targets` are this window's slice; `input_ids` carries
         `drop` extra LEADING positions when `drop > 0` (see `_memory`).
         Returns `(mean readout, Σ per-iteration mean CE, per-iteration CEs, the
         per-iteration states leaving this window)`.
         """
+        if blocks is None:
+            blocks = self._blocks if self._blocks is not None else (self,)
+        bodies: tuple[LoopBlock, ...] = tuple(blocks)
         b, t, d = h0.shape
         h = h0
         h0_flat = h0.reshape(b * t, d)
@@ -498,9 +552,7 @@ class LoopBlock(nn.Module):
         # mHC's K lanes (`mhc.py`): replicated from h0 (2409.19606 §2.1), each
         # the FULL residual width. `None` is the flag-off path, byte-for-byte.
         streams = (
-            h0.unsqueeze(-2).expand(b, t, self.mhc.n_streams, d)
-            if self.mhc is not None
-            else None
+            h0.unsqueeze(-2).expand(b, t, self.mhc.n_streams, d) if self.mhc is not None else None
         )
         out_acc = torch.zeros_like(h0)
         rec = torch.zeros((), dtype=torch.float32, device=h0.device)
@@ -519,17 +571,21 @@ class LoopBlock(nn.Module):
         for i in range(T):
             counters.count("iter")
             ran = i + 1
+            #: The DISTINCT body for this iteration (`loop_blocks`): the
+            #: weights are per body; the state (`h`, `streams`, `sources`) and
+            #: the per-iteration slots on the driver are the loop's.
+            blk = bodies[i % len(bodies)]
             if streams is not None:
                 # x_l = h_ctx: the iteration embedding joins the LANES, and
                 # H_pre (applied by the caller, `mhc.py`) aggregates them into
                 # the body's input — the crate's `h_ctx` (`mhc-2026-09-30.md`
                 # §3.4), with Eq. 3's H_pre moved out of `forward`.
                 streams = streams + self.iter_embed[i].view(1, 1, 1, d)
-                ctx = self.mhc.pre_mix(streams)
+                ctx = blk.mhc.pre_mix(streams)
                 counters.count("mhc")
             else:
                 ctx = h + self.iter_embed[i].view(1, 1, d)
-            normed = self.norm(ctx)
+            normed = blk.norm(ctx)
             ctrl = torch.cat([ctx.reshape(b * t, d), h0_flat], dim=-1)
             # MAGMA fix: fp32 masters with fp32 activations would run the slow
             # fp32 lane; `mm_mixed` casts to the compute dtype per forward.
@@ -538,25 +594,25 @@ class LoopBlock(nn.Module):
             raw = mm_mixed(
                 ctrl,
                 dense_qat_weight(
-                    self.controller.weight,
-                    self.dense_qat,
-                    self.dense_qat_alpha,
-                    cache=self._qat_cache,
+                    blk.controller.weight,
+                    blk.dense_qat,
+                    blk.dense_qat_alpha,
+                    cache=blk._qat_cache,
                 ),
-                self.compute_dtype,
+                blk.compute_dtype,
                 counters,
             )
             w_attn = torch.sigmoid(raw[:, 0:1])
             w_mem = torch.sigmoid(raw[:, 1:2])
             w_ffn = torch.sigmoid(raw[:, 2:3])
 
-            if self.attn is not None:
+            if blk.attn is not None:
                 # A CSA run carries `(kda_state, csa_state)` per iteration in
                 # `states`; the KDA arm sees only its half.
                 attn_state = None if states is None else states[i]
-                if self.csa is not None and isinstance(attn_state, tuple):
+                if blk.csa is not None and isinstance(attn_state, tuple):
                     attn_state = attn_state[0]
-                attn_out, st = self._attn(
+                attn_out, st = blk._attn(
                     normed,
                     counters,
                     carry,
@@ -566,28 +622,24 @@ class LoopBlock(nn.Module):
                 attn = attn_out.reshape(b * t, d) * w_attn
             else:
                 attn = torch.zeros(b * t, d, dtype=torch.float32, device=h0.device)
-            if self.csa is not None:
+            if blk.csa is not None:
                 prev = None if states is None else states[i]
                 csa_state = prev[1] if isinstance(prev, tuple) else None
                 if recurrent:
-                    csa_out, csa_st = self.csa.step_state(normed, csa_state, counters=counters)
+                    csa_out, csa_st = blk.csa.step_state(normed, csa_state, counters=counters)
                 elif carry:
-                    csa_out, csa_st = self.csa.forward_state(
-                        normed, csa_state, counters=counters
-                    )
+                    csa_out, csa_st = blk.csa.forward_state(normed, csa_state, counters=counters)
                 else:
-                    csa_out, csa_st = self.csa(normed, counters=counters), None
+                    csa_out, csa_st = blk.csa(normed, counters=counters), None
                 # The `msa_gate` pattern: one learned scalar per iteration slot,
                 # times the controller's attention gate, on top of KDA's output.
-                attn = attn + csa_out.reshape(b * t, d) * w_attn * torch.sigmoid(
-                    self.csa_gate[i]
-                )
+                attn = attn + csa_out.reshape(b * t, d) * w_attn * torch.sigmoid(self.csa_gate[i])
                 if carry or recurrent:
-                    assert self.attn is not None, "CSA is additive beside KDA (config refuses)"
+                    assert blk.attn is not None, "CSA is additive beside KDA (config refuses)"
                     st = (st, csa_st)
-            if self.attn is not None:
+            if blk.attn is not None:
                 new_states.append(st)
-            if self.msa is not None:
+            if blk.msa is not None:
                 # The ADAPTIVE share: softmax over the iteration gates × max_iter
                 # = a per-slot share whose MEAN over slots is 1; × the arm's
                 # capacity ratio (the owner's 1/4) it becomes the slot's budget.
@@ -598,32 +650,32 @@ class LoopBlock(nn.Module):
                 if self.adaptive_msa and self.max_iter > 1:
                     share = torch.softmax(self.msa_gate, dim=0) * self.max_iter
                     counters.count("msa_iter_gate")
-                    msa_out = self.msa.forward_k(
+                    msa_out = blk.msa.forward_k(
                         normed, counters, float(share[i].detach()) * self.msa_capacity_ratio
                     )
                     if msa_out is not None:
                         attn = attn + msa_out.reshape(b * t, d) * w_attn * share[i]
                 else:
-                    msa_out = self.msa(normed, counters=counters)
+                    msa_out = blk.msa(normed, counters=counters)
                     if msa_out is not None:
                         attn = attn + msa_out.reshape(b * t, d) * w_attn
 
-            if self.engram is not None and input_ids is not None:
-                mem = self._memory(normed, input_ids, drop, counters).reshape(b * t, d)
+            if blk.engram is not None and input_ids is not None:
+                mem = blk._memory(normed, input_ids, drop, counters).reshape(b * t, d)
                 dense = (
                     (
                         mm_mixed(
                             normed.reshape(b * t, d),
                             dense_qat_weight(
-                                self.mem_dense.weight,
-                                self.dense_qat,
-                                self.dense_qat_alpha,
-                                cache=self._qat_cache,
+                                blk.mem_dense.weight,
+                                blk.dense_qat,
+                                blk.dense_qat_alpha,
+                                cache=blk._qat_cache,
                             ),
-                            self.compute_dtype,
+                            blk.compute_dtype,
                             counters,
                         )
-                        + self.mem_dense.bias.to(self.compute_dtype)
+                        + blk.mem_dense.bias.to(blk.compute_dtype)
                     )
                     .to(torch.float32)
                     .reshape(b * t, d)
@@ -632,7 +684,7 @@ class LoopBlock(nn.Module):
             else:
                 branch = torch.zeros(b * t, d, dtype=torch.float32, device=h0.device)
 
-            ffn = self._moe_branch(normed, counters) * w_ffn
+            ffn = blk._moe_branch(normed, counters) * w_ffn
             y = (attn + branch + ffn).reshape(b, t, d)
 
             if self.loom:
@@ -654,34 +706,32 @@ class LoopBlock(nn.Module):
                 # lever: at the zero-query init every weight is 1, so the
                 # update is `y` and the composition's write is the mHC-only
                 # write bit-for-bit.
-                assert self.mhc is not None, "compose => mhc"
+                assert blk.mhc is not None, "compose => mhc"
                 counters.count("attnres_write")
                 counters.count("mhc_attnres_write")
                 updates = [torch.zeros_like(y), y]
-                update = depth_attend(
-                    updates, self.attnres[i], self.eps, scale=float(len(updates))
-                )
-                streams = self.mhc(streams, update)
+                update = depth_attend(updates, self.attnres[i], self.eps, scale=float(len(updates)))
+                streams = blk.mhc(streams, update)
                 # 2409.19606 §2.1: our K full-width lanes re-sum to K times the
                 # state, where the paper's K width-C lanes re-sum to C. The
                 # mHC-ONLY arm keeps its historical unnormalised sum (pinned);
                 # the composition applies the paper's 1/K.
-                h = streams.sum(dim=-2) / self.mhc.n_streams
+                h = streams.sum(dim=-2) / blk.mhc.n_streams
             elif self.use_attnres:
                 counters.count("attnres_write")
                 sources.append(y)
                 h = depth_attend(sources, self.attnres[i], self.eps)
-            elif self.mhc is not None:
+            elif blk.mhc is not None:
                 # Eq. 3's residual: H_res x_l + H_postᵀ F(H_pre x_l). The
                 # readout is the SUM of the lanes (2409.19606 §2.1); the crate's
                 # concat is its D/n-slicing layout, not this one (`mhc.py`).
-                streams = self.mhc(streams, y)
+                streams = blk.mhc(streams, y)
                 h = streams.sum(dim=-2)
             else:
                 counters.count("rezero_write")
-                h = ctx + y * self.residual_scale
+                h = ctx + y * blk.residual_scale
 
-            step_out = self.out_proj(h.reshape(b * t, d)).reshape(b, t, d)
+            step_out = blk.out_proj(h.reshape(b * t, d)).reshape(b, t, d)
             out_acc = out_acc + step_out
             if collect_hidden:
                 hidden.append(step_out)
@@ -774,9 +824,7 @@ class LoopBlock(nn.Module):
         which is the same defect as sharing one hidden state across them.
         """
         assert self.attn is not None
-        assert not (
-            self.attn_kind == "full" and (recurrent or carry)
-        ), (
+        assert not (self.attn_kind == "full" and (recurrent or carry)), (
             "attn_kind='full' with a state-carrying attention call "
             f"(recurrent={recurrent}, carry={carry}): exact attention has no O(1) "
             "boundary state — segment_len would have to carry every preceding "
