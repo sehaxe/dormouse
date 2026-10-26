@@ -1262,6 +1262,7 @@ def train(
             f"capture and freeze the WSD schedule), and zero_grad runs "
             f"set_to_none=False so the captured ops keep their pinned .grad buffers."
         )
+
     def micro_step(x, y, kw, n_micro: int, first: bool):
         """ONE micro-batch: forward + the DEVICE firewall + backward + the gate.
 

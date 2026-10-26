@@ -365,8 +365,7 @@ def ab(args: argparse.Namespace) -> int:
         f"a tie keeps the flat control. Verdict: {v['verdict'].upper()} "
         f"(control {v['control_mean']:.4f} +- {v['control_spread']:.4f}, "
         f"on {v['arm_mean']:.4f} +- {v['arm_spread']:.4f}, "
-        f"delta {v['delta']:+.4f})"
-        + (f"\nvoid reasons: {v['reason']}" if v["reason"] else "")
+        f"delta {v['delta']:+.4f})" + (f"\nvoid reasons: {v['reason']}" if v["reason"] else "")
     )
     print(
         f"step time (reported, NOT folded into the BPB rule): median "

@@ -256,9 +256,7 @@ class HostTables:
             # Dividing the BLOCK by it (not `m` alone) is the correction of the
             # quantity actually applied.
             touched = self.counts[uniq].to(torch.float64) + 1.0
-            denom = 1.0 - torch.pow(
-                torch.tensor(HOST_MOMENTUM, dtype=torch.float64), touched
-            )
+            denom = 1.0 - torch.pow(torch.tensor(HOST_MOMENTUM, dtype=torch.float64), touched)
             block = block / denom.to(block.dtype).unsqueeze(1)
         t[uniq] = t[uniq] - lr * block
         return n
@@ -568,9 +566,7 @@ def load_host_state(model: nn.Module, state: dict) -> None:
                 f"retrain with the corrected formula."
             )
         counts = s["counts"]
-        if tuple(counts.shape) != (m.host.counts.numel(),) or (
-            counts.dtype is not torch.int32
-        ):
+        if tuple(counts.shape) != (m.host.counts.numel(),) or (counts.dtype is not torch.int32):
             loud(
                 f"host counts {tuple(counts.shape)}:{counts.dtype} != "
                 f"({m.host.counts.numel()},):torch.int32 — one int32 per table row. "

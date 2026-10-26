@@ -149,9 +149,7 @@ def _hash_set(hashes: set[str]) -> str:
     return hashlib.sha256("\n".join(sorted(hashes)).encode("utf-8")).hexdigest()[:16]
 
 
-def split_tasks(
-    tasks: list[Task], seed: int, holdout: int
-) -> tuple[list[Task], list[Task], dict]:
+def split_tasks(tasks: list[Task], seed: int, holdout: int) -> tuple[list[Task], list[Task], dict]:
     """A deterministic train/holdout split, proved disjoint by PROMPT hash.
 
     A seeded shuffle decides which tasks are held out, so the split is a pure
@@ -244,9 +242,7 @@ def rl_draw_group(
                 task,
                 cfg.rl_budget,
                 device=device,
-                generator=rl_generator(
-                    cfg.seed, step, attempt * cfg.rl_group + g, device
-                ),
+                generator=rl_generator(cfg.seed, step, attempt * cfg.rl_group + g, device),
             )
             for g in range(cfg.rl_group)
         ]

@@ -129,13 +129,28 @@ ARMS = (
 #: The counters each arm MUST show and the ones it must NOT. Values are the
 #: exact predicates `check` applies (`>0`, `==0`).
 EXPECT = {
-    "off": {"forward": ">0", "rezero_write": ">0", "mhc": "==0", "attnres_write": "==0",
-            "mhc_attnres_forward": "==0"},
+    "off": {
+        "forward": ">0",
+        "rezero_write": ">0",
+        "mhc": "==0",
+        "attnres_write": "==0",
+        "mhc_attnres_forward": "==0",
+    },
     "mhc": {"forward": ">0", "mhc": ">0", "rezero_write": "==0", "mhc_attnres_forward": "==0"},
-    "attnres": {"forward": ">0", "attnres_write": ">0", "rezero_write": "==0",
-                "mhc_attnres_forward": "==0"},
-    "both": {"forward": ">0", "mhc": ">0", "attnres_write": ">0",
-             "mhc_attnres_forward": ">0", "mhc_attnres_write": ">0", "rezero_write": "==0"},
+    "attnres": {
+        "forward": ">0",
+        "attnres_write": ">0",
+        "rezero_write": "==0",
+        "mhc_attnres_forward": "==0",
+    },
+    "both": {
+        "forward": ">0",
+        "mhc": ">0",
+        "attnres_write": ">0",
+        "mhc_attnres_forward": ">0",
+        "mhc_attnres_write": ">0",
+        "rezero_write": "==0",
+    },
 }
 
 
@@ -180,9 +195,7 @@ def _run_one(args: argparse.Namespace) -> int:
     from dormouse.model import DormouseModel
     from dormouse.train import train
 
-    args.use_mhc, args.use_attnres = next(
-        (m, a) for name, m, a in ARMS if name == args.arm
-    )
+    args.use_mhc, args.use_attnres = next((m, a) for name, m, a in ARMS if name == args.arm)
     run = load_run(
         PRESET,
         model_overrides={
@@ -342,8 +355,7 @@ def ab(args: argparse.Namespace) -> int:
 
     control = table["off"]
     verdicts = {
-        arm: _verdict(arm, control, table[arm], window)
-        for arm in ("mhc", "attnres", "both")
+        arm: _verdict(arm, control, table[arm], window) for arm in ("mhc", "attnres", "both")
     }
     for arm, v in verdicts.items():
         print(

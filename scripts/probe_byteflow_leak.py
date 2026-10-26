@@ -61,12 +61,8 @@ def probe(m: DormouseModel, name: str, seq: int, b: int = 1) -> None:
         # the mutated row itself and later rows are expected to move
         d_self = (after[0, i] - base[0, i]).abs().max().item()
         worst = max(worst, d)
-        print(
-            f"  mutating byte {i:>3}: max|d logit| rows<{i}: {d:.3e}   "
-            f"row {i}: {d_self:.3e}"
-        )
-    print(f"  WORST pre-mutation drift: {worst:.3e}  "
-          f"{'LEAK' if worst > 1e-5 else 'causal'}")
+        print(f"  mutating byte {i:>3}: max|d logit| rows<{i}: {d:.3e}   row {i}: {d_self:.3e}")
+    print(f"  WORST pre-mutation drift: {worst:.3e}  {'LEAK' if worst > 1e-5 else 'causal'}")
 
 
 def main() -> None:

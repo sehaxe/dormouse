@@ -140,9 +140,7 @@ def bytes_per_byte(csa_kv_dim: int, csa_chunk: int) -> float:
     return 2 * csa_kv_dim * STATE_BYTES / csa_chunk
 
 
-def state_bytes(
-    context: int, csa_kv_dim: int, csa_chunk: int, *, batch: int = 1
-) -> int:
+def state_bytes(context: int, csa_kv_dim: int, csa_chunk: int, *, batch: int = 1) -> int:
     """One ring's exact bytes for `context` bytes: `ceil(ctx/chunk)` entries."""
     assert context >= 0 and batch >= 1, (context, batch)
     chunks = -(-context // csa_chunk)
@@ -168,9 +166,7 @@ def total_state_bytes(
     """Fine + coarse ring bytes (`coarse_chunk=0` is the fine-only arm)."""
     total = state_bytes(context, csa_kv_dim, csa_chunk, batch=batch)
     if csa_coarse_chunk:
-        total += coarse_state_bytes(
-            context, csa_coarse_kv_dim, csa_coarse_chunk, batch=batch
-        )
+        total += coarse_state_bytes(context, csa_coarse_kv_dim, csa_coarse_chunk, batch=batch)
     return total
 
 
@@ -189,9 +185,7 @@ def memory_table(
     SUM per context, and returns the sums; with `csa_coarse_chunk=0` it prints
     and returns the fine row exactly as before.
     """
-    fine = {
-        c: state_bytes(c, csa_kv_dim, csa_chunk, batch=batch) for c in contexts
-    }
+    fine = {c: state_bytes(c, csa_kv_dim, csa_chunk, batch=batch) for c in contexts}
     print(
         f"CSA fine memory per layer (kv={csa_kv_dim}, chunk={csa_chunk}, "
         f"batch={batch}): {bytes_per_byte(csa_kv_dim, csa_chunk):.1f} B/byte "
@@ -202,8 +196,7 @@ def memory_table(
     if not csa_coarse_chunk:
         return fine
     coarse = {
-        c: coarse_state_bytes(c, csa_coarse_kv_dim, csa_coarse_chunk, batch=batch)
-        for c in contexts
+        c: coarse_state_bytes(c, csa_coarse_kv_dim, csa_coarse_chunk, batch=batch) for c in contexts
     }
     total = {c: fine[c] + coarse[c] for c in contexts}
     print(
@@ -318,9 +311,7 @@ class CSAState:
         self.kv_dim = csa_kv_dim
         self.chunk = csa_chunk
         self.batch = batch
-        self.max_chunks = (
-            -(-DECODE_MAX_BYTES // csa_chunk) if max_chunks is None else max_chunks
-        )
+        self.max_chunks = -(-DECODE_MAX_BYTES // csa_chunk) if max_chunks is None else max_chunks
         self.device = device
         self.k = torch.empty(0, batch, csa_kv_dim, dtype=torch.bfloat16, device=device)
         self.v = torch.empty_like(self.k)
@@ -424,9 +415,7 @@ class CompressedSelectiveAttention(nn.Module):
     # -- the pooled keys/values of a whole window -------------------------
     def _mean_pool(self, x: torch.Tensor, chunk: int) -> torch.Tensor:
         """`x [b,t,d]` → `mean [b, ceil(t/chunk), d]` (mean over each chunk)."""
-        pooled = F.avg_pool1d(
-            x.transpose(1, 2), chunk, chunk, ceil_mode=True
-        )  # [b, d, n]
+        pooled = F.avg_pool1d(x.transpose(1, 2), chunk, chunk, ceil_mode=True)  # [b, d, n]
         return pooled.transpose(1, 2)  # [b, n, d]
 
     def _pool(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -455,8 +444,10 @@ class CompressedSelectiveAttention(nn.Module):
         scores = (q @ k.transpose(1, 2)) * self.scale  # [b,Q,N]
         scores = scores.masked_fill(~allowed, torch.finfo(scores.dtype).min)
         idx = scores.topk(k_eff, dim=-1).indices  # [b,Q,k_eff]
-        vv = v.unsqueeze(1).expand(b, qn, n, self.kv_dim).gather(
-            2, idx.unsqueeze(-1).expand(b, qn, k_eff, self.kv_dim)
+        vv = (
+            v.unsqueeze(1)
+            .expand(b, qn, n, self.kv_dim)
+            .gather(2, idx.unsqueeze(-1).expand(b, qn, k_eff, self.kv_dim))
         )
         sel_scores = scores.gather(2, idx)  # [b,Q,k_eff]
         sel_ok = allowed.expand(b, qn, n).gather(2, idx)
@@ -585,9 +576,7 @@ class CompressedSelectiveAttention(nn.Module):
             out = self.W_o(self._attend(q, kk, vv, allowed))
         if self.coarse_chunk:
             if cs is None:
-                cs = CSAState(
-                    d, self.coarse_kv_dim, self.coarse_chunk, batch=b, device=x.device
-                )
+                cs = CSAState(d, self.coarse_kv_dim, self.coarse_chunk, batch=b, device=x.device)
             assert (cs.batch, cs.kv_dim) == (b, self.coarse_kv_dim), (cs.batch, b)
             if cs.count != 0:
                 loud(
@@ -609,9 +598,7 @@ class CompressedSelectiveAttention(nn.Module):
             if self._coarse_on():
                 counters.count("csa_coarse_forward")
                 cq = self.W_q_c(x)
-                pos_coarse = (
-                    torch.arange(t, device=x.device) // self.coarse_chunk + n_old_c
-                )
+                pos_coarse = torch.arange(t, device=x.device) // self.coarse_chunk + n_old_c
                 key_coarse = torch.arange(cs.n, device=x.device)
                 allowed_c = key_coarse.view(1, 1, -1) < pos_coarse.view(1, t, 1)
                 ckk = cs.k[: cs.n].to(cq.dtype).transpose(0, 1)
@@ -662,9 +649,7 @@ class CompressedSelectiveAttention(nn.Module):
             out = self.W_o(fine_out)
         if self.coarse_chunk:
             if cs is None:
-                cs = CSAState(
-                    d, self.coarse_kv_dim, self.coarse_chunk, batch=b, device=x.device
-                )
+                cs = CSAState(d, self.coarse_kv_dim, self.coarse_chunk, batch=b, device=x.device)
             assert (cs.batch, cs.kv_dim) == (b, self.coarse_kv_dim), (cs.batch, b)
             cs.sum = cs.sum + x[:, 0]
             cs.count += 1

@@ -66,7 +66,7 @@ def main(argv: list[str]) -> int:
     print(f"\nmodel={args.model}")
     print(f"file={args.file} ({n_bytes} bytes, {scored} tokens)")
     print(f"tokens/byte={scored / n_bytes:.3f}")
-    print(f"BPB={bpb:.4f}  (perplexity per byte = {2 ** bpb:.2f}, compression = {8 / bpb:.2f}x)")
+    print(f"BPB={bpb:.4f}  (perplexity per byte = {2**bpb:.2f}, compression = {8 / bpb:.2f}x)")
     return 0
 
 

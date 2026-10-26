@@ -80,9 +80,7 @@ class FlexSparseSelector(nn.Module):
         #: as the factor rung): the indexer's two projections are plain
         #: `nn.Linear`s, so their weights are read through the annealed STE.
         #: They too are ATTENTION: `dense_qat_skip_attn` keeps them bf16.
-        self.dense_qat = dense_qat_kind(
-            cfg, "loop.msa.selector.q_idx", "loop.msa.selector.k_idx"
-        )
+        self.dense_qat = dense_qat_kind(cfg, "loop.msa.selector.q_idx", "loop.msa.selector.k_idx")
         self.dense_qat_alpha = cfg.factor_qat_alpha
 
     def forward(

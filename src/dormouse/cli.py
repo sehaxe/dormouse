@@ -677,9 +677,7 @@ def rl_cmd(
     )
     held = report.get("eval")
     held_field = (
-        ""
-        if not held
-        else f" pass@1={held['pass@1']:.3f} pass@budget={held['pass@budget']:.3f}"
+        "" if not held else f" pass@1={held['pass@1']:.3f} pass@budget={held['pass@budget']:.3f}"
     )
     console.print(
         f"[green]rl done[/] steps={report['steps']} loss={report['loss']:.4f} "

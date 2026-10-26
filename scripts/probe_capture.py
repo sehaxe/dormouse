@@ -39,8 +39,10 @@ def main() -> int:
         train_overrides=dict(batch=8, seq_len=64),
     )
     cfg = run.model
-    print(f"cfg: E={cfg.n_experts} k={cfg.moe_topk} cap={cfg.moe_capacity} "
-          f"kernel={cfg.moe_kernel} gather={cfg.moe_gather} d={cfg.d_model} f={cfg.d_ffn}")
+    print(
+        f"cfg: E={cfg.n_experts} k={cfg.moe_topk} cap={cfg.moe_capacity} "
+        f"kernel={cfg.moe_kernel} gather={cfg.moe_gather} d={cfg.d_model} f={cfg.d_ffn}"
+    )
     torch.manual_seed(0)
     moe = SparseMoE(cfg, device="cuda")
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 64

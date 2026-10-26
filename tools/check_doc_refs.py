@@ -110,12 +110,8 @@ LEGACY_DEAD = {
     "tests/test_device_policy.py": (
         "ships with the `multigpu` lane (device-capability layer); not merged"
     ),
-    "tests/test_distributed.py": (
-        "ships with the `multigpu` lane (DDP/FSDP2); not merged"
-    ),
-    "src/dormouse/train/distributed.py": (
-        "ships with the `multigpu` lane (DDP/FSDP2); not merged"
-    ),
+    "tests/test_distributed.py": ("ships with the `multigpu` lane (DDP/FSDP2); not merged"),
+    "src/dormouse/train/distributed.py": ("ships with the `multigpu` lane (DDP/FSDP2); not merged"),
     "src/dormouse/train/device.py": (
         "ships with the `multigpu` lane (device-capability layer); not merged"
     ),

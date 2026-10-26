@@ -57,12 +57,8 @@ SEED = 1234
 #: Captured from a clean `main` worktree (962d831) BEFORE this branch existed,
 #: seed 1234, fixture below.  Coarse is OFF, so these must never move.
 CSA_OFF_SHA = "beb23f76773c5f63a8b5ed5a549fb3c451174e9f4622c2549246cc63b4d0d318"
-CSA_ON_FINE_ONLY_SHA = (
-    "defb2afec16ed17637447ad5c495fb105e4c382dd7c64e9aacfbaf0d0ec986b6"
-)
-CSA_ON_FINE_ONLY_CAUSAL_SHA = (
-    "5c679b42c30f67d786b66e9d1f4e6f17f25789f60c61e65382dac322d8473e0a"
-)
+CSA_ON_FINE_ONLY_SHA = "defb2afec16ed17637447ad5c495fb105e4c382dd7c64e9aacfbaf0d0ec986b6"
+CSA_ON_FINE_ONLY_CAUSAL_SHA = "5c679b42c30f67d786b66e9d1f4e6f17f25789f60c61e65382dac322d8473e0a"
 #: Moved 2026-10-26: the fixture is `use_engram=false`, which no longer builds
 #: the dead `mem_dense`. `CSA_OFF_SHA`/`CSA_ON_FINE_ONLY_SHA` (Engram on) are
 #: unchanged.
@@ -140,9 +136,7 @@ def test_gate_2_coarse_is_causal_both_ways():
             later = ids.clone()
             later[:, 8] = (later[:, 8] + 1) % 251
             got = model(later)[0].view(BATCH, SEQ, -1)
-            assert torch.equal(base[:, :8], got[:, :8]), (
-                f"{name}: a position read a future byte"
-            )
+            assert torch.equal(base[:, :8], got[:, :8]), f"{name}: a position read a future byte"
             assert not torch.allclose(base[:, 8], got[:, 8]), (
                 f"{name}: position 8 ignored its own byte — the query is not live"
             )
@@ -161,10 +155,7 @@ def test_gate_2_coarse_is_causal_both_ways():
             assert not torch.allclose(base[:, 9], m_got[:, 9]), (
                 f"{name}: position 9 ignored its own byte"
             )
-            print(
-                f"{name}: pos-8 max delta "
-                f"{float((base[:, 8] - got[:, 8]).abs().max()):.3e}"
-            )
+            print(f"{name}: pos-8 max delta {float((base[:, 8] - got[:, 8]).abs().max()):.3e}")
         # A mutation at a COARSE boundary (16, chunk 8) must not move earlier
         # positions either; that is the ring's append-after-read rule.
         if over["csa_coarse_chunk"]:
@@ -181,9 +172,7 @@ def test_gate_2_coarse_is_causal_both_ways():
 def _exact_ref(q, k, v, out_proj, n: int) -> torch.Tensor:
     ref = torch.zeros_like(q)
     for p in range(1, n):  # strictly earlier positions only (no diagonal)
-        s = (q[:, p : p + 1] @ k[:, :p].transpose(1, 2)).squeeze(1) / math.sqrt(
-            q.shape[-1]
-        )
+        s = (q[:, p : p + 1] @ k[:, :p].transpose(1, 2)).squeeze(1) / math.sqrt(q.shape[-1])
         w = torch.softmax(s, dim=-1)
         ref[:, p] = (w.unsqueeze(-1) * v[:, :p]).sum(1)
     return out_proj(ref)
@@ -215,9 +204,7 @@ def test_gate_3_coarse_alone_equals_exact_attention():
     both = CompressedSelectiveAttention(cfg2)
     got = both(x)
     fine_ref = _exact_ref(both.W_q(x), both.W_k(x), both.W_v(x), both.W_o, 16)
-    coarse_ref = _exact_ref(
-        both.W_q_c(x), both.W_k_c(x), both.W_v_c(x), both.W_o_c, 16
-    )
+    coarse_ref = _exact_ref(both.W_q_c(x), both.W_k_c(x), both.W_v_c(x), both.W_o_c, 16)
     sum_err = float((got - (fine_ref + coarse_ref)).detach().abs().max())
     print(f"max |both - (W_o·fine + W_o_c·coarse)| = {sum_err:.3e}")
     assert sum_err <= 1e-5, sum_err
@@ -252,9 +239,7 @@ def test_gate_4_gradients_reach_both_levels_and_the_gate():
         "loop.csa_gate": model.loop.csa_gate.grad,
     }
     for name, grad in wanted.items():
-        assert grad is not None and torch.isfinite(grad).all(), (
-            f"{name}: no finite gradient"
-        )
+        assert grad is not None and torch.isfinite(grad).all(), f"{name}: no finite gradient"
         mag = float(grad.abs().sum())
         assert mag > 0.0, f"{name}: zero gradient — the level runs and trains nothing"
         print(f"{name:24s} |grad|_1 = {mag:.6f}")
@@ -296,9 +281,7 @@ def test_gate_6_unsupported_combinations_are_loud():
         # the divisibility rule is reachable through the config seam.
         validate(tiny_cfg(use_csa=True, csa_chunk=8, csa_coarse_chunk=100))
     with pytest.raises(LoudError, match="csa_coarse_kv_dim"):
-        validate(
-            tiny_cfg(use_csa=True, csa_coarse_chunk=256, csa_coarse_kv_dim=32)
-        )
+        validate(tiny_cfg(use_csa=True, csa_coarse_chunk=256, csa_coarse_kv_dim=32))
     with pytest.raises(LoudError, match="use_csa"):
         validate(tiny_cfg(use_csa=False, csa_coarse_chunk=256))
     with pytest.raises(LoudError, match="use_msa"):
@@ -359,9 +342,7 @@ def test_gate_7_the_forward_touches_no_host(monkeypatch):
 
 
 def test_gate_8_memory_table_is_both_rings_against_real_tensors():
-    table = memory_table(
-        csa_kv_dim=64, csa_chunk=8, csa_coarse_kv_dim=64, csa_coarse_chunk=256
-    )
+    table = memory_table(csa_kv_dim=64, csa_chunk=8, csa_coarse_kv_dim=64, csa_coarse_chunk=256)
     expected = {
         1024: 32768 + 1024,
         32768: 1_048_576 + 32768,
@@ -375,8 +356,10 @@ def test_gate_8_memory_table_is_both_rings_against_real_tensors():
         coarse.reserve(-(-context // 256))
         real = fine.bytes() + coarse.bytes()
         assert fine.k.element_size() == coarse.k.element_size() == 2
-        assert real == table[context] == total_state_bytes(
-            context, 64, 8, csa_coarse_kv_dim=64, csa_coarse_chunk=256
+        assert (
+            real
+            == table[context]
+            == total_state_bytes(context, 64, 8, csa_coarse_kv_dim=64, csa_coarse_chunk=256)
         ), (context, real, table[context])
     print(
         f"1M: fine {expected[1_048_576] - 1_048_576} B + coarse 1_048_576 B "
@@ -394,9 +377,7 @@ def test_gate_9_coarse_decode_is_under_budget_at_1m():
     assert bill["coarse"] < bill["fine"], bill
     # Every allowed coarse chunk at the default width is under the budget.
     for chunk in (64, 128, 256, 512):
-        got = mac_per_byte(
-            1_048_576, csa_coarse_chunk=chunk, csa_coarse_kv_dim=64
-        )
+        got = mac_per_byte(1_048_576, csa_coarse_chunk=chunk, csa_coarse_kv_dim=64)
         assert got["coarse"] < 3_000_000, (chunk, got)
     dense = 2 * 1_048_576 * 64  # exact attention, one head, d=64
     print(

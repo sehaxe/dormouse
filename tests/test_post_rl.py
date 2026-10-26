@@ -525,6 +525,6 @@ def test_rl_step_cuda_matches_the_cpu_fp32_twin():
     # The step really trains on the card: the graph reaches a parameter.
     assert bool(loss_gpu.requires_grad)
     loss_gpu.backward()
-    assert any(
-        p.grad is not None and float(p.grad.abs().sum()) > 0 for p in gpu.parameters()
-    ), "no parameter received a gradient from the CUDA policy-gradient step"
+    assert any(p.grad is not None and float(p.grad.abs().sum()) > 0 for p in gpu.parameters()), (
+        "no parameter received a gradient from the CUDA policy-gradient step"
+    )

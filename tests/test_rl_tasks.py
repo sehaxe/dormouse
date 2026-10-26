@@ -113,8 +113,14 @@ def test_the_verifier_accepts_every_reference_answer(tmp_path: Path):
 
 def test_the_loader_refuses_a_duplicate_prompt_and_a_known_bad_verifier(tmp_path: Path):
     """The loader's identity is the prompt hash, not the id; a bad record is LOUD."""
-    good = {"id": "a", "kind": "arith_chain", "prompt": "p", "answer": "1",
-            "verifier": "math", "difficulty_hint": 0.1}
+    good = {
+        "id": "a",
+        "kind": "arith_chain",
+        "prompt": "p",
+        "answer": "1",
+        "verifier": "math",
+        "difficulty_hint": 0.1,
+    }
     p = tmp_path / "dup.jsonl"
     p.write_text(json.dumps(good) + "\n" + json.dumps(dict(good, id="b")) + "\n")
     with pytest.raises(LoudError, match="duplicate"):

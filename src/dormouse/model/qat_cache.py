@@ -140,13 +140,7 @@ class QuantCache:
         `ste(w)` reads it back exactly as for a lone tensor.
         """
         ent = self._q.get(id(w))
-        if (
-            ent is not None
-            and ent[0] is w
-            and ent[1] == kind
-            and ent[2] == alpha
-            and ent[3] == dim
-        ):
+        if ent is not None and ent[0] is w and ent[1] == kind and ent[2] == alpha and ent[3] == dim:
             self.hits += 1
             return ent[4]
         if alpha == 0.0:

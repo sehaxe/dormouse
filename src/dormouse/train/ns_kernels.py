@@ -193,6 +193,7 @@ def shared_bytes(rt: int, block_d: int) -> int:
     """
     return _NS_SMEM[(int(rt), int(block_d))]
 
+
 #: The prescale's ε, `zeropower_via_ns`'s own `x / (x.norm() + 1e-7)`.
 NS_EPS = 1e-7
 

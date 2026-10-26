@@ -528,9 +528,9 @@ def test_a_previously_refused_adjoint_tile_launches():
     """
     if mk is None:
         pytest.skip("no triton in this build")
-    assert mk.tile_reason(
-        torch.bfloat16, 32, 64, 8, tiles=dict(mk.TILES, BLOCK_N=256)
-    ) is None, "the guard must allow the measured 256 tile"
+    assert mk.tile_reason(torch.bfloat16, 32, 64, 8, tiles=dict(mk.TILES, BLOCK_N=256)) is None, (
+        "the guard must allow the measured 256 tile"
+    )
     torch.manual_seed(3)
     e, d, r, f = 5, 24, 8, 32
     counts = torch.tensor([0, 3, 7, 2, 6], dtype=torch.int32, device=DEV)
@@ -590,9 +590,7 @@ def test_a_refused_backward_launch_falls_back_counted(monkeypatch):
     rows = order[keep]
     owner = rows // index.shape[1]
     xg = moe._gather_rows(x, owner, dt).detach().clone().requires_grad_(True)
-    counts = torch.bincount(
-        index.reshape(-1)[rows], minlength=moe.n_experts
-    ).to(torch.int32)
+    counts = torch.bincount(index.reshape(-1)[rows], minlength=moe.n_experts).to(torch.int32)
     offs = torch.zeros(moe.n_experts + 1, dtype=torch.int32, device=DEV)
     offs[1:] = torch.cumsum(counts, 0)
     cap = moe._capacity(*index.shape)
@@ -680,9 +678,7 @@ def _compiled_shared(fn, signature, constexprs: dict, warps: int) -> int:
     else:
         arch = 120  # this box's card; a compile-only gate does not need the device
     src = ASTSource(fn, signature=signature, constexprs=constexprs)
-    compiled = tcompile(
-        src, target=GPUTarget("cuda", arch, 32), options={"num_warps": warps}
-    )
+    compiled = tcompile(src, target=GPUTarget("cuda", arch, 32), options={"num_warps": warps})
     return int(compiled.metadata.shared)
 
 

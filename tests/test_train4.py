@@ -204,9 +204,7 @@ def test_ema_shadow_is_the_hand_computed_average(tmp_path, accum):
     once per forward.
     """
     cfg = _cfg()
-    run = _run_cfg(
-        tmp_path, "ema", cfg, steps=3, lr=0.01, grad_accum=accum, ema_decay=0.9
-    )
+    run = _run_cfg(tmp_path, "ema", cfg, steps=3, lr=0.01, grad_accum=accum, ema_decay=0.9)
     model = _model(cfg)
     trajectory = [{k: v.detach().clone() for k, v in model.named_parameters()}]
     original = MixOptimizer.step
@@ -316,10 +314,7 @@ def test_tie_saves_exactly_the_head():
     tied = _model(_with(_cfg(use_tsct=False), tie_embeddings=True))
     delta = param_count(untied) - param_count(tied)
     assert delta == untied.cfg.d_model * untied.cfg.vocab
-    print(
-        f"tie: param delta = {delta} (d_model*vocab = "
-        f"{untied.cfg.d_model * untied.cfg.vocab})"
-    )
+    print(f"tie: param delta = {delta} (d_model*vocab = {untied.cfg.d_model * untied.cfg.vocab})")
     assert sum(p.numel() for p in tied.lm_head.parameters()) == 0
     keys = list(tied.state_dict())
     assert keys.count("embed.weight") == 1

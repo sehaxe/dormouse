@@ -71,8 +71,9 @@ ARMS = {
 
 
 def run(arm: str, seed: int) -> float | None:
-    flags = dict(COMMON, **ARMS[arm], seed=seed, ckpt_name=f"wc_{arm}_s{seed}",
-                 out_dir="/tmp/opencode/wc")
+    flags = dict(
+        COMMON, **ARMS[arm], seed=seed, ckpt_name=f"wc_{arm}_s{seed}", out_dir="/tmp/opencode/wc"
+    )
     cmd = [".venv/bin/dormouse", "train", "medium"]
     for k, v in flags.items():
         cmd += ["--set", f"{k}={v}"]

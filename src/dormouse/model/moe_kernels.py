@@ -1231,9 +1231,7 @@ def _glu_backward(
     t_rank_n = dict(tiles, BLOCK_N=rp)
     t_wide = dict(tiles, BLOCK_K=rp)
 
-    dh = nt(
-        dyc, v, offs, cap, r, f, dict(t_rank_n, BLOCK_K=tiles["BLOCK_K"]), torch.float32
-    )
+    dh = nt(dyc, v, offs, cap, r, f, dict(t_rank_n, BLOCK_K=tiles["BLOCK_K"]), torch.float32)
     # Re-round the gate exactly as the forward did (accumulator -> dtype, multiply
     # the scale, round): the padded arm's autograd differentiates ITS rounded gate,
     # so differentiating the unrounded one here would be a 1e-2 disagreement that

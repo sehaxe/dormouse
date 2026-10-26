@@ -238,8 +238,10 @@ def test_the_declared_unsupported_combinations_are_loud():
             msg = str(e.value)
             assert key in msg and "Escape:" in msg, msg
             print(f"[prelude] refused {key}={n}: {msg.splitlines()[0]}")
-    for text in ("use_byteflow = true\nprelude_layers = 1\n",
-                 "use_byteflow = true\ncoda_layers = 1\n"):
+    for text in (
+        "use_byteflow = true\nprelude_layers = 1\n",
+        "use_byteflow = true\ncoda_layers = 1\n",
+    ):
         with pytest.raises(LoudError) as e:
             parse_preset(text)
         msg = str(e.value)

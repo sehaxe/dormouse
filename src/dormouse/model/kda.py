@@ -444,8 +444,7 @@ class KDAAttention(nn.Module):
             return out.reshape(b, t, d), ht
         counters.count("kda_step_torch", t)
         counters.why = (  # type: ignore[attr-defined]
-            "grad enabled: fused_recurrent_kda ships no backward, so the torch "
-            "recurrence ran"
+            "grad enabled: fused_recurrent_kda ships no backward, so the torch recurrence ran"
             if ok
             else why
         )

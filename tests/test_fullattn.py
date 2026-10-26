@@ -186,9 +186,7 @@ def test_gate_5_unsupported_combinations_are_loud():
     with pytest.raises(LoudError, match="use_kda=false"):
         validate(tiny_cfg(attn_kind="full", use_kda=False))
     with pytest.raises(LoudError, match="attn_kind='full'"):
-        _validate_segment(
-            tiny_cfg(attn_kind="full"), TrainConfig(segment_len=32, seq_len=SEQ)
-        )
+        _validate_segment(tiny_cfg(attn_kind="full"), TrainConfig(segment_len=32, seq_len=SEQ))
     # The runtime seam: a hand-built model never calls `validate`.
     model = DormouseModel(tiny_cfg(attn_kind="full"))
     ids, targets = _batch()

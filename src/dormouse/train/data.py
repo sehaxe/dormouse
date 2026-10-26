@@ -696,7 +696,6 @@ class DocPackedStream:
         self.source.close()
 
 
-
 def open_source(
     path: str | Path,
     batch: int,

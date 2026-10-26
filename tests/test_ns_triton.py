@@ -675,16 +675,22 @@ def test_the_real_launch_table_keeps_block_d_at_64():
         n128 = _launch_shared(shape, 128)
         n256 = _launch_shared(shape, 256)
         print(f"{str(shape):>16} {n64:>7} {n128:>7} {n256:>7}")
-        assert n64 == {  # the shipped arm, per orientation
-            (2048, 64): 65536,
-            (1024, 64, 64): 57344,
-            (64, 5461): 53248,
-        }[shape]
-        assert n128 == {
-            (2048, 64): 114688,  # REFUSED on the b1 tall chain
-            (1024, 64, 64): 90112,
-            (64, 5461): 83968,
-        }[shape]
+        assert (
+            n64
+            == {  # the shipped arm, per orientation
+                (2048, 64): 65536,
+                (1024, 64, 64): 57344,
+                (64, 5461): 53248,
+            }[shape]
+        )
+        assert (
+            n128
+            == {
+                (2048, 64): 114688,  # REFUSED on the b1 tall chain
+                (1024, 64, 64): 90112,
+                (64, 5461): 83968,
+            }[shape]
+        )
         assert n256 > nk.SMEM_CEILING_BYTES
     assert nk.BLOCK_D == 64, "the measured tall chain cannot launch 128"
 

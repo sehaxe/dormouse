@@ -1371,9 +1371,7 @@ def _state_with_defaults(state: dict, key: str, defaults: dict) -> dict:
 def _quality_state() -> dict:
     return {
         "bands": {k: list(v) for k, v in QUALITY_BANDS.items()},
-        "filters": {
-            k: {"checked": 0, "dropped": 0, "bytes": 0} for k in QUALITY_BANDS
-        },
+        "filters": {k: {"checked": 0, "dropped": 0, "bytes": 0} for k in QUALITY_BANDS},
         "docs_in": 0,
         "bytes_in": 0,
         "docs_dropped": 0,
@@ -1411,19 +1409,13 @@ def build_shards_quality(d: Domain) -> None:
         nd = _state_with_defaults(d.state, "near_dup", _near_dup_state(d.name))
         nd["eval_chunks"] = index.eval_docs
         log(f"  {d.name}: {index.eval_docs} eval chunks indexed for near-dup no-leak")
-    qs = (
-        _state_with_defaults(d.state, "quality_band", _quality_state())
-        if d.quality_band
-        else None
-    )
+    qs = _state_with_defaults(d.state, "quality_band", _quality_state()) if d.quality_band else None
 
     exact: dict[str, int] = {}
     resumed = bool(d.state["cursor"] or d.state.get("doc_i"))
     log_fh = None
     if index is not None:
-        log_fh = (d.out_dir / nd["dropped_ranges"]).open(
-            "a" if resumed else "w", encoding="utf-8"
-        )
+        log_fh = (d.out_dir / nd["dropped_ranges"]).open("a" if resumed else "w", encoding="utf-8")
 
     def apply(path: Path, chunk: bytes, off: int, *, write: bool) -> None:
         if write and nd is not None:

@@ -24,10 +24,7 @@ from dormouse.train.sft import scan_ranges  # noqa: E402
 
 #: Turn 1 calls calc; turn 2 reads the observation and answers. The `0x06` after
 #: the args is where the harness stops generation and takes over.
-SCRIPT = (
-    b'Let me compute.\n\x04calc\x05{"expr": "2 + 2"}\x06'
-    b"answer: 4\x03"
-)
+SCRIPT = b'Let me compute.\n\x04calc\x05{"expr": "2 + 2"}\x06answer: 4\x03'
 
 TASK = Task(
     cls="math",

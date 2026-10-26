@@ -216,9 +216,7 @@ def step(control: list[dict], arm: list[dict], window: int, arm_name: str) -> di
     arm's mean BPB is within the CONTROL's own seed spread of it; a larger loss
     REVERTS the step. A tie keeps the more compressed form, by design.
     """
-    why = check(control, window, EXPECT[control[0]["arm"]]) + check(
-        arm, window, EXPECT[arm_name]
-    )
+    why = check(control, window, EXPECT[control[0]["arm"]]) + check(arm, window, EXPECT[arm_name])
     cmean, cspread = summarize(control)
     amean, aspread = summarize(arm)
     out = {

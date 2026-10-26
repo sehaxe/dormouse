@@ -99,9 +99,9 @@ def test_none_attaches_no_cache_and_adds_no_parameter():
     off = _model()
     assert off._qat_caches == [], "qat=none must not build a cache"
     on = _model(factor_qat="ternary", dense_qat="ternary")
-    assert sum(p.numel() for p in on.parameters()) == sum(
-        p.numel() for p in off.parameters()
-    ), "QAT must not add parameters"
+    assert sum(p.numel() for p in on.parameters()) == sum(p.numel() for p in off.parameters()), (
+        "QAT must not add parameters"
+    )
     assert on._qat_caches, "the quantized model must collect its caches"
     x = torch.randint(0, 256, (2, 16))
     assert torch.equal(_forward(off, x), _forward(off, x))
@@ -164,9 +164,11 @@ def test_stacked_refresh_is_bit_identical_to_the_per_tensor_refresh():
             qs = stacked.refresh_stacked(stack, kind, alpha, dim=(1, 2))
             qp = torch.stack([per.refresh(s, kind, alpha) for s in slices])
             assert torch.equal(qs, qp), (kind, alpha, "projection")
-            assert torch.equal(
-                stacked.ste(stack), torch.stack([per.ste(s) for s in slices])
-            ), (kind, alpha, "ste")
+            assert torch.equal(stacked.ste(stack), torch.stack([per.ste(s) for s in slices])), (
+                kind,
+                alpha,
+                "ste",
+            )
             # The uncached arm is the same expression too (alpha=0 included).
             assert torch.equal(
                 qat_project_stacked(stack, kind, alpha, dim=(1, 2)),
@@ -340,9 +342,7 @@ def test_the_trainer_invalidates_every_trained_step(monkeypatch, tmp_path):
     )
     run = dataclasses.replace(
         run,
-        model=dataclasses.replace(
-            run.model, factor_qat="ternary", dense_qat="ternary", bf16=False
-        ),
+        model=dataclasses.replace(run.model, factor_qat="ternary", dense_qat="ternary", bf16=False),
     )
     from dormouse.train.loop import train
 
@@ -449,9 +449,9 @@ def test_medium_bank_site_refreshes_in_one_call_not_E():
         for name in ("gate_u", "up_u", "v"):
             torch.stack(
                 [
-                    factor_qat_project(
-                        getattr(ex, name).unsqueeze(0), "ternary", 1.0, dim=(1, 2)
-                    )[0]
+                    factor_qat_project(getattr(ex, name).unsqueeze(0), "ternary", 1.0, dim=(1, 2))[
+                        0
+                    ]
                     for ex in moe.experts
                 ]
             )

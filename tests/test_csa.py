@@ -219,8 +219,10 @@ def test_gate_6_unsupported_combinations_are_loud():
     wide = DormouseModel(tiny_cfg(use_csa=True, csa_topk=1000, use_engram=False, moe_topk=0))
     logits, loss, _ = wide(ids, targets)
     assert loss is not None and torch.isfinite(loss)
-    print("loud: csa_chunk/csa_kv_dim/csa_topk, use_msa, use_byteflow, use_kda=false, "
-          "attn_kind='full', segment_len>0; topk=1000 ran")
+    print(
+        "loud: csa_chunk/csa_kv_dim/csa_topk, use_msa, use_byteflow, use_kda=false, "
+        "attn_kind='full', segment_len>0; topk=1000 ran"
+    )
 
 
 # --- 7. no host read in the forward ---------------------------------------
@@ -246,8 +248,7 @@ def test_gate_7_the_forward_touches_no_host(monkeypatch):
     assert counters["csa_forward"] == 1
     _, state = attn.step_state(x[:, :1], None, counters=counters)
     assert state.n == 0 and counters["csa_step"] == 1
-    print(f"no host read: csa_forward={counters['csa_forward']} "
-          f"csa_step={counters['csa_step']}")
+    print(f"no host read: csa_forward={counters['csa_forward']} csa_step={counters['csa_step']}")
 
 
 # --- 8. the memory table is the actual ring size --------------------------

@@ -171,9 +171,7 @@ def _unit_conversion(seed: int, i: int, level: int, salt: int = 0) -> dict:
     else:
         value = Fraction(rng.randint(1, 40), rng.randint(2, 12))
     answer = value * factor
-    prompt = (
-        f"Convert {value} {src} to {dst}. Give the exact value as an integer or fraction."
-    )
+    prompt = f"Convert {value} {src} to {dst}. Give the exact value as an integer or fraction."
     # The math verifier's contract still applies: the final line must be the answer.
     return _math_record("unit_conversion", seed, i, prompt, str(answer), _difficulty(level, rng))
 
@@ -201,7 +199,7 @@ def _code_record(seed: int, kind: str, i: int, spec: dict) -> dict:
         call = f"{name}({', '.join(repr(a) for a in args)})"
         tests.append([call, repr(eval(call, namespace))])  # noqa: S307 — builder-owned
     prompt = (
-        f"{CODE_HEADER}def {name}({params}):\n    \"\"\"{doc}\"\"\"\n\n"
+        f'{CODE_HEADER}def {name}({params}):\n    """{doc}"""\n\n'
         f"Example: {tests[0][0]} -> {tests[0][1]}\n"
     )
     hint = _difficulty(spec["level"], random.Random(seed * 7 + i))
@@ -242,10 +240,7 @@ def _string_specs(rng: random.Random, level: int) -> dict:
             "params": "xs, k",
             "doc": "Return xs rotated right by k steps; an empty list stays empty.",
             "body": (
-                "    if not xs:\n"
-                "        return []\n"
-                "    k %= len(xs)\n"
-                "    return xs[-k:] + xs[:-k]"
+                "    if not xs:\n        return []\n    k %= len(xs)\n    return xs[-k:] + xs[:-k]"
             ),
             "cases": [(numbers, 1 + level), ([], 3)],
         },
@@ -297,10 +292,7 @@ def _algorithmic_specs(rng: random.Random, level: int) -> dict:
             "params": "n",
             "doc": "Return the n-th Fibonacci number, with fib(0) = 0 and fib(1) = 1.",
             "body": (
-                "    a, b = 0, 1\n"
-                "    for _ in range(n):\n"
-                "        a, b = b, a + b\n"
-                "    return a"
+                "    a, b = 0, 1\n    for _ in range(n):\n        a, b = b, a + b\n    return a"
             ),
             "cases": [(rng.randint(0, 100 * k),), (0,), (1,)],
         },
@@ -329,11 +321,7 @@ def _algorithmic_specs(rng: random.Random, level: int) -> dict:
             "name": "gcd",
             "params": "a, b",
             "doc": "Return the greatest common divisor of a and b.",
-            "body": (
-                "    while b:\n"
-                "        a, b = b, a % b\n"
-                "    return abs(a)"
-            ),
+            "body": ("    while b:\n        a, b = b, a % b\n    return abs(a)"),
             "cases": [
                 (rng.randint(1, 10 ** (k + 1)), rng.randint(1, 10 ** (k + 1))),
                 (0, rng.randint(1, 10)),
@@ -452,9 +440,7 @@ def assert_disjoint(records: list[dict], sft_seed: int, sft_tasks: int) -> dict:
     overlap = rl & sft
     if overlap:
         example = next(
-            rec["prompt"]
-            for rec in records
-            if prompt_hashes([rec["prompt"]]).pop() in overlap
+            rec["prompt"] for rec in records if prompt_hashes([rec["prompt"]]).pop() in overlap
         )
         raise SystemExit(
             f"{len(overlap)} RL prompt(s) are also in the SFT corpus (seed {sft_seed}). "

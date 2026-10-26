@@ -63,9 +63,7 @@ TINY = dict(
     shared_rank=16,
 )
 SEQ, BATCH, STEPS = 16, 2, 3
-GOLDEN = json.loads(
-    (Path(__file__).parent / "fixtures" / "docmask_golden.json").read_text()
-)
+GOLDEN = json.loads((Path(__file__).parent / "fixtures" / "docmask_golden.json").read_text())
 DOCS = [b"A" * 5, b"B" * 7, b"C" * 9]  # 5 + 7 + 9 = 21 bytes, distinct letters
 
 
@@ -104,9 +102,7 @@ def _doc_file(tmp_path: Path, docs: list[bytes], name: str = "d.bin") -> Path:
 
 
 def _doc_stream(path: Path, batch: int, seq: int) -> DocPackedStream:
-    return DocPackedStream(
-        ByteStream(path, batch, seq, check_min=False), load_doc_starts(path)
-    )
+    return DocPackedStream(ByteStream(path, batch, seq, check_min=False), load_doc_starts(path))
 
 
 def _run(tmp_path: Path, corpus: Path | None = None, **over) -> RunConfig:
@@ -338,9 +334,7 @@ def test_long_context_window_on_a_real_mix4_shard():
     """`seq_len=4096`, `segment_len=0`: one forward+backward, counters non-zero."""
     if not REAL.is_file() or not Path(str(REAL) + ".docs.json").is_file():
         pytest.skip(f"no real mix4 shard + sidecar at {REAL}")
-    stream = DocPackedStream(
-        ByteStream(REAL, 1, 4096, check_min=False), load_doc_starts(REAL)
-    )
+    stream = DocPackedStream(ByteStream(REAL, 1, 4096, check_min=False), load_doc_starts(REAL))
     x, y, mask = stream.next_batch_masked()
     assert x.shape == (1, 4096)
     assert bool(mask.any())
@@ -366,16 +360,12 @@ def test_refuses_segment_len():
 
 def test_refuses_byteflow():
     with pytest.raises(LoudError, match="use_byteflow"):
-        _validate_doc(
-            ModelConfig(**{**TINY, "use_byteflow": True}), TrainConfig(doc_masking=True)
-        )
+        _validate_doc(ModelConfig(**{**TINY, "use_byteflow": True}), TrainConfig(doc_masking=True))
 
 
 def test_refuses_a_target_bearing_aux_term():
     with pytest.raises(LoudError, match="dspark_weight"):
-        _validate_doc(
-            ModelConfig(**{**TINY, "dspark_weight": 0.1}), TrainConfig(doc_masking=True)
-        )
+        _validate_doc(ModelConfig(**{**TINY, "dspark_weight": 0.1}), TrainConfig(doc_masking=True))
 
 
 def test_refuses_capacity_dispatch():
@@ -411,9 +401,7 @@ def test_train_step_runs_with_the_mask(tmp_path):
 
     corpus = _doc_file(tmp_path, DOCS, name="corpus.bin")
     run = _run(tmp_path, corpus, doc_masking=True)
-    run = dataclasses.replace(
-        run, model=dataclasses.replace(run.model, moe_capacity=0.0)
-    )
+    run = dataclasses.replace(run, model=dataclasses.replace(run.model, moe_capacity=0.0))
     torch.manual_seed(0)
     model = DormouseModel(run.model)
     stream = _doc_stream(corpus, BATCH, SEQ)

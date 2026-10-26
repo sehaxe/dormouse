@@ -181,10 +181,7 @@ def main() -> int:
         del model
         torch.cuda.empty_cache()
 
-    print(
-        f"\nshape: {PRESET} d=1024 E=256 r=64 max_iter=4, "
-        f"b{BATCH} x s{SEQ} = {TOKENS} tok"
-    )
+    print(f"\nshape: {PRESET} d=1024 E=256 r=64 max_iter=4, b{BATCH} x s{SEQ} = {TOKENS} tok")
     print("step: forward + backward, per-step invalidation (the optimizer stage is common)\n")
     print(
         f"{'arm':10s} {'ms/step':>9s} {'tok/s':>10s} {'peak GiB':>9s}"
