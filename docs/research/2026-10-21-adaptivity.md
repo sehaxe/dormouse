@@ -253,7 +253,7 @@ truncation, §6.1 32B/50B-equivalent) · **2507.10524** (v3; "throughput" and "1
 (`--gen-max-iter` absent; ADR-0013's CALM-lite never implemented; `rand_depth` ⊥ MoR), §3.7
 (`--eval-depths`, `--rand-depth`) · `train.rs:127-133` ("there is no flag to lower it") ·
 `schema.rs:135` (`max_iter=4`) · `schema.rs:616` (`use_msa`) ·
-`docs/reviews/launch-atlas-2026-10-02.{tsv,md:100,116}` · `2026-10-18-data-capacity.md:26,40` ·
+`docs/reviews/launch-atlas-2026-10-02.md:100,116` (raw `…-2026-10-02.tsv`) · `2026-10-18-data-capacity.md:26,40` ·
 `2026-10-18-throughput-leftovers.md:46` (the "given" 573 ms) ·
 `2026-09-27-adaptive-depth-safe.md` (the same depth-curve-first conclusion) · ADR-0013 · ADR-0014 ·
 ADR-0021. `docs-site/tools/manifest.mjs` is **not** updated for this document (task restricted to one
