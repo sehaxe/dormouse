@@ -255,6 +255,7 @@ def test_the_default_step_is_byte_identical_to_clean_main():
     assert run_hashes(muon, model, 10, torch.float32) == GOLDEN_DEFAULT
 
 
+@pytest.mark.local_pin
 def test_the_fallback_step_is_byte_identical_to_clean_main():
     model = shape_model(SHAPES, dtype=torch.bfloat16)
     muon = Muon(
