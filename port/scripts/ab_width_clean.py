@@ -27,7 +27,6 @@ from __future__ import annotations
 import json
 import statistics
 import subprocess
-import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -72,8 +71,9 @@ ARMS = {
 
 
 def run(arm: str, seed: int) -> float | None:
-    flags = dict(COMMON, **ARMS[arm], seed=seed, ckpt_name=f"wc_{arm}_s{seed}",
-                 out_dir="/tmp/opencode/wc")
+    flags = dict(
+        COMMON, **ARMS[arm], seed=seed, ckpt_name=f"wc_{arm}_s{seed}", out_dir="/tmp/opencode/wc"
+    )
     cmd = [".venv/bin/dormouse", "train", "medium"]
     for k, v in flags.items():
         cmd += ["--set", f"{k}={v}"]
@@ -113,7 +113,10 @@ def main() -> int:
             continue
         m = statistics.mean(v)
         d = m - cm
-        verdict = "ADOPT (tie within bar)" if abs(d) <= bar else ("REJECT (worse)" if d > 0 else "ADOPT (better)")
+        tie = abs(d) <= bar
+        verdict = (
+            "ADOPT (tie within bar)" if tie else ("REJECT (worse)" if d > 0 else "ADOPT (better)")
+        )
         print(f"{arm:12s} {len(v):2d} {m:7.4f} {d:+8.4f}  {verdict}")
     (OUT / "verdict.json").write_text(json.dumps(rows, indent=2))
     return 0

@@ -528,9 +528,9 @@ def test_a_previously_refused_adjoint_tile_launches():
     """
     if mk is None:
         pytest.skip("no triton in this build")
-    assert mk.tile_reason(
-        torch.bfloat16, 32, 64, 8, tiles=dict(mk.TILES, BLOCK_N=256)
-    ) is None, "the guard must allow the measured 256 tile"
+    assert mk.tile_reason(torch.bfloat16, 32, 64, 8, tiles=dict(mk.TILES, BLOCK_N=256)) is None, (
+        "the guard must allow the measured 256 tile"
+    )
     torch.manual_seed(3)
     e, d, r, f = 5, 24, 8, 32
     counts = torch.tensor([0, 3, 7, 2, 6], dtype=torch.int32, device=DEV)
@@ -590,9 +590,7 @@ def test_a_refused_backward_launch_falls_back_counted(monkeypatch):
     rows = order[keep]
     owner = rows // index.shape[1]
     xg = moe._gather_rows(x, owner, dt).detach().clone().requires_grad_(True)
-    counts = torch.bincount(
-        index.reshape(-1)[rows], minlength=moe.n_experts
-    ).to(torch.int32)
+    counts = torch.bincount(index.reshape(-1)[rows], minlength=moe.n_experts).to(torch.int32)
     offs = torch.zeros(moe.n_experts + 1, dtype=torch.int32, device=DEV)
     offs[1:] = torch.cumsum(counts, 0)
     cap = moe._capacity(*index.shape)
@@ -680,9 +678,7 @@ def _compiled_shared(fn, signature, constexprs: dict, warps: int) -> int:
     else:
         arch = 120  # this box's card; a compile-only gate does not need the device
     src = ASTSource(fn, signature=signature, constexprs=constexprs)
-    compiled = tcompile(
-        src, target=GPUTarget("cuda", arch, 32), options={"num_warps": warps}
-    )
+    compiled = tcompile(src, target=GPUTarget("cuda", arch, 32), options={"num_warps": warps})
     return int(compiled.metadata.shared)
 
 
@@ -1384,3 +1380,26 @@ def bench_b1() -> None:
 if __name__ == "__main__":
     bench_small()
     bench_b1()
+
+
+def test_the_naive_dispatch_keeps_every_row_when_keep_is_none() -> None:
+    """`keep=None` is the dropless route on the CPU reference loop too.
+
+    `_padded_dispatch` was fixed for this signature and gated in
+    `test_decode_fast`; the naive arm indexes `sorted_ids[keep]` and ANDed the
+    mask, so it crashed with `TypeError: NoneType & Tensor` the moment the
+    dropless decode lane or a capacity-0 test reached it. Revert: drop the
+    `keep is None` branch -> this test raises instead of passing.
+    """
+    moe = SparseMoE(tiny_cfg(n_experts=4, moe_topk=2, rank=8, moe_kernel="naive"), device="cpu")
+    x = torch.randn(32, 64)
+    index, weight = _routing(moe, x)
+    order = torch.argsort(index.reshape(-1), stable=True)
+    keep = torch.ones_like(index.reshape(-1), dtype=torch.bool)
+
+    with torch.no_grad():
+        every = moe._naive_dispatch(x, weight, index, order, None, Counters())
+        masked = moe._naive_dispatch(x, weight, index, order, keep, Counters())
+
+    assert every.shape == masked.shape == (32, moe.f)
+    assert torch.equal(every, masked), "keep=None must be the all-rows arm bit for bit"
