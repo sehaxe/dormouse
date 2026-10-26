@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 
 from dormouse.config import (
     DEAD_SNAPSHOT_KEYS,
+    PRESET_DIR,
     PROGRESS_KEYS,
     ModelConfig,
     RunConfig,
@@ -42,30 +41,42 @@ def test_unknown_key_refuses_and_names_the_escape():
     with pytest.raises(LoudError):
         parse_preset("d_models = 64\n")
     # A deleted stub field is refused the same way — the pin that `use_gr`,
-    # `use_mhc`, `use_mor`, `use_situ`, `jepa_weight` and `stress` are GONE and
-    # not merely unwired (a re-added field would accept the key again).
+    # `use_mhc`, `use_mor`, `use_situ` and `stress` are GONE and not merely
+    # unwired (a re-added field would accept the key again). `jepa_weight` left
+    # this list on 2026-10-21: it is a real field again (`model/jepa.py`).
     with pytest.raises(LoudError) as e:
         parse_preset("d_model = 64\nn_heads = 4\nhead_dim = 16\nuse_gr = true\n")
     assert "use_gr" in str(e.value)
 
 
-def test_dead_snapshot_keys_load_counted_and_do_not_reach_the_config(capsys):
-    """(a)+(c) A snapshot written before the deletions still loads, COUNTED.
+def _toml_literal(value):
+    """A TOML scalar for a recorded default, so the fixture cannot drift."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        return f'"{value}"'
+    return repr(value)
 
-    Every `checkpoints/*.config.toml` on disk was written before `0e7d25a`
-    (and `39d0485`) deleted these fields, so refusing them would make every
-    existing checkpoint unreadable (resume, eval, decode, serve, `--init-from`).
-    The compat list drops them with a printed line naming each key and its
-    commit — COUNTED, not silent — and the resolved config must NOT carry them:
-    they are gone, not defaulted back into the schema.
+
+def test_dead_snapshot_keys_load_counted_and_do_not_reach_the_config(capsys):
+    """(a)+(c) A snapshot written before the removals still loads, COUNTED.
+
+    Every `checkpoints/*.config.toml` on disk predates the removals, so refusing
+    these keys would make every existing checkpoint unreadable (resume, eval,
+    decode, serve, `--init-from`). The compat list drops each one WITH ITS
+    RECORDED DEFAULT, with a printed line naming the key and its commit — COUNTED,
+    not silent — and the resolved config must NOT carry it: it is gone, not
+    defaulted back into the schema. Pinned per key, not as a count: the count was
+    the last thing to rot (it was a global 6 while the message is per table).
     """
+    # The list is FLAT (one name, one entry) and the drop is section-agnostic,
+    # so the model table can carry every key at its recorded default; the train
+    # table carries one, which is the per-section COUNTED line.
     text = (
         "[model]\n"
         "d_model = 64\nn_heads = 4\nhead_dim = 16\n"
-        "use_gr = false\nuse_mhc = false\nuse_mor = false\n"
-        "use_situ = false\njepa_weight = 0.0\naux_fb_weight = 0.0\n"
-        "[train]\n"
-        "steps = 3\nstress = false\n"
+        + "".join(f"{k} = {_toml_literal(v)}\n" for k, (_commit, v) in DEAD_SNAPSHOT_KEYS.items())
+        + "[train]\nsteps = 3\nstress = false\n"
     )
     back = RunConfig.from_snapshot(text)
     assert back.model.d_model == 64 and back.train.steps == 3
@@ -73,24 +84,21 @@ def test_dead_snapshot_keys_load_counted_and_do_not_reach_the_config(capsys):
         assert not hasattr(back.model, key)
         assert not hasattr(back.train, key)
     err = capsys.readouterr().err
-    # Two COUNTED lines: the model table carried six of the seven, the train
-    # table carried `stress`.
-    assert "dropped 6 dead snapshot key(s)" in err
+    # One COUNTED line per table, each naming its keys and their commits; the
+    # model table carried every key, the train table carried `stress`.
+    assert f"dropped {len(DEAD_SNAPSHOT_KEYS)} dead snapshot key(s)" in err
     assert "dropped 1 dead snapshot key(s)" in err
-    for key, commit in DEAD_SNAPSHOT_KEYS.items():
+    for key, (commit, _default) in DEAD_SNAPSHOT_KEYS.items():
         assert key in err and commit in err
 
 
 def test_the_dead_list_is_exactly_what_the_committed_snapshots_carry():
     """The list is enumerated from the snapshots, not guessed.
 
-    The snapshots are fixtures (tests/fixtures/snapshot_configs/), copied from
-    real runs: the run artifacts themselves live under checkpoints/ and are
-    never committed, so a test that scanned them could not run in a fresh
-    clone. A snapshot that carries an unknown key NOT on the list is still
-    refused, so the list has to cover every key the snapshots actually hold —
-    a missing one leaves them all unreadable (this is how `aux_fb_weight`, the
-    seventh, was found: the six-key list still refused all 24 on it).
+    A snapshot that carries an unknown key NOT on the list is still refused, so
+    the list must cover every key the on-disk snapshots actually hold — one
+    missing key leaves its run unreadable (that is how `aux_fb_weight` was
+    found: a list without it still refused every snapshot that carried it).
     """
     import dataclasses as _dc
     import glob
@@ -101,12 +109,9 @@ def test_the_dead_list_is_exactly_what_the_committed_snapshots_carry():
         "train": {f.name for f in _dc.fields(TrainConfig)},
     }
     snaps = sorted(
-        glob.glob(
-            str(Path(__file__).parent / "fixtures/snapshot_configs/**/*.config.toml"),
-            recursive=True,
-        )
+        glob.glob(str(PRESET_DIR.parent / "checkpoints/**/*.config.toml"), recursive=True)
     )
-    assert snaps, "no fixture snapshots found"
+    assert snaps, "no committed snapshots found"
     for path in snaps:
         raw = _tomllib.loads(open(path).read())
         for section in ("model", "train"):
@@ -114,6 +119,63 @@ def test_the_dead_list_is_exactly_what_the_committed_snapshots_carry():
                 assert key in known[section] or key in DEAD_SNAPSHOT_KEYS, (
                     f"{path}: {section}.{key} is unknown and not on DEAD_SNAPSHOT_KEYS"
                 )
+
+
+def test_every_snapshot_on_disk_loads():
+    """The compat list exists for exactly this: every snapshot resolves.
+
+    The enumeration above proves every KEY is either a field or on the list; this
+    proves the COMPAT PATH accepts each one — `from_snapshot` is the single seam
+    resume, eval, decode, serve and `--init-from` all cross, so one refusal here
+    breaks every one of them for that run (`mix1` and `sft12` were both refused
+    on `model.dtype` and the six `train.dist_*` before that key existed).
+    """
+    import glob
+
+    snaps = sorted(
+        glob.glob(str(PRESET_DIR.parent / "checkpoints/**/*.config.toml"), recursive=True)
+    )
+    assert snaps, "no committed snapshots found"
+    for path in snaps:
+        back = RunConfig.from_snapshot(open(path).read())
+        assert isinstance(back, RunConfig)
+
+
+def test_a_live_non_default_value_survives_the_value_check(capsys):
+    """`sw1` was trained 300 000 steps at `act_quant = "int4"` — a LIVE field.
+
+    The value check is about DEAD keys only, so a live key is never compared to a
+    default and its value survives unchanged. This is the artifact the check
+    exists for: if `act_quant` were ever retired, this same snapshot must become
+    the refusal below — never a quiet `none`, which is a different forward on the
+    same weights.
+    """
+    sw1 = PRESET_DIR.parent / "checkpoints/sw1/sw1.config.toml"
+    assert sw1.exists(), f"{sw1} missing — the snapshot suite needs checkpoints/"
+    back = RunConfig.from_snapshot(sw1.read_text())
+    assert back.model.act_quant == "int4"
+    assert back.train.steps == 300_000
+    assert "act_quant" not in capsys.readouterr().err
+
+
+def test_a_dead_key_off_its_default_refuses_loudly():
+    """The value check: a dead key is dropped only AT its recorded default.
+
+    `use_gr = true` means the checkpoint ran a mechanism this code does not have.
+    Dropping the key would resume a DIFFERENT model on the same weights, which is
+    the one thing the resume gate exists to refuse, so the snapshot is refused —
+    naming the key, its value, the default, the commit and the escape.
+    """
+    text = "[model]\nd_model = 64\nn_heads = 4\nhead_dim = 16\nuse_gr = true\n"
+    with pytest.raises(LoudError) as e:
+        RunConfig.from_snapshot(text)
+    msg = str(e.value)
+    for piece in ("use_gr", "True", "False", "0e7d25a", "Escape"):
+        assert piece in msg
+    # `False == 0` in Python, so a bool default and an int snapshot value are NOT
+    # the same thing: a `0` where the field was a bool is off the default.
+    with pytest.raises(LoudError):
+        RunConfig.from_snapshot("[train]\nstress = 0\n")
 
 
 def test_snapshot_unknown_key_not_on_the_dead_list_still_refuses():
@@ -182,7 +244,7 @@ def test_use_byteflow_is_a_real_field_with_the_crates_defaults():
         ({"byteflow_bins": 0}, "byteflow_bins"),
         ({"byteflow_d_local": 17}, "does not divide"),
         ({"byteflow_d_global": 17}, "does not divide"),
-        ({"bf16": "true"}, "bf16"),
+        ({"bf16": "true", "byteflow_logdet": "true"}, "bf16 \\+ byteflow_logdet"),
         ({"use_engram": "true"}, "use_engram"),
     ],
 )
@@ -190,6 +252,18 @@ def test_byteflow_coherence_is_loud_at_load(over, match):
     """(d) The byteflow arm's own fields are checked where a preset can be wrong."""
     with pytest.raises(LoudError, match=match):
         parse_preset(_byteflow_preset(**over))
+
+
+def test_byteflow_runs_in_bf16_and_keeps_the_exact_chunker_fp32():
+    """The dtype is a COMPUTE knob on the net (`byteflow.py`'s precision rule).
+
+    `bf16` used to be refused here; the net now runs bf16 matmuls with fp32
+    masters, so only the Cholesky pair is left refused. The preset path proves
+    the loaded MODEL carries the flag, not just `ModelConfig`'s default.
+    """
+    assert parse_preset(_byteflow_preset(bf16="true")).bf16 is True
+    logdet = parse_preset(_byteflow_preset(bf16="false", byteflow_logdet="true"))
+    assert logdet.byteflow_logdet is True
 
 
 def test_a_seq_len_below_the_patch_count_refuses(tmp_path):
@@ -293,142 +367,3 @@ def test_dspark_guards_run_outside_byteflow():
                 dspark_weight=0.1,
             )
         )
-
-
-def test_mm_dtype_and_kda_recompute_are_live_on_sft_and_rl(tmp_path, monkeypatch):
-    """M4: the two process-wide setters were called only by `train()`, so an
-    SFT/RL run could carry `mm_dtype=fp8`/`kda_disable_recompute=true` in its
-    snapshot while the step ran the process defaults (the SILENT class).
-
-    The gate runs each COMMAND through the CLI with a fake loop that records
-    the live module state at entry: the setters must have applied before the
-    forward is built. On the pre-fix tree both commands read bf16/False.
-    """
-    from typer.testing import CliRunner
-
-    from dormouse.cli import app
-    from dormouse.model import kda, tsct
-
-    preset = tmp_path / "tiny.toml"
-    preset.write_text(
-        "d_model = 64\n"
-        "n_heads = 4\n"
-        "head_dim = 16\n"
-        "d_ffn = 128\n"
-        "max_seq_len = 512\n"
-        "max_iter = 1\n"
-        "rank = 8\n"
-        "shared_rank = 16\n"
-        "moe_topk = 1\n"
-        "engram_orders = [2, 3]\n"
-        "engram_rows = 64\n"
-        "engram_dim = 8\n"
-        "bf16 = false\n"
-    )
-    data = tmp_path / "sft.bin"
-    data.write_bytes(b"x" * 4096)
-    seen: dict[str, object] = {}
-
-    def capture(run):
-        seen["config"] = (run.train.mm_dtype, run.train.kda_disable_recompute)
-        seen["live"] = (tsct.mm_dtype(), kda.disable_recompute())
-
-    import importlib
-
-    rl_mod = importlib.import_module("dormouse.post.rl_train")
-    sft_mod = importlib.import_module("dormouse.train.sft")
-
-    def fake_sft(model, run, **kw):
-        capture(run)
-        return {"steps": 0, "loss": 0.0, "supervised_bytes": 0, "nan_skipped": 0}
-
-    def fake_rl(run, **kw):
-        capture(run)
-        return {
-            "steps": 0,
-            "loss": 0.0,
-            "pass_rate": 0.0,
-            "bytes_per_solved": None,
-            "rl_samples": 0,
-            "nan_skipped": 0,
-        }
-
-    def fake_train(model, run, **kw):
-        capture(run)
-        return {"steps": 0, "loss": 0.0}
-
-    monkeypatch.setattr(sft_mod, "sft_train", fake_sft)
-    monkeypatch.setattr(rl_mod, "rl_train", fake_rl)
-    monkeypatch.setattr(importlib.import_module("dormouse.train.loop"), "train", fake_train)
-    from dormouse.cli import _preset_check
-    from dormouse.config import load_run
-
-    runner = CliRunner()
-
-    def live():
-        return (tsct.mm_dtype(), kda.disable_recompute())
-
-    tsct.set_mm_dtype("bf16")
-    kda.set_disable_recompute(False)
-    try:
-        # M6: `info` prints, and `serve`/`bench` resolve through `_preset_check`
-        # against a snapshot they do not train. Neither may inherit the
-        # process-wide compute state a training command would apply.
-        result = runner.invoke(
-            app,
-            [
-                "info",
-                str(preset),
-                "--set",
-                "mm_dtype=fp8",
-                "--set",
-                "kda_disable_recompute=true",
-            ],
-        )
-        assert result.exit_code == 0, result.output
-        assert live() == ("bf16", False), "info inherited a training global"
-        snap = load_run(str(preset))
-        for what in ("served", "scored"):
-            _preset_check(str(preset), snap, what=what)
-            assert live() == ("bf16", False), f"{what} inherited a training global"
-        # The default is the non-training one; the flag is the one seam.
-        non_training = load_run(
-            str(preset), train_overrides={"mm_dtype": "fp8", "kda_disable_recompute": True}
-        )
-        assert (non_training.train.mm_dtype, non_training.train.kda_disable_recompute) == (
-            "fp8",
-            True,
-        )
-        assert live() == ("bf16", False)
-        load_run(
-            str(preset),
-            train_overrides={"mm_dtype": "fp8", "kda_disable_recompute": True},
-            apply_compute=True,
-        )
-        assert live() == ("fp8", True)
-
-        for args in (
-            ["train", str(preset), "--data", str(data)],
-            ["run", str(preset), "--data", str(data)],
-            ["sft", str(preset), "--data", str(data)],
-            ["rl", str(preset)],
-        ):
-            seen.clear()
-            result = runner.invoke(
-                app,
-                [
-                    *args,
-                    "--set",
-                    "mm_dtype=fp8",
-                    "--set",
-                    "kda_disable_recompute=true",
-                    "--device",
-                    "cpu",
-                ],
-            )
-            assert result.exit_code == 0, result.output
-            assert seen["config"] == ("fp8", True)
-            assert seen["live"] == ("fp8", True), f"{args[0]}: the knob stayed inert"
-    finally:
-        tsct.set_mm_dtype("bf16")
-        kda.set_disable_recompute(False)

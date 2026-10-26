@@ -101,6 +101,36 @@ KNOWN_DEAD = {
 # KNOWN_DEAD exists at all: the citation is a record, not a link.
 _LEGACY = "moved to the rust-legacy branch (2026-10-19 restructure)"
 LEGACY_DEAD = {
+    # Docs that describe a lane which is NOT merged into this tree. Each names
+    # the branch, so a reader who lands the lane deletes the entry.
+    "docs/architecture/multi-gpu.md": (
+        "ships with the `multigpu` lane (DDP/FSDP2 + the device-capability layer); "
+        "not merged: one card, and the lane is 59 commits off this base"
+    ),
+    "tests/test_device_policy.py": (
+        "ships with the `multigpu` lane (device-capability layer); not merged"
+    ),
+    "tests/test_distributed.py": (
+        "ships with the `multigpu` lane (DDP/FSDP2); not merged"
+    ),
+    "src/dormouse/train/distributed.py": (
+        "ships with the `multigpu` lane (DDP/FSDP2); not merged"
+    ),
+    "src/dormouse/train/device.py": (
+        "ships with the `multigpu` lane (device-capability layer); not merged"
+    ),
+    "src/dormouse/train/ns_triton.py": (
+        "the Triton NS chain lives in `train/ns_kernels.py`; this name was the "
+        "pre-landing placeholder"
+    ),
+    "ns_triton_hook.patch": (
+        "the patch that landed the Triton NS arm; the arm is in the tree, so the "
+        "patch file itself was never needed here"
+    ),
+    "src/dormouse/post/sandbox.py": (
+        "the jail lives inside `post/verifiers.py` (`screen_code`/`run_sandbox`), "
+        "not in a module of its own"
+    ),
     "configs/byteflow.toml": _LEGACY,
     "configs/moe-cap": _LEGACY,
     "configs/mor.toml": _LEGACY,

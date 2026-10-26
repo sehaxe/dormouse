@@ -11,7 +11,7 @@ recall — currently an all-blocks selector `O(t²/r)`, being fixed for memory (
 `2026-10-15-1b-tech-verification.md`, `2026-10-15-tsct-super-kernel.md`,
 `2026-09-27-kda-sota-ceiling.md`, `archive/research/2026-09-26-long-context-agentic.md`,
 `docs/adr/0004-context-ladder.md`, `docs/adr/0014-msa-cut.md`, AGENTS.md §3.5, and the live arm
-(`port/src/dormouse/model/sparse/{sparse,attention}.py`). Then primary sources: arXiv abstracts
+(`src/dormouse/model/sparse/{sparse,attention}.py`). Then primary sources: arXiv abstracts
 and search pages read directly. **Note on tooling:** the arXiv MCP was HTTP-429/timeout for this
 whole session; every ID below was instead resolved on `arxiv.org` (abs page or search-page
 abstract) and is real as of 2026-10-16. Nothing here is cited from a title alone. Marks: **[V]**
@@ -23,7 +23,7 @@ verified against the source · **[ours]** repo fact with file · **[S]** SPECULA
 
 1. **[V] Our "1M recipe" has never run at 1M.** ADR-0004's long gate (512→4k→32k→256k→1M) has
    never executed; the longest config on disk is `max_seq_len = 2048`
-   (`port/configs/b1.toml:13`). "Best recipe" is currently unfalsifiable — there is no long-context
+   (`configs/b1.toml:13`). "Best recipe" is currently unfalsifiable — there is no long-context
    number of ours to compare. That is the honest answer to the owner's question.
 2. **[V] The component mix is *not* what the 2026 frontier ships, but it is close to the
    research frontier.** Frontier: Kimi K3 = KDA + Attention Residuals at a **1M window** (2.8T MoE,
@@ -153,7 +153,7 @@ position-robust recall at 4× the trained length, not a single-needle score.
   share, `O(t·⌈t/r⌉)` score tensor, chunked gather 13.59→3.15 GiB — `port/.../sparse/sparse.py`,
   `sparse/attention.py` (read 2026-10-16).
 - `use_msa = false` in every preset; MSA never won an A/B; the Rust crate was deleted (ADR-0014).
-- Longest config on disk is `max_seq_len = 2048` (`port/configs/b1.toml:13`); ADR-0004's long gate
+- Longest config on disk is `max_seq_len = 2048` (`configs/b1.toml:13`); ADR-0004's long gate
   is unrun.
 - Every paper claim above, against its arXiv abstract or abs page, 2026-10-16.
 - Kimi K3: 2.8T MoE, 104B active, **1M-token window**, KDA + Attention Residuals + Stable
@@ -194,7 +194,7 @@ NoteBank · 2402.10171 Fu et al. · 2107.02027 Krell et al. · 2608.22849 RIBOSP
 2404.06654 RULER · 2410.02694 HELMET · 2609.08574 SinkProbe · 2605.23170 positional failures ·
 2602.13680 AllMem · 2605.22791 GDN-2.
 
-Repo: `port/src/dormouse/model/sparse/{sparse,attention,__init__}.py` · `port/configs/b1.toml` ·
+Repo: `src/dormouse/model/sparse/{sparse,attention,__init__}.py` · `configs/b1.toml` ·
 `docs/adr/0004-context-ladder.md` · `docs/adr/0014-msa-cut.md` ·
 `docs/research/2026-10-16-new-tech-scan.md` · `docs/research/2026-10-15-1b-tech-verification.md` ·
 `docs/research/2026-09-27-kda-sota-ceiling.md` ·

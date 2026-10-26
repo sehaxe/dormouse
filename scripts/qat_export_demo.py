@@ -5,7 +5,7 @@
 
 WHAT IT DOES, in order: load the model (a checkpoint, or `--fresh` from the
 preset), force the QAT projection at `alpha=1` (no training — the projection IS
-the export's numerics), export to `<out-dir>/<name>.dormouse`, reload the file
+the export's numerics), export to `<out-dir>/<name>.qat.pt`, reload the file
 into a fresh model, forward one batch through both, and print the size table
 plus the max `|Δlogits|`. CPU-capable by design: `--preset tiny --fresh` runs
 this end to end in CI; the real use is a GPU checkpoint later.
@@ -30,7 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from dormouse.config import RunConfig, load_preset  # noqa: E402
 from dormouse.instrument import loud  # noqa: E402
 from dormouse.model import DormouseModel  # noqa: E402
-from dormouse.model.export import factor_qat_mode, verify_export, write_export  # noqa: E402
+from dormouse.model.export import export_qat, factor_qat_mode, verify_roundtrip  # noqa: E402
 from dormouse.model.model import param_count  # noqa: E402
 
 
@@ -43,7 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--ckpt-name", default="", help="checkpoint under --out-dir (required unless --fresh)"
     )
     p.add_argument("--out-dir", default="checkpoints", help="checkpoint directory")
-    p.add_argument("--out", default="", help="export path (default <out-dir>/<name>.dormouse)")
+    p.add_argument("--out", default="", help="export path (default <out-dir>/<name>.qat.pt)")
     p.add_argument("--mode", default="ternary", choices=["ternary", "mxfp4"])
     p.add_argument("--device", default="cpu")
     p.add_argument(
@@ -84,18 +84,18 @@ def main(argv: list[str] | None = None) -> int:
         load_model_state(model, run.train, load_model_half(weights))
         source = f"{weights} (its snapshot decides the config)"
     name = args.ckpt_name or args.preset
-    out = Path(args.out) if args.out else Path(args.out_dir) / f"{name}.dormouse"
+    out = Path(args.out) if args.out else Path(args.out_dir) / f"{name}.qat.pt"
     print(f"source: {source} · {param_count(model):,} params")
 
     # The QAT projection at alpha=1, no training: the network the file claims
     # to be. `verify_roundtrip` builds its reference forward from this state.
     with factor_qat_mode(model, args.mode, 1.0):
-        report = write_export(model, out, mode=args.mode, preset=args.preset)
+        report = export_qat(model, out, mode=args.mode)
         print(report.table())
         seq = min(args.seq_len, cfg.max_seq_len)
         gen = torch.Generator().manual_seed(0)
         x = torch.randint(0, cfg.vocab, (args.batch, seq), generator=gen)
-        diff = verify_export(model, out, (x,))
+        diff = verify_roundtrip(model, out, (x,))
     print(
         f"verify: max |Δlogits| = {diff:.3e} over input {tuple(x.shape)} "
         f"(reference = the projection on the fp32 masters, loaded = the file)"

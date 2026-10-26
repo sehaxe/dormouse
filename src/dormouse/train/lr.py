@@ -17,6 +17,16 @@ from __future__ import annotations
 from ..instrument import loud
 
 
+def anneal_alpha(step: int, anneal_steps: int) -> float:
+    """The `factor_qat` soft-to-hard ramp at `step`: `min(1, step / anneal_steps)`.
+
+    A PURE function of the step, which is what lets a resume land on the same
+    alpha. The trainer calls it at the alpha seam (`loop.py`); `anneal_steps <= 0`
+    is the arm being OFF, and the seam does not call it then.
+    """
+    return min(1.0, step / anneal_steps)
+
+
 def wsd_lr(
     step: int,
     *,

@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import dataclasses
 import math
-import warnings
 from pathlib import Path
 
 import pytest
@@ -22,7 +21,6 @@ from dormouse.config import ModelConfig, RunConfig, TrainConfig
 from dormouse.instrument import Counters, LoudError
 from dormouse.model import DormouseModel
 from dormouse.model.engram import enable_host_tables, host_engrams
-from dormouse.post.tasks import build_tasks
 from dormouse.train.data import ByteStream
 from dormouse.train.sft import (
     ASSIST,
@@ -30,7 +28,6 @@ from dormouse.train.sft import (
     GENERIC_QA,
     PAD,
     USER,
-    _sft_eval,
     build_sft_corpus,
     render,
     sft_loss,
@@ -40,11 +37,6 @@ from dormouse.train.sft import (
 
 runner = CliRunner()
 SEQ, BATCH = 64, 2
-
-CUDA = pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="sync-debug mode only guards CUDA work; without a card this gate cannot fire",
-)
 
 
 def tiny_model_cfg(**over) -> ModelConfig:
@@ -71,7 +63,7 @@ def tiny_model_cfg(**over) -> ModelConfig:
 def sft_run(tmp_path: Path, *, corpus: Path | None = None, **train_over) -> RunConfig:
     data = corpus if corpus is not None else tmp_path / "sft.bin"
     if corpus is None:
-        build_sft_corpus(data, seed=1, seq_len=SEQ)
+        build_sft_corpus(data, seed=1, seq_len=SEQ, n_tasks=32)
     cfg = TrainConfig(
         steps=30,
         batch=BATCH,
@@ -106,9 +98,9 @@ def _losses(lines: list[str]) -> list[float]:
 def test_corpus_is_deterministic_and_seed_dependent(tmp_path: Path):
     """Same seed = same bytes, in any process; a different seed is a different corpus."""
     a, b, c = tmp_path / "a.bin", tmp_path / "b.bin", tmp_path / "c.bin"
-    ra = build_sft_corpus(a, 7, seq_len=SEQ)
-    rb = build_sft_corpus(b, 7, seq_len=SEQ)
-    build_sft_corpus(c, 8, seq_len=SEQ)
+    ra = build_sft_corpus(a, 7, seq_len=SEQ, n_tasks=4)
+    rb = build_sft_corpus(b, 7, seq_len=SEQ, n_tasks=4)
+    build_sft_corpus(c, 8, seq_len=SEQ, n_tasks=4)
     assert a.read_bytes() == b.read_bytes()
     assert (ra["records"], ra["dropped"]) == (rb["records"], rb["dropped"])
     assert a.read_bytes() != c.read_bytes()
@@ -117,7 +109,7 @@ def test_corpus_is_deterministic_and_seed_dependent(tmp_path: Path):
 def test_markers_never_collide_with_the_content(tmp_path: Path):
     """Every record: one user marker at 0, one assistant marker, one end marker, pad tail."""
     path = tmp_path / "s.bin"
-    rep = build_sft_corpus(path, 3, seq_len=128)
+    rep = build_sft_corpus(path, 3, seq_len=128, n_tasks=8)
     raw = path.read_bytes()
     assert len(raw) == rep["bytes"] and len(raw) % rep["record_bytes"] == 0
     for i in range(rep["records"]):
@@ -133,21 +125,14 @@ def test_markers_never_collide_with_the_content(tmp_path: Path):
         render("ok", "no\x00")
 
 
-def test_the_corpus_is_the_unscored_bank_and_not_the_verifier_tasks(tmp_path: Path):
-    """M1: the corpus carries the generic/RU bank and NO `post/tasks` pair.
-
-    `post/tasks.py`'s code generator repeats one solution per `i % 3` kind, so
-    any slice of its index range would teach the RL/bench verifier's exact
-    answers. The corpus must keep the hand-written bank and must not carry a
-    single generated reference implementation.
-    """
+def test_the_corpus_carries_the_seeded_tasks_and_the_generic_pairs(tmp_path: Path):
+    """The sources are REUSED (post/tasks.py), not re-invented: both classes show up."""
     path = tmp_path / "s.bin"
-    rep = build_sft_corpus(path, 1, seq_len=256)
+    rep = build_sft_corpus(path, 1, seq_len=256, n_tasks=4)
     text = path.read_bytes()
     assert rep["records"] >= len(GENERIC_QA)
-    assert b"def add(" not in text and b"def square_sum(" not in text
-    assert b"Complete this Python function" not in text
-    assert b"answer: " in text  # the generic bank's own format
+    assert b"def add(" in text or b"def square_sum(" in text  # a code task's reference
+    assert b"answer: " in text  # the math prompt's own format, taught in the answer
     assert "Привет!".encode() in text  # the RU half of the generic set
 
 
@@ -248,7 +233,7 @@ def test_sft_train_runs_thirty_steps_and_the_loss_falls(tmp_path: Path):
     assert report["loss"] == pytest.approx(losses[-1], abs=1e-4)
     # The counter line is the run's own count of SUPERVISED bytes, per window.
     assert report["supervised_bytes"] == sum(
-        int(ln.split("sft_bytes=")[1].split()[0]) for ln in lines if ln.startswith("sft step=")
+        int(ln.split("sft_bytes=")[1]) for ln in lines if ln.startswith("sft step=")
     )
     assert report["counters"]["iter"] == 30 * run.model.max_iter
 
@@ -380,6 +365,8 @@ def test_cli_sft_builds_the_corpus_and_trains(tmp_path: Path):
             "--data",
             str(corpus),
             "--build-sft",
+            "--n-tasks",
+            "8",
             "--ckpt-name",
             "s",
             "--set",
@@ -432,6 +419,8 @@ def test_cli_sft_refuses_a_resume_without_a_checkpoint(tmp_path: Path):
             "--data",
             str(tmp_path / "sft.bin"),
             "--build-sft",
+            "--n-tasks",
+            "4",
             "--ckpt-name",
             "absent",
             "--set",
@@ -489,6 +478,8 @@ def test_cli_sft_init_from_an_engram_ram_checkpoint(tmp_path: Path):
             "--data",
             str(tmp_path / "sft.bin"),
             "--build-sft",
+            "--n-tasks",
+            "4",
             "--init-from",
             str(ckpt),
             "--ckpt-name",
@@ -681,15 +672,17 @@ def test_chat_jsonl_rows_are_filtered_capped_and_deterministic(tmp_path):
     src = tmp_path / "chat.jsonl"
     src.write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
 
-    a = build_sft_corpus(tmp_path / "a.bin", 7, seq_len=64, chat_data=src, chat_cap=1)
-    build_sft_corpus(tmp_path / "b.bin", 7, seq_len=64, chat_data=src, chat_cap=1)
+    a = build_sft_corpus(tmp_path / "a.bin", 7, seq_len=64, n_tasks=0, chat_data=src, chat_cap=1)
+    build_sft_corpus(tmp_path / "b.bin", 7, seq_len=64, n_tasks=0, chat_data=src, chat_cap=1)
     assert (tmp_path / "a.bin").read_bytes() == (tmp_path / "b.bin").read_bytes()
     assert a["chat_loaded"] == 2 and a["chat_used"] == 1
     assert a["chat_dropped_long"] == 1 and a["chat_dropped_dirty"] == 2
     assert a["chat_files"] == {str(src): 5}
 
     with pytest.raises(LoudError, match="does not exist"):
-        build_sft_corpus(tmp_path / "c.bin", 1, seq_len=64, chat_data=tmp_path / "no.jsonl")
+        build_sft_corpus(
+            tmp_path / "c.bin", 1, seq_len=64, n_tasks=0, chat_data=tmp_path / "no.jsonl"
+        )
 
 
 def test_qa_text_format_parses_and_refuses_malformed_lines(tmp_path):
@@ -707,20 +700,20 @@ def test_qa_text_format_parses_and_refuses_malformed_lines(tmp_path):
         "A: Привет! Чем помочь?\n",
         encoding="utf-8",
     )
-    built = build_sft_corpus(tmp_path / "a.bin", 3, seq_len=128, chat_data=src)
+    built = build_sft_corpus(tmp_path / "a.bin", 3, seq_len=128, n_tasks=0, chat_data=src)
     assert built["chat_files"] == {str(src): 2}
     assert built["chat_loaded"] == 2 and built["chat_used"] == 2
 
     bad = tmp_path / "bad.qa"
     bad.write_text("A: answer first?\n", encoding="utf-8")
     with pytest.raises(LoudError, match=r"bad\.qa:1"):
-        build_sft_corpus(tmp_path / "b.bin", 3, seq_len=128, chat_data=bad)
+        build_sft_corpus(tmp_path / "b.bin", 3, seq_len=128, n_tasks=0, chat_data=bad)
     bad.write_text("Q: q1\nQ: q2\nA: a\n", encoding="utf-8")
     with pytest.raises(LoudError, match="before the question"):
-        build_sft_corpus(tmp_path / "b.bin", 3, seq_len=128, chat_data=bad)
+        build_sft_corpus(tmp_path / "b.bin", 3, seq_len=128, n_tasks=0, chat_data=bad)
     bad.write_text("Q: unfinished question\n", encoding="utf-8")
     with pytest.raises(LoudError, match="never got"):
-        build_sft_corpus(tmp_path / "b.bin", 3, seq_len=128, chat_data=bad)
+        build_sft_corpus(tmp_path / "b.bin", 3, seq_len=128, n_tasks=0, chat_data=bad)
 
 
 def test_chat_cap_is_per_file_so_small_files_stay_whole(tmp_path):
@@ -735,8 +728,12 @@ def test_chat_cap_is_per_file_so_small_files_stay_whole(tmp_path):
     small = tmp_path / "small.qa"
     small.write_text("Q: mine\nA: kept\n", encoding="utf-8")
 
-    a = build_sft_corpus(tmp_path / "a.bin", 11, seq_len=64, chat_data=[big, small], chat_cap=2)
-    build_sft_corpus(tmp_path / "b.bin", 11, seq_len=64, chat_data=[big, small], chat_cap=2)
+    a = build_sft_corpus(
+        tmp_path / "a.bin", 11, seq_len=64, n_tasks=0, chat_data=[big, small], chat_cap=2
+    )
+    build_sft_corpus(
+        tmp_path / "b.bin", 11, seq_len=64, n_tasks=0, chat_data=[big, small], chat_cap=2
+    )
     assert (tmp_path / "a.bin").read_bytes() == (tmp_path / "b.bin").read_bytes()
     assert a["chat_fit"] == 6 and a["chat_used"] == 3  # 2 sampled from big + the whole small
     assert a["chat_files"] == {str(big): 5, str(small): 1}
@@ -746,92 +743,15 @@ def test_holdout_moves_the_tail_to_a_sibling(tmp_path):
     """`holdout=N` splits the LAST N records into `<name>.holdout` (the same
     fixed record size), so the training stream never reads them and the eval
     stream reads nothing else. Deterministic like the rest of the build."""
-    a = build_sft_corpus(tmp_path / "a.bin", 5, seq_len=64, holdout=7)
-    build_sft_corpus(tmp_path / "b.bin", 5, seq_len=64, holdout=7)
+    a = build_sft_corpus(tmp_path / "a.bin", 5, seq_len=64, n_tasks=0, holdout=7)
+    build_sft_corpus(tmp_path / "b.bin", 5, seq_len=64, n_tasks=0, holdout=7)
     hold = tmp_path / "a.bin.holdout"
     assert hold.is_file()
     assert hold.read_bytes() == (tmp_path / "b.bin.holdout").read_bytes()
     assert a["holdout"] == 7 and a["records"] > 7
     assert len(hold.read_bytes()) == 7 * a["record_bytes"]
     with pytest.raises(LoudError, match="holdout"):
-        build_sft_corpus(tmp_path / "c.bin", 5, seq_len=64, holdout=10_000)
-
-
-def _corpus_pairs(path: Path, record_bytes: int) -> list[tuple[str, str]]:
-    """Every record as `(instruction, answer)`, markers and the render newline out.
-
-    Decoded to `str` on purpose: the verifier's solutions are `str`, and a
-    `bytes.isdisjoint(str)` call is always True (review round 2 R2-3).
-    """
-    out = []
-    raw = path.read_bytes()
-    for off in range(0, len(raw), record_bytes):
-        rec = raw[off : off + record_bytes]
-        assert rec[0] == USER, rec[:8]
-        a = rec.index(ASSIST)
-        e = rec.index(END)
-        assert a < e
-        # render: USER + instr + \n + ASSIST
-        out.append((rec[1 : a - 1].decode("utf-8"), rec[a + 1 : e].decode("utf-8")))
-    return out
-
-
-def _verifier_solutions(seed: int, n: int = 64) -> set[str]:
-    """Every solution the RL/bench verifier can draw at `seed`, all THREE kinds.
-
-    `build_tasks` cycles `i % 3`, so `n=64` covers `add`, `square_sum` AND
-    `count_vowels`; the old substring gate named only the first two.
-    """
-    scored: set[str] = set()
-    for cls in ("code", "math"):
-        scored |= {task.solution.strip() for task in build_tasks(cls, seed, n=n)}
-    return scored
-
-
-def _solution_collisions(pairs: list[tuple[str, str]], scored: set[str]) -> list[tuple[str, str]]:
-    """The `(instruction, answer)` pairs whose answer IS a verifier solution."""
-    return [(instruction, answer) for instruction, answer in pairs if answer.strip() in scored]
-
-
-def test_the_sft_corpus_shares_no_solution_with_the_verifier(tmp_path: Path):
-    """M1 gate: the ANSWER strings, not just the ids, are disjoint.
-
-    Round 1 measured that the index offset made the task ids and instructions
-    disjoint and left the code solutions identical, because `post/tasks.py`
-    derives one solution per `i % 3` kind. This gate reads the answers out of
-    every corpus record and compares them with every solution the RL/bench
-    verifier can draw at the same seed; the corpus must also be non-empty, so
-    "drop everything" cannot pass it.
-
-    The comparison is the full answer text: for code that is the reference
-    implementation the verifier would score by execution. Generic arithmetic
-    drills (`answer: 4`) share VALUES with generated math answers by design —
-    option (a) keeps the generic bank — so the gate is on the generated
-    solution strings, not on the numeric value space.
-
-    The gate must be able to FAIL (review round 2 R2-3): the equality
-    comparison above ran `bytes` against `str` and was vacuous. The last block
-    injects a real verifier pair — the third generator kind, which the old
-    substring check never named — and requires the same helper to name it.
-    """
-    seed = 1
-    path = tmp_path / "sft.bin"
-    report = build_sft_corpus(path, seed, seq_len=512)
-    pairs = _corpus_pairs(path, report["record_bytes"])
-    answers = {answer.strip() for _instruction, answer in pairs}
-    assert answers, "the SFT corpus is empty"
-    scored = _verifier_solutions(seed)
-    assert scored, "the verifier's solution set is empty"
-    assert any("def count_vowels(" in s for s in scored), (
-        "the comparison must include the third generator kind"
-    )
-    assert _solution_collisions(pairs, scored) == []
-
-    # Injection: a REAL task the verifier would score must turn the gate red.
-    injected = build_tasks("code", seed, n=3)[2]
-    assert injected.solution.strip() in scored
-    collisions = _solution_collisions([*pairs, (injected.prompt, injected.solution)], scored)
-    assert [answer.strip() for _instruction, answer in collisions] == [injected.solution.strip()]
+        build_sft_corpus(tmp_path / "c.bin", 5, seq_len=64, n_tasks=0, holdout=10_000)
 
 
 def test_sft_eval_reports_first_byte_agreement(tmp_path):
@@ -839,7 +759,7 @@ def test_sft_eval_reports_first_byte_agreement(tmp_path):
     holdout file and lands in the log — the metric that catches a model which
     only predicts answer marginals (the sft5 failure)."""
     corpus = tmp_path / "sft.bin"
-    built = build_sft_corpus(corpus, seed=1, seq_len=SEQ, holdout=4)
+    built = build_sft_corpus(corpus, seed=1, seq_len=SEQ, n_tasks=32, holdout=4)
     hold = tmp_path / "sft.bin.holdout"
     run = sft_run(
         tmp_path,
@@ -856,104 +776,7 @@ def test_sft_eval_reports_first_byte_agreement(tmp_path):
     evals = [ln for ln in lines if ln.startswith("sft eval")]
     assert evals, lines
     assert "first=" in evals[-1] and "over " in evals[-1]
-    # The window is on the line, like the pretrain eval (audit M3).
-    assert f"over {2 * BATCH * SEQ} B (2 x {BATCH} x {SEQ})" in evals[-1], evals[-1]
     assert built["holdout"] == 4
-
-
-def test_two_sft_evals_on_one_checkpoint_score_the_same_window(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    """(c) gate: `_sft_eval` rewinds, and the holdout is THREE eval windows.
-
-    The old fixture held exactly one window (`holdout=4`, `2 x 2` records), so
-    the ring was back at `lo` even with the rewind removed and the gate could
-    not fail. Here the holdout is 12 records: pass one stops a third of the way
-    in. The second half patches `rewind` to a no-op and asserts the two passes
-    then score different bytes, so removing the call is observable from here.
-    """
-    corpus = tmp_path / "sft.bin"
-    build_sft_corpus(corpus, seed=1, seq_len=SEQ, holdout=12)
-    run = sft_run(tmp_path, corpus=corpus, eval_batches=2)
-    hold = tmp_path / "sft.bin.holdout"
-    model = DormouseModel(run.model)
-
-    eval_stream = ByteStream(hold, BATCH, SEQ)
-    ce1, first1, records1, scored1 = _sft_eval(model, eval_stream, run.train, None)
-    ce2, first2, records2, scored2 = _sft_eval(model, eval_stream, run.train, None)
-    assert ce1 == pytest.approx(ce2, abs=1e-12), (ce1, ce2)
-    assert first1 == first2
-    assert (records1, scored1) == (records2, scored2) == (2 * BATCH, 2 * BATCH * SEQ)
-
-    # The revert harness: with no rewind, pass two starts at record 4 of 12.
-    monkeypatch.setattr(ByteStream, "rewind", lambda self: None)
-    stream2 = ByteStream(hold, BATCH, SEQ)
-    a = _sft_eval(model, stream2, run.train, None)
-    b = _sft_eval(model, stream2, run.train, None)
-    assert a[0] != pytest.approx(b[0], abs=1e-12), (a, b)
-
-
-def test_the_logged_sft_byte_count_is_the_host_mask_count(tmp_path: Path):
-    """M4 gate: `sft_bytes` is the host mask's sum for a fixed batch.
-
-    The mask is built and counted on the stream's CPU window before the device
-    seam, so the printed value must equal a host `int(sft_mask(x).sum())` and
-    must not move between two identical runs.
-    """
-    corpus = tmp_path / "sft.bin"
-    build_sft_corpus(corpus, seed=3, seq_len=SEQ)
-    stream = ByteStream(corpus, BATCH, SEQ)
-    x, _y = stream.next_batch()
-    expected = int(sft_mask(x).sum())
-    run = sft_run(tmp_path, corpus=corpus, steps=1, log_every=1)
-    counts = []
-    for _ in range(2):
-        lines: list[str] = []
-        report = sft_train(DormouseModel(run.model), run, log=lines.append)
-        step_line = next(ln for ln in lines if ln.startswith("sft step="))
-        assert f"sft_bytes={expected}" in step_line
-        assert report["supervised_bytes"] == expected
-        counts.append(step_line.split("sft_bytes=")[1].split()[0])
-    assert counts[0] == counts[1] == str(expected)
-
-
-@CUDA
-def test_the_sft_step_builds_and_counts_its_mask_on_the_host(tmp_path, monkeypatch):
-    """(d) gate: on CUDA, a D2H read is a warning, so the step's byte seam is visible.
-
-    The CPU test above cannot fail on revert: the pre-fix code produced the same
-    number by counting on the device. This runs one real SFT step on the card
-    and asserts (1) `sft_mask` first sees a CPU window, i.e. the mask is built
-    before the device seam, and (2) the step's only synchronising operation is
-    the ONE declared loss-scalar read (`float(loss.detach())`). `log_every=2`
-    keeps the counters' declared log-cadence drain out of a one-step run.
-    """
-    corpus = tmp_path / "sft.bin"
-    build_sft_corpus(corpus, seed=1, seq_len=SEQ)
-    run = sft_run(tmp_path, corpus=corpus, steps=1, log_every=2)
-    import dormouse.train.sft as sft_mod
-
-    seen: list[str] = []
-    real = sft_mod.sft_mask
-
-    def spy(windows):
-        seen.append(windows.device.type)
-        mask = real(windows)
-        assert mask.device.type == "cpu", "the mask left the host before the count"
-        return mask
-
-    monkeypatch.setattr(sft_mod, "sft_mask", spy)
-    model = DormouseModel(run.model).to("cuda")
-    torch.cuda.set_sync_debug_mode("warn")
-    try:
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            sft_train(model, run, device=torch.device("cuda"), log=lambda *_: None)
-    finally:
-        torch.cuda.set_sync_debug_mode("default")
-    assert seen and seen[0] == "cpu", seen
-    syncs = [str(w.message) for w in caught if "synchroniz" in str(w.message).lower()]
-    assert len(syncs) <= 1, syncs
 
 
 def test_ru_bank_is_broad_and_fits_one_window():

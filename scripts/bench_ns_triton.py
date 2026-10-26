@@ -48,37 +48,15 @@ from dormouse.instrument import Counters  # noqa: E402
 from dormouse.train import ns_kernels as nk  # noqa: E402
 from dormouse.train.optim import Muon, zeropower_via_ns  # noqa: E402
 
+# `scripts/` is not a package (a test loads this file by path): the lane guard is
+# a sibling file, so its directory goes on the path, APPENDED not inserted (a
+# script name at the front of `sys.path` would shadow a package of that name).
+sys.path.append(str(Path(__file__).resolve().parent))
+from _lane import preflight  # noqa: E402
+
 #: The medium preset (141.9M params, 90.9M in the Muon group, 12 shapes) — the
 #: scale the research note's A/B protocol runs at.
 MEDIUM = "medium"
-
-
-def preflight() -> str | None:
-    """`None` when the card may be used, else why not (AGENTS §1.5)."""
-    if not torch.cuda.is_available():
-        return "no CUDA device"
-    try:
-        busy = subprocess.run(
-            ["pgrep", "-f", "dormouse trai[n]"], capture_output=True, text=True, timeout=15
-        ).stdout.strip()
-        used = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.used,utilization.gpu", "--format=csv,noheader"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        ).stdout.strip()
-    except Exception as e:  # noqa: BLE001 - a bench's precondition, not a run's
-        return f"cannot check the card ({e})"
-    if busy:
-        return f"a training run is live (pids {busy.replace(chr(10), ' ')})"
-    # `nvidia-smi --format=csv,noheader` prints `694 MiB, 3 %`: the NUMBER is the
-    # first whitespace token. Splitting on the comma leaves `694 MiB` and `int()`
-    # dies on it (the battery's `ValueError: invalid literal for int()`), which
-    # turned a free card into a refused bench.
-    mib = int(used.split()[0]) if used else -1
-    if mib >= 1024:
-        return f"the card already holds {mib} MiB ({used})"
-    return None
 
 
 def dispatch_counts(fn) -> tuple[int, int]:
@@ -249,7 +227,17 @@ if __name__ == "__main__":
     bench_cpu()
     if only_cpu:
         raise SystemExit(0)
-    why = preflight()
+    why = preflight("cuda")
+    if why is None:
+        # This bench's own ceiling is 1 GiB, tighter than the lane guard's 2.0:
+        # a card already holding a second model is contended however idle it looks.
+        smi = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if smi and int(smi.split()[0]) >= 1024:
+            why = f"the card already holds {smi.split()[0]} MiB (this bench's ceiling is 1024)"
     if why is not None:
         print(f"\n=== GPU sections REFUSED: {why} ===")
         print("  one GPU thing at a time (AGENTS §1.5). Nothing was allocated. Re-run when idle.")

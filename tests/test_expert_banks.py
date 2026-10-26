@@ -85,7 +85,9 @@ def test_a_cache_entry_that_cannot_serve_a_tracked_forward_is_rebuilt():
         g_u, u_u, v, g_s, u_s = moe._banks(dt)
         assert not g_u.requires_grad
     moe._bank_cache = (
-        (dt, moe.factor_qat, moe.factor_qat_alpha, versions, True),
+        # The key shape is `_banks`': the experts' `_version`s, then the SHARED
+        # basis's (`()` when `share_u` is off — this MoE), then the grad state.
+        (dt, moe.factor_qat, moe.factor_qat_alpha, versions, (), True),
         (g_u, u_u, v),
         (g_s, u_s),
     )

@@ -82,9 +82,14 @@ import argparse
 import json
 import statistics
 import subprocess
+import sys
 from pathlib import Path
 
-import torch
+# `scripts/` is not a package (a test loads this file by path): the lane guard is
+# a sibling file, so its directory goes on the path, APPENDED not inserted (a
+# script name at the front of `sys.path` would shadow a package of that name).
+sys.path.append(str(Path(__file__).resolve().parent))
+from _lane import preflight, skip  # noqa: E402
 
 #: The port's data on this box (AGENTS §2.6) — the LOCAL copy, so the driver does
 #: not depend on the /mnt drive being mounted.
@@ -112,38 +117,6 @@ ACT_GROUP = 0
 #: The arms, control first so the table reads against it. `mxfp8` / `v2_*` are
 #: deliberately absent — the module docstring names why.
 ARMS = ("none", "int8", "int4", "fp4")
-
-
-def skip(why: str) -> int:
-    """A loud SKIP: the reason, and no table. Exit 0 — the code is not at fault."""
-    print(
-        f"\n=== SKIP: {why}\n"
-        f"=== ONE GPU PROCESS AT A TIME (AGENTS §1.5): nothing was measured, so there\n"
-        f"=== is no number to quote. Re-run when the card is free.\n",
-        flush=True,
-    )
-    return 0
-
-
-def preflight(device: str) -> str | None:
-    """`None` when the card is ours, else the reason to skip (bench_opt.py's)."""
-    if device == "cpu":
-        print("[preflight] device=cpu: the card checks do not apply", flush=True)
-        return None
-    # The bracket keeps `pgrep` from matching this script's own command line.
-    busy = subprocess.run(
-        ["pgrep", "-af", "dormouse trai[n]"], capture_output=True, text=True
-    ).stdout.strip()
-    if busy:
-        return f"a dormouse process is alive:\n{busy}"
-    if not torch.cuda.is_available():
-        return "device=cuda but no CUDA device is visible"
-    free, total = torch.cuda.mem_get_info()
-    used = (total - free) / 2**30
-    if used >= 2.0:
-        return f"the card already holds {used:.2f} GiB (the preflight's ceiling is 2.0)"
-    print(f"[preflight] no dormouse process; card holds {used:.2f} GiB", flush=True)
-    return None
 
 
 def _overrides(arm: str, seed: int, out: Path, args: argparse.Namespace) -> tuple[dict, dict]:

@@ -174,7 +174,7 @@ at b1). Run it only if #1-#3 leave the BPB-vs-AdamW gap unresolved.
 
 | # | files to touch | LOC | gates it needs |
 |---|---|---|---|
-| **#1 Turbo-Muon Triton** | new `src/dormouse/train/ns_kernels.py` (3 kernels + AOL + `zeropower_via_ns_triton`, 3-D batched, `[N,64,K]` in — the same orientation `zeropower_via_ns` already transposes to; the file shipped under this name, 2026-10-18); `optim.py` `NS_KINDS` (+1 name) and one branch in `zeropower_via_ns`; `config.py` `NS_KINDS` mirror. **`ns_steps` needs no code** | ~130 | (a) **not** bit-identity — a *tolerance* gate against classic on saved b1/medium buffers: `‖outᵀout − I‖_F/rank` and cosine to the classic polar, because AOL is a different starting point, not a regrouping (unlike the Gram-NS gate in `tests/test_muon_gram.py`); (b) **default-path bit-identity**: `ns_kind="classic"` must produce the byte-identical tensor it does today; (c) COUNTED skip when triton is absent or the tensor is not CUDA — never a silent fallback (ADR-0019); (d) the 4-iteration arm's orthogonality bound, since it is the arm that changes the math |
+| **#1 Turbo-Muon Triton** | new `src/dormouse/train/ns_triton.py` (3 kernels + AOL + `zeropower_via_ns_triton`, 3-D batched, `[N,64,K]` in — the same orientation `zeropower_via_ns` already transposes to); `optim.py` `NS_KINDS` (+1 name) and one branch in `zeropower_via_ns`; `config.py` `NS_KINDS` mirror. **`ns_steps` needs no code** | ~130 | (a) **not** bit-identity — a *tolerance* gate against classic on saved b1/medium buffers: `‖outᵀout − I‖_F/rank` and cosine to the classic polar, because AOL is a different starting point, not a regrouping (unlike the Gram-NS gate in `tests/test_muon_gram.py`); (b) **default-path bit-identity**: `ns_kind="classic"` must produce the byte-identical tensor it does today; (c) COUNTED skip when triton is absent or the tensor is not CUDA — never a silent fallback (ADR-0019); (d) the 4-iteration arm's orthogonality bound, since it is the arm that changes the math |
 | **#2 NorMuon row stats** | `optim.py`: a `[N, m]` `v` buffer on `_MomGroup` (built in `_build_groups`, so `load_state_dict` keeps working), the post-NS step in `batched_step_from_model` **and** `_step_one` (one definition, two callers — the file's own rule); `config.py` a `muon_norm: colrow\|nor` arm + the mirror tuple | ~45 | (a) a hand-computed gold step on a `[2,3]` matrix, 2 steps, pinning `v` and `O` as literals (the `test_dspark_gold` idiom); (b) default-path bit-identity for `colrow`; (c) checkpoint round-trip of the new state key — the state dict is per-parameter (`optim.py:363-366`), so a new key must survive save→load and a *pre-existing* checkpoint must fill it |
 | **#3 `ns_steps 4`** | none — `config.py:432`, `loop.py:483` | 0 | no gate; the A/B is the gate |
 | **#4 Muon-VS** | `optim.py`: a full-size `Γ` buffer per shape group + the update in `_momentum_update_`'s neighbourhood; `config.py` an arm name | ~60 | same three gates as #2, plus a memory assertion (the buffer is `mn`, so it must ride the existing chunking or it OOMs a 16 GB card at b1) |
@@ -219,9 +219,9 @@ Code read: `microsoft/dion` (tree, `README.md`, `requirements_gns.txt`,
 `thib-s/flash-newton-schulz` (README) · `zichongli5/NorMuon` (repo metadata only —
 **the code was not read**). Turbo-Muon's HAL preprint is
 `hal.science/hal-05390446`.
-Repo: `port/src/dormouse/train/optim.py:67,106,153-214,303-354,450-605` ·
-`port/src/dormouse/config.py:432,458-504` · `port/src/dormouse/train/loop.py:483` ·
-`port/src/dormouse/model/tsct.py:1-15` · `configs/medium.toml` ·
+Repo: `src/dormouse/train/optim.py:67,106,153-214,303-354,450-605` ·
+`src/dormouse/config.py:432,458-504` · `src/dormouse/train/loop.py:483` ·
+`src/dormouse/model/tsct.py:1-15` · `configs/medium.toml` ·
 `docs/reviews/2026-10-16-b1-profile.md:9-43` ·
 `docs/research/2026-10-16-muon-orthogonalization-cost.md` ·
 `docs/research/2026-10-16-sf-muon.md` · `.bulba/memory.md:317` ·

@@ -24,7 +24,7 @@ TSCT/LittleBit quant ladder · MSA sparse re-entry (recipe fixed) · Nemotron-CC
 1. **[A] Our loop is exactly the regime one Oct-2026 paper says is stuck.** `2610.01153` opens: *"the gains
    from additional iterations diminish quickly and can even turn into degradation, so the extra FLOPs spent
    on looping yield little substantial improvement. Consequently, prior work typically settles on two loops."*
-   That is `port/configs/b1.toml` (`max_iter 4`, operating depth 2) and `small` (operating depth 2). Its fix
+   That is `configs/b1.toml` (`max_iter 4`, operating depth 2) and `small` (operating depth 2). Its fix
    (LOOM: bounded residual updates + input re-injection per loop + **per-loop routers** + a looping residual)
    is measured at **100M–1.7B, stable to 9–12 loops** — our scale band, not a toy.
 2. **[A] A newer paper changes the recurrence verdict we hold.** Our `φ = 0.46` is a single-axis fit
@@ -117,7 +117,7 @@ one that buys depth >2. **[S2]** at b1 the win is conditional on the MoE arm beh
 
 ### 2.2 MoE under repeated data — `2609.11917` (2026-09-10) — a gate, not a feature
 **What changes.** Nothing in the model; it changes *what we are allowed to believe*. b1 is a 1.07B-total /
-57M-active MoE [ours `port/configs/b1.toml`] trained on a 19.7 GB corpus that the recipe re-reads up to ~4×
+57M-active MoE [ours `configs/b1.toml`] trained on a 19.7 GB corpus that the recipe re-reads up to ~4×
 [ours `2026-09-26-byte-lm-recipes.md`]. The paper's boundary — "MoEs begin to suffer at 4x" — sits exactly on
 our corpus. If it transfers, every b1 MoE conclusion is measured in the one regime where MoE is documented to
 lose its advantage, and the "MoE null result" in `2026-10-16-token-skipping.md` needs a repetition-controlled

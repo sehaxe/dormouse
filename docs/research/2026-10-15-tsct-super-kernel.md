@@ -14,7 +14,7 @@ carry file:line.
 | constant | value | source |
 |---|---|---|
 | card | RTX 5060 Ti 16 GB, sm_120 (12,0), driver 615.78.08, torch 2.13.0+cu129, triton 3.7.1 | spike `docs/research/2026-10-15-torch-spike.md:60-77` |
-| b1 shape | d 2048 · H 32×64 · d_ffn 5461 · rank 64 · 2 iters · E 1024 topk-2 · shared rank 192 · 1,066,354,113 params, ~57M active/token (port counts ~37.9M touched per pass) | plan `:67-87`; `port/configs/b1.toml:8-39,89-120`; tests/test_param_count.py |
+| b1 shape | d 2048 · H 32×64 · d_ffn 5461 · rank 64 · 2 iters · E 1024 topk-2 · shared rank 192 · 1,066,354,113 params, ~57M active/token (port counts ~37.9M touched per pass) | plan `:67-87`; `configs/b1.toml:8-39,89-120`; tests/test_param_count.py |
 | the sm_120 quirk | SM12x has NO tcgen05/TMEM; warp-level `mma.sync` + NVFP4 blockscaled `m16n8k64` atom; TMA, CLC, PDL available; SM10x kernels incompatible, SM8x kernels run reasonably | Colfax tutorial (2026-06-20); **already known in-repo**: `docs/reviews/tsct2-design-2026-10-04.md:28` ("sm_120: block-scaled MMA mxf4nvf4, ~99 КБ smem, нет tcgen05") |
 | expert pass (PORT, THIS card) | **50.6 ms / 6.05 GiB fwd-only**, padded bmm arm, E=1024 r=64 f=5461 cap=64, 16384 rows bf16; naive arm 571 ms (11.3×); parity padded-vs-naive fp32 1.8e-6 | `.bulba/memory.md:306` |
 | spike expert variant | fwd 21.4 ms / fwd+bwd 52.6 ms (cap-padded bmm), 2.94 / 3.60 padded TFLOP/s; `torch._grouped_mm` 44.2 ms = 2× SLOWER, REJECTED; ragged grouped ~19 µs/group flat | spike `:143-157`, plan `:352-356`; memory.md:306 |
@@ -291,9 +291,9 @@ compilation is the named-headroom number re-attributed [S until profiled]. Littl
 §4.1 spike verdict :352-368; §7 :477-486; TSCT2 quotes :253-258, :249-252);
 `docs/research/2026-10-15-torch-spike.md` (:60-77 env; :87-127 bench A; :130-192 bench B;
 :195-272 bench C + profiler; :360-404 memory/LOC); `.bulba/memory.md:306` (port b1 profile);
-`port/src/dormouse/model/experts.py` (docstring :18-35; `_permute` :168-184; `_banks`
-:202-214; `_padded_dispatch` :216-264); `port/src/dormouse/model/kda.py:1-49,157-210`;
-`port/src/dormouse/model/tsct.py:1-27,140-155`; `port/configs/b1.toml:8-39,55-90,120`;
+`src/dormouse/model/experts.py` (docstring :18-35; `_permute` :168-184; `_banks`
+:202-214; `_padded_dispatch` :216-264); `src/dormouse/model/kda.py:1-49,157-210`;
+`src/dormouse/model/tsct.py:1-27,140-155`; `configs/b1.toml:8-39,55-90,120`;
 `docs/reviews/littlebit-design-2026-10-15.md:1-100`; `docs/reviews/tsct2-design-2026-10-04.md:28,139-170`.
 
 **Web (fetched 2026-10-15).** ThunderKittens README (github.com/HazyResearch/ThunderKittens;

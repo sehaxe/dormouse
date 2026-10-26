@@ -30,13 +30,16 @@ program on sm_120 has, and none of which is a measurement of our pass.
 1. `order = argsort(flat_ids)` -> `rows = order[keep]` -> `owner = rows // k`
    (`experts.py:982-983`). This IS the row->token map the fused kernel needs,
    and the pass already builds it — one `int32` cast is the whole ABI delta.
-2. `xg = x[owner].to(dt)` (`experts.py:990`) — THE GATHER. `x` arrives fp32
-   (`nn.RMSNorm`'s output; MEASURED 2026-10-18, see
-   `tests/test_moe_sonic.py::test_the_moe_input_is_fp32_so_the_gather_is_two_copies`)
-   and `dt` is bf16, so this line is a fp32 `index_select` (one [R,d] copy
-   written) followed by a bf16 cast (a second [R,d] copy written), and
-   `_glu_kernel` then loads the bf16 copy (`moe_kernels.py:306`). Four
-   [R,d]-sized transfers where the fused load has one.
+2. `xg = x[owner].to(dt)` (`experts.py:1621`) — THE GATHER. Since the loop's
+   SEAM cast (`loopblock.LoopBlock._moe_branch`, 2026-10-21) `x` arrives in
+   `dt` (bf16), so `SparseMoE._gather_rows` skips the cast and this line is
+   ONE `index_select` (an [R,d] copy written) that `_glu_kernel` reads back
+   (`moe_kernels.py:306`): 4·R·d, the copy plus the kernel's read. The fp32
+   seam paid 12·R·d (fp32 copy, cast read, bf16 write, bf16 read); four
+   [R,d]-sized transfers became two, and the fused load still has one.
+   `pass_bytes(..., x_bytes=4)` prices the fp32 control, which is what
+   `tests/test_moe_sonic.py` uses to prove the number moved because the seam
+   moved.
 3. `y [R,f]` written by the kernel (`moe_kernels.py:351`) and read back by the
    combine (`moe_kernels.py:531`) — the second [R,f]-sized activation, needed
    by the `dw` reduction.
@@ -51,11 +54,11 @@ with `tomllib` and asserts them, so a geometry change fails the table:
 |---|---|---|
 | geometry (E, d, f, r) | 256, 1024, 2730, 64 | 1024, 2048, 5461, 64 |
 | rows R = T·k | 49 152 | 16 384 |
-| the gather, four transfers | 805 306 368 B (768 MiB) | 536 870 912 B (512 MiB) |
-| the same rows, fused (one read) | 201 326 592 B (192 MiB) | 134 217 728 B (128 MiB) |
-| **forward saving** | **603 979 776 B (576 MiB)** | **402 653 184 B (384 MiB)** |
-| share of the forward's HBM bytes | 34% | 17% |
-| forward traffic, all of it | 1 798 438 912 B | 2 336 849 920 B |
+| the gather, three transfers (bf16 seam) | 301 989 888 B (288 MiB) | 201 326 592 B (192 MiB) |
+| the same rows, fused (one read) | 100 663 296 B (96 MiB) | 67 108 864 B (64 MiB) |
+| **forward saving** | **201 326 592 B (192 MiB)** | **134 217 728 B (128 MiB)** |
+| share of the forward's HBM bytes | 16% | 7% |
+| forward traffic, all of it | 1 295 122 432 B | 2 001 305 600 B |
 | fwd->bwd cache | 382 MiB (xg 96, y 256, gates 30) | 245 MiB (xg 64, y 171, gates 10) |
 | fwd->bwd cache, fused + no `y` cache | 78 MiB | 42 MiB |
 | backward, dy copy + 2 reads | 1024 MiB | 683 MiB |
@@ -63,10 +66,13 @@ with `tomllib` and asserts them, so a geometry change fails the table:
 
 Two results that do NOT follow the paper, both from the same two facts — our
 `grad_out` is **fp32** (`_Combine.backward` asserts it, `moe_kernels.py:1080`)
-while our `dy` is bf16, and our `x` is **fp32** while the compute dtype is bf16:
+while our `dy` is bf16, and the MoE's OUTPUT is **fp32** while the routed
+interior is bf16:
 
-* the **forward** fusion is a real byte win: two of the four transfers are
-  copies that exist only because the ABI materializes the permutation;
+* the **forward** fusion is a real byte win, but a smaller one since the loop
+  casts `normed` to the bank dtype at its seam (2026-10-21): the transfer that
+  exists only because the ABI materializes the permutation is 4·R·d, where the
+  fp32 seam paid 12·R·d;
 * the **backward** fusion is a byte LOSS: gathering `dout` inside the `dH`
   kernel means two [R,f] reads at 4 B/element (8Rf) where the shipped pass
   writes 2Rf and reads 2·2Rf (6Rf). The paper's "-2TKd bytes" assumes a bf16
@@ -86,7 +92,7 @@ weight multiply 6.7 ms, the scatter 5.5 ms against a 6.7 ms bmm chain
 (`.bulba/memory.md:312`, 2026-10-15). The research doc's "up to 15-25% step IF
 the pass is unlanded" (`docs/research/2026-10-18-throughput-leftovers.md` §4.2)
 is therefore NOT met. Honest expectation here: **<=1% of the step, most likely
-<0.5%** — the bytes removed are 17% of a forward whose 2 337 MB of traffic runs
+<0.5%** — the bytes removed are 7% of a forward whose 2 001 MB of traffic runs
 inside a measured 16.5 ms (`configs/b1.toml:47`), i.e. at ~32% of this card's
 ~450 GB/s ceiling (the figure `docs/research/2026-10-15-tsct-super-kernel.md:54`
 uses), and part of the bank re-read is served by L2 — so bytes removed do not
@@ -112,23 +118,46 @@ card):
   is the fine-grained-MoE problem §3.2 of the paper names, and it is not
   something the gather fusion touches.
 
-**The prototype.** `_gather_glu_kernel` is a REAL Triton kernel —
-`_glu_kernel`'s forward phase with ONE substitution, the A pointer's row index
-becomes `toks[row]` — with `fused_reference` (its math, in torch) and
-`gather_abi` (the `(toks, offs)` pair, built from the permute's own outputs)
-beside it so the mechanism is testable without a card. It is NOT wired into
-`experts.py` (this lane does not hold that file); the seam it would land on is
-`_triton_dispatch`'s `xg = x[owner].to(dt)` line. PROVEN on CPU: the ABI
-(`x[toks]` is bit-identical to the copy the pass gathers), the reference math
-against the module's own `_naive_dispatch`, the address audit (no read outside
-`x`, and every masked lane reads row 0), and that the kernel COMPILES for
-sm_120 (`triton.compile`, host ptxas; the precedent is
+**The prototype — and the arm it is wired as.** `_gather_glu_kernel` is a REAL
+Triton kernel — `_glu_kernel`'s forward phase with ONE substitution, the A
+pointer's row index becomes `toks[row]` — with `fused_reference` (its math, in
+torch) and `gather_abi` (the `(toks, offs)` pair, built from the permute's own
+outputs) beside it so the mechanism is testable without a card. PROVEN on CPU:
+the ABI (`x[toks]` is bit-identical to the copy the pass gathers), the reference
+math against the module's own `_naive_dispatch`, the address audit (no read
+outside `x`, and every masked lane reads row 0), and that the kernel COMPILES
+for sm_120 (`triton.compile`, host ptxas; the precedent is
 `tests/test_moe_kernel.py::test_the_fused_kernels_compile_for_this_arch`).
 MEASURED on the card, 2026-10-18: the preflight found it IDLE (849 MiB, no
 `dormouse train` process), so the two parity gates RAN instead of skipping —
 the fused kernel is `expert_gemm_glu`'s numbers at fp32, at bf16, and on the
-dropless static bound. STILL unmeasured: the kernel's TIME, which needs a bench
-and not a gate.
+dropless static bound.
+
+**WIRED 2026-10-21 as `moe_gather = "kernel"`** (`experts.SparseMoE.
+_gather_dispatch`), because the owner's instruction was to put it in the tree and
+MEASURE it rather than delete it on an estimate. What that means for a reader
+deciding whether to believe a number:
+
+* the FORWARD is the kernel: `gather_abi` builds `(toks, offs)` from the
+  permute's own `order`/`keep`, and `gather_glu` is the one entry point;
+* the BACKWARD is **the shipped grouped adjoint, recomputed on the same rows**
+  (`gather_glu`'s `_GatherGlu`), because the prototype has no adjoint of its
+  own. So the forward saves `x`, `toks` and `y` and NOT `xg` or the GLU gates,
+  and the arm pays ONE extra forward per step. The parity gate's gradient half
+  therefore tests the row map and the wiring, not a new adjoint;
+* the arm is refused (LOUD) off the bf16 loop-stack route, with the adaptive
+  width and with `factor_qat` — `config.validate` names each reason;
+* **the two findings stand**: the forward is a byte WIN (the ABI's gathered copy
+  and the kernel's read of it are 4·R·d since the loop's seam cast, 12·R·d on
+  the fp32 control) and the backward is a byte LOSS
+  (`grad_out` is fp32 while `dy` is bf16, so gathering it costs two fp32 `[R, f]`
+  reads against a bf16 copy that is written once and read twice). **The
+  MEASUREMENT decides what ships** — `scripts/bench_gather.py` prices both
+  passes from the code's own layout at the `b1` and `medium` shapes and times
+  them; until that runs there is **no speed claim in this file at all**, only
+  the byte arithmetic above and the estimate `<=1% of the step, most likely
+  <0.5%`.
+
 """
 
 from __future__ import annotations
@@ -147,14 +176,23 @@ except Exception as exc:  # noqa: BLE001 — the reason is raised by the launche
 else:
     _TRITON_WHY = None
 
-#: The dtype the MoE input ARRIVES in. Not a guess: `normed = self.norm(ctx)` is
-#: an `nn.RMSNorm` over the fp32 loop state (`loopblock.py:278,130`), and
-#: `tests/test_moe_sonic.py` measures it through a real `DormouseModel` forward
-#: in both precision modes. It is 4 bytes because of that, and the whole
-#: two-copies claim of the accounting hangs on it.
-X_BYTES = 4
+try:  # the SHIPPED grouped forward: the arm's backward re-runs it (`gather_glu`)
+    from . import moe_kernels
+except Exception as exc:  # noqa: BLE001 — the reason is raised by `gather_glu`
+    moe_kernels = None  # type: ignore[assignment]
+    _SHIPPED_WHY: str | None = f"the shipped grouped GEMM is not importable here: {exc}"
+else:
+    _SHIPPED_WHY = None
+
 #: The compute dtype the banks and the kernels use (`bf16 = true`, b1's setting).
 DT_BYTES = 2
+#: The dtype the routed pass's `x` ARRIVES in. It moved 4 -> 2 on 2026-10-21
+#: with the loop's SEAM cast (`loopblock.LoopBlock._moe_branch`): the residual
+#: stream is still fp32, but the MoE branch is handed `dt` once, so the gather
+#: is one `index_select` instead of an fp32 copy plus a cast copy. The model
+#: tests measure it through a real `DormouseModel` forward in both precision
+#: modes; `pass_bytes(..., x_bytes=4)` still prices the fp32-seam control.
+X_BYTES = DT_BYTES
 #: The MoE output / `grad_out` dtype: `SparseMoE.forward` returns fp32 and
 #: `_Combine.backward` asserts fp32 (`moe_kernels.py:1080`).
 GRAD_BYTES = 4
@@ -216,12 +254,13 @@ def pass_bytes(
     rows = shape.rows
     xg = rows * d  # one [R, d] copy, in elements
     y = rows * f
+    cast = x_bytes != dt_bytes  # the fp32 seam's `.to(dt)`; skipped at the bf16 seam
     out = {
         # --- the forward -------------------------------------------------
         "x_read": xg * x_bytes,  # `x[owner]`'s source rows (kept by the fusion)
-        "xg_write": xg * x_bytes,  # the fp32 `index_select` result
-        "xg_cast_read": xg * x_bytes,  # `.to(dt)`'s read
-        "xg_dt_write": xg * dt_bytes,  # the bf16 copy the kernel gets today
+        "xg_write": xg * x_bytes,  # the `index_select` result, in x's dtype
+        "xg_cast_read": xg * x_bytes if cast else 0,  # `.to(dt)`'s read
+        "xg_dt_write": xg * dt_bytes if cast else 0,  # the bf16 copy a cast writes
         "xg_read": xg * dt_bytes,  # `_glu_kernel`'s A load (moe_kernels.py:306)
         "y_write": y * dt_bytes,  # the pass's [R, f] output
         "y_read": y * dt_bytes,  # `combine`'s read of it (`dw`)
@@ -249,8 +288,11 @@ def pass_bytes(
             "gates_write",
         )
     )
-    # The fusion removes the fp32 copy, its cast-read, the bf16 copy and the
-    # kernel's read of that copy; the source read stays.
+    # What the fusion removes: the copy the ABI materializes and the kernel's
+    # read of it, plus the cast pair WHEN there is one. At the bf16 seam that
+    # is 4·R·d (`xg_write` + `xg_read`); at the fp32 control it is 12·R·d
+    # (fp32 copy + cast read + bf16 write + kernel read). The source read
+    # (`x_read`) stays either way.
     out["forward_gather_saving"] = (
         out["xg_write"] + out["xg_cast_read"] + out["xg_dt_write"] + out["xg_read"]
     )
@@ -259,9 +301,93 @@ def pass_bytes(
     # NEGATIVE at these shapes: the fp32 `grad_out` is twice the bf16 `dy` it
     # would replace, and it would be read twice (docstring).
     out["backward_gather_saving"] = out["backward_adjoint_current"] - out["backward_adjoint_fused"]
+    # The gathered bf16 copy the forward keeps for the backward: the cast's
+    # write at the fp32 seam, the `index_select`'s own result at the bf16 one.
+    out["xg_copy"] = xg * dt_bytes
     # What the forward leaves on the device for the backward.
-    out["cached_activation"] = out["xg_dt_write"] + out["y_write"] + out["gates_write"]
+    out["cached_activation"] = out["xg_copy"] + out["y_write"] + out["gates_write"]
     out["routing_metadata"] = rows * 4  # `toks [R] int32` — the fused ABI's own cost
+    return out
+
+
+def wired_pass_bytes(shape: Shape) -> dict[str, int]:
+    """The WIRED arm's transfers per pass — the wiring's layout, NOT the paper's.
+
+    `pass_bytes` prices the shipped `_triton_dispatch`. This prices what
+    `moe_gather = "kernel"` actually moves, and the two are not the same set: the
+    FORWARD is the kernel (no `xg`, no GLU gates), but `_GatherGlu`'s BACKWARD
+    recomputes the grouped forward (`_shipped_forward`) and `combine` still caches
+    `y`. So the keys are:
+
+    * `gather_forward` = `pass_bytes`' forward, minus the gather's `[R, d]`
+      transfers (`xg_write` + `xg_read` = 4·R·d at the bf16 seam, 12·R·d in
+      the fp32 control), minus the gates (`gpre`, `upre`, `h` — the kernel
+      saves none), plus the `[R]` int32 row map;
+    * `gather_cache` = what the forward leaves for the backward: `x` (the bf16
+      seam input), `toks`, and `y` (`combine`'s save). At `k = 2` the cached
+      `x` is `T·d·2 = R·d` bytes against the shipped `xg`'s `R·d·2`, so the
+      cache saving is the gates plus `R·d` — the 4.9x/5.8x figure in the module
+      docstring is the FUSED design's, which needs an adjoint that reads `dout`
+      through the map and does not have one here;
+    * `gather_backward` = `combine`'s adjoint (unchanged) + the recompute, which
+      is the shipped forward without its `out` write and without `combine`'s read
+      of `y` (the recompute feeds the adjoint, not the scatter).
+
+    EVERY line is asserted against the shipped table, so a change to either
+    dispatch fails here rather than leaving a stale price in the bench.
+    `scripts/bench_gather.py` prints these numbers; `tests/test_moe_sonic.py`
+    pins them on CPU, because a bench that prices a wrong layout measures
+    nothing.
+    """
+    assert shape.topk == 2, f"the cache identity below is k=2; got k={shape.topk}"
+    b = pass_bytes(shape)
+    rows = shape.rows
+    recompute = b["forward_total"] - b["y_read"] - b["out_write"]
+    gather_forward = (
+        b["x_read"]
+        + b["routing_metadata"]
+        + b["y_write"]
+        + b["y_read"]
+        + b["out_write"]
+        + b["banks_read"]
+    )
+    gather_cache = b["x_read"] // shape.topk + b["routing_metadata"] + b["y_write"]
+    out = {
+        "shipped_forward": b["forward_total"],
+        "shipped_backward": b["backward_adjoint_current"],
+        "shipped_cache": b["cached_activation"],
+        "gather_forward": gather_forward,
+        "gather_backward": b["backward_adjoint_current"] + recompute,
+        "gather_cache": gather_cache,
+        "recompute": recompute,
+    }
+    out["shipped_pass"] = out["shipped_forward"] + out["shipped_backward"]
+    out["gather_pass"] = out["gather_forward"] + out["gather_backward"]
+    # The forward saving is the shipped pass's own closed form under the bf16
+    # seam: the `index_select` copy (2·R·d) + the kernel's read of it (2·R·d),
+    # where the fp32 control still prices 12·R·d. This assertion is what fails
+    # if the seam's cast comes back: `pass_bytes(x_bytes=4)` would move it.
+    assert b["forward_gather_saving"] == 4 * rows * shape.d, (
+        "bf16 seam: the index_select copy + the kernel's read"
+    )
+    assert gather_forward == (
+        out["shipped_forward"]
+        - b["forward_gather_saving"]
+        - b["gates_write"]
+        + b["routing_metadata"]
+    )
+    assert b["gates_write"] == rows * shape.rank * (2 * 4 + DT_BYTES)
+    # k=2: the cached bf16 `x` (`T·d·2 = R·d`) is half the shipped arm's
+    # gathered `xg` (`R·d·2`), so the cache saving is the gates plus `R·d`.
+    assert gather_cache == b["x_read"] // shape.topk + b["routing_metadata"] + b["y_write"]
+    assert out["gather_cache"] == (
+        out["shipped_cache"]
+        - b["xg_copy"]
+        - b["gates_write"]
+        + b["x_read"] // shape.topk
+        + b["routing_metadata"]
+    )
+    assert out["gather_backward"] - out["shipped_backward"] == recompute
     return out
 
 
@@ -301,7 +427,9 @@ def gather_abi(
     rows = order[keep]
     toks = (rows // k).to(torch.int32).contiguous()
     kept = index.reshape(-1)[rows]
-    counts = torch.bincount(kept, minlength=experts).to(torch.int32)
+    from .experts import _bincount  # lazy: `experts` imports this module
+
+    counts = _bincount(kept, experts).to(torch.int32)
     offs = torch.zeros(experts + 1, dtype=torch.int32, device=index.device)
     offs[1:] = torch.cumsum(counts, 0)
     return toks, offs
@@ -408,9 +536,10 @@ if triton is not None:
         u_acc = tl.zeros((BLOCK_M, RP), tl.float32)
         for k in range(0, tl.cdiv(D, BLOCK_K)):
             rem = D - k * BLOCK_K
-            # The cast on load is the fp32 input meeting a bf16 dot: `x` is fp32
-            # (`X_BYTES`), the banks are `dt`, and the fused load is where the
-            # conversion now happens instead of in a separate `to(dt)` copy.
+            # The cast on load meets the banks' dtype (`dt`). At the loop's
+            # bf16 seam `x` is already `dt` and this is a no-op; a direct API
+            # caller passing fp32 gets the conversion here instead of in a
+            # separate `to(dt)` copy.
             a = tl.load(xp, mask=m_mask[:, None] & (kk[None, :] < rem), other=0.0).to(
                 y_ptr.dtype.element_ty
             )
@@ -467,9 +596,10 @@ def fused_expert_gemm_glu(
     it does there: the capacity rule's value when the caller has one, else the
     DROPLESS static bound from a shape (`toks.numel()`, no host read of `offs`).
 
-    NOT wired into `experts.py` — this lane does not hold that file. The seam is
-    `_triton_dispatch`'s `xg = x[owner].to(dt)` line: replace it with
-    `toks, offs = gather_abi(index, order, keep)` and pass `x` here.
+    `gather_glu` is the WIRED entry point (it adds the backward — see
+    `_GatherGlu`); this function is its forward alone, and it is the seam the
+    CPU gate swaps for `fused_reference` (`_kernel_forward`). `SparseMoE.
+    _gather_dispatch` is the only production caller's caller.
     """
     if _TRITON_WHY is not None:
         raise AssertionError(
@@ -518,3 +648,159 @@ def fused_expert_gemm_glu(
         num_warps=4,
     )
     return y
+
+
+def _kernel_forward(
+    x: torch.Tensor,
+    toks: torch.Tensor,
+    gate_u: torch.Tensor,
+    up_u: torch.Tensor,
+    gate_s: torch.Tensor,
+    up_s: torch.Tensor,
+    v: torch.Tensor,
+    offs: torch.Tensor,
+    cap: int | None,
+) -> torch.Tensor:
+    """The arm's FORWARD call, named so a card-less gate can swap it.
+
+    A SEAM, not a fallback: production never substitutes it, and the CPU gate
+    (`tests/test_moe_sonic.py`) replaces it with `fused_reference` to prove the
+    ABI and the gradient routing without a GPU — the kernel itself is only
+    measurable on the card, and saying which half a gate covers is the point of
+    this seam existing at all.
+    """
+    return fused_expert_gemm_glu(x, toks, gate_u, up_u, gate_s, up_s, v, offs, cap=cap)
+
+
+def _shipped_forward(
+    xg: torch.Tensor,
+    gate_u: torch.Tensor,
+    up_u: torch.Tensor,
+    gate_s: torch.Tensor,
+    up_s: torch.Tensor,
+    v: torch.Tensor,
+    offs: torch.Tensor,
+    *,
+    cap: int | None,
+    seg: torch.Tensor,
+    ws: object,
+) -> torch.Tensor:
+    """The recompute the arm's BACKWARD is: the shipped grouped forward, on `xg`.
+
+    The second seam (see `_kernel_forward`): production never substitutes it, and
+    the card-less gate does, because `_glu_backward_fused` is a Triton launch and
+    a CPU gradient gate would otherwise compare nothing. What the swap leaves
+    unmeasured is the adjoint itself — it is the shipped one, so there is nothing
+    new to measure — and what it still measures is exactly the arm's own risk:
+    that `toks` gathers the rows the routing meant, in the order the banks and
+    `offs` describe, and that `dx` lands on those token rows.
+    """
+    if moe_kernels is None:
+        raise AssertionError(f"the gather arm cannot backpropagate: {_SHIPPED_WHY}")
+    return moe_kernels.expert_gemm_glu(
+        xg, gate_u, up_u, gate_s, up_s, v, offs, cap=cap, fused_bwd=True, seg=seg, ws=ws
+    )
+
+
+class _GatherGlu(torch.autograd.Function):
+    """`forward` = the gather kernel; `backward` = the SHIPPED adjoint, recomputed.
+
+    **The prototype has no backward**, and inventing one would be a second
+    unmeasured adjoint next to a kernel the owner asked to MEASURE. So the
+    backward re-runs `moe_kernels.expert_gemm_glu` on the SAME rows — gathered
+    from `x` through `toks` inside `torch.enable_grad()` — and lets its own
+    Triton adjoint produce `dxg`, the four bank grads and `dv`. `dx` arrives
+    from autograd's `index_select` scatter, which is the same scatter the
+    shipped arm's `x[owner].to(dt)` backward performs.
+
+    What that costs is ONE extra forward per backward — the
+    `torch.utils.checkpoint` trade, taken because `_gather_glu_kernel` saves no
+    gate (`gpre`, `upre`, `h`) for the adjoint to read. What it buys is a
+    fwd→bwd cache of `x`, `toks` and `y` only: no `xg [R, d]`, no GLU gates.
+    `moe_sonic.pass_bytes` prices the cached set the fused design *would* have;
+    `scripts/bench_gather.py` prices the set THIS wiring has, because a bench
+    that prices the paper's design instead of the shipped one measures nothing.
+
+    Consequence for the gate: the gradient half of the parity test is a test of
+    the ROW MAP and of the wiring, not of an adjoint — there is no new adjoint.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        toks: torch.Tensor,
+        gate_u: torch.Tensor,
+        up_u: torch.Tensor,
+        gate_s: torch.Tensor,
+        up_s: torch.Tensor,
+        v: torch.Tensor,
+        offs: torch.Tensor,
+        cap: int | None,
+        seg: torch.Tensor,
+        ws: object,
+    ) -> torch.Tensor:
+        ctx.cap, ctx.seg, ctx.ws = cap, seg, ws
+        ctx.save_for_backward(x, toks, gate_u, up_u, gate_s, up_s, v, offs)
+        return _kernel_forward(x, toks, gate_u, up_u, gate_s, up_s, v, offs, cap)
+
+    @staticmethod
+    def backward(ctx, dy: torch.Tensor):
+        x, toks, gate_u, up_u, gate_s, up_s, v, offs = ctx.saved_tensors
+        with torch.enable_grad():
+            # The recompute must be a FUNCTION OF THE SAME LEAVES, in a fresh
+            # graph: `x` is the row source (so `index_select`'s backward scatters
+            # `dxg` into the token rows), and the five bank tensors are detached
+            # copies with their own `.grad` — the shipped adjoint differentiates
+            # exactly these, and nothing in `_banks`' cache is walked twice.
+            xd = x.detach().requires_grad_(True)
+            xg = xd.index_select(0, toks.to(torch.int64))
+            if xg.dtype != gate_u.dtype:
+                xg = xg.to(gate_u.dtype)
+            leaves = [t.detach().requires_grad_(True) for t in (gate_u, up_u, gate_s, up_s, v)]
+            y = _shipped_forward(xg, *leaves, offs, cap=ctx.cap, seg=ctx.seg, ws=ctx.ws)
+            grads = torch.autograd.grad(y, [xd, *leaves], dy, allow_unused=True)
+        # x, toks, gate_u, up_u, gate_s, up_s, v, offs, cap, seg, ws
+        return (grads[0], None, *grads[1:], None, None, None, None)
+
+
+def gather_glu(
+    x: torch.Tensor,
+    toks: torch.Tensor,
+    gate_u: torch.Tensor,
+    up_u: torch.Tensor,
+    gate_s: torch.Tensor,
+    up_s: torch.Tensor,
+    v: torch.Tensor,
+    offs: torch.Tensor,
+    *,
+    cap: int | None,
+    seg: torch.Tensor,
+    ws: object,
+) -> torch.Tensor:
+    """`y [R, f]` from the UNSORTED `x` and the row map, forward AND backward.
+
+    The one call `experts.SparseMoE._gather_dispatch` makes (`moe_gather =
+    "kernel"`). `seg [R] int32` is the permute's own row→expert map and `ws` the
+    caller's `moe_kernels.BwdWorkspace`, both passed straight to the recompute —
+    the shipped fused adjoint takes them for the same reason there: no
+    `repeat_interleave` rebuild and no per-call `[R, ·]` scratch.
+
+    Refuses LOUDLY, with the escape, when either half's ability is missing: the
+    forward needs the compiled kernel, the backward needs the shipped grouped
+    GEMM (it IS that adjoint). Neither is a silent fallback to the other arm —
+    `moe_gather = "kernel"` is a config's ask, and `_dispatch` refuses it on a
+    CPU before this is reached.
+    """
+    if _TRITON_WHY is not None:
+        raise AssertionError(
+            f"the gather arm cannot run: {_TRITON_WHY}. Escape: moe_gather='off' "
+            f"(the grouped GEMM / padded / naive arms), or a build with triton on "
+            f"a CUDA device."
+        )
+    if _SHIPPED_WHY is not None:
+        raise AssertionError(
+            f"the gather arm's backward re-runs the shipped grouped GEMM: "
+            f"{_SHIPPED_WHY}. Escape: moe_gather='off', or a build with triton."
+        )
+    return _GatherGlu.apply(x, toks, gate_u, up_u, gate_s, up_s, v, offs, cap, seg, ws)

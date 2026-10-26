@@ -13,14 +13,30 @@ template, and a loop whose cross-entropy counts only the answer's bytes.
 `0x01` opens the user turn, `0x02` the assistant turn, `0x03` closes the answer,
 `0x00` pads the record to the window. Every byte of every instruction and answer
 is asserted marker-free at render time ([`render`]) — and the assert can only
-pass because the sources are selected text (the hand-written `GENERIC_QA`, the
-generated `_ru_pairs` bank, and the distill JSONL rows, which are pre-filtered
-for sentinels and for one-window fits before
-they enter the build), never arbitrary user bytes. `post/tasks.py` is NOT a
-source: its answers are the verifier's reward set (see the comment above
-`GENERIC_QA`). `0x03` and
+pass because the sources are generated text (the seeded tasks of `post/tasks.py`,
+the hand-written `GENERIC_QA`, the generated `_ru_pairs` bank, and the distill
+JSONL rows, which are pre-filtered for sentinels and for one-window fits before
+they enter the build), never arbitrary user bytes. `0x03` and
 `0x00` exist because a fixed-size window needs an answer END: without them the
 only way to keep a window single-example is to train on padding.
+
+**The tool extension (opt-in; [`render_conversation`]).** A conversation that
+carries tool calls adds four markers to the same record grammar::
+
+    \\x01 <prompt>                    user turn (ends with \\n)
+    \\x02 <assistant text>            assistant turn
+    \\x04 <tool name> \\x05 <json args> \\x06   a tool CALL emitted by the assistant
+    \\x07 <observation>               the tool's RESULT, appended by the harness
+    \\x03                             end of the assistant turn
+
+`0x04`/`0x05`/`0x06` delimit a call, `0x07` opens an observation. [`render`]
+is unchanged — the plain corpus stays byte-identical, pinned by a sha256 gate —
+and [`render_conversation`] is the only writer of the new markers. The mask is
+the point of the extension: the loss supervises the assistant bytes AND the call
+bytes (`0x04` through `0x06`), never the observation. A model trained on tool
+OUTPUT would learn to invent observations instead of calling the tool.
+[`scan_ranges`] is the ONE rule that encodes this, and on a tool-free window it
+reproduces [`sft_mask`] exactly (gated in `tests/test_agent.py`).
 
 **One window, one example, and how that is guaranteed.** Every record is written
 as exactly `seq_len + 1` bytes (the rendered example, then `0x00` padding), and
@@ -34,12 +50,17 @@ mismatch looks like.
 **What is reused vs copied.** Reused by import: `ByteStream` (the byte stream
 contract), `wsd_lr` (the schedule — WSD, the same one `train()` runs, rather than
 a second schedule to keep honest), `warmup_steps`, `MixOptimizer` + `clip_grads`,
-`save_ckpt`/`load_ckpt`/`load_model_state`, `kda_field` and `Counters`. **Copied
-verbatim from `train()` (`loop.py`):** the NaN firewall (finite check → skip →
-count → `nan_skipped`, and the two-consecutive-all-non-finite-windows `LoudError`)
-and the log/JSON cadence. It is copied, not shared, because `loop.py` belongs to
-another lane this round; a `firewall()` helper both loops call is the follow-up,
-and the two copies must not drift before it lands.
+`save_ckpt`/`load_ckpt`/`load_model_state`, `kda_field` and `Counters`. **The NaN
+firewall** is the SAME rule `train()` runs: the finite loss is masked before
+backward, the step's gradient norm is `isfinite`-checked on the device, every
+gradient is `nan_to_num_`'d and multiplied by the 0/1 flag, and a non-finite
+loss OR gradient skips the optimizer and is COUNTED `nan_skipped` (two
+consecutive all-non-finite windows then stop the run with a `LoudError`). The
+loss half is [`firewall_loss`], the gradient half is [`gate_grads`] — shared with
+`post/rl_train.py` so the two post-training loops cannot drift. `train/loop.py`
+keeps its own form of the same block because it carries the 0/1 flag into a
+CUDA-graph capture; the two forms are pinned against each other by
+`tests/test_posttrain_fixes.py`.
 
 **The host-table path (`engram_ram`), and why SFT drives it.** A pretrain
 checkpoint from a `--engram-ram` run stores its memory OUTSIDE the model half
@@ -63,23 +84,34 @@ eval line's `fin` scores, so SFT trains exactly the readout generation reads.
 
 from __future__ import annotations
 
-import dataclasses
+import json
 import math
 import random
 import time
+from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 
-from ..config import RunConfig, TrainConfig
+from ..config import RunConfig, validate_train
 from ..instrument import Counters, LoudError, StepTimer, loud
-from ..model.engram import Engram, enable_host_tables, host_engrams, host_step_all
+from ..model.engram import enable_host_tables, host_engrams, host_step_all
 from ..model.experts import invalidate_banks_all
+from ..model.qat_cache import invalidate_qat_cache_all
+from ..post.tasks import build_tasks
 from .data import ByteStream, warmup_steps
-from .loop import kda_field, load_ckpt, load_model_state, save_ckpt, unpack_state_dict
+from .loop import (
+    init_cfg,
+    kda_field,
+    load_ckpt,
+    load_model_state,
+    save_ckpt,
+    unpack_state_dict,
+)
 from .lr import wsd_lr
-from .optim import MixOptimizer, clip_grads
+from .optim import MixOptimizer, clip_grads, grad_norm
 
 #: The template's sentinels. All four are asserted absent from every rendered
 #: instruction and answer ([`_assert_clean`]), which is what makes them markers:
@@ -90,13 +122,16 @@ END = 0x03
 PAD = 0x00
 SENTINELS = (USER, ASSIST, END, PAD)
 
-#: The corpus has NO `post.tasks` pairs. That generator is the RL/bench reward
-#: set, and its code variant derives ONE solution per `i % 3` kind: any slice of
-#: its index range therefore teaches answer strings the verifier scores (the
-#: review's M1, the round-0 CRITICAL's other half). An offset makes the ids and
-#: prompts disjoint and leaves the answers identical; the only root fix is not
-#: to put them in the corpus. Code/math instruction data must come from a source
-#: the verifier never scores (a hand-written corpus, `--chat-data`).
+#: The tool extension's markers ([`render_conversation`]). They are NOT in
+#: [`SENTINELS`] on purpose: the plain corpus renderer (`render`, `_chat_pairs`)
+#: keeps the exact behaviour it had before they existed, and only the
+#: conversation renderer asserts them absent from the text it writes.
+TOOL_CALL = 0x04  # \x04 <name> — the assistant asks for a tool
+TOOL_ARGS = 0x05  # \x05 <json args>
+TOOL_END = 0x06  # closes the call; also the byte the harness stops generation at
+OBSERVATION = 0x07  # \x07 <observation> — appended by the harness, never supervised
+TOOL_MARKERS = (TOOL_CALL, TOOL_ARGS, TOOL_END, OBSERVATION)
+TOOL_SENTINELS = SENTINELS + TOOL_MARKERS
 
 #: The generic half of the corpus: the model has to learn the FORMAT, not just
 #: code. Hand-written, both languages the corpus speaks, answers kept short so
@@ -436,15 +471,280 @@ def render(instruction: str, answer: str) -> bytes:
     )
 
 
-def _examples(chat: list[tuple[str, str]] | None = None) -> list[tuple[str, str]]:
-    """The pairs: generic QA + the RU bank + chat rows, and nothing scored.
+# ---------------------------------------------------------------------------
+# the tool template: segments, the renderer, and the ONE mask rule
+# ---------------------------------------------------------------------------
 
-    `post.tasks.build_tasks` is the RL/bench reward set; its answer strings are
-    the solutions the verifier scores, so no pair from it may enter the corpus
-    (see the module comment above `GENERIC_QA`). The seed still orders the
-    corpus below; it no longer selects generated tasks.
+
+@dataclass(frozen=True)
+class Segment:
+    """One piece of a rendered conversation. `text`/`args` are BYTES or str.
+
+    Bytes, not str, because the agent loop appends the bytes the model actually
+    emitted: re-decoding them through UTF-8 and re-encoding would silently
+    replace an invalid sequence and the trained window would stop being the
+    window that was rolled out.
     """
+
+    role: str  # "user" | "assistant" | "call" | "observation" | "end"
+    text: bytes | str = b""
+    name: str = ""
+    args: bytes | str = b""
+
+
+def _raw(value: bytes | str) -> bytes:
+    return value if isinstance(value, bytes) else value.encode("utf-8")
+
+
+def _check_clean(raw: bytes, what: str) -> None:
+    """No template marker inside a payload; louder than `_assert_clean`'s assert."""
+    for b in TOOL_SENTINELS:
+        if b in raw:
+            loud(
+                f"render_conversation: marker 0x{b:02x} appears in {what}. The markers "
+                f"must be bytes the text cannot contain, or the mask's boundaries are "
+                f"not the turn's boundaries. Escape: strip the byte, or pick another "
+                f"tool name/argument."
+            )
+
+
+def _check_json(raw: bytes, name: str) -> None:
+    """A call's args must be a JSON object — refused BEFORE the turn is rendered."""
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        loud(
+            f"render_conversation: tool {name!r} call args are not valid JSON "
+            f"({exc}). Escape: the args field must be a JSON object, e.g. "
+            f'{{"expr": "2 + 2"}}.'
+        )
+    if not isinstance(parsed, dict):
+        loud(
+            f"render_conversation: tool {name!r} call args are a JSON "
+            f"{type(parsed).__name__}, not an object. Escape: one JSON object."
+        )
+
+
+def segment_bytes(seg: Segment) -> bytes:
+    """The template bytes of one segment (no padding, no terminator magic)."""
+    text = _raw(seg.text)
+    if seg.role == "user":
+        _check_clean(text, "a user turn")
+        return bytes([USER]) + text + b"\n"
+    if seg.role == "assistant":
+        _check_clean(text, "an assistant turn")
+        return bytes([ASSIST]) + text
+    if seg.role == "call":
+        name = seg.name.encode("utf-8")
+        args = _raw(seg.args)
+        if not name:
+            loud("render_conversation: a call needs a non-empty tool name")
+        _check_clean(name, "a tool name")
+        _check_clean(args, f"tool {seg.name!r}'s args")
+        _check_json(args, seg.name)
+        return bytes([TOOL_CALL]) + name + bytes([TOOL_ARGS]) + args + bytes([TOOL_END])
+    if seg.role == "observation":
+        _check_clean(text, "an observation")
+        return bytes([OBSERVATION]) + text
+    if seg.role == "end":
+        return bytes([END])
+    loud(
+        f"render_conversation: unknown segment role {seg.role!r} (known: user, "
+        f"assistant, call, observation, end)"
+    )
+
+
+def render_conversation(segments: Sequence[Segment]) -> bytes:
+    """Render a turn-aware record: the tool template, structure checked loudly.
+
+    The order rules are the grammar's, not decoration: a call is emitted INSIDE
+    an assistant turn (`\x04` after `\x02`), an observation follows a call
+    (`\x07` after `\x06`), `end` is last, and a user turn cannot follow a call
+    (the harness would be answering itself). A conversation with no tool call
+    renders to exactly [`render`]'s bytes — gated in `tests/test_agent.py`.
+    """
+    out = bytearray()
+    last = None
+    for seg in segments:
+        if last is None and seg.role not in ("user", "assistant"):
+            loud(f"render_conversation: a record opens with {seg.role!r}, not a user turn")
+        if seg.role == "user" and last is not None and last != "end":
+            loud(
+                f"render_conversation: a user turn after {last!r} — turns are separated "
+                f"by the end marker (0x03). Escape: close the assistant turn first."
+            )
+        if seg.role == "call" and last != "assistant":
+            loud(
+                f"render_conversation: a call must follow an assistant segment "
+                f"(got {last!r}): the model emits calls inside its own turn."
+            )
+        if seg.role == "observation" and last != "call":
+            loud(f"render_conversation: an observation follows a call, not {last!r}")
+        if seg.role == "end" and last not in ("assistant", "call", "observation"):
+            loud(f"render_conversation: `end` after {last!r}")
+        if last == "end":
+            loud(f"render_conversation: {seg.role!r} after the end marker")
+        out += segment_bytes(seg)
+        last = seg.role
+    return bytes(out)
+
+
+def scan_ranges(row: Sequence[int]) -> list[tuple[int, int]]:
+    """The ONE mask rule: supervised INCLUSIVE byte spans of a rendered record.
+
+    A target position `j` is supervised iff `j + 1` lies inside a span, because
+    position `j` predicts byte `j + 1` (the `sft_mask` convention). A span is an
+    assistant turn (`0x02` through its text), a call (`0x04` through `0x06`), and
+    the end marker (`0x03`). An observation (`0x07` through the next marker),
+    the user prompt, and the padding are never supervised.
+
+    The refusals are the template's: a call marker without its `0x05`/`0x06`
+    halves, a call name that is empty, an observation outside a call, an
+    assistant turn interrupted by another `0x02`, and content after `0x03` that
+    is not padding. On a tool-free window this returns exactly the spans
+    `sft_mask` masks (same gate).
+    """
+    ranges: list[tuple[int, int]] = []
+    end_at: int | None = None
+    after_call = False
+    i = 0
+    n = len(row)
+    while i < n:
+        b = row[i]
+        if end_at is not None:
+            if b != PAD:
+                loud(
+                    f"scan_ranges: content (0x{b:02x} at byte {i}) after the end marker "
+                    f"at {end_at}. Escape: a record is `seq_len + 1` bytes and only "
+                    f"0x00 may follow 0x03."
+                )
+            i += 1
+            continue
+        if b == PAD:
+            i += 1
+            continue
+        if b == USER:
+            i += 1
+            while i < n and row[i] not in (ASSIST, TOOL_CALL, OBSERVATION, END, PAD):
+                i += 1
+            if i < n and row[i] in (TOOL_CALL, OBSERVATION):
+                loud(
+                    f"scan_ranges: 0x{b:02x} at byte {i} inside a user turn: a call or "
+                    f"an observation needs an assistant turn first."
+                )
+            after_call = False
+            continue
+        if b == ASSIST:
+            start = i
+            i += 1
+            while i < n and row[i] not in (TOOL_CALL, END, OBSERVATION, ASSIST, USER, PAD):
+                i += 1
+            ranges.append((start, max(i - 1, start)))
+            after_call = False
+            if i >= n:
+                break
+            if row[i] == TOOL_CALL:
+                continue
+            if row[i] == END:
+                ranges.append((i, i))
+                end_at = i
+                i += 1
+                continue
+            loud(
+                f"scan_ranges: 0x{row[i]:02x} at byte {i} ends an assistant turn that "
+                f"no call or end marker closed. Escape: a turn ends with 0x04 (a call) "
+                f"or 0x03."
+            )
+        if b == TOOL_CALL:
+            start = i
+            i += 1
+            while i < n and row[i] not in (TOOL_ARGS, END, PAD):
+                i += 1
+            if i >= n or row[i] != TOOL_ARGS:
+                loud(
+                    f"scan_ranges: a call marker 0x04 at byte {start} has no 0x05 args "
+                    f"marker. Escape: a call is `0x04 name 0x05 json 0x06`."
+                )
+            if i - start <= 1:
+                loud(f"scan_ranges: a call at byte {start} carries an empty tool name")
+            i += 1
+            while i < n and row[i] not in (TOOL_END, END, PAD):
+                i += 1
+            if i >= n or row[i] != TOOL_END:
+                loud(
+                    f"scan_ranges: the call at byte {start} is never closed by 0x06 "
+                    f"(the byte budget or the model cut it). Escape: a longer budget, "
+                    f"or refuse the turn."
+                )
+            ranges.append((start, i))
+            after_call = True
+            i += 1
+            continue
+        if b in (TOOL_ARGS, TOOL_END):
+            loud(f"scan_ranges: marker 0x{b:02x} at byte {i} outside a call")
+        if b == OBSERVATION:
+            if not after_call:
+                loud(
+                    f"scan_ranges: an observation at byte {i} without a call before it: "
+                    f"only the harness appends 0x07, and only as a call's result."
+                )
+            i += 1
+            while i < n and row[i] not in (TOOL_CALL, ASSIST, END, PAD, OBSERVATION):
+                i += 1
+            after_call = False
+            continue
+        if b == END:
+            ranges.append((i, i))
+            end_at = i
+            i += 1
+            continue
+        loud(
+            f"scan_ranges: stray byte 0x{b:02x} at byte {i} outside any segment. Escape: "
+            f"render the window with render_conversation."
+        )
+    if not ranges:
+        loud(
+            "scan_ranges: the window carries no assistant/call/end marker, so it is not "
+            "a rendered conversation. Escape: render_conversation, or rebuild the corpus."
+        )
+    return ranges
+
+
+def supervised_ranges(segments: Sequence[Segment]) -> list[tuple[int, int]]:
+    """[`scan_ranges`] over [`render_conversation`]'s bytes — one call, one rule."""
+    return scan_ranges(render_conversation(segments))
+
+
+def conversation_mask(windows: torch.Tensor) -> torch.Tensor:
+    """`[b, t]` bool over TARGET positions for a tool-bearing window.
+
+    The `sft_mask` convention, generalized: True for the assistant bytes and the
+    call bytes, False for the prompt, the observations and the padding. On a
+    tool-free window it equals `sft_mask` (the gate in `tests/test_agent.py`),
+    which is why the extension cannot change what today's SFT run supervises.
+    """
+    assert windows.ndim == 2, f"windows must be [b, t], got {tuple(windows.shape)}"
+    b, t = windows.shape
+    out = torch.zeros((b, t), dtype=torch.bool, device=windows.device)
+    for i in range(b):
+        for start, end in scan_ranges(windows[i].tolist()):
+            out[i, max(start - 1, 0) : end] = True
+    return out
+
+
+def _examples(
+    seed: int, n_tasks: int, chat: list[tuple[str, str]] | None = None
+) -> list[tuple[str, str]]:
+    """The pairs: generic QA + the RU bank + seeded tasks (REUSED) + chat rows."""
     out = list(GENERIC_QA) + _ru_pairs()
+    for task in build_tasks("code", seed, n=n_tasks):
+        # The task's prompt is the instruction (signature + docstring); the
+        # hidden reference implementation is the answer.
+        out.append((task.prompt.rstrip("\n"), task.solution.rstrip("\n")))
+    for task in build_tasks("math", seed, n=n_tasks):
+        # The math prompt asks for a final `answer: <value>` line, so the answer
+        # teaches that format too (it is what `verifiers._final_answer` reads).
+        out.append((task.prompt, f"answer: {task.solution}"))
     if chat:
         out.extend(chat)
     return out
@@ -455,13 +755,14 @@ def build_sft_corpus(
     seed: int,
     *,
     seq_len: int,
+    n_tasks: int = 32,
     chat_data: str | Path | list[str | Path] | None = None,
     chat_cap: int | None = None,
     holdout: int = 0,
 ) -> dict:
     """Write the instruction corpus: fixed `seq_len + 1`-byte records, deterministic.
 
-    A pure function of `(seed, seq_len, chat_data, chat_cap)`: the same
+    A pure function of `(seed, seq_len, n_tasks, chat_data, chat_cap)`: the same
     arguments produce the same bytes in any process (the shuffles are
     `random.Random(seed)` / `Random(seed + 1)`), which is what makes an SFT run
     replayable (ADR-0021's determinism discipline).
@@ -481,6 +782,8 @@ def build_sft_corpus(
     """
     if seq_len < 8:
         loud(f"build_sft_corpus seq_len={seq_len}: a window must hold a marker pair")
+    if n_tasks < 0:
+        loud(f"build_sft_corpus n_tasks={n_tasks}: a task count cannot be negative")
     if chat_cap is not None and chat_cap < 0:
         loud(f"build_sft_corpus chat_cap={chat_cap}: a cap cannot be negative")
     chat: list[tuple[str, str]] = []
@@ -496,7 +799,7 @@ def build_sft_corpus(
         chat_stats.update(dropped)
         chat_stats["chat_loaded"] = dropped.get("chat_fit", len(chat))
         chat_stats["chat_used"] = len(chat)
-    examples = _examples(chat)
+    examples = _examples(seed, n_tasks, chat)
     random.Random(seed).shuffle(examples)
     record = seq_len + 1
     records: list[bytes] = []
@@ -538,6 +841,7 @@ def build_sft_corpus(
         "bytes": record * len(records),
         "seq_len": seq_len,
         "seed": seed,
+        "n_tasks": n_tasks,
         "holdout": held,
         **chat_stats,
     }
@@ -601,29 +905,16 @@ def sft_mask(windows: torch.Tensor) -> torch.Tensor:
     return (pos[None, :] + 1 >= assist[:, None]) & (pos[None, :] + 1 <= end[:, None])
 
 
-def sft_loss(
-    logits: torch.Tensor,
-    targets: torch.Tensor,
-    mask: torch.Tensor,
-    *,
-    n_supervised: int | None = None,
-) -> torch.Tensor:
+def sft_loss(logits: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """Masked next-byte CE: the mean over the SUPERVISED positions only.
 
     `logits` is `[b*t, vocab]` (the model's own shape), `targets` `[b, t]`, `mask`
     `[b, t]` bool. Every prompt byte and every pad byte is dropped from BOTH the
     numerator and the denominator — an unmasked prompt byte is not "cheap", it is
     a byte the model was asked to predict that the task never wanted.
-
-    `n_supervised`, when the caller already counted the mask on the host (the
-    SFT loop builds the mask before the device seam), keeps the empty-mask
-    refusal off the per-step D2H path: the check is the caller's host count,
-    not a `mask.any()` on the device tensor (§1.3).
     """
     flat = mask.reshape(-1)
-    if n_supervised is None:
-        n_supervised = int(flat.sum())
-    if not n_supervised:
+    if not bool(flat.any()):
         loud(
             "sft_loss: the mask supervises no byte in this window. Escape: the "
             "window's markers are wrong (see sft_mask)."
@@ -632,107 +923,81 @@ def sft_loss(
     return F.cross_entropy(logits[flat], targets.reshape(-1)[flat])
 
 
+def firewall_loss(loss: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """The firewalls' loss half: `(loss with a zero seed on non-finite, isfinite flag)`.
+
+    `torch.where` on the scalar, not a host branch: on a healthy step the value
+    AND the gradient are bit-identical to `loss.backward()` (the where's
+    backward passes the root gradient through unchanged). This is
+    `train/loop.py`'s device block (`micro_step`, lines 1107-1116) in the form
+    the two post-training loops can share.
+    """
+    loss_d = loss.detach()
+    loss_finite = torch.isfinite(loss_d).all()
+    return torch.where(loss_finite, loss, loss_d.new_zeros(())), loss_finite
+
+
+def gate_grads(params, loss_finite: torch.Tensor) -> torch.Tensor:
+    """The firewalls' gradient half: sanitize, gate, return the 0-dim 0/1 flag.
+
+    A finite LOSS does not stop a NaN that came from an ACTIVATION (`NaN * 0` is
+    still NaN through the Jacobian), so the step's decision is the AND of the
+    loss flag and `isfinite(grad_norm)`. Every gradient is `nan_to_num_`'d
+    first, then multiplied by the flag: `*1.0` is the identity on a healthy
+    step, `*0` makes a skipped step's direction exactly zero. This is
+    `train/loop.py`'s block (`micro_step`, lines 1124-1146) copied exactly;
+    `loop.py` keeps its own form because its flag is read inside a CUDA-graph
+    capture, and this lane may not edit that file.
+
+    Sharing it between SFT and RL is what closes the hole the round-1 ledger's
+    m3 named: both loops checked only the loss scalar, so a finite loss with a
+    non-finite gradient stepped and poisoned `exp_avg_sq` permanently.
+    """
+    params = list(params)
+    grads = [p.grad for p in params if p.grad is not None]
+    raw_norm = grad_norm(params)
+    if raw_norm.device != loss_finite.device:
+        raw_norm = raw_norm.to(loss_finite.device)
+    finite = loss_finite & torch.isfinite(raw_norm)
+    gate = finite.to(torch.float32)
+    for g in grads:
+        g.nan_to_num_(0.0, 0.0, 0.0)
+        g.mul_(gate.to(g.dtype))
+    return finite
+
+
+def refuse_unwired(cfg, loop: str) -> None:
+    """REFUSE a train field this loop cannot honour, naming field/why/Escape.
+
+    The round-1 ledger's m5: both post-training loops built `MixOptimizer`
+    without `muon_variant`/`muon_sf`, so `--set muon_sf=true` reported an arm
+    that never ran. Those two change the optimizer's MATHS (a direction arm and
+    a schedule-free wrapper with its own LR contract), and their evidence lives
+    in `train()`, not here — refusing beats running an unmeasured arm.
+    `muon_state_dtype`, `ns_dtype` and `muon_sf_wd` are forwarded instead (pure
+    optimizer settings with no loop coupling), and SFT honors `grad_accum`.
+    """
+    if cfg.muon_variant != "muon":
+        loud(
+            f"{loop}: train.muon_variant={cfg.muon_variant!r} changes the Muon "
+            f"direction arm, but this loop has never run that A/B — its evidence is "
+            f"`train()`'s (`tests/test_muon_variants.py`), and accepting the flag "
+            f"here would report an arm whose number does not exist. Escape: "
+            f"muon_variant='muon' (the default), or run `dormouse train` for the arm."
+        )
+    if cfg.muon_sf:
+        loud(
+            f"{loop}: train.muon_sf=true is the schedule-free Muon arm, which needs "
+            f"`train()`'s constant-after-warmup Muon LR and its host-side skip "
+            f"decision (`MixOptimizer.step`); this loop carries neither, so the flag "
+            f"would silently run a different arm. Escape: muon_sf=false (the "
+            f"default), or run `dormouse train` for the arm."
+        )
+
+
 # ---------------------------------------------------------------------------
 # the loop
 # ---------------------------------------------------------------------------
-
-
-def _init_cfg(cfg: TrainConfig, path: Path, sd: dict, model: torch.nn.Module) -> TrainConfig:
-    """The cfg that describes the INIT FILE: its substrate and its sidecar path.
-
-    `load_model_state` reads the substrate from `cfg.engram_ram` and finds the
-    `.ngram` sibling through `cfg.out_dir`/`cfg.ckpt_name`, so an init load
-    cannot use the SFT run's own cfg — that names the sidecar THIS run will
-    write, not the init file's. The substrate is read from the FILE, not from a
-    flag: a host-table checkpoint's model half carries no `engram.tables`
-    (`Engram.to_host` deletes the parameter), which is the file's own statement
-    of where its memory lives.
-
-    The run's `engram_ram` must AGREE with the file's, and a disagreement is
-    LOUD, because the flag decides three things a mismatch would corrupt: the
-    host switch happens BEFORE the optimizer exists (a switch after it leaves
-    the tables in a parameter group that then steps a deleted tensor), the loop
-    steps the tables only when the flag is on, and `save_ckpt` writes the
-    `.ngram` only when it is on.
-    """
-    tables_in_file = any(k.endswith("engram.tables") for k in sd)
-    has_engram = any(isinstance(m, Engram) for m in model.modules())
-    host = has_engram and not tables_in_file
-    if host and not cfg.engram_ram:
-        loud(
-            f"sft --init-from: {path}'s model half carries no `engram.tables`: it "
-            f"is a host-table run (its rows are the sibling `{path.stem}.ngram`), "
-            f"or it is not this model's checkpoint at all. This run is configured "
-            f"engram_ram=false, so the memory could not be loaded: a host-table "
-            f"load switches the model to host tables after the optimizer exists, "
-            f"and the run would read a memory it never steps and never saves. "
-            f"Escape: --set engram_ram=true (the pretrain's substrate), or an init "
-            f"checkpoint whose model half carries the tables."
-        )
-    if tables_in_file and cfg.engram_ram:
-        loud(
-            f"sft --init-from: {path} carries its Engram in the model half "
-            f"(`engram.tables`) but this run is configured engram_ram=true. "
-            f"Switching to host tables would DROP the checkpoint's memory — the "
-            f"host path starts from the model's own rows and this run's `.ngram` "
-            f"sibling does not exist yet. Escape: --set engram_ram=false, or "
-            f"re-save the init as a host-table run (with its `.ngram` sibling)."
-        )
-    return dataclasses.replace(cfg, engram_ram=host, out_dir=str(path.parent), ckpt_name=path.stem)
-
-
-def _sft_eval(
-    model: torch.nn.Module,
-    eval_stream: ByteStream,
-    cfg: TrainConfig,
-    device: torch.device | str | None,
-) -> tuple[float, float, int, int]:
-    """One held-out pass: `(ce, first_frac, records, scored_bytes)`.
-
-    `rewind()` first, ALWAYS (audit MAJOR 3, the defect `train/loop.py`'s
-    `_eval_loss` fixed on 2026-09-27): the stream is a ring, so an eval that
-    inherits the previous eval's position scores different bytes and its
-    `ce=`/`first=` are not a statement about the weights alone. `scored_bytes`
-    is the eval window the line prints (`batches × batch × seq_len`), the same
-    unit as the pretrain line.
-    """
-    eval_stream.rewind()
-    ce_total = 0.0
-    batches = 0
-    first_ok = 0
-    first_n = 0
-    scored = 0
-    was_training = model.training
-    model.eval()
-    with torch.no_grad():
-        for _ in range(cfg.eval_batches):
-            ex, ey = eval_stream.next_batch()
-            if device is not None:
-                ex, ey = ex.to(device), ey.to(device)
-            emask = sft_mask(ex)
-            elogits, _en, _ec = model(ex)
-            flat = emask.reshape(-1)
-            ce_total += float(F.cross_entropy(elogits[flat], ey.reshape(-1)[flat]))
-            batches += 1
-            scored += int(ex.numel())
-            # The conditioning metric: at the assistant marker's position the
-            # model predicts the FIRST answer byte — the one byte that cannot
-            # be guessed from the answer alone.
-            is_a = ex == ASSIST
-            assist = is_a.to(torch.int8).argmax(dim=1)
-            rows = torch.arange(ex.shape[0], device=ex.device)
-            per_row = elogits.reshape(ex.shape[0], ex.shape[1], -1)
-            pred = per_row[rows, assist].argmax(dim=-1)
-            true = ey[rows, assist]
-            first_ok += int((pred == true).sum())
-            first_n += int(ex.shape[0])
-    model.train(was_training)
-    return (
-        ce_total / max(batches, 1),
-        first_ok / max(first_n, 1),
-        first_n,
-        scored,
-    )
 
 
 def sft_train(
@@ -750,12 +1015,18 @@ def sft_train(
     The schedule is WSD — `wsd_lr` with the run's `warmup_tokens`/`decay_frac`,
     i.e. the SAME schedule `train()` runs, not a second one to keep honest.
 
-    The NaN firewall and the log/JSON cadence are COPIED from `train()`
-    (`loop.py`, the finite-check/skip/count block and the window-drain block), so
-    this loop carries the same two rules: a non-finite step touches no weight and
-    is COUNTED as `nan_skipped`, and two consecutive windows in which every step
-    was non-finite stop the run with a `LoudError`. They are copies because
-    `loop.py` is another lane's file this round.
+    The NaN firewall and the log/JSON cadence are the SAME rules `train()` runs
+    (`loop.py`): a non-finite loss OR gradient touches no weight and is COUNTED
+    as `nan_skipped`, and two consecutive windows in which every step was
+    non-finite stop the run with a `LoudError`. The loss and gradient halves
+    live in [`firewall_loss`]/[`gate_grads`] and are shared with
+    `post/rl_train.py`; `loop.py` keeps its own device-flag form, which a
+    CUDA-graph capture reads.
+
+    `grad_accum > 1` is honoured: the loop reads k micro-batches, backprops
+    each window's summed CE, scales every gradient once by `1/Σ supervised
+    bytes`, and takes ONE optimizer step — the pooled mean of a `batch*k` wide
+    step, not k mean-CE steps.
 
     `device` is the batch seam, as in `train()`: the stream hands out CPU
     tensors and the caller names where the model lives.
@@ -769,6 +1040,8 @@ def sft_train(
     """
     cfg = run.train
     torch.set_float32_matmul_precision("high" if cfg.tf32 else "highest")
+    validate_train(cfg)
+    refuse_unwired(cfg, "sft")
     device = None if device is None else torch.device(device)
     if stream is None:
         stream = ByteStream(cfg.data, cfg.batch, cfg.seq_len)
@@ -790,7 +1063,7 @@ def sft_train(
         # training VRAM-budget rule, and on a CPU model the host path's NUMERICS
         # are device-agnostic (the tables ARE CPU memory) — the same call
         # `load_model_state` makes, for the same reason.
-        enable_host_tables(model)
+        enable_host_tables(model, bias_correction=cfg.engram_bias_correction)
         if not host_engrams(model):
             loud(
                 "sft engram_ram=true but the model has no Engram to host "
@@ -799,7 +1072,8 @@ def sft_train(
             )
         log(
             f"engram_ram: {len(host_engrams(model))} table set(s) in host RAM, VRAM "
-            f"holds the batch's unique rows"
+            f"holds the batch's unique rows, "
+            f"bias_correction={'on' if cfg.engram_bias_correction else 'off'}"
         )
     opt = MixOptimizer(
         model,
@@ -809,6 +1083,16 @@ def sft_train(
         ns_steps=cfg.ns_steps,
         ns_kind=cfg.ns_kind,
         colrow_3d=cfg.muon_colrow_3d,
+        # The fields the round-1 ledger's m5 found silently unwired. The two
+        # precision rungs and the SF weight-decay value are forwarded (they are
+        # pure optimizer settings); `muon_variant`/`muon_sf` were refused above,
+        # so the defaults forwarded here are the only values that reach this
+        # call and an arm can never be reported without running.
+        muon_state_dtype=cfg.muon_state_dtype,
+        ns_dtype=cfg.ns_dtype,
+        muon_variant=cfg.muon_variant,
+        muon_sf=cfg.muon_sf,
+        muon_sf_wd=cfg.muon_sf_wd,
     )
     if cfg.optim_8bit:
         opt.enable_bnb8bit()
@@ -842,29 +1126,27 @@ def sft_train(
         # architecture by construction, so the substrate is the only legal
         # difference — and `_init_cfg` refuses a substrate mismatch before the
         # load, which is why strict can stay strict.
-        load_model_state(model, _init_cfg(cfg, path, sd, model), sd, strict=True)
+        load_model_state(model, init_cfg(cfg, path, sd, model), sd, strict=True)
         log(f"sft init: weights from {path} (step {foreign.get('step', '?')}), fresh optimizer")
     if resume:
         ck, _stored = load_ckpt(run)
         # The same ONE loader as the init path (and as `train()`'s resume): a
         # host-table run's model half has no `engram.tables`, and `load_ckpt`
-        # already refused a missing `.ngram` (`require_ngram`). `resume=True`
-        # is load-bearing: a pre-sidecar checkpoint with `moe_lb_coef > 0` must
-        # be LOUD here too, not only in `train()` (review round 3 R3-3). The
-        # lane's `log` carries the COUNTED line on the controller-off escape.
-        load_model_state(model, cfg, ck["model"], log=log, resume=True)
+        # already refused a missing `.ngram` (`require_ngram`).
+        load_model_state(model, cfg, ck["model"])
         opt.load_state_dict(ck["opt"])
         start = int(ck["step"]) + 1
         if start:
-            # One step consumes `batch x (seq_len + 1)` bytes, so a resume
-            # fast-forwards exactly as far as the run had read (the same
-            # positioning rule as `train()`).
-            stream.skip_bytes(start * (cfg.seq_len + 1) * cfg.batch)
+            # One OPTIMIZER step consumes `grad_accum x batch x (seq_len + 1)`
+            # bytes, so a resume fast-forwards exactly as far as the run had
+            # read (the same positioning rule as `train()`, which also scales
+            # its fast-forward by the accumulation count).
+            stream.skip_bytes(start * (cfg.seq_len + 1) * cfg.batch * cfg.grad_accum)
         log(f"sft resume: step={start} opt_steps={opt.steps}")
 
-    warm = warmup_steps(cfg.warmup_tokens, cfg.batch, cfg.seq_len)
+    warm = warmup_steps(cfg.warmup_tokens, cfg.batch * cfg.grad_accum, cfg.seq_len)
     decay = int(round(cfg.decay_frac * cfg.steps))
-    tokens_per_step = cfg.batch * cfg.seq_len
+    tokens_per_step = cfg.batch * cfg.seq_len * cfg.grad_accum
     total = Counters()
     window = Counters()
     nan_skipped = 0
@@ -905,36 +1187,59 @@ def sft_train(
             for group in opt.muon.param_groups:
                 group["lr"] = lr
 
-        x, y = stream.next_batch()
-        # The mask is built from BYTE POSITIONS, so it is host work: build it on
-        # the stream's CPU window BEFORE the device seam, count it there, and
-        # send the finished mask across. That keeps `int(mask.sum())` and
-        # `sft_mask`'s per-row padding checks off the per-step D2H path (audit
-        # MAJOR 4 / §1.3) — the only host read left in the step is the loss.
-        mask = sft_mask(x)
-        n_mask = int(mask.sum())
-        if device is not None:
-            x, y, mask = x.to(device), y.to(device), mask.to(device)
-        # `targets=None`: the decode forward. Its logits are the ones generation
-        # samples and the eval's `fin` scores, so SFT trains that readout — the
-        # in-loop `L_Rec` is a pretraining signal and is not built here.
-        logits, _none, step_counters = model(x)
-        assert logits.shape[-1] == run.model.vocab, "logits width != vocab"
-        loss = sft_loss(logits, y, mask, n_supervised=n_mask)
-        total.count("sft_bytes", n_mask)
-        window.count("sft_bytes", n_mask)
-        supervised += n_mask
-        total.merge(step_counters)
-        window.merge(step_counters)
+        opt.zero_grad(set_to_none=True)
+        loss_finite = None
+        group_mask = 0
+        group_ce = 0.0
+        for _micro in range(cfg.grad_accum):
+            x, y = stream.next_batch()
+            if device is not None:
+                x, y = x.to(device), y.to(device)
+            mask = sft_mask(x)
+            # `targets=None`: the decode forward. Its logits are the ones
+            # generation samples and the eval's `fin` scores, so SFT trains that
+            # readout — the in-loop `L_Rec` is a pretraining signal and is not
+            # built here.
+            logits, _none, step_counters = model(x)
+            assert logits.shape[-1] == run.model.vocab, "logits width != vocab"
+            loss = sft_loss(logits, y, mask)
+            n_mask = int(mask.sum())
+            total.count("sft_bytes", n_mask)
+            window.count("sft_bytes", n_mask)
+            supervised += n_mask
+            total.merge(step_counters)
+            window.merge(step_counters)
+            # The loss half of the firewall: a non-finite window backprops a
+            # zero seed instead of skipping the backward, so the decision is one
+            # device flag rather than a host branch (see `firewall_loss`). With
+            # `grad_accum > 1` the SUM of the supervised CE is backpropped here
+            # and every gradient is divided by the group's supervised-byte
+            # count below — the pooled mean a `batch*k` wide step computes.
+            step_loss, micro_finite = firewall_loss(loss)
+            loss_finite = micro_finite if loss_finite is None else loss_finite & micro_finite
+            if cfg.grad_accum == 1:
+                step_loss.backward()
+            else:
+                (step_loss * n_mask).backward()
+            group_mask += n_mask
+            group_ce += float(loss.detach()) * n_mask
         timer.tick()
 
-        # ONE host read per step (audit MAJOR 4), same as the train loop.
-        lf = float(loss.detach())
-        finite = math.isfinite(lf)
+        # ONE host read per step (audit MAJOR 4), same as the train loop. The
+        # read is AFTER the backward because the firewall's decision is the AND
+        # of the loss flag and the device gradient norm — a finite loss with a
+        # non-finite gradient must skip the step too (round-1 ledger m3).
+        finite = bool(gate_grads(model.parameters(), loss_finite))
+        inv = 1.0 / max(group_mask, 1) if cfg.grad_accum > 1 else 1.0
+        if cfg.grad_accum > 1:
+            for p in model.parameters():
+                if p.grad is not None:
+                    p.grad.mul_(inv)
+            lf = group_ce * inv
+        else:
+            lf = float(loss.detach())
         window_finite.append(finite)
         if finite:
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
             if cfg.grad_clip > 0:
                 clip_grads(model.parameters(), cfg.grad_clip)
             opt.step()
@@ -942,15 +1247,20 @@ def sft_train(
             # parameter's VALUE can move without `_version` moving (a CUDA-graph
             # replay does exactly that), and `_banks` keys on `_version`. This
             # loop has no graph arm today; the call keeps the invariant true for
-            # any arm that ever adds one.
+            # any arm that ever adds one. The QAT projection cache needs the SAME
+            # per-step call (it is tensor-keyed, never `_version`-keyed).
             invalidate_banks_all(model)
+            invalidate_qat_cache_all(model)
             if cfg.engram_ram:
                 # The host update runs ONCE per TRAINING step, after the
                 # optimizer — the same rule and the same counters as `train()`
                 # (`loop.py:761-772`): the loop reads the memory once per
                 # ITERATION and `host_step` sums those into one update per row,
-                # and a NaN-skipped step (below) updates nothing.
-                updates, rows = host_step_all(model, lr)
+                # and a NaN-skipped step (below) updates nothing. With
+                # `grad_accum > 1` the pending leaves are ALL the group's
+                # micro-batches, and their 1/Σn scale is applied to the rows
+                # once, here.
+                updates, rows = host_step_all(model, lr * inv)
                 total.count("engram_host_updates", updates)
                 window.count("engram_host_updates", updates)
                 total.count("engram_host_update_rows", rows)
@@ -1013,35 +1323,51 @@ def sft_train(
                 )
 
         if eval_stream is not None and (step + 1) % cfg.eval_every == 0:
-            ce, frac, first_n, eval_scored = _sft_eval(model, eval_stream, cfg, device)
+            # `rewind()` first, always: an eval that inherits the stream
+            # position is not comparable with the previous one (AGENTS §2.6;
+            # the pretrain loop's `_eval_loss` carries the same line). Without
+            # it a holdout larger than one eval window measured 0.0106 nats of
+            # pure position noise at frozen weights — round-1 ledger M2.
+            eval_stream.rewind()
+            model.eval()
+            ce_total = 0.0
+            batches = 0
+            first_ok = 0
+            first_n = 0
+            with torch.no_grad():
+                for _ in range(cfg.eval_batches):
+                    ex, ey = eval_stream.next_batch()
+                    if device is not None:
+                        ex, ey = ex.to(device), ey.to(device)
+                    emask = sft_mask(ex)
+                    elogits, _en, _ec = model(ex)
+                    flat = emask.reshape(-1)
+                    ce_total += float(F.cross_entropy(elogits[flat], ey.reshape(-1)[flat]))
+                    batches += 1
+                    # The conditioning metric: at the assistant marker's
+                    # position the model predicts the FIRST answer byte — the
+                    # one byte that cannot be guessed from the answer alone.
+                    is_a = ex == ASSIST
+                    assist = is_a.to(torch.int8).argmax(dim=1)
+                    rows = torch.arange(ex.shape[0], device=ex.device)
+                    per_row = elogits.reshape(ex.shape[0], ex.shape[1], -1)
+                    pred = per_row[rows, assist].argmax(dim=-1)
+                    true = ey[rows, assist]
+                    first_ok += int((pred == true).sum())
+                    first_n += int(ex.shape[0])
+            model.train()
+            ce = ce_total / max(batches, 1)
+            frac = first_ok / max(first_n, 1)
             log(
                 f"sft eval step={step + 1} ce={ce:.4f} bpb={ce / math.log(2):.4f} "
-                f"first={100 * frac:.1f}% over {eval_scored} B "
-                f"({cfg.eval_batches} x {cfg.batch} x {cfg.seq_len}) "
-                f"= {first_n} records"
+                f"first={100 * frac:.1f}% over {first_n} records"
             )
             if sink is not None:
-                _row(
-                    event="sft_eval",
-                    step=step + 1,
-                    ce=ce,
-                    first=frac,
-                    records=first_n,
-                    scored=eval_scored,
-                )
+                _row(event="sft_eval", step=step + 1, ce=ce, first=frac, records=first_n)
 
         if (step + 1) % cfg.ckpt_every == 0:
-            # A fresh tally per save, exactly as `train/loop.py` does: a storage
-            # rung's COUNTED degradations (`nvfp4_zero_scale_blocks`) belong to
-            # the FILE just written, and the checkpoint line is where a reader
-            # sees them (review round 1 M3).
-            ck_counts = Counters()
-            weights, snapshot = save_ckpt(run, model, opt, step, counters=ck_counts)
-            ck_line = f"ckpt step={step + 1} -> {weights} ({snapshot})"
-            if ck_counts:
-                total.merge(ck_counts)
-                ck_line += " " + ck_counts.line()
-            log(ck_line)
+            weights, snapshot = save_ckpt(run, model, opt, step)
+            log(f"ckpt step={step + 1} -> {weights} ({snapshot})")
 
     if sink is not None:
         sink.close()

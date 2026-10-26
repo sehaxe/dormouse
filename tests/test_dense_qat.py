@@ -35,6 +35,7 @@ from __future__ import annotations
 import dataclasses
 import math
 import sys
+from pathlib import Path
 
 import pytest
 import torch
@@ -42,9 +43,10 @@ from conftest import tiny_cfg, tiny_run, write_corpus
 from torch import nn
 
 from dormouse.config import load_run
-from dormouse.instrument import LoudError
+from dormouse.instrument import Counters, LoudError
 from dormouse.model import DormouseModel
 from dormouse.model.tsct import (
+    DENSE_QAT_ATTN_SITES,
     DenseLinear,
     dense_qat_project,
     factor_qat_project,
@@ -52,13 +54,28 @@ from dormouse.model.tsct import (
 )
 from dormouse.train import train
 
+#: The pre-change golden for gate b: `dense_qat_skip_attn=false` must reproduce
+#: the 3.2733 arm's forward bit for bit. Captured at commit 257f1fc with
+#: `torch.set_num_threads(1)`, seed 1234, on the coverage fixture below.
+PRECHANGE = Path(__file__).resolve().parent / "fixtures" / "dense_qat_attn_prechange.pt"
+
 
 def _model(**over) -> DormouseModel:
     return DormouseModel(tiny_cfg(n_experts=4, moe_topk=2, **over))
 
 
-def _pre_quantize(model: nn.Module, kind: str = "ternary") -> int:
+def _coverage_model(**over) -> DormouseModel:
+    """The full dense tree: KDA + MSA + dSpark, and DenseLinear out_proj/lm_head."""
+    base = dict(use_tsct=False, use_msa=True, dspark_weight=0.05, dense_qat="ternary")
+    return _model(**{**base, **over})
+
+
+def _pre_quantize(model: nn.Module, kind: str = "ternary", *, skip_attn: bool = True) -> int:
     """The alpha=1 fixture: project every covered dense weight IN PLACE.
+
+    `skip_attn` mirrors the model's own `dense_qat_skip_attn`: the attention
+    sites stay masters when the default rule is on, or the two forwards would
+    disagree for the wrong reason.
 
     Returns how many weights moved, so a caller can assert the walk found the
     module set it expected (a model that grew a dense weight the fixture does
@@ -66,8 +83,10 @@ def _pre_quantize(model: nn.Module, kind: str = "ternary") -> int:
     """
     n = 0
     with torch.no_grad():
-        for m in model.modules():
+        for name, m in model.named_modules():
             if isinstance(m, (nn.Linear, DenseLinear)):
+                if skip_attn and name in DENSE_QAT_ATTN_SITES:
+                    continue
                 m.weight.copy_(dense_qat_project(m.weight, kind, 1.0))
                 n += 1
     return n
@@ -125,9 +144,9 @@ def test_dense_projector_is_the_factor_projector(kind):
     torch.manual_seed(0)
     w = torch.randn(16, 32) * 0.2
     for alpha in (0.0, 0.25, 1.0):
-        assert torch.equal(dense_qat_project(w, kind, alpha), factor_qat_project(w, kind, alpha)), (
-            f"{kind} at alpha={alpha} diverged from the factor path"
-        )
+        assert torch.equal(
+            dense_qat_project(w, kind, alpha), factor_qat_project(w, kind, alpha)
+        ), f"{kind} at alpha={alpha} diverged from the factor path"
     assert torch.equal(dense_qat_project(w, kind, 0.0), w), "alpha=0 must be the master"
 
 
@@ -184,7 +203,7 @@ def test_alpha_one_forward_equals_pre_quantized_weights():
     b = _model()
     b.load_state_dict(a.state_dict())
     n = _pre_quantize(b)
-    assert n >= 10, f"the fixture found only {n} dense weights"
+    assert n >= 7, f"the fixture found only {n} dense weights"
     x = torch.randint(0, 256, (2, 16))
     with torch.no_grad():
         la, _, _ = a(x, x)
@@ -269,10 +288,11 @@ def test_kda_projections_seam_is_quantized():
     On CPU the training forward takes the SDPA fallback, which reads q/k/v/g
     directly (and never beta), so this seam is exercised here on purpose: it is
     the same `qat_linear` call site the GPU training forward and every decode
-    step use.
+    step use. `dense_qat_skip_attn=false` is the arm under this gate; the
+    default-skip side of the same seam is `test_skip_attn_keeps_attention...`.
     """
     a = _model()
-    b = _model(dense_qat="ternary")
+    b = _model(dense_qat="ternary", dense_qat_skip_attn=False)
     b.load_state_dict(a.state_dict())
     x = torch.randn(2, 8, 64)
     with torch.no_grad():
@@ -283,59 +303,219 @@ def test_kda_projections_seam_is_quantized():
 
 
 # ---------------------------------------------------------------------------
-# COVERAGE: every nn.Linear/DenseLinear weight in the forward is projected
+# COVERAGE: every nn.Linear/DenseLinear weight in the forward is classified
 # ---------------------------------------------------------------------------
 
-#: The dense weights this fixture's forward must project, by module name. A new
-#: dense weight anywhere in the tree fails `test_coverage_...` below until it is
-#: routed through `dense_qat_project` AND listed here.
+#: The dense weights `dense_qat` projects in EVERY arm — the FFN/controller/
+#: memory/readout set BitNet b1.58 quantizes. A new dense weight anywhere in
+#: the tree fails the coverage gate until it is routed through
+#: `dense_qat_project` AND classified here or in `ATTN_SITES`.
 COVERED = (
     "loop.controller",
     "loop.mem_dense",
     "loop.out_proj",
-    "loop.attn.q_proj",
-    "loop.attn.k_proj",
-    "loop.attn.v_proj",
-    "loop.attn.g_proj",
-    "loop.attn.beta_proj",
     "loop.moe.router",
     "loop.moe.down",
     "loop.engram.query_proj",
     "loop.engram.key_proj",
     "loop.engram.value_proj",
-    "loop.msa.q_proj",
-    "loop.msa.k_proj",
-    "loop.msa.v_proj",
-    "loop.msa.selector.q_idx",
-    "loop.msa.selector.k_idx",
     "dspark.w2",
     "dspark.joint",
     "dspark.conf",
     "lm_head",
 )
 
+#: The attention sites — read from the ONE list the implementation
+#: (`tsct.dense_qat_kind`) reads. Projected ONLY with
+#: `dense_qat_skip_attn=false`, the arm the 3.2733 measurement ran.
+ATTN_SITES = DENSE_QAT_ATTN_SITES
 
-def test_coverage_every_dense_weight_is_projected(monkeypatch):
-    seen = _spy_projectors(monkeypatch)
-    # Every dense arm ON, so the walk sees the whole tree: use_tsct=false makes
-    # out_proj/lm_head DenseLinears, use_msa builds the MSA pair, dspark_weight
-    # builds the draft head.
-    model = _model(use_tsct=False, use_msa=True, dspark_weight=0.05, dense_qat="ternary")
+
+def _walk(model: nn.Module) -> dict[str, nn.Module]:
+    return {
+        name: m
+        for name, m in model.named_modules()
+        if isinstance(m, (nn.Linear, DenseLinear))
+    }
+
+
+def _walk_forward(model: DormouseModel) -> None:
     x = torch.randint(0, 256, (2, 64))
     model(x, x)  # the training forward, aux term included
     # The FLA arm's entry is not reachable on CPU (see the seam test above);
-    # call it so beta_proj's coverage is proven on the same code path the GPU
-    # training forward runs.
+    # call it so beta_proj is classified on the same code path the GPU training
+    # forward runs. Both arms own `projections` (full attention has q/k/v).
     model.loop.attn.projections(torch.randn(2, 4, 64))
 
-    walk = {name: m for name, m in model.named_modules() if isinstance(m, (nn.Linear, DenseLinear))}
-    projected = {wid for wid, _ in seen["dense"]}
-    missed = sorted(name for name, m in walk.items() if id(m.weight) not in projected)
-    assert not missed, f"dense weights the projector never saw: {missed}"
-    assert sorted(walk) == sorted(COVERED), (
+
+def _arm_attn_sites(model: nn.Module) -> tuple[str, ...]:
+    """The attention sites THIS arm owns: `kda` has g/beta, `full` has o_proj.
+
+    The ONE list (`DENSE_QAT_ATTN_SITES`) names both arms' sites because it is
+    the list `dense_qat_kind` reads; a tree can only own one arm's modules.
+    """
+    walk = _walk(model)
+    return tuple(name for name in ATTN_SITES if name in walk)
+
+
+def _projected_names(model: nn.Module, seen: dict[str, list[float]]) -> set[str]:
+    ids = {wid for wid, _ in seen["dense"]}
+    return {name for name, m in _walk(model).items() if id(m.weight) in ids}
+
+
+@pytest.mark.parametrize("attn_kind", ["kda", "full"])
+def test_coverage_every_dense_weight_is_classified(monkeypatch, attn_kind):
+    """The default arm: every site is walked, exactly the non-attention ones project."""
+    seen = _spy_projectors(monkeypatch)
+    model = _coverage_model(attn_kind=attn_kind)
+    _walk_forward(model)
+
+    walk = _walk(model)
+    sites = _arm_attn_sites(model)
+    assert sorted(walk) == sorted((*COVERED, *sites)), (
         "the covered-module list moved: a dense weight was added or removed"
     )
+    assert set(ATTN_SITES) - set(sites) == (
+        {"loop.attn.g_proj", "loop.attn.beta_proj"}
+        if attn_kind == "full"
+        else {"loop.attn.o_proj"}
+    ), "an arm's attention sites moved: kda owns g/beta, full owns o_proj"
+    assert not set(COVERED) & set(sites), "a site cannot be both classes"
+    projected = _projected_names(model, seen)
+    assert projected == set(COVERED), (
+        f"projected under the default: unexpected {sorted(projected - set(COVERED))}, "
+        f"missed {sorted(set(COVERED) - projected)}"
+    )
     assert len(seen["dense"]) >= len(COVERED), "fewer projection calls than sites"
+
+
+@pytest.mark.parametrize("attn_kind", ["kda", "full"])
+def test_coverage_skip_off_projects_every_site(monkeypatch, attn_kind):
+    """Gate b's wiring side: with the default rule off, today's full set projects."""
+    seen = _spy_projectors(monkeypatch)
+    model = _coverage_model(dense_qat_skip_attn=False, attn_kind=attn_kind)
+    _walk_forward(model)
+
+    projected = _projected_names(model, seen)
+    assert projected == set(_walk(model)), (
+        f"skip=false must project the whole tree: missed {sorted(set(_walk(model)) - projected)}"
+    )
+    assert len(seen["dense"]) >= len(_walk(model)), "fewer projection calls than sites"
+
+
+# ---------------------------------------------------------------------------
+# `dense_qat_skip_attn`: attention is never below 8 bits (the BitNet rule)
+# ---------------------------------------------------------------------------
+
+
+def test_skip_attn_defaults_on_and_loads():
+    assert tiny_cfg().dense_qat_skip_attn is True
+    on = load_run("small", model_overrides={"dense_qat": "ternary"})
+    assert on.model.dense_qat_skip_attn is True
+    off = load_run(
+        "small", model_overrides={"dense_qat": "ternary", "dense_qat_skip_attn": False}
+    )
+    assert off.model.dense_qat_skip_attn is False
+
+
+@pytest.mark.parametrize("attn_kind", ["kda", "full"])
+def test_gate_a_skip_attn_projects_no_attention_weight(monkeypatch, attn_kind):
+    """The projector sees ZERO attention weights and EVERY other dense weight."""
+    seen = _spy_projectors(monkeypatch)
+    model = _coverage_model(attn_kind=attn_kind)
+    _walk_forward(model)
+
+    walk = _walk(model)
+    sites = _arm_attn_sites(model)
+    hit = {wid for wid, _ in seen["dense"]}
+    attn_ids = {id(walk[name].weight) for name in sites}
+    assert len(attn_ids) == len(sites), "the walk does not resolve the arm's sites"
+    assert not hit & attn_ids, (
+        f"attention weights reached the projector: "
+        f"{sorted(n for n in sites if id(walk[n].weight) in hit)}"
+    )
+    missed = [name for name in COVERED if id(walk[name].weight) not in hit]
+    assert not missed, f"non-attention sites the projector never saw: {missed}"
+
+
+def test_gate_b_skip_off_is_the_pre_change_forward():
+    """`dense_qat_skip_attn=false` IS the measured 3.2733 arm's forward, bit for bit.
+
+    The golden was captured from the code before this flag existed (commit
+    257f1fc) on the coverage fixture at seed 1234. Both sides pin one thread:
+    CPU float32 reduction order follows the thread count, so the golden is the
+    same bits only at the recorded width (see the fixture's capture note).
+    """
+    old = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        torch.manual_seed(1234)
+        model = _coverage_model(dense_qat_skip_attn=False)
+        x = torch.randint(0, 256, (2, 16))
+        with torch.no_grad():
+            logits, _, _ = model(x, x)
+        assert torch.equal(logits, torch.load(PRECHANGE))
+    finally:
+        torch.set_num_threads(old)
+
+
+def test_gate_c_skip_attn_keeps_attention_on_its_master(monkeypatch):
+    """Attention's effective weight is the raw master (dtype and values), and the
+    FFN/controller/router sites are still quantized in the same forward."""
+    seen = _spy_projectors(monkeypatch)
+    on = _coverage_model()
+    off = _coverage_model(dense_qat="none")
+    off.load_state_dict(on.state_dict())
+
+    x = torch.randint(0, 256, (2, 64))
+    with torch.no_grad():
+        on(x, x)
+        xp = torch.randn(2, 4, 64)
+        pa = on.loop.attn.projections(xp)
+        pb = off.loop.attn.projections(xp)
+        xm = torch.randn(2, 64, 64)
+        ya = on.loop.msa._forward(xm, Counters(), None)
+        yb = off.loop.msa._forward(xm, Counters(), None)
+
+    for name, ta, tb in zip("qkvgb", pa, pb, strict=True):
+        assert torch.equal(ta, tb), f"attention {name} moved under skip_attn"
+        assert ta.dtype == tb.dtype
+    assert torch.equal(pa[0], on.loop.attn.q_proj(xp).reshape(2, 4, 4, 16))
+    assert torch.equal(ya, yb), "the MSA arm must read its masters under skip_attn"
+
+    hit = {wid for wid, _ in seen["dense"]}
+    for name in ("loop.controller", "loop.mem_dense", "loop.moe.router", "loop.moe.down"):
+        assert id(on.get_submodule(name).weight) in hit, f"{name} must still be quantized"
+
+
+@pytest.mark.parametrize("skip", [True, False])
+def test_gate_d_skip_attn_is_inert_with_dense_qat_none(monkeypatch, skip):
+    seen = _spy_projectors(monkeypatch)
+    model = _coverage_model(dense_qat="none", dense_qat_skip_attn=skip)
+    _walk_forward(model)
+    assert seen["dense"] == [] and seen["factor"] == [], (
+        "dense_qat=none must call neither projector, whatever skip_attn says"
+    )
+
+
+def test_gate_e_skip_attn_adds_no_host_sync(monkeypatch):
+    """Every host-read primitive is made to raise; the skipped attention path must not use one.
+
+    Scoped to the KDA arm + its `projections` seam (the sites this flag
+    changes): the full CPU forward's MoE dispatch already calls `.tolist()`,
+    a pre-existing sync that predates and is unrelated to this switch.
+    """
+    model = _coverage_model()
+    x = torch.randn(2, 8, 64)
+
+    def boom(*_a, **_k):
+        raise AssertionError("host sync in the skip_attn path")
+
+    for name in ("item", "tolist", "cpu", "numpy", "__float__", "__int__"):
+        monkeypatch.setattr(torch.Tensor, name, boom)
+    with torch.no_grad():
+        model.loop.attn.projections(x)
+        model.loop.attn(x)
 
 
 # ---------------------------------------------------------------------------

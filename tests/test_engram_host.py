@@ -109,11 +109,14 @@ def test_the_step_sums_its_iterations_into_one_nesterov_update():
     silently if `host_step` read only the last leaf. The reference is
     `crates/dormouse-train/src/offload.rs::momentum_update` transcribed here:
     `m = mu*m + (1-mu)*g`, `block = mu*m + (1-mu)*g`, `t -= lr*block`, Sinkhorn
-    only every 4th update (this is the first, so none).
+    only every 4th update (this is the first, so none). `bias_correction=False`
+    on purpose: this gate pins burn's formula verbatim, the A/B's
+    `ram_old_formula` arm; the corrected formula has its own gates in
+    `test_engram_bias.py`.
     """
     model = tiny_model()
     engram = model.loop.engram
-    enable_host_tables(model)
+    enable_host_tables(model, bias_correction=False)
     ids = torch.tensor([[3, 5, 3, 11]])
     hidden = torch.randn(2, 4, model.cfg.d_model, requires_grad=True)
 
@@ -201,6 +204,8 @@ def test_host_tables_round_trip_through_the_ngram_sibling(tmp_path, monkeypatch)
     load_host_state(fresh, load_ngram(run.train))
     assert torch.equal(fresh.loop.engram.host.rows, model.loop.engram.host.rows)
     assert torch.equal(fresh.loop.engram.host.momentum, model.loop.engram.host.momentum)
+    assert torch.equal(fresh.loop.engram.host.counts, model.loop.engram.host.counts)
+    assert int(model.loop.engram.host.counts.sum()) > 0, "the step touched rows"
     assert fresh.loop.engram.host.step == model.loop.engram.host.step == 1
 
 

@@ -9,6 +9,7 @@ anything training cares about (the masters stay live).
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import pytest
@@ -54,10 +55,10 @@ def test_nvfp4_round_trip_within_the_grid_bound():
     assert rel < 1e-1, rel.item()
     assert get.dtype == torch.float32 and get.shape == t.shape
     # Exact-code invariant: each decoded value IS a grid entry × its block's
-    # scale (magnitudes are global; scales are per-block, so the magnitudes
-    # alone are what can be pinned).
+    # EFFECTIVE scale (the e4m3 scale record is prescaled by the global power
+    # of two, which the decode divides back out).
     blocks = get.reshape(-1, 16)
-    scales = rec["scale"].float().unsqueeze(-1)
+    scales = (rec["scale"].float() / rec["global_scale"]).unsqueeze(-1)
     grid = torch.tensor((0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0))
     quot = (blocks / scales).abs()  # codes are signed; the grid is magnitudes
     dist = (quot.unsqueeze(-1) - grid).abs().amin(-1).max()
@@ -70,6 +71,71 @@ def test_zero_block_stays_zero_and_does_not_inf():
     t = torch.zeros(64)
     rec = pack_tsct(t, "nvfp4")
     assert unpack_tsct(rec).abs().max().item() == 0.0
+
+
+def test_nvfp4_small_block_prescales_instead_of_zeroing():
+    """A block below e4m3's min normal survives the two-level prescale.
+
+    Regression: the guard read `2.0 ** finfo(float8_e4m3fn).min` = 2^-448
+    (1.38e-135) instead of `finfo.tiny` = 2^-6, so it never fired. Block 0's
+    `amax/6 = 6.7e-4` underflowed the e4m3 block scale to 0.0, `q = blocks/0`
+    saturated, and every one of its 16 weights decoded as 0.0.
+    """
+    t = torch.zeros(2, 16)
+    t[0, 0] = 0.004  # amax/6 = 6.7e-4 < 2^-6
+    t[1, 0] = 0.30  # amax/6 = 0.05, already representable
+    rec = pack_tsct(t, "nvfp4")
+    get = unpack_tsct(rec)
+    global_scale = rec["global_scale"]
+    assert global_scale > 1.0, "the small block must have asked for a prescale"
+    assert math.log2(global_scale).is_integer(), f"prescale {global_scale} is not 2^k"
+    assert float(rec["scale"].float().min()) > 0.0, "a block scale underflowed to zero"
+    assert get[0, 0].item() != 0.0, "the small block was silently zeroed"
+    assert get[1, 0].item() != 0.0
+    # The first level is a power-of-two move: every decoded value is still
+    # within ONE e2m1 step of its source at that block's effective scale.
+    step = (rec["scale"].float() / global_scale).unsqueeze(-1)
+    assert ((get - t).abs() <= step + 1e-9).all(), (get - t).abs()
+
+
+def test_nvfp4_prescale_is_a_power_of_two_and_one_step_holds_across_mixed_blocks():
+    """Random per-block scales, with and without the prescale in play.
+
+    The second level is e4m3 (3 mantissa bits); the error bound is the e2m1
+    step at the PRESCALED block scale, divided back by the global. `mult=1e-5`
+    pushes every block below e4m3's min normal, so the guard must fire and
+    still keep every block alive.
+    """
+    gen = torch.Generator().manual_seed(7)
+    base = torch.randn(256 * 16, generator=gen).reshape(256, 16)
+    block_scales = torch.exp(torch.randn(256, generator=gen) * 0.8).unsqueeze(-1)
+    source = base * block_scales
+    for mult in (1.0, 1e-5):
+        t = (source * mult).reshape(16, 256)
+        rec = pack_tsct(t, "nvfp4")
+        get = unpack_tsct(rec)
+        global_scale = rec["global_scale"]
+        assert math.log2(global_scale).is_integer(), f"prescale {global_scale} is not 2^k"
+        assert (get.reshape(-1, 16).abs().sum(dim=1) > 0).all(), "a block decoded to zero"
+        step = (rec["scale"].float() / global_scale).unsqueeze(-1)
+        too_far = ((get.reshape(-1, 16) - t.reshape(-1, 16)).abs() > step + 1e-9).sum()
+        assert too_far == 0, f"{int(too_far)} element(s) beyond one e2m1 step at {mult=}"
+
+
+def test_nvfp4_block_at_the_e4m3_subnormal_boundary_round_trips():
+    """The boundary is e4m3's own grid, not an accident of the prescale."""
+    tiny = float(torch.finfo(torch.float8_e4m3fn).tiny)  # 2^-6 = min normal
+    # amax = 6·2^-9 -> the block scale is e4m3's smallest SUBNORMAL.
+    t = torch.zeros(16)
+    t[0] = 6.0 * 2.0**-9
+    get = unpack_tsct(pack_tsct(t, "nvfp4"))
+    assert get[0].item() != 0.0
+    # amax = 6·tiny -> the scale is exactly the min normal, no prescale needed.
+    t = torch.zeros(16)
+    t[0] = 6.0 * tiny
+    rec = pack_tsct(t, "nvfp4")
+    assert rec["global_scale"] == 1.0
+    assert unpack_tsct(rec)[0].item() == t[0].item()
 
 
 def test_non_factor_key_refuses_to_pack_implicitly():

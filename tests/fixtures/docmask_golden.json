@@ -1,0 +1,30 @@
+{
+  "batches": [
+    [
+      "a70285d17620424824d2454d353a8fbfdf80ae71a174fbee8e847f4f7c55a120",
+      "8819368336316db1614bef1090df2dcd57b8a528da244f5c3822001cf413a485"
+    ],
+    [
+      "60bdecbbb06ff3096ed9eb13852a5066f8a0cae843a8b26cd4b482ab1eb2b58d",
+      "b4adc344c29d2d65d53f0a1dce4e2d61f07d0b806907f922a30cb5105c762207"
+    ],
+    [
+      "a0ba8cdb2723347cc6edb0ea9c2c8d54fca88cfb6c1e67ae70d389ccabb51c39",
+      "7b7f8eb7f0c8514f6dfbf223c42386404ad1f83b2ce8e8819335e48ea2880bdd"
+    ]
+  ],
+  "fixture": {
+    "batch": 2,
+    "corpus": "bytes(range(16))*256",
+    "seq": 16
+  },
+  "init_state": "d3360f3178dc1be2f3bfc6614f52927f762fc76054187098de8faa1bdb6d2d27",
+  "logits": "57d0c0ee6c5b0240e81d95eaea18681d06ef2c9ca1400292c3f97948e79837ee",
+  "loss": "5.888380527496338",
+  "train_losses": [
+    "6.2986",
+    "4.9347",
+    "4.0408"
+  ],
+  "train_state": "7aa97a5d8b381465fc0c6501b4386ad3b2c415fb0c7b1c1384752960ddf8f535"
+}

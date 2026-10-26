@@ -56,6 +56,40 @@ Three more deviations, all COUNTED rather than hidden:
   divergence class of the paragraph above — so the state the prefill leaves is
   equivalent, not bit-equal, to the byte prefill's. `"byte"` is the arm that
   keeps the streaming re-call trick byte-identical to a single call.
+
+## The two fast arms (both off by default)
+
+`decode_graph` captures the recurrent STEP in a CUDA graph and replays it
+(`_GraphStep`): static id/logits/hidden buffers, the per-iteration KDA states
+updated IN PLACE inside the recorded body, sampling outside. It removes host
+launch overhead, not arithmetic — measured on `flagship1` (105M params, this
+box): 2057 kernel launches and 4.6 ms of device time per replay, so what is
+left is 2057 tiny kernels, not Python. Structural refusals are LOUD; a capture
+failure is COUNTED and stays eager.
+
+`decode_multibyte=k` is the MTP draft-then-verify loop: the trunk proposes the
+next byte, `MTPHead` proposes `k-1` more from the same position, ONE block
+forward (`_recurrent_block(width=k)`) verifies them, and the longest correct
+prefix is emitted with the first disagreement corrected from the target. The
+KDA step inside the block is unrolled per token on purpose: `fused_recurrent_kda`
+at `T > 1` measured 1e-4/1e-3 from the same tokens stepped one at a time, and
+the block's whole contract is the one-byte loop's bytes. It is
+GREEDY ONLY (`temp <= 1e-6`): at a temperature the block's per-position
+distribution is the one-byte loop's only up to the projection GEMM's M-shape
+(measured ~2e-7 of the carried state over 4 bytes), so a sampled block is not
+provably distributed like the loop, and shipping it would change the model.
+It also REFUSES a capacity-dropping MoE, whose drop set is not prefix-causal —
+the same defect `recurrent_non_causal` counts, except that here it would break
+the byte-equivalence gate rather than merely being a deviation.
+
+**Why not `specdecode.spec_decode_bytes`:** its verify forward is
+`window_forward` (the O(window) sliding-window call, stateless) and its draft is
+DSpark's. The recurrent arm needs a state-carry block verify plus a state
+REPAIR when a block is partly rejected (the verify advanced through bytes that
+were not emitted), and mixing the two decoders is exactly what
+`decode --spec-k --recurrent` refuses. The acceptance RULE is the same one this
+module uses, degenerated to greedy: at `temp <= 1e-6` `min(1, p/q)` is 0 or 1,
+so the correct emit is the target's argmax.
 """
 
 from __future__ import annotations
@@ -154,26 +188,30 @@ def decode_bytes(
     return bytes(ctx)
 
 
-def _recurrent_forward(
+def _recurrent_block(
     model,
     ctx: list[int],
     states: list,
     dev: torch.device,
     drop: int,
+    width: int,
     counters: Counters,
-) -> tuple[torch.Tensor, list]:
-    """ONE position (the last byte of `ctx`) through the loop block, state carried.
+) -> tuple[torch.Tensor, torch.Tensor, list]:
+    """`width` positions (the last `width` bytes of `ctx`) through the loop, state carried.
 
-    `ids` is the engram's byte window: the last `drop+1` bytes, where
-    `drop = min(max_order-1, position)` so the first positions of the stream
-    read a shorter window — the same `s = max(0, e-order)` semantics
-    `engram.raw_keys` has, and the same clamp `_forward_segmented` uses. The
-    readout for the context positions is padding that `_memory` slices off.
+    The general form of `_recurrent_forward`: `width = 1` is exactly the per-byte
+    decode step, `width > 1` is the block verify `decode_multibyte` runs. The
+    Engram's byte window is `width + drop` long: `drop` bytes of left context for
+    the first block position (the same clamp and the same `_memory` slice the
+    per-byte path uses), and the block's own bytes as context for the rest.
     """
-    d = min(drop, len(ctx) - 1)
-    ids = torch.tensor([ctx[-(d + 1) :]], dtype=torch.long, device=dev)
-    h0 = model.embed(ids[:, -1:])
-    return model.loop.recurrent_step(h0, ids, states, drop=d, counters=counters)
+    d = min(drop, len(ctx) - width)
+    assert d >= 0, f"ctx holds {len(ctx)} bytes, a block step needs at least {width}"
+    ids = torch.tensor([ctx[-(width + d) :]], dtype=torch.long, device=dev)
+    h0 = model.embed(ids[:, -width:])
+    out, states = model.loop.recurrent_step(h0, ids, states, drop=d, counters=counters)
+    logits = model.lm_head(model.norm(out.reshape(-1, model.cfg.d_model).to(torch.float32)))
+    return out, logits, states
 
 
 def _step_logits(
@@ -190,8 +228,7 @@ def _step_logits(
     burn rule that fixes `bf16 logits NaN`), applied to the readout the loop
     block returned; `decode_bytes` reaches the same row through `model(ids)`.
     """
-    out, states = _recurrent_forward(model, ctx, states, dev, drop, counters)
-    logits = model.lm_head(model.norm(out.reshape(-1, model.cfg.d_model).to(torch.float32)))
+    _, logits, states = _recurrent_block(model, ctx, states, dev, drop, 1, counters)
     return logits[-1], states
 
 
@@ -219,6 +256,24 @@ def recurrent_refusal(model) -> str | None:
             "recurrent decode with use_msa: the block-sparse arm selects its blocks "
             "INSIDE one window, and a one-byte step has no window to select in — that "
             "is a model change wearing an inference flag. Escape: use_msa=false."
+        )
+    if getattr(getattr(model, "cfg", None), "attn_kind", "kda") == "full":
+        return (
+            "recurrent decode with attn_kind='full': exact attention has no O(1) "
+            "per-byte state — a one-byte step would have to carry the whole window's "
+            "K/V (the O(window) cache the compressed arm exists to avoid), and this "
+            "decoder carries one state per iteration slot across BYTES. Escape: "
+            "attn_kind='kda', or decode with the window re-forward (--no-recurrent), "
+            "which attends inside one forward."
+        )
+    if getattr(getattr(model, "cfg", None), "halt_mode", False):
+        return (
+            "recurrent decode with halt_mode: the per-iteration KDA state is "
+            "carried across BYTES, so a stop at one byte would leave the deeper "
+            "slots' state un-advanced and the next byte would read a state that "
+            "skipped bytes — a silent model change. Escape: halt_mode=false, or "
+            "decode with the window re-forward (`--no-recurrent`), which halts "
+            "inside one forward."
         )
     return None
 
@@ -272,6 +327,290 @@ def _chunked_prefill(
     return logits[-1], states
 
 
+#: The greedy threshold `decode_multibyte` accepts: at `temp <= 1e-6` the
+#: sampler IS the argmax (the softmax is one-hot to fp32), which is the one
+#: regime where a verified draft block and the one-byte loop provably emit the
+#: same byte. `decode_multibyte` refuses any higher temperature (see its
+#: docstring): at `temp > 0` the block verify's target distribution is the same
+#: distribution only up to the KDA/projection summation order, so "byte-identical"
+#: stops being a statement one can prove.
+GREEDY_TEMP = 1e-6
+
+
+def decode_graph_refusal(model, *, batch: int = 1) -> str | None:
+    """Why a CUDA-graph replay of the decode step cannot run, or `None`.
+
+    The structural half of the arm's refusals, exposed so a caller can decide
+    BEFORE it captures anything (the capture-failure half is COUNTED at runtime
+    by `_GraphStep`). Every item here is LOUD for the same reason: a graph
+    replays recorded addresses, so a config whose step changes SHAPE or whose
+    state is not a fixed tensor cannot be captured without running a different
+    program than the eager one.
+    """
+    why = recurrent_refusal(model)
+    if why is not None:
+        return f"decode_graph: {why}"
+    if batch != 1:
+        return (
+            f"decode_graph is a batch-1 replay: the captured buffers are ONE byte window "
+            f"and one state set, so a batch of {batch} would replay the first row's ids "
+            f"and write into the first row's buffers — every other row would silently "
+            f"degrade to it. Escape: batch=1, or decode_graph=false."
+        )
+    return None
+
+
+def _state_refusal(states: list, dev: torch.device) -> str | None:
+    """Why `states` is not a set of fixed tensors a graph can own, or `None`."""
+    for i, s in enumerate(states):
+        if not torch.is_tensor(s):
+            return (
+                f"decode_graph: state slot {i} is {type(s).__name__}, not a fixed-size "
+                f"tensor. A captured step replays the ADDRESSES it recorded, so a state "
+                f"whose shape or layout moves per byte cannot be captured (the SDPA "
+                f"fallback's growing (k, v) context is exactly that). Escape: "
+                f"decode_graph=false (eager), or attn_kind='kda'."
+            )
+        if s.device.type != dev.type:
+            return (
+                f"decode_graph: state slot {i} lives on {s.device}, the step on {dev}. "
+                f"A capture records one device's addresses. Escape: one --device, or "
+                f"decode_graph=false."
+            )
+    return None
+
+
+class _EagerStep:
+    """The eager block step: `_recurrent_block` behind the graph's interface."""
+
+    def __init__(self, model, dev: torch.device, drop: int, width: int, counters: Counters) -> None:
+        assert width >= 1, f"a step is at least one byte, got {width}"
+        self.model, self.dev, self.drop, self.width = model, dev, drop, width
+        self.counters = counters
+
+    def step(self, ctx: list[int], states: list) -> tuple[torch.Tensor, torch.Tensor, list]:
+        out, logits, states = _recurrent_block(
+            self.model, ctx, states, self.dev, self.drop, self.width, self.counters
+        )
+        return logits, out.reshape(-1, self.model.cfg.d_model), states
+
+
+class _GraphStep:
+    """ONE recurrent block step (`width` positions) captured in a CUDA graph.
+
+    The discipline is `train/graph.py::OptimizerGraph`'s: static input/output
+    buffers, and every carried tensor updated IN PLACE (`copy_`), never
+    rebound — a replay writes the addresses recorded at capture, so replacing a
+    buffer instead of filling it is exactly the bug that looks like the graph
+    "sometimes" using stale state.
+
+    * `ids [1, width+drop]` — the Engram's byte window; the last `width` rows are
+      the step's block. The host writes it with `copy_` before each replay.
+    * `states [max_iter]` — the KDA state per loop-iteration slot. The step's own
+      `new_states` are copied back into these buffers INSIDE the captured body,
+      so the graph advances the state it reads.
+    * `logits [width, vocab]`, `hidden [width, d_model]` — the step's outputs.
+      Sampling stays OUTSIDE (it needs host values anyway), and `hidden` is the
+      loop's pre-norm readout the MTP draft head reads.
+
+    Capture is lazy (the first step), warmup-first (2 eager steps on a side
+    stream, with the state restored between them), and one-shot: a capture
+    failure is COUNTED and the arm stays eager for the rest of the call, because
+    a half-built graph replaying garbage is worse than no graph
+    (`train/graph.py`'s rule). A structural refusal (`decode_graph_refusal`,
+    a non-tensor state, a non-CUDA device) is LOUD instead.
+    """
+
+    def __init__(
+        self,
+        model,
+        dev: torch.device,
+        drop: int,
+        width: int,
+        counters: Counters,
+        *,
+        batch: int = 1,
+    ) -> None:
+        assert width >= 1, f"a step is at least one byte, got {width}"
+        why = decode_graph_refusal(model, batch=batch)
+        if why is not None:
+            loud(why)
+        if dev.type != "cuda" or not torch.cuda.is_available():
+            loud(
+                f"decode_graph needs a CUDA device: a CUDA graph is a CUDA-only "
+                f"mechanism, and there is no honest capture on {dev}. Escape: "
+                f"--device cuda, or decode_graph=false."
+            )
+        self.model, self.dev, self.drop, self.width = model, dev, drop, width
+        self.counters = counters
+        self.batch = batch
+        d, v = model.cfg.d_model, model.cfg.vocab
+        self.ids = torch.zeros(batch, width + drop, dtype=torch.long, device=dev)
+        self.logits = torch.zeros(batch * width, v, dtype=torch.float32, device=dev)
+        self.hidden = torch.zeros(batch * width, d, dtype=torch.float32, device=dev)
+        self.states: list | None = None
+        self.graph: torch.cuda.CUDAGraph | None = None
+        self.reason: str | None = None
+        self._scratch = Counters()
+        self._captured: dict[str, int] = {}
+        self._captured_dev: dict[str, torch.Tensor] = {}
+
+    # -- the captured body --------------------------------------------------
+
+    def _body(self) -> None:
+        """What the graph records: the step, the head, and the in-place state writeback."""
+        model = self.model
+        out, new = model.loop.recurrent_step(
+            model.embed(self.ids[:, -self.width :]),
+            self.ids,
+            self.states,
+            drop=self.drop,
+            counters=self._scratch,
+        )
+        d = model.cfg.d_model
+        logits = model.lm_head(model.norm(out.reshape(-1, d).to(torch.float32)))
+        for buf, s in zip(self.states, new, strict=True):
+            buf.copy_(s)
+        self.hidden.copy_(out.reshape(-1, d).to(torch.float32))
+        self.logits.copy_(logits)
+
+    # -- capture ------------------------------------------------------------
+
+    def _capture(self, ctx: list[int], states: list) -> None:
+        if len(ctx) < self.width + self.drop:
+            raise RuntimeError(
+                f"decode_graph: the context holds {len(ctx)} bytes, the capture window "
+                f"needs {self.width + self.drop} (width {self.width} + drop {self.drop})"
+            )
+        why = _state_refusal(states, self.dev)
+        if why is not None:
+            loud(why)
+        if self.states is None:
+            # The graph OWNS these from here on; the caller's tensors are only
+            # the initial value. A copy, not an adoption: capture must not pin
+            # an address the caller may rebind.
+            self.states = [s.detach().clone() for s in states]
+        elif len(states) != len(self.states):
+            loud(
+                f"decode_graph: {len(states)} state slots now, {len(self.states)} at "
+                f"capture. A replay owns a fixed state set. Escape: decode_graph=false."
+            )
+        self._fill(ctx, states)
+        # Warmup BEFORE capture, on a side stream: the first eager step is what
+        # materializes cuBLAS workspaces / the kernels' lazy state, and doing
+        # that inside `torch.cuda.graph` aborts the capture. The state is saved
+        # and restored around each warmup, so warmup does not advance the stream.
+        saved = [s.clone() for s in self.states]
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(2):
+                self._scratch = Counters()
+                self._body()
+                for buf, s in zip(self.states, saved, strict=True):
+                    buf.copy_(s)
+        torch.cuda.current_stream().wait_stream(stream)
+        torch.cuda.synchronize()
+        self._scratch = Counters()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, capture_error_mode="thread_local"):
+            self._body()
+        # Publish ONLY a finished graph: capture did not execute the step, so
+        # `step()` replays once and the first call returns real outputs.
+        self.graph = graph
+        # A replay runs the recorded DEVICE ops only; the arm counters the body
+        # wrote during capture would stop advancing. Snapshot them and re-count
+        # per replay (`OptimizerGraph._captured_counters`).
+        self._captured = dict(self._scratch)
+        self._captured_dev = dict(self._scratch._device)
+
+    # -- the step -----------------------------------------------------------
+
+    def _fill(self, ctx: list[int], states: list) -> None:
+        """Write this step's inputs INTO the graph-owned buffers (never rebind)."""
+        ids = torch.tensor([ctx[-(self.width + self.drop) :]], dtype=torch.long, device=self.dev)
+        assert ids.shape == self.ids.shape, f"ids {tuple(ids.shape)} != {tuple(self.ids.shape)}"
+        self.ids.copy_(ids)
+        if len(states) != len(self.states):
+            loud(
+                f"decode_graph: {len(states)} state slots for a graph captured with "
+                f"{len(self.states)}. Escape: decode_graph=false."
+            )
+        for buf, s in zip(self.states, states, strict=True):
+            buf.copy_(s)
+
+    def step(self, ctx: list[int], states: list) -> tuple[torch.Tensor, torch.Tensor, list]:
+        """One block step. Captures on the first call; COUNTED eager after a failure."""
+        if self.graph is None and self.reason is None:
+            try:
+                self._capture(ctx, states)
+            except Exception as e:  # noqa: BLE001 — no capture failure may kill a decode
+                self.reason = f"{type(e).__name__}: {e}"
+                self.graph = None
+                self.counters.count("decode_graph_fallback")
+                self.counters.why = (  # type: ignore[attr-defined]
+                    f"decode_graph: capture failed, staying EAGER — {self.reason}"
+                )
+        if self.graph is None:
+            out, logits, states = _recurrent_block(
+                self.model, ctx, states, self.dev, self.drop, self.width, self.counters
+            )
+            return logits, out.reshape(-1, self.model.cfg.d_model), states
+        self._fill(ctx, states)
+        self.graph.replay()
+        for name, n in self._captured.items():
+            self.counters.count(name, n)
+        for name, t in self._captured_dev.items():
+            self.counters.count_device(name, t)
+        self.counters.count("decode_graph_replay")
+        return (
+            self.logits.view(self.width, -1),
+            self.hidden.view(self.width, -1),
+            self.states,
+        )
+
+
+def _mtp_draft(
+    model, head, h_last: torch.Tensor, first: int, n: int, counters: Counters
+) -> list[int]:
+    """`n` bytes after `first`, greedy, from the MTP chain at ONE position.
+
+    `mtp.py`'s module `j` reads the hidden state at position `q` and
+    `embed(ids[q + j + 1])`, and predicts `x[q + j + 2]`. At decode only position
+    `q` exists, so the chain feeds itself: byte 0 is the trunk's own proposal
+    (`first`, already verified by construction), byte `j` is module `j-1`'s
+    argmax, and the module's own output becomes the next module's hidden state.
+    That is the trained module and the trained head (`model.embed`,
+    `model.lm_head`) — nothing is re-implemented; only the INPUT POSitions are
+    frozen at `q`, the same reduction `specdecode.draft_block` makes for DSpark.
+    `h_last` is the loop's own readout: training feeds `mtp.forward` the readout
+    after the coda, and the decode path has no coda step (a pre-existing
+    limitation of the recurrent head, `coda_layers = 0` in every preset). A
+    mismatch here can only lower the acceptance rate — the verify never reads
+    the draft's distribution.
+
+    The draft is a proposal, not a distribution: `decode_multibyte` is greedy
+    (the verify accepts the longest correct prefix and re-samples the first
+    disagreement from the TARGET), so a wrong draft costs a forward and never a
+    wrong byte.
+    """
+    assert head is not None, "_mtp_draft needs the MTP head"
+    assert 0 <= n <= head.k, f"mtp draft of {n} bytes, head has k={head.k}"
+    h = h_last.reshape(1, head.d_model).to(torch.float32)
+    prev = int(first)
+    out: list[int] = []
+    for j in range(n):
+        hp = head.norms_h[j](h)
+        e = model.embed(torch.tensor([[prev]], dtype=torch.long, device=h.device))
+        e = head.norms_e[j](e.reshape(1, -1).to(torch.float32))
+        x = head.projs[j](torch.cat([hp, e], dim=-1))
+        prev = int(model.lm_head(x).argmax())
+        out.append(prev)
+        h = x
+    counters.count("decode_multibyte_draft", n)
+    return out
+
+
 def recurrent_decode(
     model,
     prompt: bytes,
@@ -283,6 +622,8 @@ def recurrent_decode(
     stop: frozenset[int] | None = None,
     counters: Counters | None = None,
     prefill: str = "auto",
+    decode_graph: bool = False,
+    decode_multibyte: int = 0,
 ) -> bytes:
     """`decode_bytes`' contract, `O(1)` per byte — the state-carry decoder.
 
@@ -294,6 +635,30 @@ def recurrent_decode(
     `prefill_chunked`/`prefill_byte` = the prefill arm). The module docstring
     has the state-carry mechanism, the numerics contract and the three COUNTED
     deviations.
+
+    The two fast arms, both off by default:
+
+    `decode_graph=True` captures the one-byte step in a CUDA graph and replays
+    it (`_GraphStep`). The step is the same `recurrent_step` — the graph removes
+    the per-step launch overhead, not any arithmetic; sampling stays outside.
+    Structural refusals are LOUD (`decode_graph_refusal`: byteflow, `attn_kind`
+    full, MSA, halt, batch>1, a state that is not a fixed tensor, a non-CUDA
+    device); a capture FAILURE is COUNTED (`decode_graph_fallback` + the reason)
+    and stays eager, because a half-built graph is worse than no graph.
+
+    `decode_multibyte=k > 0` emits up to `k` bytes per forward using the model's
+    own MTP heads: the trunk proposes the first byte, the MTP chain proposes the
+    next `min(k, mtp_k+1)-1`, ONE block forward verifies them, the longest
+    correct prefix is emitted and the first disagreement is corrected from the
+    target. **Greedy only** (`temp <= 1e-6`) — see `GREEDY_TEMP`; a higher
+    temperature is refused LOUDLY rather than shipped with an unproven
+    distribution. A model without an MTP head falls back COUNTED
+    (`decode_multibyte_fallback` + the reason) to one byte per forward. The
+    block verify and the one-byte loop are the same arithmetic in a different
+    M-shape (measured: the projections' bf16 GEMM moves the carried state by
+    ~2e-7 over 4 bytes), so a near-tie could in principle flip a byte; the GPU
+    gate pins the greedy bytes for 32+ bytes on a real checkpoint rather than
+    claiming bit-identity.
 
     Cost: the prefill is `prefill="auto"` (the default) — ONE chunked forward
     over the prompt when the chunk kernel is live (CUDA + FLA, COUNTED
@@ -316,6 +681,27 @@ def recurrent_decode(
             f"'chunked' demands the chunked kernel (COUNTED fallback to byte when it "
             f"cannot run)."
         )
+    if decode_multibyte < 0:
+        loud(
+            f"decode_multibyte={decode_multibyte}: it is a count of bytes per forward. "
+            f"Escape: 0 (off), or >= 2 ({decode_multibyte} would be the one-byte loop "
+            f"with a redundant verify)."
+        )
+    if decode_multibyte == 1:
+        loud(
+            "decode_multibyte=1: one byte per forward IS the one-byte loop, and the "
+            "draft/verify would add a second forward for no byte. Escape: 0 (off), or "
+            ">= 2."
+        )
+    if decode_multibyte and temp > GREEDY_TEMP:
+        loud(
+            f"decode_multibyte={decode_multibyte} at temp={temp}: multibyte is GREEDY "
+            f"ONLY. The block verify's per-position distribution equals the one-byte "
+            f"loop's only up to the KDA/projection summation order (measured ~2e-7 of "
+            f"the carried state), so a sampled block is NOT provably distributed like "
+            f"the one-byte loop — accepting it would change what the model is. Escape: "
+            f"temp <= {GREEDY_TEMP} (greedy), or decode_multibyte=0."
+        )
     why = recurrent_refusal(model)
     if why is not None:
         loud(why)
@@ -324,12 +710,69 @@ def recurrent_decode(
     if loop.moe.topk > 0 and loop.moe.capacity > 0.0:
         counters.count("recurrent_non_causal")
     dev = torch.device(device) if device is not None else torch.device("cpu")
+    drop = 0 if loop.engram is None else max(loop.engram.orders) - 1
+    # One `why` slot is the instrument's contract, and the step's own degradation
+    # (`kda_step_torch` on CPU) writes it on every step. The arm-level reasons are
+    # collected here and folded back in at the END, so a fallback's reason cannot
+    # be overwritten by the next step's note — the reader still sees both.
+    fallbacks: list[str] = []
+    head = getattr(model, "mtp", None)
+    multibyte = int(decode_multibyte)
+    if multibyte and head is None:
+        counters.count("decode_multibyte_fallback")
+        fallbacks.append(
+            "decode_multibyte: this model has no MTP head (mtp_weight=0), so there is "
+            "no draft the verify could accept — staying at one byte per forward. "
+            "Escape: a checkpoint trained with mtp_weight > 0, or decode_multibyte=0."
+        )
+        multibyte = 0
+    if multibyte:
+        multibyte = min(multibyte, head.k + 1)
+        counters.count("decode_multibyte", multibyte)
+    if multibyte and loop.moe.topk > 0 and loop.moe.capacity > 0.0:
+        loud(
+            f"decode_multibyte with moe_topk={loop.moe.topk} and "
+            f"moe_capacity={loop.moe.capacity}: the verify block's DROP SET is a "
+            f"function of the block's composition, not of each position (the "
+            f"`recurrent_non_causal` defect this decoder already counts) — a position "
+            f"used inside a block may keep a row it drops one-byte-at-a-time, so the "
+            f"block's logits are not the one-byte loop's and the greedy equivalence "
+            f"gate cannot hold. Escape: moe_capacity=0 (dropless), or "
+            f"decode_multibyte=0."
+        )
+    if decode_graph:
+        why = decode_graph_refusal(model)
+        if why is not None:
+            loud(why)
+        if dev.type != "cuda" or not torch.cuda.is_available():
+            loud(
+                f"decode_graph needs a CUDA device: a CUDA graph is a CUDA-only "
+                f"mechanism, and there is no honest capture on {dev}. Escape: "
+                f"--device cuda, or decode_graph=false."
+            )
+        if len(prompt) < drop:
+            # The Engram's left context GROWS for the first `drop+1` positions, so
+            # the id window's width is not fixed yet. A short prompt still decodes;
+            # the graph is the thing that cannot start until the shape settles.
+            counters.count("decode_graph_fallback")
+            fallbacks.append(
+                f"decode_graph: the prompt is {len(prompt)} bytes and the Engram's "
+                f"n-gram window is {drop + 1}, so the first steps' id window grows; a "
+                f"capture needs one fixed width. Staying eager."
+            )
+            decode_graph = False
     was_training = model.training
     model.eval()
     ctx = list(prompt)
     target = len(prompt) + n_new
-    drop = 0 if loop.engram is None else max(loop.engram.orders) - 1
     states: list = [None] * model.cfg.max_iter
+    # The per-byte stepper is chosen ONCE: `_GraphStep` captures lazily on the
+    # first step (so a zero-byte call never captures), and falls back COUNTED.
+    step = (
+        _GraphStep(model, dev, drop, 1, counters)
+        if decode_graph
+        else _EagerStep(model, dev, drop, 1, counters)
+    )
     with torch.no_grad():
         chunked = prefill == "chunked"
         if prefill == "auto":
@@ -338,7 +781,7 @@ def recurrent_decode(
             why = _prefill_refusal(dev)
             if why is not None:
                 counters.count("prefill_fallback")
-                counters.why = why  # type: ignore[attr-defined]
+                fallbacks.append(why)
                 chunked = False
         if chunked:
             counters.count("prefill_chunked")
@@ -348,12 +791,83 @@ def recurrent_decode(
             logits = None
             for _ in range(len(ctx)):  # prefill: one step per prompt byte
                 logits, states = _step_logits(model, ctx, states, dev, drop, counters)
-        while True:
-            probs = torch.softmax(logits / temp, dim=-1)
-            nxt = int(torch.multinomial(probs, 1, generator=generator))
+        if not multibyte:
+            while True:
+                probs = torch.softmax(logits / temp, dim=-1)
+                nxt = int(torch.multinomial(probs, 1, generator=generator))
+                ctx.append(nxt)
+                if (stop is not None and nxt in stop) or len(ctx) >= target:
+                    break
+                logits, _hidden, states = step.step(ctx, states)
+                logits = logits[-1]
+        else:
+            # The first new byte is the prefill's own argmax (no draft can beat a
+            # byte whose distribution we already hold); the step AFTER it is what
+            # puts a hidden state at the current position for the MTP chain.
+            nxt = int(logits.argmax())
             ctx.append(nxt)
-            if (stop is not None and nxt in stop) or len(ctx) >= target:
-                break
-            logits, states = _step_logits(model, ctx, states, dev, drop, counters)
+            if not ((stop is not None and nxt in stop) or len(ctx) >= target):
+                logits, hidden, states = step.step(ctx, states)
+                logits, h = logits[-1], hidden[-1]
+                block = (
+                    _GraphStep(model, dev, drop, multibyte, counters)
+                    if decode_graph
+                    else _EagerStep(model, dev, drop, multibyte, counters)
+                )
+                while True:
+                    first = int(logits.argmax())
+                    proposals = [first]
+                    if multibyte > 1:
+                        proposals += _mtp_draft(model, head, h, first, multibyte - 1, counters)
+                    # The pre-block state, saved BEFORE the verify advances the
+                    # block's own buffers: a rejected round repairs the state by
+                    # stepping the emitted prefix from HERE.
+                    pre_states = [s.clone() for s in states]
+                    vlogits, vhidden, vstates = block.step(ctx + proposals, states)
+                    emit = [first]
+                    bad = False
+                    for j in range(multibyte - 1):
+                        wanted = int(vlogits[j].argmax())
+                        if wanted != proposals[j + 1]:
+                            emit.append(wanted)  # the first rejection, from the TARGET
+                            bad = True
+                            break
+                        emit.append(proposals[j + 1])
+                    counters.count("decode_multibyte_round")
+                    counters.count("decode_multibyte_accept", len(emit) - 1 - int(bad))
+                    if bad:
+                        counters.count("decode_multibyte_reject")
+                    base = len(ctx)
+                    stopped = False
+                    for b in emit:
+                        if len(ctx) >= target:
+                            stopped = True
+                            break
+                        ctx.append(b)
+                        if stop is not None and b in stop:
+                            stopped = True
+                            break
+                    if stopped or len(ctx) >= target:
+                        break
+                    if not bad:
+                        counters.count("decode_multibyte_full")
+                        states, logits, h = vstates, vlogits[-1], vhidden[-1]
+                    else:
+                        # The verify consumed bytes that were NOT emitted, so its
+                        # state is past a prefix the stream does not have. Advance
+                        # the state through the bytes that WERE emitted, starting
+                        # from the pre-block state, one byte at a time.
+                        counters.count("decode_multibyte_repair")
+                        rep_states = pre_states
+                        for i in range(len(emit)):
+                            logits, hidden, rep_states = step.step(ctx[: base + i + 1], rep_states)
+                            logits = logits[-1]
+                        states, h = rep_states, hidden[-1]
+        for arm in (step, locals().get("block")):
+            if arm is not None and getattr(arm, "reason", None):
+                fallbacks.append(f"decode_graph: capture failed, staying EAGER — {arm.reason}")
+    if fallbacks:
+        last = getattr(counters, "why", None)
+        counters.why = "; ".join(fallbacks + ([last] if last and last not in fallbacks else []))
     model.train(was_training)
     return bytes(ctx)

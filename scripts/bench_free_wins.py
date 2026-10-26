@@ -20,16 +20,16 @@ from __future__ import annotations
 
 import statistics
 import subprocess
+import sys
+from pathlib import Path
 
 import torch
 
-
-def preflight() -> None:
-    tr = subprocess.run(["pgrep", "-ax", "train"], capture_output=True, text=True)
-    assert tr.returncode != 0, f"a train process is live: {tr.stdout}"
-    free, total = torch.cuda.mem_get_info()
-    assert free > (1 << 30), f"only {free >> 20} MiB free of {total >> 20} — the card is held"
-    print(f"[preflight] ok: no train procs, {free >> 20} MiB free of {total >> 20}")
+# `scripts/` is not a package (a test loads this file by path): the lane guard is
+# a sibling file, so its directory goes on the path, APPENDED not inserted (a
+# script name at the front of `sys.path` would shadow a package of that name).
+sys.path.append(str(Path(__file__).resolve().parent))
+from _lane import preflight, skip  # noqa: E402
 
 
 def build(
@@ -109,5 +109,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    preflight()
+    busy = subprocess.run(["pgrep", "-ax", "train"], capture_output=True, text=True).stdout.strip()
+    why = f"a train process is live:\n{busy}" if busy else preflight("cuda")
+    if why is not None:
+        raise SystemExit(skip(why))
     main()

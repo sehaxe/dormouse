@@ -48,6 +48,7 @@ import argparse
 import json
 import statistics
 import subprocess
+import sys
 from pathlib import Path
 
 import torch
@@ -57,6 +58,12 @@ from dormouse.instrument import Counters
 from dormouse.model import tsct
 from dormouse.model.model import DormouseModel
 
+# `scripts/` is not a package (a test loads this file by path): the lane guard is
+# a sibling file, so its directory goes on the path, APPENDED not inserted (a
+# script name at the front of `sys.path` would shadow a package of that name).
+sys.path.append(str(Path(__file__).resolve().parent))
+from _lane import preflight  # noqa: E402
+
 #: The spike's phase-2 fp8 rows (`bench_f_fp8.py`, M=32768, bf16 in/out, per-tensor
 #: scales, L2 flushed) — the PREDICTION this bench checks against.
 SPIKE_ROWS = (
@@ -64,31 +71,6 @@ SPIKE_ROWS = (
     (2048, 64, 0.361, 23.82, 0.219, 39.31),
     (64, 5472, 1.611, 14.21, 1.026, 22.32),
 )
-
-
-def preflight() -> str | None:
-    """`None` when the card may be used, else why not (AGENTS §1.5)."""
-    if not torch.cuda.is_available():
-        return "no CUDA device"
-    try:
-        busy = subprocess.run(
-            ["pgrep", "-f", "dormouse trai[n]"], capture_output=True, text=True, timeout=15
-        ).stdout.strip()
-        used = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        ).stdout.strip()
-    except Exception as e:  # noqa: BLE001 - a bench's precondition, not a run's
-        return f"cannot check the card ({e})"
-    if busy:
-        return f"a training run is live (pids {busy.replace(chr(10), ' ')})"
-    mib = int(used.split()[0]) if used else -1
-    if mib >= 1024:
-        return f"the card already holds {mib} MiB"
-    print(f"[preflight] no dormouse process; card holds {mib} MiB", flush=True)
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -234,15 +216,10 @@ def main() -> int:
     ap.add_argument("--json", default="", help="write the measured rows here (e.g. ~/logs/...)")
     args = ap.parse_args()
 
-    print(
-        f"[env] torch {torch.__version__} cuda {torch.version.cuda} "
-        f"fp8={hasattr(torch, '_scaled_mm')}"
-    )
-    print(
-        f"[inventory] reading {args.preset}'s 2-D GEMM shapes from a real forward "
-        f"(batch {args.probe_batch} x seq {args.seq}) ...",
-        flush=True,
-    )
+    print(f"[env] torch {torch.__version__} cuda {torch.version.cuda} "
+          f"fp8={hasattr(torch, '_scaled_mm')}")
+    print(f"[inventory] reading {args.preset}'s 2-D GEMM shapes from a real forward "
+          f"(batch {args.probe_batch} x seq {args.seq}) ...", flush=True)
     inv = inventory(args.preset, args.probe_batch, args.seq)
     rows = args.batch * args.seq
     payload: dict = {
@@ -258,13 +235,8 @@ def main() -> int:
         "l2_flushed": False,
         "spike_rows": SPIKE_ROWS,
         "inventory": [
-            {
-                "K": k,
-                "N": n,
-                "hits_per_forward": rec["hits"],
-                "M_seen": rec["M"],
-                "lane": "fp8" if tsct.mm_fp8_shape_ok(k, n) else "bf16",
-            }
+            {"K": k, "N": n, "hits_per_forward": rec["hits"], "M_seen": rec["M"],
+             "lane": "fp8" if tsct.mm_fp8_shape_ok(k, n) else "bf16"}
             for (k, n), rec in sorted(inv.items())
         ],
         "measured": [],
@@ -272,26 +244,30 @@ def main() -> int:
     print(f"{'M':>7} {'K':>6} {'N':>6} {'hits/fwd':>8}  lane")
     for (k, n), rec in sorted(inv.items()):
         ok = tsct.mm_fp8_shape_ok(k, n)
-        print(
-            f"{rows:>7} {k:>6} {n:>6} {rec['hits']:>8}  "
-            f"{'fp8' if ok else 'bf16 (K or N not a multiple of 16)'}"
-        )
+        print(f"{rows:>7} {k:>6} {n:>6} {rec['hits']:>8}  "
+              f"{'fp8' if ok else 'bf16 (K or N not a multiple of 16)'}")
     covered = sum(r["hits"] for (k, n), r in inv.items() if tsct.mm_fp8_shape_ok(k, n))
     total = sum(r["hits"] for r in inv.values())
-    print(
-        f"[inventory] {len(inv)} distinct 2-D GEMM shapes, {total} calls/forward; "
-        f"the lane covers {covered}/{total} by shape"
-    )
+    print(f"[inventory] {len(inv)} distinct 2-D GEMM shapes, {total} calls/forward; "
+          f"the lane covers {covered}/{total} by shape")
 
     if not args.gpu:
-        print(
-            "\nCPU run: no CUDA work done. `--gpu` runs the bench (preflight: "
-            '`pgrep -f "dormouse trai[n]"` + nvidia-smi, refuses a busy card).'
-        )
+        print("\nCPU run: no CUDA work done. `--gpu` runs the bench (preflight: "
+              "`pgrep -f \"dormouse trai[n]\"` + nvidia-smi, refuses a busy card).")
         _write_json(args.json, payload)
         return 0
 
-    why = preflight()
+    why = preflight("cuda")
+    if why is None:
+        # This bench's own ceiling is 1 GiB, tighter than the lane guard's 2.0:
+        # a card already holding a second model is contended however idle it looks.
+        smi = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if smi and int(smi.split()[0]) >= 1024:
+            why = f"the card already holds {smi.split()[0]} MiB (this bench's ceiling is 1024)"
     if why is not None:
         print(f"[preflight] REFUSED: {why}. One GPU thing at a time (AGENTS §1.5).")
         _write_json(args.json, payload)
@@ -299,45 +275,33 @@ def main() -> int:
     dt = torch.bfloat16
     print("\n[spike prediction — PREDICTED, not measured here: M=32768, L2 flushed]")
     for k, n, _bf16_ms, bf16_tf, _fp8_ms, fp8_tf in SPIKE_ROWS:
-        print(
-            f"  K={k} N={n}: bf16 {bf16_tf:.2f} TFLOP/s -> fp8 {fp8_tf:.2f} TFLOP/s "
-            f"({bf16_tf / fp8_tf:.2f}x)"
-        )
-    print(
-        f"\n{'M':>7} {'K':>6} {'N':>6} {'bf16 ms':>9} {'bf16 TF/s':>10} "
-        f"{'fp8 gemm ms':>12} {'fp8 TF/s':>9} {'conv ms':>8} {'lane ms':>8} "
-        f"{'lane TF/s':>10} {'gemm x':>7} {'lane x':>7} {'err/absmax':>11}"
-    )
+        print(f"  K={k} N={n}: bf16 {bf16_tf:.2f} TFLOP/s -> fp8 {fp8_tf:.2f} TFLOP/s "
+              f"({bf16_tf / fp8_tf:.2f}x)")
+    print(f"\n{'M':>7} {'K':>6} {'N':>6} {'bf16 ms':>9} {'bf16 TF/s':>10} "
+          f"{'fp8 gemm ms':>12} {'fp8 TF/s':>9} {'conv ms':>8} {'lane ms':>8} "
+          f"{'lane TF/s':>10} {'gemm x':>7} {'lane x':>7} {'err/absmax':>11}")
     measured = []
-    for k, n in sorted(inv):
+    for (k, n) in sorted(inv):
         if not tsct.mm_fp8_shape_ok(k, n):
-            print(
-                f"{rows:>7} {k:>6} {n:>6}   bf16: K or N is not a multiple of 16 "
-                f"(the lane's own rule) — not benched"
-            )
+            print(f"{rows:>7} {k:>6} {n:>6}   bf16: K or N is not a multiple of 16 "
+                  f"(the lane's own rule) — not benched")
             continue
         r = bench_shape(rows, k, n, dt, args.warmup, args.reps)
         measured.append(r)
-        print(
-            f"{r['M']:>7} {r['K']:>6} {r['N']:>6} {r['bf16_ms']:>9.3f} "
-            f"{r['bf16_tflops']:>10.2f} {r['fp8_gemm_ms']:>12.3f} "
-            f"{r['fp8_gemm_tflops']:>9.2f} {r['conv_quant_ms']:>8.3f} "
-            f"{r['lane_ms']:>8.3f} {r['lane_tflops']:>10.2f} "
-            f"{r['speedup_gemm']:>7.2f} {r['speedup_lane']:>7.2f} "
-            f"{r['max_abs_err_over_absmax_ref']:>11.4f}"
-        )
+        print(f"{r['M']:>7} {r['K']:>6} {r['N']:>6} {r['bf16_ms']:>9.3f} "
+              f"{r['bf16_tflops']:>10.2f} {r['fp8_gemm_ms']:>12.3f} "
+              f"{r['fp8_gemm_tflops']:>9.2f} {r['conv_quant_ms']:>8.3f} "
+              f"{r['lane_ms']:>8.3f} {r['lane_tflops']:>10.2f} "
+              f"{r['speedup_gemm']:>7.2f} {r['speedup_lane']:>7.2f} "
+              f"{r['max_abs_err_over_absmax_ref']:>11.4f}")
     if measured:
-        print(
-            f"[conversion] amax {statistics.median(r['conv_amax_ms'] for r in measured):.3f} ms, "
-            f"scale+cast {statistics.median(r['conv_cast_ms'] for r in measured):.3f} ms "
-            f"(median over the benched shapes, both operands)"
-        )
+        print(f"[conversion] amax {statistics.median(r['conv_amax_ms'] for r in measured):.3f} ms, "
+              f"scale+cast {statistics.median(r['conv_cast_ms'] for r in measured):.3f} ms "
+              f"(median over the benched shapes, both operands)")
         med = statistics.median
-        print(
-            f"[lane] median gemm speedup {med(r['speedup_gemm'] for r in measured):.2f}x, "
-            f"median end-to-end {med(r['speedup_lane'] for r in measured):.2f}x "
-            f"(conversion included — what a forward pays)"
-        )
+        print(f"[lane] median gemm speedup {med(r['speedup_gemm'] for r in measured):.2f}x, "
+              f"median end-to-end {med(r['speedup_lane'] for r in measured):.2f}x "
+              f"(conversion included — what a forward pays)")
     payload["measured"] = measured
     _write_json(args.json, payload)
     return 0

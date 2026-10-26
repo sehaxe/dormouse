@@ -45,7 +45,23 @@ baseline and **below** SmolLM2-135M's 42.1 — and the two are not the same meas
 row here as an order-of-magnitude statement and nothing finer. The data gap is the
 reason: 0.4B byte-tokens seen against 13B-2T for the models in that table.
 
-Every mechanism in the tree was admitted by a 3-seed A/B on a fixed protocol, and the losers are recorded, not deleted quietly (the full ledger, with the delta and the verdict for each arm, is [docs/reviews/2026-10-19-model-scorecard.md](docs/reviews/2026-10-19-model-scorecard.md)): the ColRow fix (−0.043 BPB, the largest single win), depth-3 (−0.007), dropless routing, Triton Newton–Schulz (52 dispatches → 1), optimizer CUDA-graph (−11.7 ms/step), bf16 Muon momentum (−1.23 GiB), Engram in host RAM (bit-identical). Rejected by measurement: NorMuon (+0.072), schedule-free Muon (+0.043), SIGReg (+0.148), LOOM (tie), MSA at short context (tie), ternary weights from scratch (+0.04), KDA recompute flag (tie).
+Every mechanism in the tree was admitted by a 3-seed A/B on a fixed protocol, and
+the losers are recorded, not deleted quietly. **Wins:** ColRow on the Muon update
+(−0.043 BPB, 8.7× the control's spread), `attnres` (−0.063), the mHC × AttnRes
+composition (**−0.142** at 600 steps, 16× the spread — the largest architectural
+result on record), ByteFlow's learned patching (−0.485 at 4 bytes/patch, and −0.428
+against a *capacity-matched* control), latent attention (d/4: −0.021 BPB and **−36 %
+dense MAC**), and a shared expert basis (`share_u`: −23.5 % parameters at equal BPB).
+**Losses and ties, kept as flags:** NorMuon (+0.072), schedule-free Muon (+0.043,
+one seed diverged), SIGReg (+0.148), rank 32 at fixed width (+0.103 — the expert's
+*width*, not its count, is where capacity lives), more experts at equal rank
+(+0.033), JEPA and MTP as pretraining losses (ties in six forms), fp8 training and
+`torch.compile` (no win at these shapes — measured), and the half-step CUDA graph
+(**2.3 %**, so the step is GPU-bound, not launch-bound).
+
+The bug ledger for the 2026-10-26 debug pass — 11 confirmed defects, each with a
+reproduction and a gate that fails on revert — is
+[docs/reviews/2026-10-24-bug-ledger.md](docs/reviews/2026-10-24-bug-ledger.md).
 
 ## Quick start
 
@@ -59,7 +75,7 @@ the eval carve must look like. Each headline figure's command, log and commit is
 uv sync                # CPU environment; tests run here
 uv sync --extra gpu    # the measured stack: torch 2.13.0+cu129 + FLA (sm_120)
 
-uv run pytest                       # the suite (968 tests; CUDA gates self-skip)
+uv run pytest                       # the suite (1 437 collected; CUDA gates self-skip)
 uv run ruff check .                 # lint
 
 # train a model from a byte corpus

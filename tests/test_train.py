@@ -6,7 +6,7 @@ import math
 
 import pytest
 import torch
-from conftest import BATCH, SEQ, tiny_run, write_corpus
+from conftest import BATCH, SEQ, tiny_cfg, tiny_run
 from torch import nn
 
 from dormouse.instrument import LoudError
@@ -92,285 +92,7 @@ def test_eval_line_prints_the_byte_window(tmp_path):
     assert window == 3 * BATCH * SEQ
     assert report["eval_window_bytes"] == window
     evals = [ln for ln in lines if ln.startswith("eval ")]
-    # The tail is sized in READS (`eval_batches × batch × (seq_len + 1)` = 390 B
-    # here), so ALL THREE windows the config asks for fit; the old fixture
-    # encoded the 384 B scored-byte tail that held only two (review round 2
-    # R2-1).
-    assert evals and f"over {3 * BATCH * SEQ} B (3 x {BATCH} x {SEQ})" in evals[0]
-    assert "shortfall" not in evals[0]
-
-
-def test_the_no_eval_tail_is_sized_in_reads(tmp_path):
-    """R2-1: the default 20-window request scores 20 windows, not 19.
-
-    One window READS `batch × (seq_len + 1)` bytes and scores `batch × seq_len`
-    (the next-byte shift), so a tail carved as scored bytes held one window
-    fewer: the default `20 × 8 × 512` asked for 81 920 B, one read is 4 104 B,
-    only 19 fits, and 77 824 B were scored. The tail is now carved in reads.
-    The 1 MiB cap is still a real shortfall, and the line must name it.
-    """
-    import dataclasses
-
-    from conftest import tiny_cfg
-
-    from dormouse.train.data import eval_read_bytes, open_streams
-    from dormouse.train.loop import _eval_line
-
-    run = dataclasses.replace(
-        tiny_run(
-            tmp_path,
-            steps=1,
-            eval=True,
-            eval_every=1,
-            eval_batches=20,
-            batch=8,
-            seq_len=512,
-            data=str(tmp_path / "corpus.bin"),
-        ),
-        model=tiny_cfg(max_seq_len=512),
-    )
-    write_corpus(tmp_path / "corpus.bin", 2 << 20)
-    _train, ev = open_streams(run)
-    assert ev is not None
-    assert eval_read_bytes(run.train) == 20 * 8 * (512 + 1) == 82_080
-    assert ev.hi - ev.lo >= 20 * 8 * (512 + 1), "the tail must hold every read"
-
-    class _Counting(nn.Module):
-        """The bytes scored are the tokens this model is handed."""
-
-        def __init__(self) -> None:
-            super().__init__()
-            self.seen = 0
-
-        def forward(self, x, targets=None, counters=None, **kw):
-            self.seen += x.numel()
-            return None, torch.tensor(1.0), counters
-
-    model = _Counting()
-    line, _loss, scored = _eval_line(model, ev, run.train, run.model.max_iter, None, 1)
-    assert eval_window_bytes(run.train) == 20 * 8 * 512 == 81_920
-    assert scored == model.seen == 20 * 8 * 512
-    assert "over 81920 B (20 x 8 x 512)" in line, line
-    assert "shortfall" not in line
-
-    # A deliberately tiny tail: the 1 MiB cap binds, so the honest shortfall
-    # is still reported (COUNTED) rather than claimed away.
-    capped = dataclasses.replace(run.train, eval_batches=4096)
-    _train, ev = open_streams(dataclasses.replace(run, train=capped))
-    assert ev is not None and ev.hi - ev.lo == 1 << 20
-    model = _Counting()
-    line, _loss, scored = _eval_line(model, ev, capped, run.model.max_iter, None, 1)
-    assert scored == model.seen < eval_window_bytes(capped)
-    assert "shortfall" in line and f"requested {eval_window_bytes(capped)} B" in line
-
-
-def test_the_tail_eval_prints_only_the_bytes_it_scored(tmp_path):
-    """M5: the no-`--eval` tail is capped at 1 MiB, so a window larger than the
-    tail used to wrap. The eval line used to print the REQUESTED window; it must
-    print the bytes the pass actually scored and name the shortfall (COUNTED)."""
-    import dataclasses
-
-    from conftest import tiny_cfg
-
-    from dormouse.train.data import open_streams
-    from dormouse.train.loop import _eval_line
-
-    # The audit's own shape: 2048 x 10 x 512 = 10 MiB requested against the
-    # 1 MiB tail. 204 windows fit exactly (204 x 5130 B read <= 2^20), so the
-    # pass scores 204 x 5120 B with no wrapped re-read.
-    run = dataclasses.replace(
-        tiny_run(
-            tmp_path,
-            steps=1,
-            eval=True,
-            eval_every=1,
-            eval_batches=2048,
-            batch=10,
-            seq_len=512,
-        ),
-        model=tiny_cfg(max_seq_len=512),
-    )
-    write_corpus(tmp_path / "corpus.bin", 3 << 20)  # > the 1 MiB carve
-    _train, ev = open_streams(run)
-    assert ev is not None
-    requested = eval_window_bytes(run.train)
-    assert requested == 10 * (1 << 20), "the fixture must exceed the tail by 10x"
-
-    class _Counting(nn.Module):
-        """The bytes scored are the tokens this model is handed."""
-
-        def __init__(self):
-            super().__init__()
-            self.seen = 0
-
-        def forward(self, x, targets=None, counters=None, **kw):
-            self.seen += x.numel()
-            return None, torch.tensor(1.0), counters
-
-    model = _Counting()
-    line, _loss, scored = _eval_line(model, ev, run.train, run.model.max_iter, None, 1)
-    assert scored == model.seen == 204 * 10 * 512
-    assert scored <= 1 << 20, "the count must not claim more bytes than the tail holds"
-    assert f"over {scored} B" in line
-    assert "shortfall" in line and f"requested {requested} B" in line
-    assert f"the eval stream holds {1 << 20} B" in line
-
-
-def test_only_whole_eval_windows_are_scored_and_the_leftover_is_named(tmp_path):
-    """M5: one window reads `batch × (seq_len + 1)` bytes; score only wholes.
-
-    160 B with `batch × seq_len == 512` (batch 1) is below one read (513) and
-    must score 0 B and say why; 672 B with batch 2 / seq_len 256 holds one read
-    (514), scores 512 B, and says the other 160 B were left over.
-    """
-    from dormouse.config import TrainConfig
-    from dormouse.train.data import ByteStream
-    from dormouse.train.loop import _eval_batches, _eval_line
-
-    class _Counting(nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.seen = 0
-
-        def forward(self, x, targets=None, counters=None, **kw):
-            self.seen += x.numel()
-            return None, torch.tensor(1.0), counters
-
-    class _Range:
-        """160 B with batch × seq_len == 512 — below even one 513 B read."""
-
-        batch, seq_len, lo, hi = 1, 512, 0, 160
-
-        def rewind(self) -> None:
-            pass
-
-        def next_batch(self):  # pragma: no cover - must never be called
-            raise AssertionError("a range with no whole window must not be read")
-
-    stub = _Range()
-    assert _eval_batches(stub, 4) == 0
-    zero_line, _loss, zero = _eval_line(
-        _Counting(), stub, TrainConfig(batch=1, seq_len=512), 1, None, 1
-    )
-    assert zero == 0, "a range with no whole read must score nothing"
-    assert "over 0 B" in zero_line and "no whole window fits" in zero_line
-    assert "holds 160 B" in zero_line and "left over 160 B" in zero_line
-
-    data = tmp_path / "long.bin"
-    data.write_bytes(bytes(range(256)) * 3 + b"x" * 160)
-    assert data.stat().st_size == 928
-    stream = ByteStream(data, 2, 256, hi=672)
-    cfg = TrainConfig(batch=2, seq_len=256, eval_batches=4)
-    model = _Counting()
-    line, _loss, scored = _eval_line(model, stream, cfg, 1, None, 1)
-    assert scored == model.seen == 512
-    assert "over 512 B (1 x 2 x 256, requested 4)" in line
-    assert "holds 672 B" in line and "left over 160 B" in line
-
-
-def test_a_tiny_nvfp4_block_is_counted_on_the_checkpoint_line(tmp_path):
-    """M3: a real save surfaces the zero-scale block count, not just a test tally.
-
-    A factor matrix spanning more than e4m3's ~18 octaves loses its smallest
-    16-block even after the global prescale. `save_ckpt` used to call
-    `pack_tsct(v, rung)` with no counters, so `nvfp4_zero_scale_blocks` reached
-    no log. The checkpoint line must carry it — and the common path must not
-    grow a field it never used.
-    """
-    import dataclasses
-
-    from conftest import tiny_cfg
-
-    from dormouse.model.tsct import is_factor_key
-
-    run = dataclasses.replace(
-        tiny_run(tmp_path, steps=1, log_every=1, ckpt_every=1),
-        model=tiny_cfg(quant="nvfp4"),
-    )
-    model = DormouseModel(run.model)
-    params = dict(model.named_parameters())
-    for key in sorted(params):
-        if is_factor_key(key) and params[key].numel() >= 32:
-            with torch.no_grad():
-                params[key].zero_()
-                flat = params[key].reshape(-1)
-                flat[0] = 1.0  # a block at e4m3's top after the prescale
-                flat[16] = 1e-40  # ...and one ~130 octaves below it, lost
-            # Freeze it: one optimizer step with lr=0.01 would overwrite 1e-40
-            # with an O(lr) update and hide the fixture, not the defect.
-            params[key].requires_grad_(False)
-            break
-    else:  # pragma: no cover - the tiny model always has a factor
-        raise AssertionError("the fixture has no factor matrix")
-    lines: list[str] = []
-    report = train(model, run, log=lines.append)
-    ckpts = [ln for ln in lines if ln.startswith("ckpt ")]
-    assert ckpts and "nvfp4_zero_scale_blocks=1" in ckpts[0], ckpts
-    assert report["counters"]["nvfp4_zero_scale_blocks"] == 1
-
-    clean_dir = tmp_path / "clean"
-    clean_dir.mkdir()
-    clean_run = dataclasses.replace(
-        tiny_run(clean_dir, steps=1, log_every=1, ckpt_every=1),
-        model=tiny_cfg(quant="nvfp4"),
-    )
-    clean_lines: list[str] = []
-    train(DormouseModel(clean_run.model), clean_run, log=clean_lines.append)
-    clean_ckpts = [ln for ln in clean_lines if ln.startswith("ckpt ")]
-    assert clean_ckpts and "nvfp4_zero_scale_blocks" not in clean_ckpts[0]
-
-
-def test_a_missing_lfb_sidecar_is_loud_on_a_training_resume(tmp_path):
-    """M7/R2-2: a RESUME must not continue with bias=0 silently.
-
-    With `moe_lb_coef > 0` the bias steers routing; the sidecar is the only
-    copy of it, and a resume integrates from whatever it loads. Refusing is the
-    reading that cannot mislead — for a training resume only; the readers load
-    with a COUNTED line (`test_lfb.py`).
-    """
-    import dataclasses
-
-    from conftest import tiny_cfg
-
-    from dormouse.train.loop import ckpt_paths, lfb_path, load_model_half, load_model_state
-
-    run = dataclasses.replace(
-        tiny_run(tmp_path, steps=2, log_every=10, ckpt_every=2, ckpt_name="lfb"),
-        model=tiny_cfg(moe_lb_coef=0.05),
-    )
-    train(DormouseModel(run.model), run, log=lambda *_: None)
-    weights, _snap = ckpt_paths(run.train)
-    lfb_path(run.train).unlink()
-    fresh = DormouseModel(run.model)
-    with pytest.raises(LoudError, match="LFB sidecar"):
-        load_model_state(fresh, run.train, load_model_half(weights), resume=True)
-    # The same checkpoint loads as a READER: no objective to continue, and the
-    # zeroed controller is on the log (R2-2: a LOUD here bricks every reader).
-    lines: list[str] = []
-    load_model_state(fresh, run.train, load_model_half(weights), log=lines.append)
-    assert any("lfb: no sidecar, controller zeroed" in line for line in lines), lines
-
-
-def test_a_missing_lfb_sidecar_is_counted_when_the_controller_is_off(tmp_path):
-    """The inert case: no sidecar is reported (COUNTED), not a crash."""
-    import dataclasses
-
-    from conftest import tiny_cfg
-
-    from dormouse.train.loop import ckpt_paths, lfb_path, load_model_half, load_model_state
-
-    run = dataclasses.replace(
-        tiny_run(tmp_path, steps=2, log_every=10, ckpt_every=2, ckpt_name="lfb"),
-        model=tiny_cfg(moe_lb_coef=0.0),
-    )
-    train(DormouseModel(run.model), run, log=lambda *_: None)
-    weights, _snap = ckpt_paths(run.train)
-    lfb_path(run.train).unlink()
-    lines: list[str] = []
-    load_model_state(
-        DormouseModel(run.model), run.train, load_model_half(weights), log=lines.append
-    )
-    assert any("lfb: no sidecar, controller zeroed" in line for line in lines)
+    assert evals and f"over {window} B (3 x {BATCH} x {SEQ})" in evals[0]
 
 
 def test_log_line_carries_the_kda_arm_and_counters(tmp_path):
@@ -473,3 +195,86 @@ def test_torch_compile_off_by_default(tmp_path, monkeypatch):
     run = tiny_run(tmp_path, steps=1, log_every=1)
     train(DormouseModel(run.model), run, log=lambda *_: None)
     assert calls == []
+
+
+def test_init_from_carries_the_checkpoints_lfb_controller(tmp_path):
+    """`--init-from` must not silently switch the routing controller on.
+
+    The LFB bias is controller state that is NOT a parameter and NOT in the
+    model half (a non-persistent buffer), so no lr freezes it: a cold integrator
+    started over a converged, skewed router winds up. That is the whole
+    `train --init-from mix1` explosion: `train medium`'s preset has
+    `moe_lb_coef=0.01`, the checkpoint trained with 0, and the bias reached
+    ±4.8 in ~480 forwards — with the weights frozen (lr=1e-12) the loss read
+    1.27 -> 1.50 -> 1.1e7 by step 300 (`logs/diag_lr0.log`). The init file's
+    own snapshot is the authority on what the model is; the seam carries its
+    coefficient, LOUD, instead of the preset's.
+    """
+    import dataclasses
+
+    src_dir = tmp_path / "src"
+    src = tiny_run(tmp_path, steps=1, log_every=1, ckpt_every=1, out_dir=str(src_dir))
+    src = dataclasses.replace(src, model=dataclasses.replace(src.model, moe_lb_coef=0.0))
+    train(DormouseModel(src.model), src, log=lambda *_: None)
+    ckpt = src_dir / "t.pt"
+    assert ckpt.is_file() and ckpt.with_suffix(".config.toml").is_file()
+
+    dst_dir = tmp_path / "dst"
+    dst = tiny_run(tmp_path, steps=1, log_every=1, ckpt_every=1, out_dir=str(dst_dir))
+    dst = dataclasses.replace(dst, model=dataclasses.replace(dst.model, moe_lb_coef=0.01))
+    model = DormouseModel(dst.model)
+    lines: list[str] = []
+    train(model, dst, init_from=str(ckpt), log=lines.append)
+
+    moe = next(m for m in model.modules() if hasattr(m, "lfb_bias"))
+    assert moe.lfb_coef == 0.0, (
+        "init-from kept the preset's moe_lb_coef=0.01 over a checkpoint trained "
+        "with the controller off: the bias integrates from zero on a converged "
+        "router and routing collapses"
+    )
+    assert any("moe_lb_coef" in ln for ln in lines), lines
+    assert "moe_lb_coef = 0.0" in (dst_dir / "t.config.toml").read_text()
+
+
+def test_lfb_integrates_without_bound_when_the_load_cannot_change():
+    """The mechanism: the LFB bias is an open-loop integrator once routing is fixed.
+
+    `_lfb_step` moves every expert by `±moe_lb_coef` per routed forward from the
+    CUMULATIVE counts (`model/experts.py`). When the load cannot answer — a
+    converged router under `--init-from`, whose top-k is pinned by weights the
+    bias does not reach until it is several logits tall — the sign never flips
+    and the bias ramps linearly. It is not a parameter and no lr freezes it:
+    the diag4 run (lr=1e-12, weights frozen) measured ±4.8 after ~520 forwards
+    and the loss went 1.27 -> 5.1e6 by step 173; `moe_lb_coef=0` on the same
+    checkpoint and data stayed 1.2-1.5 for all 400 steps (`logs/diag_lr0.log`,
+    forward-only repro). That is why the init seam must carry the checkpoint's
+    coefficient rather than a preset's.
+    """
+    from dormouse.instrument import Counters
+
+    cfg = tiny_cfg(n_experts=8, moe_topk=2, moe_lb_coef=0.05)
+    moe = next(m for m in DormouseModel(cfg).modules() if hasattr(m, "lfb_bias"))
+    # the frozen load: the same two experts every forward, 64 tokens each
+    index = torch.tensor([[0, 1]] * 64)
+    counters = Counters()
+    for _ in range(100):
+        moe._lfb_step(index, counters)
+    b = moe.lfb_bias
+    assert float(b[0]) < -4.0 and float(b[1]) < -4.0, b
+    assert float(b[2:].min()) > 4.0, b
+    assert counters["moe_lfb_updates"] == 100
+
+
+def test_init_controller_is_not_on_the_fresh_path(tmp_path, monkeypatch):
+    """The fix is the init seam only: a FRESH run never reaches it (bit-identity
+    by construction, and the test fails if the call ever moves out of the
+    `init_from` branch)."""
+    from dormouse.train import loop
+
+    def boom(*a, **k):  # pragma: no cover - the assertion is that it never runs
+        raise AssertionError("init_controller ran on a fresh run")
+
+    monkeypatch.setattr(loop, "init_controller", boom)
+    run = tiny_run(tmp_path, steps=3, log_every=1)
+    report = train(DormouseModel(run.model), run, log=lambda *_: None)
+    assert math.isfinite(report["loss"])

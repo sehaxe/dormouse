@@ -27,8 +27,10 @@ gates are:
    fallback's VALUE is the classic chain bit-for-bit — a fallback that computed
    something else would be a second bug wearing a degradation's clothes. That
    includes the LAUNCH's own refusal (a tile set the device cannot fit): at the
-   shipped `BLOCK_D` no shape reaches it, so the gate patches the constant back
-   to the 128 that crashed the b1 Muon group and asserts the COUNT.
+   shipped `BLOCK_D=64` no b1 shape reaches it, so the gate patches the constant
+   to 256 — the real tall-shape launch needs 212992 B — and asserts the COUNT.
+   (128 was the audit's candidate, but the real tall `(2048, 64)` launch asks
+   114688 B and refuses; the table gate records both.)
 
 `≤1e-9` against an fp64 reference on a small matrix was the ask for tier 2; it
 cannot hold for this kernel and the split above is why. The kernel is fp32 by
@@ -51,7 +53,7 @@ import subprocess
 
 import pytest
 import torch
-from conftest import fp64_classic, gauss, local_pin, ramp, rel
+from conftest import fp64_classic, gauss, ramp, rel
 from torch import nn
 
 from dormouse.instrument import Counters, LoudError
@@ -108,15 +110,14 @@ def _card_reason() -> str | None:
 _GPU_REASON = _card_reason()
 CUDA = pytest.mark.skipif(_GPU_REASON is not None, reason=_GPU_REASON or "GPU gate")
 
-#: The optim/config/loop hook LANDED 2026-10-18 (commit 959134e); the patch
-#: file that carried it across the concurrent lane was applied and dropped.
-#: These three gates run whenever the hook is present.
+#: The optim/config/loop hook is `ns_triton_hook.patch` (a concurrent lane
+#: holds `optim.py` + `config.py`). These three gates run the moment it lands.
 _HOOK = "triton" in optim.NS_KINDS
 needs_hook = pytest.mark.skipif(
     not _HOOK,
     reason=(
-        "ns_kind='triton' is not in optim.NS_KINDS: the hook (optim.py + config.py "
-        "+ loop.py, commit 959134e) is missing from this tree. This gate runs when it is."
+        "ns_kind='triton' is not in optim.NS_KINDS: apply ns_triton_hook.patch "
+        "(optim.py + config.py + loop.py). This gate is written and runs then."
     ),
 )
 
@@ -375,7 +376,6 @@ def test_the_caller_s_tensor_is_never_written(monkeypatch):
 # --- the default path cannot move -------------------------------------------
 
 
-@local_pin
 def test_the_default_path_is_byte_identical_to_the_pinned_hashes():
     """10 fixed-seed steps of `Muon` on every default: the hashes captured BEFORE.
 
@@ -392,7 +392,7 @@ def test_the_default_path_is_byte_identical_to_the_pinned_hashes():
     ]
 
 
-# --- the hook's own gates (run once the hook is in optim.NS_KINDS) ----------
+# --- the hook's own gates (skip until `ns_triton_hook.patch` lands) -----
 
 
 @needs_hook
@@ -540,18 +540,15 @@ def test_a_non_contiguous_input_is_a_counted_fallback():
 
 @CUDA
 def test_a_shape_that_cannot_fit_falls_back_counted(monkeypatch):
-    """The b1 crash, as a COUNTED refusal: 112 KiB of tiles on a 99 KiB card.
+    """A genuine over-ceiling tile, as a COUNTED refusal, not a crash.
 
-    `BLOCK_D=128` is what this arm SHIPPED until the battery ran it. The
-    `[RT=64, BLOCK_D=128]` operands of `tl.dot(x, trans(x))` need **114688 B** of
-    shared memory against this card's **101376 B**, so the b1 Muon group's
-    `(2048, 64)` shapes died at launch with `OutOfResources` — a crash on the
-    exact shape the arm exists to accelerate, and not one of the counted
-    refusals `triton_reason` could express. Patching the constant back is the
-    falsification this gate needs: the same call must now COUNT the refusal,
-    carry triton's own numbers in the reason, and return the classic chain.
+    `BLOCK_D=256` is the caliper: the tall b1 `(2048, 64)` chain's real launch at
+    256 needs 212992 B against this card's 101376 B (measured by
+    `JITFunction.warmup` with the production args; the host `ASTSource` table
+    under-reports it at 149504 B). Remove the catch and this test dies in a
+    traceback; the shipped 64 tile is 65536 B and launches.
     """
-    monkeypatch.setattr(nk, "BLOCK_D", 128)
+    monkeypatch.setattr(nk, "BLOCK_D", 256)
     g = gauss((2048, 64)).cuda()
     c = Counters()
     out = nk.zeropower_triton_or_classic(g, 5, counters=c)
@@ -559,7 +556,137 @@ def test_a_shape_that_cannot_fit_falls_back_counted(monkeypatch):
     assert c.get("ns_triton_fallback") == 1, dict(c)
     assert c.get("ns_triton", 0) == 0, dict(c)
     assert "OutOfResources" in c.why and "shared memory" in c.why, c.why
+    assert "212992" in c.why and "101376" in c.why, c.why
     assert torch.equal(out, zeropower_via_ns(g, 5, "classic"))
+
+
+def _compiled_shared(rt: int, block_d: int, warps: int) -> int:
+    """`metadata.shared` for the real chain at `(rt, block_d)`, host-side."""
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler import ASTSource
+    from triton.compiler import compile as tcompile
+
+    if torch.cuda.is_available():
+        major, minor = torch.cuda.get_device_capability()
+        arch = major * 10 + minor
+    else:
+        arch = 120
+    sig = {
+        "X_ptr": "*fp32",
+        "O_ptr": "*fp32",
+        "sxs": "i32",
+        "sos": "i32",
+        "sr": "i32",
+        "sd": "i32",
+        "R_": "i32",
+        "D_": "i32",
+        "A": "fp32",
+        "B": "fp32",
+        "C": "fp32",
+        "EPS": "fp32",
+        "STEPS": "constexpr",
+        "RT": "constexpr",
+        "BLOCK_D": "constexpr",
+    }
+    src = ASTSource(
+        nk._ns_chain_kernel,
+        signature=sig,
+        constexprs=dict(STEPS=5, RT=rt, BLOCK_D=block_d),
+    )
+    return int(
+        tcompile(
+            src, target=GPUTarget("cuda", arch, 32), options={"num_warps": warps}
+        ).metadata.shared
+    )
+
+
+def test_the_measured_shared_memory_table_is_the_docstring():
+    """The docstring's ASTSource table, recompiled: 128 is 83968, 256 is 149504.
+
+    This is table (a) — host compile, no stride specialization. It is the number
+    the audit asked for and it is a LOWER BOUND; the real-launch gate below pins
+    the orientation-sensitive truth that keeps `BLOCK_D` at 64.
+    """
+    if not nk.TRITON_AVAILABLE:
+        pytest.skip("triton is the ability this table measures")
+    print(f"{'RT':>3} {'BLOCK_D':>8} {'warps4':>8} {'warps8':>8} {'fits4':>6}")
+    for rt in (16, 32, 64):
+        for bd in (64, 128, 256):
+            n4 = _compiled_shared(rt, bd, 4)
+            n8 = _compiled_shared(rt, bd, 8)
+            print(f"{rt:>3} {bd:>8} {n4:>8} {n8:>8} {str(n4 <= nk.SMEM_CEILING_BYTES):>6}")
+            assert n4 == nk.shared_bytes(rt, bd), (rt, bd, n4)
+            assert n8 >= n4, (rt, bd, n4, n8)
+    assert nk.BLOCK_D == 64
+    assert nk.shared_bytes(64, 128) == 83968 <= nk.SMEM_CEILING_BYTES
+    assert nk.shared_bytes(64, 256) == 149504 > nk.SMEM_CEILING_BYTES
+
+
+def _launch_shared(shape: tuple[int, ...], block_d: int) -> int:
+    """The REAL launcher's `metadata.shared` for `shape` — `warmup`, no launch.
+
+    The production args (strides included) are what Triton specializes on; this
+    is table (b) in the module docstring and it is the number a pre-check must
+    read.
+    """
+    from dormouse.train.optim import JORDAN_NS_COEFFS
+
+    x = torch.zeros(shape, dtype=torch.float32, device="cuda")
+    out = torch.empty(shape, dtype=torch.float32, device="cuda")
+    m, n = shape[-2], shape[-1]
+    r, d = min(m, n), max(m, n)
+    sr, sd = (x.stride(-1), x.stride(-2)) if m > n else (x.stride(-2), x.stride(-1))
+    a, b, c = JORDAN_NS_COEFFS
+    compiled = nk._ns_chain_kernel.warmup(
+        x,
+        out,
+        x.stride(0) if x.ndim == 3 else 0,
+        out.stride(0) if x.ndim == 3 else 0,
+        sr,
+        sd,
+        r,
+        d,
+        a,
+        b,
+        c,
+        nk.NS_EPS,
+        STEPS=5,
+        RT=max(16, nk.triton.next_power_of_2(r)),
+        BLOCK_D=block_d,
+        num_warps=nk.NUM_WARPS,
+        grid=(x.shape[0] if x.ndim == 3 else 1,),
+    )
+    return int(compiled.metadata.shared)
+
+
+@CUDA
+def test_the_real_launch_table_keeps_block_d_at_64():
+    """The launch, not the host compile, decides: the tall 128 cell is 114688.
+
+    `ASTSource` omits stride specialization, so it reports 83968 for 128 and
+    would call it a fit. The real tall `(2048, 64)` compile — the b1 Muon group's
+    own shape — needs 114688 B and refuses. The wide and batched chains do fit at
+    128, which is why the audit's single-shape compile looked green; the shipped
+    tile is 64 because 128 also measured slower on every chain.
+    """
+    print(f"{'shape':>16} {'BD64':>7} {'BD128':>7} {'BD256':>7}")
+    for shape in ((2048, 64), (1024, 64, 64), (64, 5461)):
+        n64 = _launch_shared(shape, 64)
+        n128 = _launch_shared(shape, 128)
+        n256 = _launch_shared(shape, 256)
+        print(f"{str(shape):>16} {n64:>7} {n128:>7} {n256:>7}")
+        assert n64 == {  # the shipped arm, per orientation
+            (2048, 64): 65536,
+            (1024, 64, 64): 57344,
+            (64, 5461): 53248,
+        }[shape]
+        assert n128 == {
+            (2048, 64): 114688,  # REFUSED on the b1 tall chain
+            (1024, 64, 64): 90112,
+            (64, 5461): 83968,
+        }[shape]
+        assert n256 > nk.SMEM_CEILING_BYTES
+    assert nk.BLOCK_D == 64, "the measured tall chain cannot launch 128"
 
 
 # --- the bench (`scripts/bench_ns_triton.py` runs this) ---------------------

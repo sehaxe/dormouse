@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-16. Read-only: no config touched, no code changed, nothing committed.
 **A:** given dormouse's exact forward (ONE weight-shared loop block, 2–4 iterations, byte vocab 256, KDA
-linear attention, host Engram, `port/src/dormouse/model/model.py:151-189`), *which* JEPA variant and
+linear attention, host Engram, `src/dormouse/model/model.py:151-189`), *which* JEPA variant and
 *which* exact attachment point is best, and which pieces of the burn-era JEPA+KoLeo recipe (`d8062d1`:
 6.343 vs 6.425 BPB, 3/3 seeds) to keep, drop or replace.
 **Builds on, does not repeat:** `docs/research/2026-10-16-jepa-dspark-alternatives.md` (the incumbent sweep
@@ -196,5 +196,5 @@ arXiv, fetched 2026-10-16 via the API: `2105.04906` 2021-05-11 · `2212.07525` (
 `2608.05806` 2026-08-06 · `2608.17542` 2026-08-18 · `2608.28625` 2026-07-31 · `2609.23881` 2026-09-20 ·
 `2609.35288` 2026-09-28 · `2609.36227` 2026-09-28. Repo: `crates/dormouse-core/src/{aux,model,future_byte}.rs` · `vendor/dormouse-fused/crates/burn-jepa/src/{lib,mask,losses,predictor,ema}.rs` ·
 `crates/dormouse-train/src/lib.rs` · `crates/dormouse-core/tests/{jepa_teacher_seam,preset_exec}.rs` ·
-`port/src/dormouse/{config.py,model/{model,fb}.py,train/loop.py}` · `benches/history.tsv:51-56` ·
+`src/dormouse/{config.py,model/{model,fb}.py,train/loop.py}` · `benches/history.tsv:51-56` ·
 `AGENTS.md` §2.2/§3.2 · `docs/decisions/2026-10-15-1b-readiness-plan.md:477-479`.

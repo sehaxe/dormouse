@@ -9,8 +9,8 @@ full text read for `2606.00371`, `2605.16341`, `2509.11983`, `2505.16932`,
 **checked inside `2602.21545v3` and confirmed** (App. D.1 = Jordan `(3.4445,−4.7750,2.0315)`,
 D.2 = You schedule, D.3 = PolarExpress ending `(1.875,−1.25,0.375)`).
 Code read: `Dao-AILab/gram-newton-schulz`, `dengzhanwang/Low-rank-Muon`,
-`microsoft/dion`. Repo read: `port/src/dormouse/train/optim.py` (whole),
-`port/src/dormouse/model/tsct.py:1-30`, `port/src/dormouse/config.py:271-297`,
+`microsoft/dion`. Repo read: `src/dormouse/train/optim.py` (whole),
+`src/dormouse/model/tsct.py:1-30`, `src/dormouse/config.py:271-297`,
 `docs/reviews/2026-10-16-b1-profile.md`, `docs/protocols/AB-PROTOCOL.md:25-60,200-240,370-400`.
 Marks: **[A]** paper's words · **[code]** authors' code · **[ours]** repo fact · **[S]** SPECULATION.
 
@@ -150,8 +150,8 @@ Papers (ids resolved 2026-10-16): `2608.11612` · `2606.00371` · `2605.16341` �
 `2601.19156` · `2610.03306` · `2609.39595` · `2608.04607`.
 Code: `Dao-AILab/gram-newton-schulz` · `dengzhanwang/Low-rank-Muon` ·
 `microsoft/dion` · `modded-nanogpt` NS routine.
-Repo: `port/src/dormouse/train/optim.py:16-22,56-96,136-184` ·
-`port/src/dormouse/train/loop.py:321` · `port/src/dormouse/model/tsct.py:1-30` ·
+Repo: `src/dormouse/train/optim.py:16-22,56-96,136-184` ·
+`src/dormouse/train/loop.py:321` · `src/dormouse/model/tsct.py:1-30` ·
 `docs/reviews/2026-10-16-b1-profile.md:19-43,68-84` ·
 `docs/protocols/AB-PROTOCOL.md:25-60,200-240,370-400` · `AGENTS.md` §2.1 table, §3.7 ·
 `docs/research/2026-10-16-sf-muon.md`.

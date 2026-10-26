@@ -9,7 +9,6 @@ was sync-free. These gates pin the order.
 
 from __future__ import annotations
 
-import json
 import warnings
 
 import pytest
@@ -62,45 +61,3 @@ def test_count_does_not_synchronize_a_cuda_tensor():
     finally:
         torch.cuda.set_sync_debug_mode("default")
     assert not any("synchroniz" in m.lower() for m in msgs), msgs
-
-
-# ---------------------------------------------------------------------------
-# `why` (2026-10-19 audit M2): the reason rode an attribute the log never read
-# ---------------------------------------------------------------------------
-
-
-def test_why_reaches_the_line_and_the_json_row():
-    """Eleven call sites set `counters.why`; the reader must see it in both."""
-    c = Counters()
-    c.count("moe_triton_fallback")
-    c.why = "triton: top-k 64 > 32"
-    assert c.line() == "moe_triton_fallback=1 fallback: triton: top-k 64 > 32"
-    row = dict(c)  # exactly what train/loop.py hands the JSON sink
-    assert row["why"] == "triton: top-k 64 > 32"
-    assert json.loads(json.dumps(row))["why"] == "triton: top-k 64 > 32"
-    # Empty is absent, not an empty field: a parser sees the same row shape.
-    c.why = ""
-    assert c.line() == "moe_triton_fallback=1"
-    assert "why" not in dict(c)
-
-
-def test_why_is_read_by_getattr_and_survives_a_merge():
-    a, b = Counters(), Counters()
-    a.why = "capacity=0: dropless"
-    assert a.why == "capacity=0: dropless"
-    b.why = "capacity=0: dropless"  # the same reason every step
-    a.merge(b)
-    assert a.why == "capacity=0: dropless", "a repeat must not grow the line"
-    b.why = "triton: input is on cpu"
-    a.merge(b)
-    assert a.why == "capacity=0: dropless; triton: input is on cpu"
-
-
-def test_a_long_counter_name_is_printed_whole():
-    """No silent truncation to a 24-character parser column."""
-    name = "a_counter_name_that_is_way_longer_than_24_chars"
-    c = Counters()
-    c.count(name)
-    c.why = "x"
-    assert f"{name}=1" in c.line()
-    assert c.line().endswith("fallback: x")

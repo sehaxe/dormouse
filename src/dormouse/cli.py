@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import dataclasses
 import math
-import os
 from pathlib import Path
 from typing import Annotated
 
@@ -25,7 +24,6 @@ from .instrument import LoudError
 from .model import DormouseModel, param_count
 from .model.decode import decode_bytes, encode
 from .serve import DEFAULT_MAX_TOKENS, build_server, serve_forever
-from .train.device import apply_policy, cpu_caps, probe_device, resolve_policy
 
 app = typer.Typer(
     add_completion=False,
@@ -50,19 +48,74 @@ def main() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _coerce(name: str, value: object, default: object) -> object:
+    """Make `--set` honour the FIELD's type, not the literal's punctuation.
+
+    TOML booleans are lowercase, so `--set use_msa=False` used to stay the
+    string `"False"` — truthy, i.e. the opposite of what was asked. Every bool
+    flag had that hole, and a silently flipped flag is the SILENT class this
+    repo treats as a defect. The rule is now: the field's default names the
+    type, and a literal that does not fit it is refused loudly.
+    """
+    if default is dataclasses.MISSING:
+        return value
+    want = type(default)
+    if want is bool:
+        if isinstance(value, bool):
+            return value
+        text = str(value).strip().lower()
+        if text in ("true", "1", "yes", "on"):
+            return True
+        if text in ("false", "0", "no", "off"):
+            return False
+        raise LoudError(
+            f"--set {name}={value!r}: this is a boolean field. Escape: "
+            f"--set {name}=true or --set {name}=false."
+        )
+    if want is int and not isinstance(value, bool):
+        if isinstance(value, int):
+            return value
+        try:
+            return int(str(value), 0)
+        except ValueError:
+            raise LoudError(
+                f"--set {name}={value!r}: this is an integer field. "
+                f"Escape: a whole number, e.g. --set {name}=512."
+            ) from None
+    if want is float:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+        try:
+            return float(str(value))
+        except ValueError:
+            raise LoudError(
+                f"--set {name}={value!r}: this is a float field. "
+                f"Escape: a number, e.g. --set {name}=1e-3."
+            ) from None
+    return value
+
+
 def _split_sets(sets: list[str]) -> tuple[dict[str, object], dict[str, object]]:
     """`--set k=v` routed by schema: model keys vs train keys, unknown → loud.
 
     A bare value that parses as a TOML literal keeps that type (1, 1e-3,
     true); anything else is a string — the common case is a preset name or an
-    optimizer mode.
+    optimizer mode. Booleans are then re-read against the field's own type
+    (`_coerce`), because TOML spells them lowercase and `--set flag=False`
+    would otherwise be a truthy string.
     """
+
     import tomllib
 
     model_over: dict[str, object] = {}
     train_over: dict[str, object] = {}
     model_keys = {f.name for f in dataclasses.fields(ModelConfig)}
     train_keys = {f.name for f in dataclasses.fields(TrainConfig)}
+    #: name -> declared default, used only to type-check a `--set` literal.
+    _defaults: dict[str, object] = {
+        f.name: f.default
+        for f in (*dataclasses.fields(ModelConfig), *dataclasses.fields(TrainConfig))
+    }
     for s in sets:
         if s.count("=") != 1:
             raise LoudError(f"--set {s!r}: expected exactly one `key=value`")
@@ -77,7 +130,8 @@ def _split_sets(sets: list[str]) -> tuple[dict[str, object], dict[str, object]]:
                 f"--set {k}: neither a model nor a train key. Escape: fix the "
                 f"typo, or add the field to its config class and wire it."
             )
-        where[k] = value
+        default = _defaults[k]
+        where[k] = _coerce(k, value, default)
     return model_over, train_over
 
 
@@ -103,56 +157,6 @@ def _device(name: str) -> torch.device:
     return torch.device("cuda")
 
 
-def _apply_dtype(run: RunConfig, dev: torch.device, log) -> RunConfig:
-    """The `dtype` seam: `none` (default) is a no-op, anything else probes once.
-
-    The off switch is checked FIRST and returns the same object — a run with
-    `dtype="none"` never opens a CUDA context, never calls nvidia-smi, and its
-    config is byte-identical to its history (the regression the layer must not
-    cause). With a dtype requested, the device is probed once (metadata only),
-    the policy is resolved (LOUD on an impossible request), the COUNTED line is
-    logged, and the run's `bf16` flag is set to the resolved rung.
-    """
-    if run.model.dtype == "none":
-        return run
-    caps = probe_device(dev.index or 0) if dev.type == "cuda" else cpu_caps()
-    policy = resolve_policy(caps, run.model.dtype)
-    log(policy.line())
-    return apply_policy(run, [policy], log=log)
-
-
-def _apply_fit(run: RunConfig, fit_gb: float, log) -> RunConfig:
-    """The `--fit` seam: 0 (default) is a no-op; anything else resolves and prints.
-
-    The knob is a RESOLVER, not a config field: the run's config then carries
-    the mechanisms themselves (`engram_ram=true`, `optim_8bit=true`, …), so the
-    snapshot says what ran and a resume refuses a different set. On a fleet the
-    plan uses the largest rank's micro-batch (the one that must fit) and never
-    engages the host tables (they do not reduce across ranks).
-    """
-    if not fit_gb:
-        return run
-    from .train.fit import apply_fit, plan_fit
-
-    batch = run.train.batch
-    if run.train.dist and run.train.dist_capacity not in ("", "auto"):
-        from .train.distributed import parse_capacity
-
-        world = int(os.environ.get("WORLD_SIZE", "1"))
-        batch = max(
-            s.batch
-            for s in parse_capacity(
-                run.train.dist_capacity,
-                world_size=world,
-                cfg=run.train,
-                max_seq_len=run.model.max_seq_len,
-            )
-        )
-    plan = plan_fit(run, fit_gb, batch=batch)
-    log(plan.line())
-    return apply_fit(run, plan)
-
-
 def _freeze_gc() -> None:
     """The GC-storm fix for long runs (gdb-found, 2026-10-16).
 
@@ -170,19 +174,22 @@ def _freeze_gc() -> None:
     gc.set_threshold(1_000_000, 50, 50)
 
 
-def _model(run) -> DormouseModel:
-    """Construct the model from `run` — seeded by the run, never by the caller.
+def _seed_model(run: RunConfig) -> None:
+    """Seed the process RNG from the snapshot's `train.seed` before an init.
 
-    `train.seed` is recorded in every snapshot and every `.dormouse` header, so
-    it must own the weights: `DormouseModel.__init__` draws from the global
-    torch RNG, and before this call nothing in the train path seeded it (audit
-    C1: two `seed=1` processes built `39cb6df0…` vs `c70cb36b…`). Set the seed
-    HERE, immediately before the constructor, because this is the one place
-    `train`/`run`/`sft`/`eval`/`bench`/`export`/`decode`/`serve` build a model
-    (`serve.py` imports this helper). The RL lane builds its own
-    (`post/rl_train.py`), so `rl_cmd` seeds immediately before that call.
+    The round-1 ledger's m4: `PROGRESS_KEYS` pins `seed` in the checkpoint
+    snapshot, but nothing applied it to the weights, so two runs of one config
+    started from different models (`embed.weight` differed by 5.39). Every CLI
+    entry point that builds a FRESH model calls this first. A `--resume`
+    overrides the file's value by loading the checkpoint's weights afterwards —
+    the seed only decides an init, never a resumed run.
     """
     torch.manual_seed(run.train.seed)
+
+
+def _model(run: RunConfig) -> DormouseModel:
+    """A fresh model whose init is seeded by the run's `train.seed`."""
+    _seed_model(run)
     return DormouseModel(run.model)
 
 
@@ -296,30 +303,18 @@ def train_cmd(
     steps: Annotated[int | None, typer.Option] = None,
     lr: Annotated[float | None, typer.Option] = None,
     device: Annotated[str, typer.Option(help="auto|cuda|cpu")] = "auto",
-    dist: Annotated[
-        bool,
-        typer.Option(
-            "--dist",
-            help="single-node multi-process (launch under torchrun; rank 0's log is the run's)",
-        ),
-    ] = False,
-    capacity: Annotated[
-        str,
-        typer.Option(
-            "--capacity",
-            help="per-rank micro-batches for --dist: '4,2', '4x512,2x256', or auto",
-        ),
-    ] = "",
-    fit: Annotated[
-        float,
-        typer.Option(
-            "--fit",
-            help="fit a card of this many GB (0 = off): resolves a memory-mechanism set",
-        ),
-    ] = 0.0,
     resume: Annotated[
         bool, typer.Option(help="continue `ckpt_name`; a drifted config refuses")
     ] = False,
+    init_from: Annotated[
+        str,
+        typer.Option(
+            "--init-from",
+            help="a .pt whose WEIGHTS seed this run (fresh optimizer/snapshot) — the "
+            "way to continue a run under a config it was not snapshotted with, e.g. "
+            "QAT-finish: bf16 weights, ternary forward",
+        ),
+    ] = "",
     json_log: Annotated[
         Path | None, typer.Option("--json-log", help="telemetry sink for `dormouse plot`")
     ] = None,
@@ -338,46 +333,8 @@ def train_cmd(
             train_over[k] = v
     if json_log is not None:
         train_over["json_log"] = str(json_log)
-    if dist:
-        train_over["dist"] = True
-    if capacity:
-        train_over["dist_capacity"] = capacity
-    run = load_run(
-        preset, model_overrides=model_over, train_overrides=train_over, apply_compute=True
-    )
-    run = _apply_fit(run, fit, log=print)
+    run = load_run(preset, model_overrides=model_over, train_overrides=train_over)
     dev = _device(device)
-    world = int(os.environ.get("WORLD_SIZE", "1"))
-    if dist and world <= 1:
-        raise LoudError(
-            f"--dist without torchrun (WORLD_SIZE={world}): there is no fleet to join, "
-            f"and a silent single-process run under a --dist flag is the fallback this "
-            f"repo refuses. Escape: `torchrun --standalone --nproc_per_node=2 -m "
-            f"dormouse train --dist ...`, or drop --dist."
-        )
-    if not dist and world > 1:
-        raise LoudError(
-            f"launched under torchrun (WORLD_SIZE={world}) without --dist: every rank "
-            f"would train the same data independently and overwrite the same "
-            f"checkpoint. Escape: pass --dist, or run without torchrun."
-        )
-    if dist:
-        from .train.distributed import train_dist as _train_dist
-
-        console.print(
-            Panel(
-                f"[bold]{run.source}[/] · distributed · {world} rank(s) · device {dev.type}",
-                subtitle=f"steps={run.train.steps} capacity={capacity or 'cfg.batch'}"
-                f" lr={run.train.lr} opt={run.train.opt}",
-            )
-        )
-        report = _train_dist(run, resume=resume, device_type=dev.type, log=print)
-        console.print(
-            f"[green]done[/] steps={report['steps']} loss={report['loss']:.4f} "
-            f"rank={report['rank']}/{report['world_size']}"
-        )
-        return
-    run = _apply_dtype(run, dev, log=print)
     model = _model(run).to(dev)
     _freeze_gc()
     from .train.loop import train as _train
@@ -389,7 +346,13 @@ def train_cmd(
             f" lr={run.train.lr} opt={run.train.opt}",
         )
     )
-    report = _train(model, run, resume=resume, device=None if dev.type == "cpu" else dev)
+    report = _train(
+        model,
+        run,
+        resume=resume,
+        init_from=init_from or None,
+        device=None if dev.type == "cpu" else dev,
+    )
     console.print(f"[green]done[/] steps={report['steps']} loss={report['loss']:.4f}")
 
 
@@ -438,11 +401,8 @@ def run(
             train_over[k] = v
     if out_dir is not None:
         train_over["out_dir"] = str(out_dir)
-    run = load_run(
-        preset, model_overrides=model_over, train_overrides=train_over, apply_compute=True
-    )
+    run = load_run(preset, model_overrides=model_over, train_overrides=train_over)
     dev = _device(device)
-    run = _apply_dtype(run, dev, log=print)
     model = _model(run).to(dev)
     _freeze_gc()
 
@@ -506,6 +466,9 @@ def sft_cmd(
         bool,
         typer.Option("--build-sft", help="(re)build the seeded instruction corpus at --data first"),
     ] = False,
+    n_tasks: Annotated[
+        int, typer.Option(help="code and math tasks per class in the built corpus")
+    ] = 32,
     chat_data: Annotated[
         list[Path],
         typer.Option(
@@ -559,7 +522,7 @@ def sft_cmd(
     checkpoint pair (which refuses loudly when either half is missing), so the
     bare command is the concept test — the format is learned, the knowledge is
     not there yet. `--build-sft` writes the corpus deterministically from
-    `(seed, seq_len)`; a `--data` that does not exist without it is a
+    `(seed, seq_len, n_tasks)`; a `--data` that does not exist without it is a
     loud refusal, because a pretrain corpus has no markers and the masked CE
     would refuse it one step later anyway.
     """
@@ -579,9 +542,7 @@ def sft_cmd(
         train_over["eval_data"] = str(eval_data)
     if json_log is not None:
         train_over["json_log"] = str(json_log)
-    run = load_run(
-        preset, model_overrides=model_over, train_overrides=train_over, apply_compute=True
-    )
+    run = load_run(preset, model_overrides=model_over, train_overrides=train_over)
     if not run.train.data:
         raise LoudError(
             "sft needs --data (the SFT corpus .bin) or `--set data=/path`. Escape: "
@@ -593,6 +554,7 @@ def sft_cmd(
             path,
             run.train.seed,
             seq_len=run.train.seq_len,
+            n_tasks=n_tasks,
             chat_data=chat_data or None,
             chat_cap=chat_cap,
             holdout=holdout,
@@ -666,12 +628,15 @@ def rl_cmd(
     # plain-function footgun, and the option annotation IS the fixture.
     sets: Annotated[list[str], typer.Option("--set", help="override: key=value")] = [],  # noqa: B006
 ) -> None:
-    """RL: the MiMo-style reward and a policy-gradient step on GENERATED tasks.
+    """RL: the MiMo-style reward and a policy-gradient step on verifiable tasks.
 
-    There is no corpus to point at — a step draws its task from
-    `build_tasks(cfg.rl_task_cls, seed, n=cfg.rl_tasks)` — so `--data`/`--eval`
-    do not exist here. The lane's own knobs go through `--set`: `rl_task_cls`,
-    `rl_tasks`, `rl_group`, `rl_budget`, `rl_adv`, and the reward's X/B/A/δ/s/γ.
+    The tasks come from `rl_corpus` (the JSONL `scripts/build_rl_tasks.py`
+    emits) or, when that is empty, from `build_tasks(cfg.rl_task_cls, seed +
+    SFT_TASK_OFFSET, n=cfg.rl_tasks)`. A held-out slice is never trained and is
+    scored `pass@1`/`pass@budget` every `rl_eval_every` steps. `--data`/`--eval`
+    do not exist here. The lane's own knobs go through `--set`: `rl_corpus`,
+    `rl_holdout`, `rl_eval_every`, `rl_band_lo/hi`, `rl_task_cls`, `rl_tasks`,
+    `rl_group`, `rl_budget`, `rl_adv`, and the reward's X/B/A/δ/s/γ.
     """
     from .post.rl_train import rl_train
 
@@ -685,10 +650,11 @@ def rl_cmd(
             train_over[k] = v
     if json_log is not None:
         train_over["json_log"] = str(json_log)
-    run = load_run(
-        preset, model_overrides=model_over, train_overrides=train_over, apply_compute=True
-    )
+    run = load_run(preset, model_overrides=model_over, train_overrides=train_over)
     dev = _device(device)
+    # `rl_train` builds the model internally; seed before that call (m4). The
+    # train/sft commands get the same seed through `_model`.
+    _seed_model(run)
     _freeze_gc()
     console.print(
         Panel(
@@ -700,11 +666,6 @@ def rl_cmd(
             f"adv={run.train.rl_adv}",
         )
     )
-    # C1: `rl_train` constructs its own DormouseModel (`post/rl_train.py`), so
-    # this is the seed call immediately before that construction. A direct
-    # library caller of `rl_train` still bypasses it; the durable fix is the
-    # same line inside `rl_train` (not this lane's file).
-    torch.manual_seed(run.train.seed)
     report = rl_train(
         run,
         resume=resume,
@@ -714,10 +675,17 @@ def rl_cmd(
     per_solved = (
         f"{report['bytes_per_solved']:.1f}" if report["bytes_per_solved"] is not None else "-"
     )
+    held = report.get("eval")
+    held_field = (
+        ""
+        if not held
+        else f" pass@1={held['pass@1']:.3f} pass@budget={held['pass@budget']:.3f}"
+    )
     console.print(
         f"[green]rl done[/] steps={report['steps']} loss={report['loss']:.4f} "
         f"pass={report['pass_rate']:.2f} bytes/solved={per_solved} "
         f"rl_samples={report['rl_samples']:,} nan_skipped={report['nan_skipped']}"
+        f"{held_field}"
     )
 
 
@@ -844,7 +812,7 @@ def bench_cmd(
     if preset:
         _preset_check(preset, run, what="scored")
     dev = _device(device)
-    if dev.type == "cuda" and run.model.use_kda:
+    if dev.type == "cuda" and run.model.use_kda and run.model.attn_kind == "kda":
         # The arm is checked BEFORE the run: `fla_status` is a tiny warmup call,
         # and a bench that discovers an hour later that it measured the SDPA
         # fallback has already spent the hour.
@@ -890,7 +858,12 @@ def bench_cmd(
     # console width, and a clipped counter line is a counter nobody can read
     # (`kda_sdpa` was the field that got cut).
     console.print(f"bench arm: {arm.line()}")
-    if dev.type == "cuda" and run.model.use_kda and not arm.get("kda_fla", 0):
+    if (
+        dev.type == "cuda"
+        and run.model.use_kda
+        and run.model.attn_kind == "kda"
+        and not arm.get("kda_fla", 0)
+    ):
         raise LoudError(
             "bench: on CUDA the KDA arm never ran the FLA kernel (kda_fla=0) although the "
             "pre-run check found FLA live — the model did not route through it, and the "
@@ -898,7 +871,7 @@ def bench_cmd(
             "checkpoint's numbers. Escape: check the config's `use_kda`/dispatch seam, or "
             "run --device cpu and read the number as the COUNTED fallback's."
         )
-    if dev.type == "cpu":
+    if dev.type == "cpu" and run.model.attn_kind == "kda":
         console.print(
             f"[yellow]counted[/] CPU: the attention arm is the SDPA fallback "
             f"({arm.get('kda_sdpa', 0)} calls), not the FLA KDA kernel — the same counted "
@@ -906,134 +879,10 @@ def bench_cmd(
         )
 
 
-@app.command("export")
-def export_cmd(
-    preset: Annotated[
-        str,
-        typer.Argument(help="optional CHECK: given, it must resolve to the checkpoint's numbers"),
-    ] = "",
-    ckpt_name: Annotated[str, typer.Option("--ckpt-name", help="the checkpoint to export")] = "",
-    out_dir: Annotated[Path, typer.Option(help="checkpoint directory")] = Path("checkpoints"),
-    out: Annotated[
-        str,
-        typer.Option("--out", help="artifact path (default <out-dir>/<ckpt-name>.dormouse)"),
-    ] = "",  # str, not Path: `Path()` is `.` and would read as "given"
-    mode: Annotated[str, typer.Option(help="factor rung: ternary|mxfp4")] = "ternary",
-    dense_dtype: Annotated[
-        str, typer.Option("--dense-dtype", help="dense tensors: fp16 (default) | fp32")
-    ] = "fp16",
-    engram_dtype: Annotated[
-        str, typer.Option("--engram-dtype", help="n-gram table: fp32 (default) | fp16")
-    ] = "fp32",
-    verify: Annotated[
-        bool,
-        typer.Option("--verify", help="read the file back and compare a forward to the source"),
-    ] = False,
-) -> None:
-    """Write the one-file `.dormouse` artifact: config + weights for every reader.
-
-    The readers are `dormouse decode/serve --export` (Python), the browser
-    engine (`docs-site/public/demo/engine.js`) and distribution — one format,
-    one writer. The snapshot decides the config (this is `eval`'s resolution
-    rule); `preset` is therefore a CHECK, and a model half that disagrees with
-    it is refused rather than exported under the wrong name.
-
-    `--verify` is the gate that makes the file trustworthy: it reads the
-    artifact back, checks that every record's bytes are where the header says,
-    and forwards one batch through the source model (projection on) and the
-    rebuilt one, printing the max |Δlogits|.
-    """
-    from .model.export import engine_refusal, load_export, read_export, verify_export, write_export
-    from .train.loop import load_model_state, unpack_state_dict
-
-    if not ckpt_name:
-        raise LoudError("export needs --ckpt-name (the checkpoint to export)")
-    run = _snapshot_run(out_dir, ckpt_name)
-    if preset:
-        _preset_check(preset, run, what="exported")
-    weights = Path(out_dir) / f"{ckpt_name}.pt"
-    model = _model(run)
-    # The ONE loader `eval`/`decode`/`serve` share (`load_model_half` is exactly
-    # these two lines): a storage rung's packed records unpack, and an
-    # `engram_ram` checkpoint switches the model to host tables and restores
-    # its `.ngram` sibling — which is what lets this export fold the memory IN
-    # instead of writing a memory-less model under the run's name. The
-    # checkpoint dict is read here rather than through `load_model_half` for the
-    # `step` it also carries: the artifact's provenance, and a second full
-    # `torch.load` (optimizer state included) is not worth a metadata field.
-    ck = torch.load(weights, map_location="cpu", weights_only=False)
-    load_model_state(model, run.train, unpack_state_dict(ck["model"], ck.get("model_quant_rung")))
-    step = ck["step"] if isinstance(ck.get("step"), int) else None
-    commit = _git_commit()
-    path = Path(out) if out else Path(out_dir) / f"{ckpt_name}.dormouse"
-    report = write_export(
-        model,
-        path,
-        mode=mode,
-        preset=preset or run.source,
-        seed=run.train.seed,
-        step=step,
-        commit=commit,
-        dense_dtype=dense_dtype,
-        engram_dtype=engram_dtype,
-    )
-    console.print(report.table())
-    why = engine_refusal(run.model)
-    engine_line = (
-        "[green]runnable[/] (small-byte-lm)"
-        if why is None
-        else f"[yellow]NOT runnable[/] by docs-site/public/demo/engine.js — {why}"
-    )
-    console.print(f"browser engine: {engine_line}")
-    if verify:
-        torch.manual_seed(0)
-        seq = min(64, run.model.max_seq_len)
-        x = torch.randint(0, run.model.vocab, (2, seq))
-        diff = verify_export(model, path, (x,))
-        f = read_export(path)
-        loaded = load_export(f)
-        console.print(
-            f"verify: max |Δlogits| = {diff:.3e} over {tuple(x.shape)} "
-            f"(reference = the projection on the fp32 masters, loaded = the file) · "
-            f"{sum(p.numel() for p in loaded.parameters()):,} params rebuilt"
-        )
-        if not math.isfinite(diff):
-            raise LoudError("verify: non-finite logits — the rebuilt model is not the exported one")
-
-
-def _git_commit() -> str | None:
-    """`HEAD`'s short hash, or None — the artifact's provenance, never a guess.
-
-    A non-git tree (a source tarball) leaves the header's `commit` null, which
-    is the honest value; this is metadata, so it does not stop an export.
-    """
-    import subprocess
-
-    try:
-        got = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            cwd=Path(__file__).resolve().parents[2],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except OSError:
-        return None
-    return got.stdout.strip() if got.returncode == 0 and got.stdout.strip() else None
-
-
 @app.command()
 def decode(
     out_dir: Annotated[Path, typer.Option(help="checkpoint directory")] = Path("checkpoints"),
     ckpt_name: Annotated[str, typer.Option("--ckpt-name")] = "",
-    export_file: Annotated[
-        str,
-        typer.Option(
-            "--export",
-            help="read the model from a .dormouse artifact instead of a checkpoint "
-            "(the browser demo reads the same bytes)",
-        ),
-    ] = "",  # str, not Path: `Path()` is `.` and would read as "given"
     prompt: Annotated[str, typer.Option(help="prompt text; UTF-8 bytes are the tokens")] = "",
     n: Annotated[int, typer.Option(help="new bytes to sample")] = 100,
     temp: Annotated[float, typer.Option(help="sampling temperature")] = 0.8,
@@ -1054,6 +903,24 @@ def decode(
             "(O(window)/byte). Off by default until the GPU gate has run.",
         ),
     ] = False,
+    decode_graph: Annotated[
+        bool,
+        typer.Option(
+            "--decode-graph",
+            help="recurrent decode in a CUDA graph: capture the one-byte step once and "
+            "replay it (static buffers, in-place state). Needs --recurrent and CUDA; "
+            "a capture failure falls back COUNTED to eager with the reason.",
+        ),
+    ] = False,
+    decode_multibyte: Annotated[
+        int,
+        typer.Option(
+            "--decode-multibyte",
+            help="recurrent decode, up to N bytes per forward from the model's MTP heads "
+            "(draft -> ONE verify forward -> longest correct prefix). GREEDY ONLY "
+            "(temp <= 1e-6); no MTP head = COUNTED fallback to one byte per forward.",
+        ),
+    ] = 0,
     device: Annotated[str, typer.Option(help="auto|cuda|cpu")] = "auto",
 ) -> None:
     """Sample bytes from a checkpoint (sliding-window next-byte decode).
@@ -1070,18 +937,19 @@ def decode(
     pass are the same recurrence with different summation orders (the `kda.py`
     numerics contract), which is why it is off by default and why the subtitle
     prints the counters of the arm that ran.
+
+    `--decode-graph` captures the recurrent step in a CUDA graph and replays it
+    (same bytes as eager, `decode_graph_replay` says how many); a capture
+    failure is COUNTED and prints its reason. `--decode-multibyte N` is the
+    MTP draft-then-verify loop, GREEDY ONLY (`--temp 1e-6`): it emits up to N
+    bytes per forward, and a model without an MTP head falls back COUNTED to one
+    byte per forward. Both are arms OF `--recurrent`.
     """
     from .model.specdecode import spec_decode_bytes
     from .train.loop import load_model_half, load_model_state
 
-    if not ckpt_name and not export_file:
-        raise LoudError("decode needs --ckpt-name or --export")
-    if ckpt_name and export_file:
-        raise LoudError(
-            "decode --ckpt-name and --export are two sources for one model. "
-            "Escape: pass one of them (--export reads the artifact, --ckpt-name "
-            "resolves through the checkpoint's snapshot)."
-        )
+    if not ckpt_name:
+        raise LoudError("decode needs --ckpt-name")
     if not prompt:
         raise LoudError("decode needs --prompt (the first window is the prompt)")
     if spec_k and recurrent:
@@ -1090,33 +958,49 @@ def decode(
             "draft block vs a carried state), and neither is the other's control. "
             "Escape: pass one of them."
         )
+    if (decode_graph or decode_multibyte) and not recurrent:
+        raise LoudError(
+            "decode --decode-graph / --decode-multibyte are arms OF the recurrent "
+            "decoder (the captured step is `recurrent_step`, and the multibyte verify "
+            "carries its state). Escape: add --recurrent."
+        )
+    if decode_multibyte and temp > 1e-6:
+        raise LoudError(
+            f"decode --decode-multibyte at temp={temp}: multibyte is GREEDY ONLY "
+            f"(temp <= 1e-6), because a block verify's distribution is the one-byte "
+            f"loop's only up to kernel summation order — sampling it would change what "
+            f"the model is. Escape: --temp 1e-6, or drop --decode-multibyte."
+        )
+    run = _snapshot_run(out_dir, ckpt_name)
     dev = _device(device)
-    if export_file:
-        from .model.export import load_export, read_export
-
-        artifact = read_export(export_file)
-        model = load_export(artifact, device=dev)
-        seed = int(artifact.header.get("seed") or 1)
-        source = str(export_file)
-    else:
-        run = _snapshot_run(out_dir, ckpt_name)
-        model = _model(run).to(dev)
-        seed = run.train.seed
-        source = f"{Path(out_dir) / ckpt_name}.pt"
-        # Same ONE loader as `eval`, `serve` and `load_ckpt`: the storage rung's
-        # packed records are unpacked, and an `engram_ram` checkpoint switches
-        # the model to host tables and restores its `.ngram` sibling.
-        load_model_state(model, run.train, load_model_half(Path(out_dir) / f"{ckpt_name}.pt"))
+    model = _model(run).to(dev)
     _freeze_gc()
-    gen = torch.Generator(device=dev).manual_seed(seed)
+    # Same ONE loader as `eval`, `serve` and `load_ckpt`: the storage rung's
+    # packed records are unpacked, and an `engram_ram` checkpoint switches the
+    # model to host tables and restores its `.ngram` sibling.
+    load_model_state(model, run.train, load_model_half(Path(out_dir) / f"{ckpt_name}.pt"))
+    gen = torch.Generator(device=dev).manual_seed(run.train.seed)
     body = encode(prompt)
     if recurrent:
         from .instrument import Counters
         from .model.decode import recurrent_decode
 
         arm = Counters()
-        out = recurrent_decode(model, body, n, temp=temp, device=dev, generator=gen, counters=arm)
+        out = recurrent_decode(
+            model,
+            body,
+            n,
+            temp=temp,
+            device=dev,
+            generator=gen,
+            counters=arm,
+            decode_graph=decode_graph,
+            decode_multibyte=decode_multibyte,
+        )
         subtitle = f"recurrent · {arm.line()}"
+        why = getattr(arm, "why", None)
+        if why:
+            console.print(f"[yellow]counted[/] {why}")
     elif spec_k:
         out, stats = spec_decode_bytes(
             model, body, n, spec_k=spec_k, temp=temp, device=dev, generator=gen
@@ -1134,7 +1018,7 @@ def decode(
         Panel(
             f"[bold]{prompt}[/]{text}",
             title=f"decode · temp {temp}" + (f" · spec k={spec_k}" if spec_k else ""),
-            subtitle=f"{subtitle} · {source}",
+            subtitle=subtitle,
         )
     )
 
@@ -1217,14 +1101,6 @@ def serve_cmd(
     ] = "",
     out_dir: Annotated[Path, typer.Option(help="checkpoint directory")] = Path("checkpoints"),
     ckpt_name: Annotated[str, typer.Option("--ckpt-name")] = "",
-    export_file: Annotated[
-        str,
-        typer.Option(
-            "--export",
-            help="serve a .dormouse artifact instead of a checkpoint (the browser "
-            "demo reads the same bytes)",
-        ),
-    ] = "",  # str, not Path: `Path()` is `.` and would read as "given"
     port: Annotated[int, typer.Option(help="TCP port (0 = an ephemeral one)")] = 8765,
     host: Annotated[str, typer.Option(help="bind address")] = "127.0.0.1",
     max_tokens_cap: Annotated[
@@ -1257,20 +1133,6 @@ def serve_cmd(
     recurrent (byteflow, MSA) falls back COUNTED with the reason on the startup
     line.
     """
-    if not ckpt_name and not export_file:
-        raise LoudError("serve needs --ckpt-name or --export")
-    if ckpt_name and export_file:
-        raise LoudError(
-            "serve --ckpt-name and --export are two sources for one model. Escape: "
-            "pass one of them (--export reads the artifact, --ckpt-name resolves "
-            "through the checkpoint's snapshot)."
-        )
-    if preset and export_file:
-        raise LoudError(
-            "serve --preset with --export: the preset check compares against the "
-            "checkpoint's snapshot, and an artifact carries its own config. Escape: "
-            "drop --preset (the file IS what it is)."
-        )
     if preset:
         _preset_check(preset, _snapshot_run(out_dir, ckpt_name), what="served")
     httpd = build_server(
@@ -1282,12 +1144,11 @@ def serve_cmd(
         max_tokens_cap=max_tokens_cap,
         temp=temp,
         recurrent=recurrent,
-        export=export_file or None,
     )
     state = httpd.state
     console.print(
         Panel(
-            f"[bold]{state.ckpt_name}[/] · {param_count(state.model):,} params · {state.device}",
+            f"[bold]{ckpt_name}[/] · {param_count(state.model):,} params · {state.device}",
             subtitle=f"http://{host}:{httpd.server_address[1]}/v1 · cap {max_tokens_cap} B"
             f" · temp {temp} · {'recurrent' if state.recurrent else 'plain'} arm",
         )

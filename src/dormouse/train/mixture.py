@@ -101,7 +101,16 @@ from pathlib import Path
 import torch
 
 from ..instrument import loud
-from .data import DEFAULT_RING, ByteStream, ShardStream, open_source, shard_files, shard_sizes
+from .data import (
+    DEFAULT_RING,
+    ByteStream,
+    DocPackedStream,
+    ShardStream,
+    load_doc_starts,
+    open_source,
+    shard_files,
+    shard_sizes,
+)
 
 #: The 4-epoch rule (2305.16264) — a source repeated more than this is refused
 #: unless the plan (or `--set max_epochs=N`) says otherwise. `0` = off.
@@ -403,6 +412,11 @@ def source_size(name: str, path: Path) -> int:
 def per_source_bytes(plan: MixPlan, steps: int, batch: int, seq_len: int) -> dict[str, int]:
     """Expected bytes per source: `steps_in_stage × window × weight`, summed over stages.
 
+    `steps` is the number of `next_batch()` calls the run will make — MICRO-
+    batches, i.e. `train.steps × grad_accum` — because that is what the stream
+    counts. `train/loop.py` passes exactly that, so the schedule and this
+    expectation cannot disagree about how much of each source is read.
+
     The draw is i.i.d. per step, so a realized count differs from this by
     `O(sqrt(n))` windows — it is the EXPECTATION the epoch cap is argued from,
     exactly as the research doc's table computes it.
@@ -428,18 +442,36 @@ def replay_bytes(
 ) -> dict[str, int]:
     """EXACT bytes each source serves in steps `[0, upto)` — the draw, replayed.
 
-    `steps` is the step budget in force for those steps (on an EXTENDED resume
-    it is the checkpoint's stored `steps`, not the new one: the stage schedule
-    is a function of the budget, so the new one would assign a different source
-    to already-taken steps — review round 3 R3-4), `upto` is how far to replay
-    (default: the whole budget). `per_source_bytes` is the expectation the
-    epoch cap is argued from; this is what a run with THIS seed actually read,
-    and it is what a resume must reproduce (`skip_to_step`).
+    `steps` is the run's budget (it decides the stage schedule), `upto` is how
+    far to replay (default: the whole budget). `per_source_bytes` is the
+    expectation the epoch cap is argued from; this is what a run with THIS seed
+    actually reads, and it is what a resume must reproduce (`skip_bytes`).
     """
     window = batch * (seq_len + 1)
     served = dict.fromkeys(plan.sources, 0)
     for step in range(steps if upto is None else upto):
         served[source_for_step(plan, step, steps, seed)] += window
+    return served
+
+
+def replay_steps(
+    plan: MixPlan,
+    *,
+    steps: int,
+    upto: int | None = None,
+    seed: int | None = None,
+) -> dict[str, int]:
+    """EXACT STEPS each source serves in `[0, upto)` — the `doc_masking` resume.
+
+    A document-packed step consumes a document-dependent number of BYTES, so
+    the flat-byte resume formula cannot name a position. The step index still
+    does: the source of every step is a pure function of `(seed, step, steps)`,
+    so replaying the draw gives each source the number of packed steps it owes,
+    and `DocPackedStream.skip_steps` replays exactly those.
+    """
+    served = dict.fromkeys(plan.sources, 0)
+    for step in range(steps if upto is None else upto):
+        served[source_for_step(plan, step, steps, seed)] += 1
     return served
 
 
@@ -479,6 +511,10 @@ def check_epoch_cap(
 class MixtureStream:
     """`ByteStream`'s interface over N sources: one whole batch per step, staged.
 
+    `steps` is the number of `next_batch()` calls (MICRO-batches), because the
+    stage and source of a draw are pure functions of that index. The trainer
+    passes `train.steps × grad_accum`.
+
     A source is a `.bin` FILE or a shard DIRECTORY (`open_source`): the
     directory mode reads the mount's `*.txt` shards in a seeded shuffled order
     and is the reason this class exists at 227 GB, where a concatenated corpus
@@ -488,11 +524,7 @@ class MixtureStream:
     (see the module docstring), so two instances with one seed read the same bytes
     and `skip_bytes()` reproduces exactly what an unbroken run would have read —
     for a shard source too, because `ShardStream`'s byte sequence is periodic in
-    `sum(shard sizes)` and the seed pins the file order. An EXTENDED run
-    (`steps` grew, a legal resume) must pass the checkpoint's stored budget to
-    `skip_to_step`: the schedule is a function of the budget, so the prefix has
-    to be replayed under the budget it was actually read with (review round 3
-    R3-4).
+    `sum(shard sizes)` and the seed pins the file order.
     """
 
     def __init__(
@@ -504,6 +536,7 @@ class MixtureStream:
         *,
         seed: int | None = None,
         ring_bytes: int = DEFAULT_RING,
+        doc_masking: bool = False,
     ) -> None:
         if not plan.stages:
             loud("MixtureStream: the plan has no stages")
@@ -512,22 +545,39 @@ class MixtureStream:
         self.steps = steps
         self.seed = plan.seed if seed is None else seed
         self.window = batch * (seq_len + 1)
+        self.doc_masking = doc_masking
         stage_bounds(plan, steps)  # refuse a plan whose stages do not cover the budget
-        self._streams: dict[str, ByteStream | ShardStream] = {
-            name: open_source(
-                path,
-                batch,
-                seq_len,
-                seed=_stream_seed(self.seed, name),
-                ring_bytes=ring_bytes,
-            )
-            for name, path in plan.sources.items()
-        }
+        self._streams: dict[str, ByteStream | ShardStream | DocPackedStream] = {}
+        for name, path in plan.sources.items():
+            stream: ByteStream | ShardStream
+            if doc_masking:
+                if path.is_dir():
+                    loud(
+                        f"doc_masking with source {name!r} -> {path}: a shard DIRECTORY "
+                        f"has document boundaries (one `*.txt` shard is one document) but "
+                        f"the packed reader is implemented for a `.bin` + its "
+                        f"`.docs.json` sidecar, and the shard stream's ring reads across "
+                        f"shards. Escape: concatenate the domain with "
+                        f"`scripts/build_doc_sidecar.py`'s source map (a `.bin`), or "
+                        f"doc_masking=false."
+                    )
+                # `check_min=False`: a packed row is one document, not a flat batch.
+                stream = ByteStream(path, batch, seq_len, ring_bytes=ring_bytes, check_min=False)
+                stream = DocPackedStream(stream, load_doc_starts(path))
+            else:
+                stream = open_source(
+                    path,
+                    batch,
+                    seq_len,
+                    seed=_stream_seed(self.seed, name),
+                    ring_bytes=ring_bytes,
+                )
+            self._streams[name] = stream
         self._step = 0
 
     @property
     def step(self) -> int:
-        """The step index of the NEXT batch."""
+        """The MICRO-batch index of the NEXT batch (one `next_batch()` call)."""
         return self._step
 
     @property
@@ -542,9 +592,35 @@ class MixtureStream:
 
     def next_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
         """One `[batch, seq_len]` window of inputs and the byte after each."""
+        if self.doc_masking:
+            loud(
+                "next_batch() on a doc_masking mixture: the window carries a loss "
+                "mask and dropping it would score padding and cross-document "
+                "targets. Escape: read `next_batch_masked()`, or doc_masking=false."
+            )
         name = source_for_step(self.plan, self._step, self.steps, self.seed)
         self._step += 1
-        return self._streams[name].next_batch()
+        stream = self._streams[name]
+        assert isinstance(stream, (ByteStream, ShardStream))
+        return stream.next_batch()
+
+    def next_batch_masked(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """One `doc_masking` window: inputs, targets and the `[batch, seq_len]` mask."""
+        assert self.doc_masking, "next_batch_masked on a flat mixture"
+        name = source_for_step(self.plan, self._step, self.steps, self.seed)
+        self._step += 1
+        stream = self._streams[name]
+        assert isinstance(stream, DocPackedStream)
+        return stream.next_batch_masked()
+
+    def doc_counts(self) -> dict[str, int]:
+        """Boundary counters summed over every packed source (the arm's evidence)."""
+        out: dict[str, int] = {}
+        for stream in self._streams.values():
+            if isinstance(stream, DocPackedStream):
+                for k, v in stream.counts.items():
+                    out[k] = out.get(k, 0) + v
+        return out
 
     def rewind(self) -> None:
         """Back to step 0 and every source's start — what an eval needs."""
@@ -552,13 +628,13 @@ class MixtureStream:
             stream.rewind()
         self._step = 0
 
-    def skip_bytes(self, n: int, *, budget: int | None = None) -> None:
+    def skip_bytes(self, n: int) -> None:
         """Fast-forward the whole mixture `n` bytes (resume), per source exactly.
 
-        The trainer passes `start × (seq_len + 1) × batch` bytes. `budget` is the
-        step budget the fast-forwarded steps were taken under (see
-        `skip_to_step`): the checkpoint's stored `steps` on a resume that
-        EXTENDS the run, `None` when the budget did not change.
+        The trainer passes `start × (seq_len + 1) × batch` bytes. Because the
+        source of every step is a pure function of the step index, each source is
+        advanced by the bytes IT would have served — so a resumed run continues on
+        unseen bytes and lands on the same mixture as an unbroken one.
         """
         if n < 0:
             loud(f"skip_bytes({n}): a negative fast-forward is a rewind")
@@ -568,39 +644,38 @@ class MixtureStream:
                 f"(batch={self.batch}, seq_len={self.seq_len}). Escape: pass "
                 f"steps × (seq_len + 1) × batch."
             )
-        self.skip_to_step(n // self.window, budget=budget)
-
-    def skip_to_step(self, step: int, *, budget: int | None = None) -> None:
-        """Fast-forward to the STEP INDEX `step`, replaying the schedule the run used.
-
-        The resume position is a function of the steps already taken, not of the
-        new run's budget. `steps` is an exempt progress key, so extending a
-        mixture run changes the stage boundaries (`stage_bounds(plan, steps)`);
-        replaying the prefix under the NEW budget assigns already-taken steps to
-        different sources and lands every source's cursor on the wrong byte
-        (review round 3 R3-4). `budget` is the budget in force for steps
-        `[0, step)` — the checkpoint snapshot's `steps`, which `load_ckpt`
-        returns. After the fast-forward `next_batch` uses THIS stream's budget,
-        i.e. the extended schedule starts at `step`.
-
-        `budget=None` means "the budget did not change": the current stream's
-        own `steps`, which is exact for a plain resume and for any caller that
-        has no snapshot.
-        """
-        if step < 0:
-            loud(f"skip_to_step({step}): a negative fast-forward is a rewind")
-        schedule = self.steps if budget is None else budget
+        steps = n // self.window
+        if self.doc_masking:
+            served_steps = replay_steps(
+                self.plan,
+                steps=self.steps,
+                upto=steps,
+                seed=self.seed,
+            )
+            for name, stream in self._streams.items():
+                assert isinstance(stream, DocPackedStream)
+                stream.skip_steps(served_steps[name])
+            self._step = steps
+            return
         served = replay_bytes(
             self.plan,
-            steps=schedule,
-            upto=step,
+            steps=self.steps,
+            upto=steps,
             batch=self.batch,
             seq_len=self.seq_len,
             seed=self.seed,
         )
         for name, stream in self._streams.items():
             stream.skip_bytes(served[name])
-        self._step = step
+        self._step = steps
+        # The resume contract: `steps` micro-batches were replayed, so the next
+        # draw is the one an unbroken run would make (the stage and source are
+        # pure functions of this index), and every source got exactly its share.
+        assert self._step == steps
+        assert sum(served.values()) == n, (
+            f"skip_bytes({n}): the replay served {sum(served.values())} B, not the "
+            f"whole fast-forward"
+        )
 
     def close(self) -> None:
         for stream in self._streams.values():
@@ -616,13 +691,25 @@ def open_mixture(
     seed: int | None = None,
     max_epochs: float | None = None,
     ring_bytes: int = DEFAULT_RING,
+    doc_masking: bool = False,
 ) -> MixtureStream:
     """Load a plan, run the epoch-cap guard, and build the stream — one call.
 
-    This is what the trainer's data seam calls when `mix_plan` is set:
+    `steps` is the MICRO-batch budget (the number of `next_batch()` calls the
+    run will make: `train.steps × grad_accum`) — the same unit the stream
+    counts, so the stage schedule and `check_epoch_cap` cannot disagree. This
+    is what the trainer's data seam calls when `mix_plan` is set:
     `MixtureStream(load_mix_plan(p), batch, seq_len, steps)` plus the refusal,
     which is the part a caller must not be able to forget.
     """
     plan = load_mix_plan(plan_path)
     check_epoch_cap(plan, steps=steps, batch=batch, seq_len=seq_len, max_epochs=max_epochs)
-    return MixtureStream(plan, batch, seq_len, steps, seed=seed, ring_bytes=ring_bytes)
+    return MixtureStream(
+        plan,
+        batch,
+        seq_len,
+        steps,
+        seed=seed,
+        ring_bytes=ring_bytes,
+        doc_masking=doc_masking,
+    )

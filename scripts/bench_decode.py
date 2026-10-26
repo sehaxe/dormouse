@@ -52,39 +52,14 @@ from dormouse.model import DormouseModel
 from dormouse.model.decode import decode_bytes, recurrent_decode
 from dormouse.train.loop import load_model_half, load_model_state
 
+# `scripts/` is not a package (a test loads this file by path): the lane guard is
+# a sibling file, so its directory goes on the path, APPENDED not inserted (a
+# script name at the front of `sys.path` would shadow a package of that name).
+sys.path.append(str(Path(__file__).resolve().parent))
+from _lane import preflight  # noqa: E402
+
 #: The context ladder the headline is quoted at (prompt bytes).
 CONTEXTS = (512, 1024, 2048, 4096)
-
-
-def preflight() -> str | None:
-    """`None` when the card may be used, else why not (AGENTS §1.5)."""
-    if not torch.cuda.is_available():
-        return "no CUDA device: this bench measures the card, a CPU run would measure the host"
-    try:
-        training = subprocess.run(
-            ["pgrep", "-af", "dormouse trai[n]"], capture_output=True, text=True, timeout=15
-        ).stdout.strip()
-        battery = subprocess.run(
-            ["pgrep", "-af", r"ab_[a-z0-9_]*\.p[y]"], capture_output=True, text=True, timeout=15
-        ).stdout.strip()
-        used = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        ).stdout.strip()
-    except Exception as e:  # noqa: BLE001 - a bench's precondition, not a run's
-        return f"cannot check the card ({e})"
-    if training:
-        return f"a training run is live: {training.splitlines()[0]}"
-    if battery:
-        return f"an A/B battery driver is live: {battery.splitlines()[0]}"
-    # `nvidia-smi --format=csv,noheader` prints `694 MiB`: the NUMBER is the first
-    # whitespace token (splitting on the comma leaves `694 MiB` and `int()` dies).
-    mib = int(used.split()[0]) if used else -1
-    if mib >= 1024:
-        return f"the card already holds {mib} MiB ({used})"
-    return None
 
 
 def prompt_of(length: int) -> bytes:
@@ -108,7 +83,23 @@ def main() -> int:
     dev = args.device
 
     if dev == "cuda":
-        reason = preflight()
+        busy = subprocess.run(
+            ["pgrep", "-af", r"ab_[a-z0-9_]*\.p[y]"], capture_output=True, text=True
+        ).stdout.strip()
+        reason = preflight("cuda") or (
+            f"an A/B battery driver is live: {busy.splitlines()[0]}" if busy else None
+        )
+        if reason is None:
+            # This driver's own ceiling is 1 GiB, tighter than the lane guard's 2.0:
+            # a card already holding a second model is contended however idle it looks.
+            smi = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            if smi and int(smi.split()[0]) >= 1024:
+                mib = smi.split()[0]
+                reason = f"the card already holds {mib} MiB (this driver's ceiling is 1024)"
         if reason is not None:
             print(f"[SKIP] {reason}")
             print(
@@ -117,10 +108,8 @@ def main() -> int:
             )
             return 0
     else:
-        print(
-            f"[NOTE] --device {dev}: this measures the HOST, not the card — the s/byte "
-            "SHAPE is the claim, the absolute rate is not a GPU number"
-        )
+        print(f"[NOTE] --device {dev}: this measures the HOST, not the card — the s/byte "
+              "SHAPE is the claim, the absolute rate is not a GPU number")
 
     out_dir = Path(args.out_dir)
     run = _snapshot_run(out_dir, args.ckpt_name)
@@ -192,10 +181,8 @@ def main() -> int:
     for ctx in contexts:
         chunked = rows[(ctx, "chunked")][1]
         recurrent = rows[(ctx, "recurrent")][1]
-        print(
-            f"  context {ctx:>5}: chunked {chunked:>9.1f} B/s · recurrent {recurrent:>9.1f} "
-            f"B/s · {recurrent / max(chunked, 1e-9):>6.2f}x"
-        )
+        print(f"  context {ctx:>5}: chunked {chunked:>9.1f} B/s · recurrent {recurrent:>9.1f} "
+              f"B/s · {recurrent / max(chunked, 1e-9):>6.2f}x")
     print(
         "\nread it: `gen B/s` is the per-byte generation rate with the O(context) part\n"
         "of a call cancelled; `total B/s` charges the recurrent arm's prefill (one\n"

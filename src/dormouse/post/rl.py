@@ -33,7 +33,12 @@ percentile of the SUCCESSFUL lengths in the prompt's group, the gate is the
 group's pass rate > A, and below the gate the term is **inactive and COUNTED**
 (`rl_len_penalty_gated`) — a no-op that cannot look like a mechanism. The X/B/A/
 δ/s/γ arguments are placeholders the notes leave to us; the shipped default is
-`length_penalty = 0.0`, i.e. OFF, because nobody has measured them at this scale.
+`length_penalty = 0.1`, measured by `scripts/measure_rl_length.py` (2026-10-23,
+2 500-task corpus, 200 math tasks): the longest correct answer is 1.364x the
+median correct length (15 B vs 11 B), so at `s = 0.5` its ramp is 0.727 and
+X = 0.1 costs it 7.3 % of a passing reward — the largest X in the 10 % budget.
+X = 0.2 would cost 14.5 %, over the budget. B/A/δ/s/γ keep the notes' sourced
+defaults.
 
 **Named deviations** (ADR-0011): no `--grade add|none` (the multiplicative shape
 is the one this lane ships), no importance-sampling clip and no staleness (this
@@ -81,15 +86,19 @@ class RLConfig:
     """The reward/advantage knobs in one dataclass.
 
     The notes' placeholders (X/B/A/δ/s/γ, with their sourced ranges in the
-    comments) are fields here; the defaults are the SHIPPED ones, and the length
-    penalty's default is OFF because the notes' §3.1 "ARGUMENTS TO FILL" says
-    nobody has measured them at our scale yet.
+    comments) are fields here; the defaults are the SHIPPED ones. X = 0.1 is
+    the one default this lane MEASURED (`scripts/measure_rl_length.py`, 2026-10-23):
+    the correct-answer length spread is 1.364x at its longest, so 0.1 spends
+    only 7.3 % of a passing reward ranking verbose vs terse passes. B/A/s/γ
+    keep the notes' sourced values.
     """
 
     #: `S_sol`'s proxy: "thrift" (bytes vs the reference) or "none" (`S_sol = 1`).
     quality: str = "thrift"
-    #: X — the penalty's ceiling, 0.2-0.5 when measured; 0.0 disables the term.
-    length_penalty: float = 0.0
+    #: X — the penalty's ceiling; 0.0 disables the term. 0.1 is measured, see
+    #: `scripts/measure_rl_length.py` (max/median correct length 1.364 → ramp
+    #: 0.727 at `s = 0.5`, so the longest pass loses 7.3 % of its reward).
+    length_penalty: float = 0.1
     #: B — the percentile of the SUCCESSFUL lengths that sets `ℓ*_q`, 0.5-0.75.
     quantile: float = 0.5
     #: A — the group pass rate the term needs, 0.3-0.5.
@@ -103,6 +112,10 @@ class RLConfig:
     #: The loss normaliser: "prompt-mean" (this lane's rule) or "token-mean" (the
     #: control arm the notes' §4.2 A/B names).
     agg: str = "prompt-mean"
+    #: The counterfactuals a call-bearing turn needs before `agent_rl` believes
+    #: its fork-replay mean. 1 is the floor: with none the "advantage" would be
+    #: the raw pass flag, i.e. the fork estimator silently replaced by another.
+    min_replays: int = 1
 
     def __post_init__(self) -> None:
         if self.quality not in ("thrift", "none"):
@@ -137,6 +150,11 @@ class RLConfig:
             )
         if self.gamma <= 0.0:
             loud(f"RLConfig gamma={self.gamma}: γ is the ramp's exponent, so γ > 0.")
+        if self.min_replays < 1:
+            loud(
+                f"RLConfig min_replays={self.min_replays}: a fork needs at least one "
+                f"replayed continuation (0 would make the advantage the raw pass flag)."
+            )
 
 
 @dataclass(frozen=True)

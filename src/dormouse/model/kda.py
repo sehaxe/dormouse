@@ -83,8 +83,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from ..instrument import Counters
-from .tsct import qat_linear
+from ..instrument import Counters, loud
+from .tsct import dense_qat_kind, qat_linear
 
 #: Cached warmup verdict per device TYPE: `{"cuda": (ok, why), "cpu": (ok, why)}`.
 _FLA: dict[str, tuple[bool, str]] = {}
@@ -208,17 +208,84 @@ class KDAAttention(nn.Module):
         assert h * cfg.head_dim == d, "validate() pins n_heads*head_dim == d_model"
         self.n_heads = h
         self.head_dim = cfg.head_dim
+        #: GQA (`n_kv_heads`): the k/v PROJECTION width, expanded back to `h`
+        #: immediately before the kernel. `0` resolves to `h` = MHA, so the OFF
+        #: path is the four `d×d` projections every number on record ran.
+        self.kv_heads = cfg.n_kv_heads or h
+        if self.kv_heads < 0 or self.kv_heads > h:
+            loud(
+                f"n_kv_heads={cfg.n_kv_heads}: GQA needs 0 (off/MHA) or a count "
+                f"in 1..n_heads={h}; there cannot be more KV heads than queries."
+            )
+        if h % self.kv_heads:
+            loud(
+                f"n_kv_heads={self.kv_heads} does not divide n_heads={h}: the "
+                f"expansion is `repeat_interleave(n_heads // n_kv_heads)`, so a "
+                f"ragged group has no valid mapping. Escape: a divisor of n_heads."
+            )
+        self.kv_width = self.kv_heads * cfg.head_dim
+        #: MLA-style shared latent (`attn_latent_rank`): ONE `d → r` projection
+        #: feeds the four `r → out` projections. `0` = off, four `d×d` linears.
+        self.attn_latent_rank = cfg.attn_latent_rank
+        if self.attn_latent_rank < 0:
+            loud(f"attn_latent_rank={self.attn_latent_rank}: 0 is OFF, so a rank is >= 1.")
         self.scale = 1.0 / math.sqrt(cfg.head_dim)
         self.compute_dtype = torch.bfloat16 if cfg.bf16 else torch.float32
         #: The DENSE path's switch (`tsct.dense_qat_project`, the SAME projector
         #: as the factor rung): `q/k/v/g/beta` are plain `nn.Linear`s, so their
         #: weights are read through the annealed STE. `dense_qat_alpha` is the
-        #: SAME alpha the factor ramp sets (`set_factor_qat_alpha`).
-        self.dense_qat = cfg.dense_qat
+        #: SAME alpha the factor ramp sets (`set_factor_qat_alpha`). All five
+        #: sites are ATTENTION, so the default `dense_qat_skip_attn` keeps them
+        #: bf16 (the BitNet rule; `tsct.DENSE_QAT_ATTN_SITES` owns the list).
+        #: The latent down/up are the same kind of dense site in the same arm,
+        #: so they inherit the same kind.
+        self.dense_qat = dense_qat_kind(
+            cfg,
+            "loop.attn.q_proj",
+            "loop.attn.k_proj",
+            "loop.attn.v_proj",
+            "loop.attn.g_proj",
+            "loop.attn.beta_proj",
+        )
         self.dense_qat_alpha = cfg.factor_qat_alpha
-        for name in ("q_proj", "k_proj", "v_proj", "g_proj"):
-            setattr(self, name, nn.Linear(d, d, bias=False, device=device))
+        #: `None` when the latent is off — no module, no RNG draw, no state key.
+        self.latent_down = (
+            nn.Linear(d, self.attn_latent_rank, bias=False, device=device)
+            if self.attn_latent_rank
+            else None
+        )
+        # The four projections read `c` (the latent) when it is on, `x` when it
+        # is off. Order (q, k, v, g, beta) is the old `setattr` loop's draw
+        # order, so the OFF path's init is bit-identical.
+        in_features = self.attn_latent_rank or d
+        self.q_proj = nn.Linear(in_features, d, bias=False, device=device)
+        self.k_proj = nn.Linear(in_features, self.kv_width, bias=False, device=device)
+        self.v_proj = nn.Linear(in_features, self.kv_width, bias=False, device=device)
+        self.g_proj = nn.Linear(in_features, d, bias=False, device=device)
         self.beta_proj = nn.Linear(d, h, bias=False, device=device)
+
+    def _latent_base(self, x: torch.Tensor, dq: tuple[str, float]) -> torch.Tensor:
+        """`c = x @ W_down` (`[b,t,d] → [b,t,r]`), or `x` itself when off.
+
+        The OFF branch returns `x` unmodified — no matmul, no cast, no copy — so
+        the dense path is the call it was.
+        """
+        if self.latent_down is None:
+            return x
+        return qat_linear(self.latent_down, x, *dq)
+
+    def _kv(self, x: torch.Tensor, b: int, t: int) -> torch.Tensor:
+        """`[b,t,kv_heads,hd]` → `[b,t,n_heads,hd]`, immediately before the kernel.
+
+        `repeat_interleave` is GQA's group broadcast (Ainslie et al. 2023): each
+        KV head serves `n_heads // n_kv_heads` consecutive query heads. When the
+        group is 1 (MHA / `n_kv_heads = 0`) the tensor is returned as-is, so the
+        OFF path allocates nothing and the bits do not move.
+        """
+        y = x.reshape(b, t, self.kv_heads, self.head_dim)
+        if self.kv_heads == self.n_heads:
+            return y
+        return y.repeat_interleave(self.n_heads // self.kv_heads, dim=2)
 
     def projections(
         self, x: torch.Tensor
@@ -229,14 +296,21 @@ class KDAAttention(nn.Module):
         these ops) and it is also the port's head split, so nothing is
         transposed on the way into the kernel. `g` is log-space and fp32, which
         is what both the kernel and the recurrence reference read.
+
+        `attn_latent_rank` computes `c` ONCE and reads the four projections off
+        it; `n_kv_heads` leaves k/v at the KV width and expands them here, so
+        every consumer — this arm's kernel, the SDPA fallback, the decode step —
+        still sees `[b, t, h, hd]` for all four. Both OFF by default and both
+        branches collapse to the dense call.
         """
         b, t, _ = x.shape
         h, hd = self.n_heads, self.head_dim
         dq = (self.dense_qat, self.dense_qat_alpha)
-        q = qat_linear(self.q_proj, x, *dq).reshape(b, t, h, hd)
-        k = qat_linear(self.k_proj, x, *dq).reshape(b, t, h, hd)
-        v = qat_linear(self.v_proj, x, *dq).reshape(b, t, h, hd)
-        g = F.logsigmoid(qat_linear(self.g_proj, x, *dq).float()).reshape(b, t, h, hd)
+        c = self._latent_base(x, dq)
+        q = qat_linear(self.q_proj, c, *dq).reshape(b, t, h, hd)
+        k = self._kv(qat_linear(self.k_proj, c, *dq), b, t)
+        v = self._kv(qat_linear(self.v_proj, c, *dq), b, t)
+        g = F.logsigmoid(qat_linear(self.g_proj, c, *dq).float()).reshape(b, t, h, hd)
         beta = torch.sigmoid(qat_linear(self.beta_proj, x, *dq).float())  # [b, t, h]
         return q, k, v, g, beta
 
@@ -275,6 +349,13 @@ class KDAAttention(nn.Module):
         """
         b, t, d = x.shape
         counters = Counters() if counters is None else counters
+        if state is not None and not carry:
+            loud(
+                "kda.forward_state got a non-None `state` with `carry=False`: the "
+                "one-shot call drops the entering state, so the answer would be for a "
+                "different sequence. Escape: carry=True (the segmented path) or "
+                "state=None (this window starts at position 0)."
+            )
         ok, why = fla_status(x.device)
         if ok:
             counters.count("kda_fla")
@@ -293,20 +374,25 @@ class KDAAttention(nn.Module):
         state: torch.Tensor | None = None,
         counters: Counters | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """`x [b, 1, d]` + the state entering this token → (`[b, 1, d]`, the state leaving it).
+        """`x [b, t, d]` + the state entering the block → (`[b, t, d]`, the state leaving it).
 
-        The single-token DECODE step: the same gated-delta recurrence
-        `forward_state` computes over a window, one position at a time, with the
-        state CARRIED instead of recomputed — `O(1)` per byte instead of
-        `O(window)`.
+        The DECODE step: the same gated-delta recurrence `forward_state` computes
+        over a window, one position at a time, with the state CARRIED instead of
+        recomputed — `O(1)` per byte instead of `O(window)`. `t = 1` is the
+        per-byte decode step; `t > 1` is the block verify (`decode.recurrent_decode`
+        `decode_multibyte`), and the two MUST agree per token: the recurrence is
+        sequential (`S_p` reads `S_{p-1}`), so a block is the same arithmetic in
+        the same order, not a different reduction. (The projections are still ONE
+        batched GEMM for the block, so the block and the one-byte loop differ in
+        the last bits; `decode.py`'s docstring states that and its GPU gate pins
+        the greedy bytes.)
 
         * FLA live on this device (a CUDA box whose warmup passed): the vLLM-derived
           decode kernel `fused_recurrent_kda` (FLA 0.5.2, `fused_recurrent.py:336`)
           — `initial_state` in, `final_state` out, `[b, H, head_dim, head_dim]`
           fp32 on both sides, i.e. the same state `chunk_kda` returns from
           `forward_state`. **It ships no backward**, so it is taken only where
-          none is needed (the decode path runs under `no_grad`); a carried step
-          WITH a graph stays on `chunk_kda` and the torch arm below.
+          none is needed (the decode path runs under `no_grad`).
         * No FLA (CPU, or a card whose warmup fails): the exact torch recurrence
           (`_recurrent_step`), fp32, COUNTED `kda_step_torch` — a python loop over
           head_dim² is a real degradation and the counter is how the log says so.
@@ -319,7 +405,7 @@ class KDAAttention(nn.Module):
         `state=None` means position 0, exactly as `forward_state`.
         """
         b, t, d = x.shape
-        assert t == 1, f"step_state is the single-token decode step, got t={t}"
+        assert t >= 1, f"step_state needs at least one position, got t={t}"
         counters = Counters() if counters is None else counters
         q, k, v, g, beta = self.projections(x)
         ok, why = fla_status(x.device)
@@ -329,26 +415,57 @@ class KDAAttention(nn.Module):
             dt = self.compute_dtype
             if dt != torch.float32:
                 q, k, v, beta = q.to(dt), k.to(dt), v.to(dt), beta.to(dt)
-            out, ht = fused_recurrent_kda(
-                q,
-                k,
-                v,
-                g=g,
-                beta=beta,
-                scale=self.scale,
-                initial_state=state,
-                output_final_state=True,
-                use_qk_l2norm_in_kernel=True,
-            )
-            counters.count("kda_step")
+            # ONE position per kernel call, even for a block: `fused_recurrent_kda`
+            # with `T > 1` measured 1e-4/1e-3 from the same tokens stepped one at a
+            # time (fp32 state, this card), and the block verify's whole contract is
+            # "the same bytes the one-byte loop would emit". The projections above
+            # are still shared by the block; only the recurrence is unrolled.
+            outs: list[torch.Tensor] = []
+            ht = state
+            for p in range(t):
+                o, ht = fused_recurrent_kda(
+                    q[:, p : p + 1],
+                    k[:, p : p + 1],
+                    v[:, p : p + 1],
+                    g=g[:, p : p + 1],
+                    beta=beta[:, p : p + 1],
+                    scale=self.scale,
+                    initial_state=ht,
+                    output_final_state=True,
+                    use_qk_l2norm_in_kernel=True,
+                )
+                outs.append(o)
+            counters.count("kda_step", t)
+            out = outs[0] if t == 1 else torch.cat(outs, dim=1)
             assert out.shape == (b, t, self.n_heads, self.head_dim), f"step {tuple(out.shape)}"
             assert ht is not None and ht.dtype == torch.float32, "the step state is fp32"
             want = (b, self.n_heads, self.head_dim, self.head_dim)
             assert ht.shape == want, f"step state {tuple(ht.shape)} != {want}"
             return out.reshape(b, t, d), ht
-        counters.count("kda_step_torch")
-        counters.why = why  # type: ignore[attr-defined]
-        o, ht = _recurrent_step(q, k, v, g, beta, state, self.scale)
+        counters.count("kda_step_torch", t)
+        counters.why = (  # type: ignore[attr-defined]
+            "grad enabled: fused_recurrent_kda ships no backward, so the torch "
+            "recurrence ran"
+            if ok
+            else why
+        )
+        # The reference recurrence is written for ONE position; a block is the
+        # same loop unrolled, which is what keeps `t=1` and `t=k` identical.
+        # The multi-position form is what the decode graph steps.
+        outs: list[torch.Tensor] = []
+        ht = state
+        for p in range(t):
+            o, ht = _recurrent_step(
+                q[:, p : p + 1],
+                k[:, p : p + 1],
+                v[:, p : p + 1],
+                g[:, p : p + 1],
+                beta[:, p : p + 1],
+                ht,
+                self.scale,
+            )
+            outs.append(o)
+        o = outs[0] if len(outs) == 1 else torch.cat(outs, dim=1)
         return o.reshape(b, t, d), ht
 
     def _fla_path(
@@ -365,6 +482,13 @@ class KDAAttention(nn.Module):
         see the module docstring for the gradient side), so segment s's state is
         the graph edge into segment s+1.
         """
+        if state is not None and not carry:
+            loud(
+                "kda._fla_path got a non-None `state` with `carry=False`: the "
+                "one-shot arm neither passes `initial_state` nor returns a boundary "
+                "state, so the state would be silently dropped. Escape: carry=True, "
+                "or state=None."
+            )
         from fla.ops.kda import chunk_kda
 
         b, t, d = x.shape
@@ -442,9 +566,10 @@ class KDAAttention(nn.Module):
         is bit-identical to the one-shot call's own kernel.
         """
         dq = (self.dense_qat, self.dense_qat_alpha)
-        q = F.normalize(self._heads(qat_linear(self.q_proj, x, *dq), b, t), dim=-1)
-        k = F.normalize(self._heads(qat_linear(self.k_proj, x, *dq), b, t), dim=-1)
-        v = self._heads(qat_linear(self.v_proj, x, *dq), b, t)
+        c = self._latent_base(x, dq)
+        q = F.normalize(self._heads(qat_linear(self.q_proj, c, *dq), b, t), dim=-1)
+        k = F.normalize(self._heads(self._kv(qat_linear(self.k_proj, c, *dq), b, t), b, t), dim=-1)
+        v = self._heads(self._kv(qat_linear(self.v_proj, c, *dq), b, t), b, t)
         if state is None:
             kk, vv = k, v
             y = F.scaled_dot_product_attention(q * self.scale, kk, vv, is_causal=True)
@@ -459,7 +584,7 @@ class KDAAttention(nn.Module):
             cols = torch.arange(tp + t, device=x.device).view(1, -1)
             rows = torch.arange(t, device=x.device).view(-1, 1) + tp
             y = F.scaled_dot_product_attention(q * self.scale, kk, vv, attn_mask=cols <= rows)
-        gate = torch.sigmoid(qat_linear(self.g_proj, x, *dq))  # [b, t, d]
+        gate = torch.sigmoid(qat_linear(self.g_proj, c, *dq))  # [b, t, d]
         y = y.transpose(1, 2).reshape(b, t, d) * gate
         # The state returned is the ACCUMULATED context, not this window's own
         # keys: a third segment would otherwise read only the second one's keys

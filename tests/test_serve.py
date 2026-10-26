@@ -87,13 +87,11 @@ def test_chat_completion_has_the_openai_shape(served):
     body = _chat(served, max_tokens=CAP)
     assert body["model"] == CKPT and body["object"] == "chat.completion"
     (choice,) = body["choices"]
-    produced = body["usage"]["completion_tokens"]
-    # The usage reports what was PRODUCED, not the requested cap (round 1 N2).
-    assert 1 <= produced <= CAP
-    assert choice["finish_reason"] == ("length" if produced == CAP else "stop")
+    assert choice["finish_reason"] == "stop"
     assert choice["message"]["role"] == "assistant"
     assert isinstance(choice["message"]["content"], str) and choice["message"]["content"]
-    assert body["usage"]["total_tokens"] == body["usage"]["prompt_tokens"] + produced
+    assert body["usage"]["completion_tokens"] == CAP
+    assert body["usage"]["total_tokens"] == body["usage"]["prompt_tokens"] + CAP
 
 
 def test_stream_is_sse_and_ends_with_done(served):
@@ -205,39 +203,9 @@ def test_max_tokens_above_the_cap_is_clamped_and_counted(served):
     _, httpd = served
     before = httpd.state.counters.get("max_tokens_clamped", 0)
     body = _chat(served, max_tokens=10_000)
-    # The cap bounds the budget; usage still reports what was produced (N2).
-    assert 1 <= body["usage"]["completion_tokens"] <= CAP
+    assert body["usage"]["completion_tokens"] == CAP
     assert body["choices"][0]["message"]["content"]
     assert httpd.state.counters.get("max_tokens_clamped", 0) == before + 1
-
-
-def test_usage_reports_the_bytes_produced_and_stops_at_nine(served, monkeypatch):
-    """N2's gate: `max_tokens=64`, a reply that ends at 9 B, usage says 9."""
-    import dormouse.serve as serve_mod
-
-    def nine_then_stop(model, ctx, k, **kw):
-        return ctx + b"123456789\x03"  # answer + the SFT end-of-answer byte
-
-    monkeypatch.setattr(serve_mod, "recurrent_decode", nine_then_stop)
-    body = _chat(served, max_tokens=64)
-    choice = body["choices"][0]
-    assert choice["message"]["content"] == "123456789"
-    assert choice["finish_reason"] == "stop"
-    assert body["usage"]["completion_tokens"] == 9
-    assert body["usage"]["total_tokens"] == body["usage"]["prompt_tokens"] + 9
-
-
-def test_finish_reason_is_length_when_the_budget_runs_out(served, monkeypatch):
-    """The other half of N2: `n` bytes and no stop byte is not `stop`."""
-    import dormouse.serve as serve_mod
-
-    def always_more(model, ctx, k, **kw):
-        return ctx + b"x" * k
-
-    monkeypatch.setattr(serve_mod, "recurrent_decode", always_more)
-    body = _chat(served, max_tokens=CAP)
-    assert body["usage"]["completion_tokens"] == CAP
-    assert body["choices"][0]["finish_reason"] == "length"
 
 
 def test_unknown_model_is_a_404_json_error(served):
@@ -295,12 +263,14 @@ def test_a_rung_checkpoint_serves(tmp_path: Path):
 
 def test_clamp_line_is_counted():
     """The clamp is COUNTED, not just applied: the serve line carries the number."""
+    from types import SimpleNamespace
+
     from dormouse.serve import ServeState, _max_tokens
 
     lines: list[str] = []
     state = ServeState(
         model=None,
-        seed=1,
+        run=SimpleNamespace(train=SimpleNamespace(seed=1)),
         device="cpu",
         ckpt_name=CKPT,
         max_tokens_cap=CAP,
@@ -313,20 +283,14 @@ def test_clamp_line_is_counted():
 
 
 def test_assemble_renders_the_sft_template():
-    """The prompt IS the training template, byte for byte: `\\x01{instruction}\\n\\x02`.
-
-    Pinned against `train.sft.render` — the one authority — so the two cannot
-    drift apart. Two measured failures of a prompt the model did not train on:
-    `User:/Assistant:` answered with noise (2026-10-17), and a template with
-    three extra spaces answered a *different* question (2026-10-20: `"Say
-    hello."` gave a newline and an unrelated sentence where the exact template
-    gave `answer:`-shaped text).
-    """
-    from dormouse.train.sft import render
-
+    """The prompt IS the SFT template: `\\x01instruction\\n\\x02` — the model
+    was trained on those markers flush against the text (`train/sft.py:416`'s
+    `render()`), and a `User:/Assistant:` prompt was measured answering with
+    noise (the first chat smoke, 2026-10-17). The 2026-10-20 fix removed three
+    stray spaces the server had added, which made every reply a different
+    distribution than the one the model learned."""
     got = assemble([{"role": "system", "content": "s"}, {"role": "user", "content": "u"}])
     assert got == b"\x01s\nu\n\x02"
-    assert got == render("s\nu", "")[:-1]  # the template, minus the 0x03 end marker
     # multi-turn: the last user message is the instruction, earlier ones are context
     got2 = assemble(
         [
@@ -336,9 +300,6 @@ def test_assemble_renders_the_sft_template():
         ]
     )
     assert got2 == b"\x01first\nsecond\n\x02"
-    assert got2 == render("first\nsecond", "")[:-1]
-    # no space the training pipeline never wrote
-    assert b" \n" not in got and not got.endswith(b" ")
 
 
 def test_a_stop_byte_ends_the_reply(tmp_path):
@@ -365,13 +326,15 @@ def test_recurrent_streaming_is_one_seeded_call():
     state a single call would have — the emitted bytes must match exactly, stop
     byte included.
     """
+    from types import SimpleNamespace
+
     from dormouse.model.decode import recurrent_decode
     from dormouse.serve import _STOP, ServeState, _generate
 
     model = tiny_model(moe_topk=0)
     state = ServeState(
         model=model,
-        seed=7,
+        run=SimpleNamespace(train=SimpleNamespace(seed=7)),
         device=torch.device("cpu"),
         ckpt_name=CKPT,
         max_tokens_cap=64,

@@ -40,6 +40,19 @@ burn code, not an addition — a Sinkhorn L1 balancing of the update block every
 `sinkhorn_l1`), because the batch's rows are a skewed sample of the table. Weight
 decay is disabled on this path, as on the burn side.
 
+**The bias correction on top of it** (`TrainConfig.engram_bias_correction`,
+default on). Burn's look-ahead is an exponential sum whose total weight depends
+on how many times the ROW has been touched: `block_t = (1-μ^{t+1})·g` for a
+constant gradient, so a row touched once moves by `1-μ² = 0.0975` of its
+gradient and needs ~`1/(1-μ) = 20` touches to reach full scale. That is right
+for burn's 48M-row / 300k-step production table and wrong for a 600-step
+screen, where most rows never get there. With the correction the block is
+divided by that weight, `1-μ^{t+1}` (`t` = the row's OWN touch count, not the
+global step: a global step over-corrects a row first touched at step 500), so
+the first touch is exactly the gradient and a row with `t ≥ 337` (measured) divides by
+`1.0` in fp32 — bit-unchanged. `false` is burn's formula verbatim, the A/B's
+`ram_old_formula` arm.
+
 What the host path does NOT do, and why that is honest: the rows that cross the
 bus are `[unique, dim]` fp32 per forward and the grads `[unique, dim]` back per
 step — the burn reference's own copy. There is no prefetch stream and no pinned
@@ -162,13 +175,20 @@ class HostTables:
     Layout `[orders, slots, dim]`, contiguous, so a row's ABSOLUTE index is
     `order * slots + slot`; the slot is the masked key, in range by
     construction, so no bound check is needed here (burn's `unique_rows`). The
-    only optimizer state is `momentum`, same layout (DeepSeek V4.1-Flash §2.3
-    via burn's `HostNgram`: one buffer instead of Adam's m+v, no weight decay);
-    `step` counts host updates and decides the Sinkhorn cadence.
+    optimizer state is `momentum`, same layout, plus `counts`, one int32 TOUCH
+    COUNT per row (flat `[orders*slots]`, never per dim — the update is one row
+    vector). The count is what the bias correction needs; `step` counts host
+    updates and decides the Sinkhorn cadence.
     """
 
     def __init__(
-        self, rows: torch.Tensor, momentum: torch.Tensor | None = None, step: int = 0
+        self,
+        rows: torch.Tensor,
+        momentum: torch.Tensor | None = None,
+        step: int = 0,
+        counts: torch.Tensor | None = None,
+        *,
+        bias_correction: bool = True,
     ) -> None:
         assert rows.dtype is torch.float32, f"host tables are fp32, got {rows.dtype}"
         assert rows.device.type == "cpu", f"host tables live on cpu, got {rows.device}"
@@ -176,6 +196,14 @@ class HostTables:
         self.momentum = torch.zeros_like(rows) if momentum is None else momentum
         self.step = int(step)
         assert self.momentum.shape == rows.shape, "momentum must mirror the tables"
+        n_rows = rows.numel() // rows.shape[-1]
+        self.counts = torch.zeros(n_rows, dtype=torch.int32) if counts is None else counts
+        assert self.counts.shape == (n_rows,), (
+            f"counts {tuple(self.counts.shape)} != ({n_rows},) — one per row"
+        )
+        assert self.counts.dtype is torch.int32, f"counts are int32, got {self.counts.dtype}"
+        assert self.counts.device.type == "cpu", "counts live on cpu"
+        self.bias_correction = bool(bias_correction)
 
     @property
     def shape(self) -> tuple[int, ...]:
@@ -190,12 +218,20 @@ class HostTables:
         return self.rows.reshape(-1, self.dim)
 
     def momentum_update(self, uniq: torch.Tensor, grads: torch.Tensor, lr: float) -> int:
-        """Nesterov + (every 4th) Sinkhorn on the TOUCHED rows only; returns rows.
+        """Nesterov + bias correction + (every 4th) Sinkhorn on the TOUCHED rows.
 
         burn's `momentum_update` line for line: `m = μ·m + (1-μ)·g`, the applied
         block is the look-ahead `μ·m_new + (1-μ)·g`, the table moves
         `t -= lr·block`, and the whole block is Sinkhorn-balanced before it is
         applied on every `HOST_SINKHORN_EVERY`-th update.
+
+        The correction (`bias_correction`, default on) divides the block by the
+        look-ahead's total weight `1-μ^{t+1}` on each row, `t` = that row's
+        touch count after this update. It is applied AFTER Sinkhorn on purpose:
+        Sinkhorn normalises the block's rows, so a scale applied before it is
+        partly normalised away, and the correction must survive to the update.
+        A row at `t ≥ 337` (measured) gets a divisor of exactly `1.0` in fp32, so its
+        update is bit-identical to burn's.
         """
         n = int(uniq.numel())
         if n == 0:
@@ -207,8 +243,23 @@ class HostTables:
         moved = HOST_MOMENTUM * m[uniq] + (1.0 - HOST_MOMENTUM) * grads
         m[uniq] = moved
         block = HOST_MOMENTUM * moved + (1.0 - HOST_MOMENTUM) * grads
+        # Every touch is counted even on the old-formula arm: the count is the
+        # row's history, and a checkpoint must not lose it because an A/B arm
+        # happened to run without the correction.
+        self.counts[uniq] += 1
         if self.step % HOST_SINKHORN_EVERY == 0:
             block = sinkhorn_l1(block, HOST_SINKHORN_ITERS)
+        if self.bias_correction:
+            # The look-ahead contains the current gradient twice — once through
+            # `m`, once as its own `(1-μ)` term — so after `t` touches its total
+            # weight is Σ_{k=0}^{t} μ^k = (1-μ^{t+1})/(1-μ), not `1-μ^t`.
+            # Dividing the BLOCK by it (not `m` alone) is the correction of the
+            # quantity actually applied.
+            touched = self.counts[uniq].to(torch.float64) + 1.0
+            denom = 1.0 - torch.pow(
+                torch.tensor(HOST_MOMENTUM, dtype=torch.float64), touched
+            )
+            block = block / denom.to(block.dtype).unsqueeze(1)
         t[uniq] = t[uniq] - lr * block
         return n
 
@@ -338,7 +389,7 @@ class Engram(nn.Module):
         self._pending.append((leaf, uniq))
         return self._read(hidden, emb, counters)
 
-    def to_host(self) -> None:
+    def to_host(self, *, bias_correction: bool = True) -> None:
         """Move the tables OFF the module into plain CPU fp32 memory.
 
         `del self.tables` is the point of the path, not bookkeeping: the
@@ -347,10 +398,13 @@ class Engram(nn.Module):
         VRAM the tables occupied is freed here. The values are COPIED (a device
         parameter would otherwise keep its allocation alive), and the resume
         path's state is the sibling `<ckpt>.ngram` file, not this dict.
+
+        `bias_correction` is the update's formula (`HostTables`); the fresh
+        counter starts at zero, which is the truth: no row has been updated.
         """
         assert self.host is None, "engram tables are already on host"
         rows = self.tables.detach().to("cpu").contiguous().clone()
-        self.host = HostTables(rows)
+        self.host = HostTables(rows, bias_correction=bias_correction)
         del self.tables
 
     def drop_pending(self) -> None:
@@ -364,8 +418,15 @@ class Engram(nn.Module):
         """
         self._pending = []
 
-    def host_step(self, lr: float) -> tuple[int, int]:
+    def host_step(self, lr: float, scale: float = 1.0) -> tuple[int, int]:
         """The ONE host update a TRAINING step gets: `(updates, rows)`.
+
+        `scale` is the trainer's device firewall, already read on this arm
+        (the row gradients come D2H here every step, so the flag rides an
+        existing declared read): `0.0` means the step was non-finite, and the
+        update is the OLD skip branch exactly — the pending leaves are dropped
+        and neither the tables nor their momentum move. `1.0` is the healthy
+        step, unchanged.
 
         Called by the trainer after `loss.backward()` + `opt.step()` — once per
         step, never per forward (the burn bug this rule exists for is the
@@ -385,6 +446,12 @@ class Engram(nn.Module):
         """
         assert self.host is not None, "host_step on an in-VRAM Engram"
         pending, self._pending = self._pending, []
+        if scale <= 0.0:
+            # The device firewall's skip, on the substrate that has to see the
+            # flag on the host: drop the leaves, move nothing (the old skip).
+            for leaf, _ in pending:
+                leaf.grad = None
+            return (0, 0)
         grads = [
             leaf.grad.detach().to("cpu").reshape(-1, self.dim)
             for leaf, _ in pending
@@ -408,36 +475,51 @@ def host_engrams(model: nn.Module) -> list[Engram]:
     return [m for m in model.modules() if isinstance(m, Engram) and m.host is not None]
 
 
-def enable_host_tables(model: nn.Module) -> int:
+def enable_host_tables(model: nn.Module, *, bias_correction: bool = True) -> int:
     """Switch every Engram in `model` to host tables; returns how many did.
 
     Called by the trainer at setup, BEFORE the optimizer is built — the tables
     must never enter a parameter group. Zero means the run asked for host tables
     and there are none (`use_engram = false`), which the caller reports LOUD.
+    `bias_correction` is the host update's formula; it is set on tables that are
+    ALREADY host too, so a checkpoint loader can apply the resolved config to a
+    model another call switched (the counter and tables are unchanged).
     """
     n = 0
     for m in model.modules():
-        if isinstance(m, Engram) and m.host is None:
-            m.to_host()
-            n += 1
+        if isinstance(m, Engram):
+            if m.host is None:
+                m.to_host(bias_correction=bias_correction)
+                n += 1
+            else:
+                m.host.bias_correction = bool(bias_correction)
     return n
 
 
-def host_step_all(model: nn.Module, lr: float) -> tuple[int, int]:
-    """The trainer's one host update per step, over the whole tree."""
+def host_step_all(model: nn.Module, lr: float, scale: float = 1.0) -> tuple[int, int]:
+    """The trainer's one host update per step, over the whole tree.
+
+    `scale` is the device firewall's decision for this step (see
+    `Engram.host_step`); the default keeps the pre-firewall caller unchanged.
+    """
     updates = rows = 0
     for m in host_engrams(model):
-        u, r = m.host_step(lr)
+        u, r = m.host_step(lr, scale)
         updates += u
         rows += r
     return (updates, rows)
 
 
 def host_state(model: nn.Module) -> dict:
-    """The `<ckpt>.ngram` payload: tables + momentum + step, one entry per Engram."""
+    """The `<ckpt>.ngram` payload: tables + momentum + step + counts, per Engram."""
     return {
         "engrams": [
-            {"rows": m.host.rows, "momentum": m.host.momentum, "step": m.host.step}
+            {
+                "rows": m.host.rows,
+                "momentum": m.host.momentum,
+                "step": m.host.step,
+                "counts": m.host.counts,
+            }
             for m in host_engrams(model)
         ]
     }
@@ -451,6 +533,13 @@ def load_host_state(model: nn.Module, state: dict) -> None:
     silently-mismatched pair would train a different network than the one the
     step count claims, which is the `7adda92` class (a `.ngram` sidecar that did
     not travel with the weights).
+
+    A file WITHOUT `counts` predates the bias correction and is REFUSED, not
+    defaulted: the counter is the per-row history the corrected formula needs,
+    and every guess (0, 1, the global step) changes what the next update does
+    under the same step count. Refusing keeps the old run resumable on the
+    commit that wrote it and makes a new run say so with its own `ckpt_name`;
+    a silent default would be ADR-0021's defect with an extra number.
     """
     eng = host_engrams(model)
     sets = state.get("engrams") if isinstance(state, dict) else None
@@ -468,8 +557,28 @@ def load_host_state(model: nn.Module, state: dict) -> None:
                 f"engram_rows/engram_orders/engram_dim changed since the save. Escape: "
                 f"the saved config, or a new ckpt_name."
             )
+        if "counts" not in s:
+            loud(
+                f"the host-table file carries no per-row touch counter (`counts`): it was "
+                f"written before the Engram update's bias correction, which needs each "
+                f"row's own history (`1-{HOST_MOMENTUM}^(t+1)`). Loading it with a "
+                f"guessed counter (0, 1 or the global step) would apply a different "
+                f"optimizer under the same step count (ADR-0021). Escape: resume on the "
+                f"commit that wrote it, or start a new ckpt_name and let the memory "
+                f"retrain with the corrected formula."
+            )
+        counts = s["counts"]
+        if tuple(counts.shape) != (m.host.counts.numel(),) or (
+            counts.dtype is not torch.int32
+        ):
+            loud(
+                f"host counts {tuple(counts.shape)}:{counts.dtype} != "
+                f"({m.host.counts.numel()},):torch.int32 — one int32 per table row. "
+                f"Escape: the saved config's engram_rows/orders, or a new ckpt_name."
+            )
         m.host.rows.copy_(s["rows"])
         m.host.momentum.copy_(s["momentum"])
+        m.host.counts.copy_(counts)
         m.host.step = int(s["step"])
 
 

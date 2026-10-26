@@ -176,6 +176,40 @@ def test_step_state_returns_the_state_the_chunked_arm_returns():
     assert c["kda_step_torch"] == 4, c.line()
 
 
+def test_the_torch_step_names_the_real_reason(monkeypatch):
+    """`counters.why` is the ARM's reason, not the FLA warmup's stale "ok".
+
+    With FLA healthy and grad enabled, the torch recurrence runs because the
+    fused decode kernel ships no backward — the old code copied `fla_status`'s
+    "warmup ok" into `why`, which reads as if the fused arm ran.
+    """
+    from dormouse.model import kda as kda_mod
+
+    monkeypatch.setattr(kda_mod, "fla_status", lambda dev: (True, "warmup ok"))
+    torch.manual_seed(0)
+    attn = KDAAttention(tiny_cfg(), device="cpu").eval()
+    x = torch.randn(1, 1, attn.n_heads * attn.head_dim, requires_grad=True)
+    c = Counters()
+    _out, st = attn.step_state(x, None, counters=c)
+    print(f"[step reason] {c.line()} why={c.why}")
+    assert c["kda_step_torch"] == 1, c.line()
+    assert "grad enabled" in c.why and "warmup ok" not in c.why, c.why
+    assert st.dtype == torch.float32
+
+
+def test_a_state_without_carry_is_refused_in_both_paths():
+    """A non-None `state` with `carry=False` would be SILENTLY dropped; refuse."""
+    torch.manual_seed(0)
+    attn = KDAAttention(tiny_cfg(), device="cpu").eval()
+    x = torch.randn(1, 2, attn.n_heads * attn.head_dim)
+    state = torch.zeros(1, attn.n_heads, attn.head_dim, attn.head_dim)
+    with pytest.raises(LoudError, match="carry"):
+        attn.forward_state(x, state, carry=False)
+    # The fused path's own guard, before its `import fla` — so this is a CPU gate.
+    with pytest.raises(LoudError, match="carry"):
+        attn._fla_path(x, state, carry=False)
+
+
 # -------------------------------------------- (b) the one-byte body IS the window body
 
 

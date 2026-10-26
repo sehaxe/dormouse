@@ -3,12 +3,12 @@
 **2026-10-18.** Research + one local probe. No code changed, nothing committed.
 Trigger (given by the task, not re-measured here): `torch.compile(dynamic=True)` on the
 port hits `torch._dynamo hit config.recompile_limit (8)` in `SparseMoE._banks`
-(`port/src/dormouse/model/experts.py:536-585`) at 2939 ms/step vs 573 eager (0.20x);
+(`src/dormouse/model/experts.py:536-585`) at 2939 ms/step vs 573 eager (0.20x);
 `dynamic=False` at b1 never produced a step (>45 min compile).
 
 ## 0. What `_banks` actually keys on (read first, options target this)
 
-- `_banks` (`port/src/dormouse/model/experts.py:556-637`). Cache key at **585-590**:
+- `_banks` (`src/dormouse/model/experts.py:556-637`). Cache key at **585-590**:
   `(dt, factor_qat, factor_qat_alpha, tuple(p._version for e in self.experts for p in e.parameters()), want)`;
   cache read at 592, reuse clause 598-602, rebuild+store at 603-636. Call sites: **431**
   (dense banked bmm), **690** (padded dispatch), **1008** (Triton dispatch).
@@ -18,7 +18,7 @@ port hits `torch._dynamo hit config.recompile_limit (8)` in `SparseMoE._banks`
   and `dynamic=False` failed on exactly the shape guard: `tensor '___stack0' size
   mismatch` — `docs/research/2026-10-15-torch-spike.md:236-249`). The per-step *Python*
   movers in the key are `factor_qat_alpha` (set on every module, every step, by
-  `DormouseModel.set_factor_qat_alpha`, `port/src/dormouse/model/model.py:81-95`), the
+  `DormouseModel.set_factor_qat_alpha`, `src/dormouse/model/model.py:81-95`), the
   `_version` tuple (optimizer step), and `torch.is_grad_enabled()` (train/eval).
 - `loop.py:612-627` refuses `opt_graph`+`torch_compile` together and wraps
   `torch.compile(model, dynamic=True)` — the spike's measured winner, keep it.
@@ -67,7 +67,7 @@ one graph entry while both movers change — the fix works on this exact pattern
 ## 3. Options for our code (ranked by risk)
 
 **Option 1 — lowest risk, one decorator: graph-break the cache decision.**
-Put `@torch.compiler.disable` on `_banks` itself (`port/src/dormouse/model/experts.py:556`)
+Put `@torch.compiler.disable` on `_banks` itself (`src/dormouse/model/experts.py:556`)
 or split the current body into a disabled `_banks_stacked(dt)` and leave `_banks` as a
 one-line forwarder. The alpha/`_version`/grad-state reads and the `self._bank_cache`
 mutation then run eagerly; the compiled regions at the three call sites (431/690/1008)
@@ -81,7 +81,7 @@ entry per mode (torchtitan pattern 16 says the same).
 
 **Option 2 — medium: hoist the refresh into the trainer step, no graph break.**
 Add an eager `refresh_moe_banks()` next to `set_factor_qat_alpha`
-(`port/src/dormouse/model/model.py:81-95`), called once per step in `loop.py` where the
+(`src/dormouse/model/model.py:81-95`), called once per step in `loop.py` where the
 anneal is set (~`loop.py:628`), which calls `_banks` under the current grad mode; the
 forward path (`experts.py:585-637`) then only reads the stored tuple and asserts it can
 serve this call. Keeps the compiled region whole. Evidence: torchtitan pattern 10 (side
@@ -108,7 +108,7 @@ small and known, but torchtitan treats 8 as a budget ("we aimed for ≤ 6 of 8";
 
 After whichever fix: enumerate what is left with `TORCH_LOGS=recompiles`. Candidates in
 our forward: `dense_qat_alpha` reads (`experts.py:401,469` — only when `dense_qat !=
-"none"`; default is `"none"`, `port/src/dormouse/config.py:374`), the train/eval toggle,
+"none"`; default is `"none"`, `src/dormouse/config.py:374`), the train/eval toggle,
 and `Counters` mutation.
 
 **Q5, directly:** applicable found patterns = (1) `torch.compiler.disable` region,

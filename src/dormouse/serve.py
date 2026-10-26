@@ -50,6 +50,8 @@ from .model.decode import (
     recurrent_decode,
     recurrent_refusal,
 )
+from .post.agent import ToolCall, parse_turn
+from .train.sft import END, PAD, TOOL_END, Segment, render_conversation
 
 #: The hard ceiling on one reply, in bytes (this model's tokens ARE bytes).
 DEFAULT_MAX_TOKENS = 512
@@ -76,11 +78,8 @@ def assemble(messages: Any) -> bytes:
     The model is SINGLE-TURN (the SFT corpus is instruction→answer pairs), so
     the prompt is the LAST user message — with any system text and earlier
     user turns prepended as context — wrapped in the markers the model trained
-    on: `\\x01{instruction}\\n\\x02`. The bytes are `train.sft.render`'s own
-    prefix, and `tests/test_serve.py` pins the two together: a prompt that adds
-    spaces the training pipeline never wrote makes the model answer a different
-    question (measured 2026-10-20: `"\\x01 Say hello. \\n\\x02 "` emitted a
-    newline and an unrelated sentence where the exact template gave the answer).
+    on: `\\x01{instruction}\\n\\x02` (no spaces: the corpus's own `render()`,
+    `train/sft.py:416`, puts the markers flush against the text).
     """
     if not isinstance(messages, list) or not messages:
         loud('messages: need a non-empty list of {"role", "content"} objects')
@@ -105,6 +104,115 @@ def assemble(messages: Any) -> bytes:
         loud("messages: no user turn — the model answers an instruction, and there is none")
     instruction = "\n".join([*system, *users[:-1], users[-1]])
     return bytes([TURN_OPEN]) + encode(instruction) + b"\n" + bytes([TURN_ANSWER])
+
+
+# --------------------------------------------------------------------------- tools
+#
+# `tools` is the OpenAI declaration shape; the SERVER does not run anything. It
+# renders the declaration into the prompt, and when the model emits a call it
+# returns it as `tool_calls` — the client executes the tool and sends the result
+# back as a `tool` role message, which `assemble_tools` renders as `0x07`. That
+# is the division of labour the template was extended for: the model must learn
+# to WRITE calls and never to write observations.
+
+
+def tool_schemas(tools: Any) -> dict[str, dict]:
+    """`tools: [...]` (OpenAI) → `name -> parameters schema`, validated loudly."""
+    if not isinstance(tools, list) or not tools:
+        loud("tools: need a non-empty list of {type: function, function: {...}} objects")
+    out: dict[str, dict] = {}
+    for t in tools:
+        if not isinstance(t, dict) or t.get("type") != "function":
+            loud(f"tool {t!r}: expected an object with type 'function'")
+        fn = t.get("function")
+        if not isinstance(fn, dict):
+            loud(f"tool {t!r}: `function` must be an object with a name")
+        name = fn.get("name")
+        if not isinstance(name, str) or not name:
+            loud(f"tool {t!r}: `function.name` must be a non-empty string")
+        params = fn.get("parameters") or {"type": "object", "properties": {}}
+        if not isinstance(params, dict) or params.get("type") != "object":
+            loud(f"tool {name!r}: `parameters` must be a JSON-schema object")
+        if name in out:
+            loud(f"tool {name!r} is declared twice — a call could not be routed")
+        out[name] = params
+    return out
+
+
+def _tools_line(text: str, schemas: dict[str, dict]) -> str:
+    """The tool declarations, in the prompt, in a deterministic order."""
+    lines = ["Tools:"]
+    for name in sorted(schemas):
+        params = schemas[name].get("properties", {})
+        required = set(schemas[name].get("required", ()))
+        args = ", ".join(
+            f"{key}: {params[key].get('type', 'any')}" + ("" if key in required else "?")
+            for key in params
+        )
+        lines.append(f"{name}({args})")
+    return text + "\n" + "\n".join(lines)
+
+
+def assemble_tools(messages: Any, schemas: dict[str, dict]) -> bytes:
+    """`[{role, content, tool_calls}]` → the tool-aware prompt, open assistant turn.
+
+    A `tool` message IS an observation (`0x07`), an assistant message's
+    `tool_calls` are calls (`0x04 name 0x05 args 0x06`), and a plain assistant
+    message closes its turn (`0x03`). The declaration line is appended to the
+    FIRST user turn, so the model is told which names exist.
+    """
+    if not isinstance(messages, list) or not messages:
+        loud('messages: need a non-empty list of {"role", "content"} objects')
+    segments: list[Segment] = []
+    system: list[str] = []
+    declared = False
+    for m in messages:
+        if not isinstance(m, dict):
+            loud(f"message {m!r}: expected an object with role and content")
+        role = m.get("role")
+        content = m.get("content")
+        if role == "system":
+            if not isinstance(content, str):
+                loud("message system: content must be a string")
+            system.append(content)
+            continue
+        if content is not None and not isinstance(content, str):
+            loud(f"message {role}: content must be a string, got {type(content).__name__}")
+        if role == "user":
+            text = "\n".join([*system, content or ""])
+            system = []
+            if not declared:
+                text = _tools_line(text, schemas)
+                declared = True
+            segments.append(Segment("user", text))
+        elif role == "assistant":
+            segments.append(Segment("assistant", content or ""))
+            calls = m.get("tool_calls") or []
+            if not isinstance(calls, list):
+                loud(f"message assistant: tool_calls must be a list, got {type(calls).__name__}")
+            for call in calls:
+                fn = (call or {}).get("function") or {}
+                name, args = fn.get("name"), fn.get("arguments")
+                if not isinstance(name, str) or not name:
+                    loud(f"tool_call {call!r}: `function.name` must be a string")
+                if not isinstance(args, str):
+                    loud(f"tool_call {name!r}: `function.arguments` must be a JSON string")
+                segments.append(Segment("call", name=name, args=args))
+            if not calls:
+                segments.append(Segment("end"))
+        elif role == "tool":
+            segments.append(Segment("observation", content or ""))
+        else:
+            loud(
+                f"message role {role!r}: with `tools` this server accepts system, user, "
+                f"assistant and tool"
+            )
+    if not declared:
+        loud("messages: no user turn — the model answers an instruction, and there is none")
+    # Ending on a `tool` message is the normal continuation case: the prompt opens
+    # a fresh assistant turn (`0x02`) right after the observation, which is the
+    # byte the model wrote next in training.
+    return render_conversation(segments) + bytes([TURN_ANSWER])
 
 
 def load_checkpoint(
@@ -133,25 +241,6 @@ def load_checkpoint(
     return model, run, dev
 
 
-def load_artifact(path: Path | str, device: str = "auto") -> tuple[Any, int, Any, str]:
-    """`(model, seed, device, name)` from a `.dormouse` artifact — the other source.
-
-    The browser demo reads the same file, so a served model and a demo model are
-    the same weights by construction rather than by a promise. The seed is the
-    one the header carries (the run's), which is what a served reply's sampling
-    reproducibility rests on.
-    """
-    from .cli import _device, _freeze_gc
-    from .model.export import load_export, read_export
-
-    path = Path(path)
-    f = read_export(path)
-    dev = _device(device)
-    model = load_export(f, device=dev)
-    _freeze_gc()
-    return model, int(f.header.get("seed") or 1), dev, path.name
-
-
 class ServeState:
     """What every request shares: the ONE model, its device, its decode arm.
 
@@ -165,7 +254,7 @@ class ServeState:
     def __init__(
         self,
         model: Any,
-        seed: int,
+        run: Any,
         device: torch.device,
         ckpt_name: str,
         max_tokens_cap: int,
@@ -174,11 +263,12 @@ class ServeState:
         recurrent: bool = False,
     ) -> None:
         self.model = model
+        self.run = run
         self.device = device
         self.ckpt_name = ckpt_name
         self.max_tokens_cap = max_tokens_cap
         self.temp = temp
-        self.seed = seed
+        self.seed = run.train.seed
         self.log = log
         self.recurrent = recurrent
         self.counters = Counters()
@@ -203,13 +293,7 @@ def resolve_arm(model: Any, recurrent: bool) -> tuple[bool, str | None]:
 _STOP = frozenset({0x03, 0x00})
 
 
-def _generate(
-    state: ServeState,
-    prompt: bytes,
-    n: int,
-    chunk: int = STREAM_BYTES,
-    stats: dict[str, Any] | None = None,
-) -> Iterator[str]:
+def _generate(state: ServeState, prompt: bytes, n: int, chunk: int = STREAM_BYTES) -> Iterator[str]:
     """`n` bytes past `prompt`, decoded incrementally, as text pieces.
 
     The arm is `state.recurrent`, decided once in `build_server` before the
@@ -218,11 +302,6 @@ def _generate(
     the context and carries on from the state a single call would have (byte
     prefill on CPU, so byte-identical; chunked prefill on CUDA, equal within
     the documented summation-order class).
-
-    `stats`, when given, receives `bytes` (the ANSWER bytes actually emitted,
-    stop marker excluded) and `stopped` (the reply ended on a stop byte rather
-    than the budget). The usage block reports THIS, not `n`: the requested cap
-    is not a completion (review round 1 N2).
     """
     if not prompt:
         loud("empty prompt: the first window IS the prompt (model.decode's rule)")
@@ -230,7 +309,7 @@ def _generate(
         loud(f"max_tokens={n}: must be >= 1")
     gen = torch.Generator(device=state.device).manual_seed(state.seed)
     dec = codecs.getincrementaldecoder("utf-8")("replace")
-    ctx, done, emitted = prompt, 0, 0
+    ctx, done = prompt, 0
     while done < n:
         k = min(chunk, n - done)
         before = len(ctx)
@@ -264,26 +343,47 @@ def _generate(
         if hit is not None:
             # The reply ENDED: emit the bytes up to the marker, then stop —
             # the caller must not read a finished answer's padding as text.
-            emitted += hit
             text = dec.decode(bytes(delta[:hit]))
             if text:
                 yield text
             tail = dec.decode(b"", True)
             if tail:
                 yield tail
-            if stats is not None:
-                stats.update(bytes=emitted, stopped=True)
             return
         done += k
-        emitted += len(delta)
         text = dec.decode(bytes(delta))
         if text:
             yield text
     tail = dec.decode(b"", True)
     if tail:
         yield tail
-    if stats is not None:
-        stats.update(bytes=emitted, stopped=False)
+
+
+def _tool_turn(
+    state: ServeState, prompt: bytes, n: int, schemas: dict[str, dict]
+) -> tuple[str, ToolCall | None, int]:
+    """ONE tool-aware generation: stop at `0x03`/`0x06`/`0x00`, split out a call.
+
+    A tool turn is generated in one `decode_bytes` call (the same sampler, the
+    same seeded generator as the plain arm) rather than the chunked re-call the
+    stream uses: a call must be parsed as a whole, and one call is already the
+    same byte sequence. `(text, call | None, generated bytes)`.
+    """
+    gen = torch.Generator(device=state.device).manual_seed(state.seed)
+    raw = decode_bytes(
+        state.model,
+        prompt,
+        n,
+        temp=state.temp,
+        device=state.device,
+        generator=gen,
+        stop=frozenset({END, TOOL_END, PAD}),
+    )[len(prompt) :]
+    text, call = parse_turn(raw, schemas, offset=len(prompt))
+    for cutter in (END, PAD):
+        if cutter in text:
+            text = text[: text.index(cutter)]
+    return text.decode("utf-8", "replace"), call, len(raw)
 
 
 def _max_tokens(body: dict, state: ServeState) -> int:
@@ -363,17 +463,36 @@ def make_handler(state: ServeState) -> type[BaseHTTPRequestHandler]:
                     404,
                     f"unknown model {model_id!r}: this server serves {state.ckpt_name!r}",
                 )
+            schemas = None
+            if body.get("tools"):
+                try:
+                    schemas = tool_schemas(body["tools"])
+                except LoudError as e:
+                    return self._error(400, str(e))
             try:
                 n = _max_tokens(body, state)
-                prompt = assemble(body.get("messages"))
+                prompt = (
+                    assemble_tools(body.get("messages"), schemas)
+                    if schemas is not None
+                    else assemble(body.get("messages"))
+                )
             except LoudError as e:
                 return self._error(400, str(e))
             cid, created = f"chatcmpl-{uuid.uuid4().hex[:24]}", int(time.time())
+            if schemas is not None:
+                # A tool call is one JSON message; an SSE delta has no place for
+                # it, and a silent stop-framed call would be a lie about the shape.
+                if body.get("stream"):
+                    return self._error(
+                        400,
+                        "stream=true with `tools` is not supported yet: a tool "
+                        "call is one message",
+                    )
+                return self._tool_response(prompt, n, schemas, cid, created)
             if body.get("stream"):
                 return self._stream(prompt, n, cid, created)
-            stats: dict[str, Any] = {}
             try:
-                content = "".join(_generate(state, prompt, n, stats=stats))
+                content = "".join(_generate(state, prompt, n))
             except LoudError as e:
                 return self._error(400, str(e))
             self._json(
@@ -387,16 +506,53 @@ def make_handler(state: ServeState) -> type[BaseHTTPRequestHandler]:
                         {
                             "index": 0,
                             "message": {"role": "assistant", "content": content},
-                            # `stop` = the model's end-of-answer byte; `length` =
-                            # the n-byte budget ran out mid-reply (N2).
-                            "finish_reason": "stop" if stats["stopped"] else "length",
+                            "finish_reason": "stop",
                         }
                     ],
                     # bytes ARE this model's tokens; nothing is estimated here.
                     "usage": {
                         "prompt_tokens": len(prompt),
-                        "completion_tokens": stats["bytes"],
-                        "total_tokens": len(prompt) + stats["bytes"],
+                        "completion_tokens": n,
+                        "total_tokens": len(prompt) + n,
+                    },
+                },
+            )
+
+        def _tool_response(
+            self, prompt: bytes, n: int, schemas: dict[str, dict], cid: str, created: int
+        ) -> None:
+            try:
+                text, call, used = _tool_turn(state, prompt, n, schemas)
+            except LoudError as e:
+                return self._error(400, str(e))
+            message: dict[str, Any] = {"role": "assistant", "content": text}
+            if call is not None:
+                message["tool_calls"] = [
+                    {
+                        "id": f"call_{uuid.uuid4().hex[:24]}",
+                        "type": "function",
+                        "function": {"name": call.name, "arguments": call.raw_args},
+                    }
+                ]
+            self._json(
+                200,
+                {
+                    "id": cid,
+                    "object": "chat.completion",
+                    "created": created,
+                    "model": state.ckpt_name,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": message,
+                            "finish_reason": "tool_calls" if call is not None else "stop",
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": len(prompt),
+                        # the bytes this turn actually generated, not the ask
+                        "completion_tokens": used,
+                        "total_tokens": len(prompt) + used,
                     },
                 },
             )
@@ -453,10 +609,9 @@ def build_server(
     max_tokens_cap: int = DEFAULT_MAX_TOKENS,
     temp: float = DEFAULT_TEMP,
     recurrent: bool = True,
-    export: str | None = None,
     log: Any = print,
 ) -> ServeServer:
-    """Load the model ONCE, pick the decode arm, bind, and return the ready server.
+    """Load the checkpoint ONCE, pick the decode arm, bind, and return the ready server.
 
     The arm decision happens HERE, before the socket binds, so the startup
     lines name the arm that will serve every request — and a requested
@@ -464,23 +619,16 @@ def build_server(
     (`recurrent_fallback`) with the reason, instead of failing on the first
     request. `port=0` takes an ephemeral one, so a test can run the real
     socket path.
-
-    `export` is the OTHER source: a `.dormouse` artifact, read by the same
-    reader the browser demo uses. It and `ckpt_name` are mutually exclusive at
-    the CLI layer; here an `export` simply wins because the caller has already
-    checked.
     """
     if max_tokens_cap < 1:
         loud(f"--max-tokens-cap {max_tokens_cap}: must be >= 1")
     if temp <= 0:
         loud(f"--temp {temp}: use a positive temperature (decode's rule)")
-    if export:
-        model, seed, dev, name = load_artifact(export, device)
-    else:
-        model, run, dev = load_checkpoint(out_dir, ckpt_name, device)
-        seed, name = run.train.seed, ckpt_name
+    model, run, dev = load_checkpoint(out_dir, ckpt_name, device)
     use_recurrent, why = resolve_arm(model, recurrent)
-    state = ServeState(model, seed, dev, name, max_tokens_cap, temp, log, recurrent=use_recurrent)
+    state = ServeState(
+        model, run, dev, ckpt_name, max_tokens_cap, temp, log, recurrent=use_recurrent
+    )
     if why is not None:
         state.counters.count("recurrent_fallback")
         log(

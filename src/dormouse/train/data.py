@@ -33,11 +33,18 @@ Two properties are load-bearing because the burn history paid for them:
 * **the eval stream never trains.** The split is by byte range, not by a flag,
   so a train batch cannot be drawn from the eval tail (`c4214ad`'s no-leak
   enforcement).
+
+`doc_masking=true` (a THIRD reader, [`DocPackedStream`][dormouse.train.data.
+DocPackedStream]) replaces the train stream with one DOCUMENT per row and a
+`[b,t]` loss mask; the eval stream stays flat. It needs `<data>.docs.json`
+(the offsets `scripts/build_doc_sidecar.py` derives), refuses without it, and
+is by STEP on resume, not by flat byte — see the class docstring for why.
 """
 
 from __future__ import annotations
 
 import bisect
+import json
 import math
 import mmap
 import os
@@ -52,6 +59,12 @@ from ..instrument import loud
 
 DEFAULT_RING = 64 << 20  # burn's 64 MB ring
 DEFAULT_REFILL = 8 << 20  # refilled in 8 MB chunks
+
+#: The document-offset sidecar `doc_masking` reads: `<data>.docs.json`, written
+#: by `scripts/build_doc_sidecar.py`. A convention, not a config key: a run
+#: naming a file either has its boundaries beside it or is refused, so a
+#: sidecar cannot point at a different file than the bytes being streamed.
+DOC_SIDECAR_SUFFIX = ".docs.json"
 
 
 def _windows(raw: bytes, batch: int, seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -299,7 +312,19 @@ class ShardStream:
 
 
 class ByteStream:
-    """A read-only ring over `[lo, hi)` of a memory-mapped file."""
+    """A read-only ring over `[lo, hi)` of a memory-mapped file.
+
+    The wrap is BYTE-EXACT: byte `hi - 1` is followed by byte `lo`, so one cycle
+    is the range's `hi - lo` bytes in file order and a window that straddles the
+    end is the range's tail followed by its head — nothing is skipped or
+    repeated at the seam (`tests/test_data.py` scans a full cycle). `_pos` is
+    the next byte to read and stays in `[lo, hi)`; `rewind()` and
+    `skip_bytes()` only ever move it inside that range.
+    `check_min=False` is the document-packing reader's construction
+    ([`DocPackedStream`][dormouse.train.data.DocPackedStream]): its rows come
+    from documents, so a range shorter than one flat `batch × (seq_len+1)`
+    window is not a defect there. Every flat caller keeps the check.
+    """
 
     def __init__(
         self,
@@ -311,6 +336,7 @@ class ByteStream:
         hi: int | None = None,
         ring_bytes: int = DEFAULT_RING,
         refill_bytes: int = DEFAULT_REFILL,
+        check_min: bool = True,
     ) -> None:
         self.path = Path(path)
         _refuse_dir(self.path, "data file")
@@ -330,7 +356,7 @@ class ByteStream:
         if not 0 <= self.lo < self.hi <= size:
             loud(f"byte range [{self.lo}, {self.hi}) is not inside {self.path} ({size} B)")
         self.tokens_per_batch = batch * seq_len
-        if self.hi - self.lo < self.tokens_per_batch + 1:
+        if check_min and self.hi - self.lo < self.tokens_per_batch + 1:
             loud(
                 f"byte range [{self.lo}, {self.hi}) holds {self.hi - self.lo} B, less than one "
                 f"batch of {self.tokens_per_batch + 1}: enlarge the range or shrink the batch"
@@ -338,6 +364,9 @@ class ByteStream:
         self._buf = bytearray()
         self._pos = self.lo
         self._rng_lo = self.lo
+        #: `(requested, granted)` when `open_streams` capped the eval tail at
+        #: 1 MiB; `None` is the uncapped path (no line, no changed number).
+        self.eval_tail_capped: tuple[int, int] | None = None
 
     # -- ring -----------------------------------------------------------
     def _refill(self) -> None:
@@ -345,8 +374,10 @@ class ByteStream:
         assert want > 0, "the ring is full and still cannot satisfy the request"
         take = min(want, self.hi - self._pos)
         if take <= 0:
-            # End of the range: wrap. This is the ring's whole point — the
-            # stream is a fixed byte range read repeatedly, not a file cursor.
+            # End of the range: wrap to the FIRST byte, byte-exact. This is the
+            # ring's whole point — the stream is a fixed byte range read
+            # repeatedly, not a file cursor — and `lo`, not `lo + k`, is what
+            # keeps the cycle free of skips and repeats.
             self._pos = self.lo
             take = min(want, self.hi - self._pos)
         self._buf += self._mm[self._pos : self._pos + take]
@@ -390,6 +421,281 @@ class ByteStream:
         self._mm.close()
         os.close(self._fd)
 
+    # -- random access (the document-packing reader) --------------------
+    def read_at(self, pos: int, n: int) -> bytes:
+        """`n` bytes from absolute `pos`, wrapping at `hi` into `lo`.
+
+        The ring's `_read` is sequential; the packed reader needs the byte at a
+        document's start, which can be anywhere in the range. The wrap is the
+        same periodicity `_refill` implements, so `read_at` and `next_batch`
+        name the same byte at the same position.
+        """
+        span = self.hi - self.lo
+        assert 0 < n <= span, f"read_at({pos}, {n}) outside the {span}-byte range"
+        assert self.lo <= pos < self.hi, f"read_at({pos}) outside [{self.lo}, {self.hi})"
+        if pos + n <= self.hi:
+            return bytes(self._mm[pos : pos + n])
+        first = bytes(self._mm[pos : self.hi])
+        return first + bytes(self._mm[self.lo : self.lo + (n - len(first))])
+
+
+# --- document boundaries (doc_masking) ---------------------------------------
+
+
+def doc_sidecar_path(data: str | Path) -> Path:
+    """Where the document offsets of `data` live: `<data>.docs.json`."""
+    return Path(str(data) + DOC_SIDECAR_SUFFIX)
+
+
+def load_doc_starts(data: str | Path, sidecar: str | Path | None = None) -> list[int]:
+    """The document START offsets of a `.bin`, LOUD when it has no sidecar.
+
+    The sidecar is JSON `{"version": 1, "size": <bytes>, "starts": [...]}`.
+    Every way it can lie about the file is a refusal: a missing file, a wrong
+    version, a size that is not the file's (a stale sidecar describes a
+    previous build, so every offset after the change would slice the wrong
+    document), a first start that is not 0, a non-ascending or duplicated
+    start, or a start at/after the end. There is no "fall back to the flat
+    stream" — that would train with the boundaries this flag exists to add.
+    """
+    p = Path(data)
+    side = doc_sidecar_path(p) if sidecar is None else Path(sidecar)
+    if not p.is_file():
+        loud(f"data file {p} does not exist (mount the drive, or fix the path)")
+    if not side.is_file():
+        loud(
+            f"doc_masking=true but {p} has no document-boundary sidecar {side}. The "
+            f"bytes are a flat concatenation: no reader can recover where one "
+            f"document ends and the next begins without the offsets. Escape: build "
+            f"it with `uv run scripts/build_doc_sidecar.py --bin {p} --source-dir "
+            f"<the *.txt shard directory the domain was built from>`, or set "
+            f"doc_masking=false (the flat stream, every number on record)."
+        )
+    try:
+        raw = json.loads(side.read_text())
+    except json.JSONDecodeError as e:
+        loud(f"document sidecar {side} is not JSON: {e}. Escape: rebuild it.")
+    if not isinstance(raw, dict):
+        loud(f"document sidecar {side} is not a JSON object. Escape: rebuild it.")
+    if raw.get("version") != 1:
+        loud(
+            f"document sidecar {side}: version {raw.get('version')!r} is not 1. "
+            f"Escape: rebuild it with scripts/build_doc_sidecar.py."
+        )
+    try:
+        size = int(raw.get("size", -1))
+    except (TypeError, ValueError):
+        loud(f"document sidecar {side}: `size` is not an integer. Escape: rebuild it.")
+    file_size = p.stat().st_size
+    if size != file_size:
+        loud(
+            f"document sidecar {side} describes {size} B but {p} is {file_size} B: "
+            f"the sidecar is stale (the shard was rebuilt or moved). Escape: rebuild "
+            f"it with scripts/build_doc_sidecar.py."
+        )
+    try:
+        starts = [int(s) for s in raw.get("starts", [])]
+    except (TypeError, ValueError):
+        loud(f"document sidecar {side}: `starts` is not a list of integers. Escape: rebuild it.")
+    if not starts or starts[0] != 0:
+        loud(f"document sidecar {side}: starts must begin at 0, got {starts[:1]}")
+    for a, b in zip(starts, starts[1:], strict=False):
+        if b <= a:
+            loud(f"document sidecar {side}: starts are not strictly ascending at {a} -> {b}")
+    if starts[-1] >= file_size:
+        loud(f"document sidecar {side}: a document starts at {starts[-1]} >= {file_size}")
+    return starts
+
+
+class DocPackedStream:
+    """`ByteStream`'s interface with ONE DOCUMENT per row — the `doc_masking` arm.
+
+    Why not glue whole documents into one row (sequence PACKING as usually
+    meant) and mask the boundary targets: the KDA arm is a RECURRENCE whose
+    state is carried through the fused `chunk_kda` over the whole window, so a
+    row holding two documents would let document B's positions attend to
+    document A's — the cross-document dependency this arm exists to remove.
+    Resetting the recurrent state mid-window is not available inside that
+    kernel, so the honest implementation is a window that never holds two
+    documents: every row is a whole document, or a contiguous chunk of ONE
+    document when the document is longer than `seq_len`, padded at the tail.
+
+    The consequence is named rather than hidden: a corpus of short documents
+    pays padding (a 200-byte doc leaves ~80 % of a 1024-byte row empty), while
+    the 6 MB `web` shards see no padding at all and no behavioural change —
+    which is exactly the A/B `scripts/ab_docmask.py` pre-registers.
+
+    The loss mask is `[b, t]` bool: 1 where the target byte belongs to the
+    same document as the input byte. That is every position of a chunk that
+    continues inside its document, and every position of a whole document
+    except its last byte (the successor of a document's last byte is the next
+    document, or padding — never a byte this row may be scored against).
+
+    Resume is by STEP, not by flat byte: `skip_bytes(n)` accepts the trainer's
+    own `steps × (seq_len+1) × batch` formula and REPLAYS that many packing
+    steps from the start of the range (lengths only, no reads), because a
+    packed step consumes a document-dependent number of bytes. Replaying 200k
+    steps is a few hundred thousand bisects, not a corpus read.
+    """
+
+    def __init__(
+        self,
+        source: ByteStream,
+        starts: list[int],
+    ) -> None:
+        self.source = source
+        self.batch, self.seq_len = source.batch, source.seq_len
+        self.lo, self.hi = source.lo, source.hi
+        self._doc_starts: list[int] = []
+        self._doc_ends: list[int] = []
+        for i, s in enumerate(starts):
+            end = starts[i + 1] if i + 1 < len(starts) else self.hi
+            a, b = max(s, self.lo), min(end, self.hi)
+            if a < b:
+                self._doc_starts.append(a)
+                self._doc_ends.append(b)
+        if not self._doc_starts:
+            loud(
+                f"doc_masking: {source.path} carries no document inside its byte "
+                f"range [{self.lo}, {self.hi}). Escape: a range that contains a "
+                f"document, or doc_masking=false."
+            )
+        self._pos = self.lo
+        #: Boundary counters (the long-context gate reads them): how many
+        #: windows were packed, how many document pieces they held, how many
+        #: supervised positions were inside a document, how many target
+        #: positions the mask dropped, and how many rows ended at a document's
+        #: last byte (a real boundary, as opposed to a mid-document chunk).
+        self.counts = {
+            "docmask_windows": 0,
+            "docmask_docs": 0,
+            "docmask_scored": 0,
+            "docmask_masked": 0,
+            "docmask_doc_ends": 0,
+            "docmask_padded": 0,
+        }
+
+    # -- position -------------------------------------------------------
+    @property
+    def position(self) -> int:
+        """The absolute offset of the next document byte (the packing cursor)."""
+        return self._pos
+
+    def _doc_at(self, pos: int) -> tuple[int, int]:
+        i = bisect.bisect_right(self._doc_starts, pos) - 1
+        assert i >= 0, f"position {pos} before the first document"
+        return self._doc_starts[i], self._doc_ends[i]
+
+    def _advance(self) -> int:
+        """Move the cursor over ONE row's bytes without reading, return the bytes used."""
+        a, b = self._doc_at(self._pos)
+        remaining = b - self._pos
+        whole = remaining <= self.seq_len
+        used = remaining if whole else self.seq_len + 1
+        nxt = b if whole else self._pos + used
+        self._pos = self.lo if nxt >= self.hi else nxt
+        return used
+
+    def _row(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        """One packed row → (inputs, targets, loss mask, scored positions)."""
+        a, b = self._doc_at(self._pos)
+        remaining = b - self._pos
+        if remaining <= self.seq_len:
+            chunk = self.source.read_at(self._pos, remaining)
+            x = torch.zeros(self.seq_len, dtype=torch.long)
+            y = torch.zeros(self.seq_len, dtype=torch.long)
+            mask = torch.zeros(self.seq_len, dtype=torch.bool)
+            x[:remaining] = torch.tensor(list(chunk), dtype=torch.long)
+            if remaining > 1:
+                y[: remaining - 1] = torch.tensor(list(chunk[1:]), dtype=torch.long)
+                mask[: remaining - 1] = True
+            # The last byte of a document has no successor in it: its target is
+            # the next document (a real cross-boundary target) or padding.
+            scored = max(remaining - 1, 0)
+            self.counts["docmask_doc_ends"] += 1
+            nxt = b
+        else:
+            # A chunk of ONE document: the extra byte is the last position's
+            # in-document target, so every position is supervised.
+            chunk = self.source.read_at(self._pos, self.seq_len + 1)
+            x = torch.tensor(list(chunk[: self.seq_len]), dtype=torch.long)
+            y = torch.tensor(list(chunk[1:]), dtype=torch.long)
+            mask = torch.ones(self.seq_len, dtype=torch.bool)
+            scored = self.seq_len
+            nxt = self._pos + self.seq_len + 1
+        self._pos = self.lo if nxt >= self.hi else nxt
+        self.counts["docmask_docs"] += 1
+        self.counts["docmask_scored"] += scored
+        self.counts["docmask_masked"] += self.seq_len - scored
+        self.counts["docmask_padded"] += self.seq_len - min(remaining, self.seq_len)
+        return x, y, mask, scored
+
+    def next_batch_masked(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """One `[batch, seq_len]` window of inputs, targets and the loss mask."""
+        xs, ys, ms = [], [], []
+        for _ in range(self.batch):
+            x, y, mask, _ = self._row()
+            xs.append(x)
+            ys.append(y)
+            ms.append(mask)
+        self.counts["docmask_windows"] += self.batch
+        out = torch.stack(xs), torch.stack(ys), torch.stack(ms)
+        if not bool(out[2].any()):
+            # Every row was a 1-byte document (or shorter): no target exists, so
+            # the masked mean divides by zero. LOUD, not NaN.
+            loud(
+                "doc_masking: this window contains no scorable position (every row's "
+                "document is 1 byte). Escape: a corpus whose documents have a "
+                "successor byte, or doc_masking=false."
+            )
+        return out
+
+    def doc_counts(self) -> dict[str, int]:
+        """The boundary counters (a copy: a reader cannot mutate the arm's state)."""
+        return dict(self.counts)
+
+    def next_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
+        loud(
+            "next_batch() on a doc_masking stream: the window carries a loss mask "
+            "and dropping it would score padding and cross-document targets. "
+            "Escape: read `next_batch_masked()` (the trainer does this when "
+            "doc_masking=true), or set doc_masking=false for the flat window."
+        )
+
+    # -- positioning ----------------------------------------------------
+    def rewind(self) -> None:
+        """Back to the start of the range — deterministic and repeatable."""
+        self._pos = self.lo
+
+    def skip_steps(self, steps: int) -> None:
+        """Replay `steps` packing STEPS from the range start (lengths only).
+
+        One step is one `[batch, seq_len]` window, i.e. `batch` packed rows —
+        the same unit `skip_bytes` receives from the trainer's formula.
+        """
+        if steps < 0:
+            loud(f"skip_steps({steps}): a negative fast-forward is a rewind")
+        self._pos = self.lo
+        for _ in range(steps * self.batch):
+            self._advance()
+
+    def skip_bytes(self, n: int) -> None:
+        """Fast-forward `n` flat bytes = `n // (batch × (seq_len+1))` packing steps."""
+        window = self.batch * (self.seq_len + 1)
+        if n < 0:
+            loud(f"skip_bytes({n}): a negative fast-forward is a rewind")
+        if n % window:
+            loud(
+                f"skip_bytes({n}) on a doc_masking stream: not a whole number of "
+                f"{window}-byte steps (batch={self.batch}, seq_len={self.seq_len}). "
+                f"Escape: pass steps × (seq_len+1) × batch."
+            )
+        self.skip_steps(n // window)
+
+    def close(self) -> None:
+        self.source.close()
+
+
 
 def open_source(
     path: str | Path,
@@ -416,17 +722,35 @@ def eval_window_bytes(cfg: TrainConfig) -> int:
     return cfg.eval_batches * cfg.batch * cfg.seq_len
 
 
-def eval_read_bytes(cfg: TrainConfig) -> int:
-    """`eval_batches × batch × (seq_len + 1)` — the bytes the eval READS.
+def distinct_scored_bytes(stream: ByteStream, batches: int) -> int:
+    """How many DISTINCT byte positions `batches` windows of `stream` score.
 
-    One window READS one byte more than it SCORES (the next-byte shift), so a
-    tail sized as scored bytes holds one window fewer than the config asks for
-    (review round 2 R2-1: 20 x 8 x 512 on a 81 920 B tail scored 19 windows).
-    `open_streams` carves the no-`--eval` tail with THIS number; the 1 MiB cap
-    is then the only reason the eval can still fall short, and `_eval_line`
-    names it.
+    `over N B` on the eval line is a count of scored tokens: for a window that
+    fits in the stream's range it is `batches × batch × seq_len`. Above the
+    eval tail's 1 MiB cap the window is LONGER than the range, `next_batch`
+    wraps to `lo`, and the same bytes are scored again — summing `x.numel()`
+    then counts duplicates (measured: 100 × 16 × 1024 = 1 638 400 requested
+    over a 1 048 576 B range, batch 15 byte-identical to batch 0). This walks
+    the same positions the loop reads and counts each once. The `total <= span`
+    fast path is exactly the old number, so an uncapped window does not move.
     """
-    return cfg.eval_batches * cfg.batch * (cfg.seq_len + 1)
+    span = stream.hi - stream.lo
+    total = batches * stream.batch * stream.seq_len
+    if span <= 0 or total <= span:
+        return total
+    window = stream.batch * (stream.seq_len + 1)
+    seen = bytearray(span)
+    for k in range(batches):
+        base = (k * window) % span
+        for row in range(stream.batch):
+            start = (base + row * (stream.seq_len + 1)) % span
+            end = start + stream.seq_len
+            if end <= span:
+                seen[start:end] = b"\x01" * stream.seq_len
+            else:
+                seen[start:] = b"\x01" * (span - start)
+                seen[: end - span] = b"\x01" * (end - span)
+    return sum(seen)
 
 
 def split_points(size: int, eval_bytes: int) -> tuple[int, int]:
@@ -439,47 +763,91 @@ def split_points(size: int, eval_bytes: int) -> tuple[int, int]:
 
 
 def open_streams(
-    run, *, ring_bytes: int = DEFAULT_RING, batch: int | None = None, seq_len: int | None = None
-) -> tuple[ByteStream, ByteStream | None]:
+    run, *, ring_bytes: int = DEFAULT_RING, eval_only: bool = False
+) -> tuple[ByteStream | DocPackedStream | None, ByteStream | None]:
     """The train stream and (when an eval file is set) the eval stream.
 
     `eval_data` names a DIFFERENT file (the burn recipe's held-out tail carve).
     When it is empty the eval tail of the train file is used, and the train
     stream's high bound stops one window short of it — the no-leak split.
 
-    `batch`/`seq_len` default to the config's; a distributed rank passes its
-    OWN micro-batch (stage 3's capacity profile), and then the eval carve and
-    the eval window are that rank's — which is why the caller prints the shape
-    it used. The tail is sized in READS (`eval_read_bytes`), not scored bytes,
-    so `eval_batches` whole windows fit (capped at 1 MiB; a shortfall above the
-    cap is named on the eval line).
+    `doc_masking=true` replaces the TRAIN stream with a
+    [`DocPackedStream`][dormouse.train.data.DocPackedStream] (one document per
+    row, mask included) and leaves the eval stream flat ON PURPOSE: the
+    held-out BPB is the recorded, comparable number, and re-cutting its window
+    would make every doc-masked run's eval a different measurement. The flag
+    changes what the training objective sees, not the held-out instrument.
+
+    `eval_only=True` is the mixture's call site: the TRAIN side comes from
+    `MixtureStream`, so building (and validating) a second, unused train stream
+    here would make a `mix_plan` run demand a sidecar for a file it never reads
+    (`train/loop.py`'s `open_mixture` branch).
     """
     tr = run.train
-    b = tr.batch if batch is None else batch
-    t = tr.seq_len if seq_len is None else seq_len
-    window = tr.eval_batches * b * t
+    if tr.eval_data:
+        ev = ByteStream(
+            tr.eval_data,
+            tr.batch,
+            tr.seq_len,
+            ring_bytes=min(ring_bytes, max(1 << 20, eval_window_bytes(tr))),
+        )
+        if eval_only:
+            return None, ev
+        if not tr.data:
+            loud(
+                "no data file: `data` is empty in the train config. Escape: set "
+                '`data = "/path/to/corpus.bin"` (a flat .bin of bytes).'
+            )
+        # A directory here would `stat()` as a few KB of inode and stream a
+        # "corpus" of 4096 bytes with no error — the silent-fallback class. The
+        # shard mode lives in the mixture, so the escape is the plan.
+        _refuse_dir(Path(tr.data), "data")
+        train = ByteStream(
+            tr.data, tr.batch, tr.seq_len, ring_bytes=ring_bytes, check_min=not tr.doc_masking
+        )
+        if tr.doc_masking:
+            return DocPackedStream(train, load_doc_starts(tr.data)), ev
+        return train, ev
     if not tr.data:
         loud(
             "no data file: `data` is empty in the train config. Escape: set "
             '`data = "/path/to/corpus.bin"` (a flat .bin of bytes).'
         )
-    # A directory here would `stat()` as a few KB of inode and stream a
-    # "corpus" of 4096 bytes with no error — the silent-fallback class. The
-    # shard mode lives in the mixture, so the escape is the plan.
     _refuse_dir(Path(tr.data), "data")
-    if tr.eval_data:
-        ev = ByteStream(
-            tr.eval_data,
-            b,
-            t,
-            ring_bytes=min(ring_bytes, max(1 << 20, window)),
-        )
-        train = ByteStream(tr.data, b, t, ring_bytes=ring_bytes)
-        return train, ev
-    ev_bytes = min(max(eval_read_bytes(tr), 1), 1 << 20) if tr.eval else 0
+    ev_bytes = min(max(eval_window_bytes(tr), 1), 1 << 20) if tr.eval else 0
     hi_train, _ = split_points(Path(tr.data).stat().st_size, ev_bytes)
-    train = ByteStream(tr.data, b, t, lo=0, hi=hi_train, ring_bytes=ring_bytes)
-    ev = ByteStream(tr.data, b, t, lo=hi_train, ring_bytes=1 << 20) if tr.eval else None
+    ev = (
+        ByteStream(tr.data, tr.batch, tr.seq_len, lo=hi_train, ring_bytes=1 << 20)
+        if tr.eval
+        else None
+    )
+    requested = eval_window_bytes(tr) if tr.eval else 0
+    if ev is not None and ev_bytes < requested:
+        # COUNTED, never silent: the request is larger than the tail this
+        # stream may read, so the stream wraps and the eval re-scores bytes it
+        # already scored. The eval line prints `eval_tail_capped=req/granted`
+        # and its `over N B` counts DISTINCT bytes (`distinct_scored_bytes`).
+        ev.eval_tail_capped = (requested, ev_bytes)
+        print(
+            f"eval_tail_capped={requested}/{ev_bytes}: eval_batches x batch x seq_len "
+            f"asks for {requested} B but the eval tail is capped at {ev_bytes} B; the "
+            f"stream wraps and `over N B` counts distinct bytes only. Escape: shrink "
+            f"eval_batches/batch/seq_len below {1 << 20} B, or point eval_data at a "
+            f"larger held-out file."
+        )
+    if eval_only:
+        return None, ev
+    train = ByteStream(
+        tr.data,
+        tr.batch,
+        tr.seq_len,
+        lo=0,
+        hi=hi_train,
+        ring_bytes=ring_bytes,
+        check_min=not tr.doc_masking,
+    )
+    if tr.doc_masking:
+        train = DocPackedStream(train, load_doc_starts(tr.data))
     return train, ev
 
 

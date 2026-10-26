@@ -15,13 +15,14 @@ analytic ones (`|x_q − x| ≤ block_max / 2·L`), not tuned constants.
 
 from __future__ import annotations
 
+import hashlib
+
 import pytest
 import torch
 import torch.nn.functional as F
 
 from dormouse.config import ModelConfig, load_preset, load_run, parse_preset
 from dormouse.instrument import LoudError
-from dormouse.model import act_quant as aq
 from dormouse.model.act_quant import (
     ACT_FORMATS,
     attn_format,
@@ -246,56 +247,26 @@ def test_group_must_divide_the_last_dim_and_be_non_negative():
         quantize_act(torch.randn(2), "int4", 4)  # 1-dim, group > d
 
 
-def test_non_finite_and_non_float_inputs_are_loud():
+def test_non_finite_is_left_to_the_firewall_and_non_float_inputs_are_loud():
+    """No host read here (ADR-0018 rule 2): NaN/inf are the firewall's policy.
+
+    The old `bool(torch.isfinite(x).all())` was a D2H read on every quantizer
+    call (17 syncs in one tiny training forward). The seam now computes the
+    format's answer and leaves NaN policy to `train/loop.py`'s firewall, whose
+    counter names the failure.
+    """
     bad = _randn(2, 8)
     bad[0, 3] = float("nan")
-    aq._GUARD.reset()
-    with pytest.raises(LoudError, match="non-finite"):
-        quantize_act(bad, "int8")
+    out = quantize_act(bad, "int8")
+    assert out.shape == bad.shape and bool(torch.isnan(out).any())
     inf = _randn(2, 8)
     inf[1, 0] = float("inf")
-    aq._GUARD.reset()
-    with pytest.raises(LoudError, match="non-finite"):
-        fake_quant_act(inf, "fp4")
+    out = fake_quant_act(inf, "fp4")
+    assert not bool(torch.isfinite(out).all())
     with pytest.raises(LoudError, match="float tensors"):
         quantize_act(torch.tensor([[1, 2], [3, 4]]), "int8")
     with pytest.raises(LoudError, match="LAST dim"):
         quantize_act(torch.tensor(3.0), "int8")
-
-
-def test_finite_guard_is_cadenced_and_the_forward_takes_no_host_read(monkeypatch):
-    """The 2026-10-19 audit M7: one D2H per MoE forward became a cadence.
-
-    The guard still refuses (it runs on the first calls), and a forward after
-    that window performs no `.item()` / `bool(any())` — every such read goes
-    through `Tensor.item`, so raising from it is the gate.
-    """
-    x = _randn(4, 64)
-    aq._GUARD.reset()
-    with pytest.raises(LoudError, match="non-finite"):
-        fake_quant_act(torch.full((1, 8), float("nan")), "fp4")
-    aq._GUARD.calls = aq._GUARD.first  # the next call is NOT the cadence
-    assert not aq._GUARD.due()
-
-    def _no_item(self, *args, **kwargs):
-        raise AssertionError("the per-forward path took a host read (.item())")
-
-    def _no_bool(self):
-        raise AssertionError("the per-forward path branched on a device value (bool)")
-
-    with monkeypatch.context() as m:
-        m.setattr(torch.Tensor, "item", _no_item)
-        # `if bool(tensor)` goes through `__bool__` in C, NOT through the Python
-        # `item` attribute — both must raise or the gate cannot see the guard.
-        m.setattr(torch.Tensor, "__bool__", _no_bool)
-        y = fake_quant_act(x, "fp4", 32)
-        y8 = fake_quant_act(x, "int8")
-    assert bool(torch.isfinite(y).all()) and bool(torch.isfinite(y8).all())
-    # The gap is covered by the step's NaN firewall: a non-finite input still
-    # comes out non-finite, so the loss is masked instead of a block being
-    # silently zeroed (the cadence defers the refusal, it does not hide it).
-    bad = torch.full((1, 8), float("nan"))
-    assert bool(torch.isnan(fake_quant_act(bad, "fp4")).all())
 
 
 def test_none_is_the_identity_and_all_zero_blocks_are_safe():
@@ -691,3 +662,88 @@ def test_config_new_act_rungs_their_inert_combinations_and_the_2k_rule():
         "v2_int8",
     }
     assert max_value("mxfp8") == 448.0 and max_value("v2_int4") == 7.0
+
+
+# --------------------------------------------------------------------------
+# ADR-0018 rule 2: the quantizer seam is not a host read
+# --------------------------------------------------------------------------
+
+#: sha256(logits) for the all-rungs fixture, captured on `main` (b2e0a1e,
+#: torch 2.13 CPU, seed 0, `use_tsct=false` so the init has no TSCT QR) BEFORE
+#: this change. `none` is the control; every rung must stay here.
+RUNG_SHAS = {
+    "none": "56c32d872e50e97b3ea5cebaa311af5d8b93e504bd15a887a92f327f51f89d57",
+    "int8": "b8ee2804ccdcf78b101de6c3da17222ddb90672e47d63c189607812e54fee575",
+    "int4": "f6f76f46316cfc0db6f7c0bc7b8355e3451717eea8cafd016ab28bb584b60eea",
+    "fp4": "85f392186e394cfdd5a4ec4bb462105233b0e596fefdbb5e6646c835b87256c1",
+    "mxfp8": "bcd4d53bfe5caf5823f7dac3f0b8b04a86088be40ff453b08b843bcf42270f18",
+    "v2_int4": "1f6d153118affd648775bd51718e8201489ca7503029b641e101e9374661b36c",
+    "v2_int8": "30e197f8beebd23618f6fb37066de42a4a3c459e570bfcc25b239b8e6c1c31b5",
+}
+
+#: `float(loss)` on the same fixture, captured with the shas above. The sha
+#: pins the LOGITS; this pins the scalar the trainer reads, so a loss taken
+#: from other logits or a wrong reduction cannot ride along under a green sha.
+RUNG_LOSSES = {
+    "none": 6.309731960296631,
+    "int8": 6.309488296508789,
+    "int4": 6.306822299957275,
+    "fp4": 6.309034824371338,
+    "mxfp8": 6.308507442474365,
+    "v2_int4": 6.3133368492126465,
+    "v2_int8": 6.309607982635498,
+}
+
+
+def _sha(t: torch.Tensor) -> str:
+    return hashlib.sha256(t.detach().contiguous().numpy().tobytes()).hexdigest()
+
+
+def test_every_rung_is_bit_identical_to_main_on_the_fixed_fixture():
+    """No numerical change on finite inputs: logits AND loss, all seven rungs."""
+    from conftest import tiny_cfg
+
+    from dormouse.model import DormouseModel
+
+    torch.manual_seed(0)
+    base = DormouseModel(tiny_cfg(use_tsct=False))
+    state = base.state_dict()
+    ids = torch.arange(2 * 32, dtype=torch.long).view(2, 32) % 251
+    targets = (ids + 1) % 251
+    for fmt, want in RUNG_SHAS.items():
+        torch.manual_seed(0)
+        model = DormouseModel(tiny_cfg(use_tsct=False, act_quant=fmt))
+        model.load_state_dict(state)
+        with torch.no_grad():
+            logits, loss, _ = model(ids, targets)
+        got = _sha(logits)
+        assert got == want, f"act_quant={fmt} moved the logits: {got} != {want}"
+        assert float(loss) == RUNG_LOSSES[fmt], (
+            f"act_quant={fmt} moved the loss: {float(loss)!r} != {RUNG_LOSSES[fmt]!r}"
+        )
+        print(f"act_quant={fmt} logits sha {got} loss {float(loss):.9f}")
+
+
+@pytest.mark.parametrize("fmt", ["int8", "int4", "fp4"])
+def test_a_training_forward_makes_no_host_read_in_the_quantizer(monkeypatch, fmt):
+    """A full forward+backward with every host-read primitive raising.
+
+    `moe_topk=0` is the DENSE MoE arm: the routed CPU path's
+    `_naive_dispatch` has a pre-existing `.tolist()` (`experts.py:1417`,
+    outside this change), which would mask the quantizer seam. The arms
+    `mxfp8`/`v2_*` delegate to `mxfp`/`hadamard`, whose own finite guards are
+    their modules' business; this gate is `act_quant`'s own path.
+    """
+    from conftest import tiny_model
+
+    model = tiny_model(act_quant=fmt, moe_topk=0)
+    ids = torch.arange(2 * 8, dtype=torch.long).view(2, 8) % 251
+
+    def boom(*_a, **_k):
+        raise AssertionError("host read in the activation-quantizer path")
+
+    for name in ("item", "tolist", "bool", "__bool__", "__float__"):
+        monkeypatch.setattr(torch.Tensor, name, boom)
+    _, loss, counters = model(ids, ids)
+    loss.backward()
+    assert counters.get("act_quant_arms", 0) > 0, "the arm must reach the MoE"

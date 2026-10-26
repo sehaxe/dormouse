@@ -59,23 +59,6 @@ class Counters(dict):
         super().__init__(*args, **kwargs)
         self._device: dict[str, torch.Tensor] = {}
 
-    #: The reason a COUNTED fallback ran is part of the row, not an attribute
-    #: beside it: the JSON sink serialises `dict(window)` and the log line is
-    #: `line()`, so a plain attribute would reach neither (`why` was written by
-    #: eleven call sites and printed by nothing — 2026-10-19 audit M2). It lives
-    #: under the one string key `"why"`; every int-only path below skips it.
-    @property
-    def why(self) -> str | None:
-        v = self.get("why")
-        return str(v) if isinstance(v, str) else None
-
-    @why.setter
-    def why(self, value: str) -> None:
-        if value:
-            dict.__setitem__(self, "why", str(value))
-        else:
-            dict.pop(self, "why", None)
-
     def count(self, name: str, n: int = 1) -> None:
         # THE ORDER IS LOAD-BEARING (audit 2026-10-17, CRITICAL 1): a device
         # tensor must reach `count_device` BEFORE any comparison. `if n == 0`
@@ -118,59 +101,14 @@ class Counters(dict):
         return out
 
     def line(self) -> str:
-        """The one-line form, deterministic (sorted) so two runs' lines diff.
-
-        Counters first, `why` last as `fallback: <reason>` — the reason is
-        free text, so it goes at the END where a whitespace parser can take the
-        rest of the line, and it is printed WHOLE (a counter name longer than
-        24 characters is not a parser column, and truncating it would hide the
-        name the reader needs).
-        """
-        body = " ".join(f"{k}={self[k]}" for k in sorted(self) if k != "why")
-        why = self.why
-        if not why:
-            return body
-        return f"{body} fallback: {why}" if body else f"fallback: {why}"
+        """The one-line form, deterministic (sorted) so two runs' lines diff."""
+        return " ".join(f"{k}={self[k]}" for k in sorted(self))
 
     def merge(self, other: Counters) -> None:
         for k, v in other.items():
-            if k == "why":
-                continue
             self.count(k, v)
         for k, v in other._device.items():
             self._device[k] = self._device.get(k, 0) + v
-        # Distinct reasons only: a per-step fallback merges thousands of times
-        # per window and the same reason must not grow the line.
-        prev = self.why or ""
-        if other.why and other.why not in prev:
-            self.why = f"{prev}; {other.why}" if prev else other.why
-
-
-class GuardCadence:
-    """When a device→host GUARD may take its one read: first N calls, then every M.
-
-    Rule 1.3 (zero host-device synchronization) forbids a per-forward
-    `bool(any())` / `isfinite(...).all()`: the read serialises CPU against GPU
-    on every pass. A guard whose job is to refuse a corrupt input still needs to
-    run somewhere, so it runs on this cadence and the step's NaN firewall is the
-    detector in the gap. `reset()` is the test seam — a guard test must not
-    inherit the count of the tests before it, or "the guard refuses" would be
-    asserted against a skipped call.
-    """
-
-    def __init__(self, first: int = 8, every: int = 1000) -> None:
-        assert first >= 1 and every >= 1, (first, every)
-        self.first = first
-        self.every = every
-        self.calls = 0
-
-    def due(self) -> bool:
-        """True on calls 1..`first` and every `every`-th call after that."""
-        self.calls += 1
-        return self.calls <= self.first or self.calls % self.every == 0
-
-    def reset(self) -> None:
-        self.calls = 0
 
 
 class StepTimer:

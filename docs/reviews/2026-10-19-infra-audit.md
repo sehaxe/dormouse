@@ -23,8 +23,8 @@ non-`--set` input is a preset git does not track:
 
 ```
 $ git -C port status --porcelain
-?? port/configs/small_wide.toml
-?? port/scripts/ab_qat.py
+?? configs/small_wide.toml
+?? scripts/ab_qat.py
 $ ls /home/sehaxe/dormouse/wt/pyrestructure/configs/
 b1.toml  medium.toml  mix_big.toml  small.toml  tiny.toml      # no small_wide.toml
 $ git log --all --oneline -- configs/small_wide.toml           # empty, every branch

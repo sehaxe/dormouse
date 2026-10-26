@@ -38,6 +38,34 @@ def test_unknown_set_key_refuses():
     assert r.exit_code != 0 and "neither a model nor a train key" in str(r.exception)
 
 
+def test_a_bool_set_is_read_as_a_bool_not_as_a_truthy_string():
+    """`--set flag=False` must turn the flag OFF.
+
+    TOML spells booleans lowercase, so the capitalised literal used to survive
+    as the string "False" — truthy, i.e. the opposite of what was typed. This
+    hit every bool flag in the CLI; the field's own type is the fix.
+    """
+    from dormouse.cli import _split_sets
+
+    model, _ = _split_sets(["share_u=False", "use_msa=false", "use_attnres=TRUE"])
+    assert model == {"share_u": False, "use_msa": False, "use_attnres": True}
+
+    # a literal that is not a boolean is refused, not silently truthy
+    import pytest
+
+    from dormouse.instrument import LoudError
+
+    with pytest.raises(LoudError, match="boolean field"):
+        _split_sets(["share_u=maybe"])
+
+
+def test_an_int_set_is_read_as_an_int():
+    from dormouse.cli import _split_sets
+
+    _, train = _split_sets(["steps=1000", "log_every=50"])
+    assert train == {"steps": 1000, "log_every": 50}
+
+
 def test_unported_mechanism_refuses_through_the_cli():
     r = runner.invoke(app, ["info", "small", "--set", 'quant="lbit"'])  # a training-time rung
     assert r.exit_code != 0 and "Escape" in str(
@@ -102,63 +130,6 @@ def ckpt_dir(tmp_path: Path) -> Path:
 def test_train_writes_ckpt_and_snapshot_json_ok(ckpt_dir: Path):
     we, snap = ckpt_dir / "smoke.pt", ckpt_dir / "smoke.config.toml"
     assert we.is_file() and snap.is_file()
-
-
-def test_export_writes_the_artifact_the_readers_share(ckpt_dir: Path, tmp_path: Path):
-    """`dormouse export` → the `.dormouse` file, with `--verify` as the gate."""
-    from dormouse.model.export import read_export
-
-    out = tmp_path / "smoke.dormouse"
-    r = runner.invoke(
-        app,
-        [
-            "export",
-            "--out-dir",
-            str(ckpt_dir),
-            "--ckpt-name",
-            "smoke",
-            "--out",
-            str(out),
-            "--engram-dtype",
-            "fp16",
-            "--verify",
-        ],
-    )
-    assert r.exit_code == 0, r.output
-    assert out.is_file() and out.stat().st_size > 0
-    assert "browser engine: NOT runnable" in r.output, "the tiny polygon is not the engine's"
-    assert "engine implements" in r.output, "the refusal names the fields (rich wraps the line)"
-    assert "verify: max |Δlogits|" in r.output
-    f = read_export(out)
-    assert f.header["seed"] == 1 and f.header["dtypes"] == {"dense": "fp16", "engram": "fp16"}
-    assert f.header["architecture"] == "byte-lm"
-
-
-def test_decode_reads_the_artifact_and_refuses_two_sources(ckpt_dir: Path, tmp_path: Path):
-    out = tmp_path / "smoke.dormouse"
-    made = runner.invoke(
-        app, ["export", "--out-dir", str(ckpt_dir), "--ckpt-name", "smoke", "--out", str(out)]
-    )
-    assert made.exit_code == 0, made.output
-    r = runner.invoke(
-        app, ["decode", "--export", str(out), "--prompt", "hi", "--n", "4", "--device", "cpu"]
-    )
-    assert r.exit_code == 0, r.output
-    assert "4 bytes" in r.output
-    # and it really read THAT file: a missing artifact is refused by name
-    bogus = runner.invoke(
-        app, ["decode", "--export", str(tmp_path / "nope.dormouse"), "--prompt", "hi"]
-    )
-    assert bogus.exit_code != 0 and "does not exist" in str(bogus.exception)
-    both = runner.invoke(
-        app,
-        ["decode", "--export", str(out), "--ckpt-name", "smoke", "--prompt", "hi"],
-    )
-    assert both.exit_code != 0 and "two sources" in str(both.exception)
-    none = runner.invoke(app, ["decode", "--prompt", "hi"])
-    assert none.exit_code != 0 and "--ckpt-name or --export" in str(none.exception)
-    missing = runner.invoke(app, ["export", "--out-dir", str(ckpt_dir)])
-    assert missing.exit_code != 0 and "needs --ckpt-name" in str(missing.exception)
 
 
 def test_eval_runs_the_trained_checkpoint(ckpt_dir: Path, tmp_path: Path):

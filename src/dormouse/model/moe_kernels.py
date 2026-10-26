@@ -87,7 +87,17 @@ purpose — a Triton `autotune` inside a training loop re-tunes whenever a shape
 key moves, which is the treadmill `docs/research/2026-10-15-tsct-super-kernel.md`
 §5.1 bans. Re-measure and edit the constants, do not add a decorator. `num_warps`
 is 4 on the fused kernel and 8 on the three adjoint kernels — both measured, both
-in the bench table; `BLOCK_F`/`BLOCK_N` are the ones that mattered.
+in the bench table; `BLOCK_F`/`BLOCK_N` are the ones that mattered. These numbers
+are for a TWO-BYTE dtype: `tiles_for` halves `BLOCK_N`/`BLOCK_F` at four bytes and
+drops the pipeline to one stage. A tile set that cannot fit is refused BEFORE
+launch with its numbers (`_refusal`), never by a traceback; a launch that still
+refuses falls back to the torch reference COUNTED (`moe_triton_fallback`).
+
+`smem_estimate` is calibrated against `triton.compile(...).metadata.shared` (the
+method and the table are in its docstring), not against arithmetic: the old
+model multiplied by TWO pipeline stages and TWO dot-operand pairs and was 2-8x
+pessimistic at two bytes — it refused `BLOCK_N=256` (measured 40960 B) and 512
+(measured 73728 B) against this card's 101376 B.
 """
 
 from __future__ import annotations
@@ -95,6 +105,9 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from triton.runtime.errors import OutOfResources
+
+from ..instrument import loud
 
 #: The shipped tile set, picked by the b1 bench (`scripts/bench_moe_kernel.py`).
 #:   BLOCK_M  64 — one row-block per expert at cap 64, so a program never splits
@@ -102,24 +115,26 @@ import triton.language as tl
 #:   BLOCK_K  64 — 2048/64 = 32 steps on the `x @ [d, r]` GEMMs, 64 floats = the
 #:                  whole rank in one step on the `[r, f]` side
 #:   BLOCK_F 128 — the f = 5461 write side, 43 steps; 128 measured fastest of
-#:                  {64, 128, 256} in the sweep (4.58 vs 4.83 ms), and 256
-#:                  blows the shared-memory budget at BLOCK_K 128+
+#:                  {64, 128, 256} in the sweep (4.58 vs 4.83 ms), so 128 is
+#:                  the shipped F on speed (the 256 tile measures 40960 B of
+#:                  shared memory and fits; see `smem_estimate`).
 #:   BLOCK_N 128 — the wide adjoint N tile (`dv`, `dx`, `expert_gemm`,
-#:                  `_grouped_nt_pair`); 512 is out of shared memory, and 256 is
-#:                  TOO (battery 2026-10-17: `_grouped_nt_pair` at the b1 shape
-#:                  needs 163840 B against this card's 101376 B, so the fused
-#:                  backward crashed at launch on `(2048, 64)`), so 128 is the
-#:                  shipped N. **The battery's b1 fwd+bwd row for 128 (58.15
-#:                  fused / 67.22 previous adjoint / 67.41 padded) was measured
-#:                  with a POISONED bank cache** — `experts._banks` handed the
-#:                  backward constant banks, so that backward never computed an
-#:                  expert bank gradient (the defect `tests/test_expert_banks.py`
-#:                  now gates). Re-measured on the same bench after that fix:
-#:                  fused 202-240 ms, previous adjoint 211-256, padded 215-253 —
-#:                  the fused adjoint wins by ~4-6%, not 13%, and reverting
-#:                  `_banks` alone reproduces the battery's row exactly
-#:                  (55.96/65.89/65.19). Quote the fwd rows (25.6/26.5/28.8 ms),
-#:                  which the cache defect does not touch.
+#:                  `_grouped_nt_pair`). The old arithmetic said 256/512 were
+#:                  "out of shared memory"; measured with `metadata.shared` they
+#:                  are 40960 / 73728 B and FIT. 128 stays because it is the
+#:                  measured-fast tile at the b1 shape, NOT because the guard
+#:                  refuses the others — `test_a_tile_the_device_can_hold_is_not_refused`
+#:                  is the gate that keeps this honest. **The battery's b1
+#:                  fwd+bwd row for 128 (58.15 fused / 67.22 previous adjoint
+#:                  / 67.41 padded) was measured with a POISONED bank cache** —
+#:                  `experts._banks` handed the backward constant banks, so that
+#:                  backward never computed an expert bank gradient (the defect
+#:                  `tests/test_expert_banks.py` now gates). Re-measured on the
+#:                  same bench after that fix: fused 202-240 ms, previous
+#:                  adjoint 211-256, padded 215-253 — the fused adjoint wins by
+#:                  ~4-6%, not 13%, and reverting `_banks` alone reproduces the
+#:                  battery's row exactly (55.96/65.89/65.19). Quote the fwd rows
+#:                  (25.6/26.5/28.8 ms), which the cache defect does not touch.
 #:   BLOCK_T  16 — the combine backward's TOKEN tile (one program owns
 #:                  BLOCK_T tokens and their whole row of `f`); 16 keeps the
 #:                  per-token row map load amortised without spilling the
@@ -132,6 +147,20 @@ import triton.language as tl
 TILES = {"BLOCK_M": 64, "BLOCK_K": 64, "BLOCK_F": 128, "BLOCK_N": 128, "BLOCK_T": 16}
 
 assert set(TILES) == {"BLOCK_M", "BLOCK_K", "BLOCK_F", "BLOCK_N", "BLOCK_T"}
+
+#: sm_120's per-CTA shared-memory ceiling, in bytes — the launcher's own
+#: `Hardware limit: 101376` (99 KiB of the nominal 100 KiB; the rest is not
+#: usable).
+SMEM_CEILING_BYTES = 101376
+
+#: Launch stages for the ONE kernel that passes an explicit `num_stages`
+#: (`_wgrad`): two at two bytes, one at four. This is a LAUNCH knob, not the
+#: estimate's stage model — `metadata.shared` measures the same bytes at every
+#: stage count for the two-byte kernels (table in `smem_estimate`).
+_WGRAD_STAGES = {2: 2, 4: 1}
+
+#: The dtype names a refusal must print — the message is the evidence.
+_DTYPE_NAMES = {torch.float32: "fp32", torch.bfloat16: "bf16", torch.float16: "fp16"}
 
 #: The widest top-k the fused combine backward carries: the kernel unrolls the
 #: top-k loop (`tl.static_range`), so a top-k past this is code it does not have.
@@ -161,12 +190,138 @@ def glu_arm(e: int) -> str:
     return "fused" if e >= FUSED_GLU_MIN_E else "split"
 
 
-def _tiles(tiles: dict | None) -> dict:
+def _elem_bytes(dtype: torch.dtype) -> int:
+    """Bytes per element of a compute dtype these tiles are sized for."""
+    es = {torch.float16: 2, torch.bfloat16: 2, torch.float32: 4}.get(dtype)
+    assert es is not None, f"no tile rule for dtype {dtype}: the grouped GEMMs take fp32/bf16/fp16"
+    return es
+
+
+def _pipeline_stages(dtype: torch.dtype) -> int:
+    """The `num_stages` `_wgrad` passes explicitly (a launch knob, see `_WGRAD_STAGES`)."""
+    return _WGRAD_STAGES[_elem_bytes(dtype)]
+
+
+def _launch_stages(dtype: torch.dtype) -> dict[str, int]:
+    """Extra launch kwargs: nothing at two bytes (Triton's default, so the bf16
+    path's numbers do not move), one stage at four bytes."""
+    return {} if _elem_bytes(dtype) == 2 else {"num_stages": 1}
+
+
+def _refusal(dtype: torch.dtype, tile: int, n: int) -> str:
+    """The one message a tile that cannot launch prints, numbers included."""
+    return f"{_DTYPE_NAMES[dtype]} tile BLOCK_N={tile} needs {n} bytes > {SMEM_CEILING_BYTES}"
+
+
+def smem_estimate(
+    tiles: dict, dtype: torch.dtype, rank: int | None = None, *, stages: int | None = None
+) -> int:
+    """CTA shared memory of the widest kernel in this family, bytes — MEASURED.
+
+    Method (reproducible, host-side, no launch): `triton.compiler.ASTSource` with
+    each kernel's real signature + constexprs, `triton.compile(..., target=
+    GPUTarget("cuda", 120, 32), options={"num_warps": ...})`, read
+    `metadata.shared`. Triton 3.7.1, 2026-10-26, this box's sm_120. The
+    `tests/test_moe_kernel.py` gate re-runs that compile and prints the table.
+
+    Measured (bf16, `_grouped_gemm_pair_kernel`, BM=64 BK=64, warps 8; the
+    grouped GEMM and GLU are equal or below it):
+
+    | BLOCK_N | stages 1/default/2/3/4 | shared B | allowed (101376) |
+    |--------:|:----------------------:|---------:|:----------------:|
+    |     128 |      same at all      |    24576 | yes (shipped)    |
+    |     256 |      same at all      |    40960 | yes              |
+    |     512 |      same at all      |    73728 | yes              |
+
+    fp32, BM=64 BK=64 BN=64 BF=64, the launch's `num_stages=1`: pair/GEMM/GLU
+    each **32768 B**; `stages=2` pair **65536**, `stages=3` **131072** (the
+    stage multiplier is real at four bytes and absent at two). The old model's
+    196608 B was `2 stages * 2 pairs * (64*64 + 64*128) * 4 B`, an ARITHMETIC
+    number that never matched a compile; the measured fp32 pair at BN=128 and
+    stages=2 is 98304 and fits.
+
+    The formula that reproduces the measured FAMILY max in every checked cell:
+    `stages * es * max(BM*BK + BK*BN, BM*BK + BM*BN, GLU)` with
+    `GLU = max(BM*BK + BK*RP, BM*RP + RP*BF)` and `BK = max(BLOCK_K, RP)`.
+    (At BN=64 the GLU is the max, 24576 B; the pair alone measures 16384 there.
+    At BN>=128 the pair is the max and equals the formula.)
+    `BLOCK_N=512` at fp32 overrides to 147456 and is genuinely refused; the
+    two-byte 512 does not (73728).
+    """
+    es = _elem_bytes(dtype)
+    st = 1 if stages is None else stages
+    assert st >= 1, f"a pipeline needs at least one stage, got {st}"
+    bm, bk = tiles["BLOCK_M"], tiles["BLOCK_K"]
+    bn, bf = tiles["BLOCK_N"], tiles["BLOCK_F"]
+    rp = None if rank is None else _rp(rank)
+    if rp is not None:
+        bk = max(bk, rp)  # the backward's `t_wide` reruns the adjoint at this K
+    terms = [
+        bm * bk + bk * bn,  # pair/group: one operand set, not two
+        bm * bk + bm * bn,  # `_wgrad_kernel` upper bound (measured at half this)
+    ]
+    if rp is not None:
+        terms.append(max(bm * bk + bk * rp, bm * rp + rp * bf))  # `_glu_kernel`
+    return st * es * max(terms)
+
+
+def tiles_for(dtype: torch.dtype, d_model: int, d_ff: int, rank: int | None = None) -> dict:
+    """The tile set for `dtype`: bf16/fp16 is `TILES`, fp32 halves the wide axes.
+
+    Shared memory is bytes, so a 4-byte dtype gets half the elements in the two
+    wide tiles (`BLOCK_N` and `BLOCK_F`) to hold the bytes constant; the tiles
+    are also capped at the next power of two of the dimension they tile, so a
+    narrow model does not ask for a tile wider than its axis. Refuses LOUDLY
+    before launch when even that does not fit (message: the numbers).
+    """
+    assert d_model >= 1 and d_ff >= 1, f"tile shapes must be positive, got {d_model}/{d_ff}"
     t = dict(TILES)
+    if _elem_bytes(dtype) == 4:
+        t["BLOCK_N"] = min(TILES["BLOCK_N"] // 2, triton.next_power_of_2(d_model))
+        t["BLOCK_F"] = min(TILES["BLOCK_F"] // 2, triton.next_power_of_2(d_ff))
+    n = smem_estimate(t, dtype, rank)
+    assert n <= SMEM_CEILING_BYTES, _refusal(dtype, t["BLOCK_N"], n)
+    return t
+
+
+def tile_reason(
+    dtype: torch.dtype,
+    d_model: int,
+    d_ff: int,
+    rank: int | None = None,
+    *,
+    tiles: dict | None = None,
+) -> str | None:
+    """`None` when this dtype's tile set can launch, else the measured refusal.
+
+    `tiles` overrides the dtype's own set (the bench's control arm); it is the
+    same overlay `_tiles` applies, so a refused override reads identically here
+    and at the launcher.
+    """
+    t = tiles_for(dtype, d_model, d_ff, rank)
     if tiles:
         unknown = set(tiles) - set(TILES)
         assert not unknown, f"unknown tile(s) {sorted(unknown)}; known: {sorted(TILES)}"
         t.update(tiles)
+    n = smem_estimate(t, dtype, rank)
+    return None if n <= SMEM_CEILING_BYTES else _refusal(dtype, t["BLOCK_N"], n)
+
+
+def _tiles(
+    tiles: dict | None, dtype: torch.dtype, d_model: int, d_ff: int, rank: int | None = None
+) -> dict:
+    """`tiles_for(dtype)` with the caller's overrides, asserted to fit BEFORE launch.
+
+    A bench may ask for a control tile set; a tile set the device cannot hold is
+    a refusal with the numbers, never a traceback from the first launch.
+    """
+    t = tiles_for(dtype, d_model, d_ff, rank)
+    if tiles:
+        unknown = set(tiles) - set(TILES)
+        assert not unknown, f"unknown tile(s) {sorted(unknown)}; known: {sorted(TILES)}"
+        t.update(tiles)
+    n = smem_estimate(t, dtype, rank)
+    assert n <= SMEM_CEILING_BYTES, _refusal(dtype, t["BLOCK_N"], n)
     return t
 
 
@@ -240,6 +395,57 @@ def _dropless_cap(rows: int) -> int:
 def _prec(dt: torch.dtype) -> str:
     """fp32 must be IEEE, or the parity gate measures TF32, not this kernel."""
     return "ieee" if dt == torch.float32 else "tf32"
+
+
+class LaunchRefused(RuntimeError):
+    """A Triton launch the device refused (shared memory, usually), numbered.
+
+    `OutOfResources` carries `required`/`limit`/`name`; the message keeps them so
+    a counted fallback can print the bytes. This is a REFUSAL, not a crash: the
+    callers below catch it and run the torch reference COUNTED
+    (`moe_triton_fallback`), exactly as `ns_kernels` does for its chain.
+    """
+
+    def __init__(self, kernel: str, err: Exception) -> None:
+        self.kernel = kernel
+        self.required = getattr(err, "required", None)
+        self.limit = getattr(err, "limit", None)
+        super().__init__(
+            f"{kernel}: launch refused — {err} Escape: moe_kernel=naive (or smaller tiles)"
+        )
+
+
+def _launch(kernel, grid, *args, **kwargs):
+    """Launch `kernel[grid](...)`, turning a device refusal into `LaunchRefused`.
+
+    EVERY Triton launch in this file goes through here. The estimator is
+    calibrated against the same compile, so this is a backstop for a tile the
+    measured table does not know (or a Triton whose allocation moved), never the
+    first line of defence.
+    """
+    try:
+        return kernel[grid](*args, **kwargs)
+    except OutOfResources as e:
+        raise LaunchRefused(getattr(kernel, "__name__", str(kernel)), e) from e
+
+
+def _count_launch_refusal(counters, err: LaunchRefused) -> None:
+    """COUNTED: `moe_triton_fallback` + the bytes; a call with no counter is LOUD.
+
+    Same rule as `ns_kernels.zeropower_triton_or_classic`: a fallback a reader of
+    the log cannot see is the ADR-0019 defect, so an uncounted call refuses
+    (with the bytes and the escape) instead of degrading silently.
+    """
+    if counters is None:
+        loud(
+            f"moe_kernels: {err} — this call has no Counters, so the torch fallback "
+            f"could not be COUNTED. Escape: pass the caller's Counters (or fix the "
+            f"tile: moe_kernel=naive)."
+        )
+    counters.count("moe_triton_fallback")
+    prev = getattr(counters, "why", None)
+    note = f"triton launch: {err}"
+    counters.why = f"{prev}; {note}" if prev else note  # type: ignore[attr-defined]
 
 
 def _check(xg, gate_u, up_u, gate_s, up_s, v, offs) -> None:
@@ -318,8 +524,14 @@ def _glu_kernel(
         gp += BLOCK_K * R_
         up += BLOCK_K * R_
 
-    gs = tl.load(gs_ptr + e * R_ + rr)
-    us = tl.load(us_ptr + e * R_ + rr)
+    # MASKED: `gate_s`/`up_s` are contiguous `[E, r]`, so a `rr` past `r` reads
+    # the NEXT row (or, on the last expert, past the tensor). Padded `g_acc`
+    # columns are zero, but `0 * inf`/`0 * nan` is nan, and the chain below
+    # (`sigmoid`, then the masked-to-zero `tl.dot`) would carry it into every
+    # output column of the block. `other=0.0` makes the padded arm's exact
+    # zeros, which is the parity contract.
+    gs = tl.load(gs_ptr + e * R_ + rr, mask=r_mask, other=0.0)
+    us = tl.load(us_ptr + e * R_ + rr, mask=r_mask, other=0.0)
     # The padded arm's elementwise chain runs at the compute dtype on a ROUNDED
     # GEMM output: mirror that exactly (round the accumulator, multiply, round),
     # or the parity gate measures the rounding of a different program. fp32 is a
@@ -642,7 +854,9 @@ def _glu_fused_or_head(xg, gate_u, up_u, gate_s, up_s, v, offs, cap, tiles, spli
         bufs = (gpre, upre, h)
     if split:
         y_ptr = h  # the SPLIT arm leaves the GLU result here; y is never written
-    _glu_kernel[(e, rows)](
+    _launch(
+        _glu_kernel,
+        (e, rows),
         xg,
         gate_u,
         up_u,
@@ -665,6 +879,7 @@ def _glu_fused_or_head(xg, gate_u, up_u, gate_s, up_s, v, offs, cap, tiles, spli
         SAVE=save,
         SPLIT=split,
         num_warps=4,  # 4 beat 8 on the fused kernel (4.58 vs 5.1 ms, b1 sweep)
+        **_launch_stages(dt),
     )
     return y, bufs
 
@@ -683,6 +898,7 @@ def expert_gemm_glu(
     fused_bwd: bool = True,
     seg: torch.Tensor | None = None,
     ws: BwdWorkspace | None = None,
+    counters=None,
 ) -> torch.Tensor:
     """`y [R, f]` = `(silu((xg@gate_u)·gate_s) ⊙ ((xg@up_u)·up_s)) @ v`, grouped.
 
@@ -701,6 +917,14 @@ def expert_gemm_glu(
     `_segments(offs)` and `ws=None` to a throwaway workspace: correct, and the
     reason a standalone call is still one line. `fused_bwd=False` is the
     reference adjoint, kept as the parity gate and the bench's control.
+
+    A launch the device refuses (shared-memory `OutOfResources`) is COUNTED
+    (`moe_triton_fallback`, with the bytes) when `counters` is passed and this
+    function returns the torch reference from `_glu_torch` — differentiable, so
+    the fallback still trains. Without a counter it is LOUD instead of a silent
+    degradation (the same rule as `ns_kernels`); the pre-check
+    (`_tiles`/`tile_reason`) is the measured one that keeps that path from being
+    reached in a normal run.
     """
     _check(xg, gate_u, up_u, gate_s, up_s, v, offs)
     if cap is None:
@@ -710,22 +934,28 @@ def expert_gemm_glu(
         assert seg.shape == (xg.shape[0],) and seg.dtype == torch.int32, (
             "seg must be the [R] int32 row→expert map"
         )
+    t = _tiles(tiles, xg.dtype, gate_u.shape[1], v.shape[2], gate_u.shape[2])
     if fused_bwd and ws is None:
         ws = BwdWorkspace()
-    return _ExpertGemmGlu.apply(
-        xg,
-        gate_u,
-        up_u,
-        gate_s,
-        up_s,
-        v,
-        offs,
-        int(cap),
-        _tiles(tiles),
-        bool(fused_bwd),
-        seg,
-        ws,
-    )
+    try:
+        return _ExpertGemmGlu.apply(
+            xg,
+            gate_u,
+            up_u,
+            gate_s,
+            up_s,
+            v,
+            offs,
+            int(cap),
+            t,
+            bool(fused_bwd),
+            seg,
+            ws,
+            counters,
+        )
+    except LaunchRefused as e:
+        _count_launch_refusal(counters, e)
+        return _glu_torch(xg, gate_u, up_u, gate_s, up_s, v, offs)
 
 
 def expert_gemm(
@@ -735,40 +965,51 @@ def expert_gemm(
     *,
     cap: int | None = None,
     tiles: dict | None = None,
+    counters=None,
 ) -> torch.Tensor:
     """`y [R, f]` = `h @ v[e]` per group — the second half of the split arm.
 
     No silu and no autograd: it is the seam the bench compares against the fused
-    kernel, and the shape the backward's `dy @ vᵀ` runs on.
+    kernel, and the shape the backward's `dy @ vᵀ` runs on. A refused launch runs
+    the torch reference and is COUNTED when `counters` is passed.
     """
     e, r, f = v.shape
     assert h.ndim == 2 and h.shape[1] == r and h.is_cuda and h.is_contiguous()
     assert offs.shape == (e + 1,) and offs.dtype == torch.int32
     if cap is None:
         cap = _dropless_cap(h.shape[0])
-    t = _tiles(tiles)
+    t = _tiles(tiles, h.dtype, f, f)
     y = torch.empty(h.shape[0], f, dtype=h.dtype, device=h.device)
-    _grouped_gemm_kernel[_grid(e, cap, f, t["BLOCK_M"], t["BLOCK_N"])](
-        h,
-        v,
-        y,
-        offs,
-        f,
-        r,
-        h.stride(0),
-        h.stride(1),
-        r * f,
-        f,
-        1,
-        y.stride(0),
-        1,
-        BLOCK_M=t["BLOCK_M"],
-        BLOCK_N=t["BLOCK_N"],
-        BLOCK_K=_rp(r),
-        TRANS_W=False,
-        PREC=_prec(h.dtype),
-        num_warps=8,
-    )
+    try:
+        _launch(
+            _grouped_gemm_kernel,
+            _grid(e, cap, f, t["BLOCK_M"], t["BLOCK_N"]),
+            h,
+            v,
+            y,
+            offs,
+            f,
+            r,
+            h.stride(0),
+            h.stride(1),
+            r * f,
+            f,
+            1,
+            y.stride(0),
+            1,
+            BLOCK_M=t["BLOCK_M"],
+            BLOCK_N=t["BLOCK_N"],
+            BLOCK_K=_rp(r),
+            TRANS_W=False,
+            PREC=_prec(h.dtype),
+            num_warps=8,
+            **_launch_stages(h.dtype),
+        )
+    except LaunchRefused as err:
+        _count_launch_refusal(counters, err)
+        for i, (s, t0) in enumerate(_group_bounds(offs)):
+            if t0 > s:
+                y[s:t0] = (h[s:t0].float() @ v[i].float().T).to(h.dtype)
     return y
 
 
@@ -808,7 +1049,9 @@ def _grouped_nt(a, w, offs, cap, n, k, tiles, out_dtype, out=None):
     else:
         assert out.shape == (a.shape[0], n), f"out {tuple(out.shape)} != [{a.shape[0]}, {n}]"
         assert out.dtype == out_dtype and out.is_contiguous(), "out must be the caller's buffer"
-    _grouped_gemm_kernel[_grid(e, cap, n, tiles["BLOCK_M"], tiles["BLOCK_N"])](
+    _launch(
+        _grouped_gemm_kernel,
+        _grid(e, cap, n, tiles["BLOCK_M"], tiles["BLOCK_N"]),
         a,
         w,
         out,
@@ -828,6 +1071,7 @@ def _grouped_nt(a, w, offs, cap, n, k, tiles, out_dtype, out=None):
         TRANS_W=True,
         PREC=_prec(a.dtype),
         num_warps=8,
+        **_launch_stages(a.dtype),
     )
     return out
 
@@ -846,7 +1090,9 @@ def _grouped_nt_pair(a1, w1, a2, w2, offs, cap, n, k, tiles, out_dtype):
     assert a1.stride() == a2.stride() and w1.stride() == w2.stride(), "shared strides"
     assert a1.is_contiguous() and a2.is_contiguous() and w1.is_contiguous() and w2.is_contiguous()
     out = torch.empty(a1.shape[0], n, dtype=out_dtype, device=a1.device)
-    _grouped_gemm_pair_kernel[_grid(e, cap, n, tiles["BLOCK_M"], tiles["BLOCK_N"])](
+    _launch(
+        _grouped_gemm_pair_kernel,
+        _grid(e, cap, n, tiles["BLOCK_M"], tiles["BLOCK_N"]),
         a1,
         w1,
         a2,
@@ -867,6 +1113,7 @@ def _grouped_nt_pair(a1, w1, a2, w2, offs, cap, n, k, tiles, out_dtype):
         BLOCK_K=tiles["BLOCK_K"],
         PREC=_prec(a1.dtype),
         num_warps=8,
+        **_launch_stages(a1.dtype),
     )
     return out
 
@@ -874,15 +1121,17 @@ def _grouped_nt_pair(a1, w1, a2, w2, offs, cap, n, k, tiles, out_dtype):
 def _wgrad(a, b, offs, e, cap, k, n, tiles, out_dtype):
     """`out [E, K, N]` = `a[group]ᵀ @ b[group]`.
 
-    `num_stages=2` is load-bearing, not taste: the row-loop body stages a
-    `[BLOCK_M, BLOCK_K]` and a `[BLOCK_M, BLOCK_N]` tile, and at `BLOCK_N=256`
-    three stages want 120 KB of the 99 KB of shared memory this card has
-    (`sm_120`) — which is also the tile size that made `_grouped_nt_pair` fail to
-    launch at the b1 shape, so 128 is the shipped N and two stages fit at every
-    rank from 16 to 128.
+    `num_stages` is load-bearing, not taste: the row-loop body stages a
+    `[BLOCK_M, BLOCK_K]` and a `[BLOCK_M, BLOCK_N]` tile, and a four-byte dtype
+    runs ONE stage (`_pipeline_stages`) because the same tile is twice the bytes.
+    The two-byte measure of this kernel is 16384 B at BN=128 and 32768 B at
+    BN=256 (`metadata.shared`, see `smem_estimate`), so 128 is the shipped N and
+    the GUARD no longer claims 256 cannot fit.
     """
     out = torch.empty(e, k, n, dtype=out_dtype, device=a.device)
-    _wgrad_kernel[(e, triton.cdiv(k, tiles["BLOCK_K"]), triton.cdiv(n, tiles["BLOCK_N"]))](
+    _launch(
+        _wgrad_kernel,
+        (e, triton.cdiv(k, tiles["BLOCK_K"]), triton.cdiv(n, tiles["BLOCK_N"])),
         a,
         b,
         out,
@@ -901,19 +1150,74 @@ def _wgrad(a, b, offs, e, cap, k, n, tiles, out_dtype):
         BLOCK_N=tiles["BLOCK_N"],
         PREC=_prec(a.dtype),
         num_warps=8,
-        num_stages=2,
+        num_stages=_pipeline_stages(a.dtype),
     )
     return out
 
 
-def _glu_backward(xg, gate_u, up_u, gate_s, up_s, v, offs, cap, gpre, upre, h, dy, tiles):
+def _group_bounds(offs: torch.Tensor):
+    """`(start, end)` per expert — a host read, ONLY on the torch fallback path."""
+    b = offs.tolist()
+    return list(zip(b[:-1], b[1:], strict=False))
+
+
+def _grouped_nt_torch(a, w, offs, cap, n, k, tiles, out_dtype, out=None):
+    """`_grouped_nt` in torch — the fallback for a refused launch (no Triton)."""
+    res = torch.zeros(a.shape[0], n, dtype=out_dtype, device=a.device)
+    for i, (s, t) in enumerate(_group_bounds(offs)):
+        if t > s:
+            res[s:t] = (a[s:t].float() @ w[i].float().T).to(out_dtype)
+    if out is not None:
+        assert out.shape == res.shape and out.dtype == res.dtype
+        out.copy_(res)
+        return out
+    return res
+
+
+def _wgrad_torch(a, b, offs, e, cap, k, n, tiles, out_dtype):
+    """`_wgrad` in torch — the fallback for a refused launch (no Triton)."""
+    res = torch.zeros(e, k, n, dtype=out_dtype, device=a.device)
+    for i, (s, t) in enumerate(_group_bounds(offs)):
+        if t > s:
+            res[i] = (a[s:t].float().T @ b[s:t].float()).to(out_dtype)
+    return res
+
+
+def _glu_torch(xg, gate_u, up_u, gate_s, up_s, v, offs):
+    """`(silu(x@gate)·(x@up))@v` per group in torch — the launch-refusal fallback.
+
+    Differentiable on purpose: `expert_gemm_glu` calls this OUTSIDE the custom
+    autograd Function, so a refused forward degrades to the reference program with
+    a real graph, not to a leaf that trains nothing.
+    """
+    e, d, r = gate_u.shape
+    f = v.shape[2]
+    y = torch.empty(xg.shape[0], f, dtype=xg.dtype, device=xg.device)
+    for i, (s, t) in enumerate(_group_bounds(offs)):
+        if t <= s:
+            continue
+        g = (xg[s:t] @ gate_u[i].to(xg.dtype)).to(xg.dtype) * gate_s[i]
+        u = (xg[s:t] @ up_u[i].to(xg.dtype)).to(xg.dtype) * up_s[i]
+        h = torch.nn.functional.silu(g.float()).to(xg.dtype) * u
+        y[s:t] = (h @ v[i].to(xg.dtype)).to(xg.dtype)
+    return y
+
+
+def _glu_backward(
+    xg, gate_u, up_u, gate_s, up_s, v, offs, cap, gpre, upre, h, dy, tiles, *, nt=None, wgrad=None
+):
     """The three-GEMM grouped adjoint, all of it on this module's own kernels.
 
     The REFERENCE backward (`fused_bwd=False`): two `dx` GEMMs plus `add_`, a
     `repeat_interleave` segment rebuild, and one allocation per temporary. Kept
     because it is what the fused adjoint is compared against — and because it is
-    the arm an unsupported call falls back to.
+    the arm an unsupported call falls back to. `nt`/`wgrad` are injectable so a
+    launch refusal can run the same op order with the torch reference helpers.
     """
+    if nt is None:
+        nt = _grouped_nt
+    if wgrad is None:
+        wgrad = _wgrad
     e, d, r = gate_u.shape
     f = v.shape[2]
     rp = _rp(r)
@@ -927,7 +1231,7 @@ def _glu_backward(xg, gate_u, up_u, gate_s, up_s, v, offs, cap, gpre, upre, h, d
     t_rank_n = dict(tiles, BLOCK_N=rp)
     t_wide = dict(tiles, BLOCK_K=rp)
 
-    dh = _grouped_nt(
+    dh = nt(
         dyc, v, offs, cap, r, f, dict(t_rank_n, BLOCK_K=tiles["BLOCK_K"]), torch.float32
     )
     # Re-round the gate exactly as the forward did (accumulator -> dtype, multiply
@@ -945,11 +1249,11 @@ def _glu_backward(xg, gate_u, up_u, gate_s, up_s, v, offs, cap, gpre, upre, h, d
     du_pre = du * up_s[seg]
     dg_l, du_l = dg_pre.to(xg.dtype), du_pre.to(xg.dtype)
 
-    dgate_u = _wgrad(xg, dg_l, offs, e, cap, d, r, t_rank_n, xg.dtype)
-    dup_u = _wgrad(xg, du_l, offs, e, cap, d, r, t_rank_n, xg.dtype)
-    dv = _wgrad(h, dyc, offs, e, cap, r, f, t_wide, xg.dtype)
-    dx = _grouped_nt(dg_l, gate_u, offs, cap, d, r, t_wide, xg.dtype)
-    dx = dx.add_(_grouped_nt(du_l, up_u, offs, cap, d, r, t_wide, xg.dtype))
+    dgate_u = wgrad(xg, dg_l, offs, e, cap, d, r, t_rank_n, xg.dtype)
+    dup_u = wgrad(xg, du_l, offs, e, cap, d, r, t_rank_n, xg.dtype)
+    dv = wgrad(h, dyc, offs, e, cap, r, f, t_wide, xg.dtype)
+    dx = nt(dg_l, gate_u, offs, cap, d, r, t_wide, xg.dtype)
+    dx = dx.add_(nt(du_l, up_u, offs, cap, d, r, t_wide, xg.dtype))
 
     dgate_s = _seg_sum(dg * gpre, seg, e)
     dup_s = _seg_sum(du * upre, seg, e)
@@ -1064,11 +1368,11 @@ class _Combine(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, y, w, owner, rowmap, n, ws, tiles):
+    def forward(ctx, y, w, owner, rowmap, n, ws, tiles, counters):
         out = torch.zeros(n, y.shape[1], dtype=torch.float32, device=y.device)
         out.index_add_(0, owner, y.to(torch.float32) * w.unsqueeze(-1))
         ctx.save_for_backward(y, w, rowmap)
-        ctx.ws, ctx.tiles = ws, tiles
+        ctx.ws, ctx.tiles, ctx.counters = ws, tiles, counters
         return out
 
     @staticmethod
@@ -1085,25 +1389,40 @@ class _Combine(torch.autograd.Function):
         # `.grad` — a second backward would silently rewrite the first's gradient.
         # It is `[R]` floats, so there is nothing to save by caching it.
         dw = torch.empty(R, dtype=torch.float32, device=y.device)
-        _combine_bwd_kernel[(triton.cdiv(n, tiles["BLOCK_T"]),)](
-            dout,
-            y,
-            w,
-            rowmap,
-            dy,
-            dw,
-            n,
-            f,
-            K=k,
-            TOP_K=_topk_tile(k),
-            BLOCK_T=tiles["BLOCK_T"],
-            BLOCK_F=tiles["BLOCK_F"],
-            num_warps=4,
-        )
-        return dy, dw, None, None, None, None, None
+        try:
+            _launch(
+                _combine_bwd_kernel,
+                (triton.cdiv(n, tiles["BLOCK_T"]),),
+                dout,
+                y,
+                w,
+                rowmap,
+                dy,
+                dw,
+                n,
+                f,
+                K=k,
+                TOP_K=_topk_tile(k),
+                BLOCK_T=tiles["BLOCK_T"],
+                BLOCK_F=tiles["BLOCK_F"],
+                num_warps=4,
+            )
+        except LaunchRefused as e:
+            # Torch reference for the same two outputs: `dy[row] = go·w[row]`,
+            # `dw[row] = ⟨go, y[row]⟩`; the `-1` sentinel writes nothing.
+            _count_launch_refusal(ctx.counters, e)
+            dy.zero_()
+            dw.zero_()
+            for j in range(k):
+                row = rowmap[:, j]
+                valid = row >= 0
+                rows = row[valid]
+                dy[rows] = (dout[valid] * w[rows].unsqueeze(-1)).to(y.dtype)
+                dw[rows] = (dout[valid] * y[rows].float()).sum(-1)
+        return dy, dw, None, None, None, None, None, None
 
 
-def combine(y, w, owner, rowmap, n, *, ws=None, tiles=None):
+def combine(y, w, owner, rowmap, n, *, ws=None, tiles=None, counters=None):
     """`out [n, f] = Σ_rows y[row]·w[row]`, the rows gathered by `owner` — fused bwd.
 
     The scatter half of the MoE pass (`experts.SparseMoE._triton_dispatch`), with
@@ -1132,7 +1451,14 @@ def combine(y, w, owner, rowmap, n, *, ws=None, tiles=None):
         f"escape is a smaller moe_topk, or the current backward (`fused_bwd=False`)"
     )
     return _Combine.apply(
-        y, w, owner, rowmap, n, ws if ws is not None else BwdWorkspace(), _tiles(tiles)
+        y,
+        w,
+        owner,
+        rowmap,
+        n,
+        ws if ws is not None else BwdWorkspace(),
+        _tiles(tiles, y.dtype, y.shape[1], y.shape[1]),
+        counters,
     )
 
 
@@ -1153,12 +1479,14 @@ class _ExpertGemmGlu(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, xg, gate_u, up_u, gate_s, up_s, v, offs, cap, tiles, fused_bwd, seg, ws):
+    def forward(
+        ctx, xg, gate_u, up_u, gate_s, up_s, v, offs, cap, tiles, fused_bwd, seg, ws, counters
+    ):
         if glu_arm(gate_u.shape[0]) == "split":
             _, (gpre, upre, h) = _glu_fused_or_head(
                 xg, gate_u, up_u, gate_s, up_s, v, offs, cap, tiles, split=True, save=True
             )
-            y = expert_gemm(h, v, offs, cap=cap, tiles=tiles)
+            y = expert_gemm(h, v, offs, cap=cap, tiles=tiles, counters=counters)
         else:
             y, (gpre, upre, h) = _glu_fused_or_head(
                 xg, gate_u, up_u, gate_s, up_s, v, offs, cap, tiles, split=False, save=True
@@ -1166,14 +1494,22 @@ class _ExpertGemmGlu(torch.autograd.Function):
         ctx.save_for_backward(xg, gate_u, up_u, gate_s, up_s, v, offs, gpre, upre, h)
         ctx.cap, ctx.tiles = cap, tiles
         ctx.fused_bwd, ctx.seg, ctx.ws = fused_bwd, seg, ws
+        ctx.counters = counters
         return y
 
     @staticmethod
     def backward(ctx, dy):
         xg, gate_u, up_u, gate_s, up_s, v, offs, gpre, upre, h = ctx.saved_tensors
         args = (xg, gate_u, up_u, gate_s, up_s, v, offs, ctx.cap, gpre, upre, h, dy, ctx.tiles)
-        if ctx.fused_bwd:
-            grads = _glu_backward_fused(*args, ctx.seg, ctx.ws)
-        else:
-            grads = _glu_backward(*args)
-        return (*grads, None, None, None, None, None, None)
+        try:
+            if ctx.fused_bwd:
+                grads = _glu_backward_fused(*args, ctx.seg, ctx.ws)
+            else:
+                grads = _glu_backward(*args)
+        except LaunchRefused as e:
+            # The forward's kernels fit; this tile of the adjoint did not. Run the
+            # REFERENCE chain with torch GEMMs on the same saved tensors: same op
+            # order, no launch that can refuse.
+            _count_launch_refusal(ctx.counters, e)
+            grads = _glu_backward(*args, nt=_grouped_nt_torch, wgrad=_wgrad_torch)
+        return (*grads, None, None, None, None, None, None, None)

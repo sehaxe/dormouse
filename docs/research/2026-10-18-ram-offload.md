@@ -233,8 +233,8 @@ live, and is the largest rung where the only changed variable is table capacity.
 ## 6. Sources
 
 Local (read directly, read-only): `crates/dormouse-train/src/offload.rs`, `crates/dormouse-train/src/lib.rs:1025-1050`,
-`port/src/dormouse/model/engram.py`, `port/src/dormouse/model/experts.py`, `port/src/dormouse/train/loop.py`,
-`port/src/dormouse/config.py`, `AGENTS.md` §2.4/§3.3/§3.5, `docs/research/2026-10-16-budget-savers.md` §5,
+`src/dormouse/model/engram.py`, `src/dormouse/model/experts.py`, `src/dormouse/train/loop.py`,
+`src/dormouse/config.py`, `AGENTS.md` §2.4/§3.3/§3.5, `docs/research/2026-10-16-budget-savers.md` §5,
 `docs/research/2026-09-21-per-gb-sota.md`, `docs/research/2026-10-15-1b-tech-verification.md`,
 `docs/decisions/2026-10-15-1b-readiness-plan.md`, `docs/protocols/AB-PROTOCOL.md`, `docs/papers/engram.md`.
 

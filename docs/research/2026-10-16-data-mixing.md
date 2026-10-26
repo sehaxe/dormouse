@@ -114,7 +114,7 @@ the 410M+ reading ambiguous (**SPECULATION**).
 ## 6. Recommended mix plan for `b1`
 
 Assumptions: one 19.7 GB filtered English-dominant web corpus (`AGENTS.md` §2.6); 5-20B **byte** budget =
-0.25-1.01 passes; byte-level, vocab 256, d2048, max_iter 4 (`port/configs/b1.toml`); 0.40 GFLOP/byte.
+0.25-1.01 passes; byte-level, vocab 256, d2048, max_iter 4 (`configs/b1.toml`); 0.40 GFLOP/byte.
 
 ### 6.1 The plan (fractions by stage, SmolLM2 shape)
 

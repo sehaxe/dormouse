@@ -32,7 +32,7 @@ import subprocess
 
 import pytest
 import torch
-from conftest import local_pin, tiny_cfg, tiny_run
+from conftest import tiny_cfg, tiny_run
 from torch import nn
 
 from dormouse.config import RunConfig, load_run
@@ -80,7 +80,6 @@ def _shape_model(seed: int = 0) -> nn.Module:
     return mod
 
 
-@local_pin
 def test_the_default_path_is_byte_identical():
     """`opt_graph=false` (the default) must not have moved — pinned hashes.
 
@@ -147,6 +146,10 @@ def test_the_trainer_refuses_compile_with_the_graph(tmp_path):
 def _mix(**over) -> tuple[nn.Module, MixOptimizer]:
     torch.manual_seed(0)
     model = DormouseModel(tiny_cfg())
+    if over.get("muon_sf"):
+        # The legal arm: the SF group's decay at Z must be > 0 (Lemma 3.1), and
+        # `wd` here is the AdamW half's 0.0, so the SF value is its own key.
+        over.setdefault("muon_sf_wd", 0.01)
     return model, MixOptimizer(model, lr=0.01, wd=0.0, **over)
 
 
@@ -227,6 +230,73 @@ def test_a_refused_capture_is_counted_and_the_run_stays_eager():
     graph.set_lr(0.01)
     graph.step()
     assert counters["opt_graph_fallback"] == 1 and graph._graph is None
+
+
+def test_a_fallback_restores_the_adamw_capturable_switch():
+    """`_bind_device_lr` flips AdamW onto `capturable=True`; a fallback must undo it.
+
+    On a CUDA box the flip is what makes the captured LR a device read; after a
+    refusal or a failed capture the run is eager again and must be AdamW's
+    NON-capturable branch, or the log's "stayed EAGER" is a different program.
+    The write is simulated here so the gate runs on CPU.
+    """
+    model, opt = _mix()
+    graph = _wrap(opt)
+    group = opt.adamw.param_groups[0]
+    assert not group.get("capturable", False), "the fixture starts on the eager branch"
+    group["capturable"] = True  # what `_bind_device_lr` writes when the params are CUDA
+    graph._fall_back("simulated refusal")
+    assert not group.get("capturable", False), "the capturable branch survived the fallback"
+
+
+def test_frozen_parameters_are_named_not_shape_strings():
+    """`allow_frozen`'s report must name a parameter, not `"0[0] shape (...)"`.
+
+    The old split took the second whitespace field of a `"group {gi}[{i}] shape
+    (...)` message, so the log and the reason named a fragment. The names come
+    from `model.named_parameters()` now; this is the gate on that.
+    """
+    model, opt = _mix()
+    _with_grads(model)
+    name, p = next(iter(model.named_parameters()))
+    p.grad = None
+    graph = _wrap(opt, allow_frozen=True)
+    with pytest.raises(LoudError, match="not on CUDA"):
+        graph.capture()
+    print(f"[frozen] {graph.frozen}")
+    assert graph.frozen == [name], graph.frozen
+
+
+def test_capture_empties_the_cache_once_and_before_the_refusal_decision(monkeypatch):
+    """The headroom rule must read the post-`empty_cache` allocator, once only.
+
+    A second call after `_refusals` (the old code) was both too late for the
+    decision and an extra full-device sweep on every capture attempt. The graph
+    itself is faked: this gate is the CALL ORDER, not a capture.
+    """
+    model, opt = _mix()
+    calls: list[str] = []
+
+    class _FakeGraph:
+        def replay(self) -> None:
+            calls.append("replay")
+
+    class _FakeCtx:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append("empty"))
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: calls.append("sync"))
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", _FakeGraph)
+    monkeypatch.setattr(torch.cuda, "graph", lambda *a, **k: _FakeCtx())
+    graph = _wrap(opt)
+    graph._refusals = lambda: calls.append("decision") or None
+    graph.capture()
+    print(f"[empty_cache] order={calls}")
+    assert calls == ["empty", "decision", "sync", "replay"], calls
 
 
 def test_a_capture_failure_is_counted_with_its_reason():
@@ -337,78 +407,6 @@ def test_a_replay_redoes_the_host_bookkeeping():
     graph.step()
     assert fake.n == 1 and opt.steps == steps + 1
     assert opt.counters["ns_triton"] == 1
-
-
-class _FakeGraph:
-    """A replay counter: enough for the host-bookkeeping tests (no CUDA)."""
-
-    def __init__(self) -> None:
-        self.n = 0
-
-    def replay(self) -> None:
-        self.n += 1
-
-
-def test_a_captured_counter_reason_never_enters_the_replay_map():
-    """N1: the COUNTED fallback's `why` is host text, not a replayable counter.
-
-    `Counters` stores the reason under the string key `why`; the old capture
-    copied the whole dict into `_captured_counters`, so the first replay called
-    `count("why", <str>)` and asserted — a run-killing crash one step after a
-    capture that had seen any triton-NS fallback. The reason is reported once at
-    the capture boundary and must not be re-counted per replay.
-    """
-    model, opt = _mix()
-    opt.counters.count("ns_triton_fallback")
-    opt.counters.why = "triton: input is on cpu"
-    counters = Counters()
-    graph = OptimizerGraph(opt, opt.step, counters=counters)
-    graph._snapshot_counters()
-    assert graph._captured_counters == {"ns_triton_fallback": 1}
-    assert counters.why is not None and "triton: input is on cpu" in counters.why
-
-    graph._graph = _FakeGraph()
-    for _ in range(6):
-        graph._replay()
-    assert graph._graph.n == 6
-    assert opt.counters["ns_triton_fallback"] == 7  # the capture's one + six replays
-    assert counters.why.count("triton: input is on cpu") == 1, "COUNTED once, not per replay"
-
-    # A hand-built/old map carrying the reason must not resurrect the crash.
-    graph._captured_counters = {"ns_triton": 1, "why": "old capture format"}
-    graph._replay()
-    assert opt.counters["ns_triton"] == 1
-
-
-def test_eight_opt_graph_steps_with_a_counter_reason_do_not_crash(tmp_path, monkeypatch):
-    """The task's end-to-end gate: a real `train()` run with capture+replay.
-
-    `capture` is stood in for (no CUDA here) by the same `_snapshot_counters`
-    the real one calls, plus a counter and a reason. With the old capture copy
-    the second graph step dies; with the fix the reason reaches the log exactly
-    once and the int counters keep advancing.
-    """
-    import dormouse.train.loop as loop_mod
-
-    class _Graph(OptimizerGraph):
-        def capture(self) -> None:
-            self.opt.counters.count("ns_triton_fallback")
-            self.opt.counters.why = "triton: input is on cpu"
-            self._snapshot_counters()
-            self._graph = _FakeGraph()
-            self._graph.replay()
-
-    monkeypatch.setattr(loop_mod, "OptimizerGraph", _Graph)
-    run = tiny_run(tmp_path, steps=8, log_every=100, opt_graph=True)
-    lines: list[str] = []
-    report = train(DormouseModel(run.model), run, log=lines.append)
-    counters = report["counters"]
-    assert report["nan_skipped"] == 0
-    assert counters.get("opt_graph_fallback") is None
-    assert counters.why is not None
-    assert counters.why.count("triton: input is on cpu") == 1
-    # Capture step + the two replays after it.
-    assert counters["ns_triton_fallback"] == 3
 
 
 def test_release_restarts_the_warmup():

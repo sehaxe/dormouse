@@ -58,9 +58,42 @@ has), and **every fast arm has a COUNTED fallback with its reason** — `ns_trit
 when the fused chain ran, `ns_triton_fallback` + the reason when it could not
 (`docs/research/2026-10-17-muon-variants.md` §2 #1's void check: "the Triton path
 must be COUNTED, never a silent fallback to classic"). That includes a tile set
-the DEVICE cannot fit: the b1 `(2048, 64)` shape at `BLOCK_D=128` needed 114688 B
-of shared memory against this card's 101376 B and crashed at launch (measured
-2026-10-17), which is a refusal to count, not a traceback to read.
+the DEVICE cannot fit: the launch's own `OutOfResources` is caught and COUNTED
+(`zeropower_triton_or_classic`), never a traceback.
+
+**Shared memory, measured not assumed (2026-10-26, this card, Triton 3.7.1).**
+Two measurements matter, and they disagree:
+(a) **Host-side `ASTSource + triton.compile`** (no launch, `metadata.shared`), RT=64,
+STEPS=5, the number the audit asked for:
+
+| BLOCK_D | warps 4 | warps 8 | ASTSource fits |
+|--------:|--------:|--------:|:--------------:|
+|      64 |   53248 |   65536 | yes            |
+|     128 |   83968 |   90112 | yes            |
+|     256 |  149504 |  151552 | **no**         |
+
+(b) **The REAL launch's own compile (`JITFunction.warmup` with the production
+args)** is orientation-sensitive, because Triton specializes the strides:
+
+| shape (RT=64) | BLOCK_D=64 | BLOCK_D=128 | BLOCK_D=256 |
+|---|---:|---:|---:|
+| tall `(2048, 64)` (the b1 Muon group) | 65536 | **114688 — REFUSED** | 212992 |
+| batched `(1024, 64, 64)` | 57344 | 90112 | 151552 |
+| wide `(64, 5461)` | 53248 | 83968 | 149504 |
+
+So 128 fits the wide and batched chains but NOT the tall `(2048, 64)` chain the
+b1 Muon group actually runs: the old "114688 B" was the real tall-shape number,
+not the arithmetic guess it was called. `BLOCK_D=128` with an explicit
+`num_stages=2` does fit the tall shape (81920 B), but it MEASURED slower on every
+chain — event-timed 200 launches, fp32, warm 10: tall **1.746 vs 1.051 ms**,
+batched **4.458 vs 1.135**, wide **6.053 vs 4.926** — so the shipped tile stays
+64 and the 128 arm stays a measured rejection, not an open follow-up. The 64
+arm's standing evidence is unchanged: parity **1.7e-6 … 2.3e-6** against the
+classic chain at the b1 shapes (fp32/ieee), and the b1 Muon group at
+**677.1 → 162.6 ms/step** in the bench's `_median_ms` idiom (synced
+**675.6 → 607.9 ms**). Table (a) is kept because it is the calibration the audit
+named; table (b) is the one a pre-check must read, and the launch's own
+`OutOfResources` is the backstop.
 """
 
 from __future__ import annotations
@@ -113,24 +146,52 @@ MAX_RANK = 64
 #: first call, per its README). Re-measure with `scripts/bench_ns_triton.py` and
 #: edit these, do not add a decorator.
 #:
-#: **64, not 128, and the reason is shared memory** (battery 2026-10-17). The
-#: `[RT=64, BLOCK_D=128]` operands of `tl.dot(x, trans(x))` need **114688 B**
-#: against this card's **101376 B** limit, so at 128 the b1 Muon group's
-#: `(2048, 64)` shapes died at launch with `OutOfResources` — a CRASH, not a
-#: counted fallback. At 64 every b1 shape launches with parity **1.7e-6 … 2.3e-6**
-#: against the classic chain (fp32/ieee), and the b1 Muon group measures
-#: **677.1 → 162.6 ms/step in the bench's `_median_ms` idiom** (which syncs only
-#: after the loop, so the tail reps carry queue backpressure; a per-rep-synced
-#: harness reads ~31 ms of true enqueue on BOTH arms) and **675.6 → 607.9 ms
-#: synced** — the arm's whole claim. A tile set that still cannot fit is refused
-#: COUNTED now (`zeropower_triton_or_classic`), never crashed.
+#: **64, not 128 — measured, not assumed** (2026-10-26). Host `ASTSource`
+#: compile says 128 is 83968 B, but that route omits Triton's stride
+#: specialization; the real launch on the tall b1 `(2048, 64)` shape asks
+#: **114688 B** and refuses (warmup with the production args, confirmed by an
+#: actual `OutOfResources`). 128 + `num_stages=2` fits (81920 B) and is slower on
+#: every measured chain (1.746 vs 1.051 ms tall, 4.458 vs 1.135 batched,
+#: 6.053 vs 4.926 wide), so 64 stays. Full tables and method: module docstring.
 BLOCK_D = 64
 #: 4, not 8, and it is the same sweep: every b1 chain shape measured faster at 4
 #: warps (`(2048, 64)` 1.210 vs 1.523 ms, `(64, 5461)` 5.780 vs 7.193,
 #: `(513, 1024, 64)` 7.967 vs 13.005), and on the b1 Muon group the synced step
 #: is 683.5 vs 768.7 ms (interleaved, 6 reps each) with the enqueue a tie. At
 #: `r ≤ 64` the `[r, r]` Gram is 4096 values, so 8 warps leave most threads idle.
+#: The shared-memory table is also recorded at 8 warps (it is higher: 90112 B at
+#: `BLOCK_D=128`), because a future sweep must start from numbers, not arithmetic.
 NUM_WARPS = 4
+
+#: sm_120's per-CTA ceiling, the launcher's own `Hardware limit: 101376`.
+SMEM_CEILING_BYTES = 101376
+
+#: `metadata.shared` from the host `ASTSource` compile per `(RT, BLOCK_D)` at
+#: `NUM_WARPS=4`, STEPS=5 (measured 2026-10-26). This is the DOCUMENTED table (a);
+#: it is a LOWER BOUND: the real launch adds stride specialization, and the tall
+#: `(2048, 64)` chain at 128 needs 114688 B (table (b), module docstring). The
+#: launch catch is what covers that gap; the table is not used to pick a tile.
+_NS_SMEM = {
+    (16, 64): 13312,
+    (16, 128): 19456,
+    (16, 256): 35840,
+    (32, 64): 24576,
+    (32, 128): 38912,
+    (32, 256): 71680,
+    (64, 64): 53248,
+    (64, 128): 83968,
+    (64, 256): 149504,
+}
+
+
+def shared_bytes(rt: int, block_d: int) -> int:
+    """The DOCUMENTED host-compile shared memory at `(rt, block_d)`, bytes.
+
+    Table (a) in the module docstring. It is a lower bound, not the launcher's
+    answer (the real tall-shape 128 cell is 114688); the test recompiles it so a
+    Triton drift cannot leave a stale table behind.
+    """
+    return _NS_SMEM[(int(rt), int(block_d))]
 
 #: The prescale's ε, `zeropower_via_ns`'s own `x / (x.norm() + 1e-7)`.
 NS_EPS = 1e-7
@@ -261,7 +322,9 @@ def _ns_chain_kernel(
             )
 
 
-def zeropower_triton(x: torch.Tensor, steps: int = 5) -> torch.Tensor:
+def zeropower_triton(
+    x: torch.Tensor, steps: int = 5, *, block_d: int | None = None
+) -> torch.Tensor:
     """The fused chain: `[m, n]` or `[B, m, n]` in, the polar factor out, fp32.
 
     The same semantics as `optim.zeropower_via_ns(kind="classic")` — normalize by
@@ -275,11 +338,17 @@ def zeropower_triton(x: torch.Tensor, steps: int = 5) -> torch.Tensor:
     `ns_dtype="bf16"` rung rather than composing with it
     (`docs/research/2026-10-17-muon-variants.md` §5: "the two must not ride in
     one A/B"). Exactly ONE kernel launch per call, plus the output allocation.
+
+    `block_d` is the caliper: `None` takes the shipped `BLOCK_D`, an explicit
+    value is used verbatim so a test can force the device's own refusal through
+    the COUNTED catch.
     """
     _check(x)
     assert isinstance(steps, int) and steps >= 0, f"steps={steps!r} must be a non-negative int"
     m, n = x.shape[-2], x.shape[-1]
     r, d = min(m, n), max(m, n)
+    rt = max(16, triton.next_power_of_2(r))
+    bd = BLOCK_D if block_d is None else int(block_d)
     # The logical [r, d] orientation's strides: the transpose is free (two
     # arguments), so no `x.T.contiguous()` copy and no second launch.
     sr, sd = (x.stride(-1), x.stride(-2)) if m > n else (x.stride(-2), x.stride(-1))
@@ -303,11 +372,29 @@ def zeropower_triton(x: torch.Tensor, steps: int = 5) -> torch.Tensor:
         c,
         NS_EPS,
         STEPS=steps,
-        RT=max(16, triton.next_power_of_2(r)),
-        BLOCK_D=BLOCK_D,
+        RT=rt,
+        BLOCK_D=bd,
         num_warps=NUM_WARPS,
     )
     return out
+
+
+def path_reason(x: object, ns_dtype: str = "fp32") -> str | None:
+    """`None` if the fused chain can serve THIS call, else why not.
+
+    The one place the ARM's decision lives (the dtype rung first, then the
+    shape/device reasons), so `zeropower_triton_or_classic` and the batched
+    optimizer's per-job partition cannot disagree about which chain a tensor
+    gets. Every branch is COUNTED by the caller, never silent (ADR-0019).
+    """
+    # The CONFIG reason is asked first: it is the one a reader can act on, and a
+    # device reason would otherwise mask it on every CPU box.
+    if ns_dtype != "fp32":
+        return (
+            f"ns_dtype={ns_dtype!r}: the Triton arm runs the chain in fp32 and SUBSUMES "
+            f"the bf16 rung, so the two must not ride in one A/B"
+        )
+    return triton_reason(x)
 
 
 def zeropower_triton_or_classic(
@@ -344,14 +431,7 @@ def zeropower_triton_or_classic(
         )
     # The CONFIG reason is asked first: it is the one a reader can act on, and a
     # device reason would otherwise mask it on every CPU box.
-    why = None
-    if ns_dtype != "fp32":
-        why = (
-            f"ns_dtype={ns_dtype!r}: the Triton arm runs the chain in fp32 and SUBSUMES "
-            f"the bf16 rung, so the two must not ride in one A/B"
-        )
-    if why is None:
-        why = triton_reason(g)
+    why = path_reason(g, ns_dtype)
     if why is None:
         try:
             out = zeropower_triton(g, steps)
@@ -359,11 +439,12 @@ def zeropower_triton_or_classic(
             # A tile set the device cannot fit is a REFUSAL, and a refusal is a
             # degradation like any other: COUNTED, with the number the reader
             # needs (required vs limit), never a crash at launch. Reachable on
-            # this card only by editing `BLOCK_D` — which is the point: the
-            # constants above are the thing a sweep moves, and the sweep must
-            # not be able to turn a measurement into a traceback.
+            # this card by forcing `BLOCK_D=256` — which is the point: the
+            # constants above are what a sweep moves, and a sweep must not be
+            # able to turn a measurement into a traceback.
             # `tests/test_ns_triton.py::test_a_shape_that_cannot_fit_falls_back_counted`
-            # drives this branch by patching `BLOCK_D` to 128.
+            # patches `BLOCK_D` to 256 and drives this branch (the tall shape's
+            # real launch needs 212992 B).
             why = f"the launch was refused by the device ({type(e).__name__}: {e})"
         else:
             counters.count("ns_triton")

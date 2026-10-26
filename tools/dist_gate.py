@@ -283,7 +283,8 @@ def main() -> None:
     p.add_argument("--opt", default="mix", choices=("mix", "adamw"))
     args = p.parse_args()
     Path(args.out).mkdir(parents=True, exist_ok=True)
-    {"single": run_single, "rank": run_rank, "gradref": run_gradref}[args.mode](args)
+    runner = {"single": run_single, "rank": run_rank, "gradref": run_gradref}[args.mode]
+    runner(args)
 
 
 if __name__ == "__main__":

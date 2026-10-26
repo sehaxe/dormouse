@@ -40,58 +40,101 @@ PRESET_DIR = Path(__file__).resolve().parents[2] / "configs"
 #: `json_log` — the telemetry sink is WHERE the measurement goes and it reaches
 #: no forward (audit MINOR 23, 2026-10-17: the field's own docstring promised
 #: this exemption while `diff_keys` refused the flip).
-PROGRESS_KEYS = ("steps", "log_every", "ckpt_every", "eval", "eval_every", "json_log")
+PROGRESS_KEYS = (
+    "steps",
+    "log_every",
+    "ckpt_every",
+    "eval",
+    "eval_every",
+    "json_log",
+    # `ema_decay` selects WHICH copy of the same trajectory an eval reads: the
+    # checkpoint keeps the raw iterate under `model` (what resume continues)
+    # and the shadow under `model_ema` (what eval/save serve), so changing the
+    # decay on a resume changes a view, never what was trained. It is a
+    # progress key for that reason and is documented on `TrainConfig`.
+    "ema_decay",
+)
 
-#: The commit that deleted six of the fields below (`port(cleanup): delete the
-#: six dead config stubs and the `_unsupported` machinery`, 2026-10-17).
+#: The commit that removed the stubs below (`port(cleanup): delete the six dead
+#: config stubs and the `_unsupported` machinery`, 2026-10-17).
 DEAD_SNAPSHOT_COMMIT = "0e7d25a"
 
-#: Snapshot keys that were VALID when their checkpoint was written and were
-#: deleted later, mapped to the commit that deleted each. This is **NOT a
-#: relaxation of the strict schema** — `_known` still refuses every unknown key
-#: LOUDLY, and the preset path never consults this list. It is a DATED COMPAT
-#: LIST: a snapshot is a record of what a run *was*, and every
-#: `checkpoints/*.config.toml` on disk predates these deletions, so refusing
-#: them would make all 24 of them unreadable (resume, eval, decode, serve,
-#: `--init-from`) for keys that reach no code anyway. `from_snapshot` drops them
-#: COUNTED — one printed line naming each key and its commit — while any key NOT
-#: here still refuses. The same idea as `tools/check_doc_refs.py`'s `KNOWN_DEAD`:
-#: a dated record is not a failure.
+#: Snapshot keys that were VALID when their checkpoint was written and are not
+#: fields of this branch's schema: `key -> (commit, default)`, where `commit` is
+#: the commit that removed the key from this branch's schema, or — for a LANE
+#: key — the commit that carries it on the branch this checkout does not have.
 #:
-#: Six come from `DEAD_SNAPSHOT_COMMIT`; `aux_fb_weight` (the future-byte head,
-#: arXiv:2404.19737) is a SEVENTH that the same class of defect left in every
-#: snapshot — it was deleted in `39d0485` (`delete the aux_fb future-byte head —
-#: a TIE`), and a list of six would still refuse all 24 snapshots on that key.
-#: Enumerated by reading every committed snapshot, not by guess:
-#: `checkpoints/**/*.config.toml` carries exactly these seven unknown keys.
+#: This is **NOT a relaxation of the strict schema**: `_known` still refuses
+#: every unknown key LOUDLY, the preset path never consults this list, and a key
+#: that IS a field of the class is left alone even if it is listed here (a dead
+#: entry can never shadow a live field). It is a DATED COMPAT LIST — a snapshot
+#: is a record of what a run *was*, and every `checkpoints/*.config.toml` on disk
+#: predates these removals, so refusing them would make the snapshots unreadable
+#: (resume, eval, decode, serve, `--init-from`) for keys that reach no code
+#: here. The same idea as `tools/check_doc_refs.py`'s `KNOWN_DEAD`: a dated
+#: record is not a failure.
+#:
+#: The drop is VALUE-CHECKED, and that is the mechanism. A key whose snapshot
+#: value equals its recorded `default` is dropped COUNTED (one printed line per
+#: table, naming each key and its commit). A NON-DEFAULT value is a LOUD refusal
+#: naming the key, its value, the default and the escape: the field is gone from
+#: this code, so resuming would silently run a different forward or optimizer
+#: than the checkpoint was trained with — a different model wearing the same
+#: weights. `sw1` is the standing case: a 300 000-step run trained at
+#: `act_quant = "int4"`, so retiring that field must refuse its resume, never
+#: make the run quietly become `none`.
 DEAD_SNAPSHOT_KEYS = {
-    "use_gr": DEAD_SNAPSHOT_COMMIT,
-    "use_mhc": DEAD_SNAPSHOT_COMMIT,
-    "use_mor": DEAD_SNAPSHOT_COMMIT,
-    "use_situ": DEAD_SNAPSHOT_COMMIT,
-    "jepa_weight": DEAD_SNAPSHOT_COMMIT,
-    "stress": DEAD_SNAPSHOT_COMMIT,
-    "aux_fb_weight": "39d0485",
+    # removed by `port(cleanup): delete the six dead config stubs` (0e7d25a):
+    "use_gr": (DEAD_SNAPSHOT_COMMIT, False),
+    # "use_mhc": removed from this list 2026-10-21 — it is a real field again,
+    # and a listed key that is a field is now skipped, not dropped.
+    "use_mor": (DEAD_SNAPSHOT_COMMIT, False),
+    "use_situ": (DEAD_SNAPSHOT_COMMIT, False),
+    # "jepa_weight": removed from this list 2026-10-21 — it is a real field
+    # again (JEPA as ONE mechanism, `model/jepa.py`); a listed key that is a
+    # field is skipped, not dropped.
+    "stress": (DEAD_SNAPSHOT_COMMIT, False),
+    # removed by `delete the aux_fb future-byte head — a TIE` (39d0485):
+    "aux_fb_weight": ("39d0485", 0.0),
+    # LANE keys: live on branches this checkout does not carry, under these SAME
+    # names — so there is nothing to map them onto here. No field on this branch
+    # means the same thing (`bf16` is a storage flag, not `dtype`'s per-device
+    # policy; no `train` field means "one entry per rank"). Both snapshots that
+    # carry them hold the lane's DEFAULT, so the value check drops them today; a
+    # snapshot from a lane run that MOVED one refuses (below) instead of
+    # resuming as a single-process run wearing a DDP snapshot.
+    "dtype": ("315d3d0", "none"),  # the device-policy lane (`train/device.py`)
+    "dist": ("6f75dfa", False),  # the multigpu lane (`train/distributed.py`)
+    "dist_backend": ("6f75dfa", "auto"),
+    "dist_shard": ("6f75dfa", "none"),
+    "dist_reduce": ("6f75dfa", "auto"),
+    "dist_bucket_mb": ("6f75dfa", 0),
+    "dist_capacity": ("6f75dfa", ""),
 }
 
 #: The `moe_kernel` literals — the expert-pass arms `experts._dispatch` routes
 #: between. One list, read by `validate`: a name that is not here is LOUD.
 MOE_KERNELS = ("padded", "triton", "naive")
-#: The `dtype` literals — the per-DEVICE compute policy request
-#: (`train/device.py`, which owns the ladder and the refusals; this tuple
-#: mirrors `device.DTYPES` the way `MOE_KERNELS` mirrors `experts`' arms, so
-#: the config layer does not import the device layer).
-#: `none` (the default) = the `bf16` flag decides and the layer is never
-#: called; `auto` = probe this device and take its best legal rung (COUNTED);
-#: an explicit rung is LOUD when the device cannot run it. On the CPU arm the
-#: ladder is fp32-only by the port's own rule, so `auto` resolves fp32.
-DTYPES = ("none", "auto", "bf16", "fp16", "fp32")
-#: The distributed knobs' literals — mirrors of `train/distributed.py`'s
-#: `BACKENDS` / `SHARDS` / `REDUCE_DTYPES`, so the config layer does not import
-#: the distributed layer (which imports torch.distributed at call time).
-DIST_BACKENDS = ("auto", "gloo", "nccl")
-DIST_SHARDS = ("none", "fsdp")
-DIST_REDUCE_DTYPES = ("auto", "bf16", "fp16", "fp32")
+#: The `moe_gather` literals — the gather-fused FORWARD (`model/moe_sonic.py`,
+#: SonicMoE §5.1.1): `off` is today's pass, `kernel` reads the expert rows
+#: THROUGH the permute's row map instead of a materialised `[R, d]` copy. It is
+#: a second switch on the same pass, not a fourth `moe_kernel`: `moe_kernel` is
+#: what runs when the gather arm does not, and `moe_gather` is refused (LOUD)
+#: off the bf16 loop-stack route, with the adaptive width, and with `factor_qat`.
+MOE_GATHERS = ("off", "kernel")
+#: The `share_u_mode` literals — how the routed experts' INPUT basis is shaped
+#: (`experts.py`'s module docstring): `off` is one `U` per expert, `plane` is
+#: one `U` for the bank, `dict` is one dictionary plus a per-expert column
+#: subset. A name that is not here is LOUD.
+SHARE_U_MODES = ("off", "plane", "dict")
+#: The `moe_topk_mode` literals — how many experts each TOKEN runs
+#: (`model/adaptive_topk.py`): `off` is the constant `moe_topk` width every
+#: number on record runs; `entropy`/`margin` are the per-token confidence
+#: policies. A name that is not here is LOUD.
+MOE_TOPK_MODES = ("off", "entropy", "margin")
+#: The widest per-token `k` the instrument can name (`moe_k1`..`moe_k8`). Above
+#: this is LOUD: the fused backward's top-k tile also stops at 8.
+MOE_TOPK_SLOTS_MAX = 8
 #: The `expert_act` literals — the 2026-10-16 activation tournament arms, each
 #: with its formula source in `experts.expert_glu`:
 #: `silu` (control, SwiGLU), `situ` (Kimi K3, arXiv 2607.24653 Eq. 12),
@@ -224,7 +267,8 @@ class ModelConfig:
     A key the burn side has and this port does not is NOT a field: setting it is
     an unknown key, refused loudly with the key named and the escape. A field
     that reaches no code is the defect that refusal exists to prevent (the burn
-    history's `use_mhc` reached a trainer that never read it).
+    history's `use_mhc` reached a trainer that never read it — it is ported for
+    real in `use_mhc` below, and `use_gr` is the still-dead example).
     """
 
     # --- geometry -------------------------------------------------------
@@ -235,6 +279,60 @@ class ModelConfig:
     vocab: int = 256
     max_seq_len: int = 512
     max_iter: int = 4
+    #: ---- UNIQUE BLOCKS INSIDE THE LOOP (`model/loopblock.py`) ----
+    #: The number of DISTINCT loop blocks the loop cycles over:
+    #:
+    #:     h = prelude(...)
+    #:     for i in range(max_iter):
+    #:         h = blocks[i % loop_blocks](h, iteration=i)
+    #:     h = coda(...)
+    #:
+    #: `1` (the default) is today's weight-shared loop, bit for bit: no extra
+    #: module is built, no RNG is drawn and no state-dict key appears.
+    #: `loop_blocks=2` at `max_iter=4` runs block 0 on iterations 0/2 and block 1
+    #: on 1/3 — COMPUTE is unchanged, the transformation is not. Each block owns
+    #: its FULL body (controller, KDA, Engram, MoE bank, readout), so the cost is
+    #: ≈ `loop_blocks ×` one block's parameters, which is the depth the loop
+    #: could not buy by iterating one block (`medium`: see
+    #: `tests/test_loop_blocks.py`'s table).
+    #:
+    #: LOOP-LEVEL, deliberately NOT per block (indexed by ITERATION, as today):
+    #: `iter_embed`, the `attnres` pseudo-query slots, and the per-iteration
+    #: gates `msa_gate`/`csa_gate`/`loom_gate`. They describe which pass of the
+    #: loop is running, not which transformation runs it, so block 1 sees the
+    #: same `iter_embed[1]` it would have seen as the only block. mHC's mixing
+    #: matrices ARE per block (each block owns its residual operator); only the
+    #: K-lane STATE is shared across the loop, because it is the loop's state.
+    #: Refused: `< 1`; `> max_iter` (a block that never runs is a config lie);
+    #: `> 1` with `use_byteflow` (Option A builds no loop at all, and Option B
+    #: runs it over K patch latents — an unmeasured state contract).
+    loop_blocks: int = 1
+    #: ---- HALT HEAD (`model/halt.py`): learned inference-time stopping ----
+    #: λ on the halt BCE. `0.0` (the default) builds NO head and adds no
+    #: parameter or compute; a positive weight builds
+    #: `Linear(d, d//4) -> SiLU -> Linear(d//4, 1)` and adds the term to the
+    #: training loss. The target is the model's OWN per-iteration CE: stop at
+    #: iteration `i` iff `CE_i - CE_{i+1} < halt_eps` or `i` is the loop's last
+    #: iteration — never a function of the label sequence (module docstring).
+    halt_weight: float = 0.0
+    #: The CE improvement (nats) below which one more iteration is called
+    #: unhelpful. 0.005 nats = 0.0072 BPB; set by the research scan's reading
+    #: of the depth curves, and a training knob (the A/B keeps it fixed).
+    halt_eps: float = 0.005
+    #: The earliest iteration the INFERENCE stop may fire at (1 = after the
+    #: first). A floor, not a target: `halt_min_iter > 1` guarantees a minimum
+    #: amount of thinking on every input.
+    halt_min_iter: int = 1
+    #: The INFERENCE cap on loop depth when `halt_mode` is on. LOUDLY refused
+    #: above `max_iter` IFF `halt_mode` is on (the `4`/`8` default pair must
+    #: stay a legal config: `max_iter=4`, `halt_mode=false` runs today's model).
+    halt_max_iter: int = 8
+    #: Inference-only switch: run the loop up to `halt_max_iter` and stop at
+    #: the first iteration whose stop probability exceeds 0.5. `false` (the
+    #: default) keeps fixed-depth inference — every existing snapshot's mode.
+    #: Training never halts (the head's BCE needs the full scheduled depth);
+    #: `halt_mode` without a halt head is LOUD.
+    halt_mode: bool = False
     rank: int = 64
     norm_eps: float = 1e-3
 
@@ -245,26 +343,167 @@ class ModelConfig:
     #: unlike burn's `small.toml`, which still ships fp32 (listed in the port
     #: report as a deliberate deviation).
     bf16: bool = True
-    #: The per-DEVICE compute policy request (`DTYPES`, `train/device.py`
-    #: where it is resolved and applied). `none` (the default) is the off
-    #: switch: `bf16` above decides and nothing is probed, so every run and
-    #: snapshot on record is unchanged. `auto` probes the device once and
-    #: takes its best legal rung — COUNTED, the line names the card and why —
-    #: and an explicit rung is refused LOUDLY on a device that cannot run it
-    #: (a 1650 asked for bf16 dies rather than becoming fp16 under the label).
-    #: The applied rung lands in `bf16`, which is what the snapshot and the
-    #: resume gate read; `dtype` itself is pinned too (a flip is a different
-    #: experiment).
-    dtype: str = "none"
     #: TSCT factor format. `none` resolves to bf16 factors at init; every
     #: ladder rung (fp8 → NVFP4 → LittleBit) is a REFUSAL, not a fallback.
     quant: str = "none"
 
     # --- arms -----------------------------------------------------------
+    #: The hard ATTENTION ON/OFF switch (every number on record: true). `false`
+    #: is the degenerate zero branch the loop has always had (`LoopBlock._window`
+    #: writes `torch.zeros`), NOT an attention arm — kept bit-for-bit because
+    #: `tests/test_decode_recurrent.py` and `bench_bf_dtype.py` run it.
     use_kda: bool = True
+    #: WHICH attention arm runs when `use_kda` is on:
+    #:
+    #: * `kda` (the default) — the compressed-state gated-delta arm
+    #:   (`model/kda.py`): O(1) state, the arm every number on record ran. The
+    #:   legacy spelling `use_kda=true` means this arm.
+    #: * `full` — exact causal attention (`model/fullattn.py`,
+    #:   `F.scaled_dot_product_attention(is_causal=True)`): query `p` reads keys
+    #:   `0..p`, no compression. `4·t·d_model = 4.2M` MAC/token at t=1024,
+    #:   d=1024 — the same order as the expert FFN, i.e. affordable at our
+    #:   context length. `q,k,v,o` = `4·d²` parameters against KDA's
+    #:   `4·d² + d·n_heads`: at `medium` the delta is **-16 384** (total
+    #:   141 910 405 → 141 894 021, `dormouse info`).
+    #:
+    #: `use_kda=false` does NOT mean `full`: an off switch that changed the arm
+    #: it switches on would move every zeros-arm run. `full` with `use_kda=false`
+    #: is refused (`validate`). REFUSED with it too, each naming the key and the
+    #: escape: `segment_len>0` (`_validate_segment`: no O(1) boundary state) and
+    #: the recurrent decode/prefill (`decode.recurrent_refusal`, `LoopBlock._attn`:
+    #: a one-byte step has no window to attend over). Allowed: `use_mhc` (residual
+    #: lanes, independent of the attention arm — `tests/test_fullattn.py` runs the
+    #: pair) and `use_byteflow` (the channel's loop runs over K patch latents, and
+    #: causal attention over those latents is well-defined — the same sequence
+    #: KDA already attends over, uncompressed).
+    attn_kind: str = "kda"
     use_tsct: bool = True
+    #: TIED EMBEDDINGS: `lm_head` IS `embed.weight`, transposed, and has no
+    #: parameter of its own (`model/model.py::TiedHead`). That is the frontier
+    #: stack's input/output matrix sharing: `d_model·vocab` parameters saved
+    #: against a dense head, and the head's gradient is ADDED to the embedding
+    #: table's (one matrix, two paths — gated).
+    #:
+    #: The tied head is a PLAIN `[vocab, d]` matrix, so on a `use_tsct=true`
+    #: body it REPLACES the low-rank TSCT head (`u·diag(s)·vᵀ`, `rank`
+    #: parameters) — a second difference a reader of that arm must know. On
+    #: `use_tsct=false` the head was exactly `[vocab, d]`, so tying is the
+    #: clean comparison and saves exactly `d_model·vocab`. `factor_qat` no
+    #: longer reaches the head when tied (there is no head factor pair to
+    #: quantize); the embedding is untouched by it either way.
+    #:
+    #: REFUSED with `use_byteflow` (both shapes bypass `lm_head`; the flag
+    #: would be inert while the snapshot reported it on). `false` is every
+    #: number on record, and the off path is bit-identical.
+    tie_embeddings: bool = False
+
+    # --- cheap width (2026-10-23): stop `d` from setting the dense bill ----
+    #: MLA-style SHARED LATENT for KDA's four `d×d` projections (`q,k,v,g`).
+    #: `0` (off) keeps four `nn.Linear(d, d)`: `4·d²` MAC/token per iteration,
+    #: every number on record. `r > 0` projects the block input ONCE
+    #: (`latent_down`, `d·r`) and reads the four projections off that latent
+    #: (`latent_up`, `r → out` each), so the four cost `d·r + r·Σ out` =
+    #: `5·d·r` while the width stays `d`. `beta_proj` is untouched (`d·h`).
+    #: The reshapes and the FLA call are unchanged.
+    #:
+    #: NOT refused with `factor_qat != "none"`: the four projections — and this
+    #: latent — are plain `nn.Linear` DENSE sites, and `factor_qat` reaches only
+    #: TSCT factor pairs (`u`/`v`). The switches are disjoint, not ambiguous.
+    #: `dense_qat` DOES reach them, through the same `dense_qat_kind` the module
+    #: already reads (`dense_qat_skip_attn` keeps attention bf16, latent
+    #: included). Refused: `r < 0`; `use_kda = false` (no module to reach).
+    attn_latent_rank: int = 0
+    #: GQA on KDA's `k`/`v` projections. `0` (off) is MHA: both project to
+    #: `n_heads·head_dim = d`. `h_kv > 0` projects them to `h_kv·head_dim` and
+    #: EXPANDS with `repeat_interleave(n_heads // h_kv, dim=2)` immediately
+    #: before the kernel, so `q,k,v,g` enter FLA at `[b,t,n_heads,head_dim]`
+    #: exactly as before and only the PROJECTION cost falls
+    #: (`2·d² → 2·d·h_kv·head_dim`). Composes with `attn_latent_rank`: the k/v
+    #: ups then go `r → h_kv·head_dim`.
+    #: Refused LOUDLY: `h_kv < 0`, `h_kv > n_heads`, `n_heads % h_kv != 0`
+    #: (a ragged group has no valid expansion), `use_kda = false`.
+    n_kv_heads: int = 0
+    #: Low-rank `out_proj` (the loop readout): `d → r → d`, cost `2·d·r`
+    #: instead of `d²`. `0` (off) is the readout exactly as before — TSCT at
+    #: `rank` on the default rung, a dense `DenseLinear(d, d)` when
+    #: `use_tsct = false`. `r > 0` sets THIS projection's rank and nothing
+    #: else: on the TSCT rung it builds `TSCTLinear(d, d, r)` (the same
+    #: `U diag(s) Vᵀ` form, one rank knob on one matrix); on the dense rung it
+    #: builds two dense linears (`down [r,d]`, `up [d,r]`), `2·d·r` params.
+    #: NOTE the TSCT default `rank` is already 64, so at `d = 1024` and
+    #: `r = d/4 = 256` the TSCT readout GROWS; the flag is a win where the
+    #: readout was dense or `r < rank`. Refused: `r < 0`, `r > d_model`.
+    out_proj_rank: int = 0
+    #: The expert bank's SHARED input basis (owner directive 2026-10-21) — the
+    #: OLD SPELLING of `share_u_mode = "plane"` below (kept because every
+    #: `--set` and every snapshot names it this way; the two disagreeing is
+    #: LOUD). Every ROUTED expert stops owning its `gate_u`/`up_u [d, rank]` and
+    #: reads ONE tensor per site that `SparseMoE` owns (`experts.py`'s module
+    #: docstring). The per-expert specialization left is `s` and `V [rank, f]`,
+    #: so the bank's capacity lives in a shared dictionary of input directions
+    #: instead of E interchangeable copies — the mechanism that can plausibly
+    #: make a rank-2 bank carry anything (rank 16 with a private `U` measured
+    #: +0.136 BPB, and topk-4 over the same weak bank +0.127; `scripts/ab_rank.py`
+    #: measures the shared ladder).
+    #:
+    #: OFF by default, and off is bit-identical: no parameter is created, no RNG
+    #: is drawn and no counter is emitted, so every snapshot on disk and every
+    #: parameter count on record is unchanged. The always-on shared expert is
+    #: NOT bound (it runs at `shared_rank`, a different shape, and E = 1).
+    #:
+    #: REFUSED loudly with `use_tsct = false` (the shared basis is a TSCT factor,
+    #: so there is no basis to share with the projections dense). With
+    #: `factor_qat != "none"` the basis IS quantized: ONE projection per site
+    #: with its own single α (`dim=None`) and the rung's anneal, cached once per
+    #: optimizer step and read by every expert (plane whole, dict through the
+    #: seeded gather) — `experts.SparseMoE._qat_cache` owns the one entry.
+    share_u: bool = False
+    #: How the shared basis is shaped — THE switch (`share_u` above is its
+    #: `plane` spelling, kept so every snapshot and `--set share_u=...` still
+    #: means what it meant; the two disagreeing is a LOUD error, not a merge).
+    #:
+    #: * `off` — every expert owns its `gate_u`/`up_u [d, rank]`. Every number
+    #:   on record, and bit-identical to the tree before the flag existed.
+    #: * `plane` — ONE `[d, rank]` per site: all experts project the input onto
+    #:   the SAME `rank`-dimensional plane. At rank 2 the whole bank can only
+    #:   see two directions of a `d`-dim state, which is exactly the weakness
+    #:   this mode's control exists to price.
+    #: * `dict` — ONE `[d, share_u_rank]` DICTIONARY per site, and each expert
+    #:   reads `rank` of its columns (`idx[E, rank]`, fixed and seeded, never
+    #:   learned — see `experts.py`). Two experts then see different
+    #:   `rank`-dimensional subspaces of the same dictionary, which is the one
+    #:   thing a shared plane cannot do at rank 2.
+    #:
+    #: `dict` needs `use_tsct = true` for the same reason `plane` does, plus
+    #: `share_u_rank > rank` (a width at or past the dictionary leaves no subset
+    #: to choose). `factor_qat` rides either mode (one quantized basis per site).
+    share_u_mode: str = "off"
+    #: The `dict` mode's dictionary width `R`. `d*R` parameters per site, shared
+    #: by every routed expert; each expert spends `rank` of its columns. 64 at
+    #: medium (d=1024) is 65 536 parameters against the control's 78.3M bank.
+    share_u_rank: int = 64
     use_engram: bool = True
+    #: AttnRes (`2603.15031`): the loop-boundary write becomes a softmax
+    #: mixture over the depth sources with one learned pseudo-query per
+    #: iteration slot (`loopblock.depth_attend`; the paper's score form).
+    #: COMPOSES with `use_mhc`: with both on, mHC owns the K-lane state
+    #: (`H_pre` reads it, `H_post`/`H_res` write it) and AttnRes owns WHICH
+    #: UPDATE the write carries (`loopblock`'s "THE COMPOSITION"). Alone, it
+    #: replaces ReZero exactly as it always did.
     use_attnres: bool = False
+    #: mHC (`2512.24880`, DeepSeek 2025): the residual becomes TWO streams
+    #: mixed by a doubly-stochastic (Sinkhorn-projected) matrix, at the LOOP
+    #: BOUNDARY (the paper's K=2 placement, `docs/reviews/mhc-2026-09-30.md`).
+    #: The iso-depth scaling study (`2604.21106`) measures hyperconnections
+    #: raising the recurrence-equivalence exponent φ 0.453 -> 0.646, which is
+    #: exactly the "deeper loops stop paying" wall we hit at iteration 4.
+    #: `false` (the default) leaves the model bit-identical. Composes with
+    #: `use_attnres` (see the field above); `loom` and `use_byteflow` stay
+    #: refused alongside it.
+    use_mhc: bool = False
+    #: Lanes. Only K=2 ships: it is the configuration the paper measured and
+    #: the one the review wires; `validate` refuses anything else.
+    mhc_streams: int = 2
     #: LOOM (`2610.01153`, 2026-10-01; scanned in
     #: `docs/research/2026-10-16-new-tech-scan.md` §2.1, whose row names our
     #: own `max_iter 4` / operating depth 2 as exactly the regime that paper
@@ -280,6 +519,22 @@ class ModelConfig:
     #: re-derive before any multi-loop default.
     loom: bool = False
     use_byteflow: bool = False
+    #: ---- the prelude/coda topology (`arXiv 2610.23036`, `model/prelude.py`) ----
+    #: A few UNIQUE layers that run once BEFORE the shared loop and a few that
+    #: run once AFTER it: `embed → prelude(0..N) → LoopBlock ×T → coda(0..M) →
+    #: RMSNorm → lm_head`. The loop stays weight-shared; only the layers outside
+    #: it are unique. Each is a pre-norm residual SwiGLU FFN at `d_ff = d/2`
+    #: (1 573 888 params at `medium`'s d=1024), deliberately NOT a second KDA:
+    #: a KDA copy is 4.2M there, which would put 1+1 outside the +2-6M envelope
+    #: and add a second attention arm to the model.
+    #: `0`/`0` (the default) builds nothing, draws no RNG and adds no state dict
+    #: key, so every number on record is bit-identical (`c8a2ff9` golden).
+    #: Legal range 0-4 per side; refused outside it, and refused with
+    #: `use_byteflow` (the byteflow shapes run no byte-level loop to wrap).
+    prelude_layers: int = 0
+    #: See `prelude_layers`. The coda runs on the loop's mean readout, before
+    #: the final norm and `lm_head` — those two never move.
+    coda_layers: int = 0
 
     # --- ByteFlow (arXiv 2603.03583): the byte-compression architecture -----
     # A REAL arm, not a stub: `byteflow.py` ports the crate's
@@ -310,7 +565,8 @@ class ModelConfig:
     #: Noise variance ε² of the coding rate, eq. (11).
     byteflow_eps2: float = 0.5
     #: Score the chunker with the EXACT log-det rate instead of Appendix B's
-    #: L2 fast path (the default: pure tensor ops, no host sync).
+    #: L2 fast path (the default: pure tensor ops, no host sync). REFUSED with
+    #: `bf16 = true`: bf16 Cholesky is unstable (`config._validate_byteflow`).
     byteflow_logdet: bool = False
     #: Byte-sequence length the RoPE tables are built for.
     byteflow_max_bytes: int = 8192
@@ -319,7 +575,25 @@ class ModelConfig:
     n_experts: int = 3
     #: Experts per position. `0` is the DENSE blend (burn's default), `k` is
     #: the sparse top-k dispatch. Above `n_experts` is refused by validate.
+    #: With `moe_topk_mode` != `off` this field is the ARM SWITCH (`> 0` selects
+    #: the routed pass); the per-token width comes from `moe_topk_max` there.
     moe_topk: int = 0
+    #: How many experts each TOKEN runs (`model/adaptive_topk.py`):
+    #: `off` (the default) is the constant `moe_topk` width — every existing run
+    #: and snapshot is bit-identical on it; `entropy` grows the width with the
+    #: router's normalized entropy; `margin` shrinks it with the top-1/top-2
+    #: logit gap. INFERENCE-ONLY: no new parameters and no training path.
+    moe_topk_mode: str = "off"
+    #: The narrow/wide ends of the adaptive width, in experts. `k_min >= 1`,
+    #: `k_min <= k_max <= min(8, n_experts)`; a violation is LOUD at load. Inert
+    #: when `moe_topk_mode = "off"`.
+    moe_topk_min: int = 1
+    moe_topk_max: int = 4
+    #: The confidence window the policy ramps across. `entropy`: normalized
+    #: router entropy in `[0, 1]`; `margin`: the top-1 minus top-2 LOGIT gap in
+    #: logit units. Read only when `moe_topk_mode != "off"`; `lo < hi` is LOUD.
+    moe_entropy_lo: float = 0.2
+    moe_entropy_hi: float = 0.6
     #: Tokens per expert in the capacity-bound permute:
     #: `ceil(capacity * tokens * topk / n_experts)`, never below `topk`.
     #: **`0` = DROPLESS** (2026-10-17): every assignment reaches its expert, so
@@ -349,6 +623,20 @@ class ModelConfig:
     #: is LOUD at config load. `triton` falls back COUNTED to `padded` when the
     #: kernel cannot run (no triton import, input not on CUDA) — never silently.
     moe_kernel: str = "padded"
+    #: The gather-fused FORWARD (`model/moe_sonic.py`, SonicMoE arXiv:2512.14080
+    #: §5.1.1): the grouped GEMM takes the routing's ROW MAP (`toks`/`offs` from
+    #: `gather_abi`) instead of a materialised `[R, d]` copy, so the kernel's A
+    #: load is the only read of `x`'s rows. `off` is every number on record.
+    #: `kernel` is a SECOND switch on the same pass — `moe_kernel` names the arm
+    #: that runs when the gather arm cannot (COUNTED with its reason, the same
+    #: way the triton arm falls back). Refused LOUDLY off the route it is gated
+    #: on: `bf16=false`, `use_byteflow=true`, `moe_topk_mode != "off"` (the
+    #: adaptive width moves unused slots to a sentinel expert past the bank) and
+    #: `factor_qat != "none"` (the kernel reads the dequantized `gate_u`/`up_u`/
+    #: `v`). Its BACKWARD is the shipped grouped adjoint, recomputed on the same
+    #: rows — `moe_sonic.gather_glu` says what that costs and why. No speed claim
+    #: exists until `scripts/bench_gather.py` runs.
+    moe_gather: str = "off"
     #: The expert GLU's activation, the 2026-10-16 activation tournament arm
     #: (`docs/research` scan; formula sources named in `experts.expert_glu`):
     #: `silu` = SwiGLU's gate, the control and every number on record;
@@ -398,6 +686,17 @@ class ModelConfig:
     #: convention) are listed at `DENSE_QATS`; `use_byteflow` is refused with a
     #: non-`none` value (its net's projections are not on this seam).
     dense_qat: str = "none"
+    #: Keep ATTENTION weights out of `dense_qat` — the BitNet b1.58 rule, and
+    #: the default. `tsct.DENSE_QAT_ATTN_SITES` names the ten sites (KDA's
+    #: q/k/v/g/beta and the MSA pair + its selector): b1.58 (arXiv:2402.17764)
+    #: quantizes the FFN weight matrices, not attention, and our own
+    #: `act_quant` already upgrades the attention path to >= 8 bits. Measured
+    #: 2026-10-21 on medium b8 s512, 2000 steps, one 81 920 B eval window, 3
+    #: seeds: with those ten sites projected, `factor_qat=ternary` +
+    #: `dense_qat=ternary` scored BPB 3.2733 against the bf16 control's 3.0750
+    #: (+0.198, +6.5%). `true` passes `kind="none"` at those sites; `false`
+    #: restores that measured run's behaviour and is what the A/B arm uses.
+    dense_qat_skip_attn: bool = True
     #: MemGLU's RMS-calibration constant — the authors' 9M-scale value
     #: (`2608.07323` appendix table: 0.6039096539628113).
     memglu_c0: float = 0.6039096539628113
@@ -416,6 +715,21 @@ class ModelConfig:
     shared_rank: int = 192
 
     # --- aux objectives -------------------------------------------------
+    #: ---- z-loss (PaLM §5 / Gemma-2 §9: the softmax's partition function) ----
+    #: `loss = CE + z_loss · mean_i (logsumexp(logits_i))²`. The squared
+    #: log-partition keeps the pre-softmax logits from drifting tall, which is
+    #: the stability term the PaLM/Gemma recipes carry; it is a REGULARISER, so
+    #: `pure=True` (the held-out number) skips it exactly as it skips every
+    #: aux term. `0.0` (the default) adds no op, no parameter and no counter,
+    #: and the off path is bit-identical.
+    #:
+    #: The term reaches the FINAL `lm_head` logits only (the `norm`+head exit),
+    #: not the loop's per-iteration deep-supervision terms: those are a
+    #: training-only readout of the same state, and a second z-term there would
+    #: be a different objective than the paper's. REFUSED with `use_byteflow`
+    #: (both channel shapes return `_byte_ce` and never build this term, so the
+    #: flag would be inert). Negative values are refused.
+    z_loss: float = 0.0
     #: ---- the DSpark draft head (2607.05147; port wiring 2026-10-16) ----
     #: The DSpark term adds next-K-byte draft supervision + the acceptance
     #: head. `dspark_weight` = γ (D2: the loss is γ-free, the CALLER scales);
@@ -426,6 +740,18 @@ class ModelConfig:
     dspark_k: int = 4
     dspark_stride: int = 16
     dspark_markov_rank: int = 256
+    #: ---- Multi-Token Prediction (DeepSeek-V3 §3.2, `model/mtp.py`) ----
+    #: `mtp_k` = K future-byte modules that share THIS model's embedding and
+    #: `lm_head` (the only new parameters are the K `Linear(2*d, d)` matrices);
+    #: `mtp_weight` = λ on their uniform-mean CE. `0` / `0.0` (the default)
+    #: builds nothing, so every preset's parameter count is unchanged. Refused
+    #: loudly: `mtp_weight > 0` with `mtp_k == 0`, `mtp_k` outside `0..=8`, and
+    #: `use_byteflow` (the channel has no byte ids for the future-byte
+    #: embedding, the same refusal DSpark carries). Prior evidence: the
+    #: `aux_fb` future-byte head Tied at 3 seeds at 9.2M and was deleted in
+    #: `39d0485`; the published wins are large-scale, so the A/B decides here.
+    mtp_k: int = 0
+    mtp_weight: float = 0.0
     #: SIGReg / LeJEPA (arXiv:2511.08544, `model/sigreg.py`): a REGULARISER, not
     #: a head. `loss = CE + sigreg_weight · sigreg_loss(z)`, `z` the strided
     #: sample of the state `lm_head` reads — no teacher, no predictor, no mask,
@@ -434,6 +760,81 @@ class ModelConfig:
     #: §3; the burn `l1 + 0.1·koleo` bundle cannot attribute its own 0.082 BPB).
     #: The suggested grid is 0.005 / 0.05 / 0.1 — publish which.
     sigreg_weight: float = 0.0
+    #: ---- JEPA as ONE mechanism (`model/jepa.py`): a latent predictor + its
+    #: OWN anti-collapse term, never a separate gadget. The arm switch, kept as
+    #: a bool so every arm reads the same way; it MUST agree with the weight
+    #: (`__post_init__`): `jepa` is true iff `jepa_weight > 0`.
+    jepa: bool = False
+    #: λ on the whole JEPA term: `CE + jepa_weight · (cosine + reg)`. `0.0`
+    #: builds no head, adds no parameter and leaves every number bit-identical.
+    jepa_weight: float = 0.0
+    #: The causal horizon `h`: predict `h[p+h]` from `h[p]` in the SAME forward
+    #: (`1` = the next position). Refused below 1 and above `seq_len // 8` (the
+    #: horizon must fit the window with room for a sample; the load path owns
+    #: the `seq_len` half because a preset does not know it).
+    jepa_horizon: int = 1
+    #: The anti-collapse weight INSIDE the JEPA term: SIGReg on the predicted
+    #: latents. It has its own weight so the mechanism is self-contained —
+    #: `jepa_weight` scales the sum, never the two terms differently. `0.1` is
+    #: the value `tests/test_jepa.py`'s collapse gate justifies (the predicted
+    #: latents stay spread at 0.1 and collapse at 0.0).
+    jepa_reg_weight: float = 0.1
+    #: ---- energy-based scoring (EBT, arXiv:2507.02092; `model/energy.py`) ----
+    #: `energy_weight` = λ on the margin-InfoNCE term: the target byte's energy
+    #: must beat `energy_negs` negatives sampled from the `lm_head` softmax by
+    #: `energy.MARGIN`. `0.0` (the default) builds NO head, adds no parameter
+    #: and adds no compute, so every preset and snapshot is bit-identical.
+    #:
+    #: A 256-byte vocabulary is ENUMERABLE, which is why this is a contrastive
+    #: head and not EBT's MCMC: scoring all candidates is one matmul, and the
+    #: same head is the INFERENCE reranker (`scripts/rerank.py`). A quality
+    #: claim needs that table AND `scripts/ab_energy.py`; neither has run.
+    #:
+    #: REFUSED loudly with `use_byteflow` (the channel runs the loop over K
+    #: patch latents and has no byte position for the sampler) and with
+    #: `dspark_weight > 0` (two aux objectives reading the same hidden state is
+    #: not measured here — pick one arm per run).
+    energy_weight: float = 0.0
+    #: Negatives drawn per position from the `lm_head` softmax (target removed).
+    #: `64` covers a quarter of the 256-byte vocabulary per position.
+    energy_negs: int = 64
+    #: InfoNCE temperature τ: lower is sharper (the margin is divided by it too).
+    energy_temp: float = 1.0
+    #: The head's bottleneck `k` in `Linear(d, k) -> SiLU -> Linear(k, 1)`.
+    energy_rank: int = 64
+    #: ---- the compressed, selectable KV memory (CSA) beside KDA ----
+    #: `model/csa.py`. Per `csa_chunk` byte positions ONE shared key and value (`csa_kv_dim`
+    #: wide, MQA), and each query attends exactly over the top `csa_topk`
+    #: entries of the STRICTLY EARLIER chunks — the per-token detail KDA's
+    #: O(1) state cannot hold, at `2·csa_kv_dim·2 / csa_chunk` bytes per context
+    #: byte. ADDITIVE beside KDA behind a per-iteration gate and off by default:
+    #: `use_csa=false` builds no module and no parameter. Chunk ∈ {4,8,16,32},
+    #: width ∈ {64,128}. REFUSED loudly with `use_msa` (two sparse branches is
+    #: not measured), `segment_len>0` (the boundary rule for a half-full chunk
+    #: is undecided), `use_byteflow` (its loop runs over patch latents, so a
+    #: byte chunk would silently be a latent chunk), `use_kda=false` and
+    #: `attn_kind='full'` (this arm is specified beside KDA).
+    use_csa: bool = False
+    csa_chunk: int = 8
+    csa_kv_dim: int = 64
+    csa_topk: int = 32
+    #: ---- the COARSE, DENSE second level (HCA) of the same arm ----
+    #: `csa_coarse_chunk=0` (OFF) keeps the one-level arm bit-identical. When
+    #: on (64/128/256/512, a multiple of `csa_chunk`), `csa_coarse_kv_dim`
+    #: (64/128) wide keys/values are mean-pooled per coarse chunk and EVERY
+    #: query attends densely over all strictly earlier coarse entries. The two
+    #: outputs are summed and pass through the ONE shared `csa_gate` per
+    #: iteration slot. This is the level that makes 1M decode affordable: at
+    #: 256 bytes an entry, 4096 dense entries per 1M bytes (0.52M MAC/byte at
+    #: kv=64, 1.0 MiB of state) against the fine level's 131 072-entry scan
+    #: (8.4M MAC/byte). REFUSED loudly with `use_msa`, `segment_len>0`, a
+    #: non-multiple of `csa_chunk`, or without `use_csa`.
+    csa_coarse_chunk: int = 0
+    csa_coarse_kv_dim: int = 64
+    #: The fine level's off switch. `false` runs the coarse level ALONE (the
+    #: exact-attention parity gate's configuration); refused without a coarse
+    #: level, because it would build a branch that computes nothing.
+    csa_fine: bool = True
     #: ---- the second attention arm (MSA re-entry, ADR-0014; owner 2026-10-16) ----
     #: 1M-context sparse attention BESIDE KDA (which stays the default arm).
     #: `msa_capacity_ratio` = the arm's share of the attention demand (owner:
@@ -480,6 +881,97 @@ class ModelConfig:
         """The factor format the forward actually runs (`none` → bf16)."""
         return "bf16" if self.quant == "none" else self.quant
 
+    def __post_init__(self) -> None:
+        """Resolve the `share_u` alias — ONE switch, two spellings, never two.
+
+        `share_u = true` IS `share_u_mode = "plane"`: it is the boolean the
+        variable existed as for one day, every `--set share_u=...` and every
+        snapshot on disk spells it that way, and a second mode field must not
+        turn that into a config where two keys disagree about the model. So the
+        alias wins over the default and only a CONFLICTING mode is refused —
+        the resolution happens here, the one place every construction passes
+        (`parse_preset`, `--set` through `dataclasses.replace`, tests).
+        """
+        if self.jepa != (self.jepa_weight > 0.0):
+            loud(
+                f"jepa={self.jepa} with jepa_weight={self.jepa_weight}: the switch "
+                f"and the weight must agree — `jepa` is true iff `jepa_weight > 0`. "
+                f"A switch with a zero weight builds no head (the arm would be "
+                f"inert), and a weight with the switch off is a key that lies about "
+                f"what the run computes (model/jepa.py). Escape: `jepa=true` + a "
+                f"positive `jepa_weight`, or `jepa=false` + `jepa_weight=0.0`."
+            )
+        if self.share_u_mode not in SHARE_U_MODES:
+            loud(
+                f"share_u_mode={self.share_u_mode!r} is not an arm. Known: "
+                f"{list(SHARE_U_MODES)} — `off` is a per-expert `U`, `plane` one "
+                f"basis for the whole bank, `dict` one dictionary plus a "
+                f"per-expert column subset (`experts.py`). Escape: name one of "
+                f"those, or land the mode before the config can lie about it."
+            )
+        if self.share_u:
+            if self.share_u_mode not in ("off", "plane"):
+                loud(
+                    f"share_u=true and share_u_mode={self.share_u_mode!r}: two "
+                    f"switches, two models. `share_u` is the old spelling of "
+                    f"`share_u_mode='plane'`, so it cannot also ask for the shared "
+                    f"dictionary. Escape: drop `share_u` (leave it false) and keep "
+                    f"`share_u_mode`, or set `share_u_mode='plane'`."
+                )
+            self.share_u_mode = "plane"
+        for name in ("prelude_layers", "coda_layers"):
+            n = getattr(self, name)
+            if not 0 <= n <= 4:
+                loud(
+                    f"{name}={n} outside 0..=4: the prelude/coda topology ships 0-4 "
+                    f"UNIQUE layers per side (arXiv 2610.23036, model/prelude.py), "
+                    f"and a longer stack is a model nobody priced — each layer is "
+                    f"another 3·d·d/2 parameters. Escape: 0..=4."
+                )
+        if self.z_loss < 0.0:
+            loud(
+                f"z_loss={self.z_loss}: the term is `+ coef · mean(logsumexp²)`, a "
+                f"POSITIVE stability penalty on the logits. A negative value would "
+                f"pay the model to make the partition function tall, which is the "
+                f"opposite of the PaLM/Gemma recipe and has no gate. Escape: "
+                f"z_loss >= 0, or 0.0 to leave the objective alone."
+            )
+        if self.tie_embeddings and self.use_byteflow:
+            loud(
+                "tie_embeddings=true with use_byteflow=true: both byteflow shapes "
+                "leave this model's `lm_head` behind (Option A has its own byte head; "
+                "Option B decodes with `decode_chunks`), so there is no head to tie "
+                "and the flag would be inert while the snapshot reported it on. "
+                "Escape: tie_embeddings=false, or use_byteflow=false."
+            )
+        if self.z_loss > 0.0 and self.use_byteflow:
+            loud(
+                f"z_loss={self.z_loss} with use_byteflow=true: both byteflow shapes "
+                f"compute `_byte_ce` and never reach the `norm`+`lm_head` exit this "
+                f"term is defined on, so the regulariser would be silently absent. "
+                f"Escape: z_loss=0.0, or use_byteflow=false."
+            )
+        # The loop's DISTINCT-body count. Both bounds are structural, not
+        # measured: the loop selects `i % loop_blocks`, so 1 is the bottom of
+        # the index, and a count above `max_iter` allocates a block that no
+        # iteration can reach (the config-lies defect — parameters with no
+        # forward and no gradient). `max_iter` moves freely, so the pair is
+        # checked here where both are known.
+        if self.loop_blocks < 1:
+            loud(
+                f"loop_blocks={self.loop_blocks}: the loop cycles over "
+                f"`blocks[i % loop_blocks]`, so the count is >= 1 (`1` is today's "
+                f"weight-shared block). Escape: 1..=max_iter={self.max_iter}."
+            )
+        if self.loop_blocks > self.max_iter:
+            loud(
+                f"loop_blocks={self.loop_blocks} > max_iter={self.max_iter}: block "
+                f"{self.max_iter} would never be selected (the loop index is "
+                f"`i % loop_blocks` with i < max_iter), so it would be a parameter "
+                f"tree with no forward and no gradient — a config that lies about "
+                f"the model. Escape: loop_blocks <= max_iter, or raise max_iter."
+            )
+
 
 @dataclass
 class TrainConfig:
@@ -492,6 +984,45 @@ class TrainConfig:
     lr: float = 3e-4
     wd: float = 0.01
     grad_clip: float = 1.0
+    #: GRADIENT ACCUMULATION: micro-batch count per optimizer step. `1` (the
+    #: default and every number on record) runs one forward/backward per step.
+    #: `k > 1` runs `k` micro-batches of `batch` rows, divides EACH micro-loss
+    #: by `k` before backward (so the accumulated gradient is the MEAN over the
+    #: micro-batches, not their sum), and calls the optimizer ONCE per group;
+    #: `step` counts optimizer steps, so the LR schedule and every eval/checkpoint
+    #: cadence tick once per group and never per micro-batch. The data order
+    #: matches a `batch·k` run exactly: `ByteStream.next_batch` returns
+    #: consecutive `batch·(seq_len+1)`-byte windows, so `k` reads concatenate to
+    #: the one wide window, and the gate holds the two to 1e-5 (fp reduction
+    #: order is the only difference; a same-forward `[b·k, t]` batch is
+    #: independent per row, so the math is the same mean). A CAPACITY-PADDED
+    #: MoE (`moe_capacity > 0`) is not row-separable — the dispatch drops rows
+    #: as a function of the forward's OTHER rows — so the equivalence cannot
+    #: exist there for either side; the gate runs dropless (`moe_capacity=0`,
+    #: the A/B battery's own COMMON).
+    #:
+    #: Interactions, each decided here rather than discovered:
+    #: * `opt_graph` is REFUSED with `k > 1` (LOUD in `load_run`): the graph
+    #:   captures ONE optimizer stage, and the arm this field names is the
+    #:   hosting of k backward passes around that stage — a capture of a stage
+    #:   whose gradient buffers are filled by a variable number of standing
+    #:   eager passes is not the stage the graph was verified for;
+    #: * `halt` and `segment_len` are ALLOWED: each micro-batch is a full
+    #:   scheduled-depth training forward, the loss is a mean over positions,
+    #:   and the mean of k micro-means is the wide batch's mean — the halt target
+    #:   is per-forward by construction and segmentation is memory slicing of
+    #:   one window, so neither changes meaning under accumulation;
+    #: * `rand_depth` is ALLOWED and samples ONCE per optimizer step (all
+    #:   micro-batches share the step's depth, matching one wide forward);
+    #: * `engram_ram` is ALLOWED: the host rows accumulate every pending leaf
+    #:   across the group and the host update runs once, after the group, which
+    #:   is exactly the old "once per step" contract (the cost is pending-row
+    #:   memory for `k` forwards).
+    #: The NaN firewall treats a group as skipped if ANY micro-batch is
+    #: non-finite: its contribution is sanitized on arrival, the group's shared
+    #: flag ANDs the per-micro flags, and one multiply at the end zeroes every
+    #: accumulated gradient. `nan_skipped` counts GROUPS, not forwards.
+    grad_accum: int = 1
     #: TF32 for the remaining fp32 matmuls (the Muon Newton-Schulz iterations,
     #: the KDA internals, the fp32 lm_head path): measured 2026-10-16 at b1
     #: b8x1024 as 1399 -> 1201 ms/step (+16%, mostly the optimizer's NS bmm).
@@ -688,6 +1219,30 @@ class TrainConfig:
     #: verdict must read the `X`↔`Y` gap and the LR-schedule-free claim, not the
     #: endpoint alone. `scripts/ab_muon_variants.py` is the driver.
     muon_sf: bool = False
+
+    #: The SF arm's weight decay at the **fast iterate `Z`**, i.e. the
+    #: `Z_{t+1} = (1−ηλ)Z_t − η̂P̂_t` term of arXiv:2605.23061v1 Algorithm 1
+    #: line 17 — NOT at `Y` and NOT the AdamW group's `wd`. `0.01` is the
+    #: port's standing `wd`; the theorem needs only **λ > 0** (Lemma 3.1 is
+    #: what lifts the bounded-diameter assumption the SF-Spectral bound
+    #: otherwise has to make), so a non-positive value is REFUSED under
+    #: `muon_sf=true` rather than run outside the precondition. Inert when
+    #: `muon_sf=false`: the control's Muon group carries `wd=0.0` and the
+    #: state dict does not move.
+    muon_sf_wd: float = 0.01
+
+    #: Whether the per-step TSCT polar retraction runs while `muon_sf` is on.
+    #: **`true` is REFUSED**: the retraction pulls each iterate onto the
+    #: Stiefel manifold, so the averaged iterate `X` is a convex combination
+    #: of retracted iterates and is NOT on it; the SF-Spectral proof's
+    #: projection/Lyapunov step (arXiv:2605.23061v1 §3.1, Thm 2.1) needs a
+    #: CONVEX set, and the closest-point projection onto Stiefel is not one.
+    #: This port also has no `retract_tsct` call site at all (the Rust loop's
+    #: per-step retraction was not ported), so `true` could only be an inert
+    #: knob here — the S3 gap in `docs/research/2026-10-16-sf-muon.md:82-93`.
+    #: The legal setting is therefore `false`, and it is explicit in the run's
+    #: own snapshot rather than a fact a reader has to recover from the loop.
+    muon_sf_retract: bool = False
     #: CUDA-graph capture of the optimizer STAGE (`train/graph.py`): the grad
     #: clip + the mixed step are recorded once after `GRAPH_WARMUP_STEPS` eager
     #: steps and replayed with ONE launch per step afterwards. This is the
@@ -719,6 +1274,78 @@ class TrainConfig:
     #: active capture aborts it). A resume with a different value is refused by
     #: the snapshot drift check — it changes what the optimizer computes.
     opt_graph: bool = False
+    #: CUDA-graph capture of the WHOLE training step (`train/graph.py`'s
+    #: `FullGraph`): forward + backward + the device firewall + `zero_grad` +
+    #: the optimizer stage are recorded once and replayed with ONE launch per
+    #: step. It is the direct attack on the measured 13 886 kernel launches per
+    #: b24 s1024 step (fwd 4 938, bwd 3 843, opt 2 483 + clip), where the CPU
+    #: dispatch time exceeds the GPU time (MFU 2.5%).
+    #:
+    #: **`false` by default and the default path is byte-identical** (gated:
+    #: sha256 of a 5-step `state_dict` + logits from a clean `main` worktree,
+    #: `tests/test_full_graph.py`).
+    #:
+    #: WHAT IT CHANGES, all named here because a reader must know before reading
+    #: a number off it:
+    #:
+    #: * the input batch lives in a STATIC device buffer the loop fills with
+    #:   `copy_` (a rebind would leave the recording pointing at the old rows);
+    #: * every `.grad` is pre-allocated by the eager warmup and zeroed IN PLACE
+    #:   (`set_to_none=False`), so the recording keeps its buffers;
+    #: * the LR is a device tensor filled in place (the `opt_graph` seam);
+    #: * the counters the forward writes are replayed from the capture, so a
+    #:   COUNTED arm does not go silent;
+    #: * the whole step's transients live in a graph-private pool that is
+    #:   PERMANENT for the run — this costs VRAM, and on a card that is full it
+    #:   is refused COUNTED rather than allowed to fault (`graph.py`).
+    #:
+    #: `full_graph` IMPLIES `opt_graph` (the stage is inside it), so setting both
+    #: is refused. Every arm the capture cannot carry is refused LOUDLY before
+    #: the first step, with its reason and its `Escape:` — see
+    #: `train.graph.full_graph_refusal`. The one non-refusal a reader should know
+    #: about: **data-dependent routing is fine** (the MoE top-k is a kernel on
+    #: buffer VALUES, so a replay reads whatever the buffer holds) — what is not
+    #: fine is a PYTHON branch on a routing value, and there is none on the
+    #: training path (`grep` for a host read in `model/` finds `act_quant.py:240`,
+    #: `loopblock.py:576`, `loopblock.py:674` and `engram._forward_host`, each of
+    #: which is a refused arm).
+    full_graph: bool = False
+    #: EXPONENTIAL MOVING AVERAGE of the parameters, used at eval/save time.
+    #: `0.0` (the default) keeps no shadow at all: every checkpoint/eval/serve
+    #: path is the pre-arm one, bit-identical. `0 < d < 1` keeps a shadow of the
+    #: PARAMETER TREE and applies `shadow <- d·shadow + (1-d)·param` after each
+    #: optimizer step (once per `grad_accum` group), gated by the NaN firewall's
+    #: device flag so a skipped step leaves the shadow exactly where it was —
+    #: the update is `lerp_` with a 0-dim device weight, so it adds no host
+    #: read. `1.0` is refused (a shadow that never moves is not an average).
+    #:
+    #: WHAT IT COVERS: `model.parameters()` and nothing else — the same tree the
+    #: checkpoint's model half carries. On `engram_ram` the host n-gram tables
+    #: are NOT parameters (they are a sidecar with their own update rule), so
+    #: the shadow is the EMA of the model half while eval reads the live host
+    #: tables. That is stated, not hidden: the alternative is a second 12 GB
+    #: table copy for a substrate that is already its own moving state.
+    #:
+    #: CHECKPOINT CONTRACT: when armed, `save_ckpt` writes the shadow under the
+    #: clearly named `model_ema` key BESIDE the raw training copy under `model`
+    #: (resume continues the raw iterate and its optimizer state, never the
+    #: EMA: the moments belong to the raw weights). `load_model_half` — the
+    #: shared reader of eval/decode/serve/chat — PREFERS `model_ema` when it is
+    #: present, so the checkpoint a reader serves is the averaged model. A
+    #: resume restores the shadow from that key; a checkpoint without it starts
+    #: the shadow from the loaded weights, COUNTED in the log.
+    #:
+    #: RESUME: `ema_decay` is in `PROGRESS_KEYS`, so `--set ema_decay=...` on a
+    #: resume is LEGAL even though it changes what is evaluated. The reason is
+    #: in the paragraph above: the checkpoint carries BOTH copies of the same
+    #: optimizer trajectory, and this knob selects (or re-decays) the shadow,
+    #: never the weights the training step continues from. Refused only with
+    #: `muon_sf` (the params hold the fast iterate Y during a step, so a shadow
+    #: taken there would average a variable that is not the returned iterate X;
+    #: materialising X per step is the named follow-up) and outside [0,1).
+    #: `opt_graph` is ALLOWED: the EMA update runs EAGERLY after the replay,
+    #: outside the captured region, reading the replayed parameters.
+    ema_decay: float = 0.0
     seed: int = 1
     #: WSD warmup, in TOKENS (not steps): the schedule is a function of how
     #: much data the run has seen, so a batch-size change does not change it.
@@ -742,6 +1369,33 @@ class TrainConfig:
     #: exceed `max_epochs × its file size` is a LOUD refusal naming it (the
     #: research onset: MoE degrades at 4× repetition, dense at 8×). 0 = off.
     max_epochs: float = 4.0
+    #: DOCUMENT MASKING (`train/data.py::DocPackedStream`): one DOCUMENT per
+    #: TRAIN row instead of a flat concatenation. Each row is a whole document,
+    #: or a contiguous chunk of one document when it is longer than `seq_len`,
+    #: padded at the tail; the padded/cross-document target positions are
+    #: excluded from the loss (`DormouseModel.forward(loss_mask=...)`).
+    #:
+    #: **Why one document per row and not whole-document PACKING** (two
+    #: documents glued into one row, boundary targets masked): the KDA arm is a
+    #: recurrence carried through the fused `chunk_kda` over the whole window,
+    #: and there is no state reset at a mid-window boundary. A packed row would
+    #: therefore let document B's positions attend to document A's — exactly
+    #: the cross-document dependency this flag removes. Rows that never hold
+    #: two documents need no reset anywhere, fused kernel or not.
+    #:
+    #: The cost, named: a corpus of short documents pays tail padding (a
+    #: 200-byte document leaves ~80 % of a 1024-byte row empty), so the flag is
+    #: a quality lever for short-document corpora and a near-no-op for the
+    #: 6 MB `web` shards. It needs a `<data>.docs.json` sidecar
+    #: (`scripts/build_doc_sidecar.py`): a `.bin` alone cannot say where a
+    #: document ends, and a missing sidecar is a LOUD refusal, never a flat
+    #: fallback. Refused with `segment_len>0` (the carried state has no
+    #: boundary notion), `use_byteflow=true` (patch boundaries are not document
+    #: boundaries), and the target-bearing aux terms.
+    #:
+    #: Non-progress: flipping it changes what the run trains on, so the
+    #: snapshot drift check refuses a flip on a resume.
+    doc_masking: bool = False
     out_dir: str = "checkpoints"
     timers: bool = False
     #: Host-RAM Engram tables — burn's `--engram-ram` (Qwen3.8-Flash-Next §2.3
@@ -759,6 +1413,16 @@ class TrainConfig:
     #: (there is no table to host). Flipping the flag on a resume is refused by
     #: the snapshot drift check — it changes the parameter set AND the optimizer.
     engram_ram: bool = False
+    #: The host update's transient (`model/engram.py::HostTables`). `true` (the
+    #: default) divides the Nesterov look-ahead by its total weight per ROW,
+    #: `1 - HOST_MOMENTUM**(t+1)`, `t` = that row's touch count: a cold row's
+    #: first touch is the raw gradient instead of `1-μ² = 0.0975` of it, and a
+    #: row with `t ≥ 337` (measured) divides by exactly `1.0` (bit-unchanged). `false` is
+    #: burn's `offload.rs` formula verbatim — the A/B's `ram_old_formula` arm.
+    #: Host path only (the in-VRAM table is an `nn.Parameter` on AdamW and never
+    #: reads this). In the snapshot, so a flip on a resume is refused by
+    #: `diff_keys` like every other non-progress key.
+    engram_bias_correction: bool = True
     #: The ADAPTIVE DEPTH arm (owner 2026-10-16): run the loop `T` iterations
     #: per TRAIN step, `T` sampled in `1..=max_iter` as a PURE function of
     #: `(seed, step)` (`train.loop._sample_depth`), with the loss normalized by
@@ -808,40 +1472,6 @@ class TrainConfig:
     #: a SILENT model change wearing a memory flag.
     segment_len: int = 0
 
-    # --- the distributed lane (`train/distributed.py`) -------------------
-    #: Join a single-node multi-process data-parallel run. Set by the CLI's
-    #: `--dist`; the process must have been launched under torchrun (WORLD_SIZE
-    #: > 1 is refused otherwise, and WORLD_SIZE > 1 with dist=false is refused
-    #: too — N ranks each training the same data is not a fallback).
-    dist: bool = False
-    #: The process-group backend (`distributed.BACKENDS`): `auto` is nccl on a
-    #: CUDA fleet and gloo on the CPU arm. `nccl` on a box without it is LOUD,
-    #: never a silent gloo fallback (host-staged gradients compute the right
-    #: answer at a fraction of the speed).
-    dist_backend: str = "auto"
-    #: The sharding arm (`distributed.SHARDS`): `none` = DDP (the path the
-    #: gates prove, and the only one the custom Muon optimizer can ride today),
-    #: `fsdp` = FSDP2 `fully_shard` — available for the `opt=adamw` control arm,
-    #: refused LOUDLY for Muon (the stacked momentum buffer vs DTensor
-    #: gradients, measured) and for resume/checkpoint (the DTensor state dict
-    #: is not the port's single-file format).
-    dist_shard: str = "none"
-    #: The gradient-reduce rung (`distributed.REDUCE_DTYPES`): `auto` = the
-    #: fleet's compute dtype (bf16 on this card), `fp32` = the exact reference
-    #: the gates compare against. A compressed reduce is a POSITIVE claim about
-    #: precision, not a default.
-    dist_reduce: str = "auto"
-    #: DDP's bucket cap in MiB; `0` = derive it from the gradient payload
-    #: (`distributed.bucket_mb_for`: payload/8, clamped) — a PCIe-sized
-    #: starting point, not a measured optimum.
-    dist_bucket_mb: int = 0
-    #: The capacity profile: one entry per rank, `B` or `BxT` (`"4,2"`), or
-    #: `"auto"` (a fixed matmul's measured rate per rank, the global batch
-    #: `batch × world_size` split in proportion). Empty = `batch`/`seq_len` on
-    #: every rank, and the global batch is `batch × world_size` — which is the
-    #: key the whole run is read against.
-    dist_capacity: str = ""
-
     # --- the RL lane (`post/rl.py` + `post/rl_train.py`) ----------------
     # The reward/advantage knobs are `RLConfig`'s fields, spelled here so the CLI
     # and a snapshot carry them; the mapping back is [`rl_config`], the ONE
@@ -849,9 +1479,13 @@ class TrainConfig:
     # rules and cannot drift into a second copy).
     #: `S_sol`'s proxy: `thrift` (bytes against the hidden reference) or `none`.
     rl_quality: str = "thrift"
-    #: X — the group-relative length penalty's ceiling; 0.0 = OFF (the shipped
-    #: default: nobody has measured X/B/A/δ/s/γ at this scale).
-    rl_len_penalty: float = 0.0
+    #: X — the group-relative length penalty's ceiling; 0.0 = OFF.
+    #: The default is MEASURED, not tasted: `scripts/measure_rl_length.py`
+    #: (2026-10-23, 2 500-task corpus, 200 math tasks) found the longest correct
+    #: answer 1.364x the median correct length (15 B vs 11 B). At s = 0.5 the
+    #: ramp is 0.727, so X = 0.1 costs the longest correct answer 7.3 % of a
+    #: passing reward (the stated 10 % budget; X = 0.2 costs 14.5 %, over it).
+    rl_len_penalty: float = 0.1
     #: B — the percentile of the SUCCESSFUL lengths that sets ℓ*_q (0.5-0.75).
     rl_len_quantile: float = 0.5
     #: A — the group pass rate the length term needs (0.3-0.5).
@@ -869,18 +1503,38 @@ class TrainConfig:
     #: The loss normaliser: `prompt-mean` (this lane's rule) or `token-mean` (the
     #: notes' §4.2 control arm).
     rl_agg: str = "prompt-mean"
-    #: The task class `build_tasks` generates (`code` | `math` | `noop`); the
-    #: tasks are GENERATED, so the RL lane reads no corpus at all.
+    #: The task class `build_tasks` generates (`code` | `math` | `noop`) when
+    #: `rl_corpus` is empty. `noop` exists only to test the verifier's refusal.
     rl_task_cls: str = "code"
     #: How many tasks a seed produces (`build_tasks(cls, seed, n=...)`); a step
-    #: draws ONE of them as a pure function of `(seed, step)`.
-    rl_tasks: int = 16
+    #: draws ONE of them as a pure function of `(seed, step, attempt)`. The
+    #: generated pool is the smoke path: 128 is `TASKS_PER_CLASS`, and the
+    #: default 32-task holdout leaves 96 to train on. A real run points
+    #: `rl_corpus` at the 2 500-task JSONL instead.
+    rl_tasks: int = 128
     #: G — rollouts per prompt: the group the reward, the advantage and the
     #: length penalty are all relative to. GRPO's group of 4-8 is the sourced band.
     rl_group: int = 4
     #: The rollout's byte budget (`correct@budget(bytes)`): prompt + response +
     #: 2 B per generation stroke. 256 B is the `code` class's own budget.
     rl_budget: int = 256
+    #: A `scripts/build_rl_tasks.py` JSONL corpus. Empty = the generated
+    #: `build_tasks(cls, seed + SFT_TASK_OFFSET)` pool.
+    rl_corpus: str = ""
+    #: Tasks carved out of the corpus as the held-out eval half (never trained).
+    rl_holdout: int = 32
+    #: Held-out eval cadence in steps; 0 = only the before/after readings.
+    rl_eval_every: int = 50
+    #: Sampled attempts per held-out task for `pass@budget` (plus the greedy
+    #: `pass@1` attempt, which is always taken).
+    rl_eval_samples: int = 2
+    #: The difficulty band on the group's pass rate, INCLUSIVE at both ends:
+    #: below `lo` the group is too hard, above `hi` it is consensus.
+    rl_band_lo: float = 0.2
+    rl_band_hi: float = 0.8
+    #: Candidate prompts a step may draw before the counted fallback trains the
+    #: last one (`rl_band_exhausted`). 1 disables the retry, not the band.
+    rl_band_attempts: int = 4
 
 
 #: The `rl_adv` literals — the two advantage arms `rl.rl_advantages` implements.
@@ -926,10 +1580,11 @@ class RunConfig:
         """Inverse of [`snapshot_toml`], strict about unknown keys.
 
         One COUNTED exception: a key in [`DEAD_SNAPSHOT_KEYS`] was valid when
-        the snapshot was written and was deleted later, so it is dropped with a
-        printed line naming the key and its commit rather than refused — every
-        checkpoint on disk predates the deletions. A key that is not on that
-        list still refuses LOUDLY (`_known`).
+        the snapshot was written and is not a field of this branch. It is
+        dropped only when its value IS the recorded default (a drop that changes
+        nothing the run computes); a non-default value is refused LOUDLY rather
+        than dropped, because dropping it would resume a different model. A key
+        that is not on that list still refuses (`_known`).
         """
         try:
             raw = tomllib.loads(text)
@@ -939,12 +1594,12 @@ class RunConfig:
             source=raw.get("source", ""),
             model=_from_table(
                 ModelConfig,
-                _drop_dead_snapshot_keys(raw.get("model", {}), "snapshot.model"),
+                _drop_dead_snapshot_keys(ModelConfig, raw.get("model", {}), "snapshot.model"),
                 where="snapshot.model",
             ),
             train=_from_table(
                 TrainConfig,
-                _drop_dead_snapshot_keys(raw.get("train", {}), "snapshot.train"),
+                _drop_dead_snapshot_keys(TrainConfig, raw.get("train", {}), "snapshot.train"),
                 where="snapshot.train",
             ),
         )
@@ -972,31 +1627,55 @@ def _from_table(cls: type, table: dict[str, Any], where: str) -> Any:
     return cls(**_known(cls, table, where))
 
 
-def _drop_dead_snapshot_keys(table: dict[str, Any], where: str) -> dict[str, Any]:
-    """Drop [`DEAD_SNAPSHOT_KEYS`] from a snapshot table, COUNTED (ADR-0011/0019).
+def _same_snapshot_value(value: Any, default: Any) -> bool:
+    """Is `value` the recorded default? Type-guarded: `False == 0` in Python,
+    and a snapshot that wrote `0` where the field was a bool is NOT at default."""
+    if isinstance(value, bool) or isinstance(default, bool):
+        return isinstance(value, bool) and isinstance(default, bool) and value == default
+    return value == default
 
-    A snapshot is a record of what a run WAS: these keys were valid when it was
-    written and were deleted later (see [`DEAD_SNAPSHOT_KEYS`]). Dropping them is
-    COUNTED — one printed line naming each key and its commit — because the
-    alternative is refusing every checkpoint written before those commits, which
-    is the whole class of run the snapshot path exists to reopen.
+
+def _drop_dead_snapshot_keys(cls: type, table: dict[str, Any], where: str) -> dict[str, Any]:
+    """Drop dead snapshot keys that sit at their recorded default, COUNTED.
+
+    A snapshot is a record of what a run WAS: a [`DEAD_SNAPSHOT_KEYS`] key was
+    valid when it was written and is not a field of `cls` on this branch. The
+    drop is VALUE-CHECKED — the default is dropped, because nothing the run
+    computed depends on a key that held its default; a non-default is a LOUD
+    refusal, because dropping it would resume a different model or optimizer
+    than the checkpoint was trained with. A key that IS a field of `cls` is
+    never dropped: this list is dated, the schema is live.
 
     This does NOT relax the strict schema: `_known` still refuses any key not on
     the list, LOUDLY, and `parse_preset` never calls this — a preset says what
     will RUN, so a stale key there is exactly the lie the strict check catches.
     """
-    dead = sorted(k for k in table if k in DEAD_SNAPSHOT_KEYS)
+    live = {f.name for f in dataclasses.fields(cls)}
+    dead = sorted(k for k in table if k in DEAD_SNAPSHOT_KEYS and k not in live)
     if not dead:
         return dict(table)
-    named = ", ".join(f"{k} ({DEAD_SNAPSHOT_KEYS[k]})" for k in dead)
+    for key in dead:
+        commit, default = DEAD_SNAPSHOT_KEYS[key]
+        value = table[key]
+        if not _same_snapshot_value(value, default):
+            loud(
+                f"{where}: {key} = {value!r} is a dead snapshot key whose value is "
+                f"NOT its default ({default!r}); the field is not in this code "
+                f"(commit {commit}). Refusing, not dropping: dropping it would run a "
+                f"different model/optimizer than the checkpoint was trained with. "
+                f"Escape: run this checkpoint on the commit that still reads `{key}` "
+                f"(`git log -S'{key}'` names it), or rewrite the snapshot's `{key}` to "
+                f"{default!r} and accept that the run then computes something else."
+            )
+    named = ", ".join(f"{k} ({DEAD_SNAPSHOT_KEYS[k][0]})" for k in dead)
     print(
-        f"config: {where}: dropped {len(dead)} dead snapshot key(s) {named} — valid "
-        f"when the snapshot was written, deleted later (`port(cleanup): delete the "
-        f"dead config stubs`). COUNTED, not silent: a key outside DEAD_SNAPSHOT_KEYS "
-        f"still refuses loudly.",
+        f"config: {where}: dropped {len(dead)} dead snapshot key(s) {named} — each "
+        f"at its recorded default, so the drop changes nothing this run computes. "
+        f"COUNTED, not silent: a key outside DEAD_SNAPSHOT_KEYS still refuses "
+        f"loudly, and a dead key off its default refuses too.",
         file=sys.stderr,
     )
-    return {k: v for k, v in table.items() if k not in DEAD_SNAPSHOT_KEYS}
+    return {k: v for k, v in table.items() if k not in dead}
 
 
 def validate(model: ModelConfig) -> None:
@@ -1009,6 +1688,149 @@ def validate(model: ModelConfig) -> None:
             f"n_heads*head_dim={model.n_heads * model.head_dim} != d_model="
             f"{model.d_model}: the head split must tile the residual width"
         )
+    if model.attn_kind not in ("kda", "full"):
+        loud(
+            f"attn_kind={model.attn_kind!r} is not an attention arm. Known: 'kda' "
+            f"(the compressed-state gated-delta arm every number on record ran) and "
+            f"'full' (exact causal attention, model/fullattn.py). Escape: name one "
+            f"of those, or land the arm and its gate BEFORE the config can lie "
+            f"about it."
+        )
+    if not model.use_kda and model.attn_kind != "kda":
+        loud(
+            f"attn_kind={model.attn_kind!r} with use_kda=false: use_kda=false is the "
+            f"HARD OFF switch — the loop's attention output is exactly zeros "
+            f"(loopblock._window), so the arm named here would never run. The two "
+            f"flags are not aliases: use_kda says WHETHER attention runs, attn_kind "
+            f"says WHICH. Escape: use_kda=true (the default) for attn_kind='full', "
+            f"or attn_kind='kda' if the zeros arm is what you meant."
+        )
+    if model.attn_latent_rank < 0:
+        loud(
+            f"attn_latent_rank={model.attn_latent_rank} is negative: a shared "
+            f"latent is a WIDTH in (0, d_model], and 0 is the OFF sentinel. "
+            f"Escape: 0, or a positive rank."
+        )
+    if model.attn_latent_rank and not model.use_kda:
+        loud(
+            f"attn_latent_rank={model.attn_latent_rank} with use_kda=false: the "
+            f"KDA module is not built, so the key would reach no code (the "
+            f"config-lies defect). Escape: use_kda=true, or attn_latent_rank=0."
+        )
+    if model.n_kv_heads < 0:
+        loud(
+            f"n_kv_heads={model.n_kv_heads} is negative: 0 is the OFF sentinel "
+            f"(MHA) and a positive value is a head count. Escape: 0, or >= 1."
+        )
+    if model.n_kv_heads and not model.use_kda:
+        loud(
+            f"n_kv_heads={model.n_kv_heads} with use_kda=false: the KDA module "
+            f"is not built, so the key would reach no code. Escape: use_kda=true, "
+            f"or n_kv_heads=0."
+        )
+    if model.n_kv_heads > model.n_heads:
+        loud(
+            f"n_kv_heads={model.n_kv_heads} > n_heads={model.n_heads}: GQA shares "
+            f"key/value heads with the query heads, so there cannot be more KV "
+            f"heads than queries. Escape: n_kv_heads <= n_heads."
+        )
+    if model.n_kv_heads and model.n_heads % model.n_kv_heads:
+        loud(
+            f"n_kv_heads={model.n_kv_heads} does not divide n_heads={model.n_heads}: "
+            f"GQA expands each KV head into a whole group of query heads "
+            f"(`repeat_interleave(n_heads // n_kv_heads)`), and a ragged group has "
+            f"no valid expansion. Escape: a divisor of n_heads, or 0 (MHA)."
+        )
+    if model.out_proj_rank < 0 or model.out_proj_rank > model.d_model:
+        loud(
+            f"out_proj_rank={model.out_proj_rank} outside 0..=d_model="
+            f"{model.d_model}: a rank above either dimension of the square "
+            f"readout is not a factorization, and 0 is the OFF sentinel. "
+            f"Escape: 0..=d_model."
+        )
+    if model.csa_coarse_chunk and not model.use_csa:
+        loud(
+            f"csa_coarse_chunk={model.csa_coarse_chunk} without use_csa: the "
+            f"coarse level is the second level of the CSA arm, so alone it would "
+            f"build no module and the flag would lie. Escape: use_csa=true, or "
+            f"csa_coarse_chunk=0."
+        )
+    if model.use_csa:
+        if model.csa_chunk not in (4, 8, 16, 32):
+            loud(
+                f"csa_chunk={model.csa_chunk} is not a chunk size: the arm pools "
+                f"{model.csa_chunk} byte positions into one KV entry, and the "
+                f"measured set is (4, 8, 16, 32). Escape: one of those."
+            )
+        if model.csa_kv_dim not in (64, 128):
+            loud(
+                f"csa_kv_dim={model.csa_kv_dim} is not a CSA width: the arm ships "
+                f"64 and 128 (the memory table is asserted at 64). Escape: 64 or 128."
+            )
+        if model.csa_topk < (1 if model.csa_fine else 0):
+            loud(
+                f"csa_topk={model.csa_topk}: a top-k of 0 selects no chunk, which is "
+                f"the branch switched off with its parameters and gate still built; "
+                f"and a negative top-k is not a count. csa_topk=0 is legal only when "
+                f"csa_fine=false. Escape: csa_topk >= 1, or use_csa=false."
+            )
+        if not model.csa_fine and model.csa_coarse_chunk == 0:
+            loud(
+                "csa_fine=false without a coarse level: the arm would build no "
+                "level at all while paying its gate. Escape: csa_fine=true, or "
+                "csa_coarse_chunk>0, or use_csa=false."
+            )
+        if model.csa_coarse_chunk:
+            if model.csa_coarse_chunk % model.csa_chunk:
+                loud(
+                    f"csa_coarse_chunk={model.csa_coarse_chunk} is not a multiple of "
+                    f"csa_chunk={model.csa_chunk}: a coarse entry must be a whole "
+                    f"number of fine entries, or the two levels pool different byte "
+                    f"boundaries. Escape: a multiple of csa_chunk."
+                )
+            if model.csa_coarse_chunk not in (64, 128, 256, 512):
+                loud(
+                    f"csa_coarse_chunk={model.csa_coarse_chunk} is not a coarse "
+                    f"chunk: the level means {model.csa_coarse_chunk} bytes into one "
+                    f"dense entry, and the measured set is (64, 128, 256, 512). "
+                    f"Escape: one of those."
+                )
+            if model.csa_coarse_kv_dim not in (64, 128):
+                loud(
+                    f"csa_coarse_kv_dim={model.csa_coarse_kv_dim} is not a coarse "
+                    f"width: the level ships 64 and 128. Escape: 64 or 128."
+                )
+            if model.use_msa:
+                loud(
+                    "use_csa + csa_coarse_chunk with use_msa: two sparse/dense "
+                    "attention levels beside MSA have not been measured. Escape: "
+                    "one extra branch per run, or use_msa=false."
+                )
+        if model.use_msa:
+            loud(
+                "use_csa + use_msa: two sparse attention branches have not been "
+                "measured together, so the run could not attribute a result to "
+                "either. Escape: one sparse branch per run."
+            )
+        if model.attn_kind != "kda":
+            loud(
+                f"attn_kind={model.attn_kind!r} with use_csa: CSA is specified as an "
+                f"ADDITIVE branch beside KDA's compressed state, not beside exact "
+                f"attention. Escape: attn_kind='kda', or use_csa=false."
+            )
+        if not model.use_kda:
+            loud(
+                "use_csa with use_kda=false: the hard off switch makes KDA's output "
+                "zeros, and CSA is the branch ADDED to it — the pair is not the "
+                "measured arm. Escape: use_kda=true, or use_csa=false."
+            )
+        if model.use_byteflow:
+            loud(
+                "use_csa with use_byteflow=true: the channel runs the loop over K "
+                "patch latents, so a 'csa_chunk bytes' would silently be a chunk of "
+                "latents (a different unit, and a different window). Refused rather "
+                "than repurposed. Escape: use_byteflow=false, or use_csa=false."
+            )
     if model.rank < 1 or model.shared_rank < 1:
         loud(f"rank and shared_rank must be >= 1, got {model.rank}/{model.shared_rank}")
     if not 0.0 < model.engram_lam_max <= 1.0:
@@ -1020,6 +1842,40 @@ def validate(model: ModelConfig) -> None:
             f"moe_topk={model.moe_topk} > n_experts={model.n_experts}: a top-k "
             f"above the bank is refused, not clamped (clamping is the silent collapse)"
         )
+    if model.moe_topk_mode not in MOE_TOPK_MODES:
+        loud(
+            f"moe_topk_mode={model.moe_topk_mode!r} is not a width policy. Known: "
+            f"{list(MOE_TOPK_MODES)} — `off` the constant `moe_topk` (every number on "
+            f"record), `entropy` the normalized router entropy, `margin` the top-1/"
+            f"top-2 logit gap (model/adaptive_topk.py). Escape: name one of those, or "
+            f"land the policy and its gate BEFORE the config can lie about it."
+        )
+    if not 1 <= model.moe_topk_min <= model.moe_topk_max <= MOE_TOPK_SLOTS_MAX:
+        loud(
+            f"moe_topk_min={model.moe_topk_min} / moe_topk_max={model.moe_topk_max} "
+            f"outside 1 <= min <= max <= {MOE_TOPK_SLOTS_MAX}: the histogram counters "
+            f"and the fused backward's top-k tile stop there, and an inverted window "
+            f"would clamp every token to one end. Escape: the defaults 1/4."
+        )
+    if model.moe_topk_mode != "off":
+        if model.moe_topk <= 0:
+            loud(
+                f"moe_topk_mode={model.moe_topk_mode!r} with moe_topk=0: the adaptive "
+                f"width lives on the ROUTED pass, and 0 is the dense blend (every "
+                f"expert, no router top-k). Escape: moe_topk > 0 — its VALUE selects "
+                f"the arm here, the width comes from moe_topk_max."
+            )
+        if model.moe_topk_max > model.n_experts:
+            loud(
+                f"moe_topk_max={model.moe_topk_max} > n_experts={model.n_experts}: a "
+                f"width above the bank cannot be filled. Escape: k_max <= n_experts."
+            )
+        if not model.moe_entropy_lo < model.moe_entropy_hi:
+            loud(
+                f"moe_entropy_lo={model.moe_entropy_lo} >= moe_entropy_hi="
+                f"{model.moe_entropy_hi} with mode={model.moe_topk_mode!r}: the window "
+                f"would be a step, not a ramp. Escape: lo < hi (defaults 0.2 < 0.6)."
+            )
     if model.moe_capacity < 0.0:
         loud(
             f"moe_capacity={model.moe_capacity} is negative: it is a multiple of the "
@@ -1036,14 +1892,59 @@ def validate(model: ModelConfig) -> None:
             f"(model/moe_kernels.py), `naive` the per-expert loop. Escape: name "
             f"one of those, or add the arm before the config can lie about it."
         )
-    if model.dtype not in DTYPES:
+    if model.moe_gather not in MOE_GATHERS:
         loud(
-            f"dtype={model.dtype!r} is not a request. Known: {list(DTYPES)} — "
-            f"`none` leaves the `bf16` flag deciding (the default), `auto` picks "
-            f"the best rung the device supports, and an explicit rung is refused "
-            f"when the device cannot run it (train/device.py). Escape: name one "
-            f"of those."
+            f"moe_gather={model.moe_gather!r} is not an arm. Known: "
+            f"{list(MOE_GATHERS)} — `off` is today's pass (the permute materializes "
+            f"`xg [R, d]`), `kernel` reads those rows THROUGH the row map "
+            f"(model/moe_sonic.py, SonicMoE §5.1.1). Escape: name one of those."
         )
+    if model.moe_gather == "kernel":
+        # The three facts the arm's evidence does not cover, each with the code
+        # that makes it true. A combination this arm refuses is not a numeric
+        # impossibility; it is a route nobody has measured, and ADR-0011 says a
+        # route is named before it runs, not after a run is attributed to it.
+        if not model.bf16:
+            loud(
+                "moe_gather='kernel' with bf16=false: the gather arm is wired on the "
+                "bf16 route only. Its launcher uses the bf16 tile set (`moe_sonic."
+                "TILES`) and passes no `num_stages`, where the shipped 4-byte arm "
+                "halves the wide tiles (`moe_kernels.tiles_for`) and passes "
+                "`num_stages=1` (`_launch_stages`) — the recipe it adopted after the "
+                "default set measured 196608 B against this card's 101376 B CTA "
+                "ceiling. An fp32 gather arm would be a tile/stage choice nobody has "
+                "launched. Escape: bf16=true (the b1 and medium route), or "
+                "moe_gather='off' (the fp32 arm keeps the grouped GEMM, which does "
+                "halve)."
+            )
+        if model.use_byteflow:
+            loud(
+                "moe_gather='kernel' with use_byteflow=true: the gather ABI is the loop "
+                "stack's permute over `[tokens, d]` activations, and the channel runs "
+                "that loop over K patch latents (`byteflow.compat_armed`) — an input "
+                "path the prototype's byte arithmetic and its parity gates do not "
+                "cover. Escape: use_byteflow=false, or moe_gather='off'."
+            )
+        if model.moe_topk_mode != "off":
+            loud(
+                f"moe_gather='kernel' with moe_topk_mode={model.moe_topk_mode!r}: the "
+                f"adaptive width masks the raised logits and moves the unused slots to "
+                f"a sentinel expert PAST the bank (`experts._permute`), so a forward's "
+                f"row set is not the constant-width one this ABI was proven on — "
+                f"`gather_abi`'s `offs` is a cumsum of `bincount(kept)` and the kernel "
+                f"grid is `(n_experts, ...)`, i.e. it never sees that sentinel group. "
+                f"Escape: moe_topk_mode='off', or moe_gather='off'."
+            )
+        if model.factor_qat != "none":
+            loud(
+                f"moe_gather='kernel' with factor_qat={model.factor_qat!r}: the kernel "
+                f"reads the DEQUANTIZED bank — `_banks` applies `factor_qat_project` to "
+                f"`gate_u`, `up_u` and `v` before the dtype cast, and those three "
+                f"tensors are what `_gather_glu_kernel` loads — so the arm would ride "
+                f"the quantization rung, whose alpha anneals every step, and no "
+                f"gather-parity gate covers that pair. Escape: factor_qat='none', or "
+                f"moe_gather='off'."
+            )
     if model.expert_act not in EXPERT_ACTS:
         loud(
             f"expert_act={model.expert_act!r} is not an arm. Known: "
@@ -1061,6 +1962,45 @@ def validate(model: ModelConfig) -> None:
         )
     if model.memglu_c0 <= 0.0:
         loud(f"memglu_c0={model.memglu_c0} must be > 0 (an RMS scale, not a sign)")
+    if model.share_u_mode != "off" and not model.use_tsct:
+        loud(
+            f"share_u_mode={model.share_u_mode!r} with use_tsct=false: the shared "
+            f"basis is a TSCT input factor (`u [d, rank]`), and with the "
+            f"projections dense there is no factor basis to share — the flag would "
+            f"name a mechanism the model does not have. Escape: use_tsct=true, or "
+            f"share_u_mode='off'."
+        )
+    if model.share_u_mode != "off" and model.factor_qat not in FACTOR_QATS:
+        # The shared basis is projected with ONE α over the whole tensor
+        # (`dim=None`): every rung in FACTOR_QATS supports that, including the
+        # dictionary gather. A future rung that needs a per-expert slice of a
+        # shared tensor is the combination this seam refuses, named here rather
+        # than silently degraded in the forward.
+        loud(
+            f"share_u with factor_qat={model.factor_qat!r} "
+            f"(share_u_mode={model.share_u_mode!r}): the shared basis is projected "
+            f"with ONE α over the whole tensor, and this rung is not in "
+            f"{list(FACTOR_QATS)}. Escape: name a known rung, or factor_qat='none'."
+        )
+    if model.share_u_mode == "dict":
+        if model.share_u_rank < 2:
+            loud(
+                f"share_u_mode='dict' with share_u_rank={model.share_u_rank}: the "
+                f"dictionary needs at least TWO columns for an expert to read a "
+                f"plane (one column is a single direction, and the two latents "
+                f"would be a rescaling of it). Escape: share_u_rank >= 2, or "
+                f"share_u_mode='plane'."
+            )
+        if model.rank >= model.share_u_rank:
+            loud(
+                f"share_u_mode='dict' with rank={model.rank} >= "
+                f"share_u_rank={model.share_u_rank}: each expert reads `rank` "
+                f"COLUMNS of the dictionary, so a width at (or past) the "
+                f"dictionary leaves no subset to choose and the index could read "
+                f"out of range — every expert would see the whole plane this mode "
+                f"exists to split. Escape: share_u_rank > rank (64 at medium), or "
+                f"share_u_mode='plane'."
+            )
     if model.factor_qat not in FACTOR_QATS:
         loud(
             f"factor_qat={model.factor_qat!r} is not an arm. Known: "
@@ -1165,7 +2105,63 @@ def validate(model: ModelConfig) -> None:
             f"quantizer is off, so there is no block to group. Escape: set "
             f"act_quant, or leave act_group at 0."
         )
+    if model.use_mhc:
+        for name, why in (
+            (
+                "loom",
+                "LOOM adds a second, un-A/B'd per-iteration gate to the write "
+                "(2610.01153); an mHC result from that run would be attributable to "
+                "neither mechanism",
+            ),
+            (
+                "use_byteflow",
+                "the channel runs the loop over K patch latents, so the lanes would "
+                "be patch lanes and the placement a different experiment",
+            ),
+        ):
+            if getattr(model, name):
+                loud(
+                    f"use_mhc with {name}=true: {why}. Escape: {name}=false, or "
+                    f"use_mhc=false — mHC's A/B (scripts/ab_mhc.py) moves ONE write "
+                    f"axis at a time, and AttnRes (`use_attnres`) is the only "
+                    f"partner it composes with (scripts/ab_mhc_attnres.py)."
+                )
+        if model.mhc_streams != 2:
+            loud(
+                f"mhc_streams={model.mhc_streams}: only K=2 ships. It is the K the "
+                f"φ evidence used (2604.21106 §5.2) and 2409.19606 Tab. 1's knee; "
+                f"mHC's own App. A.1 default of 4 is the named follow-up row, not a "
+                f"shipped rung. Escape: mhc_streams=2, or land the n=4 arm and its "
+                f"gate BEFORE the config can lie about it."
+            )
+    elif model.mhc_streams != 2:
+        loud(
+            f"mhc_streams={model.mhc_streams} with use_mhc=false is inert — the "
+            f"field would name a K no lane carries. Escape: use_mhc=true (K=2), or "
+            f"leave mhc_streams at its default 2."
+        )
     if model.use_byteflow:
+        if model.loop_blocks > 1:
+            loud(
+                f"loop_blocks={model.loop_blocks} with use_byteflow=true: Option A "
+                f"(`compat_armed` false) returns from `DormouseModel` before the "
+                f"model tree is built — there is no loop at all, so blocks 1+ would "
+                f"never run — and Option B runs this loop over K PATCH LATENTS, a "
+                f"different sequence shape whose depth has not been measured with "
+                f"distinct bodies. Escape: use_byteflow=false, or loop_blocks=1."
+            )
+        if model.prelude_layers or model.coda_layers:
+            loud(
+                f"prelude_layers={model.prelude_layers}/coda_layers="
+                f"{model.coda_layers} with use_byteflow=true: the byteflow shapes "
+                f"run no byte-level loop to wrap. Option A is a standalone net "
+                f"with no loop at all (`bf_net` returns before the model tree), "
+                f"and Option B runs this loop over K patch LATENTS "
+                f"(`compat_armed`), so the patcher changes the sequence length "
+                f"mid-model and a prelude/coda would act on patch states, not the "
+                f"bytes they are specified on. Escape: use_byteflow=false, or "
+                f"prelude_layers=0 and coda_layers=0."
+            )
         _validate_byteflow(model)
     if model.sigreg_weight < 0.0:
         loud(
@@ -1173,6 +2169,62 @@ def validate(model: ModelConfig) -> None:
             f"multiplier on the SIGReg term, not a sign to flip. Escape: 0.0 "
             f"(off) or a positive weight (the research doc's grid: 0.005, 0.05, "
             f"0.1 — docs/research/2026-10-16-jepa-into-dormouse.md §3)."
+        )
+    if model.jepa_weight < 0.0:
+        loud(
+            f"jepa_weight={model.jepa_weight} is negative: it scales the whole "
+            f"JEPA term (`model/jepa.py`), so a negative value flips the sign of "
+            f"both the prediction and its anti-collapse term. Escape: 0.0 (off) "
+            f"or a positive weight."
+        )
+    if model.jepa_reg_weight < 0.0:
+        loud(
+            f"jepa_reg_weight={model.jepa_reg_weight} is negative: it is the "
+            f"anti-collapse weight INSIDE the JEPA term, and a negative value "
+            f"would push the predicted latents toward collapse (the opposite of "
+            f"`sigreg_loss`'s gradient). Escape: 0.0 (no regulariser) or a "
+            f"positive weight (the gate's 0.1)."
+        )
+    if model.jepa_horizon < 1:
+        loud(
+            f"jepa_horizon={model.jepa_horizon}: the horizon is a positive count "
+            f"of positions to look ahead (1 = the next position). Escape: >= 1, "
+            f"and <= seq_len // 8 (the load path checks the window)."
+        )
+    # The ENERGY head's own coherence (`model/energy.py`, EBT arXiv:2507.02092):
+    # the weight gates the module (0 builds nothing), and every other field is
+    # a count/scale the loss would silently misuse. The two INTERACTIONS
+    # (byteflow, dspark) are refusals, never a merge: this lane has one aux
+    # objective, and the arm it would have to share a hidden state with is not
+    # measured alongside it.
+    if model.energy_weight < 0.0:
+        loud(
+            f"energy_weight={model.energy_weight} is negative: it is λ, the "
+            f"multiplier on the margin-InfoNCE term. Escape: 0.0 (off) or a "
+            f"positive weight (the A/B's grid is 0.05 / 0.1)."
+        )
+    if model.energy_negs < 1:
+        loud(
+            f"energy_negs={model.energy_negs}: the contrastive term needs at least "
+            f"one sampled negative per position. Escape: >= 1 (the default 64)."
+        )
+    if model.energy_temp <= 0.0:
+        loud(
+            f"energy_temp={model.energy_temp}: it is InfoNCE's temperature, a "
+            f"positive scale (the margin is divided by it too). Escape: > 0."
+        )
+    if model.energy_rank < 1:
+        loud(
+            f"energy_rank={model.energy_rank}: it is the head's bottleneck width "
+            f"in Linear(d, k) -> SiLU -> Linear(k, 1). Escape: >= 1."
+        )
+    if model.energy_weight > 0.0 and model.dspark_weight > 0.0:
+        loud(
+            f"energy_weight={model.energy_weight} with dspark_weight="
+            f"{model.dspark_weight}: both are aux objectives reading the SAME "
+            f"hidden state (`model.norm(out)`), and their interaction is not "
+            f"measured — a run with both armed could not attribute a BPB change "
+            f"to either. Escape: one weight per run, or land the joint A/B first."
         )
     # The dspark arm's OWN coherence (audit MINOR 12, 2026-10-17): these used to
     # live inside `_validate_byteflow`, which only runs under `use_byteflow`, so
@@ -1192,6 +2244,73 @@ def validate(model: ModelConfig) -> None:
             f"both are positive counts (the draft reach and the anchor spacing, "
             f"in bytes). Escape: k >= 1, stride >= 1."
         )
+    # The MTP arm's own coherence (`model/mtp.py`): the weight with no depth
+    # asks for a term that has no module to average, and a depth above 8 is
+    # outside the constructor's contract. Both are refusals, never clamps.
+    if model.mtp_k < 0 or model.mtp_k > 8:
+        loud(
+            f"mtp_k={model.mtp_k} outside 0..=8: it is the number of future-byte "
+            f"modules (DeepSeek-V3 §3.2). Escape: 0 (off, nothing is built) or "
+            f"1..=8 (the constructor's ceiling, `mtp.MAX_K`)."
+        )
+    if model.mtp_weight > 0.0 and model.mtp_k == 0:
+        loud(
+            f"mtp_weight={model.mtp_weight} with mtp_k=0: the weight asks for the "
+            f"MTP term but there are no future-byte modules to average (the head "
+            f"is built IFF the weight is on, and K >= 1). Escape: mtp_k >= 1, or "
+            f"mtp_weight=0.0."
+        )
+    if model.mtp_weight < 0.0:
+        loud(
+            f"mtp_weight={model.mtp_weight} is negative: it is λ, the multiplier "
+            f"on the MTP CE. Escape: 0.0 (off) or a positive weight."
+        )
+
+    # The HALT HEAD's own coherence (`model/halt.py`). The weight gates the
+    # module (0 builds nothing), the mode gates INFERENCE, and the cap is only
+    # meaningful on the arm that runs it — so the `halt_max_iter <= max_iter`
+    # refusal applies IFF a halt is requested. The default `max_iter=4` /
+    # `halt_max_iter=8` pair must stay a legal config (every snapshot loads it).
+    if model.halt_weight < 0.0:
+        loud(
+            f"halt_weight={model.halt_weight} is negative: it is λ, the multiplier "
+            f"on the halt BCE. Escape: 0.0 (off) or a positive weight."
+        )
+    if model.halt_eps < 0.0:
+        loud(
+            f"halt_eps={model.halt_eps} is negative: it is a CE improvement in "
+            f"nats, and a negative threshold would ask the head to stop when "
+            f"thinking HURTS by more than |eps|. Escape: 0.0 or a small positive "
+            f"value (the default 0.005)."
+        )
+    if model.halt_min_iter < 1:
+        loud(
+            f"halt_min_iter={model.halt_min_iter}: the first iteration is 1, so a "
+            f"floor below it names a decision the loop cannot make. Escape: >= 1."
+        )
+    if model.halt_mode:
+        if model.halt_weight <= 0.0:
+            loud(
+                f"halt_mode=true with halt_weight={model.halt_weight}: the "
+                f"checkpoint has no halt head (the head is built IFF the weight "
+                f"is on), so there is nothing to decide the stop. Escape: a "
+                f"checkpoint trained with halt_weight>0, or halt_mode=false."
+            )
+        if model.halt_max_iter > model.max_iter:
+            loud(
+                f"halt_max_iter={model.halt_max_iter} > max_iter={model.max_iter}: "
+                f"the inference cap cannot exceed the depth the loop was BUILT "
+                f"for (the `iter_embed`/gate rows stop at max_iter), so the flag "
+                f"would name thinking that has no slot. Escape: max_iter >= "
+                f"{model.halt_max_iter} (the depth-8 arm), or halt_max_iter <= "
+                f"{model.max_iter}."
+            )
+        if model.halt_max_iter < model.halt_min_iter:
+            loud(
+                f"halt_max_iter={model.halt_max_iter} < halt_min_iter="
+                f"{model.halt_min_iter}: the cap must admit the floor. Escape: "
+                f"swap them."
+            )
 
     if model.quant != "none":
         _refuse_ladder_rung(model.quant)
@@ -1205,6 +2324,13 @@ def _validate_byteflow(model: ModelConfig) -> None:
     because every boundary is a position inside the window; and the local /
     global widths must tile their head splits (`byteflow.py`, `ByteFlowNet`).
     """
+    if model.halt_weight > 0.0:
+        loud(
+            "use_byteflow with halt_weight>0: the halt head reads the byte loop's "
+            "per-iteration readout, and the channel runs the loop over K patch "
+            "latents with no per-byte CE to build a target from. Escape: "
+            "halt_weight = 0.0, or drop use_byteflow."
+        )
     if model.max_seq_len > model.byteflow_max_bytes:
         loud(
             f"max_seq_len={model.max_seq_len} > byteflow_max_bytes="
@@ -1233,15 +2359,18 @@ def _validate_byteflow(model: ModelConfig) -> None:
                 f"byteflow_{side} width {d} does not divide by its head count {h}: "
                 f"the head split must tile the width. Escape: fix the byteflow_* widths."
             )
-    # fp32 only, and there is no second reading of that: the ported net has no
-    # bf16 path (the crate refuses --bf16 for the same reason — a cast copy
-    # dressed as a dtype).
-    if model.bf16:
+    # bf16 is ALLOWED here: the net runs its matmuls in bf16 with fp32 masters
+    # (`byteflow.py`'s precision rule), the same policy as the loop. The ONE
+    # pair it cannot carry is the exact-rate chunker: a bf16 Cholesky is
+    # unstable, and the default L2 path never enters it.
+    if model.bf16 and model.byteflow_logdet:
         loud(
-            "use_byteflow with bf16=true: the ByteFlow net has no bf16 handling, so the "
-            "flag would either be a cast copy around every projection or a silent fp32 "
-            "run wearing a bf16 label. Escape: `bf16 = false` (the paper's recipe), or "
-            "drop use_byteflow."
+            "bf16 + byteflow_logdet: the exact-rate chunker factorizes "
+            "`I + c·HᵀH` with `torch.linalg.cholesky`, and a bf16 Cholesky is "
+            "unstable — the selection would change on a numerical factorization "
+            "error with no gradient to correct it. Escape: `byteflow_logdet = "
+            "false` (the L2 fast path is the default and is bf16-safe), or "
+            "`bf16 = false`."
         )
     # The channel runs OUR loop on K patch latents, and the memory arm needs a
     # byte position to hash an n-gram from — it has none on that path. Refused
@@ -1279,11 +2408,36 @@ def _validate_byteflow(model: ModelConfig) -> None:
             "term would be built and attached to nothing. Escape: sigreg_weight = 0.0, "
             "or drop use_byteflow."
         )
+    # JEPA predicts the loop's byte-position readout `h[p+h]` from `h[p]`; the
+    # channel runs the loop over K patch latents, so there are no byte positions
+    # to shift. Refused, never silently dropped (ADR-0019).
+    if model.jepa_weight > 0.0:
+        loud(
+            f"use_byteflow with jepa_weight={model.jepa_weight}: JEPA predicts the "
+            f"loop's byte-position readout `h[p+h]` from `h[p]`, and the channel "
+            f"runs the loop over K patch latents where there are no byte positions "
+            f"to shift (model/jepa.py). Escape: jepa=false and jepa_weight=0.0, or "
+            f"drop use_byteflow."
+        )
+    if model.energy_weight > 0.0:
+        loud(
+            "use_byteflow with energy_weight>0: the channel runs the loop over K "
+            "patch latents, so there is no per-BYTE position for the contrastive "
+            "head to score and no byte state the sampler could read. Escape: "
+            "energy_weight = 0.0, or drop use_byteflow."
+        )
     if model.dspark_weight > 0.0:
         loud(
             "use_byteflow with dspark_weight>0: the channel's forward carries no "
             "byte ids for the draft window to read. Escape: dspark_weight = 0.0, "
             "or drop use_byteflow."
+        )
+    if model.mtp_weight > 0.0:
+        loud(
+            "use_byteflow with mtp_weight>0: the MTP modules read the byte ids and "
+            "the loop's byte-position hidden state, and the channel runs the loop "
+            "over K patch latents with no byte ids in that forward. Escape: "
+            "mtp_weight = 0.0, or drop use_byteflow."
         )
 
 
@@ -1315,6 +2469,62 @@ def _refuse_ladder_rung(rung: str) -> str:
     )
 
 
+def _validate_doc(model: ModelConfig, tcfg: TrainConfig) -> None:
+    """`doc_masking` against the window, the byteflow shapes and the aux targets.
+
+    Each is a refusal rather than a silent no-op, for the ADR-0019 reason the
+    config layer exists: a flag that is on while the run computes the flat
+    objective is a config that lies about what trained. Every message names the
+    escape.
+    """
+    if not tcfg.doc_masking:
+        return
+    if tcfg.full_graph:
+        loud(
+            "doc_masking=true with full_graph=true: the capture fills STATIC (x, y) "
+            "buffers and the loss mask is a third per-step input it has no slot for — "
+            "a replay would train on the first step's mask forever. Escape: "
+            "full_graph=false (the eager step), or doc_masking=false."
+        )
+    if tcfg.segment_len:
+        loud(
+            f"doc_masking=true with segment_len={tcfg.segment_len}: the segmented "
+            f"forward CARRIES the KDA state across cuts, and a carried state has no "
+            f"notion of a document boundary — a document shorter than a segment would "
+            f"still see the previous document's state at the seam. Escape: "
+            f"segment_len=0 (the one-shot window, where one row holds one document), "
+            f"or doc_masking=false."
+        )
+    if model.use_byteflow:
+        loud(
+            "doc_masking=true with use_byteflow=true: the byteflow shapes patch the "
+            "byte stream at LEARNED boundaries (or run no byte loop at all), and a "
+            "patch boundary is not a document boundary — the loss mask addresses byte "
+            "positions, not patch latents. Escape: use_byteflow=false, or "
+            "doc_masking=false."
+        )
+    for name in ("dspark_weight", "mtp_weight", "jepa_weight", "energy_weight", "halt_weight"):
+        weight = float(getattr(model, name))
+        if weight > 0.0:
+            loud(
+                f"doc_masking=true with {name}={weight}: this auxiliary objective has "
+                f"its own target positions over the whole window, and the CE loss mask "
+                f"does not reach it — it would train across the padding and document "
+                f"boundaries the flag exists to remove, while the log reported the arm "
+                f"on. Escape: set {name}=0.0, or doc_masking=false."
+            )
+    if model.moe_topk > 0 and model.moe_capacity > 0:
+        loud(
+            f"doc_masking=true with moe_topk={model.moe_topk} and "
+            f"moe_capacity={model.moe_capacity}: the capacity-padded dispatch decides "
+            f"which rows an expert keeps from the WHOLE batch, so a padded row (and a "
+            f"document's masked last byte) can take capacity from a real token in "
+            f"another row — the mask would hold on the loss but not on the forward. "
+            f"Escape: moe_capacity=0 (the dropless route, where every assignment "
+            f"reaches its expert — the b1 and A/B default), or doc_masking=false."
+        )
+
+
 def _validate_segment(model: ModelConfig, tcfg: TrainConfig) -> None:
     """The segmented-training flag against the window and the arms it cannot ride.
 
@@ -1333,6 +2543,29 @@ def _validate_segment(model: ModelConfig, tcfg: TrainConfig) -> None:
         )
     if n == 0:
         return
+    if model.csa_coarse_chunk:
+        loud(
+            f"segment_len={n} with csa_coarse_chunk={model.csa_coarse_chunk}: the "
+            f"coarse level is a dense ring carried across BYTES, and what a segment "
+            f"cut does to a half-full coarse chunk is undecided — carrying it is a "
+            f"model change, dropping it silently forgets the segment. Escape: "
+            f"csa_coarse_chunk=0 (fine level only), or segment_len=0."
+        )
+    if model.use_csa:
+        loud(
+            f"segment_len={n} with use_csa: the CSA state is a chunk ring carried "
+            f"across BYTES, and what a segment cut should do to a half-full chunk is "
+            f"undecided — carrying it at the cut is a model change, and dropping it "
+            f"silently forgets the segment. Escape: use_csa=false, or segment_len=0."
+        )
+    if model.attn_kind == "full":
+        loud(
+            f"segment_len={n} with attn_kind='full': exact attention has no O(1) "
+            f"boundary state, so a segment would have to carry every preceding "
+            f"segment's K/V (O(window) per iteration slot) — the memory this flag "
+            f"exists to save, and the reason the compressed arm is the one it was "
+            f"built on. Escape: segment_len=0, or attn_kind='kda'."
+        )
     if n >= tcfg.seq_len:
         loud(
             f"segment_len={n} >= seq_len={tcfg.seq_len}: the window is one segment, so "
@@ -1365,6 +2598,15 @@ def _validate_segment(model: ModelConfig, tcfg: TrainConfig) -> None:
             f"is a model change, and this flag is allowed to change only the memory. "
             f"Escape: use_msa=false, or segment_len=0."
         )
+    if model.halt_weight > 0.0 or model.halt_mode:
+        loud(
+            f"segment_len={n} with halt_weight={model.halt_weight}/halt_mode="
+            f"{model.halt_mode}: the segmented forward runs the loop per segment, "
+            f"so the halt head's per-iteration states would be concatenations of "
+            f"segment windows and its target a per-segment mean — two unvalidated "
+            f"axes in one run. Escape: halt_weight=0 and halt_mode=false, or "
+            f"segment_len=0."
+        )
     if tcfg.rand_depth:
         loud(
             f"segment_len={n} with rand_depth=true: the adaptive-depth arm is "
@@ -1389,6 +2631,39 @@ def _validate_segment(model: ModelConfig, tcfg: TrainConfig) -> None:
             f"padded bank has no cap, so the grouped GEMM takes the static row-block "
             f"bound and exits on-device on an empty block — no sync, ADR-0018 rule 2) "
             f"— or moe_topk=0 (the dense blend `small` ships), or segment_len=0."
+        )
+
+
+def _validate_jepa(model: ModelConfig, tcfg: TrainConfig) -> None:
+    """The JEPA arm against the window and the segmented path — both halves.
+
+    The horizon crosses SEGMENT boundaries: the segmented forward runs the loop
+    per segment, so `h[p+h]` can come from the next segment's window (a different
+    state) or from the carried-state prefix, which is a second unvalidated
+    objective. The horizon also has to fit the window with room for a sample:
+    `seq_len // 8` is the widest the research plan names, and a horizon at the
+    window's scale leaves almost nothing to predict over. Both are refusals, not
+    fallbacks (ADR-0019: a term with nothing to act on must not look alive).
+    """
+    if model.jepa_weight <= 0.0:
+        return
+    if tcfg.segment_len > 0:
+        loud(
+            f"jepa_weight={model.jepa_weight} with segment_len={tcfg.segment_len}: "
+            f"JEPA predicts `h[p+h]` from `h[p]`, and the segmented forward cuts "
+            f"the window, so the horizon would cross a segment boundary — the "
+            f"target would be a state from a different window (or from the carried "
+            f"prefix), i.e. a different objective from the one-shot forward. "
+            f"Escape: segment_len=0, or jepa_weight=0.0."
+        )
+    cap = tcfg.seq_len // 8
+    if model.jepa_horizon > cap:
+        loud(
+            f"jepa_horizon={model.jepa_horizon} > seq_len // 8 = {cap} "
+            f"(seq_len={tcfg.seq_len}): the horizon must fit the training window "
+            f"with room for a predicted sample, otherwise the term reads a handful "
+            f"of positions (or none) and the A/B cannot tell it apart from off. "
+            f"Escape: a horizon <= {cap}, or jepa_weight=0.0."
         )
 
 
@@ -1451,13 +2726,77 @@ def rl_config(tcfg: TrainConfig) -> RLConfig:
     )
 
 
+def validate_train(tcfg: TrainConfig) -> None:
+    """The train-half refusals the CLI and a hand-built `train()` share.
+
+    ONE definition, two callers (`load_run` and `train/loop.py::train`): a
+    hand-built `TrainConfig` that skips `load_run` must not be able to run a
+    zero-micro-batch step or an EMA outside [0,1) either.
+    """
+    if tcfg.grad_accum < 1:
+        loud(
+            f"grad_accum={tcfg.grad_accum}: the field is a COUNT of micro-batches "
+            f"per optimizer step, so 1 is one forward/backward and 0 or a negative "
+            f"value would mean a step with no gradient at all. Escape: "
+            f"grad_accum >= 1 (the default 1)."
+        )
+    if tcfg.grad_accum > 1 and tcfg.opt_graph:
+        loud(
+            f"grad_accum={tcfg.grad_accum} with opt_graph=true: the CUDA graph "
+            f"captures ONE optimizer stage, and this arm is k EAGER backward "
+            f"passes standing around that stage — a stage whose gradient buffers "
+            f"were filled by a variable number of eager passes is not the stage "
+            f"the graph was verified on, and a capture-time frozen participating "
+            f"set is the `dion/cuda_graph.py:231-255` defect with a second way to "
+            f"starve it. Escape: opt_graph=false (the eager optimizer), or "
+            f"grad_accum=1."
+        )
+    if tcfg.full_graph and tcfg.opt_graph:
+        loud(
+            "full_graph=true with opt_graph=true names TWO captures of one region. "
+            "Escape: full_graph=true alone (it implies the optimizer capture), or "
+            "opt_graph=true alone."
+        )
+    if tcfg.full_graph and tcfg.grad_accum > 1:
+        loud(
+            f"full_graph=true with grad_accum={tcfg.grad_accum}: the accumulation loop "
+            f"is PYTHON (k forwards, a per-micro firewall AND, one group gate), so a "
+            f"capture would record ONE micro-batch and replay it as the group. "
+            f"Escape: grad_accum=1, or full_graph=false."
+        )
+    if tcfg.full_graph and tcfg.torch_compile:
+        loud(
+            "full_graph=true with torch_compile=true: a recompile attempted while a "
+            "CUDA graph capture is active aborts the capture, and `torch.compile` is "
+            "neither needed nor wanted under a graph. Escape: torch_compile=false, or "
+            "full_graph=false."
+        )
+    if not 0.0 <= tcfg.ema_decay < 1.0:
+        loud(
+            f"ema_decay={tcfg.ema_decay}: the EMA is "
+            f"`shadow <- d·shadow + (1-d)·param`, so the legal band is [0, 1). 0.0 "
+            f"is OFF; 1.0 freezes the shadow at its initial weights, which is not "
+            f"an average and would make every eval read the init. Escape: "
+            f"0.0 <= ema_decay < 1.0."
+        )
+    if tcfg.ema_decay > 0.0 and tcfg.muon_sf:
+        loud(
+            f"ema_decay={tcfg.ema_decay} with muon_sf=true: during a training step "
+            f"the parameters hold Y = (1-b1)·Z + b1·X, while the iterate this run "
+            f"evaluates and checkpoints is X (materialised by `sf('eval')`). An EMA "
+            f"updated after `opt.step()` would average Y, a different variable, and "
+            f"the checkpoint would pair an X-EMA with an optimizer built for the "
+            f"raw params. Materialising X every step for the shadow is the named "
+            f"follow-up. Escape: muon_sf=false, or ema_decay=0.0."
+        )
+
+
 def load_run(
     preset: str = "small",
     *,
     train: TrainConfig | None = None,
     train_overrides: dict[str, Any] | None = None,
     model_overrides: dict[str, Any] | None = None,
-    apply_compute: bool = False,
 ) -> RunConfig:
     """Resolve a run: preset (name or path) + both config halves + loud overrides.
 
@@ -1465,13 +2804,6 @@ def load_run(
     (`validate` for a self-inconsistent set, and the unknown-key check the
     preset layer runs), because an override that bypasses them is the
     silent-collapse shape the preset layer exists to prevent.
-
-    `apply_compute` is the opt-in for the two process-wide COMPUTE knobs
-    (`mm_dtype`, `kda_disable_recompute`), which live in module state read at
-    forward time. ONLY a command that trains passes True: `info` is a dry-run
-    print, and `serve`/`bench` load a snapshot and are not training, so letting
-    a preset's training global leak into them would make the process compute a
-    format its own snapshot does not name (the review's M6).
     """
     model = load_preset(preset)
     tcfg = train if train is not None else TrainConfig()
@@ -1504,38 +2836,6 @@ def load_run(
             f"max_epochs={tcfg.max_epochs} is negative: it is the repetition cap "
             f"in `train/mixture.py` (0 = off). Escape: a non-negative number, or "
             f"leave the default 4.0 (the measured MoE onset)."
-        )
-    if tcfg.dist_backend not in DIST_BACKENDS:
-        loud(
-            f"dist_backend={tcfg.dist_backend!r} is not a backend. Known: "
-            f"{list(DIST_BACKENDS)} — `auto` is nccl on a CUDA fleet and gloo on "
-            f"the CPU arm (train/distributed.py). Escape: name one of those."
-        )
-    if tcfg.dist_shard not in DIST_SHARDS:
-        loud(
-            f"dist_shard={tcfg.dist_shard!r} is not a sharding arm. Known: "
-            f"{list(DIST_SHARDS)} — `none` is DDP (the verified path), `fsdp` is "
-            f"FSDP2 (AdamW control arm only, see distributed.refuse_incompatible)."
-        )
-    if tcfg.dist_reduce not in DIST_REDUCE_DTYPES:
-        loud(
-            f"dist_reduce={tcfg.dist_reduce!r} is not a rung. Known: "
-            f"{list(DIST_REDUCE_DTYPES)} — `auto` follows the compute policy, "
-            f"`fp32` is the exact reference, `bf16`/`fp16` compress the link."
-        )
-    if tcfg.dist_bucket_mb < 0:
-        loud(f"dist_bucket_mb={tcfg.dist_bucket_mb}: 0 means auto, a negative cap is nonsense")
-    if not tcfg.dist and (
-        tcfg.dist_shard != "none"
-        or tcfg.dist_reduce != "auto"
-        or tcfg.dist_bucket_mb
-        or tcfg.dist_capacity
-    ):
-        loud(
-            f"dist=false with a distributed knob set (dist_shard={tcfg.dist_shard!r}, "
-            f"dist_reduce={tcfg.dist_reduce!r}, dist_bucket_mb={tcfg.dist_bucket_mb}, "
-            f"dist_capacity={tcfg.dist_capacity!r}): the knobs would be inert while "
-            f"the config carried them. Escape: dist=true, or drop them."
         )
     if tcfg.mix_plan and not Path(tcfg.mix_plan).is_file():
         loud(
@@ -1596,6 +2896,33 @@ def load_run(
             f"reported it on. Escape: opt='mix', or muon_sf=false. (Full schedule-free "
             f"AdamW is the named follow-up, not this arm.)"
         )
+    if tcfg.muon_sf and tcfg.muon_sf_wd <= 0:
+        loud(
+            f"muon_sf_wd={tcfg.muon_sf_wd}: the schedule-free arm needs weight decay "
+            f"at the FAST iterate Z, and a non-positive value leaves the theorem's "
+            f"precondition unmet — arXiv:2605.23061v1 Lemma 3.1 is what lifts the "
+            f"bounded-diameter assumption of the SF-Spectral bound "
+            f"(`docs/research/2026-10-16-sf-muon.md:77-81`, S2). The decay is "
+            f"`Z <- (1 - lr*wd)*Z - eta_hat*P_hat` (Alg 1 line 17), so it is NOT the "
+            f"AdamW group's `wd`. Escape: muon_sf_wd>0 (the arm's 0.01), or "
+            f"muon_sf=false."
+        )
+    if tcfg.muon_sf_retract:
+        loud(
+            "muon_sf_retract=true: the per-step TSCT polar retraction cannot run "
+            "under the schedule-free average. The retraction is a closest-point "
+            "projection onto the (NON-CONVEX) Stiefel manifold, while the "
+            "SF-Spectral proof's projection/Lyapunov step "
+            "(arXiv:2605.23061v1 §3.1, Thm 2.1) needs a convex set, and "
+            "X=(1-c)U1+c*U2 of retracted factors has column norms <= 1 with "
+            "equality only when the two agree — so the averaged iterate is not on "
+            "the manifold the factor contract assumes "
+            "(`docs/research/2026-10-16-sf-muon.md:82-93`, S3). This port's loop "
+            "has no `retract_tsct` call site at all, so with muon_sf=false the flag "
+            "would be inert too. Escape: muon_sf_retract=false (the default, and "
+            "the legal arm)."
+        )
+    validate_train(tcfg)
     if model_overrides:
         import dataclasses as _dc
 
@@ -1637,6 +2964,8 @@ def load_run(
     # window AND the arms, so its refusals live here, where both halves are
     # resolved — the same shape as the `engram_ram` block above.
     _validate_segment(model, tcfg)
+    _validate_doc(model, tcfg)
+    _validate_jepa(model, tcfg)
     # The RL lane's keys. The advantage arm is a literal list (checked here, the
     # way `opt` and `mm_dtype` are); the reward and penalty knobs are checked by
     # BUILDING the `RLConfig` they describe, whose `__post_init__` is LOUD — one
@@ -1655,26 +2984,26 @@ def load_run(
             f"rl_tasks={tcfg.rl_tasks} rl_group={tcfg.rl_group} "
             f"rl_budget={tcfg.rl_budget}: a step needs at least one task to draw, "
             f"one rollout in the group and one byte of budget. Escape: positive "
-            f"counts (the defaults are 16 / 4 / 256)."
+            f"counts (the defaults are 128 / 4 / 256)."
+        )
+    if tcfg.rl_holdout < 0 or tcfg.rl_eval_every < 0 or tcfg.rl_eval_samples < 1:
+        loud(
+            f"rl_holdout={tcfg.rl_holdout} rl_eval_every={tcfg.rl_eval_every} "
+            f"rl_eval_samples={tcfg.rl_eval_samples}: the holdout is >= 0, the eval "
+            f"cadence is >= 0 (0 = before/after only), and pass@budget needs at "
+            f"least one sampled attempt. Escape: the defaults are 32 / 50 / 2."
+        )
+    if not 0.0 <= tcfg.rl_band_lo <= tcfg.rl_band_hi <= 1.0:
+        loud(
+            f"rl_band=[{tcfg.rl_band_lo}, {tcfg.rl_band_hi}]: a pass rate lies in "
+            f"[0, 1] and lo <= hi. Escape: the default [0.2, 0.8]."
+        )
+    if tcfg.rl_band_attempts < 1:
+        loud(
+            f"rl_band_attempts={tcfg.rl_band_attempts}: a step draws at least one "
+            f"candidate. Escape: 1 (no retry) or more (the default is 4)."
         )
     rl_config(tcfg)
-    # The two process-wide COMPUTE knobs (`tf32`'s twins) live in module state
-    # read at forward time, not on the model object. `train()` sets them, but
-    # `sft` and `rl` never call it — a snapshot could say `mm_dtype=fp8` /
-    # `kda_disable_recompute=true` while the step ran the process defaults
-    # (audit 2026-10-19 M4, the SILENT class). The four TRAINING commands pass
-    # `apply_compute=True`, so the seam applies them once, before any forward
-    # exists; `train()` keeps its own calls for direct API callers. `info`,
-    # `serve` and `bench` resolve through here too and must not inherit a
-    # training global (review M6), which is why the default is False. `eval`
-    # and `decode` resolve from the snapshot (`from_snapshot`), not this
-    # function, so their documented "fresh process = bf16" default is unchanged.
-    if apply_compute:
-        from .model import kda as _kda
-        from .model.tsct import set_mm_dtype as _set_mm_dtype
-
-        _set_mm_dtype(tcfg.mm_dtype)
-        _kda.set_disable_recompute(tcfg.kda_disable_recompute)
     return RunConfig(source=preset, model=model, train=tcfg)
 
 

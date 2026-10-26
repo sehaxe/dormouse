@@ -119,8 +119,8 @@ no seed set; `K` is the knob.** Our operating points: byteflow_9m ran **K=128 / 
 B/patch** [ours]; the port default is **K=3200 / 8192 B = 2.56 B/patch** (`config.py:268-290`)
 — finer than anything published (BLT 4.5, H-Net 4.8, SpaceByte 6.0-6.3). A patch-size sweep
 should move K **down** (bigger patches), never up. The polygon and instruments exist:
-`port/scripts/ab_byteflow.py` (unrun 3-seed driver at K=128/512; emits `event=patch`
-mean/median/p90/histogram per run) and `port/scripts/patch_rate.py` (CPU probe, `--k` flag;
+`scripts/ab_byteflow.py` (unrun 3-seed driver at K=128/512; emits `event=patch`
+mean/median/p90/histogram per run) and `scripts/patch_rate.py` (CPU probe, `--k` flag;
 mean = T/K by construction; random-init caveat in its docstring — note `ab_byteflow.py` cites
 it as `scripts/patch_rate.py`, the repo's one dead path reference, though the file exists).
 
@@ -146,9 +146,9 @@ constant … to avoid giving larger patch sizes unfair advantage", 2412.09871 §
 
 **VERIFIED.** All IDs and dates resolved through the arXiv MCP this session; all quoted
 numbers are **[A]** or **[F]** as marked. Own-repo: `configs/byteflow.toml` (K=128,
-max_bytes=512, eps2=0.5), `port/src/dormouse/config.py:268-290` (K=3200, max_bytes=8192,
-eps2=0.5), `port/src/dormouse/model/byteflow.py:519` and `:408-424`,
-`port/scripts/ab_byteflow.py` + `port/scripts/patch_rate.py`,
+max_bytes=512, eps2=0.5), `src/dormouse/config.py:268-290` (K=3200, max_bytes=8192,
+eps2=0.5), `src/dormouse/model/byteflow.py:519` and `:408-424`,
+`scripts/ab_byteflow.py` + `scripts/patch_rate.py`,
 `docs/reviews/byteflow-ab-2026-10-02.md`, `docs/decisions/2026-10-15-1b-readiness-plan.md:21`
 (3.466/3.947/6.498 via `benches/history.tsv:157-159`), `AGENTS.md` §3.1.
 

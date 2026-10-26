@@ -46,7 +46,7 @@ a `[web]` URL, and every derived/assumed line is marked **DERIVED** or
 | filtered corpus | 19.7 GB, DCLM-classifier 0.5 + exact dedup, 272M docs → 104.2M kept | `AGENTS.md` §2.6 |
 | eval tail | 500 MB carve, sibling `real_eval/eval_tail.bin`; old 30 MB kept as `.30m.bak` | `AGENTS.md` §2.6 |
 | eval window rule | `eval_batches × batch × seq_len` **bytes**; a BPB is comparable only within one window | `AGENTS.md` §2.6 |
-| the port's day-1 stream | `port/src/dormouse/train/data.py` (180 LOC): mmap `.bin`, 64 MB ring, byte-range split, `rewind`/`skip_bytes`; no shuffle/parquet | `port/…/data.py:1-180` |
+| the port's day-1 stream | `src/dormouse/train/data.py` (180 LOC): mmap `.bin`, 64 MB ring, byte-range split, `rewind`/`skip_bytes`; no shuffle/parquet | `port/…/data.py:1-180` |
 | the crate's extras | `filter.rs` 1723 · `sft.rs` 396 · `anchors.rs` 334 · `shard.rs` 113 LOC (total `dormouse-data/src` = 3845) | `wc -l crates/dormouse-data` |
 | Engram n-gram orders | `ORDERS = [2,3,4]`, signed-FNV keys, raw (unreduced) | `crates/dormouse-data/src/lib.rs:84,105` |
 | burn-side A/B history | ByteFlow 3.466 vs plain-bytes 3.947 at equal params; ByteFlow 100k = 2.255 BPB; Engram "20–25%" law **refuted**; allocation swept | plan §1.1; `[sib]` §4 |

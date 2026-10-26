@@ -64,7 +64,12 @@ The update is `burn-muon-plus`'s, not a re-derivation:
     constant after warmup. Algorithm 1 + Appendix F, transcribed in
     `_sf_batched` / `sf_switch`; the docstring there names the two deliberate
     deviations (our ColRow stays composed; the AdamW half keeps WSD, so this is
-    a HYBRID SF-Muon + WSD-AdamW, not the paper's full-model SF).
+    a HYBRID SF-Muon + WSD-AdamW, not the paper's full-model SF). Its weight
+    decay is `muon_sf_wd`, applied at `Z` (Alg 1 line 17) and REQUIRED > 0
+    (`lambda=0` leaves Lemma 3.1's bounded-diameter lift unmet); the per-step
+    TSCT retraction is `muon_sf_retract` and `true` is refused (S3: the
+    averaged iterate is a convex combination of retracted factors, and the
+    projection step needs a convex set).
 """
 
 from __future__ import annotations
@@ -283,11 +288,158 @@ def zeropower_via_ns(
         x = x.transpose(1, 2).contiguous()
     x = x.to(_torch_dtype(ns_dtype))
     for _ in range(steps):
-        gram = x @ x.transpose(1, 2)
-        poly = b * gram + c * (gram @ gram)
-        x = a * x + poly @ x
+        # `torch.bmm` is the SAME kernel `x @ y` selects for 3-D operands, with
+        # the same operands: `matmul` only adds view/expand metadata dispatches
+        # around it (7 aten ops vs 2 per product, measured). The port's step is
+        # CPU-dispatch-bound, so the metadata is the cost; the values are
+        # bit-identical (`tests/test_muon_launch.py` pins it).
+        gram = torch.bmm(x, x.transpose(1, 2))
+        poly = b * gram + c * torch.bmm(gram, gram)
+        x = a * x + torch.bmm(poly, x)
     out = x.transpose(1, 2).contiguous() if transposed else x
     return out.to(torch.float32)
+
+
+def _gram(x: torch.Tensor) -> torch.Tensor:
+    """`x @ xᵀ` for one 2-D matrix or one `[N, d0, d1]` batch.
+
+    `torch.mm`/`torch.bmm` are the SAME kernels `x @ ...` selects; `matmul`
+    only adds view/expand metadata around them. Values are bit-identical.
+    """
+    return torch.bmm(x, x.transpose(1, 2)) if x.ndim == 3 else torch.mm(x, x.T)
+
+
+def _matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    return torch.bmm(x, y) if x.ndim == 3 else torch.mm(x, y)
+
+
+def _foreach_is_cheaper(numels: list[int]) -> bool:
+    """Would `_foreach_*` enqueue fewer kernels than the per-tensor loop?
+
+    `multi_tensor_apply` splits at 320 blocks of 65536 elements, so ONE 33.5M
+    tensor costs two launches through `_foreach_mul` and one through `x * b`.
+    The batch exists for many SMALL matrices, where the foreach packs them; it
+    must not turn a single large chunk into two launches (`medium`'s 513-tensor
+    group is one such chunk). Pure arithmetic, gated without running a chain.
+    """
+    n = len(numels)
+    if n == 0:
+        return False
+    blocks = sum(-(-x // 65536) for x in numels)
+    return max(-(-blocks // 320), -(-n // 64)) < n
+
+
+def _classic_ns_batch(tensors: list[torch.Tensor], steps: int, ns_dtype: str) -> list[torch.Tensor]:
+    """One lockstep pass over a list that fits the memory cap (see `_classic_ns_many`)."""
+    a, b, c = JORDAN_NS_COEFFS
+    pre: list[torch.Tensor] = []
+    transposed: list[bool] = []
+    for t in tensors:
+        x = t.to(torch.float32)
+        if x.ndim == 2:
+            x = x / (x.norm() + 1e-7)
+        else:
+            assert x.ndim == 3, f"NS is matrix-only or [N,d0,d1] batched, got {tuple(x.shape)}"
+            x = x / (x.norm(dim=(1, 2), keepdim=True) + 1e-7)
+        tall = x.shape[-2] > x.shape[-1]
+        transposed.append(tall)
+        if tall:
+            x = x.transpose(-2, -1).contiguous()
+        pre.append(x.to(_torch_dtype(ns_dtype)))
+    # `_foreach_*` is NOT free: its fast route splits at 320 `multi_tensor_apply`
+    # blocks (65536 elements each), so one 33.5M-element tensor costs TWO
+    # launches through it and ONE through `x * b`. Use it only where its launch
+    # count beats the per-tensor loop — many small matrices, which is the case
+    # the batch exists for. The arithmetic is the same op either way.
+    fused = _foreach_is_cheaper([t.numel() for t in tensors])
+
+    def scale(xs: list[torch.Tensor], s: float) -> list[torch.Tensor]:
+        return torch._foreach_mul(xs, s) if fused else [x * s for x in xs]
+
+    def add(xs: list[torch.Tensor], ys: list[torch.Tensor]) -> list[torch.Tensor]:
+        return torch._foreach_add(xs, ys) if fused else [x + y for x, y in zip(xs, ys, strict=True)]
+
+    work = pre
+    for _ in range(steps):
+        grams = [_gram(x) for x in work]
+        # `gram @ gram`, NOT `_gram(gram)`: the Gram is symmetric in exact
+        # arithmetic, but a bmm's two triangles are independently rounded, so
+        # `gram @ gramᵀ` moves the last bits. The reference has no transpose here.
+        squares = [_matmul(g, g) for g in grams]
+        # `b * gram` and `c * (gram @ gram)` are separate roundings in the
+        # reference; keeping two scales preserves that (an `add(alpha=c)` fuse
+        # would round once and move the bf16 chain).
+        bg = scale(grams, b)
+        cg = scale(squares, c)
+        polys = add(bg, cg)
+        px = [_matmul(p, x) for p, x in zip(polys, work, strict=True)]
+        ax = scale(work, a)
+        work = add(ax, px)
+    out: list[torch.Tensor] = []
+    for x, tall in zip(work, transposed, strict=True):
+        if tall:
+            x = x.transpose(-2, -1).contiguous()
+        out.append(x.to(torch.float32))
+    return out
+
+
+def _classic_ns_many(
+    tensors: list[torch.Tensor], steps: int = 5, ns_dtype: str = "fp32"
+) -> list[torch.Tensor]:
+    """`zeropower_via_ns(kind="classic")` for MANY matrices, one elementwise pass.
+
+    The contraction (`x @ xᵀ`, `gram @ gram`, `poly @ x`) cannot be merged
+    across different shapes, so each matrix keeps its own `mm`/`bmm`. The FIVE
+    elementwise ops per iteration can be merged: they are the same scalar op on
+    every matrix, so `torch._foreach_*` issues one launch for the whole list
+    where the per-matrix loop issued one each (the port's step is
+    host-dispatch-bound — `AGENTS.md` §2.1).
+
+    The arithmetic is the SAME operation in the SAME dtype, in the same order:
+    `b·gram`, then `c·(gram@gram)`, then their add; `a·x`, then `poly@x`, then
+    their add. `_foreach_mul`/`_foreach_add` apply exactly those elementwise
+    kernels; the per-element values are bit-identical to running
+    `zeropower_via_ns` on each tensor in turn, which `tests/test_muon_launch.py`
+    pins against the pre-change step.
+
+    The list is split at `MUON_CHUNK_ELEMS` ELEMENTS, the same cap a single
+    chunk already obeys, and the biggest tensors are placed first so a chunk
+    that fills the cap gets its own batch while the many small groups share one.
+    The lockstep pass keeps ~6 fp32 temporaries per element alive for the WHOLE
+    batch (the per-chunk loop freed them between chunks), so an unbounded pass
+    would turn b1's ~400M NS elements into ~10 GiB of transients. The cap keeps
+    the peak equal to main's one-chunk peak and only costs one extra elementwise
+    launch per sub-batch.
+
+    The prescale/postscale stay per tensor: the Frobenius norm is per SLICE for
+    a 3-D chunk (a `_foreach_norm` would collapse the batch) and the division
+    by that norm has a different shape per matrix, which is `_foreach_*`'s slow
+    route. Those are 3 launches per matrix, not 25.
+    """
+    _check_dtype("ns_dtype", ns_dtype)
+    out: list[torch.Tensor | None] = [None] * len(tensors)
+    # Biggest first: a chunk that fills the cap gets its own batch, and the many
+    # small groups share the remaining ones. The greedy split is otherwise
+    # order-dependent (a big chunk sandwiched between small ones costs an extra
+    # batch). The contraction is per matrix, so the order cannot move a value.
+    order = sorted(range(len(tensors)), key=lambda i: -tensors[i].numel())
+    batch: list[torch.Tensor] = []
+    batch_idx: list[int] = []
+    elems = 0
+    for i in order:
+        t = tensors[i]
+        n = t.numel()
+        if batch and elems + n > MUON_CHUNK_ELEMS:
+            for j, u in zip(batch_idx, _classic_ns_batch(batch, steps, ns_dtype), strict=True):
+                out[j] = u
+            batch, batch_idx, elems = [], [], 0
+        batch.append(t)
+        batch_idx.append(i)
+        elems += n
+    if batch:
+        for j, u in zip(batch_idx, _classic_ns_batch(batch, steps, ns_dtype), strict=True):
+            out[j] = u
+    return out  # type: ignore[return-value]
 
 
 def colrow_normalize(x: torch.Tensor, eps: float = 1e-7, *, colrow_3d: str = "colrow"):
@@ -530,11 +682,106 @@ class _MomGroup:
         self.z = z
 
 
-def _momentum_update_(mom: torch.Tensor, params: list, mu: float) -> None:
-    """`m ← mu·m + (1-mu)·g`, in place over a stacked buffer, one fused pass.
+def _stack_grads(params: list) -> torch.Tensor:
+    """The chunk's gradients as ONE stacked tensor — the launch-saving copy.
 
-    `fp32` (the default): `mom.mul_(mu)` + ONE `_foreach_add_` over the rows —
-    the path this port has always run, untouched.
+    `_foreach_add_`'s CUDA fast route requires the same dtype across its lists
+    (`ForeachUtils.h`'s `_check_tensors_share_device_and_dtype`), so an fp32
+    accumulator plus bf16 gradients takes the SLOW route: one launch per tensor
+    (513 for the medium `[1024, 64]` group, 256 for `[64, 2730]`). `torch.stack`
+    is one copy kernel and the add that follows is one kernel, so the mixed
+    dtype costs 2 launches per chunk instead of `len(chunk)`.
+
+    The arithmetic does not move: `stack` copies values exactly, bf16→fp32 is
+    exact, and `acc.add_(stacked, alpha)` promotes to fp32 exactly as the
+    per-row `add_` the slow route ran (TensorIterator's common dtype). Gated
+    bit-for-bit against the pre-change step in `tests/test_muon_launch.py`.
+    """
+    dtypes = {p.grad.dtype for p in params}
+    if len(dtypes) != 1:
+        loud(
+            f"a Muon shape group's gradients carry mixed dtypes {sorted(map(str, dtypes))}: "
+            f"stacking them would promote silently and move the accumulation's dtype. "
+            f"Escape: give the group one dtype, or keep those parameters in separate groups."
+        )
+    return torch.stack([p.grad for p in params])
+
+
+def _add_grads_(acc: torch.Tensor, params: list, alpha: float) -> None:
+    """`acc[i].add_(grad_i, alpha)` — the cheaper of the two launch shapes.
+
+    The per-row `_foreach_add_` takes the CUDA fast route only when the
+    accumulator and the gradients share a dtype; otherwise it is one launch per
+    tensor. The stacked `add_` is two launches whatever the dtypes are. Pick by
+    the launch counts, not by taste: a fast foreach fuses 64 tensors per launch,
+    so the stack only wins past two launches (and always wins on a mixed dtype
+    with more than two tensors).
+    """
+    n = len(params)
+    dtypes = {p.grad.dtype for p in params}
+    if len(dtypes) != 1:
+        loud(
+            f"a Muon shape group's gradients carry mixed dtypes {sorted(map(str, dtypes))}: "
+            f"an elementwise add cannot take them without a silent promotion. "
+            f"Escape: one dtype per group."
+        )
+    fast_launches = -(-n // 64)
+    if (dtypes.pop() != acc.dtype and n > 2) or fast_launches > 2:
+        acc.add_(_stack_grads(params), alpha=alpha)
+        return
+    torch._foreach_add_(torch.unbind(acc, 0), [p.grad for p in params], alpha=alpha)
+
+
+def _foreach_add_mixed_(params: list, update: torch.Tensor, alpha: float = 1.0) -> None:
+    """`p.add_(u, alpha)` for every row in a handful of launches, not one each.
+
+    The mixed-dtype add (bf16 parameter + fp32 update) is computed in fp32 and
+    stored in the parameter's dtype — TensorIterator's common dtype — and a
+    per-tensor `_foreach_add_` over that mix takes `ForeachUtils.h`'s SLOW
+    route, i.e. one launch per parameter (781 for the medium Muon groups).
+    Stacking the parameters, adding the stacked update ONCE, and copying the
+    stack back is the same elementwise operation: the stack/copy are exact and
+    the add is the same fp32-compute/bf16-store op. The copy back is a
+    same-dtype `_foreach_copy_`, which DOES take the fast route (up to 64
+    tensors per launch).
+
+    A same-dtype update skips the stack: `_foreach_add_` is already fast there.
+    A dtype this helper cannot reproduce LOUDLY refuses rather than silently
+    changing the store's rounding.
+    """
+    dtype = params[0].dtype
+    if any(p.dtype != dtype for p in params):
+        loud(
+            f"a Muon shape group mixes parameter dtypes "
+            f"{sorted({str(p.dtype) for p in params})}: the stacked writeback would "
+            f"promote them through one common dtype. Escape: one dtype per group."
+        )
+    if update.dtype == dtype:
+        torch._foreach_add_([p.detach() for p in params], torch.unbind(update), alpha=alpha)
+        return
+    if update.dtype != torch.float32:
+        loud(
+            f"the Muon update is {update.dtype} against {dtype} parameters: this "
+            f"writeback only knows the fp32-update/param-dtype store (the NS chain's "
+            f"own contract) and a same-dtype add. Escape: cast the update at its "
+            f"source, or extend the helper with a gated rung."
+        )
+    if len(params) <= 3:
+        # The stack is 3 launches; a handful of per-tensor mixed adds is fewer.
+        for p, u in zip(params, torch.unbind(update), strict=True):
+            p.detach().add_(u, alpha=alpha)
+        return
+    stacked = torch.stack([p.detach() for p in params])
+    stacked.add_(update, alpha=alpha)
+    torch._foreach_copy_([p.detach() for p in params], torch.unbind(stacked))
+
+
+def _momentum_update_(mom: torch.Tensor, params: list, mu: float) -> None:
+    """`m ← mu·m + (1-mu)·g`, in place over a stacked buffer, a few launches.
+
+    `fp32` (the default): `mom.mul_(mu)` + `_add_grads_` per CHUNK. The chunk is
+    what keeps the add on the fast route (or on a 2-launch stack) instead of a
+    per-tensor loop.
 
     `bf16`: the ACCUMULATION is fp32 and only the STORE rounds to bf16
     (arXiv:2509.23106's rung, cited in the module docstring). One fp32 temporary
@@ -544,17 +791,18 @@ def _momentum_update_(mom: torch.Tensor, params: list, mu: float) -> None:
     warm attempts (audit MAJOR 7, `~/logs/b1warm.log`), so the chunking is what
     makes the bf16 rung a memory win instead of a memory-neutral one.
     """
-    if mom.dtype != torch.bfloat16:
-        mom.mul_(mu)
-        torch._foreach_add_(torch.unbind(mom, 0), [p.grad for p in params], alpha=1.0 - mu)
-        return
     n = len(params)
     n_chunk = max(1, min(n, MUON_CHUNK_ELEMS // mom[0].numel()))
+    if mom.dtype != torch.bfloat16:
+        mom.mul_(mu)
+        for start in range(0, n, n_chunk):
+            _add_grads_(mom[start : start + n_chunk], params[start : start + n_chunk], 1.0 - mu)
+        return
     for start in range(0, n, n_chunk):
         chunk = params[start : start + n_chunk]
         acc = mom[start : start + n_chunk].to(torch.float32)
         acc.mul_(mu)
-        torch._foreach_add_(torch.unbind(acc, 0), [p.grad for p in chunk], alpha=1.0 - mu)
+        _add_grads_(acc, chunk, 1.0 - mu)
         mom[start : start + n_chunk].copy_(acc)
 
 
@@ -567,9 +815,12 @@ class Muon(Optimizer):
 
     `variant` (`MUON_VARIANTS`) picks the direction arm and `sf` wraps it in the
     schedule-free averaging — both `off`/`muon` by default. `wd` is the Muon
-    group's OWN weight decay (the papers' `-η·λ·W`), which this port carries at
-    `0.0` on every run: the trainer's `wd` reaches the AdamW half only, so the
-    default path is byte-identical to its history (the SF research doc's S2 gap).
+    group's OWN weight decay (the papers' `-η·λ·W`). The trainer sets it from
+    `muon_sf_wd` **only under `sf`**, where it is applied at the fast iterate
+    `Z` (Alg 1 line 17) and must be > 0; `MixOptimizer` refuses the arm when it
+    is not (Lemma 3.1). With `sf=false` the optimizer is constructed with
+    `wd=0.0` on every run, so the control is byte-identical to its history (the
+    SF research doc's S2 gap is a property of the arm, not of the control).
     """
 
     def __init__(
@@ -720,7 +971,15 @@ class Muon(Optimizer):
             return zeropower_via_ns(x, steps, self.ns_kind)
         return zeropower_via_ns(x, steps, self.ns_kind, self.ns_dtype)
 
-    def _step_one(self, p: torch.Tensor, lr: float, mu: float, ns: int, scale: float) -> None:
+    def _step_one(
+        self,
+        p: torch.Tensor,
+        lr: float,
+        mu: float,
+        ns: int,
+        scale: float,
+        flag: torch.Tensor | None = None,
+    ) -> None:
         """The per-param update — the reference the batched path must match.
 
         Kept because it is the definition, and used by the batched step for the
@@ -748,9 +1007,13 @@ class Muon(Optimizer):
             self._sf_one(p, update, lr)
             return
         if self.variant == "normuon":
-            self._nor_apply(p, update, lr)
+            self._nor_apply(p, update, lr, flag)
             return
         update = colrow_normalize(update)
+        if flag is not None:
+            # The device firewall's gate (0/1, on the device): `*1.0` is exact
+            # on a healthy step, so this cannot move a health-run number.
+            update = update.mul(flag.to(update.dtype))
         with torch.no_grad():
             if torch.is_tensor(lr):
                 # The CUDA-graph arm (`train/graph.py`): `lr` is a 0-dim DEVICE
@@ -766,7 +1029,9 @@ class Muon(Optimizer):
             else:
                 p.add_(update.to(p.dtype), alpha=-lr * scale)
 
-    def _nor_apply(self, p: torch.Tensor, o: torch.Tensor, lr: float) -> None:
+    def _nor_apply(
+        self, p: torch.Tensor, o: torch.Tensor, lr: float, flag: torch.Tensor | None = None
+    ) -> None:
         """The `normuon` tail for ONE parameter: `W -= η·λ·W + η·update`.
 
         `update` is the repo's tail (`normuon_repo_update_`) applied to the BARE
@@ -779,14 +1044,24 @@ class Muon(Optimizer):
         state = self.state[p]
         v = state.setdefault("v", torch.zeros(p.shape[0], dtype=torch.float32, device=p.device))
         update = normuon_repo_update_(o, v, p.shape, self.beta2)
+        if flag is not None:
+            update = update.mul(flag.to(update.dtype))
         with torch.no_grad():
             if self.wd:
-                p.mul_(1.0 - lr * self.wd)
+                p.mul_(_gate_identity(flag, 1.0 - lr * self.wd, p))
             p.add_(update.to(p.dtype), alpha=-lr)
 
     def _sf_one(self, p: torch.Tensor, o: torch.Tensor, lr: float) -> None:
         """The schedule-free tail for ONE parameter (the batched twin is
-        `_sf_batched`; both use `_sf_direction` and `_sf_ckp`)."""
+        `_sf_batched`; both use `_sf_direction` and `_sf_ckp`).
+
+        The SF arm is the ONE host-gated path left, and it is named rather than
+        silent: its `s`/`c` recursion is HOST state (`_sf_ckp`), so the firewall
+        reads the flag on the host for this arm alone and skips the whole Muon
+        step (`MixOptimizer.step`). `opt_graph` already refuses SF, so the
+        capture goal — the reason the rest of the step is device-resident — is
+        not touched by it.
+        """
         state = self.state[p]
         if "z" not in state:
             dtype = _torch_dtype(self.state_dtype)
@@ -833,6 +1108,9 @@ class Muon(Optimizer):
         whole recursion is host arithmetic — no device read, no sync (the port's
         rule 1.3). Stored per parameter as `sf_s`, so torch's own `state_dict`
         carries it (a float, not a tensor: nothing to sync and nothing to cast).
+        This is why the SF arm is host-gated in `MixOptimizer.step`: its `s` is
+        host state the device flag cannot reach without a read, and `opt_graph`
+        refuses SF for the same reason.
         """
         s = s_prev + lr * lr
         return s, lr * lr / s
@@ -874,7 +1152,7 @@ class Muon(Optimizer):
                 else:
                     p.copy_(st["z"]).lerp_(st["x"].to(p.dtype), self.sf_beta)
 
-    def batched_step_from_model(self, model) -> int:
+    def batched_step_from_model(self, model, flag: torch.Tensor | None = None) -> int:
         """The shape-batched Muon pass (a no-op when the batches are trivially small).
 
         The per-param loop above re-derives identical-shape Newton-Schulz
@@ -888,12 +1166,20 @@ class Muon(Optimizer):
         shape, so it stays a scalar.
 
         Since 2026-10-16 the stack is not per-step work at all: the stacked
-        buffer is the STATE (`_build_groups`), the momentum update is
-        `mom.mul_(mu)` + ONE fused `_foreach_add_` over its own rows (the
-        gradient stack is gone with it), and the writes are in place. What
-        remains per step is the NS chain and the final `_foreach_add_`. On the
-        `bf16` state rung the same update runs with an fp32 accumulate and a
-        bf16 store, one chunk temporary at a time (`_momentum_update_`).
+        buffer is the STATE (`_build_groups`), and the momentum update is
+        `mom.mul_(mu)` + `_add_grads_` over its own rows (the gradient stack is
+        gone with it). What remains per step is the NS chain and the final
+        write-back. On the `bf16` state rung the same update runs with an fp32
+        accumulate and a bf16 store, one chunk temporary at a time
+        (`_momentum_update_`).
+
+        The NS calls are QUEUED and run in ONE lockstep pass: the classic
+        chain's five elementwise ops per iteration are the same scalar op on
+        every queued matrix, so `_classic_ns_many` issues them once for the
+        whole list instead of once per shape group. A singleton shape group
+        still gets the per-parameter DEFINITION (`_step_one`'s 2-D ColRow and
+        cast-then-add), only its NS joins the queue — the 3-D branch's scale is
+        a different program.
 
         The group's `lr` may be a 0-dim DEVICE tensor instead of a host float
         (`train/graph.py`): `-lr * scale` is then a device scalar op the captured
@@ -905,21 +1191,47 @@ class Muon(Optimizer):
         if not self._groups:
             self._build_groups()
         n_batches = 0
+        # The default `muon` arm queues its Newton–Schulz calls and runs the
+        # classic chain in ONE lockstep pass (`_classic_ns_many`), so the five
+        # elementwise ops per iteration are issued once for every shape group
+        # instead of once per group. A job is
+        # `(params, tensor_to_orthogonalize, lr, scale, ns_steps, singleton)`.
+        jobs: list[tuple[list, torch.Tensor, float, float, int, bool]] = []
         for grp in self._groups:
             group = self.param_groups[grp.gi]
             lr, mu, ns = group["lr"], group["momentum"], group["ns_steps"]
             scale = max(1.0, grp.shape[0] / grp.shape[1]) ** 0.5
             params = grp.params
             if len(params) < 2 or any(p.grad is None for p in params):
-                # A shape with one member, or a 2-D parameter with no gradient:
-                # fall back to the definition rather than inventing a "zero
-                # gradient" row. This is not just caution — the 3-D branch of
-                # `colrow_normalize` is a KNOWN divergence from the per-param
-                # ColRow (see its docstring), so routing a singleton through the
-                # batch would MOVE that parameter's update scale by 1/sqrt(d0).
-                for p in params:
-                    if p.grad is not None:
-                        self._step_one(p, lr, mu, ns, scale)
+                # A 2-D parameter with no gradient falls back to the definition
+                # (inventing a "zero gradient" row would move the momentum).
+                if any(p.grad is None for p in params):
+                    for p in params:
+                        if p.grad is not None:
+                            self._step_one(p, lr, mu, ns, scale, flag)
+                    continue
+                if self.sf or self.variant == "normuon":
+                    # The SF/NorMuon tails are per-parameter (`_sf_one` /
+                    # `_nor_apply`); the singleton path stays the definition.
+                    self._step_one(params[0], lr, mu, ns, scale, flag)
+                    continue
+                # A shape with ONE member, default arm: the momentum rung is
+                # `_step_one`'s (same branch, same buffer), and the NS is
+                # queued so it shares the lockstep chain. The tail below is
+                # `_step_one`'s own 2-D ColRow + add, so this is the same
+                # program — NOT the 3-D branch (whose scale is a known
+                # divergence, see `colrow_normalize`'s docstring).
+                p = params[0]
+                buf = self.state[p].get("momentum")
+                if buf is None:
+                    buf = self.state[p]["momentum"] = torch.zeros_like(
+                        p.grad, dtype=_torch_dtype(self.state_dtype)
+                    )
+                if buf.dtype == torch.bfloat16:
+                    buf.copy_(buf.float().mul_(mu).add_(p.grad, alpha=1.0 - mu))
+                else:
+                    buf.mul_(mu).add_(p.grad, alpha=1.0 - mu)
+                jobs.append(([p], buf, lr, scale, ns, True))
                 continue
             mom = grp.mom
             # The momentum update, in place, without a stack: `mom` is the
@@ -940,27 +1252,105 @@ class Muon(Optimizer):
             n_chunk = max(1, min(n, MUON_CHUNK_ELEMS // (grp.shape[0] * grp.shape[1])))
             for start in range(0, n, n_chunk):
                 params_c = params[start : start + n_chunk]
-                update = self._orthogonalize(mom[start : start + n_chunk], ns)
+                pieces = mom[start : start + n_chunk]
                 if self.sf:
+                    update = self._orthogonalize(pieces, ns)
                     self._sf_batched(grp, start, len(params_c), params_c, update, lr, c)
                     continue
                 if self.variant == "normuon":
-                    self._nor_batched(grp, start, len(params_c), params_c, update, lr)
+                    update = self._orthogonalize(pieces, ns)
+                    self._nor_batched(grp, start, len(params_c), params_c, update, lr, flag)
+                    continue
+                jobs.append((params_c, pieces, lr, scale, ns, False))
+            n_batches += 1
+
+        if jobs:
+            # Group by the step count (every group normally shares `ns_steps`,
+            # but a param group may override it): one lockstep chain per count.
+            by_steps: dict[int, list[int]] = {}
+            for i, job in enumerate(jobs):
+                by_steps.setdefault(job[4], []).append(i)
+            updates: list[torch.Tensor | None] = [None] * len(jobs)
+            for steps, idxs in by_steps.items():
+                outs = self._orthogonalize_many([jobs[i][1] for i in idxs], steps)
+                for i, update in zip(idxs, outs, strict=True):
+                    updates[i] = update
+            for job, update in zip(jobs, updates, strict=True):
+                params_c, _, lr, scale, _, singleton = job
+                assert update is not None
+                if singleton:
+                    # `_step_one`'s tail, verbatim: out-of-place 2-D ColRow,
+                    # the device gate, then the cast-then-add the per-parameter
+                    # definition runs (the batched 3-D tail folds the scale into
+                    # the update instead; that difference is the definition's).
+                    update = colrow_normalize(update, colrow_3d=self.colrow_3d)
+                    if flag is not None:
+                        update = update.mul(flag.to(update.dtype))
+                    with torch.no_grad():
+                        p = params_c[0]
+                        if torch.is_tensor(lr):
+                            p.add_(update.to(p.dtype).mul_(lr), alpha=-scale)
+                        else:
+                            p.add_(update.to(p.dtype), alpha=-lr * scale)
                     continue
                 # In place: `update` is a fresh tensor the optimizer owns (NS
-                # always allocates on its first `x / (norm + eps)`), and the
-                # write-back is FOREACH — per-param copies are what kept 5221
-                # add_ + 3267 copy_ launches on the post-batched profile
-                # (55 + 57 ms/step). The size check guarantees identical
-                # shapes so the sockets align 1:1.
+                # always allocates on its first `x / (norm + eps)`). The
+                # write-back is the same-dtype fast `_foreach_add_` (or the
+                # 3-launch stacked form on the mixed dtype rung).
                 colrow_normalize_(update, colrow_3d=self.colrow_3d).mul_(-lr * scale)
+                if flag is not None:
+                    # The device firewall's gate: `*1.0` on a healthy step is
+                    # bit-exact, `*0` on a skipped one makes the write below a
+                    # zero add. Nothing here branches on the flag.
+                    update.mul_(flag.to(update.dtype))
                 with torch.no_grad():
-                    torch._foreach_add_([p.detach() for p in params_c], torch.unbind(update))
-            n_batches += 1
+                    _foreach_add_mixed_(params_c, update)
         return n_batches
 
+    def _orthogonalize_many(self, tensors: list[torch.Tensor], steps: int) -> list[torch.Tensor]:
+        """`_orthogonalize` for a LIST: fused kernels where they fit, ONE classic pass.
+
+        The `triton` arm is per-call by construction (one fused launch covers a
+        whole `[N, d0, d1]` chunk), so eligible chunks still call it one by one.
+        Everything the arm refuses — the `ns_dtype` rung, `MAX_RANK`, a non-CUDA
+        box — is COUNTED with its reason and then run through the SAME lockstep
+        classic chain, so a fallback no longer costs 25 elementwise launches per
+        iteration per group.
+        """
+        if self.ns_kind != "triton":
+            return _classic_ns_many(tensors, steps, self.ns_dtype)
+        from .ns_kernels import LAUNCH_REFUSALS, path_reason, zeropower_triton
+
+        out: list[torch.Tensor | None] = [None] * len(tensors)
+        classic: list[int] = []
+        for i, g in enumerate(tensors):
+            why = path_reason(g, self.ns_dtype)
+            if why is None:
+                try:
+                    out[i] = zeropower_triton(g, steps)
+                except LAUNCH_REFUSALS as e:
+                    why = f"the launch was refused by the device ({type(e).__name__}: {e})"
+                else:
+                    self.counters.count("ns_triton")
+                    continue
+            classic.append(i)
+            self.counters.count("ns_triton_fallback")
+            self.counters.why = f"triton: {why}"  # type: ignore[attr-defined]
+        if classic:
+            outs = _classic_ns_many([tensors[i] for i in classic], steps, self.ns_dtype)
+            for i, update in zip(classic, outs, strict=True):
+                out[i] = update
+        return out  # type: ignore[return-value]
+
     def _nor_batched(
-        self, grp: _MomGroup, start: int, k: int, params_c: list, o: torch.Tensor, lr: float
+        self,
+        grp: _MomGroup,
+        start: int,
+        k: int,
+        params_c: list,
+        o: torch.Tensor,
+        lr: float,
+        flag: torch.Tensor | None = None,
     ) -> None:
         """The `normuon` tail for one CHUNK: `W -= η·λ·W + η·update`.
 
@@ -973,10 +1363,15 @@ class Muon(Optimizer):
             grp.shape,
             self.beta2,
         )
+        if flag is not None:
+            update = update.mul(flag.to(update.dtype))
         with torch.no_grad():
             if self.wd:
-                torch._foreach_mul_([p.detach() for p in params_c], 1.0 - lr * self.wd)
-            torch._foreach_add_([p.detach() for p in params_c], torch.unbind(update), alpha=-lr)
+                torch._foreach_mul_(
+                    [p.detach() for p in params_c],
+                    [_gate_identity(flag, 1.0 - lr * self.wd, p) for p in params_c],
+                )
+            _foreach_add_mixed_(params_c, update, alpha=-lr)
 
     def _sf_batched(
         self,
@@ -1048,6 +1443,7 @@ class MixOptimizer:
         eps: float = 1e-8,
         muon_variant: str = "muon",
         muon_sf: bool = False,
+        muon_sf_wd: float | None = None,
     ) -> None:
         if opt not in ("mix", "adamw"):
             loud(f"opt={opt!r}: known optimizers are 'mix' (default) and 'adamw'")
@@ -1074,6 +1470,21 @@ class MixOptimizer:
                 f"muon_sf=false. (Full schedule-free AdamW is the named follow-up, "
                 f"not this arm.)"
             )
+        # The SF arm's decay at Z is a DIFFERENT quantity from the AdamW half's
+        # `wd` (the SF paper's Lemma 3.1, `docs/research/2026-10-16-sf-muon.md`:
+        # S2), so it has its own value. `None` keeps the pre-key behaviour
+        # (inherit `wd`) for a caller that predates the key; the trainer passes
+        # the config field explicitly.
+        sf_wd = wd if muon_sf_wd is None else muon_sf_wd
+        if muon_sf and sf_wd <= 0:
+            loud(
+                f"muon_sf=true with muon_sf_wd={sf_wd}: arXiv:2605.23061v1 "
+                f"Lemma 3.1 lifts the SF-Spectral bound's bounded-diameter "
+                f"assumption only when the fast iterate Z carries a POSITIVE "
+                f"decay (Alg 1 line 17: `Z <- (1 - lr*wd)*Z - eta_hat*P_hat`). "
+                f"At zero the arm runs outside the published assumption set. "
+                f"Escape: muon_sf_wd>0 (the arm's 0.01), or muon_sf=false."
+            )
         self.muon = (
             Muon(
                 muon_params,
@@ -1087,11 +1498,12 @@ class MixOptimizer:
                 variant=muon_variant,
                 # The Muon group's OWN weight decay (the papers' `-ηλW`): the
                 # `muon` control carries none (today's behaviour, byte-identical),
-                # the SF arm carries the trainer's `wd` because arXiv:2605.23061's
-                # Lemma 3.1 makes decay at Z necessary for long-horizon stability
-                # (the `normuon` arm runs λ=0, the Microsoft repo's own default,
-                # so it stays a one-factor arm against the control).
-                wd=wd if muon_sf else 0.0,
+                # the SF arm carries `muon_sf_wd` at `Z` because
+                # arXiv:2605.23061's Lemma 3.1 makes decay there necessary for
+                # long-horizon stability (the `normuon` arm outside SF still runs
+                # λ=0, the Microsoft repo's own default, so it stays a one-factor
+                # arm against the control).
+                wd=sf_wd if muon_sf else 0.0,
                 sf=muon_sf,
             )
             if muon_params
@@ -1162,13 +1574,115 @@ class MixOptimizer:
             )
         self.muon.sf_switch(mode)
 
-    def step(self) -> None:
-        """The mixed step: the batched Muon per shape ( Platzhalter-kill), AdamW per group."""
+    def step(self, flag: torch.Tensor | None = None) -> None:
+        """The mixed step: the batched Muon per shape ( Platzhalter-kill), AdamW per group.
+
+        `flag` is the trainer's DEVICE firewall: a 0-dim 1/0 tensor that says
+        whether this step's loss and gradients were finite. It stays on the
+        device — nothing here reads it on the host — and it multiplies every
+        WRITE the optimizer makes, so a non-finite step becomes a no-op update
+        without a `bool(tensor)` anywhere (ADR-0018 rule 2, `mask_fill` /
+        multiply-by-the-flag). `None` (every other caller) is the old path
+        unchanged.
+
+        Two arms cannot follow a device flag and are refused at setup rather
+        than silently ungated: bitsandbytes' `AdamW8bit` (it has no hook
+        between its state and the parameter write) — `train()` refuses
+        `optim_8bit` with this firewall.
+
+        AdamW's own decoupled weight decay is lifted out of `torch.optim` here
+        for ONE reason: `p.mul_(1 - lr*wd)` moves a parameter even when its
+        gradient is zero, so a gated (zeroed) first moment alone is not enough.
+        The factor is applied by `_gated_adamw_step` instead, from the same
+        `1 - lr*wd` value torch would have used (a 0-dim tensor of the SAME
+        float32 value, which ATen's scalar path also casts to), and is selected
+        to exactly 1.0 on a skipped step. On a healthy step the arithmetic is
+        bit-identical to the stock optimizer — `tests/test_nan_firewall.py`
+        pins that against a HEAD golden, and the conversion was checked on CPU.
+        """
         if self.muon is not None:
-            n_batched = self.muon.batched_step_from_model(self.model)
-            self.steps_batched = n_batched
-        self.adamw.step()
+            if self.muon.sf and flag is not None:
+                # The SF arm's `s`/`c` are HOST state (`_sf_ckp`), so its skip
+                # has to be decided on the host: ONE declared read per step,
+                # exactly the old skip branch (the step is not called at all, so
+                # `z`, `x` and `s` cannot advance). `opt_graph` refuses SF, so
+                # this never sits inside a capture; every other arm is
+                # device-resident.
+                if float(flag) > 0.0:
+                    self.steps_batched = self.muon.batched_step_from_model(self.model)
+            else:
+                n_batched = self.muon.batched_step_from_model(self.model, flag)
+                self.steps_batched = n_batched
+        if flag is None:
+            self.adamw.step()
+        else:
+            self._gated_adamw_step(flag)
         self.steps += 1
+
+    @torch.no_grad()
+    def _gated_adamw_step(self, flag: torch.Tensor) -> None:
+        """AdamW with every parameter WRITE scaled by the device flag.
+
+        Three writes happen in a stock AdamW step, and each is gated:
+
+        * `p.mul_(1 - lr*wd)` — replaced by our own multiply with a factor
+          selected to 1.0 on a skipped step (see `step`'s docstring);
+        * the moment update `exp_avg.lerp_(grad, 1-beta1)` — its `grad` was
+          sanitized to zero by the trainer, so the only thing to stop is the
+          carried first moment reaching the `addcdiv_`; it is multiplied by the
+          flag before the call, so the update term is exactly zero. The cost is
+          a semantic one, named here rather than discovered: a skipped step
+          ZEROES the first moment (`exp_avg`), i.e. the step after a NaN restarts
+          the momentum from the current gradient. The second moment keeps
+          decaying (`grad = 0`), stays finite, and the old skip left both
+          untouched — this is the price of not branching on the device value;
+        * `p.addcdiv_(exp_avg, denom, value=-step_size)` — zero numerator is a
+          zero update, and on the healthy path `exp_avg * 1.0` is bit-exact.
+
+        The weight decay is written back after `adamw.step()` so the optimizer's
+        `param_groups` — and therefore every checkpoint's `opt` half — keep the
+        config's value; only the step's own view is zero.
+        """
+        dtype = next(p for g in self.adamw.param_groups for p in g["params"]).dtype
+        device = flag.device
+        scale = flag.to(dtype)
+        keep = flag.to(torch.bool)
+        one = torch.ones_like(scale)
+        zeroed: list[tuple[dict, float]] = []
+        for group in self.adamw.param_groups:
+            params = [p for p in group["params"] if p.grad is not None]
+            if not params:
+                continue
+            lr = group["lr"]
+            wd = group.get("weight_decay", 0.0)
+            if wd:
+                # The graph arm's LR is a device tensor the capture re-reads; a
+                # host lr is the eager path's float. Both produce the SAME
+                # float32 scalar torch's `p.mul_(1 - lr*wd)` would have used.
+                factor = (
+                    1 - lr * wd
+                    if torch.is_tensor(lr)
+                    else torch.as_tensor(1.0 - lr * wd, dtype=params[0].dtype, device=device)
+                )
+                factor = torch.where(keep, factor, one)
+                # ONE scalar operand, not a list of per-parameter expand views:
+                # a list of 815 differently-shaped tensors makes `_foreach_mul_`
+                # fall back to per-tensor launches (measured: 4618 kernels per
+                # optimizer step vs 2400, ~35 ms of CPU dispatch on a step that
+                # only moves 105M parameters).
+                torch._foreach_mul_(params, factor)
+                zeroed.append((group, wd))
+                group["weight_decay"] = 0.0
+            moments = [
+                self.adamw.state[p]["exp_avg"]
+                for p in params
+                if "exp_avg" in self.adamw.state.get(p, {})
+            ]
+            if moments:
+                torch._foreach_mul_(moments, scale)
+        self.adamw.step()
+        for group, wd in zeroed:
+            group["weight_decay"] = wd
 
     def state_dict(self) -> dict:
         return {
@@ -1183,6 +1697,39 @@ class MixOptimizer:
             self.muon.load_state_dict(state["muon"])
         self.adamw.load_state_dict(state["adamw"])
         self.steps = int(state["steps"])
+
+
+def _gate_identity(flag: torch.Tensor | None, value: float, like: torch.Tensor):
+    """`value` on a finite step, the multiply identity `1.0` on a skipped one.
+
+    The device firewall's multiply-by-the-flag pattern (ADR-0018): no
+    `bool(tensor)` anywhere, and `* 1.0` is bit-exact, so the healthy path
+    cannot move. Returns a host float when `flag is None` (the old path).
+    """
+    if flag is None:
+        return value
+    one = torch.ones((), dtype=like.dtype, device=like.device)
+    kept = torch.as_tensor(value, dtype=like.dtype, device=like.device)
+    return torch.where(flag.to(torch.bool), kept, one).expand_as(like)
+
+
+def _grad_vector_norm(grads: list[torch.Tensor]) -> torch.Tensor:
+    """`‖g‖₂` over a list of GRADIENT tensors as ONE device scalar."""
+    if not grads:
+        return torch.zeros(())
+    norms = torch._foreach_norm(grads, 2)
+    return torch.linalg.vector_norm(torch.stack([n.float() for n in norms]))
+
+
+def grad_norm(params) -> torch.Tensor:
+    """`‖g‖₂` over every parameter gradient as ONE device scalar.
+
+    The device firewall's gradient test: a vector norm is non-finite iff any
+    element is, so one reduction answers "did any gradient go NaN/inf" without
+    a host read. `clip_grads` uses the same reduction for its coefficient, so
+    both call sites measure the same quantity.
+    """
+    return _grad_vector_norm([p.grad for p in params if p.grad is not None])
 
 
 def clip_grads(params, max_norm: float) -> torch.Tensor:
@@ -1200,10 +1747,7 @@ def clip_grads(params, max_norm: float) -> torch.Tensor:
     grads = [p.grad for p in params if p.grad is not None]
     if not grads:
         return torch.zeros(())
-    norms = torch._foreach_norm(grads, 2)
-    total = torch.linalg.vector_norm(
-        torch.stack([n.float() for n in norms])
-    )  # l2 over l2s = the norm of the concatenation
+    total = _grad_vector_norm(grads)
     coef = (max_norm / (total + 1e-6)).clamp(max=1.0)
     torch._foreach_mul_(grads, [coef] * len(grads))
     return total

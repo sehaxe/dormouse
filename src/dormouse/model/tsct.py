@@ -60,6 +60,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from ..instrument import Counters, loud
+from .qat_cache import QuantCache, note_qat_values
 
 # ---------------------------------------------------------------------------
 # COMPUTE rungs: the fp8 2-D GEMM lane (`mm_dtype`)
@@ -154,7 +155,9 @@ def mm_fp8_shape_ok(k: int, n: int) -> bool:
     return k % 16 == 0 and n % 16 == 0
 
 
-def _fp8_reason(x: torch.Tensor, weight: torch.Tensor, dt: torch.dtype) -> tuple[str, str] | None:
+def _fp8_reason(
+    x: torch.Tensor, weight: torch.Tensor, dt: torch.dtype
+) -> tuple[str, str] | None:
     """`None` if the fp8 lane can run THIS call, else `(reason, detail)`.
 
     The ORDER is the operands' own properties first (dtype, rank, the
@@ -329,8 +332,74 @@ def _s3t_generator(device: torch.device | str) -> torch.Generator:
     return g
 
 
-def factor_qat_project(
+def qat_values(
     w: torch.Tensor, mode: str, alpha: float, *, dim: tuple | None = None
+) -> torch.Tensor:
+    """The raw projection `q(w)` under `factor_qat` — values only, no STE.
+
+    Split out for `QuantCache`: the cache stores ONE detached `q` per weight per
+    optimizer step, and [`factor_qat_project`] re-composes the SAME expression
+    (`w + alpha·(q − w)`) from it on every forward, so cached and uncached
+    forwards are bit-identical by construction. The cache stores the PROJECTION,
+    never the blended tensor: `w + (w_q − w)` is not bitwise `w_q`.
+
+    `dim` is the absmean axis: `None` = per-tensor (`ternary.ternarize`), a tuple
+    = per first-index slice, which is the per-EXPERT α of an `[E, ·, ·]` bank.
+    """
+    if mode == "none":
+        return w
+    if mode not in ("ternary", "binary", "mxfp4", "ternary_s3t"):
+        raise AssertionError(f"factor_qat/dense_qat={mode!r} reached the projector with no mode")
+    note_qat_values(w)  # one refresh call; `w.shape[0]` is how many tensors it covers
+    if mode == "mxfp4":
+        from .mxfp import fake_quant_mx
+
+        return fake_quant_mx(w, "mxfp4")
+    if mode == "ternary_s3t":
+        from .ternary import _check_finite, stochastic_ternary
+
+        if dim is None:
+            return stochastic_ternary(w, _s3t_generator(w.device))
+        # The per-slice S3T of `stochastic_ternary`, transposed onto `dim`
+        # (see its docstring: `p = clamp(|w|/scale, 0, 1)`, STRICT `p > u`),
+        # with the one whole-tensor draw the bank's layout gives. The finite
+        # guard is the module's own, so both paths refuse an inf/NaN master
+        # identically instead of one of them zeroing it silently.
+        _check_finite(w, "factor_qat=ternary_s3t (bank slice)")
+        a = w.float().abs().mean(dim=dim, keepdim=True).clamp_min(1e-12)
+        keep_p = (w.float() / a).abs().clamp(0.0, 1.0)
+        u = torch.rand(
+            keep_p.shape,
+            generator=_s3t_generator(w.device),
+            dtype=torch.float32,
+            device=w.device,
+        )
+        return (w.float().sign() * a * (keep_p > u)).to(w.dtype)
+    if dim is None:
+        from .ternary import sign_binary, ternarize
+
+        if mode == "ternary":
+            assert 0.0 <= alpha <= 1.0, (
+                f"annealing alpha={alpha} is a schedule position in [0, 1] "
+                "(1 = pure ternary, 0 = the master); refused, not clamped"
+            )
+            return ternarize(w)
+        return sign_binary(w)
+    # The per-slice axis (banks): the same formula as `ternary.ternarize` /
+    # `ternary.sign_binary`, transposed onto `dim` — the grid is ±mean(|W|),
+    # ε only guards the division (exactly `ternarize`'s convention: divide by
+    # `α+ε`, scale back by `α`), so a banked expert and the same expert run
+    # alone land on the SAME values.
+    a = w.abs().mean(dim=dim, keepdim=True)
+    if mode == "ternary":
+        q = (w.float() / (a + 1e-5)).round().clamp(-1.0, 1.0) * a
+    else:
+        q = torch.sign(w) * a
+    return q.to(w.dtype)
+
+
+def factor_qat_project(
+    w: torch.Tensor, mode: str, alpha: float, *, dim: tuple | None = None, cache=None
 ) -> torch.Tensor:
     """The forward's view of a TSCT factor master under `factor_qat`.
 
@@ -377,9 +446,10 @@ def factor_qat_project(
         prints it at start (`train/loop.py`) and `set_factor_qat_seed` carries
         it too. The fix, if this rung ever needs one, is a step index threaded
         into the projector;
-      * the banked path refreshes the quantized stack once per optimizer step
-        (`SparseMoE._banks`' cache key), so there the mask is drawn per step,
-        not per forward.
+      * every consumer that passes a `QuantCache` (all of them inside the
+        model, wired by `DormouseModel.__init__`) refreshes the mask once per
+        optimizer step, so the mask is drawn per step, not per forward — the
+        `SparseMoE._banks` behaviour, generalized.
 
     `dim` picks the absmean's aggregation axis: `None` = the whole tensor (the
     factor-per-layer reading, `ternary.ternarize`'s per-TENSOR axis); `(1, 2)`
@@ -392,55 +462,33 @@ def factor_qat_project(
     master (`w_eff = w + alpha·(q(w) − w).detach()`; `alpha = 0` is exactly the
     master). The masters stay fp32 — quantization lives on the compute copy
     only, exactly the storage-rung contract (`pack_tsct`'s docstring).
+
+    PASS `cache=` WHEN THE WEIGHTS ONLY MOVE ONCE PER OPTIMIZER STEP. Every
+    forward would otherwise re-run the projection (`absmean`, divide, round,
+    clamp, multiply): measured 17.1 k tok/s against 40.9 k bf16 on the 9.2 M
+    polygon (2026-10-21), and the projection is the whole difference. With a
+    [`qat_cache.QuantCache`], `q` is computed on the first forward after the
+    trainer's per-step invalidation and every later forward pays one sub + one
+    add (`QuantCache.ste`); the logits are bit-identical to the uncached path
+    and dL/dw is unchanged (`tests/test_qat_cache.py`). `cache=None` (every
+    direct API caller that does not opt in) keeps the old per-forward path.
     """
     if mode == "none":
         return w
-    if mode not in ("ternary", "binary", "mxfp4", "ternary_s3t"):
-        raise AssertionError(f"factor_qat/dense_qat={mode!r} reached the projector with no mode")
-    if mode == "mxfp4":
-        from .mxfp import fake_quant_mx
-
-        q = fake_quant_mx(w, "mxfp4")
-        return (w + alpha * (q - w).detach()).to(w.dtype)
-    if mode == "ternary_s3t":
-        from .ternary import _check_finite, stochastic_ternary
-
-        if dim is None:
-            q = stochastic_ternary(w, _s3t_generator(w.device))
-        else:
-            # The per-slice S3T of `stochastic_ternary`, transposed onto `dim`
-            # (see its docstring: `p = clamp(|w|/scale, 0, 1)`, STRICT `p > u`),
-            # with the one whole-tensor draw the bank's layout gives. The finite
-            # guard is the module's own, so both paths refuse an inf/NaN master
-            # identically instead of one of them zeroing it silently.
-            _check_finite(w, "factor_qat=ternary_s3t (bank slice)")
-            a = w.float().abs().mean(dim=dim, keepdim=True).clamp_min(1e-12)
-            keep_p = (w.float() / a).abs().clamp(0.0, 1.0)
-            u = torch.rand(
-                keep_p.shape,
-                generator=_s3t_generator(w.device),
-                dtype=torch.float32,
-                device=w.device,
-            )
-            q = (w.float().sign() * a * (keep_p > u)).to(w.dtype)
-        return (w + alpha * (q.to(w.dtype) - w).detach()).to(w.dtype)
-    if dim is None:
-        from .ternary import sign_binary, ste_ternary_annealed
-
-        if mode == "ternary":
-            return ste_ternary_annealed(w, alpha)
-        return w + alpha * (sign_binary(w) - w).detach()
-    # The per-slice axis (banks): the same formula as `ternary.ternarize` /
-    # `ternary.sign_binary`, transposed onto `dim` — the grid is ±mean(|W|),
-    # ε only guards the division (exactly `ternarize`'s convention: divide by
-    # `α+ε`, scale back by `α`), so a banked expert and the same expert run
-    # alone land on the SAME values.
-    a = w.abs().mean(dim=dim, keepdim=True)
-    if mode == "ternary":
-        q = (w.float() / (a + 1e-5)).round().clamp(-1.0, 1.0) * a
-    else:
-        q = torch.sign(w) * a
-    return (w + alpha * (q.to(w.dtype) - w).detach()).to(w.dtype)
+    if alpha == 0.0:
+        # The annealing floor is the master itself: skip the projection (and
+        # its launch chain) rather than compute `w + 0·(q − w)`. The cache
+        # already takes this short-circuit; the uncached arms now agree.
+        return w
+    if cache is not None:
+        # The QAT cost fix: `refresh` is the once-per-step projection (`q` is
+        # DETACHED); `ste` is the per-forward sub+add. A miss is the uncached
+        # math once; a hit is a dict lookup. The trainer invalidates the cache
+        # after every optimizer step (`qat_cache.invalidate_qat_cache_all`).
+        cache.refresh(w, mode, alpha, dim)
+        return cache.ste(w)
+    q = qat_values(w, mode, alpha, dim=dim)
+    return (w + alpha * (q - w).detach()).to(w.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -464,6 +512,51 @@ def factor_qat_project(
 #: the forward goes through when `dense_qat != "none"`.
 dense_qat_project = factor_qat_project
 
+#: The attention sites `dense_qat_skip_attn` leaves in bf16 — ONE list, read by
+#: `dense_qat_kind` below AND by `tests/test_dense_qat.py`'s coverage gate, so a
+#: site cannot join the quantized set by accident. KDA's five projections and
+#: the MSA pair + its selector: BitNet b1.58 (arXiv:2402.17764) quantizes the
+#: FFN weight matrices, not attention, and our `act_quant` already upgrades the
+#: attention path to >= 8 bits. Projecting these ten measured +0.198 BPB
+#: (+6.5%) against the bf16 control (2026-10-21, medium b8 s512, 2000 steps,
+#: one 81 920 B eval window, 3 seeds).
+DENSE_QAT_ATTN_SITES = (
+    "loop.attn.q_proj",
+    "loop.attn.k_proj",
+    "loop.attn.v_proj",
+    "loop.attn.g_proj",
+    "loop.attn.beta_proj",
+    "loop.attn.o_proj",
+    "loop.msa.q_proj",
+    "loop.msa.k_proj",
+    "loop.msa.v_proj",
+    "loop.msa.selector.q_idx",
+    "loop.msa.selector.k_idx",
+)
+
+
+def dense_qat_kind(cfg, *sites: str) -> str:
+    """`cfg.dense_qat`, or `"none"` when `dense_qat_skip_attn` and any site is attention.
+
+    Every consumer names ALL the sites it owns, so a module whose sites are in
+    `DENSE_QAT_ATTN_SITES` reads bf16 wholesale and a new `nn.Linear` added to
+    it inherits the rule instead of silently joining the quantized set.
+    """
+    if cfg.dense_qat_skip_attn and any(site in DENSE_QAT_ATTN_SITES for site in sites):
+        return "none"
+    return cfg.dense_qat
+
+
+def dense_qat_weight(weight: torch.Tensor, kind: str, alpha: float, *, cache=None):
+    """`dense_qat_project`, or the master itself when the arm is off.
+
+    The no-op arm must not even CALL the projector: `tests/test_dense_qat.py`'s
+    gate d spies the function and requires zero calls for `dense_qat="none"`.
+    """
+    if kind == "none":
+        return weight
+    return dense_qat_project(weight, kind, alpha, cache=cache)
+
 
 def qat_linear(linear: nn.Linear, x: torch.Tensor, kind: str, alpha: float) -> torch.Tensor:
     """`linear(x)` with `dense_qat` applied to its weight — the master when off.
@@ -475,8 +568,27 @@ def qat_linear(linear: nn.Linear, x: torch.Tensor, kind: str, alpha: float) -> t
     """
     if kind == "none":
         return linear(x)
-    w = dense_qat_project(linear.weight, kind, alpha)
+    # `_qat_cache` is attached by `DormouseModel.__init__` (`attach_qat_caches`);
+    # a bare `nn.Linear` outside a model has none and takes the per-forward path.
+    w = dense_qat_project(
+        linear.weight, kind, alpha, cache=getattr(linear, "_qat_cache", None)
+    )
     return F.linear(x, w, linear.bias)
+
+
+def init_u(in_features: int, rank: int, device: torch.device | str = "cpu") -> torch.Tensor:
+    """The `U [in, rank]` init, `N(0, 1/sqrt(in))` — the distribution the
+    comment below names ("the composed map has unit-ish output scale at any
+    width", which matters because ReZero's `residual_scale` starts at 1.0).
+
+    ONE copy of the formula: the expert bank's latents (`DualLatentGLU`) and,
+    under `share_u`, the single basis `SparseMoE` owns (the `plane` mode's
+    `[d, rank]`, and the `dict` mode's `[d, share_u_rank]` DICTIONARY, whose
+    columns each expert reads `rank` of) draw the same factor. Two
+    transcriptions is how a shared basis and a per-expert one start the A/B
+    from different scales and the comparison charges that to the mechanism.
+    """
+    return torch.randn(in_features, rank, device=device) / math.sqrt(in_features)
 
 
 class TSCTLinear(nn.Module):
@@ -513,9 +625,7 @@ class TSCTLinear(nn.Module):
         # unit-ish output scale at any width, which matters because ReZero's
         # residual_scale is initialised to 1.0 (not 0 — at 0 the block body
         # gets no gradient at all, the 2026-09-27 burn bug).
-        self.u = nn.Parameter(
-            torch.randn(in_features, rank, device=device) / math.sqrt(in_features)
-        )
+        self.u = nn.Parameter(init_u(in_features, rank, device))
         self.s = nn.Parameter(torch.ones(rank, device=device))
         self.v = nn.Parameter(torch.randn(rank, out_features, device=device) / math.sqrt(rank))
         self.bias = nn.Parameter(torch.zeros(out_features, device=device)) if bias else None
@@ -524,6 +634,10 @@ class TSCTLinear(nn.Module):
         #: fp32. `s` is never quantized — it IS the scale.
         self.factor_qat = factor_qat
         self.factor_qat_alpha = factor_qat_alpha
+        #: The once-per-step projection cache (`qat_cache.QuantCache`): `u` and
+        #: `v` each get one detached `q` per trained step, instead of every
+        #: forward re-running the quantizer (the measured 2.4x cost).
+        self._qat_cache = QuantCache() if factor_qat != "none" else None
         #: The a4.8 ACTIVATION switch (`act_quant.fake_quant_act`): the `x` that
         #: feeds the factor matmuls is fake-quantized with an STE.
         #: `attn_path` marks a projection that sits INSIDE the attention arm, and
@@ -555,8 +669,9 @@ class TSCTLinear(nn.Module):
         if self.factor_qat == "none":
             return self.u, self.v
         f = factor_qat_project
-        return f(self.u, self.factor_qat, self.factor_qat_alpha), f(
-            self.v, self.factor_qat, self.factor_qat_alpha
+        cache = self._qat_cache
+        return f(self.u, self.factor_qat, self.factor_qat_alpha, cache=cache), f(
+            self.v, self.factor_qat, self.factor_qat_alpha, cache=cache
         )
 
     def effective_weight(self) -> torch.Tensor:
@@ -607,26 +722,44 @@ _FACTOR_SUFFIXES = ("u", "v", "gate_u", "up_u")
 #: sign per code; two codes per byte, low nibble first.
 _NVFP4_MAGNITUDES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
-#: COUNTED tally of NVFP4 blocks whose stored e4m3 scale rounded to zero —
-#: process-local so a `pack_tsct` call with no counters is still not silent.
-_NVFP4_ZEROED_BLOCKS = {"blocks": 0}
 
+def _e2m1_quant(t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, float]:
+    """Per-16-block NVFP4 quantize: codes u8 + e4m3 scales [n/16] + a global
+    fp32 correction.
 
-def nvfp4_zeroed_blocks() -> int:
-    """Blocks whose NVFP4 scale rounded to zero (the COUNTED tally, no counters)."""
-    return _NVFP4_ZEROED_BLOCKS["blocks"]
+    NVIDIA's NVFP4 is TWO-LEVEL for exactly the underflow this would hit:
+    a block amax smaller than e4m3's min normal rounds the block scale to
+    zero and the block is lost entirely. So the tensor is first prescaled by
+    a global power of two that pushes block scales into e4m3's normal range,
+    and the global comes back on decode.
 
+    Encode = quotient by the block scale then nearest grid magnitude (the
+    grid is LittleBit's, so a later sign rung re-uses the same codes).
+    """
+    n = t.numel()
+    assert n % 16 == 0, f"nvfp4 quantizes blocks of 16, got numel={n}"
+    # Global prescale: aim the SMALLEST nonzero block scale at e4m3's min
+    # normal. A power of two moves nothing, and e4m3's normal range is
+    # [2^-6, 448] ≈ 4.5 decades, so a block-scale span wider than that still
+    # overflows at the top (the format's limit, not a second level's job).
+    min_normal = float(torch.finfo(torch.float8_e4m3fn).tiny)  # 2^-6
+    amaxs = t.float().abs().reshape(-1, 16).amax(dim=1)
+    amaxs = amaxs[amaxs > 0]
+    if amaxs.numel() == 0:
+        global_scale = 1.0
+    else:
+        scale_min = float(amaxs.min()) / 6.0
+        exponent = torch.ceil(torch.log2(torch.tensor(min_normal / scale_min)))
+        global_scale = float(2.0**exponent) if scale_min < min_normal else 1.0
+    t = t * global_scale
 
-def _e2m1_encode(t: torch.Tensor, global_scale: float) -> tuple[torch.Tensor, torch.Tensor, int]:
-    """One NVFP4 encoding pass at `global_scale`: (codes, e4m3 scales, zeroed blocks)."""
-    blocks = (t * global_scale).float().reshape(-1, 16)
+    blocks = t.float().reshape(-1, 16)
     amax = blocks.absolute().amax(dim=1)
     scale = amax / 6.0
     # A block of exact zeros scales to 0 → decode has to multiply by 1, not 0.
     scale = torch.where(scale == 0, torch.ones_like(scale), scale)
     # The scale itself is stored e4m3 (NVIDIA's NVFP4 layout): quantize it too.
     s_fp8 = scale.to(torch.float8_e4m3fn)
-    zero_blocks = int((s_fp8.float() == 0).sum())
     q = blocks / s_fp8.float().unsqueeze(-1)
     # Nearest-magnitude rounding: searchsorted over the MIDPOINTS of adjacent
     # grid entries (bucketize alone rounds "≤ boundary", not nearest).
@@ -635,49 +768,7 @@ def _e2m1_encode(t: torch.Tensor, global_scale: float) -> tuple[torch.Tensor, to
     sign = (q < 0) & (mag_idx > 0)  # zero codes carry no sign
     codes = (sign.to(torch.int32) * 8 + mag_idx).reshape(-1)  # sign<<3 | mag, flat
     packed = (codes[0::2] | (codes[1::2] << 4)).to(torch.uint8)
-    return packed, s_fp8, zero_blocks
-
-
-def _e2m1_quant(t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, float, int]:
-    """Per-16-block NVFP4 quantize: codes u8 + e4m3 scales [n/16] + a global
-    fp32 correction + the number of blocks whose stored scale rounded to zero.
-
-    NVIDIA's NVFP4 is TWO-LEVEL for exactly the underflow this would hit:
-    a block whose e4m3 scale rounds to zero is lost entirely. The e4m3 scale
-    grid is OCP *Microscaling Formats (MX) Specification* v1.0 §5.3.1 Table 2
-    (bias 7: max normal ±448, min normal ±2⁻⁶, min subnormal ±2⁻⁹) — RNE of a
-    scale at or below `2^-10` (half the min subnormal) is the zero code, and
-    `torch.finfo(...).min` is NOT an exponent: it is −448.0, so `2 ** min` =
-    `2^-448` made the old prescale inert (2026-10-19 audit M1). `finfo.tiny`
-    (2⁻⁶) is the min NORMAL, not the zeroing boundary — a 2⁻⁶ scale is
-    representable — so the retry below is driven by the encode's actual zero
-    count, and the target is the MAX (448): keeping the large blocks
-    representable is the choice, and blocks left below the grid are counted.
-
-    Prescale: encode once, and if any nonzero block's scale rounded to zero,
-    encode again with a power-of-two global that puts the LARGEST block scale
-    at e4m3's max (448; floored, so it can never round up to NaN). The global
-    comes back on decode. Aiming the LARGEST at the top — not the smallest at
-    the min normal — is what one global multiplier can do: a tensor spanning
-    more than e4m3's ~18 octaves cannot carry both ends, the large blocks are
-    its mass, and the blocks still below the grid are returned in the fourth
-    slot for `pack_tsct` to COUNT. The global is 1.0 whenever no block would
-    zero, so the common path's record is byte-identical.
-
-    Encode = quotient by the block scale then nearest grid magnitude (the
-    grid is LittleBit's, so a later sign rung re-uses the same codes).
-    """
-    n = t.numel()
-    assert n % 16 == 0, f"nvfp4 quantizes blocks of 16, got numel={n}"
-    packed, s_fp8, zero_blocks = _e2m1_encode(t, 1.0)
-    if not zero_blocks:
-        return packed, s_fp8, 1.0, 0
-    amaxs = t.float().abs().reshape(-1, 16).amax(dim=1)
-    scale_max = float(amaxs.max()) / 6.0
-    exponent = torch.floor(torch.log2(torch.tensor(RUNG_MAX["fp8"] / scale_max)))
-    global_scale = float(2.0**exponent)
-    packed, s_fp8, zero_blocks = _e2m1_encode(t, global_scale)
-    return packed, s_fp8, global_scale, zero_blocks
+    return packed, s_fp8, global_scale
 
 
 def _e2m1_dequant(packed: torch.Tensor, scale: torch.Tensor, global_scale: float) -> torch.Tensor:
@@ -732,15 +823,8 @@ FACTORS_QUANT = {
 }
 
 
-def pack_tsct(t: torch.Tensor, rung: str, counters: Counters | None = None) -> dict[str, object]:
-    """One factor matrix → its storage record. Scales travel COMPUTED.
-
-    `counters` is where the NVFP4 rung reports blocks whose stored e4m3 scale
-    rounded to zero (`nvfp4_zero_scale_blocks`, COUNTED — such a block decodes
-    to zeros and a reader must see it). The process-local
-    [`nvfp4_zeroed_blocks`] tally makes the report unconditional for a caller
-    that passes none.
-    """
+def pack_tsct(t: torch.Tensor, rung: str) -> dict[str, object]:
+    """One factor matrix → its storage record. Scales travel COMPUTED."""
     if t.dtype != torch.float32:
         loud(f"storage rungs quantize the fp32 masters, got dtype {t.dtype}")
     if not torch.isfinite(t).all():
@@ -751,11 +835,7 @@ def pack_tsct(t: torch.Tensor, rung: str, counters: Counters | None = None) -> d
         packed = (t / scale).to(torch.float8_e4m3fn)
         return {"rung": rung, "packed": packed.reshape(t.shape), "scale": scale, "shape": t.shape}
     if rung == "nvfp4":
-        packed, scale, correction, zero_blocks = _e2m1_quant(t)
-        if zero_blocks:
-            _NVFP4_ZEROED_BLOCKS["blocks"] += zero_blocks
-            if counters is not None:
-                counters.count("nvfp4_zero_scale_blocks", zero_blocks)
+        packed, scale, correction = _e2m1_quant(t)
         return {
             "rung": rung,
             "codes": packed,
@@ -832,13 +912,18 @@ class DenseLinear(nn.Module):
         #: master untouched, every number on record.
         self.dense_qat = dense_qat
         self.dense_qat_alpha = dense_qat_alpha
+        #: The once-per-step projection cache — the same object `TSCTLinear` and
+        #: `qat_linear` read (`qat_cache.QuantCache`).
+        self._qat_cache = QuantCache() if dense_qat != "none" else None
         self.weight = nn.Parameter(
             torch.randn(out_features, in_features, device=device) / math.sqrt(in_features)
         )
         self.bias = nn.Parameter(torch.zeros(out_features, device=device)) if bias else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        w = dense_qat_project(self.weight, self.dense_qat, self.dense_qat_alpha)
+        w = dense_qat_weight(
+            self.weight, self.dense_qat, self.dense_qat_alpha, cache=self._qat_cache
+        )
         if self.compute_dtype != torch.float32:
             x = x.to(self.compute_dtype)
             w = w.to(self.compute_dtype)
@@ -848,6 +933,65 @@ class DenseLinear(nn.Module):
         if self.bias is not None:
             y = y + self.bias
         return y
+
+
+class DenseLowRank(nn.Module):
+    """A dense `d → rank → d` readout: `2·d·rank` MAC instead of `d²`.
+
+    The dense rung's `out_proj_rank` (`use_tsct = false`, so the readout would
+    otherwise be a full `DenseLinear(d, d)`). Two dense linears, no bias and no
+    nonlinearity — the composed map IS a rank-`rank` matrix, which is exactly
+    the cost this flag names. Each half keeps `DenseLinear`'s compute dtype and
+    `dense_qat` policy, so the readout does not become a second numerics path.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        rank: int,
+        out_features: int,
+        *,
+        dtype: torch.dtype = torch.bfloat16,
+        dense_qat: str = "none",
+        dense_qat_alpha: float = 1.0,
+        device: torch.device | str = "cpu",
+    ) -> None:
+        super().__init__()
+        if rank > min(in_features, out_features):
+            loud(
+                f"out_proj_rank {rank} exceeds min({in_features}, {out_features}): "
+                f"a rank above either dimension is not a factorization. Escape: "
+                f"a lower rank."
+            )
+        self.in_features = in_features
+        self.out_features = out_features
+        self.rank = rank
+        self.compute_dtype = dtype
+        self.down = DenseLinear(
+            in_features,
+            rank,
+            dtype=dtype,
+            dense_qat=dense_qat,
+            dense_qat_alpha=dense_qat_alpha,
+            device=device,
+        )
+        self.up = DenseLinear(
+            rank,
+            out_features,
+            dtype=dtype,
+            dense_qat=dense_qat,
+            dense_qat_alpha=dense_qat_alpha,
+            device=device,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.up(self.down(x))
+
+    def extra_repr(self) -> str:
+        return (
+            f"in={self.in_features}, out={self.out_features}, rank={self.rank}, "
+            f"dtype={self.compute_dtype}"
+        )
 
 
 def make_projection(

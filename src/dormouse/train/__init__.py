@@ -2,8 +2,11 @@
 
 from .data import (
     ByteStream,
+    DocPackedStream,
     ShardStream,
+    doc_sidecar_path,
     eval_window_bytes,
+    load_doc_starts,
     open_source,
     open_streams,
     shard_files,
@@ -12,23 +15,27 @@ from .data import (
 )
 from .graph import GRAPH_WARMUP_STEPS, OptimizerGraph
 from .loop import bpb, evaluate, kda_field, load_ckpt, save_ckpt, train
-from .lr import wsd_lr
+from .lr import anneal_alpha, wsd_lr
 from .optim import JORDAN_NS_COEFFS, MixOptimizer, Muon, is_muon_param, zeropower_via_ns
 
 __all__ = [
     "GRAPH_WARMUP_STEPS",
     "JORDAN_NS_COEFFS",
     "ByteStream",
+    "DocPackedStream",
     "MixOptimizer",
     "Muon",
     "OptimizerGraph",
     "ShardStream",
+    "anneal_alpha",
     "bpb",
+    "doc_sidecar_path",
     "eval_window_bytes",
     "evaluate",
     "is_muon_param",
     "kda_field",
     "load_ckpt",
+    "load_doc_starts",
     "open_source",
     "open_streams",
     "save_ckpt",

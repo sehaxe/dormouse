@@ -26,13 +26,19 @@ import statistics
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import torch
 
 from dormouse.config import load_run
-from dormouse.instrument import loud
 from dormouse.model import DormouseModel
 from dormouse.train import kda_field, open_streams, train
+
+# `scripts/` is not a package (a test loads this file by path): the lane guard is
+# a sibling file, so its directory goes on the path, APPENDED not inserted (a
+# script name at the front of `sys.path` would shadow a package of that name).
+sys.path.append(str(Path(__file__).resolve().parent))
+from _lane import preflight, skip  # noqa: E402
 
 #: The port's data on this box (AGENTS §2.6). The train file and its held-out tail.
 DATA = "/mnt/e43497ab-0ff2-45b4-b45f-28de3339a53e/aria_data/pretrain/real/corpus.bin"
@@ -40,17 +46,6 @@ EVAL = "/mnt/e43497ab-0ff2-45b4-b45f-28de3339a53e/aria_data/pretrain/real_eval/e
 
 STEPS, BATCH, SEQ = 20, 8, 512
 DEV = "cuda"
-
-
-def preflight() -> None:
-    busy = subprocess.run(["pgrep", "-ax", "train"], capture_output=True, text=True).stdout.strip()
-    if busy:
-        loud(f"a train process is alive:\n{busy}\nONE GPU process at a time (AGENTS §1.5)")
-    free, total = torch.cuda.mem_get_info()
-    used = (total - free) / 2**30
-    if used >= 1.0:
-        loud(f"the card already holds {used:.2f} GiB: waiting is the answer, not sharing")
-    print(f"[preflight] no train process; card holds {used:.2f} GiB", flush=True)
 
 
 def moe_mode(counters) -> str:
@@ -147,7 +142,20 @@ def run_arm(name: str, model_over: dict, train_over: dict) -> dict:
 
 
 def main() -> int:
-    preflight()
+    busy = subprocess.run(["pgrep", "-ax", "train"], capture_output=True, text=True).stdout.strip()
+    why = f"a train process is live:\n{busy}" if busy else preflight("cuda")
+    if why is None:
+        # This smoke's own ceiling is 1 GiB, tighter than the lane guard's 2.0:
+        # a card already holding a second model is contended however idle it looks.
+        smi = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if smi and int(smi.split()[0]) >= 1024:
+            why = f"the card already holds {smi.split()[0]} MiB (this smoke's ceiling is 1024)"
+    if why is not None:
+        return skip(why)
     arms = [
         run_arm("small", {}, {}),
         run_arm("small+topk2", {"moe_topk": 2}, {}),

@@ -16,16 +16,19 @@ carries the BYTE COUNT it scored (`eval_batches × batch × seq_len`, AGENTS
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import torch
 
-from ..config import PROGRESS_KEYS, RunConfig, TrainConfig
+from ..config import PROGRESS_KEYS, RunConfig, TrainConfig, validate_train
 from ..instrument import Counters, LoudError, StepTimer, loud
 from ..model import kda
 from ..model.engram import (
+    Engram,
     enable_host_tables,
     host_engrams,
     host_state,
@@ -33,12 +36,13 @@ from ..model.engram import (
     load_host_state,
 )
 from ..model.experts import invalidate_banks_all
+from ..model.qat_cache import invalidate_qat_cache_all
 from ..model.tsct import set_mm_dtype
-from .data import ByteStream, open_streams, warmup_steps
-from .graph import OptimizerGraph
-from .lr import wsd_lr
-from .mixture import open_mixture
-from .optim import MixOptimizer, clip_grads
+from .data import ByteStream, distinct_scored_bytes, eval_window_bytes, open_streams, warmup_steps
+from .graph import FullGraph, OptimizerGraph, full_graph_refusal
+from .lr import anneal_alpha, wsd_lr
+from .mixture import MixtureStream, open_mixture
+from .optim import MixOptimizer, clip_grads, grad_norm
 
 
 def bpb(loss: float) -> float:
@@ -46,8 +50,21 @@ def bpb(loss: float) -> float:
     return loss / math.log(2)
 
 
+def _host_scalar(value: torch.Tensor) -> float:
+    """The ONE declared host read of a device scalar (log / report cadence).
+
+    Everything the step decides is device-resident; this is the seam where the
+    already-decided numbers cross to the host, so the 0-sync rule has a single
+    auditable place to be checked (`tests/test_nan_firewall.py` patches THIS
+    function to allow the cadence and to fail on any other read).
+    """
+    return float(value)
+
+
 def kda_field(counters: Counters) -> str:
     """`kda=<arm>,n=<calls>` — which attention arm produced this window."""
+    if counters.get("attn_full_forward"):
+        return f"kda=full,n={counters['attn_full_forward']}"
     n = counters.get("kda_sdpa", 0) + counters.get("kda_fla", 0)
     if counters.get("kda_fla"):
         arm = "fla"
@@ -56,6 +73,33 @@ def kda_field(counters: Counters) -> str:
     else:
         arm = "off"
     return f"kda={arm},n={n}"
+
+
+def mtp_field(model: torch.nn.Module) -> str:
+    """`mtp=<term>` — the MTP objective's weighted value, on the log cadence.
+
+    The forward leaves its scalar DETACHED on the model (`last_mtp`) and never
+    touches the host (ADR-0018 rule 2: no `.item()` in a step). This is the one
+    declared read, once per log window, and it is what makes the arm visible in
+    the log rather than only in the parameter count. Empty when the arm never
+    ran (weight 0, a decode forward, or a step before the first training
+    forward) — a zero would claim a term that was not added.
+    """
+    value = getattr(model, "last_mtp", None)
+    return "" if value is None else f"mtp={float(value):.4f}"
+
+
+def halt_field(model: torch.nn.Module) -> str:
+    """`halt=<BCE>` — the halt objective's value, on the log cadence.
+
+    The forward leaves the term DETACHED on the model (`last_halt`) and never
+    reads it; this is the one declared read, once per log window (ADR-0018
+    rule 2 — the same shape as `mtp_field`). Empty when the arm never ran
+    (weight 0, a decode forward, a pure eval): a zero would claim a term that
+    was not added.
+    """
+    value = getattr(model, "last_halt", None)
+    return "" if value is None else f"halt={float(value):.4f}"
 
 
 def ckpt_paths(cfg: TrainConfig) -> tuple[Path, Path]:
@@ -78,116 +122,6 @@ def ngram_path(cfg: TrainConfig) -> Path:
     return weights.with_suffix(".ngram")
 
 
-def lfb_path(cfg: TrainConfig) -> Path:
-    """The LFB controller's sibling of a checkpoint: `<ckpt_name>.lfb`.
-
-    `lfb_bias` is model state — the next resume continues the integrator from it
-    — but it is deliberately NOT a persistent `state_dict` buffer: the export
-    artifact's key set is pinned by the demo engine (`docs-site/public/demo/
-    engine.js` refuses an unknown key) and by `tests/test_export.py`, which have
-    no LFB. The checkpoint still carries it, in this sibling, and
-    `load_model_state` restores it for every reader (resume, eval, decode,
-    serve) — the same sidecar contract as `<ckpt_name>.ngram` (audit 2026-10-19
-    M8: the counts persisted while the bias they integrate did not).
-    """
-    weights, _ = ckpt_paths(cfg)
-    return weights.with_suffix(".lfb")
-
-
-def _lfb_state(model: torch.nn.Module) -> dict[str, torch.Tensor]:
-    """`{buffer name: cpu copy}` for every LFB bias in `model`.
-
-    The `_orig_mod.` prefix of a `torch.compile` wrapper is stripped, like the
-    rest of the checkpoint (`save_ckpt`): every reader loads the unwrapped
-    model.
-    """
-    return {
-        name.removeprefix("_orig_mod."): buf.detach().to("cpu").clone()
-        for name, buf in model.named_buffers()
-        if name.rpartition(".")[2] == "lfb_bias"
-    }
-
-
-def _restore_lfb(
-    model: torch.nn.Module, cfg: TrainConfig, *, log=print, resume: bool = False
-) -> None:
-    """Restore the LFB bias from `<ckpt_name>.lfb` when the checkpoint has one.
-
-    A checkpoint written before the sidecar existed cannot supply it, and the
-    mark depends on WHO is loading (review round 2 R2-2):
-
-    * a TRAINING RESUME (`resume=True`) with the controller live
-      (`moe_lb_coef > 0`) is LOUD: the next optimizer step would integrate from
-      a zero bias under the checkpoint's own step count — a different network.
-      The escape is the sidecar, or an explicit `moe_lb_coef=0` (the controller
-      never MOVES the bias again);
-    * every reader — eval/decode/serve/export/bench, an SFT/RL `--init-from`,
-      and a resume with `moe_lb_coef == 0` — loads with the controller zeroed
-      and a COUNTED `lfb: no sidecar, controller zeroed` line. There is no
-      objective to continue, and a LOUD here would brick every pre-sidecar
-      artifact for every reader (the failure this scoping fixes).
-
-    `moe_lb_coef=0` is a break-glass, not a no-op: `SparseMoE.forward` adds
-    `lfb_bias` to the logits UNCONDITIONALLY (`model/experts.py`), so a
-    pre-sidecar checkpoint whose stored run had moved the bias resumes with a
-    different routing than the one it was saved in. The COUNTED line says so.
-
-    `lfb_counts` is reset here for every load. It is the sign rule's working
-    set, not controller state: the bias is the integral a resume continues.
-    `load_state_dict` restores the persistent counts too, and keeping them
-    would make the first post-load update diff against the WHOLE run (mix1
-    carries 11.8e9 accumulated counts at step 80k) instead of the steps since
-    the load — the controller's time constant would grow with the run and
-    freeze. Resetting is consistent with the restored bias: the bias survives,
-    the counts restart at zero.
-
-    A sidecar naming a buffer this model does not have, or a shape mismatch,
-    is LOUD: silently dropping controller state is the class this sidecar fixes.
-    """
-    path = lfb_path(cfg)
-    buffers = dict(model.named_buffers())
-    if not any(name.rpartition(".")[2] == "lfb_bias" for name in buffers):
-        return  # no LFB in this model: nothing to restore, nothing to report
-    for name, buf in buffers.items():
-        if name.rpartition(".")[2] == "lfb_counts":
-            buf.zero_()
-    if not path.is_file():
-        coef = float(getattr(getattr(model, "cfg", None), "moe_lb_coef", 0.0))
-        if coef > 0 and resume:
-            loud(
-                f"LFB sidecar {path} is missing but this model runs "
-                f"moe_lb_coef={coef}: a training resume would continue the routing "
-                f"controller from a zero bias under the checkpoint's step count — a "
-                f"different network. "
-                f"Escape: restore the `{path.name}` sibling, or resume with "
-                f"moe_lb_coef=0 if the controller is meant to be off."
-            )
-        log(
-            f"lfb: no sidecar, controller zeroed — routing differs from the stored "
-            f"step ({path}, moe_lb_coef={coef})"
-        )
-        return
-
-    state = torch.load(path, map_location="cpu", weights_only=True)
-    missing = sorted(k for k in state if k not in buffers)
-    if missing:
-        loud(
-            f"LFB sidecar {path} names buffer(s) {missing} this model does not "
-            f"have. Escape: load the matching checkpoint, or delete the stale "
-            f"`{path.name}` if it belongs to a different run."
-        )
-    with torch.no_grad():
-        for name, value in state.items():
-            target = buffers[name]
-            if tuple(target.shape) != tuple(value.shape):
-                loud(
-                    f"LFB sidecar {path}: {name} has shape {tuple(value.shape)} "
-                    f"but the model's buffer is {tuple(target.shape)}. Escape: "
-                    f"the sidecar does not belong to this model."
-                )
-            target.copy_(value.to(target.device))
-
-
 def host_device_type(model: torch.nn.Module) -> str:
     """The device the MODEL lives on — the one input to the host-path refusal.
 
@@ -198,7 +132,7 @@ def host_device_type(model: torch.nn.Module) -> str:
     return next(model.parameters()).device.type
 
 
-def host_tables(model: torch.nn.Module) -> int:
+def host_tables(model: torch.nn.Module, bias_correction: bool = True) -> int:
     """Switch every Engram to host tables; LOUD on a run that cannot have them.
 
     Called BEFORE the optimizer is built (`train`), which is what keeps the
@@ -213,6 +147,9 @@ def host_tables(model: torch.nn.Module) -> int:
       VRAM-budget decision (`cfg.rs:50`);
     * a model with no Engram to host (`use_engram=false`) — `load_run` refuses
       that pair too, but a hand-built model reaches here without passing it.
+
+    `bias_correction` is `TrainConfig.engram_bias_correction`: the host update's
+    formula, not a substrate choice (`enable_host_tables` sets it).
     """
     dev = host_device_type(model)
     if dev != "cuda":
@@ -222,7 +159,7 @@ def host_tables(model: torch.nn.Module) -> int:
             f"the per-forward row transfers would be pure cost against the in-VRAM "
             f"table. Escape: engram_ram=false, or run on cuda."
         )
-    n = enable_host_tables(model)
+    n = enable_host_tables(model, bias_correction=bias_correction)
     if n == 0:
         loud(
             "engram_ram=true but the model has no Engram to host (use_engram=false?): "
@@ -237,13 +174,129 @@ def load_ngram(cfg: TrainConfig) -> dict:
     return torch.load(ngram_path(cfg), map_location="cpu", weights_only=True)
 
 
+def _checkpoint_half(sd: dict, rung: str) -> dict:
+    """One model half normalized for the file: prefix stripped, rung packed.
+
+    The ONE normalization `save_ckpt` applies to BOTH copies an EMA run
+    writes (`model` raw, `model_ema` shadow), so the two cannot disagree about
+    a storage rung or a `torch.compile` prefix.
+    """
+    from ..model.tsct import is_factor_key, pack_tsct
+
+    sd = {k.removeprefix("_orig_mod."): v for k, v in sd.items()}
+    if rung and rung in ("fp8", "nvfp4", "ternary"):
+        sd = {k: (pack_tsct(v, rung) if is_factor_key(k) else v) for k, v in sd.items()}
+    return sd
+
+
+class _ModelHalf(dict):
+    """The model half of a checkpoint, plus the parts that are NOT `state_dict` keys.
+
+    `moe` is the LFB-bias section (`save_ckpt`). The biases are non-persistent
+    buffers on purpose — the optimizer must not see them and `state_dict()` must
+    not grow a routing integrator — so a strict `load_state_dict` cannot carry
+    them, while `ck["model"]` must stay exactly `state_dict()`-shaped (that is
+    what every direct `load_state_dict(ck["model"])` caller and the prefix test
+    assume). The attribute is how the ONE loader reaches them.
+    """
+
+    #: `{module name: lfb_bias}`; `None` is a file written before the section.
+    moe: dict[str, torch.Tensor] | None = None
+    #: A training load refuses a file whose controller state is missing when
+    #: `moe_lb_coef != 0`; a reader prints the COUNTED line instead (`load_model_half`).
+    refuse_missing_moe: bool = False
+
+
+def _lfb_modules(model: torch.nn.Module) -> dict[str, torch.nn.Module]:
+    """The LFB modules by CHECKPOINT name: `torch.compile`'s `_orig_mod.` stripped."""
+    return {
+        name.removeprefix("_orig_mod."): m
+        for name, m in model.named_modules()
+        if getattr(m, "lfb_bias", None) is not None
+    }
+
+
+def lfb_state(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """`{module name: lfb_bias}` — the routing controller's integrator OUTPUT.
+
+    `lfb_bias` is not reconstructible from the persistent `lfb_counts`
+    (`b_e -= coef·sign(L_e − mean L)` is the integrator's state, not a function
+    of the cumulative load), so it travels in the checkpoint's `moe` section.
+    """
+    return {
+        name: m.lfb_bias.detach().to("cpu", copy=True) for name, m in _lfb_modules(model).items()
+    }
+
+
+def _with_moe(sd: dict, moe: dict | None, *, refuse: bool) -> _ModelHalf:
+    """Wrap a model half and attach the `moe` section (may be `None` = pre-section file)."""
+    half = _ModelHalf(sd)
+    half.moe = None if moe is None else {str(k): v for k, v in moe.items()}
+    half.refuse_missing_moe = refuse
+    return half
+
+
+def _carries_lfb_counts(sd: dict) -> bool:
+    """Whether this model half carries the LFB integrator's persistent counter."""
+    return any(k == "lfb_counts" or k.endswith(".lfb_counts") for k in sd)
+
+
+def _refuse_missing_lfb(where: str, coef: float) -> None:
+    """REFUSE, never guess: a checkpoint with `lfb_counts` but no `lfb_bias`.
+
+    The prejudice is `load_host_state`'s (a `.ngram` file without `counts`): the
+    missing half IS controller state that no later step can recover, so a zero
+    default silently trains — or serves — a different router under the same step
+    count. Measured on the 4+resume repro at `moe_lb_coef=0.01`: 50 of 51
+    tensors differ; at `0.0` the run is bit-exact.
+    """
+    loud(
+        f"{where} carries `lfb_counts` but no `lfb_bias`, and this run has "
+        f"moe_lb_coef={coef:g}. The bias is the routing controller's OUTPUT "
+        f"(`b_e -= coef·sign(L_e − mean L)`); it cannot be derived from the "
+        f"cumulative counts, so starting it at zero would train a DIFFERENT router "
+        f"from the one this step count claims (measured: 50/51 tensors differ after "
+        f"4+4 steps at coef=0.01, bit-exact at coef=0). Escape: resume this file on "
+        f"the commit that wrote it, set moe_lb_coef=0 (the controller then never "
+        f"moves the bias), or start a new ckpt_name."
+    )
+
+
+def _restore_lfb(model: torch.nn.Module, moe: dict[str, torch.Tensor], *, where: str) -> int:
+    """Copy a checkpoint's `moe` section into the model's LFB buffers, LOUD on a mismatch."""
+    live = _lfb_modules(model)
+    missing = sorted(set(live) - set(moe))
+    unknown = sorted(set(moe) - set(live))
+    if missing or unknown:
+        loud(
+            f"{where}: the `moe` section names {len(moe)} LFB module(s) but this "
+            f"model has {len(live)} (missing={missing[:4]}, unknown={unknown[:4]}). "
+            f"Escape: load with the config/preset the file was written from, or "
+            f"start a new ckpt_name."
+        )
+    with torch.no_grad():
+        for name, module in live.items():
+            src = moe[name]
+            if tuple(src.shape) != tuple(module.lfb_bias.shape):
+                loud(
+                    f"{where}: `{name}.lfb_bias` is {tuple(src.shape)} in the file "
+                    f"but {tuple(module.lfb_bias.shape)} in this model. Escape: the "
+                    f"config the file was written from."
+                )
+            module.lfb_bias.copy_(
+                src.to(device=module.lfb_bias.device, dtype=module.lfb_bias.dtype)
+            )
+
+    return len(live)
+
+
 def save_ckpt(
     run: RunConfig,
     model: torch.nn.Module,
     opt: MixOptimizer,
     step: int,
     *,
-    counters: Counters | None = None,
+    ema: dict | None = None,
 ) -> tuple[Path, Path]:
     """Weights + optimizer state, plus the config snapshot beside them.
 
@@ -253,57 +306,40 @@ def save_ckpt(
     fp32. The bank/checkpoint is the rung's whole contract — the forward path
     within a run never changes numerics.
 
-    The LFB routing bias is written to the `<ckpt_name>.lfb` sibling, not into
-    the model half: it is model state (the next resume continues from it) but
-    a non-persistent buffer (`lfb_path` says why). `load_model_state` restores
-    it for every reader.
-
-    `counters` receives the storage rung's COUNTED degradations: NVFP4 blocks
-    whose stored e4m3 scale rounded to zero (`nvfp4_zero_scale_blocks`) decode
-    to zeros, and a save that did not surface the count left the audit's
-    "COUNTED, never SILENT" half of the prescale as a test-only tally (review
-    round 1 M3). The trainer passes a fresh `Counters` per checkpoint and
-    prints it on the checkpoint line.
+    `ema` (the shadow of `TrainConfig.ema_decay`) is written beside the raw
+    training copy under the clearly named `model_ema` key, packed by the SAME
+    rule. It is the checkpoint's SERVED model half — `load_model_half` prefers
+    it — while `model` stays the RAW iterate a resume continues (the optimizer
+    moments belong to those weights). An EMA checkpoint therefore carries two
+    weight copies; that is the cost of a legal resume, stated here rather than
+    discovered from a 2x file size.
     """
-    from ..model.tsct import is_factor_key, pack_tsct
-
     weights, snapshot = ckpt_paths(run.train)
     weights.parent.mkdir(parents=True, exist_ok=True)
-    sd = model.state_dict()
+    rung = run.model.quant if run.model.quant != "none" else ""
     # A torch.compile'd model is an OptimizedModule whose keys carry a
     # `_orig_mod.` prefix. Strip it on the way out (audit 2026-10-17,
     # CRITICAL 2): every reader — load_ckpt, eval, decode, serve — loads into
     # the UNWRAPPED model, so a prefixed checkpoint is unresumable and
     # un-evaluable. The prefix is a wrapper artifact, never part of the file
     # format.
-    sd = {k.removeprefix("_orig_mod."): v for k, v in sd.items()}
-    rung = run.model.quant if run.model.quant != "none" else ""
-    if rung and rung in ("fp8", "nvfp4", "ternary"):
-        sd = {
-            k: (pack_tsct(v, rung, counters=counters) if is_factor_key(k) else v)
-            for k, v in sd.items()
-        }
+    payload = {
+        "model": _checkpoint_half(model.state_dict(), rung),
+        "opt": opt.state_dict(),
+        "step": step,
+        "model_quant_rung": rung or None,
+        # The LFB bias is the other half of the routing controller (`lfb_counts`
+        # rides in `model` as a persistent buffer); it is non-persistent because
+        # `state_dict()` is the OPTIMIZER's view of the model. A file that
+        # restored only the counts would restart the integrator at zero — the
+        # measured 50/51-tensor divergence of a 4+resume at moe_lb_coef=0.01.
+        "moe": lfb_state(model),
+    }
+    if ema is not None:
+        payload["model_ema"] = _checkpoint_half(ema, rung)
     tmp = weights.with_suffix(".pt.tmp")
-    torch.save(
-        {
-            "model": sd,
-            "opt": opt.state_dict(),
-            "step": step,
-            "model_quant_rung": rung or None,
-        },
-        tmp,
-    )
+    torch.save(payload, tmp)
     tmp.replace(weights)  # atomic: a crash never leaves a half-written ckpt
-    lfb = _lfb_state(model)
-    if lfb:
-        # LFB's bias is model state but not a persistent state-dict buffer —
-        # `lfb_path` says why (the export artifact's pinned key set). Written
-        # for EVERY checkpoint, zeros included, so a reused `ckpt_name` can
-        # never inherit a stale controller from an older run.
-        lp = lfb_path(run.train)
-        tmp_lfb = lp.with_suffix(".lfb.tmp")
-        torch.save(lfb, tmp_lfb)
-        tmp_lfb.replace(lp)
     if run.train.engram_ram:
         # The host tables are not parameters, so they are not in `sd`: they are
         # the sibling file, written atomically like the weights. A checkpoint
@@ -349,9 +385,33 @@ def load_model_half(weights: Path) -> dict:
     `load_state_dict`, so a checkpoint written with `quant = fp8|nvfp4|ternary`
     — a config `validate` accepts and `save_ckpt` packs — died in the load with
     a `RuntimeError` naming neither the rung nor the escape.
+
+    An EMA checkpoint keeps its SERVED copy under `model_ema` and its RAW
+    training copy under `model`; this reader PREFERS the former, so eval,
+    decode, serve and chat all score the averaged model while `load_ckpt`'s
+    resume still continues the raw iterate and its optimizer state.
+
+    The `moe` section (the LFB biases) is attached to the returned half and the
+    ONE loader applies it. A file written before the section existed CANNOT be
+    served with the router it trained (the bias is not derivable), so that is
+    COUNTED here rather than silent; a training load of the same file REFUSES
+    (`_refuse_missing_lfb`).
     """
     ck = torch.load(weights, map_location="cpu", weights_only=False)
-    return unpack_state_dict(ck["model"], ck.get("model_quant_rung"))
+    half = ck.get("model_ema")
+    if half is None:
+        half = ck["model"]
+    sd = unpack_state_dict(half, ck.get("model_quant_rung"))
+    moe = ck.get("moe")
+    if moe is None and _carries_lfb_counts(sd):
+        print(
+            f"router: {weights} carries lfb_counts but no lfb_bias (a file written "
+            f"before the LFB section existed); serving it with a ZERO bias, i.e. a "
+            f"different router than a moe_lb_coef>0 run trained. Escape: resume it "
+            f"on the commit that wrote it (a resume refuses), or serve a file "
+            f"written by this build."
+        )
+    return _with_moe(sd, moe, refuse=False)
 
 
 def require_ngram(cfg: TrainConfig) -> None:
@@ -377,15 +437,110 @@ def require_ngram(cfg: TrainConfig) -> None:
     )
 
 
-def load_model_state(
-    model: torch.nn.Module,
-    cfg: TrainConfig,
-    sd: dict,
-    *,
-    strict: bool = True,
-    log=print,
-    resume: bool = False,
-):
+def init_cfg(cfg: TrainConfig, path: Path, sd: dict, model: torch.nn.Module) -> TrainConfig:
+    """The cfg that describes the INIT FILE: its substrate and its sidecar path.
+
+    `load_model_state` reads the substrate from `cfg.engram_ram` and finds the
+    `.ngram` sibling through `cfg.out_dir`/`cfg.ckpt_name`, so an init load
+    cannot use the SFT run's own cfg — that names the sidecar THIS run will
+    write, not the init file's. The substrate is read from the FILE, not from a
+    flag: a host-table checkpoint's model half carries no `engram.tables`
+    (`Engram.to_host` deletes the parameter), which is the file's own statement
+    of where its memory lives.
+
+    The run's `engram_ram` must AGREE with the file's, and a disagreement is
+    LOUD, because the flag decides three things a mismatch would corrupt: the
+    host switch happens BEFORE the optimizer exists (a switch after it leaves
+    the tables in a parameter group that then steps a deleted tensor), the loop
+    steps the tables only when the flag is on, and `save_ckpt` writes the
+    `.ngram` only when it is on.
+    """
+    tables_in_file = any(k.endswith("engram.tables") for k in sd)
+    has_engram = any(isinstance(m, Engram) for m in model.modules())
+    host = has_engram and not tables_in_file
+    if host and not cfg.engram_ram:
+        loud(
+            f"init-from: {path}'s model half carries no `engram.tables`: it "
+            f"is a host-table run (its rows are the sibling `{path.stem}.ngram`), "
+            f"or it is not this model's checkpoint at all. This run is configured "
+            f"engram_ram=false, so the memory could not be loaded: a host-table "
+            f"load switches the model to host tables after the optimizer exists, "
+            f"and the run would read a memory it never steps and never saves. "
+            f"Escape: --set engram_ram=true (the pretrain's substrate), or an init "
+            f"checkpoint whose model half carries the tables."
+        )
+    if tables_in_file and cfg.engram_ram:
+        loud(
+            f"init-from: {path} carries its Engram in the model half "
+            f"(`engram.tables`) but this run is configured engram_ram=true. "
+            f"Switching to host tables would DROP the checkpoint's memory — the "
+            f"host path starts from the model's own rows and this run's `.ngram` "
+            f"sibling does not exist yet. Escape: --set engram_ram=false, or "
+            f"re-save the init as a host-table run (with its `.ngram` sibling)."
+        )
+    return dataclasses.replace(cfg, engram_ram=host, out_dir=str(path.parent), ckpt_name=path.stem)
+
+
+def init_controller(run: RunConfig, model: torch.nn.Module, path: Path, *, log=print) -> RunConfig:
+    """`--init-from` carries the checkpoint's LFB coefficient, LOUD.
+
+    The LFB bias is routing-CONTROLLER state: `SparseMoE.forward` adds it to the
+    router logits unconditionally and `_lfb_step` moves it by `±moe_lb_coef` per
+    routed forward from the CUMULATIVE counts. It is neither a parameter nor part
+    of the model half (`lfb_bias` is a non-persistent buffer), so **no learning
+    rate freezes it** — the reason an `lr=1e-12` run still degrades. A cold
+    integrator started over a converged router has no feedback: the top-k is
+    pinned by weights the bias does not reach until it is several logits tall,
+    the sign never flips, and the bias ramps linearly. Measured on this seam
+    (mix1 + `train medium`'s `moe_lb_coef=0.01`, weights frozen): ±4.8 after
+    ~480 forwards, routing onto experts the model never selects, loss
+    1.275 → 1.500 → 11 425 785 by step 300 (`logs/diag_lr0.log`). The same
+    stream with `moe_lb_coef=0` reads 1.21-1.49 for all 400 steps.
+
+    `--init-from` deliberately has no config-drift gate (that is `resume`'s job;
+    the QAT seam exists to change the forward), so before this the PRESET's
+    coefficient silently decided the controller — `train medium` says 0.01
+    while mix1 trained at 0. The init file's snapshot is the authority, as it is
+    for the engram substrate: carry its coefficient, LOUD. A checkpoint with no
+    snapshot cannot say what controller it trained with, so a run asking for a
+    live one is refused rather than ramped over a converged router;
+    `moe_lb_coef=0` is the escape (a controller that never moves the bias).
+    """
+    snap = path.with_suffix(".config.toml")
+    if not snap.is_file():
+        if run.model.moe_lb_coef != 0.0:
+            loud(
+                f"init-from: {path} has no {snap.name} snapshot, so the LFB "
+                f"coefficient it trained with is unknown, and this run has "
+                f"moe_lb_coef={run.model.moe_lb_coef:g}. The bias is controller state "
+                f"(not a parameter, not in the model half), so no lr freezes it: a "
+                f"cold integrator over a converged router winds up (measured: loss "
+                f"1.275 -> 11 425 785 by step 300 with the weights frozen). Escape: "
+                f"--set moe_lb_coef=0 leaves the routing exactly the checkpoint's, or "
+                f"use an init checkpoint that carries its snapshot."
+            )
+        return run
+    stored = RunConfig.from_snapshot(snap.read_text())
+    coef = float(stored.model.moe_lb_coef)
+    if coef == float(run.model.moe_lb_coef):
+        return run
+    log(
+        f"init: moe_lb_coef {run.model.moe_lb_coef:g} -> {coef:g} from {snap.name} — "
+        f"the LFB bias is routing-controller state that is not a parameter and not "
+        f"in the model half, so a cold integrator over this checkpoint's router "
+        f"winds up (measured loss 1.275 -> 11 425 785 by step 300 with the weights "
+        f"frozen). The checkpoint's own recipe decides it."
+    )
+    model_cfg = dataclasses.replace(run.model, moe_lb_coef=coef)
+    for m in model.modules():
+        if hasattr(m, "lfb_coef"):
+            m.lfb_coef = coef
+    if hasattr(model, "cfg"):
+        model.cfg = model_cfg
+    return dataclasses.replace(run, model=model_cfg)
+
+
+def load_model_state(model: torch.nn.Module, cfg: TrainConfig, sd: dict, *, strict: bool = True):
     """The ONE way a checkpoint's model half reaches a model.
 
     `train`'s resume, `eval`, `decode`, `serve`, `scripts/chat.py` and the two
@@ -402,21 +557,29 @@ def load_model_state(
     is a training VRAM-budget rule, and a load must work on `--device cpu`.
     A missing sibling is LOUD (`require_ngram`), never freshly seeded rows.
 
-    The LFB bias is restored from the `<ckpt>.lfb` sibling after the load when
-    that file exists (`_restore_lfb`): it is a non-persistent buffer (see
-    `lfb_path`), so a plain `load_state_dict` would reset the routing
-    controller a resume is supposed to continue. `resume=True` is the
-    TRAINER's resume only: a missing sidecar with the controller live is LOUD
-    there, and every reader (or a resume with `moe_lb_coef=0`) gets the COUNTED
-    zeroed line instead of a refusal.
+    The LFB rule is the same shape: `lfb_bias` is a non-persistent buffer, so
+    it travels in the checkpoint's `moe` section and is copied here — after
+    `load_state_dict`, because the buffers are the live module's. A half that
+    says it came from a TRAINING load and carries `lfb_counts` without the
+    bias is refused when the controller is live (`_refuse_missing_lfb`);
+    a reader (`load_model_half`) has already COUNTED the zero-bias line.
     """
     if cfg.engram_ram:
         require_ngram(cfg)
-        enable_host_tables(model)  # idempotent: 0 when the model is already host
+        enable_host_tables(model, bias_correction=cfg.engram_bias_correction)  # idempotent
+    moe = getattr(sd, "moe", None)
+    refuse = bool(getattr(sd, "refuse_missing_moe", False))
     result = model.load_state_dict(sd, strict=strict)
+    if moe is not None:
+        _restore_lfb(model, moe, where=f"{len(moe)}-module `moe` section")
+    elif refuse and _carries_lfb_counts(sd):
+        # The EFFECTIVE coefficient is the model's (the preset's, or the
+        # snapshot's after `init_controller` rewrote it) — not the CLI's guess.
+        coef = max((float(m.lfb_coef) for m in _lfb_modules(model).values()), default=0.0)
+        if coef != 0.0:
+            _refuse_missing_lfb("the checkpoint", coef)
     if cfg.engram_ram:
         load_host_state(model, load_ngram(cfg))
-    _restore_lfb(model, cfg, log=log, resume=resume)
     return result
 
 
@@ -439,15 +602,6 @@ def load_ckpt(run: RunConfig) -> tuple[dict, RunConfig]:
         require_ngram(run.train)
     stored = RunConfig.from_snapshot(snapshot.read_text())
     drift = run.diff_keys(stored)
-    # The controller-off escape (`_restore_lfb`): a pre-sidecar checkpoint has
-    # no bias to restore, and `moe_lb_coef=0` is the documented break-glass —
-    # the controller never moves the bias again. It is NOT "the same function":
-    # `SparseMoE.forward` adds a stored nonzero bias unconditionally, but a
-    # missing sidecar loads a zero one, so routing differs from the stored step
-    # (the COUNTED line says so). Only that one key, only to 0, and only when
-    # the sidecar really is absent; every other model/train change is refused.
-    if run.model.moe_lb_coef == 0 and not lfb_path(run.train).is_file():
-        drift = [k for k in drift if k != "model.moe_lb_coef"]
     if drift:
         loud(
             f"resume refused: {snapshot} was written by a config that differs in "
@@ -464,7 +618,16 @@ def load_ckpt(run: RunConfig) -> tuple[dict, RunConfig]:
     # side is allowed to differ from the save side — the file's rung is what
     # describes the values, and a checkpoint is legal evidence for a bf16 run
     # starting from fp8-rounded init; the snapshot gate above handles intent.
-    ck["model"] = unpack_state_dict(ck["model"], ck.get("model_quant_rung"))
+    ck["model"] = _with_moe(
+        unpack_state_dict(ck["model"], ck.get("model_quant_rung")),
+        ck.get("moe"),
+        refuse=True,
+    )
+    # The EMA copy travels beside the raw one (`save_ckpt`). It is unpacked by
+    # the same rule, and a file without it is a legal resume: the run starts
+    # the shadow from the loaded weights (COUNTED in `train`'s log).
+    if ck.get("model_ema") is not None:
+        ck["model_ema"] = unpack_state_dict(ck["model_ema"], ck.get("model_quant_rung"))
     return ck, stored
 
 
@@ -483,25 +646,89 @@ def _sample_depth(seed: int, step: int, max_iter: int) -> int:
     return 1 + ((step * 2654435761 + seed) % max_iter)
 
 
-def _eval_batches(stream: ByteStream, requested: int) -> int:
-    """How many WHOLE eval windows the stream's byte range holds, capped at `requested`.
+def _shadow_state(model: torch.nn.Module, initial: dict | None = None) -> dict:
+    """The EMA shadow: one tensor per PARAMETER, keyed by the live name.
 
-    One `next_batch` reads `batch × (seq_len + 1)` bytes (the next-byte shift)
-    and scores `batch × seq_len` of them, so that read is the denominator a
-    range is worth: `span // (batch × (seq_len + 1))`. The old denominator
-    (`batch × seq_len`) let the last window overrun the range and wrap into its
-    head — the 160 B / 640 B wrap review round 1 measured (M5). A range can
-    still be large enough for `ByteStream` (which requires `batch × seq_len + 1`
-    bytes) yet hold no whole window: then this returns 0 and the line says so.
-    `open_streams` sizes the no-`--eval` tail in READS
-    (`eval_batches × batch × (seq_len + 1)`, capped at 1 MiB), so the cap is
-    the only reason a shortfall remains; the eval scores the windows that fit
-    and the line names what is missing (COUNTED — audit 2026-10-19 M5, review
-    round 2 R2-1).
+    `initial` is a checkpoint's `model_ema` half (already unpacked, CPU, keys
+    WITHOUT the `_orig_mod.` prefix `torch.compile` adds). Keys are matched
+    after stripping that prefix on both sides, and a set or shape mismatch is
+    LOUD: a shadow that names a different tree would make every eval score a
+    network the run never trained. `None` starts the shadow AT the current
+    weights (a fresh run, or a resume of a file written with `ema_decay=0`).
+
+    The shadow covers `named_parameters()` and nothing else — buffers and the
+    host Engram tables are not weights of the checkpoint's model half, and
+    `ema_decay`'s docstring names that boundary.
     """
-    per_window = stream.batch * (stream.seq_len + 1)
-    assert per_window > 0, "an eval window has no bytes"
-    return max(0, min(requested, (stream.hi - stream.lo) // per_window))
+    live = list(model.named_parameters())
+    if initial is not None:
+        want = [n.removeprefix("_orig_mod.") for n, _ in live]
+        missing = sorted(set(want) - set(initial))
+        extra = sorted(set(initial) - set(want))
+        if missing or extra:
+            loud(
+                f"ema: the checkpoint's `model_ema` does not name this parameter "
+                f"tree — missing {missing[:5]}{' ...' if len(missing) > 5 else ''}, "
+                f"unexpected {extra[:5]}{' ...' if len(extra) > 5 else ''}. The "
+                f"shadow is a second copy of the SAME model; evaluating a mismatched "
+                f"one would score a network this run never trained. Escape: resume "
+                f"with the checkpoint's own config, or start a fresh ckpt_name."
+            )
+    out: dict[str, torch.Tensor] = {}
+    for name, p in live:
+        src = None if initial is None else initial[name.removeprefix("_orig_mod.")]
+        if src is not None and tuple(src.shape) != tuple(p.shape):
+            loud(
+                f"ema: `model_ema` {name} has shape {tuple(src.shape)}, the model "
+                f"expects {tuple(p.shape)}. Escape: the checkpoint's config, or a "
+                f"fresh ckpt_name."
+            )
+        out[name] = (
+            p.detach().clone()
+            if src is None
+            else src.detach().to(device=p.device, dtype=p.dtype).clone()
+        )
+    return out
+
+
+@contextmanager
+def _shadow_params(model: torch.nn.Module, shadow: dict | None):
+    """Evaluate with the shadow: swap `.data` for the eval, restore after.
+
+    A reference swap, not a copy: an eval is a declared cadence, but copying a
+    1B-parameter shadow in and out of the live tensors twice per eval is the
+    kind of cost that makes an arm look slow for no reason. `.data` assignment
+    does not disturb the optimizer's parameter objects (the objects, their
+    `.grad` and their identity are untouched), which is why the switch back is
+    exact and the next step's graph sees the RAW weights it built.
+    """
+    if shadow is None:
+        yield
+        return
+    live = list(model.named_parameters())
+    saved = {name: p.data for name, p in live}
+    for name, p in live:
+        p.data = shadow[name]
+    try:
+        yield
+    finally:
+        for name, p in live:
+            p.data = saved[name]
+
+
+def _ema_update(model: torch.nn.Module, shadow: dict, decay: float, flag_dev: torch.Tensor) -> None:
+    """`shadow <- d·shadow + (1-d)·param`, ONCE per optimizer step.
+
+    `flag_dev` is the firewall's 0/1 device flag, so a NaN-skipped step leaves
+    the shadow EXACTLY where it was (`lerp` with weight 0) and no host branch on
+    a device value exists. `lerp_` is the in-place form of the recurrence; it
+    reads the parameter AFTER the step (or after the graph replay), which is
+    why `opt_graph` is legal with this arm — the EMA is outside the capture.
+    """
+    weight = flag_dev.to(torch.float32) * (1.0 - decay)
+    for name, p in model.named_parameters():
+        s = shadow[name]
+        s.lerp_(p.detach(), weight.to(s.dtype))
 
 
 def _eval_loss(
@@ -520,26 +747,13 @@ def _eval_loss(
     depths and the one generation reads. `per_iter_mean` averages the
     per-iteration CEs over the batch — the deep-supervision shape.
 
-    The byte count is what the pass SCORED, not the window the config asked
-    for: when the eval range is shorter than the requested window (the
-    no-`--eval` tail is capped at 1 MiB), the loop runs only the windows the
-    range holds, so the `over N B` field cannot claim more text than the tail
-    contains (audit 2026-10-19 M5). `_eval_line` names the shortfall.
-
     `counters`, when given, receives THIS eval's own arm counters (the eval
     forward's `engram_rows`/`engram_arms` — the `engram=` field the eval line
     prints). They are the eval's, not the run's: a training counter would say
     the memory ran during an eval that ran without it, which is exactly the
     blind spot of AGENTS §3.2's retracted arm.
-
-    With no WHOLE window in the range the pass scores 0 B and returns NaN loss:
-    there is no measurement to report, and a fabricated 0.0 would read as a
-    perfect score (`_eval_line` names the bytes left unscored).
     """
     stream.rewind()
-    batches = _eval_batches(stream, batches)
-    if batches == 0:
-        return float("nan"), 0, float("nan"), []
     total = 0.0
     scored = 0
     fin_total = 0.0
@@ -569,9 +783,15 @@ def _eval_loss(
                 per = bd["per_iter"]
                 if not per_iter_acc:
                     per_iter_acc = [0.0] * len(per)
-                for j, v in enumerate(per):
-                    per_iter_acc[j] += v
-    n = batches
+                for i, v in enumerate(per):
+                    per_iter_acc[i] += v
+    n = max(batches, 1)
+    if getattr(stream, "eval_tail_capped", None) is not None:
+        # The tail is capped below the requested window, so the stream wrapped
+        # and `scored` above counts duplicate rows. The printed figure is the
+        # DISTINCT bytes those windows scored (the cap's own COUNTED line
+        # names the requested/granted sizes).
+        scored = distinct_scored_bytes(stream, batches)
     model.train(was_training)
     if counters is not None:
         counters.merge(ev_counters)
@@ -619,10 +839,6 @@ def _eval_line(
     max_iter: int,
     device: torch.device | str | None,
     step: int,
-    *,
-    batch: int | None = None,
-    seq_len: int | None = None,
-    parallel=None,
 ) -> tuple[str, float, int]:
     """The eval line, carrying the depth curve when the config asks for it.
 
@@ -630,15 +846,7 @@ def _eval_line(
     `cfg.eval_depths` requests it on a fixed-depth run. The line reports the
     held-out loss at `max_iter` as its headline number, so the arm's curve and
     the fixed-depth control are read off the same line.
-
-    `batch`/`seq_len` are the shape the eval ACTUALLY scored (a distributed
-    rank's micro-batch), and they are printed for the same reason the config's
-    are: a BPB without its window is not a number. `parallel` adds the
-    `dist=r/P` field — in a fleet only rank 0 evaluates, and the line must say
-    so rather than look like a fleet-wide measurement.
     """
-    b = cfg.batch if batch is None else batch
-    t = cfg.seq_len if seq_len is None else seq_len
     curve = None
     eng = Counters()
     if cfg.rand_depth or cfg.eval_depths:
@@ -655,40 +863,15 @@ def _eval_line(
     # a reader learns the eval ran a memory-disabled forward, which is the defect
     # that retracted the Engram arm's numbers (AGENTS §3.2). It is printed on
     # both substrates — the host path counts the same rows in `Engram._read`.
-    #
-    # The byte field is what the pass SCORED, and it names the shortfall when
-    # the range could not hold the window the config asked for (the no-`--eval`
-    # tail is capped at 1 MiB; audit 2026-10-19 M5). A line that printed
-    # `eval_batches × batch × seq_len` here overstated the evidence by the
-    # wrapped bytes.
-    ran = _eval_batches(stream, cfg.eval_batches)
-    # The WINDOW is the shape the rank actually scored (`b`/`t`), not the
-    # config's: on a fleet a rank runs its own micro-batch, and a window that
-    # quoted the config would describe another rank's measurement.
-    window = cfg.eval_batches * b * t
-    batches_field = f"{ran} x {b} x {t}"
-    if ran != cfg.eval_batches:
-        batches_field += f", requested {cfg.eval_batches}"
     line = (
         f"eval step={step} loss={ev:.4f} bpb={bpb(ev):.3f} fin={fin:.4f} "
-        f"bpb_fin={bpb(fin):.3f} over {scored} B ({batches_field}) "
+        f"bpb_fin={bpb(fin):.3f} over {scored} B "
+        f"({cfg.eval_batches} x {cfg.batch} x {cfg.seq_len}) "
         f"engram={eng.get('engram_rows', 0)}/{eng.get('engram_arms', 0)}"
     )
-    if scored < window:
-        held = stream.hi - stream.lo
-        line += (
-            f" shortfall: requested {window} B over {cfg.eval_batches} batch(es), "
-            f"the eval stream holds {held} B; scored {scored} B"
-            + (f" over {ran} batch(es)" if ran != cfg.eval_batches else "")
-            + f", left over {held - scored} B"
-        )
-        if ran == 0:
-            line += (
-                f" (no whole window fits: one read is {b} x "
-                f"({t} + 1) = {b * (t + 1)} B)"
-            )
-    if parallel is not None:
-        line += f" dist={parallel.rank}/{parallel.world_size}"
+    capped = getattr(stream, "eval_tail_capped", None)
+    if capped is not None:
+        line += f" eval_tail_capped={capped[0]}/{capped[1]}"
 
     if per_iter:
         line += " periter=" + ",".join(f"{v:.4f}" for v in per_iter)
@@ -704,9 +887,9 @@ def train(
     stream: ByteStream | None = None,
     eval_stream: ByteStream | None = None,
     resume: bool = False,
+    init_from: str | None = None,
     log=print,
     device: torch.device | str | None = None,
-    parallel=None,
 ) -> dict:
     """Run the training loop. Returns a report dict (final loss, counters, step).
 
@@ -714,28 +897,11 @@ def train(
     from an mmap, and it is the caller who knows where the model lives), so a
     GPU run names the device here and gets its windows transferred. `None` is
     the CPU path, unchanged.
-
-    `parallel` is the distributed seam (`train/distributed.py`). `None` is the
-    single-process path and every line below is byte-identical to its history:
-    the rank's shape is the config's, the loss is untouched, the NaN decision
-    is local. With a `Parallel`, four things change and nothing else — the
-    stream is the rank's own byte range and micro-batch, the loss is scaled by
-    `world_size · t_rank / Σt` before backward (so DDP's mean-of-means lands on
-    the global token mean), the NaN decision is one collective (a rank that
-    skips backward would hang the reducer), and only rank 0 evaluates,
-    checkpoints and logs.
     """
     cfg = run.train
-    #: The model shape's effective batch. `parallel=None` keeps the config's
-    #: exactly; a rank runs its own capacity-profile entry (stage 3).
-    batch, seq_len = (
-        (cfg.batch, cfg.seq_len)
-        if parallel is None
-        else (
-            parallel.shape.batch,
-            parallel.shape.seq_len,
-        )
-    )
+    # The hand-built path skips `load_run`; the train-half refusals are ONE
+    # definition (`config.validate_train`) and this is the second caller.
+    validate_train(cfg)
     if cfg.tf32:
         # The knob the b1 opt bench measured (2026-10-16): 1399 -> 1201 ms/step.
         torch.set_float32_matmul_precision("high")
@@ -769,34 +935,41 @@ def train(
     if stream is None:
         if run.train.mix_plan:
             # The staged mixture (train/mixture.py): N sources interleaved by
-            # per-stage weights, epoch-capped LOUD. The eval side is unchanged
-            # (the same held-out file and window), so BPB stays comparable.
+            # per-stage weights, epoch-capped LOUD. Its counter is MICRO-BATCHES:
+            # the loop draws `grad_accum` windows per optimizer step, so the
+            # schedule and the epoch cap both take `steps x grad_accum` (passing
+            # `steps` ran the mix `grad_accum`x fast — stages at opt steps 18/23
+            # instead of 70/90 — and under-counted bytes by the same factor).
+            micro_steps = run.train.steps * run.train.grad_accum
             stream = open_mixture(
                 run.train.mix_plan,
-                steps=run.train.steps,
-                batch=batch,
-                seq_len=seq_len,
+                steps=micro_steps,
+                batch=run.train.batch,
+                seq_len=run.train.seq_len,
                 seed=run.train.seed,
                 max_epochs=run.train.max_epochs,
+                doc_masking=run.train.doc_masking,
             )
-            _, eval_stream = open_streams(run, batch=batch, seq_len=seq_len)
+            _, eval_stream = open_streams(run, eval_only=True)
             log(
                 f"mix_plan={run.train.mix_plan}: {len(stream.plan.sources)} sources, "
-                f"{len(stream.plan.stages)} stage(s), max_epochs={run.train.max_epochs}"
+                f"{len(stream.plan.stages)} stage(s), steps={micro_steps} micro-batches "
+                f"({run.train.steps} x grad_accum={run.train.grad_accum}), "
+                f"max_epochs={run.train.max_epochs}"
             )
         else:
-            stream, eval_stream = open_streams(run, batch=batch, seq_len=seq_len)
-        if parallel is not None:
-            # The rank's own byte range: disjoint per rank, and with equal shapes
-            # the fleet's union at step s is the contiguous block one process at
-            # Σbatch reads at step s — the equal-batch gate's whole basis.
-            stream.skip_bytes(parallel.byte_offset())
+            stream, eval_stream = open_streams(run)
+    if cfg.doc_masking:
+        # The arm's own line: which reader ran and what it does. The row shape
+        # is the whole mechanism, so a reader does not have to infer it from the
+        # flag (a packed row that still glued documents would be the defect).
+        log(
+            "doc_masking=true: one document per training row (whole document, or a "
+            "contiguous chunk of one when it is longer than seq_len), tail-padded; "
+            "padding and cross-document targets are excluded from the loss. The eval "
+            "stream stays flat (the held-out window is the comparable number)."
+        )
     model.train()
-    if parallel is not None:
-        # Refusals BEFORE any state is built, then FSDP2's shard (it must come
-        # before the optimizer so the optimizer state is sharded with it).
-        parallel.refuse_incompatible(run, resume=resume)
-        model = parallel.shard(model)
     if "ternary_s3t" in (run.model.factor_qat, run.model.dense_qat):
         # The ADR-0021 caveat, said where a reader of the log meets it. The
         # projector has no step index, so the S3T mask is a process-local
@@ -814,8 +987,11 @@ def train(
         # BEFORE the optimizer exists: on the host path the tables are not
         # parameters, so no group, no grad clip and no checkpoint half ever
         # carries them (`Engram.to_host` deletes the parameter).
-        n = host_tables(model)
-        log(f"engram_ram: {n} table set(s) in host RAM, VRAM holds the batch's unique rows")
+        n = host_tables(model, cfg.engram_bias_correction)
+        log(
+            f"engram_ram: {n} table set(s) in host RAM, VRAM holds the batch's unique "
+            f"rows, bias_correction={'on' if cfg.engram_bias_correction else 'off'}"
+        )
     opt = MixOptimizer(
         model,
         lr=cfg.lr,
@@ -837,9 +1013,23 @@ def train(
         # a resume is refused by `diff_keys`.
         muon_variant=cfg.muon_variant,
         muon_sf=cfg.muon_sf,
+        muon_sf_wd=cfg.muon_sf_wd,
     )
     if cfg.optim_8bit:
-        opt.enable_bnb8bit()
+        # The device firewall multiplies the FIRST MOMENT and the weight-decay
+        # factor before the step; bitsandbytes' AdamW8bit keeps its state in
+        # 8-bit blocks and its `step` has no seam between that state and the
+        # parameter write, so the flag could only be honoured by a host branch
+        # on the device value — the sync this path exists to remove. LOUD, and
+        # the escape is the plain AdamW this arm was a VRAM lever against
+        # (the follow-up is a snapshot-gated bnb arm, ADR-0019 style).
+        loud(
+            "optim_8bit=true: bitsandbytes' AdamW8bit has no device-flag path "
+            "(its update cannot be multiplied by the NaN firewall's flag), so a "
+            "non-finite step could not be skipped without a host read. Escape: "
+            "optim_8bit=false (plain AdamW keeps the device firewall), or gate "
+            "this arm on its own host-read path first."
+        )
 
     def sf(mode: str) -> None:
         """The schedule-free switch, a no-op when the arm is off.
@@ -857,36 +1047,72 @@ def train(
             "muon_sf: the params hold Y=(1-beta1)Z+beta1 X during every step, X is "
             "what each eval and checkpoint sees, and the Muon-group LR is CONSTANT "
             "after warmup (the AdamW half keeps WSD - the hybrid deviation "
-            "`optim.Muon.sf_switch` documents). A NaN-skipped step advances none of "
-            "Z/X/s."
+            "`optim.Muon.sf_switch` documents). Weight decay is "
+            f"{cfg.muon_sf_wd:g} AT Z (Lemma 3.1 needs wd>0 there; `config.validate` "
+            "refuses 0); the per-step TSCT retraction is OFF "
+            "(muon_sf_retract=false - the only legal setting, S3). A NaN-skipped step "
+            "advances none of Z/X/s."
         )
-    #: The GLOBAL tokens one step consumes. A fleet property: the loss scale,
-    #: the LR warmup and the logged tok/s are all defined on it, so every rank
-    #: must agree — a per-rank warmup count would put the ranks on different
-    #: schedules and silently train N different runs.
-    tokens_per_step = cfg.batch * cfg.seq_len if parallel is None else parallel.global_tokens
+    tokens_per_step = cfg.batch * cfg.seq_len * cfg.grad_accum
     start = 0
-    if resume:
-        ck, stored = load_ckpt(run)
-        load_model_state(model, cfg, ck["model"], log=log, resume=True)
+    resumed_ema: dict | None = None
+    if init_from is not None:
+        # Fine-tune init: WEIGHTS from a foreign checkpoint, no config gate and no
+        # optimizer state. The deliberate difference from `resume`, and the reason
+        # this exists: a resume must prove the config did not move (ADR-0021), so
+        # it cannot express "same weights, different forward" — which is exactly
+        # what a QAT-finish is (`factor_qat=none` bf16 checkpoint -> ternary
+        # forward). Weights leave their recorded context, so it is LOUD.
+        if resume:
+            loud(
+                "train: --init-from and --resume together name two different sources "
+                "of weights. Escape: --init-from to seed a new run from a foreign "
+                "checkpoint (fresh optimizer, fresh snapshot), or --resume to continue "
+                "THIS run."
+            )
+        path = Path(init_from)
+        if not path.is_file():
+            loud(f"train --init-from: {path} does not exist. Escape: the .pt of the run you mean.")
+        foreign = torch.load(path, map_location="cpu", weights_only=False)
+        # An EMA checkpoint's SERVED half is `model_ema` (the same preference
+        # `load_model_half` makes): a fine-tune starts from the averaged model a
+        # reader would serve, not from the raw iterate.
+        half = foreign.get("model_ema")
+        if half is None:
+            half = foreign.get("model", foreign)
+        sd = unpack_state_dict(half, foreign.get("model_quant_rung"))
+        # The LFB coefficient is the CHECKPOINT's (init_controller), and it
+        # decides whether a missing `moe` section is a refusal: resolving the
+        # controller before the load is what lets the escape it documents
+        # (`moe_lb_coef=0` carried from the snapshot) actually apply.
+        run = init_controller(run, model, path, log=log)
+        sd = _with_moe(sd, foreign.get("moe"), refuse=True)
+        # The ONE loader: an `engram_ram` checkpoint has no `engram.tables` in the
+        # model half and needs its `.ngram` sibling, which `load_model_state`
+        # restores (a missing sibling is its LOUD refusal, never fresh rows).
+        load_model_state(model, init_cfg(cfg, path, sd, model), sd)
+        log(
+            f"init: weights from {path} (step {foreign.get('step', '?')}), "
+            "fresh optimizer and snapshot — the forward may differ from the one "
+            "that trained them (this is the QAT-finish seam)"
+        )
+    elif resume:
+        ck, _stored = load_ckpt(run)
+        load_model_state(model, cfg, ck["model"])
         opt.load_state_dict(ck["opt"])
         start = int(ck["step"]) + 1
+        resumed_ema = ck.get("model_ema") if cfg.ema_decay > 0.0 else None
         if start:
             # A resumed run must continue on UNSEEN bytes: the burn failure
             # this prevents is re-reading (and memorizing) the corpus head.
-            # A mixture's position is a STEP-INDEX question, not a byte-count
-            # one: its stage schedule is a function of the run's budget, and
-            # `steps` is an exempt progress key, so an extended run must
-            # replay the prefix under the checkpoint's stored budget or it
-            # assigns already-taken steps to different sources and moves every
-            # cursor by the wrong amount (review round 3 R3-4). A fleet's rank
-            # adds its own byte offset on the byte path (stage 3).
-            skip_to_step = getattr(stream, "skip_to_step", None)
-            if skip_to_step is not None:
-                skip_to_step(start, budget=stored.train.steps)
-            else:
-                rank_off = 0 if parallel is None else parallel.byte_offset()
-                stream.skip_bytes(start * (cfg.seq_len + 1) * cfg.batch + rank_off)
+            # `grad_accum` micro-batches were drawn per optimizer step, and
+            # `MixtureStream.skip_bytes` replays exactly that many draws.
+            stream.skip_bytes(start * (cfg.seq_len + 1) * cfg.batch * cfg.grad_accum)
+            if isinstance(stream, MixtureStream):
+                assert stream.step == start * cfg.grad_accum, (
+                    f"resume skipped {stream.step} micro-batches, expected "
+                    f"{start} x grad_accum={cfg.grad_accum}"
+                )
         # The checkpoint's model half is the X iterate (a checkpoint is written
         # with the eval switch on, below), and so is the optimizer's own `x`, so
         # the params must go back to Y before the next forward. The switch is an
@@ -895,19 +1121,7 @@ def train(
         sf("train")
         log(f"resume: step={start} opt_steps={opt.steps}")
 
-    if parallel is not None:
-        # DDP AFTER the optimizer and after the resume load: the wrapper
-        # broadcasts rank 0's parameters, and the optimizer already holds those
-        # parameter objects — wrapping earlier would load a `module.`-prefixed
-        # state dict into the raw module's keys.
-        model = parallel.replicate(model)
-        log(parallel.line())
-
-    warm = (
-        warmup_steps(cfg.warmup_tokens, cfg.batch, cfg.seq_len)
-        if parallel is None
-        else warmup_steps(cfg.warmup_tokens, 1, tokens_per_step)
-    )
+    warm = warmup_steps(cfg.warmup_tokens, cfg.batch * cfg.grad_accum, cfg.seq_len)
     decay = int(round(cfg.decay_frac * cfg.steps))
     if cfg.torch_compile:
         if cfg.opt_graph:
@@ -925,6 +1139,24 @@ def train(
         # machine, not per run.
         model = torch.compile(model, dynamic=True)
         log("torch_compile: model wrapped (first steps pay the warmup)")
+    # The EMA shadow is built AFTER the resume load AND after torch.compile:
+    # it must clone the RESOLVED weights, and its keys must be the live
+    # (possibly `_orig_mod.`-prefixed) names `_shadow_params` swaps. `init_from`
+    # deliberately starts a FRESH shadow (a fine-tune is a new trajectory), so
+    # only a resume restores the stored copy.
+    ema = None
+    if cfg.ema_decay > 0.0:
+        ema = _shadow_state(model, resumed_ema)
+        source = (
+            "restored from model_ema"
+            if resumed_ema is not None
+            else "started at the loaded weights"
+        )
+        log(
+            f"ema_decay={cfg.ema_decay:g}: shadow of {len(ema)} parameter tensors "
+            f"{source}; eval and the served checkpoint use it, the raw iterate stays "
+            f"the training copy (`model_ema` vs `model` in the file)"
+        )
     anneal_steps = cfg.factor_qat_anneal_steps
     if anneal_steps > 0 and run.model.factor_qat == "none" and run.model.dense_qat == "none":
         loud(
@@ -938,15 +1170,33 @@ def train(
     window = Counters()
     nan_skipped = 0
     drowning = 0
-    window_finite: list[bool] = []
+    window_steps = 0
     timer = StepTimer()
     last_loss = float("nan")
+    #: The DEVICE firewall's state (ADR-0018 rule 2). `flag_dev` is the 1/0
+    #: integer the step's writes are multiplied by; `last_loss_dev` is the last
+    #: FINITE loss, carried on the device so the log cadence is the only host
+    #: read of it. Both are persistent storage filled IN PLACE: a CUDA graph
+    #: captured later reads this tensor's storage on every replay, so
+    #: reassigning the name would freeze the capture-time value (the same
+    #: defect `graph.set_lr` documents for the learning rate).
+    dev = next(model.parameters()).device
+    flag_dev = torch.ones((), dtype=torch.int32, device=dev)
+    last_loss_dev = torch.full((), float("nan"), device=dev)
+    #: The loss-print decision, separate from the UPDATE flag: the printed
+    #: number is the last FINITE loss (`last_loss_dev`'s contract), and a
+    #: micro-batch can have a finite loss with a non-finite gradient. ON by
+    #: default so a one-micro step hands `torch.where` the same condition the
+    #: pre-arm code did.
+    loss_ok_dev = torch.ones((), dtype=torch.bool, device=dev)
+    #: Host-substrate Engrams, resolved once: this arm's update needs the flag
+    #: on the HOST and pays an existing per-step D2H for its row gradients, so
+    #: it is the one declared exception to "no per-step device read".
+    hosts = host_engrams(model)
     #: The telemetry sink: every event (log cadence, evals, checkpoints) gets
     #: a JSON row. A dict writer that never raises on non-JSON values.
     sink = None
-    if cfg.json_log and (parallel is None or parallel.is_main):
-        # ONE writer: N ranks appending to one JSONL would interleave partial
-        # lines. Rank 0's file is the run's telemetry, like its log.
+    if cfg.json_log:
         sink = open(cfg.json_log, "a", encoding="utf-8")
 
         def _row(**kw) -> None:
@@ -965,6 +1215,8 @@ def train(
             seq_len=cfg.seq_len,
             lr=cfg.lr,
             opt=cfg.opt,
+            grad_accum=cfg.grad_accum,
+            ema_decay=cfg.ema_decay,
             resumed=start,
         )
 
@@ -978,10 +1230,15 @@ def train(
         The clip is `clip_grads` (optim.py): ONE `_foreach_norm` + ONE fused
         `_foreach_mul_` — the stock per-tensor walk measured 252 ms of a
         small-form step (2920 norm calls, profile 2026-10-16).
+
+        `flag_dev` is read INSIDE the captured region only as a device tensor,
+        which is what keeps the stage capture-safe: the loop fills its storage
+        in place before the replay, exactly like `graph.set_lr`'s learning
+        rate. No `.item()`, no `bool(tensor)`, no host branch on it.
         """
         if cfg.grad_clip > 0:
             clip_grads(model.parameters(), cfg.grad_clip)
-        opt.step()
+        opt.step(flag_dev)
 
     #: The CUDA-graph arm (`train/graph.py`, `train.opt_graph`). `None` is the
     #: default path and it is untouched: the LR stays a host float in the group
@@ -997,13 +1254,157 @@ def train(
     #: group points at any more — every replay would read a stale value.
     graph = None
     if cfg.opt_graph:
-        graph = OptimizerGraph(opt, opt_stage, counters=total, log=log)
+        graph = OptimizerGraph(opt, opt_stage, counters=total, log=log, allow_frozen=True)
         log(
             f"opt_graph: the optimizer stage is captured after {graph.warmup_steps} "
             f"eager steps and replayed with ONE launch per step; the LR lives in a "
             f"device tensor this loop fills IN PLACE (a host float would be baked at "
             f"capture and freeze the WSD schedule), and zero_grad runs "
             f"set_to_none=False so the captured ops keep their pinned .grad buffers."
+        )
+    def micro_step(x, y, kw, n_micro: int, first: bool):
+        """ONE micro-batch: forward + the DEVICE firewall + backward + the gate.
+
+        The ONE definition of the step body, called by the eager accumulation
+        loop AND recorded verbatim by the `full_graph` capture — two copies of
+        this would be two definitions of "a training step" and would drift
+        (`train/graph.py`'s own rule). Returns `(counters, contribution,
+        grads)`: the HOST counter merge and the loss accumulator stay with the
+        caller, because they are the parts a capture cannot carry.
+        """
+        logits, loss, step_counters = model(x, y, **kw)
+        assert logits.shape[-1] == run.model.vocab, "logits width != vocab"
+        # THE DEVICE FIREWALL (ADR-0018 rule 2). No host read decides this
+        # step: `loss_finite` and the gradient norm stay on the device, the
+        # masked loss makes backward's seed exactly zero, and the resulting
+        # 0-dim 1/0 flag is what every write below is multiplied by. The host
+        # sees the loss and the skip count at the log cadence only.
+        #
+        # `torch.where` on the scalar, not `mask_fill`: on a healthy step the
+        # value AND the gradient are bit-identical to `loss.backward()` (the
+        # where's backward passes the root gradient through unchanged), which
+        # is what keeps a healthy run's sha256 equal to HEAD's.
+        assert loss is not None, "a training step must carry targets"
+        loss_d = loss.detach()
+        loss_finite = torch.isfinite(loss_d).all()
+        step_loss = torch.where(loss_finite, loss, loss_d.new_zeros(()))
+        if n_micro > 1:
+            # The MEAN over micro-batches, not their sum: the accumulated
+            # gradient must be the wide batch's MEAN gradient, which is what
+            # makes `grad_accum=k, batch=b` match `batch=b*k`.
+            step_loss = step_loss / n_micro
+        if step_loss.requires_grad:
+            # A real training loss always does. A model that returns a bare
+            # tensor (the firewall's own NaN fixture) has nothing to backprop
+            # through, which is the old code's skip branch by another route.
+            step_loss.backward()
+        grads = [p.grad for p in model.parameters() if p.grad is not None]
+        # A non-finite GRADIENT disables the step too (the burn 2026-09-27
+        # lesson: a masked loss scalar does not stop a NaN that came from an
+        # ACTIVATION — `NaN * 0` is still NaN through the Jacobian). One vector
+        # norm answers "any" without a host read; the flag is the AND of both.
+        raw_norm = grad_norm(model.parameters())
+        if raw_norm.device != loss_d.device:
+            raw_norm = raw_norm.to(loss_d.device)
+        finite = loss_finite & torch.isfinite(raw_norm)
+        if n_micro > 1:
+            # Sanitize THIS micro-batch's contribution on arrival — a
+            # non-finite activation must not poison the accumulator — and AND
+            # its flag into the group's. If ANY micro fails, the final multiply
+            # below zeroes the earlier contributions too.
+            flag_dev.mul_(finite.to(torch.int32))
+            loss_ok_dev.logical_and_(loss_finite)
+        else:
+            flag_dev.copy_(finite.to(torch.int32))
+            loss_ok_dev.copy_(loss_finite)
+        # Sanitize on the device AND gate: every non-finite gradient becomes 0
+        # (so a moment cannot be poisoned), then every gradient is multiplied
+        # by the flag — `*1.0` is the identity on a healthy step, `*0` makes the
+        # skipped step's direction exactly zero (a masked loss alone does not: a
+        # NaN that came from an ACTIVATION would still be in the Jacobian).
+        gate = finite.to(torch.float32)
+        for g in grads:
+            g.nan_to_num_(0.0, 0.0, 0.0)
+            g.mul_(gate.to(g.dtype))
+        return step_counters, step_loss.detach(), grads
+
+    #: ---- `full_graph`: ONE graph for the whole step --------------------
+    #: `cfg.full_graph` (`train/graph.py::FullGraph`): forward + backward +
+    #: firewall + `zero_grad` + the optimizer stage, captured once and replayed
+    #: with ONE launch per step. The refusals are LOUD and come FIRST, before a
+    #: single step runs, so a config that cannot be captured says so instead of
+    #: silently staying eager.
+    full = None
+    if cfg.full_graph:
+        why = full_graph_refusal(cfg, run.model)
+        if why is not None:
+            loud(f"full_graph: {why}")
+        if dev.type != "cuda":
+            # UP FRONT, not at capture: this arm binds the LR as DEVICE tensors
+            # in its constructor, and a run that is refused only when the first
+            # capture fires has already moved the optimizer's LR arithmetic
+            # (fp32 tensor vs Python float) for every warmup step — i.e. it is a
+            # different program from the eager one it claims to fall back to.
+            loud(
+                f"full_graph on a {dev.type} model: a CUDA graph is a CUDA-only "
+                f"mechanism, and this arm binds the LR as device tensors before the "
+                f"first step, so a late fallback would not be the eager run. Escape: "
+                f"--device cuda, or full_graph=false."
+            )
+        _captured: dict = {}
+
+        def full_body() -> None:
+            """The captured region. A capture EXECUTES it, so a host read here
+            would surface at capture time (and `tests/test_full_graph.py` traps
+            `Tensor.item` to prove the region is clean)."""
+            opt.zero_grad(set_to_none=False)
+            flag_dev.fill_(1)
+            loss_ok_dev.fill_(True)
+            loss_sum = last_loss_dev.new_zeros(())
+            step_counters, contribution, _grads = micro_step(full.x, full.y, {}, 1, True)
+            _captured["counters"] = step_counters
+            loss_sum = loss_sum + contribution
+            torch.where(loss_ok_dev, loss_sum, last_loss_dev, out=last_loss_dev)
+            opt_stage()
+
+        def full_counters() -> None:
+            """Re-merge the counters the forward wrote.
+
+            The forward's arm counters are Python (`Counters.count`), so a
+            replay runs only its DEVICE ops and a COUNTED arm would go silent
+            after the capture step (the same rule as `OptimizerGraph._replay`).
+            Called on EVERY path — the eager warmup and a COUNTED fallback need
+            it just as much, or the arm's counters vanish whenever it is on.
+            """
+            captured = _captured.get("counters")
+            if captured:
+                total.merge(captured)
+                window.merge(captured)
+
+        full = FullGraph(
+            opt,
+            full_body,
+            batch=cfg.batch,
+            seq_len=cfg.seq_len,
+            device=dev,
+            counters=total,
+            log=log,
+            # The trainer's setting: one structurally dead gain
+            # (`loop.residual_scale` under `use_mhc`) must not disable the whole
+            # arm — that refusal is why `opt_graph` measured +0 without ever
+            # capturing. `graph._check_participants` catches the real hazard.
+            allow_frozen=True,
+            on_counters=full_counters,
+        )
+        log(
+            f"full_graph: the WHOLE step (forward + backward + firewall + zero_grad + "
+            f"the optimizer stage) is captured after {full.warmup_steps} eager steps and "
+            f"replayed with ONE launch per step. The inputs live in a static "
+            f"{cfg.batch}x{cfg.seq_len} device buffer this loop fills with `copy_`; the "
+            f"LR is a device tensor filled IN PLACE; every `.grad` is pre-allocated and "
+            f"zeroed in place. Refused arms (grad_accum>1, rand_depth, segment_len, "
+            f"use_byteflow, halt, use_msa, engram_ram, jepa, dspark, act_quant, QAT, EMA) "
+            f"are LOUD before the first step."
         )
     for step in range(start, cfg.steps):
         lr = wsd_lr(
@@ -1034,8 +1435,16 @@ def train(
             # ops read, so it is filled IN PLACE. `group["lr"] = lr` would replace
             # that tensor with a float no replay ever reads again — the silent
             # freeze `dion/cuda_graph.py:70-78` documents. `muon_sf` is refused at
-            # capture (`train/graph.py`), so the Muon group's LR is this value.
+            # capture (`train/graph.py`) and the run falls back to EAGER, but
+            # `set_lr` writes EVERY group, so the Muon group would follow WSD for
+            # the whole run unless the SF LR is written back after it — a silent
+            # non-arm (the 2026-10-21 SF re-run's config carries the battery's
+            # `opt_graph=true`). No capture can read this host float: the refusal
+            # above is the only path an SF run takes.
             graph.set_lr(lr)
+            if opt.muon is not None and cfg.muon_sf:
+                for group in opt.muon.param_groups:
+                    group["lr"] = muon_lr
         else:
             for group in opt.adamw.param_groups:
                 group["lr"] = lr
@@ -1045,18 +1454,18 @@ def train(
 
         # The ANNEALED factor_qat arm: burn-spectral's measured soft-to-hard
         # ramp (`ste_ternary_annealed`, "converges better than hard STE from
-        # step one"). alpha = min(1, step/anneal) is a PURE function of the
-        # step, so a resume lands on the same alpha. `anneal = 0` (default)
-        # leaves every module's constant alpha untouched.
+        # step one"). `anneal_alpha` is a PURE function of the step, so a
+        # resume lands on the same alpha. `anneal = 0` (default) leaves every
+        # module's constant alpha untouched.
         if anneal_steps > 0:
-            model.set_factor_qat_alpha(min(1.0, step / anneal_steps))
+            model.set_factor_qat_alpha(anneal_alpha(step, anneal_steps))
 
-        x, y = stream.next_batch()
-        if device is not None:
-            x, y = x.to(device), y.to(device)
         # The ADAPTIVE DEPTH arm: T is the pure `(seed, step)` sample, and the
         # loss divides by the depth actually run (`model.forward`/`loopblock`).
         # `None` (the default and every other config) keeps the call unchanged.
+        # With `grad_accum > 1` the depth is sampled ONCE per optimizer step and
+        # shared by every micro-batch — the same objective one wide forward
+        # would run, and the reason all micro-batches read the same `step`.
         depth = _sample_depth(cfg.seed, step, run.model.max_iter) if cfg.rand_depth else None
         kw = {} if depth is None else {"depth": depth}
         if cfg.segment_len:
@@ -1068,130 +1477,147 @@ def train(
             # activations, so it needs no segmentation, and leaving it one-shot
             # keeps the held-out number comparable with the record.
             kw["segment_len"] = cfg.segment_len
-        logits, loss, step_counters = model(x, y, **kw)
-        assert logits.shape[-1] == run.model.vocab, "logits width != vocab"
-        total.merge(step_counters)
-        window.merge(step_counters)
-        timer.tick()
-
-        # ONE host read per step, not two (audit MAJOR 4): `float(loss)` and the
-        # finiteness test share a single D2H transfer. The full device-side
-        # firewall (mask on the device, count at log cadence) needs an optimizer
-        # that accepts a device `scale` — the follow-up the audit names — and is
-        # not smuggled in here: the skip semantics below are the burn-proven
-        # ones and must not drift silently.
-        lf = float(loss.detach()) if loss is not None else float("nan")
-        finite = math.isfinite(lf)
-        if parallel is not None:
-            # The NaN decision is the FLEET's, not this rank's: a rank that
-            # skipped backward would never enter the reducer and the peers
-            # would block on a collective that never comes. MIN over the flag;
-            # a rank whose own loss was finite but whose peer's was not has its
-            # lost step COUNTED (`nan_forced_skip`), because that is a real
-            # cost of a peer's divergence and a reader should see it.
-            agreed = parallel.all_finite(finite)
-            if finite and not agreed:
-                total.count("nan_forced_skip")
-                window.count("nan_forced_skip")
-            finite = agreed
-        window_finite.append(finite)
-        if finite:
-            # The graph arm needs STABLE `.grad` buffers: `set_to_none=True` swaps
-            # each `.grad` for a fresh tensor every step, which breaks the buffers
-            # capture pinned (`dion/cuda_graph.py:170-181`). `False` is a no-op for
-            # a param whose grad is still None, so the FIRST backward allocates it
-            # — which is why the wrapper demands at least one eager step.
+        # The graph arm needs STABLE `.grad` buffers: `set_to_none=True` swaps
+        # each `.grad` for a fresh tensor every step, which breaks the buffers
+        # capture pinned (`dion/cuda_graph.py:170-181`). `False` is a no-op for
+        # a param whose grad is still None, so the FIRST backward allocates it
+        # — which is why the wrapper demands at least one eager step.
+        if full is not None:
+            # ---- the CAPTURED step: one replay does all of it --------------
+            # `doc_masking` is refused with `full_graph` in `validate`, so this
+            # read is always the flat one.
+            x, y = stream.next_batch()
+            full.fill(x, y)
+            full.set_lr(lr)
+            full.step()
+        else:
+            # ---- the EAGER step (and `opt_graph`'s stage takeover) ---------
             opt.zero_grad(set_to_none=graph is None)
-            if parallel is None:
-                loss.backward()
-            else:
-                # DDP averages the ranks' gradients; the objective is the mean
-                # over the GLOBAL batch's tokens. Scaling this rank's loss by
-                # `world_size · t_rank / Σt` makes the reducer's division land
-                # on `Σ (t_r/Σt)·g_r` exactly (stage 3's normalization).
-                (loss * parallel.loss_scale).backward()
+            # The group's firewall flag starts healthy and is ANDed by every
+            # micro-batch below (`grad_accum > 1`); a one-micro step overwrites
+            # it exactly as the pre-arm code did.
+            flag_dev.fill_(1)
+            loss_ok_dev.fill_(True)
+            loss_sum = last_loss_dev.new_zeros(())
+            n_micro = cfg.grad_accum
+            for _micro in range(n_micro):
+                if cfg.doc_masking:
+                    # DOCUMENT MASKING (off by default): one document per row
+                    # and a `[b, t]` mask, so padding and cross-document targets
+                    # are not scored. `micro_step` forwards the mask through
+                    # `kw`; the masked CE is a mean over selected positions, so
+                    # a micro-batch with fewer scored bytes contributes less —
+                    # the same semantics one wide masked batch would have.
+                    x, y, loss_mask = stream.next_batch_masked()
+                else:
+                    x, y = stream.next_batch()
+                    loss_mask = None
+                if device is not None:
+                    x, y = x.to(device), y.to(device)
+                    if loss_mask is not None:
+                        loss_mask = loss_mask.to(device)
+                micro_kw = kw if loss_mask is None else {**kw, "loss_mask": loss_mask}
+                step_counters, contribution, grads = micro_step(
+                    x, y, micro_kw, n_micro, _micro == 0
+                )
+                total.merge(step_counters)
+                window.merge(step_counters)
+                loss_sum = loss_sum + contribution
+            if n_micro > 1:
+                # THE GROUP'S DECISION: one multiply, no host branch. Healthy
+                # (`*1`) changes no bit; a single non-finite micro-batch zeroes
+                # the whole accumulated direction, which is the same "skip the
+                # step" the one-micro firewall makes.
+                gate = flag_dev.to(torch.float32)
+                for g in grads:
+                    g.mul_(gate.to(g.dtype))
+            # The last FINITE loss, carried on the DEVICE: the host reads it
+            # when the cadence fires and never before. Same bits as the old
+            # per-step `float(loss.detach())`.
+            torch.where(loss_ok_dev, loss_sum, last_loss_dev, out=last_loss_dev)
             if graph is not None:
                 # ONE launch: the captured stage IS `opt_stage()` (the grad clip
                 # plus the mixed step), and the wrapper redoes the host-side step
-                # counters that a recording cannot carry.
+                # counters a recording cannot carry. A skipped step replays too:
+                # the flag multiplies its writes to zero, which is what makes the
+                # same recording serve both outcomes with no host branch.
                 graph.step()
             else:
                 opt_stage()
-            # The parameters just moved — and a CUDA-graph replay moves them
-            # WITHOUT bumping `_version` (measured 2026-10-19). `_banks` keys its
-            # cache on `_version`, so with `opt_graph = true` the key froze at
-            # capture and the bank served the step-5 build for a whole run
-            # (experts frozen in the forward, drifting in memory, checkpoint
-            # unreproducible — the medbig2/b1night defect). One call per
-            # TRAINING step keeps the cache's real job (one build per step,
-            # reused by the loop's iterations) and nothing more.
-            invalidate_banks_all(model)
-            if opt.counters:
-                # The Muon arms' own counters (ADR-0019): `ns_triton` when the
-                # fused Newton–Schulz chain ran, `ns_triton_fallback` + the reason
-                # when it could not. Merged and CLEARED here, once per step that
-                # runs the optimizer, so the log line's counter field is where a
-                # reader learns which chain ran — and so a NaN-skipped step (which
-                # never reaches this branch) cannot leave a stale count behind.
-                total.merge(opt.counters)
-                window.merge(opt.counters)
-                opt.counters.clear()
-            if cfg.engram_ram:
-                # The host update runs ONCE per TRAINING step, after the
-                # optimizer — never per forward (the loop calls the memory once
-                # per iteration, and `host_step` sums those), and never on a
-                # NaN-skipped step (that branch does not call `opt.step`
-                # either). `rows` counts the rows this step touched; it is a
-                # CPU count already, so the 0-sync rule holds.
-                updates, rows = host_step_all(model, lr)
-                total.count("engram_host_updates", updates)
-                window.count("engram_host_updates", updates)
-                total.count("engram_host_update_rows", rows)
-                window.count("engram_host_update_rows", rows)
-            last_loss = lf
-        else:
-            # Skip the step entirely (a masked loss scalar does not stop NaN
-            # gradients from reaching the weights - the burn bug of
-            # 2026-09-27), COUNTED, and never call any cleanup: the pool went
-            # bad after NaN on the burn stack.
-            nan_skipped += 1
-            total.count("nan_skipped")
-            window.count("nan_skipped")
-            # A skipped step calls NEITHER the stage nor `graph.step()`: the graph
-            # replay advances only on a real optimizer step, exactly as the
-            # optimizer's own step count does (`train/graph.py`).
-            opt.zero_grad(set_to_none=graph is None)
-            # A skipped step never reaches `host_step_all`, so the host-path
-            # leaves it built would sit in `Engram._pending` until the next REAL
-            # step (and their rows be re-deduped there) — growth proportional to
-            # the NaN count, and the burn record has NaN FLOODS (AGENTS §2.3).
-            # Dropped here, once, in the one place that knows the step did not
-            # train. The in-VRAM path never appends, so this is a no-op there.
-            for m in host_engrams(model):
-                m.drop_pending()
+        timer.tick()
+        # COUNTED as a device counter, drained with the window's other counters
+        # at the log cadence (the `Counters.count_device` 0-sync rule). OUTSIDE
+        # any capture: `1 - flag_dev` is a device op on a persistent tensor, and
+        # the flag it reads was written by the replay above.
+        window.count_device("nan_skipped", 1 - flag_dev)
+        total.count_device("nan_skipped", 1 - flag_dev)
+        window_steps += 1
+        if ema is not None:
+            # ONCE per OPTIMIZER STEP (not per micro-batch), after the update
+            # landed. `opt_graph` is legal here because this runs EAGERLY after
+            # the replay, outside the capture.
+            _ema_update(model, ema, cfg.ema_decay, flag_dev)
+        # The parameters just moved — and a CUDA-graph replay moves them
+        # WITHOUT bumping `_version` (measured 2026-10-19). `_banks` keys its
+        # cache on `_version`, so with `opt_graph = true` the key froze at
+        # capture and the bank served the step-5 build for a whole run
+        # (experts frozen in the forward, drifting in memory, checkpoint
+        # unreproducible — the medbig2/b1night defect). One call per
+        # TRAINING step keeps the cache's real job (one build per step,
+        # reused by the loop's iterations) and nothing more. The QAT
+        # projection cache is keyed on the TENSOR, not `_version` (the same
+        # graph-replay trap), so the trainer invalidates it here beside the
+        # banks: one quantize per trained step, reused by every forward.
+        invalidate_banks_all(model)
+        invalidate_qat_cache_all(model)
+        if opt.counters:
+            # The Muon arms' own counters (ADR-0019): `ns_triton` when the
+            # fused Newton–Schulz chain ran, `ns_triton_fallback` + the reason
+            # when it could not. Merged and CLEARED here, once per step that
+            # runs the optimizer, so the log line's counter field is where a
+            # reader learns which chain ran. The clear is what makes the next
+            # step's reading this step's, skipped or not.
+            total.merge(opt.counters)
+            window.merge(opt.counters)
+            opt.counters.clear()
+        if hosts:
+            # The host-table arm, the ONE place the flag reaches the host: this
+            # substrate already copies its row gradients D2H every step, so the
+            # flag rides a read that exists and the table update has to know
+            # `0` (drop the leaves, move nothing) or `1` (the normal update).
+            # `scale=0` is the OLD skip branch exactly. With `grad_accum > 1`
+            # the group's pending leaves are ALL its micro-batches, and this
+            # one call is the old "once per step" contract (the leaves already
+            # carry the 1/k loss scale, so the summed row gradient is the wide
+            # batch's mean).
+            updates, rows = host_step_all(model, lr, _host_scalar(flag_dev))
+            total.count("engram_host_updates", updates)
+            window.count("engram_host_updates", updates)
+            total.count("engram_host_update_rows", rows)
+            window.count("engram_host_update_rows", rows)
 
         if (step + 1) % cfg.log_every == 0:
             # The 0-sync rule: every DEVICE-side counter this window gathered
             # is read NOW, in one batched GPU→CPU transfer, at the declared
-            # cadence — never per pass.
-            window.drain()
+            # cadence — never per pass. The last loss is the one other read,
+            # and it happens here and nowhere else.
+            drained = window.drain()
             total.drain()
-            if window_finite and not any(window_finite):
+            nan_window = int(drained.get("nan_skipped", 0))
+            if window_steps and nan_window >= window_steps:
                 drowning += 1
-            elif window_finite:
+            elif window_steps:
                 drowning = 0
-            window_finite = []
-            if parallel is not None:
-                # The line's loss is the FLEET's (token-weighted mean of the
-                # ranks' local means), reduced at the log cadence on every rank
-                # — a fleet line that printed rank 0's micro-batch loss would be
-                # the eval-window defect in another costume.
-                last_loss = parallel.fleet_loss(last_loss)
+            window_steps = 0
+            nan_skipped = int(total.get("nan_skipped", 0))
+            last_loss = _host_scalar(last_loss_dev)
             parts = [
                 f"step={step + 1}",
                 f"loss={last_loss:.4f}",
                 f"lr={lr:.3e}",
                 kda_field(window),
+                halt_field(model),
+                mtp_field(model),
                 window.line(),
             ]
             # Telemetry reads the interval BEFORE any opt-in timer report —
@@ -1211,18 +1637,17 @@ def train(
             # is the whole fix.
             timer.mark = time.perf_counter()
             rate = (cfg.log_every * tokens_per_step) / interval_s if interval_s > 0 else None
-            if parallel is None or parallel.is_main:
-                log(" ".join(p for p in parts if p))
-                if sink is not None:
-                    _row(
-                        event="log",
-                        step=step + 1,
-                        loss=last_loss,
-                        lr=lr,
-                        tokens_per_s=rate,
-                        counters=dict(window),
-                        nan_skipped=nan_skipped,
-                    )
+            log(" ".join(p for p in parts if p))
+            if sink is not None:
+                _row(
+                    event="log",
+                    step=step + 1,
+                    loss=last_loss,
+                    lr=lr,
+                    tokens_per_s=rate,
+                    counters=dict(window),
+                    nan_skipped=nan_skipped,
+                )
             window = Counters()
             if drowning >= 2:
                 raise LoudError(
@@ -1239,70 +1664,41 @@ def train(
             # SF: the held-out number must be scored on the RETURNED iterate X,
             # not on the gradient-evaluation point Y (Alg 1 line 18 / the
             # reference's `eval()`); the params go back to Y for the next step.
-            # A fleet evaluates on rank 0 only (`dist=r/P` on the line): its
-            # window is the rank's micro-batch, printed, and the other ranks
-            # wait at the next step's collective.
-            if parallel is None or parallel.is_main:
-                sf("eval")
+            sf("eval")
+            with _shadow_params(model, ema):
                 line, ev, scored = _eval_line(
-                    model,
-                    eval_stream,
-                    cfg,
-                    run.model.max_iter,
-                    device,
-                    step + 1,
-                    batch=batch,
-                    seq_len=seq_len,
-                    parallel=parallel,
+                    model, eval_stream, cfg, run.model.max_iter, device, step + 1
                 )
-                sf("train")
-                log(line)
-                if sink is not None:
-                    _row(event="eval", step=step + 1, loss=ev, bpb=bpb(ev), scored=scored)
+            sf("train")
+            log(line)
+            if sink is not None:
+                _row(event="eval", step=step + 1, loss=ev, bpb=bpb(ev), scored=scored)
 
-        if (step + 1) % cfg.ckpt_every == 0 and (parallel is None or parallel.is_main):
+        if (step + 1) % cfg.ckpt_every == 0:
             # A checkpoint is the model a reader would serve, so it is written
             # at X too — and on a resume the model half plus the optimizer's own
             # `x` are the same iterate, which is what makes the switch back to Y
-            # an absolute, double-lerp-free write. ONE writer (rank 0) and the
-            # UNWRAPPED module: DDP prefixes every state-dict key with `module.`.
+            # an absolute, double-lerp-free write.
             sf("eval")
-            # A fresh tally per save: the checkpoint line names a file's own
-            # zeroed blocks, not a run-cumulative number a reader cannot tie to
-            # the file (`save_ckpt`'s `counters`).
-            ck_counts = Counters()
-            weights, snapshot = save_ckpt(
-                run,
-                parallel.raw(model) if parallel is not None else model,
-                opt,
-                step,
-                counters=ck_counts,
-            )
+            weights, snapshot = save_ckpt(run, model, opt, step, ema=ema)
             sf("train")
-            ck_line = f"ckpt step={step + 1} -> {weights} ({snapshot})"
-            if ck_counts:
-                total.merge(ck_counts)
-                ck_line += " " + ck_counts.line()
-            log(ck_line)
+            log(f"ckpt step={step + 1} -> {weights} ({snapshot})")
 
-    if (
-        cfg.eval
-        and eval_stream is not None
-        and cfg.steps % cfg.eval_every != 0
-        and (parallel is None or parallel.is_main)
-    ):
+    # The report is a declared cadence: drain whatever the last (partial)
+    # window gathered, and read the last finite loss. Both are host reads, and
+    # both happen HERE — never inside a step.
+    total.drain()
+    nan_skipped = int(total.get("nan_skipped", 0))
+    last_loss = _host_scalar(last_loss_dev)
+    doc_counts = stream.doc_counts() if cfg.doc_masking else {}
+    if cfg.doc_masking:
+        log(f"doc_masking: {doc_counts}")
+    if cfg.eval and eval_stream is not None and cfg.steps % cfg.eval_every != 0:
         sf("eval")
-        line, _ev, _scored = _eval_line(
-            model,
-            eval_stream,
-            cfg,
-            run.model.max_iter,
-            device,
-            cfg.steps,
-            batch=batch,
-            seq_len=seq_len,
-            parallel=parallel,
-        )
+        with _shadow_params(model, ema):
+            line, _ev, _scored = _eval_line(
+                model, eval_stream, cfg, run.model.max_iter, device, cfg.steps
+            )
         sf("train")
         log(line)
     return {
@@ -1311,7 +1707,10 @@ def train(
         "nan_skipped": nan_skipped,
         "counters": total,
         "opt_steps": opt.steps,
-        "eval_window_bytes": cfg.eval_batches * batch * seq_len,
-        "rank": parallel.rank if parallel is not None else 0,
-        "world_size": parallel.world_size if parallel is not None else 1,
+        # The shadow this run trained (`None` at `ema_decay=0`). A test and a
+        # post-mortem read the same tensor dict the checkpoint writes; it is a
+        # declared report value, not a hot-path export.
+        "ema": ema,
+        "eval_window_bytes": eval_window_bytes(cfg),
+        "doc_counts": doc_counts,
     }

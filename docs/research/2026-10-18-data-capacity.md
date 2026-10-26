@@ -36,9 +36,9 @@ from our own docs or logs it is cited as such.
 
 | preset | params | geometry (config) | notes |
 |---|---|---|---|
-| `small` | 9 476 993 (port; burn 9 197 390) | d768 · E=3 dense blend (topk 0) · engram 25k rows/order | the A/B polygon (`port/configs/small.toml`) |
+| `small` | 9 476 993 (port; burn 9 197 390) | d768 · E=3 dense blend (topk 0) · engram 25k rows/order | the A/B polygon (`configs/small.toml`) |
 | `medium` | 138 435 969 (`medbig2`) / 141 910 405 (`med1`) | d1024 · E=256 topk 2 · rank 64 · d_ffn 2730 · engram 524 288 rows/order | two nets: `med1.config.toml` has `use_msa = true`; `medbig2`'s log has no `msa_*` counters |
-| `b1` | 1 066 358 209 | d2048 · E=1024 topk 2 · rank 64 · d_ffn 5461 · engram 4M rows/order | `port/configs/b1.toml`; active set ≈ 37.9M/iteration (config comment, derived not measured) |
+| `b1` | 1 066 358 209 | d2048 · E=1024 topk 2 · rank 64 · d_ffn 5461 · engram 4M rows/order | `configs/b1.toml`; active set ≈ 37.9M/iteration (config comment, derived not measured) |
 
 **Corpus:** 19.7 GB DCLM-filtered English (`AGENTS.md` §2.6); code/math/RU slices being
 added. **Epoch cap 4** (MoE degradation, `docs/research/2026-10-16-data-mixing.md`, sourced
@@ -220,7 +220,7 @@ The b1 point (§4.5) is last, and only conditionally.
   MobileLLM 1T (2402.14905), Hunyuan-0.5B **no token count published** (GitHub).
 - Our data points, windows and param counts: `~/logs/medium_long.log`, `~/logs/medbig2.jsonl`,
   `~/logs/b1first*.log`, `~/logs/overnight1.log`; `port/checkpoints/medium/med1.config.toml`;
-  `port/configs/{small,medium,b1}.toml`; `AGENTS.md` §2.6.
+  `configs/{small,medium,b1}.toml`; `AGENTS.md` §2.6.
 - The b1 log timestamps imply ≈7.5 kB/s while `overnight1.jsonl` logs 3.3–3.8 kB/s — the
   discrepancy is contention (AGENTS §1.5), reported, not resolved.
 

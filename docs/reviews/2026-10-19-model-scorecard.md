@@ -2,7 +2,7 @@
 
 **2026-10-19.** Written from the record on disk: training logs in `~/logs/`,
 checkpoints + config snapshots in `/home/sehaxe/dormouse/port/checkpoints/`,
-presets in `port/configs/`, this repo's `docs/`. Every number names its source;
+presets in `configs/`, this repo's `docs/`. Every number names its source;
 anything not verifiable from a file or a primary external source is marked
 **unverified**. This is a snapshot of a live project: `sw1_long` is training
 right now, `mix1_long` is stopped at ~84.8k of 260k steps, and the b1 run
@@ -18,19 +18,19 @@ Four presets exist; two have real training behind them at the sizes that matter.
 
 | preset | stored params | geometry | vocab / context | iterations | experts | Engram | pinned by |
 |---|---|---:|---|---:|---|---|---|
-| `b1` | **1,066,358,209** | d 2048 · H 32×64 · d_ffn 5461 · rank 64 | 256 / 2048 | 4 | 1024 routed, topk 2 + shared rank 192 | 3 orders × 4,194,304 rows × dim 32 = **402,653,184 rows** | `port/tests/test_param_count.py:23`; hand-sum in `port/configs/b1.toml`; banner in `~/logs/b1first.log:3` |
-| `medium` | **141,910,405** (MSA on, `med1`) / **138,435,969** (MSA off, `medbig2`/`mix1`) | d 1024 · H 16×64 · d_ffn 2730 · rank 64 | 256 / 1024 | 3–4 | 256 routed, topk 2 + shared rank 192 | 524,288 rows/order | `port/tests/test_param_count.py:172`; banners in `medium_run.log`, `medbig2.log`, `mix1.log`; the +3.47M is the MSA arm (`docs/research/2026-10-18-data-capacity.md` §1) |
-| `small` | **9,476,993** (port; burn's own was 9,197,390, +3.0% structural) | d 768 · H 12×64 · d_ffn 2048 · rank 64 | 256 / 512 | 4 | 3 experts, **dense blend** (`moe_topk=0`) + shared rank 192 | 25,000 rows/order | `port/tests/test_param_count.py:22`; `port/configs/small.toml` |
-| `small_wide` | **68,850,949** | small's body (d 768, rank 64, 25k rows/order) with medium's bank: 256 routed, topk 2 | 256 / 512 | 4 | 256 routed, topk 2 + shared rank 192 | 25,000 rows/order | banner in `~/logs/sw1_long.log:2`; `port/configs/small_wide.toml` (untracked in the canonical repo) |
+| `b1` | **1,066,358,209** | d 2048 · H 32×64 · d_ffn 5461 · rank 64 | 256 / 2048 | 4 | 1024 routed, topk 2 + shared rank 192 | 3 orders × 4,194,304 rows × dim 32 = **402,653,184 rows** | `tests/test_param_count.py:23`; hand-sum in `configs/b1.toml`; banner in `~/logs/b1first.log:3` |
+| `medium` | **141,910,405** (MSA on, `med1`) / **138,435,969** (MSA off, `medbig2`/`mix1`) | d 1024 · H 16×64 · d_ffn 2730 · rank 64 | 256 / 1024 | 3–4 | 256 routed, topk 2 + shared rank 192 | 524,288 rows/order | `tests/test_param_count.py:172`; banners in `medium_run.log`, `medbig2.log`, `mix1.log`; the +3.47M is the MSA arm (`docs/research/2026-10-18-data-capacity.md` §1) |
+| `small` | **9,476,993** (port; burn's own was 9,197,390, +3.0% structural) | d 768 · H 12×64 · d_ffn 2048 · rank 64 | 256 / 512 | 4 | 3 experts, **dense blend** (`moe_topk=0`) + shared rank 192 | 25,000 rows/order | `tests/test_param_count.py:22`; `configs/small.toml` |
+| `small_wide` | **68,850,949** | small's body (d 768, rank 64, 25k rows/order) with medium's bank: 256 routed, topk 2 | 256 / 512 | 4 | 256 routed, topk 2 + shared rank 192 | 25,000 rows/order | banner in `~/logs/sw1_long.log:2`; `configs/small_wide.toml` (untracked in the canonical repo) |
 
 **Stored** is the checkpoint: at b1, 402.65M of the 1.066B (37.8%) are Engram
 lookup rows, 626.46M are routed-expert factors (U·diag(s)·Vᵀ, rank 64), and only
 ~37M are the dense per-token machinery (KDA 16.8M, shared write 11.2M, mem 4.2M,
-shared expert 1.8M, router 2.1M, controller/out/head the rest) — `port/configs/b1.toml`
+shared expert 1.8M, router 2.1M, controller/out/head the rest) — `configs/b1.toml`
 "PARAM COUNT" block.
 
 **Active-compute per byte** at b1 is the touched-parameter set: **~37.9M per
-iteration** (`port/configs/b1.toml`, "the touched parameter set is ~37.9M per
+iteration** (`configs/b1.toml`, "the touched parameter set is ~37.9M per
 iteration", derived not measured). The readiness plan's number is **~57M active
 per token** and its own note says the two may not be the same quantity
 (`docs/decisions/2026-10-15-1b-readiness-plan.md:82-83`). medium's touched set
@@ -59,7 +59,7 @@ with identical greedy bytes.
 ## 2. Every measured BPB, with its window
 
 A BPB is only a number with its window. The window is `eval_batches × batch ×
-seq_len` bytes (`port/src/dormouse/train/loop.py`, printed on every eval line).
+seq_len` bytes (`src/dormouse/train/loop.py`, printed on every eval line).
 
 | run (checkpoint) | params | geometry | data → eval file | window | steps |
 |---|---:|---|---|---|---:|
@@ -136,7 +136,7 @@ seed, and the curve does not monotonically improve on downstream MC.**
 the same device` in the bench gather) — no medbig2 bench numbers exist. No bench
 has been run on b1, medium, small_wide, or small.
 
-**Protocol** (`port/src/dormouse/bench/{tasks,score,runner}.py`): byte-level MC,
+**Protocol** (`src/dormouse/bench/{tasks,score,runner}.py`): byte-level MC,
 no tokenizer. Each choice is scored by one teacher-forced forward on
 `context + choice`; score = Σ log p(byte) over the choice. `acc_raw` picks
 argmax of that sum (rewards short choices); `acc_mean` picks argmax of the
@@ -205,12 +205,12 @@ more than the **control's own seed spread**; a tie deletes it (AGENTS.md §1.2).
 | **ternary weights from scratch** | none 3.0540 → annealed 3.0936 / constant 3.1036 / binary 3.1414 | **+0.0396 / +0.0497 / +0.0874** | **REJECTED for training**; QAT belongs to post-base finetuning | `ab_qat_*.jsonl` |
 | **ns_steps 5 vs 3** | ns5 3.0555 → ns3 3.0613 | +0.0058 | **5 kept** (the cheaper arm loses) | `ab_ns_*.jsonl` |
 | **KDA recompute flag** | false vs true, same loss within noise (2.8037 vs 2.7954 at step 150) | tie | **default false kept**; `true` costs +960 MiB peak (13,164 vs 12,204 MiB) | `ab_kda_rec*.log` |
-| **Gram-NS** (optimizer) | — | **1.2–1.4× slower** here (hands back *more* calls, not fewer) | **stays off**; `ns_kind="triton"` won instead (below) | `docs/research/2026-10-17-muon-variants.md`; `port/src/dormouse/train/ns_kernels.py` docstring |
+| **Gram-NS** (optimizer) | — | **1.2–1.4× slower** here (hands back *more* calls, not fewer) | **stays off**; `ns_kind="triton"` won instead (below) | `docs/research/2026-10-17-muon-variants.md`; `src/dormouse/train/ns_kernels.py` docstring |
 | **Triton Newton–Schulz** | classic 68.1 ms/step → triton 18.6 ms/step for medium's Muon group (848 → 408 kernels; a b1-shape factor: 52 dispatches → 1 launch) | 3.7× faster optimizer stage | **ADMITTED** (`ns_kind=triton` in the live runs) | `fix2_bench_ns_triton.log` |
 | **optimizer CUDA graph** | — | **≈ −12 ms/step** ("the measured opt-stage capture gave −12 ms/step"; README says −11.7) | **ADMITTED** (`opt_graph=true`) | `docs/research/2026-10-18-throughput-leftovers.md:138`; README |
 | **dropless routing** | cap 2.0 dropped **77%** of b1 assignments at step 1 (cap 32: 12.5%); Triton grouped GEMM fwd 16.5 ms vs naive 626 ms | 37.9× kernel, 0% drops | **ADMITTED** (`moe_capacity=0`, `moe_kernel=triton`) | `docs/reviews/2026-10-17-port-audit.md` CRITICAL 3; `bench_dropless.log` |
-| **bf16 Muon momentum** | — | **−1.23 GiB** (README figure; the exact log was not located this session) | **ADMITTED** (`muon_state_dtype=bf16` in medbig2/mix1/sw1) | README; `port/src/dormouse/train/optim.py:36` |
-| **Engram host RAM** | — | bit-identical to the in-VRAM forward (`torch.equal` on logits and loss) | **ADMITTED** (`engram_ram=true`) | `port/tests/test_engram_host.py:39-65` |
+| **bf16 Muon momentum** | — | **−1.23 GiB** (README figure; the exact log was not located this session) | **ADMITTED** (`muon_state_dtype=bf16` in medbig2/mix1/sw1) | README; `src/dormouse/train/optim.py:36` |
+| **Engram host RAM** | — | bit-identical to the in-VRAM forward (`torch.equal` on logits and loss) | **ADMITTED** (`engram_ram=true`) | `tests/test_engram_host.py:39-65` |
 
 Not in the ledger because they are not port-lane measurements: the burn-lane A/B
 verdicts (JEPA+KoLeo 3/3 seeds, AttnRes, mHC, GR, MoE-dev…) — the burn rulebook

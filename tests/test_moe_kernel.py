@@ -58,7 +58,8 @@ DEV = "cuda"
 
 
 def _moe(**over) -> SparseMoE:
-    cfg = tiny_cfg(n_experts=4, moe_topk=2, rank=8, d_model=64, d_ffn=128, **over)
+    over.setdefault("rank", 8)
+    cfg = tiny_cfg(n_experts=4, moe_topk=2, d_model=64, d_ffn=128, **over)
     return SparseMoE(cfg, device=DEV)
 
 
@@ -402,6 +403,419 @@ def test_dispatch_counts_the_triton_fallback_on_cpu():
 
 
 # --------------------------------------------------------------------------
+# the GLU scale loads: masked at every rank, and a NaN tail must not leak
+# --------------------------------------------------------------------------
+
+#: Every rank the port can route: r=1..64, power-of-two and not. `RP` is 16 for
+#: r < 16 and `next_pow2(r)` above, so these are the two shapes of the bug.
+RANKS = [1, 2, 3, 5, 7, 8, 15, 16, 17, 24, 64]
+
+
+@CUDA
+@pytest.mark.parametrize("rank", RANKS)
+def test_the_glu_scales_are_masked_and_a_nan_tail_cannot_reach_y(rank, monkeypatch):
+    """`gate_s`/`up_s` read exactly `r` floats — the OOB read is gone.
+
+    `_glu_kernel` loads `[E, r]` rows with `tl.arange(0, RP)`; without the mask
+    every `RP > r` load reads the next row and, on the last expert, past the
+    tensor. The fixture puts `gate_s`/`up_s` in a flat buffer whose tail is NaN.
+    The OUTPUT half asserts the padded arm's numbers and finite values; the
+    SOURCE half is the falsifier: on Triton 3.7.1 the compiler drops the unused
+    lanes (rank 1's PTX has no live load past `r`), so removing the mask happens
+    to leave the output finite — measured on the scratch revert, which is why the
+    assertion on the shipped source line is here too. A future Triton that keeps
+    the lanes live fails the OUTPUT half; the mask is correct either way.
+    """
+    if mk is None:
+        pytest.skip("no triton in this build")
+    src = mk._glu_kernel.src
+    assert "gs = tl.load(gs_ptr + e * R_ + rr, mask=r_mask, other=0.0)" in src
+    assert "us = tl.load(us_ptr + e * R_ + rr, mask=r_mask, other=0.0)" in src
+    torch.manual_seed(rank)
+    moe = _moe(bf16=True, moe_capacity=1.0, moe_kernel="triton", rank=rank)
+    n, k = 64, 2
+    index = torch.stack(
+        [
+            torch.arange(n, device=DEV) % moe.n_experts,
+            (torch.arange(n, device=DEV) + 1) % moe.n_experts,
+        ],
+        dim=1,
+    )
+    weight = torch.full((n, k), 1.0 / k, dtype=torch.bfloat16, device=DEV)
+    x = torch.randn(n, moe.d, device=DEV)
+    order, keep, _dropped = moe._permute(index)
+
+    real_banks = moe._banks
+
+    def nan_tail_banks(dt):
+        gu, uu, v, gs, us = real_banks(dt)
+
+        def tail(t):
+            flat = torch.full((t.numel() + 64,), float("nan"), dtype=t.dtype, device=t.device)
+            flat[: t.numel()] = t.reshape(-1)
+            return flat[: t.numel()].view(t.shape)
+
+        return gu, uu, v, tail(gs), tail(us)
+
+    monkeypatch.setattr(moe, "_banks", nan_tail_banks)
+    with torch.no_grad():
+        padded = moe._padded_dispatch(x, weight, index, order, keep)
+        got = moe._triton_dispatch(x, weight, index, order, keep)
+    finite = bool(torch.isfinite(got).all())
+    rel = _rel(got, padded) if finite else float("nan")
+    print(f"[glu mask] rank={rank} RP={mk._rp(rank)} finite={finite} rel={rel:.3e}")
+    assert finite, f"rank={rank}: a NaN from the unmasked scale tail reached the output"
+    assert rel <= 2e-3, f"rank={rank}: {rel:.3e} vs the padded arm"
+
+
+@CUDA
+def test_a_refused_launch_is_counted_and_returns_the_torch_reference(monkeypatch):
+    """`OutOfResources` is a COUNTED fallback (with the bytes), never a traceback.
+
+    The proxy refuses on the GLU launch, which is the first kernel in the split
+    arm. The public entry point must count `moe_triton_fallback` and return the
+    torch reference — the same math, so the fallback is still a training step.
+    """
+    if mk is None:
+        pytest.skip("no triton in this build")
+    from triton.runtime.errors import OutOfResources
+
+    from dormouse.instrument import Counters
+
+    class _Refusing:
+        def __getitem__(self, grid):
+            def run(*a, **k):
+                raise OutOfResources(999999, mk.SMEM_CEILING_BYTES, "shared memory")
+
+            return run
+
+    monkeypatch.setattr(mk, "_glu_kernel", _Refusing())
+    torch.manual_seed(4)
+    e, d, r, f = 3, 32, 8, 48
+    counts = torch.tensor([2, 3, 1], dtype=torch.int32, device=DEV)
+    offs = torch.zeros(e + 1, dtype=torch.int32, device=DEV)
+    offs[1:] = torch.cumsum(counts, 0)
+    rows = int(counts.sum())
+    xg = torch.randn(rows, d, device=DEV)
+    gu = torch.randn(e, d, r, device=DEV)
+    uu = torch.randn(e, d, r, device=DEV)
+    gs = torch.randn(e, r, device=DEV) * 0.1 + 1.0
+    us = torch.randn(e, r, device=DEV) * 0.1 + 1.0
+    v = torch.randn(e, r, f, device=DEV)
+    counters = Counters()
+    got = mk.expert_gemm_glu(xg, gu, uu, gs, us, v, offs, cap=int(counts.max()), counters=counters)
+    ref = torch.zeros(rows, f, device=DEV)
+    for i in range(e):
+        s, t = int(offs[i]), int(offs[i + 1])
+        if t > s:
+            g = (xg[s:t] @ gu[i]) * gs[i]
+            u = (xg[s:t] @ uu[i]) * us[i]
+            ref[s:t] = (F.silu(g) * u) @ v[i]
+    print(f"[launch refusal] {counters.line()} why={counters.why}")
+    assert counters["moe_triton_fallback"] == 1, dict(counters)
+    assert "999999" in counters.why and str(mk.SMEM_CEILING_BYTES) in counters.why, counters.why
+    assert torch.isfinite(got).all()
+    assert _rel(got, ref) <= 1e-5, _rel(got, ref)
+
+
+@CUDA
+def test_a_previously_refused_adjoint_tile_launches():
+    """BLOCK_N=256 was refused by the old arithmetic; it launches and computes.
+
+    The pair kernel with `t_wide` at 256 measures 40960 B and fits. This runs the
+    REAL adjoint at that tile and compares it to the default-tile reference, so
+    the guard's new "allowed" is a launch, not a compile-only claim.
+    """
+    if mk is None:
+        pytest.skip("no triton in this build")
+    assert mk.tile_reason(
+        torch.bfloat16, 32, 64, 8, tiles=dict(mk.TILES, BLOCK_N=256)
+    ) is None, "the guard must allow the measured 256 tile"
+    torch.manual_seed(3)
+    e, d, r, f = 5, 24, 8, 32
+    counts = torch.tensor([0, 3, 7, 2, 6], dtype=torch.int32, device=DEV)
+    rows = int(counts.sum())
+    offs = torch.zeros(e + 1, dtype=torch.int32, device=DEV)
+    offs[1:] = torch.cumsum(counts, 0)
+    seg = torch.repeat_interleave(torch.arange(e, device=DEV), counts.to(torch.int64)).to(
+        torch.int32
+    )
+    xg = torch.randn(rows, d, device=DEV)
+    gu = torch.randn(e, d, r, device=DEV) / d**0.5
+    uu = torch.randn(e, d, r, device=DEV) / d**0.5
+    gs = torch.randn(e, r, device=DEV) * 0.1 + 1.0
+    us = torch.randn(e, r, device=DEV) * 0.1 + 1.0
+    v = torch.randn(e, r, f, device=DEV) / r**0.5
+    gpre, upre = torch.randn(rows, r, device=DEV), torch.randn(rows, r, device=DEV)
+    h = torch.randn(rows, r, device=DEV)
+    dy = torch.randn(rows, f, device=DEV)
+    cap = int(counts.max())
+    base = (xg, gu, uu, gs, us, v, offs, cap, gpre, upre, h, dy)
+    ref = mk._glu_backward(*base, mk.TILES)
+    got = mk._glu_backward_fused(*base, dict(mk.TILES, BLOCK_N=256), seg, mk.BwdWorkspace())
+    names = ("dx", "dgate_u", "dup_u", "dgate_s", "dup_s", "dv")
+    per = {n: _relz(a, b) for n, a, b in zip(names, got, ref, strict=True)}
+    print(f"[256 adjoint] worst rel={max(per.values()):.3e} ({max(per, key=per.get)})")
+    assert max(per.values()) <= 1e-5, per
+
+
+@CUDA
+def test_a_refused_backward_launch_falls_back_counted(monkeypatch):
+    """The adjoint's own refusal runs the torch reference, counted and equal.
+
+    The forward's tiles fit; `_grouped_nt_pair` is the launch the old arithmetic
+    refused. Patch it to raise and assert the backward still produces the same
+    gradients (the reference chain, same op order) with `moe_triton_fallback`.
+    """
+    if mk is None:
+        pytest.skip("no triton in this build")
+    from triton.runtime.errors import OutOfResources
+
+    from dormouse.instrument import Counters
+
+    class _Refusing:
+        def __getitem__(self, grid):
+            def run(*a, **k):
+                raise OutOfResources(999999, mk.SMEM_CEILING_BYTES, "shared memory")
+
+            return run
+
+    torch.manual_seed(6)
+    moe = _moe(bf16=False, moe_capacity=1.0, moe_kernel="triton")
+    x = torch.randn(64, moe.d, device=DEV)
+    index, weight = _routing(moe, x)
+    order, keep, _dropped = moe._permute(index)
+    dt = moe._bank_dtype()
+    gu, uu, v, gs, us = (t.detach().clone().requires_grad_(True) for t in moe._banks(dt))
+    rows = order[keep]
+    owner = rows // index.shape[1]
+    xg = moe._gather_rows(x, owner, dt).detach().clone().requires_grad_(True)
+    counts = torch.bincount(
+        index.reshape(-1)[rows], minlength=moe.n_experts
+    ).to(torch.int32)
+    offs = torch.zeros(moe.n_experts + 1, dtype=torch.int32, device=DEV)
+    offs[1:] = torch.cumsum(counts, 0)
+    cap = moe._capacity(*index.shape)
+
+    def run(counters=None):
+        tensors = [xg, gu, uu, gs, us, v]
+        for t in tensors:
+            t.grad = None
+        out = mk.expert_gemm_glu(*tensors, offs, cap=cap, counters=counters)
+        out.float().pow(2).mean().backward()
+        return out.detach(), [t.grad.detach().clone() for t in tensors]
+
+    ref_out, ref_grads = run()
+    monkeypatch.setattr(mk, "_grouped_gemm_pair_kernel", _Refusing())
+    counters = Counters()
+    got_out, got_grads = run(counters)
+    print(f"[bwd refusal] {counters.line()} why={counters.why}")
+    assert counters["moe_triton_fallback"] == 1, dict(counters)
+    assert "999999" in counters.why and str(mk.SMEM_CEILING_BYTES) in counters.why, counters.why
+    assert torch.equal(got_out, ref_out), "the forward moved under a backward refusal"
+    worst = max(float((a - b).abs().max()) for a, b in zip(got_grads, ref_grads, strict=True))
+    assert worst <= 1e-5, worst
+
+
+# --------------------------------------------------------------------------
+# the fp32 tile — the ByteFlow arm must not fall back to the naive loop
+# --------------------------------------------------------------------------
+
+#: The ByteFlow channel's loop shape (`/tmp/opencode/profile_bf.py`, 2026-10-21):
+#: `medium`'s d=1024 / f=2730 and rank 64, with the b4 x T512 window compressed
+#: to K=128 patch positions (the loop's 512 rows, topk 2 -> 1024 routed rows).
+BYTEFLOW = dict(d_model=1024, d_ff=2730, rank=64)
+
+
+def test_fp32_tiles_halve_and_fit_under_the_shared_memory_ceiling():
+    """Gate (a): 4-byte elements halve the wide tiles and the measured estimate fits.
+
+    Shared memory is bytes, so `BLOCK_N`/`BLOCK_F` halve at fp32. The measured
+    pair at BM=64 BK=64 BN=64 stages=1 is **32768 B** (`metadata.shared`); the old
+    arithmetic model said 65536 from a two-stage/two-pair multiplication that no
+    compile produced.
+    """
+    if mk is None:
+        pytest.skip("no triton in this build")
+    t = mk.tiles_for(torch.float32, **BYTEFLOW)
+    assert t["BLOCK_N"] == mk.TILES["BLOCK_N"] // 2 == 64
+    assert t["BLOCK_F"] == mk.TILES["BLOCK_F"] // 2 == 64
+    for name in ("BLOCK_M", "BLOCK_K", "BLOCK_T"):
+        assert t[name] == mk.TILES[name], f"{name} must not move at fp32"
+    n = mk.smem_estimate(t, torch.float32, BYTEFLOW["rank"])
+    print(f"[fp32 tile] {t} est={n} B <= {mk.SMEM_CEILING_BYTES} B")
+    assert n == 32768, "the measured halved pair tile at one stage is 32768 B"
+    assert n <= mk.SMEM_CEILING_BYTES
+    assert mk.tile_reason(torch.float32, **BYTEFLOW) is None, "fp32 must not fall back"
+
+
+def test_bf16_tiles_and_their_estimate_do_not_move():
+    """Gate (d): the two-byte path keeps every number it shipped.
+
+    Same dict, same estimate, and no explicit `num_stages` at the launch (Triton's
+    own default is what the bf16 numbers on record were taken with). The measured
+    shared memory at the shipped tile is **24576 B**, not the old model's 98304.
+    """
+    if mk is None:
+        pytest.skip("no triton in this build")
+    for dtype in (torch.bfloat16, torch.float16):
+        assert mk.tiles_for(dtype, **BYTEFLOW) == mk.TILES
+        assert mk._launch_stages(dtype) == {}
+    n = mk.smem_estimate(mk.TILES, torch.bfloat16, BYTEFLOW["rank"])
+    print(f"[bf16 tile] {mk.TILES} est={n} B <= {mk.SMEM_CEILING_BYTES} B")
+    assert n == 24576, "the measured bf16 pair tile is 24576 B"
+    assert n <= mk.SMEM_CEILING_BYTES
+    assert mk._launch_stages(torch.float32) == {"num_stages": 1}
+
+
+def _compiled_shared(fn, signature, constexprs: dict, warps: int) -> int:
+    """`metadata.shared` for one host-side compile (ptxas; no device, no launch)."""
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler import ASTSource
+    from triton.compiler import compile as tcompile
+
+    if torch.cuda.is_available():
+        major, minor = torch.cuda.get_device_capability()
+        arch = major * 10 + minor
+    else:
+        arch = 120  # this box's card; a compile-only gate does not need the device
+    src = ASTSource(fn, signature=signature, constexprs=constexprs)
+    compiled = tcompile(
+        src, target=GPUTarget("cuda", arch, 32), options={"num_warps": warps}
+    )
+    return int(compiled.metadata.shared)
+
+
+def test_a_tile_the_compiled_device_can_hold_is_not_refused():
+    """The measured table, and the tiles the old arithmetic wrongly refused.
+
+    Reproduces the calibration the docstring names: compile the REAL pair kernel
+    with `ASTSource`, read `metadata.shared`, and assert (a) the estimate equals
+    it, (b) the tile fits, and (c) `tile_reason` does not refuse it. On revert to
+    `2 stages * 2 pairs` this is red for BN=256 and 512 — the two tiles the
+    guard used to reject while the compiled device held them.
+    """
+    if mk is None:
+        pytest.skip("no triton in this build")
+    sig = _sig(
+        "a1_ptr:*bf16 w1_ptr:*bf16 a2_ptr:*bf16 w2_ptr:*bf16 o_ptr:*bf16 offs_ptr:*i32 "
+        "N:i32 K:i32 sam:i32 sak:i32 swe:i32 swk:i32 swn:i32 som:i32 son:i32 "
+        "BLOCK_M:constexpr BLOCK_N:constexpr BLOCK_K:constexpr PREC:constexpr"
+    )
+    print(f"{'tile':>16} {'measured':>9} {'estimate':>9} {'fits':>5} {'allowed':>8}")
+    for bn in (64, 128, 256, 512):
+        tiles = dict(mk.TILES, BLOCK_N=bn)
+        measured = _compiled_shared(
+            mk._grouped_gemm_pair_kernel,
+            sig,
+            dict(BLOCK_M=64, BLOCK_N=bn, BLOCK_K=64, PREC="tf32"),
+            8,
+        )
+        est = mk.smem_estimate(tiles, torch.bfloat16, BYTEFLOW["rank"])
+        allowed = mk.tile_reason(torch.bfloat16, **BYTEFLOW, tiles={"BLOCK_N": bn}) is None
+        print(
+            f"{'BN=' + str(bn):>16} {measured:>9} {est:>9} "
+            f"{str(measured <= mk.SMEM_CEILING_BYTES):>5} {str(allowed):>8}"
+        )
+        assert measured <= est, f"BN={bn}: estimate {est} is BELOW the measured {measured}"
+        if bn >= 128:
+            # At BN>=128 the pair is the family's widest consumer; at 64 the GLU
+            # is (24576 B), so the pair is smaller than the max there.
+            assert measured == est, f"BN={bn}: estimate {est} != measured {measured}"
+        assert measured <= mk.SMEM_CEILING_BYTES, f"BN={bn} does not fit this compile"
+        assert allowed, f"BN={bn} fits ({measured} B) but the guard refused it"
+    # At the shipped tile the GLU is the family max: measure it and pin 24576.
+    sig_glu = _sig(
+        "x_ptr:*bf16 gu_ptr:*bf16 uu_ptr:*bf16 gs_ptr:*bf16 us_ptr:*bf16 v_ptr:*bf16 "
+        "y_ptr:*bf16 offs_ptr:*i32 gpre_ptr:*fp32 upre_ptr:*fp32 h_ptr:*bf16 "
+        "D:i32 R_:i32 F_:i32 BLOCK_M:constexpr BLOCK_K:constexpr BLOCK_F:constexpr "
+        "RP:constexpr PREC:constexpr SAVE:constexpr SPLIT:constexpr"
+    )
+    glu = _compiled_shared(
+        mk._glu_kernel,
+        sig_glu,
+        dict(BLOCK_M=64, BLOCK_K=64, BLOCK_F=128, RP=64, PREC="tf32", SAVE=True, SPLIT=False),
+        4,
+    )
+    print(f"{'GLU shipped':>16} {glu:>9} {mk.smem_estimate(mk.TILES, torch.bfloat16, 64):>9}")
+    assert glu == 24576 == mk.smem_estimate(mk.TILES, torch.bfloat16, 64), glu
+    # The 512 tile FITS at bf16 (73728 B); the fp32 override of the same tile does
+    # not (147456 B), which is the genuine refusal the next gate exercises.
+    assert mk.tile_reason(torch.bfloat16, **BYTEFLOW, tiles={"BLOCK_N": 512}) is None
+
+
+def test_a_tile_that_cannot_fit_is_refused_before_launch_with_its_numbers():
+    """Gate (3): the refusal names the numbers, and it fires before any launch.
+
+    The genuine over-ceiling tile is fp32 `BLOCK_N=512` (147456 B measured-model);
+    the fp32 two-stage pair at the shipped BN=64 is 65536 B and fits. This is a
+    CALIBRATION point, not the tiles the shipped path uses — the gate below proves
+    the bf16 256/512 tiles it used to refuse really do fit.
+    """
+    if mk is None:
+        pytest.skip("no triton in this build")
+    t32 = mk.tiles_for(torch.float32, **BYTEFLOW)
+    two_stage = mk.smem_estimate(t32, torch.float32, BYTEFLOW["rank"], stages=2)
+    assert two_stage == 65536 and two_stage <= mk.SMEM_CEILING_BYTES
+    reason = mk.tile_reason(torch.float32, **BYTEFLOW, tiles=dict(mk.TILES, BLOCK_N=512))
+    print(f"[tile refusal] {reason}")
+    assert reason == "fp32 tile BLOCK_N=512 needs 147456 bytes > 101376"
+    with pytest.raises(AssertionError, match=r"fp32 tile BLOCK_N=512 needs 147456 bytes > 101376"):
+        mk._tiles({"BLOCK_N": 512}, torch.float32, **BYTEFLOW)
+
+
+def test_the_tile_fallback_is_counted_with_the_numbers(monkeypatch):
+    """Gate (c): when the tile does not fit, the dispatch COUNTS it and says so.
+
+    `tile_reason` returning a reason must reach `moe_triton_fallback` and the
+    counter's `why` unchanged — a fallback a reader of the log cannot see is the
+    ADR-0019 defect this gate exists for. The reason is the same string the
+    refusal above prints.
+    """
+    if mk is None:
+        pytest.skip("no triton in this build")
+    reason = "fp32 tile BLOCK_N=512 needs 147456 bytes > 101376"
+    monkeypatch.setattr(mk, "tile_reason", lambda *a, **k: reason)
+    moe = SparseMoE(tiny_cfg(n_experts=4, moe_topk=2, rank=8, moe_kernel="triton"), device="cpu")
+    x = torch.randn(32, 64)
+    index, weight = _routing(moe, x)
+    counters = Counters()
+    with torch.no_grad():
+        out = moe._dispatch(x, weight, index, counters)
+    print(f"[tile fallback] {counters.line()} why={counters.why}")
+    assert counters["moe_triton_fallback"] == 1
+    assert reason in counters.why, counters.why
+    assert counters["moe_naive_dispatch"] == 1  # CPU: the padded bank cannot run either
+    assert torch.isfinite(out).all()
+
+
+@CUDA
+def test_fp32_triton_runs_the_halved_tile_and_matches_the_padded_bank():
+    """Gate (b): fp32 Triton == fp32 padded at the small shape, rel <= 1e-5.
+
+    This is the existing fp32 parity shape with the NEW tile underneath: if the
+    dtype-aware tile or the one-stage launch changed the arithmetic, this is the
+    gate that fails. It also proves the launch is LEGAL at fp32 (the old tile
+    died in `OutOfResources`), which a CPU test cannot.
+    """
+    moe = _moe(bf16=False)
+    t = mk.tiles_for(torch.float32, moe.d, moe.f, moe.experts[0].rank)
+    assert t["BLOCK_N"] == 64 and mk._launch_stages(torch.float32) == {"num_stages": 1}
+    x = torch.randn(64, moe.d, device=DEV)
+    index, weight = _routing(moe, x)
+    order, keep, dropped = moe._permute(index)
+    with torch.no_grad():
+        padded = moe._padded_dispatch(x, weight, index, order, keep)
+        triton = moe._triton_dispatch(x, weight, index, order, keep)
+    rel = _rel(triton, padded)
+    print(
+        f"[fp32 parity] E={moe.n_experts} d={moe.d} f={moe.f} r={moe.experts[0].rank} "
+        f"BLOCK_N={t['BLOCK_N']} stages=1 rel={rel:.3e}"
+    )
+    assert rel <= 1e-5, f"{rel:.3e} exceeds 1e-5"
+
+
+# --------------------------------------------------------------------------
 # the FUSED backward — parity against the previous adjoint, per parameter group
 # --------------------------------------------------------------------------
 
@@ -536,7 +950,7 @@ def test_the_combine_forward_is_the_scatter_it_replaced():
     rowmap[6, 0], rowmap[6, 1] = 7, 8
 
     with torch.no_grad():
-        got = mk._Combine.apply(y, w, owner, rowmap, n, mk.BwdWorkspace(), mk.TILES)
+        got = mk._Combine.apply(y, w, owner, rowmap, n, mk.BwdWorkspace(), mk.TILES, None)
     ref = torch.zeros(n, f, dtype=torch.float32)
     ref.index_add_(0, owner, y.to(torch.float32) * w.unsqueeze(-1))
     print(f"[combine fwd] rows={rows} n={n} equal={torch.equal(got, ref)}")
