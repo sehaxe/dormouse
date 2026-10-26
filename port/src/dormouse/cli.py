@@ -174,7 +174,22 @@ def _freeze_gc() -> None:
     gc.set_threshold(1_000_000, 50, 50)
 
 
-def _model(run) -> DormouseModel:
+def _seed_model(run: RunConfig) -> None:
+    """Seed the process RNG from the snapshot's `train.seed` before an init.
+
+    The round-1 ledger's m4: `PROGRESS_KEYS` pins `seed` in the checkpoint
+    snapshot, but nothing applied it to the weights, so two runs of one config
+    started from different models (`embed.weight` differed by 5.39). Every CLI
+    entry point that builds a FRESH model calls this first. A `--resume`
+    overrides the file's value by loading the checkpoint's weights afterwards —
+    the seed only decides an init, never a resumed run.
+    """
+    torch.manual_seed(run.train.seed)
+
+
+def _model(run: RunConfig) -> DormouseModel:
+    """A fresh model whose init is seeded by the run's `train.seed`."""
+    _seed_model(run)
     return DormouseModel(run.model)
 
 
@@ -637,6 +652,9 @@ def rl_cmd(
         train_over["json_log"] = str(json_log)
     run = load_run(preset, model_overrides=model_over, train_overrides=train_over)
     dev = _device(device)
+    # `rl_train` builds the model internally; seed before that call (m4). The
+    # train/sft commands get the same seed through `_model`.
+    _seed_model(run)
     _freeze_gc()
     console.print(
         Panel(

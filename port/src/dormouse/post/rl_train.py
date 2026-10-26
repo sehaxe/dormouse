@@ -4,11 +4,14 @@
 aggregation, the step — and this module is the trainer around it: the piece that
 turns a checkpoint into a policy that solves tasks in fewer bytes. The loop's
 shape is `train/sft.py`'s, copied rather than reinvented: the same NaN firewall
-(a non-finite step touches no weight, is COUNTED `nan_skipped`, and two
-consecutive all-non-finite windows stop the run with a `LoudError`), the same
-log/JSON cadence, the same `save_ckpt`/`load_ckpt` pair, and the same
-`--init-from` path (`loop.init_cfg` + `load_model_state`, which is what makes a
-host-table pretrain checkpoint a legal init).
+(the loss AND the device gradient norm decide the step; a non-finite one touches
+no weight, is COUNTED `nan_skipped`, and two consecutive all-non-finite windows
+stop the run with a `LoudError`), the same log/JSON cadence, the same
+`save_ckpt`/`load_ckpt` pair, and the same `--init-from` path (`loop.init_cfg` +
+`load_model_state`, which is what makes a host-table pretrain checkpoint a legal
+init). The firewall's two halves are `train.sft.firewall_loss`/`gate_grads`, so
+this loop cannot drift from SFT's; `train/loop.py` keeps its own device-flag
+form because a CUDA-graph capture reads it.
 
 **What is different, and why.** SFT reads a corpus; this lane GENERATES its
 data. The prompts come from either the JSONL corpus `scripts/build_rl_tasks.py`
@@ -55,9 +58,12 @@ config different runs and a resume a different objective:
   happened to emit before the budget stopped them (a shared stream would make a
   one-byte change anywhere reshuffle every later rollout).
 
-The model's own init is not seeded here — `train()` and `sft_train()` do not
-seed it either; a caller that wants two identical runs seeds torch first, which
-is what the determinism gate does.
+The model's own init is not seeded by THIS function — a `RunConfig` passed
+straight to `rl_train()` runs under the caller's RNG, exactly as `train()` and
+`sft_train()` do. The CLI entry points seed `cfg.seed` before the build
+(`cli._model` / `cli._seed_model`), so `dormouse rl` and `dormouse train` with
+one seed produce one init; a resume overrides the file's value by loading the
+checkpoint's weights.
 
 **The counters.** `rl_steps` (one per `rl_step` call) and `rl_samples` (one per
 sample that contributed a log-prob) are the loop's own evidence; the skips
@@ -94,7 +100,7 @@ from pathlib import Path
 
 import torch
 
-from ..config import RunConfig, rl_config
+from ..config import RunConfig, rl_config, validate_train
 from ..instrument import Counters, LoudError, loud
 from ..model import DormouseModel
 from ..model.engram import enable_host_tables, host_engrams, host_step_all
@@ -368,6 +374,22 @@ def rl_train(
     """
     cfg = run.train
     torch.set_float32_matmul_precision("high" if cfg.tf32 else "highest")
+    # `train.sft` imports `post.tasks`, so a top-level import from this module
+    # is a cycle (the same reason `init_cfg` is imported locally below).
+    from ..train.sft import firewall_loss, gate_grads, refuse_unwired
+
+    validate_train(cfg)
+    refuse_unwired(cfg, "rl")
+    if cfg.grad_accum != 1:
+        loud(
+            f"rl: train.grad_accum={cfg.grad_accum}: the RL step is ONE prompt "
+            f"group — G rollouts, one policy-gradient backward, one advantage "
+            f"normalisation inside that group. Accumulating k groups into one "
+            f"optimizer step would average different groups' normalised "
+            f"advantages under one LR, an arm this loop has never measured. "
+            f"Escape: grad_accum=1 (the default), or run `dormouse train` for "
+            f"accumulation."
+        )
     rl_cfg: RLConfig = rl_config(cfg)
     dev = torch.device("cpu") if device is None else torch.device(device)
     model = DormouseModel(run.model).to(dev)
@@ -396,6 +418,15 @@ def rl_train(
         ns_steps=cfg.ns_steps,
         ns_kind=cfg.ns_kind,
         colrow_3d=cfg.muon_colrow_3d,
+        # The fields round-1 ledger m5 found silently unwired. The two precision
+        # rungs and the SF weight-decay value are forwarded (pure optimizer
+        # settings); the two direction arms are REFUSED above, so a reported arm
+        # always ran.
+        muon_state_dtype=cfg.muon_state_dtype,
+        ns_dtype=cfg.ns_dtype,
+        muon_variant=cfg.muon_variant,
+        muon_sf=cfg.muon_sf,
+        muon_sf_wd=cfg.muon_sf_wd,
     )
     if cfg.optim_8bit:
         opt.enable_bnb8bit()
@@ -553,11 +584,19 @@ def rl_train(
         adv_n += len(advantages)
 
         # The firewall `train()`/`sft_train()` carry: ONE host read per step.
+        # The read is AFTER the backward because the step's decision is the AND
+        # of the loss flag and the device gradient norm — a finite loss with a
+        # non-finite gradient must skip too (round-1 ledger m3), or `exp_avg_sq`
+        # is poisoned permanently.
         lf = float(loss.detach())
-        finite = math.isfinite(lf)
+        if kept > 0:
+            step_loss, loss_finite = firewall_loss(loss)
+            step_loss.backward()
+            finite = bool(gate_grads(model.parameters(), loss_finite))
+        else:
+            finite = math.isfinite(lf)
         window_finite.append(finite)
         if finite and kept > 0:
-            loss.backward()
             if cfg.grad_clip > 0:
                 clip_grads(model.parameters(), cfg.grad_clip)
             opt.step()
