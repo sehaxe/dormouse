@@ -668,7 +668,7 @@ def test_config_new_act_rungs_their_inert_combinations_and_the_2k_rule():
 # ADR-0018 rule 2: the quantizer seam is not a host read
 # --------------------------------------------------------------------------
 
-#: sha256(logits | loss) for the all-rungs fixture, captured on `main` (b2e0a1e,
+#: sha256(logits) for the all-rungs fixture, captured on `main` (b2e0a1e,
 #: torch 2.13 CPU, seed 0, `use_tsct=false` so the init has no TSCT QR) BEFORE
 #: this change. `none` is the control; every rung must stay here.
 RUNG_SHAS = {
@@ -679,6 +679,19 @@ RUNG_SHAS = {
     "mxfp8": "bcd4d53bfe5caf5823f7dac3f0b8b04a86088be40ff453b08b843bcf42270f18",
     "v2_int4": "1f6d153118affd648775bd51718e8201489ca7503029b641e101e9374661b36c",
     "v2_int8": "30e197f8beebd23618f6fb37066de42a4a3c459e570bfcc25b239b8e6c1c31b5",
+}
+
+#: `float(loss)` on the same fixture, captured with the shas above. The sha
+#: pins the LOGITS; this pins the scalar the trainer reads, so a loss taken
+#: from other logits or a wrong reduction cannot ride along under a green sha.
+RUNG_LOSSES = {
+    "none": 6.309731960296631,
+    "int8": 6.309488296508789,
+    "int4": 6.306822299957275,
+    "fp4": 6.309034824371338,
+    "mxfp8": 6.308507442474365,
+    "v2_int4": 6.3133368492126465,
+    "v2_int8": 6.309607982635498,
 }
 
 
@@ -705,6 +718,9 @@ def test_every_rung_is_bit_identical_to_main_on_the_fixed_fixture():
             logits, loss, _ = model(ids, targets)
         got = _sha(logits)
         assert got == want, f"act_quant={fmt} moved the logits: {got} != {want}"
+        assert float(loss) == RUNG_LOSSES[fmt], (
+            f"act_quant={fmt} moved the loss: {float(loss)!r} != {RUNG_LOSSES[fmt]!r}"
+        )
         print(f"act_quant={fmt} logits sha {got} loss {float(loss):.9f}")
 
 

@@ -842,15 +842,18 @@ def test_the_fused_kernel_takes_the_dropless_static_bound():
 
 
 @CUDA
-@pytest.mark.parametrize("bf16", [True])
-def test_the_bf16_seam_arms_agree_on_the_card(bf16):
+def test_the_bf16_seam_arms_agree_on_the_card():
     """Gate (f) on the card: triton vs padded vs naive on the same bf16 rows.
 
     One routing, one bank, one `x.to(dt)` — so the only difference is the arm.
     `moe_capacity = 0.25` gives all three a capacity to work with (the padded
     arm refuses dropless by design); the DROPS are the same `keep` for all
     three, which is what makes the comparison a comparison of the arithmetic.
+    `bf16` is the arm this gate exists for: it is the seam's dtype
+    (`moe_gather`/the triton path run on the bank's dtype), and the fp32 arm is
+    `test_experts_gpu.py`'s.
     """
+    bf16 = True
     moe, x, weight, index, order, keep, _d = _cuda_setup(bf16=bf16, capacity=0.25)
     dt = moe._bank_dtype()
     xb = x.to(dt)

@@ -19,7 +19,7 @@ from conftest import tiny_cfg, tiny_run, write_corpus
 from dormouse.instrument import LoudError
 from dormouse.model import DormouseModel
 from dormouse.model.experts import SparseMoE
-from dormouse.train import train
+from dormouse.train import anneal_alpha, train
 
 
 def _model(**over) -> DormouseModel:
@@ -60,16 +60,32 @@ def test_bank_cache_rebuilds_when_alpha_moves():
     assert c is b, "an unchanged alpha must hit the cache (same object)"
 
 
-def test_ramp_schedule_is_a_pure_function_of_the_step():
-    n = 100
-    assert [min(1.0, s / n) for s in (0, 1, 50, 99, 100, 250)] == [
-        0.0,
-        0.01,
-        0.5,
-        0.99,
-        1.0,
-        1.0,
-    ]
+@pytest.mark.parametrize(
+    ("anneal_steps", "step", "want"),
+    [
+        (100, 0, 0.0),
+        (100, 1, 0.01),
+        (100, 50, 0.5),
+        (100, 99, 0.99),
+        (100, 100, 1.0),
+        (100, 250, 1.0),
+        (200, 0, 0.0),
+        (200, 1, 0.005),
+        (200, 50, 0.25),
+        (200, 99, 0.495),
+        (200, 100, 0.5),
+        (200, 250, 1.0),
+    ],
+)
+def test_ramp_schedule_is_a_pure_function_of_the_step(anneal_steps, step, want):
+    """`anneal_alpha` is the implementation the trainer calls at the alpha seam.
+
+    The table above is the schedule, not the formula: a `step / (anneal + 1)`
+    denominator, an off-by-one at the shoulder, or a wrong clip moves a number.
+    `test_the_trainer_ramps_alpha_over_the_run` below pins that the seam really
+    calls THIS function.
+    """
+    assert anneal_alpha(step, anneal_steps) == want
 
 
 def test_the_trainer_refuses_an_anneal_with_no_arm(tmp_path):
