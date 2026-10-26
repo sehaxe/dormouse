@@ -948,8 +948,9 @@ def train(
                 seq_len=run.train.seq_len,
                 seed=run.train.seed,
                 max_epochs=run.train.max_epochs,
+                doc_masking=run.train.doc_masking,
             )
-            _, eval_stream = open_streams(run)
+            _, eval_stream = open_streams(run, eval_only=True)
             log(
                 f"mix_plan={run.train.mix_plan}: {len(stream.plan.sources)} sources, "
                 f"{len(stream.plan.stages)} stage(s), steps={micro_steps} micro-batches "
@@ -958,6 +959,16 @@ def train(
             )
         else:
             stream, eval_stream = open_streams(run)
+    if cfg.doc_masking:
+        # The arm's own line: which reader ran and what it does. The row shape
+        # is the whole mechanism, so a reader does not have to infer it from the
+        # flag (a packed row that still glued documents would be the defect).
+        log(
+            "doc_masking=true: one document per training row (whole document, or a "
+            "contiguous chunk of one when it is longer than seq_len), tail-padded; "
+            "padding and cross-document targets are excluded from the loss. The eval "
+            "stream stays flat (the held-out window is the comparable number)."
+        )
     model.train()
     if "ternary_s3t" in (run.model.factor_qat, run.model.dense_qat):
         # The ADR-0021 caveat, said where a reader of the log meets it. The
@@ -1473,6 +1484,8 @@ def train(
         # — which is why the wrapper demands at least one eager step.
         if full is not None:
             # ---- the CAPTURED step: one replay does all of it --------------
+            # `doc_masking` is refused with `full_graph` in `validate`, so this
+            # read is always the flat one.
             x, y = stream.next_batch()
             full.fill(x, y)
             full.set_lr(lr)
@@ -1488,11 +1501,24 @@ def train(
             loss_sum = last_loss_dev.new_zeros(())
             n_micro = cfg.grad_accum
             for _micro in range(n_micro):
-                x, y = stream.next_batch()
+                if cfg.doc_masking:
+                    # DOCUMENT MASKING (off by default): one document per row
+                    # and a `[b, t]` mask, so padding and cross-document targets
+                    # are not scored. `micro_step` forwards the mask through
+                    # `kw`; the masked CE is a mean over selected positions, so
+                    # a micro-batch with fewer scored bytes contributes less —
+                    # the same semantics one wide masked batch would have.
+                    x, y, loss_mask = stream.next_batch_masked()
+                else:
+                    x, y = stream.next_batch()
+                    loss_mask = None
                 if device is not None:
                     x, y = x.to(device), y.to(device)
+                    if loss_mask is not None:
+                        loss_mask = loss_mask.to(device)
+                micro_kw = kw if loss_mask is None else {**kw, "loss_mask": loss_mask}
                 step_counters, contribution, grads = micro_step(
-                    x, y, kw, n_micro, _micro == 0
+                    x, y, micro_kw, n_micro, _micro == 0
                 )
                 total.merge(step_counters)
                 window.merge(step_counters)
@@ -1664,6 +1690,9 @@ def train(
     total.drain()
     nan_skipped = int(total.get("nan_skipped", 0))
     last_loss = _host_scalar(last_loss_dev)
+    doc_counts = stream.doc_counts() if cfg.doc_masking else {}
+    if cfg.doc_masking:
+        log(f"doc_masking: {doc_counts}")
     if cfg.eval and eval_stream is not None and cfg.steps % cfg.eval_every != 0:
         sf("eval")
         with _shadow_params(model, ema):
@@ -1683,4 +1712,5 @@ def train(
         # declared report value, not a hot-path export.
         "ema": ema,
         "eval_window_bytes": eval_window_bytes(cfg),
+        "doc_counts": doc_counts,
     }

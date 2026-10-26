@@ -1321,6 +1321,33 @@ class TrainConfig:
     #: exceed `max_epochs × its file size` is a LOUD refusal naming it (the
     #: research onset: MoE degrades at 4× repetition, dense at 8×). 0 = off.
     max_epochs: float = 4.0
+    #: DOCUMENT MASKING (`train/data.py::DocPackedStream`): one DOCUMENT per
+    #: TRAIN row instead of a flat concatenation. Each row is a whole document,
+    #: or a contiguous chunk of one document when it is longer than `seq_len`,
+    #: padded at the tail; the padded/cross-document target positions are
+    #: excluded from the loss (`DormouseModel.forward(loss_mask=...)`).
+    #:
+    #: **Why one document per row and not whole-document PACKING** (two
+    #: documents glued into one row, boundary targets masked): the KDA arm is a
+    #: recurrence carried through the fused `chunk_kda` over the whole window,
+    #: and there is no state reset at a mid-window boundary. A packed row would
+    #: therefore let document B's positions attend to document A's — exactly
+    #: the cross-document dependency this flag removes. Rows that never hold
+    #: two documents need no reset anywhere, fused kernel or not.
+    #:
+    #: The cost, named: a corpus of short documents pays tail padding (a
+    #: 200-byte document leaves ~80 % of a 1024-byte row empty), so the flag is
+    #: a quality lever for short-document corpora and a near-no-op for the
+    #: 6 MB `web` shards. It needs a `<data>.docs.json` sidecar
+    #: (`scripts/build_doc_sidecar.py`): a `.bin` alone cannot say where a
+    #: document ends, and a missing sidecar is a LOUD refusal, never a flat
+    #: fallback. Refused with `segment_len>0` (the carried state has no
+    #: boundary notion), `use_byteflow=true` (patch boundaries are not document
+    #: boundaries), and the target-bearing aux terms.
+    #:
+    #: Non-progress: flipping it changes what the run trains on, so the
+    #: snapshot drift check refuses a flip on a resume.
+    doc_masking: bool = False
     out_dir: str = "checkpoints"
     timers: bool = False
     #: Host-RAM Engram tables — burn's `--engram-ram` (Qwen3.8-Flash-Next §2.3
@@ -2385,6 +2412,62 @@ def _refuse_ladder_rung(rung: str) -> str:
     )
 
 
+def _validate_doc(model: ModelConfig, tcfg: TrainConfig) -> None:
+    """`doc_masking` against the window, the byteflow shapes and the aux targets.
+
+    Each is a refusal rather than a silent no-op, for the ADR-0019 reason the
+    config layer exists: a flag that is on while the run computes the flat
+    objective is a config that lies about what trained. Every message names the
+    escape.
+    """
+    if not tcfg.doc_masking:
+        return
+    if tcfg.full_graph:
+        loud(
+            "doc_masking=true with full_graph=true: the capture fills STATIC (x, y) "
+            "buffers and the loss mask is a third per-step input it has no slot for — "
+            "a replay would train on the first step's mask forever. Escape: "
+            "full_graph=false (the eager step), or doc_masking=false."
+        )
+    if tcfg.segment_len:
+        loud(
+            f"doc_masking=true with segment_len={tcfg.segment_len}: the segmented "
+            f"forward CARRIES the KDA state across cuts, and a carried state has no "
+            f"notion of a document boundary — a document shorter than a segment would "
+            f"still see the previous document's state at the seam. Escape: "
+            f"segment_len=0 (the one-shot window, where one row holds one document), "
+            f"or doc_masking=false."
+        )
+    if model.use_byteflow:
+        loud(
+            "doc_masking=true with use_byteflow=true: the byteflow shapes patch the "
+            "byte stream at LEARNED boundaries (or run no byte loop at all), and a "
+            "patch boundary is not a document boundary — the loss mask addresses byte "
+            "positions, not patch latents. Escape: use_byteflow=false, or "
+            "doc_masking=false."
+        )
+    for name in ("dspark_weight", "mtp_weight", "jepa_weight", "energy_weight", "halt_weight"):
+        weight = float(getattr(model, name))
+        if weight > 0.0:
+            loud(
+                f"doc_masking=true with {name}={weight}: this auxiliary objective has "
+                f"its own target positions over the whole window, and the CE loss mask "
+                f"does not reach it — it would train across the padding and document "
+                f"boundaries the flag exists to remove, while the log reported the arm "
+                f"on. Escape: set {name}=0.0, or doc_masking=false."
+            )
+    if model.moe_topk > 0 and model.moe_capacity > 0:
+        loud(
+            f"doc_masking=true with moe_topk={model.moe_topk} and "
+            f"moe_capacity={model.moe_capacity}: the capacity-padded dispatch decides "
+            f"which rows an expert keeps from the WHOLE batch, so a padded row (and a "
+            f"document's masked last byte) can take capacity from a real token in "
+            f"another row — the mask would hold on the loss but not on the forward. "
+            f"Escape: moe_capacity=0 (the dropless route, where every assignment "
+            f"reaches its expert — the b1 and A/B default), or doc_masking=false."
+        )
+
+
 def _validate_segment(model: ModelConfig, tcfg: TrainConfig) -> None:
     """The segmented-training flag against the window and the arms it cannot ride.
 
@@ -2824,6 +2907,7 @@ def load_run(
     # window AND the arms, so its refusals live here, where both halves are
     # resolved — the same shape as the `engram_ram` block above.
     _validate_segment(model, tcfg)
+    _validate_doc(model, tcfg)
     _validate_jepa(model, tcfg)
     # The RL lane's keys. The advantage arm is a literal list (checked here, the
     # way `opt` and `mm_dtype` are); the reward and penalty knobs are checked by

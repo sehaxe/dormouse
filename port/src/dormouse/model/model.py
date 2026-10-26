@@ -40,7 +40,7 @@ from .dspark import DSparkHead, dspark_aux_loss
 from .energy import EnergyHead, energy_contrastive_loss
 from .halt import HaltHead, halt_loss
 from .jepa import JepaHead
-from .loopblock import LoopBlock
+from .loopblock import LoopBlock, masked_ce_mean
 from .mtp import MTPHead
 from .prelude import UniqueLayer
 from .qat_cache import QuantCache, attach_qat_caches, take_qat_refresh_counts
@@ -268,6 +268,7 @@ class DormouseModel(nn.Module):
         pure: bool = False,
         breakdown: bool = False,
         segment_len: int = 0,
+        loss_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, Counters]:
         """`input_ids [b,t]` (+ `targets [b,t]`) → (logits `[b*t,vocab]`, loss, counters).
 
@@ -285,10 +286,32 @@ class DormouseModel(nn.Module):
         the trainer's loss code is untouched. The EVAL path deliberately does
         not pass it: an eval saves no activations (`no_grad`), and leaving it
         one-shot keeps the held-out number comparable with the record.
+
+        `loss_mask [b,t]` is the `doc_masking` arm's position weight (1/0):
+        the per-iteration CEs and the final CE are means over the SELECTED
+        positions only, so padding and cross-document targets contribute
+        neither a loss nor a gradient. `None` (the default, every number on
+        record) is the unchanged `.mean()` path, bit for bit.
         """
         counters = Counters() if counters is None else counters
         assert input_ids.dtype in (torch.long, torch.int64), "input_ids must be integer ids"
         assert input_ids.ndim == 2, f"input_ids must be [b, t], got {tuple(input_ids.shape)}"
+        if loss_mask is not None:
+            assert loss_mask.shape == input_ids.shape, (
+                f"loss_mask {tuple(loss_mask.shape)} != input_ids {tuple(input_ids.shape)}"
+            )
+            if segment_len:
+                loud(
+                    f"loss_mask with segment_len={segment_len}: the segmented forward "
+                    f"carries state across its cuts, so a document boundary inside the "
+                    f"window is not a segment boundary. Escape: segment_len=0."
+                )
+            if self.bf_net is not None or self.bf is not None:
+                loud(
+                    "loss_mask with use_byteflow: the byteflow shapes score patch "
+                    "latents, not byte positions, so a [b,t] byte mask addresses a "
+                    "different sequence. Escape: use_byteflow=false, or loss_mask=None."
+                )
         if self.cfg.dense_qat != "none":
             # The dense path ran (the per-site proof is the coverage gate,
             # tests/test_dense_qat.py: every nn.Linear/DenseLinear weight in the
@@ -303,7 +326,7 @@ class DormouseModel(nn.Module):
             logits, loss = self._forward_channel(input_ids, targets, counters, depth)
         else:
             logits, loss = self._forward_byte_lm(
-                input_ids, targets, counters, depth, pure, breakdown, segment_len
+                input_ids, targets, counters, depth, pure, breakdown, segment_len, loss_mask
             )
         if self._qat_caches:
             # Cache hits in THIS forward, on the existing counter line: the
@@ -411,6 +434,7 @@ class DormouseModel(nn.Module):
         pure: bool = False,
         breakdown: bool = False,
         segment_len: int = 0,
+        loss_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """The plain byte-level stack: embedding → prelude → loop → coda → RMSNorm → lm_head."""
         h0 = self.embed(input_ids)
@@ -480,6 +504,7 @@ class DormouseModel(nn.Module):
             halt=halt,
             halt_min_iter=self.cfg.halt_min_iter,
             collect_hidden=self.halt is not None and targets is not None and not pure,
+            loss_mask=loss_mask,
         )
         # The coda: unique layers, once, after the loop's mean readout. They sit
         # BEFORE the final norm/head, which stay exactly where they are today
@@ -506,7 +531,13 @@ class DormouseModel(nn.Module):
             # what a looped block needs (readiness plan §5) — and adds the one
             # term that makes the logits it RETURNS the logits it TRAINS.
             flat = targets.reshape(-1, 1)
-            ce_final = -F.log_softmax(logits, dim=-1).gather(1, flat).mean()
+            ce_final = -F.log_softmax(logits, dim=-1).gather(1, flat)
+            if loss_mask is not None:
+                # doc_masking: padding and cross-document targets carry no loss
+                # and no gradient — the same selected mean the loop used.
+                ce_final = masked_ce_mean(ce_final, loss_mask)
+            else:
+                ce_final = ce_final.mean()
             if breakdown:
                 # Eval-only host reads (called under `torch.no_grad()` by
                 # `evaluate(..., breakdown=True)`; NEVER in the training path —

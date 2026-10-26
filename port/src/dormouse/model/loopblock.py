@@ -152,6 +152,19 @@ def _rms_no_gain(x: torch.Tensor, eps: float) -> torch.Tensor:
     return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
 
 
+def masked_ce_mean(ce: torch.Tensor, loss_mask: torch.Tensor) -> torch.Tensor:
+    """`ce [N,1]`'s mean over the positions `loss_mask [b,t]` selects.
+
+    The `doc_masking` arm's reduction: a mean over the SELECTED positions, so
+    a padded position contributes neither loss nor gradient. The mask is
+    guaranteed non-empty by the packed reader (every row holds a document or a
+    document chunk), so this is two device ops and no host read — the 0-sync
+    rule holds on the training path.
+    """
+    w = loss_mask.reshape(-1, 1).to(ce.dtype)
+    return (ce * w).sum() / w.sum()
+
+
 class AttnResSlot(nn.Module):
     """One pseudo-query per loop-iteration slot (arXiv:2603.15031 §5).
 
@@ -335,6 +348,7 @@ class LoopBlock(nn.Module):
         halt: nn.Module | None = None,
         halt_min_iter: int = 1,
         collect_hidden: bool = False,
+        loss_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, Counters]:
         """`h0 [b,t,d]` → (`mean readout [b,t,d]`, SUM of per-iteration mean CEs, counters).
 
@@ -376,6 +390,13 @@ class LoopBlock(nn.Module):
                 f"memory, never the objective. Escape: a divisor of {t}."
             )
         if segment_len > 0:
+            if loss_mask is not None:
+                loud(
+                    f"loss_mask with segment_len={segment_len}: the segmented forward "
+                    f"carries the KDA state across its cuts, so a document boundary "
+                    f"inside the window is not a segment boundary. Escape: "
+                    f"segment_len=0."
+                )
             return self._forward_segmented(
                 h0, input_ids, targets, lm_head, counters, T, segment_len
             )
@@ -390,6 +411,7 @@ class LoopBlock(nn.Module):
             halt=halt,
             halt_min_iter=halt_min_iter,
             collect_hidden=collect_hidden,
+            loss_mask=loss_mask,
         )
         # The per-iteration CEs as a LIST on the module (host floats ONLY on an
         # eval-style read; see `model.DormouseModel.forward(breakdown=True)`) —
@@ -446,6 +468,7 @@ class LoopBlock(nn.Module):
         halt: nn.Module | None = None,
         halt_min_iter: int = 1,
         collect_hidden: bool = False,
+        loss_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor], list]:
         """`T` iterations over ONE window — a segment, or the whole sequence.
 
@@ -666,8 +689,11 @@ class LoopBlock(nn.Module):
                 assert lm_head is not None, "per-iteration CE needs the lm_head"
                 logits = lm_head(step_out.reshape(b * t, d).to(torch.float32))
                 ce = -F.log_softmax(logits, dim=-1).gather(1, targets.reshape(-1, 1))
-                rec = rec + ce.mean()
-                per_iter.append(ce.mean())
+                # `doc_masking`: the mean over the SELECTED positions only (the
+                # `None` default is the historical `.mean()`, bit for bit).
+                term = ce.mean() if loss_mask is None else masked_ce_mean(ce, loss_mask)
+                rec = rec + term
+                per_iter.append(term)
             if halt is not None and ran >= halt_min_iter:
                 # The HALT DECISION: one scalar from this iteration's readout,
                 # read to the host and compared to 0.5. Inference only — the
