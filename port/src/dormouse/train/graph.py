@@ -126,7 +126,7 @@ def _iter_groups(opt):
             yield group, False
 
 
-def _bind_device_lr(opt) -> list[tuple[dict, torch.Tensor]]:
+def _bind_device_lr(opt) -> tuple[list[tuple[dict, torch.Tensor]], list[tuple[dict, bool, object]]]:
     """Every optimizer group's LR as a persistent 0-dim DEVICE tensor.
 
     ONE definition for both graph arms (`OptimizerGraph`, `FullGraph`): a
@@ -136,8 +136,14 @@ def _bind_device_lr(opt) -> list[tuple[dict, torch.Tensor]]:
     torch's own `capturable=True` switch — without it its non-capturable branch
     hands the dispatcher a 0-dim tensor as `addcdiv_`'s `value`, i.e. a HOST
     read the capture window refuses.
+
+    Returns `(lr_tensors, capturable_restore)`: the second list is
+    `(group, key_was_present, old_value)` so `_fall_back` can put AdamW back on
+    the eager path it claims to be (a `capturable=True` left behind would keep
+    AdamW's captured arithmetic after the log said "stayed EAGER").
     """
     out: list[tuple[dict, torch.Tensor]] = []
+    restore: list[tuple[dict, bool, object]] = []
     for group, is_adamw in _iter_groups(opt):
         params = group["params"]
         if not params:
@@ -145,39 +151,23 @@ def _bind_device_lr(opt) -> list[tuple[dict, torch.Tensor]]:
         tensor = torch.tensor(float(group["lr"]), dtype=torch.float32, device=params[0].device)
         group["lr"] = tensor
         out.append((group, tensor))
-        if is_adamw and params[0].device.type == "cuda":
-            group["capturable"] = True
-            for p in params:
-                # A checkpoint written BEFORE this arm landed (or read through
-                # `load_ckpt`'s `map_location="cpu"`) carries a HOST `step`
-                # counter. torch's capturable branch asserts the counter shares
-                # the param's device, and that assert would fire in the eager
-                # WARMUP step — outside any try/except.
-                state = opt.adamw.state.get(p, {})
-                if "step" in state and state["step"].device.type != "cuda":
-                    state["step"] = state["step"].to(
-                        device=params[0].device, dtype=torch.float32
-                    )
-    return out
+        if is_adamw:
+            restore.append((group, "capturable" in group, group.get("capturable")))
+            if params[0].device.type == "cuda":
+                group["capturable"] = True
+                for p in params:
+                    # A checkpoint written BEFORE this arm landed (or read through
+                    # `load_ckpt`'s `map_location="cpu"`) carries a HOST `step`
+                    # counter. torch's capturable branch asserts the counter shares
+                    # the param's device, and that assert would fire in the eager
+                    # WARMUP step — outside any try/except.
+                    state = opt.adamw.state.get(p, {})
+                    if "step" in state and state["step"].device.type != "cuda":
+                        state["step"] = state["step"].to(
+                            device=params[0].device, dtype=torch.float32
+                        )
+    return out, restore
 
-
-def _starved(model) -> tuple[list[str], list[str]]:
-    """`(names with a grad, names without)` over `model.parameters()`.
-
-    A parameter with no gradient after the whole warmup is STRUCTURALLY dead (a
-    residual gain the forward never reads: `loop.residual_scale` under
-    `use_mhc`, which is why `opt_graph` measured +0 at b8 s512 — the capture was
-    REFUSED, so the arm never ran). Excluding it from the captured participating
-    set changes nothing about the run. What the old refusal protected against —
-    a parameter starved on ONE step — is caught on every replay
-    (`FullGraph._check_participants`), which is the check that actually matters.
-    """
-    live, dead = [], []
-    for name, p in model.named_parameters():
-        if not p.requires_grad:
-            continue
-        (dead if p.grad is None else live).append(name)
-    return live, dead
 
 #: The capture's error mode: what inductor uses, and what survives another
 #: thread's capture-unsafe CUDA call (`dion/cuda_graph.py:88-116`).
@@ -235,7 +225,7 @@ class OptimizerGraph:
         #: `(group, tensor)`: the persistent LR tensors, and the groups that read
         #: them. `group["lr"] IS` the tensor, so the captured ops re-read the live
         #: value on every replay.
-        self._lr: list[tuple[dict, torch.Tensor]] = _bind_device_lr(opt)
+        self._lr, self._capturable_restore = _bind_device_lr(opt)
         #: The ORDERED `(group, tensor)` list `set_lr` writes; the same list the
         #: `FullGraph` arm uses, so the two arms cannot bind the LR differently.
         self.frozen: list[str] = []
@@ -307,8 +297,9 @@ class OptimizerGraph:
                 f"the dispatcher — a sync inside the capture window, which CUDA graphs "
                 f"refuse. Escape: muon_variant='muon', or opt_graph=false."
             )
+        names = {id(p): n for n, p in self.opt.model.named_parameters()}
         missing = [
-            f"group {gi}[{i}] shape {tuple(p.shape)}"
+            (names.get(id(p), f"group {gi}[{i}]"), p)
             for gi, (group, _) in enumerate(self._groups())
             for i, p in enumerate(group["params"])
             if p.requires_grad and p.grad is None
@@ -319,7 +310,7 @@ class OptimizerGraph:
             # silently stop being updated for the rest of the run
             # (`dion/cuda_graph.py:231-255`).
             more = f", ... (+{len(missing) - 5} more)" if len(missing) > 5 else ""
-            shown = ", ".join(missing[:5]) + more
+            shown = ", ".join(f"{n} {tuple(p.shape)}" for n, p in missing[:5]) + more
             return (
                 f"{len(missing)} parameter(s) require a gradient but have .grad=None at "
                 f"capture, so every replay would leave them frozen: {shown}. Escape: "
@@ -337,7 +328,7 @@ class OptimizerGraph:
             # its `.grad` is None on every step and the refusal fired forever.
             # The hazard the refusal exists for — a parameter starved on ONE
             # step — is caught on every replay by `_check_participants`.
-            self.frozen = [m.split(" ", 1)[1] for m in missing]
+            self.frozen = [n for n, _ in missing]
             if self.counters is not None:
                 self.counters.count("opt_graph_frozen", len(self.frozen))
             if self.log is not None and len(missing) <= 5:
@@ -397,19 +388,13 @@ class OptimizerGraph:
         (`dion/cuda_graph.py:257-274`), so a capture without it leaves the
         trajectory one step short.
         """
-        torch.cuda.empty_cache()  # before the headroom rule: it must see the truth
+        torch.cuda.empty_cache()  # ONE call, before `_refusals`: the headroom rule
+        # must read the allocator's real state (the previous step's cached blocks
+        # are what a capture's private pool has to be mapped out of).
         why = self._refusals()
         if why is not None:
             loud(f"{self.arm}: capture refused — {why}")
         torch.cuda.synchronize()
-        # The capture's allocations come from a graph-private pool that must be
-        # MAPPED from free VRAM, and the step that just ran is still holding the
-        # allocator's cached blocks. Measured on this box at b24 s1024: without
-        # this the capture dies with an allocator OOM; with it the capture maps
-        # and the run continues. It is a ONE-TIME cost, before any timed step —
-        # and it runs BEFORE `_refusals` (below) so the headroom rule reads the
-        # allocator's real state, not the cached one.
-        torch.cuda.empty_cache()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, capture_error_mode=CAPTURE_ERROR_MODE):
             self.stage()
@@ -457,8 +442,11 @@ class OptimizerGraph:
     def step(self) -> None:
         """One optimizer stage: eager during warmup and after a fallback, replay after.
 
-        A NaN-skipped step must NOT call this (the trainer's rule): the stage is
-        what advances the graph, exactly as it is what advances the optimizer.
+        Called UNCONDITIONALLY, including on a step the NaN firewall skipped: the
+        eager path also runs the stage on a masked step (the device flag has
+        already zeroed the gradients), and `opt_graph`'s warmup/capture must be
+        the same program. A capture records the stage once; the flag is what
+        makes one recording serve both outcomes without a host branch.
         """
         self._steps += 1
         if self._graph is not None:
@@ -504,12 +492,21 @@ class OptimizerGraph:
         a subtly different program from the one it claims to be. A group that
         does NOT hold a device tensor is left alone — the trainer writes the SF
         Muon group's constant LR as a host float after `set_lr`, and clobbering
-        it would put the fallback step on the WSD value for one step.
+        it would put the fallback step on the WSD value for one step. AdamW's
+        `capturable` switch is restored too (to its pre-bind value, or removed):
+        leaving it True would keep the captured arithmetic while the log says
+        the run "stayed EAGER".
         """
         self.reason = reason
         for group, tensor in self._lr:
             if group.get("lr") is tensor:
                 group["lr"] = self._lr_value
+        for group, was_present, old in self._capturable_restore:
+            if was_present:
+                group["capturable"] = old
+            else:
+                group.pop("capturable", None)
+        self._capturable_restore.clear()
         if self.counters is not None:
             # ONE counter for both arms (`opt_graph_fallback` is the documented
             # name the log/JSONL schema carries), but the REASON names the arm
@@ -548,6 +545,13 @@ def full_graph_refusal(train, model) -> str | None:
     replays correctly (the kernel reads whatever the buffer holds).
 
     `train` is a `TrainConfig`, `model` a `ModelConfig`.
+
+    Everything decidable from CONFIG is here, so it fires before the first eager
+    step: the optimizer arms (`optim_8bit`, `muon_sf`, `muon_variant`), the
+    per-step HOST reads (`engram_ram`, `moe_offload`, `use_msa`, JEPA, DSpark,
+    act_quant, QAT), and the known non-capturable arms. Only the checks that need
+    the LIVE model stay in `capture()`: a parameter starved through the whole
+    warmup (`.grad is None`) and the VRAM headroom, which is a device measurement.
     """
     if train.opt_graph:
         return (
@@ -555,6 +559,29 @@ def full_graph_refusal(train, model) -> str | None:
             "the whole step, and the optimizer stage inside it. The optimizer graph "
             "would replay inside the superset's replay. Escape: full_graph=true alone "
             "(it implies the optimizer capture), or opt_graph=true alone."
+        )
+    if getattr(train, "optim_8bit", False):
+        return (
+            "optim_8bit=true: bitsandbytes' AdamW8bit has no capturable / "
+            "device-tensor-LR path, so a captured step would freeze its LR at the "
+            "capture value. Escape: optim_8bit=false, or full_graph=false."
+        )
+    if getattr(train, "muon_sf", False):
+        return (
+            "muon_sf=true: the schedule-free wrapper's `_sf_ckp` recursion "
+            "(`s += lr*lr`, `c = lr*lr/s`) is HOST arithmetic and reads `lr` as a "
+            "Python float (`optim.Muon._sf_ckp`), so a captured step would freeze "
+            "BOTH the iterate averaging and the LR at capture time. Escape: "
+            "muon_sf=false, or full_graph=false (putting `_sf_ckp` on device is the "
+            "named follow-up, not this arm)."
+        )
+    if getattr(train, "muon_variant", "muon") != "muon":
+        return (
+            f"muon_variant={train.muon_variant!r}: the NorMuon tail applies the LR as "
+            f"`torch._foreach_add_(..., alpha=-lr)` (`optim.Muon._nor_batched`), and "
+            f"an `alpha` that is a 0-dim device tensor is read back to the HOST by "
+            f"the dispatcher — a sync inside the capture window, which CUDA graphs "
+            f"refuse. Escape: muon_variant='muon', or full_graph=false."
         )
     if train.grad_accum > 1:
         return (
@@ -613,6 +640,13 @@ def full_graph_refusal(train, model) -> str | None:
             "device→host INDEX transfer (`engram._forward_host`'s `.to('cpu')`), which a "
             "capture window refuses. Escape: engram_ram=false (the in-VRAM table), or "
             "full_graph=false."
+        )
+    if getattr(model, "moe_offload", False):
+        return (
+            "moe_offload=true: the expert pass's host-offload hooks park every saved "
+            "activation in host RAM and copy it back for the backward — a blocking "
+            "device→host transfer inside the captured window, which a capture neither "
+            "records nor replays. Escape: moe_offload=false, or full_graph=false."
         )
     if getattr(model, "jepa_weight", 0.0) > 0.0:
         return (
@@ -785,11 +819,11 @@ class FullGraph(OptimizerGraph):
 
     def capture(self) -> None:
         """Capture the whole step and replay it once (the replay IS the step)."""
+        torch.cuda.empty_cache()  # before the headroom rule: it must see the truth
         why = self._refusals()
         if why is not None:
             loud(f"full_graph: capture refused — {why}")
         torch.cuda.synchronize()
-        torch.cuda.empty_cache()
         graph = torch.cuda.CUDAGraph()
         # The WARMUP's last backward left an `AccumulateGrad` node referring to
         # the DEFAULT stream. Capture runs on a side stream, so autograd refuses
@@ -823,7 +857,13 @@ class FullGraph(OptimizerGraph):
         self._host_bookkeeping()
 
     def step(self) -> None:
-        """One step: eager during warmup and after a fallback, one replay after."""
+        """One step: eager during warmup and after a fallback, one replay after.
+
+        Called UNCONDITIONALLY — a NaN-skipped step replays too: `full_body`
+        re-fills the device flag with 1 and the micro-step's mask zeroes the whole
+        contribution before the recorded optimizer stage, which is exactly what
+        the eager path does with the same flag.
+        """
         self._steps += 1
         if self._graph is not None:
             self._replay()

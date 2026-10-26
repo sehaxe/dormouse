@@ -193,6 +193,10 @@ def _tiny_pair():
     "train_over, model_over, needle",
     [
         (dict(opt_graph=True), {}, "TWO captures"),
+        (dict(optim_8bit=True), {}, "bitsandbytes"),
+        (dict(muon_sf=True), {}, "schedule-free"),
+        (dict(muon_variant="normuon"), {}, "NorMuon"),
+        ({}, dict(moe_offload=True), "host-offload"),
         (dict(grad_accum=2), {}, "accumulation loop is PYTHON"),
         (dict(rand_depth=True), {}, "sampled from `(seed, step)` on the HOST"),
         (dict(segment_len=16), {}, "PYTHON loop over segments"),
