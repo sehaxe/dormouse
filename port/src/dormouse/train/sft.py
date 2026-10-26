@@ -50,12 +50,17 @@ mismatch looks like.
 **What is reused vs copied.** Reused by import: `ByteStream` (the byte stream
 contract), `wsd_lr` (the schedule — WSD, the same one `train()` runs, rather than
 a second schedule to keep honest), `warmup_steps`, `MixOptimizer` + `clip_grads`,
-`save_ckpt`/`load_ckpt`/`load_model_state`, `kda_field` and `Counters`. **Copied
-verbatim from `train()` (`loop.py`):** the NaN firewall (finite check → skip →
-count → `nan_skipped`, and the two-consecutive-all-non-finite-windows `LoudError`)
-and the log/JSON cadence. It is copied, not shared, because `loop.py` belongs to
-another lane this round; a `firewall()` helper both loops call is the follow-up,
-and the two copies must not drift before it lands.
+`save_ckpt`/`load_ckpt`/`load_model_state`, `kda_field` and `Counters`. **The NaN
+firewall** is the SAME rule `train()` runs: the finite loss is masked before
+backward, the step's gradient norm is `isfinite`-checked on the device, every
+gradient is `nan_to_num_`'d and multiplied by the 0/1 flag, and a non-finite
+loss OR gradient skips the optimizer and is COUNTED `nan_skipped` (two
+consecutive all-non-finite windows then stop the run with a `LoudError`). The
+loss half is [`firewall_loss`], the gradient half is [`gate_grads`] — shared with
+`post/rl_train.py` so the two post-training loops cannot drift. `train/loop.py`
+keeps its own form of the same block because it carries the 0/1 flag into a
+CUDA-graph capture; the two forms are pinned against each other by
+`tests/test_posttrain_fixes.py`.
 
 **The host-table path (`engram_ram`), and why SFT drives it.** A pretrain
 checkpoint from a `--engram-ram` run stores its memory OUTSIDE the model half
@@ -90,7 +95,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-from ..config import RunConfig
+from ..config import RunConfig, validate_train
 from ..instrument import Counters, LoudError, StepTimer, loud
 from ..model.engram import enable_host_tables, host_engrams, host_step_all
 from ..model.experts import invalidate_banks_all
@@ -106,7 +111,7 @@ from .loop import (
     unpack_state_dict,
 )
 from .lr import wsd_lr
-from .optim import MixOptimizer, clip_grads
+from .optim import MixOptimizer, clip_grads, grad_norm
 
 #: The template's sentinels. All four are asserted absent from every rendered
 #: instruction and answer ([`_assert_clean`]), which is what makes them markers:
@@ -918,6 +923,78 @@ def sft_loss(logits: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor) ->
     return F.cross_entropy(logits[flat], targets.reshape(-1)[flat])
 
 
+def firewall_loss(loss: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """The firewalls' loss half: `(loss with a zero seed on non-finite, isfinite flag)`.
+
+    `torch.where` on the scalar, not a host branch: on a healthy step the value
+    AND the gradient are bit-identical to `loss.backward()` (the where's
+    backward passes the root gradient through unchanged). This is
+    `train/loop.py`'s device block (`micro_step`, lines 1107-1116) in the form
+    the two post-training loops can share.
+    """
+    loss_d = loss.detach()
+    loss_finite = torch.isfinite(loss_d).all()
+    return torch.where(loss_finite, loss, loss_d.new_zeros(())), loss_finite
+
+
+def gate_grads(params, loss_finite: torch.Tensor) -> torch.Tensor:
+    """The firewalls' gradient half: sanitize, gate, return the 0-dim 0/1 flag.
+
+    A finite LOSS does not stop a NaN that came from an ACTIVATION (`NaN * 0` is
+    still NaN through the Jacobian), so the step's decision is the AND of the
+    loss flag and `isfinite(grad_norm)`. Every gradient is `nan_to_num_`'d
+    first, then multiplied by the flag: `*1.0` is the identity on a healthy
+    step, `*0` makes a skipped step's direction exactly zero. This is
+    `train/loop.py`'s block (`micro_step`, lines 1124-1146) copied exactly;
+    `loop.py` keeps its own form because its flag is read inside a CUDA-graph
+    capture, and this lane may not edit that file.
+
+    Sharing it between SFT and RL is what closes the hole the round-1 ledger's
+    m3 named: both loops checked only the loss scalar, so a finite loss with a
+    non-finite gradient stepped and poisoned `exp_avg_sq` permanently.
+    """
+    params = list(params)
+    grads = [p.grad for p in params if p.grad is not None]
+    raw_norm = grad_norm(params)
+    if raw_norm.device != loss_finite.device:
+        raw_norm = raw_norm.to(loss_finite.device)
+    finite = loss_finite & torch.isfinite(raw_norm)
+    gate = finite.to(torch.float32)
+    for g in grads:
+        g.nan_to_num_(0.0, 0.0, 0.0)
+        g.mul_(gate.to(g.dtype))
+    return finite
+
+
+def refuse_unwired(cfg, loop: str) -> None:
+    """REFUSE a train field this loop cannot honour, naming field/why/Escape.
+
+    The round-1 ledger's m5: both post-training loops built `MixOptimizer`
+    without `muon_variant`/`muon_sf`, so `--set muon_sf=true` reported an arm
+    that never ran. Those two change the optimizer's MATHS (a direction arm and
+    a schedule-free wrapper with its own LR contract), and their evidence lives
+    in `train()`, not here — refusing beats running an unmeasured arm.
+    `muon_state_dtype`, `ns_dtype` and `muon_sf_wd` are forwarded instead (pure
+    optimizer settings with no loop coupling), and SFT honors `grad_accum`.
+    """
+    if cfg.muon_variant != "muon":
+        loud(
+            f"{loop}: train.muon_variant={cfg.muon_variant!r} changes the Muon "
+            f"direction arm, but this loop has never run that A/B — its evidence is "
+            f"`train()`'s (`tests/test_muon_variants.py`), and accepting the flag "
+            f"here would report an arm whose number does not exist. Escape: "
+            f"muon_variant='muon' (the default), or run `dormouse train` for the arm."
+        )
+    if cfg.muon_sf:
+        loud(
+            f"{loop}: train.muon_sf=true is the schedule-free Muon arm, which needs "
+            f"`train()`'s constant-after-warmup Muon LR and its host-side skip "
+            f"decision (`MixOptimizer.step`); this loop carries neither, so the flag "
+            f"would silently run a different arm. Escape: muon_sf=false (the "
+            f"default), or run `dormouse train` for the arm."
+        )
+
+
 # ---------------------------------------------------------------------------
 # the loop
 # ---------------------------------------------------------------------------
@@ -938,12 +1015,18 @@ def sft_train(
     The schedule is WSD — `wsd_lr` with the run's `warmup_tokens`/`decay_frac`,
     i.e. the SAME schedule `train()` runs, not a second one to keep honest.
 
-    The NaN firewall and the log/JSON cadence are COPIED from `train()`
-    (`loop.py`, the finite-check/skip/count block and the window-drain block), so
-    this loop carries the same two rules: a non-finite step touches no weight and
-    is COUNTED as `nan_skipped`, and two consecutive windows in which every step
-    was non-finite stop the run with a `LoudError`. They are copies because
-    `loop.py` is another lane's file this round.
+    The NaN firewall and the log/JSON cadence are the SAME rules `train()` runs
+    (`loop.py`): a non-finite loss OR gradient touches no weight and is COUNTED
+    as `nan_skipped`, and two consecutive windows in which every step was
+    non-finite stop the run with a `LoudError`. The loss and gradient halves
+    live in [`firewall_loss`]/[`gate_grads`] and are shared with
+    `post/rl_train.py`; `loop.py` keeps its own device-flag form, which a
+    CUDA-graph capture reads.
+
+    `grad_accum > 1` is honoured: the loop reads k micro-batches, backprops
+    each window's summed CE, scales every gradient once by `1/Σ supervised
+    bytes`, and takes ONE optimizer step — the pooled mean of a `batch*k` wide
+    step, not k mean-CE steps.
 
     `device` is the batch seam, as in `train()`: the stream hands out CPU
     tensors and the caller names where the model lives.
@@ -957,6 +1040,8 @@ def sft_train(
     """
     cfg = run.train
     torch.set_float32_matmul_precision("high" if cfg.tf32 else "highest")
+    validate_train(cfg)
+    refuse_unwired(cfg, "sft")
     device = None if device is None else torch.device(device)
     if stream is None:
         stream = ByteStream(cfg.data, cfg.batch, cfg.seq_len)
@@ -998,6 +1083,16 @@ def sft_train(
         ns_steps=cfg.ns_steps,
         ns_kind=cfg.ns_kind,
         colrow_3d=cfg.muon_colrow_3d,
+        # The fields the round-1 ledger's m5 found silently unwired. The two
+        # precision rungs and the SF weight-decay value are forwarded (they are
+        # pure optimizer settings); `muon_variant`/`muon_sf` were refused above,
+        # so the defaults forwarded here are the only values that reach this
+        # call and an arm can never be reported without running.
+        muon_state_dtype=cfg.muon_state_dtype,
+        ns_dtype=cfg.ns_dtype,
+        muon_variant=cfg.muon_variant,
+        muon_sf=cfg.muon_sf,
+        muon_sf_wd=cfg.muon_sf_wd,
     )
     if cfg.optim_8bit:
         opt.enable_bnb8bit()
@@ -1042,15 +1137,16 @@ def sft_train(
         opt.load_state_dict(ck["opt"])
         start = int(ck["step"]) + 1
         if start:
-            # One step consumes `batch x (seq_len + 1)` bytes, so a resume
-            # fast-forwards exactly as far as the run had read (the same
-            # positioning rule as `train()`).
-            stream.skip_bytes(start * (cfg.seq_len + 1) * cfg.batch)
+            # One OPTIMIZER step consumes `grad_accum x batch x (seq_len + 1)`
+            # bytes, so a resume fast-forwards exactly as far as the run had
+            # read (the same positioning rule as `train()`, which also scales
+            # its fast-forward by the accumulation count).
+            stream.skip_bytes(start * (cfg.seq_len + 1) * cfg.batch * cfg.grad_accum)
         log(f"sft resume: step={start} opt_steps={opt.steps}")
 
-    warm = warmup_steps(cfg.warmup_tokens, cfg.batch, cfg.seq_len)
+    warm = warmup_steps(cfg.warmup_tokens, cfg.batch * cfg.grad_accum, cfg.seq_len)
     decay = int(round(cfg.decay_frac * cfg.steps))
-    tokens_per_step = cfg.batch * cfg.seq_len
+    tokens_per_step = cfg.batch * cfg.seq_len * cfg.grad_accum
     total = Counters()
     window = Counters()
     nan_skipped = 0
@@ -1091,31 +1187,59 @@ def sft_train(
             for group in opt.muon.param_groups:
                 group["lr"] = lr
 
-        x, y = stream.next_batch()
-        if device is not None:
-            x, y = x.to(device), y.to(device)
-        mask = sft_mask(x)
-        # `targets=None`: the decode forward. Its logits are the ones generation
-        # samples and the eval's `fin` scores, so SFT trains that readout — the
-        # in-loop `L_Rec` is a pretraining signal and is not built here.
-        logits, _none, step_counters = model(x)
-        assert logits.shape[-1] == run.model.vocab, "logits width != vocab"
-        loss = sft_loss(logits, y, mask)
-        n_mask = int(mask.sum())
-        total.count("sft_bytes", n_mask)
-        window.count("sft_bytes", n_mask)
-        supervised += n_mask
-        total.merge(step_counters)
-        window.merge(step_counters)
+        opt.zero_grad(set_to_none=True)
+        loss_finite = None
+        group_mask = 0
+        group_ce = 0.0
+        for _micro in range(cfg.grad_accum):
+            x, y = stream.next_batch()
+            if device is not None:
+                x, y = x.to(device), y.to(device)
+            mask = sft_mask(x)
+            # `targets=None`: the decode forward. Its logits are the ones
+            # generation samples and the eval's `fin` scores, so SFT trains that
+            # readout — the in-loop `L_Rec` is a pretraining signal and is not
+            # built here.
+            logits, _none, step_counters = model(x)
+            assert logits.shape[-1] == run.model.vocab, "logits width != vocab"
+            loss = sft_loss(logits, y, mask)
+            n_mask = int(mask.sum())
+            total.count("sft_bytes", n_mask)
+            window.count("sft_bytes", n_mask)
+            supervised += n_mask
+            total.merge(step_counters)
+            window.merge(step_counters)
+            # The loss half of the firewall: a non-finite window backprops a
+            # zero seed instead of skipping the backward, so the decision is one
+            # device flag rather than a host branch (see `firewall_loss`). With
+            # `grad_accum > 1` the SUM of the supervised CE is backpropped here
+            # and every gradient is divided by the group's supervised-byte
+            # count below — the pooled mean a `batch*k` wide step computes.
+            step_loss, micro_finite = firewall_loss(loss)
+            loss_finite = micro_finite if loss_finite is None else loss_finite & micro_finite
+            if cfg.grad_accum == 1:
+                step_loss.backward()
+            else:
+                (step_loss * n_mask).backward()
+            group_mask += n_mask
+            group_ce += float(loss.detach()) * n_mask
         timer.tick()
 
-        # ONE host read per step (audit MAJOR 4), same as the train loop.
-        lf = float(loss.detach())
-        finite = math.isfinite(lf)
+        # ONE host read per step (audit MAJOR 4), same as the train loop. The
+        # read is AFTER the backward because the firewall's decision is the AND
+        # of the loss flag and the device gradient norm — a finite loss with a
+        # non-finite gradient must skip the step too (round-1 ledger m3).
+        finite = bool(gate_grads(model.parameters(), loss_finite))
+        inv = 1.0 / max(group_mask, 1) if cfg.grad_accum > 1 else 1.0
+        if cfg.grad_accum > 1:
+            for p in model.parameters():
+                if p.grad is not None:
+                    p.grad.mul_(inv)
+            lf = group_ce * inv
+        else:
+            lf = float(loss.detach())
         window_finite.append(finite)
         if finite:
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
             if cfg.grad_clip > 0:
                 clip_grads(model.parameters(), cfg.grad_clip)
             opt.step()
@@ -1132,8 +1256,11 @@ def sft_train(
                 # optimizer — the same rule and the same counters as `train()`
                 # (`loop.py:761-772`): the loop reads the memory once per
                 # ITERATION and `host_step` sums those into one update per row,
-                # and a NaN-skipped step (below) updates nothing.
-                updates, rows = host_step_all(model, lr)
+                # and a NaN-skipped step (below) updates nothing. With
+                # `grad_accum > 1` the pending leaves are ALL the group's
+                # micro-batches, and their 1/Σn scale is applied to the rows
+                # once, here.
+                updates, rows = host_step_all(model, lr * inv)
                 total.count("engram_host_updates", updates)
                 window.count("engram_host_updates", updates)
                 total.count("engram_host_update_rows", rows)
@@ -1196,6 +1323,12 @@ def sft_train(
                 )
 
         if eval_stream is not None and (step + 1) % cfg.eval_every == 0:
+            # `rewind()` first, always: an eval that inherits the stream
+            # position is not comparable with the previous one (AGENTS §2.6;
+            # the pretrain loop's `_eval_loss` carries the same line). Without
+            # it a holdout larger than one eval window measured 0.0106 nats of
+            # pure position noise at frozen weights — round-1 ledger M2.
+            eval_stream.rewind()
             model.eval()
             ce_total = 0.0
             batches = 0
