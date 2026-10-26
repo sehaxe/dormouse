@@ -403,6 +403,11 @@ def source_size(name: str, path: Path) -> int:
 def per_source_bytes(plan: MixPlan, steps: int, batch: int, seq_len: int) -> dict[str, int]:
     """Expected bytes per source: `steps_in_stage × window × weight`, summed over stages.
 
+    `steps` is the number of `next_batch()` calls the run will make — MICRO-
+    batches, i.e. `train.steps × grad_accum` — because that is what the stream
+    counts. `train/loop.py` passes exactly that, so the schedule and this
+    expectation cannot disagree about how much of each source is read.
+
     The draw is i.i.d. per step, so a realized count differs from this by
     `O(sqrt(n))` windows — it is the EXPECTATION the epoch cap is argued from,
     exactly as the research doc's table computes it.
@@ -476,6 +481,10 @@ def check_epoch_cap(
 class MixtureStream:
     """`ByteStream`'s interface over N sources: one whole batch per step, staged.
 
+    `steps` is the number of `next_batch()` calls (MICRO-batches), because the
+    stage and source of a draw are pure functions of that index. The trainer
+    passes `train.steps × grad_accum`.
+
     A source is a `.bin` FILE or a shard DIRECTORY (`open_source`): the
     directory mode reads the mount's `*.txt` shards in a seeded shuffled order
     and is the reason this class exists at 227 GB, where a concatenated corpus
@@ -520,7 +529,7 @@ class MixtureStream:
 
     @property
     def step(self) -> int:
-        """The step index of the NEXT batch."""
+        """The MICRO-batch index of the NEXT batch (one `next_batch()` call)."""
         return self._step
 
     @property
@@ -573,6 +582,14 @@ class MixtureStream:
         for name, stream in self._streams.items():
             stream.skip_bytes(served[name])
         self._step = steps
+        # The resume contract: `steps` micro-batches were replayed, so the next
+        # draw is the one an unbroken run would make (the stage and source are
+        # pure functions of this index), and every source got exactly its share.
+        assert self._step == steps
+        assert sum(served.values()) == n, (
+            f"skip_bytes({n}): the replay served {sum(served.values())} B, not the "
+            f"whole fast-forward"
+        )
 
     def close(self) -> None:
         for stream in self._streams.values():
@@ -591,7 +608,10 @@ def open_mixture(
 ) -> MixtureStream:
     """Load a plan, run the epoch-cap guard, and build the stream — one call.
 
-    This is what the trainer's data seam calls when `mix_plan` is set:
+    `steps` is the MICRO-batch budget (the number of `next_batch()` calls the
+    run will make: `train.steps × grad_accum`) — the same unit the stream
+    counts, so the stage schedule and `check_epoch_cap` cannot disagree. This
+    is what the trainer's data seam calls when `mix_plan` is set:
     `MixtureStream(load_mix_plan(p), batch, seq_len, steps)` plus the refusal,
     which is the part a caller must not be able to forget.
     """

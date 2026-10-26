@@ -338,6 +338,9 @@ class ByteStream:
         self._buf = bytearray()
         self._pos = self.lo
         self._rng_lo = self.lo
+        #: `(requested, granted)` when `open_streams` capped the eval tail at
+        #: 1 MiB; `None` is the uncapped path (no line, no changed number).
+        self.eval_tail_capped: tuple[int, int] | None = None
 
     # -- ring -----------------------------------------------------------
     def _refill(self) -> None:
@@ -416,6 +419,37 @@ def eval_window_bytes(cfg: TrainConfig) -> int:
     return cfg.eval_batches * cfg.batch * cfg.seq_len
 
 
+def distinct_scored_bytes(stream: ByteStream, batches: int) -> int:
+    """How many DISTINCT byte positions `batches` windows of `stream` score.
+
+    `over N B` on the eval line is a count of scored tokens: for a window that
+    fits in the stream's range it is `batches × batch × seq_len`. Above the
+    eval tail's 1 MiB cap the window is LONGER than the range, `next_batch`
+    wraps to `lo`, and the same bytes are scored again — summing `x.numel()`
+    then counts duplicates (measured: 100 × 16 × 1024 = 1 638 400 requested
+    over a 1 048 576 B range, batch 15 byte-identical to batch 0). This walks
+    the same positions the loop reads and counts each once. The `total <= span`
+    fast path is exactly the old number, so an uncapped window does not move.
+    """
+    span = stream.hi - stream.lo
+    total = batches * stream.batch * stream.seq_len
+    if span <= 0 or total <= span:
+        return total
+    window = stream.batch * (stream.seq_len + 1)
+    seen = bytearray(span)
+    for k in range(batches):
+        base = (k * window) % span
+        for row in range(stream.batch):
+            start = (base + row * (stream.seq_len + 1)) % span
+            end = start + stream.seq_len
+            if end <= span:
+                seen[start:end] = b"\x01" * stream.seq_len
+            else:
+                seen[start:] = b"\x01" * (span - start)
+                seen[: end - span] = b"\x01" * (end - span)
+    return sum(seen)
+
+
 def split_points(size: int, eval_bytes: int) -> tuple[int, int]:
     """`(hi_train, hi_total)`: the eval tail is the LAST `eval_bytes` bytes."""
     if eval_bytes < 0:
@@ -459,6 +493,20 @@ def open_streams(run, *, ring_bytes: int = DEFAULT_RING) -> tuple[ByteStream, By
         if tr.eval
         else None
     )
+    requested = eval_window_bytes(tr) if tr.eval else 0
+    if ev is not None and ev_bytes < requested:
+        # COUNTED, never silent: the request is larger than the tail this
+        # stream may read, so the stream wraps and the eval re-scores bytes it
+        # already scored. The eval line prints `eval_tail_capped=req/granted`
+        # and its `over N B` counts DISTINCT bytes (`distinct_scored_bytes`).
+        ev.eval_tail_capped = (requested, ev_bytes)
+        print(
+            f"eval_tail_capped={requested}/{ev_bytes}: eval_batches x batch x seq_len "
+            f"asks for {requested} B but the eval tail is capped at {ev_bytes} B; the "
+            f"stream wraps and `over N B` counts distinct bytes only. Escape: shrink "
+            f"eval_batches/batch/seq_len below {1 << 20} B, or point eval_data at a "
+            f"larger held-out file."
+        )
     return train, ev
 
 

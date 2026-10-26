@@ -38,10 +38,10 @@ from ..model.engram import (
 from ..model.experts import invalidate_banks_all
 from ..model.qat_cache import invalidate_qat_cache_all
 from ..model.tsct import set_mm_dtype
-from .data import ByteStream, eval_window_bytes, open_streams, warmup_steps
+from .data import ByteStream, distinct_scored_bytes, eval_window_bytes, open_streams, warmup_steps
 from .graph import FullGraph, OptimizerGraph, full_graph_refusal
 from .lr import wsd_lr
-from .mixture import open_mixture
+from .mixture import MixtureStream, open_mixture
 from .optim import MixOptimizer, clip_grads, grad_norm
 
 
@@ -189,6 +189,107 @@ def _checkpoint_half(sd: dict, rung: str) -> dict:
     return sd
 
 
+class _ModelHalf(dict):
+    """The model half of a checkpoint, plus the parts that are NOT `state_dict` keys.
+
+    `moe` is the LFB-bias section (`save_ckpt`). The biases are non-persistent
+    buffers on purpose — the optimizer must not see them and `state_dict()` must
+    not grow a routing integrator — so a strict `load_state_dict` cannot carry
+    them, while `ck["model"]` must stay exactly `state_dict()`-shaped (that is
+    what every direct `load_state_dict(ck["model"])` caller and the prefix test
+    assume). The attribute is how the ONE loader reaches them.
+    """
+
+    #: `{module name: lfb_bias}`; `None` is a file written before the section.
+    moe: dict[str, torch.Tensor] | None = None
+    #: A training load refuses a file whose controller state is missing when
+    #: `moe_lb_coef != 0`; a reader prints the COUNTED line instead (`load_model_half`).
+    refuse_missing_moe: bool = False
+
+
+def _lfb_modules(model: torch.nn.Module) -> dict[str, torch.nn.Module]:
+    """The LFB modules by CHECKPOINT name: `torch.compile`'s `_orig_mod.` stripped."""
+    return {
+        name.removeprefix("_orig_mod."): m
+        for name, m in model.named_modules()
+        if getattr(m, "lfb_bias", None) is not None
+    }
+
+
+def lfb_state(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """`{module name: lfb_bias}` — the routing controller's integrator OUTPUT.
+
+    `lfb_bias` is not reconstructible from the persistent `lfb_counts`
+    (`b_e -= coef·sign(L_e − mean L)` is the integrator's state, not a function
+    of the cumulative load), so it travels in the checkpoint's `moe` section.
+    """
+    return {
+        name: m.lfb_bias.detach().to("cpu", copy=True) for name, m in _lfb_modules(model).items()
+    }
+
+
+def _with_moe(sd: dict, moe: dict | None, *, refuse: bool) -> _ModelHalf:
+    """Wrap a model half and attach the `moe` section (may be `None` = pre-section file)."""
+    half = _ModelHalf(sd)
+    half.moe = None if moe is None else {str(k): v for k, v in moe.items()}
+    half.refuse_missing_moe = refuse
+    return half
+
+
+def _carries_lfb_counts(sd: dict) -> bool:
+    """Whether this model half carries the LFB integrator's persistent counter."""
+    return any(k == "lfb_counts" or k.endswith(".lfb_counts") for k in sd)
+
+
+def _refuse_missing_lfb(where: str, coef: float) -> None:
+    """REFUSE, never guess: a checkpoint with `lfb_counts` but no `lfb_bias`.
+
+    The prejudice is `load_host_state`'s (a `.ngram` file without `counts`): the
+    missing half IS controller state that no later step can recover, so a zero
+    default silently trains — or serves — a different router under the same step
+    count. Measured on the 4+resume repro at `moe_lb_coef=0.01`: 50 of 51
+    tensors differ; at `0.0` the run is bit-exact.
+    """
+    loud(
+        f"{where} carries `lfb_counts` but no `lfb_bias`, and this run has "
+        f"moe_lb_coef={coef:g}. The bias is the routing controller's OUTPUT "
+        f"(`b_e -= coef·sign(L_e − mean L)`); it cannot be derived from the "
+        f"cumulative counts, so starting it at zero would train a DIFFERENT router "
+        f"from the one this step count claims (measured: 50/51 tensors differ after "
+        f"4+4 steps at coef=0.01, bit-exact at coef=0). Escape: resume this file on "
+        f"the commit that wrote it, set moe_lb_coef=0 (the controller then never "
+        f"moves the bias), or start a new ckpt_name."
+    )
+
+
+def _restore_lfb(model: torch.nn.Module, moe: dict[str, torch.Tensor], *, where: str) -> int:
+    """Copy a checkpoint's `moe` section into the model's LFB buffers, LOUD on a mismatch."""
+    live = _lfb_modules(model)
+    missing = sorted(set(live) - set(moe))
+    unknown = sorted(set(moe) - set(live))
+    if missing or unknown:
+        loud(
+            f"{where}: the `moe` section names {len(moe)} LFB module(s) but this "
+            f"model has {len(live)} (missing={missing[:4]}, unknown={unknown[:4]}). "
+            f"Escape: load with the config/preset the file was written from, or "
+            f"start a new ckpt_name."
+        )
+    with torch.no_grad():
+        for name, module in live.items():
+            src = moe[name]
+            if tuple(src.shape) != tuple(module.lfb_bias.shape):
+                loud(
+                    f"{where}: `{name}.lfb_bias` is {tuple(src.shape)} in the file "
+                    f"but {tuple(module.lfb_bias.shape)} in this model. Escape: the "
+                    f"config the file was written from."
+                )
+            module.lfb_bias.copy_(
+                src.to(device=module.lfb_bias.device, dtype=module.lfb_bias.dtype)
+            )
+
+    return len(live)
+
+
 def save_ckpt(
     run: RunConfig,
     model: torch.nn.Module,
@@ -227,6 +328,12 @@ def save_ckpt(
         "opt": opt.state_dict(),
         "step": step,
         "model_quant_rung": rung or None,
+        # The LFB bias is the other half of the routing controller (`lfb_counts`
+        # rides in `model` as a persistent buffer); it is non-persistent because
+        # `state_dict()` is the OPTIMIZER's view of the model. A file that
+        # restored only the counts would restart the integrator at zero — the
+        # measured 50/51-tensor divergence of a 4+resume at moe_lb_coef=0.01.
+        "moe": lfb_state(model),
     }
     if ema is not None:
         payload["model_ema"] = _checkpoint_half(ema, rung)
@@ -283,12 +390,28 @@ def load_model_half(weights: Path) -> dict:
     training copy under `model`; this reader PREFERS the former, so eval,
     decode, serve and chat all score the averaged model while `load_ckpt`'s
     resume still continues the raw iterate and its optimizer state.
+
+    The `moe` section (the LFB biases) is attached to the returned half and the
+    ONE loader applies it. A file written before the section existed CANNOT be
+    served with the router it trained (the bias is not derivable), so that is
+    COUNTED here rather than silent; a training load of the same file REFUSES
+    (`_refuse_missing_lfb`).
     """
     ck = torch.load(weights, map_location="cpu", weights_only=False)
     half = ck.get("model_ema")
     if half is None:
         half = ck["model"]
-    return unpack_state_dict(half, ck.get("model_quant_rung"))
+    sd = unpack_state_dict(half, ck.get("model_quant_rung"))
+    moe = ck.get("moe")
+    if moe is None and _carries_lfb_counts(sd):
+        print(
+            f"router: {weights} carries lfb_counts but no lfb_bias (a file written "
+            f"before the LFB section existed); serving it with a ZERO bias, i.e. a "
+            f"different router than a moe_lb_coef>0 run trained. Escape: resume it "
+            f"on the commit that wrote it (a resume refuses), or serve a file "
+            f"written by this build."
+        )
+    return _with_moe(sd, moe, refuse=False)
 
 
 def require_ngram(cfg: TrainConfig) -> None:
@@ -433,11 +556,28 @@ def load_model_state(model: torch.nn.Module, cfg: TrainConfig, sd: dict, *, stri
     `enable_host_tables` (not `host_tables`) is the call: the CUDA-only refusal
     is a training VRAM-budget rule, and a load must work on `--device cpu`.
     A missing sibling is LOUD (`require_ngram`), never freshly seeded rows.
+
+    The LFB rule is the same shape: `lfb_bias` is a non-persistent buffer, so
+    it travels in the checkpoint's `moe` section and is copied here — after
+    `load_state_dict`, because the buffers are the live module's. A half that
+    says it came from a TRAINING load and carries `lfb_counts` without the
+    bias is refused when the controller is live (`_refuse_missing_lfb`);
+    a reader (`load_model_half`) has already COUNTED the zero-bias line.
     """
     if cfg.engram_ram:
         require_ngram(cfg)
         enable_host_tables(model, bias_correction=cfg.engram_bias_correction)  # idempotent
+    moe = getattr(sd, "moe", None)
+    refuse = bool(getattr(sd, "refuse_missing_moe", False))
     result = model.load_state_dict(sd, strict=strict)
+    if moe is not None:
+        _restore_lfb(model, moe, where=f"{len(moe)}-module `moe` section")
+    elif refuse and _carries_lfb_counts(sd):
+        # The EFFECTIVE coefficient is the model's (the preset's, or the
+        # snapshot's after `init_controller` rewrote it) — not the CLI's guess.
+        coef = max((float(m.lfb_coef) for m in _lfb_modules(model).values()), default=0.0)
+        if coef != 0.0:
+            _refuse_missing_lfb("the checkpoint", coef)
     if cfg.engram_ram:
         load_host_state(model, load_ngram(cfg))
     return result
@@ -478,7 +618,11 @@ def load_ckpt(run: RunConfig) -> tuple[dict, RunConfig]:
     # side is allowed to differ from the save side — the file's rung is what
     # describes the values, and a checkpoint is legal evidence for a bf16 run
     # starting from fp8-rounded init; the snapshot gate above handles intent.
-    ck["model"] = unpack_state_dict(ck["model"], ck.get("model_quant_rung"))
+    ck["model"] = _with_moe(
+        unpack_state_dict(ck["model"], ck.get("model_quant_rung")),
+        ck.get("moe"),
+        refuse=True,
+    )
     # The EMA copy travels beside the raw one (`save_ckpt`). It is unpacked by
     # the same rule, and a file without it is a legal resume: the run starts
     # the shadow from the loaded weights (COUNTED in `train`'s log).
@@ -642,6 +786,12 @@ def _eval_loss(
                 for i, v in enumerate(per):
                     per_iter_acc[i] += v
     n = max(batches, 1)
+    if getattr(stream, "eval_tail_capped", None) is not None:
+        # The tail is capped below the requested window, so the stream wrapped
+        # and `scored` above counts duplicate rows. The printed figure is the
+        # DISTINCT bytes those windows scored (the cap's own COUNTED line
+        # names the requested/granted sizes).
+        scored = distinct_scored_bytes(stream, batches)
     model.train(was_training)
     if counters is not None:
         counters.merge(ev_counters)
@@ -719,6 +869,9 @@ def _eval_line(
         f"({cfg.eval_batches} x {cfg.batch} x {cfg.seq_len}) "
         f"engram={eng.get('engram_rows', 0)}/{eng.get('engram_arms', 0)}"
     )
+    capped = getattr(stream, "eval_tail_capped", None)
+    if capped is not None:
+        line += f" eval_tail_capped={capped[0]}/{capped[1]}"
 
     if per_iter:
         line += " periter=" + ",".join(f"{v:.4f}" for v in per_iter)
@@ -782,11 +935,15 @@ def train(
     if stream is None:
         if run.train.mix_plan:
             # The staged mixture (train/mixture.py): N sources interleaved by
-            # per-stage weights, epoch-capped LOUD. The eval side is unchanged
-            # (the same held-out file and window), so BPB stays comparable.
+            # per-stage weights, epoch-capped LOUD. Its counter is MICRO-BATCHES:
+            # the loop draws `grad_accum` windows per optimizer step, so the
+            # schedule and the epoch cap both take `steps x grad_accum` (passing
+            # `steps` ran the mix `grad_accum`x fast — stages at opt steps 18/23
+            # instead of 70/90 — and under-counted bytes by the same factor).
+            micro_steps = run.train.steps * run.train.grad_accum
             stream = open_mixture(
                 run.train.mix_plan,
-                steps=run.train.steps,
+                steps=micro_steps,
                 batch=run.train.batch,
                 seq_len=run.train.seq_len,
                 seed=run.train.seed,
@@ -795,7 +952,9 @@ def train(
             _, eval_stream = open_streams(run)
             log(
                 f"mix_plan={run.train.mix_plan}: {len(stream.plan.sources)} sources, "
-                f"{len(stream.plan.stages)} stage(s), max_epochs={run.train.max_epochs}"
+                f"{len(stream.plan.stages)} stage(s), steps={micro_steps} micro-batches "
+                f"({run.train.steps} x grad_accum={run.train.grad_accum}), "
+                f"max_epochs={run.train.max_epochs}"
             )
         else:
             stream, eval_stream = open_streams(run)
@@ -911,11 +1070,16 @@ def train(
         if half is None:
             half = foreign.get("model", foreign)
         sd = unpack_state_dict(half, foreign.get("model_quant_rung"))
+        # The LFB coefficient is the CHECKPOINT's (init_controller), and it
+        # decides whether a missing `moe` section is a refusal: resolving the
+        # controller before the load is what lets the escape it documents
+        # (`moe_lb_coef=0` carried from the snapshot) actually apply.
+        run = init_controller(run, model, path, log=log)
+        sd = _with_moe(sd, foreign.get("moe"), refuse=True)
         # The ONE loader: an `engram_ram` checkpoint has no `engram.tables` in the
         # model half and needs its `.ngram` sibling, which `load_model_state`
         # restores (a missing sibling is its LOUD refusal, never fresh rows).
         load_model_state(model, init_cfg(cfg, path, sd, model), sd)
-        run = init_controller(run, model, path, log=log)
         log(
             f"init: weights from {path} (step {foreign.get('step', '?')}), "
             "fresh optimizer and snapshot — the forward may differ from the one "
@@ -930,7 +1094,14 @@ def train(
         if start:
             # A resumed run must continue on UNSEEN bytes: the burn failure
             # this prevents is re-reading (and memorizing) the corpus head.
+            # `grad_accum` micro-batches were drawn per optimizer step, and
+            # `MixtureStream.skip_bytes` replays exactly that many draws.
             stream.skip_bytes(start * (cfg.seq_len + 1) * cfg.batch * cfg.grad_accum)
+            if isinstance(stream, MixtureStream):
+                assert stream.step == start * cfg.grad_accum, (
+                    f"resume skipped {stream.step} micro-batches, expected "
+                    f"{start} x grad_accum={cfg.grad_accum}"
+                )
         # The checkpoint's model half is the X iterate (a checkpoint is written
         # with the eval switch on, below), and so is the optimizer's own `x`, so
         # the params must go back to Y before the next forward. The switch is an
