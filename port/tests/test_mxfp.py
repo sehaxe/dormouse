@@ -181,7 +181,8 @@ def test_mxfp4_hand_block_matches_scalar_reference_bit_for_bit() -> None:
     assert scales.flatten().tolist() == [ref_code] == [127], "amax 6 ⇒ e8m0 0x7F = 2^0"
     assert dequant.flatten().float().tolist() == _ref_block_values(block), "values differ"
     # ...and not a 3-level quantizer wearing an fp4 label (AGENTS §3.7 act-quant):
-    codes = {c for byte in ref_packed for c in (byte & 0xF, byte >> 4)}
+    # the codes come from the QUANTIZER's bytes, not from the reference's.
+    codes = {c for byte in packed.flatten().tolist() for c in (byte & 0xF, byte >> 4)}
     assert {c & 7 for c in codes} == set(range(8)), "all 8 magnitudes must be reachable"
     assert codes == set(range(16)) - {8}, "each magnitude with each sign; no negative zero"
     assert 8 not in codes, "a zero magnitude carries no sign (code 8 is the unused one)"

@@ -299,7 +299,15 @@ class ShardStream:
 
 
 class ByteStream:
-    """A read-only ring over `[lo, hi)` of a memory-mapped file."""
+    """A read-only ring over `[lo, hi)` of a memory-mapped file.
+
+    The wrap is BYTE-EXACT: byte `hi - 1` is followed by byte `lo`, so one cycle
+    is the range's `hi - lo` bytes in file order and a window that straddles the
+    end is the range's tail followed by its head — nothing is skipped or
+    repeated at the seam (`tests/test_data.py` scans a full cycle). `_pos` is
+    the next byte to read and stays in `[lo, hi)`; `rewind()` and
+    `skip_bytes()` only ever move it inside that range.
+    """
 
     def __init__(
         self,
@@ -348,8 +356,10 @@ class ByteStream:
         assert want > 0, "the ring is full and still cannot satisfy the request"
         take = min(want, self.hi - self._pos)
         if take <= 0:
-            # End of the range: wrap. This is the ring's whole point — the
-            # stream is a fixed byte range read repeatedly, not a file cursor.
+            # End of the range: wrap to the FIRST byte, byte-exact. This is the
+            # ring's whole point — the stream is a fixed byte range read
+            # repeatedly, not a file cursor — and `lo`, not `lo + k`, is what
+            # keeps the cycle free of skips and repeats.
             self._pos = self.lo
             take = min(want, self.hi - self._pos)
         self._buf += self._mm[self._pos : self._pos + take]

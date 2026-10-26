@@ -40,7 +40,7 @@ from ..model.qat_cache import invalidate_qat_cache_all
 from ..model.tsct import set_mm_dtype
 from .data import ByteStream, distinct_scored_bytes, eval_window_bytes, open_streams, warmup_steps
 from .graph import FullGraph, OptimizerGraph, full_graph_refusal
-from .lr import wsd_lr
+from .lr import anneal_alpha, wsd_lr
 from .mixture import MixtureStream, open_mixture
 from .optim import MixOptimizer, clip_grads, grad_norm
 
@@ -1443,11 +1443,11 @@ def train(
 
         # The ANNEALED factor_qat arm: burn-spectral's measured soft-to-hard
         # ramp (`ste_ternary_annealed`, "converges better than hard STE from
-        # step one"). alpha = min(1, step/anneal) is a PURE function of the
-        # step, so a resume lands on the same alpha. `anneal = 0` (default)
-        # leaves every module's constant alpha untouched.
+        # step one"). `anneal_alpha` is a PURE function of the step, so a
+        # resume lands on the same alpha. `anneal = 0` (default) leaves every
+        # module's constant alpha untouched.
         if anneal_steps > 0:
-            model.set_factor_qat_alpha(min(1.0, step / anneal_steps))
+            model.set_factor_qat_alpha(anneal_alpha(step, anneal_steps))
 
         # The ADAPTIVE DEPTH arm: T is the pure `(seed, step)` sample, and the
         # loss divides by the depth actually run (`model.forward`/`loopblock`).

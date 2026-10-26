@@ -12,7 +12,7 @@ from .data import (
 )
 from .graph import GRAPH_WARMUP_STEPS, OptimizerGraph
 from .loop import bpb, evaluate, kda_field, load_ckpt, save_ckpt, train
-from .lr import wsd_lr
+from .lr import anneal_alpha, wsd_lr
 from .optim import JORDAN_NS_COEFFS, MixOptimizer, Muon, is_muon_param, zeropower_via_ns
 
 __all__ = [
@@ -23,6 +23,7 @@ __all__ = [
     "Muon",
     "OptimizerGraph",
     "ShardStream",
+    "anneal_alpha",
     "bpb",
     "eval_window_bytes",
     "evaluate",

@@ -195,7 +195,10 @@ def test_f_the_offloaded_arm_is_exact_on_the_padded_bank_at_bf16():
         }
     assert set(grads[False]) == set(grads[True]) != set()
     assert (out[True] - out[False]).abs().max() <= 2e-3 * out[False].abs().max()
-    assert (out[True] - out[False]).abs().max() <= 2e-3 * out[False].abs().max()
+    # ... and the same bound as a NORM ratio, which the absolute check cannot
+    # state (a large output hides a small relative error and vice versa).
+    rel_out = float((out[True] - out[False]).norm() / (out[False].norm() + 1e-12))
+    assert rel_out <= 2e-3, f"output rel={rel_out:.3e} exceeds 2e-3"
     worst, where = 0.0, ""
     for name, g in grads[False].items():
         rel = float((g - grads[True][name]).norm()) / max(float(g.norm()), 1e-12)
