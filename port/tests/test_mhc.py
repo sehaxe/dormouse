@@ -96,6 +96,10 @@ def test_sinkhorn_is_doubly_stochastic_and_non_negative():
     streams = torch.randn(2, 3, 2, 8)
     for label in ("init", "perturbed"):
         if label == "perturbed":
+            # Seeded: the assertion is 1e-5 and an unseeded normal_() hits
+            # 1.37e-5 by chance on ~1 run in 5 (observed 2026-10-27), i.e. the
+            # gate could go red without any code changing.
+            torch.manual_seed(20261027)
             with torch.no_grad():
                 mix.b_res.normal_(0.0, 1.0)
         _, _, h_res = mix.hyper_mappings(streams)
