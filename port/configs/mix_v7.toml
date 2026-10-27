@@ -1,0 +1,88 @@
+# port mix plan: v7 — the corpus built from the OPEN, classifier-filtered sets.
+#
+# What changed against v4: the English web share is no longer the raw crawl from
+# the local mount (which measured as unfiltered Common Crawl and gave only x1.07
+# from our own heuristics, 2026-10-23). It is FineWeb-Edu — the same crawl after
+# a teacher-trained educational classifier — plus Cosmopedia (textbook-style
+# explanations) and, new as a domain, peS2o open research papers.
+#
+# Target shares over the 22.2 GB on disk (docs/guides/dataset.md records the
+# measured per-domain sizes and the three named source deviations of v4):
+#
+#   fwedu      42%   FineWeb-Edu, ODC-BY
+#   cosmo      10%   Cosmopedia v2, ODC-BY  (explanations, not facts)
+#   ru         12%   fineweb-2 rus_Cyrl, ODC-BY
+#   code       12%   codeparrot/github-code-clean, Apache-2.0 (still 7 languages:
+#                    starcoderdata / Nemotron-CC-Code are gated 401)
+#   math        5%   mix4 math (local LaTeX, filtered)
+#   finemath    4%   finemath-3plus, ODC-BY (math web, quality filtered)
+#   science     5%   peS2o v2, ODC-BY — the first real science-prose domain here
+#   wiki_en     4%   mix4
+#   wiki_ru     2%   mix4
+#   reasoning   2%   mix4 CoT traces
+#   instruct    1%   mix4 clean pairs
+#   rudialog    1%   mix4
+#
+# S1 prose, S2 adds code+math+science, S3 is the decay stage: math/code/science
+# up, instructions weighted up. Weights are a probability vector per stage
+# (mixer.py refuses otherwise).
+
+max_epochs = 4.0
+seed = 20261027
+
+[sources]
+fwedu = "/home/sehaxe/dormouse/data_local/best/fwedu.bin"
+cosmo = "/home/sehaxe/dormouse/data_local/best/cosmo.bin"
+ru = "/home/sehaxe/dormouse/data_local/best/ru.bin"
+math = "/home/sehaxe/dormouse/data_local/mix4/math.bin"
+finemath = "/home/sehaxe/dormouse/data_local/best/finemath.bin"
+science = "/home/sehaxe/dormouse/data_local/best/science.bin"
+code = "/home/sehaxe/dormouse/data_local/mix4/code.bin"
+wiki_en = "/home/sehaxe/dormouse/data_local/mix4/wiki_en.bin"
+wiki_ru = "/home/sehaxe/dormouse/data_local/mix4/wiki_ru.bin"
+reasoning = "/home/sehaxe/dormouse/data_local/mix4/reasoning.bin"
+instruct = "/home/sehaxe/dormouse/data_local/mix4/instruct.bin"
+rudialog = "/home/sehaxe/dormouse/data_local/mix4/rudialog.bin"
+
+[[stage]]
+until_frac = 0.42
+[stage.weights]
+fwedu = 0.58
+cosmo = 0.12
+ru = 0.165
+wiki_en = 0.055
+wiki_ru = 0.027
+rudialog = 0.014
+instruct = 0.011
+reasoning = 0.028
+
+[[stage]]
+until_frac = 0.80
+[stage.weights]
+fwedu = 0.40
+cosmo = 0.10
+ru = 0.12
+code = 0.13
+math = 0.05
+finemath = 0.04
+science = 0.05
+wiki_en = 0.04
+wiki_ru = 0.02
+reasoning = 0.02
+instruct = 0.015
+rudialog = 0.015
+
+[[stage]]
+until_frac = 1.0
+[stage.weights]
+fwedu = 0.22
+cosmo = 0.08
+ru = 0.08
+code = 0.24
+math = 0.09
+finemath = 0.08
+science = 0.09
+instruct = 0.05
+reasoning = 0.04
+wiki_en = 0.02
+wiki_ru = 0.01
