@@ -42,6 +42,7 @@ import math
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from ..instrument import Counters
 from .tsct import dense_qat_kind, qat_linear
@@ -66,6 +67,8 @@ class FullAttention(nn.Module):
         self.head_dim = hd
         self.scale = 1.0 / math.sqrt(hd)
         self.compute_dtype = torch.bfloat16 if cfg.bf16 else torch.float32
+        #: see ModelConfig.sdpa_mem_efficient (measured 2.1x on sm_120)
+        self.sdpa_mem_efficient = bool(getattr(cfg, "sdpa_mem_efficient", False))
         #: `dense_qat`'s per-site rule, the same call shape KDA makes: all four
         #: projections are ATTENTION sites (`tsct.DENSE_QAT_ATTN_SITES`), so the
         #: default `dense_qat_skip_attn` keeps them bf16 and an explicitly
@@ -106,13 +109,33 @@ class FullAttention(nn.Module):
         if dt != x.dtype:
             q, k, v = q.to(dt), k.to(dt), v.to(dt)
         # [b, t, h, hd] → [b, h, t, hd]: SDPA's query/key/value layout.
-        y = F.scaled_dot_product_attention(
-            q.transpose(1, 2),
-            k.transpose(1, 2),
-            v.transpose(1, 2),
-            is_causal=True,
-            scale=self.scale,
-        )
+        #
+        # THE BACKEND IS NOT NEUTRAL ON THIS CARD. Measured 2026-10-27 on the
+        # RTX 5060 Ti (sm_120, torch 2.13.0+cu129), b=8 h=16 t=1024 hd=64 bf16
+        # causal: flash 1.91 ms, EFFICIENT 0.91 ms, math 19.05 ms. PyTorch picks
+        # flash by default, i.e. 2.1x SLOWER than the memory-efficient kernel on
+        # this device. `sdpa_mem_efficient` (default False, so every number on
+        # record keeps its backend) forces EFFICIENT and records which kernel
+        # actually ran in `sdpa_backend`, so a run cannot silently drift.
+        if getattr(self, "sdpa_mem_efficient", False):
+            with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
+                y = F.scaled_dot_product_attention(
+                    q.transpose(1, 2),
+                    k.transpose(1, 2),
+                    v.transpose(1, 2),
+                    is_causal=True,
+                    scale=self.scale,
+                )
+            counters.count("sdpa_mem_efficient")
+        else:
+            y = F.scaled_dot_product_attention(
+                q.transpose(1, 2),
+                k.transpose(1, 2),
+                v.transpose(1, 2),
+                is_causal=True,
+                scale=self.scale,
+            )
+            counters.count("sdpa_default_backend")
         y = y.transpose(1, 2).reshape(b, t, d)
         if dt != x.dtype:
             y = y.to(x.dtype)

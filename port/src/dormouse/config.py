@@ -840,6 +840,12 @@ class ModelConfig:
     #: `msa_capacity_ratio` = the arm's share of the attention demand (owner:
     #: 1/4 of KDA's); `adaptive_msa` = the model decides WHERE that 1/4 goes
     #: (per-iteration learned share, mean = the ratio; the `msa_gate` blend).
+    #: Force the memory-efficient SDPA kernel instead of whatever PyTorch picks.
+    #: Measured on the RTX 5060 Ti (sm_120, torch 2.13.0+cu129), b8 h16 t1024
+    #: hd64 bf16 causal: flash 1.91 ms, EFFICIENT 0.91 ms -- PyTorch's default
+    #: (flash) is 2.1x SLOWER here. Default False so every number on record keeps
+    #: the backend it ran with; a run that turns it on records `sdpa_mem_efficient`.
+    sdpa_mem_efficient: bool = False
     use_msa: bool = False
     msa_topk: int = 32
     msa_block: int = 4
