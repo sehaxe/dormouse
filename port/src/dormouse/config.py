@@ -504,6 +504,15 @@ class ModelConfig:
     #: Lanes. Only K=2 ships: it is the configuration the paper measured and
     #: the one the review wires; `validate` refuses anything else.
     mhc_streams: int = 2
+    #: The residual chain as fused Triton kernels (`model/fused_residual.py`):
+    #: `H_pre`'s mix, the AttnRes write, `H_res`/`H_post` and the lane readout
+    #: become two forward launches and two backward launches per iteration
+    #: instead of ~780 (`tests/test_fused_residual.py` pins the count and the
+    #: parity). OFF by default and bit-identical when off: the eager lines run
+    #: unchanged. Needs `use_mhc` (there is no lane state to fuse without it —
+    #: `validate` refuses the pair), K=2, and fp32 lanes; a CPU host is a
+    #: COUNTED fallback (`fused_residual_fallback`), not a silent one.
+    fused_residual: bool = False
     #: LOOM (`2610.01153`, 2026-10-01; scanned in
     #: `docs/research/2026-10-16-new-tech-scan.md` §2.1, whose row names our
     #: own `max_iter 4` / operating depth 2 as exactly the regime that paper
@@ -2145,6 +2154,18 @@ def validate(model: ModelConfig) -> None:
             f"mhc_streams={model.mhc_streams} with use_mhc=false is inert — the "
             f"field would name a K no lane carries. Escape: use_mhc=true (K=2), or "
             f"leave mhc_streams at its default 2."
+        )
+    if model.fused_residual and not model.use_mhc:
+        loud(
+            "fused_residual=true with use_mhc=false: the fused kernels ARE the mHC "
+            "residual chain (H_pre's lane mix, the Sinkhorn-projected H_res, the "
+            "H_post write, the lane readout) — with no lanes there is nothing they "
+            "can replace, so the flag would report an arm that never ran. That also "
+            "covers the AttnRes-ONLY write: it mixes over a GROWING source list "
+            "([h0, y_1, …, y_i], re-scored every iteration), so it is not one "
+            "iteration's local chain either. Escape: use_mhc=true (the composition, "
+            "where the write is local: u_0 = 0, u_1 = y), or fused_residual=false "
+            "(the ReZero write is three elementwise ops and needs no kernel)."
         )
     if model.use_byteflow:
         if model.loop_blocks > 1:

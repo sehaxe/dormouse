@@ -147,6 +147,7 @@ from torch import nn
 from torch.utils.checkpoint import checkpoint
 
 from ..instrument import Counters, loud
+from . import fused_residual
 from .csa import CompressedSelectiveAttention
 from .engram import Engram, memory_floor_mix
 from .experts import SparseMoE
@@ -373,6 +374,15 @@ class LoopBlock(nn.Module):
         self.mhc = (
             MHCMix(d, cfg.mhc_streams, device=device) if getattr(cfg, "use_mhc", False) else None
         )
+        #: The residual chain as fused Triton kernels (`model/fused_residual.py`):
+        #: `H_pre`'s lane mix, the AttnRes write, `H_res`/`H_post` and the readout
+        #: in two forward launches and two backward launches per iteration instead
+        #: of ~780. OFF is the eager path below, byte for byte — the flag only
+        #: chooses a route, it never changes a formula. `config.validate` refuses
+        #: it without `use_mhc` (there would be no lanes to fuse); a host without
+        #: CUDA/Triton is a COUNTED fallback (`_fused_ok`).
+        self.fused_residual = bool(getattr(cfg, "fused_residual", False))
+        self._fused_fell_back = False
         #: The DISTINCT bodies this driver cycles over (`DormouseModel` sets it
         #: to `(loop, *loop_extra)`); `None` means this block is the whole loop.
         #: Read by `_window`, so EVERY caller — one-shot, segmented, recurrent
@@ -466,6 +476,34 @@ class LoopBlock(nn.Module):
         self._per_iter_ce = per_iter
         return out, (None if targets is None else rec), counters
 
+    def _fused_ok(self, xl: torch.Tensor, counters: Counters) -> bool:
+        """Can the fused chain run on this tensor? A host check is COUNTED, a
+        shape/dtype mismatch is LOUD.
+
+        The distinction is the repo's one mark per degradation: "this host has
+        no CUDA" is a legal place to run the model (the CPU suite is), so it must
+        not stop the run — but a reader has to be able to tell the arm did not
+        run, so it increments `fused_residual_fallback` **once** per window. A
+        `[b,t,K,d]` the kernel cannot hold, or a non-fp32 lane, is a config that
+        lies about the arm, so it dies with the escape.
+        """
+        if not self.fused_residual or self.mhc is None:
+            return False
+        if self._fused_fell_back:
+            return False
+        if fused_residual.host_reason(xl.device.type) is not None:
+            counters.count("fused_residual_fallback")
+            self._fused_fell_back = True
+            return False
+        why = fused_residual.unsupported_reason(
+            xl.dtype, self.mhc.n_streams, xl.shape[-1] * self.mhc.n_streams, xl.device.type
+        )
+        if why is None:
+            counters.count("fused_residual")
+            return True
+        loud(why)
+        return False  # unreachable; `loud` raises
+
     def _moe_branch(self, normed: torch.Tensor, counters: Counters) -> torch.Tensor:
         """The MoE write at the SEAM: cast `normed` to the bank dtype ONCE, cast back to fp32.
 
@@ -554,6 +592,9 @@ class LoopBlock(nn.Module):
         streams = (
             h0.unsqueeze(-2).expand(b, t, self.mhc.n_streams, d) if self.mhc is not None else None
         )
+        #: `None` until the first pre-mix decides it (`_fused_ok`); `False` for
+        #: a block with no lanes, where neither fused nor eager chain exists.
+        fuse: bool | None = None
         out_acc = torch.zeros_like(h0)
         rec = torch.zeros((), dtype=torch.float32, device=h0.device)
         per_iter: list[torch.Tensor] = []
@@ -571,6 +612,7 @@ class LoopBlock(nn.Module):
         for i in range(T):
             counters.count("iter")
             ran = i + 1
+            mhc_raw = None
             #: The DISTINCT body for this iteration (`loop_blocks`): the
             #: weights are per body; the state (`h`, `streams`, `sources`) and
             #: the per-iteration slots on the driver are the loop's.
@@ -581,7 +623,14 @@ class LoopBlock(nn.Module):
                 # the body's input — the crate's `h_ctx` (`mhc-2026-09-30.md`
                 # §3.4), with Eq. 3's H_pre moved out of `forward`.
                 streams = streams + self.iter_embed[i].view(1, 1, 1, d)
-                ctx = blk.mhc.pre_mix(streams)
+                if fuse is None:
+                    # `streams` is the post-add tensor the kernels see, so the
+                    # dtype/shape check runs here and not on `h0`.
+                    fuse = self._fused_ok(streams, counters)
+                if fuse:
+                    ctx, mhc_raw = fused_residual.pre(blk.mhc, streams, counters)
+                else:
+                    ctx = blk.mhc.pre_mix(streams)
                 counters.count("mhc")
             else:
                 ctx = h + self.iter_embed[i].view(1, 1, d)
@@ -709,14 +758,21 @@ class LoopBlock(nn.Module):
                 assert blk.mhc is not None, "compose => mhc"
                 counters.count("attnres_write")
                 counters.count("mhc_attnres_write")
-                updates = [torch.zeros_like(y), y]
-                update = depth_attend(updates, self.attnres[i], self.eps, scale=float(len(updates)))
-                streams = blk.mhc(streams, update)
-                # 2409.19606 §2.1: our K full-width lanes re-sum to K times the
-                # state, where the paper's K width-C lanes re-sum to C. The
-                # mHC-ONLY arm keeps its historical unnormalised sum (pinned);
-                # the composition applies the paper's 1/K.
-                h = streams.sum(dim=-2) / blk.mhc.n_streams
+                if fuse:
+                    streams, h = fused_residual.write(
+                        blk.mhc, self.attnres[i], streams, y, mhc_raw, True, self.eps, counters
+                    )
+                else:
+                    updates = [torch.zeros_like(y), y]
+                    update = depth_attend(
+                        updates, self.attnres[i], self.eps, scale=float(len(updates))
+                    )
+                    streams = blk.mhc(streams, update)
+                    # 2409.19606 §2.1: our K full-width lanes re-sum to K times the
+                    # state, where the paper's K width-C lanes re-sum to C. The
+                    # mHC-ONLY arm keeps its historical unnormalised sum (pinned);
+                    # the composition applies the paper's 1/K.
+                    h = streams.sum(dim=-2) / blk.mhc.n_streams
             elif self.use_attnres:
                 counters.count("attnres_write")
                 sources.append(y)
@@ -725,8 +781,20 @@ class LoopBlock(nn.Module):
                 # Eq. 3's residual: H_res x_l + H_postᵀ F(H_pre x_l). The
                 # readout is the SUM of the lanes (2409.19606 §2.1); the crate's
                 # concat is its D/n-slicing layout, not this one (`mhc.py`).
-                streams = blk.mhc(streams, y)
-                h = streams.sum(dim=-2)
+                if fuse:
+                    streams, h = fused_residual.write(
+                        blk.mhc,
+                        self.attnres[i] if self.attnres is not None else None,
+                        streams,
+                        y,
+                        mhc_raw,
+                        False,
+                        self.eps,
+                        counters,
+                    )
+                else:
+                    streams = blk.mhc(streams, y)
+                    h = streams.sum(dim=-2)
             else:
                 counters.count("rezero_write")
                 h = ctx + y * blk.residual_scale
