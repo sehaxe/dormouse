@@ -319,6 +319,28 @@ class LoopBlock(nn.Module):
         if self.csa is not None:
             if not body_only:
                 self.csa_gate = nn.Parameter(torch.zeros(cfg.max_iter, device=device))
+        # The EXACT LOCAL WINDOW (`model/fullattn.py`, `attn_window`): a third
+        # ADDITIVE path beside KDA/CSA, off by default, so `attn_window=0` keeps
+        # the parameter tree — and every pinned `state_dict` hash — exactly as
+        # it was. It carries no state (a `W`-position band is `O(W)` of keys per
+        # forward), so the state-carrying calls are refused at the seam below.
+        if cfg.attn_window:
+            assert cfg.attn_kind != "full", (
+                f"attn_window={cfg.attn_window} with attn_kind='full': the exact arm "
+                f"already reads every earlier position, so the band would be a strict "
+                f"subset computed a second time. Escape: attn_kind='kda', or "
+                f"attn_window=0."
+            )
+        self.window_attn = (
+            FullAttention(
+                cfg,
+                device=device,
+                window=cfg.attn_window,
+                query_chunk=cfg.attn_window_query_chunk,
+            )
+            if cfg.attn_window
+            else None
+        )
         self.moe = SparseMoE(cfg, device=device)
         self.engram = Engram(cfg, device=device) if cfg.use_engram else None
         # The dense half of the memory branch's mixture — the `(1-g)·v_t` term.
@@ -637,6 +659,23 @@ class LoopBlock(nn.Module):
                 if carry or recurrent:
                     assert blk.attn is not None, "CSA is additive beside KDA (config refuses)"
                     st = (st, csa_st)
+            if blk.window_attn is not None:
+                # The exact local band: an ADDITIVE path, the same
+                # `w_attn`-scaled sum the MSA branch below joins. It has no
+                # O(1) boundary state, so a state-carrying call would silently
+                # read a NARROWER band than the one-shot forward (the bytes
+                # before a segment cut / the earlier decode positions).
+                assert not (carry or recurrent), (
+                    f"attn_window={self.window_attn.window} with a state-carrying "
+                    f"attention call (recurrent={recurrent}, carry={carry}): the "
+                    f"local band has no boundary state, so a segment cut or a "
+                    f"one-byte step would read fewer than the window's positions — "
+                    f"a model change wearing a memory flag. Escape: attn_window=0, "
+                    f"or segment_len=0 and the one-shot forward."
+                )
+                counters.count("attn_window_iter")
+                wout = blk.window_attn(normed, counters=counters)
+                attn = attn + wout.reshape(b * t, d) * w_attn
             if blk.attn is not None:
                 new_states.append(st)
             if blk.msa is not None:

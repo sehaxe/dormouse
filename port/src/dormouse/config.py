@@ -377,6 +377,37 @@ class ModelConfig:
     #: causal attention over those latents is well-defined — the same sequence
     #: KDA already attends over, uncompressed).
     attn_kind: str = "kda"
+    #: ---- an EXACT LOCAL WINDOW beside whatever arm `attn_kind` names ----
+    #: `model/fullattn.py`'s `FullAttention` restricted to the last `attn_window`
+    #: positions (`0` = OFF, no module, no parameter, every hash unchanged):
+    #: position `p` reads keys `max(0, p-W+1)..p` — strictly causal (`p` itself
+    #: included, unlike CSA's strictly-earlier chunks) and NOTHING older. It is
+    #: an ADDITIVE third path, summed into the same `attn` branch as KDA/CSA
+    #: (`LoopBlock._window`), so `kda + window` and `kda + csa + window` are
+    #: legal — the point is exact recall of the local band that KDA's O(1) state
+    #: compresses away. Cost on top of the rest: `W·d` MAC/byte for the score
+    #: and `W·d` for the value (`fullattn.window_mac_per_byte`), i.e. FLAT in the
+    #: context length — the reason a 32 KiB window at 4 MiB is affordable.
+    #: `torch.nn.functional.scaled_dot_product_attention` in this environment
+    #: (torch 2.13.0+cu129) has NO `window_size` argument (`TypeError:
+    #: unexpected keyword argument 'window_size'`, measured), so the band is an
+    #: explicit causal-band boolean mask — exact on every backend, and it is
+    #: what the chunked path slices.
+    #: REFUSED loudly: negative, `attn_kind='full'` (the window is a strict
+    #: subset of the arm already there — a silent second attention), with
+    #: `segment_len>0` (a segment cut would hide the bytes before the cut, so
+    #: the segmentation would change the model), with `use_byteflow` (its loop
+    #: runs over patch latents, so a "byte window" would be a latent window),
+    #: and on the recurrent decode (`decode.recurrent_refusal`).
+    attn_window: int = 0
+    #: Query-block size for `attn_window` (`0` = one block, the whole window).
+    #: A MEMORY-ONLY lever: the banded score tensor is `C × (C+W-1)` per block
+    #: instead of `t × t`, so a 4 MiB window never materialises a 4M×4M band.
+    #: The output equals the unchunked path to bf16/fp32 round-off (printed as
+    #: max|Δ| by the gate) — the SDPA kernel sees the same masked band, sliced.
+    #: REFUSED without `attn_window`, and refused at `>= max_seq_len` (one
+    #: block: the flag would buy nothing while the log line reported it on).
+    attn_window_query_chunk: int = 0
     use_tsct: bool = True
     #: TIED EMBEDDINGS: `lm_head` IS `embed.weight`, transposed, and has no
     #: parameter of its own (`model/model.py::TiedHead`). That is the frontier
@@ -835,6 +866,31 @@ class ModelConfig:
     #: exact-attention parity gate's configuration); refused without a coarse
     #: level, because it would build a branch that computes nothing.
     csa_fine: bool = True
+    #: ---- the THIRD level (the MIDDLE one in cost, the OUTERMOST by chunk) ----
+    #: `csa_mid_chunk=0` (OFF) keeps the two-level arm bit-identical. When on it
+    #: must be a MULTIPLE of `csa_coarse_chunk` (of `csa_chunk` when coarse is
+    #: off) and at least `csa_chunk`: one mid entry is a whole number of
+    #: contained entries, so the three levels pool the same byte boundaries and
+    #: `csa_hierarchical` can narrow selection by containment. Same algebra as
+    #: the coarse level (mean-pool, DENSE causal mask over strictly earlier
+    #: chunks, its own `W_{q,k,v,o}` at `csa_kv_dim`), its own ring in the
+    #: `(fine, coarse, mid)` state, summed into the same shared `csa_gate`.
+    #: REFUSED loudly without `use_csa`, if it is not a multiple of the level it
+    #: contains, or if it is smaller than `csa_chunk` (a "middle" level finer
+    #: than the finest one selects nothing new).
+    csa_mid_chunk: int = 0
+    #: ---- hierarchical selection for the FINE level ----
+    #: `false` (the default) is today's flat selection: every query scores ALL
+    #: earlier fine chunks. `true` scores the OUTERMOST level first (the largest
+    #: chunk — the mid level, then the coarse one), keeps its top `csa_topk`,
+    #: restricts the next level's candidates to the survivors, and only then
+    #: scores the fine chunks inside the surviving coarse entries — so the fine
+    #: attention runs over `csa_topk` survivors instead of `t / csa_chunk` keys.
+    #: Requires `csa_mid_chunk > 0` (without a third level the "hierarchy" is a
+    #: rename of the flat scan) and `csa_fine=true` (it narrows the fine scan).
+    #: `false` keeps every pinned state_dict/logits hash byte-identical; the
+    #: counters name the survivors per level (`csa_sel_coarse`/`_mid`/`_fine`).
+    csa_hierarchical: bool = False
     #: ---- the second attention arm (MSA re-entry, ADR-0014; owner 2026-10-16) ----
     #: 1M-context sparse attention BESIDE KDA (which stays the default arm).
     #: `msa_capacity_ratio` = the arm's share of the attention demand (owner:
@@ -1711,6 +1767,49 @@ def validate(model: ModelConfig) -> None:
             f"says WHICH. Escape: use_kda=true (the default) for attn_kind='full', "
             f"or attn_kind='kda' if the zeros arm is what you meant."
         )
+    if model.attn_window < 0:
+        loud(
+            f"attn_window={model.attn_window} is negative: it is a count of byte "
+            f"positions the local band reaches back over, and 0 is the OFF value. "
+            f"Escape: 0, or a positive window."
+        )
+    if model.attn_window_query_chunk < 0:
+        loud(
+            f"attn_window_query_chunk={model.attn_window_query_chunk} is negative: it "
+            f"is a query-block size, and 0 is the OFF value (one block). Escape: 0, "
+            f"or a positive block size."
+        )
+    if model.attn_window_query_chunk and not model.attn_window:
+        loud(
+            f"attn_window_query_chunk={model.attn_window_query_chunk} without "
+            f"attn_window: the query blocks exist only to cap the banded score "
+            f"tensor of the local window, so alone the flag would change nothing "
+            f"while the log line reported it on. Escape: attn_window>0, or "
+            f"attn_window_query_chunk=0."
+        )
+    if model.attn_window and model.attn_kind == "full":
+        loud(
+            f"attn_window={model.attn_window} with attn_kind='full': the exact arm "
+            f"already reads every earlier position, so the window would be a strict "
+            f"subset computed a second time — `4·d²` dead parameters and a silent "
+            f"double attention. Escape: attn_kind='kda' (the window beside the "
+            f"compressed arm is the arm this flag exists for), or attn_window=0."
+        )
+    if model.attn_window and model.use_byteflow:
+        loud(
+            f"attn_window={model.attn_window} with use_byteflow=true: the channel's "
+            f"loop runs over K patch latents, not over the byte window, so a 'window "
+            f"of {model.attn_window} bytes' would silently be a window of latents (a "
+            f"different unit and a different band). Refused rather than repurposed. "
+            f"Escape: use_byteflow=false, or attn_window=0."
+        )
+    if model.attn_window_query_chunk >= model.max_seq_len > 0:
+        loud(
+            f"attn_window_query_chunk={model.attn_window_query_chunk} >= "
+            f"max_seq_len={model.max_seq_len}: the forward is at most one query "
+            f"block, so the chunking would buy nothing while the log line reported "
+            f"it on. Escape: a chunk < max_seq_len, or 0 (one block)."
+        )
     if model.attn_latent_rank < 0:
         loud(
             f"attn_latent_rank={model.attn_latent_rank} is negative: a shared "
@@ -1761,6 +1860,35 @@ def validate(model: ModelConfig) -> None:
             f"build no module and the flag would lie. Escape: use_csa=true, or "
             f"csa_coarse_chunk=0."
         )
+    if model.csa_mid_chunk and not model.use_csa:
+        loud(
+            f"csa_mid_chunk={model.csa_mid_chunk} without use_csa: the mid level is "
+            f"the third level of the CSA arm, so alone it would build no module and "
+            f"the flag would lie. Escape: use_csa=true, or csa_mid_chunk=0."
+        )
+    if model.csa_hierarchical:
+        if not model.use_csa:
+            loud(
+                "csa_hierarchical=true without use_csa: hierarchical selection "
+                "narrows the FINE level's scan inside the CSA arm, which is not "
+                "built. Escape: use_csa=true, or csa_hierarchical=false."
+            )
+        if not model.csa_mid_chunk:
+            loud(
+                "csa_hierarchical=true without csa_mid_chunk: the hierarchy needs a "
+                "level above the fine one to select THROUGH — with only coarse+fine "
+                "it would score the same coarse entries the dense branch already "
+                "scores and then still scan every fine chunk, i.e. a rename of the "
+                "flat search wearing a flag. Escape: csa_mid_chunk=<multiple of the "
+                "coarse chunk>, or csa_hierarchical=false."
+            )
+        if not model.csa_fine:
+            loud(
+                "csa_hierarchical=true with csa_fine=false: the hierarchy narrows "
+                "the FINE level's candidate set, and the fine level is off — the "
+                "flag would select for an attention that does not run. Escape: "
+                "csa_fine=true, or csa_hierarchical=false."
+            )
     if model.use_csa:
         if model.csa_chunk not in (4, 8, 16, 32):
             loud(
@@ -1786,6 +1914,27 @@ def validate(model: ModelConfig) -> None:
                 "level at all while paying its gate. Escape: csa_fine=true, or "
                 "csa_coarse_chunk>0, or use_csa=false."
             )
+        if model.csa_mid_chunk:
+            contained = model.csa_coarse_chunk or model.csa_chunk
+            if model.csa_mid_chunk < model.csa_chunk:
+                loud(
+                    f"csa_mid_chunk={model.csa_mid_chunk} is smaller than "
+                    f"csa_chunk={model.csa_chunk}: the mid level is COARSER than the "
+                    f"fine one (its entries are what the fine chunks are selected "
+                    f"inside), so a mid chunk below a fine chunk is not a third level. "
+                    f"Escape: csa_mid_chunk >= csa_chunk."
+                )
+            if model.csa_mid_chunk % contained:
+                loud(
+                    f"csa_mid_chunk={model.csa_mid_chunk} is not a multiple of "
+                    f"{'csa_coarse_chunk' if model.csa_coarse_chunk else 'csa_chunk'}"
+                    f"={contained}: a mid entry must be a whole number of the entries "
+                    f"it contains, or the hierarchy would select a set that is not "
+                    f"the union of its children's chunks (two different byte "
+                    f"boundaries, and `csa_hierarchical` would then compute something "
+                    f"the flat scan never computes). Escape: a multiple of "
+                    f"{contained}."
+                )
         if model.csa_coarse_chunk:
             if model.csa_coarse_chunk % model.csa_chunk:
                 loud(
@@ -2571,6 +2720,17 @@ def _validate_segment(model: ModelConfig, tcfg: TrainConfig) -> None:
             f"segment's K/V (O(window) per iteration slot) — the memory this flag "
             f"exists to save, and the reason the compressed arm is the one it was "
             f"built on. Escape: segment_len=0, or attn_kind='kda'."
+        )
+    if model.attn_window:
+        loud(
+            f"segment_len={n} with attn_window={model.attn_window}: the local band "
+            f"reaches {model.attn_window} positions back, and a segment cut hides "
+            f"everything before it — so the first positions of every segment would "
+            f"read a NARROWER band than the one-shot forward's, i.e. the "
+            f"segmentation would change the model, not only the memory (the same "
+            f"reason attn_kind='full' is refused here). Carrying the K/V across the "
+            f"cut is the O(window·d) state segments exist to avoid. Escape: "
+            f"attn_window=0, or segment_len=0."
         )
     if n >= tcfg.seq_len:
         loud(

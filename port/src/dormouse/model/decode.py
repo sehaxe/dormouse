@@ -266,6 +266,15 @@ def recurrent_refusal(model) -> str | None:
             "attn_kind='kda', or decode with the window re-forward (--no-recurrent), "
             "which attends inside one forward."
         )
+    if getattr(getattr(model, "cfg", None), "attn_window", 0):
+        return (
+            "recurrent decode with attn_window: the exact local band has no O(1) "
+            "per-byte state — a one-byte step would have to carry the last "
+            "`attn_window` positions' K/V (the O(window) cache the compressed arm "
+            "exists to avoid) or read a one-position band, which is a different "
+            "model. Escape: attn_window=0, or decode with the window re-forward "
+            "(--no-recurrent), which attends inside one forward."
+        )
     if getattr(getattr(model, "cfg", None), "halt_mode", False):
         return (
             "recurrent decode with halt_mode: the per-iteration KDA state is "
