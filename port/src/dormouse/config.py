@@ -1055,6 +1055,20 @@ class TrainConfig:
     lr: float = 3e-4
     wd: float = 0.01
     grad_clip: float = 1.0
+    #: THE FIXED CROSS-ENTROPY (arXiv:2610.31642 §2): the loss keeps the
+    #: target logit out of the `1 + e^{-m}` denominator, so the target
+    #: gradient does not round to exactly 0 past the dtype's precision cliff
+    #: (16.6 nats in fp32, 5.5 in bf16) and `sum_c dL/dlogit_c == 0` at every
+    #: margin. `false` (the default, every number on record) is the historical
+    #: `log_softmax → NLL` path BIT FOR BIT — the flag is a branch, not a
+    #: rewrite. Honoured by `train`, `sft_train` and `rl_train`; the log line
+    #: carries `ce_cliff=N`, the DEVICE-side count of tokens whose margin
+    #: passed the cliff, so a real run reports the prevalence the fix acts on.
+    #: The loss's arithmetic is fp32 on every path (the head is fp32 by the
+    #: burn rule), which is why the live cliff is 16.6 and not bf16's 5.5.
+    #: No refusal against `mm_dtype=fp8`: that names the 2-D GEMM's compute
+    #: mode, not the logits the loss reads.
+    ce_fixed: bool = False
     #: GRADIENT ACCUMULATION: micro-batch count per optimizer step. `1` (the
     #: default and every number on record) runs one forward/backward per step.
     #: `k > 1` runs `k` micro-batches of `batch` rows, divides EACH micro-loss

@@ -147,6 +147,7 @@ from torch import nn
 from torch.utils.checkpoint import checkpoint
 
 from ..instrument import Counters, loud
+from ..losses import fixed_cross_entropy
 from . import fused_residual
 from .csa import CompressedSelectiveAttention
 from .engram import Engram, memory_floor_mix
@@ -424,12 +425,17 @@ class LoopBlock(nn.Module):
         halt_min_iter: int = 1,
         collect_hidden: bool = False,
         loss_mask: torch.Tensor | None = None,
+        ce_fixed: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None, Counters]:
         """`h0 [b,t,d]` → (`mean readout [b,t,d]`, SUM of per-iteration mean CEs, counters).
 
         The CE is a SUM over iterations, not a mean: the model divides by the
         number of terms once it has added the final readout's own CE (see
         `model.DormouseModel.forward` for why that term exists).
+
+        `ce_fixed` swaps the per-iteration CE for `losses.fixed_cross_entropy`
+        (arXiv:2610.31642 §2). `False` is the historical `log_softmax` line, bit
+        for bit.
 
         `depth=None` runs `max_iter` iterations (ADR-0013's fixed depth,
         unchanged); `depth=T` runs exactly `T` and the readout mean divides by
@@ -473,7 +479,7 @@ class LoopBlock(nn.Module):
                     f"segment_len=0."
                 )
             return self._forward_segmented(
-                h0, input_ids, targets, lm_head, counters, T, segment_len
+                h0, input_ids, targets, lm_head, counters, T, segment_len, ce_fixed
             )
         out, rec, per_iter, _ = self._window(
             h0,
@@ -487,6 +493,7 @@ class LoopBlock(nn.Module):
             halt_min_iter=halt_min_iter,
             collect_hidden=collect_hidden,
             loss_mask=loss_mask,
+            ce_fixed=ce_fixed,
         )
         # The per-iteration CEs as a LIST on the module (host floats ONLY on an
         # eval-style read; see `model.DormouseModel.forward(breakdown=True)`) —
@@ -573,6 +580,7 @@ class LoopBlock(nn.Module):
         collect_hidden: bool = False,
         loss_mask: torch.Tensor | None = None,
         blocks: tuple[LoopBlock, ...] | list[LoopBlock] | None = None,
+        ce_fixed: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor], list]:
         """`T` iterations over ONE window — a segment, or the whole sequence.
 
@@ -845,7 +853,12 @@ class LoopBlock(nn.Module):
             if targets is not None:
                 assert lm_head is not None, "per-iteration CE needs the lm_head"
                 logits = lm_head(step_out.reshape(b * t, d).to(torch.float32))
-                ce = -F.log_softmax(logits, dim=-1).gather(1, targets.reshape(-1, 1))
+                if ce_fixed:
+                    ce = fixed_cross_entropy(
+                        logits, targets, reduction="none", counters=counters
+                    ).reshape(-1, 1)
+                else:
+                    ce = -F.log_softmax(logits, dim=-1).gather(1, targets.reshape(-1, 1))
                 # `doc_masking`: the mean over the SELECTED positions only (the
                 # `None` default is the historical `.mean()`, bit for bit).
                 term = ce.mean() if loss_mask is None else masked_ce_mean(ce, loss_mask)
@@ -985,6 +998,7 @@ class LoopBlock(nn.Module):
         counters: Counters,
         T: int,
         segment_len: int,
+        ce_fixed: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None, Counters]:
         """The segmented training forward: `t // segment_len` checkpointed windows.
 
@@ -1081,6 +1095,7 @@ class LoopBlock(nn.Module):
                     carry=True,
                     states=list(states),
                     drop=_drop,
+                    ce_fixed=ce_fixed,
                 )
                 return out, rec, per_iter, seg_counters, *states_out
 

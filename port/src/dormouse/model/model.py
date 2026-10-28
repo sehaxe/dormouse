@@ -28,6 +28,7 @@ from torch import nn
 
 from ..config import ModelConfig
 from ..instrument import Counters, loud
+from ..losses import fixed_cross_entropy
 from .byteflow import (
     BfChannel,
     ByteFlowNet,
@@ -291,6 +292,7 @@ class DormouseModel(nn.Module):
         breakdown: bool = False,
         segment_len: int = 0,
         loss_mask: torch.Tensor | None = None,
+        ce_fixed: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None, Counters]:
         """`input_ids [b,t]` (+ `targets [b,t]`) → (logits `[b*t,vocab]`, loss, counters).
 
@@ -314,6 +316,15 @@ class DormouseModel(nn.Module):
         positions only, so padding and cross-document targets contribute
         neither a loss nor a gradient. `None` (the default, every number on
         record) is the unchanged `.mean()` path, bit for bit.
+
+        `ce_fixed` routes the per-iteration CE and the final CE through
+        `losses.fixed_cross_entropy` (arXiv:2610.31642 §2: the target logit's
+        gradient does not collapse past the dtype's precision cliff, and the
+        gradient sums to zero). `False` (the default, every number on record)
+        is the historical `log_softmax` path, bit for bit — the flag is the
+        TRAIN half's (`TrainConfig.ce_fixed`), which is why it is threaded here
+        rather than stored on `ModelConfig`: a checkpoint's snapshot pairs a
+        model with the objective it was trained on.
         """
         counters = Counters() if counters is None else counters
         assert input_ids.dtype in (torch.long, torch.int64), "input_ids must be integer ids"
@@ -342,13 +353,21 @@ class DormouseModel(nn.Module):
             counters.count("dense_qat_arms")
         if self.bf_net is not None:
             self._refuse_segmented(segment_len)
-            logits, loss = self._forward_net(input_ids, targets, counters)
+            logits, loss = self._forward_net(input_ids, targets, counters, ce_fixed)
         elif self.bf is not None:
             self._refuse_segmented(segment_len)
-            logits, loss = self._forward_channel(input_ids, targets, counters, depth)
+            logits, loss = self._forward_channel(input_ids, targets, counters, depth, ce_fixed)
         else:
             logits, loss = self._forward_byte_lm(
-                input_ids, targets, counters, depth, pure, breakdown, segment_len, loss_mask
+                input_ids,
+                targets,
+                counters,
+                depth,
+                pure,
+                breakdown,
+                segment_len,
+                loss_mask,
+                ce_fixed,
             )
         if self._qat_caches:
             # Cache hits in THIS forward, on the existing counter line: the
@@ -391,13 +410,14 @@ class DormouseModel(nn.Module):
         input_ids: torch.Tensor,
         targets: torch.Tensor | None,
         counters: Counters,
+        ce_fixed: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Option A: the byteflow net alone — its byte logits ARE the model's."""
         counters.count("bf_net")
         assert self.bf_net is not None
         b, t = input_ids.shape
         flat = self.bf_net(input_ids).reshape(b * t, self.cfg.vocab)
-        return flat, _byte_ce(flat, targets)
+        return flat, _byte_ce(flat, targets, fixed=ce_fixed, counters=counters)
 
     def _forward_channel(
         self,
@@ -405,6 +425,7 @@ class DormouseModel(nn.Module):
         targets: torch.Tensor | None,
         counters: Counters,
         depth: int | None = None,
+        ce_fixed: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Option B: front stage → this model's loop on K latents → back stage.
 
@@ -445,7 +466,7 @@ class DormouseModel(nn.Module):
         out_acc, _, _ = self.loop(x, None, None, None, counters=counters, depth=depth)
         logits = bf.net.decode_chunks(bf.out_proj(out_acc), h, sel)  # [b, t, vocab]
         flat = logits.reshape(-1, self.cfg.vocab)
-        return flat, _byte_ce(flat, targets)
+        return flat, _byte_ce(flat, targets, fixed=ce_fixed, counters=counters)
 
     def _forward_byte_lm(
         self,
@@ -457,6 +478,7 @@ class DormouseModel(nn.Module):
         breakdown: bool = False,
         segment_len: int = 0,
         loss_mask: torch.Tensor | None = None,
+        ce_fixed: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """The plain byte-level stack: embedding → prelude → loop → coda → RMSNorm → lm_head."""
         h0 = self.embed(input_ids)
@@ -527,6 +549,7 @@ class DormouseModel(nn.Module):
             halt_min_iter=self.cfg.halt_min_iter,
             collect_hidden=self.halt is not None and targets is not None and not pure,
             loss_mask=loss_mask,
+            ce_fixed=ce_fixed,
         )
         # The coda: unique layers, once, after the loop's mean readout. They sit
         # BEFORE the final norm/head, which stay exactly where they are today
@@ -553,7 +576,12 @@ class DormouseModel(nn.Module):
             # what a looped block needs (readiness plan §5) — and adds the one
             # term that makes the logits it RETURNS the logits it TRAINS.
             flat = targets.reshape(-1, 1)
-            ce_final = -F.log_softmax(logits, dim=-1).gather(1, flat)
+            if ce_fixed:
+                ce_final = fixed_cross_entropy(
+                    logits, targets, reduction="none", counters=counters
+                ).reshape(-1, 1)
+            else:
+                ce_final = -F.log_softmax(logits, dim=-1).gather(1, flat)
             if loss_mask is not None:
                 # doc_masking: padding and cross-document targets carry no loss
                 # and no gradient — the same selected mean the loop used.
@@ -731,15 +759,24 @@ class TiedHead(nn.Module):
         return F.linear(x.to(torch.float32), self._owner[0].weight.to(torch.float32))
 
 
-def _byte_ce(flat_logits: torch.Tensor, targets: torch.Tensor | None) -> torch.Tensor | None:
+def _byte_ce(
+    flat_logits: torch.Tensor,
+    targets: torch.Tensor | None,
+    *,
+    fixed: bool = False,
+    counters: Counters | None = None,
+) -> torch.Tensor | None:
     """The byte-lm CE: mean over positions and batch of the target log-prob.
 
     Shared by both byteflow shapes (A and B) so the two cannot disagree about
     what the objective is; `None` on a decode forward ("no labels" is not
-    "loss 0").
+    "loss 0"). `fixed` selects `losses.fixed_cross_entropy`
+    (arXiv:2610.31642 §2); `False` is the historical line, bit for bit.
     """
     if targets is None:
         return None
+    if fixed:
+        return fixed_cross_entropy(flat_logits, targets, counters=counters)
     loss = -F.log_softmax(flat_logits, dim=-1).gather(1, targets.reshape(-1, 1)).mean()
     # No finiteness assert: see `_forward_byte_lm`'s note — the device
     # firewall owns the NaN decision and cannot be preempted by a host read.

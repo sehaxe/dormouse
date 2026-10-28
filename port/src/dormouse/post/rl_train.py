@@ -105,7 +105,14 @@ from ..instrument import Counters, LoudError, loud
 from ..model import DormouseModel
 from ..model.engram import enable_host_tables, host_engrams, host_step_all
 from ..model.qat_cache import invalidate_qat_cache_all
-from ..train.loop import kda_field, load_ckpt, load_model_state, save_ckpt, unpack_state_dict
+from ..train.loop import (
+    ce_field,
+    kda_field,
+    load_ckpt,
+    load_model_state,
+    save_ckpt,
+    unpack_state_dict,
+)
 from ..train.optim import MixOptimizer, clip_grads
 from .rl import RLConfig, Sample, group_rewards, group_stats, reward, rl_advantages, rl_step
 from .rollouts import Rollout, rollout
@@ -569,8 +576,16 @@ def rl_train(
             cfg.rl_adv,
             samples=samples,
         )
+        # `fixed=True` only when ON: a default run's call is the historical one,
+        # argument for argument (`train/sft.py`'s same rule).
         loss, step_counters = rl_step(
-            model, opt, samples, advantages, rl_cfg, counters=step_counters
+            model,
+            opt,
+            samples,
+            advantages,
+            rl_cfg,
+            counters=step_counters,
+            **({"fixed": True} if cfg.ce_fixed else {}),
         )
         total.merge(step_counters)
         window.merge(step_counters)
@@ -633,7 +648,7 @@ def rl_train(
                 m.drop_pending()
 
         if (step + 1) % cfg.log_every == 0:
-            window.drain()
+            drained = window.drain()
             total.drain()
             if window_finite and not any(window_finite):
                 drowning += 1
@@ -653,6 +668,7 @@ def rl_train(
                         f"rl_samples={window.get('rl_samples', 0)}",
                         f"nan_skipped={nan_skipped}",
                         kda_field(window),
+                        ce_field(cfg, drained),
                         window.line(),
                     ]
                 )

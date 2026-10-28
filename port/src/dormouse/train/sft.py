@@ -97,12 +97,14 @@ import torch.nn.functional as F
 
 from ..config import RunConfig, validate_train
 from ..instrument import Counters, LoudError, StepTimer, loud
+from ..losses import fixed_cross_entropy
 from ..model.engram import enable_host_tables, host_engrams, host_step_all
 from ..model.experts import invalidate_banks_all
 from ..model.qat_cache import invalidate_qat_cache_all
 from ..post.tasks import build_tasks
 from .data import ByteStream, warmup_steps
 from .loop import (
+    ce_field,
     init_cfg,
     kda_field,
     load_ckpt,
@@ -905,7 +907,14 @@ def sft_mask(windows: torch.Tensor) -> torch.Tensor:
     return (pos[None, :] + 1 >= assist[:, None]) & (pos[None, :] + 1 <= end[:, None])
 
 
-def sft_loss(logits: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+def sft_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    fixed: bool = False,
+    counters: Counters | None = None,
+) -> torch.Tensor:
     """Masked next-byte CE: the mean over the SUPERVISED positions only.
 
     `logits` is `[b*t, vocab]` (the model's own shape), `targets` `[b, t]`, `mask`
@@ -920,6 +929,11 @@ def sft_loss(logits: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor) ->
             "window's markers are wrong (see sft_mask)."
         )
     assert logits.shape[0] == flat.numel(), "logits rows != window positions"
+    if fixed:
+        # arXiv:2610.31642 §2. The DEFAULT is byte-for-byte the F.cross_entropy
+        # above (same selected rows, same reduction), which is the line every
+        # number on record came from.
+        return fixed_cross_entropy(logits[flat], targets.reshape(-1)[flat], counters=counters)
     return F.cross_entropy(logits[flat], targets.reshape(-1)[flat])
 
 
@@ -1202,7 +1216,7 @@ def sft_train(
             # built here.
             logits, _none, step_counters = model(x)
             assert logits.shape[-1] == run.model.vocab, "logits width != vocab"
-            loss = sft_loss(logits, y, mask)
+            loss = sft_loss(logits, y, mask, fixed=cfg.ce_fixed, counters=step_counters)
             n_mask = int(mask.sum())
             total.count("sft_bytes", n_mask)
             window.count("sft_bytes", n_mask)
@@ -1279,7 +1293,7 @@ def sft_train(
                 m.drop_pending()
 
         if (step + 1) % cfg.log_every == 0:
-            window.drain()
+            drained = window.drain()
             total.drain()
             if window_finite and not any(window_finite):
                 drowning += 1
@@ -1291,6 +1305,7 @@ def sft_train(
                 f"loss={last_loss:.4f}",
                 f"lr={lr:.3e}",
                 kda_field(window),
+                ce_field(cfg, drained),
                 window.line(),
             ]
             # The interval read must precede any `report()` (it resets the
@@ -1342,7 +1357,12 @@ def sft_train(
                     emask = sft_mask(ex)
                     elogits, _en, _ec = model(ex)
                     flat = emask.reshape(-1)
-                    ce_total += float(F.cross_entropy(elogits[flat], ey.reshape(-1)[flat]))
+                    if cfg.ce_fixed:
+                        # The eval scores the run's own objective.
+                        ece = fixed_cross_entropy(elogits[flat], ey.reshape(-1)[flat])
+                    else:
+                        ece = F.cross_entropy(elogits[flat], ey.reshape(-1)[flat])
+                    ce_total += float(ece)
                     batches += 1
                     # The conditioning metric: at the assistant marker's
                     # position the model predicts the FIRST answer byte — the
