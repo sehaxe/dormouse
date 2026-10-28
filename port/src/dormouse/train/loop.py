@@ -102,6 +102,20 @@ def halt_field(model: torch.nn.Module) -> str:
     return "" if value is None else f"halt={float(value):.4f}"
 
 
+def ce_field(cfg: TrainConfig, drained: dict) -> str:
+    """`ce_cliff=N` when the fixed CE is on: 0 is a statement, not an absence.
+
+    `drained` is the window's `Counters.drain()` — the ONE batched device read,
+    at the log cadence. A token counts when its margin (paper §2:
+    `z_t - LSE_{j != t} z_j`) passed the logits dtype's cliff, i.e. when the
+    standard path's target gradient would have rounded to exactly 0. The field
+    is absent when the flag is off, so a control run's line is unchanged.
+    """
+    if not cfg.ce_fixed:
+        return ""
+    return f"ce_cliff={int(drained.get('ce_cliff_tokens', 0))}"
+
+
 def ckpt_paths(cfg: TrainConfig) -> tuple[Path, Path]:
     base = Path(cfg.out_dir)
     return base / f"{cfg.ckpt_name}.pt", base / f"{cfg.ckpt_name}.config.toml"
@@ -738,6 +752,7 @@ def _eval_loss(
     device: torch.device | str | None,
     depth: int | None,
     counters: Counters | None = None,
+    ce_fixed: bool = False,
 ) -> tuple[float, int, float, list[float]]:
     """One held-out pass at ONE loop depth: (loss, bytes, fin, per_iter_mean).
 
@@ -761,6 +776,10 @@ def _eval_loss(
     was_training = model.training
     model.eval()
     kw = {} if depth is None else {"depth": depth}
+    if ce_fixed:
+        # The held-out number scores the objective the run trains on
+        # (`TrainConfig.ce_fixed`), not a second, easier one.
+        kw["ce_fixed"] = True
     ev_counters = Counters()
     with torch.no_grad():
         for _ in range(batches):
@@ -811,6 +830,7 @@ def evaluate(
     *,
     depths: bool = False,
     counters: Counters | None = None,
+    ce_fixed: bool = False,
 ) -> tuple[float, int] | dict[int, tuple[float, int]]:
     """Mean held-out CE over `batches` windows + the BYTES those windows scored.
 
@@ -826,10 +846,10 @@ def evaluate(
     """
     if depths:
         return {
-            d: _eval_loss(model, stream, batches, device, d, counters)
+            d: _eval_loss(model, stream, batches, device, d, counters, ce_fixed)
             for d in range(1, model.cfg.max_iter + 1)
         }
-    return _eval_loss(model, stream, batches, device, None, counters)
+    return _eval_loss(model, stream, batches, device, None, counters, ce_fixed)
 
 
 def _eval_line(
@@ -850,11 +870,19 @@ def _eval_line(
     curve = None
     eng = Counters()
     if cfg.rand_depth or cfg.eval_depths:
-        curve = evaluate(model, stream, cfg.eval_batches, device=device, depths=True, counters=eng)
+        curve = evaluate(
+            model,
+            stream,
+            cfg.eval_batches,
+            device=device,
+            depths=True,
+            counters=eng,
+            ce_fixed=cfg.ce_fixed,
+        )
         ev, scored, fin, per_iter = curve[max_iter]
     else:
         ev, scored, fin, per_iter = evaluate(
-            model, stream, cfg.eval_batches, device=device, counters=eng
+            model, stream, cfg.eval_batches, device=device, counters=eng, ce_fixed=cfg.ce_fixed
         )
     # `fin` = the CE of the final mean readout — the DEPTH-COMPARABLE number
     # (the headline `loss` averages T+1 terms and is not, see `_eval_loss`).
@@ -1468,6 +1496,12 @@ def train(
         # would run, and the reason all micro-batches read the same `step`.
         depth = _sample_depth(cfg.seed, step, run.model.max_iter) if cfg.rand_depth else None
         kw = {} if depth is None else {"depth": depth}
+        if cfg.ce_fixed:
+            # The fixed CE (arXiv:2610.31642 §2). Passed only when ON, so a
+            # default run's forward call is the historical one argument-for-
+            # argument — and a module wrapper that does not accept it fails
+            # loudly at the flag that asked for it, not silently.
+            kw["ce_fixed"] = True
         if cfg.segment_len:
             # The SEGMENTED training forward: the window is cut into
             # `segment_len`-position segments and the KDA state is carried across
@@ -1618,6 +1652,7 @@ def train(
                 kda_field(window),
                 halt_field(model),
                 mtp_field(model),
+                ce_field(cfg, drained),
                 window.line(),
             ]
             # Telemetry reads the interval BEFORE any opt-in timer report —

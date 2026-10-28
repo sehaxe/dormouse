@@ -59,6 +59,7 @@ from dataclasses import dataclass
 import torch
 
 from ..instrument import Counters, loud
+from ..losses import fixed_cross_entropy
 from .rollouts import Rollout
 from .tasks import Task
 from .train_steps import crr_advantage
@@ -489,7 +490,12 @@ def pg_loss(
 
 
 def response_logp(
-    logits: torch.Tensor, ids: torch.Tensor, prompt_lens: int | Sequence[int]
+    logits: torch.Tensor,
+    ids: torch.Tensor,
+    prompt_lens: int | Sequence[int],
+    *,
+    fixed: bool = False,
+    counters: Counters | None = None,
 ) -> torch.Tensor:
     """Σ_j log π(ids[j] | ids[:j]) over the RESPONSE positions, one sum per row.
 
@@ -512,6 +518,18 @@ def response_logp(
             f"Escape: prompt + response must fit the model's window."
         )
     pl = torch.as_tensor(lens, dtype=torch.long, device=ids.device)
+    if fixed:
+        # `log π` through the fixed CE (`losses.fixed_cross_entropy`): the same
+        # `log_softmax(...).gather(...)` value, but its gradient at the SAMPLED
+        # byte is `-(sum of the other probabilities)` instead of `q_t - 1`,
+        # which rounds to exactly 0 once the model is confidently correct
+        # (arXiv:2610.31642 §2). Negating the loss is the log-probability.
+        rows = logits.reshape(b, t, -1)[:, :-1].reshape(-1, logits.shape[-1])
+        picked = -fixed_cross_entropy(
+            rows, ids[:, 1:], reduction="none", counters=counters
+        ).reshape(b, t - 1)
+        pos_ = torch.arange(1, t, device=ids.device).unsqueeze(0)
+        return (picked * (pos_ >= pl.unsqueeze(1))).sum(dim=-1)
     lp = torch.log_softmax(logits.reshape(b, t, -1).float(), dim=-1)
     picked = lp[:, :-1, :].gather(-1, ids[:, 1:].unsqueeze(-1)).squeeze(-1)  # [b, t-1]
     pos = torch.arange(1, t, device=ids.device).unsqueeze(0)
@@ -531,6 +549,7 @@ def rl_step(
     cfg: RLConfig,
     *,
     counters: Counters | None = None,
+    fixed: bool = False,
 ) -> tuple[torch.Tensor, Counters]:
     """ONE policy-gradient step's forward and loss. Returns `(loss, counters)`.
 
@@ -601,7 +620,7 @@ def rl_step(
         x = torch.tensor([list(ids)], dtype=torch.long, device=dev)
         logits, _none, step_counters = model(x, targets=None)
         counters.merge(step_counters)
-        sums.append(response_logp(logits, x, len(s.prompt))[0])
+        sums.append(response_logp(logits, x, len(s.prompt), fixed=fixed, counters=counters)[0])
         values.append(a.value)
         kept_groups.append(s.group)
         kept_weights.append(weights[i])
