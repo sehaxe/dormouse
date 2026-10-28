@@ -395,8 +395,71 @@ def test_per_byte_cost_does_not_grow_with_context():
     got = {length: marginal(length) for length in lengths}
     print("[recurrent O(1)] per-byte " + " ".join(f"L={k}:{v * 1e3:.3f}ms" for k, v in got.items()))
     lo, hi = min(got.values()), max(got.values())
-    assert lo > 0.0, f"the marginal cost measured nothing: {got}"
+    if lo <= 0.0:
+        # A non-positive marginal means the two runs were separated by less than
+        # the timer's noise on this box, so the RATIO below would be a number
+        # divided by noise. Do not fail on it and do not pass silently: the
+        # deterministic sibling `test_the_recurrent_state_does_not_grow_with_context`
+        # carries the O(1) claim without a clock, and this one only refines it.
+        pytest.skip(
+            f"wall-clock marginal unresolvable under load: {got} — the O(1) claim is "
+            "asserted structurally by test_the_recurrent_state_does_not_grow_with_context"
+        )
     assert hi / lo < 2.0, f"the per-byte cost grows with context: {got}"
+
+
+def test_the_recurrent_state_does_not_grow_with_context():
+    """`O(1)` per byte, without a clock: the carried state is context-independent.
+
+    A decoder that kept a window, grew a KV cache, or re-read the prefix would
+    have to carry more state for a longer prompt. This asserts the shapes — so it
+    fails on a real regression and never on a loaded box (the timing sibling
+    above cannot tell those apart).
+    """
+    model = tiny_model(moe_topk=0)
+    seen = {}
+
+    for length in (8, 64, 256):
+        prompt = bytes((i * 7 + 3) % 251 + 1 for i in range(length))
+        grab = {}
+        originals = {}
+
+        def spy(method):
+            def wrapper(self, *a, **kw):
+                # the step must CONSUME one new position and a constant-size state:
+                # a windowed re-read decoder passes the whole context here instead.
+                seq = a[0].shape[1] if a and torch.is_tensor(a[0]) else kw.get("seq", 1)
+                grab.setdefault("in_seq", []).append(int(seq))
+                out = method(self, *a, **kw)
+                st = out[-1] if isinstance(out, tuple) else out
+                grab.setdefault("state", []).append(
+                    tuple(st.shape) if torch.is_tensor(st) else type(st).__name__
+                )
+                return out
+            return wrapper
+
+        for cls in {type(m) for m in model.modules() if hasattr(m, "step_state")}:
+            originals[cls] = cls.step_state
+            cls.step_state = spy(cls.step_state)
+        try:
+            recurrent_decode(model, prompt, 4, temp=0.8, generator=torch.Generator().manual_seed(1))
+        finally:
+            for cls, fn in originals.items():
+                cls.step_state = fn
+
+        assert grab, "the state seam (KDAAttention.step_state) never fired"
+        assert set(grab["in_seq"]) == {1}, (
+            f"a decode step consumed {sorted(set(grab['in_seq']))} positions at L={length}: "
+            "the step is re-reading the context, which is the O(L) shape this gate exists to catch"
+        )
+        shapes = sorted(set(grab["state"]))
+        seen[length] = shapes
+
+    first = seen[8]
+    for length, shapes in seen.items():
+        assert shapes == first, (
+            f"the carried state grew with context: L={length} gives {shapes}, L=8 gives {first}"
+        )
 
 
 # --------------------------------------------------------- the chunked prefill
