@@ -27,6 +27,18 @@ j. the full CPU suite (reported with this branch, not runnable from inside
 
 The `dormouse info` gate is in (c): a closed-form parameter count that drifts
 from the instantiated tree is the defect the CLI line exists to catch.
+
+**The paper form (`layerrope_form="paper"`, v2).** The project page's reference
+snippet: `gamma[d]` + FOUR scalars per site, a log-linear magnitude
+`r_l = a_mag + b_mag·log_l` and a RoPE-spectrum per-PAIR rotation
+`ang_j = θ_l·base^(-2j/d)`, applied at BOTH the read and the write of the
+attention branch and of the FFN/MoE branch — `4·(d+4)` per block. Its gates,
+lettered as the v2 task letters them, are the `test_paper_*` functions below:
+identity bit-parity, live depth scaling, live WRITE sites (with the
+bit-identical zeroed-branch comparison), per-pair rotation, the parameter table,
+`position` vs `iteration` depth indexing, the five parameters' gradients in
+every site, and the refusals/counters/no-host-sync rules. `form="v1"` is
+untouched and its gates above still pass unmodified — that is gate (b).
 """
 
 from __future__ import annotations
@@ -38,13 +50,15 @@ import re
 
 import pytest
 import torch
+import torch.nn as nn
 from conftest import BATCH, SEQ, tiny_cfg, tiny_model, tiny_run
 from typer.testing import CliRunner
 
 from dormouse.cli import app
 from dormouse.config import ModelConfig, load_preset, load_run, parse_preset
 from dormouse.instrument import Counters, LoudError
-from dormouse.model import DormouseModel, param_count
+from dormouse.model import DormouseModel, loopblock, param_count
+from dormouse.model.layerrope import LayerRoPEPaperGains, rotate_pairs
 from dormouse.train import train
 from dormouse.train.loop import ckpt_paths, load_ckpt
 
@@ -485,8 +499,429 @@ def test_i_the_counter_is_device_side_and_drains_at_the_log_cadence(tmp_path):
     assert report["counters"]["layerrope_forward"] == 3 * want
 
 
-def test_the_driver_plan_resolves_every_arm():
-    """The pre-registered driver: 12 arms, the right split, and `plan` runs."""
+# ---------------------------------------------------------------------------
+# The PAPER form (`layerrope_form="paper"`): the project page's snippet.
+# ---------------------------------------------------------------------------
+
+#: Site order is the model's (`layerrope.PAPER_SITES`): this is the index every
+#: test below addresses when it zeroes or moves ONE gain.
+PAPER = ("attn_read", "attn_write", "mlp_read", "mlp_write")
+
+
+def _paper(**over) -> DormouseModel:
+    """Same seed as `_built()`, paper form — so two builds are comparable."""
+    return _built(layerrope=True, layerrope_form="paper", **over)
+
+
+def _logits(model: DormouseModel, x: torch.Tensor) -> torch.Tensor:
+    """`model(x)` with no targets: logits only, no loss to read."""
+    model.eval()
+    with torch.no_grad():
+        logits, loss, _ = model(x)
+    assert loss is None and bool(torch.isfinite(logits).all())
+    return logits
+
+
+def _site(name: str) -> int:
+    return PAPER.index(name)
+
+
+def test_paper_c_identity_is_a_bit_exact_no_op():
+    """Gate c: `init="identity"` -> every gain IS gamma, and the forward is OFF's."""
+    off = _built()
+    on = _built(layerrope=True, layerrope_form="paper", layerrope_init="identity")
+    gains = on.layerrope
+    assert isinstance(gains, LayerRoPEPaperGains)
+    assert gains.n_blocks == 1 and len(gains.sites) == 4
+    d = on.cfg.d_model
+    n_layers = on.cfg.prelude_layers + on.cfg.max_iter + on.cfg.coda_layers
+    for site in PAPER:
+        table = gains.table(0, site)
+        assert table.shape == (n_layers, d), table.shape
+        gamma = gains.sites[_site(site)].gamma
+        for depth in range(n_layers):
+            assert torch.equal(table[depth], gamma), (site, depth)
+    # The flag adds no RNG draw: every surviving weight is the OFF weight.
+    off_sd, on_sd = off.state_dict(), on.state_dict()
+    removed = set(off_sd) - set(on_sd)
+    added = set(on_sd) - set(off_sd)
+    print(f"[paper] identity removed={sorted(removed)} added={len(added)} keys")
+    assert removed == {"loop.norm.weight"}, removed
+    assert len(added) == 4 * 7, sorted(added)  # gamma + 4 scalars + freq/log_l
+    for key, value in off_sd.items():
+        if key in removed:
+            continue
+        assert key in on_sd, key
+        assert torch.equal(value, on_sd[key]), f"{key}: the paper build changed a non-gain weight"
+    x, y = _batch()
+    with torch.no_grad():
+        logits_off, loss_off, _ = off(x, y)
+        logits_on, loss_on, _ = on(x, y)
+    delta = float((logits_off - logits_on).abs().max())
+    exact = torch.equal(logits_off, logits_on)
+    print(
+        f"[paper] identity forward max|Δ|={delta:.3e} bit_exact={exact} "
+        f"loss {float(loss_off):.9f} / {float(loss_on):.9f}"
+    )
+    assert exact or delta < 1e-6, delta
+    assert torch.equal(loss_off, loss_on)
+
+
+def test_paper_c_paper_init_is_live_depth_scaling():
+    """Gate c: the paper init is NOT an identity, and `b_mag` moves the logits."""
+    off = _built()
+    on = _paper()
+    gains = on.layerrope
+    table = gains.table(0, "attn_read")
+    spread = float((table[0] - table[-1]).detach().abs().max())
+    x, _ = _batch()
+    before = _logits(on, x)
+    off_logits = _logits(off, x)
+    with torch.no_grad():
+        gains.sites[0].b_mag.add_(0.1)
+    after = _logits(on, x)
+    moved = float((before - after).abs().max())
+    vs_off = float((before - off_logits).abs().max())
+    print(
+        f"[paper] init=paper depth spread {spread:.3e} (NOT identity), "
+        f"b_mag+0.1 max|Δ logits|={moved:.3e}, vs OFF {vs_off:.3e}"
+    )
+    assert spread > 1e-3, "the paper init must depth-scale from step 1"
+    assert moved > 1e-4, moved
+
+
+def test_paper_e_write_sites_are_live_and_sit_at_the_residual_seam():
+    """Gate e: BOTH write gains move the output, reads do something ELSE."""
+    x, _ = _batch()
+    base = _logits(_paper(), x)
+    delta: dict[str, float] = {}
+    for name in PAPER:
+        model = _paper()
+        model.layerrope.sites[_site(name)].gamma.data.zero_()
+        delta[name] = float((_logits(model, x) - base).abs().max())
+    print("[paper] zero-gain deltas: " + " ".join(f"{k}={v:.4e}" for k, v in delta.items()))
+    assert delta["attn_write"] > 1e-3 and delta["mlp_write"] > 1e-3
+    assert delta["attn_read"] > 1e-3 and delta["mlp_read"] > 1e-3
+    assert delta["attn_read"] != delta["attn_write"], (
+        "the read and the write gain are the same seam"
+    )
+    # The MLP branch is HOMOGENEOUS in its input at zero (no bias, silu(0)=0,
+    # and the routing sees an all-zero row), so a zero READ and a zero WRITE give
+    # the same output there. The read/write split is only distinguishable with a
+    # NON-zero scale: the read changes what the branch computes (routing +
+    # silu), the write only rescales what it produced.
+    scaled: dict[str, float] = {}
+    for name in PAPER:
+        model = _paper()
+        model.layerrope.sites[_site(name)].gamma.data.mul_(0.5)
+        scaled[name] = float((_logits(model, x) - base).abs().max())
+    print("[paper] gamma*0.5 deltas: " + " ".join(f"{k}={v:.4e}" for k, v in scaled.items()))
+    assert scaled["attn_read"] != scaled["attn_write"]
+    assert scaled["mlp_read"] != scaled["mlp_write"]
+
+    # `attn_write = 0` must equal a run whose attention-side outputs are zeroed:
+    # the gain multiplies the BRANCH, it is not a rewrite of the norm.
+    model = _paper()
+    model.layerrope.sites[_site("attn_write")].gamma.data.zero_()
+    killed = _logits(model, x)
+    block = model.loop
+
+    class _Zero(nn.Module):
+        def forward(self, h, *, counters=None):
+            return torch.zeros_like(h)
+
+    saved_attn, saved_mix = block.attn, loopblock.memory_floor_mix
+    block.attn = _Zero()
+    loopblock.memory_floor_mix = lambda *args: torch.zeros_like(args[0])
+    try:
+        zeroed = _logits(model, x)
+    finally:
+        block.attn = saved_attn
+        loopblock.memory_floor_mix = saved_mix
+    assert torch.equal(killed, zeroed), "attn_write is not a multiply on the branch output"
+
+    # The same for the FFN write: zero the gain vs zero the MoE output.
+    model = _paper()
+    model.layerrope.sites[_site("mlp_write")].gamma.data.zero_()
+    killed = _logits(model, x)
+    block = model.loop
+    saved_moe = block._moe_branch
+    block._moe_branch = lambda normed, counters: torch.zeros_like(
+        normed.reshape(-1, normed.shape[-1])
+    )
+    try:
+        zeroed = _logits(model, x)
+    finally:
+        block._moe_branch = saved_moe
+    assert torch.equal(killed, zeroed), "mlp_write is not a multiply on the branch output"
+    print("[paper] write gains are multiplies on the branch, zero-for-zero at both seams")
+
+
+def test_paper_f_rotation_is_live_and_per_pair():
+    """Gate f: `a_rot` moves the logits, and the spectrum gives each pair its own angle.
+
+    The per-pair claim is recovered from the MODEL's own gain table (the
+    rotation an implementation actually applied to each pair), never from a
+    local re-derivation of the formula — a re-derivation passes even when the
+    implementation rotates every pair by one angle.
+    """
+    model = _paper()
+    x, _ = _batch()
+    site = model.layerrope.sites[0]
+
+    def applied(depth: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """`(per-pair angle, per-pair magnitude)` the table row was given."""
+        with torch.no_grad():
+            gain = model.layerrope.table(0, "attn_read")[depth]
+            gamma = site.gamma
+            g = gain.reshape(-1, 2)
+            g0 = gamma.reshape(-1, 2)
+            mag = g.norm(dim=-1) / g0.norm(dim=-1)
+            rot = torch.atan2(g[:, 1], g[:, 0]) - torch.atan2(g0[:, 1], g0[:, 0])
+            return (rot + math.pi) % (2 * math.pi) - math.pi, mag
+
+    rot, mag = applied(1)
+    log_l = float(site.log_l[1])
+    theta = math.exp(float(site.a_rot.detach()) + float(site.b_rot.detach()) * log_l)
+    want = theta * site.freq
+    angle_err = float((rot - want).abs().max())
+    scale = math.exp(float(site.a_mag.detach()) + float(site.b_mag.detach()) * log_l)
+    scale_err = float((mag - scale).abs().max())
+    n_distinct = int(torch.unique(rot).numel())
+    pair_gap = float((rot[0] - rot[1]).abs())
+    ratio = float(rot.max() / rot.min())
+    print(
+        f"[paper] per-pair angle vs theta·freq max|Δ|={angle_err:.3e}; "
+        f"magnitude vs exp(r) max|Δ|={scale_err:.3e}; {n_distinct}/{rot.numel()} "
+        f"distinct pairs, gap(first two)={pair_gap:.4e}, angle max/min={ratio:.3f} "
+        f"(spectrum buffer ratio {float(site.freq.max() / site.freq.min()):.3f}, "
+        f"base={site.base})"
+    )
+    assert angle_err < 1e-4, angle_err
+    assert scale_err < 1e-6, scale_err
+    assert n_distinct == rot.numel(), "the spectrum must give every pair its own angle"
+    assert pair_gap > 1e-6, pair_gap
+    assert math.isclose(ratio, site.base ** ((site.d - 2) / site.d), rel_tol=1e-4)
+    before = _logits(model, x)
+    with torch.no_grad():
+        site.a_rot.fill_(1.0)
+    after = _logits(model, x)
+    moved = float((before - after).abs().max())
+    print(f"[paper] a_rot=1.0 max|Δ logits|={moved:.4e}")
+    assert moved > 1e-3, moved
+
+    # v1 rotated every pair by ONE angle: the contrast the v2 form exists for.
+    v1 = _built(layerrope=True).layerrope
+    one = rotate_pairs(v1.gamma_shared, v1.theta[0])
+    pair_delta = float(
+        (one.reshape(-1, 2)[:, 1] / v1.gamma_shared.reshape(-1, 2)[:, 1]).detach().std()
+    )
+    print(f"[paper] v1 pair-angle spread={pair_delta:.3e} (0 = one angle for all pairs)")
+    assert pair_delta < 1e-6
+
+
+def test_paper_g_parameter_counts():
+    """Gate g: paper 4·(d+4) per block, v1 d+2·n_depths, baseline 2·L·d."""
+    off = _built()
+    v1 = _built(layerrope=True)
+    paper = _paper()
+    d = off.cfg.d_model
+    layers = paper.cfg.max_iter
+    site_counts = [sum(p.numel() for p in s.parameters()) for s in paper.layerrope.sites]
+    buffers = len(paper.layerrope.sites[0]._buffers)
+    block = sum(site_counts)
+    v1_count = sum(p.numel() for p in v1.layerrope.parameters())
+    baseline = 2 * layers * d
+    delta = param_count(paper) - param_count(off)
+    print(
+        f"[paper] d={d} L={layers}: sites={site_counts} buffers/site={buffers} "
+        f"block={block} (want {4 * (d + 4)}); v1={v1_count} "
+        f"(want {d + 2 * v1.layerrope.n_depths}); per-layer baseline 2·L·d={baseline}; "
+        f"model delta paper-OFF={delta:+d}, v1-OFF={param_count(v1) - param_count(off):+d}"
+    )
+    assert site_counts == [d + 4] * 4
+    assert block == 4 * (d + 4)
+    assert buffers == 2, buffers  # freq, log_l
+    assert v1_count == d + 2 * v1.layerrope.n_depths
+    # The block's own norm gain (d) is replaced by the four sites.
+    assert delta == block - d == 4 * (d + 4) - d
+
+    # The closed form against the INSTANTIATED medium tree (`dormouse info`):
+    # paper replaces only the loop's norm gain, v1 also the final norm's.
+    runner = CliRunner()
+
+    def total(*sets: str) -> int:
+        out = runner.invoke(app, ["info", "medium", *[f"--set={s}" for s in sets]])
+        assert out.exit_code == 0, out.output
+        m = re.search(r"([\d,]+) params", out.output)
+        assert m, out.output
+        return int(m.group(1).replace(",", ""))
+
+    base, v1_med, paper_med = (
+        total(),
+        total("layerrope=true"),
+        total("layerrope=true", "layerrope_form=paper"),
+    )
+    print(
+        f"[paper] medium: base={base:,} v1={v1_med:,} ({v1_med - base:+,}) "
+        f"paper={paper_med:,} ({paper_med - base:+,}); d=1024 L=4 -> "
+        f"block {4 * (1024 + 4):,} vs per-layer baseline {2 * 4 * 1024:,}"
+    )
+    assert base - paper_med == 1024 - 4 * (1024 + 4)
+    assert v1_med - base == (1024 + 2 * 5) - 2 * 1024
+
+
+def test_paper_h_position_index_is_iteration_independent():
+    """Gate h: `position` gives every iteration ONE gain; `iteration` does not."""
+    seen: dict[str, tuple[float, float]] = {}
+    for mode in ("iteration", "position"):
+        model = _built(layerrope=True, layerrope_form="paper", layerrope_index=mode, max_iter=3)
+        gains = model.layerrope
+        gains.begin_forward()
+        assert gains.table(0, "attn_read").shape[0] == 3
+        # The index the FORWARD actually passes: read the block's own dispatch
+        # flag, so a block that ignores `layerrope_index` fails here.
+        block = model.loop
+        assert block._paper_index == mode, (block._paper_index, mode)
+        assert block._paper_position == model.cfg.prelude_layers
+
+        it1 = 1 if block._paper_index == "iteration" else block._paper_position
+        it2 = 2 if block._paper_index == "iteration" else block._paper_position
+        first, second = gains.for_iteration(0, it1), gains.for_iteration(0, it2)
+        gaps = [float((a - b).abs().detach().max()) for a, b in zip(first, second, strict=False)]
+        seen[mode] = (max(gaps), min(gaps))
+        print(
+            f"[paper] index={block._paper_index} paper_position={block._paper_position} "
+            f"site gaps it1/it2=" + " ".join(f"{g:.3e}" for g in gaps)
+        )
+        if mode == "position":
+            assert all(torch.equal(a, b) for a, b in zip(first, second, strict=False)), (
+                "position mode must not depend on the loop iteration"
+            )
+        else:
+            assert all(g > 0.0 for g in gaps), "iteration mode must move the gain every pass"
+    assert seen["position"][0] == 0.0 and seen["iteration"][1] > 0.0
+
+
+def test_paper_i_every_parameter_gets_a_gradient_in_every_site(tmp_path):
+    """Gate i: all five parameters of ALL FOUR sites, finite and non-zero, 3 steps."""
+    torch.manual_seed(0)
+    run = dataclasses.replace(
+        tiny_run(tmp_path, steps=3, log_every=100),
+        model=tiny_cfg(layerrope=True, layerrope_form="paper", max_iter=3),
+    )
+    model = DormouseModel(run.model)
+    train(model, run, log=lambda *_: None)
+    named = dict(model.named_parameters())
+    dead: list[str] = []
+    for site in PAPER:
+        k = _site(site)
+        for leaf in ("gamma", "a_mag", "b_mag", "a_rot", "b_rot"):
+            name = f"layerrope.sites.{k}.{leaf}"
+            p = named[name]
+            assert p.grad is not None, f"{name}: no gradient slot after 3 steps"
+            assert bool(torch.isfinite(p.grad).all()), f"{name}: non-finite gradient"
+            peak = float(p.grad.detach().abs().max())
+            nonzero = int((p.grad.detach() != 0).sum())
+            print(
+                f"[paper] 3-step {name} shape={tuple(p.shape)} max|grad|={peak:.3e} "
+                f"nonzero={nonzero}/{p.numel()}"
+            )
+            if peak == 0.0:
+                dead.append(name)
+    assert not dead, f"dead paper-form parameters: {dead}"
+
+
+def test_paper_j_counter_and_refusals():
+    """Gate j: DEVICE counter=4/iteration; every declared refusal is LOUD."""
+    model = tiny_model(layerrope=True, layerrope_form="paper", moe_topk=0, max_iter=3)
+    x, y = _batch()
+    counters = Counters()
+    with torch.no_grad():
+        model(x, y, counters=counters)
+    assert "layerrope_forward" in counters._device, counters._device
+    assert "layerrope_forward" not in counters, counters
+    counters.drain()
+    want = 4 * model.cfg.max_iter
+    print(f"[paper] drained layerrope_forward={counters['layerrope_forward']} want={want}")
+    assert counters["layerrope_forward"] == want
+
+    failures = (
+        ("layerrope = true\nlayerrope_form = 'x'\n", "layerrope_form"),
+        ("layerrope = true\nlayerrope_form = 'paper'\nlayerrope_index = 'x'\n", "layerrope_index"),
+        ("layerrope = true\nlayerrope_form = 'paper'\nlayerrope_init = 'x'\n", "layerrope_init"),
+        ("layerrope = true\nlayerrope_form = 'paper'\nlayerrope_base = 0.0\n", "layerrope_base"),
+        # The v1 path reads no beta/base/index/init: a non-default value there
+        # would name an arm the forward never runs.
+        ("layerrope = true\nlayerrope_beta_init = -0.3\n", "layerrope_beta_init"),
+        ("layerrope = true\nlayerrope_base = 50.0\n", "layerrope_base"),
+        ("layerrope = true\nlayerrope_index = 'position'\n", "layerrope_index"),
+        ("layerrope = true\nlayerrope_init = 'identity'\n", "layerrope_init"),
+        # The v1 subfields are the paper form's mirror image.
+        (
+            "layerrope = true\nlayerrope_form = 'paper'\nlayerrope_amp_init = 0.5\n",
+            "layerrope_amp_init",
+        ),
+        (
+            "layerrope = true\nlayerrope_form = 'paper'\nlayerrope_per_site = true\n",
+            "layerrope_per_site",
+        ),
+        ("layerrope_form = 'paper'\n", "layerrope_form"),
+    )
+    for text, key in failures:
+        with pytest.raises(LoudError) as e:
+            parse_preset(text)
+        msg = str(e.value)
+        assert key in msg and "Escape:" in msg, msg
+        print(f"[paper] refused {key}: {msg.splitlines()[0][:110]}")
+    # The runtime seam a hand-built `ModelConfig` reaches.
+    with pytest.raises(LoudError) as e:
+        DormouseModel(tiny_cfg(layerrope=True, layerrope_form="nope"))
+    assert "layerrope_form" in str(e.value)
+    with pytest.raises(LoudError) as e:
+        DormouseModel(tiny_cfg(layerrope=True, layerrope_form="paper", layerrope_index="nope"))
+    assert "layerrope_index" in str(e.value)
+    # `full_graph`/`opt_graph` are refused for BOTH forms (the depth index is a
+    # host-selected slice, so a capture would freeze it).
+    for key in ("full_graph", "opt_graph"):
+        with pytest.raises(LoudError) as e:
+            load_run(
+                "tiny",
+                model_overrides={"layerrope": True, "layerrope_form": "paper"},
+                train_overrides={key: True},
+            )
+        assert key in str(e.value) and "Escape:" in str(e.value)
+
+
+def test_paper_j_no_host_sync_in_the_step():
+    """Gate j: `.item/.tolist/.__float__/.__bool__` raise around a real step."""
+    model = tiny_model(layerrope=True, layerrope_form="paper", moe_topk=0, max_iter=3)
+    x, y = _batch()
+    names = ("item", "tolist", "__float__", "__bool__")
+    saved = {n: getattr(torch.Tensor, n) for n in names}
+
+    def boom(*_a, **_k):
+        raise AssertionError("host sync in the paper-form step")
+
+    try:
+        for n in names:
+            setattr(torch.Tensor, n, boom)
+        logits, loss, _ = model(x, y)
+        assert loss is not None
+        loss.backward()
+        with torch.no_grad():
+            for p in model.parameters():
+                if p.grad is not None:
+                    p -= 0.001 * p.grad
+    finally:
+        for n, f in saved.items():
+            setattr(torch.Tensor, n, f)
+    print(f"[paper] patched forward+backward+step ok loss={float(loss.detach()):.4f}")
+    assert bool(torch.isfinite(logits).all())
+
+
+def test_paper_the_driver_has_the_new_ab_arms():
+    """The NEW A/B: 9 arms, 3 seeds, and the pre-registered rule is in the docstring."""
     import importlib.util
     from pathlib import Path
 
@@ -497,22 +932,23 @@ def test_the_driver_plan_resolves_every_arm():
     spec.loader.exec_module(mod)
     names = [a["name"] for a in mod.ARMS]
     assert names == [
-        "off_lr5e-4",
-        "off_lr1e-3",
-        "off_lr3e-3",
-        "on_lr5e-4",
-        "on_lr1e-3",
-        "on_lr3e-3",
-        "off",
-        "on",
-        "off_mhc0",
-        "off_mhc1",
-        "on_mhc0",
-        "on_mhc1",
+        "no_layerrope_5e-4",
+        "v1_5e-4",
+        "paper_5e-4",
+        "paper_identity_5e-4",
+        "paper_pos_5e-4",
+        "v1_1e-3",
+        "paper_1e-3",
+        "paper_identity_1e-3",
+        "paper_pos_1e-3",
     ], names
-    assert all(a["model"]["layerrope"] for a in mod.ARMS if a["name"].startswith("on"))
-    assert not any(a["model"]["layerrope"] for a in mod.ARMS if a["name"].startswith("off"))
-    assert mod.ARMS[0]["seeds"] == (1, 2) and mod.BY_NAME["off"]["seeds"] == (1, 2, 3)
+    assert mod.SEEDS == (1, 2, 3), "3 seeds per arm"
+    assert mod.ARMS[0]["model"]["layerrope"] is False
+    assert mod.BY_NAME["v1_5e-4"]["model"]["layerrope_form"] == "v1"
+    assert mod.BY_NAME["paper_pos_5e-4"]["model"]["layerrope_index"] == "position"
+    assert mod.BY_NAME["paper_identity_5e-4"]["model"]["layerrope_init"] == "identity"
+    assert mod.BY_NAME["paper_5e-4"]["lr"] == 5e-4 and mod.BY_NAME["paper_1e-3"]["lr"] == 1e-3
     assert mod.COMMON_TRAIN["opt_graph"] is False, "layerrope refuses opt_graph"
+    assert "2 x spread(control)" in mod.__doc__, "the verdict rule must be pre-registered"
     assert mod.main(["plan"]) == 0
-    print("[layerrope] driver plan: 12 arms resolve, run mode NOT executed")
+    print("[paper] driver plan: 9 arms resolve, run mode NOT executed")

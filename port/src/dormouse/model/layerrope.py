@@ -4,6 +4,85 @@ Paper: *LayerRoPE: Dynamic Depth-wise Magnitude & Angular Superposition*
 (arXiv:2610.09179). In a deep residual stack the per-layer normalisation gain
 `gamma` empirically encodes **depth**: its magnitude grows with depth and its
 direction rotates. LayerRoPE makes that explicit instead of learning one free
+`[d]` vector per layer/site.
+
+TWO FORMS, one flag (`layerrope_form`)
+--------------------------------------
+`"v1"` (default) is this file's first implementation: ONE shared `gamma_shared`
+`[d]` + per-depth scalars `(amp_i, theta_i)` (`d + 2·n_depths` parameters),
+applied at the NORM READ sites only, every channel pair rotated by the SAME
+angle. It is what the `layerrope` branch shipped and every v1 gate pins; it is
+unchanged here.
+
+`"paper"` is the project page's reference snippet, transcribed below as
+[`LayerRoPESite`] — `gamma[d]` + FOUR scalars per site (`a_mag`, `b_mag`,
+`a_rot`, `b_rot`), a log-linear magnitude `r_l = a_mag + b_mag·log_l`, a
+RoPE-spectrum rotation `ang_j = θ_l · base^(-2j/d)` (a per-PAIR angle), and the
+`log_l` / `freq` buffers:
+
+    r_l     = a_mag + b_mag · log_l
+    θ_l     = exp(a_rot + b_rot · log_l)
+    ang_j   = θ_l · base^(-2j/d)              (j = 0 … d/2-1)
+    gain_l  = Re/Im-interleave( gamma · exp(r_l + i·ang) )
+
+One site is `d + 4` parameters + 2 buffers; a whole block is FOUR sites —
+`attn_read`, `attn_write`, `mlp_read`, `mlp_write` — i.e. `4·(d+4)`, O(d),
+against the per-layer baseline `2·L·d`.
+
+INIT: `layerrope_init="paper"` uses the paper's `beta_init=-0.5`, and it is NOT
+an identity: `r_l = -0.5·log(l+1)` and `θ_l = (l+1)^-0.5` from the first
+forward. `layerrope_init="identity"` is the bit-identity gate.
+
+**A correction to the obvious reading of "identity".** Setting
+`b_mag = b_rot = 0` gives `r = 0, θ = 1`, and `θ = 1` is NOT an unrotated gain
+in the reference: `ang = θ·freq = freq ≠ 0`, so the gain would still be rotated
+by the spectrum. `identity` therefore ALSO turns the spectrum off (it
+short-circuits `table()` to `gamma` broadcast over depth) — otherwise the
+`torch.equal(gain, gamma)` gate could not exist. That is the only place this
+file departs from the snippet's arithmetic.
+
+WHERE THE FOUR GAINS GO IN THIS MODEL (`loopblock.py`)
+------------------------------------------------------
+The paper's stack is `h = h + attn_write·attn(normalize(h)·attn_read)` then
+`h = h + mlp_write·mlp(normalize(h)·mlp_read)`. Our block computes ONE
+`normalize(ctx)` and TWO branch sums joined into one residual update `y`
+(`loopblock._window`), so the read gains are the norm's affine —
+`F.rms_norm(ctx, (d,), attn_read, eps)` and `… , mlp_read, …`, one fused call
+each — and the write gains multiply each branch's OUTPUT where it enters `y`:
+`attn·attn_write`, `ffn·mlp_write`, immediately before `y = attn + branch +
+ffn`. `y` is exactly the `F(H_pre·x_l)` the residual operator (mHC's
+`H_post`, AttnRes' write, ReZero's `α`) deposits, so the write gain sits at the
+branch→residual seam and NOT inside any mixer's internals. Because mHC/AttnRes
+are LINEAR in `y`, scaling the branch at that seam is the paper's
+`h + write·F(...)` for every residual arm this repo has.
+
+Our block does NOT have the paper's four sites for free — it has a shared norm
+and a third branch (the Engram memory read). The mapping is stated, not
+invented: `attn_read` feeds the attention arm (KDA/CSA/the local window) AND
+the Engram dense read, and `attn_write` scales the attention-side write
+(`attn + branch`), because the memory read is a read of the same normalised
+state and its output joins the same residual update; the paper has no memory
+sub-layer and leaving it unscaled would make `attn_write` scale only part of
+the attention-side write. `mlp_read`/`mlp_write` are the FFN/MoE branch. The
+prelude/coda unique layers keep their own RMSNorm gains (they are outside the
+looped block; paper form wires the block).
+
+DEPTH INDEX. `layerrope_index="iteration"` (default) uses the ACTUAL loop
+iteration `i`, v1's choice. `"position"` uses the block's position in the
+network and is INDEPENDENT of the loop iteration — the choice Parcae's looped
+model makes ("each layer's depth index is its position in the network,
+independent of the loop iteration"), and the reason the paper's depth scaling
+can transfer to a weight-shared loop: a single loop body is ONE depth, so all
+its iterations read the same gain. With `loop_blocks=N` body `b` owns the
+position `P+b`, still independent of the iteration.
+
+v1's own depth docstring follows.
+
+--- v1 ---
+
+In a deep residual stack the per-layer normalisation gain `gamma` empirically
+encodes **depth**: its magnitude grows with depth and its
+direction rotates. LayerRoPE makes that explicit instead of learning one free
 `[d]` vector per layer/site:
 
     gamma_i = amp_i * rotate_pairs(gamma_shared, theta_i)
@@ -88,7 +167,17 @@ from torch import nn
 
 from ..instrument import loud
 
-__all__ = ["LayerRoPEGains", "LayerRoPENorm", "rotate_pairs"]
+__all__ = [
+    "PAPER_SITES",
+    "LayerRoPEGains",
+    "LayerRoPENorm",
+    "LayerRoPEPaperGains",
+    "LayerRoPESite",
+    "rotate_pairs",
+]
+
+#: The paper's four sites per block, in the order `for_iteration` returns them.
+PAPER_SITES = ("attn_read", "attn_write", "mlp_read", "mlp_write")
 
 
 def rotate_pairs(v: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
@@ -213,3 +302,147 @@ class LayerRoPENorm(nn.Module):
         d = self.depth if depth is None else depth
         gain = self._gains.gain(d, self.site)
         return F.rms_norm(x, (self.d,), gain, self.eps)
+
+
+class LayerRoPESite(nn.Module):
+    """One LayerRoPE site, the paper's reference form (module docstring).
+
+    `gamma [d]` + four scalars + the two buffers the snippet registers
+    (`freq`, `log_l`). `table()` is the snippet's `forward()` verbatim: it
+    returns the `[n_layers, d]` gain table, and `[index]` is one layer's gain.
+    The table is INPUT-INDEPENDENT — it is a function of the parameters only,
+    which is why the whole table is built once per forward (`begin_forward`)
+    and sliced per iteration.
+
+    `identity=True` sets `b_mag = b_rot = 0` AND short-circuits `table()` to
+    `gamma`; the short-circuit is not cosmetic: `θ = exp(0) = 1` still rotates
+    by `freq` in the snippet (`ang = θ·freq`), so a plain zero-beta init is NOT
+    the identity (module docstring, "A correction to the obvious reading").
+    """
+
+    def __init__(
+        self,
+        d: int,
+        n_layers: int,
+        *,
+        base: float = 100.0,
+        beta_init: float = -0.5,
+        identity: bool = False,
+        device: torch.device | str = "cpu",
+    ) -> None:
+        super().__init__()
+        if d % 2:
+            loud(
+                f"layerrope paper form with d_model={d}: the spectrum rotates "
+                f"adjacent channel PAIRS, so the width must be even. Escape: an "
+                f"even d_model, or layerrope=false."
+            )
+        assert n_layers >= 1, f"layerrope n_layers={n_layers}: at least one depth"
+        assert base > 0.0, f"layerrope base={base}: the spectrum needs base > 0"
+        self.d = int(d)
+        self.n_layers = int(n_layers)
+        self.base = float(base)
+        self.identity = bool(identity)
+        #: The shared per-site vector: the gain is `gamma` rotated/scaled by the
+        #: depth index. `[d]`, one per site — NOT one per layer.
+        self.gamma = nn.Parameter(torch.ones(d, device=device))
+        self.a_mag = nn.Parameter(torch.zeros((), device=device))
+        beta = 0.0 if identity else float(beta_init)
+        self.b_mag = nn.Parameter(torch.tensor(beta, device=device))
+        self.a_rot = nn.Parameter(torch.zeros((), device=device))
+        self.b_rot = nn.Parameter(torch.tensor(beta, device=device))
+        # buffer, not parameter: the spectrum is a constant of the width/base.
+        j = torch.arange(d // 2, device=device, dtype=torch.float32)
+        self.register_buffer("freq", base ** (-2.0 * j / d))
+        self.register_buffer("log_l", torch.log(torch.arange(1.0, n_layers + 1, device=device)))
+
+    def table(self) -> torch.Tensor:
+        """The paper's `forward()`: `[n_layers, d]`, the gain at every depth."""
+        if self.identity:
+            return self.gamma.unsqueeze(0).expand(self.n_layers, self.d)
+        r = self.a_mag + self.b_mag * self.log_l
+        theta = torch.exp(self.a_rot + self.b_rot * self.log_l)
+        ang = theta[:, None] * self.freq
+        c = torch.polar(torch.exp(r)[:, None].expand_as(ang), ang)
+        g = torch.view_as_complex(self.gamma.view(-1, 2))
+        return torch.view_as_real(g * c).flatten(-2)
+
+
+class LayerRoPEPaperGains(nn.Module):
+    """The block's FOUR sites of [`LayerRoPESite`], one owner for the whole model.
+
+    Keyed `layerrope.sites.<block*4 + site>.*`; `n_blocks = loop_blocks` (each
+    distinct loop body is its own set, because it is its own layer). The gain
+    table is built ONCE per forward (`begin_forward`, input-independent) and
+    sliced per iteration (`for_iteration`), so the per-step cost is the table
+    build, not one build per read.
+
+    `_applications` is a DEVICE counter (four per `for_iteration`, i.e. per
+    iteration per block), drained by the trainer on the log cadence — the proof
+    the arm ran costs no host read.
+    """
+
+    def __init__(
+        self,
+        d: int,
+        n_layers: int,
+        *,
+        n_blocks: int = 1,
+        base: float = 100.0,
+        beta_init: float = -0.5,
+        identity: bool = False,
+        device: torch.device | str = "cpu",
+    ) -> None:
+        super().__init__()
+        assert n_blocks >= 1, f"layerrope n_blocks={n_blocks}"
+        self.d = int(d)
+        self.n_layers = int(n_layers)
+        self.n_blocks = int(n_blocks)
+        self.identity = bool(identity)
+        self.sites = nn.ModuleList(
+            [
+                LayerRoPESite(
+                    d,
+                    n_layers,
+                    base=base,
+                    beta_init=beta_init,
+                    identity=identity,
+                    device=device,
+                )
+                for _ in range(self.n_blocks * len(PAPER_SITES))
+            ]
+        )
+        #: The built table, `[n_blocks·4, n_layers, d]`; a plain attribute (not
+        #: a buffer) so it never reaches the state dict.
+        self._table: torch.Tensor | None = None
+        self.register_buffer(
+            "_applications",
+            torch.zeros((), dtype=torch.int64, device=device),
+            persistent=False,
+        )
+
+    def begin_forward(self) -> None:
+        """Build every site's table once — a function of the parameters only."""
+        self._table = torch.stack([site.table() for site in self.sites])
+
+    def table(self, block: int = 0, site: str = "attn_read") -> torch.Tensor:
+        """One site's `[n_layers, d]` table (the reference's `forward()`)."""
+        return self.sites[block * len(PAPER_SITES) + PAPER_SITES.index(site)].table()
+
+    def for_iteration(
+        self, block: int, index: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """`(attn_read, attn_write, mlp_read, mlp_write)` at one depth index."""
+        assert self._table is not None, "begin_forward() must run once per forward"
+        assert 0 <= index < self.n_layers, f"layerrope depth {index} outside 0..{self.n_layers}"
+        assert 0 <= block < self.n_blocks, f"layerrope block {block} outside 0..{self.n_blocks}"
+        base = block * len(PAPER_SITES)
+        out = tuple(self._table[base + s][index] for s in range(len(PAPER_SITES)))
+        self._applications.add_(len(PAPER_SITES))
+        return out  # type: ignore[return-value]
+
+    def take_applications(self) -> torch.Tensor:
+        """The applications since the last take, as a DEVICE scalar (no host read)."""
+        n = self._applications.clone()
+        self._applications.zero_()
+        return n

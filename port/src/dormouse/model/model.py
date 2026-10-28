@@ -40,7 +40,7 @@ from .dspark import DSparkHead, dspark_aux_loss
 from .energy import EnergyHead, energy_contrastive_loss
 from .halt import HaltHead, halt_loss
 from .jepa import JepaHead
-from .layerrope import LayerRoPEGains, LayerRoPENorm
+from .layerrope import LayerRoPEGains, LayerRoPENorm, LayerRoPEPaperGains
 from .loopblock import LoopBlock, masked_ce_mean
 from .mtp import MTPHead
 from .prelude import UniqueLayer
@@ -70,6 +70,31 @@ class DormouseModel(nn.Module):
                     f"adjacent channel PAIRS, so the width must be even. Escape: an "
                     f"even d_model, or layerrope=false."
                 )
+            if cfg.layerrope_form not in ("v1", "paper"):
+                loud(
+                    f"layerrope_form={cfg.layerrope_form!r} is not a LayerRoPE form. "
+                    f"Known: 'v1' and 'paper' (`model/layerrope.py`). Escape: name "
+                    f"one of those, or layerrope=false."
+                )
+            if cfg.layerrope_form == "paper":
+                if cfg.layerrope_index not in ("iteration", "position"):
+                    loud(
+                        f"layerrope_index={cfg.layerrope_index!r} is not a depth "
+                        f"index. Known: 'iteration' and 'position'. Escape: name one "
+                        f"of those, or layerrope_form='v1'."
+                    )
+                if cfg.layerrope_init not in ("paper", "identity"):
+                    loud(
+                        f"layerrope_init={cfg.layerrope_init!r} is not a LayerRoPE "
+                        f"init. Known: 'paper' and 'identity'. Escape: name one of "
+                        f"those, or layerrope_form='v1'."
+                    )
+                if cfg.layerrope_base <= 0.0:
+                    loud(
+                        f"layerrope_base={cfg.layerrope_base}: the RoPE spectrum is "
+                        f"base^(-2j/d), so the base must be positive. Escape: base "
+                        f"> 0 (100.0 is the paper's)."
+                    )
         if cfg.loop_blocks > 1 and cfg.use_byteflow:
             # The config layer's refusal, held here too because a hand-built
             # model skips `validate` (the same rule the prelude seam follows).
@@ -154,11 +179,18 @@ class DormouseModel(nn.Module):
         #: JEPA (`jepa.py`): declared before the byteflow early return so a
         #: channel model has the attribute (None) rather than no attribute.
         self.jepa: JepaHead | None = None
-        #: LayerRoPE (`layerrope.py`, arXiv:2610.09179): the ONE shared
-        #: `gamma_shared` plus the per-depth `(amp, theta)` table. Built only
-        #: with the flag on; declared before the byteflow early return so a
-        #: channel model has the attribute (None) rather than no attribute.
-        self.layerrope: LayerRoPEGains | None = None
+        #: LayerRoPE (`layerrope.py`, arXiv:2610.09179): v1's ONE shared
+        #: `gamma_shared` plus the per-depth `(amp, theta)` table, or — under
+        #: `layerrope_form="paper"` — the four per-site gains of the block.
+        #: Built only with the flag on; declared before the byteflow early
+        #: return so a channel model has the attribute (None) rather than no
+        #: attribute.
+        self.layerrope: LayerRoPEGains | LayerRoPEPaperGains | None = None
+        #: The v1 gains only (None under the paper form): the prelude/coda/final
+        #: norms and the loop body take `layerrope=` from this, so the paper
+        #: form cannot half-wire them.
+        v1_gains: LayerRoPEGains | None = None
+        paper_gains: LayerRoPEPaperGains | None = None
         #: Every QAT cache in the tree (`qat_cache.QuantCache`), collected after
         #: the build below. `forward` drains their hit counts into `qat_reuse`;
         #: the trainer invalidates them once per optimizer step.
@@ -169,22 +201,39 @@ class DormouseModel(nn.Module):
         d = cfg.d_model
         self.embed = nn.Embedding(cfg.vocab, d, device=device)
         if cfg.layerrope:
-            #: ONE shared vector + one scalar pair per depth (module docstring):
-            #: with the terminal final norm the table is
-            #: `n_depths = P + max_iter + C + 1`; the per-site variant adds the
-            #: site axis only, never a second `gamma_shared`.
-            n_depths = cfg.prelude_layers + cfg.max_iter + cfg.coda_layers + 1
-            n_sites = cfg.prelude_layers + cfg.loop_blocks + cfg.coda_layers + 1
-            self.layerrope = LayerRoPEGains(
-                d,
-                n_depths,
-                n_sites=n_sites,
-                per_site=cfg.layerrope_per_site,
-                amp_init=cfg.layerrope_amp_init,
-                theta_init=cfg.layerrope_theta_init,
-                learn_theta=cfg.layerrope_learn_theta,
-                device=device,
-            )
+            if cfg.layerrope_form == "paper":
+                #: The paper form (`layerrope.py`): FOUR sites per loop body,
+                #: `d + 4` parameters each. The table's depth axis is the
+                #: network's: `P + max_iter + C` covers both index modes
+                #: (iteration `i < max_iter`, position `P + b`).
+                paper_gains = LayerRoPEPaperGains(
+                    d,
+                    max(cfg.prelude_layers + cfg.max_iter + cfg.coda_layers, 1),
+                    n_blocks=cfg.loop_blocks,
+                    base=cfg.layerrope_base,
+                    beta_init=cfg.layerrope_beta_init,
+                    identity=cfg.layerrope_init == "identity",
+                    device=device,
+                )
+                self.layerrope = paper_gains
+            else:
+                #: ONE shared vector + one scalar pair per depth (module
+                #: docstring): with the terminal final norm the table is
+                #: `n_depths = P + max_iter + C + 1`; the per-site variant adds
+                #: the site axis only, never a second `gamma_shared`.
+                n_depths = cfg.prelude_layers + cfg.max_iter + cfg.coda_layers + 1
+                n_sites = cfg.prelude_layers + cfg.loop_blocks + cfg.coda_layers + 1
+                v1_gains = LayerRoPEGains(
+                    d,
+                    n_depths,
+                    n_sites=n_sites,
+                    per_site=cfg.layerrope_per_site,
+                    amp_init=cfg.layerrope_amp_init,
+                    theta_init=cfg.layerrope_theta_init,
+                    learn_theta=cfg.layerrope_learn_theta,
+                    device=device,
+                )
+                self.layerrope = v1_gains
         #: The UNIQUE layers outside the shared loop (`prelude.py`, arXiv
         #: 2610.23036): `N` run once before it, `M` once after it. Empty at the
         #: defaults (0/0), so no parameter, no RNG draw and no state dict key —
@@ -194,7 +243,7 @@ class DormouseModel(nn.Module):
                 UniqueLayer(
                     cfg,
                     device=device,
-                    layerrope=self.layerrope,
+                    layerrope=v1_gains,
                     layerrope_depth=j,
                     layerrope_site=j,
                 )
@@ -204,9 +253,12 @@ class DormouseModel(nn.Module):
         self.loop = LoopBlock(
             cfg,
             device=device,
-            layerrope=self.layerrope,
+            layerrope=v1_gains,
             layerrope_depth=cfg.prelude_layers,
             layerrope_site=cfg.prelude_layers,
+            layerrope_paper=paper_gains,
+            paper_block=0,
+            paper_position=cfg.prelude_layers,
         )
         #: The DISTINCT bodies inside the loop (`loop_blocks`, `config.py`):
         #: `self.loop` is body 0 and owns the per-iteration slots; each extra is
@@ -221,9 +273,12 @@ class DormouseModel(nn.Module):
                     cfg,
                     device=device,
                     body_only=True,
-                    layerrope=self.layerrope,
+                    layerrope=v1_gains,
                     layerrope_depth=cfg.prelude_layers,
                     layerrope_site=cfg.prelude_layers + b,
+                    layerrope_paper=paper_gains,
+                    paper_block=b,
+                    paper_position=cfg.prelude_layers + b,
                 )
                 for b in range(1, cfg.loop_blocks)
             ]
@@ -237,7 +292,7 @@ class DormouseModel(nn.Module):
                 UniqueLayer(
                     cfg,
                     device=device,
-                    layerrope=self.layerrope,
+                    layerrope=v1_gains,
                     layerrope_depth=cfg.prelude_layers + cfg.max_iter + j,
                     layerrope_site=cfg.prelude_layers + cfg.loop_blocks + j,
                 )
@@ -249,11 +304,11 @@ class DormouseModel(nn.Module):
         #: last iteration's depth (see `layerrope.py`).
         self.norm = (
             nn.RMSNorm(d, eps=cfg.norm_eps, device=device)
-            if self.layerrope is None
+            if v1_gains is None
             else LayerRoPENorm(
                 d,
                 cfg.norm_eps,
-                self.layerrope,
+                v1_gains,
                 depth=cfg.prelude_layers + cfg.max_iter + cfg.coda_layers,
                 site=cfg.prelude_layers + cfg.loop_blocks + cfg.coda_layers,
             )
