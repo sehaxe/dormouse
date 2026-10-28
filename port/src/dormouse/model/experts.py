@@ -1562,6 +1562,7 @@ class SparseMoE(nn.Module):
                     counters.count("moe_triton_fallback")
                     counters.why = f"fused backward: {fwhy}"  # type: ignore[attr-defined]
                 counters.count("moe_triton_gemm")
+                self._count_tile(counters)
                 return self._expert_pass(
                     lambda: self._triton_dispatch(
                         x, weight, index, order, keep_rows, fused_bwd=fwhy is None
@@ -1645,6 +1646,7 @@ class SparseMoE(nn.Module):
                 prev = getattr(counters, "why", None)
                 counters.why = f"{prev}; {note}" if prev else note  # type: ignore[attr-defined]
             counters.count("moe_triton_gemm")
+            self._count_tile(counters)
             return self._expert_pass(
                 lambda: self._triton_dispatch(
                     x, weight, index, order, keep_rows, dropless=True, fused_bwd=fwhy is None
@@ -1661,17 +1663,32 @@ class SparseMoE(nn.Module):
             lambda: self._naive_dispatch(x, weight, index, order, keep, counters), counters
         )
 
+    def _count_tile(self, counters: Counters) -> None:
+        """COUNTED: the tile the search picked, as a counter NAME (`moe_tile_N…_M…_st…`).
+
+        ADR-0019: the tile is a degradation of the ideal (the shape may have cost
+        a pipeline stage or half of `BLOCK_N`), so a reader of the log must see
+        which one ran without a profiler — `moe_tile_N128_M64_st1=<forwards>` on
+        the log line says the arm gave up a stage, and `st2` says it kept it.
+        Same seam as `moe_triton_gemm` (cardinality is one per tile set, so the
+        counter line stays short).
+        """
+        counters.count(
+            moe_kernels.tile_name(self._bank_dtype(), self.d, self.f, self.experts[0].rank)
+        )
+
     def _triton_reason(self, x: torch.Tensor) -> str | None:
         """`None` if the unpadded grouped GEMM can run THIS call, else why not.
 
         The arm is unpadded by construction (`offs` carries the ragged bounds),
         so the gates are the ability itself (no triton, no CUDA) and the TILE:
-        `moe_kernels.tile_reason` estimates the CTA shared memory of the widest
-        kernel from the tile constants and the compute dtype. A set that does
-        not fit is COUNTED with its numbers instead of dying at launch — that is
-        what `196608 B > 101376` on the fp32 ByteFlow arm used to do, and why
-        that arm ran `moe_kernel=naive`. `moe_kernels.tiles_for` now halves the
-        wide tiles at four bytes, so the fp32 shape fits and no fallback fires.
+        `moe_kernels.tile_reason` runs the ordered tile SEARCH (`TILE_SEARCH`)
+        and estimates the CTA shared memory of the widest kernel for each
+        candidate from the compute dtype. A shape no candidate fits is COUNTED
+        with its numbers instead of dying at launch — the loud message names the
+        dtype, the smallest candidate's bytes, the ceiling and the escape — and
+        the search means a merely WIDE shape (rank 192 bf16) now runs at the
+        largest tile that fits instead of killing the run at step 0.
         """
         if _TRITON_WHY is not None:
             return _TRITON_WHY

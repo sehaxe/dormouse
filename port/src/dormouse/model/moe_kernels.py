@@ -89,8 +89,14 @@ key moves, which is the treadmill `docs/research/2026-10-15-tsct-super-kernel.md
 is 4 on the fused kernel and 8 on the three adjoint kernels — both measured, both
 in the bench table; `BLOCK_F`/`BLOCK_N` are the ones that mattered. These numbers
 are for a TWO-BYTE dtype: `tiles_for` halves `BLOCK_N`/`BLOCK_F` at four bytes and
-drops the pipeline to one stage. A tile set that cannot fit is refused BEFORE
-launch with its numbers (`_refusal`), never by a traceback; a launch that still
+drops the pipeline to one stage.
+
+That dtype rule is the BASE of a deterministic SEARCH, not the answer: `_fit`
+walks `TILE_SEARCH`'s ordered candidates (BLOCK_N, stages, BLOCK_M) and takes the
+first whose `smem_estimate` fits `SMEM_CEILING_BYTES`. Before 2026-10-28 the code
+picked the base and `assert`ed it fitted, so a wide shape (rank 192 bf16) died at
+step 0 with `163840 bytes > 101376` instead of running. When no candidate fits,
+the refusal is LOUD with the numbers AND an `Escape:` line; a launch that still
 refuses falls back to the torch reference COUNTED (`moe_triton_fallback`).
 
 `smem_estimate` is calibrated against `triton.compile(...).metadata.shared` (the
@@ -242,9 +248,28 @@ def smem_estimate(
 
     The formula that reproduces the measured FAMILY max in every checked cell:
     `stages * es * max(BM*BK + BK*BN, BM*BK + BM*BN, GLU)` with
-    `GLU = max(BM*BK + BK*RP, BM*RP + RP*BF)` and `BK = max(BLOCK_K, RP)`.
+    `BK = max(BLOCK_K, RP)` (the adjoint's `t_wide` reruns at K = RP) and
+    `GLU = max(BM*BLOCK_K + BLOCK_K*RP, BM*RP + RP*BF)` — the GLU tiles the RANK
+    on N and D on K, so its K tile is `BLOCK_K`, NOT the raised `BK`.
     (At BN=64 the GLU is the max, 24576 B; the pair alone measures 16384 there.
     At BN>=128 the pair is the max and equals the formula.)
+
+    **Corrected 2026-10-28 (rank > BLOCK_K):** the GLU term used the raised `BK`,
+    which charged `RP*RP` for a `[BLOCK_K, RP]` weight tile and made the family
+    look 5/3 too wide at rank 192. Measured, this box, same compile harness:
+
+    | kernel | tile | measured B | old model | this model |
+    |---|---|---|---|---|
+    | `_glu_kernel` | BM 64, BK 64, BF 128, RP 64 | 24576 | 24576 | 24576 |
+    | `_glu_kernel` | … RP 128 | 49152 | 49152 | 49152 |
+    | `_glu_kernel` | … RP 256 (rank 192) | **98304** | 163840 | 98304 |
+    | `_glu_kernel` | … RP 256, stages 1/2/3/4 | 98304 each | — | 98304 |
+    | `_grouped_gemm_pair_kernel` | BM 64, BN 128, BK 256 | 98304 | 98304 | 98304 |
+
+    So `163840 > 101376` — the refusal that killed every `rank>=192` bf16 arm
+    at step 0 — was the MODEL's number, not the device's: the widest kernel at
+    rank 192 measures 98304 B and fits.
+
     `BLOCK_N=512` at fp32 overrides to 147456 and is genuinely refused; the
     two-byte 512 does not (73728).
     """
@@ -254,6 +279,7 @@ def smem_estimate(
     bm, bk = tiles["BLOCK_M"], tiles["BLOCK_K"]
     bn, bf = tiles["BLOCK_N"], tiles["BLOCK_F"]
     rp = None if rank is None else _rp(rank)
+    gk = bk  # `_glu_kernel`'s K tile: it loops D by BLOCK_K (no rank raise)
     if rp is not None:
         bk = max(bk, rp)  # the backward's `t_wide` reruns the adjoint at this K
     terms = [
@@ -261,27 +287,105 @@ def smem_estimate(
         bm * bk + bm * bn,  # `_wgrad_kernel` upper bound (measured at half this)
     ]
     if rp is not None:
-        terms.append(max(bm * bk + bk * rp, bm * rp + rp * bf))  # `_glu_kernel`
+        terms.append(max(bm * gk + gk * rp, bm * rp + rp * bf))  # `_glu_kernel`
     return st * es * max(terms)
 
 
-def tiles_for(dtype: torch.dtype, d_model: int, d_ff: int, rank: int | None = None) -> dict:
-    """The tile set for `dtype`: bf16/fp16 is `TILES`, fp32 halves the wide axes.
+#: The tile SEARCH's order — a PRIORITY list, never a sweep: the first candidate
+#: that fits the CTA's shared memory wins, so the shape that ran yesterday picks
+#: yesterday's tile. Same rule as `TILES` (no autotune): edit the order here.
+#:
+#:   BLOCK_N  wide first — the measured-fast axis at b1: a wide N tile is a whole
+#:            adjoint column block per program instead of one mma tile, which is
+#:            what the bench table picked 128 for. Then half, then a quarter.
+#:   stages   deepest first — a deeper pipeline is the faster one and the one axis
+#:            that COSTS shared memory at four bytes (`smem_estimate`: 32768 /
+#:            65536 / 131072 at one / two / three stages at fp32, unchanged at
+#:            every stage count at two bytes). Giving a stage up keeps the tile;
+#:            shrinking the tile costs performance, so stages go first.
+#:   BLOCK_M  tall first — 64 is one row-block per expert at cap 64, so a program
+#:            never splits a group (TILES); 32 only when nothing at 64 fits.
+#: Two-byte dtypes also search two stages (the family's own `_WGRAD_STAGES`
+#: depth); four-byte dtypes launch with `num_stages=1`, so they have no depth to
+#: give and search one.
+TILE_SEARCH = {"BLOCK_N": (1, 2, 4), "stages": (2, 1), "BLOCK_M": (1, 2)}
 
-    Shared memory is bytes, so a 4-byte dtype gets half the elements in the two
-    wide tiles (`BLOCK_N` and `BLOCK_F`) to hold the bytes constant; the tiles
-    are also capped at the next power of two of the dimension they tile, so a
-    narrow model does not ask for a tile wider than its axis. Refuses LOUDLY
-    before launch when even that does not fit (message: the numbers).
+
+def _base_tiles(dtype: torch.dtype, d_model: int, d_ff: int) -> dict:
+    """The dtype's own set: `TILES`, or the halved wide axes for a 4-byte dtype.
+
+    Shared memory is bytes, so fp32 gets half the elements in the two wide tiles
+    (`BLOCK_N` and `BLOCK_F`) to hold the bytes constant, capped at the next
+    power of two of the dimension they tile so a narrow model does not ask for a
+    tile wider than its axis.
     """
-    assert d_model >= 1 and d_ff >= 1, f"tile shapes must be positive, got {d_model}/{d_ff}"
     t = dict(TILES)
     if _elem_bytes(dtype) == 4:
         t["BLOCK_N"] = min(TILES["BLOCK_N"] // 2, triton.next_power_of_2(d_model))
         t["BLOCK_F"] = min(TILES["BLOCK_F"] // 2, triton.next_power_of_2(d_ff))
-    n = smem_estimate(t, dtype, rank)
-    assert n <= SMEM_CEILING_BYTES, _refusal(dtype, t["BLOCK_N"], n)
     return t
+
+
+def _candidates(dtype: torch.dtype, base: dict) -> list[tuple[dict, int]]:
+    """`(tiles, stages)` in `TILE_SEARCH` order — the divisor axes, nested.
+
+    A divisor of 1 is the base tile; 2 and 4 shrink the axis (`max(16, …)` is
+    `tl.dot`'s floor, `_rp`'s own rule). Deterministic: same dtype and base in,
+    same list out, no measurement and no state.
+    """
+    stages = TILE_SEARCH["stages"] if _elem_bytes(dtype) == 2 else (1,)
+    out: list[tuple[dict, int]] = []
+    for bn in (base["BLOCK_N"] // d for d in TILE_SEARCH["BLOCK_N"]):
+        for st in stages:
+            for bm in (base["BLOCK_M"] // d for d in TILE_SEARCH["BLOCK_M"]):
+                out.append((dict(base, BLOCK_N=max(16, bn), BLOCK_M=max(16, bm)), st))
+    return out
+
+
+def _fit(
+    dtype: torch.dtype, d_model: int, d_ff: int, rank: int | None
+) -> tuple[tuple[dict, int, int] | None, tuple[int, dict, int] | None]:
+    """The search: `((tiles, stages, bytes), None)` if one fits, else
+    `(None, (bytes, tiles, stages))` of the LEAST demanding candidate.
+
+    The bytes come from `smem_estimate` — the same formula the launcher's
+    backstop and the calibration gate use, never a second copy of the arithmetic.
+    """
+    base = _base_tiles(dtype, d_model, d_ff)
+    smallest = None
+    for t, st in _candidates(dtype, base):
+        n = smem_estimate(t, dtype, rank, stages=st)
+        if n <= SMEM_CEILING_BYTES:
+            return (t, st, n), None
+        if smallest is None or n < smallest[0]:
+            smallest = (n, t, st)
+    return None, smallest
+
+
+def _exhausted(dtype: torch.dtype, d_model: int, d_ff: int, rank: int | None, miss) -> str:
+    """The one message the search prints when NO candidate fits: numbers + escape."""
+    n, t, st = miss
+    return (
+        f"no {_DTYPE_NAMES[dtype]} tile in the search fits shared memory at "
+        f"d_model={d_model} d_ff={d_ff} rank={rank}: the smallest candidate "
+        f"(BLOCK_N={t['BLOCK_N']}, BLOCK_M={t['BLOCK_M']}, stages={st}) needs {n} bytes "
+        f"> {SMEM_CEILING_BYTES}. Escape: reduce rank / d_ffn, or use moe_kernel=naive"
+    )
+
+
+def tiles_for(dtype: torch.dtype, d_model: int, d_ff: int, rank: int | None = None) -> dict:
+    """The first tile set in `TILE_SEARCH` that fits `dtype`'s shared memory.
+
+    LOUD when no candidate fits (`_exhausted`: dtype, smallest candidate's bytes,
+    the ceiling, the shape, and the `Escape:` line) — never a traceback from the
+    first launch. With no override in play the search IS the answer, so this and
+    `tile_reason` agree on every shape.
+    """
+    assert d_model >= 1 and d_ff >= 1, f"tile shapes must be positive, got {d_model}/{d_ff}"
+    hit, miss = _fit(dtype, d_model, d_ff, rank)
+    if hit is None:
+        loud(_exhausted(dtype, d_model, d_ff, rank, miss))
+    return hit[0]
 
 
 def tile_reason(
@@ -292,13 +396,18 @@ def tile_reason(
     *,
     tiles: dict | None = None,
 ) -> str | None:
-    """`None` when this dtype's tile set can launch, else the measured refusal.
+    """`None` when a tile set can launch, else the refusal with its numbers.
 
-    `tiles` overrides the dtype's own set (the bench's control arm); it is the
+    `tiles` overrides the search's choice (the bench's control arm); it is the
     same overlay `_tiles` applies, so a refused override reads identically here
-    and at the launcher.
+    and at the launcher. An EXHAUSTED search returns the loud message instead of
+    raising: the caller counts the fallback with those words (`moe_triton_fallback`
+    + `counters.why`), which is how a reader of the log learns the arm did not run.
     """
-    t = tiles_for(dtype, d_model, d_ff, rank)
+    hit, miss = _fit(dtype, d_model, d_ff, rank)
+    if hit is None:
+        return _exhausted(dtype, d_model, d_ff, rank, miss)
+    t = hit[0]
     if tiles:
         unknown = set(tiles) - set(TILES)
         assert not unknown, f"unknown tile(s) {sorted(unknown)}; known: {sorted(TILES)}"
@@ -307,21 +416,39 @@ def tile_reason(
     return None if n <= SMEM_CEILING_BYTES else _refusal(dtype, t["BLOCK_N"], n)
 
 
+def tile_name(dtype: torch.dtype, d_model: int, d_ff: int, rank: int | None = None) -> str:
+    """`moe_tile_N<BLOCK_N>_M<BLOCK_M>_st<stages>` — the counter that names the tile.
+
+    COUNTED, not SILENT (ADR-0019): a reader of the training log sees which tile
+    the arm ran without a profiler, and a shape that had to give up BLOCK_N or a
+    pipeline stage says so in the same field. `st` is the stage depth the search
+    accepted the shape at; the launches keep the dtype's own `_launch_stages`
+    (nothing at two bytes, `num_stages=1` at four).
+    """
+    hit, _ = _fit(dtype, d_model, d_ff, rank)
+    assert hit is not None, "tile_name on an exhausted search: the arm cannot run"
+    t, st, _ = hit
+    return f"moe_tile_N{t['BLOCK_N']}_M{t['BLOCK_M']}_st{st}"
+
+
 def _tiles(
     tiles: dict | None, dtype: torch.dtype, d_model: int, d_ff: int, rank: int | None = None
 ) -> dict:
     """`tiles_for(dtype)` with the caller's overrides, asserted to fit BEFORE launch.
 
     A bench may ask for a control tile set; a tile set the device cannot hold is
-    a refusal with the numbers, never a traceback from the first launch.
+    a refusal with the numbers, never a traceback from the first launch. The
+    override is tried AS ASKED — there is nothing to search for a tile the caller
+    named — so this keeps the assert the search replaced.
     """
     t = tiles_for(dtype, d_model, d_ff, rank)
     if tiles:
         unknown = set(tiles) - set(TILES)
         assert not unknown, f"unknown tile(s) {sorted(unknown)}; known: {sorted(TILES)}"
         t.update(tiles)
-    n = smem_estimate(t, dtype, rank)
-    assert n <= SMEM_CEILING_BYTES, _refusal(dtype, t["BLOCK_N"], n)
+        n = smem_estimate(t, dtype, rank)
+        assert n <= SMEM_CEILING_BYTES, _refusal(dtype, t["BLOCK_N"], n)
+    return t
     return t
 
 
@@ -1231,9 +1358,7 @@ def _glu_backward(
     t_rank_n = dict(tiles, BLOCK_N=rp)
     t_wide = dict(tiles, BLOCK_K=rp)
 
-    dh = nt(
-        dyc, v, offs, cap, r, f, dict(t_rank_n, BLOCK_K=tiles["BLOCK_K"]), torch.float32
-    )
+    dh = nt(dyc, v, offs, cap, r, f, dict(t_rank_n, BLOCK_K=tiles["BLOCK_K"]), torch.float32)
     # Re-round the gate exactly as the forward did (accumulator -> dtype, multiply
     # the scale, round): the padded arm's autograd differentiates ITS rounded gate,
     # so differentiating the unrounded one here would be a 1e-2 disagreement that
