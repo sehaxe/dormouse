@@ -32,6 +32,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from .layerrope import LayerRoPEGains, LayerRoPENorm
 from .tsct import dense_qat_kind, qat_linear
 
 __all__ = ["UniqueLayer"]
@@ -40,7 +41,15 @@ __all__ = ["UniqueLayer"]
 class UniqueLayer(nn.Module):
     """`h = h + down(silu(gate(norm(h))) * up(norm(h)))` — one, not shared."""
 
-    def __init__(self, cfg, *, device: torch.device | str = "cpu") -> None:
+    def __init__(
+        self,
+        cfg,
+        *,
+        device: torch.device | str = "cpu",
+        layerrope: LayerRoPEGains | None = None,
+        layerrope_depth: int = 0,
+        layerrope_site: int = 0,
+    ) -> None:
         super().__init__()
         d = cfg.d_model
         #: Half the loop's FFN width: the budget at d=1024 is 1.57M per layer
@@ -49,7 +58,21 @@ class UniqueLayer(nn.Module):
         d_ff = max(d // 2, 1)
         self.d = d
         self.d_ff = d_ff
-        self.norm = nn.RMSNorm(d, eps=cfg.norm_eps, device=device)
+        #: The unique layer's OWN depth index under LayerRoPE (prelude `j`,
+        #: coda `P + max_iter + j`) — fixed for its lifetime. OFF builds the
+        #: plain `nn.RMSNorm` bit for bit; ON replaces its gain with the shared
+        #: `gamma_i` (`model/layerrope.py`).
+        self.norm = (
+            nn.RMSNorm(d, eps=cfg.norm_eps, device=device)
+            if layerrope is None
+            else LayerRoPENorm(
+                d,
+                cfg.norm_eps,
+                layerrope,
+                depth=layerrope_depth,
+                site=layerrope_site,
+            )
+        )
         self.gate = nn.Linear(d, d_ff, bias=False, device=device)
         self.up = nn.Linear(d, d_ff, bias=False, device=device)
         self.down = nn.Linear(d_ff, d, bias=False, device=device)

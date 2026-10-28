@@ -153,6 +153,7 @@ from .engram import Engram, memory_floor_mix
 from .experts import SparseMoE
 from .fullattn import FullAttention
 from .kda import KDAAttention
+from .layerrope import LayerRoPEGains, LayerRoPENorm
 from .mhc import MHCMix
 from .qat_cache import QuantCache
 from .sparse import BlockSparseAttention
@@ -226,6 +227,9 @@ class LoopBlock(nn.Module):
         *,
         device: torch.device | str = "cpu",
         body_only: bool = False,
+        layerrope: LayerRoPEGains | None = None,
+        layerrope_depth: int = 0,
+        layerrope_site: int = 0,
     ) -> None:
         """One loop body. `body_only` drops the LOOP-LEVEL, per-iteration slots.
 
@@ -263,7 +267,19 @@ class LoopBlock(nn.Module):
         #: block projects directly (controller, `mem_dense`); the linears go
         #: through `qat_linear`'s own attached cache.
         self._qat_cache = QuantCache() if cfg.dense_qat != "none" else None
-        self.norm = nn.RMSNorm(d, eps=cfg.norm_eps, device=device)
+        #: LayerRoPE (`model/layerrope.py`): the block's ONE pre-norm gain is
+        #: `gamma_{P+i}` — the same site the attention and the MoE read, which is
+        #: this repo's "attention pre-norm + FFN pre-norm" already. `None` builds
+        #: the plain `nn.RMSNorm` bit for bit; otherwise `_layerrope_depth` is the
+        #: PRELUDE offset `P`, and `_window` adds the ACTUAL iteration number.
+        self._layerrope_depth = None if layerrope is None else int(layerrope_depth)
+        self.norm = (
+            nn.RMSNorm(d, eps=cfg.norm_eps, device=device)
+            if layerrope is None
+            else LayerRoPENorm(
+                d, cfg.norm_eps, layerrope, depth=layerrope_depth, site=layerrope_site
+            )
+        )
         # The three gates only. burn's controller ALSO emits the expert-blend
         # logits and its MoE "adds NO parameters"; the port's MoE owns a
         # dedicated router linear (the baked decision for this port), so the
@@ -656,7 +672,14 @@ class LoopBlock(nn.Module):
                 counters.count("mhc")
             else:
                 ctx = h + self.iter_embed[i].view(1, 1, d)
-            normed = blk.norm(ctx)
+            if blk._layerrope_depth is None:
+                normed = blk.norm(ctx)
+            else:
+                # The ACTUAL iteration number (`i`), never the run's compacted
+                # position: a shorter rand-depth run uses a PREFIX of the depth
+                # table and the coda/final depths stay anchored to `max_iter`
+                # (`layerrope.py` module docstring).
+                normed = blk.norm(ctx, depth=blk._layerrope_depth + i)
             ctrl = torch.cat([ctx.reshape(b * t, d), h0_flat], dim=-1)
             # MAGMA fix: fp32 masters with fp32 activations would run the slow
             # fp32 lane; `mm_mixed` casts to the compute dtype per forward.
