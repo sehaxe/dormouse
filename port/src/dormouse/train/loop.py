@@ -24,7 +24,13 @@ from pathlib import Path
 
 import torch
 
-from ..config import PROGRESS_KEYS, RunConfig, TrainConfig, validate_train
+from ..config import (
+    PROGRESS_KEYS,
+    RunConfig,
+    TrainConfig,
+    validate_model_train,
+    validate_train,
+)
 from ..instrument import Counters, LoudError, StepTimer, loud
 from ..model import kda
 from ..model.engram import (
@@ -930,6 +936,9 @@ def train(
     # The hand-built path skips `load_run`; the train-half refusals are ONE
     # definition (`config.validate_train`) and this is the second caller.
     validate_train(cfg)
+    # The MODEL×TRAIN capture refusals (LayerRoPE with full_graph/opt_graph),
+    # the same second caller (`config.validate_model_train`).
+    validate_model_train(run.model, cfg)
     if cfg.tf32:
         # The knob the b1 opt bench measured (2026-10-16): 1399 -> 1201 ms/step.
         torch.set_float32_matmul_precision("high")
@@ -1290,6 +1299,7 @@ def train(
             f"capture and freeze the WSD schedule), and zero_grad runs "
             f"set_to_none=False so the captured ops keep their pinned .grad buffers."
         )
+
     def micro_step(x, y, kw, n_micro: int, first: bool):
         """ONE micro-batch: forward + the DEVICE firewall + backward + the gate.
 

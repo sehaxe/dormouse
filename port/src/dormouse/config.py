@@ -335,6 +335,73 @@ class ModelConfig:
     halt_mode: bool = False
     rank: int = 64
     norm_eps: float = 1e-3
+    #: ---- LayerRoPE (`model/layerrope.py`, arXiv:2610.09179) ----
+    #: Depth-wise magnitude + angular superposition of the norm gain. ONE shared
+    #: `gamma_shared [d]` and per-depth `(amp_i, theta_i)` scalars replace the
+    #: per-site RMSNorm gains:
+    #:
+    #:     gamma_i = amp_i · rotate_pairs(gamma_shared, theta_i)
+    #:
+    #: The depth index is the PRELUDE layer, the ACTUAL loop iteration (`P+i`,
+    #: not a compacted run position), the CODA layer, or the terminal final
+    #: norm (`P + max_iter + C`); all sites at one depth share `gamma_i`. With
+    #: the identity init (`amp_init=1.0, theta_init=0.0`) the ON forward is the
+    #: OFF forward bit for bit, but the state-dict keys differ (`layerrope.*`
+    #: replace the per-site `.norm.weight`s), so a resume across the flag is
+    #: refused by the snapshot drift gate. ALLOWED with `use_mhc`,
+    #: `use_attnres`, `use_csa`, `attn_window`, `segment_len`, `rand_depth`,
+    #: `loop_blocks`, `prelude_layers`/`coda_layers`, `tie_embeddings`,
+    #: `ema_decay`, `grad_accum`, `muon_sf` (the gain table is 1-D → AdamW) and
+    #: the QAT arms (their seam is dense weights, never norm gains). REFUSED
+    #: with `use_byteflow` (the channel path builds no byte-level norm tree),
+    #: an odd `d_model` (pair rotation), `full_graph`/`opt_graph`
+    #: (`validate_model_train`), and any subfield set without this master
+    #: switch.
+    layerrope: bool = False
+    #: `amp_i` at initialisation. `1.0` is the identity; a magnitude is
+    #: positive, so `<= 0` is refused rather than silently zeroing the arm.
+    layerrope_amp_init: float = 1.0
+    #: `theta_i` at initialisation (radians). `0.0` is the identity rotation.
+    layerrope_theta_init: float = 0.0
+    #: One `(amp, theta)` per `(depth, site)` instead of per depth. `false` is
+    #: the paper's single shared vector — this flag exists for the follow-up
+    #: per-site A/B, not for the first measurement.
+    layerrope_per_site: bool = False
+    #: Learn `theta_i`. `false` makes the angle a fixed BUFFER (at
+    #: `layerrope_theta_init`), so the angular part is a constant rotation.
+    layerrope_learn_theta: bool = True
+    #: Which LayerRoPE form runs. `"v1"` is the implementation this branch
+    #: shipped — ONE shared `gamma_shared` + per-depth `(amp_i, theta_i)`, at
+    #: the norm READ sites only, one angle for every channel pair. `"paper"` is
+    #: the project page's reference snippet: `gamma[d]` + FOUR scalars per site
+    #: (`a_mag`, `b_mag`, `a_rot`, `b_rot`), log-linear magnitude
+    #: `r_l = a_mag + b_mag·log_l`, RoPE-spectrum per-PAIR rotation
+    #: `ang_j = θ_l·base^(-2j/d)`, applied at BOTH the read and the write of the
+    #: attention branch and of the FFN/MoE branch — four sites per block,
+    #: `4·(d+4)` parameters (one site is `d + 4` + 2 buffers). `"v1"` is the
+    #: default so no number on record moves; `"paper"` is a different parameter
+    #: tree, so a resume across the form is refused by the snapshot gate.
+    layerrope_form: str = "v1"
+    #: The paper form's `beta_init`: `b_mag` and `b_rot` at initialisation.
+    #: `-0.5` is the paper's value, and it is NOT an identity — the gain is
+    #: depth-scaled from step 1 (`r_l = β·log_l`). Refused with `form="v1"`,
+    #: which reads no beta.
+    layerrope_beta_init: float = -0.5
+    #: The paper form's `base` of the RoPE spectrum `base^(-2j/d)`. `100.0` is
+    #: the paper's value; `> 0` only. Refused with `form="v1"`.
+    layerrope_base: float = 100.0
+    #: The depth index. `"iteration"` (default, v1's rule) is the ACTUAL loop
+    #: iteration — a shorter run uses a prefix of the table. `"position"` is
+    #: the body's position in the NETWORK, independent of the loop iteration:
+    #: the paper's looped-model reading (Parcae), under which every iteration
+    #: of one weight-shared body reads the same gain. Refused with `form="v1"`.
+    layerrope_index: str = "iteration"
+    #: The paper form's initialisation. `"paper"` is `beta_init` as given (a
+    #: live depth scaling from step 1). `"identity"` sets `b_mag = b_rot = 0`
+    #: AND turns the spectrum off, so every depth's gain IS `gamma` and the
+    #: forward equals the `layerrope=false` forward bit for bit — the arm's
+    #: bit-identity gate, not the paper's init. Refused with `form="v1"`.
+    layerrope_init: str = "paper"
 
     # --- precision ------------------------------------------------------
     #: bf16 activations/weights with fp32 masters (`docs/architecture/bf16-plan.md`).
@@ -2352,6 +2419,16 @@ def validate(model: ModelConfig) -> None:
                 f"bytes they are specified on. Escape: use_byteflow=false, or "
                 f"prelude_layers=0 and coda_layers=0."
             )
+        if model.layerrope:
+            # Before `_validate_byteflow`, so the LayerRoPE refusal is the one a
+            # reader sees rather than an unrelated chunker-width error.
+            loud(
+                "layerrope=true with use_byteflow=true: both byteflow shapes leave "
+                "this model's byte-level loop — Option A builds no loop at all and "
+                "Option B runs it over K patch latents, so the LayerRoPE norm tree "
+                "would never be built while the flag reported it on. Escape: "
+                "use_byteflow=false, or layerrope=false."
+            )
         _validate_byteflow(model)
     if model.sigreg_weight < 0.0:
         loud(
@@ -2501,6 +2578,105 @@ def validate(model: ModelConfig) -> None:
                 f"{model.halt_min_iter}: the cap must admit the floor. Escape: "
                 f"swap them."
             )
+
+    if model.layerrope:
+        if model.d_model % 2:
+            loud(
+                f"layerrope=true with d_model={model.d_model}: the rotation acts on "
+                f"adjacent channel PAIRS, so the width must be even. Escape: an even "
+                f"d_model, or layerrope=false."
+            )
+        if model.layerrope_form not in ("v1", "paper"):
+            loud(
+                f"layerrope_form={model.layerrope_form!r} is not a LayerRoPE form. "
+                f"Known: 'v1' (shared gamma, per-depth amp/theta, read sites only) "
+                f"and 'paper' (gamma + 4 scalars per site, read AND write, RoPE "
+                f"spectrum). Escape: name one of those, or layerrope=false."
+            )
+        if model.layerrope_index not in ("iteration", "position"):
+            loud(
+                f"layerrope_index={model.layerrope_index!r} is not a depth index. "
+                f"Known: 'iteration' (the ACTUAL loop iteration, v1's rule) and "
+                f"'position' (the body's position in the network, independent of "
+                f"the loop iteration). Escape: name one of those, or "
+                f"layerrope_form='v1' (which reads no index)."
+            )
+        if model.layerrope_init not in ("paper", "identity"):
+            loud(
+                f"layerrope_init={model.layerrope_init!r} is not a LayerRoPE init. "
+                f"Known: 'paper' (the paper's beta_init, depth-scaled from step 1) "
+                f"and 'identity' (every depth's gain IS gamma). Escape: name one of "
+                f"those, or layerrope_form='v1' (which reads no init)."
+            )
+        if model.layerrope_base <= 0.0:
+            loud(
+                f"layerrope_base={model.layerrope_base}: the RoPE spectrum is "
+                f"base^(-2j/d), so the base must be positive. Escape: base > 0 "
+                f"(100.0 is the paper's), or layerrope_form='v1'."
+            )
+        if model.layerrope_form == "v1":
+            # The paper form is the only reader of these; a non-default value on
+            # the v1 path would be a config naming an arm the forward never runs
+            # (the same rule the `layerrope=false` block below applies).
+            for key in (
+                "layerrope_beta_init",
+                "layerrope_base",
+                "layerrope_index",
+                "layerrope_init",
+            ):
+                value = getattr(model, key)
+                default = ModelConfig.__dataclass_fields__[key].default
+                if value != default:
+                    loud(
+                        f"{key}={value!r} with layerrope_form='v1': the v1 path "
+                        f"reads no beta/base/index/init — the paper form is their "
+                        f"only reader, so this would name an arm the forward never "
+                        f"runs. Escape: layerrope_form='paper', or {key}={default!r}."
+                    )
+            if model.layerrope_amp_init <= 0.0:
+                loud(
+                    f"layerrope_amp_init={model.layerrope_amp_init}: `amp_i` is the "
+                    f"MAGNITUDE of the gain, so a non-positive value would zero or flip "
+                    f"every normalised state. Escape: amp_init > 0 (1.0 is the identity), "
+                    f"or layerrope=false."
+                )
+        else:
+            for key in (
+                "layerrope_amp_init",
+                "layerrope_theta_init",
+                "layerrope_per_site",
+                "layerrope_learn_theta",
+            ):
+                value = getattr(model, key)
+                default = ModelConfig.__dataclass_fields__[key].default
+                if value != default:
+                    loud(
+                        f"{key}={value!r} with layerrope_form='paper': the paper "
+                        f"form has no `amp`/`theta` table and no per-site variant "
+                        f"(its magnitude and rotation ARE the four scalars per "
+                        f"site), so this field would reach no code. Escape: "
+                        f"layerrope_form='v1', or {key}={default!r}."
+                    )
+    else:
+        for key in (
+            "layerrope_amp_init",
+            "layerrope_theta_init",
+            "layerrope_per_site",
+            "layerrope_learn_theta",
+            "layerrope_form",
+            "layerrope_beta_init",
+            "layerrope_base",
+            "layerrope_index",
+            "layerrope_init",
+        ):
+            value = getattr(model, key)
+            default = ModelConfig.__dataclass_fields__[key].default
+            if value != default:
+                loud(
+                    f"{key}={value!r} without layerrope=true: the subfield reaches no "
+                    f"code, so the config would name an arm the forward never runs. "
+                    f"Escape: layerrope=true, or {key}={default!r}."
+                )
 
     if model.quant != "none":
         _refuse_ladder_rung(model.quant)
@@ -2992,6 +3168,36 @@ def validate_train(tcfg: TrainConfig) -> None:
         )
 
 
+def validate_model_train(model: ModelConfig, tcfg: TrainConfig) -> None:
+    """Cross-half refusals: a MODEL arm that a TRAIN capture cannot carry.
+
+    ONE definition with two callers (`load_run` and `train/loop.py::train`), the
+    same shape as `validate_train` — a hand-built run that skips `load_run`
+    must hear the same refusal. LayerRoPE's per-depth gain is a device-side
+    gather + rotation (no host read), but a capture would freeze the Python
+    depth index it is built from, and the identity has not been measured inside
+    a graph. Refused rather than silently captured; the reason names the arm.
+    """
+    if not model.layerrope:
+        return
+    if tcfg.full_graph:
+        loud(
+            "layerrope=true with full_graph=true: the per-depth gain is selected by "
+            "a PYTHON depth index (`model/layerrope.py::LayerRoPEGains._index`) and "
+            "the rotation is a device op — a capture would freeze the depth index "
+            "and replay one depth's gain at every site. The arm is not measured "
+            "inside a graph. Escape: full_graph=false, or layerrope=false."
+        )
+    if tcfg.opt_graph:
+        loud(
+            "layerrope=true with opt_graph=true: the optimizer stage is captured "
+            "with the participating parameter set frozen, and LayerRoPE's gain table "
+            "is indexed by depth at forward time — the capture contract has not been "
+            "verified for the rotated gains. Escape: opt_graph=false, or "
+            "layerrope=false."
+        )
+
+
 def load_run(
     preset: str = "small",
     *,
@@ -3129,6 +3335,9 @@ def load_run(
 
         model = _dc.replace(model, **model_overrides)
         validate(model)
+    # The MODEL arm × TRAIN capture refusals (`full_graph`, `opt_graph`), after
+    # the overrides so an override cannot bypass them.
+    validate_model_train(model, tcfg)
     if tcfg.batch < 1 or tcfg.seq_len < 1 or tcfg.steps < 1:
         loud(f"batch={tcfg.batch} seq_len={tcfg.seq_len} steps={tcfg.steps}: all must be >= 1")
     if tcfg.seq_len > model.max_seq_len:

@@ -442,6 +442,53 @@ testable and A/B-able (ADR-0017).
       `port/scripts/bench_full_graph.py` (`--modes eager,full_graph`,
       launch count for ONE step).
 
+- [x] P-LAYERROPE2. port (Python): upgrade LayerRoPE to the paper's reference
+      form beside v1. `layerrope_form: "v1" | "paper"` (default `"v1"`, so no
+      number on record moves). `"paper"` = the project page's snippet,
+      transcribed verbatim as `layerrope.LayerRoPESite`: `gamma[d]` + 4 scalars
+      (`a_mag`, `b_mag`, `a_rot`, `b_rot`), log-linear `r_l = a_mag + b_mag·log_l`,
+      RoPE-spectrum per-PAIR angle `ang_j = θ_l·base^(-2j/d)`, buffers
+      `freq`/`log_l`, table built ONCE per forward (input-independent).
+      FOUR sites per block (`attn_read`, `attn_write`, `mlp_read`,
+      `mlp_write`) = `4·(d+4)` params; v1 stays `d + 2·n_depths`; the per-layer
+      baseline is `2·L·d`. READ gain = the fused `F.rms_norm` affine;
+      WRITE gain = a multiply on each branch's OUTPUT where it enters `y`, the
+      residual update (`loopblock.py` `_window`, before
+      `y = attn + branch + ffn`), which is the `F(H_pre x_l)` mHC/AttnRes/ReZero
+      deposit — no mixer internals touched. Our block has ONE shared pre-norm
+      and a THIRD branch (Engram): `attn_read`/`attn_write` cover the attention
+      arm AND the memory read (stated in the docstring, not invented as a fifth
+      site). `layerrope_index: "iteration" | "position"` — `"position"` is the
+      paper's looped-model rule (all iterations of one body read one gain);
+      `layerrope_beta_init=-0.5`, `layerrope_base=100.0`, and
+      `layerrope_init: "paper" | "identity"`. **The parent's identity claim does
+      not hold in the snippet**: `b_mag=b_rot=0` gives `r=0, θ=1`, and
+      `ang = θ·freq = freq ≠ 0` is still a rotation — so `"identity"` also
+      short-circuits the spectrum, which is the only way `torch.equal(gain,
+      gamma)` can be true; the deviation is named in the module docstring.
+      Measured: identity forward is bit-identical (max|Δ| = 0.0, loss equal) to
+      `layerrope=false` on the pinned tiny fixture; paper init is live
+      (`b_mag += 0.1` moves the logits); both write gains move the output and
+      `torch.equal` a run whose branch output is zeroed; per-pair angles
+      recovered from the table match `θ·freq` at 1e-5 with 32/32 distinct pairs
+      and an angle ratio of 86.6 at d=64 (`base^((d-2)/d)`); all five parameters
+      of all four sites get finite non-zero gradients in a real 3-step run;
+      `layerrope_forward` counts 4/iteration (device-side, drained at the log
+      cadence). Refusals: bad form/index/init/base, `beta_init`/`base`/`index`/
+      `init` with `form="v1"`, `amp_init`/`theta_init`/`per_site`/`learn_theta`
+      with `form="paper"`, any subfield without `layerrope=true`. Gates in
+      `tests/test_layerrope.py` (19 v1 gates unchanged + 10 paper gates), ten
+      scratch reverts each turning its named gate red, sha256 restored
+      (`layerrope.py` `0cf1637…`, `loopblock.py` `ff56109…`, `config.py`
+      `3d742b4…`). Driver `scripts/ab_layerrope.py` REWRITTEN for the new A/B:
+      `no_layerrope_5e-4` control, `v1_/paper_/paper_identity_/paper_pos_` at
+      5e-4 and 1e-3, 3 seeds × 600 steps, b8 s512, medium, mix4/web.bin +
+      web_eval.bin; pre-registered: paper replaces v1 iff
+      `mean(v1) − mean(paper) > 2 × spread(control)` at the same LR,
+      paper_pos vs paper_iter decided by the same rule, LR band width reported
+      per form. Written, **NOT run** (no GPU work on this task): no timing, no
+      BPB, no verdict exists.
+
 
 ## Critical Files
 

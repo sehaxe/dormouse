@@ -154,6 +154,7 @@ from .engram import Engram, memory_floor_mix
 from .experts import SparseMoE
 from .fullattn import FullAttention
 from .kda import KDAAttention
+from .layerrope import LayerRoPEGains, LayerRoPENorm, LayerRoPEPaperGains
 from .mhc import MHCMix
 from .qat_cache import QuantCache
 from .sparse import BlockSparseAttention
@@ -227,8 +228,22 @@ class LoopBlock(nn.Module):
         *,
         device: torch.device | str = "cpu",
         body_only: bool = False,
+        layerrope: LayerRoPEGains | None = None,
+        layerrope_depth: int = 0,
+        layerrope_site: int = 0,
+        layerrope_paper: LayerRoPEPaperGains | None = None,
+        paper_block: int = 0,
+        paper_position: int = 0,
     ) -> None:
         """One loop body. `body_only` drops the LOOP-LEVEL, per-iteration slots.
+
+        `layerrope` is v1's shared `(gamma_shared, amp, theta)` table;
+        `layerrope_paper` is the paper form's four sites for THIS body
+        (`paper_block`) at the network position `paper_position` (read only
+        when `layerrope_index="position"`). Exactly one of them may be set:
+        v1 REPLACES the block's norm gain, the paper form replaces the norm
+        itself (its read gain is the norm's affine) and adds two write gains.
+        Both `None` builds the plain `nn.RMSNorm` bit for bit.
 
         `DormouseModel(loop_blocks=N)` builds ONE full block (`loop`, the
         driver: it owns `iter_embed`/`attnres`/`*_gate` and the loop state) and
@@ -264,7 +279,35 @@ class LoopBlock(nn.Module):
         #: block projects directly (controller, `mem_dense`); the linears go
         #: through `qat_linear`'s own attached cache.
         self._qat_cache = QuantCache() if cfg.dense_qat != "none" else None
-        self.norm = nn.RMSNorm(d, eps=cfg.norm_eps, device=device)
+        #: LayerRoPE (`model/layerrope.py`): the block's ONE pre-norm gain is
+        #: `gamma_{P+i}` — the same site the attention and the MoE read, which is
+        #: this repo's "attention pre-norm + FFN pre-norm" already. `None` builds
+        #: the plain `nn.RMSNorm` bit for bit; otherwise `_layerrope_depth` is the
+        #: PRELUDE offset `P`, and `_window` adds the ACTUAL iteration number.
+        self._layerrope_depth = None if layerrope is None else int(layerrope_depth)
+        if layerrope is not None and layerrope_paper is not None:
+            loud(
+                "loop block built with BOTH layerrope forms (v1 gains and the paper "
+                "sites): exactly one may own the norm. Escape: pass one, or neither."
+            )
+        #: The paper form's four sites for this body (`layerrope.py`). Held with
+        #: `object.__setattr__` so the shared module is NOT re-registered under
+        #: every block (one set of `layerrope.sites.*` keys, as v1 does for its
+        #: gains via `LayerRoPENorm`).
+        object.__setattr__(self, "_paper", layerrope_paper)
+        self._paper_block = int(paper_block)
+        self._paper_position = int(paper_position)
+        self._paper_index = cfg.layerrope_index
+        if layerrope_paper is not None:
+            #: The read gains ARE the norm's affine (`F.rms_norm(x, gain)`), so
+            #: a separate gain parameter here would be a second, dead vector.
+            self.norm = None
+        elif layerrope is None:
+            self.norm = nn.RMSNorm(d, eps=cfg.norm_eps, device=device)
+        else:
+            self.norm = LayerRoPENorm(
+                d, cfg.norm_eps, layerrope, depth=layerrope_depth, site=layerrope_site
+            )
         # The three gates only. burn's controller ALSO emits the expert-blend
         # logits and its MoE "adds NO parameters"; the port's MoE owns a
         # dedicated router linear (the baked decision for this port), so the
@@ -639,6 +682,12 @@ class LoopBlock(nn.Module):
         # of the whole depth history: mHC's lanes already hold that history.
         sources: list[torch.Tensor] = [h0] if self.use_attnres and not compose else []
         new_states: list = []
+        if self._paper is not None:
+            # The paper form's gain table is a function of the parameters ONLY
+            # (input-independent), so ONE build per window serves every
+            # iteration — the reference computes the whole `[L, d]` table per
+            # forward, and `for_iteration` slices it (`layerrope.py`).
+            self._paper.begin_forward()
         for i in range(T):
             counters.count("iter")
             ran = i + 1
@@ -664,7 +713,30 @@ class LoopBlock(nn.Module):
                 counters.count("mhc")
             else:
                 ctx = h + self.iter_embed[i].view(1, 1, d)
-            normed = blk.norm(ctx)
+            gains = None
+            if blk._paper is not None:
+                # PAPER FORM (`layerrope.py`): the two READ gains are the norm's
+                # affine — `normalize(ctx) · attn_read` folded into one fused
+                # `F.rms_norm` call, which with `read == ones` is the OFF path's
+                # bits. The depth index is the ACTUAL iteration (v1's choice) or
+                # the body's network POSITION, independent of the iteration —
+                # the paper's looped-model reading.
+                gains = blk._paper.for_iteration(
+                    blk._paper_block,
+                    i if blk._paper_index == "iteration" else blk._paper_position,
+                )
+                normed = F.rms_norm(ctx, (d,), gains[0], blk.eps)
+                normed_mlp = F.rms_norm(ctx, (d,), gains[2], blk.eps)
+            elif blk._layerrope_depth is None:
+                normed = blk.norm(ctx)
+                normed_mlp = normed
+            else:
+                # The ACTUAL iteration number (`i`), never the run's compacted
+                # position: a shorter rand-depth run uses a PREFIX of the depth
+                # table and the coda/final depths stay anchored to `max_iter`
+                # (`layerrope.py` module docstring).
+                normed = blk.norm(ctx, depth=blk._layerrope_depth + i)
+                normed_mlp = normed
             ctrl = torch.cat([ctx.reshape(b * t, d), h0_flat], dim=-1)
             # MAGMA fix: fp32 masters with fp32 activations would run the slow
             # fp32 lane; `mm_mixed` casts to the compute dtype per forward.
@@ -780,7 +852,20 @@ class LoopBlock(nn.Module):
             else:
                 branch = torch.zeros(b * t, d, dtype=torch.float32, device=h0.device)
 
-            ffn = blk._moe_branch(normed, counters) * w_ffn
+            ffn = blk._moe_branch(normed_mlp, counters) * w_ffn
+            if gains is not None:
+                # PAPER FORM's WRITE gains (`layerrope.py`): each branch's
+                # OUTPUT is scaled where it enters `y`, the residual UPDATE.
+                # `y` is exactly the `F(H_pre·x_l)` the residual operator
+                # deposits (mHC `H_post`, AttnRes' write, ReZero's `α`), and all
+                # three are LINEAR in `y`, so this is the paper's
+                # `h + write·F(...)` for every residual arm without touching a
+                # mixer's internals. `branch` (the Engram memory read) belongs to
+                # the attention side: same read of the same normalised state,
+                # same residual update (module docstring states the mapping).
+                attn = attn * gains[1]
+                branch = branch * gains[1]
+                ffn = ffn * gains[3]
             y = (attn + branch + ffn).reshape(b, t, d)
 
             if self.loom:
