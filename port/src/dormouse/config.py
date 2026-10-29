@@ -21,6 +21,7 @@ resume, changing what the model computes is not.
 from __future__ import annotations
 
 import dataclasses
+import math
 import sys
 import tomllib
 from dataclasses import dataclass, field
@@ -1684,6 +1685,48 @@ class TrainConfig:
     #: last three are the finding this feature came with: each one would have been
     #: a SILENT model change wearing a memory flag.
     segment_len: int = 0
+    #: PER-ITERATION CHECKPOINTING (`model/loopblock.py::_window`): each of the
+    #: `max_iter` passes over the SAME weights runs inside
+    #: `checkpoint(use_reentrant=False)`, so only that iteration's INPUT state
+    #: survives the forward and the deepest activation set kept for the backward
+    #: is one iteration's, not `max_iter` iterations'. It is a MEMORY decision,
+    #: not a model change: the same ops run on the same inputs and the backward
+    #: recomputes them exactly (the gate is `1e-6` relative on logits and
+    #: gradients, and CPU measures bit-identity). It composes with
+    #: `segment_len` (a checkpointed iteration inside a checkpointed segment),
+    #: `rand_depth` (the count is the ACTUAL depth, sampled before the call),
+    #: `use_csa` (the ring state is carried as an input, never checkpointed),
+    #: `use_engram`, `loop_blocks` and `grad_accum` (each micro-batch's backward
+    #: consumes its own recompute before the next forward).
+    #:
+    #: `false` is the default and the historical graph, bit for bit. Counter
+    #: `iter_checkpoint_saved` is the number of iterations the backward will
+    #: recompute, once per window — a zero on a run with the flag on means the
+    #: arm never fired. REFUSED with `full_graph` / `opt_graph`: a capture cannot
+    #: see a recompute, and replaying a graph that skipped it would feed the
+    #: backward a tensor the capture never kept.
+    iter_checkpoint: bool = False
+    #: PINNED HOST OFFLOAD of the LARGEST saved activations (`model/act_mem.py`),
+    #: in GiB moved to host PER FORWARD; `0.0` is OFF and installs no hooks.
+    #: The point is the idle PCIe time under a ~780 ms step (~32 GB/s on PCIe
+    #: 4.0 x16, so ~6 GiB can move without extending the step), not device
+    #: capacity. The first training forward PROFILES the saves; at its end the
+    #: sizes are sorted descending and the largest prefix that fits the budget
+    #: sets the threshold. Later forwards park every save at or above it (up to
+    #: the budget) in a pinned buffer, and the backward copies them back EXACTLY
+    #: — the loss and gradients are identical to the off run (`1e-6` relative
+    #: gate; exact on CPU). Buffers are pooled per size class and returned on
+    #: the backward edge, so the pool is bounded by the number of save sizes and
+    #: does not grow with the step count. `grad_accum` is safe: each micro-batch's
+    #: saves are consumed by its own backward before the next forward.
+    #:
+    #: Counters `offload_tensors` and `offload_gib_x100` (the bytes actually
+    #: parked, integer hundredths of a GiB) appear on the log line, and
+    #: `offload_profile_forward` marks the one forward that only measured sizes.
+    #: REFUSED with `full_graph` / `opt_graph` (a capture cannot see a Python
+    #: hook or an H2D/D2H copy) and with `use_byteflow` (the chunked head builds
+    #: a second patch-latent forward whose save set is not measured here).
+    activation_offload: float = 0.0
 
     # --- the RL lane (`post/rl.py` + `post/rl_train.py`) ----------------
     # The reward/advantage knobs are `RLConfig`'s fields, spelled here so the CLI
@@ -3209,6 +3252,49 @@ def validate_train(tcfg: TrainConfig) -> None:
             "Escape: full_graph=true alone (it implies the optimizer capture), or "
             "opt_graph=true alone."
         )
+    if tcfg.iter_checkpoint and tcfg.full_graph:
+        loud(
+            "iter_checkpoint=true with full_graph=true: a CUDA graph capture records "
+            "ONE launch sequence and replays it, while per-iteration checkpointing is "
+            "a RECOMPUTE the backward performs on the eager graph — the capture "
+            "cannot see it, and replaying a graph whose saved set was built without "
+            "the recompute would hand the backward tensors the capture never kept. "
+            "Escape: full_graph=false, or iter_checkpoint=false."
+        )
+    if tcfg.iter_checkpoint and tcfg.opt_graph:
+        loud(
+            "iter_checkpoint=true with opt_graph=true: the optimizer stage is "
+            "captured and replayed, but checkpointing changes the graph the backward "
+            "runs BEFORE that stage — a recompute a capture cannot see. A replayed "
+            "stage whose gradients came from a different saved set is not the stage "
+            "the capture was verified on. Escape: opt_graph=false, or "
+            "iter_checkpoint=false."
+        )
+    if tcfg.activation_offload != 0.0:
+        if not math.isfinite(tcfg.activation_offload) or tcfg.activation_offload < 0.0:
+            loud(
+                f"activation_offload={tcfg.activation_offload}: the budget is a "
+                f"non-negative GiB count moved to host per forward; 0.0 is OFF, and a "
+                f"negative or non-finite value would install hooks with no useful "
+                f"bound. Escape: activation_offload >= 0 (e.g. 4.0), or 0.0."
+            )
+        if tcfg.full_graph:
+            loud(
+                f"activation_offload={tcfg.activation_offload} with full_graph=true: "
+                f"a capture cannot see a Python `saved_tensors_hooks` pair or its "
+                f"H2D/D2H copies, so a replayed step would read whatever the capture "
+                f"happened to leave on the device instead of the parked tensor. "
+                f"Escape: full_graph=false, or activation_offload=0.0."
+            )
+        if tcfg.opt_graph:
+            loud(
+                f"activation_offload={tcfg.activation_offload} with opt_graph=true: "
+                f"the optimizer stage is captured, but the backward that fills its "
+                f"gradient buffers runs eager with host copies a capture cannot see — "
+                f"a replayed stage would be fed gradients from a different graph than "
+                f"the one it was verified on. Escape: opt_graph=false, or "
+                f"activation_offload=0.0."
+            )
     if tcfg.full_graph and tcfg.grad_accum > 1:
         loud(
             f"full_graph=true with grad_accum={tcfg.grad_accum}: the accumulation loop "
@@ -3253,6 +3339,15 @@ def validate_model_train(model: ModelConfig, tcfg: TrainConfig) -> None:
     depth index it is built from, and the identity has not been measured inside
     a graph. Refused rather than silently captured; the reason names the arm.
     """
+    if tcfg.activation_offload > 0.0 and model.use_byteflow:
+        loud(
+            f"activation_offload={tcfg.activation_offload} with use_byteflow=true: "
+            f"the chunked head builds a second patch-latent forward whose save set is "
+            f"not measured here, so a global saved-tensor hook would park a graph "
+            f"nobody has measured (and the chunked head's own re-forward conflicts "
+            f"with a second hook pair). Escape: use_byteflow=false, or "
+            f"activation_offload=0.0."
+        )
     if not model.layerrope:
         return
     if tcfg.full_graph:

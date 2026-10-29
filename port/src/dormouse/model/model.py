@@ -29,6 +29,7 @@ from torch import nn
 from ..config import ModelConfig
 from ..instrument import Counters, loud
 from ..losses import fixed_cross_entropy, logit_softcap
+from .act_mem import ActivationOffload
 from .byteflow import (
     BfChannel,
     ByteFlowNet,
@@ -419,6 +420,60 @@ class DormouseModel(nn.Module):
         # `dense_qat` is on (`qat_linear` reads it). A model built with both
         # switches off collects nothing — no cache, every number on record.
         self._qat_caches = attach_qat_caches(self, dense=cfg.dense_qat != "none")
+        #: The host-offload mechanism, installed by the TRAINER
+        #: (`configure_actmem`): a model built and forwarded without it keeps
+        #: `None`, and `forward` takes no branch and installs no hooks.
+        self._act_offload: ActivationOffload | None = None
+
+    def set_iter_checkpoint(self, on: bool) -> int:
+        """Enable per-iteration checkpointing on every loop block; return the count.
+
+        The flag is a TRAIN-half field (`TrainConfig.iter_checkpoint`) because
+        it changes what the backward recomputes, not what the model computes.
+        One call at the top of a run is enough: nothing reads it per step on the
+        host. A model with no loop block (`use_byteflow` Option A builds none)
+        would run the flag inert, so it refuses with the escape.
+        """
+        n = 0
+        for module in self.modules():
+            if isinstance(module, LoopBlock):
+                module.iter_checkpoint = bool(on)
+                n += 1
+        if on and n == 0:
+            loud(
+                "iter_checkpoint=true but this model builds no loop block "
+                "(use_byteflow Option A returns before the loop), so the flag would "
+                "recompute nothing while the log line reported it on. Escape: "
+                "use_byteflow=false, or iter_checkpoint=false."
+            )
+        return n
+
+    def configure_actmem(self, *, iter_checkpoint: bool, activation_offload: float) -> None:
+        """Install both TrainConfig activation-memory arms in one call.
+
+        Called once by the trainer. `activation_offload=0.0` leaves the hook pair
+        uninstalled (`self._act_offload is None`), which is the bit-identical
+        default; a positive budget refuses the byteflow shapes because their
+        chunked head's save set is not measured (see `model/act_mem.py`).
+        """
+        if iter_checkpoint:
+            self.set_iter_checkpoint(True)
+        if activation_offload == 0.0:
+            self._act_offload = None
+            return
+        mech = ActivationOffload(activation_offload)
+        if self.bf is not None or self.bf_net is not None:
+            loud(
+                f"activation_offload={activation_offload} with use_byteflow=true: "
+                f"both byteflow shapes build a chunked head over patch latents "
+                f"(`byteflow.encode_chunks`/`decode_chunks`) and re-read activations "
+                f"across chunk boundaries, so a global saved-tensor hook would park a "
+                f"graph whose save set nobody has measured — and the chunked head's "
+                f"own re-forward already conflicts with a second hook pair. Escape: "
+                f"use_byteflow=false, or activation_offload=0.0."
+            )
+        mech.bind(self)
+        self._act_offload = mech
 
     def set_factor_qat_alpha(self, alpha: float) -> None:
         """Set the annealing alpha on EVERY QAT consumer (one call per step).
@@ -516,17 +571,35 @@ class DormouseModel(nn.Module):
             self._refuse_segmented(segment_len)
             logits, loss = self._forward_channel(input_ids, targets, counters, depth, ce_fixed)
         else:
-            logits, loss = self._forward_byte_lm(
-                input_ids,
-                targets,
-                counters,
-                depth,
-                pure,
-                breakdown,
-                segment_len,
-                loss_mask,
-                ce_fixed,
-            )
+            # The host-offload arm is a TRAINING decision: `no_grad` saves
+            # nothing, so an eval/decode call never installs the hooks even with
+            # the flag on. `_act_offload is None` is the off path's only branch.
+            off = self._act_offload
+            if off is not None and torch.is_grad_enabled():
+                with off.region(counters):
+                    logits, loss = self._forward_byte_lm(
+                        input_ids,
+                        targets,
+                        counters,
+                        depth,
+                        pure,
+                        breakdown,
+                        segment_len,
+                        loss_mask,
+                        ce_fixed,
+                    )
+            else:
+                logits, loss = self._forward_byte_lm(
+                    input_ids,
+                    targets,
+                    counters,
+                    depth,
+                    pure,
+                    breakdown,
+                    segment_len,
+                    loss_mask,
+                    ce_fixed,
+                )
         if self._qat_caches:
             # Cache hits in THIS forward, on the existing counter line: the
             # proof the once-per-step path ran (a cache that silently missed on
