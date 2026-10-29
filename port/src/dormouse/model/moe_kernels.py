@@ -283,12 +283,15 @@ def smem_estimate(
     if rp is not None:
         bk = max(bk, rp)  # the backward's `t_wide` reruns the adjoint at this K
     terms = [
-        # MEASURED, twice: bf16 BM64/BN128/BK128/st2 demands 196608 B from the
-        # device while the one-operand form estimates 98304 — `_grouped_gemm_pair_kernel`
-        # keeps two operand sets live. The 2x is a launch refusal reproduced on this
-        # box, not a guess; without it the search below happily picks N=128 and the
-        # arm dies at step 0.
-        2 * (bm * bk + bk * bn),
+        # ONE operand set per stage. Compiler-measured on this box (bf16, BM 64,
+        # warps 8): BN/BK 64/64 -> 16384, 128/64 -> 24576, 128/128 -> 49152,
+        # 64/256 -> 65536, 128/256 -> 98304. All five equal this formula exactly.
+        # A `2 *` here was tried on 2026-10-29 to explain a 196608 B launch
+        # refusal; the refusal was `stages=2 x 98304`, not two operand sets, and
+        # the 2x made the search abandon tiles the device accepts (rank>=128 arms
+        # then ran at N=64/M=32). The rank>=128 step-0 deaths were the GLU term
+        # charging RP*RP, fixed in the docstring's 2026-10-28 correction.
+        bm * bk + bk * bn,
         bm * bk + bm * bn,  # `_wgrad_kernel` upper bound (measured at half this)
     ]
     if rp is not None:
