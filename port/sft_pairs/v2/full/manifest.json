@@ -1,0 +1,214 @@
+{
+  "eval_file": "/home/sehaxe/dormouse/data_local/mix4/web_eval.bin",
+  "files": {
+    "code_fable.jsonl": "6ac5d8318c1184623583cbd2525a71caec0ae4b7a30fdf45813a40de1c8e6bf2",
+    "code_glm.jsonl": "6df6e8f8337acd9779d605546449b5838f72c6f74c2be547294f9b8feedb9132",
+    "code_kimi.jsonl": "93be5340c763eb08b91341b16a0cc45570d395501381d53f7eeecf69db57b07f",
+    "holdout.jsonl": "1ccafdc8b8ec241f0a0b32d37bd6995ca64121c9f7e6726963bf9679b187a834",
+    "math_r1.jsonl": "4e02b38d6c90c6d527124df6e58fd1b08575e080f4d00776261e2c631a4fdd87",
+    "reason_gpt61.jsonl": "9966a979ed07ec0832b43424fd51cf49c78cfa17efa5648bda709b73d69fd5f8",
+    "reason_qwen38.jsonl": "0c80b9a9f20b33038699b01c95d24df6e085b3f5e29d7148aa2dd484763be317",
+    "tool_ratchet.jsonl": "f86fab7b0a97a95063d29ccdd8af47126bc6c7171441882eee6f2a0987cd50bd"
+  },
+  "format": 1,
+  "mix": {
+    "code_fable": 5.41,
+    "code_glm": 36.03,
+    "code_kimi": 0.04,
+    "math_r1": 27.56,
+    "reason_gpt61": 0.39,
+    "reason_qwen38": 13.22,
+    "tool_ratchet": 17.35
+  },
+  "rules": {
+    "holdout_rows": 300,
+    "leak_bytes": 50,
+    "near_dup_jaccard": 0.9,
+    "prompt_max": 400,
+    "response_max": 500,
+    "window": 1024
+  },
+  "sources": {
+    "code_fable": {
+      "domain": "code",
+      "license": "cc-by-4.0",
+      "license_risk": "low",
+      "quota": 1500,
+      "rows": 769,
+      "stat": {
+        "accounts": false,
+        "bytes_out": 350324,
+        "drops": {
+          "control": 1,
+          "degenerate": 0,
+          "exact_dup": 0,
+          "language": 0,
+          "leak": 0,
+          "near_dup": 6,
+          "prompt_long": 1537,
+          "quota": 0,
+          "render": 0,
+          "response_long": 173
+        },
+        "kept": 783,
+        "seen": 2500
+      }
+    },
+    "code_glm": {
+      "domain": "code",
+      "license": "mit",
+      "license_risk": "low",
+      "quota": 6000,
+      "rows": 5119,
+      "stat": {
+        "accounts": false,
+        "bytes_out": 2702077,
+        "drops": {
+          "control": 0,
+          "degenerate": 0,
+          "exact_dup": 43,
+          "language": 0,
+          "leak": 0,
+          "near_dup": 210,
+          "prompt_long": 247,
+          "quota": 0,
+          "render": 0,
+          "response_long": 11432
+        },
+        "kept": 5226,
+        "seen": 17158
+      }
+    },
+    "code_kimi": {
+      "domain": "code",
+      "license": "cc-by-4.0",
+      "license_risk": "low",
+      "quota": 800,
+      "rows": 6,
+      "stat": {
+        "accounts": false,
+        "bytes_out": 2986,
+        "drops": {
+          "control": 0,
+          "degenerate": 0,
+          "exact_dup": 0,
+          "language": 0,
+          "leak": 0,
+          "near_dup": 0,
+          "prompt_long": 1191,
+          "quota": 0,
+          "render": 0,
+          "response_long": 3
+        },
+        "kept": 6,
+        "seen": 1200
+      }
+    },
+    "math_r1": {
+      "domain": "math",
+      "license": "apache-2.0",
+      "license_risk": "low",
+      "quota": 4000,
+      "rows": 3915,
+      "stat": {
+        "accounts": false,
+        "bytes_out": 1317180,
+        "drops": {
+          "control": 19,
+          "degenerate": 0,
+          "exact_dup": 0,
+          "language": 1,
+          "leak": 0,
+          "near_dup": 47,
+          "prompt_long": 3092,
+          "quota": 11584,
+          "render": 0,
+          "response_long": 5
+        },
+        "kept": 15584,
+        "seen": 18748
+      }
+    },
+    "reason_gpt61": {
+      "domain": "reasoning",
+      "license": "gpl-2.0",
+      "license_risk": "unclear",
+      "quota": 2500,
+      "rows": 55,
+      "stat": {
+        "accounts": false,
+        "bytes_out": 25599,
+        "drops": {
+          "control": 0,
+          "degenerate": 0,
+          "exact_dup": 0,
+          "language": 0,
+          "leak": 0,
+          "near_dup": 0,
+          "prompt_long": 41,
+          "quota": 0,
+          "render": 0,
+          "response_long": 39
+        },
+        "kept": 56,
+        "seen": 136
+      }
+    },
+    "reason_qwen38": {
+      "domain": "reasoning",
+      "license": "other:alibaba-terms",
+      "license_risk": "unclear",
+      "quota": 4000,
+      "rows": 1878,
+      "stat": {
+        "accounts": false,
+        "bytes_out": 975142,
+        "drops": {
+          "control": 1,
+          "degenerate": 0,
+          "exact_dup": 0,
+          "language": 1,
+          "leak": 0,
+          "near_dup": 0,
+          "prompt_long": 2317,
+          "quota": 0,
+          "render": 0,
+          "response_long": 5764
+        },
+        "kept": 1917,
+        "seen": 10000
+      }
+    },
+    "tool_ratchet": {
+      "domain": "tool",
+      "license": "apache-2.0",
+      "license_risk": "low",
+      "quota": 6000,
+      "rows": 2465,
+      "stat": {
+        "accounts": false,
+        "bytes_out": 726295,
+        "drops": {
+          "control": 0,
+          "degenerate": 0,
+          "exact_dup": 0,
+          "language": 0,
+          "leak": 0,
+          "near_dup": 1,
+          "prompt_long": 420,
+          "quota": 0,
+          "render": 0,
+          "response_long": 0
+        },
+        "kept": 2519,
+        "seen": 2940
+      }
+    }
+  },
+  "totals": {
+    "bytes": 6099603,
+    "clean_rows": 12274,
+    "holdout_rows": 300,
+    "train_rows": 14207
+  }
+}

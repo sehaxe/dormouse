@@ -20,3 +20,4 @@ wt/
 vendor/cubecl-cuda/
 vendor/cubecl-runtime/
 vendor/cubecl-server/
+sft_pairs/v2/**/*.jsonl
