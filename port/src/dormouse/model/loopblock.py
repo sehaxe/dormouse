@@ -147,7 +147,7 @@ from torch import nn
 from torch.utils.checkpoint import checkpoint
 
 from ..instrument import Counters, loud
-from ..losses import fixed_cross_entropy
+from ..losses import fixed_cross_entropy, logit_softcap
 from . import fused_residual
 from .csa import CompressedSelectiveAttention
 from .engram import Engram, memory_floor_mix
@@ -426,6 +426,12 @@ class LoopBlock(nn.Module):
         # only when the flag is on, so a `loom = false` model's parameter tree —
         # and every preset count pinned off it — is exactly today's.
         self.loom = bool(getattr(cfg, "loom", False))
+        #: Gemma-2's final-logit cap (`config.ModelConfig.logit_softcap`):
+        #: applied to EVERY per-iteration head output before its CE, so the
+        #: deep-supervision terms and the final CE are the same bounded
+        #: distribution. `0.0` skips the branch; the value is a plain float, so
+        #: a CUDA capture re-reads it as a constant (the cap is not scheduled).
+        self.logit_softcap = float(getattr(cfg, "logit_softcap", 0.0))
         self.loom_gate = (
             nn.Parameter(torch.zeros(cfg.max_iter, device=device))
             if self.loom and not body_only
@@ -938,6 +944,11 @@ class LoopBlock(nn.Module):
             if targets is not None:
                 assert lm_head is not None, "per-iteration CE needs the lm_head"
                 logits = lm_head(step_out.reshape(b * t, d).to(torch.float32))
+                if self.logit_softcap > 0.0:
+                    # The same Gemma-2 cap the final exit applies; the loop's
+                    # per-iteration deep-supervision CE must score the same
+                    # bounded distribution (`losses.logit_softcap`).
+                    logits = logit_softcap(logits, self.logit_softcap)
                 if ce_fixed:
                     ce = fixed_cross_entropy(
                         logits, targets, reduction="none", counters=counters

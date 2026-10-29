@@ -48,7 +48,7 @@ from .data import ByteStream, distinct_scored_bytes, eval_window_bytes, open_str
 from .graph import FullGraph, OptimizerGraph, full_graph_refusal
 from .lr import anneal_alpha, wsd_lr
 from .mixture import MixtureStream, open_mixture
-from .optim import MixOptimizer, clip_grads, grad_norm
+from .optim import MixOptimizer, agc_clip, clip_grads, grad_norm
 
 
 def bpb(loss: float) -> float:
@@ -1051,6 +1051,12 @@ def train(
         muon_variant=cfg.muon_variant,
         muon_sf=cfg.muon_sf,
         muon_sf_wd=cfg.muon_sf_wd,
+        # The AdamW denominator floor (`train.adam_eps`): a one-line experiment
+        # with a sourced mechanism — the equilibrium logit scale is bounded by
+        # about log(1/eps), and 1e-8's ~18.4 nats sits above the fp32
+        # softmax-collapse cliff (16.6). 1e-8 is torch's own default, so the
+        # off path is bit-identical.
+        eps=cfg.adam_eps,
     )
     if cfg.optim_8bit:
         # The device firewall multiplies the FIRST MOMENT and the weight-decay
@@ -1268,11 +1274,18 @@ def train(
         `_foreach_mul_` — the stock per-tensor walk measured 252 ms of a
         small-form step (2920 norm calls, profile 2026-10-16).
 
+        AGC (`cfg.agc_clip`, off at 0.0) runs FIRST: it needs the accumulated
+        gradient (after every micro-batch), and it must bound each parameter's
+        direction before the global norm clip decides the step's overall size.
+        Both stay device-only and add no host read.
+
         `flag_dev` is read INSIDE the captured region only as a device tensor,
         which is what keeps the stage capture-safe: the loop fills its storage
         in place before the replay, exactly like `graph.set_lr`'s learning
         rate. No `.item()`, no `bool(tensor)`, no host branch on it.
         """
+        if cfg.agc_clip > 0.0:
+            agc_clip(model.parameters(), cfg.agc_clip)
         if cfg.grad_clip > 0:
             clip_grads(model.parameters(), cfg.grad_clip)
         opt.step(flag_dev)
@@ -1641,6 +1654,15 @@ def train(
             window.count("engram_host_update_rows", rows)
 
         if (step + 1) % cfg.log_every == 0:
+            # The per-group gradient norms (muon / adamw / norms_biases) are
+            # measured HERE, once per log window, never per step: this is the
+            # "which group exploded" evidence, drained with the counter batch
+            # below. They read the `.grad` the optimizer stage just consumed
+            # (post-firewall, post-AGC/clip), stay on the device until
+            # `drain()`, and add no host read to the step path.
+            for name, value in opt.group_grad_norms().items():
+                window.count_device(f"g_norm_{name}", value)
+                total.count_device(f"g_norm_{name}", value)
             # The 0-sync rule: every DEVICE-side counter this window gathered
             # is read NOW, in one batched GPU→CPU transfer, at the declared
             # cadence — never per pass. The last loss is the one other read,

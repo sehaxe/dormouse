@@ -837,6 +837,26 @@ class ModelConfig:
     #: (both channel shapes return `_byte_ce` and never build this term, so the
     #: flag would be inert). Negative values are refused.
     z_loss: float = 0.0
+    #: ---- Gemma-2 logit soft-cap (`logit_softcap`) ----
+    #: `logits <- cap * tanh(logits / cap)` on the LM head output, applied at
+    #: the two places the head trains against CE (the loop's per-iteration
+    #: readout and the final `norm`+`lm_head` exit) and therefore to the eval
+    #: objective, which runs those same two paths. Every logit is bounded to
+    #: `(-cap, cap)`, so every margin (`losses.ce_margin`) is bounded by `2·cap`
+    #: — 30 nats at `cap=15`, against the fp32 softmax-collapse cliff at 16.6.
+    #: The claim is a BOUNDED logit range (unbounded drift is what it removes),
+    #: not that 15 makes the cliff unreachable: the worst-case margin is still
+    #: above it. `0.0` (the default) enters no branch and is bit-identical to
+    #: the pre-flag model.
+    #:
+    #: COMPOSES with `ce_fixed` (the cap is applied to the logits BEFORE the
+    #: fixed loss sees them, so its margin arithmetic is computed on capped
+    #: values) and is REFUSED with `use_byteflow`: both byteflow shapes return
+    #: `_byte_ce` on patch latents and never reach this head, so the flag
+    #: would be silently inert. Also REFUSED with `mtp_weight > 0`: MTP calls
+    #: the shared head itself and its CE would read uncapped logits beside the
+    #: model's capped ones. Negative values are refused.
+    logit_softcap: float = 0.0
     #: ---- the DSpark draft head (2607.05147; port wiring 2026-10-16) ----
     #: The DSpark term adds next-K-byte draft supervision + the acceptance
     #: head. `dspark_weight` = γ (D2: the loss is γ-free, the CALLER scales);
@@ -1089,6 +1109,30 @@ class ModelConfig:
                 f"term is defined on, so the regulariser would be silently absent. "
                 f"Escape: z_loss=0.0, or use_byteflow=false."
             )
+        if self.logit_softcap < 0.0:
+            loud(
+                f"logit_softcap={self.logit_softcap}: the Gemma-2 cap is "
+                f"`cap * tanh(logits / cap)`, so a negative cap reflects the logits "
+                f"and a zero cap divides by zero. Escape: logit_softcap > 0, or 0.0 "
+                f"to leave the head untouched."
+            )
+        if self.logit_softcap > 0.0 and self.use_byteflow:
+            loud(
+                f"logit_softcap={self.logit_softcap} with use_byteflow=true: both "
+                f"byteflow shapes return `_byte_ce` from their own patch-latent head "
+                f"and never reach `norm`+`lm_head`, so the cap would be silently "
+                f"inert while the snapshot reported it on. Escape: "
+                f"logit_softcap=0.0, or use_byteflow=false."
+            )
+        if self.logit_softcap > 0.0 and self.mtp_weight > 0.0:
+            loud(
+                f"logit_softcap={self.logit_softcap} with mtp_weight={self.mtp_weight}: "
+                f"MTP calls the shared `lm_head` itself (`model/mtp.py`) and its CE "
+                f"would read UNCAPPED logits while the model's two CE sites read "
+                f"capped ones — two logit scales in one objective, exactly the "
+                f"silent inconsistency this flag must not create. Escape: "
+                f"mtp_weight=0.0, or logit_softcap=0.0."
+            )
         # The loop's DISTINCT-body count. Both bounds are structural, not
         # measured: the loop selects `i % loop_blocks`, so 1 is the bottom of
         # the index, and a count above `max_iter` allocates a block that no
@@ -1122,6 +1166,23 @@ class TrainConfig:
     lr: float = 3e-4
     wd: float = 0.01
     grad_clip: float = 1.0
+    #: ---- AGC: adaptive gradient clipping (arXiv:2102.06171 §2.2) ----
+    #: Per-parameter scaling `scale = λ · ||p|| / max(||g||, 1e-3)` clamped to
+    #: `<= 1.0`, applied to `.grad` BEFORE the global `grad_clip` and after
+    #: every micro-batch of `grad_accum` (one optimizer stage, one AGC pass).
+    #: `0.0` (the default) enters no branch and is bit-identical to the
+    #: pre-flag trainer. The mechanism, its exact variant and the paper's
+    #: `λ·||W||²` threshold are documented at `train/optim.py::agc_clip`.
+    #: Negative values are refused. It is device-only and adds no host sync.
+    agc_clip: float = 0.0
+    #: ---- AdamW's denominator floor (`MixOptimizer(eps=...)`) ----
+    #: The equilibrium logit scale is bounded by about `log(1/eps)`: 1e-8 (the
+    #: default, torch's own) allows ~18.4 nats while the fp32 softmax-collapse
+    #: cliff is 16.6 (`losses.CLIFF`), so raising eps to 1e-6 lowers that
+    #: ceiling to ~13.8 and is the sourced mechanism this knob tests — not a
+    #: tuning guess. It reaches `torch.optim.AdamW`'s AdamW half only; Muon has
+    #: no denominator. Must be > 0. Non-default values are snapshot-checked.
+    adam_eps: float = 1e-8
     #: THE FIXED CROSS-ENTROPY (arXiv:2610.31642 §2): the loss keeps the
     #: target logit out of the `1 + e^{-m}` denominator, so the target
     #: gradient does not round to exactly 0 past the dtype's precision cliff
@@ -3116,6 +3177,20 @@ def validate_train(tcfg: TrainConfig) -> None:
             f"per optimizer step, so 1 is one forward/backward and 0 or a negative "
             f"value would mean a step with no gradient at all. Escape: "
             f"grad_accum >= 1 (the default 1)."
+        )
+    if not tcfg.agc_clip >= 0.0:
+        loud(
+            f"agc_clip={tcfg.agc_clip}: AGC's λ multiplies `||p|| / max(||g||, 1e-3)` "
+            f"and is clamped to <= 1.0, so a negative threshold asks for a negative "
+            f"gradient and NaN is not a threshold. Escape: agc_clip >= 0 "
+            f"(0.0 is OFF, the default)."
+        )
+    if not tcfg.adam_eps > 0.0:
+        loud(
+            f"adam_eps={tcfg.adam_eps}: AdamW's update divides by "
+            f"`sqrt(v) + eps`, so eps must be a positive finite floor — 0 divides by "
+            f"zero on a coordinate whose second moment is 0 and NaN is not a floor. "
+            f"Escape: adam_eps > 0 (torch's 1e-8 is the default)."
         )
     if tcfg.grad_accum > 1 and tcfg.opt_graph:
         loud(

@@ -28,7 +28,7 @@ from torch import nn
 
 from ..config import ModelConfig
 from ..instrument import Counters, loud
-from ..losses import fixed_cross_entropy
+from ..losses import fixed_cross_entropy, logit_softcap
 from .byteflow import (
     BfChannel,
     ByteFlowNet,
@@ -153,6 +153,20 @@ class DormouseModel(nn.Module):
                 f"z_loss={cfg.z_loss} with use_byteflow=true: the z-term is defined "
                 f"on the `norm`+`lm_head` logits and both byteflow shapes return "
                 f"`_byte_ce` instead. Escape: z_loss=0.0, or use_byteflow=false."
+            )
+        if cfg.logit_softcap > 0.0 and cfg.use_byteflow:
+            loud(
+                f"logit_softcap={cfg.logit_softcap} with use_byteflow=true: both "
+                f"byteflow shapes return `_byte_ce` from their own patch-latent head "
+                f"and never reach this model's `norm`+`lm_head`, so the cap would be "
+                f"inert. Escape: logit_softcap=0.0, or use_byteflow=false."
+            )
+        if cfg.logit_softcap > 0.0 and cfg.mtp_weight > 0.0:
+            loud(
+                f"logit_softcap={cfg.logit_softcap} with mtp_weight={cfg.mtp_weight}: "
+                f"MTP's CE calls the shared `lm_head` directly and would read uncapped "
+                f"logits while the model's two CE sites read capped ones. Escape: "
+                f"mtp_weight=0.0, or logit_softcap=0.0."
             )
         # `factor_qat_seed`'s ONE consumer (`tsct.set_factor_qat_seed`): the S3T
         # mask stream is a process-local generator, and a model build is its
@@ -711,6 +725,12 @@ class DormouseModel(nn.Module):
         # norm and the head run in fp32 whatever the body computed in.
         hn = self.norm(out)
         logits = self.lm_head(hn.reshape(-1, self.cfg.d_model).to(torch.float32))
+        if self.cfg.logit_softcap > 0.0:
+            # Gemma-2's final-logit cap (`losses.logit_softcap`): applied to
+            # the head output BEFORE the final CE, z-loss and the returned
+            # logits, so a training step and the held-out objective score the
+            # same bounded distribution. `0.0` enters no branch.
+            logits = logit_softcap(logits, self.cfg.logit_softcap)
         loss = None
         if targets is not None:
             assert rec_sum is not None, "targets given but the loop accumulated no L_Rec"
