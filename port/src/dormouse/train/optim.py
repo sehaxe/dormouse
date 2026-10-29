@@ -1424,7 +1424,18 @@ def is_muon_param(name: str, p: torch.Tensor) -> bool:
 
 
 class MixOptimizer:
-    """Muon (2-D) + AdamW (the rest), or AdamW for everything."""
+    """Muon (2-D) + AdamW (the rest), or AdamW for everything.
+
+    `eps` (the trainer passes `train.adam_eps`) is the ADAMW DENOMINATOR FLOOR,
+    not a Muon epsilon. The mechanism it exposes: at equilibrium the AdamW step
+    per coordinate is `g / (sqrt(v) + eps)`, so a logit coordinate stops being
+    driven once its gradient falls below `eps`; the reachable logit scale is
+    therefore bounded by about `log(1/eps)`. The default 1e-8 allows ~18.4 nats
+    while the fp32 softmax-collapse cliff is 16.6 nats (`losses.CLIFF`), and
+    1e-6 lowers that ceiling to ~13.8 — the sourced reason raising eps is the
+    one-line experiment, rather than a guess. `1e-8` is torch's own default, so
+    the off path is bit-identical.
+    """
 
     def __init__(
         self,
@@ -1510,6 +1521,12 @@ class MixOptimizer:
             else None
         )
         self.adamw = AdamW(adamw_params, lr=lr, weight_decay=wd, betas=betas, eps=eps)
+        #: `eps` (train.adam_eps) is the AdamW denominator floor, not a Muon
+        #: epsilon: the equilibrium logit scale is bounded by about
+        #: `log(1/eps)` — 1e-8 allows ~18.4 nats while the fp32
+        #: softmax-collapse cliff is 16.6 (`losses.CLIFF`) — so raising it to
+        #: 1e-6 lowers that ceiling to ~13.8. Snapshot-checked at the config
+        #: layer; non-default values are refused on a resume by `diff_keys`.
         #: `bnb8 = True` swaps AdamW for bitsandbytes' 8-bit AdamW on the SAME
         #: params — the b1 enabler (the spike's 6.4-7.9 GiB regime rode it;
         #: eager fp32 state at 1.07B params OOMs a 16-GB card). Import is
@@ -1684,6 +1701,48 @@ class MixOptimizer:
         for group, wd in zeroed:
             group["weight_decay"] = wd
 
+    def group_grad_norms(self) -> dict[str, torch.Tensor]:
+        """Per-optimizer-group gradient norms, on the DEVICE, one launch each.
+
+        The diagnostic behind `g_norm_<group>` on the log line: when the next
+        divergence happens, "which group exploded" is measured instead of
+        guessed. Three groups, exactly the routing this optimizer uses:
+
+        * `muon` — the parameters `routing` sent to Muon;
+        * `adamw` — the non-1-D AdamW parameters (the hashed-memory tables);
+        * `norms_biases` — the 1-D AdamW vectors (norms, biases, scales).
+
+        Each value is the L2 norm of that group's concatenated gradients, built
+        from ONE `torch._foreach_norm` per non-empty group plus one
+        `vector_norm`, all on the gradients' device: no `.item()`, no host
+        branch, so the caller can run it at the log cadence and drain it with
+        the window's other counters (the 0-sync rule). It reads `.grad` AFTER
+        the firewall and the optimizer stage's clips, i.e. what the optimizer
+        actually consumed; a skipped (non-finite) step is all zeros, which is
+        itself the signal that the loss/gradient firewall fired.
+        """
+        groups: dict[str, list[torch.Tensor]] = {"muon": [], "adamw": [], "norms_biases": []}
+        for name, p in self.model.named_parameters():
+            if p.grad is None:
+                continue
+            if self.routing.get(name, "adamw") == "muon":
+                groups["muon"].append(p.grad)
+            elif p.ndim <= 1:
+                groups["norms_biases"].append(p.grad)
+            else:
+                groups["adamw"].append(p.grad)
+        params = list(self.model.parameters())
+        device = params[0].device if params else torch.device("cpu")
+        out: dict[str, torch.Tensor] = {}
+        with torch.no_grad():
+            for name, grads in groups.items():
+                if not grads:
+                    out[name] = torch.zeros((), device=device)
+                    continue
+                norms = torch._foreach_norm(grads, 2)
+                out[name] = torch.linalg.vector_norm(torch.stack([n.float() for n in norms]))
+        return out
+
     def state_dict(self) -> dict:
         return {
             "steps": self.steps,
@@ -1730,6 +1789,60 @@ def grad_norm(params) -> torch.Tensor:
     both call sites measure the same quantity.
     """
     return _grad_vector_norm([p.grad for p in params if p.grad is not None])
+
+
+#: AGC's ε = 1e-3 (arXiv:2102.06171 §2.2's default): the floor under the
+#: gradient norm, so a zero/degenerate gradient cannot divide the scale.
+AGC_EPS = 1e-3
+
+
+def agc_clip(params, clipping: float, eps: float = AGC_EPS) -> None:
+    """Adaptive Gradient Clipping, per parameter tensor (Brock et al. 2021 §2.2).
+
+    VARIANT IMPLEMENTED. The paper's Eq. 3 clips each unit `i` of a layer's
+    gradient by
+
+        G_i <- (λ · ‖W_i‖_F^? / ‖G_i‖_F) · G_i   when ‖G_i‖_F / ‖W_i‖_F^? > λ,
+
+    with `‖W_i‖_F^? = max(‖W_i‖_F, ε)`. Squaring the test gives the same
+    threshold in the `λ²·‖W‖²` form, and the numerator `λ·‖p‖` is that
+    threshold's square root: **the per-tensor parameter norm `‖p‖` is what
+    stands in for `‖W_i‖_F`** here. Two deviations from the paper, both
+    deliberate and stated rather than discovered:
+
+    * **Unit = the whole parameter tensor**, not a conv filter row. The
+      paper's unit is a row because every layer is a conv; this port routes
+      whole `nn.Parameter` tensors (Muon's factor matrices, AdamW's vectors and
+      tables), so the same `λ‖p‖/max(‖g‖,ε)` ratio is applied per tensor. It is
+      the unit-wise form at the granularity the optimizer sees.
+    * **The ε floor is on the GRADIENT norm** (`max(‖g‖, ε)`), the form this
+      arm was specified with, not the paper's `max(‖W‖, ε)`. The paper's
+      parameter floor exists so a zero-initialised weight is not clipped to
+      exactly zero; this variant has no such floor, so a zero-initialised
+      tensor (`AttnResSlot.query`, `LOOM`'s gate) gets scale 0 and stays at its
+      init while AGC is on. That is a property of the specified formula, not a
+      silent one — it is why AGC is an A/B arm and off by default.
+
+    `scale = clipping · ‖p‖ / max(‖g‖, eps)`, clamped to `<= 1.0`, is computed
+    for EVERY parameter as three tensor ops: two `torch._foreach_norm` launches
+    (per-parameter parameter norms and gradient norms — one launch for the
+    group, not one per tensor), one fused `_foreach_mul_`. Everything stays on
+    the gradients' device: no `.item()`, no `.cpu()`, no host branch, so the
+    step path keeps its 0-sync rule and the pass composes with `grad_accum`
+    (the trainer calls it once, in `opt_stage`, after every micro-batch).
+
+    Called BEFORE `clip_grads` so AGC sees the accumulated gradient and the
+    global norm clip then bounds what remains.
+    """
+    live = [p for p in params if p.grad is not None]
+    if not live:
+        return
+    grads = [p.grad for p in live]
+    with torch.no_grad():
+        p_norm = torch.stack([n.float() for n in torch._foreach_norm(live, 2)])
+        g_norm = torch.stack([n.float() for n in torch._foreach_norm(grads, 2)])
+        scale = (clipping * p_norm / g_norm.clamp_min(eps)).clamp_(max=1.0)
+        torch._foreach_mul_(grads, list(scale.unbind()))
 
 
 def clip_grads(params, max_norm: float) -> torch.Tensor:

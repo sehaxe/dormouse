@@ -86,17 +86,27 @@ class Counters(dict):
 
         One GPU→CPU transfer for the whole window, at the log cadence's
         declared cost. The pending state empties; counters stay honest.
+
+        Integer tensors accumulate as integer counters (a zero is not an
+        entry). A 0-dim FLOAT tensor is kept as a float under the same name,
+        INCLUDING an exact 0.0: a norm is a measurement, not a count, and
+        truncating it to `int` would make `g_norm_muon=3` unable to tell 0.31
+        from 0.39 (the per-group gradient-norm diagnostic,
+        `train/optim.py::group_grad_norms`); an all-zero group is a statement
+        ("every gradient in it was gated"), not an absence.
         """
-        out: dict[str, int] = {}
+        out: dict[str, float | int | list[int]] = {}
         for name, t in list(self._device.items()):
-            out[name] = int(t.item()) if t.numel() == 1 else [int(x) for x in t.tolist()]
+            out[name] = t.item() if t.numel() == 1 else [int(x) for x in t.tolist()]
             del self._device[name]
         for name, value in out.items():
             if isinstance(value, list):
                 for i, v in enumerate(value):
                     if v:
                         self.count(f"{name}[{i}]", v)
-            else:
+            elif isinstance(value, float):
+                self[name] = self.get(name, 0) + value
+            elif value:
                 self.count(name, value)
         return out
 
@@ -106,7 +116,10 @@ class Counters(dict):
 
     def merge(self, other: Counters) -> None:
         for k, v in other.items():
-            self.count(k, v)
+            if isinstance(v, float):
+                self[k] = self.get(k, 0) + v
+            else:
+                self.count(k, v)
         for k, v in other._device.items():
             self._device[k] = self._device.get(k, 0) + v
 

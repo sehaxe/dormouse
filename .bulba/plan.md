@@ -489,6 +489,37 @@ testable and A/B-able (ADR-0017).
       per form. Written, **NOT run** (no GPU work on this task): no timing, no
       BPB, no verdict exists.
 
+- [x] P-LRBAND. port (Python): three OFF-by-default LR-band stabilizers and a
+      per-group gradient-norm diagnostic, so the next divergence names WHICH
+      optimizer group widened the band. `train.agc_clip` (float, 0.0 = off) is
+      Brock et al. 2021 §2.2's per-parameter `λ·||p||/max(||g||,1e-3)` clamped
+      `<=1`: two `torch._foreach_norm` launches (not N), device-only, applied in
+      `opt_stage` BEFORE `clip_grads` and once per accumulated step. The exact
+      variant and the paper's `λ²||W||²` threshold (with `||p||` standing in for
+      the parameter norm) are stated in `optim.agc_clip`'s docstring, including
+      the zero-init consequence of flooring the GRADIENT norm. `train.adam_eps`
+      (1e-8) reaches `MixOptimizer(eps=)` -> `torch.optim.AdamW`; the docstring
+      names the mechanism: the equilibrium logit scale is ~`log(1/eps)`, 18.4
+      nats at 1e-8 against the fp32 softmax-collapse cliff at 16.6, 13.8 at
+      1e-6. `ModelConfig.logit_softcap` (0.0 = off) is Gemma-2's
+      `cap·tanh(z/cap)` on the per-iteration and final CE logits, so the eval
+      objective is capped too; it composes with `ce_fixed` and is REFUSED with
+      `use_byteflow` and `mtp_weight>0` (MTP reads the shared head uncapped).
+      Diagnostic `g_norm_{muon,adamw,norms_biases}` once per `log_every`, on
+      device, drained with the window's counters (`Counters.drain` now keeps a
+      0-dim float as a float). Defaults pinned bit-identical: state sha256
+      `526b6c9e…` + logits sha256 `af5d2fd8…` from a 5-step tiny run in a clean
+      detached `main` worktree (`06109ae`) captured before the edit. Gates
+      `tests/test_lrband.py` (12; eight scratch reverts each turned its named
+      gate red, every file restored byte-for-byte with sha256). Driver
+      `scripts/ab_lrband.py`: (a) `lr {1e-3,2e-3,3e-3} x warmup_frac
+      {0.02,0.08}`, (b) `+z_loss 1e-3` / `+adam_eps 1e-6` / `+agc_clip 0.01` /
+      `+softcap 15` at the surviving LR, 3 seeds x 600 steps, `medium`,
+      mix4/web.bin + web_eval.bin, JSONL under `~/logs/ab_lrband/`,
+      pre-registered verdict (a divergence voids the arm; a win must beat the
+      control's 3-seed spread), `plan`/`profile`/`run`. Written, **NOT run**
+      (GPU busy with the flagship): no timing, no BPB, no verdict exists.
+
 
 ## Critical Files
 

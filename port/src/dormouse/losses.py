@@ -67,6 +67,31 @@ def cliff(dtype: torch.dtype) -> float:
     return CLIFF[dtype]
 
 
+def logit_softcap(logits: torch.Tensor, cap: float) -> torch.Tensor:
+    """Gemma-2's final logit soft-cap: `cap · tanh(logits / cap)`.
+
+    The published form (Gemma 2, arXiv:2408.00118 §2: the final logits are
+    divided by `cap`, passed through `tanh`, and multiplied back), so every
+    logit is bounded to `(-cap, cap)` and every CE margin to `2·cap` (30 nats
+    at `cap=15`). The stability claim is that logit drift can no longer be
+    unbounded; it is NOT that 15 puts the worst-case margin under the fp32
+    softmax-collapse cliff at 16.6 (`CLIFF`) — 30 is still above it.
+
+    Applied to the same logits the CE reads: the loop's per-iteration head
+    output and the final `norm`+`lm_head` output (which is also what the eval
+    objective scores). `ce_fixed` composes: the cap is a transform of the
+    logits, applied before either the fixed or the historical loss sees them.
+    A non-positive cap is LOUD — 0 divides, a negative value reflects.
+    """
+    if not cap > 0.0:
+        loud(
+            f"logit_softcap cap={cap}: the transform is `cap * tanh(logits / cap)`, "
+            f"so 0 divides by zero and a negative cap reflects the logits. Escape: "
+            f"cap > 0, or leave logit_softcap=0.0 (the off default)."
+        )
+    return cap * torch.tanh(logits / cap)
+
+
 def ce_margin(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     """The paper's margin `z_t - LSE_{j != t} z_j` per row, in fp32.
 
