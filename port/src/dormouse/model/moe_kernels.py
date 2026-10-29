@@ -283,7 +283,12 @@ def smem_estimate(
     if rp is not None:
         bk = max(bk, rp)  # the backward's `t_wide` reruns the adjoint at this K
     terms = [
-        bm * bk + bk * bn,  # pair/group: one operand set, not two
+        # MEASURED, twice: bf16 BM64/BN128/BK128/st2 demands 196608 B from the
+        # device while the one-operand form estimates 98304 — `_grouped_gemm_pair_kernel`
+        # keeps two operand sets live. The 2x is a launch refusal reproduced on this
+        # box, not a guess; without it the search below happily picks N=128 and the
+        # arm dies at step 0.
+        2 * (bm * bk + bk * bn),
         bm * bk + bm * bn,  # `_wgrad_kernel` upper bound (measured at half this)
     ]
     if rp is not None:
