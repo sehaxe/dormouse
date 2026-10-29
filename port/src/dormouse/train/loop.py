@@ -1007,6 +1007,30 @@ def train(
             "stream stays flat (the held-out window is the comparable number)."
         )
     model.train()
+    if cfg.iter_checkpoint or cfg.activation_offload > 0.0:
+        # The two activation-memory arms (`model/act_mem.py` and
+        # `loopblock._window`): both off by default and both installed ONCE here,
+        # before any forward, so a run that says `false`/`0.0` takes no branch.
+        model.configure_actmem(
+            iter_checkpoint=cfg.iter_checkpoint,
+            activation_offload=cfg.activation_offload,
+        )
+        if cfg.iter_checkpoint:
+            log(
+                "iter_checkpoint: each loop iteration runs in "
+                "checkpoint(use_reentrant=False); only the iteration's input state "
+                "survives the forward and the backward recomputes the body. "
+                "`iter_checkpoint_saved` on the log line counts the recomputed "
+                "iterations per window."
+            )
+        if cfg.activation_offload > 0.0:
+            log(
+                f"activation_offload={cfg.activation_offload:g} GiB: the first training "
+                f"forward profiles the saved-tensor sizes, then the largest saves that "
+                f"fit the budget are parked in pinned host memory and copied back on "
+                f"the backward edge. Values are exact (1e-6 relative gate); "
+                f"`offload_tensors`/`offload_gib_x100` count what moved."
+            )
     if "ternary_s3t" in (run.model.factor_qat, run.model.dense_qat):
         # The ADR-0021 caveat, said where a reader of the log meets it. The
         # projector has no step index, so the S3T mask is a process-local

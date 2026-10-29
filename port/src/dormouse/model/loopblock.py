@@ -261,6 +261,12 @@ class LoopBlock(nn.Module):
         d = cfg.d_model
         self.d = d
         self.max_iter = cfg.max_iter
+        #: `iter_checkpoint` (TrainConfig): wrap EACH iteration's body in
+        #: `checkpoint(use_reentrant=False)` so only the iteration's INPUT state
+        #: survives the forward. Off is the historical graph, bit for bit; the
+        #: trainer sets it once (`DormouseModel.set_iter_checkpoint`) and a
+        #: hand-built model defaults to off.
+        self.iter_checkpoint = False
         self.eps = cfg.norm_eps
         self.lam_max = cfg.engram_lam_max
         self.use_engram = cfg.use_engram
@@ -650,6 +656,17 @@ class LoopBlock(nn.Module):
         `drop` extra LEADING positions when `drop > 0` (see `_memory`).
         Returns `(mean readout, Σ per-iteration mean CE, per-iteration CEs, the
         per-iteration states leaving this window)`.
+
+        `iter_checkpoint` (off by default) wraps each iteration in
+        `checkpoint(use_reentrant=False)`, so the deepest activation set kept
+        for the backward is ONE iteration's rather than `T` of them. It is a
+        memory decision only: the same ops run on the same inputs, and the
+        recomputation is exact (the gate is a `1e-6` relative match on logits
+        and gradients). What survives the forward is the state that crosses
+        iterations — `h`, the mHC lanes, the AttnRes history and the carried
+        attention state — which the body takes as explicit arguments for that
+        reason. `rand_depth` and `loop_blocks` are resolved per iteration before
+        the call, so the count is the ACTUAL depth, never a fixed `max_iter`.
         """
         if blocks is None:
             blocks = self._blocks if self._blocks is not None else (self,)
@@ -697,267 +714,90 @@ class LoopBlock(nn.Module):
         for i in range(T):
             counters.count("iter")
             ran = i + 1
-            mhc_raw = None
-            #: The DISTINCT body for this iteration (`loop_blocks`): the
-            #: weights are per body; the state (`h`, `streams`, `sources`) and
-            #: the per-iteration slots on the driver are the loop's.
             blk = bodies[i % len(bodies)]
-            if streams is not None:
-                # x_l = h_ctx: the iteration embedding joins the LANES, and
-                # H_pre (applied by the caller, `mhc.py`) aggregates them into
-                # the body's input — the crate's `h_ctx` (`mhc-2026-09-30.md`
-                # §3.4), with Eq. 3's H_pre moved out of `forward`.
-                streams = streams + self.iter_embed[i].view(1, 1, 1, d)
-                if fuse is None:
-                    # `streams` is the post-add tensor the kernels see, so the
-                    # dtype/shape check runs here and not on `h0`.
-                    fuse = self._fused_ok(streams, counters)
-                if fuse:
-                    ctx, mhc_raw = fused_residual.pre(blk.mhc, streams, counters)
-                else:
-                    ctx = blk.mhc.pre_mix(streams)
-                counters.count("mhc")
-            else:
-                ctx = h + self.iter_embed[i].view(1, 1, d)
-            gains = None
-            if blk._paper is not None:
-                # PAPER FORM (`layerrope.py`): the two READ gains are the norm's
-                # affine — `normalize(ctx) · attn_read` folded into one fused
-                # `F.rms_norm` call, which with `read == ones` is the OFF path's
-                # bits. The depth index is the ACTUAL iteration (v1's choice) or
-                # the body's network POSITION, independent of the iteration —
-                # the paper's looped-model reading.
-                gains = blk._paper.for_iteration(
-                    blk._paper_block,
-                    i if blk._paper_index == "iteration" else blk._paper_position,
-                )
-                normed = F.rms_norm(ctx, (d,), gains[0], blk.eps)
-                normed_mlp = F.rms_norm(ctx, (d,), gains[2], blk.eps)
-            elif blk._layerrope_depth is None:
-                normed = blk.norm(ctx)
-                normed_mlp = normed
-            else:
-                # The ACTUAL iteration number (`i`), never the run's compacted
-                # position: a shorter rand-depth run uses a PREFIX of the depth
-                # table and the coda/final depths stay anchored to `max_iter`
-                # (`layerrope.py` module docstring).
-                normed = blk.norm(ctx, depth=blk._layerrope_depth + i)
-                normed_mlp = normed
-            ctrl = torch.cat([ctx.reshape(b * t, d), h0_flat], dim=-1)
-            # MAGMA fix: fp32 masters with fp32 activations would run the slow
-            # fp32 lane; `mm_mixed` casts to the compute dtype per forward.
-            # `dense_qat_project` is the identity when the arm is off (same
-            # parameter object), so the default path is byte-for-byte today's.
-            raw = mm_mixed(
-                ctrl,
-                dense_qat_weight(
-                    blk.controller.weight,
-                    blk.dense_qat,
-                    blk.dense_qat_alpha,
-                    cache=blk._qat_cache,
-                ),
-                blk.compute_dtype,
-                counters,
-            )
-            w_attn = torch.sigmoid(raw[:, 0:1])
-            w_mem = torch.sigmoid(raw[:, 1:2])
-            w_ffn = torch.sigmoid(raw[:, 2:3])
+            # The state slot is read ONLY for a block that has an attention arm:
+            # a block without one (`attn_kind` off, the recurrent test's fixture)
+            # is legal with a shorter `states`, and reading it unconditionally is
+            # the out-of-range the original guarded with the same `if`.
+            attn_state = states[i] if (blk.attn is not None and states is not None) else None
+            if self.iter_checkpoint and torch.is_grad_enabled():
 
-            if blk.attn is not None:
-                # A CSA run carries `(kda_state, csa_state)` per iteration in
-                # `states`; the KDA arm sees only its half.
-                attn_state = None if states is None else states[i]
-                if blk.csa is not None and isinstance(attn_state, tuple):
-                    attn_state = attn_state[0]
-                attn_out, st = blk._attn(
-                    normed,
-                    counters,
-                    carry,
+                def body(h_in, streams_in, sources_in, attn_in, fuse_in, blk_in, i_in):
+                    """The checkpointed unit: its counters are its own (see above)."""
+                    cnt = Counters()
+                    out = self._step(
+                        h_in,
+                        streams_in,
+                        sources_in,
+                        blk_in,
+                        i_in,
+                        h0_flat,
+                        attn_in,
+                        fuse_in,
+                        cnt,
+                        input_ids,
+                        targets,
+                        lm_head,
+                        carry=carry,
+                        recurrent=recurrent,
+                        drop=drop,
+                        loss_mask=loss_mask,
+                        ce_fixed=ce_fixed,
+                        compose=compose,
+                    )
+                    return (*out, cnt)
+
+                #: `use_reentrant=False` + the ACTUAL body for THIS iteration:
+                #: `rand_depth` varies `T`, `loop_blocks` varies the weights per
+                #: index, and both are resolved before the call, so no fixed
+                #: count is assumed. What survives the forward is this
+                #: iteration's INPUT state (`h`, the mHC lanes, the AttnRes
+                #: history, the carried attention state), not its body.
+                h, streams, y, step_out, term, st, fuse, cnt = checkpoint(
+                    body,
+                    h,
+                    streams,
+                    tuple(sources),
                     attn_state,
-                    recurrent=recurrent,
+                    fuse,
+                    blk,
+                    i,
+                    use_reentrant=False,
                 )
-                attn = attn_out.reshape(b * t, d) * w_attn
+                counters.merge(cnt)
+                #: The number of iterations the backward will run AGAIN, one
+                #: per window. Counted OUTSIDE the body so a recompute cannot
+                #: count itself (checkpoint discards the recompute's `cnt`).
+                counters.count("iter_checkpoint_saved")
             else:
-                attn = torch.zeros(b * t, d, dtype=torch.float32, device=h0.device)
-            if blk.csa is not None:
-                prev = None if states is None else states[i]
-                csa_state = prev[1] if isinstance(prev, tuple) else None
-                if recurrent:
-                    csa_out, csa_st = blk.csa.step_state(normed, csa_state, counters=counters)
-                elif carry:
-                    csa_out, csa_st = blk.csa.forward_state(normed, csa_state, counters=counters)
-                else:
-                    csa_out, csa_st = blk.csa(normed, counters=counters), None
-                # The `msa_gate` pattern: one learned scalar per iteration slot,
-                # times the controller's attention gate, on top of KDA's output.
-                attn = attn + csa_out.reshape(b * t, d) * w_attn * torch.sigmoid(self.csa_gate[i])
-                if carry or recurrent:
-                    assert blk.attn is not None, "CSA is additive beside KDA (config refuses)"
-                    st = (st, csa_st)
-            if blk.window_attn is not None:
-                # The exact local band: an ADDITIVE path, the same
-                # `w_attn`-scaled sum the MSA branch below joins. It has no
-                # O(1) boundary state, so a state-carrying call would silently
-                # read a NARROWER band than the one-shot forward (the bytes
-                # before a segment cut / the earlier decode positions).
-                assert not (carry or recurrent), (
-                    f"attn_window={self.window_attn.window} with a state-carrying "
-                    f"attention call (recurrent={recurrent}, carry={carry}): the "
-                    f"local band has no boundary state, so a segment cut or a "
-                    f"one-byte step would read fewer than the window's positions — "
-                    f"a model change wearing a memory flag. Escape: attn_window=0, "
-                    f"or segment_len=0 and the one-shot forward."
+                h, streams, y, step_out, term, st, fuse = self._step(
+                    h,
+                    streams,
+                    tuple(sources),
+                    blk,
+                    i,
+                    h0_flat,
+                    attn_state,
+                    fuse,
+                    counters,
+                    input_ids,
+                    targets,
+                    lm_head,
+                    carry=carry,
+                    recurrent=recurrent,
+                    drop=drop,
+                    loss_mask=loss_mask,
+                    ce_fixed=ce_fixed,
+                    compose=compose,
                 )
-                counters.count("attn_window_iter")
-                wout = blk.window_attn(normed, counters=counters)
-                attn = attn + wout.reshape(b * t, d) * w_attn
+            if self.use_attnres and not compose:
+                sources.append(y)
             if blk.attn is not None:
                 new_states.append(st)
-            if blk.msa is not None:
-                # The ADAPTIVE share: softmax over the iteration gates × max_iter
-                # = a per-slot share whose MEAN over slots is 1; × the arm's
-                # capacity ratio (the owner's 1/4) it becomes the slot's budget.
-                # The ROUNDED share picks the block count (compute follows), and
-                # the SOFT share multiplies the branch's output below, so the
-                # gates receive gradient — the model learns WHERE to spend the
-                # 25%, and a zero share can switch a slot off entirely.
-                if self.adaptive_msa and self.max_iter > 1:
-                    share = torch.softmax(self.msa_gate, dim=0) * self.max_iter
-                    counters.count("msa_iter_gate")
-                    msa_out = blk.msa.forward_k(
-                        normed, counters, float(share[i].detach()) * self.msa_capacity_ratio
-                    )
-                    if msa_out is not None:
-                        attn = attn + msa_out.reshape(b * t, d) * w_attn * share[i]
-                else:
-                    msa_out = blk.msa(normed, counters=counters)
-                    if msa_out is not None:
-                        attn = attn + msa_out.reshape(b * t, d) * w_attn
-
-            if blk.engram is not None and input_ids is not None:
-                mem = blk._memory(normed, input_ids, drop, counters).reshape(b * t, d)
-                dense = (
-                    (
-                        mm_mixed(
-                            normed.reshape(b * t, d),
-                            dense_qat_weight(
-                                blk.mem_dense.weight,
-                                blk.dense_qat,
-                                blk.dense_qat_alpha,
-                                cache=blk._qat_cache,
-                            ),
-                            blk.compute_dtype,
-                            counters,
-                        )
-                        + blk.mem_dense.bias.to(blk.compute_dtype)
-                    )
-                    .to(torch.float32)
-                    .reshape(b * t, d)
-                )
-                branch = memory_floor_mix(mem, dense, w_mem, self.lam_max)
-            else:
-                branch = torch.zeros(b * t, d, dtype=torch.float32, device=h0.device)
-
-            ffn = blk._moe_branch(normed_mlp, counters) * w_ffn
-            if gains is not None:
-                # PAPER FORM's WRITE gains (`layerrope.py`): each branch's
-                # OUTPUT is scaled where it enters `y`, the residual UPDATE.
-                # `y` is exactly the `F(H_pre·x_l)` the residual operator
-                # deposits (mHC `H_post`, AttnRes' write, ReZero's `α`), and all
-                # three are LINEAR in `y`, so this is the paper's
-                # `h + write·F(...)` for every residual arm without touching a
-                # mixer's internals. `branch` (the Engram memory read) belongs to
-                # the attention side: same read of the same normalised state,
-                # same residual update (module docstring states the mapping).
-                attn = attn * gains[1]
-                branch = branch * gains[1]
-                ffn = ffn * gains[3]
-            y = (attn + branch + ffn).reshape(b, t, d)
-
-            if self.loom:
-                # LOOM (2610.01153): per-loop router conditioning + variance
-                # control in ONE place — the RMS-normalized write is the arm's
-                # own signal (unit scale, so it cannot grow with depth) and the
-                # per-slot gate decides how much of it this iteration writes.
-                # `gate[i] == 0` adds an exact zero: the at-init forward IS the
-                # `loom = false` forward, bit for bit.
-                counters.count("loom")
-                y = y + _rms_no_gain(y, self.eps) * self.loom_gate[i].view(1, 1, 1)
-
-            if compose:
-                # THE COMPOSITION (module docstring): AttnRes mixes the write
-                # UPDATES — `u_0 = 0` (the embedding's update: H_res already
-                # carries it) and `u_1 = y` (this iteration's body) — and
-                # `H_post` deposits EXACTLY that mixture. The query scores the
-                # same tensors that are written. `scale = 2` is the identity
-                # lever: at the zero-query init every weight is 1, so the
-                # update is `y` and the composition's write is the mHC-only
-                # write bit-for-bit.
-                assert blk.mhc is not None, "compose => mhc"
-                counters.count("attnres_write")
-                counters.count("mhc_attnres_write")
-                if fuse:
-                    streams, h = fused_residual.write(
-                        blk.mhc, self.attnres[i], streams, y, mhc_raw, True, self.eps, counters
-                    )
-                else:
-                    updates = [torch.zeros_like(y), y]
-                    update = depth_attend(
-                        updates, self.attnres[i], self.eps, scale=float(len(updates))
-                    )
-                    streams = blk.mhc(streams, update)
-                    # 2409.19606 §2.1: our K full-width lanes re-sum to K times the
-                    # state, where the paper's K width-C lanes re-sum to C. The
-                    # mHC-ONLY arm keeps its historical unnormalised sum (pinned);
-                    # the composition applies the paper's 1/K.
-                    h = streams.sum(dim=-2) / blk.mhc.n_streams
-            elif self.use_attnres:
-                counters.count("attnres_write")
-                sources.append(y)
-                h = depth_attend(sources, self.attnres[i], self.eps)
-            elif blk.mhc is not None:
-                # Eq. 3's residual: H_res x_l + H_postᵀ F(H_pre x_l). The
-                # readout is the SUM of the lanes (2409.19606 §2.1); the crate's
-                # concat is its D/n-slicing layout, not this one (`mhc.py`).
-                if fuse:
-                    streams, h = fused_residual.write(
-                        blk.mhc,
-                        self.attnres[i] if self.attnres is not None else None,
-                        streams,
-                        y,
-                        mhc_raw,
-                        False,
-                        self.eps,
-                        counters,
-                    )
-                else:
-                    streams = blk.mhc(streams, y)
-                    h = streams.sum(dim=-2)
-            else:
-                counters.count("rezero_write")
-                h = ctx + y * blk.residual_scale
-
-            step_out = blk.out_proj(h.reshape(b * t, d)).reshape(b, t, d)
             out_acc = out_acc + step_out
             if collect_hidden:
                 hidden.append(step_out)
-            if targets is not None:
-                assert lm_head is not None, "per-iteration CE needs the lm_head"
-                logits = lm_head(step_out.reshape(b * t, d).to(torch.float32))
-                if self.logit_softcap > 0.0:
-                    # The same Gemma-2 cap the final exit applies; the loop's
-                    # per-iteration deep-supervision CE must score the same
-                    # bounded distribution (`losses.logit_softcap`).
-                    logits = logit_softcap(logits, self.logit_softcap)
-                if ce_fixed:
-                    ce = fixed_cross_entropy(
-                        logits, targets, reduction="none", counters=counters
-                    ).reshape(-1, 1)
-                else:
-                    ce = -F.log_softmax(logits, dim=-1).gather(1, targets.reshape(-1, 1))
-                # `doc_masking`: the mean over the SELECTED positions only (the
-                # `None` default is the historical `.mean()`, bit for bit).
-                term = ce.mean() if loss_mask is None else masked_ce_mean(ce, loss_mask)
+            if term is not None:
                 rec = rec + term
                 per_iter.append(term)
             if halt is not None and ran >= halt_min_iter:
@@ -974,6 +814,302 @@ class LoopBlock(nn.Module):
         self._depth_ran = ran
         self._per_iter_hidden = hidden
         return out_acc / ran, rec, per_iter, new_states
+
+    def _step(
+        self,
+        h: torch.Tensor,
+        streams: torch.Tensor | None,
+        sources: tuple[torch.Tensor, ...],
+        blk: LoopBlock,
+        i: int,
+        h0_flat: torch.Tensor,
+        attn_state: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None,
+        fuse: bool | None,
+        counters: Counters,
+        input_ids: torch.Tensor | None,
+        targets: torch.Tensor | None,
+        lm_head: nn.Module | None,
+        *,
+        carry: bool,
+        recurrent: bool,
+        drop: int,
+        loss_mask: torch.Tensor | None,
+        ce_fixed: bool,
+        compose: bool,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | tuple[torch.Tensor, ...] | None,
+        bool | None,
+    ]:
+        """ONE iteration of the loop — the body `_window` runs `T` times.
+
+        Split out so the iteration can be wrapped in
+        `checkpoint(use_reentrant=False)` (`iter_checkpoint`): the checkpointed
+        function must be a real callable over the iteration's INPUT state, and
+        the four things that live across iterations (`h`, the mHC lanes, the
+        AttnRes history, the carried attention state) are explicit arguments.
+        Everything that is fixed for the window — `h0_flat`, the ids, the head,
+        the drop, `carry`/`recurrent` — is closed over or passed as a keyword, so
+        a recompute reads the same values. Returns `(h, streams, y, step_out,
+        ce_term, attn_state_out, fuse)`; the caller owns the accumulators and
+        the counters merge, exactly as the segmented path does.
+        """
+        b, t, d = h.shape
+        mhc_raw = None
+        st = None
+        if streams is not None:
+            # x_l = h_ctx: the iteration embedding joins the LANES, and
+            # H_pre (applied by the caller, `mhc.py`) aggregates them into
+            # the body's input — the crate's `h_ctx` (`mhc-2026-09-30.md`
+            # §3.4), with Eq. 3's H_pre moved out of `forward`.
+            streams = streams + self.iter_embed[i].view(1, 1, 1, d)
+            if fuse is None:
+                # `streams` is the post-add tensor the kernels see, so the
+                # dtype/shape check runs here and not on `h0`.
+                fuse = self._fused_ok(streams, counters)
+            if fuse:
+                ctx, mhc_raw = fused_residual.pre(blk.mhc, streams, counters)
+            else:
+                ctx = blk.mhc.pre_mix(streams)
+            counters.count("mhc")
+        else:
+            ctx = h + self.iter_embed[i].view(1, 1, d)
+        gains = None
+        if blk._paper is not None:
+            # PAPER FORM (`layerrope.py`): the two READ gains are the norm's
+            # affine — `normalize(ctx) · attn_read` folded into one fused
+            # `F.rms_norm` call, which with `read == ones` is the OFF path's
+            # bits. The depth index is the ACTUAL iteration (v1's choice) or
+            # the body's network POSITION, independent of the iteration —
+            # the paper's looped-model reading.
+            gains = blk._paper.for_iteration(
+                blk._paper_block,
+                i if blk._paper_index == "iteration" else blk._paper_position,
+            )
+            normed = F.rms_norm(ctx, (d,), gains[0], blk.eps)
+            normed_mlp = F.rms_norm(ctx, (d,), gains[2], blk.eps)
+        elif blk._layerrope_depth is None:
+            normed = blk.norm(ctx)
+            normed_mlp = normed
+        else:
+            # The ACTUAL iteration number (`i`), never the run's compacted
+            # position: a shorter rand-depth run uses a PREFIX of the depth
+            # table and the coda/final depths stay anchored to `max_iter`
+            # (`layerrope.py` module docstring).
+            normed = blk.norm(ctx, depth=blk._layerrope_depth + i)
+            normed_mlp = normed
+        ctrl = torch.cat([ctx.reshape(b * t, d), h0_flat], dim=-1)
+        # MAGMA fix: fp32 masters with fp32 activations would run the slow
+        # fp32 lane; `mm_mixed` casts to the compute dtype per forward.
+        # `dense_qat_project` is the identity when the arm is off (same
+        # parameter object), so the default path is byte-for-byte today's.
+        raw = mm_mixed(
+            ctrl,
+            dense_qat_weight(
+                blk.controller.weight,
+                blk.dense_qat,
+                blk.dense_qat_alpha,
+                cache=blk._qat_cache,
+            ),
+            blk.compute_dtype,
+            counters,
+        )
+        w_attn = torch.sigmoid(raw[:, 0:1])
+        w_mem = torch.sigmoid(raw[:, 1:2])
+        w_ffn = torch.sigmoid(raw[:, 2:3])
+
+        if blk.attn is not None:
+            # A CSA run carries `(kda_state, csa_state)` per iteration in
+            # `states`; the KDA arm sees only its half.
+            prev = attn_state
+            if blk.csa is not None and isinstance(attn_state, tuple):
+                attn_state = attn_state[0]
+            attn_out, st = blk._attn(
+                normed,
+                counters,
+                carry,
+                attn_state,
+                recurrent=recurrent,
+            )
+            attn = attn_out.reshape(b * t, d) * w_attn
+        else:
+            attn = torch.zeros(b * t, d, dtype=torch.float32, device=h.device)
+        if blk.csa is not None:
+            csa_state = prev[1] if isinstance(prev, tuple) else None
+            if recurrent:
+                csa_out, csa_st = blk.csa.step_state(normed, csa_state, counters=counters)
+            elif carry:
+                csa_out, csa_st = blk.csa.forward_state(normed, csa_state, counters=counters)
+            else:
+                csa_out, csa_st = blk.csa(normed, counters=counters), None
+            # The `msa_gate` pattern: one learned scalar per iteration slot,
+            # times the controller's attention gate, on top of KDA's output.
+            attn = attn + csa_out.reshape(b * t, d) * w_attn * torch.sigmoid(self.csa_gate[i])
+            if carry or recurrent:
+                assert blk.attn is not None, "CSA is additive beside KDA (config refuses)"
+                st = (st, csa_st)
+        if blk.window_attn is not None:
+            # The exact local band: an ADDITIVE path, the same
+            # `w_attn`-scaled sum the MSA branch below joins. It has no
+            # O(1) boundary state, so a state-carrying call would silently
+            # read a NARROWER band than the one-shot forward (the bytes
+            # before a segment cut / the earlier decode positions).
+            assert not (carry or recurrent), (
+                f"attn_window={self.window_attn.window} with a state-carrying "
+                f"attention call (recurrent={recurrent}, carry={carry}): the "
+                f"local band has no boundary state, so a segment cut or a "
+                f"one-byte step would read fewer than the window's positions — "
+                f"a model change wearing a memory flag. Escape: attn_window=0, "
+                f"or segment_len=0 and the one-shot forward."
+            )
+            counters.count("attn_window_iter")
+            wout = blk.window_attn(normed, counters=counters)
+            attn = attn + wout.reshape(b * t, d) * w_attn
+        if blk.msa is not None:
+            # The ADAPTIVE share: softmax over the iteration gates × max_iter
+            # = a per-slot share whose MEAN over slots is 1; × the arm's
+            # capacity ratio (the owner's 1/4) it becomes the slot's budget.
+            # The ROUNDED share picks the block count (compute follows), and
+            # the SOFT share multiplies the branch's output below, so the
+            # gates receive gradient — the model learns WHERE to spend the
+            # 25%, and a zero share can switch a slot off entirely.
+            if self.adaptive_msa and self.max_iter > 1:
+                share = torch.softmax(self.msa_gate, dim=0) * self.max_iter
+                counters.count("msa_iter_gate")
+                msa_out = blk.msa.forward_k(
+                    normed, counters, float(share[i].detach()) * self.msa_capacity_ratio
+                )
+                if msa_out is not None:
+                    attn = attn + msa_out.reshape(b * t, d) * w_attn * share[i]
+            else:
+                msa_out = blk.msa(normed, counters=counters)
+                if msa_out is not None:
+                    attn = attn + msa_out.reshape(b * t, d) * w_attn
+
+        if blk.engram is not None and input_ids is not None:
+            mem = blk._memory(normed, input_ids, drop, counters).reshape(b * t, d)
+            dense = (
+                (
+                    mm_mixed(
+                        normed.reshape(b * t, d),
+                        dense_qat_weight(
+                            blk.mem_dense.weight,
+                            blk.dense_qat,
+                            blk.dense_qat_alpha,
+                            cache=blk._qat_cache,
+                        ),
+                        blk.compute_dtype,
+                        counters,
+                    )
+                    + blk.mem_dense.bias.to(blk.compute_dtype)
+                )
+                .to(torch.float32)
+                .reshape(b * t, d)
+            )
+            branch = memory_floor_mix(mem, dense, w_mem, self.lam_max)
+        else:
+            branch = torch.zeros(b * t, d, dtype=torch.float32, device=h.device)
+
+        ffn = blk._moe_branch(normed_mlp, counters) * w_ffn
+        if gains is not None:
+            # PAPER FORM's WRITE gains (`layerrope.py`): each branch's
+            # OUTPUT is scaled where it enters `y`, the residual UPDATE.
+            # `y` is exactly the `F(H_pre·x_l)` the residual operator
+            # deposits (mHC `H_post`, AttnRes' write, ReZero's `α`), and all
+            # three are LINEAR in `y`, so this is the paper's
+            # `h + write·F(...)` for every residual arm without touching a
+            # mixer's internals. `branch` (the Engram memory read) belongs to
+            # the attention side: same read of the same normalised state,
+            # same residual update (module docstring states the mapping).
+            attn = attn * gains[1]
+            branch = branch * gains[1]
+            ffn = ffn * gains[3]
+        y = (attn + branch + ffn).reshape(b, t, d)
+
+        if self.loom:
+            # LOOM (2610.01153): per-loop router conditioning + variance
+            # control in ONE place — the RMS-normalized write is the arm's
+            # own signal (unit scale, so it cannot grow with depth) and the
+            # per-slot gate decides how much of it this iteration writes.
+            # `gate[i] == 0` adds an exact zero: the at-init forward IS the
+            # `loom = false` forward, bit for bit.
+            counters.count("loom")
+            y = y + _rms_no_gain(y, self.eps) * self.loom_gate[i].view(1, 1, 1)
+
+        if compose:
+            # THE COMPOSITION (module docstring): AttnRes mixes the write
+            # UPDATES — `u_0 = 0` (the embedding's update: H_res already
+            # carries it) and `u_1 = y` (this iteration's body) — and
+            # `H_post` deposits EXACTLY that mixture. The query scores the
+            # same tensors that are written. `scale = 2` is the identity
+            # lever: at the zero-query init every weight is 1, so the
+            # update is `y` and the composition's write is the mHC-only
+            # write bit-for-bit.
+            assert blk.mhc is not None, "compose => mhc"
+            counters.count("attnres_write")
+            counters.count("mhc_attnres_write")
+            if fuse:
+                streams, h = fused_residual.write(
+                    blk.mhc, self.attnres[i], streams, y, mhc_raw, True, self.eps, counters
+                )
+            else:
+                updates = [torch.zeros_like(y), y]
+                update = depth_attend(updates, self.attnres[i], self.eps, scale=float(len(updates)))
+                streams = blk.mhc(streams, update)
+                # 2409.19606 §2.1: our K full-width lanes re-sum to K times the
+                # state, where the paper's K width-C lanes re-sum to C. The
+                # mHC-ONLY arm keeps its historical unnormalised sum (pinned);
+                # the composition applies the paper's 1/K.
+                h = streams.sum(dim=-2) / blk.mhc.n_streams
+        elif self.use_attnres:
+            counters.count("attnres_write")
+            h = depth_attend((*sources, y), self.attnres[i], self.eps)
+        elif blk.mhc is not None:
+            # Eq. 3's residual: H_res x_l + H_postᵀ F(H_pre x_l). The
+            # readout is the SUM of the lanes (2409.19606 §2.1); the crate's
+            # concat is its D/n-slicing layout, not this one (`mhc.py`).
+            if fuse:
+                streams, h = fused_residual.write(
+                    blk.mhc,
+                    self.attnres[i] if self.attnres is not None else None,
+                    streams,
+                    y,
+                    mhc_raw,
+                    False,
+                    self.eps,
+                    counters,
+                )
+            else:
+                streams = blk.mhc(streams, y)
+                h = streams.sum(dim=-2)
+        else:
+            counters.count("rezero_write")
+            h = ctx + y * blk.residual_scale
+
+        step_out = blk.out_proj(h.reshape(b * t, d)).reshape(b, t, d)
+        term = None
+        if targets is not None:
+            assert lm_head is not None, "per-iteration CE needs the lm_head"
+            logits = lm_head(step_out.reshape(b * t, d).to(torch.float32))
+            if self.logit_softcap > 0.0:
+                # The same Gemma-2 cap the final exit applies; the loop's
+                # per-iteration deep-supervision CE must score the same
+                # bounded distribution (`losses.logit_softcap`).
+                logits = logit_softcap(logits, self.logit_softcap)
+            if ce_fixed:
+                ce = fixed_cross_entropy(
+                    logits, targets, reduction="none", counters=counters
+                ).reshape(-1, 1)
+            else:
+                ce = -F.log_softmax(logits, dim=-1).gather(1, targets.reshape(-1, 1))
+            # `doc_masking`: the mean over the SELECTED positions only (the
+            # `None` default is the historical `.mean()`, bit for bit).
+            term = ce.mean() if loss_mask is None else masked_ce_mean(ce, loss_mask)
+        return h, streams, y, step_out, term, st, fuse
 
     def recurrent_step(
         self,
