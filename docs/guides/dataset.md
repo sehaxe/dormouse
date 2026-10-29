@@ -86,3 +86,36 @@ Stages in `mix_v4.toml` (fractions of the **optimizer** step budget, after the
 `grad_accum` fix): S1 0–42% prose, S2 42–80% adds code/math/reasoning, S3 80–100%
 decay with code 26%, math 32%, instruct 11%. The epoch cap refuses loudly when a
 source would be read past `max_epochs`.
+
+## SFT corpus v2 — frontier distillations under an open license
+
+`scripts/build_sft_v2.py` turns open distillation datasets into one corpus in our
+pair format. The owner's rule was "newest teachers, and a license you can defend",
+which is why the source list is short and each row carries its provenance.
+
+| source | teacher | license | rows kept | risk |
+|---|---|---|---:|---|
+| `atmike/ox-alpha-glm-5.3-flash-…-17k-raw` | GLM-5.3-Flash | MIT | 5 119 | low |
+| `j0no12/qwen38-kimi-fable` → `fable-5-trace` | Fable-5 | CC-BY-4.0 | 769 | low |
+| `j0no12/qwen38-kimi-fable` → `kimi-k3-trace` | Kimi-K3 | CC-BY-4.0 | 6 | low |
+| `harshbhx/ratchet-toolcall-train` | Nemotron-3-Ultra (open) | Apache-2.0 | 2 465 | low |
+| `open-r1/OpenR1-Math-220k` | DeepSeek-R1 | Apache-2.0 | 3 915 | low |
+| `FlaneAI/GPT-6.1-Sol-…` | GPT-6.1 Sol | GPL-2.0 | 55 | **unclear** |
+| `j0no12/…` → `qwen3.8-max` | Qwen3.8-Max | other (Alibaba) | 1 878 | **unclear** |
+
+Two corpora are written: `sft_pairs/v2/full/` (all seven sources, 14 207 rows) and
+`sft_pairs/v2/clean/` (the five low-risk sources, 12 274 rows), so a quarantined
+source can be dropped without rebuilding. Each source is its own file.
+
+Filters, applied in order, each counted at the first rule that fires — prompt
+≤ 400 B, response ≤ 500 B (a 103M model has a 1024-byte window; a 3 000-token trace
+is unusable), English or Russian only, no control bytes, no degenerate answers,
+exact dedup, near-dup (5-byte-shingle MinHash, J ≥ 0.9, within a source), and a
+50-byte eval-leak gate against `data_local/mix4/web_eval.bin`. What the length caps
+cost is visible in the dashboard: `code_glm` keeps 5 119 of 17 158 and `code_fimi`
+6 of 1 200 — long code and long traces simply do not fit.
+
+The 300-row holdout is chosen by the smallest hash of the **rendered** bytes, so it
+is disjoint from train by construction, not by bookkeeping. The corpus (JSONL) is
+gitignored like `aria_*.jsonl`; `manifest.json` is committed and carries the
+per-source dashboard, the drop counts and the file hashes.
