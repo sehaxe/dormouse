@@ -134,13 +134,14 @@ body {
   padding: var(--pad);
   margin-top: 20px;
   background: var(--canvas);
-  opacity: 0;
-  animation: rise 0.55s cubic-bezier(0.2, 0.7, 0.2, 1) forwards;
-  animation-delay: calc(var(--i, 0) * 70ms);
+  animation: rise 0.5s cubic-bezier(0.2, 0.7, 0.2, 1) both;
+  animation-delay: calc(var(--i, 0) * 55ms);
 }
+/* transform-only: a slow first paint (or a screenshot) must never show an empty
+   block, which is what an opacity-from-zero entrance does on a slow link. */
 @keyframes rise {
-  from { opacity: 0; transform: translateY(6px); }
-  to { opacity: 1; transform: none; }
+  from { transform: translateY(5px); }
+  to { transform: none; }
 }
 
 .block > h2 {
@@ -250,7 +251,7 @@ body {
   color: #d8d4d4;
   max-height: 214px;
   overflow: hidden;
-  mask-image: linear-gradient(to bottom, transparent, #000 12%, #000 82%, transparent);
+  mask-image: linear-gradient(to bottom, #000 88%, transparent);
 }
 .term .ln { display: block; }
 .term .ln.key { color: var(--on-dark); }
