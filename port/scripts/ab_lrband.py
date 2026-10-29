@@ -455,6 +455,16 @@ def run(args: argparse.Namespace) -> int:
     out_dir = Path(args.out_dir).expanduser()
     data = args.data
     why = preflight(args.device) or data_missing(data, args.eval)
+    if why and getattr(args, "force_busy", False):
+        import subprocess as _sp
+
+        holders = _sp.run(
+            ["nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        print(f"[force-busy] ignoring preflight: {why}\n[force-busy] holders:\n{holders}")
+        why = None
     if why is not None:
         return skip(why)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -531,6 +541,12 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--data", default=DATA)
     r.add_argument("--eval", default=EVAL)
     r.add_argument("--out-dir", default="~/logs/ab_lrband")
+    r.add_argument(
+        "--force-busy",
+        action="store_true",
+        help="proceed although another process holds the card; timings are then "
+        "meaningless (BPB is not), and the holders are printed first",
+    )
     c = sub.add_parser("_run", help="one arm-seed (child mode)")
     c.add_argument("--suite", choices=("a", "b"), required=True)
     c.add_argument("--lr", type=float, required=True)
