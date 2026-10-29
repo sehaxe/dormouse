@@ -408,6 +408,27 @@ def test_per_byte_cost_does_not_grow_with_context():
     assert hi / lo < 2.0, f"the per-byte cost grows with context: {got}"
 
 
+def _make_spy(bucket):
+    """Bind the per-length bucket at definition time (no loop-variable closure)."""
+
+    def spy(method):
+        def wrapper(self, *a, **kw):
+            # the step must CONSUME one new position and a constant-size state:
+            # a windowed re-read decoder passes the whole context here instead.
+            seq = a[0].shape[1] if a and torch.is_tensor(a[0]) else kw.get("seq", 1)
+            bucket.setdefault("in_seq", []).append(int(seq))
+            out = method(self, *a, **kw)
+            st = out[-1] if isinstance(out, tuple) else out
+            bucket.setdefault("state", []).append(
+                tuple(st.shape) if torch.is_tensor(st) else type(st).__name__
+            )
+            return out
+
+        return wrapper
+
+    return spy
+
+
 def test_the_recurrent_state_does_not_grow_with_context():
     """`O(1)` per byte, without a clock: the carried state is context-independent.
 
@@ -423,20 +444,7 @@ def test_the_recurrent_state_does_not_grow_with_context():
         prompt = bytes((i * 7 + 3) % 251 + 1 for i in range(length))
         grab = {}
         originals = {}
-
-        def spy(method):
-            def wrapper(self, *a, **kw):
-                # the step must CONSUME one new position and a constant-size state:
-                # a windowed re-read decoder passes the whole context here instead.
-                seq = a[0].shape[1] if a and torch.is_tensor(a[0]) else kw.get("seq", 1)
-                grab.setdefault("in_seq", []).append(int(seq))
-                out = method(self, *a, **kw)
-                st = out[-1] if isinstance(out, tuple) else out
-                grab.setdefault("state", []).append(
-                    tuple(st.shape) if torch.is_tensor(st) else type(st).__name__
-                )
-                return out
-            return wrapper
+        spy = _make_spy(grab)
 
         for cls in {type(m) for m in model.modules() if hasattr(m, "step_state")}:
             originals[cls] = cls.step_state

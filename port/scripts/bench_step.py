@@ -14,6 +14,7 @@ median and the implied bytes/second.
 from __future__ import annotations
 
 import argparse
+import pathlib
 import statistics
 import sys
 import time
@@ -23,8 +24,8 @@ import torch
 from dormouse.cli import _device, _model, _snapshot_run
 from dormouse.config import validate, validate_train
 from dormouse.instrument import Counters
-from dormouse.train.optim import MixOptimizer
 from dormouse.train.loop import load_model_half, load_model_state
+from dormouse.train.optim import MixOptimizer
 
 
 def main() -> int:
@@ -84,7 +85,8 @@ def main() -> int:
     validate(run.model)
     dev = _device(a.device)
     model = _model(run).to(dev).train()
-    load_model_state(model, run.train, load_model_half(__import__("pathlib").Path(a.ckpt_dir) / a.ckpt_name / f"{a.ckpt_name}.pt"))
+    ckpt = pathlib.Path(a.ckpt_dir) / a.ckpt_name / f"{a.ckpt_name}.pt"
+    load_model_state(model, run.train, load_model_half(ckpt))
     c = run.train
     opt = MixOptimizer(
         model, lr=c.lr, wd=c.wd, opt=c.opt, ns_steps=c.ns_steps, ns_kind=c.ns_kind,

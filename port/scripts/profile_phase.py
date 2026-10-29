@@ -149,7 +149,8 @@ def main() -> int:
             f"{r.self_device_time_total / 1e3:8.2f} ms  {r.count:7d}x  {r.key[:58]}"
         )
     launches = sum(r.count for r in rows)
-    print(f"\n  launches/step: {launches / (a.steps * 5):,.0f}   peak {torch.cuda.max_memory_allocated(dev) / 2**30:.2f} GiB")
+    peak = torch.cuda.max_memory_allocated(dev) / 2**30
+    print(f"\n  launches/step: {launches / (a.steps * 5):,.0f}   peak {peak:.2f} GiB")
 
     # MFU from an independent FLOP count of the same shape.
     from dormouse.width import macs_per_token
