@@ -2,38 +2,36 @@
 
 Owner asleep (2026-10-28 night). Full autonomy until he returns.
 
-## Goal
-1. Fix the tile-estimator bug that voids every rank >= 128 arm (`_grouped_gemm_pair_kernel`
-   needs 196 608 B while its own docstring table says 98 304 — the table is wrong by 2x and the
-   tile search does not descend on that path).
-2. Re-run the rank ladder (64 / 128 / 192 / 256, 3 seeds, lr=5e-4) and pick the rank by
-   measurement, not by the SCT paper's prior.
-3. Launch the flagship pre-train on the measured recipe and leave it running with a monitor.
+## State (2026-10-29 night, updated)
 
-## Recipe (measured winners only, all 3-seed A/B)
-- CSA on (+0.0106), mHC on, AttnRes on (-0.050), share_u on (-0.013), attn_latent_rank 256
-  (-0.021 and -36% dense MAC), max_iter 3, LayerRoPE paper form (widen the LR basin).
-- lr 5e-4 — the only LR with a tight spread in two independent A/Bs (0.007 / 0.036).
-  1e-3 is stable ONLY with LayerRoPE (3.2373 +- 0.081) and is kept for the next run, not this one:
-  an unattended multi-day run must not gamble on a 600-step stability reading.
-- 8k window, doc_masking on (needs the .docs.json sidecars that mix_v7's sources carry).
+**Flagship is RUNNING and healthy** — do not restart it.
 
-## Closures tonight (do not reopen without a new measurement)
-- Softmax/CE collapse: does not fire here (fp32 loss, max margin 4.69 vs cliff 16.6; gradient
-  sum violation 0). `ce_fixed` stays default-false.
-- LayerRoPE v1 is superseded by the paper form (`v1` dropped); depth index = iteration, not position.
-- ByteFlow: -0.43 BPB quality, -15% speed. Not in this run.
+```
+step 55 300 / 320 000  (17%)   loss 1.1551   26 799 B/s   1.36 GB of 7.86   0 nan_skipped
+eval: 50k 1.8062 · 52k 1.7849 · 54k 1.7800      ETA ~67 h
+checkpoints: dormouse/checkpoints/flagship/flagship.pt (979 MB, every 25k)
+recipe: medium 102.7M · CSA fine+coarse · mHC · AttnRes · share_u · LayerRoPE(paper)
+        latent 256 · E=256 rank 64 · iters 3 · b8 s1024 accum 3 · lr 5e-4 · mix_v7 · 8k
+log: ~/logs/flagship.log · ~/logs/flagship.jsonl · dashboard http://127.0.0.1:3789 (tailnet)
+```
 
-## Report on return
-STATUS: DONE + what ran, what the numbers are, what is still open.
+Reference: mix1 finished at BPB 1.883 after 4.18 GB; we are at **1.7800 after 1.36 GB**.
 
-## Launched overnight (2026-10-28 22:40)
-- `logs/night_chain.sh` (setsid): waits for the rank A/B (`logs/ab_rank_up/`, 4 arms x 3 seeds,
-  lr 5e-4), then `logs/pick_rank.py` decides (an arm must beat control by more than 2x the larger
-  spread; ties keep rank 64), then launches the flagship.
-- Flagship: medium (141.9M, share_u -> ~105M active-mem), max_iter 3, CSA(chunk 8 + coarse 256),
-  mHC + AttnRes, LayerRoPE paper form, attn_latent_rank 256, rank from the A/B, E=256,
-  b24 s1024, lr 5e-4, warmup 150M bytes (1.9%), decay_frac 0.15, mix_v7 (22.2 GB),
-  320k steps = 7.86 GB of tokens, ckpt_every 25k (~12 x 1.5 GB), eval_every 2k.
-- doc_masking OFF: the sidecars (`docs.json`) are not built for mix_v7's sources; building them is
-  the first task for the next run (scripts/build_doc_sidecar.py).
+## Next run (flagship2, NOT started — needs the card)
+- `lr=1e-3` (measured best on the full recipe: 3.2373 ± 0.081 vs 3.3938 ± 0.026 at 5e-4,
+  3 seeds, same battery). Everything else identical, so the two runs form a clean at-scale A/B.
+- Missing measurement before trusting it: there is **no 5e-4 arm in the same ladder** — the
+  comparison comes from the earlier layerrope2 battery (b8 s512). Re-run both LR at the
+  flagship's exact shape (b8 s1024 × accum 3) with 2 seeds when the card is free.
+
+## Open items (owner decisions)
+1. **Cleanup**: 65 worktrees, 127 GB; 55 of them dirty (uncommitted agent leftovers).
+   Deleting them loses work — needs an explicit OK. Only 4 were clean+merged (removed).
+2. **Formatting**: 55 files would be reformatted by `ruff format` (pre-existing debt). Safe but
+   a big diff that would collide with those dirty worktrees.
+3. **GPU purchase**: cart holds 2 × MSI RTX3090 AERO 24G @ $616.91 = $1 233.82 (Superbuy).
+   Verified: single-SKU lot (no variant trap), price = Chinese domestic teardown tier.
+   Not verified: seller DSR (none shown), photos, mining history. Recommendation: buy ONE with
+   detailed inspection + FurMark video, then the second. Alibaba/BY delivery works (checked).
+   Migration work needed for sm_86: `moe_kernels.py` has sm_120's 101 376 B smem ceiling
+   hardcoded; tile table must be re-measured on Ampere.
