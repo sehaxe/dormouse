@@ -87,10 +87,9 @@ def test_two_runs_are_byte_identical(tmp_path):
 
 @pytest.mark.skipif(not _corpus_files(), reason="the v2 corpus is not built in this tree")
 def test_every_row_renders_through_the_real_sft_path():
-    from dormouse.config import TrainConfig
     from dormouse.train.sft import _chat_pairs
 
-    cfg = TrainConfig()
+    window = 1024  # the model's window, the rule the builder applies
     total = 0
     refused = 0
     rendered = []
@@ -103,7 +102,7 @@ def test_every_row_renders_through_the_real_sft_path():
             n = len(text.encode())
             rendered.append(n)
             total += 1
-            if n + 3 > cfg.seq_len if hasattr(cfg, "seq_len") else False:
+            if n + 3 > window:
                 refused += 1
     assert total > 0
     assert refused == 0, f"{refused} pairs exceed the window"
@@ -153,7 +152,8 @@ def test_no_pair_shares_fifty_bytes_with_the_eval():
     for path in files:
         for row in _rows(path):
             body = (row["prompt"] + "\n" + row["response"]).encode()
-            assert not guard.leaks(body), f"{path.name}: a pair leaks 50 bytes of eval: {body[:80]!r}"
+            ok = not guard.leaks(body)
+            assert ok, f"{path.name}: a pair leaks 50 bytes of eval: {body[:80]!r}"
             checked += 1
     assert checked > 0
     print(f"[sft_v2] leak gate: {checked} pairs, none carry 50 eval bytes")

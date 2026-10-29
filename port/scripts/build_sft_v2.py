@@ -27,7 +27,6 @@ import hashlib
 import json
 import re
 import sys
-import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -59,9 +58,9 @@ SOURCES = [
     ("reason_gpt61", "reasoning", "gpl-2.0", "unclear", 2500),
     ("math_r1", "math", "apache-2.0", "low", 4000),
 ]
-QUOTA = {n: q for n, _d, _l, _r, q in SOURCES}
-RISK = {n: r for n, _d, _l, r, _q in SOURCES}
-LICENSE = {n: l for n, _d, l, _r, _q in SOURCES}
+QUOTA = {n: q for n, _d, _lic, _r, q in SOURCES}
+RISK = {n: r for n, _d, _lic, r, _q in SOURCES}
+LICENSE = {n: lic for n, _d, lic, _r, _q in SOURCES}
 DOMAIN = {n: d for n, d, _l, _r, _q in SOURCES}
 
 DROP_KEYS = (
