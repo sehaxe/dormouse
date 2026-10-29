@@ -99,7 +99,7 @@ COMMON = [
     "--set",
     "grad_accum=1",
     "--set",
-    "lr=1e-3",
+    "lr=5e-4",
     "--set",
     "warmup_tokens=16384000",
     "--set",

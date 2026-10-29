@@ -21,7 +21,7 @@ import time
 import torch
 
 from dormouse.cli import _device, _model, _snapshot_run
-from dormouse.config import validate_train
+from dormouse.config import validate, validate_train
 from dormouse.instrument import Counters
 from dormouse.train.optim import MixOptimizer
 from dormouse.train.loop import load_model_half, load_model_state
@@ -39,6 +39,10 @@ def main() -> int:
     ap.add_argument("--latent", type=int, default=256)
     ap.add_argument("--out-rank", type=int, default=0)
     ap.add_argument("--no-csa", action="store_true")
+    ap.add_argument("--rank", type=int, default=64)
+    ap.add_argument("--experts", type=int, default=256)
+    ap.add_argument("--no-engram", action="store_true")
+    ap.add_argument("--fused", action="store_true", help="fused mHC+AttnRes chain")
     ap.add_argument("--ckpt-dir", default="/home/sehaxe/dormouse/checkpoints")
     ap.add_argument("--ckpt-name", default="longctx1")
     ap.add_argument("--device", default="auto")
@@ -57,7 +61,7 @@ def main() -> int:
         "use_mhc": True,
         "use_attnres": True,
         "share_u": True,
-        "use_engram": False,
+        "use_engram": not a.no_engram,
         "moe_kernel": "triton",
         "moe_capacity": 0.0,
         "doc_masking": False,
@@ -74,6 +78,10 @@ def main() -> int:
         setattr(run.train, k, v)
     validate_train(run.train)
 
+    run.model.fused_residual = a.fused
+    run.model.rank = a.rank
+    run.model.n_experts = a.experts
+    validate(run.model)
     dev = _device(a.device)
     model = _model(run).to(dev).train()
     load_model_state(model, run.train, load_model_half(__import__("pathlib").Path(a.ckpt_dir) / a.ckpt_name / f"{a.ckpt_name}.pt"))
