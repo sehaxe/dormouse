@@ -48,6 +48,15 @@ PROGRESS_KEYS = (
     "eval",
     "eval_every",
     "json_log",
+    # The WSD tail: both keys move WHERE the remaining steps land on the LR
+    # curve and neither is read by a forward, which is the same class as
+    # `steps` (scaling `steps` alone already re-plans the decay window, so
+    # allowing these two is not a new freedom — it is the same freedom spelled
+    # directly, and it is what makes "anneal now, longer, to almost zero" a
+    # resume instead of a re-launch). The scheduled LR is logged every
+    # `log_every`, so a resume that changes them is visible in the log line.
+    "decay_frac",
+    "min_lr_frac",
     # `ema_decay` selects WHICH copy of the same trajectory an eval reads: the
     # checkpoint keeps the raw iterate under `model` (what resume continues)
     # and the shadow under `model_ema` (what eval/save serve), so changing the
@@ -1564,8 +1573,20 @@ class TrainConfig:
     #: WSD warmup, in TOKENS (not steps): the schedule is a function of how
     #: much data the run has seen, so a batch-size change does not change it.
     warmup_tokens: int = 0
-    #: Fraction of the token budget spent on the WSD decay.
+    #: Fraction of the token budget spent on the WSD decay. A PROGRESS key: it
+    #: moves the decay window of the REMAINING steps and never reaches a
+    #: forward, exactly like `steps` (which already moves the same window by
+    #: scaling the total). Re-planning a run's tail — "start the decay now, make
+    #: it longer" — is a legitimate resume, and refusing it forced a re-launch
+    #: from scratch (measured 2026-10-30: 320k-step flagship plateaued at 1.74
+    #: by step 100k; the tail had to be re-planned, and only `steps` was legal).
     decay_frac: float = 0.1
+    #: The LR the WSD decay lands on, as a fraction of `lr` (`wsd_lr`'s
+    #: `final_frac`): the last step trains at `lr * min_lr_frac`. 0.1 is the
+    #: schedule's long-standing floor; a small value (0.01) is a full anneal to
+    #: (almost) zero. A PROGRESS key for the same reason as `decay_frac`: it
+    #: shapes the remaining LR path, never the forward.
+    min_lr_frac: float = 0.1
     #: JSONL telemetry sink: one row per event (log line, eval, checkpoint),
     #: consumed by `dormouse plot`. Empty = off. A PROGRESS key: it is where
     #: measurements go, never what the run computes, so re-pointing it on a
@@ -3234,6 +3255,21 @@ def validate_train(tcfg: TrainConfig) -> None:
             f"`sqrt(v) + eps`, so eps must be a positive finite floor — 0 divides by "
             f"zero on a coordinate whose second moment is 0 and NaN is not a floor. "
             f"Escape: adam_eps > 0 (torch's 1e-8 is the default)."
+        )
+    if not 0.0 <= tcfg.decay_frac <= 1.0:
+        loud(
+            f"decay_frac={tcfg.decay_frac}: it is a FRACTION of the whole run "
+            f"(`decay_steps = round(decay_frac * steps)`), so [0, 1] is the only "
+            f"meaningful range — 0 is a constant LR after warmup and 1 is a decay "
+            f"from step 0. Escape: 0 <= decay_frac <= 1 (0.1 is the default)."
+        )
+    if not 0.0 < tcfg.min_lr_frac <= 1.0:
+        loud(
+            f"min_lr_frac={tcfg.min_lr_frac}: `wsd_lr`'s `final_frac` is the LR "
+            f"the decay LANDS on, so it must be in (0, 1] — 0 asks for a division "
+            f"by a zero LR basin and >1 would make the 'decay' an increase. "
+            f"Escape: 0 < min_lr_frac <= 1 (0.1 is the default, 0.01 is a full "
+            f"anneal to near zero)."
         )
     if tcfg.grad_accum > 1 and tcfg.opt_graph:
         loud(

@@ -1483,7 +1483,12 @@ def train(
         )
     for step in range(start, cfg.steps):
         lr = wsd_lr(
-            step, total_steps=cfg.steps, peak_lr=cfg.lr, warmup_steps=warm, decay_steps=decay
+            step,
+            total_steps=cfg.steps,
+            peak_lr=cfg.lr,
+            warmup_steps=warm,
+            decay_steps=decay,
+            final_frac=cfg.min_lr_frac,
         )
         muon_lr = lr
         if opt.muon is not None:
