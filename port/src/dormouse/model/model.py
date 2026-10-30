@@ -38,6 +38,7 @@ from .byteflow import (
     compat_armed,
     count_channel,
 )
+from .convcodec import ConvCodec, codec_kind
 from .dspark import DSparkHead, dspark_aux_loss
 from .energy import EnergyHead, energy_contrastive_loss
 from .halt import HaltHead, halt_loss
@@ -55,6 +56,9 @@ class DormouseModel(nn.Module):
     def __init__(self, cfg: ModelConfig, *, device: torch.device | str = "cpu") -> None:
         super().__init__()
         self.cfg = cfg
+        # Same two refusals `config.validate` owns (bad name; `conv` with
+        # `use_byteflow=false`), held at the seam a hand-built model reaches.
+        codec_kind(cfg)
         if cfg.layerrope:
             # The same two refusals `config.validate` owns, held at the runtime
             # seam because a hand-built model skips `validate` (ADR-0019).
@@ -180,7 +184,7 @@ class DormouseModel(nn.Module):
         #: the loop is not built at all — no dormant parameter tree), `bf` is
         #: the channel that runs THIS model's loop over K patch latents. Exactly
         #: one of them is ever non-None, and which one is COUNTED per forward.
-        self.bf_net: ByteFlowNet | None = None
+        self.bf_net: ByteFlowNet | ConvCodec | None = None
         self.bf: BfChannel | None = None
         #: The MTP arm (`mtp.py`) and the scalar its own log line reads. The
         #: tensor is DETACHED by the forward and read only on the log cadence
@@ -212,7 +216,17 @@ class DormouseModel(nn.Module):
         #: the trainer invalidates them once per optimizer step.
         self._qat_caches: list[QuantCache] = []
         if cfg.use_byteflow and not compat_armed(cfg):
-            self.bf_net = ByteFlowNet(byteflow_config(cfg), device=device)
+            if codec_kind(cfg) == "conv":
+                bfc = byteflow_config(cfg)
+                self.bf_net = ConvCodec(
+                    bfc.d_global,
+                    patch_bytes=cfg.byteflow_patch_bytes,
+                    dtype=bfc.dtype,
+                    k_tokens=bfc.k_tokens,
+                    device=device,
+                )
+            else:
+                self.bf_net = ByteFlowNet(byteflow_config(cfg), device=device)
             return
         d = cfg.d_model
         self.embed = nn.Embedding(cfg.vocab, d, device=device)
