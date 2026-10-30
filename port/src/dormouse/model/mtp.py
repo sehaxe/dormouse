@@ -44,6 +44,46 @@ Positions whose shift runs past the window are dropped by SLICING (no wrap,
 no modulo, no mask tensor): with a window of `t` bytes, module `j` scores
 `t - (j + 1)` positions.
 
+## Soft-MTP (arXiv:2610.38331, "Multi-Token Prediction Done Right", Teoh 2026)
+
+`forward_soft` implements the paper's KL gradient-recovery trick. The standard
+MTP CE at head `k` (module `j = k-1`, shift `k`) and the NTP CE at the ALIGNED
+position — NTP position `q + k` predicts the same byte as head `k` at position
+`q` — are both `(p - onehot)·W` in hidden space. Their difference cancels the
+one-hot:
+
+    d/dx_k [CE_mtp_k - CE_ntp_at_aligned] = (p_mtp - p_ntp)·W   (the KL gradient)
+
+The trick gets that difference without a second softmax by adding a
+straight-through term to the NTP hidden the CE reads:
+
+    ntp_hidden[:, k:] += s_k · (x_k.detach() - x_k)
+
+The forward value is exactly unchanged (`x - x = 0`); the backward at `x_k`
+gets `-s_k · dCE_ntp/dntp_hidden[t+k]`, which, at the right `s_k`, is exactly
+the NTP half of the KL gradient. `s_k` undoes the NTP CE's mean and total-loss
+scale and re-applies head `k`'s own mean and the 1/K head average:
+
+    s_k = weight · N_ntp / (n_heads · N_k · ntp_loss_scale)
+
+with `ntp_loss_scale` the factor the NTP CE carries in the total loss (`1/(T+1)`
+in `model.py`; `1.0` in the paper's own loss, which has no depth divisor).
+`forward` is unchanged and bit-identical when the flag is off: the soft branch
+is the only code that touches the coupling.
+
+**The premise this repo satisfies, named rather than assumed:** `model.py`
+passes the SAME `self.lm_head` to both the NTP CE and this module. That head may
+be dense, TSCT-factorized or `TiedHead` (the tiny default is TSCT); all three
+are linear in the hidden, which is the whole premise — the identity is in the
+head's hidden-space gradient and never reads `W` as a matrix. It is NOT
+recovered at `W` itself: the head's own parameter gradient stays the hard-CE
+push (the reference's `test_the_two_objectives_differ_at_the_unembedding`).
+
+**Alignment, off-by-one named:** module `j` (shift `j+1`) scores
+`targets[:, j+1:]` from `x_j[:, :t-j-1]`; its label at index `q` is the same
+byte the NTP CE at position `q + j + 1` scores. So the coupled slice is
+`ntp_hidden[:, shift:]`, not `[:, :n]` and not a roll.
+
 ## Named design choices
 
 * **The two RMSNorms are gain-free** (`elementwise_affine=False`). The stated
@@ -59,6 +99,14 @@ no modulo, no mask tensor): with a window of `t` bytes, module `j` scores
 * **Uniform mean over the modules that produced positions.** At `t > K` that is
   all K; a short window simply scores fewer terms, and `t <= 1` returns an exact
   zero with an empty `per_k` rather than a fabricated term.
+* **`x_j` is BOTH head `j`'s input and module `j+1`'s input**, because this
+  module is DeepSeek-sequential and has no per-head final norm. The routed
+  gradient at `x_j` is therefore added to any gradient a LATER module sends
+  back through the chain; the identity above is about the head's own term, and
+  the gate isolates the last module (whose `x` feeds no later head) plus a
+  K=1 fixture. This is a structural difference from the reference's
+  `final_norm(hiddens[head])` seam, named so a reader does not read the gate as
+  a claim the chain term vanishes.
 """
 
 from __future__ import annotations
@@ -72,6 +120,17 @@ from ..instrument import loud
 #: The config layer's ceiling (`config.validate`); the constructor re-checks it
 #: because a hand-built `ModelConfig` never passes through `validate`.
 MAX_K = 8
+
+
+def _widen(t: torch.Tensor) -> torch.Tensor:
+    """Upcast a low-precision activation to fp32; leave fp32/fp64 alone.
+
+    The burn rule this module follows is "cast to fp32 before every Linear".
+    `fp64` is the KL-recovery gate's dtype: downcasting it would throw away the
+    identity the gate measures, and no production path produces fp64 here. The
+    reference's `hi()` lambda is the same rule (`never DOWNcast fp64`).
+    """
+    return t.float() if t.dtype in (torch.float16, torch.bfloat16) else t
 
 
 class MTPHead(nn.Module):
@@ -138,6 +197,73 @@ class MTPHead(nn.Module):
         uniform mean. No position is reused across the shift: module `j` scores
         the first `t - (j + 1)` positions against `targets[:, j+1:]`.
         """
+        loss, per_k, _coupled = self._run(
+            h_last,
+            ids,
+            targets,
+            embed=embed,
+            head=head,
+            weight=weight,
+            soft=False,
+            ntp_hidden=None,
+            ntp_loss_scale=1.0,
+        )
+        return loss, per_k
+
+    def forward_soft(
+        self,
+        h_last: torch.Tensor,
+        ids: torch.Tensor,
+        targets: torch.Tensor,
+        *,
+        embed: nn.Module,
+        head: nn.Module,
+        weight: float,
+        ntp_hidden: torch.Tensor,
+        ntp_loss_scale: float,
+    ) -> tuple[torch.Tensor, list[torch.Tensor], torch.Tensor]:
+        """Soft-MTP: the CE terms, plus the NTP hidden the caller must score.
+
+        The returned third tensor is `ntp_hidden` with each module's
+        straight-through coupling added at its ALIGNED slice:
+        `out[:, shift:] = ntp_hidden[:, shift:] + s_j·(x_j.detach() - x_j)`.
+        It is numerically equal to `ntp_hidden` in the forward; only its
+        backward differs. The caller computes the NTP CE on it (with the SAME
+        head and the same total-loss factor it passed as `ntp_loss_scale`) and
+        uses that CE in place of the plain NTP CE.
+
+        `ntp_loss_scale` is the factor the NTP CE's mean carries in the total
+        loss — `1/(T+1)` in `model.py`, `1.0` in the paper's loss. It is an
+        argument, not a constant here: the MTP module must not guess the
+        caller's depth convention.
+        """
+        loss, per_k, coupled = self._run(
+            h_last,
+            ids,
+            targets,
+            embed=embed,
+            head=head,
+            weight=weight,
+            soft=True,
+            ntp_hidden=ntp_hidden,
+            ntp_loss_scale=ntp_loss_scale,
+        )
+        assert coupled is not None, "soft=True must return the coupled NTP hidden"
+        return loss, per_k, coupled
+
+    def _run(
+        self,
+        h_last: torch.Tensor,
+        ids: torch.Tensor,
+        targets: torch.Tensor,
+        *,
+        embed: nn.Module,
+        head: nn.Module,
+        weight: float,
+        soft: bool,
+        ntp_hidden: torch.Tensor | None,
+        ntp_loss_scale: float,
+    ) -> tuple[torch.Tensor, list[torch.Tensor], torch.Tensor | None]:
         assert weight >= 0.0, f"mtp weight {weight} is a multiplier, not a sign"
         assert h_last.ndim == 3, f"h_last must be [b, t, d], got {tuple(h_last.shape)}"
         b, t, d = h_last.shape
@@ -146,25 +272,50 @@ class MTPHead(nn.Module):
             f"ids {tuple(ids.shape)} and targets {tuple(targets.shape)} must both be [{b}, {t}]"
         )
         assert targets.dtype in (torch.long, torch.int64), "targets must be byte ids"
+        # The modules that actually produce positions: `shift = j+1` needs
+        # `t > j+1`, so the loop stops after `min(k, t-1)` of them. The mean
+        # below divides by THAT count, and the soft scale must too.
+        n_heads = min(self.k, t - 1)
+        assert n_heads >= 0, "a negative module count is impossible"
+        if soft:
+            assert ntp_hidden is not None, "soft MTP needs the NTP hidden to couple"
+            assert ntp_hidden.shape == h_last.shape, (
+                f"ntp_hidden {tuple(ntp_hidden.shape)} != h_last {tuple(h_last.shape)}"
+            )
+            assert ntp_loss_scale > 0.0, (
+                f"ntp_loss_scale={ntp_loss_scale}: it is the NTP CE's factor in the "
+                f"total loss, so 0 would put the routed term at an infinite scale"
+            )
+        # A CLONE, never an in-place edit of the caller's hidden: `model.py`
+        # still returns the logits/aux terms computed from the original.
+        coupled = ntp_hidden.clone() if (soft and n_heads > 0) else None
         per_k: list[torch.Tensor] = []
         h = h_last
-        for j in range(self.k):
+        for j in range(n_heads):
             shift = j + 1
             n = t - shift
-            if n <= 0:
-                # Every later module shifts further; none has a position left.
-                break
-            hp = self.norms_h[j](h[:, :n].to(torch.float32))
-            e = self.norms_e[j](embed(ids[:, shift : shift + n]).to(torch.float32))
+            hp = self.norms_h[j](_widen(h[:, :n]))
+            e = self.norms_e[j](_widen(embed(ids[:, shift : shift + n])))
             x = self.projs[j](torch.cat([hp, e], dim=-1))  # [b, n, d]
-            logits = head(x.reshape(b * n, d).to(torch.float32))
+            logits = head(_widen(x.reshape(b * n, d)))
             per_k.append(F.cross_entropy(logits, targets[:, shift : shift + n].reshape(b * n)))
+            if coupled is not None:
+                # `s_k = weight · N_ntp / (n_heads · N_k · ntp_loss_scale)`:
+                # undo the NTP CE's mean (N_ntp) and total-loss factor, then
+                # apply head k's own mean (N_k) and the 1/n_heads average.
+                # This is the reference's `kl_recovery_scale` with the depth
+                # divisor (`ntp_loss_scale`) made an explicit argument. N_ntp
+                # is the full `b*t` because the NTP CE here has no ignore mask
+                # (`model.py` asserts `loss_mask is None` on this path); N_k is
+                # `b*n` because no MTP position is masked either.
+                scale = weight * (b * t) / (n_heads * (b * n) * ntp_loss_scale)
+                coupled[:, shift:] = coupled[:, shift:] + scale * (x.detach() - x)
             # The next module is deeper by one shift: its input positions are
             # this module's output WITHOUT the last row, so no label is ever
             # reused and nothing wraps.
             h = x
         if not per_k:
-            return torch.zeros((), dtype=torch.float32, device=h_last.device), per_k
+            return torch.zeros((), dtype=torch.float32, device=h_last.device), per_k, coupled
         # No finiteness check HERE: `bool(tensor)` is a host read, and the
         # caller's own `assert torch.isfinite(loss)` already fires on the sum.
-        return torch.stack(per_k).mean() * weight, per_k
+        return torch.stack(per_k).mean() * weight, per_k, coupled

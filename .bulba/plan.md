@@ -519,6 +519,31 @@ testable and A/B-able (ADR-0017).
       pre-registered verdict (a divergence voids the arm; a win must beat the
       control's 3-seed spread), `plan`/`profile`/`run`. Written, **NOT run**
       (GPU busy with the flagship): no timing, no BPB, no verdict exists.
+- [x] P-MTP-SOFT. port (Python): Soft-MTP (arXiv:2610.38331), behind
+      `ModelConfig.mtp_soft` beside `mtp_weight`; OFF is bit-identical (pins
+      from clean `main` `21a97d2`, captured before the edit: tiny state sha256
+      `e26c6a07…`/`894fe40f…`, logits `c7839283…`, losses 6.119609355926514 /
+      8.997851371765137, MTP-proj + embed grad sha256). `MTPHead.forward_soft`
+      adds `ntp_hidden[:, k:] += s_k·(x_k.detach() - x_k)` and returns the
+      coupled hidden; `model.py` computes the NTP CE on it through the existing
+      CE path and keeps the returned logits/aux on the original. `s_k` =
+      `weight·N_ntp/(n_heads·N_k·ntp_loss_scale)` with this repo's
+      `ntp_loss_scale = 1/(T+1)` (the reference's `kl_recovery_scale` has no
+      depth divisor). fp64 decisive gate: last-head gradient == explicit
+      KL(p_ntp‖p_mtp) at `7.5e-16…1.1e-15` relative for K=1,2,3, full vocab,
+      dense head; **FINDING**: this module has no per-head final norm, so
+      `x_j` also feeds module `j+1` and the later heads' coupling routes back
+      through the sequential projection — the identity is exact only at the
+      last head (and K=1); earlier heads carry that cross term, quantified and
+      named in the test. The shared-`lm_head` premise HOLDS (dense/TSCT/tied
+      are all linear; the tiny default is TSCT). Refused with
+      `mtp_weight==0` and `logit_softcap>0` (the verifier would be capped while
+      the MTP head reads the head uncapped). Device counter `mtp_soft`, no
+      host sync in the module (`.item/.tolist/.__bool__` gate). Gates
+      `tests/test_mtp_soft.py` (12); driver `scripts/ab_mtp_soft.py`
+      (`ntp`/`hard_mtp`/`soft_mtp`, 3 seeds x 600, b8 s512, mix_v7, probe for
+      per-head CE/acceptance; keep rule pre-registered) written and **NOT run**
+      (card busy).
 
 
 ## Critical Files

@@ -389,6 +389,15 @@ class DormouseModel(nn.Module):
         # weight is on, so `mtp_k = mtp_weight = 0` (every preset) leaves the
         # tree — and the parameter count — exactly as it was. A weight with
         # `mtp_k == 0` is LOUD in `MTPHead` even without `config.validate`.
+        if cfg.mtp_soft and cfg.mtp_weight <= 0.0:
+            # The same refusal `validate` owns, held at the runtime seam a
+            # hand-built ModelConfig reaches without passing through it.
+            loud(
+                f"mtp_soft=true with mtp_weight={cfg.mtp_weight}: soft-MTP routes "
+                f"the NTP gradient into an MTP hidden, and the MTP head is built "
+                f"IFF the weight is on (mtp.py). Escape: mtp_weight > 0 with "
+                f"mtp_k >= 1, or mtp_soft=false."
+            )
         self.mtp = (
             MTPHead(cfg.d_model, cfg.mtp_k, eps=cfg.norm_eps, device=device)
             if (cfg.mtp_weight > 0.0)
@@ -805,6 +814,10 @@ class DormouseModel(nn.Module):
             # same bounded distribution. `0.0` enters no branch.
             logits = logit_softcap(logits, self.cfg.logit_softcap)
         loss = None
+        # Set only on the soft-MTP arm; the hard path leaves it None and keeps
+        # its MTP call exactly where it was, so `mtp_soft=false` is the old
+        # program (gate 1 pins the state and logits).
+        mtp_terms: tuple[torch.Tensor, list[torch.Tensor], torch.Tensor] | None = None
         if targets is not None:
             assert rec_sum is not None, "targets given but the loop accumulated no L_Rec"
             # (Σ_i CE_i + CE_final) / (max_iter + 1), unweighted.
@@ -818,13 +831,66 @@ class DormouseModel(nn.Module):
             # keeps L_Rec — deep supervision over every iteration, which is
             # what a looped block needs (readiness plan §5) — and adds the one
             # term that makes the logits it RETURNS the logits it TRAINS.
+            #
+            # (Σ_i CE_i + CE_final) / (T + 1), unweighted, with T the depth this
+            # forward ACTUALLY ran. burn's code divided by `max_iter + 1`
+            # unconditionally; under the ADAPTIVE DEPTH arm that divisor is a
+            # constant that no longer counts the terms summed, so a T=1 step
+            # would read as the loss of a max_iter-deep model (and the arm's
+            # whole point — scale-comparable depths — would be invisible in
+            # the curve). One divisor, the count of terms it divides. It is
+            # computed HERE, before the CE, because soft-MTP's scale needs it.
+            T = self.cfg.max_iter if depth is None else depth
+            if halt is not None:
+                # The depth the halted loop ACTUALLY ran: the loss divides by
+                # the terms it summed, exactly as a scheduled depth does.
+                T = getattr(self.loop, "_depth_ran", T)
+            if not pure and self.mtp is not None and self.cfg.mtp_soft:
+                # SOFT-MTP (arXiv:2610.38331): the MTP modules compute their
+                # own CE and return the NTP hidden with the straight-through
+                # coupling added. The CE below then reads THAT hidden; the
+                # returned `logits` and the aux terms keep the original one
+                # (the coupling is a forward no-op — gate 3).
+                assert loss_mask is None, (
+                    "mtp_soft with loss_mask: MTP has no ignore_index, so the "
+                    "coupled slice and the masked NTP mean would address "
+                    "different position sets; config.validate refuses "
+                    "doc_masking with mtp_weight>0"
+                )
+                assert self.cfg.logit_softcap == 0.0, (
+                    "mtp_soft with logit_softcap: the MTP head reads the shared "
+                    "head uncapped and the NTP CE would read a capped "
+                    "distribution; ModelConfig.__post_init__ refuses the pair"
+                )
+                mtp_terms = self.mtp.forward_soft(
+                    out,
+                    input_ids,
+                    targets,
+                    embed=self.embed,
+                    head=self.lm_head,
+                    weight=self.cfg.mtp_weight,
+                    ntp_hidden=hn,
+                    # The NTP CE's factor in the total: `(rec_sum + ce)/ (T+1)`.
+                    ntp_loss_scale=1.0 / (T + 1),
+                )
+                # A DEVICE counter: the arm's "it ran" proof, drained with the
+                # window's other counters at the log cadence (never read here).
+                counters.count_device(
+                    "mtp_soft",
+                    torch.ones((), dtype=torch.int64, device=hn.device),
+                )
+                logits_ntp = self.lm_head(
+                    mtp_terms[2].reshape(-1, self.cfg.d_model).to(torch.float32)
+                )
+            else:
+                logits_ntp = logits
             flat = targets.reshape(-1, 1)
             if ce_fixed:
                 ce_final = fixed_cross_entropy(
-                    logits, targets, reduction="none", counters=counters
+                    logits_ntp, targets, reduction="none", counters=counters
                 ).reshape(-1, 1)
             else:
-                ce_final = -F.log_softmax(logits, dim=-1).gather(1, flat)
+                ce_final = -F.log_softmax(logits_ntp, dim=-1).gather(1, flat)
             if loss_mask is not None:
                 # doc_masking: padding and cross-document targets carry no loss
                 # and no gradient — the same selected mean the loop used.
@@ -845,17 +911,7 @@ class DormouseModel(nn.Module):
                     "per_iter": [float(t.detach()) for t in per],
                 }
             # (Σ_i CE_i + CE_final) / (T + 1), unweighted, with T the depth this
-            # forward ACTUALLY ran. burn's code divided by `max_iter + 1`
-            # unconditionally; under the ADAPTIVE DEPTH arm that divisor is a
-            # constant that no longer counts the terms summed, so a T=1 step
-            # would read as the loss of a max_iter-deep model (and the arm's
-            # whole point — scale-comparable depths — would be invisible in
-            # the curve). One divisor, the count of terms it divides.
-            T = self.cfg.max_iter if depth is None else depth
-            if halt is not None:
-                # The depth the halted loop ACTUALLY ran: the loss divides by
-                # the terms it summed, exactly as a scheduled depth does.
-                T = getattr(self.loop, "_depth_ran", T)
+            # forward ACTUALLY ran (computed above, before the CE expression).
             loss = (rec_sum + ce_final) / (T + 1)
             if not pure and self.cfg.z_loss > 0.0:
                 # z-loss (PaLM §5 / Gemma-2 §9): keep the pre-softmax logits
@@ -952,14 +1008,19 @@ class DormouseModel(nn.Module):
                 # future-byte modules on the loop's own final readout, sharing
                 # THIS model's `embed` and `lm_head`. The term is a training
                 # signal like DSpark's, so `pure` (the held-out number) skips it.
-                mtp_loss, mtp_per_k = self.mtp(
-                    out,
-                    input_ids,
-                    targets,
-                    embed=self.embed,
-                    head=self.lm_head,
-                    weight=self.cfg.mtp_weight,
-                )
+                # The soft arm computed its terms above (the CE had to read the
+                # coupled hidden); the hard arm computes them HERE, unchanged.
+                if mtp_terms is None:
+                    mtp_loss, mtp_per_k = self.mtp(
+                        out,
+                        input_ids,
+                        targets,
+                        embed=self.embed,
+                        head=self.lm_head,
+                        weight=self.cfg.mtp_weight,
+                    )
+                else:
+                    mtp_loss, mtp_per_k, _coupled = mtp_terms
                 loss = loss + mtp_loss
                 # The value `train/loop.py`'s `mtp_field` reads on the LOG
                 # cadence: detached, and NOT read here — a `.item()` per step
