@@ -24,6 +24,7 @@ nothing is measured, so there is no number to quote.
 
 from __future__ import annotations
 
+import os
 import statistics
 import subprocess
 import sys
@@ -156,8 +157,15 @@ def main() -> int:
             capture_output=True,
             text=True,
         ).stdout.strip()
-        if smi and int(smi.split()[0]) >= 1024:
-            why = f"the card already holds {smi.split()[0]} MiB (this bench's ceiling is 1024)"
+        # The ceiling is about a second MODEL, not about a desktop: this box
+        # drives a display from the same card, so ~1.6 GiB is the compositor and
+        # is not contention. Raise it explicitly when that is the case.
+        ceiling = int(os.environ.get("BF_BENCH_MAX_MIB", "1024"))
+        if smi and int(smi.split()[0]) >= ceiling:
+            why = (
+                f"the card already holds {smi.split()[0]} MiB (ceiling {ceiling}; "
+                f"raise BF_BENCH_MAX_MIB if this is the desktop compositor, not a model)"
+            )
     if why is not None:
         return skip(why)
     if not torch.cuda.is_available():
