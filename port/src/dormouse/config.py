@@ -901,6 +901,16 @@ class ModelConfig:
     #: off. REFUSED with `mtp_weight == 0` (there is no MTP hidden to route
     #: into) and with `logit_softcap > 0` (below).
     mtp_soft: bool = False
+    #: ---- the reference's per-head seam (`mtp.py`) ----
+    #: `mtp_head_norm=true` adds a per-head final `RMSNorm` (WITH a learnable
+    #: gain, matching the reference's `RMSNorm`; `K·d` parameters) between the
+    #: MTP projection and the shared head. Each head's normalized hidden is
+    #: read ONLY by that head's CE/coupling; the next module still consumes the
+    #: raw projection output. The seam is what makes the soft-MTP KL identity
+    #: exact at EVERY head instead of only the last, so `mtp_soft=true`
+    #: REQUIRES it (LOUD otherwise). OFF by default: no module, no parameter,
+    #: and the hard path is bit-identical to the pre-seam model.
+    mtp_head_norm: bool = False
     #: SIGReg / LeJEPA (arXiv:2511.08544, `model/sigreg.py`): a REGULARISER, not
     #: a head. `loss = CE + sigreg_weight · sigreg_loss(z)`, `z` the strided
     #: sample of the state `lm_head` reads — no teacher, no predictor, no mask,
@@ -1145,6 +1155,17 @@ class ModelConfig:
                 f"and never reach `norm`+`lm_head`, so the cap would be silently "
                 f"inert while the snapshot reported it on. Escape: "
                 f"logit_softcap=0.0, or use_byteflow=false."
+            )
+        if self.mtp_soft and not self.mtp_head_norm:
+            loud(
+                "mtp_soft=true with mtp_head_norm=false: the KL gradient-recovery "
+                "identity is exact only when each MTP head reads its OWN "
+                "normalized hidden. Without the seam `x_j` is also module "
+                "j+1's input, so a later head's coupling back-propagates through "
+                "the sequential projection and the identity holds only at the "
+                "last head (measured rel ~0.79 at K=3 head 0, fp64). Escape: "
+                "mtp_head_norm=true (the reference's per-head final RMSNorm), or "
+                "mtp_soft=false."
             )
         if self.mtp_soft and self.logit_softcap > 0.0:
             loud(
@@ -2673,6 +2694,14 @@ def validate(model: ModelConfig) -> None:
             f"MTP term but there are no future-byte modules to average (the head "
             f"is built IFF the weight is on, and K >= 1). Escape: mtp_k >= 1, or "
             f"mtp_weight=0.0."
+        )
+    if model.mtp_soft and not model.mtp_head_norm:
+        loud(
+            "mtp_soft=true with mtp_head_norm=false: the soft-MTP identity needs "
+            "each head's OWN normalized hidden (the reference's per-head final "
+            "RMSNorm); without it a later head's coupling flows back through the "
+            "sequential projection. Escape: mtp_head_norm=true, or "
+            "mtp_soft=false."
         )
     if model.mtp_soft and model.mtp_weight <= 0.0:
         loud(

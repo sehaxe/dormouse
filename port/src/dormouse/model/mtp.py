@@ -79,6 +79,19 @@ head's hidden-space gradient and never reads `W` as a matrix. It is NOT
 recovered at `W` itself: the head's own parameter gradient stays the hard-CE
 push (the reference's `test_the_two_objectives_differ_at_the_unembedding`).
 
+**The seam, and why `mtp_soft` REQUIRES it.** The reference's `final_norm`
+gives each MTP head its OWN post-norm hidden (`z_k`), which no later head reads.
+Without that seam, `x_j` is both head `j`'s input and module `j+1`'s input, so
+the coupling applied to `x_{j+1}` back-propagates through the sequential
+projection and the identity is exact only at the LAST head. `head_norm=True`
+adds the reference's seam: a per-head `RMSNorm` (with a learnable gain, see
+below) applied to the projection output, read ONLY by that head's CE and its
+coupling; the next module still consumes the RAW `x_j`. With it the KL
+identity holds at EVERY head (`tests/test_mtp_soft.py`'s float64 gate).
+`config.py` refuses `mtp_soft=true` with `mtp_head_norm=false`; a hand-built
+`MTPHead` can still be called without the seam, and the tests pin that the old
+chain term is then real, so the refusal is not ceremony.
+
 **Alignment, off-by-one named:** module `j` (shift `j+1`) scores
 `targets[:, j+1:]` from `x_j[:, :t-j-1]`; its label at index `q` is the same
 byte the NTP CE at position `q + j + 1` scores. So the coupled slice is
@@ -86,10 +99,14 @@ byte the NTP CE at position `q + j + 1` scores. So the coupled slice is
 
 ## Named design choices
 
-* **The two RMSNorms are gain-free** (`elementwise_affine=False`). The stated
-  parameter budget is the K projection matrices alone — at `d = 1024`, K = 4:
-  4 x 2 097 152 = 8.4M — and a learnable norm gain would add 2*d*K more. This
-  is a deviation from DeepSeek-V3's learnable norms, and it is the budget's.
+* **The two INPUT RMSNorms are gain-free** (`elementwise_affine=False`) — the
+  `norms_h`/`norms_e` before the concat. The per-head FINAL norm (the
+  `mtp_head_norm` seam) is a different module and it has a learnable gain,
+  matching the reference's `blocks.RMSNorm`; `K·d` parameters, which at
+  `d = 1024`, K = 4 is 4 096 — 0.05% of the 8.4M the projections cost. The
+  input norms stay gain-free because that is this port's stated projection
+  budget (the reference's own input norms do carry gains; that is a
+  pre-existing budget deviation, not the seam's).
 * **No host reads.** The forward never calls `.item()`, `int(tensor)` or
   `.tolist()` (gate 5). The returned loss is a device scalar; `per_k` is a list
   of device scalars. The caller decides when to read them.
@@ -99,14 +116,16 @@ byte the NTP CE at position `q + j + 1` scores. So the coupled slice is
 * **Uniform mean over the modules that produced positions.** At `t > K` that is
   all K; a short window simply scores fewer terms, and `t <= 1` returns an exact
   zero with an empty `per_k` rather than a fabricated term.
-* **`x_j` is BOTH head `j`'s input and module `j+1`'s input**, because this
-  module is DeepSeek-sequential and has no per-head final norm. The routed
-  gradient at `x_j` is therefore added to any gradient a LATER module sends
-  back through the chain; the identity above is about the head's own term, and
-  the gate isolates the last module (whose `x` feeds no later head) plus a
-  K=1 fixture. This is a structural difference from the reference's
-  `final_norm(hiddens[head])` seam, named so a reader does not read the gate as
-  a claim the chain term vanishes.
+* **The seam (`head_norm=True`) is what makes the identity per-head.** The
+  reference's `final_norm` gives each head its OWN post-norm hidden `z_k` that
+  no later head reads. Without it, `x_j` is both head `j`'s input and module
+  `j+1`'s input, so the coupling applied to `x_{j+1}` back-propagates through
+  the sequential projection: the identity then holds only at the last head
+  (test `test_without_the_seam_the_nonfinal_head_carries_the_chain_term`).
+  With the seam, `z_j = head_norms[j](x_j)` is used ONLY for head `j`'s CE and
+  its coupling; the next module still consumes the RAW `x_j`. `config.py`
+  refuses `mtp_soft=true` without the seam, and `MTPHead` can still be built
+  without it (the tests use that to pin the chain term).
 """
 
 from __future__ import annotations
@@ -136,11 +155,12 @@ def _widen(t: torch.Tensor) -> torch.Tensor:
 class MTPHead(nn.Module):
     """K sequential future-byte modules, sharing the model's embed and head.
 
-    Module `j` owns `norms_h[j]`, `norms_e[j]` and `projs[j]`; `projs[j]` is the
-    only parameterised part (the norms are gain-free), so `2 * d * d` per module
-    at `[2d, d]`, bias-free. `forward` consumes the PREVIOUS module's output,
-    which is what makes the K depths sequential rather than K independent shallow
-    heads.
+    Module `j` owns `norms_h[j]`, `norms_e[j]`, `projs[j]` and (when the seam is
+    on) `head_norms[j]`. `projs[j]` is the only parameterised part of the
+    projection; `norms_h`/`norms_e` are gain-free, while `head_norms` carries a
+    learnable gain (the reference's `RMSNorm`) when `head_norm=True` — `K·d`
+    parameters. `forward` consumes the PREVIOUS module's output, which is what
+    makes the K depths sequential rather than K independent shallow heads.
     """
 
     def __init__(
@@ -149,6 +169,7 @@ class MTPHead(nn.Module):
         k: int,
         *,
         eps: float = 1e-3,
+        head_norm: bool = False,
         device: torch.device | str = "cpu",
     ) -> None:
         super().__init__()
@@ -177,6 +198,21 @@ class MTPHead(nn.Module):
         # the budget did not name.
         self.projs = nn.ModuleList(
             [nn.Linear(2 * d_model, d_model, bias=False, device=device) for _ in range(k)]
+        )
+        # The reference's per-head final norm (`final_norm(hiddens[head])`):
+        # WITH a gain, matching `blocks.RMSNorm` in the reference. It isolates
+        # head j's input from module j+1's, which is what makes the soft-MTP KL
+        # identity hold at every head, not just the last. `None` when off, so
+        # the off path allocates nothing and the state dict is unchanged.
+        self.head_norms = (
+            nn.ModuleList(
+                [
+                    nn.RMSNorm(d_model, eps=eps, elementwise_affine=True, device=device)
+                    for _ in range(k)
+                ]
+            )
+            if head_norm
+            else None
         )
 
     def forward(
@@ -297,7 +333,12 @@ class MTPHead(nn.Module):
             hp = self.norms_h[j](_widen(h[:, :n]))
             e = self.norms_e[j](_widen(embed(ids[:, shift : shift + n])))
             x = self.projs[j](torch.cat([hp, e], dim=-1))  # [b, n, d]
-            logits = head(_widen(x.reshape(b * n, d)))
+            # The reference's per-head seam: `z` is the ONLY input head `j`
+            # reads, and the coupling writes its gradient into `z`; the next
+            # module still consumes the RAW `x`, so a later head's coupling
+            # cannot flow back into `z`.
+            z = x if self.head_norms is None else self.head_norms[j](_widen(x))
+            logits = head(_widen(z.reshape(b * n, d)))
             per_k.append(F.cross_entropy(logits, targets[:, shift : shift + n].reshape(b * n)))
             if coupled is not None:
                 # `s_k = weight · N_ntp / (n_heads · N_k · ntp_loss_scale)`:
@@ -309,7 +350,7 @@ class MTPHead(nn.Module):
                 # (`model.py` asserts `loss_mask is None` on this path); N_k is
                 # `b*n` because no MTP position is masked either.
                 scale = weight * (b * t) / (n_heads * (b * n) * ntp_loss_scale)
-                coupled[:, shift:] = coupled[:, shift:] + scale * (x.detach() - x)
+                coupled[:, shift:] = coupled[:, shift:] + scale * (z.detach() - z)
             # The next module is deeper by one shift: its input positions are
             # this module's output WITHOUT the last row, so no label is ever
             # reused and nothing wraps.

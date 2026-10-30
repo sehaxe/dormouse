@@ -3,10 +3,12 @@
 The claim under test is the paper's KL gradient-recovery identity, in the
 version `model/mtp.py` implements for THIS repo:
 
-    d/dx_k [ CE_mtp_k - CE_ntp_at_aligned ] = (p_mtp - p_ntp) · W
+    d/dz_k [ CE_mtp_k - CE_ntp_at_aligned ] = (p_mtp - p_ntp) · W
 
-`x_k` is module `k`'s projection output (the tensor the shared head reads).
-The coupling is `ntp_hidden[:, k:] += s_k·(x_k.detach() - x_k)`, a forward
+`z_k` is module `k`'s head input: the per-head final RMSNorm's output when the
+`mtp_head_norm` seam is on (the reference's `final_norm(hiddens[k])`, and
+`mtp_soft` REQUIRES it), or the raw projection output `x_k` when it is off.
+The coupling is `ntp_hidden[:, k:] += s_k·(z_k.detach() - z_k)`, a forward
 no-op whose backward supplies exactly the `-s_k·g_CE_ntp` half. `s_k` carries
 the reference's `kl_recovery_scale` AND this repo's total-loss factor
 `ntp_loss_scale = 1/(T+1)`, because the NTP CE is divided by the depth here.
@@ -15,13 +17,16 @@ The decisive gate (b) is float64 with a full vocabulary and a DENSE linear
 head — the paper's premise. The repo's actual head may be dense, TSCT or tied;
 all three are linear in the hidden, which is all the identity reads, and the
 fixture exercises the real `MTPHead.forward_soft` and the real scale code.
-The gate for non-final modules is honest about the structural difference: this
-module's `x_j` also feeds module `j+1`, so the TOTAL gradient at a non-final
-`x_j` carries that chain term. The gate isolates the last module (whose `x`
-feeds no later head) and tests the routed DIFFERENCE on every module.
+With the seam ON, every head's `z_j` is an independent tensor (the next module
+reads the RAW `x_j`), so gate (b) compares EVERY head to its explicit KL.
+With the seam OFF, `x_j` is also module `j+1`'s input and the later coupling
+back-propagates through the sequential projection: the identity then holds
+only at the last head. That is why `config.py` refuses `mtp_soft` without the
+seam, and the no-seam finding is pinned below so the refusal is not ceremony.
 
-Pins in gate (a) were captured on clean `main` at `21a97d2` BEFORE any edit,
-with the script transcribed in `_state_hash`/`_grad_hash` below.
+Pins in gate (a) were captured on clean `main` at `21a97d2` BEFORE any edit;
+the `mtp_head_norm=false` path was re-verified against the SAME pins after the
+previous commit `10c3831`, and the seam is inert when no MTP module is built.
 """
 
 from __future__ import annotations
@@ -97,7 +102,7 @@ def test_gate_a_mtp_soft_off_is_bit_identical_to_clean_main() -> None:
     """`mtp_soft=false` is the old program: pinned state, logits, loss, grads."""
     ids, targets = _fixed_batch()
 
-    off = _build(mtp_k=0, mtp_weight=0.0, mtp_soft=False)
+    off = _build(mtp_k=0, mtp_weight=0.0, mtp_soft=False, mtp_head_norm=False)
     assert off.mtp is None and param_count(off) == 64_881
     assert _state_hash(off) == PIN_OFF_STATE
     logits, loss, _ = off(ids, targets)
@@ -106,7 +111,7 @@ def test_gate_a_mtp_soft_off_is_bit_identical_to_clean_main() -> None:
     loss.backward()
     assert _grad_hash(off.embed.weight) == PIN_OFF_EMBED_GRAD
 
-    k2 = _build(mtp_k=2, mtp_weight=0.5, mtp_soft=False)
+    k2 = _build(mtp_k=2, mtp_weight=0.5, mtp_soft=False, mtp_head_norm=False)
     assert _state_hash(k2) == PIN_K2_STATE
     logits, loss, _ = k2(ids, targets)
     assert hashlib.sha256(logits.detach().numpy().tobytes()).hexdigest() == PIN_K2_LOGITS
@@ -115,7 +120,7 @@ def test_gate_a_mtp_soft_off_is_bit_identical_to_clean_main() -> None:
     assert _grad_hash(k2.embed.weight) == PIN_K2_EMBED_GRAD
     assert tuple(_grad_hash(p.weight) for p in k2.mtp.projs) == PIN_K2_PROJ_GRADS
 
-    k1 = _build(7, mtp_k=1, mtp_weight=0.3, mtp_soft=False)
+    k1 = _build(7, mtp_k=1, mtp_weight=0.3, mtp_soft=False, mtp_head_norm=False)
     assert _state_hash(k1) == PIN_K1_STATE
     logits, loss, _ = k1(ids, targets)
     assert hashlib.sha256(logits.detach().numpy().tobytes()).hexdigest() == PIN_K1_LOGITS
@@ -125,22 +130,63 @@ def test_gate_a_mtp_soft_off_is_bit_identical_to_clean_main() -> None:
     assert _grad_hash(k1.mtp.projs[0].weight) == PIN_K1_PROJ_GRAD
 
 
+def test_gate_a2_the_seam_is_inert_when_no_mtp_module_is_built() -> None:
+    """`mtp_weight=0` builds NO MTP module: the seam flag cannot touch the tree.
+
+    The model is constructed with `mtp_head_norm=true` and a nonzero `mtp_k`,
+    but the weight is 0, so `self.mtp is None`; the parameter count, state,
+    logits, loss and the embedding gradient must equal the clean-main pins.
+    """
+    ids, targets = _fixed_batch()
+    for k in (0, 2):
+        model = _build(mtp_k=k, mtp_weight=0.0, mtp_head_norm=True, mtp_soft=False)
+        assert model.mtp is None, f"k={k}: the MTP module was built at weight 0"
+        assert param_count(model) == 64_881
+        assert _state_hash(model) == PIN_OFF_STATE
+        logits, loss, _ = model(ids, targets)
+        assert hashlib.sha256(logits.detach().numpy().tobytes()).hexdigest() == PIN_OFF_LOGITS
+        assert float(loss.detach()) == PIN_OFF_LOSS
+        loss.backward()
+        assert _grad_hash(model.embed.weight) == PIN_OFF_EMBED_GRAD
+
+
+def test_gate_a3_the_seam_is_additive_and_only_adds_ktimes_d_parameters() -> None:
+    """The seam adds K RMSNorm gains; the base parameters are bit-identical."""
+    ids, targets = _fixed_batch()
+    base = _build(mtp_k=2, mtp_weight=0.5, mtp_head_norm=False, mtp_soft=False)
+    seam = _build(mtp_k=2, mtp_weight=0.5, mtp_head_norm=True, mtp_soft=False)
+    assert base.mtp.head_norms is None
+    assert seam.mtp.head_norms is not None
+    # ONE gain per head, d_model=64: the seam costs K*d, not a projection.
+    assert param_count(seam) - param_count(base) == 2 * 64
+    base_sd, seam_sd = base.state_dict(), seam.state_dict()
+    for name, tensor in base_sd.items():
+        assert torch.equal(tensor, seam_sd[name]), f"the seam moved the base parameter {name}"
+    assert set(seam_sd) - set(base_sd) == {f"mtp.head_norms.{j}.weight" for j in range(2)}
+    logits_b, loss_b, _ = base(ids, targets)
+    logits_s, loss_s, _ = seam(ids, targets)
+    assert torch.equal(logits_b, logits_s), "the seam touched the NTP logits"
+    assert not torch.equal(loss_b, loss_s), "the seam did not change the MTP term"
+
+
 # --- gate (b): the decisive float64 KL-recovery identity ---------------------
 
 D_FIX, V_FIX, B_FIX, T_FIX = 8, 11, 2, 9
 W_FIX, DIV_FIX = 0.7, 3.0
 
 
-def _soft_fixture(k: int, seed: int = 0):
+def _soft_fixture(k: int, seed: int = 0, *, head_norm: bool = True):
     """A tiny fp64 fixture: real `MTPHead.forward_soft`, dense shared head.
 
     The head is `nn.Linear` with no bias — the paper's premise (`W` dense and
     shared). Every tensor is fp64; `mtp._widen` preserves fp64 (it only widens
     fp16/bf16), so the fixture measures the algebra, not fp32 round-off.
-    Returns the module, the inputs, the captured `x_j`, and their gradients.
+    Returns the module, the inputs, the captured head inputs `z_j`, and their
+    gradients. `head_norm=True` captures the seam's RMSNorm outputs; False
+    captures the raw projection outputs (the no-seam finding).
     """
     torch.manual_seed(seed)
-    mtp = MTPHead(D_FIX, k).double()
+    mtp = MTPHead(D_FIX, k, head_norm=head_norm).double()
     embed = nn.Embedding(V_FIX, D_FIX).double()
     head = nn.Linear(D_FIX, V_FIX, bias=False).double()
     h = torch.randn(B_FIX, T_FIX, D_FIX, dtype=torch.float64)
@@ -153,11 +199,12 @@ def _soft_fixture(k: int, seed: int = 0):
         out.retain_grad()
         xs.append(out)
 
-    # The head reads `x.reshape(...)` (a VIEW), while the coupling reads `x`
-    # itself. A hook on the projection output is therefore the only place both
-    # gradient paths meet — a hook on the head input would see the view only.
-    for proj in mtp.projs:
-        proj.register_forward_hook(keep)
+    # The head reads `z.reshape(...)` (a VIEW), while the coupling reads `z`
+    # itself. A hook on the tensor both paths meet at is therefore the only
+    # place the two gradients add — a hook on the head input would see the view.
+    modules = mtp.head_norms if head_norm else mtp.projs
+    for module in modules:
+        module.register_forward_hook(keep)
 
     ntp_hidden = h.clone()
     loss, _per_k, coupled = mtp.forward_soft(
@@ -188,37 +235,43 @@ def _kl_grad_for(x: torch.Tensor, p_ntp: torch.Tensor, w: torch.Tensor, k: int) 
 
 
 @pytest.mark.parametrize("k", [1, 2, 3])
-def test_gate_b_the_last_module_gradient_equals_explicit_kl_fp64(k: int) -> None:
-    """The decisive gate: <= 1e-10 relative in float64, full vocabulary.
+def test_gate_b_every_head_gradient_equals_explicit_kl_fp64(k: int) -> None:
+    """The decisive gate: EVERY head, <= 1e-10 relative in float64.
 
-    Only the LAST module is compared: its `x` feeds no later head, so its
-    total gradient IS the head's own CE minus the routed NTP term. Non-final
-    modules carry the later modules' chain term — tested separately below.
+    With `mtp_head_norm=True` (which `mtp_soft` requires) each head's `z_j` is
+    an independent tensor — the next module reads the raw projection output —
+    so the total gradient at `z_j` is the head's own CE minus the routed NTP
+    term. Compare every head to explicit `KL(p_ntp.detach() || p_mtp)`, full
+    vocabulary, dense linear head.
     """
-    _mtp, head, h, _ids, _targets, xs = _soft_fixture(k)
-    j = k - 1
-    shift = j + 1
-    n = T_FIX - shift
-    x = xs[j].detach().reshape(B_FIX, n, D_FIX)
-    got = xs[j].grad.reshape(B_FIX, n, D_FIX)
-    p_ntp = F.softmax(h.detach()[:, shift : shift + n] @ head.weight.t(), dim=-1)
-    want = _kl_grad_for(x, p_ntp, head.weight.detach(), k)
-    rel = (got - want).norm() / (want.norm() + 1e-300)
-    assert rel <= 1e-10, f"k={k}: relative {rel:.3e} (max abs {(got - want).abs().max():.3e})"
+    _mtp, head, h, _ids, _targets, zs = _soft_fixture(k)
+    assert len(zs) == min(k, T_FIX - 1), "the seam outputs were not captured"
+    for j, z in enumerate(zs):
+        shift = j + 1
+        n = T_FIX - shift
+        z_j = z.detach().reshape(B_FIX, n, D_FIX)
+        got = z.grad.reshape(B_FIX, n, D_FIX)
+        p_ntp = F.softmax(h.detach()[:, shift : shift + n] @ head.weight.t(), dim=-1)
+        want = _kl_grad_for(z_j, p_ntp, head.weight.detach(), k)
+        rel = (got - want).norm() / (want.norm() + 1e-300)
+        assert rel <= 1e-10, (
+            f"k={k} head {j}: relative {rel:.3e} (max abs {(got - want).abs().max():.3e})"
+        )
 
 
 @pytest.mark.parametrize("k", [1, 2, 3])
-def test_gate_b2_the_routed_difference_is_exact_at_the_last_module(k: int) -> None:
-    """`soft_grad − hard_grad == −s_j·g_CE_ntp` at the last module, <= 1e-10 rel.
+def test_gate_b2_every_head_routes_at_its_own_scale_fp64(k: int) -> None:
+    """`soft_grad − hard_grad == −s_j·g_CE_ntp` at EVERY head, <= 1e-10 rel.
 
-    At the last module there is no later head, so the difference is exactly the
-    coupling's contribution and the explicit reconstruction can be compared.
-    This pins the scale formula (`s_k` includes the per-head mean and the 1/k
-    average) at `n_heads = k`, not only at k=1.
+    The hard arm carries the same seam (`head_norm=True`), so the MTP CE term
+    cancels in the difference and the later modules' chain term is not in the
+    seam's `z_j` at all. At every head, the difference is exactly the coupling's
+    contribution; this pins the scale formula including the per-head mean and
+    the 1/k average.
     """
-    # The hard arm: `forward` (no coupling), same seed/inputs.
+    # The hard arm: `forward` (no coupling), same seed/inputs, seam ON.
     torch.manual_seed(0)
-    mtp = MTPHead(D_FIX, k).double()
+    mtp = MTPHead(D_FIX, k, head_norm=True).double()
     embed = nn.Embedding(V_FIX, D_FIX).double()
     head = nn.Linear(D_FIX, V_FIX, bias=False).double()
     h = torch.randn(B_FIX, T_FIX, D_FIX, dtype=torch.float64)
@@ -230,14 +283,14 @@ def test_gate_b2_the_routed_difference_is_exact_at_the_last_module(k: int) -> No
         out.retain_grad()
         hs.append(out)
 
-    for proj in mtp.projs:
-        proj.register_forward_hook(keep)
+    for module in mtp.head_norms:
+        module.register_forward_hook(keep)
     loss, _ = mtp(h, ids, targets, embed=embed, head=head, weight=W_FIX)
     loss.backward()
     hard = [x.grad.detach().clone() for x in hs]
 
     # The soft arm again, with the same seed (a fresh module has the same init).
-    mtp_s, head_s, h_s, ids_s, targets_s, xs = _soft_fixture(k)
+    mtp_s, head_s, h_s, ids_s, targets_s, zs = _soft_fixture(k)
     assert torch.equal(head_s.weight, head.weight), "the two arms must share W"
     assert torch.equal(mtp_s.projs[0].weight, mtp.projs[0].weight), (
         "the two arms must share the head module"
@@ -245,39 +298,41 @@ def test_gate_b2_the_routed_difference_is_exact_at_the_last_module(k: int) -> No
     assert torch.equal(h_s, h) and torch.equal(ids_s, ids) and torch.equal(targets_s, targets)
 
     n_heads = min(k, T_FIX - 1)
-    j = n_heads - 1
-    shift = j + 1
-    n = T_FIX - shift
-    soft = xs[j].grad.reshape(B_FIX, n, D_FIX)
-    diff = soft - hard[j].reshape(B_FIX, n, D_FIX)
+    assert len(hard) == n_heads and len(zs) == n_heads, "the two arms' captures differ"
+    for j in range(n_heads):
+        shift = j + 1
+        n = T_FIX - shift
+        soft = zs[j].grad.reshape(B_FIX, n, D_FIX)
+        diff = soft - hard[j].reshape(B_FIX, n, D_FIX)
 
-    # Explicit routed term: a fresh backward through the coupled hidden, with
-    # the real scale formula from `mtp.py`.
-    x = xs[j].detach().reshape(B_FIX, n, D_FIX).clone().requires_grad_(True)
-    coupled = h_s.detach().clone()
-    scale = W_FIX * (B_FIX * T_FIX) / (n_heads * (B_FIX * n) * (1.0 / DIV_FIX))
-    coupled[:, shift:] = coupled[:, shift:] + scale * (x.detach() - x)
-    ce = (
-        -F.log_softmax(head_s(coupled.reshape(-1, D_FIX)), dim=-1)
-        .gather(1, targets_s.reshape(-1, 1))
-        .mean()
-    )
-    (ce / DIV_FIX).backward()
-    want = x.grad
-    rel = (diff - want).norm() / (want.norm() + 1e-300)
-    assert rel <= 1e-10, (
-        f"k={k} module {j}: relative {rel:.3e} (max abs {(diff - want).abs().max():.3e})"
-    )
+        # Explicit routed term: a fresh backward through the coupled hidden,
+        # with the real scale formula from `mtp.py`.
+        z = zs[j].detach().reshape(B_FIX, n, D_FIX).clone().requires_grad_(True)
+        coupled = h_s.detach().clone()
+        scale = W_FIX * (B_FIX * T_FIX) / (n_heads * (B_FIX * n) * (1.0 / DIV_FIX))
+        coupled[:, shift:] = coupled[:, shift:] + scale * (z.detach() - z)
+        ce = (
+            -F.log_softmax(head_s(coupled.reshape(-1, D_FIX)), dim=-1)
+            .gather(1, targets_s.reshape(-1, 1))
+            .mean()
+        )
+        (ce / DIV_FIX).backward()
+        want = z.grad
+        rel = (diff - want).norm() / (want.norm() + 1e-300)
+        assert rel <= 1e-10, (
+            f"k={k} head {j}: relative {rel:.3e} (max abs {(diff - want).abs().max():.3e})"
+        )
 
 
 def test_gate_b3_the_model_wiring_uses_the_T_plus_1_scale() -> None:
     """The model-level scale: `ntp_loss_scale = 1/(T+1)` reaches `forward_soft`.
 
     The module gate (b) passes `ntp_loss_scale` directly; this one runs the
-    real `DormouseModel` at `max_iter=2` (so the NTP CE carries `1/3`) and
-    compares the LAST head's soft-vs-hard gradient difference to the explicit
-    routed term. A model that passed `1.0` (or the wrong alignment) is red.
-    fp32, so the bound is 1e-5 relative — the module's fp64 bound is gate (b).
+    real `DormouseModel` at `max_iter=2` (so the NTP CE carries `1/3`) with the
+    seam ON and compares the LAST head's soft-vs-hard gradient difference to
+    the explicit routed term. A model that passed `1.0` (or the wrong
+    alignment) is red. fp32, so the bound is 1e-5 relative — the module's fp64
+    bound is gate (b).
     """
     ids, targets = _fixed_batch()
     b, t = ids.shape
@@ -288,7 +343,7 @@ def test_gate_b3_the_model_wiring_uses_the_T_plus_1_scale() -> None:
     divisor = 3.0  # max_iter=2 in tiny_cfg
 
     def _run_arm(soft: bool):
-        model = _build(mtp_k=k, mtp_weight=weight, mtp_soft=soft)
+        model = _build(mtp_k=k, mtp_weight=weight, mtp_head_norm=True, mtp_soft=soft)
         if soft:
             # Same initialisation as the hard arm, so the MTP CE term cancels.
             model.load_state_dict(hard_state)
@@ -298,17 +353,18 @@ def test_gate_b3_the_model_wiring_uses_the_T_plus_1_scale() -> None:
             out.retain_grad()
             store.append(out)
 
-        model.mtp.projs[-1].register_forward_hook(keep)
+        model.mtp.head_norms[-1].register_forward_hook(keep)
         seen = _capture_head_inputs(model)
         _logits, loss, _ = model(ids, targets)
         loss.backward()
+        assert store, "the seam output was not captured"
         return store[0].detach(), store[0].grad.detach(), seen
 
     torch.manual_seed(1234)
-    hard_state = _build(mtp_k=k, mtp_weight=weight, mtp_soft=False).state_dict()
-    hard_x, hard_grad, _ = _run_arm(False)
-    soft_x, soft_grad, seen = _run_arm(True)
-    assert torch.equal(hard_x, soft_x), "the two arms' last hidden differs"
+    hard_state = _build(mtp_k=k, mtp_weight=weight, mtp_head_norm=True, mtp_soft=False).state_dict()
+    hard_z, hard_grad, _ = _run_arm(False)
+    soft_z, soft_grad, seen = _run_arm(True)
+    assert torch.equal(hard_z, soft_z), "the two arms' last head input differs"
     diff = (soft_grad - hard_grad).reshape(b, n, -1)
 
     # The NTP hidden the soft CE read: the nearest [b*t, d] head input before
@@ -317,33 +373,33 @@ def test_gate_b3_the_model_wiring_uses_the_T_plus_1_scale() -> None:
     hn = next(s for s in reversed(seen[:-1]) if s.shape == coupled.shape)
     assert torch.equal(hn, coupled), "the coupled hidden moved"
 
-    x = soft_x.reshape(b, n, -1).clone().requires_grad_(True)
-    model = _build(mtp_k=k, mtp_weight=weight, mtp_soft=True)
+    z = soft_z.reshape(b, n, -1).clone().requires_grad_(True)
+    model = _build(mtp_k=k, mtp_weight=weight, mtp_head_norm=True, mtp_soft=True)
     model.load_state_dict(hard_state)
     coupled_hidden = hn.reshape(b, t, -1).clone()
     scale = weight * (b * t) / (min(k, t - 1) * (b * n) * (1.0 / divisor))
-    coupled_hidden[:, shift:] = coupled_hidden[:, shift:] + scale * (x.detach() - x)
+    coupled_hidden[:, shift:] = coupled_hidden[:, shift:] + scale * (z.detach() - z)
     logits = model.lm_head(coupled_hidden.reshape(-1, model.cfg.d_model).to(torch.float32))
     ce = -F.log_softmax(logits, dim=-1).gather(1, targets.reshape(-1, 1)).mean()
     (ce / divisor).backward()
-    want = x.grad.reshape(b, n, -1)
+    want = z.grad.reshape(b, n, -1)
     rel = (diff - want).norm() / (want.norm() + 1e-300)
     assert rel <= 1e-5, f"model-level routing relative {rel:.3e} (want <= 1e-5)"
 
 
-def test_the_nonfinal_head_deviation_is_the_sequential_chain_not_a_scale_bug() -> None:
-    """FINDING, not a tolerance: this module's `x_j` also feeds module `j+1`.
+def test_without_the_seam_the_nonfinal_head_carries_the_chain_term() -> None:
+    """FINDING, pinned: without `mtp_head_norm` the identity is last-head only.
 
-    The reference's per-head seam is `final_norm(hiddens[k])`, a tensor no later
-    head reads. Here the projection output `x_j` IS the next module's input, so
-    the NTP coupling applied to `x_{j+1}` back-propagates to `x_j` through the
-    sequential projection. The last head's total gradient is therefore the KL
-    exactly (gate b), while a non-final head's carries that cross-head term on
-    top of its own KL. This test quantifies it so a reader cannot mistake the
-    partial identity for a broken scale; it does NOT assert equality.
+    This is why `config.py` refuses `mtp_soft=true` with `mtp_head_norm=false`.
+    The projection output `x_j` is also module `j+1`'s input, so the NTP
+    coupling applied to `x_{j+1}` back-propagates to `x_j` through the
+    sequential projection; the last head's total gradient is the KL exactly,
+    while a non-final head carries that cross-head term on top of its own KL.
+    The seam ON is gate (b), which is exact at every head.
     """
     k = 3
-    _mtp, head, h, _ids, _targets, xs = _soft_fixture(k)
+    _mtp, head, h, _ids, _targets, xs = _soft_fixture(k, head_norm=False)
+    assert len(xs) == min(k, T_FIX - 1), "the no-seam outputs were not captured"
     # j = 0's total gradient vs the direct KL for head 0.
     shift = 1
     n = T_FIX - shift
@@ -351,7 +407,7 @@ def test_the_nonfinal_head_deviation_is_the_sequential_chain_not_a_scale_bug() -
     p_ntp = F.softmax(h.detach()[:, shift : shift + n] @ head.weight.t(), dim=-1)
     want = _kl_grad_for(xs[0].detach().reshape(B_FIX, n, D_FIX), p_ntp, head.weight.detach(), k)
     rel = (got - want).norm() / (want.norm() + 1e-300)
-    # The last head is the isolated one; its identity is gate b.
+    # The last head is already isolated without the seam; its identity is exact.
     last = xs[-1].grad.reshape(B_FIX, T_FIX - k, D_FIX)
     p_last = F.softmax(h.detach()[:, k:] @ head.weight.t(), dim=-1)
     want_last = _kl_grad_for(
@@ -359,10 +415,10 @@ def test_the_nonfinal_head_deviation_is_the_sequential_chain_not_a_scale_bug() -
     )
     assert (last - want_last).norm() / want_last.norm() <= 1e-10
     # Non-final: the cross term is real and large. If a future refactor isolates
-    # the head inputs (a per-head final norm), this record must be updated.
+    # the head inputs without the flag, this record must be updated.
     assert rel > 1e-3, (
-        f"the non-final head now matches the direct KL ({rel:.3e}); the module's "
-        f"head seam changed — update this finding and the gate docstring"
+        f"the non-final head now matches the direct KL ({rel:.3e}) without the "
+        f"seam; the module's head seam changed — update this finding and gate (b)"
     )
 
 
@@ -380,11 +436,11 @@ def _capture_head_inputs(model: DormouseModel) -> list[torch.Tensor]:
 
 
 def test_gate_cd_ntp_forward_and_loss_scalar_are_unchanged() -> None:
-    """The coupling is `x - x`: the returned logits, the NTP hidden and the
-    total loss scalar are `torch.equal` to the hard arm's."""
+    """The coupling is `z - z`: the returned logits, the NTP hidden and the
+    total loss scalar are `torch.equal` to the hard arm's (same seam on both)."""
     ids, targets = _fixed_batch()
-    hard = _build(mtp_k=2, mtp_weight=0.5, mtp_soft=False)
-    soft = _build(mtp_k=2, mtp_weight=0.5, mtp_soft=True)
+    hard = _build(mtp_k=2, mtp_weight=0.5, mtp_head_norm=True, mtp_soft=False)
+    soft = _build(mtp_k=2, mtp_weight=0.5, mtp_head_norm=True, mtp_soft=True)
     soft.load_state_dict(hard.state_dict())
 
     logits_h, loss_h, counters_h = hard(ids, targets)
@@ -414,7 +470,7 @@ def test_gate_no_host_sync_in_the_soft_path(monkeypatch: pytest.MonkeyPatch) -> 
     `.tolist()` on this branch and is not part of the soft path.
     """
     torch.manual_seed(0)
-    mtp = MTPHead(8, 2)
+    mtp = MTPHead(8, 2, head_norm=True)
     embed = nn.Embedding(16, 8)
     head = nn.Linear(8, 16)
     h = torch.randn(2, 6, 8)
@@ -446,10 +502,10 @@ def test_gate_no_host_sync_in_the_soft_path(monkeypatch: pytest.MonkeyPatch) -> 
 
 def test_gate_e_gradients_are_finite_and_mtp_parameters_are_trained() -> None:
     ids, targets = _fixed_batch()
-    hard = _build(mtp_k=2, mtp_weight=0.5, mtp_soft=False)
+    hard = _build(mtp_k=2, mtp_weight=0.5, mtp_head_norm=True, mtp_soft=False)
     _logits, loss_h, _ = hard(ids, targets)
     loss_h.backward()
-    soft = _build(mtp_k=2, mtp_weight=0.5, mtp_soft=True)
+    soft = _build(mtp_k=2, mtp_weight=0.5, mtp_head_norm=True, mtp_soft=True)
     soft.load_state_dict(hard.state_dict())
     _logits, loss_s, _ = soft(ids, targets)
     loss_s.backward()
@@ -463,7 +519,8 @@ def test_gate_e_gradients_are_finite_and_mtp_parameters_are_trained() -> None:
             continue
         assert torch.isfinite(param.grad).all(), f"{name} has a non-finite gradient"
     mtp_params = {n: p for n, p in soft.named_parameters() if n.startswith("mtp.")}
-    assert len(mtp_params) == 2, sorted(mtp_params)
+    # K projections + K seam gains (the seam is on and must be trained too).
+    assert len(mtp_params) == 4, sorted(mtp_params)
     for name, param in mtp_params.items():
         assert param.grad is not None, f"{name} got no gradient"
         assert torch.count_nonzero(param.grad).item() > 0, f"{name} got an all-zero gradient"
@@ -473,30 +530,49 @@ def test_gate_e_gradients_are_finite_and_mtp_parameters_are_trained() -> None:
 
 
 def test_gate_f_refusals_and_snapshot_round_trip() -> None:
+    # The new requirement: soft needs the seam, and the message names both
+    # flags and the Escape.
+    with pytest.raises(LoudError, match="mtp_head_norm") as exc:
+        tiny_cfg(mtp_k=1, mtp_weight=0.5, mtp_soft=True)
+    assert "Escape" in str(exc.value) and "mtp_soft=false" in str(exc.value)
+    # `validate` owns the same refusal for a mutated config.
+    bad = tiny_cfg(mtp_k=1, mtp_weight=0.5, mtp_soft=False)
+    bad.mtp_soft = True
+    with pytest.raises(LoudError, match="mtp_head_norm"):
+        validate(bad)
     with pytest.raises(LoudError, match="mtp_soft"):
-        validate(tiny_cfg(mtp_k=1, mtp_weight=0.0, mtp_soft=True))
+        validate(tiny_cfg(mtp_k=1, mtp_weight=0.0, mtp_soft=True, mtp_head_norm=True))
     with pytest.raises(LoudError, match="mtp_soft"):
-        tiny_cfg(mtp_k=1, mtp_weight=0.5, mtp_soft=True, logit_softcap=15.0)
+        tiny_cfg(
+            mtp_k=1,
+            mtp_weight=0.5,
+            mtp_soft=True,
+            mtp_head_norm=True,
+            logit_softcap=15.0,
+        )
     with pytest.raises(LoudError, match="mtp_soft"):
-        DormouseModel(tiny_cfg(mtp_k=1, mtp_weight=0.0, mtp_soft=True))
+        DormouseModel(tiny_cfg(mtp_k=1, mtp_weight=0.0, mtp_soft=True, mtp_head_norm=True))
 
     on = RunConfig(
         source="tiny",
-        model=tiny_cfg(mtp_k=1, mtp_weight=0.5, mtp_soft=True),
+        model=tiny_cfg(mtp_k=1, mtp_weight=0.5, mtp_soft=True, mtp_head_norm=True),
         train=TrainConfig(),
     )
     text = on.snapshot_toml()
-    assert "mtp_soft = true" in text, text
+    assert "mtp_soft = true" in text and "mtp_head_norm = true" in text, text
     back = RunConfig.from_snapshot(text)
     assert back.model.mtp_soft is True
+    assert back.model.mtp_head_norm is True
     assert back.diff_keys(on) == []
 
     off = RunConfig(
         source="tiny",
-        model=tiny_cfg(mtp_k=1, mtp_weight=0.5, mtp_soft=False),
+        model=tiny_cfg(mtp_k=1, mtp_weight=0.5, mtp_soft=False, mtp_head_norm=False),
         train=TrainConfig(),
     )
-    assert RunConfig.from_snapshot(off.snapshot_toml()).model.mtp_soft is False
+    back_off = RunConfig.from_snapshot(off.snapshot_toml())
+    assert back_off.model.mtp_soft is False
+    assert back_off.model.mtp_head_norm is False
 
 
 # --- the A/B driver's pre-registered rule (pure logic, no GPU) ---------------
@@ -530,24 +606,44 @@ def test_the_driver_keep_rule_is_the_preregistered_three_clauses() -> None:
     window = 81920
     ntp = [_run_row(1, 3.00, 0), _run_row(2, 3.04, 0), _run_row(3, 2.96, 0)]  # spread 0.08
     hard = [_run_row(1, 2.99, 2), _run_row(2, 3.01, 2), _run_row(3, 3.00, 2)]
-    soft_win = [_run_row(1, 2.97, 2), _run_row(2, 2.98, 2), _run_row(3, 2.98, 2)]
+    hard_seam = [_run_row(1, 2.98, 2), _run_row(2, 2.99, 2), _run_row(3, 2.97, 2)]
+    soft_win = [_run_row(1, 2.96, 2), _run_row(2, 2.97, 2), _run_row(3, 2.96, 2)]
 
-    keep = mod.verdict(ntp, hard, soft_win, window, accept_hard=0.50, accept_soft=0.60)
+    keep = mod.verdict(
+        ntp, hard, hard_seam, soft_win, window, accept_hard_seam=0.50, accept_soft=0.60
+    )
     assert keep["verdict"] == "keep", keep
 
-    # Clause 1: not better than hard.
-    tie = mod.verdict(ntp, hard, hard, window, accept_hard=0.50, accept_soft=0.60)
+    # Clause 1: not better than the seam-on control.
+    tie = mod.verdict(
+        ntp, hard, hard_seam, hard_seam, window, accept_hard_seam=0.50, accept_soft=0.60
+    )
     assert tie["verdict"] == "drop", tie
 
-    # Clause 2: better than hard but worse than ntp by more than 2x its spread.
+    # Clause 2: better than hard+seam but worse than ntp by more than 2x spread.
     bad = [_run_row(1, 3.20, 2), _run_row(2, 3.21, 2), _run_row(3, 3.20, 2)]
-    far = mod.verdict(ntp, hard, bad, window, accept_hard=0.50, accept_soft=0.60)
+    far = mod.verdict(ntp, hard, hard_seam, bad, window, accept_hard_seam=0.50, accept_soft=0.60)
     assert far["verdict"] == "drop", far
 
-    # Clause 3: BPB wins but acceptance is not higher.
-    no_accept = mod.verdict(ntp, hard, soft_win, window, accept_hard=0.60, accept_soft=0.60)
+    # Clause 3: BPB wins but acceptance is not higher than hard+seam.
+    no_accept = mod.verdict(
+        ntp, hard, hard_seam, soft_win, window, accept_hard_seam=0.60, accept_soft=0.60
+    )
     assert no_accept["verdict"] == "drop", no_accept
 
     # No probe => VOID, and a VOID arm is never a keep.
-    void = mod.verdict(ntp, hard, soft_win, window, accept_hard=None, accept_soft=None)
+    void = mod.verdict(
+        ntp, hard, hard_seam, soft_win, window, accept_hard_seam=None, accept_soft=None
+    )
     assert void["verdict"] == "void" and not void["verdict"] == "keep", void
+
+
+def test_the_driver_seam_rule_helps_hurts_or_ties_on_its_own_spread() -> None:
+    mod = _load_ab_soft()
+    hard = [_run_row(1, 3.00, 2), _run_row(2, 3.04, 2), _run_row(3, 2.96, 2)]  # spread 0.08
+    helps = [_run_row(1, 2.90, 2), _run_row(2, 2.91, 2), _run_row(3, 2.89, 2)]
+    hurts = [_run_row(1, 3.09, 2), _run_row(2, 3.10, 2), _run_row(3, 3.08, 2)]
+    tie = [_run_row(1, 2.99, 2), _run_row(2, 3.02, 2), _run_row(3, 2.98, 2)]
+    assert mod.seam_verdict(hard, helps)["verdict"] == "helps"
+    assert mod.seam_verdict(hard, hurts)["verdict"] == "hurts"
+    assert mod.seam_verdict(hard, tie)["verdict"] == "tie"

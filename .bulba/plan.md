@@ -543,7 +543,32 @@ testable and A/B-able (ADR-0017).
       `tests/test_mtp_soft.py` (12); driver `scripts/ab_mtp_soft.py`
       (`ntp`/`hard_mtp`/`soft_mtp`, 3 seeds x 600, b8 s512, mix_v7, probe for
       per-head CE/acceptance; keep rule pre-registered) written and **NOT run**
-      (card busy).
+      (card busy). The FINDING is fixed by P-MTP-SEAM below.
+- [x] P-MTP-SEAM. port (Python): the reference's per-head final RMSNorm, and
+      `mtp_soft` now REQUIRES it. `ModelConfig.mtp_head_norm` (beside
+      `mtp_weight`, default false) adds `MTPHead.head_norms[j]`, a per-head
+      RMSNorm WITH a gain (matching the reference's `blocks.RMSNorm`; `K·d`
+      parameters — tiny d=64/K=2: +128; medium d=1024/K=4: +4 096). The head's
+      CE and its coupling read ONLY the normalized `z_j`; the next module still
+      consumes the RAW `x_j`, so `z_j` is an independent tensor. `mtp_soft=true`
+      with `mtp_head_norm=false` is LOUD in `__post_init__`, `validate` and the
+      model constructor, with an Escape naming both flags. fp64 every-head
+      gate: relative `4.985e-16…8.933e-16` for K=1,2,3 (asserted <=1e-10);
+      WITHOUT the seam the same gate is 8.87e-1 / 1.08e+0 / 1.12e-15 (last head
+      only), pinned in `test_without_the_seam_the_nonfinal_head_carries_the_chain_term`.
+      OFF: `mtp_weight=0` builds NO module even with `mtp_head_norm=true`
+      (state/logits/loss/embed-grad pins from `21a97d2` unchanged, gate a2);
+      `mtp_head_norm=false, mtp_soft=false` reproduces the SAME pins, re-measured
+      on the previous commit `10c3831`. Seam delta: `param_count(seam) -
+      param_count(base) = K·d`, every base parameter bit-identical, NTP logits
+      bit-identical, only `mtp.head_norms.*.weight` new (gate a3). Reverts
+      18/18 turned their named gate red. Driver extended to 4 arms
+      (`ntp` / `hard_mtp` / `hard_mtp_seam` / `soft_mtp_seam`), 3 seeds x 600,
+      b8 s512, mix_v7 + eval_mix; the seam-alone verdict is printed and the
+      soft keep rule is re-stated against hard+seam; written, **NOT run**
+      (card busy). Suite diff vs clean `21a97d2`: the same single pre-existing
+      `test_sft_v2::test_the_manifest_accounts_for_every_row` failure; ruff
+      clean.
 
 
 ## Critical Files

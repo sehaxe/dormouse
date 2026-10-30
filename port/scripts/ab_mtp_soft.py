@@ -9,18 +9,21 @@ thing at a time), so the keep rule is written here BEFORE the first run. A busy
 card makes the driver REFUSE and exit 1; nothing is measured and no table
 prints.
 
-**The arms** — one model field differs (`mtp_soft`), everything else is shared:
+**The arms** — the seam is the reference's per-head final RMSNorm
+(`mtp_head_norm`), and the soft trick REQUIRES it (config refuses otherwise):
 
-* `ntp`      — `mtp_k=0, mtp_weight=0.0`: the control, no MTP head at all.
-* `hard_mtp` — `mtp_k=4, mtp_weight=1.0, mtp_soft=false`: DeepSeek-V3 §3.2
-  future-byte CE (`model/mtp.py`, `forward`).
-* `soft_mtp` — `mtp_k=4, mtp_weight=1.0, mtp_soft=true`: the same CE VALUE, with
-  the NTP CE's gradient at each head's ALIGNED position routed into the head
-  (`forward_soft`, arXiv:2610.38331). The total loss value is bit-identical to
-  `hard_mtp` (the coupling is `x - x`); only the backward differs.
+* `ntp`            — `mtp_k=0, mtp_weight=0.0`: the control, no MTP head.
+* `hard_mtp`       — `mtp_k=4, mtp_weight=1.0, mtp_head_norm=false`: today's
+  DeepSeek-V3 §3.2 future-byte CE (`model/mtp.py`, `forward`).
+* `hard_mtp_seam`  — the same CE with `mtp_head_norm=true`: the seam ALONE.
+  This is an architecture change, so its own BPB vs `hard_mtp` decides whether
+  the seam is adopted at all.
+* `soft_mtp_seam`  — `mtp_head_norm=true, mtp_soft=true`: the paper method.
+  The total loss VALUE is bit-identical to `hard_mtp_seam` (the coupling is
+  `x - x`); only the backward differs.
 
 K=4 because the probe reports acceptance for k=1..4 and one K makes the arms a
-single knob. λ=1.0 for both MTP arms, the value `ab_mtp.py` uses, so the
+single knob. λ=1.0 on every MTP arm, the value `ab_mtp.py` uses, so the
 per-head scale is the same one its gates pin.
 
 **The recipe** is `/tmp/opencode/battery.sh`'s `BASE` + `COMMON` (the same
@@ -34,24 +37,31 @@ is `steps`, so the `--probe` pass has a final checkpoint to load; without
 `--probe` the checkpoint is still written (600 steps is one checkpoint, not a
 cadence).
 
-**The pre-registered keep rule** (the reason this file exists before a run):
+**The pre-registered rules** (the reason this file exists before a run):
 
-    soft_mtp ENTERS the recipe iff ALL THREE hold
-      1. mean held-out BPB(soft_mtp) < mean held-out BPB(hard_mtp)   (strictly),
-      2. mean held-out BPB(soft_mtp) <= mean BPB(ntp) + 2 * control_spread,
-         where control_spread = max(ntp seeds) - min(ntp seeds),
-      3. mean draft acceptance over k=1..4 is HIGHER for soft_mtp than for
-         hard_mtp (the `--probe` measurement; without it the arm is VOID).
+    SEAM ADOPTION (reported, and it gates the recipe change)
+      the seam alone is adopted iff mean BPB(hard_mtp_seam) < mean BPB(hard_mtp)
+      by MORE than hard_mtp's own seed spread. If it hurts or ties, the
+      architecture change is not adopted, and `soft_mtp_seam` cannot enter even
+      if it clears the three clauses below.
 
-Anything else is a DROP. The second clause is the "no worse than the control
-beyond twice its own seed noise" guard: a tie with `ntp` on BPB is not a reason
-to carry a head, and a 2x-spread deficit is a regression even if it edges out
-`hard_mtp`. The mechanism is deleted if it cannot clear all three (AGENTS
-§1.2); it is not kept "to be safe".
+    SOFT ENTRY (the paper method, against its own seam-on control)
+      soft_mtp_seam ENTERS the recipe iff ALL THREE hold
+        1. mean held-out BPB(soft_mtp_seam) < mean BPB(hard_mtp_seam),
+        2. mean held-out BPB(soft_mtp_seam) <= mean BPB(ntp) + 2*control_spread,
+           where control_spread = max(ntp seeds) - min(ntp seeds),
+        3. mean draft acceptance over k=1..4 is HIGHER for soft_mtp_seam than
+           for hard_mtp_seam (the `--probe` measurement; without it VOID).
+
+Anything else is a DROP. Clause 2 is the "no worse than the control beyond
+twice its own seed noise" guard: a tie with `ntp` on BPB is not a reason to
+carry a head, and a 2x-spread deficit is a regression even if it edges out the
+hard arm. The mechanism is deleted if it cannot clear all three (AGENTS §1.2);
+it is not kept "to be safe".
 
 VOID (not a number) when an eval window is not 81 920 B, a NaN-skipped step
 occurred, `mtp=` is absent on a hard/soft run or present on `ntp`, or the
-acceptance probe did not run on the two MTP arms. A VOID arm is not a keep.
+acceptance probe did not run on the two seam arms. A VOID arm is not a keep.
 
 **What the driver does NOT do:** apply the verdict, tune λ/K per seed, or read
 the training `loss=` as a quality number (it carries `λ·MTP` by construction).
@@ -93,11 +103,12 @@ MTP_K = 4
 MTP_WEIGHT = 1.0
 WINDOW = EVAL_BATCHES * BATCH * SEQ
 
-#: `(arm, mtp_k, mtp_weight, mtp_soft)`.
+#: `(arm, mtp_k, mtp_weight, mtp_soft, mtp_head_norm)`.
 ARMS = (
-    ("ntp", 0, 0.0, False),
-    ("hard_mtp", MTP_K, MTP_WEIGHT, False),
-    ("soft_mtp", MTP_K, MTP_WEIGHT, True),
+    ("ntp", 0, 0.0, False, False),
+    ("hard_mtp", MTP_K, MTP_WEIGHT, False, False),
+    ("hard_mtp_seam", MTP_K, MTP_WEIGHT, False, True),
+    ("soft_mtp_seam", MTP_K, MTP_WEIGHT, True, True),
 )
 
 #: The v7 mix plan's train side; `data` is still passed because the eval half's
@@ -204,31 +215,36 @@ def check(runs: list[dict], window: int, *, mtp: bool) -> list[str]:
 def verdict(
     ntp: list[dict],
     hard: list[dict],
+    hard_seam: list[dict],
     soft: list[dict],
     window: int,
     *,
-    accept_hard: float | None,
+    accept_hard_seam: float | None,
     accept_soft: float | None,
 ) -> dict:
-    """The pre-registered three-clause rule in the module docstring."""
+    """The pre-registered three-clause soft rule, against the seam-on control."""
     why = (
         check(ntp, window, mtp=False)
         + check(hard, window, mtp=True)
+        + check(hard_seam, window, mtp=True)
         + check(soft, window, mtp=True)
     )
-    if accept_hard is None or accept_soft is None:
-        why.append("no acceptance probe on the two MTP arms — clause 3 cannot be read")
+    if accept_hard_seam is None or accept_soft is None:
+        why.append("no acceptance probe on the two seam arms — clause 3 cannot be read")
     nmean, nspread = summarize(ntp)
     hmean, _hspread = summarize(hard)
+    hsmean, _hsspread = summarize(hard_seam)
     smean, _sspread = summarize(soft)
     out = {
         "ntp_mean": nmean,
         "control_spread": nspread,
         "hard_mean": hmean,
+        "hard_seam_mean": hsmean,
         "soft_mean": smean,
         "soft_minus_hard": smean - hmean,
+        "soft_minus_hard_seam": smean - hsmean,
         "soft_minus_ntp": smean - nmean,
-        "accept_hard": accept_hard,
+        "accept_hard_seam": accept_hard_seam,
         "accept_soft": accept_soft,
         "reason": "",
     }
@@ -236,16 +252,40 @@ def verdict(
         out["verdict"] = "void"
         out["reason"] = "; ".join(why)
     elif (
-        smean < hmean
+        smean < hsmean
         and smean <= nmean + 2.0 * nspread
         and accept_soft is not None
-        and accept_hard is not None
-        and accept_soft > accept_hard
+        and accept_hard_seam is not None
+        and accept_soft > accept_hard_seam
     ):
         out["verdict"] = "keep"
     else:
         out["verdict"] = "drop"
     return out
+
+
+def seam_verdict(hard: list[dict], hard_seam: list[dict]) -> dict:
+    """The seam alone vs today's hard MTP: helps/hurts/tie by hard's own spread.
+
+    This decides whether the ARCHITECTURE change is adopted; the soft rule is
+    evaluated against the seam-on control, but a seam that hurts blocks it.
+    """
+    hmean, hspread = summarize(hard)
+    smean, _ = summarize(hard_seam)
+    delta = smean - hmean
+    if delta < -hspread:
+        verdict = "helps"
+    elif delta > hspread:
+        verdict = "hurts"
+    else:
+        verdict = "tie"
+    return {
+        "hard_mean": hmean,
+        "hard_spread": hspread,
+        "seam_mean": smean,
+        "delta": delta,
+        "verdict": verdict,
+    }
 
 
 # --- the train half ---------------------------------------------------------
@@ -256,6 +296,7 @@ def run_one(
     k: int,
     weight: float,
     soft: bool,
+    head_norm: bool,
     seed: int,
     out_dir: Path,
     device: str,
@@ -286,6 +327,8 @@ def run_one(
         f"mtp_weight={weight}",
         "--set",
         f"mtp_soft={'true' if soft else 'false'}",
+        "--set",
+        f"mtp_head_norm={'true' if head_norm else 'false'}",
         "--set",
         f"ckpt_name={name}",
         "--set",
@@ -332,7 +375,10 @@ def probe(ckpt_dir: Path, ckpt_name: str, device: str) -> dict:
     def keep(_m, _inp, out):
         xs.append(out.detach())
 
-    handles = [p.register_forward_hook(keep) for p in model.mtp.projs]
+    # Capture the tensor the shared head actually reads: the per-head seam's
+    # output when `mtp_head_norm` is on, the raw projection output otherwise.
+    modules = model.mtp.head_norms if model.mtp.head_norms is not None else model.mtp.projs
+    handles = [p.register_forward_hook(keep) for p in modules]
     _train, ev = open_streams(run, eval_only=True)
     assert ev is not None, "eval_data is set but open_streams returned no eval stream"
     ev.rewind()
@@ -379,17 +425,19 @@ def ab(args: argparse.Namespace) -> int:
     out_dir = Path(args.out_dir).expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
     print(
-        f"Soft-MTP A/B: 3 arms x {len(seeds)} seeds x {args.steps} steps, {PRESET} "
+        f"Soft-MTP A/B: 4 arms x {len(seeds)} seeds x {args.steps} steps, {PRESET} "
         f"b{BATCH} s{SEQ}, window {WINDOW} B, K={MTP_K}, λ={MTP_WEIGHT}. "
         f"Output: {out_dir}\n"
-        f"pre-registered: KEEP iff BPB(soft) < BPB(hard) AND BPB(soft) <= "
-        f"BPB(ntp) + 2*control_spread AND acceptance(soft) > acceptance(hard); "
-        f"otherwise DROP. A VOID arm is not a keep. The probe is "
+        f"pre-registered: KEEP soft_mtp_seam iff BPB(soft+seam) < BPB(hard+seam) "
+        f"AND BPB(soft+seam) <= BPB(ntp) + 2*control_spread AND "
+        f"acceptance(soft+seam) > acceptance(hard+seam); the seam alone is "
+        f"adopted iff BPB(hard+seam) < BPB(hard) by more than hard's own spread. "
+        f"Otherwise DROP. A VOID arm is not a keep. The probe is "
         f"{'ON' if args.probe else 'OFF (a keep is impossible without it)'}."
     )
-    for arm, k, weight, soft in ARMS:
+    for arm, k, weight, soft, head_norm in ARMS:
         for seed in seeds:
-            rc = run_one(arm, k, weight, soft, seed, out_dir, args.device, args.steps)
+            rc = run_one(arm, k, weight, soft, head_norm, seed, out_dir, args.device, args.steps)
             if rc != 0:
                 return rc
 
@@ -404,7 +452,7 @@ def ab(args: argparse.Namespace) -> int:
             )
     probes: dict[tuple[str, int], dict] = {}
     if args.probe:
-        for arm, k, _weight, _soft in ARMS:
+        for arm, k, _weight, _soft, _head_norm in ARMS:
             if k == 0:
                 continue
             for seed in seeds:
@@ -435,32 +483,45 @@ def ab(args: argparse.Namespace) -> int:
             gr = " ".join(f"{v:.3f}" for v in p["greedy"])
             print(f"{arm:>9s} {seed:>4d} {ce:>26s} {acc:>26s} {gr:>20s}")
 
-    accept_hard = accept_soft = None
+    accept_hard_seam = accept_soft_seam = accept_hard = None
     if args.probe:
         hard = [p["accept_mean"] for (arm, _s), p in probes.items() if arm == "hard_mtp"]
-        soft = [p["accept_mean"] for (arm, _s), p in probes.items() if arm == "soft_mtp"]
+        hard_seam = [p["accept_mean"] for (arm, _s), p in probes.items() if arm == "hard_mtp_seam"]
+        soft_seam = [p["accept_mean"] for (arm, _s), p in probes.items() if arm == "soft_mtp_seam"]
         accept_hard = statistics.mean(hard) if hard else None
-        accept_soft = statistics.mean(soft) if soft else None
+        accept_hard_seam = statistics.mean(hard_seam) if hard_seam else None
+        accept_soft_seam = statistics.mean(soft_seam) if soft_seam else None
 
+    seam = seam_verdict(table["hard_mtp"], table["hard_mtp_seam"])
+    print(
+        f"\nseam alone vs hard_mtp: {seam['verdict'].upper()} "
+        f"(hard {seam['hard_mean']:.4f} +- {seam['hard_spread']:.4f}, "
+        f"seam {seam['seam_mean']:.4f}, delta {seam['delta']:+.4f}; "
+        f"accept {accept_hard} -> {accept_hard_seam})"
+    )
     v = verdict(
         table["ntp"],
         table["hard_mtp"],
-        table["soft_mtp"],
+        table["hard_mtp_seam"],
+        table["soft_mtp_seam"],
         WINDOW,
-        accept_hard=accept_hard,
-        accept_soft=accept_soft,
+        accept_hard_seam=accept_hard_seam,
+        accept_soft=accept_soft_seam,
     )
     print(
-        f"\nsoft_mtp vs hard_mtp: {v['verdict'].upper()} "
+        f"\nsoft_mtp_seam vs hard_mtp_seam: {v['verdict'].upper()} "
         f"(ntp {v['ntp_mean']:.4f} +- {v['control_spread']:.4f}, "
-        f"hard {v['hard_mean']:.4f}, soft {v['soft_mean']:.4f}; "
-        f"soft-hard {v['soft_minus_hard']:+.4f}, soft-ntp {v['soft_minus_ntp']:+.4f}; "
-        f"accept {v['accept_hard']} -> {v['accept_soft']})"
+        f"hard+seam {v['hard_seam_mean']:.4f}, soft+seam {v['soft_mean']:.4f}; "
+        f"soft-hard+seam {v['soft_minus_hard_seam']:+.4f}, "
+        f"soft-ntp {v['soft_minus_ntp']:+.4f}; "
+        f"accept {v['accept_hard_seam']} -> {v['accept_soft']})"
         + (f"\nvoid reasons: {v['reason']}" if v["reason"] else "")
     )
     print(
-        "\nkeep rule: better than hard_mtp AND no worse than ntp by more than "
-        "2x the control spread AND a higher acceptance. Anything else drops it."
+        "\nkeep rule: soft+seam must beat hard+seam, stay within ntp + 2x the "
+        "control spread, and raise acceptance; the seam alone must beat hard_mtp "
+        "by more than hard's spread before the architecture change is adopted. "
+        "Anything else drops it."
     )
     return 0
 
@@ -468,7 +529,7 @@ def ab(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="mode", required=True)
-    a = sub.add_parser("ab", help="the A/B driver (3 arms x 3 seeds)")
+    a = sub.add_parser("ab", help="the A/B driver (4 arms x 3 seeds)")
     a.add_argument("--seeds", default=",".join(str(s) for s in SEEDS))
     a.add_argument("--steps", type=int, default=STEPS)
     a.add_argument("--device", default="cuda")

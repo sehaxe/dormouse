@@ -398,8 +398,25 @@ class DormouseModel(nn.Module):
                 f"IFF the weight is on (mtp.py). Escape: mtp_weight > 0 with "
                 f"mtp_k >= 1, or mtp_soft=false."
             )
+        if cfg.mtp_soft and not cfg.mtp_head_norm:
+            # The seam is what isolates each head's hidden; without it the
+            # identity is last-head-only (see `mtp.py`). This is the runtime
+            # seam for a config mutated after construction.
+            loud(
+                "mtp_soft=true with mtp_head_norm=false: the KL recovery identity "
+                "needs the reference's per-head final RMSNorm (each head reads "
+                "its OWN hidden). Without it the later heads' coupling flows back "
+                "through the sequential projection. Escape: mtp_head_norm=true, "
+                "or mtp_soft=false."
+            )
         self.mtp = (
-            MTPHead(cfg.d_model, cfg.mtp_k, eps=cfg.norm_eps, device=device)
+            MTPHead(
+                cfg.d_model,
+                cfg.mtp_k,
+                eps=cfg.norm_eps,
+                head_norm=cfg.mtp_head_norm,
+                device=device,
+            )
             if (cfg.mtp_weight > 0.0)
             else None
         )
