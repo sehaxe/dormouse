@@ -687,6 +687,19 @@ class ModelConfig:
     byteflow_logdet: bool = False
     #: Byte-sequence length the RoPE tables are built for.
     byteflow_max_bytes: int = 8192
+    #: Which codec turns the byte window into K patch latents. `"attention"` is
+    #: the ported ByteFlow net and the default — the bit-identical path every
+    #: number on record ran. `"conv"` is `model/convcodec.py`: strided-conv
+    #: patchify + low-rank unpatchify, no attention, ~1.9 % of the loop's MACs
+    #: per patch instead of the attention codec's >400 %. Refused for any other
+    #: name, and refused with `use_byteflow = false` (nothing would build it).
+    byteflow_codec: str = "attention"
+    #: Bytes per patch of the conv codec's strided patchify (`byteflow_codec =
+    #: "conv"` only; the default 8 is the training target, 4/8 are the bench's
+    #: arms). The runtime window must be divisible by it and K must be <= the
+    #: patch count. REFUSED at a non-default value under the attention codec:
+    #: the field would be inert.
+    byteflow_patch_bytes: int = 8
 
     # --- MoE ------------------------------------------------------------
     n_experts: int = 3
@@ -2565,6 +2578,21 @@ def validate(model: ModelConfig) -> None:
             "where the write is local: u_0 = 0, u_1 = y), or fused_residual=false "
             "(the ReZero write is three elementwise ops and needs no kernel)."
         )
+    # The codec selector is checked even when `use_byteflow = false`: an
+    # unknown name must not fall back to attention, and `conv` with nothing to
+    # build it is the config-field-that-lies defect (ADR-0019).
+    if model.byteflow_codec not in ("attention", "conv"):
+        loud(
+            f"byteflow_codec={model.byteflow_codec!r} is not a codec. Known: "
+            f"'attention' (the ported ByteFlow net, the default) and 'conv' "
+            f"(`model/convcodec.py`). Escape: name one of those."
+        )
+    if model.byteflow_codec == "conv" and not model.use_byteflow:
+        loud(
+            "byteflow_codec='conv' with use_byteflow=false: the codec is only built "
+            "by the byteflow shapes, so the field would name a codec that never runs. "
+            "Escape: use_byteflow=true, or byteflow_codec='attention'."
+        )
     if model.use_byteflow:
         if model.loop_blocks > 1:
             loud(
@@ -2899,6 +2927,46 @@ def _validate_byteflow(model: ModelConfig) -> None:
         loud("byteflow_eps2 must be > 0 (it divides d inside the logdet)")
     if model.byteflow_bins < 1:
         loud("byteflow_bins must be >= 1")
+    if model.byteflow_codec == "conv":
+        s = model.byteflow_patch_bytes
+        if s < 1:
+            loud(
+                f"byteflow_patch_bytes={s} with byteflow_codec='conv': it is a count "
+                f"of bytes per patch, so it must be >= 1. Escape: 8 (the default), or "
+                f"a positive divisor of the training window."
+            )
+        if model.byteflow_max_bytes % s:
+            loud(
+                f"byteflow_max_bytes={model.byteflow_max_bytes} is not a multiple of "
+                f"byteflow_patch_bytes={s}: the conv patchify covers "
+                f"floor(max_bytes/s) patches and the remainder would be silently "
+                f"dropped. Escape: a patch_bytes that divides the window, or lower "
+                f"byteflow_max_bytes."
+            )
+        if model.byteflow_k_tokens > model.byteflow_max_bytes // s:
+            loud(
+                f"byteflow_k_tokens={model.byteflow_k_tokens} > the conv codec's patch "
+                f"count {model.byteflow_max_bytes // s} "
+                f"(byteflow_max_bytes={model.byteflow_max_bytes} / "
+                f"byteflow_patch_bytes={s}): one latent per selected patch, so K above "
+                f"the patch count has nothing to select. Escape: lower K / "
+                f"byteflow_patch_bytes, or raise the window."
+            )
+        if model.byteflow_logdet:
+            loud(
+                "byteflow_logdet=true with byteflow_codec='conv': the exact log-det "
+                "rate scores the ATTENTION codec's byte positions; the conv codec "
+                "selects patches with the L2 streaming gains, so the flag would be "
+                "inert while the config reported the exact route. Escape: "
+                "byteflow_logdet=false, or byteflow_codec='attention'."
+            )
+    elif model.byteflow_patch_bytes != 8:
+        loud(
+            f"byteflow_patch_bytes={model.byteflow_patch_bytes} with "
+            f"byteflow_codec='attention': the field configures the conv codec's "
+            f"patchify, and the attention net has no patch stride, so the value would "
+            f"be inert. Escape: byteflow_codec='conv', or leave it at 8."
+        )
     for d, h, side in (
         (model.byteflow_d_local, model.byteflow_heads_local, "local"),
         (model.byteflow_d_global, model.byteflow_heads_global, "global"),

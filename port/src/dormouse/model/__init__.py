@@ -18,6 +18,7 @@ from .byteflow import (
     marginal_gains_l2,
     select_positions,
 )
+from .convcodec import ConvCodec, codec_kind
 from .engram import Engram, fnv, raw_keys, table_slots
 from .experts import DualLatentGLU, SparseMoE
 from .kda import KDAAttention, fla_status
@@ -31,6 +32,7 @@ __all__ = [
     "ByteFlowConfig",
     "ByteFlowNet",
     "CanonLayer",
+    "ConvCodec",
     "DenseLinear",
     "DormouseModel",
     "DualLatentGLU",
@@ -44,6 +46,7 @@ __all__ = [
     "bf_for_model",
     "byteflow_config",
     "coding_rate_exact",
+    "codec_kind",
     "compat_armed",
     "effective_bins",
     "fla_status",

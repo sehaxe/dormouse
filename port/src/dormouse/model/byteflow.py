@@ -840,8 +840,22 @@ class BfChannel(nn.Module):
 
     def __init__(self, cfg: ModelConfig, *, device: torch.device | str = "cpu") -> None:
         super().__init__()
+        # Lazy: `convcodec.py` imports this module's `_MixedLinear` and chunker,
+        # so a top-level import here would be a cycle. The call draws no RNG,
+        # so the attention default stays bit-identical.
+        from .convcodec import ConvCodec, codec_kind
+
         bfc = byteflow_config(cfg)
-        self.net = ByteFlowNet(dataclasses.replace(bfc, g_layers=0), device=device)
+        if codec_kind(cfg) == "conv":
+            self.net = ConvCodec(
+                bfc.d_global,
+                patch_bytes=cfg.byteflow_patch_bytes,
+                dtype=bfc.dtype,
+                k_tokens=bfc.k_tokens,
+                device=device,
+            )
+        else:
+            self.net = ByteFlowNet(dataclasses.replace(bfc, g_layers=0), device=device)
         # The two pairing Linears are on the SAME compute-dtype rule as the net:
         # bf16 GEMM, fp32 out (the loop's state and the residual are fp32).
         self.in_proj = _MixedLinear(
