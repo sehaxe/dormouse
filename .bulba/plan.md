@@ -519,6 +519,56 @@ testable and A/B-able (ADR-0017).
       pre-registered verdict (a divergence voids the arm; a win must beat the
       control's 3-seed spread), `plan`/`profile`/`run`. Written, **NOT run**
       (GPU busy with the flagship): no timing, no BPB, no verdict exists.
+- [x] P-MTP-SOFT. port (Python): Soft-MTP (arXiv:2610.38331), behind
+      `ModelConfig.mtp_soft` beside `mtp_weight`; OFF is bit-identical (pins
+      from clean `main` `21a97d2`, captured before the edit: tiny state sha256
+      `e26c6a07…`/`894fe40f…`, logits `c7839283…`, losses 6.119609355926514 /
+      8.997851371765137, MTP-proj + embed grad sha256). `MTPHead.forward_soft`
+      adds `ntp_hidden[:, k:] += s_k·(x_k.detach() - x_k)` and returns the
+      coupled hidden; `model.py` computes the NTP CE on it through the existing
+      CE path and keeps the returned logits/aux on the original. `s_k` =
+      `weight·N_ntp/(n_heads·N_k·ntp_loss_scale)` with this repo's
+      `ntp_loss_scale = 1/(T+1)` (the reference's `kl_recovery_scale` has no
+      depth divisor). fp64 decisive gate: last-head gradient == explicit
+      KL(p_ntp‖p_mtp) at `7.5e-16…1.1e-15` relative for K=1,2,3, full vocab,
+      dense head; **FINDING**: this module has no per-head final norm, so
+      `x_j` also feeds module `j+1` and the later heads' coupling routes back
+      through the sequential projection — the identity is exact only at the
+      last head (and K=1); earlier heads carry that cross term, quantified and
+      named in the test. The shared-`lm_head` premise HOLDS (dense/TSCT/tied
+      are all linear; the tiny default is TSCT). Refused with
+      `mtp_weight==0` and `logit_softcap>0` (the verifier would be capped while
+      the MTP head reads the head uncapped). Device counter `mtp_soft`, no
+      host sync in the module (`.item/.tolist/.__bool__` gate). Gates
+      `tests/test_mtp_soft.py` (12); driver `scripts/ab_mtp_soft.py`
+      (`ntp`/`hard_mtp`/`soft_mtp`, 3 seeds x 600, b8 s512, mix_v7, probe for
+      per-head CE/acceptance; keep rule pre-registered) written and **NOT run**
+      (card busy). The FINDING is fixed by P-MTP-SEAM below.
+- [x] P-MTP-SEAM. port (Python): the reference's per-head final RMSNorm, and
+      `mtp_soft` now REQUIRES it. `ModelConfig.mtp_head_norm` (beside
+      `mtp_weight`, default false) adds `MTPHead.head_norms[j]`, a per-head
+      RMSNorm WITH a gain (matching the reference's `blocks.RMSNorm`; `K·d`
+      parameters — tiny d=64/K=2: +128; medium d=1024/K=4: +4 096). The head's
+      CE and its coupling read ONLY the normalized `z_j`; the next module still
+      consumes the RAW `x_j`, so `z_j` is an independent tensor. `mtp_soft=true`
+      with `mtp_head_norm=false` is LOUD in `__post_init__`, `validate` and the
+      model constructor, with an Escape naming both flags. fp64 every-head
+      gate: relative `4.985e-16…8.933e-16` for K=1,2,3 (asserted <=1e-10);
+      WITHOUT the seam the same gate is 8.87e-1 / 1.08e+0 / 1.12e-15 (last head
+      only), pinned in `test_without_the_seam_the_nonfinal_head_carries_the_chain_term`.
+      OFF: `mtp_weight=0` builds NO module even with `mtp_head_norm=true`
+      (state/logits/loss/embed-grad pins from `21a97d2` unchanged, gate a2);
+      `mtp_head_norm=false, mtp_soft=false` reproduces the SAME pins, re-measured
+      on the previous commit `10c3831`. Seam delta: `param_count(seam) -
+      param_count(base) = K·d`, every base parameter bit-identical, NTP logits
+      bit-identical, only `mtp.head_norms.*.weight` new (gate a3). Reverts
+      18/18 turned their named gate red. Driver extended to 4 arms
+      (`ntp` / `hard_mtp` / `hard_mtp_seam` / `soft_mtp_seam`), 3 seeds x 600,
+      b8 s512, mix_v7 + eval_mix; the seam-alone verdict is printed and the
+      soft keep rule is re-stated against hard+seam; written, **NOT run**
+      (card busy). Suite diff vs clean `21a97d2`: the same single pre-existing
+      `test_sft_v2::test_the_manifest_accounts_for_every_row` failure; ruff
+      clean.
 
 
 ## Critical Files
