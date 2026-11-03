@@ -13,9 +13,15 @@ while the loop scales with latents.
 (h, z, sel)`, `decode_chunks(g, h, sel) -> [b, t, 256]`, `forward(bytes) ->
 [b, t, 256]` — with NO attention:
 
-* **patchify** — one strided `nn.Conv1d(width → width, kernel = stride =
-  `patch_bytes`) over the byte embedding, then `layers` residual `Conv1d(3)` +
-  GELU blocks over the patch axis;
+* **patchify** — a CAUSAL depthwise `Conv1d(3)` stack (`layers` layers,
+  left-padded, stride 1) over the byte embedding, so every byte position's
+  state carries its left context; then one strided `nn.Conv1d(width → width,
+  kernel = stride = `patch_bytes`)` over the PREVIOUS patch's window (left
+  `patch_bytes` zeros), then `layers` residual CAUSAL `Conv1d(3)` + GELU
+  blocks over the patch axis. Patch `i`'s feature is therefore a function of
+  bytes `<= is - 1` only, and the next-byte logits at positions
+  `[is, is + s)` can see `[.., is - 1]` and nothing from their own patch.
+  See "Causality" below for why the byte stack is depthwise;
 * **chunking** — the SAME `marginal_gains_l2` + `select_positions` bookkeeping
   as the attention codec, applied to the patch features. `sel` is still
   ASCENDING BYTE POSITIONS (patch starts), position 0 always selected, and
@@ -45,17 +51,42 @@ Attention codec, d=1024, f=2730, E=3, w=512, per BYTE and per direction:
 |---|---|---|---|
 | attention | 4 | 109.1 M | 453 % |
 | attention | 8 | 218.2 M | 905 % |
-| conv (this one, C=64, r=64, d_global=1024) | 4 | 306 176 | 1.27 % |
-| conv (this one, C=64, r=64, d_global=1024) | 8 | 456 704 | 1.90 % |
+| conv (this one, C=64, r=64, d_global=1024) | 4 | 307 712 | 1.28 % |
+| conv (this one, C=64, r=64, d_global=1024) | 8 | 459 776 | 1.91 % |
 
-The conv line is `C·C·s + L·C·C·3 + C·d_global + d_global·r + r·s·256 +
-s·C·256 + s·256·3` with C=64, L=2, r=64: patchify 32 768 + residual convs
-24 576 + proj 65 536 + low-rank 196 608 + skip 131 072 + smooth 6 144. The
-attention fraction is arithmetic, not wall time: the loop is launch-bound on
-this box (AGENTS §3.1), which is why 4.5x the loop's MACs measured as 31 % of
-its wall time. Cutting the arithmetic to 1.9 % is what makes the codec cheap
-in both currencies; `scripts/bench_bf_dtype.py`'s codec arms are the wall-time
-check on a GPU.
+The conv line is `C·C·s + L·3·C·s + L·C·C·3 + C·d_global + d_global·r +
+r·s·256 + s·C·256 + s·256·3` with C=64, L=2, r=64: previous-patch conv 32 768
++ causal byte stack 3 072 + residual patch convs 24 576 + proj 65 536 +
+low-rank 196 608 + skip 131 072 + smooth 6 144. The attention fraction is
+arithmetic, not wall time: the loop is launch-bound on this box (AGENTS §3.1),
+which is why 4.5x the loop's MACs measured as 31 % of its wall time. Cutting
+the arithmetic to 1.9 % is what makes the codec cheap in both currencies;
+`scripts/bench_bf_dtype.py`'s codec arms are the wall-time check on a GPU.
+
+# Causality
+
+The first draft patchified the window with a strided conv that read the patch's
+OWN bytes, so a latent contained the very bytes it then predicted: measured on
+the 5070 Ti (314 M, b8 s1024, patch_bytes=4, K=256=P), eval BPB fell to 0.4992
+by step 400 while train loss sat at 0.7851 — a shortcut, not learning. The
+same held for the patch-axis residual convs (`padding=1` on both sides is a
+future tap). Both are now one-sided.
+
+The byte stack is DEPTHWISE, not dense: a dense `C·C·3` stack costs 12 288
+MAC/byte, i.e. 98 304/patch at 8 bytes and 2.7 % of the loop on its own, so
+the 2 % ceiling would have to be abandoned. Depthwise costs 384 MAC/byte and
+gives the same kernel-3 left-context receptive field (5 bytes after two
+layers); the channel mixing it omits is supplied by the strided patch conv,
+which now reads the PREVIOUS patch's window (same 32 768 MAC as before). That
+choice — shift the patch conv and keep the full s-byte window, rather than
+gather one boundary position — preserves a position-sensitive `s·C → C` map
+for zero extra MACs and widens the look-back to `s + 4` bytes. `self.convs`
+over the patch axis is left-padded for the same reason.
+
+The invariant a causal codec must satisfy (and the one that would have caught
+this) is `bytes[:, q:]` must not move `logits[:, :q]` for any `q`;
+`tests/test_codec_causality.py` runs it at every patch boundary and inside a
+patch, fp32 and bf16, for both codecs.
 
 Constants were tuned DOWN from the first draft (C=128, r=256, 4.8 %/patch):
 `test_convcodec.py` pins `num_params()` and `mac_per_patch()` under ceilings so
@@ -152,7 +183,8 @@ class ConvCodec(nn.Module):
         if not 1 <= layers <= 2:
             loud(
                 f"conv codec: layers={layers}; the design is 1-2 residual conv layers. "
-                f"Escape: 1 or 2 (each extra kernel-3 layer is C²·3 MAC/patch)."
+                f"Escape: 1 or 2 (each extra layer adds C²·3 MAC/patch on the patch "
+                f"axis and 3·C·s MAC/patch on the byte axis)."
             )
         self.d_global = d_global
         self.patch_bytes = patch_bytes
@@ -161,6 +193,14 @@ class ConvCodec(nn.Module):
         self.dtype = dtype
         self.k_tokens = k_tokens
         self.embedding = nn.Embedding(VOCAB, width, device=device)
+        #: Causal left-context stack over BYTES (stride 1, depthwise: C·3
+        #: MAC/byte, not the C·C·3 a dense kernel would cost).
+        self.causal = nn.ModuleList(
+            [
+                nn.Conv1d(width, width, kernel_size=3, groups=width, device=device)
+                for _ in range(layers)
+            ]
+        )
         self.patchify = nn.Conv1d(
             width, width, kernel_size=patch_bytes, stride=patch_bytes, device=device
         )
@@ -201,11 +241,21 @@ class ConvCodec(nn.Module):
         return y.to(torch.float32)
 
     def _patches(self, h: torch.Tensor) -> torch.Tensor:
-        """`[b, t, width]` bytes → `[b, p, width]` patch features (no attention)."""
+        """`[b, t, width]` bytes → `[b, p, width]` patch features, CAUSALLY.
+
+        Patch `i` reads the previous patch's byte window, never its own: the
+        byte stack's left padding plus the ``patch_bytes``-zero shift is what
+        makes `bytes[:, is:]` invisible to feature `i`.
+        """
         x = h.transpose(1, 2)
-        p = F.gelu(self._conv(self.patchify, x, stride=self.patch_bytes))
+        for conv in self.causal:
+            x = x + F.gelu(self._conv(conv, F.pad(x, (2, 0)), groups=conv.groups))
+        # Shift right by one patch: patch i's conv window covers bytes
+        # [(i-1)s, is-1]; patch 0's window is the left pad.
+        prev = F.pad(x, (self.patch_bytes, 0))
+        p = F.gelu(self._conv(self.patchify, prev, stride=self.patch_bytes))
         for conv in self.convs:
-            p = p + F.gelu(self._conv(conv, p, padding=1))
+            p = p + F.gelu(self._conv(conv, F.pad(p, (2, 0))))
         return p.transpose(1, 2)
 
     # -- the contract -------------------------------------------------------
@@ -288,8 +338,9 @@ class ConvCodec(nn.Module):
         """
         s, c, dg, r = self.patch_bytes, self.width, self.d_global, self.rank
         return (
-            c * c * s  # patchify
-            + len(self.convs) * c * c * 3  # residual convs
+            c * c * s  # previous-patch strided conv
+            + len(self.causal) * 3 * c * s  # causal depthwise byte stack
+            + len(self.convs) * c * c * 3  # residual patch convs
             + c * dg  # patch → global
             + dg * r  # low-rank up
             + r * s * VOCAB  # low-rank down

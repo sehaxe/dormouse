@@ -271,6 +271,6 @@ def test_conv_stays_under_the_cost_ceilings():
             f"{bpp}B/patch: {cc.num_params()} params > ceiling {CODEC_PARAM_CEILING}"
         )
         # The documented estimates, so a change to either constant is visible.
-        want = 456_704 if bpp == 8 else 306_176
+        want = 459_776 if bpp == 8 else 307_712
         assert cc.mac_per_patch() == want
         assert 1.0 <= 100.0 * cc.mac_per_patch() / 24_100_000 <= 2.0
