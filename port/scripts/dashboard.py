@@ -271,6 +271,7 @@ def snapshot() -> dict:
             "nan": last.get("nan_skipped", 0),
         },
         "stair": _stair(evals, run_cfg),
+        "agent": _agent_eval(),
         "history": [
             {"step": e["step"], "bpb": e.get("bpb"), "loss": e.get("loss")}
             for e in evals[-120:]
@@ -491,6 +492,21 @@ def frag_panels(s: dict) -> str:
     else:
         ck_html = '<div class="void">[–] no checkpoint yet</div>'
 
+    ag = s.get("agent") or {}
+    if ag:
+        def pct(v):
+            return f"{100 * v:.0f}%" if isinstance(v, (int, float)) else "—"
+
+        ag_html = f"""<div class="kv">
+  <div class="k">format (valid call)</div><div class="v">{pct(ag.get('format'))}</div>
+  <div class="k">prose, no call</div><div class="v">{ag.get('no_call', '—')}/{ag.get('prompts', '—')}</div>
+  <div class="k">executable</div><div class="v">{pct(ag.get('exec'))}</div>
+  <div class="k">task success</div><div class="v">{ag.get('passed')}/{ag.get('tasks')}</div>
+  <div class="k">sandbox refusals</div><div class="v">{ag.get('audit', '—')}</div>
+</div><div class="void" style="margin-top:10px">{html.escape(str(ag.get('run')))} · {html.escape(str(ag.get('state')))}</div>"""
+    else:
+        ag_html = '<div class="void">[–] no agent eval yet</div>'
+
     if s["sft"]:
         sf = s["sft"]
         mix = " · ".join(
@@ -519,6 +535,7 @@ def frag_panels(s: dict) -> str:
   <div class="panel"><h3>gpu</h3>{gpu_html}</div>
   <div class="panel"><h3>checkpoints</h3>{ck_html}</div>
   <div class="panel"><h3>sft corpus v2</h3>{sft_html}</div>
+  <div class="panel"><h3>capability · agent eval</h3>{ag_html}</div>
   <div class="panel"><h3>eval history</h3>
     <div id="evals" sse-swap="evals">{frag_evals(s)}</div></div>
   <div class="panel"><h3>recent commits</h3><ul class="rows">{commits}</ul></div>
@@ -662,6 +679,33 @@ def _stair(evals: list[dict], run_cfg: dict) -> dict:
             "cur": [[round(st * bps / 1e9, 3), round(b, 4)] for st, b in
                     ((e["step"], e["bpb"]) for e in evals)],
             "ref": [[round(st * ref_bps / 1e9, 3), round(b, 4)] for st, b in ref],
+        }
+    except Exception:
+        return {}
+
+
+
+def _agent_eval() -> dict:
+    """The newest `logs/agent_eval_*.json`: the capability numbers, not BPB.
+
+    Absent file -> {} and the panel says so. These four are reported apart on
+    purpose (a blended score hides which one is broken).
+    """
+    try:
+        files = sorted(LOGS.glob("agent_eval_*.json"), key=lambda f: f.stat().st_mtime)
+        if not files:
+            return {}
+        d = json.loads(files[-1].read_text(encoding="utf-8"))
+        return {
+            "run": files[-1].stem.replace("agent_eval_", ""),
+            "state": d.get("state"),
+            "format": (d.get("format") or {}).get("rate"),
+            "prompts": (d.get("format") or {}).get("prompts"),
+            "no_call": (d.get("format") or {}).get("no_call"),
+            "exec": (d.get("execution") or {}).get("rate"),
+            "passed": sum(v.get("passed", 0) for v in (d.get("task_success") or {}).values()),
+            "tasks": sum(v.get("tasks", 0) for v in (d.get("task_success") or {}).values()),
+            "audit": (d.get("escape_audit") or {}).get("attempts"),
         }
     except Exception:
         return {}
