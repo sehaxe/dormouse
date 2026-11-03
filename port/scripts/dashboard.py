@@ -270,6 +270,7 @@ def snapshot() -> dict:
             "eta": eta,
             "nan": last.get("nan_skipped", 0),
         },
+        "stair": _stair(evals, run_cfg),
         "history": [
             {"step": e["step"], "bpb": e.get("bpb"), "loss": e.get("loss")}
             for e in evals[-120:]
@@ -399,6 +400,26 @@ def frag_chart(s: dict) -> str:
     dots = "".join(
         f'<circle class="pt" cx="{sx(x):.1f}" cy="{sy(y):.1f}" r="2.4"/>' for x, y in zip(xs, ys, strict=True)
     )
+    # the 105M reference on the same token axis (GB), when it exists
+    st = s.get("stair") or {}
+    ref_pts = ""
+    if st.get("ref") and st.get("cur"):
+        allx = [p[0] for p in st["ref"] + st["cur"]]
+        x0, x1 = min(allx), max(allx)
+        ry = [p[1] for p in st["ref"]]
+        ys_all = ys + ry
+        y0, y1 = min(ys_all), max(ys_all)
+        pad = max(0.004, (y1 - y0) * 0.18)
+        y0, y1 = y0 - pad, y1 + pad
+
+        def sx2(x: float) -> float:
+            return PADL + (x - x0) / max(1e-9, (x1 - x0)) * (W - PADL - 8)
+
+        def sy2(y: float) -> float:
+            return PADT + (1 - (y - y0) / max(1e-9, (y1 - y0))) * (H - PADT - PADB)
+
+        ref_pts = " ".join(f"{sx2(x):.1f},{sy2(y):.1f}" for x, y in st["ref"])
+
     last = h[-1]
     return f"""<div class="chart">
 <svg viewBox="0 0 {W} {H}" preserveAspectRatio="none" role="img"
@@ -406,6 +427,7 @@ def frag_chart(s: dict) -> str:
   <g class="grid">{''.join(grid)}</g>
   <polygon class="area" points="{area}"/>
   <polyline class="line" points="{pts}"/>
+  {f'<polyline class="line ref" points="{ref_pts}"/>' if ref_pts else ""}
   {dots}
   <circle class="pt last" cx="{sx(last['step']):.1f}" cy="{sy(last['bpb']):.1f}" r="3.6"/>
   <text class="lbl" x="{min(W - 12, sx(last['step']) + 9):.1f}"
@@ -616,6 +638,33 @@ def _params(n) -> str:
     (that is the bug this whole block exists to kill).
     """
     return f"{int(n):,} params" if n else "params n/a"
+
+
+
+def _stair(evals: list[dict], run_cfg: dict) -> dict:
+    """The active run against the 105M flagship, on TOKENS SEEN, not steps.
+
+    The whole "why 200M" question is a token-vs-capacity trade, and comparing
+    curves by step answers it wrongly (a bigger model is behind at equal steps
+    by construction). Missing reference -> {} and the panel hides itself.
+    """
+    try:
+        bps = (
+            int(run_cfg.get("batch", 8)) * int(run_cfg.get("seq_len", 1024))
+            * int(run_cfg.get("grad_accum", 1))
+        )
+        ref_rows = _jsonl(LOGS / "flagship_resume.jsonl") + _jsonl(LOGS / "flagship.jsonl")
+        ref = sorted({(r["step"], r["bpb"]) for r in ref_rows if r.get("event") == "eval"})
+        ref_bps = 8 * 1024 * 3
+        return {
+            "name": RUN,
+            "ref_name": "flagship 105M",
+            "cur": [[round(st * bps / 1e9, 3), round(b, 4)] for st, b in
+                    ((e["step"], e["bpb"]) for e in evals)],
+            "ref": [[round(st * ref_bps / 1e9, 3), round(b, 4)] for st, b in ref],
+        }
+    except Exception:
+        return {}
 
 
 def _run_config() -> dict:
