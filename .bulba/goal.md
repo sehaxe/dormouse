@@ -1,37 +1,43 @@
-# MODE: AWAY
+# MODE: AUTONOMOUS (owner granted full autonomy, 2026-11-03)
 
-Owner asleep (2026-10-28 night). Full autonomy until he returns.
+## Правило работы
 
-## State (2026-10-29 night, updated)
+Не останавливаться. Каждый цикл: один замер → вердикт по заранее записанному правилу →
+запись вердикта в docs/reviews → следующий замер. Раз в цикл — полная сюита и ruff.
+Ничего не пушить, ничего деструктивного с git, карта — один GPU-процесс.
 
-**Flagship is RUNNING and healthy** — do not restart it.
+## Железо
 
 ```
-step 55 300 / 320 000  (17%)   loss 1.1551   26 799 B/s   1.36 GB of 7.86   0 nan_skipped
-eval: 50k 1.8062 · 52k 1.7849 · 54k 1.7800      ETA ~67 h
-checkpoints: dormouse/checkpoints/flagship/flagship.pt (979 MB, every 25k)
-recipe: medium 102.7M · CSA fine+coarse · mHC · AttnRes · share_u · LayerRoPE(paper)
-        latent 256 · E=256 rank 64 · iters 3 · b8 s1024 accum 3 · lr 5e-4 · mix_v7 · 8k
-log: ~/logs/flagship.log · ~/logs/flagship.jsonl · dashboard http://127.0.0.1:3789 (tailnet)
+GPU: RTX 5070 Ti 16 GB (sm_120, x8 gen3), 1350 W БП, Xeon 2690 v4, 62 GB RAM
+5060 Ti: физически не встаёт (слоты x8 закрытые, 5070 Ti занимает 3 позиции)
+         нужен райзер x8→x16 (~50 BYN) для второго лейна; DDP через gen3 x8
+         бесполезен: all-reduce 314M = 0.19 с против шага 0.40 с
 ```
 
-Reference: mix1 finished at BPB 1.883 after 4.18 GB; we are at **1.7800 after 1.36 GB**.
+## Текущая очередь (в порядке ценности)
 
-## Next run (flagship2, NOT started — needs the card)
-- `lr=1e-3` (measured best on the full recipe: 3.2373 ± 0.081 vs 3.3938 ± 0.026 at 5e-4,
-  3 seeds, same battery). Everything else identical, so the two runs form a clean at-scale A/B.
-- Missing measurement before trusting it: there is **no 5e-4 arm in the same ladder** — the
-  comparison comes from the earlier layerrope2 battery (b8 s512). Re-run both LR at the
-  flagship's exact shape (b8 s1024 × accum 3) with 2 seeds when the card is free.
+1. **LR-проба 314M** — идёт, 3 плеча × 2 сида × 800 шагов
+2. **ByteFlow A/B на 314M** (конв-кодек, 4 и 8 байт/патч) — самый большой рычаг:
+   −0.3725 BPB замерено, конв-кодек 5.4% шага вместо 34.8%
+   ВАЖНО: mHC несовместим с byteflow (громкий отказ) → обе плеча без mHC
+3. **Полный 314M прогон** (6.3 ГБ, ~3.6 суток) с победившим рецептом
+4. **ZeRO-1/2** для 1B (CPU-работа, worktree, гейты на 2 рангах)
+5. Дальше: агентный eval-харнесс, data mix8, docs
 
-## Open items (owner decisions)
-1. **Cleanup**: 65 worktrees, 127 GB; 55 of them dirty (uncommitted agent leftovers).
-   Deleting them loses work — needs an explicit OK. Only 4 were clean+merged (removed).
-2. **Formatting**: 55 files would be reformatted by `ruff format` (pre-existing debt). Safe but
-   a big diff that would collide with those dirty worktrees.
-3. **GPU purchase**: cart holds 2 × MSI RTX3090 AERO 24G @ $616.91 = $1 233.82 (Superbuy).
-   Verified: single-SKU lot (no variant trap), price = Chinese domestic teardown tier.
-   Not verified: seller DSR (none shown), photos, mining history. Recommendation: buy ONE with
-   detailed inspection + FurMark video, then the second. Alibaba/BY delivery works (checked).
-   Migration work needed for sm_86: `moe_kernels.py` has sm_120's 101 376 B smem ceiling
-   hardcoded; tile table must be re-measured on Ampere.
+## Зафиксированные вердикты (не пересматривать)
+
+- soft-MTP: **DROP** (3.6129 против 3.5884 у hard+seam, против 3.5829 у контроля)
+- seam сам по себе: TIE
+- конв-кодек: **KEEP** (доля 34.8% → 5.4%, шаг 47.6 → 32.6 мс)
+- ByteFlow: **WIN** (−0.3725 BPB, 18× разброса), но +31% времени с attention-кодеком
+- 105M флагман: **1.7292** финал, стена ёмкости (decay за 41k шагов дал 0.0008)
+- DDP на PCIe 3.0 x8: **не рычаг** (обмен съедает 25-48% шага)
+- карта 5070 Ti: ×1.71 бенч / ~×2.0 реальный прогон, ноль миграции
+
+## Открытые вопросы
+
+1. LR для 314M (проба идёт)
+2. Даёт ли ByteFlow выигрыш на 314M так же, как на 105M
+3. Влезет ли byteflow 8 байт/патч в 16 ГБ на 314M (K=128 латентов)
+4. Нужен ли райзер (решение владельца)
