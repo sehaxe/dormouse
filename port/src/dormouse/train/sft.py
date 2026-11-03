@@ -336,8 +336,16 @@ def _read_chat_file(path: Path) -> list[tuple[str, str]]:
                     f"sft --chat-data {path}:{lineno}: not valid JSON ({exc.msg}). "
                     f'Escape: one {{"instruction", "response"}} object per line.'
                 )
+            # `prompt` is what our own builder writes (`scripts/build_sft_v2.py`),
+            # `instruction` is the distill exports' pair. Reading only one of them
+            # silently emptied a corpus built by the other: 11 499 rows dropped as
+            # "dirty" on 2026-11-04. Both keys now resolve, `prompt` first because
+            # it is our own format.
             pairs.append(
-                (str(row.get("instruction", "")).strip(), str(row.get("response", "")).strip())
+                (
+                    str(row.get("prompt", row.get("instruction", ""))).strip(),
+                    str(row.get("response", row.get("output", ""))).strip(),
+                )
             )
         return pairs
     pairs = []

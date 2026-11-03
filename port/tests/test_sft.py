@@ -685,6 +685,33 @@ def test_chat_jsonl_rows_are_filtered_capped_and_deterministic(tmp_path):
         )
 
 
+def test_chat_jsonl_accepts_our_own_prompt_response_pair(tmp_path):
+    """`build_sft_v2.py` writes `prompt`/`response`; the reader only knew
+    `instruction`. Reading one format as the other dropped 11 499 of 11 499 rows
+    as "dirty" on 2026-11-04 — an empty SFT corpus that looked like a filter."""
+    import json
+
+    rows = [
+        {"prompt": "Hi there", "response": "Hello!"},
+        {"instruction": "How are you?", "response": "Fine, thanks."},
+        {"prompt": "Privet", "instruction": "ignored when prompt exists", "response": "Privet!"},
+        {"response": "an answer with no prompt"},
+    ]
+    src = tmp_path / "both.jsonl"
+    src.write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+
+    r = build_sft_corpus(tmp_path / "c.bin", 3, seq_len=64, n_tasks=0, chat_data=src)
+    # three carry a prompt; the fourth has none and is dropped as dirty
+    assert r["chat_loaded"] == 3, r
+    assert r["chat_dropped_dirty"] == 1, r
+
+    # the prompt key WINS over instruction when both are present
+    from dormouse.train.sft import _read_chat_file
+
+    pairs = _read_chat_file(src)
+    assert pairs[2] == ("Privet", "Privet!")
+
+
 def test_qa_text_format_parses_and_refuses_malformed_lines(tmp_path):
     """The hand-editable Q/A format: `#` comments and blank lines are free,
     pairs are positional, and every malformed line is a LOUD error naming
