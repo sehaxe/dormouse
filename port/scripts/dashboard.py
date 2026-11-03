@@ -36,10 +36,34 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]          # port/
 REPO = ROOT.parent                                   # dormouse/
 LOGS = Path(os.environ.get("DASH_LOGS", Path.home() / "logs"))
-JSONL = LOGS / "flagship.jsonl"
-TRAIN_LOG = LOGS / "flagship.log"
-STATUS_LOG = LOGS / "flagship_status.log"
-CKPT = REPO / "checkpoints" / "flagship"
+
+
+def _active_run() -> str:
+    """The run to show: `DASH_RUN`, else the newest `<name>.jsonl` that has rows.
+
+    Hard-coding `flagship` meant the board went stale the moment the next stair
+    started (2026-11-04: the 200M run was live and the board still read 1.72).
+    Ties break on mtime, so a resumed run wins over its predecessor's file.
+    """
+    explicit = os.environ.get("DASH_RUN")
+    if explicit:
+        return explicit
+    best, best_mtime = "flagship", -1.0
+    for f in LOGS.glob("*.jsonl"):
+        try:
+            m = f.stat().st_mtime
+        except OSError:
+            continue
+        if m > best_mtime:
+            best, best_mtime = f.stem, m
+    return best
+
+
+RUN = _active_run()
+JSONL = LOGS / f"{RUN}.jsonl"
+TRAIN_LOG = LOGS / f"{RUN}.log"
+STATUS_LOG = LOGS / f"{RUN}_status.log"
+CKPT = REPO / "checkpoints" / RUN
 SFT_MANIFEST = ROOT / "sft_pairs" / "v2" / "full" / "manifest.json"
 STATIC = ROOT / "dashboard" / "static"
 
@@ -163,12 +187,19 @@ def snapshot() -> dict:
     logs = [r for r in rows if r.get("event") == "log"]
     evals = [r for r in rows if r.get("event") == "eval"]
     last = logs[-1] if logs else {}
+    # Every number about the run comes from the run's OWN config snapshot: a
+    # hard-coded 320k / 24 576 bytes-per-step reported the flagship's shape for
+    # whatever was actually training (caught when the 200M stair started).
+    run_cfg = _run_config()
     step = int(last.get("step") or (evals[-1]["step"] if evals else 0))
-    total_steps = 320_000
+    total_steps = int(run_cfg.get("steps", 320_000))
     bpb = evals[-1].get("bpb") if evals else None
     prev_bpb = evals[-2].get("bpb") if len(evals) > 1 else None
     tps = float(last.get("tokens_per_s") or 0.0)
-    bytes_per_step = 24_576  # b8 x s1024 x grad_accum 3
+    bytes_per_step = (
+        int(run_cfg.get("batch", 8)) * int(run_cfg.get("seq_len", 1024))
+        * int(run_cfg.get("grad_accum", 1))
+    )
     seen = step * bytes_per_step
     budget = total_steps * bytes_per_step
     eta = (budget - seen) / tps if tps > 0 else float("nan")
@@ -219,12 +250,16 @@ def snapshot() -> dict:
         "age": age,
         "exited": exited,
         "run": {
-            "name": "flagship",
-            "shape": "medium · b8×s1024×accum3 · it3",
-            "params": 102_678_943,
+            "name": RUN,
+            "shape": (
+                f"d{run_cfg.get('d_model','?')} · b{run_cfg.get('batch','?')}"
+                f"×s{run_cfg.get('seq_len','?')}×accum{run_cfg.get('grad_accum',1)}"
+                f" · it{run_cfg.get('max_iter','?')}"
+            ),
+            "params": run_cfg.get("params"),
             "step": step,
             "total_steps": total_steps,
-            "decay_at": int(total_steps * 0.85),
+            "decay_at": int(total_steps * (1.0 - float(run_cfg.get("decay_frac", 0.15)))),
             "bpb": bpb,
             "bpb_prev": prev_bpb,
             "loss": last.get("loss"),
@@ -308,6 +343,7 @@ def frag_metrics(s: dict) -> str:
 
 
 def frag_hero(s: dict) -> str:
+    run = s.get("run", RUN)
     lines = s["tail"] or ["(no log yet)"]
     out = []
     for i, ln in enumerate(lines):
@@ -323,7 +359,7 @@ def frag_hero(s: dict) -> str:
         out.append(f'<span class="{cls}">{safe}</span>')
     age = s["age"]
     return f"""<div class="term">
-  <div class="bar-top"><span>flagship · train</span>
+  <div class="bar-top"><span>{run} · train</span>
     <span>{'log ' + _human_secs(age) + ' old' if age < 1e9 else 'no log'}</span></div>
   <pre>{''.join(out)}</pre>
 </div>"""
@@ -534,7 +570,7 @@ def page(s: dict, query: str = "") -> str:
   </div>
 
   <div class="block" style="--i:0">
-    <h2>run <span class="hint">{html.escape(r['shape'])} · {r['params']:,} params</span></h2>
+    <h2>run <span class="hint">{html.escape(r['shape'])} · {_params(r['params'])}</span></h2>
     <div class="run">
       <span class="id">{r['name']}</span>
       <span>step <b>{r['step']:,}</b> / {r['total_steps']:,}</span>
@@ -571,11 +607,41 @@ tick(); setInterval(tick, 1000);
 </body></html>"""
 
 
+
+
+def _params(n) -> str:
+    """`param_count` lives behind the model build; the snapshot has no count.
+
+    Showing "—" beats showing the flagship's 102 678 943 on a run that is not it
+    (that is the bug this whole block exists to kill).
+    """
+    return f"{int(n):,} params" if n else "params n/a"
+
+
+def _run_config() -> dict:
+    """The active run's own snapshot: `<out_dir>/<name>.config.toml` [train]+[model].
+
+    Flat, because every consumer here wants one key. Missing file -> {} (the
+    board then shows the fallbacks rather than refusing to render).
+    """
+    try:
+        import tomllib
+
+        p = CKPT / f"{RUN}.config.toml"
+        cfg = tomllib.loads(p.read_text())
+        t, m = cfg.get("train", {}), cfg.get("model", {})
+        out = {**m, **t}
+        out["params"] = cfg.get("params") or m.get("params")
+        return out
+    except Exception:
+        return {}
+
+
 def _jsonl_snapshot_cfg() -> str:
     try:
         import tomllib
 
-        p = CKPT / "flagship.config.toml"
+        p = CKPT / f"{RUN}.config.toml"
         cfg = tomllib.loads(p.read_text())
         m, t = cfg.get("model", {}), cfg.get("train", {})
         return (
