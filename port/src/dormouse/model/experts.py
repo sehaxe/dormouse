@@ -663,6 +663,7 @@ class SparseMoE(nn.Module):
                     f"width above the bank cannot be filled. Escape: k_max <= n_experts."
                 )
         self.capacity = cfg.moe_capacity
+        self.router_jitter = getattr(cfg, "moe_router_jitter", 0.0)
         self.moe_kernel = cfg.moe_kernel
         #: The gather-fused FORWARD (`model/moe_sonic.py`, SonicMoE §5.1.1): a
         #: second switch on the same pass. `moe_kernel` is what runs when this
@@ -893,6 +894,15 @@ class SparseMoE(nn.Module):
             dt,
             counters,
         )
+        if self.router_jitter > 0.0 and self.training:
+            # TIE-BREAKING NOISE, Switch-Transformer style. Without it a bank of
+            # near-identical experts at init collapses: measured 2026-11-04, one
+            # expert took 3 800 of 8 192 tokens and the dropless bank needed
+            # 5.56 GiB, i.e. the "512 experts" were doing the work of two. The
+            # RNG is consumed only when the arm is on, so the OFF path's bits
+            # and its RNG stream are untouched.
+            logits = logits + torch.randn_like(logits) * self.router_jitter
+            counters.count("moe_router_jitter")
         probs = F.softmax(logits, dim=-1)  # [n, E]
         # a4.8: the activation quantization arm (COUNTED — a reader of the log
         # line sees it) applies to the EXPERTS' activations only. The router
@@ -1366,7 +1376,13 @@ class SparseMoE(nn.Module):
         is not a per-expert read (the old loop's `unique().tolist()`), and the
         padded arm's route never reaches it.
         """
-        n, k = index.shape
+        # ROWS, not the shape's first dim: the dispatch is fed per-batch-element
+        # in some paths, and `_capacity` is a function of the TOKEN count. Using
+        # `index.shape[0]` there made capacity=2.0 keep 12 288 of 49 152
+        # assignments — 74.5% dropped, measured 2026-11-04. The rule is exact
+        # only on rows.
+        k = index.shape[-1]
+        n = index.numel() // k
         if self.capacity > 0:
             return self._capacity(n, k)
         flat_e = index.reshape(-1)

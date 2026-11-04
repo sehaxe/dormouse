@@ -769,6 +769,13 @@ class ModelConfig:
     #: with the static row-block bound and the kernels' on-device empty-block
     #: exit (`moe_dropless` + `moe_triton_gemm`), and the reference loop is the
     #: COUNTED fallback (`moe_naive_dispatch` + the reason).
+    #: Tie-breaking noise on the router logits, Switch-Transformer style
+    #: (`std` in logit units). Measured 2026-11-04: with a fresh bank of 512
+    #: near-identical experts and NO jitter, one expert took 3 800 of 8 192
+    #: tokens, so the dropless bank needed 5.56 GiB and the "512 experts" were
+    #: doing the work of two. 0.01 is the Switch value. OFF, and it consumes RNG
+    #: only when on, so every existing pin and RNG stream is untouched.
+    moe_router_jitter: float = 0.0
     moe_capacity: float = 1.0
     #: Loss-Free Balancing step (arXiv:2408.15664): before the top-k decision
     #: the scores read `probs + b_e`, and after the forward `b_e` moves by
