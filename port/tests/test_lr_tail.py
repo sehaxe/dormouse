@@ -238,12 +238,16 @@ def test_the_lr_curve_of_the_shipped_recipe_is_unchanged() -> None:
 
 
 def test_progress_keys_are_a_closed_set() -> None:
-    """The two new keys are the ONLY thing added to the resume freedoms.
+    """The set is CLOSED: every member is named here, with its reason.
 
-    Revert: add another key (say `lr`) -> this fails, which is the point: the
-    relaxation must stay scoped to the schedule tail.
+    Revert: add another key (say `lr`) -> this fails, which is the point: each
+    relaxation must be argued for, not slipped in. `seq_len` joined 2026-11-04
+    (the window is not a parameter and the KDA/CSA arms carry no positional
+    table), and `tests/test_resume.py` holds its grow-only companion rule for
+    `max_seq_len`.
     """
     assert set(PROGRESS_KEYS) == {
+        "seq_len",
         "steps",
         "log_every",
         "ckpt_every",
