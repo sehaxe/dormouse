@@ -430,5 +430,6 @@ def test_the_static_cap_arm_captures():
 # ------------------------------------------------------------- the switch
 def test_the_literal_is_declared_and_the_counter_names_the_arm():
     assert "batched" in MOE_KERNELS
+    assert "bucketed" in MOE_KERNELS
     validate(tiny_cfg(moe_kernel="batched", moe_capacity=1.0, moe_topk=2))
-    assert MOE_KERNELS == ("padded", "triton", "naive", "batched")
+    assert MOE_KERNELS == ("padded", "triton", "naive", "batched", "bucketed")

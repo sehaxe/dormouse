@@ -135,7 +135,7 @@ DEAD_SNAPSHOT_KEYS = {
 
 #: The `moe_kernel` literals — the expert-pass arms `experts._dispatch` routes
 #: between. One list, read by `validate`: a name that is not here is LOUD.
-MOE_KERNELS = ("padded", "triton", "naive", "batched")
+MOE_KERNELS = ("padded", "triton", "naive", "batched", "bucketed")
 #: The `moe_gather` literals — the gather-fused FORWARD (`model/moe_sonic.py`,
 #: SonicMoE §5.1.1): `off` is today's pass, `kernel` reads the expert rows
 #: THROUGH the permute's row map instead of a materialised `[R, d]` copy. It is
@@ -791,7 +791,10 @@ class ModelConfig:
     #: GLU fused); `naive` = the per-expert loop (the CPU path); `batched` = the
     #: SAME bank with the cap chosen for this batch (the capacity rule when
     #: `moe_capacity > 0`, the largest group when dropless) — the arm that turns
-    #: the dropless Python loop into three `bmm`s. An unknown name is LOUD at
+    #: the dropless Python loop into three `bmm`s; `bucketed` = the same bmms over
+    #: a PLAN of `[n_b, cap_b, ·]` banks (experts classed by row count), so a
+    #: collapsed router costs `2 · 2048` rows per bucket instead of
+    #: `E · max_group`. An unknown name is LOUD at
     #: config load. `triton` falls back COUNTED to `padded` when the kernel
     #: cannot run (no triton import, input not on CUDA) — never silently.
     moe_kernel: str = "padded"
@@ -2425,8 +2428,10 @@ def validate(model: ModelConfig) -> None:
             f"and fallback), `triton` the unpadded grouped GEMM "
             f"(model/moe_kernels.py), `naive` the per-expert loop, `batched` the "
             f"same [E, cap, ·] bank with cap = this batch's largest group (the "
-            f"dropless arm). Escape: name one of those, or add the arm before "
-            f"the config can lie about it."
+            f"dropless arm), `bucketed` the same bank split into row-count classes "
+            f"(`[n_b, cap_b, ·]` per bucket, so a collapsed router cannot ask for "
+            f"an E-many-expert bank). Escape: name one of those, or add the arm "
+            f"before the config can lie about it."
         )
     if model.moe_gather not in MOE_GATHERS:
         loud(

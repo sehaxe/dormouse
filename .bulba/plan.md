@@ -185,6 +185,33 @@ testable and A/B-able (ADR-0017).
       `scripts/bench_moe_paths.py` (m400 / b8s1024 / b1s8192; naive / triton /
       batched; fwd + fwd+bwd + launches) written and **NOT run** (this task made
       no GPU measurement). No GPU timing exists.
+- [x] P-MOE-BUCKETS. port (Python): `moe_kernel="bucketed"` — the batched bank
+      without the memory cliff. `experts._bucket_plan` classes each batch's
+      experts by row count (within 2x share a bucket, capped at
+      `MOE_BUCKET_ROWS = 2048` rows; an expert past it gets a bucket of its
+      own); `_bucketed_dispatch` writes every assignment ONCE into a flat
+      scratch addressed `bucket_offset + local_id·cap_b` and runs the existing
+      three-`bmm` bank body per bucket, concatenating in bucket order before the
+      ONE `slots` gather. Memory is `Σ n_b·cap_b·d·itemsize` ≤
+      `2·MOE_BUCKET_ROWS` rows per class bucket, and the single-expert collapse
+      is `1·count·d` (8 192 × 1 536 × 2 B = 25 MB), not `E·max_group·d` (the
+      12 GiB ask measured 2026-11-04). `MOE_BUCKET_BYTES = 256 MiB` is the LOUD
+      refusal with the busiest bucket's measured numbers; counters `moe_buckets`
+      and `moe_bank_bytes`; ONE host read (`counts.tolist()`, E ints) is the
+      plan's documented sync. Gates `tests/test_moe_buckets.py` (a-f): one
+      bucket `torch.equal` to `_bank_dispatch` in fp32 and bf16, dropless and
+      capacity (32 768 B); 90%-on-one-expert matches the per-expert loop at
+      4.6e-8 with 2 buckets / 54 016 B while `_batched_cap` refuses the same
+      routing; counts `[1,1000,1,1]` and `[1000,1,1,1]` plan 2 buckets each
+      (Δ 0.0); capacity drops give exactly 0 to output and router gradient;
+      the only reported sync is `tolist`; the plan is deterministic (and the
+      same counts in a shuffled token order give the same plan). Six scratch
+      reverts turned their named gate red and restored sha256. `config.
+      MOE_KERNELS` grows to five literals; `full_graph` REFUSES the arm (the
+      plan is a host-side allocation shape). `scripts/bench_moe_paths.py` gains
+      `--arm` and `--routing pathological` and prints `moe_bank_bytes` per arm
+      (m400 / b8s1024 / b1s8192) — written and **NOT run** (the card is held;
+      no GPU timing exists).
 - [ ] C12. `feat: smoke preset + --smoke`, `docs/README-model.md` (≤60 lines).
 - [x] P-HALT. port (Python): the halt head + the depth-8 path. `port/src/dormouse/
       model/halt.py` — BCE target read from the model's OWN per-iteration CE
