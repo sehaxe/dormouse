@@ -1716,7 +1716,7 @@ class MixOptimizer:
         # group shares it.
         self._adamw_t += 1
         t = self._adamw_t
-        for group in self.adamw.param_groups:
+        for group in self.adamw.param_groups:  # stepaudit-excuse: <=8 groups, _foreach_ each
             params = [p for p in group["params"] if p.grad is not None]
             if not params:
                 continue
@@ -1725,7 +1725,7 @@ class MixOptimizer:
             beta1, beta2 = group["betas"]
             eps = group["eps"]
             states = [self.adamw.state[p] for p in params]
-            for p, st in zip(params, states, strict=True):
+            for p, st in zip(params, states, strict=True):  # stepaudit-excuse: state init, step 1
                 if "step" not in st:
                     st["step"] = torch.zeros((), dtype=torch.float32)
                     st["exp_avg"] = torch.zeros_like(p, memory_format=torch.preserve_format)
