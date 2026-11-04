@@ -402,6 +402,17 @@ ul.rows li b { font-weight: 500; color: var(--ink); }
 .gauge .mk.hot { background: var(--warn); }
 .gauge .val { font-size: 12px; text-align: right; color: var(--ink); font-variant-numeric: tabular-nums; }
 
+/* routing health: the dead-expert state is RED, not a footnote */
+.routing { display: grid; gap: 10px; }
+.routing .kv { margin-top: 0; }
+.gauge .mk.ok { background: var(--ok); }
+.gauge .mk.warn { background: var(--warn); }
+.gauge .mk.bad { background: var(--bad); }
+.route-state { font-size: 11.5px; color: var(--mute); }
+.route-ok .route-state { color: var(--ok); }
+.route-warn .route-state { color: var(--warn); }
+.route-bad .route-state { color: var(--bad); }
+
 /* ---------------------------------------------------------------- footer */
 
 .foot {

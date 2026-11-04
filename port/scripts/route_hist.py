@@ -11,12 +11,46 @@ MoE comparison we ran is measured on a partly dead bank. This prints the counts.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import torch  # noqa: E402
+
+
+def summary(counts, n_experts: int, **extra) -> dict:
+    """The one routing-health record: counters the dashboard reads, no torch.
+
+    `route_hist.py --json PATH` writes this shape so the panel can show the LAST
+    histogram instead of paying for another model load. `live_experts` is the
+    field the restart planner compares against E.
+    """
+    c = [int(v) for v in counts[:n_experts]]
+    total = sum(c)
+    live = sum(1 for v in c if v > 0)
+    top = sorted(c, reverse=True)[:10]
+    top_share = sum(top) / total if total else 0.0
+    max_share = max(c) / total if total and c else 0.0
+    return {
+        "n_experts": int(n_experts),
+        "assignments": total,
+        "live_experts": live,
+        "live_frac": round(live / max(1, n_experts), 6),
+        "max_share": round(max_share, 6),
+        "max_share_x100": round(100.0 * max_share, 2),
+        "top10_share": round(top_share, 6),
+        "top10_share_x100": round(100.0 * top_share, 2),
+        "counts": c,
+        **extra,
+    }
+
+
+def write_json(path, payload: dict) -> None:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
 def main() -> int:
@@ -28,6 +62,11 @@ def main() -> int:
     ap.add_argument("--seq", type=int, default=1024)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--data", default="/home/sehaxe/dormouse/data_local/best/fwedu.bin")
+    ap.add_argument(
+        "--json",
+        metavar="PATH",
+        help="write the histogram as JSON (the dashboard panel reads this file)",
+    )
     a = ap.parse_args()
 
     from dormouse.config import RunConfig
@@ -54,7 +93,6 @@ def main() -> int:
     targets = torch.tensor(list(chunk[1:]), device="cuda", dtype=torch.long).view(a.batch, a.seq)
 
     moe = model.loop.moe
-    seen: list[torch.Tensor] = []
     # The router is a dense Linear on the block input; walk the model's own
     # entry point so the hidden state is exactly the training one.
     grabbed: list[torch.Tensor] = []
@@ -87,10 +125,22 @@ def main() -> int:
     )
     top = torch.topk(c, min(10, c.numel()))
     print("top-10 experts by assignments:")
-    for rank, (val, ix) in enumerate(zip(top.values.tolist(), top.indices.tolist()), 1):
+    pairs = zip(top.values.tolist(), top.indices.tolist(), strict=True)
+    for rank, (val, ix) in enumerate(pairs, 1):
         print(f"  {rank:2}. expert {ix:4}  {val:8.0f}  {100 * val / max(1, total):5.1f}%")
     share = top.values.sum().item()
     print(f"\ntop-10 hold {100 * share / max(1, total):.1f}% of all tokens")
+    if a.json:
+        payload = summary(
+            counts[: moe.n_experts].tolist(),
+            moe.n_experts,
+            ckpt=a.ckpt,
+            step=state.get("step"),
+            batch=a.batch,
+            seq=a.seq,
+        )
+        write_json(a.json, payload)
+        print(f"wrote {a.json}")
     return 0
 
 
