@@ -264,7 +264,10 @@ except Exception as exc:  # noqa: BLE001 — the reason is COUNTED by `_dispatch
 else:
     _TRITON_WHY = None
 
-from . import moe_sonic  # the gather-fused forward (`moe_gather = "kernel"`)
+from . import (
+    moe_sonic,  # the gather-fused forward (`moe_gather = "kernel"`)
+    route_fused,  # the fused route head + the counting permute
+)
 
 
 def _bincount(x: torch.Tensor, minlength: int) -> torch.Tensor:
@@ -750,6 +753,17 @@ class SparseMoE(nn.Module):
         #: them did not run the arm it is labelled with.
         self.moe_gather = cfg.moe_gather
         self.moe_offload = cfg.moe_offload
+        #: The fused route head (`model/route_fused.py`): ONE kernel for
+        #: softmax + LFB bias + top-k + the gate gather, instead of 4 tensor ops
+        #: and ~9 CUDA kernels over the same `[n, E]`. The old path is what runs
+        #: when the kernel cannot (`_route_fused_reason` → COUNTED
+        #: `moe_route_fused_fallback`); `config.validate` refuses the two
+        #: combinations the arm has no code for (adaptive width, `aux`).
+        self.moe_route_fused = cfg.moe_route_fused
+        #: The permute's algorithm (`argsort` today's stable sort, `count` the
+        #: counting sort in `model/route_fused.py`). The permutation is the SAME
+        #: tensor by construction; the knob is cost, not semantics.
+        self.moe_permute = cfg.moe_permute
         #: The compressed-forward sprint's factor quantization (`factor_qat`):
         #: `_banks` applies it to the fp32 stacks before the dt-conversion, and
         #: `DualLatentGLU` applies the SAME projection (dim=None on a 2-D
@@ -1013,7 +1027,20 @@ class SparseMoE(nn.Module):
             # and its RNG stream are untouched.
             logits = logits + torch.randn_like(logits) * self.router_jitter
             counters.count("moe_router_jitter")
-        probs = F.softmax(logits, dim=-1)  # [n, E]
+        # The routed pass's cheap half: the fused route head replaces `softmax`,
+        # the bias add, `topk` and the gate gather with ONE kernel
+        # (`model/route_fused.py`). `probs` is then NOT materialized — which is
+        # why the arm is refused under `moe_lb_mode="aux"` (its term reads the
+        # softmax) and why the dense blend and the adaptive width keep the old
+        # path. The fallback is COUNTED with its reason (ADR-0019).
+        why = self._route_fused_reason(x) if self.moe_route_fused else None
+        if why is not None:
+            counters.count("moe_route_fused_fallback")
+            prev = getattr(counters, "why", None)
+            counters.why = f"{prev}; route: {why}" if prev else f"route: {why}"  # type: ignore[attr-defined]
+        probs = None if self.moe_route_fused and why is None else F.softmax(logits, dim=-1)
+        if probs is None:
+            counters.count("moe_route_fused_calls")
         # a4.8: the activation quantization arm (COUNTED — a reader of the log
         # line sees it) applies to the EXPERTS' activations only. The router
         # above reads the raw state on purpose (`router` is a dense `nn.Linear`,
@@ -1054,42 +1081,48 @@ class SparseMoE(nn.Module):
                     weighted += expert(x, glu=self._glu) * probs[:, ex : ex + 1]
                 counters.count("moe_dense_loop", n)  # the fallback, read in logs
         else:
-            # LFB (arXiv:2408.15664): the top-k reads the RAISED logits
-            # `logits + b_e` (the paper's bias is on the pre-softmax score).
-            # The A/B caught BIASES ON PROBS flooding the bank: a ±0.4
-            # cumulative bias swamps a 1/E = 0.015-range prob and every token
-            # runs to the same two experts (67,459 drops vs 42,065). In logit
-            # space the bias competes with logits' own scale; the gate weight
-            # stays the honest prob from the UNbiased softmax (the bias
-            # steers selection, never magnitude).
-            raised = logits + self.lfb_bias
-            if self.topk_mode == "off":
-                # The control, unchanged: ONE global width, no policy call at all
-                # (the off-arm bit-parity gate pins this branch against a digest
-                # measured before the policy existed).
-                index = raised.topk(self.topk, dim=-1).indices
-                weight = torch.gather(probs, 1, index)
+            if probs is None:
+                # The fused route: same top-k (down to the tie rule) and the same
+                # gathered gate, one launch.
+                index, weight = route_fused.softmax_topk(logits, self.lfb_bias, self.topk)
                 real = index
             else:
-                # The adaptive width: the policy sees the UNbiased logits (the
-                # bias steers selection, never the confidence that picks k), the
-                # mask is applied to the RAISED scores so LFB still selects, and
-                # the weights come from the unbiased softmax, zeroed on the
-                # padding slots.
-                k = choose_k(
-                    logits,
-                    mode=self.topk_mode,
-                    k_min=self.topk_min,
-                    k_max=self.topk_max,
-                    entropy_lo=self.entropy_lo,
-                    entropy_hi=self.entropy_hi,
-                )
-                index, active = select_topk(raised, k, self.topk_max)
-                self._k_counters(k, counters)
-                # A weight-0 padding slot is neither a load (LFB) nor a dispatch
-                # (the aux term): both read the REAL assignments only.
-                real = index[active]
-                weight = torch.gather(probs, 1, index) * active.to(probs.dtype)
+                # LFB (arXiv:2408.15664): the top-k reads the RAISED logits
+                # `logits + b_e` (the paper's bias is on the pre-softmax score).
+                # The A/B caught BIASES ON PROBS flooding the bank: a ±0.4
+                # cumulative bias swamps a 1/E = 0.015-range prob and every token
+                # runs to the same two experts (67,459 drops vs 42,065). In logit
+                # space the bias competes with logits' own scale; the gate weight
+                # stays the honest prob from the UNbiased softmax (the bias
+                # steers selection, never magnitude).
+                raised = logits + self.lfb_bias
+                if self.topk_mode == "off":
+                    # The control, unchanged: ONE global width, no policy call at
+                    # all (the off-arm bit-parity gate pins this branch against a
+                    # digest measured before the policy existed).
+                    index = raised.topk(self.topk, dim=-1).indices
+                    weight = torch.gather(probs, 1, index)
+                    real = index
+                else:
+                    # The adaptive width: the policy sees the UNbiased logits (the
+                    # bias steers selection, never the confidence that picks k), the
+                    # mask is applied to the RAISED scores so LFB still selects, and
+                    # the weights come from the unbiased softmax, zeroed on the
+                    # padding slots.
+                    k = choose_k(
+                        logits,
+                        mode=self.topk_mode,
+                        k_min=self.topk_min,
+                        k_max=self.topk_max,
+                        entropy_lo=self.entropy_lo,
+                        entropy_hi=self.entropy_hi,
+                    )
+                    index, active = select_topk(raised, k, self.topk_max)
+                    self._k_counters(k, counters)
+                    # A weight-0 padding slot is neither a load (LFB) nor a dispatch
+                    # (the aux term): both read the REAL assignments only.
+                    real = index[active]
+                    weight = torch.gather(probs, 1, index) * active.to(probs.dtype)
             # THIS forward's routing histogram, on device, computed ONCE: the
             # bias controller, the aux term and the health counters all read it,
             # and nothing here crosses to the host. A run that armed none of them
@@ -1285,7 +1318,10 @@ class SparseMoE(nn.Module):
         return max(k, math.ceil(self.capacity * n * k / self.n_experts))
 
     def _permute(
-        self, index: torch.Tensor, valid: torch.Tensor | None = None
+        self,
+        index: torch.Tensor,
+        valid: torch.Tensor | None = None,
+        counters: Counters | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """The routing permute: `(order, keep, dropped)` — one place, both arms.
 
@@ -1309,6 +1345,13 @@ class SparseMoE(nn.Module):
         and `dropped` is 0, so the ragged arms see the full assignment set. That
         is what makes the drop set independent of the window's composition, and
         it is the whole reason this mode exists (module docstring).
+
+        `moe_permute="count"` replaces the stable argsort with the counting sort
+        in `model/route_fused.py`. The permutation is IDENTICAL (stable by
+        construction, which the gate pins element-wise), so nothing downstream
+        can tell which arm ran except the counters — and a kernel that cannot
+        serve the call falls back to the argsort COUNTED (`moe_permute_fallback`
+        + the reason), never silently.
         """
         n, k = index.shape
         flat_ids = index.reshape(-1)
@@ -1320,7 +1363,22 @@ class SparseMoE(nn.Module):
             active = valid.reshape(-1).to(torch.bool)
             safe = flat_ids.masked_fill(~active, self.n_experts)
             groups = self.n_experts + 1
-        order = torch.argsort(safe, stable=True)
+        if self.moe_permute == "count":
+            why = route_fused.reason(index)
+            if why is None:
+                order = route_fused.count_permute(safe, groups)
+                if counters is not None:
+                    counters.count("moe_permute_count")
+            else:
+                if counters is not None:
+                    counters.count("moe_permute_fallback")
+                    prev = getattr(counters, "why", None)
+                    counters.why = (  # type: ignore[attr-defined]
+                        f"{prev}; permute: {why}" if prev else f"permute: {why}"
+                    )
+                order = torch.argsort(safe, stable=True)
+        else:
+            order = torch.argsort(safe, stable=True)
         sorted_ids = safe[order]
         counts = _bincount(sorted_ids, groups)
         offsets = torch.cumsum(counts, 0) - counts
@@ -2173,7 +2231,7 @@ class SparseMoE(nn.Module):
         — the pre-policy path, bit for bit.
         """
         valid = None if self.topk_mode == "off" else weight > 0
-        order, keep, dropped = self._permute(index, valid)
+        order, keep, dropped = self._permute(index, valid, counters)
         n, k = index.shape
         # `keep=None` = every permuted row survives, and `order[keep]` is then
         # `order`. Two cases are provably all-True: dropless (`capacity=0` keeps
@@ -2208,7 +2266,7 @@ class SparseMoE(nn.Module):
                     # parking would buy a third forward and offload `x` for
                     # nothing. Asked for and not run must be visible (ADR-0019).
                     counters.count("moe_offload_inert_gather")
-                return self._gather_dispatch(x, weight, index, order, keep, counters)
+                return self._gather_dispatch(x, weight, index, order, keep_rows, counters)
             counters.count("moe_gather_fallback")
             counters.why = f"gather: {gwhy}"  # type: ignore[attr-defined]
         if self.capacity == 0:
@@ -2459,6 +2517,32 @@ class SparseMoE(nn.Module):
             return f"input is on {x.device.type}: the gather kernel is the CUDA path"
         return None
 
+    def _route_fused_reason(self, x: torch.Tensor) -> str | None:
+        """`None` if the fused route head can run THIS call, else why not.
+
+        COUNTED (`moe_route_fused_fallback` + the reason), the same contract as
+        `_gather_reason`: a config asks for the arm and an arm that cannot serve
+        a call must not vanish. Two of the reasons are config-level and are also
+        refused LOUDLY by `config.validate` (the adaptive width moves unused
+        slots to a sentinel id and zeroes them, which the fused kernel's
+        constant-width selection does not express; `moe_lb_mode="aux"` reads the
+        softmax, which the fused arm does not materialize). What is left is
+        ability: triton importable, input on CUDA.
+        """
+        if self.topk <= 0:
+            return "moe_topk=0 is the dense blend: there is no top-k to fuse"
+        if self.topk_mode != "off":
+            return (
+                f"moe_topk_mode={self.topk_mode!r}: the adaptive width masks the "
+                f"raised logits and keeps `probs` for its zeroed slots"
+            )
+        if self.lb_mode == "aux":
+            return (
+                "moe_lb_mode='aux' reads the softmax `probs`, which the fused route "
+                "does not materialize"
+            )
+        return route_fused.reason(x)
+
     def _fused_bwd_reason(self, k: int) -> str | None:
         """`None` if the FUSED backward can serve a top-k of `k`, else why not.
 
@@ -2618,7 +2702,7 @@ class SparseMoE(nn.Module):
         weight: torch.Tensor,
         index: torch.Tensor,
         order: torch.Tensor,
-        keep: torch.Tensor,
+        keep: torch.Tensor | None,
         counters: Counters,
     ) -> torch.Tensor:
         """The gather-fused forward: same rows, same scatter, NO gathered copy.
@@ -2646,7 +2730,11 @@ class SparseMoE(nn.Module):
         assert moe_kernels is not None, "the gather arm needs the shipped grouped GEMM"
         n, k = index.shape
         dt = self._bank_dtype()
-        rows = order[keep]
+        # `keep=None` is every permuted row (dropless / one token): `_dispatch`
+        # hands `keep_rows`, so the ABI's `order[keep]` — a BOOLEAN mask, i.e. a
+        # `nonzero` and a host-side length — is not built on the route that does
+        # not need it. Same rule `_triton_dispatch` states one function up.
+        rows = order if keep is None else order[keep]
         owner = rows // k
         toks, offs = moe_sonic.gather_abi(index, order, keep, self.n_experts)
         gate_u, up_u, v, gate_s, up_s = self._banks(dt)

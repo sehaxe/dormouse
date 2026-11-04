@@ -406,7 +406,7 @@ def tile_work(shape: Shape, counts: list[int] | tuple[int, ...], block_m: int = 
 
 
 def gather_abi(
-    index: torch.Tensor, order: torch.Tensor, keep: torch.Tensor, experts: int
+    index: torch.Tensor, order: torch.Tensor, keep: torch.Tensor | None, experts: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """`(toks, offs)` — the fused kernel's ABI, built from the permute's OWN outputs.
 
@@ -424,7 +424,11 @@ def gather_abi(
     """
     assert index.ndim == 2 and experts >= 1, "a routing needs [T, k] and a bank size"
     k = index.shape[1]
-    rows = order[keep]
+    # `keep=None` is EVERY permuted row (`_dispatch`'s static route: dropless, or
+    # a one-token decode). The bool-mask index would be a `nonzero` — a D2H read
+    # whose output length changes with the routing — for a filter that provably
+    # keeps everything.
+    rows = order if keep is None else order[keep]
     toks = (rows // k).to(torch.int32).contiguous()
     kept = index.reshape(-1)[rows]
     from .experts import _bincount  # lazy: `experts` imports this module

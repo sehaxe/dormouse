@@ -720,6 +720,31 @@ testable and A/B-able (ADR-0017).
       4.295 GMAC, total 7.516 -> 5.905 GMAC (21 % fewer, −2 `bmm` launches).
 
 
+- [x] P-DISPATCH-CENSUS. port (Python): the dispatch census, the fused route head
+      and the counting permute — both arms OFF. **The finding first:** the profile's
+      31.6 ms `moe_dispatch` is NOT the router/top-k. Per forwarded pass the census
+      prices route+permute+gather+combine at 1 815 MB / 53 launches, and the two new
+      arms remove 119 MB and 19 launches (−6.6 %, −36 %); at ~29 µs per kernel launch
+      that is ~0.7 ms/pass, not the −20…−28 ms the profile's region share implied.
+      The region is (a) the expert adjoint's GEMM/pass kernels the seam attribution
+      swallowed — `_grouped_gemm_pair` 8.5 + `_wgrad` 1.6 + `_grouped_gemm` 0.8 =
+      10.8 ms/step — and (b) the bank rebuild's copies, 577 of the region's 888.5
+      kernels/step (4.6 ms), and (c) the combine's fp32 scatter, 1 476 MB/pass
+      (81 % of the routing cluster's bytes: `zeros` + `y.to(f32)*w` + `index_add_`).
+      The router GEMM is 35 MB / 2 launches — not a target. Follow-ups, in order:
+      fuse the combine's three forward ops into its existing kernel; stop rebuilding
+      the bank every step (its `.to()` per expert is the launch hog); then the
+      gather arm's missing adjoint. `scripts/dispatch_census.py` (`--ab`) and
+      `tests/test_moe_route_fused.py` (21 gates, 4 scratch reverts red, tie fixture
+      pinned both ways, OFF pinned to main's digests).
+      `moe_route_fused` = one Triton pass for softmax + LFB bias + top-k + gate
+      gather; `moe_permute="count"` = stable counting sort, element-wise identical
+      to the stable argsort. GPU parity + `bench_gather` are written and NOT run —
+      the card is on the multi-day job. `moe_gather="kernel"` re-checked: the
+      forward saves exactly 4·R·d, the recompute adds 654 MB, so the PASS is
+      +554 MB (unchanged conclusion); one defect fixed on the dropless route (it
+      passed `keep`, not `keep_rows`, so it built an all-True bool-mask index).
+
 ## Critical Files
 
 - `crates/dormouse-core/src/loop_block.rs` (617, in flight)
