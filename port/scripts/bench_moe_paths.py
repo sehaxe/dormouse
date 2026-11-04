@@ -193,11 +193,16 @@ def _shape(name: str, args) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--geometry", choices=[*SHAPES, "all"], default="all")
+    ap.add_argument("--allow-busy", action="store_true")
     ap.add_argument("--iters", type=int, default=5)
     ap.add_argument("--warm", type=int, default=2)
     ap.add_argument("--seed", type=int, default=11)
     args = ap.parse_args()
     why = preflight(DEV)
+    if why and a.allow_busy:
+        print(f"[COUNTED] measuring with a foreign process on the card: {why}")
+        print("[COUNTED] numbers below are an UPPER bound on ms/step, not a clean baseline")
+        why = None
     if why is not None:
         return skip(why)
     if not torch.cuda.is_available():

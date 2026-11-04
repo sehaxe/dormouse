@@ -445,6 +445,8 @@ EXCUSED_FUNCTIONS = {
     "_shadow_state": "EMA setup, once per run",
     "_shadow_params": "SF arm only (muon_sf)",
     "_eval_loss": "eval cadence, no backward",
+    "MixOptimizer._fast_adamw_ok": "capability probe over <=8 param groups, no tensor work",
+    "DormouseModel.set_recompute": "setup, once per run",
     "train": "the step DRIVER itself — the bracket, not a loop inside a step",
     "zeropower_via_ns": "per-matrix NS, the retraction's inherent sequential chain",
     "_foreach_add_mixed_": "comprehension inside the batched momentum primitive",

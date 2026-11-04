@@ -268,6 +268,13 @@ class LoopBlock(nn.Module):
         #: trainer sets it once (`DormouseModel.set_iter_checkpoint`) and a
         #: hand-built model defaults to off.
         self.iter_checkpoint = False
+        #: `activation_recompute` (`TrainConfig`): "none" | "full" | "selective".
+        #: `full` is `iter_checkpoint`'s whole-iteration checkpoint; `selective`
+        #: keeps the read half (q/k/v/g projections, KDA/CSA boundary state) and
+        #: recomputes only the write half (MoE + out_proj). Set once by
+        #: `DormouseModel.set_recompute`; "none" with `iter_checkpoint` still on
+        #: is the historical bool, mapped in `_window`.
+        self.recompute = "none"
         self.eps = cfg.norm_eps
         self.lam_max = cfg.engram_lam_max
         self.use_engram = cfg.use_engram
@@ -771,7 +778,14 @@ class LoopBlock(nn.Module):
             # is legal with a shorter `states`, and reading it unconditionally is
             # the out-of-range the original guarded with the same `if`.
             attn_state = states[i] if (blk.attn is not None and states is not None) else None
-            if self.iter_checkpoint and torch.is_grad_enabled():
+            #: The TRAIN-half recompute arm. `iter_checkpoint` is the historical
+            #: boolean (already in every snapshot); `activation_recompute` names
+            #: the three arms the bench compares. A run that sets both to
+            #: different modes is refused at the config seam.
+            mode = self.recompute if self.recompute != "none" else (
+                "full" if self.iter_checkpoint else "none"
+            )
+            if mode == "full" and torch.is_grad_enabled():
 
                 def body(h_in, streams_in, sources_in, attn_in, fuse_in, blk_in, i_in, slots_in):
                     """The checkpointed unit: its counters are its own (see above)."""
@@ -787,13 +801,9 @@ class LoopBlock(nn.Module):
                         fuse_in,
                         cnt,
                         input_ids,
-                        targets,
-                        lm_head,
                         carry=carry,
                         recurrent=recurrent,
                         drop=drop,
-                        loss_mask=loss_mask,
-                        ce_fixed=ce_fixed,
                         compose=compose,
                         mem_slots=slots_in,
                     )
@@ -805,7 +815,7 @@ class LoopBlock(nn.Module):
                 #: count is assumed. What survives the forward is this
                 #: iteration's INPUT state (`h`, the mHC lanes, the AttnRes
                 #: history, the carried attention state), not its body.
-                h, streams, y, step_out, term, st, fuse, cnt = checkpoint(
+                h, streams, y, step_out, st, fuse, cnt = checkpoint(
                     body,
                     h,
                     streams,
@@ -816,14 +826,20 @@ class LoopBlock(nn.Module):
                     i,
                     mem_slots,
                     use_reentrant=False,
+                    # The forward is deterministic: no dropout, no sampled
+                    # noise, no RNG-consuming op. Replaying the RNG state on
+                    # the recompute is pure overhead here, and `False` is the
+                    # documented opt-out.
+                    preserve_rng_state=False,
                 )
                 counters.merge(cnt)
                 #: The number of iterations the backward will run AGAIN, one
                 #: per window. Counted OUTSIDE the body so a recompute cannot
                 #: count itself (checkpoint discards the recompute's `cnt`).
                 counters.count("iter_checkpoint_saved")
+                counters.count("recompute_full")
             else:
-                h, streams, y, step_out, term, st, fuse = self._step(
+                h, streams, y, step_out, st, fuse = self._step(
                     h,
                     streams,
                     tuple(sources),
@@ -834,16 +850,14 @@ class LoopBlock(nn.Module):
                     fuse,
                     counters,
                     input_ids,
-                    targets,
-                    lm_head,
                     carry=carry,
                     recurrent=recurrent,
                     drop=drop,
-                    loss_mask=loss_mask,
-                    ce_fixed=ce_fixed,
                     compose=compose,
                     mem_slots=mem_slots,
+                    post_checkpoint=mode == "selective",
                 )
+            term = self._iter_ce(step_out, targets, lm_head, counters, loss_mask, ce_fixed)
             if self.use_attnres and not compose:
                 sources.append(y)
             if blk.attn is not None:
@@ -881,22 +895,18 @@ class LoopBlock(nn.Module):
         fuse: str | None,
         counters: Counters,
         input_ids: torch.Tensor | None,
-        targets: torch.Tensor | None,
-        lm_head: nn.Module | None,
         *,
         carry: bool,
         recurrent: bool,
         drop: int,
-        loss_mask: torch.Tensor | None,
-        ce_fixed: bool,
         compose: bool,
         mem_slots: torch.Tensor | None = None,
+        post_checkpoint: bool = False,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor | None,
         torch.Tensor,
         torch.Tensor,
-        torch.Tensor | None,
         torch.Tensor | tuple[torch.Tensor, ...] | None,
         str | None,
     ]:
@@ -910,8 +920,9 @@ class LoopBlock(nn.Module):
         Everything that is fixed for the window — `h0_flat`, the ids, the head,
         the drop, `carry`/`recurrent` — is closed over or passed as a keyword, so
         a recompute reads the same values. Returns `(h, streams, y, step_out,
-        ce_term, attn_state_out, fuse)`; the caller owns the accumulators and
-        the counters merge, exactly as the segmented path does.
+        attn_state_out, fuse)`; the per-iteration CE is the caller's (`_iter_ce`,
+        outside every checkpoint), and the accumulators and the counter merge
+        stay with the caller exactly as the segmented path does.
         """
         b, t, d = h.shape
         mhc_raw = None
@@ -1110,6 +1121,79 @@ class LoopBlock(nn.Module):
         else:
             branch = self._zero(h, (b * t, d), torch.float32)
 
+        post = (
+            h,
+            streams,
+            attn,
+            branch,
+            normed_mlp,
+            w_ffn,
+            gains,
+            mhc_raw,
+            ctx,
+            fuse,
+            tuple(sources),
+            blk,
+            i,
+        )
+        if post_checkpoint and torch.is_grad_enabled():
+            # SELECTIVE (`activation_recompute="selective"`): the READ side —
+            # norm, controller, attention and Engram — stays in the graph, so
+            # the q/k/v/g projection outputs and the KDA/CSA boundary state are
+            # KEPT. Only the write side — the MoE pass, the residual write and
+            # `out_proj` — is recomputed. The checkpointed unit has its own
+            # counters and gets no CE: the per-iteration head is cheap and runs
+            # in the caller (`_iter_ce`), so the backward never repeats it.
+            cnt = Counters()
+            h, streams, y = checkpoint(
+                self._step_post,
+                *post,
+                cnt,
+                compose,
+                use_reentrant=False,
+                preserve_rng_state=False,
+            )
+            counters.merge(cnt)
+            counters.count("iter_checkpoint_saved")
+            counters.count("recompute_selective")
+        else:
+            h, streams, y = self._step_post(*post, counters, compose)
+        # `out_proj` runs OUTSIDE the selective checkpoint: its input and output
+        # are two [b,t,d] residuals (the cheap end of the chain), so keeping
+        # them costs less than recomputing a d×d matmul per iteration. `full`
+        # still checkpoints it as part of the whole body.
+        b, t, _ = h.shape
+        step_out = blk.out_proj(h.reshape(b * t, d)).reshape(b, t, d)
+        return h, streams, y, step_out, st, fuse
+
+    def _step_post(
+        self,
+        h: torch.Tensor,
+        streams: torch.Tensor | None,
+        attn: torch.Tensor,
+        branch: torch.Tensor,
+        normed_mlp: torch.Tensor,
+        w_ffn: torch.Tensor,
+        gains: tuple | None,
+        mhc_raw: torch.Tensor | None,
+        ctx: torch.Tensor,
+        fuse: bool | None,
+        sources: tuple[torch.Tensor, ...],
+        blk: LoopBlock,
+        i: int,
+        counters: Counters,
+        compose: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+        """The WRITE half of one iteration — the unit `selective` recomputes.
+
+        `ffn` (the MoE pass) and the residual write. `out_proj` runs in the
+        caller, outside the checkpoint, because its two residual-sized tensors
+        are the cheap end of the chain. Everything this half reads from the
+        READ half is an explicit argument, so a recompute reads the same tensors
+        the forward did. Returns `(h, streams, y)`; the attention state and
+        `fuse` stay with the caller (the read side's outputs, never recomputed).
+        """
+        b, t, d = h.shape
         ffn = blk._moe_branch(normed_mlp, counters) * w_ffn
         if gains is not None:
             # PAPER FORM's WRITE gains (`layerrope.py`): each branch's
@@ -1191,26 +1275,44 @@ class LoopBlock(nn.Module):
             counters.count("rezero_write")
             h = ctx + y * blk.residual_scale
 
-        step_out = blk.out_proj(h.reshape(b * t, d)).reshape(b, t, d)
-        term = None
-        if targets is not None:
-            assert lm_head is not None, "per-iteration CE needs the lm_head"
-            logits = lm_head(step_out.reshape(b * t, d).to(torch.float32))
-            if self.logit_softcap > 0.0:
-                # The same Gemma-2 cap the final exit applies; the loop's
-                # per-iteration deep-supervision CE must score the same
-                # bounded distribution (`losses.logit_softcap`).
-                logits = logit_softcap(logits, self.logit_softcap)
-            if ce_fixed:
-                ce = fixed_cross_entropy(
-                    logits, targets, reduction="none", counters=counters
-                ).reshape(-1, 1)
-            else:
-                ce = -F.log_softmax(logits, dim=-1).gather(1, targets.reshape(-1, 1))
-            # `doc_masking`: the mean over the SELECTED positions only (the
-            # `None` default is the historical `.mean()`, bit for bit).
-            term = ce.mean() if loss_mask is None else masked_ce_mean(ce, loss_mask)
-        return h, streams, y, step_out, term, st, fuse
+        return h, streams, y
+
+    def _iter_ce(
+        self,
+        step_out: torch.Tensor,
+        targets: torch.Tensor | None,
+        lm_head: nn.Module | None,
+        counters: Counters,
+        loss_mask: torch.Tensor | None,
+        ce_fixed: bool,
+    ) -> torch.Tensor | None:
+        """The per-iteration deep-supervision CE — OUTSIDE every checkpoint.
+
+        The head is cheap (byte vocab) and its output is `[t, vocab]`; keeping
+        it in the forward graph costs little, while recomputing it in the
+        backward is a full head matmul + softmax per iteration. Running it
+        here, on the checkpoint's output `step_out`, makes that recompute
+        impossible by construction.
+        """
+        if targets is None:
+            return None
+        assert lm_head is not None, "per-iteration CE needs the lm_head"
+        b, t, d = step_out.shape
+        logits = lm_head(step_out.reshape(b * t, d).to(torch.float32))
+        if self.logit_softcap > 0.0:
+            # The same Gemma-2 cap the final exit applies; the loop's
+            # per-iteration deep-supervision CE must score the same
+            # bounded distribution (`losses.logit_softcap`).
+            logits = logit_softcap(logits, self.logit_softcap)
+        if ce_fixed:
+            ce = fixed_cross_entropy(
+                logits, targets, reduction="none", counters=counters
+            ).reshape(-1, 1)
+        else:
+            ce = -F.log_softmax(logits, dim=-1).gather(1, targets.reshape(-1, 1))
+        # `doc_masking`: the mean over the SELECTED positions only (the
+        # `None` default is the historical `.mean()`, bit for bit).
+        return ce.mean() if loss_mask is None else masked_ce_mean(ce, loss_mask)
 
     def recurrent_step(
         self,

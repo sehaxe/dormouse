@@ -1830,6 +1830,17 @@ class TrainConfig:
     #: see a recompute, and replaying a graph that skipped it would feed the
     #: backward a tensor the capture never kept.
     iter_checkpoint: bool = False
+    #: THE NAMED RECOMPUTE ARM (`model/recompute.py`): "none" | "full" |
+    #: "selective". `full` is `iter_checkpoint`'s whole-iteration checkpoint;
+    #: `selective` keeps the READ half (the q/k/v/g projection outputs, the
+    #: KDA/CSA boundary state, the Engram read) and checkpoints only the WRITE
+    #: half (the MoE pass, the residual write, `out_proj`), so the backward
+    #: never repeats the expensive read-side matmuls while the large MoE
+    #: activations still leave VRAM. `iter_checkpoint=true` with this field at
+    #: "none" is the historical alias for "full"; naming two different modes is
+    #: refused. The per-iteration head runs OUTSIDE every checkpoint in all
+    #: three arms (`_iter_ce`), so its matmul is never recomputed.
+    activation_recompute: str = "none"
     #: PINNED HOST OFFLOAD of the LARGEST saved activations (`model/act_mem.py`),
     #: in GiB moved to host PER FORWARD; `0.0` is OFF and installs no hooks.
     #: The point is the idle PCIe time under a ~780 ms step (~32 GB/s on PCIe
@@ -3540,6 +3551,27 @@ def validate_train(tcfg: TrainConfig) -> None:
             "the capture was verified on. Escape: opt_graph=false, or "
             "iter_checkpoint=false."
         )
+    if tcfg.activation_recompute not in ("none", "full", "selective"):
+        loud(
+            f"activation_recompute={tcfg.activation_recompute!r} is not a recompute "
+            f"mode. Known: 'none', 'full', 'selective'. Escape: name one of those."
+        )
+    if tcfg.iter_checkpoint and tcfg.activation_recompute not in ("none", "full"):
+        loud(
+            f"iter_checkpoint=true with activation_recompute="
+            f"{tcfg.activation_recompute!r}: two names for one recompute arm, and "
+            f"they do not name the same one. Escape: iter_checkpoint=false and the "
+            f"enum, or activation_recompute='full'."
+        )
+    for capture, why in (
+        ("full_graph", "a capture cannot see a recompute the backward performs"),
+        ("opt_graph", "the captured stage's gradients would come from a different graph"),
+    ):
+        if tcfg.activation_recompute != "none" and getattr(tcfg, capture):
+            loud(
+                f"activation_recompute={tcfg.activation_recompute!r} with {capture}=true: "
+                f"{why}. Escape: {capture}=false, or activation_recompute='none'."
+            )
     if tcfg.activation_offload != 0.0:
         if not math.isfinite(tcfg.activation_offload) or tcfg.activation_offload < 0.0:
             loud(
@@ -3617,6 +3649,21 @@ def validate_model_train(model: ModelConfig, tcfg: TrainConfig) -> None:
             f"nobody has measured (and the chunked head's own re-forward conflicts "
             f"with a second hook pair). Escape: use_byteflow=false, or "
             f"activation_offload=0.0."
+        )
+    if tcfg.activation_offload > 0.0 and not model.bf16:
+        loud(
+            f"activation_offload={tcfg.activation_offload} with bf16=false: the arm "
+            f"parks fp32 activations, i.e. twice the pinned bytes and twice the PCIe "
+            f"traffic of the measured bf16 arm; the budget would price a different "
+            f"tensor set. Escape: bf16=true, or activation_offload=0.0."
+        )
+    if tcfg.activation_recompute != "none" and model.use_byteflow:
+        loud(
+            f"activation_recompute={tcfg.activation_recompute!r} with use_byteflow=true: "
+            f"both byteflow shapes leave this model's byte-level loop (Option A builds "
+            f"none, Option B runs it over K patch latents), so there is no iteration "
+            f"to wrap and the arm would be inert. Escape: use_byteflow=false, or "
+            f"activation_recompute='none'."
         )
     if not model.layerrope:
         return
