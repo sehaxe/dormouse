@@ -47,11 +47,38 @@ def main() -> int:
         if val is not None:
             arms.setdefault(m.group(1), []).append(val)
 
+    # A CONTROL WITH ONE SEED HAS NO SPREAD, AND `bar = c_mean - 2*0` MAKES AN
+    # EXACT TIE A WIN. Measured class (audit 2026-11-04): one control log, or
+    # identical seeds, and every arm that does nothing "wins". The rule below
+    # refuses to promote on fewer than MIN_SEEDS control runs and requires the
+    # effect to clear both the control's spread AND a floor that a BPB difference
+    # has to beat to mean anything at our eval resolution.
+    MIN_SEEDS = 3
+    MIN_EFFECT = 0.01  # BPB; our eval spread is ~0.006-0.02 at 600-2000 steps
+    if len(ctl) < MIN_SEEDS:
+        print(
+            f"control has {len(ctl)} seed(s), need {MIN_SEEDS}: a spread of 0 makes "
+            f"an exact tie a WIN, so no promotion is possible. "
+            f"Escape: run the control at {MIN_SEEDS} seeds.",
+            file=sys.stderr,
+        )
+        return 2
     c_mean = statistics.mean(ctl)
     c_spread = max(ctl) - min(ctl)
-    bar = c_mean - 2 * c_spread
+    if c_spread <= 0.0:
+        print(
+            f"control seeds are identical ({ctl}): the spread is 0 and the bar is "
+            f"the mean, so a tie would promote. Escape: distinct seeds.",
+            file=sys.stderr,
+        )
+        return 2
+    need = max(2 * c_spread, MIN_EFFECT)
+    bar = c_mean - need
     print(f"control: n={len(ctl)} {[round(x, 4) for x in ctl]}")
-    print(f"  mean={c_mean:.4f}  spread={c_spread:.4f}  promotion bar={bar:.4f}\n")
+    print(
+        f"  mean={c_mean:.4f}  spread={c_spread:.4f}  need={need:.4f}  "
+        f"promotion bar={bar:.4f}\n"
+    )
     print(f"{'arm':16s} {'n':>2s} {'mean':>7s} {'spread':>7s} {'delta':>8s}  verdict")
     print("-" * 58)
     for arm in sorted(arms, key=lambda a: statistics.mean(arms[a])):
