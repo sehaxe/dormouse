@@ -1995,8 +1995,10 @@ class RunConfig:
                         continue
                 if section == "model" and f.name == "max_seq_len" and not positional:
                     continue  # handled above: grow-only, and a grow is a resume
-                if section == "model" and f.name == "moe_kernel":
-                    # implementation key: the arms are proven equal to 1e-6
+                if section == "model" and f.name in ("moe_kernel",):
+                    # implementation keys: `moe_kernel`'s arms are proven equal
+                    # to 1e-6, and the balancing rule decides selection, not
+                    # representation
                     continue
                 if getattr(a, f.name) != getattr(b, f.name):
                     out.append(f"{section}.{f.name}")

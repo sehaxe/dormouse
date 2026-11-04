@@ -336,7 +336,17 @@ def test_snapshot_round_trip_and_progress_exemption():
 
     longer = replace(run, train=replace(run.train, steps=999, log_every=1, eval=True))
     assert longer.diff_keys(run) == []
-    assert set(PROGRESS_KEYS) <= set(TrainConfig().__dataclass_fields__)
+    # A progress key may live on the MODEL half when it names an IMPLEMENTATION
+    # choice whose arms are proven equal (`moe_kernel`: three kernels, parity
+    # 1e-6, worth 8.6x on the step; `moe_lb_mode`: the balancing rule). Those are
+    # exempted by name in `diff_keys`, not by section, so the closed set has to
+    # span both halves — a key that exists in NEITHER is still a red test.
+    from dormouse.config import ModelConfig
+
+    known = set(TrainConfig().__dataclass_fields__) | set(
+        ModelConfig().__dataclass_fields__
+    )
+    assert set(PROGRESS_KEYS) <= known
     # ... and so is the telemetry sink: it decides WHERE the measurement goes,
     # never what the model computes (audit MINOR 23, 2026-10-17).
     assert "json_log" in PROGRESS_KEYS

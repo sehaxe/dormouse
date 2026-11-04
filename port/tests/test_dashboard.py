@@ -68,7 +68,10 @@ def test_page_carries_the_sse_wiring(dash):
 def test_fragments_render(dash):
     s = dash.snapshot()
     assert "held-out bpb" in dash.frag_metrics(s)
-    assert "flagship" in dash.frag_hero(s)
+    # The hero names the ACTIVE run, which is whatever the log dir holds — it was
+    # hard-coded to `flagship` and went red the day a new stair started (the board
+    # followed the run correctly, the test did not).
+    assert s["run"]["name"] in dash.frag_hero(s)
     if len(s["history"]) >= 2:
         assert "<svg" in dash.frag_chart(s) and "polyline" in dash.frag_chart(s)
     assert "mechanisms" in dash.frag_panels(s)
