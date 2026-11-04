@@ -66,7 +66,7 @@ projection — the plane whole, the dictionary through the seeded column gather
 already walks to, so the basis and the per-expert factors move on ONE
 schedule.
 
-Dispatch has TWO arms over ONE permute, and the log line says which ran:
+Dispatch has FOUR arms over ONE permute, and the log line says which ran:
 
 * **padded (CUDA, the fast arm)**: gather the kept rows into ONE zero-filled
   `[E, cap, d]` bank and run the whole expert bank as three batched matmuls
@@ -101,6 +101,15 @@ Dispatch has TWO arms over ONE permute, and the log line says which ran:
   `moe_kernels.FUSED_TOPK_MAX` is the one call the fused path refuses, and it
   says so on the counter line (`moe_triton_fallback`, reason `fused backward:
   …`) while `moe_triton_gemm` still counts — the grouped GEMM did run.
+* **batched (the dropless bank)**: the SAME `[E, cap, ·]` body as `padded`, but
+  `cap` is chosen for THIS batch — the largest group when `moe_capacity = 0`,
+  the capacity rule's number otherwise. It replaces the dropless per-expert
+  loop's `E` tiny GEMMs with three `bmm`s: measured on the 5070 Ti at the m400
+  shape (8192 tokens, E=512, r=64) the loop is 99.56 ms and the bank 11.45 ms
+  (`scripts/part_bench.py`; this task's CPU run is the parity gate, not the
+  timing). The dropless cap is one host scalar (`counts.max()`), because a bank
+  shape needs a Python int; it is the only host read in the arm (see
+  `_batched_cap`).
 * **naive (the CPU path and the correctness reference)**: gather → per-expert
   matmul → scatter over a capacity-bound permute. The day-one implementation,
   kept because it is what the padded arm is compared against — the same rows,
@@ -138,8 +147,8 @@ what makes the average width the compute that actually happens on the ragged
 arms. Counters: `moe_k1`..`moe_k{max}` (per-token histogram, device
 accumulators) and `moe_k_mean_x100` (the mean width × 100, an INT).
 
-All of them count: `moe_padded_bmm`, `moe_triton_gemm`, `moe_gather_forward` or
-`moe_naive_dispatch`
+All of them count: `moe_padded_bmm`, `moe_batched_calls`, `moe_triton_gemm`,
+`moe_gather_forward` or `moe_naive_dispatch`
 (with the reason attached to the counter object) on the step's counter line, so
 a reader never has to guess which one produced the loss.
 
@@ -154,10 +163,11 @@ pair. With `moe_capacity = 0` every assignment goes to its expert, the routing i
 per position, and the segmented forward is the one-shot forward
 (`tests/test_longctx.py`). Three consequences, each of them LOUD or COUNTED:
 
-* the padded arm **refuses** (`_padded_dispatch`): a capacity-padded `[E, cap, ·]`
-  bank has no shape without a cap, and sizing it to the largest expert would be
-  an input-dependent bank — a different arm, not a flag;
-* the arm that runs is the RAGGED one, and it is the GROUPED GEMM: its
+* the padded arm **refuses** (`_padded_dispatch`): its `[E, cap, ·]` bank has
+  no shape without a FIXED cap. The dropless bank is `moe_kernel="batched"`,
+  which sizes the cap to THIS batch's largest group (one host scalar), so it is
+  a separate arm rather than the padded one silently reading a capacity of 0;
+* with the default `padded` arm the dropless route runs the GROUPED GEMM: its
   row-block grid takes a STATIC bound the host reads from a SHAPE
   (`moe_kernels._dropless_cap` — `R` rows in one group, the widest any expert
   can be) and every program EXITS on-device when its block is empty (two `offs`
@@ -1311,6 +1321,83 @@ class SparseMoE(nn.Module):
         mats, scales = cached[1], cached[2]
         return (mats[0], mats[1], mats[2], scales[0], scales[1])
 
+    def _assert_homogeneous(self) -> None:
+        """Refuse a bank whose experts have different factor shapes — LOUD.
+
+        `moe_kernel="batched"` runs ONE `bmm` over `[E, cap, ·]`, which exists
+        only when every expert's factors stack. Per-expert adaptive rank (or a
+        hand-mutated expert) breaks that, and `torch.stack` would die with a
+        shape error that names neither the arm nor an escape; this guard does.
+        `share_u` experts own no `U` (the parent binds one), so the check reads
+        what each expert actually carries.
+        """
+
+        def shapes(ex) -> tuple:
+            gu = getattr(ex, "gate_u", None)
+            uu = getattr(ex, "up_u", None)
+            return (
+                tuple(ex.gate_s.shape),
+                tuple(ex.up_s.shape),
+                tuple(ex.v.shape),
+                None if gu is None else tuple(gu.shape),
+                None if uu is None else tuple(uu.shape),
+            )
+
+        want = shapes(self.experts[0])
+        for i, ex in enumerate(self.experts[1:], 1):
+            got = shapes(ex)
+            if got != want:
+                loud(
+                    f"moe_kernel='batched' needs every routed expert to have the "
+                    f"same factor shapes for ONE [E, cap, ·] bank, got expert 0 "
+                    f"{want} and expert {i} {got}. A per-expert rank/width makes "
+                    f"the bank heterogeneous. Escape: one rank for every routed "
+                    f"expert, or moe_kernel='naive' (the per-expert loop)."
+                )
+
+    def _batched_cap(self, index: torch.Tensor, weight: torch.Tensor) -> int:
+        """The bank's common row cap: the capacity rule, or this batch's max group.
+
+        `moe_capacity > 0` is the rule's own static cap — the same number the
+        padded arm uses, so the capacity DROPS are the same ones (`keep`). With
+        `moe_capacity = 0` every assignment is kept, so the tight bound is the
+        LARGEST group in this batch; it is a device reduction plus ONE host
+        scalar read, because a `[E, cap, ·]` allocation needs a Python int. It
+        is not a per-expert read (the old loop's `unique().tolist()`), and the
+        padded arm's route never reaches it.
+        """
+        n, k = index.shape
+        if self.capacity > 0:
+            return self._capacity(n, k)
+        flat_e = index.reshape(-1)
+        groups = self.n_experts
+        if self.topk_mode != "off":
+            flat_e = flat_e.masked_fill(~(weight > 0).reshape(-1), self.n_experts)
+            groups += 1
+        counts = _bincount(flat_e, groups)
+        return max(1, int(counts[: self.n_experts].max().item()))
+
+    def _batched_dispatch(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        index: torch.Tensor,
+        order: torch.Tensor,
+        keep: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Gather → ONE `[E, cap, ·]` bmm bank → weighted scatter, dropless too.
+
+        The same arithmetic as `_padded_dispatch`, with the cap chosen for THIS
+        batch when `moe_capacity = 0` (`_batched_cap`): every assignment gets a
+        row, so this arm is the per-expert loop's function with three batched
+        GEMMs instead of E tiny ones. `moe_capacity > 0` uses the capacity
+        rule's cap and drops exactly the rows the other capacity arms drop.
+        """
+        self._assert_homogeneous()
+        return self._bank_dispatch(
+            x, weight, index, order, keep, self._batched_cap(index, weight)
+        )
+
     def _padded_dispatch(
         self,
         x: torch.Tensor,
@@ -1328,23 +1415,40 @@ class SparseMoE(nn.Module):
         laid out, never which tokens get an expert.
 
         `moe_capacity = 0` (dropless) is REFUSED here: this arm IS a
-        `[E, cap, ·]` bank and dropless has no cap to size it. A bank sized to
-        the largest expert would be an input-dependent arm (a new mechanism, not
-        a flag), and the rule's floor `k` would silently drop every row past it.
-        `_dispatch` routes the dropless mode to the ragged arm instead; this
-        guard is the seam for a direct call.
+        `[E, cap, ·]` bank and dropless has no cap to size it. The dropless
+        bank is `moe_kernel="batched"` (it sizes the cap to this batch's largest
+        group); this guard is the seam for a direct call.
         """
         if self.capacity == 0:
             loud(
                 "the padded MoE arm with moe_capacity=0: this arm materializes a "
                 "[E, cap, ·] bank and dropless has no cap (the rule's floor would be "
                 "k, which drops every row past it — a silently wrong forward). "
-                "Escape: moe_capacity > 0 for the padded kernel, or the dropless "
-                "route, which is moe_kernel=naive (the ragged arms keep every "
-                "assignment)."
+                "Escape: moe_capacity > 0 for the padded kernel, moe_kernel='batched' "
+                "for the dropless bank, or moe_kernel=naive (the ragged arms keep "
+                "every assignment)."
             )
         n, k = index.shape
-        e, cap = self.n_experts, self._capacity(n, k)
+        return self._bank_dispatch(x, weight, index, order, keep, self._capacity(n, k))
+
+    def _bank_dispatch(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        index: torch.Tensor,
+        order: torch.Tensor,
+        keep: torch.Tensor | None,
+        cap: int,
+    ) -> torch.Tensor:
+        """The `[E, cap, ·]` bank body shared by `padded` and `batched`.
+
+        `cap` is the ONE difference between the two arms: the capacity rule's
+        number (`padded`) or the batch's largest group (`batched`, dropless).
+        Everything else — the dump slot, the zero fill, the fp32 router weight —
+        is one implementation so the arms cannot drift.
+        """
+        n, k = index.shape
+        e = self.n_experts
         dt = self._bank_dtype()
         flat_w = weight.reshape(-1)
         flat_e = index.reshape(-1)
@@ -1487,13 +1591,15 @@ class SparseMoE(nn.Module):
         reason on the counter object (ADR-0019 — a degradation a reader of the
         log cannot see is a defect).
 
-        `moe_capacity = 0` (dropless) short-circuits to the RAGGED arm: the
-        permute keeps every assignment and the padded arm has no cap to size its
-        bank with (`_padded_dispatch` refuses), so the grouped GEMM runs with the
-        static row-block bound and the kernels' on-device empty-block exit — no
-        host read-back of `offs` (ADR-0018 rule 2). `_dropless_dispatch` owns
-        that route and its counters (`moe_dropless`, `moe_triton_gemm`, or
-        `moe_naive_dispatch` + the reason when the kernel cannot serve the call).
+        `moe_capacity = 0` (dropless) short-circuits to `_dropless_dispatch`: the
+        permute keeps every assignment and the padded arm has no fixed cap to
+        size its bank with (`_padded_dispatch` refuses), so either the batched
+        arm sizes one to the batch's largest group (`moe_kernel="batched"`) or
+        the grouped GEMM runs with the static row-block bound and the kernels'
+        on-device empty-block exit — no host read-back of `offs` (ADR-0018 rule
+        2). `_dropless_dispatch` owns that route and its counters (`moe_dropless`,
+        `moe_batched_calls`, `moe_triton_gemm`, or `moe_naive_dispatch` + the
+        reason when the kernel cannot serve the call).
 
         A zero router weight is an adaptive-width PADDING SLOT, not a dropped
         assignment: it must not consume capacity (a padding row that keeps a real
@@ -1543,6 +1649,13 @@ class SparseMoE(nn.Module):
         if self.capacity == 0:
             return self._dropless_dispatch(x, weight, index, order, keep, keep_rows, counters)
         notes = [] if gwhy is None else [f"gather: {gwhy}"]
+        if self.moe_kernel == "batched":
+            if notes:
+                counters.why = "; ".join(notes)  # type: ignore[attr-defined]
+            counters.count("moe_batched_calls")
+            return self._expert_pass(
+                lambda: self._batched_dispatch(x, weight, index, order, keep_rows), counters
+            )
         if self.moe_kernel == "triton":
             why = (
                 None
@@ -1599,9 +1712,10 @@ class SparseMoE(nn.Module):
     ) -> torch.Tensor:
         """The `moe_capacity = 0` route: the RAGGED arms, the grouped GEMM first.
 
-        The padded arm is out by construction (a `[E, cap, ·]` bank has no cap),
-        so the choice is between the grouped GEMM and the reference loop — and the
-        grouped GEMM now SERVES dropless: its row-block grid takes a static bound
+        The padded arm is out by construction (a `[E, cap, ·]` bank has no fixed
+        cap), so the choice is the batched bank (its cap is this batch's largest
+        group), the grouped GEMM, or the reference loop — and the grouped GEMM
+        now SERVES dropless: its row-block grid takes a static bound
         the host reads from a shape (`moe_kernels._dropless_cap`) and every
         program exits on-device when its block is empty, so no `offs` read-back is
         needed (ADR-0018 rule 2). Before that early-exit existed this route had to
@@ -1618,6 +1732,11 @@ class SparseMoE(nn.Module):
         the only thing that can send it back to the previous adjoint, COUNTED).
         """
         counters.count("moe_dropless")
+        if self.moe_kernel == "batched":
+            counters.count("moe_batched_calls")
+            return self._expert_pass(
+                lambda: self._batched_dispatch(x, weight, index, order, keep_rows), counters
+            )
         why = None
         if self.moe_kernel == "naive":
             why = "moe_kernel=naive: the config picked the reference loop"
